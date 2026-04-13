@@ -180,150 +180,143 @@ dir0_x, dir1_x = _encode_dir(ny, nz)   # X-slices (YZ plane)
 These can be computed per grid point and then voxelized into the 3D patch
 (using the same splatting approach as the neural tracer).
 
-### 3.2 Cos and grad_mag — from per-surface distance transforms (no winding needed)
+### 3.2 Surface chain ordering
 
-The cos channel encodes `0.5 + 0.5 * cos(2π * winding)`, which peaks at 1.0 on
-each sheet surface and dips to ~0.5 midway between sheets. The grad_mag channel
-encodes local sheet density (inverse of inter-sheet spacing). Crucially, both
-signals are **locally determined** — they only depend on the distances to nearby
-surfaces, not on a global winding number.
+The data loader (`load_folder()`) returns tifxyz surfaces sorted alphabetically
+by directory path, which has no relation to their spatial arrangement. All
+DT-derived channels (cos, grad_mag, validity) require knowing which surface is
+prev/next for each voxel, so we must **explicitly order the surfaces into a
+chain** first.
 
-We derive both from **per-surface distance transforms**:
+We use the greedy chain algorithm from `lasagna/labels_to_winding_volume.py`
+(lines 268–305):
 
-1. Voxelize each surface individually into its own binary 3D mask. The neural
-   tracer's `_voxelize_surface_from_sampled_grid` already does per-surface
-   voxelization.
-2. For each surface `k`, compute the **Euclidean distance transform**
-   `dt_k = edt(~mask_k)`. This gives, for every voxel, the distance to the
-   nearest voxel of surface `k`.
-3. At each voxel, sort the per-surface distances to find the **two smallest**:
-   `d1` (nearest surface) and `d2` (second-nearest surface). The local
-   inter-sheet spacing is `spacing = d1 + d2`.
-4. Derive both channels:
-   - **cos**: `0.5 + 0.5 * cos(π * d1 / max(d1 + d2, eps))` — peaks at 1.0 on
-     each surface (d1=0), dips to a minimum at the midpoint (d1 = d2), and rises
-     again approaching the next sheet.
-   - **grad_mag**: `1 / (d1 + d2)` — the sheet density, high where sheets are
-     close together, low where they are far apart.
+1. Voxelize each surface `k` into a binary mask `mask_k`.
+2. Compute the EDT for each: `dt_k = edt(~mask_k)`.
+3. Compute pairwise average distances: `avg_dist[i,j]` = mean of `dt_i` over
+   the voxels of surface `j`. This is cheap — the DTs are already computed.
+4. Start the chain at the most isolated surface (highest mean distance to all
+   others).
+5. Greedily append the closest unused surface.
 
 ```python
-from scipy.ndimage import distance_transform_edt
+from vesuvius.image_proc.edt import distance_transform_edt
 
-# Compute per-surface distance transforms
-# surface_masks: list of (Z, Y, X) bool, one per surface in this patch
+# 1-2. Voxelize + EDT (already needed for cos/grad_mag)
 dts = [distance_transform_edt(~mask) for mask in surface_masks]
 
-# Stack and sort to find two smallest distances at each voxel
-dt_stack = np.stack(dts, axis=0)           # (K, Z, Y, X)
-dt_sorted = np.sort(dt_stack, axis=0)       # sorted along surface axis
-d1 = dt_sorted[0]                           # distance to nearest surface
-d2 = dt_sorted[1] if len(dts) > 1 else d1  # distance to 2nd-nearest
+# 3. Pairwise average distances
+N = len(dts)
+avg_dist = np.zeros((N, N), dtype=np.float64)
+for i in range(N):
+    for j in range(N):
+        if i != j:
+            avg_dist[i, j] = float(dts[i][surface_masks[j]].mean())
 
-spacing = d1 + d2  # local inter-sheet spacing
-half_spacing = spacing / 2.0
+# 4. Start with most isolated surface
+total_avg = np.array([np.mean([avg_dist[i, j] for j in range(N) if j != i])
+                       for i in range(N)])
+chain = [int(np.argmax(total_avg))]
+used = set(chain)
 
-cos_channel = 0.5 + 0.5 * np.cos(np.pi * np.clip(d1 / (half_spacing + 1e-6), 0, 1))
+# 5. Greedy nearest neighbor
+for _ in range(N - 1):
+    last = chain[-1]
+    best = min((j for j in range(N) if j not in used),
+               key=lambda j: avg_dist[last, j])
+    chain.append(best)
+    used.add(best)
+```
+
+In a typical training patch N is small (2–5 surfaces), so this is negligible
+compared to the EDT computation.
+
+### 3.3 Cos, grad_mag, and validity — chain-aware DT derivation
+
+With the chain ordering established, every voxel needs three things:
+1. Its **nearest surface** in the chain (index into `chain`)
+2. Which **side** of that surface it sits on (toward prev or toward next)
+3. The **distances** to the two surfaces it sits between
+
+All three are determined by **DT-gradient dot products**.
+
+#### DT-gradient dot product — core idea
+
+Given two distance transforms `dt_A` and `dt_B`, compute `∇dt_A · ∇dt_B`:
+
+- **dot < 0** → gradients oppose → the voxel is **between** surfaces A and B.
+- **dot ≥ 0** → gradients agree → the voxel is on the **same side** of both.
+
+This works because `∇dt` always points away from the nearest surface point.
+Between two surfaces the "away" directions oppose; outside both they align.
+
+#### Per-voxel side detection
+
+For each voxel nearest to chain surface `k`, compute the dot product against
+the previous chain neighbor's DT:
+
+```python
+dot_prev = np.zeros(shape, dtype=np.float32)
+for ax in range(3):
+    gn = np.gradient(dt_chain[k], axis=ax)
+    gp = np.gradient(dt_chain[k-1], axis=ax)
+    dot_prev[is_nearest_k] += (gn * gp)[is_nearest_k]
+
+use_prev_side = dot_prev < 0
+# dot < 0 → between prev and nearest → d_lo=dist_prev, d_hi=dist_nearest
+# dot ≥ 0 → between nearest and next → d_lo=dist_nearest, d_hi=dist_next
+```
+
+This gives the two bracketing distances `d_lo` and `d_hi` for each voxel:
+
+```python
+d_lo = np.where(use_prev_side, dist_prev, dist_nearest)
+d_hi = np.where(use_prev_side, dist_nearest, dist_next)
+spacing = d_lo + d_hi
+```
+
+#### Deriving cos and grad_mag
+
+The cos channel encodes `0.5 + 0.5 * cos(2π * winding)`, which peaks at 1.0
+on each sheet surface and dips to 0.0 midway between sheets. The grad_mag
+channel encodes local sheet density (inverse of inter-sheet spacing).
+
+```python
+cos_channel = 0.5 + 0.5 * np.cos(np.pi * np.clip(d_lo / (spacing / 2 + 1e-6), 0, 1))
 grad_mag = 1.0 / (spacing + 1e-6)
 ```
 
-This approach has key advantages:
-- **No winding assignment needed** — no inter-surface ordering, no global layer
-  counting. Each surface contributes independently via its own distance
-  transform.
-- **Grad_mag is directly derived** — the inter-sheet spacing at each voxel is
-  simply the sum of the two smallest per-surface distances.
-- **Works with any number of surfaces** — with 2+ surfaces the two-smallest
-  distances give exact local spacing; with only 1 surface, cos and grad_mag
-  cannot be supervised (only direction channels are usable).
-- **Naturally handles the midpoint** — the cosine profile smoothly transitions
-  between sheets using the local half-spacing.
+#### Envelope detection (validity)
 
-### 3.3 Validity filtering
-
-Not all voxels produce reliable training signal. The existing 2D label pipeline
-(`gen_post_data.py:compute_label_supervision`) uses several layers of filtering
-to determine valid supervision regions, and the 3D tifxyz case needs analogous
-filtering.
-
-#### Existing 2D filtering (reference)
-
-The 2D code works on label slices `{0=background, 1=surface, 2=ignore}` and
-applies these filters in `gen_post_data.py` and `train_unet.py`:
-
-1. **Border removal**: 3px border marked as ignore (label=2) to avoid edge
-   artifacts from distance transforms.
-
-2. **Connected-component validation**: Each label-CC (foreground strip) must
-   touch ignore regions in at least **two disjoint locations** — this ensures
-   the surface is "sandwiched" between background regions on both sides, giving
-   a meaningful distance field. CCs that only touch ignore on one side are
-   rejected (they represent sheet edges, where distances are unreliable).
-
-3. **Chain validation**: The inner components (alternating fg/bg strips) must
-   form a **simple linear chain** (no branching). The chain is found by
-   building a 4-connected adjacency graph between fg/bg components and walking
-   from a degree-1 endpoint. Branching or incomplete chains are rejected.
-
-4. **Endpoint exclusion**: The first and last components in the chain are
-   skipped entirely — they represent the outermost half-layers where there is
-   no neighboring surface on one side, making the distance field one-sided and
-   unreliable.
-
-5. **Outer-CC erosion**: Valid outer CC masks are eroded by 16px
-   (`cv2.erode` with a 33×33 kernel) to stay away from boundaries where the
-   distance field is affected by the mask edge rather than actual sheet
-   structure. Stored as `outer_cc_idx` (contiguous 1..K indices).
-
-6. **Gradient validity mask**: For grad_mag and direction channels, an
-   additional check requires **both neighbors** in the finite-difference
-   stencil to lie within the eroded valid mask. This is computed as the
-   intersection of shifted masks: `m_grad = m_x & m_y` where
-   `m_x[..., :-1] = eroded[..., 1:] & eroded[..., :-1]` (and similarly for y).
-   This prevents gradients from straddling valid/invalid boundaries.
-
-7. **frac_pos sentinel**: Areas outside valid regions get `frac_pos = -1.0`,
-   which is masked out in the loss via `valid_frac = (outer_idx > 0) &
-   (frac_pos > -0.5)`.
-
-#### 3D tifxyz filtering (proposed)
-
-The analogous filtering for voxelized tifxyz surfaces:
-
-1. **No surfaces → no loss**: If a patch contains zero surfaces, there is
-   nothing to supervise — skip entirely (zero validity mask on all channels).
-   With exactly one surface, only direction channels (normals) can be
-   supervised; cos and grad_mag get a zero validity mask since they require
-   inter-sheet spacing from d1+d2.
-
-2. **Distance-based validity**: Only supervise voxels where `d2` (distance to
-   second-nearest surface) is finite and below a reasonable threshold (e.g.
-   half the patch size). Voxels far from any second surface have unreliable
-   spacing estimates.
-
-3. **Boundary erosion**: Erode the valid region by a margin (e.g. 8–16 voxels)
-   near patch edges where the distance transform is clipped by the patch
-   boundary rather than reflecting true sheet structure. This mirrors the
-   16px erosion and 3px border removal in the 2D code.
-
-4. **Gradient validity**: For direction channels derived via finite differences
-   on the splatted field, require both neighbors in the stencil to be valid
-   (same `m_x & m_y` approach as the 2D code).
-
-5. **Surface-edge exclusion**: Near the edges of a tifxyz surface's valid
-   region (where `_valid_mask` transitions from True to False), the distance
-   transform is truncated. Exclude voxels within a margin of these boundaries
-   — analogous to the 2D endpoint exclusion.
+Voxels outside the entire surface stack are invalid. Detect them using the
+dot product between the first and last chain DTs:
 
 ```python
-# Validity mask for cos and grad_mag
-valid = np.ones_like(d1, dtype=bool)
-valid &= len(surface_masks) >= 2          # need ≥2 surfaces
-valid &= d2 < max_reliable_distance       # d2 not clipped by patch boundary
-valid &= erode_3d(valid, margin=16)       # stay away from patch edges
+dot_envelope = np.zeros(shape, dtype=np.float32)
+for axis in range(3):
+    g1 = np.gradient(dt_chain[0], axis=axis)
+    g2 = np.gradient(dt_chain[-1], axis=axis)
+    dot_envelope += g1 * g2
 
-# For direction channels: gradient validity
-# (both neighbors in finite-difference stencil must be valid)
+outside_mask = (dot_envelope > 0) & (~on_any_surface)
 ```
+
+#### Combined validity mask
+
+```python
+valid = np.ones(shape, dtype=bool)
+valid &= num_surfaces >= 2              # need ≥2 surfaces
+valid &= ~outside_mask                  # exclude exterior voxels
+valid &= erode_3d(valid, margin=8)      # exclude patch-edge artifacts
+```
+
+#### Reference
+
+`lasagna/labels_to_winding_volume.py`:
+- Lines 268–305: greedy chain construction
+- Lines 307–348: chain-adjacent dot-product side detection
+- Lines 350–368: envelope exterior detection
+- Lines 374–402: per-voxel winding interpolation using chain distances
 
 
 ---
@@ -347,14 +340,12 @@ To produce labels on-the-fly from tifxyz surfaces for a given patch:
 3. Voxelize direction channels:
    a. Splat the 6 direction values at each surface point's 3D position
    b. Normalize splatted direction values (divide by weight accumulator)
-4. Per-surface distance transforms + cos/grad_mag:
+4. Per-surface distance transforms (§3.2–3.3):
    a. For each surface k: dt_k = edt(~mask_k)
-   b. Sort per-voxel to find d1 (nearest) and d2 (second-nearest)
-   c. cos = 0.5 + 0.5 * cos(π * d1 / ((d1+d2)/2))
-   d. grad_mag = 1 / (d1 + d2)
-5. Validity filtering:
-   a. Mask out voxels with <2 surfaces or d2 > threshold
-   b. Erode valid region near patch/surface boundaries
+   b. Build greedy chain by pairwise average distances
+   c. Per-voxel: find nearest chain surface, dot-product side detection
+   d. cos and grad_mag from chain-aware bracketing distances (d_lo, d_hi)
+   e. Envelope detection (dot of first/last chain DTs) → validity mask
 6. Average-pool to step resolution if needed
 ```
 
@@ -645,3 +636,73 @@ inter-sheet space (splat along normals).
 
 - **Training resolution**: Full resolution. Labels are voxelized at full res;
   the UNet operates at full res and its output is pooled to step res downstream.
+
+
+---
+
+## 9. Shared GPU-Accelerated EDT Utility
+
+The per-surface distance transforms in §3.2 are the computational bottleneck of
+on-the-fly label derivation. A shared GPU-accelerated EDT utility is provided at
+`vesuvius.image_proc.edt` to make this fast.
+
+### Location
+
+`vesuvius/src/vesuvius/image_proc/edt.py`
+
+### Public API
+
+```python
+from vesuvius.image_proc.edt import distance_transform_edt, signed_distance_field, edt_dilate
+
+# Drop-in replacement for scipy.ndimage.distance_transform_edt
+dt = distance_transform_edt(~surface_mask)
+
+# Signed distance field (positive inside, negative outside)
+sdf = signed_distance_field(binary_mask)
+
+# Fast binary dilation via EDT thresholding
+dilated = edt_dilate(binary_mask, radius_voxels=8)
+```
+
+### Backend priority
+
+| Priority | Backend | Package | Notes |
+|----------|---------|---------|-------|
+| 1 | `cupyx.scipy.ndimage.distance_transform_edt` | `cupy-cuda12x` | GPU PBA 3D, 10-50x faster |
+| 2 | `edt.edt()` | `edt` | CPU Felzenszwalb, parallel, ~5-10x faster than scipy |
+| 3 | `scipy.ndimage.distance_transform_edt` | `scipy` | CPU baseline, always available |
+
+Backend is resolved once per process and cached. CuPy uses
+`float64_distances=False` and a non-blocking stream for async GPU→CPU transfer.
+
+### Installation
+
+GPU acceleration requires CuPy matching your CUDA version:
+```bash
+pip install cupy-cuda12x   # CUDA 12.x
+```
+
+The `edt` package is a good CPU-only fallback:
+```bash
+pip install edt
+```
+
+Neither is required — scipy is always available as the final fallback.
+
+### Usage in tifxyz training (§3.2)
+
+```python
+from vesuvius.image_proc.edt import distance_transform_edt
+
+# Per-surface distance transforms for cos and grad_mag derivation
+dts = [distance_transform_edt(~mask) for mask in surface_masks]
+dt_stack = np.stack(dts, axis=0)
+dt_sorted = np.sort(dt_stack, axis=0)
+d1, d2 = dt_sorted[0], dt_sorted[1]
+```
+
+### Origin
+
+Extracted from `vesuvius/src/vesuvius/neural_tracing/datasets/dataset_rowcol_cond.py:62-203`
+which has the same CuPy-with-fallback pattern battle-tested in neural tracer training.
