@@ -449,8 +449,53 @@ static void write_zero_sentinel(std::byte* dst) {
 }
 
 // ============================================================================
-// Mask: use lowest-resolution level to skip empty chunks
+// Occupancy: which source chunks exist on storage
 // ============================================================================
+
+// Fast path: a single S3 LIST (paginated) returns every existing key under
+// the level's prefix.  We parse the trailing "<cz>/<cy>/<cx>" out of each
+// key and mark the corresponding chunk as occupied.  No per-chunk HEAD/GET,
+// no separate-level mask scan — one round-trip per 10K chunks.
+static std::vector<bool> build_occupancy_from_listing(
+    IOBackend& io, int level,
+    const std::vector<size_t>& shape, const std::vector<size_t>& chunks)
+{
+    if (shape.size() < 3) return {};
+    size_t nz = (shape[0] + chunks[0] - 1) / chunks[0];
+    size_t ny = (shape[1] + chunks[1] - 1) / chunks[1];
+    size_t nx = (shape[2] + chunks[2] - 1) / chunks[2];
+    std::vector<bool> mask(nz * ny * nx, false);
+
+    std::string prefix = std::to_string(level) + "/";
+    auto keys = io.list_chunks(prefix);
+    size_t parsed = 0;
+    for (const auto& k : keys) {
+        // Expect "<level>/<cz>/<cy>/<cx>".  Find the three trailing ints.
+        size_t e = k.size();
+        auto find_prev_slash = [&](size_t end) -> size_t {
+            for (size_t i = end; i > 0; --i) if (k[i - 1] == '/') return i - 1;
+            return std::string::npos;
+        };
+        size_t s3 = find_prev_slash(e);
+        if (s3 == std::string::npos) continue;
+        size_t s2 = find_prev_slash(s3);
+        if (s2 == std::string::npos) continue;
+        size_t s1 = find_prev_slash(s2);
+        if (s1 == std::string::npos) continue;
+        try {
+            size_t cz = std::stoul(k.substr(s1 + 1, s2 - s1 - 1));
+            size_t cy = std::stoul(k.substr(s2 + 1, s3 - s2 - 1));
+            size_t cx = std::stoul(k.substr(s3 + 1));
+            if (cz < nz && cy < ny && cx < nx) {
+                mask[cz * ny * nx + cy * nx + cx] = true;
+                ++parsed;
+            }
+        } catch (...) { /* skip non-chunk keys */ }
+    }
+    printf("  Occupancy from LIST: %zu / %zu chunks present (%.1f%% sparse)\n",
+           parsed, mask.size(), 100.0 * (1.0 - (double)parsed / mask.size()));
+    return mask;
+}
 
 static std::vector<bool> build_occupancy_mask(
     IOBackend& io,
@@ -728,38 +773,13 @@ int main(int argc, char** argv) {
         size_t shard_nx = (shape[2] + SHARD_DIM - 1) / SHARD_DIM;
         size_t total_shards = shard_nz * shard_ny * shard_nx;
 
-        // Build occupancy mask at 128³ chunk granularity
-        std::vector<bool> occ_mask;
-        int mask_level = -1;
-        for (int mi = (int)levels.size() - 1; mi >= 0; mi--) {
-            if (levels[mi] > l) {
-                mask_level = levels[mi];
-                break;
-            }
-        }
-        if (mask_level >= 0) {
-            for (size_t mi = 0; mi < levels.size(); mi++) {
-                if (levels[mi] == mask_level) {
-                    // Build mask at 128³ granularity
-                    std::vector<size_t> chunk128 = {CHUNK_DIM, CHUNK_DIM, CHUNK_DIM};
-                    std::vector<size_t> mask_src_chunks = {128, 128, 128};
-                    // Read mask level's actual chunk size
-                    try {
-                        Json mask_zarray = Json::parse(
-                            input->read_string(std::to_string(mask_level) + "/.zarray"));
-                        if (mask_zarray.contains("chunks")) {
-                            mask_src_chunks.clear();
-                            for (auto& v : mask_zarray["chunks"])
-                                mask_src_chunks.push_back(v.get_size_t());
-                        }
-                    } catch (...) {}
-                    occ_mask = build_occupancy_mask(
-                        *input, l, shape, chunk128,
-                        mask_level, shapes[mi], mask_src_chunks);
-                    break;
-                }
-            }
-        }
+        // Occupancy at 128^3 chunk granularity from a single LIST of the
+        // source level (one paginated round-trip, ≤10K keys per page).
+        // No need for the old L5-mask scan path: LIST gives exact existence
+        // for every chunk in one shot.
+        std::vector<size_t> chunk128 = {CHUNK_DIM, CHUNK_DIM, CHUNK_DIM};
+        std::vector<bool> occ_mask =
+            build_occupancy_from_listing(*input, l, shape, chunk128);
 
         printf("  Source: chunks [%zu,%zu,%zu], compressor: %s, sep: '%s', dtype: %s\n",
                src_chunks[0], src_chunks[1], src_chunks[2],
