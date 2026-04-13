@@ -8,7 +8,7 @@ add_subdirectory(VC3D)
 #################
 
 add_executable(vc_render_video src/vc_render_video.cpp)
-target_link_libraries(vc_render_video z5 opencv_core vc_core opencv_videoio)
+target_link_libraries(vc_render_video opencv_core vc_core opencv_videoio)
 
 add_executable(vc_render_tifxyz src/vc_render_tifxyz.cpp)
 target_link_libraries(vc_render_tifxyz vc_core vc_flattening Boost::program_options TIFF::TIFF)
@@ -27,6 +27,19 @@ target_link_libraries(vc_grow_seg_from_segments vc_core vc_tracer)
 
 add_executable(vc_tifxyz2obj src/vc_tifxyz2obj.cpp)
 target_link_libraries(vc_tifxyz2obj vc_core)
+
+add_executable(vc_tifxyz2zarr_sparse src/vc_tifxyz2zarr_sparse.cpp)
+target_link_libraries(vc_tifxyz2zarr_sparse vc_core Boost::program_options)
+
+add_executable(vc_add_ignore_label src/vc_add_ignore_label.cpp)
+target_link_libraries(vc_add_ignore_label
+    vc_core
+    Boost::program_options
+    CGAL::CGAL
+    opencv_core
+    opencv_imgproc
+    opencv_imgcodecs
+)
 
 add_executable(vc_obj2tifxyz src/vc_obj2tifxyz.cpp)
 target_link_libraries(vc_obj2tifxyz vc_core)
@@ -71,7 +84,6 @@ set(vc_diffuse_winding_sources
 add_executable(vc_diffuse_winding ${vc_diffuse_winding_sources})
 target_include_directories(vc_diffuse_winding PRIVATE diffusion)
 target_link_libraries(vc_diffuse_winding
-        z5
         opencv_videoio
         opencv_ximgproc
         vc_core
@@ -97,7 +109,6 @@ target_link_libraries(vc_visualize vc_core Boost::program_options)
 add_executable(vc_ced2d src/vc_ced2d.cpp)
 target_link_libraries(vc_ced2d
     vc_core
-    z5
     opencv_core
     opencv_imgcodecs
     opencv_imgproc
@@ -111,7 +122,7 @@ target_link_libraries(vc_transform_geom vc_core Boost::program_options)
 
 
 add_executable(vc_gen_normalgrids src/vc_gen_normalgrids.cpp diffusion/support.cpp)
-target_link_libraries(vc_gen_normalgrids vc_core z5 Boost::program_options opencv_core opencv_imgproc opencv_ximgproc OpenMP::OpenMP_CXX Ceres::ceres)
+target_link_libraries(vc_gen_normalgrids vc_core Boost::program_options opencv_core opencv_imgproc opencv_ximgproc OpenMP::OpenMP_CXX Ceres::ceres)
 target_include_directories(vc_gen_normalgrids PRIVATE diffusion)
 
 # Read / visualize NormalGridVolume
@@ -151,6 +162,14 @@ target_link_libraries(vc_tifxyz vc_core Boost::program_options opencv_core)
 add_executable(vc_zarr_to_tiff src/vc_zarr_to_tiff.cpp)
 target_link_libraries(vc_zarr_to_tiff vc_core Boost::program_options TIFF::TIFF)
 
+add_executable(vc_zarr_recompress src/vc_zarr_recompress.cpp)
+target_link_libraries(vc_zarr_recompress vc_core)
+target_include_directories(vc_zarr_recompress PRIVATE
+    ${CMAKE_SOURCE_DIR}/libs/c-blosc/blosc
+    ${CMAKE_BINARY_DIR}/libs/c-blosc/blosc
+)
+
+
 # Precompiled headers for CLI apps (reuse vc_core's PCH)
 if(VC_USE_PCH)
     foreach(_app
@@ -166,6 +185,8 @@ if(VC_USE_PCH)
         vc_flatten
         vc_tifxyz_inp_mask
         vc_tifxyz_winding
+        vc_tifxyz2zarr_sparse
+        vc_add_ignore_label
         vc_fill_quadmesh
         vc_tiffxyz_upscale_grounding
         vc_calc_surface_metrics
@@ -183,44 +204,10 @@ if(VC_USE_PCH)
         vc_rgb2tifxyz
         vc_telea_inpaint
         vc_thinning
+        vc_thinning_bench
         vc_tifxyz
         vc_zarr_to_tiff
     )
         target_precompile_headers(${_app} REUSE_FROM vc_core)
     endforeach()
-endif()
-
-# Install targets
-if(VC_INSTALL_APPS)
-install(
-    TARGETS
-        vc_render_video
-        vc_render_tifxyz
-        vc_objrefine
-        vc_grow_seg_from_seed
-        vc_grow_seg_from_segments
-        vc_seg_add_overlap
-        vc_tifxyz2obj
-        vc_obj2tifxyz
-        vc_obj2tifxyz_legacy
-        vc_flatten
-        vc_tifxyz2rgb
-        vc_rgb2tifxyz
-        vc_tifxyz_winding
-        vc_tifxyz_gengt
-        vc_fill_quadmesh
-        vc_calc_surface_metrics
-        vc_diffuse_winding
-        vc_ced2d
-        vc_transform_geom
-        vc_gen_normalgrids
-        vc_ngrids
-        vc_telea_inpaint
-        vc_thinning
-        vc_tifxyz
-        vc_zarr_to_tiff
-        ${extra_apps}
-    RUNTIME DESTINATION bin
-    COMPONENT Programs
-)
 endif()

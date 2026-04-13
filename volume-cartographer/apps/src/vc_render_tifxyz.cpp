@@ -1,4 +1,6 @@
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/cache/HttpMetadataFetcher.hpp"
+#include "vc/core/cache/SimpleCacheFactory.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Tiff.hpp"
@@ -6,7 +8,8 @@
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/flattening/ABFFlattening.hpp"
 
-#include "z5/factory.hxx"
+#include "vc/core/types/Volume.hpp"
+#include "vc/core/types/VcDataset.hpp"
 #include <nlohmann/json.hpp>
 
 #include <opencv2/imgproc.hpp>
@@ -16,6 +19,7 @@
 #include <algorithm>
 #include <atomic>
 #include <boost/program_options.hpp>
+#include <limits>
 #include <mutex>
 #include <cmath>
 #include <set>
@@ -23,6 +27,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <thread>
+#include <unordered_set>
 #include <tiffio.h>
 #include <omp.h>
 
@@ -331,6 +336,266 @@ static std::vector<float> buildOffsetList(int numSlices, double sliceStep, doubl
     return out;
 }
 
+static std::vector<float> buildCompositeOffsetList(
+    int compositeStart, int compositeEnd, double sliceStep, double dsScale)
+{
+    std::vector<float> out;
+    out.reserve(std::max(0, compositeEnd - compositeStart + 1));
+    for (int zi = compositeStart; zi <= compositeEnd; zi++)
+        out.push_back(float(double(zi) * sliceStep * dsScale));
+    return out;
+}
+
+struct ChunkRegion {
+    int minIz = 0, maxIz = -1;
+    int minIy = 0, maxIy = -1;
+    int minIx = 0, maxIx = -1;
+
+    [[nodiscard]] bool valid() const
+    {
+        return minIz <= maxIz && minIy <= maxIy && minIx <= maxIx;
+    }
+};
+
+static ChunkRegion computeChunkRegionForSamples(
+    const cv::Mat_<cv::Vec3f>& base,
+    const cv::Mat_<cv::Vec3f>& dirs,
+    const std::vector<float>& offsets,
+    vc::VcDataset* ds)
+{
+    ChunkRegion invalid;
+    if (!ds || base.empty() || offsets.empty()) return invalid;
+
+    float loX = std::numeric_limits<float>::max();
+    float loY = std::numeric_limits<float>::max();
+    float loZ = std::numeric_limits<float>::max();
+    float hiX = std::numeric_limits<float>::lowest();
+    float hiY = std::numeric_limits<float>::lowest();
+    float hiZ = std::numeric_limits<float>::lowest();
+    bool found = false;
+
+    auto updateBounds = [&](int r, int c) {
+        const auto& pt = base(r, c);
+        if (!std::isfinite(pt[0]) || !std::isfinite(pt[1]) || !std::isfinite(pt[2])) return;
+
+        const auto& dir = dirs(r, c);
+        for (float off : offsets) {
+            float px = pt[0] + dir[0] * off;
+            float py = pt[1] + dir[1] * off;
+            float pz = pt[2] + dir[2] * off;
+            loX = std::min(loX, px); hiX = std::max(hiX, px);
+            loY = std::min(loY, py); hiY = std::max(hiY, py);
+            loZ = std::min(loZ, pz); hiZ = std::max(hiZ, pz);
+            found = true;
+        }
+    };
+
+    const int h = base.rows;
+    const int w = base.cols;
+    for (int c = 0; c < w; c++) {
+        updateBounds(0, c);
+        updateBounds(h - 1, c);
+    }
+    for (int r = 1; r < h - 1; r++) {
+        updateBounds(r, 0);
+        updateBounds(r, w - 1);
+    }
+    for (int r = 32; r < h - 1; r += 32)
+        for (int c = 32; c < w - 1; c += 32)
+            updateBounds(r, c);
+
+    if (!found) return invalid;
+
+    loX -= 2.0f; loY -= 2.0f; loZ -= 2.0f;
+    hiX += 2.0f; hiY += 2.0f; hiZ += 2.0f;
+
+    const auto& chunkShape = ds->defaultChunkShape();
+    const auto& shape = ds->shape();
+
+    ChunkRegion region;
+    region.minIx = std::max(0, int(std::floor(loX / double(chunkShape[2]))));
+    region.maxIx = std::min(int(std::ceil(hiX / double(chunkShape[2]))),
+                            int((shape[2] - 1) / chunkShape[2]));
+    region.minIy = std::max(0, int(std::floor(loY / double(chunkShape[1]))));
+    region.maxIy = std::min(int(std::ceil(hiY / double(chunkShape[1]))),
+                            int((shape[1] - 1) / chunkShape[1]));
+    region.minIz = std::max(0, int(std::floor(loZ / double(chunkShape[0]))));
+    region.maxIz = std::min(int(std::ceil(hiZ / double(chunkShape[0]))),
+                            int((shape[0] - 1) / chunkShape[0]));
+    return region;
+}
+
+static std::string loadCachedRemoteUrl(const std::filesystem::path& volumePath)
+{
+    auto markerPath = volumePath / ".remote_source.json";
+    std::ifstream file(markerPath);
+    if (!file.is_open()) return {};
+
+    try {
+        json marker;
+        file >> marker;
+        if (marker.contains("url") && marker["url"].is_string())
+            return marker["url"].get<std::string>();
+    } catch (...) {
+    }
+    return {};
+}
+
+static bool pathsEquivalent(const std::filesystem::path& a, const std::filesystem::path& b)
+{
+    std::error_code ecA, ecB;
+    auto ca = std::filesystem::weakly_canonical(a, ecA);
+    auto cb = std::filesystem::weakly_canonical(b, ecB);
+    if (!ecA && !ecB) return ca == cb;
+    return a.lexically_normal() == b.lexically_normal();
+}
+
+static std::vector<vc::cache::ChunkKey> collectPrefetchKeysForRows(
+    QuadSurface* surf,
+    vc::VcDataset* ds,
+    int level,
+    const cv::Size& fullSize,
+    const cv::Rect& crop,
+    const cv::Size& tgtSize,
+    float renderScale,
+    float scaleSeg,
+    float dsScale,
+    bool hasAffine,
+    const AffineTransform& aff,
+    uint32_t rowStart,
+    uint32_t rowEnd,
+    uint32_t bandH,
+    int numSlices,
+    double sliceStep,
+    const std::vector<float>& accumOffsets,
+    bool isComposite,
+    int compositeStart,
+    int compositeEnd)
+{
+    std::unordered_set<vc::cache::ChunkKey, vc::cache::ChunkKeyHash> uniq;
+    std::vector<float> offsets = isComposite
+        ? buildCompositeOffsetList(compositeStart, compositeEnd, sliceStep, dsScale)
+        : buildOffsetList(numSlices, sliceStep, dsScale, accumOffsets);
+
+    auto wallStart = std::chrono::steady_clock::now();
+    auto lastPrint = wallStart;
+    uint32_t totalRows = rowEnd > rowStart ? (rowEnd - rowStart) : 0;
+
+    for (uint32_t row = rowStart; row < rowEnd; row++) {
+        uint32_t y0 = row * bandH;
+        uint32_t dy = std::min(bandH, uint32_t(tgtSize.height) - y0);
+
+        float u0, v0;
+        computeCanvasOrigin(fullSize, u0, v0);
+        u0 += float(crop.x);
+        v0 += float(crop.y) + float(y0);
+
+        cv::Mat_<cv::Vec3f> bandPts, bandNrm;
+        genTile(surf, cv::Size(tgtSize.width, int(dy)), renderScale, u0, v0, bandPts, bandNrm);
+
+        cv::Mat_<cv::Vec3f> base, dirs;
+        prepareBaseAndDirs(bandPts, bandNrm, scaleSeg, dsScale, hasAffine, aff, base, dirs);
+
+        auto region = computeChunkRegionForSamples(base, dirs, offsets, ds);
+        if (region.valid()) {
+            for (int iz = region.minIz; iz <= region.maxIz; iz++)
+                for (int iy = region.minIy; iy <= region.maxIy; iy++)
+                    for (int ix = region.minIx; ix <= region.maxIx; ix++)
+                        uniq.insert(vc::cache::ChunkKey{level, iz, iy, ix});
+        }
+
+        auto now = std::chrono::steady_clock::now();
+        double since = std::chrono::duration<double>(now - lastPrint).count();
+        uint32_t done = row - rowStart + 1;
+        if (since >= 1.0 || done == totalRows) {
+            lastPrint = now;
+            double elapsed = std::chrono::duration<double>(now - wallStart).count();
+            double eta = done > 0 ? elapsed * (double(totalRows) / done - 1.0) : 0.0;
+            const char* prefix = g_logFile ? "  " : "\r  ";
+            const char* suffix = g_logFile ? "\n" : "";
+            logPrintf(stderr,
+                      "%sprefetch plan %u/%u rows (%d%%)  %zu chunks  %dm%02ds  eta %dm%02ds%s",
+                      prefix, done, totalRows, totalRows ? int(100.0 * done / totalRows) : 100,
+                      uniq.size(),
+                      int(elapsed) / 60, int(elapsed) % 60,
+                      int(eta) / 60, int(eta) % 60, suffix);
+        }
+    }
+    if (!g_logFile && totalRows > 0) std::fprintf(stderr, "\n");
+
+    std::vector<vc::cache::ChunkKey> keys;
+    keys.reserve(uniq.size());
+    for (const auto& key : uniq) keys.push_back(key);
+    std::sort(keys.begin(), keys.end(), [](const auto& a, const auto& b) {
+        if (a.level != b.level) return a.level < b.level;
+        if (a.iz != b.iz) return a.iz < b.iz;
+        if (a.iy != b.iy) return a.iy < b.iy;
+        return a.ix < b.ix;
+    });
+    return keys;
+}
+
+static bool prefetchChunkKeys(
+    vc::cache::TieredChunkCache* cache,
+    const std::vector<vc::cache::ChunkKey>& keys)
+{
+    if (!cache || keys.empty()) return true;
+
+    auto start = std::chrono::steady_clock::now();
+    auto lastPrint = start;
+    size_t available = cache->countAvailable(keys);
+    size_t lastAvailable = available;
+    size_t idleRetries = 0;
+
+    cache->prefetch(keys);
+
+    while (available < keys.size()) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        available = cache->countAvailable(keys);
+        auto now = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration<double>(now - start).count();
+        double since = std::chrono::duration<double>(now - lastPrint).count();
+
+        if (since >= 0.5 || available == keys.size()) {
+            lastPrint = now;
+            double rate = elapsed > 0 ? double(available) / elapsed : 0.0;
+            double eta = rate > 0 ? double(keys.size() - available) / rate : 0.0;
+            auto stats = cache->stats();
+            const char* prefix = g_logFile ? "  " : "\r  ";
+            const char* suffix = g_logFile ? "\n" : "";
+            logPrintf(stderr,
+                      "%sprefetch %zu/%zu chunks (%d%%)  %.1f chunks/s  pending %zu  %dm%02ds  eta %dm%02ds%s",
+                      prefix, available, keys.size(),
+                      int(100.0 * double(available) / double(keys.size())),
+                      rate, stats.ioPending,
+                      int(elapsed) / 60, int(elapsed) % 60,
+                      int(eta) / 60, int(eta) % 60, suffix);
+        }
+
+        if (available >= keys.size()) break;
+
+        auto stats = cache->stats();
+        if (stats.ioPending == 0 && available == lastAvailable) {
+            idleRetries++;
+            if (idleRetries > 3) {
+                if (!g_logFile) std::fprintf(stderr, "\n");
+                logPrintf(stderr,
+                          "Error: prefetch stalled with %zu/%zu chunks available\n",
+                          available, keys.size());
+                return false;
+            }
+            cache->prefetch(keys);
+        } else {
+            idleRetries = 0;
+        }
+
+        lastAvailable = available;
+    }
+
+    if (!g_logFile) std::fprintf(stderr, "\n");
+    return true;
+}
+
 // Process raw multi-slice results into final per-slice images (accumulation + rotate/flip).
 // Returns one cv::Mat per output slice.
 template <typename T>
@@ -359,8 +624,8 @@ static std::vector<cv::Mat> processRawSlices(std::vector<cv::Mat_<T>>& raw, int 
 // WriteFn: void(const std::vector<cv::Mat>& slices, uint32_t bandIdx, uint32_t bandY0)
 template <typename T, typename WriteFn>
 static void renderBands(
-    QuadSurface* surf, z5::Dataset* ds,
-    ChunkCache<T>* cache,
+    QuadSurface* surf, vc::VcDataset* ds,
+    vc::cache::TieredChunkCache* cache, int level,
     const cv::Size& fullSize, const cv::Rect& crop, const cv::Size& tgtSize,
     float renderScale, float scaleSeg, float dsScale,
     bool hasAffine, const AffineTransform& aff,
@@ -407,10 +672,10 @@ static void renderBands(
             // Composite mode: always u8 — callers always instantiate with T=uint8_t
             cv::Mat_<uint8_t> compOut;
             if constexpr (std::is_same_v<T, uint8_t>) {
-                readCompositeFast(compOut, ds, base, dirs,
+                readCompositeFast(compOut, cache, level, base, dirs,
                                   float(sliceStep * dsScale),
                                   compositeStart, compositeEnd,
-                                  compositeParams, *cache);
+                                  compositeParams);
             }
             cv::Mat s = compOut;
             rotateFlipIfNeeded(s, rotQuad, flipAxis);
@@ -418,7 +683,7 @@ static void renderBands(
         } else {
             // Normal: bulk read + accumulate
             std::vector<cv::Mat_<T>> raw;
-            readMultiSlice(raw, ds, cache, base, dirs, allOffsets);
+            readMultiSlice(raw, cache, level, base, dirs, allOffsets);
             slices = processRawSlices<T>(raw, numSlices, accumOffsets, accumType, cvType, rotQuad, flipAxis);
         }
 
@@ -434,17 +699,12 @@ static void renderBands(
             double elapsed = std::chrono::duration<double>(now - wallStart).count();
             double eta = done > 0 ? elapsed * (double(bandsThis) / done - 1.0) : 0.0;
             double bandsPerSec = elapsed > 0 ? done / elapsed : 0.0;
-            auto cs = cache->stats();
-            uint64_t tot = cs.hits + cs.misses;
-            double hr = tot > 0 ? 100.0 * cs.hits / tot : 0.0;
-            double gbR = cs.bytesRead / (1024.0*1024.0*1024.0);
             const char* prefix = g_logFile ? "  " : "\r  ";
             const char* suffix = g_logFile ? "\n" : "";
-            logPrintf(stderr, "%sband %u/%u (%d%%)  %.1f bands/s  %dm%02ds  eta %dm%02ds  cache %.1f%% evict %lu read %.2fGB%s",
+            logPrintf(stderr, "%sband %u/%u (%d%%)  %.1f bands/s  %dm%02ds  eta %dm%02ds%s",
                 prefix, done, bandsThis, int(100.0 * done / bandsThis),
                 bandsPerSec,
-                int(elapsed)/60, int(elapsed)%60, int(eta)/60, int(eta)%60,
-                hr, (unsigned long)cs.evictions, gbR, suffix);
+                int(elapsed)/60, int(elapsed)%60, int(eta)/60, int(eta)%60, suffix);
         }
     }
     if (!g_logFile) std::fprintf(stderr, "\n");
@@ -480,8 +740,8 @@ static void writeTifBand(std::vector<TiffWriter>& writers,
 
 template <typename T>
 static void renderTiles(
-    QuadSurface* surf, z5::Dataset* ds,
-    ChunkCache<T>* cache,
+    QuadSurface* surf, vc::VcDataset* ds,
+    vc::cache::TieredChunkCache* cache, int level,
     const cv::Size& fullSize, const cv::Rect& crop, const cv::Size& tgtSize,
     float renderScale, float scaleSeg, float dsScale,
     bool hasAffine, const AffineTransform& aff,
@@ -493,10 +753,10 @@ static void renderTiles(
     int numParts, int partId,
     int cvType,
     // Zarr output
-    z5::Dataset* dsOut, const std::vector<size_t>& chunks0,
+    vc::VcDataset* dsOut, const std::vector<size_t>& chunks0,
     size_t tilesXSrc, size_t tilesYSrc,
     // Pyramid datasets L1-L5 (empty = no inline pyramid)
-    const std::vector<z5::Dataset*>& pyramidDs,
+    const std::vector<vc::VcDataset*>& pyramidDs,
     // TIF output (optional)
     std::vector<TiffWriter>* tifWriters, uint32_t tiffTileH,
     bool quickTif,
@@ -572,14 +832,13 @@ static void renderTiles(
                 if (needsRotFlip)
                     mapTileIndex(int(tx), int(ty), int(tilesXSrc), int(tilesYSrc),
                                  std::max(rotQuad, 0), flipAxis, dTx, dTy, dTX, dTY);
-                z5::types::ShapeType cid = {0, size_t(dTy), size_t(dTx)};
-                if (dsOut->chunkExists(cid)) {
+                if (dsOut->chunkExists(0, size_t(dTy), size_t(dTx))) {
                     // Still need to scatter into pyramid accum buffers
                     // No rotation when inline pyramid is active
                     if (!pyrAccum.empty()) {
                         size_t chunkZ = chunks0[0], chunkY = chunks0[1], chunkX = chunks0[2];
                         std::vector<T> existingBuf(chunkZ * chunkY * chunkX, T(0));
-                        dsOut->readChunk(cid, existingBuf.data());
+                        dsOut->readChunk(0, size_t(dTy), size_t(dTx), existingBuf.data());
                         uint32_t dxTile = std::min(uint32_t(CW), uint32_t(tgtSize.width) - tx * uint32_t(CW));
                         size_t dy_actual = std::min(chunkY, size_t(dy));
                         size_t dx_actual = std::min(chunkX, size_t(dxTile));
@@ -620,15 +879,15 @@ static void renderTiles(
             if (isComposite) {
                 if constexpr (std::is_same_v<T, uint8_t>) {
                     cv::Mat_<uint8_t> compOut;
-                    readCompositeFast(compOut, ds, base, dirs,
+                    readCompositeFast(compOut, cache, level, base, dirs,
                                       float(sliceStep * dsScale),
                                       compositeStart, compositeEnd,
-                                      compositeParams, *cache);
+                                      compositeParams);
                     raw.resize(1);
                     raw[0] = compOut;
                 }
             } else {
-                sampleTileSlices(raw, ds, cache, base, dirs, allOffsets);
+                sampleTileSlices(raw, cache, level, base, dirs, allOffsets);
             }
 
             // Accumulate (no rotation — applied per-zarr-chunk and per-tif-band separately)
@@ -667,8 +926,8 @@ static void renderTiles(
                         std::memcpy(&chunkBuf[sliceOff + yy * chunkX], row, dx_actual * sizeof(T));
                     }
                 }
-                z5::types::ShapeType chunkId = {0, size_t(dstTy), size_t(dstTx)};
-                dsOut->writeChunk(chunkId, chunkBuf.data());
+                dsOut->writeChunk(0, size_t(dstTy), size_t(dstTx),
+                                  chunkBuf.data(), chunkBuf.size() * sizeof(T));
 
                 // Scatter L0 tile into L1 pyramid accumulation buffer
                 // No rotation when inline pyramid is active, so tx/ty == dstTx/dstTy.
@@ -743,8 +1002,8 @@ static void renderTiles(
 
                 // Write each column's accumulation buffer as a zarr chunk
                 for (size_t cx = 0; cx < pa.bufs.size(); cx++) {
-                    z5::types::ShapeType chunkId = {0, pyrChunkRow, cx};
-                    pyramidDs[li]->writeChunk(chunkId, pa.bufs[cx].data());
+                    pyramidDs[li]->writeChunk(0, pyrChunkRow, cx,
+                                              pa.bufs[cx].data(), pa.bufs[cx].size() * sizeof(T));
                 }
 
                 // Cascade: scatter this level's buffers into the next level's accum
@@ -783,17 +1042,12 @@ static void renderTiles(
             // Chunks written this part: done tile-rows × numTileCols chunks per row
             double chunksWritten = double(done) * double(numTileCols);
             double chunksPerSec = elapsed > 0 ? chunksWritten / elapsed : 0.0;
-            auto cs = cache->stats();
-            uint64_t tot = cs.hits + cs.misses;
-            double hr = tot > 0 ? 100.0 * cs.hits / tot : 0.0;
-            double gbR = cs.bytesRead / (1024.0*1024.0*1024.0);
             const char* prefix = g_logFile ? "  " : "\r  ";
             const char* suffix = g_logFile ? "\n" : "";
-            logPrintf(stderr, "%stile-row %u/%u (%d%%)  %.1f chunks/s  %dm%02ds  eta %dm%02ds  cache %.1f%% evict %lu read %.2fGB%s",
+            logPrintf(stderr, "%stile-row %u/%u (%d%%)  %.1f chunks/s  %dm%02ds  eta %dm%02ds%s",
                 prefix, done, tileRowsThis, int(100.0 * done / tileRowsThis),
                 chunksPerSec,
-                int(elapsed)/60, int(elapsed)%60, int(eta)/60, int(eta)%60,
-                hr, (unsigned long)cs.evictions, gbR, suffix);
+                int(elapsed)/60, int(elapsed)%60, int(eta)/60, int(eta)%60, suffix);
         }
     }
     if (!g_logFile) std::fprintf(stderr, "\n");
@@ -818,6 +1072,8 @@ int main(int argc, char *argv[])
         ("help,h", "Show this help message")
         ("segmentation,s", po::value<std::string>(), "Path to a single tifxyz segmentation folder")
         ("cache-gb", po::value<size_t>()->default_value(16), "Zarr chunk cache size in GB")
+        ("prefetch-remote", po::bool_switch()->default_value(false), "Prefetch required remote chunks into the existing staged cache before rendering")
+        ("remote-url", po::value<std::string>(), "Remote OME-Zarr URL for remote cache streaming/prefetch (optional if --volume cache already records it)")
         ("log-path", po::value<std::string>(), "Log all output to file instead of stdout/stderr")
         ("timeout", po::value<int>()->default_value(0), "Kill process if not finished within N minutes")
         ("num-slices,n", po::value<int>()->default_value(1), "Number of slices to render")
@@ -915,6 +1171,18 @@ int main(int argc, char *argv[])
     }
 
     std::filesystem::path vol_path = parsed["volume"].as<std::string>();
+    const bool prefetchRemote = parsed["prefetch-remote"].as<bool>();
+    std::string remoteUrl = parsed.count("remote-url") ? parsed["remote-url"].as<std::string>() : "";
+    if (remoteUrl.empty()) {
+        remoteUrl = loadCachedRemoteUrl(vol_path);
+        if (!remoteUrl.empty())
+            logPrintf(stdout, "Detected cached remote source: %s\n", remoteUrl.c_str());
+    }
+    const bool useRemoteCache = !remoteUrl.empty();
+    if (prefetchRemote && !useRemoteCache) {
+        logPrintf(stderr, "Error: --prefetch-remote requires --remote-url or a cached remote source marker under --volume\n");
+        return EXIT_FAILURE;
+    }
 
     if (!parsed.count("segmentation")) { logPrintf(stderr, "Error: --segmentation required\n"); return EXIT_FAILURE; }
     std::filesystem::path seg_path = parsed["segmentation"].as<std::string>();
@@ -1023,22 +1291,70 @@ int main(int argc, char *argv[])
     }
 
     // --- Open source volume ---
-    z5::filesystem::handle::Group group(vol_path, z5::FileMode::FileMode::r);
-    z5::filesystem::handle::Dataset ds_handle(group, std::to_string(group_idx),
-        json::parse(std::ifstream(vol_path/std::to_string(group_idx)/".zarray")).value<std::string>("dimension_separator","."));
-    auto ds = z5::filesystem::openDataset(ds_handle);
-    {
-        std::ostringstream oss; oss << ds->shape();
-        logPrintf(stdout, "zarr dataset size for group %d %s\n", group_idx, oss.str().c_str());
+    std::shared_ptr<Volume> remoteVolume;
+    std::unique_ptr<vc::VcDataset> ownedDs;
+    vc::VcDataset* ds = nullptr;
+    const int cacheLevel = useRemoteCache ? group_idx : 0;
+
+    const size_t cache_bytes = parsed["cache-gb"].as<size_t>() * 1024ull * 1024ull * 1024ull;
+    std::unique_ptr<vc::cache::TieredChunkCache> ownedChunkCache;
+    vc::cache::TieredChunkCache* chunk_cache = nullptr;
+
+    if (useRemoteCache) {
+        const std::string expectedId = vc::cache::deriveRemoteVolumeId(remoteUrl);
+        if (expectedId.empty()) {
+            logPrintf(stderr, "Error: could not derive remote volume id from --remote-url\n");
+            return EXIT_FAILURE;
+        }
+        if (vol_path.filename() != expectedId) {
+            logPrintf(stderr,
+                      "Error: --volume path '%s' does not match the staged cache directory for --remote-url '%s' (expected final path component '%s')\n",
+                      vol_path.string().c_str(), remoteUrl.c_str(), expectedId.c_str());
+            return EXIT_FAILURE;
+        }
+
+        try {
+            remoteVolume = Volume::NewFromUrl(remoteUrl, vol_path.parent_path());
+            remoteVolume->setCacheBudget(cache_bytes, 0);
+            if (!pathsEquivalent(remoteVolume->path(), vol_path)) {
+                logPrintf(stderr,
+                          "Error: remote cache path mismatch; refusing to use staged cache '%s' because remote metadata resolved to '%s'\n",
+                          vol_path.string().c_str(),
+                          remoteVolume->path().string().c_str());
+                return EXIT_FAILURE;
+            }
+            ds = remoteVolume->zarrDataset(group_idx);
+            if (!ds) {
+                logPrintf(stderr, "Error: group index %d not available in remote volume cache\n", group_idx);
+                return EXIT_FAILURE;
+            }
+            chunk_cache = remoteVolume->tieredCache();
+            logPrintf(stdout, "Remote cache streaming: reusing staged cache at %s\n", remoteVolume->path().string().c_str());
+        } catch (const std::exception& e) {
+            logPrintf(stderr, "Error opening remote volume cache: %s\n", e.what());
+            return EXIT_FAILURE;
+        }
+    } else {
+        ownedDs = std::make_unique<vc::VcDataset>(vol_path / std::to_string(group_idx));
+        ds = ownedDs.get();
+        ownedChunkCache = vc::cache::createSimpleTieredCache(ds, cache_bytes, ds->path());
+        chunk_cache = ownedChunkCache.get();
     }
 
-    const bool output_is_u16 = (ds->getDtype() == z5::types::Datatype::uint16);
+    {
+        std::ostringstream oss;
+        for (auto v : ds->shape()) oss << v << " ";
+        logPrintf(stdout, "zarr dataset size for group %d [%s]\n", group_idx, oss.str().c_str());
+    }
+
+    const bool output_is_u16 = (ds->getDtype() == vc::VcDtype::uint16);
     logPrintf(stdout, "Source dtype: %s\n", output_is_u16 ? "uint16" : "uint8");
     if (output_is_u16 && isCompositeMode)
         logPrintf(stderr, "Warning: composite forces 8-bit output (source is 16-bit)\n");
     {
-        std::ostringstream oss; oss << ds->chunking().blockShape();
-        logPrintf(stdout, "chunk shape %s\n", oss.str().c_str());
+        std::ostringstream oss;
+        for (auto v : ds->defaultChunkShape()) oss << v << " ";
+        logPrintf(stdout, "chunk shape [%s]\n", oss.str().c_str());
     }
 
     int rotQuadGlobal = -1;
@@ -1056,10 +1372,6 @@ int main(int argc, char *argv[])
     }
     if (wantTif) std::filesystem::create_directories(tifOutputArg);
 
-    const size_t cache_bytes = parsed["cache-gb"].as<size_t>() * 1024ull * 1024ull * 1024ull;
-    ChunkCache<uint8_t> chunk_cache_u8(cache_bytes);
-    ChunkCache<uint16_t> chunk_cache_u16(cache_bytes);
-
     if (int t = parsed["timeout"].as<int>(); t > 0) {
         logPrintf(stdout, "Timeout: %d minutes\n", t);
         std::thread([t]{ std::this_thread::sleep_for(std::chrono::minutes(t)); logPrintf(stderr, "\n[timeout]\n"); if (g_logFile) std::fflush(g_logFile); _exit(2); }).detach();
@@ -1068,7 +1380,7 @@ int main(int argc, char *argv[])
     // ============================================================
     // process_one: render a single segmentation to output
     // ============================================================
-    auto process_one = [&](const std::filesystem::path& seg_folder) {
+    auto process_one = [&](const std::filesystem::path& seg_folder) -> bool {
         {
             std::ostringstream oss;
             oss << "Rendering: " << seg_folder.string();
@@ -1079,7 +1391,7 @@ int main(int argc, char *argv[])
 
         std::unique_ptr<QuadSurface> surf;
         try { surf = load_quad_from_tifxyz(seg_folder); }
-        catch (...) { logPrintf(stderr, "Error loading: %s\n", seg_folder.string().c_str()); return; }
+        catch (...) { logPrintf(stderr, "Error loading: %s\n", seg_folder.string().c_str()); return false; }
 
         if (parsed["flatten"].as<bool>()) {
             logPrintf(stdout, "Applying ABF++ flattening...\n");
@@ -1140,7 +1452,7 @@ int main(int argc, char *argv[])
         int cx = parsed["crop-x"].as<int>(), cy = parsed["crop-y"].as<int>();
         int cw = parsed["crop-width"].as<int>(), ch = parsed["crop-height"].as<int>();
         bool manual = cw > 0 && ch > 0, autoCrop = parsed["auto-crop"].as<bool>();
-        if (autoCrop && manual) { logPrintf(stderr, "Error: --auto-crop and --crop-* are mutually exclusive\n"); return; }
+        if (autoCrop && manual) { logPrintf(stderr, "Error: --auto-crop and --crop-* are mutually exclusive\n"); return false; }
 
         if (autoCrop && col_max >= col_min) {
             double sx = render_scale / surf->_scale[0], sy = render_scale / surf->_scale[1];
@@ -1151,7 +1463,7 @@ int main(int argc, char *argv[])
             logPrintf(stdout, "auto-crop: [%d×%d from (%d,%d)]\n", crop.width, crop.height, crop.x, crop.y);
         } else if (manual) {
             crop = cv::Rect(cx, cy, cw, ch) & canvasROI;
-            if (crop.width <= 0 || crop.height <= 0) { logPrintf(stderr, "Error: crop outside canvas\n"); return; }
+            if (crop.width <= 0 || crop.height <= 0) { logPrintf(stderr, "Error: crop outside canvas\n"); return false; }
             tgt_size = crop.size();
         }
 
@@ -1169,8 +1481,8 @@ int main(int argc, char *argv[])
         const size_t CH = 128, CW = 128;
         size_t baseZ = isCompositeMode ? 1 : size_t(std::max(1, num_slices));
         std::vector<size_t> chunks0;
-        std::unique_ptr<z5::Dataset> dsOut;
-        z5::filesystem::handle::File outFile(wantZarr ? zarrOutputArg : "/dev/null");
+        std::unique_ptr<vc::VcDataset> dsOut;
+        std::filesystem::path outFilePath(wantZarr ? zarrOutputArg : "/dev/null");
         size_t tilesYSrc = 0, tilesXSrc = 0;
 
         if (wantZarr) {
@@ -1178,36 +1490,35 @@ int main(int argc, char *argv[])
             if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(zarrXY.width, zarrXY.height);
             size_t baseY = zarrXY.height, baseX = zarrXY.width;
 
-            outFile = z5::filesystem::handle::File(zarrOutputArg);
+            outFilePath = zarrOutputArg;
             std::vector<size_t> shape0 = {baseZ, baseY, baseX};
             chunks0 = {shape0[0], std::min(CH, shape0[1]), std::min(CW, shape0[2])};
-            json compOpts = {{"cname","zstd"},{"clevel",1},{"shuffle",0}};
-            std::string dtype = useU16 ? "uint16" : "uint8";
+            auto vcDtype = useU16 ? vc::VcDtype::uint16 : vc::VcDtype::uint8;
 
             if (pre_flag) {
                 logPrintf(stdout, "[pre] creating zarr + all levels...\n");
-                z5::createFile(outFile, true);
-                z5::createDataset(outFile, "0", dtype, shape0, chunks0, std::string("blosc"), compOpts);
+                std::filesystem::create_directories(outFilePath);
+                vc::createZarrDataset(outFilePath, "0", shape0, chunks0, vcDtype, "blosc");
                 logPrintf(stdout, "[pre] L0 shape: [%zu,%zu,%zu]\n", shape0[0], shape0[1], shape0[2]);
                 if (wantPyramid)
-                    createPyramidDatasets(outFile, shape0, CH, CW, useU16);
+                    createPyramidDatasets(outFilePath, shape0, CH, CW, useU16);
 
                 cv::Size attrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
-                writeZarrAttrs(outFile, vol_path, group_idx, baseZ, slice_step, accum_step,
+                writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW);
-                return;
+                return true;
             } else if (numParts > 1) {
                 if (!std::filesystem::exists(std::filesystem::path(zarrOutputArg) / "0" / ".zarray")) {
-                    logPrintf(stderr, "Error: run --pre first in multi-part mode\n"); return;
+                    logPrintf(stderr, "Error: run --pre first in multi-part mode\n"); return false;
                 }
-                dsOut = z5::openDataset(outFile, "0");
+                dsOut = std::make_unique<vc::VcDataset>(outFilePath / "0");
             } else if (resumeFlag && std::filesystem::exists(std::filesystem::path(zarrOutputArg) / "0" / ".zarray")) {
-                dsOut = z5::openDataset(outFile, "0");
+                dsOut = std::make_unique<vc::VcDataset>(outFilePath / "0");
                 logPrintf(stdout, "[resume] opening existing zarr\n");
             } else {
-                z5::createFile(outFile, true);
-                dsOut = z5::createDataset(outFile, "0", dtype, shape0, chunks0, std::string("blosc"), compOpts);
+                std::filesystem::create_directories(outFilePath);
+                dsOut = vc::createZarrDataset(outFilePath, "0", shape0, chunks0, vcDtype, "blosc");
             }
 
             tilesYSrc = (tgt_size.height + CH - 1) / CH;
@@ -1241,7 +1552,7 @@ int main(int argc, char *argv[])
                 bool all = true;
                 for (int z = 0; z < tifSlices; z++) if (!std::filesystem::exists(makePartPath(z))) { all = false; break; }
                 if (all) {
-                    if (!wantZarr) { logPrintf(stdout, "[tif] all slices exist, skipping.\n"); return; }
+                    if (!wantZarr) { logPrintf(stdout, "[tif] all slices exist, skipping.\n"); return true; }
                     logPrintf(stdout, "[tif] all slices exist, skipping tif output.\n");
                     tifSkip = true;
                 }
@@ -1259,21 +1570,59 @@ int main(int argc, char *argv[])
         // Inline pyramid only works without rotation/flip (accumulation assumes
         // source tile-rows map 1:1 to destination tile-rows for row-group flushing)
         const bool inlinePyramid = wantZarr && wantPyramid && !pre_flag && !hasRotFlip;
-        std::vector<z5::Dataset*> pyramidDs;
-        std::vector<std::unique_ptr<z5::Dataset>> pyramidOwned;
+        std::vector<vc::VcDataset*> pyramidDs;
+        std::vector<std::unique_ptr<vc::VcDataset>> pyramidOwned;
         if (wantZarr && wantPyramid && !pre_flag) {
             // Single-part: create datasets now; multi-part/resume: already created them
             if (numParts <= 1 && !resumeFlag) {
                 cv::Size zarrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(zarrXY.width, zarrXY.height);
                 std::vector<size_t> shape0 = {baseZ, size_t(zarrXY.height), size_t(zarrXY.width)};
-                createPyramidDatasets(outFile, shape0, CH, CW, useU16);
+                createPyramidDatasets(outFilePath, shape0, CH, CW, useU16);
             }
             if (inlinePyramid) {
                 for (int level = 1; level <= 5; level++) {
-                    pyramidOwned.push_back(z5::openDataset(outFile, std::to_string(level)));
+                    pyramidOwned.push_back(std::make_unique<vc::VcDataset>(outFilePath / std::to_string(level)));
                     pyramidDs.push_back(pyramidOwned.back().get());
                 }
+            }
+        }
+
+        if (prefetchRemote) {
+            constexpr uint32_t kPrefetchBandH = 128;
+            uint32_t rowStart = 0;
+            uint32_t rowEnd = 0;
+            if (wantZarr) {
+                uint32_t totalRows = static_cast<uint32_t>(tilesYSrc);
+                uint32_t rowsPerPart = (totalRows + uint32_t(numParts) - 1) / uint32_t(numParts);
+                if (numParts > 1 && inlinePyramid) {
+                    constexpr uint32_t kPyrAlign = 32;
+                    rowsPerPart = ((rowsPerPart + kPyrAlign - 1) / kPyrAlign) * kPyrAlign;
+                }
+                rowStart = uint32_t(partId) * rowsPerPart;
+                rowEnd = std::min(rowStart + rowsPerPart, totalRows);
+            } else {
+                uint32_t totalRows = (uint32_t(tgt_size.height) + kPrefetchBandH - 1) / kPrefetchBandH;
+                uint32_t rowsPerPart = (totalRows + uint32_t(numParts) - 1) / uint32_t(numParts);
+                rowStart = uint32_t(partId) * rowsPerPart;
+                rowEnd = std::min(rowStart + rowsPerPart, totalRows);
+            }
+
+            auto prefetchKeys = collectPrefetchKeysForRows(
+                surf.get(), ds, cacheLevel,
+                full_size, crop, tgt_size,
+                float(render_scale), scale_seg, ds_scale,
+                hasAffine, affineTransform,
+                rowStart, rowEnd, kPrefetchBandH,
+                num_slices, slice_step, accumOffsets,
+                isCompositeMode, compositeStart, compositeEnd);
+
+            logPrintf(stdout, "Prefetch: %zu chunk(s) across rows %u..%u\n",
+                      prefetchKeys.size(),
+                      rowStart,
+                      rowEnd > rowStart ? rowEnd - 1 : rowStart);
+            if (!prefetchChunkKeys(chunk_cache, prefetchKeys)) {
+                return false;
             }
         }
 
@@ -1282,7 +1631,7 @@ int main(int argc, char *argv[])
             if (wantZarr) {
                 // Tile-based: OMP-parallel over output zarr chunks
                 if (useU16)
-                    renderTiles<uint16_t>(surf.get(), ds.get(), &chunk_cache_u16,
+                    renderTiles<uint16_t>(surf.get(), ds, chunk_cache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
@@ -1292,7 +1641,7 @@ int main(int argc, char *argv[])
                         tifWriters.empty() ? nullptr : &tifWriters, tiffTileH, quickTif,
                         resumeFlag);
                 else
-                    renderTiles<uint8_t>(surf.get(), ds.get(), &chunk_cache_u8,
+                    renderTiles<uint8_t>(surf.get(), ds, chunk_cache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
@@ -1324,13 +1673,13 @@ int main(int argc, char *argv[])
                 };
 
                 if (useU16)
-                    renderBands<uint16_t>(surf.get(), ds.get(), &chunk_cache_u16,
+                    renderBands<uint16_t>(surf.get(), ds, chunk_cache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
                         compositeParams, rotQuad, flip_axis, numParts, partId, cvType, bandH, writerFn);
                 else
-                    renderBands<uint8_t>(surf.get(), ds.get(), &chunk_cache_u8,
+                    renderBands<uint8_t>(surf.get(), ds, chunk_cache, cacheLevel,
                         full_size, crop, tgt_size, float(render_scale), scale_seg, ds_scale,
                         hasAffine, affineTransform, num_slices, slice_step,
                         accumOffsets, accumType, isCompositeMode, compositeStart, compositeEnd,
@@ -1346,8 +1695,8 @@ int main(int argc, char *argv[])
             if (wantPyramid && hasRotFlip) {
                 logPrintf(stdout, "[pyramid] building from L0...\n");
                 for (int level = 1; level <= 5; level++) {
-                    if (useU16) buildPyramidLevel<uint16_t>(outFile, level, CH, CW, numParts, partId);
-                    else        buildPyramidLevel<uint8_t>(outFile, level, CH, CW, numParts, partId);
+                    if (useU16) buildPyramidLevel<uint16_t>(outFilePath, level, CH, CW, numParts, partId);
+                    else        buildPyramidLevel<uint8_t>(outFilePath, level, CH, CW, numParts, partId);
                 }
             }
 
@@ -1355,26 +1704,15 @@ int main(int argc, char *argv[])
             if (numParts <= 1) {
                 cv::Size attrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
-                writeZarrAttrs(outFile, vol_path, group_idx, baseZ, slice_step, accum_step,
+                writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW);
             }
         }
+        return true;
     };
 
-    process_one(seg_path);
-
-    // Print final cache stats
-    auto printStats = [](const char* name, const auto& s) {
-        uint64_t tot = s.hits + s.misses;
-        if (tot == 0) return;
-        logPrintf(stdout, "[%s cache] hits=%lu miss=%lu rate=%.1f%% evict=%lu read=%.2fGB re-read=%lu(%.2fGB)\n",
-                  name, (unsigned long)s.hits, (unsigned long)s.misses,
-                  100.0*s.hits/tot, (unsigned long)s.evictions,
-                  s.bytesRead/(1024.0*1024.0*1024.0),
-                  (unsigned long)s.reReads, s.reReadBytes/(1024.0*1024.0*1024.0));
-    };
-    printStats("u8", chunk_cache_u8.stats());
-    printStats("u16", chunk_cache_u16.stats());
+    if (!process_one(seg_path))
+        return EXIT_FAILURE;
 
     stopLogFlusher();
     return EXIT_SUCCESS;

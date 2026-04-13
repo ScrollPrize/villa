@@ -5,7 +5,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 
-#include "z5/factory.hxx"
+#include "vc/core/types/VcDataset.hpp"
 #include <nlohmann/json.hpp>
 
 #include <opencv2/imgcodecs.hpp>
@@ -819,7 +819,7 @@ int main(int argc, char *argv[])
                     continue;
                 
                 
-                cv::Vec3f ptr = surfs[i]->pointer();
+                cv::Vec3f ptr(0, 0, 0);
                 float res = surfs[i]->pointTo(ptr, surf_points[0](p), 2.0);
                 
                 if (res < 0 || res >= 2)

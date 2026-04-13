@@ -6,6 +6,36 @@ import torch
 from torch.utils.data import Sampler
 
 
+class StatefulShuffledSampler(Sampler[int]):
+    """
+    Shuffle once, then keep sampling from a persistent cursor across __iter__ calls.
+
+    This prevents repeats across epoch boundaries until the full dataset order has
+    been exhausted, even when training stops each epoch early via batch limits.
+    """
+
+    def __init__(self, num_samples: int, *, seed: int = 0):
+        self.num_samples = int(num_samples)
+        if self.num_samples <= 0:
+            raise ValueError(f"num_samples must be > 0, got {num_samples}")
+
+        generator = torch.Generator()
+        generator.manual_seed(int(seed))
+        self._order = torch.randperm(self.num_samples, generator=generator).tolist()
+        self._cursor = 0
+
+    def __len__(self) -> int:
+        return int(self.num_samples)
+
+    def __iter__(self) -> Iterator[int]:
+        for _ in range(self.num_samples):
+            idx = int(self._order[self._cursor])
+            self._cursor += 1
+            if self._cursor >= self.num_samples:
+                self._cursor = 0
+            yield idx
+
+
 class GroupStratifiedBatchSampler(Sampler[List[int]]):
     def __init__(
         self,
@@ -86,4 +116,3 @@ class GroupStratifiedBatchSampler(Sampler[List[int]]):
             # mix groups within the batch
             self._rng.shuffle(batch)
             yield batch
-

@@ -4,7 +4,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
-#include "z5/factory.hxx"
+#include "vc/core/types/VcDataset.hpp"
 #include <nlohmann/json.hpp>
 
 #include <filesystem>

@@ -5,8 +5,8 @@
 #include "../SegmentationModule.hpp"
 #include "../SegmentationWidget.hpp"
 
-#include "../../CVolumeViewer.hpp"
-#include "../../CSurfaceCollection.hpp"
+#include "../../tiled/CTiledVolumeViewer.hpp"
+#include "../../CState.hpp"
 #include "../../ViewerManager.hpp"
 #include "../../SurfacePanelController.hpp"
 
@@ -48,11 +48,11 @@
 
 Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth);
 
+const QString kCopyLatestSentinel = QStringLiteral("copy_displacement_latest");
+const QString kDenseLatestSentinel = QStringLiteral("extrap_displacement_latest");
+
 namespace
 {
-const QString kDenseLatestSentinel = QStringLiteral("extrap_displacement_latest");
-const QString kCopyLatestSentinel = QStringLiteral("copy_displacement_latest");
-
 QString cacheRootForVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
 {
     if (!pkg) {
@@ -63,6 +63,9 @@ QString cacheRootForVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
     return QDir(base).filePath(QStringLiteral("cache"));
 }
 
+// NOTE: SegmentationGrowth.cpp has an equivalent ensureGenerationsChannel with a bool
+// return value. These two live in separate anonymous namespaces (different TUs) and
+// cannot easily be merged without a shared header; keep them in sync if modified.
 void ensureGenerationsChannel(QuadSurface* surface)
 {
     if (!surface) {
@@ -119,7 +122,7 @@ std::optional<std::pair<int, int>> worldToGridIndexApprox(QuadSurface* surface,
     }
 
     if (!pointerSeedValid) {
-        pointerSeed = surface->pointer();
+        pointerSeed = cv::Vec3f(0, 0, 0);
         pointerSeedValid = true;
     }
 
@@ -608,7 +611,7 @@ void refreshSegmentationViewers(ViewerManager* manager)
         return;
     }
 
-    manager->forEachViewer([](CVolumeViewer* viewer) {
+    manager->forEachViewer([](CTiledVolumeViewer* viewer) {
         if (!viewer) {
             return;
         }
@@ -619,7 +622,6 @@ void refreshSegmentationViewers(ViewerManager* manager)
         }
     });
 }
-
 struct DenseDisplacementJob
 {
     QString socketPath;
@@ -750,18 +752,37 @@ nlohmann::json sendSocketJsonRequest(const QString& socketPath, const nlohmann::
     }
 
     const std::string requestPayload = request.dump() + "\n";
-    if (::send(sock, requestPayload.c_str(), requestPayload.size(), 0) < 0) {
-        ::close(sock);
-        throw std::runtime_error("Failed to send dense displacement request.");
+    const char* ptr = requestPayload.c_str();
+    size_t remaining = requestPayload.size();
+    while (remaining > 0) {
+        ssize_t sent = ::send(sock, ptr, remaining, 0);
+        if (sent < 0) {
+            ::close(sock);
+            throw std::runtime_error("Failed to send dense displacement request.");
+        }
+        ptr += sent;
+        remaining -= sent;
     }
 
+    struct timeval tv;
+    tv.tv_sec = 300;  // 5 minute timeout
+    tv.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
     std::string responsePayload;
-    char ch = 0;
-    while (::recv(sock, &ch, 1, 0) == 1) {
-        if (ch == '\n') {
-            break;
+    char buf[4096];
+    ssize_t n;
+    while ((n = ::recv(sock, buf, sizeof(buf), 0)) > 0) {
+        for (ssize_t i = 0; i < n; ++i) {
+            if (buf[i] == '\n') {
+                ::close(sock);
+                if (responsePayload.empty()) {
+                    throw std::runtime_error("Dense displacement service returned an empty response.");
+                }
+                return nlohmann::json::parse(responsePayload);
+            }
+            responsePayload.push_back(buf[i]);
         }
-        responsePayload.push_back(ch);
     }
     ::close(sock);
 
@@ -802,6 +823,107 @@ std::string makeUniqueSegmentId(const std::filesystem::path& pathsDir, const std
     return candidate;
 }
 
+TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
+{
+    TracerGrowthResult result;
+    std::vector<std::filesystem::path> temporaryPaths;
+    temporaryPaths.reserve(3);
+    if (!job.tifxyzInputPath.isEmpty()) {
+        temporaryPaths.emplace_back(job.tifxyzInputPath.toStdString());
+    }
+
+    auto finalizeResult = [&]() -> TracerGrowthResult {
+        result.temporarySurfacePaths.clear();
+        result.temporarySurfacePaths.reserve(temporaryPaths.size());
+        for (const auto& path : temporaryPaths) {
+            if (!path.empty()) {
+                result.temporarySurfacePaths.push_back(path);
+            }
+        }
+        return result;
+    };
+
+    nlohmann::json request;
+    request["request_type"] = "displacement_copy_grow";
+    request["tifxyz_path"] = job.tifxyzInputPath.toStdString();
+    request["volume_path"] = job.volumeZarrPath.toStdString();
+    request["volume_scale"] = std::max(0, job.volumeScale);
+    request["checkpoint_path"] = job.checkpointPath.toStdString();
+    request["tta_merge_method"] = job.ttaMergeMethod.toStdString();
+    request["tta_outlier_drop_thresh"] = job.ttaOutlierDropThresh;
+
+    switch (job.ttaMode) {
+    case DenseTtaMode::Rotate3:
+        request["tta"] = true;
+        request["tta_transform"] = "rotate3";
+        break;
+    case DenseTtaMode::None:
+        request["tta"] = false;
+        break;
+    case DenseTtaMode::Mirror:
+    default:
+        request["tta"] = true;
+        request["tta_transform"] = "mirror";
+        break;
+    }
+
+    if (job.customParams) {
+        auto copyArgsIt = job.customParams->find("copy_args");
+        if (copyArgsIt != job.customParams->end() && copyArgsIt->is_object()) {
+            request["copy_args"] = *copyArgsIt;
+        }
+        auto copyOverridesIt = job.customParams->find("copy_overrides");
+        if (copyOverridesIt != job.customParams->end() && copyOverridesIt->is_object()) {
+            request["overrides"] = *copyOverridesIt;
+        }
+    }
+
+    nlohmann::json response;
+    try {
+        response = sendSocketJsonRequest(job.socketPath, request);
+    } catch (const std::exception& ex) {
+        result.error = QStringLiteral("Displacement copy request failed: %1").arg(ex.what());
+        return finalizeResult();
+    }
+
+    if (response.contains("error")) {
+        QString serviceError;
+        if (response["error"].is_string()) {
+            serviceError = QString::fromStdString(response["error"].get<std::string>());
+        } else {
+            serviceError = QString::fromStdString(response["error"].dump());
+        }
+        result.error = QStringLiteral("Displacement copy service error: %1").arg(serviceError);
+        return finalizeResult();
+    }
+
+    if (!response.contains("output_tifxyz_paths") || !response["output_tifxyz_paths"].is_object()) {
+        result.error = QStringLiteral("Displacement copy response missing output_tifxyz_paths.");
+        return finalizeResult();
+    }
+
+    const auto& outputs = response["output_tifxyz_paths"];
+    if (!outputs.contains("front") || !outputs["front"].is_string()) {
+        result.error = QStringLiteral("Displacement copy response missing front output.");
+        return finalizeResult();
+    }
+    if (!outputs.contains("back") || !outputs["back"].is_string()) {
+        result.error = QStringLiteral("Displacement copy response missing back output.");
+        return finalizeResult();
+    }
+
+    const QString frontPath = QString::fromStdString(outputs["front"].get<std::string>());
+    const QString backPath = QString::fromStdString(outputs["back"].get<std::string>());
+    if (!frontPath.isEmpty()) {
+        temporaryPaths.emplace_back(frontPath.toStdString());
+    }
+    if (!backPath.isEmpty()) {
+        temporaryPaths.emplace_back(backPath.toStdString());
+    }
+
+    result.statusMessage = QStringLiteral("Displacement copy completed");
+    return finalizeResult();
+}
 TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
 {
     TracerGrowthResult result;
@@ -920,107 +1042,6 @@ TracerGrowthResult runDenseDisplacementGrowth(const DenseDisplacementJob& job)
     return finalizeResult();
 }
 
-TracerGrowthResult runCopyDisplacementGrowth(const CopyDisplacementJob& job)
-{
-    TracerGrowthResult result;
-    std::vector<std::filesystem::path> temporaryPaths;
-    temporaryPaths.reserve(3);
-    if (!job.tifxyzInputPath.isEmpty()) {
-        temporaryPaths.emplace_back(job.tifxyzInputPath.toStdString());
-    }
-
-    auto finalizeResult = [&]() -> TracerGrowthResult {
-        result.temporarySurfacePaths.clear();
-        result.temporarySurfacePaths.reserve(temporaryPaths.size());
-        for (const auto& path : temporaryPaths) {
-            if (!path.empty()) {
-                result.temporarySurfacePaths.push_back(path);
-            }
-        }
-        return result;
-    };
-
-    nlohmann::json request;
-    request["request_type"] = "displacement_copy_grow";
-    request["tifxyz_path"] = job.tifxyzInputPath.toStdString();
-    request["volume_path"] = job.volumeZarrPath.toStdString();
-    request["volume_scale"] = std::max(0, job.volumeScale);
-    request["checkpoint_path"] = job.checkpointPath.toStdString();
-    request["tta_merge_method"] = job.ttaMergeMethod.toStdString();
-    request["tta_outlier_drop_thresh"] = job.ttaOutlierDropThresh;
-
-    switch (job.ttaMode) {
-    case DenseTtaMode::Rotate3:
-        request["tta"] = true;
-        request["tta_transform"] = "rotate3";
-        break;
-    case DenseTtaMode::None:
-        request["tta"] = false;
-        break;
-    case DenseTtaMode::Mirror:
-    default:
-        request["tta"] = true;
-        request["tta_transform"] = "mirror";
-        break;
-    }
-
-    if (job.customParams) {
-        auto copyArgsIt = job.customParams->find("copy_args");
-        if (copyArgsIt != job.customParams->end() && copyArgsIt->is_object()) {
-            request["copy_args"] = *copyArgsIt;
-        }
-        auto copyOverridesIt = job.customParams->find("copy_overrides");
-        if (copyOverridesIt != job.customParams->end() && copyOverridesIt->is_object()) {
-            request["overrides"] = *copyOverridesIt;
-        }
-    }
-
-    nlohmann::json response;
-    try {
-        response = sendSocketJsonRequest(job.socketPath, request);
-    } catch (const std::exception& ex) {
-        result.error = QStringLiteral("Displacement copy request failed: %1").arg(ex.what());
-        return finalizeResult();
-    }
-
-    if (response.contains("error")) {
-        QString serviceError;
-        if (response["error"].is_string()) {
-            serviceError = QString::fromStdString(response["error"].get<std::string>());
-        } else {
-            serviceError = QString::fromStdString(response["error"].dump());
-        }
-        result.error = QStringLiteral("Displacement copy service error: %1").arg(serviceError);
-        return finalizeResult();
-    }
-
-    if (!response.contains("output_tifxyz_paths") || !response["output_tifxyz_paths"].is_object()) {
-        result.error = QStringLiteral("Displacement copy response missing output_tifxyz_paths.");
-        return finalizeResult();
-    }
-
-    const auto& outputs = response["output_tifxyz_paths"];
-    if (!outputs.contains("front") || !outputs["front"].is_string()) {
-        result.error = QStringLiteral("Displacement copy response missing front output.");
-        return finalizeResult();
-    }
-    if (!outputs.contains("back") || !outputs["back"].is_string()) {
-        result.error = QStringLiteral("Displacement copy response missing back output.");
-        return finalizeResult();
-    }
-
-    const QString frontPath = QString::fromStdString(outputs["front"].get<std::string>());
-    const QString backPath = QString::fromStdString(outputs["back"].get<std::string>());
-    if (!frontPath.isEmpty()) {
-        temporaryPaths.emplace_back(frontPath.toStdString());
-    }
-    if (!backPath.isEmpty()) {
-        temporaryPaths.emplace_back(backPath.toStdString());
-    }
-
-    result.statusMessage = QStringLiteral("Displacement copy completed");
-    return finalizeResult();
-}
 } // namespace
 
 SegmentationGrower::SegmentationGrower(Context context,
@@ -1065,12 +1086,12 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         return false;
     }
 
-    if (!_context.module || !_context.widget || !_context.surfaces) {
+    if (!_context.module || !_context.widget || !_context.state) {
         showStatus(tr("Segmentation growth is unavailable."), kStatusLong);
         return false;
     }
 
-    auto segmentationSurface = std::dynamic_pointer_cast<QuadSurface>(_context.surfaces->surface("segmentation"));
+    auto segmentationSurface = std::dynamic_pointer_cast<QuadSurface>(_context.state->surface("segmentation"));
     if (!segmentationSurface) {
         qCInfo(lcSegGrowth) << "Rejecting growth because segmentation surface is missing";
         showStatus(tr("Segmentation surface is not available."), kStatusMedium);
@@ -1125,8 +1146,8 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
                 try {
                     sdtVolume = volumeContext.package->volume(sdtVolumeId);
                     if (sdtVolume) {
-                        sdtContext.binaryDataset = sdtVolume->zarrDataset(0);
-                        sdtContext.cache = _context.chunkCache;
+                        sdtContext.cache = sdtVolume->tieredCache();
+                        sdtContext.level = 0;
                         sdtContextPtr = &sdtContext;
                         qCInfo(lcSegGrowth) << "Linear+Fit: SDT refinement using volume"
                                             << QString::fromStdString(sdtVolumeId);
@@ -1154,8 +1175,8 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
                         try {
                             sdtVolume = volumeContext.package->volume(sdtVolumeId);
                             if (sdtVolume) {
-                                sdtContext.binaryDataset = sdtVolume->zarrDataset(0);
-                                sdtContext.cache = _context.chunkCache;
+                                sdtContext.cache = sdtVolume->tieredCache();
+                                sdtContext.level = 0;
                                 sdtContextPtr = &sdtContext;
                                 qCInfo(lcSegGrowth) << "SDT refinement enabled with volume"
                                                     << QString::fromStdString(sdtVolumeId);
@@ -1207,8 +1228,8 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
                 try {
                     skeletonVolume = volumeContext.package->volume(skeletonVolumeId);
                     if (skeletonVolume) {
-                        skeletonContext.binaryDataset = skeletonVolume->zarrDataset(0);
-                        skeletonContext.cache = _context.chunkCache;
+                        skeletonContext.cache = skeletonVolume->tieredCache();
+                        skeletonContext.level = 0;
                         skeletonContextPtr = &skeletonContext;
                         qCInfo(lcSegGrowth) << "Skeleton Path: using volume"
                                             << QString::fromStdString(skeletonVolumeId);
@@ -1314,8 +1335,8 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
 
         // Re-set the surface in the collection to trigger proper viewer refresh
         // (same pattern used by Tracer growth)
-        if (_context.surfaces) {
-            _context.surfaces->setSurface("segmentation", segmentationSurface, false, true);
+        if (_context.state) {
+            _context.state->setSurface("segmentation", segmentationSurface, false, true);
         }
         refreshSegmentationViewers(_context.viewerManager);
         if (_context.module && _context.module->hasActiveSession()) {
@@ -1582,11 +1603,11 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         return true;
     }
 
-    // Heatmap neural tracer integration - pass neural_socket to GrowPatch when enabled.
+    // Heatmap neural tracer integration - pass neural_socket when enabled, GrowPatch will use it as needed
     if (neuralTracerEnabled) {
-        const QString checkpointPath = _context.widget->neuralCheckpointPath().trimmed();
+        const QString checkpointPath = _context.widget->neuralCheckpointPath();
         const QString pythonPath = _context.widget->neuralPythonPath();
-        const QString volumeZarr = _context.widget->volumeZarrPath().trimmed();
+        const QString volumeZarr = _context.widget->volumeZarrPath();
         const int volumeScale = _context.widget->neuralVolumeScale();
         const int batchSize = _context.widget->neuralBatchSize();
 
@@ -1614,6 +1635,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             return false;
         }
 
+        // Add neural socket parameters to custom params
         if (!request.customParams) {
             request.customParams = nlohmann::json::object();
         }
@@ -1651,7 +1673,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     TracerGrowthContext ctx;
     ctx.resumeSurface = segmentationSurface.get();
     ctx.volume = growthVolume.get();
-    ctx.cache = _context.chunkCache;
+    ctx.level = 0;
     ctx.cacheRoot = cacheRootForVolumePkg(volumeContext.package);
     ctx.voxelSize = growthVolume->voxelSize();
     ctx.normalGridPath = volumeContext.normalGridPath;
@@ -1735,6 +1757,28 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     return true;
 }
 
+void SegmentationGrower::finalize(bool ok)
+{
+    if (_context.module) {
+        _context.module->setGrowthInProgress(false);
+    }
+    _running = false;
+    _activeRequest.reset();
+}
+
+void SegmentationGrower::handleFailure(const QString& message)
+{
+    auto showStatus = [&](const QString& text, int timeout) {
+        if (_callbacks.showStatus) {
+            _callbacks.showStatus(text, timeout);
+        }
+    };
+    if (!message.isEmpty()) {
+        showStatus(message, kStatusLong);
+    }
+    finalize(false);
+}
+
 bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
 {
     auto showStatus = [&](const QString& text, int timeout) {
@@ -1747,7 +1791,7 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
         showStatus(tr("A surface growth operation is already running."), kStatusMedium);
         return false;
     }
-    if (!_context.module || !_context.widget || !_context.surfaces) {
+    if (!_context.module || !_context.widget || !_context.state) {
         showStatus(tr("Segmentation growth is unavailable."), kStatusLong);
         return false;
     }
@@ -1768,7 +1812,7 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
         return false;
     }
 
-    auto segmentationSurface = std::dynamic_pointer_cast<QuadSurface>(_context.surfaces->surface("segmentation"));
+    auto segmentationSurface = std::dynamic_pointer_cast<QuadSurface>(_context.state->surface("segmentation"));
     if (!segmentationSurface) {
         showStatus(tr("Segmentation surface is not available."), kStatusMedium);
         return false;
@@ -1910,28 +1954,6 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
     _watcher->setFuture(future);
 
     return true;
-}
-
-void SegmentationGrower::finalize(bool ok)
-{
-    if (_context.module) {
-        _context.module->setGrowthInProgress(false);
-    }
-    _running = false;
-    _activeRequest.reset();
-}
-
-void SegmentationGrower::handleFailure(const QString& message)
-{
-    auto showStatus = [&](const QString& text, int timeout) {
-        if (_callbacks.showStatus) {
-            _callbacks.showStatus(text, timeout);
-        }
-    };
-    if (!message.isEmpty()) {
-        showStatus(message, kStatusLong);
-    }
-    finalize(false);
 }
 
 // Compute bounding box of cells that changed between two point matrices
@@ -2186,14 +2208,14 @@ void SegmentationGrower::onFutureFinished()
             _surfacePanel->refreshSurfaceMetrics(*frontId);
             _surfacePanel->addSingleSegmentation(*backId);
             _surfacePanel->refreshSurfaceMetrics(*backId);
-        } else if (_context.surfaces) {
+        } else if (_context.state) {
             auto loadedFront = request.volumeContext.package->loadSurface(*frontId);
             if (loadedFront) {
-                _context.surfaces->setSurface(*frontId, loadedFront, true, false);
+                _context.state->setSurface(*frontId, loadedFront, true, false);
             }
             auto loadedBack = request.volumeContext.package->loadSurface(*backId);
             if (loadedBack) {
-                _context.surfaces->setSurface(*backId, loadedBack, true, false);
+                _context.state->setSurface(*backId, loadedBack, true, false);
             }
         }
 
@@ -2257,8 +2279,6 @@ void SegmentationGrower::onFutureFinished()
             return;
         }
 
-        // The new directory exists on disk now, but VolumePkg may not know this ID yet.
-        // Register it before any loadSurface call.
         if (!request.volumeContext.package->addSingleSegmentation(newSegmentId)) {
             request.volumeContext.package->refreshSegmentations();
         }
@@ -2269,10 +2289,10 @@ void SegmentationGrower::onFutureFinished()
         if (_surfacePanel) {
             _surfacePanel->addSingleSegmentation(newSegmentId);
             _surfacePanel->refreshSurfaceMetrics(newSegmentId);
-        } else if (_context.surfaces) {
+        } else if (_context.state) {
             auto loadedSurface = request.volumeContext.package->loadSurface(newSegmentId);
             if (loadedSurface) {
-                _context.surfaces->setSurface(newSegmentId, loadedSurface, true, false);
+                _context.state->setSurface(newSegmentId, loadedSurface, true, false);
             }
         }
 
@@ -2443,8 +2463,8 @@ void SegmentationGrower::onFutureFinished()
                     }
 
                     if (reloadedSurface) {
-                        if (_context.surfaces && !persistedId.empty() && _context.surfaces->surface(persistedId)) {
-                            _context.surfaces->setSurface(persistedId, reloadedSurface, true, false);
+                        if (_context.state && !persistedId.empty() && _context.state->surface(persistedId)) {
+                            _context.state->setSurface(persistedId, reloadedSurface, true, false);
                         }
                         request.segmentationSurface = reloadedSurface;
                         surfaceToPersist = reloadedSurface.get();
@@ -2461,10 +2481,10 @@ void SegmentationGrower::onFutureFinished()
         _context.module->requestAutosaveFromGrowth();
     }
 
-    std::vector<std::pair<CVolumeViewer*, bool>> resetDefaults;
+    std::vector<std::pair<CTiledVolumeViewer*, bool>> resetDefaults;
     if (_context.viewerManager) {
         ViewerManager* manager = _context.viewerManager;
-        manager->forEachViewer([manager, &resetDefaults](CVolumeViewer* viewer) {
+        manager->forEachViewer([manager, &resetDefaults](CTiledVolumeViewer* viewer) {
             if (!viewer || viewer->surfName() != "segmentation") {
                 return;
             }
@@ -2474,8 +2494,8 @@ void SegmentationGrower::onFutureFinished()
         });
     }
 
-    if (_context.surfaces) {
-        _context.surfaces->setSurface("segmentation", request.segmentationSurface, false, true);
+    if (_context.state) {
+        _context.state->setSurface("segmentation", request.segmentationSurface, false, true);
         // Note: SurfacePatchIndex is automatically updated via handleSurfaceChanged signal
     }
 
@@ -2508,8 +2528,8 @@ void SegmentationGrower::onFutureFinished()
 
     QuadSurface* currentSegSurface = nullptr;
     std::shared_ptr<Surface> currentSegSurfaceHolder;  // Keep surface alive during this scope
-    if (_context.surfaces) {
-        currentSegSurfaceHolder = _context.surfaces->surface("segmentation");
+    if (_context.state) {
+        currentSegSurfaceHolder = _context.state->surface("segmentation");
         currentSegSurface = dynamic_cast<QuadSurface*>(currentSegSurfaceHolder.get());
     }
     if (!currentSegSurface) {
@@ -2610,7 +2630,6 @@ void SegmentationGrower::onFutureFinished()
     }
 
     qCInfo(lcSegGrowth) << "Tracer growth completed successfully";
-
     cleanupDisplacementTemporarySurfaces(surfaceToPersist ? surfaceToPersist->path : std::filesystem::path());
     delete result.surface;
 

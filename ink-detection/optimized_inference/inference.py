@@ -13,7 +13,9 @@ os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")
 import gc
 import math
 import logging
+import time
 from typing import List, Tuple, Optional, Union, Dict, Protocol
+from contextlib import suppress
 
 import numpy as np
 import torch
@@ -26,6 +28,7 @@ from tqdm.auto import tqdm
 import zarr
 
 from k8s import get_tqdm_kwargs
+from profiling import get_worker_profiler, scoped_timer
 from processing import path_exists, get_cached_zarr_store
 
 # ----------------------------- Logging ---------------------------------------
@@ -137,6 +140,7 @@ class LayersSource:
             self._needs_transpose = False
             self._start_z = None
             self._end_z = None
+            self.storage_kind = "array"
         elif isinstance(src, str):
             if not path_exists(src):
                 raise ValueError(f"Zarr path does not exist: {src}")
@@ -168,6 +172,7 @@ class LayersSource:
 
             self._start_z = start_z if start_z is not None else 0
             self._end_z = end_z if end_z is not None else full_shape[2]
+            self.storage_kind = "remote_zarr" if src.startswith("s3://") else "local_zarr"
 
             if self._end_z > full_shape[2]:
                 logger.warning(f"Requested end_z={self._end_z} exceeds available channels={full_shape[2]}, clamping")
@@ -210,7 +215,7 @@ def preprocess_layers(
     is_reverse_segment: bool = False,
     start_z: Optional[int] = None,
     end_z: Optional[int] = None
-) -> Tuple[LayersSource, np.ndarray, Tuple[int, int], bool]:
+) -> Tuple[LayersSource, Optional[np.ndarray], Tuple[int, int], bool]:
     """
     Prepare layers for streaming inference.
 
@@ -222,7 +227,7 @@ def preprocess_layers(
         end_z: Optional ending z-layer index (exclusive)
 
     Returns:
-        (source, mask, orig_shape, reverse_flag)
+        (source, mask_or_None, orig_shape, reverse_flag)
     """
     try:
         src = LayersSource(layers, start_z=start_z, end_z=end_z)
@@ -230,10 +235,8 @@ def preprocess_layers(
         if c != CFG.in_chans:
             logger.warning(f"Model expects {CFG.in_chans} channels, got {c}")
 
-        if fragment_mask is None:
-            fragment_mask = np.ones((h, w), dtype=np.uint8) * 255
-
-        logger.info(f"Prepared layers source: shape={src.shape}, mask={fragment_mask.shape}, reverse={is_reverse_segment}")
+        mask_desc = f"{fragment_mask.shape}" if fragment_mask is not None else "None"
+        logger.info(f"Prepared layers source: shape={src.shape}, mask={mask_desc}, reverse={is_reverse_segment}")
         return src, fragment_mask, (h, w), bool(is_reverse_segment)
 
     except Exception as e:
@@ -256,20 +259,28 @@ class SlidingWindowDataset(Dataset):
         return int(self.xyxys.shape[0])
 
     def __getitem__(self, idx):
-        x1, y1, x2, y2 = self.xyxys[idx].tolist()
-        tile = self.source.read_roi(y1, y2, x1, x2)  # (tile, tile, C), uint8
-        if self.reverse:
-            tile = tile[:, :, ::-1]
-        # Clip to match training range - in-place for speed
-        np.clip(tile, 0, CFG.max_clip_value, out=tile)
+        worker_profiler = get_worker_profiler()
+        with scoped_timer(worker_profiler, "preprocess_seconds", flag="approximate"):
+            x1, y1, x2, y2 = self.xyxys[idx].tolist()
+            read_metric = "local_read_seconds"
+            if self.source.storage_kind == "remote_zarr":
+                read_metric = "remote_read_seconds"
+            with scoped_timer(worker_profiler, read_metric, flag="approximate"):
+                tile = self.source.read_roi(y1, y2, x1, x2)  # (tile, tile, C), uint8
+            if self.source.storage_kind != "remote_zarr" and worker_profiler is not None:
+                worker_profiler.increment_counter("local_read_bytes", int(tile.nbytes), flag="approximate")
+            if self.reverse:
+                tile = tile[:, :, ::-1]
+            # Clip to match training range - in-place for speed
+            np.clip(tile, 0, CFG.max_clip_value, out=tile)
 
-        data = self.transform(image=tile)  # -> tensor (C,H,W)
-        tens = data["image"].unsqueeze(0)  # -> (1,C,H,W) so C becomes frames
-        return tens, self.xyxys[idx]
+            data = self.transform(image=tile)  # -> tensor (C,H,W)
+            tens = data["image"].unsqueeze(0)  # -> (1,C,H,W) so C becomes frames
+            return tens, self.xyxys[idx]
 
 def create_inference_dataloader(
     source: LayersSource,
-    fragment_mask: np.ndarray,
+    fragment_mask: Optional[np.ndarray],
     reverse: bool
 ) -> Tuple[DataLoader, Tuple[int, int], Dict[str, int]]:
     """Return (loader, pred_shape=(H,W), partition_info)."""
@@ -279,17 +290,26 @@ def create_inference_dataloader(
         x1_list = _grid_1d(w, CFG.tile_size, CFG.stride)
         y1_list = _grid_1d(h, CFG.tile_size, CFG.stride)
 
-        xyxys: List[List[int]] = []
-        for y1 in y1_list:
-            for x1 in x1_list:
-                y2, x2 = y1 + CFG.tile_size, x1 + CFG.tile_size
-                # compute valid ratio inside bounds
-                yy1, yy2 = max(0, y1), min(h, y2)
-                xx1, xx2 = max(0, x1), min(w, x2)
-                roi = fragment_mask[yy1:yy2, xx1:xx2]
-                valid_ratio = float(roi.size and (roi != 0).mean() or 0.0)
-                if valid_ratio >= CFG.min_valid_ratio:
-                    xyxys.append([x1, y1, x2, y2])
+        if fragment_mask is None or CFG.min_valid_ratio <= 0.0:
+            # No filtering needed: either no mask or threshold admits everything
+            xyxys = [[x1, y1, x1 + CFG.tile_size, y1 + CFG.tile_size]
+                     for y1 in y1_list for x1 in x1_list]
+        else:
+            # Use integral image for O(1) per-tile mask validity check
+            sat = np.zeros((h + 1, w + 1), dtype=np.float64)
+            sat[1:, 1:] = np.cumsum(np.cumsum((fragment_mask != 0).astype(np.float64), axis=0), axis=1)
+            min_valid = CFG.min_valid_ratio
+            xyxys: List[List[int]] = []
+            for y1 in y1_list:
+                for x1 in x1_list:
+                    y2, x2 = y1 + CFG.tile_size, x1 + CFG.tile_size
+                    yy1, yy2 = max(0, y1), min(h, y2)
+                    xx1, xx2 = max(0, x1), min(w, x2)
+                    area = (yy2 - yy1) * (xx2 - xx1)
+                    if area > 0:
+                        roi_sum = sat[yy2, xx2] - sat[yy1, xx2] - sat[yy2, xx1] + sat[yy1, xx1]
+                        if roi_sum / area >= min_valid:
+                            xyxys.append([x1, y1, x2, y2])
 
         if not xyxys:
             raise ValueError("No valid tiles (mask empty or fully filtered).")
@@ -327,8 +347,7 @@ def create_inference_dataloader(
         if CFG.tile_size != CFG.size:
             tfm_list.append(A.Resize(CFG.size, CFG.size))
         tfm_list += [
-            A.Normalize(mean=[0.0] * CFG.in_chans, std=[1.0] * CFG.in_chans,
-                        max_pixel_value=CFG.max_clip_value),
+            A.ToFloat(max_value=CFG.max_clip_value),
             ToTensorV2(),
         ]
         transform = A.Compose(tfm_list)
@@ -358,7 +377,8 @@ def predict_fn(
     test_loader: DataLoader,
     model: InferenceModel,
     device: torch.device,
-    pred_shape: Tuple[int, int]
+    pred_shape: Tuple[int, int],
+    profiler=None,
 ) -> Dict[str, str]:
     """
     Run tiled inference and write results to zarr files.
@@ -375,6 +395,11 @@ def predict_fn(
 
         weight_tensor: Optional[torch.Tensor] = None
         model.eval()
+        batch_count = 0
+        tile_count = 0
+        torch_profiler_batches = 20
+        if profiler is not None and profiler.enable_torch_profiler():
+            profiler.start_torch_profiler(use_cuda=device.type == "cuda")
 
         with torch.inference_mode():
             try:
@@ -386,23 +411,39 @@ def predict_fn(
                         unit="tile",
                         **get_tqdm_kwargs())
 
+            # Only sync CUDA for per-phase timing when detailed profiling is enabled;
+            # in production this avoids ~20s of GPU pipeline stalls per run.
+            detailed_sync = (
+                device.type == "cuda"
+                and profiler is not None
+                and getattr(profiler, "detailed_enabled", False)
+            )
+
             for (images, xys) in test_loader:
-                images = images.to(device, non_blocking=True)
+                batch_count += 1
+                tile_count += int(images.size(0))
+                with scoped_timer(profiler, "host_to_device_seconds", cuda_sync=detailed_sync):
+                    images = images.to(device, non_blocking=True)
 
                 amp_device = "cuda" if device.type == "cuda" else "cpu"
-                with torch.autocast(device_type=amp_device, enabled=True):
-                    y_preds = model.forward(images)  # Model-specific forward
-
-                y_preds = torch.sigmoid(y_preds)
+                with scoped_timer(profiler, "forward_seconds", cuda_sync=detailed_sync):
+                    with torch.autocast(device_type=amp_device, enabled=True):
+                        y_preds = model.forward(images)  # Model-specific forward
+                    y_preds = torch.sigmoid(y_preds)
+                    y_preds_resized = F.interpolate(
+                        y_preds.float(),
+                        size=(CFG.tile_size, CFG.tile_size),
+                        mode='bilinear',
+                        align_corners=False
+                    )  # (B,1,tile,tile)
+                    if profiler is not None and profiler._torch_profiler is not None and batch_count <= torch_profiler_batches:
+                        with suppress(Exception):
+                            profiler._torch_profiler.step()
+                        if batch_count == torch_profiler_batches:
+                            profiler.stop_torch_profiler()
 
                 # Get scale factor from model
                 scale_factor = model.get_output_scale_factor()
-                y_preds_resized = F.interpolate(
-                    y_preds.float(),
-                    size=(CFG.tile_size, CFG.tile_size),
-                    mode='bilinear',
-                    align_corners=False
-                )  # (B,1,tile,tile)
 
                 if weight_tensor is None:
                     th, tw = y_preds_resized.shape[-2:]
@@ -415,15 +456,17 @@ def predict_fn(
 
                 y_weighted = (y_preds_resized * weight_tensor).squeeze(1)  # (B,th,tw)
 
-                y_cpu = y_weighted.cpu().numpy()
-                w_cpu = weight_tensor.detach().cpu().numpy().astype(np.float32)
+                with scoped_timer(profiler, "device_to_host_seconds", cuda_sync=detailed_sync):
+                    y_cpu = y_weighted.cpu().numpy()
+                    w_cpu = weight_tensor.detach().cpu().numpy().astype(np.float32)
 
-                if torch.is_tensor(xys):
-                    xys = xys.cpu().numpy().astype(np.int32)
-                for i in range(xys.shape[0]):
-                    x1, y1, x2, y2 = [int(v) for v in xys[i]]
-                    mask_pred[y1:y2, x1:x2] += y_cpu[i]
-                    mask_count[y1:y2, x1:x2] += w_cpu
+                with scoped_timer(profiler, "postprocess_seconds"):
+                    if torch.is_tensor(xys):
+                        xys = xys.cpu().numpy().astype(np.int32)
+                    for i in range(xys.shape[0]):
+                        x1, y1, x2, y2 = [int(v) for v in xys[i]]
+                        mask_pred[y1:y2, x1:x2] += y_cpu[i]
+                        mask_count[y1:y2, x1:x2] += w_cpu
                 pbar.update(images.size(0))
             pbar.close()
 
@@ -439,35 +482,57 @@ def predict_fn(
         compressor = LZ4(acceleration=1) if CFG.use_zarr_compression else None
 
         # Create and write mask_pred zarr
-        mask_pred_z = zarr.open(
-            mask_pred_path,
-            mode='w',
-            shape=(H, W),
-            chunks=(1024, 1024),
-            dtype=np.float32,
-            compressor=compressor,
-            zarr_format=2,
-            config={'write_empty_chunks': False}
-        )
-        mask_pred_z[:] = mask_pred
+        with scoped_timer(profiler, "zarr_write_seconds", flag="approximate"):
+            mask_pred_z = zarr.open(
+                mask_pred_path,
+                mode='w',
+                shape=(H, W),
+                chunks=(1024, 1024),
+                dtype=np.float32,
+                compressor=compressor,
+                zarr_format=2,
+                config={'write_empty_chunks': False}
+            )
+            mask_pred_z[:] = mask_pred
 
         # Create and write mask_count zarr
-        mask_count_z = zarr.open(
-            mask_count_path,
-            mode='w',
-            shape=(H, W),
-            chunks=(1024, 1024),
-            dtype=np.float32,
-            compressor=compressor,
-            zarr_format=2,
-            config={'write_empty_chunks': False}
-        )
-        mask_count_z[:] = mask_count
+        with scoped_timer(profiler, "zarr_write_seconds", flag="approximate"):
+            mask_count_z = zarr.open(
+                mask_count_path,
+                mode='w',
+                shape=(H, W),
+                chunks=(1024, 1024),
+                dtype=np.float32,
+                compressor=compressor,
+                zarr_format=2,
+                config={'write_empty_chunks': False}
+            )
+            mask_count_z[:] = mask_count
+        if profiler is not None:
+            profiler.increment_counter("local_write_bytes", int(mask_pred.nbytes + mask_count.nbytes), flag="approximate")
+            profiler.set_metric("partition_batches", batch_count, semantics="counter delta")
+            profiler.set_metric("partition_tiles", tile_count, semantics="counter delta")
+            if batch_count > 0:
+                wall = profiler.metrics.get("total_wall_seconds")
+                active_seconds = (
+                    float(profiler.metrics.get("host_to_device_seconds") or 0.0)
+                    + float(profiler.metrics.get("forward_seconds") or 0.0)
+                    + float(profiler.metrics.get("device_to_host_seconds") or 0.0)
+                    + float(profiler.metrics.get("postprocess_seconds") or 0.0)
+                )
+                if active_seconds > 0:
+                    profiler.set_metric(
+                        "steady_state_tiles_per_second",
+                        float(tile_count) / active_seconds,
+                        flag="estimated",
+                    )
 
         logger.info(f"Partition {CFG.part_id} completed. Wrote zarr arrays to {CFG.zarr_output_dir}")
         return {
             "mask_pred": mask_pred_path,
             "mask_count": mask_count_path,
+            "partition_batches": batch_count,
+            "partition_tiles": tile_count,
         }
 
     except Exception as e:
@@ -482,7 +547,8 @@ def run_inference(
     fragment_mask: Optional[np.ndarray] = None,
     is_reverse_segment: bool = False,
     start_z: Optional[int] = None,
-    end_z: Optional[int] = None
+    end_z: Optional[int] = None,
+    profiler=None,
 ) -> Dict[str, str]:
     """
     Main entrypoint: accepts either a stacked array (H,W,C) or path to a zarr array.
@@ -501,11 +567,17 @@ def run_inference(
     """
     try:
         logger.info("Starting inference process...")
-        source, mask, orig_shape, reverse = preprocess_layers(
-            layers, fragment_mask, is_reverse_segment, start_z=start_z, end_z=end_z
-        )
+        with scoped_timer(profiler, "preprocess_seconds", flag="approximate"):
+            source, mask, orig_shape, reverse = preprocess_layers(
+                layers, fragment_mask, is_reverse_segment, start_z=start_z, end_z=end_z
+            )
         test_loader, pred_shape, partition_info = create_inference_dataloader(source, mask, reverse)
-        result = predict_fn(test_loader, model, device, pred_shape)
+        if profiler is not None:
+            profiler.set_metric("partition_tiles", partition_info.get("partition_tiles", 0), semantics="counter delta")
+            profiler.set_metric("tiles_total", partition_info.get("total_tiles", 0), semantics="metadata")
+        result = predict_fn(test_loader, model, device, pred_shape, profiler=profiler)
+        if profiler is not None:
+            result["partition_info"] = partition_info
 
         logger.info("Inference completed successfully")
         return result

@@ -10,7 +10,7 @@ add_library(vc_core
         src/SurfacePatchIndex.cpp
         src/PointIndex.cpp
         src/Logging.cpp
-        src/ChunkCache.cpp
+        src/SparseChunkSpool.cpp
         src/Slicing.cpp
         src/Compositing.cpp
         src/PlaneSurface.cpp
@@ -18,6 +18,18 @@ add_library(vc_core
         src/Render.cpp
         src/Tiff.cpp
         src/Zarr.cpp
+        src/VcDataset.cpp
+        src/NetworkFilesystem.cpp
+        src/cache/ChunkSource.cpp
+        src/cache/DiskStore.cpp
+        src/cache/HttpMetadataFetcher.cpp
+        src/cache/IOPool.cpp
+        src/cache/TieredChunkCache.cpp
+        src/cache/VcDecompressor.cpp
+        src/cache/SimpleCacheFactory.cpp
+        src/RemoteUrl.cpp
+        src/RemoteScroll.cpp
+        src/PostProcess.cpp
         src/Geometry.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
@@ -32,13 +44,32 @@ target_link_libraries(vc_core
         opencv_calib3d
         opencv_video
         nlohmann_json::nlohmann_json
-        z5
+        xtensor
         OpenMP::OpenMP_CXX
         TIFF::TIFF
-        #${CURL_LIBRARIES}
-        #${OPENSSL_LIBRARIES}
-        #${ZLIB_LIBRARIES}
+        OpenABF
+        CURL::libcurl
 )
+
+# utils header-only library + vendored blosc1 compression + video codec
+# WHOLE_ARCHIVE is needed because ThinLTO + lld can internalize symbols from
+# static archives before cross-archive references are resolved.
+target_link_libraries(vc_core PUBLIC
+    $<BUILD_INTERFACE:utils>
+    $<BUILD_INTERFACE:$<LINK_LIBRARY:WHOLE_ARCHIVE,utils_video_codec>>
+)
+target_link_libraries(vc_core PRIVATE
+    $<BUILD_INTERFACE:blosc_static>
+)
+target_include_directories(vc_core PRIVATE
+    ${CMAKE_SOURCE_DIR}/libs/c-blosc/blosc
+    ${CMAKE_BINARY_DIR}/libs/c-blosc/blosc
+    ${CMAKE_SOURCE_DIR}/libs/c-blosc/internal-complibs/zstd-1.5.6
+    ${CMAKE_SOURCE_DIR}/libs/c-blosc/internal-complibs/lz4-1.10.0
+    ${CMAKE_SOURCE_DIR}/libs/c-blosc/internal-complibs/zlib-1.3.1
+)
+
+target_compile_definitions(vc_core PUBLIC VC_USE_CURL)
 
 # Precompiled headers for faster builds
 if(VC_USE_PCH)
@@ -97,17 +128,11 @@ target_precompile_headers(vc_core PRIVATE
     <opencv2/imgcodecs.hpp>
     # Boost (used by CLI apps)
     <boost/program_options.hpp>
-    # z5/xtensor (zarr volume access - heavy templates)
+    # xtensor (chunk buffer type - heavy templates)
     <xtensor/containers/xarray.hpp>
     <xtensor/containers/xadapt.hpp>
     <xtensor/views/xview.hpp>
     <xtensor/generators/xbuilder.hpp>
-    <z5/factory.hxx>
-    <z5/dataset.hxx>
-    <z5/attributes.hxx>
-    <z5/filesystem/handle.hxx>
-    <z5/filesystem/dataset.hxx>
-    <z5/multiarray/xtensor_access.hxx>
 )
 endif()
 
@@ -126,43 +151,4 @@ target_link_libraries(vc_tracer PUBLIC vc_core vc_ui Ceres::ceres Qt6::Core)
 target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
 if(VC_USE_PCH)
     target_precompile_headers(vc_tracer REUSE_FROM vc_core)
-endif()
-
-if(VC_INSTALL_LIBS)
-    install(
-            TARGETS vc_core
-            COMPONENT "Libraries"
-            EXPORT "${targets_export_name}"
-            ARCHIVE DESTINATION "lib"
-            LIBRARY DESTINATION "lib"
-            INCLUDES DESTINATION "${include_install_dir}"
-            RUNTIME DESTINATION "bin"
-    )
-
-    install(
-            TARGETS vc_flattening
-            COMPONENT "Libraries"
-            EXPORT "${targets_export_name}"
-            ARCHIVE DESTINATION "lib"
-            LIBRARY DESTINATION "lib"
-            INCLUDES DESTINATION "${include_install_dir}"
-            RUNTIME DESTINATION "bin"
-    )
-
-    install(
-            TARGETS vc_ui
-            COMPONENT "Libraries"
-            EXPORT "${targets_export_name}"
-            ARCHIVE DESTINATION "lib"
-            LIBRARY DESTINATION "lib"
-            INCLUDES DESTINATION "${include_install_dir}"
-            RUNTIME DESTINATION "bin"
-    )
-
-    install(
-            DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/include/"
-            DESTINATION "${include_install_dir}"
-            COMPONENT "Libraries"
-            FILES_MATCHING REGEX ".*\\.(h|hpp)$"
-    )
 endif()

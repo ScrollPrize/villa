@@ -7,8 +7,8 @@
 #include <vector>
 
 #include <opencv2/core.hpp>
-#include <z5/dataset.hxx>
-#include <z5/filesystem/handle.hxx>
+
+namespace vc { class VcDataset; }
 
 // Map a tile index through rotation + flip (pure integer tile coordinate transform).
 // Used by both zarr and tif writers.
@@ -35,7 +35,7 @@ inline void mapTileIndex(int tx, int ty, int tilesX, int tilesY,
 // Write one band's slices as zarr chunks using writeChunk (fast, avoids subarray overhead).
 // chunks0 = {chunkZ, chunkY, chunkX} from the L0 dataset's chunk shape.
 template <typename T>
-void writeZarrBand(z5::Dataset* dsOut, const std::vector<cv::Mat>& slices,
+void writeZarrBand(vc::VcDataset* dsOut, const std::vector<cv::Mat>& slices,
                    uint32_t bandIdx, const std::vector<size_t>& chunks0,
                    size_t tilesXSrc, size_t tilesYSrc,
                    int rotQuad, int flipAxis);
@@ -70,19 +70,32 @@ void downsampleTileIntoPreserveZ(const T* src, size_t srcZ, size_t srcY, size_t 
 // Build one pyramid level (2x mean downsample) via readChunk/writeChunk + OMP.
 // numParts/partId partition the output tile-rows across VMs (1/0 = no partitioning).
 template <typename T>
-void buildPyramidLevel(z5::filesystem::handle::File& outFile, int level,
+void buildPyramidLevel(const std::filesystem::path& outFile, int level,
                        size_t CH, size_t CW,
                        int numParts = 1, int partId = 0);
 
 // Create pyramid level datasets L1-L5 (metadata only, no data).
 // Called by --pre so that multi-part workers can open existing datasets.
-void createPyramidDatasets(z5::filesystem::handle::File& outFile,
+void createPyramidDatasets(const std::filesystem::path& outFile,
                            const std::vector<size_t>& shape0,
                            size_t CH, size_t CW, bool isU16);
 
 // Write OME-Zarr .zattrs multiscales JSON.
-void writeZarrAttrs(z5::filesystem::handle::File& outFile,
+void writeZarrAttrs(const std::filesystem::path& outFile,
                     const std::filesystem::path& volPath, int groupIdx,
                     size_t baseZ, double sliceStep, double accumStep,
                     const std::string& accumTypeStr, size_t accumSamples,
                     const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW);
+
+// Write a dense uint8 ZYX subregion into a freshly created dataset via
+// writeChunk(). Chunks overlapping the region are materialized; untouched
+// chunks are left absent and are expected to read back as the dataset's
+// configured fill value.
+//
+// Precondition: dsOut must refer to a new output dataset. This helper does not
+// preserve any prior chunk contents outside the written subregion.
+void writeZarrRegionU8ByChunk(vc::VcDataset* dsOut,
+                              const std::vector<size_t>& offset,
+                              const std::vector<size_t>& regionShape,
+                              const uint8_t* data,
+                              uint8_t fillValue = 0);

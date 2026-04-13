@@ -4,6 +4,7 @@
 #include <array>
 #include <cstdint>
 #include <cmath>
+#include <iostream>
 #include <limits>
 #include <optional>
 #include <utility>
@@ -527,7 +528,27 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     impl_->surfaceRecords.clear();
     impl_->patchCount = 0;
 
-    const size_t surfaceCount = surfaces.size();
+    // Eagerly load any surfaces whose TIFF data hasn't been loaded yet.
+    // This is safe because rebuild() typically runs on a background thread.
+    std::vector<SurfacePtr> loaded;
+    loaded.reserve(surfaces.size());
+    for (const auto& s : surfaces) {
+        if (!s) {
+            continue;
+        }
+        if (!s->isLoaded()) {
+            std::cout << "[SurfacePatchIndex] Loading surface: " << s->id << std::endl;
+            s->rawPointsPtr();  // triggers ensureLoaded()
+        }
+        if (s->isLoaded()) {
+            loaded.push_back(s);
+            std::cout << "[SurfacePatchIndex] Indexed surface: " << s->id << std::endl;
+        } else {
+            std::cout << "[SurfacePatchIndex] Failed to load surface: " << s->id << std::endl;
+        }
+    }
+    const size_t surfaceCount = loaded.size();
+    std::cout << "[SurfacePatchIndex] rebuild: " << surfaceCount << " of " << surfaces.size() << " surfaces loaded" << std::endl;
     if (surfaceCount == 0) {
         impl_->tree.reset();
         impl_->samplingStride = std::max(1, impl_->samplingStride);
@@ -539,7 +560,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     const float padding = bboxPadding;
 
     // Pre-create all masks (sequential, enables thread-safe parallel access)
-    for (const SurfacePtr& surface : surfaces) {
+    for (const SurfacePtr& surface : loaded) {
         impl_->ensureMask(surface);
     }
 
@@ -551,7 +572,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     #pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < surfaceCount; ++i) {
         perSurfaceCells[i] = Impl::collectEntriesForSurface(
-            surfaces[i],
+            loaded[i],
             padding,
             stride,
             0,
@@ -560,7 +581,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
             std::numeric_limits<int>::max());
 
         // Update mask for this surface (each surface has its own mask, no contention)
-        auto* rec = impl_->getRecord(surfaces[i].get());
+        auto* rec = impl_->getRecord(loaded[i].get());
         if (rec) {
             for (auto& cell : perSurfaceCells[i]) {
                 rec->mask.setActive(cell.first.rowIndex(), cell.first.colIndex(), cell.second.hasPatch);

@@ -23,14 +23,13 @@ struct CorrectionsBounds {
 
 class SegmentationModule;
 class SegmentationWidget;
-class CSurfaceCollection;
+class CState;
 class ViewerManager;
 class SurfacePanelController;
 class VolumePkg;
 class Volume;
-template <typename T> class ChunkCache;
 class QuadSurface;
-class CVolumeViewer;
+class CTiledVolumeViewer;
 
 class SegmentationGrower : public QObject
 {
@@ -41,9 +40,8 @@ public:
     {
         SegmentationModule* module{nullptr};
         SegmentationWidget* widget{nullptr};
-        CSurfaceCollection* surfaces{nullptr};
+        CState* state{nullptr};
         ViewerManager* viewerManager{nullptr};
-        ChunkCache<uint8_t>* chunkCache{nullptr};
     };
 
     struct UiCallbacks
@@ -75,6 +73,7 @@ public:
                SegmentationGrowthDirection direction,
                int steps,
                bool inpaintOnly);
+
     bool startCopyWithNt(const VolumeContext& volumeContext);
 
     bool running() const { return _running; }
@@ -89,14 +88,14 @@ private:
         double growthVoxelSize{0.0};
         bool usingCorrections{false};
         bool inpaintOnly{false};
+        bool denseDisplacement{false};
+        bool denseCreateNewSegment{false};
+        bool copyDisplacement{false};
         std::optional<cv::Rect> correctionsAffectedBounds;
         // For corrections annotation saving
         std::optional<CorrectionsBounds> correctionsBounds;
         std::unique_ptr<QuadSurface> beforeCrop;
         SegmentationCorrectionsPayload corrections;
-        bool denseDisplacement{false};
-        bool denseCreateNewSegment{false};
-        bool copyDisplacement{false};
     };
 
     void finalize(bool ok);

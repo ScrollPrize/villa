@@ -17,6 +17,16 @@ def build_model(run_state, data_state, wandb_logger):
         size=CFG.size,
         norm=getattr(CFG, "norm", "batch"),
         group_norm_groups=int(getattr(CFG, "group_norm_groups", 32)),
+        model_impl=str(getattr(CFG, "model_impl", "resnet3d_hybrid")),
+        vesuvius_model_config=getattr(CFG, "vesuvius_model_config", {}),
+        vesuvius_target_name=str(getattr(CFG, "vesuvius_target_name", "ink")),
+        vesuvius_z_projection_mode=str(getattr(CFG, "vesuvius_z_projection_mode", "logsumexp")),
+        vesuvius_z_projection_lse_tau=float(getattr(CFG, "vesuvius_z_projection_lse_tau", 1.0)),
+        vesuvius_z_projection_mlp_hidden=int(getattr(CFG, "vesuvius_z_projection_mlp_hidden", 64)),
+        vesuvius_z_projection_mlp_dropout=float(getattr(CFG, "vesuvius_z_projection_mlp_dropout", 0.0)),
+        vesuvius_z_projection_mlp_depth=int(
+            getattr(CFG, "vesuvius_z_projection_mlp_depth", None) or getattr(CFG, "in_chans", 1)
+        ),
         objective=CFG.objective,
         loss_mode=CFG.loss_mode,
         erm_group_topk=int(getattr(CFG, "erm_group_topk", 0)),
@@ -78,6 +88,36 @@ def build_model(run_state, data_state, wandb_logger):
 
 def build_trainer(args, wandb_logger):
     trainer_logger = wandb_logger if wandb_logger is not None else False
+    max_steps_per_epoch = getattr(args, "max_steps_per_epoch", None)
+    trainer_kwargs = {}
+    if max_steps_per_epoch is not None:
+        max_steps_per_epoch = int(max_steps_per_epoch)
+        if max_steps_per_epoch < 1:
+            raise ValueError(f"max_steps_per_epoch must be >= 1, got {max_steps_per_epoch}")
+        trainer_kwargs["limit_train_batches"] = int(max_steps_per_epoch)
+
+    callbacks = [
+        ModelCheckpoint(
+            filename="best-epoch{epoch}",
+            dirpath=CFG.model_dir,
+            monitor="val/worst_group_loss",
+            mode="min",
+            save_top_k=1,
+            save_last=True,
+        ),
+    ]
+    if trainer_logger is not False:
+        callbacks.insert(0, LearningRateMonitor(logging_interval="step"))
+    if CFG.save_every_epoch:
+        callbacks.append(
+            ModelCheckpoint(
+                filename="epoch{epoch}",
+                dirpath=CFG.model_dir,
+                every_n_epochs=1,
+                save_top_k=-1,
+            )
+        )
+
     return pl.Trainer(
         max_epochs=CFG.epochs,
         accelerator=args.accelerator,
@@ -90,31 +130,8 @@ def build_trainer(args, wandb_logger):
         precision=args.precision,
         gradient_clip_val=CFG.max_grad_norm,
         gradient_clip_algorithm="norm",
-        callbacks=(
-            [
-                LearningRateMonitor(logging_interval="step"),
-                ModelCheckpoint(
-                    filename="best-epoch{epoch}",
-                    dirpath=CFG.model_dir,
-                    monitor="val/worst_group_loss",
-                    mode="min",
-                    save_top_k=1,
-                    save_last=True,
-                ),
-            ]
-            + (
-                [
-                    ModelCheckpoint(
-                        filename="epoch{epoch}",
-                        dirpath=CFG.model_dir,
-                        every_n_epochs=1,
-                        save_top_k=-1,
-                    )
-                ]
-                if CFG.save_every_epoch
-                else []
-            )
-        ),
+        callbacks=callbacks,
+        **trainer_kwargs,
     )
 
 

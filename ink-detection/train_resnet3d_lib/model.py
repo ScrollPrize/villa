@@ -1,6 +1,7 @@
 import time
 import os.path as osp
 from contextlib import nullcontext
+from types import SimpleNamespace
 
 import numpy as np
 import torch
@@ -1076,6 +1077,14 @@ class RegressionPLModel(pl.LightningModule):
         norm="batch",
         group_norm_groups=32,
         erm_group_topk=0,
+        model_impl="resnet3d_hybrid",
+        vesuvius_model_config=None,
+        vesuvius_target_name="ink",
+        vesuvius_z_projection_mode="logsumexp",
+        vesuvius_z_projection_lse_tau=1.0,
+        vesuvius_z_projection_mlp_hidden=64,
+        vesuvius_z_projection_mlp_dropout=0.0,
+        vesuvius_z_projection_mlp_depth=62,
     ):
         super(RegressionPLModel, self).__init__()
 
@@ -1139,43 +1148,70 @@ class RegressionPLModel(pl.LightningModule):
         self.loss_func1 = smp.losses.DiceLoss(mode="binary")
         self.loss_func2 = smp.losses.SoftBCEWithLogitsLoss(smooth_factor=0.25)
 
-        self.backbone = generate_model(
-            model_depth=50,
-            n_input_channels=1,
-            forward_features=True,
-            n_classes=1039,
-        )
-
         norm = str(norm).lower()
         group_norm_groups = int(group_norm_groups)
-        init_ckpt_path = getattr(CFG, "init_ckpt_path", None)
-        if not init_ckpt_path:
-            backbone_pretrained_path = getattr(CFG, "backbone_pretrained_path", "./r3d50_KM_200ep.pth")
-            if not osp.exists(backbone_pretrained_path):
-                raise FileNotFoundError(
-                    f"Missing backbone pretrained weights: {backbone_pretrained_path}. "
-                    "Either place r3d50_KM_200ep.pth next to train_resnet3d.py, set CFG.backbone_pretrained_path, "
-                    "or pass --init_ckpt_path to fine-tune from a previous run."
-                )
-            backbone_ckpt = torch.load(backbone_pretrained_path, map_location="cpu")
-            state_dict = backbone_ckpt.get("state_dict", backbone_ckpt)
-            conv1_weight = state_dict["conv1.weight"]
-            state_dict["conv1.weight"] = conv1_weight.sum(dim=1, keepdim=True)
-            self.backbone.load_state_dict(state_dict, strict=False)
+        self.model_impl = str(model_impl).strip().lower()
+        if self.model_impl not in {"resnet3d_hybrid", "vesuvius_resunet_hybrid"}:
+            raise ValueError(
+                "model_impl must be 'resnet3d_hybrid' or 'vesuvius_resunet_hybrid', "
+                f"got {self.model_impl!r}"
+            )
 
-        if norm == "group":
-            replace_batchnorm_with_groupnorm(self.backbone, desired_groups=group_norm_groups)
+        self.vesuvius_target_name = str(vesuvius_target_name).strip()
+        if not self.vesuvius_target_name:
+            raise ValueError("vesuvius_target_name must be non-empty")
 
-        was_training = self.backbone.training
-        try:
-            self.backbone.eval()
-            with torch.no_grad():
-                encoder_dims = [x.size(1) for x in self.backbone(torch.rand(1, 1, 20, 256, 256))]
-        finally:
-            if was_training:
-                self.backbone.train()
+        if vesuvius_model_config is None:
+            vesuvius_model_config = {}
+        if not isinstance(vesuvius_model_config, dict):
+            raise TypeError(
+                "vesuvius_model_config must be a dict, "
+                f"got {type(vesuvius_model_config).__name__}"
+            )
+        self.vesuvius_model_config = dict(vesuvius_model_config)
 
-        self.decoder = Decoder(encoder_dims=encoder_dims, upscale=1, norm=norm, group_norm_groups=group_norm_groups)
+        self.vesuvius_z_projection_mode = str(vesuvius_z_projection_mode).strip().lower()
+        if self.vesuvius_z_projection_mode not in {"logsumexp", "max", "mean", "learned_mlp"}:
+            raise ValueError(
+                "vesuvius_z_projection_mode must be one of "
+                "'logsumexp', 'max', 'mean', 'learned_mlp', "
+                f"got {self.vesuvius_z_projection_mode!r}"
+            )
+        self.vesuvius_z_projection_lse_tau = float(vesuvius_z_projection_lse_tau)
+        if self.vesuvius_z_projection_lse_tau <= 0:
+            raise ValueError(
+                f"vesuvius_z_projection_lse_tau must be > 0, got {self.vesuvius_z_projection_lse_tau}"
+            )
+        self.vesuvius_z_projection_mlp_hidden = int(vesuvius_z_projection_mlp_hidden)
+        if self.vesuvius_z_projection_mlp_hidden <= 0:
+            raise ValueError(
+                "vesuvius_z_projection_mlp_hidden must be > 0, "
+                f"got {self.vesuvius_z_projection_mlp_hidden}"
+            )
+        self.vesuvius_z_projection_mlp_dropout = float(vesuvius_z_projection_mlp_dropout)
+        if not (0.0 <= self.vesuvius_z_projection_mlp_dropout <= 1.0):
+            raise ValueError(
+                "vesuvius_z_projection_mlp_dropout must be in [0, 1], "
+                f"got {self.vesuvius_z_projection_mlp_dropout}"
+            )
+        self.vesuvius_z_projection_mlp_depth = int(vesuvius_z_projection_mlp_depth)
+        if self.vesuvius_z_projection_mlp_depth <= 0:
+            raise ValueError(
+                "vesuvius_z_projection_mlp_depth must be > 0, "
+                f"got {self.vesuvius_z_projection_mlp_depth}"
+            )
+
+        self.backbone = None
+        self.decoder = None
+        self.vesuvius_network = None
+        self.z_projection_head = None
+        self._vesuvius_depth_divisor = 1
+        self._vesuvius_depth_pad_logged = False
+
+        if self.model_impl == "resnet3d_hybrid":
+            self._init_resnet3d_hybrid(norm=norm, group_norm_groups=group_norm_groups)
+        else:
+            self._init_vesuvius_resunet_hybrid()
 
         if self.hparams.with_norm:
             if norm == "group":
@@ -1223,6 +1259,212 @@ class RegressionPLModel(pl.LightningModule):
             offset=offset,
         )
 
+    def _init_resnet3d_hybrid(self, *, norm: str, group_norm_groups: int):
+        self.backbone = generate_model(
+            model_depth=50,
+            n_input_channels=1,
+            forward_features=True,
+            n_classes=1039,
+        )
+
+        init_ckpt_path = getattr(CFG, "init_ckpt_path", None)
+        if not init_ckpt_path:
+            backbone_pretrained_path = getattr(CFG, "backbone_pretrained_path", "./r3d50_KM_200ep.pth")
+            if not osp.exists(backbone_pretrained_path):
+                raise FileNotFoundError(
+                    f"Missing backbone pretrained weights: {backbone_pretrained_path}. "
+                    "Either place r3d50_KM_200ep.pth next to train_resnet3d.py, set CFG.backbone_pretrained_path, "
+                    "or pass --init_ckpt_path to fine-tune from a previous run."
+                )
+            backbone_ckpt = torch.load(backbone_pretrained_path, map_location="cpu")
+            state_dict = backbone_ckpt.get("state_dict", backbone_ckpt)
+            conv1_weight = state_dict["conv1.weight"]
+            state_dict["conv1.weight"] = conv1_weight.sum(dim=1, keepdim=True)
+            self.backbone.load_state_dict(state_dict, strict=False)
+
+        if norm == "group":
+            replace_batchnorm_with_groupnorm(self.backbone, desired_groups=group_norm_groups)
+
+        was_training = self.backbone.training
+        try:
+            self.backbone.eval()
+            with torch.no_grad():
+                encoder_dims = [x.size(1) for x in self.backbone(torch.rand(1, 1, 20, 256, 256))]
+        finally:
+            if was_training:
+                self.backbone.train()
+
+        self.decoder = Decoder(encoder_dims=encoder_dims, upscale=1, norm=norm, group_norm_groups=group_norm_groups)
+
+    def _init_vesuvius_resunet_hybrid(self):
+        try:
+            from vesuvius.models.build.build_network_from_config import NetworkFromConfig
+        except Exception as exc:
+            raise ImportError(
+                "model_impl='vesuvius_resunet_hybrid' requires the 'vesuvius' package to be importable."
+            ) from exc
+
+        model_config = dict(self.vesuvius_model_config)
+        model_config.setdefault("architecture_type", "unet")
+        model_config.setdefault("basic_encoder_block", "BasicBlockD")
+        model_config.setdefault("bottleneck_block", "BasicBlockD")
+        model_config.setdefault("basic_decoder_block", "ConvBlock")
+        model_config.setdefault("separate_decoders", False)
+        if "norm_op" not in model_config:
+            cfg_norm = str(getattr(CFG, "norm", "batch")).strip().lower()
+            if cfg_norm == "batch":
+                model_config["norm_op"] = "nn.BatchNorm3d"
+            elif cfg_norm in {"instance", "instancenorm"}:
+                model_config["norm_op"] = "nn.InstanceNorm3d"
+            elif cfg_norm == "group":
+                # NetworkFromConfig currently supports InstanceNorm/BatchNorm (not GroupNorm).
+                model_config["norm_op"] = "nn.InstanceNorm3d"
+                print("CFG.norm='group' mapped to nn.InstanceNorm3d for NetworkFromConfig.")
+            else:
+                model_config["norm_op"] = "nn.InstanceNorm3d"
+
+        target_name = self.vesuvius_target_name
+        out_channels = int(getattr(CFG, "target_size", 1))
+        if out_channels != 1:
+            raise ValueError(
+                "vesuvius_resunet_hybrid currently supports binary segmentation only "
+                f"(target_size must be 1, got {out_channels})"
+            )
+
+        targets_cfg = model_config.get("targets")
+        if targets_cfg is None:
+            targets_cfg = {}
+        if not isinstance(targets_cfg, dict):
+            raise TypeError(
+                "vesuvius_model_config.targets must be a dict when provided, "
+                f"got {type(targets_cfg).__name__}"
+            )
+        targets_cfg = {str(k): dict(v or {}) for k, v in targets_cfg.items()}
+        if target_name not in targets_cfg:
+            targets_cfg[target_name] = {"out_channels": out_channels, "activation": "none"}
+        if "out_channels" not in targets_cfg[target_name] and "channels" not in targets_cfg[target_name]:
+            targets_cfg[target_name]["out_channels"] = out_channels
+        if "activation" not in targets_cfg[target_name]:
+            targets_cfg[target_name]["activation"] = "none"
+
+        target_z_proj = targets_cfg[target_name].get("z_projection")
+        if target_z_proj is None:
+            target_z_proj = {}
+        if not isinstance(target_z_proj, dict):
+            raise TypeError(
+                f"Target '{target_name}' z_projection must be a dict when provided, "
+                f"got {type(target_z_proj).__name__}"
+            )
+        target_z_proj = dict(target_z_proj)
+        target_z_proj.setdefault("mode", self.vesuvius_z_projection_mode)
+        target_z_proj.setdefault("z_projection_lse_tau", self.vesuvius_z_projection_lse_tau)
+        target_z_proj.setdefault("z_projection_mlp_depth", self.vesuvius_z_projection_mlp_depth)
+        target_z_proj.setdefault("z_projection_mlp_hidden", self.vesuvius_z_projection_mlp_hidden)
+        target_z_proj.setdefault("z_projection_mlp_dropout", self.vesuvius_z_projection_mlp_dropout)
+        targets_cfg[target_name]["z_projection"] = target_z_proj
+
+        mgr = SimpleNamespace()
+        mgr.targets = targets_cfg
+        mgr.train_patch_size = (
+            int(getattr(CFG, "in_chans", 1)),
+            int(getattr(CFG, "size", 256)),
+            int(getattr(CFG, "size", 256)),
+        )
+        mgr.train_batch_size = int(getattr(CFG, "train_batch_size", 1))
+        mgr.in_channels = 1
+        mgr.autoconfigure = bool(model_config.pop("autoconfigure", True))
+        spacing = model_config.pop("spacing", [1, 1, 1])
+        if len(spacing) != 3:
+            raise ValueError(f"vesuvius spacing must have 3 entries for 3D mode, got {spacing!r}")
+        mgr.spacing = spacing
+        mgr.model_name = str(getattr(CFG, "model_name", "vesuvius_resunet_hybrid"))
+        mgr.model_config = model_config
+        mgr.enable_deep_supervision = False
+        mgr.op_dims = 3
+
+        self.vesuvius_network = NetworkFromConfig(mgr)
+        must_div = getattr(self.vesuvius_network, "must_be_divisible_by", None)
+        if isinstance(must_div, (list, tuple, np.ndarray)) and len(must_div) > 0:
+            self._vesuvius_depth_divisor = max(1, int(must_div[0]))
+
+    def _maybe_pad_vesuvius_depth(self, x: torch.Tensor) -> torch.Tensor:
+        divisor = int(getattr(self, "_vesuvius_depth_divisor", 1))
+        if divisor <= 1:
+            return x
+        depth = int(x.shape[2])
+        remainder = depth % divisor
+        if remainder == 0:
+            return x
+
+        if self.vesuvius_z_projection_mode == "learned_mlp":
+            raise ValueError(
+                "Input depth is not divisible by the network downsampling factor "
+                f"(depth={depth}, divisor={divisor}). "
+                "For learned_mlp z-projection, set in_chans/layer_range to a divisible value."
+            )
+
+        pad_depth = divisor - remainder
+        x = F.pad(x, (0, 0, 0, 0, 0, pad_depth), mode="replicate")
+        if not self._vesuvius_depth_pad_logged:
+            log(
+                "auto-padding input depth for vesuvius_resunet_hybrid "
+                f"from {depth} to {depth + pad_depth} (divisor={divisor})"
+            )
+            self._vesuvius_depth_pad_logged = True
+        return x
+
+    def _project_z(self, logits_3d: torch.Tensor) -> torch.Tensor:
+        if logits_3d.ndim != 5:
+            raise ValueError(f"_project_z expects a 5D tensor [B,C,Z,H,W], got shape {tuple(logits_3d.shape)}")
+
+        mode = self.vesuvius_z_projection_mode
+        if mode == "max":
+            return torch.amax(logits_3d, dim=2)
+        if mode == "mean":
+            return torch.mean(logits_3d, dim=2)
+        if mode == "logsumexp":
+            tau = self.vesuvius_z_projection_lse_tau
+            return tau * torch.logsumexp(logits_3d / tau, dim=2)
+        if mode == "learned_mlp":
+            raise RuntimeError(
+                "learned_mlp z-projection is now implemented inside NetworkFromConfig. "
+                "Ensure the target z_projection config is set there."
+            )
+        raise ValueError(f"Unknown z projection mode: {mode!r}")
+
+    def _extract_vesuvius_logits(self, outputs):
+        if not isinstance(outputs, dict):
+            raise TypeError(
+                "vesuvius_resunet_hybrid expects dict outputs from NetworkFromConfig, "
+                f"got {type(outputs).__name__}"
+            )
+        if self.vesuvius_target_name not in outputs:
+            raise KeyError(
+                f"Missing target {self.vesuvius_target_name!r} in NetworkFromConfig outputs. "
+                f"Available targets: {sorted(outputs.keys())!r}"
+            )
+
+        logits = outputs[self.vesuvius_target_name]
+        if isinstance(logits, (list, tuple)):
+            if len(logits) == 0:
+                raise ValueError(f"Target {self.vesuvius_target_name!r} returned an empty logits list")
+            logits = logits[0]
+
+        if logits.ndim == 5:
+            logits = self._project_z(logits)
+        elif logits.ndim != 4:
+            raise ValueError(
+                f"Target {self.vesuvius_target_name!r} produced unsupported shape {tuple(logits.shape)}; "
+                "expected [B,C,H,W] or [B,C,Z,H,W]"
+            )
+        return logits
+
+    def _align_targets_to_outputs(self, targets: torch.Tensor, outputs: torch.Tensor) -> torch.Tensor:
+        targets = targets.float()
+        if targets.shape[-2:] != outputs.shape[-2:]:
+            targets = F.interpolate(targets, size=outputs.shape[-2:], mode="bilinear", align_corners=False)
+        return targets
+
     def on_train_epoch_start(self):
         device = self.device
         self._train_loss_sum = torch.tensor(0.0, device=device)
@@ -1252,11 +1494,15 @@ class RegressionPLModel(pl.LightningModule):
             x = x[:, None]
         if self.hparams.with_norm:
             x = self.normalization(x)
-        feat_maps = self.backbone(x)
-        feat_maps_pooled = [torch.max(f, dim=2)[0] for f in feat_maps]
-        pred_mask = self.decoder(feat_maps_pooled)
+        if self.model_impl == "resnet3d_hybrid":
+            feat_maps = self.backbone(x)
+            feat_maps_pooled = [torch.max(f, dim=2)[0] for f in feat_maps]
+            pred_mask = self.decoder(feat_maps_pooled)
+            return pred_mask
 
-        return pred_mask
+        x = self._maybe_pad_vesuvius_depth(x)
+        outputs = self.vesuvius_network(x)
+        return self._extract_vesuvius_logits(outputs)
 
     def compute_per_sample_loss_and_dice(self, logits, targets):
         targets = targets.float()
@@ -1333,6 +1579,7 @@ class RegressionPLModel(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         x, y, g = batch
         outputs = self(x)
+        y = self._align_targets_to_outputs(y, outputs)
 
         objective = str(self.hparams.objective).lower()
         loss_mode = str(self.hparams.loss_mode).lower()
@@ -1495,6 +1742,7 @@ class RegressionPLModel(pl.LightningModule):
     def validation_step(self, batch, batch_idx, dataloader_idx=0):
         x, y, xyxys, g = batch
         outputs = self(x)
+        y = self._align_targets_to_outputs(y, outputs)
         per_sample_loss, per_sample_dice, per_sample_bce, per_sample_dice_loss = self.compute_per_sample_loss_and_dice(outputs, y)
 
         self._val_loss_sum += per_sample_loss.sum()
@@ -1690,12 +1938,45 @@ class RegressionPLModel(pl.LightningModule):
                     eta_min=float(eta_min),
             )
             interval = "step"
+        elif scheduler_name in {"cosine_warmup", "diffusers_cosine_warmup"}:
+            try:
+                from vesuvius.models.training.lr_schedulers import get_scheduler as get_vesuvius_scheduler
+            except Exception as exc:
+                raise ImportError(
+                    "Scheduler requires vesuvius.models.training.lr_schedulers to be importable."
+                ) from exc
+
+            total_steps = max(1, steps_per_epoch * epochs)
+            raw_warmup_steps = getattr(CFG, "scheduler_warmup_steps", None)
+            if raw_warmup_steps is None:
+                warmup_steps = int(0.1 * total_steps)
+            else:
+                warmup_steps = int(raw_warmup_steps)
+            warmup_steps = max(0, min(warmup_steps, total_steps - 1))
+
+            scheduler_kwargs = {
+                "warmup_steps": int(warmup_steps),
+            }
+            if scheduler_name == "diffusers_cosine_warmup":
+                scheduler_kwargs["num_cycles"] = float(getattr(CFG, "scheduler_num_cycles", 0.5))
+
+            scheduler = get_vesuvius_scheduler(
+                scheduler_type=scheduler_name,
+                optimizer=optimizer,
+                initial_lr=float(CFG.lr),
+                max_steps=int(total_steps),
+                **scheduler_kwargs,
+            )
+            interval = "step"
         elif scheduler_name == "gradualwarmupschedulerv2":
             scheduler = get_scheduler(CFG, optimizer)
             interval = "epoch"
         else:
             raise ValueError(
-                f"Unsupported scheduler={CFG.scheduler!r}. Supported: 'OneCycleLR' | 'cosine' | 'GradualWarmupSchedulerV2'."
+                "Unsupported scheduler="
+                f"{CFG.scheduler!r}. Supported: "
+                "'OneCycleLR' | 'cosine' | 'cosine_warmup' | "
+                "'diffusers_cosine_warmup' | 'GradualWarmupSchedulerV2'."
             )
 
         return {

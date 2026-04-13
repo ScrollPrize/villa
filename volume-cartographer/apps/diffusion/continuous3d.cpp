@@ -1,16 +1,16 @@
 #include "continuous3d.hpp"
 
 #include "common.hpp"
+#include "vc/core/cache/SimpleCacheFactory.hpp"
 
 #include <vc/ui/VCCollection.hpp>
 #include <vc/core/util/GridStore.hpp>
-#include "z5/factory.hxx"
-#include "z5/filesystem/handle.hxx"
-#include "z5/common.hxx"
-#include "z5/multiarray/xtensor_access.hxx"
+#include "vc/core/types/VcDataset.hpp"
 
 #include <boost/program_options.hpp>
 #include <opencv2/imgcodecs.hpp>
+#include <xtensor/containers/xtensor.hpp>
+#include <xtensor/generators/xbuilder.hpp>
 
 namespace po = boost::program_options;
 namespace fs = std::filesystem;
@@ -122,8 +122,7 @@ int continuous3d_main(const po::variables_map& vm) {
 
     std::cout << "Found point " << *target_point << " for winding " << target_winding << std::endl;
 
-    z5::filesystem::handle::Group group_handle(volume_path);
-    std::unique_ptr<z5::Dataset> ds = z5::openDataset(group_handle, dataset_name);
+    auto ds = std::make_unique<vc::VcDataset>(volume_path / dataset_name);
     if (!ds) {
         std::cerr << "Error: Could not open dataset '" << dataset_name << "' in volume '" << volume_path << "'." << std::endl;
         return 1;
@@ -143,8 +142,8 @@ int continuous3d_main(const po::variables_map& vm) {
     std::vector<size_t> slice_shape = {(size_t)box_d, (size_t)box_h, (size_t)box_w};
     xt::xtensor<uint8_t, 3, xt::layout_type::column_major> slice_data = xt::zeros<uint8_t>(slice_shape);
 
-    ChunkCache<uint8_t> cache(4llu*1024*1024*1024);
-    readArea3D(slice_data, offset, ds.get(), &cache);
+    auto cache = vc::cache::createSimpleTieredCache(ds.get(), 4llu*1024*1024*1024, ds->path());
+    readArea3D(slice_data, offset, cache.get(), 0);
 
     for (int z = 0; z < box_d; ++z) {
         for (int y = 0; y < box_h; ++y) {

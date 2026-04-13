@@ -3,7 +3,7 @@
 #include "../SegmentationModule.hpp"
 #include "SegmentationEditManager.hpp"
 #include "../SegmentationWidget.hpp"
-#include "../../CSurfaceCollection.hpp"
+#include "../../CState.hpp"
 
 #include <QCoreApplication>
 #include <QObject>
@@ -22,21 +22,21 @@ constexpr float kBrushSampleSpacing = 2.0f;
 SegmentationBrushTool::SegmentationBrushTool(SegmentationModule& module,
                                              SegmentationEditManager* editManager,
                                              SegmentationWidget* widget,
-                                             CSurfaceCollection* surfaces)
+                                             CState* state)
     : _module(module)
     , _editManager(editManager)
     , _widget(widget)
-    , _surfaces(surfaces)
+    , _state(state)
 {
 }
 
 void SegmentationBrushTool::setDependencies(SegmentationEditManager* editManager,
                                             SegmentationWidget* widget,
-                                            CSurfaceCollection* surfaces)
+                                            CState* state)
 {
     _editManager = editManager;
     _widget = widget;
-    _surfaces = surfaces;
+    _state = state;
 }
 
 void SegmentationBrushTool::setActive(bool active)
@@ -188,8 +188,8 @@ bool SegmentationBrushTool::applyPending(float dragRadiusSteps)
     // Capture delta for undo after edits have been tracked
     (void)_module.captureUndoDelta();
 
-    if (_surfaces) {
-        _surfaces->setSurface("segmentation", _editManager->previewSurface(), false, true);
+    if (_state) {
+        _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
     }
 
     _module.emitPendingChanges();

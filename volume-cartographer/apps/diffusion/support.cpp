@@ -7,11 +7,6 @@
 #include <boost/graph/adjacency_list.hpp>
 #include <boost/graph/graph_utility.hpp>
 
-#include <opencv2/ximgproc.hpp>
-
-
-
-
 void populate_normal_grid(const SkeletonGraph& g, vc::core::util::GridStore& normal_grid, double spiral_step) {
     const float target_dist_sq = static_cast<float>(spiral_step * spiral_step);
 

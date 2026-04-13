@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Tuple, Union
@@ -10,6 +11,9 @@ if TYPE_CHECKING:
     import zarr
     import torch
 
+os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", str((1 << 63) - 1))
+
+import cv2
 import numpy as np
 from numpy.typing import NDArray
 
@@ -60,6 +64,7 @@ class Tifxyz:
     _quad_centers_cache: Optional[NDArray[np.float32]] = field(default=None, repr=False)
     _normals_cache: Optional[Tuple[NDArray[np.float32], NDArray[np.float32], NDArray[np.float32]]] = field(default=None, repr=False)
     _patches_cache: Optional[List[Tuple[Tuple[int, int, int, int], Tuple[float, ...]]]] = field(default=None, repr=False)
+    _labels: List[Dict[str, Any]] = field(default_factory=list, repr=False)
 
     def __post_init__(self) -> None:
         """Validate shapes and ensure arrays are float32."""
@@ -195,6 +200,115 @@ class Tifxyz:
     def _stored_shape(self) -> Tuple[int, int]:
         """Return the internal storage shape (implementation detail)."""
         return self._x.shape  # type: ignore[return-value]
+
+    def list_labels(self) -> List[Dict[str, Any]]:
+        """List discovered label metadata."""
+        return [dict(label) for label in self._labels]
+
+    def _resolve_label_selector(self, selector: Union[int, str]) -> Dict[str, Any]:
+        labels = self._labels
+        if not labels:
+            raise ValueError("No labels were discovered for this segment")
+
+        if isinstance(selector, int):
+            if selector < 0 or selector >= len(labels):
+                raise IndexError(
+                    f"Label index out of range: {selector}. "
+                    f"Valid range: [0, {len(labels) - 1}]"
+                )
+            return labels[selector]
+
+        if isinstance(selector, str):
+            exact = [label for label in labels if label["filename"] == selector]
+            if len(exact) == 1:
+                return exact[0]
+
+            by_suffix = [label for label in labels if label["name"] == selector]
+            if len(by_suffix) == 1:
+                return by_suffix[0]
+            if len(by_suffix) > 1:
+                matches = ", ".join(str(label["filename"]) for label in by_suffix)
+                raise ValueError(
+                    f"Ambiguous label suffix {selector!r}. "
+                    f"Matches: {matches}"
+                )
+
+            available = ", ".join(str(label["filename"]) for label in labels)
+            raise FileNotFoundError(
+                f"Label {selector!r} not found. Available labels: {available}"
+            )
+
+        raise TypeError(
+            f"Label selector must be int or str, got {type(selector).__name__}"
+        )
+
+    @staticmethod
+    def _to_uint8(image: NDArray[Any]) -> NDArray[np.uint8]:
+        """Convert label image to uint8, scaling dynamic range when needed."""
+        if image.dtype == np.uint8:
+            return image
+
+        if image.dtype == np.bool_:
+            return (image.astype(np.uint8) * 255)
+
+        array = image.astype(np.float32, copy=False)
+        finite = np.isfinite(array)
+        if not finite.any():
+            return np.zeros(array.shape, dtype=np.uint8)
+
+        min_val = float(np.min(array[finite]))
+        max_val = float(np.max(array[finite]))
+        if max_val <= min_val:
+            out = np.zeros(array.shape, dtype=np.uint8)
+            constant = np.clip(min_val, 0.0, 255.0)
+            out[finite] = np.uint8(round(constant))
+            return out
+
+        scaled = (array - min_val) / (max_val - min_val)
+        scaled = np.clip(scaled, 0.0, 1.0) * 255.0
+        scaled[~finite] = 0.0
+        return np.rint(scaled).astype(np.uint8)
+
+    def load_label(self, selector: Union[int, str]) -> NDArray[np.uint8]:
+        """Load a discovered label by index, filename, or suffix.
+
+        Parameters
+        ----------
+        selector : Union[int, str]
+            Label selector:
+            - int: index from list_labels()
+            - str: exact filename first, then suffix (e.g. "ink" -> *_ink.*)
+        """
+        label = self._resolve_label_selector(selector)
+        filename = str(label["filename"])
+        path = Path(label["path"])
+
+        error = label.get("error")
+        if error:
+            raise ValueError(f"Cannot load label {filename!r}: {error}")
+
+        expected_shape = self._stored_shape
+        discovered_shape = label.get("shape")
+        if discovered_shape != expected_shape:
+            raise ValueError(
+                f"Cannot load label {filename!r}: "
+                f"expected shape {expected_shape}, got {discovered_shape}"
+            )
+
+        image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if image is None:
+            raise ValueError(f"Failed to read label image: {path}")
+        if image.ndim != 2:
+            raise ValueError(
+                f"Label {filename!r} must be 2D grayscale, got shape {image.shape}"
+            )
+        if image.shape != expected_shape:
+            raise ValueError(
+                f"Label {filename!r} shape changed on disk: "
+                f"expected {expected_shape}, got {image.shape}"
+            )
+
+        return self._to_uint8(image)
 
     @property
     def _valid_mask(self) -> NDArray[np.bool_]:

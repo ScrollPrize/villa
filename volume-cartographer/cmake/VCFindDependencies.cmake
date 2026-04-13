@@ -16,8 +16,8 @@ function(vc_suppress_warnings dir)
     endforeach()
 endfunction()
 
-set(BUILD_Z5PY OFF CACHE BOOL "Disable Python bits for z5" FORCE)
-set(WITH_BLOSC ON  CACHE BOOL "Enable Blosc in z5"        FORCE)
+# ---- utils is now vendored in utils/ and added via add_subdirectory() ------
+# (see top-level CMakeLists.txt)
 
 # ---- xtl / xsimd / xtensor (chunk buffer type, used throughout) --------------
 set(XTENSOR_USE_XSIMD 1)
@@ -53,30 +53,6 @@ foreach(_target xtl xsimd xtensor)
         target_include_directories(${_target} SYSTEM INTERFACE ${_inc_dirs})
     endif()
 endforeach()
-
-# Point z5's find_package(xtensor) (and transitive deps) at FetchContent builds
-set(xtl_DIR     "${FETCHCONTENT_BASE_DIR}/xtl-build"     CACHE PATH "" FORCE)
-set(xsimd_DIR   "${FETCHCONTENT_BASE_DIR}/xsimd-build"   CACHE PATH "" FORCE)
-set(xtensor_DIR "${FETCHCONTENT_BASE_DIR}/xtensor-build" CACHE PATH "" FORCE)
-
-
-FetchContent_Declare(
-    z5
-    GIT_REPOSITORY https://github.com/constantinpape/z5.git
-    GIT_TAG        2.0.20
-)
-FetchContent_MakeAvailable(z5)
-
-# z5's CMakeLists uses include_directories() which doesn't propagate;
-# link xtensor onto the z5 INTERFACE target so consumers get the headers.
-target_link_libraries(z5 INTERFACE xtensor)
-
-# Mark z5 headers as SYSTEM to suppress warnings
-get_target_property(_z5_inc_dirs z5 INTERFACE_INCLUDE_DIRECTORIES)
-if(_z5_inc_dirs)
-    set_target_properties(z5 PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "")
-    target_include_directories(z5 SYSTEM INTERFACE ${_z5_inc_dirs})
-endif()
 
 # ---- Qt (apps / utils) -------------------------------------------------------
 find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network Concurrent)
@@ -115,7 +91,23 @@ if(NOT OpenCV_FOUND)
     find_package(OpenCV 4 QUIET REQUIRED)
 endif()
 
+# ---- CGAL --------------------------------------------------------------------
+find_package(CGAL QUIET)
+if (NOT CGAL_FOUND)
+    message(FATAL_ERROR
+        "CGAL is required but was not found.\n"
+        "Please install it first (Ubuntu): sudo apt-get install -y libcgal-dev\n"
+        "If installed in a non-standard prefix, set CGAL_DIR to the directory containing\n"
+        "CGALConfig.cmake (or cgal-config.cmake), or add that directory to CMAKE_PREFIX_PATH.")
+endif()
+
 # ---- OpenMP ------------------------------------------------------------------
+# Auto-disable OpenMP when using Clang (Clang's OpenMP support is often problematic)
+if (VC_USE_OPENMP AND CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(STATUS "Clang detected — disabling OpenMP (use GCC for OpenMP support)")
+    set(VC_USE_OPENMP OFF)
+endif()
+
 if (VC_USE_OPENMP)
     message(STATUS "OpenMP support enabled")
     if(APPLE)
@@ -150,8 +142,6 @@ else()
     add_library(openmp_stub INTERFACE)
     add_library(OpenMP::OpenMP_CXX ALIAS openmp_stub)
     add_library(OpenMP::OpenMP_C  ALIAS openmp_stub)
-    # Add openmp_stub to the export set so install(EXPORT) works
-    install(TARGETS openmp_stub EXPORT "${targets_export_name}")
 endif()
 
 # ---- xtensor/xsimd (already fetched above) -----------------------------------
@@ -169,6 +159,37 @@ if (NOT json_POPULATED)
     FetchContent_Populate(json)
     add_subdirectory(${json_SOURCE_DIR} ${json_BINARY_DIR} EXCLUDE_FROM_ALL)
     vc_suppress_warnings("${json_SOURCE_DIR}")
+endif()
+
+# ---- c-blosc (compression for zarr chunks) -----------------------------------
+set(BUILD_TESTS      OFF CACHE BOOL "" FORCE)
+set(BUILD_FUZZERS    OFF CACHE BOOL "" FORCE)
+set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+set(BUILD_SHARED     OFF CACHE BOOL "" FORCE)
+set(BUILD_STATIC     ON  CACHE BOOL "" FORCE)
+set(PREFER_EXTERNAL_ZLIB OFF CACHE BOOL "" FORCE)
+set(PREFER_EXTERNAL_ZSTD OFF CACHE BOOL "" FORCE)
+set(PREFER_EXTERNAL_LZ4  OFF CACHE BOOL "" FORCE)
+set(DEACTIVATE_SNAPPY ON CACHE BOOL "" FORCE)
+# c-blosc has cmake_minimum_required < 3.5; newer CMake rejects it.
+if(NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM)
+    set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
+endif()
+FetchContent_Declare(
+    c-blosc
+    DOWNLOAD_EXTRACT_TIMESTAMP ON
+    URL https://github.com/Blosc/c-blosc/archive/refs/tags/v1.21.6.tar.gz
+)
+FetchContent_GetProperties(c-blosc)
+if(NOT c-blosc_POPULATED)
+    FetchContent_Populate(c-blosc)
+    add_subdirectory(${c-blosc_SOURCE_DIR} ${c-blosc_BINARY_DIR} EXCLUDE_FROM_ALL)
+    vc_suppress_warnings("${c-blosc_SOURCE_DIR}")
+    # GCC 15+ defaults to C23 where `bool` is a keyword, breaking blosc's
+    # `typedef _Bool bool`.  Pin blosc_static to C17 to avoid this.
+    if(TARGET blosc_static)
+        set_target_properties(blosc_static PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED ON)
+    endif()
 endif()
 
 # ---- CURL (for HTTP chunk source / remote volumes) ---------------------------

@@ -1,23 +1,23 @@
 FROM ubuntu:noble
 ARG DEBIAN_FRONTEND=noninteractive
-RUN apt-get update \
- && apt-get install -y --no-install-recommends software-properties-common \
- && add-apt-repository -y universe \
- && apt-get update \
- && rm -rf /var/lib/apt/lists/*
+RUN apt -y update
+RUN apt -y install software-properties-common
+RUN add-apt-repository -y universe
+RUN apt -y update
+RUN apt -y upgrade
+RUN apt -y full-upgrade
 
 # --- base toolchain & libs (avoiding xtensor-dev here) ---
-RUN apt-get update \
- && apt-get install -y --no-install-recommends --fix-missing \
+RUN apt -y install --no-install-recommends \
     build-essential git cmake ninja-build pkg-config \
     qt6-base-dev libboost-system-dev libboost-program-options-dev libceres-dev \
+    libcgal-dev \
     libopencv-dev libopencv-contrib-dev \
     libblosc-dev libspdlog-dev libgsl-dev libsdl2-dev libcurl4-openssl-dev nlohmann-json3-dev libavahi-client-dev \
     file curl unzip ca-certificates bzip2 wget fuse jq gimp desktop-file-utils \
  && rm -rf /var/lib/apt/lists/*
 
-RUN apt-get update \
- && apt-get install -y --no-install-recommends --fix-missing \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     flex bison zlib1g-dev gfortran libopenblas-dev liblapack-dev libscotch-dev libhwloc-dev \
  && rm -rf /var/lib/apt/lists/*
 
@@ -65,8 +65,7 @@ RUN mkdir -p pastix-install scotch-install
 # --- libigl: clone and pin to latest commit (as of 2025-10-02) ---
 # Latest on main: Aug 1, 2025 — ae8f959ea26d7059abad4c698aba8d6b7c3205e8
 ARG LIBIGL_COMMIT=ae8f959ea26d7059abad4c698aba8d6b7c3205e8
-RUN rm -rf libigl \
-    && git clone https://github.com/libigl/libigl.git libigl \
+RUN git clone https://github.com/libigl/libigl.git libigl \
      && cd libigl \
      && git fetch --depth 1 origin ${LIBIGL_COMMIT} \
      && git checkout -q ${LIBIGL_COMMIT} \
@@ -96,30 +95,27 @@ RUN make SCOTCH_HOME=/usr/local/scotch install
     
     # --- build libigl-based target (after overlay) ---
 WORKDIR /src/libs/flatboi
-RUN rm -rf build && mkdir -p build
-WORKDIR /src/libs/flatboi/build
-RUN cmake .. -DCMAKE_BUILD_TYPE=Release \
+RUN rm -rf build \
+ && cmake -S . -B build \
+      -DCMAKE_BUILD_TYPE=Release \
       -DLIBIGL_WITH_PASTIX=ON \
       -DBLA_VENDOR=OpenBLAS \
       -DCMAKE_PREFIX_PATH=/usr/local/pastix \
       -DCMAKE_CXX_FLAGS_RELEASE="-O3 -DNDEBUG" \
       -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
       -DCMAKE_CXX_FLAGS="-DSLIM_CACHED"
-RUN cmake --build . -j"$(nproc)"
+RUN cmake --build build -j"$(nproc)"
     
 # Install the flatboi binary into PATH before removing /src
-RUN install -m 0755 ./flatboi /usr/local/bin/flatboi
+RUN install -m 0755 /src/libs/flatboi/build/flatboi /usr/local/bin/flatboi
 
 # ------------------------- Build the main project ---------------------------
 RUN mkdir -p /src/build
 WORKDIR /src/build
 RUN cmake -DVC_WITH_CUDA_SPARSE=off \
-          -DCPACK_DEBIAN_PACKAGE_SHLIBDEPS=ON \
-          -DCPACK_DEBIAN_PACKAGE_DEPENDS="" \
           -GNinja /src \
  && ninja \
- && cpack -G DEB -V \
- && dpkg -i /src/build/pkgs/vc3d*.deb
+ && cp bin/* /usr/local/bin/
 
 # --------------------------- Cleanup build tree ------------------------------
 RUN apt -y autoremove && rm -rf /src

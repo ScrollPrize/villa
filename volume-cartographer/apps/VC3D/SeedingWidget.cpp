@@ -1,4 +1,5 @@
 #include "SeedingWidget.hpp"
+#include "CState.hpp"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QMessageBox>
@@ -21,8 +22,6 @@
 #include "vc/core/util/Logging.hpp"
 
 #include "vc/ui/VCCollection.hpp"
-#include "CSurfaceCollection.hpp"
-
 #include <cmath>
 #include <filesystem>
 #include <fstream>
@@ -38,18 +37,15 @@ using PathRenderMode = ViewerOverlayControllerBase::PathRenderMode;
 
 
 
-SeedingWidget::SeedingWidget(VCCollection* point_collection, CSurfaceCollection* surface_collection, QWidget* parent)
+SeedingWidget::SeedingWidget(VCCollection* point_collection, CState* state, QWidget* parent)
     : QWidget(parent)
-    , fVpkg(nullptr)
-    , currentVolume(nullptr)
-    , chunkCache(nullptr)
     , currentZSlice(0)
     , currentMode(Mode::PointMode)
     , isDrawing(false)
     , colorIndex(0)
     , jobsRunning(false)
     , _point_collection(point_collection)
-    , _surface_collection(surface_collection)
+    , _state(state)
     , progressUtil(new ProgressUtil(nullptr, this))
 {
     qRegisterMetaType<PathPrimitive>("PathPrimitive");
@@ -65,11 +61,6 @@ SeedingWidget::SeedingWidget(VCCollection* point_collection, CSurfaceCollection*
     
     // Automatically find the executable path
     executablePath = findExecutablePath();
-    if (executablePath.isEmpty()) {
-        QMessageBox::warning(this, "Warning",
-            "Could not find vc_grow_seg_from_seed executable. "
-            "Please ensure it is built and in your PATH or in the build directory.");
-    }
 }
 
 SeedingWidget::~SeedingWidget()
@@ -388,24 +379,11 @@ void SeedingWidget::setupUI()
     setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Preferred);
 }
 
-void SeedingWidget::setVolumePkg(std::shared_ptr<VolumePkg> vpkg)
+void SeedingWidget::setState(CState* state)
 {
-    std::cout << "SeedingWidget::setVolumePkg called - vpkg: " << (vpkg ? "valid" : "null") << std::endl;
-    fVpkg = vpkg;
+    _state = state;
     updateButtonStates();
 }
-
-void SeedingWidget::setCurrentVolume(std::shared_ptr<Volume> volume)
-{
-    currentVolume = volume;
-    updateButtonStates();
-}
-
-void SeedingWidget::setCache(ChunkCache<uint8_t>* cache)
-{
-    chunkCache = cache;
-}
-
 
 void SeedingWidget::onCollectionsAdded(const std::vector<uint64_t>& collectionIds)
 {
@@ -430,10 +408,6 @@ void SeedingWidget::onCollectionRemoved(uint64_t collectionId)
 
 void SeedingWidget::onVolumeChanged(std::shared_ptr<Volume> vol, const std::string& volumeId)
 {
-    std::cout << "SeedingWidget::onVolumeChanged called - volume: " << (vol ? "valid" : "null")
-              << ", volumeId: " << volumeId << std::endl;
-    currentVolume = vol;
-    currentVolumeId = volumeId;
     updateButtonStates();
 }
 
@@ -456,11 +430,12 @@ void SeedingWidget::onClearPeaksClicked()
 
 void SeedingWidget::onPreviewRaysClicked()
 {
+    auto currentVolume = _state ? _state->currentVolume() : nullptr;
     if (currentMode != Mode::PointMode || !currentVolume) {
         return;
     }
 
-    POI* focus_poi = _surface_collection->poi("focus");
+    POI* focus_poi = _state->poi("focus");
     if (!focus_poi) {
         QMessageBox::warning(this, "Warning", "No focus point set. Please set a focus point before previewing rays.");
         return;
@@ -499,6 +474,7 @@ void SeedingWidget::onPreviewRaysClicked()
 
 void SeedingWidget::onCastRaysClicked()
 {
+    auto currentVolume = _state ? _state->currentVolume() : nullptr;
     if (currentMode == Mode::PointMode) {
         if (!currentVolume) {
             return;
@@ -529,10 +505,11 @@ void SeedingWidget::onCastRaysClicked()
 
 void SeedingWidget::computeDistanceTransform()
 {
+    auto currentVolume = _state ? _state->currentVolume() : nullptr;
     if (!currentVolume) {
         return;
     }
-    
+
     // Get the current slice data
     const int width = currentVolume->sliceWidth();
     const int height = currentVolume->sliceHeight();
@@ -548,7 +525,7 @@ void SeedingWidget::computeDistanceTransform()
     }
     
     // Read the slice data using the volume's dataset
-    readInterpolated3D(sliceData, currentVolume->zarrDataset(0), coords, chunkCache);
+    currentVolume->sample(sliceData, coords, vc::SampleParams{});
     
     // Threshold the slice to create a binary image for distance transform
     cv::Mat binaryImage;
@@ -565,11 +542,12 @@ void SeedingWidget::computeDistanceTransform()
 
 void SeedingWidget::castRays()
 {
+    auto currentVolume = _state ? _state->currentVolume() : nullptr;
     if (!currentVolume) {
         return;
     }
     
-    POI* focusPoi = _surface_collection ? _surface_collection->poi("focus") : nullptr;
+    POI* focusPoi = _state ? _state->poi("focus") : nullptr;
     if (!focusPoi) {
         QMessageBox::warning(this, "Warning", "No focus point set. Please set a focus point before casting rays.");
         return;
@@ -600,33 +578,42 @@ void SeedingWidget::castRays()
 }
 
 void SeedingWidget::findPeaksAlongRay(
-    const cv::Vec2f& rayDir, 
+    const cv::Vec2f& rayDir,
     const cv::Vec3f& startPoint)
 {
+    auto currentVolume = _state ? _state->currentVolume() : nullptr;
     if (!currentVolume) {
         return;
     }
     
     const int maxRadius = maxRadiusSpinBox->value();
     auto [width, height, depth] = currentVolume->shape();
-    
+    float bx0 = 0, by0 = 0, bz0 = 0;
+    float bx1 = static_cast<float>(width), by1 = static_cast<float>(height), bz1 = static_cast<float>(depth);
+    const auto& db = currentVolume->dataBounds();
+    if (db.valid) {
+        bx0 = static_cast<float>(db.minX); bx1 = static_cast<float>(db.maxX);
+        by0 = static_cast<float>(db.minY); by1 = static_cast<float>(db.maxY);
+        bz0 = static_cast<float>(db.minZ); bz1 = static_cast<float>(db.maxZ);
+    }
+
     std::vector<float> intensities;
     std::vector<cv::Vec3f> positions;
-    
+
     // Get the window size from the spinbox
     const int window = windowSizeSpinBox->value();
-    
+
     // Trace ray up to max radius (assuming ray is in XY plane for now)
     for (int dist = 1; dist < maxRadius; dist++) {
         cv::Vec3f point;
         point[0] = startPoint[0] + dist * rayDir[0];
         point[1] = startPoint[1] + dist * rayDir[1];
         point[2] = startPoint[2]; // Keep Z constant for now (ray in XY plane)
-        
-        // Check bounds
-        if (point[0] < 0 || point[0] >= width || 
-            point[1] < 0 || point[1] >= height ||
-            point[2] < 0 || point[2] >= depth) {
+
+        // Check bounds against data region
+        if (point[0] < bx0 || point[0] >= bx1 ||
+            point[1] < by0 || point[1] >= by1 ||
+            point[2] < bz0 || point[2] >= bz1) {
             break;
         }
         
@@ -635,17 +622,17 @@ void SeedingWidget::findPeaksAlongRay(
         coord(0, 0) = point;
         
         cv::Mat_<uint8_t> intensity(1, 1);
-        readInterpolated3D(intensity, currentVolume->zarrDataset(0), coord, chunkCache);
-        
+        currentVolume->sample(intensity, coord, vc::SampleParams{});
+
         // Store intensity and position
         intensities.push_back(intensity(0, 0));
         positions.push_back(point);
     }
-    
+
     if (intensities.empty()) {
         return;
     }
-    
+
     // Place a single point at the center of each above-threshold segment
     const int thr = thresholdSpinBox->value();
     bool inside = false;
@@ -719,11 +706,15 @@ void SeedingWidget::findPeaksAlongRay(
 
 void SeedingWidget::onRunSegmentationClicked()
 {
+    auto fVpkg = _state ? _state->vpkg() : nullptr;
+    auto currentVolume = _state ? _state->currentVolume() : nullptr;
+    auto currentVolumeId = _state ? _state->currentVolumeId() : std::string{};
+
     std::cout << "SeedingWidget::onRunSegmentationClicked - START" << std::endl;
     std::cout << "  currentVolume: " << (currentVolume ? "valid" : "null") << std::endl;
     std::cout << "  currentVolumeId: " << currentVolumeId << std::endl;
     std::cout << "  fVpkg: " << (fVpkg ? "valid" : "null") << std::endl;
-    
+
     // Get the selected collection name from the combo box
     std::string sourceCollection = collectionComboBox->currentText().toStdString();
     if (sourceCollection.empty()) {
@@ -733,7 +724,7 @@ void SeedingWidget::onRunSegmentationClicked()
 
     // Combine analysis points and user-placed points for segmentation
     std::vector<ColPoint> allPoints = _point_collection->getPoints(sourceCollection);
-    
+
     if (allPoints.empty() || !fVpkg) {
         QMessageBox::warning(this, "Error", "No points available for segmentation or volume package not loaded.");
         return;
@@ -746,7 +737,7 @@ void SeedingWidget::onRunSegmentationClicked()
     // Get paths
     std::filesystem::path pathsDir;
     std::filesystem::path seedJsonPath;
-    
+
     if (fVpkg->hasSegmentations() && !fVpkg->segmentationIDs().empty()) {
         auto segID = fVpkg->segmentationIDs()[0];
         auto seg = fVpkg->segmentation(segID);
@@ -757,28 +748,28 @@ void SeedingWidget::onRunSegmentationClicked()
             QMessageBox::warning(this, "Error", "No volumes in volume package.");
             return;
         }
-        
+
         auto vol = fVpkg->volume();
         std::filesystem::path vpkgPath = vol->path().parent_path().parent_path();
         pathsDir = vpkgPath / "paths";
         seedJsonPath = vpkgPath / "seed.json";
-        
+
         if (!std::filesystem::exists(pathsDir)) {
             QMessageBox::warning(this, "Error", "Segmentation paths directory not found in volume package.");
             return;
         }
     }
-    
+
     if (!std::filesystem::exists(seedJsonPath)) {
         QMessageBox::warning(this, "Error", "seed.json not found in volume package.");
         return;
     }
-    
+
     if (!currentVolume) {
         QMessageBox::warning(this, "Error", "No current volume selected.");
         return;
     }
-    
+
     std::filesystem::path volumePath = currentVolume->path();
     QString workingDir = QString::fromStdString(pathsDir.parent_path().string());
 
@@ -938,6 +929,7 @@ QString SeedingWidget::findExecutablePath()
 
 void SeedingWidget::updateParameterPreview()
 {
+    auto currentVolume = _state ? _state->currentVolume() : nullptr;
     auto focus_points = _point_collection->getPoints("focus");
     if (focus_points.empty() || !currentVolume) {
         return;
@@ -983,29 +975,30 @@ void SeedingWidget::updateParameterPreview()
 
 void SeedingWidget::updateModeUI()
 {
+    auto currentVolume = _state ? _state->currentVolume() : nullptr;
     if (currentMode == Mode::PointMode) {
         castRaysButton->setText("Cast Rays");
         resetPointsButton->setText("Reset Points");
-        
+
         // Show radius and angle controls in point mode
         maxRadiusLabel->setVisible(true);
         maxRadiusSpinBox->setVisible(true);
         angleStepLabel->setVisible(true);
         angleStepSpinBox->setVisible(true);
-        
+
         // Enable/disable based on state
         castRaysButton->setEnabled(currentVolume != nullptr);
         resetPointsButton->setEnabled(true);
     } else { // DrawMode
         castRaysButton->setText("Analyze Paths");
         resetPointsButton->setText("Clear All Paths");
-        
+
         // Hide radius and angle controls in draw mode
         maxRadiusLabel->setVisible(false);
         maxRadiusSpinBox->setVisible(false);
         angleStepLabel->setVisible(false);
         angleStepSpinBox->setVisible(false);
-        
+
         // Enable/disable based on paths
         bool hasPaths = !paths.empty();
         castRaysButton->setEnabled(hasPaths && currentVolume != nullptr);
@@ -1015,6 +1008,7 @@ void SeedingWidget::updateModeUI()
 
 void SeedingWidget::analyzePaths()
 {
+    auto currentVolume = _state ? _state->currentVolume() : nullptr;
     if (!currentVolume || paths.empty()) {
         return;
     }
@@ -1060,6 +1054,7 @@ void SeedingWidget::analyzePaths()
 
 void SeedingWidget::findPeaksAlongPath(const PathPrimitive& path)
 {
+    auto currentVolume = _state ? _state->currentVolume() : nullptr;
     if (!currentVolume || path.points.empty()) {
         return;
     }
@@ -1067,18 +1062,26 @@ void SeedingWidget::findPeaksAlongPath(const PathPrimitive& path)
     // densify the path so we don't skip over small surfaces when drawing
     PathPrimitive densifiedPath = path.densify(0.5f); // Sample every 0.5 pixels
 
-    // Get volume dimensions for bounds checking
+    // Get data bounds for bounds checking
     auto [width, height, depth] = currentVolume->shape();
-    
+    float bx0 = 0, by0 = 0, bz0 = 0;
+    float bx1 = static_cast<float>(width), by1 = static_cast<float>(height), bz1 = static_cast<float>(depth);
+    const auto& db = currentVolume->dataBounds();
+    if (db.valid) {
+        bx0 = static_cast<float>(db.minX); bx1 = static_cast<float>(db.maxX);
+        by0 = static_cast<float>(db.minY); by1 = static_cast<float>(db.maxY);
+        bz0 = static_cast<float>(db.minZ); bz1 = static_cast<float>(db.maxZ);
+    }
+
     std::vector<float> intensities;
     std::vector<cv::Vec3f> positions;
-    
+
     // Read intensity values at each point along the (denser) path
     for (const auto& pt : densifiedPath.points) {
-        // Check bounds
-        if (pt[0] >= 0 && pt[0] < width && 
-            pt[1] >= 0 && pt[1] < height && 
-            pt[2] >= 0 && pt[2] < depth) {
+        // Check bounds against data region
+        if (pt[0] >= bx0 && pt[0] < bx1 &&
+            pt[1] >= by0 && pt[1] < by1 &&
+            pt[2] >= bz0 && pt[2] < bz1) {
             
             // Create a single-point coordinate matrix for reading
             cv::Mat_<cv::Vec3f> coord(1, 1);
@@ -1086,8 +1089,8 @@ void SeedingWidget::findPeaksAlongPath(const PathPrimitive& path)
             
             // Read the intensity value at this 3D point
             cv::Mat_<uint8_t> intensity(1, 1);
-            readInterpolated3D(intensity, currentVolume->zarrDataset(0), coord, chunkCache);
-            
+            currentVolume->sample(intensity, coord, vc::SampleParams{});
+
             intensities.push_back(intensity(0, 0));
             positions.push_back(pt);
         }
@@ -1235,6 +1238,7 @@ void SeedingWidget::finalizePath()
 
 void SeedingWidget::finalizePathLabelWraps(bool shiftHeld)
 {
+    auto currentVolume = _state ? _state->currentVolume() : nullptr;
     if (!isDrawing || currentPath.points.size() < 2 || !currentVolume) {
         isDrawing = false;
         currentPath.points.clear();
@@ -1271,6 +1275,7 @@ void SeedingWidget::finalizePathLabelWraps(bool shiftHeld)
 
 void SeedingWidget::findPeaksAlongPathToCollection(const PathPrimitive& path, const std::string& collectionName)
 {
+    auto currentVolume = _state ? _state->currentVolume() : nullptr;
     if (!currentVolume || path.points.empty()) {
         return;
     }
@@ -1278,18 +1283,26 @@ void SeedingWidget::findPeaksAlongPathToCollection(const PathPrimitive& path, co
     PathPrimitive densifiedPath = path.densify(0.5f);
 
     auto [width, height, depth] = currentVolume->shape();
+    float bx0 = 0, by0 = 0, bz0 = 0;
+    float bx1 = static_cast<float>(width), by1 = static_cast<float>(height), bz1 = static_cast<float>(depth);
+    const auto& db = currentVolume->dataBounds();
+    if (db.valid) {
+        bx0 = static_cast<float>(db.minX); bx1 = static_cast<float>(db.maxX);
+        by0 = static_cast<float>(db.minY); by1 = static_cast<float>(db.maxY);
+        bz0 = static_cast<float>(db.minZ); bz1 = static_cast<float>(db.maxZ);
+    }
 
     std::vector<float> intensities;
     std::vector<cv::Vec3f> positions;
 
     for (const auto& pt : densifiedPath.points) {
-        if (pt[0] >= 0 && pt[0] < width &&
-            pt[1] >= 0 && pt[1] < height &&
-            pt[2] >= 0 && pt[2] < depth) {
+        if (pt[0] >= bx0 && pt[0] < bx1 &&
+            pt[1] >= by0 && pt[1] < by1 &&
+            pt[2] >= bz0 && pt[2] < bz1) {
             cv::Mat_<cv::Vec3f> coord(1, 1);
             coord(0, 0) = pt;
             cv::Mat_<uint8_t> intensity(1, 1);
-            readInterpolated3D(intensity, currentVolume->zarrDataset(0), coord, chunkCache);
+            currentVolume->sample(intensity, coord, vc::SampleParams{});
             intensities.push_back(intensity(0, 0));
             positions.push_back(pt);
         }
@@ -1420,6 +1433,9 @@ void SeedingWidget::updateInfoLabel()
 
 void SeedingWidget::updateButtonStates()
 {
+    auto currentVolume = _state ? _state->currentVolume() : nullptr;
+    auto fVpkg = _state ? _state->vpkg() : nullptr;
+
     // Enable segmentation if we have any points (analysis results OR user points)
     bool hasAnyPoints = !_point_collection->getPoints("seeding_peaks").empty() || !_point_collection->getPoints("seeding_seeds").empty();
     runSegmentationButton->setEnabled(hasAnyPoints && currentVolume != nullptr);
@@ -1439,7 +1455,7 @@ void SeedingWidget::updateButtonStates()
     }
 
     // Enable neural trace if we have volume, checkpoint, and focus point
-    bool hasFocus = _surface_collection && _surface_collection->poi("focus") != nullptr;
+    bool hasFocus = _state && _state->poi("focus") != nullptr;
     bool hasCheckpoint = !_neuralCheckpointPath.isEmpty() && QFile::exists(_neuralCheckpointPath);
     _btnNeuralTrace->setEnabled(currentVolume != nullptr && hasFocus && hasCheckpoint && !jobsRunning);
 }
@@ -1478,6 +1494,9 @@ void SeedingWidget::onMouseRelease(cv::Vec3f vol_point, Qt::MouseButton button, 
 
 void SeedingWidget::onExpandSeedsClicked()
 {
+    auto fVpkg = _state ? _state->vpkg() : nullptr;
+    auto currentVolume = _state ? _state->currentVolume() : nullptr;
+
     if (!fVpkg || !currentVolume) {
         QMessageBox::warning(this, "Error", "Volume package or volume not loaded.");
         return;
@@ -1490,7 +1509,7 @@ void SeedingWidget::onExpandSeedsClicked()
     // Get paths
     std::filesystem::path pathsDir;
     std::filesystem::path expandJsonPath;
-    
+
     if (fVpkg->hasSegmentations() && !fVpkg->segmentationIDs().empty()) {
         auto segID = fVpkg->segmentationIDs()[0];
         auto seg = fVpkg->segmentation(segID);
@@ -1501,23 +1520,23 @@ void SeedingWidget::onExpandSeedsClicked()
             QMessageBox::warning(this, "Error", "No volumes in volume package.");
             return;
         }
-        
+
         auto vol = fVpkg->volume();
         std::filesystem::path vpkgPath = vol->path().parent_path().parent_path();
         pathsDir = vpkgPath / "paths";
         expandJsonPath = vpkgPath / "expand.json";
-        
+
         if (!std::filesystem::exists(pathsDir)) {
             QMessageBox::warning(this, "Error", "Segmentation paths directory not found in volume package.");
             return;
         }
     }
-    
+
     if (!std::filesystem::exists(expandJsonPath)) {
         QMessageBox::warning(this, "Error", "expand.json not found in volume package.");
         return;
     }
-    
+
     std::filesystem::path volumePath = currentVolume->path();
     QString workingDir = QString::fromStdString(pathsDir.parent_path().string());
 
@@ -1770,13 +1789,16 @@ void SeedingWidget::onNeuralCheckpointBrowseClicked()
 
 void SeedingWidget::onNeuralTraceClicked()
 {
+    auto currentVolume = _state ? _state->currentVolume() : nullptr;
+    auto fVpkg = _state ? _state->vpkg() : nullptr;
+
     // Validate prerequisites
     if (!currentVolume) {
         QMessageBox::warning(this, "Error", "No volume selected.");
         return;
     }
 
-    POI* focusPoi = _surface_collection ? _surface_collection->poi("focus") : nullptr;
+    POI* focusPoi = _state ? _state->poi("focus") : nullptr;
     if (!focusPoi) {
         QMessageBox::warning(this, "Error", "No focus point set. Please set a focus point first.");
         return;

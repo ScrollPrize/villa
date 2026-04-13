@@ -11,7 +11,7 @@
 
 #include <opencv2/core.hpp>
 
-class CSurfaceCollection;
+class CState;
 class SegmentationEditManager;
 class Surface;
 class QuadSurface;
@@ -76,15 +76,14 @@ public:
         QColor approvalBrushColor{0, 255, 0};  // Current painting color (default pure green)
         QuadSurface* surface{nullptr};
         std::optional<cv::Vec3f> approvalHoverWorld;  // Current hover position for brush circle
-        std::optional<QPointF> approvalHoverScenePos; // Scene position (avoids expensive pointTo)
-        float approvalHoverViewerScale{1.0f};         // Viewer scale for the hover position
+        std::optional<QPointF> approvalHoverSurfacePos; // Surface position (for dirty checking)
         std::optional<cv::Vec3f> approvalHoverPlaneNormal;  // Plane normal when hovering in XY/XZ/YZ viewers
 
         bool operator==(const State& rhs) const;
         bool operator!=(const State& rhs) const { return !(*this == rhs); }
     };
 
-    explicit SegmentationOverlayController(CSurfaceCollection* surfaces, QObject* parent = nullptr);
+    explicit SegmentationOverlayController(CState* state, QObject* parent = nullptr);
 
     void setEditingEnabled(bool enabled);
     void setEditManager(SegmentationEditManager* manager);
@@ -160,28 +159,31 @@ public:
     [[nodiscard]] int approvalMaskOpacity() const { return _approvalMaskOpacity; }
 
 protected:
-    bool isOverlayEnabledFor(CVolumeViewer* viewer) const override;
-    void collectPrimitives(CVolumeViewer* viewer,
+    bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
+    void collectPrimitives(VolumeViewerBase* viewer,
                            ViewerOverlayControllerBase::OverlayBuilder& builder) override;
+    void detachViewer(VolumeViewerBase* viewer) override;
 
 private slots:
     void onSurfaceChanged(std::string name, std::shared_ptr<Surface> surface);
 
 private:
     void buildRadiusOverlay(const State& state,
-                            CVolumeViewer* viewer,
+                            VolumeViewerBase* viewer,
                             ViewerOverlayControllerBase::OverlayBuilder& builder) const;
     void buildVertexMarkers(const State& state,
-                            CVolumeViewer* viewer,
+                            VolumeViewerBase* viewer,
                             ViewerOverlayControllerBase::OverlayBuilder& builder) const;
     void buildApprovalMaskOverlay(const State& state,
-                                  CVolumeViewer* viewer,
+                                  VolumeViewerBase* viewer,
                                   ViewerOverlayControllerBase::OverlayBuilder& builder) const;
+    void buildSurfaceOverlapOverlay(VolumeViewerBase* viewer,
+                                    ViewerOverlayControllerBase::OverlayBuilder& builder) const;
 
     ViewerOverlayControllerBase::PathPrimitive buildMaskPrimitive(const State& state) const;
     bool shouldShowMask(const State& state) const;
 
-    CSurfaceCollection* _surfaces{nullptr};
+    CState* _state{nullptr};
     SegmentationEditManager* _editManager{nullptr};
     ViewerManager* _viewerManager{nullptr};
     bool _editingEnabled{false};
@@ -201,11 +203,11 @@ private:
         uint64_t savedImageVersion{0};
         uint64_t pendingImageVersion{0};
     };
-    mutable std::map<CVolumeViewer*, ViewerImageCache> _viewerCaches;
+    mutable std::map<VolumeViewerBase*, ViewerImageCache> _viewerCaches;
     mutable uint64_t _savedImageVersion{0};
     mutable uint64_t _pendingImageVersion{0};
 
-    void rebuildViewerCache(CVolumeViewer* viewer, QuadSurface* surface) const;
+    void rebuildViewerCache(VolumeViewerBase* viewer, QuadSurface* surface) const;
 
     // Bilinear interpolation helper for QImage alpha channel
     // Returns interpolated alpha value (0.0-255.0) at floating point coordinates
@@ -232,4 +234,17 @@ private:
 
     // Approval mask overlay opacity (0-100, where 50 is default)
     int _approvalMaskOpacity{50};
+
+    // Surface overlap overlay cache
+    struct OverlapCache {
+        QImage image;                                       // ARGB32 overlap image (grid-sized)
+        std::map<std::string, cv::Vec3b> overlays;          // Overlay config when image was built
+        float threshold{0.0f};                              // Threshold when image was built
+        QuadSurface* surface{nullptr};                      // Current surface when image was built
+        uint64_t surfaceVersion{0};                         // Surface content version
+    };
+    mutable std::map<VolumeViewerBase*, OverlapCache> _overlapCaches;
+
+    // Deferred refresh timer - fires after throttle window to apply pending state
+    QTimer* _deferredRefreshTimer{nullptr};
 };

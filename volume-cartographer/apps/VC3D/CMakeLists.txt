@@ -5,14 +5,22 @@ add_definitions(-DCHUNK_CACHE_SIZE_GB=${CHUNK_CACHE_SIZE_GB})
 
 set(srcs
     VCAppMain.cpp
+    CState.cpp
+    CState.hpp
     Keybinds.cpp
     Keybinds.hpp
     CWindow.cpp
     CWindowContextMenu.cpp
-    CVolumeViewer.cpp
-    CVolumeViewerIntersections.cpp
-    CVolumeViewerRender.cpp
-    CVolumeViewerOverlay.cpp
+    FileWatcherService.cpp
+    FileWatcherService.hpp
+    AxisAlignedSliceController.cpp
+    AxisAlignedSliceController.hpp
+    FocusHistoryManager.cpp
+    FocusHistoryManager.hpp
+    SurfaceAreaCalculator.cpp
+    SurfaceAreaCalculator.hpp
+    SegmentationCommandHandler.cpp
+    SegmentationCommandHandler.hpp
     CVolumeViewerView.cpp
     VolumeViewerCmaps.cpp
     VolumeViewerCmaps.hpp
@@ -29,7 +37,6 @@ set(srcs
     elements/RangeSlider.cpp
     elements/RangeSlider.hpp
     SettingsDialog.cpp
-    CSurfaceCollection.cpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp
     SeedingWidget.cpp
@@ -126,6 +133,22 @@ set(srcs
     CPointCollectionWidget.cpp
     elements/COutlinedTextItem.hpp
     elements/COutlinedTextItem.cpp
+    tiled/CTiledVolumeViewer.cpp
+    tiled/CTiledVolumeViewer.hpp
+    tiled/TiledViewerCamera.cpp
+    tiled/TiledViewerCamera.hpp
+    tiled/TileScene.cpp
+    tiled/TileScene.hpp
+    tiled/TileRenderer.cpp
+    tiled/TileRenderer.hpp
+    tiled/TileRenderController.cpp
+    tiled/TileRenderController.hpp
+    tiled/SliceCache.cpp
+    tiled/SliceCache.hpp
+    tiled/RenderPool.cpp
+    tiled/RenderPool.hpp
+    tiled/PostProcess.cpp
+    tiled/PostProcess.hpp
 )
 
 if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)
@@ -141,6 +164,7 @@ target_include_directories(VC3D
         ${CMAKE_SOURCE_DIR}/libs/edt
         ${CMAKE_SOURCE_DIR}/libs/cc3d
         ${CMAKE_SOURCE_DIR}/libs/djikstra3d
+        ${CMAKE_SOURCE_DIR}/libs/c-blosc/blosc
 )
 
 # Avahi for mDNS service discovery (Linux only)
@@ -151,37 +175,23 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     endif()
 endif()
 
+if(AVAHI_FOUND)
+    target_compile_definitions(VC3D PRIVATE VC_HAVE_AVAHI=1)
+else()
+    target_compile_definitions(VC3D PRIVATE VC_HAVE_AVAHI=0)
+endif()
+
 target_link_libraries(VC3D
     vc_core
     vc_ui
     vc_tracer
     vc_flattening
     Qt6::Core
+    Qt6::Concurrent
     Qt6::Gui
     Qt6::Widgets
     Qt6::Network
     opencv_ximgproc
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
+    blosc_static
 )
-
-if (${VC_INSTALL_APPS})
-    install(
-        TARGETS VC3D
-        BUNDLE DESTINATION . COMPONENT Programs
-        RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR} COMPONENT Programs
-    )
-
-    install(
-            PROGRAMS ${CMAKE_SOURCE_DIR}/scripts/vc_sync.py
-            DESTINATION ${CMAKE_INSTALL_BINDIR}
-            COMPONENT Programs
-    )
-
-
-    qt_generate_deploy_app_script(
-        TARGET VC3D
-        OUTPUT_SCRIPT vc_gui_deploy_script
-        NO_UNSUPPORTED_PLATFORM_ERROR
-    )
-    install(SCRIPT ${vc_gui_deploy_script} COMPONENT Programs)
-endif()

@@ -3,11 +3,11 @@
 #include "SegmentationGrowth.hpp"
 
 #include <opencv2/core.hpp>
-#include <vc/core/util/ChunkCache.hpp>
-#include <z5/dataset.hxx>
 #include <cstdint>
 #include <memory>
 #include <unordered_map>
+
+namespace vc::cache { class TieredChunkCache; }
 
 class QuadSurface;
 
@@ -42,8 +42,8 @@ struct NewtonRefinementParams {
 
 // Context for SDT-guided refinement
 struct SDTContext {
-    z5::Dataset* binaryDataset = nullptr;
-    ChunkCache<uint8_t>* cache = nullptr;
+    vc::cache::TieredChunkCache* cache = nullptr;
+    int level = 0;
     NewtonRefinementParams params;
 
     // Local SDT chunk cache (keyed by chunk origin)
@@ -75,8 +75,8 @@ struct SkeletonPathParams {
 
 // Context for skeleton path extrapolation
 struct SkeletonPathContext {
-    z5::Dataset* binaryDataset = nullptr;
-    ChunkCache<uint8_t>* cache = nullptr;
+    vc::cache::TieredChunkCache* cache = nullptr;
+    int level = 0;
     SkeletonPathParams params;
 
     // Cache for loaded binary chunks (keyed by chunk origin)

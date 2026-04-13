@@ -45,12 +45,49 @@ https://github.com/MIC-DKFZ/nnUNet
 
 import functools
 
+import torch
 import torch.nn as nn
 from ..utilities.utils import get_pool_and_conv_props, get_n_blocks_per_stage
 from .encoder import Encoder
 from .decoder import Decoder
 from .activations import SwiGLUBlock, GLUBlock
 from .primus_wrapper import PrimusEncoder, PrimusDecoder
+
+
+class LearnedMLPZProjection(nn.Module):
+    """Project [B, C, Z, H, W] logits to [B, C, H, W] with an MLP over Z."""
+
+    def __init__(self, depth: int, hidden: int, dropout: float):
+        super().__init__()
+        self.depth = int(depth)
+        if self.depth <= 0:
+            raise ValueError(f"z-projection mlp depth must be > 0, got {self.depth}")
+        hidden = int(hidden)
+        if hidden <= 0:
+            raise ValueError(f"z-projection mlp hidden must be > 0, got {hidden}")
+        dropout = float(dropout)
+        if not (0.0 <= dropout <= 1.0):
+            raise ValueError(f"z-projection mlp dropout must be in [0, 1], got {dropout}")
+
+        self.mlp = nn.Sequential(
+            nn.Linear(self.depth, hidden),
+            nn.ReLU(inplace=True),
+            nn.Dropout(p=dropout),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, logits_3d: torch.Tensor) -> torch.Tensor:
+        if logits_3d.ndim != 5:
+            raise ValueError(
+                f"LearnedMLPZProjection expects [B, C, Z, H, W], got shape {tuple(logits_3d.shape)}"
+            )
+        depth = int(logits_3d.shape[2])
+        if depth != self.depth:
+            raise ValueError(
+                f"z-projection depth mismatch: expected Z={self.depth}, got Z={depth}"
+            )
+        x = logits_3d.permute(0, 1, 3, 4, 2).contiguous()  # [B, C, H, W, Z]
+        return self.mlp(x).squeeze(-1)  # [B, C, H, W]
 
 def get_activation_module(activation_str: str):
     if activation_str is None:
@@ -67,6 +104,112 @@ def get_activation_module(activation_str: str):
         raise ValueError(f"Unknown activation type: {activation_str}")
 
 class NetworkFromConfig(nn.Module):
+    def _read_projection_value(self, raw_cfg, target_info, model_config, key, default):
+        if isinstance(raw_cfg, dict) and key in raw_cfg:
+            return raw_cfg[key]
+        if key in target_info:
+            return target_info[key]
+        return model_config.get(key, default)
+
+    def _resolve_target_projection(self, target_name, target_info, model_config):
+        raw_cfg = target_info.get("z_projection", None)
+        if raw_cfg is not None and not isinstance(raw_cfg, dict):
+            raise TypeError(
+                f"Target '{target_name}' z_projection must be a dict when provided, "
+                f"got {type(raw_cfg).__name__}"
+            )
+
+        mode_default = model_config.get("z_projection_mode", "none")
+        if isinstance(raw_cfg, dict):
+            mode = raw_cfg.get("mode", mode_default)
+        else:
+            mode = target_info.get("z_projection_mode", mode_default)
+        mode = str(mode).strip().lower()
+        if mode in {"", "none", "off", "false", "0"}:
+            return None
+        if mode not in {"max", "mean", "logsumexp", "learned_mlp"}:
+            raise ValueError(
+                f"Unknown z_projection mode for target '{target_name}': {mode!r}. "
+                "Expected one of: max, mean, logsumexp, learned_mlp, none"
+            )
+        if self.op_dims != 3:
+            raise ValueError(
+                f"z_projection is only supported for 3D outputs. "
+                f"Target '{target_name}' requested mode={mode!r} with op_dims={self.op_dims}"
+            )
+
+        spec = {"mode": mode}
+        if mode == "logsumexp":
+            tau = float(self._read_projection_value(
+                raw_cfg, target_info, model_config, "z_projection_lse_tau", 1.0
+            ))
+            if tau <= 0:
+                raise ValueError(
+                    f"Target '{target_name}' z_projection_lse_tau must be > 0, got {tau}"
+                )
+            spec["lse_tau"] = tau
+        elif mode == "learned_mlp":
+            default_depth = int(self.patch_size[0]) if len(self.patch_size) == 3 else None
+            depth = self._read_projection_value(
+                raw_cfg, target_info, model_config, "z_projection_mlp_depth", default_depth
+            )
+            if depth is None:
+                raise ValueError(
+                    f"Target '{target_name}' learned_mlp z-projection requires z_projection_mlp_depth"
+                )
+            hidden = int(self._read_projection_value(
+                raw_cfg, target_info, model_config, "z_projection_mlp_hidden", 64
+            ))
+            dropout = float(self._read_projection_value(
+                raw_cfg, target_info, model_config, "z_projection_mlp_dropout", 0.0
+            ))
+            spec.update({
+                "mlp_depth": int(depth),
+                "mlp_hidden": hidden,
+                "mlp_dropout": dropout,
+            })
+        return spec
+
+    def _register_target_projection(self, target_name, target_info, model_config):
+        spec = self._resolve_target_projection(target_name, target_info, model_config)
+        if spec is None:
+            return
+        self.task_z_projection_cfg[target_name] = spec
+        if spec["mode"] == "learned_mlp":
+            self.task_z_projection_heads[target_name] = LearnedMLPZProjection(
+                depth=spec["mlp_depth"],
+                hidden=spec["mlp_hidden"],
+                dropout=spec["mlp_dropout"],
+            )
+        print(f"Task '{target_name}' configured with z-projection mode '{spec['mode']}'")
+
+    def _apply_z_projection_tensor(self, task_name, tensor, spec):
+        if tensor.ndim != 5:
+            return tensor
+        mode = spec["mode"]
+        if mode == "max":
+            return torch.amax(tensor, dim=2)
+        if mode == "mean":
+            return torch.mean(tensor, dim=2)
+        if mode == "logsumexp":
+            tau = float(spec.get("lse_tau", 1.0))
+            return tau * torch.logsumexp(tensor / tau, dim=2)
+        if mode == "learned_mlp":
+            if task_name not in self.task_z_projection_heads:
+                raise RuntimeError(
+                    f"Target '{task_name}' requested learned_mlp z-projection but no head was initialized"
+                )
+            return self.task_z_projection_heads[task_name](tensor)
+        raise ValueError(f"Unknown z-projection mode {mode!r} for target '{task_name}'")
+
+    def _apply_z_projection(self, task_name, logits):
+        spec = self.task_z_projection_cfg.get(task_name)
+        if spec is None:
+            return logits
+        if isinstance(logits, (list, tuple)):
+            return type(logits)(self._apply_z_projection_tensor(task_name, l, spec) for l in logits)
+        return self._apply_z_projection_tensor(task_name, logits, spec)
+
     def __init__(self, mgr):
         super().__init__()
         self.mgr = mgr
@@ -83,6 +226,22 @@ class NetworkFromConfig(nn.Module):
             print("model_config is empty; using default configuration")
             model_config = {}
 
+        self.op_dims = getattr(mgr, 'op_dims', None)
+        if self.op_dims is None:
+            if len(self.patch_size) == 2:
+                self.op_dims = 2
+                print(f"Using 2D operations based on patch_size {self.patch_size}")
+            elif len(self.patch_size) == 3:
+                self.op_dims = 3
+                print(f"Using 3D operations based on patch_size {self.patch_size}")
+            else:
+                raise ValueError(f"Patch size must have either 2 or 3 dimensions! Got {len(self.patch_size)}D: {self.patch_size}")
+        else:
+            print(f"Using dimensionality ({self.op_dims}D) from ConfigManager")
+
+        self.task_z_projection_cfg = {}
+        self.task_z_projection_heads = nn.ModuleDict()
+
         self.save_config = False
         
         self.architecture_type = model_config.get("architecture_type", "unet")
@@ -92,11 +251,11 @@ class NetworkFromConfig(nn.Module):
         # Primus decoders do not emit multi-scale logits; block DS to avoid silent misconfiguration
         if self.architecture_type.lower().startswith("primus"):
             if ds_enabled:
-                raise ValueError(
-                    "Deep supervision is enabled but the selected architecture 'primus' does not "
-                    "support multi-scale logits. Please disable deep supervision or switch to the 'unet' architecture "
-                    "with separate decoders for the supervised tasks."
+                print(
+                    "Warning: Deep supervision is enabled but the selected architecture 'primus' does not "
+                    "support multi-scale logits. Disabling deep supervision for this run."
                 )
+                setattr(mgr, "enable_deep_supervision", False)
             self._init_primus(mgr, model_config)
             return
 
@@ -114,19 +273,6 @@ class NetworkFromConfig(nn.Module):
         self.nonlin = model_config.get("nonlin", "nn.LeakyReLU")
         self.nonlin_kwargs = model_config.get("nonlin_kwargs", {"inplace": True})
 
-        self.op_dims = getattr(mgr, 'op_dims', None)
-        if self.op_dims is None:
-            if len(self.patch_size) == 2:
-                self.op_dims = 2
-                print(f"Using 2D operations based on patch_size {self.patch_size}")
-            elif len(self.patch_size) == 3:
-                self.op_dims = 3
-                print(f"Using 3D operations based on patch_size {self.patch_size}")
-            else:
-                raise ValueError(f"Patch size must have either 2 or 3 dimensions! Got {len(self.patch_size)}D: {self.patch_size}")
-        else:
-            print(f"Using dimensionality ({self.op_dims}D) from ConfigManager")
-
         # Convert string operation types to actual PyTorch classes
         if isinstance(self.conv_op, str):
             if self.op_dims == 2:
@@ -140,16 +286,39 @@ class NetworkFromConfig(nn.Module):
             self.norm_op_kwargs = {}
             print("Normalization disabled (norm_op=None)")
         elif isinstance(self.norm_op, str):
-            if self.norm_op == "nn.GroupNorm":
+            norm_key = self.norm_op.strip().lower().replace(" ", "")
+            if norm_key.startswith("torch.nn."):
+                norm_key = norm_key[len("torch.nn."):]
+            if norm_key.startswith("nn."):
+                norm_key = norm_key[len("nn."):]
+
+            is_batch = norm_key in {"batch", "batchnorm", "batchnorm2d", "batchnorm3d"}
+            is_instance = norm_key in {"instance", "instancenorm", "instancenorm2d", "instancenorm3d"}
+            is_group = norm_key == "groupnorm"
+
+            if is_group:
                 num_groups = self.norm_op_kwargs.pop("num_groups", 32)
                 self.norm_op = functools.partial(nn.GroupNorm, num_groups)
                 print(f"Using GroupNorm (num_groups={num_groups})")
+            elif not (is_batch or is_instance):
+                raise ValueError(
+                    f"Unknown norm_op string: {self.norm_op!r}. "
+                    "Expected batch/BatchNorm*, instance/InstanceNorm*, or nn.GroupNorm."
+                )
             elif self.op_dims == 2:
-                self.norm_op = nn.InstanceNorm2d
-                print("Using 2D normalization (nn.InstanceNorm2d)")
+                if is_batch:
+                    self.norm_op = nn.BatchNorm2d
+                    print("Using 2D normalization (nn.BatchNorm2d)")
+                else:
+                    self.norm_op = nn.InstanceNorm2d
+                    print("Using 2D normalization (nn.InstanceNorm2d)")
             else:
-                self.norm_op = nn.InstanceNorm3d
-                print("Using 3D normalization (nn.InstanceNorm3d)")
+                if is_batch:
+                    self.norm_op = nn.BatchNorm3d
+                    print("Using 3D normalization (nn.BatchNorm3d)")
+                else:
+                    self.norm_op = nn.InstanceNorm3d
+                    print("Using 3D normalization (nn.InstanceNorm3d)")
 
         if isinstance(self.dropout_op, str):
             if self.op_dims == 2:
@@ -416,6 +585,7 @@ class NetworkFromConfig(nn.Module):
                 out_channels = self.in_channels
                 print(f"No channel specification found for task '{target_name}', defaulting to {out_channels} channels (matching input)")
             target_info["out_channels"] = out_channels
+            self._register_target_projection(target_name, target_info, model_config)
 
             # Determine per-task override for decoder sharing
             use_separate = target_info.get("separate_decoder", separate_decoders_default)
@@ -506,6 +676,7 @@ class NetworkFromConfig(nn.Module):
             "in_channels": self.in_channels,
             "autoconfigure": self.autoconfigure,
             "targets": self.targets,
+            "target_z_projection": self.task_z_projection_cfg,
             "separate_decoders": len(tasks_using_separate) > 0,
             "num_pool_per_axis": getattr(self, 'num_pool_per_axis', None),
             "must_be_divisible_by": getattr(self, 'must_be_divisible_by', None)
@@ -543,7 +714,7 @@ class NetworkFromConfig(nn.Module):
         
         patch_embed_size = model_config.get("patch_embed_size", (8, 8, 8))
         if isinstance(patch_embed_size, int):
-            patch_embed_size = (patch_embed_size,) * 3
+            patch_embed_size = (patch_embed_size,) * len(self.patch_size)
         
         # Ensure input shape is specified
         input_shape = model_config.get("input_shape", self.patch_size)
@@ -600,6 +771,7 @@ class NetworkFromConfig(nn.Module):
                 out_channels = self.in_channels
                 print(f"No channel specification found for task '{target_name}', defaulting to {out_channels} channels")
             target_info["out_channels"] = out_channels
+            self._register_target_projection(target_name, target_info, model_config)
 
             use_separate = target_info.get("separate_decoder", separate_decoders_default)
             if use_separate:
@@ -647,6 +819,7 @@ class NetworkFromConfig(nn.Module):
             "input_shape": input_shape,
             "in_channels": self.in_channels,
             "targets": self.targets,
+            "target_z_projection": self.task_z_projection_cfg,
             "decoder_norm": decoder_norm_str,
             "decoder_act": decoder_act_str,
             "separate_decoders": len(tasks_using_separate) > 0,
@@ -735,6 +908,7 @@ class NetworkFromConfig(nn.Module):
             # If enabled, keep the list so training can supervise all scales.
             if isinstance(logits, (list, tuple)) and len(logits) > 0 and not ds_enabled:
                 logits = logits[0]
+            logits = self._apply_z_projection(task_name, logits)
             activation_fn = self.task_activations[task_name] if task_name in self.task_activations else None
             if activation_fn is not None and not self.training:
                 if isinstance(logits, (list, tuple)):
@@ -749,6 +923,7 @@ class NetworkFromConfig(nn.Module):
                 shared_features = self.shared_decoder(features)
             for task_name, head in self.task_heads.items():
                 logits = head(shared_features)
+                logits = self._apply_z_projection(task_name, logits)
                 activation_fn = self.task_activations[task_name] if task_name in self.task_activations else None
                 if activation_fn is not None and not self.training:
                     if isinstance(logits, (list, tuple)):

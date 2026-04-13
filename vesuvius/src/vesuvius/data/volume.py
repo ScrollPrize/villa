@@ -114,6 +114,7 @@ class Volume:
                  domain: Optional[str] = None,
                  path: Optional[str] = None,
                  download_only: bool = False,
+                 anon: bool = False,
                  ):
 
         """
@@ -152,6 +153,9 @@ class Volume:
         download_only : bool, default = False
             If True, only prepare for downloading without loading the actual data.
             Useful for segments when you only want to download the ink labels.
+        anon : bool, default = False
+            If True, use anonymous (unsigned) requests for S3 access.
+            Required for public S3 buckets when no AWS credentials are configured.
         """
 
         # Initialize basic attributes
@@ -164,6 +168,7 @@ class Volume:
         self.return_as_tensor = return_as_tensor
         self.path = path
         self.verbose = verbose
+        self.anon = anon
         self.inklabel = None  # Initialize inklabel
 
         # --- Input Validation ---
@@ -314,6 +319,12 @@ class Volume:
             print('  zarr_vol = Volume(type="zarr", path="/path/to/my/data.zarr")')
             raise
 
+    def _s3_storage_options(self, path: str) -> Optional[dict]:
+        """Return storage_options for S3 paths, None otherwise."""
+        if path.startswith('s3://'):
+            return {'anon': self.anon}
+        return None
+
     def _init_from_zarr_path(self):
         """Helper to initialize directly from a Zarr path."""
         # Log what we're doing if verbose
@@ -326,7 +337,7 @@ class Volume:
             self.data = open_zarr(
                 path=self.path,
                 mode='r',
-                storage_options={'anon': False} if self.path.startswith('s3://') else None,
+                storage_options=self._s3_storage_options(self.path),
                 verbose=self.verbose
             )
 
@@ -545,7 +556,7 @@ class Volume:
                 zarr_store = open_zarr(
                     path=zattrs_path, 
                     mode='r',
-                    storage_options={'anon': False} if zattrs_path.startswith('s3://') else None,
+                    storage_options=self._s3_storage_options(zattrs_path),
                     verbose=self.verbose
                 )
                 
@@ -575,7 +586,8 @@ class Volume:
                 
             try:
                 # Use fsspec to open the file directly - works for any protocol
-                with fsspec.open(zattrs_path, mode='rb') as f:
+                so = self._s3_storage_options(zattrs_path) or {}
+                with fsspec.open(zattrs_path, mode='rb', **so) as f:
                     zattrs_content = json.load(f)
                 
                 if self.verbose:
@@ -608,7 +620,7 @@ class Volume:
             data = open_zarr(
                 path=base_path,
                 mode='r',
-                storage_options={'anon': False} if base_path.startswith('s3://') else None,
+                storage_options=self._s3_storage_options(base_path),
                 verbose=self.verbose
             )
             
@@ -661,7 +673,7 @@ class Volume:
         try:
             # Note: We still use fsspec here because this is a PNG file, not a zarr store
             # For PNGs and other file types, fsspec.open is still the appropriate choice
-            storage_options = {'anon': False} if inklabel_url.startswith('s3://') else None
+            storage_options = self._s3_storage_options(inklabel_url)
             with fsspec.open(inklabel_url, mode='rb', **({} if storage_options is None else storage_options)) as f:
                 img_bytes = f.read()
                 img = Image.open(BytesIO(img_bytes))

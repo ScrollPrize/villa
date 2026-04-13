@@ -7,7 +7,7 @@
 #include <vector>
 
 class SegmentationEditManager;
-class CSurfaceCollection;
+class CState;
 class SegmentationModule;
 
 class SegmentationLineTool : public SegmentationTool
@@ -15,12 +15,12 @@ class SegmentationLineTool : public SegmentationTool
 public:
     SegmentationLineTool(SegmentationModule& module,
                          SegmentationEditManager* editManager,
-                         CSurfaceCollection* surfaces,
+                         CState* state,
                          float& smoothStrength,
                          int& smoothIterations);
 
     void setDependencies(SegmentationEditManager* editManager,
-                         CSurfaceCollection* surfaces);
+                         CState* state);
     void setSmoothing(float& smoothStrength, int& smoothIterations);
 
     void startStroke(const cv::Vec3f& worldPos);
@@ -38,7 +38,7 @@ public:
 private:
     SegmentationModule& _module;
     SegmentationEditManager* _editManager{nullptr};
-    CSurfaceCollection* _surfaces{nullptr};
+    CState* _state{nullptr};
     float* _smoothStrength{nullptr};
     int* _smoothIterations{nullptr};
 

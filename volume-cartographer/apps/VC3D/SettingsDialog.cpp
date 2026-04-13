@@ -2,6 +2,9 @@
 
 #include "VCSettings.hpp"
 
+#include <algorithm>
+#include <QDir>
+#include <QFileDialog>
 #include <QSettings>
 #include <QMessageBox>
 #include <QToolTip>
@@ -45,19 +48,60 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     }
 
     spinPreloadedSlices->setValue(settings.value(perf::PRELOADED_SLICES, perf::PRELOADED_SLICES_DEFAULT).toInt());
-    chkSkipImageFormatConvExp->setChecked(settings.value(perf::SKIP_IMAGE_FORMAT_CONV, perf::SKIP_IMAGE_FORMAT_CONV_DEFAULT).toBool());
     spinParallelProcesses->setValue(settings.value(perf::PARALLEL_PROCESSES, perf::PARALLEL_PROCESSES_DEFAULT).toInt());
     spinIterationCount->setValue(settings.value(perf::ITERATION_COUNT, perf::ITERATION_COUNT_DEFAULT).toInt());
     cmbDownscaleOverride->setCurrentIndex(settings.value(perf::DOWNSCALE_OVERRIDE, perf::DOWNSCALE_OVERRIDE_DEFAULT).toInt());
     chkFastInterpolation->setChecked(settings.value(perf::FAST_INTERPOLATION, perf::FAST_INTERPOLATION_DEFAULT).toBool());
     chkEnableFileWatching->setChecked(settings.value(perf::ENABLE_FILE_WATCHING, perf::ENABLE_FILE_WATCHING_DEFAULT).toBool());
 
+    // Cache settings
+    spinRamCacheSizeGB->setValue(settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toInt());
+    spinDiskCacheSizeGB->setValue(settings.value(perf::DISK_CACHE_SIZE_GB, perf::DISK_CACHE_SIZE_GB_DEFAULT).toInt());
+    {
+        QString defaultCache = QDir::homePath() + "/.VC3D/remote_cache";
+        edtRemoteCachePath->setText(settings.value(viewer::REMOTE_CACHE_DIR, defaultCache).toString());
+    }
+
+    // Video codec recompression settings
+    chkVideoRecompress->setChecked(settings.value(perf::VIDEO_RECOMPRESS_ENABLED, perf::VIDEO_RECOMPRESS_ENABLED_DEFAULT).toBool());
+    {
+        // Map codec type value to combo index: 0=H264→0, 1=H265→1, 3=C3D→2
+        int codecType = settings.value(perf::VIDEO_CODEC_TYPE, perf::VIDEO_CODEC_TYPE_DEFAULT).toInt();
+        int comboIdx = (codecType == 3) ? 2 : codecType;
+        cmbVideoCodecType->setCurrentIndex(std::clamp(comboIdx, 0, 2));
+    }
+    cmbVideoQualityPreset->setCurrentIndex(std::clamp(
+        settings.value(perf::VIDEO_QUALITY_PRESET, perf::VIDEO_QUALITY_PRESET_DEFAULT).toInt(),
+        0, perf::PRESET_COUNT - 1));
+    chkRechunk32->setChecked(settings.value(perf::VIDEO_RECHUNK_32, perf::VIDEO_RECHUNK_32_DEFAULT).toBool());
+    spinPrefetchLevels->setValue(settings.value(perf::PREFETCH_LEVELS, perf::PREFETCH_LEVELS_DEFAULT).toInt());
+    spinIOThreads->setValue(settings.value(perf::IO_THREADS, perf::IO_THREADS_DEFAULT).toInt());
+
+    // Enable/disable codec options based on checkbox
+    auto updateVideoCodecEnabled = [this]{
+        bool enabled = chkVideoRecompress->isChecked();
+        cmbVideoCodecType->setEnabled(enabled);
+        cmbVideoQualityPreset->setEnabled(enabled);
+        chkRechunk32->setEnabled(enabled);
+    };
+    updateVideoCodecEnabled();
+    connect(chkVideoRecompress, &QCheckBox::toggled, this, updateVideoCodecEnabled);
+
+    connect(btnBrowseRemoteCachePath, &QPushButton::clicked, this, [this]{
+        QString dir = QFileDialog::getExistingDirectory(this, tr("Select Remote Cache Directory"),
+            edtRemoteCachePath->text());
+        if (!dir.isEmpty()) {
+            edtRemoteCachePath->setText(dir);
+        }
+    });
 
     connect(btnHelpDownscaleOverride, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpDownscaleOverride->toolTip()); });
     connect(btnHelpScrollSpeed, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpScrollSpeed->toolTip()); });
     connect(btnHelpDisplayOpacity, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpDisplayOpacity->toolTip()); });
     connect(btnHelpPreloadedSlices, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpPreloadedSlices->toolTip()); });
     connect(btnHelpFastInterpolation, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpFastInterpolation->toolTip()); });
+    connect(btnHelpRamCacheSize, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpRamCacheSize->toolTip()); });
+    connect(btnHelpDiskCacheSize, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpDiskCacheSize->toolTip()); });
 }
 
 void SettingsDialog::accept()
@@ -92,12 +136,29 @@ void SettingsDialog::accept()
     }
 
     settings.setValue(perf::PRELOADED_SLICES, spinPreloadedSlices->value());
-    settings.setValue(perf::SKIP_IMAGE_FORMAT_CONV, chkSkipImageFormatConvExp->isChecked() ? "1" : "0");
     settings.setValue(perf::PARALLEL_PROCESSES, spinParallelProcesses->value());
     settings.setValue(perf::ITERATION_COUNT, spinIterationCount->value());
     settings.setValue(perf::DOWNSCALE_OVERRIDE, cmbDownscaleOverride->currentIndex());
     settings.setValue(perf::FAST_INTERPOLATION, chkFastInterpolation->isChecked() ? "1" : "0");
     settings.setValue(perf::ENABLE_FILE_WATCHING, chkEnableFileWatching->isChecked() ? "1" : "0");
+
+    // Cache settings
+    settings.setValue(perf::RAM_CACHE_SIZE_GB, spinRamCacheSizeGB->value());
+    settings.setValue(perf::DISK_CACHE_SIZE_GB, spinDiskCacheSizeGB->value());
+    settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text());
+
+    // Video codec recompression
+    settings.setValue(perf::VIDEO_RECOMPRESS_ENABLED, chkVideoRecompress->isChecked());
+    {
+        // Map combo index to codec type value: 0→0(H264), 1→1(H265), 2→3(C3D)
+        static constexpr int comboToCodec[] = {0, 1, 3};
+        int idx = std::clamp(cmbVideoCodecType->currentIndex(), 0, 2);
+        settings.setValue(perf::VIDEO_CODEC_TYPE, comboToCodec[idx]);
+    }
+    settings.setValue(perf::VIDEO_QUALITY_PRESET, cmbVideoQualityPreset->currentIndex());
+    settings.setValue(perf::VIDEO_RECHUNK_32, chkRechunk32->isChecked());
+    settings.setValue(perf::PREFETCH_LEVELS, spinPrefetchLevels->value());
+    settings.setValue(perf::IO_THREADS, spinIOThreads->value());
 
     QMessageBox::information(this, tr("Restart required"), tr("Note: Some settings only take effect once you restarted the app."));
 

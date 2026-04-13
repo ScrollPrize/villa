@@ -10,6 +10,7 @@ os.environ.setdefault("OPENCV_IO_MAX_IMAGE_PIXELS", "0")
 import logging
 import shutil
 import math
+import time
 from typing import List, Tuple, Optional
 import concurrent.futures
 
@@ -21,13 +22,13 @@ from numcodecs import LZ4
 from tqdm.auto import tqdm
 import fsspec
 from vendored_cache_store import CacheStore
-from zarr.storage import LocalStore, FsspecStore
+from zarr.storage import LocalStore, FsspecStore, MemoryStore
 
 from k8s import get_tqdm_kwargs
+from profiling import dir_size_bytes, get_active_profiler
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 
 def path_exists(path: str) -> bool:
     """Check if path exists (supports local paths and S3 URLs)."""
@@ -97,6 +98,18 @@ def get_cached_zarr_store(path: str):
             f"  Cache max age: {cache_max_age}"
         )
 
+        # Optional in-memory layer on top of disk cache to avoid repeated
+        # pathlib read_bytes/open calls during sliding window inference.
+        mem_cache_mb = int(os.environ.get("ZARR_MEM_CACHE_MB", "512"))
+        if mem_cache_mb > 0:
+            cached_store = CacheStore(
+                store=cached_store,
+                cache_store=MemoryStore(),
+                max_size=mem_cache_mb * 1024 * 1024,
+                max_age_seconds="infinity",
+            )
+            logger.info(f"  In-memory cache layer: {mem_cache_mb} MB")
+
         return cached_store
 
     return path
@@ -149,6 +162,8 @@ def get_zarr_store(path: str):
 def _read_gray_any(path: str) -> np.ndarray:
     """Read a grayscale image from various formats."""
     ext = os.path.splitext(path)[1].lower()
+    profiler = get_active_profiler()
+    start = time.monotonic()
     try:
         if ext in (".tif", ".tiff"):
             img = tiff.imread(path)
@@ -166,6 +181,15 @@ def _read_gray_any(path: str) -> np.ndarray:
     except Exception:
         logger.exception(f"Exception reading image: {path}")
         return None
+    finally:
+        elapsed = time.monotonic() - start
+        if profiler is not None:
+            profiler.add_duration("decode_or_deserialize_seconds", elapsed, flag="approximate")
+            profiler.add_duration("local_read_seconds", elapsed, flag="approximate")
+            try:
+                profiler.increment_counter("local_read_bytes", os.path.getsize(path))
+            except OSError:
+                profiler.add_note(f"Local read byte size unavailable for {path}")
 
 
 def create_surface_volume_zarr(
@@ -173,7 +197,8 @@ def create_surface_volume_zarr(
     output_path: str,
     chunk_size: int = 1024,
     max_workers: Optional[int] = None,
-    use_compression: bool = True
+    use_compression: bool = True,
+    profiler=None,
 ) -> str:
     """
     Create a surface volume zarr array from a list of layer image files.
@@ -239,6 +264,7 @@ def create_surface_volume_zarr(
     compression_msg = "with LZ4 compression" if use_compression else "without compression"
     logger.info(f"Creating zarr array {compression_msg}")
 
+    open_start = time.monotonic()
     z = zarr.open(
         store,
         mode="w",
@@ -249,6 +275,8 @@ def create_surface_volume_zarr(
         zarr_format=2,
         config={'write_empty_chunks': False}  # Don't write chunks that are entirely fill_value
     )
+    if profiler is not None:
+        profiler.add_duration("zarr_write_seconds", time.monotonic() - open_start, flag="approximate")
 
     # Parallel reads with batching to limit memory usage
     if max_workers is None:
@@ -264,7 +292,13 @@ def create_surface_volume_zarr(
             raise RuntimeError(f"Failed to read image: {p}")
         if img.shape != (h, w):
             raise RuntimeError(f"Layer size mismatch: {p} has {img.shape}, expected {(h, w)}")
+        write_start = time.monotonic()
         z[:, :, idx] = img  # write to zarr immediately
+        if profiler is not None:
+            profiler.add_duration("zarr_write_seconds", time.monotonic() - write_start, flag="approximate")
+            if not is_s3:
+                profiler.add_duration("local_write_seconds", time.monotonic() - write_start, flag="approximate")
+                profiler.increment_counter("local_write_bytes", int(img.nbytes))
         del img  # release memory ASAP
         return idx
 
@@ -281,6 +315,10 @@ def create_surface_volume_zarr(
                     pbar.update(1)
 
     logger.info(f"Surface volume zarr created successfully at {output_path}")
+    if profiler is not None and not is_s3:
+        profiler.set_metric("local_write_bytes", dir_size_bytes(output_path), flag="exact", semantics="counter delta")
+    elif profiler is not None and is_s3:
+        profiler.add_note("Prepare-step zarr byte attribution for S3-backed writes is unavailable; only wall time is recorded.")
     return output_path
 
 
@@ -518,7 +556,8 @@ def reduce_partitions(
     tile_size: int,
     add_scale_bar: bool = False,
     pixel_resolution_um: Optional[float] = None,
-    scale_bar_length_um: float = 10000.0
+    scale_bar_length_um: float = 10000.0,
+    profiler=None,
 ) -> Tuple:
     """
     Create a lazy tile generator that blends partition zarr arrays tile-by-tile.
@@ -559,10 +598,30 @@ def reduce_partitions(
         cached_count_path = os.path.join(cache_dir, f"mask_count_part_{part_id:03d}.zarr")
 
         if not os.path.exists(cached_pred_path):
+            bytes_to_copy = dir_size_bytes(mask_pred_path)
+            copy_start = time.monotonic()
             shutil.copytree(mask_pred_path, cached_pred_path)
+            if profiler is not None:
+                elapsed = time.monotonic() - copy_start
+                profiler.add_duration("cache_fill_seconds", elapsed, flag="approximate")
+                profiler.add_duration("local_read_seconds", elapsed, flag="approximate")
+                profiler.add_duration("local_write_seconds", elapsed, flag="approximate")
+                profiler.increment_counter("cache_fill_bytes", bytes_to_copy)
+                profiler.increment_counter("local_read_bytes", bytes_to_copy)
+                profiler.increment_counter("local_write_bytes", bytes_to_copy)
 
         if not os.path.exists(cached_count_path):
+            bytes_to_copy = dir_size_bytes(mask_count_path)
+            copy_start = time.monotonic()
             shutil.copytree(mask_count_path, cached_count_path)
+            if profiler is not None:
+                elapsed = time.monotonic() - copy_start
+                profiler.add_duration("cache_fill_seconds", elapsed, flag="approximate")
+                profiler.add_duration("local_read_seconds", elapsed, flag="approximate")
+                profiler.add_duration("local_write_seconds", elapsed, flag="approximate")
+                profiler.increment_counter("cache_fill_bytes", bytes_to_copy)
+                profiler.increment_counter("local_read_bytes", bytes_to_copy)
+                profiler.increment_counter("local_write_bytes", bytes_to_copy)
 
         # Open zarr arrays from cache
         mask_pred_z = zarr.open(cached_pred_path, mode='r')
@@ -607,6 +666,7 @@ def reduce_partitions(
                 tile_h = y_end - y
 
                 for x in range(0, W, tile_size):
+                    tile_start = time.monotonic()
                     x_end = min(x + tile_size, W)
                     tile_w = x_end - x
 
@@ -617,8 +677,13 @@ def reduce_partitions(
                     # Inner loop: accumulate from all partitions for this tile
                     for mask_pred_z, mask_count_z in partition_zarrs:
                         # Read tile from pre-opened zarr arrays
+                        read_start = time.monotonic()
                         pred_chunk = mask_pred_z[y:y_end, x:x_end]
                         count_chunk = mask_count_z[y:y_end, x:x_end]
+                        if profiler is not None:
+                            elapsed = time.monotonic() - read_start
+                            profiler.add_duration("local_read_seconds", elapsed, flag="approximate")
+                            profiler.increment_counter("local_read_bytes", int(pred_chunk.nbytes + count_chunk.nbytes))
 
                         # Accumulate
                         tile_pred += pred_chunk
@@ -638,6 +703,8 @@ def reduce_partitions(
                         result_uint8 = np.where(mask_tile == 255, scale_tile, result_uint8)
 
                     # Yield the tile
+                    if profiler is not None:
+                        profiler.add_duration("reduce_seconds", time.monotonic() - tile_start, flag="approximate")
                     yield result_uint8
                     pbar.update(1)
                     tile_idx_x += 1
@@ -647,7 +714,14 @@ def reduce_partitions(
 
 # ----------------------------- TIFF Writing ------------------------------
 
-def write_tiled_tiff(tile_iterator, shape: Tuple[int, int], output_path: str, tile_size: int = 1024, pixel_resolution_um: Optional[float] = None) -> None:
+def write_tiled_tiff(
+    tile_iterator,
+    shape: Tuple[int, int],
+    output_path: str,
+    tile_size: int = 1024,
+    pixel_resolution_um: Optional[float] = None,
+    profiler=None,
+) -> None:
     """
     Write tiles from iterator to a tiled TIFF file.
 
@@ -687,9 +761,15 @@ def write_tiled_tiff(tile_iterator, shape: Tuple[int, int], output_path: str, ti
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
 
         # Write with tiling and compression using iterator
+        write_start = time.monotonic()
         tiff.imwrite(output_path, tile_iterator, **tiff_kwargs)
+        elapsed = time.monotonic() - write_start
+        if profiler is not None:
+            profiler.add_duration("local_write_seconds", elapsed, flag="approximate")
 
         file_size_mb = os.path.getsize(output_path) / (1024 * 1024)
+        if profiler is not None:
+            profiler.increment_counter("local_write_bytes", os.path.getsize(output_path))
         logger.info(f"Wrote tiled TIFF: {output_path} ({file_size_mb:.2f} MB)")
 
     except Exception as e:

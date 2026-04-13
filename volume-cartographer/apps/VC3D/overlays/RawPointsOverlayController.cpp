@@ -1,7 +1,8 @@
 #include "RawPointsOverlayController.hpp"
 
-#include "../CSurfaceCollection.hpp"
-#include "../CVolumeViewer.hpp"
+#include "../CState.hpp"
+#include "../tiled/CTiledVolumeViewer.hpp"
+#include "../VolumeViewerBase.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
@@ -23,14 +24,14 @@ bool isValidPoint(const cv::Vec3f& p)
 
 } // namespace
 
-RawPointsOverlayController::RawPointsOverlayController(CSurfaceCollection* surfaces, QObject* parent)
+RawPointsOverlayController::RawPointsOverlayController(CState* state, QObject* parent)
     : ViewerOverlayControllerBase(kOverlayGroupRawPoints, parent)
-    , _surfaces(surfaces)
+    , _state(state)
 {
-    if (_surfaces) {
-        connect(_surfaces, &CSurfaceCollection::sendSurfaceChanged,
+    if (_state) {
+        connect(_state, &CState::surfaceChanged,
                 this, &RawPointsOverlayController::onSurfaceChanged);
-        connect(_surfaces, &CSurfaceCollection::sendPOIChanged,
+        connect(_state, &CState::poiChanged,
                 this, &RawPointsOverlayController::onPoiChanged);
     }
 }
@@ -117,19 +118,19 @@ void RawPointsOverlayController::setPointOpacity(float opacity)
     }
 }
 
-bool RawPointsOverlayController::isOverlayEnabledFor(CVolumeViewer* viewer) const
+bool RawPointsOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer) const
 {
-    return _enabled && _surfaces && viewer;
+    return _enabled && _state && viewer;
 }
 
-void RawPointsOverlayController::collectPrimitives(CVolumeViewer* viewer, OverlayBuilder& builder)
+void RawPointsOverlayController::collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder)
 {
-    if (!_enabled || !_surfaces || !viewer) {
+    if (!_enabled || !_state || !viewer) {
         return;
     }
 
     // Get the segmentation surface
-    auto surfacePtr = _surfaces->surface("segmentation");
+    auto surfacePtr = _state->surface("segmentation");
     auto* quadSurface = dynamic_cast<QuadSurface*>(surfacePtr.get());
     if (!quadSurface) {
         return;
@@ -164,17 +165,17 @@ void RawPointsOverlayController::onPoiChanged(std::string name, POI* /*poi*/)
 
 std::optional<std::pair<int, int>> RawPointsOverlayController::focusGridPosition(QuadSurface* surface) const
 {
-    if (!_surfaces || !surface) {
+    if (!_state || !surface) {
         return std::nullopt;
     }
 
-    POI* focusPoi = _surfaces->poi("focus");
+    POI* focusPoi = _state->poi("focus");
     if (!focusPoi) {
         return std::nullopt;
     }
 
     // Convert world position to grid position using pointTo
-    cv::Vec3f ptr = surface->pointer();
+    cv::Vec3f ptr(0, 0, 0);
     float dist = surface->pointTo(ptr, focusPoi->p, 10.0f, 100);
     if (dist > 5.0f) {
         return std::nullopt;
@@ -197,7 +198,7 @@ std::optional<std::pair<int, int>> RawPointsOverlayController::focusGridPosition
     return std::make_pair(row, col);
 }
 
-void RawPointsOverlayController::collectFlattenedViewPoints(CVolumeViewer* viewer,
+void RawPointsOverlayController::collectFlattenedViewPoints(VolumeViewerBase* viewer,
                                                             QuadSurface* surface,
                                                             OverlayBuilder& builder)
 {
@@ -296,7 +297,7 @@ void RawPointsOverlayController::collectFlattenedViewPoints(CVolumeViewer* viewe
     }
 }
 
-void RawPointsOverlayController::collectPlaneViewPoints(CVolumeViewer* viewer,
+void RawPointsOverlayController::collectPlaneViewPoints(VolumeViewerBase* viewer,
                                                         QuadSurface* surface,
                                                         OverlayBuilder& builder)
 {
@@ -383,7 +384,7 @@ void RawPointsOverlayController::collectPlaneViewPoints(CVolumeViewer* viewer,
     // Render points with color based on signed distance
     for (size_t i = 0; i < count; ++i) {
         const PlanePoint& pp = candidates[i];
-        QPointF scenePos = viewer->volumePointToScene(pp.world);
+        QPointF scenePos = viewer->volumeToScene(pp.world);
         const OverlayStyle& style = (pp.signedDistance >= 0) ? positiveStyle : negativeStyle;
         builder.addCircle(scenePos, scaledRadius, true, style);
     }

@@ -1,5 +1,9 @@
 import torch
 import numpy as np
+import fsspec
+import json
+import os
+import threading
 from numba import njit
 from dataclasses import dataclass
 from pathlib import Path
@@ -13,6 +17,261 @@ from scipy import ndimage
 from vesuvius.image_proc.intensity.normalization import normalize_zscore
 import tifffile
 import warnings
+
+
+_HTTP_PREFIXES = ('http://', 'https://')
+
+
+class _DiskCacheStore(zarr.abc.store.Store):
+    """Zarr 3 store wrapper that caches remote chunks to local disk.
+
+    Provides the same lazy-caching semantics as fsspec's ``filecache`` but
+    works with zarr 3's async store interface without requiring the wrapped
+    filesystem to support async (which ``WholeFileCacheFileSystem`` does not).
+    """
+
+    def __init__(self, remote: zarr.abc.store.Store, cache_dir: str, url: str) -> None:
+        super().__init__(read_only=True)
+        self._remote = remote
+        # Namespace cache by the normalized remote URL to prevent cross-dataset
+        # chunk-key collisions. Zarr chunk keys are relative paths inside one
+        # store (e.g. "c/0/1/2"), so without a per-URL prefix every dataset
+        # would write to the same paths under cache_dir.
+        normalized = url.rstrip('/')
+        scheme, sep, rest = normalized.partition('://')
+        subdir = os.path.join(scheme, rest) if sep else normalized
+        self._cache_dir = os.path.join(cache_dir, subdir)
+
+    async def _open(self) -> None:
+        self._is_open = True
+
+    # Suffix appended to the cached path to mark a "known-missing" chunk.
+    # Zarr chunk keys don't contain this pattern, so there's no collision
+    # with a real cached chunk filename.
+    _NEGATIVE_MARKER_SUFFIX = ".__notfound__"
+
+    def _atomic_write_bytes(self, target: str, data: bytes) -> None:
+        """Write `data` to `target` atomically.
+
+        Uses a per-process/thread temp file in the same directory + os.replace,
+        which is atomic on POSIX. Concurrent readers always see either the
+        old content or the new — never a partially written file.
+        """
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        tmp = f"{target}.tmp.{os.getpid()}.{threading.get_ident()}"
+        try:
+            with open(tmp, 'wb') as f:
+                f.write(data)
+            os.replace(tmp, target)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
+
+    async def get(self, key, prototype, byte_range=None):
+        cached = os.path.join(self._cache_dir, key)
+        marker = cached + self._NEGATIVE_MARKER_SUFFIX
+
+        if byte_range is None:
+            # Positive cache hit → return bytes.
+            if os.path.isfile(cached):
+                try:
+                    with open(cached, 'rb') as f:
+                        return prototype.buffer.from_bytes(f.read())
+                except FileNotFoundError:
+                    # Raced with a concurrent replace; fall through to re-fetch.
+                    pass
+            # Negative cache hit → known-missing, skip the remote round-trip.
+            if os.path.isfile(marker):
+                return None
+
+        result = await self._remote.get(key, prototype, byte_range=byte_range)
+
+        # Only cache whole-chunk reads; byte-range reads aren't cacheable.
+        if byte_range is None:
+            if result is None:
+                # Negative cache: mark the chunk as known-missing. This is safe
+                # ONLY because zarr's FsspecStore allowed_exceptions is narrow
+                # enough that None means "the chunk genuinely doesn't exist"
+                # (not "a transient network error happened"). See open_zarr
+                # below for the exact allowed_exceptions we pass.
+                try:
+                    self._atomic_write_bytes(marker, b"")
+                except OSError:
+                    # Negative cache is best-effort: if we can't write the
+                    # marker (disk full, permissions, etc.), just continue.
+                    pass
+            else:
+                self._atomic_write_bytes(cached, result.to_bytes())
+        return result
+
+    async def get_partial_values(self, prototype, key_ranges):
+        return await self._remote.get_partial_values(prototype, key_ranges)
+
+    async def exists(self, key):
+        cached = os.path.join(self._cache_dir, key)
+        if os.path.isfile(cached):
+            return True
+        if os.path.isfile(cached + self._NEGATIVE_MARKER_SUFFIX):
+            return False
+        return await self._remote.exists(key)
+
+    async def set(self, key, value):
+        raise PermissionError("read-only cache store")
+
+    async def set_if_not_exists(self, key, value):
+        raise PermissionError("read-only cache store")
+
+    async def delete(self, key):
+        raise PermissionError("read-only cache store")
+
+    async def is_empty(self, prefix=""):
+        return await self._remote.is_empty(prefix)
+
+    @property
+    def supports_writes(self):
+        return False
+
+    @property
+    def supports_deletes(self):
+        return False
+
+    @property
+    def supports_partial_writes(self):
+        return False
+
+    @property
+    def supports_listing(self):
+        return self._remote.supports_listing
+
+    def list(self):
+        return self._remote.list()
+
+    def list_prefix(self, prefix):
+        return self._remote.list_prefix(prefix)
+
+    def list_dir(self, prefix):
+        return self._remote.list_dir(prefix)
+
+    def __eq__(self, other):
+        return (
+            isinstance(other, _DiskCacheStore)
+            and self._remote == other._remote
+            and self._cache_dir == other._cache_dir
+        )
+
+
+def _resolve_config_relative_path(path_value, config):
+    """Resolve a possibly-relative path against the config file's directory."""
+    if path_value is None:
+        return None
+
+    path_obj = Path(os.path.expanduser(str(path_value)))
+    if path_obj.is_absolute():
+        return path_obj
+
+    config_dir = config.get('_config_dir') or config.get('config_dir')
+    if config_dir:
+        return Path(config_dir).expanduser() / path_obj
+    return Path.cwd() / path_obj
+
+
+def _load_http_basic_auth(auth_json_path, config):
+    """Load HTTP basic auth credentials from a JSON file."""
+    resolved_path = _resolve_config_relative_path(auth_json_path, config)
+    if resolved_path is None:
+        return None
+
+    if not resolved_path.exists():
+        raise FileNotFoundError(f"volume_auth_json file not found: {resolved_path}")
+
+    with open(resolved_path, 'r', encoding='utf-8') as f:
+        auth_data = json.load(f)
+
+    if not isinstance(auth_data, dict):
+        raise ValueError(
+            f"volume_auth_json must contain a JSON object, got {type(auth_data).__name__}"
+        )
+
+    auth_root = auth_data.get('auth') if isinstance(auth_data.get('auth'), dict) else auth_data
+    username = auth_root.get('username', auth_root.get('user'))
+    password = auth_root.get('password')
+
+    if not username or password is None:
+        raise ValueError(
+            f"volume_auth_json ({resolved_path}) must contain 'username' (or 'user') and 'password' fields"
+        )
+
+    return str(username), str(password)
+
+
+def open_zarr(path, scale=None, auth_json_path=None, config=None):
+    """Open a zarr volume from a local path, HTTP URL, or S3 URI.
+
+    Remote paths (HTTP/S3) require ``volume_cache_dir`` in *config* to enable
+    fsspec ``filecache`` so that zarr chunks are cached locally across epochs
+    and training runs.
+
+    Args:
+        path: Local path, ``http(s)://`` URL, or ``s3://`` URI to a zarr store.
+        scale: Resolution level inside the zarr group (default ``0``).
+        auth_json_path: Path to a JSON file with HTTP basic-auth credentials.
+        config: Dict with optional keys ``volume_cache_dir``, ``_config_dir``.
+    """
+    import aiohttp
+
+    path = str(path)
+    config = {} if config is None else config
+    scale = 0 if scale is None else int(scale)
+
+    is_http = path.startswith(_HTTP_PREFIXES)
+    is_s3 = path.startswith('s3://')
+
+    if is_http or is_s3:
+        cache_dir = config.get('volume_cache_dir')
+        if not cache_dir:
+            raise ValueError(
+                f"Remote volume path {path!r} requires 'volume_cache_dir' in config. "
+                f"Set it to a local directory for caching, e.g. "
+                f'{{"volume_cache_dir": "/data/zarr_cache"}}'
+            )
+        cache_dir = str(_resolve_config_relative_path(cache_dir, config) or cache_dir)
+
+    if is_http:
+        storage_opts = {}
+        # Only truly "chunk missing" errors belong here. Zarr converts anything
+        # in this tuple to a None return from store.get, which _DiskCacheStore
+        # then negative-caches. A broad catch like OSError/ClientResponseError
+        # would silently treat transient network failures (connection reset,
+        # 503) as permanent "missing" and poison the cache.
+        store_exceptions = (KeyError, FileNotFoundError)
+
+        if auth_json_path:
+            username, password = _load_http_basic_auth(auth_json_path, config)
+            storage_opts['client_kwargs'] = {'auth': aiohttp.BasicAuth(username, password)}
+
+        remote = zarr.storage.FsspecStore.from_url(
+            path.rstrip('/'),
+            storage_options=storage_opts,
+            read_only=True,
+            allowed_exceptions=store_exceptions,
+        )
+        store = _DiskCacheStore(remote, cache_dir, url=path)
+        return zarr.open(store, path=str(scale), mode='r')
+
+    if is_s3:
+        remote = zarr.storage.FsspecStore.from_url(
+            path.rstrip('/'),
+            storage_options={'anon': False},
+            read_only=True,
+        )
+        store = _DiskCacheStore(remote, cache_dir, url=path)
+        return zarr.open(store, path=str(scale), mode='r')
+
+    # Local path — no caching needed.
+    return zarr.open(path, path=str(scale), mode='r')
 
 
 def _parse_z_range(z_range):

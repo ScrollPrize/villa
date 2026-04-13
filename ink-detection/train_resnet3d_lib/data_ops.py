@@ -305,13 +305,17 @@ def resolve_segment_zarr_path(fragment_id):
     if not fragment_id:
         raise ValueError("segment id must be a non-empty string")
 
-    candidate = osp.normpath(osp.join(dataset_root, f"{fragment_id}.zarr"))
-    if _looks_like_zarr_store(candidate):
-        return candidate
+    candidates = [
+        osp.normpath(osp.join(dataset_root, f"{fragment_id}.zarr")),
+        osp.normpath(osp.join(dataset_root, fragment_id, f"{fragment_id}.zarr")),
+    ]
+    for candidate in candidates:
+        if _looks_like_zarr_store(candidate):
+            return candidate
 
     raise FileNotFoundError(
         f"Could not resolve zarr volume path for segment={fragment_id}. "
-        f"Expected zarr store at {candidate!r}."
+        f"Tried: {candidates!r}."
     )
 
 
@@ -566,15 +570,6 @@ def read_label_and_fragment_mask_for_shape(
         fragment_mask.shape[:2],
         pad_multiple,
     )
-    _assert_bottom_right_pad_compatible_global(
-        str(fragment_id),
-        "label",
-        mask.shape[:2],
-        "mask",
-        fragment_mask.shape[:2],
-        pad_multiple,
-    )
-
     fragment_mask_padded = np.zeros((image_h, image_w), dtype=fragment_mask.dtype)
     h = min(fragment_mask.shape[0], fragment_mask_padded.shape[0])
     w = min(fragment_mask.shape[1], fragment_mask_padded.shape[1])
@@ -1017,7 +1012,17 @@ def _resize_label_for_loss(label, cfg):
         label = label.to(dtype=torch.float32)
     if label.numel() > 0 and float(label.max().detach().item()) > 1.0:
         label = label / 255.0
-    return F.interpolate(label.unsqueeze(0), (cfg.size // 4, cfg.size // 4)).squeeze(0)
+
+    model_impl = str(getattr(cfg, "model_impl", "resnet3d_hybrid")).strip().lower()
+    target_side = int(getattr(cfg, "size", 256))
+    if model_impl != "vesuvius_resunet_hybrid":
+        target_side = max(1, target_side // 4)
+    target_hw = (target_side, target_side)
+
+    label_4d = label.unsqueeze(0)
+    if tuple(label_4d.shape[-2:]) != target_hw:
+        label_4d = F.interpolate(label_4d, size=target_hw)
+    return label_4d.squeeze(0)
 
 
 def _apply_joint_transform(transform, image, label, cfg):

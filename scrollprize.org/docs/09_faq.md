@@ -8,7 +8,7 @@ hide_table_of_contents: true
 
   <meta
     name="description"
-    content="A $1,500,000+ machine learning and computer vision competition"
+    content="A $1,700,000+ machine learning and computer vision competition"
   />
 
   <meta property="og:type" content="website" />
@@ -16,7 +16,7 @@ hide_table_of_contents: true
   <meta property="og:title" content="Vesuvius Challenge" />
   <meta
     property="og:description"
-    content="A $1,500,000+ machine learning and computer vision competition"
+    content="A $1,700,000+ machine learning and computer vision competition"
   />
   <meta
     property="og:image"
@@ -28,7 +28,7 @@ hide_table_of_contents: true
   <meta property="twitter:title" content="Vesuvius Challenge" />
   <meta
     property="twitter:description"
-    content="A $1,500,000+ machine learning and computer vision competition"
+    content="A $1,700,000+ machine learning and computer vision competition"
   />
   <meta
     property="twitter:image"
@@ -174,7 +174,7 @@ This depends on the jurisdiction you live in, but generally yes, you do have to 
 
 <div>Generally <strong>yes</strong>, with the conditions that are specified in the <a href="https://forms.gle/HV1J6dJbmCB2z5QL8">Data Agreement</a>:</div>
 
-* Any publications and presentations must cite the EduceLab-Scrolls Dataset.
+* Any publications and presentations must cite the dataset(s) used. See the <a href="/data#how-to-cite">How to Cite</a> section on the data page for the correct citation for EduceLab-Scrolls data versus newer Vesuvius Challenge scan releases.
 * You won’t publish any revelation of hidden text (or associated code) without the written approval of Vesuvius Challenge.
 
 We very much encourage researchers and students to work on this! Be sure to reach out to us [on Discord or by email](/get_started#1-join-the-community).

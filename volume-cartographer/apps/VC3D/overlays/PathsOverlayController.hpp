@@ -10,7 +10,7 @@ public:
     explicit PathsOverlayController(QObject* parent = nullptr);
 
 protected:
-    bool isOverlayEnabledFor(CVolumeViewer* viewer) const override;
-    void collectPrimitives(CVolumeViewer* viewer, OverlayBuilder& builder) override;
+    bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
+    void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) override;
 };
 

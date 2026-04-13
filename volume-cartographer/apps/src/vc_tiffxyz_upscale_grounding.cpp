@@ -4,7 +4,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 
-#include "z5/factory.hxx"
+#include "vc/core/types/VcDataset.hpp"
 #include <nlohmann/json.hpp>
 
 #include <opencv2/imgcodecs.hpp>
@@ -310,7 +310,7 @@ int main(int argc, char *argv[])
             if (points_lr(p)[0] == -1)
                 continue;
             
-            auto ptr = surfs[i]->pointer();
+            auto ptr = cv::Vec3f(0, 0, 0);
             float res = surfs[i]->pointTo(ptr, points_lr(p), 2.0);
             
             if (res < 0 || res >= 2)

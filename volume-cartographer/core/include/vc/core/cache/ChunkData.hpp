@@ -49,13 +49,21 @@ using ChunkDataPtr = std::shared_ptr<ChunkData>;
 
 // Compressed chunk bytes (warm tier / on-disk storage).
 struct CompressedChunk {
-    std::vector<uint8_t> data;
+    std::vector<uint8_t> data;  // compressed bytes
 };
 
 // Callback signature for decompressing raw bytes into ChunkData.
 // The cache itself is compression-agnostic; the caller provides this.
 using DecompressFn = std::function<ChunkDataPtr(
     const std::vector<uint8_t>& compressed,
+    const ChunkKey& key)>;
+
+// Optional callback for recompressing chunks before writing to disk cache.
+// Called with the original compressed bytes from the remote source.
+// Returns recompressed bytes (e.g., video codec compressed).
+// If null, chunks are stored to disk in their original format.
+using RecompressFn = std::function<std::vector<uint8_t>(
+    const std::vector<uint8_t>& original,
     const ChunkKey& key)>;
 
 }  // namespace vc::cache

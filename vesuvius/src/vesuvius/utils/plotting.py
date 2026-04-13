@@ -36,7 +36,11 @@ def _save_gif_worker(frames_list, path, _fps):
         sys.exit(1)
 
 
-def minmax_scale_to_8bit(arr_np, clip_quantile: float = 0.005):
+def minmax_scale_to_8bit(
+    arr_np,
+    clip_quantile: float = 0.005,
+    value_range: Optional[tuple[float, float]] = None,
+):
     """Convert array to 8-bit by scaling to 0-255 range with optional outlier clipping (default 0.5/99.5 percentiles)."""
     if not 0.0 <= clip_quantile < 0.5:
         raise ValueError("clip_quantile must be in the range [0.0, 0.5)")
@@ -47,7 +51,13 @@ def minmax_scale_to_8bit(arr_np, clip_quantile: float = 0.005):
     else:
         arr_np = arr_np.astype(np.float32, copy=False)
 
-    if clip_quantile > 0.0:
+    if value_range is not None:
+        lower, upper = value_range
+        lower = float(lower)
+        upper = float(upper)
+        if np.isfinite(lower) and np.isfinite(upper) and upper > lower:
+            arr_np = np.clip(arr_np, lower, upper)
+    elif clip_quantile > 0.0:
         lower = float(np.quantile(arr_np, clip_quantile))
         upper = float(np.quantile(arr_np, 1.0 - clip_quantile))
         if upper > lower:
@@ -68,6 +78,109 @@ def minmax_scale_to_8bit(arr_np, clip_quantile: float = 0.005):
             scaled = 0.0
         arr_np = np.full_like(arr_np, scaled, dtype=np.float32)
     return np.clip(arr_np, 0, 255).astype(np.uint8)
+
+
+def _resolve_display_signal(
+    arr_np: np.ndarray,
+    *,
+    is_2d_run: bool,
+    task_name: str | None = None,
+    task_cfg: Dict | None = None,
+):
+    """Resolve the signal actually rendered by convert_slice_to_bgr for consistent global scaling."""
+    task_cfg = task_cfg or {}
+    task_type = task_cfg.get("visualization") or task_cfg.get("type")
+    is_spatial_3d_volume = arr_np.ndim == 3 and not is_2d_run
+    is_surface = (
+        (task_name is not None and task_name.endswith("surface_frame"))
+        or task_type == "surface_frame"
+        or (arr_np.ndim >= 3 and arr_np.shape[0] == 9 and not is_spatial_3d_volume)
+    )
+    if is_surface:
+        return None
+
+    if arr_np.ndim == 2:
+        return arr_np
+
+    # In 3D runs, [Z, H, W] tensors are spatial volumes, not channel-first 2D tensors.
+    if arr_np.ndim == 3 and not is_2d_run:
+        return arr_np
+
+    if arr_np.ndim == 3:
+        if arr_np.shape[0] == 1:
+            return arr_np[0]
+        if arr_np.shape[0] == 3:
+            return np.transpose(arr_np, (1, 2, 0))
+        if arr_np.shape[0] == 2:
+            return arr_np[1]
+        is_affinity = (
+            task_type == "affinity"
+            or (task_name is not None and "affinity" in task_name.lower())
+        )
+        return arr_np.mean(axis=0) if is_affinity else arr_np[0]
+
+    if arr_np.ndim == 4:
+        if arr_np.shape[0] == 1:
+            return arr_np[0]
+        if arr_np.shape[0] == 3:
+            return np.transpose(arr_np, (1, 2, 3, 0))
+        if arr_np.shape[0] == 2:
+            return arr_np[1]
+        is_affinity = (
+            task_type == "affinity"
+            or (task_name is not None and "affinity" in task_name.lower())
+        )
+        return arr_np.mean(axis=0) if is_affinity else arr_np[0]
+
+    return arr_np
+
+
+def _compute_display_value_range(
+    arr_np: np.ndarray,
+    *,
+    is_2d_run: bool,
+    task_name: str | None = None,
+    task_cfg: Dict | None = None,
+    clip_quantile: float = 0.005,
+) -> Optional[tuple[float, float]]:
+    """Compute robust global visualization bounds used for all slices of a panel."""
+    signal = _resolve_display_signal(
+        arr_np,
+        is_2d_run=is_2d_run,
+        task_name=task_name,
+        task_cfg=task_cfg,
+    )
+    if signal is None:
+        return None
+
+    vals = signal.astype(np.float32, copy=False)
+    finite_mask = np.isfinite(vals)
+    if not np.any(finite_mask):
+        return (0.0, 1.0)
+    finite_vals = vals[finite_mask]
+
+    if clip_quantile > 0.0 and finite_vals.size > 1:
+        lower = float(np.quantile(finite_vals, clip_quantile))
+        upper = float(np.quantile(finite_vals, 1.0 - clip_quantile))
+    else:
+        lower = float(finite_vals.min())
+        upper = float(finite_vals.max())
+
+    if not np.isfinite(lower) or not np.isfinite(upper):
+        return (0.0, 1.0)
+
+    # Keep a stable non-degenerate range for nearly-uniform panels.
+    if upper <= lower:
+        lower = float(finite_vals.min())
+        upper = float(finite_vals.max())
+        if upper <= lower:
+            uniform_val = lower
+            assumed_max = max(2.0, uniform_val)
+            if assumed_max <= 0.0:
+                assumed_max = 1.0
+            return (0.0, float(assumed_max))
+
+    return (lower, upper)
 
 
 def add_text_label(img, text):
@@ -151,7 +264,13 @@ def _surface_frame_to_bgr(frame_slice):
     return combined
 
 
-def convert_slice_to_bgr(slice_2d_or_3d, *, task_name: str | None = None, task_cfg: Dict | None = None):
+def convert_slice_to_bgr(
+    slice_2d_or_3d,
+    *,
+    task_name: str | None = None,
+    task_cfg: Dict | None = None,
+    value_range: Optional[tuple[float, float]] = None,
+):
     """Convert a slice to BGR format for visualization"""
     task_cfg = task_cfg or {}
     task_type = task_cfg.get("visualization") or task_cfg.get("type")
@@ -163,7 +282,7 @@ def convert_slice_to_bgr(slice_2d_or_3d, *, task_name: str | None = None, task_c
 
     if slice_2d_or_3d.ndim == 2:
         # Single channel - convert to BGR
-        ch_8u = minmax_scale_to_8bit(slice_2d_or_3d)
+        ch_8u = minmax_scale_to_8bit(slice_2d_or_3d, value_range=value_range)
         return cv2.cvtColor(ch_8u, cv2.COLOR_GRAY2BGR)
 
     elif slice_2d_or_3d.ndim == 3:
@@ -174,17 +293,17 @@ def convert_slice_to_bgr(slice_2d_or_3d, *, task_name: str | None = None, task_c
                 pass
         if slice_2d_or_3d.shape[0] == 1:
             # Single channel with channel dimension
-            ch_8u = minmax_scale_to_8bit(slice_2d_or_3d[0])
+            ch_8u = minmax_scale_to_8bit(slice_2d_or_3d[0], value_range=value_range)
             return cv2.cvtColor(ch_8u, cv2.COLOR_GRAY2BGR)
         
         elif slice_2d_or_3d.shape[0] == 3:
             # RGB or normal map - just transpose and scale
             rgb = np.transpose(slice_2d_or_3d, (1, 2, 0))
-            return minmax_scale_to_8bit(rgb)
+            return minmax_scale_to_8bit(rgb, value_range=value_range)
         
         elif slice_2d_or_3d.shape[0] == 2:
             # Binary segmentation - use foreground channel (channel 1)
-            ch_8u = minmax_scale_to_8bit(slice_2d_or_3d[1])
+            ch_8u = minmax_scale_to_8bit(slice_2d_or_3d[1], value_range=value_range)
             return cv2.cvtColor(ch_8u, cv2.COLOR_GRAY2BGR)
         
         else:
@@ -195,9 +314,9 @@ def convert_slice_to_bgr(slice_2d_or_3d, *, task_name: str | None = None, task_c
             if is_affinity:
                 # Aggregate across channels for visualization
                 agg = slice_2d_or_3d.mean(axis=0)
-                ch_8u = minmax_scale_to_8bit(agg)
+                ch_8u = minmax_scale_to_8bit(agg, value_range=value_range)
             else:
-                ch_8u = minmax_scale_to_8bit(slice_2d_or_3d[0])
+                ch_8u = minmax_scale_to_8bit(slice_2d_or_3d[0], value_range=value_range)
             return cv2.cvtColor(ch_8u, cv2.COLOR_GRAY2BGR)
     
     else:
@@ -234,6 +353,8 @@ def save_debug(
         extracted from the visualization (middle Z slice for 3D data).
     """
     
+    tasks_dict = tasks_dict or {}
+
     # Get input array
     # Convert BFloat16 to Float32 before numpy conversion
     if input_volume.dtype == torch.bfloat16:
@@ -373,6 +494,71 @@ def save_debug(
     # Create visualization
     # Get actual prediction tasks (not skeleton data)
     pred_task_names = sorted(list(preds_np.keys()))
+
+    # Compute stable global display ranges per panel/tensor to avoid per-slice flicker artifacts.
+    val_input_range = _compute_display_value_range(inp_np, is_2d_run=is_2d)
+    target_ranges = {
+        t_name: _compute_display_value_range(
+            t_arr,
+            is_2d_run=is_2d,
+            task_name=t_name,
+            task_cfg=tasks_dict.get(t_name, {}),
+        )
+        for t_name, t_arr in targets_np.items()
+    }
+    pred_ranges = {
+        t_name: _compute_display_value_range(
+            p_arr,
+            is_2d_run=is_2d,
+            task_name=t_name,
+            task_cfg=tasks_dict.get(t_name, {}),
+        )
+        for t_name, p_arr in preds_np.items()
+    }
+
+    train_input_range = (
+        _compute_display_value_range(train_inp_np, is_2d_run=is_2d) if train_inp_np is not None else None
+    )
+    train_target_ranges = {
+        t_name: _compute_display_value_range(
+            t_arr,
+            is_2d_run=is_2d,
+            task_name=t_name,
+            task_cfg=tasks_dict.get(t_name, {}),
+        )
+        for t_name, t_arr in train_targets_np.items()
+    }
+    train_pred_ranges = {
+        t_name: _compute_display_value_range(
+            p_arr,
+            is_2d_run=is_2d,
+            task_name=t_name,
+            task_cfg=tasks_dict.get(t_name, {}),
+        )
+        for t_name, p_arr in train_preds_np.items()
+    }
+
+    unlabeled_input_range = (
+        _compute_display_value_range(unlabeled_inp_np, is_2d_run=is_2d) if unlabeled_inp_np is not None else None
+    )
+    unlabeled_pseudo_ranges = {
+        t_name: _compute_display_value_range(
+            p_arr,
+            is_2d_run=is_2d,
+            task_name=t_name,
+            task_cfg=tasks_dict.get(t_name, {}),
+        )
+        for t_name, p_arr in unlabeled_pseudo_np.items()
+    }
+    unlabeled_pred_ranges = {
+        t_name: _compute_display_value_range(
+            p_arr,
+            is_2d_run=is_2d,
+            task_name=t_name,
+            task_cfg=tasks_dict.get(t_name, {}),
+        )
+        for t_name, p_arr in unlabeled_preds_np.items()
+    }
     
     def _pad_rows_to_uniform_width(rows_list: list[np.ndarray]) -> list[np.ndarray]:
         if not rows_list:
@@ -399,59 +585,119 @@ def save_debug(
         rows = []
         
         # Val row: input, targets (including skels), preds
-        val_imgs = [add_text_label(convert_slice_to_bgr(inp_np), "Val Input")]
+        val_imgs = [add_text_label(convert_slice_to_bgr(inp_np, value_range=val_input_range), "Val Input")]
         
         # Show all targets (including skeleton data)
         for t_name in sorted(targets_np.keys()):
             gt = targets_np[t_name]
             gt_slice = gt[0] if gt.shape[0] == 1 else gt
             label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-            val_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), label))
+            val_imgs.append(
+                add_text_label(
+                    convert_slice_to_bgr(
+                        gt_slice,
+                        task_name=t_name,
+                        task_cfg=tasks_dict.get(t_name, {}),
+                        value_range=target_ranges.get(t_name),
+                    ),
+                    label,
+                )
+            )
         
         # Show predictions (only for actual model outputs)
         for t_name in pred_task_names:
             pred = preds_np[t_name]
             pred_slice = pred[0] if pred.ndim == 3 and pred.shape[0] == 1 else pred
-            val_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
+            val_imgs.append(
+                add_text_label(
+                    convert_slice_to_bgr(
+                        pred_slice,
+                        task_name=t_name,
+                        task_cfg=tasks_dict.get(t_name, {}),
+                        value_range=pred_ranges.get(t_name),
+                    ),
+                    f"Pred {t_name}",
+                )
+            )
         
         rows.append(np.hstack(val_imgs))
         
         # Train row if available
         if train_inp_np is not None:
-            train_imgs = [add_text_label(convert_slice_to_bgr(train_inp_np), "Train Input")]
+            train_imgs = [add_text_label(convert_slice_to_bgr(train_inp_np, value_range=train_input_range), "Train Input")]
             
             # Show all train targets (including skeleton data)
             for t_name in sorted(train_targets_np.keys()):
                 gt = train_targets_np[t_name]
                 gt_slice = gt[0] if gt.shape[0] == 1 else gt
                 label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-                train_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), label))
+                train_imgs.append(
+                    add_text_label(
+                        convert_slice_to_bgr(
+                            gt_slice,
+                            task_name=t_name,
+                            task_cfg=tasks_dict.get(t_name, {}),
+                            value_range=train_target_ranges.get(t_name),
+                        ),
+                        label,
+                    )
+                )
             
             # Show train predictions (only for actual model outputs)
             for t_name in pred_task_names:
                 if t_name in train_preds_np:
                     pred = train_preds_np[t_name]
                     pred_slice = pred[0] if pred.ndim == 3 and pred.shape[0] == 1 else pred
-                    train_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
+                    train_imgs.append(
+                        add_text_label(
+                            convert_slice_to_bgr(
+                                pred_slice,
+                                task_name=t_name,
+                                task_cfg=tasks_dict.get(t_name, {}),
+                                value_range=train_pred_ranges.get(t_name),
+                            ),
+                            f"Pred {t_name}",
+                        )
+                    )
 
             rows.append(np.hstack(train_imgs))
 
         # Unlabeled row if available (for semi-supervised training)
         if unlabeled_inp_np is not None:
-            unlabeled_imgs = [add_text_label(convert_slice_to_bgr(unlabeled_inp_np), "Unlabeled")]
+            unlabeled_imgs = [add_text_label(convert_slice_to_bgr(unlabeled_inp_np, value_range=unlabeled_input_range), "Unlabeled")]
 
             # Show pseudo-labels (teacher predictions)
             for t_name in sorted(unlabeled_pseudo_np.keys()):
                 pseudo = unlabeled_pseudo_np[t_name]
                 pseudo_slice = pseudo[0] if pseudo.ndim == 3 and pseudo.shape[0] == 1 else pseudo
-                unlabeled_imgs.append(add_text_label(convert_slice_to_bgr(pseudo_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pseudo {t_name}"))
+                unlabeled_imgs.append(
+                    add_text_label(
+                        convert_slice_to_bgr(
+                            pseudo_slice,
+                            task_name=t_name,
+                            task_cfg=tasks_dict.get(t_name, {}),
+                            value_range=unlabeled_pseudo_ranges.get(t_name),
+                        ),
+                        f"Pseudo {t_name}",
+                    )
+                )
 
             # Show student predictions on unlabeled data
             for t_name in pred_task_names:
                 if t_name in unlabeled_preds_np:
                     pred = unlabeled_preds_np[t_name]
                     pred_slice = pred[0] if pred.ndim == 3 and pred.shape[0] == 1 else pred
-                    unlabeled_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
+                    unlabeled_imgs.append(
+                        add_text_label(
+                            convert_slice_to_bgr(
+                                pred_slice,
+                                task_name=t_name,
+                                task_cfg=tasks_dict.get(t_name, {}),
+                                value_range=unlabeled_pred_ranges.get(t_name),
+                            ),
+                            f"Pred {t_name}",
+                        )
+                    )
 
             rows.append(np.hstack(unlabeled_imgs))
 
@@ -481,7 +727,7 @@ def save_debug(
             inp_slice = inp_np[z_idx] if inp_np.ndim == 3 else inp_np[:, z_idx, :, :]
             
             # Val row
-            val_imgs = [add_text_label(convert_slice_to_bgr(inp_slice), "Val Input")]
+            val_imgs = [add_text_label(convert_slice_to_bgr(inp_slice, value_range=val_input_range), "Val Input")]
             
             # Show all targets (including skeleton data)
             for t_name in sorted(targets_np.keys()):
@@ -491,7 +737,17 @@ def save_debug(
                 else:
                     gt_slice = gt[:, z_idx, :, :]
                 label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-                val_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), label))
+                val_imgs.append(
+                    add_text_label(
+                        convert_slice_to_bgr(
+                            gt_slice,
+                            task_name=t_name,
+                            task_cfg=tasks_dict.get(t_name, {}),
+                            value_range=target_ranges.get(t_name),
+                        ),
+                        label,
+                    )
+                )
             
             # Show predictions (only for actual model outputs)
             for t_name in pred_task_names:
@@ -503,14 +759,24 @@ def save_debug(
                         pred_slice = pred[:, z_idx, :, :]
                 else:
                     pred_slice = pred[z_idx, :, :]
-                val_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
+                val_imgs.append(
+                    add_text_label(
+                        convert_slice_to_bgr(
+                            pred_slice,
+                            task_name=t_name,
+                            task_cfg=tasks_dict.get(t_name, {}),
+                            value_range=pred_ranges.get(t_name),
+                        ),
+                        f"Pred {t_name}",
+                    )
+                )
             
             rows.append(np.hstack(val_imgs))
             
             # Train row if available
             if train_inp_np is not None:
                 train_slice = train_inp_np[z_idx] if train_inp_np.ndim == 3 else train_inp_np[:, z_idx, :, :]
-                train_imgs = [add_text_label(convert_slice_to_bgr(train_slice), "Train Input")]
+                train_imgs = [add_text_label(convert_slice_to_bgr(train_slice, value_range=train_input_range), "Train Input")]
                 
                 # Show all train targets (including skeleton data)
                 for t_name in sorted(train_targets_np.keys()):
@@ -520,7 +786,17 @@ def save_debug(
                     else:
                         gt_slice = gt[:, z_idx, :, :]
                     label = f"Skel {t_name.replace('_skel', '')}" if t_name.endswith('_skel') else f"GT {t_name}"
-                    train_imgs.append(add_text_label(convert_slice_to_bgr(gt_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), label))
+                    train_imgs.append(
+                        add_text_label(
+                            convert_slice_to_bgr(
+                                gt_slice,
+                                task_name=t_name,
+                                task_cfg=tasks_dict.get(t_name, {}),
+                                value_range=train_target_ranges.get(t_name),
+                            ),
+                            label,
+                        )
+                    )
                 
                 # Show train predictions (only for actual model outputs)
                 for t_name in pred_task_names:
@@ -533,14 +809,24 @@ def save_debug(
                                 pred_slice = pred[:, z_idx, :, :]
                         else:
                             pred_slice = pred[z_idx, :, :]
-                        train_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
+                        train_imgs.append(
+                            add_text_label(
+                                convert_slice_to_bgr(
+                                    pred_slice,
+                                    task_name=t_name,
+                                    task_cfg=tasks_dict.get(t_name, {}),
+                                    value_range=train_pred_ranges.get(t_name),
+                                ),
+                                f"Pred {t_name}",
+                            )
+                        )
 
                 rows.append(np.hstack(train_imgs))
 
             # Unlabeled row if available (for semi-supervised training)
             if unlabeled_inp_np is not None:
                 unlabeled_slice = unlabeled_inp_np[z_idx] if unlabeled_inp_np.ndim == 3 else unlabeled_inp_np[:, z_idx, :, :]
-                unlabeled_imgs = [add_text_label(convert_slice_to_bgr(unlabeled_slice), "Unlabeled")]
+                unlabeled_imgs = [add_text_label(convert_slice_to_bgr(unlabeled_slice, value_range=unlabeled_input_range), "Unlabeled")]
 
                 # Show pseudo-labels (teacher predictions)
                 for t_name in sorted(unlabeled_pseudo_np.keys()):
@@ -552,7 +838,17 @@ def save_debug(
                             pseudo_slice = pseudo[:, z_idx, :, :]
                     else:
                         pseudo_slice = pseudo[z_idx, :, :]
-                    unlabeled_imgs.append(add_text_label(convert_slice_to_bgr(pseudo_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pseudo {t_name}"))
+                    unlabeled_imgs.append(
+                        add_text_label(
+                            convert_slice_to_bgr(
+                                pseudo_slice,
+                                task_name=t_name,
+                                task_cfg=tasks_dict.get(t_name, {}),
+                                value_range=unlabeled_pseudo_ranges.get(t_name),
+                            ),
+                            f"Pseudo {t_name}",
+                        )
+                    )
 
                 # Show student predictions on unlabeled data
                 for t_name in pred_task_names:
@@ -565,7 +861,17 @@ def save_debug(
                                 pred_slice = pred[:, z_idx, :, :]
                         else:
                             pred_slice = pred[z_idx, :, :]
-                        unlabeled_imgs.append(add_text_label(convert_slice_to_bgr(pred_slice, task_name=t_name, task_cfg=tasks_dict.get(t_name, {})), f"Pred {t_name}"))
+                        unlabeled_imgs.append(
+                            add_text_label(
+                                convert_slice_to_bgr(
+                                    pred_slice,
+                                    task_name=t_name,
+                                    task_cfg=tasks_dict.get(t_name, {}),
+                                    value_range=unlabeled_pred_ranges.get(t_name),
+                                ),
+                                f"Pred {t_name}",
+                            )
+                        )
 
                 rows.append(np.hstack(unlabeled_imgs))
 

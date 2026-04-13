@@ -7,13 +7,6 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-if [[ "${AGENTS_AGENT_MODE:-0}" == "1" && "${AGENTS_ALLOW_INSTALL:-0}" != "1" ]]; then
-  echo "INFO: build_dependencies.sh is disabled by default in agent mode."
-  echo "Set AGENTS_ALLOW_INSTALL=1 to run this script."
-  echo "Example: AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 ./volume-cartographer/scripts/build_dependencies.sh"
-  exit 0
-fi
-
 # ---------------------------------------------------------------------------
 # Paths / config
 # ---------------------------------------------------------------------------
@@ -58,6 +51,7 @@ sudo dpkg-reconfigure -f noninteractive tzdata
 sudo apt-get install -y \
   build-essential git clang llvm ccache ninja-build lld cmake pkg-config \
   qt6-base-dev libboost-system-dev libboost-program-options-dev libceres-dev \
+  libcgal-dev \
   libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev libgsl-dev libsdl2-dev \
   libcurl4-openssl-dev file curl unzip ca-certificates bzip2 wget fuse jq gimp \
   desktop-file-utils flex bison zlib1g-dev gfortran libopenblas-dev liblapack-dev \

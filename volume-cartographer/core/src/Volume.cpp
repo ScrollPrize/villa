@@ -2,21 +2,26 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <limits>
+#include <mutex>
 #include <optional>
+#include <thread>
+
 #include <opencv2/imgcodecs.hpp>
 #include <nlohmann/json.hpp>
 
 #include "vc/core/util/LoadJson.hpp"
-
-#include "z5/attributes.hxx"
-#include "z5/dataset.hxx"
-#include "z5/filesystem/handle.hxx"
-#include "z5/handle.hxx"
-#include "z5/types/types.hxx"
-#include "z5/factory.hxx"
-#include "z5/filesystem/metadata.hxx"
-#include "z5/multiarray/xtensor_access.hxx"
+#include "vc/core/util/Slicing.hpp"
+#include "vc/core/cache/TieredChunkCache.hpp"
+#include "vc/core/cache/ChunkSource.hpp"
+#include "vc/core/cache/VcDecompressor.hpp"
+#include "vc/core/cache/DiskStore.hpp"
+#include "vc/core/cache/HttpMetadataFetcher.hpp"
+#include "vc/core/util/RemoteUrl.hpp"
+#include "vc/core/util/NetworkFilesystem.hpp"
+#include "vc/core/util/PostProcess.hpp"
+#include "vc/core/types/VcDataset.hpp"
 
 static const std::filesystem::path METADATA_FILE = "meta.json";
 static const std::filesystem::path METADATA_FILE_ALT = "metadata.json";
@@ -29,10 +34,8 @@ Volume::Volume(std::filesystem::path path) : path_(std::move(path))
     _height = metadata_["height"].get<int>();
     _slices = metadata_["slices"].get<int>();
 
-    std::vector<std::mutex> init_mutexes(_slices);
-
-
     zarrOpen();
+    mountInfo_ = vc::detectNetworkMount(path_);
 }
 
 // Setup a Volume from a folder of slices
@@ -50,9 +53,10 @@ Volume::Volume(std::filesystem::path path, std::string uuid, std::string name)
     metadata_["max"] = double{};
 
     zarrOpen();
+    mountInfo_ = vc::detectNetworkMount(path_);
 }
 
-Volume::~Volume() = default;
+Volume::~Volume() noexcept = default;
 
 void Volume::loadMetadata()
 {
@@ -130,138 +134,26 @@ bool Volume::checkDir(std::filesystem::path path)
             std::filesystem::exists(path / ".zattrs"));
 }
 
+static int ceilDivPow2(int v, int level)
+{
+    const int64_t denom = int64_t{1} << level;
+    return static_cast<int>((static_cast<int64_t>(v) + denom - 1) / denom);
+}
+
 void Volume::zarrOpen()
 {
     if (!metadata_.contains("format") || metadata_["format"].get<std::string>() != "zarr")
         return;
 
-    zarrFile_ = std::make_unique<z5::filesystem::handle::File>(path_);
-    z5::filesystem::handle::Group group(path_, z5::FileMode::FileMode::r);
-    z5::readAttributes(group, zarrGroup_);
+    zarrDs_ = vc::openZarrLevels(path_);
 
-    auto isPowerOfTwoScale = [](double v) {
-        if (!(v > 0.0)) return false;
-        const double lv = std::log2(v);
-        const double rounded = std::round(lv);
-        return std::abs(lv - rounded) < 1e-6;
-    };
-
-    auto scaleToLevel = [](double v) -> int {
-        return static_cast<int>(std::llround(std::log2(v)));
-    };
-
-    struct Candidate {
-        int level;
-        std::string path;
-    };
-    std::vector<Candidate> candidates;
-
-    bool usedOmeMultiscales = false;
-    if (zarrGroup_.contains("multiscales") && zarrGroup_["multiscales"].is_array() &&
-        !zarrGroup_["multiscales"].empty()) {
-        const auto& ms0 = zarrGroup_["multiscales"][0];
-        if (ms0.contains("datasets") && ms0["datasets"].is_array()) {
-            usedOmeMultiscales = true;
-            for (const auto& ds : ms0["datasets"]) {
-                if (!ds.contains("path") || !ds["path"].is_string()) {
-                    throw std::runtime_error("OME-Zarr dataset entry missing string 'path' in " + path_.string());
-                }
-                const std::string dsPath = ds["path"].get<std::string>();
-
-                if (!ds.contains("coordinateTransformations") || !ds["coordinateTransformations"].is_array()) {
-                    throw std::runtime_error("OME-Zarr dataset '" + dsPath + "' missing coordinateTransformations in " + path_.string());
-                }
-
-                std::optional<int> level;
-                for (const auto& tr : ds["coordinateTransformations"]) {
-                    if (!tr.is_object() || !tr.contains("type") || !tr["type"].is_string())
-                        continue;
-                    if (tr["type"].get<std::string>() != "scale")
-                        continue;
-                    if (!tr.contains("scale") || !tr["scale"].is_array() || tr["scale"].size() < 3) {
-                        throw std::runtime_error("OME-Zarr dataset '" + dsPath + "' has invalid scale transformation in " + path_.string());
-                    }
-
-                    const double sz = tr["scale"][0].get<double>();
-                    const double sy = tr["scale"][1].get<double>();
-                    const double sx = tr["scale"][2].get<double>();
-                    if (std::abs(sz - sy) > 1e-6 || std::abs(sz - sx) > 1e-6 || !isPowerOfTwoScale(sz)) {
-                        throw std::runtime_error(
-                            "unsupported OME-Zarr scale for dataset '" + dsPath +
-                            "' (expected isotropic power-of-two, got [" +
-                            std::to_string(sz) + "," + std::to_string(sy) + "," + std::to_string(sx) +
-                            "]) in " + path_.string());
-                    }
-                    level = scaleToLevel(sz);
-                    break;
-                }
-
-                if (!level.has_value()) {
-                    throw std::runtime_error("OME-Zarr dataset '" + dsPath + "' has no scale transformation in " + path_.string());
-                }
-                candidates.push_back({*level, dsPath});
-            }
-        }
-    }
-
-    if (!usedOmeMultiscales) {
-        std::vector<std::string> groups;
-        zarrFile_->keys(groups);
-        std::sort(groups.begin(), groups.end());
-        for (const auto& name : groups) {
-            try {
-                const int level = std::stoi(name);
-                if (level < 0) {
-                    continue;
-                }
-                candidates.push_back({level, name});
-            } catch (...) {
-                // Ignore non-numeric groups in legacy fallback mode.
-            }
-        }
-    }
-
-    if (candidates.empty()) {
-        throw std::runtime_error("no zarr datasets found in " + path_.string());
-    }
-
-    int maxLevel = -1;
-    for (const auto& c : candidates) {
-        maxLevel = std::max(maxLevel, c.level);
-    }
-    zarrDs_.clear();
-    zarrDs_.resize(static_cast<size_t>(maxLevel + 1));
-
-    for (const auto& c : candidates) {
-        if (c.level < 0) {
-            continue;
-        }
-
-        // Allow missing scales: ignore datasets declared in metadata but not physically present.
-        if (!std::filesystem::exists(path_ / c.path / ".zarray")) {
-            continue;
-        }
-
-        // Read metadata first to discover the dimension separator
-        z5::filesystem::handle::Dataset tmp_handle(path_ / c.path, z5::FileMode::FileMode::r);
-        z5::DatasetMetadata dsMeta;
-        z5::filesystem::readMetadata(tmp_handle, dsMeta);
-
-        // Re-create handle with correct delimiter so chunk keys resolve properly
-        z5::filesystem::handle::Dataset ds_handle(group, c.path, dsMeta.zarrDelimiter);
-
-        auto ds = z5::filesystem::openDataset(ds_handle);
-        if (ds->getDtype() != z5::types::Datatype::uint8 && ds->getDtype() != z5::types::Datatype::uint16)
-            throw std::runtime_error("only uint8 & uint16 is currently supported for zarr datasets incompatible type found in "+path_.string()+" / " +c.path);
-
-        zarrDs_[static_cast<size_t>(c.level)] = std::move(ds);
+    for (size_t i = 0; i < zarrDs_.size(); i++) {
+        auto dtype = zarrDs_[i]->getDtype();
+        if (dtype != vc::VcDtype::uint8 && dtype != vc::VcDtype::uint16)
+            throw std::runtime_error("only uint8 & uint16 is currently supported for zarr datasets, incompatible type found in " + path_.string());
     }
 
     if (metadataAutoGenerated_) {
-        auto ceilDivPow2 = [](int v, int level) -> int {
-            const int64_t denom = int64_t{1} << level;
-            return static_cast<int>((static_cast<int64_t>(v) + denom - 1) / denom);
-        };
 
         bool hasReference = false;
         int baseSlices = 0;
@@ -316,11 +208,6 @@ void Volume::zarrOpen()
     // Verify each existing level shape against meta.json dimensions and level downscale.
     // zarr shape is [z, y, x] = [slices, height, width]
     if (!skipShapeCheck) {
-        auto ceilDivPow2 = [](int v, int level) -> int {
-            const int64_t denom = int64_t{1} << level;
-            return static_cast<int>((static_cast<int64_t>(v) + denom - 1) / denom);
-        };
-
         bool hasAnyPhysicalScale = false;
         for (size_t level = 0; level < zarrDs_.size(); ++level) {
             const auto& ds = zarrDs_[level];
@@ -362,16 +249,68 @@ std::shared_ptr<Volume> Volume::New(std::filesystem::path path, std::string uuid
     return std::make_shared<Volume>(path, uuid, name);
 }
 
-int Volume::sliceWidth() const { return _width; }
-int Volume::sliceHeight() const { return _height; }
-int Volume::numSlices() const { return _slices; }
-std::array<int, 3> Volume::shape() const { return {_width, _height, _slices}; }
+std::shared_ptr<Volume> Volume::NewFromUrl(
+    const std::string& url,
+    const std::filesystem::path& cacheRoot,
+    const vc::cache::HttpAuth& authIn)
+{
+    namespace fs = std::filesystem;
+
+    // Resolve s3:// URLs to https:// and detect AWS credentials
+    auto resolved = vc::resolveRemoteUrl(url);
+    vc::cache::HttpAuth auth = authIn;
+    if (resolved.useAwsSigv4 && !auth.awsSigv4) {
+        // Caller didn't provide auth — populate from env vars
+        auth.awsSigv4 = true;
+        auth.region = resolved.awsRegion;
+        auto getEnv = [](const char* name) -> std::string {
+            const char* v = std::getenv(name);
+            return v ? v : "";
+        };
+        auth.accessKey = getEnv("AWS_ACCESS_KEY_ID");
+        auth.secretKey = getEnv("AWS_SECRET_ACCESS_KEY");
+        auth.sessionToken = getEnv("AWS_SESSION_TOKEN");
+    } else if (resolved.useAwsSigv4 && auth.awsSigv4 && auth.region.empty()) {
+        auth.region = resolved.awsRegion;
+    }
+
+    // Determine cache root
+    fs::path root = cacheRoot;
+    if (root.empty()) {
+        root = fs::path(std::getenv("HOME") ? std::getenv("HOME") : "/tmp") / ".VC3D" / "remote_cache";
+    }
+
+    // Fetch remote metadata (downloads .zarray files, synthesizes meta.json)
+    auto info = vc::cache::fetchRemoteZarrMetadata(resolved.httpsUrl, root, auth);
+
+    // Temporarily skip shape validation (staging dir has no chunk data)
+    struct SkipShapeGuard {
+        bool prev;
+        SkipShapeGuard() : prev(skipShapeCheck) { skipShapeCheck = true; }
+        ~SkipShapeGuard() { skipShapeCheck = prev; }
+    };
+    SkipShapeGuard guard;
+
+    auto vol = std::make_shared<Volume>(info.stagingDir);
+
+    vol->isRemote_ = true;
+    vol->remoteUrl_ = info.url;
+    vol->remoteDelimiter_ = info.delimiter;
+    vol->remoteAuth_ = auth;
+
+    return vol;
+}
+
+int Volume::sliceWidth() const noexcept { return _width; }
+int Volume::sliceHeight() const noexcept { return _height; }
+int Volume::numSlices() const noexcept { return _slices; }
+std::array<int, 3> Volume::shape() const noexcept { return {_width, _height, _slices}; }
 double Volume::voxelSize() const
 {
     return metadata_["voxelsize"].get<double>();
 }
 
-z5::Dataset *Volume::zarrDataset(int level) const {
+vc::VcDataset *Volume::zarrDataset(int level) const {
     if (level < 0 || zarrDs_.empty())
         return nullptr;
 
@@ -381,6 +320,818 @@ z5::Dataset *Volume::zarrDataset(int level) const {
     return zarrDs_[level].get();
 }
 
-size_t Volume::numScales() const {
+size_t Volume::numScales() const noexcept {
     return zarrDs_.size();
+}
+
+std::unique_ptr<vc::cache::TieredChunkCache> Volume::createTieredCache(
+    std::shared_ptr<vc::cache::DiskStore> diskStore) const
+{
+    if (zarrDs_.empty()) return nullptr;
+
+    // Build level metadata from our zarr datasets
+    std::vector<vc::cache::FileSystemChunkSource::LevelMeta> levels;
+    levels.reserve(zarrDs_.size());
+    for (auto& ds : zarrDs_) {
+        const auto& shape = ds->shape();
+        const auto& chunks = ds->defaultChunkShape();
+        vc::cache::FileSystemChunkSource::LevelMeta lm;
+        lm.shape = {
+            static_cast<int>(shape[0]),
+            static_cast<int>(shape[1]),
+            static_cast<int>(shape[2])};
+        lm.chunkShape = {
+            static_cast<int>(chunks[0]),
+            static_cast<int>(chunks[1]),
+            static_cast<int>(chunks[2])};
+        levels.push_back(lm);
+    }
+
+    // Get delimiter from VcDataset
+    std::string delimiter = zarrDs_[0]->delimiter();
+
+    // Create chunk source: HTTP for remote volumes, filesystem for local
+    std::unique_ptr<vc::cache::ChunkSource> source;
+    if (isRemote_) {
+        source = std::make_unique<vc::cache::HttpChunkSource>(
+            remoteUrl_, remoteDelimiter_, std::move(levels), remoteAuth_);
+
+        // For remote volumes, use the staging dir itself as the disk store.
+        if (!diskStore) {
+            vc::cache::DiskStore::Config dsCfg;
+            dsCfg.root = path_;
+            dsCfg.directMode = true;
+            dsCfg.delimiter = remoteDelimiter_;
+            dsCfg.maxBytes = diskCacheMaxBytes_;
+            diskStore = std::make_shared<vc::cache::DiskStore>(std::move(dsCfg));
+        }
+    } else {
+        source = std::make_unique<vc::cache::FileSystemChunkSource>(
+            path_, delimiter, std::move(levels));
+
+        // Auto-enable disk caching for network-mounted volumes (s3fs, NFS, etc.)
+        if (!diskStore && mountInfo_.type == vc::FilesystemType::NetworkMount) {
+            // If s3fs already has its own local cache (use_cache option),
+            // skip our DiskStore to avoid double-caching.
+            if (!mountInfo_.cacheDir.empty()) {
+                fprintf(stderr, "[Volume] Detected %s mount with use_cache=%s; "
+                                "skipping app-level disk cache (s3fs handles it)\n",
+                        mountInfo_.label.c_str(),
+                        mountInfo_.cacheDir.c_str());
+            } else {
+                namespace fs = std::filesystem;
+                auto home = std::getenv("HOME");
+                vc::cache::DiskStore::Config dsCfg;
+                dsCfg.root = fs::path(home ? home : "/tmp") / ".VC3D" / "network_cache" / id();
+                dsCfg.maxBytes = diskCacheMaxBytes_;
+                dsCfg.delimiter = delimiter;
+                std::string cacheRootStr = dsCfg.root.string();
+                diskStore = std::make_shared<vc::cache::DiskStore>(std::move(dsCfg));
+                fprintf(stderr, "[Volume] Detected network filesystem (%s); "
+                                "enabling local disk cache at %s\n",
+                        mountInfo_.label.c_str(),
+                        cacheRootStr.c_str());
+            }
+        }
+    }
+
+    // Build dataset pointers for the decompressor
+    std::vector<vc::VcDataset*> dsPtrs;
+    dsPtrs.reserve(zarrDs_.size());
+    for (auto& ds : zarrDs_) {
+        dsPtrs.push_back(ds.get());
+    }
+    auto decompress = vc::cache::makeVcDecompressor(dsPtrs);
+
+    vc::cache::TieredChunkCache::Config config;
+    config.volumeId = id();
+    config.hotMaxBytes = cacheBudgetHot_;
+    config.warmMaxBytes = cacheBudgetWarm_;
+    if (isRemote_ || mountInfo_.type == vc::FilesystemType::NetworkMount) {
+        if (ioThreads_ > 0) {
+            config.ioThreads = ioThreads_;
+        } else if (mountInfo_.parallelCount > 0) {
+            config.ioThreads = mountInfo_.parallelCount;
+        } else {
+            int cores = static_cast<int>(std::thread::hardware_concurrency());
+            config.ioThreads = std::clamp(cores, 2, 8);
+        }
+        fprintf(stderr, "[Volume] IO threads: %d\n", config.ioThreads);
+    }
+
+    if (videoRecompressEnabled_ && (isRemote_ || mountInfo_.type == vc::FilesystemType::NetworkMount)) {
+        config.recompress = vc::cache::makeVideoRecompressor(dsPtrs, videoCodecType_, videoCodecQP_);
+    }
+
+    return std::make_unique<vc::cache::TieredChunkCache>(
+        std::move(config),
+        std::move(source),
+        std::move(decompress),
+        std::move(diskStore));
+}
+
+// ============================================================================
+// Cache management
+// ============================================================================
+
+void Volume::ensureTieredCache() const
+{
+    std::call_once(cacheOnce_, [this]() {
+        auto* self = const_cast<Volume*>(this);
+        tieredCache_ = self->createTieredCache(self->pendingDiskStore_);
+    });
+}
+
+vc::cache::TieredChunkCache* Volume::tieredCache()
+{
+    ensureTieredCache();
+    return tieredCache_.get();
+}
+
+void Volume::setCacheBudget(size_t hotBytes, size_t warmBytes)
+{
+    cacheBudgetHot_ = hotBytes;
+    cacheBudgetWarm_ = warmBytes;
+}
+
+void Volume::setDiskStore(std::shared_ptr<vc::cache::DiskStore> store)
+{
+    if (tieredCache_) {
+        fprintf(stderr, "[Volume] WARNING: setDiskStore() called after cache "
+                        "already created — ignoring\n");
+        return;
+    }
+    pendingDiskStore_ = std::move(store);
+}
+
+void Volume::setDiskCacheMaxBytes(size_t bytes)
+{
+    diskCacheMaxBytes_ = bytes;
+}
+
+void Volume::setVideoRecompression(bool enabled, int codecType, int qp)
+{
+    videoRecompressEnabled_ = enabled;
+    videoCodecType_ = codecType;
+    videoCodecQP_ = qp;
+}
+
+void Volume::setIOThreads(int count)
+{
+    ioThreads_ = count;
+}
+
+// ============================================================================
+// Sampling API
+// ============================================================================
+
+// Helper: apply optional post-processing from SampleParams in-place.
+static void applyOptionalPostProcess(cv::Mat_<uint8_t>& img,
+                                     const vc::SampleParams& params)
+{
+    if (!params.postProcess) return;
+    vc::applyPostProcess(img, *params.postProcess);
+}
+
+// Helper: scale level-0 coords to pyramid level coords.
+static cv::Mat_<cv::Vec3f> scaleCoords(const cv::Mat_<cv::Vec3f>& coords, int level)
+{
+    if (level <= 0) return coords;
+    float scale = 1.0f / static_cast<float>(1 << level);
+    return coords * scale;
+}
+
+void Volume::sample(cv::Mat_<uint8_t>& out,
+                    const cv::Mat_<cv::Vec3f>& coords,
+                    const vc::SampleParams& params)
+{
+    auto scaled = scaleCoords(coords, params.level);
+    readInterpolated3D(out, tieredCache(), params.level, scaled, params.method);
+    applyOptionalPostProcess(out, params);
+}
+
+void Volume::sample(cv::Mat_<uint16_t>& out,
+                    const cv::Mat_<cv::Vec3f>& coords,
+                    const vc::SampleParams& params)
+{
+    auto scaled = scaleCoords(coords, params.level);
+    readInterpolated3D(out, tieredCache(), params.level, scaled, params.method);
+}
+
+int Volume::sampleBestEffort(cv::Mat_<uint8_t>& out,
+                              const cv::Mat_<cv::Vec3f>& coords,
+                              const vc::SampleParams& params)
+{
+    const int nScales = static_cast<int>(numScales());
+    const int level = params.level;
+
+    // Compute world-space bounding box once, reuse for all level checks.
+    // This avoids re-scanning border/interior pixels per level.
+    auto wb = coordsWorldBBox(coords);
+
+    for (int lvl = level; lvl < nScales; lvl++) {
+        if (allChunksCachedFast(wb, lvl)) {
+            auto scaled = scaleCoords(coords, lvl);
+            readInterpolated3D(out, tieredCache(), lvl, scaled, params.method);
+            if (lvl > level) {
+                // Prefetch desired level and one intermediate for progressive refinement
+                prefetchChunks(coords, level);
+                if (lvl - level > 1)
+                    prefetchChunks(coords, level + 1);
+            } else if (lvl > 0) {
+                // At desired level — prefetch next finer for smooth zoom-in
+                prefetchChunks(coords, lvl - 1);
+            }
+            if (!out.empty())
+                applyOptionalPostProcess(out, params);
+            return lvl;
+        }
+    }
+
+    // No level had all chunks cached.  Fall back to a blocking read at the
+    // coarsest level (which is pinned hot in steady state, so this only blocks
+    // during initial loading).  This matches sampleCompositeBestEffort behavior.
+    int last = std::max(0, nScales - 1);
+    auto scaled = scaleCoords(coords, last);
+    readInterpolated3D(out, tieredCache(), last, scaled, params.method);
+    if (last > level) {
+        prefetchChunks(coords, level);
+        if (last - level > 1)
+            prefetchChunks(coords, level + 1);
+    }
+    if (!out.empty())
+        applyOptionalPostProcess(out, params);
+    return last;
+}
+
+void Volume::sampleComposite(cv::Mat_<uint8_t>& out,
+                              const cv::Mat_<cv::Vec3f>& coords,
+                              const cv::Mat_<cv::Vec3f>& normals,
+                              const vc::SampleParams& params)
+{
+    float scale = (params.level > 0) ? (1.0f / static_cast<float>(1 << params.level)) : 1.0f;
+    auto scaled = scaleCoords(coords, params.level);
+    readCompositeFast(out, tieredCache(), params.level, scaled, normals, scale,
+                      params.zStart, params.zEnd,
+                      params.composite.value_or(CompositeParams{}),
+                      params.method);
+    applyOptionalPostProcess(out, params);
+}
+
+int Volume::sampleCompositeBestEffort(cv::Mat_<uint8_t>& out,
+                                       const cv::Mat_<cv::Vec3f>& coords,
+                                       const cv::Mat_<cv::Vec3f>& normals,
+                                       const vc::SampleParams& params)
+{
+    const int nScales = static_cast<int>(numScales());
+    const int level = params.level;
+    const auto& cp = params.composite.value_or(CompositeParams{});
+
+    for (int lvl = level; lvl < nScales; lvl++) {
+        if (allCompositeChunksCached(coords, normals, params.zStart, params.zEnd, lvl)) {
+            // Render at this level
+            vc::SampleParams lvlParams = params;
+            lvlParams.level = lvl;
+            sampleComposite(out, coords, normals, lvlParams);
+            if (lvl > level)
+                prefetchCompositeChunks(coords, normals, params.zStart, params.zEnd, level);
+            return lvl;
+        }
+    }
+
+    // Coarsest level — block
+    int last = std::max(0, nScales - 1);
+    vc::SampleParams lastParams = params;
+    lastParams.level = last;
+    sampleComposite(out, coords, normals, lastParams);
+    if (last > level)
+        prefetchCompositeChunks(coords, normals, params.zStart, params.zEnd, level);
+    return last;
+}
+
+// ============================================================================
+// Composite-aware chunk helpers
+// ============================================================================
+
+namespace {
+struct BBox6f {
+    float loX, loY, loZ, hiX, hiY, hiZ;
+};
+
+BBox6f computeCompositeBBox(const cv::Mat_<cv::Vec3f>& coords,
+                            const cv::Mat_<cv::Vec3f>& normals,
+                            int zStart, int zEnd, int level)
+{
+    float scale = (level > 0) ? (1.0f / static_cast<float>(1 << level)) : 1.0f;
+
+    float loX = std::numeric_limits<float>::max();
+    float loY = std::numeric_limits<float>::max();
+    float loZ = std::numeric_limits<float>::max();
+    float hiX = std::numeric_limits<float>::lowest();
+    float hiY = std::numeric_limits<float>::lowest();
+    float hiZ = std::numeric_limits<float>::lowest();
+
+    const bool hasNormals = !normals.empty() && normals.size() == coords.size();
+    const int h = coords.rows;
+    const int w = coords.cols;
+
+    auto updateBounds = [&](int r, int c) {
+        const auto& v = coords(r, c);
+        float sx = v[0] * scale;
+        float sy = v[1] * scale;
+        float sz = v[2] * scale;
+
+        cv::Vec3f n = hasNormals ? normals(r, c) : cv::Vec3f(1, 0, 0);
+        for (int z : {zStart, zEnd}) {
+            float off = z * scale;
+            float px = sx + n[0] * off;
+            float py = sy + n[1] * off;
+            float pz = sz + n[2] * off;
+            loX = std::min(loX, px); hiX = std::max(hiX, px);
+            loY = std::min(loY, py); hiY = std::max(hiY, py);
+            loZ = std::min(loZ, pz); hiZ = std::max(hiZ, pz);
+        }
+    };
+
+    // Sample border pixels + sparse grid instead of every pixel.
+    // Top and bottom rows
+    for (int c = 0; c < w; ++c) {
+        updateBounds(0, c);
+        updateBounds(h - 1, c);
+    }
+    // Left and right columns (excluding corners already covered)
+    for (int r = 1; r < h - 1; ++r) {
+        updateBounds(r, 0);
+        updateBounds(r, w - 1);
+    }
+    // Sparse interior grid (every 32 pixels) to catch curved surfaces
+    for (int r = 32; r < h - 1; r += 32) {
+        for (int c = 32; c < w - 1; c += 32) {
+            updateBounds(r, c);
+        }
+    }
+
+    // 1-voxel margin for interpolation (plus extra for normal offset curvature)
+    loX -= 2.0f; loY -= 2.0f; loZ -= 2.0f;
+    hiX += 2.0f; hiY += 2.0f; hiZ += 2.0f;
+
+    return {loX, loY, loZ, hiX, hiY, hiZ};
+}
+} // anonymous namespace
+
+Volume::ChunkBBox Volume::compositeChunkBBox(
+    const cv::Mat_<cv::Vec3f>& coords,
+    const cv::Mat_<cv::Vec3f>& normals,
+    int zStart, int zEnd, int level) const
+{
+    vc::VcDataset* ds = zarrDataset(level);
+    if (!ds || coords.empty()) return {0, -1, 0, -1, 0, -1};  // invalid
+
+    auto bb = computeCompositeBBox(coords, normals, zStart, zEnd, level);
+
+    auto cs = ds->defaultChunkShape();  // {cz, cy, cx}
+    const auto& shape = ds->shape();    // {z, y, x}
+
+    ChunkBBox cbbox;
+    cbbox.minIx = std::max(0, static_cast<int>(std::floor(bb.loX / cs[2])));
+    cbbox.maxIx = std::min(static_cast<int>(std::ceil(bb.hiX / cs[2])),
+                           static_cast<int>((shape[2] - 1) / cs[2]));
+    cbbox.minIy = std::max(0, static_cast<int>(std::floor(bb.loY / cs[1])));
+    cbbox.maxIy = std::min(static_cast<int>(std::ceil(bb.hiY / cs[1])),
+                           static_cast<int>((shape[1] - 1) / cs[1]));
+    cbbox.minIz = std::max(0, static_cast<int>(std::floor(bb.loZ / cs[0])));
+    cbbox.maxIz = std::min(static_cast<int>(std::ceil(bb.hiZ / cs[0])),
+                           static_cast<int>((shape[0] - 1) / cs[0]));
+    return cbbox;
+}
+
+bool Volume::allCompositeChunksCached(
+    const cv::Mat_<cv::Vec3f>& coords,
+    const cv::Mat_<cv::Vec3f>& normals,
+    int zStart, int zEnd, int level) const
+{
+    ensureTieredCache();
+    if (!tieredCache_ || coords.empty()) return false;
+
+    auto cbbox = compositeChunkBBox(coords, normals, zStart, zEnd, level);
+    if (cbbox.minIx > cbbox.maxIx || cbbox.minIy > cbbox.maxIy || cbbox.minIz > cbbox.maxIz)
+        return false;
+
+    return tieredCache_->areAllCachedInRegion(
+        level, cbbox.minIz, cbbox.minIy, cbbox.minIx,
+        cbbox.maxIz, cbbox.maxIy, cbbox.maxIx);
+}
+
+void Volume::prefetchCompositeChunks(
+    const cv::Mat_<cv::Vec3f>& coords,
+    const cv::Mat_<cv::Vec3f>& normals,
+    int zStart, int zEnd, int level)
+{
+    ensureTieredCache();
+    if (!tieredCache_ || coords.empty()) return;
+
+    auto cbbox = compositeChunkBBox(coords, normals, zStart, zEnd, level);
+    if (cbbox.minIx > cbbox.maxIx || cbbox.minIy > cbbox.maxIy || cbbox.minIz > cbbox.maxIz)
+        return;
+
+    tieredCache_->prefetchRegion(level, cbbox.minIz, cbbox.minIy, cbbox.minIx,
+                                 cbbox.maxIz, cbbox.maxIy, cbbox.maxIx);
+}
+
+void Volume::pinCoarsestLevel(bool blocking)
+{
+    ensureTieredCache();
+    if (!tieredCache_ || zarrDs_.empty()) return;
+
+    int last = static_cast<int>(zarrDs_.size()) - 1;
+    vc::VcDataset* ds = zarrDataset(last);
+    if (!ds) return;
+
+    const auto& shape = ds->shape();
+    const auto& chunks = ds->defaultChunkShape();
+    std::array<int, 3> gridDims = {
+        static_cast<int>((shape[0] + chunks[0] - 1) / chunks[0]),
+        static_cast<int>((shape[1] + chunks[1] - 1) / chunks[1]),
+        static_cast<int>((shape[2] + chunks[2] - 1) / chunks[2])
+    };
+    tieredCache_->pinLevel(last, gridDims, blocking);
+
+    if (blocking) {
+        computeDataBounds();
+    }
+}
+
+// ============================================================================
+// Data bounds
+// ============================================================================
+
+void Volume::computeDataBounds()
+{
+    // Set bounds to the full volume shape — no scanning needed.
+    dataBounds_.minX = 0;
+    dataBounds_.maxX = _width - 1;
+    dataBounds_.minY = 0;
+    dataBounds_.maxY = _height - 1;
+    dataBounds_.minZ = 0;
+    dataBounds_.maxZ = _slices - 1;
+    dataBounds_.valid = true;
+
+    // Push to cache so ChunkSampler can skip chunks outside bounds
+    ensureTieredCache();
+    if (tieredCache_) {
+        tieredCache_->setDataBounds(
+            dataBounds_.minX, dataBounds_.maxX,
+            dataBounds_.minY, dataBounds_.maxY,
+            dataBounds_.minZ, dataBounds_.maxZ);
+    }
+
+    fprintf(stderr, "[Volume] dataBounds: x=[%d, %d] y=[%d, %d] z=[%d, %d] (full volume shape)\n",
+            dataBounds_.minX, dataBounds_.maxX,
+            dataBounds_.minY, dataBounds_.maxY,
+            dataBounds_.minZ, dataBounds_.maxZ);
+}
+
+const Volume::DataBounds& Volume::dataBounds() const
+{
+    if (!boundsComputed_.load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(boundsMutex_);
+        if (!boundsComputed_.load(std::memory_order_relaxed)) {
+            const_cast<Volume*>(this)->computeDataBounds();
+            boundsComputed_.store(true, std::memory_order_release);
+        }
+    }
+    return dataBounds_;
+}
+
+bool Volume::needsRemoteLevel5Prime() const
+{
+    if (!isRemote_) return false;
+    if (zarrDs_.size() < 6) return false;  // need at least levels 0-5
+
+    {
+        std::lock_guard lock(remoteLevel5PrimeMutex_);
+        if (remoteLevel5PrimeStarted_ || remoteLevel5PrimeDone_) return false;
+    }
+
+    // Check if level 5 is already fully cached locally
+    const_cast<Volume*>(this)->ensureTieredCache();
+    if (!tieredCache_) return false;
+
+    auto levelShape = tieredCache_->levelShape(5);
+    auto chunkShape = tieredCache_->chunkShape(5);
+    int gridZ = (levelShape[0] + chunkShape[0] - 1) / chunkShape[0];
+    int gridY = (levelShape[1] + chunkShape[1] - 1) / chunkShape[1];
+    int gridX = (levelShape[2] + chunkShape[2] - 1) / chunkShape[2];
+
+    return !tieredCache_->areAllCachedInRegion(5, 0, 0, 0,
+                                                gridZ - 1, gridY - 1, gridX - 1);
+}
+
+void Volume::primeRemoteLevel5Blocking(
+    std::function<void(size_t completed, size_t total)> progressCb)
+{
+    {
+        std::lock_guard lock(remoteLevel5PrimeMutex_);
+        if (remoteLevel5PrimeDone_) return;
+        remoteLevel5PrimeStarted_ = true;
+    }
+
+    ensureTieredCache();
+    if (!tieredCache_ || zarrDs_.size() < 6) {
+        std::lock_guard lock(remoteLevel5PrimeMutex_);
+        remoteLevel5PrimeDone_ = true;
+        return;
+    }
+
+    auto levelShape = tieredCache_->levelShape(5);
+    auto chunkShape = tieredCache_->chunkShape(5);
+    int gridZ = (levelShape[0] + chunkShape[0] - 1) / chunkShape[0];
+    int gridY = (levelShape[1] + chunkShape[1] - 1) / chunkShape[1];
+    int gridX = (levelShape[2] + chunkShape[2] - 1) / chunkShape[2];
+    size_t total = static_cast<size_t>(gridZ) * gridY * gridX;
+    size_t completed = 0;
+
+    try {
+        for (int iz = 0; iz < gridZ; iz++) {
+            for (int iy = 0; iy < gridY; iy++) {
+                for (int ix = 0; ix < gridX; ix++) {
+                    tieredCache_->getBlocking(vc::cache::ChunkKey{5, iz, iy, ix});
+                    completed++;
+                    if (progressCb)
+                        progressCb(completed, total);
+                }
+            }
+        }
+        tieredCache_->flushPersistentState();
+    } catch (...) {
+        std::lock_guard lock(remoteLevel5PrimeMutex_);
+        remoteLevel5PrimeStarted_ = false;
+        throw;
+    }
+
+    std::lock_guard lock(remoteLevel5PrimeMutex_);
+    remoteLevel5PrimeDone_ = true;
+}
+
+// ============================================================================
+// Chunk query / prefetch
+// ============================================================================
+
+Volume::WorldBBox Volume::coordsWorldBBox(const cv::Mat_<cv::Vec3f>& coords) const
+{
+    WorldBBox wb;
+    wb.loX = std::numeric_limits<float>::max();
+    wb.loY = std::numeric_limits<float>::max();
+    wb.loZ = std::numeric_limits<float>::max();
+    wb.hiX = std::numeric_limits<float>::lowest();
+    wb.hiY = std::numeric_limits<float>::lowest();
+    wb.hiZ = std::numeric_limits<float>::lowest();
+
+    if (coords.empty()) return wb;
+
+    const int h = coords.rows;
+    const int w = coords.cols;
+
+    auto updateBounds = [&](const cv::Vec3f& v) {
+        wb.loX = std::min(wb.loX, v[0]); wb.hiX = std::max(wb.hiX, v[0]);
+        wb.loY = std::min(wb.loY, v[1]); wb.hiY = std::max(wb.hiY, v[1]);
+        wb.loZ = std::min(wb.loZ, v[2]); wb.hiZ = std::max(wb.hiZ, v[2]);
+    };
+
+    // All 4 borders
+    const auto* topRow = coords.ptr<cv::Vec3f>(0);
+    const auto* botRow = coords.ptr<cv::Vec3f>(h - 1);
+    for (int x = 0; x < w; ++x) {
+        updateBounds(topRow[x]);
+        updateBounds(botRow[x]);
+    }
+    for (int y = 1; y < h - 1; ++y) {
+        const auto* row = coords.ptr<cv::Vec3f>(y);
+        updateBounds(row[0]);
+        updateBounds(row[w - 1]);
+    }
+
+    // Sparse interior grid (every 32 pixels) to catch curved surfaces
+    for (int y = 32; y < h - 1; y += 32) {
+        const auto* row = coords.ptr<cv::Vec3f>(y);
+        for (int x = 32; x < w - 1; x += 32) {
+            updateBounds(row[x]);
+        }
+    }
+
+    return wb;
+}
+
+Volume::ChunkBBox Volume::worldBBoxToChunkBBox(const WorldBBox& wb, int level) const
+{
+    vc::VcDataset* ds = zarrDataset(level);
+    if (!ds) return {0, -1, 0, -1, 0, -1};
+
+    float scale = (level > 0) ? (1.0f / static_cast<float>(1 << level)) : 1.0f;
+    auto cs = ds->defaultChunkShape();
+    const auto& shape = ds->shape();
+
+    // Apply scale + interpolation margin
+    float loX = wb.loX * scale - 2.0f;
+    float loY = wb.loY * scale - 2.0f;
+    float loZ = wb.loZ * scale - 2.0f;
+    float hiX = wb.hiX * scale + 2.0f;
+    float hiY = wb.hiY * scale + 2.0f;
+    float hiZ = wb.hiZ * scale + 2.0f;
+
+    ChunkBBox bb;
+    bb.minIx = std::max(0, static_cast<int>(std::floor(loX / cs[2])));
+    bb.maxIx = std::min(static_cast<int>(std::ceil(hiX / cs[2])),
+                        static_cast<int>((shape[2] - 1) / cs[2]));
+    bb.minIy = std::max(0, static_cast<int>(std::floor(loY / cs[1])));
+    bb.maxIy = std::min(static_cast<int>(std::ceil(hiY / cs[1])),
+                        static_cast<int>((shape[1] - 1) / cs[1]));
+    bb.minIz = std::max(0, static_cast<int>(std::floor(loZ / cs[0])));
+    bb.maxIz = std::min(static_cast<int>(std::ceil(hiZ / cs[0])),
+                        static_cast<int>((shape[0] - 1) / cs[0]));
+    return bb;
+}
+
+Volume::ChunkBBox Volume::coordsToChunkBBox(
+    const cv::Mat_<cv::Vec3f>& coords, int level) const
+{
+    return worldBBoxToChunkBBox(coordsWorldBBox(coords), level);
+}
+
+bool Volume::allChunksCached(const cv::Mat_<cv::Vec3f>& coords, int level) const
+{
+    ensureTieredCache();
+    if (!tieredCache_) return false;
+
+    auto bb = coordsToChunkBBox(coords, level);
+    if (bb.minIx > bb.maxIx || bb.minIy > bb.maxIy || bb.minIz > bb.maxIz) return false;
+
+    return tieredCache_->areAllCachedInRegion(
+        level, bb.minIz, bb.minIy, bb.minIx,
+        bb.maxIz, bb.maxIy, bb.maxIx);
+}
+
+bool Volume::allChunksCachedFast(const WorldBBox& wb, int level) const
+{
+    ensureTieredCache();
+    if (!tieredCache_) return false;
+
+    auto bb = worldBBoxToChunkBBox(wb, level);
+    if (bb.minIx > bb.maxIx || bb.minIy > bb.maxIy || bb.minIz > bb.maxIz) return false;
+
+    return tieredCache_->areAllCachedInRegion(
+        level, bb.minIz, bb.minIy, bb.minIx,
+        bb.maxIz, bb.maxIy, bb.maxIx);
+}
+
+void Volume::prefetchChunks(const cv::Mat_<cv::Vec3f>& coords, int level)
+{
+    ensureTieredCache();
+    if (!tieredCache_) return;
+
+    auto bb = coordsToChunkBBox(coords, level);
+    if (bb.minIx > bb.maxIx || bb.minIy > bb.maxIy || bb.minIz > bb.maxIz) return;  // invalid bbox
+
+    tieredCache_->prefetchRegion(level,
+        bb.minIz, bb.minIy, bb.minIx,
+        bb.maxIz, bb.maxIy, bb.maxIx);
+}
+
+void Volume::prefetchLevels(int fromLevel, int toLevel)
+{
+    // Only allow one prefetch to run per volume
+    bool expected = false;
+    if (!prefetchStarted_.compare_exchange_strong(expected, true))
+        return;
+
+    ensureTieredCache();
+    if (!tieredCache_) return;
+
+    int maxLevel = tieredCache_->numLevels() - 1;
+    fromLevel = std::clamp(fromLevel, 0, maxLevel);
+    toLevel = std::clamp(toLevel, 0, maxLevel);
+
+    // Use data bounds to limit prefetch to non-empty region
+    const auto& db = dataBounds();
+    bool hasDataBounds = db.valid;
+    int dbMinX = db.minX, dbMaxX = db.maxX;
+    int dbMinY = db.minY, dbMaxY = db.maxY;
+    int dbMinZ = db.minZ, dbMaxZ = db.maxZ;
+
+    size_t diskBudget = diskCacheMaxBytes_;
+
+    // Spawn a background thread that feeds levels coarsest-first
+    std::thread([cache = tieredCache_.get(), fromLevel, toLevel, diskBudget,
+                 hasDataBounds, dbMinX, dbMaxX, dbMinY, dbMaxY, dbMinZ, dbMaxZ]() {
+        for (int lvl = toLevel; lvl >= fromLevel; lvl--) {
+            int iz0 = 0, iy0 = 0, ix0 = 0;
+            auto ls = cache->levelShape(lvl);
+            auto cs = cache->chunkShape(lvl);
+            int iz1 = (ls[0] + cs[0] - 1) / cs[0] - 1;
+            int iy1 = (ls[1] + cs[1] - 1) / cs[1] - 1;
+            int ix1 = (ls[2] + cs[2] - 1) / cs[2] - 1;
+
+            if (hasDataBounds) {
+                // Only prefetch chunks that overlap the data bounds
+                float scale = 1.0f / static_cast<float>(1 << lvl);
+                iz0 = std::max(0, static_cast<int>(dbMinZ * scale) / cs[0]);
+                iy0 = std::max(0, static_cast<int>(dbMinY * scale) / cs[1]);
+                ix0 = std::max(0, static_cast<int>(dbMinX * scale) / cs[2]);
+                iz1 = std::min(iz1, static_cast<int>(dbMaxZ * scale) / cs[0]);
+                iy1 = std::min(iy1, static_cast<int>(dbMaxY * scale) / cs[1]);
+                ix1 = std::min(ix1, static_cast<int>(dbMaxX * scale) / cs[2]);
+            }
+
+            int total = (iz1 - iz0 + 1) * (iy1 - iy0 + 1) * (ix1 - ix0 + 1);
+
+            // Estimate on-disk size using average compressed bytes per file.
+            // DiskStore tracks actual compressed file sizes, so this accounts
+            // for recompression.
+            auto stats = cache->stats();
+            size_t diskUsed = stats.diskBytes;
+            size_t avgBytesPerChunk = (stats.diskFiles > 0)
+                ? diskUsed / stats.diskFiles
+                : static_cast<size_t>(cs[0]) * cs[1] * cs[2];  // fallback: uncompressed
+            size_t estimatedBytes = static_cast<size_t>(total) * avgBytesPerChunk;
+            if (diskBudget > 0 && diskUsed + estimatedBytes > diskBudget) {
+                double estGB = estimatedBytes / (1024.0 * 1024.0 * 1024.0);
+                double budgetGB = diskBudget / (1024.0 * 1024.0 * 1024.0);
+                double usedGB = diskUsed / (1024.0 * 1024.0 * 1024.0);
+                std::fprintf(stderr,
+                    "[Volume] Skipping level %d prefetch: %d chunks (~%.1f GB) "
+                    "would exceed disk budget (%.1f/%.1f GB used)\n",
+                    lvl, total, estGB, usedGB, budgetGB);
+                continue;
+            }
+
+            double estGB = estimatedBytes / (1024.0 * 1024.0 * 1024.0);
+            std::fprintf(stderr, "[Volume] Prefetching level %d (%d chunks, ~%.1f GB)...\n",
+                         lvl, total, estGB);
+
+            // Drip-feed: submit one z-slab at a time, waiting for the queue
+            // to drain between slabs so we don't overwhelm the IO pool.
+            int submitted = 0;
+            int slabSize = (iy1 - iy0 + 1) * (ix1 - ix0 + 1);
+
+            for (int iz = iz0; iz <= iz1; iz++) {
+                cache->prefetchRegion(lvl, iz, iy0, ix0, iz, iy1, ix1);
+                submitted += slabSize;
+
+                if (submitted % 5000 < slabSize)
+                    std::fprintf(stderr, "[Volume] Level %d prefetch: %d/%d\n",
+                                 lvl, submitted, total);
+
+                // Wait for queue to drain before submitting more
+                while (cache->stats().ioPending > 10000) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+            }
+            std::fprintf(stderr, "[Volume] Level %d prefetch: %d/%d done\n",
+                         lvl, submitted, total);
+        }
+        std::fprintf(stderr, "[Volume] Level prefetch complete (levels %d-%d)\n",
+                     fromLevel, toLevel);
+    }).detach();
+}
+
+void Volume::cancelPendingPrefetch()
+{
+    if (tieredCache_) {
+        tieredCache_->cancelPendingPrefetch();
+    }
+}
+
+void Volume::prefetchWorldBBox(const cv::Vec3f& lo, const cv::Vec3f& hi, int level)
+{
+    ensureTieredCache();
+    if (!tieredCache_) return;
+
+    vc::VcDataset* ds = zarrDataset(level);
+    if (!ds) return;
+
+    float scale = (level > 0) ? (1.0f / static_cast<float>(1 << level)) : 1.0f;
+    auto cs = ds->defaultChunkShape();  // {cz, cy, cx}
+    const auto& shape = ds->shape();    // {z, y, x}
+
+    // Apply margin to float coords, then floor/ceil to chunk indices
+    float sLoX = lo[0] * scale - 1.0f;
+    float sHiX = hi[0] * scale + 1.0f;
+    float sLoY = lo[1] * scale - 1.0f;
+    float sHiY = hi[1] * scale + 1.0f;
+    float sLoZ = lo[2] * scale - 1.0f;
+    float sHiZ = hi[2] * scale + 1.0f;
+
+    int minIx = std::max(0, static_cast<int>(std::floor(sLoX / cs[2])));
+    int maxIx = std::min(static_cast<int>((shape[2] - 1) / cs[2]),
+                         static_cast<int>(std::ceil(sHiX / cs[2])));
+    int minIy = std::max(0, static_cast<int>(std::floor(sLoY / cs[1])));
+    int maxIy = std::min(static_cast<int>((shape[1] - 1) / cs[1]),
+                         static_cast<int>(std::ceil(sHiY / cs[1])));
+    int minIz = std::max(0, static_cast<int>(std::floor(sLoZ / cs[0])));
+    int maxIz = std::min(static_cast<int>((shape[0] - 1) / cs[0]),
+                         static_cast<int>(std::ceil(sHiZ / cs[0])));
+
+    if (minIx > maxIx || minIy > maxIy || minIz > maxIz) return;
+
+    tieredCache_->prefetchRegion(level, minIz, minIy, minIx, maxIz, maxIy, maxIx);
 }

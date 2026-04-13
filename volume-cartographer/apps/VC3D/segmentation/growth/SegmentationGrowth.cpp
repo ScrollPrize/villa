@@ -12,7 +12,7 @@
 #include <QLoggingCategory>
 #include <QString>
 
-#include "z5/factory.hxx"
+#include "vc/core/types/VcDataset.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
@@ -27,13 +27,13 @@
 Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth)
 
 namespace
-{void createRotatingBackup(QuadSurface* surface, const std::filesystem::path& surfacePath, int maxBackups = 10)
+{void createRotatingBackup(QuadSurface* surface, int maxBackups = 10)
 {
     if (!surface) {
         return;
     }
 
-    qCInfo(lcSegGrowth) << "Creating backup for:" << QString::fromStdString(surfacePath.string());
+    qCInfo(lcSegGrowth) << "Creating backup for:" << QString::fromStdString(surface->path.string());
 
     try {
         // Create a rotating backup snapshot
@@ -144,16 +144,10 @@ QString directionToString(SegmentationGrowthDirection direction)
 }
 
 bool appendDirectionField(const SegmentationDirectionFieldConfig& config,
-                          ChunkCache<uint8_t>* cache,
                           const QString& cacheRoot,
                           std::vector<DirectionField>& out,
                           QString& error)
 {
-    if (!cache) {
-        error = QStringLiteral("Direction field loading failed: chunk cache unavailable");
-        return false;
-    }
-
     if (!config.isValid()) {
         return true;
     }
@@ -174,15 +168,13 @@ bool appendDirectionField(const SegmentationDirectionFieldConfig& config,
     }
 
     try {
-        z5::filesystem::handle::Group group(zarrPath, z5::FileMode::FileMode::r);
         const int scaleLevel = std::clamp(config.scale, 0, 5);
 
-        std::vector<std::unique_ptr<z5::Dataset>> datasets;
+        std::vector<std::unique_ptr<vc::VcDataset>> datasets;
         datasets.reserve(3);
         for (char axis : std::string("xyz")) {
-            z5::filesystem::handle::Group axisGroup(group, std::string(1, axis));
-            z5::filesystem::handle::Dataset datasetHandle(axisGroup, std::to_string(scaleLevel), ".");
-            datasets.push_back(z5::filesystem::openDataset(datasetHandle));
+            auto dsPath = std::filesystem::path(zarrPath) / std::string(1, axis) / std::to_string(scaleLevel);
+            datasets.push_back(std::make_unique<vc::VcDataset>(dsPath));
         }
 
         const float scaleFactor = std::pow(2.0f, -static_cast<float>(scaleLevel));
@@ -194,7 +186,6 @@ bool appendDirectionField(const SegmentationDirectionFieldConfig& config,
         out.emplace_back(segmentationDirectionFieldOrientationKey(config.orientation).toStdString(),
                          std::make_unique<Chunked3dVec3fFromUint8>(std::move(datasets),
                                                                    scaleFactor,
-                                                                   cache,
                                                                    cacheRootStr,
                                                                    uniqueId),
                          std::unique_ptr<Chunked3dFloatFromUint8>(),
@@ -256,7 +247,15 @@ void ensureNormalsInward(QuadSurface* surface, const Volume* volume)
     cv::normalize(normal, normal);
 
     auto [w, h, d] = volume->shape();
-    cv::Vec3f volumeCenter(w * 0.5f, h * 0.5f, d * 0.5f);
+    const auto& db = volume->dataBounds();
+    cv::Vec3f volumeCenter;
+    if (db.valid) {
+        volumeCenter = cv::Vec3f((db.minX + db.maxX) * 0.5f,
+                                  (db.minY + db.maxY) * 0.5f,
+                                  (db.minZ + db.maxZ) * 0.5f);
+    } else {
+        volumeCenter = cv::Vec3f(w * 0.5f, h * 0.5f, d * 0.5f);
+    }
     cv::Vec3f toCenter = volumeCenter - p;
     toCenter[2] = 0.0f;
 
@@ -344,7 +343,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
 {
     TracerGrowthResult result;
 
-    if (!context.resumeSurface || !context.volume || !context.cache) {
+    if (!context.resumeSurface || !context.volume) {
         result.error = QStringLiteral("Missing context for tracer growth");
         return result;
     }
@@ -356,7 +355,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
 
     ensureNormalsInward(context.resumeSurface, context.volume);
 
-    z5::Dataset* dataset = context.volume->zarrDataset(0);
+    vc::VcDataset* dataset = context.volume->zarrDataset(0);
     if (!dataset) {
         result.error = QStringLiteral("Unable to access primary volume dataset");
         return result;
@@ -374,7 +373,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
     nlohmann::json params = buildTracerParams(request);
 
     int startGen = 0;
-    if (context.resumeSurface) {
+    {
         cv::Mat resumeGenerations = context.resumeSurface->channel("generations");
         if (!resumeGenerations.empty()) {
             double minVal = 0.0;
@@ -418,8 +417,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
 
     if (requestedSteps > 0) {
         targetGenerations = startGen + requestedSteps;
-    } else if (!context.resumeSurface) {
-        targetGenerations = std::max(startGen + 1, 1);
     }
 
     if (targetGenerations < startGen) {
@@ -464,7 +461,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         }
 
         QString loadError;
-        if (!appendDirectionField(config, context.cache, context.cacheRoot, directionFields, loadError)) {
+        if (!appendDirectionField(config, context.cacheRoot, directionFields, loadError)) {
             result.error = loadError;
             return result;
         }
@@ -495,11 +492,11 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
             }
         }
         qCInfo(lcSegGrowth) << "  params:" << QString::fromStdString(params.dump());
-        std::filesystem::path surface_path = context.resumeSurface->path;
-        createRotatingBackup(context.resumeSurface, surface_path);
+        createRotatingBackup(context.resumeSurface);
         QuadSurface* surface = tracer(dataset,
                                       1.0f,
-                                      context.cache,
+                                      context.volume->tieredCache(),
+                                      context.level,
                                       origin,
                                       params,
                                       context.cacheRoot.toStdString(),

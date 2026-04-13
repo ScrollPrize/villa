@@ -328,7 +328,7 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
     if (_pointerSeedValid) {
         ptr = _pointerSeed;
     } else {
-        ptr = _baseSurface->pointer();
+        ptr = cv::Vec3f(0, 0, 0);
         _pointerSeed = ptr;
         _pointerSeedValid = true;
     }
@@ -396,8 +396,7 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
                 const float breakThreshold = (radius == 0)
                                                  ? stepNorm
                                                  : stepNorm * 1.5f * static_cast<float>(radius);
-                const float breakThresholdSq = breakThreshold * breakThreshold;
-                if (bestDistSq <= breakThresholdSq) {
+                if (bestDistSq <= breakThreshold * breakThreshold) {
                     break;
                 }
             }
@@ -439,8 +438,7 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
                 const float breakRadius = (radius == 0)
                                               ? stepNorm
                                               : stepNorm * profile.breakMultiplier * static_cast<float>(radius);
-                const float breakRadiusSq = breakRadius * breakRadius;
-                if (bestDistSq <= breakRadiusSq) {
+                if (bestDistSq <= breakRadius * breakRadius) {
                     break;
                 }
             }

@@ -21,7 +21,7 @@
 #include <variant>
 #include <vector>
 
-class CVolumeViewer;
+class VolumeViewerBase;
 class ViewerManager;
 class QGraphicsItem;
 class QGraphicsScene;
@@ -151,14 +151,14 @@ public:
     explicit ViewerOverlayControllerBase(std::string overlayGroupKey, QObject* parent = nullptr);
     ~ViewerOverlayControllerBase() override;
 
-    void attachViewer(CVolumeViewer* viewer);
-    void detachViewer(CVolumeViewer* viewer);
+    void attachViewer(VolumeViewerBase* viewer);
+    virtual void detachViewer(VolumeViewerBase* viewer);
 
     void bindToViewerManager(ViewerManager* manager);
 
     void refreshAll();
-    void refreshViewer(CVolumeViewer* viewer);
-    static void applyPrimitives(CVolumeViewer* viewer,
+    void refreshViewer(VolumeViewerBase* viewer);
+    static void applyPrimitives(VolumeViewerBase* viewer,
                                 const std::string& overlayKey,
                                 std::vector<OverlayPrimitive> primitives);
 
@@ -167,7 +167,7 @@ protected:
 
     class OverlayBuilder {
     public:
-        explicit OverlayBuilder(CVolumeViewer* viewer);
+        explicit OverlayBuilder(VolumeViewerBase* viewer);
 
         void addPoint(const QPointF& position,
                       qreal radius,
@@ -208,41 +208,41 @@ protected:
 
         bool empty() const { return _primitives.empty(); }
         std::vector<OverlayPrimitive> takePrimitives();
-        CVolumeViewer* viewer() const { return _viewer; }
+        VolumeViewerBase* viewer() const { return _viewer; }
 
     private:
-        CVolumeViewer* _viewer{nullptr};
+        VolumeViewerBase* _viewer{nullptr};
         std::vector<OverlayPrimitive> _primitives;
     };
 
-    virtual bool isOverlayEnabledFor(CVolumeViewer* viewer) const;
-    virtual void collectPrimitives(CVolumeViewer* viewer, OverlayBuilder& builder) = 0;
+    virtual bool isOverlayEnabledFor(VolumeViewerBase* viewer) const;
+    virtual void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) = 0;
 
-    QPointF volumeToScene(CVolumeViewer* viewer, const cv::Vec3f& volumePoint) const;
-    cv::Vec3f sceneToVolume(CVolumeViewer* viewer, const QPointF& scenePoint) const;
-    std::vector<QPointF> volumeToScene(CVolumeViewer* viewer,
+    QPointF volumeToScene(VolumeViewerBase* viewer, const cv::Vec3f& volumePoint) const;
+    cv::Vec3f sceneToVolume(VolumeViewerBase* viewer, const QPointF& scenePoint) const;
+    std::vector<QPointF> volumeToScene(VolumeViewerBase* viewer,
                                        const std::vector<cv::Vec3f>& volumePoints) const;
-    QGraphicsScene* viewerScene(CVolumeViewer* viewer) const;
-    QRectF visibleSceneRect(CVolumeViewer* viewer) const;
-    bool isScenePointVisible(CVolumeViewer* viewer, const QPointF& scenePoint) const;
-    Surface* viewerSurface(CVolumeViewer* viewer) const;
+    QGraphicsScene* viewerScene(VolumeViewerBase* viewer) const;
+    QRectF visibleSceneRect(VolumeViewerBase* viewer) const;
+    bool isScenePointVisible(VolumeViewerBase* viewer, const QPointF& scenePoint) const;
+    Surface* viewerSurface(VolumeViewerBase* viewer) const;
 
-    FilteredPoints filterPoints(CVolumeViewer* viewer,
+    FilteredPoints filterPoints(VolumeViewerBase* viewer,
                                 const std::vector<cv::Vec3f>& points,
                                 const PointFilterOptions& options) const;
 
-    void clearOverlay(CVolumeViewer* viewer) const;
+    void clearOverlay(VolumeViewerBase* viewer) const;
 
     ViewerManager* manager() const { return _manager; }
 
 private:
     struct ViewerEntry {
-        CVolumeViewer* viewer{nullptr};
+        VolumeViewerBase* viewer{nullptr};
         QMetaObject::Connection overlaysUpdatedConn;
         QMetaObject::Connection destroyedConn;
     };
 
-    void rebuildOverlay(CVolumeViewer* viewer);
+    void rebuildOverlay(VolumeViewerBase* viewer);
     void detachAllViewers();
 
     std::string _overlayGroupKey;

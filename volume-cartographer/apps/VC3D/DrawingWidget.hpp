@@ -18,7 +18,8 @@
 using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
 using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/Slicing.hpp"
+
+class CState;
 
 
 /**
@@ -35,15 +36,9 @@ public:
     explicit DrawingWidget(QWidget* parent = nullptr);
     ~DrawingWidget();
     
-    /** Set the volume package */
-    void setVolumePkg(std::shared_ptr<VolumePkg> vpkg);
-    
-    /** Set the current volume */
-    void setCurrentVolume(std::shared_ptr<Volume> volume);
-    
-    /** Set the cache for volume data access */
-    void setCache(ChunkCache<uint8_t>* cache);
-    
+    /** Set the application state (replaces setVolumePkg/setCurrentVolume) */
+    void setState(CState* state);
+
     /** Clear all drawn paths */
     void clearAllPaths();
     
@@ -144,11 +139,8 @@ private:
                               float eraserRadius, PathBrushShape brushShape) const;
 
 private:
-    // Volume data
-    std::shared_ptr<VolumePkg> fVpkg;
-    std::shared_ptr<Volume> currentVolume;
-    std::string currentVolumeId;
-    ChunkCache<uint8_t>* chunkCache;
+    // Application state (owns volume/vpkg references)
+    CState* _state{nullptr};
     
     // Drawing state
     int currentPathId;

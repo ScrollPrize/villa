@@ -19,7 +19,7 @@
 
 #include <opencv2/core.hpp>
 
-#include "../CVolumeViewer.hpp"
+#include "../tiled/CTiledVolumeViewer.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "growth/SegmentationGrowth.hpp"
 #include "SegmentationPushPullConfig.hpp"
@@ -34,8 +34,8 @@ inline constexpr int kStatusMedium = 2000;
 inline constexpr int kStatusLong = 5000;
 
 
-class CSurfaceCollection;
-class CVolumeViewer;
+class CState;
+class CTiledVolumeViewer;
 class PlaneSurface;
 class Surface;
 class QuadSurface;
@@ -60,7 +60,7 @@ public:
                        SegmentationEditManager* editManager,
                        SegmentationOverlayController* overlay,
                        ViewerManager* viewerManager,
-                       CSurfaceCollection* surfaces,
+                       CState* state,
                        VCCollection* pointCollection,
                        bool editingEnabled,
                        QObject* parent = nullptr);
@@ -141,7 +141,7 @@ public:
     void applyCorrectionAnchorOffset(float offsetX, float offsetY);
     void saveCorrectionPoints(const std::filesystem::path& segmentPath);
 
-    void attachViewer(CVolumeViewer* viewer);
+    void attachViewer(CTiledVolumeViewer* viewer);
     void updateViewerCursors();
 
     bool handleKeyPress(QKeyEvent* event);
@@ -165,13 +165,13 @@ public:
         int row{0};
         int col{0};
         cv::Vec3f world{0.0f, 0.0f, 0.0f};
-        CVolumeViewer* viewer{nullptr};
+        CTiledVolumeViewer* viewer{nullptr};
     };
 
     [[nodiscard]] HoverInfo hoverInfo() const;
-    [[nodiscard]] bool isSegmentationViewer(const CVolumeViewer* viewer) const;
+    [[nodiscard]] bool isSegmentationViewer(const CTiledVolumeViewer* viewer) const;
 
-    void setRotationHandleHitTester(std::function<bool(CVolumeViewer*, const cv::Vec3f&)> tester);
+    void setRotationHandleHitTester(std::function<bool(CTiledVolumeViewer*, const cv::Vec3f&)> tester);
 
 signals:
     void editingEnabledChanged(bool enabled);
@@ -207,7 +207,7 @@ private:
         int col{0};
         cv::Vec3f startWorld{0.0f, 0.0f, 0.0f};
         cv::Vec3f lastWorld{0.0f, 0.0f, 0.0f};
-        QPointer<CVolumeViewer> viewer;
+        QPointer<CTiledVolumeViewer> viewer;
         bool moved{false};
 
         void reset();
@@ -219,9 +219,9 @@ private:
         int row{0};
         int col{0};
         cv::Vec3f world{0.0f, 0.0f, 0.0f};
-        QPointer<CVolumeViewer> viewer;
+        QPointer<CTiledVolumeViewer> viewer;
 
-        void set(int r, int c, const cv::Vec3f& w, CVolumeViewer* v);
+        void set(int r, int c, const cv::Vec3f& w, CTiledVolumeViewer* v);
         void clear();
     };
 
@@ -232,7 +232,7 @@ private:
         int anchorCol{0};
         cv::Vec3f startWorld{0.0f, 0.0f, 0.0f};  // Where drag started (on surface)
         cv::Vec3f currentWorld{0.0f, 0.0f, 0.0f};  // Current drag position
-        QPointer<CVolumeViewer> viewer;
+        QPointer<CTiledVolumeViewer> viewer;
         bool moved{false};
 
         void reset() {
@@ -247,7 +247,7 @@ private:
     };
 
     void bindWidgetSignals();
-    void bindViewerSignals(CVolumeViewer* viewer);
+    void bindViewerSignals(CTiledVolumeViewer* viewer);
 
     void emitPendingChanges();
     void refreshOverlay();
@@ -258,7 +258,7 @@ private:
     uint64_t createCorrectionCollection(bool announce);
     void handleCorrectionPointAdded(const cv::Vec3f& worldPos);
     void handleCorrectionPointRemove(const cv::Vec3f& worldPos);
-    void beginCorrectionDrag(int row, int col, CVolumeViewer* viewer, const cv::Vec3f& worldPos);
+    void beginCorrectionDrag(int row, int col, CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos);
     void updateCorrectionDrag(const cv::Vec3f& worldPos);
     void finishCorrectionDrag();
     void cancelCorrectionDrag();
@@ -275,20 +275,20 @@ private:
                                     bool inpaintOnly);
     void clearLineDragStroke();
 
-    void handleMousePress(CVolumeViewer* viewer,
+    void handleMousePress(CTiledVolumeViewer* viewer,
                           const cv::Vec3f& worldPos,
                           const cv::Vec3f& surfaceNormal,
                           Qt::MouseButton button,
                           Qt::KeyboardModifiers modifiers);
-    void handleMouseMove(CVolumeViewer* viewer,
+    void handleMouseMove(CTiledVolumeViewer* viewer,
                          const cv::Vec3f& worldPos,
                          Qt::MouseButtons buttons,
                          Qt::KeyboardModifiers modifiers);
-    void handleMouseRelease(CVolumeViewer* viewer,
+    void handleMouseRelease(CTiledVolumeViewer* viewer,
                             const cv::Vec3f& worldPos,
                             Qt::MouseButton button,
                             Qt::KeyboardModifiers modifiers);
-    void handleWheel(CVolumeViewer* viewer,
+    void handleWheel(CTiledVolumeViewer* viewer,
                      int deltaSteps,
                      const QPointF& scenePos,
                      const cv::Vec3f& worldPos);
@@ -306,16 +306,16 @@ private:
     void updateOverlayFalloff(FalloffTool tool);
     [[nodiscard]] float falloffRadius(FalloffTool tool) const;
     [[nodiscard]] float falloffSigma(FalloffTool tool) const;
-    void beginDrag(int row, int col, CVolumeViewer* viewer, const cv::Vec3f& worldPos);
+    void beginDrag(int row, int col, CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos);
     void updateDrag(const cv::Vec3f& worldPos);
     void finishDrag();
     void cancelDrag();
 
-    void updateHover(CVolumeViewer* viewer, const cv::Vec3f& worldPos);
-    [[nodiscard]] bool isNearRotationHandle(CVolumeViewer* viewer, const cv::Vec3f& worldPos) const;
+    void updateHover(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos);
+    [[nodiscard]] bool isNearRotationHandle(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos) const;
     SegmentationEditManager::GridSearchResolution hoverLookupDetail(const cv::Vec3f& worldPos);
     void resetHoverLookupDetail();
-    void recordPointerSample(CVolumeViewer* viewer, const cv::Vec3f& worldPos);
+    void recordPointerSample(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos);
 
     bool startPushPull(int direction, std::optional<bool> alphaOverride = std::nullopt);
     void stopPushPull(int direction);
@@ -332,7 +332,7 @@ private:
     SegmentationEditManager* _editManager{nullptr};
     SegmentationOverlayController* _overlay{nullptr};
     ViewerManager* _viewerManager{nullptr};
-    CSurfaceCollection* _surfaces{nullptr};
+    CState* _state{nullptr};
     VCCollection* _pointCollection{nullptr};
 
     bool _editingEnabled{false};
@@ -356,9 +356,9 @@ private:
     DragState _drag;
     HoverState _hover;
     CorrectionDragState _correctionDrag;
-    QSet<CVolumeViewer*> _attachedViewers;
+    QSet<CTiledVolumeViewer*> _attachedViewers;
 
-    std::function<bool(CVolumeViewer*, const cv::Vec3f&)> _rotationHandleHitTester;
+    std::function<bool(CTiledVolumeViewer*, const cv::Vec3f&)> _rotationHandleHitTester;
 
     bool _lineDrawKeyActive{false};
     std::optional<std::vector<SegmentationGrowthDirection>> _pendingShortcutDirections;
@@ -411,7 +411,7 @@ private:
     {
         bool valid{false};
         cv::Vec3f world{0.0f, 0.0f, 0.0f};
-        QPointer<CVolumeViewer> viewer;
+        QPointer<CTiledVolumeViewer> viewer;
     };
     HoverPointerSample _hoverPointer;
 };

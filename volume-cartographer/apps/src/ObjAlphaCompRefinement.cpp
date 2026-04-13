@@ -4,10 +4,7 @@
 #include <xtensor/io/xio.hpp>
 #include <xtensor/views/xview.hpp>
 
-#include "z5/factory.hxx"
-#include "z5/filesystem/handle.hxx"
-#include "z5/multiarray/xtensor_access.hxx"
-#include "z5/attributes.hxx"
+#include "vc/core/types/VcDataset.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/core.hpp>
@@ -17,6 +14,7 @@
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/cache/SimpleCacheFactory.hpp"
 #include "vc/core/util/StreamOperators.hpp"
 #include "vc/core/util/Surface.hpp"
 
@@ -142,9 +140,9 @@ bool istype(const std::string &line, const std::string &type)
 
 
 struct DSReader {
-    z5::Dataset* ds;
+    vc::cache::TieredChunkCache* cache;
     float scale;
-    ChunkCache<uint8_t>* cache;
+    int level;
     std::mutex read_mutex;
 };
 
@@ -171,7 +169,7 @@ float alphacomp_offset(DSReader &reader, cv::Vec3f point, cv::Vec3f normal, floa
         cv::Mat_<cv::Vec3f> offmat(size, normal*off*reader.scale);
         {
             std::lock_guard<std::mutex> lock(reader.read_mutex);
-            readInterpolated3D(slice, reader.ds, coords+offmat, reader.cache);
+            readInterpolated3D(slice, reader.cache, reader.level, coords+offmat);
         }
 
         cv::Mat floatslice;
@@ -270,7 +268,7 @@ int process_obj(const std::string& src,
     if (vertexcolor) {
         std::lock_guard<std::mutex> lock(reader.read_mutex);
         cv::Mat_<cv::Vec3f> vs_mat(static_cast<int>(vs.size()), 1, vs.data());
-        readInterpolated3D(slice, reader.ds, vs_mat*reader.scale, reader.cache);
+        readInterpolated3D(slice, reader.cache, reader.level, vs_mat*reader.scale);
     }
 
     obj.clear();
@@ -409,16 +407,14 @@ int main(int argc, char *argv[])
     const nlohmann::json params = nlohmann::json::parse(params_f);
     const RefinementConfig cfg = parse_config(params);
 
-    z5::filesystem::handle::Group group(vol_path.string(), z5::FileMode::FileMode::r);
-    z5::filesystem::handle::Dataset ds_handle(group, cfg.dataset_group, "/");
-    std::unique_ptr<z5::Dataset> ds = z5::filesystem::openDataset(ds_handle);
+    std::unique_ptr<vc::VcDataset> ds = std::make_unique<vc::VcDataset>(vol_path / cfg.dataset_group);
 
     std::cout << "zarr dataset size for scale group " << cfg.dataset_group << " " << ds->shape() << std::endl;
-    std::cout << "chunk shape shape " << ds->chunking().blockShape() << std::endl;
+    std::cout << "chunk shape shape " << ds->defaultChunkShape() << std::endl;
     std::cout << "chunk cache size (bytes) " << cfg.cache_bytes << std::endl;
-    ChunkCache<uint8_t> chunk_cache(cfg.cache_bytes);
+    auto chunk_cache = vc::cache::createSimpleTieredCache(ds.get(), cfg.cache_bytes, ds->path());
 
-    DSReader reader = {ds.get(), cfg.reader_scale, &chunk_cache};
+    DSReader reader = {chunk_cache.get(), cfg.reader_scale, 0};
 
     MeasureLife timer("processing surface ...\n");
 

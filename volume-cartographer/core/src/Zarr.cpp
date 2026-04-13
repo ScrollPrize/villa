@@ -1,4 +1,5 @@
 #include "vc/core/util/Zarr.hpp"
+#include "vc/core/types/VcDataset.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -7,10 +8,10 @@
 #include <iomanip>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 
 #include <nlohmann/json.hpp>
 #include <omp.h>
-#include <z5/factory.hxx>
 
 using json = nlohmann::json;
 
@@ -19,7 +20,7 @@ using json = nlohmann::json;
 // ============================================================
 
 template <typename T>
-void writeZarrBand(z5::Dataset* dsOut, const std::vector<cv::Mat>& slices,
+void writeZarrBand(vc::VcDataset* dsOut, const std::vector<cv::Mat>& slices,
                    uint32_t bandIdx, const std::vector<size_t>& chunks0,
                    size_t tilesXSrc, size_t tilesYSrc,
                    int rotQuad, int flipAxis)
@@ -47,15 +48,105 @@ void writeZarrBand(z5::Dataset* dsOut, const std::vector<cv::Mat>& slices,
                 std::memcpy(&chunkBuf[sliceOff + yy * chunkX], &row[x0s], dx_actual * sizeof(T));
             }
         }
-        z5::types::ShapeType chunkId = {0, size_t(dstTy), size_t(dstTx)};
-        dsOut->writeChunk(chunkId, chunkBuf.data());
+        dsOut->writeChunk(0, size_t(dstTy), size_t(dstTx),
+                          chunkBuf.data(), chunkBuf.size() * sizeof(T));
     }
 }
 
-template void writeZarrBand<uint8_t>(z5::Dataset*, const std::vector<cv::Mat>&,
+template void writeZarrBand<uint8_t>(vc::VcDataset*, const std::vector<cv::Mat>&,
     uint32_t, const std::vector<size_t>&, size_t, size_t, int, int);
-template void writeZarrBand<uint16_t>(z5::Dataset*, const std::vector<cv::Mat>&,
+template void writeZarrBand<uint16_t>(vc::VcDataset*, const std::vector<cv::Mat>&,
     uint32_t, const std::vector<size_t>&, size_t, size_t, int, int);
+
+void writeZarrRegionU8ByChunk(vc::VcDataset* dsOut,
+                              const std::vector<size_t>& offset,
+                              const std::vector<size_t>& regionShape,
+                              const uint8_t* data,
+                              uint8_t fillValue)
+{
+    if (!dsOut) {
+        throw std::runtime_error("writeZarrRegionU8ByChunk requires a dataset");
+    }
+    if (offset.size() != 3 || regionShape.size() != 3) {
+        throw std::runtime_error("writeZarrRegionU8ByChunk expects 3D ZYX inputs");
+    }
+    if (dsOut->shape().size() != 3 || dsOut->defaultChunkShape().size() != 3) {
+        throw std::runtime_error("writeZarrRegionU8ByChunk requires a 3D dataset");
+    }
+    if (dsOut->getDtype() != vc::VcDtype::uint8) {
+        throw std::runtime_error("writeZarrRegionU8ByChunk only supports uint8 datasets");
+    }
+    if ((regionShape[0] > 0 || regionShape[1] > 0 || regionShape[2] > 0) && !data) {
+        throw std::runtime_error("writeZarrRegionU8ByChunk requires input data");
+    }
+
+    const auto& datasetShape = dsOut->shape();
+    const auto& chunkShape = dsOut->defaultChunkShape();
+    for (size_t d = 0; d < 3; ++d) {
+        if (offset[d] > datasetShape[d] || regionShape[d] > (datasetShape[d] - offset[d])) {
+            throw std::runtime_error("writeZarrRegionU8ByChunk region exceeds dataset bounds");
+        }
+        if (regionShape[d] == 0) {
+            return;
+        }
+    }
+
+    const size_t chunkElems = chunkShape[0] * chunkShape[1] * chunkShape[2];
+    std::vector<uint8_t> chunkBuf(chunkElems, fillValue);
+
+    const size_t chunkZ0 = offset[0] / chunkShape[0];
+    const size_t chunkY0 = offset[1] / chunkShape[1];
+    const size_t chunkX0 = offset[2] / chunkShape[2];
+    const size_t chunkZ1 = (offset[0] + regionShape[0] - 1) / chunkShape[0];
+    const size_t chunkY1 = (offset[1] + regionShape[1] - 1) / chunkShape[1];
+    const size_t chunkX1 = (offset[2] + regionShape[2] - 1) / chunkShape[2];
+
+    for (size_t cz = chunkZ0; cz <= chunkZ1; ++cz) {
+        const size_t chunkBaseZ = cz * chunkShape[0];
+        for (size_t cy = chunkY0; cy <= chunkY1; ++cy) {
+            const size_t chunkBaseY = cy * chunkShape[1];
+            for (size_t cx = chunkX0; cx <= chunkX1; ++cx) {
+                const size_t chunkBaseX = cx * chunkShape[2];
+
+                const size_t overlapZ0 = std::max(chunkBaseZ, offset[0]);
+                const size_t overlapY0 = std::max(chunkBaseY, offset[1]);
+                const size_t overlapX0 = std::max(chunkBaseX, offset[2]);
+                const size_t overlapZ1 = std::min(chunkBaseZ + chunkShape[0], offset[0] + regionShape[0]);
+                const size_t overlapY1 = std::min(chunkBaseY + chunkShape[1], offset[1] + regionShape[1]);
+                const size_t overlapX1 = std::min(chunkBaseX + chunkShape[2], offset[2] + regionShape[2]);
+
+                if (overlapZ0 >= overlapZ1 || overlapY0 >= overlapY1 || overlapX0 >= overlapX1) {
+                    continue;
+                }
+
+                std::fill(chunkBuf.begin(), chunkBuf.end(), fillValue);
+
+                const size_t copyZ = overlapZ1 - overlapZ0;
+                const size_t copyY = overlapY1 - overlapY0;
+                const size_t copyX = overlapX1 - overlapX0;
+
+                const size_t srcBaseZ = overlapZ0 - offset[0];
+                const size_t srcBaseY = overlapY0 - offset[1];
+                const size_t srcBaseX = overlapX0 - offset[2];
+                const size_t dstBaseZ = overlapZ0 - chunkBaseZ;
+                const size_t dstBaseY = overlapY0 - chunkBaseY;
+                const size_t dstBaseX = overlapX0 - chunkBaseX;
+
+                for (size_t z = 0; z < copyZ; ++z) {
+                    for (size_t y = 0; y < copyY; ++y) {
+                        const size_t srcOff =
+                            ((srcBaseZ + z) * regionShape[1] + (srcBaseY + y)) * regionShape[2] + srcBaseX;
+                        const size_t dstOff =
+                            ((dstBaseZ + z) * chunkShape[1] + (dstBaseY + y)) * chunkShape[2] + dstBaseX;
+                        std::memcpy(chunkBuf.data() + dstOff, data + srcOff, copyX);
+                    }
+                }
+
+                dsOut->writeChunk(cz, cy, cx, chunkBuf.data(), chunkBuf.size());
+            }
+        }
+    }
+}
 
 // ============================================================
 // downsampleChunk
@@ -148,26 +239,22 @@ template void downsampleTileIntoPreserveZ<uint16_t>(const uint16_t*, size_t, siz
 // ============================================================
 
 template <typename T>
-void buildPyramidLevel(z5::filesystem::handle::File& outFile, int level,
+void buildPyramidLevel(const std::filesystem::path& outDir, int level,
                        size_t CH, size_t CW,
                        int numParts, int partId)
 {
-    auto src = z5::openDataset(outFile, std::to_string(level - 1));
-    auto dst = z5::openDataset(outFile, std::to_string(level));
+    auto src = std::make_unique<vc::VcDataset>(outDir / std::to_string(level - 1));
+    auto dst = std::make_unique<vc::VcDataset>(outDir / std::to_string(level));
     const auto& ss = src->shape();
-    const auto& sc = src->defaultChunkShape();  // source chunk shape (fixed, e.g. 128×128)
-    const auto& dc = dst->defaultChunkShape();  // dst chunk shape (same Y×X as source)
+    const auto& sc = src->defaultChunkShape();
+    const auto& dc = dst->defaultChunkShape();
     const auto& ds = dst->shape();
 
-    // Source chunk grid
     size_t srcChunksY = (ss[1] + sc[1] - 1) / sc[1];
     size_t srcChunksX = (ss[2] + sc[2] - 1) / sc[2];
-
-    // Dest chunk grid (half as many chunks since shape halves but chunk size stays)
     size_t dstChunksY = (ds[1] + dc[1] - 1) / dc[1];
     size_t dstChunksX = (ds[2] + dc[2] - 1) / dc[2];
 
-    // Contiguous block assignment: each part gets a contiguous range of dest tile rows
     size_t rowsPerPart = (dstChunksY + size_t(numParts) - 1) / size_t(numParts);
     size_t rowStart = size_t(partId) * rowsPerPart;
     size_t rowEnd = std::min(rowStart + rowsPerPart, dstChunksY);
@@ -184,26 +271,20 @@ void buildPyramidLevel(z5::filesystem::handle::File& outFile, int level,
 
         std::vector<T> dstBuf(dstElems, T(0));
 
-        // Each dest chunk assembles from a 2×2 grid of source chunks
         for (int sy = 0; sy < 2; sy++) {
             for (int sx = 0; sx < 2; sx++) {
                 size_t scy = dcy * 2 + sy;
                 size_t scx = dcx * 2 + sx;
                 if (scy >= srcChunksY || scx >= srcChunksX) continue;
 
-                z5::types::ShapeType srcId = {0, scy, scx};
                 std::vector<T> srcBuf(srcElems, T(0));
-                if (src->chunkExists(srcId))
-                    src->readChunk(srcId, srcBuf.data());
-                else
+                if (!src->readChunk(0, scy, scx, srcBuf.data()))
                     continue;
 
-                // Actual valid extent in this source chunk
                 size_t saZ = std::min(sc[0], ss[0]);
                 size_t saY = std::min(sc[1], ss[1] - scy * sc[1]);
                 size_t saX = std::min(sc[2], ss[2] - scx * sc[2]);
 
-                // Offset within dest chunk: each source chunk downsamples to half-chunk
                 size_t halfY = sc[1] / 2, halfX = sc[2] / 2;
                 size_t offY = sy * halfY;
                 size_t offX = sx * halfX;
@@ -215,8 +296,8 @@ void buildPyramidLevel(z5::filesystem::handle::File& outFile, int level,
             }
         }
 
-        z5::types::ShapeType dstId = {0, dcy, dcx};
-        dst->writeChunk(dstId, dstBuf.data());
+        dst->writeChunk(0, dcy, dcx,
+                        dstBuf.data(), dstBuf.size() * sizeof(T));
 
         size_t d = ++done;
         #pragma omp critical(pp)
@@ -226,29 +307,26 @@ void buildPyramidLevel(z5::filesystem::handle::File& outFile, int level,
     if (myTiles > 0) std::cout << std::endl;
 }
 
-template void buildPyramidLevel<uint8_t>(z5::filesystem::handle::File&, int, size_t, size_t, int, int);
-template void buildPyramidLevel<uint16_t>(z5::filesystem::handle::File&, int, size_t, size_t, int, int);
+template void buildPyramidLevel<uint8_t>(const std::filesystem::path&, int, size_t, size_t, int, int);
+template void buildPyramidLevel<uint16_t>(const std::filesystem::path&, int, size_t, size_t, int, int);
 
 // ============================================================
 // createPyramidDatasets
 // ============================================================
 
-void createPyramidDatasets(z5::filesystem::handle::File& outFile,
+void createPyramidDatasets(const std::filesystem::path& outDir,
                            const std::vector<size_t>& shape0,
                            size_t CH, size_t CW, bool isU16)
 {
-    json compOpts = {{"cname","zstd"},{"clevel",1},{"shuffle",0}};
-    std::string dtype = isU16 ? "uint16" : "uint8";
+    auto dtype = isU16 ? vc::VcDtype::uint16 : vc::VcDtype::uint8;
 
-    // All pyramid levels use the same chunk Y×X as the input volume (typically 128×128).
-    // Keep Z fixed and halve only X/Y at each level.
     std::vector<size_t> prevShape = shape0;
     for (int level = 1; level <= 5; level++) {
-        std::vector<size_t> ds = {prevShape[0], (prevShape[1] + 1) / 2, (prevShape[2] + 1) / 2};
-        size_t chZ = std::min(ds[0], shape0[0]);  // clamp to level shape Z
-        std::vector<size_t> dc = {chZ, std::min(CH, ds[1]), std::min(CW, ds[2])};
-        z5::createDataset(outFile, std::to_string(level), dtype, ds, dc, std::string("blosc"), compOpts);
-        prevShape = ds;
+        std::vector<size_t> shape = {(prevShape[0]+1)/2, (prevShape[1]+1)/2, (prevShape[2]+1)/2};
+        size_t chZ = std::min(shape[0], shape0[0]);
+        std::vector<size_t> chunks = {chZ, std::min(CH, shape[1]), std::min(CW, shape[2])};
+        vc::createZarrDataset(outDir, std::to_string(level), shape, chunks, dtype, "blosc");
+        prevShape = shape;
     }
 }
 
@@ -256,7 +334,7 @@ void createPyramidDatasets(z5::filesystem::handle::File& outFile,
 // writeZarrAttrs
 // ============================================================
 
-void writeZarrAttrs(z5::filesystem::handle::File& outFile,
+void writeZarrAttrs(const std::filesystem::path& outDir,
                     const std::filesystem::path& volPath, int groupIdx,
                     size_t baseZ, double sliceStep, double accumStep,
                     const std::string& accumTypeStr, size_t accumSamples,
@@ -297,5 +375,6 @@ void writeZarrAttrs(z5::filesystem::handle::File& outFile,
     }
     ms["metadata"] = json{{"downsampling_method","mean"}};
     attrs["multiscales"] = json::array({ms});
-    z5::filesystem::writeAttributes(outFile, attrs);
+
+    vc::writeZarrAttributes(outDir, attrs);
 }

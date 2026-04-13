@@ -88,9 +88,12 @@ namespace viewer {
     constexpr auto INTERSECTION_THICKNESS = "viewer/intersection_thickness";
     constexpr auto INTERSECTION_SAMPLING_STRIDE = "viewer/intersection_sampling_stride";
 
+    constexpr auto INTERSECTION_MAX_SURFACES = "viewer/intersection_max_surfaces";
+
     constexpr int INTERSECTION_OPACITY_DEFAULT = 100;
     constexpr float INTERSECTION_THICKNESS_DEFAULT = 0.0f;
     constexpr int INTERSECTION_SAMPLING_STRIDE_DEFAULT = 1;
+    constexpr int INTERSECTION_MAX_SURFACES_DEFAULT = 0;  // 0 = unlimited
 
     // Axis Overlays
     constexpr auto SHOW_AXIS_OVERLAYS = "viewer/show_axis_overlays";
@@ -102,6 +105,16 @@ namespace viewer {
     constexpr int AXIS_OVERLAY_OPACITY_DEFAULT = 100;
     constexpr bool USE_AXIS_ALIGNED_SLICES_DEFAULT = true;
     constexpr int SLICE_STEP_SIZE_DEFAULT = 1;
+
+    // Remote volume chunk cache directory
+    constexpr auto REMOTE_CACHE_DIR = "viewer/remote_cache_dir";
+    // Default: ~/.VC3D/remote_cache (resolved at runtime via QDir::homePath())
+
+    // Recent remote volume URLs
+    constexpr auto REMOTE_RECENT_URLS = "viewer/remote_recent_urls";
+
+    // Local cache directory for network-mounted volpkgs
+    constexpr auto NETWORK_CACHE_DIR = "viewer/network_cache_dir";
 
     // Audio/UX
     constexpr auto PLAY_SOUND_AFTER_SEG_RUN = "viewer/play_sound_after_seg_run";
@@ -118,6 +131,7 @@ namespace viewer {
     constexpr auto GROUP_RENDER_SETTINGS_EXPANDED = "viewer/group_render_settings_expanded";
     constexpr auto GROUP_COMPOSITE_EXPANDED = "viewer/group_composite_expanded";
     constexpr auto GROUP_POSTPROCESSING_EXPANDED = "viewer/group_postprocessing_expanded";
+    constexpr auto GROUP_TRANSFORMS_EXPANDED = "viewer/group_transforms_expanded";
 
     constexpr bool GROUP_PREPROCESSING_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_NORMAL_VIS_EXPANDED_DEFAULT = true;
@@ -126,6 +140,7 @@ namespace viewer {
     constexpr bool GROUP_RENDER_SETTINGS_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_COMPOSITE_EXPANDED_DEFAULT = true;
     constexpr bool GROUP_POSTPROCESSING_EXPANDED_DEFAULT = true;
+    constexpr bool GROUP_TRANSFORMS_EXPANDED_DEFAULT = true;
 }
 
 // -----------------------------------------------------------------------------
@@ -133,20 +148,51 @@ namespace viewer {
 // -----------------------------------------------------------------------------
 namespace perf {
     constexpr auto PRELOADED_SLICES = "perf/preloaded_slices";
-    constexpr auto SKIP_IMAGE_FORMAT_CONV = "perf/chkSkipImageFormatConvExp";
     constexpr auto PARALLEL_PROCESSES = "perf/parallel_processes";
     constexpr auto ITERATION_COUNT = "perf/iteration_count";
     constexpr auto DOWNSCALE_OVERRIDE = "perf/downscale_override";
     constexpr auto FAST_INTERPOLATION = "perf/fast_interpolation";
     constexpr auto ENABLE_FILE_WATCHING = "perf/enable_file_watching";
+    constexpr auto RAM_CACHE_SIZE_GB = "perf/ram_cache_size_gb";
+    constexpr auto DISK_CACHE_SIZE_GB = "perf/disk_cache_size_gb";
 
     constexpr int PRELOADED_SLICES_DEFAULT = 200;
-    constexpr bool SKIP_IMAGE_FORMAT_CONV_DEFAULT = false;
     constexpr int PARALLEL_PROCESSES_DEFAULT = 8;
     constexpr int ITERATION_COUNT_DEFAULT = 1000;
     constexpr int DOWNSCALE_OVERRIDE_DEFAULT = 0;
     constexpr bool FAST_INTERPOLATION_DEFAULT = false;
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
+    constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
+    constexpr int DISK_CACHE_SIZE_GB_DEFAULT = 100;
+
+    // Video codec recompression for remote streaming
+    constexpr auto VIDEO_RECOMPRESS_ENABLED = "perf/video_recompress_enabled";
+    constexpr auto VIDEO_CODEC_TYPE = "perf/video_codec_type";  // 0=H264, 1=H265, 3=C3D
+    constexpr auto VIDEO_QUALITY_PRESET = "perf/video_quality_preset";
+
+    constexpr auto VIDEO_RECHUNK_32 = "perf/video_rechunk_32";
+
+    constexpr bool VIDEO_RECOMPRESS_ENABLED_DEFAULT = false;
+    constexpr int VIDEO_CODEC_TYPE_DEFAULT = 0;  // H264
+    constexpr int VIDEO_QUALITY_PRESET_DEFAULT = 3;  // Balanced
+    constexpr bool VIDEO_RECHUNK_32_DEFAULT = false;
+
+    // Quality preset → per-codec QP mapping
+    // Index: 0=Lossless, 1=Near-lossless, 2=High, 3=Balanced, 4=Compact, 5=Max compression
+    constexpr int PRESET_COUNT = 6;
+    // H.264/H.265/AV1 QP values (0=lossless uses 0)
+    constexpr int PRESET_VIDEO_QP[PRESET_COUNT] = {0, 18, 22, 28, 35, 42};
+    // C3D size divisor shift: 0=lossless, 1=lossless/2, 2=/4, 3=/8, 4=/16, 5=/32
+    constexpr int PRESET_C3D_QUALITY[PRESET_COUNT] = {0, 1, 2, 3, 4, 5};
+
+    // Number of background IO (download) threads
+    constexpr auto IO_THREADS = "perf/io_threads";
+    constexpr int IO_THREADS_DEFAULT = 8;
+
+    // Prefetch pyramid levels on remote volume open
+    // 0 = none, 1 = coarsest only (already pinned), 2 = coarsest 2, etc.
+    constexpr auto PREFETCH_LEVELS = "perf/prefetch_levels";
+    constexpr int PREFETCH_LEVELS_DEFAULT = 0;  // disabled
 }
 
 // -----------------------------------------------------------------------------
@@ -194,6 +240,9 @@ namespace neighbor_copy {
 // -----------------------------------------------------------------------------
 namespace aws {
     constexpr auto DEFAULT_PROFILE = "aws/default_profile";
+    constexpr auto ACCESS_KEY = "aws/access_key";
+    constexpr auto SECRET_KEY = "aws/secret_key";
+    constexpr auto SESSION_TOKEN = "aws/session_token";
 
     constexpr auto DEFAULT_PROFILE_DEFAULT = "";
 }

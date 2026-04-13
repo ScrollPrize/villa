@@ -13,10 +13,6 @@
 #include "Surface.hpp"
 #include "Tiff.hpp"
 
-// Forward declarations
-template<typename T>
-class ChunkCache;
-
 // Surface loading and channel flags
 #define SURF_LOAD_IGNORE_MASK 1
 #define SURF_CHANNEL_NORESIZE 1
@@ -273,7 +269,6 @@ private:
 class QuadSurface : public Surface
 {
 public:
-    cv::Vec3f pointer() override;
     QuadSurface() = default;
     // points will be cloned in constructor
     QuadSurface(const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &scale);
@@ -310,6 +305,8 @@ public:
     void save(const std::filesystem::path &path, bool force_overwrite = false);
     void save_meta();
     Rect3D bbox();
+
+    bool isLoaded() const { return !_needsLoad; }
 
     virtual cv::Mat_<cv::Vec3f> rawPoints() { ensureLoaded(); return *_points; }
     virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { ensureLoaded(); return _points.get(); }
@@ -373,6 +370,8 @@ public:
     /** Resample the surface by a scale factor. factor > 1 increases density, < 1 decreases.
      *  Uses bilinear interpolation by default (cv::INTER_LINEAR), matching rotate(). */
     void resample(float factor, int interpolation = 1);  // 1 = cv::INTER_LINEAR
+    /** Resample the surface independently in X and Y. */
+    void resample(float factor_x, float factor_y, int interpolation);
 
     /** Compute optimal rotation angle to place highest Z values at row 0 */
     float computeZOrientationAngle() const;
@@ -442,4 +441,3 @@ bool overlap(QuadSurface& a, QuadSurface& b, int max_iters = 1000);
 bool contains(QuadSurface& a, const cv::Vec3f& loc, int max_iters = 1000);
 bool contains(QuadSurface& a, const std::vector<cv::Vec3f>& locs);
 bool contains_any(QuadSurface& a, const std::vector<cv::Vec3f>& locs);
-

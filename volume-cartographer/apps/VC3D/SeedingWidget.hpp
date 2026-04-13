@@ -15,7 +15,6 @@
 #include <opencv2/core.hpp>
 #include <memory>
 
-#include "CSurfaceCollection.hpp"
 #include "elements/ProgressUtil.hpp"
 #include "overlays/ViewerOverlayControllerBase.hpp"
 
@@ -23,17 +22,16 @@ using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/ui/VCCollection.hpp"
 
+class CState;
 
 class SeedingWidget : public QWidget {
     Q_OBJECT
     
 public:
-    explicit SeedingWidget(VCCollection* point_collection, CSurfaceCollection* surface_collection, QWidget* parent = nullptr);
+    explicit SeedingWidget(VCCollection* point_collection, CState* state, QWidget* parent = nullptr);
     ~SeedingWidget();
     
-    void setVolumePkg(std::shared_ptr<VolumePkg> vpkg);
-    void setCurrentVolume(std::shared_ptr<Volume> volume);
-    void setCache(ChunkCache<uint8_t>* cache);
+    void setState(CState* state);
     
 signals:
     void sendPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
@@ -130,13 +128,9 @@ private:
     ProgressUtil* progressUtil;
     
     // Data
-    std::shared_ptr<VolumePkg> fVpkg;
-    std::shared_ptr<Volume> currentVolume;
-    std::string currentVolumeId;
-    ChunkCache<uint8_t>* chunkCache;
+    CState* _state{nullptr};
     int currentZSlice;
     VCCollection* _point_collection;
-    CSurfaceCollection* _surface_collection;
     cv::Mat distanceTransform;
     
     // Drawing mode data
