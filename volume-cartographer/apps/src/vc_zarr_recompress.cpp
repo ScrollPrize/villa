@@ -1461,12 +1461,10 @@ int main(int argc, char** argv) {
             }
 
             if (tasks.empty()) {
-                // Nothing to do for this shard.
-                int s_count = processed_shards.fetch_add(1) + 1;
-                report_progress(s_count);
-                std::lock_guard lk(in_flight_mtx);
-                in_flight_shards--;
-                in_flight_cv.notify_one();
+                // All inner chunks skipped via occupancy.  Finalize so the
+                // 8KB sentinel shard still gets uploaded — we want every
+                // grid slot to exist as an object downstream.
+                finalize_shard(shard);
                 continue;
             }
 
