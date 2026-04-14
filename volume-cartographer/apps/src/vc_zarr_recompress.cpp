@@ -653,7 +653,10 @@ int main(int argc, char** argv) {
                   << "  --levels CSV     Process only listed levels (e.g. 4,5). [default: all]\n"
                   << "  --rank N         VM index in fanout (0..world-1). [default: 0]\n"
                   << "  --world N        Total VM count for horizontal scaling. [default: 1]\n"
-                  << "                   With --world 4, VM 0 handles sz%%4==0, VM 1 sz%%4==1, etc.\n";
+                  << "                   With --world 4, VM 0 handles sz%%4==0, VM 1 sz%%4==1, etc.\n"
+                  << "  --one-shard L/sz/sy/sx  Process exactly one shard + exit.\n"
+                  << "                          Skips occupancy and resume lists. Coordinator\n"
+                  << "                          handles both. Use for per-shard process fanout.\n";
         return 1;
     }
 
@@ -678,6 +681,7 @@ int main(int argc, char** argv) {
     std::string levels_arg;    // empty = all discovered; else CSV of levels
     int rank = 0;              // this VM's index in the fanout (0..world-1)
     int world = 1;             // total VM count for horizontal scaling
+    std::string one_shard_arg; // "L/sz/sy/sx" — process exactly one shard + exit
 
     for (int i = 3; i < argc; i++) {
         std::string arg = argv[i];
@@ -692,6 +696,7 @@ int main(int argc, char** argv) {
         else if (arg == "--levels" && i + 1 < argc) levels_arg = argv[++i];
         else if (arg == "--rank" && i + 1 < argc) rank = std::atoi(argv[++i]);
         else if (arg == "--world" && i + 1 < argc) world = std::atoi(argv[++i]);
+        else if (arg == "--one-shard" && i + 1 < argc) one_shard_arg = argv[++i];
     }
     if (stats_pct < 0) stats_pct = 0;
     if (stats_pct > 100) stats_pct = 100;
@@ -699,6 +704,12 @@ int main(int argc, char** argv) {
     if (air_clamp > 255) air_clamp = 255;
     if (shift_n < 0) shift_n = 0;
     if (shift_n > 7) shift_n = 7;
+    // In --one-shard mode, force the level filter to the shard's level.
+    if (!one_shard_arg.empty()) {
+        int ol = -1;
+        std::sscanf(one_shard_arg.c_str(), "%d", &ol);
+        if (ol >= 0 && ol <= 5) levels_arg = std::to_string(ol);
+    }
     if (world < 1) world = 1;
     if (rank < 0 || rank >= world) {
         fprintf(stderr, "Invalid --rank %d (must be 0..%d)\n", rank, world - 1);
@@ -789,9 +800,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Write zarr v3 root metadata (uses natural level order for metadata
-    // regardless of processing order).
-    output->write_string("zarr.json", make_zarr_v3_group_with_multiscales(levels, shapes));
+    // Write zarr v3 root metadata (coordinator writes it once in one-shard
+    // mode, so workers skip this).
+    if (one_shard_arg.empty()) {
+        output->write_string("zarr.json",
+            make_zarr_v3_group_with_multiscales(levels, shapes));
+    }
 
     // Reorder levels for processing based on --levels CSV (user may request
     // e.g. 5,4,3,2,1,0 to see small levels first).
@@ -815,9 +829,12 @@ int main(int argc, char** argv) {
 
         printf("\n=== Level %d ===\n", l);
 
-        // Write per-level zarr v3 metadata
-        output->write_string(std::to_string(l) + "/zarr.json",
-                              make_zarr_v3_metadata(shape, qp));
+        // Write per-level zarr v3 metadata (skipped in one-shard mode — the
+        // coordinator writes it once before fanning out workers).
+        if (one_shard_arg.empty()) {
+            output->write_string(std::to_string(l) + "/zarr.json",
+                                  make_zarr_v3_metadata(shape, qp));
+        }
 
         // Read input .zarray to determine compressor, chunks, dtype, dim_sep
         std::string level_prefix = std::to_string(l) + "/";
@@ -865,11 +882,14 @@ int main(int argc, char** argv) {
 
         // Build a global per-chunk occupancy bitmap up front via parallel
         // per-cz LISTs.  Workers will look up bits instead of doing 8 LISTs
-        // per shard.  For L0 this is ~593 LISTs (32 in flight) ≈ 10-30 sec
-        // upfront cost vs 76800 × 8 LISTs spread across the run.
+        // per shard.  Skipped in --one-shard mode: the coordinator already
+        // filtered to this shard and the inner download loop falls back to
+        // per-chunk GETs with 404 being cheap (~50 ms each, 128 parallel).
         std::vector<size_t> chunk128 = {CHUNK_DIM, CHUNK_DIM, CHUNK_DIM};
-        std::vector<bool> occ_mask =
-            build_occupancy_from_listing(*input, l, shape, chunk128, 64);
+        std::vector<bool> occ_mask;
+        if (one_shard_arg.empty()) {
+            occ_mask = build_occupancy_from_listing(*input, l, shape, chunk128, 64);
+        }
 
         printf("  Source: chunks [%zu,%zu,%zu], compressor: %s, sep: '%s', dtype: %s\n",
                src_chunks[0], src_chunks[1], src_chunks[2],
@@ -889,27 +909,39 @@ int main(int argc, char** argv) {
         // stay balanced.
         struct ShardPos { size_t sz, sy, sx; };
         std::vector<ShardPos> shard_positions;
-        for (size_t sz = 0; sz < shard_nz; sz++) {
-            if (world > 1 && (sz % (size_t)world) != (size_t)rank) continue;
-            for (size_t sy = 0; sy < shard_ny; sy++)
-                for (size_t sx = 0; sx < shard_nx; sx++)
-                    shard_positions.push_back({sz, sy, sx});
-        }
-        if (world > 1) {
-            printf("  Fanout: this VM owns %zu of %zu shards\n",
-                   shard_positions.size(), shard_nz * shard_ny * shard_nx);
+        if (!one_shard_arg.empty()) {
+            // Parse "L/sz/sy/sx" — L already filtered via levels_arg.
+            size_t sz = 0, sy = 0, sx = 0;
+            int parsed_L = -1;
+            std::sscanf(one_shard_arg.c_str(), "%d/%zu/%zu/%zu",
+                        &parsed_L, &sz, &sy, &sx);
+            if (parsed_L != l) continue;  // this level isn't our target
+            if (sz >= shard_nz || sy >= shard_ny || sx >= shard_nx) {
+                fprintf(stderr, "--one-shard %s: out of range\n", one_shard_arg.c_str());
+                return 1;
+            }
+            shard_positions.push_back({sz, sy, sx});
+        } else {
+            for (size_t sz = 0; sz < shard_nz; sz++) {
+                if (world > 1 && (sz % (size_t)world) != (size_t)rank) continue;
+                for (size_t sy = 0; sy < shard_ny; sy++)
+                    for (size_t sx = 0; sx < shard_nx; sx++)
+                        shard_positions.push_back({sz, sy, sx});
+            }
+            if (world > 1) {
+                printf("  Fanout: this VM owns %zu of %zu shards\n",
+                       shard_positions.size(), shard_nz * shard_ny * shard_nx);
+            }
         }
 
-        // List existing shards for resume (one S3 list instead of per-shard HEAD)
+        // List existing shards for resume (skipped in one-shard mode: the
+        // coordinator handles resume by skipping this whole invocation).
         std::set<std::string> existing_shards;
-        {
+        if (one_shard_arg.empty()) {
             std::string shard_prefix = std::to_string(l) + "/c/";
             auto keys = output->list_chunks(shard_prefix);
             for (auto& k : keys) {
-                // Extract shard key: "level/c/sz/sy/sx" from "level/c/sz/sy/sx/..."
-                // Shard files are just "level/c/sz/sy/sx" (no subdirectory)
                 auto rel = k.substr(shard_prefix.size());
-                // rel is like "0/0/0" — reconstruct full shard key
                 existing_shards.insert(shard_prefix + rel);
             }
             printf("  Resume LIST: %zu existing shards in S3 (will skip on resume)\n",
