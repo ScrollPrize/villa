@@ -25,9 +25,11 @@ import json
 import os
 import random
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
+import torch
 
 # Ensure lasagna/ dir is on sys.path so we can import sibling modules.
 _LASAGNA_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -54,74 +56,124 @@ def _dataset_display_name(dataset_cfg: dict, fallback_idx: int) -> str:
     return f"dataset{fallback_idx}"
 
 
-def _edt_with_indices(mask_not_b_uint8: np.ndarray):
-    """CuPy EDT + feature transform on the complement of B's mask.
+def _edt_with_indices_torch(mask_not_b_uint8):
+    """CuPy EDT + feature transform, returned as torch CUDA tensors.
 
-    Input: (Z, Y, X) uint8 — 1 where B is absent, 0 on B's surface.
-    Returns: (dist, inds) as numpy on CPU. `dist` is (Z, Y, X) float32.
-    `inds` is (3, Z, Y, X) int32 — for each voxel, the (z, y, x) index
-    of the nearest voxel where the mask is 0 (i.e. nearest point on B).
+    Input: ``mask_not_b_uint8`` — a (Z, Y, X) uint8 tensor on CUDA,
+    with 1 where B is absent and 0 on B's surface.
+
+    Returns:
+        dist: (Z, Y, X) float32 torch CUDA tensor.
+        inds: (3, Z, Y, X) int64 torch CUDA tensor — nearest-B voxel
+            index for every voxel.
+
+    CuPy has no in-place torch path, so we round-trip via DLPack —
+    no host copy. ``edt_torch`` in ``tifxyz_labels`` does the same
+    for the distances-only case; this helper adds the feature
+    transform.
     """
     import cupy as cp
     from cupyx.scipy.ndimage import distance_transform_edt as cupy_edt
 
-    cp_mask = cp.asarray(mask_not_b_uint8)
-    dist, inds = cupy_edt(
+    cp_mask = cp.from_dlpack(mask_not_b_uint8.contiguous())
+    dist_cp, inds_cp = cupy_edt(
         cp_mask, return_distances=True, return_indices=True,
     )
-    return cp.asnumpy(dist).astype(np.float32), cp.asnumpy(inds).astype(np.int32)
+    dist = torch.from_dlpack(dist_cp).to(torch.float32)
+    # cupy EDT returns int32 indices; upcast to int64 so torch's
+    # advanced indexing is happy (and matches long() elsewhere).
+    inds = torch.from_dlpack(inds_cp).to(torch.int64)
+    return dist, inds
 
 
-def _signed_distance_samples(
-    points_a_zyx: np.ndarray,   # (M, 3) float32
-    normals_a_zyx: np.ndarray,  # (M, 3) float32
-    mask_b: np.ndarray,         # (Z, Y, X) bool
-) -> np.ndarray:
-    """Return a length-M array of signed distances from points on A to B."""
+def _signed_distance_samples_gpu(
+    points_a_zyx: torch.Tensor,   # (M, 3) float32 CUDA
+    normals_a_zyx: torch.Tensor,  # (M, 3) float32 CUDA
+    mask_b: torch.Tensor,         # (Z, Y, X) bool   CUDA
+) -> torch.Tensor:
+    """Return (M,) float32 CUDA tensor of signed distances from points on A to B.
+
+    Math is identical to the previous numpy version; only the device
+    changed. All gathers and arithmetic stay on CUDA.
+    """
     Z, Y, X = mask_b.shape
-    if points_a_zyx.shape[0] == 0 or not mask_b.any():
-        return np.empty(0, dtype=np.float32)
+    if points_a_zyx.shape[0] == 0 or not bool(mask_b.any()):
+        return torch.empty(0, dtype=torch.float32, device=mask_b.device)
 
-    complement = (~mask_b).astype(np.uint8)
-    dist_b, inds_b = _edt_with_indices(complement)
+    mask_not_b = (~mask_b).to(torch.uint8)
+    dist_b, inds_b = _edt_with_indices_torch(mask_not_b)
 
-    pz = np.clip(np.floor(points_a_zyx[:, 0]).astype(np.int64), 0, Z - 1)
-    py = np.clip(np.floor(points_a_zyx[:, 1]).astype(np.int64), 0, Y - 1)
-    px = np.clip(np.floor(points_a_zyx[:, 2]).astype(np.int64), 0, X - 1)
+    pz = points_a_zyx[:, 0].floor().clamp(0, Z - 1).long()
+    py = points_a_zyx[:, 1].floor().clamp(0, Y - 1).long()
+    px = points_a_zyx[:, 2].floor().clamp(0, X - 1).long()
 
-    d = dist_b[pz, py, px]  # (M,) unsigned distance from voxel of P to B
+    d = dist_b[pz, py, px]  # (M,) quantized voxel-to-voxel distance
 
-    nearest_z = inds_b[0, pz, py, px].astype(np.float32)
-    nearest_y = inds_b[1, pz, py, px].astype(np.float32)
-    nearest_x = inds_b[2, pz, py, px].astype(np.float32)
-    nearest = np.stack([nearest_z, nearest_y, nearest_x], axis=-1)
+    nz = inds_b[0, pz, py, px].to(torch.float32)
+    ny = inds_b[1, pz, py, px].to(torch.float32)
+    nx = inds_b[2, pz, py, px].to(torch.float32)
+    nearest = torch.stack([nz, ny, nx], dim=-1)
 
-    v = points_a_zyx.astype(np.float32) - nearest  # (M, 3)
-    dot = np.sum(v * normals_a_zyx.astype(np.float32), axis=-1)
-    sign = np.where(dot >= 0.0, 1.0, -1.0).astype(np.float32)
+    v = points_a_zyx.to(torch.float32) - nearest
+    dot = (v * normals_a_zyx.to(torch.float32)).sum(dim=-1)
+    sign = torch.where(
+        dot >= 0.0,
+        torch.ones((), dtype=torch.float32, device=dot.device),
+        -torch.ones((), dtype=torch.float32, device=dot.device),
+    )
+    return (d.to(torch.float32) * sign).to(torch.float32)
 
-    return (d.astype(np.float32) * sign).astype(np.float32)
+
+# Cached quantile tensor keyed on device so we don't reallocate.
+_QUANTILE_CACHE: dict = {}
 
 
-def _compute_stats(signed: np.ndarray) -> dict:
-    """Compute min/max/percentiles, flipping sign if median is negative."""
-    pct = np.percentile(signed, _PCT_VALUES)
-    smin = float(signed.min())
-    smax = float(signed.max())
-    median = float(pct[_PCT_LABELS.index("50")])
-    flipped = False
-    if median < 0.0:
-        flipped = True
-        pct = -pct[::-1]  # negate and reverse so labels still map in order
-        smin, smax = -smax, -smin
+def _quantile_vec(device: torch.device) -> torch.Tensor:
+    q = _QUANTILE_CACHE.get(device)
+    if q is None:
+        q = torch.tensor(
+            [v / 100.0 for v in _PCT_VALUES],
+            device=device, dtype=torch.float32,
+        )
+        _QUANTILE_CACHE[device] = q
+    return q
+
+
+def _compute_stats_gpu(signed: torch.Tensor) -> dict:
+    """Compute min/max/percentiles on CUDA, flipping sign if median is negative.
+
+    Pulls only ~13 scalars back to host (min, max, sign-flip flag,
+    and the 11 percentiles). The raw per-point tensor stays on GPU.
+    """
+    if signed.numel() == 0:
+        return {
+            "n_samples": 0,
+            "min": 0.0, "max": 0.0,
+            "percentiles": {label: 0.0 for label in _PCT_LABELS},
+            "sign_flipped": False,
+        }
+
+    q = _quantile_vec(signed.device)
+    pct = torch.quantile(signed, q)              # (P,) float
+    smin = signed.min()
+    smax = signed.max()
+    median = pct[_PCT_LABELS.index("50")]
+    flipped_t = median < 0.0
+    # Negate+flip so post-flip percentiles keep the same ordering.
+    pct_flipped = -pct.flip(0)
+    pct_out = torch.where(flipped_t, pct_flipped, pct)
+    smin_out = torch.where(flipped_t, -smax, smin)
+    smax_out = torch.where(flipped_t, -smin, smax)
+
+    pct_vals = pct_out.detach().cpu().tolist()
     return {
-        "n_samples": int(signed.shape[0]),
-        "min": smin,
-        "max": smax,
+        "n_samples": int(signed.numel()),
+        "min": float(smin_out.item()),
+        "max": float(smax_out.item()),
         "percentiles": {
-            label: float(pct[i]) for i, label in enumerate(_PCT_LABELS)
+            label: float(pct_vals[i]) for i, label in enumerate(_PCT_LABELS)
         },
-        "sign_flipped": bool(flipped),
+        "sign_flipped": bool(flipped_t.item()),
     }
 
 
@@ -156,6 +208,21 @@ def _surface_desc(i: int, info_entry: dict, patch) -> dict:
 def _pair_score(stats: dict) -> tuple[float, float, float]:
     p = stats["percentiles"]
     return (p["1"], p["0.1"], stats["min"])
+
+
+def _fmt_duration(seconds: float) -> str:
+    """Compact duration: `1.2s` / `12.3s` / `4m32s` / `1h23m`."""
+    if seconds < 0 or not np.isfinite(seconds):
+        return "?"
+    if seconds < 60.0:
+        return f"{seconds:.1f}s"
+    if seconds < 3600.0:
+        m = int(seconds // 60)
+        s = int(seconds - m * 60)
+        return f"{m}m{s:02d}s"
+    h = int(seconds // 3600)
+    m = int((seconds - h * 3600) // 60)
+    return f"{h}h{m:02d}m"
 
 
 def run_dataset_overlap(
@@ -249,6 +316,16 @@ def run_dataset_overlap(
     out_file = Path(out_path)
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
+    analysis_device = (
+        torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    )
+    if analysis_device.type != "cuda":
+        print(
+            f"{TAG} WARNING: CUDA unavailable, falling back to CPU "
+            "(cupy EDT still required — this will fail on a CPU-only host).",
+            flush=True,
+        )
+
     top_records: list[dict] = []
     total_written = 0
     total_overlapping = 0  # patches whose worst-pair p50 <= 1 (same-surface rule)
@@ -260,7 +337,7 @@ def run_dataset_overlap(
         f"{'dataset':<12} {'idx':>6} {'pair':<5} "
         f"{'min':>5} "
         + " ".join(f"{'p'+lbl:>5}" for lbl in _SUMMARY_PCTS)
-        + f" {'overlap':>14}"
+        + f" {'overlap':>14} {'mean':>6} {'last':>6} {'eta':>6}"
     )
 
     with out_file.open("w") as fout:
@@ -320,6 +397,10 @@ def run_dataset_overlap(
                 persistent_workers=False,
             )
 
+            ds_scan_start = time.perf_counter()
+            ds_last_tick = ds_scan_start
+            ds_total_n = len(indices)
+
             for i, batch in enumerate(loader):
                 idx = indices[i]
                 n_surfaces = int(batch["num_surfaces"][0])
@@ -336,6 +417,7 @@ def run_dataset_overlap(
                 if not pairs:
                     continue
 
+                # Build slot → surface_geometry lookup aligned with `info`.
                 geom_by_slot: dict[int, dict] = {}
                 for entry in geom:
                     wi = int(entry["wrap_idx"])
@@ -344,30 +426,42 @@ def run_dataset_overlap(
                             geom_by_slot[slot] = entry
                             break
 
-                masks_np = masks_t.detach().cpu().numpy() > 0.5
+                # Move surface masks to GPU **once per patch**; all
+                # pair evaluations then share the CUDA tensors.
+                masks_cuda = (masks_t.to(analysis_device) > 0.5)
+
+                # Pre-move per-slot points/normals to GPU once per patch.
+                pts_by_slot: dict[int, torch.Tensor] = {}
+                nrm_by_slot: dict[int, torch.Tensor] = {}
+                for slot, entry in geom_by_slot.items():
+                    pts = np.asarray(
+                        entry.get("points_local", np.zeros((0, 3), np.float32)),
+                        dtype=np.float32,
+                    )
+                    nrm = np.asarray(
+                        entry.get("normals_zyx", np.zeros((0, 3), np.float32)),
+                        dtype=np.float32,
+                    )
+                    if pts.shape[0] == 0:
+                        continue
+                    pts_by_slot[slot] = torch.from_numpy(pts).to(analysis_device)
+                    nrm_by_slot[slot] = torch.from_numpy(nrm).to(analysis_device)
 
                 best = None
                 num_evaluated = 0
                 for (a, b) in pairs:
-                    geom_a = geom_by_slot.get(a)
-                    if geom_a is None:
+                    pts_a = pts_by_slot.get(a)
+                    if pts_a is None:
                         continue
-                    pts_a = np.asarray(
-                        geom_a.get("points_local", np.zeros((0, 3), np.float32))
-                    )
-                    nrm_a = np.asarray(
-                        geom_a.get("normals_zyx", np.zeros((0, 3), np.float32))
-                    )
-                    if pts_a.shape[0] == 0:
-                        continue
-                    mask_b = masks_np[b]
-                    if not mask_b.any():
+                    nrm_a = nrm_by_slot[a]
+                    mask_b_t = masks_cuda[b]
+                    if not bool(mask_b_t.any()):
                         continue
 
-                    signed = _signed_distance_samples(pts_a, nrm_a, mask_b)
-                    if signed.size == 0:
+                    signed = _signed_distance_samples_gpu(pts_a, nrm_a, mask_b_t)
+                    if signed.numel() == 0:
                         continue
-                    stats = _compute_stats(signed)
+                    stats = _compute_stats_gpu(signed)
                     num_evaluated += 1
                     score = _pair_score(stats)
                     if best is None or score < best[0]:
@@ -414,9 +508,22 @@ def run_dataset_overlap(
                 )
                 stats_str = " ".join(f"{perc[lbl]:5.1f}" for lbl in _SUMMARY_PCTS)
                 ds_col = ds_name if len(ds_name) <= 12 else ds_name[:12]
+
+                # Timing: per-row delta and ETA from the dataset's
+                # rolling average since ds_scan_start.
+                now = time.perf_counter()
+                row_dt = now - ds_last_tick
+                ds_last_tick = now
+                rows_done = i + 1
+                mean_dt = (now - ds_scan_start) / max(rows_done, 1)
+                remaining = max(ds_total_n - rows_done, 0)
+                eta_s = remaining * mean_dt
+
                 line = (
                     f"{ds_col:<12} {int(idx):>6} {pair_str:<5} "
-                    f"{wp['min']:5.1f} {stats_str} {overlap_str:>14}"
+                    f"{wp['min']:5.1f} {stats_str} {overlap_str:>14} "
+                    f"{_fmt_duration(mean_dt):>6} {_fmt_duration(row_dt):>6} "
+                    f"{_fmt_duration(eta_s):>6}"
                 )
 
                 top_records.append(record)
