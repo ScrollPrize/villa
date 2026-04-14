@@ -498,7 +498,8 @@ def compute_patch_labels(
     normals_valid: torch.Tensor,
     surface_chain_info: list[dict],
     device: torch.device = None,
-    same_surface_threshold: float | None = None,
+    same_surface_groups: list[list[int]] | None = None,
+    precomputed_dts: list[torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute 8 training channels + validity using externally supplied chains.
 
@@ -511,12 +512,16 @@ def compute_patch_labels(
     between two chain-adjacent surfaces. Normals_valid (direction channels)
     is passed through unchanged — it already only covers voxels on a surface.
 
-    When ``same_surface_threshold`` is set, duplicate wraps (consecutive
-    in chain, from different segments, with unsigned median distance
-    <= threshold) are merged into a single surface before the chain
-    bracketing runs. The merge reuses the already-computed per-surface
-    EDTs; see :func:`detect_same_surface_groups` and
-    :func:`apply_same_surface_merge`.
+    Merging is controlled by ``same_surface_groups`` — a
+    ``list[list[int]]`` of original slot indices to collapse
+    together, computed upstream by whoever cares about the merge
+    (training: :func:`compute_batch_targets`; analysis:
+    :func:`run_dataset_overlap`). ``compute_patch_labels`` itself
+    does not detect. It applies
+    :func:`apply_same_surface_merge` when groups are given and
+    otherwise leaves the surfaces alone. Keeping the detection out
+    of this helper means every caller runs detection in exactly
+    one place.
 
     Args:
         surface_masks: list of N bool tensors (Z, Y, X).
@@ -524,17 +529,31 @@ def compute_patch_labels(
         normals_valid: (Z, Y, X) bool — where splatting produced valid normals.
         surface_chain_info: list of N per-mask chain dicts (aligned order).
         device: target device (defaults to surface_masks[0].device).
-        same_surface_threshold: optional voxel-median distance threshold
-            for the same-surface merge. ``None`` disables merging and
-            keeps ``merge_groups`` as the identity mapping.
+        same_surface_groups: optional ``list[list[int]]`` of original
+            slot indices to collapse. ``None`` leaves surfaces alone.
+        precomputed_dts: optional list of per-surface EDTs to reuse.
+            When the caller already ran the distance transforms (e.g.
+            during detection), passing them here avoids redoing the
+            EDT loop. Must be aligned with ``surface_masks``.
 
     Returns:
         dict with keys:
-          - 'targets'        (8, Z, Y, X)
-          - 'validity'       (Z, Y, X)
-          - 'normals_valid'  (Z, Y, X)
-          - 'merge_groups'   list[int] of length N, mapping each
-            original surface slot to its merged slot index.
+          - 'targets'              (8, Z, Y, X)
+          - 'validity'             (Z, Y, X)
+          - 'normals_valid'        (Z, Y, X)
+          - 'merge_groups'         list[int] of length N_original,
+            mapping each original surface slot to its merged slot index.
+          - 'merged_surface_masks' list[bool Tensor], len N_merged —
+            the post-merge masks actually consumed by
+            derive_cos_gradmag_validity. Identity with the input
+            when the merge is off (or every group is a singleton).
+          - 'merged_chain_info'    list[dict], len N_merged — the
+            post-merge chain_info entries (representative's label /
+            chain / pos / has_prev / has_next, plus ``merged_from``
+            for multi-member groups). Identity otherwise.
+
+        Exposing the merged lists lets callers (e.g. the vis) reuse
+        the exact state the loss saw instead of re-deriving it.
     """
     N = len(surface_masks)
     if device is None and N > 0:
@@ -553,22 +572,27 @@ def compute_patch_labels(
             "validity": torch.zeros(shape, dtype=torch.bool, device=device),
             "normals_valid": empty_normals_valid,
             "merge_groups": [],
+            "merged_surface_masks": [],
+            "merged_chain_info": [],
         }
 
-    # EDT of complement for each surface
-    dts = []
-    for mask in surface_masks:
-        complement = ~mask
-        dts.append(edt_torch(complement.to(torch.uint8)))
-
-    if same_surface_threshold is not None and N >= 2:
-        groups = detect_same_surface_groups(
-            dts, surface_masks, surface_chain_info,
-            threshold=float(same_surface_threshold),
+    # EDT of complement for each surface — reuse precomputed if caller
+    # already ran them (e.g. compute_batch_targets does detection).
+    if precomputed_dts is not None:
+        assert len(precomputed_dts) == N, (
+            "precomputed_dts must be aligned with surface_masks"
         )
+        dts = list(precomputed_dts)
+    else:
+        dts = []
+        for mask in surface_masks:
+            complement = ~mask
+            dts.append(edt_torch(complement.to(torch.uint8)))
+
+    if same_surface_groups is not None and N >= 2:
         dts, surface_masks, surface_chain_info, merge_groups = \
             apply_same_surface_merge(
-                dts, surface_masks, surface_chain_info, groups,
+                dts, surface_masks, surface_chain_info, same_surface_groups,
             )
     else:
         merge_groups = list(range(N))
@@ -587,4 +611,6 @@ def compute_patch_labels(
         "validity": valid,
         "normals_valid": empty_normals_valid,
         "merge_groups": merge_groups,
+        "merged_surface_masks": list(surface_masks),
+        "merged_chain_info": list(surface_chain_info),
     }

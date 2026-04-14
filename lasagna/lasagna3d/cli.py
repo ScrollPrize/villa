@@ -110,13 +110,6 @@ def main() -> None:
                               "Bypasses --num-samples/--seed shuffle and "
                               "scans exactly those patches, in order, in "
                               "every dataset.")
-    overlap.add_argument("--same-surface-threshold", type=float, default=None,
-                         help="Voxel-median distance threshold for the "
-                              "same-surface merge, forwarded to the vis "
-                              "render path. Only affects JPEG output "
-                              "(when --vis-dir is also given); the JSONL "
-                              "stats stay unmerged by design so the "
-                              "analysis still reports raw duplicate pairs.")
 
     args = parser.parse_args()
 
@@ -155,7 +148,6 @@ def main() -> None:
             model_path=args.model,
             inference_tile_size=args.inference_tile_size,
             explicit_indices=_parse_idx(args.idx),
-            same_surface_threshold=args.same_surface_threshold,
         )
         return
 

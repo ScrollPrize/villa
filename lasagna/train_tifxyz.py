@@ -88,29 +88,54 @@ def compute_batch_targets(
     batch: dict,
     device: torch.device,
     same_surface_threshold: float | None = None,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, list[list[int]]]:
+    same_surface_groups_batch: list[list[list[int]] | None] | None = None,
+) -> Tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    list[list[int]],
+    list[list[torch.Tensor]],
+    list[list[dict]],
+]:
     """Compute training targets on GPU from dataset batch.
 
     Runs EDT + chain ordering + cos/grad_mag derivation on each sample.
-    When ``same_surface_threshold`` is set, duplicate wraps are merged
-    inside ``compute_patch_labels`` before the cos/grad_mag bracketing
-    — see :func:`tifxyz_labels.detect_same_surface_groups`.
+    This function is the single place where training-side same-surface
+    detection happens: EDTs are built here, handed to
+    :func:`tifxyz_labels.detect_same_surface_groups` when a threshold
+    is provided, and the resulting groups + the already-computed EDTs
+    are passed down to :func:`compute_patch_labels` so nothing is
+    recomputed. ``compute_patch_labels`` itself never detects.
 
     Args:
         batch: dict from collate_variable_surfaces
         device: CUDA device
         same_surface_threshold: optional voxel-median distance threshold
-            forwarded to ``compute_patch_labels``. ``None`` disables the
-            merge.
+            for the same-surface detector. ``None`` disables detection
+            for the whole batch (unless overridden by an explicit
+            ``same_surface_groups_batch`` entry).
+        same_surface_groups_batch: optional per-sample explicit groups
+            (``list[list[int]]`` per sample, or ``None`` to fall back
+            to threshold-based detection for that sample). Used by
+            `dataset overlap --vis-dir` to render the exact pairs its
+            analysis flagged.
 
     Returns:
         targets: (B, 8, Z, Y, X) float32
         validity: (B, 1, Z, Y, X) float32 — where cos/grad_mag are valid
         normals_valid: (B, 1, Z, Y, X) float32 — where directions are valid
         dir_weight: (B, 6, Z, Y, X) float32 — per-direction relevance weight
-        merge_groups_batch: list of per-sample ``merge_groups`` lists from
-            ``compute_patch_labels``; each list maps original surface slot
-            → merged slot index (identity when the merge is disabled).
+        merge_groups_batch: per-sample ``merge_groups`` lists mapping
+            each original surface slot → merged slot index (identity
+            when the merge is disabled).
+        merged_masks_batch: per-sample list of merged surface masks
+            (CUDA bool tensors) — exactly the tensors the loss saw.
+            Training doesn't consume this; it's exposed so the vis
+            can render the post-merge state without duplicating the
+            merge logic.
+        merged_chain_info_batch: per-sample merged chain_info lists,
+            one entry per merged group.
     """
     B = batch["image"].shape[0]
     surface_masks_list = batch["surface_masks"]  # list of (Ni, Z, Y, X)
@@ -122,6 +147,10 @@ def compute_batch_targets(
     all_targets = []
     all_validity = []
     merge_groups_batch: list[list[int]] = []
+    merged_masks_batch: list[list[torch.Tensor]] = []
+    merged_chain_info_batch: list[list[dict]] = []
+
+    from tifxyz_labels import edt_torch, detect_same_surface_groups
 
     for b in range(B):
         # Convert surface masks to CUDA bool tensors
@@ -133,19 +162,47 @@ def compute_batch_targets(
         dir_ch = direction_channels[b]  # (6, Z, Y, X)
         nv = normals_valid_batch[b, 0] > 0.5  # (Z, Y, X)
 
+        chain_info_b = surface_chain_info_batch[b]
+
+        # --- Same-surface merge resolution ---
+        explicit_groups = None
+        if same_surface_groups_batch is not None and b < len(same_surface_groups_batch):
+            explicit_groups = same_surface_groups_batch[b]
+
+        dts: list[torch.Tensor] | None = None
+        groups: list[list[int]] | None = None
+        if explicit_groups is not None:
+            groups = explicit_groups
+        elif same_surface_threshold is not None and N >= 2:
+            # Detect here so compute_patch_labels doesn't duplicate EDT work.
+            dts = [edt_torch((~m).to(torch.uint8)) for m in cuda_masks]
+            groups = detect_same_surface_groups(
+                dts, cuda_masks, chain_info_b,
+                threshold=float(same_surface_threshold),
+            )
+
         # Compute labels on GPU using the patch's externally-built chains.
         result = compute_patch_labels(
             surface_masks=cuda_masks,
             direction_channels=dir_ch,
             normals_valid=nv,
-            surface_chain_info=surface_chain_info_batch[b],
+            surface_chain_info=chain_info_b,
             device=device,
-            same_surface_threshold=same_surface_threshold,
+            same_surface_groups=groups,
+            precomputed_dts=dts,
         )
 
         all_targets.append(result["targets"])      # (8, Z, Y, X)
         all_validity.append(result["validity"])     # (Z, Y, X)
-        merge_groups_batch.append(list(result.get("merge_groups", list(range(N)))))
+        merge_groups_batch.append(
+            list(result.get("merge_groups", list(range(N))))
+        )
+        merged_masks_batch.append(
+            list(result.get("merged_surface_masks", cuda_masks))
+        )
+        merged_chain_info_batch.append(
+            list(result.get("merged_chain_info", surface_chain_info_batch[b]))
+        )
 
     targets = torch.stack(all_targets, dim=0)       # (B, 8, Z, Y, X)
     validity = torch.stack(all_validity, dim=0).unsqueeze(1).float()  # (B, 1, Z, Y, X)
@@ -154,7 +211,10 @@ def compute_batch_targets(
     # Direction weight: could use normal projections, but for now uniform
     dir_weight = normals_valid.expand(-1, 6, -1, -1, -1).clone()
 
-    return targets, validity, normals_valid, dir_weight, merge_groups_batch
+    return (
+        targets, validity, normals_valid, dir_weight,
+        merge_groups_batch, merged_masks_batch, merged_chain_info_batch,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -564,11 +624,13 @@ def train(
             image = batch["image"].to(device, non_blocking=True)
 
             # Compute targets on GPU from surface masks
-            targets, validity, normals_valid, dir_weight, _merge_groups = \
-                compute_batch_targets(
-                    batch, device,
-                    same_surface_threshold=same_surface_threshold,
-                )
+            (
+                targets, validity, normals_valid, dir_weight,
+                _merge_groups, _merged_masks, _merged_chain_info,
+            ) = compute_batch_targets(
+                batch, device,
+                same_surface_threshold=same_surface_threshold,
+            )
 
             if validity.sum() == 0:
                 print(f"{TAG} WARNING: zero-validity batch, skipping", flush=True)
@@ -687,11 +749,13 @@ def _evaluate(
     with torch.no_grad(), torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_autocast):
         for batch in val_iter:
             image = batch["image"].to(device)
-            targets, validity, normals_valid, dir_weight, _merge_groups = \
-                compute_batch_targets(
-                    batch, device,
-                    same_surface_threshold=same_surface_threshold,
-                )
+            (
+                targets, validity, normals_valid, dir_weight,
+                _merge_groups, _merged_masks, _merged_chain_info,
+            ) = compute_batch_targets(
+                batch, device,
+                same_surface_threshold=same_surface_threshold,
+            )
 
             if validity.sum() == 0:
                 continue

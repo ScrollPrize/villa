@@ -210,6 +210,38 @@ def _pair_score(stats: dict) -> tuple[float, float, float]:
     return (p["1"], p["0.1"], stats["min"])
 
 
+def _groups_from_pairs(n: int, pairs: list[tuple[int, int]]) -> list[list[int]]:
+    """Union-find: build groups of original slot indices from merge pairs.
+
+    Every slot in [0, n) is included, singletons for slots that don't
+    appear in any pair. Groups are returned in order of first
+    occurrence of their representative.
+    """
+    parent = list(range(n))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[max(ra, rb)] = min(ra, rb)
+
+    for a, b in pairs:
+        if 0 <= a < n and 0 <= b < n:
+            union(a, b)
+
+    groups_by_root: dict[int, list[int]] = {}
+    for i in range(n):
+        r = find(i)
+        groups_by_root.setdefault(r, []).append(i)
+    ordered_roots = sorted(groups_by_root.keys())
+    return [sorted(groups_by_root[r]) for r in ordered_roots]
+
+
 def _fmt_duration(seconds: float) -> str:
     """Compact duration: `1.2s` / `12.3s` / `4m32s` / `1h23m`."""
     if seconds < 0 or not np.isfinite(seconds):
@@ -237,7 +269,6 @@ def run_dataset_overlap(
     model_path: str | None = None,
     inference_tile_size: int | None = None,
     explicit_indices: list[int] | None = None,
-    same_surface_threshold: float | None = None,
 ) -> None:
     """Scan patches and write per-patch worst-pair overlap stats to JSONL.
 
@@ -272,12 +303,16 @@ def run_dataset_overlap(
     if vis_dir is not None:
         vis_out = Path(vis_dir)
         vis_out.mkdir(parents=True, exist_ok=True)
+        # The overlap command always feeds the vis its own detected
+        # groups per patch (see `overlap_pairs` below), so threshold
+        # resolution here is deliberately fixed at None — the vis
+        # shows exactly what the analysis flagged, no separate rule.
         inference_ctx = build_inference_context(
             model_path=model_path,
             config=config,
             patch_size=patch_size,
             inference_tile_size=inference_tile_size,
-            same_surface_threshold=same_surface_threshold,
+            same_surface_threshold=None,
         )
     elif model_path is not None:
         print(
@@ -288,17 +323,21 @@ def run_dataset_overlap(
     # When vis_top_k is set we need to keep the raw batch around so we
     # can render it later; otherwise we render inline and drop it.
     defer_render = vis_out is not None and vis_top_k is not None
-    deferred: list[tuple[dict, int, str, dict]] = []  # (batch, idx, ds_name, record)
+    # (batch, idx, ds_name, record, vis_groups)
+    deferred: list[tuple[dict, int, str, dict, list[list[int]] | None]] = []
 
-    def _render_one(batch, idx, ds_name) -> str:
+    def _render_one(batch, idx, ds_name, same_surface_groups=None) -> str:
         """Render the vis JPEG and return a short suffix describing the
         outcome (filename or error) so the per-patch summary stays on
-        one line."""
+        one line. ``same_surface_groups`` is the exact grouping the
+        analysis loop just detected for this patch — the vis renders
+        that state instead of re-running detection."""
         fname = default_vis_filename(ds_name, idx)
         title = default_vis_title(ds_name, idx, _sample_from_batch(batch))
         try:
             render_batch_figure(
                 batch, vis_out / fname, title, seed + idx, inference_ctx,
+                same_surface_groups=same_surface_groups,
             )
             return fname
         except Exception as e:
@@ -449,6 +488,7 @@ def run_dataset_overlap(
 
                 best = None
                 num_evaluated = 0
+                overlap_pairs: list[tuple[int, int]] = []
                 for (a, b) in pairs:
                     pts_a = pts_by_slot.get(a)
                     if pts_a is None:
@@ -466,6 +506,10 @@ def run_dataset_overlap(
                     score = _pair_score(stats)
                     if best is None or score < best[0]:
                         best = (score, a, b, stats)
+                    # Same rule that drives the stdout overlap counter:
+                    # post-flip median ≤ 1 → treat as duplicate.
+                    if stats["percentiles"]["50"] <= 1.0:
+                        overlap_pairs.append((a, b))
 
                 if best is None:
                     continue
@@ -528,12 +572,22 @@ def run_dataset_overlap(
 
                 top_records.append(record)
 
+                # The grouping the vis should render = whatever the
+                # analysis just flagged for this patch (overlap_pairs,
+                # filtered by the `p50 ≤ 1` rule above).
+                vis_groups = (
+                    _groups_from_pairs(n_surfaces, overlap_pairs)
+                    if overlap_pairs else None
+                )
+
                 vis_suffix = ""
                 if vis_out is not None:
                     if defer_render:
-                        deferred.append((batch, idx, ds_name, record))
+                        deferred.append((batch, idx, ds_name, record, vis_groups))
                     else:
-                        vis_suffix = f"  {_render_one(batch, idx, ds_name)}"
+                        vis_suffix = (
+                            f"  {_render_one(batch, idx, ds_name, vis_groups)}"
+                        )
 
                 if (total_written - 1) % _HEADER_EVERY == 0:
                     print(_HEADER, flush=True)
@@ -554,8 +608,11 @@ def run_dataset_overlap(
         )
         k = min(int(vis_top_k), len(deferred))
         print(f"{TAG} rendering top-{k} worst patches into {vis_out}", flush=True)
-        for batch, idx, ds_name, _record in deferred[:k]:
-            print(f"{TAG}   {_render_one(batch, idx, ds_name)}", flush=True)
+        for batch, idx, ds_name, _record, vis_groups in deferred[:k]:
+            print(
+                f"{TAG}   {_render_one(batch, idx, ds_name, vis_groups)}",
+                flush=True,
+            )
 
     if top_records:
         top_records.sort(

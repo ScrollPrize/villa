@@ -79,17 +79,61 @@ def _surface_color(sample_seed: int, surface_idx: int) -> str:
     return palette[surface_idx % len(palette)]
 
 
-def _color_slot(chain_info_list, si: int) -> int:
-    """Pick the palette slot for surface ``si``.
+def _groups_from_merge_groups(merge_groups):
+    """Rebuild ``list[list[int]]`` of original slots per merged slot."""
+    groups: list[list[int]] = []
+    slot_by_new: dict[int, int] = {}
+    for original, new_slot in enumerate(merge_groups):
+        new_slot = int(new_slot)
+        if new_slot not in slot_by_new:
+            slot_by_new[new_slot] = len(groups)
+            groups.append([])
+        groups[slot_by_new[new_slot]].append(original)
+    return groups
 
-    When `compute_patch_labels` merged duplicate wraps, `_render_sample_figure`
-    stamps a ``color_slot`` key onto each per-surface entry pointing at
-    the group representative. This helper falls back to ``si`` when the
-    key is missing (unmerged path).
+
+def _merge_geometry_by_groups(orig_geom, orig_chain_info, merge_groups):
+    """Collapse ``surface_geometry`` to one concatenated entry per merged slot.
+
+    Each merged entry carries:
+      - wrap_idx    — the representative's wrap_idx
+      - points_local / normals_zyx — concatenation of every member's points
+      - merged_from — tuple of original slot indices in this group
     """
-    if 0 <= si < len(chain_info_list):
-        return int(chain_info_list[si].get("color_slot", si))
-    return si
+    if not orig_geom:
+        return []
+    geom_by_slot: dict[int, dict] = {}
+    for entry in orig_geom:
+        wi = int(entry.get("wrap_idx", -1))
+        for slot, ci in enumerate(orig_chain_info):
+            if int(ci.get("wrap_idx", -2)) == wi:
+                geom_by_slot[slot] = entry
+                break
+    merged: list[dict] = []
+    for grp in _groups_from_merge_groups(merge_groups):
+        pts_list, nrm_list = [], []
+        for k in grp:
+            g = geom_by_slot.get(k)
+            if g is None:
+                continue
+            pts = np.asarray(
+                g.get("points_local", np.zeros((0, 3), np.float32))
+            )
+            nrm = np.asarray(
+                g.get("normals_zyx", np.zeros((0, 3), np.float32))
+            )
+            if pts.shape[0] > 0:
+                pts_list.append(pts)
+                nrm_list.append(nrm)
+        merged.append({
+            "wrap_idx": int(orig_chain_info[grp[0]].get("wrap_idx", grp[0])),
+            "points_local": (np.concatenate(pts_list, axis=0)
+                             if pts_list else np.zeros((0, 3), np.float32)),
+            "normals_zyx": (np.concatenate(nrm_list, axis=0)
+                            if nrm_list else np.zeros((0, 3), np.float32)),
+            "merged_from": tuple(grp),
+        })
+    return merged
 
 # Matches ScaleSpaceLoss3D default num_scales in train_tifxyz.py
 _NUM_SCALES = 3
@@ -536,7 +580,11 @@ def _compute_inference_output(batch, training_output, model_path, device,
         return None
 
 
-def _compute_training_output(batch: dict, same_surface_threshold: float | None = None):
+def _compute_training_output(
+    batch: dict,
+    same_surface_threshold: float | None = None,
+    same_surface_groups: list[list[int]] | None = None,
+):
     """Run ``compute_batch_targets`` on one batch and package numpy arrays.
 
     Returns ``None`` if CUDA is unavailable or the call fails, in which
@@ -551,12 +599,18 @@ def _compute_training_output(batch: dict, same_surface_threshold: float | None =
         return None
 
     device = torch.device("cuda")
+    groups_batch = None
+    if same_surface_groups is not None:
+        groups_batch = [same_surface_groups]
     try:
-        targets, validity, normals_valid, _dir_weight, merge_groups_batch = \
-            compute_batch_targets(
-                batch, device,
-                same_surface_threshold=same_surface_threshold,
-            )
+        (
+            targets, validity, normals_valid, _dir_weight,
+            merge_groups_batch, merged_masks_batch, merged_chain_info_batch,
+        ) = compute_batch_targets(
+            batch, device,
+            same_surface_threshold=same_surface_threshold,
+            same_surface_groups_batch=groups_batch,
+        )
     except Exception as exc:
         print(f"{TAG} WARNING: compute_batch_targets failed ({exc})", flush=True)
         return None
@@ -571,12 +625,22 @@ def _compute_training_output(batch: dict, same_surface_threshold: float | None =
             up = F.interpolate(lvl, size=full_size, mode="nearest")
             pyramid_upsampled.append(up[0, 0].detach().cpu().numpy())
 
+    merged_masks_np = [
+        m.detach().cpu().numpy().astype(np.float32)
+        for m in (merged_masks_batch[0] if merged_masks_batch else [])
+    ]
+    merged_chain_info = list(
+        merged_chain_info_batch[0] if merged_chain_info_batch else []
+    )
+
     return {
         "targets": targets[0].detach().cpu().numpy(),         # (8, Z, Y, X)
         "validity": validity[0, 0].detach().cpu().numpy(),    # (Z, Y, X)
         "normals_valid": normals_valid[0, 0].detach().cpu().numpy(),
         "validity_pyramid": pyramid_upsampled,                # list of (Z, Y, X)
         "merge_groups": list(merge_groups_batch[0]) if merge_groups_batch else [],
+        "merged_surface_masks": merged_masks_np,              # list of (Z, Y, X)
+        "merged_chain_info": merged_chain_info,               # list[dict]
     }
 
 
@@ -591,7 +655,7 @@ def _draw_contours_and_labels(ax, mask_slices: list, chain_info_list: list,
             continue
         info = chain_info_list[si]
         complete = bool(info.get("has_prev", False)) and bool(info.get("has_next", False))
-        color = _surface_color(sample_seed, _color_slot(chain_info_list, si))
+        color = _surface_color(sample_seed, si)
         for contour in measure.find_contours(mslice.astype(np.float32), 0.5):
             ax.plot(contour[:, 1], contour[:, 0],
                     color=color, linewidth=0.9, alpha=0.9)
@@ -647,7 +711,7 @@ def _draw_normal_arrows(ax, surface_geometry, chain_info_list,
         u = u / mag
         v = v / mag
 
-        color = _brighten(_surface_color(sample_seed, _color_slot(chain_info_list, si)))
+        color = _brighten(_surface_color(sample_seed, si))
         ax.quiver(
             pts[:, hcol], pts[:, vcol],
             u * _ARROW_LEN_PX, v * _ARROW_LEN_PX,
@@ -733,8 +797,7 @@ def _draw_grid_fused_arrows(ax, nx_vol, ny_vol, nz_vol, valid_3d,
 
 def _draw_surface_axis_arrows(ax, dir_channels, surface_geometry,
                               plane: str, plane_coord: int,
-                              sample_seed: int,
-                              chain_info_list: list | None = None):
+                              sample_seed: int):
     """For each surface in `surface_geometry`, sample axis-decoded
     direction at the surface points and draw per-surface-colored arrows
     on the named plane.
@@ -766,8 +829,7 @@ def _draw_surface_axis_arrows(ax, dir_channels, surface_geometry,
         d0v = dir_channels[c0_idx, zi, yi, xi]
         d1v = dir_channels[c1_idx, zi, yi, xi]
         h, v = _decode_dir_pair(d0v, d1v)
-        slot = _color_slot(chain_info_list, si) if chain_info_list else si
-        color = _brighten(_surface_color(sample_seed, slot))
+        color = _brighten(_surface_color(sample_seed, si))
         ax.quiver(
             h_pos, v_pos, h * _ARROW_LEN_PX, v * _ARROW_LEN_PX,
             angles="xy", scale_units="xy", scale=1.0,
@@ -777,8 +839,7 @@ def _draw_surface_axis_arrows(ax, dir_channels, surface_geometry,
 
 def _draw_surface_fused_arrows(ax, nx_vol, ny_vol, nz_vol, surface_geometry,
                                plane: str, plane_coord: int,
-                               sample_seed: int,
-                               chain_info_list: list | None = None):
+                               sample_seed: int):
     """For each surface in `surface_geometry`, sample the FUSED 3D normal
     at the surface points and draw the in-plane projection.
     """
@@ -813,8 +874,7 @@ def _draw_surface_fused_arrows(ax, nx_vol, ny_vol, nz_vol, surface_geometry,
         mag = np.sqrt(h * h + v * v) + 1e-8
         h = h / mag
         v = v / mag
-        slot = _color_slot(chain_info_list, si) if chain_info_list else si
-        color = _brighten(_surface_color(sample_seed, slot))
+        color = _brighten(_surface_color(sample_seed, si))
         ax.quiver(
             h_pos, v_pos, h * _ARROW_LEN_PX, v * _ARROW_LEN_PX,
             angles="xy", scale_units="xy", scale=1.0,
@@ -876,35 +936,60 @@ def _render_sample_figure(
     inference_output: dict | None = None,
 ) -> None:
     image = sample["image"][0].numpy()                  # (Z, Y, X)
-    surface_masks = sample["surface_masks"].numpy()      # (N, Z, Y, X)
-    chain_info = sample["surface_chain_info"]            # list[dict]
-    surface_geometry = sample.get("surface_geometry", [])  # list[dict]
 
-    # When compute_patch_labels merged duplicate wraps, stamp each
-    # entry with a shared `color_slot` and the group's label so all
-    # per-surface drawers render merged wraps with identical color
-    # and label while still iterating every original wrap.
-    merge_groups = None
+    # Per-surface data from the dataset. We swap these three to the
+    # merged views produced by compute_patch_labels when the merge
+    # fires — the drawers then see one entry per merged group and
+    # don't need any merge awareness. `surface_masks_np` is kept
+    # around because the row-1 "ghost" outlines for discarded members
+    # need the pre-merge tensors.
+    surface_masks_np = sample["surface_masks"].numpy()   # (N_orig, Z, Y, X)
+    original_chain_info = sample["surface_chain_info"]   # list[dict], len N_orig
+    original_geometry = sample.get("surface_geometry", [])
+
+    merge_groups: list[int] | None = None
+    merged_masks = None
+    merged_chain_info = None
     if training_output is not None:
-        mg = training_output.get("merge_groups") or []
-        if len(mg) == len(chain_info):
+        merged_masks = training_output.get("merged_surface_masks")
+        merged_chain_info = training_output.get("merged_chain_info")
+        mg = training_output.get("merge_groups")
+        if mg and len(mg) == len(original_chain_info):
             merge_groups = list(mg)
-    if merge_groups is not None:
-        first_by_group: dict[int, int] = {}
-        for si, g in enumerate(merge_groups):
-            first_by_group.setdefault(int(g), si)
-        rewritten = []
-        for si, entry in enumerate(chain_info):
-            rep = first_by_group[int(merge_groups[si])]
-            new_entry = dict(chain_info[rep])  # inherit rep's label/chain/pos
-            new_entry["color_slot"] = int(rep)
-            rewritten.append(new_entry)
-        chain_info = rewritten
+
+    if (
+        merge_groups is not None
+        and merged_masks
+        and merged_chain_info is not None
+        and len(merged_chain_info) == len(set(merge_groups))
+    ):
+        surface_masks = np.stack(merged_masks, axis=0) \
+            if merged_masks else np.zeros((0,) + surface_masks_np.shape[1:],
+                                          dtype=np.float32)
+        chain_info = list(merged_chain_info)
+        surface_geometry = _merge_geometry_by_groups(
+            original_geometry, original_chain_info, merge_groups,
+        )
+        n_orig = len(merge_groups)
+        n_merged = len(chain_info)
+        if n_merged < n_orig:
+            groups_list = _groups_from_merge_groups(merge_groups)
+            summary = ", ".join(
+                f"{chain_info[new_slot].get('label', '?')}="
+                f"{[original_chain_info[k].get('label', '?') for k in grp]}"
+                for new_slot, grp in enumerate(groups_list)
+                if len(grp) > 1
+            )
+            print(
+                f"{TAG} merge: {n_orig}→{n_merged} surfaces ({summary})",
+                flush=True,
+            )
     else:
-        for si, entry in enumerate(chain_info):
-            if "color_slot" not in entry:
-                # Non-mutating: drawers fall back to si when key is missing.
-                pass
+        surface_masks = surface_masks_np
+        chain_info = list(original_chain_info)
+        surface_geometry = original_geometry
+        merge_groups = None
+
     direction_channels_full = sample.get("direction_channels")
     if direction_channels_full is not None:
         direction_channels_full = direction_channels_full.numpy()  # (6,Z,Y,X)
@@ -932,11 +1017,34 @@ def _render_sample_figure(
     # counts within the same figure.
     rows: list[tuple[str, callable, int]] = []
 
-    # Row 1 — CT + contours + labels
+    # Row 1 — CT + contours + labels.
+    # If merging discarded members of a group, draw the pre-merge
+    # outlines as gray ghosts under the colored merged contours so
+    # the absorbed wraps stay visible.
+    discarded_slots: list[int] = []
+    if merge_groups is not None:
+        for grp in _groups_from_merge_groups(merge_groups):
+            if len(grp) > 1:
+                discarded_slots.extend(grp[1:])
+
     def draw_row_contours(sf):
         axes = sf.subplots(1, 3)
         for col, ax in enumerate(axes):
             ax.imshow(image_disp[col], cmap="gray", interpolation="nearest")
+
+            # Gray ghosts of discarded (non-rep) members.
+            for k in discarded_slots:
+                mslice = _plane_slices(surface_masks_np[k], cz, cy, cx)[col]
+                if mslice.size == 0 or not np.any(mslice > 0.5):
+                    continue
+                for contour in measure.find_contours(
+                    mslice.astype(np.float32), 0.5,
+                ):
+                    ax.plot(
+                        contour[:, 1], contour[:, 0],
+                        color="#888888", linewidth=0.7, zorder=1,
+                    )
+
             mslices = [_plane_slices(m, cz, cy, cx)[col] for m in surface_masks]
             _draw_contours_and_labels(ax, mslices, chain_info, arrow_seed)
             ax.set_title(plane_names[col], fontsize=9)
@@ -1237,7 +1345,6 @@ def _render_sample_figure(
                         _draw_surface_axis_arrows(
                             ax, dc, surface_geometry,
                             plane_keys[col], plane_coords[col], arrow_seed,
-                            chain_info_list=chain_info,
                         )
                         ax.set_title(
                             f"{gname}  {plane_names[col]}", fontsize=9)
@@ -1262,7 +1369,6 @@ def _render_sample_figure(
                             _draw_surface_fused_arrows(
                                 ax, nx, ny, nz, surface_geometry,
                                 plane_keys[col], plane_coords[col], arrow_seed,
-                                chain_info_list=chain_info,
                             )
                             ax.set_title(
                                 f"{gname}  {plane_names[col]}", fontsize=9)
@@ -1548,15 +1654,23 @@ def render_batch_figure(
     title: str,
     arrow_seed: int,
     inference_ctx: dict,
+    same_surface_groups: list[list[int]] | None = None,
 ) -> None:
     """End-to-end: compute training_output (+ optional inference_output)
     and write the JPEG. Mirrors what `run_dataset_vis` does for a single
     batch, so alternate commands render an identical figure.
+
+    ``same_surface_groups`` (optional) overrides
+    ``compute_patch_labels``'s own detection — used by
+    `dataset overlap` to render exactly the pairs its analysis
+    flagged. When ``None``, falls back to the threshold in
+    ``inference_ctx``.
     """
     sample = _sample_from_batch(batch)
     training_output = _compute_training_output(
         batch,
         same_surface_threshold=inference_ctx.get("same_surface_threshold"),
+        same_surface_groups=same_surface_groups,
     )
 
     inference_output = None
