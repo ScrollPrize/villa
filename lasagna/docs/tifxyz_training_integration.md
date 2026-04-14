@@ -201,65 +201,59 @@ dir0_x, dir1_x = _encode_dir(ny, nz)   # X-slices (YZ plane)
 These can be computed per grid point and then voxelized into the 3D patch
 (using the same splatting approach as the neural tracer).
 
-### 3.2 Surface chain ordering
+### 3.2 Surface chain ordering (geometry + filename-winding)
 
-The data loader (`load_folder()`) returns tifxyz surfaces sorted alphabetically
-by directory path, which has no relation to their spatial arrangement. All
-DT-derived channels (cos, grad_mag, validity) require knowing which surface is
-prev/next for each voxel, so we must **explicitly order the surfaces into a
-chain** first.
+The data loader returns tifxyz surfaces in no particular spatial order, and
+all DT-derived channels (cos, grad_mag, validity) need to know which
+surfaces are chain-adjacent. Earlier versions of this pipeline scanned
+pairwise DT means to greedily build a single chain; **that approach is
+gone**. We now:
 
-We use the greedy chain algorithm from `lasagna/labels_to_winding_volume.py`
-(lines 268–305):
+1. Reuse the neural tracer's triplet-neighbor logic to order surfaces once
+   per patch, based on (a) each wrap's 2D median position in surface
+   parameter space and (b) compatibility via consecutive `w<N>` filename
+   winding ids.
+2. Support **multiple independent chains** in the same patch (branches,
+   disconnected sheet stacks).
+3. Hand the ordering to the label-derivation step as `surface_chain_info`
+   metadata — EDTs are only used for bracketing distances, never for
+   ordering.
 
-1. Voxelize each surface `k` into a binary mask `mask_k`.
-2. Compute the EDT for each: `dt_k = edt(~mask_k)`.
-3. Compute pairwise average distances: `avg_dist[i,j]` = mean of `dt_i` over
-   the voxels of surface `j`. This is cheap — the DTs are already computed.
-4. Start the chain at the most isolated surface (highest mean distance to all
-   others).
-5. Greedily append the closest unused surface.
+The ordering is implemented in `lasagna/tifxyz_lasagna_dataset.py`:
 
 ```python
-from vesuvius.image_proc.edt import distance_transform_edt
-
-# 1-2. Voxelize + EDT (already needed for cos/grad_mag)
-dts = [distance_transform_edt(~mask) for mask in surface_masks]
-
-# 3. Pairwise average distances
-N = len(dts)
-avg_dist = np.zeros((N, N), dtype=np.float64)
-for i in range(N):
-    for j in range(N):
-        if i != j:
-            avg_dist[i, j] = float(dts[i][surface_masks[j]].mean())
-
-# 4. Start with most isolated surface
-total_avg = np.array([np.mean([avg_dist[i, j] for j in range(N) if j != i])
-                       for i in range(N)])
-chain = [int(np.argmax(total_avg))]
-used = set(chain)
-
-# 5. Greedy nearest neighbor
-for _ in range(N - 1):
-    last = chain[-1]
-    best = min((j for j in range(N) if j not in used),
-               key=lambda j: avg_dist[last, j])
-    chain.append(best)
-    used.add(best)
+def build_patch_chains(patch, max_wraps: int) -> dict:
+    # 1. For each wrap, compute a 2D median (x, y) over its stored
+    #    coordinates via _compute_wrap_order_stats.
+    # 2. Sort wraps along the dominant-spread axis (x or y).
+    # 3. Link each wrap to its nearest compatible neighbor on each side.
+    #    Compatibility = same segment, or consecutive w<N> winding ids.
+    # 4. Walk reciprocal next-links from chain heads to form chains;
+    #    asymmetric leftovers become singleton chains.
+    # Returns: {wrap_idx: {chain, pos, has_prev, has_next, label}}
 ```
 
-In a typical training patch N is small (2–5 surfaces), so this is negligible
-compared to the EDT computation.
+This is a port of `_build_triplet_neighbor_lookup` in
+`vesuvius/src/vesuvius/neural_tracing/datasets/dataset_rowcol_cond.py`, so
+lasagna and the neural tracer agree on chain topology. The helpers
+`_compute_wrap_order_stats`, `_extract_wrap_ids`, and
+`_triplet_wraps_compatible` are imported from
+`vesuvius.neural_tracing.datasets.common`.
+
+The dataset's `__getitem__` calls `build_patch_chains` once per patch and
+emits a `surface_chain_info` list aligned with the retained `surface_masks`,
+carrying `{chain, pos, has_prev, has_next}` per mask. This is collated
+through to the training step and forwarded to `compute_patch_labels`.
 
 ### 3.3 Cos, grad_mag, and validity — chain-aware DT derivation
 
-With the chain ordering established, every voxel needs three things:
-1. Its **nearest surface** in the chain (index into `chain`)
-2. Which **side** of that surface it sits on (toward prev or toward next)
-3. The **distances** to the two surfaces it sits between
+With chains already in hand (§3.2), every voxel needs:
+1. Its **globally nearest surface** (across all chains).
+2. Whether that surface has a chain neighbor on the side this voxel sits.
+3. The **bracketing distances** to the two surfaces it lies between.
 
-All three are determined by **DT-gradient dot products**.
+All three come from **DT-gradient dot products**. The implementation lives
+in `lasagna/tifxyz_labels.py:derive_cos_gradmag_validity()`.
 
 #### DT-gradient dot product — core idea
 
@@ -271,73 +265,74 @@ Given two distance transforms `dt_A` and `dt_B`, compute `∇dt_A · ∇dt_B`:
 This works because `∇dt` always points away from the nearest surface point.
 Between two surfaces the "away" directions oppose; outside both they align.
 
-#### Per-voxel side detection
+#### Between-neighbors validity ("only between neighboring surfaces")
 
-For each voxel nearest to chain surface `k`, compute the dot product against
-the previous chain neighbor's DT:
+The new validity rule is strict: **a voxel is supervised for cos/grad_mag
+only if it is strictly between its nearest surface and one of that
+surface's chain-adjacent neighbors.** This removes the old
+`~outside_envelope` mask entirely — we no longer fabricate validity for
+voxels on the open side of a chain endpoint.
+
+For each chain, for each position `pos` in the chain, for each voxel whose
+nearest surface is the one at `pos`:
 
 ```python
-dot_prev = np.zeros(shape, dtype=np.float32)
-for ax in range(3):
-    gn = np.gradient(dt_chain[k], axis=ax)
-    gp = np.gradient(dt_chain[k-1], axis=ax)
-    dot_prev[is_nearest_k] += (gn * gp)[is_nearest_k]
+# has_prev, has_next come from chain position (not from DT scanning)
+if has_prev:
+    dot_prev = sum(grad(dt_near)[k] * grad(dt_prev)[k] for k in (0,1,2))
+    between_prev = (dot_prev < 0) & is_nearest
+if has_next:
+    dot_next = sum(grad(dt_near)[k] * grad(dt_next)[k] for k in (0,1,2))
+    between_next = (dot_next < 0) & is_nearest
 
-use_prev_side = dot_prev < 0
-# dot < 0 → between prev and nearest → d_lo=dist_prev, d_hi=dist_nearest
-# dot ≥ 0 → between nearest and next → d_lo=dist_nearest, d_hi=dist_next
+use_prev = between_prev                       # prefer prev when both sides qualify
+use_next = between_next & ~use_prev
+local_valid = use_prev | use_next             # only bracketed voxels
 ```
 
-This gives the two bracketing distances `d_lo` and `d_hi` for each voxel:
+Consequences:
+- Chain middles with neighbors on both sides supervise both sides.
+- Chain endpoints supervise only the side that has an actual neighbor.
+- Chain-of-one surfaces contribute zero valid voxels.
+- Outside-envelope voxels fail both `between_prev` and `between_next` and
+  are automatically invalid.
+- Multiple independent chains in the same patch are handled naturally:
+  global nearest-surface assignment routes each voxel to the chain it
+  belongs to.
+
+#### Bracketing distances, cos and grad_mag
 
 ```python
-d_lo = np.where(use_prev_side, dist_prev, dist_nearest)
-d_hi = np.where(use_prev_side, dist_nearest, dist_next)
+d_lo = torch.where(use_prev, dt_prev, dt_near)
+d_hi = torch.where(use_prev, dt_near, dt_next)
 spacing = d_lo + d_hi
-```
-
-#### Deriving cos and grad_mag
-
-The cos channel encodes `0.5 + 0.5 * cos(2π * winding)`, which peaks at 1.0
-on each sheet surface and dips to 0.0 midway between sheets. The grad_mag
-channel encodes local sheet density (inverse of inter-sheet spacing).
-
-```python
-cos_channel = 0.5 + 0.5 * np.cos(np.pi * np.clip(d_lo / (spacing / 2 + 1e-6), 0, 1))
+frac = torch.clamp(d_lo / (spacing * 0.5 + 1e-6), 0.0, 1.0)
+cos     = 0.5 + 0.5 * torch.cos(math.pi * frac)
 grad_mag = 1.0 / (spacing + 1e-6)
 ```
 
-#### Envelope detection (validity)
+`cos` peaks at 1.0 on each sheet and dips to 0.0 midway between sheets;
+`grad_mag` encodes inverse inter-sheet spacing. Both are assigned only at
+voxels where `local_valid` is true, leaving the rest at 0 and excluded from
+the loss via the validity mask.
 
-Voxels outside the entire surface stack are invalid. Detect them using the
-dot product between the first and last chain DTs:
+#### Direction channels and masking
 
-```python
-dot_envelope = np.zeros(shape, dtype=np.float32)
-for axis in range(3):
-    g1 = np.gradient(dt_chain[0], axis=axis)
-    g2 = np.gradient(dt_chain[-1], axis=axis)
-    dot_envelope += g1 * g2
-
-outside_mask = (dot_envelope > 0) & (~on_any_surface)
-```
-
-#### Combined validity mask
-
-```python
-valid = np.ones(shape, dtype=bool)
-valid &= num_surfaces >= 2              # need ≥2 surfaces
-valid &= ~outside_mask                  # exclude exterior voxels
-valid &= erode_3d(valid, margin=8)      # exclude patch-edge artifacts
-```
+Direction channels (`dir_z`, `dir_y`, `dir_x`) are supervised **only on
+surface voxels**. That masking is independent of chains — it comes from
+`normals_valid`, which is the accumulated splatting weight from
+`_splat_multichannel` in `tifxyz_lasagna_dataset.py`. Non-zero weights mark
+voxels where surface normals were splatted; everything else is masked out
+of the direction loss. No chain information is needed or used here.
 
 #### Reference
 
-`lasagna/labels_to_winding_volume.py`:
-- Lines 268–305: greedy chain construction
-- Lines 307–348: chain-adjacent dot-product side detection
-- Lines 350–368: envelope exterior detection
-- Lines 374–402: per-voxel winding interpolation using chain distances
+- Chain building: `lasagna/tifxyz_lasagna_dataset.py:build_patch_chains()`
+- Chain regrouping from per-mask info:
+  `lasagna/tifxyz_labels.py:chains_from_surface_info()`
+- Cos/grad_mag/validity: `lasagna/tifxyz_labels.py:derive_cos_gradmag_validity()`
+- Triplet logic this ports:
+  `vesuvius/src/vesuvius/neural_tracing/datasets/dataset_rowcol_cond.py:_build_triplet_neighbor_lookup()`
 
 
 ---
@@ -352,21 +347,25 @@ To produce labels on-the-fly from tifxyz surfaces for a given patch:
 
 ```
 1. Identify which tifxyz surfaces intersect this patch's world bbox
-2. For each surface k:
+2. Build chains for this patch once via build_patch_chains():
+   → per-wrap {chain, pos, has_prev, has_next}
+3. For each surface k (that survived chain/bbox filtering):
    a. Bicubic-upsample surface grid from stored to full resolution
    b. Sample the surface grid within the padded bbox
    c. Compute normals at the sampled grid points
-   c. Encode direction channels (6 values per grid point)
-   d. Voxelize into a per-surface binary mask (mask_k)
-3. Voxelize direction channels:
+   d. Encode direction channels (6 values per grid point)
+   e. Voxelize into a per-surface binary mask (mask_k)
+4. Voxelize direction channels:
    a. Splat the 6 direction values at each surface point's 3D position
    b. Normalize splatted direction values (divide by weight accumulator)
-4. Per-surface distance transforms (§3.2–3.3):
+   → this produces normals_valid, which directly masks direction loss
+5. Per-surface distance transforms + chain-aware bracketing (§3.3):
    a. For each surface k: dt_k = edt(~mask_k)
-   b. Build greedy chain by pairwise average distances
-   c. Per-voxel: find nearest chain surface, dot-product side detection
-   d. cos and grad_mag from chain-aware bracketing distances (d_lo, d_hi)
-   e. Envelope detection (dot of first/last chain DTs) → validity mask
+   b. Global nearest-surface assignment across all chains/surfaces
+   c. Per-voxel between-neighbors detection via grad dot products with
+      the surface's chain-adjacent neighbors (only; no envelope search)
+   d. cos and grad_mag from bracketing distances (d_lo, d_hi)
+   e. validity = (between_prev) | (between_next) per voxel
 6. Average-pool to step resolution if needed
 ```
 
@@ -528,9 +527,10 @@ patches instantly with no progress bars or recomputation.
 
 | File | Purpose |
 |------|---------|
-| `lasagna/tifxyz_lasagna_dataset.py` | `TifxyzLasagnaDataset` — data loading (CT crops, surface masks, direction channels) |
-| `lasagna/tifxyz_labels.py` | `compute_patch_labels()` — GPU label derivation (EDT, chain ordering, cos/grad_mag) |
-| `lasagna/train_tifxyz.py` | Training script |
+| `lasagna/tifxyz_lasagna_dataset.py` | `TifxyzLasagnaDataset` (CT crops, surface masks, direction channels), `build_patch_chains()` (geometry + filename-winding ordering), `collate_variable_surfaces()` (passes chain info through the batch) |
+| `lasagna/tifxyz_labels.py` | `compute_patch_labels()`, `chains_from_surface_info()`, `derive_cos_gradmag_validity()` — chain-aware cos/grad_mag with between-neighbors masking |
+| `lasagna/train_tifxyz.py` | Training script; `compute_batch_targets()` forwards `surface_chain_info` to label derivation |
+| `lasagna/lasagna3d/` | `python -m lasagna3d` analysis CLI (`dataset vis` renders three-plane JPEGs with chain-colored overlays — see [`lasagna3d_cli.md`](lasagna3d_cli.md)) |
 
 ### Multi-channel splatting
 
@@ -616,17 +616,25 @@ pip install edt
 
 Neither is required — scipy is always available as the final fallback.
 
-### Usage in tifxyz training (§3.2)
+### Usage in tifxyz training (§3.2–3.3)
+
+In `tifxyz_labels.py` each surface gets one EDT of its complement on GPU
+(via `edt_torch`, CuPy + DLPack). Ordering and side detection come from the
+externally-provided chains (§3.2), not from scanning distances:
 
 ```python
-from vesuvius.image_proc.edt import distance_transform_edt
+from lasagna.tifxyz_labels import (
+    edt_torch, chains_from_surface_info, derive_cos_gradmag_validity,
+)
 
-# Per-surface distance transforms for cos and grad_mag derivation
-dts = [distance_transform_edt(~mask) for mask in surface_masks]
-dt_stack = np.stack(dts, axis=0)
-dt_sorted = np.sort(dt_stack, axis=0)
-d1, d2 = dt_sorted[0], dt_sorted[1]
+dts = [edt_torch((~m).to(torch.uint8)) for m in surface_masks]
+chains = chains_from_surface_info(surface_chain_info)  # [[idx, ...], ...]
+cos, grad_mag, valid = derive_cos_gradmag_validity(dts, surface_masks, chains)
 ```
+
+There is no sort or pairwise-mean step — bracketing comes from the chain
+neighbors at each position, and between-ness is confirmed via the
+DT-gradient dot product (§3.3).
 
 ### Origin
 

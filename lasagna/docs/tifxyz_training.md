@@ -200,17 +200,78 @@ Resume training with `--weights path/to/model_current.pt`.
    3D chunks and finds surface wraps within each chunk. Results are cached to
    `.patch_cache/world_chunks_*.json` per segments directory.
 
-2. **Dataset `__getitem__`** -- reads a CT crop from zarr, voxelizes surface
-   masks and direction channels from tifxyz grids.
+2. **Chain ordering** -- `build_patch_chains()` in
+   `tifxyz_lasagna_dataset.py` groups the wraps of each patch into ordered
+   chains (see "Surface chain ordering" below). This replaces the old
+   EDT-pairwise greedy ordering; it is geometry + filename-winding driven and
+   supports multiple independent chains per patch.
 
-3. **GPU label derivation** -- `compute_patch_labels()` runs EDT + chain
-   ordering + cos/grad_mag computation on GPU per batch.
+3. **Dataset `__getitem__`** -- reads a CT crop from zarr, voxelizes surface
+   masks and direction channels from tifxyz grids, and emits per-retained-mask
+   chain metadata (`chain`, `pos`, `has_prev`, `has_next`) aligned with
+   `surface_masks`.
 
-4. **Augmentation** -- random flips, 90-degree rotations, intensity jitter
+4. **GPU label derivation** -- `compute_patch_labels()` computes per-surface
+   EDTs once per sample, then uses the externally supplied chains to derive
+   cos and grad_mag **only for voxels bracketed between two chain-adjacent
+   surfaces**. There is no EDT-based ordering search.
+
+5. **Augmentation** -- random flips, 90-degree rotations, intensity jitter
    applied after label computation.
 
-5. **Loss** -- masked multi-scale MSE (cos, direction) + smooth L1 (grad_mag),
-   weighted by validity masks.
+6. **Loss** -- masked multi-scale MSE (cos, direction) + smooth L1 (grad_mag),
+   weighted by validity masks. Directions are supervised only on surface
+   voxels (via `normals_valid`); cos and grad_mag are supervised only in the
+   between-neighbors region (via the chain-derived validity mask).
+
+
+## Surface chain ordering
+
+The dataset produces **multi-chain** ordering metadata per patch via
+`build_patch_chains(patch, max_wraps)` in
+`lasagna/tifxyz_lasagna_dataset.py`. This ports the triplet neighbor logic
+from `vesuvius/neural_tracing/datasets/dataset_rowcol_cond._build_triplet_neighbor_lookup`:
+
+1. For each wrap, compute a 2D median `(x, y)` over its stored-resolution
+   coordinates (`_compute_wrap_order_stats`).
+2. Pick the dominant-spread axis as the local through-the-scroll direction.
+3. Sort wraps along that axis. For each wrap, link to the nearest
+   **compatible** neighbor on each side. "Compatible"
+   (`_triplet_wraps_compatible`) means same segment, OR wrap ids parsed from
+   the segment filename via the `w<N>` convention differ by exactly 1.
+4. Walk reciprocal next-links from chain heads to form chains; leftover
+   wraps become singleton chains.
+
+The returned dict has one entry per wrap:
+`{wrap_idx: {"chain", "pos", "has_prev", "has_next", "label"}}`.
+The dataset carries this through to `compute_patch_labels` as the
+`surface_chain_info` field on each sample (per-retained-mask dicts aligned
+with `surface_masks`).
+
+### Validity ("between neighboring surfaces")
+
+For every voxel, `derive_cos_gradmag_validity()`:
+
+- Finds the globally nearest surface across all chains.
+- Restricts supervision to the chain the nearest surface belongs to, at its
+  chain position.
+- A voxel is **valid only when it is strictly between the nearest surface
+  and one of its chain-adjacent neighbors**. Between-ness is detected via
+  the DT-gradient dot product: `dot(grad(dt_near), grad(dt_neighbor)) < 0`
+  means the gradients point toward each other, so the voxel is bracketed.
+- Chain endpoints with no neighbor on the "open" side are invalid on that
+  side. Chain-of-one wraps contribute no valid voxels.
+
+Directions are supervised independently on surface voxels only — that
+validity comes from `normals_valid` (the splatting weight accumulator from
+the dataset) and is not affected by chain topology.
+
+## Inspecting the dataset
+
+See [`lasagna3d_cli.md`](lasagna3d_cli.md) for the
+`python -m lasagna3d dataset vis` tool, which renders three-plane JPEGs of
+dataset samples with the same chain labels wired into the training loop.
+Use it to sanity-check chain ordering before long runs.
 
 
 ## Implementation Files
@@ -218,8 +279,10 @@ Resume training with `--weights path/to/model_current.pt`.
 | File | Purpose |
 |------|---------|
 | `lasagna/train_tifxyz.py` | Training script and CLI |
-| `lasagna/tifxyz_lasagna_dataset.py` | `TifxyzLasagnaDataset` -- CT crops + surface voxelization |
-| `lasagna/tifxyz_labels.py` | `compute_patch_labels()` -- GPU label derivation |
+| `lasagna/tifxyz_lasagna_dataset.py` | `TifxyzLasagnaDataset` (CT crops, surface voxelization) and `build_patch_chains()` (multi-chain ordering) |
+| `lasagna/tifxyz_labels.py` | `compute_patch_labels()`, `chains_from_surface_info()`, `derive_cos_gradmag_validity()` (GPU, chain-aware) |
+| `lasagna/lasagna3d/` | `python -m lasagna3d` analysis CLI — see [`lasagna3d_cli.md`](lasagna3d_cli.md) |
 | `vesuvius/src/vesuvius/neural_tracing/datasets/patch_finding.py` | `find_world_chunk_patches()` -- world-chunk patch discovery |
-| `vesuvius/src/vesuvius/neural_tracing/datasets/common.py` | `open_zarr()`, `voxelize_surface_grid_masked()`, `ChunkPatch` |
+| `vesuvius/src/vesuvius/neural_tracing/datasets/common.py` | `open_zarr()`, `voxelize_surface_grid_masked()`, `ChunkPatch`, `_compute_wrap_order_stats()`, `_triplet_wraps_compatible()` |
+| `vesuvius/src/vesuvius/neural_tracing/datasets/dataset_rowcol_cond.py` | Original `_build_triplet_neighbor_lookup()` that `build_patch_chains` ports |
 | `vesuvius/src/vesuvius/image_proc/edt.py` | GPU-accelerated EDT (CuPy > edt > scipy fallback) |
