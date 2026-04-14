@@ -23,6 +23,17 @@ Config JSON format:
 """
 from __future__ import annotations
 
+# Must be set before `import torch` (before any CUDA alloc). Expandable
+# segments let a reserved block grow contiguously instead of fragmenting
+# into per-size pools — without this the vis inference forward OOMs
+# reliably after training forwards on the same GPU even with several
+# GB free in the reserved pool.
+import os as _os
+_os.environ.setdefault(
+    "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True",
+)
+del _os
+
 # Pre-warm numba LLVM runtime before any other imports. torch pulls in
 # opt_einsum, whose backends/__init__.py eagerly imports
 # opt_einsum.backends.tensorflow, which loads tensorflow's LLVM and poisons
@@ -250,42 +261,108 @@ def augment_targets_3d(
     targets: torch.Tensor,
     validity: torch.Tensor,
     normals_valid: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
     """Random 3D spatial augmentation on image + computed targets.
 
-    Flips along each axis independently, plus random 90-degree rotation
-    around Z axis. Direction channels need sign correction on flip.
+    Returns the sampled ``(flip_z, flip_y, flip_x, k)`` params so the
+    same transform can be replayed on the vis batch.
     """
-    # Flip Z (dim 2 in BCDHW)
-    if torch.rand(1).item() < 0.5:
+    flip_z = bool(torch.rand(1).item() < 0.5)
+    flip_y = bool(torch.rand(1).item() < 0.5)
+    flip_x = bool(torch.rand(1).item() < 0.5)
+    k = int(torch.randint(0, 4, (1,)).item())
+
+    if flip_z:
         image = torch.flip(image, [2])
         targets = torch.flip(targets, [2])
         validity = torch.flip(validity, [2])
         normals_valid = torch.flip(normals_valid, [2])
-
-    # Flip Y (dim 3)
-    if torch.rand(1).item() < 0.5:
+    if flip_y:
         image = torch.flip(image, [3])
         targets = torch.flip(targets, [3])
         validity = torch.flip(validity, [3])
         normals_valid = torch.flip(normals_valid, [3])
-
-    # Flip X (dim 4)
-    if torch.rand(1).item() < 0.5:
+    if flip_x:
         image = torch.flip(image, [4])
         targets = torch.flip(targets, [4])
         validity = torch.flip(validity, [4])
         normals_valid = torch.flip(normals_valid, [4])
-
-    # Random 90-degree rotation around Z axis (dims 3, 4)
-    k = int(torch.randint(0, 4, (1,)).item())
     if k:
         image = torch.rot90(image, k, dims=(3, 4))
         targets = torch.rot90(targets, k, dims=(3, 4))
         validity = torch.rot90(validity, k, dims=(3, 4))
         normals_valid = torch.rot90(normals_valid, k, dims=(3, 4))
 
-    return image, targets, validity, normals_valid
+    return image, targets, validity, normals_valid, (flip_z, flip_y, flip_x, k)
+
+
+def _apply_aug_to_vis_batch(batch: dict, params: tuple,
+                            size_zyx: tuple) -> dict:
+    """Replay augmentation params on a shallow-copied batch so the full
+    vis renders the same flipped/rotated state the model trained on."""
+    flip_z, flip_y, flip_x, k = params
+    if not (flip_z or flip_y or flip_x or k):
+        return batch
+
+    Zs, Ys, Xs = int(size_zyx[0]), int(size_zyx[1]), int(size_zyx[2])
+
+    def _flip_rot_vol(t, dims):
+        dz, dy, dx = dims
+        if flip_z:
+            t = torch.flip(t, [dz])
+        if flip_y:
+            t = torch.flip(t, [dy])
+        if flip_x:
+            t = torch.flip(t, [dx])
+        if k:
+            t = torch.rot90(t, k, dims=(dy, dx))
+        return t
+
+    def _apply_to_geom(geom_list):
+        out = []
+        for g in geom_list:
+            pts = np.asarray(
+                g.get("points_local", np.zeros((0, 3), np.float32))
+            ).astype(np.float32).copy()
+            nrm = np.asarray(
+                g.get("normals_zyx", np.zeros((0, 3), np.float32))
+            ).astype(np.float32).copy()
+            if pts.shape[0]:
+                if flip_z:
+                    pts[:, 0] = (Zs - 1) - pts[:, 0]
+                    nrm[:, 0] *= -1.0
+                if flip_y:
+                    pts[:, 1] = (Ys - 1) - pts[:, 1]
+                    nrm[:, 1] *= -1.0
+                if flip_x:
+                    pts[:, 2] = (Xs - 1) - pts[:, 2]
+                    nrm[:, 2] *= -1.0
+                for _ in range(k % 4):
+                    y_new = pts[:, 2].copy()
+                    x_new = (Ys - 1) - pts[:, 1]
+                    pts[:, 1] = y_new
+                    pts[:, 2] = x_new
+                    ny_new = nrm[:, 2].copy()
+                    nx_new = -nrm[:, 1]
+                    nrm[:, 1] = ny_new
+                    nrm[:, 2] = nx_new
+            out.append({**g, "points_local": pts, "normals_zyx": nrm})
+        return out
+
+    aug = dict(batch)
+    aug["image"] = _flip_rot_vol(batch["image"], dims=(2, 3, 4))
+    aug["normals_valid"] = _flip_rot_vol(batch["normals_valid"], dims=(2, 3, 4))
+    aug["padding_mask"] = _flip_rot_vol(batch["padding_mask"], dims=(2, 3, 4))
+    aug["direction_channels"] = _flip_rot_vol(
+        batch["direction_channels"], dims=(2, 3, 4),
+    )
+    aug["surface_masks"] = [
+        _flip_rot_vol(m, dims=(1, 2, 3)) for m in batch["surface_masks"]
+    ]
+    aug["surface_geometry"] = [
+        _apply_to_geom(gs) for gs in batch.get("surface_geometry", [])
+    ]
+    return aug
 
 
 def augment_intensity(image: torch.Tensor) -> torch.Tensor:
@@ -699,6 +776,7 @@ def train(
 
     # Initial eval before training so we see init/load performance.
     print(f"{TAG} running pre-training eval at step 0...", flush=True)
+    _init_vis_batch: list = []
     init_val_loss = _evaluate(
         model, val_loader, scale_loss_mse, scale_loss_l1,
         device, writer, global_step,
@@ -707,10 +785,11 @@ def train(
         verbose=verbose,
         same_surface_threshold=same_surface_threshold,
         output_sigmoid=output_sigmoid,
+        vis_batch_out=_init_vis_batch,
     )
-    for _probe_batch in val_loader:
-        _log_full_vis(_probe_batch, "val", 0)
-        break
+    if _init_vis_batch:
+        _log_full_vis(_init_vis_batch[0], "val", global_step)
+    _init_vis_batch.clear()
     print(f"{TAG} init val={init_val_loss:.4f}", flush=True)
 
     last_val_loss = init_val_loss
@@ -760,7 +839,7 @@ def train(
                 continue
 
             # Spatial augmentation on image + targets
-            image, targets, validity, normals_valid = augment_targets_3d(
+            image, targets, validity, normals_valid, aug_params = augment_targets_3d(
                 image, targets, validity, normals_valid,
             )
             # Intensity augmentation on CT only
@@ -866,13 +945,16 @@ def train(
                 _log_vis(writer, "train", image, pred, targets, cos_mask, global_step)
 
             if global_step % vis_interval_steps == 0:
-                _log_full_vis(batch, "train", global_step)
+                size_zyx = tuple(int(v) for v in batch["image"].shape[2:])
+                aug_batch = _apply_aug_to_vis_batch(batch, aug_params, size_zyx)
+                _log_full_vis(aug_batch, "train", global_step)
 
             global_step += 1
 
             # Periodic validation mid-epoch so we see val trajectory
             # at a much higher resolution than once-per-epoch.
             if global_step > 0 and global_step % val_every_steps == 0:
+                _vis_batch: list = []
                 last_val_loss = _evaluate(
                     model, val_loader, scale_loss_mse, scale_loss_l1,
                     device, writer, global_step,
@@ -881,10 +963,11 @@ def train(
                     verbose=verbose,
                     same_surface_threshold=same_surface_threshold,
                     output_sigmoid=output_sigmoid,
+                    vis_batch_out=_vis_batch,
                 )
-                for _probe_batch in val_loader:
-                    _log_full_vis(_probe_batch, "val", global_step)
-                    break
+                if _vis_batch:
+                    _log_full_vis(_vis_batch[0], "val", global_step)
+                _vis_batch.clear()
                 model.train()
                 train_iter.write(
                     f"{TAG} step {global_step}  val={last_val_loss:.4f}"
@@ -930,6 +1013,7 @@ def _evaluate(
     verbose: bool = False,
     same_surface_threshold: float | None = None,
     output_sigmoid: bool = False,
+    vis_batch_out: list | None = None,
 ):
     model.eval()
     losses = []
@@ -971,6 +1055,8 @@ def _evaluate(
 
             if not vis_done:
                 _log_vis(writer, "val", image, pred, targets, cos_mask, global_step)
+                if vis_batch_out is not None:
+                    vis_batch_out.append(batch)
                 vis_done = True
 
     mean_loss = sum(losses) / max(len(losses), 1)

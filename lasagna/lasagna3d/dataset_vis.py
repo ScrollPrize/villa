@@ -578,7 +578,11 @@ def _compute_inference_output(batch, training_output, model_path, device,
             "compare_size": int(compare_size),
         }
     except Exception as exc:
-        print(f"{TAG} WARNING: inference failed ({exc})", flush=True)
+        print(
+            f"{TAG} WARNING: inference failed "
+            f"({type(exc).__name__}: {exc})",
+            flush=True,
+        )
         return None
 
 
@@ -617,15 +621,35 @@ def _compute_training_output(
         print(f"{TAG} WARNING: compute_batch_targets failed ({exc})", flush=True)
         return None
 
-    pyramid_tensors = scale_space_validity_pyramid(validity, _NUM_SCALES)
     full_size = validity.shape[2:]
-    pyramid_upsampled = []
-    for lvl in pyramid_tensors:
-        if lvl.shape[2:] == full_size:
-            pyramid_upsampled.append(lvl[0, 0].detach().cpu().numpy())
-        else:
-            up = F.interpolate(lvl, size=full_size, mode="nearest")
-            pyramid_upsampled.append(up[0, 0].detach().cpu().numpy())
+
+    def _upsample_pyramid(tensors):
+        out = []
+        for lvl in tensors:
+            if lvl.shape[2:] == full_size:
+                out.append(lvl[0, 0].detach().cpu().numpy())
+            else:
+                up = F.interpolate(lvl, size=full_size, mode="nearest")
+                out.append(up[0, 0].detach().cpu().numpy())
+        return out
+
+    pyramid_upsampled = _upsample_pyramid(
+        scale_space_validity_pyramid(validity, _NUM_SCALES)
+    )
+    nv_pyramid_upsampled = _upsample_pyramid(
+        scale_space_validity_pyramid(normals_valid, _NUM_SCALES)
+    )
+
+    def _pyramid_any(pyr):
+        if not pyr:
+            return np.zeros(tuple(int(s) for s in full_size), dtype=np.float32)
+        out = np.asarray(pyr[0]).astype(np.float32)
+        for lvl in pyr[1:]:
+            out = np.maximum(out, np.asarray(lvl).astype(np.float32))
+        return out
+
+    validity_ss = _pyramid_any(pyramid_upsampled)
+    normals_valid_ss = _pyramid_any(nv_pyramid_upsampled)
 
     merged_masks_np = [
         m.detach().cpu().numpy().astype(np.float32)
@@ -640,6 +664,8 @@ def _compute_training_output(
         "validity": validity[0, 0].detach().cpu().numpy(),    # (Z, Y, X)
         "normals_valid": normals_valid[0, 0].detach().cpu().numpy(),
         "validity_pyramid": pyramid_upsampled,                # list of (Z, Y, X)
+        "validity_ss": validity_ss,                           # (Z, Y, X)
+        "normals_valid_ss": normals_valid_ss,                 # (Z, Y, X)
         "merge_groups": list(merge_groups_batch[0]) if merge_groups_batch else [],
         "merged_surface_masks": merged_masks_np,              # list of (Z, Y, X)
         "merged_chain_info": merged_chain_info,               # list[dict]
@@ -1126,6 +1152,18 @@ def _render_sample_figure(
         # splatting step, same mask the training dir loss uses.
         normals_valid_full = training_output["normals_valid"]  # (Z, Y, X)
         nv_slices_full = _plane_slices(normals_valid_full, cz, cy, cx)
+        # Scale-space any-valid masks — used for the ss-sum panels so
+        # the thicker (dilated) residual footprint from coarse scales
+        # is actually drawn instead of being NaN'd out by the scale-0
+        # mask.
+        validity_ss_full = training_output.get("validity_ss")
+        normals_valid_ss_full = training_output.get("normals_valid_ss")
+        if validity_ss_full is None:
+            validity_ss_full = validity
+        if normals_valid_ss_full is None:
+            normals_valid_ss_full = normals_valid_full
+        valid_ss_slices = _plane_slices(validity_ss_full, cz, cy, cx)
+        nv_ss_slices = _plane_slices(normals_valid_ss_full, cz, cy, cx)
         # Shared vmax for grad_mag computed once on GT, reused for pred.
         gm_vmax = _auto_vmax(grad_mag_gt, validity > 0.5, percentile=99.0)
 
@@ -1160,7 +1198,7 @@ def _render_sample_figure(
             ddir_ss_slices = _plane_slices(diff_dir_ss, cz, cy, cx)
             dir_diff_vmax = max(
                 _auto_vmax(diff_dir_full, normals_valid_full > 0.5, 99.0),
-                _auto_vmax(diff_dir_ss, normals_valid_full > 0.5, 99.0),
+                _auto_vmax(diff_dir_ss, normals_valid_ss_full > 0.5, 99.0),
             )
             # Pred direction channels padded/cropped to vis size (Z=Y=X)
             # for both decoded-axis and fused arrow rows.
@@ -1179,11 +1217,11 @@ def _render_sample_figure(
             # Shared diff vmax across full + ss for the same channel
             cos_diff_vmax = max(
                 _auto_vmax(diff_cos_full, validity > 0.5, 99.0),
-                _auto_vmax(diff_cos_ss, validity > 0.5, 99.0),
+                _auto_vmax(diff_cos_ss, validity_ss_full > 0.5, 99.0),
             )
             mag_diff_vmax = max(
                 _auto_vmax(diff_mag_full, validity > 0.5, 99.0),
-                _auto_vmax(diff_mag_ss, validity > 0.5, 99.0),
+                _auto_vmax(diff_mag_ss, validity_ss_full > 0.5, 99.0),
             )
 
         def _draw_cos_panel(ax, slc):
@@ -1213,8 +1251,12 @@ def _render_sample_figure(
                         if gi < 2:
                             _draw_cos_panel(ax, slices[col])
                         else:
+                            mask_slices = (
+                                valid_ss_slices if gi == 3
+                                else valid_slices_full
+                            )
                             _draw_diff_panel(
-                                ax, slices[col], valid_slices_full[col],
+                                ax, slices[col], mask_slices[col],
                                 cos_diff_vmax,
                             )
                         ax.set_title(
@@ -1249,8 +1291,12 @@ def _render_sample_figure(
                                       interpolation="nearest",
                                       vmin=0.0, vmax=gm_vmax)
                         else:
+                            mask_slices = (
+                                valid_ss_slices if gi == 3
+                                else valid_slices_full
+                            )
                             _draw_diff_panel(
-                                ax, slices[col], valid_slices_full[col],
+                                ax, slices[col], mask_slices[col],
                                 mag_diff_vmax,
                             )
                         ax.set_xticks([]); ax.set_yticks([])
@@ -1286,8 +1332,11 @@ def _render_sample_figure(
                 for col in range(3):
                     for gi, (gname, slices) in enumerate(groups):
                         ax = axes[col * 2 + gi]
+                        mask_slices = (
+                            nv_ss_slices if gi == 1 else nv_slices_full
+                        )
                         _draw_diff_panel(
-                            ax, slices[col], nv_slices_full[col],
+                            ax, slices[col], mask_slices[col],
                             dir_diff_vmax,
                         )
                         ax.set_title(
