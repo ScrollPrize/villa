@@ -78,7 +78,7 @@ class _DiskCacheStore(zarr.abc.store.Store):
     """
 
     def __init__(self, remote: zarr.abc.store.Store, cache_dir: str, url: str,
-                 offline: bool = False, retry_budget_seconds: float = 600.0) -> None:
+                 offline: bool = False, retry_budget_seconds: float = 0.0) -> None:
         super().__init__(read_only=True)
         self._remote = remote
         self._offline = offline
@@ -109,7 +109,14 @@ class _DiskCacheStore(zarr.abc.store.Store):
         OfflineCacheMiss, etc.) propagate immediately. After the budget is
         exhausted, the last exception is re-raised so callers crash with a
         meaningful traceback rather than silently dropping data.
+
+        When `_retry_budget_seconds <= 0` the wrapper short-circuits and
+        passes through to `self._remote.get` with zero overhead — preserving
+        the original (non-retry) behavior for callers that don't opt in.
         """
+        if self._retry_budget_seconds <= 0.0:
+            return await self._remote.get(key, prototype, byte_range=byte_range)
+
         deadline = time.monotonic() + self._retry_budget_seconds
         delay = 1.0
         attempt = 0
@@ -343,7 +350,7 @@ def open_zarr(path, scale=None, auth_json_path=None, config=None):
             )
         cache_dir = str(_resolve_config_relative_path(cache_dir, config) or cache_dir)
         offline = bool(config.get('volume_cache_offline', False))
-        retry_budget = float(config.get('volume_cache_retry_seconds', 600.0))
+        retry_budget = float(config.get('volume_cache_retry_seconds', 0.0))
 
     if is_http:
         storage_opts = {}
