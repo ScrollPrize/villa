@@ -566,7 +566,13 @@ def train(
 
     # Dataset
     print(f"{TAG} building dataset...", flush=True)
-    full_dataset = TifxyzLasagnaDataset(config, apply_augmentation=False)
+    # include_geometry + include_patch_ref are required for the full
+    # render_batch_figure path (arrow drawers + fresh inference crop).
+    full_dataset = TifxyzLasagnaDataset(
+        config, apply_augmentation=False,
+        include_geometry=True,
+        include_patch_ref=True,
+    )
 
     n = len(full_dataset)
     # Fixed 10-sample val set, deterministically spread across the
@@ -645,6 +651,10 @@ def train(
     )
     arch_patch = int(model_patch_size) if model_patch_size else int(patch_size)
     vis_ctx["model_build_patch_size"] = arch_patch
+    # Run vis inference at the model's native build patch size, so
+    # --model-patch-size controls the CT crop fed to the vis model.
+    vis_ctx["inference_size_eff"] = arch_patch
+    vis_ctx["compare_size"] = min(int(patch_size), arch_patch)
     vis_ctx["output_sigmoid"] = bool(output_sigmoid)
     vis_ctx["loss_weights"] = (float(w_cos), float(w_mag), float(w_dir))
     vis_out_dir = run_dir / "vis"
@@ -663,6 +673,10 @@ def train(
             out_path = vis_out_dir / f"{tag}_step_{step:07d}.jpg"
             was_training = model.training
             model.eval()
+            # Release fragmented free blocks so the vis inference
+            # forward can find a contiguous activation buffer.
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             try:
                 render_batch_figure(
                     batch_for_vis, out_path, title,
@@ -673,6 +687,8 @@ def train(
             finally:
                 if was_training:
                     model.train()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             img_rgb = np.asarray(Image.open(out_path).convert("RGB"))
             writer.add_image(
                 f"{tag}/full_vis", img_rgb, step, dataformats="HWC",
