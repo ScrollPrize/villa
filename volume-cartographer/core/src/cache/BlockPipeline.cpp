@@ -102,7 +102,17 @@ BlockPipeline::BlockPipeline(
     , source_(std::move(source))
     , decompress_(std::move(decompress))
     , ioPool_(config_.ioThreads)
-    , blockCache_(BlockCache::Config{config_.bytes})
+    , blockCache_([&] {
+        // Reserve a small residency floor per pyramid level so a coarse
+        // fallback image is always available even under heavy fine-level
+        // pressure. 4096 blocks = 16 MiB per level = ~32 canonical 128^3
+        // chunks — enough for a viewport-worth at any level. Floors are
+        // clamped inside BlockCache if they'd overwhelm the arena.
+        BlockCache::Config bcfg;
+        bcfg.bytes = config_.bytes;
+        for (auto& f : bcfg.levelFloor) f = 4096;
+        return bcfg;
+      }())
 {
     // Scan the on-disk cache once at startup so the stats bar reports
     // actual usage instead of "0 GB / 0 shards" until we write something.

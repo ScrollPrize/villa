@@ -6,6 +6,10 @@
 
 namespace vc::cache {
 
+// Upper bound on pyramid levels (levels 0..kMaxLevels-1). Real pipelines
+// use up to 6; the extra headroom costs nothing.
+constexpr int kMaxLevels = 8;
+
 // Identifies a chunk in a multi-resolution volume pyramid.
 // All indices use logical (z, y, x) order.
 struct ChunkKey {

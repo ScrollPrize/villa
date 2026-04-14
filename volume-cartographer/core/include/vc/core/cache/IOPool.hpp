@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <deque>
@@ -65,7 +66,11 @@ private:
     enum class ShardState : uint8_t { Queued, InFlight, Done };
 
     std::unordered_map<ShardKey, ShardState, ShardKeyHash> shards_;
-    std::deque<ShardKey> queue_;
+    // One queue per pyramid level. popNext() drains the coarsest (highest
+    // level index) non-empty queue first, so low-res chunks stream in ahead
+    // of high-res for the same viewport.
+    std::array<std::deque<ShardKey>, kMaxLevels> queues_;
+    size_t queueTotal_ = 0;
 
     bool shutdown_ = false;
 

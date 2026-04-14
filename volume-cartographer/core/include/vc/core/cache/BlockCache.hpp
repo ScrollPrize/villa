@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -8,6 +9,8 @@
 #include <vector>
 
 #include <utils/hash.hpp>
+
+#include "ChunkKey.hpp"
 
 namespace vc::cache {
 
@@ -53,6 +56,13 @@ class BlockCache {
 public:
     struct Config {
         size_t bytes = 10ULL << 30;   // 10 GiB default
+
+        // Per-level residency floor, in slots. A level's blocks are protected
+        // from eviction while that level's occupancy is at or below its
+        // floor. Caller must keep the sum of floors well below the total
+        // slot count (e.g. <= capacity/2) so the clock sweep can always
+        // make progress. Zero means "no protection" for that level.
+        std::array<size_t, kMaxLevels> levelFloor{};
     };
 
     explicit BlockCache(Config cfg);
@@ -94,6 +104,11 @@ private:
     std::vector<uint64_t> usedBits_;
     size_t occupiedCount_ = 0;
     size_t clockHand_ = 0;
+
+    // Occupancy and floor per pyramid level. Blocks at a level with
+    // occupancy <= floor are protected from the clock sweep.
+    std::array<size_t, kMaxLevels> levelOccupied_{};
+    std::array<size_t, kMaxLevels> levelFloor_{};
 
     static constexpr size_t bitWord(size_t i) noexcept { return i >> 6; }
     static constexpr uint64_t bitMask(size_t i) noexcept { return uint64_t(1) << (i & 63u); }

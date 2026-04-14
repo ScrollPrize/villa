@@ -18,6 +18,16 @@ BlockCache::BlockCache(Config cfg)
     nSlots_ = config_.bytes / sizeof(Block);
     arenaBytes_ = nSlots_ * sizeof(Block);
 
+    levelFloor_ = config_.levelFloor;
+    size_t totalFloor = 0;
+    for (auto f : levelFloor_) totalFloor += f;
+    // Keep at least half the arena unprotected so the clock sweep always has
+    // candidates. Oversubscribed floors are clamped proportionally.
+    if (nSlots_ && totalFloor > nSlots_ / 2) {
+        double scale = double(nSlots_ / 2) / double(totalFloor);
+        for (auto& f : levelFloor_) f = size_t(double(f) * scale);
+    }
+
     // Anonymous private mmap: virtual region committed, physical pages arrive
     // on first touch. Kernel manages paging; we can madvise(MADV_DONTNEED) on
     // individual slots to release physical pages back while keeping the
@@ -86,16 +96,31 @@ void BlockCache::put(const BlockKey& key, const uint8_t* src) noexcept
     setUsed(slot, true);
     slotKey_[slot] = key;
     map_[key] = slot;
+    if (key.level >= 0 && key.level < kMaxLevels)
+        levelOccupied_[key.level]++;
 }
 
 size_t BlockCache::reclaimSlotLocked()
 {
+    // Clock sweep with per-level floor protection. A slot is "protected"
+    // while its level's occupancy is at or below that level's floor — the
+    // sweep walks past such slots without clearing their used bit, so they
+    // can't win eviction. Config guarantees sum(floors) <= nSlots_/2, so a
+    // non-protected victim always exists when the arena is full.
     for (;;) {
         size_t i = clockHand_;
         clockHand_ = (clockHand_ + 1) % nSlots_;
         if (!isOccupied(i)) continue;
+        const BlockKey& k = slotKey_[i];
+        const bool protectedSlot =
+            (k.level >= 0 && k.level < kMaxLevels)
+            && (levelOccupied_[k.level] <= levelFloor_[k.level]);
+        if (protectedSlot) continue;
         if (!isUsed(i)) {
-            map_.erase(slotKey_[i]);
+            if (k.level >= 0 && k.level < kMaxLevels
+                && levelOccupied_[k.level] > 0)
+                levelOccupied_[k.level]--;
+            map_.erase(k);
             slotKey_[i] = kEmptyKey;
             return i;
         }
@@ -118,6 +143,7 @@ void BlockCache::clear()
     std::fill(usedBits_.begin(), usedBits_.end(), 0);
     occupiedCount_ = 0;
     clockHand_ = 0;
+    levelOccupied_.fill(0);
     // Tell kernel we don't need any of these pages for now.
     if (arena_ && arenaBytes_) {
         ::madvise(arena_, arenaBytes_, MADV_DONTNEED);
