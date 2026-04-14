@@ -39,6 +39,7 @@ Flags:
 | `--seed` | `0` | Seed for the per-dataset deterministic shuffle. |
 | `--patch-size` | config value | Override `patch_size` from the config. |
 | `--num-workers` | `os.cpu_count()` | DataLoader workers for parallel per-sample extraction *and* thread-pool size for parallel render/save. `0` runs everything on the main thread. |
+| `--model` | `None` | Optional checkpoint path. When set, runs inference on the same image the dataset hands to training, computes per-channel losses (same `ScaleSpaceLoss3D` instances training uses), and adds rows for prediction + residuals. Loss values are printed in the figure title. **The checkpoint's `patch_size` is read first and overrides both `--patch-size` and the dataset config's `patch_size`** — `NetworkFromConfig.autoconfigure` derives the encoder stage count from patch size, so any mismatch would silently load a wrong architecture. The checkpoint is loaded **strictly**: any missing or unexpected state-dict key raises `RuntimeError`. For old checkpoints that don't embed `patch_size`, the loader falls back to a sibling `config.json` (the file `train_tifxyz.train` writes alongside checkpoints). |
 
 The command iterates each entry in `config.datasets`, builds a
 single-dataset `TifxyzLasagnaDataset`, deterministically shuffles its
@@ -89,6 +90,21 @@ rendered for the rest):
 | 5 | Validity mask at full scale |
 | 6 | Validity mask at scale 1 (pooled by 2, erosion of `1 − mask`) |
 | 7 | Validity mask at scale 2 (pooled by 2 again) |
+
+When `--model` is passed, four additional rows are appended:
+
+| Row | Content |
+|---|---|
+| 8 | `pred cos`, `gray`, `[0, 1]` |
+| 9 | `pred grad_mag`, `viridis`, auto-ranged |
+| 10 | Per-voxel `cos` residual `(pred − target)² · mask` at full res, `hot`, auto-ranged |
+| 11 | Per-voxel `grad_mag` residual `smooth_l1(pred, target) · mask` at full res, `hot`, auto-ranged |
+| 12 | `cos` scale-space residual sum: residuals at every level of the same masked-average pyramid `ScaleSpaceLoss3D` uses, upsampled nearest to full res and summed across scales. Shows where the multi-scale loss is being charged. |
+| 13 | `grad_mag` scale-space residual sum (same construction with `smooth_l1`) |
+
+Per-channel loss values (`loss_cos`, `loss_mag`, `loss_dir`, `total`)
+are computed with the exact same `ScaleSpaceLoss3D` instances the
+training loop uses and added to the figure title.
 
 The scale-space pyramid is built by calling
 `tifxyz_labels.scale_space_validity_pyramid`, which is the same helper

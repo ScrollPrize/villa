@@ -29,7 +29,15 @@ def main() -> None:
     vis.add_argument("--seed", type=int, default=0,
                      help="Seed for deterministic shuffle (default: 0).")
     vis.add_argument("--patch-size", type=int, default=None,
-                     help="Override patch_size from the config.")
+                     help="Patch size for model construction (architecture "
+                          "autoconfigures from this). With --model, only "
+                          "needed as fallback for checkpoints that don't "
+                          "embed patch_size.")
+    vis.add_argument("--model", type=str, default=None,
+                     help="Optional checkpoint path. If set, runs inference "
+                          "and adds rows for prediction + diff (full + "
+                          "scale-space sum). Loss values are added to the "
+                          "title.")
     vis.add_argument("--num-workers", type=int, default=None,
                      help="DataLoader workers for parallel extraction "
                           "and render thread pool size. Default: number "
@@ -47,6 +55,7 @@ def main() -> None:
             seed=args.seed,
             patch_size=args.patch_size,
             num_workers=args.num_workers,
+            model_path=args.model,
         )
         return
 

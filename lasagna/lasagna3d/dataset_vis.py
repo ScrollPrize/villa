@@ -141,6 +141,172 @@ def _sample_from_batch(batch: dict) -> dict:
     }
 
 
+_MODEL_CACHE: dict = {}
+
+
+def _read_checkpoint_meta(model_path: str, patch_size_override: int | None = None) -> dict:
+    """Read architecture metadata (patch_size, norm_type, upsample_mode)
+    from a checkpoint. Falls back to the sibling ``config.json`` (the
+    file ``train_tifxyz.train`` writes next to checkpoints) for old
+    checkpoints that don't embed ``patch_size``.
+    """
+    import torch
+    ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+    meta = {}
+    if isinstance(ckpt, dict):
+        for k in ("patch_size", "norm_type", "upsample_mode",
+                  "in_channels", "out_channels"):
+            if k in ckpt:
+                meta[k] = ckpt[k]
+
+    if "patch_size" not in meta:
+        sibling = Path(model_path).parent / "config.json"
+        if sibling.is_file():
+            try:
+                with open(sibling, "r") as f:
+                    cfg = json.load(f)
+                if "patch_size" in cfg:
+                    meta["patch_size"] = int(cfg["patch_size"])
+                for k in ("norm_type", "upsample_mode"):
+                    if k in cfg and k not in meta:
+                        meta[k] = cfg[k]
+            except Exception:
+                pass
+
+    if patch_size_override is not None:
+        meta["patch_size"] = int(patch_size_override)
+
+    if "patch_size" not in meta:
+        raise ValueError(
+            f"Cannot determine patch_size for checkpoint {model_path}: "
+            f"not in the checkpoint dict and no sibling config.json with "
+            f"patch_size. Either pass --patch-size <N> (the patch size "
+            f"the model was trained at) or re-train with the updated "
+            f"train_tifxyz.py that embeds patch_size in the checkpoint."
+        )
+    return meta
+
+
+def _load_model(model_path: str, patch_size: int, device):
+    """Build + load a checkpoint once per run (strict), cache by path."""
+    from train_tifxyz import build_model
+    key = (model_path, patch_size, str(device))
+    if key not in _MODEL_CACHE:
+        model, _, _ = build_model(
+            patch_size=patch_size, device=str(device), weights=model_path,
+            strict=True,
+        )
+        model.eval()
+        _MODEL_CACHE[key] = model
+    return _MODEL_CACHE[key]
+
+
+def _scale_space_residual_sum(pred, target, mask, num_scales: int, kind: str):
+    """Per-voxel residual at every scale (matching ScaleSpaceLoss3D pooling),
+    upsampled to full res and summed. Used to visualize where the
+    multi-scale loss is being charged.
+    """
+    import torch
+    import torch.nn.functional as F
+    from tifxyz_labels import scale_space_pool_validity
+
+    full_size = pred.shape[2:]
+    x, y = pred, target
+    m = (mask > 0.5).float()
+    total = torch.zeros_like(pred)
+    for scale in range(num_scales):
+        if kind == "mse":
+            r = (x - y) ** 2 * m
+        else:
+            r = F.smooth_l1_loss(x, y, reduction="none") * m
+        if r.shape[2:] != full_size:
+            r = F.interpolate(r, size=full_size, mode="nearest")
+        total = total + r
+        if scale == num_scales - 1 or x.size(2) < 2 or x.size(3) < 2 or x.size(4) < 2:
+            break
+        eps = 1e-6
+        m_count = F.avg_pool3d(m, kernel_size=2, stride=2)
+        denom = m_count.clamp_min(eps)
+        x = F.avg_pool3d(x * m, kernel_size=2, stride=2) / denom
+        y = F.avg_pool3d(y * m, kernel_size=2, stride=2) / denom
+        m = scale_space_pool_validity(m)
+    return total
+
+
+def _compute_inference_output(batch, training_output, model_path, device):
+    """Run the model, compute losses (same path as training), and produce
+    per-channel diff maps (full-res masked residual + scale-space sum).
+    Returns ``None`` if CUDA / model load fail.
+    """
+    import torch
+    import torch.nn.functional as F
+    from train_tifxyz import MaskedMSE, MaskedSmoothL1, ScaleSpaceLoss3D
+
+    if not torch.cuda.is_available() or training_output is None:
+        return None
+
+    try:
+        image = batch["image"].to(device, non_blocking=True)
+        # patch_size is resolved up in `run_dataset_vis` from the
+        # checkpoint metadata and used to override the dataset config,
+        # so image.shape[-1] is now guaranteed to match.
+        patch_size = int(image.shape[-1])
+        model = _load_model(model_path, patch_size, device)
+
+        targets_np = training_output["targets"]
+        validity_np = training_output["validity"]
+        normals_valid_np = training_output["normals_valid"]
+        targets_t = torch.from_numpy(targets_np).unsqueeze(0).to(device)
+        validity_t = torch.from_numpy(validity_np).view(1, 1, *validity_np.shape).to(device)
+        normals_valid_t = torch.from_numpy(normals_valid_np).view(
+            1, 1, *normals_valid_np.shape).to(device)
+
+        with torch.no_grad():
+            results = model(image)
+            pred = torch.sigmoid(results["output"])
+
+        cos_mask = validity_t
+        dir_mask = (normals_valid_t > 0.5).float()
+
+        sl_mse = ScaleSpaceLoss3D(MaskedMSE(), num_scales=_NUM_SCALES)
+        sl_l1 = ScaleSpaceLoss3D(MaskedSmoothL1(), num_scales=_NUM_SCALES)
+
+        with torch.no_grad():
+            loss_cos = sl_mse(pred[:, 0:1], targets_t[:, 0:1], mask=cos_mask).item()
+            loss_mag = sl_l1(pred[:, 1:2], targets_t[:, 1:2], mask=cos_mask).item()
+            loss_dir = sl_mse(
+                pred[:, 2:8], targets_t[:, 2:8], mask=dir_mask,
+            ).item()
+
+            cos_diff_full = ((pred[:, 0:1] - targets_t[:, 0:1]) ** 2 * cos_mask)
+            mag_diff_full = (
+                F.smooth_l1_loss(pred[:, 1:2], targets_t[:, 1:2], reduction="none")
+                * cos_mask
+            )
+            cos_diff_ss = _scale_space_residual_sum(
+                pred[:, 0:1], targets_t[:, 0:1], cos_mask, _NUM_SCALES, "mse",
+            )
+            mag_diff_ss = _scale_space_residual_sum(
+                pred[:, 1:2], targets_t[:, 1:2], cos_mask, _NUM_SCALES, "l1",
+            )
+
+        return {
+            "pred_cos": pred[0, 0].detach().cpu().numpy(),
+            "pred_mag": pred[0, 1].detach().cpu().numpy(),
+            "diff_cos_full": cos_diff_full[0, 0].detach().cpu().numpy(),
+            "diff_mag_full": mag_diff_full[0, 0].detach().cpu().numpy(),
+            "diff_cos_ss": cos_diff_ss[0, 0].detach().cpu().numpy(),
+            "diff_mag_ss": mag_diff_ss[0, 0].detach().cpu().numpy(),
+            "loss_cos": loss_cos,
+            "loss_mag": loss_mag,
+            "loss_dir": loss_dir,
+            "loss_total": loss_cos + loss_mag + loss_dir,
+        }
+    except Exception as exc:
+        print(f"{TAG} WARNING: inference failed ({exc})", flush=True)
+        return None
+
+
 def _compute_training_output(batch: dict):
     """Run ``compute_batch_targets`` on one batch and package numpy arrays.
 
@@ -268,6 +434,7 @@ def _render_sample_figure(
     out_path: Path,
     title: str,
     arrow_seed: int = 0,
+    inference_output: dict | None = None,
 ) -> None:
     image = sample["image"][0].numpy()                  # (Z, Y, X)
     surface_masks = sample["surface_masks"].numpy()      # (N, Z, Y, X)
@@ -357,6 +524,74 @@ def _render_sample_figure(
                         )
                 return _draw
             rows.append((f"validity s{scale_idx}", _make_drawer(scale_slices)))
+
+        if inference_output is not None:
+            pred_cos = inference_output["pred_cos"]
+            pred_mag = inference_output["pred_mag"]
+            diff_cos_full = inference_output["diff_cos_full"]
+            diff_mag_full = inference_output["diff_mag_full"]
+            diff_cos_ss = inference_output["diff_cos_ss"]
+            diff_mag_ss = inference_output["diff_mag_ss"]
+
+            pred_cos_slices = _plane_slices(pred_cos, cz, cy, cx)
+            pred_mag_slices = _plane_slices(pred_mag, cz, cy, cx)
+            dcos_full_slices = _plane_slices(diff_cos_full, cz, cy, cx)
+            dmag_full_slices = _plane_slices(diff_mag_full, cz, cy, cx)
+            dcos_ss_slices = _plane_slices(diff_cos_ss, cz, cy, cx)
+            dmag_ss_slices = _plane_slices(diff_mag_ss, cz, cy, cx)
+
+            pred_mag_vmax = _auto_vmax(pred_mag, validity > 0.5, percentile=99.0)
+            dcos_full_vmax = _auto_vmax(diff_cos_full, validity > 0.5, 99.0)
+            dmag_full_vmax = _auto_vmax(diff_mag_full, validity > 0.5, 99.0)
+            dcos_ss_vmax = _auto_vmax(diff_cos_ss, validity > 0.5, 99.0)
+            dmag_ss_vmax = _auto_vmax(diff_mag_ss, validity > 0.5, 99.0)
+
+            def draw_pred_cos(axes):
+                for col, ax in enumerate(axes):
+                    ax.imshow(pred_cos_slices[col], cmap="gray",
+                              interpolation="nearest", vmin=0.0, vmax=1.0)
+                    ax.set_title(f"pred cos  {plane_names[col]}", fontsize=9)
+            rows.append(("pred cos", draw_pred_cos))
+
+            def draw_pred_mag(axes):
+                for col, ax in enumerate(axes):
+                    ax.imshow(image_disp[col], cmap="gray",
+                              interpolation="nearest", alpha=0.35)
+                    ax.imshow(pred_mag_slices[col], cmap="viridis",
+                              interpolation="nearest",
+                              vmin=0.0, vmax=pred_mag_vmax)
+                    ax.set_title(
+                        f"pred grad_mag (vmax={pred_mag_vmax:.3g})  "
+                        f"{plane_names[col]}", fontsize=9)
+            rows.append(("pred grad_mag", draw_pred_mag))
+
+            def _make_diff_drawer(slices, vmax, label):
+                def _draw(axes):
+                    for col, ax in enumerate(axes):
+                        ax.imshow(image_disp[col], cmap="gray",
+                                  interpolation="nearest", alpha=0.35)
+                        disp = np.where(
+                            valid_slices_full[col] > 0.5, slices[col], np.nan)
+                        ax.imshow(disp, cmap="hot",
+                                  interpolation="nearest",
+                                  vmin=0.0, vmax=vmax)
+                        ax.set_title(
+                            f"{label} (vmax={vmax:.3g})  "
+                            f"{plane_names[col]}", fontsize=8)
+                return _draw
+
+            rows.append(("cos residual full",
+                         _make_diff_drawer(dcos_full_slices, dcos_full_vmax,
+                                           "cos resid full")))
+            rows.append(("grad_mag residual full",
+                         _make_diff_drawer(dmag_full_slices, dmag_full_vmax,
+                                           "grad_mag resid full")))
+            rows.append(("cos residual ss",
+                         _make_diff_drawer(dcos_ss_slices, dcos_ss_vmax,
+                                           "cos resid ss-sum")))
+            rows.append(("grad_mag residual ss",
+                         _make_diff_drawer(dmag_ss_slices, dmag_ss_vmax,
+                                           "grad_mag resid ss-sum")))
     else:
         def _skip(axes):
             for ax in axes:
@@ -377,7 +612,16 @@ def _render_sample_figure(
             ax.set_xticks([])
             ax.set_yticks([])
 
-    fig.suptitle(title, fontsize=9)
+    full_title = title
+    if inference_output is not None:
+        full_title = (
+            f"{title}\n"
+            f"loss_cos={inference_output['loss_cos']:.4f}  "
+            f"loss_mag={inference_output['loss_mag']:.4f}  "
+            f"loss_dir={inference_output['loss_dir']:.4f}  "
+            f"total={inference_output['loss_total']:.4f}"
+        )
+    fig.suptitle(full_title, fontsize=9)
     fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.99))
     fig.savefig(out_path, dpi=110, format="jpeg")
     plt.close(fig)
@@ -403,6 +647,7 @@ def run_dataset_vis(
     seed: int = 0,
     patch_size: int | None = None,
     num_workers: int | None = None,
+    model_path: str | None = None,
 ) -> None:
     """Render visualization JPEGs for samples from each dataset.
 
@@ -425,6 +670,28 @@ def run_dataset_vis(
         config = json.load(f)
     if patch_size is not None:
         config["patch_size"] = patch_size
+
+    # When --model is set, the checkpoint dictates the architecture
+    # (NetworkFromConfig.autoconfigure derives stage count from patch
+    # size), so we MUST run the dataset at the same patch size the
+    # checkpoint was trained on. Read the checkpoint metadata up front
+    # and override config["patch_size"] before the dataset is built.
+    if model_path is not None:
+        meta = _read_checkpoint_meta(model_path, patch_size_override=patch_size)
+        ckpt_patch = int(meta["patch_size"])
+        prev_patch = config.get("patch_size")
+        if prev_patch is not None and int(prev_patch) != ckpt_patch:
+            print(
+                f"{TAG} checkpoint patch_size={ckpt_patch} — overriding "
+                f"dataset patch_size {prev_patch}",
+                flush=True,
+            )
+        else:
+            print(
+                f"{TAG} checkpoint patch_size={ckpt_patch}",
+                flush=True,
+            )
+        config["patch_size"] = ckpt_patch
 
     out_dir = Path(vis_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -491,6 +758,14 @@ def run_dataset_vis(
                 sample = _sample_from_batch(batch)
                 training_output = _compute_training_output(batch)
 
+                inference_output = None
+                if model_path is not None:
+                    import torch
+                    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+                    inference_output = _compute_inference_output(
+                        batch, training_output, model_path, device,
+                    )
+
                 n_wraps = int(sample["num_surfaces"])
                 n_chains = (
                     len({c["chain"] for c in sample["surface_chain_info"]})
@@ -507,7 +782,7 @@ def run_dataset_vis(
                 fut = render_pool.submit(
                     _render_sample_figure,
                     sample, training_output, out_path,
-                    title, seed + idx,
+                    title, seed + idx, inference_output,
                 )
                 pending.append((i, idx, out_path, fut))
 

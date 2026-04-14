@@ -312,6 +312,7 @@ def build_model(
     norm_type: Optional[str] = None,
     upsample_mode: Optional[str] = None,
     batch_size: int = 2,
+    strict: bool = False,
 ) -> Tuple[nn.Module, str, str]:
     ckpt = None
     if weights is not None:
@@ -321,6 +322,15 @@ def build_model(
                 norm_type = ckpt.get("norm_type", "instance")
             if upsample_mode is None:
                 upsample_mode = ckpt.get("upsample_mode", "transpconv")
+            if strict:
+                ckpt_patch = ckpt.get("patch_size")
+                if ckpt_patch is not None and int(ckpt_patch) != int(patch_size):
+                    raise ValueError(
+                        f"Strict load: patch_size mismatch — checkpoint "
+                        f"was trained at {ckpt_patch}, caller asked for "
+                        f"{patch_size}. The architecture autoconfigures "
+                        f"on patch size; they must match."
+                    )
     if norm_type is None:
         norm_type = "instance"
     if upsample_mode is None:
@@ -350,18 +360,33 @@ def build_model(
             state_dict = ckpt["state_dict"]
         else:
             state_dict = ckpt
-        model_state = model.state_dict()
-        filtered = {k: v for k, v in state_dict.items()
-                    if k in model_state and model_state[k].shape == v.shape}
-        missing = [k for k in model_state if k not in filtered]
-        skipped = [k for k in state_dict if k not in filtered]
-        model_state.update(filtered)
-        model.load_state_dict(model_state)
-        print(f"{TAG} loaded {len(filtered)}/{len(model_state)} params from {weights}")
-        if skipped:
-            print(f"{TAG} skipped from checkpoint: {skipped[:5]}{'...' if len(skipped) > 5 else ''}")
-        if missing:
-            print(f"{TAG} randomly initialized: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+        if strict:
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+            if missing or unexpected:
+                raise RuntimeError(
+                    f"Strict checkpoint load failed for {weights}:\n"
+                    f"  missing ({len(missing)}): "
+                    f"{list(missing)[:5]}{'...' if len(missing) > 5 else ''}\n"
+                    f"  unexpected ({len(unexpected)}): "
+                    f"{list(unexpected)[:5]}{'...' if len(unexpected) > 5 else ''}\n"
+                    f"This usually means the checkpoint was trained with a "
+                    f"different patch_size / norm_type / upsample_mode than "
+                    f"the caller asked for."
+                )
+            print(f"{TAG} loaded {len(state_dict)} params (strict) from {weights}")
+        else:
+            model_state = model.state_dict()
+            filtered = {k: v for k, v in state_dict.items()
+                        if k in model_state and model_state[k].shape == v.shape}
+            missing = [k for k in model_state if k not in filtered]
+            skipped = [k for k in state_dict if k not in filtered]
+            model_state.update(filtered)
+            model.load_state_dict(model_state)
+            print(f"{TAG} loaded {len(filtered)}/{len(model_state)} params from {weights}")
+            if skipped:
+                print(f"{TAG} skipped from checkpoint: {skipped[:5]}{'...' if len(skipped) > 5 else ''}")
+            if missing:
+                print(f"{TAG} randomly initialized: {missing[:5]}{'...' if len(missing) > 5 else ''}")
 
     return model, norm_type, upsample_mode
 
@@ -602,6 +627,9 @@ def train(
             "norm_type": norm_type,
             "upsample_mode": upsample_mode,
             "precision": precision,
+            "patch_size": patch_size,
+            "in_channels": 1,
+            "out_channels": 8,
         }
         torch.save(ckpt_data, run_dir / "model_current.pt")
         if val_loss < best_val_loss:
