@@ -255,7 +255,8 @@ def _read_checkpoint_meta(model_path: str, patch_size_override: int | None = Non
     meta = {}
     if isinstance(ckpt, dict):
         for k in ("patch_size", "norm_type", "upsample_mode",
-                  "in_channels", "out_channels", "output_sigmoid"):
+                  "in_channels", "out_channels", "output_sigmoid",
+                  "w_cos", "w_mag", "w_dir"):
             if k in ckpt:
                 meta[k] = ckpt[k]
 
@@ -373,7 +374,8 @@ def _compute_inference_output(batch, training_output, model_path, device,
                               model_build_patch_size: int,
                               inference_size: int,
                               compare_size: int,
-                              output_sigmoid: bool):
+                              output_sigmoid: bool,
+                              loss_weights: tuple = (1.0, 1.0, 1.0)):
     """Run the model on a fresh CT crop centered on the patch's world
     bbox, then compute losses + residual maps cropped to `compare_size`.
     Returns ``None`` if CUDA / model load fail.
@@ -424,12 +426,6 @@ def _compute_inference_output(batch, training_output, model_path, device,
             .float()
             .unsqueeze(0).unsqueeze(0)
             .to(device, non_blocking=True)
-        )
-        print(
-            f"{TAG} forward: input={tuple(img_for_model.shape)}  "
-            f"world_min={tuple(int(v) for v in min_corner)}  "
-            f"world_max={tuple(int(v) for v in max_corner)}",
-            flush=True,
         )
 
         targets_np = training_output["targets"]
@@ -515,6 +511,14 @@ def _compute_inference_output(batch, training_output, model_path, device,
             "loss_mag": loss_mag,
             "loss_dir": loss_dir,
             "loss_total": loss_cos + loss_mag + loss_dir,
+            "w_cos": float(loss_weights[0]),
+            "w_mag": float(loss_weights[1]),
+            "w_dir": float(loss_weights[2]),
+            "loss_weighted_total": (
+                float(loss_weights[0]) * loss_cos
+                + float(loss_weights[1]) * loss_mag
+                + float(loss_weights[2]) * loss_dir
+            ),
             "inference_size": int(inference_size),
             "compare_size": int(compare_size),
         }
@@ -921,38 +925,30 @@ def _render_sample_figure(
             n_panels_norm = 6
             def draw_row_grid_normals(sf):
                 axes = sf.subplots(1, 6)
-                # Cols 0..2 GT; cols 3..5 pred.
-                for col in range(3):
-                    ax = axes[col]
-                    ax.imshow(image_disp[col], cmap="gray",
-                              interpolation="nearest",
-                              vmin=0, vmax=600)
-                    _draw_grid_normal_arrows(
-                        ax, direction_channels, normals_valid,
-                        plane_keys[col], plane_coords[col],
-                        color="#22c55e",
-                    )
-                    ax.set_title(f"GT  {plane_names[col]}", fontsize=9)
-                    ax.set_xticks([]); ax.set_yticks([])
-
                 # pred_dir is at inference_size; pad/crop to dataset
                 # patch size so the grid arrows align with the GT panel.
                 pred_dir = _center_crop_or_pad_3d(
                     inference_output["pred_dir"], normals_valid.shape[-1],
                     pad_value=0.0,
                 )
+                # Per axis: GT then pred.
                 for col in range(3):
-                    ax = axes[3 + col]
-                    ax.imshow(image_disp[col], cmap="gray",
-                              interpolation="nearest",
-                              vmin=0, vmax=600)
-                    _draw_grid_normal_arrows(
-                        ax, pred_dir, normals_valid,
-                        plane_keys[col], plane_coords[col],
-                        color="#f97316",
-                    )
-                    ax.set_title(f"pred  {plane_names[col]}", fontsize=9)
-                    ax.set_xticks([]); ax.set_yticks([])
+                    for gi, (gname, dc, qc) in enumerate([
+                        ("GT", direction_channels, "#22c55e"),
+                        ("pred", pred_dir, "#f97316"),
+                    ]):
+                        ax = axes[col * 2 + gi]
+                        ax.imshow(image_disp[col], cmap="gray",
+                                  interpolation="nearest",
+                                  vmin=0, vmax=600)
+                        _draw_grid_normal_arrows(
+                            ax, dc, normals_valid,
+                            plane_keys[col], plane_coords[col],
+                            color=qc,
+                        )
+                        ax.set_title(
+                            f"{gname}  {plane_names[col]}", fontsize=9)
+                        ax.set_xticks([]); ax.set_yticks([])
             rows.append(("normals grid (GT | pred)", draw_row_grid_normals, n_panels_norm))
         else:
             def draw_row_grid_normals(sf):
@@ -1064,10 +1060,10 @@ def _render_sample_figure(
                     (f"|p−t| (vmax={cos_diff_vmax:.3g})", dcos_full_slices),
                     (f"ss-sum (vmax={cos_diff_vmax:.3g})", dcos_ss_slices),
                 ]
-                for gi, (gname, slices) in enumerate(groups):
-                    for col in range(3):
-                        ax = axes[gi * 3 + col]
-                        if gi < 2:  # GT / pred → grayscale 0..1
+                for col in range(3):
+                    for gi, (gname, slices) in enumerate(groups):
+                        ax = axes[col * 4 + gi]
+                        if gi < 2:
                             _draw_cos_panel(ax, slices[col])
                         else:
                             _draw_diff_panel(
@@ -1096,9 +1092,9 @@ def _render_sample_figure(
                     (f"|p−t|", dmag_full_slices, "hot"),
                     (f"ss-sum", dmag_ss_slices, "hot"),
                 ]
-                for gi, (gname, slices, cmap) in enumerate(groups):
-                    for col in range(3):
-                        ax = axes[gi * 3 + col]
+                for col in range(3):
+                    for gi, (gname, slices, cmap) in enumerate(groups):
+                        ax = axes[col * 4 + gi]
                         if gi < 2:
                             disp = np.where(
                                 valid_slices_full[col] > 0.5, slices[col], np.nan)
@@ -1140,9 +1136,9 @@ def _render_sample_figure(
                     (f"|p−t| (vmax={dir_diff_vmax:.3g})", ddir_full_slices),
                     (f"ss-sum (vmax={dir_diff_vmax:.3g})", ddir_ss_slices),
                 ]
-                for gi, (gname, slices) in enumerate(groups):
-                    for col in range(3):
-                        ax = axes[gi * 3 + col]
+                for col in range(3):
+                    for gi, (gname, slices) in enumerate(groups):
+                        ax = axes[col * 2 + gi]
                         _draw_diff_panel(
                             ax, slices[col], nv_slices_full[col],
                             dir_diff_vmax,
@@ -1161,32 +1157,24 @@ def _render_sample_figure(
             if fused_ok:
                 def draw_row_grid_fused(sf):
                     axes = sf.subplots(1, 6)
+                    entries = [
+                        ("GT fused", nx_gt, ny_gt, nz_gt, "#22c55e"),
+                        ("pred fused", nx_pr, ny_pr, nz_pr, "#f97316"),
+                    ]
                     for col in range(3):
-                        ax = axes[col]
-                        ax.imshow(image_disp[col], cmap="gray",
-                                  interpolation="nearest",
-                                  vmin=0, vmax=600)
-                        _draw_grid_fused_arrows(
-                            ax, nx_gt, ny_gt, nz_gt, normals_valid,
-                            plane_keys[col], plane_coords[col],
-                            color="#22c55e",
-                        )
-                        ax.set_title(f"GT fused  {plane_names[col]}",
-                                     fontsize=9)
-                        ax.set_xticks([]); ax.set_yticks([])
-                    for col in range(3):
-                        ax = axes[3 + col]
-                        ax.imshow(image_disp[col], cmap="gray",
-                                  interpolation="nearest",
-                                  vmin=0, vmax=600)
-                        _draw_grid_fused_arrows(
-                            ax, nx_pr, ny_pr, nz_pr, normals_valid,
-                            plane_keys[col], plane_coords[col],
-                            color="#f97316",
-                        )
-                        ax.set_title(f"pred fused  {plane_names[col]}",
-                                     fontsize=9)
-                        ax.set_xticks([]); ax.set_yticks([])
+                        for gi, (gname, nx, ny, nz, qc) in enumerate(entries):
+                            ax = axes[col * 2 + gi]
+                            ax.imshow(image_disp[col], cmap="gray",
+                                      interpolation="nearest",
+                                      vmin=0, vmax=600)
+                            _draw_grid_fused_arrows(
+                                ax, nx, ny, nz, normals_valid,
+                                plane_keys[col], plane_coords[col],
+                                color=qc,
+                            )
+                            ax.set_title(
+                                f"{gname}  {plane_names[col]}", fontsize=9)
+                            ax.set_xticks([]); ax.set_yticks([])
                 rows.append(
                     ("normals dense (fused)", draw_row_grid_fused, 6))
 
@@ -1194,32 +1182,23 @@ def _render_sample_figure(
             # channels. Per-surface colors (matching row 1 contours).
             def draw_row_surface_axis(sf):
                 axes = sf.subplots(1, 6)
+                entries = [
+                    ("GT axis on-surface", direction_channels),
+                    ("pred axis on-surface", pred_dir_padded),
+                ]
                 for col in range(3):
-                    ax = axes[col]
-                    ax.imshow(image_disp[col], cmap="gray",
-                              interpolation="nearest",
-                              vmin=0, vmax=600)
-                    _draw_surface_axis_arrows(
-                        ax, direction_channels, surface_geometry,
-                        plane_keys[col], plane_coords[col], arrow_seed,
-                    )
-                    ax.set_title(
-                        f"GT axis on-surface  {plane_names[col]}",
-                        fontsize=9)
-                    ax.set_xticks([]); ax.set_yticks([])
-                for col in range(3):
-                    ax = axes[3 + col]
-                    ax.imshow(image_disp[col], cmap="gray",
-                              interpolation="nearest",
-                              vmin=0, vmax=600)
-                    _draw_surface_axis_arrows(
-                        ax, pred_dir_padded, surface_geometry,
-                        plane_keys[col], plane_coords[col], arrow_seed,
-                    )
-                    ax.set_title(
-                        f"pred axis on-surface  {plane_names[col]}",
-                        fontsize=9)
-                    ax.set_xticks([]); ax.set_yticks([])
+                    for gi, (gname, dc) in enumerate(entries):
+                        ax = axes[col * 2 + gi]
+                        ax.imshow(image_disp[col], cmap="gray",
+                                  interpolation="nearest",
+                                  vmin=0, vmax=600)
+                        _draw_surface_axis_arrows(
+                            ax, dc, surface_geometry,
+                            plane_keys[col], plane_coords[col], arrow_seed,
+                        )
+                        ax.set_title(
+                            f"{gname}  {plane_names[col]}", fontsize=9)
+                        ax.set_xticks([]); ax.set_yticks([])
             rows.append(
                 ("normals on-surface (axis)", draw_row_surface_axis, 6))
 
@@ -1227,32 +1206,23 @@ def _render_sample_figure(
             if fused_ok:
                 def draw_row_surface_fused(sf):
                     axes = sf.subplots(1, 6)
+                    entries = [
+                        ("GT fused on-surface", nx_gt, ny_gt, nz_gt),
+                        ("pred fused on-surface", nx_pr, ny_pr, nz_pr),
+                    ]
                     for col in range(3):
-                        ax = axes[col]
-                        ax.imshow(image_disp[col], cmap="gray",
-                                  interpolation="nearest",
-                                  vmin=0, vmax=600)
-                        _draw_surface_fused_arrows(
-                            ax, nx_gt, ny_gt, nz_gt, surface_geometry,
-                            plane_keys[col], plane_coords[col], arrow_seed,
-                        )
-                        ax.set_title(
-                            f"GT fused on-surface  {plane_names[col]}",
-                            fontsize=9)
-                        ax.set_xticks([]); ax.set_yticks([])
-                    for col in range(3):
-                        ax = axes[3 + col]
-                        ax.imshow(image_disp[col], cmap="gray",
-                                  interpolation="nearest",
-                                  vmin=0, vmax=600)
-                        _draw_surface_fused_arrows(
-                            ax, nx_pr, ny_pr, nz_pr, surface_geometry,
-                            plane_keys[col], plane_coords[col], arrow_seed,
-                        )
-                        ax.set_title(
-                            f"pred fused on-surface  {plane_names[col]}",
-                            fontsize=9)
-                        ax.set_xticks([]); ax.set_yticks([])
+                        for gi, (gname, nx, ny, nz) in enumerate(entries):
+                            ax = axes[col * 2 + gi]
+                            ax.imshow(image_disp[col], cmap="gray",
+                                      interpolation="nearest",
+                                      vmin=0, vmax=600)
+                            _draw_surface_fused_arrows(
+                                ax, nx, ny, nz, surface_geometry,
+                                plane_keys[col], plane_coords[col], arrow_seed,
+                            )
+                            ax.set_title(
+                                f"{gname}  {plane_names[col]}", fontsize=9)
+                            ax.set_xticks([]); ax.set_yticks([])
                 rows.append(
                     ("normals on-surface (fused)",
                      draw_row_surface_fused, 6))
@@ -1290,20 +1260,21 @@ def _render_sample_figure(
                         gt_d1 = direction_channels[c1i, :, :, pc]
                         pr_d0 = pred_dir_padded[c0i, :, :, pc]
                         pr_d1 = pred_dir_padded[c1i, :, :, pc]
-                    axes[col].imshow(_falsecolor(gt_d0, gt_d1),
-                                     interpolation="nearest")
-                    axes[col].set_title(
+                    ax_gt = axes[col * 2]
+                    ax_pr = axes[col * 2 + 1]
+                    ax_gt.imshow(_falsecolor(gt_d0, gt_d1),
+                                 interpolation="nearest")
+                    ax_gt.set_title(
                         f"GT (d{c0i},d{c1i})  {plane_names[col]}",
                         fontsize=8)
-                    axes[col].set_xticks([]); axes[col].set_yticks([])
+                    ax_gt.set_xticks([]); ax_gt.set_yticks([])
 
-                    axes[3 + col].imshow(_falsecolor(pr_d0, pr_d1),
-                                         interpolation="nearest")
-                    axes[3 + col].set_title(
+                    ax_pr.imshow(_falsecolor(pr_d0, pr_d1),
+                                 interpolation="nearest")
+                    ax_pr.set_title(
                         f"pred (d{c0i},d{c1i})  {plane_names[col]}",
                         fontsize=8)
-                    axes[3 + col].set_xticks([])
-                    axes[3 + col].set_yticks([])
+                    ax_pr.set_xticks([]); ax_pr.set_yticks([])
 
             rows.append(
                 ("direction channels (R=d0, G=d1)",
@@ -1372,7 +1343,11 @@ def _render_sample_figure(
 
     n_rows = len(rows)
     max_panels = max(n for _, _, n in rows)
-    fig = plt.figure(figsize=(2.4 * max_panels, 3.0 * n_rows))
+    title_height_in = 0.9 if has_inf else 0.6
+    fig_h = 3.0 * n_rows + title_height_in
+    fig = plt.figure(figsize=(2.4 * max_panels, fig_h))
+    top_frac = 1.0 - title_height_in / fig_h
+    fig.subplots_adjust(top=top_frac)
     subfigs = fig.subfigures(nrows=n_rows, ncols=1)
     if n_rows == 1:
         subfigs = [subfigs]
@@ -1381,14 +1356,22 @@ def _render_sample_figure(
 
     full_title = title
     if has_inf:
+        wc = inference_output["w_cos"]
+        wm = inference_output["w_mag"]
+        wd = inference_output["w_dir"]
+        lc = inference_output["loss_cos"]
+        lm = inference_output["loss_mag"]
+        ld = inference_output["loss_dir"]
+        lt = inference_output["loss_weighted_total"]
         full_title = (
             f"{title}\n"
-            f"loss_cos={inference_output['loss_cos']:.4f}  "
-            f"loss_mag={inference_output['loss_mag']:.4f}  "
-            f"loss_dir={inference_output['loss_dir']:.4f}  "
-            f"total={inference_output['loss_total']:.4f}"
+            f"loss_cos={lc:.4f} (w={wc:g})  "
+            f"loss_mag={lm:.4f} (w={wm:g})  "
+            f"loss_dir={ld:.4f} (w={wd:g})\n"
+            f"weighted total = {wc:g}·cos + {wm:g}·mag + {wd:g}·dir "
+            f"= {lt:.4f}"
         )
-    fig.suptitle(full_title, fontsize=9)
+    fig.suptitle(full_title, fontsize=10, y=0.995, va="top")
     fig.savefig(out_path, dpi=100, format="jpeg", bbox_inches="tight")
     plt.close(fig)
 
@@ -1457,6 +1440,7 @@ def run_dataset_vis(
     # size), independent of the dataset patch / inference patch.
     model_build_patch_size: int | None = None
     output_sigmoid: bool = True
+    loss_weights: tuple[float, float, float] = (1.0, 1.0, 1.0)
     if model_path is not None:
         meta = _read_checkpoint_meta(model_path, patch_size_override=patch_size)
         model_build_patch_size = int(meta["patch_size"])
@@ -1466,6 +1450,11 @@ def run_dataset_vis(
         else:
             output_sigmoid = True
             sig_src = "default (no key in checkpoint)"
+        loss_weights = (
+            float(meta.get("w_cos", 1.0)),
+            float(meta.get("w_mag", 1.0)),
+            float(meta.get("w_dir", 1.0)),
+        )
         print(
             f"{TAG} model_build={model_build_patch_size}  "
             f"dataset_patch={dataset_patch}  "
@@ -1478,6 +1467,11 @@ def run_dataset_vis(
             f"{TAG} output_sigmoid={output_sigmoid} ({sig_src}) — "
             f"{'applying torch.sigmoid' if output_sigmoid else 'using clamp(0, 1)'} "
             f"to model output",
+            flush=True,
+        )
+        print(
+            f"{TAG} loss weights: w_cos={loss_weights[0]}  "
+            f"w_mag={loss_weights[1]}  w_dir={loss_weights[2]}",
             flush=True,
         )
 
@@ -1557,6 +1551,7 @@ def run_dataset_vis(
                         inference_size_eff,
                         compare_size,
                         output_sigmoid,
+                        loss_weights,
                     )
 
                 n_wraps = int(sample["num_surfaces"])
