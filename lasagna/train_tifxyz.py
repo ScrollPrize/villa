@@ -70,6 +70,13 @@ from tifxyz_labels import (
     scale_space_pool_validity,
 )
 from tifxyz_lasagna_dataset import TifxyzLasagnaDataset, collate_variable_surfaces
+from lasagna3d.dataset_vis import (
+    build_inference_context,
+    render_batch_figure,
+    default_vis_title,
+    _sample_from_batch,
+)
+from PIL import Image
 
 
 TAG = "[train_tifxyz]"
@@ -608,6 +615,16 @@ def train(
     best_val_loss = float("inf")
     global_step = 0
 
+    # Lasagna3d-style full-vis logging: one JPEG per ~1000 samples,
+    # written to run_dir/vis and mirrored into TB as an image.
+    vis_ctx = build_inference_context(
+        model_path=None, config=config,
+        same_surface_threshold=same_surface_threshold,
+    )
+    vis_out_dir = run_dir / "vis"
+    vis_out_dir.mkdir(exist_ok=True)
+    vis_interval_steps = max(1, 1000 // max(batch_size, 1))
+
     for epoch in range(epochs):
         model.train()
         epoch_losses: List[float] = []
@@ -687,6 +704,30 @@ def train(
 
             if global_step % 100 == 0:
                 _log_vis(writer, "train", image, pred, targets, cos_mask, global_step)
+
+            if global_step % vis_interval_steps == 0:
+                try:
+                    sample0 = _sample_from_batch(batch)
+                    patch_info0 = sample0["patch_info"]
+                    ds_name = str(patch_info0.get("dataset_name",
+                                                  patch_info0.get("dataset", "train")))
+                    idx0 = int(patch_info0.get("patch_idx", global_step))
+                    title = (f"step={global_step}  "
+                             + default_vis_title(ds_name, idx0, sample0))
+                    out_path = vis_out_dir / f"step_{global_step:07d}.jpg"
+                    render_batch_figure(
+                        batch, out_path, title,
+                        arrow_seed=global_step,
+                        inference_ctx=vis_ctx,
+                    )
+                    img_rgb = np.asarray(Image.open(out_path).convert("RGB"))
+                    writer.add_image(
+                        "train/full_vis", img_rgb,
+                        global_step, dataformats="HWC",
+                    )
+                except Exception as e:
+                    print(f"{TAG} full_vis render failed at step "
+                          f"{global_step}: {e}", flush=True)
 
             global_step += 1
 
