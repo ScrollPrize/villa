@@ -569,10 +569,15 @@ def train(
     full_dataset = TifxyzLasagnaDataset(config, apply_augmentation=False)
 
     n = len(full_dataset)
-    n_val = max(1, int(n * val_fraction))
-    n_train = n - n_val
-    train_indices = list(range(n_train))
-    val_indices = list(range(n_train, n))
+    # Fixed 10-sample val set, deterministically spread across the
+    # dataset via evenly-spaced indices. `val_fraction` is ignored.
+    n_val = min(10, n)
+    val_indices = sorted({
+        int(round(i)) for i in np.linspace(0, n - 1, n_val)
+    })
+    val_set = set(val_indices)
+    train_indices = [i for i in range(n) if i not in val_set]
+    n_train = len(train_indices)
     train_dataset = Subset(full_dataset, train_indices)
     val_dataset = Subset(full_dataset, val_indices)
 
@@ -679,6 +684,9 @@ def train(
         break
     print(f"{TAG} init val={init_val_loss:.4f}", flush=True)
 
+    last_val_loss = init_val_loss
+    val_every_steps = 200
+
     for epoch in range(epochs):
         model.train()
         epoch_losses: List[float] = []
@@ -739,6 +747,48 @@ def train(
                 cos_mask = validity
                 dir_mask = (normals_valid > 0.5).float()
 
+                # Per-sample grad-mag screen: flag any sample with
+                # per-sample scale-space L1 >= 1 as an outlier, log it,
+                # and drop it from the batch for this step. Keeps the
+                # bad sample from dominating the gradient.
+                B = pred.shape[0]
+                per_mag = torch.stack([
+                    scale_loss_l1(
+                        pred[b:b+1, 1:2], targets[b:b+1, 1:2],
+                        mask=cos_mask[b:b+1],
+                    ) for b in range(B)
+                ])
+                bad = [b for b in range(B) if float(per_mag[b].item()) >= 1.0]
+                for b in bad:
+                    pi = batch["patch_info"][b]
+                    ds_b = pi.get("dataset_name", pi.get("dataset", "?"))
+                    idx_b = pi.get("patch_idx", "?")
+                    print(
+                        f"{TAG} hi-mag skip step={global_step} "
+                        f"ds={ds_b} idx={idx_b} "
+                        f"mag_loss={float(per_mag[b].item()):.4f}",
+                        flush=True,
+                    )
+                n_hi_mag += len(bad)
+                if len(bad) == B:
+                    train_iter.set_postfix(
+                        loss="---",
+                        skip=f"{100.0 * n_skipped / max(n_seen, 1):.1f}%",
+                        himag=n_hi_mag,
+                        merge=f"{100.0 * (1.0 - n_surfaces_post / max(n_surfaces_pre, 1)):.1f}%",
+                    )
+                    continue
+                if bad:
+                    keep = torch.tensor(
+                        [b for b in range(B) if b not in bad],
+                        device=pred.device, dtype=torch.long,
+                    )
+                    pred = pred.index_select(0, keep)
+                    targets = targets.index_select(0, keep)
+                    cos_mask = cos_mask.index_select(0, keep)
+                    dir_mask = dir_mask.index_select(0, keep)
+                    dir_weight = dir_weight.index_select(0, keep)
+
                 # Per-channel losses
                 loss_cos = scale_loss_mse(pred[:, 0:1], targets[:, 0:1], mask=cos_mask)
                 loss_mag = scale_loss_l1(pred[:, 1:2], targets[:, 1:2], mask=cos_mask)
@@ -766,6 +816,7 @@ def train(
                 loss=f"{loss.item():.4f}",
                 avg20=f"{running:.4f}",
                 skip=f"{100.0 * n_skipped / max(n_seen, 1):.1f}%",
+                himag=n_hi_mag,
                 merge=f"{100.0 * (1.0 - n_surfaces_post / max(n_surfaces_pre, 1)):.1f}%",
             )
 
@@ -784,19 +835,29 @@ def train(
 
             global_step += 1
 
+            # Periodic validation mid-epoch so we see val trajectory
+            # at a much higher resolution than once-per-epoch.
+            if global_step > 0 and global_step % val_every_steps == 0:
+                last_val_loss = _evaluate(
+                    model, val_loader, scale_loss_mse, scale_loss_l1,
+                    device, writer, global_step,
+                    w_cos, w_mag, w_dir,
+                    amp_dtype=amp_dtype, use_autocast=use_autocast,
+                    verbose=verbose,
+                    same_surface_threshold=same_surface_threshold,
+                    output_sigmoid=output_sigmoid,
+                )
+                for _probe_batch in val_loader:
+                    _log_full_vis(_probe_batch, "val", global_step)
+                    break
+                model.train()
+                train_iter.write(
+                    f"{TAG} step {global_step}  val={last_val_loss:.4f}"
+                )
+
         cosine_scheduler.step()
 
-        # Validation
-        val_loss = _evaluate(
-            model, val_loader, scale_loss_mse, scale_loss_l1,
-            device, writer, global_step,
-            w_cos, w_mag, w_dir,
-            amp_dtype=amp_dtype, use_autocast=use_autocast,
-            verbose=verbose,
-            same_surface_threshold=same_surface_threshold,
-            output_sigmoid=output_sigmoid,
-        )
-
+        val_loss = last_val_loss
         mean_train = sum(epoch_losses) / max(len(epoch_losses), 1)
         print(
             f"epoch {epoch + 1}/{epochs}  "
