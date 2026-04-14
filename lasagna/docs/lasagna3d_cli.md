@@ -159,6 +159,103 @@ endpoints or singletons) get a **thin** label (fontsize 7, regular).
 The title above each JPEG reports the dataset name, patch index, total wrap
 count, chain count, and the world bbox.
 
+### `dataset overlap` — per-patch surface-overlap diagnostics
+
+Scans training patches and, for each patch, measures how close
+candidate surface pairs get to intersecting. Writes one JSON line per
+patch with the worst pair's signed-distance statistics so overlapping
+segments in existing datasets can be flagged quantitatively.
+
+```bash
+PYTHONPATH=vesuvius/src/:lasagna/ python -m lasagna3d dataset overlap \
+    --train-config lasagna/configs/tifxyz_train_s3.json \
+    --out ./tmp/overlap.jsonl \
+    --num-samples 200
+```
+
+Flags:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--train-config` | *required* | Path to a lasagna training JSON config. |
+| `--out` | *required* | Output JSONL path; parent directory is created. |
+| `--num-samples` | all | Patches to scan per dataset (deterministic shuffle). |
+| `--seed` | `0` | Per-dataset shuffle seed. |
+| `--num-workers` | `os.cpu_count()` | DataLoader workers. `0` runs everything on the main thread. |
+| `--vis-dir` | `None` | If set, render a `dataset vis`-style JPEG per emitted patch into this directory (reuses `dataset_vis._render_sample_figure`, so rows, contours and normal arrows are identical to what `dataset vis` would produce for that patch). Filenames are sortable by worst-pair `p1` so `ls` puts the worst patches first. The title embeds the worst pair's labels and its post-flip `p1` / `p50` / `min` / `n_samples`. Requires CUDA for the label rows. |
+| `--vis-top-k` | `None` | With `--vis-dir`, render only the K worst patches after scanning completes (ranked by post-flip `p1`, tie-breaks by `0.1`, then `min`). Without it, every emitted patch is rendered inline during the scan. |
+
+#### Candidate pair rule
+
+A pair `(i, j)` of surfaces in a patch is considered iff:
+
+1. They share the same `chain` in `surface_chain_info`,
+2. `|pos_i - pos_j| == 1` (consecutive in that chain), and
+3. `segment_idx_i != segment_idx_j` (different source segment files).
+
+These are the only pairs that can reasonably duplicate each other
+given how `build_patch_chains` links wraps.
+
+#### Signed distance sampling
+
+For each candidate pair `(A, B)` the command computes a 3D
+Euclidean distance transform of `~mask_B` on CUDA with
+`return_indices=True` (via CuPy). Each raw surface point `P` on `A`
+(from `surface_geometry[A].points_local`, the same tensor the dataset
+already splats to produce direction channels) is queried against
+`dist_B` and the feature-transform indices give the nearest voxel
+`P'` on `B`. Sign comes from `A`'s own normal at `P`:
+
+```
+d_signed(P) = |P - P'| · sign((P - P') · n_A(P))
+```
+
+Intersection appears as negative samples in the lower tail of the
+distribution.
+
+#### Stats and sign flip
+
+For the signed samples of each pair we compute `min`, `max`, and
+percentiles at `[0.1, 1, 5, 15, 25, 50, 75, 85, 95, 99, 99.9]`.
+If the raw median is negative, all samples are negated before stats
+are computed so the **reported median is always ≥ 0**. The record
+field `sign_flipped` records whether that happened. Ranking between
+pairs and across patches still uses the post-flip `p1` — intersection
+severity shows up as a negative `p1` (and possibly `0.1`, `min`).
+
+Per patch the command picks the pair with the lowest `p1`
+(tie-break: `0.1`, then `min`) and writes a record of the form:
+
+```json
+{
+  "dataset": "s3",
+  "dataset_idx": 0,
+  "patch_idx": 1742,
+  "world_bbox": [z0, z1, y0, y1, x0, x1],
+  "num_surfaces": 6,
+  "num_pairs_considered": 3,
+  "num_pairs_evaluated": 3,
+  "worst_pair": {
+    "a": {"surface_slot": 2, "wrap_idx": 2, "label": "a1",
+          "segment_idx": 11, "segment_path": "…/w12_seg_a.tifxyz"},
+    "b": {"surface_slot": 3, "wrap_idx": 3, "label": "a2",
+          "segment_idx": 14, "segment_path": "…/w12_seg_b.tifxyz"},
+    "n_samples": 8421,
+    "min": -3.2, "max": 17.8,
+    "percentiles": {"0.1": -2.9, "1": -1.7, "5": 0.2, "15": 1.1,
+                    "25": 2.4, "50": 4.6, "75": 7.2, "85": 8.9,
+                    "95": 12.1, "99": 15.4, "99.9": 17.1},
+    "sign_flipped": false
+  }
+}
+```
+
+Patches with zero candidate pairs (e.g. a single surface, or all
+surfaces from the same source segment) are silently skipped.
+After all datasets finish, a top-20 ranking by `p1` is printed to
+stdout so worst-offending patches are easy to spot and re-render with
+`dataset vis`.
+
 ## Adding new subcommands
 
 The package layout is:

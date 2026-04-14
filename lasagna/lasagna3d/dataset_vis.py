@@ -1384,6 +1384,131 @@ def _dataset_display_name(dataset_cfg: dict, fallback_idx: int) -> str:
     return f"dataset{fallback_idx}"
 
 
+def default_vis_filename(ds_name: str, idx: int) -> str:
+    """Canonical JPEG filename used by `dataset vis` — shared so other
+    commands that render via `render_batch_figure` produce identically
+    named files for the same (dataset, index). Keyed only on the
+    stable dataset patch index, not on enumeration order."""
+    return f"{ds_name}_idx{idx:06d}.jpg"
+
+
+def default_vis_title(ds_name: str, idx: int, sample: dict) -> str:
+    """Canonical figure title used by `dataset vis`."""
+    n_wraps = int(sample["num_surfaces"])
+    n_chains = (
+        len({c["chain"] for c in sample["surface_chain_info"]})
+        if sample["surface_chain_info"] else 0
+    )
+    return (
+        f"{ds_name}  idx={idx}  wraps={n_wraps}  chains={n_chains}\n"
+        f"bbox={sample['patch_info']['world_bbox']}"
+    )
+
+
+def build_inference_context(
+    model_path: str | None,
+    config: dict,
+    patch_size: int | None = None,
+    inference_tile_size: int | None = None,
+) -> dict:
+    """Load checkpoint meta and derive all knobs `_compute_inference_output`
+    needs. Returns a dict that's also safe when ``model_path is None``
+    (the ``model_path`` field is then ``None`` and callers should skip
+    inference entirely).
+
+    This is the single source of truth for `dataset vis` and any other
+    command (e.g. `dataset overlap --vis-dir`) that renders the same
+    figure.
+    """
+    dataset_patch = int(config["patch_size"])
+    inference_size_eff = (
+        int(inference_tile_size) if inference_tile_size else dataset_patch
+    )
+    compare_size = min(dataset_patch, inference_size_eff)
+    vis_size = dataset_patch
+
+    ctx = {
+        "model_path": model_path,
+        "dataset_patch": dataset_patch,
+        "inference_size_eff": inference_size_eff,
+        "compare_size": compare_size,
+        "vis_size": vis_size,
+        "model_build_patch_size": None,
+        "output_sigmoid": True,
+        "loss_weights": (1.0, 1.0, 1.0),
+    }
+
+    if model_path is None:
+        return ctx
+
+    meta = _read_checkpoint_meta(model_path, patch_size_override=patch_size)
+    ctx["model_build_patch_size"] = int(meta["patch_size"])
+    if "output_sigmoid" in meta:
+        ctx["output_sigmoid"] = bool(meta["output_sigmoid"])
+        sig_src = "checkpoint"
+    else:
+        ctx["output_sigmoid"] = True
+        sig_src = "default (no key in checkpoint)"
+    ctx["loss_weights"] = (
+        float(meta.get("w_cos", 1.0)),
+        float(meta.get("w_mag", 1.0)),
+        float(meta.get("w_dir", 1.0)),
+    )
+    print(
+        f"{TAG} model_build={ctx['model_build_patch_size']}  "
+        f"dataset_patch={dataset_patch}  "
+        f"inference={inference_size_eff}  "
+        f"compare={compare_size}  "
+        f"vis={vis_size}",
+        flush=True,
+    )
+    print(
+        f"{TAG} output_sigmoid={ctx['output_sigmoid']} ({sig_src}) — "
+        f"{'applying torch.sigmoid' if ctx['output_sigmoid'] else 'using clamp(0, 1)'} "
+        f"to model output",
+        flush=True,
+    )
+    print(
+        f"{TAG} loss weights: w_cos={ctx['loss_weights'][0]}  "
+        f"w_mag={ctx['loss_weights'][1]}  w_dir={ctx['loss_weights'][2]}",
+        flush=True,
+    )
+    return ctx
+
+
+def render_batch_figure(
+    batch: dict,
+    out_path: Path,
+    title: str,
+    arrow_seed: int,
+    inference_ctx: dict,
+) -> None:
+    """End-to-end: compute training_output (+ optional inference_output)
+    and write the JPEG. Mirrors what `run_dataset_vis` does for a single
+    batch, so alternate commands render an identical figure.
+    """
+    sample = _sample_from_batch(batch)
+    training_output = _compute_training_output(batch)
+
+    inference_output = None
+    if inference_ctx.get("model_path") is not None:
+        import torch
+        device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+        inference_output = _compute_inference_output(
+            batch, training_output, inference_ctx["model_path"], device,
+            inference_ctx["model_build_patch_size"],
+            inference_ctx["inference_size_eff"],
+            inference_ctx["compare_size"],
+            inference_ctx["output_sigmoid"],
+            inference_ctx["loss_weights"],
+        )
+
+    _render_sample_figure(
+        sample, training_output, out_path, title, arrow_seed,
+        inference_output,
+    )
+
+
 def run_dataset_vis(
     train_config: str,
     vis_dir: str,
@@ -1393,6 +1518,7 @@ def run_dataset_vis(
     num_workers: int | None = None,
     model_path: str | None = None,
     inference_tile_size: int | None = None,
+    explicit_indices: list[int] | None = None,
 ) -> None:
     """Render visualization JPEGs for samples from each dataset.
 
@@ -1418,57 +1544,12 @@ def run_dataset_vis(
     # checkpoints that don't embed `patch_size`. The dataset always uses the
     # training config's own `patch_size` (so GT, surface masks, validity,
     # cache, etc. match training exactly).
-
-    # The dataset uses the training config patch size for everything:
-    # patch finding, surface mask voxelization, GT computation. The
-    # inference flag does NOT affect the dataset — we only feed the
-    # model a separately-read CT crop of size `inference_size`.
-    dataset_patch = int(config["patch_size"])
-    inference_size_eff = (
-        int(inference_tile_size) if inference_tile_size else dataset_patch
+    inference_ctx = build_inference_context(
+        model_path=model_path,
+        config=config,
+        patch_size=patch_size,
+        inference_tile_size=inference_tile_size,
     )
-    compare_size = min(dataset_patch, inference_size_eff)
-    vis_size = dataset_patch
-
-    # When --model is set, the checkpoint determines the architecture
-    # (NetworkFromConfig.autoconfigure derives stage count from patch
-    # size), independent of the dataset patch / inference patch.
-    model_build_patch_size: int | None = None
-    output_sigmoid: bool = True
-    loss_weights: tuple[float, float, float] = (1.0, 1.0, 1.0)
-    if model_path is not None:
-        meta = _read_checkpoint_meta(model_path, patch_size_override=patch_size)
-        model_build_patch_size = int(meta["patch_size"])
-        if "output_sigmoid" in meta:
-            output_sigmoid = bool(meta["output_sigmoid"])
-            sig_src = "checkpoint"
-        else:
-            output_sigmoid = True
-            sig_src = "default (no key in checkpoint)"
-        loss_weights = (
-            float(meta.get("w_cos", 1.0)),
-            float(meta.get("w_mag", 1.0)),
-            float(meta.get("w_dir", 1.0)),
-        )
-        print(
-            f"{TAG} model_build={model_build_patch_size}  "
-            f"dataset_patch={dataset_patch}  "
-            f"inference={inference_size_eff}  "
-            f"compare={compare_size}  "
-            f"vis={vis_size}",
-            flush=True,
-        )
-        print(
-            f"{TAG} output_sigmoid={output_sigmoid} ({sig_src}) — "
-            f"{'applying torch.sigmoid' if output_sigmoid else 'using clamp(0, 1)'} "
-            f"to model output",
-            flush=True,
-        )
-        print(
-            f"{TAG} loss weights: w_cos={loss_weights[0]}  "
-            f"w_mag={loss_weights[1]}  w_dir={loss_weights[2]}",
-            flush=True,
-        )
 
     out_dir = Path(vis_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1507,9 +1588,19 @@ def run_dataset_vis(
                   flush=True)
             continue
 
-        indices = list(range(n_total))
-        random.Random(seed + ds_idx).shuffle(indices)
-        indices = indices[: min(num_samples, n_total)]
+        if explicit_indices is not None:
+            indices = [k for k in explicit_indices if 0 <= k < n_total]
+            if len(indices) != len(explicit_indices):
+                dropped = sorted(set(explicit_indices) - set(indices))
+                print(
+                    f"{TAG} [{ds_idx}] '{ds_name}': dropping out-of-range "
+                    f"indices {dropped} (valid range 0..{n_total - 1})",
+                    flush=True,
+                )
+        else:
+            indices = list(range(n_total))
+            random.Random(seed + ds_idx).shuffle(indices)
+            indices = indices[: min(num_samples, n_total)]
 
         print(
             f"{TAG} [{ds_idx}] '{ds_name}': rendering {len(indices)} / {n_total} "
@@ -1534,38 +1625,12 @@ def run_dataset_vis(
             for i, batch in enumerate(loader):
                 idx = indices[i]
                 sample = _sample_from_batch(batch)
-                training_output = _compute_training_output(batch)
-
-                inference_output = None
-                if model_path is not None:
-                    import torch
-                    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
-                    inference_output = _compute_inference_output(
-                        batch, training_output, model_path, device,
-                        model_build_patch_size,
-                        inference_size_eff,
-                        compare_size,
-                        output_sigmoid,
-                        loss_weights,
-                    )
-
-                n_wraps = int(sample["num_surfaces"])
-                n_chains = (
-                    len({c["chain"] for c in sample["surface_chain_info"]})
-                    if sample["surface_chain_info"] else 0
-                )
-                title = (
-                    f"{ds_name}  idx={idx}  wraps={n_wraps}  chains={n_chains}\n"
-                    f"bbox={sample['patch_info']['world_bbox']}"
-                )
-                out_path = (
-                    out_dir / f"{ds_name}_sample{i:03d}_idx{idx:06d}.jpg"
-                )
+                title = default_vis_title(ds_name, idx, sample)
+                out_path = out_dir / default_vis_filename(ds_name, idx)
 
                 fut = render_pool.submit(
-                    _render_sample_figure,
-                    sample, training_output, out_path,
-                    title, seed + idx, inference_output,
+                    render_batch_figure,
+                    batch, out_path, title, seed + idx, inference_ctx,
                 )
                 pending.append((i, idx, out_path, fut))
 
