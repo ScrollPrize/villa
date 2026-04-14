@@ -1227,16 +1227,20 @@ void CAdaptiveVolumeViewer::updateStatusLabel()
             .arg(unit);
 
         if (s.sharded) {
-            status += QString(" | dl %1sh w %2sh io %3 neg %4")
+            status += QString(" | dl %1sh w %2sh dlq %3 enq %4 ldq %5 neg %6")
                 .arg(s.iceFetches)
                 .arg(s.diskWrites)
-                .arg(s.ioPending)
+                .arg(s.downloadPending)
+                .arg(s.encodePending)
+                .arg(s.loadPending)
                 .arg(s.negativeCount);
         } else {
-            status += QString(" | dl %1 w %2 io %3 neg %4")
+            status += QString(" | dl %1 w %2 dlq %3 enq %4 ldq %5 neg %6")
                 .arg(s.iceFetches)
                 .arg(s.diskWrites)
-                .arg(s.ioPending)
+                .arg(s.downloadPending)
+                .arg(s.encodePending)
+                .arg(s.loadPending)
                 .arg(s.negativeCount);
         }
     }

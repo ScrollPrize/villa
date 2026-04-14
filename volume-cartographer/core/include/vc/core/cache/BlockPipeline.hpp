@@ -6,9 +6,11 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -31,7 +33,13 @@ namespace vc::cache {
 class BlockPipeline {
 public:
     struct Config {
-        size_t bytes = 10ULL << 30;  // 10 GiB
+        size_t bytes = 10ULL << 30;          // 10 GiB block cache
+        // RAM cache of compressed canonical h265 shard files. The loader
+        // pool checks this before hitting disk; on a miss it reads the
+        // whole shard file once and caches it, so subsequent inner-chunk
+        // reads from the same shard are zero-syscall memcpy. Set to 0 to
+        // disable shard caching (loader goes straight to disk every time).
+        size_t shardCacheBytes = 1ULL << 30; // 1 GiB default
         std::string volumeId;
         // Defaults to hardware_concurrency(); see constructor.
         int ioThreads = 0;
@@ -103,7 +111,14 @@ public:
         uint64_t iceFetches = 0;
         uint64_t misses = 0;
         size_t blocks = 0;
-        size_t ioPending = 0;
+        size_t ioPending = 0;             // total across all pools (compat)
+        size_t downloadPending = 0;        // s3 → staged ChunkData queue
+        size_t encodePending = 0;          // staged ChunkData → h265 disk queue
+        size_t loadPending = 0;            // disk → ram queue
+        uint64_t shardHits = 0;            // loader found shard in RAM cache
+        uint64_t shardMisses = 0;          // loader had to read shard from disk
+        size_t shardCacheBytes = 0;        // current shard cache occupancy
+        size_t shardCacheEntries = 0;
         uint64_t diskWrites = 0;
         size_t negativeCount = 0;
         size_t diskBytes = 0;
@@ -119,16 +134,58 @@ private:
     std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels_;
     std::unique_ptr<VolumeSource> source_;
     DecompressFn decompress_;
-    // Two fully independent pools.
-    //   downloaderPool_ does s3 → canonical h265 → disk. That's its whole
-    //     job. It never touches the block cache.
-    //   loaderPool_ does disk → decode → insert into block cache. It
-    //     never touches the network.
+    // Three fully independent pools — each specialised for one stage so no
+    // stage can starve another.
+    //   downloaderPool_ : s3 fetch + source decode + re-chunk → staged
+    //     ChunkData. Network-bound. Never touches disk or block cache.
+    //   encodePool_     : take staged ChunkData → h265 encode → disk.
+    //     CPU-bound. Never touches the network or block cache.
+    //   loaderPool_     : disk read → h265 decode → insert block cache.
+    //     Mixed disk/CPU. Never touches the network.
     // Submission in fetchInteractive triages on the disk shard index:
     // present → loaderPool_ directly; absent → downloaderPool_, whose
-    // completion callback hands the key off to loaderPool_.
+    // completion forwards to encodePool_, whose completion forwards to
+    // loaderPool_.
     IOPool downloaderPool_;
+    IOPool encodePool_;
     IOPool loaderPool_;
+    // Hand-off buffer between downloader and encoder. Download inserts
+    // (key → decoded ChunkData) after assembling, encoder takes it out.
+    mutable std::mutex encodeStagingMutex_;
+    std::unordered_map<ChunkKey, ChunkDataPtr, ChunkKeyHash> encodeStaging_;
+
+    // Shard-level LRU cache of compressed canonical h265 shard files.
+    // Populated on loader misses. Bytes-budgeted; when exceeded the
+    // least-recently-used shard is evicted. shared_ptr on the buffer so
+    // concurrent loaders can serve from the same shard without the cache
+    // mutex blocking them.
+    mutable std::mutex shardCacheMutex_;
+    struct ShardCacheEntry {
+        ShardKey key;
+        std::shared_ptr<std::vector<std::byte>> bytes;
+    };
+    std::list<ShardCacheEntry> shardCacheLru_;  // front = most recent
+    std::unordered_map<ShardKey,
+                       std::list<ShardCacheEntry>::iterator,
+                       ShardKeyHash> shardCacheMap_;
+    size_t shardCacheTotalBytes_ = 0;
+    // Hits/misses so the status bar can surface them.
+    std::atomic<uint64_t> statShardHits_{0};
+    std::atomic<uint64_t> statShardMisses_{0};
+
+    // Translate a ChunkKey into the shard it lives in (zarr v3 sharded
+    // grid coordinates). Empty/non-sharded arrays return the zero shard.
+    [[nodiscard]] ShardKey canonicalShardKey(const ChunkKey& key) const noexcept;
+
+    // Pull the whole shard file for `key` through the LRU cache. First
+    // hit from any thread reads the file once; subsequent hits just bump
+    // the LRU head and return the shared buffer.
+    std::shared_ptr<std::vector<std::byte>> shardBytesFor(
+        const ChunkKey& key, utils::ZarrArray& dz);
+
+    // Insert into the shard cache, evicting LRU until under budget.
+    void shardCacheInsertLocked(const ShardKey& sk,
+                                std::shared_ptr<std::vector<std::byte>> bytes);
 
     BlockCache blockCache_;
 

@@ -51,6 +51,89 @@ static bool diskShardMarksChunkEmpty(utils::ZarrArray& dz, const ChunkKey& key) 
     return dz.inner_chunk_is_empty(chunkIndices(key));
 }
 
+ShardKey BlockPipeline::canonicalShardKey(const ChunkKey& key) const noexcept
+{
+    if (key.level < 0 || key.level >= int(diskLevels_.size())) return {};
+    const auto* dz = diskLevels_[key.level].get();
+    if (!dz || !dz->is_sharded()) return {key.level, 0, 0, 0};
+    const auto& m = dz->metadata();
+    auto bpcZ = m.sub_chunks_per_shard(0);
+    auto bpcY = m.sub_chunks_per_shard(1);
+    auto bpcX = m.sub_chunks_per_shard(2);
+    ShardKey sk{key.level, 0, 0, 0};
+    sk.sz = bpcZ ? key.iz / int(bpcZ) : key.iz;
+    sk.sy = bpcY ? key.iy / int(bpcY) : key.iy;
+    sk.sx = bpcX ? key.ix / int(bpcX) : key.ix;
+    return sk;
+}
+
+void BlockPipeline::shardCacheInsertLocked(
+    const ShardKey& sk,
+    std::shared_ptr<std::vector<std::byte>> bytes)
+{
+    if (!bytes || bytes->empty()) return;
+    const size_t budget = config_.shardCacheBytes;
+    if (budget == 0) return;
+    const size_t entrySize = bytes->size();
+    if (entrySize > budget) return;  // single shard too big for budget
+
+    // Remove existing entry for this key, if any.
+    if (auto it = shardCacheMap_.find(sk); it != shardCacheMap_.end()) {
+        shardCacheTotalBytes_ -= it->second->bytes ? it->second->bytes->size() : 0;
+        shardCacheLru_.erase(it->second);
+        shardCacheMap_.erase(it);
+    }
+    // Evict LRU until we fit.
+    while (!shardCacheLru_.empty()
+           && shardCacheTotalBytes_ + entrySize > budget) {
+        auto& victim = shardCacheLru_.back();
+        shardCacheTotalBytes_ -= victim.bytes ? victim.bytes->size() : 0;
+        shardCacheMap_.erase(victim.key);
+        shardCacheLru_.pop_back();
+    }
+    shardCacheLru_.push_front({sk, std::move(bytes)});
+    shardCacheMap_[sk] = shardCacheLru_.begin();
+    shardCacheTotalBytes_ += entrySize;
+}
+
+std::shared_ptr<std::vector<std::byte>> BlockPipeline::shardBytesFor(
+    const ChunkKey& key, utils::ZarrArray& dz)
+{
+    if (config_.shardCacheBytes == 0) return nullptr;
+    const ShardKey sk = canonicalShardKey(key);
+
+    // Fast path: hit under the cache mutex, move entry to LRU head.
+    {
+        std::lock_guard lk(shardCacheMutex_);
+        auto it = shardCacheMap_.find(sk);
+        if (it != shardCacheMap_.end()) {
+            shardCacheLru_.splice(shardCacheLru_.begin(),
+                                   shardCacheLru_, it->second);
+            statShardHits_.fetch_add(1, std::memory_order_relaxed);
+            return it->second->bytes;
+        }
+    }
+
+    // Miss — do the disk read outside the cache lock so concurrent hits
+    // on other shards aren't blocked behind our I/O.
+    statShardMisses_.fetch_add(1, std::memory_order_relaxed);
+    auto raw = dz.read_whole_shard(chunkIndices(key));
+    if (!raw || raw->empty()) return nullptr;
+    auto bytes = std::make_shared<std::vector<std::byte>>(std::move(*raw));
+
+    std::lock_guard lk(shardCacheMutex_);
+    // Another thread may have raced us to populate this shard; prefer
+    // the entry already in the cache to keep `shared_ptr` identity
+    // consistent across concurrent reads.
+    if (auto it = shardCacheMap_.find(sk); it != shardCacheMap_.end()) {
+        shardCacheLru_.splice(shardCacheLru_.begin(),
+                               shardCacheLru_, it->second);
+        return it->second->bytes;
+    }
+    shardCacheInsertLocked(sk, bytes);
+    return bytes;
+}
+
 // Decode a canonical h265 chunk from disk bytes. Uses the video header for
 // dims; independent of any source VcDataset.
 static ChunkDataPtr decodeCanonicalH265(const std::vector<uint8_t>& compressed) {
@@ -101,12 +184,21 @@ BlockPipeline::BlockPipeline(
     , diskLevels_(std::move(diskLevels))
     , source_(std::move(source))
     , decompress_(std::move(decompress))
+    // Thread sizing: oversubscribe the I/O-bound pools (download & load)
+    // to 2× hardware_concurrency so a worker is always ready when a chunk
+    // lands. The encode pool is pure CPU x265 work — size it to exactly
+    // hardware_concurrency so a burst of encodes doesn't thrash cores.
     , downloaderPool_(config_.ioThreads > 0
                   ? config_.ioThreads
-                  : (std::thread::hardware_concurrency() ?
-                     static_cast<int>(std::thread::hardware_concurrency()) : 8))
-    , loaderPool_(std::thread::hardware_concurrency() ?
-                     static_cast<int>(std::thread::hardware_concurrency()) : 8)
+                  : (std::thread::hardware_concurrency()
+                     ? 2 * static_cast<int>(std::thread::hardware_concurrency())
+                     : 16))
+    , encodePool_(std::thread::hardware_concurrency()
+                     ? static_cast<int>(std::thread::hardware_concurrency())
+                     : 8)
+    , loaderPool_(std::thread::hardware_concurrency()
+                     ? 2 * static_cast<int>(std::thread::hardware_concurrency())
+                     : 16)
     , blockCache_([&] {
         // Reserve a small residency floor per pyramid level so a coarse
         // fallback image is always available even under heavy fine-level
@@ -145,19 +237,21 @@ BlockPipeline::BlockPipeline(
                 initialDiskShards_, double(initialDiskBytes_) / (1024.0 * 1024.0));
     }
 
-    // Shard mapper is identity for both pools: each canonical chunk is its
-    // own work unit. HttpSource's internal shard cache still amortizes S3
-    // GETs across chunks that fall in the same source shard.
+    // Shard mapper is identity for all three pools: each canonical chunk
+    // is its own work unit. HttpSource's internal shard cache still
+    // amortizes S3 GETs across chunks that fall in the same source shard.
     auto shardMapper = [](const ChunkKey& key) -> ShardKey {
         return {key.level, key.iz, key.iy, key.ix};
     };
     downloaderPool_.setShardMapper(shardMapper);
+    encodePool_.setShardMapper(shardMapper);
     loaderPool_.setShardMapper(shardMapper);
 
-    // Downloader: s3 (or local filesystem source) → canonical h265 → disk.
-    // Never touches the block cache. Its completion callback hands the key
-    // off to the loader so the chunk ends up in RAM without any cross-pool
-    // synchronisation.
+    // Downloader: network fetch + source-codec decode + re-chunk into a
+    // canonical 128³ ChunkData. Stages the decoded buffer and hands the
+    // key to the encoder. Does NOT touch disk, h265, or the block cache —
+    // so one thread can return to fetching the next chunk as quickly as
+    // possible.
     downloaderPool_.setFetchFunc([this](const ShardKey& shard) -> IOPool::FetchResult {
         ChunkKey key{shard.level, shard.sz, shard.sy, shard.sx};
         if (isNegativeCached(key)) return {};
@@ -172,7 +266,10 @@ BlockPipeline::BlockPipeline(
             return {};
         }
 
-        // Source fetch + re-encode to canonical h265 + disk write.
+        // Pull source chunks over the network and assemble a canonical
+        // 128³ buffer. Source decode happens here too because the
+        // re-chunking needs the voxels; it's a small fraction of the
+        // overall work compared to x265 encode, which is now off-thread.
         auto decoded = assembleCanonicalChunk(key);
         if (!decoded) {
             auto* http = dynamic_cast<HttpSource*>(source_.get());
@@ -185,26 +282,12 @@ BlockPipeline::BlockPipeline(
             return {};
         }
         statIceFetches_.fetch_add(1, std::memory_order_relaxed);
-        auto h265 = encodeCanonicalH265(*decoded);
-        zarrWriteChunk(*dz, key,
-            reinterpret_cast<const uint8_t*>(h265.data()), h265.size());
-        statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
-        statDiskBytes_.fetch_add(h265.size(), std::memory_order_relaxed);
-        if (dz->is_sharded()) {
-            const auto& m = dz->metadata();
-            ShardKey sk{key.level, 0, 0, 0};
-            auto bpcZ = m.sub_chunks_per_shard(0);
-            auto bpcY = m.sub_chunks_per_shard(1);
-            auto bpcX = m.sub_chunks_per_shard(2);
-            sk.sz = bpcZ ? key.iz / int(bpcZ) : key.iz;
-            sk.sy = bpcY ? key.iy / int(bpcY) : key.iy;
-            sk.sx = bpcX ? key.ix / int(bpcX) : key.ix;
-            std::lock_guard lk(writtenShardsMutex_);
-            writtenShards_.insert(sk);
-        }
 
-        // Report the key as the result; the completion callback forwards
-        // it to the loader so it ends up in the block cache.
+        // Stage for the encoder.
+        {
+            std::lock_guard lk(encodeStagingMutex_);
+            encodeStaging_[key] = std::move(decoded);
+        }
         IOPool::FetchResult result;
         result.emplace_back(key, std::vector<uint8_t>{});
         return result;
@@ -213,11 +296,65 @@ BlockPipeline::BlockPipeline(
     downloaderPool_.setCompletionCallback(
         [this](IOPool::FetchResult&& res) {
             if (res.empty()) return;
+            std::vector<ChunkKey> encodeKeys;
+            encodeKeys.reserve(res.size());
+            for (auto& [key, _] : res) encodeKeys.push_back(key);
+            const int targetLevel = encodeKeys.front().level;
+            encodePool_.updateInteractive(encodeKeys, targetLevel);
+        });
+
+    // Encoder: take staged ChunkData → h265 encode → disk write → forward
+    // the key to the loader. Pure CPU work plus a small disk write;
+    // oversubscribing this pool just thrashes cores, so it runs at 1×
+    // hardware_concurrency.
+    encodePool_.setFetchFunc([this](const ShardKey& shard) -> IOPool::FetchResult {
+        ChunkKey key{shard.level, shard.sz, shard.sy, shard.sx};
+        auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
+        if (!dz) return {};
+
+        ChunkDataPtr decoded;
+        {
+            std::lock_guard lk(encodeStagingMutex_);
+            auto it = encodeStaging_.find(key);
+            if (it == encodeStaging_.end()) return {};
+            decoded = std::move(it->second);
+            encodeStaging_.erase(it);
+        }
+        if (!decoded) return {};
+
+        auto h265 = encodeCanonicalH265(*decoded);
+        zarrWriteChunk(*dz, key,
+            reinterpret_cast<const uint8_t*>(h265.data()), h265.size());
+        statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
+        statDiskBytes_.fetch_add(h265.size(), std::memory_order_relaxed);
+        if (dz->is_sharded()) {
+            const ShardKey sk = canonicalShardKey(key);
+            {
+                std::lock_guard lk(writtenShardsMutex_);
+                writtenShards_.insert(sk);
+            }
+            // Shard file grew on disk; drop the stale cached copy so the
+            // loader re-reads it next time.
+            std::lock_guard lk(shardCacheMutex_);
+            if (auto it = shardCacheMap_.find(sk); it != shardCacheMap_.end()) {
+                shardCacheTotalBytes_ -= it->second->bytes
+                    ? it->second->bytes->size() : 0;
+                shardCacheLru_.erase(it->second);
+                shardCacheMap_.erase(it);
+            }
+        }
+
+        IOPool::FetchResult result;
+        result.emplace_back(key, std::vector<uint8_t>{});
+        return result;
+    });
+
+    encodePool_.setCompletionCallback(
+        [this](IOPool::FetchResult&& res) {
+            if (res.empty()) return;
             std::vector<ChunkKey> loaderKeys;
             loaderKeys.reserve(res.size());
             for (auto& [key, _] : res) loaderKeys.push_back(key);
-            // Use the same level as the completed work so the loader's
-            // weighted round-robin still prioritises the viewport.
             const int targetLevel = loaderKeys.front().level;
             loaderPool_.updateInteractive(loaderKeys, targetLevel);
         });
@@ -240,12 +377,29 @@ BlockPipeline::BlockPipeline(
                 negativeCache_.insert(key);
                 return {};
             }
-            auto diskBytes = zarrReadChunk(*dz, key);
-            if (diskBytes && !diskBytes->empty()) {
+            // Route through the shard cache. Subsequent inner chunks from
+            // the same shard served from RAM with no syscalls.
+            std::optional<std::vector<std::byte>> innerBytes;
+            if (dz->is_sharded() && config_.shardCacheBytes > 0) {
+                auto shardBytes = shardBytesFor(key, *dz);
+                if (shardBytes) {
+                    auto idx = chunkIndices(key);
+                    const auto& m = dz->metadata();
+                    std::vector<std::size_t> inner(idx.size());
+                    for (size_t d = 0; d < idx.size(); ++d) {
+                        auto ips = m.sub_chunks_per_shard(d);
+                        inner[d] = ips ? idx[d] % ips : idx[d];
+                    }
+                    innerBytes = dz->extract_inner_chunk(*shardBytes, inner);
+                }
+            } else {
+                innerBytes = zarrReadChunk(*dz, key);
+            }
+            if (innerBytes && !innerBytes->empty()) {
                 statColdHits_.fetch_add(1, std::memory_order_relaxed);
                 std::vector<uint8_t> buf(
-                    reinterpret_cast<const uint8_t*>(diskBytes->data()),
-                    reinterpret_cast<const uint8_t*>(diskBytes->data() + diskBytes->size()));
+                    reinterpret_cast<const uint8_t*>(innerBytes->data()),
+                    reinterpret_cast<const uint8_t*>(innerBytes->data() + innerBytes->size()));
                 decoded = decodeCanonicalH265(buf);
             }
         } else if (source_) {
@@ -279,14 +433,16 @@ BlockPipeline::BlockPipeline(
         });
 
     downloaderPool_.start();
+    encodePool_.start();
     loaderPool_.start();
     loadNegativeCache();
 }
 
 BlockPipeline::~BlockPipeline() {
-    // Stop the downloader first so no more work can land in the loader's
-    // queue while we're trying to drain it.
+    // Stop upstream-first so no new work lands in downstream queues while
+    // we're trying to drain them.
     downloaderPool_.stop();
+    encodePool_.stop();
     loaderPool_.stop();
     auto cold = statColdHits_.load();
     auto ice = statIceFetches_.load();
@@ -457,11 +613,26 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
 
 void BlockPipeline::clearMemory() {
     blockCache_.clear();
+    std::lock_guard lk(shardCacheMutex_);
+    shardCacheLru_.clear();
+    shardCacheMap_.clear();
+    shardCacheTotalBytes_ = 0;
 }
 
 void BlockPipeline::clearAll() {
     downloaderPool_.cancelPending();
+    encodePool_.cancelPending();
     loaderPool_.cancelPending();
+    {
+        std::lock_guard lk(encodeStagingMutex_);
+        encodeStaging_.clear();
+    }
+    {
+        std::lock_guard lk(shardCacheMutex_);
+        shardCacheLru_.clear();
+        shardCacheMap_.clear();
+        shardCacheTotalBytes_ = 0;
+    }
     blockCache_.clear();
     bloomClear();
     std::lock_guard lock(negativeMutex_);
@@ -539,7 +710,17 @@ auto BlockPipeline::stats() const -> Stats {
     s.iceFetches = statIceFetches_.load(std::memory_order_relaxed);
     s.misses = statMisses_.load(std::memory_order_relaxed);
     s.blocks = blockCache_.size();
-    s.ioPending = downloaderPool_.pendingCount() + loaderPool_.pendingCount();
+    s.downloadPending = downloaderPool_.pendingCount();
+    s.encodePending = encodePool_.pendingCount();
+    s.loadPending = loaderPool_.pendingCount();
+    s.ioPending = s.downloadPending + s.encodePending + s.loadPending;
+    s.shardHits = statShardHits_.load(std::memory_order_relaxed);
+    s.shardMisses = statShardMisses_.load(std::memory_order_relaxed);
+    {
+        std::lock_guard lk(shardCacheMutex_);
+        s.shardCacheBytes = shardCacheTotalBytes_;
+        s.shardCacheEntries = shardCacheLru_.size();
+    }
     s.diskWrites = statDiskWrites_.load(std::memory_order_relaxed);
     {
         std::lock_guard lock(negativeMutex_);

@@ -1510,6 +1510,34 @@ public:
         return data;
     }
 
+    /// Read the whole shard file that contains the given inner-chunk indices.
+    /// Returns the raw shard bytes (including the trailing index). Use with
+    /// extract_inner_chunk() to pull out individual inner chunks — useful
+    /// when a caller maintains an external shard-level cache and wants to
+    /// serve many inner chunks from a single disk read.
+    [[nodiscard]] std::optional<std::vector<std::byte>>
+    read_whole_shard(std::span<const std::size_t> chunk_indices) const {
+        if (!is_sharded()) return std::nullopt;
+        const auto ndim = meta_.ndim();
+        std::vector<std::size_t> shard_idx(ndim);
+        for (std::size_t d = 0; d < ndim; ++d) {
+            auto ips = meta_.sub_chunks_per_shard(d);
+            shard_idx[d] = chunk_indices[d] / ips;
+        }
+        std::lock_guard lock(*shard_write_mutex_);
+        auto key = chunk_key(shard_idx);
+        auto p = root_ / key;
+        std::ifstream f(p, std::ios::binary | std::ios::ate);
+        if (!f) return std::nullopt;
+        auto size = static_cast<std::streamsize>(f.tellg());
+        if (size <= 0) return std::nullopt;
+        std::vector<std::byte> data(static_cast<std::size_t>(size));
+        f.seekg(0);
+        f.read(reinterpret_cast<char*>(data.data()), size);
+        if (!f) return std::nullopt;
+        return data;
+    }
+
     /// Extract a single inner chunk from shard data.
     [[nodiscard]] std::optional<std::vector<std::byte>>
     extract_inner_chunk(std::span<const std::byte> shard_data,

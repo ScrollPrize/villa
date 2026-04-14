@@ -249,7 +249,12 @@ auto video_decode(
         ctx = de265_new_decoder();
         if (!ctx) throw std::runtime_error("video_decode: failed to create decoder");
         de265_set_parameter_bool(ctx, DE265_DECODER_PARAM_BOOL_SEI_CHECK_HASH, 0);
-        de265_start_worker_threads(ctx, 0);
+        // Enable libde265's wavefront/tile parallel decode. Each loader
+        // thread has its own decoder context, so `nThreads` here is
+        // per-context. Keep it small so (loaders × per-context-threads)
+        // doesn't explode on a saturated loader pool — 2 is a reasonable
+        // compromise between per-chunk latency and core contention.
+        de265_start_worker_threads(ctx, 2);
     }
     de265_reset(ctx);
 
