@@ -131,6 +131,47 @@ TEST(GridStoreCache, ConcurrentRepeatedROIQueriesAreStable)
     EXPECT_GT(stats.decodedPathHits, 0);
 }
 
+TEST(GridStoreCache, ScratchQueryReusesBuffersAndMatchesGet)
+{
+    ScopedTempDir tempDir;
+    const auto gridPath = tempDir.path() / "sample.grid";
+
+    vc::core::util::GridStore writer(cv::Rect(0, 0, 256, 256), 16);
+    populateWriter(writer);
+    writer.save(gridPath.string());
+
+    vc::core::util::GridStore reader(gridPath.string());
+    vc::core::util::GridStore::QueryScratch scratch;
+    const cv::Rect roi(0, 0, 128, 128);
+
+    auto collectWithScratch = [&](const cv::Rect& query) {
+        std::multiset<std::string> encoded;
+        reader.forEach(query, scratch, [&](const std::shared_ptr<std::vector<cv::Point>>& path) {
+            std::stringstream ss;
+            for (const auto& pt : *path) {
+                ss << pt.x << "," << pt.y << ";";
+            }
+            encoded.insert(ss.str());
+        });
+        std::stringstream out;
+        for (const auto& entry : encoded) {
+            out << entry << "|";
+        }
+        return out.str();
+    };
+
+    const auto expected = pathSignature(reader.get(roi));
+    const auto first = collectWithScratch(roi);
+    const auto idsCapacity = scratch.ids.capacity();
+    const auto resultsCapacity = scratch.results.capacity();
+    const auto second = collectWithScratch(roi);
+
+    EXPECT_EQ(first, expected);
+    EXPECT_EQ(second, expected);
+    EXPECT_GE(scratch.ids.capacity(), idsCapacity);
+    EXPECT_GE(scratch.results.capacity(), resultsCapacity);
+}
+
 TEST(GridStoreCache, SaveWithoutVerificationStillReloadsIdentically)
 {
     ScopedTempDir tempDir;

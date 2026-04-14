@@ -1355,6 +1355,233 @@ static bool is_valid_normal_u8(uint8_t ux, uint8_t uy, uint8_t uz) {
     return !(ux == 128 && uy == 128 && uz == 128);
 }
 
+static std::optional<size_t> memAvailableBytes()
+{
+#ifdef __linux__
+    std::ifstream in("/proc/meminfo");
+    if (!in) {
+        return std::nullopt;
+    }
+
+    std::string key;
+    size_t value = 0;
+    std::string unit;
+    while (in >> key >> value >> unit) {
+        if (key == "MemAvailable:") {
+            return value * 1024ull;
+        }
+    }
+#endif
+    return std::nullopt;
+}
+
+struct NormalsZarrLayout {
+    std::vector<size_t> fullShapeZyx;
+    std::vector<size_t> chunkShapeZyx;
+    cv::Vec3i originXyz = cv::Vec3i(0, 0, 0);
+    int sampleStep = 1;
+};
+
+struct NormalsCropU8 {
+    NormalsZarrLayout layout;
+    CropIndexBox3z cropZyx;
+    std::vector<uint8_t> x;
+    std::vector<uint8_t> y;
+    std::vector<uint8_t> z;
+};
+
+static std::unique_ptr<vc::VcDataset> open_normals_axis_dataset(
+    const fs::path& zarr_root,
+    const char* axis)
+{
+    return std::make_unique<vc::VcDataset>(zarr_root / axis / "0");
+}
+
+static void assert_normals_fill_value_128(const fs::path& zarr_root, const char* axis)
+{
+    const fs::path zarray_path = zarr_root / axis / "0" / ".zarray";
+    if (!fs::exists(zarray_path)) {
+        throw std::runtime_error(
+            std::string("Missing ") + axis + "/0/.zarray under normals zarr root: " +
+            zarr_root.string());
+    }
+
+    nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_path));
+    if (!j.contains("fill_value")) {
+        throw std::runtime_error(
+            std::string("Missing fill_value in ") + axis + "/0/.zarray under normals zarr root: " +
+            zarr_root.string());
+    }
+
+    const int fv = j["fill_value"].get<int>();
+    if (fv != 128) {
+        std::stringstream msg;
+        msg << "Normals zarr has unexpected fill_value=" << fv
+            << " for " << axis << "/0; expected 128";
+        throw std::runtime_error(msg.str());
+    }
+}
+
+static NormalsZarrLayout read_normals_zarr_layout(const fs::path& zarr_root)
+{
+    auto dsx = open_normals_axis_dataset(zarr_root, "x");
+    auto dsy = open_normals_axis_dataset(zarr_root, "y");
+    auto dsz = open_normals_axis_dataset(zarr_root, "z");
+    if (!dsx || !dsy || !dsz) {
+        throw std::runtime_error("Failed to open x/y/z datasets under zarr root: " + zarr_root.string());
+    }
+    if (dsx->shape() != dsy->shape() || dsx->shape() != dsz->shape()) {
+        throw std::runtime_error("x/y/z datasets have different shapes under: " + zarr_root.string());
+    }
+    if (dsx->shape().size() != 3) {
+        throw std::runtime_error("Expected 3D datasets (ZYX) for normals zarr under: " + zarr_root.string());
+    }
+
+    assert_normals_fill_value_128(zarr_root, "x");
+    assert_normals_fill_value_128(zarr_root, "y");
+    assert_normals_fill_value_128(zarr_root, "z");
+
+    NormalsZarrLayout layout;
+    layout.fullShapeZyx = {dsx->shape()[0], dsx->shape()[1], dsx->shape()[2]};
+    layout.chunkShapeZyx = {
+        dsx->defaultChunkShape()[0],
+        dsx->defaultChunkShape()[1],
+        dsx->defaultChunkShape()[2],
+    };
+
+    try {
+        nlohmann::json attrs = vc::readZarrAttributes(zarr_root);
+        if (attrs.contains("grid_origin_xyz") &&
+            attrs["grid_origin_xyz"].is_array() &&
+            attrs["grid_origin_xyz"].size() == 3) {
+            layout.originXyz = cv::Vec3i(
+                attrs["grid_origin_xyz"][0].get<int>(),
+                attrs["grid_origin_xyz"][1].get<int>(),
+                attrs["grid_origin_xyz"][2].get<int>());
+        }
+        if (attrs.contains("sample_step")) {
+            layout.sampleStep = std::max(1, attrs["sample_step"].get<int>());
+        }
+    } catch (...) {
+        // Attributes are optional; keep defaults.
+    }
+
+    return layout;
+}
+
+static NormalsCropU8 load_normals_crop_u8(
+    const fs::path& zarr_root,
+    const std::optional<CropBox3i>& crop_opt,
+    double* read_seconds = nullptr)
+{
+    const auto read_start = std::chrono::steady_clock::now();
+    NormalsCropU8 crop;
+    crop.layout = read_normals_zarr_layout(zarr_root);
+
+    const CropBox3i crop_xyz = crop_opt.value_or(CropBox3i{
+        cv::Vec3i(std::numeric_limits<int>::min() / 4,
+                  std::numeric_limits<int>::min() / 4,
+                  std::numeric_limits<int>::min() / 4),
+        cv::Vec3i(std::numeric_limits<int>::max() / 4,
+                  std::numeric_limits<int>::max() / 4,
+                  std::numeric_limits<int>::max() / 4),
+    });
+
+    crop.cropZyx = crop_to_zarr_zyx(
+        crop_xyz,
+        crop.layout.originXyz,
+        crop.layout.sampleStep,
+        crop.layout.fullShapeZyx);
+    const size_t CZ = crop.cropZyx.shape[0];
+    const size_t CY = crop.cropZyx.shape[1];
+    const size_t CX = crop.cropZyx.shape[2];
+    if (CZ == 0 || CY == 0 || CX == 0) {
+        throw std::runtime_error("--crop maps to empty region in normals zarr index space");
+    }
+
+    auto dsx = open_normals_axis_dataset(zarr_root, "x");
+    auto dsy = open_normals_axis_dataset(zarr_root, "y");
+    auto dsz = open_normals_axis_dataset(zarr_root, "z");
+
+    crop.x.assign(CZ * CY * CX, 0);
+    crop.y.assign(CZ * CY * CX, 0);
+    crop.z.assign(CZ * CY * CX, 0);
+
+    const std::vector<size_t> off(crop.cropZyx.off.begin(), crop.cropZyx.off.end());
+    const std::vector<size_t> region_shape(crop.cropZyx.shape.begin(), crop.cropZyx.shape.end());
+    dsx->readRegion(off, region_shape, crop.x.data());
+    dsy->readRegion(off, region_shape, crop.y.data());
+    dsz->readRegion(off, region_shape, crop.z.data());
+
+    if (read_seconds != nullptr) {
+        *read_seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - read_start).count();
+    }
+    return crop;
+}
+
+static void create_normals_output_zarr(
+    const fs::path& out_zarr,
+    const NormalsZarrLayout& layout,
+    const std::optional<CropIndexBox3z>& crop_zyx = std::nullopt)
+{
+    std::filesystem::create_directories(out_zarr);
+    vc::createZarrDataset(out_zarr / "x", "0", layout.fullShapeZyx, layout.chunkShapeZyx, vc::VcDtype::uint8, "blosc", "/", 128);
+    vc::createZarrDataset(out_zarr / "y", "0", layout.fullShapeZyx, layout.chunkShapeZyx, vc::VcDtype::uint8, "blosc", "/", 128);
+    vc::createZarrDataset(out_zarr / "z", "0", layout.fullShapeZyx, layout.chunkShapeZyx, vc::VcDtype::uint8, "blosc", "/", 128);
+
+    nlohmann::json attrs;
+    attrs["source"] = "vc_ngrids";
+    attrs["description"] = "Direction-field encoded normals: x/0,y/0,z/0 uint8 with decode (u8-128)/127";
+    attrs["encoding"] = {
+        {"type", "direction-field-u8"},
+        {"decode", "(u8-128)/127"},
+        {"fill_value", 128},
+    };
+    attrs["grid_origin_xyz"] = {
+        layout.originXyz[0],
+        layout.originXyz[1],
+        layout.originXyz[2],
+    };
+    attrs["sample_step"] = layout.sampleStep;
+    attrs["grid_shape_zyx"] = {
+        layout.fullShapeZyx[0],
+        layout.fullShapeZyx[1],
+        layout.fullShapeZyx[2],
+    };
+    if (crop_zyx.has_value()) {
+        attrs["crop_off_zyx"] = {
+            crop_zyx->off[0],
+            crop_zyx->off[1],
+            crop_zyx->off[2],
+        };
+        attrs["crop_shape_zyx"] = {
+            crop_zyx->shape[0],
+            crop_zyx->shape[1],
+            crop_zyx->shape[2],
+        };
+    }
+    vc::writeZarrAttributes(out_zarr, attrs);
+}
+
+static void write_normals_crop_u8(
+    const fs::path& out_zarr,
+    const CropIndexBox3z& crop_zyx,
+    const std::vector<uint8_t>& ax,
+    const std::vector<uint8_t>& ay,
+    const std::vector<uint8_t>& az)
+{
+    auto out_dsx = open_normals_axis_dataset(out_zarr, "x");
+    auto out_dsy = open_normals_axis_dataset(out_zarr, "y");
+    auto out_dsz = open_normals_axis_dataset(out_zarr, "z");
+
+    const std::vector<size_t> crop_off(crop_zyx.off.begin(), crop_zyx.off.end());
+    const std::vector<size_t> crop_shape(crop_zyx.shape.begin(), crop_zyx.shape.end());
+    out_dsx->writeRegion(crop_off, crop_shape, ax.data());
+    out_dsy->writeRegion(crop_off, crop_shape, ay.data());
+    out_dsz->writeRegion(crop_off, crop_shape, az.data());
+}
+
 static void run_align_normals_zarr(
     const fs::path& zarr_root,
     const fs::path& out_zarr,
@@ -1373,73 +1600,19 @@ static void run_align_normals_zarr(
     metrics["radius"] = radius;
     metrics["candidate_samples_per_iter"] = candidate_samples_per_iter;
 
-    // Determine delimiter from x/0/.zarray (fallback "." to match other tools).
-    std::string delim = ".";
-    {
-        const fs::path zarray_path = zarr_root / "x" / "0" / ".zarray";
-        if (fs::exists(zarray_path)) {
-            nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_path));
-            delim = j.value<std::string>("dimension_separator", ".");
-        }
-    }
-
-    // Optional origin/step from attrs (if present) so crop can be applied in voxel coords.
-    cv::Vec3i origin_xyz(0, 0, 0);
-    int step = 1;
-    {
-        try {
-            nlohmann::json attrs = vc::readZarrAttributes(zarr_root);
-            if (attrs.contains("grid_origin_xyz") && attrs["grid_origin_xyz"].is_array() && attrs["grid_origin_xyz"].size() == 3) {
-                origin_xyz = cv::Vec3i(attrs["grid_origin_xyz"][0].get<int>(), attrs["grid_origin_xyz"][1].get<int>(), attrs["grid_origin_xyz"][2].get<int>());
-            }
-            if (attrs.contains("sample_step")) {
-                step = std::max(1, attrs["sample_step"].get<int>());
-            }
-        } catch (...) {
-            // attrs optional.
-        }
-    }
-
-    auto open_u8_zyx = [&](const char* axis) -> std::unique_ptr<vc::VcDataset> {
-        return std::make_unique<vc::VcDataset>(zarr_root / axis / "0");
-    };
-
-    auto dsx = open_u8_zyx("x");
-    auto dsy = open_u8_zyx("y");
-    auto dsz = open_u8_zyx("z");
-    if (!dsx || !dsy || !dsz) {
-        throw std::runtime_error("Failed to open x/y/z datasets under zarr root: " + zarr_root.string());
-    }
-    if (dsx->shape() != dsy->shape() || dsx->shape() != dsz->shape()) {
-        throw std::runtime_error("x/y/z datasets have different shapes under: " + zarr_root.string());
-    }
-    if (dsx->shape().size() != 3) {
-        throw std::runtime_error("Expected 3D datasets (ZYX) for normals zarr under: " + zarr_root.string());
-    }
-    const std::vector<size_t> full_shape = {dsx->shape()[0], dsx->shape()[1], dsx->shape()[2]};
-
-    // Assert fill_value is 128 (neutral "no normal"); vc_ngrids relies on this convention.
-    auto assert_fill_value_128 = [&](const char* axis) {
-        const fs::path zarray_path = zarr_root / axis / "0" / ".zarray";
-        if (!fs::exists(zarray_path)) {
-            throw std::runtime_error(std::string("Missing ") + axis + "/0/.zarray under normals zarr root: " + zarr_root.string());
-        }
-        nlohmann::json j = nlohmann::json::parse(std::ifstream(zarray_path));
-        if (!j.contains("fill_value")) {
-            throw std::runtime_error(std::string("Missing fill_value in ") + axis + "/0/.zarray under normals zarr root: " + zarr_root.string());
-        }
-        const int fv = j["fill_value"].get<int>();
-        if (fv != 128) {
-            std::stringstream msg;
-            msg << "Normals zarr has unexpected fill_value=" << fv
-                << " for " << axis << "/0; expected 128";
-            throw std::runtime_error(msg.str());
-        }
-    };
-    assert_fill_value_128("x");
-    assert_fill_value_128("y");
-    assert_fill_value_128("z");
-
+    double read_seconds = 0.0;
+    NormalsCropU8 normals = load_normals_crop_u8(zarr_root, crop_opt, &read_seconds);
+    metrics["read_seconds"] = read_seconds;
+    const auto& crop_zyx = normals.cropZyx;
+    const auto& full_shape = normals.layout.fullShapeZyx;
+    const cv::Vec3i origin_xyz = normals.layout.originXyz;
+    const int step = normals.layout.sampleStep;
+    const size_t CZ = crop_zyx.shape[0];
+    const size_t CY = crop_zyx.shape[1];
+    const size_t CX = crop_zyx.shape[2];
+    auto& ax = normals.x;
+    auto& ay = normals.y;
+    auto& az = normals.z;
     const CropBox3i crop_xyz = crop_opt.value_or(CropBox3i{
         cv::Vec3i(std::numeric_limits<int>::min() / 4,
                   std::numeric_limits<int>::min() / 4,
@@ -1448,29 +1621,6 @@ static void run_align_normals_zarr(
                   std::numeric_limits<int>::max() / 4,
                   std::numeric_limits<int>::max() / 4),
     });
-
-    const CropIndexBox3z crop_zyx = crop_to_zarr_zyx(crop_xyz, origin_xyz, step, full_shape);
-    const size_t CZ = crop_zyx.shape[0];
-    const size_t CY = crop_zyx.shape[1];
-    const size_t CX = crop_zyx.shape[2];
-    if (CZ == 0 || CY == 0 || CX == 0) {
-        throw std::runtime_error("--crop maps to empty region in normals zarr index space");
-    }
-
-    const auto read_start = std::chrono::steady_clock::now();
-    // Load the cropped normals into memory.
-    std::vector<uint8_t> ax(CZ * CY * CX, 0);
-    std::vector<uint8_t> ay(CZ * CY * CX, 0);
-    std::vector<uint8_t> az(CZ * CY * CX, 0);
-    {
-        std::vector<size_t> off(crop_zyx.off.begin(), crop_zyx.off.end());
-        std::vector<size_t> regionShape(crop_zyx.shape.begin(), crop_zyx.shape.end());
-        dsx->readRegion(off, regionShape, ax.data());
-        dsy->readRegion(off, regionShape, ay.data());
-        dsz->readRegion(off, regionShape, az.data());
-    }
-    metrics["read_seconds"] = std::chrono::duration<double>(
-        std::chrono::steady_clock::now() - read_start).count();
 
     const size_t N = CZ * CY * CX;
     auto lin_of = [&](size_t iz, size_t iy, size_t ix) -> size_t {
@@ -1802,40 +1952,19 @@ static void run_align_normals_zarr(
         az[lin_of(iz, iy, ix)] = flip_u8_dir_component(az[lin_of(iz, iy, ix)]);
     }
 
-    // Write output zarr: create full-sized datasets and only write the cropped subarray.
-    std::filesystem::create_directories(out_zarr);
-
-    const std::vector<size_t> chunks = {std::min<size_t>(64, full_shape[0]), std::min<size_t>(64, full_shape[1]), std::min<size_t>(64, full_shape[2])};
-
-    auto out_dsx = vc::createZarrDataset(out_zarr / "x", "0", full_shape, chunks, vc::VcDtype::uint8, "blosc", "/", 128);
-    auto out_dsy = vc::createZarrDataset(out_zarr / "y", "0", full_shape, chunks, vc::VcDtype::uint8, "blosc", "/", 128);
-    auto out_dsz = vc::createZarrDataset(out_zarr / "z", "0", full_shape, chunks, vc::VcDtype::uint8, "blosc", "/", 128);
-
-    const std::vector<size_t> cropOff(crop_zyx.off.begin(), crop_zyx.off.end());
-    const std::vector<size_t> cropShape(crop_zyx.shape.begin(), crop_zyx.shape.end());
     metrics["align_seconds"] = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - align_start).count();
     const auto write_start = std::chrono::steady_clock::now();
-    writeZarrRegionU8ByChunk(out_dsx.get(), cropOff, cropShape, ax.data(), 128);
-    writeZarrRegionU8ByChunk(out_dsy.get(), cropOff, cropShape, ay.data(), 128);
-    writeZarrRegionU8ByChunk(out_dsz.get(), cropOff, cropShape, az.data(), 128);
+    create_normals_output_zarr(out_zarr, normals.layout, crop_zyx);
+    write_normals_crop_u8(out_zarr, crop_zyx, ax, ay, az);
 
-    // Minimal attrs on root.
-    nlohmann::json attrs;
-    attrs["source"] = "vc_ngrids";
-    attrs["note_axes_order"] = "ZYX";
-    attrs["encoding"] = "uint8_dir";
-    attrs["decode"] = "(v-128)/127";
-    attrs["grid_origin_xyz"] = {origin_xyz[0], origin_xyz[1], origin_xyz[2]};
-    attrs["sample_step"] = step;
+    nlohmann::json attrs = vc::readZarrAttributes(out_zarr);
     attrs["align_normals"] = true;
     attrs["align_seed_samples"] = seed_samples;
     attrs["align_radius_step_units"] = radius;
     attrs["align_candidate_samples_per_iter"] = candidate_samples_per_iter;
     attrs["crop_min_xyz"] = {crop_xyz.min[0], crop_xyz.min[1], crop_xyz.min[2]};
     attrs["crop_max_xyz"] = {crop_xyz.max[0], crop_xyz.max[1], crop_xyz.max[2]};
-    attrs["crop_off_zyx"] = {crop_zyx.off[0], crop_zyx.off[1], crop_zyx.off[2]};
-    attrs["crop_shape_zyx"] = {crop_zyx.shape[0], crop_zyx.shape[1], crop_zyx.shape[2]};
     vc::writeZarrAttributes(out_zarr, attrs);
 
     metrics["write_seconds"] = std::chrono::duration<double>(
@@ -1850,6 +1979,103 @@ static void run_align_normals_zarr(
     if (metrics_json_path.has_value()) {
         write_metrics_json(*metrics_json_path, metrics);
     }
+}
+
+struct FitPlaneConfig {
+    int plane_idx = 0;
+    const char* dir = "";
+    int slice_axis = 0;
+};
+
+struct FitPlaneSliceEntry {
+    int slice = 0;
+    std::shared_ptr<const vc::core::util::GridStore> grid;
+};
+
+struct FitPlaneSliceTable {
+    FitPlaneConfig cfg;
+    std::vector<FitPlaneSliceEntry> entries;
+};
+
+struct FitGridAccessPlan {
+    bool preload = false;
+    size_t estimatedBytes = 0;
+    size_t budgetBytes = 0;
+    size_t availableBytes = 0;
+    double preloadSeconds = 0.0;
+    std::array<FitPlaneSliceTable, 3> planes;
+};
+
+static fs::path normal_grid_slice_path(
+    const fs::path& input_dir,
+    const char* plane_dir,
+    int slice)
+{
+    char filename[256];
+    snprintf(filename, sizeof(filename), "%06d.grid", slice);
+    return input_dir / plane_dir / filename;
+}
+
+static FitGridAccessPlan build_fit_grid_access_plan(
+    const fs::path& input_dir,
+    vc::core::util::NormalGridVolume& ngv,
+    const CropBox3i& read_box,
+    int sparse_volume)
+{
+    const FitPlaneConfig plane_cfgs[3] = {
+        {0, "xy", 2},
+        {1, "xz", 1},
+        {2, "yz", 0},
+    };
+
+    FitGridAccessPlan plan;
+    const auto available = memAvailableBytes();
+    plan.availableBytes = available.value_or(0);
+    if (available.has_value()) {
+        plan.budgetBytes = std::min<size_t>(
+            256ull << 20,
+            std::max<size_t>(64ull << 20, *available / 16));
+    } else {
+        plan.budgetBytes = 128ull << 20;
+    }
+
+    for (size_t plane = 0; plane < std::size(plane_cfgs); ++plane) {
+        plan.planes[plane].cfg = plane_cfgs[plane];
+        const auto& cfg = plan.planes[plane].cfg;
+        const int axis = cfg.slice_axis;
+        const int s_min = read_box.min[axis];
+        const int s_max = read_box.max[axis];
+        int slice_start = align_down(s_min, sparse_volume);
+        if (slice_start < s_min) {
+            slice_start += std::max(1, sparse_volume);
+        }
+
+        for (int slice = slice_start; slice < s_max; slice += std::max(1, sparse_volume)) {
+            const fs::path grid_path = normal_grid_slice_path(input_dir, cfg.dir, slice);
+            if (!fs::exists(grid_path)) {
+                continue;
+            }
+
+            plan.planes[plane].entries.push_back(FitPlaneSliceEntry{slice, nullptr});
+            std::error_code ec;
+            plan.estimatedBytes += fs::file_size(grid_path, ec);
+        }
+    }
+
+    plan.preload = plan.estimatedBytes > 0 && plan.estimatedBytes <= plan.budgetBytes;
+    if (!plan.preload) {
+        return plan;
+    }
+
+    const auto preload_start = std::chrono::steady_clock::now();
+    for (auto& plane : plan.planes) {
+        for (auto& entry : plane.entries) {
+            entry.grid = ngv.get_grid(plane.cfg.plane_idx, entry.slice);
+        }
+    }
+    plan.preloadSeconds = std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - preload_start).count();
+    return plan;
 }
 
 static void run_fit_normals(
@@ -1905,6 +2131,22 @@ static void run_fit_normals(
         std::min(vol_xyz[1], crop.max[1] + rad_i),
         std::min(vol_xyz[2], crop.max[2] + rad_i));
 
+    FitGridAccessPlan grid_access_plan = build_fit_grid_access_plan(
+        input_dir,
+        ngv,
+        read_box,
+        sparse_volume);
+    metrics["grid_access"] = {
+        {"mode", grid_access_plan.preload ? "preload" : "stream"},
+        {"estimated_bytes", static_cast<long long>(grid_access_plan.estimatedBytes)},
+        {"budget_bytes", static_cast<long long>(grid_access_plan.budgetBytes)},
+        {"available_bytes", static_cast<long long>(grid_access_plan.availableBytes)},
+        {"preload_seconds", grid_access_plan.preloadSeconds},
+        {"xy_slices", static_cast<long long>(grid_access_plan.planes[0].entries.size())},
+        {"xz_slices", static_cast<long long>(grid_access_plan.planes[1].entries.size())},
+        {"yz_slices", static_cast<long long>(grid_access_plan.planes[2].entries.size())},
+    };
+
     // Optional PLY output: per-thread temp files then merge.
     const int nthreads = std::max(1, omp_get_max_threads());
     struct ThreadOut {
@@ -1940,17 +2182,6 @@ static void run_fit_normals(
         const int g = 0;
         const int r = static_cast<int>(std::lround(t * 255.0));
         return cv::Vec3b(static_cast<uint8_t>(b), static_cast<uint8_t>(g), static_cast<uint8_t>(r));
-    };
-
-    struct PlaneCfg {
-        int plane_idx;
-        const char* dir;
-        int slice_axis;
-    };
-    const PlaneCfg planes[3] = {
-        {0, "xy", 2},
-        {1, "xz", 1},
-        {2, "yz", 0},
     };
 
     auto has_enough_plane_support = [&](const std::array<std::vector<cv::Point3f>, 3>& dirs_unit) -> bool {
@@ -2121,7 +2352,22 @@ static void run_fit_normals(
     };
 
     std::vector<FitStats> stats = stats_of();
-    std::vector<ThreadSliceGridCache> thread_grid_cache(static_cast<size_t>(std::max(1, omp_get_max_threads())));
+    const size_t thread_grid_cache_capacity = std::max<size_t>(
+        128,
+        std::min<size_t>(
+            1024,
+            std::max({
+                grid_access_plan.planes[0].entries.size(),
+                grid_access_plan.planes[1].entries.size(),
+                grid_access_plan.planes[2].entries.size(),
+            })));
+    std::vector<ThreadSliceGridCache> thread_grid_cache;
+    if (!grid_access_plan.preload) {
+        thread_grid_cache.reserve(static_cast<size_t>(std::max(1, omp_get_max_threads())));
+        for (int t = 0; t < std::max(1, omp_get_max_threads()); ++t) {
+            thread_grid_cache.emplace_back(thread_grid_cache_capacity);
+        }
+    }
 
     auto gather_samples_for_radius = [&](
         const cv::Point3f& sample,
@@ -2130,6 +2376,7 @@ static void run_fit_normals(
         std::array<std::vector<cv::Point3f>, 3>& dirs_unit,
         std::array<std::vector<double>, 3>& weights,
         std::array<std::vector<cv::Point3f>, 3>& deltas_xyz,
+        vc::core::util::GridStore::QueryScratch& grid_query_scratch,
         int& used_segments_total,
         int& used_segments_short_paths,
         double& t_ng_read_s,
@@ -2147,7 +2394,8 @@ static void run_fit_normals(
         (void)inv_two_sigma2;
         const float sample_arr[3] = {sample.x, sample.y, sample.z};
 
-        for (const auto& pc : planes) {
+        for (const auto& plane : grid_access_plan.planes) {
+            const auto& pc = plane.cfg;
             // plane axes
             const int u_axis = (pc.plane_idx == 2) ? 1 : 0;
             const int v_axis = (pc.plane_idx == 0) ? 1 : 2;
@@ -2156,10 +2404,16 @@ static void run_fit_normals(
             const int s_center = static_cast<int>(sample_arr[s_axis]);
             const int s_min = std::max(read_box.min[s_axis], static_cast<int>(std::floor(s_center - rad)));
             const int s_max = std::min(read_box.max[s_axis], static_cast<int>(std::ceil(s_center + rad)) + 1);
-            int slice_start = align_down(s_min, sparse_volume);
-            if (slice_start < s_min) slice_start += std::max(1, sparse_volume);
+            auto slice_it = std::lower_bound(
+                plane.entries.begin(),
+                plane.entries.end(),
+                s_min,
+                [](const FitPlaneSliceEntry& entry, int slice_value) {
+                    return entry.slice < slice_value;
+                });
 
-            for (int slice = slice_start; slice < s_max; slice += std::max(1, sparse_volume)) {
+            for (; slice_it != plane.entries.end() && slice_it->slice < s_max; ++slice_it) {
+                const int slice = slice_it->slice;
                 // Shrink the 2D query rect based on distance in the slice axis:
                 // at offset ds from the center, the in-slice radius is sqrt(r^2 - ds^2).
                 const float ds = std::abs(static_cast<float>(slice) - sample_arr[s_axis]);
@@ -2175,15 +2429,22 @@ static void run_fit_normals(
                 const cv::Rect query(u0, v0, u1 - u0, v1 - v0);
 
                 const auto t_read0 = std::chrono::steady_clock::now();
-                auto grid = thread_grid_cache[static_cast<size_t>(tid)].get(ngv, pc.plane_idx, slice);
+                std::shared_ptr<const vc::core::util::GridStore> grid;
+                if (grid_access_plan.preload) {
+                    grid = slice_it->grid;
+                } else {
+                    grid = thread_grid_cache[static_cast<size_t>(tid)].get(ngv, pc.plane_idx, slice);
+                }
                 if (!grid) continue;
-
-                const auto paths = grid->get(query);
+                grid->forEach(
+                    query,
+                    grid_query_scratch,
+                    [&](const std::shared_ptr<std::vector<cv::Point>>&) {});
                 const auto t_read1 = std::chrono::steady_clock::now();
                 t_ng_read_s += std::chrono::duration<double>(t_read1 - t_read0).count();
 
                 const auto t_pp0 = std::chrono::steady_clock::now();
-                for (const auto& path_ptr : paths) {
+                for (const auto& path_ptr : grid_query_scratch.results) {
                     if (!path_ptr || path_ptr->size() < 2) continue;
 
                     const int seg_count = static_cast<int>(path_ptr->size()) - 1;
@@ -2252,6 +2513,7 @@ static void run_fit_normals(
         std::array<std::vector<cv::Point3f>, 3> dirs_unit;
         std::array<std::vector<double>, 3> weights;
         std::array<std::vector<cv::Point3f>, 3> deltas_xyz;
+        vc::core::util::GridStore::QueryScratch gridQueryScratch;
     };
     std::vector<FitBuffers> fit_buffers(static_cast<size_t>(std::max(1, omp_get_max_threads())));
     for (auto& fb : fit_buffers) {
@@ -2427,6 +2689,7 @@ static void run_fit_normals(
                                               dirs_unit,
                                               weights,
                                               deltas_xyz,
+                                              fb.gridQueryScratch,
                                               used_segments_total,
                                               used_segments_short_paths,
                                               t_ng_read_s,
@@ -2634,33 +2897,28 @@ static void run_fit_normals(
     if (out_zarr_opt.has_value()) {
         const fs::path out_zarr = *out_zarr_opt;
 
-        // Create datasets with Zarr metadata using '/' as dimension_separator.
-        // NOTE: direction-field readers in vc_grow_seg_from_seed expect:
-        //   <root>/{x,y,z}/0/.zarray
-        // and will read the delimiter from that .zarray.
-        std::filesystem::create_directories(out_zarr);
-
-        auto dsx = vc::createZarrDataset(out_zarr / "x", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/", 128);
-        auto dsy = vc::createZarrDataset(out_zarr / "y", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/", 128);
-        auto dsz = vc::createZarrDataset(out_zarr / "z", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/", 128);
-        auto ds_fit_rms = vc::createZarrDataset(out_zarr / "fit_rms", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
-        auto ds_fit_frac = vc::createZarrDataset(out_zarr / "fit_frac_short_paths", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
-        auto ds_fit_rad = vc::createZarrDataset(out_zarr / "fit_used_radius", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
-        auto ds_fit_sc = vc::createZarrDataset(out_zarr / "fit_segment_count", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
+        NormalsZarrLayout output_layout;
+        output_layout.fullShapeZyx = output_shape_zyx;
+        output_layout.chunkShapeZyx = output_chunks_zyx;
+        output_layout.sampleStep = step;
+        create_normals_output_zarr(
+            out_zarr,
+            output_layout,
+            CropIndexBox3z{
+                {static_cast<size_t>(crop_off_z), static_cast<size_t>(crop_off_y), static_cast<size_t>(crop_off_x)},
+                {static_cast<size_t>(crop_nz), static_cast<size_t>(crop_ny), static_cast<size_t>(crop_nx)},
+            });
+        vc::createZarrDataset(out_zarr / "fit_rms", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
+        vc::createZarrDataset(out_zarr / "fit_frac_short_paths", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
+        vc::createZarrDataset(out_zarr / "fit_used_radius", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
+        vc::createZarrDataset(out_zarr / "fit_segment_count", "0", output_shape_zyx, output_chunks_zyx, vc::VcDtype::uint8, "blosc", "/");
 
         materialize_stats = materialize_fit_output_spool(out_zarr, *output_spool, static_cast<size_t>(nthreads));
 
-        // Minimal attrs on root.
-        nlohmann::json attrs;
-        attrs["source"] = "vc_ngrids";
-        attrs["note_axes_order"] = "ZYX";
-        attrs["encoding"] = "uint8_dir";
-        attrs["decode"] = "(v-128)/127";
-        attrs["sample_step"] = step;
+        nlohmann::json attrs = vc::readZarrAttributes(out_zarr);
         attrs["radius"] = radius;
         attrs["crop_min_xyz"] = {crop.min[0], crop.min[1], crop.min[2]};
         attrs["crop_max_xyz"] = {crop.max[0], crop.max[1], crop.max[2]};
-        attrs["grid_shape_zyx"] = {output_shape_zyx[0], output_shape_zyx[1], output_shape_zyx[2]};
 
         // Diagnostics.
         attrs["fit_rms_group"] = "fit_rms/0";
