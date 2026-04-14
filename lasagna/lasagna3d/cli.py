@@ -29,21 +29,25 @@ def main() -> None:
     vis.add_argument("--seed", type=int, default=0,
                      help="Seed for deterministic shuffle (default: 0).")
     vis.add_argument("--patch-size", type=int, default=None,
-                     help="Patch size for model construction (architecture "
-                          "autoconfigures from this). With --model, only "
-                          "needed as fallback for checkpoints that don't "
-                          "embed patch_size.")
+                     help="Model-architecture patch size used to BUILD the "
+                          "model (NetworkFromConfig autoconfigures from "
+                          "this). Only needed as a fallback for old "
+                          "checkpoints that don't embed `patch_size`. Does "
+                          "NOT change the dataset patch size — the dataset "
+                          "always uses the training config's `patch_size`.")
     vis.add_argument("--model", type=str, default=None,
                      help="Optional checkpoint path. If set, runs inference "
                           "and adds rows for prediction + diff (full + "
                           "scale-space sum). Loss values are added to the "
                           "title.")
     vis.add_argument("--inference-tile-size", type=int, default=None,
-                     help="Cubic patch the model runs on (single forward). "
-                          "Dataset emits max(config patch_size, this); "
-                          "loss + residuals are scored at min(config "
-                          "patch_size, this), center-cropped from both "
-                          "pred and target. Default: dataset patch size.")
+                     help="Cubic patch size of the CT crop the model runs "
+                          "on (single forward). The dataset is unaffected "
+                          "and always emits the training config patch size. "
+                          "Loss + residuals are computed at min(this, "
+                          "config patch_size); vis is rendered at the "
+                          "config patch size with pred padded/cropped. "
+                          "Default: training config patch size.")
     vis.add_argument("--num-workers", type=int, default=None,
                      help="DataLoader workers for parallel extraction "
                           "and render thread pool size. Default: number "

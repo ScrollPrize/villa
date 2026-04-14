@@ -189,6 +189,28 @@ def _center_crop_np(arr, target: int):
     return arr[..., _slc(z), _slc(y), _slc(x)]
 
 
+def _center_crop_or_pad_3d(arr, target: int, pad_value=np.nan):
+    """Center each trailing 3 spatial axis of `arr` into a `target`-sized
+    cubic box: crop axes that are larger, pad (with `pad_value`) axes
+    that are smaller. Returns a new array of shape `(..., target, target, target)`.
+    """
+    *lead, z, y, x = arr.shape
+    out = np.full((*lead, target, target, target), pad_value, dtype=arr.dtype)
+
+    def _src_dst(d):
+        if d >= target:
+            s = (d - target) // 2
+            return slice(s, s + target), slice(0, target)
+        s = (target - d) // 2
+        return slice(0, d), slice(s, s + d)
+
+    sz, dz = _src_dst(z)
+    sy, dy = _src_dst(y)
+    sx, dx = _src_dst(x)
+    out[..., dz, dy, dx] = arr[..., sz, sy, sx]
+    return out
+
+
 def _crop_offset(shape_zyx, target: int):
     """Per-axis offset subtracted from a coord to convert dataset-patch
     coordinates to comparison-tile coordinates.
@@ -295,33 +317,66 @@ def _scale_space_residual_sum(pred, target, mask, num_scales: int, kind: str):
 
 def _compute_inference_output(batch, training_output, model_path, device,
                               model_build_patch_size: int,
-                              inference_tile_size: int | None,
-                              comparison_tile: int,
+                              inference_size: int,
+                              compare_size: int,
                               output_sigmoid: bool):
-    """Run the model, compute losses (same path as training), and produce
-    per-channel diff maps (full-res masked residual + scale-space sum).
+    """Run the model on a fresh CT crop centered on the patch's world
+    bbox, then compute losses + residual maps cropped to `compare_size`.
     Returns ``None`` if CUDA / model load fail.
     """
     import torch
     import torch.nn.functional as F
     from train_tifxyz import MaskedMSE, MaskedSmoothL1, ScaleSpaceLoss3D
+    from vesuvius.neural_tracing.datasets.common import (
+        _read_volume_crop_from_patch,
+    )
 
     if not torch.cuda.is_available() or training_output is None:
         return None
 
     try:
-        image = batch["image"].to(device, non_blocking=True)
         model = _load_model(model_path, model_build_patch_size, device)
 
-        # Inference patch: defaults to the full dataset patch.
-        # If --inference-tile-size is *smaller* than the dataset
-        # patch, center-crop the image before the forward (memory
-        # saver). If it's larger, the dataset already emits the
-        # bigger patch (configured in run_dataset_vis), so the full
-        # image IS the inference patch.
-        dataset_size = int(image.shape[-1])
-        infer_size = int(inference_tile_size) if inference_tile_size else dataset_size
-        img_for_model = _center_crop_torch(image, infer_size)
+        # Read a fresh inference-sized CT crop centered on the patch's
+        # world center. Independent of the dataset's image tensor —
+        # works for any inference_size (smaller, equal, or larger than
+        # the dataset patch). _read_volume_crop_from_patch zero-pads
+        # outside the volume so edge patches still produce a clean
+        # cubic crop.
+        patches = batch.get("_patch")
+        if not patches:
+            print(f"{TAG} WARNING: batch missing '_patch' — cannot read "
+                  f"inference crop", flush=True)
+            return None
+        patch = patches[0]
+        z0, z1, y0, y1, x0, x1 = patch.world_bbox
+        cz_w = (z0 + z1) // 2
+        cy_w = (y0 + y1) // 2
+        cx_w = (x0 + x1) // 2
+        half = inference_size // 2
+        min_corner = np.array([cz_w - half, cy_w - half, cx_w - half],
+                              dtype=np.int64)
+        max_corner = min_corner + np.array(
+            [inference_size, inference_size, inference_size], dtype=np.int64,
+        )
+        inf_crop = _read_volume_crop_from_patch(
+            patch,
+            crop_size=(inference_size, inference_size, inference_size),
+            min_corner=min_corner, max_corner=max_corner,
+            image_normalization="unit",
+        )
+        img_for_model = (
+            torch.from_numpy(inf_crop)
+            .float()
+            .unsqueeze(0).unsqueeze(0)
+            .to(device, non_blocking=True)
+        )
+        print(
+            f"{TAG} forward: input={tuple(img_for_model.shape)}  "
+            f"world_min={tuple(int(v) for v in min_corner)}  "
+            f"world_max={tuple(int(v) for v in max_corner)}",
+            flush=True,
+        )
 
         targets_np = training_output["targets"]
         validity_np = training_output["validity"]
@@ -336,21 +391,22 @@ def _compute_inference_output(batch, training_output, model_path, device,
         ):
             results = model(img_for_model)
             raw = results["output"].float()
-            # Match training-time post-processing exactly:
-            # `train_unet_3d.py` does `sigmoid(out)` if output_sigmoid
-            # else `clamp(0, 1)`; old checkpoints store this flag in
-            # the ckpt dict.
             if output_sigmoid:
-                pred = torch.sigmoid(raw)
+                pred_full = torch.sigmoid(raw)
             else:
-                pred = raw.clamp(0.0, 1.0)
+                pred_full = raw.clamp(0.0, 1.0)
+        print(
+            f"{TAG} forward: output={tuple(pred_full.shape)}",
+            flush=True,
+        )
 
-        # Compare at the smaller of (inference patch, comparison tile).
-        compare = min(infer_size, comparison_tile)
-        pred = _center_crop_torch(pred, compare)
-        targets_t = _center_crop_torch(targets_t, compare)
-        validity_t = _center_crop_torch(validity_t, compare)
-        normals_valid_t = _center_crop_torch(normals_valid_t, compare)
+        # Loss + residuals at compare_size = min(inference, dataset).
+        # pred_full is at inference_size; targets are at dataset_patch.
+        # Both center-cropped to compare_size.
+        pred = _center_crop_torch(pred_full, compare_size)
+        targets_t = _center_crop_torch(targets_t, compare_size)
+        validity_t = _center_crop_torch(validity_t, compare_size)
+        normals_valid_t = _center_crop_torch(normals_valid_t, compare_size)
 
         cos_mask = validity_t
         dir_mask = (normals_valid_t > 0.5).float()
@@ -376,10 +432,13 @@ def _compute_inference_output(batch, training_output, model_path, device,
                 pred[:, 1:2], targets_t[:, 1:2], cos_mask, _NUM_SCALES, "abs",
             )
 
+        # Full-size pred (at inference_size) for display; renderer will
+        # crop or pad to dataset_patch (vis_size) as needed.
         return {
-            "pred_cos": pred[0, 0].detach().cpu().numpy(),
-            "pred_mag": pred[0, 1].detach().cpu().numpy(),
-            "pred_dir": pred[0, 2:8].detach().cpu().numpy(),  # (6, Z, Y, X)
+            "pred_cos": pred_full[0, 0].detach().cpu().numpy(),
+            "pred_mag": pred_full[0, 1].detach().cpu().numpy(),
+            "pred_dir": pred_full[0, 2:8].detach().cpu().numpy(),  # (6,Z,Y,X)
+            # Residuals are at compare_size (loss size).
             "diff_cos_full": cos_diff_full[0, 0].detach().cpu().numpy(),
             "diff_mag_full": mag_diff_full[0, 0].detach().cpu().numpy(),
             "diff_cos_ss": cos_diff_ss[0, 0].detach().cpu().numpy(),
@@ -388,7 +447,8 @@ def _compute_inference_output(batch, training_output, model_path, device,
             "loss_mag": loss_mag,
             "loss_dir": loss_dir,
             "loss_total": loss_cos + loss_mag + loss_dir,
-            "compare_tile": int(compare),
+            "inference_size": int(inference_size),
+            "compare_size": int(compare_size),
         }
     except Exception as exc:
         print(f"{TAG} WARNING: inference failed ({exc})", flush=True)
@@ -572,52 +632,10 @@ def _render_sample_figure(
     if direction_channels_full is not None:
         direction_channels_full = direction_channels_full.numpy()  # (6,Z,Y,X)
 
-    # Center-crop everything to the comparison tile when inference
-    # rows are present, so GT and pred panels are at the same scale
-    # and aligned. Without inference, render the full dataset patch.
-    if inference_output is not None:
-        compare = int(inference_output["compare_tile"])
-        full_zyx = image.shape  # (Z, Y, X)
-        offset = _crop_offset(full_zyx, compare)
-        image = _center_crop_np(image, compare)
-        surface_masks = _center_crop_np(surface_masks, compare)
-        if direction_channels_full is not None:
-            direction_channels_full = _center_crop_np(
-                direction_channels_full, compare,
-            )
-        # Also crop the training_output (it's still at dataset size)
-        if training_output is not None:
-            training_output = {
-                "targets": _center_crop_np(training_output["targets"], compare),
-                "validity": _center_crop_np(training_output["validity"], compare),
-                "normals_valid": _center_crop_np(
-                    training_output["normals_valid"], compare),
-                "validity_pyramid": [
-                    _center_crop_np(p, compare)
-                    for p in training_output["validity_pyramid"]
-                ],
-            }
-        # Offset surface_geometry into cropped local coords + drop
-        # points that fall outside the cropped box.
-        new_geom = []
-        for geom in surface_geometry:
-            pts = np.asarray(geom["points_local"])
-            nrm = np.asarray(geom["normals_zyx"])
-            if pts.shape[0] == 0:
-                new_geom.append({"points_local": pts, "normals_zyx": nrm})
-                continue
-            shifted = pts - offset[None, :]
-            inside = (
-                (shifted[:, 0] >= 0) & (shifted[:, 0] < compare) &
-                (shifted[:, 1] >= 0) & (shifted[:, 1] < compare) &
-                (shifted[:, 2] >= 0) & (shifted[:, 2] < compare)
-            )
-            new_geom.append({
-                "points_local": shifted[inside],
-                "normals_zyx": nrm[inside],
-            })
-        surface_geometry = new_geom
-
+    # Renderer always draws at the dataset patch size (vis_size).
+    # Pred and residuals come from inference_output at potentially
+    # different sizes — the per-row drawers center-crop or pad them
+    # below as needed.
     Z, Y, X = image.shape
     cz, cy, cx = Z // 2, Y // 2, X // 2
     image_disp = [
@@ -684,7 +702,12 @@ def _render_sample_figure(
                     ax.set_title(f"GT  {plane_names[col]}", fontsize=9)
                     ax.set_xticks([]); ax.set_yticks([])
 
-                pred_dir = inference_output["pred_dir"]
+                # pred_dir is at inference_size; pad/crop to dataset
+                # patch size so the grid arrows align with the GT panel.
+                pred_dir = _center_crop_or_pad_3d(
+                    inference_output["pred_dir"], normals_valid.shape[-1],
+                    pad_value=0.0,
+                )
                 for col in range(3):
                     ax = axes[3 + col]
                     ax.imshow(image_disp[col], cmap="gray",
@@ -725,12 +748,22 @@ def _render_sample_figure(
         gm_vmax = _auto_vmax(grad_mag_gt, validity > 0.5, percentile=99.0)
 
         if has_inf:
-            pred_cos = inference_output["pred_cos"]
-            pred_mag = inference_output["pred_mag"]
-            diff_cos_full = inference_output["diff_cos_full"]
-            diff_mag_full = inference_output["diff_mag_full"]
-            diff_cos_ss = inference_output["diff_cos_ss"]
-            diff_mag_ss = inference_output["diff_mag_ss"]
+            # pred_* are at inference_size; residuals at compare_size.
+            # Both are center-cropped/padded to dataset patch size (= Z)
+            # so they line up with the GT panels in the same row.
+            assert Z == Y == X, "vis assumes cubic dataset patches"
+            pred_cos = _center_crop_or_pad_3d(
+                inference_output["pred_cos"], Z)
+            pred_mag = _center_crop_or_pad_3d(
+                inference_output["pred_mag"], Z)
+            diff_cos_full = _center_crop_or_pad_3d(
+                inference_output["diff_cos_full"], Z)
+            diff_mag_full = _center_crop_or_pad_3d(
+                inference_output["diff_mag_full"], Z)
+            diff_cos_ss = _center_crop_or_pad_3d(
+                inference_output["diff_cos_ss"], Z)
+            diff_mag_ss = _center_crop_or_pad_3d(
+                inference_output["diff_mag_ss"], Z)
             pred_cos_slices = _plane_slices(pred_cos, cz, cy, cx)
             pred_mag_slices = _plane_slices(pred_mag, cz, cy, cx)
             dcos_full_slices = _plane_slices(diff_cos_full, cz, cy, cx)
@@ -932,17 +965,22 @@ def run_dataset_vis(
 
     with open(train_config, "r") as f:
         config = json.load(f)
-    if patch_size is not None:
-        config["patch_size"] = patch_size
+    # NOTE: --patch-size is intentionally NOT applied to config["patch_size"].
+    # It is only the model-architecture patch size used as a fallback for old
+    # checkpoints that don't embed `patch_size`. The dataset always uses the
+    # training config's own `patch_size` (so GT, surface masks, validity,
+    # cache, etc. match training exactly).
 
-    # Comparison tile = the original training patch size; loss and
-    # residuals are scored at this size regardless of how big the
-    # inference patch is. The dataset must emit at least this size.
-    comparison_tile = int(config["patch_size"])
-    if inference_tile_size is not None:
-        # Dataset must be big enough for the inference patch too.
-        config["patch_size"] = max(comparison_tile, int(inference_tile_size))
-    dataset_emit = int(config["patch_size"])
+    # The dataset uses the training config patch size for everything:
+    # patch finding, surface mask voxelization, GT computation. The
+    # inference flag does NOT affect the dataset — we only feed the
+    # model a separately-read CT crop of size `inference_size`.
+    dataset_patch = int(config["patch_size"])
+    inference_size_eff = (
+        int(inference_tile_size) if inference_tile_size else dataset_patch
+    )
+    compare_size = min(dataset_patch, inference_size_eff)
+    vis_size = dataset_patch
 
     # When --model is set, the checkpoint determines the architecture
     # (NetworkFromConfig.autoconfigure derives stage count from patch
@@ -952,26 +990,18 @@ def run_dataset_vis(
     if model_path is not None:
         meta = _read_checkpoint_meta(model_path, patch_size_override=patch_size)
         model_build_patch_size = int(meta["patch_size"])
-        # output_sigmoid: stored in the checkpoint (old train_unet_3d
-        # ckpts have it; train_tifxyz ckpts default to True). If the
-        # ckpt stores False, training applied `clamp(0, 1)` instead of
-        # `sigmoid(out)` — so we MUST do the same here, otherwise the
-        # vis sees an extra sigmoid the training never had.
         if "output_sigmoid" in meta:
             output_sigmoid = bool(meta["output_sigmoid"])
             sig_src = "checkpoint"
         else:
             output_sigmoid = True
             sig_src = "default (no key in checkpoint)"
-        infer_patch_eff = (
-            int(inference_tile_size) if inference_tile_size else dataset_emit
-        )
-        compare_eff = min(comparison_tile, infer_patch_eff)
         print(
             f"{TAG} model_build={model_build_patch_size}  "
-            f"dataset_emit={dataset_emit}  "
-            f"inference_patch={infer_patch_eff}  "
-            f"compare={compare_eff}",
+            f"dataset_patch={dataset_patch}  "
+            f"inference={inference_size_eff}  "
+            f"compare={compare_size}  "
+            f"vis={vis_size}",
             flush=True,
         )
         print(
@@ -1010,6 +1040,7 @@ def run_dataset_vis(
         # extra work the vis requires over the training path.
         dataset = TifxyzLasagnaDataset(
             sub_config, apply_augmentation=False, include_geometry=True,
+            include_patch_ref=(model_path is not None),
         )
         n_total = len(dataset)
         if n_total == 0:
@@ -1053,8 +1084,8 @@ def run_dataset_vis(
                     inference_output = _compute_inference_output(
                         batch, training_output, model_path, device,
                         model_build_patch_size,
-                        inference_tile_size,
-                        comparison_tile,
+                        inference_size_eff,
+                        compare_size,
                         output_sigmoid,
                     )
 

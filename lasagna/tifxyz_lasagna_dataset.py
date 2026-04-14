@@ -512,6 +512,7 @@ class TifxyzLasagnaDataset(Dataset):
         config: dict,
         apply_augmentation: bool = True,
         include_geometry: bool = False,
+        include_patch_ref: bool = False,
     ):
         # Normalize patch_size to 3-element ZYX array
         patch_size_zyx = np.asarray(config["patch_size"], dtype=np.int32).reshape(-1)
@@ -526,6 +527,10 @@ class TifxyzLasagnaDataset(Dataset):
         # training consumes. Keep False for training (no visible work cost
         # beyond allocating a tiny list of views).
         self.include_geometry = bool(include_geometry)
+        # When True, attach the raw ChunkPatch object to each sample so
+        # downstream code (e.g. lasagna3d dataset vis) can re-read fresh
+        # CT crops at different sizes for inference.
+        self.include_patch_ref = bool(include_patch_ref)
 
         # Augmentation
         if apply_augmentation:
@@ -816,6 +821,8 @@ class TifxyzLasagnaDataset(Dataset):
         }
         if self.include_geometry:
             sample["surface_geometry"] = surface_geometry
+        if self.include_patch_ref:
+            sample["_patch"] = patch
         return sample
 
 
@@ -845,4 +852,6 @@ def collate_variable_surfaces(batch):
     }
     if "surface_geometry" in batch[0]:
         out["surface_geometry"] = [b["surface_geometry"] for b in batch]
+    if "_patch" in batch[0]:
+        out["_patch"] = [b["_patch"] for b in batch]
     return out
