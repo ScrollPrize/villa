@@ -445,10 +445,6 @@ def _compute_inference_output(batch, training_output, model_path, device,
                 pred_full = torch.sigmoid(raw)
             else:
                 pred_full = raw.clamp(0.0, 1.0)
-        print(
-            f"{TAG} forward: output={tuple(pred_full.shape)}",
-            flush=True,
-        )
 
         # Loss + residuals at compare_size = min(inference, dataset).
         # pred_full is at inference_size; targets are at dataset_patch.
@@ -1343,11 +1339,10 @@ def _render_sample_figure(
 
     n_rows = len(rows)
     max_panels = max(n for _, _, n in rows)
-    title_height_in = 0.9 if has_inf else 0.6
-    fig_h = 3.0 * n_rows + title_height_in
-    fig = plt.figure(figsize=(2.4 * max_panels, fig_h))
-    top_frac = 1.0 - title_height_in / fig_h
-    fig.subplots_adjust(top=top_frac)
+    fig = plt.figure(
+        figsize=(2.4 * max_panels, 3.0 * n_rows),
+        layout="constrained",
+    )
     subfigs = fig.subfigures(nrows=n_rows, ncols=1)
     if n_rows == 1:
         subfigs = [subfigs]
@@ -1371,8 +1366,8 @@ def _render_sample_figure(
             f"weighted total = {wc:g}·cos + {wm:g}·mag + {wd:g}·dir "
             f"= {lt:.4f}"
         )
-    fig.suptitle(full_title, fontsize=10, y=0.995, va="top")
-    fig.savefig(out_path, dpi=100, format="jpeg", bbox_inches="tight")
+    fig.suptitle(full_title, fontsize=10)
+    fig.savefig(out_path, dpi=100, format="jpeg")
     plt.close(fig)
 
 
