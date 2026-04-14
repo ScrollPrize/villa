@@ -64,7 +64,11 @@ if _LASAGNA_DIR not in sys.path:
 
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 
-from tifxyz_labels import compute_patch_labels, encode_direction_channels
+from tifxyz_labels import (
+    compute_patch_labels,
+    encode_direction_channels,
+    scale_space_pool_validity,
+)
 from tifxyz_lasagna_dataset import TifxyzLasagnaDataset, collate_variable_surfaces
 
 
@@ -272,14 +276,28 @@ class ScaleSpaceLoss3D(nn.Module):
             if scale < self.num_scales - 1:
                 if x.size(2) < 2 or x.size(3) < 2 or x.size(4) < 2:
                     break
-                x = self.pool(x)
-                y = self.pool(y)
                 if m is not None:
-                    invalid = 1.0 - m
-                    invalid_pooled = F.max_pool3d(invalid, kernel_size=2, stride=2)
-                    m = 1.0 - invalid_pooled
-                if w is not None:
-                    w = -F.max_pool3d(-w, kernel_size=2, stride=2)
+                    # Masked-average pooling: at each coarser scale,
+                    # x and y are averaged only over the *valid* voxels
+                    # of every 2x2x2 block. The validity mask itself
+                    # follows the any-valid rule (max-pool), shared with
+                    # the vis via scale_space_pool_validity. This way a
+                    # single valid voxel in a block still produces a
+                    # meaningful coarse target instead of being silently
+                    # diluted by the seven invalid neighbours.
+                    eps = 1e-6
+                    m_count = F.avg_pool3d(m, kernel_size=2, stride=2)
+                    denom = m_count.clamp_min(eps)
+                    x = F.avg_pool3d(x * m, kernel_size=2, stride=2) / denom
+                    y = F.avg_pool3d(y * m, kernel_size=2, stride=2) / denom
+                    if w is not None:
+                        w = F.avg_pool3d(w * m, kernel_size=2, stride=2) / denom
+                    m = scale_space_pool_validity(m)
+                else:
+                    x = self.pool(x)
+                    y = self.pool(y)
+                    if w is not None:
+                        w = self.pool(w)
         return total
 
 

@@ -300,21 +300,73 @@ Consequences:
   global nearest-surface assignment routes each voxel to the chain it
   belongs to.
 
+**Near-surface carve-out (1-voxel halo).** The dt-gradient
+between-ness test is unreliable in a 1-voxel halo around every
+rasterized surface, for three distinct reasons:
+
+1. **On-surface (`dt_near = 0`)**: the central-difference gradient of
+   `dt_near` collapses to ~0 (neighbours are at `dt = 1` on both
+   sides), so the dot product is ~0 and the strict `< 0` check rejects
+   the voxel.
+2. **Adjacent (`dt_near = 1`)**: along axes parallel to a flat
+   surface, central differences give `(1 − 1)/2 = 0`, so
+   `grad(dt_near)` collapses to a single nonzero component. If
+   `grad(dt_prev)` happens to put its nonzero component on a different
+   axis (curved or non-coplanar prev), the dot is exactly 0 — again
+   rejected by `< 0`.
+3. **`argmin` tie-break**: at voxels equidistant from two surfaces
+   (sheets two voxels apart, intersections), `nearest_surf` picks the
+   lower index. The "loser" surface never processes that voxel, and
+   the winner's gradient test may also fail — leaving an isolated
+   one-voxel hole in cos *and* grad_mag.
+
+We therefore OR `(dt_near < 1.5) & is_nearest` into the
+prev/next eligibility masks before routing. The bracketing formula
+degrades gracefully across the halo: at `dt_near = 0` it produces
+`cos = 1`; at `dt_near = 1` it produces `cos ≈ 0.976`, matching the
+value the dt test already gives at the next voxel out — no
+discontinuity.
+
+**Routing precedence.** When the dt-gradient test does fire correctly
+on a near-surface voxel, we trust it: `between_prev` / `between_next`
+take precedence over the carve-out for the prev/next routing decision.
+The carve-out only gets to choose the side for voxels where *neither*
+between-ness check succeeded (the genuinely-degenerate cases). This
+preserves the geometric correctness of in-gap supervision — e.g. in a
+3-surface chain, a `dt_near = 1` voxel just to one side of the middle
+surface gets bracketed by the gap it actually sits in, not the
+opposite gap.
+
+A consequence of the wider halo: the carve-out admits voxels exactly
+1 step *outside* a chain endpoint surface as well (since they have
+`dt_near = 1`). They get a smooth extrapolation of the cos signal
+(`cos ≈ 0.976`, `grad_mag ≈ 1/(spacing + 1)`), which is mild and
+geometrically smooth supervision noise rather than a contradiction.
+
 #### Bracketing distances, cos and grad_mag
 
 ```python
 d_lo = torch.where(use_prev, dt_prev, dt_near)
 d_hi = torch.where(use_prev, dt_near, dt_next)
 spacing = d_lo + d_hi
-frac = torch.clamp(d_lo / (spacing * 0.5 + 1e-6), 0.0, 1.0)
-cos     = 0.5 + 0.5 * torch.cos(math.pi * frac)
+frac = d_lo / (spacing + 1e-6)                       # 0 at "lo", 1 at "hi"
+cos      = 0.5 + 0.5 * torch.cos(2.0 * math.pi * frac)
 grad_mag = 1.0 / (spacing + 1e-6)
 ```
 
-`cos` peaks at 1.0 on each sheet and dips to 0.0 midway between sheets;
-`grad_mag` encodes inverse inter-sheet spacing. Both are assigned only at
-voxels where `local_valid` is true, leaving the rest at 0 and excluded from
-the loss via the validity mask.
+`cos` is a **full-period** winding encoding across each inter-sheet gap:
+it peaks at 1.0 on each sheet, dips to 0.0 midway, and rises back to 1.0
+on the opposing sheet. `grad_mag` encodes inverse inter-sheet spacing.
+Both are assigned only at voxels where `local_valid` is true, leaving
+the rest at 0 and excluded from the loss via the validity mask.
+
+**Note** — earlier revisions used a half-period formula
+(`cos(π·clamp(d_lo/(spacing/2), 0, 1))`) that clamped the second half of
+every gap to 0 and produced a step discontinuity at the midway boundary
+between the `use_prev` and `use_next` branches. The current full-period
+formula removes the clamp and uses a true sinusoid across the whole
+gap, verified via a synthetic two-plane unit check
+(`profile[x] == 0.5 + 0.5·cos(2π·(x-x_lo)/spacing)` to within 1e-3).
 
 #### Direction channels and masking
 

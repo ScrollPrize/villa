@@ -222,7 +222,13 @@ Resume training with `--weights path/to/model_current.pt`.
 6. **Loss** -- masked multi-scale MSE (cos, direction) + smooth L1 (grad_mag),
    weighted by validity masks. Directions are supervised only on surface
    voxels (via `normals_valid`); cos and grad_mag are supervised only in the
-   between-neighbors region (via the chain-derived validity mask).
+   between-neighbors region (via the chain-derived validity mask). At
+   coarser scales `ScaleSpaceLoss3D` performs **masked-average pooling**
+   on prediction and target (averaging only over valid voxels per
+   2×2×2 block) and uses an **any-valid** rule for the validity mask
+   itself (`tifxyz_labels.scale_space_pool_validity` = `max_pool3d`).
+   This keeps coarse supervision wherever a block has at least one
+   valid voxel instead of eroding signal away.
 
 
 ## Surface chain ordering

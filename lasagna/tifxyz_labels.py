@@ -71,6 +71,48 @@ def encode_direction_channels(
 
 
 # ---------------------------------------------------------------------------
+# Scale-space validity pooling (shared with ScaleSpaceLoss3D and vis)
+# ---------------------------------------------------------------------------
+
+def scale_space_pool_validity(m: torch.Tensor) -> torch.Tensor:
+    """Single step of validity scale-space pooling — **any-valid** rule.
+
+    A coarse voxel is valid iff *at least one* of its eight fine children
+    was valid. Implemented as a plain ``max_pool3d`` on the validity
+    mask. Both ``ScaleSpaceLoss3D`` and ``lasagna3d dataset vis`` call
+    this so the validity mask the loss applies at each scale is exactly
+    what the visualization shows.
+
+    This pairs with the masked-average pooling of the prediction and
+    target tensors in ``ScaleSpaceLoss3D``: at coarser scales we average
+    the signal only over valid voxels, so as long as the block contains
+    *any* valid voxel we have a meaningful coarse target and should keep
+    supervising it.
+    """
+    return F.max_pool3d(m, kernel_size=2, stride=2)
+
+
+def scale_space_validity_pyramid(
+    m: torch.Tensor, num_scales: int,
+) -> list[torch.Tensor]:
+    """Return ``[level_0, level_1, ..., level_{n-1}]`` of validity masks.
+
+    ``level_0 = m`` (full res). Each subsequent level is one
+    ``scale_space_pool_validity`` step. Stops early if spatial dims drop
+    below 2. Used by vis to display the full pyramid; loss code keeps
+    calling ``scale_space_pool_validity`` incrementally to avoid holding
+    every level in memory at once.
+    """
+    levels = [m]
+    for _ in range(num_scales - 1):
+        cur = levels[-1]
+        if cur.shape[-1] < 2 or cur.shape[-2] < 2 or cur.shape[-3] < 2:
+            break
+        levels.append(scale_space_pool_validity(cur))
+    return levels
+
+
+# ---------------------------------------------------------------------------
 # Chain reconstruction from per-mask metadata
 # ---------------------------------------------------------------------------
 
@@ -234,11 +276,55 @@ def derive_cos_gradmag_validity(
                 between_next = torch.zeros(shape, dtype=torch.bool, device=device)
                 dt_next = dt_near
 
-            # A voxel belongs to the prev side if it's bracketed by (prev, near);
-            # otherwise to the next side if bracketed by (near, next). If both,
-            # prefer prev (arbitrary but deterministic).
-            use_prev = between_prev
-            use_next = between_next & ~use_prev
+            # Near-surface carve-out (1-voxel halo, dt_near < 1.5).
+            #
+            # The dt-gradient between-ness test is unreliable in three
+            # cases right at/next to the surface:
+            #
+            #   1. On-surface (dt_near=0): grad(dt_near)≈0 via central
+            #      differences — dot test degenerates to ~0.
+            #   2. Adjacent (dt_near=1): along axes parallel to the
+            #      surface, central differences give (1−1)/2=0, so
+            #      grad(dt_near) collapses to a single component. If
+            #      grad(dt_prev) has its nonzero component on a
+            #      different axis (curved/non-coplanar prev), the dot
+            #      can be exactly 0 — strict `< 0` rejects it.
+            #   3. Argmin tie-break at dt=1 from two surfaces (sheets
+            #      two voxels apart, intersections): only the lower
+            #      index "wins" is_nearest, the loser never processes
+            #      that voxel, and the winner's gradient test may also
+            #      fail.
+            #
+            # All three live within a 1-voxel halo. We bypass the dot
+            # test there and let the bracketing formula produce the
+            # natural cos value (1 at dt_near=0, ~0.976 at dt_near=1
+            # — matching what the dot test already supervises at the
+            # next voxel out).
+            near_surface = (dt_near < 1.5) & is_nearest
+
+            # The dt-gradient test, when it works, tells us *which side*
+            # of `near` the voxel is on (between prev or between next).
+            # The carve-out only kicks in for voxels where the test is
+            # unreliable — so we should only let the carve-out *route*
+            # voxels that the dt test couldn't classify.
+            unrouted_carveout = near_surface & ~between_prev & ~between_next
+
+            # Routing precedence: trust the dt test first; for unrouted
+            # carve-out voxels prefer `next` (so on-surface voxels hit
+            # d_lo = dt_near = 0 → cos(0) = 1 directly), falling back to
+            # `prev` only when there is no next neighbour.
+            use_next = between_next.clone()
+            use_prev = between_prev.clone()
+            if has_next:
+                use_next = use_next | unrouted_carveout
+            elif has_prev:
+                # No next neighbour — carve-out has to use prev side.
+                use_prev = use_prev | unrouted_carveout
+            # Mutual exclusivity: a voxel routed via use_next cannot
+            # also be routed via use_prev (off-surface bracketed voxels
+            # already disjoint by construction; this matters for the
+            # rare double-bracket case at degenerate geometries).
+            use_prev = use_prev & ~use_next
             local_valid = use_prev | use_next
             if not local_valid.any():
                 continue
@@ -246,8 +332,15 @@ def derive_cos_gradmag_validity(
             d_lo = torch.where(use_prev, dt_prev, dt_near)
             d_hi = torch.where(use_prev, dt_near, dt_next)
             spacing = d_lo + d_hi
-            frac = torch.clamp(d_lo / (spacing * 0.5 + 1e-6), 0.0, 1.0)
-            cos_full = 0.5 + 0.5 * torch.cos(math.pi * frac)
+            # Full-period winding cos over the *entire* inter-sheet gap:
+            # frac = d_lo / spacing runs 0 → 1 from the "lo" surface to
+            # the "hi" surface, and 0.5 + 0.5*cos(2π·frac) goes 1 → 0 → 1
+            # smoothly across it. The old half-period + clamp formula
+            # clipped the second half of every gap to 0 and produced a
+            # discontinuous jump at the midway transition between the
+            # use_prev and use_next branches.
+            frac = d_lo / (spacing + 1e-6)
+            cos_full = 0.5 + 0.5 * torch.cos(2.0 * math.pi * frac)
             grad_mag_full = 1.0 / (spacing + 1e-6)
 
             cos_out = torch.where(local_valid, cos_full, cos_out)

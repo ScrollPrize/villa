@@ -511,6 +511,7 @@ class TifxyzLasagnaDataset(Dataset):
         self,
         config: dict,
         apply_augmentation: bool = True,
+        include_geometry: bool = False,
     ):
         # Normalize patch_size to 3-element ZYX array
         patch_size_zyx = np.asarray(config["patch_size"], dtype=np.int32).reshape(-1)
@@ -519,6 +520,12 @@ class TifxyzLasagnaDataset(Dataset):
         self.patch_size_zyx = patch_size_zyx
 
         self.max_surfaces_per_patch = int(config.get("max_surfaces_per_patch", 8))
+        # Emits per-surface raw geometry (``surface_geometry``) in the
+        # __getitem__ output when True. Used by lasagna3d dataset vis to
+        # draw normal arrows and per-wrap labels from the exact tensors
+        # training consumes. Keep False for training (no visible work cost
+        # beyond allocating a tiny list of views).
+        self.include_geometry = bool(include_geometry)
 
         # Augmentation
         if apply_augmentation:
@@ -580,21 +587,31 @@ class TifxyzLasagnaDataset(Dataset):
     def _extract_and_voxelize_wrap(self, patch, wrap, min_corner, crop_size):
         """Extract a wrap surface, voxelize it, and compute direction channels.
 
-        Args:
-            patch: ChunkPatch containing the volume and world_bbox
-            wrap: dict with "segment", "bbox_2d", etc.
-            min_corner: (3,) int64 array — ZYX origin of the crop
-            crop_size: (Z, Y, X) int tuple
+        This is the **single source of truth** for turning one wrap into its
+        training signal. Both the training path (``__getitem__``) and the
+        visualization path (``lasagna3d dataset vis``) call this method and
+        build their output from the returned dict — the vis never
+        re-implements the upsample/trim/voxelize logic.
 
-        Returns:
-            surface_mask: (Z, Y, X) float32 — binary voxelization
-            dir_points_local: (M, 3) float32 — local ZYX positions for splatting
-            dir_values: (M, 6) float32 — direction channel values
+        Returns a dict with keys:
+            mask          (Z, Y, X) float32 — binary voxelization
+            points_local  (M, 3) float32   — local ZYX positions for splatting
+            normals_zyx   (M, 3) float32   — raw ZYX normals at those positions
+                                             (pre double-angle encoding)
+            dir_values    (M, 6) float32   — double-angle direction channels
         """
         crop_size_tuple = tuple(int(v) for v in crop_size)
         empty_pts = np.zeros((0, 3), dtype=np.float32)
         empty_vals = np.zeros((0, 6), dtype=np.float32)
         empty_mask = np.zeros(crop_size_tuple, dtype=np.float32)
+
+        def _empty(mask=empty_mask):
+            return {
+                "mask": mask,
+                "points_local": empty_pts,
+                "normals_zyx": empty_pts.copy(),
+                "dir_values": empty_vals,
+            }
 
         seg = wrap["segment"]
         r_min, r_max, c_min, c_max = wrap["bbox_2d"]
@@ -606,18 +623,18 @@ class TifxyzLasagnaDataset(Dataset):
         c_min = max(0, c_min)
         c_max = min(seg_w - 1, c_max)
         if r_max < r_min or c_max < c_min:
-            return empty_mask, empty_pts, empty_vals
+            return _empty()
 
         # Read stored-resolution grid
         seg.use_stored_resolution()
         scale_y, scale_x = seg._scale
         x_s, y_s, z_s, valid_s = seg[r_min:r_max + 1, c_min:c_max + 1]
         if x_s.size == 0:
-            return empty_mask, empty_pts, empty_vals
+            return _empty()
 
         # Skip wraps with invalid cells in stored grid (upsampling requires all-valid)
         if valid_s is not None and not valid_s.all():
-            return empty_mask, empty_pts, empty_vals
+            return _empty()
 
         # Upsample to full resolution
         try:
@@ -625,12 +642,12 @@ class TifxyzLasagnaDataset(Dataset):
                 x_s, y_s, z_s, scale_y, scale_x,
             )
         except ValueError:
-            return empty_mask, empty_pts, empty_vals
+            return _empty()
 
         # Trim to world bbox
         trimmed = _trim_to_world_bbox(x_full, y_full, z_full, patch.world_bbox)
         if trimmed is None:
-            return empty_mask, empty_pts, empty_vals
+            return _empty()
         x_full, y_full, z_full = trimmed
 
         # Build (H, W, 3) ZYX grid in world coordinates
@@ -654,7 +671,7 @@ class TifxyzLasagnaDataset(Dataset):
         )
 
         if not np.any(valid):
-            return empty_mask, empty_pts, empty_vals
+            return _empty()
 
         # Voxelize using neural tracing's line-drawing rasterizer
         surface_mask = voxelize_surface_grid_masked(
@@ -667,14 +684,18 @@ class TifxyzLasagnaDataset(Dataset):
         # Direction encoding from normals
         valid_for_dir = valid & np.isfinite(normals_zyx).all(axis=-1)
         if not np.any(valid_for_dir):
-            return surface_mask, empty_pts, empty_vals
+            return _empty(surface_mask)
 
         pts_local = zyx_local[valid_for_dir].astype(np.float32)
-        dir_vals = compute_direction_values(
-            normals_zyx[valid_for_dir].astype(np.float32),
-        )
+        normals_used = normals_zyx[valid_for_dir].astype(np.float32)
+        dir_vals = compute_direction_values(normals_used)
 
-        return surface_mask, pts_local, dir_vals
+        return {
+            "mask": surface_mask,
+            "points_local": pts_local,
+            "normals_zyx": normals_used,
+            "dir_values": dir_vals,
+        }
 
     def __getitem__(self, idx):
         patch = self.patches[idx]
@@ -691,7 +712,7 @@ class TifxyzLasagnaDataset(Dataset):
             min_corner=min_corner, max_corner=max_corner,
         )
 
-        # Per-patch chain info (wrap_idx → chain/pos/has_prev/has_next)
+        # Per-patch chain info (wrap_idx → chain/pos/has_prev/has_next/label)
         chain_info_full = build_patch_chains(patch, self.max_surfaces_per_patch)
 
         # Per-surface: voxelize mask and compute direction channels
@@ -699,17 +720,26 @@ class TifxyzLasagnaDataset(Dataset):
         all_dir_points = []
         all_dir_values = []
         kept_wrap_indices: list[int] = []
+        surface_geometry: list[dict] = []
 
         for wrap_idx, wrap in enumerate(patch.wraps[:self.max_surfaces_per_patch]):
-            mask, dir_pts, dir_vals = self._extract_and_voxelize_wrap(
+            wrap_out = self._extract_and_voxelize_wrap(
                 patch, wrap, min_corner, crop_size,
             )
+            mask = wrap_out["mask"]
             if np.any(mask > 0):
                 surface_masks.append(mask)
                 kept_wrap_indices.append(wrap_idx)
+                dir_pts = wrap_out["points_local"]
                 if dir_pts.shape[0] > 0:
                     all_dir_points.append(dir_pts)
-                    all_dir_values.append(dir_vals)
+                    all_dir_values.append(wrap_out["dir_values"])
+                if self.include_geometry:
+                    surface_geometry.append({
+                        "wrap_idx": wrap_idx,
+                        "points_local": wrap_out["points_local"],
+                        "normals_zyx": wrap_out["normals_zyx"],
+                    })
 
         num_surfaces = len(surface_masks)
 
@@ -719,15 +749,19 @@ class TifxyzLasagnaDataset(Dataset):
             entry = chain_info_full.get(wi)
             if entry is None:
                 surface_chain_info.append({
+                    "wrap_idx": wi,
                     "chain": -1, "pos": 0,
                     "has_prev": False, "has_next": False,
+                    "label": "?",
                 })
             else:
                 surface_chain_info.append({
+                    "wrap_idx": wi,
                     "chain": int(entry["chain"]),
                     "pos": int(entry["pos"]),
                     "has_prev": bool(entry["has_prev"]),
                     "has_next": bool(entry["has_next"]),
+                    "label": str(entry.get("label", f"?{int(entry['pos'])}")),
                 })
 
         # Stack surface masks: (N, Z, Y, X)
@@ -760,7 +794,7 @@ class TifxyzLasagnaDataset(Dataset):
         normals_valid_t = torch.as_tensor(normals_valid_vol, dtype=torch.float32).unsqueeze(0)
         padding_mask_t = torch.as_tensor(padding_mask, dtype=torch.float32).unsqueeze(0)
 
-        return {
+        sample = {
             "image": vol_crop_t,                        # (1, Z, Y, X)
             "surface_masks": surface_masks_t,           # (N, Z, Y, X)
             "direction_channels": direction_channels_t, # (6, Z, Y, X)
@@ -774,6 +808,9 @@ class TifxyzLasagnaDataset(Dataset):
                 "idx": int(idx),
             },
         }
+        if self.include_geometry:
+            sample["surface_geometry"] = surface_geometry
+        return sample
 
 
 def collate_variable_surfaces(batch):
@@ -790,7 +827,7 @@ def collate_variable_surfaces(batch):
     surface_chain_info = [b["surface_chain_info"] for b in batch]
     patch_infos = [b["patch_info"] for b in batch]
 
-    return {
+    out = {
         "image": images,                        # (B, 1, Z, Y, X)
         "surface_masks": surface_masks,         # list of (Ni, Z, Y, X) tensors
         "direction_channels": direction_channels,  # (B, 6, Z, Y, X)
@@ -800,3 +837,6 @@ def collate_variable_surfaces(batch):
         "surface_chain_info": surface_chain_info,  # list of list[dict]
         "patch_info": patch_infos,
     }
+    if "surface_geometry" in batch[0]:
+        out["surface_geometry"] = [b["surface_geometry"] for b in batch]
+    return out

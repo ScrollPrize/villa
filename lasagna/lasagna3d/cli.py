@@ -30,6 +30,11 @@ def main() -> None:
                      help="Seed for deterministic shuffle (default: 0).")
     vis.add_argument("--patch-size", type=int, default=None,
                      help="Override patch_size from the config.")
+    vis.add_argument("--num-workers", type=int, default=None,
+                     help="DataLoader workers for parallel extraction "
+                          "and render thread pool size. Default: number "
+                          "of CPU cores (os.cpu_count()). 0 runs "
+                          "everything on the main thread.")
 
     args = parser.parse_args()
 
@@ -41,6 +46,7 @@ def main() -> None:
             num_samples=args.num_samples,
             seed=args.seed,
             patch_size=args.patch_size,
+            num_workers=args.num_workers,
         )
         return
 
