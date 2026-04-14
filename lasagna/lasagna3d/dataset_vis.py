@@ -432,7 +432,8 @@ def _compute_inference_output(batch, training_output, model_path, device,
                               inference_size: int,
                               compare_size: int,
                               output_sigmoid: bool,
-                              loss_weights: tuple = (1.0, 1.0, 1.0)):
+                              loss_weights: tuple = (1.0, 1.0, 1.0),
+                              model=None):
     """Run the model on a fresh CT crop centered on the patch's world
     bbox, then compute losses + residual maps cropped to `compare_size`.
     Returns ``None`` if CUDA / model load fail.
@@ -448,7 +449,8 @@ def _compute_inference_output(batch, training_output, model_path, device,
         return None
 
     try:
-        model = _load_model(model_path, model_build_patch_size, device)
+        if model is None:
+            model = _load_model(model_path, model_build_patch_size, device)
 
         # Read a fresh inference-sized CT crop centered on the patch's
         # world center. Independent of the dataset's image tensor —
@@ -1650,6 +1652,7 @@ def render_batch_figure(
     arrow_seed: int,
     inference_ctx: dict,
     same_surface_groups: list[list[int]] | None = None,
+    model=None,
 ) -> None:
     """End-to-end: compute training_output (+ optional inference_output)
     and write the JPEG. Mirrors what `run_dataset_vis` does for a single
@@ -1669,16 +1672,17 @@ def render_batch_figure(
     )
 
     inference_output = None
-    if inference_ctx.get("model_path") is not None:
+    if inference_ctx.get("model_path") is not None or model is not None:
         import torch
         device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
         inference_output = _compute_inference_output(
-            batch, training_output, inference_ctx["model_path"], device,
+            batch, training_output, inference_ctx.get("model_path"), device,
             inference_ctx["model_build_patch_size"],
             inference_ctx["inference_size_eff"],
             inference_ctx["compare_size"],
             inference_ctx["output_sigmoid"],
             inference_ctx["loss_weights"],
+            model=model,
         )
 
     _render_sample_figure(

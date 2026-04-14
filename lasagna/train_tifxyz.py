@@ -637,10 +637,16 @@ def train(
 
     # Lasagna3d-style full-vis logging: one JPEG per ~1000 samples,
     # written to run_dir/vis and mirrored into TB as an image.
+    # The live model is handed to render_batch_figure so the figure
+    # includes inference + residual rows, not just supervision.
     vis_ctx = build_inference_context(
         model_path=None, config=config,
         same_surface_threshold=same_surface_threshold,
     )
+    arch_patch = int(model_patch_size) if model_patch_size else int(patch_size)
+    vis_ctx["model_build_patch_size"] = arch_patch
+    vis_ctx["output_sigmoid"] = bool(output_sigmoid)
+    vis_ctx["loss_weights"] = (float(w_cos), float(w_mag), float(w_dir))
     vis_out_dir = run_dir / "vis"
     vis_out_dir.mkdir(exist_ok=True)
     vis_interval_steps = max(1, 1000 // max(batch_size, 1))
@@ -655,11 +661,18 @@ def train(
             title = (f"step={step}  "
                      + default_vis_title(ds_name, idx0, sample0))
             out_path = vis_out_dir / f"{tag}_step_{step:07d}.jpg"
-            render_batch_figure(
-                batch_for_vis, out_path, title,
-                arrow_seed=step,
-                inference_ctx=vis_ctx,
-            )
+            was_training = model.training
+            model.eval()
+            try:
+                render_batch_figure(
+                    batch_for_vis, out_path, title,
+                    arrow_seed=step,
+                    inference_ctx=vis_ctx,
+                    model=model,
+                )
+            finally:
+                if was_training:
+                    model.train()
             img_rgb = np.asarray(Image.open(out_path).convert("RGB"))
             writer.add_image(
                 f"{tag}/full_vis", img_rgb, step, dataformats="HWC",
@@ -749,24 +762,30 @@ def train(
 
                 # Per-sample grad-mag screen: flag any sample with
                 # per-sample scale-space L1 >= 1 as an outlier, log it,
-                # and drop it from the batch for this step. Keeps the
-                # bad sample from dominating the gradient.
+                # and drop it from the batch for this step. Runs under
+                # no_grad with each scalar eagerly moved to a Python
+                # float — nothing is retained past the with block, so
+                # the screen adds no autograd graph to the forward.
                 B = pred.shape[0]
-                per_mag = torch.stack([
-                    scale_loss_l1(
-                        pred[b:b+1, 1:2], targets[b:b+1, 1:2],
-                        mask=cos_mask[b:b+1],
-                    ) for b in range(B)
-                ])
-                bad = [b for b in range(B) if float(per_mag[b].item()) >= 1.0]
+                with torch.no_grad():
+                    per_mag_vals: list[float] = []
+                    for b in range(B):
+                        v = scale_loss_l1(
+                            pred[b:b+1, 1:2].detach(),
+                            targets[b:b+1, 1:2],
+                            mask=cos_mask[b:b+1],
+                        )
+                        per_mag_vals.append(float(v.item()))
+                        del v
+                bad = [b for b, v in enumerate(per_mag_vals) if v >= 1.0]
                 for b in bad:
                     pi = batch["patch_info"][b]
-                    ds_b = pi.get("dataset_name", pi.get("dataset", "?"))
-                    idx_b = pi.get("patch_idx", "?")
+                    seg = pi.get("segment_uuid", "?")
+                    idx_b = pi.get("idx", "?")
                     print(
                         f"{TAG} hi-mag skip step={global_step} "
-                        f"ds={ds_b} idx={idx_b} "
-                        f"mag_loss={float(per_mag[b].item()):.4f}",
+                        f"seg={seg} idx={idx_b} "
+                        f"mag_loss={per_mag_vals[b]:.4f}",
                         flush=True,
                     )
                 n_hi_mag += len(bad)
