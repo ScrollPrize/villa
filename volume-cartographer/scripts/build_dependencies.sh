@@ -77,7 +77,39 @@ if [[ "$MODE" == "root" ]]; then
     libavahi-client-dev libde265-dev libx265-dev rclone nlohmann-json3-dev liblz4-dev \
     libcurl4-openssl-dev file curl unzip ca-certificates bzip2 wget fuse jq gimp \
     desktop-file-utils flex bison zlib1g-dev gfortran libopenblas-dev liblapack-dev \
-    libscotch-dev libhwloc-dev libomp-dev
+    libscotch-dev libhwloc-dev libomp-dev \
+    mdadm nvme-cli
+
+  # ---- Ephemeral NVMe: RAID0 + mount at /ephemeral ------------------------
+  # EC2 instance-store NVMe drives show up with model "Amazon EC2 NVMe Instance
+  # Storage". Detect them, RAID0 into /dev/md0 (if >=2), format ext4, mount
+  # at /ephemeral (owned by $TARGET_USER). Idempotent — skipped if already
+  # mounted. Data here is lost on stop/terminate, never use for state we need.
+  if ! mountpoint -q /ephemeral; then
+    mapfile -t NVMES < <(lsblk -dno NAME,MODEL | awk '/Instance Storage/ {print "/dev/"$1}')
+    if [[ ${#NVMES[@]} -eq 0 ]]; then
+      log "Ephemeral: no local NVMe instance storage detected; skipping"
+    else
+      log "Ephemeral: found ${#NVMES[@]} NVMe devices: ${NVMES[*]}"
+      for d in "${NVMES[@]}"; do umount "$d" 2>/dev/null || true; wipefs -a "$d" || true; done
+      if [[ ${#NVMES[@]} -ge 2 ]]; then
+        EPHEMERAL_DEV=/dev/md0
+        mdadm --stop /dev/md0 2>/dev/null || true
+        mdadm --create --verbose /dev/md0 --level=0 --raid-devices=${#NVMES[@]} \
+              --force --run "${NVMES[@]}"
+      else
+        EPHEMERAL_DEV="${NVMES[0]}"
+      fi
+      mkfs.ext4 -F -E nodiscard -L ephemeral "$EPHEMERAL_DEV"
+      mkdir -p /ephemeral
+      mount -o noatime,nodiratime "$EPHEMERAL_DEV" /ephemeral
+      chown "$TARGET_USER:$TARGET_USER" /ephemeral
+      chmod 0755 /ephemeral
+      log "Ephemeral: mounted $EPHEMERAL_DEV at /ephemeral ($(df -h /ephemeral | awk 'NR==2{print $2}'))"
+    fi
+  else
+    log "Ephemeral: /ephemeral already mounted; skipping"
+  fi
 
   log "apt: pin xtl 0.7.7 + xtensor 0.25"
   tmpd="$(mktemp -d)"; pushd "$tmpd" >/dev/null
