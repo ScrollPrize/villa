@@ -858,3 +858,134 @@ def collate_variable_surfaces(batch):
     if "_patch" in batch[0]:
         out["_patch"] = [b["_patch"] for b in batch]
     return out
+
+
+# ---------------------------------------------------------------------------
+# Geometry-level spatial augmentation
+# ---------------------------------------------------------------------------
+
+def _transform_geometry(geom_list, flip_z, flip_y, flip_x, k, size_zyx):
+    """Flip/rot transform for a single sample's surface_geometry list.
+
+    Applies per-axis coordinate flips + k*90° rotation around Z,
+    with the matching sign flip / XY rotation on the raw normals.
+    The result still holds valid ``points_local`` / ``normals_zyx``
+    in the patch-local ZYX frame, so downstream re-splatting via
+    ``compute_direction_values`` + ``_splat_multichannel`` produces
+    a correctly encoded direction_channels volume for the new frame.
+    """
+    Zs, Ys, Xs = int(size_zyx[0]), int(size_zyx[1]), int(size_zyx[2])
+    out = []
+    for g in geom_list:
+        pts = np.asarray(
+            g.get("points_local", np.zeros((0, 3), np.float32))
+        ).astype(np.float32).copy()
+        nrm = np.asarray(
+            g.get("normals_zyx", np.zeros((0, 3), np.float32))
+        ).astype(np.float32).copy()
+        if pts.shape[0]:
+            if flip_z:
+                pts[:, 0] = (Zs - 1) - pts[:, 0]
+                nrm[:, 0] *= -1.0
+            if flip_y:
+                pts[:, 1] = (Ys - 1) - pts[:, 1]
+                nrm[:, 1] *= -1.0
+            if flip_x:
+                pts[:, 2] = (Xs - 1) - pts[:, 2]
+                nrm[:, 2] *= -1.0
+            for _ in range(k % 4):
+                y_new = pts[:, 2].copy()
+                x_new = (Ys - 1) - pts[:, 1]
+                pts[:, 1] = y_new
+                pts[:, 2] = x_new
+                ny_new = nrm[:, 2].copy()
+                nx_new = -nrm[:, 1]
+                nrm[:, 1] = ny_new
+                nrm[:, 2] = nx_new
+        out.append({**g, "points_local": pts, "normals_zyx": nrm})
+    return out
+
+
+def augment_batch_inplace(batch: dict) -> dict:
+    """Apply a single shared random flip+rot90 transform to every
+    patch-local field in a collated batch, then re-splat the
+    direction_channels and normals_valid volumes from the
+    augmented surface_geometry so the double-angle encoding is
+    correct in the new frame.
+
+    Intended to be called by the training loop before
+    ``compute_batch_targets``. Val should not call this.
+    """
+    flip_z = bool(torch.rand(1).item() < 0.5)
+    flip_y = bool(torch.rand(1).item() < 0.5)
+    flip_x = bool(torch.rand(1).item() < 0.5)
+    k = int(torch.randint(0, 4, (1,)).item())
+    if not (flip_z or flip_y or flip_x or k):
+        return batch
+
+    def _flip_rot(t, dims):
+        dz, dy, dx = dims
+        if flip_z:
+            t = torch.flip(t, [dz])
+        if flip_y:
+            t = torch.flip(t, [dy])
+        if flip_x:
+            t = torch.flip(t, [dx])
+        if k:
+            t = torch.rot90(t, k, dims=(dy, dx))
+        return t
+
+    batch["image"] = _flip_rot(batch["image"], (2, 3, 4))
+    batch["padding_mask"] = _flip_rot(batch["padding_mask"], (2, 3, 4))
+    batch["surface_masks"] = [
+        _flip_rot(m, (1, 2, 3)) for m in batch["surface_masks"]
+    ]
+
+    B = batch["image"].shape[0]
+    Z, Y, X = batch["image"].shape[2:]
+
+    if "surface_geometry" not in batch:
+        # No geometry — can only re-splat if we have it. Fall back
+        # to geometric flip of the existing direction_channels (this
+        # retains the latent sign/rotation bug but avoids crashing
+        # on datasets built without include_geometry=True).
+        batch["direction_channels"] = _flip_rot(
+            batch["direction_channels"], (2, 3, 4),
+        )
+        batch["normals_valid"] = _flip_rot(
+            batch["normals_valid"], (2, 3, 4),
+        )
+        return batch
+
+    new_dir_channels = torch.zeros_like(batch["direction_channels"])
+    new_normals_valid = torch.zeros_like(batch["normals_valid"])
+
+    for b in range(B):
+        geom = _transform_geometry(
+            batch["surface_geometry"][b],
+            flip_z, flip_y, flip_x, k, (Z, Y, X),
+        )
+        batch["surface_geometry"][b] = geom
+
+        if not geom:
+            continue
+        pts_list = [g["points_local"] for g in geom if g["points_local"].shape[0]]
+        nrm_list = [g["normals_zyx"] for g in geom if g["normals_zyx"].shape[0]]
+        if not pts_list:
+            continue
+        all_pts = np.concatenate(pts_list, axis=0)
+        all_nrm = np.concatenate(nrm_list, axis=0)
+        dir_vals = compute_direction_values(all_nrm)  # (N, 6)
+        dir_ch, nv = _splat_multichannel(
+            all_pts, dir_vals, (int(Z), int(Y), int(X)),
+        )
+        new_dir_channels[b] = torch.as_tensor(
+            dir_ch, dtype=new_dir_channels.dtype,
+        )
+        new_normals_valid[b, 0] = torch.as_tensor(
+            nv, dtype=new_normals_valid.dtype,
+        )
+
+    batch["direction_channels"] = new_dir_channels
+    batch["normals_valid"] = new_normals_valid
+    return batch

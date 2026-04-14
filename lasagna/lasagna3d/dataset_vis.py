@@ -136,7 +136,7 @@ def _merge_geometry_by_groups(orig_geom, orig_chain_info, merge_groups):
     return merged
 
 # Matches ScaleSpaceLoss3D default num_scales in train_tifxyz.py
-_NUM_SCALES = 3
+_NUM_SCALES = 5
 _ARROW_LEN_PX = 18.0
 _MAX_ARROWS_PER_PLANE = 25
 _GRID_NORMAL_STRIDE = 12
@@ -433,7 +433,8 @@ def _compute_inference_output(batch, training_output, model_path, device,
                               compare_size: int,
                               output_sigmoid: bool,
                               loss_weights: tuple = (1.0, 1.0, 1.0),
-                              model=None):
+                              model=None,
+                              inference_image_override=None):
     """Run the model on a fresh CT crop centered on the patch's world
     bbox, then compute losses + residual maps cropped to `compare_size`.
     Returns ``None`` if CUDA / model load fail.
@@ -452,40 +453,53 @@ def _compute_inference_output(batch, training_output, model_path, device,
         if model is None:
             model = _load_model(model_path, model_build_patch_size, device)
 
-        # Read a fresh inference-sized CT crop centered on the patch's
-        # world center. Independent of the dataset's image tensor —
-        # works for any inference_size (smaller, equal, or larger than
-        # the dataset patch). _read_volume_crop_from_patch zero-pads
-        # outside the volume so edge patches still produce a clean
-        # cubic crop.
-        patches = batch.get("_patch")
-        if not patches:
-            print(f"{TAG} WARNING: batch missing '_patch' — cannot read "
-                  f"inference crop", flush=True)
-            return None
-        patch = patches[0]
-        z0, z1, y0, y1, x0, x1 = patch.world_bbox
-        cz_w = (z0 + z1) // 2
-        cy_w = (y0 + y1) // 2
-        cx_w = (x0 + x1) // 2
-        half = inference_size // 2
-        min_corner = np.array([cz_w - half, cy_w - half, cx_w - half],
-                              dtype=np.int64)
-        max_corner = min_corner + np.array(
-            [inference_size, inference_size, inference_size], dtype=np.int64,
-        )
-        inf_crop = _read_volume_crop_from_patch(
-            patch,
-            crop_size=(inference_size, inference_size, inference_size),
-            min_corner=min_corner, max_corner=max_corner,
-            image_normalization="unit",
-        )
-        img_for_model = (
-            torch.from_numpy(inf_crop)
-            .float()
-            .unsqueeze(0).unsqueeze(0)
-            .to(device, non_blocking=True)
-        )
+        if inference_image_override is not None:
+            # Caller supplied the CT the model should see directly —
+            # used by the training loop so the vis runs inference on
+            # the same (augmented) batch image that's displayed, not
+            # on a fresh world-frame read that would visually desync.
+            img_for_model = inference_image_override[0:1].to(
+                device, non_blocking=True,
+            ).float()
+            if img_for_model.ndim == 4:
+                img_for_model = img_for_model.unsqueeze(0)
+            inference_size = int(img_for_model.shape[-1])
+            compare_size = min(int(compare_size), inference_size)
+        else:
+            # Read a fresh inference-sized CT crop centered on the
+            # patch's world center. Independent of the dataset's image
+            # tensor — works for any inference_size (smaller, equal,
+            # or larger than the dataset patch).
+            # _read_volume_crop_from_patch zero-pads outside the volume
+            # so edge patches still produce a clean cubic crop.
+            patches = batch.get("_patch")
+            if not patches:
+                print(f"{TAG} WARNING: batch missing '_patch' — cannot read "
+                      f"inference crop", flush=True)
+                return None
+            patch = patches[0]
+            z0, z1, y0, y1, x0, x1 = patch.world_bbox
+            cz_w = (z0 + z1) // 2
+            cy_w = (y0 + y1) // 2
+            cx_w = (x0 + x1) // 2
+            half = inference_size // 2
+            min_corner = np.array([cz_w - half, cy_w - half, cx_w - half],
+                                  dtype=np.int64)
+            max_corner = min_corner + np.array(
+                [inference_size, inference_size, inference_size], dtype=np.int64,
+            )
+            inf_crop = _read_volume_crop_from_patch(
+                patch,
+                crop_size=(inference_size, inference_size, inference_size),
+                min_corner=min_corner, max_corner=max_corner,
+                image_normalization="unit",
+            )
+            img_for_model = (
+                torch.from_numpy(inf_crop)
+                .float()
+                .unsqueeze(0).unsqueeze(0)
+                .to(device, non_blocking=True)
+            )
 
         targets_np = training_output["targets"]
         validity_np = training_output["validity"]
@@ -1702,6 +1716,7 @@ def render_batch_figure(
     inference_ctx: dict,
     same_surface_groups: list[list[int]] | None = None,
     model=None,
+    inference_image_override=None,
 ) -> None:
     """End-to-end: compute training_output (+ optional inference_output)
     and write the JPEG. Mirrors what `run_dataset_vis` does for a single
@@ -1732,6 +1747,7 @@ def render_batch_figure(
             inference_ctx["output_sigmoid"],
             inference_ctx["loss_weights"],
             model=model,
+            inference_image_override=inference_image_override,
         )
 
     _render_sample_figure(

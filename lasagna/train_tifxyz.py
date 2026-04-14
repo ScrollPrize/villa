@@ -80,7 +80,11 @@ from tifxyz_labels import (
     encode_direction_channels,
     scale_space_pool_validity,
 )
-from tifxyz_lasagna_dataset import TifxyzLasagnaDataset, collate_variable_surfaces
+from tifxyz_lasagna_dataset import (
+    TifxyzLasagnaDataset,
+    augment_batch_inplace,
+    collate_variable_surfaces,
+)
 from lasagna3d.dataset_vis import (
     build_inference_context,
     render_batch_figure,
@@ -236,137 +240,18 @@ def compute_batch_targets(
 
 
 # ---------------------------------------------------------------------------
-# 3D augmentation (spatial + intensity)
+# CT intensity augmentation (spatial augmentation lives in the dataset
+# via `augment_batch_inplace`, which re-splats direction_channels from
+# the flipped/rotated surface_geometry so the double-angle encoding
+# stays correct in the new frame — no per-channel sign/rotation fixups).
 # ---------------------------------------------------------------------------
 
-def augment_spatial_3d(
-    image: torch.Tensor,
-    surface_masks: list[torch.Tensor],
-    direction_channels: torch.Tensor,
-    normals_valid: torch.Tensor,
-) -> Tuple[torch.Tensor, list[torch.Tensor], torch.Tensor, torch.Tensor]:
-    """Random spatial augmentation: flips and 90-degree rotations.
-
-    Applied BEFORE GPU target computation. Only flips and rotations
-    (no interpolation) to preserve binary mask integrity.
-    """
-    # Note: augmentation done per-sample before collation would be cleaner
-    # but for simplicity we skip spatial augmentation on the raw surfaces
-    # and only apply it after target computation (see augment_targets).
-    return image, surface_masks, direction_channels, normals_valid
-
-
-def augment_targets_3d(
-    image: torch.Tensor,
-    targets: torch.Tensor,
-    validity: torch.Tensor,
-    normals_valid: torch.Tensor,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, tuple]:
-    """Random 3D spatial augmentation on image + computed targets.
-
-    Returns the sampled ``(flip_z, flip_y, flip_x, k)`` params so the
-    same transform can be replayed on the vis batch.
-    """
-    flip_z = bool(torch.rand(1).item() < 0.5)
-    flip_y = bool(torch.rand(1).item() < 0.5)
-    flip_x = bool(torch.rand(1).item() < 0.5)
-    k = int(torch.randint(0, 4, (1,)).item())
-
-    if flip_z:
-        image = torch.flip(image, [2])
-        targets = torch.flip(targets, [2])
-        validity = torch.flip(validity, [2])
-        normals_valid = torch.flip(normals_valid, [2])
-    if flip_y:
-        image = torch.flip(image, [3])
-        targets = torch.flip(targets, [3])
-        validity = torch.flip(validity, [3])
-        normals_valid = torch.flip(normals_valid, [3])
-    if flip_x:
-        image = torch.flip(image, [4])
-        targets = torch.flip(targets, [4])
-        validity = torch.flip(validity, [4])
-        normals_valid = torch.flip(normals_valid, [4])
-    if k:
-        image = torch.rot90(image, k, dims=(3, 4))
-        targets = torch.rot90(targets, k, dims=(3, 4))
-        validity = torch.rot90(validity, k, dims=(3, 4))
-        normals_valid = torch.rot90(normals_valid, k, dims=(3, 4))
-
-    return image, targets, validity, normals_valid, (flip_z, flip_y, flip_x, k)
-
-
-def _apply_aug_to_vis_batch(batch: dict, params: tuple,
-                            size_zyx: tuple) -> dict:
-    """Replay augmentation params on a shallow-copied batch so the full
-    vis renders the same flipped/rotated state the model trained on."""
-    flip_z, flip_y, flip_x, k = params
-    if not (flip_z or flip_y or flip_x or k):
-        return batch
-
-    Zs, Ys, Xs = int(size_zyx[0]), int(size_zyx[1]), int(size_zyx[2])
-
-    def _flip_rot_vol(t, dims):
-        dz, dy, dx = dims
-        if flip_z:
-            t = torch.flip(t, [dz])
-        if flip_y:
-            t = torch.flip(t, [dy])
-        if flip_x:
-            t = torch.flip(t, [dx])
-        if k:
-            t = torch.rot90(t, k, dims=(dy, dx))
-        return t
-
-    def _apply_to_geom(geom_list):
-        out = []
-        for g in geom_list:
-            pts = np.asarray(
-                g.get("points_local", np.zeros((0, 3), np.float32))
-            ).astype(np.float32).copy()
-            nrm = np.asarray(
-                g.get("normals_zyx", np.zeros((0, 3), np.float32))
-            ).astype(np.float32).copy()
-            if pts.shape[0]:
-                if flip_z:
-                    pts[:, 0] = (Zs - 1) - pts[:, 0]
-                    nrm[:, 0] *= -1.0
-                if flip_y:
-                    pts[:, 1] = (Ys - 1) - pts[:, 1]
-                    nrm[:, 1] *= -1.0
-                if flip_x:
-                    pts[:, 2] = (Xs - 1) - pts[:, 2]
-                    nrm[:, 2] *= -1.0
-                for _ in range(k % 4):
-                    y_new = pts[:, 2].copy()
-                    x_new = (Ys - 1) - pts[:, 1]
-                    pts[:, 1] = y_new
-                    pts[:, 2] = x_new
-                    ny_new = nrm[:, 2].copy()
-                    nx_new = -nrm[:, 1]
-                    nrm[:, 1] = ny_new
-                    nrm[:, 2] = nx_new
-            out.append({**g, "points_local": pts, "normals_zyx": nrm})
-        return out
-
-    aug = dict(batch)
-    aug["image"] = _flip_rot_vol(batch["image"], dims=(2, 3, 4))
-    aug["normals_valid"] = _flip_rot_vol(batch["normals_valid"], dims=(2, 3, 4))
-    aug["padding_mask"] = _flip_rot_vol(batch["padding_mask"], dims=(2, 3, 4))
-    aug["direction_channels"] = _flip_rot_vol(
-        batch["direction_channels"], dims=(2, 3, 4),
-    )
-    aug["surface_masks"] = [
-        _flip_rot_vol(m, dims=(1, 2, 3)) for m in batch["surface_masks"]
-    ]
-    aug["surface_geometry"] = [
-        _apply_to_geom(gs) for gs in batch.get("surface_geometry", [])
-    ]
-    return aug
-
-
 def augment_intensity(image: torch.Tensor) -> torch.Tensor:
-    """Random CT intensity augmentation (applied to image only)."""
+    """Random CT intensity augmentation (applied to image only).
+
+    Mirrors train_unet_3d.augment_intensity: brightness delta,
+    contrast factor, gamma, noise, and a final clamp to [0, 1].
+    """
     if torch.rand(1).item() < 0.5:
         delta = (torch.rand(1, device=image.device).item() - 0.5) * 0.3
         image = image + delta
@@ -374,10 +259,13 @@ def augment_intensity(image: torch.Tensor) -> torch.Tensor:
         factor = 0.7 + torch.rand(1, device=image.device).item() * 0.6
         mean = image.mean()
         image = (image - mean) * factor + mean
+    if torch.rand(1).item() < 0.5:
+        gamma = 0.7 + torch.rand(1, device=image.device).item() * 1.3
+        image = image.clamp(0, 1).pow(gamma)
     if torch.rand(1).item() < 0.3:
         noise = torch.randn_like(image) * 0.03
         image = image + noise
-    return image
+    return image.clamp(0, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -711,8 +599,8 @@ def train(
     # Losses
     mse_loss = MaskedMSE()
     smooth_l1_loss = MaskedSmoothL1()
-    scale_loss_mse = ScaleSpaceLoss3D(mse_loss, num_scales=3)
-    scale_loss_l1 = ScaleSpaceLoss3D(smooth_l1_loss, num_scales=3)
+    scale_loss_mse = ScaleSpaceLoss3D(mse_loss, num_scales=5)
+    scale_loss_l1 = ScaleSpaceLoss3D(smooth_l1_loss, num_scales=5)
 
     writer = SummaryWriter(log_dir=str(run_dir))
     best_val_loss = float("inf")
@@ -760,6 +648,7 @@ def train(
                     arrow_seed=step,
                     inference_ctx=vis_ctx,
                     model=model,
+                    inference_image_override=batch_for_vis["image"],
                 )
             finally:
                 if was_training:
@@ -813,9 +702,16 @@ def train(
         n_surfaces_post = 0
 
         for batch in train_iter:
+            # Geometry-level spatial augmentation: flips the image,
+            # surface_masks, padding_mask and surface_geometry, then
+            # re-splats direction_channels + normals_valid from the
+            # augmented geometry so downstream target derivation sees
+            # a fully consistent frame. Skipped entirely when the
+            # sampled transform is identity.
+            batch = augment_batch_inplace(batch)
             image = batch["image"].to(device, non_blocking=True)
 
-            # Compute targets on GPU from surface masks
+            # Compute targets on GPU from (post-aug) surface masks.
             (
                 targets, validity, normals_valid, dir_weight,
                 _merge_groups, _merged_masks, _merged_chain_info,
@@ -838,11 +734,7 @@ def train(
                 )
                 continue
 
-            # Spatial augmentation on image + targets
-            image, targets, validity, normals_valid, aug_params = augment_targets_3d(
-                image, targets, validity, normals_valid,
-            )
-            # Intensity augmentation on CT only
+            # Intensity augmentation on CT only (spatial is already done).
             image = augment_intensity(image)
 
             # Forward pass
@@ -945,9 +837,7 @@ def train(
                 _log_vis(writer, "train", image, pred, targets, cos_mask, global_step)
 
             if global_step % vis_interval_steps == 0:
-                size_zyx = tuple(int(v) for v in batch["image"].shape[2:])
-                aug_batch = _apply_aug_to_vis_batch(batch, aug_params, size_zyx)
-                _log_full_vis(aug_batch, "train", global_step)
+                _log_full_vis(batch, "train", global_step)
 
             global_step += 1
 
@@ -1017,6 +907,9 @@ def _evaluate(
 ):
     model.eval()
     losses = []
+    losses_cos: list[float] = []
+    losses_mag: list[float] = []
+    losses_dir: list[float] = []
     vis_done = False
 
     val_iter = loader
@@ -1049,6 +942,9 @@ def _evaluate(
             loss_dir = scale_loss_mse(pred[:, 2:8], targets[:, 2:8], mask=dir_mask, weight=dir_weight)
             loss = w_cos * loss_cos + w_mag * loss_mag + w_dir * loss_dir
             losses.append(loss.item())
+            losses_cos.append(loss_cos.item())
+            losses_mag.append(loss_mag.item())
+            losses_dir.append(loss_dir.item())
 
             if verbose:
                 val_iter.set_postfix(loss=f"{loss.item():.4f}")
@@ -1059,8 +955,12 @@ def _evaluate(
                     vis_batch_out.append(batch)
                 vis_done = True
 
-    mean_loss = sum(losses) / max(len(losses), 1)
+    n = max(len(losses), 1)
+    mean_loss = sum(losses) / n
     writer.add_scalar("val/loss", mean_loss, global_step)
+    writer.add_scalar("val/loss_cos", sum(losses_cos) / n, global_step)
+    writer.add_scalar("val/loss_mag", sum(losses_mag) / n, global_step)
+    writer.add_scalar("val/loss_dir", sum(losses_dir) / n, global_step)
     return mean_loss
 
 
