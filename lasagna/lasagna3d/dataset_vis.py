@@ -315,6 +315,40 @@ def _scale_space_residual_sum(pred, target, mask, num_scales: int, kind: str):
     return total
 
 
+def _scale_space_dir_residual_sum(pred_d, target_d, mask, num_scales: int):
+    """Multi-channel scale-space residual sum for direction channels.
+
+    Per scale: takes the per-voxel mean abs diff over the 6 direction
+    channels (masked), upsamples nearest to full res, and sums across
+    scales. Mirrors `_scale_space_residual_sum` for scalar fields.
+    """
+    import torch
+    import torch.nn.functional as F
+    from tifxyz_labels import scale_space_pool_validity
+
+    full_size = pred_d.shape[2:]
+    x, y = pred_d, target_d
+    m = (mask > 0.5).float()
+    total = torch.zeros(
+        (pred_d.shape[0], 1, *full_size),
+        device=pred_d.device, dtype=pred_d.dtype,
+    )
+    for scale in range(num_scales):
+        r = ((x - y).abs() * m).mean(dim=1, keepdim=True)
+        if r.shape[2:] != full_size:
+            r = F.interpolate(r, size=full_size, mode="nearest")
+        total = total + r
+        if scale == num_scales - 1 or x.size(2) < 2 or x.size(3) < 2 or x.size(4) < 2:
+            break
+        eps = 1e-6
+        m_count = F.avg_pool3d(m, kernel_size=2, stride=2)
+        denom = m_count.clamp_min(eps)
+        x = F.avg_pool3d(x * m, kernel_size=2, stride=2) / denom
+        y = F.avg_pool3d(y * m, kernel_size=2, stride=2) / denom
+        m = scale_space_pool_validity(m)
+    return total
+
+
 def _compute_inference_output(batch, training_output, model_path, device,
                               model_build_patch_size: int,
                               inference_size: int,
@@ -431,6 +465,15 @@ def _compute_inference_output(batch, training_output, model_path, device,
             mag_diff_ss = _scale_space_residual_sum(
                 pred[:, 1:2], targets_t[:, 1:2], cos_mask, _NUM_SCALES, "abs",
             )
+            # Per-voxel mean abs residual over the 6 direction channels,
+            # masked by the normals validity. Same idea as cos/grad_mag
+            # but reduced over the channel axis so we can show one map.
+            dir_diff_full = (
+                (pred[:, 2:8] - targets_t[:, 2:8]).abs() * dir_mask
+            ).mean(dim=1, keepdim=True)
+            dir_diff_ss = _scale_space_dir_residual_sum(
+                pred[:, 2:8], targets_t[:, 2:8], dir_mask, _NUM_SCALES,
+            )
 
         # Full-size pred (at inference_size) for display; renderer will
         # crop or pad to dataset_patch (vis_size) as needed.
@@ -438,11 +481,16 @@ def _compute_inference_output(batch, training_output, model_path, device,
             "pred_cos": pred_full[0, 0].detach().cpu().numpy(),
             "pred_mag": pred_full[0, 1].detach().cpu().numpy(),
             "pred_dir": pred_full[0, 2:8].detach().cpu().numpy(),  # (6,Z,Y,X)
+            # Uncropped pred at native inference_size, just for the
+            # debug "full inference patch" row in the renderer.
+            "pred_cos_native": pred_full[0, 0].detach().cpu().numpy(),
             # Residuals are at compare_size (loss size).
             "diff_cos_full": cos_diff_full[0, 0].detach().cpu().numpy(),
             "diff_mag_full": mag_diff_full[0, 0].detach().cpu().numpy(),
             "diff_cos_ss": cos_diff_ss[0, 0].detach().cpu().numpy(),
             "diff_mag_ss": mag_diff_ss[0, 0].detach().cpu().numpy(),
+            "diff_dir_full": dir_diff_full[0, 0].detach().cpu().numpy(),
+            "diff_dir_ss": dir_diff_ss[0, 0].detach().cpu().numpy(),
             "loss_cos": loss_cos,
             "loss_mag": loss_mag,
             "loss_dir": loss_dir,
@@ -764,12 +812,22 @@ def _render_sample_figure(
                 inference_output["diff_cos_ss"], Z)
             diff_mag_ss = _center_crop_or_pad_3d(
                 inference_output["diff_mag_ss"], Z)
+            diff_dir_full = _center_crop_or_pad_3d(
+                inference_output["diff_dir_full"], Z)
+            diff_dir_ss = _center_crop_or_pad_3d(
+                inference_output["diff_dir_ss"], Z)
             pred_cos_slices = _plane_slices(pred_cos, cz, cy, cx)
             pred_mag_slices = _plane_slices(pred_mag, cz, cy, cx)
             dcos_full_slices = _plane_slices(diff_cos_full, cz, cy, cx)
             dmag_full_slices = _plane_slices(diff_mag_full, cz, cy, cx)
             dcos_ss_slices = _plane_slices(diff_cos_ss, cz, cy, cx)
             dmag_ss_slices = _plane_slices(diff_mag_ss, cz, cy, cx)
+            ddir_full_slices = _plane_slices(diff_dir_full, cz, cy, cx)
+            ddir_ss_slices = _plane_slices(diff_dir_ss, cz, cy, cx)
+            dir_diff_vmax = max(
+                _auto_vmax(diff_dir_full, validity > 0.5, 99.0),
+                _auto_vmax(diff_dir_ss, validity > 0.5, 99.0),
+            )
             # Shared diff vmax across full + ss for the same channel
             cos_diff_vmax = max(
                 _auto_vmax(diff_cos_full, validity > 0.5, 99.0),
@@ -867,6 +925,29 @@ def _render_sample_figure(
                     )
             rows.append(("grad_mag", draw_row_gm, 3))
 
+        # normals residual row — only when --model is set; mean abs
+        # residual over the 6 direction channels under dir_mask, plus
+        # scale-space sum.
+        if has_inf:
+            def draw_row_normals_residual(sf):
+                axes = sf.subplots(1, 6)
+                groups = [
+                    (f"|p−t| (vmax={dir_diff_vmax:.3g})", ddir_full_slices),
+                    (f"ss-sum (vmax={dir_diff_vmax:.3g})", ddir_ss_slices),
+                ]
+                for gi, (gname, slices) in enumerate(groups):
+                    for col in range(3):
+                        ax = axes[gi * 3 + col]
+                        _draw_diff_panel(
+                            ax, slices[col], valid_slices_full[col],
+                            dir_diff_vmax,
+                        )
+                        ax.set_title(
+                            f"normals {gname}  {plane_names[col]}",
+                            fontsize=8,
+                        )
+            rows.append(("normals residual", draw_row_normals_residual, 6))
+
         # validity scale rows
         for scale_idx, scale_vol in enumerate(pyramid):
             scale_slices = _plane_slices(scale_vol, cz, cy, cx)
@@ -890,6 +971,34 @@ def _render_sample_figure(
             rows.append(
                 (f"validity s{scale_idx}",
                  _make_validity_drawer(scale_slices), 3))
+
+        # Debug row: pred_cos at the FULL native inference patch
+        # size (no center-crop or pad) so it's visible whether the
+        # model actually saw the larger context.
+        if has_inf:
+            pred_cos_native = inference_output["pred_cos_native"]
+            inference_size = int(inference_output["inference_size"])
+            ncz = pred_cos_native.shape[0] // 2
+            ncy = pred_cos_native.shape[1] // 2
+            ncx = pred_cos_native.shape[2] // 2
+            native_slices = _plane_slices(pred_cos_native, ncz, ncy, ncx)
+
+            def draw_row_pred_native(sf):
+                axes = sf.subplots(1, 3)
+                native_titles = [
+                    f"axial z={ncz}",
+                    f"coronal y={ncy}",
+                    f"sagittal x={ncx}",
+                ]
+                for col, ax in enumerate(axes):
+                    ax.imshow(native_slices[col], cmap="gray",
+                              interpolation="nearest", vmin=0.0, vmax=1.0)
+                    ax.set_title(
+                        f"pred cos native ({inference_size}³)  "
+                        f"{native_titles[col]}", fontsize=8,
+                    )
+                    ax.set_xticks([]); ax.set_yticks([])
+            rows.append(("pred cos (full inference)", draw_row_pred_native, 3))
     else:
         def draw_skip(sf):
             axes = sf.subplots(1, 3)
