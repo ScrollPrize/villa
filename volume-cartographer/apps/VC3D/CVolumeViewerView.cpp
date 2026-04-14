@@ -235,8 +235,12 @@ void CVolumeViewerView::mousePressEvent(QMouseEvent *event)
 
 void CVolumeViewerView::resizeEvent(QResizeEvent *event)
 {
-    emit sendResized();
+    // Base class first so viewport()->size() reflects the new dimensions.
+    // Otherwise the tiled viewer's onResized reads the stale viewport size,
+    // leaves the framebuffer/sceneRect at the old dims, and subsequent mouse
+    // events map through an offset proportional to the resize delta.
     QGraphicsView::resizeEvent(event);
+    emit sendResized();
 }
 
 void CVolumeViewerView::mouseMoveEvent(QMouseEvent *event)

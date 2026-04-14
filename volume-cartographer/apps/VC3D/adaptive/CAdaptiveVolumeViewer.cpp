@@ -45,6 +45,12 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
     _view->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     _view->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     _view->setTransformationAnchor(QGraphicsView::NoAnchor);
+    // Anchor the scene at the viewport top-left, not the default AlignCenter.
+    // The framebuffer draws at viewport (0,0) in drawBackground, so if the
+    // scene were centered (which happens whenever sceneRect < viewport, e.g.
+    // during a resize lag) mapToScene would shift mouse coords by half the
+    // size delta and every edit would land up-left of the cursor.
+    _view->setAlignment(Qt::AlignLeft | Qt::AlignTop);
     _view->setRenderHint(QPainter::Antialiasing, false);
     _view->setScrollPanDisabled(true);
     _view->setViewportUpdateMode(QGraphicsView::FullViewportUpdate);
@@ -433,8 +439,13 @@ void CAdaptiveVolumeViewer::submitRender()
     } else {
         cv::Mat_<cv::Vec3f> coords;
         cv::Mat_<cv::Vec3f> normals;
-        cv::Vec3f offset(_camera.surfacePtr[0] * _camera.scale,
-                         _camera.surfacePtr[1] * _camera.scale,
+        // surf->gen treats offset as the TOP-LEFT of the rendered region in
+        // scaled surface units, but camera.surfacePtr is the CENTRE of the
+        // view (matching sceneToSurface). Shift by half the viewport so the
+        // rendered pixels and the mouse→surface math agree — without this
+        // every edit lands up-left of the cursor by half the viewport.
+        cv::Vec3f offset(_camera.surfacePtr[0] * _camera.scale - float(fbW) * 0.5f,
+                         _camera.surfacePtr[1] * _camera.scale - float(fbH) * 0.5f,
                          _camera.zOff);
         const bool wantComposite = _compositeSettings.enabled;
         surf->gen(&coords, wantComposite ? &normals : nullptr,
@@ -832,19 +843,26 @@ void CAdaptiveVolumeViewer::onKeyPress(int key, Qt::KeyboardModifiers)
 
 QPointF CAdaptiveVolumeViewer::surfaceToScene(float surfX, float surfY) const
 {
+    // Framebuffer is drawn at viewport (0,0) in CVolumeViewerView::drawBackground.
+    // Do the surface→viewport math first, then map viewport→scene through the
+    // view so any transform/alignment/scroll state is accounted for.
     float vpCx = static_cast<float>(_framebuffer.width()) * 0.5f;
     float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
-    return {static_cast<qreal>((surfX - _camSurfX) * _camScale + vpCx),
-            static_cast<qreal>((surfY - _camSurfY) * _camScale + vpCy)};
+    const qreal vx = (surfX - _camSurfX) * _camScale + vpCx;
+    const qreal vy = (surfY - _camSurfY) * _camScale + vpCy;
+    return _view->mapToScene(QPointF(vx, vy).toPoint());
 }
 
 cv::Vec2f CAdaptiveVolumeViewer::sceneToSurface(const QPointF& scenePos) const
 {
     if (_framebuffer.isNull() || _camScale <= 0) return {0, 0};
+    // Reverse: scene→viewport first (undoes any view transform), then the
+    // framebuffer-centered surface math. Matches surfaceToScene exactly.
+    QPoint vp = _view->mapFromScene(scenePos);
     float vpCx = static_cast<float>(_framebuffer.width()) * 0.5f;
     float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
-    return {(static_cast<float>(scenePos.x()) - vpCx) / _camScale + _camSurfX,
-            (static_cast<float>(scenePos.y()) - vpCy) / _camScale + _camSurfY};
+    return {(static_cast<float>(vp.x()) - vpCx) / _camScale + _camSurfX,
+            (static_cast<float>(vp.y()) - vpCy) / _camScale + _camSurfY};
 }
 
 QPointF CAdaptiveVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
