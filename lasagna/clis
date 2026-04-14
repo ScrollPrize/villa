@@ -171,3 +171,4 @@ python $SRC/preprocess_cos_omezarr.py integrate --z-volume cos_3d_z.zarr --y-vol
 PYTHONPATH=$SRC/vesuvius/src/:$SRC/ python $SRC/lasagna/train_tifxyz.py --config $SRC/lasagna/configs/tifxyz_train_s3.json --patch-size 64 --batch-size 1 --epochs 2 --num-workers 0
 
 
+PYTHONPATH=$SRC/vesuvius/src/:$SRC/lasagna/ python -m lasagna3d dataset vis --train-config $SRC/lasagna/configs/tifxyz_train_s3.json --vis-dir ./review
