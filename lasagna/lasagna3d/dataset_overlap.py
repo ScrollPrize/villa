@@ -223,20 +223,19 @@ def run_dataset_overlap(
     defer_render = vis_out is not None and vis_top_k is not None
     deferred: list[tuple[dict, int, str, dict]] = []  # (batch, idx, ds_name, record)
 
-    def _render_one(batch, idx, ds_name):
+    def _render_one(batch, idx, ds_name) -> str:
+        """Render the vis JPEG and return a short suffix describing the
+        outcome (filename or error) so the per-patch summary stays on
+        one line."""
         fname = default_vis_filename(ds_name, idx)
         title = default_vis_title(ds_name, idx, _sample_from_batch(batch))
         try:
             render_batch_figure(
                 batch, vis_out / fname, title, seed + idx, inference_ctx,
             )
-            print(f"{TAG}   vis → {fname}", flush=True)
+            return fname
         except Exception as e:
-            print(
-                f"{TAG}   vis render failed for idx={idx}: "
-                f"{type(e).__name__}: {e}",
-                flush=True,
-            )
+            return f"FAILED ({type(e).__name__}: {e})"
 
     datasets_cfg = config.get("datasets", [])
     if not datasets_cfg:
@@ -252,6 +251,17 @@ def run_dataset_overlap(
 
     top_records: list[dict] = []
     total_written = 0
+    total_overlapping = 0  # patches whose worst-pair p50 <= 1 (same-surface rule)
+    # Per-patch stdout columns — min, then percentiles that aren't p50
+    # (p50 is already shown as median). Ordered low → high.
+    _SUMMARY_PCTS = ("1", "5", "15", "25", "50", "75", "85", "95", "99")
+    _HEADER_EVERY = 20
+    _HEADER = (
+        f"{'dataset':<12} {'idx':>6} {'pair':<5} "
+        f"{'min':>5} "
+        + " ".join(f"{'p'+lbl:>5}" for lbl in _SUMMARY_PCTS)
+        + f" {'overlap':>14}"
+    )
 
     with out_file.open("w") as fout:
         for ds_idx, ds_entry in enumerate(datasets_cfg):
@@ -389,24 +399,38 @@ def run_dataset_overlap(
                 fout.flush()
                 total_written += 1
 
-                p1 = record["worst_pair"]["percentiles"]["1"]
-                p50 = record["worst_pair"]["percentiles"]["50"]
-                la = record["worst_pair"]["a"]["label"]
-                lb = record["worst_pair"]["b"]["label"]
-                flipped = "*" if record["worst_pair"]["sign_flipped"] else ""
-                print(
-                    f"{TAG} ds={ds_name} idx={idx} worst={la}↔{lb} "
-                    f"p1={p1:.3f}{flipped} median={p50:.3f}",
-                    flush=True,
+                wp = record["worst_pair"]
+                perc = wp["percentiles"]
+                p50 = perc["50"]
+                if p50 <= 1.0:
+                    total_overlapping += 1
+                overlap_frac = total_overlapping / total_written
+                pos_a = int(info[a].get("pos", 0))
+                pos_b = int(info[b].get("pos", 0))
+                pair_str = f"{pos_a}-{pos_b}"
+                overlap_str = (
+                    f"{total_overlapping}/{total_written} "
+                    f"({100.0 * overlap_frac:.1f}%)"
+                )
+                stats_str = " ".join(f"{perc[lbl]:5.1f}" for lbl in _SUMMARY_PCTS)
+                ds_col = ds_name if len(ds_name) <= 12 else ds_name[:12]
+                line = (
+                    f"{ds_col:<12} {int(idx):>6} {pair_str:<5} "
+                    f"{wp['min']:5.1f} {stats_str} {overlap_str:>14}"
                 )
 
                 top_records.append(record)
 
+                vis_suffix = ""
                 if vis_out is not None:
                     if defer_render:
                         deferred.append((batch, idx, ds_name, record))
                     else:
-                        _render_one(batch, idx, ds_name)
+                        vis_suffix = f"  {_render_one(batch, idx, ds_name)}"
+
+                if (total_written - 1) % _HEADER_EVERY == 0:
+                    print(_HEADER, flush=True)
+                print(line + vis_suffix, flush=True)
 
     print(
         f"{TAG} done — wrote {total_written} records to {out_file}",
@@ -424,7 +448,7 @@ def run_dataset_overlap(
         k = min(int(vis_top_k), len(deferred))
         print(f"{TAG} rendering top-{k} worst patches into {vis_out}", flush=True)
         for batch, idx, ds_name, _record in deferred[:k]:
-            _render_one(batch, idx, ds_name)
+            print(f"{TAG}   {_render_one(batch, idx, ds_name)}", flush=True)
 
     if top_records:
         top_records.sort(

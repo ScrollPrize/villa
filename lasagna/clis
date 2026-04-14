@@ -174,3 +174,7 @@ PYTHONPATH=$SRC/vesuvius/src/:$SRC/ python $SRC/lasagna/train_tifxyz.py --config
 PYTHONPATH=$SRC/vesuvius/src/:$SRC/lasagna/ python -m lasagna3d dataset vis --train-config $SRC/lasagna/configs/tifxyz_train_s3.json --vis-dir ./review
 
 PYTHONPATH=$SRC/vesuvius/src/:$SRC/lasagna/ time python -m lasagna3d dataset vis --train-config $SRC/lasagna/configs/tifxyz_train_s3.json --vis-dir ./review --num-workers 0 --model ../train3d/runs_srv/unet3d/20260325_011010_3d/model_current.pt
+
+PYTHONPATH=$SRC/vesuvius/src/:$SRC/lasagna/ time python -m lasagna3d dataset overlap --train-config $SRC/lasagna/configs/tifxyz_train_s3.json --vis-dir ./review --num-workers 0 --model ../train3d/runs_srv/unet3d/20260325_011010_3d/model_current.pt --patch-size 320 --inference-tile-size 320 --out overlap.json
+
+PYTHONPATH=$SRC/vesuvius/src/:$SRC/lasagna/ time python -m lasagna3d dataset overlap --train-config $SRC/lasagna/configs/tifxyz_train_s3.json --vis-dir ./review --num-workers 0 --out overlap.json
