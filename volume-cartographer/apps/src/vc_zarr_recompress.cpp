@@ -66,6 +66,7 @@
 #include <set>
 #include <sstream>
 #include <future>
+#include <map>
 #include <unordered_set>
 #include <chrono>
 
@@ -687,6 +688,8 @@ int main(int argc, char** argv) {
                   << "  --one-shard L/sz/sy/sx  Process exactly one shard + exit.\n"
                   << "                          Skips occupancy and resume lists. Coordinator\n"
                   << "                          handles both. Use for per-shard process fanout.\n"
+                  << "  --shard-file PATH       File of 'L/sz/sy/sx' lines — batch many shards\n"
+                  << "                          in one process (amortize x265 init + TCP reuse).\n"
                   << "  --encode-jobs N  Encode pool threads per worker [default: 2*cores]\n"
                   << "  --occupancy-file PATH  Binary bitmap of input chunk existence\n"
                   << "                          (nz*ny*nx bits). Skips S3 LIST entirely.\n"
@@ -716,6 +719,7 @@ int main(int argc, char** argv) {
     int rank = 0;              // this VM's index in the fanout (0..world-1)
     int world = 1;             // total VM count for horizontal scaling
     std::string one_shard_arg; // "L/sz/sy/sx" — process exactly one shard + exit
+    std::string shard_file;    // file of "L/sz/sy/sx" lines — batch in one process
     int encode_jobs = 0;       // 0 = 2*hw_concurrency (default)
     std::string occupancy_file; // external occupancy bitmap (coordinator-built)
 
@@ -733,6 +737,7 @@ int main(int argc, char** argv) {
         else if (arg == "--rank" && i + 1 < argc) rank = std::atoi(argv[++i]);
         else if (arg == "--world" && i + 1 < argc) world = std::atoi(argv[++i]);
         else if (arg == "--one-shard" && i + 1 < argc) one_shard_arg = argv[++i];
+        else if (arg == "--shard-file" && i + 1 < argc) shard_file = argv[++i];
         else if (arg == "--encode-jobs" && i + 1 < argc) encode_jobs = std::atoi(argv[++i]);
         else if (arg == "--occupancy-file" && i + 1 < argc) occupancy_file = argv[++i];
     }
@@ -747,6 +752,38 @@ int main(int argc, char** argv) {
         int ol = -1;
         std::sscanf(one_shard_arg.c_str(), "%d", &ol);
         if (ol >= 0 && ol <= 5) levels_arg = std::to_string(ol);
+    }
+    // Parse --shard-file into a map of level -> list of (sz, sy, sx).
+    // Drives both levels_arg (so only listed levels are processed) and the
+    // shard_positions filter inside each level.
+    struct ShardPos { size_t sz, sy, sx; };
+    std::map<int, std::vector<ShardPos>> shard_file_entries;
+    if (!shard_file.empty()) {
+        std::ifstream sf(shard_file);
+        if (!sf) {
+            fprintf(stderr, "Cannot open --shard-file: %s\n", shard_file.c_str());
+            return 1;
+        }
+        std::string line;
+        std::set<int> seen_levels;
+        while (std::getline(sf, line)) {
+            if (line.empty()) continue;
+            int L = -1;
+            size_t sz = 0, sy = 0, sx = 0;
+            if (std::sscanf(line.c_str(), "%d/%zu/%zu/%zu", &L, &sz, &sy, &sx) != 4) {
+                fprintf(stderr, "bad shard-file line: %s\n", line.c_str());
+                return 1;
+            }
+            shard_file_entries[L].push_back({sz, sy, sx});
+            seen_levels.insert(L);
+        }
+        // Override levels_arg to cover exactly the levels in the file.
+        std::string csv;
+        for (int L : seen_levels) {
+            if (!csv.empty()) csv += ",";
+            csv += std::to_string(L);
+        }
+        levels_arg = csv;
     }
     if (world < 1) world = 1;
     if (rank < 0 || rank >= world) {
@@ -794,6 +831,7 @@ int main(int argc, char** argv) {
     }
     std::vector<int> levels;
     std::vector<std::vector<size_t>> shapes;
+    std::vector<Json> zarrays; // parallel with levels/shapes; cached from discovery
 
     for (int l = 0; l < 6; l++) {
         if (!levels_filter.empty() && !levels_filter.count(l)) continue;
@@ -823,6 +861,7 @@ int main(int argc, char** argv) {
 
         levels.push_back(l);
         shapes.push_back(padded_shape);
+        zarrays.push_back(zarray);
         printf("Found level %d: shape [%zu, %zu, %zu] -> padded [%zu, %zu, %zu]\n",
                l,
                shape.size() > 0 ? shape[0] : 0,
@@ -840,7 +879,7 @@ int main(int argc, char** argv) {
 
     // Write zarr v3 root metadata (coordinator writes it once in one-shard
     // mode, so workers skip this).
-    if (one_shard_arg.empty()) {
+    if (one_shard_arg.empty() && shard_file.empty()) {
         output->write_string("zarr.json",
             make_zarr_v3_group_with_multiscales(levels, shapes));
     }
@@ -850,15 +889,18 @@ int main(int argc, char** argv) {
     if (!levels_order.empty()) {
         std::vector<int> new_levels;
         std::vector<std::vector<size_t>> new_shapes;
+        std::vector<Json> new_zarrays;
         for (int l : levels_order) {
             auto it = std::find(levels.begin(), levels.end(), l);
             if (it == levels.end()) continue;
             size_t idx = it - levels.begin();
             new_levels.push_back(levels[idx]);
             new_shapes.push_back(shapes[idx]);
+            new_zarrays.push_back(zarrays[idx]);
         }
         levels = std::move(new_levels);
         shapes = std::move(new_shapes);
+        zarrays = std::move(new_zarrays);
     }
 
     for (size_t li = 0; li < levels.size(); li++) {
@@ -869,17 +911,14 @@ int main(int argc, char** argv) {
 
         // Write per-level zarr v3 metadata (skipped in one-shard mode — the
         // coordinator writes it once before fanning out workers).
-        if (one_shard_arg.empty()) {
+        if (one_shard_arg.empty() && shard_file.empty()) {
             output->write_string(std::to_string(l) + "/zarr.json",
                                   make_zarr_v3_metadata(shape, qp));
         }
 
-        // Read input .zarray to determine compressor, chunks, dtype, dim_sep
+        // Reuse cached .zarray from discovery phase (saves a GET per worker).
         std::string level_prefix = std::to_string(l) + "/";
-        Json zarray;
-        try {
-            zarray = Json::parse(input->read_string(level_prefix + ".zarray"));
-        } catch (...) {}
+        Json zarray = zarrays[li];
 
         std::string compressor_id;
         if (zarray.contains("compressor") && !zarray["compressor"].is_null()) {
@@ -934,7 +973,7 @@ int main(int argc, char** argv) {
             auto pos = p.find("{L}");
             if (pos != std::string::npos) p.replace(pos, 3, std::to_string(l));
             occ_mask = load_occupancy_file(p, occ_nz, occ_ny, occ_nx);
-        } else if (one_shard_arg.empty()) {
+        } else if (one_shard_arg.empty() && shard_file.empty()) {
             occ_mask = build_occupancy_from_listing(*input, l, shape, chunk128, 64);
         }
 
@@ -954,7 +993,6 @@ int main(int argc, char** argv) {
         // only take sz planes where (sz % world == rank).  Interleaving by
         // sz gives each VM a mix of dense and empty regions so wall times
         // stay balanced.
-        struct ShardPos { size_t sz, sy, sx; };
         std::vector<ShardPos> shard_positions;
         if (!one_shard_arg.empty()) {
             // Parse "L/sz/sy/sx" — L already filtered via levels_arg.
@@ -968,6 +1006,15 @@ int main(int argc, char** argv) {
                 return 1;
             }
             shard_positions.push_back({sz, sy, sx});
+        } else if (!shard_file.empty()) {
+            // Only process shards listed in the file for this level.
+            auto it = shard_file_entries.find(l);
+            if (it != shard_file_entries.end()) {
+                for (auto& sp : it->second) {
+                    if (sp.sz < shard_nz && sp.sy < shard_ny && sp.sx < shard_nx)
+                        shard_positions.push_back(sp);
+                }
+            }
         } else {
             for (size_t sz = 0; sz < shard_nz; sz++) {
                 if (world > 1 && (sz % (size_t)world) != (size_t)rank) continue;
@@ -984,7 +1031,7 @@ int main(int argc, char** argv) {
         // List existing shards for resume (skipped in one-shard mode: the
         // coordinator handles resume by skipping this whole invocation).
         std::set<std::string> existing_shards;
-        if (one_shard_arg.empty()) {
+        if (one_shard_arg.empty() && shard_file.empty()) {
             std::string shard_prefix = std::to_string(l) + "/c/";
             auto keys = output->list_chunks(shard_prefix);
             for (auto& k : keys) {

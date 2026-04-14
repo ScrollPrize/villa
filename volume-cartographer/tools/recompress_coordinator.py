@@ -169,24 +169,40 @@ def write_metadata(s3, bucket: str, prefix: str, binary: str,
 
 
 def run_worker(binary: str, input_url: str, output_url: str,
-               level: int, sz: int, sy: int, sx: int,
+               shards: list[tuple[int, int, int, int]],
                qp: int, air_clamp: int, shift_n: int,
                inner_jobs: int, encode_jobs: int,
-               occupancy_file: str | None) -> tuple[int, int, int, int, int]:
-    """Launch one worker, wait for it, return exit code + shard coords."""
+               occupancy_file_template: str | None) -> tuple[int, int]:
+    """Launch one worker to process a batch of shards.  Returns (rc, count).
+
+    Worker init (x265, curl, backends) is amortized across all shards in
+    the batch.  TCP connections to S3 are reused across shard uploads."""
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", delete=False,
+                                      prefix="shards_", suffix=".txt") as tf:
+        for (L, sz, sy, sx) in shards:
+            tf.write(f"{L}/{sz}/{sy}/{sx}\n")
+        shard_file_path = tf.name
+
+    # --occupancy-file accepts {L} substitution inside the binary when
+    # iterating across multiple levels in one batch.
     cmd = [binary, input_url, output_url,
            "--qp", str(qp),
            "--air-clamp", str(air_clamp),
            "--bit-shift", str(shift_n),
            "--inner-jobs", str(inner_jobs),
            "--encode-jobs", str(encode_jobs),
-           "--one-shard", f"{level}/{sz}/{sy}/{sx}"]
-    if occupancy_file:
-        cmd.extend(["--occupancy-file", occupancy_file])
+           "--shard-file", shard_file_path]
+    if occupancy_file_template:
+        cmd.extend(["--occupancy-file", occupancy_file_template])
     # stdout to /dev/null: workers are numerous and chatty
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
                           stderr=subprocess.DEVNULL, check=False)
-    return (proc.returncode, level, sz, sy, sx)
+    try:
+        os.unlink(shard_file_path)
+    except OSError:
+        pass
+    return (proc.returncode, len(shards))
 
 
 def main():
@@ -207,6 +223,10 @@ def main():
                     help="Per-worker encode thread pool size (default 8 = "
                          "small since the coordinator already parallelises "
                          "across many worker processes)")
+    ap.add_argument("--batch-size", type=int, default=64,
+                    help="Shards per worker invocation. Amortizes fork+exec "
+                         "and x265 init across many shards. Crash isolation "
+                         "is lost within a batch.")
     ap.add_argument("--skip-metadata", action="store_true",
                     help="Skip the metadata-write phase (assume already done)")
     args = ap.parse_args()
@@ -258,33 +278,40 @@ def main():
               f"({100*(1-present/total_bits):.1f}% sparse) in "
               f"{time.time()-t_occ:.1f}s -> {occ_path}")
 
+        # Split todo into batches of args.batch_size. Each batch is one
+        # worker invocation (amortizes x265 init + curl TCP reuse).
+        batches = []
+        for i in range(0, len(todo), args.batch_size):
+            batch = [(level, sz, sy, sx) for (sz, sy, sx) in
+                     todo[i:i + args.batch_size]]
+            batches.append(batch)
+
         t0 = time.time()
         completed = 0
         failed = 0
         with futures.ThreadPoolExecutor(max_workers=args.jobs) as pool:
             futs = {
                 pool.submit(run_worker, args.binary, args.input, args.output,
-                            level, sz, sy, sx,
+                            batch,
                             args.qp, args.air_clamp, args.bit_shift,
                             args.inner_jobs, args.encode_jobs,
-                            occ_path): (sz, sy, sx)
-                for (sz, sy, sx) in todo
+                            occ_path): batch
+                for batch in batches
             }
             for fut in futures.as_completed(futs):
-                rc, lv, sz, sy, sx = fut.result()
+                rc, count = fut.result()
                 if rc != 0:
-                    failed += 1
-                    print(f"[coord] L{lv} {sz}/{sy}/{sx}: FAILED rc={rc}",
-                          file=sys.stderr)
-                completed += 1
-                if completed % 50 == 0 or completed == len(todo):
-                    dt = time.time() - t0
-                    rate = completed / dt if dt > 0 else 0
-                    remaining = len(todo) - completed
-                    eta = remaining / rate if rate > 0 else float("inf")
-                    print(f"[coord] L{level}: {completed}/{len(todo)} "
-                          f"({rate:.1f}/s, ETA {eta/60:.1f} min, "
-                          f"{failed} failed)")
+                    failed += count
+                    print(f"[coord] L{level} batch FAILED rc={rc} "
+                          f"({count} shards lost)", file=sys.stderr)
+                completed += count
+                dt = time.time() - t0
+                rate = completed / dt if dt > 0 else 0
+                remaining = len(todo) - completed
+                eta = remaining / rate if rate > 0 else float("inf")
+                print(f"[coord] L{level}: {completed}/{len(todo)} "
+                      f"({rate:.1f}/s, ETA {eta/60:.1f} min, "
+                      f"{failed} failed)")
 
         total_done_all_levels += completed
         print(f"[coord] level {level} done: {completed}/{len(todo)} "
