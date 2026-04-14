@@ -367,7 +367,7 @@ def run_dataset_overlap(
 
     top_records: list[dict] = []
     total_written = 0
-    total_overlapping = 0  # patches whose worst-pair p50 <= 1 (same-surface rule)
+    total_overlapping = 0  # patches whose worst-pair p25 <= 2 (same-surface rule)
     # Per-patch stdout columns — min, then percentiles that aren't p50
     # (p50 is already shown as median). Ordered low → high.
     _SUMMARY_PCTS = ("1", "5", "15", "25", "50", "75", "85", "95", "99")
@@ -507,8 +507,8 @@ def run_dataset_overlap(
                     if best is None or score < best[0]:
                         best = (score, a, b, stats)
                     # Same rule that drives the stdout overlap counter:
-                    # post-flip median ≤ 1 → treat as duplicate.
-                    if stats["percentiles"]["50"] <= 1.0:
+                    # post-flip p25 ≤ 2 → treat as duplicate.
+                    if stats["percentiles"]["25"] <= 2.0:
                         overlap_pairs.append((a, b))
 
                 if best is None:
@@ -539,8 +539,7 @@ def run_dataset_overlap(
 
                 wp = record["worst_pair"]
                 perc = wp["percentiles"]
-                p50 = perc["50"]
-                if p50 <= 1.0:
+                if perc["25"] <= 2.0:
                     total_overlapping += 1
                 overlap_frac = total_overlapping / total_written
                 pos_a = int(info[a].get("pos", 0))

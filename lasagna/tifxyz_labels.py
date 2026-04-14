@@ -368,9 +368,9 @@ def detect_same_surface_groups(
        (consecutive in chain ordering).
     2. They come from different source segments
        (``segment_idx_i != segment_idx_j``).
-    3. The unsigned median of ``dts[j]`` sampled over voxels where
-       ``mask_i`` is true is ``<= threshold`` (or symmetrically the
-       reverse direction).
+    3. The unsigned 25th percentile of ``dts[j]`` sampled over voxels
+       where ``mask_i`` is true is ``<= threshold`` (or symmetrically
+       the reverse direction).
 
     ``dts[k]`` is ``edt_torch(~mask_k)`` — the same list the caller
     already built for loss derivation, so detection reuses those
@@ -418,12 +418,14 @@ def detect_same_surface_groups(
                 mask_j = mask_j > 0.5
             if not bool(mask_j.any()):
                 continue
-            # Symmetric: median distance from A's support to B, and
+            # Symmetric: p25 distance from A's support to B, and
             # from B's support to A; take the smaller so we don't miss
             # a pair where one side happens to be tiny.
-            med_ij = float(torch.median(dts[j][mask_i]).item())
-            med_ji = float(torch.median(dts[i][mask_j]).item())
-            if min(med_ij, med_ji) <= thr:
+            q25_ij = float(torch.quantile(
+                dts[j][mask_i].float(), 0.25).item())
+            q25_ji = float(torch.quantile(
+                dts[i][mask_j].float(), 0.25).item())
+            if min(q25_ij, q25_ji) <= thr:
                 _union(i, j)
 
     groups_by_root: dict[int, list[int]] = {}

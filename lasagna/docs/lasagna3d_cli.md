@@ -41,7 +41,7 @@ Flags:
 | `--num-workers` | `os.cpu_count()` | DataLoader workers for parallel per-sample extraction *and* thread-pool size for parallel render/save. `0` runs everything on the main thread. |
 | `--inference-tile-size` | `None` | Cubic patch size of the CT crop the model is run on (single forward). The **dataset is unaffected** — it always emits the training config patch size, with the same patches, GT, and surface masks training would see. Only the CT input fed to the model is read at this size, centered on the same patch's world bbox center (zero-padded outside the volume). Loss and residuals are computed at `min(config_patch_size, inference_tile_size)` (center-cropped from both pred and target). Vis is rendered at the config patch size; `pred` is center-cropped or zero-padded to that size for display. Defaults to the config patch size. |
 | `--model` | `None` | Optional checkpoint path. When set, runs inference on the same image the dataset hands to training, computes per-channel losses (same `ScaleSpaceLoss3D` instances training uses), and adds rows for prediction + residuals. Loss values are printed in the figure title. **The checkpoint's `patch_size` is read first and overrides both `--patch-size` and the dataset config's `patch_size`** — `NetworkFromConfig.autoconfigure` derives the encoder stage count from patch size, so any mismatch would silently load a wrong architecture. The checkpoint is loaded **strictly**: any missing or unexpected state-dict key raises `RuntimeError`. For old checkpoints that don't embed `patch_size`, the loader falls back to a sibling `config.json` (the file `train_tifxyz.train` writes alongside checkpoints). |
-| `--same-surface-threshold` | config value | Voxel-median distance threshold for the same-surface merge inside `compute_patch_labels`. Duplicate wraps (consecutive in chain, different source segments, unsigned median distance ≤ threshold) are collapsed into one surface for EDT, validity bracketing, and all derived losses — the vis still draws both contours but they share a label and color. When unset, falls back to the training config's `same_surface_threshold` field (default `None` = off). See `lasagna/tifxyz_labels.py:detect_same_surface_groups`. |
+| `--same-surface-threshold` | config value | Voxel-p25 distance threshold for the same-surface merge inside `compute_patch_labels`. Duplicate wraps (consecutive in chain, different source segments, unsigned 25th-percentile distance ≤ threshold) are collapsed into one surface for EDT, validity bracketing, and all derived losses — the vis still draws both contours but they share a label and color. When unset, falls back to the training config's `same_surface_threshold` field (default `None` = off; recommended `2.0`). See `lasagna/tifxyz_labels.py:detect_same_surface_groups`. |
 
 The command iterates each entry in `config.datasets`, builds a
 single-dataset `TifxyzLasagnaDataset`, deterministically shuffles its
@@ -185,7 +185,15 @@ Flags:
 | `--num-workers` | `os.cpu_count()` | DataLoader workers. `0` runs everything on the main thread. |
 | `--vis-dir` | `None` | If set, render a `dataset vis`-style JPEG per emitted patch into this directory (reuses `dataset_vis._render_sample_figure`, so rows, contours and normal arrows are identical to what `dataset vis` would produce for that patch). Filenames are sortable by worst-pair `p1` so `ls` puts the worst patches first. The title embeds the worst pair's labels and its post-flip `p1` / `p50` / `min` / `n_samples`. Requires CUDA for the label rows. |
 | `--vis-top-k` | `None` | With `--vis-dir`, render only the K worst patches after scanning completes (ranked by post-flip `p1`, tie-breaks by `0.1`, then `min`). Without it, every emitted patch is rendered inline during the scan. |
-| `--same-surface-threshold` | `None` | Voxel-median distance threshold forwarded to the vis render path. When set together with `--vis-dir`, JPEGs show the **merged** state (duplicate wraps collapsed inside `compute_patch_labels`; both contours still draw but share color and label). **The JSONL stats output is always unmerged by design** — the analysis is about raw duplicate pairs, so only the vis side opts into the merge. Overrides the training config's `same_surface_threshold`. |
+
+The overlap counter column and the vis merge both use a fixed
+rule: a pair is considered "same surface" when its post-flip
+signed `p25` is `≤ 2.0`. Pairs flagged this way are unioned into
+groups via union-find and passed as explicit `same_surface_groups`
+into `compute_patch_labels`, so the vis shows exactly what a
+training run with `same_surface_threshold: 2.0` would merge. The
+JSONL output is still the raw unmerged stats. There is no
+`--same-surface-threshold` flag on `dataset overlap`.
 
 #### Candidate pair rule
 
