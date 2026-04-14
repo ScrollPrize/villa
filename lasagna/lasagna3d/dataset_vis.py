@@ -631,12 +631,12 @@ def _draw_normal_arrows(ax, surface_geometry, chain_info_list,
         u = u / mag
         v = v / mag
 
-        color = _surface_color(sample_seed, si)
+        color = _brighten(_surface_color(sample_seed, si))
         ax.quiver(
             pts[:, hcol], pts[:, vcol],
             u * _ARROW_LEN_PX, v * _ARROW_LEN_PX,
             angles="xy", scale_units="xy", scale=1.0,
-            color=color, width=0.004, headwidth=3.0, headlength=4.0, alpha=0.9,
+            color=color, width=0.006, headwidth=3.5, headlength=4.5, alpha=1.0,
         )
 
 
@@ -710,7 +710,8 @@ def _draw_grid_fused_arrows(ax, nx_vol, ny_vol, nz_vol, valid_3d,
     ax.quiver(
         cc, rr, h * _ARROW_LEN_PX, v * _ARROW_LEN_PX,
         angles="xy", scale_units="xy", scale=1.0,
-        color=color, width=0.004, headwidth=3.0, headlength=4.0, alpha=0.9,
+        color=_brighten(color), width=0.006,
+        headwidth=3.5, headlength=4.5, alpha=1.0,
     )
 
 
@@ -837,7 +838,8 @@ def _draw_grid_normal_arrows(ax, dir_channels, normals_valid_3d,
     ax.quiver(
         cc, rr, h * _ARROW_LEN_PX, v * _ARROW_LEN_PX,
         angles="xy", scale_units="xy", scale=1.0,
-        color=color, width=0.004, headwidth=3.0, headlength=4.0, alpha=0.9,
+        color=_brighten(color), width=0.006,
+        headwidth=3.5, headlength=4.5, alpha=1.0,
     )
 
 
@@ -900,7 +902,8 @@ def _render_sample_figure(
         axes = sf.subplots(1, 3)
         rng = np.random.default_rng(arrow_seed)
         for col, ax in enumerate(axes):
-            ax.imshow(image_disp[col], cmap="gray", interpolation="nearest")
+            ax.imshow(image_disp[col], cmap="gray",
+                      interpolation="nearest", vmin=0, vmax=600)
             _draw_normal_arrows(
                 ax, surface_geometry, chain_info,
                 plane_keys[col], plane_coords[col], rng, arrow_seed,
@@ -922,7 +925,8 @@ def _render_sample_figure(
                 for col in range(3):
                     ax = axes[col]
                     ax.imshow(image_disp[col], cmap="gray",
-                              interpolation="nearest")
+                              interpolation="nearest",
+                              vmin=0, vmax=600)
                     _draw_grid_normal_arrows(
                         ax, direction_channels, normals_valid,
                         plane_keys[col], plane_coords[col],
@@ -940,7 +944,8 @@ def _render_sample_figure(
                 for col in range(3):
                     ax = axes[3 + col]
                     ax.imshow(image_disp[col], cmap="gray",
-                              interpolation="nearest")
+                              interpolation="nearest",
+                              vmin=0, vmax=600)
                     _draw_grid_normal_arrows(
                         ax, pred_dir, normals_valid,
                         plane_keys[col], plane_coords[col],
@@ -954,7 +959,8 @@ def _render_sample_figure(
                 axes = sf.subplots(1, 3)
                 for col, ax in enumerate(axes):
                     ax.imshow(image_disp[col], cmap="gray",
-                              interpolation="nearest")
+                              interpolation="nearest",
+                              vmin=0, vmax=600)
                     _draw_grid_normal_arrows(
                         ax, direction_channels, normals_valid,
                         plane_keys[col], plane_coords[col],
@@ -1158,7 +1164,8 @@ def _render_sample_figure(
                     for col in range(3):
                         ax = axes[col]
                         ax.imshow(image_disp[col], cmap="gray",
-                                  interpolation="nearest")
+                                  interpolation="nearest",
+                                  vmin=0, vmax=600)
                         _draw_grid_fused_arrows(
                             ax, nx_gt, ny_gt, nz_gt, normals_valid,
                             plane_keys[col], plane_coords[col],
@@ -1170,7 +1177,8 @@ def _render_sample_figure(
                     for col in range(3):
                         ax = axes[3 + col]
                         ax.imshow(image_disp[col], cmap="gray",
-                                  interpolation="nearest")
+                                  interpolation="nearest",
+                                  vmin=0, vmax=600)
                         _draw_grid_fused_arrows(
                             ax, nx_pr, ny_pr, nz_pr, normals_valid,
                             plane_keys[col], plane_coords[col],
@@ -1190,7 +1198,7 @@ def _render_sample_figure(
                     ax = axes[col]
                     ax.imshow(image_disp[col], cmap="gray",
                               interpolation="nearest",
-                              vmin=0.0, vmax=2.5)
+                              vmin=0, vmax=600)
                     _draw_surface_axis_arrows(
                         ax, direction_channels, surface_geometry,
                         plane_keys[col], plane_coords[col], arrow_seed,
@@ -1203,7 +1211,7 @@ def _render_sample_figure(
                     ax = axes[3 + col]
                     ax.imshow(image_disp[col], cmap="gray",
                               interpolation="nearest",
-                              vmin=0.0, vmax=2.5)
+                              vmin=0, vmax=600)
                     _draw_surface_axis_arrows(
                         ax, pred_dir_padded, surface_geometry,
                         plane_keys[col], plane_coords[col], arrow_seed,
@@ -1223,7 +1231,7 @@ def _render_sample_figure(
                         ax = axes[col]
                         ax.imshow(image_disp[col], cmap="gray",
                                   interpolation="nearest",
-                                  vmin=0.0, vmax=2.5)
+                                  vmin=0, vmax=600)
                         _draw_surface_fused_arrows(
                             ax, nx_gt, ny_gt, nz_gt, surface_geometry,
                             plane_keys[col], plane_coords[col], arrow_seed,
@@ -1236,7 +1244,7 @@ def _render_sample_figure(
                         ax = axes[3 + col]
                         ax.imshow(image_disp[col], cmap="gray",
                                   interpolation="nearest",
-                                  vmin=0.0, vmax=2.5)
+                                  vmin=0, vmax=600)
                         _draw_surface_fused_arrows(
                             ax, nx_pr, ny_pr, nz_pr, surface_geometry,
                             plane_keys[col], plane_coords[col], arrow_seed,
