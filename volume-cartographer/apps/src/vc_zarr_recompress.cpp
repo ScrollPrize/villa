@@ -730,12 +730,18 @@ int main(int argc, char** argv) {
     printf("\n");
 
     // Discover pyramid levels (all 6 by default, or a --levels CSV subset).
+    // Preserve the CSV order so callers can request e.g. "5,4,3,2,1,0" to
+    // finish small levels first (available for testing) before L0.
+    std::vector<int> levels_order;
     std::set<int> levels_filter;
     if (!levels_arg.empty()) {
         std::stringstream ss(levels_arg);
         std::string tok;
         while (std::getline(ss, tok, ','))
-            if (!tok.empty()) levels_filter.insert(std::atoi(tok.c_str()));
+            if (!tok.empty()) {
+                int l = std::atoi(tok.c_str());
+                if (levels_filter.insert(l).second) levels_order.push_back(l);
+            }
     }
     std::vector<int> levels;
     std::vector<std::vector<size_t>> shapes;
@@ -783,8 +789,25 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Write zarr v3 root metadata
+    // Write zarr v3 root metadata (uses natural level order for metadata
+    // regardless of processing order).
     output->write_string("zarr.json", make_zarr_v3_group_with_multiscales(levels, shapes));
+
+    // Reorder levels for processing based on --levels CSV (user may request
+    // e.g. 5,4,3,2,1,0 to see small levels first).
+    if (!levels_order.empty()) {
+        std::vector<int> new_levels;
+        std::vector<std::vector<size_t>> new_shapes;
+        for (int l : levels_order) {
+            auto it = std::find(levels.begin(), levels.end(), l);
+            if (it == levels.end()) continue;
+            size_t idx = it - levels.begin();
+            new_levels.push_back(levels[idx]);
+            new_shapes.push_back(shapes[idx]);
+        }
+        levels = std::move(new_levels);
+        shapes = std::move(new_shapes);
+    }
 
     for (size_t li = 0; li < levels.size(); li++) {
         int l = levels[li];
