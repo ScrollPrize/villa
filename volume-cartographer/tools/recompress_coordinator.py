@@ -80,10 +80,17 @@ def build_occupancy_bitmap(s3, bucket: str, prefix: str, level: int,
                             shape: list[int], out_path: str,
                             parallelism: int = 64) -> tuple[int, int]:
     """Build a packed occupancy bitmap via parallel per-cz LISTs. Workers
-    list each cz prefix concurrently, coordinator merges into one bitmap."""
-    nz = (shape[0] + CHUNK_DIM - 1) // CHUNK_DIM
-    ny = (shape[1] + CHUNK_DIM - 1) // CHUNK_DIM
-    nx = (shape[2] + CHUNK_DIM - 1) // CHUNK_DIM
+    list each cz prefix concurrently, coordinator merges into one bitmap.
+
+    Dims use the volume shape padded to multiples of SHARD_DIM (matches the
+    binary's expectation, which uses padded_shape for occ_mask sizing).
+    Chunks beyond the unpadded volume can never exist so their bits stay 0."""
+    # Pad to multiple of SHARD_DIM per axis (matches binary's padded_shape).
+    padded = [max(SHARD_DIM, ((d + SHARD_DIM - 1) // SHARD_DIM) * SHARD_DIM)
+              for d in shape]
+    nz = (padded[0] + CHUNK_DIM - 1) // CHUNK_DIM
+    ny = (padded[1] + CHUNK_DIM - 1) // CHUNK_DIM
+    nx = (padded[2] + CHUNK_DIM - 1) // CHUNK_DIM
     total = nz * ny * nx
     packed = bytearray((total + 7) // 8)
     present = 0
