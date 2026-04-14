@@ -620,6 +620,166 @@ def _draw_normal_arrows(ax, surface_geometry, chain_info_list,
         )
 
 
+def _fuse_normals_volume(direction_channels):
+    """Apply the existing inference-side `_estimate_normal` (from
+    `lasagna/preprocess_cos_omezarr.py`) voxel-wise to the (6, Z, Y, X)
+    direction channels, returning the fused 3D normal as three (Z, Y, X)
+    arrays `(nx, ny, nz)`. This is the same iterative observation-
+    weighted fit used in cos/grad_mag fusion for production inference.
+    """
+    from preprocess_cos_omezarr import _estimate_normal
+    d0_z = direction_channels[0]
+    d1_z = direction_channels[1]
+    d0_y = direction_channels[2]
+    d1_y = direction_channels[3]
+    d0_x = direction_channels[4]
+    d1_x = direction_channels[5]
+    _w_z, _w_y, _w_x, nx, ny, nz = _estimate_normal(
+        d0_z, d1_z, d0_y, d1_y, d0_x, d1_x,
+    )
+    return nx.astype(np.float32), ny.astype(np.float32), nz.astype(np.float32)
+
+
+def _plane_axes(plane: str):
+    """Return (slice_axis, h_field_idx, v_field_idx) for the named plane.
+    h/v are indices into the (z=0, y=1, x=2) order for ZYX volumes;
+    used both for slicing direction-channel volumes and for picking
+    in-plane components of a 3D normal.
+    """
+    if plane == "axial":
+        return 0, 2, 1   # z fixed; horizontal=x, vertical=y
+    if plane == "coronal":
+        return 1, 2, 0   # y fixed; horizontal=x, vertical=z
+    return 2, 1, 0       # sagittal: x fixed; horizontal=y, vertical=z
+
+
+def _draw_grid_fused_arrows(ax, nx_vol, ny_vol, nz_vol, valid_3d,
+                            plane: str, plane_coord: int,
+                            color: str = "#22c55e") -> None:
+    """Draw arrows of the fused 3D normal projected onto a plane, on a
+    regular `_GRID_NORMAL_STRIDE` grid where `valid_3d` is set.
+    """
+    slice_axis, h_idx, v_idx = _plane_axes(plane)
+    fields = (nz_vol, ny_vol, nx_vol)  # ZYX order
+
+    def _slc(v):
+        if slice_axis == 0:
+            return v[plane_coord, :, :]
+        if slice_axis == 1:
+            return v[:, plane_coord, :]
+        return v[:, :, plane_coord]
+
+    h_field = _slc(fields[h_idx])
+    v_field = _slc(fields[v_idx])
+    valid = _slc(valid_3d)
+
+    rows, cols = h_field.shape
+    s = _GRID_NORMAL_STRIDE
+    rr, cc = np.mgrid[s // 2:rows:s, s // 2:cols:s]
+    rr = rr.flatten()
+    cc = cc.flatten()
+    keep = valid[rr, cc] > 0.5
+    if not np.any(keep):
+        return
+    rr, cc = rr[keep], cc[keep]
+    h = h_field[rr, cc]
+    v = v_field[rr, cc]
+    mag = np.sqrt(h * h + v * v) + 1e-8
+    h = h / mag
+    v = v / mag
+    ax.quiver(
+        cc, rr, h * _ARROW_LEN_PX, v * _ARROW_LEN_PX,
+        angles="xy", scale_units="xy", scale=1.0,
+        color=color, width=0.004, headwidth=3.0, headlength=4.0, alpha=0.9,
+    )
+
+
+def _draw_surface_axis_arrows(ax, dir_channels, surface_geometry,
+                              plane: str, plane_coord: int,
+                              sample_seed: int):
+    """For each surface in `surface_geometry`, sample axis-decoded
+    direction at the surface points and draw per-surface-colored arrows
+    on the named plane.
+    """
+    c0_idx, c1_idx = _PLANE_DIR_CHANNELS[plane]
+    slice_axis, h_idx, v_idx = _plane_axes(plane)
+    Zd, Yd, Xd = dir_channels.shape[1], dir_channels.shape[2], dir_channels.shape[3]
+
+    for si, geom in enumerate(surface_geometry):
+        pts = np.asarray(geom["points_local"])
+        if pts.shape[0] == 0:
+            continue
+        m = np.abs(pts[:, slice_axis] - plane_coord) < 0.6
+        if not np.any(m):
+            continue
+        pts_p = pts[m]
+        if pts_p.shape[0] > _MAX_ARROWS_PER_PLANE:
+            pick = np.random.default_rng(sample_seed + si).choice(
+                pts_p.shape[0], size=_MAX_ARROWS_PER_PLANE, replace=False,
+            )
+            pts_p = pts_p[pick]
+        zi = np.clip(pts_p[:, 0].astype(np.int64), 0, Zd - 1)
+        yi = np.clip(pts_p[:, 1].astype(np.int64), 0, Yd - 1)
+        xi = np.clip(pts_p[:, 2].astype(np.int64), 0, Xd - 1)
+        d0v = dir_channels[c0_idx, zi, yi, xi]
+        d1v = dir_channels[c1_idx, zi, yi, xi]
+        h, v = _decode_dir_pair(d0v, d1v)
+        # Pull point columns matching the plane axes
+        cols = pts_p[:, [0, 1, 2]]  # ZYX
+        h_pos = cols[:, h_idx]
+        v_pos = cols[:, v_idx]
+        color = _surface_color(sample_seed, si)
+        ax.quiver(
+            h_pos, v_pos, h * _ARROW_LEN_PX, v * _ARROW_LEN_PX,
+            angles="xy", scale_units="xy", scale=1.0,
+            color=color, width=0.004, headwidth=3.0, headlength=4.0, alpha=0.9,
+        )
+
+
+def _draw_surface_fused_arrows(ax, nx_vol, ny_vol, nz_vol, surface_geometry,
+                               plane: str, plane_coord: int,
+                               sample_seed: int):
+    """For each surface in `surface_geometry`, sample the FUSED 3D normal
+    at the surface points and draw the in-plane projection.
+    """
+    slice_axis, h_idx, v_idx = _plane_axes(plane)
+    fields = (nz_vol, ny_vol, nx_vol)  # ZYX order
+    Zd, Yd, Xd = nx_vol.shape
+
+    for si, geom in enumerate(surface_geometry):
+        pts = np.asarray(geom["points_local"])
+        if pts.shape[0] == 0:
+            continue
+        m = np.abs(pts[:, slice_axis] - plane_coord) < 0.6
+        if not np.any(m):
+            continue
+        pts_p = pts[m]
+        if pts_p.shape[0] > _MAX_ARROWS_PER_PLANE:
+            pick = np.random.default_rng(sample_seed + si + 9001).choice(
+                pts_p.shape[0], size=_MAX_ARROWS_PER_PLANE, replace=False,
+            )
+            pts_p = pts_p[pick]
+        zi = np.clip(pts_p[:, 0].astype(np.int64), 0, Zd - 1)
+        yi = np.clip(pts_p[:, 1].astype(np.int64), 0, Yd - 1)
+        xi = np.clip(pts_p[:, 2].astype(np.int64), 0, Xd - 1)
+        h_field = fields[h_idx]
+        v_field = fields[v_idx]
+        h = h_field[zi, yi, xi]
+        v = v_field[zi, yi, xi]
+        mag = np.sqrt(h * h + v * v) + 1e-8
+        h = h / mag
+        v = v / mag
+        cols = pts_p[:, [0, 1, 2]]
+        h_pos = cols[:, h_idx]
+        v_pos = cols[:, v_idx]
+        color = _surface_color(sample_seed, si)
+        ax.quiver(
+            h_pos, v_pos, h * _ARROW_LEN_PX, v * _ARROW_LEN_PX,
+            angles="xy", scale_units="xy", scale=1.0,
+            color=color, width=0.004, headwidth=3.0, headlength=4.0, alpha=0.9,
+        )
+
+
 def _draw_grid_normal_arrows(ax, dir_channels, normals_valid_3d,
                              plane: str, plane_coord: int,
                              color: str = "#22c55e") -> None:
@@ -828,6 +988,20 @@ def _render_sample_figure(
                 _auto_vmax(diff_dir_full, validity > 0.5, 99.0),
                 _auto_vmax(diff_dir_ss, validity > 0.5, 99.0),
             )
+            # Pred direction channels padded/cropped to vis size (Z=Y=X)
+            # for both decoded-axis and fused arrow rows.
+            pred_dir_padded = _center_crop_or_pad_3d(
+                inference_output["pred_dir"], Z, pad_value=0.0,
+            )
+            # Fused 3D normals (nx, ny, nz) for GT and pred. Same fit
+            # as production cos/grad_mag fusion uses.
+            try:
+                nx_gt, ny_gt, nz_gt = _fuse_normals_volume(direction_channels)
+                nx_pr, ny_pr, nz_pr = _fuse_normals_volume(pred_dir_padded)
+                fused_ok = True
+            except Exception as exc:
+                print(f"{TAG} WARNING: normal fusion failed ({exc})", flush=True)
+                fused_ok = False
             # Shared diff vmax across full + ss for the same channel
             cos_diff_vmax = max(
                 _auto_vmax(diff_cos_full, validity > 0.5, 99.0),
@@ -947,6 +1121,156 @@ def _render_sample_figure(
                             fontsize=8,
                         )
             rows.append(("normals residual", draw_row_normals_residual, 6))
+
+        # ---- Additional normal vis rows (only with --model) ----------
+        if has_inf:
+            # Row: dense regular-grid arrows of FUSED 3D normals
+            # (production fit), GT|pred. Same fit as cos/grad_mag
+            # fusion uses for inference.
+            if fused_ok:
+                def draw_row_grid_fused(sf):
+                    axes = sf.subplots(1, 6)
+                    for col in range(3):
+                        ax = axes[col]
+                        ax.imshow(image_disp[col], cmap="gray",
+                                  interpolation="nearest")
+                        _draw_grid_fused_arrows(
+                            ax, nx_gt, ny_gt, nz_gt, normals_valid,
+                            plane_keys[col], plane_coords[col],
+                            color="#22c55e",
+                        )
+                        ax.set_title(f"GT fused  {plane_names[col]}",
+                                     fontsize=9)
+                        ax.set_xticks([]); ax.set_yticks([])
+                    for col in range(3):
+                        ax = axes[3 + col]
+                        ax.imshow(image_disp[col], cmap="gray",
+                                  interpolation="nearest")
+                        _draw_grid_fused_arrows(
+                            ax, nx_pr, ny_pr, nz_pr, normals_valid,
+                            plane_keys[col], plane_coords[col],
+                            color="#f97316",
+                        )
+                        ax.set_title(f"pred fused  {plane_names[col]}",
+                                     fontsize=9)
+                        ax.set_xticks([]); ax.set_yticks([])
+                rows.append(
+                    ("normals dense (fused)", draw_row_grid_fused, 6))
+
+            # Row: on-surface arrows from axis-decoded direction
+            # channels. Per-surface colors (matching row 1 contours).
+            def draw_row_surface_axis(sf):
+                axes = sf.subplots(1, 6)
+                for col in range(3):
+                    ax = axes[col]
+                    ax.imshow(image_disp[col], cmap="gray",
+                              interpolation="nearest")
+                    _draw_surface_axis_arrows(
+                        ax, direction_channels, surface_geometry,
+                        plane_keys[col], plane_coords[col], arrow_seed,
+                    )
+                    ax.set_title(
+                        f"GT axis on-surface  {plane_names[col]}",
+                        fontsize=9)
+                    ax.set_xticks([]); ax.set_yticks([])
+                for col in range(3):
+                    ax = axes[3 + col]
+                    ax.imshow(image_disp[col], cmap="gray",
+                              interpolation="nearest")
+                    _draw_surface_axis_arrows(
+                        ax, pred_dir_padded, surface_geometry,
+                        plane_keys[col], plane_coords[col], arrow_seed,
+                    )
+                    ax.set_title(
+                        f"pred axis on-surface  {plane_names[col]}",
+                        fontsize=9)
+                    ax.set_xticks([]); ax.set_yticks([])
+            rows.append(
+                ("normals on-surface (axis)", draw_row_surface_axis, 6))
+
+            # Row: on-surface arrows from FUSED normals.
+            if fused_ok:
+                def draw_row_surface_fused(sf):
+                    axes = sf.subplots(1, 6)
+                    for col in range(3):
+                        ax = axes[col]
+                        ax.imshow(image_disp[col], cmap="gray",
+                                  interpolation="nearest")
+                        _draw_surface_fused_arrows(
+                            ax, nx_gt, ny_gt, nz_gt, surface_geometry,
+                            plane_keys[col], plane_coords[col], arrow_seed,
+                        )
+                        ax.set_title(
+                            f"GT fused on-surface  {plane_names[col]}",
+                            fontsize=9)
+                        ax.set_xticks([]); ax.set_yticks([])
+                    for col in range(3):
+                        ax = axes[3 + col]
+                        ax.imshow(image_disp[col], cmap="gray",
+                                  interpolation="nearest")
+                        _draw_surface_fused_arrows(
+                            ax, nx_pr, ny_pr, nz_pr, surface_geometry,
+                            plane_keys[col], plane_coords[col], arrow_seed,
+                        )
+                        ax.set_title(
+                            f"pred fused on-surface  {plane_names[col]}",
+                            fontsize=9)
+                        ax.set_xticks([]); ax.set_yticks([])
+                rows.append(
+                    ("normals on-surface (fused)",
+                     draw_row_surface_fused, 6))
+
+            # Row: 2-channel false color of direction channels.
+            # Per plane, take the relevant axis pair and build an RGB
+            # image with R = d0, G = d1, B = 0.5. GT vs pred.
+            def draw_row_dir_falsecolor(sf):
+                axes = sf.subplots(1, 6)
+
+                def _falsecolor(d0_slice, d1_slice):
+                    rgb = np.stack([
+                        np.clip(d0_slice, 0.0, 1.0),
+                        np.clip(d1_slice, 0.0, 1.0),
+                        np.full_like(d0_slice, 0.5),
+                    ], axis=-1)
+                    return rgb
+
+                for col in range(3):
+                    plane = plane_keys[col]
+                    pc = plane_coords[col]
+                    c0i, c1i = _PLANE_DIR_CHANNELS[plane]
+                    if plane == "axial":
+                        gt_d0 = direction_channels[c0i, pc, :, :]
+                        gt_d1 = direction_channels[c1i, pc, :, :]
+                        pr_d0 = pred_dir_padded[c0i, pc, :, :]
+                        pr_d1 = pred_dir_padded[c1i, pc, :, :]
+                    elif plane == "coronal":
+                        gt_d0 = direction_channels[c0i, :, pc, :]
+                        gt_d1 = direction_channels[c1i, :, pc, :]
+                        pr_d0 = pred_dir_padded[c0i, :, pc, :]
+                        pr_d1 = pred_dir_padded[c1i, :, pc, :]
+                    else:
+                        gt_d0 = direction_channels[c0i, :, :, pc]
+                        gt_d1 = direction_channels[c1i, :, :, pc]
+                        pr_d0 = pred_dir_padded[c0i, :, :, pc]
+                        pr_d1 = pred_dir_padded[c1i, :, :, pc]
+                    axes[col].imshow(_falsecolor(gt_d0, gt_d1),
+                                     interpolation="nearest")
+                    axes[col].set_title(
+                        f"GT (d{c0i},d{c1i})  {plane_names[col]}",
+                        fontsize=8)
+                    axes[col].set_xticks([]); axes[col].set_yticks([])
+
+                    axes[3 + col].imshow(_falsecolor(pr_d0, pr_d1),
+                                         interpolation="nearest")
+                    axes[3 + col].set_title(
+                        f"pred (d{c0i},d{c1i})  {plane_names[col]}",
+                        fontsize=8)
+                    axes[3 + col].set_xticks([])
+                    axes[3 + col].set_yticks([])
+
+            rows.append(
+                ("direction channels (R=d0, G=d1)",
+                 draw_row_dir_falsecolor, 6))
 
         # validity scale rows
         for scale_idx, scale_vol in enumerate(pyramid):
