@@ -51,21 +51,15 @@ def read_source_zarray(s3, bucket: str, prefix: str, level: int) -> dict | None:
         return None
 
 
-def build_occupancy_bitmap(s3, bucket: str, prefix: str, level: int,
-                            shape: list[int], out_path: str) -> tuple[int, int]:
-    """LIST the input level once, build a packed occupancy bitmap, write it
-    to out_path. Returns (total_bits, present_bits)."""
-    nz = (shape[0] + CHUNK_DIM - 1) // CHUNK_DIM
-    ny = (shape[1] + CHUNK_DIM - 1) // CHUNK_DIM
-    nx = (shape[2] + CHUNK_DIM - 1) // CHUNK_DIM
-    total = nz * ny * nx
-    # Packed bitmap: bit i at packed[i>>3] >> (i & 7) & 1
-    packed = bytearray((total + 7) // 8)
-
-    src_prefix = f"{prefix}/{level}/"
-    paginator = s3.get_paginator("list_objects_v2")
-    present = 0
-    for page in paginator.paginate(Bucket=bucket, Prefix=src_prefix):
+def _list_cz(bucket: str, src_prefix: str, cz: int, ny: int, nx: int):
+    """List one cz prefix in parallel, return a list of (cz, cy, cx) that
+    exist.  New S3 client per call (boto3 client is not thread-safe
+    across all operations; cheap to construct per thread)."""
+    local_s3 = boto3.client("s3")
+    paginator = local_s3.get_paginator("list_objects_v2")
+    cz_prefix = f"{src_prefix}{cz}/"
+    out = []
+    for page in paginator.paginate(Bucket=bucket, Prefix=cz_prefix):
         for obj in page.get("Contents", []) or []:
             key = obj["Key"]
             rel = key[len(src_prefix):]
@@ -73,16 +67,37 @@ def build_occupancy_bitmap(s3, bucket: str, prefix: str, level: int,
             if len(parts) != 3:
                 continue
             try:
-                cz, cy, cx = (int(p) for p in parts)
+                cz2, cy, cx = (int(p) for p in parts)
             except ValueError:
                 continue
-            if cz >= nz or cy >= ny or cx >= nx:
+            if cz2 != cz or cy >= ny or cx >= nx:
                 continue
-            i = cz * ny * nx + cy * nx + cx
-            packed[i >> 3] |= 1 << (i & 7)
-            present += 1
+            out.append((cz2, cy, cx))
+    return out
 
-    # Header: 3x uint32 little-endian (nz, ny, nx)
+
+def build_occupancy_bitmap(s3, bucket: str, prefix: str, level: int,
+                            shape: list[int], out_path: str,
+                            parallelism: int = 64) -> tuple[int, int]:
+    """Build a packed occupancy bitmap via parallel per-cz LISTs. Workers
+    list each cz prefix concurrently, coordinator merges into one bitmap."""
+    nz = (shape[0] + CHUNK_DIM - 1) // CHUNK_DIM
+    ny = (shape[1] + CHUNK_DIM - 1) // CHUNK_DIM
+    nx = (shape[2] + CHUNK_DIM - 1) // CHUNK_DIM
+    total = nz * ny * nx
+    packed = bytearray((total + 7) // 8)
+    present = 0
+
+    src_prefix = f"{prefix}/{level}/"
+    with futures.ThreadPoolExecutor(max_workers=parallelism) as pool:
+        futs = [pool.submit(_list_cz, bucket, src_prefix, cz, ny, nx)
+                for cz in range(nz)]
+        for fut in futures.as_completed(futs):
+            for cz, cy, cx in fut.result():
+                i = cz * ny * nx + cy * nx + cx
+                packed[i >> 3] |= 1 << (i & 7)
+                present += 1
+
     import struct
     header = struct.pack("<III", nz, ny, nx)
     with open(out_path, "wb") as f:
