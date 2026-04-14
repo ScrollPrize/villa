@@ -484,6 +484,36 @@ static void write_zero_sentinel(std::byte* dst) {
 // the level's prefix.  We parse the trailing "<cz>/<cy>/<cx>" out of each
 // key and mark the corresponding chunk as occupied.  No per-chunk HEAD/GET,
 // no separate-level mask scan — one round-trip per 10K chunks.
+// Load a coordinator-built occupancy bitmap from /dev/shm or any file.
+// Format: 12-byte header (u32 nz, u32 ny, u32 nx, little-endian), then
+// packed bitset of nz*ny*nx bits (ceil(N/8) bytes).
+// Dims must match the level's (nz, ny, nx) or we throw.
+static std::vector<bool> load_occupancy_file(const std::string& path,
+                                              size_t nz, size_t ny, size_t nx)
+{
+    std::ifstream f(path, std::ios::binary);
+    if (!f) throw std::runtime_error("occupancy-file: cannot open " + path);
+    uint32_t header[3];
+    f.read(reinterpret_cast<char*>(header), sizeof(header));
+    if (!f) throw std::runtime_error("occupancy-file: short read on header");
+    if (header[0] != nz || header[1] != ny || header[2] != nx) {
+        throw std::runtime_error("occupancy-file: dims mismatch (expected "
+            + std::to_string(nz) + "/" + std::to_string(ny) + "/"
+            + std::to_string(nx) + ", got "
+            + std::to_string(header[0]) + "/" + std::to_string(header[1]) + "/"
+            + std::to_string(header[2]) + ")");
+    }
+    const size_t bits = nz * ny * nx;
+    const size_t bytes = (bits + 7) / 8;
+    std::vector<uint8_t> packed(bytes);
+    f.read(reinterpret_cast<char*>(packed.data()), bytes);
+    if (!f) throw std::runtime_error("occupancy-file: short read on bitmap");
+    std::vector<bool> mask(bits, false);
+    for (size_t i = 0; i < bits; ++i)
+        mask[i] = (packed[i >> 3] >> (i & 7)) & 1;
+    return mask;
+}
+
 static std::vector<bool> build_occupancy_from_listing(
     IOBackend& io, int level,
     const std::vector<size_t>& shape, const std::vector<size_t>& chunks,
@@ -656,7 +686,11 @@ int main(int argc, char** argv) {
                   << "                   With --world 4, VM 0 handles sz%%4==0, VM 1 sz%%4==1, etc.\n"
                   << "  --one-shard L/sz/sy/sx  Process exactly one shard + exit.\n"
                   << "                          Skips occupancy and resume lists. Coordinator\n"
-                  << "                          handles both. Use for per-shard process fanout.\n";
+                  << "                          handles both. Use for per-shard process fanout.\n"
+                  << "  --encode-jobs N  Encode pool threads per worker [default: 2*cores]\n"
+                  << "  --occupancy-file PATH  Binary bitmap of input chunk existence\n"
+                  << "                          (nz*ny*nx bits). Skips S3 LIST entirely.\n"
+                  << "                          {L} in path is replaced by level number.\n";
         return 1;
     }
 
@@ -683,6 +717,7 @@ int main(int argc, char** argv) {
     int world = 1;             // total VM count for horizontal scaling
     std::string one_shard_arg; // "L/sz/sy/sx" — process exactly one shard + exit
     int encode_jobs = 0;       // 0 = 2*hw_concurrency (default)
+    std::string occupancy_file; // external occupancy bitmap (coordinator-built)
 
     for (int i = 3; i < argc; i++) {
         std::string arg = argv[i];
@@ -699,6 +734,7 @@ int main(int argc, char** argv) {
         else if (arg == "--world" && i + 1 < argc) world = std::atoi(argv[++i]);
         else if (arg == "--one-shard" && i + 1 < argc) one_shard_arg = argv[++i];
         else if (arg == "--encode-jobs" && i + 1 < argc) encode_jobs = std::atoi(argv[++i]);
+        else if (arg == "--occupancy-file" && i + 1 < argc) occupancy_file = argv[++i];
     }
     if (stats_pct < 0) stats_pct = 0;
     if (stats_pct > 100) stats_pct = 100;
@@ -889,7 +925,16 @@ int main(int argc, char** argv) {
         // per-chunk GETs with 404 being cheap (~50 ms each, 128 parallel).
         std::vector<size_t> chunk128 = {CHUNK_DIM, CHUNK_DIM, CHUNK_DIM};
         std::vector<bool> occ_mask;
-        if (one_shard_arg.empty()) {
+        size_t occ_nz = (shape[0] + CHUNK_DIM - 1) / CHUNK_DIM;
+        size_t occ_ny = (shape[1] + CHUNK_DIM - 1) / CHUNK_DIM;
+        size_t occ_nx = (shape[2] + CHUNK_DIM - 1) / CHUNK_DIM;
+        if (!occupancy_file.empty()) {
+            // Substitute the level number if path contains {L}
+            std::string p = occupancy_file;
+            auto pos = p.find("{L}");
+            if (pos != std::string::npos) p.replace(pos, 3, std::to_string(l));
+            occ_mask = load_occupancy_file(p, occ_nz, occ_ny, occ_nx);
+        } else if (one_shard_arg.empty()) {
             occ_mask = build_occupancy_from_listing(*input, l, shape, chunk128, 64);
         }
 

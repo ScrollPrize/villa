@@ -51,6 +51,46 @@ def read_source_zarray(s3, bucket: str, prefix: str, level: int) -> dict | None:
         return None
 
 
+def build_occupancy_bitmap(s3, bucket: str, prefix: str, level: int,
+                            shape: list[int], out_path: str) -> tuple[int, int]:
+    """LIST the input level once, build a packed occupancy bitmap, write it
+    to out_path. Returns (total_bits, present_bits)."""
+    nz = (shape[0] + CHUNK_DIM - 1) // CHUNK_DIM
+    ny = (shape[1] + CHUNK_DIM - 1) // CHUNK_DIM
+    nx = (shape[2] + CHUNK_DIM - 1) // CHUNK_DIM
+    total = nz * ny * nx
+    # Packed bitmap: bit i at packed[i>>3] >> (i & 7) & 1
+    packed = bytearray((total + 7) // 8)
+
+    src_prefix = f"{prefix}/{level}/"
+    paginator = s3.get_paginator("list_objects_v2")
+    present = 0
+    for page in paginator.paginate(Bucket=bucket, Prefix=src_prefix):
+        for obj in page.get("Contents", []) or []:
+            key = obj["Key"]
+            rel = key[len(src_prefix):]
+            parts = rel.split("/")
+            if len(parts) != 3:
+                continue
+            try:
+                cz, cy, cx = (int(p) for p in parts)
+            except ValueError:
+                continue
+            if cz >= nz or cy >= ny or cx >= nx:
+                continue
+            i = cz * ny * nx + cy * nx + cx
+            packed[i >> 3] |= 1 << (i & 7)
+            present += 1
+
+    # Header: 3x uint32 little-endian (nz, ny, nx)
+    import struct
+    header = struct.pack("<III", nz, ny, nx)
+    with open(out_path, "wb") as f:
+        f.write(header)
+        f.write(packed)
+    return total, present
+
+
 def list_existing_shards(s3, bucket: str, prefix: str, level: int) -> set[tuple[int, int, int]]:
     """Return set of (sz, sy, sx) already in S3 under level/c/."""
     done = set()
@@ -109,7 +149,8 @@ def write_metadata(s3, bucket: str, prefix: str, binary: str,
 def run_worker(binary: str, input_url: str, output_url: str,
                level: int, sz: int, sy: int, sx: int,
                qp: int, air_clamp: int, shift_n: int,
-               inner_jobs: int, encode_jobs: int) -> tuple[int, int, int, int, int]:
+               inner_jobs: int, encode_jobs: int,
+               occupancy_file: str | None) -> tuple[int, int, int, int, int]:
     """Launch one worker, wait for it, return exit code + shard coords."""
     cmd = [binary, input_url, output_url,
            "--qp", str(qp),
@@ -118,6 +159,8 @@ def run_worker(binary: str, input_url: str, output_url: str,
            "--inner-jobs", str(inner_jobs),
            "--encode-jobs", str(encode_jobs),
            "--one-shard", f"{level}/{sz}/{sy}/{sx}"]
+    if occupancy_file:
+        cmd.extend(["--occupancy-file", occupancy_file])
     # stdout to /dev/null: workers are numerous and chatty
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
                           stderr=subprocess.DEVNULL, check=False)
@@ -183,6 +226,16 @@ def main():
         if not todo:
             continue
 
+        # Build per-level occupancy bitmap once; workers use it via --occupancy-file.
+        # Replaces ~400 404 GETs per shard with a single LIST + one mmap-style read.
+        occ_path = f"/dev/shm/occ_L{level}.bin"
+        t_occ = time.time()
+        total_bits, present = build_occupancy_bitmap(
+            s3, in_bucket, in_prefix, level, shape, occ_path)
+        print(f"[coord] level {level}: occupancy bitmap {present}/{total_bits} "
+              f"({100*(1-present/total_bits):.1f}% sparse) in "
+              f"{time.time()-t_occ:.1f}s -> {occ_path}")
+
         t0 = time.time()
         completed = 0
         failed = 0
@@ -191,7 +244,8 @@ def main():
                 pool.submit(run_worker, args.binary, args.input, args.output,
                             level, sz, sy, sx,
                             args.qp, args.air_clamp, args.bit_shift,
-                            args.inner_jobs, args.encode_jobs): (sz, sy, sx)
+                            args.inner_jobs, args.encode_jobs,
+                            occ_path): (sz, sy, sx)
                 for (sz, sy, sx) in todo
             }
             for fut in futures.as_completed(futs):
