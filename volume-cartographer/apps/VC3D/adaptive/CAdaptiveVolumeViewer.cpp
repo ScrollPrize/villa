@@ -317,6 +317,12 @@ void CAdaptiveVolumeViewer::submitRender()
         int interpIdx = s.value(perf::INTERPOLATION_METHOD, 1).toInt();
         _samplingMethod = static_cast<vc::Sampling>(std::clamp(interpIdx, 0, 3));
     }
+    const CompositeParams& lightP = _compositeSettings.params;
+    const bool rakingEnabled = _compositeSettings.postRakingEnabled;
+    const float rakingAz = _compositeSettings.postRakingAzimuth;
+    const float rakingEl = _compositeSettings.postRakingElevation;
+    const float rakingStrength = std::clamp(_compositeSettings.postRakingStrength, 0.0f, 1.0f);
+    const float rakingDepth = std::max(0.01f, _compositeSettings.postRakingDepthScale);
 
     auto surf = _surfWeak.lock();
     if (!surf || !_volume || !_volume->zarrDataset()) return;
@@ -342,10 +348,10 @@ void CAdaptiveVolumeViewer::submitRender()
 
     std::array<uint32_t, 256> lut;
     const bool stretchFirstPass = stretch && !_cachedStretchValid;
-    // When CLAHE is active the colormap must be deferred until after CLAHE.
-    // In that case the sampling LUT is grayscale-only.
-    const bool deferColormap = _compositeSettings.postClaheEnabled
-                               && !_baseColormapId.empty();
+    // CLAHE and raking both operate on gray, so the colormap is deferred
+    // until after those passes. The sampling LUT in that case is gray-only.
+    const bool postGrayDomain = _compositeSettings.postClaheEnabled || rakingEnabled;
+    const bool deferColormap = postGrayDomain && !_baseColormapId.empty();
     const std::string& sampleColormapId = deferColormap
         ? std::string() : _baseColormapId;
     if (stretchFirstPass) {
@@ -422,7 +428,8 @@ void CAdaptiveVolumeViewer::submitRender()
             nullptr, &origin, &vx_step, &vy_step,
             nullptr, pNormal,
             numLayers, zStart, zStep,
-            fbW, fbH, method, lut.data(), sampleMethod);
+            fbW, fbH, method, lut.data(), sampleMethod,
+            &lightP);  // sampler uses lightP for volumetric and lighting paths
     } else {
         cv::Mat_<cv::Vec3f> coords;
         cv::Mat_<cv::Vec3f> normals;
@@ -456,7 +463,8 @@ void CAdaptiveVolumeViewer::submitRender()
                 &coords, nullptr, nullptr, nullptr,
                 pNormals, nullptr,
                 numLayers, zStart, zStep,
-                fbW, fbH, method, lut.data(), sampleMethod);
+                fbW, fbH, method, lut.data(), sampleMethod,
+            &lightP);  // sampler uses lightP for volumetric and lighting paths
         }
     }
 
@@ -511,17 +519,56 @@ void CAdaptiveVolumeViewer::submitRender()
 
     // CLAHE post-pass — runs on grayscale before any colormap is applied.
     // When a colormap is selected we also run the colormap LUT here.
-    if (_compositeSettings.postClaheEnabled) {
+    if (postGrayDomain) {
         cv::Mat_<uint8_t> gray(fbH, fbW);
         for (int y = 0; y < fbH; y++) {
             const uint32_t* row = fbBits + size_t(y) * size_t(fbStride);
             uint8_t* dst = gray.ptr<uint8_t>(y);
             for (int x = 0; x < fbW; x++) dst[x] = uint8_t(row[x] & 0xFFu);
         }
-        const int tile = std::max(1, _compositeSettings.postClaheTileSize);
-        const double clip = std::max(0.01, double(_compositeSettings.postClaheClipLimit));
-        auto clahe = cv::createCLAHE(clip, cv::Size(tile, tile));
-        clahe->apply(gray, gray);
+        if (_compositeSettings.postClaheEnabled) {
+            const int tile = std::max(1, _compositeSettings.postClaheTileSize);
+            const double clip = std::max(0.01, double(_compositeSettings.postClaheClipLimit));
+            auto clahe = cv::createCLAHE(clip, cv::Size(tile, tile));
+            clahe->apply(gray, gray);
+        }
+        if (rakingEnabled) {
+            // Treat gray as a heightfield. Scharr gives a screen-space
+            // gradient; compose a surface normal (depth scales vertical
+            // slope vs. unit-height image plane) and Lambert-shade it.
+            cv::Mat gx, gy;
+            cv::Scharr(gray, gx, CV_32F, 1, 0, 1.0 / 32.0);
+            cv::Scharr(gray, gy, CV_32F, 0, 1, 1.0 / 32.0);
+            const float azRad = rakingAz * float(M_PI) / 180.0f;
+            const float elRad = rakingEl * float(M_PI) / 180.0f;
+            const float ce = std::cos(elRad);
+            const float Lx = ce * std::cos(azRad);
+            const float Ly = ce * std::sin(azRad);
+            const float Lz = std::sin(elRad);
+            const float strength = rakingStrength;
+            const float ambient = 1.0f - strength;
+            const float depth = rakingDepth;
+            #pragma omp parallel for
+            for (int y = 0; y < fbH; y++) {
+                uint8_t* dst = gray.ptr<uint8_t>(y);
+                const float* gxr = gx.ptr<float>(y);
+                const float* gyr = gy.ptr<float>(y);
+                for (int x = 0; x < fbW; x++) {
+                    const float nx = -gxr[x] * depth;
+                    const float ny = -gyr[x] * depth;
+                    const float nz = 1.0f;
+                    const float invLen = 1.0f
+                        / std::sqrt(nx * nx + ny * ny + nz * nz);
+                    const float nDotL = (nx * Lx + ny * Ly + nz * Lz) * invLen;
+                    float lit = ambient + strength * std::max(0.0f, nDotL);
+                    if (lit > 1.0f) lit = 1.0f;
+                    float v = float(dst[x]) * lit;
+                    if (v < 0.0f) v = 0.0f;
+                    if (v > 255.0f) v = 255.0f;
+                    dst[x] = uint8_t(v);
+                }
+            }
+        }
 
         if (deferColormap) {
             // Identity window/level (gray is already windowed) + user colormap.

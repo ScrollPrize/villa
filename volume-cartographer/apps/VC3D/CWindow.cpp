@@ -2,6 +2,7 @@
 #include "RamStats.hpp"
 
 #include <cstdlib>
+#include <functional>
 #include <malloc.h>
 
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
@@ -3597,6 +3598,7 @@ void CWindow::CreateWidgets(void)
             case 2: method = "min"; break;
             case 3: method = "alpha"; break;
             case 4: method = "beerLambert"; break;
+            case 5: method = "volumetric"; break;
         }
 
         if (auto* viewer = segmentationViewer()) {
@@ -3720,6 +3722,7 @@ void CWindow::CreateWidgets(void)
         if (auto* viewer = segmentationViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.lightAzimuth = static_cast<float>(value);
+            s.params.updateLightDir();
             viewer->setCompositeRenderSettings(s);
         }
     });
@@ -3729,6 +3732,7 @@ void CWindow::CreateWidgets(void)
         if (auto* viewer = segmentationViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.lightElevation = static_cast<float>(value);
+            s.params.updateLightDir();
             viewer->setCompositeRenderSettings(s);
         }
     });
@@ -3751,11 +3755,22 @@ void CWindow::CreateWidgets(void)
         }
     });
 
-    // Connect Volume Gradients checkbox
+    // Connect Volume Gradients checkbox — switches the lighting normal
+    // source between mesh-interpolated (0) and per-sample volume gradient (1).
     connect(ui.chkUseVolumeGradients, &QCheckBox::toggled, this, [this](bool checked) {
         if (auto* viewer = segmentationViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.useVolumeGradients = checked;
+            s.params.lightNormalSource = checked ? 1 : 0;
+            viewer->setCompositeRenderSettings(s);
+        }
+    });
+
+    // Connect Shadow Steps spinbox (Volumetric method)
+    connect(ui.spinShadowSteps, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (auto* viewer = segmentationViewer()) {
+            auto s = viewer->compositeRenderSettings();
+            s.params.shadowSteps = std::clamp(value, 1, 64);
             viewer->setCompositeRenderSettings(s);
         }
     });
@@ -3974,6 +3989,62 @@ void CWindow::CreateWidgets(void)
             viewer->setCompositeRenderSettings(s);
         });
     });
+
+    // Raking light — heightfield post-process
+    auto setRakingEnabled = [this](bool on) {
+        ui.spinRakingAzimuth->setEnabled(on);
+        ui.spinRakingElevation->setEnabled(on);
+        ui.spinRakingStrength->setEnabled(on);
+        ui.spinRakingDepthScale->setEnabled(on);
+        ui.lblRakingAzimuth->setEnabled(on);
+        ui.lblRakingElevation->setEnabled(on);
+        ui.lblRakingStrength->setEnabled(on);
+        ui.lblRakingDepth->setEnabled(on);
+    };
+    setRakingEnabled(ui.chkRakingEnabled->isChecked());
+
+    connect(ui.chkRakingEnabled, &QCheckBox::toggled, this, [this, setRakingEnabled](bool checked) {
+        setRakingEnabled(checked);
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([checked](CTiledVolumeViewer* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.postRakingEnabled = checked;
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+    connect(ui.spinRakingAzimuth, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([v](CTiledVolumeViewer* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.postRakingAzimuth = float(v);
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+    connect(ui.spinRakingElevation, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([v](CTiledVolumeViewer* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.postRakingElevation = float(v);
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+    connect(ui.spinRakingStrength, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([v](CTiledVolumeViewer* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.postRakingStrength = std::clamp(float(v), 0.0f, 1.0f);
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+    connect(ui.spinRakingDepthScale, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([v](CTiledVolumeViewer* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.postRakingDepthScale = std::max(0.01f, float(v));
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+
 
     bool resetViewOnSurfaceChange = settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
                                                    vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();

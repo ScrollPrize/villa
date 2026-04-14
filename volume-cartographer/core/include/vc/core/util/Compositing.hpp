@@ -23,8 +23,20 @@ struct CompositeParams {
     float blEmission = 1.5f;          // Emission scale (higher = brighter)
     float blAmbient = 0.1f;           // Ambient light (background illumination)
 
-    // Directional lighting parameters
+    // Volumetric-method shadow integration: at each view-ray sample a
+    // secondary ray walks this many voxels toward the light, integrating
+    // density to attenuate the voxel's emission. Higher = softer/more
+    // accurate shadows, linear cost.
+    int shadowSteps = 8;
+
+    // Directional lighting parameters (applied per-sample in the compositor)
     bool lightingEnabled = false;     // Enable surface lighting
+    // Source of the surface normal used for Lambertian shading:
+    //   0 = mesh normal (describes the unrolled sheet orientation; flat for
+    //       papyrus detail — can't reveal crackle or fiber).
+    //   1 = volume gradient ∇V at the base sample position (reveals local
+    //       density structure — this is where ink, fiber, and crackle live).
+    int lightNormalSource = 0;
     float lightAzimuth = 45.0f;       // Light direction azimuth (degrees, 0=right, 90=up)
     float lightElevation = 45.0f;     // Light direction elevation (degrees above horizon)
     float lightDiffuse = 0.7f;        // Diffuse lighting strength (0-1)
@@ -75,6 +87,16 @@ struct CompositeRenderSettings {
     bool postClaheEnabled = false;
     float postClaheClipLimit = 2.0f;
     int postClaheTileSize = 8;
+
+    // Raking-light post-process: treat the composite gray image as a
+    // heightfield, light it from a low angle. Reveals papyrus surface
+    // texture (crackle, fiber, ink relief) independent of brightness
+    // contrast. Pure 2D pass after CLAHE, before colormap.
+    bool postRakingEnabled = false;
+    float postRakingAzimuth = 30.0f;    // degrees, 0=+x, 90=+y
+    float postRakingElevation = 20.0f;  // degrees above the image plane
+    float postRakingStrength = 0.8f;    // 0..1 blend between unlit and lit
+    float postRakingDepthScale = 4.0f;  // heightfield amplification
 
     bool operator==(const CompositeRenderSettings&) const = default;
 };

@@ -648,6 +648,11 @@
            <string>Beer-Lambert</string>
           </property>
          </item>
+         <item>
+          <property name="text">
+           <string>Volumetric</string>
+          </property>
+         </item>
         </widget>
        </item>
       </layout>
@@ -1030,7 +1035,7 @@
          </property>
         </widget>
        </item>
-       <item row="12" column="0" colspan="4">
+       <item row="12" column="0" colspan="2">
         <widget class="QCheckBox" name="chkUseVolumeGradients">
          <property name="text">
           <string>Use Volume Gradients</string>
@@ -1038,6 +1043,83 @@
          <property name="toolTip">
           <string>Compute lighting normals from volume data instead of mesh geometry. Reveals texture details but is slower to compute.</string>
          </property>
+        </widget>
+       </item>
+       <item row="12" column="2">
+        <widget class="QLabel" name="lblShadowSteps">
+         <property name="text"><string>Shadow steps</string></property>
+         <property name="toolTip"><string>Shadow-ray length (voxels) for the Volumetric compositing method.</string></property>
+        </widget>
+       </item>
+       <item row="12" column="3">
+        <widget class="QSpinBox" name="spinShadowSteps">
+         <property name="minimum"><number>1</number></property>
+         <property name="maximum"><number>64</number></property>
+         <property name="value"><number>8</number></property>
+        </widget>
+       </item>
+       <item row="13" column="0" colspan="4">
+        <widget class="QCheckBox" name="chkRakingEnabled">
+         <property name="text">
+          <string>Raking light (2D)</string>
+         </property>
+         <property name="toolTip">
+          <string>Treat the composite image as a heightfield and shade from a low-angle light. Reveals papyrus surface texture (crackle, fiber, ink relief) independent of brightness contrast.</string>
+         </property>
+        </widget>
+       </item>
+       <item row="14" column="0">
+        <widget class="QLabel" name="lblRakingAzimuth">
+         <property name="text"><string>Rake azim.</string></property>
+        </widget>
+       </item>
+       <item row="14" column="1">
+        <widget class="QDoubleSpinBox" name="spinRakingAzimuth">
+         <property name="minimum"><double>0.0</double></property>
+         <property name="maximum"><double>360.0</double></property>
+         <property name="singleStep"><double>5.0</double></property>
+         <property name="value"><double>30.0</double></property>
+         <property name="suffix"><string>°</string></property>
+        </widget>
+       </item>
+       <item row="14" column="2">
+        <widget class="QLabel" name="lblRakingElevation">
+         <property name="text"><string>Rake elev.</string></property>
+        </widget>
+       </item>
+       <item row="14" column="3">
+        <widget class="QDoubleSpinBox" name="spinRakingElevation">
+         <property name="minimum"><double>0.0</double></property>
+         <property name="maximum"><double>90.0</double></property>
+         <property name="singleStep"><double>5.0</double></property>
+         <property name="value"><double>20.0</double></property>
+         <property name="suffix"><string>°</string></property>
+        </widget>
+       </item>
+       <item row="15" column="0">
+        <widget class="QLabel" name="lblRakingStrength">
+         <property name="text"><string>Rake strength</string></property>
+        </widget>
+       </item>
+       <item row="15" column="1">
+        <widget class="QDoubleSpinBox" name="spinRakingStrength">
+         <property name="minimum"><double>0.0</double></property>
+         <property name="maximum"><double>1.0</double></property>
+         <property name="singleStep"><double>0.05</double></property>
+         <property name="value"><double>0.8</double></property>
+        </widget>
+       </item>
+       <item row="15" column="2">
+        <widget class="QLabel" name="lblRakingDepth">
+         <property name="text"><string>Rake depth</string></property>
+        </widget>
+       </item>
+       <item row="15" column="3">
+        <widget class="QDoubleSpinBox" name="spinRakingDepthScale">
+         <property name="minimum"><double>0.1</double></property>
+         <property name="maximum"><double>64.0</double></property>
+         <property name="singleStep"><double>0.5</double></property>
+         <property name="value"><double>4.0</double></property>
         </widget>
        </item>
       </layout>

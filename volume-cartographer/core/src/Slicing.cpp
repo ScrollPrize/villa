@@ -726,11 +726,12 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
 // adaptive path, no per-layer overhead).
 // ----------------------------------------------------------------------------
 
-enum class AccumMode2 : std::uint8_t { Max, Min, Mean, LayerStorage };
+enum class AccumMode2 : std::uint8_t { Max, Min, Mean, LayerStorage, Volumetric };
 
 static AccumMode2 accumModeFor(const std::string& m) {
     if (m == "max") return AccumMode2::Max;
     if (m == "min") return AccumMode2::Min;
+    if (m == "volumetric") return AccumMode2::Volumetric;
     if (m == "median" || m == "alpha" || m == "minabs") return AccumMode2::LayerStorage;
     return AccumMode2::Mean;
 }
@@ -746,7 +747,8 @@ void sampleCompositeAdaptiveImpl(
     int numLayers, int zStart, float zStep,
     int w, int h,
     const std::string& compositeMethod,
-    const uint32_t lut[256])
+    const uint32_t lut[256],
+    const CompositeParams* lightParams)
 {
     auto levelScale = [](int lvl) { return (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f; };
     const float zLo = float(zStart) * zStep;
@@ -862,6 +864,84 @@ void sampleCompositeAdaptiveImpl(
                 cv::Vec3f nrm = nrow ? nrow[x] : (planeNormal ? *planeNormal : cv::Vec3f(0,0,0));
                 if (nrow && !isfinite_bitwise(nrm[0])) { outRow[x] = lut[0]; continue; }
 
+                if constexpr (AMode == AccumMode2::Volumetric) {
+                    // Volumetric Beer-Lambert with secondary shadow rays.
+                    // Walks the view ray front-to-back through the slab;
+                    // at each view-ray sample, integrates density along a
+                    // shadow ray toward the light to attenuate the voxel's
+                    // emission. Materials with high density in front of the
+                    // light end up darker (self-shadowing), which reveals
+                    // micro-structure — fibers, ink, crackle — as relief.
+                    const CompositeParams* p = lightParams;
+                    const float extinction = p ? p->blExtinction : 1.5f;
+                    const float emissionScale = p ? p->blEmission : 1.5f;
+                    const float ambient = p ? p->blAmbient : 0.1f;
+                    const float diffuse = p ? p->lightDiffuse : 1.0f;
+                    const int shadowSteps = p ? std::max(1, p->shadowSteps) : 8;
+                    const float lDx = p ? p->lightDirX : 0.5f;
+                    const float lDy = p ? p->lightDirY : 0.5f;
+                    const float lDz = p ? p->lightDirZ : 0.707f;
+
+                    const float extN = extinction / 255.0f;
+                    const float emiN = emissionScale / 255.0f;
+
+                    const float vdx = nrm[0] * zStep;
+                    const float vdy = nrm[1] * zStep;
+                    const float vdz = nrm[2] * zStep;
+                    float wxV = base[0] + nrm[0] * float(zStart) * zStep;
+                    float wyV = base[1] + nrm[1] * float(zStart) * zStep;
+                    float wzV = base[2] + nrm[2] * float(zStart) * zStep;
+
+                    // All sampling happens at the desired (finest) level.
+                    // Sampler coords are world * scl0; one sampler-voxel
+                    // step along the light direction is just adding lDir
+                    // since it's a unit vector.
+                    const float scl0 = scales[0];
+                    float transmittance = 1.0f;
+                    float accumC = 0.0f;
+                    for (int li = 0; li < numLayers; li++) {
+                        const float svx = wxV * scl0;
+                        const float svy = wyV * scl0;
+                        const float svz = wzV * scl0;
+                        uint8_t v = 0;
+                        bool got = trySampleNearestUnchecked(*samplers[0],
+                            svz, svy, svx, v);
+                        if (!got) {
+                            for (int i = 0; i < nSamplers; i++) {
+                                float scl = scales[i];
+                                if (trySampleNB<SMode>(sampler(i),
+                                    wzV * scl, wyV * scl, wxV * scl, v)) break;
+                            }
+                        }
+                        if (v > 0) {
+                            // Shadow ray: desired-level samples only. Missing
+                            // chunks read as zero density (no shadow) — good
+                            // enough while coarse levels stream in.
+                            float shadowAccum = 0.0f;
+                            float shx = svx, shy = svy, shz = svz;
+                            for (int k = 1; k <= shadowSteps; k++) {
+                                shx += lDx; shy += lDy; shz += lDz;
+                                uint8_t sv = 0;
+                                trySampleNB<SMode>(*samplers[0],
+                                    shz, shy, shx, sv);
+                                shadowAccum += float(sv);
+                            }
+                            const float L = diffuse * std::exp(-extN * shadowAccum);
+                            const float emission = float(v) * emiN * (L + ambient);
+                            const float layerT = std::exp(-extN * float(v));
+                            accumC += emission * transmittance * (1.0f - layerT);
+                            transmittance *= layerT;
+                            if (transmittance < 0.001f) break;
+                        }
+                        wxV += vdx; wyV += vdy; wzV += vdz;
+                    }
+                    accumC += ambient * transmittance;
+                    float vF = std::min(255.0f, accumC * 255.0f);
+                    if (vF < 0.f) vF = 0.f;
+                    outRow[x] = lut[uint8_t(vF)];
+                    continue;
+                }
+
                 float accum=0.f, mx=0.f, mn=255.f;
                 int count=0;
                 // Incremental per-layer offset along the normal direction:
@@ -953,6 +1033,40 @@ void sampleCompositeAdaptiveImpl(
                         val = s * invN;
                     }
                 }
+                if (lightParams && lightParams->lightingEnabled) {
+                    cv::Vec3f lnrm;
+                    if (lightParams->lightNormalSource == 1) {
+                        // Volume-gradient normal: six cheap samples around
+                        // base in the desired-level sampler's space. Reveals
+                        // local density variation (fibers, ink, crackle)
+                        // that a smoothed mesh normal can't.
+                        const float bx = base[0] * endScale;
+                        const float by = base[1] * endScale;
+                        const float bz = base[2] * endScale;
+                        uint8_t gx0=0, gx1=0, gy0=0, gy1=0, gz0=0, gz1=0;
+                        const bool gok =
+                            trySampleNB<SMode>(*samplers[0], bz, by, bx - 1.f, gx0)
+                         && trySampleNB<SMode>(*samplers[0], bz, by, bx + 1.f, gx1)
+                         && trySampleNB<SMode>(*samplers[0], bz, by - 1.f, bx, gy0)
+                         && trySampleNB<SMode>(*samplers[0], bz, by + 1.f, bx, gy1)
+                         && trySampleNB<SMode>(*samplers[0], bz - 1.f, by, bx, gz0)
+                         && trySampleNB<SMode>(*samplers[0], bz + 1.f, by, bx, gz1);
+                        if (gok) {
+                            // Gradient from dense → sparse: serves as an
+                            // outward-facing surface normal for Lambertian
+                            // shading.
+                            lnrm = cv::Vec3f(
+                                float(gx0) - float(gx1),
+                                float(gy0) - float(gy1),
+                                float(gz0) - float(gz1));
+                        } else {
+                            lnrm = nrm;
+                        }
+                    } else {
+                        lnrm = nrm;
+                    }
+                    val *= computeLightingFactor(lnrm, *lightParams);
+                }
                 if (val < 0.f) val = 0.f; if (val > 255.f) val = 255.f;
                 outRow[x] = lut[uint8_t(val)];
             }
@@ -973,29 +1087,35 @@ void dispatchCompositeAdaptive(
     int numLayers, int zStart, float zStep,
     int w, int h,
     const std::string& method,
-    const uint32_t lut[256])
+    const uint32_t lut[256],
+    const CompositeParams* lightParams)
 {
     switch (accumModeFor(method)) {
         case AccumMode2::Max:
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::Max>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams); break;
         case AccumMode2::Min:
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::Min>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams); break;
         case AccumMode2::LayerStorage:
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::LayerStorage>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams); break;
+        case AccumMode2::Volumetric:
+            sampleCompositeAdaptiveImpl<SMode, AccumMode2::Volumetric>(
+                outBuf, outStride, cache, desiredLevel, numLevels,
+                coords, origin, vx_step, vy_step, normals, planeNormal,
+                numLayers, zStart, zStep, w, h, method, lut, lightParams); break;
         default:
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::Mean>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams); break;
     }
 }
 
@@ -1013,7 +1133,8 @@ void sampleAdaptiveARGB32(
     int width, int height,
     const std::string& compositeMethod,
     const uint32_t lut[256],
-    vc::Sampling method)
+    vc::Sampling method,
+    const CompositeParams* lightParams)
 {
     if (numLayers <= 0) numLayers = 1;
     // Composite rendering forces Nearest: averaging N layers already
@@ -1025,12 +1146,12 @@ void sampleAdaptiveARGB32(
         dispatchCompositeAdaptive<SampleMode::Nearest>(
             outBuf, outStride, *cache, desiredLevel, numLevels,
             coords, origin, vx_step, vy_step, normals, planeNormal,
-            numLayers, zStart, zStep, width, height, compositeMethod, lut);
+            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams);
     } else {
         dispatchCompositeAdaptive<SampleMode::Trilinear>(
             outBuf, outStride, *cache, desiredLevel, numLevels,
             coords, origin, vx_step, vy_step, normals, planeNormal,
-            numLayers, zStart, zStep, width, height, compositeMethod, lut);
+            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams);
     }
 }
 

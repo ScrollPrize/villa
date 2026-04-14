@@ -126,7 +126,11 @@ void sampleAdaptiveARGB32(
     int width, int height,
     const std::string& compositeMethod,
     const uint32_t lut[256],
-    vc::Sampling method = vc::Sampling::Nearest);
+    vc::Sampling method = vc::Sampling::Nearest,
+    // Optional lighting: when lightParams->lightingEnabled is true the
+    // composite output is modulated by a Lambertian diffuse factor.
+    // Normal source (mesh vs. volume gradient) is selected via the params.
+    const CompositeParams* lightParams = nullptr);
 
 // Fused plane composite: inline coords + nearest-neighbor per layer + composite + LUT → ARGB32.
 // No coord matrix allocation. For PlaneSurface composite rendering.
