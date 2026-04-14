@@ -705,11 +705,10 @@ def _draw_normal_arrows(ax, surface_geometry, chain_info_list,
             pts = pts[pick]
             nrm = nrm[pick]
 
+        # Length reflects in-plane projection of the (unit 3D) normal,
+        # so arrows shrink as the normal tilts out of the slice plane.
         u = nrm[:, hcol]
         v = nrm[:, vcol]
-        mag = np.sqrt(u * u + v * v) + 1e-8
-        u = u / mag
-        v = v / mag
 
         color = _brighten(_surface_color(sample_seed, si))
         ax.quiver(
@@ -782,11 +781,9 @@ def _draw_grid_fused_arrows(ax, nx_vol, ny_vol, nz_vol, valid_3d,
     if not np.any(keep):
         return
     rr, cc = rr[keep], cc[keep]
+    # Keep in-plane projection length so arrows shrink with out-of-plane tilt.
     h = h_field[rr, cc]
     v = v_field[rr, cc]
-    mag = np.sqrt(h * h + v * v) + 1e-8
-    h = h / mag
-    v = v / mag
     ax.quiver(
         cc, rr, h * _ARROW_LEN_PX, v * _ARROW_LEN_PX,
         angles="xy", scale_units="xy", scale=1.0,
@@ -869,11 +866,9 @@ def _draw_surface_fused_arrows(ax, nx_vol, ny_vol, nz_vol, surface_geometry,
         xi = np.clip(pts_p[:, 2].astype(np.int64), 0, Xd - 1)
         h_field = fields[h_idx]
         v_field = fields[v_idx]
+        # Keep in-plane projection length so arrows shrink with out-of-plane tilt.
         h = h_field[zi, yi, xi]
         v = v_field[zi, yi, xi]
-        mag = np.sqrt(h * h + v * v) + 1e-8
-        h = h / mag
-        v = v / mag
         color = _brighten(_surface_color(sample_seed, si))
         ax.quiver(
             h_pos, v_pos, h * _ARROW_LEN_PX, v * _ARROW_LEN_PX,

@@ -393,6 +393,7 @@ def build_model(
     upsample_mode: Optional[str] = None,
     batch_size: int = 2,
     strict: bool = False,
+    model_patch_size: Optional[int] = None,
 ) -> Tuple[nn.Module, str, str]:
     ckpt = None
     if weights is not None:
@@ -426,7 +427,17 @@ def build_model(
     model_config["upsample_mode"] = upsample_mode
     mgr.model_config = model_config
     mgr.targets = {"output": {"out_channels": 8, "activation": "none"}}
-    mgr.train_patch_size = (patch_size, patch_size, patch_size)
+    # Model-architecture patch size: defaults to training patch size,
+    # but can be overridden (e.g. to match a checkpoint trained at a
+    # different size while training at a new patch size).
+    arch_patch = int(model_patch_size) if model_patch_size else int(patch_size)
+    mgr.train_patch_size = (arch_patch, arch_patch, arch_patch)
+    if arch_patch != int(patch_size):
+        print(
+            f"{TAG} model_patch_size={arch_patch} overrides "
+            f"training patch_size={patch_size} for architecture autoconfigure",
+            flush=True,
+        )
     mgr.train_batch_size = batch_size
     mgr.in_channels = 1
     mgr.autoconfigure = True
@@ -503,8 +514,9 @@ def train(
     run_name: str = "tifxyz",
     epochs: int = 100,
     batch_size: int = 2,
-    lr: float = 1e-4,
+    lr: float = 1e-2,
     patch_size: int = 128,
+    model_patch_size: Optional[int] = None,
     w_cos: float = 1.0,
     w_mag: float = 1.0,
     w_dir: float = 1.0,
@@ -512,8 +524,9 @@ def train(
     val_fraction: float = 0.15,
     device: str = "cuda",
     weights: Optional[str] = None,
-    norm_type: str = "instance",
+    norm_type: str = "none",
     upsample_mode: str = "trilinear",
+    output_sigmoid: bool = False,
     precision: str = "bf16",
     verbose: bool = False,
 ) -> None:
@@ -544,6 +557,7 @@ def train(
         "num_workers": num_workers, "val_fraction": val_fraction,
         "device": device, "weights": weights,
         "norm_type": norm_type, "upsample_mode": upsample_mode,
+        "output_sigmoid": output_sigmoid,
         "precision": precision,
         "same_surface_threshold": same_surface_threshold,
         "cmd": " ".join(sys.argv),
@@ -578,6 +592,7 @@ def train(
     model, norm_type, upsample_mode = build_model(
         patch_size, device, weights, norm_type=norm_type,
         upsample_mode=upsample_mode, batch_size=batch_size,
+        model_patch_size=model_patch_size,
     )
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
@@ -625,17 +640,61 @@ def train(
     vis_out_dir.mkdir(exist_ok=True)
     vis_interval_steps = max(1, 1000 // max(batch_size, 1))
 
+    def _log_full_vis(batch_for_vis, tag: str, step: int) -> None:
+        try:
+            sample0 = _sample_from_batch(batch_for_vis)
+            patch_info0 = sample0["patch_info"]
+            ds_name = str(patch_info0.get("dataset_name",
+                                          patch_info0.get("dataset", tag)))
+            idx0 = int(patch_info0.get("patch_idx", step))
+            title = (f"step={step}  "
+                     + default_vis_title(ds_name, idx0, sample0))
+            out_path = vis_out_dir / f"{tag}_step_{step:07d}.jpg"
+            render_batch_figure(
+                batch_for_vis, out_path, title,
+                arrow_seed=step,
+                inference_ctx=vis_ctx,
+            )
+            img_rgb = np.asarray(Image.open(out_path).convert("RGB"))
+            writer.add_image(
+                f"{tag}/full_vis", img_rgb, step, dataformats="HWC",
+            )
+        except Exception as e:
+            print(f"{TAG} full_vis ({tag}) render failed at step "
+                  f"{step}: {e}", flush=True)
+
+    # Initial eval before training so we see init/load performance.
+    print(f"{TAG} running pre-training eval at step 0...", flush=True)
+    init_val_loss = _evaluate(
+        model, val_loader, scale_loss_mse, scale_loss_l1,
+        device, writer, global_step,
+        w_cos, w_mag, w_dir,
+        amp_dtype=amp_dtype, use_autocast=use_autocast,
+        verbose=verbose,
+        same_surface_threshold=same_surface_threshold,
+        output_sigmoid=output_sigmoid,
+    )
+    for _probe_batch in val_loader:
+        _log_full_vis(_probe_batch, "val", 0)
+        break
+    print(f"{TAG} init val={init_val_loss:.4f}", flush=True)
+
     for epoch in range(epochs):
         model.train()
         epoch_losses: List[float] = []
 
-        train_iter = train_loader
-        if verbose:
-            train_iter = tqdm(
-                train_loader,
-                desc=f"epoch {epoch + 1}/{epochs} train",
-                dynamic_ncols=True,
-            )
+        train_iter = tqdm(
+            train_loader,
+            desc=f"epoch {epoch + 1}/{epochs} train",
+            dynamic_ncols=True,
+            mininterval=0.0, miniters=1,
+        )
+
+        n_seen = 0
+        n_skipped = 0
+        n_hi_mag = 0
+        n_surfaces_pre = 0
+        n_surfaces_post = 0
 
         for batch in train_iter:
             image = batch["image"].to(device, non_blocking=True)
@@ -649,8 +708,18 @@ def train(
                 same_surface_threshold=same_surface_threshold,
             )
 
+            n_seen += 1
+            for mg in _merge_groups:
+                n_surfaces_pre += len(mg)
+                n_surfaces_post += len(set(int(x) for x in mg))
+
             if validity.sum() == 0:
-                print(f"{TAG} WARNING: zero-validity batch, skipping", flush=True)
+                n_skipped += 1
+                train_iter.set_postfix(
+                    loss="---",
+                    skip=f"{100.0 * n_skipped / max(n_seen, 1):.1f}%",
+                    merge=f"{100.0 * (1.0 - n_surfaces_post / max(n_surfaces_pre, 1)):.1f}%",
+                )
                 continue
 
             # Spatial augmentation on image + targets
@@ -663,7 +732,8 @@ def train(
             # Forward pass
             with torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_autocast):
                 results = model(image)
-                pred = torch.sigmoid(results["output"])  # (B, 8, Z, Y, X)
+                raw_pred = results["output"]
+                pred = torch.sigmoid(raw_pred) if output_sigmoid else raw_pred  # (B, 8, Z, Y, X)
 
                 # Combined validity: cos/grad_mag need surface validity, directions need normals validity
                 cos_mask = validity
@@ -691,9 +761,13 @@ def train(
             if not math.isfinite(loss.item()):
                 print(f"{TAG} NaN/Inf at step {global_step}: loss={loss.item()}", flush=True)
 
-            if verbose:
-                running = sum(epoch_losses[-20:]) / min(len(epoch_losses), 20)
-                train_iter.set_postfix(loss=f"{loss.item():.4f}", avg20=f"{running:.4f}")
+            running = sum(epoch_losses[-20:]) / min(len(epoch_losses), 20)
+            train_iter.set_postfix(
+                loss=f"{loss.item():.4f}",
+                avg20=f"{running:.4f}",
+                skip=f"{100.0 * n_skipped / max(n_seen, 1):.1f}%",
+                merge=f"{100.0 * (1.0 - n_surfaces_post / max(n_surfaces_pre, 1)):.1f}%",
+            )
 
             if global_step % 10 == 0:
                 writer.add_scalar("train/loss", loss.item(), global_step)
@@ -706,28 +780,7 @@ def train(
                 _log_vis(writer, "train", image, pred, targets, cos_mask, global_step)
 
             if global_step % vis_interval_steps == 0:
-                try:
-                    sample0 = _sample_from_batch(batch)
-                    patch_info0 = sample0["patch_info"]
-                    ds_name = str(patch_info0.get("dataset_name",
-                                                  patch_info0.get("dataset", "train")))
-                    idx0 = int(patch_info0.get("patch_idx", global_step))
-                    title = (f"step={global_step}  "
-                             + default_vis_title(ds_name, idx0, sample0))
-                    out_path = vis_out_dir / f"step_{global_step:07d}.jpg"
-                    render_batch_figure(
-                        batch, out_path, title,
-                        arrow_seed=global_step,
-                        inference_ctx=vis_ctx,
-                    )
-                    img_rgb = np.asarray(Image.open(out_path).convert("RGB"))
-                    writer.add_image(
-                        "train/full_vis", img_rgb,
-                        global_step, dataformats="HWC",
-                    )
-                except Exception as e:
-                    print(f"{TAG} full_vis render failed at step "
-                          f"{global_step}: {e}", flush=True)
+                _log_full_vis(batch, "train", global_step)
 
             global_step += 1
 
@@ -741,6 +794,7 @@ def train(
             amp_dtype=amp_dtype, use_autocast=use_autocast,
             verbose=verbose,
             same_surface_threshold=same_surface_threshold,
+            output_sigmoid=output_sigmoid,
         )
 
         mean_train = sum(epoch_losses) / max(len(epoch_losses), 1)
@@ -756,6 +810,7 @@ def train(
             "state_dict": model.state_dict(),
             "norm_type": norm_type,
             "upsample_mode": upsample_mode,
+            "output_sigmoid": output_sigmoid,
             "precision": precision,
             "patch_size": patch_size,
             "in_channels": 1,
@@ -778,6 +833,7 @@ def _evaluate(
     amp_dtype=torch.bfloat16, use_autocast=True,
     verbose: bool = False,
     same_surface_threshold: float | None = None,
+    output_sigmoid: bool = False,
 ):
     model.eval()
     losses = []
@@ -802,7 +858,8 @@ def _evaluate(
                 continue
 
             results = model(image)
-            pred = torch.sigmoid(results["output"])
+            raw_pred = results["output"]
+            pred = torch.sigmoid(raw_pred) if output_sigmoid else raw_pred
 
             cos_mask = validity
             dir_mask = (normals_valid > 0.5).float()
@@ -839,8 +896,14 @@ def main() -> None:
     parser.add_argument("--run-name", type=str, default="tifxyz")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=2)
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--patch-size", type=int, default=128)
+    parser.add_argument("--model-patch-size", type=int, default=None,
+                        help="Patch size used only for model architecture "
+                             "autoconfigure (stage count). Defaults to "
+                             "--patch-size. Set this to the checkpoint's "
+                             "patch size when continuing training at a "
+                             "different training patch size.")
     parser.add_argument("--w-cos", type=float, default=1.0)
     parser.add_argument("--w-mag", type=float, default=1.0)
     parser.add_argument("--w-dir", type=float, default=1.0)
@@ -849,10 +912,13 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--weights", type=str, default=None,
                         help="Checkpoint to resume from.")
-    parser.add_argument("--norm-type", type=str, default="instance",
+    parser.add_argument("--norm-type", type=str, default="none",
                         choices=["instance", "group", "none"])
     parser.add_argument("--upsample-mode", type=str, default="trilinear",
                         choices=["transpconv", "trilinear", "pixelshuffle"])
+    parser.add_argument("--output-sigmoid", action="store_true", default=False,
+                        help="Apply torch.sigmoid to model output. Off by "
+                             "default, matching train_unet_3d.")
     parser.add_argument("--precision", type=str, default="bf16",
                         choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--verbose", "-v", action="store_true",
@@ -868,6 +934,7 @@ def main() -> None:
         batch_size=args.batch_size,
         lr=args.lr,
         patch_size=args.patch_size,
+        model_patch_size=args.model_patch_size,
         w_cos=args.w_cos,
         w_mag=args.w_mag,
         w_dir=args.w_dir,
@@ -877,6 +944,7 @@ def main() -> None:
         weights=args.weights,
         norm_type=args.norm_type,
         upsample_mode=args.upsample_mode,
+        output_sigmoid=args.output_sigmoid,
         precision=args.precision,
         verbose=args.verbose,
     )
