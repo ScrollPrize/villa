@@ -77,6 +77,40 @@ void createInputVolume(const fs::path& root)
     ds->writeRegion({0, 0, 0}, {64, 64, 64}, volume.data());
 }
 
+void createChunkedNormalsInput(const fs::path& root)
+{
+    const std::vector<size_t> shape = {80, 80, 80};
+    const std::vector<size_t> chunks = {64, 64, 64};
+    auto dsx = vc::createZarrDataset(root / "x", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/", 128);
+    auto dsy = vc::createZarrDataset(root / "y", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/", 128);
+    auto dsz = vc::createZarrDataset(root / "z", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/", 128);
+
+    std::vector<uint8_t> x(shape[0] * shape[1] * shape[2], 128);
+    std::vector<uint8_t> y(shape[0] * shape[1] * shape[2], 128);
+    std::vector<uint8_t> z(shape[0] * shape[1] * shape[2], 128);
+    auto idx = [&](int zz, int yy, int xx) {
+        return static_cast<size_t>((zz * static_cast<int>(shape[1]) + yy) * static_cast<int>(shape[2]) + xx);
+    };
+
+    for (int zz = 7; zz < 9; ++zz) {
+        for (int yy = 8; yy < 10; ++yy) {
+            for (int xx = 9; xx < 11; ++xx) {
+                x[idx(zz, yy, xx)] = 255;
+                y[idx(zz, yy, xx)] = 128;
+                z[idx(zz, yy, xx)] = 128;
+            }
+        }
+    }
+
+    dsx->writeRegion({0, 0, 0}, shape, x.data());
+    dsy->writeRegion({0, 0, 0}, shape, y.data());
+    dsz->writeRegion({0, 0, 0}, shape, z.data());
+    vc::writeZarrAttributes(root, {
+        {"grid_origin_xyz", {0, 0, 0}},
+        {"sample_step", 1},
+    });
+}
+
 std::string quote(const fs::path& path)
 {
     return "\"" + path.string() + "\"";
@@ -111,6 +145,14 @@ size_t countValidNormals(const fs::path& zarrRoot)
         }
     }
     return valid;
+}
+
+uint8_t readVoxel(const fs::path& path, size_t z, size_t y, size_t x)
+{
+    vc::VcDataset ds(path);
+    uint8_t value = 0;
+    ds.readRegion({z, y, x}, {1, 1, 1}, &value);
+    return value;
 }
 
 } // namespace
@@ -168,4 +210,27 @@ TEST(NGridsSmoke, FitAndAlignNormalsAreDeterministicSingleThreaded)
     EXPECT_TRUE(fs::is_directory(align1Root / "x" / "0"));
     EXPECT_GT(countValidNormals(align1Root), 0u);
     expectDatasetsEqual(align1Root, align2Root, {"x", "y", "z"});
+}
+
+TEST(NGridsSmoke, AlignCropPreservesFillOutsidePartialChunks)
+{
+    ScopedTempDir tempDir;
+    const auto inputRoot = tempDir.path() / "normals_input.zarr";
+    const auto outputRoot = tempDir.path() / "aligned_output.zarr";
+
+    createChunkedNormalsInput(inputRoot);
+
+    std::string align_cmd = std::string("OMP_NUM_THREADS=1 ")
+        + VC_NGRIDS_BIN
+        + " -i " + quote(inputRoot)
+        + " --align-normals"
+        + " --crop 9 8 7 11 10 9"
+        + " --output-zarr " + quote(outputRoot);
+    ASSERT_EQ(std::system(align_cmd.c_str()), 0);
+
+    EXPECT_EQ(readVoxel(outputRoot / "x" / "0", 0, 0, 0), static_cast<uint8_t>(128));
+    EXPECT_EQ(readVoxel(outputRoot / "y" / "0", 0, 0, 0), static_cast<uint8_t>(128));
+    EXPECT_EQ(readVoxel(outputRoot / "z" / "0", 0, 0, 0), static_cast<uint8_t>(128));
+
+    EXPECT_NE(readVoxel(outputRoot / "x" / "0", 7, 8, 9), static_cast<uint8_t>(128));
 }
