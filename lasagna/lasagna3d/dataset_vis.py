@@ -952,6 +952,10 @@ def _render_sample_figure(
         cos_gt_slices = _plane_slices(cos_gt, cz, cy, cx)
         gm_gt_slices = _plane_slices(grad_mag_gt, cz, cy, cx)
         valid_slices_full = _plane_slices(validity, cz, cy, cx)
+        # Normals have their own (sparser) mask — normals_valid from the
+        # splatting step, same mask the training dir loss uses.
+        normals_valid_full = training_output["normals_valid"]  # (Z, Y, X)
+        nv_slices_full = _plane_slices(normals_valid_full, cz, cy, cx)
         # Shared vmax for grad_mag computed once on GT, reused for pred.
         gm_vmax = _auto_vmax(grad_mag_gt, validity > 0.5, percentile=99.0)
 
@@ -985,8 +989,8 @@ def _render_sample_figure(
             ddir_full_slices = _plane_slices(diff_dir_full, cz, cy, cx)
             ddir_ss_slices = _plane_slices(diff_dir_ss, cz, cy, cx)
             dir_diff_vmax = max(
-                _auto_vmax(diff_dir_full, validity > 0.5, 99.0),
-                _auto_vmax(diff_dir_ss, validity > 0.5, 99.0),
+                _auto_vmax(diff_dir_full, normals_valid_full > 0.5, 99.0),
+                _auto_vmax(diff_dir_ss, normals_valid_full > 0.5, 99.0),
             )
             # Pred direction channels padded/cropped to vis size (Z=Y=X)
             # for both decoded-axis and fused arrow rows.
@@ -1113,7 +1117,7 @@ def _render_sample_figure(
                     for col in range(3):
                         ax = axes[gi * 3 + col]
                         _draw_diff_panel(
-                            ax, slices[col], valid_slices_full[col],
+                            ax, slices[col], nv_slices_full[col],
                             dir_diff_vmax,
                         )
                         ax.set_title(
