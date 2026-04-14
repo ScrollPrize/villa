@@ -51,6 +51,7 @@ if _LASAGNA_DIR not in sys.path:
 import matplotlib  # noqa: E402
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
+import matplotlib.colors as mcolors  # noqa: E402
 from skimage import measure  # noqa: E402
 
 
@@ -82,6 +83,25 @@ _NUM_SCALES = 3
 _ARROW_LEN_PX = 18.0
 _MAX_ARROWS_PER_PLANE = 25
 _GRID_NORMAL_STRIDE = 12
+_SURFACE_ARROW_STRIDE = 4  # in-plane pixel grid for on-surface arrow rows
+
+
+def _grid_bucket_indices(h_pos: np.ndarray, v_pos: np.ndarray,
+                         stride: int) -> np.ndarray:
+    """Keep at most one index per stride x stride in-plane cell."""
+    if h_pos.size == 0:
+        return np.empty(0, dtype=np.int64)
+    hb = np.floor(h_pos / stride).astype(np.int64)
+    vb = np.floor(v_pos / stride).astype(np.int64)
+    v_span = int(vb.max() - vb.min() + 2)
+    key = hb * v_span + vb
+    _, first = np.unique(key, return_index=True)
+    return np.sort(first)
+
+
+def _brighten(color: str, factor: float = 1.25) -> tuple[float, float, float]:
+    r, g, b = mcolors.to_rgb(color)
+    return (min(1.0, r * factor), min(1.0, g * factor), min(1.0, b * factor))
 
 # Plane → (channel pair indices) for direction_channels (6, Z, Y, X).
 # Encoding from tifxyz_lasagna_dataset.compute_direction_values:
@@ -713,26 +733,26 @@ def _draw_surface_axis_arrows(ax, dir_channels, surface_geometry,
         if not np.any(m):
             continue
         pts_p = pts[m]
-        if pts_p.shape[0] > _MAX_ARROWS_PER_PLANE:
-            pick = np.random.default_rng(sample_seed + si).choice(
-                pts_p.shape[0], size=_MAX_ARROWS_PER_PLANE, replace=False,
-            )
-            pts_p = pts_p[pick]
+        cols = pts_p[:, [0, 1, 2]]
+        h_pos = cols[:, h_idx]
+        v_pos = cols[:, v_idx]
+        keep = _grid_bucket_indices(h_pos, v_pos, _SURFACE_ARROW_STRIDE)
+        if keep.size == 0:
+            continue
+        pts_p = pts_p[keep]
+        h_pos = h_pos[keep]
+        v_pos = v_pos[keep]
         zi = np.clip(pts_p[:, 0].astype(np.int64), 0, Zd - 1)
         yi = np.clip(pts_p[:, 1].astype(np.int64), 0, Yd - 1)
         xi = np.clip(pts_p[:, 2].astype(np.int64), 0, Xd - 1)
         d0v = dir_channels[c0_idx, zi, yi, xi]
         d1v = dir_channels[c1_idx, zi, yi, xi]
         h, v = _decode_dir_pair(d0v, d1v)
-        # Pull point columns matching the plane axes
-        cols = pts_p[:, [0, 1, 2]]  # ZYX
-        h_pos = cols[:, h_idx]
-        v_pos = cols[:, v_idx]
-        color = _surface_color(sample_seed, si)
+        color = _brighten(_surface_color(sample_seed, si))
         ax.quiver(
             h_pos, v_pos, h * _ARROW_LEN_PX, v * _ARROW_LEN_PX,
             angles="xy", scale_units="xy", scale=1.0,
-            color=color, width=0.004, headwidth=3.0, headlength=4.0, alpha=0.9,
+            color=color, width=0.006, headwidth=3.5, headlength=4.5, alpha=1.0,
         )
 
 
@@ -754,11 +774,15 @@ def _draw_surface_fused_arrows(ax, nx_vol, ny_vol, nz_vol, surface_geometry,
         if not np.any(m):
             continue
         pts_p = pts[m]
-        if pts_p.shape[0] > _MAX_ARROWS_PER_PLANE:
-            pick = np.random.default_rng(sample_seed + si + 9001).choice(
-                pts_p.shape[0], size=_MAX_ARROWS_PER_PLANE, replace=False,
-            )
-            pts_p = pts_p[pick]
+        cols = pts_p[:, [0, 1, 2]]
+        h_pos = cols[:, h_idx]
+        v_pos = cols[:, v_idx]
+        keep = _grid_bucket_indices(h_pos, v_pos, _SURFACE_ARROW_STRIDE)
+        if keep.size == 0:
+            continue
+        pts_p = pts_p[keep]
+        h_pos = h_pos[keep]
+        v_pos = v_pos[keep]
         zi = np.clip(pts_p[:, 0].astype(np.int64), 0, Zd - 1)
         yi = np.clip(pts_p[:, 1].astype(np.int64), 0, Yd - 1)
         xi = np.clip(pts_p[:, 2].astype(np.int64), 0, Xd - 1)
@@ -769,14 +793,11 @@ def _draw_surface_fused_arrows(ax, nx_vol, ny_vol, nz_vol, surface_geometry,
         mag = np.sqrt(h * h + v * v) + 1e-8
         h = h / mag
         v = v / mag
-        cols = pts_p[:, [0, 1, 2]]
-        h_pos = cols[:, h_idx]
-        v_pos = cols[:, v_idx]
-        color = _surface_color(sample_seed, si)
+        color = _brighten(_surface_color(sample_seed, si))
         ax.quiver(
             h_pos, v_pos, h * _ARROW_LEN_PX, v * _ARROW_LEN_PX,
             angles="xy", scale_units="xy", scale=1.0,
-            color=color, width=0.004, headwidth=3.0, headlength=4.0, alpha=0.9,
+            color=color, width=0.006, headwidth=3.5, headlength=4.5, alpha=1.0,
         )
 
 
@@ -1168,7 +1189,8 @@ def _render_sample_figure(
                 for col in range(3):
                     ax = axes[col]
                     ax.imshow(image_disp[col], cmap="gray",
-                              interpolation="nearest")
+                              interpolation="nearest",
+                              vmin=0.0, vmax=2.5)
                     _draw_surface_axis_arrows(
                         ax, direction_channels, surface_geometry,
                         plane_keys[col], plane_coords[col], arrow_seed,
@@ -1180,7 +1202,8 @@ def _render_sample_figure(
                 for col in range(3):
                     ax = axes[3 + col]
                     ax.imshow(image_disp[col], cmap="gray",
-                              interpolation="nearest")
+                              interpolation="nearest",
+                              vmin=0.0, vmax=2.5)
                     _draw_surface_axis_arrows(
                         ax, pred_dir_padded, surface_geometry,
                         plane_keys[col], plane_coords[col], arrow_seed,
@@ -1199,7 +1222,8 @@ def _render_sample_figure(
                     for col in range(3):
                         ax = axes[col]
                         ax.imshow(image_disp[col], cmap="gray",
-                                  interpolation="nearest")
+                                  interpolation="nearest",
+                                  vmin=0.0, vmax=2.5)
                         _draw_surface_fused_arrows(
                             ax, nx_gt, ny_gt, nz_gt, surface_geometry,
                             plane_keys[col], plane_coords[col], arrow_seed,
@@ -1211,7 +1235,8 @@ def _render_sample_figure(
                     for col in range(3):
                         ax = axes[3 + col]
                         ax.imshow(image_disp[col], cmap="gray",
-                                  interpolation="nearest")
+                                  interpolation="nearest",
+                                  vmin=0.0, vmax=2.5)
                         _draw_surface_fused_arrows(
                             ax, nx_pr, ny_pr, nz_pr, surface_geometry,
                             plane_keys[col], plane_coords[col], arrow_seed,
