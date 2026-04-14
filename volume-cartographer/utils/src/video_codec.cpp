@@ -130,6 +130,11 @@ auto video_encode(std::span<const std::byte> raw, const VideoCodecParams& params
     // which on 128x128 frames with Z=128 costs more than it saves.
     xparam->bEnableWavefront = 0;
     xparam->frameNumThreads = 1;
+    // Disable x265's internal NUMA thread pool — each encoder otherwise
+    // spawns ~hw_concurrency threads, which explodes when we run many
+    // encoders in parallel (32 workers × 8 encoders × 64 threads = 16k
+    // threads = instant OOM).  Single-threaded encode per chunk.
+    x265_param_parse(xparam, "pools", "none");
     xparam->logLevel = X265_LOG_NONE;
 
     // Small frames (128x128 per Z slice): 32x32 CTUs match the content
