@@ -423,7 +423,6 @@ def predict_fn(
             )
 
             for (images, xys, valids) in test_loader:
-                batch_count += 1
                 raw_batch_size = int(images.size(0))
                 # If the whole batch is empty (all tiles fully zero), skip the forward
                 # pass entirely. We don't filter within a batch because torch.compile
@@ -431,6 +430,7 @@ def predict_fn(
                 if not bool(valids.view(raw_batch_size, -1).any()):
                     pbar.update(raw_batch_size)
                     continue
+                batch_count += 1
                 tile_count += raw_batch_size
                 with scoped_timer(profiler, "host_to_device_seconds", cuda_sync=detailed_sync):
                     images = images.to(device, non_blocking=True)
