@@ -496,7 +496,7 @@ class TifxyzLasagnaDataset(Dataset):
     """Dataset that derives lasagna training channels from tifxyz surfaces.
 
     Each __getitem__ returns:
-        - vol_crop: (1, Z, Y, X) float32 — z-score normalized CT crop
+        - vol_crop: (1, Z, Y, X) float32 — CT crop in [0, 1] (uint8/255)
         - surface_masks: (N, Z, Y, X) float32 — per-surface binary voxelization
         - direction_channels: (6, Z, Y, X) float32 — splatted direction values
         - normals_valid: (1, Z, Y, X) float32 — where directions were splatted
@@ -572,6 +572,7 @@ class TifxyzLasagnaDataset(Dataset):
                 _read_volume_crop_from_patch(
                     patch, crop_size=crop_size,
                     min_corner=min_corner, max_corner=max_corner,
+                    image_normalization="unit",
                 )
             except OfflineCacheMiss:
                 dropped += 1
@@ -706,10 +707,15 @@ class TifxyzLasagnaDataset(Dataset):
         min_corner = np.array([z0, y0, x0], dtype=np.int64)
         max_corner = min_corner + np.array(crop_size, dtype=np.int64)
 
-        # Read CT crop (z-score normalized)
+        # Read CT crop normalized to [0, 1] via uint8/255, matching the
+        # `lasagna/eval_unet_3d.tiled_infer_3d` and `train_unet_3d`
+        # input distribution. This keeps train_tifxyz training and
+        # `lasagna3d dataset vis` inference consistent with each other
+        # and with old `train_unet_3d` checkpoints.
         vol_crop = _read_volume_crop_from_patch(
             patch, crop_size=crop_size,
             min_corner=min_corner, max_corner=max_corner,
+            image_normalization="unit",
         )
 
         # Per-patch chain info (wrap_idx → chain/pos/has_prev/has_next/label)

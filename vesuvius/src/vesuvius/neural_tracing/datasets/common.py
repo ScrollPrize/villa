@@ -618,7 +618,18 @@ def _compute_wrap_order_stats(wrap):
     }
 
 
-def _read_volume_crop_from_patch(patch, crop_size, min_corner, max_corner):
+def _read_volume_crop_from_patch(patch, crop_size, min_corner, max_corner,
+                                 image_normalization: str = "zscore"):
+    """Read a CT crop and normalize it.
+
+    image_normalization:
+        "zscore" — per-crop zero-mean unit-std (default; back-compat).
+        "unit"   — uint8 / 255 → float in [0, 1] (matches the existing
+                   `lasagna/eval_unet_3d.tiled_infer_3d` and
+                   `lasagna/train_unet_3d` training/inference paths,
+                   so models trained or evaluated in either pipeline
+                   see the same input distribution).
+    """
     volume = patch.volume
     if isinstance(volume, zarr.Group):
         volume = volume[str(patch.scale)]
@@ -640,7 +651,15 @@ def _read_volume_crop_from_patch(patch, crop_size, min_corner, max_corner):
             src_starts[1]:src_ends[1],
             src_starts[2]:src_ends[2],
         ]
-    return normalize_zscore(vol_crop)
+
+    if image_normalization == "unit":
+        return vol_crop.astype(np.float32) / 255.0
+    if image_normalization == "zscore":
+        return normalize_zscore(vol_crop)
+    raise ValueError(
+        f"Unknown image_normalization '{image_normalization}' "
+        f"(expected 'zscore' or 'unit')."
+    )
 
 
 def _validate_result_tensors(result: dict, idx: int, enabled: bool):

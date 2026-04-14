@@ -213,7 +213,7 @@ def _read_checkpoint_meta(model_path: str, patch_size_override: int | None = Non
     meta = {}
     if isinstance(ckpt, dict):
         for k in ("patch_size", "norm_type", "upsample_mode",
-                  "in_channels", "out_channels"):
+                  "in_channels", "out_channels", "output_sigmoid"):
             if k in ckpt:
                 meta[k] = ckpt[k]
 
@@ -296,7 +296,8 @@ def _scale_space_residual_sum(pred, target, mask, num_scales: int, kind: str):
 def _compute_inference_output(batch, training_output, model_path, device,
                               model_build_patch_size: int,
                               inference_tile_size: int | None,
-                              comparison_tile: int):
+                              comparison_tile: int,
+                              output_sigmoid: bool):
     """Run the model, compute losses (same path as training), and produce
     per-channel diff maps (full-res masked residual + scale-space sum).
     Returns ``None`` if CUDA / model load fail.
@@ -334,7 +335,15 @@ def _compute_inference_output(batch, training_output, model_path, device,
             device_type=device.type, dtype=torch.bfloat16, enabled=True,
         ):
             results = model(img_for_model)
-            pred = torch.sigmoid(results["output"]).float()
+            raw = results["output"].float()
+            # Match training-time post-processing exactly:
+            # `train_unet_3d.py` does `sigmoid(out)` if output_sigmoid
+            # else `clamp(0, 1)`; old checkpoints store this flag in
+            # the ckpt dict.
+            if output_sigmoid:
+                pred = torch.sigmoid(raw)
+            else:
+                pred = raw.clamp(0.0, 1.0)
 
         # Compare at the smaller of (inference patch, comparison tile).
         compare = min(infer_size, comparison_tile)
@@ -939,9 +948,21 @@ def run_dataset_vis(
     # (NetworkFromConfig.autoconfigure derives stage count from patch
     # size), independent of the dataset patch / inference patch.
     model_build_patch_size: int | None = None
+    output_sigmoid: bool = True
     if model_path is not None:
         meta = _read_checkpoint_meta(model_path, patch_size_override=patch_size)
         model_build_patch_size = int(meta["patch_size"])
+        # output_sigmoid: stored in the checkpoint (old train_unet_3d
+        # ckpts have it; train_tifxyz ckpts default to True). If the
+        # ckpt stores False, training applied `clamp(0, 1)` instead of
+        # `sigmoid(out)` — so we MUST do the same here, otherwise the
+        # vis sees an extra sigmoid the training never had.
+        if "output_sigmoid" in meta:
+            output_sigmoid = bool(meta["output_sigmoid"])
+            sig_src = "checkpoint"
+        else:
+            output_sigmoid = True
+            sig_src = "default (no key in checkpoint)"
         infer_patch_eff = (
             int(inference_tile_size) if inference_tile_size else dataset_emit
         )
@@ -951,6 +972,12 @@ def run_dataset_vis(
             f"dataset_emit={dataset_emit}  "
             f"inference_patch={infer_patch_eff}  "
             f"compare={compare_eff}",
+            flush=True,
+        )
+        print(
+            f"{TAG} output_sigmoid={output_sigmoid} ({sig_src}) — "
+            f"{'applying torch.sigmoid' if output_sigmoid else 'using clamp(0, 1)'} "
+            f"to model output",
             flush=True,
         )
 
@@ -1028,6 +1055,7 @@ def run_dataset_vis(
                         model_build_patch_size,
                         inference_tile_size,
                         comparison_tile,
+                        output_sigmoid,
                     )
 
                 n_wraps = int(sample["num_surfaces"])
