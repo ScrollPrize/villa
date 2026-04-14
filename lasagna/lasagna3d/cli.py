@@ -38,6 +38,12 @@ def main() -> None:
                           "and adds rows for prediction + diff (full + "
                           "scale-space sum). Loss values are added to the "
                           "title.")
+    vis.add_argument("--inference-tile-size", type=int, default=None,
+                     help="Cubic patch the model runs on (single forward). "
+                          "Dataset emits max(config patch_size, this); "
+                          "loss + residuals are scored at min(config "
+                          "patch_size, this), center-cropped from both "
+                          "pred and target. Default: dataset patch size.")
     vis.add_argument("--num-workers", type=int, default=None,
                      help="DataLoader workers for parallel extraction "
                           "and render thread pool size. Default: number "
@@ -56,6 +62,7 @@ def main() -> None:
             patch_size=args.patch_size,
             num_workers=args.num_workers,
             model_path=args.model,
+            inference_tile_size=args.inference_tile_size,
         )
         return
 

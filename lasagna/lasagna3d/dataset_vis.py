@@ -81,6 +81,30 @@ def _surface_color(sample_seed: int, surface_idx: int) -> str:
 _NUM_SCALES = 3
 _ARROW_LEN_PX = 18.0
 _MAX_ARROWS_PER_PLANE = 25
+_GRID_NORMAL_STRIDE = 12
+
+# Plane → (channel pair indices) for direction_channels (6, Z, Y, X).
+# Encoding from tifxyz_lasagna_dataset.compute_direction_values:
+#   axial    z-slice : channels (0,1) encode (nx, ny)
+#   coronal  y-slice : channels (2,3) encode (nx, nz)
+#   sagittal x-slice : channels (4,5) encode (ny, nz)
+_PLANE_DIR_CHANNELS = {
+    "axial": (0, 1),
+    "coronal": (2, 3),
+    "sagittal": (4, 5),
+}
+
+
+def _decode_dir_pair(d0, d1):
+    """Inverse of `tifxyz_lasagna_dataset._encode_dir_np`.
+
+    Returns a 2D unit-direction `(h, v)` for the in-plane normal
+    component encoded by the (d0, d1) channel pair.
+    """
+    cos2t = 2.0 * d0 - 1.0
+    sin2t = cos2t - np.sqrt(2.0) * (2.0 * d1 - 1.0)
+    theta = np.arctan2(sin2t, cos2t) / 2.0
+    return np.cos(theta), np.sin(theta)
 
 
 # ---------------------------------------------------------------------------
@@ -139,6 +163,40 @@ def _sample_from_batch(batch: dict) -> dict:
         "surface_geometry": batch.get("surface_geometry", [[]])[0],
         "patch_info": batch["patch_info"][0],
     }
+
+
+def _center_crop_torch(t, target: int):
+    """Center-crop the trailing 3 spatial dims of a torch tensor to `target`.
+    No-op on dims already <= target.
+    """
+    z, y, x = t.shape[-3:]
+    def _slc(d):
+        if d <= target:
+            return slice(None)
+        s = (d - target) // 2
+        return slice(s, s + target)
+    return t[..., _slc(z), _slc(y), _slc(x)]
+
+
+def _center_crop_np(arr, target: int):
+    """Center-crop the trailing 3 spatial dims of a numpy array to `target`."""
+    *_, z, y, x = arr.shape
+    def _slc(d):
+        if d <= target:
+            return slice(None)
+        s = (d - target) // 2
+        return slice(s, s + target)
+    return arr[..., _slc(z), _slc(y), _slc(x)]
+
+
+def _crop_offset(shape_zyx, target: int):
+    """Per-axis offset subtracted from a coord to convert dataset-patch
+    coordinates to comparison-tile coordinates.
+    """
+    return np.array(
+        [(d - target) // 2 if d > target else 0 for d in shape_zyx],
+        dtype=np.float32,
+    )
 
 
 _MODEL_CACHE: dict = {}
@@ -217,6 +275,8 @@ def _scale_space_residual_sum(pred, target, mask, num_scales: int, kind: str):
     for scale in range(num_scales):
         if kind == "mse":
             r = (x - y) ** 2 * m
+        elif kind == "abs":
+            r = (x - y).abs() * m
         else:
             r = F.smooth_l1_loss(x, y, reduction="none") * m
         if r.shape[2:] != full_size:
@@ -234,7 +294,9 @@ def _scale_space_residual_sum(pred, target, mask, num_scales: int, kind: str):
 
 
 def _compute_inference_output(batch, training_output, model_path, device,
-                              model_build_patch_size: int):
+                              model_build_patch_size: int,
+                              inference_tile_size: int | None,
+                              comparison_tile: int):
     """Run the model, compute losses (same path as training), and produce
     per-channel diff maps (full-res masked residual + scale-space sum).
     Returns ``None`` if CUDA / model load fail.
@@ -248,13 +310,17 @@ def _compute_inference_output(batch, training_output, model_path, device,
 
     try:
         image = batch["image"].to(device, non_blocking=True)
-        # The model is built once at the checkpoint's training patch
-        # size (so NetworkFromConfig autoconfigures the right number
-        # of stages), but the inference pass below runs on whatever
-        # cubic patch the dataset emits — 3D UNets are size-agnostic
-        # at forward time as long as the side is divisible by the
-        # encoder strides.
         model = _load_model(model_path, model_build_patch_size, device)
+
+        # Inference patch: defaults to the full dataset patch.
+        # If --inference-tile-size is *smaller* than the dataset
+        # patch, center-crop the image before the forward (memory
+        # saver). If it's larger, the dataset already emits the
+        # bigger patch (configured in run_dataset_vis), so the full
+        # image IS the inference patch.
+        dataset_size = int(image.shape[-1])
+        infer_size = int(inference_tile_size) if inference_tile_size else dataset_size
+        img_for_model = _center_crop_torch(image, infer_size)
 
         targets_np = training_output["targets"]
         validity_np = training_output["validity"]
@@ -264,13 +330,18 @@ def _compute_inference_output(batch, training_output, model_path, device,
         normals_valid_t = torch.from_numpy(normals_valid_np).view(
             1, 1, *normals_valid_np.shape).to(device)
 
-        # Match training: bf16 autocast halves the activation memory
-        # so inference fits in the same budget as the training step.
         with torch.no_grad(), torch.amp.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=True,
         ):
-            results = model(image)
+            results = model(img_for_model)
             pred = torch.sigmoid(results["output"]).float()
+
+        # Compare at the smaller of (inference patch, comparison tile).
+        compare = min(infer_size, comparison_tile)
+        pred = _center_crop_torch(pred, compare)
+        targets_t = _center_crop_torch(targets_t, compare)
+        validity_t = _center_crop_torch(validity_t, compare)
+        normals_valid_t = _center_crop_torch(normals_valid_t, compare)
 
         cos_mask = validity_t
         dir_mask = (normals_valid_t > 0.5).float()
@@ -285,21 +356,21 @@ def _compute_inference_output(batch, training_output, model_path, device,
                 pred[:, 2:8], targets_t[:, 2:8], mask=dir_mask,
             ).item()
 
-            cos_diff_full = ((pred[:, 0:1] - targets_t[:, 0:1]) ** 2 * cos_mask)
-            mag_diff_full = (
-                F.smooth_l1_loss(pred[:, 1:2], targets_t[:, 1:2], reduction="none")
-                * cos_mask
-            )
+            # Use absolute residuals for visualization (intuitive scale)
+            # — losses themselves above are still exact MSE/SmoothL1.
+            cos_diff_full = ((pred[:, 0:1] - targets_t[:, 0:1]).abs() * cos_mask)
+            mag_diff_full = ((pred[:, 1:2] - targets_t[:, 1:2]).abs() * cos_mask)
             cos_diff_ss = _scale_space_residual_sum(
-                pred[:, 0:1], targets_t[:, 0:1], cos_mask, _NUM_SCALES, "mse",
+                pred[:, 0:1], targets_t[:, 0:1], cos_mask, _NUM_SCALES, "abs",
             )
             mag_diff_ss = _scale_space_residual_sum(
-                pred[:, 1:2], targets_t[:, 1:2], cos_mask, _NUM_SCALES, "l1",
+                pred[:, 1:2], targets_t[:, 1:2], cos_mask, _NUM_SCALES, "abs",
             )
 
         return {
             "pred_cos": pred[0, 0].detach().cpu().numpy(),
             "pred_mag": pred[0, 1].detach().cpu().numpy(),
+            "pred_dir": pred[0, 2:8].detach().cpu().numpy(),  # (6, Z, Y, X)
             "diff_cos_full": cos_diff_full[0, 0].detach().cpu().numpy(),
             "diff_mag_full": mag_diff_full[0, 0].detach().cpu().numpy(),
             "diff_cos_ss": cos_diff_ss[0, 0].detach().cpu().numpy(),
@@ -308,6 +379,7 @@ def _compute_inference_output(batch, training_output, model_path, device,
             "loss_mag": loss_mag,
             "loss_dir": loss_dir,
             "loss_total": loss_cos + loss_mag + loss_dir,
+            "compare_tile": int(compare),
         }
     except Exception as exc:
         print(f"{TAG} WARNING: inference failed ({exc})", flush=True)
@@ -431,6 +503,46 @@ def _draw_normal_arrows(ax, surface_geometry, chain_info_list,
         )
 
 
+def _draw_grid_normal_arrows(ax, dir_channels, normals_valid_3d,
+                             plane: str, plane_coord: int,
+                             color: str = "#22c55e") -> None:
+    """Decode direction_channels back to a 2D in-plane direction and draw
+    arrows on a regular voxel grid (every `_GRID_NORMAL_STRIDE` voxels)
+    where `normals_valid_3d` is set.
+    """
+    c0, c1 = _PLANE_DIR_CHANNELS[plane]
+    if plane == "axial":
+        d0 = dir_channels[c0, plane_coord, :, :]
+        d1 = dir_channels[c1, plane_coord, :, :]
+        valid = normals_valid_3d[plane_coord, :, :]
+    elif plane == "coronal":
+        d0 = dir_channels[c0, :, plane_coord, :]
+        d1 = dir_channels[c1, :, plane_coord, :]
+        valid = normals_valid_3d[:, plane_coord, :]
+    else:
+        d0 = dir_channels[c0, :, :, plane_coord]
+        d1 = dir_channels[c1, :, :, plane_coord]
+        valid = normals_valid_3d[:, :, plane_coord]
+
+    rows, cols = d0.shape
+    s = _GRID_NORMAL_STRIDE
+    rr, cc = np.mgrid[s // 2:rows:s, s // 2:cols:s]
+    rr = rr.flatten()
+    cc = cc.flatten()
+    keep = valid[rr, cc] > 0.5
+    if not np.any(keep):
+        return
+    rr, cc = rr[keep], cc[keep]
+    d0v = d0[rr, cc]
+    d1v = d1[rr, cc]
+    h, v = _decode_dir_pair(d0v, d1v)
+    ax.quiver(
+        cc, rr, h * _ARROW_LEN_PX, v * _ARROW_LEN_PX,
+        angles="xy", scale_units="xy", scale=1.0,
+        color=color, width=0.004, headwidth=3.0, headlength=4.0, alpha=0.9,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Figure assembly
 # ---------------------------------------------------------------------------
@@ -447,6 +559,55 @@ def _render_sample_figure(
     surface_masks = sample["surface_masks"].numpy()      # (N, Z, Y, X)
     chain_info = sample["surface_chain_info"]            # list[dict]
     surface_geometry = sample.get("surface_geometry", [])  # list[dict]
+    direction_channels_full = sample.get("direction_channels")
+    if direction_channels_full is not None:
+        direction_channels_full = direction_channels_full.numpy()  # (6,Z,Y,X)
+
+    # Center-crop everything to the comparison tile when inference
+    # rows are present, so GT and pred panels are at the same scale
+    # and aligned. Without inference, render the full dataset patch.
+    if inference_output is not None:
+        compare = int(inference_output["compare_tile"])
+        full_zyx = image.shape  # (Z, Y, X)
+        offset = _crop_offset(full_zyx, compare)
+        image = _center_crop_np(image, compare)
+        surface_masks = _center_crop_np(surface_masks, compare)
+        if direction_channels_full is not None:
+            direction_channels_full = _center_crop_np(
+                direction_channels_full, compare,
+            )
+        # Also crop the training_output (it's still at dataset size)
+        if training_output is not None:
+            training_output = {
+                "targets": _center_crop_np(training_output["targets"], compare),
+                "validity": _center_crop_np(training_output["validity"], compare),
+                "normals_valid": _center_crop_np(
+                    training_output["normals_valid"], compare),
+                "validity_pyramid": [
+                    _center_crop_np(p, compare)
+                    for p in training_output["validity_pyramid"]
+                ],
+            }
+        # Offset surface_geometry into cropped local coords + drop
+        # points that fall outside the cropped box.
+        new_geom = []
+        for geom in surface_geometry:
+            pts = np.asarray(geom["points_local"])
+            nrm = np.asarray(geom["normals_zyx"])
+            if pts.shape[0] == 0:
+                new_geom.append({"points_local": pts, "normals_zyx": nrm})
+                continue
+            shifted = pts - offset[None, :]
+            inside = (
+                (shifted[:, 0] >= 0) & (shifted[:, 0] < compare) &
+                (shifted[:, 1] >= 0) & (shifted[:, 1] < compare) &
+                (shifted[:, 2] >= 0) & (shifted[:, 2] < compare)
+            )
+            new_geom.append({
+                "points_local": shifted[inside],
+                "normals_zyx": nrm[inside],
+            })
+        surface_geometry = new_geom
 
     Z, Y, X = image.shape
     cz, cy, cx = Z // 2, Y // 2, X // 2
@@ -459,168 +620,255 @@ def _render_sample_figure(
     plane_coords = [cz, cy, cx]
     plane_keys = ["axial", "coronal", "sagittal"]
 
-    rows: list[tuple[str, callable]] = []
+    has_inf = inference_output is not None
+    direction_channels = direction_channels_full
+
+    # Each row: (label, drawer, n_panels). drawer(subfigure) creates
+    # its own subplot grid, so different rows can have different col
+    # counts within the same figure.
+    rows: list[tuple[str, callable, int]] = []
 
     # Row 1 — CT + contours + labels
-    def draw_row_contours(axes):
+    def draw_row_contours(sf):
+        axes = sf.subplots(1, 3)
         for col, ax in enumerate(axes):
             ax.imshow(image_disp[col], cmap="gray", interpolation="nearest")
             mslices = [_plane_slices(m, cz, cy, cx)[col] for m in surface_masks]
             _draw_contours_and_labels(ax, mslices, chain_info, arrow_seed)
             ax.set_title(plane_names[col], fontsize=9)
-    rows.append(("CT + chain contours", draw_row_contours))
+            ax.set_xticks([]); ax.set_yticks([])
+    rows.append(("CT + chain contours", draw_row_contours, 3))
 
-    # Row 2 — CT + normal arrows
-    def draw_row_arrows(axes):
+    # Row 2 — CT + sparse normal arrows from raw points
+    def draw_row_arrows(sf):
+        axes = sf.subplots(1, 3)
         rng = np.random.default_rng(arrow_seed)
         for col, ax in enumerate(axes):
             ax.imshow(image_disp[col], cmap="gray", interpolation="nearest")
             _draw_normal_arrows(
                 ax, surface_geometry, chain_info,
-                plane_keys[col], plane_coords[col], rng,
-                arrow_seed,
+                plane_keys[col], plane_coords[col], rng, arrow_seed,
             )
             ax.set_title(plane_names[col], fontsize=9)
-    rows.append(("CT + normals", draw_row_arrows))
+            ax.set_xticks([]); ax.set_yticks([])
+    rows.append(("CT + sparse normals (raw)", draw_row_arrows, 3))
+
+    # Row 3 — regular-grid normals decoded from direction_channels.
+    # GT-only without --model; GT vs pred side-by-side with --model.
+    if direction_channels is not None and training_output is not None:
+        normals_valid = training_output["normals_valid"]  # (Z, Y, X)
+
+        if has_inf:
+            n_panels_norm = 6
+            def draw_row_grid_normals(sf):
+                axes = sf.subplots(1, 6)
+                # Cols 0..2 GT; cols 3..5 pred.
+                for col in range(3):
+                    ax = axes[col]
+                    ax.imshow(image_disp[col], cmap="gray",
+                              interpolation="nearest")
+                    _draw_grid_normal_arrows(
+                        ax, direction_channels, normals_valid,
+                        plane_keys[col], plane_coords[col],
+                        color="#22c55e",
+                    )
+                    ax.set_title(f"GT  {plane_names[col]}", fontsize=9)
+                    ax.set_xticks([]); ax.set_yticks([])
+
+                pred_dir = inference_output["pred_dir"]
+                for col in range(3):
+                    ax = axes[3 + col]
+                    ax.imshow(image_disp[col], cmap="gray",
+                              interpolation="nearest")
+                    _draw_grid_normal_arrows(
+                        ax, pred_dir, normals_valid,
+                        plane_keys[col], plane_coords[col],
+                        color="#f97316",
+                    )
+                    ax.set_title(f"pred  {plane_names[col]}", fontsize=9)
+                    ax.set_xticks([]); ax.set_yticks([])
+            rows.append(("normals grid (GT | pred)", draw_row_grid_normals, n_panels_norm))
+        else:
+            def draw_row_grid_normals(sf):
+                axes = sf.subplots(1, 3)
+                for col, ax in enumerate(axes):
+                    ax.imshow(image_disp[col], cmap="gray",
+                              interpolation="nearest")
+                    _draw_grid_normal_arrows(
+                        ax, direction_channels, normals_valid,
+                        plane_keys[col], plane_coords[col],
+                        color="#22c55e",
+                    )
+                    ax.set_title(f"GT normals  {plane_names[col]}", fontsize=9)
+                    ax.set_xticks([]); ax.set_yticks([])
+            rows.append(("normals grid (GT)", draw_row_grid_normals, 3))
 
     if training_output is not None:
         targets = training_output["targets"]              # (8, Z, Y, X)
         validity = training_output["validity"]            # (Z, Y, X)
-        pyramid = training_output["validity_pyramid"]     # list[(Z,Y,X)]
-        cos = targets[0]
-        grad_mag = targets[1]
-        cos_slices = _plane_slices(cos, cz, cy, cx)
-        gm_slices = _plane_slices(grad_mag, cz, cy, cx)
+        pyramid = training_output["validity_pyramid"]
+        cos_gt = targets[0]
+        grad_mag_gt = targets[1]
+        cos_gt_slices = _plane_slices(cos_gt, cz, cy, cx)
+        gm_gt_slices = _plane_slices(grad_mag_gt, cz, cy, cx)
         valid_slices_full = _plane_slices(validity, cz, cy, cx)
-        gm_vmax = _auto_vmax(grad_mag, validity > 0.5, percentile=99.0)
+        # Shared vmax for grad_mag computed once on GT, reused for pred.
+        gm_vmax = _auto_vmax(grad_mag_gt, validity > 0.5, percentile=99.0)
 
-        def draw_row_cos(axes):
-            for col, ax in enumerate(axes):
-                ax.imshow(cos_slices[col], cmap="gray",
-                          interpolation="nearest", vmin=0.0, vmax=1.0)
-                ax.set_title(f"cos  {plane_names[col]}", fontsize=9)
-        rows.append(("cos", draw_row_cos))
-
-        def draw_row_gm(axes):
-            for col, ax in enumerate(axes):
-                ax.imshow(image_disp[col], cmap="gray",
-                          interpolation="nearest", alpha=0.35)
-                disp = np.where(valid_slices_full[col] > 0.5, gm_slices[col], np.nan)
-                ax.imshow(disp, cmap="viridis", interpolation="nearest",
-                          vmin=0.0, vmax=gm_vmax)
-                ax.set_title(f"grad_mag (vmax={gm_vmax:.3g})  {plane_names[col]}",
-                             fontsize=9)
-        rows.append(("grad_mag", draw_row_gm))
-
-        for scale_idx, scale_vol in enumerate(pyramid):
-            scale_slices = _plane_slices(scale_vol, cz, cy, cx)
-            coarse = tuple(s // (2 ** scale_idx) for s in validity.shape)
-
-            def _make_drawer(slices, scale_idx=scale_idx, coarse=coarse):
-                def _draw(axes):
-                    for col, ax in enumerate(axes):
-                        ax.imshow(image_disp[col], cmap="gray",
-                                  interpolation="nearest", alpha=0.35)
-                        ax.imshow(slices[col], cmap="magma",
-                                  interpolation="nearest", vmin=0.0, vmax=1.0)
-                        ax.set_title(
-                            f"validity s{scale_idx} "
-                            f"(coarse {coarse[0]}×{coarse[1]}×{coarse[2]}) "
-                            f"{plane_names[col]}",
-                            fontsize=8,
-                        )
-                return _draw
-            rows.append((f"validity s{scale_idx}", _make_drawer(scale_slices)))
-
-        if inference_output is not None:
+        if has_inf:
             pred_cos = inference_output["pred_cos"]
             pred_mag = inference_output["pred_mag"]
             diff_cos_full = inference_output["diff_cos_full"]
             diff_mag_full = inference_output["diff_mag_full"]
             diff_cos_ss = inference_output["diff_cos_ss"]
             diff_mag_ss = inference_output["diff_mag_ss"]
-
             pred_cos_slices = _plane_slices(pred_cos, cz, cy, cx)
             pred_mag_slices = _plane_slices(pred_mag, cz, cy, cx)
             dcos_full_slices = _plane_slices(diff_cos_full, cz, cy, cx)
             dmag_full_slices = _plane_slices(diff_mag_full, cz, cy, cx)
             dcos_ss_slices = _plane_slices(diff_cos_ss, cz, cy, cx)
             dmag_ss_slices = _plane_slices(diff_mag_ss, cz, cy, cx)
+            # Shared diff vmax across full + ss for the same channel
+            cos_diff_vmax = max(
+                _auto_vmax(diff_cos_full, validity > 0.5, 99.0),
+                _auto_vmax(diff_cos_ss, validity > 0.5, 99.0),
+            )
+            mag_diff_vmax = max(
+                _auto_vmax(diff_mag_full, validity > 0.5, 99.0),
+                _auto_vmax(diff_mag_ss, validity > 0.5, 99.0),
+            )
 
-            pred_mag_vmax = _auto_vmax(pred_mag, validity > 0.5, percentile=99.0)
-            dcos_full_vmax = _auto_vmax(diff_cos_full, validity > 0.5, 99.0)
-            dmag_full_vmax = _auto_vmax(diff_mag_full, validity > 0.5, 99.0)
-            dcos_ss_vmax = _auto_vmax(diff_cos_ss, validity > 0.5, 99.0)
-            dmag_ss_vmax = _auto_vmax(diff_mag_ss, validity > 0.5, 99.0)
+        def _draw_cos_panel(ax, slc):
+            ax.imshow(slc, cmap="gray", interpolation="nearest",
+                      vmin=0.0, vmax=1.0)
+            ax.set_xticks([]); ax.set_yticks([])
 
-            def draw_pred_cos(axes):
+        def _draw_diff_panel(ax, slc, mask_slc, vmax):
+            disp = np.where(mask_slc > 0.5, slc, np.nan)
+            ax.imshow(disp, cmap="hot", interpolation="nearest",
+                      vmin=0.0, vmax=vmax)
+            ax.set_xticks([]); ax.set_yticks([])
+
+        # cos row — GT only without --model, GT|pred|diff_full|diff_ss with --model
+        if has_inf:
+            def draw_row_cos(sf):
+                axes = sf.subplots(1, 12)
+                groups = [
+                    ("GT", cos_gt_slices),
+                    ("pred", pred_cos_slices),
+                    (f"|p−t| (vmax={cos_diff_vmax:.3g})", dcos_full_slices),
+                    (f"ss-sum (vmax={cos_diff_vmax:.3g})", dcos_ss_slices),
+                ]
+                for gi, (gname, slices) in enumerate(groups):
+                    for col in range(3):
+                        ax = axes[gi * 3 + col]
+                        if gi < 2:  # GT / pred → grayscale 0..1
+                            _draw_cos_panel(ax, slices[col])
+                        else:
+                            _draw_diff_panel(
+                                ax, slices[col], valid_slices_full[col],
+                                cos_diff_vmax,
+                            )
+                        ax.set_title(
+                            f"cos {gname}  {plane_names[col]}", fontsize=8,
+                        )
+            rows.append(("cos", draw_row_cos, 12))
+        else:
+            def draw_row_cos(sf):
+                axes = sf.subplots(1, 3)
                 for col, ax in enumerate(axes):
-                    ax.imshow(pred_cos_slices[col], cmap="gray",
-                              interpolation="nearest", vmin=0.0, vmax=1.0)
-                    ax.set_title(f"pred cos  {plane_names[col]}", fontsize=9)
-            rows.append(("pred cos", draw_pred_cos))
+                    _draw_cos_panel(ax, cos_gt_slices[col])
+                    ax.set_title(f"cos  {plane_names[col]}", fontsize=9)
+            rows.append(("cos", draw_row_cos, 3))
 
-            def draw_pred_mag(axes):
+        # grad_mag row — same extension structure
+        if has_inf:
+            def draw_row_gm(sf):
+                axes = sf.subplots(1, 12)
+                groups = [
+                    (f"GT (vmax={gm_vmax:.3g})", gm_gt_slices, "viridis"),
+                    (f"pred", pred_mag_slices, "viridis"),
+                    (f"|p−t|", dmag_full_slices, "hot"),
+                    (f"ss-sum", dmag_ss_slices, "hot"),
+                ]
+                for gi, (gname, slices, cmap) in enumerate(groups):
+                    for col in range(3):
+                        ax = axes[gi * 3 + col]
+                        if gi < 2:
+                            disp = np.where(
+                                valid_slices_full[col] > 0.5, slices[col], np.nan)
+                            ax.imshow(disp, cmap=cmap,
+                                      interpolation="nearest",
+                                      vmin=0.0, vmax=gm_vmax)
+                        else:
+                            _draw_diff_panel(
+                                ax, slices[col], valid_slices_full[col],
+                                mag_diff_vmax,
+                            )
+                        ax.set_xticks([]); ax.set_yticks([])
+                        ax.set_title(
+                            f"grad_mag {gname}  {plane_names[col]}", fontsize=8,
+                        )
+            rows.append(("grad_mag", draw_row_gm, 12))
+        else:
+            def draw_row_gm(sf):
+                axes = sf.subplots(1, 3)
                 for col, ax in enumerate(axes):
-                    ax.imshow(image_disp[col], cmap="gray",
-                              interpolation="nearest", alpha=0.35)
-                    ax.imshow(pred_mag_slices[col], cmap="viridis",
-                              interpolation="nearest",
-                              vmin=0.0, vmax=pred_mag_vmax)
+                    disp = np.where(
+                        valid_slices_full[col] > 0.5, gm_gt_slices[col], np.nan)
+                    ax.imshow(disp, cmap="viridis",
+                              interpolation="nearest", vmin=0.0, vmax=gm_vmax)
+                    ax.set_xticks([]); ax.set_yticks([])
                     ax.set_title(
-                        f"pred grad_mag (vmax={pred_mag_vmax:.3g})  "
-                        f"{plane_names[col]}", fontsize=9)
-            rows.append(("pred grad_mag", draw_pred_mag))
+                        f"grad_mag (vmax={gm_vmax:.3g})  {plane_names[col]}",
+                        fontsize=9,
+                    )
+            rows.append(("grad_mag", draw_row_gm, 3))
 
-            def _make_diff_drawer(slices, vmax, label):
-                def _draw(axes):
+        # validity scale rows
+        for scale_idx, scale_vol in enumerate(pyramid):
+            scale_slices = _plane_slices(scale_vol, cz, cy, cx)
+            coarse = tuple(s // (2 ** scale_idx) for s in validity.shape)
+
+            def _make_validity_drawer(slices, scale_idx=scale_idx, coarse=coarse):
+                def _draw(sf):
+                    axes = sf.subplots(1, 3)
                     for col, ax in enumerate(axes):
                         ax.imshow(image_disp[col], cmap="gray",
                                   interpolation="nearest", alpha=0.35)
-                        disp = np.where(
-                            valid_slices_full[col] > 0.5, slices[col], np.nan)
-                        ax.imshow(disp, cmap="hot",
-                                  interpolation="nearest",
-                                  vmin=0.0, vmax=vmax)
+                        ax.imshow(slices[col], cmap="magma",
+                                  interpolation="nearest", vmin=0.0, vmax=1.0)
+                        ax.set_xticks([]); ax.set_yticks([])
                         ax.set_title(
-                            f"{label} (vmax={vmax:.3g})  "
-                            f"{plane_names[col]}", fontsize=8)
+                            f"validity s{scale_idx} "
+                            f"({coarse[0]}×{coarse[1]}×{coarse[2]})  "
+                            f"{plane_names[col]}", fontsize=8,
+                        )
                 return _draw
-
-            rows.append(("cos residual full",
-                         _make_diff_drawer(dcos_full_slices, dcos_full_vmax,
-                                           "cos resid full")))
-            rows.append(("grad_mag residual full",
-                         _make_diff_drawer(dmag_full_slices, dmag_full_vmax,
-                                           "grad_mag resid full")))
-            rows.append(("cos residual ss",
-                         _make_diff_drawer(dcos_ss_slices, dcos_ss_vmax,
-                                           "cos resid ss-sum")))
-            rows.append(("grad_mag residual ss",
-                         _make_diff_drawer(dmag_ss_slices, dmag_ss_vmax,
-                                           "grad_mag resid ss-sum")))
+            rows.append(
+                (f"validity s{scale_idx}",
+                 _make_validity_drawer(scale_slices), 3))
     else:
-        def _skip(axes):
+        def draw_skip(sf):
+            axes = sf.subplots(1, 3)
             for ax in axes:
                 ax.text(0.5, 0.5, "CUDA unavailable — EDT backend disabled",
                         ha="center", va="center",
                         transform=ax.transAxes, fontsize=9)
-                ax.set_xticks([])
-                ax.set_yticks([])
-        rows.append(("supervision (skipped: no CUDA)", _skip))
+                ax.set_xticks([]); ax.set_yticks([])
+        rows.append(("supervision (skipped: no CUDA)", draw_skip, 3))
 
     n_rows = len(rows)
-    fig, axes = plt.subplots(n_rows, 3, figsize=(12, 3.0 * n_rows))
+    max_panels = max(n for _, _, n in rows)
+    fig = plt.figure(figsize=(2.4 * max_panels, 3.0 * n_rows))
+    subfigs = fig.subfigures(nrows=n_rows, ncols=1)
     if n_rows == 1:
-        axes = np.asarray([axes])
-    for row_idx, (_label, drawer) in enumerate(rows):
-        drawer(axes[row_idx])
-        for ax in axes[row_idx]:
-            ax.set_xticks([])
-            ax.set_yticks([])
+        subfigs = [subfigs]
+    for (_label, drawer, _n), sf in zip(rows, subfigs):
+        drawer(sf)
 
     full_title = title
-    if inference_output is not None:
+    if has_inf:
         full_title = (
             f"{title}\n"
             f"loss_cos={inference_output['loss_cos']:.4f}  "
@@ -629,8 +877,7 @@ def _render_sample_figure(
             f"total={inference_output['loss_total']:.4f}"
         )
     fig.suptitle(full_title, fontsize=9)
-    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.99))
-    fig.savefig(out_path, dpi=110, format="jpeg")
+    fig.savefig(out_path, dpi=100, format="jpeg", bbox_inches="tight")
     plt.close(fig)
 
 
@@ -655,6 +902,7 @@ def run_dataset_vis(
     patch_size: int | None = None,
     num_workers: int | None = None,
     model_path: str | None = None,
+    inference_tile_size: int | None = None,
 ) -> None:
     """Render visualization JPEGs for samples from each dataset.
 
@@ -678,19 +926,31 @@ def run_dataset_vis(
     if patch_size is not None:
         config["patch_size"] = patch_size
 
-    # When --model is set, the checkpoint dictates the architecture
+    # Comparison tile = the original training patch size; loss and
+    # residuals are scored at this size regardless of how big the
+    # inference patch is. The dataset must emit at least this size.
+    comparison_tile = int(config["patch_size"])
+    if inference_tile_size is not None:
+        # Dataset must be big enough for the inference patch too.
+        config["patch_size"] = max(comparison_tile, int(inference_tile_size))
+    dataset_emit = int(config["patch_size"])
+
+    # When --model is set, the checkpoint determines the architecture
     # (NetworkFromConfig.autoconfigure derives stage count from patch
-    # size), so we MUST run the dataset at the same patch size the
-    # checkpoint was trained on. Read the checkpoint metadata up front
-    # and override config["patch_size"] before the dataset is built.
+    # size), independent of the dataset patch / inference patch.
     model_build_patch_size: int | None = None
     if model_path is not None:
         meta = _read_checkpoint_meta(model_path, patch_size_override=patch_size)
         model_build_patch_size = int(meta["patch_size"])
-        infer_patch = config.get("patch_size")
+        infer_patch_eff = (
+            int(inference_tile_size) if inference_tile_size else dataset_emit
+        )
+        compare_eff = min(comparison_tile, infer_patch_eff)
         print(
-            f"{TAG} model built at patch_size={model_build_patch_size}, "
-            f"inference at dataset patch_size={infer_patch}",
+            f"{TAG} model_build={model_build_patch_size}  "
+            f"dataset_emit={dataset_emit}  "
+            f"inference_patch={infer_patch_eff}  "
+            f"compare={compare_eff}",
             flush=True,
         )
 
@@ -766,6 +1026,8 @@ def run_dataset_vis(
                     inference_output = _compute_inference_output(
                         batch, training_output, model_path, device,
                         model_build_patch_size,
+                        inference_tile_size,
+                        comparison_tile,
                     )
 
                 n_wraps = int(sample["num_surfaces"])
