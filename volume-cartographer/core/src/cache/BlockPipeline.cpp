@@ -101,10 +101,12 @@ BlockPipeline::BlockPipeline(
     , diskLevels_(std::move(diskLevels))
     , source_(std::move(source))
     , decompress_(std::move(decompress))
-    , ioPool_(config_.ioThreads > 0
+    , downloaderPool_(config_.ioThreads > 0
                   ? config_.ioThreads
                   : (std::thread::hardware_concurrency() ?
                      static_cast<int>(std::thread::hardware_concurrency()) : 8))
+    , loaderPool_(std::thread::hardware_concurrency() ?
+                     static_cast<int>(std::thread::hardware_concurrency()) : 8)
     , blockCache_([&] {
         // Reserve a small residency floor per pyramid level so a coarse
         // fallback image is always available even under heavy fine-level
@@ -143,20 +145,88 @@ BlockPipeline::BlockPipeline(
                 initialDiskShards_, double(initialDiskBytes_) / (1024.0 * 1024.0));
     }
 
-    // Per-chunk IOPool granularity. Shard mapper is identity; each canonical
-    // chunk is its own work unit. When the HTTP source is itself sharded,
-    // HttpSource's internal shard cache amortizes S3 GETs across chunks that
-    // fall in the same source shard.
-    ioPool_.setShardMapper([](const ChunkKey& key) -> ShardKey {
+    // Shard mapper is identity for both pools: each canonical chunk is its
+    // own work unit. HttpSource's internal shard cache still amortizes S3
+    // GETs across chunks that fall in the same source shard.
+    auto shardMapper = [](const ChunkKey& key) -> ShardKey {
         return {key.level, key.iz, key.iy, key.ix};
+    };
+    downloaderPool_.setShardMapper(shardMapper);
+    loaderPool_.setShardMapper(shardMapper);
+
+    // Downloader: s3 (or local filesystem source) → canonical h265 → disk.
+    // Never touches the block cache. Its completion callback hands the key
+    // off to the loader so the chunk ends up in RAM without any cross-pool
+    // synchronisation.
+    downloaderPool_.setFetchFunc([this](const ShardKey& shard) -> IOPool::FetchResult {
+        ChunkKey key{shard.level, shard.sz, shard.sy, shard.sx};
+        if (isNegativeCached(key)) return {};
+
+        auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
+        if (!dz || !source_) return {};
+
+        if (diskShardMarksChunkEmpty(*dz, key)) {
+            bloomAdd(key);
+            std::lock_guard lock(negativeMutex_);
+            negativeCache_.insert(key);
+            return {};
+        }
+
+        // Source fetch + re-encode to canonical h265 + disk write.
+        auto decoded = assembleCanonicalChunk(key);
+        if (!decoded) {
+            auto* http = dynamic_cast<HttpSource*>(source_.get());
+            if (!http || !http->hadTransientError()) {
+                bloomAdd(key);
+                std::lock_guard lock(negativeMutex_);
+                negativeCache_.insert(key);
+                if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
+            }
+            return {};
+        }
+        statIceFetches_.fetch_add(1, std::memory_order_relaxed);
+        auto h265 = encodeCanonicalH265(*decoded);
+        zarrWriteChunk(*dz, key,
+            reinterpret_cast<const uint8_t*>(h265.data()), h265.size());
+        statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
+        statDiskBytes_.fetch_add(h265.size(), std::memory_order_relaxed);
+        if (dz->is_sharded()) {
+            const auto& m = dz->metadata();
+            ShardKey sk{key.level, 0, 0, 0};
+            auto bpcZ = m.sub_chunks_per_shard(0);
+            auto bpcY = m.sub_chunks_per_shard(1);
+            auto bpcX = m.sub_chunks_per_shard(2);
+            sk.sz = bpcZ ? key.iz / int(bpcZ) : key.iz;
+            sk.sy = bpcY ? key.iy / int(bpcY) : key.iy;
+            sk.sx = bpcX ? key.ix / int(bpcX) : key.ix;
+            std::lock_guard lk(writtenShardsMutex_);
+            writtenShards_.insert(sk);
+        }
+
+        // Report the key as the result; the completion callback forwards
+        // it to the loader so it ends up in the block cache.
+        IOPool::FetchResult result;
+        result.emplace_back(key, std::vector<uint8_t>{});
+        return result;
     });
 
-    // Fetch func does all the work on an IOPool worker thread: source fetch,
-    // decode (exactly once with the source codec or canonical h265), insert
-    // into the block cache, and — for remote-sourced volumes — h265-encode
-    // (exactly once) and write to canonical disk. Returns an empty result
-    // so the completion callback is just for arrival notifications.
-    ioPool_.setFetchFunc([this](const ShardKey& shard) -> IOPool::FetchResult {
+    downloaderPool_.setCompletionCallback(
+        [this](IOPool::FetchResult&& res) {
+            if (res.empty()) return;
+            std::vector<ChunkKey> loaderKeys;
+            loaderKeys.reserve(res.size());
+            for (auto& [key, _] : res) loaderKeys.push_back(key);
+            // Use the same level as the completed work so the loader's
+            // weighted round-robin still prioritises the viewport.
+            const int targetLevel = loaderKeys.front().level;
+            loaderPool_.updateInteractive(loaderKeys, targetLevel);
+        });
+
+    // Loader: disk → decode → block cache. Never touches the network.
+    // When there's no canonical disk tier (local filesystem source used
+    // directly), the loader pulls from the source instead — the source
+    // itself lives on disk so the "disk → RAM" framing still applies.
+    loaderPool_.setFetchFunc([this](const ShardKey& shard) -> IOPool::FetchResult {
         ChunkKey key{shard.level, shard.sz, shard.sy, shard.sx};
         if (isNegativeCached(key)) return {};
 
@@ -178,82 +248,46 @@ BlockPipeline::BlockPipeline(
                     reinterpret_cast<const uint8_t*>(diskBytes->data() + diskBytes->size()));
                 decoded = decodeCanonicalH265(buf);
             }
+        } else if (source_) {
+            // Local source, no disk tier: treat the source files as disk.
+            std::vector<uint8_t> compressed;
+            try { compressed = source_->fetch(key); } catch (...) { return {}; }
+            if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) {
+                bloomAdd(key);
+                std::lock_guard lock(negativeMutex_);
+                negativeCache_.insert(key);
+                return {};
+            }
+            statColdHits_.fetch_add(1, std::memory_order_relaxed);
+            if (decompress_) decoded = decompress_(compressed, key);
         }
 
-        if (!decoded) {
-            if (!source_) return {};
-            if (!dz) {
-                // Local source: no disk tier, decode straight from source bytes.
-                std::vector<uint8_t> compressed;
-                try { compressed = source_->fetch(key); } catch (...) { return {}; }
-                if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) {
-                    bloomAdd(key);
-                    std::lock_guard lock(negativeMutex_);
-                    negativeCache_.insert(key);
-                    return {};
-                }
-                statIceFetches_.fetch_add(1, std::memory_order_relaxed);
-                if (decompress_) decoded = decompress_(compressed, key);
-                if (!decoded) return {};
-            } else {
-                // Remote source + canonical disk. Assemble canonical 128^3 from
-                // source (decoding once with the source codec), encode once to
-                // h265, write the h265 bytes to disk. Keep the decoded buffer
-                // for block-cache population below.
-                decoded = assembleCanonicalChunk(key);
-                if (!decoded) {
-                    auto* http = dynamic_cast<HttpSource*>(source_.get());
-                    if (!http || !http->hadTransientError()) {
-                        bloomAdd(key);
-                        std::lock_guard lock(negativeMutex_);
-                        negativeCache_.insert(key);
-                        if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
-                    }
-                    return {};
-                }
-                statIceFetches_.fetch_add(1, std::memory_order_relaxed);
-                auto h265 = encodeCanonicalH265(*decoded);
-                zarrWriteChunk(*dz, key,
-                    reinterpret_cast<const uint8_t*>(h265.data()), h265.size());
-                statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
-                statDiskBytes_.fetch_add(h265.size(), std::memory_order_relaxed);
-                if (dz->is_sharded()) {
-                    const auto& m = dz->metadata();
-                    ShardKey sk{key.level, 0, 0, 0};
-                    auto bpcZ = m.sub_chunks_per_shard(0);
-                    auto bpcY = m.sub_chunks_per_shard(1);
-                    auto bpcX = m.sub_chunks_per_shard(2);
-                    sk.sz = bpcZ ? key.iz / int(bpcZ) : key.iz;
-                    sk.sy = bpcY ? key.iy / int(bpcY) : key.iy;
-                    sk.sx = bpcX ? key.ix / int(bpcX) : key.ix;
-                    std::lock_guard lk(writtenShardsMutex_);
-                    writtenShards_.insert(sk);
-                }
-            }
-        }
+        if (!decoded) return {};
 
-        if (decoded) {
-            insertChunkAsBlocks(key, *decoded);
-            if (!chunkArrivedFlag_.exchange(true, std::memory_order_acq_rel)) {
-                std::lock_guard cbLock(callbackMutex_);
-                for (const auto& [id, cb] : chunkReadyListeners_)
-                    cb(key);
-            }
+        insertChunkAsBlocks(key, *decoded);
+        if (!chunkArrivedFlag_.exchange(true, std::memory_order_acq_rel)) {
+            std::lock_guard cbLock(callbackMutex_);
+            for (const auto& [id, cb] : chunkReadyListeners_)
+                cb(key);
         }
         return {};
     });
 
-    ioPool_.setCompletionCallback(
+    loaderPool_.setCompletionCallback(
         [](IOPool::FetchResult&&) {
             // Work already done inside the fetch func.
         });
 
-    ioPool_.start();
+    downloaderPool_.start();
+    loaderPool_.start();
     loadNegativeCache();
 }
 
 BlockPipeline::~BlockPipeline() {
-    ioPool_.stop();
+    // Stop the downloader first so no more work can land in the loader's
+    // queue while we're trying to drain it.
+    downloaderPool_.stop();
+    loaderPool_.stop();
     auto cold = statColdHits_.load();
     auto ice = statIceFetches_.load();
     if (cold > 0 || ice > 0) {
@@ -284,15 +318,34 @@ void BlockPipeline::bloomClear() noexcept {
     for (auto& w : negativeBloom_) w.store(0, std::memory_order_relaxed);
 }
 
-void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys) {
+void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targetLevel) {
     if (keys.empty()) return;
-    std::vector<ChunkKey> submit;
-    submit.reserve(keys.size());
+    // Triage by disk presence: chunks already on disk go straight to the
+    // loader pool (fast, CPU-bound decode), chunks that need fetching go
+    // to the downloader pool (slow, network-bound). The two pools are
+    // fully independent so the loader can't be starved by in-flight S3
+    // work.
+    std::vector<ChunkKey> loaderKeys, downloaderKeys;
+    loaderKeys.reserve(keys.size());
+    downloaderKeys.reserve(keys.size());
     for (const auto& key : keys) {
         if (isNegativeCached(key)) continue;
-        submit.push_back(key);
+        auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
+        const bool diskPresent = dz
+            && dz->is_sharded()
+            && dz->inner_chunk_exists(chunkIndices(key));
+        if (diskPresent || !dz) {
+            // Present on canonical disk, OR no canonical disk tier at all
+            // (local filesystem source — the "disk" is the source files).
+            loaderKeys.push_back(key);
+        } else {
+            downloaderKeys.push_back(key);
+        }
     }
-    if (!submit.empty()) ioPool_.updateInteractive(submit);
+    if (!loaderKeys.empty())
+        loaderPool_.updateInteractive(loaderKeys, targetLevel);
+    if (!downloaderKeys.empty())
+        downloaderPool_.updateInteractive(downloaderKeys, targetLevel);
 }
 
 BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
@@ -407,7 +460,8 @@ void BlockPipeline::clearMemory() {
 }
 
 void BlockPipeline::clearAll() {
-    ioPool_.cancelPending();
+    downloaderPool_.cancelPending();
+    loaderPool_.cancelPending();
     blockCache_.clear();
     bloomClear();
     std::lock_guard lock(negativeMutex_);
@@ -485,7 +539,7 @@ auto BlockPipeline::stats() const -> Stats {
     s.iceFetches = statIceFetches_.load(std::memory_order_relaxed);
     s.misses = statMisses_.load(std::memory_order_relaxed);
     s.blocks = blockCache_.size();
-    s.ioPending = ioPool_.pendingCount();
+    s.ioPending = downloaderPool_.pendingCount() + loaderPool_.pendingCount();
     s.diskWrites = statDiskWrites_.load(std::memory_order_relaxed);
     {
         std::lock_guard lock(negativeMutex_);

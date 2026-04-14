@@ -292,7 +292,7 @@ void prefetchRegion(BlockPipeline& cache, int level,
     keys.clear();
     appendChunksForRegion(cache, level, minVx, minVy, minVz,
                           maxVx, maxVy, maxVz, keys);
-    if (!keys.empty()) cache.fetchInteractive(keys);
+    if (!keys.empty()) cache.fetchInteractive(keys, level);
 }
 
 // prefetchCoordsRegion / prefetchPlaneRegion: inputs are already in
@@ -664,7 +664,7 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
                 prefetchKeys);
         }
     }
-    if (!prefetchKeys.empty()) cache.fetchInteractive(prefetchKeys);
+    if (!prefetchKeys.empty()) cache.fetchInteractive(prefetchKeys, desiredLevel);
 
     float scales[32] = {};
     const int nSamplersTotal = numLevels - desiredLevel;
@@ -748,7 +748,9 @@ void sampleCompositeAdaptiveImpl(
     int w, int h,
     const std::string& compositeMethod,
     const uint32_t lut[256],
-    const CompositeParams* lightParams)
+    const CompositeParams* lightParams,
+    uint8_t* levelOut,
+    int levelStride)
 {
     auto levelScale = [](int lvl) { return (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f; };
     const float zLo = float(zStart) * zStep;
@@ -790,7 +792,7 @@ void sampleCompositeAdaptiveImpl(
                 appendChunksForRegion(cache, lvl,
                     minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s, keys);
             }
-            if (!keys.empty()) cache.fetchInteractive(keys);
+            if (!keys.empty()) cache.fetchInteractive(keys, desiredLevel);
         }
     } else {
         cv::Vec3f p0 = *origin + (*planeNormal) * zMin;
@@ -805,7 +807,7 @@ void sampleCompositeAdaptiveImpl(
             appendChunksForRegion(cache, lvl,
                 minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s, keys);
         }
-        if (!keys.empty()) cache.fetchInteractive(keys);
+        if (!keys.empty()) cache.fetchInteractive(keys, desiredLevel);
     }
 
     // Precompute per-level scale factor once (1.0 / 2^lvl). Hoists the
@@ -851,6 +853,7 @@ void sampleCompositeAdaptiveImpl(
             const int xEnd = std::min(tx + kTile, w);
         for (int y=ty; y<yEnd; y++) {
             uint32_t* outRow = outBuf + size_t(y) * size_t(outStride);
+            uint8_t* lvlRow = levelOut ? (levelOut + size_t(y) * size_t(levelStride)) : nullptr;
             const cv::Vec3f* crow = coords ? coords->ptr<cv::Vec3f>(y) : nullptr;
             const cv::Vec3f* nrow = normals ? normals->ptr<cv::Vec3f>(y) : nullptr;
             for (int x=tx; x<xEnd; x++) {
@@ -859,10 +862,17 @@ void sampleCompositeAdaptiveImpl(
                 // both map to a black output pixel.
                 if (!isfinite_bitwise(base[0])
                     || (base[0] == 0.f && base[1] == 0.f && base[2] == 0.f)) {
-                    outRow[x] = lut[0]; continue;
+                    outRow[x] = lut[0];
+                    if (lvlRow) lvlRow[x] = 0;
+                    continue;
                 }
                 cv::Vec3f nrm = nrow ? nrow[x] : (planeNormal ? *planeNormal : cv::Vec3f(0,0,0));
-                if (nrow && !isfinite_bitwise(nrm[0])) { outRow[x] = lut[0]; continue; }
+                if (nrow && !isfinite_bitwise(nrm[0])) {
+                    outRow[x] = lut[0];
+                    if (lvlRow) lvlRow[x] = 0;
+                    continue;
+                }
+                uint8_t pxLevel = 0;
 
                 if constexpr (AMode == AccumMode2::Volumetric) {
                     // Volumetric Beer-Lambert with secondary shadow rays.
@@ -910,7 +920,10 @@ void sampleCompositeAdaptiveImpl(
                             for (int i = 0; i < nSamplers; i++) {
                                 float scl = scales[i];
                                 if (trySampleNB<SMode>(sampler(i),
-                                    wzV * scl, wyV * scl, wxV * scl, v)) break;
+                                    wzV * scl, wyV * scl, wxV * scl, v)) {
+                                    if (uint8_t(i) > pxLevel) pxLevel = uint8_t(i);
+                                    break;
+                                }
                             }
                         }
                         if (v > 0) {
@@ -939,6 +952,7 @@ void sampleCompositeAdaptiveImpl(
                     float vF = std::min(255.0f, accumC * 255.0f);
                     if (vF < 0.f) vF = 0.f;
                     outRow[x] = lut[uint8_t(vF)];
+                    if (lvlRow) lvlRow[x] = pxLevel;
                     continue;
                 }
 
@@ -998,7 +1012,10 @@ void sampleCompositeAdaptiveImpl(
                         // sampling fills in from whichever level is ready.
                         for (int i=0; i<nSamplers; i++) {
                             float scl = scales[i];
-                            if (trySampleNB<SMode>(sampler(i), wz*scl, wy*scl, wx*scl, v)) break;
+                            if (trySampleNB<SMode>(sampler(i), wz*scl, wy*scl, wx*scl, v)) {
+                                if (uint8_t(i) > pxLevel) pxLevel = uint8_t(i);
+                                break;
+                            }
                         }
                     }
                     if constexpr (AMode == AccumMode2::Max) { mx = std::max(mx, float(v)); }
@@ -1069,6 +1086,7 @@ void sampleCompositeAdaptiveImpl(
                 }
                 if (val < 0.f) val = 0.f; if (val > 255.f) val = 255.f;
                 outRow[x] = lut[uint8_t(val)];
+                if (lvlRow) lvlRow[x] = pxLevel;
             }
         }
         }  // tile x
@@ -1088,34 +1106,36 @@ void dispatchCompositeAdaptive(
     int w, int h,
     const std::string& method,
     const uint32_t lut[256],
-    const CompositeParams* lightParams)
+    const CompositeParams* lightParams,
+    uint8_t* levelOut,
+    int levelStride)
 {
     switch (accumModeFor(method)) {
         case AccumMode2::Max:
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::Max>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut, lightParams); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride); break;
         case AccumMode2::Min:
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::Min>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut, lightParams); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride); break;
         case AccumMode2::LayerStorage:
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::LayerStorage>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut, lightParams); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride); break;
         case AccumMode2::Volumetric:
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::Volumetric>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut, lightParams); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride); break;
         default:
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::Mean>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut, lightParams); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride); break;
     }
 }
 
@@ -1134,7 +1154,9 @@ void sampleAdaptiveARGB32(
     const std::string& compositeMethod,
     const uint32_t lut[256],
     vc::Sampling method,
-    const CompositeParams* lightParams)
+    const CompositeParams* lightParams,
+    uint8_t* levelOut,
+    int levelStride)
 {
     if (numLayers <= 0) numLayers = 1;
     // Composite rendering forces Nearest: averaging N layers already
@@ -1146,12 +1168,12 @@ void sampleAdaptiveARGB32(
         dispatchCompositeAdaptive<SampleMode::Nearest>(
             outBuf, outStride, *cache, desiredLevel, numLevels,
             coords, origin, vx_step, vy_step, normals, planeNormal,
-            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams);
+            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams, levelOut, levelStride);
     } else {
         dispatchCompositeAdaptive<SampleMode::Trilinear>(
             outBuf, outStride, *cache, desiredLevel, numLevels,
             coords, origin, vx_step, vy_step, normals, planeNormal,
-            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams);
+            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams, levelOut, levelStride);
     }
 }
 

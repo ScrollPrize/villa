@@ -44,8 +44,11 @@ public:
     void submit(const std::vector<ChunkKey>& keys);
 
     // Update interactive viewport. New shards get queued; old queued shards
-    // not in the new set get dropped.
-    void updateInteractive(const std::vector<ChunkKey>& keys);
+    // not in the new set get dropped. targetLevel is the pyramid level the
+    // viewer is currently displaying at — popNext gives it the highest
+    // weight so the user reaches that resolution fastest, while levels
+    // adjacent to it still make steady progress.
+    void updateInteractive(const std::vector<ChunkKey>& keys, int targetLevel = 0);
 
     void cancelPending();
 
@@ -71,6 +74,12 @@ private:
     // of high-res for the same viewport.
     std::array<std::deque<ShardKey>, kMaxLevels> queues_;
     size_t queueTotal_ = 0;
+    // Per-level pops served so far. popNext picks the level with the
+    // smallest served/weight ratio among non-empty queues, yielding
+    // weighted round-robin instead of strict priority.
+    std::array<uint64_t, kMaxLevels> served_{};
+    // Zoom-target level; popNext weights levels by distance from this.
+    int targetLevel_ = 0;
 
     bool shutdown_ = false;
 

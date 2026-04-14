@@ -330,12 +330,28 @@ void CAdaptiveVolumeViewer::submitRender()
     const float rakingStrength = std::clamp(_compositeSettings.postRakingStrength, 0.0f, 1.0f);
     const float rakingDepth = std::max(0.01f, _compositeSettings.postRakingDepthScale);
 
+    // Debug overlay: paint a per-pixel gradient based on fallback-level depth
+    // so the user can see which regions rendered against downscaled chunks.
+    const bool highlightDownscaled = [] {
+        QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
+        return s.value("viewer_controls/highlight_downscaled", false).toBool();
+    }();
+
     auto surf = _surfWeak.lock();
     if (!surf || !_volume || !_volume->zarrDataset()) return;
 
     int fbW = _framebuffer.width();
     int fbH = _framebuffer.height();
     if (fbW <= 0 || fbH <= 0) return;
+
+    if (highlightDownscaled) {
+        if (_levelBuffer.rows != fbH || _levelBuffer.cols != fbW) {
+            _levelBuffer.create(fbH, fbW);
+        }
+        _levelBuffer.setTo(0);
+    }
+    uint8_t* lvlOutPtr = highlightDownscaled ? _levelBuffer.ptr<uint8_t>(0) : nullptr;
+    const int lvlOutStride = highlightDownscaled ? int(_levelBuffer.step1()) : 0;
 
     auto* fbBits = reinterpret_cast<uint32_t*>(_framebuffer.bits());
     int fbStride = _framebuffer.bytesPerLine() / 4;
@@ -435,7 +451,8 @@ void CAdaptiveVolumeViewer::submitRender()
             nullptr, pNormal,
             numLayers, zStart, zStep,
             fbW, fbH, method, lut.data(), sampleMethod,
-            &lightP);  // sampler uses lightP for volumetric and lighting paths
+            &lightP,  // sampler uses lightP for volumetric and lighting paths
+            lvlOutPtr, lvlOutStride);
     } else {
         cv::Mat_<cv::Vec3f> coords;
         cv::Mat_<cv::Vec3f> normals;
@@ -475,7 +492,8 @@ void CAdaptiveVolumeViewer::submitRender()
                 pNormals, nullptr,
                 numLayers, zStart, zStep,
                 fbW, fbH, method, lut.data(), sampleMethod,
-            &lightP);  // sampler uses lightP for volumetric and lighting paths
+            &lightP,  // sampler uses lightP for volumetric and lighting paths
+            lvlOutPtr, lvlOutStride);
         }
     }
 
@@ -598,6 +616,45 @@ void CAdaptiveVolumeViewer::submitRender()
                     uint32_t v = src[x];
                     row[x] = 0xFF000000u | (v << 16) | (v << 8) | v;
                 }
+            }
+        }
+    }
+
+    if (highlightDownscaled && lvlOutPtr
+        && _levelBuffer.rows == fbH && _levelBuffer.cols == fbW) {
+        // Fallback-depth gradient: green (1 level coarser) → red (5+ coarser).
+        // Encoded as ARGB with 0xFF alpha so the blend below can mix against
+        // the framebuffer without per-channel premultiplication logic.
+        static const uint32_t kLevelColors[6] = {
+            0u,                      // 0: desired level — no overlay
+            0xFF34D399u,             // 1: green
+            0xFF4ADE80u,             // 2: lime
+            0xFFFACC15u,             // 3: yellow
+            0xFFFB923Cu,             // 4: orange
+            0xFFEF4444u,             // 5+: red
+        };
+        // Linear blend `out = (src * (256-a) + color * a) / 256` per channel.
+        // a = 96 ≈ 37% overlay — enough to read the tint without hiding data.
+        constexpr uint32_t kA = 96;
+        constexpr uint32_t kIA = 256 - kA;
+        for (int y = 0; y < fbH; y++) {
+            uint32_t* row = fbBits + size_t(y) * size_t(fbStride);
+            const uint8_t* lvls = _levelBuffer.ptr<uint8_t>(y);
+            for (int x = 0; x < fbW; x++) {
+                const uint8_t lvl = lvls[x];
+                if (lvl == 0) continue;
+                const uint32_t c = kLevelColors[std::min<uint8_t>(lvl, 5)];
+                const uint32_t src = row[x];
+                const uint32_t sr = (src >> 16) & 0xFFu;
+                const uint32_t sg = (src >> 8) & 0xFFu;
+                const uint32_t sb = src & 0xFFu;
+                const uint32_t cr = (c >> 16) & 0xFFu;
+                const uint32_t cg = (c >> 8) & 0xFFu;
+                const uint32_t cb = c & 0xFFu;
+                const uint32_t r = (sr * kIA + cr * kA) >> 8;
+                const uint32_t g = (sg * kIA + cg * kA) >> 8;
+                const uint32_t b = (sb * kIA + cb * kA) >> 8;
+                row[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
             }
         }
     }

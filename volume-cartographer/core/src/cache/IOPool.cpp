@@ -92,13 +92,21 @@ void IOPool::submit(const std::vector<ChunkKey>& keys)
     if (added) cv_.notify_all();
 }
 
-void IOPool::updateInteractive(const std::vector<ChunkKey>& keys)
+void IOPool::updateInteractive(const std::vector<ChunkKey>& keys, int targetLevel)
 {
     if (keys.empty()) return;
 
     {
         std::lock_guard lock(mutex_);
         if (shutdown_) return;
+        if (targetLevel >= 0 && targetLevel < kMaxLevels
+            && targetLevel != targetLevel_) {
+            // Reset the served counters whenever the viewport target
+            // changes so the new priority kicks in immediately instead of
+            // being masked by historical counts.
+            targetLevel_ = targetLevel;
+            served_.fill(0);
+        }
 
         // Priority model: the most-recent call reflects what the user is
         // looking at *right now*. Within each level's queue, new keys go to
@@ -165,13 +173,46 @@ ShardKey IOPool::popNext()
     if (shutdown_ && queueTotal_ == 0)
         throw std::runtime_error("IOPool shutdown");
 
-    // Coarsest level first: level indices grow coarser (higher index).
-    for (int lvl = kMaxLevels - 1; lvl >= 0; --lvl) {
-        auto& q = queues_[lvl];
-        if (q.empty()) continue;
+    // Weighted round-robin keyed on the current viewport's target level.
+    // The target (the resolution the viewer is actually asking to display)
+    // wins the most threads; levels adjacent to it get secondary share so
+    // the coarse fallback and the zoom-out neighbours stay warm.
+    //
+    // Weight vs. distance-from-target: 0→6, 1→3, 2→2, 3+→1. Target at
+    // level 1 (scroll at ~0.37x zoom) gives weights 3,6,3,2,1,1 for
+    // levels 0..5 — level 1 gets ~38% of pops, 0 and 2 each ~19%, rest
+    // ~6% each.
+    auto weightFor = [&](int lvl) -> int {
+        int d = lvl - targetLevel_;
+        if (d < 0) d = -d;
+        switch (d) {
+            case 0: return 6;
+            case 1: return 3;
+            case 2: return 2;
+            default: return 1;
+        }
+    };
+
+    int bestLevel = -1;
+    int bestWeight = 1;
+    // Compare served/weight ratios using cross-multiplication to avoid
+    // floating point. bestLevel wins when
+    //   served[bestLevel] * weight[lvl] > served[lvl] * weight[bestLevel]
+    // (candidate has a smaller served/weight).
+    for (int lvl = 0; lvl < kMaxLevels; ++lvl) {
+        if (queues_[lvl].empty()) continue;
+        const int w = weightFor(lvl);
+        if (bestLevel < 0) { bestLevel = lvl; bestWeight = w; continue; }
+        const uint64_t lhs = served_[bestLevel] * uint64_t(w);
+        const uint64_t rhs = served_[lvl]       * uint64_t(bestWeight);
+        if (lhs > rhs) { bestLevel = lvl; bestWeight = w; }
+    }
+    if (bestLevel >= 0) {
+        auto& q = queues_[bestLevel];
         ShardKey sk = q.front();
         q.pop_front();
         queueTotal_--;
+        served_[bestLevel]++;
         shards_[sk] = ShardState::InFlight;
         return sk;
     }

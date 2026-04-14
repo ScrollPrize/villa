@@ -55,8 +55,10 @@ public:
 
     // --- Interactive fetch (for viewport chunks) ---
     // Chunk keys are still the IO unit — after decode, each chunk is split
-    // into 16^3 blocks and inserted into the block cache.
-    void fetchInteractive(const std::vector<ChunkKey>& keys);
+    // into 16^3 blocks and inserted into the block cache. targetLevel is
+    // the pyramid level the viewer is currently displaying at; shards at
+    // that level get the highest IO priority.
+    void fetchInteractive(const std::vector<ChunkKey>& keys, int targetLevel = 0);
 
     // --- Cache management ---
     void clearMemory();
@@ -117,7 +119,16 @@ private:
     std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels_;
     std::unique_ptr<VolumeSource> source_;
     DecompressFn decompress_;
-    IOPool ioPool_;
+    // Two fully independent pools.
+    //   downloaderPool_ does s3 → canonical h265 → disk. That's its whole
+    //     job. It never touches the block cache.
+    //   loaderPool_ does disk → decode → insert into block cache. It
+    //     never touches the network.
+    // Submission in fetchInteractive triages on the disk shard index:
+    // present → loaderPool_ directly; absent → downloaderPool_, whose
+    // completion callback hands the key off to loaderPool_.
+    IOPool downloaderPool_;
+    IOPool loaderPool_;
 
     BlockCache blockCache_;
 

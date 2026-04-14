@@ -262,6 +262,9 @@ private:
 
     // --- Framebuffer ---
     QImage _framebuffer;
+    // Per-pixel pyramid-level tag (0 = desired, 1..5 = fallback depth).
+    // Allocated lazily when "highlight downscaled chunks" is enabled.
+    cv::Mat_<uint8_t> _levelBuffer;
     float _camSurfX = 0, _camSurfY = 0, _camScale = 1.0f;
 
     // --- Data ---

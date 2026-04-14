@@ -130,7 +130,12 @@ void sampleAdaptiveARGB32(
     // Optional lighting: when lightParams->lightingEnabled is true the
     // composite output is modulated by a Lambertian diffuse factor.
     // Normal source (mesh vs. volume gradient) is selected via the params.
-    const CompositeParams* lightParams = nullptr);
+    const CompositeParams* lightParams = nullptr,
+    // Optional per-pixel fallback-level output. When non-null, each pixel is
+    // tagged with the *coarsest* pyramid-level offset used while sampling
+    // (0 = desired level, 1..N = fallback depth). Stride is in bytes.
+    uint8_t* levelOut = nullptr,
+    int levelStride = 0);
 
 // Fused plane composite: inline coords + nearest-neighbor per layer + composite + LUT → ARGB32.
 // No coord matrix allocation. For PlaneSurface composite rendering.

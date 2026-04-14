@@ -2951,6 +2951,28 @@ void CWindow::CreateWidgets(void)
         viewerControlsLayout->addWidget(interpWidget);
     }
 
+    // Highlight downscaled chunks — tints pixels that rendered against a
+    // coarser pyramid level than the zoom-level target (green → red).
+    {
+        auto* chkHighlight = new QCheckBox(tr("Highlight downscaled chunks"));
+        chkHighlight->setToolTip(
+            tr("Tint pixels sourced from a coarser pyramid level than the current zoom "
+               "target. Green = 1 level coarser; red = 5+ levels coarser. Untinted pixels "
+               "rendered at the requested resolution."));
+        chkHighlight->setChecked(
+            settings.value("viewer_controls/highlight_downscaled", false).toBool());
+        connect(chkHighlight, &QCheckBox::toggled, this, [this](bool on) {
+            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
+            s.setValue("viewer_controls/highlight_downscaled", on);
+            if (_viewerManager) {
+                _viewerManager->forEachViewer([](CTiledVolumeViewer* v) {
+                    v->renderVisible(true);
+                });
+            }
+        });
+        viewerControlsLayout->addWidget(chkHighlight);
+    }
+
     // Navigation sensitivity controls
     {
         auto* navWidget = new QWidget;
