@@ -71,65 +71,33 @@ def encode_direction_channels(
 
 
 # ---------------------------------------------------------------------------
-# Greedy chain ordering
+# Chain reconstruction from per-mask metadata
 # ---------------------------------------------------------------------------
 
-def build_surface_chain(
-    surface_masks: list[torch.Tensor],
-    dts: list[torch.Tensor],
-) -> list[int]:
-    """Order N surfaces into a greedy nearest-neighbor chain.
+def chains_from_surface_info(surface_chain_info: list[dict]) -> list[list[int]]:
+    """Group per-surface chain metadata into ordered chains.
 
-    Starts with the most isolated surface (highest mean distance to all
-    others), then greedily appends the closest unused surface.
-
-    Args:
-        surface_masks: list of N bool tensors (Z, Y, X)
-        dts: list of N float tensors — EDT of complement (~mask)
-
-    Returns:
-        chain: list of N indices defining the chain order
+    Input: one dict per surface_mask with keys chain/pos/has_prev/has_next
+    (produced by ``tifxyz_lasagna_dataset.build_patch_chains`` and wired
+    through the dataset). Returns a list of chains, each a list of
+    surface_mask indices sorted by pos in that chain. Surfaces with
+    ``chain == -1`` are treated as standalone singletons.
     """
-    N = len(surface_masks)
-    if N <= 1:
-        return list(range(N))
-
-    # Pairwise average distances: avg_dist[i, j] = mean(dt_i[mask_j])
-    avg_dist = torch.zeros(N, N, dtype=torch.float64)
-    for i in range(N):
-        dt_i = dts[i]
-        for j in range(N):
-            if i != j:
-                mask_j = surface_masks[j]
-                n_j = int(mask_j.sum().item())
-                if n_j > 0:
-                    avg_dist[i, j] = float(dt_i[mask_j].double().mean().item())
-
-    # Total average distance per surface
-    total_avg = torch.zeros(N, dtype=torch.float64)
-    for i in range(N):
-        vals = [avg_dist[i, j].item() for j in range(N) if i != j]
-        total_avg[i] = sum(vals) / max(len(vals), 1)
-
-    # Start with most isolated surface
-    chain = [int(total_avg.argmax().item())]
-    used = set(chain)
-
-    # Greedily add closest unused
-    for _ in range(N - 1):
-        last = chain[-1]
-        best_j = -1
-        best_d = float("inf")
-        for j in range(N):
-            if j not in used and avg_dist[last, j].item() < best_d:
-                best_d = avg_dist[last, j].item()
-                best_j = j
-        if best_j < 0:
-            break
-        chain.append(best_j)
-        used.add(best_j)
-
-    return chain
+    groups: dict[int, list[tuple[int, int]]] = {}
+    standalone: list[int] = []
+    for surf_idx, info in enumerate(surface_chain_info):
+        cid = int(info.get("chain", -1))
+        if cid < 0:
+            standalone.append(surf_idx)
+            continue
+        groups.setdefault(cid, []).append((int(info.get("pos", 0)), surf_idx))
+    chains: list[list[int]] = []
+    for cid in sorted(groups.keys()):
+        ordered = [surf_idx for _, surf_idx in sorted(groups[cid])]
+        chains.append(ordered)
+    for surf_idx in standalone:
+        chains.append([surf_idx])
+    return chains
 
 
 # ---------------------------------------------------------------------------
@@ -175,118 +143,118 @@ def _dot_product_gradients(
 def derive_cos_gradmag_validity(
     dts: list[torch.Tensor],
     surface_masks: list[torch.Tensor],
-    chain: list[int],
+    chains: list[list[int]],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Derive cos channel, grad_mag channel, and validity mask from chain-ordered DTs.
+    """Derive cos / grad_mag / validity for all voxels bracketed between
+    chain-adjacent surfaces.
 
-    Ports the algorithm from labels_to_winding_volume.py:307-411 to PyTorch.
+    The ordering is externally supplied (see
+    ``tifxyz_lasagna_dataset.build_patch_chains``). Unlike the old
+    EDT-scanning path, we support multiple independent chains in the same
+    patch and ONLY supervise voxels that lie strictly between two
+    chain-adjacent surfaces — i.e., the "between neighboring surfaces"
+    region. Voxels outside the envelope of a chain, or inside a chain-of-one,
+    are left invalid.
 
     Args:
-        dts: list of N float32 CUDA tensors — EDT of complement (~mask_k)
-        surface_masks: list of N bool CUDA tensors
-        chain: ordered surface indices from build_surface_chain()
+        dts: list of N float32 CUDA tensors — EDT of complement(~mask_k).
+            Indexed by surface-mask index (same order as ``surface_masks``).
+        surface_masks: list of N bool CUDA tensors.
+        chains: list of chains, each a list of surface-mask indices in order.
 
     Returns:
-        cos: (Z, Y, X) float32 — 0.5 + 0.5 * cos(pi * fractional_position)
-        grad_mag: (Z, Y, X) float32 — 1 / inter-sheet spacing
-        valid: (Z, Y, X) bool — True for voxels between first and last surfaces
+        cos, grad_mag, valid — all (Z, Y, X); cos/grad_mag are 0 outside
+        ``valid``.
     """
-    N = len(chain)
+    if not dts:
+        raise ValueError("derive_cos_gradmag_validity requires at least one surface")
     shape = dts[0].shape
     device = dts[0].device
+    N_total = len(dts)
 
-    if N < 2:
-        return (
-            torch.full(shape, 0.5, device=device),
-            torch.zeros(shape, device=device),
-            torch.zeros(shape, dtype=torch.bool, device=device),
-        )
+    cos_out = torch.zeros(shape, device=device)
+    grad_mag_out = torch.zeros(shape, device=device)
+    valid_out = torch.zeros(shape, dtype=torch.bool, device=device)
 
-    # -- Nearest surface per voxel -------------------------------------------
-    # Stack DTs for chain surfaces and find nearest
-    dt_stack = torch.stack([dts[chain[k]] for k in range(N)], dim=0)  # (N, Z, Y, X)
-    dist_nearest, nearest_k = dt_stack.min(dim=0)  # both (Z, Y, X), nearest_k is index into chain
+    if N_total == 0:
+        return cos_out, grad_mag_out, valid_out
 
-    # -- Build chain neighbor lookup -----------------------------------------
-    # For each chain position k, find prev and next chain surface indices
-    prev_chain_idx = torch.full((N,), -1, dtype=torch.long, device=device)
-    next_chain_idx = torch.full((N,), -1, dtype=torch.long, device=device)
-    for k in range(N):
-        if k > 0:
-            prev_chain_idx[k] = chain[k - 1]
-        if k < N - 1:
-            next_chain_idx[k] = chain[k + 1]
+    # Global "which surface is nearest" across ALL surfaces (any chain).
+    # This decides, for each voxel, which surface's bracketing logic applies.
+    dt_stack = torch.stack(dts, dim=0)           # (N_total, Z, Y, X)
+    _, nearest_surf = dt_stack.min(dim=0)        # (Z, Y, X) int
+    del dt_stack
 
-    # -- Chain-adjacent distances + dot-product side detection ---------------
-    dist_prev = torch.full(shape, float("inf"), device=device)
-    dist_next = torch.full(shape, float("inf"), device=device)
-    dot_prev = torch.zeros(shape, device=device)
+    # Precompute DT gradients once per surface (shared across pos iterations).
+    grads: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+    for dt in dts:
+        gz, gy, gx = torch.gradient(dt, dim=(0, 1, 2))
+        grads.append((gz, gy, gx))
 
-    for pos_in_chain in range(N):
-        cc_idx = chain[pos_in_chain]
-        is_nearest = nearest_k == pos_in_chain
-        if not is_nearest.any():
+    def _dot(i: int, j: int) -> torch.Tensor:
+        gi = grads[i]
+        gj = grads[j]
+        return gi[0] * gj[0] + gi[1] * gj[1] + gi[2] * gj[2]
+
+    for chain in chains:
+        L = len(chain)
+        if L < 2:
+            # Chain-of-one has no neighbor pair — no bracketed voxels.
             continue
+        for pos, surf_idx in enumerate(chain):
+            if surf_idx < 0 or surf_idx >= N_total:
+                continue
+            is_nearest = nearest_surf == surf_idx
+            if not is_nearest.any():
+                continue
 
-        dt_near = dts[cc_idx]
+            has_prev = pos > 0
+            has_next = pos < L - 1
+            if not has_prev and not has_next:
+                continue
 
-        # Prev: distance + dot product of DT gradients
-        if pos_in_chain > 0:
-            prev_idx = chain[pos_in_chain - 1]
-            dt_prev_cc = dts[prev_idx]
-            dist_prev[is_nearest] = dt_prev_cc[is_nearest]
+            dt_near = dts[surf_idx]
 
-            # Dot product of gradients for side detection
-            for ax in range(3):
-                gn = torch.gradient(dt_near, dim=ax)[0]
-                gp = torch.gradient(dt_prev_cc, dim=ax)[0]
-                dot_prev[is_nearest] += gn[is_nearest] * gp[is_nearest]
-                del gn, gp
+            # "Between near and neighbor X" ↔ dot(grad(near), grad(X)) < 0:
+            # the two gradients point toward each other.
+            if has_prev:
+                prev_idx = chain[pos - 1]
+                dot_prev = _dot(surf_idx, prev_idx)
+                between_prev = (dot_prev < 0) & is_nearest
+                dt_prev = dts[prev_idx]
+            else:
+                between_prev = torch.zeros(shape, dtype=torch.bool, device=device)
+                dt_prev = dt_near
+            if has_next:
+                next_idx = chain[pos + 1]
+                dot_next = _dot(surf_idx, next_idx)
+                between_next = (dot_next < 0) & is_nearest
+                dt_next = dts[next_idx]
+            else:
+                between_next = torch.zeros(shape, dtype=torch.bool, device=device)
+                dt_next = dt_near
 
-        # Next: distance only
-        if pos_in_chain < N - 1:
-            next_idx = chain[pos_in_chain + 1]
-            dist_next[is_nearest] = dts[next_idx][is_nearest]
+            # A voxel belongs to the prev side if it's bracketed by (prev, near);
+            # otherwise to the next side if bracketed by (near, next). If both,
+            # prefer prev (arbitrary but deterministic).
+            use_prev = between_prev
+            use_next = between_next & ~use_prev
+            local_valid = use_prev | use_next
+            if not local_valid.any():
+                continue
 
-    # -- Envelope mask (exterior voxels) ------------------------------------
-    dt_first = dts[chain[0]]
-    dt_last = dts[chain[-1]]
-    dot_envelope = torch.zeros(shape, device=device)
-    for ax in range(3):
-        g1 = torch.gradient(dt_first, dim=ax)[0]
-        g2 = torch.gradient(dt_last, dim=ax)[0]
-        dot_envelope += g1 * g2
-        del g1, g2
+            d_lo = torch.where(use_prev, dt_prev, dt_near)
+            d_hi = torch.where(use_prev, dt_near, dt_next)
+            spacing = d_lo + d_hi
+            frac = torch.clamp(d_lo / (spacing * 0.5 + 1e-6), 0.0, 1.0)
+            cos_full = 0.5 + 0.5 * torch.cos(math.pi * frac)
+            grad_mag_full = 1.0 / (spacing + 1e-6)
 
-    on_any_surface = torch.zeros(shape, dtype=torch.bool, device=device)
-    for k in range(N):
-        on_any_surface |= surface_masks[chain[k]]
-    outside_mask = (dot_envelope > 0) & (~on_any_surface)
+            cos_out = torch.where(local_valid, cos_full, cos_out)
+            grad_mag_out = torch.where(local_valid, grad_mag_full, grad_mag_out)
+            valid_out |= local_valid
 
-    # -- Side detection: use_prev_side = dot_prev < 0 ----------------------
-    use_prev_side = dot_prev < 0
-    # Last chain surface has no next — force prev side
-    is_nearest_last = nearest_k == (N - 1)
-    use_prev_side[is_nearest_last] = True
-    # need_prev == -1 (first surface) → dot_prev stays 0 → use_prev_side=False → next side ✓
-
-    # -- Bracketing distances -----------------------------------------------
-    d_lo = torch.where(use_prev_side, dist_prev, dist_nearest)
-    d_hi = torch.where(use_prev_side, dist_nearest, dist_next)
-    spacing = d_lo + d_hi
-
-    # -- Cos and grad_mag ---------------------------------------------------
-    # cos peaks at 1.0 on surfaces, dips to 0.0 midway
-    frac = torch.clamp(d_lo / (spacing * 0.5 + 1e-6), 0.0, 1.0)
-    cos = 0.5 + 0.5 * torch.cos(math.pi * frac)
-
-    # grad_mag = inverse inter-sheet spacing
-    grad_mag = 1.0 / (spacing + 1e-6)
-
-    # -- Validity mask -------------------------------------------------------
-    valid = ~outside_mask
-
-    return cos, grad_mag, valid
+    return cos_out, grad_mag_out, valid_out
 
 
 # ---------------------------------------------------------------------------
@@ -297,25 +265,29 @@ def compute_patch_labels(
     surface_masks: list[torch.Tensor],
     direction_channels: torch.Tensor,
     normals_valid: torch.Tensor,
+    surface_chain_info: list[dict],
     device: torch.device = None,
 ) -> dict[str, torch.Tensor]:
-    """Compute all 8 training channels + validity from surface masks and directions.
+    """Compute 8 training channels + validity using externally supplied chains.
 
-    This is the top-level function called from the training step. Inputs are
-    CUDA tensors produced by the dataset (voxelized surface masks and splatted
-    direction channels).
+    The chain ordering comes from ``tifxyz_lasagna_dataset.build_patch_chains``
+    (geometry + filename-winding compatibility) and is handed down via
+    ``surface_chain_info`` — one dict per surface_mask with
+    chain/pos/has_prev/has_next. We no longer scan EDTs to build a chain.
+
+    Validity (cos + grad_mag) is restricted to voxels that are strictly
+    between two chain-adjacent surfaces. Normals_valid (direction channels)
+    is passed through unchanged — it already only covers voxels on a surface.
 
     Args:
-        surface_masks: list of N bool tensors (Z, Y, X) — per-surface binary masks
-        direction_channels: (6, Z, Y, X) float32 — pre-splatted direction values
-        normals_valid: (Z, Y, X) bool — where direction splatting produced valid values
-        device: target device (defaults to surface_masks[0].device)
+        surface_masks: list of N bool tensors (Z, Y, X).
+        direction_channels: (6, Z, Y, X) float32 — pre-splatted direction values.
+        normals_valid: (Z, Y, X) bool — where splatting produced valid normals.
+        surface_chain_info: list of N per-mask chain dicts (aligned order).
+        device: target device (defaults to surface_masks[0].device).
 
     Returns:
-        dict with keys:
-            'targets': (8, Z, Y, X) float32 — [cos, grad_mag, dir_z(2), dir_y(2), dir_x(2)]
-            'validity': (Z, Y, X) bool — voxels where cos/grad_mag are reliable
-            'normals_valid': (Z, Y, X) bool — where directions are valid
+        dict with 'targets' (8, Z, Y, X), 'validity' (Z, Y, X), 'normals_valid'.
     """
     N = len(surface_masks)
     if device is None and N > 0:
@@ -323,16 +295,16 @@ def compute_patch_labels(
 
     shape = surface_masks[0].shape if N > 0 else (1, 1, 1)
 
-    if N < 2:
-        # Not enough surfaces — cos/grad_mag are undefined
-        targets = torch.zeros(8, *shape, device=device)
-        # Fill direction channels if available
-        if direction_channels is not None and direction_channels.numel() > 0:
-            targets[2:8] = direction_channels
+    empty_normals_valid = (
+        normals_valid if normals_valid is not None
+        else torch.zeros(shape, dtype=torch.bool, device=device)
+    )
+
+    if N == 0:
         return {
-            "targets": targets,
+            "targets": torch.zeros(8, *shape, device=device),
             "validity": torch.zeros(shape, dtype=torch.bool, device=device),
-            "normals_valid": normals_valid if normals_valid is not None else torch.zeros(shape, dtype=torch.bool, device=device),
+            "normals_valid": empty_normals_valid,
         }
 
     # EDT of complement for each surface
@@ -341,13 +313,9 @@ def compute_patch_labels(
         complement = ~mask
         dts.append(edt_torch(complement.to(torch.uint8)))
 
-    # Chain ordering
-    chain = build_surface_chain(surface_masks, dts)
+    chains = chains_from_surface_info(surface_chain_info)
+    cos, grad_mag, valid = derive_cos_gradmag_validity(dts, surface_masks, chains)
 
-    # Derive cos, grad_mag, validity
-    cos, grad_mag, valid = derive_cos_gradmag_validity(dts, surface_masks, chain)
-
-    # Assemble 8-channel targets
     targets = torch.zeros(8, *shape, device=device)
     targets[0] = cos
     targets[1] = grad_mag
@@ -357,5 +325,5 @@ def compute_patch_labels(
     return {
         "targets": targets,
         "validity": valid,
-        "normals_valid": normals_valid if normals_valid is not None else torch.zeros(shape, dtype=torch.bool, device=device),
+        "normals_valid": empty_normals_valid,
     }

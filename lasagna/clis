@@ -172,3 +172,4 @@ PYTHONPATH=$SRC/vesuvius/src/:$SRC/ python $SRC/lasagna/train_tifxyz.py --config
 
 
 PYTHONPATH=$SRC/vesuvius/src/:$SRC/lasagna/ python -m lasagna3d dataset vis --train-config $SRC/lasagna/configs/tifxyz_train_s3.json --vis-dir ./review
+

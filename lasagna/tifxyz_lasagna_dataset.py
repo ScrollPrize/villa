@@ -23,10 +23,13 @@ from vesuvius.neural_tracing.datasets.common import (
     ChunkPatch,
     OfflineCacheMiss,
     open_zarr,
+    _compute_wrap_order_stats,
+    _extract_wrap_ids,
     _parse_z_range,
     _read_volume_crop_from_patch,
     _segment_overlaps_z_range,
     _trim_to_world_bbox,
+    _triplet_wraps_compatible,
     _upsample_world_triplet,
     voxelize_surface_grid_masked,
 )
@@ -239,6 +242,117 @@ def _estimate_grid_normals(zyx_grid):
     normals = np.cross(tangent_r, tangent_c)
     norm = np.linalg.norm(normals, axis=-1, keepdims=True) + 1e-6
     return normals / norm
+
+
+# ---------------------------------------------------------------------------
+# Chain building (ports dataset_rowcol_cond._build_triplet_neighbor_lookup)
+# ---------------------------------------------------------------------------
+
+def build_patch_chains(patch, max_wraps: int) -> dict:
+    """Group a patch's wraps into ordered chains.
+
+    For each wrap in patch.wraps[:max_wraps], computes a 2D median position,
+    sorts wraps along the dominant-spread axis, and links each wrap to its
+    nearest compatible neighbor on each side. "Compatible" is same segment
+    or consecutive ``w<N>`` filename winding ids (per neural_tracing's
+    ``_triplet_wraps_compatible``). Chains are formed by walking reciprocal
+    next-links.
+
+    Returns ``{wrap_idx: {"chain": int, "pos": int, "has_prev": bool,
+    "has_next": bool, "label": str}}``.
+    """
+    wraps = patch.wraps[:max_wraps]
+    wrap_stats = []
+    for wrap_idx, wrap in enumerate(wraps):
+        s = _compute_wrap_order_stats(wrap)
+        if s is None:
+            continue
+        seg = wrap.get("segment")
+        seg_path = getattr(seg, "path", None)
+        from pathlib import Path as _P
+        seg_name = _P(seg_path).name if seg_path is not None else ""
+        wrap_ids = _extract_wrap_ids(seg_name)
+        if not wrap_ids:
+            wrap_ids = _extract_wrap_ids(getattr(seg, "uuid", ""))
+        wrap_stats.append({
+            "wrap_idx": wrap_idx,
+            "segment_idx": int(wrap["segment_idx"]),
+            "wrap_ids": wrap_ids,
+            "x_median": s["x_median"],
+            "y_median": s["y_median"],
+        })
+
+    result: dict = {}
+    if not wrap_stats:
+        return result
+
+    if len(wrap_stats) == 1:
+        wi = wrap_stats[0]["wrap_idx"]
+        result[wi] = {
+            "chain": 0, "pos": 0,
+            "has_prev": False, "has_next": False,
+            "label": "a0",
+        }
+        return result
+
+    xs = np.array([s["x_median"] for s in wrap_stats], dtype=np.float32)
+    ys = np.array([s["y_median"] for s in wrap_stats], dtype=np.float32)
+    order_axis = "x" if (xs.max() - xs.min()) >= (ys.max() - ys.min()) else "y"
+    if order_axis == "x":
+        ordered = sorted(wrap_stats, key=lambda s: (s["x_median"], s["wrap_idx"]))
+    else:
+        ordered = sorted(wrap_stats, key=lambda s: (s["y_median"], s["wrap_idx"]))
+
+    prev_of: dict = {}
+    next_of: dict = {}
+    for pos, target in enumerate(ordered):
+        for lp in range(pos - 1, -1, -1):
+            if _triplet_wraps_compatible(target, ordered[lp]):
+                prev_of[target["wrap_idx"]] = ordered[lp]["wrap_idx"]
+                break
+        for rp in range(pos + 1, len(ordered)):
+            if _triplet_wraps_compatible(target, ordered[rp]):
+                next_of[target["wrap_idx"]] = ordered[rp]["wrap_idx"]
+                break
+
+    chains: list = []
+    visited: set = set()
+    for s in ordered:
+        wi = s["wrap_idx"]
+        if wi in visited:
+            continue
+        p = prev_of.get(wi)
+        if p is not None and next_of.get(p) == wi:
+            continue
+        chain = []
+        cur = wi
+        while cur is not None and cur not in visited:
+            chain.append(cur)
+            visited.add(cur)
+            nxt = next_of.get(cur)
+            if nxt is not None and prev_of.get(nxt) == cur:
+                cur = nxt
+            else:
+                cur = None
+        chains.append(chain)
+    for s in ordered:
+        wi = s["wrap_idx"]
+        if wi in visited:
+            continue
+        chains.append([wi])
+        visited.add(wi)
+
+    for ci, chain in enumerate(chains):
+        letter = chr(ord("a") + ci) if ci < 26 else f"z{ci - 25}"
+        for pos, wi in enumerate(chain):
+            result[wi] = {
+                "chain": ci,
+                "pos": pos,
+                "has_prev": pos > 0,
+                "has_next": pos < len(chain) - 1,
+                "label": f"{letter}{pos}",
+            }
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -577,22 +691,44 @@ class TifxyzLasagnaDataset(Dataset):
             min_corner=min_corner, max_corner=max_corner,
         )
 
+        # Per-patch chain info (wrap_idx → chain/pos/has_prev/has_next)
+        chain_info_full = build_patch_chains(patch, self.max_surfaces_per_patch)
+
         # Per-surface: voxelize mask and compute direction channels
         surface_masks = []
         all_dir_points = []
         all_dir_values = []
+        kept_wrap_indices: list[int] = []
 
-        for wrap in patch.wraps[:self.max_surfaces_per_patch]:
+        for wrap_idx, wrap in enumerate(patch.wraps[:self.max_surfaces_per_patch]):
             mask, dir_pts, dir_vals = self._extract_and_voxelize_wrap(
                 patch, wrap, min_corner, crop_size,
             )
             if np.any(mask > 0):
                 surface_masks.append(mask)
+                kept_wrap_indices.append(wrap_idx)
                 if dir_pts.shape[0] > 0:
                     all_dir_points.append(dir_pts)
                     all_dir_values.append(dir_vals)
 
         num_surfaces = len(surface_masks)
+
+        # Per-retained-mask chain metadata (aligned with surface_masks ordering).
+        surface_chain_info: list[dict] = []
+        for wi in kept_wrap_indices:
+            entry = chain_info_full.get(wi)
+            if entry is None:
+                surface_chain_info.append({
+                    "chain": -1, "pos": 0,
+                    "has_prev": False, "has_next": False,
+                })
+            else:
+                surface_chain_info.append({
+                    "chain": int(entry["chain"]),
+                    "pos": int(entry["pos"]),
+                    "has_prev": bool(entry["has_prev"]),
+                    "has_next": bool(entry["has_next"]),
+                })
 
         # Stack surface masks: (N, Z, Y, X)
         if num_surfaces > 0:
@@ -631,6 +767,7 @@ class TifxyzLasagnaDataset(Dataset):
             "normals_valid": normals_valid_t,           # (1, Z, Y, X)
             "num_surfaces": num_surfaces,
             "padding_mask": padding_mask_t,             # (1, Z, Y, X)
+            "surface_chain_info": surface_chain_info,   # list[dict], len == N
             "patch_info": {
                 "segment_uuid": str(patch.wraps[0]["segment"].uuid) if patch.wraps else "",
                 "world_bbox": patch.world_bbox,
@@ -650,6 +787,7 @@ def collate_variable_surfaces(batch):
     padding_masks = torch.stack([b["padding_mask"] for b in batch])
     num_surfaces = [b["num_surfaces"] for b in batch]
     surface_masks = [b["surface_masks"] for b in batch]
+    surface_chain_info = [b["surface_chain_info"] for b in batch]
     patch_infos = [b["patch_info"] for b in batch]
 
     return {
@@ -659,5 +797,6 @@ def collate_variable_surfaces(batch):
         "normals_valid": normals_valid,         # (B, 1, Z, Y, X)
         "num_surfaces": num_surfaces,           # list of ints
         "padding_mask": padding_masks,          # (B, 1, Z, Y, X)
+        "surface_chain_info": surface_chain_info,  # list of list[dict]
         "patch_info": patch_infos,
     }

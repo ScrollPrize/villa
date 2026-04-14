@@ -100,6 +100,7 @@ def compute_batch_targets(
     """
     B = batch["image"].shape[0]
     surface_masks_list = batch["surface_masks"]  # list of (Ni, Z, Y, X)
+    surface_chain_info_batch = batch["surface_chain_info"]  # list[list[dict]]
     direction_channels = batch["direction_channels"].to(device)  # (B, 6, Z, Y, X)
     normals_valid_batch = batch["normals_valid"].to(device)  # (B, 1, Z, Y, X)
 
@@ -117,11 +118,12 @@ def compute_batch_targets(
         dir_ch = direction_channels[b]  # (6, Z, Y, X)
         nv = normals_valid_batch[b, 0] > 0.5  # (Z, Y, X)
 
-        # Compute labels on GPU
+        # Compute labels on GPU using the patch's externally-built chains.
         result = compute_patch_labels(
             surface_masks=cuda_masks,
             direction_channels=dir_ch,
             normals_valid=nv,
+            surface_chain_info=surface_chain_info_batch[b],
             device=device,
         )
 
