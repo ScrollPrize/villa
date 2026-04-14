@@ -87,7 +87,7 @@ void SegmentationEditManager::setRadius(float radiusSteps)
     if (!std::isfinite(radiusSteps)) {
         return;
     }
-    _radiusSteps = std::clamp(radiusSteps, 0.25f, 128.0f);
+    _radiusSteps = std::clamp(radiusSteps, 0.25f, 512.0f);
 }
 
 void SegmentationEditManager::setSigma(float sigmaSteps)
@@ -95,7 +95,7 @@ void SegmentationEditManager::setSigma(float sigmaSteps)
     if (!std::isfinite(sigmaSteps)) {
         return;
     }
-    _sigmaSteps = std::clamp(sigmaSteps, 0.05f, 32.0f);
+    _sigmaSteps = std::clamp(sigmaSteps, 0.05f, 256.0f);
 }
 
 void SegmentationEditManager::setEditScale(float scale)
@@ -981,13 +981,22 @@ bool SegmentationEditManager::buildActiveSamples(const std::pair<int, int>& grid
     }
 
     const float stepNorm = stepNormalization();
-    const float maxRadiusWorld = std::max(0.0f, _radiusSteps) * stepNorm;
+    // Samples beyond ~3σ pick up a Gaussian weight < 0.011, which is
+    // visually indistinguishable from zero but still costs a sample + a
+    // vertex update per iteration. Cap the effective radius to that band
+    // so a wide radius with a tight sigma doesn't silently burn work on
+    // cells that won't move.
+    const float sigmaCapSteps = std::max(0.0f, _sigmaSteps) * 3.0f;
+    const float effectiveRadiusSteps = (sigmaCapSteps > 0.0f)
+        ? std::min(std::max(0.0f, _radiusSteps), sigmaCapSteps)
+        : std::max(0.0f, _radiusSteps);
+    const float maxRadiusWorld = effectiveRadiusSteps * stepNorm;
     if (maxRadiusWorld <= 0.0f) {
         return false;
     }
     const float maxRadiusWorldSq = maxRadiusWorld * maxRadiusWorld;
 
-    const int gridExtent = std::max(1, static_cast<int>(std::ceil(_radiusSteps))) + 1;
+    const int gridExtent = std::max(1, static_cast<int>(std::ceil(effectiveRadiusSteps))) + 1;
     const int rowStart = std::max(0, centerRow - gridExtent);
     const int rowEnd = std::min(rows - 1, centerRow + gridExtent);
     const int colStart = std::max(0, centerCol - gridExtent);
