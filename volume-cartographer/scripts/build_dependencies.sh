@@ -35,6 +35,26 @@ export JOBS
 log() { printf "\n\033[1;36m==> %s\033[0m\n" "$*"; }
 
 # ---------------------------------------------------------------------------
+# Architecture / GPU detection
+#   - CUDA + cudss are only available for x86_64 with an NVIDIA GPU.
+#   - Otherwise we fall back to apt libceres-dev and disable CUDA sparse.
+# ---------------------------------------------------------------------------
+ARCH="$(uname -m)"
+USE_CUDA=0
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L 2>/dev/null | grep -q GPU; then
+  case "$ARCH" in
+    x86_64|aarch64) USE_CUDA=1 ;;
+  esac
+fi
+if [[ "${VC_FORCE_NO_CUDA:-0}" == "1" ]]; then USE_CUDA=0; fi
+case "$ARCH" in
+  x86_64)  CUDSS_DEB_ARCH=amd64; CUDSS_LIBDIR=/usr/lib/x86_64-linux-gnu ;;
+  aarch64) CUDSS_DEB_ARCH=arm64; CUDSS_LIBDIR=/usr/lib/aarch64-linux-gnu ;;
+  *)       CUDSS_DEB_ARCH=""; CUDSS_LIBDIR="" ;;
+esac
+log "Arch: $ARCH   USE_CUDA=$USE_CUDA"
+
+# ---------------------------------------------------------------------------
 # OS prerequisites (Ubuntu/Noble-like flow)
 # ---------------------------------------------------------------------------
 if [[ "$(uname -s)" != "Linux" ]]; then
@@ -50,9 +70,10 @@ sudo dpkg-reconfigure -f noninteractive tzdata
 
 sudo apt-get install -y \
   build-essential git clang llvm ccache ninja-build lld cmake pkg-config \
-  qt6-base-dev libboost-system-dev libboost-program-options-dev libceres-dev \
-  libcgal-dev \
+  qt6-base-dev libboost-system-dev libboost-program-options-dev \
+  libcgal-dev libsuitesparse-dev \
   libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev libgsl-dev libsdl2-dev \
+  libavahi-client-dev libde265-dev libx265-dev rclone nlohmann-json3-dev liblz4-dev \
   libcurl4-openssl-dev file curl unzip ca-certificates bzip2 wget fuse jq gimp \
   desktop-file-utils flex bison zlib1g-dev gfortran libopenblas-dev liblapack-dev \
   libscotch-dev libhwloc-dev libomp-dev
@@ -72,6 +93,53 @@ rm -rf "$tmpd"
 # ---------------------------------------------------------------------------
 rm -rf "$BUILD_DIR" "$INSTALL_PREFIX"
 mkdir -p "$BUILD_DIR" "$INSTALL_PREFIX"
+
+# ---------------------------------------------------------------------------
+# Optional: CUDA + cuDSS + Ceres-from-source (x86_64 w/ NVIDIA GPU only)
+# On other hosts we use the apt libceres-dev installed above.
+# ---------------------------------------------------------------------------
+CERES_PREFIX=""
+if [[ "$USE_CUDA" == "1" ]]; then
+  log "Installing CUDA toolkit + cuDSS (x86_64 GPU host)"
+  if ! command -v nvcc >/dev/null 2>&1; then
+    sudo apt-get install -y nvidia-cuda-toolkit
+  fi
+  if ! dpkg -l | grep -q '^ii  cudss'; then
+    tmpc="$(mktemp -d)"; pushd "$tmpc" >/dev/null
+    CUDSS_DEB="cudss-local-repo-ubuntu2404-0.4.0_0.4.0-1_${CUDSS_DEB_ARCH}.deb"
+    wget -q "https://developer.download.nvidia.com/compute/cudss/0.4.0/local_installers/${CUDSS_DEB}"
+    sudo dpkg -i "$CUDSS_DEB"
+    sudo cp /var/cudss-local-repo-ubuntu2404-0.4.0/cudss-*-keyring.gpg /usr/share/keyrings/
+    sudo apt-get update
+    sudo apt-get install -y cudss
+    popd >/dev/null; rm -rf "$tmpc"
+  fi
+
+  log "Building Ceres from source with CUDA sparse"
+  CERES_PREFIX="$INSTALL_PREFIX/ceres-cuda"
+  CERES_SRC="$BUILD_DIR/ceres-solver"
+  rm -rf "$CERES_SRC" "$CERES_PREFIX"
+  git clone https://github.com/ceres-solver/ceres-solver.git "$CERES_SRC"
+  pushd "$CERES_SRC" >/dev/null
+  git submodule update --init
+  mkdir build && cd build
+  cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DBUILD_SHARED_LIBS=ON \
+    -Dcudss_DIR="${CUDSS_LIBDIR}/libcudss/12/cmake/cudss" \
+    -DSUITESPARSE=ON -DEIGENSPARSE=ON \
+    -DUSE_CUDA=ON -DCUDA_SPARSE=ON -DACCELERATING_SPARSE_SCHUR=ON \
+    -DBUILD_TESTING=OFF -DBUILD_BENCHMARKS=OFF -DBUILD_EXAMPLES=OFF \
+    -DCMAKE_CXX_FLAGS="-march=native" \
+    -DCMAKE_INSTALL_PREFIX="$CERES_PREFIX"
+  cmake --build . -j"$JOBS"
+  cmake --install .
+  sudo ldconfig
+  popd >/dev/null
+else
+  log "Using distro Ceres (libceres-dev); CUDA sparse disabled"
+  sudo apt-get install -y libceres-dev
+fi
 
 # ---------------------------------------------------------------------------
 # z5 (pinned) → $INSTALL_PREFIX
@@ -112,12 +180,15 @@ sudo mkdir -p /usr/local/scotch
 rm -rf "$SCOTCH_SRC"; mkdir -p "$SCOTCH_SRC"
 tar -xzf "$LIBS_DIR/scotch_6.0.4.tar.gz" -C "$SCOTCH_SRC" --strip-components=1
 pushd "$SCOTCH_SRC/src" >/dev/null
-cp ./Make.inc/Makefile.inc.x86-64_pc_linux2 Makefile.inc
+case "$ARCH" in
+  aarch64) cp ./Make.inc/Makefile.inc.aarch64_pc_linux2 Makefile.inc 2>/dev/null \
+           || cp ./Make.inc/Makefile.inc.x86-64_pc_linux2 Makefile.inc ;;
+  *)       cp ./Make.inc/Makefile.inc.x86-64_pc_linux2 Makefile.inc ;;
+esac
 make -j"$JOBS" scotch
 sudo mkdir -p /usr/local/scotch/{bin,include,lib,share/man/man1}
-make prefix=/usr/local/scotch install || true
-# Do NOT prefer locally installed static Scotch; rely on distro shared libs
-# (libscotch-7.0.so, libscotcherr-7.0.so) to match the working Docker.
+sudo make prefix=/usr/local/scotch install
+# Don't prefer static Scotch; force link against shared libs.
 sudo find /usr/local/scotch/lib -name "libscotch*.a" -delete || true
 popd >/dev/null
 
@@ -128,9 +199,9 @@ rm -rf "$PASTIX_SRC"; mkdir -p "$PASTIX_SRC"
 tar -xjf "$LIBS_DIR/pastix_5.2.3.tar.bz2" -C "$PASTIX_SRC" --strip-components=1
 pushd "$PASTIX_SRC/src" >/dev/null
 cp "$LIBS_DIR/config.in" config.in
-# Link PaStiX against distro Scotch shared libs
-sed -i -E "s|^SCOTCH_HOME[[:space:]]*=.*$|SCOTCH_HOME = /usr|" config.in
-make SCOTCH_HOME=/usr && sudo make install SCOTCH_HOME=/usr
+# Build PaStiX against the Scotch we just built into /usr/local/scotch
+sed -i -E "s|^SCOTCH_HOME[[:space:]]*=.*$|SCOTCH_HOME = /usr/local/scotch|" config.in
+make SCOTCH_HOME=/usr/local/scotch
 sudo make install SCOTCH_HOME=/usr/local/scotch
 popd >/dev/null
 
@@ -192,17 +263,20 @@ popd >/dev/null
 # Build main project (VC3D) WITHOUT PaStiX
 # ---------------------------------------------------------------------------
 log "Configuring & building VC3D (no PaStiX)"
+VC3D_PREFIX_PATH="$INSTALL_PREFIX"
+[[ -n "$CERES_PREFIX" ]] && VC3D_PREFIX_PATH="$CERES_PREFIX;$INSTALL_PREFIX"
+rm -rf "$REPO_ROOT/build"
 mkdir -p "$REPO_ROOT/build"
 pushd "$REPO_ROOT/build" >/dev/null
 cmake .. -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-  -DCMAKE_PREFIX_PATH="$INSTALL_PREFIX" \
-  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_PREFIX_PATH="$VC3D_PREFIX_PATH" \
+  -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ \
   -DVC_WITH_PASTIX=OFF \
-  -DVC_WITH_CUDA_SPARSE=OFF
+  -DVC_WITH_CUDA_SPARSE=$([[ "$USE_CUDA" == "1" ]] && echo ON || echo OFF)
 cmake --build . -j"$JOBS"
 popd >/dev/null
-log "VC3D built successfully (without PaStiX)."
+log "VC3D built successfully."
 
 log "All done."

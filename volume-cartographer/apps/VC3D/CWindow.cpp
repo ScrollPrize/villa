@@ -1,4 +1,5 @@
 #include "CWindow.hpp"
+#include <iostream>
 #include "RamStats.hpp"
 
 #include <cstdlib>

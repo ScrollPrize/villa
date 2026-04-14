@@ -1,4 +1,5 @@
 #include "vc/core/util/Geometry.hpp"
+#include <iostream>
 #include "vc/core/util/QuadSurface.hpp"
 
 

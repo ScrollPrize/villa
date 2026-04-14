@@ -1,4 +1,5 @@
 #include <cmath>
+#include <iostream>
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vc/core/util/Slicing.hpp"
+#include <iostream>
 #include "vc/core/util/HashFunctions.hpp"
 #include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/types/Array3D.hpp"

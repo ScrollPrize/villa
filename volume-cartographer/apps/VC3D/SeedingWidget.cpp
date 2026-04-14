@@ -1,4 +1,5 @@
 #include "SeedingWidget.hpp"
+#include <iostream>
 #include "CState.hpp"
 #include <QVBoxLayout>
 #include <QHBoxLayout>

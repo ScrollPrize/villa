@@ -1,4 +1,5 @@
 #include "vc/core/util/PlaneSurface.hpp"
+#include <iostream>
 #include "vc/core/util/Geometry.hpp"
 
 #include <opencv2/calib3d.hpp>

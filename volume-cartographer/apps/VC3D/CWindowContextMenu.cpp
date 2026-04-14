@@ -1,4 +1,5 @@
 #include "CWindow.hpp"
+#include <iostream>
 #include "SurfacePanelController.hpp"
 #include "VCSettings.hpp"
 #include "SegmentationCommandHandler.hpp"

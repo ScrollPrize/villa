@@ -1,4 +1,5 @@
 #include "continuous3d.hpp"
+#include <iostream>
 
 #include "common.hpp"
 #include "vc/core/cache/BlockPipeline.hpp"

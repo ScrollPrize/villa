@@ -122,17 +122,17 @@ static void printResult(const BenchResult& r, int tileW, int tileH) {
 
 static void printCacheStats(vc::cache::BlockPipeline* cache) {
     auto s = cache->stats();
-    uint64_t total = s.hotHits + s.coldHits + s.iceFetches + s.misses;
+    uint64_t total = s.blockHits + s.coldHits + s.iceFetches + s.misses;
     if (total == 0) total = 1;
 
     auto pct = [&](uint64_t n) { return 100.0 * n / total; };
 
     printf("\n  Cache stats:\n");
-    printf("    Hot  hits:  %8llu  (%5.1f%%)\n", (unsigned long long)s.hotHits,  pct(s.hotHits));
+    printf("    Block hits: %8llu  (%5.1f%%)\n", (unsigned long long)s.blockHits, pct(s.blockHits));
     printf("    Cold hits:  %8llu  (%5.1f%%)\n", (unsigned long long)s.coldHits, pct(s.coldHits));
     printf("    Ice fetch:  %8llu  (%5.1f%%)\n", (unsigned long long)s.iceFetches, pct(s.iceFetches));
     printf("    Misses:     %8llu  (%5.1f%%)\n", (unsigned long long)s.misses,  pct(s.misses));
-    printf("    Hot bytes:  %8.1f MB\n", s.hotBytes / (1024.0 * 1024.0));
+    printf("    Disk bytes: %8.1f MB\n", s.diskBytes / (1024.0 * 1024.0));
     printf("    IO pending: %8zu\n", s.ioPending);
     printf("    Disk writes:%8llu\n", (unsigned long long)s.diskWrites);
 }
