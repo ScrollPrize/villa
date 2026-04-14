@@ -1565,6 +1565,21 @@ static void create_normals_output_zarr(
     vc::writeZarrAttributes(out_zarr, attrs);
 }
 
+static std::vector<size_t> bounded_normals_output_chunks(
+    const std::vector<size_t>& full_shape_zyx,
+    size_t cap = 64)
+{
+    if (full_shape_zyx.size() != 3) {
+        throw std::runtime_error("bounded_normals_output_chunks expects 3D ZYX shape");
+    }
+
+    return {
+        std::min(cap, full_shape_zyx[0]),
+        std::min(cap, full_shape_zyx[1]),
+        std::min(cap, full_shape_zyx[2]),
+    };
+}
+
 static void write_normals_crop_u8(
     const fs::path& out_zarr,
     const CropIndexBox3z& crop_zyx,
@@ -1575,75 +1590,12 @@ static void write_normals_crop_u8(
     auto out_dsx = open_normals_axis_dataset(out_zarr, "x");
     auto out_dsy = open_normals_axis_dataset(out_zarr, "y");
     auto out_dsz = open_normals_axis_dataset(out_zarr, "z");
+    const std::vector<size_t> crop_off(crop_zyx.off.begin(), crop_zyx.off.end());
+    const std::vector<size_t> crop_shape(crop_zyx.shape.begin(), crop_zyx.shape.end());
 
-    auto write_region_preserving_fill = [](
-        vc::VcDataset& ds,
-        const CropIndexBox3z& crop_box,
-        const std::vector<uint8_t>& src,
-        uint8_t fill_value) {
-        const auto& chunk_shape = ds.defaultChunkShape();
-        const size_t chunk_elems = chunk_shape[0] * chunk_shape[1] * chunk_shape[2];
-        std::vector<uint8_t> chunk_buf(chunk_elems, fill_value);
-
-        const size_t z0 = crop_box.off[0];
-        const size_t y0 = crop_box.off[1];
-        const size_t x0 = crop_box.off[2];
-        const size_t z1 = z0 + crop_box.shape[0];
-        const size_t y1 = y0 + crop_box.shape[1];
-        const size_t x1 = x0 + crop_box.shape[2];
-
-        const size_t chunk_z0 = z0 / chunk_shape[0];
-        const size_t chunk_y0 = y0 / chunk_shape[1];
-        const size_t chunk_x0 = x0 / chunk_shape[2];
-        const size_t chunk_z1 = (z1 - 1) / chunk_shape[0];
-        const size_t chunk_y1 = (y1 - 1) / chunk_shape[1];
-        const size_t chunk_x1 = (x1 - 1) / chunk_shape[2];
-
-        for (size_t cz = chunk_z0; cz <= chunk_z1; ++cz) {
-            for (size_t cy = chunk_y0; cy <= chunk_y1; ++cy) {
-                for (size_t cx = chunk_x0; cx <= chunk_x1; ++cx) {
-                    ds.readChunkOrFill(cz, cy, cx, chunk_buf.data());
-
-                    const size_t chunk_base_z = cz * chunk_shape[0];
-                    const size_t chunk_base_y = cy * chunk_shape[1];
-                    const size_t chunk_base_x = cx * chunk_shape[2];
-
-                    const size_t copy_z0 = std::max(z0, chunk_base_z);
-                    const size_t copy_y0 = std::max(y0, chunk_base_y);
-                    const size_t copy_x0 = std::max(x0, chunk_base_x);
-                    const size_t copy_z1 = std::min(z1, chunk_base_z + chunk_shape[0]);
-                    const size_t copy_y1 = std::min(y1, chunk_base_y + chunk_shape[1]);
-                    const size_t copy_x1 = std::min(x1, chunk_base_x + chunk_shape[2]);
-
-                    for (size_t z = copy_z0; z < copy_z1; ++z) {
-                        const size_t src_z = z - z0;
-                        const size_t dst_z = z - chunk_base_z;
-                        for (size_t y = copy_y0; y < copy_y1; ++y) {
-                            const size_t src_y = y - y0;
-                            const size_t dst_y = y - chunk_base_y;
-                            const size_t src_offset =
-                                (src_z * crop_box.shape[1] + src_y) * crop_box.shape[2] +
-                                (copy_x0 - x0);
-                            const size_t dst_offset =
-                                (dst_z * chunk_shape[1] + dst_y) * chunk_shape[2] +
-                                (copy_x0 - chunk_base_x);
-                            const size_t copy_len = copy_x1 - copy_x0;
-                            std::memcpy(
-                                chunk_buf.data() + dst_offset,
-                                src.data() + src_offset,
-                                copy_len * sizeof(uint8_t));
-                        }
-                    }
-
-                    ds.writeChunk(cz, cy, cx, chunk_buf.data(), chunk_buf.size() * sizeof(uint8_t));
-                }
-            }
-        }
-    };
-
-    write_region_preserving_fill(*out_dsx, crop_zyx, ax, 128);
-    write_region_preserving_fill(*out_dsy, crop_zyx, ay, 128);
-    write_region_preserving_fill(*out_dsz, crop_zyx, az, 128);
+    writeZarrRegionU8ByChunk(out_dsx.get(), crop_off, crop_shape, ax.data(), 128);
+    writeZarrRegionU8ByChunk(out_dsy.get(), crop_off, crop_shape, ay.data(), 128);
+    writeZarrRegionU8ByChunk(out_dsz.get(), crop_off, crop_shape, az.data(), 128);
 }
 
 static void run_align_normals_zarr(
@@ -2019,7 +1971,13 @@ static void run_align_normals_zarr(
     metrics["align_seconds"] = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - align_start).count();
     const auto write_start = std::chrono::steady_clock::now();
-    create_normals_output_zarr(out_zarr, normals.layout, crop_zyx);
+    NormalsZarrLayout output_layout = normals.layout;
+    output_layout.chunkShapeZyx = bounded_normals_output_chunks(output_layout.fullShapeZyx);
+    for (const char* axis : {"x", "y", "z"}) {
+        std::error_code ec;
+        fs::remove_all(out_zarr / axis, ec);
+    }
+    create_normals_output_zarr(out_zarr, output_layout, crop_zyx);
     write_normals_crop_u8(out_zarr, crop_zyx, ax, ay, az);
 
     nlohmann::json attrs = vc::readZarrAttributes(out_zarr);

@@ -1,6 +1,7 @@
 #include "test.hpp"
 
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
@@ -40,6 +41,15 @@ private:
     fs::path path_;
 };
 
+struct NormalVoxel {
+    int z = 0;
+    int y = 0;
+    int x = 0;
+    uint8_t nx = 128;
+    uint8_t ny = 128;
+    uint8_t nz = 128;
+};
+
 void writeJson(const fs::path& path, const nlohmann::json& json)
 {
     std::ofstream out(path);
@@ -77,13 +87,17 @@ void createInputVolume(const fs::path& root)
     ds->writeRegion({0, 0, 0}, {64, 64, 64}, volume.data());
 }
 
-void createChunkedNormalsInput(const fs::path& root)
+void createNormalsInput(
+    const fs::path& root,
+    const std::array<size_t, 3>& shape,
+    const std::array<size_t, 3>& chunks,
+    const std::vector<NormalVoxel>& voxels)
 {
-    const std::vector<size_t> shape = {80, 80, 80};
-    const std::vector<size_t> chunks = {64, 64, 64};
-    auto dsx = vc::createZarrDataset(root / "x", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/", 128);
-    auto dsy = vc::createZarrDataset(root / "y", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/", 128);
-    auto dsz = vc::createZarrDataset(root / "z", "0", shape, chunks, vc::VcDtype::uint8, "blosc", "/", 128);
+    const std::vector<size_t> shape_vec = {shape[0], shape[1], shape[2]};
+    const std::vector<size_t> chunk_vec = {chunks[0], chunks[1], chunks[2]};
+    auto dsx = vc::createZarrDataset(root / "x", "0", shape_vec, chunk_vec, vc::VcDtype::uint8, "blosc", "/", 128);
+    auto dsy = vc::createZarrDataset(root / "y", "0", shape_vec, chunk_vec, vc::VcDtype::uint8, "blosc", "/", 128);
+    auto dsz = vc::createZarrDataset(root / "z", "0", shape_vec, chunk_vec, vc::VcDtype::uint8, "blosc", "/", 128);
 
     std::vector<uint8_t> x(shape[0] * shape[1] * shape[2], 128);
     std::vector<uint8_t> y(shape[0] * shape[1] * shape[2], 128);
@@ -92,23 +106,39 @@ void createChunkedNormalsInput(const fs::path& root)
         return static_cast<size_t>((zz * static_cast<int>(shape[1]) + yy) * static_cast<int>(shape[2]) + xx);
     };
 
-    for (int zz = 7; zz < 9; ++zz) {
-        for (int yy = 8; yy < 10; ++yy) {
-            for (int xx = 9; xx < 11; ++xx) {
-                x[idx(zz, yy, xx)] = 255;
-                y[idx(zz, yy, xx)] = 128;
-                z[idx(zz, yy, xx)] = 128;
-            }
-        }
+    for (const auto& voxel : voxels) {
+        x[idx(voxel.z, voxel.y, voxel.x)] = voxel.nx;
+        y[idx(voxel.z, voxel.y, voxel.x)] = voxel.ny;
+        z[idx(voxel.z, voxel.y, voxel.x)] = voxel.nz;
     }
 
-    dsx->writeRegion({0, 0, 0}, shape, x.data());
-    dsy->writeRegion({0, 0, 0}, shape, y.data());
-    dsz->writeRegion({0, 0, 0}, shape, z.data());
+    dsx->writeRegion({0, 0, 0}, shape_vec, x.data());
+    dsy->writeRegion({0, 0, 0}, shape_vec, y.data());
+    dsz->writeRegion({0, 0, 0}, shape_vec, z.data());
     vc::writeZarrAttributes(root, {
         {"grid_origin_xyz", {0, 0, 0}},
         {"sample_step", 1},
     });
+}
+
+void createChunkedNormalsInput(const fs::path& root)
+{
+    std::vector<NormalVoxel> voxels;
+    for (int zz = 7; zz < 9; ++zz) {
+        for (int yy = 8; yy < 10; ++yy) {
+            for (int xx = 9; xx < 11; ++xx) {
+                voxels.push_back(NormalVoxel{
+                    .z = zz,
+                    .y = yy,
+                    .x = xx,
+                    .nx = 255,
+                    .ny = 128,
+                    .nz = 128,
+                });
+            }
+        }
+    }
+    createNormalsInput(root, {80, 80, 80}, {64, 64, 64}, voxels);
 }
 
 std::string quote(const fs::path& path)
@@ -153,6 +183,11 @@ uint8_t readVoxel(const fs::path& path, size_t z, size_t y, size_t x)
     uint8_t value = 0;
     ds.readRegion({z, y, x}, {1, 1, 1}, &value);
     return value;
+}
+
+nlohmann::json readJsonFile(const fs::path& path)
+{
+    return nlohmann::json::parse(std::ifstream(path));
 }
 
 } // namespace
@@ -233,4 +268,69 @@ TEST(NGridsSmoke, AlignCropPreservesFillOutsidePartialChunks)
     EXPECT_EQ(readVoxel(outputRoot / "z" / "0", 0, 0, 0), static_cast<uint8_t>(128));
 
     EXPECT_NE(readVoxel(outputRoot / "x" / "0", 7, 8, 9), static_cast<uint8_t>(128));
+}
+
+TEST(NGridsSmoke, AlignRerunReplacesPreviousCropData)
+{
+    ScopedTempDir tempDir;
+    const auto inputRoot = tempDir.path() / "normals_input.zarr";
+    const auto outputRoot = tempDir.path() / "aligned_output.zarr";
+
+    createNormalsInput(
+        inputRoot,
+        {80, 80, 80},
+        {64, 64, 64},
+        {
+            NormalVoxel{.z = 7, .y = 8, .x = 9, .nx = 255, .ny = 128, .nz = 128},
+            NormalVoxel{.z = 7, .y = 8, .x = 20, .nx = 255, .ny = 128, .nz = 128},
+        });
+
+    std::string align_first_cmd = std::string("OMP_NUM_THREADS=1 ")
+        + VC_NGRIDS_BIN
+        + " -i " + quote(inputRoot)
+        + " --align-normals"
+        + " --crop 9 8 7 10 9 8"
+        + " --output-zarr " + quote(outputRoot);
+    std::string align_second_cmd = std::string("OMP_NUM_THREADS=1 ")
+        + VC_NGRIDS_BIN
+        + " -i " + quote(inputRoot)
+        + " --align-normals"
+        + " --crop 20 8 7 21 9 8"
+        + " --output-zarr " + quote(outputRoot);
+
+    ASSERT_EQ(std::system(align_first_cmd.c_str()), 0);
+    EXPECT_NE(readVoxel(outputRoot / "x" / "0", 7, 8, 9), static_cast<uint8_t>(128));
+
+    ASSERT_EQ(std::system(align_second_cmd.c_str()), 0);
+    EXPECT_EQ(readVoxel(outputRoot / "x" / "0", 7, 8, 9), static_cast<uint8_t>(128));
+    EXPECT_NE(readVoxel(outputRoot / "x" / "0", 7, 8, 20), static_cast<uint8_t>(128));
+}
+
+TEST(NGridsSmoke, AlignOutputChunksAreCapped)
+{
+    ScopedTempDir tempDir;
+    const auto inputRoot = tempDir.path() / "normals_input.zarr";
+    const auto outputRoot = tempDir.path() / "aligned_output.zarr";
+
+    createNormalsInput(
+        inputRoot,
+        {80, 80, 80},
+        {80, 80, 80},
+        {
+            NormalVoxel{.z = 7, .y = 8, .x = 9, .nx = 255, .ny = 128, .nz = 128},
+        });
+
+    std::string align_cmd = std::string("OMP_NUM_THREADS=1 ")
+        + VC_NGRIDS_BIN
+        + " -i " + quote(inputRoot)
+        + " --align-normals"
+        + " --crop 9 8 7 10 9 8"
+        + " --output-zarr " + quote(outputRoot);
+    ASSERT_EQ(std::system(align_cmd.c_str()), 0);
+
+    const auto zarray = readJsonFile(outputRoot / "x" / "0" / ".zarray");
+    ASSERT_TRUE(zarray.contains("chunks"));
+    ASSERT_EQ(zarray["chunks"][0].get<int>(), 64);
+    ASSERT_EQ(zarray["chunks"][1].get<int>(), 64);
+    ASSERT_EQ(zarray["chunks"][2].get<int>(), 64);
 }
