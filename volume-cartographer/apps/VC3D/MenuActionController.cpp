@@ -702,7 +702,7 @@ bool MenuActionController::tryResolveRemoteAuth(const QString& url,
 QString MenuActionController::remoteCacheDirectory() const
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    QString defaultCache = QDir::homePath() + "/.VC3D/remote_cache";
+    QString defaultCache = vc3d::defaultCacheBase() + "/remote_cache";
     QString cacheDir = settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR, defaultCache).toString();
     QDir().mkpath(cacheDir);
     return cacheDir;

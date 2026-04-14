@@ -1,14 +1,33 @@
 #pragma once
 
 #include <QDir>
+#include <QFileInfo>
 #include <QString>
 
 namespace vc3d {
 
+// Prefer /ephemeral/VC3D when the host has local NVMe instance storage
+// mounted there (see scripts/build_dependencies.sh); fall back to ~/.VC3D.
+// Cached on first call because filesystem state doesn't change during a run.
+inline QString defaultCacheBase()
+{
+    static const QString base = []() {
+        const QString eph = QStringLiteral("/ephemeral");
+        QFileInfo fi(eph);
+        if (fi.isDir() && fi.isWritable()) {
+            QString p = eph + "/VC3D";
+            QDir().mkpath(p);
+            return p;
+        }
+        return QDir::homePath() + "/.VC3D";
+    }();
+    return base;
+}
+
 inline QString settingsFilePath()
 {
-    const QString homeDir = QDir::homePath();
-    const QString configDir = homeDir + "/.VC3D";
+    // Settings must stay in the user's home — /ephemeral is lost on stop.
+    const QString configDir = QDir::homePath() + "/.VC3D";
     QDir dir;
     if (!dir.exists(configDir)) {
         dir.mkpath(configDir);
@@ -116,7 +135,8 @@ namespace viewer {
 
     // Remote volume chunk cache directory
     constexpr auto REMOTE_CACHE_DIR = "viewer/remote_cache_dir";
-    // Default: ~/.VC3D/remote_cache (resolved at runtime via QDir::homePath())
+    // Default: vc3d::defaultCacheBase() + "/remote_cache" — uses /ephemeral
+    // when mounted, else ~/.VC3D.
 
     // Recent remote volume URLs
     constexpr auto REMOTE_RECENT_URLS = "viewer/remote_recent_urls";

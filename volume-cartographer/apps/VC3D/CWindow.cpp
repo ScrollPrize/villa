@@ -4373,9 +4373,9 @@ void CWindow::OpenVolume(const QString& path)
                 auto reply = QMessageBox::question(
                     this, tr("Network Volume Detected"),
                     tr("This volume package is on a network filesystem (%1).\n\n"
-                       "Local disk caching is enabled automatically (~/.VC3D/network_cache/).\n"
+                       "Local disk caching is enabled automatically (%2/network_cache/).\n"
                        "Would you like to choose a custom cache directory instead?")
-                        .arg(QString::fromStdString(label)),
+                        .arg(QString::fromStdString(label), vc3d::defaultCacheBase()),
                     QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
 
                 if (reply == QMessageBox::Yes) {
@@ -4383,7 +4383,7 @@ void CWindow::OpenVolume(const QString& path)
                     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
                     QString lastDir = settings.value(viewer::NETWORK_CACHE_DIR).toString();
                     if (lastDir.isEmpty()) {
-                        lastDir = QDir::homePath() + "/.VC3D/network_cache";
+                        lastDir = vc3d::defaultCacheBase() + "/network_cache";
                     }
 
                     QString cacheDir = QFileDialog::getExistingDirectory(

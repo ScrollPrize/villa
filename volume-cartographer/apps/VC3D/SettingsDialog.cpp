@@ -61,7 +61,7 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     spinRamCacheSizeGB->setValue(settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toInt());
     spinDiskCacheSizeGB->setValue(settings.value(perf::DISK_CACHE_SIZE_GB, perf::DISK_CACHE_SIZE_GB_DEFAULT).toInt());
     {
-        QString defaultCache = QDir::homePath() + "/.VC3D/remote_cache";
+        QString defaultCache = vc3d::defaultCacheBase() + "/remote_cache";
         edtRemoteCachePath->setText(settings.value(viewer::REMOTE_CACHE_DIR, defaultCache).toString());
     }
 
