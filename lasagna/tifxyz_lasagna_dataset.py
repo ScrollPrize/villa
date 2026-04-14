@@ -757,10 +757,12 @@ class TifxyzLasagnaDataset(Dataset):
         # Per-retained-mask chain metadata (aligned with surface_masks ordering).
         surface_chain_info: list[dict] = []
         for wi in kept_wrap_indices:
+            seg_idx = int(patch.wraps[wi]["segment_idx"])
             entry = chain_info_full.get(wi)
             if entry is None:
                 surface_chain_info.append({
                     "wrap_idx": wi,
+                    "segment_idx": seg_idx,
                     "chain": -1, "pos": 0,
                     "has_prev": False, "has_next": False,
                     "label": "?",
@@ -768,6 +770,7 @@ class TifxyzLasagnaDataset(Dataset):
             else:
                 surface_chain_info.append({
                     "wrap_idx": wi,
+                    "segment_idx": seg_idx,
                     "chain": int(entry["chain"]),
                     "pos": int(entry["pos"]),
                     "has_prev": bool(entry["has_prev"]),

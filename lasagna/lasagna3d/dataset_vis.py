@@ -78,6 +78,19 @@ def _surface_color(sample_seed: int, surface_idx: int) -> str:
     rng.shuffle(palette)
     return palette[surface_idx % len(palette)]
 
+
+def _color_slot(chain_info_list, si: int) -> int:
+    """Pick the palette slot for surface ``si``.
+
+    When `compute_patch_labels` merged duplicate wraps, `_render_sample_figure`
+    stamps a ``color_slot`` key onto each per-surface entry pointing at
+    the group representative. This helper falls back to ``si`` when the
+    key is missing (unmerged path).
+    """
+    if 0 <= si < len(chain_info_list):
+        return int(chain_info_list[si].get("color_slot", si))
+    return si
+
 # Matches ScaleSpaceLoss3D default num_scales in train_tifxyz.py
 _NUM_SCALES = 3
 _ARROW_LEN_PX = 18.0
@@ -523,7 +536,7 @@ def _compute_inference_output(batch, training_output, model_path, device,
         return None
 
 
-def _compute_training_output(batch: dict):
+def _compute_training_output(batch: dict, same_surface_threshold: float | None = None):
     """Run ``compute_batch_targets`` on one batch and package numpy arrays.
 
     Returns ``None`` if CUDA is unavailable or the call fails, in which
@@ -539,9 +552,11 @@ def _compute_training_output(batch: dict):
 
     device = torch.device("cuda")
     try:
-        targets, validity, normals_valid, _dir_weight = compute_batch_targets(
-            batch, device,
-        )
+        targets, validity, normals_valid, _dir_weight, merge_groups_batch = \
+            compute_batch_targets(
+                batch, device,
+                same_surface_threshold=same_surface_threshold,
+            )
     except Exception as exc:
         print(f"{TAG} WARNING: compute_batch_targets failed ({exc})", flush=True)
         return None
@@ -561,6 +576,7 @@ def _compute_training_output(batch: dict):
         "validity": validity[0, 0].detach().cpu().numpy(),    # (Z, Y, X)
         "normals_valid": normals_valid[0, 0].detach().cpu().numpy(),
         "validity_pyramid": pyramid_upsampled,                # list of (Z, Y, X)
+        "merge_groups": list(merge_groups_batch[0]) if merge_groups_batch else [],
     }
 
 
@@ -575,7 +591,7 @@ def _draw_contours_and_labels(ax, mask_slices: list, chain_info_list: list,
             continue
         info = chain_info_list[si]
         complete = bool(info.get("has_prev", False)) and bool(info.get("has_next", False))
-        color = _surface_color(sample_seed, si)
+        color = _surface_color(sample_seed, _color_slot(chain_info_list, si))
         for contour in measure.find_contours(mslice.astype(np.float32), 0.5):
             ax.plot(contour[:, 1], contour[:, 0],
                     color=color, linewidth=0.9, alpha=0.9)
@@ -631,7 +647,7 @@ def _draw_normal_arrows(ax, surface_geometry, chain_info_list,
         u = u / mag
         v = v / mag
 
-        color = _brighten(_surface_color(sample_seed, si))
+        color = _brighten(_surface_color(sample_seed, _color_slot(chain_info_list, si)))
         ax.quiver(
             pts[:, hcol], pts[:, vcol],
             u * _ARROW_LEN_PX, v * _ARROW_LEN_PX,
@@ -717,7 +733,8 @@ def _draw_grid_fused_arrows(ax, nx_vol, ny_vol, nz_vol, valid_3d,
 
 def _draw_surface_axis_arrows(ax, dir_channels, surface_geometry,
                               plane: str, plane_coord: int,
-                              sample_seed: int):
+                              sample_seed: int,
+                              chain_info_list: list | None = None):
     """For each surface in `surface_geometry`, sample axis-decoded
     direction at the surface points and draw per-surface-colored arrows
     on the named plane.
@@ -749,7 +766,8 @@ def _draw_surface_axis_arrows(ax, dir_channels, surface_geometry,
         d0v = dir_channels[c0_idx, zi, yi, xi]
         d1v = dir_channels[c1_idx, zi, yi, xi]
         h, v = _decode_dir_pair(d0v, d1v)
-        color = _brighten(_surface_color(sample_seed, si))
+        slot = _color_slot(chain_info_list, si) if chain_info_list else si
+        color = _brighten(_surface_color(sample_seed, slot))
         ax.quiver(
             h_pos, v_pos, h * _ARROW_LEN_PX, v * _ARROW_LEN_PX,
             angles="xy", scale_units="xy", scale=1.0,
@@ -759,7 +777,8 @@ def _draw_surface_axis_arrows(ax, dir_channels, surface_geometry,
 
 def _draw_surface_fused_arrows(ax, nx_vol, ny_vol, nz_vol, surface_geometry,
                                plane: str, plane_coord: int,
-                               sample_seed: int):
+                               sample_seed: int,
+                               chain_info_list: list | None = None):
     """For each surface in `surface_geometry`, sample the FUSED 3D normal
     at the surface points and draw the in-plane projection.
     """
@@ -794,7 +813,8 @@ def _draw_surface_fused_arrows(ax, nx_vol, ny_vol, nz_vol, surface_geometry,
         mag = np.sqrt(h * h + v * v) + 1e-8
         h = h / mag
         v = v / mag
-        color = _brighten(_surface_color(sample_seed, si))
+        slot = _color_slot(chain_info_list, si) if chain_info_list else si
+        color = _brighten(_surface_color(sample_seed, slot))
         ax.quiver(
             h_pos, v_pos, h * _ARROW_LEN_PX, v * _ARROW_LEN_PX,
             angles="xy", scale_units="xy", scale=1.0,
@@ -859,6 +879,32 @@ def _render_sample_figure(
     surface_masks = sample["surface_masks"].numpy()      # (N, Z, Y, X)
     chain_info = sample["surface_chain_info"]            # list[dict]
     surface_geometry = sample.get("surface_geometry", [])  # list[dict]
+
+    # When compute_patch_labels merged duplicate wraps, stamp each
+    # entry with a shared `color_slot` and the group's label so all
+    # per-surface drawers render merged wraps with identical color
+    # and label while still iterating every original wrap.
+    merge_groups = None
+    if training_output is not None:
+        mg = training_output.get("merge_groups") or []
+        if len(mg) == len(chain_info):
+            merge_groups = list(mg)
+    if merge_groups is not None:
+        first_by_group: dict[int, int] = {}
+        for si, g in enumerate(merge_groups):
+            first_by_group.setdefault(int(g), si)
+        rewritten = []
+        for si, entry in enumerate(chain_info):
+            rep = first_by_group[int(merge_groups[si])]
+            new_entry = dict(chain_info[rep])  # inherit rep's label/chain/pos
+            new_entry["color_slot"] = int(rep)
+            rewritten.append(new_entry)
+        chain_info = rewritten
+    else:
+        for si, entry in enumerate(chain_info):
+            if "color_slot" not in entry:
+                # Non-mutating: drawers fall back to si when key is missing.
+                pass
     direction_channels_full = sample.get("direction_channels")
     if direction_channels_full is not None:
         direction_channels_full = direction_channels_full.numpy()  # (6,Z,Y,X)
@@ -1191,6 +1237,7 @@ def _render_sample_figure(
                         _draw_surface_axis_arrows(
                             ax, dc, surface_geometry,
                             plane_keys[col], plane_coords[col], arrow_seed,
+                            chain_info_list=chain_info,
                         )
                         ax.set_title(
                             f"{gname}  {plane_names[col]}", fontsize=9)
@@ -1215,6 +1262,7 @@ def _render_sample_figure(
                             _draw_surface_fused_arrows(
                                 ax, nx, ny, nz, surface_geometry,
                                 plane_keys[col], plane_coords[col], arrow_seed,
+                                chain_info_list=chain_info,
                             )
                             ax.set_title(
                                 f"{gname}  {plane_names[col]}", fontsize=9)
@@ -1410,6 +1458,7 @@ def build_inference_context(
     config: dict,
     patch_size: int | None = None,
     inference_tile_size: int | None = None,
+    same_surface_threshold: float | None = None,
 ) -> dict:
     """Load checkpoint meta and derive all knobs `_compute_inference_output`
     needs. Returns a dict that's also safe when ``model_path is None``
@@ -1427,6 +1476,22 @@ def build_inference_context(
     compare_size = min(dataset_patch, inference_size_eff)
     vis_size = dataset_patch
 
+    # Resolution: explicit arg > training config field > None.
+    resolved_same_surface_threshold: float | None
+    if same_surface_threshold is not None:
+        resolved_same_surface_threshold = float(same_surface_threshold)
+    else:
+        cfg_thr = config.get("same_surface_threshold")
+        resolved_same_surface_threshold = (
+            float(cfg_thr) if cfg_thr is not None else None
+        )
+    if resolved_same_surface_threshold is not None:
+        print(
+            f"{TAG} same_surface_threshold={resolved_same_surface_threshold} — "
+            "vis will show merged duplicate wraps",
+            flush=True,
+        )
+
     ctx = {
         "model_path": model_path,
         "dataset_patch": dataset_patch,
@@ -1436,6 +1501,7 @@ def build_inference_context(
         "model_build_patch_size": None,
         "output_sigmoid": True,
         "loss_weights": (1.0, 1.0, 1.0),
+        "same_surface_threshold": resolved_same_surface_threshold,
     }
 
     if model_path is None:
@@ -1488,7 +1554,10 @@ def render_batch_figure(
     batch, so alternate commands render an identical figure.
     """
     sample = _sample_from_batch(batch)
-    training_output = _compute_training_output(batch)
+    training_output = _compute_training_output(
+        batch,
+        same_surface_threshold=inference_ctx.get("same_surface_threshold"),
+    )
 
     inference_output = None
     if inference_ctx.get("model_path") is not None:
@@ -1519,6 +1588,7 @@ def run_dataset_vis(
     model_path: str | None = None,
     inference_tile_size: int | None = None,
     explicit_indices: list[int] | None = None,
+    same_surface_threshold: float | None = None,
 ) -> None:
     """Render visualization JPEGs for samples from each dataset.
 
@@ -1549,6 +1619,7 @@ def run_dataset_vis(
         config=config,
         patch_size=patch_size,
         inference_tile_size=inference_tile_size,
+        same_surface_threshold=same_surface_threshold,
     )
 
     out_dir = Path(vis_dir)
