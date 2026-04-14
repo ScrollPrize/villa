@@ -2,6 +2,7 @@
 #include "VCSettings.hpp"
 
 #include <algorithm>
+#include <thread>
 #include <QSettings>
 
 #include "vc/core/util/PlaneSurface.hpp"
@@ -96,11 +97,12 @@ void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
         vol->setCacheBudget(_cacheSizeBytes);
         vol->setDiskCacheMaxBytes(_diskCacheSizeBytes);
 
-        using namespace vc3d::settings;
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-
-        int ioThreads = settings.value(perf::IO_THREADS, perf::IO_THREADS_DEFAULT).toInt();
-        vol->setIOThreads(std::clamp(ioThreads, 1, 100));
+        // One IO thread per hardware thread. Each IOPool worker does
+        // fetch + decode + block split, all CPU-bound work that scales
+        // with core count.
+        unsigned hw = std::thread::hardware_concurrency();
+        if (hw == 0) hw = 8;
+        vol->setIOThreads(static_cast<int>(hw));
     }
 }
 

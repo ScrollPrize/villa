@@ -172,9 +172,8 @@ namespace perf {
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
     constexpr int DISK_CACHE_SIZE_GB_DEFAULT = 100;
 
-    // Number of background IO (download) threads
-    constexpr auto IO_THREADS = "perf/io_threads";
-    constexpr int IO_THREADS_DEFAULT = 8;
+    // IO thread count is not configurable — it tracks
+    // std::thread::hardware_concurrency() at runtime.
 
 }
 

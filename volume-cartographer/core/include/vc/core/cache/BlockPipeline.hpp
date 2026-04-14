@@ -33,7 +33,8 @@ public:
     struct Config {
         size_t bytes = 10ULL << 30;  // 10 GiB
         std::string volumeId;
-        int ioThreads = 8;
+        // Defaults to hardware_concurrency(); see constructor.
+        int ioThreads = 0;
     };
 
     BlockPipeline(

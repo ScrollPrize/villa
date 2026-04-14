@@ -101,7 +101,10 @@ BlockPipeline::BlockPipeline(
     , diskLevels_(std::move(diskLevels))
     , source_(std::move(source))
     , decompress_(std::move(decompress))
-    , ioPool_(config_.ioThreads)
+    , ioPool_(config_.ioThreads > 0
+                  ? config_.ioThreads
+                  : (std::thread::hardware_concurrency() ?
+                     static_cast<int>(std::thread::hardware_concurrency()) : 8))
     , blockCache_([&] {
         // Reserve a small residency floor per pyramid level so a coarse
         // fallback image is always available even under heavy fine-level
