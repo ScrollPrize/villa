@@ -233,7 +233,8 @@ def _scale_space_residual_sum(pred, target, mask, num_scales: int, kind: str):
     return total
 
 
-def _compute_inference_output(batch, training_output, model_path, device):
+def _compute_inference_output(batch, training_output, model_path, device,
+                              model_build_patch_size: int):
     """Run the model, compute losses (same path as training), and produce
     per-channel diff maps (full-res masked residual + scale-space sum).
     Returns ``None`` if CUDA / model load fail.
@@ -247,11 +248,13 @@ def _compute_inference_output(batch, training_output, model_path, device):
 
     try:
         image = batch["image"].to(device, non_blocking=True)
-        # patch_size is resolved up in `run_dataset_vis` from the
-        # checkpoint metadata and used to override the dataset config,
-        # so image.shape[-1] is now guaranteed to match.
-        patch_size = int(image.shape[-1])
-        model = _load_model(model_path, patch_size, device)
+        # The model is built once at the checkpoint's training patch
+        # size (so NetworkFromConfig autoconfigures the right number
+        # of stages), but the inference pass below runs on whatever
+        # cubic patch the dataset emits — 3D UNets are size-agnostic
+        # at forward time as long as the side is divisible by the
+        # encoder strides.
+        model = _load_model(model_path, model_build_patch_size, device)
 
         targets_np = training_output["targets"]
         validity_np = training_output["validity"]
@@ -261,9 +264,13 @@ def _compute_inference_output(batch, training_output, model_path, device):
         normals_valid_t = torch.from_numpy(normals_valid_np).view(
             1, 1, *normals_valid_np.shape).to(device)
 
-        with torch.no_grad():
+        # Match training: bf16 autocast halves the activation memory
+        # so inference fits in the same budget as the training step.
+        with torch.no_grad(), torch.amp.autocast(
+            device_type=device.type, dtype=torch.bfloat16, enabled=True,
+        ):
             results = model(image)
-            pred = torch.sigmoid(results["output"])
+            pred = torch.sigmoid(results["output"]).float()
 
         cos_mask = validity_t
         dir_mask = (normals_valid_t > 0.5).float()
@@ -676,22 +683,16 @@ def run_dataset_vis(
     # size), so we MUST run the dataset at the same patch size the
     # checkpoint was trained on. Read the checkpoint metadata up front
     # and override config["patch_size"] before the dataset is built.
+    model_build_patch_size: int | None = None
     if model_path is not None:
         meta = _read_checkpoint_meta(model_path, patch_size_override=patch_size)
-        ckpt_patch = int(meta["patch_size"])
-        prev_patch = config.get("patch_size")
-        if prev_patch is not None and int(prev_patch) != ckpt_patch:
-            print(
-                f"{TAG} checkpoint patch_size={ckpt_patch} — overriding "
-                f"dataset patch_size {prev_patch}",
-                flush=True,
-            )
-        else:
-            print(
-                f"{TAG} checkpoint patch_size={ckpt_patch}",
-                flush=True,
-            )
-        config["patch_size"] = ckpt_patch
+        model_build_patch_size = int(meta["patch_size"])
+        infer_patch = config.get("patch_size")
+        print(
+            f"{TAG} model built at patch_size={model_build_patch_size}, "
+            f"inference at dataset patch_size={infer_patch}",
+            flush=True,
+        )
 
     out_dir = Path(vis_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -764,6 +765,7 @@ def run_dataset_vis(
                     device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
                     inference_output = _compute_inference_output(
                         batch, training_output, model_path, device,
+                        model_build_patch_size,
                     )
 
                 n_wraps = int(sample["num_surfaces"])
