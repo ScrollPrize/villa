@@ -108,13 +108,15 @@ def write_metadata(s3, bucket: str, prefix: str, binary: str,
 
 def run_worker(binary: str, input_url: str, output_url: str,
                level: int, sz: int, sy: int, sx: int,
-               qp: int, air_clamp: int, shift_n: int, inner_jobs: int) -> tuple[int, int, int, int, int]:
+               qp: int, air_clamp: int, shift_n: int,
+               inner_jobs: int, encode_jobs: int) -> tuple[int, int, int, int, int]:
     """Launch one worker, wait for it, return exit code + shard coords."""
     cmd = [binary, input_url, output_url,
            "--qp", str(qp),
            "--air-clamp", str(air_clamp),
            "--bit-shift", str(shift_n),
            "--inner-jobs", str(inner_jobs),
+           "--encode-jobs", str(encode_jobs),
            "--one-shard", f"{level}/{sz}/{sy}/{sx}"]
     # stdout to /dev/null: workers are numerous and chatty
     proc = subprocess.run(cmd, stdout=subprocess.DEVNULL,
@@ -136,6 +138,10 @@ def main():
                     help="Number of worker processes in parallel")
     ap.add_argument("--inner-jobs", type=int, default=64,
                     help="Per-worker --inner-jobs (chunk fan-out)")
+    ap.add_argument("--encode-jobs", type=int, default=8,
+                    help="Per-worker encode thread pool size (default 8 = "
+                         "small since the coordinator already parallelises "
+                         "across many worker processes)")
     ap.add_argument("--skip-metadata", action="store_true",
                     help="Skip the metadata-write phase (assume already done)")
     args = ap.parse_args()
@@ -185,7 +191,7 @@ def main():
                 pool.submit(run_worker, args.binary, args.input, args.output,
                             level, sz, sy, sx,
                             args.qp, args.air_clamp, args.bit_shift,
-                            args.inner_jobs): (sz, sy, sx)
+                            args.inner_jobs, args.encode_jobs): (sz, sy, sx)
                 for (sz, sy, sx) in todo
             }
             for fut in futures.as_completed(futs):

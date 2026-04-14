@@ -682,6 +682,7 @@ int main(int argc, char** argv) {
     int rank = 0;              // this VM's index in the fanout (0..world-1)
     int world = 1;             // total VM count for horizontal scaling
     std::string one_shard_arg; // "L/sz/sy/sx" — process exactly one shard + exit
+    int encode_jobs = 0;       // 0 = 2*hw_concurrency (default)
 
     for (int i = 3; i < argc; i++) {
         std::string arg = argv[i];
@@ -697,6 +698,7 @@ int main(int argc, char** argv) {
         else if (arg == "--rank" && i + 1 < argc) rank = std::atoi(argv[++i]);
         else if (arg == "--world" && i + 1 < argc) world = std::atoi(argv[++i]);
         else if (arg == "--one-shard" && i + 1 < argc) one_shard_arg = argv[++i];
+        else if (arg == "--encode-jobs" && i + 1 < argc) encode_jobs = std::atoi(argv[++i]);
     }
     if (stats_pct < 0) stats_pct = 0;
     if (stats_pct > 100) stats_pct = 100;
@@ -1302,7 +1304,8 @@ int main(int argc, char** argv) {
         // so we don't need a 1:1 thread-to-core ratio. The extra encode threads
         // hide x265 internal sync stalls and let CPU saturate.
         const int n_enc = std::max(1,
-            (int)std::thread::hardware_concurrency() * 2);
+            encode_jobs > 0 ? encode_jobs
+                            : (int)std::thread::hardware_concurrency() * 2);
         std::vector<std::thread> dl_threads;
         dl_threads.reserve(n_dl);
         for (int i = 0; i < n_dl; i++) dl_threads.emplace_back(dl_fn);
