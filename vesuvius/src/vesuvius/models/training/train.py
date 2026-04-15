@@ -1908,6 +1908,7 @@ class BaseTrainer:
             scaler.step(optimizer)
             scaler.update()
             optimizer_stepped = True
+            self._update_ema_model(model)
             if should_time_optimizer:
                 self._record_startup_timing("first_optimizer_step", perf_counter() - step_stage_start)
                 self._first_optimizer_timing_recorded = True

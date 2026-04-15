@@ -1340,6 +1340,8 @@ class NetworkFromConfig(nn.Module):
             "targets": self.targets,
             "target_z_projection": self.task_z_projection_cfg,
             "separate_decoders": len(tasks_using_separate) > 0,
+            "pool_op_kernel_sizes": [list(v) for v in self.shared_encoder.strides[1:]],
+            "strides": [list(v) for v in self.shared_encoder.strides],
             "enable_deep_supervision": ds_enabled,
         }
 

@@ -907,6 +907,66 @@ def test_direct_segmentation_rejects_unsupported_loss_name(tmp_path: Path):
         trainer._compute_train_loss(outputs, targets_dict, loss_fns)
 
 
+def test_train_step_updates_ema_after_optimizer_step(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="direct_segmentation",
+        guide_loss_weight=0.0,
+        losses=[{"name": "BCEWithLogitsLoss", "weight": 1.0}],
+    )
+    mgr.ema_config = {
+        "enabled": True,
+        "decay": 0.9,
+        "start_step": 1,
+        "update_every_steps": 1,
+        "validate": True,
+    }
+    mgr.gradient_accumulation = 1
+    mgr.optimizer = "AdamW"
+    mgr.initial_lr = 1e-3
+    mgr.weight_decay = 0.0
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model().to(trainer.device)
+    optimizer = trainer._get_optimizer(model)
+    scaler = torch.amp.GradScaler("cpu", enabled=True)
+    trainer._initialize_ema_model(model)
+
+    dataset = trainer._configure_dataset(is_training=True)
+    batch = next(iter(DataLoader(dataset, batch_size=1, shuffle=False)))
+    batch = {key: value.to(trainer.device) if torch.is_tensor(value) else value for key, value in batch.items()}
+    ema_before = {
+        name: tensor.detach().clone()
+        for name, tensor in trainer.ema_model.state_dict().items()
+        if torch.is_floating_point(tensor)
+    }
+
+    total_loss, *_rest, optimizer_stepped = trainer._train_step(
+        model,
+        batch,
+        trainer._build_loss(),
+        use_amp=False,
+        autocast_ctx=torch.autocast(device_type="cpu", enabled=False),
+        epoch=0,
+        step=0,
+        scaler=scaler,
+        optimizer=optimizer,
+        num_iters=1,
+        grad_accumulate_n=1,
+    )
+
+    assert torch.isfinite(total_loss)
+    assert optimizer_stepped is True
+    ema_after = trainer.ema_model.state_dict()
+    assert any(
+        not torch.allclose(ema_before[name], ema_after[name])
+        for name in ema_before
+    )
+
+
 def test_prepare_metrics_for_logging_includes_guide_loss_entries():
     mgr = _make_mgr(Path("/tmp/guide_backbone.pt"), Path("/tmp/guide_backbone.pt"))
     trainer = BaseTrainer(mgr=mgr, verbose=False)
