@@ -509,11 +509,22 @@ class Inferer():
             raise RuntimeError(
                 f"Dataset for part {self.part_id}/{self.num_parts} is empty (based on calculated coordinates in '{expected_attr_name}'). Check input data and partitioning.")
 
+        # Let the dataset decide whether to expose a filtered view (e.g. a Subset
+        # over non-empty patches when the input zarr's chunk occupancy has been
+        # pre-indexed). len(loader_dataset) drives tqdm and the written-count
+        # assertion below, so progress/ETA reflect only patches the model actually sees.
+        loader_dataset = self.dataset.active_view()
+        self.num_active_patches = len(loader_dataset)
         if self.verbose:
-            print(f"Total patches to process for part {self.part_id}: {self.num_total_patches}")
+            if self.num_active_patches != self.num_total_patches:
+                print(
+                    f"Pre-filtered to {self.num_active_patches} of {self.num_total_patches} patches "
+                    f"({100.0 * self.num_active_patches / self.num_total_patches:.1f}%)"
+                )
+            print(f"Total patches to process for part {self.part_id}: {self.num_active_patches}")
 
         self.dataloader = DataLoader(
-            self.dataset,
+            loader_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_dataloader_workers,
@@ -701,7 +712,7 @@ class Inferer():
         def to_device(tensor):
             return tensor.to(self.device, non_blocking=(self.device.type == 'cuda'))
 
-        with tqdm(total=self.num_total_patches, desc=f"Inferring Part {self.part_id}", **get_tqdm_kwargs()) as pbar:
+        with tqdm(total=self.num_active_patches, desc=f"Inferring Part {self.part_id}", **get_tqdm_kwargs()) as pbar:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = []
                 
@@ -792,8 +803,8 @@ class Inferer():
         if self.verbose:
             print(f"Finished writing {self.current_patch_write_index} patches.")
         
-        if self.current_patch_write_index != self.num_total_patches:
-            print(f"Warning: Expected {self.num_total_patches} patches, but wrote {self.current_patch_write_index}.")
+        if self.current_patch_write_index != self.num_active_patches:
+            print(f"Warning: Expected {self.num_active_patches} patches, but wrote {self.current_patch_write_index}.")
 
     def _finalize_output_batch(self, output_batch):
         if output_batch.dtype != torch.float16:

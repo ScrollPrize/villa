@@ -15,6 +15,7 @@ from vesuvius.data.volume import Volume
 from vesuvius.utils import list_files, is_aws_ec2_instance
 # Import get_max_value from data.utils to avoid import errors
 from vesuvius.data.utils import get_max_value, open_zarr
+from vesuvius.data.zarr_chunk_index import build_chunk_occupancy, compute_patch_non_empty_mask
 
 class VCDataset(Dataset):
     def __init__(
@@ -84,6 +85,7 @@ class VCDataset(Dataset):
         self.return_as_tensor = True # Dataset __getitem__ always returns tensors
         self.skip_empty_patches = skip_empty_patches
         self.empty_patches_skipped = 0  # Counter for skipped patches
+        self.non_empty_mask = None  # Per-patch bool mask; populated below for infer mode with zarr input
 
         # Data partitioning parameters
         if num_parts < 1:
@@ -313,6 +315,94 @@ class VCDataset(Dataset):
                          print(f"  Part {self.part_id} Z-range of positions: [{self.all_positions[0][0]} - {self.all_positions[-1][0]}]")
                     else:
                          print(f"  Warning: No patch starting positions found in the Z-range [{z_start}, {z_end}) for part {self.part_id}.")
+
+            # Build per-patch non-empty mask from the input zarr's chunk occupancy.
+            # This lets us drop patches that fall entirely in empty regions of a sparse
+            # input without ever touching the underlying data; fallback to None leaves
+            # today's lazy min/max-based detection untouched.
+            self.non_empty_mask = self._build_non_empty_mask_from_chunks(use_path)
+
+
+    def _build_non_empty_mask_from_chunks(self, use_path):
+        if not self.skip_empty_patches or not self.all_positions:
+            return None
+        if use_path is None:
+            return None
+
+        try:
+            import zarr as _zarr
+        except ImportError:
+            return None
+
+        array_obj = getattr(self.volume, 'data', None)
+        if array_obj is None:
+            return None
+
+        if isinstance(array_obj, _zarr.Array):
+            array_url = use_path.rstrip('/')
+            array_chunks = tuple(array_obj.chunks)
+            array_shape = tuple(array_obj.shape)
+        elif isinstance(array_obj, _zarr.hierarchy.Group):
+            first_key = None
+            for key in array_obj.keys():
+                if isinstance(array_obj[key], _zarr.Array):
+                    first_key = key
+                    break
+            if first_key is None:
+                return None
+            sub = array_obj[first_key]
+            array_url = use_path.rstrip('/') + '/' + first_key
+            array_chunks = tuple(sub.chunks)
+            array_shape = tuple(sub.shape)
+        else:
+            return None
+
+        occupancy = build_chunk_occupancy(
+            array_url,
+            chunks=array_chunks,
+            shape=array_shape,
+            verbose=self.verbose,
+        )
+        if occupancy is None:
+            return None
+
+        # Drop channel axis for 4D shapes to get spatial chunk sizes.
+        if len(array_chunks) == 4:
+            chunks_spatial = array_chunks[1:]
+        else:
+            chunks_spatial = array_chunks
+
+        mask = compute_patch_non_empty_mask(
+            occupancy,
+            self.all_positions,
+            tuple(self.patch_size),
+            chunks_spatial,
+        )
+
+        if self.verbose:
+            n = int(len(mask))
+            k = int(mask.sum())
+            print(f"  Pre-filtered {n - k} of {n} patches as empty via chunk index ({k} remain)")
+
+        return mask
+
+
+    def active_view(self):
+        """Return the dataset view the DataLoader should iterate.
+
+        If the input zarr's chunk occupancy let us pre-filter empty patches,
+        this returns a `torch.utils.data.Subset` over the non-empty indices
+        (so `len(...)` reflects only patches that will actually run through
+        the model, and tqdm totals/ETAs become honest). Otherwise returns
+        `self`. `Subset[i]` forwards to `self[original_idx]`, so the patch
+        index carried through `__getitem__` and used as the zarr write index
+        is unchanged.
+        """
+        mask = getattr(self, 'non_empty_mask', None)
+        if mask is None or len(mask) != len(self.all_positions):
+            return self
+        indices = np.flatnonzero(mask).tolist()
+        return torch.utils.data.Subset(self, indices)
 
 
     def set_distributed(self, rank: int, world_size: int):
