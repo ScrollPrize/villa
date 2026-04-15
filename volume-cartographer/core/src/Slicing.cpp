@@ -781,10 +781,14 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
             const int xEnd = std::min(tx + kTile, w);
         for (int y = ty; y < yEnd; y++) {
             uint32_t* outRow = outBuf + size_t(y) * size_t(outStride);
+            // Row-base pointer hoisted out of the per-pixel loop. cv::Mat_()
+            // operator() recomputes the row offset on every call — cheap
+            // individually but it's on the per-pixel hot path.
+            const cv::Vec3f* crow = coords ? coords->ptr<cv::Vec3f>(y) : nullptr;
             for (int x = tx; x < xEnd; x++) {
                 cv::Vec3f c;
-                if (coords) c = (*coords)(y, x);
-                else        c = *origin + *vx_step * float(x) + *vy_step * float(y);
+                if (crow) c = crow[x];
+                else      c = *origin + *vx_step * float(x) + *vy_step * float(y);
 
                 uint8_t pix = 0;
                 // Surfaces report NaN or (0,0,0) for undefined pixels —

@@ -10,6 +10,7 @@
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>
 
+#include <array>
 #include <iostream>
 #include <system_error>
 #include <cmath>
@@ -684,9 +685,13 @@ static float search_min_loc(const cv::Mat_<E> &points, cv::Vec2f &loc, cv::Vec3f
     float best = sdist(val, tgt);
     float res;
 
-    //TODO check maybe add more search patterns, compare motion estimation for video compression, x265, ...
-    std::vector<cv::Vec2f> search = {{0,-1},{0,1},{-1,-1},{-1,0},{-1,1},{1,-1},{1,0},{1,1}};
-    // std::vector<cv::Vec2f> search = {{0,-1},{0,1},{-1,0},{1,0}};
+    // 8-neighbor search offsets: hold in a static constexpr-ish array
+    // instead of allocating a fresh vector per call. pointTo() calls
+    // this up to ~10*max_iters times per navigation click.
+    static const std::array<cv::Vec2f, 8> search = {
+        cv::Vec2f{0,-1}, cv::Vec2f{0,1},
+        cv::Vec2f{-1,-1}, cv::Vec2f{-1,0}, cv::Vec2f{-1,1},
+        cv::Vec2f{1,-1},  cv::Vec2f{1,0},  cv::Vec2f{1,1}};
     cv::Vec2f step = init_step;
 
     while (changed) {

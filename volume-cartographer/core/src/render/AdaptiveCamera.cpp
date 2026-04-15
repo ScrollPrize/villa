@@ -31,7 +31,17 @@ void AdaptiveCamera::recalcPyramidLevel(int numScales) noexcept
         dsScaleIdx = std::min(dsScaleIdx, numScales - 1);
     }
 
-    dsScale = std::pow(2.0f, -dsScaleIdx);
+    // std::pow is called per frame; for the handful of integer dsScaleIdx
+    // values we see in practice (0..~12) a tiny LUT is exact and free.
+    static constexpr float kInvPow2[] = {
+        1.0f, 1.0f/2, 1.0f/4, 1.0f/8, 1.0f/16, 1.0f/32, 1.0f/64,
+        1.0f/128, 1.0f/256, 1.0f/512, 1.0f/1024, 1.0f/2048, 1.0f/4096,
+        1.0f/8192, 1.0f/16384, 1.0f/32768,
+    };
+    constexpr int kTableSize = int(sizeof(kInvPow2) / sizeof(kInvPow2[0]));
+    dsScale = (dsScaleIdx >= 0 && dsScaleIdx < kTableSize)
+        ? kInvPow2[dsScaleIdx]
+        : std::pow(2.0f, -dsScaleIdx);
 }
 
 // Predefined zoom stops where TILE_PX/scale is a "nice" number, eliminating

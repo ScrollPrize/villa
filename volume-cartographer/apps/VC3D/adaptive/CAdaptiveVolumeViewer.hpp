@@ -4,6 +4,7 @@
 #include <QPointF>
 #include <QImage>
 
+#include <array>
 #include <chrono>
 #include <memory>
 #include <map>
@@ -309,6 +310,10 @@ private:
     cv::Ptr<cv::CLAHE> _claheCache;
     int _claheCacheTile = -1;
     double _claheCacheClip = -1.0;
+    cv::Mat _rakingGx, _rakingGy;
+    std::array<uint32_t, 256> _deferredCmapLut{};
+    std::string _deferredCmapId;
+    bool _deferredCmapValid = false;
 
 public:
     // Re-reads perf/interaction settings from disk into cached members.

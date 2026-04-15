@@ -621,9 +621,18 @@ void CAdaptiveVolumeViewer::submitRender()
             // Treat gray as a heightfield. Scharr gives a screen-space
             // gradient; compose a surface normal (depth scales vertical
             // slope vs. unit-height image plane) and Lambert-shade it.
-            cv::Mat gx, gy;
-            cv::Scharr(gray, gx, CV_32F, 1, 0, 1.0 / 32.0);
-            cv::Scharr(gray, gy, CV_32F, 0, 1, 1.0 / 32.0);
+            // Reuse cached gx/gy cv::Mat allocations across frames — Scharr
+            // used to alloc+free two CV_32F matrices of full fb size every
+            // frame raking was active.
+            if (_rakingGx.rows != fbH || _rakingGx.cols != fbW
+                || _rakingGx.type() != CV_32F) {
+                _rakingGx.create(fbH, fbW, CV_32F);
+                _rakingGy.create(fbH, fbW, CV_32F);
+            }
+            cv::Scharr(gray, _rakingGx, CV_32F, 1, 0, 1.0 / 32.0);
+            cv::Scharr(gray, _rakingGy, CV_32F, 0, 1, 1.0 / 32.0);
+            cv::Mat& gx = _rakingGx;
+            cv::Mat& gy = _rakingGy;
             const float azRad = rakingAz * float(M_PI) / 180.0f;
             const float elRad = rakingEl * float(M_PI) / 180.0f;
             const float ce = std::cos(elRad);
@@ -657,8 +666,15 @@ void CAdaptiveVolumeViewer::submitRender()
 
         if (deferColormap) {
             // Identity window/level (gray is already windowed) + user colormap.
-            std::array<uint32_t, 256> cmapLut;
-            vc::buildWindowLevelColormapLut(cmapLut, 0.0f, 255.0f, _baseColormapId);
+            // Cache the built LUT: the identity-window LUT depends only on
+            // _baseColormapId, so we rebuild only when the colormap actually
+            // changes instead of once per frame.
+            if (!_deferredCmapValid || _deferredCmapId != _baseColormapId) {
+                vc::buildWindowLevelColormapLut(_deferredCmapLut, 0.0f, 255.0f, _baseColormapId);
+                _deferredCmapId = _baseColormapId;
+                _deferredCmapValid = true;
+            }
+            const auto& cmapLut = _deferredCmapLut;
             for (int y = 0; y < fbH; y++) {
                 uint32_t* row = fbBits + size_t(y) * size_t(fbStride);
                 const uint8_t* src = gray.ptr<uint8_t>(y);
