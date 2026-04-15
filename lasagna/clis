@@ -184,3 +184,5 @@ PYTHONPATH=$SRC/vesuvius/src/:$SRC/lasagna/ python $SRC/lasagna/train_tifxyz.py 
 
 PYTHONPATH=$SRC/vesuvius/src/:$SRC/lasagna/ python $SRC/lasagna/train_tifxyz.py --config $SRC/lasagna/configs/tifxyz_train_s3.json --run-name tifxyz_s3_cont_n --patch-size 192 --weights ../train3d/runs_srv/unet3d/20260325_011010_3d/model_current.pt --w-cos 1.0 --w-mag 100.0 --w-dir 100.0 --num-workers 4 --batch-size 1 --model-patc
 h-size 320 --lr 1e-5 --w-smooth 100.0
+
+CUDA_VISIBLE_DEVICES=6,7 PYTHONPATH=$SRC/vesuvius/src/:$SRC/lasagna/ torchrun --nproc_per_node=2 --rdzv-backend=c10d   --rdzv-endpoint=127.0.0.1:29527 $SRC/lasagna/train_tifxyz.py --config $SRC/lasagna/configs/tifxyz_train_s3_srv.json --run-name normals_scratch --patch-size 192 --w-cos 1.0 --w-mag 100.0 --w-dir 100.0 --num-workers 8 --batch-size 4 --model-patch-size 320 --lr 8e-5 --w-smooth 100.0 --weights /home/ubuntu/hendrik/20260325_011010_3d/model_current.pt
