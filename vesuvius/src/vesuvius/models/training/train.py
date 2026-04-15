@@ -1085,6 +1085,13 @@ class BaseTrainer:
 
     def _get_deep_supervision_scales(self, model):
         cfg = getattr(model, 'final_config', {})
+        architecture_type = str(cfg.get('architecture_type', '') or '').lower()
+        if architecture_type.startswith('mednext'):
+            strides = cfg.get('strides', None)
+            if strides is None:
+                return None
+            arr = np.vstack(strides).astype(np.float32)
+            return list(list(i) for i in 1 / arr)
         pool_kernels = cfg.get('pool_op_kernel_sizes', None)
         if pool_kernels is None:
             return None
