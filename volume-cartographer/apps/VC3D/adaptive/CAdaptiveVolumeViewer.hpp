@@ -4,6 +4,7 @@
 #include <QPointF>
 #include <QImage>
 
+#include <chrono>
 #include <memory>
 #include <map>
 #include <set>
@@ -13,6 +14,7 @@
 #include <unordered_map>
 
 #include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
 #include <QFutureWatcher>
 #include <QPainterPath>
 
@@ -303,6 +305,10 @@ private:
     vc::Sampling _samplingMethod = vc::Sampling::Trilinear;
     bool _highlightDownscaled = false;
     QString _lastStatusText;
+    std::chrono::steady_clock::time_point _lastStretchScan{};
+    cv::Ptr<cv::CLAHE> _claheCache;
+    int _claheCacheTile = -1;
+    double _claheCacheClip = -1.0;
 
 public:
     // Re-reads perf/interaction settings from disk into cached members.

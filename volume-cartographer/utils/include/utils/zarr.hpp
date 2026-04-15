@@ -1219,8 +1219,9 @@ public:
                          static_cast<std::streamsize>(index_size));
         }
 
-        // Lock to prevent concurrent shard writes from corrupting the file
-        std::lock_guard lock(*shard_write_mutex_);
+        // Lock to prevent concurrent writes tearing this shard file.
+        // Striped so writers to different shards run concurrently.
+        std::lock_guard lock(shard_mutex_for(p));
 
         // Open for random read/write
         std::fstream f(p, std::ios::binary | std::ios::in | std::ios::out);
@@ -1343,7 +1344,7 @@ public:
                          static_cast<std::streamsize>(index_size));
         }
 
-        std::lock_guard lock(*shard_write_mutex_);
+        std::lock_guard lock(shard_mutex_for(p));
         std::fstream f(p, std::ios::binary | std::ios::in | std::ios::out);
         if (!f) return;
 
@@ -1375,7 +1376,7 @@ public:
             index[i * 2 + 1] = sentinel_nbytes;
         }
 
-        std::lock_guard lock(*shard_write_mutex_);
+        std::lock_guard lock(shard_mutex_for(p));
         std::ofstream f(p, std::ios::binary | std::ios::trunc);
         if (!f) return;
         f.write(reinterpret_cast<const char*>(index.data()),
@@ -1502,11 +1503,11 @@ public:
             stride *= meta_.sub_chunks_per_shard(d);
         }
 
-        // Lock to prevent reading while another thread is writing
-        std::lock_guard lock(*shard_write_mutex_);
-
         auto key = chunk_key(shard_idx);
         auto p = root_ / key;
+        // Lock to prevent reading while another thread is writing the
+        // same shard (striped — reads against other shards don't block).
+        std::lock_guard lock(shard_mutex_for(p));
         std::ifstream f(p, std::ios::binary);
         if (!f) return std::nullopt;
 
@@ -1541,9 +1542,9 @@ public:
             auto ips = meta_.sub_chunks_per_shard(d);
             shard_idx[d] = chunk_indices[d] / ips;
         }
-        std::lock_guard lock(*shard_write_mutex_);
         auto key = chunk_key(shard_idx);
         auto p = root_ / key;
+        std::lock_guard lock(shard_mutex_for(p));
         std::ifstream f(p, std::ios::binary | std::ios::ate);
         if (!f) return std::nullopt;
         auto size = static_cast<std::streamsize>(f.tellg());
@@ -1569,8 +1570,20 @@ public:
     Codec codec_;
     CodecRegistry registry_;
 
-    // Per-shard mutex for concurrent write safety
-    mutable std::shared_ptr<std::mutex> shard_write_mutex_ = std::make_shared<std::mutex>();
+    // Striped mutexes for concurrent write safety. A single global mutex
+    // serialized all writers across the entire array — with the parallel
+    // pipeline writing to many shards at once this was the dominant
+    // write-path bottleneck. 64 stripes gives us essentially free
+    // concurrency across independent shards while still protecting a
+    // single shard from being torn by two writers.
+    static constexpr std::size_t kShardMutexStripes = 64;
+    mutable std::shared_ptr<std::array<std::mutex, kShardMutexStripes>>
+        shard_write_mutexes_ = std::make_shared<std::array<std::mutex, kShardMutexStripes>>();
+
+    [[nodiscard]] std::mutex& shard_mutex_for(const std::filesystem::path& p) const {
+        std::size_t h = std::hash<std::string>{}(p.native());
+        return (*shard_write_mutexes_)[h % kShardMutexStripes];
+    }
 };
 
 // ---------------------------------------------------------------------------

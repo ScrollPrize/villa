@@ -538,14 +538,26 @@ void CAdaptiveVolumeViewer::submitRender()
     //     the background by sampling the framebuffer so the stretch
     //     tracks drifting scene content.
     if (stretch) {
-        int lo = 255, hi = 0;
-        for (int y = 0; y < fbH; y++) {
-            const uint32_t* row = fbBits + size_t(y) * size_t(fbStride);
-            for (int x = 0; x < fbW; x++) {
-                int v = int(row[x] & 0xFFu);
-                if (v < lo) lo = v;
-                if (v > hi) hi = v;
+        // Scanning w*h pixels for min/max every frame is wasteful during
+        // pans where content drifts only slowly. On the first pass we
+        // always scan (the 2-pass LUT rebuild depends on it); otherwise
+        // throttle to ~every 150 ms so the stretch still tracks drifting
+        // content without blocking every frame.
+        int lo = _cachedStretchLo, hi = _cachedStretchHi;
+        const auto now = std::chrono::steady_clock::now();
+        const bool doScan = stretchFirstPass
+            || (now - _lastStretchScan) > std::chrono::milliseconds(150);
+        if (doScan) {
+            lo = 255; hi = 0;
+            for (int y = 0; y < fbH; y++) {
+                const uint32_t* row = fbBits + size_t(y) * size_t(fbStride);
+                for (int x = 0; x < fbW; x++) {
+                    int v = int(row[x] & 0xFFu);
+                    if (v < lo) lo = v;
+                    if (v > hi) hi = v;
+                }
             }
+            _lastStretchScan = now;
         }
         if (stretchFirstPass) {
             // One-time 2-pass: re-LUT the identity output we just rendered.
@@ -590,8 +602,15 @@ void CAdaptiveVolumeViewer::submitRender()
         if (_compositeSettings.postClaheEnabled) {
             const int tile = std::max(1, _compositeSettings.postClaheTileSize);
             const double clip = std::max(0.01, double(_compositeSettings.postClaheClipLimit));
-            auto clahe = cv::createCLAHE(clip, cv::Size(tile, tile));
-            clahe->apply(gray, gray);
+            // Cache the CLAHE instance: it allocates internal histogram
+            // buffers on construction. Rebuild only when the parameters
+            // actually change.
+            if (!_claheCache || tile != _claheCacheTile || clip != _claheCacheClip) {
+                _claheCache = cv::createCLAHE(clip, cv::Size(tile, tile));
+                _claheCacheTile = tile;
+                _claheCacheClip = clip;
+            }
+            _claheCache->apply(gray, gray);
         }
         if (rakingEnabled) {
             // Treat gray as a heightfield. Scharr gives a screen-space
