@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <optional>
 #include <random>
 #include <limits>
@@ -40,6 +41,14 @@ struct MmappedData {
 
 class GridStore::GridStoreImpl {
 public:
+    struct QueryBucketRange {
+        int startX = 0;
+        int endX = -1;
+        int startY = 0;
+        int endY = -1;
+        bool empty = true;
+    };
+
     struct SegCacheEntry {
         std::shared_ptr<LineSegList> seglist;
         size_t decoded_bytes = 0;
@@ -79,44 +88,104 @@ public:
         }
     }
 
-    std::vector<std::shared_ptr<std::vector<cv::Point>>> get(const cv::Rect& query_rect) const {
-        std::vector<std::shared_ptr<std::vector<cv::Point>>> result;
+    QueryBucketRange queryBucketRange(const cv::Rect& query_rect) const {
+        QueryBucketRange range;
+        if (grid_size_.width <= 0 || grid_size_.height <= 0) {
+            return range;
+        }
+
         cv::Rect clamped_rect = query_rect & bounds_;
+        if (clamped_rect.width <= 0 || clamped_rect.height <= 0) {
+            return range;
+        }
 
         cv::Point start = (clamped_rect.tl() - bounds_.tl()) / cell_size_;
         cv::Point end = (clamped_rect.br() - bounds_.tl()) / cell_size_;
+        start.x = std::clamp(start.x, 0, grid_size_.width - 1);
+        start.y = std::clamp(start.y, 0, grid_size_.height - 1);
+        end.x = std::clamp(end.x, 0, grid_size_.width - 1);
+        end.y = std::clamp(end.y, 0, grid_size_.height - 1);
+        if (start.x > end.x || start.y > end.y) {
+            return range;
+        }
+
+        range.startX = start.x;
+        range.endX = end.x;
+        range.startY = start.y;
+        range.endY = end.y;
+        range.empty = false;
+        return range;
+    }
+
+    void collect_query_results(const cv::Rect& query_rect, GridStore::QueryScratch& scratch) const {
+        scratch.ids.clear();
+        scratch.results.clear();
+        const QueryBucketRange range = queryBucketRange(query_rect);
+        if (range.empty) {
+            return;
+        }
 
         if (read_only_) {
-            std::unordered_set<size_t> offsets;
-            for (int y = start.y; y <= end.y; ++y) {
-                for (int x = start.x; x <= end.x; ++x) {
+            for (int y = range.startY; y <= range.endY; ++y) {
+                for (int x = range.startX; x <= range.endX; ++x) {
                     int index = y * grid_size_.width + x;
                     auto bucket_ptr = get_bucket_offsets(index);
                     if (bucket_ptr && !bucket_ptr->empty()) {
-                        offsets.insert(bucket_ptr->begin(), bucket_ptr->end());
+                        scratch.ids.insert(
+                            scratch.ids.end(),
+                            bucket_ptr->begin(),
+                            bucket_ptr->end());
                     }
                 }
             }
-            result.reserve(offsets.size());
-            for (size_t offset : offsets) {
-                result.push_back(get_points_from_offset(offset));
+            std::sort(scratch.ids.begin(), scratch.ids.end());
+            scratch.ids.erase(
+                std::unique(scratch.ids.begin(), scratch.ids.end()),
+                scratch.ids.end());
+
+            scratch.results.reserve(scratch.ids.size());
+            for (size_t offset : scratch.ids) {
+                scratch.results.push_back(get_points_from_offset(offset));
             }
         } else {
-            std::unordered_set<int> handles;
-            for (int y = start.y; y <= end.y; ++y) {
-                for (int x = start.x; x <= end.x; ++x) {
+            for (int y = range.startY; y <= range.endY; ++y) {
+                for (int x = range.startX; x <= range.endX; ++x) {
                     int index = y * grid_size_.width + x;
                     if (index >= 0 && index < grid_.size()) {
-                        handles.insert(grid_[index].begin(), grid_[index].end());
+                        scratch.ids.insert(
+                            scratch.ids.end(),
+                            grid_[index].begin(),
+                            grid_[index].end());
                     }
                 }
             }
-            result.reserve(handles.size());
-            for (int handle : handles) {
-                result.push_back(storage_[handle]->get());
+            std::sort(scratch.ids.begin(), scratch.ids.end());
+            scratch.ids.erase(
+                std::unique(scratch.ids.begin(), scratch.ids.end()),
+                scratch.ids.end());
+
+            scratch.results.reserve(scratch.ids.size());
+            for (size_t handle : scratch.ids) {
+                scratch.results.push_back(storage_[static_cast<size_t>(handle)]->get());
             }
         }
-        return result;
+    }
+
+    std::vector<std::shared_ptr<std::vector<cv::Point>>> get(const cv::Rect& query_rect) const {
+        GridStore::QueryScratch scratch;
+        collect_query_results(query_rect, scratch);
+        return std::move(scratch.results);
+    }
+
+    void forEach(
+        const cv::Rect& query_rect,
+        GridStore::QueryScratch& scratch,
+        const std::function<void(const std::shared_ptr<std::vector<cv::Point>>&)>& visitor) const
+    {
+        collect_query_results(query_rect, scratch);
+        for (const auto& path : scratch.results) {
+            visitor(path);
+        }
     }
 
     std::vector<std::shared_ptr<std::vector<cv::Point>>> get_all() const {
@@ -769,6 +838,14 @@ std::vector<std::shared_ptr<std::vector<cv::Point>>> GridStore::get(const cv::Po
     int y = static_cast<int>(center.y - radius);
     int size = static_cast<int>(radius * 2);
     return get(cv::Rect(x, y, size, size));
+}
+
+void GridStore::forEach(
+    const cv::Rect& query_rect,
+    QueryScratch& scratch,
+    const std::function<void(const std::shared_ptr<std::vector<cv::Point>>&)>& visitor) const
+{
+    pimpl_->forEach(query_rect, scratch, visitor);
 }
 
 std::vector<std::shared_ptr<std::vector<cv::Point>>> GridStore::get_all() const {
