@@ -213,6 +213,13 @@ private:
     // Split a decoded chunk into 16^3 blocks and insert into blockCache_.
     void insertChunkAsBlocks(const ChunkKey& key, const ChunkData& chunk);
 
+    // All-zero canonical chunks: record their key instead of materialising
+    // 512 identical zero blocks in the arena. blockAt() returns a pointer
+    // to a single static zero-block when the block's canonical chunk is
+    // in this set.
+    mutable std::mutex emptyChunksMutex_;
+    std::unordered_set<ChunkKey, ChunkKeyHash> emptyChunks_;
+
     // Negative cache (same design as before).
     static constexpr size_t kBloomBits = 65536;
     std::array<std::atomic<uint64_t>, kBloomBits / 64> negativeBloom_{};

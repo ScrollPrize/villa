@@ -25,19 +25,30 @@ void IOPool::start()
                 if (stop.stop_requested()) return;
 
                 FetchResult result;
+                bool fetchOk = false;
                 if (fetchFunc_) {
                     try {
                         result = fetchFunc_(shard);
+                        fetchOk = true;
                     } catch (const std::exception& e) {
+                        // Exception = transient failure (HTTP 5xx, auth,
+                        // decode). Drop the shard from the state map
+                        // entirely so the next interactive request re-queues
+                        // it, instead of permanently marking it Done.
                         std::lock_guard lock(mutex_);
-                        shards_[shard] = ShardState::Done;
+                        shards_.erase(shard);
                         continue;
                     }
                 }
 
+                // On success record Done so back-to-back requests against
+                // the same shard don't re-fetch. On empty-result success
+                // (e.g. shard-sentinel missing-chunk) also Done — the
+                // downstream fetchFunc_ already negative-cached that case.
                 {
                     std::lock_guard lock(mutex_);
-                    shards_[shard] = ShardState::Done;
+                    if (fetchOk) shards_[shard] = ShardState::Done;
+                    else         shards_.erase(shard);
                 }
 
                 if (onComplete_ && !result.empty()) {
@@ -144,12 +155,15 @@ void IOPool::updateInteractive(const std::vector<ChunkKey>& keys, int targetLeve
 
             auto it = shards_.find(sk);
             if (it != shards_.end()) {
-                // Already in flight or finished — don't re-queue. Re-fetching
-                // a finished chunk forces a redundant disk read + h265 decode
-                // per render pass; block cache evictions are handled via the
-                // blocking getBlockingBlock path on the sampler side.
-                if (it->second == ShardState::InFlight
-                    || it->second == ShardState::Done) continue;
+                // InFlight: a worker is on it, don't double-schedule.
+                // Done: re-queue. The downstream fetchFunc (BlockPipeline
+                // loader/encoder) already short-circuits when the blocks
+                // or output are still in memory, so re-queueing a Done
+                // shard is cheap when data is resident and correct when
+                // it was evicted. Previously we skipped Done, which meant
+                // evicted blocks could stay missing for the rest of the
+                // session.
+                if (it->second == ShardState::InFlight) continue;
                 it->second = ShardState::Queued;
             } else {
                 shards_[sk] = ShardState::Queued;

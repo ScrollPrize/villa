@@ -663,6 +663,20 @@ void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targ
 }
 
 BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
+    // Canonical chunks are 128³ = 8x8x8 blocks of 16³. Reverse-map a block
+    // coord to its enclosing canonical chunk coord and check the
+    // empty-chunks set before touching the real block cache.
+    const ChunkKey chunkKey{key.level, key.bz / 8, key.by / 8, key.bx / 8};
+    {
+        std::lock_guard lk(emptyChunksMutex_);
+        if (emptyChunks_.count(chunkKey)) {
+            // One canonical zero block shared by every caller asking for
+            // a block inside any empty chunk — no arena consumption.
+            static constinit Block kZeroBlock{};
+            statBlockHits_.fetch_add(1, std::memory_order_relaxed);
+            return &kZeroBlock;
+        }
+    }
     auto b = blockCache_.get(key);
     if (b) statBlockHits_.fetch_add(1, std::memory_order_relaxed);
     else   statMisses_.fetch_add(1, std::memory_order_relaxed);
@@ -740,6 +754,17 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
     const int bxN = cx / kBlockSize;
     if (bzN * kBlockSize != cz || byN * kBlockSize != cy || bxN * kBlockSize != cx) return;
 
+    // Zero-chunk shortcut: VcDecompressor already scanned the decoded bytes
+    // and set isEmpty when every voxel is zero. Record the canonical chunk
+    // key and skip copying 512 identical zero blocks into the arena —
+    // blockAt() will hand out a shared static zero block for every inner
+    // block of this chunk. Saves ~2 MB of arena per empty 128³ chunk.
+    if (chunk.isEmpty) {
+        std::lock_guard lk(emptyChunksMutex_);
+        emptyChunks_.insert(key);
+        return;
+    }
+
     const uint8_t* src = chunk.rawData();
     const int strideZ = chunk.strideZ();
     const int strideY = chunk.strideY();
@@ -771,6 +796,10 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
 
 void BlockPipeline::clearMemory() {
     blockCache_.clear();
+    {
+        std::lock_guard elk(emptyChunksMutex_);
+        emptyChunks_.clear();
+    }
     std::lock_guard lk(shardCacheMutex_);
     shardCacheLru_.clear();
     shardCacheMap_.clear();
@@ -792,6 +821,10 @@ void BlockPipeline::clearAll() {
         shardCacheTotalBytes_ = 0;
     }
     blockCache_.clear();
+    {
+        std::lock_guard elk(emptyChunksMutex_);
+        emptyChunks_.clear();
+    }
     bloomClear();
     std::lock_guard lock(negativeMutex_);
     negativeCache_.clear();

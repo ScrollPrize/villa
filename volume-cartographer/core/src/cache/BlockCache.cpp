@@ -77,6 +77,9 @@ BlockPtr BlockCache::get(const BlockKey& key) noexcept
 void BlockCache::put(const BlockKey& key, const uint8_t* src) noexcept
 {
     std::lock_guard lock(mutex_);
+    // Degenerate config (cache size rounded below one block) — bail
+    // instead of dividing by zero in the slot-assignment arithmetic.
+    if (nSlots_ == 0) return;
 
     if (auto it = map_.find(key); it != map_.end()) {
         Block* b = &arena_[it->second];
