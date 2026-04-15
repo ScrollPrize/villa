@@ -1321,6 +1321,13 @@ class NetworkFromConfig(nn.Module):
             self.task_activations[target_name] = get_activation_module(activation_str)
             print(f"MedNeXt task '{target_name}' configured with separate decoder ({out_channels} channels)")
 
+        mednext_pool_factors = []
+        encoder_strides = [tuple(int(v) for v in stride) for stride in self.shared_encoder.strides]
+        for prev_stride, next_stride in zip(encoder_strides[:-1], encoder_strides[1:]):
+            mednext_pool_factors.append([
+                int(next_dim // prev_dim) for prev_dim, next_dim in zip(prev_stride, next_stride)
+            ])
+
         self.final_config = {
             "model_name": self.mgr.model_name,
             "architecture_type": self.architecture_type,
@@ -1340,8 +1347,8 @@ class NetworkFromConfig(nn.Module):
             "targets": self.targets,
             "target_z_projection": self.task_z_projection_cfg,
             "separate_decoders": len(tasks_using_separate) > 0,
-            "pool_op_kernel_sizes": [list(v) for v in self.shared_encoder.strides[1:]],
-            "strides": [list(v) for v in self.shared_encoder.strides],
+            "pool_op_kernel_sizes": mednext_pool_factors,
+            "strides": [list(v) for v in encoder_strides],
             "enable_deep_supervision": ds_enabled,
         }
 

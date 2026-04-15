@@ -203,7 +203,11 @@ class BaseTrainer:
         Subclasses can override this to save extra state (e.g., EMA model).
         Returns a dict that will be merged into the checkpoint.
         """
-        return {}
+        extra = {}
+        if self.ema_model is not None and self.ema_save_in_checkpoint:
+            extra["ema_model"] = self.ema_model.state_dict()
+            extra["ema_optimizer_step"] = int(self._ema_optimizer_step)
+        return extra
 
     def _unwrap_model(self, model):
         if hasattr(model, 'module'):
@@ -1646,6 +1650,9 @@ class BaseTrainer:
                     if isinstance(ckpt, dict) and 'ema_model' in ckpt:
                         self._checkpoint_ema_state = ckpt['ema_model']
                         print("Found EMA model state in checkpoint")
+                    if isinstance(ckpt, dict) and 'ema_optimizer_step' in ckpt:
+                        self._checkpoint_ema_optimizer_step = ckpt['ema_optimizer_step']
+                        print(f"Found EMA optimizer step in checkpoint: {self._checkpoint_ema_optimizer_step}")
                     del ckpt
                 except Exception:
                     pass
@@ -2334,6 +2341,8 @@ class BaseTrainer:
                         num_val_iters = len(val_indices)
 
                     val_pbar = tqdm(range(num_val_iters), desc=f'Validation {epoch + 1}')
+                    validation_model = self._get_validation_model(model)
+                    validation_model.eval()
 
                     for i in val_pbar:
                         try:
@@ -2343,7 +2352,7 @@ class BaseTrainer:
                             data_dict = next(val_dataloader_iter)
 
                         task_losses, inputs, targets_dict, outputs = self._validation_step(
-                            model=model,
+                            model=validation_model,
                             data_dict=data_dict,
                             loss_fns=loss_fns,
                             use_amp=use_amp

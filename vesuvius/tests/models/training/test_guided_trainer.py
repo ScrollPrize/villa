@@ -967,6 +967,88 @@ def test_train_step_updates_ema_after_optimizer_step(tmp_path: Path):
     )
 
 
+def test_initialize_ema_model_restores_optimizer_step_from_checkpoint(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(data_root, guide_checkpoint, guide_fusion_stage="direct_segmentation", guide_loss_weight=0.0)
+    mgr.ema_config = {
+        "enabled": True,
+        "decay": 0.9,
+        "start_step": 5,
+        "update_every_steps": 3,
+        "validate": True,
+    }
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model().to(trainer.device)
+    ema_reference = trainer._create_ema_model(model)
+    trainer._checkpoint_ema_state = ema_reference.state_dict()
+    trainer._checkpoint_ema_optimizer_step = 17
+
+    trainer._initialize_ema_model(model)
+
+    assert trainer._ema_optimizer_step == 17
+
+
+def test_validation_loop_uses_ema_model_when_enabled(tmp_path: Path, monkeypatch):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(data_root, guide_checkpoint)
+    mgr.max_epoch = 1
+    mgr.val_every_n = 1
+    mgr.max_steps_per_epoch = 1
+    mgr.max_val_steps_per_epoch = 1
+    mgr.gradient_accumulation = 1
+    mgr.optimizer = "AdamW"
+    mgr.initial_lr = 1e-3
+    mgr.weight_decay = 0.0
+    mgr.wandb_project = None
+    mgr.auto_detect_channels = lambda dataset, sample: None
+    mgr.ckpt_out_base = tmp_path / "ckpts"
+    mgr.checkpoint_path = None
+    mgr.load_weights_only = False
+    mgr.verbose = False
+    mgr.ema_config = {
+        "enabled": True,
+        "decay": 0.9,
+        "start_step": 1,
+        "update_every_steps": 1,
+        "validate": True,
+    }
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+
+    validation_models = []
+    monkeypatch.setattr(trainer, "_initialize_wandb", lambda *args, **kwargs: None)
+    monkeypatch.setattr(trainer, "_save_debug_image", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(trainer, "_save_debug_media", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(trainer, "_on_epoch_end", lambda **kwargs: (kwargs["checkpoint_history"], kwargs["best_checkpoints"], None))
+    monkeypatch.setattr(trainer, "_finalize_training", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(
+        trainer,
+        "_configure_dataloaders",
+        lambda train_dataset, val_dataset: (
+            DataLoader(train_dataset, batch_size=1, shuffle=False),
+            DataLoader(val_dataset, batch_size=1, shuffle=False),
+            [0],
+            [0],
+        ),
+    )
+
+    original_validation_step = trainer._validation_step
+
+    def _wrapped_validation_step(model, data_dict, loss_fns, use_amp):
+        validation_models.append(model)
+        return original_validation_step(model, data_dict, loss_fns, use_amp)
+
+    monkeypatch.setattr(trainer, "_validation_step", _wrapped_validation_step)
+
+    trainer.train()
+
+    assert validation_models
+    assert all(model is trainer.ema_model for model in validation_models)
+
+
 def test_prepare_metrics_for_logging_includes_guide_loss_entries():
     mgr = _make_mgr(Path("/tmp/guide_backbone.pt"), Path("/tmp/guide_backbone.pt"))
     trainer = BaseTrainer(mgr=mgr, verbose=False)
