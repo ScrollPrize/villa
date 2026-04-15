@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from copy import deepcopy
 
 import pytest
 import torch
@@ -132,6 +133,20 @@ def _make_pretrained_backbone_mgr(
     )
 
 
+def _make_reloaded_mgr(final_config: dict, base_mgr: SimpleNamespace) -> SimpleNamespace:
+    return SimpleNamespace(
+        targets=deepcopy(final_config["targets"]),
+        train_patch_size=tuple(final_config["patch_size"]),
+        train_batch_size=int(final_config["batch_size"]),
+        in_channels=int(final_config["in_channels"]),
+        autoconfigure=bool(final_config["autoconfigure"]),
+        model_name=final_config["model_name"],
+        enable_deep_supervision=getattr(base_mgr, "enable_deep_supervision", False),
+        spacing=getattr(base_mgr, "spacing", (1.0, 1.0, 1.0)),
+        model_config=deepcopy(final_config),
+    )
+
+
 def test_tokenbook3d_returns_unit_interval_mask():
     module = TokenBook3D(n_tokens=8, embed_dim=16)
     x = torch.randn(2, 16, 2, 2, 2)
@@ -202,6 +217,54 @@ def test_guided_network_forward_works_with_trainable_guide_backbone(tmp_path: Pa
     assert set(outputs_with_aux.keys()) == {"ink"}
     assert aux["guide_mask"].shape == (2, 1, 2, 2, 2)
     assert any(parameter.requires_grad for parameter in model.guide_backbone.parameters())
+
+
+def test_learned_mlp_z_projection_reloads_from_final_config(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(checkpoint_path, basic_encoder_block="ConvBlock")
+    mgr.model_config["z_projection_mode"] = "learned_mlp"
+    mgr.model_config["z_projection_mlp_depth"] = 16
+    mgr.model_config["z_projection_mlp_hidden"] = 32
+    mgr.model_config["z_projection_mlp_dropout"] = 0.1
+
+    model = NetworkFromConfig(mgr)
+    assert model.task_z_projection_cfg["ink"]["mode"] == "learned_mlp"
+    assert "ink" in model.task_z_projection_heads
+    assert model.final_config["target_z_projection"]["ink"]["mode"] == "learned_mlp"
+
+    reload_mgr = _make_reloaded_mgr(model.final_config, mgr)
+    reloaded = NetworkFromConfig(reload_mgr)
+    reloaded.load_state_dict(model.state_dict(), strict=True)
+
+    x = torch.randn(2, 1, 16, 16, 16)
+    outputs = reloaded(x)
+    assert "ink" in reloaded.task_z_projection_heads
+    assert reloaded.task_z_projection_cfg["ink"]["mode"] == "learned_mlp"
+    assert outputs["ink"].shape == (2, 1, 16, 16)
+
+
+def test_logsumexp_z_projection_reloads_from_final_config(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(checkpoint_path, basic_encoder_block="ConvBlock")
+    mgr.model_config["z_projection_mode"] = "logsumexp"
+    mgr.model_config["z_projection_lse_tau"] = 0.7
+
+    model = NetworkFromConfig(mgr)
+    assert model.task_z_projection_cfg["ink"]["mode"] == "logsumexp"
+    assert model.task_z_projection_cfg["ink"]["lse_tau"] == pytest.approx(0.7)
+    assert model.final_config["target_z_projection"]["ink"]["mode"] == "logsumexp"
+
+    reload_mgr = _make_reloaded_mgr(model.final_config, mgr)
+    reloaded = NetworkFromConfig(reload_mgr)
+    reloaded.load_state_dict(model.state_dict(), strict=True)
+
+    x = torch.randn(2, 1, 16, 16, 16)
+    outputs = reloaded(x)
+    assert reloaded.task_z_projection_cfg["ink"]["mode"] == "logsumexp"
+    assert reloaded.task_z_projection_cfg["ink"]["lse_tau"] == pytest.approx(0.7)
+    assert outputs["ink"].shape == (2, 1, 16, 16)
 
 
 @pytest.mark.parametrize("basic_encoder_block", ["ConvBlock", "BasicBlockD"])
