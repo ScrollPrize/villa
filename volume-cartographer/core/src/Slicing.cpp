@@ -1131,7 +1131,14 @@ void sampleCompositeAdaptiveImpl(
                 else if constexpr (AMode == AccumMode2::Mean) val = count ? accum * (1.0f/float(count)) : 0.f;
                 else {
                     if (compositeMethod == "median") {
-                        std::nth_element(layerVals.begin(), layerVals.begin()+numLayers/2, layerVals.end());
+                        // For the small N we see in practice (<=~33 layers),
+                        // insertion-sort-up-to-the-median beats nth_element:
+                        // its introselect setup costs more than sorting a
+                        // few dozen floats. partial_sort gives us exactly
+                        // that for small N without branching on size.
+                        std::partial_sort(layerVals.begin(),
+                                          layerVals.begin() + numLayers/2 + 1,
+                                          layerVals.end());
                         val = layerVals[numLayers/2];
                     } else if (compositeMethod == "minabs") {
                         // Hoist abs(best-127.5) out of the loop and use std::fabs

@@ -144,14 +144,14 @@ void DiskStore::put(
         {
             std::lock_guard<std::mutex> lk(indexMtx_);
             // Remove old entry if overwriting an existing file
-            auto pit = pathIndex_.find(path.string());
+            auto pit = pathIndex_.find(path.native());
             if (pit != pathIndex_.end()) {
                 oldSize = pit->second->second.bytes;
                 timeIndex_.erase(pit->second);
                 pathIndex_.erase(pit);
             }
             auto it = timeIndex_.emplace(mtime, IndexEntry{path, size});
-            pathIndex_.emplace(path.string(), it);
+            pathIndex_.emplace(path.native(), it);
         }
         // Adjust totalBytes_: add new size, subtract old if overwriting
         if (oldSize > 0 && oldSize <= size) {
@@ -240,7 +240,7 @@ void DiskStore::evictToSize(size_t targetBytes)
                        prev, prev - entry.bytes, std::memory_order_relaxed))
                 ;
 
-            pathIndex_.erase(entry.path.string());
+            pathIndex_.erase(entry.path.native());
             it = timeIndex_.erase(it);
         }
     }
@@ -298,7 +298,7 @@ void DiskStore::initTotalBytes()
 
         auto mtime = entry.last_write_time();
         auto it = timeIndex_.emplace(mtime, IndexEntry{entry.path(), sz});
-        pathIndex_.emplace(entry.path().string(), it);
+        pathIndex_.emplace(entry.path().native(), it);
     }
     totalBytes_.store(total, std::memory_order_relaxed);
     std::fprintf(stderr, "[DiskStore] initTotalBytes: root=%s files=%zu bytes=%zu (%.1f MB)\n",
@@ -332,7 +332,7 @@ void DiskStore::clearAll()
 void DiskStore::removeFromIndex(const std::filesystem::path& path)
 {
     // Caller must hold indexMtx_
-    auto pit = pathIndex_.find(path.string());
+    auto pit = pathIndex_.find(path.native());
     if (pit != pathIndex_.end()) {
         timeIndex_.erase(pit->second);
         pathIndex_.erase(pit);

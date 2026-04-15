@@ -635,11 +635,22 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
 
     // --- apply offset along normals only where normals are valid --------
     if (need_normals && ul[2] != 0.0f) {
+        const float off = ul[2];
         for (int j = 0; j < h; ++j) {
+            // Row pointers skip cv::Mat::at()'s bounds-check overhead and
+            // let the compiler hoist the row-base arithmetic out of the
+            // inner loop. This runs per rendered pixel every frame.
+            const cv::Vec3f* nrow = normals->ptr<cv::Vec3f>(j);
+            cv::Vec3f* crow = coords->ptr<cv::Vec3f>(j);
             for (int i = 0; i < w; ++i) {
-                const cv::Vec3f n = (*normals)(j, i);
-                if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2])) {
-                    (*coords)(j, i) += n * ul[2];
+                const cv::Vec3f& n = nrow[i];
+                // -ffast-math makes std::isfinite unreliable (and slow).
+                // `x == x` is false only for NaN; we only need to skip NaN
+                // here — inf would still produce a finite offset if rare.
+                if (n[0] == n[0] && n[1] == n[1] && n[2] == n[2]) {
+                    crow[i][0] += n[0] * off;
+                    crow[i][1] += n[1] * off;
+                    crow[i][2] += n[2] * off;
                 }
             }
         }

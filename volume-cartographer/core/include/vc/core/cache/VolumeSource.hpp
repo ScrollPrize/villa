@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <list>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -14,6 +15,7 @@
 #include "HttpMetadataFetcher.hpp"  // HttpAuth (= utils::AwsAuth)
 
 namespace utils { class HttpClient; }
+namespace utils::detail { struct ShardIndex; }
 
 namespace vc::cache {
 
@@ -120,8 +122,21 @@ private:
     std::array<int, 3> shardShape_ = {0, 0, 0};
     std::array<int, 3> chunksPerShard_ = {1, 1, 1};
 
+    struct ShardCacheEntry {
+        std::shared_ptr<std::vector<uint8_t>> bytes;
+        // Parsed shard index cached alongside the bytes so fetchFromShard
+        // doesn't reparse the 16-byte-per-entry table on every inner-chunk
+        // extraction. Populated lazily on first fetchFromShard call.
+        std::shared_ptr<utils::detail::ShardIndex> index;
+    };
+    struct ShardLruNode {
+        std::string url;
+        ShardCacheEntry entry;
+    };
     std::mutex shardCacheMutex_;
-    std::unordered_map<std::string, std::shared_ptr<std::vector<uint8_t>>> shardCache_;
+    std::list<ShardLruNode> shardCacheLru_;
+    std::unordered_map<std::string, std::list<ShardLruNode>::iterator> shardCacheMap_;
+    std::size_t shardCacheBytes_ = 0;
 
     std::atomic<bool> transientError_{false};
 };

@@ -253,7 +253,10 @@ private:
                                  curl_off_t, curl_off_t,
                                  curl_off_t, curl_off_t) noexcept
     {
-        return abort_flag().load(std::memory_order_acquire) ? 1 : 0;
+        // Called on every curl transfer event (high frequency).
+        // Relaxed is fine: we don't need acquire ordering with other data,
+        // just eventual visibility of the abort bit.
+        return abort_flag().load(std::memory_order_relaxed) ? 1 : 0;
     }
 
 public:
@@ -310,6 +313,13 @@ public:
             curl_easy_setopt(curl, CURLOPT_TIMEOUT,
                              static_cast<long>(config_.transfer_timeout.count()));
             curl_easy_setopt(curl, CURLOPT_USERAGENT, config_.user_agent.c_str());
+            // Keep TCP connections alive so back-to-back fetches against
+            // S3 don't pay the TLS handshake cost each time. curl_easy_reset
+            // preserves the connection cache and SSL session IDs, so we just
+            // need to ensure keepalive is on. Ping every 30s after 30s idle.
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L);
             if (config_.follow_redirects) {
                 curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
                 curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
@@ -529,6 +539,12 @@ private:
                              static_cast<long>(config_.connect_timeout.count()));
             curl_easy_setopt(curl, CURLOPT_TIMEOUT,
                              static_cast<long>(config_.transfer_timeout.count()));
+
+            // TCP keepalive: keeps idle-pooled connections from being torn
+            // down between bursts of S3 fetches so we reuse the TLS session.
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L);
 
             // Redirects
             if (config_.follow_redirects) {

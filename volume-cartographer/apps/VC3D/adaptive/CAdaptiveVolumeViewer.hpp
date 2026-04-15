@@ -301,6 +301,17 @@ private:
     float _zoomSensitivity = 1.0f;
     float _zScrollSensitivity = 1.0f;
     vc::Sampling _samplingMethod = vc::Sampling::Trilinear;
+    bool _highlightDownscaled = false;
+    QString _lastStatusText;
+
+public:
+    // Re-reads perf/interaction settings from disk into cached members.
+    // Call after the user toggles values in the Viewer Controls panel;
+    // submitRender() reads the cached members on every frame instead of
+    // opening QSettings.
+    void reloadPerfSettings();
+
+private:
 
     // --- Content bounds for pan clamping ---
     float _contentMinU = 0, _contentMaxU = 0;

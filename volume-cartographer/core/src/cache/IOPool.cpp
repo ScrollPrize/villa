@@ -60,7 +60,7 @@ void IOPool::submit(const std::vector<ChunkKey>& keys)
 {
     if (keys.empty()) return;
 
-    bool added = false;
+    int addedCount = 0;
     {
         std::lock_guard lock(mutex_);
         if (shutdown_) return;
@@ -78,7 +78,7 @@ void IOPool::submit(const std::vector<ChunkKey>& keys)
                     it->second = ShardState::Queued;
                     queues_[sk.level].push_back(sk);
                     queueTotal_++;
-                    added = true;
+                    ++addedCount;
                 }
                 continue;
             }
@@ -86,16 +86,21 @@ void IOPool::submit(const std::vector<ChunkKey>& keys)
             shards_[sk] = ShardState::Queued;
             queues_[sk.level].push_back(sk);
             queueTotal_++;
-            added = true;
+            ++addedCount;
         }
     }
-    if (added) cv_.notify_all();
+    // Wake exactly as many workers as we added items, capped at pool size.
+    // notify_all() created a thundering herd on every submit — most workers
+    // would re-sleep immediately after finding the queue empty.
+    const int toWake = std::min(addedCount, numThreads_);
+    for (int i = 0; i < toWake; ++i) cv_.notify_one();
 }
 
 void IOPool::updateInteractive(const std::vector<ChunkKey>& keys, int targetLevel)
 {
     if (keys.empty()) return;
 
+    size_t totalToWake = 0;
     {
         std::lock_guard lock(mutex_);
         if (shutdown_) return;
@@ -160,8 +165,9 @@ void IOPool::updateInteractive(const std::vector<ChunkKey>& keys, int targetLeve
             q.insert(q.end(), backlog[lvl].begin(), backlog[lvl].end());
             queueTotal_ += q.size();
         }
+        totalToWake = std::min<size_t>(queueTotal_, size_t(numThreads_));
     }
-    cv_.notify_all();
+    for (size_t i = 0; i < totalToWake; ++i) cv_.notify_one();
 }
 
 ShardKey IOPool::popNext()

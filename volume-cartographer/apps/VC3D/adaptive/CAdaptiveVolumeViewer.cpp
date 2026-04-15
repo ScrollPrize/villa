@@ -99,6 +99,11 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
     if (_zoomSensitivity <= 0.0f) _zoomSensitivity = 1.0f;
     _zScrollSensitivity = settings.value(viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT).toFloat();
     if (_zScrollSensitivity <= 0.0f) _zScrollSensitivity = 1.0f;
+    {
+        int interpIdx = settings.value(perf::INTERPOLATION_METHOD, 1).toInt();
+        _samplingMethod = static_cast<vc::Sampling>(std::clamp(interpIdx, 0, 3));
+    }
+    _highlightDownscaled = settings.value("viewer_controls/highlight_downscaled", false).toBool();
 
     auto* layout = new QVBoxLayout;
     layout->addWidget(_view);
@@ -338,18 +343,20 @@ void CAdaptiveVolumeViewer::scheduleRender()
 }
 
 
+void CAdaptiveVolumeViewer::reloadPerfSettings()
+{
+    QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
+    using namespace vc3d::settings;
+    _panSensitivity = std::max(0.01f, s.value(viewer::PAN_SENSITIVITY, viewer::PAN_SENSITIVITY_DEFAULT).toFloat());
+    _zoomSensitivity = std::max(0.01f, s.value(viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT).toFloat());
+    _zScrollSensitivity = std::max(0.01f, s.value(viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT).toFloat());
+    int interpIdx = s.value(perf::INTERPOLATION_METHOD, 1).toInt();
+    _samplingMethod = static_cast<vc::Sampling>(std::clamp(interpIdx, 0, 3));
+    _highlightDownscaled = s.value("viewer_controls/highlight_downscaled", false).toBool();
+}
+
 void CAdaptiveVolumeViewer::submitRender()
 {
-    // Re-read sensitivity settings (changed live via Viewer Controls panel)
-    {
-        QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-        using namespace vc3d::settings;
-        _panSensitivity = std::max(0.01f, s.value(viewer::PAN_SENSITIVITY, viewer::PAN_SENSITIVITY_DEFAULT).toFloat());
-        _zoomSensitivity = std::max(0.01f, s.value(viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT).toFloat());
-        _zScrollSensitivity = std::max(0.01f, s.value(viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT).toFloat());
-        int interpIdx = s.value(perf::INTERPOLATION_METHOD, 1).toInt();
-        _samplingMethod = static_cast<vc::Sampling>(std::clamp(interpIdx, 0, 3));
-    }
     const CompositeParams& lightP = _compositeSettings.params;
     const bool rakingEnabled = _compositeSettings.postRakingEnabled;
     const float rakingAz = _compositeSettings.postRakingAzimuth;
@@ -357,12 +364,9 @@ void CAdaptiveVolumeViewer::submitRender()
     const float rakingStrength = std::clamp(_compositeSettings.postRakingStrength, 0.0f, 1.0f);
     const float rakingDepth = std::max(0.01f, _compositeSettings.postRakingDepthScale);
 
-    // Debug overlay: paint a per-pixel gradient based on fallback-level depth
-    // so the user can see which regions rendered against downscaled chunks.
-    const bool highlightDownscaled = [] {
-        QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-        return s.value("viewer_controls/highlight_downscaled", false).toBool();
-    }();
+    // Debug overlay: paint a per-pixel gradient based on fallback-level depth.
+    // Cached in reloadPerfSettings() instead of re-read from disk each frame.
+    const bool highlightDownscaled = _highlightDownscaled;
 
     auto surf = _surfWeak.lock();
     if (!surf || !_volume || !_volume->zarrDataset()) return;
@@ -693,7 +697,10 @@ void CAdaptiveVolumeViewer::submitRender()
     _camScale = _camera.scale;
 
     renderIntersections();
-    _view->viewport()->repaint();
+    // update() schedules a deferred repaint via the event loop; repaint()
+    // blocks the UI thread synchronously until paintEvent returns, which
+    // stalls every frame during pans/zooms.
+    _view->viewport()->update();
     updateStatusLabel();
 }
 
@@ -1280,9 +1287,16 @@ void CAdaptiveVolumeViewer::updateStatusLabel()
     }
 
     status += " [adaptive]";
-    _lbl->setText(status);
-    _lbl->adjustSize();
-    _lbl->show();
+    // Skip the setText+adjustSize+show round-trip when the string is
+    // identical to the last one we pushed. The label is rebuilt every
+    // frame, but stats only tick a few times a second — most frames would
+    // churn identical text through Qt's text layout engine.
+    if (status != _lastStatusText) {
+        _lastStatusText = status;
+        _lbl->setText(status);
+        _lbl->adjustSize();
+        _lbl->show();
+    }
 }
 
 void CAdaptiveVolumeViewer::fitSurfaceInView()

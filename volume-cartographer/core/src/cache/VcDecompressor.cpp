@@ -101,10 +101,17 @@ DecompressFn makeVcDecompressor(const std::vector<vc::VcDataset*>& datasets)
         } else if (dtype == vc::VcDtype::uint16) {
             ds.decompress(compressed, result->rawData(), chunkSize);
 
+            // Forward scan is technically safe (dst[i] only writes byte i
+            // while src[i] reads bytes 2i..2i+1, which are ahead of the
+            // write cursor), but aliasing a uint16_t* over a buffer that's
+            // concurrently being written via uint8_t* violates strict
+            // aliasing and is a minefield under TBAA + -ffast-math. Use
+            // memcpy to read each uint16 before writing the uint8.
             auto* dst = result->rawData();
-            auto* src = reinterpret_cast<const uint16_t*>(dst);
-            for (size_t i = 0; i < chunkSize; i++) {
-                dst[i] = static_cast<uint8_t>(src[i] / 257);
+            for (size_t i = 0; i < chunkSize; ++i) {
+                uint16_t v;
+                std::memcpy(&v, dst + i * 2, sizeof(v));
+                dst[i] = static_cast<uint8_t>(v / 257);
             }
             result->resizeBytes(chunkSize);
         } else {

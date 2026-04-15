@@ -2966,7 +2966,10 @@ void CWindow::CreateWidgets(void)
         connect(cmbInterp, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int idx) {
             QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
             s.setValue(vc3d::settings::perf::INTERPOLATION_METHOD, idx);
-            _viewerManager->forEachViewer([](CTiledVolumeViewer* v) { v->update(); });
+            _viewerManager->forEachViewer([](CTiledVolumeViewer* v) {
+                v->reloadPerfSettings();
+                v->update();
+            });
         });
         viewExtrasLayout->addWidget(interpWidget);
     }
@@ -2986,6 +2989,7 @@ void CWindow::CreateWidgets(void)
             s.setValue("viewer_controls/highlight_downscaled", on);
             if (_viewerManager) {
                 _viewerManager->forEachViewer([](CTiledVolumeViewer* v) {
+                    v->reloadPerfSettings();
                     v->renderVisible(true);
                 });
             }
@@ -3008,9 +3012,14 @@ void CWindow::CreateWidgets(void)
             spin->setDecimals(1);
             spin->setValue(settings.value(settingsKey, defaultVal).toDouble());
             navLayout->addWidget(spin, row, 1);
-            connect(spin, &QDoubleSpinBox::valueChanged, this, [settingsKey](double v) {
+            connect(spin, &QDoubleSpinBox::valueChanged, this, [this, settingsKey](double v) {
                 QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
                 s.setValue(settingsKey, v);
+                if (_viewerManager) {
+                    _viewerManager->forEachViewer([](CTiledVolumeViewer* v) {
+                        v->reloadPerfSettings();
+                    });
+                }
             });
         };
         addSpin(0, tr("Pan sensitivity"), viewer::PAN_SENSITIVITY, viewer::PAN_SENSITIVITY_DEFAULT);

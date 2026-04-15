@@ -438,9 +438,17 @@ BlockPipeline::BlockPipeline(
 
         insertChunkAsBlocks(key, *decoded);
         if (!chunkArrivedFlag_.exchange(true, std::memory_order_acq_rel)) {
-            std::lock_guard cbLock(callbackMutex_);
-            for (const auto& [id, cb] : chunkReadyListeners_)
-                cb(key);
+            // Snapshot callbacks under lock and release before firing so
+            // a slow listener can't serialize the loader hot path or
+            // deadlock with add/remove calls that need the same mutex.
+            std::vector<ChunkReadyCallback> snapshot;
+            {
+                std::lock_guard cbLock(callbackMutex_);
+                snapshot.reserve(chunkReadyListeners_.size());
+                for (const auto& [id, cb] : chunkReadyListeners_)
+                    snapshot.push_back(cb);
+            }
+            for (const auto& cb : snapshot) cb(key);
         }
         return {};
     });
