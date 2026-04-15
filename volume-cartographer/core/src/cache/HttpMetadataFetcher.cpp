@@ -382,20 +382,30 @@ static std::optional<RemoteZarrInfo> tryLoadCachedMetadata(
     // here — that's our own canonical output format, not the source's
     // metadata; doing so flipped v2-chunked sources into sharded mode and
     // made every subsequent chunk fetch 404 against the real S3 layout.
-    ShardConfig shardConfig;
-    if (auto recovered = readRemoteShardConfig(stagingDir)) {
-        shardConfig = *recovered;
-        if (auto* log = cacheDebugLog()) {
-            if (shardConfig.enabled)
-                std::fprintf(log,
-                    "[REMOTE] Recovered shard config from marker: shape=[%d, %d, %d]\n",
-                    shardConfig.shardShape[0],
-                    shardConfig.shardShape[1],
-                    shardConfig.shardShape[2]);
-            else
-                std::fprintf(log,
-                    "[REMOTE] Marker reports source is not sharded\n");
-        }
+    //
+    // If the marker is missing the shard_config field entirely (pre-fix
+    // staging dir), we can't trust the cached metadata: a v3-sharded
+    // source would silently come back up in non-sharded mode and every
+    // chunk fetch would 404. Force a live re-fetch in that case.
+    auto recovered = readRemoteShardConfig(stagingDir);
+    if (!recovered) {
+        if (auto* log = cacheDebugLog())
+            std::fprintf(log,
+                "[REMOTE] Marker at %s lacks shard_config (pre-upgrade cache); re-fetching\n",
+                stagingDir.c_str());
+        return std::nullopt;
+    }
+    ShardConfig shardConfig = *recovered;
+    if (auto* log = cacheDebugLog()) {
+        if (shardConfig.enabled)
+            std::fprintf(log,
+                "[REMOTE] Recovered shard config from marker: shape=[%d, %d, %d]\n",
+                shardConfig.shardShape[0],
+                shardConfig.shardShape[1],
+                shardConfig.shardShape[2]);
+        else
+            std::fprintf(log,
+                "[REMOTE] Marker reports source is not sharded\n");
     }
 
     if (auto* log = cacheDebugLog())

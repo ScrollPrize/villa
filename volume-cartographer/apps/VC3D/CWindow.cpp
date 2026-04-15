@@ -4,7 +4,9 @@
 
 #include <cstdlib>
 #include <functional>
+#if defined(__GLIBC__)
 #include <malloc.h>
+#endif
 
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "WindowRangeWidget.hpp"
@@ -627,11 +629,14 @@ CWindow::CWindow(size_t cacheSizeGB) :
 
     // Periodic glibc heap trim: returns sbrk-grown segments back to the OS
     // once they're no longer in use. Cheap (~µs) when nothing to trim.
-    // Also dumps a RAM stats line for live monitoring.
+    // Also dumps a RAM stats line for live monitoring. malloc_trim is a
+    // glibc extension — skipped on macOS / non-glibc libc.
     auto* trimTimer = new QTimer(this);
     trimTimer->setInterval(1000);
     connect(trimTimer, &QTimer::timeout, this, [this]() {
+#if defined(__GLIBC__)
         ::malloc_trim(0);
+#endif
         vc3d::ramstats::dumpOnce(_viewerManager.get(), _state);
     });
     trimTimer->start();
@@ -2076,16 +2081,22 @@ void CWindow::downloadRemoteSegmentOnDemand(const QString& segmentId)
 
     auto future = QtConcurrent::run(
         [dlBase, baseUrl, segId, cachePath, auth, segSource]() -> std::shared_ptr<QuadSurface> {
-            // Derive volpkg name from base URL (same logic as phase 2)
-            std::string volpkgName = baseUrl;
-            while (!volpkgName.empty() && volpkgName.back() == '/') volpkgName.pop_back();
-            auto slash = volpkgName.rfind('/');
-            if (slash != std::string::npos) volpkgName = volpkgName.substr(slash + 1);
-
-            std::filesystem::path volpkgCache = std::filesystem::path(cachePath) / volpkgName;
+            // Cache-root layout MUST match MenuActionController::promptAndLoadRemoteSegments
+            // so previously-preloaded segments are reused on demand instead
+            // of re-downloaded into a second location.
+            //   Direct sources: flat → cachePath/paths/<segId>
+            //   Segments/Paths (full volpkg): nested → cachePath/<volpkgName>/{paths|segments}/<segId>
+            std::filesystem::path segmentRoot = cachePath;
+            if (segSource != vc::RemoteSegmentSource::Direct) {
+                std::string volpkgName = baseUrl;
+                while (!volpkgName.empty() && volpkgName.back() == '/') volpkgName.pop_back();
+                auto slash = volpkgName.rfind('/');
+                if (slash != std::string::npos) volpkgName = volpkgName.substr(slash + 1);
+                segmentRoot = std::filesystem::path(cachePath) / volpkgName;
+            }
 
             auto localDir = vc::downloadRemoteSegment(
-                dlBase, segId, volpkgCache, auth, segSource);
+                dlBase, segId, segmentRoot, auth, segSource);
 
             if (!std::filesystem::exists(localDir / "meta.json")) {
                 return nullptr;

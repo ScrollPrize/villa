@@ -212,6 +212,12 @@ BlockPipeline::BlockPipeline(
         return bcfg;
       }())
 {
+    // Clear any stale process-wide HTTP abort flag from a previous
+    // BlockPipeline's destructor. Without this, a volume swap during the
+    // same session would leave the flag set and every subsequent curl
+    // request would return CURLE_ABORTED_BY_CALLBACK → silent failure.
+    utils::HttpClient::resetAbort();
+
     // Scan the on-disk cache once at startup so the stats bar reports
     // actual usage instead of "0 GB / 0 shards" until we write something.
     // Counts every regular file under each level root (each shard is one
@@ -507,7 +513,11 @@ BlockPipeline::BlockPipeline(
                     return {};
                 }
 
-                // Sanity: bytes must already be VC3D/H.265.
+                // Sanity: bytes must already be VC3D/H.265. If not, the
+                // source advertised canonical structure but serves blosc
+                // or raw — we can't use it. Mark the chunk negative so
+                // we stop re-fetching it every render; otherwise every
+                // fetchInteractive would re-queue it forever.
                 if (!utils::is_video_compressed(std::span<const std::byte>(
                         reinterpret_cast<const std::byte*>(bytes.data()),
                         bytes.size()))) {
@@ -515,9 +525,15 @@ BlockPipeline::BlockPipeline(
                     if (warned.fetch_add(1) < 5) {
                         std::fprintf(stderr,
                             "[BlockPipeline] passthrough: chunk lvl=%d "
-                            "(%d,%d,%d) lacks VC3D magic — dropping\n",
+                            "(%d,%d,%d) lacks VC3D magic — marking absent\n",
                             key.level, key.iz, key.iy, key.ix);
                     }
+                    bloomAdd(key);
+                    {
+                        std::lock_guard lock(negativeMutex_);
+                        negativeCache_.insert(key);
+                    }
+                    if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
                     return {};
                 }
 

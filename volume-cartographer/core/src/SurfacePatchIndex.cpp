@@ -2,10 +2,8 @@
 
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cstdint>
 #include <cmath>
-#include <cstdio>
 #include <iostream>
 #include <limits>
 #include <optional>
@@ -954,12 +952,6 @@ bool SurfacePatchIndex::Impl::removeSurfaceEntries(const SurfacePtr& surface)
 
     SurfaceCellMask& mask = it->second.mask;
 
-    // Diagnostic: show how many rtree remove operations we're about to do
-    // so we can size the impact relative to the 13% rtree CPU seen in perf.
-    using clk = std::chrono::steady_clock;
-    const auto t0 = clk::now();
-    const int activeCount = mask.activeCount;
-
     // Walk active cells via states bitset, use dense cachedBoxes for each.
     if (tree && mask.activeCount > 0 && !mask.cachedBoxes.empty()) {
         for (int row = 0; row < mask.rows; ++row) {
@@ -973,14 +965,6 @@ bool SurfacePatchIndex::Impl::removeSurfaceEntries(const SurfacePtr& surface)
             }
         }
     }
-    const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
-    std::fprintf(stderr,
-        "[SPI::removeSurfaceEntries] surface=%p id=%s cells=%d took=%.1fms (patchCountAfter=%zu)\n",
-        static_cast<const void*>(surface.get()),
-        surface->id.c_str(),
-        activeCount,
-        ms,
-        patchCount);
 
     // Clear the mask entirely (faster than individual eraseBox calls)
     mask.clear();

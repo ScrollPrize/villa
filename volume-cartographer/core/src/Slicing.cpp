@@ -713,7 +713,12 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
             appendChunksForCoordsSurface(cache, lvl, *coords, prefetchKeys);
         }
         const cv::Vec3f cv = (*coords)(coords->rows / 2, coords->cols / 2);
-        if (isfinite_bitwise(cv[0])) {
+        // Guard against the (0,0,0) off-surface sentinel — isfinite() accepts
+        // zero, which would bias the priority sort toward voxel origin
+        // instead of where the user is actually looking. Require a
+        // non-degenerate magnitude before trusting the center pixel.
+        if (isfinite_bitwise(cv[0])
+            && (cv[0] * cv[0] + cv[1] * cv[1] + cv[2] * cv[2]) > 0.25f) {
             viewCenterL0 = cv;
             haveCenter = true;
         }
@@ -853,7 +858,11 @@ void sampleCompositeAdaptiveImpl(
             appendChunksForCoordsSurface(cache, lvl, *coords, keys);
         }
         const cv::Vec3f cvCenter = (*coords)(coords->rows / 2, coords->cols / 2);
-        if (isfinite_bitwise(cvCenter[0])) {
+        // Guard against the (0,0,0) off-surface sentinel — see note in
+        // samplePixelsAdaptiveARGB32 above.
+        if (isfinite_bitwise(cvCenter[0])
+            && (cvCenter[0] * cvCenter[0] + cvCenter[1] * cvCenter[1]
+                + cvCenter[2] * cvCenter[2]) > 0.25f) {
             viewCenterL0 = cvCenter;
             haveCenter = true;
         }

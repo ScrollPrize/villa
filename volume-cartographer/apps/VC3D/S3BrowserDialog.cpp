@@ -103,16 +103,21 @@ void S3BrowserDialog::navigateTo(const QString& s3Url)
 
     // Bump the sequence for every navigation so a late-arriving response
     // to an older request is dropped instead of overwriting the current
-    // listing (and spuriously clearing the "loading" indicator).
+    // listing (and spuriously clearing the "loading" indicator). Also
+    // capture the requested path so that even if the user navigates back
+    // to an already-seen URL, we don't confuse responses whose paths
+    // differ from the current _currentUrl at completion time.
     const std::uint64_t seq = ++_listRequestSeq;
+    const QString requestedUrl = _currentUrl;
 
     auto* watcher = new QFutureWatcher<vc::cache::S3ListResult>(this);
     connect(watcher, &QFutureWatcher<vc::cache::S3ListResult>::finished, this,
-        [this, watcher, seq]() {
+        [this, watcher, seq, requestedUrl]() {
             watcher->deleteLater();
-            if (seq != _listRequestSeq) {
-                // A newer navigateTo has already been issued; its watcher
-                // will toggle the loading state when it lands.
+            if (seq != _listRequestSeq || requestedUrl != _currentUrl) {
+                // A newer navigateTo has already been issued (possibly
+                // to a different path); its watcher will toggle the
+                // loading state when it lands.
                 return;
             }
             setLoading(false);
