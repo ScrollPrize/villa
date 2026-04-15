@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cstdarg>
 #include <thread>
+#include <optional>
 #include <unordered_set>
 #include <tiffio.h>
 #include <omp.h>
@@ -1055,6 +1056,29 @@ static void renderTiles(
 
 
 // ============================================================
+// readVolumeVoxelSize – read voxelsize from volume metadata
+// ============================================================
+
+static std::optional<double> readVolumeVoxelSize(const std::filesystem::path& volPath)
+{
+    auto tryFile = [](const std::filesystem::path& p, const char* key) -> std::optional<double> {
+        if (!std::filesystem::exists(p)) return std::nullopt;
+        try {
+            Json j = Json::parse_file(p.string());
+            Json sub = key ? (j.is_object() && j.contains(key) ? j[key] : Json{}) : j;
+            if (key && !sub.is_object()) return std::nullopt;
+            if (sub.is_object() && sub.contains("voxelsize") && sub["voxelsize"].is_number())
+                return sub["voxelsize"].get_double();
+        } catch (...) {}
+        return std::nullopt;
+    };
+    if (auto v = tryFile(volPath / "meta.json", nullptr)) return v;
+    if (auto v = tryFile(volPath / "metadata.json", "scan")) return v;
+    if (auto v = tryFile(volPath / "metadata.json", nullptr)) return v;
+    return std::nullopt;
+}
+
+// ============================================================
 // main
 // ============================================================
 
@@ -1111,7 +1135,9 @@ int main(int argc, char *argv[])
         ("merge-tiff-parts", po::bool_switch()->default_value(false), "Merge partial TIFFs from multi-VM render")
         ("pyramid", po::value<bool>()->default_value(true), "Build pyramid levels L1-L5 (default: true)")
         ("resume", po::bool_switch()->default_value(false), "Skip chunks that already exist on disk")
-        ("pre", po::bool_switch()->default_value(false), "Create zarr + all level datasets");
+        ("pre", po::bool_switch()->default_value(false), "Create zarr + all level datasets")
+        ("voxel-size", po::value<double>(), "Physical voxel size for OME-Zarr scale metadata (reads from volume metadata if omitted)")
+        ("voxel-unit", po::value<std::string>()->default_value("nanometer"), "Physical unit for OME-Zarr axes (e.g. nanometer, micrometer)");
     // clang-format on
 
     po::options_description all("Usage");
@@ -1357,6 +1383,27 @@ int main(int argc, char *argv[])
         logPrintf(stdout, "chunk shape [%s]\n", oss.str().c_str());
     }
 
+    // --- Resolve voxel size for OME-Zarr metadata ---
+    const std::string voxel_unit = parsed["voxel-unit"].as<std::string>();
+    double base_voxel_size = 1.0;
+    if (parsed.count("voxel-size")) {
+        base_voxel_size = parsed["voxel-size"].as<double>();
+        if (!std::isfinite(base_voxel_size) || base_voxel_size <= 0.0) {
+            logPrintf(stderr, "Error: --voxel-size must be a positive finite number\n");
+            return EXIT_FAILURE;
+        }
+        logPrintf(stdout, "Voxel size (from CLI): %g %s\n", base_voxel_size, voxel_unit.c_str());
+    } else if (auto mv = readVolumeVoxelSize(vol_path); mv.has_value()) {
+        if (std::isfinite(*mv) && *mv > 0.0) {
+            base_voxel_size = *mv;
+            logPrintf(stdout, "Voxel size (from volume metadata): %g %s\n", base_voxel_size, voxel_unit.c_str());
+        } else {
+            logPrintf(stderr, "Warning: ignoring invalid metadata voxelsize; using default 1.0\n");
+        }
+    } else {
+        logPrintf(stdout, "Voxel size: 1.0 (no metadata found; override with --voxel-size)\n");
+    }
+
     int rotQuadGlobal = -1;
     if (std::abs(rotate_angle) > 1e-6) {
         rotQuadGlobal = normalizeQuadrantRotation(rotate_angle);
@@ -1506,7 +1553,8 @@ int main(int argc, char *argv[])
                 cv::Size attrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
-                               accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW);
+                               accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
+                               base_voxel_size, voxel_unit);
                 return true;
             } else if (numParts > 1) {
                 if (!std::filesystem::exists(std::filesystem::path(zarrOutputArg) / "0" / ".zarray")) {
@@ -1705,7 +1753,8 @@ int main(int argc, char *argv[])
                 cv::Size attrXY = tgt_size;
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
-                               accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW);
+                               accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
+                               base_voxel_size, voxel_unit);
             }
         }
         return true;

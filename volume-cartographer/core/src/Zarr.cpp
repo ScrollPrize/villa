@@ -322,7 +322,8 @@ void createPyramidDatasets(const std::filesystem::path& outDir,
 
     std::vector<size_t> prevShape = shape0;
     for (int level = 1; level <= 5; level++) {
-        std::vector<size_t> shape = {(prevShape[0]+1)/2, (prevShape[1]+1)/2, (prevShape[2]+1)/2};
+        // Keep Z fixed and halve only Y/X at each level (anisotropic scaling).
+        std::vector<size_t> shape = {prevShape[0], (prevShape[1]+1)/2, (prevShape[2]+1)/2};
         size_t chZ = std::min(shape[0], shape0[0]);
         std::vector<size_t> chunks = {chZ, std::min(CH, shape[1]), std::min(CW, shape[2])};
         vc::createZarrDataset(outDir, std::to_string(level), shape, chunks, dtype, "blosc");
@@ -338,7 +339,8 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
                     const std::filesystem::path& volPath, int groupIdx,
                     size_t baseZ, double sliceStep, double accumStep,
                     const std::string& accumTypeStr, size_t accumSamples,
-                    const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW)
+                    const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW,
+                    double baseVoxelSize, const std::string& voxelUnit)
 {
     Json attrs;
     attrs["source_zarr"] = volPath.string();
@@ -362,17 +364,22 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
 
     Json ms;
     ms["version"] = "0.4"; ms["name"] = "render";
+    auto makeAxis = [&](const char* name) -> Json {
+        Json ax = Json{{"name", name}, {"type", "space"}};
+        if (!voxelUnit.empty()) ax["unit"] = voxelUnit;
+        return ax;
+    };
     Json axes = Json::array();
-    axes.push_back(Json{{"name","z"},{"type","space"}});
-    axes.push_back(Json{{"name","y"},{"type","space"}});
-    axes.push_back(Json{{"name","x"},{"type","space"}});
+    axes.push_back(makeAxis("z"));
+    axes.push_back(makeAxis("y"));
+    axes.push_back(makeAxis("x"));
     ms["axes"] = std::move(axes);
     ms["datasets"] = Json::array();
     for (int l = 0; l <= 5; l++) {
-        double s = std::pow(2.0, l);
-        const double sz = 1.0;
+        const double sYX = baseVoxelSize * std::pow(2.0, l);
+        const double sZ = baseVoxelSize;
         Json scale_arr = Json::array();
-        scale_arr.push_back(sz); scale_arr.push_back(s); scale_arr.push_back(s);
+        scale_arr.push_back(sZ); scale_arr.push_back(sYX); scale_arr.push_back(sYX);
         Json trans_arr = Json::array();
         trans_arr.push_back(0.0); trans_arr.push_back(0.0); trans_arr.push_back(0.0);
         Json transforms = Json::array();
