@@ -573,15 +573,15 @@ class BaseTrainer:
             region_target = torch.cat([foreground, ignore_channel], dim=1)
             return fg_prediction, region_target, {}
 
+        extra_loss_kwargs = {}
         if loss_name == "BCEWithLogitsLoss":
             if ignore_mask is not None:
-                bce_target = target.float().clone()
-                bce_target = torch.where(ignore_mask, bce_target, foreground)
+                bce_target = foreground
+                extra_loss_kwargs["loss_mask"] = (~ignore_mask).float()
             else:
                 bce_target = foreground
-            return fg_prediction, bce_target, {}
+            return fg_prediction, bce_target, extra_loss_kwargs
 
-        extra_loss_kwargs = {}
         if ignore_mask is not None:
             extra_loss_kwargs["loss_mask"] = (~ignore_mask).float()
         return fg_prediction, foreground, extra_loss_kwargs

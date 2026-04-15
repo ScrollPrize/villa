@@ -175,6 +175,27 @@ def test_tokenbook3d_token_mlp_returns_unit_interval_mask():
     assert float(guide.max().detach()) <= 1.0
 
 
+def test_tokenbook3d_token_mask_does_not_globally_renormalize_surviving_tokens():
+    module = TokenBook3D(n_tokens=4, embed_dim=16)
+    x = torch.randn(1, 16, 2, 2, 2)
+    token_mask = torch.ones((1, 8), dtype=torch.float32)
+    token_mask[:, 4:] = 0.0
+
+    full_guide = module(x)
+    masked_guide = module(x, token_mask=token_mask)
+
+    full_flat = full_guide.reshape(1, -1)
+    masked_flat = masked_guide.reshape(1, -1)
+    kept = token_mask.bool()
+    dropped = ~kept
+
+    assert torch.allclose(masked_flat[dropped], torch.full_like(masked_flat[dropped], 0.5), atol=1e-6, rtol=1e-6)
+    assert not torch.allclose(masked_flat[kept], torch.full_like(masked_flat[kept], 0.5), atol=1e-3, rtol=1e-3)
+    assert masked_flat[kept].abs().mean().item() > 0.0
+    assert masked_flat[kept].std().item() > 0.0
+    assert full_flat[kept].std().item() > 0.0
+
+
 def test_pixelshuffle3d_upsamples_tuple_factor_shape():
     module = PixelShuffle3D((2, 2, 2))
     x = torch.randn(2, 32, 3, 4, 5)

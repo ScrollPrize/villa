@@ -88,8 +88,6 @@ class TokenBook3D(nn.Module):
         if token_mask is not None:
             token_mask = token_mask.to(device=similarities.device, dtype=similarities.dtype)
             similarities = similarities * token_mask
-            denom = token_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-            similarities = similarities / denom
 
         guide = similarities.reshape(batch_size, 1, depth, height, width)
         guide = guide * 0.5 + 0.5
