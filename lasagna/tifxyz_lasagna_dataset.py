@@ -893,13 +893,16 @@ def _transform_geometry(geom_list, flip_z, flip_y, flip_x, k, size_zyx):
             if flip_x:
                 pts[:, 2] = (Xs - 1) - pts[:, 2]
                 nrm[:, 2] *= -1.0
+            # torch.rot90(k=+1, dims=(Y, X)) sends old (y, x) to
+            # new ((N-1) - old_x, old_y). Vectors rotate the same
+            # way: old +y -> new +x, old +x -> new -y.
             for _ in range(k % 4):
-                y_new = pts[:, 2].copy()
-                x_new = (Ys - 1) - pts[:, 1]
+                y_new = (Ys - 1) - pts[:, 2].copy()
+                x_new = pts[:, 1].copy()
                 pts[:, 1] = y_new
                 pts[:, 2] = x_new
-                ny_new = nrm[:, 2].copy()
-                nx_new = -nrm[:, 1]
+                ny_new = -nrm[:, 2].copy()
+                nx_new = nrm[:, 1].copy()
                 nrm[:, 1] = ny_new
                 nrm[:, 2] = nx_new
         out.append({**g, "points_local": pts, "normals_zyx": nrm})
