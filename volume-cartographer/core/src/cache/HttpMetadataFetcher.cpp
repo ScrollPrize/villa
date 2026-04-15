@@ -284,12 +284,55 @@ static std::optional<std::string> readRemoteSourceMarker(
     }
 }
 
+// Read any persisted source shard config from the marker. Only returns a
+// config when this cache was created for a v3-sharded source — v2 sources
+// write enabled=false (or omit the field) so we never mistake them.
+static std::optional<ShardConfig> readRemoteShardConfig(
+    const std::filesystem::path& stagingDir)
+{
+    auto markerJson = readFile(stagingDir / kRemoteSourceFile);
+    if (markerJson.empty()) return std::nullopt;
+    try {
+        auto marker = utils::Json::parse(markerJson);
+        auto* sc = json_find(marker, "shard_config");
+        if (!sc || !sc->is_object()) return std::nullopt;
+        ShardConfig cfg;
+        auto* en = json_find(*sc, "enabled");
+        if (en && en->is_boolean()) cfg.enabled = en->get_bool();
+        if (!cfg.enabled) return cfg;
+        auto* shape = json_find(*sc, "shape");
+        if (!shape || !shape->is_array()) return std::nullopt;
+        if (shape->size() != 3) return std::nullopt;
+        cfg.shardShape = {
+            int((*shape)[0].get_int()),
+            int((*shape)[1].get_int()),
+            int((*shape)[2].get_int()),
+        };
+        return cfg;
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
 static void writeRemoteSourceMarker(
     const std::filesystem::path& stagingDir,
-    const std::string& baseUrl)
+    const std::string& baseUrl,
+    const ShardConfig* shardConfig = nullptr)
 {
     utils::Json marker;
     marker["url"] = baseUrl;
+    if (shardConfig) {
+        utils::Json sc;
+        sc["enabled"] = shardConfig->enabled;
+        if (shardConfig->enabled) {
+            utils::JsonArray shape;
+            shape.push_back(utils::Json(shardConfig->shardShape[0]));
+            shape.push_back(utils::Json(shardConfig->shardShape[1]));
+            shape.push_back(utils::Json(shardConfig->shardShape[2]));
+            sc["shape"] = utils::Json(std::move(shape));
+        }
+        marker["shard_config"] = std::move(sc);
+    }
     writeFile(stagingDir / kRemoteSourceFile, marker.dump(2));
 }
 
@@ -334,33 +377,24 @@ static std::optional<RemoteZarrInfo> tryLoadCachedMetadata(
         } catch (...) {}
     }
 
-    // Recover the source's shard config from the cached level-0 zarr.json
-    // if present. Without this, HttpSource stays in non-sharded mode on
-    // every vc3d run after the first and tries to fetch chunks via the
-    // wrong URL pattern (chunkUrl instead of shardUrl).
+    // Recover the source shard config from the marker file we wrote during
+    // the live metadata fetch. Reading the local `0/zarr.json` is WRONG
+    // here — that's our own canonical output format, not the source's
+    // metadata; doing so flipped v2-chunked sources into sharded mode and
+    // made every subsequent chunk fetch 404 against the real S3 layout.
     ShardConfig shardConfig;
-    auto level0ZarrJson = stagingDir / "0" / "zarr.json";
-    if (fs::exists(level0ZarrJson)) {
-        try {
-            auto json = readFile(level0ZarrJson);
-            auto meta = utils::detail::parse_zarr_json(json);
-            if (meta.shard_config && meta.chunks.size() >= 3) {
-                shardConfig.enabled = true;
-                shardConfig.shardShape = {
-                    int(meta.chunks[0]), int(meta.chunks[1]), int(meta.chunks[2])
-                };
-                if (auto* log = cacheDebugLog())
-                    std::fprintf(log,
-                        "[REMOTE] Recovered shard config from cached zarr.json: shape=[%d, %d, %d]\n",
-                        shardConfig.shardShape[0],
-                        shardConfig.shardShape[1],
-                        shardConfig.shardShape[2]);
-            }
-        } catch (const std::exception& e) {
-            if (auto* log = cacheDebugLog())
+    if (auto recovered = readRemoteShardConfig(stagingDir)) {
+        shardConfig = *recovered;
+        if (auto* log = cacheDebugLog()) {
+            if (shardConfig.enabled)
                 std::fprintf(log,
-                    "[REMOTE] Failed to recover shard config from cached zarr.json: %s\n",
-                    e.what());
+                    "[REMOTE] Recovered shard config from marker: shape=[%d, %d, %d]\n",
+                    shardConfig.shardShape[0],
+                    shardConfig.shardShape[1],
+                    shardConfig.shardShape[2]);
+            else
+                std::fprintf(log,
+                    "[REMOTE] Marker reports source is not sharded\n");
         }
     }
 
@@ -395,7 +429,9 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
     }
 
     if (auto cached = tryLoadCachedMetadata(baseUrl, stagingDir)) {
-        writeRemoteSourceMarker(stagingDir, baseUrl);
+        // Preserve the existing shard config entry so we don't downgrade
+        // the marker back to "unknown" on the rewrite.
+        writeRemoteSourceMarker(stagingDir, baseUrl, &cached->shardConfig);
         return *cached;
     }
 
@@ -563,7 +599,7 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
     meta["max"] = 255;
 
     writeFile(stagingDir / "meta.json", meta.dump(2));
-    writeRemoteSourceMarker(stagingDir, baseUrl);
+    writeRemoteSourceMarker(stagingDir, baseUrl, &shardConfig);
 
     if (auto* log = cacheDebugLog())
         std::fprintf(log, "[REMOTE] Metadata complete: %d levels, shape=[%d, %d, %d] delimiter='%s'%s\n",
