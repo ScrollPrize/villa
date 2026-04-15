@@ -508,6 +508,23 @@ class BaseTrainer:
         if skeleton_data is not None and base_loss.__class__.__name__ in skeleton_losses:
             return loss_fn(prediction, ground_truth, skeleton_data, **extra_loss_kwargs)
 
+        if base_loss.__class__.__name__ == "BCEWithLogitsLoss" and "loss_mask" in extra_loss_kwargs:
+            loss_mask = extra_loss_kwargs.pop("loss_mask")
+            if loss_mask.dim() == prediction.dim() - 1:
+                loss_mask = loss_mask.unsqueeze(1)
+            if loss_mask.shape[1] == 1 and prediction.shape[1] > 1:
+                loss_mask = loss_mask.expand_as(prediction)
+            loss_map = F.binary_cross_entropy_with_logits(
+                prediction,
+                ground_truth,
+                weight=base_loss.weight,
+                pos_weight=base_loss.pos_weight,
+                reduction="none",
+            )
+            masked_loss = loss_map * loss_mask.to(dtype=loss_map.dtype)
+            denom = loss_mask.sum().clamp_min(1.0)
+            return masked_loss.sum() / denom
+
         return loss_fn(prediction, ground_truth, **extra_loss_kwargs)
 
     def _resolve_target_ignore_value(self, target_name: str):

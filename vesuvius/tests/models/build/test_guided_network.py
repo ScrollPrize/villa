@@ -196,6 +196,17 @@ def test_tokenbook3d_token_mask_does_not_globally_renormalize_surviving_tokens()
     assert full_flat[kept].std().item() > 0.0
 
 
+def test_tokenbook3d_use_ema_keeps_book_trainable() -> None:
+    module = TokenBook3D(n_tokens=4, embed_dim=16, ema_decay=0.9, use_ema=True)
+    x = torch.randn(2, 16, 2, 2, 2, requires_grad=True)
+
+    guide = module(x)
+    guide.sum().backward()
+
+    assert module.book.grad is not None
+    assert torch.count_nonzero(module.book.grad).item() > 0
+
+
 def test_pixelshuffle3d_upsamples_tuple_factor_shape():
     module = PixelShuffle3D((2, 2, 2))
     x = torch.randn(2, 32, 3, 4, 5)
@@ -672,21 +683,27 @@ def test_pretrained_backbone_freeze_encoder_disables_grads_and_preserves_weights
     assert model.shared_encoder.training is False
 
 
-def test_pretrained_backbone_without_freeze_encoder_still_reinitializes_conv_stem(tmp_path: Path):
+def test_pretrained_backbone_without_freeze_encoder_preserves_encoder_weights_under_init(tmp_path: Path):
     checkpoint_path = tmp_path / "guide_backbone.pt"
     _write_local_guide_checkpoint(checkpoint_path)
     mgr = _make_pretrained_backbone_mgr(checkpoint_path, freeze_encoder=False)
     model = NetworkFromConfig(mgr)
 
-    before = {
+    encoder_before = {
         key: value.detach().clone()
         for key, value in model.shared_encoder.state_dict().items()
     }
+    decoder_before = {
+        key: value.detach().clone()
+        for key, value in model.task_decoders["surface"].state_dict().items()
+    }
     model.apply(InitWeights_He(neg_slope=0.2))
-    after = model.shared_encoder.state_dict()
+    encoder_after = model.shared_encoder.state_dict()
+    decoder_after = model.task_decoders["surface"].state_dict()
 
-    changed = [key for key in before if not torch.equal(before[key], after[key])]
-    assert "backbone.down_projection.proj.weight" in changed
+    assert all(torch.equal(encoder_before[key], encoder_after[key]) for key in encoder_before)
+    changed_decoder = [key for key in decoder_before if not torch.equal(decoder_before[key], decoder_after[key])]
+    assert changed_decoder
 
 
 def test_build_dinov2_decoder_accepts_pixelshuffle_conv(tmp_path: Path):

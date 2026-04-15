@@ -814,6 +814,37 @@ def test_direct_segmentation_plain_bce_with_logits_masks_ignored_labels(tmp_path
     assert extra_loss_kwargs["loss_mask"][..., 0, 0, 1].item() == pytest.approx(1.0)
 
 
+def test_direct_segmentation_plain_bce_with_logits_ignores_masked_voxels_in_loss(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="direct_segmentation",
+        guide_loss_weight=0.0,
+        losses=[{"name": "BCEWithLogitsLoss", "weight": 1.0}],
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    trainer.mgr.targets["ink"]["ignore_label"] = -1.0
+
+    prediction = torch.zeros((1, 2, 4, 4, 4), dtype=torch.float32)
+    target = torch.zeros((1, 1, 4, 4, 4), dtype=torch.float32)
+    target[..., 0, 0, 0] = -1.0
+    target[..., 0, 0, 1] = 1.0
+    value = trainer._compute_loss_value(
+        torch.nn.BCEWithLogitsLoss(),
+        prediction,
+        target,
+        target_name="ink",
+        targets_dict={"ink": target},
+        outputs={"ink": prediction},
+    )
+
+    assert torch.isfinite(value)
+    assert value.item() == pytest.approx(float(torch.nn.functional.softplus(torch.tensor(0.0)).item()), rel=1e-4)
+
+
 def test_direct_segmentation_medial_surface_recall_smoke_runs(tmp_path: Path):
     data_root = _make_synthetic_dataset(tmp_path)
     guide_checkpoint = tmp_path / "guide_backbone.pt"

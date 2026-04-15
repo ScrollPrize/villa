@@ -69,7 +69,10 @@ class TokenBook3D(nn.Module):
             self._ema_update()
 
         batch_size, _channels, depth, height, width = x.shape
-        book = self.book_ema if self.use_ema and self.book_ema is not None else self.book
+        if self.training or not self.use_ema or self.book_ema is None:
+            book = self.book
+        else:
+            book = self.book_ema
 
         tokens = self.input_conv(x).flatten(2).transpose(1, 2)
         tokens = F.normalize(tokens, dim=-1)

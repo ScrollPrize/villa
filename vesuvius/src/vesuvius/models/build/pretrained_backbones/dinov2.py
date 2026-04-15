@@ -306,7 +306,10 @@ def build_dinov2_backbone(name, input_channels, input_shape, *, config_path=None
         )
     backbone = build_dinovol_2_backbone(model_config)
     backbone.load_pretrained_weights(_load_teacher_backbone_state(checkpoint), unchunk=True)
-    return Dinov2Backbone(backbone)
+    wrapped = Dinov2Backbone(backbone)
+    for module in wrapped.modules():
+        setattr(module, "_skip_weight_init", True)
+    return wrapped
 
 
 def build_dinov2_decoder(name, encoder, num_classes):
