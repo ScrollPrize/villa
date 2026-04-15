@@ -284,6 +284,84 @@ void appendChunksForRegion(BlockPipeline& cache, int level,
                 out.push_back({level, iz, iy, ix});
 }
 
+// Surface-aware chunk enumeration. Bbox enumeration is correct for planes
+// (the plane really does span its bbox) but disastrous for curved surfaces:
+// a flattened scroll surface might span a 4000x4000x500 voxel bbox while
+// actually crossing only a few hundred chunks. The other thousands of
+// bbox-interior chunks are off-surface, genuinely absent on S3, and end up
+// poisoning the negative cache for no reason. Walk per-pixel coords, map
+// each to its chunk, dedup. Sub-sample to keep the dedup set cheap.
+void appendChunksForCoordsSurface(BlockPipeline& cache, int level,
+                                  const cv::Mat_<cv::Vec3f>& coords,
+                                  std::vector<vc::cache::ChunkKey>& out) {
+    auto cs = cache.chunkShape(level);
+    if (cs[0] <= 0 || cs[1] <= 0 || cs[2] <= 0) return;
+    auto ls = cache.levelShape(level);
+    const int chunksZ = (ls[0] + cs[0] - 1) / cs[0];
+    const int chunksY = (ls[1] + cs[1] - 1) / cs[1];
+    const int chunksX = (ls[2] + cs[2] - 1) / cs[2];
+
+    const float scale = (level > 0) ? 1.0f / float(1 << level) : 1.0f;
+    // Sub-sample stride: at native resolution, ~1 voxel per pixel and a
+    // chunk is 128 voxels, so an 8-pixel stride still hits every chunk
+    // the surface crosses (16 samples per chunk row → safe coverage even
+    // for steeply oblique surface patches).
+    const int stride = (coords.rows > 256) ? 8 : 1;
+
+    std::unordered_set<vc::cache::ChunkKey, vc::cache::ChunkKeyHash> seen;
+    seen.reserve(512);
+
+    for (int r = 0; r < coords.rows; r += stride) {
+        const cv::Vec3f* row = coords.ptr<cv::Vec3f>(r);
+        for (int c = 0; c < coords.cols; c += stride) {
+            const cv::Vec3f& v = row[c];
+            // Skip NaN / zero-sentinel pixels (off-surface).
+            if (!isfinite_bitwise(v[0])) continue;
+            if (v[0] == 0.f && v[1] == 0.f && v[2] == 0.f) continue;
+            const int ix_ = int(std::floor(v[0] * scale));
+            const int iy_ = int(std::floor(v[1] * scale));
+            const int iz_ = int(std::floor(v[2] * scale));
+            if (ix_ < 0 || iy_ < 0 || iz_ < 0) continue;
+            const int cx = ix_ / cs[2];
+            const int cy = iy_ / cs[1];
+            const int cz = iz_ / cs[0];
+            if (cx >= chunksX || cy >= chunksY || cz >= chunksZ) continue;
+            vc::cache::ChunkKey k{level, cz, cy, cx};
+            if (seen.insert(k).second) out.push_back(k);
+        }
+    }
+}
+
+// Sort prefetch keys by 3D distance from the viewport-center voxel (in
+// level-0 space). The IOPool preserves submission order when rebuilding
+// the front of its priority queue, so center-most chunks land at the head
+// of the download/load queue and stream in first. `centerL0` is in level-0
+// voxel coordinates.
+void sortKeysByCenterDistance(std::vector<vc::cache::ChunkKey>& keys,
+                              const std::array<int, 3>* chunkShapesByLevel,
+                              int numLevels,
+                              const cv::Vec3f& centerL0) {
+    if (keys.size() < 2) return;
+    auto sqDist = [&](const vc::cache::ChunkKey& k) -> float {
+        if (k.level < 0 || k.level >= numLevels) return std::numeric_limits<float>::max();
+        const auto& cs = chunkShapesByLevel[k.level];
+        if (cs[0] <= 0) return std::numeric_limits<float>::max();
+        const float scale = float(1 << k.level);
+        // Chunk center in level-0 voxel space.
+        float cx = (float(k.ix) + 0.5f) * float(cs[2]) * scale;
+        float cy = (float(k.iy) + 0.5f) * float(cs[1]) * scale;
+        float cz = (float(k.iz) + 0.5f) * float(cs[0]) * scale;
+        float dx = cx - centerL0[0];
+        float dy = cy - centerL0[1];
+        float dz = cz - centerL0[2];
+        return dx*dx + dy*dy + dz*dz;
+    };
+    std::sort(keys.begin(), keys.end(),
+        [&](const vc::cache::ChunkKey& a, const vc::cache::ChunkKey& b) {
+            return sqDist(a) < sqDist(b);
+        });
+}
+
 // Convenience wrapper: single-region, single-level. Submits immediately.
 void prefetchRegion(BlockPipeline& cache, int level,
                     float minVx, float minVy, float minVz,
@@ -626,29 +704,18 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
     // Thread-local to avoid per-frame alloc/free.
     thread_local std::vector<vc::cache::ChunkKey> prefetchKeys;
     prefetchKeys.clear();
+    cv::Vec3f viewCenterL0(0, 0, 0);
+    bool haveCenter = false;
     if (coords) {
-        // Compute world-space bbox once, subsample like the composite path.
-        float minVx = FLT_MAX, minVy = FLT_MAX, minVz = FLT_MAX;
-        float maxVx = -FLT_MAX, maxVy = -FLT_MAX, maxVz = -FLT_MAX;
-        const int stride = (coords->rows > 256) ? 8 : 1;
-        for (int r = 0; r < coords->rows; r += stride) {
-            const cv::Vec3f* row = coords->ptr<cv::Vec3f>(r);
-            for (int c = 0; c < coords->cols; c += stride) {
-                const auto& v = row[c];
-                // Branchless NaN-safe reduction: fmin/fmax propagate
-                // the non-NaN operand on NEON.
-                minVx = std::fmin(minVx, v[0]); maxVx = std::fmax(maxVx, v[0]);
-                minVy = std::fmin(minVy, v[1]); maxVy = std::fmax(maxVy, v[1]);
-                minVz = std::fmin(minVz, v[2]); maxVz = std::fmax(maxVz, v[2]);
-            }
+        // Surface-aware enumeration: only the chunks the surface actually
+        // crosses, never the bbox interior.
+        for (int lvl = desiredLevel; lvl < numLevels; lvl++) {
+            appendChunksForCoordsSurface(cache, lvl, *coords, prefetchKeys);
         }
-        if (maxVx >= minVx) {
-            for (int lvl = desiredLevel; lvl < numLevels; lvl++) {
-                float s = levelScale(lvl);
-                appendChunksForRegion(cache, lvl,
-                    minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s,
-                    prefetchKeys);
-            }
+        const cv::Vec3f cv = (*coords)(coords->rows / 2, coords->cols / 2);
+        if (isfinite_bitwise(cv[0])) {
+            viewCenterL0 = cv;
+            haveCenter = true;
         }
     } else {
         // Plane bbox from corners, compute once then scale per level.
@@ -663,8 +730,22 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
                 minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s,
                 prefetchKeys);
         }
+        viewCenterL0 = *origin
+            + (*vx_step) * (float(w) * 0.5f)
+            + (*vy_step) * (float(h) * 0.5f);
+        haveCenter = true;
     }
-    if (!prefetchKeys.empty()) cache.fetchInteractive(prefetchKeys, desiredLevel);
+    if (!prefetchKeys.empty()) {
+        if (haveCenter) {
+            std::array<std::array<int, 3>, vc::cache::kMaxLevels> shapes{};
+            for (int lvl = 0; lvl < numLevels && lvl < vc::cache::kMaxLevels; ++lvl)
+                shapes[lvl] = cache.chunkShape(lvl);
+            sortKeysByCenterDistance(prefetchKeys, shapes.data(),
+                                     std::min(numLevels, int(vc::cache::kMaxLevels)),
+                                     viewCenterL0);
+        }
+        cache.fetchInteractive(prefetchKeys, desiredLevel);
+    }
 
     float scales[32] = {};
     const int nSamplersTotal = numLevels - desiredLevel;
@@ -758,41 +839,32 @@ void sampleCompositeAdaptiveImpl(
     const float zMin = std::min(zLo, zHi), zMax = std::max(zLo, zHi);
 
     // Prefetch covered bbox across all fallback levels.
+    cv::Vec3f viewCenterL0(0, 0, 0);
+    bool haveCenter = false;
     if (coords) {
-        float minVx=FLT_MAX, minVy=FLT_MAX, minVz=FLT_MAX;
-        float maxVx=-FLT_MAX, maxVy=-FLT_MAX, maxVz=-FLT_MAX;
-        // Subsample the coord grid for bbox computation: for a ~1920x1080
-        // coords matrix, an 8x8 stride gives 30k samples instead of 2M
-        // and still bounds the actual bbox within a voxel of truth
-        // (prefetch is block-granular anyway).
-        const int stride = (coords->rows > 256) ? 8 : 1;
-        // Hoist the normals pointer out of the per-pixel branch and use
-        // fmin/fmax so the reduction vectorizes — NaN coords/normals
-        // propagate their non-NaN counterpart through the reduction.
-        const bool haveNormals = normals != nullptr;
-        for (int r=0; r<coords->rows; r += stride) {
-            const cv::Vec3f* row = coords->ptr<cv::Vec3f>(r);
-            const cv::Vec3f* nrow = haveNormals ? normals->ptr<cv::Vec3f>(r) : nullptr;
-            for (int c=0; c<coords->cols; c += stride) {
-                const cv::Vec3f v = row[c];
-                const cv::Vec3f n = haveNormals ? nrow[c] : cv::Vec3f(0,0,0);
-                float lox = v[0]+n[0]*zMin, hix = v[0]+n[0]*zMax;
-                float loy = v[1]+n[1]*zMin, hiy = v[1]+n[1]*zMax;
-                float loz = v[2]+n[2]*zMin, hiz = v[2]+n[2]*zMax;
-                minVx=std::fmin(minVx,std::fmin(lox,hix)); maxVx=std::fmax(maxVx,std::fmax(lox,hix));
-                minVy=std::fmin(minVy,std::fmin(loy,hiy)); maxVy=std::fmax(maxVy,std::fmax(loy,hiy));
-                minVz=std::fmin(minVz,std::fmin(loz,hiz)); maxVz=std::fmax(maxVz,std::fmax(loz,hiz));
-            }
+        // Surface-aware enumeration replaces bbox: a curved scroll surface
+        // spans a huge bbox while only crossing a few hundred chunks. Use
+        // the per-pixel coords to enqueue exactly the chunks the surface
+        // touches; bbox enumeration is left in place only to compute the
+        // view center fallback when the central pixel is NaN.
+        thread_local std::vector<vc::cache::ChunkKey> keys;
+        keys.clear();
+        for (int lvl = desiredLevel; lvl < numLevels; ++lvl) {
+            appendChunksForCoordsSurface(cache, lvl, *coords, keys);
         }
-        if (maxVx >= minVx) {
-            thread_local std::vector<vc::cache::ChunkKey> keys;
-            keys.clear();
-            for (int lvl=desiredLevel; lvl<numLevels; lvl++) {
-                float s = levelScale(lvl);
-                appendChunksForRegion(cache, lvl,
-                    minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s, keys);
-            }
-            if (!keys.empty()) cache.fetchInteractive(keys, desiredLevel);
+        const cv::Vec3f cvCenter = (*coords)(coords->rows / 2, coords->cols / 2);
+        if (isfinite_bitwise(cvCenter[0])) {
+            viewCenterL0 = cvCenter;
+            haveCenter = true;
+        }
+        if (!keys.empty()) {
+            std::array<std::array<int, 3>, vc::cache::kMaxLevels> shapes{};
+            for (int lvl = 0; lvl < numLevels && lvl < vc::cache::kMaxLevels; ++lvl)
+                shapes[lvl] = cache.chunkShape(lvl);
+            sortKeysByCenterDistance(keys, shapes.data(),
+                                     std::min(numLevels, int(vc::cache::kMaxLevels)),
+                                     viewCenterL0);
+            cache.fetchInteractive(keys, desiredLevel);
         }
     } else {
         cv::Vec3f p0 = *origin + (*planeNormal) * zMin;
@@ -807,8 +879,21 @@ void sampleCompositeAdaptiveImpl(
             appendChunksForRegion(cache, lvl,
                 minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s, keys);
         }
-        if (!keys.empty()) cache.fetchInteractive(keys, desiredLevel);
+        viewCenterL0 = *origin
+            + (*vx_step) * (float(w) * 0.5f)
+            + (*vy_step) * (float(h) * 0.5f);
+        haveCenter = true;
+        if (!keys.empty()) {
+            std::array<std::array<int, 3>, vc::cache::kMaxLevels> shapes{};
+            for (int lvl = 0; lvl < numLevels && lvl < vc::cache::kMaxLevels; ++lvl)
+                shapes[lvl] = cache.chunkShape(lvl);
+            sortKeysByCenterDistance(keys, shapes.data(),
+                                     std::min(numLevels, int(vc::cache::kMaxLevels)),
+                                     viewCenterL0);
+            cache.fetchInteractive(keys, desiredLevel);
+        }
     }
+    (void)haveCenter;
 
     // Precompute per-level scale factor once (1.0 / 2^lvl). Hoists the
     // integer shift + int->float convert + fdiv out of the hot inner loop.
