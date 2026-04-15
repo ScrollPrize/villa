@@ -61,12 +61,47 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from types import SimpleNamespace
+
+
+def _init_distributed():
+    """Read torchrun env vars and bring up the process group.
+
+    Returns (rank, local_rank, world_size, is_dist).
+    Single-GPU runs (no torchrun) → (0, 0, 1, False) and no init.
+    """
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", "0"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    is_dist = world_size > 1
+    if is_dist and not dist.is_initialized():
+        dist.init_process_group(backend="nccl", init_method="env://")
+        torch.cuda.set_device(local_rank)
+    return rank, local_rank, world_size, is_dist
+
+
+def _allreduce_max(value: int, world_size: int, device) -> int:
+    if world_size <= 1:
+        return value
+    t = torch.tensor([int(value)], device=device, dtype=torch.long)
+    dist.all_reduce(t, op=dist.ReduceOp.MAX)
+    return int(t.item())
+
+
+def _allreduce_mean(value: float, world_size: int, device) -> float:
+    if world_size <= 1:
+        return float(value)
+    t = torch.tensor([float(value)], device=device, dtype=torch.float64)
+    dist.all_reduce(t, op=dist.ReduceOp.SUM)
+    return float(t.item() / world_size)
 
 # Ensure lasagna/ dir is on sys.path for sibling imports
 _LASAGNA_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -614,9 +649,33 @@ def train(
     wandb_run_name: Optional[str] = None,
     wandb_tags: Optional[List[str]] = None,
 ) -> None:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = Path(log_dir) / f"{timestamp}_{run_name}"
-    run_dir.mkdir(parents=True, exist_ok=True)
+    rank, local_rank, world_size, is_dist = _init_distributed()
+    is_main = rank == 0
+
+    # Pin each rank to its visible device. With CUDA_VISIBLE_DEVICES,
+    # local_rank indexes into the (already-masked) visible set, so
+    # cuda:{local_rank} always refers to a device the process owns.
+    if is_dist:
+        device = f"cuda:{local_rank}"
+    device_type = "cuda" if str(device).startswith("cuda") else "cpu"
+
+    # Rank 0 picks the run_dir name, then broadcasts it so every rank
+    # resolves the same path (timestamps would otherwise drift across
+    # process startup).
+    if is_main:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_dir_str = str(Path(log_dir) / f"{timestamp}_{run_name}")
+    else:
+        run_dir_str = ""
+    if is_dist:
+        bcast = [run_dir_str]
+        dist.broadcast_object_list(bcast, src=0)
+        run_dir_str = bcast[0]
+    run_dir = Path(run_dir_str)
+    if is_main:
+        run_dir.mkdir(parents=True, exist_ok=True)
+    if is_dist:
+        dist.barrier()
 
     # Load config
     with open(config_path, "r") as f:
@@ -662,11 +721,13 @@ def train(
         "same_surface_threshold": same_surface_threshold,
         "cmd": " ".join(sys.argv),
     }
-    (run_dir / "config.json").write_text(json.dumps(run_config, indent=2) + "\n")
+    if is_main:
+        (run_dir / "config.json").write_text(json.dumps(run_config, indent=2) + "\n")
 
     # Optional W&B init. Soft dep — failure never breaks training.
+    # Only rank 0 talks to W&B.
     wandb_run = None
-    if wandb_enabled:
+    if wandb_enabled and is_main:
         try:
             import wandb
             wandb_run = wandb.init(
@@ -709,17 +770,41 @@ def train(
     train_dataset = Subset(full_dataset, train_indices)
     val_dataset = Subset(full_dataset, val_indices)
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True,
-        num_workers=num_workers, pin_memory=True,
-        collate_fn=collate_variable_surfaces,
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=1, shuffle=False,
-        num_workers=num_workers,
-        collate_fn=collate_variable_surfaces,
-    )
-    print(f"{TAG} {n_train} train / {n_val} val patches", flush=True)
+    if is_dist:
+        train_sampler = DistributedSampler(
+            train_dataset, num_replicas=world_size, rank=rank,
+            shuffle=True, drop_last=True,
+        )
+        val_sampler = DistributedSampler(
+            val_dataset, num_replicas=world_size, rank=rank,
+            shuffle=False, drop_last=False,
+        )
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, sampler=train_sampler,
+            num_workers=num_workers, pin_memory=True,
+            collate_fn=collate_variable_surfaces,
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=1, sampler=val_sampler,
+            num_workers=num_workers,
+            collate_fn=collate_variable_surfaces,
+        )
+    else:
+        train_sampler = None
+        val_sampler = None
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=True,
+            collate_fn=collate_variable_surfaces,
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=1, shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collate_variable_surfaces,
+        )
+    if is_main:
+        print(f"{TAG} {n_train} train / {n_val} val patches "
+              f"(world_size={world_size})", flush=True)
 
     # Model
     model, norm_type, upsample_mode = build_model(
@@ -727,6 +812,19 @@ def train(
         upsample_mode=upsample_mode, batch_size=batch_size,
         model_patch_size=model_patch_size,
     )
+    if is_dist:
+        # DDP broadcasts module state from rank 0 on init, so
+        # checkpoint loads on rank 0 (or random init from rank 0)
+        # propagate to all ranks automatically.
+        model = DDP(
+            model, device_ids=[local_rank],
+            output_device=local_rank,
+            broadcast_buffers=True,
+            find_unused_parameters=False,
+        )
+    # Convenience handle for state_dict / inference forward that
+    # bypasses DDP's collective hooks.
+    model_core = model.module if is_dist else model
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
     # LR warmup + cosine decay
@@ -751,7 +849,8 @@ def train(
         amp_dtype = torch.float32
         use_autocast = False
         scaler = torch.amp.GradScaler(enabled=False)
-    print(f"{TAG} precision: {precision}, upsample: {upsample_mode}", flush=True)
+    if is_main:
+        print(f"{TAG} precision: {precision}, upsample: {upsample_mode}", flush=True)
 
     # Losses
     mse_loss = MaskedMSE()
@@ -759,7 +858,7 @@ def train(
     scale_loss_mse = ScaleSpaceLoss3D(mse_loss, num_scales=5)
     scale_loss_l1 = ScaleSpaceLoss3D(smooth_l1_loss, num_scales=5)
 
-    writer = SummaryWriter(log_dir=str(run_dir))
+    writer = SummaryWriter(log_dir=str(run_dir)) if is_main else None
     best_val_loss = float("inf")
     global_step = 0
 
@@ -788,16 +887,22 @@ def train(
         return (a.transpose(1, 2, 0) * 255.0 + 0.5).astype(np.uint8)
 
     def log_scalar(tag, value, step):
+        if not is_main:
+            return
         writer.add_scalar(tag, value, step)
         if wandb_run is not None:
             wandb_run.log({tag: value}, step=step)
 
     def log_image(tag, img_hwc_uint8, step):
+        if not is_main:
+            return
         writer.add_image(tag, img_hwc_uint8, step, dataformats="HWC")
         if _wandb_image_allowed(step):
             wandb_run.log({tag: _to_jpg_wandb(img_hwc_uint8)}, step=step)
 
     def log_images(tag, imgs_bchw, step):
+        if not is_main:
+            return
         writer.add_images(tag, imgs_bchw, step)
         if _wandb_image_allowed(step):
             gallery = [
@@ -823,10 +928,13 @@ def train(
     vis_ctx["output_sigmoid"] = bool(output_sigmoid)
     vis_ctx["loss_weights"] = (float(w_cos), float(w_mag), float(w_dir))
     vis_out_dir = run_dir / "vis"
-    vis_out_dir.mkdir(exist_ok=True)
+    if is_main:
+        vis_out_dir.mkdir(exist_ok=True)
     vis_interval_steps = max(1, 1000 // max(batch_size, 1))
 
     def _log_full_vis(batch_for_vis, tag: str, step: int) -> None:
+        if not is_main:
+            return
         try:
             sample0 = _sample_from_batch(batch_for_vis)
             patch_info0 = sample0["patch_info"]
@@ -847,7 +955,7 @@ def train(
                     batch_for_vis, out_path, title,
                     arrow_seed=step,
                     inference_ctx=vis_ctx,
-                    model=model,
+                    model=model_core,
                     inference_image_override=batch_for_vis["image"],
                 )
             finally:
@@ -862,7 +970,8 @@ def train(
                   f"{step}: {e}", flush=True)
 
     # Initial eval before training so we see init/load performance.
-    print(f"{TAG} running pre-training eval at step 0...", flush=True)
+    if is_main:
+        print(f"{TAG} running pre-training eval at step 0...", flush=True)
     _init_vis_batch: list = []
     init_val_loss = _evaluate(
         model, val_loader, scale_loss_mse, scale_loss_l1,
@@ -870,29 +979,38 @@ def train(
         w_cos, w_mag, w_dir,
         w_dir_dense=w_dir_dense, w_smooth=w_smooth,
         amp_dtype=amp_dtype, use_autocast=use_autocast,
-        verbose=verbose,
+        verbose=verbose and is_main,
         same_surface_threshold=same_surface_threshold,
         output_sigmoid=output_sigmoid,
         vis_batch_out=_init_vis_batch,
+        device_type=device_type,
+        world_size=world_size,
+        is_main=is_main,
     )
     if _init_vis_batch:
         _log_full_vis(_init_vis_batch[0], "val", global_step)
     _init_vis_batch.clear()
-    print(f"{TAG} init val={init_val_loss:.4f}", flush=True)
+    if is_main:
+        print(f"{TAG} init val={init_val_loss:.4f}", flush=True)
 
     last_val_loss = init_val_loss
     val_every_steps = 200
 
     for epoch in range(epochs):
         model.train()
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
         epoch_losses: List[float] = []
 
-        train_iter = tqdm(
-            train_loader,
-            desc=f"epoch {epoch + 1}/{epochs} train",
-            dynamic_ncols=True,
-            mininterval=0.0, miniters=1,
-        )
+        if is_main:
+            train_iter = tqdm(
+                train_loader,
+                desc=f"epoch {epoch + 1}/{epochs} train",
+                dynamic_ncols=True,
+                mininterval=0.0, miniters=1,
+            )
+        else:
+            train_iter = train_loader
 
         n_seen = 0
         n_skipped = 0
@@ -925,20 +1043,28 @@ def train(
                 n_surfaces_pre += len(mg)
                 n_surfaces_post += len(set(int(x) for x in mg))
 
-            if validity.sum() == 0:
+            local_validity_empty = int(validity.sum().item() == 0)
+            global_any_empty = _allreduce_max(
+                local_validity_empty, world_size, device,
+            )
+            if global_any_empty:
+                # In single-GPU mode, just skip. In DDP, an empty rank
+                # would desync allreduce with active ranks — so we
+                # collectively skip when ANY rank has no valid voxels.
                 n_skipped += 1
-                train_iter.set_postfix(
-                    loss="---",
-                    skip=f"{100.0 * n_skipped / max(n_seen, 1):.1f}%",
-                    merge=f"{100.0 * (1.0 - n_surfaces_post / max(n_surfaces_pre, 1)):.1f}%",
-                )
+                if is_main:
+                    train_iter.set_postfix(
+                        loss="---",
+                        skip=f"{100.0 * n_skipped / max(n_seen, 1):.1f}%",
+                        merge=f"{100.0 * (1.0 - n_surfaces_post / max(n_surfaces_pre, 1)):.1f}%",
+                    )
                 continue
 
             # Intensity augmentation on CT only (spatial is already done).
             image = augment_intensity(image)
 
             # Forward pass
-            with torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_autocast):
+            with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_autocast):
                 results = model(image)
                 raw_pred = results["output"]
                 pred = torch.sigmoid(raw_pred) if output_sigmoid else raw_pred  # (B, 8, Z, Y, X)
@@ -980,13 +1106,18 @@ def train(
                         flush=True,
                     )
                 n_hi_mag += len(bad)
-                if len(bad) == B:
-                    train_iter.set_postfix(
-                        loss="---",
-                        skip=f"{100.0 * n_skipped / max(n_seen, 1):.1f}%",
-                        himag=n_hi_mag,
-                        merge=f"{100.0 * (1.0 - n_surfaces_post / max(n_surfaces_pre, 1)):.1f}%",
-                    )
+                local_all_bad = int(len(bad) == B)
+                global_any_all_bad = _allreduce_max(
+                    local_all_bad, world_size, device,
+                )
+                if global_any_all_bad:
+                    if is_main:
+                        train_iter.set_postfix(
+                            loss="---",
+                            skip=f"{100.0 * n_skipped / max(n_seen, 1):.1f}%",
+                            himag=n_hi_mag,
+                            merge=f"{100.0 * (1.0 - n_surfaces_post / max(n_surfaces_pre, 1)):.1f}%",
+                        )
                     continue
                 if bad:
                     keep = torch.tensor(
@@ -1058,13 +1189,14 @@ def train(
                 print(f"{TAG} NaN/Inf at step {global_step}: loss={loss.item()}", flush=True)
 
             running = sum(epoch_losses[-20:]) / min(len(epoch_losses), 20)
-            train_iter.set_postfix(
-                loss=f"{loss.item():.4f}",
-                avg20=f"{running:.4f}",
-                skip=f"{100.0 * n_skipped / max(n_seen, 1):.1f}%",
-                himag=n_hi_mag,
-                merge=f"{100.0 * (1.0 - n_surfaces_post / max(n_surfaces_pre, 1)):.1f}%",
-            )
+            if is_main:
+                train_iter.set_postfix(
+                    loss=f"{loss.item():.4f}",
+                    avg20=f"{running:.4f}",
+                    skip=f"{100.0 * n_skipped / max(n_seen, 1):.1f}%",
+                    himag=n_hi_mag,
+                    merge=f"{100.0 * (1.0 - n_surfaces_post / max(n_surfaces_pre, 1)):.1f}%",
+                )
 
             if global_step % 10 == 0:
                 log_scalar("train/loss", loss.item(), global_step)
@@ -1104,49 +1236,61 @@ def train(
                     w_cos, w_mag, w_dir,
                     w_dir_dense=w_dir_dense, w_smooth=w_smooth,
                     amp_dtype=amp_dtype, use_autocast=use_autocast,
-                    verbose=verbose,
+                    verbose=verbose and is_main,
                     same_surface_threshold=same_surface_threshold,
                     output_sigmoid=output_sigmoid,
                     vis_batch_out=_vis_batch,
+                    device_type=device_type,
+                    world_size=world_size,
+                    is_main=is_main,
                 )
                 if _vis_batch:
                     _log_full_vis(_vis_batch[0], "val", global_step)
                 _vis_batch.clear()
                 model.train()
-                ckpt_data = {
-                    "state_dict": model.state_dict(),
-                    "norm_type": norm_type,
-                    "upsample_mode": upsample_mode,
-                    "output_sigmoid": output_sigmoid,
-                    "precision": precision,
-                    "patch_size": patch_size,
-                    "in_channels": 1,
-                    "out_channels": 8,
-                }
-                torch.save(ckpt_data, run_dir / "model_current.pt")
-                is_best = last_val_loss < best_val_loss
-                if is_best:
-                    best_val_loss = last_val_loss
-                    torch.save(ckpt_data, run_dir / "model_best.pt")
-                train_iter.write(
-                    f"{TAG} step {global_step}  val={last_val_loss:.4f}"
-                    + ("  [best]" if is_best else "")
-                )
+                if is_main:
+                    ckpt_data = {
+                        "state_dict": model_core.state_dict(),
+                        "norm_type": norm_type,
+                        "upsample_mode": upsample_mode,
+                        "output_sigmoid": output_sigmoid,
+                        "precision": precision,
+                        "patch_size": patch_size,
+                        "in_channels": 1,
+                        "out_channels": 8,
+                    }
+                    torch.save(ckpt_data, run_dir / "model_current.pt")
+                    is_best = last_val_loss < best_val_loss
+                    if is_best:
+                        best_val_loss = last_val_loss
+                        torch.save(ckpt_data, run_dir / "model_best.pt")
+                    train_iter.write(
+                        f"{TAG} step {global_step}  val={last_val_loss:.4f}"
+                        + ("  [best]" if is_best else "")
+                    )
+                if is_dist:
+                    dist.barrier()
 
         cosine_scheduler.step()
 
         mean_train = sum(epoch_losses) / max(len(epoch_losses), 1)
-        print(
-            f"epoch {epoch + 1}/{epochs}  "
-            f"train={mean_train:.4f}  val={last_val_loss:.4f}  "
-            f"lr={optimizer.param_groups[0]['lr']:.2e}",
-            flush=True,
-        )
+        if is_main:
+            print(
+                f"epoch {epoch + 1}/{epochs}  "
+                f"train={mean_train:.4f}  val={last_val_loss:.4f}  "
+                f"lr={optimizer.param_groups[0]['lr']:.2e}",
+                flush=True,
+            )
 
-    writer.close()
+    if writer is not None:
+        writer.close()
     if wandb_run is not None:
         wandb_run.finish()
-    print(f"{TAG} done. Logs & checkpoints in {run_dir}", flush=True)
+    if is_main:
+        print(f"{TAG} done. Logs & checkpoints in {run_dir}", flush=True)
+    if is_dist:
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def _evaluate(
@@ -1160,6 +1304,9 @@ def _evaluate(
     same_surface_threshold: float | None = None,
     output_sigmoid: bool = False,
     vis_batch_out: list | None = None,
+    device_type: str = "cuda",
+    world_size: int = 1,
+    is_main: bool = True,
 ):
     model.eval()
     losses = []
@@ -1175,7 +1322,7 @@ def _evaluate(
     if verbose:
         val_iter = tqdm(loader, desc="val", dynamic_ncols=True, leave=False)
 
-    with torch.no_grad(), torch.amp.autocast(device_type=device, dtype=amp_dtype, enabled=use_autocast):
+    with torch.no_grad(), torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_autocast):
         for batch in val_iter:
             image = batch["image"].to(device)
             (
@@ -1241,33 +1388,41 @@ def _evaluate(
             if verbose:
                 val_iter.set_postfix(loss=f"{loss.item():.4f}")
 
-            if not vis_done:
+            # Vis batch is captured only on rank 0 — that rank's
+            # first batch is what gets rendered downstream.
+            if not vis_done and is_main:
                 _log_vis(log_images, "val", image, pred, targets, cos_mask, global_step)
                 if vis_batch_out is not None:
                     vis_batch_out.append(batch)
                 vis_done = True
 
+    # Per-rank means → cross-rank average. Each rank's val shard is
+    # roughly the same size (DistributedSampler pads to equal length).
     n = max(len(losses), 1)
-    mean_loss = sum(losses) / n
-    log_scalar("val/loss", mean_loss, global_step)
-    log_scalar("val/loss_cos", sum(losses_cos) / n, global_step)
-    log_scalar("val/loss_mag", sum(losses_mag) / n, global_step)
-    log_scalar(
-        "val/loss_dir_sparse", sum(losses_dir_sparse) / n, global_step,
+    local_means = {
+        "val/loss": sum(losses) / n,
+        "val/loss_cos": sum(losses_cos) / n,
+        "val/loss_mag": sum(losses_mag) / n,
+        "val/loss_dir_sparse": sum(losses_dir_sparse) / n,
+        "val/loss_dir_dense": sum(losses_dir_dense) / n,
+        "val/loss_smooth": sum(losses_smooth) / n,
+    }
+    global_means = {
+        k: _allreduce_mean(v, world_size, device)
+        for k, v in local_means.items()
+    }
+    for k, v in global_means.items():
+        log_scalar(k, v, global_step)
+    # Always call allreduce on every rank to stay in sync, even when
+    # the local shard happened to skip the angle metric.
+    local_ang = (
+        sum(angles_sparse_deg) / len(angles_sparse_deg)
+        if angles_sparse_deg else 0.0
     )
-    log_scalar(
-        "val/loss_dir_dense", sum(losses_dir_dense) / n, global_step,
-    )
-    log_scalar(
-        "val/loss_smooth", sum(losses_smooth) / n, global_step,
-    )
-    if angles_sparse_deg:
-        log_scalar(
-            "val/dir_angle_deg_sparse",
-            sum(angles_sparse_deg) / len(angles_sparse_deg),
-            global_step,
-        )
-    return mean_loss
+    global_ang = _allreduce_mean(local_ang, world_size, device)
+    if angles_sparse_deg or world_size > 1:
+        log_scalar("val/dir_angle_deg_sparse", global_ang, global_step)
+    return global_means["val/loss"]
 
 
 # ---------------------------------------------------------------------------

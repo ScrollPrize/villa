@@ -1,6 +1,7 @@
 {
     "volume_cache_dir": "/home/hendrik/business/aiconsulting/vesuviuschallenge/data/zarr_cache",
     "volume_cache_retry_seconds": 600,
+    "volume_cache_offline": true,
     "patch_size": 192,
     "overlap_fraction": 0.25,
     "chunk_pad": 20.0,
