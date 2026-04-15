@@ -562,22 +562,22 @@ def build_model(
 # Visualization
 # ---------------------------------------------------------------------------
 
-def _log_vis(writer, tag, image, pred, targets, mask, step):
+def _log_vis(log_images, tag, image, pred, targets, mask, step):
     with torch.no_grad():
         b = min(4, image.size(0))
         mid_z = pred.size(2) // 2
         mid_z_img = image.size(2) // 2
 
-        writer.add_images(f"{tag}/input_z", image[:b, :, mid_z_img], step)
+        log_images(f"{tag}/input_z", image[:b, :, mid_z_img], step)
         m = mask[:b, :, mid_z]
 
         for i, name in enumerate(_CHANNEL_NAMES):
             p = pred[:b, i:i+1, mid_z]
             t = targets[:b, i:i+1, mid_z]
-            writer.add_images(f"{tag}/{name}_pred", p.clamp(0, 1), step)
-            writer.add_images(f"{tag}/{name}_gt", (t * m).clamp(0, 1), step)
+            log_images(f"{tag}/{name}_pred", p.clamp(0, 1), step)
+            log_images(f"{tag}/{name}_gt", (t * m).clamp(0, 1), step)
 
-        writer.add_images(f"{tag}/validity", m, step)
+        log_images(f"{tag}/validity", m, step)
 
 
 # ---------------------------------------------------------------------------
@@ -607,6 +607,11 @@ def train(
     output_sigmoid: bool = False,
     precision: str = "bf16",
     verbose: bool = False,
+    wandb_enabled: bool = False,
+    wandb_project: Optional[str] = None,
+    wandb_entity: Optional[str] = None,
+    wandb_run_name: Optional[str] = None,
+    wandb_tags: Optional[List[str]] = None,
 ) -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = Path(log_dir) / f"{timestamp}_{run_name}"
@@ -643,6 +648,28 @@ def train(
         "cmd": " ".join(sys.argv),
     }
     (run_dir / "config.json").write_text(json.dumps(run_config, indent=2) + "\n")
+
+    # Optional W&B init. Soft dep — failure never breaks training.
+    wandb_run = None
+    if wandb_enabled:
+        try:
+            import wandb
+            wandb_run = wandb.init(
+                project=wandb_project or "lasagna-tifxyz",
+                entity=wandb_entity,
+                name=wandb_run_name or f"{timestamp}_{run_name}",
+                dir=str(run_dir),
+                config=run_config,
+                tags=wandb_tags or None,
+                resume="allow",
+            )
+            print(f"{TAG} W&B logging enabled: {wandb_run.url}", flush=True)
+        except Exception as e:
+            print(
+                f"{TAG} W&B init failed ({e}); continuing without W&B",
+                flush=True,
+            )
+            wandb_run = None
 
     # Dataset
     print(f"{TAG} building dataset...", flush=True)
@@ -721,6 +748,49 @@ def train(
     best_val_loss = float("inf")
     global_step = 0
 
+    # Dual-sink logging helpers. TB gets everything unchanged; W&B
+    # gets scalars at full cadence and images gated to every
+    # WANDB_IMG_EVERY steps and JPEG-compressed for bandwidth.
+    import io as _io
+    WANDB_IMG_EVERY = 1000
+
+    def _wandb_image_allowed(step: int) -> bool:
+        return wandb_run is not None and (step % WANDB_IMG_EVERY == 0)
+
+    def _to_jpg_wandb(arr_hwc_uint8):
+        import wandb
+        buf = _io.BytesIO()
+        Image.fromarray(arr_hwc_uint8).save(buf, format="JPEG", quality=85)
+        buf.seek(0)
+        return wandb.Image(Image.open(buf).copy())
+
+    def _chw_to_hwc_uint8(t):
+        a = t.detach().float().clamp(0, 1).cpu().numpy()
+        if a.shape[0] == 1:
+            a = np.repeat(a, 3, axis=0)
+        elif a.shape[0] > 3:
+            a = a[:3]
+        return (a.transpose(1, 2, 0) * 255.0 + 0.5).astype(np.uint8)
+
+    def log_scalar(tag, value, step):
+        writer.add_scalar(tag, value, step)
+        if wandb_run is not None:
+            wandb_run.log({tag: value}, step=step)
+
+    def log_image(tag, img_hwc_uint8, step):
+        writer.add_image(tag, img_hwc_uint8, step, dataformats="HWC")
+        if _wandb_image_allowed(step):
+            wandb_run.log({tag: _to_jpg_wandb(img_hwc_uint8)}, step=step)
+
+    def log_images(tag, imgs_bchw, step):
+        writer.add_images(tag, imgs_bchw, step)
+        if _wandb_image_allowed(step):
+            gallery = [
+                _to_jpg_wandb(_chw_to_hwc_uint8(imgs_bchw[i]))
+                for i in range(imgs_bchw.shape[0])
+            ]
+            wandb_run.log({tag: gallery}, step=step)
+
     # Lasagna3d-style full-vis logging: one JPEG per ~1000 samples,
     # written to run_dir/vis and mirrored into TB as an image.
     # The live model is handed to render_batch_figure so the figure
@@ -771,9 +841,7 @@ def train(
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
             img_rgb = np.asarray(Image.open(out_path).convert("RGB"))
-            writer.add_image(
-                f"{tag}/full_vis", img_rgb, step, dataformats="HWC",
-            )
+            log_image(f"{tag}/full_vis", img_rgb, step)
         except Exception as e:
             print(f"{TAG} full_vis ({tag}) render failed at step "
                   f"{step}: {e}", flush=True)
@@ -783,7 +851,7 @@ def train(
     _init_vis_batch: list = []
     init_val_loss = _evaluate(
         model, val_loader, scale_loss_mse, scale_loss_l1,
-        device, writer, global_step,
+        device, log_scalar, log_images, global_step,
         w_cos, w_mag, w_dir,
         w_dir_dense=w_dir_dense, w_smooth=w_smooth,
         amp_dtype=amp_dtype, use_autocast=use_autocast,
@@ -984,27 +1052,27 @@ def train(
             )
 
             if global_step % 10 == 0:
-                writer.add_scalar("train/loss", loss.item(), global_step)
-                writer.add_scalar("train/loss_cos", loss_cos.item(), global_step)
-                writer.add_scalar("train/loss_mag", loss_mag.item(), global_step)
-                writer.add_scalar(
+                log_scalar("train/loss", loss.item(), global_step)
+                log_scalar("train/loss_cos", loss_cos.item(), global_step)
+                log_scalar("train/loss_mag", loss_mag.item(), global_step)
+                log_scalar(
                     "train/loss_dir_sparse", loss_dir_sparse.item(), global_step,
                 )
-                writer.add_scalar(
+                log_scalar(
                     "train/loss_dir_dense", loss_dir_dense.item(), global_step,
                 )
-                writer.add_scalar(
+                log_scalar(
                     "train/loss_smooth", loss_smooth.item(), global_step,
                 )
-                writer.add_scalar(
+                log_scalar(
                     "train/dir_angle_deg_sparse",
                     dir_angle_deg_sparse,
                     global_step,
                 )
-                writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+                log_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
 
             if global_step % 100 == 0:
-                _log_vis(writer, "train", image, pred, targets, cos_mask, global_step)
+                _log_vis(log_images, "train", image, pred, targets, cos_mask, global_step)
 
             if global_step % vis_interval_steps == 0:
                 _log_full_vis(batch, "train", global_step)
@@ -1017,7 +1085,7 @@ def train(
                 _vis_batch: list = []
                 last_val_loss = _evaluate(
                     model, val_loader, scale_loss_mse, scale_loss_l1,
-                    device, writer, global_step,
+                    device, log_scalar, log_images, global_step,
                     w_cos, w_mag, w_dir,
                     w_dir_dense=w_dir_dense, w_smooth=w_smooth,
                     amp_dtype=amp_dtype, use_autocast=use_autocast,
@@ -1061,12 +1129,14 @@ def train(
         )
 
     writer.close()
+    if wandb_run is not None:
+        wandb_run.finish()
     print(f"{TAG} done. Logs & checkpoints in {run_dir}", flush=True)
 
 
 def _evaluate(
     model, loader, scale_loss_mse, scale_loss_l1,
-    device, writer, global_step,
+    device, log_scalar, log_images, global_step,
     w_cos, w_mag, w_dir,
     w_dir_dense: float = 0.1,
     w_smooth: float = 0.1,
@@ -1157,27 +1227,27 @@ def _evaluate(
                 val_iter.set_postfix(loss=f"{loss.item():.4f}")
 
             if not vis_done:
-                _log_vis(writer, "val", image, pred, targets, cos_mask, global_step)
+                _log_vis(log_images, "val", image, pred, targets, cos_mask, global_step)
                 if vis_batch_out is not None:
                     vis_batch_out.append(batch)
                 vis_done = True
 
     n = max(len(losses), 1)
     mean_loss = sum(losses) / n
-    writer.add_scalar("val/loss", mean_loss, global_step)
-    writer.add_scalar("val/loss_cos", sum(losses_cos) / n, global_step)
-    writer.add_scalar("val/loss_mag", sum(losses_mag) / n, global_step)
-    writer.add_scalar(
+    log_scalar("val/loss", mean_loss, global_step)
+    log_scalar("val/loss_cos", sum(losses_cos) / n, global_step)
+    log_scalar("val/loss_mag", sum(losses_mag) / n, global_step)
+    log_scalar(
         "val/loss_dir_sparse", sum(losses_dir_sparse) / n, global_step,
     )
-    writer.add_scalar(
+    log_scalar(
         "val/loss_dir_dense", sum(losses_dir_dense) / n, global_step,
     )
-    writer.add_scalar(
+    log_scalar(
         "val/loss_smooth", sum(losses_smooth) / n, global_step,
     )
     if angles_sparse_deg:
-        writer.add_scalar(
+        log_scalar(
             "val/dir_angle_deg_sparse",
             sum(angles_sparse_deg) / len(angles_sparse_deg),
             global_step,
@@ -1236,6 +1306,17 @@ def main() -> None:
                         choices=["bf16", "fp16", "fp32"])
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Show per-sample progress bar with running loss.")
+    parser.add_argument("--wandb", action="store_true", default=False,
+                        help="Enable Weights & Biases logging (in "
+                             "addition to TensorBoard).")
+    parser.add_argument("--wandb-project", type=str, default=None,
+                        help="W&B project name (default: lasagna-tifxyz).")
+    parser.add_argument("--wandb-entity", type=str, default=None,
+                        help="W&B entity/user (default: user's default).")
+    parser.add_argument("--wandb-run-name", type=str, default=None,
+                        help="W&B run name (default: <timestamp>_<run_name>).")
+    parser.add_argument("--wandb-tags", type=str, default=None,
+                        help="Comma-separated list of W&B run tags.")
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -1262,6 +1343,14 @@ def main() -> None:
         output_sigmoid=args.output_sigmoid,
         precision=args.precision,
         verbose=args.verbose,
+        wandb_enabled=args.wandb,
+        wandb_project=args.wandb_project,
+        wandb_entity=args.wandb_entity,
+        wandb_run_name=args.wandb_run_name,
+        wandb_tags=(
+            [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
+            if args.wandb_tags else None
+        ),
     )
 
 
