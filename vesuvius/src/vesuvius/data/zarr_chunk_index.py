@@ -16,8 +16,9 @@ import hashlib
 import json
 import os
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import fsspec
 import numpy as np
@@ -27,6 +28,8 @@ from vesuvius.utils.k8s import get_tqdm_kwargs
 
 
 SIDECAR_NAME = ".chunk_occupancy.npz"
+
+_LIST_MAX_WORKERS = int(os.environ.get("VESUVIUS_CHUNK_INDEX_WORKERS", "32"))
 
 
 def _local_cache_dir() -> Path:
@@ -168,52 +171,99 @@ def _save_cached(array_url: str, sig: str, bitmap: np.ndarray) -> None:
         warnings.warn(f"Failed to save local chunk occupancy cache to {local}: {e}")
 
 
-def _iter_chunk_filenames_s3(array_url: str):
-    """Stream chunk filenames under an s3:// zarr v2 array prefix.
+def _read_zarray(array_url: str) -> Optional[dict]:
+    """Fetch and parse `.zarray` for the given array URL.
 
-    Drives `list_objects_v2` page by page via s3fs's sync `call_s3`, so we can
-    yield results without materialising the full key list (which at ~9M files
-    would be ~GB of Python strings and minutes of silence).
+    Returns the parsed JSON dict, or None on any failure (caller falls back
+    to the lazy empty-detection path).
+    """
+    zarray_url = array_url.rstrip("/") + "/.zarray"
+    try:
+        if array_url.startswith("s3://"):
+            fs = fsspec.filesystem("s3", anon=False)
+            with fs.open(zarray_url.replace("s3://", ""), "rb") as f:
+                return json.loads(f.read())
+        else:
+            with open(zarray_url, "rb") as f:
+                return json.loads(f.read())
+    except Exception as e:
+        warnings.warn(f"Failed to read {zarray_url}: {e}")
+        return None
+
+
+def _list_chunks_s3(array_url: str, sub_prefix: str) -> List[str]:
+    """List chunk keys under an S3 zarr v2 array at `sub_prefix`.
+
+    Returns keys relative to the array prefix (e.g. `"0/12/3/7"` for a
+    `/`-separated 4D array, or `"0.12.3.7"` for a `.`-separated one).
     """
     fs = fsspec.filesystem("s3", anon=False)
     bucket_and_prefix = array_url.replace("s3://", "").rstrip("/")
     bucket, _, prefix = bucket_and_prefix.partition("/")
     if prefix and not prefix.endswith("/"):
         prefix = prefix + "/"
+    full_prefix = prefix + sub_prefix
 
+    results: List[str] = []
     continuation = None
     while True:
-        kwargs = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
+        kwargs = {"Bucket": bucket, "Prefix": full_prefix, "MaxKeys": 1000}
         if continuation is not None:
             kwargs["ContinuationToken"] = continuation
         resp = fs.call_s3("list_objects_v2", **kwargs)
         for obj in resp.get("Contents", []) or []:
             key = obj["Key"]
-            # Skip anything in a sub-prefix (shouldn't happen for a zarr v2
-            # array's flat chunk layout, but guard anyway) and the sidecar.
             rest = key[len(prefix):] if prefix else key
-            if "/" in rest:
-                continue
-            yield rest
+            results.append(rest)
         if not resp.get("IsTruncated"):
-            return
+            break
         continuation = resp.get("NextContinuationToken")
         if continuation is None:
-            return
+            break
+    return results
 
 
-def _iter_chunk_filenames(array_url: str):
-    """Yield chunk filenames (basenames) under a zarr v2 array directory."""
-    if array_url.startswith("s3://"):
-        yield from _iter_chunk_filenames_s3(array_url)
-    else:
+def _list_chunks_local(array_url: str, sub_prefix: str, sep: str) -> List[str]:
+    """List chunk keys under a local zarr v2 array at `sub_prefix`.
+
+    For `sep == "."` the chunks are flat files directly under `array_url`,
+    so `sub_prefix` is a filename-prefix filter. For `sep == "/"` the
+    chunks are nested in directories — walk the deepest level and
+    reassemble paths relative to `array_url`.
+    """
+    base = array_url.rstrip("/")
+    results: List[str] = []
+
+    if sep == ".":
         try:
-            with os.scandir(array_url) as it:
+            with os.scandir(base) as it:
                 for entry in it:
-                    if entry.is_file():
-                        yield entry.name
+                    if entry.is_file() and entry.name.startswith(sub_prefix):
+                        results.append(entry.name)
         except FileNotFoundError:
-            return
+            pass
+        return results
+
+    # Nested-directory layout: sub_prefix is e.g. "0/12/" — recurse under it.
+    start = os.path.join(base, sub_prefix.rstrip("/")) if sub_prefix else base
+    if not os.path.isdir(start):
+        return results
+
+    prefix_depth = len(base.rstrip("/")) + 1  # strip "base/" from absolute paths
+    stack = [start]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        stack.append(entry.path)
+                    elif entry.is_file():
+                        rel = entry.path[prefix_depth:]
+                        results.append(rel)
+        except FileNotFoundError:
+            continue
+    return results
 
 
 def build_chunk_occupancy(
@@ -282,30 +332,39 @@ def build_chunk_occupancy(
     else:
         print(f"  Chunk occupancy cache disabled for {array_url}")
 
-    print(f"  Building chunk occupancy index for {array_url} (grid {grid_dims})...")
+    zarray = _read_zarray(array_url)
+    if zarray is None:
+        return None
+    sep = zarray.get("dimension_separator", ".")
+    if sep not in (".", "/"):
+        warnings.warn(f"Unknown dimension_separator {sep!r} for {array_url}; skipping chunk index")
+        return None
+
+    # Partition the chunk keyspace along the leading axis (z, or c×z for 4D).
+    # Each sub-prefix corresponds to one "row" of chunks and is listed
+    # independently — in parallel on S3, sequentially on local FS.
+    z_grid = grid_dims[0]
+    if rank == 4:
+        c_grid = int(np.ceil(shape[0] / chunks[0])) if chunks[0] > 0 else 0
+        sub_prefixes = [f"{c}{sep}{z}{sep}" for c in range(c_grid) for z in range(z_grid)]
+    else:
+        sub_prefixes = [f"{z}{sep}" for z in range(z_grid)]
+
+    print(
+        f"  Building chunk occupancy index for {array_url} "
+        f"(grid {grid_dims}, separator {sep!r}, {len(sub_prefixes)} rows)..."
+    )
 
     occupancy = np.zeros(grid_dims, dtype=bool)
-
     parsed = 0
     skipped = 0
-    # Stream + count. tqdm runs with total=None so it just shows the running
-    # count and rate — S3 has no way to know the total up front, and the
-    # theoretical max (grid.prod) is a poor estimate for sparse volumes.
-    pbar_kwargs = {
-        "desc": "  Listing chunks",
-        "unit": " files",
-        "unit_scale": True,
-        "leave": False,
-        "disable": not verbose,
-        **get_tqdm_kwargs(),
-    }
-    pbar = tqdm(**pbar_kwargs)
-    try:
-        for filename in _iter_chunk_filenames(array_url):
-            pbar.update(1)
-            if not filename or not filename[0].isdigit():
+
+    def _consume(relpaths: List[str]) -> None:
+        nonlocal parsed, skipped
+        for rel in relpaths:
+            if not rel or not rel[0].isdigit():
                 continue
-            parts = filename.split(".")
+            parts = rel.split(sep)
             if len(parts) != rank:
                 continue
             try:
@@ -319,6 +378,29 @@ def build_chunk_occupancy(
                 continue
             occupancy[spatial_idx] = True
             parsed += 1
+
+    pbar_kwargs = {
+        "total": len(sub_prefixes),
+        "desc": "  Listing chunks",
+        "unit": "row",
+        "leave": False,
+        "disable": not verbose,
+        **get_tqdm_kwargs(),
+    }
+    pbar = tqdm(**pbar_kwargs)
+    try:
+        if array_url.startswith("s3://"):
+            with ThreadPoolExecutor(max_workers=min(_LIST_MAX_WORKERS, max(1, len(sub_prefixes)))) as ex:
+                futures = [ex.submit(_list_chunks_s3, array_url, sp) for sp in sub_prefixes]
+                for fut in as_completed(futures):
+                    _consume(fut.result())
+                    pbar.update(1)
+                    pbar.set_postfix_str(f"found={parsed}")
+        else:
+            for sp in sub_prefixes:
+                _consume(_list_chunks_local(array_url, sp, sep))
+                pbar.update(1)
+                pbar.set_postfix_str(f"found={parsed}")
     finally:
         pbar.close()
 
