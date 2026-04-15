@@ -79,6 +79,8 @@ from tifxyz_labels import (
     compute_patch_labels,
     encode_direction_channels,
     scale_space_pool_validity,
+    decode_to_tensor,
+    tensor_unsigned_angle_deg,
 )
 from tifxyz_lasagna_dataset import (
     TifxyzLasagnaDataset,
@@ -924,6 +926,29 @@ def train(
                     + w_smooth * loss_smooth
                 )
 
+                # Sign-invariant unsigned angular error on sparse
+                # direction voxels — reported in degrees for an
+                # interpretable "how far off is the model's normal"
+                # number, computed via Frobenius inner product on
+                # tensor moments (|cos θ|² = ⟨N_p, N_g⟩_F) so that
+                # n and -n are treated as the same direction.
+                # decode_to_tensor expects channel-first (C, ...);
+                # pred is (B, 6, Z, Y, X), so permute first.
+                with torch.no_grad():
+                    t_pred = decode_to_tensor(
+                        pred[:, 2:8].detach().permute(1, 0, 2, 3, 4)
+                    )
+                    t_gt_batch = batch["tensor_moments"].to(
+                        device, non_blocking=True,
+                    )
+                    if bad:
+                        t_gt_batch = t_gt_batch.index_select(0, keep)
+                    dir_angle_deg_sparse = tensor_unsigned_angle_deg(
+                        t_pred,
+                        t_gt_batch.permute(1, 0, 2, 3, 4),
+                        mask=dir_sparse_mask[:, 0],
+                    ).item()
+
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -958,6 +983,11 @@ def train(
                 )
                 writer.add_scalar(
                     "train/loss_smooth", loss_smooth.item(), global_step,
+                )
+                writer.add_scalar(
+                    "train/dir_angle_deg_sparse",
+                    dir_angle_deg_sparse,
+                    global_step,
                 )
                 writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
 
@@ -1041,6 +1071,7 @@ def _evaluate(
     losses_dir_sparse: list[float] = []
     losses_dir_dense: list[float] = []
     losses_smooth: list[float] = []
+    angles_sparse_deg: list[float] = []
     vis_done = False
 
     val_iter = loader
@@ -1094,6 +1125,22 @@ def _evaluate(
             losses_dir_dense.append(loss_dir_dense.item())
             losses_smooth.append(loss_smooth.item())
 
+            # Sign-invariant unsigned angular error on sparse voxels.
+            # decode_to_tensor expects channel-first (C, ...); pred is
+            # (B, 6, Z, Y, X), so permute to (6, B, Z, Y, X) first.
+            t_pred_val = decode_to_tensor(
+                pred[:, 2:8].permute(1, 0, 2, 3, 4)
+            )
+            t_gt_val = batch["tensor_moments"].to(
+                device, non_blocking=True,
+            ).permute(1, 0, 2, 3, 4)
+            ang_deg = tensor_unsigned_angle_deg(
+                t_pred_val,
+                t_gt_val,
+                mask=dir_sparse_mask[:, 0],
+            ).item()
+            angles_sparse_deg.append(ang_deg)
+
             if verbose:
                 val_iter.set_postfix(loss=f"{loss.item():.4f}")
 
@@ -1117,6 +1164,12 @@ def _evaluate(
     writer.add_scalar(
         "val/loss_smooth", sum(losses_smooth) / n, global_step,
     )
+    if angles_sparse_deg:
+        writer.add_scalar(
+            "val/dir_angle_deg_sparse",
+            sum(angles_sparse_deg) / len(angles_sparse_deg),
+            global_step,
+        )
     return mean_loss
 
 

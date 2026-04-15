@@ -148,6 +148,131 @@ def encode_from_tensor(
     )
 
 
+def decode_to_tensor(
+    encoded: torch.Tensor,
+    eps: float = 1e-6,
+) -> torch.Tensor:
+    """Invert :func:`encode_from_tensor` for a unit-vector direction.
+
+    Given a 6-channel ``(d0_z, d1_z, d0_y, d1_y, d0_x, d1_x)`` input
+    that represents an encoded unit direction, solve the coupled
+    plane equations for the 6 unique second-moment tensor components
+    ``(nx², ny², nz², nx·ny, nx·nz, ny·nz)``.
+
+    Args:
+        encoded: ``(6, ...)`` float32 double-angle encoding.
+
+    Returns:
+        ``(6, ...)`` float32 tensor moments. For inputs that are
+        exactly the encoding of a unit vector, the output is the
+        corresponding rank-1 ``n·nᵀ``. For predicted (non-unit)
+        encodings, it's a regularized best-fit tensor — suitable
+        for computing angular distances against a GT tensor.
+
+    Robust to encoding-singularity configurations via clamped
+    denominators: at ``c_y → -1`` (pred → "nx is degenerate in the
+    XZ plane"), the solution gracefully drives ``nx²`` toward 0.
+    """
+    sqrt2 = math.sqrt(2.0)
+    d0_z = encoded[0]
+    d1_z = encoded[1]
+    d0_y = encoded[2]
+    d1_y = encoded[3]
+    d0_x = encoded[4]
+    d1_x = encoded[5]
+
+    # Recover (cos 2θ, sin 2θ) per plane — direct inverse of the
+    # _pair() branch in encode_from_tensor.
+    c_z = 2.0 * d0_z - 1.0
+    s_z = c_z - (2.0 * d1_z - 1.0) * sqrt2
+    c_y = 2.0 * d0_y - 1.0
+    s_y = c_y - (2.0 * d1_y - 1.0) * sqrt2
+    c_x = 2.0 * d0_x - 1.0
+    s_x = c_x - (2.0 * d1_x - 1.0) * sqrt2
+
+    # Solve the coupled system for the three plane sums.
+    #
+    #   nx² = A(1+c_z)/2 = B(1+c_y)/2   →   B = A·(1+c_z)/(1+c_y)
+    #   ny² = A(1-c_z)/2 = C(1+c_x)/2   →   C = A·(1-c_z)/(1+c_x)
+    #   A + B + C = 2                   (∵ nx²+ny²+nz² = 1)
+    one_plus_cy = (1.0 + c_y).clamp(min=eps)
+    one_plus_cx = (1.0 + c_x).clamp(min=eps)
+    ratio_b = (1.0 + c_z) / one_plus_cy
+    ratio_c = (1.0 - c_z) / one_plus_cx
+    denom = (1.0 + ratio_b + ratio_c).clamp(min=eps)
+    A = 2.0 / denom
+    B = A * ratio_b
+    C = A * ratio_c
+
+    nx2 = (A * (1.0 + c_z) * 0.5).clamp(min=0.0, max=1.0)
+    ny2 = (A * (1.0 - c_z) * 0.5).clamp(min=0.0, max=1.0)
+    nz2 = (B * (1.0 - c_y) * 0.5).clamp(min=0.0, max=1.0)
+
+    # Off-diagonals recovered directly from sin 2θ: sin2t = 2·ab/(a²+b²).
+    nxny = s_z * A * 0.5
+    nxnz = s_y * B * 0.5
+    nynz = s_x * C * 0.5
+
+    return torch.stack([nx2, ny2, nz2, nxny, nxnz, nynz], dim=0)
+
+
+def tensor_unsigned_angle_deg(
+    t_pred: torch.Tensor,
+    t_gt: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Unsigned mean angular error (in degrees) between two
+    second-moment tensor fields — inherently sign-invariant.
+
+    For two rank-1 tensors ``N_p = n_p · n_pᵀ`` and ``N_g = n_g · n_gᵀ``
+    built from unit vectors, the Frobenius inner product satisfies
+    ``⟨N_p, N_g⟩_F = (n_p · n_g)²`` — a **sign-invariant** squared
+    cosine of the angle between the two (unsigned) directions. We
+    then take ``arccos(|cos|) · 180/π`` to get the unsigned angle
+    in [0°, 90°].
+
+    Args:
+        t_pred: ``(6, ...)`` float32 — pred tensor components.
+        t_gt:   ``(6, ...)`` float32 — GT tensor components.
+        mask:   optional ``(...)`` float/bool — weight or selection
+            mask. When provided, the reported scalar is the
+            mask-weighted mean angle.
+
+    Returns:
+        scalar ``torch.Tensor`` — mean unsigned angular error in
+        degrees across the masked region (or the whole volume
+        when ``mask`` is None).
+
+    The off-diagonal tensor components are carried with a factor
+    of 2 in the sum because the symmetric matrix has each off-
+    diagonal pair stored once in the 6-vector but contributes
+    twice in the full ``tr(A · B)``.
+    """
+    cos_sq = (
+        t_pred[0] * t_gt[0]
+        + t_pred[1] * t_gt[1]
+        + t_pred[2] * t_gt[2]
+        + 2.0 * (
+            t_pred[3] * t_gt[3]
+            + t_pred[4] * t_gt[4]
+            + t_pred[5] * t_gt[5]
+        )
+    )
+    cos_sq = cos_sq.clamp(min=0.0, max=1.0)
+    # Small subtraction under the sqrt so ``acos`` gets a value
+    # strictly inside [-1, 1]; 1e-12 floors identical tensors at
+    # ~5.7e-5 degrees rather than 0.028°.
+    cos_abs = torch.sqrt((cos_sq - 1e-12).clamp(min=0.0))
+    angle_rad = torch.acos(cos_abs.clamp(max=1.0))
+    angle_deg = angle_rad * (180.0 / math.pi)
+    if mask is not None:
+        m = mask.float()
+        num = (angle_deg * m).sum()
+        denom = m.sum().clamp(min=1.0)
+        return num / denom
+    return angle_deg.mean()
+
+
 def slerp_unit(
     n1: torch.Tensor,
     n2: torch.Tensor,
