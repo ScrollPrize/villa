@@ -291,14 +291,15 @@ def build_chunk_occupancy(
     # Stream + count. tqdm runs with total=None so it just shows the running
     # count and rate — S3 has no way to know the total up front, and the
     # theoretical max (grid.prod) is a poor estimate for sparse volumes.
-    pbar = tqdm(
-        desc="  Listing chunks",
-        unit=" files",
-        unit_scale=True,
-        leave=False,
-        disable=not verbose,
+    pbar_kwargs = {
+        "desc": "  Listing chunks",
+        "unit": " files",
+        "unit_scale": True,
+        "leave": False,
+        "disable": not verbose,
         **get_tqdm_kwargs(),
-    )
+    }
+    pbar = tqdm(**pbar_kwargs)
     try:
         for filename in _iter_chunk_filenames(array_url):
             pbar.update(1)
