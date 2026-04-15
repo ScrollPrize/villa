@@ -351,11 +351,39 @@ class MaskedSmoothL1(nn.Module):
 
 
 class ScaleSpaceLoss3D(nn.Module):
-    def __init__(self, base_loss: nn.Module, num_scales: int) -> None:
+    """Multi-scale masked loss.
+
+    Per-scale weights are a decaying geometric series with decay
+    ``scale_decay`` (default 0.8) — scale 0 gets 1.0, scale 1 gets
+    0.8, scale 2 gets 0.64, etc. — then re-normalized so the weights
+    sum to exactly 1. This keeps the loss magnitude independent of
+    ``num_scales`` and biases supervision toward the fine scales
+    without dropping coarse structure entirely.
+
+    For ``num_scales=5, scale_decay=0.8`` the normalized weights are
+    approximately ``[0.355, 0.284, 0.227, 0.182, 0.145]``.
+    """
+
+    def __init__(
+        self,
+        base_loss: nn.Module,
+        num_scales: int,
+        scale_decay: float = 0.8,
+    ) -> None:
         super().__init__()
         self.base_loss = base_loss
         self.num_scales = num_scales
+        self.scale_decay = float(scale_decay)
         self.pool = nn.AvgPool3d(kernel_size=2, stride=2)
+
+        raw = [self.scale_decay ** s for s in range(num_scales)]
+        s = sum(raw)
+        # Register as a plain buffer so .to(device) migrates it with
+        # the module. Keeps autograd out of the weights entirely.
+        self.register_buffer(
+            "scale_weights",
+            torch.tensor([w / s for w in raw], dtype=torch.float32),
+        )
 
     def forward(self, pred, target, mask=None, weight=None):
         x, y = pred, target
@@ -369,7 +397,8 @@ class ScaleSpaceLoss3D(nn.Module):
 
         total = torch.zeros((), device=pred.device, dtype=pred.dtype)
         for scale in range(self.num_scales):
-            total = total + self.base_loss(x, y, mask=m, weight=w)
+            sw = float(self.scale_weights[scale].item())
+            total = total + sw * self.base_loss(x, y, mask=m, weight=w)
             if scale < self.num_scales - 1:
                 if x.size(2) < 2 or x.size(3) < 2 or x.size(4) < 2:
                     break
