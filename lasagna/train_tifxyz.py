@@ -116,15 +116,17 @@ def compute_batch_targets(
     torch.Tensor,
     torch.Tensor,
     torch.Tensor,
+    torch.Tensor,
     list[list[int]],
     list[list[torch.Tensor]],
     list[list[dict]],
 ]:
     """Compute training targets on GPU from dataset batch.
 
-    Runs EDT + chain ordering + cos/grad_mag derivation on each sample.
-    This function is the single place where training-side same-surface
-    detection happens: EDTs are built here, handed to
+    Runs EDT + chain ordering + cos/grad_mag derivation + raw-normal
+    slerp densification + last-second double-angle encoding on each
+    sample. This function is the single place where training-side
+    same-surface detection happens: EDTs are built here, handed to
     :func:`tifxyz_labels.detect_same_surface_groups` when a threshold
     is provided, and the resulting groups + the already-computed EDTs
     are passed down to :func:`compute_patch_labels` so nothing is
@@ -146,8 +148,13 @@ def compute_batch_targets(
     Returns:
         targets: (B, 8, Z, Y, X) float32
         validity: (B, 1, Z, Y, X) float32 — where cos/grad_mag are valid
-        normals_valid: (B, 1, Z, Y, X) float32 — where directions are valid
-        dir_weight: (B, 6, Z, Y, X) float32 — per-direction relevance weight
+        dir_sparse_mask: (B, 1, Z, Y, X) float32 — voxels with original
+            splatted raw normals (hard supervision).
+        dir_dense_mask:  (B, 1, Z, Y, X) float32 — voxels filled by the
+            slerp blend inside the validity bracket.
+        dir_axis_weight: (B, 6, Z, Y, X) float32 — per-plane relevance
+            weight derived from the densified raw normal's in-plane
+            magnitude.
         merge_groups_batch: per-sample ``merge_groups`` lists mapping
             each original surface slot → merged slot index (identity
             when the merge is disabled).
@@ -162,14 +169,15 @@ def compute_batch_targets(
     B = batch["image"].shape[0]
     surface_masks_list = batch["surface_masks"]  # list of (Ni, Z, Y, X)
     surface_chain_info_batch = batch["surface_chain_info"]  # list[list[dict]]
-    direction_channels = batch["direction_channels"].to(device)  # (B, 6, Z, Y, X)
+    raw_normals_batch = batch["raw_normals"].to(device)  # (B, 3, Z, Y, X)
     normals_valid_batch = batch["normals_valid"].to(device)  # (B, 1, Z, Y, X)
 
     spatial_shape = batch["image"].shape[2:]  # (Z, Y, X)
     all_targets = []
     all_validity = []
-    all_dir_valid = []
-    all_dir_weight = []
+    all_sparse_masks = []
+    all_dense_masks = []
+    all_axis_weight = []
     merge_groups_batch: list[list[int]] = []
     merged_masks_batch: list[list[torch.Tensor]] = []
     merged_chain_info_batch: list[list[dict]] = []
@@ -182,8 +190,8 @@ def compute_batch_targets(
         N = masks_b.shape[0]
         cuda_masks = [masks_b[i] > 0.5 for i in range(N)]
 
-        # Direction channels for this sample
-        dir_ch = direction_channels[b]  # (6, Z, Y, X)
+        # Raw normals + splat validity for this sample
+        raw_n = raw_normals_batch[b]  # (3, Z, Y, X)
         nv = normals_valid_batch[b, 0] > 0.5  # (Z, Y, X)
 
         chain_info_b = surface_chain_info_batch[b]
@@ -201,8 +209,8 @@ def compute_batch_targets(
         elif same_surface_threshold is not None and N >= 2:
             # Detect here so compute_patch_labels doesn't duplicate
             # EDT work. Use the joint _with_indices variant so we get
-            # the feature transforms needed by the direction blend
-            # in the same cupy pass.
+            # the feature transforms needed by the slerp blend in the
+            # same cupy pass.
             dts = []
             fts = []
             for m in cuda_masks:
@@ -217,7 +225,7 @@ def compute_batch_targets(
         # Compute labels on GPU using the patch's externally-built chains.
         result = compute_patch_labels(
             surface_masks=cuda_masks,
-            direction_channels=dir_ch,
+            raw_normals=raw_n,
             normals_valid=nv,
             surface_chain_info=chain_info_b,
             device=device,
@@ -226,10 +234,11 @@ def compute_batch_targets(
             precomputed_fts=fts,
         )
 
-        all_targets.append(result["targets"])      # (8, Z, Y, X)
-        all_validity.append(result["validity"])     # (Z, Y, X)
-        all_dir_valid.append(result["normals_valid"])  # (Z, Y, X) bool
-        all_dir_weight.append(result["dir_weight"])    # (Z, Y, X) float
+        all_targets.append(result["targets"])          # (8, Z, Y, X)
+        all_validity.append(result["validity"])        # (Z, Y, X)
+        all_sparse_masks.append(result["dir_sparse_mask"])  # (Z, Y, X) bool
+        all_dense_masks.append(result["dir_dense_mask"])    # (Z, Y, X) bool
+        all_axis_weight.append(result["dir_axis_weight"])   # (6, Z, Y, X)
         merge_groups_batch.append(
             list(result.get("merge_groups", list(range(N))))
         )
@@ -242,23 +251,22 @@ def compute_batch_targets(
 
     targets = torch.stack(all_targets, dim=0)       # (B, 8, Z, Y, X)
     validity = torch.stack(all_validity, dim=0).unsqueeze(1).float()  # (B, 1, Z, Y, X)
-    # Direction validity + weight come from the densification pass
-    # inside compute_patch_labels — 1.0 on splatted wrap voxels, 0.1
-    # on DT-blended voxels inside the validity bracket, 0 outside.
-    normals_valid = torch.stack(all_dir_valid, dim=0).unsqueeze(1).float()  # (B, 1, Z, Y, X)
-    dir_weight = torch.stack(all_dir_weight, dim=0).unsqueeze(1).expand(-1, 6, -1, -1, -1).contiguous()
+    dir_sparse_mask = torch.stack(all_sparse_masks, dim=0).unsqueeze(1).float()
+    dir_dense_mask = torch.stack(all_dense_masks, dim=0).unsqueeze(1).float()
+    dir_axis_weight = torch.stack(all_axis_weight, dim=0)  # (B, 6, Z, Y, X)
 
     return (
-        targets, validity, normals_valid, dir_weight,
+        targets, validity,
+        dir_sparse_mask, dir_dense_mask, dir_axis_weight,
         merge_groups_batch, merged_masks_batch, merged_chain_info_batch,
     )
 
 
 # ---------------------------------------------------------------------------
 # CT intensity augmentation (spatial augmentation lives in the dataset
-# via `augment_batch_inplace`, which re-splats direction_channels from
-# the flipped/rotated surface_geometry so the double-angle encoding
-# stays correct in the new frame — no per-channel sign/rotation fixups).
+# via `augment_batch_inplace`, which re-splats raw normals from the
+# flipped/rotated surface_geometry; the 6-channel double-angle encoding
+# is derived last-second inside `compute_patch_labels`).
 # ---------------------------------------------------------------------------
 
 def augment_intensity(image: torch.Tensor) -> torch.Tensor:
@@ -790,7 +798,7 @@ def train(
         for batch in train_iter:
             # Geometry-level spatial augmentation: flips the image,
             # surface_masks, padding_mask and surface_geometry, then
-            # re-splats direction_channels + normals_valid from the
+            # re-splats raw_normals + normals_valid from the
             # augmented geometry so downstream target derivation sees
             # a fully consistent frame. Skipped entirely when the
             # sampled transform is identity.
@@ -799,7 +807,8 @@ def train(
 
             # Compute targets on GPU from (post-aug) surface masks.
             (
-                targets, validity, normals_valid, dir_weight,
+                targets, validity,
+                dir_sparse_mask, dir_dense_mask, dir_axis_weight,
                 _merge_groups, _merged_masks, _merged_chain_info,
             ) = compute_batch_targets(
                 batch, device,
@@ -829,9 +838,13 @@ def train(
                 raw_pred = results["output"]
                 pred = torch.sigmoid(raw_pred) if output_sigmoid else raw_pred  # (B, 8, Z, Y, X)
 
-                # Combined validity: cos/grad_mag need surface validity, directions need normals validity
+                # cos/grad_mag live in the chain-bracket validity.
+                # Direction supervision is split into two masks by
+                # source (sparse splat vs densified slerp fill) and
+                # weighted per-channel by the normal's in-plane
+                # projection into each slice plane.
                 cos_mask = validity
-                dir_mask = (normals_valid > 0.5).float()
+                dir_mask = ((dir_sparse_mask + dir_dense_mask) > 0.5).float()
 
                 # Per-sample grad-mag screen: flag any sample with
                 # per-sample scale-space L1 >= 1 as an outlier, log it,
@@ -879,26 +892,20 @@ def train(
                     targets = targets.index_select(0, keep)
                     cos_mask = cos_mask.index_select(0, keep)
                     dir_mask = dir_mask.index_select(0, keep)
-                    dir_weight = dir_weight.index_select(0, keep)
-
-                # Direction supervision is split by source so we can
-                # watch the hard (sparse, original tifxyz splat) error
-                # independently of the soft DT-blended fill. dir_weight
-                # is per-voxel 1.0 on sparse, 0.1 on dense, 0 elsewhere.
-                sparse_dir_mask = (dir_weight[:, 0:1] > 0.9).float()
-                dense_dir_mask = (
-                    (dir_weight[:, 0:1] > 0.05)
-                    & (dir_weight[:, 0:1] < 0.9)
-                ).float()
+                    dir_sparse_mask = dir_sparse_mask.index_select(0, keep)
+                    dir_dense_mask = dir_dense_mask.index_select(0, keep)
+                    dir_axis_weight = dir_axis_weight.index_select(0, keep)
 
                 # Per-channel losses
                 loss_cos = scale_loss_mse(pred[:, 0:1], targets[:, 0:1], mask=cos_mask)
                 loss_mag = scale_loss_l1(pred[:, 1:2], targets[:, 1:2], mask=cos_mask)
                 loss_dir_sparse = scale_loss_mse(
-                    pred[:, 2:8], targets[:, 2:8], mask=sparse_dir_mask,
+                    pred[:, 2:8], targets[:, 2:8],
+                    mask=dir_sparse_mask, weight=dir_axis_weight,
                 )
                 loss_dir_dense = scale_loss_mse(
-                    pred[:, 2:8], targets[:, 2:8], mask=dense_dir_mask,
+                    pred[:, 2:8], targets[:, 2:8],
+                    mask=dir_dense_mask, weight=dir_axis_weight,
                 )
                 loss_smooth = direction_smoothness_loss(pred[:, 2:8], dir_mask)
                 loss = (
@@ -1036,7 +1043,8 @@ def _evaluate(
         for batch in val_iter:
             image = batch["image"].to(device)
             (
-                targets, validity, normals_valid, dir_weight,
+                targets, validity,
+                dir_sparse_mask, dir_dense_mask, dir_axis_weight,
                 _merge_groups, _merged_masks, _merged_chain_info,
             ) = compute_batch_targets(
                 batch, device,
@@ -1051,20 +1059,17 @@ def _evaluate(
             pred = torch.sigmoid(raw_pred) if output_sigmoid else raw_pred
 
             cos_mask = validity
-            dir_mask = (normals_valid > 0.5).float()
-            sparse_dir_mask = (dir_weight[:, 0:1] > 0.9).float()
-            dense_dir_mask = (
-                (dir_weight[:, 0:1] > 0.05)
-                & (dir_weight[:, 0:1] < 0.9)
-            ).float()
+            dir_mask = ((dir_sparse_mask + dir_dense_mask) > 0.5).float()
 
             loss_cos = scale_loss_mse(pred[:, 0:1], targets[:, 0:1], mask=cos_mask)
             loss_mag = scale_loss_l1(pred[:, 1:2], targets[:, 1:2], mask=cos_mask)
             loss_dir_sparse = scale_loss_mse(
-                pred[:, 2:8], targets[:, 2:8], mask=sparse_dir_mask,
+                pred[:, 2:8], targets[:, 2:8],
+                mask=dir_sparse_mask, weight=dir_axis_weight,
             )
             loss_dir_dense = scale_loss_mse(
-                pred[:, 2:8], targets[:, 2:8], mask=dense_dir_mask,
+                pred[:, 2:8], targets[:, 2:8],
+                mask=dir_dense_mask, weight=dir_axis_weight,
             )
             loss_smooth = direction_smoothness_loss(pred[:, 2:8], dir_mask)
             loss = (

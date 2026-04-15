@@ -5,8 +5,11 @@ calls ``dataset[idx]`` and ``compute_batch_targets`` exactly the way the
 training loop does, then renders the resulting tensors. That means:
 
 - The voxelized surface masks you see are the tensors the UNet is fed.
-- The normal arrows are drawn from the raw normals the dataset computed
-  to produce ``direction_channels`` (exposed via ``include_geometry=True``).
+- The normal arrows are drawn from the raw normals the dataset splats
+  into the ``raw_normals`` tensor (exposed via ``include_geometry=True``).
+  The 6-channel double-angle encoding is derived downstream inside
+  ``tifxyz_labels.compute_patch_labels`` — the vis pulls it from the
+  post-compute ``targets[2:8]``, which is exactly what the loss sees.
 - The per-surface chain labels are the ``surface_chain_info`` metadata the
   loss sees.
 - cos / grad_mag / validity come from ``train_tifxyz.compute_batch_targets``.
@@ -232,7 +235,7 @@ def _sample_from_batch(batch: dict) -> dict:
     return {
         "image": batch["image"][0],
         "surface_masks": batch["surface_masks"][0],
-        "direction_channels": batch["direction_channels"][0],
+        "raw_normals": batch["raw_normals"][0],
         "normals_valid": batch["normals_valid"][0],
         "num_surfaces": batch["num_surfaces"][0],
         "padding_mask": batch["padding_mask"][0],
@@ -624,7 +627,8 @@ def _compute_training_output(
         groups_batch = [same_surface_groups]
     try:
         (
-            targets, validity, normals_valid, _dir_weight,
+            targets, validity,
+            dir_sparse_mask, dir_dense_mask, _dir_axis_weight,
             merge_groups_batch, merged_masks_batch, merged_chain_info_batch,
         ) = compute_batch_targets(
             batch, device,
@@ -634,6 +638,14 @@ def _compute_training_output(
     except Exception as exc:
         print(f"{TAG} WARNING: compute_batch_targets failed ({exc})", flush=True)
         return None
+
+    # Direction supervision lives in the union of the sparse splat
+    # mask and the densified slerp-blend mask. We keep it as a single
+    # ``normals_valid`` field in the vis output for backward compat
+    # with the downstream panels.
+    normals_valid = (
+        (dir_sparse_mask + dir_dense_mask) > 0.5
+    ).float()
 
     full_size = validity.shape[2:]
 
@@ -1027,9 +1039,26 @@ def _render_sample_figure(
         surface_geometry = original_geometry
         merge_groups = None
 
-    direction_channels_full = sample.get("direction_channels")
-    if direction_channels_full is not None:
-        direction_channels_full = direction_channels_full.numpy()  # (6,Z,Y,X)
+    # The dataset now carries raw normals (3, Z, Y, X) rather than
+    # a pre-encoded 6-channel ``direction_channels`` — the
+    # double-angle encoding is derived inside compute_patch_labels
+    # after slerp-blending at the chain-adjacent bracket.
+    # For the vis panels we prefer the post-compute encoded targets
+    # (what the loss sees), which are already inside
+    # ``training_output["targets"][2:8]``. Without training_output
+    # (e.g. non-CUDA path) fall back to encoding the sparse raw
+    # splat directly.
+    direction_channels_full = None
+    if training_output is not None:
+        direction_channels_full = training_output["targets"][2:8]
+    else:
+        raw_normals_full = sample.get("raw_normals")
+        if raw_normals_full is not None:
+            import torch as _t
+            from tifxyz_labels import encode_direction_channels as _enc
+            rn_t = _t.as_tensor(raw_normals_full, dtype=_t.float32)
+            nz, ny, nx = rn_t[0], rn_t[1], rn_t[2]
+            direction_channels_full = _enc(nx, ny, nz).numpy()
 
     # Renderer always draws at the dataset patch size (vis_size).
     # Pred and residuals come from inference_output at potentially

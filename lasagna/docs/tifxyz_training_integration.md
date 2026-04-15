@@ -371,39 +371,67 @@ gap, verified via a synthetic two-plane unit check
 #### Direction channels and masking
 
 Direction channels (`dir_z`, `dir_y`, `dir_x`) are supervised **densely
-inside the cos validity bracket**. The raw sparse splat from
-`_splat_multichannel` in `tifxyz_lasagna_dataset.py` only covers voxels
-where the tifxyz points actually landed, so `derive_cos_gradmag_validity`
-runs a DT-based densification in the same per-chain loop used for cos:
+inside the cos validity bracket** by slerp-blending raw normals and
+encoding once at the end.
+
+The dataset splats **raw ZYX normals** (not the 6-channel encoding)
+via `_splat_multichannel` into `batch["raw_normals"]` shape
+`(3, Z, Y, X)`, plus a splat validity mask `batch["normals_valid"]`.
+`derive_cos_gradmag_validity` then densifies in the same per-chain
+loop used for cos:
 
 1. Per-wrap EDTs are built with `edt_torch_with_indices` so each wrap
-   also gets a feature transform `(3, Z, Y, X)` that, at every voxel,
-   points to the ZYX coordinate of the nearest on-wrap voxel. In the
-   training loop `compute_batch_targets` does a joint
-   dts+fts pass and threads both into `compute_patch_labels` via
-   `precomputed_dts` / `precomputed_fts`.
+   also gets a feature transform `(3, Z, Y, X)` pointing to the ZYX
+   coordinate of the nearest on-wrap voxel. In the training loop
+   `compute_batch_targets` does a joint dts+fts pass and threads both
+   into `compute_patch_labels` via `precomputed_dts` /
+   `precomputed_fts`.
 2. Inside the per-chain-position block, after the bracket masks
    (`use_prev`, `use_next`) and the cos fraction
-   `frac = d_lo / (d_lo + d_hi)` are computed, the direction values
-   are gathered at the `lo` and `hi` wraps' feature-transform indices
-   and blended as `(1 - frac) * dir_lo + frac * dir_hi`. The routed
-   voxel on the `lo` surface reads back as 100 % `lo` and smoothly
-   interpolates to 100 % `hi` at the `hi` surface.
+   `frac = d_lo / (d_lo + d_hi)` are computed, the **raw normals**
+   at the two bracketing wraps are gathered at those feature-transform
+   indices and combined via `slerp_unit(n_lo, n_hi, frac)`. Slerp is
+   sign-invariant (flips `n2` to `n1`'s hemisphere for the shorter
+   arc) with a lerp fallback for near-parallel vectors. This blends
+   in angle space — linearly blending the encoded
+   `(d0, d1)` channels would be wrong because the double-angle
+   encoding is nonlinear in θ.
 3. `apply_same_surface_merge` recomputes feature transforms from the
    unioned mask for merged groups, so the lookup stays exact after
    same-surface collapse.
-4. `compute_patch_labels` produces a combined output: sparse splatted
-   values are kept untouched at their exact voxels, densified values
-   fill the rest of the bracket, and the per-voxel `dir_weight` is
-   `1.0` on sparse voxels, `0.1` in the densified fill, `0`
-   elsewhere. `compute_batch_targets` stacks per-sample
-   `dir_weight` to `(B, 6, Z, Y, X)` and feeds it to `ScaleSpaceLoss3D`.
+4. After the chain loop, `compute_patch_labels` sparse-overrides
+   `n_dense` with the dataset-splatted `raw_normals` wherever
+   `normals_valid` is `True` — those voxels keep their exact
+   ground-truth normals. Then it calls `encode_direction_channels(nx,
+   ny, nz)` **once** to produce the final 6-channel `targets[2:8]`.
+5. Per-plane relevance weights are derived from the densified raw
+   normal: `w_z = √(nx² + ny²)`, `w_y = √(nx² + nz²)`,
+   `w_x = √(ny² + nz²)`, giving a `(6, Z, Y, X)` `dir_axis_weight`
+   tensor. Voxels whose normal is perpendicular to a slice plane get
+   near-zero weight on that plane's direction pair — the double-angle
+   encoding there is degenerate noise. This matches the old
+   `train_unet_3d.py:278-282` per-plane weighting.
+6. Two boolean masks are returned separately: `dir_sparse_mask`
+   (splatted wrap voxels, hard ground truth) and `dir_dense_mask`
+   (bracket fill from the slerp blend). `compute_batch_targets`
+   stacks them alongside `dir_axis_weight` and hands all three to
+   the train loop, which runs the direction MSE twice — once per
+   mask, both with `weight=dir_axis_weight` — logging
+   `train/loss_dir_sparse` and `train/loss_dir_dense` separately so
+   the hard wrap-voxel error is visible independent of the softer
+   bracket fill.
 
-An earlier global-top-2-closest densifier produced visible streaks at
-Voronoi boundaries and cross-chain leaks; reusing cos's chain-adjacent
-bracket routing eliminates both. See
-`lasagna/tifxyz_labels.py:derive_cos_gradmag_validity` for the shared
-loop.
+Two earlier attempts were wrong and got replaced:
+
+- A global-top-2-closest densifier blended the two nearest wraps per
+  voxel → visible streaks at Voronoi boundaries and cross-chain
+  leaks.
+- Blending encoded `direction_channels` linearly at the
+  chain-adjacent bracket → midpoints shrank toward 0.5 in encoded
+  space (the encoding is nonlinear in θ).
+
+See `lasagna/tifxyz_labels.py:derive_cos_gradmag_validity` and
+`tifxyz_labels.slerp_unit` for the implementation.
 
 #### Reference
 
@@ -432,32 +460,37 @@ To produce labels on-the-fly from tifxyz surfaces for a given patch:
 3. For each surface k (that survived chain/bbox filtering):
    a. Bicubic-upsample surface grid from stored to full resolution
    b. Sample the surface grid within the padded bbox
-   c. Compute normals at the sampled grid points
-   d. Encode direction channels (6 values per grid point)
-   e. Voxelize into a per-surface binary mask (mask_k)
-4. Voxelize direction channels:
-   a. Splat the 6 direction values at each surface point's 3D position
-   b. Normalize splatted direction values (divide by weight accumulator)
-   → this produces normals_valid, the SPARSE mask used later to tag
-     voxels that keep their original splat value (weight 1.0) vs
-     voxels filled by the chain-adjacent blend (weight 0.1)
+   c. Compute raw normals at the sampled grid points (no encoding yet)
+   d. Voxelize into a per-surface binary mask (mask_k)
+4. Splat raw normals:
+   a. _splat_multichannel(points, normals_zyx (N, 3), crop_size)
+      → raw_normals (3, Z, Y, X), normals_valid (Z, Y, X)
+   → normals_valid is the SPARSE mask used later to tag voxels that
+     keep their original splat value (dir_sparse_mask) vs voxels
+     filled by the chain-adjacent slerp blend (dir_dense_mask). The
+     6-channel double-angle encoding is derived downstream in one
+     place.
 5. Per-surface distance transforms + feature transforms + chain-aware
    bracketing + direction densification (§3.3):
    a. For each surface k: (dt_k, ft_k) = edt_with_indices(~mask_k).
       The feature transform ft_k gives, at every voxel, the ZYX of
-      the nearest on-wrap voxel (used to gather direction values).
+      the nearest on-wrap voxel (used to gather raw normals).
    b. Global nearest-surface assignment across all chains/surfaces
    c. Per-voxel between-neighbors detection via grad dot products with
       the surface's chain-adjacent neighbors (only; no envelope search)
    d. cos and grad_mag from bracketing distances (d_lo, d_hi);
       frac = d_lo / (d_lo + d_hi)
-   e. dir_dense = (1 - frac) * dir(lo) + frac * dir(hi), gathered at
-      the lo/hi wraps' feature transforms — in the same loop as (d),
-      same routing, same frac
+   e. n_dense(v) = slerp_unit(
+           raw_normals[ft_lo(v)], raw_normals[ft_hi(v)], frac(v),
+      ) — sign-invariant spherical interpolation in angle space,
+      in the same loop as (d), same routing, same frac
    f. validity = (between_prev) | (between_next) per voxel
-   g. Final direction = sparse splat where normals_valid, else
-      dir_dense; dir_weight = 1.0 on sparse, 0.1 in densified fill,
-      0 outside the bracket
+   g. Sparse override: n_final = raw_normals where normals_valid
+      else n_dense. Then encode_direction_channels(nx, ny, nz)
+      once → targets[2:8]. Per-plane relevance weights come from
+      n_final via √(·² + ·²) → dir_axis_weight (6, Z, Y, X).
+      Masks: dir_sparse_mask (wrap voxels, weight 1.0 upstream),
+      dir_dense_mask (bracket fill, weight 0.1 upstream).
 6. Average-pool to step resolution if needed
 ```
 
@@ -489,17 +522,21 @@ Implemented in `lasagna/tifxyz_lasagna_dataset.py` as `TifxyzLasagnaDataset`.
 - `find_world_chunk_patches()` handles patch discovery with caching; each chunk
   contains pre-computed wraps with segment references and 2D bboxes
 - Multi-surface wraps: each chunk's wraps are voxelized into separate masks,
-  direction channels are splatted from all wraps combined
+  raw normals are splatted from all wraps combined
 - Multi-channel trilinear splatting via `_splat_multichannel_trilinear_numba()`
   (numba) with numpy fallback
 
 **`__getitem__` returns:**
 ```python
 {
-    "image":              # (1, Z, Y, X) float32 — z-score normalized CT crop
+    "image":              # (1, Z, Y, X) float32 — CT crop in [0, 1]
     "surface_masks":      # (N, Z, Y, X) float32 — per-surface binary voxelization
-    "direction_channels": # (6, Z, Y, X) float32 — splatted direction values
-    "normals_valid":      # (1, Z, Y, X) float32 — where directions were splatted
+    "raw_normals":        # (3, Z, Y, X) float32 — sparse splat of raw ZYX normals.
+                          #   The 6-channel double-angle encoding is derived
+                          #   downstream by tifxyz_labels.compute_patch_labels
+                          #   AFTER chain-adjacent slerp-blending, so this is
+                          #   the single source of truth for direction sup.
+    "normals_valid":      # (1, Z, Y, X) float32 — where the normal splat landed
     "num_surfaces":       # int
     "padding_mask":       # (1, Z, Y, X) float32 — where CT data exists
     "patch_info":         # dict with dataset_idx, segment_uuid, world_bbox, idx
@@ -715,13 +752,13 @@ plus a **feature transform** (nearest-on-wrap voxel indices) via
 `edt_torch_with_indices`, which runs CuPy's distance transform once and
 returns both the distances and the indices. Ordering and side detection
 come from the externally-provided chains (§3.2), not from scanning
-distances; the feature transforms drive the direction-channel blend
+distances; the feature transforms drive the raw-normal slerp blend
 inside the same loop:
 
 ```python
 from lasagna.tifxyz_labels import (
     edt_torch_with_indices, chains_from_surface_info,
-    derive_cos_gradmag_validity,
+    derive_cos_gradmag_validity, encode_direction_channels,
 )
 
 dts, fts = [], []
@@ -729,16 +766,19 @@ for m in surface_masks:
     d, ft = edt_torch_with_indices((~m).to(torch.uint8))
     dts.append(d); fts.append(ft)
 chains = chains_from_surface_info(surface_chain_info)  # [[idx, ...], ...]
-cos, grad_mag, valid, dir_dense = derive_cos_gradmag_validity(
+cos, grad_mag, valid, n_dense = derive_cos_gradmag_validity(
     dts, surface_masks, chains,
-    fts=fts, direction_channels=direction_channels,
+    fts=fts, raw_normals=raw_normals,
 )
+# Sparse override + last-second encoding happen inside
+# compute_patch_labels — n_dense is the slerp-blended dense raw
+# normal volume, valid is the bracket mask, and
+# encode_direction_channels converts the final normal field into
+# the 6-channel double-angle targets[2:8].
 ```
 
-`dir_dense` is zero outside the validity bracket; combine with the
-sparse splat (keeping sparse values where they exist) and a
-`dir_weight` of `1.0` / `0.1` (sparse vs densified) to build the final
-direction target — see `compute_patch_labels` for the exact wiring.
+See `compute_patch_labels` for the full sparse-override +
+`encode_direction_channels` + `dir_axis_weight` wiring.
 
 There is no sort or pairwise-mean step — bracketing comes from the chain
 neighbors at each position, and between-ness is confirmed via the

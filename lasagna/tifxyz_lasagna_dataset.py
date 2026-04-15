@@ -194,39 +194,6 @@ def _splat_multichannel(points_zyx, values, crop_size):
 # Direction channel encoding (numpy, for CPU splatting)
 # ---------------------------------------------------------------------------
 
-def _encode_dir_np(gx, gy):
-    """Double-angle direction encoding (numpy)."""
-    eps = 1e-8
-    inv_sqrt2 = 1.0 / np.sqrt(2.0)
-    r2 = gx * gx + gy * gy + eps
-    cos2t = (gx * gx - gy * gy) / r2
-    sin2t = 2.0 * gx * gy / r2
-    d0 = 0.5 + 0.5 * cos2t
-    d1 = 0.5 + 0.5 * (cos2t - sin2t) * inv_sqrt2
-    return d0.astype(np.float32), d1.astype(np.float32)
-
-
-def compute_direction_values(normals_zyx):
-    """Compute 6 direction channel values from ZYX normals.
-
-    Args:
-        normals_zyx: (N, 3) or (H, W, 3) float32 — normals in ZYX order
-
-    Returns:
-        (N, 6) or (H, W, 6) float32 — [dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x]
-    """
-    orig_shape = normals_zyx.shape[:-1]
-    normals = normals_zyx.reshape(-1, 3)
-    nz, ny, nx = normals[:, 0], normals[:, 1], normals[:, 2]
-
-    dir0_z, dir1_z = _encode_dir_np(nx, ny)   # Z-slices (XY plane)
-    dir0_y, dir1_y = _encode_dir_np(nx, nz)   # Y-slices (XZ plane)
-    dir0_x, dir1_x = _encode_dir_np(ny, nz)   # X-slices (YZ plane)
-
-    result = np.stack([dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x], axis=-1)
-    return result.reshape(*orig_shape, 6)
-
-
 # ---------------------------------------------------------------------------
 # Surface normal estimation from grid
 # ---------------------------------------------------------------------------
@@ -498,13 +465,17 @@ class TifxyzLasagnaDataset(Dataset):
     Each __getitem__ returns:
         - vol_crop: (1, Z, Y, X) float32 — CT crop in [0, 1] (uint8/255)
         - surface_masks: (N, Z, Y, X) float32 — per-surface binary voxelization
-        - direction_channels: (6, Z, Y, X) float32 — splatted direction values
-        - normals_valid: (1, Z, Y, X) float32 — where directions were splatted
+        - raw_normals: (3, Z, Y, X) float32 — splatted raw ZYX normals. The
+          double-angle direction encoding is derived downstream, in
+          `tifxyz_labels.derive_cos_gradmag_validity`, AFTER chain-adjacent
+          slerp-blending — so this raw representation is the single source
+          of truth.
+        - normals_valid: (1, Z, Y, X) float32 — where normals were splatted
         - num_surfaces: int
         - padding_mask: (1, Z, Y, X) float32 — where CT data exists
 
-    GPU label derivation (EDT, chain, cos/grad_mag) happens in the train step
-    via tifxyz_labels.compute_patch_labels().
+    GPU label derivation (EDT, chain, cos/grad_mag, direction encoding)
+    happens in the train step via tifxyz_labels.compute_patch_labels().
     """
 
     def __init__(
@@ -602,13 +573,17 @@ class TifxyzLasagnaDataset(Dataset):
         Returns a dict with keys:
             mask          (Z, Y, X) float32 — binary voxelization
             points_local  (M, 3) float32   — local ZYX positions for splatting
-            normals_zyx   (M, 3) float32   — raw ZYX normals at those positions
-                                             (pre double-angle encoding)
-            dir_values    (M, 6) float32   — double-angle direction channels
+            normals_zyx   (M, 3) float32   — raw ZYX normals at those positions.
+                                             The double-angle encoding is
+                                             applied downstream in
+                                             `tifxyz_labels.derive_cos_gradmag_validity`,
+                                             AFTER slerp-blending between
+                                             chain-adjacent wraps, so this
+                                             raw representation is the single
+                                             source of truth.
         """
         crop_size_tuple = tuple(int(v) for v in crop_size)
         empty_pts = np.zeros((0, 3), dtype=np.float32)
-        empty_vals = np.zeros((0, 6), dtype=np.float32)
         empty_mask = np.zeros(crop_size_tuple, dtype=np.float32)
 
         def _empty(mask=empty_mask):
@@ -616,7 +591,6 @@ class TifxyzLasagnaDataset(Dataset):
                 "mask": mask,
                 "points_local": empty_pts,
                 "normals_zyx": empty_pts.copy(),
-                "dir_values": empty_vals,
             }
 
         seg = wrap["segment"]
@@ -687,20 +661,23 @@ class TifxyzLasagnaDataset(Dataset):
         # Compute normals from the grid
         normals_zyx = _estimate_grid_normals(zyx_world)
 
-        # Direction encoding from normals
+        # Raw normals are the single source of truth for direction
+        # supervision. The 6-channel double-angle encoding is derived
+        # downstream in `tifxyz_labels.derive_cos_gradmag_validity`
+        # *after* slerp-blending the raw normals at chain-adjacent
+        # brackets, so the encoding lives in exactly one place and
+        # the blend is done in the correct (angle) space.
         valid_for_dir = valid & np.isfinite(normals_zyx).all(axis=-1)
         if not np.any(valid_for_dir):
             return _empty(surface_mask)
 
         pts_local = zyx_local[valid_for_dir].astype(np.float32)
         normals_used = normals_zyx[valid_for_dir].astype(np.float32)
-        dir_vals = compute_direction_values(normals_used)
 
         return {
             "mask": surface_mask,
             "points_local": pts_local,
             "normals_zyx": normals_used,
-            "dir_values": dir_vals,
         }
 
     def __getitem__(self, idx):
@@ -726,10 +703,10 @@ class TifxyzLasagnaDataset(Dataset):
         # Per-patch chain info (wrap_idx → chain/pos/has_prev/has_next/label)
         chain_info_full = build_patch_chains(patch, self.max_surfaces_per_patch)
 
-        # Per-surface: voxelize mask and compute direction channels
+        # Per-surface: voxelize mask and collect raw normals for splatting
         surface_masks = []
-        all_dir_points = []
-        all_dir_values = []
+        all_normal_points = []
+        all_normals_zyx = []
         kept_wrap_indices: list[int] = []
         surface_geometry: list[dict] = []
 
@@ -741,10 +718,10 @@ class TifxyzLasagnaDataset(Dataset):
             if np.any(mask > 0):
                 surface_masks.append(mask)
                 kept_wrap_indices.append(wrap_idx)
-                dir_pts = wrap_out["points_local"]
-                if dir_pts.shape[0] > 0:
-                    all_dir_points.append(dir_pts)
-                    all_dir_values.append(wrap_out["dir_values"])
+                pts_local = wrap_out["points_local"]
+                if pts_local.shape[0] > 0:
+                    all_normal_points.append(pts_local)
+                    all_normals_zyx.append(wrap_out["normals_zyx"])
                 if self.include_geometry:
                     surface_geometry.append({
                         "wrap_idx": wrap_idx,
@@ -784,15 +761,19 @@ class TifxyzLasagnaDataset(Dataset):
         else:
             surface_masks_arr = np.zeros((0,) + crop_size, dtype=np.float32)
 
-        # Splat direction channels from all surfaces combined: (6, Z, Y, X)
-        if all_dir_points:
-            pts = np.concatenate(all_dir_points, axis=0)
-            vals = np.concatenate(all_dir_values, axis=0)
-            direction_channels, normals_valid_vol = _splat_multichannel(
+        # Splat RAW normals from all surfaces combined: (3, Z, Y, X).
+        # Downstream derive_cos_gradmag_validity slerp-blends these at
+        # the chain-adjacent bracket and calls encode_direction_channels
+        # once to produce the final 6-channel targets[2:8] — this is the
+        # "one canonical representation" rule for normal supervision.
+        if all_normal_points:
+            pts = np.concatenate(all_normal_points, axis=0)
+            vals = np.concatenate(all_normals_zyx, axis=0)  # (N, 3) raw normals
+            raw_normals_vol, normals_valid_vol = _splat_multichannel(
                 pts, vals, crop_size,
             )
         else:
-            direction_channels = np.zeros((6,) + crop_size, dtype=np.float32)
+            raw_normals_vol = np.zeros((3,) + crop_size, dtype=np.float32)
             normals_valid_vol = np.zeros(crop_size, dtype=np.float32)
 
         # Padding mask: where CT data actually exists (non-zero after crop)
@@ -804,14 +785,14 @@ class TifxyzLasagnaDataset(Dataset):
         ).unsqueeze(0)  # (1, Z, Y, X)
 
         surface_masks_t = torch.as_tensor(surface_masks_arr, dtype=torch.float32)
-        direction_channels_t = torch.as_tensor(direction_channels, dtype=torch.float32)
+        raw_normals_t = torch.as_tensor(raw_normals_vol, dtype=torch.float32)
         normals_valid_t = torch.as_tensor(normals_valid_vol, dtype=torch.float32).unsqueeze(0)
         padding_mask_t = torch.as_tensor(padding_mask, dtype=torch.float32).unsqueeze(0)
 
         sample = {
             "image": vol_crop_t,                        # (1, Z, Y, X)
             "surface_masks": surface_masks_t,           # (N, Z, Y, X)
-            "direction_channels": direction_channels_t, # (6, Z, Y, X)
+            "raw_normals": raw_normals_t,               # (3, Z, Y, X)
             "normals_valid": normals_valid_t,           # (1, Z, Y, X)
             "num_surfaces": num_surfaces,
             "padding_mask": padding_mask_t,             # (1, Z, Y, X)
@@ -835,7 +816,7 @@ def collate_variable_surfaces(batch):
     Stacks fixed-size tensors normally, keeps surface_masks as a list.
     """
     images = torch.stack([b["image"] for b in batch])
-    direction_channels = torch.stack([b["direction_channels"] for b in batch])
+    raw_normals = torch.stack([b["raw_normals"] for b in batch])
     normals_valid = torch.stack([b["normals_valid"] for b in batch])
     padding_masks = torch.stack([b["padding_mask"] for b in batch])
     num_surfaces = [b["num_surfaces"] for b in batch]
@@ -846,7 +827,7 @@ def collate_variable_surfaces(batch):
     out = {
         "image": images,                        # (B, 1, Z, Y, X)
         "surface_masks": surface_masks,         # list of (Ni, Z, Y, X) tensors
-        "direction_channels": direction_channels,  # (B, 6, Z, Y, X)
+        "raw_normals": raw_normals,             # (B, 3, Z, Y, X)
         "normals_valid": normals_valid,         # (B, 1, Z, Y, X)
         "num_surfaces": num_surfaces,           # list of ints
         "padding_mask": padding_masks,          # (B, 1, Z, Y, X)
@@ -871,8 +852,8 @@ def _transform_geometry(geom_list, flip_z, flip_y, flip_x, k, size_zyx):
     with the matching sign flip / XY rotation on the raw normals.
     The result still holds valid ``points_local`` / ``normals_zyx``
     in the patch-local ZYX frame, so downstream re-splatting via
-    ``compute_direction_values`` + ``_splat_multichannel`` produces
-    a correctly encoded direction_channels volume for the new frame.
+    ``_splat_multichannel`` produces a correct raw-normal volume
+    for the new frame.
     """
     Zs, Ys, Xs = int(size_zyx[0]), int(size_zyx[1]), int(size_zyx[2])
     out = []
@@ -912,9 +893,17 @@ def _transform_geometry(geom_list, flip_z, flip_y, flip_x, k, size_zyx):
 def augment_batch_inplace(batch: dict) -> dict:
     """Apply a single shared random flip+rot90 transform to every
     patch-local field in a collated batch, then re-splat the
-    direction_channels and normals_valid volumes from the
-    augmented surface_geometry so the double-angle encoding is
-    correct in the new frame.
+    ``raw_normals`` and ``normals_valid`` volumes from the augmented
+    surface_geometry.
+
+    Raw normals are transformed coherently with the points by
+    ``_transform_geometry`` (sign-flipping per axis, rotating in the
+    XY plane), so re-splatting them is the correct thing to do in
+    any flip/rot frame. The 6-channel double-angle encoding is
+    derived much later, inside
+    ``tifxyz_labels.derive_cos_gradmag_validity``, AFTER
+    chain-adjacent slerp-blending — so no encoded volume needs to be
+    re-splatted here.
 
     Intended to be called by the training loop before
     ``compute_batch_targets``. Val should not call this.
@@ -949,18 +938,31 @@ def augment_batch_inplace(batch: dict) -> dict:
 
     if "surface_geometry" not in batch:
         # No geometry — can only re-splat if we have it. Fall back
-        # to geometric flip of the existing direction_channels (this
-        # retains the latent sign/rotation bug but avoids crashing
-        # on datasets built without include_geometry=True).
-        batch["direction_channels"] = _flip_rot(
-            batch["direction_channels"], (2, 3, 4),
-        )
+        # to a plain geometric flip of the already-splatted raw
+        # normals. Flips/rotations must also sign-flip / rotate the
+        # normal components to stay consistent with the image.
+        rn = _flip_rot(batch["raw_normals"], (2, 3, 4))
+        if flip_z:
+            rn[:, 0] = -rn[:, 0]
+        if flip_y:
+            rn[:, 1] = -rn[:, 1]
+        if flip_x:
+            rn[:, 2] = -rn[:, 2]
+        for _ in range(k % 4):
+            # Rotate the (ny, nx) pair in the XY plane the same way
+            # _transform_geometry rotates the points (see the
+            # docstring there). new_ny = -old_nx, new_nx = old_ny.
+            ny_old = rn[:, 1].clone()
+            nx_old = rn[:, 2].clone()
+            rn[:, 1] = -nx_old
+            rn[:, 2] = ny_old
+        batch["raw_normals"] = rn
         batch["normals_valid"] = _flip_rot(
             batch["normals_valid"], (2, 3, 4),
         )
         return batch
 
-    new_dir_channels = torch.zeros_like(batch["direction_channels"])
+    new_raw_normals = torch.zeros_like(batch["raw_normals"])
     new_normals_valid = torch.zeros_like(batch["normals_valid"])
 
     for b in range(B):
@@ -977,18 +979,17 @@ def augment_batch_inplace(batch: dict) -> dict:
         if not pts_list:
             continue
         all_pts = np.concatenate(pts_list, axis=0)
-        all_nrm = np.concatenate(nrm_list, axis=0)
-        dir_vals = compute_direction_values(all_nrm)  # (N, 6)
-        dir_ch, nv = _splat_multichannel(
-            all_pts, dir_vals, (int(Z), int(Y), int(X)),
+        all_nrm = np.concatenate(nrm_list, axis=0)  # (N, 3) raw normals
+        raw_vol, nv = _splat_multichannel(
+            all_pts, all_nrm, (int(Z), int(Y), int(X)),
         )
-        new_dir_channels[b] = torch.as_tensor(
-            dir_ch, dtype=new_dir_channels.dtype,
+        new_raw_normals[b] = torch.as_tensor(
+            raw_vol, dtype=new_raw_normals.dtype,
         )
         new_normals_valid[b, 0] = torch.as_tensor(
             nv, dtype=new_normals_valid.dtype,
         )
 
-    batch["direction_channels"] = new_dir_channels
+    batch["raw_normals"] = new_raw_normals
     batch["normals_valid"] = new_normals_valid
     return batch

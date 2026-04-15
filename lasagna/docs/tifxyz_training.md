@@ -281,41 +281,80 @@ For every voxel, `derive_cos_gradmag_validity()`:
 - Chain endpoints with no neighbor on the "open" side are invalid on that
   side. Chain-of-one wraps contribute no valid voxels.
 
-### Direction densification
+### Direction densification (raw-normal slerp, last-second encoding)
 
-`_splat_multichannel` produces `direction_channels` only at the raw
-tifxyz point positions, so the sparse supervision covers just the wrap
-voxels themselves. To get a useful gradient throughout the
-between-wraps region, `derive_cos_gradmag_validity()` also emits a
-**dense** direction volume when it is handed the per-wrap feature
-transforms and the sparse `direction_channels`:
+The dataset does **not** carry a pre-encoded 6-channel
+`direction_channels` volume any more. Instead it splats raw ZYX
+normals:
+
+```
+_splat_multichannel(points_local, normals_zyx, crop_size)
+  → raw_normals   (3, Z, Y, X)   # sparse trilinear splat of unit vectors
+  → normals_valid (Z, Y, X)      # where the splat landed
+```
+
+These are carried through augmentation (`augment_batch_inplace`
+re-splats from the already-transformed `surface_geometry`) and
+handed to `compute_patch_labels` alongside the surface masks. The
+single place that touches the double-angle encoding is
+`derive_cos_gradmag_validity` — and it does so *after* slerp-blending
+in angle space:
 
 - Per-wrap EDTs are computed jointly with **feature transforms** via
-  `edt_torch_with_indices(~mask_i)` (a single CuPy call that returns
-  both the distance and the ZYX coordinates of the nearest on-wrap
-  voxel). These are threaded down from `compute_batch_targets` via
-  `precomputed_fts` alongside `precomputed_dts`.
+  `edt_torch_with_indices(~mask_i)` (one CuPy call, returning both
+  distances and nearest-on-wrap ZYX indices). These are threaded
+  down from `compute_batch_targets` via `precomputed_fts` alongside
+  `precomputed_dts`.
 - Inside the per-chain, per-position loop (the same loop that routes
   voxels to their chain-adjacent `prev` or `next` bracket for cos),
-  the encoded direction values are gathered at the two bracketing
-  wraps' nearest-on-wrap voxels and blended using the **same**
-  `frac = d_lo / (d_lo + d_hi)` that drives cos. So at `d_lo = 0`
-  (on the `lo` surface) the blended direction is 100% that wrap's
-  encoding, and across the gap it interpolates linearly to the `hi`
-  wrap's encoding — in lockstep with the cos winding.
+  the raw normals at the two bracketing wraps are gathered at those
+  feature-transform indices (so the blend always reads from the
+  surface-local raw normals, not from a decoded encoding) and
+  combined via `slerp_unit(n_lo, n_hi, frac)` using the **same**
+  `frac = d_lo / (d_lo + d_hi)` that drives cos. Slerp is
+  sign-invariant (it flips `n2` into `n1`'s hemisphere so the
+  shorter arc is taken) and degenerates gracefully into lerp when
+  the two normals are near-parallel.
+- At `d_lo = 0` (on the `lo` surface) the blend yields 100 % `n_lo`;
+  across the gap it rotates smoothly through the cross-product
+  geodesic to 100 % `n_hi` at the `hi` surface — correctly in angle
+  space, **not** in encoded space.
 - `apply_same_surface_merge` recomputes feature transforms from the
-  unioned mask for merged groups, so the nearest-on-wrap lookup stays
-  exact after a same-surface merge.
-- The sparse splatted values are preserved at their exact voxels
-  (the blend never overwrites them). `dir_weight` is `1.0` on those
-  voxels, `0.1` inside the bracket fill, and `0` elsewhere.
+  unioned mask for merged groups, so the nearest-on-wrap lookup
+  stays exact after a same-surface merge.
+- After the chain loop, `compute_patch_labels` sparse-overrides
+  `n_dense` with the original `raw_normals` wherever
+  `normals_valid` is `True` (splatted wrap voxels keep their hard
+  ground-truth values), then calls
+  `encode_direction_channels(nx, ny, nz)` **once** to produce the
+  final 6-channel `targets[2:8]`. If the encoding ever needs to
+  change, only that one function needs to change.
+- Per-plane relevance weights fall out of the densified raw-normal
+  field: for each voxel, `w_z = √(nx² + ny²)`, `w_y = √(nx² + nz²)`,
+  `w_x = √(ny² + nz²)`. The 6-channel `dir_axis_weight` is
+  `[w_z, w_z, w_y, w_y, w_x, w_x]`. A voxel whose normal is
+  perpendicular to a given slice plane gets near-zero weight on
+  that plane's direction pair — the encoding there is degenerate
+  noise so the loss correctly ignores it. This restores the
+  per-plane weighting the old `train_unet_3d.py` had.
+- Two masks are returned separately: `dir_sparse_mask`
+  (splatted wrap voxels) and `dir_dense_mask` (bracket fill). The
+  train loop runs the direction MSE twice — once per mask, both
+  with `weight=dir_axis_weight` — and logs
+  `train/loss_dir_sparse` vs `train/loss_dir_dense` so the hard
+  wrap-voxel error is visible separately from the softer bracket
+  fill.
 
-Why the chain-adjacent routing matters: an earlier version of the
-densifier picked the globally two-nearest wraps per voxel and blended
-those, which produced visible streaks at Voronoi boundaries between
-wrap catchment regions and leaked across chains. Using the exact
-same routing as cos eliminates both failure modes — the blend
-changes smoothly in lockstep with cos across every gap.
+Why iterative approaches failed:
+
+- An earlier densifier picked the globally two-nearest wraps per
+  voxel → visible streaks at Voronoi boundaries and cross-chain
+  leaks. Using the chain-adjacent routing fixes both.
+- Blending the already-encoded 6-channel `direction_channels`
+  linearly → wrong: the double-angle encoding is nonlinear in θ,
+  so a 50/50 encoded-space average is not the angular midpoint
+  and the magnitudes shrink toward 0.5. Slerping raw normals and
+  encoding last-second is the correct operation.
 
 ## Inspecting the dataset
 
