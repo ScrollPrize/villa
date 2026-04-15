@@ -251,6 +251,19 @@ def test_guided_network_forward_works_with_trainable_guide_backbone(tmp_path: Pa
     assert any(parameter.requires_grad for parameter in model.guide_backbone.parameters())
 
 
+def test_guide_token_mask_sampling_is_disabled_in_eval_mode(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(checkpoint_path, basic_encoder_block="ConvBlock")
+    mgr.model_config["guide_tokenbook_sample_rate"] = 0.25
+    model = NetworkFromConfig(mgr).eval()
+
+    guide_features = torch.randn(2, 48, 2, 2, 2)
+    mask = model._sample_guide_token_mask(guide_features)
+
+    assert mask is None
+
+
 def test_learned_mlp_z_projection_reloads_from_final_config(tmp_path: Path):
     checkpoint_path = tmp_path / "guide_backbone.pt"
     _write_local_guide_checkpoint(checkpoint_path)
