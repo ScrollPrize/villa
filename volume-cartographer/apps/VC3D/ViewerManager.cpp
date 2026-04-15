@@ -731,6 +731,14 @@ void ViewerManager::handleSurfaceChanged(std::string name, std::shared_ptr<Surfa
 
 void ViewerManager::handleSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf)
 {
+    // Fast path on app shutdown: don't bother maintaining the rtree when
+    // everything is about to be freed anyway. A single large surface would
+    // otherwise cost ~11s of per-cell tree->remove() while the user stares
+    // at a frozen window.
+    if (_shuttingDown.load(std::memory_order_relaxed)) {
+        return;
+    }
+
     // Called BEFORE surface deletion - remove from R-tree index
     auto quad = std::dynamic_pointer_cast<QuadSurface>(surf);
 
@@ -740,6 +748,11 @@ void ViewerManager::handleSurfaceWillBeDeleted(std::string name, std::shared_ptr
     const bool isDeletingByActualId = quad && (name == quad->id);
 
     if (isDeletingByActualId) {
+        // Track whether this surface was ever actually indexed. If not,
+        // the R-tree has nothing to remove — skip the whole mask walk.
+        const bool wasIndexed = (_indexedSurfaceIds.find(name)
+                                 != _indexedSurfaceIds.end());
+
         // Remove from indexed surface IDs
         _indexedSurfaceIds.erase(name);
 
@@ -759,8 +772,14 @@ void ViewerManager::handleSurfaceWillBeDeleted(std::string name, std::shared_ptr
             _surfacesQueuedForRemovalDuringRebuild.emplace_back(name, surf);
         }
 
-        // Remove from the current R-tree index
-        _surfacePatchIndex.removeSurface(quad);
+        if (wasIndexed) {
+            // Remove from the current R-tree index
+            _surfacePatchIndex.removeSurface(quad);
+        } else {
+            std::fprintf(stderr,
+                "[ViewerManager::handleSurfaceWillBeDeleted] name=%s skipping "
+                "removeSurface (never indexed)\n", name.c_str());
+        }
 
         // Invalidate intersection lines on all viewers so stale lines from the
         // deleted surface don't persist on screen.

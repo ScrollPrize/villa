@@ -1104,7 +1104,12 @@ CWindow::CWindow(size_t cacheSizeGB) :
 // Destructor
 CWindow::~CWindow()
 {
-
+    // Backstop in case ~CWindow is reached without closeEvent firing (e.g.
+    // if the app is torn down programmatically). Same rationale as the
+    // closeEvent hook — skip SurfacePatchIndex removal during teardown.
+    if (_viewerManager) {
+        _viewerManager->beginShutdown();
+    }
     if (_fileWatcher) {
         _fileWatcher->stopWatching();
     }
@@ -4184,6 +4189,14 @@ void CWindow::saveWindowState()
 
 void CWindow::closeEvent(QCloseEvent* event)
 {
+    // Tell ViewerManager to stop maintaining the SurfacePatchIndex. The
+    // CState teardown below iterates every tracked surface and sets it to
+    // nullptr, which would otherwise trigger an O(N) rtree->remove() per
+    // surface — easily 10+ seconds on a flattened segment with millions
+    // of cells.
+    if (_viewerManager) {
+        _viewerManager->beginShutdown();
+    }
     saveWindowState();
     event->accept();
 }

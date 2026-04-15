@@ -4,6 +4,7 @@
 #include <QString>
 #include <QFutureWatcher>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
@@ -109,6 +110,12 @@ public:
     void refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface, const cv::Rect& changedRegion);
     void waitForPendingIndexRebuild();
 
+    // Stop maintaining the SurfacePatchIndex. Any subsequent
+    // surfaceWillBeDeleted signals will be ignored instead of triggering
+    // an O(N) rtree removal. Intended to be called from the close path so
+    // that tearing down thousands of cells doesn't block app exit.
+    void beginShutdown() noexcept { _shuttingDown = true; }
+
 signals:
     void viewerCreated(CTiledVolumeViewer* viewer);
     void overlayWindowChanged(float low, float high);
@@ -156,6 +163,7 @@ private:
     int _surfacePatchSamplingStride{1};
     bool _surfacePatchStrideUserSet{false};
     int _targetRefinedStride{0};  // 0 = no refinement pending
+    std::atomic<bool> _shuttingDown{false};
     int _intersectionMaxSurfaces{0};  // 0 = unlimited
 
     VolumeOverlayController* _volumeOverlay{nullptr};
