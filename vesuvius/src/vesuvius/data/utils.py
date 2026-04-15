@@ -82,7 +82,15 @@ def open_zarr(path: str, mode: str = 'r',
         # Always use AWS credentials for S3 URLs
         if 'anon' not in storage_options:
             storage_options['anon'] = False
-        
+
+        # Disable boto3 request/response checksums: they show up as the top CPU
+        # consumer in inference (httpchecksum.update) and add no value on top of
+        # TLS + S3 ETag. Requires botocore >= 1.36.
+        config_kwargs = dict(storage_options.get('config_kwargs') or {})
+        config_kwargs.setdefault('request_checksum_calculation', 'when_required')
+        config_kwargs.setdefault('response_checksum_validation', 'when_required')
+        storage_options['config_kwargs'] = config_kwargs
+
         if verbose:
             print(f"Opening S3 zarr store at {path} with storage_options: {storage_options}")
         
