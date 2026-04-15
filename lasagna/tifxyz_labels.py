@@ -39,6 +39,32 @@ def edt_torch(mask: torch.Tensor) -> torch.Tensor:
     return torch.from_dlpack(dt).float()
 
 
+def edt_torch_with_indices(
+    mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """EDT + feature transform on a CUDA bool/uint8 tensor.
+
+    Input voxels ≠ 0 are foreground; distance from each foreground
+    voxel to the nearest background (zero) voxel, plus the ZYX
+    coordinates of that nearest background voxel.
+
+    Returns:
+        dist: (Z, Y, X) float32 — CUDA.
+        idx:  (3, Z, Y, X) int64 — CUDA.
+    """
+    import cupy as cp
+    from cupyx.scipy.ndimage import distance_transform_edt as cupy_edt
+
+    cp_arr = cp.from_dlpack(mask.contiguous())
+    dt, idx = cupy_edt(
+        cp_arr,
+        return_distances=True,
+        return_indices=True,
+        float64_distances=False,
+    )
+    return torch.from_dlpack(dt).float(), torch.from_dlpack(idx).long()
+
+
 # ---------------------------------------------------------------------------
 # Direction encoding
 # ---------------------------------------------------------------------------
@@ -186,7 +212,14 @@ def derive_cos_gradmag_validity(
     dts: list[torch.Tensor],
     surface_masks: list[torch.Tensor],
     chains: list[list[int]],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    fts: Optional[list[torch.Tensor]] = None,
+    direction_channels: Optional[torch.Tensor] = None,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    Optional[torch.Tensor],
+]:
     """Derive cos / grad_mag / validity for all voxels bracketed between
     chain-adjacent surfaces.
 
@@ -203,10 +236,23 @@ def derive_cos_gradmag_validity(
             Indexed by surface-mask index (same order as ``surface_masks``).
         surface_masks: list of N bool CUDA tensors.
         chains: list of chains, each a list of surface-mask indices in order.
+        fts: optional list of per-wrap feature-transform tensors aligned
+            with ``dts``. Each entry is ``(3, Z, Y, X)`` int64 giving the
+            ZYX coordinates of the nearest on-wrap voxel per voxel.
+            When provided together with ``direction_channels`` the
+            function also builds a dense direction volume by gathering
+            at those indices and blending between the chain-adjacent
+            bracket pair with the same routing as cos / grad_mag.
+        direction_channels: optional ``(6, Z, Y, X)`` float32 sparse
+            splat that ``fts`` gathers from. Ignored when ``fts`` is
+            None.
 
     Returns:
         cos, grad_mag, valid — all (Z, Y, X); cos/grad_mag are 0 outside
         ``valid``.
+        dir_dense — ``(6, Z, Y, X)`` float32 densified direction volume
+            when ``fts`` + ``direction_channels`` were provided, else
+            ``None``. Zero outside ``valid``.
     """
     if not dts:
         raise ValueError("derive_cos_gradmag_validity requires at least one surface")
@@ -218,8 +264,14 @@ def derive_cos_gradmag_validity(
     grad_mag_out = torch.zeros(shape, device=device)
     valid_out = torch.zeros(shape, dtype=torch.bool, device=device)
 
+    want_dir = fts is not None and direction_channels is not None
+    if want_dir:
+        dir_dense = torch.zeros_like(direction_channels)
+    else:
+        dir_dense = None
+
     if N_total == 0:
-        return cos_out, grad_mag_out, valid_out
+        return cos_out, grad_mag_out, valid_out, dir_dense
 
     # Global "which surface is nearest" across ALL surfaces (any chain).
     # This decides, for each voxel, which surface's bracketing logic applies.
@@ -347,7 +399,44 @@ def derive_cos_gradmag_validity(
             grad_mag_out = torch.where(local_valid, grad_mag_full, grad_mag_out)
             valid_out |= local_valid
 
-    return cos_out, grad_mag_out, valid_out
+            # Direction blend — uses the SAME routed bracket pair
+            # and the SAME ``frac`` so the densified direction
+            # varies smoothly in lockstep with cos across the gap.
+            # On each side: lo = the surface whose dt runs from 0
+            # at the surface to (spacing) at the opposite one.
+            #   use_prev voxels: lo = prev, hi = near.
+            #   use_next voxels: lo = near, hi = next.
+            # With frac = d_lo / spacing, dir_blend interpolates
+            # linearly from dir(lo) at the "lo" surface to dir(hi)
+            # at the "hi" surface.
+            if want_dir:
+                def _gather(ft: torch.Tensor) -> torch.Tensor:
+                    return direction_channels[:, ft[0], ft[1], ft[2]]
+
+                dir_near = _gather(fts[surf_idx])
+                dir_lo = torch.zeros_like(dir_near)
+                dir_hi = torch.zeros_like(dir_near)
+                if has_prev:
+                    dir_prev = _gather(fts[prev_idx])
+                    use_prev_b = use_prev.unsqueeze(0)
+                    dir_lo = torch.where(use_prev_b, dir_prev, dir_lo)
+                    dir_hi = torch.where(use_prev_b, dir_near, dir_hi)
+                    del dir_prev
+                if has_next:
+                    dir_next = _gather(fts[next_idx])
+                    use_next_b = use_next.unsqueeze(0)
+                    dir_lo = torch.where(use_next_b, dir_near, dir_lo)
+                    dir_hi = torch.where(use_next_b, dir_next, dir_hi)
+                    del dir_next
+                del dir_near
+
+                frac_b = frac.unsqueeze(0)
+                dir_blend = (1.0 - frac_b) * dir_lo + frac_b * dir_hi
+                local_valid_b = local_valid.unsqueeze(0)
+                dir_dense = torch.where(local_valid_b, dir_blend, dir_dense)
+                del dir_lo, dir_hi, dir_blend
+
+    return cos_out, grad_mag_out, valid_out, dir_dense
 
 
 # ---------------------------------------------------------------------------
@@ -442,7 +531,14 @@ def apply_same_surface_merge(
     surface_masks: list[torch.Tensor],
     surface_chain_info: list[dict],
     groups: list[list[int]],
-) -> tuple[list[torch.Tensor], list[torch.Tensor], list[dict], list[int]]:
+    fts: Optional[list[torch.Tensor]] = None,
+) -> tuple[
+    list[torch.Tensor],
+    list[torch.Tensor],
+    list[dict],
+    list[int],
+    Optional[list[torch.Tensor]],
+]:
     """Collapse each group of surfaces into one merged representative.
 
     For every group of size ≥ 2:
@@ -454,15 +550,21 @@ def apply_same_surface_merge(
         ``merged_from`` tuple records the original slot indices, so
         downstream code (vis) can still iterate all originals.
 
-    Returns ``(merged_dts, merged_masks, merged_chain_info, merge_groups)``
-    where ``merge_groups[k]`` is the merged slot that original slot
-    ``k`` belongs to.
+    Returns ``(merged_dts, merged_masks, merged_chain_info,
+    merge_groups, merged_fts)`` where ``merge_groups[k]`` is the
+    merged slot that original slot ``k`` belongs to and
+    ``merged_fts`` is ``None`` iff ``fts`` was ``None``.
+
+    When ``fts`` is provided, each merged group's feature transform
+    is recomputed from the merged mask via ``edt_torch_with_indices``
+    so the nearest-on-wrap lookup is exact for the unioned surface.
     """
     N = sum(len(g) for g in groups)
     merge_groups = [0] * N
     merged_dts: list[torch.Tensor] = []
     merged_masks: list[torch.Tensor] = []
     merged_info: list[dict] = []
+    merged_fts: Optional[list[torch.Tensor]] = [] if fts is not None else None
     for new_slot, group in enumerate(groups):
         for original in group:
             merge_groups[original] = new_slot
@@ -471,6 +573,8 @@ def apply_same_surface_merge(
             merged_masks.append(surface_masks[k])
             merged_dts.append(dts[k])
             merged_info.append(dict(surface_chain_info[k]))
+            if merged_fts is not None:
+                merged_fts.append(fts[k])
             continue
         m = surface_masks[group[0]]
         if m.dtype != torch.bool:
@@ -487,7 +591,12 @@ def apply_same_surface_merge(
         merged_masks.append(m)
         merged_dts.append(d)
         merged_info.append(info)
-    return merged_dts, merged_masks, merged_info, merge_groups
+        if merged_fts is not None:
+            # Recompute the feature transform from the merged mask
+            # so nearest-on-wrap lookups are exact for the union.
+            _, merged_ft = edt_torch_with_indices((~m).to(torch.uint8))
+            merged_fts.append(merged_ft)
+    return merged_dts, merged_masks, merged_info, merge_groups, merged_fts
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +611,7 @@ def compute_patch_labels(
     device: torch.device = None,
     same_surface_groups: list[list[int]] | None = None,
     precomputed_dts: list[torch.Tensor] | None = None,
+    precomputed_fts: list[torch.Tensor] | None = None,
 ) -> dict[str, torch.Tensor]:
     """Compute 8 training channels + validity using externally supplied chains.
 
@@ -573,6 +683,7 @@ def compute_patch_labels(
             "targets": torch.zeros(8, *shape, device=device),
             "validity": torch.zeros(shape, dtype=torch.bool, device=device),
             "normals_valid": empty_normals_valid,
+            "dir_weight": torch.zeros(shape, device=device),
             "merge_groups": [],
             "merged_surface_masks": [],
             "merged_chain_info": [],
@@ -580,38 +691,90 @@ def compute_patch_labels(
 
     # EDT of complement for each surface — reuse precomputed if caller
     # already ran them (e.g. compute_batch_targets does detection).
+    # We also need per-wrap feature transforms for the direction
+    # blend; compute them jointly with the dts via the _with_indices
+    # helper so CuPy only does one pass.
+    want_dir = (
+        direction_channels is not None and direction_channels.numel() > 0
+    )
     if precomputed_dts is not None:
         assert len(precomputed_dts) == N, (
             "precomputed_dts must be aligned with surface_masks"
         )
         dts = list(precomputed_dts)
+        if precomputed_fts is not None:
+            assert len(precomputed_fts) == N, (
+                "precomputed_fts must be aligned with surface_masks"
+            )
+            fts: Optional[list[torch.Tensor]] = list(precomputed_fts)
+        elif want_dir:
+            # Caller gave us dts but not fts — backfill the feature
+            # transforms. Rare path; cheap for the handful of wraps
+            # per patch.
+            fts = [
+                edt_torch_with_indices((~mask).to(torch.uint8))[1]
+                for mask in surface_masks
+            ]
+        else:
+            fts = None
     else:
         dts = []
+        fts = [] if want_dir else None
         for mask in surface_masks:
-            complement = ~mask
-            dts.append(edt_torch(complement.to(torch.uint8)))
+            complement = (~mask).to(torch.uint8)
+            if want_dir:
+                d, ft = edt_torch_with_indices(complement)
+                dts.append(d)
+                fts.append(ft)
+            else:
+                dts.append(edt_torch(complement))
 
     if same_surface_groups is not None and N >= 2:
-        dts, surface_masks, surface_chain_info, merge_groups = \
+        dts, surface_masks, surface_chain_info, merge_groups, fts = \
             apply_same_surface_merge(
                 dts, surface_masks, surface_chain_info, same_surface_groups,
+                fts=fts,
             )
     else:
         merge_groups = list(range(N))
 
     chains = chains_from_surface_info(surface_chain_info)
-    cos, grad_mag, valid = derive_cos_gradmag_validity(dts, surface_masks, chains)
+    cos, grad_mag, valid, dir_dense = derive_cos_gradmag_validity(
+        dts, surface_masks, chains,
+        fts=fts,
+        direction_channels=direction_channels if want_dir else None,
+    )
 
     targets = torch.zeros(8, *shape, device=device)
     targets[0] = cos
     targets[1] = grad_mag
-    if direction_channels is not None and direction_channels.numel() > 0:
-        targets[2:8] = direction_channels
+
+    # Keep ORIGINAL sparse splatted direction values on the wrap
+    # voxels themselves; fill the rest of the validity bracket with
+    # the chain-adjacent blend produced above. Sparse voxels get
+    # full weight (1.0) and densified voxels get 0.1 so training
+    # still leans on the hard samples.
+    DENSE_WEIGHT = 0.1
+    if want_dir and dir_dense is not None:
+        sparse_mask = empty_normals_valid.bool()
+        sparse_mask_b = sparse_mask.unsqueeze(0)
+        dc_final = torch.where(sparse_mask_b, direction_channels, dir_dense)
+        targets[2:8] = dc_final
+        dir_valid = valid | sparse_mask
+        dir_weight = torch.where(
+            sparse_mask,
+            torch.tensor(1.0, device=device),
+            torch.tensor(DENSE_WEIGHT, device=device),
+        ) * dir_valid.float()
+    else:
+        dir_valid = empty_normals_valid
+        dir_weight = torch.zeros(shape, device=device)
 
     return {
         "targets": targets,
         "validity": valid,
-        "normals_valid": empty_normals_valid,
+        "normals_valid": dir_valid,
+        "dir_weight": dir_weight,
         "merge_groups": merge_groups,
         "merged_surface_masks": list(surface_masks),
         "merged_chain_info": list(surface_chain_info),

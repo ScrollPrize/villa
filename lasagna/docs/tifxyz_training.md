@@ -220,9 +220,13 @@ Resume training with `--weights path/to/model_current.pt`.
    applied after label computation.
 
 6. **Loss** -- masked multi-scale MSE (cos, direction) + smooth L1 (grad_mag),
-   weighted by validity masks. Directions are supervised only on surface
-   voxels (via `normals_valid`); cos and grad_mag are supervised only in the
-   between-neighbors region (via the chain-derived validity mask). At
+   weighted by validity masks. Cos and grad_mag are supervised only in the
+   between-neighbors region (via the chain-derived validity mask).
+   Directions are supervised **densely** inside the same between-neighbors
+   bracket: the encoded direction channels are filled by a chain-adjacent
+   DT blend (see "Direction densification" below), weighted `1.0` on the
+   sparse splatted wrap voxels and `0.1` on the blended fill so training
+   still leans on the hard samples. At
    coarser scales `ScaleSpaceLoss3D` performs **masked-average pooling**
    on prediction and target (averaging only over valid voxels per
    2×2×2 block) and uses an **any-valid** rule for the validity mask
@@ -268,9 +272,41 @@ For every voxel, `derive_cos_gradmag_validity()`:
 - Chain endpoints with no neighbor on the "open" side are invalid on that
   side. Chain-of-one wraps contribute no valid voxels.
 
-Directions are supervised independently on surface voxels only — that
-validity comes from `normals_valid` (the splatting weight accumulator from
-the dataset) and is not affected by chain topology.
+### Direction densification
+
+`_splat_multichannel` produces `direction_channels` only at the raw
+tifxyz point positions, so the sparse supervision covers just the wrap
+voxels themselves. To get a useful gradient throughout the
+between-wraps region, `derive_cos_gradmag_validity()` also emits a
+**dense** direction volume when it is handed the per-wrap feature
+transforms and the sparse `direction_channels`:
+
+- Per-wrap EDTs are computed jointly with **feature transforms** via
+  `edt_torch_with_indices(~mask_i)` (a single CuPy call that returns
+  both the distance and the ZYX coordinates of the nearest on-wrap
+  voxel). These are threaded down from `compute_batch_targets` via
+  `precomputed_fts` alongside `precomputed_dts`.
+- Inside the per-chain, per-position loop (the same loop that routes
+  voxels to their chain-adjacent `prev` or `next` bracket for cos),
+  the encoded direction values are gathered at the two bracketing
+  wraps' nearest-on-wrap voxels and blended using the **same**
+  `frac = d_lo / (d_lo + d_hi)` that drives cos. So at `d_lo = 0`
+  (on the `lo` surface) the blended direction is 100% that wrap's
+  encoding, and across the gap it interpolates linearly to the `hi`
+  wrap's encoding — in lockstep with the cos winding.
+- `apply_same_surface_merge` recomputes feature transforms from the
+  unioned mask for merged groups, so the nearest-on-wrap lookup stays
+  exact after a same-surface merge.
+- The sparse splatted values are preserved at their exact voxels
+  (the blend never overwrites them). `dir_weight` is `1.0` on those
+  voxels, `0.1` inside the bracket fill, and `0` elsewhere.
+
+Why the chain-adjacent routing matters: an earlier version of the
+densifier picked the globally two-nearest wraps per voxel and blended
+those, which produced visible streaks at Voronoi boundaries between
+wrap catchment regions and leaked across chains. Using the exact
+same routing as cos eliminates both failure modes — the blend
+changes smoothly in lockstep with cos across every gap.
 
 ## Inspecting the dataset
 

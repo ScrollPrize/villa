@@ -370,12 +370,40 @@ gap, verified via a synthetic two-plane unit check
 
 #### Direction channels and masking
 
-Direction channels (`dir_z`, `dir_y`, `dir_x`) are supervised **only on
-surface voxels**. That masking is independent of chains — it comes from
-`normals_valid`, which is the accumulated splatting weight from
-`_splat_multichannel` in `tifxyz_lasagna_dataset.py`. Non-zero weights mark
-voxels where surface normals were splatted; everything else is masked out
-of the direction loss. No chain information is needed or used here.
+Direction channels (`dir_z`, `dir_y`, `dir_x`) are supervised **densely
+inside the cos validity bracket**. The raw sparse splat from
+`_splat_multichannel` in `tifxyz_lasagna_dataset.py` only covers voxels
+where the tifxyz points actually landed, so `derive_cos_gradmag_validity`
+runs a DT-based densification in the same per-chain loop used for cos:
+
+1. Per-wrap EDTs are built with `edt_torch_with_indices` so each wrap
+   also gets a feature transform `(3, Z, Y, X)` that, at every voxel,
+   points to the ZYX coordinate of the nearest on-wrap voxel. In the
+   training loop `compute_batch_targets` does a joint
+   dts+fts pass and threads both into `compute_patch_labels` via
+   `precomputed_dts` / `precomputed_fts`.
+2. Inside the per-chain-position block, after the bracket masks
+   (`use_prev`, `use_next`) and the cos fraction
+   `frac = d_lo / (d_lo + d_hi)` are computed, the direction values
+   are gathered at the `lo` and `hi` wraps' feature-transform indices
+   and blended as `(1 - frac) * dir_lo + frac * dir_hi`. The routed
+   voxel on the `lo` surface reads back as 100 % `lo` and smoothly
+   interpolates to 100 % `hi` at the `hi` surface.
+3. `apply_same_surface_merge` recomputes feature transforms from the
+   unioned mask for merged groups, so the lookup stays exact after
+   same-surface collapse.
+4. `compute_patch_labels` produces a combined output: sparse splatted
+   values are kept untouched at their exact voxels, densified values
+   fill the rest of the bracket, and the per-voxel `dir_weight` is
+   `1.0` on sparse voxels, `0.1` in the densified fill, `0`
+   elsewhere. `compute_batch_targets` stacks per-sample
+   `dir_weight` to `(B, 6, Z, Y, X)` and feeds it to `ScaleSpaceLoss3D`.
+
+An earlier global-top-2-closest densifier produced visible streaks at
+Voronoi boundaries and cross-chain leaks; reusing cos's chain-adjacent
+bracket routing eliminates both. See
+`lasagna/tifxyz_labels.py:derive_cos_gradmag_validity` for the shared
+loop.
 
 #### Reference
 
@@ -410,14 +438,26 @@ To produce labels on-the-fly from tifxyz surfaces for a given patch:
 4. Voxelize direction channels:
    a. Splat the 6 direction values at each surface point's 3D position
    b. Normalize splatted direction values (divide by weight accumulator)
-   → this produces normals_valid, which directly masks direction loss
-5. Per-surface distance transforms + chain-aware bracketing (§3.3):
-   a. For each surface k: dt_k = edt(~mask_k)
+   → this produces normals_valid, the SPARSE mask used later to tag
+     voxels that keep their original splat value (weight 1.0) vs
+     voxels filled by the chain-adjacent blend (weight 0.1)
+5. Per-surface distance transforms + feature transforms + chain-aware
+   bracketing + direction densification (§3.3):
+   a. For each surface k: (dt_k, ft_k) = edt_with_indices(~mask_k).
+      The feature transform ft_k gives, at every voxel, the ZYX of
+      the nearest on-wrap voxel (used to gather direction values).
    b. Global nearest-surface assignment across all chains/surfaces
    c. Per-voxel between-neighbors detection via grad dot products with
       the surface's chain-adjacent neighbors (only; no envelope search)
-   d. cos and grad_mag from bracketing distances (d_lo, d_hi)
-   e. validity = (between_prev) | (between_next) per voxel
+   d. cos and grad_mag from bracketing distances (d_lo, d_hi);
+      frac = d_lo / (d_lo + d_hi)
+   e. dir_dense = (1 - frac) * dir(lo) + frac * dir(hi), gathered at
+      the lo/hi wraps' feature transforms — in the same loop as (d),
+      same routing, same frac
+   f. validity = (between_prev) | (between_next) per voxel
+   g. Final direction = sparse splat where normals_valid, else
+      dir_dense; dir_weight = 1.0 on sparse, 0.1 in densified fill,
+      0 outside the bracket
 6. Average-pool to step resolution if needed
 ```
 
@@ -671,18 +711,34 @@ Neither is required — scipy is always available as the final fallback.
 ### Usage in tifxyz training (§3.2–3.3)
 
 In `tifxyz_labels.py` each surface gets one EDT of its complement on GPU
-(via `edt_torch`, CuPy + DLPack). Ordering and side detection come from the
-externally-provided chains (§3.2), not from scanning distances:
+plus a **feature transform** (nearest-on-wrap voxel indices) via
+`edt_torch_with_indices`, which runs CuPy's distance transform once and
+returns both the distances and the indices. Ordering and side detection
+come from the externally-provided chains (§3.2), not from scanning
+distances; the feature transforms drive the direction-channel blend
+inside the same loop:
 
 ```python
 from lasagna.tifxyz_labels import (
-    edt_torch, chains_from_surface_info, derive_cos_gradmag_validity,
+    edt_torch_with_indices, chains_from_surface_info,
+    derive_cos_gradmag_validity,
 )
 
-dts = [edt_torch((~m).to(torch.uint8)) for m in surface_masks]
+dts, fts = [], []
+for m in surface_masks:
+    d, ft = edt_torch_with_indices((~m).to(torch.uint8))
+    dts.append(d); fts.append(ft)
 chains = chains_from_surface_info(surface_chain_info)  # [[idx, ...], ...]
-cos, grad_mag, valid = derive_cos_gradmag_validity(dts, surface_masks, chains)
+cos, grad_mag, valid, dir_dense = derive_cos_gradmag_validity(
+    dts, surface_masks, chains,
+    fts=fts, direction_channels=direction_channels,
+)
 ```
+
+`dir_dense` is zero outside the validity bracket; combine with the
+sparse splat (keeping sparse values where they exist) and a
+`dir_weight` of `1.0` / `0.1` (sparse vs densified) to build the final
+direction target — see `compute_patch_labels` for the exact wiring.
 
 There is no sort or pairwise-mean step — bracketing comes from the chain
 neighbors at each position, and between-ness is confirmed via the

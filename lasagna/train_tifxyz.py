@@ -168,11 +168,13 @@ def compute_batch_targets(
     spatial_shape = batch["image"].shape[2:]  # (Z, Y, X)
     all_targets = []
     all_validity = []
+    all_dir_valid = []
+    all_dir_weight = []
     merge_groups_batch: list[list[int]] = []
     merged_masks_batch: list[list[torch.Tensor]] = []
     merged_chain_info_batch: list[list[dict]] = []
 
-    from tifxyz_labels import edt_torch, detect_same_surface_groups
+    from tifxyz_labels import edt_torch_with_indices, detect_same_surface_groups
 
     for b in range(B):
         # Convert surface masks to CUDA bool tensors
@@ -192,12 +194,21 @@ def compute_batch_targets(
             explicit_groups = same_surface_groups_batch[b]
 
         dts: list[torch.Tensor] | None = None
+        fts: list[torch.Tensor] | None = None
         groups: list[list[int]] | None = None
         if explicit_groups is not None:
             groups = explicit_groups
         elif same_surface_threshold is not None and N >= 2:
-            # Detect here so compute_patch_labels doesn't duplicate EDT work.
-            dts = [edt_torch((~m).to(torch.uint8)) for m in cuda_masks]
+            # Detect here so compute_patch_labels doesn't duplicate
+            # EDT work. Use the joint _with_indices variant so we get
+            # the feature transforms needed by the direction blend
+            # in the same cupy pass.
+            dts = []
+            fts = []
+            for m in cuda_masks:
+                d, ft = edt_torch_with_indices((~m).to(torch.uint8))
+                dts.append(d)
+                fts.append(ft)
             groups = detect_same_surface_groups(
                 dts, cuda_masks, chain_info_b,
                 threshold=float(same_surface_threshold),
@@ -212,10 +223,13 @@ def compute_batch_targets(
             device=device,
             same_surface_groups=groups,
             precomputed_dts=dts,
+            precomputed_fts=fts,
         )
 
         all_targets.append(result["targets"])      # (8, Z, Y, X)
         all_validity.append(result["validity"])     # (Z, Y, X)
+        all_dir_valid.append(result["normals_valid"])  # (Z, Y, X) bool
+        all_dir_weight.append(result["dir_weight"])    # (Z, Y, X) float
         merge_groups_batch.append(
             list(result.get("merge_groups", list(range(N))))
         )
@@ -228,10 +242,11 @@ def compute_batch_targets(
 
     targets = torch.stack(all_targets, dim=0)       # (B, 8, Z, Y, X)
     validity = torch.stack(all_validity, dim=0).unsqueeze(1).float()  # (B, 1, Z, Y, X)
-    normals_valid = normals_valid_batch  # (B, 1, Z, Y, X)
-
-    # Direction weight: could use normal projections, but for now uniform
-    dir_weight = normals_valid.expand(-1, 6, -1, -1, -1).clone()
+    # Direction validity + weight come from the densification pass
+    # inside compute_patch_labels — 1.0 on splatted wrap voxels, 0.1
+    # on DT-blended voxels inside the validity bracket, 0 outside.
+    normals_valid = torch.stack(all_dir_valid, dim=0).unsqueeze(1).float()  # (B, 1, Z, Y, X)
+    dir_weight = torch.stack(all_dir_weight, dim=0).unsqueeze(1).expand(-1, 6, -1, -1, -1).contiguous()
 
     return (
         targets, validity, normals_valid, dir_weight,
@@ -859,37 +874,35 @@ def train(
                     _log_full_vis(_vis_batch[0], "val", global_step)
                 _vis_batch.clear()
                 model.train()
+                ckpt_data = {
+                    "state_dict": model.state_dict(),
+                    "norm_type": norm_type,
+                    "upsample_mode": upsample_mode,
+                    "output_sigmoid": output_sigmoid,
+                    "precision": precision,
+                    "patch_size": patch_size,
+                    "in_channels": 1,
+                    "out_channels": 8,
+                }
+                torch.save(ckpt_data, run_dir / "model_current.pt")
+                is_best = last_val_loss < best_val_loss
+                if is_best:
+                    best_val_loss = last_val_loss
+                    torch.save(ckpt_data, run_dir / "model_best.pt")
                 train_iter.write(
                     f"{TAG} step {global_step}  val={last_val_loss:.4f}"
+                    + ("  [best]" if is_best else "")
                 )
 
         cosine_scheduler.step()
 
-        val_loss = last_val_loss
         mean_train = sum(epoch_losses) / max(len(epoch_losses), 1)
         print(
             f"epoch {epoch + 1}/{epochs}  "
-            f"train={mean_train:.4f}  val={val_loss:.4f}  "
+            f"train={mean_train:.4f}  val={last_val_loss:.4f}  "
             f"lr={optimizer.param_groups[0]['lr']:.2e}",
             flush=True,
         )
-
-        # Checkpoints
-        ckpt_data = {
-            "state_dict": model.state_dict(),
-            "norm_type": norm_type,
-            "upsample_mode": upsample_mode,
-            "output_sigmoid": output_sigmoid,
-            "precision": precision,
-            "patch_size": patch_size,
-            "in_channels": 1,
-            "out_channels": 8,
-        }
-        torch.save(ckpt_data, run_dir / "model_current.pt")
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(ckpt_data, run_dir / "model_best.pt")
-            print(f"  -> new best val loss: {val_loss:.4f}", flush=True)
 
     writer.close()
     print(f"{TAG} done. Logs & checkpoints in {run_dir}", flush=True)
