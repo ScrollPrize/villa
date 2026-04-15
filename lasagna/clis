@@ -181,3 +181,6 @@ PYTHONPATH=$SRC/vesuvius/src/:$SRC/lasagna/ time python -m lasagna3d dataset ove
 
 PYTHONPATH=$SRC/vesuvius/src/:$SRC/lasagna/ python $SRC/lasagna/train_tifxyz.py --config $SRC/lasagna/configs/tifxyz_train_s3.json --run-name tifxyz_s3_cont --patch-size 192 --weights ../train3d/runs_srv/unet3d/20260325_011010_3d/model_current.pt --w-cos 1.0 --w-mag 100.0 --w-dir 1.0 --num-workers 4 --batch-size 2 --model-patch-size 320
 
+
+PYTHONPATH=$SRC/vesuvius/src/:$SRC/lasagna/ python $SRC/lasagna/train_tifxyz.py --config $SRC/lasagna/configs/tifxyz_train_s3.json --run-name tifxyz_s3_cont_n --patch-size 192 --weights ../train3d/runs_srv/unet3d/20260325_011010_3d/model_current.pt --w-cos 1.0 --w-mag 100.0 --w-dir 100.0 --num-workers 4 --batch-size 1 --model-patc
+h-size 320 --lr 1e-5 --w-smooth 100.0

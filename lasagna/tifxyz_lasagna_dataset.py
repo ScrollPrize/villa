@@ -49,10 +49,19 @@ TAG = "[tifxyz_lasagna_dataset]"
 
 if njit is not None:
     @njit(cache=True)
-    def _splat_multichannel_trilinear_numba(points, values, size_z, size_y, size_x, n_channels):
+    def _splat_multichannel_trilinear_numba(
+        points, values, size_z, size_y, size_x, n_channels, sign_align,
+    ):
         """Splat (N, n_channels) values at (N, 3) ZYX positions into a volume.
 
         Returns (n_channels, size_z, size_y, size_x) float32.
+
+        When ``sign_align`` is true, each new contribution to a destination
+        voxel is pairwise-aligned to the voxel's existing accumulated
+        direction: if ``dot(accum_sum, new_value) < 0`` the new value is
+        flipped for that voxel only before adding. This fixes intra-wrap
+        cross-product sign cancellation on raw-normal splats where adjacent
+        points can end up with near-antipodal normals.
         """
         vox = np.zeros((n_channels, size_z, size_y, size_x), dtype=np.float32)
         weights = np.zeros((size_z, size_y, size_x), dtype=np.float32)
@@ -93,9 +102,23 @@ if njit is not None:
                         if wx <= 0.0:
                             continue
                         w = wz * wy * wx
+
+                        # Per-voxel pairwise sign alignment: dot the
+                        # new contribution against the accumulator.
+                        # dot(accum_sum, new) has the same sign as
+                        # dot(accum_mean, new) since accum_sum is a
+                        # positive multiple of the mean.
+                        sign = 1.0
+                        if sign_align and weights[zi, yi, xi] > 0.0:
+                            d_align = 0.0
+                            for c in range(n_channels):
+                                d_align += vox[c, zi, yi, xi] * values[i, c]
+                            if d_align < 0.0:
+                                sign = -1.0
+
                         weights[zi, yi, xi] += w
                         for c in range(n_channels):
-                            vox[c, zi, yi, xi] += w * values[i, c]
+                            vox[c, zi, yi, xi] += w * sign * values[i, c]
 
         # Normalize by accumulated weight
         for zi in range(size_z):
@@ -109,13 +132,21 @@ else:
     _splat_multichannel_trilinear_numba = None
 
 
-def _splat_multichannel(points_zyx, values, crop_size):
+def _splat_multichannel(points_zyx, values, crop_size, sign_align=False):
     """Splat multi-channel values at 3D positions into a volume.
 
     Args:
         points_zyx: (N, 3) float32 — local ZYX positions
         values: (N, C) float32 — channel values per point
         crop_size: (Z, Y, X) int tuple
+        sign_align: when True, pairwise-align each new contribution
+            to the destination voxel's currently accumulated direction
+            via ``dot(accum_sum, new) < 0 → flip new``. Used by the
+            raw-normal splat path so trilinear averaging of
+            locally-antipodal cross-product normals doesn't cancel
+            to zero. Not a global hemisphere projection; the reference
+            is built up per-voxel from whichever contribution arrived
+            first.
 
     Returns:
         (C, Z, Y, X) float32 — splatted volume
@@ -145,43 +176,85 @@ def _splat_multichannel(points_zyx, values, crop_size):
     if _splat_multichannel_trilinear_numba is not None:
         vox = _splat_multichannel_trilinear_numba(
             points_zyx, values,
-            crop_size[0], crop_size[1], crop_size[2], C,
+            crop_size[0], crop_size[1], crop_size[2], C, bool(sign_align),
         )
         # Recompute weight for the mask (any non-zero channel)
         weight = np.zeros(crop_size, dtype=np.float32)
         weight[np.any(np.abs(vox) > 0, axis=0)] = 1.0
         return vox, weight
 
-    # Fallback: numpy (slower but functional)
+    # Fallback: numpy (slower but functional). When sign_align is on
+    # the vectorized np.add.at path doesn't work because each new
+    # contribution must check the current accumulator state — we
+    # drop to a plain Python loop over points.
     vox = np.zeros((C,) + crop_size, dtype=np.float32)
     weights = np.zeros(crop_size, dtype=np.float32)
-    base = np.floor(points_zyx).astype(np.int64)
-    frac = points_zyx - base.astype(np.float32)
 
-    for oz in (0, 1):
-        z_idx = base[:, 0] + oz
-        wz = (1.0 - frac[:, 0]) if oz == 0 else frac[:, 0]
-        for oy in (0, 1):
-            y_idx = base[:, 1] + oy
-            wy = (1.0 - frac[:, 1]) if oy == 0 else frac[:, 1]
-            for ox in (0, 1):
-                x_idx = base[:, 2] + ox
-                wx = (1.0 - frac[:, 2]) if ox == 0 else frac[:, 2]
-                w = wz * wy * wx
-                valid = (
-                    (w > 0)
-                    & (z_idx >= 0) & (z_idx < crop_size[0])
-                    & (y_idx >= 0) & (y_idx < crop_size[1])
-                    & (x_idx >= 0) & (x_idx < crop_size[2])
-                )
-                if np.any(valid):
-                    zi = z_idx[valid]
-                    yi = y_idx[valid]
-                    xi = x_idx[valid]
-                    wv = w[valid].astype(np.float32)
-                    np.add.at(weights, (zi, yi, xi), wv)
-                    for c in range(C):
-                        np.add.at(vox[c], (zi, yi, xi), wv * values[valid, c])
+    if sign_align:
+        for i in range(points_zyx.shape[0]):
+            pz, py, px = points_zyx[i]
+            z0 = int(np.floor(pz)); y0 = int(np.floor(py)); x0 = int(np.floor(px))
+            dz = pz - z0; dy = py - y0; dx = px - x0
+            for oz in (0, 1):
+                zi = z0 + oz
+                if zi < 0 or zi >= crop_size[0]:
+                    continue
+                wz = (1.0 - dz) if oz == 0 else dz
+                if wz <= 0.0:
+                    continue
+                for oy in (0, 1):
+                    yi = y0 + oy
+                    if yi < 0 or yi >= crop_size[1]:
+                        continue
+                    wy = (1.0 - dy) if oy == 0 else dy
+                    if wy <= 0.0:
+                        continue
+                    for ox in (0, 1):
+                        xi = x0 + ox
+                        if xi < 0 or xi >= crop_size[2]:
+                            continue
+                        wx = (1.0 - dx) if ox == 0 else dx
+                        if wx <= 0.0:
+                            continue
+                        w = float(wz * wy * wx)
+                        sign = 1.0
+                        if weights[zi, yi, xi] > 0.0:
+                            d_align = 0.0
+                            for c in range(C):
+                                d_align += vox[c, zi, yi, xi] * values[i, c]
+                            if d_align < 0.0:
+                                sign = -1.0
+                        weights[zi, yi, xi] += w
+                        for c in range(C):
+                            vox[c, zi, yi, xi] += w * sign * values[i, c]
+    else:
+        base = np.floor(points_zyx).astype(np.int64)
+        frac = points_zyx - base.astype(np.float32)
+
+        for oz in (0, 1):
+            z_idx = base[:, 0] + oz
+            wz = (1.0 - frac[:, 0]) if oz == 0 else frac[:, 0]
+            for oy in (0, 1):
+                y_idx = base[:, 1] + oy
+                wy = (1.0 - frac[:, 1]) if oy == 0 else frac[:, 1]
+                for ox in (0, 1):
+                    x_idx = base[:, 2] + ox
+                    wx = (1.0 - frac[:, 2]) if ox == 0 else frac[:, 2]
+                    w = wz * wy * wx
+                    valid = (
+                        (w > 0)
+                        & (z_idx >= 0) & (z_idx < crop_size[0])
+                        & (y_idx >= 0) & (y_idx < crop_size[1])
+                        & (x_idx >= 0) & (x_idx < crop_size[2])
+                    )
+                    if np.any(valid):
+                        zi = z_idx[valid]
+                        yi = y_idx[valid]
+                        xi = x_idx[valid]
+                        wv = w[valid].astype(np.float32)
+                        np.add.at(weights, (zi, yi, xi), wv)
+                        for c in range(C):
+                            np.add.at(vox[c], (zi, yi, xi), wv * values[valid, c])
 
     # Normalize
     nonzero = weights > 0
@@ -770,7 +843,7 @@ class TifxyzLasagnaDataset(Dataset):
             pts = np.concatenate(all_normal_points, axis=0)
             vals = np.concatenate(all_normals_zyx, axis=0)  # (N, 3) raw normals
             raw_normals_vol, normals_valid_vol = _splat_multichannel(
-                pts, vals, crop_size,
+                pts, vals, crop_size, sign_align=True,
             )
         else:
             raw_normals_vol = np.zeros((3,) + crop_size, dtype=np.float32)
@@ -982,6 +1055,7 @@ def augment_batch_inplace(batch: dict) -> dict:
         all_nrm = np.concatenate(nrm_list, axis=0)  # (N, 3) raw normals
         raw_vol, nv = _splat_multichannel(
             all_pts, all_nrm, (int(Z), int(Y), int(X)),
+            sign_align=True,
         )
         new_raw_normals[b] = torch.as_tensor(
             raw_vol, dtype=new_raw_normals.dtype,
