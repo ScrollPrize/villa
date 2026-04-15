@@ -657,7 +657,7 @@ class BaseTrainer:
                 foreground = foreground.masked_fill(ignore_mask, 0.0)
             valid_mask = (~ignore_mask).float()
         else:
-            foreground = (guide_target > 0).any(dim=1, keepdim=True).float()
+            foreground = guide_target[:, -1:].float()
             valid_mask = torch.ones_like(foreground)
 
         target_resize = F.interpolate(foreground, size=guide_mask.shape[2:], mode="nearest")

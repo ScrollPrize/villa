@@ -1502,3 +1502,27 @@ def test_guide_alignment_loss_is_amp_safe_on_cuda():
 
     assert loss is not None
     assert torch.isfinite(loss)
+
+
+def test_guide_alignment_loss_uses_foreground_channel_for_multichannel_targets():
+    mgr = _make_mgr(Path("/tmp/data"), Path("/tmp/guide_backbone.pt"))
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    trainer.device = torch.device("cpu")
+    trainer._current_aux_outputs = {
+        "guide_mask": torch.full((1, 1, 2, 2, 2), 0.25, dtype=torch.float32)
+    }
+    target = torch.zeros((1, 2, 2, 2, 2), dtype=torch.float32)
+    target[:, 0] = 1.0
+    target[:, 0, 0, 0, 0] = 0.0
+    target[:, 1, 0, 0, 0] = 1.0
+    targets_dict = {"ink": target}
+
+    loss = trainer._compute_guide_alignment_loss(targets_dict)
+
+    expected = torch.nn.functional.binary_cross_entropy(
+        trainer._current_aux_outputs["guide_mask"],
+        target[:, 1:2],
+        reduction="mean",
+    )
+    assert loss is not None
+    assert torch.isclose(loss, expected)
