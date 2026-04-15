@@ -233,6 +233,9 @@ class AutoregMeshModel(nn.Module):
         self.cross_attention_every_n_blocks = int(self.config["cross_attention_every_n_blocks"])
         self.pointer_temperature = float(self.config["pointer_temperature"])
         self.coarse_prediction_mode = str(self.config["coarse_prediction_mode"])
+        self.conditioning_feature_debias_mode = str(self.config["conditioning_feature_debias_mode"])
+        self.conditioning_feature_debias_basis_source = str(self.config["conditioning_feature_debias_basis_source"])
+        self.conditioning_feature_debias_components = int(self.config["conditioning_feature_debias_components"])
 
         self.backbone = None
         memory_in_dim = self.decoder_dim
@@ -248,6 +251,15 @@ class AutoregMeshModel(nn.Module):
                 parameter.requires_grad = False
             self.backbone.eval()
             memory_in_dim = int(self.backbone.embed_dim)
+            if self.conditioning_feature_debias_mode != "none":
+                if self.conditioning_feature_debias_components >= memory_in_dim:
+                    raise ValueError(
+                        "conditioning_feature_debias_components must be smaller than Dinovol embed_dim, "
+                        f"got components={self.conditioning_feature_debias_components} embed_dim={memory_in_dim}"
+                    )
+
+        if self.conditioning_feature_debias_mode != "none" and self.backbone is None:
+            raise ValueError("conditioning_feature_debias_mode requires a configured dinov2_backbone")
 
         self.memory_proj = nn.Linear(memory_in_dim, self.decoder_dim, bias=True)
         self.memory_coord_mlp = nn.Sequential(
@@ -324,6 +336,13 @@ class AutoregMeshModel(nn.Module):
         self.position_refine_head = nn.Linear(self.decoder_dim, 3, bias=True)
         nn.init.zeros_(self.position_refine_head.weight)
         nn.init.zeros_(self.position_refine_head.bias)
+        debias_basis = torch.empty(0, 0, dtype=torch.float32)
+        if self.conditioning_feature_debias_mode != "none":
+            debias_basis = self._build_conditioning_feature_debias_basis(
+                device=next(self.backbone.parameters()).device,
+            )
+        self.register_buffer("conditioning_feature_debias_basis", debias_basis, persistent=False)
+        self.last_conditioning_feature_debias_norm_ratio: float = 1.0
 
     def _normalize_xyz(self, xyz: Tensor) -> Tensor:
         shape = torch.tensor(self.input_shape, device=xyz.device, dtype=xyz.dtype)
@@ -350,6 +369,45 @@ class AutoregMeshModel(nn.Module):
         coords = torch.stack(torch.meshgrid(z_axis, y_axis, x_axis, indexing="ij"), dim=-1).reshape(-1, 3)
         return self._normalize_xyz(coords)
 
+    @torch.no_grad()
+    def _build_conditioning_feature_debias_basis(self, *, device: torch.device) -> Tensor:
+        if self.conditioning_feature_debias_basis_source != "zero_volume_svd":
+            raise ValueError(
+                "conditioning_feature_debias_basis_source must currently be 'zero_volume_svd', "
+                f"got {self.conditioning_feature_debias_basis_source!r}"
+            )
+        zero_volume = torch.zeros(
+            (1, int(self.config.get("input_channels", 1)), *self.input_shape),
+            device=device,
+            dtype=torch.float32,
+        )
+        features = self.backbone(zero_volume)[0]
+        features = F.normalize(features, p=2, dim=1)
+        channels = int(features.shape[1])
+        flat = features.reshape(channels, -1)
+        flat = flat - flat.mean(dim=1, keepdim=True)
+        u, _, _ = torch.linalg.svd(flat, full_matrices=False)
+        return u[:, :self.conditioning_feature_debias_components].contiguous().to(dtype=torch.float32)
+
+    def _debias_conditioning_features(self, raw_tokens: Tensor) -> Tensor:
+        if self.conditioning_feature_debias_mode == "none":
+            self.last_conditioning_feature_debias_norm_ratio = 1.0
+            return raw_tokens
+        basis = self.conditioning_feature_debias_basis.to(device=raw_tokens.device, dtype=torch.float32)
+        x = raw_tokens.to(torch.float32)
+        original_norm = torch.linalg.norm(x, dim=-1, keepdim=True)
+        x_t = x.transpose(1, 2)
+        coeff = torch.matmul(basis.transpose(0, 1).unsqueeze(0), x_t)
+        projection = torch.matmul(basis.unsqueeze(0), coeff)
+        debiased = x_t - projection
+        debiased = debiased.transpose(1, 2)
+        debiased_norm = torch.linalg.norm(debiased, dim=-1, keepdim=True)
+        scale = original_norm / debiased_norm.clamp(min=1e-6)
+        debiased = debiased * scale
+        ratio = (debiased_norm / original_norm.clamp(min=1e-6)).mean().item()
+        self.last_conditioning_feature_debias_norm_ratio = float(ratio)
+        return debiased.to(dtype=raw_tokens.dtype)
+
     def encode_conditioning(self, volume: Tensor | None, vol_tokens: Tensor | None = None) -> dict[str, Tensor]:
         if vol_tokens is None:
             if self.backbone is None:
@@ -366,6 +424,7 @@ class AutoregMeshModel(nn.Module):
             batch_size = int(raw_tokens.shape[0])
             grid_shape = tuple(int(v) for v in (self.input_shape[0] // self.patch_size[0], self.input_shape[1] // self.patch_size[1], self.input_shape[2] // self.patch_size[2]))
 
+        raw_tokens = self._debias_conditioning_features(raw_tokens)
         memory_tokens = self.memory_proj(raw_tokens)
         patch_centers = self._make_memory_patch_centers(
             grid_shape,

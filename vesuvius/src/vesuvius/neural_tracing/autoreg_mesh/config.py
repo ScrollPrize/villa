@@ -42,6 +42,9 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "decoder_dropout": 0.0,
     "pointer_temperature": 0.25,
     "coarse_prediction_mode": "joint_pointer",
+    "conditioning_feature_debias_mode": "none",
+    "conditioning_feature_debias_basis_source": "zero_volume_svd",
+    "conditioning_feature_debias_components": 16,
     "rope_base": 100.0,
     "rope_min_period": None,
     "rope_max_period": None,
@@ -194,6 +197,12 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("pointer_temperature must be positive")
     if str(cfg["coarse_prediction_mode"]) not in {"joint_pointer", "axis_factorized"}:
         raise ValueError("coarse_prediction_mode must be one of {'joint_pointer', 'axis_factorized'}")
+    if str(cfg["conditioning_feature_debias_mode"]) not in {"none", "orthogonal_project"}:
+        raise ValueError("conditioning_feature_debias_mode must be one of {'none', 'orthogonal_project'}")
+    if str(cfg["conditioning_feature_debias_basis_source"]) != "zero_volume_svd":
+        raise ValueError("conditioning_feature_debias_basis_source must currently be 'zero_volume_svd'")
+    if int(cfg["conditioning_feature_debias_components"]) <= 0:
+        raise ValueError("conditioning_feature_debias_components must be positive")
     if cfg.get("rope_normalize_coords") not in {"min", "max", "separate"}:
         raise ValueError("rope_normalize_coords must be one of {'min', 'max', 'separate'}")
     if cfg.get("rope_base") is not None and (cfg.get("rope_min_period") is not None or cfg.get("rope_max_period") is not None):

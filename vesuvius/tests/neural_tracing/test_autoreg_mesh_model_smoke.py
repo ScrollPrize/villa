@@ -199,6 +199,13 @@ def _make_cached_token_config() -> dict:
     }
 
 
+def _make_debias_config(checkpoint_path: Path) -> dict:
+    config = _make_config(checkpoint_path)
+    config["conditioning_feature_debias_mode"] = "orthogonal_project"
+    config["conditioning_feature_debias_components"] = 4
+    return config
+
+
 def _make_factorized_cached_token_config() -> dict:
     config = _make_cached_token_config()
     config["coarse_prediction_mode"] = "axis_factorized"
@@ -355,6 +362,48 @@ def test_axis_factorized_autoreg_mesh_model_forward_and_losses_are_finite() -> N
     assert torch.isfinite(losses["coarse_x_loss"])
     for value in losses.values():
         assert torch.isfinite(value)
+
+
+def test_debias_autoreg_mesh_model_forward_and_losses_are_finite(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "tiny_dinovol.pt"
+    _write_local_guide_checkpoint(checkpoint)
+    config = _make_debias_config(checkpoint)
+    model = AutoregMeshModel(config)
+
+    batch = autoreg_mesh_collate([_make_sample("left"), _make_sample("up")])
+    batch = _move_batch(batch, torch.device("cpu"))
+    outputs = model(batch)
+    losses = compute_autoreg_mesh_losses(
+        outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+    )
+
+    assert model.conditioning_feature_debias_basis.shape == (48, 4)
+    assert outputs["coarse_logits"].shape[-1] == 8
+    for value in losses.values():
+        assert torch.isfinite(value)
+
+
+def test_debias_projection_reduces_energy_in_learned_basis(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "tiny_dinovol.pt"
+    _write_local_guide_checkpoint(checkpoint)
+    config = _make_debias_config(checkpoint)
+    model = AutoregMeshModel(config).eval()
+
+    volume = torch.zeros((1, 1, 16, 16, 16), dtype=torch.float32)
+    with torch.no_grad():
+        features = model.backbone(volume)[0]
+    raw_tokens = features.flatten(2).transpose(1, 2).contiguous()
+    basis = model.conditioning_feature_debias_basis
+
+    raw_proj = torch.matmul(raw_tokens.to(torch.float32), basis).pow(2).sum(dim=-1).mean()
+    debiased = model._debias_conditioning_features(raw_tokens)
+    deb_proj = torch.matmul(debiased.to(torch.float32), basis).pow(2).sum(dim=-1).mean()
+
+    assert debiased.shape == raw_tokens.shape
+    assert torch.isfinite(debiased).all()
+    assert deb_proj.item() < raw_proj.item()
 
 
 def test_position_refine_head_is_zero_initialized() -> None:
@@ -1172,6 +1221,9 @@ def test_distance_aware_target_default_config_values() -> None:
     validated = validate_autoreg_mesh_config(config)
     assert validated["pointer_temperature"] == pytest.approx(0.25)
     assert validated["coarse_prediction_mode"] == "joint_pointer"
+    assert validated["conditioning_feature_debias_mode"] == "none"
+    assert validated["conditioning_feature_debias_basis_source"] == "zero_volume_svd"
+    assert validated["conditioning_feature_debias_components"] == 16
     assert validated["scheduled_sampling_pattern"] == "stripwise_full_strip_greedy"
     assert validated["xyz_soft_loss_enabled"] is True
     assert validated["xyz_soft_loss_weight"] == pytest.approx(1.0)
@@ -1353,6 +1405,16 @@ def test_rope_config_validation_rejects_invalid_values() -> None:
     with pytest.raises(ValueError, match="coarse_prediction_mode"):
         validate_autoreg_mesh_config(bad_coarse_mode)
 
+    bad_debias_mode = _make_cached_token_config()
+    bad_debias_mode["conditioning_feature_debias_mode"] = "weird"
+    with pytest.raises(ValueError, match="conditioning_feature_debias_mode"):
+        validate_autoreg_mesh_config(bad_debias_mode)
+
+    bad_debias_source = _make_cached_token_config()
+    bad_debias_source["conditioning_feature_debias_basis_source"] = "dataset"
+    with pytest.raises(ValueError, match="conditioning_feature_debias_basis_source"):
+        validate_autoreg_mesh_config(bad_debias_source)
+
     bad_sched_pattern = _make_cached_token_config()
     bad_sched_pattern["scheduled_sampling_pattern"] = "iid"
     with pytest.raises(ValueError, match="scheduled_sampling_pattern"):
@@ -1380,6 +1442,9 @@ def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     assert result["dataset_length"] == len(dataset)
     assert result["sample_count"] == 2
     assert result["coarse_prediction_mode"] == "joint_pointer"
+    assert result["conditioning_feature_debias_mode"] == "none"
+    assert result["conditioning_feature_debias_basis_source"] == "zero_volume_svd"
+    assert result["conditioning_feature_debias_components"] == 16
     assert result["coarse_grid_shape"] == [2, 2, 2]
     assert result["coarse_axis_sizes"] == {"z": 2, "y": 2, "x": 2}
     assert result["median_prompt_length"] > 0
@@ -1404,6 +1469,27 @@ def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     assert result["rope_rescale_coords"] == pytest.approx(2.0)
     assert result["forward_ms"] >= 0.0
     assert result["infer_ms"] >= 0.0
+
+
+def test_debias_benchmark_reports_settings_and_norm_ratio(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "tiny_dinovol.pt"
+    _write_local_guide_checkpoint(checkpoint)
+    config = _make_debias_config(checkpoint)
+    dataset = _ListDataset([_make_sample("left")])
+    model = AutoregMeshModel(config).eval()
+
+    result = run_autoreg_mesh_benchmark(
+        config,
+        dataset=dataset,
+        model=model,
+        device="cpu",
+        sample_count=1,
+    )
+
+    assert result["conditioning_feature_debias_mode"] == "orthogonal_project"
+    assert result["conditioning_feature_debias_basis_source"] == "zero_volume_svd"
+    assert result["conditioning_feature_debias_components"] == 4
+    assert np.isfinite(result["conditioning_feature_debias_norm_ratio"])
 
 
 def test_axis_factorized_benchmark_reports_mode_and_axis_sizes() -> None:

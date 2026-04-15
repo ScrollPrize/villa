@@ -104,6 +104,10 @@ def run_autoreg_mesh_benchmark(
         "sample_count": int(sample_count),
         "pointer_temperature": float(cfg.get("pointer_temperature", 0.25)),
         "coarse_prediction_mode": str(cfg.get("coarse_prediction_mode", "joint_pointer")),
+        "conditioning_feature_debias_mode": str(cfg.get("conditioning_feature_debias_mode", "none")),
+        "conditioning_feature_debias_basis_source": str(cfg.get("conditioning_feature_debias_basis_source", "zero_volume_svd")),
+        "conditioning_feature_debias_components": int(cfg.get("conditioning_feature_debias_components", 16)),
+        "conditioning_feature_debias_norm_ratio": float(getattr(model, "last_conditioning_feature_debias_norm_ratio", 1.0)),
         "coarse_grid_shape": list(int(v) for v in model.coarse_grid_shape),
         "coarse_axis_sizes": {
             "z": int(model.coarse_grid_shape[0]),
