@@ -4,6 +4,8 @@
 #include <QString>
 #include <QStringList>
 
+#include <cstdint>
+
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
 
 class QLineEdit;
@@ -39,6 +41,10 @@ private:
     vc::cache::HttpAuth _auth;
     QString _currentUrl;   // e.g. "s3://bucket/prefix/"
     QString _selectedUrl;
+    // Monotonic counter incremented on every navigateTo() — late-arriving
+    // list responses check against this before touching the UI so a slow
+    // previous listing can't overwrite the results of a newer one.
+    std::uint64_t _listRequestSeq{0};
 
     QLineEdit* _pathBar{nullptr};
     QListWidget* _listWidget{nullptr};

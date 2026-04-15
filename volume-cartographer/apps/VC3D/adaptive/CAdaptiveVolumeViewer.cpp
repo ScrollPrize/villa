@@ -156,13 +156,24 @@ void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     if (_volume && _volume->numScales() >= 1) {
         auto* cache = _volume->tieredCache();
         QPointer<CAdaptiveVolumeViewer> guard(this);
+        // Capture a weak_ptr to the Volume, not a raw cache pointer, so the
+        // queued UI callback can't dereference a BlockPipeline that was
+        // destroyed by a volume swap. removeChunkReadyListener prevents
+        // NEW notifications from firing, but doesn't cancel Qt-queued
+        // events that were already in flight — so we have to re-check at
+        // dispatch time whether the cache we were notified about is still
+        // the viewer's current cache, and only then touch it.
+        std::weak_ptr<Volume> volumeWeak = _volume;
         _chunkCbId = cache->addChunkReadyListener(
-            [guard, cache](const vc::cache::ChunkKey&) {
-                QMetaObject::invokeMethod(qApp, [guard, cache]() {
-                    if (guard) {
-                        cache->clearChunkArrivedFlag();
-                        guard->scheduleRender();
+            [guard, volumeWeak](const vc::cache::ChunkKey&) {
+                QMetaObject::invokeMethod(qApp, [guard, volumeWeak]() {
+                    if (!guard) return;
+                    auto vol = volumeWeak.lock();
+                    if (!vol || guard->_volume != vol) return;
+                    if (auto* c = vol->tieredCache()) {
+                        c->clearChunkArrivedFlag();
                     }
+                    guard->scheduleRender();
                 }, Qt::QueuedConnection);
             });
     }
