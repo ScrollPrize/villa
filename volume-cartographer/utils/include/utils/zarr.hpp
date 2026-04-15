@@ -1209,7 +1209,15 @@ public:
         auto p = root_ / key;
         std::filesystem::create_directories(p.parent_path());
 
-        // Create shard with empty index if it doesn't exist
+        // Lock to prevent concurrent writes tearing this shard file.
+        // Striped so writers to different shards run concurrently.
+        //
+        // Must cover the exists-check-and-create pair: without the lock
+        // two writers racing on a fresh shard would both see !exists,
+        // both truncate with an empty index, and the second writer would
+        // overwrite the first's already-committed index entry.
+        std::lock_guard lock(shard_mutex_for(p));
+
         if (!std::filesystem::exists(p)) {
             std::ofstream create(p, std::ios::binary);
             // Write empty index: all entries = (0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF)
@@ -1218,10 +1226,6 @@ public:
             create.write(reinterpret_cast<const char*>(empty_index.data()),
                          static_cast<std::streamsize>(index_size));
         }
-
-        // Lock to prevent concurrent writes tearing this shard file.
-        // Striped so writers to different shards run concurrently.
-        std::lock_guard lock(shard_mutex_for(p));
 
         // Open for random read/write
         std::fstream f(p, std::ios::binary | std::ios::in | std::ios::out);

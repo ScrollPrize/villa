@@ -545,7 +545,12 @@ void CAdaptiveVolumeViewer::submitRender()
         // content without blocking every frame.
         int lo = _cachedStretchLo, hi = _cachedStretchHi;
         const auto now = std::chrono::steady_clock::now();
+        // Always scan when the cached bounds haven't been initialized,
+        // otherwise the first frame after a fresh invalidation would use
+        // the stale default 0/255 bounds for the whole 150 ms hysteresis
+        // window.
         const bool doScan = stretchFirstPass
+            || !_cachedStretchValid
             || (now - _lastStretchScan) > std::chrono::milliseconds(150);
         if (doScan) {
             lo = 255; hi = 0;

@@ -1402,9 +1402,12 @@ void readCompositeFastImpl(
                     case AccumMode::Mean: val = count > 0 ? accum / float(count) : 0.f; break;
                     case AccumMode::LayerStorage: {
                         if (params.method == "median") {
-                            std::nth_element(layerVals.begin(),
-                                             layerVals.begin() + numLayers / 2,
-                                             layerVals.end());
+                            // partial_sort matches the other median path
+                            // (Slicing.cpp composite) and beats nth_element
+                            // at the small N we run with (<=~33).
+                            std::partial_sort(layerVals.begin(),
+                                              layerVals.begin() + numLayers / 2 + 1,
+                                              layerVals.end());
                             val = layerVals[numLayers / 2];
                         } else if (params.method == "minabs") {
                             float best = layerVals[0];

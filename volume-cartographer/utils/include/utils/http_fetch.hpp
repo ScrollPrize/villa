@@ -253,10 +253,12 @@ private:
                                  curl_off_t, curl_off_t,
                                  curl_off_t, curl_off_t) noexcept
     {
-        // Called on every curl transfer event (high frequency).
-        // Relaxed is fine: we don't need acquire ordering with other data,
-        // just eventual visibility of the abort bit.
-        return abort_flag().load(std::memory_order_relaxed) ? 1 : 0;
+        // Acquire ordering pairs with the release store in abortAll() so
+        // termination is guaranteed to be observed promptly. On x86 this
+        // is free (plain load); relaxed would have worked there but is
+        // not formally guaranteed to see the abort bit in bounded time
+        // on weakly-ordered archs.
+        return abort_flag().load(std::memory_order_acquire) ? 1 : 0;
     }
 
 public:
@@ -302,6 +304,7 @@ public:
 
         HttpResponse resp;
         for (std::size_t attempt = 0; attempt <= config_.max_retries; ++attempt) {
+            if (isAborted()) { std::fclose(f); return resp; }
             resp = HttpResponse{};
             std::fseek(f, 0, SEEK_SET);
             auto* curl = thread_handle();
