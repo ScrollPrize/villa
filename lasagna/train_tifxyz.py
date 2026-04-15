@@ -510,6 +510,18 @@ def build_model(
 
     model = NetworkFromConfig(mgr).to(device)
 
+    if ckpt is None:
+        # NetworkFromConfig's conv Encoder/Decoder don't run an
+        # explicit init pass, so without this the weights fall back
+        # to PyTorch's default Conv3d.reset_parameters —
+        # kaiming_uniform_(a=sqrt(5)) — which undershoots the target
+        # variance for ReLU/LeakyReLU activations and slows early
+        # convergence. Match nnUNet's canonical init
+        # (kaiming_normal_ + neg_slope=1e-2, zero biases) so the
+        # LR-warmup phase isn't spent correcting scale.
+        from vesuvius.models.utils import InitWeights_He
+        model.apply(InitWeights_He(neg_slope=1e-2))
+
     if ckpt is not None:
         if isinstance(ckpt, dict) and "state_dict" in ckpt:
             state_dict = ckpt["state_dict"]
