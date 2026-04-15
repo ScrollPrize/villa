@@ -110,11 +110,16 @@ def get_activation_module(activation_str: str):
         raise ValueError(f"Unknown activation type: {activation_str}")
 
 class NetworkFromConfig(nn.Module):
-    def _read_projection_value(self, raw_cfg, target_info, model_config, key, default):
+    def _read_projection_value(self, raw_cfg, target_info, model_config, key, default, *, resolved_cfg=None, resolved_key=None):
         if isinstance(raw_cfg, dict) and key in raw_cfg:
             return raw_cfg[key]
         if key in target_info:
             return target_info[key]
+        if isinstance(resolved_cfg, dict):
+            if resolved_key is not None and resolved_key in resolved_cfg:
+                return resolved_cfg[resolved_key]
+            if key in resolved_cfg:
+                return resolved_cfg[key]
         return model_config.get(key, default)
 
     def _resolve_target_projection(self, target_name, target_info, model_config):
@@ -124,12 +129,38 @@ class NetworkFromConfig(nn.Module):
                 f"Target '{target_name}' z_projection must be a dict when provided, "
                 f"got {type(raw_cfg).__name__}"
             )
+        resolved_cfg = None
+        target_projection_cfg = model_config.get("target_z_projection")
+        if target_projection_cfg is not None:
+            if not isinstance(target_projection_cfg, dict):
+                raise TypeError(
+                    f"model_config.target_z_projection must be a dict when provided, "
+                    f"got {type(target_projection_cfg).__name__}"
+                )
+            resolved_cfg = target_projection_cfg.get(target_name)
+            if resolved_cfg is not None and not isinstance(resolved_cfg, dict):
+                raise TypeError(
+                    f"model_config.target_z_projection['{target_name}'] must be a dict when provided, "
+                    f"got {type(resolved_cfg).__name__}"
+                )
 
         mode_default = model_config.get("z_projection_mode", "none")
         if isinstance(raw_cfg, dict):
-            mode = raw_cfg.get("mode", mode_default)
+            if "mode" in raw_cfg:
+                mode = raw_cfg["mode"]
+            elif "z_projection_mode" in target_info:
+                mode = target_info["z_projection_mode"]
+            elif isinstance(resolved_cfg, dict) and "mode" in resolved_cfg:
+                mode = resolved_cfg["mode"]
+            else:
+                mode = mode_default
         else:
-            mode = target_info.get("z_projection_mode", mode_default)
+            if "z_projection_mode" in target_info:
+                mode = target_info["z_projection_mode"]
+            elif isinstance(resolved_cfg, dict) and "mode" in resolved_cfg:
+                mode = resolved_cfg["mode"]
+            else:
+                mode = mode_default
         mode = str(mode).strip().lower()
         if mode in {"", "none", "off", "false", "0"}:
             return None
@@ -147,7 +178,8 @@ class NetworkFromConfig(nn.Module):
         spec = {"mode": mode}
         if mode == "logsumexp":
             tau = float(self._read_projection_value(
-                raw_cfg, target_info, model_config, "z_projection_lse_tau", 1.0
+                raw_cfg, target_info, model_config, "z_projection_lse_tau", 1.0,
+                resolved_cfg=resolved_cfg, resolved_key="lse_tau"
             ))
             if tau <= 0:
                 raise ValueError(
@@ -157,17 +189,20 @@ class NetworkFromConfig(nn.Module):
         elif mode == "learned_mlp":
             default_depth = int(self.patch_size[0]) if len(self.patch_size) == 3 else None
             depth = self._read_projection_value(
-                raw_cfg, target_info, model_config, "z_projection_mlp_depth", default_depth
+                raw_cfg, target_info, model_config, "z_projection_mlp_depth", default_depth,
+                resolved_cfg=resolved_cfg, resolved_key="mlp_depth"
             )
             if depth is None:
                 raise ValueError(
                     f"Target '{target_name}' learned_mlp z-projection requires z_projection_mlp_depth"
                 )
             hidden = int(self._read_projection_value(
-                raw_cfg, target_info, model_config, "z_projection_mlp_hidden", 64
+                raw_cfg, target_info, model_config, "z_projection_mlp_hidden", 64,
+                resolved_cfg=resolved_cfg, resolved_key="mlp_hidden"
             ))
             dropout = float(self._read_projection_value(
-                raw_cfg, target_info, model_config, "z_projection_mlp_dropout", 0.0
+                raw_cfg, target_info, model_config, "z_projection_mlp_dropout", 0.0,
+                resolved_cfg=resolved_cfg, resolved_key="mlp_dropout"
             ))
             spec.update({
                 "mlp_depth": int(depth),
@@ -926,7 +961,7 @@ class NetworkFromConfig(nn.Module):
             self.guide_backbone.eval()
 
     def _sample_guide_token_mask(self, guide_features):
-        if self.guide_tokenbook_sample_rate >= 1.0:
+        if (not self.training) or self.guide_tokenbook_sample_rate >= 1.0:
             return None
 
         batch_size = guide_features.shape[0]
@@ -980,7 +1015,7 @@ class NetworkFromConfig(nn.Module):
         if self.guide_freeze:
             with torch.inference_mode():
                 frozen_features = self.guide_backbone(x)[0]
-        return frozen_features.clone()
+            return frozen_features.clone()
         return self.guide_backbone(x)[0]
 
     def _build_direct_segmentation_outputs(self, x):
@@ -1286,6 +1321,13 @@ class NetworkFromConfig(nn.Module):
             self.task_activations[target_name] = get_activation_module(activation_str)
             print(f"MedNeXt task '{target_name}' configured with separate decoder ({out_channels} channels)")
 
+        mednext_pool_factors = []
+        encoder_strides = [tuple(int(v) for v in stride) for stride in self.shared_encoder.strides]
+        for prev_stride, next_stride in zip(encoder_strides[:-1], encoder_strides[1:]):
+            mednext_pool_factors.append([
+                int(next_dim // prev_dim) for prev_dim, next_dim in zip(prev_stride, next_stride)
+            ])
+
         self.final_config = {
             "model_name": self.mgr.model_name,
             "architecture_type": self.architecture_type,
@@ -1305,6 +1347,8 @@ class NetworkFromConfig(nn.Module):
             "targets": self.targets,
             "target_z_projection": self.task_z_projection_cfg,
             "separate_decoders": len(tasks_using_separate) > 0,
+            "pool_op_kernel_sizes": mednext_pool_factors,
+            "strides": [list(v) for v in encoder_strides],
             "enable_deep_supervision": ds_enabled,
         }
 

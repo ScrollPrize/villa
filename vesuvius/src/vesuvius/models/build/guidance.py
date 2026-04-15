@@ -69,7 +69,10 @@ class TokenBook3D(nn.Module):
             self._ema_update()
 
         batch_size, _channels, depth, height, width = x.shape
-        book = self.book_ema if self.use_ema and self.book_ema is not None else self.book
+        if self.training or not self.use_ema or self.book_ema is None:
+            book = self.book
+        else:
+            book = self.book_ema
 
         tokens = self.input_conv(x).flatten(2).transpose(1, 2)
         tokens = F.normalize(tokens, dim=-1)
@@ -88,8 +91,6 @@ class TokenBook3D(nn.Module):
         if token_mask is not None:
             token_mask = token_mask.to(device=similarities.device, dtype=similarities.dtype)
             similarities = similarities * token_mask
-            denom = token_mask.sum(dim=1, keepdim=True).clamp_min(1.0)
-            similarities = similarities / denom
 
         guide = similarities.reshape(batch_size, 1, depth, height, width)
         guide = guide * 0.5 + 0.5

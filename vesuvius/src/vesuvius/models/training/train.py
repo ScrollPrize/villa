@@ -203,7 +203,11 @@ class BaseTrainer:
         Subclasses can override this to save extra state (e.g., EMA model).
         Returns a dict that will be merged into the checkpoint.
         """
-        return {}
+        extra = {}
+        if self.ema_model is not None and self.ema_save_in_checkpoint:
+            extra["ema_model"] = self.ema_model.state_dict()
+            extra["ema_optimizer_step"] = int(self._ema_optimizer_step)
+        return extra
 
     def _unwrap_model(self, model):
         if hasattr(model, 'module'):
@@ -504,6 +508,23 @@ class BaseTrainer:
         if skeleton_data is not None and base_loss.__class__.__name__ in skeleton_losses:
             return loss_fn(prediction, ground_truth, skeleton_data, **extra_loss_kwargs)
 
+        if base_loss.__class__.__name__ == "BCEWithLogitsLoss" and "loss_mask" in extra_loss_kwargs:
+            loss_mask = extra_loss_kwargs.pop("loss_mask")
+            if loss_mask.dim() == prediction.dim() - 1:
+                loss_mask = loss_mask.unsqueeze(1)
+            if loss_mask.shape[1] == 1 and prediction.shape[1] > 1:
+                loss_mask = loss_mask.expand_as(prediction)
+            loss_map = F.binary_cross_entropy_with_logits(
+                prediction,
+                ground_truth,
+                weight=base_loss.weight,
+                pos_weight=base_loss.pos_weight,
+                reduction="none",
+            )
+            masked_loss = loss_map * loss_mask.to(dtype=loss_map.dtype)
+            denom = loss_mask.sum().clamp_min(1.0)
+            return masked_loss.sum() / denom
+
         return loss_fn(prediction, ground_truth, **extra_loss_kwargs)
 
     def _resolve_target_ignore_value(self, target_name: str):
@@ -573,15 +594,15 @@ class BaseTrainer:
             region_target = torch.cat([foreground, ignore_channel], dim=1)
             return fg_prediction, region_target, {}
 
+        extra_loss_kwargs = {}
         if loss_name == "BCEWithLogitsLoss":
             if ignore_mask is not None:
-                bce_target = target.float().clone()
-                bce_target = torch.where(ignore_mask, bce_target, foreground)
+                bce_target = foreground
+                extra_loss_kwargs["loss_mask"] = (~ignore_mask).float()
             else:
                 bce_target = foreground
-            return fg_prediction, bce_target, {}
+            return fg_prediction, bce_target, extra_loss_kwargs
 
-        extra_loss_kwargs = {}
         if ignore_mask is not None:
             extra_loss_kwargs["loss_mask"] = (~ignore_mask).float()
         return fg_prediction, foreground, extra_loss_kwargs
@@ -636,7 +657,7 @@ class BaseTrainer:
                 foreground = foreground.masked_fill(ignore_mask, 0.0)
             valid_mask = (~ignore_mask).float()
         else:
-            foreground = (guide_target > 0).any(dim=1, keepdim=True).float()
+            foreground = guide_target[:, -1:].float()
             valid_mask = torch.ones_like(foreground)
 
         target_resize = F.interpolate(foreground, size=guide_mask.shape[2:], mode="nearest")
@@ -1064,6 +1085,13 @@ class BaseTrainer:
 
     def _get_deep_supervision_scales(self, model):
         cfg = getattr(model, 'final_config', {})
+        architecture_type = str(cfg.get('architecture_type', '') or '').lower()
+        if architecture_type.startswith('mednext'):
+            strides = cfg.get('strides', None)
+            if strides is None:
+                return None
+            arr = np.vstack(strides).astype(np.float32)
+            return list(list(i) for i in 1 / arr)
         pool_kernels = cfg.get('pool_op_kernel_sizes', None)
         if pool_kernels is None:
             return None
@@ -1646,6 +1674,9 @@ class BaseTrainer:
                     if isinstance(ckpt, dict) and 'ema_model' in ckpt:
                         self._checkpoint_ema_state = ckpt['ema_model']
                         print("Found EMA model state in checkpoint")
+                    if isinstance(ckpt, dict) and 'ema_optimizer_step' in ckpt:
+                        self._checkpoint_ema_optimizer_step = ckpt['ema_optimizer_step']
+                        print(f"Found EMA optimizer step in checkpoint: {self._checkpoint_ema_optimizer_step}")
                     del ckpt
                 except Exception:
                     pass
@@ -1908,6 +1939,7 @@ class BaseTrainer:
             scaler.step(optimizer)
             scaler.update()
             optimizer_stepped = True
+            self._update_ema_model(model)
             if should_time_optimizer:
                 self._record_startup_timing("first_optimizer_step", perf_counter() - step_stage_start)
                 self._first_optimizer_timing_recorded = True
@@ -2333,6 +2365,8 @@ class BaseTrainer:
                         num_val_iters = len(val_indices)
 
                     val_pbar = tqdm(range(num_val_iters), desc=f'Validation {epoch + 1}')
+                    validation_model = self._get_validation_model(model)
+                    validation_model.eval()
 
                     for i in val_pbar:
                         try:
@@ -2342,7 +2376,7 @@ class BaseTrainer:
                             data_dict = next(val_dataloader_iter)
 
                         task_losses, inputs, targets_dict, outputs = self._validation_step(
-                            model=model,
+                            model=validation_model,
                             data_dict=data_dict,
                             loss_fns=loss_fns,
                             use_amp=use_amp

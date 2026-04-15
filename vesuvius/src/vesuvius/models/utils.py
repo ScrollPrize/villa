@@ -35,6 +35,8 @@ class InitWeights_He(object):
 
     def __call__(self, module):
         if isinstance(module, nn.Conv3d) or isinstance(module, nn.Conv2d) or isinstance(module, nn.ConvTranspose2d) or isinstance(module, nn.ConvTranspose3d):
+            if getattr(module, "_skip_weight_init", False):
+                return
             if hasattr(module, "weight") and isinstance(module.weight, torch.Tensor) and not module.weight.requires_grad:
                 return
             module.weight = nn.init.kaiming_normal_(module.weight, a=self.neg_slope)
@@ -48,6 +50,8 @@ class InitWeights_XavierUniform(object):
 
     def __call__(self, module):
         if isinstance(module, nn.Conv3d) or isinstance(module, nn.Conv2d) or isinstance(module, nn.ConvTranspose2d) or isinstance(module, nn.ConvTranspose3d):
+            if getattr(module, "_skip_weight_init", False):
+                return
             if hasattr(module, "weight") and isinstance(module.weight, torch.Tensor) and not module.weight.requires_grad:
                 return
             module.weight = nn.init.xavier_uniform_(module.weight, self.gain)

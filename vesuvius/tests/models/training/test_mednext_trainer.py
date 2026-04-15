@@ -234,6 +234,7 @@ def test_mednext_v1_deep_supervision_checkpoint_roundtrip_loads_plain_inference_
     mgr = _make_mgr(data_root, enable_deep_supervision=True)
     trainer = BaseTrainer(mgr=mgr, verbose=False)
     model = trainer._build_model()
+    assert model.final_config["pool_op_kernel_sizes"] == [[2, 2, 2]] * 4
     checkpoint_path = tmp_path / "mednext_ds_model.pth"
     torch.save({"model_config": model.final_config, "model": model.state_dict()}, checkpoint_path)
 
@@ -257,6 +258,15 @@ def test_mednext_v1_deep_supervision_checkpoint_roundtrip_loads_plain_inference_
     assert isinstance(output["surface"], torch.Tensor)
     assert output["surface"].shape == (1, 2, 32, 32, 32)
     assert model_info["network"].final_config["enable_deep_supervision"] is True
+    assert model_info["network"].final_config["pool_op_kernel_sizes"] == [[2, 2, 2]] * 4
+    ds_scales = trainer._get_deep_supervision_scales(model_info["network"])
+    assert ds_scales == [
+        [1.0, 1.0, 1.0],
+        [0.5, 0.5, 0.5],
+        [0.25, 0.25, 0.25],
+        [0.125, 0.125, 0.125],
+        [0.0625, 0.0625, 0.0625],
+    ]
 
 
 def test_mednext_mixed_decoder_checkpoint_roundtrip_preserves_layout(tmp_path: Path):

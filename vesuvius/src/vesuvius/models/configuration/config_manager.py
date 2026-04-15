@@ -117,6 +117,16 @@ class ConfigManager:
             labels = spec.get("labels")
             if labels is None:
                 labels = spec.get("label_paths")
+            if labels is None and "label" in spec:
+                singular_label = spec.get("label")
+                if singular_label in (None, ""):
+                    labels = {}
+                elif len(target_names) == 1:
+                    labels = {target_names[0]: singular_label}
+                else:
+                    raise ValueError(
+                        "Explicit volume entries that use singular 'label' require exactly one configured target"
+                    )
             if labels is None or labels == {}:
                 return True
             if not isinstance(labels, dict):

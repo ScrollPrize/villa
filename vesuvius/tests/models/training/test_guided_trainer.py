@@ -370,6 +370,107 @@ def test_pretrained_backbone_pixelshuffle_checkpoint_roundtrip_preserves_plain_i
     assert model_info["network"].final_config["pretrained_decoder_type"] == "pixelshuffle_conv"
 
 
+def test_pretrained_backbone_pixelshuffle_convhead_big_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_pretrained_backbone_mgr(
+        data_root,
+        guide_checkpoint,
+        pretrained_decoder_type="pixelshuffle_convhead_big",
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model()
+    checkpoint_path = tmp_path / "pretrained_pixelshuffle_convhead_big_model.pth"
+    torch.save({"model_config": model.final_config, "model": model.state_dict()}, checkpoint_path)
+
+    output_dir = tmp_path / "inference_out_pretrained_pixelshuffle_convhead_big"
+    output_dir.mkdir()
+    inferer = Inferer(
+        model_path=str(checkpoint_path),
+        input_dir=str(data_root / "images" / "volume1.zarr"),
+        output_dir=str(output_dir),
+        input_format="zarr",
+        do_tta=False,
+        device="cpu",
+        num_dataloader_workers=0,
+        model_type="train_py",
+    )
+
+    model_info = inferer._load_train_py_model(checkpoint_path)
+    output = model_info["network"](torch.randn(1, 1, 16, 16, 16))
+
+    assert isinstance(output, dict)
+    assert set(output.keys()) == {"surface"}
+    assert output["surface"].shape == (1, 2, 16, 16, 16)
+    assert model_info["network"].final_config["pretrained_decoder_type"] == "pixelshuffle_convhead_big"
+
+
+def test_pretrained_backbone_explicit_volumes_dataset_loads_from_volume_specs(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_pretrained_backbone_mgr(
+        data_root,
+        guide_checkpoint,
+        pretrained_decoder_type="pixelshuffle_convhead_big",
+    )
+
+    runtime_cfg_dir = tmp_path / "runtime_configs"
+    runtime_cfg_dir.mkdir()
+    mgr.data_path = runtime_cfg_dir
+    mgr.dataset_config = {
+        "volumes": [
+            {
+                "image": str(data_root / "images" / "volume1.zarr"),
+                "label": str(data_root / "labels" / "volume1_surface.zarr"),
+            }
+        ],
+        "skip_patch_validation": True,
+    }
+    mgr.skip_patch_validation = True
+
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    dataset = trainer._configure_dataset(is_training=True)
+
+    assert len(dataset._volumes) == 1
+    assert dataset._volumes[0].image_path == data_root / "images" / "volume1.zarr"
+    assert dataset._volumes[0].label_paths["surface"] == data_root / "labels" / "volume1_surface.zarr"
+    assert dataset._volumes[0].has_labels is True
+    assert len(dataset) > 0
+
+
+def test_pretrained_backbone_explicit_volumes_duplicate_image_ids_match_cache_naming(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_pretrained_backbone_mgr(
+        data_root,
+        guide_checkpoint,
+        pretrained_decoder_type="pixelshuffle_convhead_big",
+    )
+
+    runtime_cfg_dir = tmp_path / "runtime_configs"
+    runtime_cfg_dir.mkdir()
+    image_path = data_root / "images" / "volume1.zarr"
+    label_path = data_root / "labels" / "volume1_surface.zarr"
+    mgr.data_path = runtime_cfg_dir
+    mgr.dataset_config = {
+        "volumes": [
+            {"image": str(image_path), "label": str(label_path)},
+            {"image": str(image_path), "label": str(label_path)},
+            {"image": str(image_path), "label": str(label_path)},
+        ],
+        "skip_patch_validation": True,
+    }
+    mgr.skip_patch_validation = True
+
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    dataset = trainer._configure_dataset(is_training=True)
+
+    assert [vol.volume_id for vol in dataset._volumes] == ["volume1", "volume1_1", "volume1_2"]
+
+
 def test_direct_segmentation_checkpoint_roundtrip_preserves_plain_inference_forward(tmp_path: Path):
     data_root = _make_synthetic_dataset(tmp_path)
     guide_checkpoint = tmp_path / "guide_backbone.pt"
@@ -676,6 +777,74 @@ def test_direct_segmentation_plain_bce_with_logits_loss_smoke_runs(tmp_path: Pat
     assert "guide_mask" not in task_losses
 
 
+def test_direct_segmentation_plain_bce_with_logits_masks_ignored_labels(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="direct_segmentation",
+        guide_loss_weight=0.0,
+        losses=[{"name": "BCEWithLogitsLoss", "weight": 1.0}],
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    trainer.mgr.targets["ink"]["ignore_label"] = -1.0
+
+    prediction = torch.zeros((1, 2, 4, 4, 4), dtype=torch.float32)
+    target = torch.zeros((1, 1, 4, 4, 4), dtype=torch.float32)
+    target[..., 0, 0, 0] = -1.0
+    target[..., 0, 0, 1] = 1.0
+
+    bce_loss = torch.nn.BCEWithLogitsLoss()
+    adapted_prediction, adapted_target, extra_loss_kwargs = trainer._adapt_direct_segmentation_loss_inputs(
+        bce_loss,
+        prediction,
+        target,
+        target_name="ink",
+    )
+
+    assert adapted_prediction.shape == (1, 1, 4, 4, 4)
+    assert adapted_target.shape == (1, 1, 4, 4, 4)
+    assert torch.isfinite(adapted_target).all()
+    assert adapted_target[..., 0, 0, 0].item() == pytest.approx(0.0)
+    assert adapted_target[..., 0, 0, 1].item() == pytest.approx(1.0)
+    assert "loss_mask" in extra_loss_kwargs
+    assert extra_loss_kwargs["loss_mask"][..., 0, 0, 0].item() == pytest.approx(0.0)
+    assert extra_loss_kwargs["loss_mask"][..., 0, 0, 1].item() == pytest.approx(1.0)
+
+
+def test_direct_segmentation_plain_bce_with_logits_ignores_masked_voxels_in_loss(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="direct_segmentation",
+        guide_loss_weight=0.0,
+        losses=[{"name": "BCEWithLogitsLoss", "weight": 1.0}],
+    )
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    trainer.mgr.targets["ink"]["ignore_label"] = -1.0
+
+    prediction = torch.zeros((1, 2, 4, 4, 4), dtype=torch.float32)
+    target = torch.zeros((1, 1, 4, 4, 4), dtype=torch.float32)
+    target[..., 0, 0, 0] = -1.0
+    target[..., 0, 0, 1] = 1.0
+    value = trainer._compute_loss_value(
+        torch.nn.BCEWithLogitsLoss(),
+        prediction,
+        target,
+        target_name="ink",
+        targets_dict={"ink": target},
+        outputs={"ink": prediction},
+    )
+
+    assert torch.isfinite(value)
+    assert value.item() == pytest.approx(float(torch.nn.functional.softplus(torch.tensor(0.0)).item()), rel=1e-4)
+
+
 def test_direct_segmentation_medial_surface_recall_smoke_runs(tmp_path: Path):
     data_root = _make_synthetic_dataset(tmp_path)
     guide_checkpoint = tmp_path / "guide_backbone.pt"
@@ -767,6 +936,148 @@ def test_direct_segmentation_rejects_unsupported_loss_name(tmp_path: Path):
 
     with pytest.raises(ValueError, match="not supported with guide_fusion_stage='direct_segmentation'"):
         trainer._compute_train_loss(outputs, targets_dict, loss_fns)
+
+
+def test_train_step_updates_ema_after_optimizer_step(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(
+        data_root,
+        guide_checkpoint,
+        guide_fusion_stage="direct_segmentation",
+        guide_loss_weight=0.0,
+        losses=[{"name": "BCEWithLogitsLoss", "weight": 1.0}],
+    )
+    mgr.ema_config = {
+        "enabled": True,
+        "decay": 0.9,
+        "start_step": 1,
+        "update_every_steps": 1,
+        "validate": True,
+    }
+    mgr.gradient_accumulation = 1
+    mgr.optimizer = "AdamW"
+    mgr.initial_lr = 1e-3
+    mgr.weight_decay = 0.0
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model().to(trainer.device)
+    optimizer = trainer._get_optimizer(model)
+    scaler = torch.amp.GradScaler("cpu", enabled=True)
+    trainer._initialize_ema_model(model)
+
+    dataset = trainer._configure_dataset(is_training=True)
+    batch = next(iter(DataLoader(dataset, batch_size=1, shuffle=False)))
+    batch = {key: value.to(trainer.device) if torch.is_tensor(value) else value for key, value in batch.items()}
+    ema_before = {
+        name: tensor.detach().clone()
+        for name, tensor in trainer.ema_model.state_dict().items()
+        if torch.is_floating_point(tensor)
+    }
+
+    total_loss, *_rest, optimizer_stepped = trainer._train_step(
+        model,
+        batch,
+        trainer._build_loss(),
+        use_amp=False,
+        autocast_ctx=torch.autocast(device_type="cpu", enabled=False),
+        epoch=0,
+        step=0,
+        scaler=scaler,
+        optimizer=optimizer,
+        num_iters=1,
+        grad_accumulate_n=1,
+    )
+
+    assert torch.isfinite(total_loss)
+    assert optimizer_stepped is True
+    ema_after = trainer.ema_model.state_dict()
+    assert any(
+        not torch.allclose(ema_before[name], ema_after[name])
+        for name in ema_before
+    )
+
+
+def test_initialize_ema_model_restores_optimizer_step_from_checkpoint(tmp_path: Path):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(data_root, guide_checkpoint, guide_fusion_stage="direct_segmentation", guide_loss_weight=0.0)
+    mgr.ema_config = {
+        "enabled": True,
+        "decay": 0.9,
+        "start_step": 5,
+        "update_every_steps": 3,
+        "validate": True,
+    }
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    model = trainer._build_model().to(trainer.device)
+    ema_reference = trainer._create_ema_model(model)
+    trainer._checkpoint_ema_state = ema_reference.state_dict()
+    trainer._checkpoint_ema_optimizer_step = 17
+
+    trainer._initialize_ema_model(model)
+
+    assert trainer._ema_optimizer_step == 17
+
+
+def test_validation_loop_uses_ema_model_when_enabled(tmp_path: Path, monkeypatch):
+    data_root = _make_synthetic_dataset(tmp_path)
+    guide_checkpoint = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(guide_checkpoint)
+    mgr = _make_mgr(data_root, guide_checkpoint)
+    mgr.max_epoch = 1
+    mgr.val_every_n = 1
+    mgr.max_steps_per_epoch = 1
+    mgr.max_val_steps_per_epoch = 1
+    mgr.gradient_accumulation = 1
+    mgr.optimizer = "AdamW"
+    mgr.initial_lr = 1e-3
+    mgr.weight_decay = 0.0
+    mgr.wandb_project = None
+    mgr.auto_detect_channels = lambda dataset, sample: None
+    mgr.ckpt_out_base = tmp_path / "ckpts"
+    mgr.checkpoint_path = None
+    mgr.load_weights_only = False
+    mgr.verbose = False
+    mgr.ema_config = {
+        "enabled": True,
+        "decay": 0.9,
+        "start_step": 1,
+        "update_every_steps": 1,
+        "validate": True,
+    }
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+
+    validation_models = []
+    monkeypatch.setattr(trainer, "_initialize_wandb", lambda *args, **kwargs: None)
+    monkeypatch.setattr(trainer, "_save_debug_image", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(trainer, "_save_debug_media", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(trainer, "_on_epoch_end", lambda **kwargs: (kwargs["checkpoint_history"], kwargs["best_checkpoints"], None))
+    monkeypatch.setattr(trainer, "_finalize_training", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(
+        trainer,
+        "_configure_dataloaders",
+        lambda train_dataset, val_dataset: (
+            DataLoader(train_dataset, batch_size=1, shuffle=False),
+            DataLoader(val_dataset, batch_size=1, shuffle=False),
+            [0],
+            [0],
+        ),
+    )
+
+    original_validation_step = trainer._validation_step
+
+    def _wrapped_validation_step(model, data_dict, loss_fns, use_amp):
+        validation_models.append(model)
+        return original_validation_step(model, data_dict, loss_fns, use_amp)
+
+    monkeypatch.setattr(trainer, "_validation_step", _wrapped_validation_step)
+
+    trainer.train()
+
+    assert validation_models
+    assert all(model is trainer.ema_model for model in validation_models)
 
 
 def test_prepare_metrics_for_logging_includes_guide_loss_entries():
@@ -1191,3 +1502,27 @@ def test_guide_alignment_loss_is_amp_safe_on_cuda():
 
     assert loss is not None
     assert torch.isfinite(loss)
+
+
+def test_guide_alignment_loss_uses_foreground_channel_for_multichannel_targets():
+    mgr = _make_mgr(Path("/tmp/data"), Path("/tmp/guide_backbone.pt"))
+    trainer = BaseTrainer(mgr=mgr, verbose=False)
+    trainer.device = torch.device("cpu")
+    trainer._current_aux_outputs = {
+        "guide_mask": torch.full((1, 1, 2, 2, 2), 0.25, dtype=torch.float32)
+    }
+    target = torch.zeros((1, 2, 2, 2, 2), dtype=torch.float32)
+    target[:, 0] = 1.0
+    target[:, 0, 0, 0, 0] = 0.0
+    target[:, 1, 0, 0, 0] = 1.0
+    targets_dict = {"ink": target}
+
+    loss = trainer._compute_guide_alignment_loss(targets_dict)
+
+    expected = torch.nn.functional.binary_cross_entropy(
+        trainer._current_aux_outputs["guide_mask"],
+        target[:, 1:2],
+        reduction="mean",
+    )
+    assert loss is not None
+    assert torch.isclose(loss, expected)

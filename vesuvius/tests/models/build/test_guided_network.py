@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
+from copy import deepcopy
 
 import pytest
 import torch
@@ -11,6 +12,7 @@ from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.build.guidance import TokenBook3D
 from vesuvius.models.build.pretrained_backbones.dinovol_2_builder import build_dinovol_2_backbone
 from vesuvius.models.build.pretrained_backbones.dinov2 import (
+    PixelShuffleConvHeadBigDinov2Decoder,
     PixelShuffleConvDinov2Decoder,
     build_dinov2_backbone,
     build_dinov2_decoder,
@@ -131,6 +133,20 @@ def _make_pretrained_backbone_mgr(
     )
 
 
+def _make_reloaded_mgr(final_config: dict, base_mgr: SimpleNamespace) -> SimpleNamespace:
+    return SimpleNamespace(
+        targets=deepcopy(final_config["targets"]),
+        train_patch_size=tuple(final_config["patch_size"]),
+        train_batch_size=int(final_config["batch_size"]),
+        in_channels=int(final_config["in_channels"]),
+        autoconfigure=bool(final_config["autoconfigure"]),
+        model_name=final_config["model_name"],
+        enable_deep_supervision=getattr(base_mgr, "enable_deep_supervision", False),
+        spacing=getattr(base_mgr, "spacing", (1.0, 1.0, 1.0)),
+        model_config=deepcopy(final_config),
+    )
+
+
 def test_tokenbook3d_returns_unit_interval_mask():
     module = TokenBook3D(n_tokens=8, embed_dim=16)
     x = torch.randn(2, 16, 2, 2, 2)
@@ -159,6 +175,38 @@ def test_tokenbook3d_token_mlp_returns_unit_interval_mask():
     assert float(guide.max().detach()) <= 1.0
 
 
+def test_tokenbook3d_token_mask_does_not_globally_renormalize_surviving_tokens():
+    module = TokenBook3D(n_tokens=4, embed_dim=16)
+    x = torch.randn(1, 16, 2, 2, 2)
+    token_mask = torch.ones((1, 8), dtype=torch.float32)
+    token_mask[:, 4:] = 0.0
+
+    full_guide = module(x)
+    masked_guide = module(x, token_mask=token_mask)
+
+    full_flat = full_guide.reshape(1, -1)
+    masked_flat = masked_guide.reshape(1, -1)
+    kept = token_mask.bool()
+    dropped = ~kept
+
+    assert torch.allclose(masked_flat[dropped], torch.full_like(masked_flat[dropped], 0.5), atol=1e-6, rtol=1e-6)
+    assert not torch.allclose(masked_flat[kept], torch.full_like(masked_flat[kept], 0.5), atol=1e-3, rtol=1e-3)
+    assert masked_flat[kept].abs().mean().item() > 0.0
+    assert masked_flat[kept].std().item() > 0.0
+    assert full_flat[kept].std().item() > 0.0
+
+
+def test_tokenbook3d_use_ema_keeps_book_trainable() -> None:
+    module = TokenBook3D(n_tokens=4, embed_dim=16, ema_decay=0.9, use_ema=True)
+    x = torch.randn(2, 16, 2, 2, 2, requires_grad=True)
+
+    guide = module(x)
+    guide.sum().backward()
+
+    assert module.book.grad is not None
+    assert torch.count_nonzero(module.book.grad).item() > 0
+
+
 def test_pixelshuffle3d_upsamples_tuple_factor_shape():
     module = PixelShuffle3D((2, 2, 2))
     x = torch.randn(2, 32, 3, 4, 5)
@@ -183,6 +231,85 @@ def test_guided_network_forward_shapes_and_aux_outputs(tmp_path: Path, basic_enc
     assert outputs["ink"].shape == (2, 1, 16, 16, 16)
     assert set(outputs_with_aux.keys()) == {"ink"}
     assert aux["guide_mask"].shape == (2, 1, 2, 2, 2)
+
+
+def test_guided_network_forward_works_with_trainable_guide_backbone(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(checkpoint_path, basic_encoder_block="ConvBlock")
+    mgr.model_config["guide_freeze"] = False
+    model = NetworkFromConfig(mgr)
+    x = torch.randn(2, 1, 16, 16, 16)
+
+    outputs = model(x)
+    outputs_with_aux, aux = model(x, return_aux=True)
+
+    assert set(outputs.keys()) == {"ink"}
+    assert outputs["ink"].shape == (2, 1, 16, 16, 16)
+    assert set(outputs_with_aux.keys()) == {"ink"}
+    assert aux["guide_mask"].shape == (2, 1, 2, 2, 2)
+    assert any(parameter.requires_grad for parameter in model.guide_backbone.parameters())
+
+
+def test_guide_token_mask_sampling_is_disabled_in_eval_mode(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(checkpoint_path, basic_encoder_block="ConvBlock")
+    mgr.model_config["guide_tokenbook_sample_rate"] = 0.25
+    model = NetworkFromConfig(mgr).eval()
+
+    guide_features = torch.randn(2, 48, 2, 2, 2)
+    mask = model._sample_guide_token_mask(guide_features)
+
+    assert mask is None
+
+
+def test_learned_mlp_z_projection_reloads_from_final_config(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(checkpoint_path, basic_encoder_block="ConvBlock")
+    mgr.model_config["z_projection_mode"] = "learned_mlp"
+    mgr.model_config["z_projection_mlp_depth"] = 16
+    mgr.model_config["z_projection_mlp_hidden"] = 32
+    mgr.model_config["z_projection_mlp_dropout"] = 0.1
+
+    model = NetworkFromConfig(mgr)
+    assert model.task_z_projection_cfg["ink"]["mode"] == "learned_mlp"
+    assert "ink" in model.task_z_projection_heads
+    assert model.final_config["target_z_projection"]["ink"]["mode"] == "learned_mlp"
+
+    reload_mgr = _make_reloaded_mgr(model.final_config, mgr)
+    reloaded = NetworkFromConfig(reload_mgr)
+    reloaded.load_state_dict(model.state_dict(), strict=True)
+
+    x = torch.randn(2, 1, 16, 16, 16)
+    outputs = reloaded(x)
+    assert "ink" in reloaded.task_z_projection_heads
+    assert reloaded.task_z_projection_cfg["ink"]["mode"] == "learned_mlp"
+    assert outputs["ink"].shape == (2, 1, 16, 16)
+
+
+def test_logsumexp_z_projection_reloads_from_final_config(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(checkpoint_path, basic_encoder_block="ConvBlock")
+    mgr.model_config["z_projection_mode"] = "logsumexp"
+    mgr.model_config["z_projection_lse_tau"] = 0.7
+
+    model = NetworkFromConfig(mgr)
+    assert model.task_z_projection_cfg["ink"]["mode"] == "logsumexp"
+    assert model.task_z_projection_cfg["ink"]["lse_tau"] == pytest.approx(0.7)
+    assert model.final_config["target_z_projection"]["ink"]["mode"] == "logsumexp"
+
+    reload_mgr = _make_reloaded_mgr(model.final_config, mgr)
+    reloaded = NetworkFromConfig(reload_mgr)
+    reloaded.load_state_dict(model.state_dict(), strict=True)
+
+    x = torch.randn(2, 1, 16, 16, 16)
+    outputs = reloaded(x)
+    assert reloaded.task_z_projection_cfg["ink"]["mode"] == "logsumexp"
+    assert reloaded.task_z_projection_cfg["ink"]["lse_tau"] == pytest.approx(0.7)
+    assert outputs["ink"].shape == (2, 1, 16, 16)
 
 
 @pytest.mark.parametrize("basic_encoder_block", ["ConvBlock", "BasicBlockD"])
@@ -279,6 +406,22 @@ def test_pretrained_backbone_pixelshuffle_conv_decoder_returns_input_resolution(
 
     assert outputs["surface"].shape == (2, 2, 16, 16, 16)
     assert model.final_config["pretrained_decoder_type"] == "pixelshuffle_conv"
+
+
+def test_pretrained_backbone_pixelshuffle_convhead_big_returns_input_resolution(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_pretrained_backbone_mgr(
+        checkpoint_path,
+        freeze_encoder=True,
+        decoder_type="pixelshuffle_convhead_big",
+    )
+    model = NetworkFromConfig(mgr)
+
+    outputs = model(torch.randn(2, 1, 16, 16, 16))
+
+    assert outputs["surface"].shape == (2, 2, 16, 16, 16)
+    assert model.final_config["pretrained_decoder_type"] == "pixelshuffle_convhead_big"
 
 
 def test_encoder_skip_only_feature_gating_uses_residual_alpha_formula():
@@ -553,21 +696,27 @@ def test_pretrained_backbone_freeze_encoder_disables_grads_and_preserves_weights
     assert model.shared_encoder.training is False
 
 
-def test_pretrained_backbone_without_freeze_encoder_still_reinitializes_conv_stem(tmp_path: Path):
+def test_pretrained_backbone_without_freeze_encoder_preserves_encoder_weights_under_init(tmp_path: Path):
     checkpoint_path = tmp_path / "guide_backbone.pt"
     _write_local_guide_checkpoint(checkpoint_path)
     mgr = _make_pretrained_backbone_mgr(checkpoint_path, freeze_encoder=False)
     model = NetworkFromConfig(mgr)
 
-    before = {
+    encoder_before = {
         key: value.detach().clone()
         for key, value in model.shared_encoder.state_dict().items()
     }
+    decoder_before = {
+        key: value.detach().clone()
+        for key, value in model.task_decoders["surface"].state_dict().items()
+    }
     model.apply(InitWeights_He(neg_slope=0.2))
-    after = model.shared_encoder.state_dict()
+    encoder_after = model.shared_encoder.state_dict()
+    decoder_after = model.task_decoders["surface"].state_dict()
 
-    changed = [key for key in before if not torch.equal(before[key], after[key])]
-    assert "backbone.down_projection.proj.weight" in changed
+    assert all(torch.equal(encoder_before[key], encoder_after[key]) for key in encoder_before)
+    changed_decoder = [key for key in decoder_before if not torch.equal(decoder_before[key], decoder_after[key])]
+    assert changed_decoder
 
 
 def test_build_dinov2_decoder_accepts_pixelshuffle_conv(tmp_path: Path):
@@ -583,12 +732,50 @@ def test_build_dinov2_decoder_accepts_pixelshuffle_conv(tmp_path: Path):
     assert output.shape == (1, 2, 16, 16, 16)
     assert all(isinstance(stage[3], torch.nn.GroupNorm) for stage in decoder.decode)
     assert all(isinstance(stage[4], torch.nn.GELU) for stage in decoder.decode)
+    assert all(isinstance(stage[2], torch.nn.Conv3d) for stage in decoder.decode)
+    assert all(stage[2].kernel_size == (3, 3, 3) for stage in decoder.decode)
+    assert all(stage[2].padding == (1, 1, 1) for stage in decoder.decode)
+    assert all(stage[2].bias is None for stage in decoder.decode)
     assert decoder.decode[-1][2].out_channels > 2
     assert decoder.final_refine[0].in_channels == decoder.decode[-1][2].out_channels
+    assert decoder.final_refine[0].bias is None
     assert isinstance(decoder.final_refine[1], torch.nn.GroupNorm)
     assert isinstance(decoder.final_refine[2], torch.nn.GELU)
     assert len(decoder.final_refine) == 5
     assert decoder.final_refine[-1].kernel_size == (1, 1, 1)
+    assert decoder.final_refine[0].kernel_size == (3, 3, 3)
+    assert decoder.final_refine[3].kernel_size == (3, 3, 3)
+
+
+def test_build_dinov2_decoder_accepts_pixelshuffle_convhead_big(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    encoder = build_dinov2_backbone(str(checkpoint_path), input_channels=1, input_shape=(16, 16, 16))
+    decoder = build_dinov2_decoder("pixelshuffle_convhead_big", encoder, num_classes=2)
+
+    features = torch.randn(1, encoder.embed_dim, 2, 2, 2)
+    output = decoder(features)
+
+    assert isinstance(decoder, PixelShuffleConvHeadBigDinov2Decoder)
+    assert output.shape == (1, 2, 16, 16, 16)
+    assert not hasattr(decoder, "pre_refine")
+    assert all(isinstance(stage[3], torch.nn.GroupNorm) for stage in decoder.decode)
+    assert all(isinstance(stage[4], torch.nn.GELU) for stage in decoder.decode)
+    assert all(isinstance(stage[2], torch.nn.Conv3d) for stage in decoder.decode)
+    assert all(stage[2].kernel_size == (3, 3, 3) for stage in decoder.decode)
+    assert all(stage[2].padding == (1, 1, 1) for stage in decoder.decode)
+    assert all(stage[2].bias is None for stage in decoder.decode)
+    assert decoder.decode[-1][2].out_channels > 2
+    assert decoder.final_refine[0].in_channels == decoder.decode[-1][2].out_channels
+    assert decoder.final_refine[0].bias is None
+    assert isinstance(decoder.final_refine[1], torch.nn.GroupNorm)
+    assert isinstance(decoder.final_refine[2], torch.nn.GELU)
+    assert len(decoder.final_refine) == 5
+    assert decoder.final_refine[-1].kernel_size == (1, 1, 1)
+    assert decoder.final_refine[0].kernel_size == (7, 7, 7)
+    assert decoder.final_refine[0].padding == (3, 3, 3)
+    assert decoder.final_refine[3].kernel_size == (3, 3, 3)
+    assert decoder.final_refine[3].padding == (1, 1, 1)
 
 
 def test_feature_encoder_guidance_backprop_updates_all_stage_tokenbooks(tmp_path: Path):

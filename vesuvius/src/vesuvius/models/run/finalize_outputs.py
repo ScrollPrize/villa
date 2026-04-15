@@ -20,7 +20,7 @@ from vesuvius.utils.k8s import get_tqdm_kwargs
 class FinalizeConfig:
     """Bundle all finalization parameters."""
     mode: str = "binary"           # "binary" or "multiclass"
-    threshold: bool = False
+    threshold: Optional[float] = None  # None=probabilities; float in (0,1)=binarize at that probability
     is_multi_task: bool = False
     target_info: Optional[dict] = None
 
@@ -51,6 +51,15 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
     is_multi_task = config.is_multi_task
     target_info = config.target_info
 
+    # Convert probability threshold to a raw-logit cutoff: sigmoid(x) > T  <=>  x > ln(T/(1-T)).
+    # This also works for 2-class softmax, where p_fg > T  <=>  logit[1] - logit[0] > ln(T/(1-T)).
+    if threshold is not None:
+        if not (0.0 < threshold < 1.0):
+            raise ValueError(f"threshold must be in (0, 1), got {threshold}")
+        logit_cutoff = float(np.log(threshold / (1.0 - threshold)))
+    else:
+        logit_cutoff = None
+
     single_channel_binary = mode == "binary" and (not is_multi_task or not target_info) and num_classes == 1
 
     if mode == "binary":
@@ -60,40 +69,40 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
                 start_ch = info['start_channel']
                 end_ch = info['end_channel']
                 target_logits = logits_np[start_ch:end_ch]
-                exp_logits = np.exp(target_logits - np.max(target_logits, axis=0, keepdims=True))
-                softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
-                if threshold:
-                    binary_mask = (softmax[1] > softmax[0]).astype(np.float32)
+                if logit_cutoff is not None:
+                    binary_mask = (target_logits[1] - target_logits[0] > logit_cutoff).astype(np.float32)
                     target_results.append(binary_mask)
                 else:
-                    fg_prob = softmax[1]
-                    target_results.append(fg_prob)
+                    exp_logits = np.exp(target_logits - np.max(target_logits, axis=0, keepdims=True))
+                    softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
+                    target_results.append(softmax[1])
             output_data = np.stack(target_results, axis=0)
         elif num_classes == 1:
             # Single-channel logits: interpret channel as foreground logit.
             logits = logits_np[0].astype(np.float32)
-            if threshold:
-                output_data = (logits > 0).astype(np.float32)[np.newaxis, ...]
+            if logit_cutoff is not None:
+                output_data = (logits > logit_cutoff).astype(np.float32)[np.newaxis, ...]
             else:
                 probs = 1.0 / (1.0 + np.exp(-np.clip(logits, -20, 20)))
                 output_data = probs[np.newaxis, ...]
         else:
-            exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True))
-            softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
-            if threshold:
-                binary_mask = (softmax[1] > softmax[0]).astype(np.float32)
+            if logit_cutoff is not None:
+                binary_mask = (logits_np[1] - logits_np[0] > logit_cutoff).astype(np.float32)
                 output_data = binary_mask[np.newaxis, ...]
             else:
+                exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True))
+                softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
                 fg_prob = softmax[1:2]
                 output_data = fg_prob
     else:  # multiclass
-        exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True))
-        softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
         argmax = np.argmax(logits_np, axis=0).astype(np.float32)
         argmax = argmax[np.newaxis, ...]
-        if threshold:
+        if threshold is not None:
+            # In multiclass the CLI only allows the bare-flag form (arrives as 0.5); emit argmax only.
             output_data = argmax
         else:
+            exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True))
+            softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
             output_data = np.concatenate([softmax, argmax], axis=0)
 
     output_np = output_data
@@ -130,7 +139,7 @@ def compute_finalized_shape(spatial_shape, num_classes, config: FinalizeConfig):
         Output shape tuple (C_out, Z, Y, X)
     """
     mode = config.mode
-    threshold = config.threshold
+    threshold = config.threshold is not None
     is_multi_task = config.is_multi_task
     target_info = config.target_info
 
@@ -150,13 +159,13 @@ def compute_finalized_shape(spatial_shape, num_classes, config: FinalizeConfig):
 def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_classes, spatial_shape, output_chunks, is_multi_task=False, target_info=None):
     """
     Process a single chunk of the volume in parallel.
-    
+
     Args:
         chunk_info: Dictionary with chunk boundaries and indices
         input_path: Path to input zarr
         output_path: Path to output zarr
         mode: Processing mode ("binary" or "multiclass")
-        threshold: Whether to apply threshold/argmax
+        threshold: Optional probability cutoff in (0,1); None emits probabilities
         num_classes: Number of classes in input
         spatial_shape: Spatial dimensions of the volume (Z, Y, X)
         output_chunks: Chunk size for output
@@ -206,7 +215,7 @@ def finalize_logits(
     input_path: str,
     output_path: str,
     mode: str = "binary",  # "binary" or "multiclass"
-    threshold: bool = False,  # If True, will apply argmax and only save class predictions
+    threshold: Optional[float] = None,  # None=probabilities; float in (0,1)=binarize at that probability (multiclass: any non-None => argmax)
     delete_intermediates: bool = False,  # If True, will delete the input logits after processing
     chunk_size: tuple = None,  # Optional custom chunk size for output
     num_workers: int = None,  # Number of worker processes to use
@@ -216,12 +225,12 @@ def finalize_logits(
 ):
     """
     Process merged logits and apply softmax/argmax to produce final outputs.
-    
+
     Args:
         input_path: Path to the merged logits Zarr store
         output_path: Path for the finalized output Zarr store
         mode: "binary" (2 channels) or "multiclass" (>2 channels)
-        threshold: If True, applies argmax and only saves class predictions
+        threshold: Optional probability cutoff in (0,1); None emits probabilities
         delete_intermediates: Whether to delete input logits after processing
         chunk_size: Optional custom chunk size for output (Z,Y,X)
         num_workers: Number of worker processes to use for parallel processing
@@ -250,8 +259,10 @@ def finalize_logits(
         shuffle=numcodecs.blosc.SHUFFLE
     )
     
+    threshold_enabled = threshold is not None
+
     print(f"Opening input logits: {input_path}")
-    print(f"Mode: {mode}, Threshold flag: {threshold}")
+    print(f"Mode: {mode}, Threshold: {threshold if threshold_enabled else 'off'}")
     input_store = open_zarr(
         path=input_path,
         mode='r',
@@ -284,7 +295,7 @@ def finalize_logits(
         elif num_classes not in (1, 2):
             raise ValueError(f"Binary mode expects 1 or 2 channels, but input has {num_classes} channels.")
         elif num_classes == 1:
-            print("Detected single-channel binary logits. Using sigmoid finalization (or logit>0 with --threshold).")
+            print("Detected single-channel binary logits. Using sigmoid finalization (or thresholded mask with --threshold).")
     elif mode == "multiclass" and num_classes < 2:
         raise ValueError(f"Multiclass mode expects at least 2 channels, but input has {num_classes} channels.")
     
@@ -307,28 +318,25 @@ def finalize_logits(
             # For multi-task binary, output one channel per target
             num_targets = len(target_info)
             output_shape = (num_targets, *spatial_shape)  # One mask per target
-            if threshold:
+            if threshold_enabled:
                 print(f"Output will have {num_targets} channels: [" + ", ".join(f"{k}_binary_mask" for k in sorted(target_info.keys())) + "]")
             else:
                 print(f"Output will have {num_targets} channels: [" + ", ".join(f"{k}_softmax_fg" for k in sorted(target_info.keys())) + "]")
         else:
             if num_classes == 1:
                 output_shape = (1, *spatial_shape)
-                if threshold:
+                if threshold_enabled:
                     print("Output will have 1 channel: [binary_mask_from_logit]")
                 else:
                     print("Output will have 1 channel: [sigmoid_fg]")
             else:
-                if threshold:
-                    # If thresholding, only output argmax channel for binary
-                    output_shape = (1, *spatial_shape)  # Just the binary mask (argmax)
+                output_shape = (1, *spatial_shape)
+                if threshold_enabled:
                     print("Output will have 1 channel: [binary_mask]")
                 else:
-                     # Just softmax of FG class
-                    output_shape = (1, *spatial_shape)
                     print("Output will have 1 channel: [softmax_fg]")
     else:  # multiclass
-        if threshold:
+        if threshold_enabled:
             # If threshold is provided for multiclass, only save the argmax
             output_shape = (1, *spatial_shape)
             print("Output will have 1 channel: [argmax]")
@@ -508,6 +516,38 @@ def finalize_logits(
     print(f"Final output saved to: {output_path}")
 
 
+# --- Shared CLI helpers ---
+def add_threshold_arguments(parser):
+    """Register the shared `--threshold` / `--threshold-value` arguments on an argparse parser.
+
+    - `--threshold` toggles thresholding on (default cutoff = 0.5).
+    - `--threshold-value T` overrides the cutoff (must be in (0, 1)); requires --threshold.
+    """
+    parser.add_argument('--threshold', dest='threshold', action='store_true',
+                        help='Binarize the probability map (default cutoff 0.5). '
+                             'In multiclass mode this emits the argmax channel.')
+    parser.add_argument('--threshold-value', dest='threshold_value', type=float, default=None,
+                        help='Override the probability cutoff used by --threshold '
+                             '(float in (0, 1)). Binary mode only.')
+
+
+def resolve_threshold(parser, args):
+    """Validate --threshold / --threshold-value and return the effective Optional[float] cutoff.
+
+    Returns None if thresholding is disabled, else a float in (0, 1) (0.5 if no override).
+    Calls parser.error on invalid combinations.
+    """
+    if args.threshold_value is not None and not args.threshold:
+        parser.error("--threshold-value requires --threshold")
+    if args.threshold_value is not None and not (0.0 < args.threshold_value < 1.0):
+        parser.error(f"--threshold-value must be in (0, 1), got {args.threshold_value}")
+    if args.mode == 'multiclass' and args.threshold_value is not None:
+        parser.error("--threshold-value is not applicable in multiclass mode (argmax ignores the cutoff)")
+    if not args.threshold:
+        return None
+    return args.threshold_value if args.threshold_value is not None else 0.5
+
+
 # --- Command Line Interface ---
 def main():
     """Entry point for the vesuvius.finalize command."""
@@ -518,8 +558,7 @@ def main():
                       help='Path for the finalized output Zarr store')
     parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
                       help='Processing mode. "binary" for 2-class segmentation, "multiclass" for >2 classes. Default: binary')
-    parser.add_argument('--threshold', dest='threshold', action='store_true',
-                      help='If set, applies argmax and only saves the class predictions (no probabilities). Works for both binary and multiclass.')
+    add_threshold_arguments(parser)
     parser.add_argument('--delete-intermediates', dest='delete_intermediates', action='store_true',
                       help='Delete intermediate logits after processing')
     parser.add_argument('--chunk-size', dest='chunk_size', type=str, default=None,
@@ -539,6 +578,8 @@ def main():
     if args.part_id < 0 or args.part_id >= args.num_parts:
         parser.error(f"Invalid part_id {args.part_id} for num_parts {args.num_parts}. part_id must be 0 <= part_id < num_parts")
 
+    effective_threshold = resolve_threshold(parser, args)
+
     chunks = None
     if args.chunk_size:
         try:
@@ -552,7 +593,7 @@ def main():
             input_path=args.input_path,
             output_path=args.output_path,
             mode=args.mode,
-            threshold=args.threshold,
+            threshold=effective_threshold,
             delete_intermediates=args.delete_intermediates,
             chunk_size=chunks,
             num_workers=args.num_workers,
