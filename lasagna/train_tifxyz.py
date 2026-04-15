@@ -592,6 +592,7 @@ def train(
     batch_size: int = 2,
     lr: float = 1e-2,
     patch_size: int = 128,
+    label_patch_size: Optional[int] = None,
     model_patch_size: Optional[int] = None,
     w_cos: float = 1.0,
     w_mag: float = 1.0,
@@ -622,6 +623,19 @@ def train(
         config = json.load(f)
 
     config["patch_size"] = patch_size
+    effective_label_patch = (
+        int(label_patch_size) if label_patch_size is not None
+        else int(patch_size)
+    )
+    config["label_patch_size"] = effective_label_patch
+    if effective_label_patch != int(patch_size):
+        print(
+            f"{TAG} label_patch_size={effective_label_patch} < "
+            f"patch_size={patch_size}: GT region placed at random "
+            f"offset inside larger CT crop (up to L/2 cropping per "
+            f"edge during training)",
+            flush=True,
+        )
 
     same_surface_threshold = config.get("same_surface_threshold")
     if same_surface_threshold is not None:
@@ -637,6 +651,7 @@ def train(
         "config_path": config_path,
         "epochs": epochs, "batch_size": batch_size, "lr": lr,
         "patch_size": patch_size,
+        "label_patch_size": effective_label_patch,
         "w_cos": w_cos, "w_mag": w_mag, "w_dir": w_dir,
         "w_dir_dense": w_dir_dense, "w_smooth": w_smooth,
         "num_workers": num_workers, "val_fraction": val_fraction,
@@ -1270,7 +1285,15 @@ def main() -> None:
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch-size", type=int, default=2)
     parser.add_argument("--lr", type=float, default=1e-2)
-    parser.add_argument("--patch-size", type=int, default=128)
+    parser.add_argument("--patch-size", type=int, default=128,
+                        help="CT read patch size (model input).")
+    parser.add_argument("--label-patch-size", type=int, default=None,
+                        help="GT region size inside the CT crop. "
+                             "Defaults to --patch-size. When smaller, "
+                             "the label region is placed at a random "
+                             "offset inside the larger CT crop at train "
+                             "time (up to L/2 cropping per edge); val "
+                             "uses the centered position.")
     parser.add_argument("--model-patch-size", type=int, default=None,
                         help="Patch size used only for model architecture "
                              "autoconfigure (stage count). Defaults to "
@@ -1328,6 +1351,7 @@ def main() -> None:
         batch_size=args.batch_size,
         lr=args.lr,
         patch_size=args.patch_size,
+        label_patch_size=args.label_patch_size,
         model_patch_size=args.model_patch_size,
         w_cos=args.w_cos,
         w_mag=args.w_mag,

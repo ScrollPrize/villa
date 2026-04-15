@@ -518,11 +518,29 @@ class TifxyzLasagnaDataset(Dataset):
         include_geometry: bool = False,
         include_patch_ref: bool = False,
     ):
-        # Normalize patch_size to 3-element ZYX array
+        # Normalize patch_size to 3-element ZYX array (CT read size).
         patch_size_zyx = np.asarray(config["patch_size"], dtype=np.int32).reshape(-1)
         if patch_size_zyx.size == 1:
             patch_size_zyx = np.repeat(patch_size_zyx, 3)
         self.patch_size_zyx = patch_size_zyx
+
+        # Label patch size (GT region). Defaults to patch_size for
+        # backward compat. When smaller than patch_size, the GT region
+        # is placed at a (train-time) random offset inside the larger
+        # CT crop so the model sees varying context around varying
+        # supervision positions. Patch tiling still uses label size so
+        # wrap-caching / dataset layout are unchanged.
+        label_cfg = config.get("label_patch_size", patch_size_zyx)
+        label_patch_size_zyx = np.asarray(label_cfg, dtype=np.int32).reshape(-1)
+        if label_patch_size_zyx.size == 1:
+            label_patch_size_zyx = np.repeat(label_patch_size_zyx, 3)
+        if np.any(label_patch_size_zyx > patch_size_zyx):
+            raise ValueError(
+                f"label_patch_size {label_patch_size_zyx.tolist()} must be "
+                f"<= patch_size {patch_size_zyx.tolist()} per-dim"
+            )
+        self.label_patch_size_zyx = label_patch_size_zyx
+        self.apply_augmentation = bool(apply_augmentation)
 
         self.max_surfaces_per_patch = int(config.get("max_surfaces_per_patch", 8))
         # Emits per-surface raw geometry (``surface_geometry``) in the
@@ -546,8 +564,9 @@ class TifxyzLasagnaDataset(Dataset):
         else:
             self.augmentations = None
 
-        # Find patches using world-chunk method
-        self.patches = _find_patches_world_chunks(config, self.patch_size_zyx)
+        # Find patches using world-chunk method. Tiling + chunk cache
+        # are keyed off the (small) label region, not the CT read size.
+        self.patches = _find_patches_world_chunks(config, self.label_patch_size_zyx)
 
         print(f"{TAG} loaded {len(self.patches)} patches")
 
@@ -570,12 +589,19 @@ class TifxyzLasagnaDataset(Dataset):
             iterator = patches
 
         crop_size = tuple(int(v) for v in self.patch_size_zyx)
+        label_size = tuple(int(v) for v in self.label_patch_size_zyx)
         crop_size_arr = np.array(crop_size, dtype=np.int64)
+        # Centered offset — deterministic, matches val-time placement.
+        center_off = np.array(
+            [(crop_size[i] - label_size[i]) // 2 for i in range(3)],
+            dtype=np.int64,
+        )
         kept = []
         dropped = 0
         for patch in iterator:
             z0, _, y0, _, x0, _ = patch.world_bbox
-            min_corner = np.array([z0, y0, x0], dtype=np.int64)
+            label_min = np.array([z0, y0, x0], dtype=np.int64)
+            min_corner = label_min - center_off
             max_corner = min_corner + crop_size_arr
             try:
                 _read_volume_crop_from_patch(
@@ -718,8 +744,35 @@ class TifxyzLasagnaDataset(Dataset):
 
         z0, z1, y0, y1, x0, x1 = patch.world_bbox
         crop_size = tuple(int(v) for v in self.patch_size_zyx)
-        # world_bbox is half-open: [z0, z1), so max_corner = min_corner + crop_size
-        min_corner = np.array([z0, y0, x0], dtype=np.int64)
+        label_size = tuple(int(v) for v in self.label_patch_size_zyx)
+        # Label region origin in world coords (sized label_patch_size).
+        label_min = np.array([z0, y0, x0], dtype=np.int64)
+        # Place the label region inside the (larger) CT crop.
+        # paste_off ∈ [-L/2, P - L/2] allows up to half of the GT to
+        # be cropped off either edge during training; val/eval uses
+        # the centered position. When P == L, randomization collapses
+        # to the centered case.
+        if self.apply_augmentation and np.any(
+            np.asarray(crop_size) > np.asarray(label_size)
+        ):
+            paste_off = np.array(
+                [
+                    int(np.random.randint(
+                        -label_size[i] // 2,
+                        crop_size[i] - label_size[i] // 2 + 1,
+                    ))
+                    for i in range(3)
+                ],
+                dtype=np.int64,
+            )
+        else:
+            paste_off = np.array(
+                [(crop_size[i] - label_size[i]) // 2 for i in range(3)],
+                dtype=np.int64,
+            )
+        # CT read origin: shift so the label region lands at paste_off
+        # inside the P-sized volume we build below.
+        min_corner = label_min - paste_off
         max_corner = min_corner + np.array(crop_size, dtype=np.int64)
 
         # Read CT crop normalized to [0, 1] via uint8/255, matching the
