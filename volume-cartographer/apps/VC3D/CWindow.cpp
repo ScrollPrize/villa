@@ -2941,10 +2941,14 @@ void CWindow::CreateWidgets(void)
     };
 
     using namespace vc3d::settings;
-    addViewerGroup(tr("View"),
+    auto* viewGroup = addViewerGroup(tr("View"),
                    detachScrollContents(ui.scrollAreaView, ui.dockWidgetViewContents),
                    viewer::GROUP_VIEW_EXPANDED,
                    viewer::GROUP_VIEW_EXPANDED_DEFAULT);
+
+    // Interpolation + highlight-downscaled live inside the View group so
+    // all display-affecting toggles sit together.
+    auto* viewExtrasLayout = viewGroup ? viewGroup->contentLayout() : viewerControlsLayout;
 
     // Interpolation method selector
     {
@@ -2964,7 +2968,7 @@ void CWindow::CreateWidgets(void)
             s.setValue(vc3d::settings::perf::INTERPOLATION_METHOD, idx);
             _viewerManager->forEachViewer([](CTiledVolumeViewer* v) { v->update(); });
         });
-        viewerControlsLayout->addWidget(interpWidget);
+        viewExtrasLayout->addWidget(interpWidget);
     }
 
     // Highlight downscaled chunks — tints pixels that rendered against a
@@ -2986,7 +2990,7 @@ void CWindow::CreateWidgets(void)
                 });
             }
         });
-        viewerControlsLayout->addWidget(chkHighlight);
+        viewExtrasLayout->addWidget(chkHighlight);
     }
 
     // Navigation sensitivity controls
