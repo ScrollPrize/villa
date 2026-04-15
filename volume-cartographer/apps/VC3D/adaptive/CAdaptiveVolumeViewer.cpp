@@ -621,13 +621,14 @@ void CAdaptiveVolumeViewer::submitRender()
             // Treat gray as a heightfield. Scharr gives a screen-space
             // gradient; compose a surface normal (depth scales vertical
             // slope vs. unit-height image plane) and Lambert-shade it.
-            // Reuse cached gx/gy cv::Mat allocations across frames — Scharr
-            // used to alloc+free two CV_32F matrices of full fb size every
-            // frame raking was active.
+            // Lazy-allocate the gradient matrices — raking is off by
+            // default, so unconditionally reserving ~16 MB/viewer at 1080p
+            // for this path would be wasteful. Once raking turns on we
+            // reuse the matrices across frames.
             if (_rakingGx.rows != fbH || _rakingGx.cols != fbW
                 || _rakingGx.type() != CV_32F) {
-                _rakingGx.create(fbH, fbW, CV_32F);
-                _rakingGy.create(fbH, fbW, CV_32F);
+                _rakingGx = cv::Mat(fbH, fbW, CV_32F);
+                _rakingGy = cv::Mat(fbH, fbW, CV_32F);
             }
             cv::Scharr(gray, _rakingGx, CV_32F, 1, 0, 1.0 / 32.0);
             cv::Scharr(gray, _rakingGy, CV_32F, 0, 1, 1.0 / 32.0);

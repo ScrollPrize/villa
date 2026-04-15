@@ -48,6 +48,11 @@ BlockCache::BlockCache(Config cfg)
     const size_t words = (nSlots_ + 63u) / 64u;
     occupiedBits_.assign(words, 0);
     usedBits_.assign(words, 0);
+    // Default max_load_factor of 1.0 means libstdc++ sizes the bucket array
+    // at 2x insertion count. At 2.5M slots that's ~40 MB of extra buckets.
+    // Push the load factor to 1.0 before reserving so the reserve matches
+    // actual need (buckets ≈ nSlots_ instead of ≈ 2*nSlots_).
+    map_.max_load_factor(1.0f);
     map_.reserve(nSlots_);
 }
 
