@@ -8,10 +8,9 @@
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
 
-CState::CState(size_t cacheSizeBytes, size_t diskCacheSizeBytes, QObject* parent)
+CState::CState(size_t cacheSizeBytes, QObject* parent)
     : QObject(parent)
     , _cacheSizeBytes(cacheSizeBytes)
-    , _diskCacheSizeBytes(diskCacheSizeBytes)
 {
     _pointCollection = new VCCollection(this);
 
@@ -95,7 +94,6 @@ void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
 {
     if (vol && _cacheSizeBytes > 0) {
         vol->setCacheBudget(_cacheSizeBytes);
-        vol->setDiskCacheMaxBytes(_diskCacheSizeBytes);
 
         // One IO thread per hardware thread. Each IOPool worker does
         // fetch + decode + block split, all CPU-bound work that scales

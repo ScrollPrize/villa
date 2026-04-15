@@ -91,8 +91,6 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
     using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     _camera.downscaleOverride = settings.value(perf::DOWNSCALE_OVERRIDE, perf::DOWNSCALE_OVERRIDE_DEFAULT).toInt();
-    _navSpeed = settings.value(viewer::NAV_SPEED, viewer::NAV_SPEED_DEFAULT).toFloat();
-    if (_navSpeed <= 0.0f) _navSpeed = 1.0f;
     _panSensitivity = settings.value(viewer::PAN_SENSITIVITY, viewer::PAN_SENSITIVITY_DEFAULT).toFloat();
     if (_panSensitivity <= 0.0f) _panSensitivity = 1.0f;
     _zoomSensitivity = settings.value(viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT).toFloat();

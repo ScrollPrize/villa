@@ -77,9 +77,7 @@ public:
     [[nodiscard]] size_t numScales() const noexcept;
 
     // Create a BlockPipeline backed by this volume's zarr data.
-    // diskZarr: optional local zarr v3 sharded array for cold tier.
-    [[nodiscard]] std::unique_ptr<vc::cache::BlockPipeline> createTieredCache(
-        std::shared_ptr<utils::ZarrArray> diskZarr = nullptr) const;
+    [[nodiscard]] std::unique_ptr<vc::cache::BlockPipeline> createTieredCache() const;
 
     // --- Cache management ---
 
@@ -92,12 +90,6 @@ public:
 
     // Inject a local zarr array for the cold cache tier.
     // Must be called before first tieredCache() access.
-    void setDiskZarr(std::shared_ptr<utils::ZarrArray> zarr);
-
-    // Set the maximum size for the auto-created disk cache (remote volumes).
-    // Must be called before first tieredCache() access.
-    void setDiskCacheMaxBytes(size_t bytes);
-
     // Set the number of background IO threads for chunk fetching.
     // Must be called before first tieredCache() access.
     void setIOThreads(int count);
@@ -183,8 +175,6 @@ protected:
     mutable std::unique_ptr<vc::cache::BlockPipeline> tieredCache_;
     mutable std::once_flag cacheOnce_;
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
-    size_t diskCacheMaxBytes_ = 100ULL << 30; // 100 GB default
-    std::shared_ptr<utils::ZarrArray> pendingDiskZarr_;
     int ioThreads_ = 0;  // 0 = use default
     utils::VideoCodecParams encodeParams_ = {.qp = 36};
 

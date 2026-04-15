@@ -4188,11 +4188,6 @@ void SegmentationCommandHandler::onRenameSurface(const QString& segmentId)
 
     // === Clean up the segment before renaming ===
 
-    // Wait for any pending index rebuild
-    if (_waitForIndexRebuildCallback) {
-        _waitForIndexRebuildCallback();
-    }
-
     // Clear from surface collection (including "segmentation" if it matches)
     if (_state) {
         auto currentSurface = _state->surface(oldId);

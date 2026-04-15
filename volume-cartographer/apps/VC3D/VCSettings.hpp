@@ -63,7 +63,6 @@ namespace viewer {
     constexpr auto FWD_BACK_STEP_MS = "viewer/fwd_back_step_ms";
     constexpr auto CENTER_ON_ZOOM = "viewer/center_on_zoom";
     constexpr auto SCROLL_SPEED = "viewer/scroll_speed";
-    constexpr auto NAV_SPEED = "viewer/nav_speed";
     constexpr auto PAN_SENSITIVITY = "viewer/pan_sensitivity";
     constexpr auto ZOOM_SENSITIVITY = "viewer/zoom_sensitivity";
     constexpr auto ZSCROLL_SENSITIVITY = "viewer/zscroll_sensitivity";
@@ -73,7 +72,6 @@ namespace viewer {
     constexpr int FWD_BACK_STEP_MS_DEFAULT = 25;
     constexpr bool CENTER_ON_ZOOM_DEFAULT = false;
     constexpr int SCROLL_SPEED_DEFAULT = -1;
-    constexpr float NAV_SPEED_DEFAULT = 1.0f;
     constexpr float PAN_SENSITIVITY_DEFAULT = 1.0f;
     constexpr float ZOOM_SENSITIVITY_DEFAULT = 1.0f;
     constexpr float ZSCROLL_SENSITIVITY_DEFAULT = 1.0f;
@@ -182,7 +180,6 @@ namespace perf {
     constexpr auto INTERPOLATION_METHOD = "viewer/interpolation_method";
     constexpr auto ENABLE_FILE_WATCHING = "perf/enable_file_watching";
     constexpr auto RAM_CACHE_SIZE_GB = "perf/ram_cache_size_gb";
-    constexpr auto DISK_CACHE_SIZE_GB = "perf/disk_cache_size_gb";
 
     constexpr int PRELOADED_SLICES_DEFAULT = 200;
     constexpr int PARALLEL_PROCESSES_DEFAULT = 8;
@@ -190,7 +187,6 @@ namespace perf {
     constexpr int DOWNSCALE_OVERRIDE_DEFAULT = 0;
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
-    constexpr int DISK_CACHE_SIZE_GB_DEFAULT = 100;
 
     // IO thread count is not configurable — it tracks
     // std::thread::hardware_concurrency() at runtime.

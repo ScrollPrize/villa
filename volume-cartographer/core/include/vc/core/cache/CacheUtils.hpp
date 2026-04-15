@@ -61,7 +61,6 @@ namespace vc::cache {
 }
 
 // Build a chunk filename from a ChunkKey: "<iz><delim><iy><delim><ix>"
-// Used by DiskStore and FileSystemSource.
 // Uses a stack buffer to avoid heap allocation on the hot path (Issue 51).
 [[nodiscard]] inline std::string chunkFilename(
     const ChunkKey& key,

@@ -657,13 +657,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _cacheSizeBytes = cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
     std::cout << "chunk cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
 
-    // Disk cache size from settings
-    size_t diskCacheSizeGB = settings.value(vc3d::settings::perf::DISK_CACHE_SIZE_GB,
-                                            vc3d::settings::perf::DISK_CACHE_SIZE_GB_DEFAULT).toULongLong();
-    size_t diskCacheSizeBytes = diskCacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
-    std::cout << "disk cache budget is " << diskCacheSizeGB << " gigabytes" << std::endl;
-
-    _state = new CState(_cacheSizeBytes, diskCacheSizeBytes, this);
+    _state = new CState(_cacheSizeBytes, this);
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
 
@@ -2686,11 +2680,6 @@ void CWindow::CreateWidgets(void)
     _segmentationCommandHandler->setClearSelectionCallback([this]() {
         clearSurfaceSelection();
     });
-    _segmentationCommandHandler->setWaitForIndexRebuildCallback([this]() {
-        if (_viewerManager) {
-            _viewerManager->waitForPendingIndexRebuild();
-        }
-    });
     _segmentationCommandHandler->setRestoreSelectionCallback([this](const std::string& id) {
         if (treeWidgetSurfaces) {
             QTreeWidgetItemIterator it(treeWidgetSurfaces);
@@ -4450,21 +4439,6 @@ void CWindow::OpenVolume(const QString& path)
 
                     if (!cacheDir.isEmpty()) {
                         settings.setValue(viewer::NETWORK_CACHE_DIR, cacheDir);
-
-                        auto cachePath = fs::path(cacheDir.toStdString());
-                        // Open local zarr if it exists at the cache path
-                        for (const auto& volId : _state->vpkg()->volumeIDs()) {
-                            auto vol = _state->vpkg()->volume(volId);
-                            auto zarrPath = cachePath / volId / "0";
-                            if (fs::exists(zarrPath / "zarr.json")) {
-                                try {
-                                    auto zarr = std::make_shared<utils::ZarrArray>(
-                                        utils::ZarrArray::open(zarrPath));
-                                    vol->setDiskZarr(zarr);
-                                } catch (...) {}
-                            }
-                        }
-
                         Logger()->info("Network cache custom dir: {} (fs: {})",
                                        cacheDir.toStdString(), label);
                     }

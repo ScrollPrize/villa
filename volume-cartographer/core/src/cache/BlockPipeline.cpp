@@ -585,7 +585,6 @@ skipPassthrough:
     downloaderPool_.start();
     encodePool_.start();
     loaderPool_.start();
-    loadNegativeCache();
 }
 
 BlockPipeline::~BlockPipeline() {
@@ -608,7 +607,6 @@ BlockPipeline::~BlockPipeline() {
         std::fprintf(stderr, "[Cache] session summary: coldHits=%lu iceFetches=%lu (%.0f%% from disk)\n",
                      cold, ice, (cold + ice) > 0 ? 100.0 * cold / (cold + ice) : 0.0);
     }
-    saveNegativeCache();
 }
 
 void BlockPipeline::bloomAdd(const ChunkKey& key) noexcept {
@@ -932,12 +930,6 @@ auto BlockPipeline::stats() const -> Stats {
     }
     return s;
 }
-
-// Negative info now lives in the on-disk shard index (empty chunks marked
-// there directly); the in-memory bloom + set is a session-scoped speedup.
-void BlockPipeline::loadNegativeCache() {}
-void BlockPipeline::saveNegativeCache() const {}
-void BlockPipeline::flushPersistentState() {}
 
 std::unique_ptr<BlockPipeline> openFilesystemPipeline(
     VcDataset* ds, size_t maxBytes, const std::filesystem::path& datasetPath)

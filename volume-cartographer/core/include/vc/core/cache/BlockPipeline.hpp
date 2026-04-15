@@ -92,8 +92,6 @@ public:
     [[nodiscard]] std::array<int, 3> chunkShape(int level) const noexcept;
     [[nodiscard]] std::array<int, 3> levelShape(int level) const noexcept;
 
-    void flushPersistentState();
-
     // --- Logical data bounds ---
     struct DataBoundsL0 {
         int minX = 0, maxX = 0;
@@ -127,7 +125,7 @@ public:
         uint64_t iceFetches = 0;
         uint64_t misses = 0;
         size_t blocks = 0;
-        size_t ioPending = 0;             // total across all pools (compat)
+        size_t ioPending = 0;             // download + encode + load
         size_t downloadPending = 0;        // s3 → staged ChunkData queue
         size_t encodePending = 0;          // staged ChunkData → h265 disk queue
         size_t loadPending = 0;            // disk → ram queue
@@ -228,8 +226,6 @@ private:
     void bloomClear() noexcept;
     mutable std::mutex negativeMutex_;
     std::unordered_set<ChunkKey, ChunkKeyHash> negativeCache_;
-    void loadNegativeCache();
-    void saveNegativeCache() const;
 
     mutable std::mutex callbackMutex_;
     std::vector<std::pair<ChunkReadyCallbackId, ChunkReadyCallback>> chunkReadyListeners_;

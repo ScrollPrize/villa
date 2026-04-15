@@ -103,7 +103,7 @@ public:
     //     for this inner chunk is the all-FF "missing" sentinel or the
     //     (0xFF...FE, 0) zero-data placeholder.
     // Cleared on any successful fetch and on transient/auth/curl errors.
-    // The negative cache should ONLY be poisoned when this is true.
+    // Only insert into negativeCache_ when this is true.
     [[nodiscard]] static bool lastFetchWasAbsent() noexcept;
 
 private:

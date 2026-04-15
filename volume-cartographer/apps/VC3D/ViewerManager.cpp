@@ -444,11 +444,6 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
     refreshSurfacePatchIndex(surface);
 }
 
-void ViewerManager::waitForPendingIndexRebuild()
-{
-    // No-op: never block the GUI thread waiting for index rebuild
-}
-
 void ViewerManager::primeSurfacePatchIndicesAsync()
 {
     if (!_surfacePatchIndexWatcher) {

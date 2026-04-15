@@ -108,7 +108,6 @@ public:
     SurfacePatchIndex* surfacePatchIndex();
     void refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface);
     void refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface, const cv::Rect& changedRegion);
-    void waitForPendingIndexRebuild();
 
     // Stop maintaining the SurfacePatchIndex. Any subsequent
     // surfaceWillBeDeleted signals will be ignored instead of triggering

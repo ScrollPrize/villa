@@ -279,8 +279,7 @@ size_t Volume::numScales() const noexcept {
     return zarrDs_.size();
 }
 
-std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache(
-    std::shared_ptr<utils::ZarrArray> /*diskZarr_unused*/) const
+std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
 {
     if (zarrDs_.empty()) return nullptr;
     std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels;
@@ -430,7 +429,7 @@ void Volume::ensureTieredCache() const
 {
     std::call_once(cacheOnce_, [this]() {
         auto* self = const_cast<Volume*>(this);
-        tieredCache_ = self->createTieredCache(self->pendingDiskZarr_);
+        tieredCache_ = self->createTieredCache();
     });
 }
 
@@ -443,21 +442,6 @@ vc::cache::BlockPipeline* Volume::tieredCache()
 void Volume::setCacheBudget(size_t hotBytes)
 {
     cacheBudgetHot_ = hotBytes;
-}
-
-void Volume::setDiskZarr(std::shared_ptr<utils::ZarrArray> zarr)
-{
-    if (tieredCache_) {
-        fprintf(stderr, "[Volume] WARNING: setDiskZarr() called after cache "
-                        "already created — ignoring\n");
-        return;
-    }
-    pendingDiskZarr_ = std::move(zarr);
-}
-
-void Volume::setDiskCacheMaxBytes(size_t bytes)
-{
-    diskCacheMaxBytes_ = bytes;
 }
 
 void Volume::setIOThreads(int count)

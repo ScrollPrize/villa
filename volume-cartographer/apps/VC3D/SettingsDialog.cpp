@@ -27,9 +27,6 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     edtImpactRange->setText(settings.value(viewer::IMPACT_RANGE_STEPS, viewer::IMPACT_RANGE_STEPS_DEFAULT).toString());
     edtScanRange->setText(settings.value(viewer::SCAN_RANGE_STEPS, viewer::SCAN_RANGE_STEPS_DEFAULT).toString());
     spinScrollSpeed->setValue(settings.value(viewer::SCROLL_SPEED, viewer::SCROLL_SPEED_DEFAULT).toInt());
-    if (auto* spinNavSpeed = findChild<QDoubleSpinBox*>("spinNavSpeed")) {
-        spinNavSpeed->setValue(settings.value(viewer::NAV_SPEED, viewer::NAV_SPEED_DEFAULT).toDouble());
-    }
     spinDisplayOpacity->setValue(settings.value(viewer::DISPLAY_SEGMENT_OPACITY, viewer::DISPLAY_SEGMENT_OPACITY_DEFAULT).toInt());
     chkPlaySoundAfterSegRun->setChecked(settings.value(viewer::PLAY_SOUND_AFTER_SEG_RUN, viewer::PLAY_SOUND_AFTER_SEG_RUN_DEFAULT).toInt() != 0);
     edtUsername->setText(settings.value(viewer::USERNAME, viewer::USERNAME_DEFAULT).toString());
@@ -59,7 +56,6 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
 
     // Cache settings
     spinRamCacheSizeGB->setValue(settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toInt());
-    spinDiskCacheSizeGB->setValue(settings.value(perf::DISK_CACHE_SIZE_GB, perf::DISK_CACHE_SIZE_GB_DEFAULT).toInt());
     {
         QString defaultCache = vc3d::defaultCacheBase() + "/remote_cache";
         edtRemoteCachePath->setText(settings.value(viewer::REMOTE_CACHE_DIR, defaultCache).toString());
@@ -92,7 +88,6 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     connect(btnHelpDisplayOpacity, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpDisplayOpacity->toolTip()); });
     connect(btnHelpPreloadedSlices, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpPreloadedSlices->toolTip()); });
     connect(btnHelpRamCacheSize, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpRamCacheSize->toolTip()); });
-    connect(btnHelpDiskCacheSize, &QPushButton::clicked, this, [this]{ QToolTip::showText(QCursor::pos(), btnHelpDiskCacheSize->toolTip()); });
 }
 
 void SettingsDialog::accept()
@@ -109,9 +104,6 @@ void SettingsDialog::accept()
     settings.setValue(viewer::IMPACT_RANGE_STEPS, edtImpactRange->text());
     settings.setValue(viewer::SCAN_RANGE_STEPS, edtScanRange->text());
     settings.setValue(viewer::SCROLL_SPEED, spinScrollSpeed->value());
-    if (auto* spinNavSpeed = findChild<QDoubleSpinBox*>("spinNavSpeed")) {
-        settings.setValue(viewer::NAV_SPEED, spinNavSpeed->value());
-    }
     settings.setValue(viewer::DISPLAY_SEGMENT_OPACITY, spinDisplayOpacity->value());
     settings.setValue(viewer::PLAY_SOUND_AFTER_SEG_RUN, chkPlaySoundAfterSegRun->isChecked() ? "1" : "0");
     settings.setValue(viewer::USERNAME, edtUsername->text());
@@ -137,7 +129,6 @@ void SettingsDialog::accept()
 
     // Cache settings
     settings.setValue(perf::RAM_CACHE_SIZE_GB, spinRamCacheSizeGB->value());
-    settings.setValue(perf::DISK_CACHE_SIZE_GB, spinDiskCacheSizeGB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text());
 
     // IO_THREADS setting removed — see CState::applyCacheBudget.

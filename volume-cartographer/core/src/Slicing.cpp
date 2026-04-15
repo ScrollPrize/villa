@@ -288,9 +288,9 @@ void appendChunksForRegion(BlockPipeline& cache, int level,
 // (the plane really does span its bbox) but disastrous for curved surfaces:
 // a flattened scroll surface might span a 4000x4000x500 voxel bbox while
 // actually crossing only a few hundred chunks. The other thousands of
-// bbox-interior chunks are off-surface, genuinely absent on S3, and end up
-// poisoning the negative cache for no reason. Walk per-pixel coords, map
-// each to its chunk, dedup. Sub-sample to keep the dedup set cheap.
+// bbox-interior chunks are off-surface and would trigger pointless S3
+// fetches. Walk per-pixel coords, map each to its chunk, dedup.
+// Sub-sample to keep the dedup set cheap.
 void appendChunksForCoordsSurface(BlockPipeline& cache, int level,
                                   const cv::Mat_<cv::Vec3f>& coords,
                                   std::vector<vc::cache::ChunkKey>& out) {

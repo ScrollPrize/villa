@@ -16,7 +16,6 @@
 
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
-#include <QFutureWatcher>
 #include <QPainterPath>
 
 #include "VolumeViewerBase.hpp"
@@ -42,10 +41,10 @@ class PlaneSurface;
 // Backward-compat alias — all external code still uses CTiledVolumeViewer
 #define CTiledVolumeViewer CAdaptiveVolumeViewer
 
-// Minimal adaptive volume viewer. Renders a PlaneSurface using
-// samplePlaneAdaptiveARGB32 directly to a viewport-sized framebuffer.
-// Diagnostic replacement for CTiledVolumeViewer — no overlays, no
-// composite, no tiling, no prefetching.
+// Adaptive per-pixel volume viewer. Renders a PlaneSurface via
+// samplePlaneAdaptiveARGB32 directly to a viewport-sized framebuffer,
+// with composite post-process (CLAHE, raking light), intersections,
+// and overlays.
 class CAdaptiveVolumeViewer : public QWidget, public VolumeViewerBase
 {
     Q_OBJECT
@@ -299,7 +298,6 @@ private:
     int _cachedStretchHi = 255;
     CompositeRenderSettings _compositeSettings;
     bool _resetViewOnSurfaceChange = true;
-    float _navSpeed = 1.0f;
     float _panSensitivity = 1.0f;
     float _zoomSensitivity = 1.0f;
     float _zScrollSensitivity = 1.0f;
