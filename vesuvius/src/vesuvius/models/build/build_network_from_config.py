@@ -961,7 +961,7 @@ class NetworkFromConfig(nn.Module):
             self.guide_backbone.eval()
 
     def _sample_guide_token_mask(self, guide_features):
-        if self.guide_tokenbook_sample_rate >= 1.0:
+        if (not self.training) or self.guide_tokenbook_sample_rate >= 1.0:
             return None
 
         batch_size = guide_features.shape[0]
