@@ -244,6 +244,11 @@ void CAdaptiveVolumeViewer::onSurfaceChanged(const std::string& name,
     if (!surf) {
         _scene->clear();
         _overlayGroups.clear();
+        // QGraphicsScene::clear() delete'd every QGraphicsItem we had cached
+        // pointers to. Drop the dangling handles so the next
+        // invalidateIntersect() doesn't double-free.
+        _intersectionItems.clear();
+        _lastIntersectFp = {};
         return;
     }
 
@@ -280,7 +285,15 @@ void CAdaptiveVolumeViewer::onSurfaceWillBeDeleted(const std::string& /*name*/,
 
 void CAdaptiveVolumeViewer::onVolumeClosing()
 {
+    // Unregister the chunk-ready listener on the BlockPipeline that is
+    // about to be destroyed, and drop our own reference to the Volume so
+    // we don't keep the cache resident.
+    if (_chunkCbId != 0 && _volume && _volume->tieredCache()) {
+        _volume->tieredCache()->removeChunkReadyListener(_chunkCbId);
+    }
+    _chunkCbId = 0;
     onSurfaceChanged(_surfName, nullptr);
+    _volume.reset();
 }
 
 void CAdaptiveVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
@@ -820,6 +833,12 @@ void CAdaptiveVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMo
             submitRender();
             updateStatusLabel();
         }
+    } else if (modifiers & Qt::ControlModifier) {
+        // Ctrl+wheel is bound to segmentation brush-radius changes
+        // (SegmentationModule connects sendSegmentationRadiusWheel). Without
+        // this branch the event falls into the zoom path and the in-editor
+        // radius shortcut silently stops working.
+        emit sendSegmentationRadiusWheel(steps, scenePoint, sceneToVolume(scenePoint));
     } else {
         int zoomDir = (steps > 0) ? 1 : (steps < 0) ? -1 : 0;
         if (zoomDir != 0)

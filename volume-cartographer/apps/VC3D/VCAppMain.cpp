@@ -20,7 +20,9 @@
 #include <omp.h>
 #include <blosc.h>
 #include <cstdlib>
+#if defined(__GLIBC__)
 #include <malloc.h>
+#endif
 #ifndef _WIN32
 #include <dlfcn.h>
 #include <sys/resource.h>
@@ -60,7 +62,7 @@ auto main(int argc, char* argv[]) -> int
     setThreadPoliciesEarly();
 #endif
 
-#if defined(__linux__) && !defined(VC_HAVE_MIMALLOC)
+#if defined(__GLIBC__) && !defined(VC_HAVE_MIMALLOC)
     // Tune glibc's malloc to give freed pages back to the OS more aggressively.
     // Lower M_MMAP_THRESHOLD pushes bigger allocations through mmap (returned
     // independently on free), reducing main-heap fragmentation. Lower

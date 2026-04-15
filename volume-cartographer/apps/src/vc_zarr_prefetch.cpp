@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
@@ -28,6 +29,8 @@
 #include <thread>
 #include <unordered_set>
 #include <vector>
+
+#include <utils/http_fetch.hpp>
 
 #include <boost/program_options.hpp>
 
@@ -45,6 +48,13 @@ namespace po = boost::program_options;
 namespace fs = std::filesystem;
 
 namespace {
+
+std::atomic<bool> g_shutdown{false};
+
+void handleSigint(int) {
+    g_shutdown.store(true, std::memory_order_release);
+    utils::HttpClient::abortAll();
+}
 
 // Slash-trimmed concat: "https://host/foo" + "0/zarr.json".
 std::string urlJoin(const std::string& base, const std::string& tail) {
@@ -144,6 +154,28 @@ void prefetchCanonicalLevel(
         * std::uint64_t(shardsPerAxis[1])
         * std::uint64_t(shardsPerAxis[2]);
 
+    // Sweep any leftover .part files from a previously interrupted run so
+    // they don't accumulate and confuse disk-usage accounting.
+    {
+        std::error_code ec;
+        fs::path cDir = lvlPath / "c";
+        if (fs::exists(cDir, ec)) {
+            std::uint64_t removed = 0;
+            for (auto it = fs::recursive_directory_iterator(cDir, ec);
+                 !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
+                if (it->is_regular_file(ec) && it->path().extension() == ".part") {
+                    fs::remove(it->path(), ec);
+                    if (!ec) ++removed;
+                }
+            }
+            if (removed) {
+                std::fprintf(stderr,
+                    "[prefetch] level %d  cleaned %lu stale .part files\n",
+                    level, static_cast<unsigned long>(removed));
+            }
+        }
+    }
+
     // Single shared queue of shard coordinates.
     struct Shard { int sz, sy, sx; };
     std::vector<Shard> queue;
@@ -165,6 +197,7 @@ void prefetchCanonicalLevel(
 
     auto worker = [&]() {
         while (true) {
+            if (g_shutdown.load(std::memory_order_acquire)) return;
             std::size_t i = nextIdx.fetch_add(1, std::memory_order_relaxed);
             if (i >= queue.size()) return;
             auto [sz, sy, sx] = queue[i];
@@ -304,11 +337,15 @@ void prefetchCanonicalLevel(
         std::fflush(stderr);
     };
     while (done.load(std::memory_order_relaxed) < totalShards) {
+        if (g_shutdown.load(std::memory_order_acquire)) break;
         std::this_thread::sleep_for(std::chrono::seconds(2));
         report(false);
     }
     for (auto& t : pool) t.join();
     report(true);
+    if (g_shutdown.load(std::memory_order_acquire)) {
+        std::fprintf(stderr, "[prefetch] level %d aborted by user\n", level);
+    }
 }
 
 // Non-canonical: drive the live BlockPipeline so chunks are transcoded into
@@ -352,6 +389,7 @@ void prefetchTranscodeLevel(
         return buf;
     };
     while (true) {
+        if (g_shutdown.load(std::memory_order_acquire)) break;
         auto s = pipe.stats();
         if (s.ioPending == 0) break;
         auto now = std::chrono::steady_clock::now();
@@ -390,6 +428,8 @@ void prefetchTranscodeLevel(
 }  // namespace
 
 int main(int argc, char** argv) {
+    std::signal(SIGINT, handleSigint);
+    std::signal(SIGTERM, handleSigint);
     std::string url;
     std::string cacheDirStr;
     std::string levelsArg = "0";
@@ -568,6 +608,7 @@ int main(int argc, char** argv) {
 
     const int passthroughJobs = jobs > 0 ? jobs : 16;
     for (int lvl : levelOrder) {
+        if (g_shutdown.load(std::memory_order_acquire)) break;
         if (levelCanonical[lvl]) {
             // openOrCreateDiskLevel writes zarr.json so vc3d can read the
             // cache later; we then ignore the returned ZarrArray and write
@@ -580,6 +621,10 @@ int main(int argc, char** argv) {
         }
     }
 
+    if (g_shutdown.load(std::memory_order_acquire)) {
+        std::fprintf(stderr, "[prefetch] aborted by user\n");
+        return 130;
+    }
     std::fprintf(stderr, "[prefetch] all levels complete\n");
     return 0;
 }

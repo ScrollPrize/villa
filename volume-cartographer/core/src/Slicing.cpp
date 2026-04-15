@@ -867,12 +867,17 @@ void sampleCompositeAdaptiveImpl(
             haveCenter = true;
         }
         if (!keys.empty()) {
-            std::array<std::array<int, 3>, vc::cache::kMaxLevels> shapes{};
-            for (int lvl = 0; lvl < numLevels && lvl < vc::cache::kMaxLevels; ++lvl)
-                shapes[lvl] = cache.chunkShape(lvl);
-            sortKeysByCenterDistance(keys, shapes.data(),
-                                     std::min(numLevels, int(vc::cache::kMaxLevels)),
-                                     viewCenterL0);
+            if (haveCenter) {
+                // Without a real center (viewCenterL0 would fall back to
+                // the (0,0,0) default), the distance sort would wrongly
+                // bias prefetch toward the volume origin.
+                std::array<std::array<int, 3>, vc::cache::kMaxLevels> shapes{};
+                for (int lvl = 0; lvl < numLevels && lvl < vc::cache::kMaxLevels; ++lvl)
+                    shapes[lvl] = cache.chunkShape(lvl);
+                sortKeysByCenterDistance(keys, shapes.data(),
+                                         std::min(numLevels, int(vc::cache::kMaxLevels)),
+                                         viewCenterL0);
+            }
             cache.fetchInteractive(keys, desiredLevel);
         }
     } else {
@@ -893,16 +898,17 @@ void sampleCompositeAdaptiveImpl(
             + (*vy_step) * (float(h) * 0.5f);
         haveCenter = true;
         if (!keys.empty()) {
-            std::array<std::array<int, 3>, vc::cache::kMaxLevels> shapes{};
-            for (int lvl = 0; lvl < numLevels && lvl < vc::cache::kMaxLevels; ++lvl)
-                shapes[lvl] = cache.chunkShape(lvl);
-            sortKeysByCenterDistance(keys, shapes.data(),
-                                     std::min(numLevels, int(vc::cache::kMaxLevels)),
-                                     viewCenterL0);
+            if (haveCenter) {
+                std::array<std::array<int, 3>, vc::cache::kMaxLevels> shapes{};
+                for (int lvl = 0; lvl < numLevels && lvl < vc::cache::kMaxLevels; ++lvl)
+                    shapes[lvl] = cache.chunkShape(lvl);
+                sortKeysByCenterDistance(keys, shapes.data(),
+                                         std::min(numLevels, int(vc::cache::kMaxLevels)),
+                                         viewCenterL0);
+            }
             cache.fetchInteractive(keys, desiredLevel);
         }
     }
-    (void)haveCenter;
 
     // Precompute per-level scale factor once (1.0 / 2^lvl). Hoists the
     // integer shift + int->float convert + fdiv out of the hot inner loop.

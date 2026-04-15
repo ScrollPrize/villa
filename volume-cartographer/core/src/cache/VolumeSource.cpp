@@ -233,6 +233,12 @@ std::vector<uint8_t> HttpSource::httpGet(const std::string& url)
         return {};
     }
 
+    // Clear the sticky "transient trouble" flag on any successful response
+    // (including 200 with empty body). Otherwise one bad 5xx early in a
+    // session would make the flag latch forever and callers would keep
+    // suppressing negative-cache writes.
+    transientError_.store(false, std::memory_order_relaxed);
+
     std::vector<uint8_t> result(resp.body.size());
     if (!result.empty())
         std::memcpy(result.data(), resp.body.data(), result.size());
@@ -278,10 +284,19 @@ std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
     }
 
     const int nChunks = totalChunksPerShard();
-    if (shardData->size() < size_t(nChunks) * 16) return {};
+    if (shardData->size() < size_t(nChunks) * 16) {
+        // Corrupt / truncated shard — treat as a transient failure, not
+        // a genuine absence. Explicitly clear the flag so a stale true
+        // from a previous httpGet on this thread can't poison the caller.
+        tl_last_was_absent = false;
+        return {};
+    }
 
     const int inner = innerChunkIndex(key);
-    if (inner < 0 || inner >= nChunks) return {};
+    if (inner < 0 || inner >= nChunks) {
+        tl_last_was_absent = false;
+        return {};
+    }
 
     // Deserialize the shard index (first n_inner * 16 bytes) and pick the
     // entry for our inner chunk.
@@ -299,7 +314,12 @@ std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
         tl_last_was_absent = true;
         return {};
     }
-    if (entry.offset + entry.nbytes > shardData->size()) return {};
+    if (entry.offset + entry.nbytes > shardData->size()) {
+        // Entry points beyond the shard bytes — corrupt/truncated, not
+        // absent. Don't let callers negative-cache this.
+        tl_last_was_absent = false;
+        return {};
+    }
 
     return {shardData->data() + entry.offset,
             shardData->data() + entry.offset + entry.nbytes};

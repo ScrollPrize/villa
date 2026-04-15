@@ -8,8 +8,11 @@
 
 #include <cstdio>
 #include <fstream>
-#include <malloc.h>
 #include <string>
+
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #if defined(VC_HAVE_MIMALLOC)
 #include <mimalloc.h>
@@ -27,6 +30,7 @@ struct ProcStatus {
 ProcStatus readProcStatus()
 {
     ProcStatus s;
+#if defined(__linux__)
     std::ifstream f("/proc/self/status");
     std::string line;
     while (std::getline(f, line)) {
@@ -41,6 +45,7 @@ ProcStatus readProcStatus()
         parseKB("VmHWM:", s.vmHwmKB);
         parseKB("VmSwap:", s.vmSwapKB);
     }
+#endif
     return s;
 }
 
@@ -66,13 +71,13 @@ namespace vc3d::ramstats {
 void dumpOnce(ViewerManager* viewerManager, CState* state)
 {
     const ProcStatus ps = readProcStatus();
-#if defined(VC_HAVE_MIMALLOC)
-    // mimalloc's mi_process_info returns nonsense after a while on 3.2 —
-    // just rely on /proc/self/status for the authoritative RSS/commit.
-    const struct mallinfo2 mi{};
-    (void)mi;
-#else
+#if defined(__GLIBC__) && !defined(VC_HAVE_MIMALLOC)
+    // mallinfo2 is glibc-only (>=2.33). Skipped on macOS / musl / with
+    // mimalloc (which overrides malloc and makes the legacy struct noise).
     const struct mallinfo2 mi = mallinfo2();
+#else
+    struct { int uordblks=0, fordblks=0, hblkhd=0; } mi;
+    (void)mi;
 #endif
 
     std::size_t blockBytes = 0;

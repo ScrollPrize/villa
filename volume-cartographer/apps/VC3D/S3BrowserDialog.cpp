@@ -83,6 +83,14 @@ QString S3BrowserDialog::s3ToHttps(const QString& s3Url) const
 
 void S3BrowserDialog::navigateTo(const QString& s3Url)
 {
+    // Bump the sequence FIRST so any in-flight watcher whose
+    // textChanged-triggered slot re-enters navigateTo, or which is about
+    // to finish during this function body, is invalidated before we mutate
+    // _currentUrl / _pathBar. Without this ordering, a late response to an
+    // earlier navigation could still pass the seq check if it lands between
+    // the assignments above and the ++ below.
+    ++_listRequestSeq;
+
     _currentUrl = s3Url;
     if (!_currentUrl.endsWith('/')) _currentUrl += '/';
     _pathBar->setText(_currentUrl);
@@ -107,7 +115,7 @@ void S3BrowserDialog::navigateTo(const QString& s3Url)
     // capture the requested path so that even if the user navigates back
     // to an already-seen URL, we don't confuse responses whose paths
     // differ from the current _currentUrl at completion time.
-    const std::uint64_t seq = ++_listRequestSeq;
+    const std::uint64_t seq = _listRequestSeq;
     const QString requestedUrl = _currentUrl;
 
     auto* watcher = new QFutureWatcher<vc::cache::S3ListResult>(this);

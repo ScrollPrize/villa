@@ -521,13 +521,13 @@ BlockPipeline::BlockPipeline(
                 if (!utils::is_video_compressed(std::span<const std::byte>(
                         reinterpret_cast<const std::byte*>(bytes.data()),
                         bytes.size()))) {
-                    static std::atomic<int> warned{0};
-                    if (warned.fetch_add(1) < 5) {
-                        std::fprintf(stderr,
-                            "[BlockPipeline] passthrough: chunk lvl=%d "
-                            "(%d,%d,%d) lacks VC3D magic — marking absent\n",
-                            key.level, key.iz, key.iy, key.ix);
-                    }
+                    // Always log: these are source-level corruption events,
+                    // not transient noise. Rate-limiting to 5 previously hid
+                    // systemic codec-mismatch issues from users.
+                    std::fprintf(stderr,
+                        "[BlockPipeline] passthrough: chunk lvl=%d "
+                        "(%d,%d,%d) lacks VC3D magic — marking absent\n",
+                        key.level, key.iz, key.iy, key.ix);
                     bloomAdd(key);
                     {
                         std::lock_guard lock(negativeMutex_);
