@@ -96,6 +96,58 @@ def encode_direction_channels(
     return torch.stack([dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x], dim=0)
 
 
+def encode_from_tensor(
+    tensor6: torch.Tensor,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    """Double-angle direction encoding computed directly from the
+    6 unique components of the second-moment tensor ``N = n·nᵀ``.
+
+    Args:
+        tensor6: ``(6, ...)`` float32 tensor, channels in the order
+            ``(nx², ny², nz², nx·ny, nx·nz, ny·nz)``. Any trailing
+            spatial dims are preserved.
+
+    Returns:
+        ``(6, ...)`` float32 — the same 6-channel encoding produced
+        by :func:`encode_direction_channels` when the input is a
+        single unit vector, but computed from tensor components so
+        that linear averaging of the tensor (which is the correct
+        sign-invariant operation on direction distributions) flows
+        straight into the encoding without ever constructing an
+        intermediate "mean normal".
+
+    This fixes the slerp-encoding spike: slerp between two sign-
+    ambiguous normals can cross the encoding's singular axis and
+    push an encoded channel to its extreme even when both endpoints
+    are far from it. Blending the tensor is the correct operation
+    for sign-invariant directions and stays smooth through those
+    configurations.
+    """
+    nx2 = tensor6[0]
+    ny2 = tensor6[1]
+    nz2 = tensor6[2]
+    nxny = tensor6[3]
+    nxnz = tensor6[4]
+    nynz = tensor6[5]
+    inv_sqrt2 = 1.0 / math.sqrt(2.0)
+
+    def _pair(a2: torch.Tensor, b2: torch.Tensor, ab: torch.Tensor):
+        r2 = a2 + b2 + eps
+        cos2t = (a2 - b2) / r2
+        sin2t = 2.0 * ab / r2
+        d0 = 0.5 + 0.5 * cos2t
+        d1 = 0.5 + 0.5 * (cos2t - sin2t) * inv_sqrt2
+        return d0, d1
+
+    dir0_z, dir1_z = _pair(nx2, ny2, nxny)   # Z-slices (XY plane)
+    dir0_y, dir1_y = _pair(nx2, nz2, nxnz)   # Y-slices (XZ plane)
+    dir0_x, dir1_x = _pair(ny2, nz2, nynz)   # X-slices (YZ plane)
+    return torch.stack(
+        [dir0_z, dir1_z, dir0_y, dir1_y, dir0_x, dir1_x], dim=0,
+    )
+
+
 def slerp_unit(
     n1: torch.Tensor,
     n2: torch.Tensor,
@@ -261,7 +313,7 @@ def derive_cos_gradmag_validity(
     surface_masks: list[torch.Tensor],
     chains: list[list[int]],
     fts: Optional[list[torch.Tensor]] = None,
-    raw_normals: Optional[torch.Tensor] = None,
+    tensor_moments: Optional[torch.Tensor] = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -269,8 +321,8 @@ def derive_cos_gradmag_validity(
     Optional[torch.Tensor],
 ]:
     """Derive cos / grad_mag / validity for all voxels bracketed between
-    chain-adjacent surfaces; optionally also a densified raw-normal
-    volume slerp-blended at the same bracket.
+    chain-adjacent surfaces; optionally also a densified second-moment
+    tensor volume linearly blended at the same bracket.
 
     The ordering is externally supplied (see
     ``tifxyz_lasagna_dataset.build_patch_chains``). Unlike the old
@@ -288,22 +340,24 @@ def derive_cos_gradmag_validity(
         fts: optional list of per-wrap feature-transform tensors aligned
             with ``dts``. Each entry is ``(3, Z, Y, X)`` int64 giving the
             ZYX coordinates of the nearest on-wrap voxel per voxel.
-            When provided together with ``raw_normals`` the function
-            also builds a dense raw-normal volume by gathering at those
-            indices and **slerp**-blending the chain-adjacent bracket
-            pair with the same routing as cos / grad_mag.
-        raw_normals: optional ``(3, Z, Y, X)`` float32 raw-normal splat
-            that ``fts`` gathers from. Double-angle encoding is applied
-            *downstream* in ``compute_patch_labels``, not here —
-            blending in angle space (via slerp) is the correct
-            operation, blending in encoded space is not.
+            When provided together with ``tensor_moments`` the function
+            also builds a dense tensor-moment volume by gathering at
+            those indices and **linearly** blending the chain-adjacent
+            bracket pair with the same routing as cos / grad_mag.
+        tensor_moments: optional ``(6, Z, Y, X)`` float32 splatted
+            second-moment tensor ``(nx², ny², nz², nx·ny, nx·nz, ny·nz)``
+            — the sign-invariant representation of raw normals. Linear
+            blending of these components is the correct sign-invariant
+            operation on direction distributions and avoids the slerp
+            encoding-singularity spike that happens when a geodesic
+            midpoint lands on an encoding pole.
 
     Returns:
         cos, grad_mag, valid — all (Z, Y, X); cos/grad_mag are 0 outside
         ``valid``.
-        n_dense — ``(3, Z, Y, X)`` float32 densified raw-normal volume
-            when ``fts`` + ``raw_normals`` were provided, else ``None``.
-            Zero outside ``valid``.
+        t_dense — ``(6, Z, Y, X)`` float32 densified tensor-moment volume
+            when ``fts`` + ``tensor_moments`` were provided, else
+            ``None``. Zero outside ``valid``.
     """
     if not dts:
         raise ValueError("derive_cos_gradmag_validity requires at least one surface")
@@ -315,14 +369,14 @@ def derive_cos_gradmag_validity(
     grad_mag_out = torch.zeros(shape, device=device)
     valid_out = torch.zeros(shape, dtype=torch.bool, device=device)
 
-    want_dir = fts is not None and raw_normals is not None
+    want_dir = fts is not None and tensor_moments is not None
     if want_dir:
-        n_dense = torch.zeros_like(raw_normals)
+        t_dense = torch.zeros_like(tensor_moments)
     else:
-        n_dense = None
+        t_dense = None
 
     if N_total == 0:
-        return cos_out, grad_mag_out, valid_out, n_dense
+        return cos_out, grad_mag_out, valid_out, t_dense
 
     # Global "which surface is nearest" across ALL surfaces (any chain).
     # This decides, for each voxel, which surface's bracketing logic applies.
@@ -450,17 +504,19 @@ def derive_cos_gradmag_validity(
             grad_mag_out = torch.where(local_valid, grad_mag_full, grad_mag_out)
             valid_out |= local_valid
 
-            # Raw-normal slerp blend — uses the SAME routed bracket
-            # pair and the SAME ``frac`` as cos / grad_mag. Blending
-            # normals in angle space (slerp) is the correct
-            # operation; blending their double-angle encodings
-            # linearly is not (the encoding is nonlinear in θ and
-            # the midpoint shrinks toward 0.5). We gather the
-            # sparse splatted raw normals at the nearest-on-wrap
-            # voxel via the feature transform, slerp in lockstep
-            # with cos, and encode the final normal field into 6
-            # double-angle channels downstream, in
-            # compute_patch_labels.
+            # Second-moment tensor linear blend — uses the SAME
+            # routed bracket pair and the SAME ``frac`` as cos /
+            # grad_mag. The tensor ``N = n·nᵀ`` is the sign-
+            # invariant representation of an unsigned direction
+            # (``nnᵀ = (−n)(−n)ᵀ``), and linear interpolation of
+            # its components is the correct averaging operation
+            # for direction distributions. This avoids both the
+            # sign ambiguity of raw-normal averaging AND the
+            # encoding-singularity spike that slerp through a
+            # geodesic midpoint hits when the midpoint lands on an
+            # encoding pole. The final 6-channel encoding is
+            # derived from the blended tensor in compute_patch_labels
+            # via ``encode_from_tensor``.
             #
             # On each side: lo = the surface whose dt runs from 0
             # at the surface to (spacing) at the opposite one.
@@ -468,38 +524,33 @@ def derive_cos_gradmag_validity(
             #   use_next voxels: lo = near, hi = next.
             if want_dir:
                 def _gather(ft: torch.Tensor) -> torch.Tensor:
-                    return raw_normals[:, ft[0], ft[1], ft[2]]
+                    return tensor_moments[:, ft[0], ft[1], ft[2]]
 
-                n_near = _gather(fts[surf_idx])
-                n_lo = torch.zeros_like(n_near)
-                n_hi = torch.zeros_like(n_near)
+                t_near = _gather(fts[surf_idx])
+                t_lo = torch.zeros_like(t_near)
+                t_hi = torch.zeros_like(t_near)
                 if has_prev:
-                    n_prev = _gather(fts[prev_idx])
+                    t_prev = _gather(fts[prev_idx])
                     use_prev_b = use_prev.unsqueeze(0)
-                    n_lo = torch.where(use_prev_b, n_prev, n_lo)
-                    n_hi = torch.where(use_prev_b, n_near, n_hi)
-                    del n_prev
+                    t_lo = torch.where(use_prev_b, t_prev, t_lo)
+                    t_hi = torch.where(use_prev_b, t_near, t_hi)
+                    del t_prev
                 if has_next:
-                    n_next = _gather(fts[next_idx])
+                    t_next = _gather(fts[next_idx])
                     use_next_b = use_next.unsqueeze(0)
-                    n_lo = torch.where(use_next_b, n_near, n_lo)
-                    n_hi = torch.where(use_next_b, n_next, n_hi)
-                    del n_next
-                del n_near
+                    t_lo = torch.where(use_next_b, t_near, t_lo)
+                    t_hi = torch.where(use_next_b, t_next, t_hi)
+                    del t_next
+                del t_near
 
-                # Re-normalize in case the sparse splat picked up
-                # trilinear-fractional neighbors whose components
-                # sum to less than 1. slerp_unit also renormalizes
-                # its output.
-                n_lo = n_lo / n_lo.norm(dim=0, keepdim=True).clamp(min=1e-6)
-                n_hi = n_hi / n_hi.norm(dim=0, keepdim=True).clamp(min=1e-6)
-                n_blend = slerp_unit(n_lo, n_hi, frac)
+                frac_b = frac.unsqueeze(0)
+                t_blend = (1.0 - frac_b) * t_lo + frac_b * t_hi
 
                 local_valid_b = local_valid.unsqueeze(0)
-                n_dense = torch.where(local_valid_b, n_blend, n_dense)
-                del n_lo, n_hi, n_blend
+                t_dense = torch.where(local_valid_b, t_blend, t_dense)
+                del t_lo, t_hi, t_blend
 
-    return cos_out, grad_mag_out, valid_out, n_dense
+    return cos_out, grad_mag_out, valid_out, t_dense
 
 
 # ---------------------------------------------------------------------------
@@ -680,7 +731,7 @@ def apply_same_surface_merge(
 
 def compute_patch_labels(
     surface_masks: list[torch.Tensor],
-    raw_normals: torch.Tensor,
+    tensor_moments: torch.Tensor,
     normals_valid: torch.Tensor,
     surface_chain_info: list[dict],
     device: torch.device = None,
@@ -697,11 +748,15 @@ def compute_patch_labels(
 
     Validity (cos + grad_mag) is restricted to voxels that are strictly
     between two chain-adjacent surfaces. Direction supervision is densely
-    filled inside the same bracket by slerp-blending the splatted
-    ``raw_normals`` at the chain-adjacent pair (see
-    :func:`derive_cos_gradmag_validity`); the final densified normal
-    volume is encoded to the 6-channel double-angle representation ONCE
-    at the end, just before writing ``targets[2:8]``.
+    filled inside the same bracket by **linearly blending** the splatted
+    ``tensor_moments`` at the chain-adjacent pair (see
+    :func:`derive_cos_gradmag_validity`). The final densified tensor is
+    encoded to the 6-channel double-angle representation via
+    :func:`encode_from_tensor` ONCE at the end, just before writing
+    ``targets[2:8]``. The tensor representation is sign-invariant and
+    smooth under linear interpolation, which avoids both the sign
+    ambiguity of raw-normal averaging and the encoding-singularity spike
+    that slerp through a geodesic midpoint hits.
 
     Merging is controlled by ``same_surface_groups`` — a
     ``list[list[int]]`` of original slot indices to collapse
@@ -716,13 +771,15 @@ def compute_patch_labels(
 
     Args:
         surface_masks: list of N bool tensors (Z, Y, X).
-        raw_normals: (3, Z, Y, X) float32 — sparsely splatted raw
-            ZYX normals. The blend happens in this space (slerp),
-            and the double-angle encoding is applied downstream
-            once ``n_dense`` is built.
+        tensor_moments: (6, Z, Y, X) float32 — sparsely splatted
+            second-moment tensor components
+            ``(nx², ny², nz², nx·ny, nx·nz, ny·nz)``. Sign-invariant
+            representation of unsigned direction. Linearly blended at
+            the chain-adjacent bracket, encoded via
+            ``encode_from_tensor`` to produce ``targets[2:8]``.
         normals_valid: (Z, Y, X) bool — where splatting produced
-            valid normals. Voxels here keep their original splatted
-            normals at ``dir_sparse_mask``-weight 1.0.
+            valid tensor moments. Voxels here keep their original
+            splatted tensor at ``dir_sparse_mask``-weight 1.0.
         surface_chain_info: list of N per-mask chain dicts (aligned order).
         device: target device (defaults to surface_masks[0].device).
         same_surface_groups: optional ``list[list[int]]`` of original
@@ -733,7 +790,7 @@ def compute_patch_labels(
             EDT loop. Must be aligned with ``surface_masks``.
         precomputed_fts: optional list of per-surface feature transforms
             (``(3, Z, Y, X)`` int64, one per surface) aligned with
-            ``precomputed_dts``. If omitted but ``raw_normals`` is
+            ``precomputed_dts``. If omitted but ``tensor_moments`` is
             provided, they're computed here via
             ``edt_torch_with_indices``.
 
@@ -802,7 +859,7 @@ def compute_patch_labels(
     # the gather always lands on a voxel with real data and avoids
     # the "slerp from a zero vector" artifact.
     want_dir = (
-        raw_normals is not None and raw_normals.numel() > 0
+        tensor_moments is not None and tensor_moments.numel() > 0
     )
     nv_bool: Optional[torch.Tensor] = None
     if want_dir:
@@ -859,44 +916,49 @@ def compute_patch_labels(
         merge_groups = list(range(N))
 
     chains = chains_from_surface_info(surface_chain_info)
-    cos, grad_mag, valid, n_dense = derive_cos_gradmag_validity(
+    cos, grad_mag, valid, t_dense = derive_cos_gradmag_validity(
         dts, surface_masks, chains,
         fts=fts,
-        raw_normals=raw_normals if want_dir else None,
+        tensor_moments=tensor_moments if want_dir else None,
     )
 
     targets = torch.zeros(8, *shape, device=device)
     targets[0] = cos
     targets[1] = grad_mag
 
-    if want_dir and n_dense is not None:
+    if want_dir and t_dense is not None:
         # Sparse override: voxels where the dataset actually splatted
-        # a raw normal keep that hard value unchanged — they are the
+        # a tensor keep that hard value unchanged — they are the
         # "ground truth" points. Everywhere else inside the validity
-        # bracket we use the chain-adjacent slerp blend from n_dense.
+        # bracket we use the chain-adjacent linear tensor blend from
+        # ``t_dense``.
         sparse_mask = empty_normals_valid.bool()
         sparse_mask_b = sparse_mask.unsqueeze(0)
-        n_final = torch.where(sparse_mask_b, raw_normals, n_dense)
+        t_final = torch.where(sparse_mask_b, tensor_moments, t_dense)
 
-        # Encode ONCE, at the very end, into the 6-channel
-        # double-angle representation the model predicts.
-        # `encode_direction_channels` takes (nx, ny, nz) but the
-        # raw_normals tensor is stored in ZYX order.
-        nz = n_final[0]
-        ny = n_final[1]
-        nx = n_final[2]
-        targets[2:8] = encode_direction_channels(nx, ny, nz)
+        # Encode ONCE, at the very end, directly from the tensor.
+        # encode_from_tensor computes the double-angle channels
+        # from the six second-moment components without ever going
+        # through a mean-direction vector — so linear interpolation
+        # of the tensor flows straight into a smooth encoded target
+        # with no slerp singularity spikes.
+        targets[2:8] = encode_from_tensor(t_final)
 
-        # Per-plane relevance weight: the double-angle encoding is
-        # derived from the 2D projection of the normal into each
-        # slice plane, so a voxel whose normal is ~perpendicular to
-        # a given plane has a near-zero in-plane magnitude → the
-        # 2D projection (and thus the encoding) is noise. Weight
-        # each direction-pair by that in-plane projection.
+        # Per-plane relevance weight — a degenerate direction in a
+        # given slice plane has near-zero in-plane "magnitude", and
+        # the tensor gives us that magnitude directly as the sum of
+        # the two diagonal components for the plane's axis pair.
+        # ``sqrt(nx² + ny²)`` on a single unit vector equals the
+        # 2D projection magnitude; on a blended tensor it's the
+        # "mean in-plane second moment", which is the correct
+        # generalization.
         eps = 1e-6
-        w_z = torch.sqrt(nx * nx + ny * ny + eps)  # XY plane (Z-slices)
-        w_y = torch.sqrt(nx * nx + nz * nz + eps)  # XZ plane (Y-slices)
-        w_x = torch.sqrt(ny * ny + nz * nz + eps)  # YZ plane (X-slices)
+        nx2 = t_final[0]
+        ny2 = t_final[1]
+        nz2 = t_final[2]
+        w_z = torch.sqrt(nx2 + ny2 + eps)  # XY plane (Z-slices)
+        w_y = torch.sqrt(nx2 + nz2 + eps)  # XZ plane (Y-slices)
+        w_x = torch.sqrt(ny2 + nz2 + eps)  # YZ plane (X-slices)
         dir_axis_weight = torch.stack(
             [w_z, w_z, w_y, w_y, w_x, w_x], dim=0,
         )

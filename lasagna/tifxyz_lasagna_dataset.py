@@ -284,6 +284,29 @@ def _estimate_grid_normals(zyx_grid):
     return normals / norm
 
 
+def _tensor_moments_from_normals_zyx(normals_zyx: np.ndarray) -> np.ndarray:
+    """Convert ``(N, 3)`` raw ZYX normals to ``(N, 6)`` second-moment
+    tensor components ``(nx², ny², nz², nx·ny, nx·nz, ny·nz)``.
+
+    This is the sign-invariant representation of an unsigned
+    direction: ``n·nᵀ`` and ``(−n)·(−n)ᵀ`` are identical, so
+    linear averaging of these 6 components is the correct operation
+    for splat accumulation and for chain-adjacent blending.
+    Encoding via :func:`tifxyz_labels.encode_from_tensor` then
+    produces the same 6-channel direction targets as encoding each
+    normal individually — without ever needing a mean-direction
+    vector that could land on a slerp encoding singularity.
+    """
+    normals_zyx = np.asarray(normals_zyx, dtype=np.float32)
+    nz = normals_zyx[..., 0]
+    ny = normals_zyx[..., 1]
+    nx = normals_zyx[..., 2]
+    return np.stack(
+        [nx * nx, ny * ny, nz * nz, nx * ny, nx * nz, ny * nz],
+        axis=-1,
+    ).astype(np.float32)
+
+
 # ---------------------------------------------------------------------------
 # Chain building (ports dataset_rowcol_cond._build_triplet_neighbor_lookup)
 # ---------------------------------------------------------------------------
@@ -834,19 +857,29 @@ class TifxyzLasagnaDataset(Dataset):
         else:
             surface_masks_arr = np.zeros((0,) + crop_size, dtype=np.float32)
 
-        # Splat RAW normals from all surfaces combined: (3, Z, Y, X).
-        # Downstream derive_cos_gradmag_validity slerp-blends these at
-        # the chain-adjacent bracket and calls encode_direction_channels
-        # once to produce the final 6-channel targets[2:8] — this is the
-        # "one canonical representation" rule for normal supervision.
+        # Splat 6-component SECOND-MOMENT TENSOR from all surfaces
+        # combined: (6, Z, Y, X). The tensor representation
+        # N = n·nᵀ (unique components nx², ny², nz², nx·ny, nx·nz,
+        # ny·nz) is sign-invariant — opposite-signed cross-product
+        # normals at adjacent grid points produce the SAME tensor,
+        # so trilinear averaging in this space can't cancel or
+        # produce wrong directions. Downstream
+        # derive_cos_gradmag_validity linearly blends this tensor
+        # at the chain-adjacent bracket and calls encode_from_tensor
+        # once to produce the final 6-channel targets[2:8] —
+        # entirely avoiding the slerp encoding-singularity spike
+        # that linear interpolation through a "mean direction"
+        # hits at configurations where the geodesic midpoint
+        # crosses an encoding pole.
         if all_normal_points:
             pts = np.concatenate(all_normal_points, axis=0)
-            vals = np.concatenate(all_normals_zyx, axis=0)  # (N, 3) raw normals
-            raw_normals_vol, normals_valid_vol = _splat_multichannel(
-                pts, vals, crop_size, sign_align=True,
+            raw_nrm = np.concatenate(all_normals_zyx, axis=0)  # (N, 3)
+            tensor_vals = _tensor_moments_from_normals_zyx(raw_nrm)  # (N, 6)
+            tensor_moments_vol, normals_valid_vol = _splat_multichannel(
+                pts, tensor_vals, crop_size,
             )
         else:
-            raw_normals_vol = np.zeros((3,) + crop_size, dtype=np.float32)
+            tensor_moments_vol = np.zeros((6,) + crop_size, dtype=np.float32)
             normals_valid_vol = np.zeros(crop_size, dtype=np.float32)
 
         # Padding mask: where CT data actually exists (non-zero after crop)
@@ -858,14 +891,14 @@ class TifxyzLasagnaDataset(Dataset):
         ).unsqueeze(0)  # (1, Z, Y, X)
 
         surface_masks_t = torch.as_tensor(surface_masks_arr, dtype=torch.float32)
-        raw_normals_t = torch.as_tensor(raw_normals_vol, dtype=torch.float32)
+        tensor_moments_t = torch.as_tensor(tensor_moments_vol, dtype=torch.float32)
         normals_valid_t = torch.as_tensor(normals_valid_vol, dtype=torch.float32).unsqueeze(0)
         padding_mask_t = torch.as_tensor(padding_mask, dtype=torch.float32).unsqueeze(0)
 
         sample = {
             "image": vol_crop_t,                        # (1, Z, Y, X)
             "surface_masks": surface_masks_t,           # (N, Z, Y, X)
-            "raw_normals": raw_normals_t,               # (3, Z, Y, X)
+            "tensor_moments": tensor_moments_t,         # (6, Z, Y, X) — nx², ny², nz², nx·ny, nx·nz, ny·nz
             "normals_valid": normals_valid_t,           # (1, Z, Y, X)
             "num_surfaces": num_surfaces,
             "padding_mask": padding_mask_t,             # (1, Z, Y, X)
@@ -889,7 +922,7 @@ def collate_variable_surfaces(batch):
     Stacks fixed-size tensors normally, keeps surface_masks as a list.
     """
     images = torch.stack([b["image"] for b in batch])
-    raw_normals = torch.stack([b["raw_normals"] for b in batch])
+    tensor_moments = torch.stack([b["tensor_moments"] for b in batch])
     normals_valid = torch.stack([b["normals_valid"] for b in batch])
     padding_masks = torch.stack([b["padding_mask"] for b in batch])
     num_surfaces = [b["num_surfaces"] for b in batch]
@@ -900,7 +933,7 @@ def collate_variable_surfaces(batch):
     out = {
         "image": images,                        # (B, 1, Z, Y, X)
         "surface_masks": surface_masks,         # list of (Ni, Z, Y, X) tensors
-        "raw_normals": raw_normals,             # (B, 3, Z, Y, X)
+        "tensor_moments": tensor_moments,       # (B, 6, Z, Y, X)
         "normals_valid": normals_valid,         # (B, 1, Z, Y, X)
         "num_surfaces": num_surfaces,           # list of ints
         "padding_mask": padding_masks,          # (B, 1, Z, Y, X)
@@ -966,17 +999,15 @@ def _transform_geometry(geom_list, flip_z, flip_y, flip_x, k, size_zyx):
 def augment_batch_inplace(batch: dict) -> dict:
     """Apply a single shared random flip+rot90 transform to every
     patch-local field in a collated batch, then re-splat the
-    ``raw_normals`` and ``normals_valid`` volumes from the augmented
-    surface_geometry.
+    ``tensor_moments`` and ``normals_valid`` volumes from the
+    augmented surface_geometry.
 
     Raw normals are transformed coherently with the points by
     ``_transform_geometry`` (sign-flipping per axis, rotating in the
     XY plane), so re-splatting them is the correct thing to do in
-    any flip/rot frame. The 6-channel double-angle encoding is
-    derived much later, inside
-    ``tifxyz_labels.derive_cos_gradmag_validity``, AFTER
-    chain-adjacent slerp-blending — so no encoded volume needs to be
-    re-splatted here.
+    any flip/rot frame. We splat the 6-component second-moment
+    tensor (``nx², ny², nz², nx·ny, nx·nz, ny·nz``) rather than the
+    raw normals so that averaging is sign-invariant by construction.
 
     Intended to be called by the training loop before
     ``compute_batch_targets``. Val should not call this.
@@ -1010,32 +1041,58 @@ def augment_batch_inplace(batch: dict) -> dict:
     Z, Y, X = batch["image"].shape[2:]
 
     if "surface_geometry" not in batch:
-        # No geometry — can only re-splat if we have it. Fall back
-        # to a plain geometric flip of the already-splatted raw
-        # normals. Flips/rotations must also sign-flip / rotate the
-        # normal components to stay consistent with the image.
-        rn = _flip_rot(batch["raw_normals"], (2, 3, 4))
-        if flip_z:
-            rn[:, 0] = -rn[:, 0]
-        if flip_y:
-            rn[:, 1] = -rn[:, 1]
+        # No geometry — best we can do is a spatial flip/rot of the
+        # already-splatted tensor volume. Tensor components are
+        # sign-invariant, so per-axis flips only require permuting
+        # the off-diagonal components that involve a flipped axis.
+        # k=rot90 in the XY plane permutes nx² ↔ ny² and signs on
+        # off-diagonals involving X/Y. We derive it from the
+        # raw-normal transform: old (nz, ny, nx) → new
+        # (nz, -nx, ny), so:
+        #   new_nx² = ny²
+        #   new_ny² = nx²
+        #   new_nz² = nz²
+        #   new (nx·ny) = (ny)·(-nx) = -(nx·ny)
+        #   new (nx·nz) = (ny)·(nz)   =  (ny·nz)
+        #   new (ny·nz) = (-nx)·(nz)  = -(nx·nz)
+        tm = _flip_rot(batch["tensor_moments"], (2, 3, 4))
+        # Axis flips: diagonals (nx², ny², nz²) unchanged. Off-
+        # diagonals pick up a sign iff they involve exactly one
+        # flipped axis (sign flips an odd number of times).
+        sgn_xy = 1.0
+        sgn_xz = 1.0
+        sgn_yz = 1.0
         if flip_x:
-            rn[:, 2] = -rn[:, 2]
+            sgn_xy = -sgn_xy
+            sgn_xz = -sgn_xz
+        if flip_y:
+            sgn_xy = -sgn_xy
+            sgn_yz = -sgn_yz
+        if flip_z:
+            sgn_xz = -sgn_xz
+            sgn_yz = -sgn_yz
+        tm[:, 3] = tm[:, 3] * sgn_xy
+        tm[:, 4] = tm[:, 4] * sgn_xz
+        tm[:, 5] = tm[:, 5] * sgn_yz
+        # rot90 around Z, k times.
         for _ in range(k % 4):
-            # Rotate the (ny, nx) pair in the XY plane the same way
-            # _transform_geometry rotates the points (see the
-            # docstring there). new_ny = -old_nx, new_nx = old_ny.
-            ny_old = rn[:, 1].clone()
-            nx_old = rn[:, 2].clone()
-            rn[:, 1] = -nx_old
-            rn[:, 2] = ny_old
-        batch["raw_normals"] = rn
+            nx2_old = tm[:, 0].clone()
+            ny2_old = tm[:, 1].clone()
+            nxny_old = tm[:, 3].clone()
+            nxnz_old = tm[:, 4].clone()
+            nynz_old = tm[:, 5].clone()
+            tm[:, 0] = ny2_old               # new nx² = old ny²
+            tm[:, 1] = nx2_old               # new ny² = old nx²
+            tm[:, 3] = -nxny_old             # new nx·ny = -(old nx·ny)
+            tm[:, 4] = nynz_old              # new nx·nz = old ny·nz
+            tm[:, 5] = -nxnz_old             # new ny·nz = -(old nx·nz)
+        batch["tensor_moments"] = tm
         batch["normals_valid"] = _flip_rot(
             batch["normals_valid"], (2, 3, 4),
         )
         return batch
 
-    new_raw_normals = torch.zeros_like(batch["raw_normals"])
+    new_tensor = torch.zeros_like(batch["tensor_moments"])
     new_normals_valid = torch.zeros_like(batch["normals_valid"])
 
     for b in range(B):
@@ -1053,17 +1110,17 @@ def augment_batch_inplace(batch: dict) -> dict:
             continue
         all_pts = np.concatenate(pts_list, axis=0)
         all_nrm = np.concatenate(nrm_list, axis=0)  # (N, 3) raw normals
-        raw_vol, nv = _splat_multichannel(
-            all_pts, all_nrm, (int(Z), int(Y), int(X)),
-            sign_align=True,
+        tensor_vals = _tensor_moments_from_normals_zyx(all_nrm)  # (N, 6)
+        tensor_vol, nv = _splat_multichannel(
+            all_pts, tensor_vals, (int(Z), int(Y), int(X)),
         )
-        new_raw_normals[b] = torch.as_tensor(
-            raw_vol, dtype=new_raw_normals.dtype,
+        new_tensor[b] = torch.as_tensor(
+            tensor_vol, dtype=new_tensor.dtype,
         )
         new_normals_valid[b, 0] = torch.as_tensor(
             nv, dtype=new_normals_valid.dtype,
         )
 
-    batch["raw_normals"] = new_raw_normals
+    batch["tensor_moments"] = new_tensor
     batch["normals_valid"] = new_normals_valid
     return batch

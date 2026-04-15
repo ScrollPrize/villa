@@ -5,11 +5,13 @@ calls ``dataset[idx]`` and ``compute_batch_targets`` exactly the way the
 training loop does, then renders the resulting tensors. That means:
 
 - The voxelized surface masks you see are the tensors the UNet is fed.
-- The normal arrows are drawn from the raw normals the dataset splats
-  into the ``raw_normals`` tensor (exposed via ``include_geometry=True``).
-  The 6-channel double-angle encoding is derived downstream inside
-  ``tifxyz_labels.compute_patch_labels`` — the vis pulls it from the
-  post-compute ``targets[2:8]``, which is exactly what the loss sees.
+- The normal arrows are drawn from the raw normals stored in the
+  per-sample ``surface_geometry`` list (exposed via
+  ``include_geometry=True``). The direction-channel encoding itself
+  is derived downstream inside ``tifxyz_labels.compute_patch_labels``
+  via tensor-moment blending + ``encode_from_tensor`` — the vis
+  pulls the 6-channel target from the post-compute ``targets[2:8]``,
+  which is exactly what the loss sees.
 - The per-surface chain labels are the ``surface_chain_info`` metadata the
   loss sees.
 - cos / grad_mag / validity come from ``train_tifxyz.compute_batch_targets``.
@@ -235,7 +237,7 @@ def _sample_from_batch(batch: dict) -> dict:
     return {
         "image": batch["image"][0],
         "surface_masks": batch["surface_masks"][0],
-        "raw_normals": batch["raw_normals"][0],
+        "tensor_moments": batch["tensor_moments"][0],
         "normals_valid": batch["normals_valid"][0],
         "num_surfaces": batch["num_surfaces"][0],
         "padding_mask": batch["padding_mask"][0],
@@ -1042,23 +1044,23 @@ def _render_sample_figure(
     # The dataset now carries raw normals (3, Z, Y, X) rather than
     # a pre-encoded 6-channel ``direction_channels`` — the
     # double-angle encoding is derived inside compute_patch_labels
-    # after slerp-blending at the chain-adjacent bracket.
+    # via tensor-moment linear blending + ``encode_from_tensor`` at
+    # the chain-adjacent bracket.
     # For the vis panels we prefer the post-compute encoded targets
     # (what the loss sees), which are already inside
     # ``training_output["targets"][2:8]``. Without training_output
-    # (e.g. non-CUDA path) fall back to encoding the sparse raw
+    # (e.g. non-CUDA path) fall back to encoding the sparse tensor
     # splat directly.
     direction_channels_full = None
     if training_output is not None:
         direction_channels_full = training_output["targets"][2:8]
     else:
-        raw_normals_full = sample.get("raw_normals")
-        if raw_normals_full is not None:
+        tm_full = sample.get("tensor_moments")
+        if tm_full is not None:
             import torch as _t
-            from tifxyz_labels import encode_direction_channels as _enc
-            rn_t = _t.as_tensor(raw_normals_full, dtype=_t.float32)
-            nz, ny, nx = rn_t[0], rn_t[1], rn_t[2]
-            direction_channels_full = _enc(nx, ny, nz).numpy()
+            from tifxyz_labels import encode_from_tensor as _enc_from_t
+            tm_t = _t.as_tensor(tm_full, dtype=_t.float32)
+            direction_channels_full = _enc_from_t(tm_t).numpy()
 
     # Renderer always draws at the dataset patch size (vis_size).
     # Pred and residuals come from inference_output at potentially

@@ -169,7 +169,7 @@ def compute_batch_targets(
     B = batch["image"].shape[0]
     surface_masks_list = batch["surface_masks"]  # list of (Ni, Z, Y, X)
     surface_chain_info_batch = batch["surface_chain_info"]  # list[list[dict]]
-    raw_normals_batch = batch["raw_normals"].to(device)  # (B, 3, Z, Y, X)
+    tensor_moments_batch = batch["tensor_moments"].to(device)  # (B, 6, Z, Y, X)
     normals_valid_batch = batch["normals_valid"].to(device)  # (B, 1, Z, Y, X)
 
     spatial_shape = batch["image"].shape[2:]  # (Z, Y, X)
@@ -192,8 +192,8 @@ def compute_batch_targets(
         N = masks_b.shape[0]
         cuda_masks = [masks_b[i] > 0.5 for i in range(N)]
 
-        # Raw normals + splat validity for this sample
-        raw_n = raw_normals_batch[b]  # (3, Z, Y, X)
+        # Tensor moments + splat validity for this sample
+        tm = tensor_moments_batch[b]  # (6, Z, Y, X)
         nv = normals_valid_batch[b, 0] > 0.5  # (Z, Y, X)
 
         chain_info_b = surface_chain_info_batch[b]
@@ -215,11 +215,9 @@ def compute_batch_targets(
             #   routing and same-surface detection (distance fields
             #   unchanged from before).
             # - ``fts`` are from ``~(surface_mask & normals_valid)`` —
-            #   used only for the slerp gather, so the feature
-            #   transform always lands on a voxel with splatted raw
-            #   normals. Surface-mask voxels that the trilinear splat
-            #   didn't reach would otherwise produce (0, 0, 0)
-            #   gathers and slerp garbage.
+            #   used only for the tensor gather, so the feature
+            #   transform always lands on a voxel that actually
+            #   carries splatted tensor moments.
             dts = []
             fts = []
             for m in cuda_masks:
@@ -235,7 +233,7 @@ def compute_batch_targets(
         # Compute labels on GPU using the patch's externally-built chains.
         result = compute_patch_labels(
             surface_masks=cuda_masks,
-            raw_normals=raw_n,
+            tensor_moments=tm,
             normals_valid=nv,
             surface_chain_info=chain_info_b,
             device=device,
