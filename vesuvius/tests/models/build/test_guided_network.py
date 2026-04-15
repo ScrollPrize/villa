@@ -186,6 +186,24 @@ def test_guided_network_forward_shapes_and_aux_outputs(tmp_path: Path, basic_enc
     assert aux["guide_mask"].shape == (2, 1, 2, 2, 2)
 
 
+def test_guided_network_forward_works_with_trainable_guide_backbone(tmp_path: Path):
+    checkpoint_path = tmp_path / "guide_backbone.pt"
+    _write_local_guide_checkpoint(checkpoint_path)
+    mgr = _make_mgr(checkpoint_path, basic_encoder_block="ConvBlock")
+    mgr.model_config["guide_freeze"] = False
+    model = NetworkFromConfig(mgr)
+    x = torch.randn(2, 1, 16, 16, 16)
+
+    outputs = model(x)
+    outputs_with_aux, aux = model(x, return_aux=True)
+
+    assert set(outputs.keys()) == {"ink"}
+    assert outputs["ink"].shape == (2, 1, 16, 16, 16)
+    assert set(outputs_with_aux.keys()) == {"ink"}
+    assert aux["guide_mask"].shape == (2, 1, 2, 2, 2)
+    assert any(parameter.requires_grad for parameter in model.guide_backbone.parameters())
+
+
 @pytest.mark.parametrize("basic_encoder_block", ["ConvBlock", "BasicBlockD"])
 def test_feature_encoder_guidance_returns_encoder_stage_aux_outputs(tmp_path: Path, basic_encoder_block: str):
     checkpoint_path = tmp_path / "guide_backbone.pt"

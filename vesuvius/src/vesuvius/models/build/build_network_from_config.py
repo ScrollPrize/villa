@@ -980,7 +980,7 @@ class NetworkFromConfig(nn.Module):
         if self.guide_freeze:
             with torch.inference_mode():
                 frozen_features = self.guide_backbone(x)[0]
-        return frozen_features.clone()
+            return frozen_features.clone()
         return self.guide_backbone(x)[0]
 
     def _build_direct_segmentation_outputs(self, x):
