@@ -595,6 +595,7 @@ def apply_same_surface_merge(
     surface_chain_info: list[dict],
     groups: list[list[int]],
     fts: Optional[list[torch.Tensor]] = None,
+    normals_valid: Optional[torch.Tensor] = None,
 ) -> tuple[
     list[torch.Tensor],
     list[torch.Tensor],
@@ -621,6 +622,12 @@ def apply_same_surface_merge(
     When ``fts`` is provided, each merged group's feature transform
     is recomputed from the merged mask via ``edt_torch_with_indices``
     so the nearest-on-wrap lookup is exact for the unioned surface.
+    If ``normals_valid`` is also supplied, the feature transform is
+    computed from ``~(merged_mask & normals_valid)`` instead — this
+    ensures the slerp gather in ``derive_cos_gradmag_validity``
+    always lands on a voxel that actually carries splatted raw
+    normals (surface-mask voxels outside the splat footprint would
+    otherwise produce (0, 0, 0) gathers and slerp garbage).
     """
     N = sum(len(g) for g in groups)
     merge_groups = [0] * N
@@ -655,9 +662,14 @@ def apply_same_surface_merge(
         merged_dts.append(d)
         merged_info.append(info)
         if merged_fts is not None:
-            # Recompute the feature transform from the merged mask
-            # so nearest-on-wrap lookups are exact for the union.
-            _, merged_ft = edt_torch_with_indices((~m).to(torch.uint8))
+            # Recompute the feature transform from the merged mask,
+            # intersected with normals_valid when available so the
+            # gather always lands on splatted voxels.
+            if normals_valid is not None:
+                ft_src = m & normals_valid
+            else:
+                ft_src = m
+            _, merged_ft = edt_torch_with_indices((~ft_src).to(torch.uint8))
             merged_fts.append(merged_ft)
     return merged_dts, merged_masks, merged_info, merge_groups, merged_fts
 
@@ -779,12 +791,31 @@ def compute_patch_labels(
 
     # EDT of complement for each surface — reuse precomputed if caller
     # already ran them (e.g. compute_batch_targets does detection).
-    # We also need per-wrap feature transforms for the direction
-    # blend; compute them jointly with the dts via the _with_indices
-    # helper so CuPy only does one pass.
+    # ``dts`` are always built from ``~surface_mask`` so cos routing +
+    # same-surface detection see the same distance fields they always
+    # did. But the feature transforms ``fts`` used for the slerp
+    # gather must point to voxels that actually carry splatted raw
+    # normals — ``surface_masks`` and ``normals_valid`` are built by
+    # different rasterizers (line-drawing vs trilinear splat), so
+    # there can be surface-mask voxels where the splat never landed.
+    # Computing fts from ``~(surface_mask & normals_valid)`` ensures
+    # the gather always lands on a voxel with real data and avoids
+    # the "slerp from a zero vector" artifact.
     want_dir = (
         raw_normals is not None and raw_normals.numel() > 0
     )
+    nv_bool: Optional[torch.Tensor] = None
+    if want_dir:
+        nv_bool = empty_normals_valid.bool()
+
+    def _ft_src(mask: torch.Tensor) -> torch.Tensor:
+        # Source set for the feature transform: intersect the
+        # voxelized surface mask with the splat validity so the
+        # nearest-on-wrap lookup always hits a splatted voxel.
+        if nv_bool is not None:
+            return (mask & nv_bool)
+        return mask
+
     if precomputed_dts is not None:
         assert len(precomputed_dts) == N, (
             "precomputed_dts must be aligned with surface_masks"
@@ -797,10 +828,11 @@ def compute_patch_labels(
             fts: Optional[list[torch.Tensor]] = list(precomputed_fts)
         elif want_dir:
             # Caller gave us dts but not fts — backfill the feature
-            # transforms. Rare path; cheap for the handful of wraps
-            # per patch.
+            # transforms from the splat-intersected source set.
             fts = [
-                edt_torch_with_indices((~mask).to(torch.uint8))[1]
+                edt_torch_with_indices(
+                    (~_ft_src(mask)).to(torch.uint8),
+                )[1]
                 for mask in surface_masks
             ]
         else:
@@ -809,19 +841,19 @@ def compute_patch_labels(
         dts = []
         fts = [] if want_dir else None
         for mask in surface_masks:
-            complement = (~mask).to(torch.uint8)
+            dts.append(edt_torch((~mask).to(torch.uint8)))
             if want_dir:
-                d, ft = edt_torch_with_indices(complement)
-                dts.append(d)
+                _, ft = edt_torch_with_indices(
+                    (~_ft_src(mask)).to(torch.uint8),
+                )
                 fts.append(ft)
-            else:
-                dts.append(edt_torch(complement))
 
     if same_surface_groups is not None and N >= 2:
         dts, surface_masks, surface_chain_info, merge_groups, fts = \
             apply_same_surface_merge(
                 dts, surface_masks, surface_chain_info, same_surface_groups,
                 fts=fts,
+                normals_valid=nv_bool,
             )
     else:
         merge_groups = list(range(N))

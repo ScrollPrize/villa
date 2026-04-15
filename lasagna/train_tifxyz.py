@@ -182,7 +182,9 @@ def compute_batch_targets(
     merged_masks_batch: list[list[torch.Tensor]] = []
     merged_chain_info_batch: list[list[dict]] = []
 
-    from tifxyz_labels import edt_torch_with_indices, detect_same_surface_groups
+    from tifxyz_labels import (
+        edt_torch, edt_torch_with_indices, detect_same_surface_groups,
+    )
 
     for b in range(B):
         # Convert surface masks to CUDA bool tensors
@@ -208,14 +210,22 @@ def compute_batch_targets(
             groups = explicit_groups
         elif same_surface_threshold is not None and N >= 2:
             # Detect here so compute_patch_labels doesn't duplicate
-            # EDT work. Use the joint _with_indices variant so we get
-            # the feature transforms needed by the slerp blend in the
-            # same cupy pass.
+            # EDT work.
+            # - ``dts`` are from ``~surface_mask`` — used for cos
+            #   routing and same-surface detection (distance fields
+            #   unchanged from before).
+            # - ``fts`` are from ``~(surface_mask & normals_valid)`` —
+            #   used only for the slerp gather, so the feature
+            #   transform always lands on a voxel with splatted raw
+            #   normals. Surface-mask voxels that the trilinear splat
+            #   didn't reach would otherwise produce (0, 0, 0)
+            #   gathers and slerp garbage.
             dts = []
             fts = []
             for m in cuda_masks:
-                d, ft = edt_torch_with_indices((~m).to(torch.uint8))
-                dts.append(d)
+                dts.append(edt_torch((~m).to(torch.uint8)))
+                ft_src = m & nv
+                _, ft = edt_torch_with_indices((~ft_src).to(torch.uint8))
                 fts.append(ft)
             groups = detect_same_surface_groups(
                 dts, cuda_masks, chain_info_b,
