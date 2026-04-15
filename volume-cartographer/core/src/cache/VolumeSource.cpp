@@ -194,9 +194,23 @@ int HttpSource::totalChunksPerShard() const noexcept
     return chunksPerShard_[0] * chunksPerShard_[1] * chunksPerShard_[2];
 }
 
+namespace {
+thread_local bool tl_last_was_absent = false;
+}
+
+bool HttpSource::lastFetchWasAbsent() noexcept
+{
+    return tl_last_was_absent;
+}
+
 std::vector<uint8_t> HttpSource::httpGet(const std::string& url)
 {
     auto resp = client_->get(url);
+    // Per-thread "this object is genuinely absent" signal: true on real
+    // 404, false on success or any transient/auth error. fetchFromShard
+    // also flips it on after seeing a missing/zero-placeholder index entry
+    // inside a successfully-downloaded shard.
+    tl_last_was_absent = (resp.status_code == 404);
     if (!resp.ok()) {
         // 404 is an expected "chunk doesn't exist" response — stay quiet.
         // Anything else (403/401/5xx) almost always means auth or network
@@ -276,9 +290,15 @@ std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
     auto index = utils::detail::ShardIndex::deserialize(shardBytes, size_t(nChunks));
     const auto& entry = index.entries[inner];
 
-    if (entry.is_missing()) return {};
-    // Zero-chunk placeholder sentinel (offset = ~0ull - 1, nbytes = 0).
-    if (entry.offset == (~uint64_t(0) - 1) && entry.nbytes == 0) return {};
+    // Both forms of "this inner chunk is genuinely absent" inside an
+    // existing shard: the missing-sentinel (~0,~0) and the zero-data
+    // placeholder (~0-1, 0). Flag it so the caller knows it's safe to
+    // negative-cache (vs. a transient failure from the shard download).
+    if (entry.is_missing()
+        || (entry.offset == (~uint64_t(0) - 1) && entry.nbytes == 0)) {
+        tl_last_was_absent = true;
+        return {};
+    }
     if (entry.offset + entry.nbytes > shardData->size()) return {};
 
     return {shardData->data() + entry.offset,

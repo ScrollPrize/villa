@@ -94,6 +94,16 @@ public:
         return transientError_.load(std::memory_order_relaxed);
     }
 
+    // Per-thread "this chunk is genuinely absent on the source" signal,
+    // set by the most recent fetch on this thread. True iff EITHER:
+    //   - the HTTP GET returned 404, OR
+    //   - the source is a sharded v3 zarr and the per-shard index entry
+    //     for this inner chunk is the all-FF "missing" sentinel or the
+    //     (0xFF...FE, 0) zero-data placeholder.
+    // Cleared on any successful fetch and on transient/auth/curl errors.
+    // The negative cache should ONLY be poisoned when this is true.
+    [[nodiscard]] static bool lastFetchWasAbsent() noexcept;
+
 private:
     std::string chunkUrl(const ChunkKey& key) const;
     std::string shardUrl(const ChunkKey& key) const;

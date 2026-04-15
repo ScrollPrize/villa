@@ -273,8 +273,13 @@ BlockPipeline::BlockPipeline(
         // overall work compared to x265 encode, which is now off-thread.
         auto decoded = assembleCanonicalChunk(key);
         if (!decoded) {
-            auto* http = dynamic_cast<HttpSource*>(source_.get());
-            if (!http || !http->hadTransientError()) {
+            // Negative-cache *only* when the source confirms the chunk is
+            // genuinely absent — a real S3 404, or a sharded v3 missing/
+            // zero-placeholder index entry. Transient errors / curl
+            // failures / auth issues must not poison the cache.
+            const bool isHttp = dynamic_cast<HttpSource*>(source_.get()) != nullptr;
+            const bool absent = !isHttp || HttpSource::lastFetchWasAbsent();
+            if (absent) {
                 bloomAdd(key);
                 std::lock_guard lock(negativeMutex_);
                 negativeCache_.insert(key);
@@ -408,9 +413,15 @@ BlockPipeline::BlockPipeline(
             std::vector<uint8_t> compressed;
             try { compressed = source_->fetch(key); } catch (...) { return {}; }
             if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) {
-                bloomAdd(key);
-                std::lock_guard lock(negativeMutex_);
-                negativeCache_.insert(key);
+                // Same rule as the downloader: only poison the negative
+                // cache when the source confirms genuine absence.
+                const bool isHttp = dynamic_cast<HttpSource*>(source_.get()) != nullptr;
+                const bool absent = !isHttp || HttpSource::lastFetchWasAbsent();
+                if (absent) {
+                    bloomAdd(key);
+                    std::lock_guard lock(negativeMutex_);
+                    negativeCache_.insert(key);
+                }
                 return {};
             }
             statColdHits_.fetch_add(1, std::memory_order_relaxed);
@@ -485,8 +496,9 @@ BlockPipeline::BlockPipeline(
                 try { bytes = source_->fetch(key); }
                 catch (...) { return {}; }
                 if (bytes.empty()) {
-                    auto* http = dynamic_cast<HttpSource*>(source_.get());
-                    if (!http || !http->hadTransientError()) {
+                    // Negative-cache only on confirmed source-side absence
+                    // (real 404 or sharded-v3 missing/zero placeholder).
+                    if (HttpSource::lastFetchWasAbsent()) {
                         bloomAdd(key);
                         std::lock_guard lock(negativeMutex_);
                         negativeCache_.insert(key);

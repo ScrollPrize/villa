@@ -10,6 +10,9 @@
 #include "vc/core/render/PostProcess.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/types/SampleParams.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
+#include "vc/core/cache/ChunkKey.hpp"
+#include <unordered_set>
 
 #include <opencv2/imgproc.hpp>
 
@@ -344,14 +347,15 @@ void CAdaptiveVolumeViewer::submitRender()
     int fbH = _framebuffer.height();
     if (fbW <= 0 || fbH <= 0) return;
 
-    if (highlightDownscaled) {
-        if (_levelBuffer.rows != fbH || _levelBuffer.cols != fbW) {
-            _levelBuffer.create(fbH, fbW);
-        }
-        _levelBuffer.setTo(0);
+    // Always populate the level buffer — the debug overlay is optional, but
+    // we need the per-pixel fallback depth to enqueue the missing high-res
+    // chunks below regardless of whether the overlay is shown.
+    if (_levelBuffer.rows != fbH || _levelBuffer.cols != fbW) {
+        _levelBuffer.create(fbH, fbW);
     }
-    uint8_t* lvlOutPtr = highlightDownscaled ? _levelBuffer.ptr<uint8_t>(0) : nullptr;
-    const int lvlOutStride = highlightDownscaled ? int(_levelBuffer.step1()) : 0;
+    _levelBuffer.setTo(0);
+    uint8_t* lvlOutPtr = _levelBuffer.ptr<uint8_t>(0);
+    const int lvlOutStride = int(_levelBuffer.step1());
 
     auto* fbBits = reinterpret_cast<uint32_t*>(_framebuffer.bits());
     int fbStride = _framebuffer.bytesPerLine() / 4;
