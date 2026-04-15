@@ -20,6 +20,7 @@
 #include "VolumeSource.hpp"
 #include "IOPool.hpp"
 #include <utils/zarr.hpp>
+#include <utils/video_codec.hpp>
 
 namespace vc { class VcDataset; }
 
@@ -43,6 +44,21 @@ public:
         std::string volumeId;
         // Defaults to hardware_concurrency(); see constructor.
         int ioThreads = 0;
+        // H.265 encode parameters used when re-encoding non-canonical source
+        // chunks into the canonical disk cache. depth/height/width are filled
+        // in per-chunk; qp/air_clamp/shift_n carry the configured values.
+        // Default qp=36 matches the historical hard-coded value.
+        utils::VideoCodecParams encodeParams = {.qp = 36};
+
+        // When non-zero, declares the source is byte-identical to our local
+        // canonical disk format: zarr v3, sharded with these dims, 128^3
+        // inner H.265 chunks. The downloader then bypasses the encoder
+        // entirely — fetchWholeShard from source, write the bytes verbatim
+        // to disk, forward chunk keys directly to the loader. Skipping the
+        // decode→re-encode round trip is the whole point.
+        // Local shard shape (currently 1024^3) MUST match this for the
+        // byte-passthrough to be valid.
+        std::array<int, 3> canonicalSourceShard = {0, 0, 0};
     };
 
     BlockPipeline(

@@ -222,6 +222,42 @@ public:
     {
     }
 
+    // Flip the process-global abort flag. Any in-flight curl_easy_perform
+    // returns CURLE_ABORTED_BY_CALLBACK on the next progress tick (sub-
+    // millisecond on an active socket) and pending retries bail. Use to
+    // make app shutdown effectively instantaneous regardless of S3 timeout.
+    static void abortAll() noexcept
+    {
+        abort_flag().store(true, std::memory_order_release);
+    }
+
+    // Reset the abort flag (e.g. for tests that re-use the process).
+    static void resetAbort() noexcept
+    {
+        abort_flag().store(false, std::memory_order_release);
+    }
+
+    [[nodiscard]] static bool isAborted() noexcept
+    {
+        return abort_flag().load(std::memory_order_acquire);
+    }
+
+private:
+    static std::atomic<bool>& abort_flag() noexcept
+    {
+        static std::atomic<bool> flag{false};
+        return flag;
+    }
+
+    static int xferinfo_callback(void* /*clientp*/,
+                                 curl_off_t, curl_off_t,
+                                 curl_off_t, curl_off_t) noexcept
+    {
+        return abort_flag().load(std::memory_order_acquire) ? 1 : 0;
+    }
+
+public:
+
     // GET request
     [[nodiscard]] HttpResponse get(std::string_view url) const {
         return perform(url, Method::GET, {}, {});
@@ -282,6 +318,8 @@ public:
             curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp.body);
             curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
             curl_easy_setopt(curl, CURLOPT_HEADERDATA, &resp);
+            curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+            curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferinfo_callback);
 
             auto auth_state = apply_auth(curl);
 
@@ -478,6 +516,7 @@ private:
         HttpResponse resp;
 
         for (std::size_t attempt = 0; attempt <= config_.max_retries; ++attempt) {
+            if (isAborted()) return resp;
             resp = HttpResponse{};
             auto* curl = thread_handle();
             curl_easy_reset(curl);
@@ -499,6 +538,12 @@ private:
 
             // User agent
             curl_easy_setopt(curl, CURLOPT_USERAGENT, config_.user_agent.c_str());
+
+            // Process-wide abort hook — returning non-zero from the xfer
+            // callback aborts the transfer immediately. Used for fast
+            // shutdown so the worker pool isn't stuck inside curl.
+            curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+            curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferinfo_callback);
 
             // Write callback (body)
             curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
@@ -578,13 +623,14 @@ private:
             }
 
             // Retry on network / transient curl errors
-            if (attempt < config_.max_retries) {
+            if (attempt < config_.max_retries && !isAborted()) {
                 thread_local std::mt19937 rng{std::random_device{}()};
                 std::uniform_int_distribution<unsigned> jitter(0, 100);
                 std::this_thread::sleep_for(
                     std::chrono::milliseconds(200 * (1u << attempt) + jitter(rng)));
                 continue;
             }
+            break;
         }
 
         return resp; // return last response even on failure

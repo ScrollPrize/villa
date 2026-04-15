@@ -334,6 +334,36 @@ static std::optional<RemoteZarrInfo> tryLoadCachedMetadata(
         } catch (...) {}
     }
 
+    // Recover the source's shard config from the cached level-0 zarr.json
+    // if present. Without this, HttpSource stays in non-sharded mode on
+    // every vc3d run after the first and tries to fetch chunks via the
+    // wrong URL pattern (chunkUrl instead of shardUrl).
+    ShardConfig shardConfig;
+    auto level0ZarrJson = stagingDir / "0" / "zarr.json";
+    if (fs::exists(level0ZarrJson)) {
+        try {
+            auto json = readFile(level0ZarrJson);
+            auto meta = utils::detail::parse_zarr_json(json);
+            if (meta.shard_config && meta.chunks.size() >= 3) {
+                shardConfig.enabled = true;
+                shardConfig.shardShape = {
+                    int(meta.chunks[0]), int(meta.chunks[1]), int(meta.chunks[2])
+                };
+                if (auto* log = cacheDebugLog())
+                    std::fprintf(log,
+                        "[REMOTE] Recovered shard config from cached zarr.json: shape=[%d, %d, %d]\n",
+                        shardConfig.shardShape[0],
+                        shardConfig.shardShape[1],
+                        shardConfig.shardShape[2]);
+            }
+        } catch (const std::exception& e) {
+            if (auto* log = cacheDebugLog())
+                std::fprintf(log,
+                    "[REMOTE] Failed to recover shard config from cached zarr.json: %s\n",
+                    e.what());
+        }
+    }
+
     if (auto* log = cacheDebugLog())
         std::fprintf(log, "[REMOTE] Using cached metadata from %s (%d levels)\n",
                      stagingDir.c_str(), numLevels);
@@ -342,7 +372,8 @@ static std::optional<RemoteZarrInfo> tryLoadCachedMetadata(
         .url = baseUrl,
         .stagingDir = stagingDir,
         .delimiter = delimiter,
-        .numLevels = numLevels
+        .numLevels = numLevels,
+        .shardConfig = shardConfig
     };
 }
 

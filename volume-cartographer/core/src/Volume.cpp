@@ -371,6 +371,39 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache(
     vc::cache::BlockPipeline::Config config;
     config.volumeId = id();
     config.bytes = cacheBudgetHot_;
+    config.encodeParams = encodeParams_;
+
+    // Canonical-passthrough detection. Remote sources whose shard layout
+    // matches our local cache (zarr v3, sharded, 128^3 inner H.265 chunks,
+    // 1024^3 shards) get whole-shard byte-passthrough — one HTTP request +
+    // one disk write per source shard instead of decoding and re-encoding
+    // 512 inner chunks. We probe level 0 zarr.json directly because the
+    // remoteShardConfig from NewFromUrl isn't always populated.
+    if (isRemote_) {
+        try {
+            auto resolved = vc::resolveRemoteUrl(remoteUrl_);
+            const std::string base = resolved.httpsUrl
+                + (resolved.httpsUrl.back() == '/' ? "" : "/");
+            auto json = vc::cache::httpGetString(base + "0/zarr.json", remoteAuth_);
+            if (!json.empty()) {
+                auto meta = utils::detail::parse_zarr_json(json);
+                if (utils::is_canonical_vc3d(meta)
+                    && meta.chunks.size() >= 3
+                    && meta.chunks[0] == 1024
+                    && meta.chunks[1] == 1024
+                    && meta.chunks[2] == 1024) {
+                    config.canonicalSourceShard = {1024, 1024, 1024};
+                    fprintf(stderr,
+                        "[Volume] canonical-passthrough enabled (source "
+                        "shards 1024x1024x1024 match local)\n");
+                }
+            }
+        } catch (const std::exception& e) {
+            fprintf(stderr,
+                "[Volume] canonical-passthrough detection failed: %s\n",
+                e.what());
+        }
+    }
     if (isRemote_ || mountInfo_.type == vc::FilesystemType::NetworkMount) {
         if (ioThreads_ > 0) {
             config.ioThreads = ioThreads_;
@@ -430,6 +463,16 @@ void Volume::setDiskCacheMaxBytes(size_t bytes)
 void Volume::setIOThreads(int count)
 {
     ioThreads_ = count;
+}
+
+void Volume::setEncodeParams(const utils::VideoCodecParams& params)
+{
+    if (tieredCache_) {
+        fprintf(stderr, "[Volume] WARNING: setEncodeParams() called after cache "
+                        "already created — ignoring\n");
+        return;
+    }
+    encodeParams_ = params;
 }
 
 // ============================================================================

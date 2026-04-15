@@ -94,31 +94,33 @@ void dumpOnce(ViewerManager* viewerManager, CState* state)
     const std::size_t surfaceBytes = estimateLoadedSurfaceBytes(state);
 
 #if defined(VC_HAVE_MIMALLOC)
-    std::fprintf(stderr,
-        "[RAM] rss=%ldMB hwm=%ldMB swap=%ldMB"
-        " | blocks=%zuMB | spi=%zu_patches/%zu_surfs | surface_points=%zuMB\n",
-        ps.vmRssKB / 1024,
-        ps.vmHwmKB / 1024,
-        ps.vmSwapKB / 1024,
-        blockBytes / (1024*1024),
-        patchCount,
-        surfaceCount,
-        surfaceBytes / (1024*1024));
+    // std::fprintf(stderr,
+    //     "[RAM] rss=%ldMB hwm=%ldMB swap=%ldMB"
+    //     " | blocks=%zuMB | spi=%zu_patches/%zu_surfs | surface_points=%zuMB\n",
+    //     ps.vmRssKB / 1024,
+    //     ps.vmHwmKB / 1024,
+    //     ps.vmSwapKB / 1024,
+    //     blockBytes / (1024*1024),
+    //     patchCount,
+    //     surfaceCount,
+    //     surfaceBytes / (1024*1024));
 #else
-    std::fprintf(stderr,
-        "[RAM] rss=%ldMB hwm=%ldMB swap=%ldMB | malloc:in_use=%zuMB free=%zuMB mmap=%zuMB"
-        " | blocks=%zuMB | spi=%zu_patches/%zu_surfs | surface_points=%zuMB\n",
-        ps.vmRssKB / 1024,
-        ps.vmHwmKB / 1024,
-        ps.vmSwapKB / 1024,
-        std::size_t(mi.uordblks) / (1024*1024),
-        std::size_t(mi.fordblks) / (1024*1024),
-        std::size_t(mi.hblkhd) / (1024*1024),
-        blockBytes / (1024*1024),
-        patchCount,
-        surfaceCount,
-        surfaceBytes / (1024*1024));
+    // std::fprintf(stderr,
+    //     "[RAM] rss=%ldMB hwm=%ldMB swap=%ldMB | malloc:in_use=%zuMB free=%zuMB mmap=%zuMB"
+    //     " | blocks=%zuMB | spi=%zu_patches/%zu_surfs | surface_points=%zuMB\n",
+    //     ps.vmRssKB / 1024,
+    //     ps.vmHwmKB / 1024,
+    //     ps.vmSwapKB / 1024,
+    //     std::size_t(mi.uordblks) / (1024*1024),
+    //     std::size_t(mi.fordblks) / (1024*1024),
+    //     std::size_t(mi.hblkhd) / (1024*1024),
+    //     blockBytes / (1024*1024),
+    //     patchCount,
+    //     surfaceCount,
+    //     surfaceBytes / (1024*1024));
 #endif
+    (void)ps; (void)mi; (void)blockBytes; (void)patchCount;
+    (void)surfaceCount; (void)surfaceBytes;
 }
 
 }  // namespace vc3d::ramstats

@@ -15,6 +15,7 @@
 #include "vc/core/types/SampleParams.hpp"
 #include "vc/core/cache/HttpMetadataFetcher.hpp"  // HttpAuth
 #include "vc/core/util/NetworkFilesystem.hpp"
+#include "utils/video_codec.hpp"
 
 // Forward declarations
 namespace vc { class VcDataset; }
@@ -62,6 +63,8 @@ public:
     [[nodiscard]] std::string name() const;
     [[nodiscard]] const std::string& remoteUrl() const noexcept { return remoteUrl_; }
     [[nodiscard]] const vc::cache::HttpAuth& remoteAuth() const noexcept { return remoteAuth_; }
+    [[nodiscard]] const std::string& remoteDelimiter() const noexcept { return remoteDelimiter_; }
+    [[nodiscard]] const vc::cache::ShardConfig& remoteShardConfig() const noexcept { return remoteShardConfig_; }
     [[nodiscard]] std::filesystem::path path() const noexcept { return path_; }
 
     [[nodiscard]] int sliceWidth() const noexcept;
@@ -98,6 +101,11 @@ public:
     // Set the number of background IO threads for chunk fetching.
     // Must be called before first tieredCache() access.
     void setIOThreads(int count);
+
+    // Override the H.265 encode params used when re-encoding non-canonical
+    // source chunks into the canonical disk cache. depth/height/width are
+    // ignored (filled per chunk). Must be called before first tieredCache().
+    void setEncodeParams(const utils::VideoCodecParams& params);
 
     // --- Sampling API ---
 
@@ -178,6 +186,7 @@ protected:
     size_t diskCacheMaxBytes_ = 100ULL << 30; // 100 GB default
     std::shared_ptr<utils::ZarrArray> pendingDiskZarr_;
     int ioThreads_ = 0;  // 0 = use default
+    utils::VideoCodecParams encodeParams_ = {.qp = 36};
 
     void ensureTieredCache() const;
 

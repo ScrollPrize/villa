@@ -457,6 +457,23 @@ struct ZarrMetadata {
     }
 };
 
+/// Structural check: zarr v3, sharded, with 128^3 inner chunks. A true return
+/// here means the layout matches our canonical disk-cache format, but does NOT
+/// guarantee the inner bytes are VC3D/H.265 — only a runtime magic check on a
+/// fetched inner chunk can confirm that.
+[[nodiscard]] inline bool is_canonical_vc3d(const ZarrMetadata& m) noexcept {
+    if (m.version != ZarrVersion::v3) return false;
+    if (!m.shard_config) return false;
+    const auto& sc = *m.shard_config;
+    if (sc.sub_chunks.size() < 3) return false;
+    if (sc.sub_chunks[0] != 128 || sc.sub_chunks[1] != 128 || sc.sub_chunks[2] != 128)
+        return false;
+    if (m.chunks.size() < 3) return false;
+    for (int d = 0; d < 3; ++d) if (m.chunks[d] % 128 != 0) return false;
+    if (m.dtype != ZarrDtype::uint8) return false;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Store abstraction
 // ---------------------------------------------------------------------------
