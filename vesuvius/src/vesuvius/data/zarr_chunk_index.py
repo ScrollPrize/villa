@@ -21,6 +21,9 @@ from typing import Optional, Tuple
 
 import fsspec
 import numpy as np
+from tqdm.auto import tqdm
+
+from vesuvius.utils.k8s import get_tqdm_kwargs
 
 
 SIDECAR_NAME = ".chunk_occupancy.npz"
@@ -85,8 +88,16 @@ def _deserialize_bitmap(blob: bytes, expected_sig: str, expected_grid: Tuple[int
     return bitmap.astype(bool, copy=False)
 
 
-def _load_cached(array_url: str, sig: str, expected_grid: Tuple[int, ...]) -> Optional[np.ndarray]:
-    """Try sidecar next to the array first (shared across partitions), then local cache."""
+def _load_cached(
+    array_url: str, sig: str, expected_grid: Tuple[int, ...]
+) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    """Try sidecar next to the array first (shared across partitions), then local cache.
+
+    Returns (bitmap, source) where `source` is one of:
+      - "sidecar:<url>"  sidecar file next to the zarr array
+      - "local:<path>"   per-host local fallback cache
+      - None             no cache hit (bitmap is also None)
+    """
     sidecar = _sidecar_url(array_url)
     try:
         if array_url.startswith("s3://"):
@@ -97,14 +108,14 @@ def _load_cached(array_url: str, sig: str, expected_grid: Tuple[int, ...]) -> Op
                     blob = f.read()
                 bitmap = _deserialize_bitmap(blob, sig, expected_grid)
                 if bitmap is not None:
-                    return bitmap
+                    return bitmap, f"sidecar:{sidecar}"
         else:
             if os.path.exists(sidecar):
                 with open(sidecar, "rb") as f:
                     blob = f.read()
                 bitmap = _deserialize_bitmap(blob, sig, expected_grid)
                 if bitmap is not None:
-                    return bitmap
+                    return bitmap, f"sidecar:{sidecar}"
     except Exception as e:
         warnings.warn(f"Failed to load sidecar chunk occupancy from {sidecar}: {e}")
 
@@ -113,10 +124,12 @@ def _load_cached(array_url: str, sig: str, expected_grid: Tuple[int, ...]) -> Op
         try:
             with open(local, "rb") as f:
                 blob = f.read()
-            return _deserialize_bitmap(blob, sig, expected_grid)
+            bitmap = _deserialize_bitmap(blob, sig, expected_grid)
+            if bitmap is not None:
+                return bitmap, f"local:{local}"
         except Exception as e:
             warnings.warn(f"Failed to load local chunk occupancy cache at {local}: {e}")
-    return None
+    return None, None
 
 
 def _save_cached(array_url: str, sig: str, bitmap: np.ndarray) -> None:
@@ -129,12 +142,14 @@ def _save_cached(array_url: str, sig: str, bitmap: np.ndarray) -> None:
             key = sidecar.replace("s3://", "")
             with fs.open(key, "wb") as f:
                 f.write(blob)
+            print(f"  Chunk occupancy cache SAVED to sidecar: {sidecar}")
             return
         else:
             tmp = sidecar + ".tmp"
             with open(tmp, "wb") as f:
                 f.write(blob)
             os.replace(tmp, sidecar)
+            print(f"  Chunk occupancy cache SAVED to sidecar: {sidecar}")
             return
     except Exception as e:
         warnings.warn(
@@ -148,17 +163,49 @@ def _save_cached(array_url: str, sig: str, bitmap: np.ndarray) -> None:
         with open(tmp, "wb") as f:
             f.write(blob)
         os.replace(tmp, local)
+        print(f"  Chunk occupancy cache SAVED to local fallback: {local}")
     except Exception as e:
         warnings.warn(f"Failed to save local chunk occupancy cache to {local}: {e}")
 
 
-def _list_chunk_filenames(array_url: str):
+def _iter_chunk_filenames_s3(array_url: str):
+    """Stream chunk filenames under an s3:// zarr v2 array prefix.
+
+    Drives `list_objects_v2` page by page via s3fs's sync `call_s3`, so we can
+    yield results without materialising the full key list (which at ~9M files
+    would be ~GB of Python strings and minutes of silence).
+    """
+    fs = fsspec.filesystem("s3", anon=False)
+    bucket_and_prefix = array_url.replace("s3://", "").rstrip("/")
+    bucket, _, prefix = bucket_and_prefix.partition("/")
+    if prefix and not prefix.endswith("/"):
+        prefix = prefix + "/"
+
+    continuation = None
+    while True:
+        kwargs = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
+        if continuation is not None:
+            kwargs["ContinuationToken"] = continuation
+        resp = fs.call_s3("list_objects_v2", **kwargs)
+        for obj in resp.get("Contents", []) or []:
+            key = obj["Key"]
+            # Skip anything in a sub-prefix (shouldn't happen for a zarr v2
+            # array's flat chunk layout, but guard anyway) and the sidecar.
+            rest = key[len(prefix):] if prefix else key
+            if "/" in rest:
+                continue
+            yield rest
+        if not resp.get("IsTruncated"):
+            return
+        continuation = resp.get("NextContinuationToken")
+        if continuation is None:
+            return
+
+
+def _iter_chunk_filenames(array_url: str):
     """Yield chunk filenames (basenames) under a zarr v2 array directory."""
     if array_url.startswith("s3://"):
-        fs = fsspec.filesystem("s3", anon=False)
-        prefix = array_url.replace("s3://", "").rstrip("/")
-        for key in fs.find(prefix, withdirs=False):
-            yield key.rsplit("/", 1)[-1]
+        yield from _iter_chunk_filenames_s3(array_url)
     else:
         try:
             with os.scandir(array_url) as it:
@@ -217,41 +264,62 @@ def build_chunk_occupancy(
 
     sig = _zarray_signature(array_url) if use_cache else None
     if sig is not None:
-        cached = _load_cached(array_url, sig, grid_dims)
+        cached, source = _load_cached(array_url, sig, grid_dims)
         if cached is not None:
-            if verbose:
-                occ = int(cached.sum())
-                total = int(cached.size)
-                print(
-                    f"  Chunk occupancy cache hit for {array_url}: "
-                    f"{occ}/{total} ({100.0 * occ / total:.1f}%) chunks occupied"
-                )
+            occ = int(cached.sum())
+            total = int(cached.size)
+            print(
+                f"  Chunk occupancy cache HIT ({source}): "
+                f"{occ}/{total} ({100.0 * occ / total:.1f}%) chunks occupied for {array_url}"
+            )
             return cached
+        print(f"  Chunk occupancy cache MISS for {array_url} (will build and cache)")
+    elif use_cache:
+        print(
+            f"  Chunk occupancy cache skipped for {array_url} "
+            f"(could not read .zarray signature; no caching this run)"
+        )
+    else:
+        print(f"  Chunk occupancy cache disabled for {array_url}")
 
-    if verbose:
-        print(f"  Building chunk occupancy index for {array_url} (grid {grid_dims})...")
+    print(f"  Building chunk occupancy index for {array_url} (grid {grid_dims})...")
 
     occupancy = np.zeros(grid_dims, dtype=bool)
 
     parsed = 0
     skipped = 0
-    for filename in _list_chunk_filenames(array_url):
-        if not filename or not filename[0].isdigit():
-            continue
-        parts = filename.split(".")
-        if len(parts) != rank:
-            continue
-        try:
-            idxs = tuple(int(p) for p in parts)
-        except ValueError:
-            skipped += 1
-            continue
-        spatial_idx = tuple(idxs[ax] for ax in spatial_axes)
-        if any(spatial_idx[i] >= grid_dims[i] for i in range(len(grid_dims))):
-            skipped += 1
-            continue
-        occupancy[spatial_idx] = True
-        parsed += 1
+    # Stream + count. tqdm runs with total=None so it just shows the running
+    # count and rate — S3 has no way to know the total up front, and the
+    # theoretical max (grid.prod) is a poor estimate for sparse volumes.
+    pbar = tqdm(
+        desc="  Listing chunks",
+        unit=" files",
+        unit_scale=True,
+        leave=False,
+        disable=not verbose,
+        **get_tqdm_kwargs(),
+    )
+    try:
+        for filename in _iter_chunk_filenames(array_url):
+            pbar.update(1)
+            if not filename or not filename[0].isdigit():
+                continue
+            parts = filename.split(".")
+            if len(parts) != rank:
+                continue
+            try:
+                idxs = tuple(int(p) for p in parts)
+            except ValueError:
+                skipped += 1
+                continue
+            spatial_idx = tuple(idxs[ax] for ax in spatial_axes)
+            if any(spatial_idx[i] >= grid_dims[i] for i in range(len(grid_dims))):
+                skipped += 1
+                continue
+            occupancy[spatial_idx] = True
+            parsed += 1
+    finally:
+        pbar.close()
 
     if parsed == 0:
         warnings.warn(
