@@ -224,9 +224,18 @@ Resume training with `--weights path/to/model_current.pt`.
    between-neighbors region (via the chain-derived validity mask).
    Directions are supervised **densely** inside the same between-neighbors
    bracket: the encoded direction channels are filled by a chain-adjacent
-   DT blend (see "Direction densification" below), weighted `1.0` on the
-   sparse splatted wrap voxels and `0.1` on the blended fill so training
-   still leans on the hard samples. At
+   DT blend (see "Direction densification" below). The direction loss is
+   split into two terms with independent weights and TB scalars:
+   `loss_dir_sparse` (MSE on the original splatted wrap voxels, weight
+   `--w-dir` default `1.0`) and `loss_dir_dense` (MSE on the
+   DT-blended fill voxels, weight `--w-dir-dense` default `0.1`).
+   A third `loss_smooth` term (weight `--w-smooth` default `0.1`)
+   applies an L1 spatial-gradient penalty to the predicted direction
+   channels inside the validity bracket — it smooths the model's
+   output directly, independent of any residual roughness in the
+   densified target. Having the three terms separate makes it
+   possible to watch the true wrap-voxel error (`loss_dir_sparse`)
+   in isolation from the softer densified target error. At
    coarser scales `ScaleSpaceLoss3D` performs **masked-average pooling**
    on prediction and target (averaging only over valid voxels per
    2×2×2 block) and uses an **any-valid** rule for the validity mask

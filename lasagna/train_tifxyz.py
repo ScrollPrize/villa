@@ -287,6 +287,43 @@ def augment_intensity(image: torch.Tensor) -> torch.Tensor:
 # Loss functions (reused from train_unet_3d.py)
 # ---------------------------------------------------------------------------
 
+def direction_smoothness_loss(
+    pred_dir: torch.Tensor, mask: torch.Tensor,
+) -> torch.Tensor:
+    """L1 smoothness regularizer on the 6 direction channels.
+
+    Penalizes absolute finite-difference gradients of ``pred_dir`` along
+    each spatial axis, averaged over all positions where BOTH endpoints
+    of the finite difference are supervised (``mask`` is 1 at both).
+    This lets the model produce a smooth direction field inside the
+    validity bracket without fighting the out-of-bracket garbage.
+
+    Args:
+        pred_dir: ``(B, 6, Z, Y, X)`` — predicted direction channels.
+        mask:     ``(B, 1, Z, Y, X)`` or ``(B, Z, Y, X)`` — direction
+                  validity (1 in bracket, 0 outside).
+    """
+    if mask.ndim == pred_dir.ndim - 1:
+        mask = mask.unsqueeze(1)
+    mask = (mask > 0.5).float()
+
+    gz = (pred_dir[:, :, 1:, :, :] - pred_dir[:, :, :-1, :, :]).abs()
+    gy = (pred_dir[:, :, :, 1:, :] - pred_dir[:, :, :, :-1, :]).abs()
+    gx = (pred_dir[:, :, :, :, 1:] - pred_dir[:, :, :, :, :-1]).abs()
+
+    mz = mask[:, :, 1:, :, :] * mask[:, :, :-1, :, :]
+    my = mask[:, :, :, 1:, :] * mask[:, :, :, :-1, :]
+    mx = mask[:, :, :, :, 1:] * mask[:, :, :, :, :-1]
+
+    def _avg(grad: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+        # Broadcasting m (B, 1, ...) over the 6 direction channels.
+        num = (grad * m).sum()
+        denom = (m.sum() * grad.shape[1]).clamp(min=1.0)
+        return num / denom
+
+    return (_avg(gz, mz) + _avg(gy, my) + _avg(gx, mx)) / 3.0
+
+
 class MaskedMSE(nn.Module):
     def forward(self, pred, target, mask=None, weight=None):
         diff = (pred - target) ** 2
@@ -500,6 +537,8 @@ def train(
     w_cos: float = 1.0,
     w_mag: float = 1.0,
     w_dir: float = 1.0,
+    w_dir_dense: float = 0.1,
+    w_smooth: float = 0.1,
     num_workers: int = 4,
     val_fraction: float = 0.15,
     device: str = "cuda",
@@ -533,7 +572,9 @@ def train(
     run_config = {
         "config_path": config_path,
         "epochs": epochs, "batch_size": batch_size, "lr": lr,
-        "patch_size": patch_size, "w_cos": w_cos, "w_mag": w_mag, "w_dir": w_dir,
+        "patch_size": patch_size,
+        "w_cos": w_cos, "w_mag": w_mag, "w_dir": w_dir,
+        "w_dir_dense": w_dir_dense, "w_smooth": w_smooth,
         "num_workers": num_workers, "val_fraction": val_fraction,
         "device": device, "weights": weights,
         "norm_type": norm_type, "upsample_mode": upsample_mode,
@@ -685,6 +726,7 @@ def train(
         model, val_loader, scale_loss_mse, scale_loss_l1,
         device, writer, global_step,
         w_cos, w_mag, w_dir,
+        w_dir_dense=w_dir_dense, w_smooth=w_smooth,
         amp_dtype=amp_dtype, use_autocast=use_autocast,
         verbose=verbose,
         same_surface_threshold=same_surface_threshold,
@@ -810,14 +852,33 @@ def train(
                     dir_mask = dir_mask.index_select(0, keep)
                     dir_weight = dir_weight.index_select(0, keep)
 
+                # Direction supervision is split by source so we can
+                # watch the hard (sparse, original tifxyz splat) error
+                # independently of the soft DT-blended fill. dir_weight
+                # is per-voxel 1.0 on sparse, 0.1 on dense, 0 elsewhere.
+                sparse_dir_mask = (dir_weight[:, 0:1] > 0.9).float()
+                dense_dir_mask = (
+                    (dir_weight[:, 0:1] > 0.05)
+                    & (dir_weight[:, 0:1] < 0.9)
+                ).float()
+
                 # Per-channel losses
                 loss_cos = scale_loss_mse(pred[:, 0:1], targets[:, 0:1], mask=cos_mask)
                 loss_mag = scale_loss_l1(pred[:, 1:2], targets[:, 1:2], mask=cos_mask)
-                loss_dir = scale_loss_mse(
-                    pred[:, 2:8], targets[:, 2:8],
-                    mask=dir_mask, weight=dir_weight,
+                loss_dir_sparse = scale_loss_mse(
+                    pred[:, 2:8], targets[:, 2:8], mask=sparse_dir_mask,
                 )
-                loss = w_cos * loss_cos + w_mag * loss_mag + w_dir * loss_dir
+                loss_dir_dense = scale_loss_mse(
+                    pred[:, 2:8], targets[:, 2:8], mask=dense_dir_mask,
+                )
+                loss_smooth = direction_smoothness_loss(pred[:, 2:8], dir_mask)
+                loss = (
+                    w_cos * loss_cos
+                    + w_mag * loss_mag
+                    + w_dir * loss_dir_sparse
+                    + w_dir_dense * loss_dir_dense
+                    + w_smooth * loss_smooth
+                )
 
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -845,7 +906,15 @@ def train(
                 writer.add_scalar("train/loss", loss.item(), global_step)
                 writer.add_scalar("train/loss_cos", loss_cos.item(), global_step)
                 writer.add_scalar("train/loss_mag", loss_mag.item(), global_step)
-                writer.add_scalar("train/loss_dir", loss_dir.item(), global_step)
+                writer.add_scalar(
+                    "train/loss_dir_sparse", loss_dir_sparse.item(), global_step,
+                )
+                writer.add_scalar(
+                    "train/loss_dir_dense", loss_dir_dense.item(), global_step,
+                )
+                writer.add_scalar(
+                    "train/loss_smooth", loss_smooth.item(), global_step,
+                )
                 writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
 
             if global_step % 100 == 0:
@@ -864,6 +933,7 @@ def train(
                     model, val_loader, scale_loss_mse, scale_loss_l1,
                     device, writer, global_step,
                     w_cos, w_mag, w_dir,
+                    w_dir_dense=w_dir_dense, w_smooth=w_smooth,
                     amp_dtype=amp_dtype, use_autocast=use_autocast,
                     verbose=verbose,
                     same_surface_threshold=same_surface_threshold,
@@ -912,6 +982,8 @@ def _evaluate(
     model, loader, scale_loss_mse, scale_loss_l1,
     device, writer, global_step,
     w_cos, w_mag, w_dir,
+    w_dir_dense: float = 0.1,
+    w_smooth: float = 0.1,
     amp_dtype=torch.bfloat16, use_autocast=True,
     verbose: bool = False,
     same_surface_threshold: float | None = None,
@@ -922,7 +994,9 @@ def _evaluate(
     losses = []
     losses_cos: list[float] = []
     losses_mag: list[float] = []
-    losses_dir: list[float] = []
+    losses_dir_sparse: list[float] = []
+    losses_dir_dense: list[float] = []
+    losses_smooth: list[float] = []
     vis_done = False
 
     val_iter = loader
@@ -949,15 +1023,34 @@ def _evaluate(
 
             cos_mask = validity
             dir_mask = (normals_valid > 0.5).float()
+            sparse_dir_mask = (dir_weight[:, 0:1] > 0.9).float()
+            dense_dir_mask = (
+                (dir_weight[:, 0:1] > 0.05)
+                & (dir_weight[:, 0:1] < 0.9)
+            ).float()
 
             loss_cos = scale_loss_mse(pred[:, 0:1], targets[:, 0:1], mask=cos_mask)
             loss_mag = scale_loss_l1(pred[:, 1:2], targets[:, 1:2], mask=cos_mask)
-            loss_dir = scale_loss_mse(pred[:, 2:8], targets[:, 2:8], mask=dir_mask, weight=dir_weight)
-            loss = w_cos * loss_cos + w_mag * loss_mag + w_dir * loss_dir
+            loss_dir_sparse = scale_loss_mse(
+                pred[:, 2:8], targets[:, 2:8], mask=sparse_dir_mask,
+            )
+            loss_dir_dense = scale_loss_mse(
+                pred[:, 2:8], targets[:, 2:8], mask=dense_dir_mask,
+            )
+            loss_smooth = direction_smoothness_loss(pred[:, 2:8], dir_mask)
+            loss = (
+                w_cos * loss_cos
+                + w_mag * loss_mag
+                + w_dir * loss_dir_sparse
+                + w_dir_dense * loss_dir_dense
+                + w_smooth * loss_smooth
+            )
             losses.append(loss.item())
             losses_cos.append(loss_cos.item())
             losses_mag.append(loss_mag.item())
-            losses_dir.append(loss_dir.item())
+            losses_dir_sparse.append(loss_dir_sparse.item())
+            losses_dir_dense.append(loss_dir_dense.item())
+            losses_smooth.append(loss_smooth.item())
 
             if verbose:
                 val_iter.set_postfix(loss=f"{loss.item():.4f}")
@@ -973,7 +1066,15 @@ def _evaluate(
     writer.add_scalar("val/loss", mean_loss, global_step)
     writer.add_scalar("val/loss_cos", sum(losses_cos) / n, global_step)
     writer.add_scalar("val/loss_mag", sum(losses_mag) / n, global_step)
-    writer.add_scalar("val/loss_dir", sum(losses_dir) / n, global_step)
+    writer.add_scalar(
+        "val/loss_dir_sparse", sum(losses_dir_sparse) / n, global_step,
+    )
+    writer.add_scalar(
+        "val/loss_dir_dense", sum(losses_dir_dense) / n, global_step,
+    )
+    writer.add_scalar(
+        "val/loss_smooth", sum(losses_smooth) / n, global_step,
+    )
     return mean_loss
 
 
@@ -1001,7 +1102,17 @@ def main() -> None:
                              "different training patch size.")
     parser.add_argument("--w-cos", type=float, default=1.0)
     parser.add_argument("--w-mag", type=float, default=1.0)
-    parser.add_argument("--w-dir", type=float, default=1.0)
+    parser.add_argument("--w-dir", type=float, default=1.0,
+                        help="Weight on the sparse (original splat) "
+                             "direction loss.")
+    parser.add_argument("--w-dir-dense", type=float, default=0.1,
+                        help="Weight on the DT-blended dense "
+                             "direction loss. Default 0.1 so training "
+                             "leans on the hard samples.")
+    parser.add_argument("--w-smooth", type=float, default=0.1,
+                        help="Weight on L1 spatial-gradient smoothness "
+                             "regularization of predicted direction "
+                             "channels inside the validity bracket.")
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--val-fraction", type=float, default=0.15)
     parser.add_argument("--device", type=str, default=None)
@@ -1033,6 +1144,8 @@ def main() -> None:
         w_cos=args.w_cos,
         w_mag=args.w_mag,
         w_dir=args.w_dir,
+        w_dir_dense=args.w_dir_dense,
+        w_smooth=args.w_smooth,
         num_workers=args.num_workers,
         val_fraction=args.val_fraction,
         device=device,
