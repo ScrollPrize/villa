@@ -248,6 +248,12 @@ class AutoregMeshModel(nn.Module):
                 self.input_shape,
                 config_path=self.config.get("dinov2_config_path"),
             )
+            backbone_patch_size = tuple(int(v) for v in self.backbone.patch_embed_size)
+            if backbone_patch_size != self.patch_size:
+                raise ValueError(
+                    "autoreg_mesh patch_size must match the selected Dinov2 backbone patch stride; "
+                    f"config patch_size={self.patch_size!r} backbone patch_embed_size={backbone_patch_size!r}"
+                )
             for parameter in self.backbone.parameters():
                 parameter.requires_grad = False
             self.backbone.eval()

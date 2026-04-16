@@ -250,6 +250,19 @@ class _ResamplingSampleIndexDataset(Dataset):
         return {"value": value}
 
 
+class _SplitCloneAutoregDataset:
+    def __init__(self, apply_volume_only_augmentation: bool, patch_metadata=None) -> None:
+        self.sample_index = [(0, 0), (1, 0), (2, 0), (3, 0)]
+        self._apply_volume_only_augmentation = bool(apply_volume_only_augmentation)
+        self._patch_metadata = patch_metadata or {"sample_index": tuple(self.sample_index)}
+
+    def __len__(self) -> int:
+        return len(self.sample_index)
+
+    def export_patch_metadata(self):
+        return dict(self._patch_metadata)
+
+
 class _FakeWandbImage:
     def __init__(self, data, caption=None) -> None:
         self.data = np.asarray(data)
@@ -465,6 +478,16 @@ def test_model_train_keeps_frozen_backbone_in_eval_mode(tmp_path: Path) -> None:
 
     assert model.training is True
     assert model.backbone.training is False
+
+
+def test_model_rejects_backbone_patch_size_mismatch(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "tiny_dinovol.pt"
+    _write_local_guide_checkpoint(checkpoint)
+    config = _make_config(checkpoint)
+    config["patch_size"] = [16, 16, 16]
+
+    with pytest.raises(ValueError, match="patch_size must match"):
+        AutoregMeshModel(config)
 
 
 def test_debias_projection_reduces_energy_in_learned_basis(tmp_path: Path) -> None:
@@ -808,6 +831,42 @@ def test_autoreg_mesh_validation_metrics_are_logged_in_history(tmp_path: Path) -
     assert "rollout_val_triangle_flip_rate" in result["history"][0]
     assert "rollout_val_pred_oob_fraction" in result["history"][0]
     assert "rollout_val_invalid_vertex_fraction" in result["history"][0]
+
+
+def test_split_dataset_honors_disabled_train_volume_augmentation(tmp_path: Path) -> None:
+    from vesuvius.neural_tracing.autoreg_mesh import train as train_module
+
+    checkpoint = tmp_path / "tiny_dinovol.pt"
+    _write_local_guide_checkpoint(checkpoint)
+    config = validate_autoreg_mesh_config(_make_config(checkpoint))
+    config["volume_only_augmentation"]["enabled"] = False
+
+    dataset = _SplitCloneAutoregDataset(apply_volume_only_augmentation=False)
+    clone_calls: list[bool] = []
+
+    def _fake_clone(cfg, patch_metadata, *, apply_volume_only_augmentation: bool):
+        del cfg, patch_metadata
+        clone_calls.append(bool(apply_volume_only_augmentation))
+        return _SplitCloneAutoregDataset(apply_volume_only_augmentation=apply_volume_only_augmentation)
+
+    original_dataset_cls = train_module.AutoregMeshDataset
+    original_clone = train_module._clone_autoreg_mesh_dataset
+    try:
+        train_module.AutoregMeshDataset = _SplitCloneAutoregDataset
+        train_module._clone_autoreg_mesh_dataset = _fake_clone
+        train_dataset, val_dataset = train_module._split_dataset(
+            dataset,
+            cfg=config,
+            seed=0,
+            val_fraction=0.5,
+        )
+    finally:
+        train_module.AutoregMeshDataset = original_dataset_cls
+        train_module._clone_autoreg_mesh_dataset = original_clone
+
+    assert clone_calls == [False, False]
+    assert train_dataset is not None
+    assert val_dataset is not None
 
 
 def test_restrict_dataset_samples_prevents_cross_split_resampling() -> None:

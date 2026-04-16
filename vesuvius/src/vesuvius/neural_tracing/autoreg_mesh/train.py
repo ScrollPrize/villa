@@ -103,7 +103,11 @@ def _split_dataset(dataset: Dataset, *, cfg: dict, seed: int, val_fraction: floa
     if isinstance(dataset, AutoregMeshDataset):
         patch_metadata = dataset.export_patch_metadata()
         train_dataset = _restrict_dataset_samples(
-            _clone_autoreg_mesh_dataset(cfg, patch_metadata, apply_volume_only_augmentation=True),
+            _clone_autoreg_mesh_dataset(
+                cfg,
+                patch_metadata,
+                apply_volume_only_augmentation=bool(cfg.get("volume_only_augmentation", {}).get("enabled", False)),
+            ),
             train_indices,
         )
         if not val_indices:
