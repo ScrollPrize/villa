@@ -11,6 +11,8 @@ from scipy import ndimage
 from torch.utils.data import Dataset
 from tqdm.auto import tqdm
 
+from vesuvius.models.augmentation.transforms.spatial.mirroring import MirrorTransform
+from vesuvius.models.augmentation.transforms.spatial.transpose import TransposeAxesTransform
 from vesuvius.neural_tracing.autoreg_mesh.config import validate_autoreg_mesh_config
 from vesuvius.neural_tracing.autoreg_mesh.serialization import (
     DIRECTION_TO_ID,
@@ -36,6 +38,13 @@ def _lookup_cached_vol_tokens(cache: Any, sample_key):
     if hasattr(cache, "get"):
         return cache.get(sample_key, None)
     return None
+
+
+def _spatial_axes_equal(crop_size: tuple[int, int, int], axes: list[int]) -> bool:
+    if len(axes) < 2:
+        return False
+    reference = int(crop_size[axes[0]])
+    return all(int(crop_size[axis]) == reference for axis in axes[1:])
 
 
 def _normalize_surface_downsample_factor(surface_downsample_factor) -> tuple[int, int]:
@@ -272,6 +281,64 @@ def _apply_volume_only_augmentation(volume: np.ndarray, augmentation_cfg: dict, 
     return np.nan_to_num(vol, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
 
 
+def _apply_spatial_augmentation(
+    volume: np.ndarray,
+    *,
+    cond_local: np.ndarray,
+    masked_local: np.ndarray,
+    crop_size: tuple[int, int, int],
+    augmentation_cfg: dict,
+    enabled: bool,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, dict[str, object]]:
+    volume_np = np.asarray(volume, dtype=np.float32)
+    cond_np = np.asarray(cond_local, dtype=np.float32)
+    masked_np = np.asarray(masked_local, dtype=np.float32)
+    metadata = {
+        "spatial_augmented": False,
+        "spatial_mirror_axes": [],
+        "spatial_axis_order": [0, 1, 2],
+    }
+    if not bool(enabled):
+        return volume_np.astype(np.float32, copy=True), cond_np.copy(), masked_np.copy(), metadata
+
+    cond_shape = cond_np.shape[:2]
+    masked_shape = masked_np.shape[:2]
+    cond_count = int(np.prod(cond_shape))
+    keypoints = torch.from_numpy(
+        np.concatenate([cond_np.reshape(-1, 3), masked_np.reshape(-1, 3)], axis=0).astype(np.float32)
+    )
+    data_dict = {
+        "image": torch.from_numpy(volume_np[None].astype(np.float32)),
+        "keypoints": keypoints,
+        "crop_shape": crop_size,
+    }
+
+    mirror_prob = float(augmentation_cfg.get("mirror_prob", 0.5))
+    mirror_axes = [int(axis) for axis in augmentation_cfg.get("mirror_axes", [0, 1, 2])]
+    if mirror_prob > 0.0 and torch.rand(1).item() < mirror_prob:
+        mirror_transform = MirrorTransform(tuple(mirror_axes))
+        params = mirror_transform.get_parameters(**data_dict)
+        data_dict = mirror_transform.apply(data_dict, **params)
+        metadata["spatial_augmented"] = metadata["spatial_augmented"] or bool(params["axes"])
+        metadata["spatial_mirror_axes"] = [int(axis) for axis in params["axes"]]
+
+    transpose_prob = float(augmentation_cfg.get("transpose_prob", 0.25))
+    transpose_axes = [int(axis) for axis in augmentation_cfg.get("transpose_axes", [0, 1, 2])]
+    if transpose_prob > 0.0 and torch.rand(1).item() < transpose_prob and _spatial_axes_equal(crop_size, transpose_axes):
+        transpose_transform = TransposeAxesTransform(set(transpose_axes))
+        params = transpose_transform.get_parameters(**data_dict)
+        data_dict = transpose_transform.apply(data_dict, **params)
+        axis_order = [int(axis) - 1 for axis in params["axis_order"][1:]]
+        metadata["spatial_augmented"] = metadata["spatial_augmented"] or axis_order != [0, 1, 2]
+        metadata["spatial_axis_order"] = axis_order
+
+    keypoints_out = data_dict["keypoints"].detach().cpu().numpy().astype(np.float32, copy=False)
+    cond_out = keypoints_out[:cond_count].reshape(*cond_shape, 3)
+    masked_out = keypoints_out[cond_count:].reshape(*masked_shape, 3)
+    volume_out = data_dict["image"].squeeze(0).detach().cpu().numpy().astype(np.float32, copy=False)
+    return volume_out, cond_out, masked_out, metadata
+
+
 def extract_wrap_world_surface_stored(patch, wrap: dict, *, require_all_valid: bool = True) -> np.ndarray | None:
     """Extract one wrap directly on the stored tifxyz lattice in world ZYX coordinates."""
     seg = wrap["segment"]
@@ -427,11 +494,17 @@ class AutoregMeshDataset(Dataset):
         patch_metadata=None,
         apply_augmentation: bool = False,
         apply_perturbation: bool = False,
+        apply_spatial_augmentation: bool | None = None,
         apply_volume_only_augmentation: bool | None = None,
         max_resample_attempts: int = 8,
     ) -> None:
         self.config = validate_autoreg_mesh_config(config)
         self.max_resample_attempts = int(max_resample_attempts)
+        self.apply_spatial_augmentation = bool(
+            self.config.get("spatial_augmentation", {}).get("enabled", False)
+            if apply_spatial_augmentation is None
+            else apply_spatial_augmentation
+        )
         self.apply_volume_only_augmentation = bool(
             self.config.get("volume_only_augmentation", {}).get("enabled", False)
             if apply_volume_only_augmentation is None
@@ -654,10 +727,31 @@ class AutoregMeshDataset(Dataset):
         min_corner = np.asarray(conditioning["min_corner"], dtype=np.int64)
         max_corner = np.asarray(conditioning["max_corner"], dtype=np.int64)
         vol_crop = _read_volume_crop_from_patch(patch, self.crop_size, min_corner, max_corner)
+        cond_local = np.asarray(conditioning["cond_zyxs_unperturbed"], dtype=np.float32) - min_corner[None, None, :]
+        masked_local = np.asarray(conditioning["masked_zyxs"], dtype=np.float32) - min_corner[None, None, :]
+        vol_crop, cond_local, masked_local, spatial_aug_metadata = _apply_spatial_augmentation(
+            vol_crop,
+            cond_local=cond_local,
+            masked_local=masked_local,
+            crop_size=self.crop_size,
+            augmentation_cfg=self.config.get("spatial_augmentation", {}),
+            enabled=self.apply_spatial_augmentation,
+        )
         vol_crop = _apply_volume_only_augmentation(
             vol_crop,
             self.config.get("volume_only_augmentation", {}),
             enabled=self.apply_volume_only_augmentation,
+        )
+        serialized = serialize_split_conditioning_example(
+            cond_zyxs_local=cond_local,
+            masked_zyxs_local=masked_local,
+            direction=str(conditioning["cond_direction"]).lower(),
+            volume_shape=self.crop_size,
+            patch_size=self.config["patch_size"],
+            offset_num_bins=self.config["offset_num_bins"],
+            frontier_band_width=int(self.config["frontier_band_width"]),
+            surface_downsample_factor=effective_surface_downsample_factor,
+            use_stored_resolution_only=use_stored_surface,
         )
 
         if not bool(np.any(serialized["prompt_tokens"]["valid_mask"])):
@@ -707,6 +801,9 @@ class AutoregMeshDataset(Dataset):
                 "conditioning_shape": tuple(int(v) for v in serialized["conditioning_grid_local"].shape[:2]),
                 "sample_key": sample_key,
                 "surface_sampling_mode": "stored" if use_stored_surface else "full",
+                "spatial_augmented": bool(spatial_aug_metadata["spatial_augmented"]),
+                "spatial_mirror_axes": list(spatial_aug_metadata["spatial_mirror_axes"]),
+                "spatial_axis_order": list(spatial_aug_metadata["spatial_axis_order"]),
             },
             "conditioning_grid_local": torch.from_numpy(serialized["conditioning_grid_local"]).to(torch.float32),
             "prompt_anchor_xyz": torch.from_numpy(serialized["prompt_anchor_xyz"]).to(torch.float32),

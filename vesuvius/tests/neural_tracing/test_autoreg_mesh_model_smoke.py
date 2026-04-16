@@ -15,6 +15,7 @@ from vesuvius.models.build.pretrained_backbones.rope import MixedRopePositionEmb
 from vesuvius.neural_tracing.autoreg_mesh.benchmark import run_autoreg_mesh_benchmark
 from vesuvius.neural_tracing.autoreg_mesh.config import validate_autoreg_mesh_config
 from vesuvius.neural_tracing.autoreg_mesh.dataset import (
+    _apply_spatial_augmentation,
     _apply_volume_only_augmentation,
     _compute_target_boundary_stats,
     _fast_prefilter_plan,
@@ -330,9 +331,10 @@ class _ResamplingSampleIndexDataset(Dataset):
 
 
 class _SplitCloneAutoregDataset:
-    def __init__(self, apply_volume_only_augmentation: bool, patch_metadata=None) -> None:
+    def __init__(self, apply_volume_only_augmentation: bool, apply_spatial_augmentation: bool = False, patch_metadata=None) -> None:
         self.sample_index = [(0, 0), (1, 0), (2, 0), (3, 0)]
         self._apply_volume_only_augmentation = bool(apply_volume_only_augmentation)
+        self._apply_spatial_augmentation = bool(apply_spatial_augmentation)
         self._patch_metadata = patch_metadata or {"sample_index": tuple(self.sample_index)}
 
     def __len__(self) -> int:
@@ -960,13 +962,16 @@ def test_split_dataset_honors_disabled_train_volume_augmentation(tmp_path: Path)
     config = validate_autoreg_mesh_config(_make_config(checkpoint))
     config["volume_only_augmentation"]["enabled"] = False
 
-    dataset = _SplitCloneAutoregDataset(apply_volume_only_augmentation=False)
-    clone_calls: list[bool] = []
+    dataset = _SplitCloneAutoregDataset(apply_volume_only_augmentation=False, apply_spatial_augmentation=False)
+    clone_calls: list[tuple[bool, bool]] = []
 
-    def _fake_clone(cfg, patch_metadata, *, apply_volume_only_augmentation: bool):
+    def _fake_clone(cfg, patch_metadata, *, apply_spatial_augmentation: bool, apply_volume_only_augmentation: bool):
         del cfg, patch_metadata
-        clone_calls.append(bool(apply_volume_only_augmentation))
-        return _SplitCloneAutoregDataset(apply_volume_only_augmentation=apply_volume_only_augmentation)
+        clone_calls.append((bool(apply_spatial_augmentation), bool(apply_volume_only_augmentation)))
+        return _SplitCloneAutoregDataset(
+            apply_volume_only_augmentation=apply_volume_only_augmentation,
+            apply_spatial_augmentation=apply_spatial_augmentation,
+        )
 
     original_dataset_cls = train_module.AutoregMeshDataset
     original_clone = train_module._clone_autoreg_mesh_dataset
@@ -983,7 +988,7 @@ def test_split_dataset_honors_disabled_train_volume_augmentation(tmp_path: Path)
         train_module.AutoregMeshDataset = original_dataset_cls
         train_module._clone_autoreg_mesh_dataset = original_clone
 
-    assert clone_calls == [False, False]
+    assert clone_calls == [(True, False), (False, False)]
     assert train_dataset is not None
     assert val_dataset is not None
 
@@ -1744,6 +1749,138 @@ def test_volume_only_augmentation_changes_volume_without_touching_geometry() -> 
     assert torch.equal(sample["target_grid_local"], original_target)
 
 
+def test_spatial_augmentation_mirror_transforms_volume_and_mesh(monkeypatch: pytest.MonkeyPatch) -> None:
+    volume = np.arange(4 * 4 * 4, dtype=np.float32).reshape(4, 4, 4)
+    cond = np.array([[[0.0, 1.0, 2.0], [1.0, 2.0, 3.0]]], dtype=np.float32)
+    masked = np.array([[[2.0, 1.0, 0.0], [3.0, 2.0, 1.0]]], dtype=np.float32)
+
+    def _zero_rand(*size, **kwargs):
+        return torch.zeros(*size, **kwargs)
+
+    monkeypatch.setattr(torch, "rand", _zero_rand)
+    aug_volume, aug_cond, aug_masked, meta = _apply_spatial_augmentation(
+        volume,
+        cond_local=cond,
+        masked_local=masked,
+        crop_size=(4, 4, 4),
+        augmentation_cfg={
+            "enabled": True,
+            "mirror_prob": 1.0,
+            "transpose_prob": 0.0,
+            "mirror_axes": [0, 2],
+            "transpose_axes": [0, 1, 2],
+        },
+        enabled=True,
+    )
+
+    np.testing.assert_allclose(aug_volume, np.flip(volume, axis=(0, 2)))
+    expected_cond = cond.copy()
+    expected_masked = masked.copy()
+    for arr in (expected_cond, expected_masked):
+        arr[..., 0] = 3.0 - arr[..., 0]
+        arr[..., 2] = 3.0 - arr[..., 2]
+    np.testing.assert_allclose(aug_cond, expected_cond)
+    np.testing.assert_allclose(aug_masked, expected_masked)
+    assert meta["spatial_augmented"] is True
+    assert meta["spatial_mirror_axes"] == [0, 2]
+    assert meta["spatial_axis_order"] == [0, 1, 2]
+
+
+def test_spatial_augmentation_transpose_transforms_volume_and_mesh(monkeypatch: pytest.MonkeyPatch) -> None:
+    volume = np.arange(4 * 4 * 4, dtype=np.float32).reshape(4, 4, 4)
+    cond = np.array([[[0.0, 1.0, 2.0], [1.0, 2.0, 3.0]]], dtype=np.float32)
+    masked = np.array([[[2.0, 1.0, 0.0], [3.0, 2.0, 1.0]]], dtype=np.float32)
+
+    def _zero_rand(*size, **kwargs):
+        return torch.zeros(*size, **kwargs)
+
+    monkeypatch.setattr(torch, "rand", _zero_rand)
+    monkeypatch.setattr(np.random, "shuffle", lambda axes: axes.reverse())
+    aug_volume, aug_cond, aug_masked, meta = _apply_spatial_augmentation(
+        volume,
+        cond_local=cond,
+        masked_local=masked,
+        crop_size=(4, 4, 4),
+        augmentation_cfg={
+            "enabled": True,
+            "mirror_prob": 0.0,
+            "transpose_prob": 1.0,
+            "mirror_axes": [0, 1, 2],
+            "transpose_axes": [0, 1, 2],
+        },
+        enabled=True,
+    )
+
+    np.testing.assert_allclose(aug_volume, np.transpose(volume, (2, 1, 0)))
+    np.testing.assert_allclose(aug_cond, cond[..., [2, 1, 0]])
+    np.testing.assert_allclose(aug_masked, masked[..., [2, 1, 0]])
+    assert meta["spatial_augmented"] is True
+    assert meta["spatial_axis_order"] == [2, 1, 0]
+
+
+def test_spatial_augmentation_keeps_direction_and_strip_positions_stable(monkeypatch: pytest.MonkeyPatch) -> None:
+    cond = np.array(
+        [
+            [[0.0, 0.0, 0.0], [0.5, 0.0, 1.0]],
+            [[1.0, 1.0, 0.0], [1.5, 1.0, 1.0]],
+            [[2.0, 2.0, 0.0], [2.5, 2.0, 1.0]],
+        ],
+        dtype=np.float32,
+    )
+    masked = np.array(
+        [
+            [[0.0, 0.0, 2.0], [0.5, 0.0, 3.0]],
+            [[1.0, 1.0, 2.0], [1.5, 1.0, 3.0]],
+            [[2.0, 2.0, 2.0], [2.5, 2.0, 3.0]],
+        ],
+        dtype=np.float32,
+    )
+
+    def _zero_rand(*size, **kwargs):
+        return torch.zeros(*size, **kwargs)
+
+    monkeypatch.setattr(torch, "rand", _zero_rand)
+    monkeypatch.setattr(np.random, "shuffle", lambda axes: axes.reverse())
+    _, cond_aug, masked_aug, _ = _apply_spatial_augmentation(
+        np.zeros((4, 4, 4), dtype=np.float32),
+        cond_local=cond,
+        masked_local=masked,
+        crop_size=(4, 4, 4),
+        augmentation_cfg={
+            "enabled": True,
+            "mirror_prob": 1.0,
+            "transpose_prob": 1.0,
+            "mirror_axes": [0, 1, 2],
+            "transpose_axes": [0, 1, 2],
+        },
+        enabled=True,
+    )
+    original = serialize_split_conditioning_example(
+        cond_zyxs_local=cond,
+        masked_zyxs_local=masked,
+        direction="left",
+        volume_shape=(16, 16, 16),
+        patch_size=(8, 8, 8),
+        offset_num_bins=(4, 4, 4),
+        frontier_band_width=4,
+    )
+    augmented = serialize_split_conditioning_example(
+        cond_zyxs_local=cond_aug,
+        masked_zyxs_local=masked_aug,
+        direction="left",
+        volume_shape=(16, 16, 16),
+        patch_size=(8, 8, 8),
+        offset_num_bins=(4, 4, 4),
+        frontier_band_width=4,
+    )
+
+    assert augmented["direction"] == original["direction"]
+    np.testing.assert_allclose(augmented["conditioning_grid_local"], cond_aug)
+    np.testing.assert_allclose(augmented["target_grid_local"], masked_aug)
+    np.testing.assert_array_equal(augmented["target_strip_positions"], original["target_strip_positions"])
+    np.testing.assert_array_equal(augmented["prompt_tokens"]["strip_positions"], original["prompt_tokens"]["strip_positions"])
+
+
 def test_scheduled_sampling_probability_progression() -> None:
     from vesuvius.neural_tracing.autoreg_mesh.train import _scheduled_sampling_prob
 
@@ -1866,13 +2003,14 @@ def test_offset_loss_is_gated_by_active_weight(tmp_path: Path) -> None:
 def test_offset_loss_weight_activates_after_start_step(tmp_path: Path) -> None:
     config = _make_cached_token_config()
     config["out_dir"] = str(tmp_path / "runs_offset")
+    config["offset_loss_weight"] = 0.2
     config["offset_loss_start_step"] = 1
     dataset = _make_training_dataset()
 
     result = run_autoreg_mesh_training(config, dataset=dataset, device="cpu", max_steps=2)
 
     assert result["history"][0]["offset_loss_weight_active"] == pytest.approx(0.0)
-    assert result["history"][1]["offset_loss_weight_active"] == pytest.approx(1.0)
+    assert result["history"][1]["offset_loss_weight_active"] == pytest.approx(0.2)
 
 
 def test_distance_aware_target_builder_normalizes_and_respects_edges() -> None:
@@ -1934,6 +2072,11 @@ def test_distance_aware_target_default_config_values() -> None:
     assert validated["coarse_continuation_lateral_scale"] == pytest.approx(3.0)
     assert validated["coarse_continuation_min_radius_scale"] == pytest.approx(2.5)
     assert validated["coarse_continuation_empty_fallback"] == "disable_for_token"
+    assert validated["spatial_augmentation"]["enabled"] is True
+    assert validated["spatial_augmentation"]["mirror_prob"] == pytest.approx(0.5)
+    assert validated["spatial_augmentation"]["transpose_prob"] == pytest.approx(0.25)
+    assert validated["spatial_augmentation"]["mirror_axes"] == [0, 1, 2]
+    assert validated["spatial_augmentation"]["transpose_axes"] == [0, 1, 2]
     assert validated["volume_only_augmentation"]["enabled"] is True
     assert validated["volume_only_augmentation"]["gamma_prob"] == pytest.approx(0.4)
 
@@ -2151,6 +2294,16 @@ def test_rope_config_validation_rejects_invalid_values() -> None:
     bad_aug_prob["volume_only_augmentation"] = {"enabled": True, "gamma_prob": 1.5}
     with pytest.raises(ValueError, match="volume_only_augmentation.gamma_prob"):
         validate_autoreg_mesh_config(bad_aug_prob)
+
+    bad_spatial_prob = _make_cached_token_config()
+    bad_spatial_prob["spatial_augmentation"] = {"enabled": True, "mirror_prob": 1.5}
+    with pytest.raises(ValueError, match="spatial_augmentation.mirror_prob"):
+        validate_autoreg_mesh_config(bad_spatial_prob)
+
+    bad_cached_spatial = _make_cached_token_config()
+    bad_cached_spatial["cache_vol_tokens"] = True
+    with pytest.raises(ValueError, match="cache_vol_tokens"):
+        validate_autoreg_mesh_config(bad_cached_spatial)
 
     bad_constraint_mode = _make_cached_token_config()
     bad_constraint_mode["coarse_continuation_constraint_mode"] = "soft_bias"

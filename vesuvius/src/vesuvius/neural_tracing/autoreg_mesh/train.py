@@ -86,6 +86,7 @@ def _clone_autoreg_mesh_dataset(
     cfg: dict,
     patch_metadata,
     *,
+    apply_spatial_augmentation: bool,
     apply_volume_only_augmentation: bool,
 ) -> AutoregMeshDataset:
     return AutoregMeshDataset(
@@ -93,6 +94,7 @@ def _clone_autoreg_mesh_dataset(
         patch_metadata=patch_metadata,
         apply_augmentation=False,
         apply_perturbation=False,
+        apply_spatial_augmentation=bool(apply_spatial_augmentation),
         apply_volume_only_augmentation=bool(apply_volume_only_augmentation),
     )
 
@@ -107,6 +109,7 @@ def _split_dataset(dataset: Dataset, *, cfg: dict, seed: int, val_fraction: floa
             _clone_autoreg_mesh_dataset(
                 cfg,
                 patch_metadata,
+                apply_spatial_augmentation=bool(cfg.get("spatial_augmentation", {}).get("enabled", False)),
                 apply_volume_only_augmentation=bool(cfg.get("volume_only_augmentation", {}).get("enabled", False)),
             ),
             train_indices,
@@ -114,7 +117,12 @@ def _split_dataset(dataset: Dataset, *, cfg: dict, seed: int, val_fraction: floa
         if not val_indices:
             return train_dataset, None
         val_dataset = _restrict_dataset_samples(
-            _clone_autoreg_mesh_dataset(cfg, patch_metadata, apply_volume_only_augmentation=False),
+            _clone_autoreg_mesh_dataset(
+                cfg,
+                patch_metadata,
+                apply_spatial_augmentation=False,
+                apply_volume_only_augmentation=False,
+            ),
             val_indices,
         )
         return train_dataset, val_dataset
@@ -424,7 +432,7 @@ def _geometry_sd_weight_active(cfg: dict, *, global_step: int) -> float:
 def _offset_loss_weight_active(cfg: dict, *, global_step: int) -> float:
     if int(global_step) < int(cfg.get("offset_loss_start_step", 0)):
         return 0.0
-    return 1.0
+    return float(cfg.get("offset_loss_weight", 1.0))
 
 
 def _scheduled_sampling_feedback_state(cfg: dict, *, global_step: int) -> tuple[bool, bool]:

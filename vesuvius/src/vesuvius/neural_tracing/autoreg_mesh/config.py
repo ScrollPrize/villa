@@ -36,6 +36,17 @@ def _normalize_surface_downsample_factor(value) -> int | tuple[int, int]:
     return factors
 
 
+def _normalize_axis_list(name: str, value) -> list[int]:
+    if not isinstance(value, (list, tuple)) or len(value) == 0:
+        raise ValueError(f"{name} must be a non-empty sequence of axes")
+    axes = [int(v) for v in value]
+    if any(axis not in {0, 1, 2} for axis in axes):
+        raise ValueError(f"{name} axes must be in {{0,1,2}}, got {value!r}")
+    if len(set(axes)) != len(axes):
+        raise ValueError(f"{name} axes must be unique, got {value!r}")
+    return axes
+
+
 DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "seed": 0,
     "crop_size": [128, 128, 128],
@@ -44,8 +55,16 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "surface_downsample_factor": 1,
     "use_stored_resolution_only": False,
     "prefilter_show_progress": True,
+    "spatial_augmentation": {
+        "enabled": True,
+        "mirror_prob": 0.5,
+        "transpose_prob": 0.25,
+        "mirror_axes": [0, 1, 2],
+        "transpose_axes": [0, 1, 2],
+    },
     "patch_size": [8, 8, 8],
     "offset_num_bins": [16, 16, 16],
+    "offset_loss_weight": 1.0,
     "offset_loss_start_step": 0,
     "direction_order": ["left", "right", "up", "down"],
     "cache_vol_tokens": False,
@@ -215,6 +234,8 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError(f"patch_size must be positive, got {cfg['patch_size']!r}")
     if any(size <= 0 for size in cfg["offset_num_bins"]):
         raise ValueError(f"offset_num_bins must be positive, got {cfg['offset_num_bins']!r}")
+    if float(cfg["offset_loss_weight"]) < 0.0:
+        raise ValueError("offset_loss_weight must be non-negative")
     if int(cfg["offset_loss_start_step"]) < 0:
         raise ValueError("offset_loss_start_step must be >= 0")
     if any(size % patch != 0 for size, patch in zip(cfg["input_shape"], cfg["patch_size"])):
@@ -332,6 +353,23 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("coarse_continuation_empty_fallback must currently be 'disable_for_token'")
     if float(cfg["occupancy_loss_weight"]) < 0.0:
         raise ValueError("occupancy_loss_weight must be non-negative")
+    raw_spatial_aug = cfg.get("spatial_augmentation") or {}
+    if not isinstance(raw_spatial_aug, dict):
+        raise ValueError("spatial_augmentation must be a mapping of augmentation settings")
+    spatial_aug = dict(raw_spatial_aug)
+    for key, default in DEFAULT_AUTOREG_MESH_CONFIG["spatial_augmentation"].items():
+        spatial_aug.setdefault(key, default)
+    if not isinstance(spatial_aug.get("enabled"), bool):
+        raise ValueError("spatial_augmentation.enabled must be a boolean")
+    for key in ("mirror_prob", "transpose_prob"):
+        value = float(spatial_aug[key])
+        if value < 0.0 or value > 1.0:
+            raise ValueError(f"spatial_augmentation.{key} must be within [0, 1]")
+    spatial_aug["mirror_axes"] = _normalize_axis_list("spatial_augmentation.mirror_axes", spatial_aug["mirror_axes"])
+    spatial_aug["transpose_axes"] = _normalize_axis_list("spatial_augmentation.transpose_axes", spatial_aug["transpose_axes"])
+    if bool(cfg.get("cache_vol_tokens", False)) and bool(spatial_aug["enabled"]):
+        raise ValueError("spatial_augmentation.enabled=true is incompatible with cache_vol_tokens=true")
+    cfg["spatial_augmentation"] = spatial_aug
     if int(cfg["num_steps"]) <= 0:
         raise ValueError("num_steps must be positive")
     if int(cfg["batch_size"]) <= 0:

@@ -8,10 +8,21 @@
       "segments_path": "/ephemeral/2um_surf_dataset/tifxyz/0139"
     }
   ],
-  "crop_size": [128, 128, 128],
-  "input_shape": [128, 128, 128],
+  "crop_size": [
+    128,
+    128,
+    128
+  ],
+  "input_shape": [
+    128,
+    128,
+    128
+  ],
   "sample_mode": "wrap",
-  "cond_percent": [0.1, 0.5],
+  "cond_percent": [
+    0.1,
+    0.5
+  ],
   "overlap_fraction": 0.25,
   "chunk_pad": 20.0,
   "force_recompute_patches": false,
@@ -19,9 +30,17 @@
   "surface_downsample_factor": 1,
   "frontier_band_width": 4,
   "dinov2_backbone": "/ephemeral/dinov2_ckpts/shift005_jitter005_step_342500.pt/checkpoint_step_342500.pt",
-  "patch_size": [8, 8, 8],
-  "offset_num_bins": [16, 16, 16],
-  "offset_loss_start_step": 2000,
+  "patch_size": [
+    8,
+    8,
+    8
+  ],
+  "offset_num_bins": [
+    16,
+    16,
+    16
+  ],
+  "offset_loss_start_step": 4000,
   "decoder_dim": 768,
   "decoder_depth": 16,
   "decoder_num_heads": 16,
@@ -60,12 +79,12 @@
   "boundary_loss_weight": 0.0,
   "boundary_loss_start_step": 0,
   "geometry_metric_enabled": true,
-  "geometry_metric_weight": 0.01,
-  "geometry_metric_start_step": 2000,
+  "geometry_metric_weight": 0.001,
+  "geometry_metric_start_step": 6000,
   "geometry_metric_loss": "huber",
   "geometry_sd_enabled": true,
-  "geometry_sd_weight": 0.005,
-  "geometry_sd_start_step": 2000,
+  "geometry_sd_weight": 0.0005,
+  "geometry_sd_start_step": 7000,
   "distance_aware_coarse_targets_enabled": true,
   "distance_aware_coarse_target_radius": 1,
   "distance_aware_coarse_target_sigma": 1.0,
@@ -82,7 +101,10 @@
     "name": "adamw",
     "learning_rate": 0.0002,
     "weight_decay": 0.01,
-    "betas": [0.9, 0.95]
+    "betas": [
+      0.9,
+      0.95
+    ]
   },
   "scheduler": "warmup_poly",
   "scheduler_kwargs": {
@@ -99,5 +121,6 @@
   "wandb_run_name": "autoreg-mesh-0139-2um-r1-s10-axis-sd-debias16",
   "wandb_resume": true,
   "wandb_log_images": true,
-  "wandb_image_frequency": 1000
+  "wandb_image_frequency": 1000,
+  "offset_loss_weight": 0.2
 }
