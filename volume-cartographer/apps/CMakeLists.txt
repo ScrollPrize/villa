@@ -166,7 +166,7 @@ add_executable(vc_zarr_recompress src/vc_zarr_recompress.cpp)
 target_link_libraries(vc_zarr_recompress vc_core blosc_static)
 
 add_executable(vc_zarr_prefetch src/vc_zarr_prefetch.cpp)
-target_link_libraries(vc_zarr_prefetch vc_core utils_video_codec Boost::program_options)
+target_link_libraries(vc_zarr_prefetch vc_core Boost::program_options)
 
 add_executable(vc_zarr_verify src/vc_zarr_verify.cpp)
 target_link_libraries(vc_zarr_verify vc_core)
