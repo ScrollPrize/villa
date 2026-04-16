@@ -1579,19 +1579,26 @@ void MenuActionController::openRemoteScroll(
                         const std::string& dlBase = (segSource == vc::RemoteSegmentSource::Direct)
                             ? segBaseUrl : baseUrl;
 
+                        // For Direct sources the on-demand download in CWindow
+                        // uses flat cachePath (no volpkgName nesting). Match that
+                        // layout here so preloaded segments are found on-demand.
+                        const std::filesystem::path segCache =
+                            (segSource == vc::RemoteSegmentSource::Direct)
+                                ? std::filesystem::path(cachePath) : volpkgCache;
+
                         // Lazy loading: only download meta.json for each segment,
                         // and fully load only those whose TIFFs are already cached.
                         for (const auto& segId : segIds) {
                             try {
                                 // Download metadata only (fast)
                                 vc::downloadRemoteSegmentMetadataOnly(
-                                    dlBase, segId, volpkgCache, scrollAuth, segSource);
+                                    dlBase, segId, segCache, scrollAuth, segSource);
 
                                 // If TIFFs are already cached, load the surface
-                                if (vc::isRemoteSegmentFullyCached(volpkgCache, segId, segSource)) {
+                                if (vc::isRemoteSegmentFullyCached(segCache, segId, segSource)) {
                                     const char* subdir = (segSource == vc::RemoteSegmentSource::Segments)
                                         ? "segments" : "paths";
-                                    auto localDir = volpkgCache / subdir / segId;
+                                    auto localDir = segCache / subdir / segId;
                                     auto seg = Segmentation::New(localDir);
                                     if (seg && seg->canLoadSurface()) {
                                         auto surf = seg->loadSurface();

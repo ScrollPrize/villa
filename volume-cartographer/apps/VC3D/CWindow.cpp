@@ -2040,9 +2040,18 @@ void CWindow::downloadRemoteSegmentOnDemand(const QString& segmentId)
     }
 
     auto* watcher = new QFutureWatcher<std::shared_ptr<QuadSurface>>(this);
+    // Capture the current session URL so the completion handler can detect
+    // a stale result if the user closed/switched volumes during download.
+    const std::string expectedBaseUrl = _remoteScroll.baseUrl;
     connect(watcher, &QFutureWatcher<std::shared_ptr<QuadSurface>>::finished, this,
-        [this, watcher, segId]() {
+        [this, watcher, segId, expectedBaseUrl]() {
             watcher->deleteLater();
+            // If the remote scroll session changed, silently discard the
+            // result — applying a segment from a previous dataset to the
+            // current CState would corrupt surface state.
+            if (_remoteScroll.baseUrl != expectedBaseUrl) {
+                return;
+            }
             std::shared_ptr<QuadSurface> surf;
             try {
                 surf = watcher->result();
