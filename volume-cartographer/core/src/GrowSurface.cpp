@@ -139,6 +139,272 @@ static double wrap_angle_diff_deg(double delta) {
     return delta;
 }
 
+static double elapsed_ms(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - start).count();
+}
+
+static void add_ms_atomic(double& target, double ms) {
+#pragma omp atomic update
+    target += ms;
+}
+
+static void add_int_atomic(int& target, int value) {
+#pragma omp atomic update
+    target += value;
+}
+
+struct ScopedMs {
+    explicit ScopedMs(double& total_ms)
+        : total_ms_(total_ms)
+        , start_(std::chrono::steady_clock::now())
+    {}
+
+    ~ScopedMs() {
+        total_ms_ += elapsed_ms(start_);
+    }
+
+    double& total_ms_;
+    std::chrono::steady_clock::time_point start_;
+};
+
+struct ScopedAtomicMs {
+    explicit ScopedAtomicMs(double& total_ms)
+        : total_ms_(total_ms)
+        , start_(std::chrono::steady_clock::now())
+    {}
+
+    ~ScopedAtomicMs() {
+        add_ms_atomic(total_ms_, elapsed_ms(start_));
+    }
+
+    double& total_ms_;
+    std::chrono::steady_clock::time_point start_;
+};
+
+static void print_ms(std::ostream& os, const char* label, double ms) {
+    os << ' ' << label << '=' << std::fixed << std::setprecision(1) << ms << "ms";
+}
+
+struct OptimizerTiming {
+    double total_ms{0.0};
+    double setup_ms{0.0};
+    double inpaint_mask_ms{0.0};
+    double thin_plate_ms{0.0};
+    double inpaint_problem_ms{0.0};
+    double inpaint_solve_ms{0.0};
+    double inpaint_surface_setup_ms{0.0};
+    double opt_problem_ms{0.0};
+    double opt_solve_ms{0.0};
+    double save_inp_hr_ms{0.0};
+    double hr_surface_gen_ms{0.0};
+    double remap_ms{0.0};
+    double remap_filter_ms{0.0};
+    double remap_add_iters_ms{0.0};
+    double cleanup_ms{0.0};
+    double point_to_ms{0.0};
+
+    void add(const OptimizerTiming& other) {
+        total_ms += other.total_ms;
+        setup_ms += other.setup_ms;
+        inpaint_mask_ms += other.inpaint_mask_ms;
+        thin_plate_ms += other.thin_plate_ms;
+        inpaint_problem_ms += other.inpaint_problem_ms;
+        inpaint_solve_ms += other.inpaint_solve_ms;
+        inpaint_surface_setup_ms += other.inpaint_surface_setup_ms;
+        opt_problem_ms += other.opt_problem_ms;
+        opt_solve_ms += other.opt_solve_ms;
+        save_inp_hr_ms += other.save_inp_hr_ms;
+        hr_surface_gen_ms += other.hr_surface_gen_ms;
+        remap_ms += other.remap_ms;
+        remap_filter_ms += other.remap_filter_ms;
+        remap_add_iters_ms += other.remap_add_iters_ms;
+        cleanup_ms += other.cleanup_ms;
+        point_to_ms += other.point_to_ms;
+    }
+
+    void print(std::ostream& os, const char* prefix) const {
+        os << prefix;
+        print_ms(os, "total", total_ms);
+        print_ms(os, "setup", setup_ms);
+        print_ms(os, "inpaint_mask", inpaint_mask_ms);
+        print_ms(os, "thin_plate", thin_plate_ms);
+        print_ms(os, "inpaint_problem", inpaint_problem_ms);
+        print_ms(os, "inpaint_solve", inpaint_solve_ms);
+        print_ms(os, "inpaint_surface_setup", inpaint_surface_setup_ms);
+        print_ms(os, "opt_problem", opt_problem_ms);
+        print_ms(os, "opt_solve", opt_solve_ms);
+        print_ms(os, "save_inp_hr", save_inp_hr_ms);
+        print_ms(os, "hr_surface_gen", hr_surface_gen_ms);
+        print_ms(os, "remap", remap_ms);
+        print_ms(os, "remap_filter", remap_filter_ms);
+        print_ms(os, "remap_add_iters", remap_add_iters_ms);
+        print_ms(os, "cleanup", cleanup_ms);
+        print_ms(os, "pointTo_sum", point_to_ms);
+        os << std::endl;
+    }
+};
+
+struct GrowthTimingTotals {
+    int generations{0};
+    int candidates_processed{0};
+    int candidates_accepted{0};
+    int global_opt_count{0};
+    int wrap_stats_count{0};
+    int umbilicus_count{0};
+
+    double generation_total_ms{0.0};
+    double point_to_ms{0.0};
+    double prune_ms{0.0};
+    double build_savable_ms{0.0};
+    double invalidate_ms{0.0};
+    double full_fringe_rebuild_ms{0.0};
+    double candidate_collect_ms{0.0};
+    double force_retry_ms{0.0};
+    double candidate_sort_ms{0.0};
+    double candidate_process_wall_ms{0.0};
+    double candidate_sync_ms{0.0};
+    double candidate_local_surface_ms{0.0};
+    double candidate_ref_init_solve_ms{0.0};
+    double candidate_inlier_eval_ms{0.0};
+    double candidate_duplicate_check_ms{0.0};
+    double candidate_accept_setup_ms{0.0};
+    double candidate_wrap_set_ms{0.0};
+    double candidate_umbilicus_sample_ms{0.0};
+    double candidate_problem_build_ms{0.0};
+    double candidate_overlap_attach_ms{0.0};
+    double candidate_local_solve_ms{0.0};
+    double candidate_post_attach_ms{0.0};
+    double candidate_commit_ms{0.0};
+    double mirror_ms{0.0};
+    double wrap_batch_refresh_ms{0.0};
+    double threshold_ms{0.0};
+    double loc_count_ms{0.0};
+    double debug_save_ms{0.0};
+    double global_total_ms{0.0};
+    double global_setup_ms{0.0};
+    double global_optimize_ms{0.0};
+    double global_copy_ms{0.0};
+    double global_wrap_rebuild_ms{0.0};
+    double global_thread_reset_ms{0.0};
+    double global_area_scan_ms{0.0};
+    double global_fringe_rebuild_ms{0.0};
+    double progress_log_ms{0.0};
+    double wrap_stats_total_ms{0.0};
+    double wrap_stats_unwrap_ms{0.0};
+    double wrap_stats_correct_ms{0.0};
+    double wrap_stats_compute_ms{0.0};
+    double wrap_debug_tif_ms{0.0};
+    double umbilicus_total_ms{0.0};
+    double umbilicus_sample_scan_ms{0.0};
+    double umbilicus_orient_ms{0.0};
+    double umbilicus_row_scan_ms{0.0};
+    double umbilicus_retry_ms{0.0};
+    double umbilicus_write_json_ms{0.0};
+    double umbilicus_build_ms{0.0};
+    double umbilicus_tracker_rebuild_ms{0.0};
+    double expand_total_ms{0.0};
+    double expand_resize_ms{0.0};
+    double expand_shift_data_ms{0.0};
+    double expand_thread_reset_ms{0.0};
+    double expand_wrap_rebuild_ms{0.0};
+    double expand_bounds_fringe_ms{0.0};
+    double expand_area_scan_ms{0.0};
+    double inliers_write_ms{0.0};
+
+    OptimizerTiming optimizer;
+
+    void reset() {
+        *this = GrowthTimingTotals{};
+    }
+
+    void print(int start_generation, int end_generation) const {
+        std::cout << "[Timing] gens " << start_generation << "-" << end_generation
+                  << " n=" << generations;
+        print_ms(std::cout, "total", generation_total_ms);
+        if (generations > 0) {
+            print_ms(std::cout, "avg_per_gen", generation_total_ms / generations);
+        }
+        print_ms(std::cout, "pointTo_sum", point_to_ms);
+        std::cout << std::endl;
+
+        std::cout << "[Timing] growth";
+        print_ms(std::cout, "prune", prune_ms);
+        print_ms(std::cout, "build_savable", build_savable_ms);
+        print_ms(std::cout, "invalidate", invalidate_ms);
+        print_ms(std::cout, "full_fringe_rebuild", full_fringe_rebuild_ms);
+        print_ms(std::cout, "candidate_collect", candidate_collect_ms);
+        print_ms(std::cout, "force_retry", force_retry_ms);
+        print_ms(std::cout, "candidate_sort", candidate_sort_ms);
+        print_ms(std::cout, "candidate_process_wall", candidate_process_wall_ms);
+        print_ms(std::cout, "mirror", mirror_ms);
+        print_ms(std::cout, "wrap_batch_refresh", wrap_batch_refresh_ms);
+        print_ms(std::cout, "threshold", threshold_ms);
+        print_ms(std::cout, "loc_count", loc_count_ms);
+        print_ms(std::cout, "debug_save", debug_save_ms);
+        std::cout << std::endl;
+
+        std::cout << "[Timing] candidates processed=" << candidates_processed
+                  << " accepted=" << candidates_accepted;
+        print_ms(std::cout, "sync", candidate_sync_ms);
+        print_ms(std::cout, "local_surfaces", candidate_local_surface_ms);
+        print_ms(std::cout, "ref_init_solve", candidate_ref_init_solve_ms);
+        print_ms(std::cout, "inlier_eval", candidate_inlier_eval_ms);
+        print_ms(std::cout, "duplicate_check", candidate_duplicate_check_ms);
+        print_ms(std::cout, "accept_setup", candidate_accept_setup_ms);
+        print_ms(std::cout, "wrap_set", candidate_wrap_set_ms);
+        print_ms(std::cout, "umbilicus_sample", candidate_umbilicus_sample_ms);
+        print_ms(std::cout, "problem_build", candidate_problem_build_ms);
+        print_ms(std::cout, "overlap_attach", candidate_overlap_attach_ms);
+        print_ms(std::cout, "local_solve", candidate_local_solve_ms);
+        print_ms(std::cout, "post_attach", candidate_post_attach_ms);
+        print_ms(std::cout, "commit", candidate_commit_ms);
+        std::cout << std::endl;
+
+        std::cout << "[Timing] wrap stats_count=" << wrap_stats_count;
+        print_ms(std::cout, "total", wrap_stats_total_ms);
+        print_ms(std::cout, "unwrap", wrap_stats_unwrap_ms);
+        print_ms(std::cout, "correct", wrap_stats_correct_ms);
+        print_ms(std::cout, "compute", wrap_stats_compute_ms);
+        print_ms(std::cout, "debug_tif", wrap_debug_tif_ms);
+        std::cout << " umbilicus_count=" << umbilicus_count;
+        print_ms(std::cout, "umb_total", umbilicus_total_ms);
+        print_ms(std::cout, "sample_scan", umbilicus_sample_scan_ms);
+        print_ms(std::cout, "orient", umbilicus_orient_ms);
+        print_ms(std::cout, "row_scan", umbilicus_row_scan_ms);
+        print_ms(std::cout, "retry", umbilicus_retry_ms);
+        print_ms(std::cout, "write_json", umbilicus_write_json_ms);
+        print_ms(std::cout, "build_umbilicus", umbilicus_build_ms);
+        print_ms(std::cout, "tracker_rebuild", umbilicus_tracker_rebuild_ms);
+        std::cout << std::endl;
+
+        std::cout << "[Timing] global count=" << global_opt_count;
+        print_ms(std::cout, "total", global_total_ms);
+        print_ms(std::cout, "setup", global_setup_ms);
+        print_ms(std::cout, "optimizer_call", global_optimize_ms);
+        print_ms(std::cout, "copy_back", global_copy_ms);
+        print_ms(std::cout, "wrap_rebuild", global_wrap_rebuild_ms);
+        print_ms(std::cout, "thread_reset", global_thread_reset_ms);
+        print_ms(std::cout, "area_scan", global_area_scan_ms);
+        print_ms(std::cout, "fringe_rebuild", global_fringe_rebuild_ms);
+        print_ms(std::cout, "progress_log", progress_log_ms);
+        std::cout << std::endl;
+
+        optimizer.print(std::cout, "[Timing] optimizer_sum");
+
+        std::cout << "[Timing] expand/io";
+        print_ms(std::cout, "expand_total", expand_total_ms);
+        print_ms(std::cout, "resize", expand_resize_ms);
+        print_ms(std::cout, "shift_data", expand_shift_data_ms);
+        print_ms(std::cout, "thread_reset", expand_thread_reset_ms);
+        print_ms(std::cout, "wrap_rebuild", expand_wrap_rebuild_ms);
+        print_ms(std::cout, "bounds_fringe", expand_bounds_fringe_ms);
+        print_ms(std::cout, "area_scan", expand_area_scan_ms);
+        print_ms(std::cout, "inliers_write", inliers_write_ms);
+        std::cout << std::endl;
+    }
+};
+
 static bool seed_point_valid(const cv::Vec3f& p) {
     return p[0] != -1.0f && p[1] != -1.0f && p[2] != -1.0f;
 }
@@ -368,8 +634,10 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     vc::wrap_tracking::WrapTracker* wrap_tracker = nullptr,
     bool remap_use_inpaint = false,
     bool debug_diagnostics = false,
-    bool skip_inpaint = false)
+    bool skip_inpaint = false,
+    OptimizerTiming* timing = nullptr)
 {
+    const auto optimizer_start = std::chrono::steady_clock::now();
     std::cout << "optimizer: optimizing surface " << state.size() << " " << used_area <<  " " << static_bounds << std::endl;
 
     const int step_int = surftrack_round_step(step);
@@ -389,50 +657,57 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                   << " static_bounds=" << static_bounds << std::endl;
     }
 
-    cv::Mat_<cv::Vec3d> points_new = points.clone();
+    cv::Mat_<cv::Vec3d> points_new;
     cv::Mat_<cv::Vec3f> points_f;
-    points.convertTo(points_f, CV_32FC3);
-    QuadSurface* sm = new QuadSurface(points_f, {1,1});
-
+    QuadSurface* sm = nullptr;
     std::shared_mutex mutex;
-
     double pointTo_total_ms = 0.0;
-
+    double timing_dummy_ms = 0.0;
+    auto optimizer_timer_target = [&](double OptimizerTiming::*member) -> double& {
+        return timing ? timing->*member : timing_dummy_ms;
+    };
     SurfTrackerData data_new;
-    data_new._data = data._data;
-
-    used_area = cv::Rect(used_area.x-2,used_area.y-2,used_area.size().width+4,used_area.size().height+4);
-    // Clamp expanded used_area to valid grid bounds to avoid OOB in subsequent loops
-    {
-        cv::Rect grid_bounds(0, 0, state.cols, state.rows);
-        used_area = used_area & grid_bounds;
-    }
-    cv::Rect used_area_hr = {used_area.x*step_int, used_area.y*step_int, used_area.width*step_int, used_area.height*step_int};
-
+    cv::Rect used_area_hr;
     ceres::Problem problem_inpaint;
     ceres::Solver::Summary summary;
     ceres::Solver::Options options;
-#ifdef VC_USE_CUDA_SPARSE
-    if (use_cuda_sparse && ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::CUDA_SPARSE)) {
-        options.linear_solver_type = ceres::SPARSE_SCHUR;
-        options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
-    } else {
-        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-    }
-#else
-    options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
-#endif
-    options.minimizer_progress_to_stdout = false;
-    options.max_num_iterations = std::max(1, window_inpaint_max_iters);
-    options.num_threads = omp_get_max_threads();
-    options.use_nonmonotonic_steps = false;
+    {
+        ScopedMs timer(optimizer_timer_target(&OptimizerTiming::setup_ms));
+        points_new = points.clone();
+        points.convertTo(points_f, CV_32FC3);
+        sm = new QuadSurface(points_f, {1,1});
 
-    for(int j=used_area.y;j<used_area.br().y;j++)
-        for(int i=used_area.x;i<used_area.br().x;i++)
-            if (state(j,i) & STATE_LOC_VALID) {
-                data_new.surfs({j,i}).insert(sm);
-                data_new.loc(sm, {j,i}) = {static_cast<double>(j),static_cast<double>(i)};
-            }
+        data_new._data = data._data;
+
+        used_area = cv::Rect(used_area.x-2,used_area.y-2,used_area.size().width+4,used_area.size().height+4);
+        // Clamp expanded used_area to valid grid bounds to avoid OOB in subsequent loops
+        {
+            cv::Rect grid_bounds(0, 0, state.cols, state.rows);
+            used_area = used_area & grid_bounds;
+        }
+        used_area_hr = {used_area.x*step_int, used_area.y*step_int, used_area.width*step_int, used_area.height*step_int};
+#ifdef VC_USE_CUDA_SPARSE
+        if (use_cuda_sparse && ceres::IsSparseLinearAlgebraLibraryTypeAvailable(ceres::CUDA_SPARSE)) {
+            options.linear_solver_type = ceres::SPARSE_SCHUR;
+            options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
+        } else {
+            options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+        }
+#else
+        options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+#endif
+        options.minimizer_progress_to_stdout = false;
+        options.max_num_iterations = std::max(1, window_inpaint_max_iters);
+        options.num_threads = omp_get_max_threads();
+        options.use_nonmonotonic_steps = false;
+
+        for(int j=used_area.y;j<used_area.br().y;j++)
+            for(int i=used_area.x;i<used_area.br().x;i++)
+                if (state(j,i) & STATE_LOC_VALID) {
+                    data_new.surfs({j,i}).insert(sm);
+                    data_new.loc(sm, {j,i}) = {static_cast<double>(j),static_cast<double>(i)};
+                }
+    }
 
     cv::Mat_<uint8_t> new_state = state.clone();
 
@@ -445,23 +720,26 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     cv::Mat_<uint8_t> inpaint_mask(state.size(), static_cast<uint8_t>(0));
     int inpainted_count = 0;
     if (!skip_inpaint) {
-        // Build inpaint mask by closing valid regions and marking newly included cells.
-        for(int r=0;r<closing_r+2;r++) {
-            cv::Mat_<uint8_t> masked;
-            bitwise_and(state, STATE_VALID, masked);
-            cv::dilate(masked, masked, m, {-1,-1}, r);
-            cv::erode(masked, masked, m, {-1,-1}, std::min(r,closing_r));
-            // cv::imwrite("masked.tif", masked);
+        {
+            ScopedMs timer(optimizer_timer_target(&OptimizerTiming::inpaint_mask_ms));
+            // Build inpaint mask by closing valid regions and marking newly included cells.
+            for(int r=0;r<closing_r+2;r++) {
+                cv::Mat_<uint8_t> masked;
+                bitwise_and(state, STATE_VALID, masked);
+                cv::dilate(masked, masked, m, {-1,-1}, r);
+                cv::erode(masked, masked, m, {-1,-1}, std::min(r,closing_r));
+                // cv::imwrite("masked.tif", masked);
 
-            for(int j=used_area.y;j<used_area.br().y;j++)
-                for(int i=used_area.x;i<used_area.br().x;i++)
-                    if ((masked(j,i) & STATE_VALID) && ((new_state(j,i) & STATE_VALID) == 0)) {
-                        new_state(j, i) = STATE_COORD_VALID;
-                        if (points_new(j, i)[0] == -1)
-                            points_new(j, i) = {0,0,0};
-                        inpaint_mask(j, i) = 255;
-                        inpainted_count++;
-                    }
+                for(int j=used_area.y;j<used_area.br().y;j++)
+                    for(int i=used_area.x;i<used_area.br().x;i++)
+                        if ((masked(j,i) & STATE_VALID) && ((new_state(j,i) & STATE_VALID) == 0)) {
+                            new_state(j, i) = STATE_COORD_VALID;
+                            if (points_new(j, i)[0] == -1)
+                                points_new(j, i) = {0,0,0};
+                            inpaint_mask(j, i) = 255;
+                            inpainted_count++;
+                        }
+            }
         }
 
         if (inpainted_count > 0) {
@@ -470,55 +748,75 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
             std::cout << "optimizer: thin-plate inpaint " << inpainted_count
                       << " cells (warmup " << warmup_iters
                       << ", iters " << thin_plate_iters << ")" << std::endl;
-            thin_plate_inpaint(points_new, new_state, inpaint_mask, used_area, warmup_iters, thin_plate_iters);
+            {
+                ScopedMs timer(optimizer_timer_target(&OptimizerTiming::thin_plate_ms));
+                thin_plate_inpaint(points_new, new_state, inpaint_mask, used_area, warmup_iters, thin_plate_iters);
+            }
 
-            for(int j=used_area.y;j<used_area.br().y;j++)
-                for(int i=used_area.x;i<used_area.br().x;i++)
-                    if (inpaint_mask(j, i)) {
-                        res_count += surftrack_add_global(sm, {j,i}, data_new, problem_inpaint, new_state, points_new, step*src_step, LOSS_3D_INDIRECT | OPTIMIZE_ALL);
-                    }
+            {
+                ScopedMs timer(optimizer_timer_target(&OptimizerTiming::inpaint_problem_ms));
+                for(int j=used_area.y;j<used_area.br().y;j++)
+                    for(int i=used_area.x;i<used_area.br().x;i++)
+                        if (inpaint_mask(j, i)) {
+                            res_count += surftrack_add_global(sm, {j,i}, data_new, problem_inpaint, new_state, points_new, step*src_step, LOSS_3D_INDIRECT | OPTIMIZE_ALL);
+                        }
+            }
         }
     }
 
-    for(int j=used_area.y;j<used_area.br().y;j++)
-        for(int i=used_area.x;i<used_area.br().x;i++)
-            if (state(j,i) & STATE_LOC_VALID)
-                if (problem_inpaint.HasParameterBlock(&points_new(j,i)[0]))
-                    problem_inpaint.SetParameterBlockConstant(&points_new(j,i)[0]);
+    {
+        ScopedMs timer(optimizer_timer_target(&OptimizerTiming::inpaint_problem_ms));
+        for(int j=used_area.y;j<used_area.br().y;j++)
+            for(int i=used_area.x;i<used_area.br().x;i++)
+                if (state(j,i) & STATE_LOC_VALID)
+                    if (problem_inpaint.HasParameterBlock(&points_new(j,i)[0]))
+                        problem_inpaint.SetParameterBlockConstant(&points_new(j,i)[0]);
+    }
 
-    ceres::Solve(options, &problem_inpaint, &summary);
+    {
+        ScopedMs timer(optimizer_timer_target(&OptimizerTiming::inpaint_solve_ms));
+        ceres::Solve(options, &problem_inpaint, &summary);
+    }
     std::cout << summary.BriefReport() << std::endl;
 
-    cv::Mat_<cv::Vec3d> points_inpainted = points_new.clone();
-
-    //TODO we could directly use higher res here?
+    cv::Mat_<cv::Vec3d> points_inpainted;
     cv::Mat_<cv::Vec3f> points_inpainted_f;
-    points_inpainted.convertTo(points_inpainted_f, CV_32FC3);
-    QuadSurface* sm_inp = new QuadSurface(points_inpainted_f, {1,1});
-
+    QuadSurface* sm_inp = nullptr;
     SurfTrackerData data_inp;
-    data_inp._data = data_new._data;
+    {
+        ScopedMs timer(optimizer_timer_target(&OptimizerTiming::inpaint_surface_setup_ms));
+        points_inpainted = points_new.clone();
 
-    for(int j=used_area.y;j<used_area.br().y;j++)
-        for(int i=used_area.x;i<used_area.br().x;i++)
-            if (new_state(j,i) & STATE_VALID) {
-                data_inp.surfs({j,i}).insert(sm_inp);
-                data_inp.loc(sm_inp, {j,i}) = {static_cast<double>(j),static_cast<double>(i)};
-            }
+        //TODO we could directly use higher res here?
+        points_inpainted.convertTo(points_inpainted_f, CV_32FC3);
+        sm_inp = new QuadSurface(points_inpainted_f, {1,1});
+
+        data_inp._data = data_new._data;
+
+        for(int j=used_area.y;j<used_area.br().y;j++)
+            for(int i=used_area.x;i<used_area.br().x;i++)
+                if (new_state(j,i) & STATE_VALID) {
+                    data_inp.surfs({j,i}).insert(sm_inp);
+                    data_inp.loc(sm_inp, {j,i}) = {static_cast<double>(j),static_cast<double>(i)};
+                }
+    }
 
     ceres::Problem problem;
 
     std::cout << "optimizer: using " << used_area.tl() << used_area.br() << std::endl;
 
     int fix_points = 0;
-    for(int j=used_area.y;j<used_area.br().y;j++)
-        for(int i=used_area.x;i<used_area.br().x;i++) {
-            if (!(new_state(j,i) & STATE_LOC_VALID)) continue;  // skip cells without valid locs
-            res_count += surftrack_add_global(sm_inp, {j,i}, data_inp, problem, new_state, points_new, step*src_step, LOSS_3D_INDIRECT | SURF_LOSS | OPTIMIZE_ALL);
-            fix_points++;
-            if (problem.HasParameterBlock(&data_inp.loc(sm_inp, {j,i})[0]))
-                problem.AddResidualBlock(LinChkDistLoss::Create(data_inp.loc(sm_inp, {j,i}), 1.0), nullptr, &data_inp.loc(sm_inp, {j,i})[0]);
-        }
+    {
+        ScopedMs timer(optimizer_timer_target(&OptimizerTiming::opt_problem_ms));
+        for(int j=used_area.y;j<used_area.br().y;j++)
+            for(int i=used_area.x;i<used_area.br().x;i++) {
+                if (!(new_state(j,i) & STATE_LOC_VALID)) continue;  // skip cells without valid locs
+                res_count += surftrack_add_global(sm_inp, {j,i}, data_inp, problem, new_state, points_new, step*src_step, LOSS_3D_INDIRECT | SURF_LOSS | OPTIMIZE_ALL);
+                fix_points++;
+                if (problem.HasParameterBlock(&data_inp.loc(sm_inp, {j,i})[0]))
+                    problem.AddResidualBlock(LinChkDistLoss::Create(data_inp.loc(sm_inp, {j,i}), 1.0), nullptr, &data_inp.loc(sm_inp, {j,i})[0]);
+            }
+    }
 
     std::cout << "optimizer: num fix points " << fix_points << std::endl;
 
@@ -526,33 +824,43 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     data_inp.seed_coord = points_new(seed);
 
     int fix_points_z = 0;
-    for(int j=used_area.y;j<used_area.br().y;j++)
-        for(int i=used_area.x;i<used_area.br().x;i++) {
-            if (!(new_state(j,i) & STATE_LOC_VALID)) continue;  // skip cells without valid locs
-            fix_points_z++;
-            if (problem.HasParameterBlock(&data_inp.loc(sm_inp, {j,i})[0]))
-                problem.AddResidualBlock(ZLocationLoss<cv::Vec3d>::Create(points_new, data_inp.seed_coord[2] - (j-data.seed_loc[0])*step*src_step, z_loc_loss_w), new ceres::HuberLoss(1.0), &data_inp.loc(sm_inp, {j,i})[0]);
-        }
+    {
+        ScopedMs timer(optimizer_timer_target(&OptimizerTiming::opt_problem_ms));
+        for(int j=used_area.y;j<used_area.br().y;j++)
+            for(int i=used_area.x;i<used_area.br().x;i++) {
+                if (!(new_state(j,i) & STATE_LOC_VALID)) continue;  // skip cells without valid locs
+                fix_points_z++;
+                if (problem.HasParameterBlock(&data_inp.loc(sm_inp, {j,i})[0]))
+                    problem.AddResidualBlock(ZLocationLoss<cv::Vec3d>::Create(points_new, data_inp.seed_coord[2] - (j-data.seed_loc[0])*step*src_step, z_loc_loss_w), new ceres::HuberLoss(1.0), &data_inp.loc(sm_inp, {j,i})[0]);
+            }
+    }
 
     std::cout << "optimizer: optimizing " << res_count << " residuals, seed " << seed << std::endl;
 
-    for(int j=used_area.y;j<used_area.br().y;j++)
-        for(int i=used_area.x;i<used_area.br().x;i++)
-            if (static_bounds.contains(cv::Point(i,j))) {
-                if (problem.HasParameterBlock(&data_inp.loc(sm_inp, {j,i})[0]))
-                    problem.SetParameterBlockConstant(&data_inp.loc(sm_inp, {j,i})[0]);
-                if (problem.HasParameterBlock(&points_new(j, i)[0]))
-                    problem.SetParameterBlockConstant(&points_new(j, i)[0]);
-            }
+    {
+        ScopedMs timer(optimizer_timer_target(&OptimizerTiming::opt_problem_ms));
+        for(int j=used_area.y;j<used_area.br().y;j++)
+            for(int i=used_area.x;i<used_area.br().x;i++)
+                if (static_bounds.contains(cv::Point(i,j))) {
+                    if (problem.HasParameterBlock(&data_inp.loc(sm_inp, {j,i})[0]))
+                        problem.SetParameterBlockConstant(&data_inp.loc(sm_inp, {j,i})[0]);
+                    if (problem.HasParameterBlock(&points_new(j, i)[0]))
+                        problem.SetParameterBlockConstant(&points_new(j, i)[0]);
+                }
+    }
 
     options.max_num_iterations = std::max(1, window_opt_max_iters);
     options.use_nonmonotonic_steps = false;
     options.use_inner_iterations = false;
-    ceres::Solve(options, &problem, &summary);
+    {
+        ScopedMs timer(optimizer_timer_target(&OptimizerTiming::opt_solve_ms));
+        ceres::Solve(options, &problem, &summary);
+    }
     std::cout << summary.FullReport() << std::endl;
     std::cout << "optimizer: rms " << sqrt(summary.final_cost/summary.num_residual_blocks) << " count " << summary.num_residual_blocks << std::endl;
 
     if (save_inp_hr) {
+        ScopedMs timer(optimizer_timer_target(&OptimizerTiming::save_inp_hr_ms));
         cv::Mat_<cv::Vec3f> points_hr_inp =
             surftrack_genpoints_hr(data, new_state, points_inpainted, used_area, step, src_step,
                                    /*inpaint=*/true,
@@ -579,10 +887,13 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
         }
     }
 
-    cv::Mat_<cv::Vec3f> points_hr =
-        surftrack_genpoints_hr(data, new_state, points_inpainted, used_area, step, src_step,
-                               /*inpaint=*/remap_use_inpaint,
-                               /*parallel=*/hr_gen_parallel);
+    cv::Mat_<cv::Vec3f> points_hr;
+    {
+        ScopedMs timer(optimizer_timer_target(&OptimizerTiming::hr_surface_gen_ms));
+        points_hr = surftrack_genpoints_hr(data, new_state, points_inpainted, used_area, step, src_step,
+                                           /*inpaint=*/remap_use_inpaint,
+                                           /*parallel=*/hr_gen_parallel);
+    }
     if (debug_diagnostics) {
         int valid_new_state = count_valid(new_state, used_area, STATE_LOC_VALID | STATE_COORD_VALID);
         std::cout << "[GrowSurface][diag] remap inputs new_state_valid=" << valid_new_state
@@ -601,6 +912,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     std::atomic<int> remap_loc_valid{0};
     std::atomic<int> remap_loc_oob{0};
     std::atomic<int> remap_loc_invalid{0};
+    {
+    ScopedMs timer(optimizer_timer_target(&OptimizerTiming::remap_ms));
 #pragma omp parallel for if(remap_parallel)
     for(int j=used_area.y;j<used_area.br().y;j++)
         for(int i=used_area.x;i<used_area.br().x;i++)
@@ -656,6 +969,9 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
                         #pragma omp atomic
                         pointTo_total_ms += _elapsed;
+                        if (timing) {
+                            add_ms_atomic(timing->point_to_ms, _elapsed);
+                        }
                         if (res <= thr) {
                             cv::Vec3f loc = s->loc_raw(ptr);
                             mutex.lock();
@@ -670,6 +986,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                     remap_loc_invalid.fetch_add(1, std::memory_order_relaxed);
                 }
             }
+    }
     std::cout << "remap: done" << std::endl;
     if (debug_diagnostics) {
         std::cout << "[GrowSurface][diag] remap loc_valid=" << remap_loc_valid.load(std::memory_order_relaxed)
@@ -679,20 +996,23 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                   << std::endl;
     }
 
-    //now filter by consistency
-    for(int j=used_area.y;j<used_area.br().y-1;j++)
-        for(int i=used_area.x;i<used_area.br().x-1;i++)
-            if (!static_bounds.contains(cv::Point(i,j)) && state_out(j,i) & STATE_VALID) {
-                SurfPtrSet surf_src = data_out.surfs({j,i});
-                for (auto s : surf_src) {
-                    int count;
-                    float cost = local_cost(s, {j,i}, data_out, state_out, points_out, step, src_step, &count);
-                    if (cost >= local_cost_inl_th /*|| count < 1*/) {
-                        data_out.erase(s, {j,i});
-                        data_out.eraseSurf(s, {j,i});
+    {
+        ScopedMs timer(optimizer_timer_target(&OptimizerTiming::remap_filter_ms));
+        //now filter by consistency
+        for(int j=used_area.y;j<used_area.br().y-1;j++)
+            for(int i=used_area.x;i<used_area.br().x-1;i++)
+                if (!static_bounds.contains(cv::Point(i,j)) && state_out(j,i) & STATE_VALID) {
+                    SurfPtrSet surf_src = data_out.surfs({j,i});
+                    for (auto s : surf_src) {
+                        int count;
+                        float cost = local_cost(s, {j,i}, data_out, state_out, points_out, step, src_step, &count);
+                        if (cost >= local_cost_inl_th /*|| count < 1*/) {
+                            data_out.erase(s, {j,i});
+                            data_out.eraseSurf(s, {j,i});
+                        }
                     }
                 }
-            }
+    }
 
     const int cols = state_out.cols;
     const int j_start = used_area.y;
@@ -709,6 +1029,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                 frontier.push_back(j * cols + i);
 
     int added = 1;
+    {
+    ScopedMs timer(optimizer_timer_target(&OptimizerTiming::remap_add_iters_ms));
     for (int r = 0; r < 30 && added && !frontier.empty(); ++r) {
         ALifeTime timer("optimizer: add iteration\n");
 
@@ -760,6 +1082,9 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
                         #pragma omp atomic
                         pointTo_total_ms += _elapsed;
+                        if (timing) {
+                            add_ms_atomic(timing->point_to_ms, _elapsed);
+                        }
                         if (_res > remap_attach_surface_th)
                             continue;
 
@@ -802,6 +1127,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
 
         std::cout << "optimizer: added " << added << std::endl;
     }
+    }
 
     if (debug_diagnostics) {
         int valid_pre_clean = 0;
@@ -817,6 +1143,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                   << " attached=" << attached_pre_clean << std::endl;
     }
 
+    {
+    ScopedMs timer(optimizer_timer_target(&OptimizerTiming::cleanup_ms));
     //reset unsupported points
 #pragma omp parallel for
     for(int j=used_area.y;j<used_area.br().y-1;j++)
@@ -853,7 +1181,11 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     // Cleanup temporary QuadSurface objects to avoid memory leak
     delete sm;
     delete sm_inp;
+    }
 
+    if (timing) {
+        timing->total_ms += elapsed_ms(optimizer_start);
+    }
     dbg_counter++;
 }
 
@@ -884,12 +1216,16 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     int window_opt_max_iters = params.value("window_opt_max_iters", 1000);
     if (window_opt_max_iters < 1)
         window_opt_max_iters = 1;
+    int timing_report_interval = params.value("timing_report_interval", 500);
+    if (timing_report_interval < 0)
+        timing_report_interval = 0;
 
 
     std::cout << "global_steps_per_window: " << global_steps_per_window << std::endl;
     std::cout << "window_inpaint_max_iters: " << window_inpaint_max_iters << std::endl;
     std::cout << "window_opt_max_iters: " << window_opt_max_iters << std::endl;
     std::cout << "global_step_max_iters: " << global_step_max_iters << std::endl;
+    std::cout << "timing_report_interval: " << timing_report_interval << std::endl;
     std::cout << "flip_x: " << flip_x_param << std::endl;
     if (!wrap_growth_direction_raw.empty() && !wrap_growth_direction_valid) {
         std::cout << "warning: unknown wrap_growth_direction '" << wrap_growth_direction_raw
@@ -2280,22 +2616,52 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     };
 
     bool skip_inpaint_next_opt = skip_inpaint;
+    GrowthTimingTotals timing_totals;
+    int timing_report_start_generation = 0;
     for(int generation=0;generation<stop_gen;generation++) {
+        const auto generation_timing_start = std::chrono::steady_clock::now();
+        const double point_to_generation_start_ms = pointTo_total_ms;
+        bool generation_timing_finished = false;
+        auto finish_generation_timing = [&](bool force_report) {
+            if (generation_timing_finished)
+                return;
+            generation_timing_finished = true;
+            timing_totals.generations++;
+            timing_totals.generation_total_ms += elapsed_ms(generation_timing_start);
+            timing_totals.point_to_ms += pointTo_total_ms - point_to_generation_start_ms;
+            const bool interval_report = timing_report_interval > 0 &&
+                                         generation > 0 &&
+                                         (generation % timing_report_interval) == 0;
+            if ((interval_report || force_report) && timing_totals.generations > 0) {
+                timing_totals.print(timing_report_start_generation, generation);
+                timing_totals.reset();
+                timing_report_start_generation = generation + 1;
+            }
+        };
         bool wrap_stats_refreshed_this_generation = false;
         const bool use_wrap_batch_refresh = (wrap_tracker && wrap_batch_refresh);
         bool fringe_rebuilt = false;
-        bool misconnect_pruned = prune_misconnects(generation, use_wrap_batch_refresh);
+        bool misconnect_pruned = false;
+        {
+            ScopedMs timer(timing_totals.prune_ms);
+            misconnect_pruned = prune_misconnects(generation, use_wrap_batch_refresh);
+        }
         if (misconnect_pruned) {
             reset_after_prune(true);
             skip_inpaint_next_opt = true;
             fringe_rebuilt = true;
         } else {
+            ScopedMs timer(timing_totals.build_savable_ms);
             build_savable_mask();
         }
         bool cleared_all = false;
         if (fringe_invalidate_interval > 0 && generation > 0 &&
             (generation % fringe_invalidate_interval) == 0) {
-            bool invalidated = invalidate_fringe_cells(use_wrap_batch_refresh, &cleared_all);
+            bool invalidated = false;
+            {
+                ScopedMs timer(timing_totals.invalidate_ms);
+                invalidated = invalidate_fringe_cells(use_wrap_batch_refresh, &cleared_all);
+            }
             if (invalidated && !cleared_all) {
                 reset_after_prune(true);
                 skip_inpaint_next_opt = true;
@@ -2303,11 +2669,13 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             }
             if (cleared_all) {
                 fringe.clear();
+                finish_generation_timing(true);
                 break;
             }
         }
         if (!fringe_rebuilt && fringe_full_rebuild_interval > 0 && generation > 0 &&
             (generation % fringe_full_rebuild_interval) == 0) {
+            ScopedMs timer(timing_totals.full_fringe_rebuild_ms);
             fringe.clearBorderFlags();
             build_savable_mask();
             fringe.rebuildBoundary();
@@ -2324,69 +2692,73 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             }
             return count;
         };
-        if (generation == 0 && !resume_prefilled) {
-            cands.insert(cv::Vec2i(y0-1,x0));
-        }
-        else
-            for(const auto& p : fringe)
-            {
-                if ((state(p) & STATE_LOC_VALID) == 0)
-                    continue;
-
-                fringe.incrementAttempts(p);
-                if (fringe.shouldPrune(p)) {
-                    int neighbor_count = valid_neighbor_count(p);
-                    if (neighbor_count >= 3) {
-                        fringe.resetAttempts(p);
-                    } else {
-                        if (state(p) & STATE_LOC_VALID) {
-                            auto &surfs_here = data.surfs(p);
-                            for (auto s : surfs_here)
-                                data.erase(s, p);
-                            surfs_here.clear();
-                        }
-                        state(p) = 0;
-                        points(p) = {-1,-1,-1};
-                        generations(p) = 0;
-                        inliers_sum_dbg(p) = 0;
-                        force_retry_count(p) = 0;
-                        force_retry_mark(p) = 0;
-                        umbilicus_sampled(p) = 0;
-                        fringe.resetAttempts(p);
-                        pruned_any = true;
-                        for (const auto& n : neighs) {
-                            cv::Vec2i pn = p + n;
-                            if (point_in_bounds(state, pn) && (state(pn) & STATE_LOC_VALID))
-                                fringe_requeue.insert(pn);
-                        }
-                        continue;
-                    }
-                }
-
-                for(const auto& n : neighs) {
-                    cv::Vec2i pn = p+n;
-                    if (!point_in_bounds(state, pn)) {
-                        fringe.checkBorderContact(pn, size);
-                        continue;
-                    }
-                    if (is_savable(pn) &&
-                        (state(pn) & STATE_PROCESSING) == 0 &&
-                        (state(pn) & STATE_LOC_VALID) == 0) {
-                        state(pn) |= STATE_PROCESSING;
-                        cands.insert(pn);
-                    }
-                }
+        {
+            ScopedMs timer(timing_totals.candidate_collect_ms);
+            if (generation == 0 && !resume_prefilled) {
+                cands.insert(cv::Vec2i(y0-1,x0));
             }
-        fringe.clear();
-        if (!fringe_requeue.empty()) {
-            for (const auto& p : fringe_requeue)
-                fringe.insert(p);
-        }
-        if (pruned_any) {
-            reset_after_prune(false);
+            else
+                for(const auto& p : fringe)
+                {
+                    if ((state(p) & STATE_LOC_VALID) == 0)
+                        continue;
+
+                    fringe.incrementAttempts(p);
+                    if (fringe.shouldPrune(p)) {
+                        int neighbor_count = valid_neighbor_count(p);
+                        if (neighbor_count >= 3) {
+                            fringe.resetAttempts(p);
+                        } else {
+                            if (state(p) & STATE_LOC_VALID) {
+                                auto &surfs_here = data.surfs(p);
+                                for (auto s : surfs_here)
+                                    data.erase(s, p);
+                                surfs_here.clear();
+                            }
+                            state(p) = 0;
+                            points(p) = {-1,-1,-1};
+                            generations(p) = 0;
+                            inliers_sum_dbg(p) = 0;
+                            force_retry_count(p) = 0;
+                            force_retry_mark(p) = 0;
+                            umbilicus_sampled(p) = 0;
+                            fringe.resetAttempts(p);
+                            pruned_any = true;
+                            for (const auto& n : neighs) {
+                                cv::Vec2i pn = p + n;
+                                if (point_in_bounds(state, pn) && (state(pn) & STATE_LOC_VALID))
+                                    fringe_requeue.insert(pn);
+                            }
+                            continue;
+                        }
+                    }
+
+                    for(const auto& n : neighs) {
+                        cv::Vec2i pn = p+n;
+                        if (!point_in_bounds(state, pn)) {
+                            fringe.checkBorderContact(pn, size);
+                            continue;
+                        }
+                        if (is_savable(pn) &&
+                            (state(pn) & STATE_PROCESSING) == 0 &&
+                            (state(pn) & STATE_LOC_VALID) == 0) {
+                            state(pn) |= STATE_PROCESSING;
+                            cands.insert(pn);
+                        }
+                    }
+                }
+            fringe.clear();
+            if (!fringe_requeue.empty()) {
+                for (const auto& p : fringe_requeue)
+                    fringe.insert(p);
+            }
+            if (pruned_any) {
+                reset_after_prune(false);
+            }
         }
 
         if (!force_retry.empty()) {
+            ScopedMs timer(timing_totals.force_retry_ms);
             for (const auto& p : force_retry) {
                 force_retry_mark(p) = 0;
                 if (state(p) & STATE_LOC_VALID)
@@ -2406,7 +2778,11 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
         }
 
         // Deterministic, sorted vector of candidates
-        std::vector<cv::Vec2i> cands_vec(cands.begin(), cands.end());
+        std::vector<cv::Vec2i> cands_vec;
+        {
+            ScopedMs timer(timing_totals.candidate_sort_ms);
+            cands_vec.assign(cands.begin(), cands.end());
+        }
 
         std::shared_mutex mutex;
         int best_inliers_gen = 0;
@@ -2433,6 +2809,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
 
             if (state(p) & STATE_LOC_VALID)
                 return;
+            add_int_atomic(timing_totals.candidates_processed, 1);
 
             if (points(p)[0] != -1)
                 throw std::runtime_error("oops points(p)[0]");
@@ -2442,30 +2819,34 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             std::unordered_map<QuadSurface*, int> local_counts;
             local_counts[seed] = 1;
 
-            mutex.lock_shared();
             SurfTrackerData &data_th = data_ths[omp_get_thread_num()];
-            int misses = 0;
-            for(const auto& added : added_points_threads[omp_get_thread_num()]) {
-                data_th.surfs(added) = data.surfs(added);
-                for (auto &s : data.surfsC(added)) {
-                    if (!data.has(s, added)) {
-                        // Inconsistent: surface present without a stored mapping.
-                        // Drop from thread-local set to avoid stale references.
-                        data_th.surfs(added).erase(s);
-                        misses++;
-                        continue;
+            {
+                ScopedAtomicMs timer(timing_totals.candidate_sync_ms);
+                mutex.lock_shared();
+                int misses = 0;
+                for(const auto& added : added_points_threads[omp_get_thread_num()]) {
+                    data_th.surfs(added) = data.surfs(added);
+                    for (auto &s : data.surfsC(added)) {
+                        if (!data.has(s, added)) {
+                            // Inconsistent: surface present without a stored mapping.
+                            // Drop from thread-local set to avoid stale references.
+                            data_th.surfs(added).erase(s);
+                            misses++;
+                            continue;
+                        }
+                        data_th.loc(s, added) = data.loc(s, added);
                     }
-                    data_th.loc(s, added) = data.loc(s, added);
                 }
+                if (misses) {
+                    std::cout << "grow: cleaned " << misses << " stale surface refs in thread-local cache" << std::endl;
+                }
+                mutex.unlock_shared();
+                mutex.lock();
+                added_points_threads[omp_get_thread_num()].resize(0);
+                mutex.unlock();
             }
-            if (misses) {
-                std::cout << "grow: cleaned " << misses << " stale surface refs in thread-local cache" << std::endl;
-            }
-            mutex.unlock_shared();
-            mutex.lock();
-            added_points_threads[omp_get_thread_num()].resize(0);
-            mutex.unlock();
 
+            const auto local_surface_start = std::chrono::steady_clock::now();
             // Build local_surfs from valid neighbors
             for(int oy=std::max(p[0]-r,0);oy<=std::min(p[0]+r,h-1);oy++)
                 for(int ox=std::max(p[1]-r,0);ox<=std::min(p[1]+r,w-1);ox++)
@@ -2512,6 +2893,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                       [&](QuadSurface* a, QuadSurface* b) {
                           return a->id < b->id;
                       });
+            add_ms_atomic(timing_totals.candidate_local_surface_ms, elapsed_ms(local_surface_start));
 
             cv::Vec3d best_coord = {-1,-1,-1};
             int best_inliers = -1;
@@ -2544,36 +2926,41 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                 double j1 = det_jitter_symm(p[0], p[1], salt ^ 0x9e3779b97f4a7c15ULL) * deterministic_jitter_px;
                 data_th.loc(ref_surf,p) = avg + cv::Vec2d(j0, j1);
 
-                ceres::Problem problem;
-
-                state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
-
-                int straight_count_init = 0;
-                int count_init = surftrack_add_local(ref_surf, p, data_th, problem, state, points, step, src_step, LOSS_ZLOC | LOSS_3D_INDIRECT, &straight_count_init);
-                if (count_init == 0) {
-                    state(p) = 0;
-                    points(p) = {-1,-1,-1};
-                    generations(p) = 0;
-                    data_th.erase(ref_surf, p);
-                    continue;
-                }
-                ceres::Solver::Summary summary;
-                ceres::Solve(options, &problem, &summary);
-                float cost_init = sqrt(summary.final_cost/count_init);
-
                 bool fail = false;
-                cv::Vec2d ref_loc = data_th.loc(ref_surf,p);
-
-                if (!data_th.valid_int(ref_surf,p))
-                    fail = true;
-
                 cv::Vec3d coord;
+                cv::Vec2d ref_loc;
+                {
+                    ScopedAtomicMs timer(timing_totals.candidate_ref_init_solve_ms);
+                    ceres::Problem problem;
 
-                if (!fail) {
-                    coord = data_th.lookup_int(ref_surf,p);
-                    if (coord[0] == -1)
+                    state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
+
+                    int straight_count_init = 0;
+                    int count_init = surftrack_add_local(ref_surf, p, data_th, problem, state, points, step, src_step, LOSS_ZLOC | LOSS_3D_INDIRECT, &straight_count_init);
+                    if (count_init == 0) {
+                        state(p) = 0;
+                        points(p) = {-1,-1,-1};
+                        generations(p) = 0;
+                        data_th.erase(ref_surf, p);
+                        continue;
+                    }
+                    ceres::Solver::Summary summary;
+                    ceres::Solve(options, &problem, &summary);
+                    float cost_init = sqrt(summary.final_cost/count_init);
+                    (void)cost_init;
+
+                    ref_loc = data_th.loc(ref_surf,p);
+
+                    if (!data_th.valid_int(ref_surf,p))
                         fail = true;
+
+                    if (!fail) {
+                        coord = data_th.lookup_int(ref_surf,p);
+                        if (coord[0] == -1)
+                            fail = true;
+                    }
                 }
+
 
                 if (fail) {
                     state(p) = 0;
@@ -2590,29 +2977,32 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                 int inliers_sum = 0;
                 int inliers_count = 0;
 
-                for(auto test_surf : test_surfs) {
-                    //FIXME this does not check geometry, only if its also on the surfaces (which might be good enough...)
-                    auto _t0 = std::chrono::steady_clock::now();
-                    cv::Vec3f ptr;
-                    float _res = pointTo_seeded_neighbor(test_surf, data_th, state, p, coord,
-                                                         assoc_surface_th, point_to_max_iters, patch_index_ptr, &ptr);
-                    double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
-                    #pragma omp atomic
-                    pointTo_total_ms += _elapsed;
-                    if (_res <= assoc_surface_th) {
-                        cv::Vec3f loc = test_surf->loc_raw(ptr);
-                        int count = 0;
-                        int straight_count = 0;
-                        state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
-                        data_th.loc(test_surf, p) = {loc[1], loc[0]};
-                        float cost = local_cost(test_surf, p, data_th, state, points, step, src_step, &count, &straight_count);
-                        state(p) = 0;
-                        points(p) = {-1,-1,-1};
-                        generations(p) = 0;
-                        data_th.erase(test_surf, p);
-                        if (cost < local_cost_inl_th && (ref_seed || (count >= 2 && straight_count >= straight_min_count))) {
-                            inliers_sum += count;
-                            inliers_count++;
+                {
+                    ScopedAtomicMs timer(timing_totals.candidate_inlier_eval_ms);
+                    for(auto test_surf : test_surfs) {
+                        //FIXME this does not check geometry, only if its also on the surfaces (which might be good enough...)
+                        auto _t0 = std::chrono::steady_clock::now();
+                        cv::Vec3f ptr;
+                        float _res = pointTo_seeded_neighbor(test_surf, data_th, state, p, coord,
+                                                             assoc_surface_th, point_to_max_iters, patch_index_ptr, &ptr);
+                        double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
+                        #pragma omp atomic
+                        pointTo_total_ms += _elapsed;
+                        if (_res <= assoc_surface_th) {
+                            cv::Vec3f loc = test_surf->loc_raw(ptr);
+                            int count = 0;
+                            int straight_count = 0;
+                            state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
+                            data_th.loc(test_surf, p) = {loc[1], loc[0]};
+                            float cost = local_cost(test_surf, p, data_th, state, points, step, src_step, &count, &straight_count);
+                            state(p) = 0;
+                            points(p) = {-1,-1,-1};
+                            generations(p) = 0;
+                            data_th.erase(test_surf, p);
+                            if (cost < local_cost_inl_th && (ref_seed || (count >= 2 && straight_count >= straight_min_count))) {
+                                inliers_sum += count;
+                                inliers_count++;
+                            }
                         }
                     }
                 }
@@ -2635,6 +3025,8 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                 throw std::runtime_error("oops points(p)[0]");
 
             // Guard against duplicating existing 3D coords.
+            {
+            ScopedAtomicMs timer(timing_totals.candidate_duplicate_check_ms);
             if (best_inliers >= curr_best_inl_th || best_ref_seed)
             {
                 if (enforce_z_range && (best_coord[2] < z_min || best_coord[2] > z_max)) {
@@ -2678,22 +3070,29 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                     }
                 }
             }
+            }
 
             if (best_inliers >= curr_best_inl_th || best_ref_seed) {
+                add_int_atomic(timing_totals.candidates_accepted, 1);
                 if (best_coord[0] == -1)
                     throw std::runtime_error("oops best_cord[0]");
 
-                data_th.surfs(p).insert(best_surf);
-                data_th.loc(best_surf, p) = best_loc;
-                state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
-                points(p) = best_coord;
+                {
+                    ScopedAtomicMs timer(timing_totals.candidate_accept_setup_ms);
+                    data_th.surfs(p).insert(best_surf);
+                    data_th.loc(best_surf, p) = best_loc;
+                    state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
+                    points(p) = best_coord;
+                }
 
                 if (wrap_tracker && !use_wrap_batch_refresh) {
+                    ScopedAtomicMs timer(timing_totals.candidate_wrap_set_ms);
                     wrap_tracker->set_cell(p, best_coord);
                 }
 
                 // Collect samples for dynamic umbilicus estimation (per-row)
                 if (umbilicus_estimator && !umbilicus_estimator->has_center(p[0])) {
+                    ScopedAtomicMs timer(timing_totals.candidate_umbilicus_sample_ms);
                     if (!umbilicus_sampled(p)) {
                         cv::Vec3f normal = grid_normal(
                             points, cv::Vec3f(static_cast<float>(p[1]), static_cast<float>(p[0]), 0.0f));
@@ -2711,81 +3110,96 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                 generations(p) = static_cast<uint16_t>(std::min<int>(std::numeric_limits<uint16_t>::max(), generation + 1));
 
                 ceres::Problem problem;
-                surftrack_add_local(best_surf, p, data_th, problem, state, points, step, src_step, SURF_LOSS | LOSS_ZLOC | LOSS_3D_INDIRECT);
+                {
+                    ScopedAtomicMs timer(timing_totals.candidate_problem_build_ms);
+                    surftrack_add_local(best_surf, p, data_th, problem, state, points, step, src_step, SURF_LOSS | LOSS_ZLOC | LOSS_3D_INDIRECT);
 
-                // Add wrap-aware losses if enabled
-                if (wrap_tracker) {
-                    add_wrap_losses(p, points, state, problem, wrap_tracker.get());
+                    // Add wrap-aware losses if enabled
+                    if (wrap_tracker) {
+                        add_wrap_losses(p, points, state, problem, wrap_tracker.get());
+                    }
                 }
 
                 SurfPtrSet more_local_surfs;
 
-                for(auto test_surf : test_surfs) {
-                    for(auto s : overlapping_map[test_surf])
-                        if (!local_surfs_filtered.contains(s) && s != best_surf)
-                            more_local_surfs.insert(s);
+                {
+                    ScopedAtomicMs timer(timing_totals.candidate_overlap_attach_ms);
+                    for(auto test_surf : test_surfs) {
+                        for(auto s : overlapping_map[test_surf])
+                            if (!local_surfs_filtered.contains(s) && s != best_surf)
+                                more_local_surfs.insert(s);
 
-                    if (test_surf == best_surf)
-                        continue;
-
-                    auto _t0 = std::chrono::steady_clock::now();
-                    cv::Vec3f ptr;
-                    float _res = pointTo_seeded_neighbor(test_surf, data_th, state, p, best_coord,
-                                                         assoc_surface_th, point_to_max_iters, patch_index_ptr, &ptr);
-                    double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
-                    #pragma omp atomic
-                    pointTo_total_ms += _elapsed;
-                    if (_res <= assoc_surface_th) {
-                        cv::Vec3f loc = test_surf->loc_raw(ptr);
-                        cv::Vec3f coord = SurfTrackerData::lookup_int_loc(test_surf, {loc[1], loc[0]});
-                        if (coord[0] == -1) {
+                        if (test_surf == best_surf)
                             continue;
+
+                        auto _t0 = std::chrono::steady_clock::now();
+                        cv::Vec3f ptr;
+                        float _res = pointTo_seeded_neighbor(test_surf, data_th, state, p, best_coord,
+                                                             assoc_surface_th, point_to_max_iters, patch_index_ptr, &ptr);
+                        double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
+                        #pragma omp atomic
+                        pointTo_total_ms += _elapsed;
+                        if (_res <= assoc_surface_th) {
+                            cv::Vec3f loc = test_surf->loc_raw(ptr);
+                            cv::Vec3f coord = SurfTrackerData::lookup_int_loc(test_surf, {loc[1], loc[0]});
+                            if (coord[0] == -1) {
+                                continue;
+                            }
+                            int count = 0;
+                            float cost = local_cost_destructive(test_surf, p, data_th, state, points, step, src_step, loc, &count);
+                            if (cost < local_cost_inl_th) {
+                                data_th.loc(test_surf, p) = {loc[1], loc[0]};
+                                data_th.surfs(p).insert(test_surf);
+                                surftrack_add_local(test_surf, p, data_th, problem, state, points, step, src_step, SURF_LOSS | LOSS_ZLOC | LOSS_3D_INDIRECT);
+                            }
+                            else
+                                data_th.erase(test_surf, p);
                         }
-                        int count = 0;
-                        float cost = local_cost_destructive(test_surf, p, data_th, state, points, step, src_step, loc, &count);
-                        if (cost < local_cost_inl_th) {
-                            data_th.loc(test_surf, p) = {loc[1], loc[0]};
-                            data_th.surfs(p).insert(test_surf);
-                            surftrack_add_local(test_surf, p, data_th, problem, state, points, step, src_step, SURF_LOSS | LOSS_ZLOC | LOSS_3D_INDIRECT);
-                        }
-                        else
-                            data_th.erase(test_surf, p);
                     }
                 }
 
                 ceres::Solver::Summary summary;
 
-                ceres::Solve(options, &problem, &summary);
+                {
+                    ScopedAtomicMs timer(timing_totals.candidate_local_solve_ms);
+                    ceres::Solve(options, &problem, &summary);
+                }
 
                 if (wrap_tracker && use_wrap_batch_refresh) {
+                    ScopedAtomicMs timer(timing_totals.candidate_wrap_set_ms);
                     wrap_tracker->set_cell(p, points(p));
                     wrap_rows_touched[p[0]].store(1, std::memory_order_relaxed);
                 }
 
                 //TODO only add/test if we have 2 neighs which both find locations
-                for(auto test_surf : test_surfs) {
-                    auto _t0 = std::chrono::steady_clock::now();
-                    cv::Vec3f ptr;
-                    float res = pointTo_seeded_neighbor(test_surf, data_th, state, p, best_coord,
-                                                        assoc_surface_th, point_to_max_iters, patch_index_ptr, &ptr);
-                    double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
-                    #pragma omp atomic
-                    pointTo_total_ms += _elapsed;
-                    if (res <= assoc_surface_th) {
-                        cv::Vec3f loc = test_surf->loc_raw(ptr);
-                        cv::Vec3f coord = SurfTrackerData::lookup_int_loc(test_surf, {loc[1], loc[0]});
-                        if (coord[0] == -1) {
-                            continue;
-                        }
-                        int count = 0;
-                        float cost = local_cost_destructive(test_surf, p, data_th, state, points, step, src_step, loc, &count);
-                        if (cost < local_cost_inl_th) {
-                            data_th.loc(test_surf, p) = {loc[1], loc[0]};
-                            data_th.surfs(p).insert(test_surf);
+                {
+                    ScopedAtomicMs timer(timing_totals.candidate_post_attach_ms);
+                    for(auto test_surf : test_surfs) {
+                        auto _t0 = std::chrono::steady_clock::now();
+                        cv::Vec3f ptr;
+                        float res = pointTo_seeded_neighbor(test_surf, data_th, state, p, best_coord,
+                                                            assoc_surface_th, point_to_max_iters, patch_index_ptr, &ptr);
+                        double _elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - _t0).count();
+                        #pragma omp atomic
+                        pointTo_total_ms += _elapsed;
+                        if (res <= assoc_surface_th) {
+                            cv::Vec3f loc = test_surf->loc_raw(ptr);
+                            cv::Vec3f coord = SurfTrackerData::lookup_int_loc(test_surf, {loc[1], loc[0]});
+                            if (coord[0] == -1) {
+                                continue;
+                            }
+                            int count = 0;
+                            float cost = local_cost_destructive(test_surf, p, data_th, state, points, step, src_step, loc, &count);
+                            if (cost < local_cost_inl_th) {
+                                data_th.loc(test_surf, p) = {loc[1], loc[0]};
+                                data_th.surfs(p).insert(test_surf);
+                            };
                         };
                     }
                 }
 
+                {
+                ScopedAtomicMs timer(timing_totals.candidate_commit_ms);
                 mutex.lock();
                 succ++;
 
@@ -2820,6 +3234,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                 area_accum_vox2 += maybe_quad_area_and_mark(p[0]  , p[1]-1, state, points, quad_done);
                 area_accum_vox2 += maybe_quad_area_and_mark(p[0]  , p[1]  , state, points, quad_done);
                 mutex.unlock();
+                }
             }
             else if (best_inliers == -1) {
                 //just try again some other time
@@ -2886,12 +3301,16 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             }
         };
 
-        if (use_spread_out_ordering)
-            process_cands_spread();
-        else
-            process_cands_row_col();
+        {
+            ScopedMs timer(timing_totals.candidate_process_wall_ms);
+            if (use_spread_out_ordering)
+                process_cands_spread();
+            else
+                process_cands_row_col();
+        }
 
         if (mirror_pending && !mirror_done && generation >= mirror_ready_generation) {
+            ScopedMs timer(timing_totals.mirror_ms);
             data.flip_x(x0);
 
             for(int i=0;i<omp_get_max_threads();i++) {
@@ -2988,6 +3407,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
         }
 
         if (use_wrap_batch_refresh) {
+            ScopedMs timer(timing_totals.wrap_batch_refresh_ms);
             for (int row = 0; row < h; ++row) {
                 if (!wrap_rows_touched[row].load(std::memory_order_relaxed)) {
                     continue;
@@ -2999,6 +3419,8 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             }
         }
 
+        {
+        ScopedMs timer(timing_totals.threshold_ms);
         int inl_lower_bound_reg = params.value("consensus_default_th", 10);
         int inl_lower_bound_b = params.value("consensus_limit_th", 2);
         int inl_lower_bound = inl_lower_bound_reg;
@@ -3012,12 +3434,16 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             fringe.rebuildIncremental(2);
         } else
             curr_best_inl_th = inlier_base_threshold;
+        }
 
+        {
+        ScopedMs timer(timing_totals.loc_count_ms);
         loc_valid_count = 0;
         for(int j=used_area.y;j<used_area.br().y-1;j++)
             for(int i=used_area.x;i<used_area.br().x-1;i++)
                 if (state(j,i) & STATE_LOC_VALID)
                     loc_valid_count++;
+        }
 
         bool update_mapping = (succ >= 1000 && (loc_valid_count-last_succ_parametrization) >= std::max(100.0, 0.3*last_succ_parametrization));
         if (fringe.empty() && final_opts) {
@@ -3036,6 +3462,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
         }
 
         if (save_generation_debug) {
+            ScopedMs timer(timing_totals.debug_save_ms);
             {
                 cv::Mat_<cv::Vec3f> points_hr =
                     surftrack_genpoints_hr(data, state, points, used_area, step, src_step,
@@ -3072,40 +3499,60 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
 
         //lets just see what happens
         if (update_mapping) {
+            ScopedMs global_timer(timing_totals.global_total_ms);
+            timing_totals.global_opt_count++;
             global_opt_count++;
             bool save_inp_hr = (global_opt_count % 5 == 0);
             dbg_counter = generation;
-            SurfTrackerData opt_data = data;
-            cv::Rect all(0,0,w, h);
-            cv::Mat_<uint8_t> opt_state = state.clone();
-            cv::Mat_<cv::Vec3d> opt_points = points.clone();
-            cv::Mat_<uint16_t> opt_generations = generations.clone();
+            SurfTrackerData opt_data;
+            cv::Mat_<uint8_t> opt_state;
+            cv::Mat_<cv::Vec3d> opt_points;
+            cv::Mat_<uint16_t> opt_generations;
+            cv::Rect active;
+            {
+                ScopedMs timer(timing_totals.global_setup_ms);
+                opt_data = data;
+                opt_state = state.clone();
+                opt_points = points.clone();
+                opt_generations = generations.clone();
+                active = active_bounds & used_area;
+            }
 
-            cv::Rect active = active_bounds & used_area;
-            optimize_surface_mapping(opt_data, opt_state, opt_points, opt_generations, active, static_bounds, step, src_step,
-                                     {y0,x0}, closing_r, overlapping_map, patch_index_ptr,
-                                     window_inpaint_max_iters, window_opt_max_iters,
-                                     save_inp_hr, tgt_dir, &last_inp_hr_surface_uuid,
-                                     /*hr_gen_parallel=*/params.value("hr_gen_parallel", false),
-                                     /*remap_parallel=*/params.value("remap_parallel", false),
-                                     /*use_cuda_sparse=*/params.value("use_cuda_sparse", true),
-                                     wrap_tracker.get(),
-                                     remap_use_inpaint,
-                                     debug_diagnostics,
-                                     skip_inpaint_next_opt);
+            OptimizerTiming optimizer_timing;
+            {
+                ScopedMs timer(timing_totals.global_optimize_ms);
+                optimize_surface_mapping(opt_data, opt_state, opt_points, opt_generations, active, static_bounds, step, src_step,
+                                         {y0,x0}, closing_r, overlapping_map, patch_index_ptr,
+                                         window_inpaint_max_iters, window_opt_max_iters,
+                                         save_inp_hr, tgt_dir, &last_inp_hr_surface_uuid,
+                                         /*hr_gen_parallel=*/params.value("hr_gen_parallel", false),
+                                         /*remap_parallel=*/params.value("remap_parallel", false),
+                                         /*use_cuda_sparse=*/params.value("use_cuda_sparse", true),
+                                         wrap_tracker.get(),
+                                         remap_use_inpaint,
+                                         debug_diagnostics,
+                                         skip_inpaint_next_opt,
+                                         &optimizer_timing);
+            }
+            timing_totals.optimizer.add(optimizer_timing);
+            optimizer_timing.print(std::cout, "[Timing] optimizer_call");
             skip_inpaint_next_opt = skip_inpaint;
             if (active.area() > 0) {
-                copy(opt_data, data, active);
-                opt_points(active).copyTo(points(active));
-                opt_state(active).copyTo(state(active));
-                opt_generations(active).copyTo(generations(active));
-                for (int j = active.y; j < active.br().y; ++j)
-                    for (int i = active.x; i < active.br().x; ++i) {
-                        force_retry_count(j, i) = 0;
-                        force_retry_mark(j, i) = 0;
-                    }
+                {
+                    ScopedMs timer(timing_totals.global_copy_ms);
+                    copy(opt_data, data, active);
+                    opt_points(active).copyTo(points(active));
+                    opt_state(active).copyTo(state(active));
+                    opt_generations(active).copyTo(generations(active));
+                    for (int j = active.y; j < active.br().y; ++j)
+                        for (int i = active.x; i < active.br().x; ++i) {
+                            force_retry_count(j, i) = 0;
+                            force_retry_mark(j, i) = 0;
+                        }
+                }
 
                 if (wrap_tracker) {
+                    ScopedMs timer(timing_totals.global_wrap_rebuild_ms);
                     const auto& umbilicus = wrap_tracker->umbilicus();
                     const bool flip_x_local = wrap_tracker->flip_x();
                     auto new_tracker = std::make_unique<vc::wrap_tracking::WrapTracker>(
@@ -3135,29 +3582,39 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                     wrap_tracker = std::move(new_tracker);
                 }
 
-                for(int i=0;i<omp_get_max_threads();i++) {
-                    data_ths[i] = data;
-                    added_points_threads[i].resize(0);
+                {
+                    ScopedMs timer(timing_totals.global_thread_reset_ms);
+                    for(int i=0;i<omp_get_max_threads();i++) {
+                        data_ths[i] = data;
+                        added_points_threads[i].resize(0);
+                    }
+                    force_retry.clear();
                 }
-                force_retry.clear();
                 // After remap, geometry/states may have changed -> recompute area mask/accumulator
-                init_area_scan();
+                {
+                    ScopedMs timer(timing_totals.global_area_scan_ms);
+                    init_area_scan();
+                }
             }
 
             last_succ_parametrization = loc_valid_count;
             //recalc fringe after surface optimization (which often shrinks the surf)
             curr_best_inl_th = inlier_base_threshold;
-            if (fringe_full_boundary) {
-                build_savable_mask();
-                fringe.rebuildBoundary();
-            } else {
-                fringe.rebuildIncremental(2);
+            {
+                ScopedMs timer(timing_totals.global_fringe_rebuild_ms);
+                if (fringe_full_boundary) {
+                    build_savable_mask();
+                    fringe.rebuildBoundary();
+                } else {
+                    fringe.rebuildIncremental(2);
+                }
             }
         }
 
         const double current_area_vx2 = area_accum_vox2;
         const double current_area_cm2 = current_area_vx2 * double(voxelsize) * double(voxelsize) / 1e8;
         if (generation % 100 == 0) {
+            ScopedMs timer(timing_totals.progress_log_ms);
             printf("gen %d processing %lu fringe cands (total done %d fringe: %lu) area %.0f vx^2 (%f cm^2) best th: %d\n",
                    generation, static_cast<unsigned long>(cands.size()), succ, static_cast<unsigned long>(fringe.size()),
                    current_area_vx2, current_area_cm2, best_inliers_gen);
@@ -3165,20 +3622,32 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
 
         // Update wrap tracking statistics periodically
         if (wrap_tracker && generation > 0 && generation % wrap_stats_update_interval == 0) {
+            ScopedMs wrap_total_timer(timing_totals.wrap_stats_total_ms);
+            timing_totals.wrap_stats_count++;
             if (!wrap_stats_refreshed_this_generation) {
                 std::cout << "[WrapTracker] Updating stats at gen " << generation << std::endl;
                 // Unwrap all rows with valid cells
-                for (int row = 0; row < h; ++row) {
-                    wrap_tracker->unwrap_row(row, state);
+                {
+                    ScopedMs timer(timing_totals.wrap_stats_unwrap_ms);
+                    for (int row = 0; row < h; ++row) {
+                        wrap_tracker->unwrap_row(row, state);
+                    }
                 }
                 // Correct wrap errors using row-to-row consistency
-                for (int row = 0; row < h; ++row) {
-                    wrap_tracker->correct_wrap_from_neighbors(row, state);
+                {
+                    ScopedMs timer(timing_totals.wrap_stats_correct_ms);
+                    for (int row = 0; row < h; ++row) {
+                        wrap_tracker->correct_wrap_from_neighbors(row, state);
+                    }
                 }
-                wrap_tracker->compute_statistics(state);
+                {
+                    ScopedMs timer(timing_totals.wrap_stats_compute_ms);
+                    wrap_tracker->compute_statistics(state);
+                }
                 wrap_stats_refreshed_this_generation = true;
             }
             if (wrap_debug_tif_interval > 0 && generation % wrap_debug_tif_interval == 0) {
+                ScopedMs timer(timing_totals.wrap_debug_tif_ms);
                 try {
                     write_wrap_debug_tifs(state, used_area, generation, tgt_dir, wrap_tracker.get());
                 } catch (const std::exception& ex) {
@@ -3189,36 +3658,44 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
 
         // Dynamic umbilicus estimation: update wrap_tracker as new rows wrap around
         if (umbilicus_estimator && generation > 0 && generation % wrap_stats_update_interval == 0) {
+            ScopedMs umbilicus_total_timer(timing_totals.umbilicus_total_ms);
+            timing_totals.umbilicus_count++;
             int sampled_attempts = 0;
             int sampled_added = 0;
             int sampled_invalid = 0;
             cv::Rect sample_area = used_area & cv::Rect(0, 0, points.cols, points.rows);
-            for (int row = sample_area.y; row < sample_area.br().y; ++row) {
-                if (umbilicus_estimator->has_center(row)) {
-                    continue;
-                }
-                for (int col = sample_area.x; col < sample_area.br().x; ++col) {
-                    if (!(state(row, col) & STATE_COORD_VALID)) {
+            {
+                ScopedMs timer(timing_totals.umbilicus_sample_scan_ms);
+                for (int row = sample_area.y; row < sample_area.br().y; ++row) {
+                    if (umbilicus_estimator->has_center(row)) {
                         continue;
                     }
-                    if (umbilicus_sampled(row, col)) {
-                        continue;
-                    }
-                    sampled_attempts++;
-                    cv::Vec3f normal = grid_normal(
-                        points, cv::Vec3f(static_cast<float>(col), static_cast<float>(row), 0.0f));
-                    if (std::isfinite(normal[0]) && std::isfinite(normal[1]) && std::isfinite(normal[2]) &&
-                        (normal[0] != 0 || normal[1] != 0 || normal[2] != 0)) {
-                        umbilicus_estimator->add_sample(row, points(row, col), normal);
-                        umbilicus_sampled(row, col) = 1;
-                        sampled_added++;
-                    } else {
-                        sampled_invalid++;
+                    for (int col = sample_area.x; col < sample_area.br().x; ++col) {
+                        if (!(state(row, col) & STATE_COORD_VALID)) {
+                            continue;
+                        }
+                        if (umbilicus_sampled(row, col)) {
+                            continue;
+                        }
+                        sampled_attempts++;
+                        cv::Vec3f normal = grid_normal(
+                            points, cv::Vec3f(static_cast<float>(col), static_cast<float>(row), 0.0f));
+                        if (std::isfinite(normal[0]) && std::isfinite(normal[1]) && std::isfinite(normal[2]) &&
+                            (normal[0] != 0 || normal[1] != 0 || normal[2] != 0)) {
+                            umbilicus_estimator->add_sample(row, points(row, col), normal);
+                            umbilicus_sampled(row, col) = 1;
+                            sampled_added++;
+                        } else {
+                            sampled_invalid++;
+                        }
                     }
                 }
             }
             // Orient normals toward mesh centroid before estimation
-            umbilicus_estimator->orient_normals_to_centroid();
+            {
+                ScopedMs timer(timing_totals.umbilicus_orient_ms);
+                umbilicus_estimator->orient_normals_to_centroid();
+            }
             // Scan rows that have wrapped around and estimate centers
             int centers_estimated = 0;
             int rows_wrapped = 0;
@@ -3226,24 +3703,27 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             int rows_with_min_samples = 0;
             int max_samples = 0;
             const int min_wrap_samples = 8;
-            for (int row = 0; row < points.rows; ++row) {
-                int sample_count = umbilicus_estimator->sample_count(row);
-                if (sample_count > 0) {
-                    rows_with_samples++;
-                    if (sample_count >= min_wrap_samples) {
-                        rows_with_min_samples++;
+            {
+                ScopedMs timer(timing_totals.umbilicus_row_scan_ms);
+                for (int row = 0; row < points.rows; ++row) {
+                    int sample_count = umbilicus_estimator->sample_count(row);
+                    if (sample_count > 0) {
+                        rows_with_samples++;
+                        if (sample_count >= min_wrap_samples) {
+                            rows_with_min_samples++;
+                        }
+                        if (sample_count > max_samples) {
+                            max_samples = sample_count;
+                        }
                     }
-                    if (sample_count > max_samples) {
-                        max_samples = sample_count;
-                    }
-                }
-                if (umbilicus_estimator->has_wrapped(row)) {
-                    rows_wrapped++;
-                    if (!umbilicus_estimator->has_center(row)) {
-                        cv::Vec2d center;
-                        double mean_z;
-                        if (umbilicus_estimator->estimate_center(row, &center, &mean_z)) {
-                            centers_estimated++;
+                    if (umbilicus_estimator->has_wrapped(row)) {
+                        rows_wrapped++;
+                        if (!umbilicus_estimator->has_center(row)) {
+                            cv::Vec2d center;
+                            double mean_z;
+                            if (umbilicus_estimator->estimate_center(row, &center, &mean_z)) {
+                                centers_estimated++;
+                            }
                         }
                     }
                 }
@@ -3251,6 +3731,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             // Retry pending rows every 50 generations
             int centers_from_retry = 0;
             if (generation % 50 == 0 && generation > 0) {
+                ScopedMs timer(timing_totals.umbilicus_retry_ms);
                 centers_from_retry = umbilicus_estimator->retry_pending_rows();
             }
 
@@ -3270,6 +3751,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             // Write JSON if we have any accepted centers
             // Write to paths/ directory (one level up from tgt_dir which is paths/segment/)
             if ((centers_estimated > 0 || centers_from_retry > 0) && centers_total > 0) {
+                ScopedMs timer(timing_totals.umbilicus_write_json_ms);
                 std::filesystem::path paths_dir = tgt_dir.parent_path();
                 std::filesystem::path json_path = paths_dir / "estimated_umbilicus.json";
                 umbilicus_estimator->write_json(json_path.string());
@@ -3278,28 +3760,35 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             // Once we have new rows estimated, rebuild the umbilicus
             if (centers_estimated > 0 || centers_from_retry > 0) {
                 try {
-                    auto built_umbilicus = umbilicus_estimator->build_umbilicus(volume_shape);
-                    apply_umbilicus_seam(built_umbilicus);
-                    auto new_umbilicus = std::make_unique<vc::core::util::Umbilicus>(std::move(built_umbilicus));
-                    apply_wrap_growth_direction(*new_umbilicus);
-                    auto new_tracker = std::make_unique<vc::wrap_tracking::WrapTracker>(
-                        *new_umbilicus, points.rows, points.cols, wrap_flip_x);
-                    double seed_theta_ref = seed_theta_reference(*new_umbilicus);
-                    new_tracker->initialize_from_seed(data.seed_coord, data.seed_loc[1], seed_theta_ref);
-                    // Populate existing cells
-                    for (int r = 0; r < points.rows; ++r) {
-                        for (int c = 0; c < points.cols; ++c) {
-                            if (state(r, c) & STATE_COORD_VALID) {
-                                new_tracker->set_cell({r, c}, points(r, c));
+                    std::unique_ptr<vc::core::util::Umbilicus> new_umbilicus;
+                    {
+                        ScopedMs timer(timing_totals.umbilicus_build_ms);
+                        auto built_umbilicus = umbilicus_estimator->build_umbilicus(volume_shape);
+                        apply_umbilicus_seam(built_umbilicus);
+                        new_umbilicus = std::make_unique<vc::core::util::Umbilicus>(std::move(built_umbilicus));
+                        apply_wrap_growth_direction(*new_umbilicus);
+                    }
+                    {
+                        ScopedMs timer(timing_totals.umbilicus_tracker_rebuild_ms);
+                        auto new_tracker = std::make_unique<vc::wrap_tracking::WrapTracker>(
+                            *new_umbilicus, points.rows, points.cols, wrap_flip_x);
+                        double seed_theta_ref = seed_theta_reference(*new_umbilicus);
+                        new_tracker->initialize_from_seed(data.seed_coord, data.seed_loc[1], seed_theta_ref);
+                        // Populate existing cells
+                        for (int r = 0; r < points.rows; ++r) {
+                            for (int c = 0; c < points.cols; ++c) {
+                                if (state(r, c) & STATE_COORD_VALID) {
+                                    new_tracker->set_cell({r, c}, points(r, c));
+                                }
                             }
                         }
+                        const bool had_wrap_tracker = static_cast<bool>(wrap_tracker);
+                        wrap_tracker = std::move(new_tracker);
+                        umbilicus_ptr = std::move(new_umbilicus);
+                        std::cout << "[WrapTracker] " << (had_wrap_tracker ? "Updated" : "Created")
+                                  << " from estimated umbilicus (" << centers_total
+                                  << " rows) at generation " << generation << std::endl;
                     }
-                    const bool had_wrap_tracker = static_cast<bool>(wrap_tracker);
-                    wrap_tracker = std::move(new_tracker);
-                    umbilicus_ptr = std::move(new_umbilicus);
-                    std::cout << "[WrapTracker] " << (had_wrap_tracker ? "Updated" : "Created")
-                              << " from estimated umbilicus (" << centers_total
-                              << " rows) at generation " << generation << std::endl;
                 } catch (const std::exception& e) {
                     std::cerr << "[WrapTracker] Failed to build umbilicus: " << e.what() << std::endl;
                 }
@@ -3334,6 +3823,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             }
         }
         if (should_expand && (expand_right > 0 || expand_top > 0 || expand_bottom > 0)) {
+            ScopedMs expand_total_timer(timing_totals.expand_total_ms);
             fringe.clearBorderFlags();
             std::cout << "expanding by (right=" << expand_right
                       << ", top=" << expand_top
@@ -3344,56 +3834,60 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
 
             const int old_w = w;
             const int old_h = h;
-            w += expand_right;
-            h += (expand_top + expand_bottom);
-            size = {w,h};
-            bounds = {0,0,w-1,h-1};
-
             const int y_offset = expand_top;
-            cv::Rect copy_roi(0, y_offset, old_w, old_h);
+            {
+                ScopedMs timer(timing_totals.expand_resize_ms);
+                w += expand_right;
+                h += (expand_top + expand_bottom);
+                size = {w,h};
+                bounds = {0,0,w-1,h-1};
 
-            cv::Mat_<cv::Vec3d> old_points = points;
-            points = cv::Mat_<cv::Vec3d>(size, {-1,-1,-1});
-            old_points.copyTo(points(copy_roi));
+                cv::Rect copy_roi(0, y_offset, old_w, old_h);
 
-            cv::Mat_<uint8_t> old_state = state;
-            state = cv::Mat_<uint8_t>(size, 0);
-            old_state.copyTo(state(copy_roi));
+                cv::Mat_<cv::Vec3d> old_points = points;
+                points = cv::Mat_<cv::Vec3d>(size, {-1,-1,-1});
+                old_points.copyTo(points(copy_roi));
 
-            cv::Mat_<uint16_t> old_generations = generations;
-            generations = cv::Mat_<uint16_t>(size, static_cast<uint16_t>(0));
-            old_generations.copyTo(generations(copy_roi));
+                cv::Mat_<uint8_t> old_state = state;
+                state = cv::Mat_<uint8_t>(size, 0);
+                old_state.copyTo(state(copy_roi));
 
-            cv::Mat_<uint16_t> old_inliers_sum_dbg = inliers_sum_dbg;
-            inliers_sum_dbg = cv::Mat_<uint16_t>(size, 0);
-            old_inliers_sum_dbg.copyTo(inliers_sum_dbg(copy_roi));
+                cv::Mat_<uint16_t> old_generations = generations;
+                generations = cv::Mat_<uint16_t>(size, static_cast<uint16_t>(0));
+                old_generations.copyTo(generations(copy_roi));
 
-            cv::Mat_<uint8_t> old_umbilicus_sampled = umbilicus_sampled;
-            umbilicus_sampled = cv::Mat_<uint8_t>(size, static_cast<uint8_t>(0));
-            old_umbilicus_sampled.copyTo(umbilicus_sampled(copy_roi));
+                cv::Mat_<uint16_t> old_inliers_sum_dbg = inliers_sum_dbg;
+                inliers_sum_dbg = cv::Mat_<uint16_t>(size, 0);
+                old_inliers_sum_dbg.copyTo(inliers_sum_dbg(copy_roi));
 
-            cv::Mat_<uint8_t> old_force_retry_count = force_retry_count;
-            force_retry_count = cv::Mat_<uint8_t>(size, static_cast<uint8_t>(0));
-            old_force_retry_count.copyTo(force_retry_count(copy_roi));
+                cv::Mat_<uint8_t> old_umbilicus_sampled = umbilicus_sampled;
+                umbilicus_sampled = cv::Mat_<uint8_t>(size, static_cast<uint8_t>(0));
+                old_umbilicus_sampled.copyTo(umbilicus_sampled(copy_roi));
 
-            cv::Mat_<uint8_t> old_force_retry_mark = force_retry_mark;
-            force_retry_mark = cv::Mat_<uint8_t>(size, static_cast<uint8_t>(0));
-            old_force_retry_mark.copyTo(force_retry_mark(copy_roi));
+                cv::Mat_<uint8_t> old_force_retry_count = force_retry_count;
+                force_retry_count = cv::Mat_<uint8_t>(size, static_cast<uint8_t>(0));
+                old_force_retry_count.copyTo(force_retry_count(copy_roi));
 
-            fringe.resize(size, copy_roi);
+                cv::Mat_<uint8_t> old_force_retry_mark = force_retry_mark;
+                force_retry_mark = cv::Mat_<uint8_t>(size, static_cast<uint8_t>(0));
+                old_force_retry_mark.copyTo(force_retry_mark(copy_roi));
 
-            wrap_rows_touched = std::vector<std::atomic<uint8_t>>(h);
-            for (auto& flag : wrap_rows_touched)
-                flag.store(0, std::memory_order_relaxed);
+                fringe.resize(size, copy_roi);
 
-            if ((expand_top + expand_bottom) > 0 && umbilicus_estimator) {
-                umbilicus_estimator = std::make_unique<vc::wrap_tracking::UmbilicusEstimator>(
-                    points.rows);
-                umbilicus_sampled.setTo(0);
-                std::cout << "[UmbilicusEstimator] Reset after vertical resize" << std::endl;
+                wrap_rows_touched = std::vector<std::atomic<uint8_t>>(h);
+                for (auto& flag : wrap_rows_touched)
+                    flag.store(0, std::memory_order_relaxed);
+
+                if ((expand_top + expand_bottom) > 0 && umbilicus_estimator) {
+                    umbilicus_estimator = std::make_unique<vc::wrap_tracking::UmbilicusEstimator>(
+                        points.rows);
+                    umbilicus_sampled.setTo(0);
+                    std::cout << "[UmbilicusEstimator] Reset after vertical resize" << std::endl;
+                }
             }
 
             if (y_offset != 0) {
+                ScopedMs timer(timing_totals.expand_shift_data_ms);
                 used_area.y += y_offset;
                 used_area_hr = {used_area.x*step_int, used_area.y*step_int, used_area.width*step_int, used_area.height*step_int};
                 y0 += y_offset;
@@ -3421,12 +3915,16 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                     p[0] += y_offset;
             }
 
-            for(int i=0;i<omp_get_max_threads();i++) {
-                data_ths[i] = data;
-                added_points_threads[i].clear();
+            {
+                ScopedMs timer(timing_totals.expand_thread_reset_ms);
+                for(int i=0;i<omp_get_max_threads();i++) {
+                    data_ths[i] = data;
+                    added_points_threads[i].clear();
+                }
             }
 
             if (wrap_tracker) {
+                ScopedMs timer(timing_totals.expand_wrap_rebuild_ms);
                 const auto& umbilicus = wrap_tracker->umbilicus();
                 bool flip_x_local = wrap_tracker->flip_x();
                 auto new_tracker = std::make_unique<vc::wrap_tracking::WrapTracker>(
@@ -3447,34 +3945,41 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                 wrap_tracker = std::move(new_tracker);
             }
 
-            if (expand_right > 0) {
-                int overlap = 5;
-                active_bounds = {w-sliding_w-2*closing_r-10-overlap,
-                                 closing_r+5,
-                                 sliding_w+2*closing_r+10+overlap,
-                                 h-closing_r-10};
-                static_bounds = {0,0,w-sliding_w-2*closing_r-10,h};
-            } else {
-                active_bounds.y = closing_r+5;
-                active_bounds.height = h - closing_r - 10;
-                static_bounds.height = h;
-            }
+            {
+                ScopedMs timer(timing_totals.expand_bounds_fringe_ms);
+                if (expand_right > 0) {
+                    int overlap = 5;
+                    active_bounds = {w-sliding_w-2*closing_r-10-overlap,
+                                     closing_r+5,
+                                     sliding_w+2*closing_r+10+overlap,
+                                     h-closing_r-10};
+                    static_bounds = {0,0,w-sliding_w-2*closing_r-10,h};
+                } else {
+                    active_bounds.y = closing_r+5;
+                    active_bounds.height = h - closing_r - 10;
+                    static_bounds.height = h;
+                }
 
-            cv::Rect active = active_bounds & used_area;
+                cv::Rect active = active_bounds & used_area;
 
-            std::cout << size << bounds << used_area << active_bounds << (used_area & active_bounds) << static_bounds << std::endl;
-            curr_best_inl_th = inlier_base_threshold;
-            if (fringe_full_boundary) {
-                build_savable_mask();
-                fringe.rebuildBoundary();
-            } else {
-                fringe.rebuildIncremental(2);
+                std::cout << size << bounds << used_area << active_bounds << (used_area & active_bounds) << static_bounds << std::endl;
+                curr_best_inl_th = inlier_base_threshold;
+                if (fringe_full_boundary) {
+                    build_savable_mask();
+                    fringe.rebuildBoundary();
+                } else {
+                    fringe.rebuildIncremental(2);
+                }
             }
             // Grid grew; rebuild area mask/accumulator in new shape
-            init_area_scan();
+            {
+                ScopedMs timer(timing_totals.expand_area_scan_ms);
+                init_area_scan();
+            }
         }
 
         if (generation % 1000 == 0) {
+            ScopedMs timer(timing_totals.inliers_write_ms);
             try {
                 writeTiff(tgt_dir / "inliers_sum.tif", inliers_sum_dbg(used_area));
             } catch (const std::exception& ex) {
@@ -3495,8 +4000,13 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                           << " force_retry=" << force_retry.size()
                           << " used_area=" << used_area << std::endl;
             }
+            finish_generation_timing(true);
             break;
         }
+        finish_generation_timing(false);
+    }
+    if (timing_totals.generations > 0) {
+        timing_totals.print(timing_report_start_generation, std::max(0, stop_gen - 1));
     }
 
     // Final exact surface area from final optimized geometry.
