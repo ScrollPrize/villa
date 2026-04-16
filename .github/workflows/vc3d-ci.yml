@@ -42,10 +42,11 @@ jobs:
           export DEBIAN_FRONTEND=noninteractive
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            build-essential git cmake ninja-build ccache \
+            build-essential git cmake ninja-build ccache pkg-config \
             qt6-base-dev libboost-system-dev libboost-program-options-dev \
             libceres-dev libcgal-dev xtensor-dev libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev \
-            libgsl-dev libsdl2-dev libcurl4-openssl-dev
+            libgsl-dev libsdl2-dev libcurl4-openssl-dev \
+            libde265-dev libx265-dev liblz4-dev nlohmann-json3-dev
 
       - name: Restore ccache
         if: ${{ steps.changes.outputs.vc == 'true' }}
