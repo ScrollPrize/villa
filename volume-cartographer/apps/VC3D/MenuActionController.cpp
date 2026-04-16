@@ -603,15 +603,15 @@ void MenuActionController::attachRemoteSegments()
     }
 
     const auto auth = volume->remoteAuth();
-    // Volume::NewFromUrl stages the volume at `cacheRoot / volumeId`, and
-    // promptAndLoadRemoteSegments expects the original cacheRoot (it builds
-    // `cacheRoot / "paths" / segId` for each segment). Going up one level
-    // recovers it; if path() is already the root (shouldn't happen for
-    // remote volumes), fall back to it.
-    auto volPath = volume->path();
-    const std::string cachePath = volPath.has_parent_path()
-        ? volPath.parent_path().string()
-        : volPath.string();
+    // Use the app-level remote cache directory — the same value every other
+    // entry point (openRemoteUrl, attachRemoteZarrUrl, openRemoteScroll)
+    // passes to Volume::NewFromUrl *and* to promptAndLoadRemoteSegments.
+    // Deriving from volume->path() is wrong: the volume is staged at
+    // `<cache>/<id>` for direct opens and `<cache>/<volpkg>/volumes/<id>` for
+    // scroll opens, so parent_path() lands in the wrong tree depending on
+    // how the volume was loaded. Segments are consistently cached at
+    // `<remoteCacheDirectory()>/paths/<segId>`.
+    const std::string cachePath = remoteCacheDirectory().toStdString();
     promptAndLoadRemoteSegments(auth, cachePath);
 }
 

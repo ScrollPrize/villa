@@ -544,6 +544,24 @@ void CAdaptiveVolumeViewer::submitRender()
             surf->gen(&_genCoords, &_genNormals,
                       cv::Size(fbW, fbH), cv::Vec3f(0, 0, 0),
                       _camera.scale, offset);
+            // Lazy-capture the translation direction when zOff was set by a
+            // path that didn't populate _zOffWorldDir (adjustSurfaceOffset
+            // via Ctrl+./Ctrl+, shortcuts, or any other non-Shift-scroll
+            // source). Without this, those offsets would be silent no-ops
+            // until the user first Shift-scrolled.
+            if (_camera.zOff != 0.0f &&
+                _zOffWorldDir[0] == 0.0f && _zOffWorldDir[1] == 0.0f && _zOffWorldDir[2] == 0.0f &&
+                !_genNormals.empty()) {
+                const int cy = _genNormals.rows / 2;
+                const int cx = _genNormals.cols / 2;
+                const cv::Vec3f n = _genNormals(cy, cx);
+                if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2])) {
+                    const float len = static_cast<float>(cv::norm(n));
+                    if (len > 1e-6f) {
+                        _zOffWorldDir = n / len;
+                    }
+                }
+            }
             // Apply z-offset as a rigid world-space translation using the
             // cached direction. On cache hits _genCoords is already shifted
             // — avoid double-applying by only running this on cache miss.
