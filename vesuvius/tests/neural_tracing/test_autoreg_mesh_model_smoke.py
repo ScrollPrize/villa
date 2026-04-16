@@ -32,6 +32,7 @@ from vesuvius.neural_tracing.autoreg_mesh.losses import (
     compute_autoreg_mesh_losses,
 )
 from vesuvius.neural_tracing.autoreg_mesh.model import AutoregMeshModel
+from vesuvius.neural_tracing.autoreg_mesh.model import _batched_rope_from_coords
 from vesuvius.neural_tracing.autoreg_mesh.serialization import deserialize_continuation_grid, serialize_split_conditioning_example
 from vesuvius.neural_tracing.autoreg_mesh.train import (
     _choose_best_xy_slice,
@@ -724,6 +725,17 @@ def test_axis_factorized_autoreg_mesh_inference_reconstructs_lattice() -> None:
     assert "predicted_coarse_axis_ids" in result
     assert tuple(result["predicted_coarse_axis_ids"].keys()) == ("z", "y", "x")
     assert result["predicted_coarse_axis_ids"]["z"].shape[0] == int(sample["target_coarse_ids"].shape[0])
+
+
+def test_infer_rejects_nonpositive_max_steps() -> None:
+    config = _make_factorized_cached_token_config()
+    model = AutoregMeshModel(config).eval()
+    sample = _make_sample_with_cached_tokens("left")
+
+    with pytest.raises(ValueError, match="max_steps"):
+        infer_autoreg_mesh(model, sample, max_steps=0)
+    with pytest.raises(ValueError, match="max_steps"):
+        infer_autoreg_mesh(model, sample, max_steps=-1)
 
 
 def test_autoreg_mesh_inference_uses_sampled_xyz_for_non_greedy_rollout(monkeypatch) -> None:
@@ -1622,6 +1634,26 @@ def test_rope_default_config_values() -> None:
     assert validated["rope_shift_coords"] == pytest.approx(0.05)
     assert validated["rope_jitter_coords"] == pytest.approx(1.05)
     assert validated["rope_rescale_coords"] == pytest.approx(2.0)
+
+
+def test_batched_rope_from_coords_casts_to_rope_dtype() -> None:
+    class _DtypeCheckingRope:
+        def __init__(self) -> None:
+            self.periods = torch.ones((1,), dtype=torch.bfloat16)
+            self.seen_dtypes: list[torch.dtype] = []
+
+        def get_embed_from_coords(self, sample_coords: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+            self.seen_dtypes.append(sample_coords.dtype)
+            return sample_coords, sample_coords
+
+    rope = _DtypeCheckingRope()
+    coords = torch.randn(2, 4, 3, dtype=torch.float32)
+
+    sin, cos = _batched_rope_from_coords(rope, coords)
+
+    assert sin.shape == coords.shape
+    assert cos.shape == coords.shape
+    assert rope.seen_dtypes == [torch.bfloat16, torch.bfloat16]
 
 
 def test_rope_config_validation_rejects_invalid_values() -> None:

@@ -41,7 +41,8 @@ def _resolve_rope_dtype(value):
 def _batched_rope_from_coords(rope: MixedRopePositionEmbedding, coords: Tensor) -> tuple[Tensor, Tensor]:
     if coords.ndim != 3 or coords.shape[-1] != 3:
         raise ValueError(f"coords must have shape [B, T, 3], got {tuple(coords.shape)}")
-    rope_values = [rope.get_embed_from_coords(sample_coords) for sample_coords in coords]
+    rope_dtype = rope.periods.dtype
+    rope_values = [rope.get_embed_from_coords(sample_coords.to(dtype=rope_dtype)) for sample_coords in coords]
     sin = torch.stack([item[0] for item in rope_values], dim=0)
     cos = torch.stack([item[1] for item in rope_values], dim=0)
     return sin, cos

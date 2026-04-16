@@ -43,6 +43,7 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "frontier_band_width": 4,
     "surface_downsample_factor": 1,
     "use_stored_resolution_only": False,
+    "prefilter_show_progress": True,
     "patch_size": [8, 8, 8],
     "offset_num_bins": [16, 16, 16],
     "offset_loss_start_step": 0,
@@ -196,6 +197,8 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
 
     if cfg["sample_mode"] != "wrap":
         raise ValueError("autoreg_mesh MVP requires sample_mode='wrap'")
+    if not isinstance(cfg.get("prefilter_show_progress"), bool):
+        raise ValueError("prefilter_show_progress must be a boolean")
     if int(cfg["frontier_band_width"]) <= 0:
         raise ValueError("frontier_band_width must be positive")
     cfg["surface_downsample_factor"] = _normalize_surface_downsample_factor(cfg["surface_downsample_factor"])

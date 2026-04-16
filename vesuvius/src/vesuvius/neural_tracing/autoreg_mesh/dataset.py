@@ -9,11 +9,14 @@ import torch
 import torch.nn.functional as F
 from scipy import ndimage
 from torch.utils.data import Dataset
+from tqdm.auto import tqdm
 
 from vesuvius.neural_tracing.autoreg_mesh.config import validate_autoreg_mesh_config
 from vesuvius.neural_tracing.autoreg_mesh.serialization import (
     DIRECTION_TO_ID,
     IGNORE_INDEX,
+    downsample_surface_grid,
+    extract_frontier_prompt_band,
     serialize_split_conditioning_example,
 )
 from vesuvius.neural_tracing.datasets.common import _read_volume_crop_from_patch, _trim_to_world_bbox
@@ -75,6 +78,30 @@ def _reachable_conditioning_counts(axis_size: int, low: float, high: float) -> t
     return tuple(counts)
 
 
+def _split_surface_grid(
+    surface_zyx: np.ndarray,
+    *,
+    direction: str,
+    conditioning_count: int,
+) -> tuple[np.ndarray, np.ndarray] | tuple[None, None]:
+    surface = np.asarray(surface_zyx, dtype=np.float32)
+    h_grid, w_grid = surface.shape[:2]
+    conditioning_count = int(conditioning_count)
+    if direction == "left":
+        split_col = min(max(conditioning_count, 1), w_grid - 1)
+        return surface[:, :split_col, :], surface[:, split_col:, :]
+    if direction == "right":
+        split_col = w_grid - min(max(conditioning_count, 1), w_grid - 1)
+        return surface[:, split_col:, :], surface[:, :split_col, :]
+    if direction == "up":
+        split_row = min(max(conditioning_count, 1), h_grid - 1)
+        return surface[:split_row, :, :], surface[split_row:, :, :]
+    if direction == "down":
+        split_row = h_grid - min(max(conditioning_count, 1), h_grid - 1)
+        return surface[split_row:, :, :], surface[:split_row, :, :]
+    return None, None
+
+
 def _in_bounds_vertex_mask(grid_local: np.ndarray, *, volume_shape: tuple[int, int, int]) -> np.ndarray:
     grid = np.asarray(grid_local, dtype=np.float32)
     valid = np.isfinite(grid).all(axis=-1)
@@ -129,6 +156,58 @@ def _should_reject_boundary_stats(
         float(boundary_stats["frontier_invalid_fraction"]) > 0.0 or
         float(boundary_stats["target_invalid_fraction"]) > float(max_target_invalid_fraction)
     )
+
+
+def _fast_prefilter_plan(
+    surface_local: np.ndarray,
+    *,
+    direction: str,
+    conditioning_count: int,
+    frontier_band_width: int,
+    surface_downsample_factor,
+    volume_shape: tuple[int, int, int],
+) -> tuple[bool, dict[str, float | bool] | None]:
+    cond_local, masked_local = _split_surface_grid(
+        surface_local,
+        direction=str(direction),
+        conditioning_count=int(conditioning_count),
+    )
+    if cond_local is None or masked_local is None:
+        return False, None
+    if cond_local.size == 0 or masked_local.size == 0:
+        return False, None
+
+    cond_local = downsample_surface_grid(
+        cond_local,
+        direction=str(direction),
+        surface_downsample_factor=surface_downsample_factor,
+    )
+    masked_local = downsample_surface_grid(
+        masked_local,
+        direction=str(direction),
+        surface_downsample_factor=surface_downsample_factor,
+    )
+    if cond_local.size == 0 or masked_local.size == 0:
+        return False, None
+
+    prompt_grid = extract_frontier_prompt_band(
+        cond_local,
+        direction=str(direction),
+        frontier_band_width=int(frontier_band_width),
+    )
+    if not bool(_in_bounds_vertex_mask(prompt_grid, volume_shape=volume_shape).any()):
+        return False, None
+    if not bool(_in_bounds_vertex_mask(masked_local, volume_shape=volume_shape).any()):
+        return False, None
+
+    boundary_stats = _compute_target_boundary_stats(
+        masked_local,
+        volume_shape=volume_shape,
+        direction=str(direction),
+    )
+    if _should_reject_boundary_stats(boundary_stats):
+        return False, boundary_stats
+    return True, boundary_stats
 
 
 def _apply_volume_only_augmentation(volume: np.ndarray, augmentation_cfg: dict, *, enabled: bool) -> np.ndarray:
@@ -457,7 +536,15 @@ class AutoregMeshDataset(Dataset):
 
     def _build_valid_split_plans(self) -> dict[tuple[int, int], tuple[dict, ...]]:
         valid_plans: dict[tuple[int, int], tuple[dict, ...]] = {}
-        for patch_idx, wrap_idx in self.sample_index:
+        iterator = self.sample_index
+        if bool(self.config.get("prefilter_show_progress", True)) and len(self.sample_index) > 0:
+            iterator = tqdm(
+                self.sample_index,
+                desc="autoreg_mesh prefilter",
+                unit="wrap",
+                leave=False,
+            )
+        for patch_idx, wrap_idx in iterator:
             sample_key = _sample_key(patch_idx, wrap_idx)
             patch = self.patches[int(patch_idx)]
             wrap = patch.wraps[int(wrap_idx)]
@@ -465,6 +552,8 @@ class AutoregMeshDataset(Dataset):
             surface_zyx = self._extract_surface_for_plan(patch, wrap, use_stored_surface=use_stored_surface)
             if surface_zyx is None:
                 continue
+            min_corner = np.round([patch.world_bbox[0], patch.world_bbox[2], patch.world_bbox[4]]).astype(np.float32)
+            surface_local = np.asarray(surface_zyx, dtype=np.float32) - min_corner[None, None, :]
             h_grid, w_grid = surface_zyx.shape[:2]
             plan_list: list[dict] = []
             directions = []
@@ -479,40 +568,34 @@ class AutoregMeshDataset(Dataset):
                     self._base_dataset._cond_percent_min,
                     self._base_dataset._cond_percent_max,
                 ):
-                    conditioning, serialized = self._serialize_candidate_plan(
-                        patch_idx=int(patch_idx),
-                        wrap_idx=int(wrap_idx),
-                        patch=patch,
-                        surface_zyx=surface_zyx,
+                    is_valid, _boundary_stats = _fast_prefilter_plan(
+                        surface_local,
                         direction=direction,
                         conditioning_count=int(conditioning_count),
-                        effective_surface_downsample_factor=effective_surface_downsample_factor,
-                        use_stored_surface=use_stored_surface,
-                    )
-                    if conditioning is None or serialized is None:
-                        continue
-                    if not bool(np.any(serialized["prompt_tokens"]["valid_mask"])):
-                        continue
-                    if not bool(np.any(serialized["target_valid_mask"])):
-                        continue
-                    boundary_stats = _compute_target_boundary_stats(
-                        serialized["target_grid_local"],
+                        frontier_band_width=int(self.config["frontier_band_width"]),
+                        surface_downsample_factor=effective_surface_downsample_factor,
                         volume_shape=self.crop_size,
-                        direction=str(serialized["direction"]),
                     )
-                    if _should_reject_boundary_stats(boundary_stats):
+                    if not bool(is_valid):
                         continue
                     plan_list.append(
                         {
                             "direction": str(direction),
                             "conditioning_count": int(conditioning_count),
-                            "conditioning_percent": float(conditioning["conditioning_percent"]),
+                            "conditioning_percent": float(conditioning_count) / float(max(axis_size, 1)),
                             "use_stored_surface": bool(use_stored_surface),
                             "effective_surface_downsample_factor": effective_surface_downsample_factor,
                         }
                     )
             if plan_list:
                 valid_plans[sample_key] = tuple(plan_list)
+            if hasattr(iterator, "set_postfix"):
+                iterator.set_postfix(
+                    kept=len(valid_plans),
+                    plans=int(sum(len(plans) for plans in valid_plans.values())),
+                )
+        if hasattr(iterator, "close"):
+            iterator.close()
         return valid_plans
 
     def _resolve_surface_sampling_plan(self, wrap: dict) -> tuple[bool, int | tuple[int, int]]:

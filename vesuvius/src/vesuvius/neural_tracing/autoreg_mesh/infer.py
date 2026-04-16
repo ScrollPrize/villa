@@ -117,7 +117,10 @@ def infer_autoreg_mesh(
     total_vertices = int(target_grid_shape[0] * target_grid_shape[1])
     if max_steps is None:
         max_steps = total_vertices
-    max_steps = min(int(max_steps), total_vertices)
+    max_steps = int(max_steps)
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive or None")
+    max_steps = min(max_steps, total_vertices)
 
     encoded = model.encode_conditioning(volume, vol_tokens=vol_tokens)
     memory_tokens = encoded["memory_tokens"]
