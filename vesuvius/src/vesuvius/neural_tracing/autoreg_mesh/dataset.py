@@ -17,7 +17,6 @@ from vesuvius.neural_tracing.autoreg_mesh.serialization import (
     serialize_split_conditioning_example,
 )
 from vesuvius.neural_tracing.datasets.common import _read_volume_crop_from_patch, _trim_to_world_bbox
-from vesuvius.neural_tracing.datasets.conditioning import create_split_conditioning
 from vesuvius.neural_tracing.datasets.dataset_defaults import (
     setdefault_rowcol_cond_dataset_config,
     validate_rowcol_cond_dataset_config,
@@ -52,6 +51,28 @@ def _maybe_collapse_downsample_factor(factor_row: int, factor_col: int) -> int |
     if int(factor_row) == int(factor_col):
         return int(factor_row)
     return (int(factor_row), int(factor_col))
+
+
+def _sample_key(patch_idx: int, wrap_idx: int) -> tuple[int, int]:
+    return int(patch_idx), int(wrap_idx)
+
+
+def _reachable_conditioning_counts(axis_size: int, low: float, high: float) -> tuple[int, ...]:
+    axis_size = int(axis_size)
+    if axis_size < 2:
+        return tuple()
+    p_low = float(min(low, high))
+    p_high = float(max(low, high))
+    counts = []
+    for count in range(1, axis_size):
+        interval_low = max(p_low, (float(count) - 0.5) / float(axis_size))
+        interval_high = min(p_high, (float(count) + 0.5) / float(axis_size))
+        if interval_low <= interval_high:
+            counts.append(int(count))
+    if not counts:
+        default_count = min(max(int(round(axis_size * p_low)), 1), axis_size - 1)
+        counts.append(int(default_count))
+    return tuple(counts)
 
 
 def _in_bounds_vertex_mask(grid_local: np.ndarray, *, volume_shape: tuple[int, int, int]) -> np.ndarray:
@@ -215,6 +236,7 @@ def create_split_conditioning_from_surface_grid(
     patch,
     surface_zyx: np.ndarray,
     conditioning_percent: float | None = None,
+    conditioning_count: int | None = None,
     cond_direction: str | None = None,
 ) -> dict | None:
     """Mirror create_split_conditioning using a caller-provided surface grid."""
@@ -247,21 +269,32 @@ def create_split_conditioning_from_surface_grid(
     if not valid_directions:
         return None
 
-    if conditioning_percent is None:
-        conditioning_percent = random.uniform(dataset._cond_percent_min, dataset._cond_percent_max)
-    conditioning_percent = float(conditioning_percent)
     if cond_direction is None:
         cond_direction = random.choice(valid_directions)
     cond_direction = str(cond_direction).lower()
     if cond_direction not in valid_directions:
         return None
 
-    r_cond = int(round(h_grid * conditioning_percent))
-    c_cond = int(round(w_grid * conditioning_percent))
-    if h_grid >= 2:
-        r_cond = min(max(r_cond, 1), h_grid - 1)
-    if w_grid >= 2:
-        c_cond = min(max(c_cond, 1), w_grid - 1)
+    if conditioning_count is None:
+        if conditioning_percent is None:
+            conditioning_percent = random.uniform(dataset._cond_percent_min, dataset._cond_percent_max)
+        conditioning_percent = float(conditioning_percent)
+        r_cond = int(round(h_grid * conditioning_percent))
+        c_cond = int(round(w_grid * conditioning_percent))
+        if h_grid >= 2:
+            r_cond = min(max(r_cond, 1), h_grid - 1)
+        if w_grid >= 2:
+            c_cond = min(max(c_cond, 1), w_grid - 1)
+    else:
+        conditioning_count = int(conditioning_count)
+        if cond_direction in {"left", "right"}:
+            c_cond = min(max(conditioning_count, 1), w_grid - 1)
+            r_cond = min(max(int(round(h_grid * float(dataset._cond_percent_min))), 1), max(h_grid - 1, 1)) if h_grid >= 2 else 0
+            conditioning_percent = float(c_cond) / float(max(w_grid, 1))
+        else:
+            r_cond = min(max(conditioning_count, 1), h_grid - 1)
+            c_cond = min(max(int(round(w_grid * float(dataset._cond_percent_min))), 1), max(w_grid - 1, 1)) if w_grid >= 2 else 0
+            conditioning_percent = float(r_cond) / float(max(h_grid, 1))
 
     if cond_direction == "left":
         cond_zyxs = surface[:, :c_cond, :]
@@ -339,12 +372,148 @@ class AutoregMeshDataset(Dataset):
         self.patches = self._base_dataset.patches
         self.sample_index = list(self._base_dataset.sample_index)
         self.crop_size = tuple(int(v) for v in self._base_dataset.crop_size)
+        precomputed_plans = None
+        if isinstance(patch_metadata, dict):
+            precomputed_plans = patch_metadata.get("autoreg_mesh_valid_split_plans")
+        if precomputed_plans is None:
+            self._valid_split_plans = self._build_valid_split_plans()
+        else:
+            self._valid_split_plans = {
+                _sample_key(*sample_key): tuple(dict(plan) for plan in plans)
+                for sample_key, plans in dict(precomputed_plans).items()
+            }
+        self.sample_index = [
+            _sample_key(*sample_key)
+            for sample_key in self.sample_index
+            if len(self._valid_split_plans.get(_sample_key(*sample_key), ())) > 0
+        ]
+        self._prefilter_stats = {
+            "num_samples_with_valid_plans": len(self.sample_index),
+            "num_total_valid_split_plans": int(sum(len(plans) for plans in self._valid_split_plans.values())),
+        }
+        if not self.sample_index:
+            raise RuntimeError("autoreg_mesh dataset prefilter removed every sample; no valid wrap splits remain")
 
     def __len__(self) -> int:
         return len(self.sample_index)
 
     def export_patch_metadata(self):
-        return self._base_dataset.export_patch_metadata()
+        metadata = self._base_dataset.export_patch_metadata()
+        metadata["autoreg_mesh_valid_split_plans"] = {
+            sample_key: tuple(dict(plan) for plan in plans)
+            for sample_key, plans in self._valid_split_plans.items()
+        }
+        metadata["autoreg_mesh_prefilter_stats"] = dict(self._prefilter_stats)
+        return metadata
+
+    def _extract_surface_for_plan(self, patch, wrap: dict, *, use_stored_surface: bool) -> np.ndarray | None:
+        if bool(use_stored_surface):
+            return extract_wrap_world_surface_stored(
+                patch,
+                wrap,
+                require_all_valid=True,
+            )
+        return self._base_dataset._extract_wrap_world_surface(patch, wrap, require_all_valid=True)
+
+    def _serialize_candidate_plan(
+        self,
+        *,
+        patch_idx: int,
+        wrap_idx: int,
+        patch,
+        surface_zyx: np.ndarray,
+        direction: str,
+        conditioning_count: int,
+        effective_surface_downsample_factor,
+        use_stored_surface: bool,
+    ) -> tuple[dict | None, dict | None]:
+        conditioning = create_split_conditioning_from_surface_grid(
+            self._base_dataset,
+            idx=0,
+            patch_idx=patch_idx,
+            wrap_idx=wrap_idx,
+            patch=patch,
+            surface_zyx=surface_zyx,
+            cond_direction=str(direction),
+            conditioning_count=int(conditioning_count),
+        )
+        if conditioning is None:
+            return None, None
+        min_corner = np.asarray(conditioning["min_corner"], dtype=np.int64)
+        cond_local = np.asarray(conditioning["cond_zyxs_unperturbed"], dtype=np.float32) - min_corner[None, None, :]
+        masked_local = np.asarray(conditioning["masked_zyxs"], dtype=np.float32) - min_corner[None, None, :]
+        serialized = serialize_split_conditioning_example(
+            cond_zyxs_local=cond_local,
+            masked_zyxs_local=masked_local,
+            direction=str(conditioning["cond_direction"]).lower(),
+            volume_shape=self.crop_size,
+            patch_size=self.config["patch_size"],
+            offset_num_bins=self.config["offset_num_bins"],
+            frontier_band_width=int(self.config["frontier_band_width"]),
+            surface_downsample_factor=effective_surface_downsample_factor,
+            use_stored_resolution_only=use_stored_surface,
+        )
+        return conditioning, serialized
+
+    def _build_valid_split_plans(self) -> dict[tuple[int, int], tuple[dict, ...]]:
+        valid_plans: dict[tuple[int, int], tuple[dict, ...]] = {}
+        for patch_idx, wrap_idx in self.sample_index:
+            sample_key = _sample_key(patch_idx, wrap_idx)
+            patch = self.patches[int(patch_idx)]
+            wrap = patch.wraps[int(wrap_idx)]
+            use_stored_surface, effective_surface_downsample_factor = self._resolve_surface_sampling_plan(wrap)
+            surface_zyx = self._extract_surface_for_plan(patch, wrap, use_stored_surface=use_stored_surface)
+            if surface_zyx is None:
+                continue
+            h_grid, w_grid = surface_zyx.shape[:2]
+            plan_list: list[dict] = []
+            directions = []
+            if w_grid >= 2:
+                directions.extend(["left", "right"])
+            if h_grid >= 2:
+                directions.extend(["up", "down"])
+            for direction in directions:
+                axis_size = w_grid if direction in {"left", "right"} else h_grid
+                for conditioning_count in _reachable_conditioning_counts(
+                    axis_size,
+                    self._base_dataset._cond_percent_min,
+                    self._base_dataset._cond_percent_max,
+                ):
+                    conditioning, serialized = self._serialize_candidate_plan(
+                        patch_idx=int(patch_idx),
+                        wrap_idx=int(wrap_idx),
+                        patch=patch,
+                        surface_zyx=surface_zyx,
+                        direction=direction,
+                        conditioning_count=int(conditioning_count),
+                        effective_surface_downsample_factor=effective_surface_downsample_factor,
+                        use_stored_surface=use_stored_surface,
+                    )
+                    if conditioning is None or serialized is None:
+                        continue
+                    if not bool(np.any(serialized["prompt_tokens"]["valid_mask"])):
+                        continue
+                    if not bool(np.any(serialized["target_valid_mask"])):
+                        continue
+                    boundary_stats = _compute_target_boundary_stats(
+                        serialized["target_grid_local"],
+                        volume_shape=self.crop_size,
+                        direction=str(serialized["direction"]),
+                    )
+                    if _should_reject_boundary_stats(boundary_stats):
+                        continue
+                    plan_list.append(
+                        {
+                            "direction": str(direction),
+                            "conditioning_count": int(conditioning_count),
+                            "conditioning_percent": float(conditioning["conditioning_percent"]),
+                            "use_stored_surface": bool(use_stored_surface),
+                            "effective_surface_downsample_factor": effective_surface_downsample_factor,
+                        }
+                    )
+            if plan_list:
+                valid_plans[sample_key] = tuple(plan_list)
+        return valid_plans
 
     def _resolve_surface_sampling_plan(self, wrap: dict) -> tuple[bool, int | tuple[int, int]]:
         factor_row, factor_col = _normalize_surface_downsample_factor(self.config["surface_downsample_factor"])
@@ -373,28 +542,29 @@ class AutoregMeshDataset(Dataset):
 
     def _build_example(self, idx: int) -> dict | None:
         patch_idx, wrap_idx = self.sample_index[int(idx)]
+        sample_key = _sample_key(patch_idx, wrap_idx)
+        split_plans = self._valid_split_plans.get(sample_key, ())
+        if not split_plans:
+            return None
         patch = self.patches[patch_idx]
         wrap = patch.wraps[wrap_idx]
-        use_stored_surface, effective_surface_downsample_factor = self._resolve_surface_sampling_plan(wrap)
-        if use_stored_surface:
-            surface_stored = extract_wrap_world_surface_stored(
-                patch,
-                wrap,
-                require_all_valid=True,
-            )
-            if surface_stored is None:
-                return None
-            conditioning = create_split_conditioning_from_surface_grid(
-                self._base_dataset,
-                idx=int(idx),
-                patch_idx=patch_idx,
-                wrap_idx=wrap_idx,
-                patch=patch,
-                surface_zyx=surface_stored,
-            )
-        else:
-            conditioning = create_split_conditioning(self._base_dataset, int(idx), patch_idx, wrap_idx, patch)
-        if conditioning is None:
+        split_plan = random.choice(split_plans)
+        use_stored_surface = bool(split_plan["use_stored_surface"])
+        effective_surface_downsample_factor = split_plan["effective_surface_downsample_factor"]
+        surface_zyx = self._extract_surface_for_plan(patch, wrap, use_stored_surface=use_stored_surface)
+        if surface_zyx is None:
+            return None
+        conditioning, serialized = self._serialize_candidate_plan(
+            patch_idx=int(patch_idx),
+            wrap_idx=int(wrap_idx),
+            patch=patch,
+            surface_zyx=surface_zyx,
+            direction=str(split_plan["direction"]),
+            conditioning_count=int(split_plan["conditioning_count"]),
+            effective_surface_downsample_factor=effective_surface_downsample_factor,
+            use_stored_surface=use_stored_surface,
+        )
+        if conditioning is None or serialized is None:
             return None
 
         min_corner = np.asarray(conditioning["min_corner"], dtype=np.int64)
@@ -406,20 +576,6 @@ class AutoregMeshDataset(Dataset):
             enabled=self.apply_volume_only_augmentation,
         )
 
-        cond_local = (np.asarray(conditioning["cond_zyxs_unperturbed"], dtype=np.float32) - min_corner[None, None, :])
-        masked_local = (np.asarray(conditioning["masked_zyxs"], dtype=np.float32) - min_corner[None, None, :])
-
-        serialized = serialize_split_conditioning_example(
-            cond_zyxs_local=cond_local,
-            masked_zyxs_local=masked_local,
-            direction=str(conditioning["cond_direction"]).lower(),
-            volume_shape=self.crop_size,
-            patch_size=self.config["patch_size"],
-            offset_num_bins=self.config["offset_num_bins"],
-            frontier_band_width=int(self.config["frontier_band_width"]),
-            surface_downsample_factor=effective_surface_downsample_factor,
-            use_stored_resolution_only=use_stored_surface,
-        )
         if not bool(np.any(serialized["prompt_tokens"]["valid_mask"])):
             return None
         if not bool(np.any(serialized["target_valid_mask"])):
