@@ -258,7 +258,7 @@ def train(config_path):
         config["model_type"] = "vesuvius_unet"
 
     mode = str(config.get("mode", "flat")).strip().lower()
-    if mode in {"normal_pooled_3d", "full_3d"}:
+    if mode in {"normal_pooled_3d", "full_3d", "full_3d_single_wrap"}:
         raise ValueError(
             "Semi-supervised uncertainty-aware mean teacher currently supports only the projected training path"
         )
