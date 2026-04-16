@@ -1175,7 +1175,11 @@ bool SurfacePatchIndex::updateSurface(const SurfacePtr& surface)
                                                 points->rows - 1,
                                                 0,
                                                 points->cols - 1);
-    return impl_->replaceSurfaceEntries(surface, std::move(cells));
+    const bool updated = impl_->replaceSurfaceEntries(surface, std::move(cells));
+    if (updated) {
+        ++impl_->surfaceGenerations[surface.get()];
+    }
+    return updated;
 }
 
 bool SurfacePatchIndex::updateSurfaceRegion(const SurfacePtr& surface,
@@ -1205,33 +1209,25 @@ bool SurfacePatchIndex::updateSurfaceRegion(const SurfacePtr& surface,
 
     const int stride = impl_->samplingStride;
 
-    // When sampling stride > 1, entries at stride-aligned positions cover multiple
-    // cells. An entry at row R covers rows [R, R+stride). To find all entries whose
-    // coverage overlaps the update region [rowStart, rowEnd), we need to expand the
-    // removal bounds to include entries up to (stride-1) positions before the update
-    // region start. For example, with stride=4 and rowStart=5, an entry at
-    // row 4 covers rows 4-7 and must be removed and re-inserted with updated bbox.
-    const int expandedRowStart = std::max(0, rowStart - (stride - 1));
-    const int expandedColStart = std::max(0, colStart - (stride - 1));
+    // Entries are always keyed by the index-wide sampling stride. PatchRecord
+    // does not store a per-entry stride, so region updates must replace the
+    // same stride-aligned cells created by rebuild().
+    const int alignedRowStart = (rowStart / stride) * stride;
+    const int alignedColStart = (colStart / stride) * stride;
 
-    impl_->removeCells(surface, expandedRowStart, rowEnd, expandedColStart, colEnd);
+    impl_->removeCells(surface, alignedRowStart, rowEnd, alignedColStart, colEnd);
 
-    int samplingStride = stride;
-    const int rowSpan = rowEnd - expandedRowStart;
-    const int colSpan = colEnd - expandedColStart;
-    if (samplingStride > 1 && (rowSpan < samplingStride || colSpan < samplingStride)) {
-        // Small update regions can otherwise end up deleting sampled cells without
-        // re-inserting replacements because the stride skips every local index.
-        samplingStride = 1;
-    }
     auto cells = Impl::collectEntriesForSurface(surface,
                                                 impl_->bboxPadding,
-                                                samplingStride,
-                                                expandedRowStart,
+                                                stride,
+                                                alignedRowStart,
                                                 rowEnd,
-                                                expandedColStart,
+                                                alignedColStart,
                                                 colEnd);
     impl_->insertCells(cells);
+    if (!cells.empty()) {
+        ++impl_->surfaceGenerations[surface.get()];
+    }
     return !cells.empty();
 }
 
@@ -1597,14 +1593,17 @@ void SurfacePatchIndex::queueCellRangeUpdate(const SurfacePtr& surface,
         return;
     }
 
-    // Handle stride expansion: entries at stride-aligned positions cover multiple cells
+    // Queue only the stride-aligned entries that can overlap this changed cell
+    // range. PatchRecord has no per-entry stride, so queuing every cell and
+    // flushing with stride-1 entries would mix incompatible entry sizes and
+    // leave duplicate-looking intersection geometry.
     const int stride = impl_->samplingStride;
-    const int expandedRowStart = std::max(0, rowStart - (stride - 1));
-    const int expandedColStart = std::max(0, colStart - (stride - 1));
+    const int alignedRowStart = (rowStart / stride) * stride;
+    const int alignedColStart = (colStart / stride) * stride;
 
     auto& mask = impl_->ensureMask(surface);
-    for (int row = expandedRowStart; row < rowEnd; ++row) {
-        for (int col = expandedColStart; col < colEnd; ++col) {
+    for (int row = alignedRowStart; row < rowEnd; row += stride) {
+        for (int col = alignedColStart; col < colEnd; col += stride) {
             mask.queueUpdate(row, col);
         }
     }
@@ -1663,12 +1662,6 @@ bool SurfacePatchIndex::Impl::flushPendingSurface(const SurfacePtr& surface, Sur
     toInsert.reserve(mask.pendingCells.size());
 
     const int stride = samplingStride;
-    int usedStride = stride;
-
-    // For small pending regions, use stride 1 to avoid gaps
-    if (mask.pendingCells.size() < static_cast<size_t>(stride * stride)) {
-        usedStride = 1;
-    }
 
     for (std::size_t idx : mask.pendingCells) {
         const int row = static_cast<int>(idx / mask.cols);
@@ -1689,7 +1682,7 @@ bool SurfacePatchIndex::Impl::flushPendingSurface(const SurfacePtr& surface, Sur
 
         // Build new entry
         CellEntry entry;
-        if (buildCellEntry(surface, *points, col, row, usedStride, bboxPadding, entry)) {
+        if (buildCellEntry(surface, *points, col, row, stride, bboxPadding, entry)) {
             toInsert.emplace_back(CellKey(surface, row, col), std::move(entry));
         }
     }

@@ -617,11 +617,9 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
         const bool flushed = _surfacePatchIndex.flushPendingUpdates(quad);
         if (flushed) {
             _indexedSurfaceIds.insert(surfId);
-            qCInfo(lcViewerManager) << "Flushed pending SurfacePatchIndex cells for"
-                                    << surfId.c_str();
         }
         _surfacePatchIndexNeedsRebuild = _surfacePatchIndexNeedsRebuild && !flushed;
-        return flushed;
+        return flushed || isEditUpdate;
     }
 
     if (isEditUpdate && alreadyIndexed) {
