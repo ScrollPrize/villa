@@ -541,6 +541,10 @@ class TifxyzLasagnaDataset(Dataset):
             )
         self.label_patch_size_zyx = label_patch_size_zyx
         self.apply_augmentation = bool(apply_augmentation)
+        self.random_paste_offset = bool(
+            config.get("random_paste_offset",
+                        np.any(label_patch_size_zyx < patch_size_zyx))
+        )
 
         self.max_surfaces_per_patch = int(config.get("max_surfaces_per_patch", 8))
         # Emits per-surface raw geometry (``surface_geometry``) in the
@@ -590,22 +594,38 @@ class TifxyzLasagnaDataset(Dataset):
 
         crop_size = tuple(int(v) for v in self.patch_size_zyx)
         label_size = tuple(int(v) for v in self.label_patch_size_zyx)
-        crop_size_arr = np.array(crop_size, dtype=np.int64)
-        # Centered offset — deterministic, matches val-time placement.
-        center_off = np.array(
-            [(crop_size[i] - label_size[i]) // 2 for i in range(3)],
-            dtype=np.int64,
-        )
+        # Envelope covering every possible runtime CT read. Training
+        # uses paste_off ∈ [-L/2, P − L/2] per axis, so ct_min ranges
+        # over [label_min − (P − L/2), label_min + L/2] and the union
+        # of all ct_max ends at label_min + L/2 + P. That's a 2P cube
+        # starting at label_min − (P − L/2). When P == L, val uses
+        # the centered position — checking the P-sized centered
+        # window is sufficient, keeping filter cost unchanged for
+        # pre-random-offset runs.
+        is_random = any(crop_size[i] > label_size[i] for i in range(3))
+        if is_random:
+            env_size = tuple(2 * crop_size[i] for i in range(3))
+            env_off = np.array(
+                [-(crop_size[i] - label_size[i] // 2) for i in range(3)],
+                dtype=np.int64,
+            )
+        else:
+            env_size = crop_size
+            env_off = np.array(
+                [-((crop_size[i] - label_size[i]) // 2) for i in range(3)],
+                dtype=np.int64,
+            )
+        env_size_arr = np.array(env_size, dtype=np.int64)
         kept = []
         dropped = 0
         for patch in iterator:
             z0, _, y0, _, x0, _ = patch.world_bbox
             label_min = np.array([z0, y0, x0], dtype=np.int64)
-            min_corner = label_min - center_off
-            max_corner = min_corner + crop_size_arr
+            min_corner = label_min + env_off
+            max_corner = min_corner + env_size_arr
             try:
                 _read_volume_crop_from_patch(
-                    patch, crop_size=crop_size,
+                    patch, crop_size=env_size,
                     min_corner=min_corner, max_corner=max_corner,
                     image_normalization="unit",
                 )
@@ -740,6 +760,29 @@ class TifxyzLasagnaDataset(Dataset):
         }
 
     def __getitem__(self, idx):
+        try:
+            return self._getitem_impl(idx)
+        except (PermissionError, OSError, ConnectionError,
+                TimeoutError, OfflineCacheMiss) as e:
+            # Transient zarr/S3 read errors (expired token, network
+            # hiccup, stale credential, missing cache chunk). Return
+            # None → collate_variable_surfaces filters it, and the
+            # train loop's empty-batch path skips the step.
+            patch = self.patches[idx] if idx < len(self.patches) else None
+            seg = ""
+            if patch is not None and patch.wraps:
+                try:
+                    seg = str(patch.wraps[0]["segment"].uuid)
+                except Exception:
+                    seg = "?"
+            print(
+                f"{TAG} read error idx={idx} seg={seg} "
+                f"{type(e).__name__}: {e} — skipping sample",
+                flush=True,
+            )
+            return None
+
+    def _getitem_impl(self, idx):
         patch = self.patches[idx]
 
         z0, z1, y0, y1, x0, x1 = patch.world_bbox
@@ -752,7 +795,7 @@ class TifxyzLasagnaDataset(Dataset):
         # be cropped off either edge during training; val/eval uses
         # the centered position. When P == L, randomization collapses
         # to the centered case.
-        if self.apply_augmentation and np.any(
+        if self.random_paste_offset and np.any(
             np.asarray(crop_size) > np.asarray(label_size)
         ):
             paste_off = np.array(
@@ -911,6 +954,12 @@ def collate_variable_surfaces(batch):
 
     Stacks fixed-size tensors normally, keeps surface_masks as a list.
     """
+    # Filter samples that raised in __getitem__ (transient zarr/S3
+    # read errors etc.). An empty result signals the train loop to
+    # skip the step.
+    batch = [b for b in batch if b is not None]
+    if not batch:
+        return None
     images = torch.stack([b["image"] for b in batch])
     tensor_moments = torch.stack([b["tensor_moments"] for b in batch])
     normals_valid = torch.stack([b["normals_valid"] for b in batch])
@@ -1006,6 +1055,7 @@ def augment_batch_inplace(batch: dict) -> dict:
     flip_y = bool(torch.rand(1).item() < 0.5)
     flip_x = bool(torch.rand(1).item() < 0.5)
     k = int(torch.randint(0, 4, (1,)).item())
+    batch["_aug"] = (flip_z, flip_y, flip_x, k)
     if not (flip_z or flip_y or flip_x or k):
         return batch
 

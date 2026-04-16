@@ -2,6 +2,7 @@
     "volume_cache_dir": "/ephemeral/hendrik/zarr_cache",
     "volume_cache_retry_seconds": 600,
     "patch_size": 192,
+    "volume_cache_offline": false,
     "overlap_fraction": 0.25,
     "chunk_pad": 20.0,
     "same_surface_threshold": 2.0,

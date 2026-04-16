@@ -133,6 +133,21 @@ from PIL import Image
 
 TAG = "[train_tifxyz]"
 
+
+def _filter_batch(batch: dict, keep_list: list) -> dict:
+    """Return a shallow copy of collated batch dict with only the given sample indices."""
+    B_orig = len(batch["patch_info"])
+    out = {}
+    for k, v in batch.items():
+        if isinstance(v, torch.Tensor) and v.ndim >= 1 and v.shape[0] == B_orig:
+            keep_t = torch.tensor(keep_list, device=v.device, dtype=torch.long)
+            out[k] = v.index_select(0, keep_t)
+        elif isinstance(v, list) and len(v) == B_orig:
+            out[k] = [v[i] for i in keep_list]
+        else:
+            out[k] = v
+    return out
+
 _CHANNEL_NAMES = [
     "cos", "grad_mag",
     "dir0_z", "dir1_z", "dir0_y", "dir1_y", "dir0_x", "dir1_x",
@@ -688,6 +703,7 @@ def train(
     )
     config["label_patch_size"] = effective_label_patch
     if effective_label_patch != int(patch_size):
+        config["random_paste_offset"] = True
         print(
             f"{TAG} label_patch_size={effective_label_patch} < "
             f"patch_size={patch_size}: GT region placed at random "
@@ -996,6 +1012,21 @@ def train(
     last_val_loss = init_val_loss
     val_every_steps = 200
 
+    # Hi-mag skip hysteresis. The per-sample screen rejects samples
+    # with scale-space L1 >= 1 to keep pathological grad_mag outliers
+    # out of the gradient. Early in training, almost everything is
+    # above the threshold and the screen would starve the loss; this
+    # state machine disables the filter when 100 consecutive samples
+    # exceed threshold and re-enables it once >50% of a 100-sample
+    # window is back under threshold. In DDP we all-reduce per-step
+    # (above, total) counts so every rank updates state identically.
+    from collections import deque
+    HIMAG_WINDOW = 100
+    HIMAG_DISABLE_ABOVE = 75  # disable when >= this many of window are above
+    HIMAG_ENABLE_ABOVE = 50   # re-enable when < this many of window are above
+    himag_flags: "deque[int]" = deque(maxlen=HIMAG_WINDOW)
+    himag_enabled = True
+
     for epoch in range(epochs):
         model.train()
         if train_sampler is not None:
@@ -1014,11 +1045,32 @@ def train(
 
         n_seen = 0
         n_skipped = 0
+        n_read_err = 0
         n_hi_mag = 0
         n_surfaces_pre = 0
         n_surfaces_post = 0
 
         for batch in train_iter:
+            # All samples this rank raised in __getitem__ (transient
+            # zarr/S3 read errors). Coordinate with other ranks so
+            # that if ANY rank is empty, all skip this step.
+            local_read_err = int(batch is None)
+            global_any_read_err = _allreduce_max(
+                local_read_err, world_size, device,
+            )
+            if global_any_read_err:
+                if local_read_err:
+                    n_read_err += 1
+                n_skipped += 1
+                if is_main:
+                    train_iter.set_postfix(
+                        loss="---",
+                        skip=f"{100.0 * n_skipped / max(n_seen + 1, 1):.1f}%",
+                        rderr=n_read_err,
+                        merge=f"{100.0 * (1.0 - n_surfaces_post / max(n_surfaces_pre, 1)):.1f}%",
+                    )
+                continue
+
             # Geometry-level spatial augmentation: flips the image,
             # surface_masks, padding_mask and surface_geometry, then
             # re-splats raw_normals + normals_valid from the
@@ -1094,17 +1146,64 @@ def train(
                         )
                         per_mag_vals.append(float(v.item()))
                         del v
-                bad = [b for b, v in enumerate(per_mag_vals) if v >= 1.0]
-                for b in bad:
-                    pi = batch["patch_info"][b]
-                    seg = pi.get("segment_uuid", "?")
-                    idx_b = pi.get("idx", "?")
+                local_above = [b for b, v in enumerate(per_mag_vals) if v >= 1.0]
+                local_above_cnt = len(local_above)
+
+                # Sync (above, total) across ranks so every rank
+                # updates the hysteresis state identically.
+                if is_dist:
+                    cnt_t = torch.tensor(
+                        [local_above_cnt, B],
+                        device=device, dtype=torch.long,
+                    )
+                    dist.all_reduce(cnt_t, op=dist.ReduceOp.SUM)
+                    global_above = int(cnt_t[0].item())
+                    global_total = int(cnt_t[1].item())
+                else:
+                    global_above = local_above_cnt
+                    global_total = B
+
+                # Extend the 100-sample ring buffer: append 1 per
+                # above-threshold sample and 0 per below. Order within
+                # a step doesn't matter — only window counts drive
+                # the state transitions.
+                global_below = global_total - global_above
+                himag_flags.extend([1] * global_above + [0] * global_below)
+                window_above = sum(himag_flags)
+                prev_enabled = himag_enabled
+                if himag_enabled:
+                    # Disable when ≥75% of the 100-sample window is
+                    # above threshold — the filter is starving the
+                    # loss and needs to let the model recover.
+                    if (len(himag_flags) == HIMAG_WINDOW
+                            and window_above >= HIMAG_DISABLE_ABOVE):
+                        himag_enabled = False
+                else:
+                    # Re-enable once <50% of the window is above.
+                    if (len(himag_flags) == HIMAG_WINDOW
+                            and window_above < HIMAG_ENABLE_ABOVE):
+                        himag_enabled = True
+                if is_main and prev_enabled != himag_enabled:
+                    state = "ENABLED" if himag_enabled else "DISABLED"
                     print(
-                        f"{TAG} hi-mag skip step={global_step} "
-                        f"seg={seg} idx={idx_b} "
-                        f"mag_loss={per_mag_vals[b]:.4f}",
+                        f"{TAG} hi-mag filter {state} at step "
+                        f"{global_step} (window above "
+                        f"{window_above}/{len(himag_flags)})",
                         flush=True,
                     )
+
+                bad = local_above if himag_enabled else []
+                if himag_enabled:
+                    for b in bad:
+                        pi = batch["patch_info"][b]
+                        seg = pi.get("segment_uuid", "?")
+                        idx_b = pi.get("idx", "?")
+                        print(
+                            f"{TAG} hi-mag skip step={global_step} "
+                            f"seg={seg} idx={idx_b} "
+                            f"mag_loss={per_mag_vals[b]:.4f}",
+                            flush=True,
+                        )
                 n_hi_mag += len(bad)
                 local_all_bad = int(len(bad) == B)
                 global_any_all_bad = _allreduce_max(
@@ -1116,12 +1215,14 @@ def train(
                             loss="---",
                             skip=f"{100.0 * n_skipped / max(n_seen, 1):.1f}%",
                             himag=n_hi_mag,
+                            hifilt="on" if himag_enabled else "OFF",
                             merge=f"{100.0 * (1.0 - n_surfaces_post / max(n_surfaces_pre, 1)):.1f}%",
                         )
                     continue
                 if bad:
+                    keep_list = [b for b in range(B) if b not in bad]
                     keep = torch.tensor(
-                        [b for b in range(B) if b not in bad],
+                        keep_list,
                         device=pred.device, dtype=torch.long,
                     )
                     pred = pred.index_select(0, keep)
@@ -1131,6 +1232,8 @@ def train(
                     dir_sparse_mask = dir_sparse_mask.index_select(0, keep)
                     dir_dense_mask = dir_dense_mask.index_select(0, keep)
                     dir_axis_weight = dir_axis_weight.index_select(0, keep)
+                    image = image.index_select(0, keep)
+                    batch = _filter_batch(batch, keep_list)
 
                 # Per-channel losses
                 loss_cos = scale_loss_mse(pred[:, 0:1], targets[:, 0:1], mask=cos_mask)
@@ -1194,7 +1297,9 @@ def train(
                     loss=f"{loss.item():.4f}",
                     avg20=f"{running:.4f}",
                     skip=f"{100.0 * n_skipped / max(n_seen, 1):.1f}%",
+                    rderr=n_read_err,
                     himag=n_hi_mag,
+                    hifilt="on" if himag_enabled else "OFF",
                     merge=f"{100.0 * (1.0 - n_surfaces_post / max(n_surfaces_pre, 1)):.1f}%",
                 )
 
@@ -1220,6 +1325,16 @@ def train(
 
             if global_step % 100 == 0:
                 _log_vis(log_images, "train", image, pred, targets, cos_mask, global_step)
+                aug = batch.get("_aug")
+                if aug and is_main:
+                    fz, fy, fx, kk = aug
+                    print(
+                        f"{TAG} vis step={global_step} "
+                        f"aug=(flip_z={fz}, flip_y={fy}, "
+                        f"flip_x={fx}, k={kk})",
+                        flush=True,
+                    )
+                    log_scalar("train/aug_k", kk, global_step)
 
             if global_step % vis_interval_steps == 0:
                 _log_full_vis(batch, "train", global_step)
@@ -1324,6 +1439,10 @@ def _evaluate(
 
     with torch.no_grad(), torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_autocast):
         for batch in val_iter:
+            if batch is None:
+                # Transient read error on this val shard sample —
+                # no grad sync in val so each rank skips independently.
+                continue
             image = batch["image"].to(device)
             (
                 targets, validity,
