@@ -110,6 +110,42 @@ class _BaseRopePositionEmbedding(nn.Module):
 
         return coords
 
+    def _sample_coord_augmentation_params(self, *, device: torch.device, dtype: torch.dtype):
+        shift = None
+        jitter = None
+        rescale = None
+        if self.training and self.shift_coords is not None:
+            shift = torch.empty(self.ndim, device=device, dtype=dtype).uniform_(
+                -self.shift_coords, self.shift_coords
+            )
+        if self.training and self.jitter_coords is not None:
+            jitter_log = math.log(self.jitter_coords)
+            jitter = torch.empty(self.ndim, device=device, dtype=dtype).uniform_(
+                -jitter_log, jitter_log
+            ).exp()
+        if self.training and self.rescale_coords is not None:
+            rescale_log = math.log(self.rescale_coords)
+            rescale = torch.empty(1, device=device, dtype=dtype).uniform_(
+                -rescale_log, rescale_log
+            ).exp()
+        return shift, jitter, rescale
+
+    def apply_coord_augmentation_params(
+        self,
+        coords: Tensor,
+        *,
+        shift: Tensor | None,
+        jitter: Tensor | None,
+        rescale: Tensor | None,
+    ) -> Tensor:
+        if shift is not None:
+            coords = coords + shift[None, :]
+        if jitter is not None:
+            coords = coords * jitter[None, :]
+        if rescale is not None:
+            coords = coords * rescale
+        return coords
+
     def _build_periods(self, count: int, denominator_dim: int, *, device: torch.device | None = None) -> Tensor:
         device = device or torch.device("cpu")
         if self.base is not None:
@@ -192,13 +228,16 @@ class RopePositionEmbedding(_BaseRopePositionEmbedding):
         )
         self.periods.data.copy_(periods)
 
-    def get_embed(self, shape: Sequence[int]) -> RopeEmbedding:
-        coords = self._get_coords(shape)
+    def get_embed_from_coords(self, coords: Tensor) -> RopeEmbedding:
         angles = 2 * math.pi * coords[:, :, None] / self.periods[None, None, :]
         angles = angles.flatten(1, 2).tile(2)
         cos = torch.cos(angles)
         sin = torch.sin(angles)
         return sin, cos
+
+    def get_embed(self, shape: Sequence[int]) -> RopeEmbedding:
+        coords = self._get_coords(shape)
+        return self.get_embed_from_coords(coords)
 
     def forward(self, shape: Sequence[int]) -> RopeEmbedding:
         return self.get_embed(shape)
@@ -319,13 +358,16 @@ class MixedRopePositionEmbedding(_BaseRopePositionEmbedding):
     def no_weight_decay(self) -> set[str]:
         return {"mix_frequencies"}
 
-    def get_embed(self, shape: Sequence[int]) -> RopeEmbedding:
-        coords = self._get_coords(shape)
+    def get_embed_from_coords(self, coords: Tensor) -> RopeEmbedding:
         angles = 2 * math.pi * torch.einsum("td,hpd->htp", coords, self.mix_frequencies)
         angles = angles.tile(2)
         cos = torch.cos(angles)
         sin = torch.sin(angles)
         return sin, cos
+
+    def get_embed(self, shape: Sequence[int]) -> RopeEmbedding:
+        coords = self._get_coords(shape)
+        return self.get_embed_from_coords(coords)
 
     def forward(self, shape: Sequence[int]) -> RopeEmbedding:
         return self.get_embed(shape)
