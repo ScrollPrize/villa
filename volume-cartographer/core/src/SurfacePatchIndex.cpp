@@ -1839,11 +1839,23 @@ SurfacePatchIndex::computePlaneIntersections(
     // side of the plane. plane.scalarp(p) returns signed distance from
     // plane to point; if all 8 bbox corners share the same side of the
     // plane (and clear the tolerance), the patch can't intersect.
+    //
+    // R-tree boxes are quantized through boxSnap (16-bit per axis over
+    // ~101000 units → ~1.54 units/step). The stored lo/hi can each
+    // shift by up to half a step inward, shrinking the box by up to
+    // one full step per axis vs the true patch bbox. We expand the
+    // box by one step on every side before the corner test so a
+    // genuinely-intersecting patch is never wrongly rejected.
+    constexpr float kQuantPad = 1.6f;  // > one quant step (~1.541)
     auto bboxStraddlesPlane = [&](const Impl::Box3& box) {
         const auto& lo = box.min_corner();
         const auto& hi = box.max_corner();
-        const float lox = lo.get<0>(), loy = lo.get<1>(), loz = lo.get<2>();
-        const float hix = hi.get<0>(), hiy = hi.get<1>(), hiz = hi.get<2>();
+        const float lox = lo.get<0>() - kQuantPad;
+        const float loy = lo.get<1>() - kQuantPad;
+        const float loz = lo.get<2>() - kQuantPad;
+        const float hix = hi.get<0>() + kQuantPad;
+        const float hiy = hi.get<1>() + kQuantPad;
+        const float hiz = hi.get<2>() + kQuantPad;
         const float d000 = plane.scalarp({lox, loy, loz});
         const float d100 = plane.scalarp({hix, loy, loz});
         const float d010 = plane.scalarp({lox, hiy, loz});
