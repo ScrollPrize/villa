@@ -134,6 +134,30 @@ using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 namespace
 {
 
+std::string compositeMethodForModeIndex(int index)
+{
+    switch (index) {
+        case 0: return "max";
+        case 1: return "mean";
+        case 2: return "min";
+        case 3: return "alpha";
+        case 4: return "beerLambert";
+        case 5: return "volumetric";
+        default: return "mean";
+    }
+}
+
+int compositeModeIndexForMethod(const std::string& method)
+{
+    if (method == "max") return 0;
+    if (method == "mean") return 1;
+    if (method == "min") return 2;
+    if (method == "alpha") return 3;
+    if (method == "beerLambert") return 4;
+    if (method == "volumetric") return 5;
+    return 1;
+}
+
 bool isRemoteTransformSource(const QString& source)
 {
     const QString trimmed = source.trimmed();
@@ -646,6 +670,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
                                                   vc3d::settings::viewer::MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT).toBool();
     setWindowIcon(QPixmap(":/images/logo.png"));
     ui.setupUi(this);
+    ui.cmbCompositeMode->setCurrentIndex(compositeModeIndexForMethod("max"));
     const QString baseTitle = windowTitle();
     const QString repoShortHash = QString::fromStdString(ProjectInfo::RepositoryShortHash()).trimmed();
     if (!repoShortHash.isEmpty() && !repoShortHash.startsWith('@')
@@ -675,6 +700,16 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _viewerManager->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
     connect(_viewerManager.get(), &ViewerManager::viewerCreated, this, [this](CTiledVolumeViewer* viewer) {
         configureViewerConnections(viewer);
+        if (!viewer) {
+            return;
+        }
+        auto s = viewer->compositeRenderSettings();
+        s.params.method = compositeMethodForModeIndex(ui.cmbCompositeMode->currentIndex());
+        viewer->setCompositeRenderSettings(s);
+        if (viewer->surfName() == "segmentation") {
+            QSignalBlocker blocker(ui.chkCompositeEnabled);
+            ui.chkCompositeEnabled->setChecked(s.enabled);
+        }
     });
 
     // Slice step size label in status bar
@@ -912,16 +947,15 @@ CWindow::CWindow(size_t cacheSizeGB) :
     fCompositeViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CompositeView), this);
     fCompositeViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fCompositeViewShortcut, &QShortcut::activated, [this]() {
-        if (!_viewerManager) {
+        auto* viewer = segmentationViewer();
+        if (!viewer) {
             return;
         }
-        _viewerManager->forEachViewer([](CTiledVolumeViewer* viewer) {
-            if (viewer && viewer->surfName() == "segmentation") {
-                auto s = viewer->compositeRenderSettings();
-                s.enabled = !s.enabled;
-                viewer->setCompositeRenderSettings(s);
-            }
-        });
+        auto s = viewer->compositeRenderSettings();
+        s.enabled = !s.enabled;
+        viewer->setCompositeRenderSettings(s);
+        QSignalBlocker blocker(ui.chkCompositeEnabled);
+        ui.chkCompositeEnabled->setChecked(s.enabled);
     });
 
     // Toggle direction hints overlay (Ctrl+T)
@@ -3659,21 +3693,18 @@ void CWindow::CreateWidgets(void)
     });
 
     connect(ui.cmbCompositeMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        std::string method = "max";
-        switch (index) {
-            case 0: method = "max"; break;
-            case 1: method = "mean"; break;
-            case 2: method = "min"; break;
-            case 3: method = "alpha"; break;
-            case 4: method = "beerLambert"; break;
-            case 5: method = "volumetric"; break;
+        if (!_viewerManager) {
+            return;
         }
-
-        if (auto* viewer = segmentationViewer()) {
+        const std::string method = compositeMethodForModeIndex(index);
+        _viewerManager->forEachViewer([&method](CTiledVolumeViewer* viewer) {
+            if (!viewer) {
+                return;
+            }
             auto s = viewer->compositeRenderSettings();
             s.params.method = method;
             viewer->setCompositeRenderSettings(s);
-        }
+        });
     });
 
     if (chkAxisAlignedSlices) {
