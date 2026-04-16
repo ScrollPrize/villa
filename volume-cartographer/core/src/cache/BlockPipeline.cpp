@@ -972,7 +972,14 @@ int BlockPipeline::numLevels() const noexcept {
 }
 
 std::array<int, 3> BlockPipeline::chunkShape(int level) const noexcept {
-    return source_ ? source_->chunkShape(level) : std::array<int, 3>{0, 0, 0};
+    if (!source_) return {0, 0, 0};
+    // When a disk-tier exists for this level, chunks are canonicalized to
+    // 128³ by assembleCanonicalChunk / insertChunkAsBlocks. The source's
+    // native chunk size may differ (e.g., 256³); returning it would make
+    // Slicing.cpp's chunk-key enumeration compute the wrong grid.
+    if (level >= 0 && level < int(diskLevels_.size()) && diskLevels_[level])
+        return {128, 128, 128};
+    return source_->chunkShape(level);
 }
 
 std::array<int, 3> BlockPipeline::levelShape(int level) const noexcept {
@@ -1004,11 +1011,21 @@ size_t BlockPipeline::countAvailable(const std::vector<ChunkKey>& keys) const {
     constexpr int kMaxL = 16;
     std::array<int, kMaxL> bpcZ{}, bpcY{}, bpcX{};
     std::array<bool, kMaxL> shapeCached{};
+    // Snapshot emptyChunks_ once for the batch so we don't re-acquire the
+    // mutex per key. Zero chunks are recorded here by insertChunkAsBlocks
+    // and have no block-cache entry, so without this check countAvailable
+    // would report them as unavailable and wait loops would stall.
+    std::unordered_set<ChunkKey, ChunkKeyHash> emptySnap;
+    {
+        std::lock_guard lk(emptyChunksMutex_);
+        emptySnap = emptyChunks_;
+    }
     for (const auto& key : keys) {
         if (isNegativeCached(key)) { n++; continue; }
+        if (emptySnap.count(key)) { n++; continue; }
         if (key.level < 0 || key.level >= kMaxL) continue;
         if (!shapeCached[key.level]) {
-            auto csk = source_->chunkShape(key.level);
+            auto csk = chunkShape(key.level);
             if (csk[0] <= 0) { shapeCached[key.level] = true; continue; }
             bpcZ[key.level] = csk[0] / kBlockSize;
             bpcY[key.level] = csk[1] / kBlockSize;
