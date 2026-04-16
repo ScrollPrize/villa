@@ -776,7 +776,7 @@ void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
     if (outCandidates.capacity() < 2048) {
         outCandidates.reserve(2048);
     }
-    forEachTriangle(bounds, targetSurface, [&](const TriangleCandidate& candidate) {
+    forEachTriangleImpl(bounds, targetSurface, nullptr, [&](const TriangleCandidate& candidate) {
         outCandidates.push_back(candidate);
     });
 }
@@ -792,7 +792,7 @@ void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
     if (outCandidates.capacity() < 2048) {
         outCandidates.reserve(2048);
     }
-    forEachTriangle(bounds, targetSurfaces, [&](const TriangleCandidate& candidate) {
+    forEachTriangleImpl(bounds, nullptr, &targetSurfaces, [&](const TriangleCandidate& candidate) {
         outCandidates.push_back(candidate);
     });
 }
@@ -801,6 +801,7 @@ void SurfacePatchIndex::forEachTriangle(const Rect3D& bounds,
                                         const SurfacePtr& targetSurface,
                                         const std::function<void(const TriangleCandidate&)>& visitor) const
 {
+    if (!visitor) return;
     forEachTriangleImpl(bounds, targetSurface, nullptr, visitor);
 }
 
@@ -808,19 +809,20 @@ void SurfacePatchIndex::forEachTriangle(const Rect3D& bounds,
                                         const std::unordered_set<SurfacePtr>& targetSurfaces,
                                         const std::function<void(const TriangleCandidate&)>& visitor) const
 {
-    if (targetSurfaces.empty()) {
+    if (!visitor || targetSurfaces.empty()) {
         return;
     }
     forEachTriangleImpl(bounds, nullptr, &targetSurfaces, visitor);
 }
 
+template <typename Visitor>
 void SurfacePatchIndex::forEachTriangleImpl(
     const Rect3D& bounds,
     const SurfacePtr& targetSurface,
     const std::unordered_set<SurfacePtr>* filterSurfaces,
-    const std::function<void(const TriangleCandidate&)>& visitor) const
+    Visitor&& visitor) const
 {
-    if (!visitor || !impl_ || !impl_->tree) {
+    if (!impl_ || !impl_->tree) {
         return;
     }
 
@@ -1778,9 +1780,7 @@ SurfacePatchIndex::computePlaneIntersections(
     const PlaneSurface& plane,
     const cv::Rect& planeRoi,
     const std::unordered_set<SurfacePtr>& targets,
-    float clipTolerance,
-    std::vector<TriangleCandidate>* triangleBuf,
-    std::unordered_map<SurfacePtr, std::vector<size_t>>* surfaceBuf) const
+    float clipTolerance) const
 {
     std::unordered_map<SurfacePtr, std::vector<TriangleSegment>> result;
     if (empty() || targets.empty()) {
@@ -1820,50 +1820,31 @@ SurfacePatchIndex::computePlaneIntersections(
     viewBbox.low -= cv::Vec3f(padding, padding, padding);
     viewBbox.high += cv::Vec3f(padding, padding, padding);
 
-    // Query triangles from R-tree
-    std::vector<TriangleCandidate> localTriBuf;
-    auto& triangles = triangleBuf ? *triangleBuf : localTriBuf;
-    queryTriangles(viewBbox, targets, triangles);
-
-    // Group triangles by surface
-    std::unordered_map<SurfacePtr, std::vector<size_t>> localSurfBuf;
-    auto& bySurface = surfaceBuf ? *surfaceBuf : localSurfBuf;
-    for (auto& [surf, indices] : bySurface) {
-        indices.clear();
-    }
-    for (size_t idx = 0; idx < triangles.size(); ++idx) {
-        const auto& surface = triangles[idx].surface;
-        if (surface) {
-            bySurface[surface].push_back(idx);
-        }
+    // Pre-create per-target buckets so the visitor lookup is a single
+    // pointer-keyed find (no allocation, no rehash) per triangle.
+    std::unordered_map<const QuadSurface*, std::vector<TriangleSegment>*> buckets;
+    buckets.reserve(targets.size());
+    for (const auto& t : targets) {
+        if (t) buckets.emplace(t.get(), &result[t]);
     }
 
-    // Clip triangles per surface in parallel
-    for (const auto& target : targets) {
-        const auto it = bySurface.find(target);
-        if (it == bySurface.end()) {
-            continue;
-        }
-        const auto& indices = it->second;
-        const size_t n = indices.size();
+    // Fused visitor: for every triangle the R-tree spits out, clip it
+    // against the plane right there and append the resulting segment to
+    // the per-surface bucket. Skips the intermediate TriangleCandidate
+    // vector and the bySurface grouping pass entirely.
+    forEachTriangleImpl(viewBbox, nullptr, &targets,
+        [&](const TriangleCandidate& tri) {
+            auto seg = clipTriangleToPlane(tri, plane, clipTolerance);
+            if (!seg) return;
+            auto it = buckets.find(tri.surface.get());
+            if (it == buckets.end()) return;
+            it->second->push_back(std::move(*seg));
+        });
 
-        std::vector<std::optional<TriangleSegment>> clipResults(n);
-        #pragma omp parallel for schedule(dynamic, 64)
-        for (size_t k = 0; k < n; ++k) {
-            clipResults[k] =
-                clipTriangleToPlane(triangles[indices[k]], plane, clipTolerance);
-        }
-
-        std::vector<TriangleSegment> segments;
-        segments.reserve(n);
-        for (auto& r : clipResults) {
-            if (r) {
-                segments.push_back(std::move(*r));
-            }
-        }
-        if (!segments.empty()) {
-            result[target] = std::move(segments);
-        }
+    // Drop empty entries that were pre-created but never received a segment.
+    for (auto it = result.begin(); it != result.end(); ) {
+        if (it->second.empty()) it = result.erase(it);
+        else ++it;
     }
 
     return result;
