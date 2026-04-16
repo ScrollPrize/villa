@@ -19,8 +19,6 @@ set(srcs
     FileWatcherService.hpp
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
-    FocusHistoryManager.cpp
-    FocusHistoryManager.hpp
     SurfaceAreaCalculator.cpp
     SurfaceAreaCalculator.hpp
     SegmentationCommandHandler.cpp

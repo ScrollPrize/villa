@@ -104,7 +104,6 @@
 #include "MenuActionController.hpp"
 #include "FileWatcherService.hpp"
 #include "AxisAlignedSliceController.hpp"
-#include "FocusHistoryManager.hpp"
 #include "SurfaceAreaCalculator.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "vc/core/Version.hpp"
@@ -1947,7 +1946,6 @@ void CWindow::onLoadAffineRequested()
 void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 {
     const bool hadVolume = static_cast<bool>(_state->currentVolume());
-    auto previousVolume = _state->currentVolume();
     POI* existingFocusPoi = _state ? _state->poi("focus") : nullptr;
 
     // CState handles cache budget and volume ID resolution, and emits volumeChanged
@@ -1955,10 +1953,6 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 
     if (newvol) {
         primeRemoteLevel5WithDialog(this, newvol);
-    }
-
-    if (previousVolume != newvol) {
-        _focusHistory.clear();
     }
 
     const bool growthVolumeValid = _state->hasVpkg() && !_state->segmentationGrowthVolumeId().empty() &&
@@ -2267,7 +2261,7 @@ void CWindow::toggleFocusedView()
     }
 }
 
-bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId, bool addToHistory)
+bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId)
 {
     if (!_state) {
         return false;
@@ -2289,10 +2283,6 @@ bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, 
     }
 
     _state->setPOI("focus", focus);
-
-    if (addToHistory) {
-        _focusHistory.record(focus->p, focus->n, focus->surfaceId);
-    }
 
     // Get surface for orientation - look up by ID
     Surface* orientationSource = _state->surfaceRaw(focus->surfaceId);
@@ -2320,6 +2310,27 @@ void CWindow::recenterPlaneViewersOn(const cv::Vec3f& position)
             viewer->centerOnVolumePoint(position, true);
         }
     });
+}
+
+bool CWindow::recenterViewersOnCurrentFocus()
+{
+    if (!_state || !_viewerManager) {
+        return false;
+    }
+
+    POI* focus = _state->poi("focus");
+    if (!focus) {
+        return false;
+    }
+
+    const cv::Vec3f position = focus->p;
+    _viewerManager->forEachViewer([&position](CTiledVolumeViewer* viewer) {
+        if (viewer) {
+            viewer->centerOnVolumePoint(position, true);
+        }
+    });
+
+    return true;
 }
 
 bool CWindow::centerFocusOnCursor()
@@ -2351,7 +2362,7 @@ bool CWindow::centerFocusOnCursor()
             return false;
         }
 
-        return centerFocusAt(p, n, viewer->surfName(), true);
+        return centerFocusAt(p, n, viewer->surfName());
     };
 
     // Prefer the viewer actually under the mouse cursor. With tiled MDI
@@ -2392,7 +2403,7 @@ bool CWindow::centerFocusOnCursor()
         return false;
     }
 
-    return centerFocusAt(cursor->p, cursor->n, cursor->surfaceId, true);
+    return centerFocusAt(cursor->p, cursor->n, cursor->surfaceId);
 }
 
 void CWindow::setSegmentationCursorMirroring(bool enabled)
@@ -4175,23 +4186,9 @@ void CWindow::keyPressEvent(QKeyEvent* event)
         }
     }
 
-    if (event->key() == vc3d::keybinds::keypress::FocusHistoryBack.key) {
-        if (event->modifiers() == vc3d::keybinds::keypress::FocusHistoryBack.modifiers) {
-            auto entry = _focusHistory.step(-1);
-            if (entry) {
-                _focusHistory.setNavigating(true);
-                centerFocusAt(entry->position, entry->normal, entry->surfaceId, false);
-                _focusHistory.setNavigating(false);
-            }
-            event->accept();
-            return;
-        } else if (event->modifiers() == vc3d::keybinds::keypress::FocusHistoryForward.modifiers) {
-            auto entry = _focusHistory.step(1);
-            if (entry) {
-                _focusHistory.setNavigating(true);
-                centerFocusAt(entry->position, entry->normal, entry->surfaceId, false);
-                _focusHistory.setNavigating(false);
-            }
+    if (event->key() == vc3d::keybinds::keypress::RecenterFocus.key &&
+        event->modifiers() == vc3d::keybinds::keypress::RecenterFocus.modifiers) {
+        if (recenterViewersOnCurrentFocus()) {
             event->accept();
             return;
         }
@@ -4652,7 +4649,6 @@ void CWindow::CloseVolume(void)
     // CState::closeAll emits volumeClosing, clears surfaces, vpkg, volume, points
     _state->closeAll();
 
-    _focusHistory.clear();
     updateNormalGridAvailability();
     if (_segmentationWidget) {
         _segmentationWidget->setAvailableVolumes({}, QString());
@@ -4712,7 +4708,7 @@ void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf
         if (_state && surf) {
             surfId = _state->findSurfaceId(surf);
         }
-        centerFocusAt(vol_loc, normal, surfId, true);
+        centerFocusAt(vol_loc, normal, surfId);
     }
     else {
     }
@@ -5649,7 +5645,7 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
         }
     } else {
         // 1 point: just center, don't change orientation
-        centerFocusAt(focusPos, cv::Vec3f(0, 0, 1), "", true);
+        centerFocusAt(focusPos, cv::Vec3f(0, 0, 1), "");
         return;
     }
 
