@@ -120,11 +120,17 @@ public:
     void setGeneration(const SurfacePtr& surface, uint64_t gen);
 
 private:
-    template <typename Visitor>
+    struct NoPatchFilter {
+        template <typename Box>
+        bool operator()(const Box&) const { return true; }
+    };
+
+    template <typename Visitor, typename PatchFilter = NoPatchFilter>
     void forEachTriangleImpl(const Rect3D& bounds,
                              const SurfacePtr& targetSurface,
                              const std::unordered_set<SurfacePtr>* filterSurfaces,
-                             Visitor&& visitor) const;
+                             Visitor&& visitor,
+                             PatchFilter&& patchFilter = NoPatchFilter{}) const;
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

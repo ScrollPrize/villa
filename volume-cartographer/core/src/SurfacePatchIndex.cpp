@@ -815,12 +815,13 @@ void SurfacePatchIndex::forEachTriangle(const Rect3D& bounds,
     forEachTriangleImpl(bounds, nullptr, &targetSurfaces, visitor);
 }
 
-template <typename Visitor>
+template <typename Visitor, typename PatchFilter>
 void SurfacePatchIndex::forEachTriangleImpl(
     const Rect3D& bounds,
     const SurfacePtr& targetSurface,
     const std::unordered_set<SurfacePtr>* filterSurfaces,
-    Visitor&& visitor) const
+    Visitor&& visitor,
+    PatchFilter&& patchFilter) const
 {
     if (!impl_ || !impl_->tree) {
         return;
@@ -857,6 +858,12 @@ void SurfacePatchIndex::forEachTriangleImpl(
             if (!found) {
                 return;
             }
+        }
+        // Optional caller-supplied bbox-level reject (e.g. plane-vs-bbox).
+        // Runs before the expensive loadPatchCorners call. With the default
+        // NoPatchFilter the compiler folds this away.
+        if (!patchFilter(entry.first)) {
+            return;
         }
 
         // Precompute surface params for the quad (use cached center*scale offsets)
@@ -1828,6 +1835,28 @@ SurfacePatchIndex::computePlaneIntersections(
         if (t) buckets.emplace(t.get(), &result[t]);
     }
 
+    // Patch-level reject: skip patches whose bbox lies entirely on one
+    // side of the plane. plane.scalarp(p) returns signed distance from
+    // plane to point; if all 8 bbox corners share the same side of the
+    // plane (and clear the tolerance), the patch can't intersect.
+    auto bboxStraddlesPlane = [&](const Impl::Box3& box) {
+        const auto& lo = box.min_corner();
+        const auto& hi = box.max_corner();
+        const float lox = lo.get<0>(), loy = lo.get<1>(), loz = lo.get<2>();
+        const float hix = hi.get<0>(), hiy = hi.get<1>(), hiz = hi.get<2>();
+        const float d000 = plane.scalarp({lox, loy, loz});
+        const float d100 = plane.scalarp({hix, loy, loz});
+        const float d010 = plane.scalarp({lox, hiy, loz});
+        const float d110 = plane.scalarp({hix, hiy, loz});
+        const float d001 = plane.scalarp({lox, loy, hiz});
+        const float d101 = plane.scalarp({hix, loy, hiz});
+        const float d011 = plane.scalarp({lox, hiy, hiz});
+        const float d111 = plane.scalarp({hix, hiy, hiz});
+        const float dmin = std::min({d000, d100, d010, d110, d001, d101, d011, d111});
+        const float dmax = std::max({d000, d100, d010, d110, d001, d101, d011, d111});
+        return dmin <= clipTolerance && dmax >= -clipTolerance;
+    };
+
     // Fused visitor: for every triangle the R-tree spits out, clip it
     // against the plane right there and append the resulting segment to
     // the per-surface bucket. Skips the intermediate TriangleCandidate
@@ -1839,7 +1868,8 @@ SurfacePatchIndex::computePlaneIntersections(
             auto it = buckets.find(tri.surface.get());
             if (it == buckets.end()) return;
             it->second->push_back(std::move(*seg));
-        });
+        },
+        bboxStraddlesPlane);
 
     // Drop empty entries that were pre-created but never received a segment.
     for (auto it = result.begin(); it != result.end(); ) {
