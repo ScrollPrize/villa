@@ -1,0 +1,101 @@
+{
+    "out_dir": "/home/sean/Desktop/test",
+    "mode": "full_3d",
+    "full_3d": {
+        "projection_half_thickness": 3.0
+    },
+    "patch_finding_scale": 4,
+    "seed": 27,
+    "patch_size": [
+        256,
+        256,
+        256
+    ],
+
+    "batch_size": 2,
+    "patch_overlap": 0.5,
+    "patch_min_labeled_coverage": 0.02,
+    "num_iterations": 250000,
+    "val_every": 1000,
+    "mixed_precision": "bf16",
+    "dice_label_smoothing": 0.1,
+    "bce_label_smoothing": 0.1,
+    "dataloader_workers": 10,
+    "warmup_steps": 1000,
+    "image_normalization": "percentile_minmax",
+    "loss": {
+        "terms": [
+            {
+                "name": "LabelSmoothedDCAndBCELoss",
+                "metric_name": "base",
+                "weight": 1.0,
+                "weight_dice": 1.0,
+                "weight_ce": 1.0
+            }
+        ]
+    },
+    "model_type": "unet",
+    "step_count": 1,
+    "in_channels": 2,
+    "model_config": {
+        "autoconfigure": true
+    },
+    "ema": {
+        "enabled": true,
+        "decay": 0.9995,
+        "start_step": 1000,
+        "update_every_steps": 1,
+        "validate": true,
+        "save_in_checkpoint": true
+      },
+    "targets": {
+        "ink": {
+            "out_channels": 1,
+            "activation": "none"
+        }
+    },
+     "datasets": [
+        {
+            "volume_scale": 0,
+            "volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/",
+            "segments_path": "/home/sean/Desktop/new_labels_fixed_matched/phercparis4"
+        },
+        {
+            "volume_scale": 0,
+            "volume_path": "s3://vesuvius-challenge-open-data/PHerc0139/volumes/20260102150214-2.399um-0.2m-78keV-masked.zarr/",
+            "segments_path": "/home/sean/Desktop/new_labels_fixed_matched/0139"
+        },
+        {
+            "volume_scale": 0,
+            "volume_path": "s3://vesuvius-challenge-open-data/PHerc0500P2/volumes/20250526151718-2.215um-0.4m-111keV-masked.zarr/",
+            "segments_path": "/home/sean/Desktop/new_labels_fixed_matched/0500p2"
+        },
+        {
+            "volume_scale": 0,
+            "volume_path": "s3://vesuvius-challenge-open-data/PHerc0814/volumes/20260309142202-2.399um-0.2m-78keV-masked.zarr/",
+            "segments_path": "/home/sean/Desktop/new_labels_fixed_matched/814"
+        },
+        {
+            "volume_scale": 0,
+            "volume_path": "s3://vesuvius-challenge-open-data/PHerc0841/volumes/20260319124803-2.403um-0.2m-77keV-masked.zarr/",
+            "segments_path": "/home/sean/Desktop/new_labels_fixed_matched/841"
+        },
+        {
+            "volume_scale": 0,
+            "volume_path": "s3://scrollprize-volumes/esrf/20251130/SCROLLS_HEL_2.399um_78keV_0.22m_PHerc_1667_TA_0001_masked.zarr/",
+            "segments_path": "/home/sean/Desktop/new_labels_fixed_matched/1667"
+        },
+         {
+            "volume_scale": 0,
+             "volume_path": "s3://vesuvius-challenge-open-data/PHercMAN5/volumes/20260311104824-2.399um-0.2m-78keV-masked.zarr/",
+            "segments_path": "/home/sean/Desktop/new_labels_fixed_matched/man5"
+        },
+        {
+            "volume_scale": 0,
+            "volume_path": "s3://vesuvius-challenge-open-data/PHerc0009B/volumes/20250820154339-2.401um-0.3m-77keV-masked.zarr/",
+            "segments_path": "/home/sean/Desktop/new_labels_fixed_matched/0009b"
+        }
+     ],
+
+    "save_every": 5000
+}
