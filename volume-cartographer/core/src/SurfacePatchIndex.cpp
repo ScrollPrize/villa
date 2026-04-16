@@ -386,9 +386,25 @@ struct SurfacePatchIndex::Impl {
         SurfaceCellMask mask;
     };
 
+    static constexpr int kMinTileStride = 8;
     size_t patchCount = 0;
     float bboxPadding = 0.0f;
+    // samplingStride: triangulation stride — controls how finely the
+    // visitor emits triangles within a tile (user-facing).
+    // tileStride: rtree-storage stride — one entry per tileStride×tileStride
+    // source-mesh region. Keeping tileStride decoupled from (and at least
+    // kMinTileStride) keeps rtree memory bounded even when the user wants
+    // stride-1 triangulation. Always a multiple of samplingStride.
     int samplingStride = 1;
+    int tileStride = kMinTileStride;
+
+    static int computeTileStride(int triStride) noexcept {
+        const int s = std::max(1, triStride);
+        if (s >= kMinTileStride) return s;
+        // Round kMinTileStride up to the nearest multiple of s so that
+        // sub-iteration inside a tile divides evenly.
+        return ((kMinTileStride + s - 1) / s) * s;
+    }
 
     // Maps raw pointer -> record (for fast lookup while keeping surface alive via shared_ptr in record)
     std::unordered_map<QuadSurface*, SurfaceRecord> surfaceRecords;
@@ -447,40 +463,51 @@ struct SurfacePatchIndex::Impl {
 
     bool flushPendingSurface(const SurfacePtr& surface, SurfaceCellMask& mask);
 
-    static PatchHit evaluatePatch(const PatchRecord& rec, int stride, const cv::Vec3f& point) {
+    // Evaluates a tile (rec spans tileStride×tileStride source cells).
+    // Sub-iterates at triStride to find the closest sub-quad, returning a
+    // PatchHit with u,v expressed in tile-local source-mesh-cell units
+    // (range [0, tileStride], not bary over the full tile).
+    static PatchHit evaluatePatch(const PatchRecord& rec,
+                                  int tileStride,
+                                  int triStride,
+                                  const cv::Vec3f& point) {
         PatchHit best;
+        triStride = std::max(1, triStride);
+        tileStride = std::max(triStride, tileStride);
 
-        std::array<cv::Vec3f, 4> corners;
-        if (!loadPatchCorners(rec, stride, corners)) {
-            return best;
-        }
+        for (int subJ = 0; subJ < tileStride; subJ += triStride) {
+            for (int subI = 0; subI < tileStride; subI += triStride) {
+                const PatchRecord subRec{rec.surface, rec.i + subI, rec.j + subJ};
+                std::array<cv::Vec3f, 4> corners;
+                if (!loadPatchCorners(subRec, triStride, corners)) {
+                    continue;
+                }
 
-        const auto& p00 = corners[0];
-        const auto& p10 = corners[1];
-        const auto& p11 = corners[2];
-        const auto& p01 = corners[3];
+                const auto& p00 = corners[0];
+                const auto& p10 = corners[1];
+                const auto& p11 = corners[2];
+                const auto& p01 = corners[3];
 
-        // Triangle 0: (p00, p10, p01)
-        {
-            TriangleHit tri = closestPointOnTriangle(point, p00, p10, p01);
-            if (tri.distSq < best.distSq) {
-                best.valid = true;
-                best.distSq = tri.distSq;
-                best.u = clamp01(tri.bary[1]);
-                best.v = clamp01(tri.bary[2]);
-            }
-        }
+                auto recordHit = [&](float subU, float subV, float distSq) {
+                    if (distSq >= best.distSq) return;
+                    best.valid = true;
+                    best.distSq = distSq;
+                    best.u = static_cast<float>(subI) + subU * static_cast<float>(triStride);
+                    best.v = static_cast<float>(subJ) + subV * static_cast<float>(triStride);
+                };
 
-        // Triangle 1: (p10, p11, p01)
-        {
-            TriangleHit tri = closestPointOnTriangle(point, p10, p11, p01);
-            if (tri.distSq < best.distSq) {
-                best.valid = true;
-                best.distSq = tri.distSq;
-                float u = clamp01(tri.bary[0] + tri.bary[1]);
-                float v = clamp01(tri.bary[1] + tri.bary[2]);
-                best.u = u;
-                best.v = v;
+                // Triangle 0: (p00, p10, p01)
+                {
+                    TriangleHit tri = closestPointOnTriangle(point, p00, p10, p01);
+                    recordHit(clamp01(tri.bary[1]), clamp01(tri.bary[2]), tri.distSq);
+                }
+                // Triangle 1: (p10, p11, p01)
+                {
+                    TriangleHit tri = closestPointOnTriangle(point, p10, p11, p01);
+                    float u = clamp01(tri.bary[0] + tri.bary[1]);
+                    float v = clamp01(tri.bary[1] + tri.bary[2]);
+                    recordHit(u, v, tri.distSq);
+                }
             }
         }
 
@@ -594,11 +621,13 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     if (surfaceCount == 0) {
         impl_->tree.reset();
         impl_->samplingStride = std::max(1, impl_->samplingStride);
+        impl_->tileStride = Impl::computeTileStride(impl_->samplingStride);
         return;
     }
 
     impl_->samplingStride = std::max(1, impl_->samplingStride);
-    const int stride = impl_->samplingStride;
+    impl_->tileStride = Impl::computeTileStride(impl_->samplingStride);
+    const int stride = impl_->tileStride;
     const float padding = bboxPadding;
 
     // Pre-create all masks (sequential, enables thread-safe parallel access)
@@ -672,6 +701,7 @@ void SurfacePatchIndex::clear()
         impl_->bboxPadding = 0.0f;
         impl_->surfaceRecords.clear();
         impl_->samplingStride = 1;
+        impl_->tileStride = Impl::computeTileStride(1);
     }
 }
 
@@ -729,7 +759,8 @@ SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const Su
             return;
         }
 
-        Impl::PatchHit hit = Impl::evaluatePatch(rec, impl_->samplingStride, worldPoint);
+        Impl::PatchHit hit = Impl::evaluatePatch(rec, impl_->tileStride,
+                                                  impl_->samplingStride, worldPoint);
         if (!hit.valid || hit.distSq > bestDistSq) {
             return;
         }
@@ -866,18 +897,15 @@ void SurfacePatchIndex::forEachTriangleImpl(
             return;
         }
 
-        // Precompute surface params for the quad (use cached center*scale offsets)
-        const float baseX = static_cast<float>(rec.i);
-        const float baseY = static_cast<float>(rec.j);
-        const int stride = std::max(1, impl_->samplingStride);
+        // The rtree entry covers a tileStride×tileStride source-mesh tile
+        // anchored at (rec.i, rec.j). Sub-iterate at the (finer) triangulation
+        // stride, emitting fine triangles per sub-cell. This keeps the rtree
+        // small while letting the visual triangulation be as fine as the user
+        // wants.
+        const int triStride = std::max(1, impl_->samplingStride);
+        const int tile = std::max(triStride, impl_->tileStride);
 
-        // Load corners once for both triangles (avoids redundant matrix reads)
-        std::array<cv::Vec3f, 4> corners;
-        if (!Impl::loadPatchCorners(rec, stride, corners)) {
-            return;
-        }
-
-        // Get or create cached surface metadata
+        // Surface cache lookup (once per tile)
         auto cacheIt = surfaceCacheMap.find(rec.surface);
         if (cacheIt == surfaceCacheMap.end()) {
             auto srIt = impl_->surfaceRecords.find(rec.surface);
@@ -895,50 +923,61 @@ void SurfacePatchIndex::forEachTriangleImpl(
         }
         const SurfaceCache& cache = cacheIt->second;
 
-        // Compute effective stride (clamped at boundaries, matching loadPatchCorners)
-        const float effectiveStrideX = static_cast<float>(std::min(stride, cache.cols - 1 - rec.i));
-        const float effectiveStrideY = static_cast<float>(std::min(stride, cache.rows - 1 - rec.j));
+        // Sub-iteration bounds: stop at the tile edge AND the surface edge.
+        // loadPatchCorners requires col+stride and row+stride to be < cols/rows.
+        const int subColLimit = std::min(rec.i + tile, cache.cols - 1);
+        const int subRowLimit = std::min(rec.j + tile, cache.rows - 1);
 
-        // Params for corners: [0]=(0,0), [1]=(stride,0), [2]=(stride,stride), [3]=(0,stride)
-        std::array<cv::Vec3f, 4> params = {
-            cv::Vec3f(baseX - cache.cx, baseY - cache.cy, 0.0f),
-            cv::Vec3f(baseX + effectiveStrideX - cache.cx, baseY - cache.cy, 0.0f),
-            cv::Vec3f(baseX + effectiveStrideX - cache.cx, baseY + effectiveStrideY - cache.cy, 0.0f),
-            cv::Vec3f(baseX - cache.cx, baseY + effectiveStrideY - cache.cy, 0.0f)
-        };
+        for (int subJ = rec.j; subJ < subRowLimit; subJ += triStride) {
+            for (int subI = rec.i; subI < subColLimit; subI += triStride) {
+                const Impl::PatchRecord subRec{rec.surface, subI, subJ};
+                std::array<cv::Vec3f, 4> corners;
+                if (!Impl::loadPatchCorners(subRec, triStride, corners)) {
+                    continue;
+                }
 
-        // Emit both triangles from cached corners/params
-        // Triangle 0: corners[0,1,3], params[0,1,3]
-        // Triangle 1: corners[1,2,3], params[1,2,3]
-        for (int triIdx = 0; triIdx < 2; ++triIdx) {
-            TriangleCandidate candidate;
-            candidate.surface = cache.ownedPtr;
-            candidate.i = rec.i;
-            candidate.j = rec.j;
-            candidate.triangleIndex = triIdx;
+                const float baseX = static_cast<float>(subI);
+                const float baseY = static_cast<float>(subJ);
+                const float effectiveStrideX = static_cast<float>(std::min(triStride, cache.cols - 1 - subI));
+                const float effectiveStrideY = static_cast<float>(std::min(triStride, cache.rows - 1 - subJ));
 
-            if (triIdx == 0) {
-                candidate.world = {corners[0], corners[1], corners[3]};
-                candidate.surfaceParams = {params[0], params[1], params[3]};
-            } else {
-                candidate.world = {corners[1], corners[2], corners[3]};
-                candidate.surfaceParams = {params[1], params[2], params[3]};
+                const std::array<cv::Vec3f, 4> params = {
+                    cv::Vec3f(baseX - cache.cx, baseY - cache.cy, 0.0f),
+                    cv::Vec3f(baseX + effectiveStrideX - cache.cx, baseY - cache.cy, 0.0f),
+                    cv::Vec3f(baseX + effectiveStrideX - cache.cx, baseY + effectiveStrideY - cache.cy, 0.0f),
+                    cv::Vec3f(baseX - cache.cx, baseY + effectiveStrideY - cache.cy, 0.0f)
+                };
+
+                for (int triIdx = 0; triIdx < 2; ++triIdx) {
+                    TriangleCandidate candidate;
+                    candidate.surface = cache.ownedPtr;
+                    candidate.i = subI;
+                    candidate.j = subJ;
+                    candidate.triangleIndex = triIdx;
+
+                    if (triIdx == 0) {
+                        candidate.world = {corners[0], corners[1], corners[3]};
+                        candidate.surfaceParams = {params[0], params[1], params[3]};
+                    } else {
+                        candidate.world = {corners[1], corners[2], corners[3]};
+                        candidate.surfaceParams = {params[1], params[2], params[3]};
+                    }
+
+                    const auto& w0 = candidate.world[0];
+                    const auto& w1 = candidate.world[1];
+                    const auto& w2 = candidate.world[2];
+                    if (std::max({w0[0], w1[0], w2[0]}) < bounds.low[0] ||
+                        std::min({w0[0], w1[0], w2[0]}) > bounds.high[0] ||
+                        std::max({w0[1], w1[1], w2[1]}) < bounds.low[1] ||
+                        std::min({w0[1], w1[1], w2[1]}) > bounds.high[1] ||
+                        std::max({w0[2], w1[2], w2[2]}) < bounds.low[2] ||
+                        std::min({w0[2], w1[2], w2[2]}) > bounds.high[2]) {
+                        continue;
+                    }
+
+                    visitor(candidate);
+                }
             }
-
-            // Inline triangle-AABB intersection check (avoids function call overhead)
-            const auto& w0 = candidate.world[0];
-            const auto& w1 = candidate.world[1];
-            const auto& w2 = candidate.world[2];
-            if (std::max({w0[0], w1[0], w2[0]}) < bounds.low[0] ||
-                std::min({w0[0], w1[0], w2[0]}) > bounds.high[0] ||
-                std::max({w0[1], w1[1], w2[1]}) < bounds.low[1] ||
-                std::min({w0[1], w1[1], w2[1]}) > bounds.high[1] ||
-                std::max({w0[2], w1[2], w2[2]}) < bounds.low[2] ||
-                std::min({w0[2], w1[2], w2[2]}) > bounds.high[2]) {
-                continue;
-            }
-
-            visitor(candidate);
         }
     };
 
@@ -1179,7 +1218,7 @@ bool SurfacePatchIndex::updateSurface(const SurfacePtr& surface)
 
     auto cells = Impl::collectEntriesForSurface(surface,
                                                 impl_->bboxPadding,
-                                                impl_->samplingStride,
+                                                impl_->tileStride,
                                                 0,
                                                 points->rows - 1,
                                                 0,
@@ -1216,9 +1255,9 @@ bool SurfacePatchIndex::updateSurfaceRegion(const SurfacePtr& surface,
         return false;
     }
 
-    const int stride = impl_->samplingStride;
+    const int stride = impl_->tileStride;
 
-    // Entries are always keyed by the index-wide sampling stride. PatchRecord
+    // Entries are always keyed by the index-wide tile stride. PatchRecord
     // does not store a per-entry stride, so region updates must replace the
     // same stride-aligned cells created by rebuild().
     const int alignedRowStart = (rowStart / stride) * stride;
@@ -1258,6 +1297,7 @@ bool SurfacePatchIndex::setSamplingStride(int stride)
         return false;
     }
     impl_->samplingStride = stride;
+    impl_->tileStride = Impl::computeTileStride(stride);
     impl_->tree.reset();
     impl_->surfaceRecords.clear();
     impl_->patchCount = 0;
@@ -1285,7 +1325,7 @@ SurfacePatchIndex::Impl::makePatchEntry(const CellKey& key) const
     rec.j = key.rowIndex();
 
     std::array<cv::Vec3f, 4> corners;
-    if (!loadPatchCorners(rec, samplingStride, corners)) {
+    if (!loadPatchCorners(rec, tileStride, corners)) {
         return std::nullopt;
     }
 
@@ -1606,7 +1646,7 @@ void SurfacePatchIndex::queueCellRangeUpdate(const SurfacePtr& surface,
     // range. PatchRecord has no per-entry stride, so queuing every cell and
     // flushing with stride-1 entries would mix incompatible entry sizes and
     // leave duplicate-looking intersection geometry.
-    const int stride = impl_->samplingStride;
+    const int stride = impl_->tileStride;
     const int alignedRowStart = (rowStart / stride) * stride;
     const int alignedColStart = (colStart / stride) * stride;
 
@@ -1670,7 +1710,7 @@ bool SurfacePatchIndex::Impl::flushPendingSurface(const SurfacePtr& surface, Sur
     toRemove.reserve(mask.pendingCells.size());
     toInsert.reserve(mask.pendingCells.size());
 
-    const int stride = samplingStride;
+    const int stride = tileStride;
 
     for (std::size_t idx : mask.pendingCells) {
         const int row = static_cast<int>(idx / mask.cols);
