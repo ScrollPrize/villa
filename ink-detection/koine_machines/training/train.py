@@ -52,11 +52,17 @@ class ValidationMetricBatch:
         return self.targets
 
 
-_NATIVE_3D_TRAINING_MODES = {"normal_pooled_3d", "full_3d"}
+_FULL_3D_SINGLE_WRAP_MODE = "full_3d_single_wrap"
+_FULL_3D_TRAINING_MODES = {"full_3d", _FULL_3D_SINGLE_WRAP_MODE}
+_NATIVE_3D_TRAINING_MODES = {"normal_pooled_3d", *_FULL_3D_TRAINING_MODES}
 
 
 def _is_native_3d_training_mode(mode):
     return str(mode).strip().lower() in _NATIVE_3D_TRAINING_MODES
+
+
+def _uses_surface_mask_channel(mode):
+    return str(mode).strip().lower() in {"normal_pooled_3d", _FULL_3D_SINGLE_WRAP_MODE}
 
 
 def _disable_z_projection_for_normal_pooled_3d(config):
@@ -199,6 +205,7 @@ def train(config_path):
     mode = str(config.get('mode', 'flat')).strip().lower()
     native_3d_mode = _is_native_3d_training_mode(mode)
     normal_pooled_mode = mode == 'normal_pooled_3d'
+    surface_mask_channel = _uses_surface_mask_channel(mode)
     pooling_config = config.get('normal_pooling') or {}
     deep_supervision_enabled = bool(config.get('enable_deep_supervision', False))
     model_type = str(config.get('model_type', '')).strip().lower()
@@ -207,7 +214,7 @@ def train(config_path):
         raise ValueError("normal_pooled_3d is currently only supported with the vesuvius_unet model path")
     if native_3d_mode:
         _disable_z_projection_for_normal_pooled_3d(config)
-        config['in_channels'] = 2
+        config['in_channels'] = 1 + int(surface_mask_channel)
 
     config.setdefault('volume_auth_json', None)
     requested_stitch_factor = int(config.get('stitch_factor', 1))
@@ -278,7 +285,7 @@ def train(config_path):
 
     full_3d_label_dilation = 0.0
     full_3d_supervision_dilation = 0.0
-    if mode == 'full_3d':
+    if mode in _FULL_3D_TRAINING_MODES:
         _full_3d_config = config.get('full_3d') or {}
         full_3d_label_dilation = float(_full_3d_config.get('label_dilation_distance', 0.0))
         full_3d_supervision_dilation = float(_full_3d_config.get('supervision_dilation_distance', 0.0))
@@ -290,8 +297,18 @@ def train(config_path):
     shared_ds = InkDataset(dataset_config, do_augmentations=False)
     if len(shared_ds.training_patches) == 0:
         raise ValueError("FlatInkDataset produced no training patches after applying supervision masking")
-    train_ds = InkDataset(dataset_config, do_augmentations=True, patches=shared_ds.training_patches)
-    val_ds = InkDataset(dataset_config, do_augmentations=False, patches=shared_ds.validation_patches)
+    train_ds = InkDataset(
+        dataset_config,
+        do_augmentations=True,
+        patches=shared_ds.training_patches,
+        segments=shared_ds.segments,
+    )
+    val_ds = InkDataset(
+        dataset_config,
+        do_augmentations=False,
+        patches=shared_ds.validation_patches,
+        segments=shared_ds.segments,
+    )
     train_subset = train_ds
     val_subset = val_ds
 
@@ -438,7 +455,7 @@ def train(config_path):
 
     def get_model_input(batch):
         image = batch['image'].float()
-        if native_3d_mode:
+        if surface_mask_channel:
             surface_mask = batch['surface_mask'].float()
             return torch.cat([image, surface_mask], dim=1)
         return image
@@ -485,7 +502,7 @@ def train(config_path):
             ignore_mask = ((batch['flat_supervision'] <= 0) | (batch['flat_valid'] <= 0) | (pooled_valid <= 0)).to(dtype=targets.dtype)
             return pooled_logits, targets, ignore_mask
 
-        if mode == 'full_3d':
+        if mode in _FULL_3D_TRAINING_MODES:
             crop_shape = tuple(int(v) for v in batch['image'].shape[-3:])
             if tuple(int(v) for v in preds.shape[-3:]) != crop_shape:
                 preds = F.interpolate(
@@ -618,7 +635,7 @@ def train(config_path):
             train_preview_targets = targets.detach()
             train_preview_ignore_mask = ignore_mask.detach()
             train_preview_volume_logits = (preds[0] if isinstance(preds, (list, tuple)) else preds).detach() if normal_pooled_mode else None
-            if mode == 'full_3d':
+            if mode in _FULL_3D_TRAINING_MODES:
                 (train_preview_batch,train_preview_preds,train_preview_targets,train_preview_ignore_mask) = _build_full_3d_preview_batch(
                     batch,
                     train_preview_preds,
@@ -744,7 +761,7 @@ def train(config_path):
                         val_preview_targets = val_targets.detach()
                         val_preview_ignore = val_ignore_mask.detach()
                         val_preview_volume_logits = preview_volume_preds.detach() if normal_pooled_mode else None
-                        if mode == 'full_3d':
+                        if mode in _FULL_3D_TRAINING_MODES:
                             (
                                 val_preview_batch,
                                 val_preview_preds,

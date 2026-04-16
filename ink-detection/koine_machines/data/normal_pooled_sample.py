@@ -575,18 +575,32 @@ def _build_normal_pooled_flat_metadata(
     *,
     support_patch_zyxs,
     support_valid,
-    support_patch_zyxs_halo,
-    support_valid_halo,
-    trim_slices,
     support_inklabels_flat_patch,
     support_supervision_flat_patch,
     crop_bbox,
+    support_patch_zyxs_halo=None,
+    support_valid_halo=None,
+    trim_slices=None,
+    patch_tifxyz=None,
+    support_bbox=None,
 ):
-    normals_local_zyx = _compute_normals_local_zyx_from_position_halo(
-        support_patch_zyxs_halo,
-        support_valid_halo,
-        trim_slices,
-    )
+    if patch_tifxyz is not None:
+        if support_bbox is None:
+            raise ValueError("support_bbox is required when patch_tifxyz is provided")
+        support_y0, support_y1, support_x0, support_x1 = (int(v) for v in support_bbox)
+        nx, ny, nz = patch_tifxyz.get_normals(support_y0, support_y1, support_x0, support_x1)
+        normals_local_zyx = np.stack([nz, ny, nx], axis=-1).astype(np.float32, copy=False)
+    else:
+        if support_patch_zyxs_halo is None or support_valid_halo is None or trim_slices is None:
+            raise ValueError(
+                "support_patch_zyxs_halo, support_valid_halo, and trim_slices are required "
+                "when patch_tifxyz is not provided"
+            )
+        normals_local_zyx = _compute_normals_local_zyx_from_position_halo(
+            support_patch_zyxs_halo,
+            support_valid_halo,
+            trim_slices,
+        )
 
     flat_points_local_zyx = (
         np.asarray(support_patch_zyxs, dtype=np.float32)

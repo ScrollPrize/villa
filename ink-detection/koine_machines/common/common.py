@@ -7,6 +7,7 @@ import numpy as np
 import zarr
 
 _FLAT_PATCH_FINDING_CACHE_VERSION = "v4"
+_PUBLIC_S3_VOLUME_SUBSTRINGS = ("vesuvius-challenge-open-data",)
 
 
 def load_volume_auth(auth_json_path):
@@ -111,8 +112,55 @@ def load_flat_patch_cache(path):
         return json.load(f)
 
 
+def _available_zarr_top_level_keys(store):
+    try:
+        root = zarr.open(store, mode="r")
+        keys = sorted(
+            {
+                *(str(key) for key in root.group_keys()),
+                *(str(key) for key in root.array_keys()),
+            }
+        )
+    except Exception:
+        return ()
+    return tuple(keys)
+
+
+def _open_zarr_resolution(store, *, source_path, resolution):
+    resolution_path = str(resolution)
+    try:
+        return zarr.open(store, path=resolution_path, mode="r")
+    except zarr.errors.PathNotFoundError as exc:
+        message = (
+            f"{str(source_path).rstrip('/')}/{resolution_path} "
+            f"(resolution {resolution_path!r} in zarr store {source_path!r})"
+        )
+        available_keys = _available_zarr_top_level_keys(store)
+        if available_keys:
+            preview = ", ".join(available_keys[:20])
+            if len(available_keys) > 20:
+                preview = f"{preview}, ..."
+            message = f"{message}; available top-level keys: {preview}"
+        raise zarr.errors.PathNotFoundError(message) from exc
+
+
 def open_zarr(path, resolution, auth=None):
     path_str = str(path)
+    if path_str.startswith("s3://"):
+        fs_kwargs = {}
+        if any(public_path in path_str for public_path in _PUBLIC_S3_VOLUME_SUBSTRINGS):
+            fs_kwargs["anon"] = True
+        fs = fsspec.filesystem("s3", **fs_kwargs)
+        store = zarr.storage.FSStore(
+            path_str.rstrip("/"),
+            fs=fs,
+            mode="r",
+            check=False,
+            create=False,
+            exceptions=(KeyError, FileNotFoundError, PermissionError, OSError),
+        )
+        return _open_zarr_resolution(store, source_path=path_str, resolution=resolution)
+
     user, password = load_volume_auth(auth)
     use_https_auth = path_str.startswith("https://") and bool(user) and bool(password)
     if use_https_auth:
@@ -128,8 +176,8 @@ def open_zarr(path, resolution, auth=None):
             create=False,
             exceptions=(KeyError, FileNotFoundError, PermissionError, OSError, aiohttp.ClientResponseError),
         )
-        return zarr.open(store, path=str(resolution), mode="r")
-    return zarr.open(path_str, path=str(resolution), mode="r")
+        return _open_zarr_resolution(store, source_path=path_str, resolution=resolution)
+    return _open_zarr_resolution(path_str, source_path=path_str, resolution=resolution)
 
 def label_version_cache_token(label_version):
     if label_version in (None, ""):

@@ -151,19 +151,7 @@ def create_training_transforms(
     transforms.append(
         RandomTransform(
             GammaTransform(
-                gamma=BGContrast((0.7, 1.5)),
-                p_invert_image=1,
-                synchronize_channels=False,
-                p_per_channel=1,
-                p_retain_stats=1,
-            ),
-            apply_probability=0.2,
-        )
-    )
-    transforms.append(
-        RandomTransform(
-            GammaTransform(
-                gamma=BGContrast((0.7, 1.5)),
+                gamma=BGContrast((0.3, 0.8)),
                 p_invert_image=0,
                 synchronize_channels=False,
                 p_per_channel=1,
