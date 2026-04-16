@@ -17,6 +17,25 @@ _ROPE_DTYPE_ALIASES = {
 }
 
 
+def _normalize_surface_downsample_factor(value) -> int | tuple[int, int]:
+    if isinstance(value, int):
+        factor = int(value)
+        if factor <= 0:
+            raise ValueError("surface_downsample_factor must be positive")
+        return factor
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError(
+            "surface_downsample_factor must be a positive int or a length-2 sequence, "
+            f"got {value!r}"
+        )
+    factors = tuple(int(v) for v in value)
+    if any(v <= 0 for v in factors):
+        raise ValueError("surface_downsample_factor factors must be positive")
+    if factors[0] == factors[1]:
+        return int(factors[0])
+    return factors
+
+
 DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "seed": 0,
     "crop_size": [128, 128, 128],
@@ -77,6 +96,9 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "triangle_barrier_weight": 0.1,
     "triangle_barrier_start_step": 0,
     "triangle_barrier_margin": 0.05,
+    "boundary_loss_enabled": True,
+    "boundary_loss_weight": 0.05,
+    "boundary_loss_start_step": 0,
     "geometry_metric_enabled": True,
     "geometry_metric_weight": 0.01,
     "geometry_metric_start_step": 2000,
@@ -122,6 +144,17 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "wandb_xy_slice_mode": "best_xy_slice",
     "wandb_xy_slice_line_thickness": 1,
     "wandb_xy_slice_depth_tolerance": 0.75,
+    "volume_only_augmentation": {
+        "enabled": True,
+        "contrast_prob": 0.3,
+        "mult_brightness_prob": 0.3,
+        "add_brightness_prob": 0.1,
+        "gamma_prob": 0.4,
+        "gaussian_noise_prob": 0.2,
+        "gaussian_blur_prob": 0.15,
+        "slice_illumination_prob": 0.15,
+        "lowres_prob": 0.10,
+    },
 }
 
 
@@ -165,8 +198,7 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("autoreg_mesh MVP requires sample_mode='wrap'")
     if int(cfg["frontier_band_width"]) <= 0:
         raise ValueError("frontier_band_width must be positive")
-    if int(cfg["surface_downsample_factor"]) <= 0:
-        raise ValueError("surface_downsample_factor must be positive")
+    cfg["surface_downsample_factor"] = _normalize_surface_downsample_factor(cfg["surface_downsample_factor"])
     if any(size <= 0 for size in cfg["input_shape"]):
         raise ValueError(f"input_shape must be positive, got {cfg['input_shape']!r}")
     if any(size <= 0 for size in cfg["patch_size"]):
@@ -254,6 +286,10 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("triangle_barrier_start_step must be >= 0")
     if float(cfg["triangle_barrier_margin"]) < 0.0:
         raise ValueError("triangle_barrier_margin must be non-negative")
+    if float(cfg["boundary_loss_weight"]) < 0.0:
+        raise ValueError("boundary_loss_weight must be non-negative")
+    if int(cfg["boundary_loss_start_step"]) < 0:
+        raise ValueError("boundary_loss_start_step must be >= 0")
     if str(cfg["geometry_metric_loss"]) != "huber":
         raise ValueError("geometry_metric_loss must currently be 'huber'")
     if float(cfg["geometry_metric_weight"]) < 0.0:
@@ -319,6 +355,28 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("wandb_xy_slice_line_thickness must be positive")
     if float(cfg["wandb_xy_slice_depth_tolerance"]) <= 0.0:
         raise ValueError("wandb_xy_slice_depth_tolerance must be positive")
+
+    raw_volume_only_aug = cfg.get("volume_only_augmentation") or {}
+    if not isinstance(raw_volume_only_aug, dict):
+        raise ValueError("volume_only_augmentation must be a mapping of augmentation settings")
+    volume_only_aug = dict(raw_volume_only_aug)
+    volume_only_aug.setdefault("enabled", True)
+    for key, default in DEFAULT_AUTOREG_MESH_CONFIG["volume_only_augmentation"].items():
+        volume_only_aug.setdefault(key, default)
+    for key in (
+        "contrast_prob",
+        "mult_brightness_prob",
+        "add_brightness_prob",
+        "gamma_prob",
+        "gaussian_noise_prob",
+        "gaussian_blur_prob",
+        "slice_illumination_prob",
+        "lowres_prob",
+    ):
+        value = float(volume_only_aug[key])
+        if value < 0.0 or value > 1.0:
+            raise ValueError(f"volume_only_augmentation.{key} must be within [0, 1]")
+    cfg["volume_only_augmentation"] = volume_only_aug
 
     optimizer = dict(cfg.get("optimizer") or {})
     optimizer.setdefault("name", "adamw")

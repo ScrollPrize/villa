@@ -9,11 +9,17 @@ import torch
 import tifffile
 from torch.utils.data import Dataset
 
+import vesuvius.neural_tracing.autoreg_mesh.infer as autoreg_mesh_infer
 from vesuvius.models.build.pretrained_backbones.dinovol_2_builder import build_dinovol_2_backbone
 from vesuvius.models.build.pretrained_backbones.rope import MixedRopePositionEmbedding
 from vesuvius.neural_tracing.autoreg_mesh.benchmark import run_autoreg_mesh_benchmark
 from vesuvius.neural_tracing.autoreg_mesh.config import validate_autoreg_mesh_config
-from vesuvius.neural_tracing.autoreg_mesh.dataset import autoreg_mesh_collate
+from vesuvius.neural_tracing.autoreg_mesh.dataset import (
+    _apply_volume_only_augmentation,
+    _compute_target_boundary_stats,
+    _should_reject_boundary_stats,
+    autoreg_mesh_collate,
+)
 from vesuvius.neural_tracing.autoreg_mesh.infer import infer_autoreg_mesh
 from vesuvius.neural_tracing.autoreg_mesh.losses import (
     _build_distance_aware_coarse_targets,
@@ -300,6 +306,65 @@ def _move_batch(batch: dict, device: torch.device) -> dict:
         else:
             moved[key] = value
     return moved
+
+
+class _DummySamplingInferenceModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self._param = torch.nn.Parameter(torch.zeros(()))
+        self.offset_num_bins = (4, 4, 4)
+        self.coarse_prediction_mode = "joint_pointer"
+        self.coarse_grid_shape = (2, 2, 2)
+
+    def encode_conditioning(self, volume, vol_tokens=None):
+        device = volume.device
+        return {
+            "memory_tokens": torch.zeros((1, 8, 4), device=device, dtype=torch.float32),
+            "memory_patch_centers": torch.zeros((1, 8, 3), device=device, dtype=torch.float32),
+        }
+
+    def forward_from_encoded(self, batch, *, memory_tokens, memory_patch_centers):
+        del batch, memory_tokens, memory_patch_centers
+        device = self._param.device
+        coarse_logits = torch.tensor([[[0.0, 5.0, -5.0, -5.0, -5.0, -5.0, -5.0, -5.0]]], device=device)
+        offset_logits = torch.full((1, 1, 3, 4), -6.0, device=device)
+        offset_logits[0, 0, 0, 0] = 6.0
+        offset_logits[0, 0, 1, 0] = 6.0
+        offset_logits[0, 0, 2, 0] = 6.0
+        pred_coarse_ids = torch.tensor([[1]], dtype=torch.long, device=device)
+        pred_offset_bins = torch.zeros((1, 1, 3), dtype=torch.long, device=device)
+        pred_xyz = self.decode_local_xyz(pred_coarse_ids, pred_offset_bins)
+        pred_refine_residual = torch.tensor([[[1.5, -0.5, 0.25]]], dtype=torch.float32, device=device)
+        return {
+            "coarse_logits": coarse_logits,
+            "coarse_axis_logits": None,
+            "offset_logits": offset_logits,
+            "stop_logits": torch.full((1, 1), -8.0, dtype=torch.float32, device=device),
+            "pred_coarse_ids": pred_coarse_ids,
+            "pred_coarse_axis_ids": {
+                "z": torch.zeros((1, 1), dtype=torch.long, device=device),
+                "y": torch.zeros((1, 1), dtype=torch.long, device=device),
+                "x": torch.ones((1, 1), dtype=torch.long, device=device),
+            },
+            "pred_offset_bins": pred_offset_bins,
+            "pred_refine_residual": pred_refine_residual,
+            "pred_xyz": pred_xyz,
+            "pred_xyz_soft": pred_xyz + pred_refine_residual,
+            "pred_xyz_refined": pred_xyz + pred_refine_residual,
+            "coarse_grid_shape": self.coarse_grid_shape,
+            "coarse_prediction_mode": self.coarse_prediction_mode,
+        }
+
+    def decode_local_xyz(self, coarse_ids: torch.Tensor, offset_bins: torch.Tensor) -> torch.Tensor:
+        coarse = coarse_ids.to(torch.long)
+        gyx = self.coarse_grid_shape[1] * self.coarse_grid_shape[2]
+        z = coarse // gyx
+        rem = coarse % gyx
+        y = rem // self.coarse_grid_shape[2]
+        x = rem % self.coarse_grid_shape[2]
+        starts = torch.stack([z, y, x], dim=-1).to(torch.float32) * 8.0
+        widths = torch.tensor([2.0, 2.0, 2.0], device=coarse.device, dtype=torch.float32)
+        return starts + (offset_bins.to(torch.float32) + 0.5) * widths.view(1, 1, 3)
 
 
 def test_autoreg_mesh_model_forward_and_losses_are_finite(tmp_path: Path) -> None:
@@ -661,6 +726,40 @@ def test_axis_factorized_autoreg_mesh_inference_reconstructs_lattice() -> None:
     assert result["predicted_coarse_axis_ids"]["z"].shape[0] == int(sample["target_coarse_ids"].shape[0])
 
 
+def test_autoreg_mesh_inference_uses_sampled_xyz_for_non_greedy_rollout(monkeypatch) -> None:
+    model = _DummySamplingInferenceModel().eval()
+    sample = _make_sample("left")
+    sampled = iter([
+        torch.tensor(0, dtype=torch.long),
+        torch.tensor(1, dtype=torch.long),
+        torch.tensor(2, dtype=torch.long),
+        torch.tensor(3, dtype=torch.long),
+    ])
+
+    monkeypatch.setattr(
+        autoreg_mesh_infer,
+        "_sample_from_logits",
+        lambda logits, *, greedy: next(sampled),
+    )
+
+    result = infer_autoreg_mesh(
+        model,
+        sample,
+        max_steps=1,
+        stop_probability_threshold=1.1,
+        greedy=False,
+    )
+
+    expected_bin_center = model.decode_local_xyz(
+        torch.tensor([[0]], dtype=torch.long),
+        torch.tensor([[[1, 2, 3]]], dtype=torch.long),
+    )[0, 0].detach().cpu().numpy()
+    expected_xyz = expected_bin_center + np.array([1.5, -0.5, 0.25], dtype=np.float32)
+
+    np.testing.assert_allclose(result["predicted_bin_center_vertices_local"][0], expected_bin_center)
+    np.testing.assert_allclose(result["predicted_continuation_vertices_local"][0], expected_xyz)
+
+
 def test_autoreg_mesh_validation_metrics_are_logged_in_history(tmp_path: Path) -> None:
     config = _make_cached_token_config()
     config["out_dir"] = str(tmp_path / "runs_val")
@@ -675,9 +774,13 @@ def test_autoreg_mesh_validation_metrics_are_logged_in_history(tmp_path: Path) -
     assert "val_coarse_excess_nll" in result["history"][0]
     assert "val_offset_loss" in result["history"][0]
     assert "val_stop_loss" in result["history"][0]
+    assert "val_teacher_forced_pred_oob_fraction" in result["history"][0]
+    assert "val_target_invalid_fraction" in result["history"][0]
     assert "rollout_val_xyz_l1_refined" in result["history"][0]
     assert "rollout_val_seam_edge_error" in result["history"][0]
     assert "rollout_val_triangle_flip_rate" in result["history"][0]
+    assert "rollout_val_pred_oob_fraction" in result["history"][0]
+    assert "rollout_val_invalid_vertex_fraction" in result["history"][0]
 
 
 def test_restrict_dataset_samples_prevents_cross_split_resampling() -> None:
@@ -1108,6 +1211,101 @@ def test_invalid_target_positions_are_masked_from_loss(tmp_path: Path) -> None:
     assert torch.isfinite(losses["loss"])
 
 
+def test_target_boundary_stats_detect_invalid_frontier_and_reject() -> None:
+    target_grid = _make_sample("left")["target_grid_local"].numpy().copy()
+    target_grid[:, 0, 0] = -1.0
+
+    stats = _compute_target_boundary_stats(
+        target_grid,
+        volume_shape=(16, 16, 16),
+        direction="left",
+    )
+
+    assert stats["frontier_invalid_fraction"] > 0.0
+    assert stats["touches_crop_boundary"] is True
+    assert _should_reject_boundary_stats(stats) is True
+
+
+def test_target_boundary_stats_reject_high_invalid_fraction() -> None:
+    target_grid = _make_sample("up")["target_grid_local"].numpy().copy()
+    target_grid[:] = np.array([32.0, 32.0, 32.0], dtype=np.float32)
+
+    stats = _compute_target_boundary_stats(
+        target_grid,
+        volume_shape=(16, 16, 16),
+        direction="up",
+    )
+
+    assert stats["target_invalid_fraction"] == pytest.approx(1.0)
+    assert _should_reject_boundary_stats(stats) is True
+
+
+def test_boundary_loss_and_oob_metrics_increase_outside_crop() -> None:
+    batch = autoreg_mesh_collate([_make_sample("left")])
+    inside = {
+        "coarse_logits": torch.zeros((1, batch["target_xyz"].shape[1], 8), dtype=torch.float32),
+        "offset_logits": torch.zeros((1, batch["target_xyz"].shape[1], 3, 4), dtype=torch.float32),
+        "stop_logits": torch.zeros((1, batch["target_xyz"].shape[1]), dtype=torch.float32),
+        "pred_refine_residual": torch.zeros_like(batch["target_xyz"]),
+        "pred_xyz": batch["target_xyz"].clone(),
+        "pred_xyz_soft": batch["target_xyz"].clone(),
+        "pred_xyz_refined": batch["target_xyz"].clone(),
+        "pred_coarse_ids": batch["target_coarse_ids"].clone(),
+        "pred_coarse_axis_ids": {
+            "z": torch.zeros_like(batch["target_coarse_ids"]),
+            "y": torch.zeros_like(batch["target_coarse_ids"]),
+            "x": torch.zeros_like(batch["target_coarse_ids"]),
+        },
+        "coarse_grid_shape": (2, 2, 2),
+    }
+    outside = dict(inside)
+    outside["pred_xyz_refined"] = batch["target_xyz"].clone() + 64.0
+
+    inside_losses = compute_autoreg_mesh_losses(
+        inside,
+        batch,
+        offset_num_bins=(4, 4, 4),
+        boundary_loss_weight_active=1.0,
+    )
+    outside_losses = compute_autoreg_mesh_losses(
+        outside,
+        batch,
+        offset_num_bins=(4, 4, 4),
+        boundary_loss_weight_active=1.0,
+    )
+
+    assert inside_losses["boundary_loss"].item() >= 0.0
+    assert outside_losses["boundary_loss"].item() > inside_losses["boundary_loss"].item()
+    assert outside_losses["pred_oob_fraction_refined"].item() > inside_losses["pred_oob_fraction_refined"].item()
+    assert torch.isfinite(outside_losses["loss"])
+
+
+def test_volume_only_augmentation_changes_volume_without_touching_geometry() -> None:
+    sample = _make_sample("left")
+    original_volume = sample["volume"].numpy()[0].copy()
+    original_target = sample["target_grid_local"].clone()
+
+    augmented = _apply_volume_only_augmentation(
+        original_volume,
+        {
+            "enabled": True,
+            "contrast_prob": 1.0,
+            "mult_brightness_prob": 1.0,
+            "add_brightness_prob": 1.0,
+            "gamma_prob": 1.0,
+            "gaussian_noise_prob": 1.0,
+            "gaussian_blur_prob": 1.0,
+            "slice_illumination_prob": 1.0,
+            "lowres_prob": 1.0,
+        },
+        enabled=True,
+    )
+
+    assert augmented.shape == original_volume.shape
+    assert not np.allclose(augmented, original_volume)
+    assert torch.equal(sample["target_grid_local"], original_target)
+
+
 def test_scheduled_sampling_probability_progression() -> None:
     from vesuvius.neural_tracing.autoreg_mesh.train import _scheduled_sampling_prob
 
@@ -1273,6 +1471,9 @@ def test_distance_aware_target_default_config_values() -> None:
     assert validated["triangle_barrier_enabled"] is True
     assert validated["triangle_barrier_weight"] == pytest.approx(0.1)
     assert validated["triangle_barrier_margin"] == pytest.approx(0.05)
+    assert validated["boundary_loss_enabled"] is True
+    assert validated["boundary_loss_weight"] == pytest.approx(0.05)
+    assert validated["boundary_loss_start_step"] == 0
     assert validated["rollout_val_examples_per_log"] == 1
     assert validated["rollout_val_max_steps"] is None
     assert validated["wandb_log_xy_slice_images"] is True
@@ -1288,6 +1489,16 @@ def test_distance_aware_target_default_config_values() -> None:
     assert validated["distance_aware_coarse_targets_enabled"] is True
     assert validated["distance_aware_coarse_target_radius"] == 1
     assert validated["distance_aware_coarse_target_sigma"] == pytest.approx(1.0)
+    assert validated["volume_only_augmentation"]["enabled"] is True
+    assert validated["volume_only_augmentation"]["gamma_prob"] == pytest.approx(0.4)
+
+
+def test_anisotropic_surface_downsample_factor_validates() -> None:
+    config = _make_cached_token_config()
+    config["surface_downsample_factor"] = [2, 1]
+    validated = validate_autoreg_mesh_config(config)
+
+    assert validated["surface_downsample_factor"] == (2, 1)
 
 
 def test_distance_aware_coarse_loss_prefers_nearby_cells() -> None:
@@ -1465,6 +1676,16 @@ def test_rope_config_validation_rejects_invalid_values() -> None:
     bad_xy_mode["wandb_xy_slice_mode"] = "triple"
     with pytest.raises(ValueError, match="wandb_xy_slice_mode"):
         validate_autoreg_mesh_config(bad_xy_mode)
+
+    bad_downsample = _make_cached_token_config()
+    bad_downsample["surface_downsample_factor"] = [2, 1, 1]
+    with pytest.raises(ValueError, match="surface_downsample_factor"):
+        validate_autoreg_mesh_config(bad_downsample)
+
+    bad_aug_prob = _make_cached_token_config()
+    bad_aug_prob["volume_only_augmentation"] = {"enabled": True, "gamma_prob": 1.5}
+    with pytest.raises(ValueError, match="volume_only_augmentation.gamma_prob"):
+        validate_autoreg_mesh_config(bad_aug_prob)
 
 
 def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:

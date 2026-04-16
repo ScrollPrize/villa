@@ -17,8 +17,11 @@ from vesuvius.neural_tracing.autoreg_mesh.config import load_autoreg_mesh_config
 from vesuvius.neural_tracing.autoreg_mesh.dataset import AutoregMeshDataset, autoreg_mesh_collate
 from vesuvius.neural_tracing.autoreg_mesh.infer import infer_autoreg_mesh
 from vesuvius.neural_tracing.autoreg_mesh.losses import (
+    _boundary_touch_fraction_from_sequence,
     _coarse_accuracy_metrics,
+    _invalid_vertex_fraction_from_sequence,
     _l1_xyz_metric,
+    _pred_oob_fraction_from_sequence,
     _seam_edge_error_from_sequence,
     _triangle_flip_rate_from_sequence,
     compute_autoreg_mesh_losses,
@@ -78,12 +81,18 @@ def _restrict_dataset_samples(dataset: Dataset, selected_indices: list[int]) -> 
     return dataset
 
 
-def _clone_autoreg_mesh_dataset(cfg: dict, patch_metadata) -> AutoregMeshDataset:
+def _clone_autoreg_mesh_dataset(
+    cfg: dict,
+    patch_metadata,
+    *,
+    apply_volume_only_augmentation: bool,
+) -> AutoregMeshDataset:
     return AutoregMeshDataset(
         cfg,
         patch_metadata=patch_metadata,
         apply_augmentation=False,
         apply_perturbation=False,
+        apply_volume_only_augmentation=bool(apply_volume_only_augmentation),
     )
 
 
@@ -93,10 +102,16 @@ def _split_dataset(dataset: Dataset, *, cfg: dict, seed: int, val_fraction: floa
 
     if isinstance(dataset, AutoregMeshDataset):
         patch_metadata = dataset.export_patch_metadata()
-        train_dataset = _restrict_dataset_samples(_clone_autoreg_mesh_dataset(cfg, patch_metadata), train_indices)
+        train_dataset = _restrict_dataset_samples(
+            _clone_autoreg_mesh_dataset(cfg, patch_metadata, apply_volume_only_augmentation=True),
+            train_indices,
+        )
         if not val_indices:
             return train_dataset, None
-        val_dataset = _restrict_dataset_samples(_clone_autoreg_mesh_dataset(cfg, patch_metadata), val_indices)
+        val_dataset = _restrict_dataset_samples(
+            _clone_autoreg_mesh_dataset(cfg, patch_metadata, apply_volume_only_augmentation=False),
+            val_indices,
+        )
         return train_dataset, val_dataset
 
     if not val_indices:
@@ -241,6 +256,17 @@ def _mean_metric_dict(metric_dicts: list[dict[str, float]], *, prefix: str) -> d
     return {f"{prefix}{key}": value / float(len(metric_dicts)) for key, value in sums.items()}
 
 
+def _mean_batch_sample_metrics(batch: dict, *, prefix: str = "") -> dict[str, float]:
+    metrics = {}
+    if "target_invalid_fraction" in batch:
+        metrics[f"{prefix}target_invalid_fraction"] = float(batch["target_invalid_fraction"].to(torch.float32).mean().item())
+    if "frontier_invalid_fraction" in batch:
+        metrics[f"{prefix}frontier_invalid_fraction"] = float(batch["frontier_invalid_fraction"].to(torch.float32).mean().item())
+    if "touches_crop_boundary" in batch:
+        metrics[f"{prefix}touches_crop_boundary"] = float(batch["touches_crop_boundary"].to(torch.float32).mean().item())
+    return metrics
+
+
 def _make_rollout_metric_batch(raw_sample: dict, inference_result: dict) -> tuple[dict, torch.Tensor, torch.Tensor, dict[str, torch.Tensor] | None]:
     batch = autoreg_mesh_collate([raw_sample])
     target_len = int(batch["target_lengths"][0].item())
@@ -312,6 +338,9 @@ def _evaluate_rollout_validation(
                 "seam_edge_error": float(_seam_edge_error_from_sequence(pred_xyz_padded, batch, band_width=seam_band_width).item()),
                 "coarse_exact_acc": float(coarse_metrics["coarse_exact_acc"].item()),
                 "triangle_flip_rate": float(_triangle_flip_rate_from_sequence(pred_xyz_padded, batch).item()),
+                "pred_oob_fraction": float(_pred_oob_fraction_from_sequence(pred_xyz_padded, batch).item()),
+                "invalid_vertex_fraction": float(_invalid_vertex_fraction_from_sequence(pred_xyz_padded, batch).item()),
+                "boundary_touch_fraction": float(_boundary_touch_fraction_from_sequence(pred_xyz_padded, batch).item()),
                 "stop_count_error": float(abs(pred_len - target_len)),
             }
         )
@@ -363,6 +392,14 @@ def _triangle_barrier_weight_active(cfg: dict, *, global_step: int) -> float:
     if int(global_step) < int(cfg.get("triangle_barrier_start_step", 0)):
         return 0.0
     return float(cfg.get("triangle_barrier_weight", 0.0))
+
+
+def _boundary_loss_weight_active(cfg: dict, *, global_step: int) -> float:
+    if not bool(cfg.get("boundary_loss_enabled", True)):
+        return 0.0
+    if int(global_step) < int(cfg.get("boundary_loss_start_step", 0)):
+        return 0.0
+    return float(cfg.get("boundary_loss_weight", 0.0))
 
 
 def _geometry_metric_weight_active(cfg: dict, *, global_step: int) -> float:
@@ -858,6 +895,7 @@ def _evaluate_validation(
             seam_band_width=int(cfg.get("seam_band_width", 1)),
             triangle_barrier_weight_active=_triangle_barrier_weight_active(cfg, global_step=global_step),
             triangle_barrier_margin=float(cfg.get("triangle_barrier_margin", 0.05)),
+            boundary_loss_weight_active=_boundary_loss_weight_active(cfg, global_step=global_step),
             geometry_metric_weight_active=_geometry_metric_weight_active(cfg, global_step=global_step),
             geometry_metric_loss_type=str(cfg.get("geometry_metric_loss", "huber")),
             geometry_sd_weight_active=_geometry_sd_weight_active(cfg, global_step=global_step),
@@ -866,7 +904,9 @@ def _evaluate_validation(
             distance_aware_coarse_target_sigma=float(cfg.get("distance_aware_coarse_target_sigma", 1.0)),
             distance_aware_coarse_target_loss=str(cfg.get("distance_aware_coarse_target_loss", "soft_ce")),
         )
-        metric_dicts.append(_loss_dict_to_metrics(loss_dict))
+        metrics = _loss_dict_to_metrics(loss_dict)
+        metrics.update(_mean_batch_sample_metrics(batch))
+        metric_dicts.append(metrics)
     model.train()
     return _mean_metric_dict(metric_dicts, prefix="val_"), iterator
 
@@ -1002,6 +1042,7 @@ def run_autoreg_mesh_training(
             xyz_soft_loss_weight_active = _xyz_soft_loss_weight_active(cfg, global_step=global_step)
             seam_loss_weight_active = _seam_loss_weight_active(cfg, global_step=global_step)
             triangle_barrier_weight_active = _triangle_barrier_weight_active(cfg, global_step=global_step)
+            boundary_loss_weight_active = _boundary_loss_weight_active(cfg, global_step=global_step)
             geometry_metric_weight_active = _geometry_metric_weight_active(cfg, global_step=global_step)
             geometry_sd_weight_active = _geometry_sd_weight_active(cfg, global_step=global_step)
             offset_feedback_enabled, refine_feedback_enabled = _scheduled_sampling_feedback_state(cfg, global_step=global_step)
@@ -1027,6 +1068,7 @@ def run_autoreg_mesh_training(
                 seam_band_width=int(cfg.get("seam_band_width", 1)),
                 triangle_barrier_weight_active=triangle_barrier_weight_active,
                 triangle_barrier_margin=float(cfg.get("triangle_barrier_margin", 0.05)),
+                boundary_loss_weight_active=boundary_loss_weight_active,
                 geometry_metric_weight_active=geometry_metric_weight_active,
                 geometry_metric_loss_type=str(cfg.get("geometry_metric_loss", "huber")),
                 geometry_sd_weight_active=geometry_sd_weight_active,
@@ -1060,9 +1102,11 @@ def run_autoreg_mesh_training(
             metrics["xyz_soft_loss_weight_active"] = float(xyz_soft_loss_weight_active)
             metrics["seam_loss_weight_active"] = float(seam_loss_weight_active)
             metrics["triangle_barrier_weight_active"] = float(triangle_barrier_weight_active)
+            metrics["boundary_loss_weight_active"] = float(boundary_loss_weight_active)
             metrics["geometry_metric_weight_active"] = float(geometry_metric_weight_active)
             metrics["geometry_sd_weight_active"] = float(geometry_sd_weight_active)
             metrics["step"] = float(global_step)
+            metrics.update(_mean_batch_sample_metrics(batch, prefix="train_"))
             if skipped_step > 0.0:
                 metrics["skipped_step_nonfinite_grad"] = skipped_step
 

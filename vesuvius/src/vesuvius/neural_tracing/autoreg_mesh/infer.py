@@ -184,14 +184,18 @@ def infer_autoreg_mesh(
         offset_tensor = torch.tensor(offset_bins, dtype=torch.long, device=device).view(1, 1, 3)
         coarse_tensor = torch.tensor([[coarse_id]], dtype=torch.long, device=device)
         bin_center_xyz = model.decode_local_xyz(coarse_tensor, offset_tensor)[0, 0].detach().cpu().numpy()
-        xyz = outputs["pred_xyz_refined"][0, current_len - 1].detach().cpu().numpy()
+        refine_residual = outputs.get("pred_refine_residual")
+        if refine_residual is not None:
+            sampled_xyz = bin_center_xyz + refine_residual[0, current_len - 1].detach().cpu().numpy()
+        else:
+            sampled_xyz = bin_center_xyz
         stop_prob = float(torch.sigmoid(outputs["stop_logits"][0, current_len - 1]).item())
 
         generated_coarse.append(coarse_id)
         for axis_name in ("z", "y", "x"):
             generated_coarse_axes[axis_name].append(coarse_axis_ids[axis_name])
         generated_offsets.append(offset_bins)
-        generated_xyz.append(xyz.astype(np.float32, copy=False))
+        generated_xyz.append(sampled_xyz.astype(np.float32, copy=False))
         generated_bin_center_xyz.append(bin_center_xyz.astype(np.float32, copy=False))
         stop_probabilities.append(stop_prob)
 

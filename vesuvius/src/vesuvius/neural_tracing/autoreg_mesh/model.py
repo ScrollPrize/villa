@@ -771,9 +771,6 @@ class AutoregMeshModel(nn.Module):
             pred_refine_residual,
         )
         pred_xyz_refined = pred_xyz_bin_center + pred_refine_residual
-        max_coord = torch.tensor(self.input_shape, device=hidden.device, dtype=hidden.dtype) - 1e-4
-        pred_xyz_refined = torch.maximum(pred_xyz_refined, torch.zeros_like(pred_xyz_refined))
-        pred_xyz_refined = torch.minimum(pred_xyz_refined, max_coord.view(1, 1, 3))
 
         return {
             "coarse_logits": coarse_outputs["coarse_logits"],

@@ -298,11 +298,63 @@ def _prediction_finite_mask(pred_xyz_sequence: Tensor) -> Tensor:
     return torch.isfinite(pred_xyz_sequence).all(dim=-1)
 
 
+def _sequence_token_mask(pred_xyz_sequence: Tensor, batch: dict) -> Tensor:
+    if "target_mask" in batch:
+        return batch["target_mask"].to(device=pred_xyz_sequence.device, dtype=torch.bool)
+    return torch.ones(pred_xyz_sequence.shape[:2], device=pred_xyz_sequence.device, dtype=torch.bool)
+
+
+def _crop_max_coord(pred_xyz_sequence: Tensor, batch: dict) -> Tensor:
+    if "volume" not in batch:
+        raise KeyError("batch does not contain volume")
+    crop_shape = tuple(int(v) for v in batch["volume"].shape[-3:])
+    return torch.tensor(crop_shape, device=pred_xyz_sequence.device, dtype=pred_xyz_sequence.dtype) - 1e-4
+
+
+def _invalid_vertex_fraction_from_sequence(pred_xyz_sequence: Tensor, batch: dict) -> Tensor:
+    mask = _sequence_token_mask(pred_xyz_sequence, batch)
+    invalid = ~_prediction_finite_mask(pred_xyz_sequence)
+    return _masked_mean(invalid.to(dtype=pred_xyz_sequence.dtype), mask)
+
+
+def _pred_oob_fraction_from_sequence(pred_xyz_sequence: Tensor, batch: dict) -> Tensor:
+    if "volume" not in batch:
+        return pred_xyz_sequence.new_zeros(())
+    mask = _sequence_token_mask(pred_xyz_sequence, batch)
+    finite = _prediction_finite_mask(pred_xyz_sequence)
+    max_coord = _crop_max_coord(pred_xyz_sequence, batch)
+    oob = finite & (((pred_xyz_sequence < 0.0) | (pred_xyz_sequence >= max_coord.view(1, 1, 3))).any(dim=-1))
+    return _masked_mean(oob.to(dtype=pred_xyz_sequence.dtype), mask)
+
+
+def _boundary_touch_fraction_from_sequence(pred_xyz_sequence: Tensor, batch: dict) -> Tensor:
+    if "volume" not in batch:
+        return pred_xyz_sequence.new_zeros(())
+    mask = _sequence_token_mask(pred_xyz_sequence, batch)
+    finite = _prediction_finite_mask(pred_xyz_sequence)
+    max_coord = _crop_max_coord(pred_xyz_sequence, batch)
+    touches = finite & (((pred_xyz_sequence <= 0.0) | (pred_xyz_sequence >= max_coord.view(1, 1, 3))).any(dim=-1))
+    sample_mask = mask.any(dim=-1)
+    sample_touch = torch.where(sample_mask, touches.any(dim=-1), torch.zeros_like(sample_mask))
+    return _masked_mean(sample_touch.to(dtype=pred_xyz_sequence.dtype), sample_mask)
+
+
 def _l1_xyz_metric(pred_xyz_sequence: Tensor, batch: dict) -> Tensor:
     if "target_xyz" not in batch or "target_supervision_mask" not in batch:
         return pred_xyz_sequence.new_zeros(())
     mask = batch["target_supervision_mask"] & _prediction_finite_mask(pred_xyz_sequence)
     per_token = (pred_xyz_sequence - batch["target_xyz"]).abs().mean(dim=-1)
+    return _masked_mean(per_token, mask)
+
+
+def _boundary_loss(outputs: dict, batch: dict) -> Tensor:
+    if "volume" not in batch:
+        return outputs.get("pred_xyz_refined", outputs["pred_xyz"]).new_zeros(())
+    pred_xyz = outputs.get("pred_xyz_refined", outputs["pred_xyz"])
+    mask = batch.get("target_supervision_mask", _sequence_token_mask(pred_xyz, batch)) & _prediction_finite_mask(pred_xyz)
+    max_coord = _crop_max_coord(pred_xyz, batch)
+    per_axis = F.softplus(-pred_xyz) + F.softplus(pred_xyz - max_coord.view(1, 1, 3))
+    per_token = per_axis.sum(dim=-1)
     return _masked_mean(per_token, mask)
 
 
@@ -751,6 +803,7 @@ def compute_autoreg_mesh_losses(
     seam_band_width: int = 1,
     triangle_barrier_weight_active: float = 0.0,
     triangle_barrier_margin: float = 0.05,
+    boundary_loss_weight_active: float = 0.0,
     geometry_metric_weight_active: float = 0.0,
     geometry_metric_loss_type: str = "huber",
     geometry_sd_weight_active: float = 0.0,
@@ -823,6 +876,11 @@ def compute_autoreg_mesh_losses(
         )
         total_loss = total_loss + float(triangle_barrier_weight_active) * triangle_barrier_loss
 
+    boundary_loss = total_loss.new_zeros(())
+    if float(boundary_loss_weight_active) > 0.0:
+        boundary_loss = _boundary_loss(outputs, batch)
+        total_loss = total_loss + float(boundary_loss_weight_active) * boundary_loss
+
     geometry_metric_loss = total_loss.new_zeros(())
     if float(geometry_metric_weight_active) > 0.0:
         geometry_metric_loss = _geometry_metric_loss(
@@ -846,6 +904,9 @@ def compute_autoreg_mesh_losses(
     coarse_acc_metrics = _coarse_accuracy_metrics(outputs, batch)
     xyz_l1_soft = _l1_xyz_metric(soft_xyz_for_loss.detach(), batch)
     xyz_l1_refined = _l1_xyz_metric(pred_xyz_refined.detach(), batch)
+    pred_oob_fraction_refined = _pred_oob_fraction_from_sequence(pred_xyz_refined.detach(), batch)
+    invalid_vertex_fraction_refined = _invalid_vertex_fraction_from_sequence(pred_xyz_refined.detach(), batch)
+    boundary_touch_fraction_refined = _boundary_touch_fraction_from_sequence(pred_xyz_refined.detach(), batch)
     seam_edge_error_refined = _seam_edge_error_from_sequence(pred_xyz_refined.detach(), batch, band_width=int(seam_band_width))
     triangle_flip_rate_refined = _triangle_flip_rate_from_sequence(pred_xyz_refined.detach(), batch)
     geometry_metric_refined = _geometry_metric_loss_from_sequence(pred_xyz_refined.detach(), batch, loss_type=geometry_metric_loss_type)
@@ -884,8 +945,14 @@ def compute_autoreg_mesh_losses(
         "seam_edge_error_refined": seam_edge_error_refined,
         "triangle_barrier_loss": triangle_barrier_loss,
         "triangle_barrier_weight_active": total_loss.new_tensor(float(triangle_barrier_weight_active)),
+        "boundary_loss": boundary_loss,
+        "boundary_loss_weight_active": total_loss.new_tensor(float(boundary_loss_weight_active)),
         "triangle_flip_rate_soft": triangle_flip_rate_soft,
         "triangle_flip_rate_refined": triangle_flip_rate_refined,
+        "pred_oob_fraction_refined": pred_oob_fraction_refined,
+        "teacher_forced_pred_oob_fraction": pred_oob_fraction_refined,
+        "teacher_forced_invalid_vertex_fraction": invalid_vertex_fraction_refined,
+        "teacher_forced_boundary_touch_fraction": boundary_touch_fraction_refined,
         "geometry_metric_loss": geometry_metric_loss,
         "geometry_metric_weight_active": total_loss.new_tensor(float(geometry_metric_weight_active)),
         "geometry_metric_refined": geometry_metric_refined,

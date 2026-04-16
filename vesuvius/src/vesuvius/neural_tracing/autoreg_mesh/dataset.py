@@ -6,6 +6,8 @@ import random
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+from scipy import ndimage
 from torch.utils.data import Dataset
 
 from vesuvius.neural_tracing.autoreg_mesh.config import validate_autoreg_mesh_config
@@ -50,6 +52,123 @@ def _maybe_collapse_downsample_factor(factor_row: int, factor_col: int) -> int |
     if int(factor_row) == int(factor_col):
         return int(factor_row)
     return (int(factor_row), int(factor_col))
+
+
+def _in_bounds_vertex_mask(grid_local: np.ndarray, *, volume_shape: tuple[int, int, int]) -> np.ndarray:
+    grid = np.asarray(grid_local, dtype=np.float32)
+    valid = np.isfinite(grid).all(axis=-1)
+    for axis, size in enumerate(volume_shape):
+        valid &= grid[..., axis] >= 0.0
+        valid &= grid[..., axis] < float(size)
+    return valid
+
+
+def _frontier_band_mask(mask: np.ndarray, *, direction: str, band_width: int = 1) -> np.ndarray:
+    band = max(1, int(band_width))
+    if direction == "left":
+        band = min(band, int(mask.shape[1]))
+        return mask[:, :band]
+    if direction == "right":
+        band = min(band, int(mask.shape[1]))
+        return mask[:, -band:]
+    if direction == "up":
+        band = min(band, int(mask.shape[0]))
+        return mask[:band, :]
+    if direction == "down":
+        band = min(band, int(mask.shape[0]))
+        return mask[-band:, :]
+    raise ValueError(f"unsupported direction {direction!r}")
+
+
+def _compute_target_boundary_stats(
+    target_grid_local: np.ndarray,
+    *,
+    volume_shape: tuple[int, int, int],
+    direction: str,
+    frontier_band_width: int = 1,
+) -> dict[str, float | bool]:
+    valid_mask = _in_bounds_vertex_mask(target_grid_local, volume_shape=volume_shape)
+    invalid_mask = ~valid_mask
+    frontier_invalid = _frontier_band_mask(invalid_mask, direction=str(direction), band_width=int(frontier_band_width))
+    frontier_invalid_fraction = float(frontier_invalid.mean()) if frontier_invalid.size > 0 else 1.0
+    target_invalid_fraction = float(invalid_mask.mean()) if invalid_mask.size > 0 else 1.0
+    return {
+        "target_invalid_fraction": target_invalid_fraction,
+        "frontier_invalid_fraction": frontier_invalid_fraction,
+        "touches_crop_boundary": bool(invalid_mask.any()),
+    }
+
+
+def _should_reject_boundary_stats(
+    boundary_stats: dict[str, float | bool],
+    *,
+    max_target_invalid_fraction: float = 0.25,
+) -> bool:
+    return (
+        float(boundary_stats["frontier_invalid_fraction"]) > 0.0 or
+        float(boundary_stats["target_invalid_fraction"]) > float(max_target_invalid_fraction)
+    )
+
+
+def _apply_volume_only_augmentation(volume: np.ndarray, augmentation_cfg: dict, *, enabled: bool) -> np.ndarray:
+    volume_np = np.asarray(volume, dtype=np.float32)
+    if not bool(enabled):
+        return volume_np.astype(np.float32, copy=True)
+
+    vol = volume_np.astype(np.float32, copy=True)
+    finite = np.isfinite(vol)
+    if not bool(finite.any()):
+        return vol
+
+    def _value_range() -> tuple[float, float, float]:
+        low = float(vol[finite].min())
+        high = float(vol[finite].max())
+        return low, high, max(high - low, 1e-6)
+
+    if random.random() < float(augmentation_cfg.get("contrast_prob", 0.0)):
+        mean = float(vol[finite].mean())
+        factor = random.uniform(0.75, 1.25)
+        vol = (vol - mean) * factor + mean
+
+    if random.random() < float(augmentation_cfg.get("mult_brightness_prob", 0.0)):
+        vol = vol * random.uniform(0.8, 1.2)
+
+    if random.random() < float(augmentation_cfg.get("add_brightness_prob", 0.0)):
+        _low, _high, value_range = _value_range()
+        vol = vol + random.uniform(-0.1, 0.1) * value_range
+
+    if random.random() < float(augmentation_cfg.get("gamma_prob", 0.0)):
+        low, _high, value_range = _value_range()
+        normalized = np.clip((vol - low) / value_range, 0.0, 1.0)
+        gamma = random.uniform(0.7, 1.5)
+        vol = low + (normalized ** gamma) * value_range
+
+    if random.random() < float(augmentation_cfg.get("gaussian_noise_prob", 0.0)):
+        _low, _high, value_range = _value_range()
+        noise_std = random.uniform(0.01, 0.04) * value_range
+        vol = vol + np.random.normal(0.0, noise_std, size=vol.shape).astype(np.float32)
+
+    if random.random() < float(augmentation_cfg.get("gaussian_blur_prob", 0.0)):
+        sigma = random.uniform(0.35, 0.9)
+        vol = ndimage.gaussian_filter(vol, sigma=sigma, mode="nearest").astype(np.float32, copy=False)
+
+    if random.random() < float(augmentation_cfg.get("slice_illumination_prob", 0.0)) and int(vol.shape[0]) > 1:
+        depth = int(vol.shape[0])
+        anchors = min(4, depth)
+        anchor_z = np.linspace(0.0, float(depth - 1), num=anchors, dtype=np.float32)
+        anchor_scale = 1.0 + np.random.uniform(-0.15, 0.15, size=anchors).astype(np.float32)
+        slice_scale = np.interp(np.arange(depth, dtype=np.float32), anchor_z, anchor_scale).astype(np.float32)
+        vol = vol * slice_scale[:, None, None]
+
+    if random.random() < float(augmentation_cfg.get("lowres_prob", 0.0)):
+        scale = random.uniform(0.5, 0.85)
+        tensor = torch.from_numpy(vol).unsqueeze(0).unsqueeze(0)
+        lowres_shape = [max(2, int(round(size * scale))) for size in vol.shape]
+        tensor = F.interpolate(tensor, size=lowres_shape, mode="trilinear", align_corners=False)
+        tensor = F.interpolate(tensor, size=list(vol.shape), mode="trilinear", align_corners=False)
+        vol = tensor.squeeze(0).squeeze(0).numpy().astype(np.float32, copy=False)
+
+    return np.nan_to_num(vol, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
 
 
 def extract_wrap_world_surface_stored(patch, wrap: dict, *, require_all_valid: bool = True) -> np.ndarray | None:
@@ -195,10 +314,16 @@ class AutoregMeshDataset(Dataset):
         patch_metadata=None,
         apply_augmentation: bool = False,
         apply_perturbation: bool = False,
+        apply_volume_only_augmentation: bool | None = None,
         max_resample_attempts: int = 8,
     ) -> None:
         self.config = validate_autoreg_mesh_config(config)
         self.max_resample_attempts = int(max_resample_attempts)
+        self.apply_volume_only_augmentation = bool(
+            self.config.get("volume_only_augmentation", {}).get("enabled", False)
+            if apply_volume_only_augmentation is None
+            else apply_volume_only_augmentation
+        )
 
         base_config = deepcopy(config)
         base_config["sample_mode"] = "wrap"
@@ -275,6 +400,11 @@ class AutoregMeshDataset(Dataset):
         min_corner = np.asarray(conditioning["min_corner"], dtype=np.int64)
         max_corner = np.asarray(conditioning["max_corner"], dtype=np.int64)
         vol_crop = _read_volume_crop_from_patch(patch, self.crop_size, min_corner, max_corner)
+        vol_crop = _apply_volume_only_augmentation(
+            vol_crop,
+            self.config.get("volume_only_augmentation", {}),
+            enabled=self.apply_volume_only_augmentation,
+        )
 
         cond_local = (np.asarray(conditioning["cond_zyxs_unperturbed"], dtype=np.float32) - min_corner[None, None, :])
         masked_local = (np.asarray(conditioning["masked_zyxs"], dtype=np.float32) - min_corner[None, None, :])
@@ -293,6 +423,13 @@ class AutoregMeshDataset(Dataset):
         if not bool(np.any(serialized["prompt_tokens"]["valid_mask"])):
             return None
         if not bool(np.any(serialized["target_valid_mask"])):
+            return None
+        boundary_stats = _compute_target_boundary_stats(
+            serialized["target_grid_local"],
+            volume_shape=self.crop_size,
+            direction=str(serialized["direction"]),
+        )
+        if _should_reject_boundary_stats(boundary_stats):
             return None
 
         sample_key = (int(patch_idx), int(wrap_idx))
@@ -337,12 +474,16 @@ class AutoregMeshDataset(Dataset):
             "target_coarse_ids": torch.from_numpy(serialized["target_coarse_ids"]).to(torch.long),
             "target_offset_bins": torch.from_numpy(serialized["target_offset_bins"]).to(torch.long),
             "target_valid_mask": torch.from_numpy(serialized["target_valid_mask"]).to(torch.bool),
+            "target_invalid_mask": torch.from_numpy(~serialized["target_valid_mask"]).to(torch.bool),
             "target_stop": torch.from_numpy(serialized["target_stop"]).to(torch.float32),
             "target_xyz": torch.from_numpy(serialized["target_xyz"]).to(torch.float32),
             "target_bin_center_xyz": torch.from_numpy(serialized["target_bin_center_xyz"]).to(torch.float32),
             "target_strip_positions": torch.from_numpy(serialized["target_strip_positions"]).to(torch.long),
             "target_strip_coords": torch.from_numpy(serialized["target_strip_coords"]).to(torch.float32),
             "target_grid_local": torch.from_numpy(serialized["target_grid_local"]).to(torch.float32),
+            "target_invalid_fraction": torch.tensor(float(boundary_stats["target_invalid_fraction"]), dtype=torch.float32),
+            "frontier_invalid_fraction": torch.tensor(float(boundary_stats["frontier_invalid_fraction"]), dtype=torch.float32),
+            "touches_crop_boundary": torch.tensor(bool(boundary_stats["touches_crop_boundary"]), dtype=torch.bool),
             "direction": str(serialized["direction"]),
             "direction_id": torch.tensor(int(serialized["direction_id"]), dtype=torch.long),
             "strip_length": torch.tensor(int(serialized["strip_length"]), dtype=torch.long),
@@ -498,7 +639,20 @@ def autoreg_mesh_collate(batch: list[dict]) -> dict:
     result["target_strip_coords"] = target_strip_coords
     result["target_mask"] = target_padding_mask
     result["target_valid_mask"] = target_valid_mask & target_padding_mask
+    result["target_invalid_mask"] = (~result["target_valid_mask"]) & target_padding_mask
     result["target_supervision_mask"] = result["target_valid_mask"]
     result["target_lengths"] = target_padding_mask.sum(dim=1)
+    result["target_invalid_fraction"] = torch.stack(
+        [item.get("target_invalid_fraction", torch.tensor(0.0, dtype=torch.float32)) for item in batch],
+        dim=0,
+    )
+    result["frontier_invalid_fraction"] = torch.stack(
+        [item.get("frontier_invalid_fraction", torch.tensor(0.0, dtype=torch.float32)) for item in batch],
+        dim=0,
+    )
+    result["touches_crop_boundary"] = torch.stack(
+        [item.get("touches_crop_boundary", torch.tensor(False, dtype=torch.bool)) for item in batch],
+        dim=0,
+    )
     result["direction_id"] = torch.stack([torch.tensor(DIRECTION_TO_ID[item["direction"]], dtype=torch.long) for item in batch])
     return result
