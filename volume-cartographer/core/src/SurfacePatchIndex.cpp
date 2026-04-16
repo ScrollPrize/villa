@@ -443,6 +443,10 @@ struct SurfacePatchIndex::Impl {
     static Entry buildEntryFromCorners(const PatchRecord& rec,
                                        const std::array<cv::Vec3f, 4>& corners,
                                        float bboxPadding);
+    static Entry buildEntryFromBbox(const PatchRecord& rec,
+                                    cv::Vec3f low,
+                                    cv::Vec3f high,
+                                    float bboxPadding);
     void removeCellEntry(SurfaceCellMask& mask,
                          const SurfacePtr& surface,
                          int row,
@@ -1350,6 +1354,15 @@ SurfacePatchIndex::Impl::Entry SurfacePatchIndex::Impl::buildEntryFromCorners(
         std::max({corners[0][2], corners[1][2], corners[2][2], corners[3][2]})
     };
 
+    return buildEntryFromBbox(rec, low, high, bboxPadding);
+}
+
+SurfacePatchIndex::Impl::Entry SurfacePatchIndex::Impl::buildEntryFromBbox(
+    const PatchRecord& rec,
+    cv::Vec3f low,
+    cv::Vec3f high,
+    float bboxPadding)
+{
     if (bboxPadding > 0.0f) {
         low -= cv::Vec3f(bboxPadding, bboxPadding, bboxPadding);
         high += cv::Vec3f(bboxPadding, bboxPadding, bboxPadding);
@@ -1450,11 +1463,13 @@ bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
         return false;
     }
 
+    // Tile corners must be valid — that's the contract for visitors that
+    // load corners at tile-stride (e.g. evaluatePatch). Skip the tile
+    // entirely if any corner is the -1.0f sentinel.
     const cv::Vec3f& p00 = points(row, col);
     const cv::Vec3f& p10 = points(row, col + effectiveColStride);
     const cv::Vec3f& p01 = points(row + effectiveRowStride, col);
     const cv::Vec3f& p11 = points(row + effectiveRowStride, col + effectiveColStride);
-
     if (p00[0] == -1.0f || p10[0] == -1.0f || p01[0] == -1.0f || p11[0] == -1.0f) {
         return false;
     }
@@ -1464,8 +1479,33 @@ bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
     rec.i = col;
     rec.j = row;
 
-    std::array<cv::Vec3f, 4> corners = {p00, p10, p11, p01};
-    outEntry.patch = buildEntryFromCorners(rec, corners, bboxPadding);
+    // True-bbox from every interior source point. The visitor sub-iterates
+    // inside this tile at the (finer) triangulation stride and emits
+    // triangles built from arbitrary interior source points. Computing the
+    // bbox from only the 4 tile corners would miss interior bulge on a
+    // curved surface, which would let the bbox-vs-plane early reject drop
+    // tiles whose interior actually crosses the plane. Scanning all
+    // (effectiveStride+1)² points (≤81 reads per tile at tileStride 8)
+    // is paid once at index-build time on the background thread.
+    cv::Vec3f low{p00};
+    cv::Vec3f high{p00};
+    auto extend = [&](const cv::Vec3f& p) {
+        if (p[0] == -1.0f) return;
+        low[0] = std::min(low[0], p[0]);
+        low[1] = std::min(low[1], p[1]);
+        low[2] = std::min(low[2], p[2]);
+        high[0] = std::max(high[0], p[0]);
+        high[1] = std::max(high[1], p[1]);
+        high[2] = std::max(high[2], p[2]);
+    };
+    for (int dr = 0; dr <= effectiveRowStride; ++dr) {
+        const cv::Vec3f* rowPtr = &points(row + dr, col);
+        for (int dc = 0; dc <= effectiveColStride; ++dc) {
+            extend(rowPtr[dc]);
+        }
+    }
+
+    outEntry.patch = buildEntryFromBbox(rec, low, high, bboxPadding);
     outEntry.hasPatch = true;
 
     return true;
