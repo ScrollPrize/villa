@@ -401,11 +401,8 @@ def _triangle_barrier_weight_active(cfg: dict, *, global_step: int) -> float:
 
 
 def _boundary_loss_weight_active(cfg: dict, *, global_step: int) -> float:
-    if not bool(cfg.get("boundary_loss_enabled", True)):
-        return 0.0
-    if int(global_step) < int(cfg.get("boundary_loss_start_step", 0)):
-        return 0.0
-    return float(cfg.get("boundary_loss_weight", 0.0))
+    del cfg, global_step
+    return 0.0
 
 
 def _geometry_metric_weight_active(cfg: dict, *, global_step: int) -> float:

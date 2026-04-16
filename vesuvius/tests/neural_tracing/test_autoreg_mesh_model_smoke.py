@@ -1601,7 +1601,23 @@ def test_target_boundary_stats_reject_high_invalid_fraction() -> None:
     )
 
     assert stats["target_invalid_fraction"] == pytest.approx(1.0)
+    assert stats["frontier_invalid_fraction"] == pytest.approx(1.0)
     assert _should_reject_boundary_stats(stats) is True
+
+
+def test_target_boundary_stats_allow_truncated_continuation_away_from_frontier() -> None:
+    target_grid = _make_sample("up")["target_grid_local"].numpy().copy()
+    target_grid[-1, :, :] = np.array([32.0, 32.0, 32.0], dtype=np.float32)
+
+    stats = _compute_target_boundary_stats(
+        target_grid,
+        volume_shape=(16, 16, 16),
+        direction="up",
+    )
+
+    assert stats["frontier_invalid_fraction"] == pytest.approx(0.0)
+    assert stats["target_invalid_fraction"] > 0.0
+    assert _should_reject_boundary_stats(stats) is False
 
 
 def test_boundary_loss_and_oob_metrics_increase_outside_crop() -> None:
@@ -1641,6 +1657,8 @@ def test_boundary_loss_and_oob_metrics_increase_outside_crop() -> None:
     assert inside_losses["boundary_loss"].item() >= 0.0
     assert outside_losses["boundary_loss"].item() > inside_losses["boundary_loss"].item()
     assert outside_losses["pred_oob_fraction_refined"].item() > inside_losses["pred_oob_fraction_refined"].item()
+    assert outside_losses["loss"].item() == pytest.approx(inside_losses["loss"].item())
+    assert outside_losses["boundary_loss_weight_active"].item() == pytest.approx(0.0)
     assert torch.isfinite(outside_losses["loss"])
 
 
@@ -1891,8 +1909,8 @@ def test_distance_aware_target_default_config_values() -> None:
     assert validated["triangle_barrier_enabled"] is True
     assert validated["triangle_barrier_weight"] == pytest.approx(0.1)
     assert validated["triangle_barrier_margin"] == pytest.approx(0.05)
-    assert validated["boundary_loss_enabled"] is True
-    assert validated["boundary_loss_weight"] == pytest.approx(0.05)
+    assert validated["boundary_loss_enabled"] is False
+    assert validated["boundary_loss_weight"] == pytest.approx(0.0)
     assert validated["boundary_loss_start_step"] == 0
     assert validated["rollout_val_examples_per_log"] == 1
     assert validated["rollout_val_max_steps"] is None

@@ -152,9 +152,9 @@ def _should_reject_boundary_stats(
     *,
     max_target_invalid_fraction: float = 0.25,
 ) -> bool:
+    del max_target_invalid_fraction
     return (
-        float(boundary_stats["frontier_invalid_fraction"]) > 0.0 or
-        float(boundary_stats["target_invalid_fraction"]) > float(max_target_invalid_fraction)
+        float(boundary_stats["frontier_invalid_fraction"]) > 0.0
     )
 
 

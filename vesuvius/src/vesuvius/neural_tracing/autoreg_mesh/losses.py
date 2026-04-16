@@ -951,10 +951,7 @@ def compute_autoreg_mesh_losses(
         )
         total_loss = total_loss + float(triangle_barrier_weight_active) * triangle_barrier_loss
 
-    boundary_loss = total_loss.new_zeros(())
-    if float(boundary_loss_weight_active) > 0.0:
-        boundary_loss = _boundary_loss(outputs, batch)
-        total_loss = total_loss + float(boundary_loss_weight_active) * boundary_loss
+    boundary_loss = _boundary_loss(outputs, batch)
 
     geometry_metric_loss = total_loss.new_zeros(())
     if float(geometry_metric_weight_active) > 0.0:
@@ -1025,7 +1022,7 @@ def compute_autoreg_mesh_losses(
         "triangle_barrier_loss": triangle_barrier_loss,
         "triangle_barrier_weight_active": total_loss.new_tensor(float(triangle_barrier_weight_active)),
         "boundary_loss": boundary_loss,
-        "boundary_loss_weight_active": total_loss.new_tensor(float(boundary_loss_weight_active)),
+        "boundary_loss_weight_active": total_loss.new_zeros(()),
         "triangle_flip_rate_soft": triangle_flip_rate_soft,
         "triangle_flip_rate_refined": triangle_flip_rate_refined,
         "first_strip_wrong_side_rate_refined": first_strip_wrong_side_rate_refined,
