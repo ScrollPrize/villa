@@ -234,7 +234,7 @@ void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     }
     _scene->setSceneRect(0, 0, vpW, vpH);
 
-    submitRender();
+    scheduleRender();
     updateStatusLabel();
 }
 
@@ -333,7 +333,7 @@ void CAdaptiveVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
     _camera.surfacePtr[0] = proj[0];
     _camera.surfacePtr[1] = proj[1];
 
-    submitRender();
+    scheduleRender();
 }
 
 // ============================================================================
@@ -770,12 +770,9 @@ void CAdaptiveVolumeViewer::submitRender()
     updateStatusLabel();
 }
 
-void CAdaptiveVolumeViewer::renderVisible(bool force)
+void CAdaptiveVolumeViewer::renderVisible(bool /*force*/)
 {
-    if (force)
-        submitRender();
-    else
-        scheduleRender();
+    scheduleRender();
 }
 
 // ============================================================================
@@ -794,7 +791,7 @@ void CAdaptiveVolumeViewer::panByF(float dx, float dy)
     }
 
     _cachedStretchValid = false;
-    submitRender();
+    scheduleRender();
 }
 
 void CAdaptiveVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
@@ -906,7 +903,7 @@ void CAdaptiveVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMo
                 maxZ = static_cast<float>(std::max({w, h, d}));
             }
             _camera.zOff = std::clamp(_camera.zOff + dz, -maxZ, maxZ);
-            submitRender();
+            scheduleRender();
             updateStatusLabel();
         }
     } else if (modifiers & Qt::ControlModifier) {
@@ -932,7 +929,7 @@ void CAdaptiveVolumeViewer::onResized()
         _framebuffer.fill(QColor(64, 64, 64));
     }
     _scene->setSceneRect(0, 0, w, h);
-    submitRender();
+    scheduleRender();
 }
 
 void CAdaptiveVolumeViewer::onCursorMove(QPointF scenePos)
@@ -957,7 +954,7 @@ void CAdaptiveVolumeViewer::onPanStart(Qt::MouseButton, Qt::KeyboardModifiers)
 void CAdaptiveVolumeViewer::onPanRelease(Qt::MouseButton, Qt::KeyboardModifiers)
 {
     _isPanning = false;
-    submitRender();
+    scheduleRender();
 }
 
 void CAdaptiveVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton buttons,
@@ -1268,21 +1265,21 @@ void CAdaptiveVolumeViewer::adjustSurfaceOffset(float dn)
         maxZ = static_cast<float>(std::max({w, h, d}));
     }
     _camera.zOff = std::clamp(_camera.zOff + dn, -maxZ, maxZ);
-    submitRender();
+    scheduleRender();
     updateStatusLabel();
 }
 
 void CAdaptiveVolumeViewer::resetSurfaceOffsets()
 {
     _camera.zOff = 0.0f;
-    submitRender();
+    scheduleRender();
 }
 
 void CAdaptiveVolumeViewer::setVolumeWindow(float low, float high)
 {
     _windowLow = std::clamp(low, 0.0f, 65535.0f);
     _windowHigh = std::clamp(high, 0.0f, 65535.0f);
-    if (_volume) submitRender();
+    if (_volume) scheduleRender();
 }
 
 // ============================================================================
@@ -1398,7 +1395,7 @@ void CAdaptiveVolumeViewer::fitSurfaceInView()
     _camera.scale = 0.5f;
     if (_volume)
         _camera.recalcPyramidLevel(static_cast<int>(_volume->numScales()));
-    submitRender();
+    scheduleRender();
 }
 
 bool CAdaptiveVolumeViewer::isAxisAlignedView() const
@@ -1419,7 +1416,7 @@ bool CAdaptiveVolumeViewer::eventFilter(QObject* watched, QEvent* event)
         auto* sub = qobject_cast<QMdiSubWindow*>(watched);
         if (sub && !sub->isMinimized() && _dirtyWhileMinimized) {
             _dirtyWhileMinimized = false;
-            submitRender();
+            scheduleRender();
         }
     }
     return QWidget::eventFilter(watched, event);
