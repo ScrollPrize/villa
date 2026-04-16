@@ -1235,9 +1235,11 @@ def train(
                     image = image.index_select(0, keep)
                     batch = _filter_batch(batch, keep_list)
 
-                # Per-channel losses
-                loss_cos = scale_loss_mse(pred[:, 0:1], targets[:, 0:1], mask=cos_mask)
-                loss_mag = scale_loss_l1(pred[:, 1:2], targets[:, 1:2], mask=cos_mask)
+                # Per-channel losses — weighted by grad_mag GT (closer surfaces → higher weight)
+                # Normalize so 20 vx spacing (grad_mag=0.05) → weight 1.0
+                cos_mag_weight = targets[:, 1:2] * 20.0
+                loss_cos = scale_loss_mse(pred[:, 0:1], targets[:, 0:1], mask=cos_mask, weight=cos_mag_weight)
+                loss_mag = scale_loss_l1(pred[:, 1:2], targets[:, 1:2], mask=cos_mask, weight=cos_mag_weight)
                 loss_dir_sparse = scale_loss_mse(
                     pred[:, 2:8], targets[:, 2:8],
                     mask=dir_sparse_mask, weight=dir_axis_weight,
