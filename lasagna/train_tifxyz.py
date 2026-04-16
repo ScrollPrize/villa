@@ -499,6 +499,58 @@ class ScaleSpaceLoss3D(nn.Module):
 # Model construction (same as train_unet_3d.py)
 # ---------------------------------------------------------------------------
 
+def _reinit_decoder_scales(model: nn.Module, n_scales: int) -> list[str]:
+    """Re-initialize the last *n_scales* decoder stages (highest resolution).
+
+    Resets: decoder conv blocks, upsample modules, seg heads / task heads,
+    and the encoder stem (which feeds the highest-res skip).
+
+    Supports both architectures:
+      - shared_decoder + task_heads  (default when deep_supervision=False)
+      - task_decoders["output"]      (separate decoder per task)
+    """
+    from vesuvius.models.utils import InitWeights_He
+    init_fn = InitWeights_He(neg_slope=1e-2)
+
+    # Find the decoder — shared or per-task
+    if hasattr(model, "shared_decoder") and model.shared_decoder is not None:
+        decoder = model.shared_decoder
+        dec_prefix = "shared_decoder"
+    elif hasattr(model, "task_decoders") and "output" in model.task_decoders:
+        decoder = model.task_decoders["output"]
+        dec_prefix = "task_decoders.output"
+    else:
+        raise RuntimeError("Cannot find decoder on model (no shared_decoder or task_decoders.output)")
+
+    n_dec = len(decoder.stages)
+    if n_scales > n_dec:
+        n_scales = n_dec
+
+    reinit_names: list[str] = []
+
+    for i in range(n_dec - n_scales, n_dec):
+        decoder.stages[i].apply(init_fn)
+        reinit_names.append(f"{dec_prefix}.stages.{i}")
+        decoder.transpconvs[i].apply(init_fn)
+        reinit_names.append(f"{dec_prefix}.transpconvs.{i}")
+
+    if hasattr(decoder, "seg_layers"):
+        for i in range(len(decoder.seg_layers)):
+            decoder.seg_layers[i].apply(init_fn)
+            reinit_names.append(f"{dec_prefix}.seg_layers.{i}")
+
+    if hasattr(model, "task_heads"):
+        for name, head in model.task_heads.items():
+            head.apply(init_fn)
+            reinit_names.append(f"task_heads.{name}")
+
+    if hasattr(model, "shared_encoder") and hasattr(model.shared_encoder, "stem"):
+        model.shared_encoder.stem.apply(init_fn)
+        reinit_names.append("shared_encoder.stem")
+
+    return reinit_names
+
+
 def build_model(
     patch_size: int,
     device: str,
@@ -508,6 +560,7 @@ def build_model(
     batch_size: int = 2,
     strict: bool = False,
     model_patch_size: Optional[int] = None,
+    reinit_decoder_scales: int = 0,
 ) -> Tuple[nn.Module, str, str]:
     ckpt = None
     if weights is not None:
@@ -605,6 +658,12 @@ def build_model(
             if missing:
                 print(f"{TAG} randomly initialized: {missing[:5]}{'...' if len(missing) > 5 else ''}")
 
+    if reinit_decoder_scales > 0 and ckpt is not None:
+        names = _reinit_decoder_scales(model, reinit_decoder_scales)
+        print(f"{TAG} re-initialized {len(names)} modules "
+              f"(last {reinit_decoder_scales} decoder scales): "
+              f"{names}", flush=True)
+
     return model, norm_type, upsample_mode
 
 
@@ -663,6 +722,7 @@ def train(
     wandb_entity: Optional[str] = None,
     wandb_run_name: Optional[str] = None,
     wandb_tags: Optional[List[str]] = None,
+    reinit_decoder_scales: int = 0,
 ) -> None:
     rank, local_rank, world_size, is_dist = _init_distributed()
     is_main = rank == 0
@@ -827,6 +887,7 @@ def train(
         patch_size, device, weights, norm_type=norm_type,
         upsample_mode=upsample_mode, batch_size=batch_size,
         model_patch_size=model_patch_size,
+        reinit_decoder_scales=reinit_decoder_scales,
     )
     if is_dist:
         # DDP broadcasts module state from rank 0 on init, so
@@ -1594,6 +1655,11 @@ def main() -> None:
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--weights", type=str, default=None,
                         help="Checkpoint to resume from.")
+    parser.add_argument("--reinit-decoder-scales", type=int, default=0,
+                        help="After loading checkpoint, re-initialize the "
+                             "last N decoder stages (highest-resolution "
+                             "conv blocks, upsample modules, seg heads, "
+                             "and encoder stem). Use with --weights.")
     parser.add_argument("--norm-type", type=str, default="none",
                         choices=["instance", "group", "none"])
     parser.add_argument("--upsample-mode", type=str, default="trilinear",
@@ -1651,6 +1717,7 @@ def main() -> None:
             [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
             if args.wandb_tags else None
         ),
+        reinit_decoder_scales=args.reinit_decoder_scales,
     )
 
 

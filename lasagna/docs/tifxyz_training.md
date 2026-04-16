@@ -143,22 +143,89 @@ python lasagna/train_tifxyz.py \
 | Argument | Default | Description |
 |----------|---------|-------------|
 | `--config` | (required) | JSON config path |
-| `--patch-size` | 128 | Cubic patch size in voxels |
+| `--patch-size` | 128 | Cubic CT input patch size in voxels |
+| `--label-patch-size` | same as patch-size | GT region size (smaller = more CT context around labels) |
+| `--model-patch-size` | same as patch-size | Architecture patch size (for loading checkpoints trained at different sizes) |
 | `--batch-size` | 2 | Training batch size |
 | `--epochs` | 100 | Number of epochs |
-| `--lr` | 1e-4 | Learning rate (AdamW) |
+| `--lr` | 1e-2 | Learning rate (AdamW) |
 | `--num-workers` | 4 | DataLoader workers (0 for debugging) |
 | `--val-fraction` | 0.15 | Fraction of patches for validation |
 | `--log-dir` | `runs/tifxyz3d` | TensorBoard log directory |
 | `--run-name` | `tifxyz` | Run name (used in log subdirectory) |
 | `--weights` | None | Checkpoint path to resume from |
-| `--norm-type` | `instance` | Normalization: `instance`, `group`, `none` |
+| `--reinit-decoder-scales` | 0 | After loading checkpoint, re-initialize the last N decoder stages (highest-res conv blocks, upsample modules, seg heads, encoder stem). Use with `--weights` |
+| `--norm-type` | `none` | Normalization: `instance`, `group`, `none` |
 | `--upsample-mode` | `trilinear` | Decoder upsampling: `transpconv`, `trilinear`, `pixelshuffle` |
+| `--output-sigmoid` | off | Apply sigmoid to model output |
 | `--precision` | `bf16` | Training precision: `bf16`, `fp16`, `fp32` |
 | `--w-cos` | 1.0 | Loss weight for cos channel |
 | `--w-mag` | 1.0 | Loss weight for grad_mag channel |
-| `--w-dir` | 1.0 | Loss weight for direction channels |
+| `--w-dir` | 1.0 | Loss weight for sparse direction channels |
+| `--w-dir-dense` | 0.1 | Loss weight for dense (slerp-filled) direction channels |
+| `--w-smooth` | 0.1 | Loss weight for direction smoothness penalty |
 | `--device` | auto | `cuda` or `cpu` (auto-detected) |
+| `--verbose` / `-v` | off | Per-sample progress bar with running loss |
+| `--wandb` | off | Enable Weights & Biases logging (alongside TensorBoard) |
+| `--wandb-project` | None | W&B project name |
+| `--wandb-entity` | None | W&B entity/user |
+| `--wandb-run-name` | None | W&B run name |
+| `--wandb-tags` | None | Comma-separated W&B tags |
+
+### Multi-GPU (DDP)
+
+Launch with `torchrun` for data-parallel training:
+
+```bash
+torchrun --nproc_per_node=4 lasagna/train_tifxyz.py \
+    --config config.json --patch-size 128 --batch-size 2
+```
+
+Use `--master-port` to avoid collisions with other users on a shared server:
+
+```bash
+torchrun --nproc_per_node=4 --master-port=29501 lasagna/train_tifxyz.py ...
+```
+
+Works with `CUDA_VISIBLE_DEVICES` — `local_rank` indexes into the visible set.
+
+### Label patch size
+
+When `--label-patch-size` < `--patch-size`, the GT occupies a smaller region
+centered (with random offset) inside a larger CT crop. This gives the model
+more spatial context without needing larger label regions. Patch tiling uses
+the label size to preserve cache efficiency. A random paste offset is applied
+automatically when label < patch.
+
+### Partial decoder reinitialization
+
+When resuming from a checkpoint, `--reinit-decoder-scales N` re-initializes
+the N highest-resolution decoder stages with fresh He-normal weights. This is
+useful when fine-resolution outputs have degraded during training. It resets:
+- Decoder conv blocks (skip-fusion convolutions)
+- Upsample modules (transpconv / trilinear / pixelshuffle)
+- All segmentation output heads
+- The encoder stem (feeds the highest-res skip connection)
+
+### Loss weighting by gradient magnitude
+
+The cos and grad_mag losses are weighted proportionally to the GT gradient
+magnitude (= 1/spacing between adjacent surfaces). Normalization: 20 voxel
+spacing → weight 1.0. Closer surfaces get higher weight (5 vx → 4×),
+farther surfaces get lower weight (100 vx → 0.2×).
+
+### Hi-mag filtering with hysteresis
+
+Samples with high gradient magnitude (surfaces very close together) are
+filtered using a sliding-window hysteresis: disabled when ≥75 of the last
+100 samples are above threshold, re-enabled when <50 are above. This
+prevents training from being dominated by pathological tight-surface regions.
+
+### Read-error resilience
+
+S3/zarr transient read errors (PermissionError, OSError, ConnectionError,
+TimeoutError) are caught in the dataset and the sample is skipped. The
+warmup counter only increments for successfully used samples.
 
 
 ## Output
@@ -185,13 +252,18 @@ Checkpoints contain:
 ```python
 {
     "state_dict": model.state_dict(),
-    "norm_type": "instance",
+    "norm_type": "none",
     "upsample_mode": "trilinear",
-    "precision": "bf16",
+    "output_sigmoid": False,
+    "patch_size": 128,
+    "in_channels": 1,
+    "out_channels": 8,
 }
 ```
 
-Resume training with `--weights path/to/model_current.pt`.
+Resume training with `--weights path/to/model_current.pt`. The loader is
+flexible by default — it matches keys by name AND shape, skipping mismatched
+parameters and randomly initializing missing ones.
 
 
 ## Pipeline Overview
@@ -368,11 +440,13 @@ Use it to sanity-check chain ordering before long runs.
 
 | File | Purpose |
 |------|---------|
-| `lasagna/train_tifxyz.py` | Training script and CLI |
-| `lasagna/tifxyz_lasagna_dataset.py` | `TifxyzLasagnaDataset` (CT crops, surface voxelization) and `build_patch_chains()` (multi-chain ordering) |
+| `lasagna/train_tifxyz.py` | Training script and CLI (DDP, W&B, hi-mag filtering, partial reinit) |
+| `lasagna/tifxyz_lasagna_dataset.py` | `TifxyzLasagnaDataset` (CT crops, surface voxelization, augmentation) and `build_patch_chains()` (multi-chain ordering) |
 | `lasagna/tifxyz_labels.py` | `compute_patch_labels()`, `chains_from_surface_info()`, `derive_cos_gradmag_validity()` (GPU, chain-aware) |
+| `lasagna/preprocess_cos_omezarr.py` | Inference: per-axis 2D preprocessing and tiled 3D `predict3d` mode |
+| `lasagna/scripts/download_omezarr.py` | Parallel S3 OME-Zarr chunk downloader with progress display |
 | `lasagna/lasagna3d/` | `python -m lasagna3d` analysis CLI — see [`lasagna3d_cli.md`](lasagna3d_cli.md) |
-| `vesuvius/src/vesuvius/neural_tracing/datasets/patch_finding.py` | `find_world_chunk_patches()` -- world-chunk patch discovery |
+| `vesuvius/src/vesuvius/models/build/build_network_from_config.py` | `NetworkFromConfig` — shared encoder + decoder/task-heads UNet builder |
+| `vesuvius/src/vesuvius/neural_tracing/datasets/patch_finding.py` | `find_world_chunk_patches()` — world-chunk patch discovery |
 | `vesuvius/src/vesuvius/neural_tracing/datasets/common.py` | `open_zarr()`, `voxelize_surface_grid_masked()`, `ChunkPatch`, `_compute_wrap_order_stats()`, `_triplet_wraps_compatible()` |
-| `vesuvius/src/vesuvius/neural_tracing/datasets/dataset_rowcol_cond.py` | Original `_build_triplet_neighbor_lookup()` that `build_patch_chains` ports |
 | `vesuvius/src/vesuvius/image_proc/edt.py` | GPU-accelerated EDT (CuPy > edt > scipy fallback) |
