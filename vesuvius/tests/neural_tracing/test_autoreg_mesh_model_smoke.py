@@ -93,6 +93,22 @@ def _make_surface(rows: int, cols: int, *, z_offset: float, y_offset: float, x_o
     return np.stack([z, y, x], axis=-1).astype(np.float32)
 
 
+def _make_large_surface(rows: int, cols: int, *, horizontal_split: bool) -> np.ndarray:
+    row_axis = np.arange(rows, dtype=np.float32)[:, None]
+    col_axis = np.arange(cols, dtype=np.float32)[None, :]
+    row_grid = np.broadcast_to(row_axis, (rows, cols))
+    col_grid = np.broadcast_to(col_axis, (rows, cols))
+    if horizontal_split:
+        z = 8.0 + (row_grid * 0.25) + (col_grid * 0.05)
+        y = 10.0 + (row_grid * 4.0)
+        x = 15.0 + (col_grid * 2.0)
+    else:
+        z = 8.0 + (row_grid * 0.05) + (col_grid * 0.25)
+        y = 15.0 + (row_grid * 2.0)
+        x = 10.0 + (col_grid * 4.0)
+    return np.stack([z, y, x], axis=-1).astype(np.float32)
+
+
 def _make_sample(direction: str) -> dict:
     if direction in {"left", "right"}:
         full = _make_surface(3, 4, z_offset=4.0, y_offset=2.0, x_offset=3.0)
@@ -146,6 +162,62 @@ def _make_sample(direction: str) -> dict:
         "world_bbox": torch.tensor((0.0, 16.0, 0.0, 16.0, 0.0, 16.0), dtype=torch.float32),
         "target_grid_shape": torch.tensor(serialized["target_grid_shape"], dtype=torch.long),
         "wrap_metadata": {"segment_uuid": f"synthetic_{direction}"},
+    }
+
+
+def _make_large_sample(direction: str) -> dict:
+    if direction in {"left", "right"}:
+        full = _make_large_surface(3, 4, horizontal_split=True)
+        cond = full[:, :2] if direction == "left" else full[:, 2:]
+        masked = full[:, 2:] if direction == "left" else full[:, :2]
+    else:
+        full = _make_large_surface(4, 3, horizontal_split=False)
+        cond = full[:2, :] if direction == "up" else full[2:, :]
+        masked = full[2:, :] if direction == "up" else full[:2, :]
+
+    serialized = serialize_split_conditioning_example(
+        cond_zyxs_local=cond,
+        masked_zyxs_local=masked,
+        direction=direction,
+        volume_shape=(32, 32, 32),
+        patch_size=(8, 8, 8),
+        offset_num_bins=(4, 4, 4),
+        frontier_band_width=4,
+    )
+    volume = torch.randn(1, 32, 32, 32, dtype=torch.float32)
+    return {
+        "volume": volume,
+        "vol_tokens": None,
+        "prompt_tokens": {
+            "coarse_ids": torch.from_numpy(serialized["prompt_tokens"]["coarse_ids"]).to(torch.long),
+            "offset_bins": torch.from_numpy(serialized["prompt_tokens"]["offset_bins"]).to(torch.long),
+            "xyz": torch.from_numpy(serialized["prompt_tokens"]["xyz"]).to(torch.float32),
+            "strip_positions": torch.from_numpy(serialized["prompt_tokens"]["strip_positions"]).to(torch.long),
+            "strip_coords": torch.from_numpy(serialized["prompt_tokens"]["strip_coords"]).to(torch.float32),
+            "valid_mask": torch.from_numpy(serialized["prompt_tokens"]["valid_mask"]).to(torch.bool),
+        },
+        "prompt_meta": serialized["prompt_meta"],
+        "conditioning_grid_local": torch.from_numpy(serialized["conditioning_grid_local"]).to(torch.float32),
+        "prompt_anchor_xyz": torch.from_numpy(serialized["prompt_anchor_xyz"]).to(torch.float32),
+        "prompt_anchor_valid": torch.tensor(bool(serialized["prompt_anchor_valid"]), dtype=torch.bool),
+        "prompt_grid_local": torch.from_numpy(serialized["prompt_grid_local"]).to(torch.float32),
+        "target_coarse_ids": torch.from_numpy(serialized["target_coarse_ids"]).to(torch.long),
+        "target_offset_bins": torch.from_numpy(serialized["target_offset_bins"]).to(torch.long),
+        "target_valid_mask": torch.from_numpy(serialized["target_valid_mask"]).to(torch.bool),
+        "target_stop": torch.from_numpy(serialized["target_stop"]).to(torch.float32),
+        "target_xyz": torch.from_numpy(serialized["target_xyz"]).to(torch.float32),
+        "target_bin_center_xyz": torch.from_numpy(serialized["target_bin_center_xyz"]).to(torch.float32),
+        "target_strip_positions": torch.from_numpy(serialized["target_strip_positions"]).to(torch.long),
+        "target_strip_coords": torch.from_numpy(serialized["target_strip_coords"]).to(torch.float32),
+        "target_grid_local": torch.from_numpy(serialized["target_grid_local"]).to(torch.float32),
+        "direction": direction,
+        "direction_id": torch.tensor(serialized["direction_id"], dtype=torch.long),
+        "strip_length": torch.tensor(serialized["strip_length"], dtype=torch.long),
+        "num_strips": torch.tensor(serialized["num_strips"], dtype=torch.long),
+        "min_corner": torch.zeros(3, dtype=torch.float32),
+        "world_bbox": torch.tensor((0.0, 32.0, 0.0, 32.0, 0.0, 32.0), dtype=torch.float32),
+        "target_grid_shape": torch.tensor(serialized["target_grid_shape"], dtype=torch.long),
+        "wrap_metadata": {"segment_uuid": f"large_{direction}"},
     }
 
 
@@ -218,6 +290,13 @@ def _make_debias_config(checkpoint_path: Path) -> dict:
 def _make_factorized_cached_token_config() -> dict:
     config = _make_cached_token_config()
     config["coarse_prediction_mode"] = "axis_factorized"
+    return config
+
+
+def _make_large_cached_token_config() -> dict:
+    config = _make_cached_token_config()
+    config["input_shape"] = [32, 32, 32]
+    config["crop_size"] = [32, 32, 32]
     return config
 
 
@@ -863,9 +942,12 @@ def test_autoreg_mesh_validation_metrics_are_logged_in_history(tmp_path: Path) -
     assert "val_stop_loss" in result["history"][0]
     assert "val_teacher_forced_pred_oob_fraction" in result["history"][0]
     assert "val_target_invalid_fraction" in result["history"][0]
+    assert "val_coarse_constraint_keep_fraction" in result["history"][0]
+    assert "val_first_strip_wrong_side_rate_refined" in result["history"][0]
     assert "rollout_val_xyz_l1_refined" in result["history"][0]
     assert "rollout_val_seam_edge_error" in result["history"][0]
     assert "rollout_val_triangle_flip_rate" in result["history"][0]
+    assert "rollout_val_first_strip_wrong_side_rate" in result["history"][0]
     assert "rollout_val_pred_oob_fraction" in result["history"][0]
     assert "rollout_val_invalid_vertex_fraction" in result["history"][0]
 
@@ -1147,6 +1229,148 @@ def test_factorized_soft_decode_matches_hard_decode_for_one_hot_axis_logits() ->
 
 
 @pytest.mark.parametrize("direction", ["left", "right", "up", "down"])
+def test_coarse_continuation_mask_keeps_gt_and_masks_clear_wrong_side(direction: str) -> None:
+    config = _make_large_cached_token_config()
+    model = AutoregMeshModel(config).eval()
+    batch = autoreg_mesh_collate([_make_large_sample(direction)])
+    generation_inputs = model._build_teacher_forced_generation_inputs(batch)
+    raw_mask = model._build_raw_coarse_continuation_mask(batch, generation_inputs)
+    assert raw_mask is not None
+    adjusted_mask, metrics = model._finalize_coarse_constraint_mask(
+        raw_mask,
+        sequence_mask=generation_inputs["sequence_mask"],
+        target_coarse_ids=batch["target_coarse_ids"],
+        target_supervision_mask=batch["target_supervision_mask"],
+    )
+    assert adjusted_mask is not None
+
+    gt_id = int(batch["target_coarse_ids"][0, 0].item())
+    assert bool(adjusted_mask[0, 0, gt_id].item())
+    z, y, x = model._unflatten_coarse_ids(batch["target_coarse_ids"][:, :1])
+    wrong_z = int(z[0, 0].item())
+    if direction == "left":
+        wrong_y = int(y[0, 0].item())
+        wrong_x = 0
+    elif direction == "right":
+        wrong_y = int(y[0, 0].item())
+        wrong_x = int(model.coarse_grid_shape[2] - 1)
+    elif direction == "up":
+        wrong_y = 0
+        wrong_x = int(x[0, 0].item())
+    else:
+        wrong_y = int(model.coarse_grid_shape[1] - 1)
+        wrong_x = int(x[0, 0].item())
+    wrong_id = int(model._flatten_coarse_axis_ids(
+        torch.tensor([[wrong_z]], dtype=torch.long),
+        torch.tensor([[wrong_y]], dtype=torch.long),
+        torch.tensor([[wrong_x]], dtype=torch.long),
+    )[0, 0].item())
+    assert bool(raw_mask[0, 0, wrong_id].item()) is False
+    assert metrics["coarse_constraint_keep_fraction"].item() < 1.0
+
+
+def test_joint_pointer_constraint_changes_argmax() -> None:
+    model = AutoregMeshModel(_make_cached_token_config()).eval()
+    with torch.no_grad():
+        model.pointer_query.weight.zero_()
+        model.pointer_query.bias.zero_()
+        model.pointer_key.weight.zero_()
+        eye = torch.eye(model.decoder_dim)
+        model.pointer_query.weight.copy_(eye)
+        model.pointer_key.weight.copy_(eye)
+
+    hidden = torch.zeros((1, 1, model.decoder_dim), dtype=torch.float32)
+    hidden[0, 0, 0] = 1.0
+    hidden[0, 0, 1] = 0.5
+    memory_tokens = torch.zeros((1, 8, model.decoder_dim), dtype=torch.float32)
+    memory_tokens[0, 0, 0] = 1.0
+    memory_tokens[0, 1, 1] = 1.0
+    metrics = {
+        "coarse_constraint_keep_fraction": hidden.new_tensor(0.25),
+        "coarse_constraint_empty_rate": hidden.new_zeros(()),
+        "coarse_constraint_target_outside_rate": hidden.new_zeros(()),
+    }
+    raw_outputs = model._compute_coarse_outputs(hidden, memory_tokens)
+    masked_outputs = model._compute_coarse_outputs(
+        hidden,
+        memory_tokens,
+        coarse_valid_mask=torch.tensor([[[False, True, False, False, False, False, False, False]]]),
+        coarse_constraint_metrics=metrics,
+    )
+
+    assert int(raw_outputs["pred_coarse_ids"][0, 0].item()) == 0
+    assert int(masked_outputs["pred_coarse_ids"][0, 0].item()) == 1
+    assert masked_outputs["coarse_constraint_keep_fraction"].item() == pytest.approx(0.25)
+
+
+def test_axis_factorized_constraint_changes_argmax() -> None:
+    model = AutoregMeshModel(_make_factorized_cached_token_config()).eval()
+    with torch.no_grad():
+        for layer in (model.pointer_query_z, model.pointer_query_y, model.pointer_query_x):
+            layer.weight.zero_()
+            layer.bias.zero_()
+            layer.weight.copy_(torch.eye(model.decoder_dim))
+        for layer in (model.pointer_key_z, model.pointer_key_y, model.pointer_key_x):
+            layer.weight.zero_()
+            layer.weight.copy_(torch.eye(model.decoder_dim))
+
+    hidden = torch.zeros((1, 1, model.decoder_dim), dtype=torch.float32)
+    hidden[0, 0, 0] = 2.0
+    hidden[0, 0, 2] = 2.0
+    hidden[0, 0, 4] = 2.0
+    hidden[0, 0, 1] = 0.5
+    hidden[0, 0, 3] = 0.5
+    hidden[0, 0, 5] = 0.5
+    memory_tokens = torch.zeros((1, 8, model.decoder_dim), dtype=torch.float32)
+    cursor = 0
+    for z_idx in range(2):
+        for y_idx in range(2):
+            for x_idx in range(2):
+                memory_tokens[0, cursor, z_idx] = 1.0
+                memory_tokens[0, cursor, 2 + y_idx] = 1.0
+                memory_tokens[0, cursor, 4 + x_idx] = 1.0
+                cursor += 1
+    metrics = {
+        "coarse_constraint_keep_fraction": hidden.new_tensor(0.125),
+        "coarse_constraint_empty_rate": hidden.new_zeros(()),
+        "coarse_constraint_target_outside_rate": hidden.new_zeros(()),
+    }
+    raw_outputs = model._compute_coarse_outputs(hidden, memory_tokens)
+    only_last = torch.zeros((1, 1, 8), dtype=torch.bool)
+    only_last[0, 0, 7] = True
+    masked_outputs = model._compute_coarse_outputs(
+        hidden,
+        memory_tokens,
+        coarse_valid_mask=only_last,
+        coarse_constraint_metrics=metrics,
+    )
+
+    assert int(raw_outputs["pred_coarse_axis_ids"]["z"][0, 0].item()) == 0
+    assert int(raw_outputs["pred_coarse_axis_ids"]["y"][0, 0].item()) == 0
+    assert int(raw_outputs["pred_coarse_axis_ids"]["x"][0, 0].item()) == 0
+    assert int(masked_outputs["pred_coarse_axis_ids"]["z"][0, 0].item()) == 1
+    assert int(masked_outputs["pred_coarse_axis_ids"]["y"][0, 0].item()) == 1
+    assert int(masked_outputs["pred_coarse_axis_ids"]["x"][0, 0].item()) == 1
+    assert int(masked_outputs["pred_coarse_ids"][0, 0].item()) == 7
+
+
+def test_coarse_constraint_gt_union_and_empty_fallback() -> None:
+    model = AutoregMeshModel(_make_cached_token_config()).eval()
+    raw_mask = torch.zeros((1, 1, 8), dtype=torch.bool)
+    adjusted, metrics = model._finalize_coarse_constraint_mask(
+        raw_mask,
+        sequence_mask=torch.tensor([[True]], dtype=torch.bool),
+        target_coarse_ids=torch.tensor([[3]], dtype=torch.long),
+        target_supervision_mask=torch.tensor([[True]], dtype=torch.bool),
+    )
+
+    assert adjusted is not None
+    assert bool(torch.all(adjusted).item())
+    assert metrics["coarse_constraint_empty_rate"].item() == pytest.approx(1.0)
+    assert metrics["coarse_constraint_target_outside_rate"].item() == pytest.approx(1.0)
+
+
+@pytest.mark.parametrize("direction", ["left", "right", "up", "down"])
 def test_sequence_to_grid_torch_matches_numpy_deserialize(direction: str) -> None:
     sample = _make_sample(direction)
     grid_shape = tuple(int(v) for v in sample["target_grid_shape"].tolist())
@@ -1284,6 +1508,23 @@ def test_seam_edge_loss_is_near_zero_on_ground_truth_and_increases_when_displace
 
     assert gt_loss.item() == pytest.approx(0.0, abs=1e-6)
     assert displaced_loss.item() > gt_loss.item()
+
+
+def test_first_strip_wrong_side_rate_refined_detects_mirrored_first_strip() -> None:
+    from vesuvius.neural_tracing.autoreg_mesh.losses import _first_strip_wrong_side_rate_from_sequence
+
+    batch = autoreg_mesh_collate([_make_sample("left")])
+    gt_rate = _first_strip_wrong_side_rate_from_sequence(batch["target_xyz"], batch)
+    mirrored = batch["target_xyz"].clone()
+    strip_length = int(batch["strip_length"][0].item())
+    cond_grid = batch["conditioning_grid_local"][0]
+    frontier = cond_grid[:, -1, :]
+    first_strip = mirrored[0, :strip_length]
+    mirrored[0, :strip_length] = frontier - 0.5 * (first_strip - frontier)
+    mirrored_rate = _first_strip_wrong_side_rate_from_sequence(mirrored, batch)
+
+    assert gt_rate.item() == pytest.approx(0.0, abs=1e-6)
+    assert mirrored_rate.item() > gt_rate.item()
 
 
 def test_triangle_barrier_increases_for_flipped_continuation() -> None:
@@ -1668,6 +1909,13 @@ def test_distance_aware_target_default_config_values() -> None:
     assert validated["distance_aware_coarse_targets_enabled"] is True
     assert validated["distance_aware_coarse_target_radius"] == 1
     assert validated["distance_aware_coarse_target_sigma"] == pytest.approx(1.0)
+    assert validated["coarse_continuation_constraint_enabled"] is True
+    assert validated["coarse_continuation_constraint_mode"] == "hard_mask"
+    assert validated["coarse_continuation_forward_scale"] == pytest.approx(4.0)
+    assert validated["coarse_continuation_backward_scale"] == pytest.approx(1.5)
+    assert validated["coarse_continuation_lateral_scale"] == pytest.approx(3.0)
+    assert validated["coarse_continuation_min_radius_scale"] == pytest.approx(2.5)
+    assert validated["coarse_continuation_empty_fallback"] == "disable_for_token"
     assert validated["volume_only_augmentation"]["enabled"] is True
     assert validated["volume_only_augmentation"]["gamma_prob"] == pytest.approx(0.4)
 
@@ -1885,6 +2133,16 @@ def test_rope_config_validation_rejects_invalid_values() -> None:
     bad_aug_prob["volume_only_augmentation"] = {"enabled": True, "gamma_prob": 1.5}
     with pytest.raises(ValueError, match="volume_only_augmentation.gamma_prob"):
         validate_autoreg_mesh_config(bad_aug_prob)
+
+    bad_constraint_mode = _make_cached_token_config()
+    bad_constraint_mode["coarse_continuation_constraint_mode"] = "soft_bias"
+    with pytest.raises(ValueError, match="coarse_continuation_constraint_mode"):
+        validate_autoreg_mesh_config(bad_constraint_mode)
+
+    bad_constraint_fallback = _make_cached_token_config()
+    bad_constraint_fallback["coarse_continuation_empty_fallback"] = "none"
+    with pytest.raises(ValueError, match="coarse_continuation_empty_fallback"):
+        validate_autoreg_mesh_config(bad_constraint_fallback)
 
 
 def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:

@@ -45,6 +45,22 @@ def _build_target_strip_coords(direction: str, grid_shape: tuple[int, int], *, d
     return torch.tensor(coords, dtype=torch.float32, device=device)
 
 
+def _build_target_strip_positions(direction: str, grid_shape: tuple[int, int], *, device: torch.device) -> Tensor:
+    h, w = int(grid_shape[0]), int(grid_shape[1])
+    positions: list[tuple[int, int]] = []
+    if direction in {"left", "right"}:
+        strips = list(range(w)) if direction == "left" else list(range(w - 1, -1, -1))
+        for strip_idx, _col_idx in enumerate(strips):
+            for within_idx in range(h):
+                positions.append((strip_idx, within_idx))
+    else:
+        strips = list(range(h)) if direction == "up" else list(range(h - 1, -1, -1))
+        for strip_idx, _row_idx in enumerate(strips):
+            for within_idx in range(w):
+                positions.append((strip_idx, within_idx))
+    return torch.tensor(positions, dtype=torch.long, device=device)
+
+
 def _sample_from_logits(logits: Tensor, *, greedy: bool) -> Tensor:
     if greedy:
         return logits.argmax(dim=-1)
@@ -128,6 +144,7 @@ def infer_autoreg_mesh(
         encoded = model.encode_conditioning(volume, vol_tokens=vol_tokens)
         memory_tokens = encoded["memory_tokens"]
         all_target_strip_coords = _build_target_strip_coords(direction, target_grid_shape, device=device)
+        all_target_strip_positions = _build_target_strip_positions(direction, target_grid_shape, device=device)
 
         generated_coarse: list[int] = []
         generated_coarse_axes: dict[str, list[int]] = {"z": [], "y": [], "x": []}
@@ -152,9 +169,14 @@ def infer_autoreg_mesh(
                 prompt_tokens=prompt_tokens,
                 prompt_anchor_xyz=prompt_anchor_xyz,
                 direction_id=direction_id,
+                direction=[direction],
+                conditioning_grid_local=[batch["conditioning_grid_local"][0].to(device)],
+                strip_length=batch["strip_length"].to(device),
+                num_strips=batch["num_strips"].to(device),
                 target_coarse_ids=target_coarse_ids,
                 target_offset_bins=target_offset_bins,
                 target_xyz=target_xyz,
+                target_strip_positions=all_target_strip_positions[:current_len].unsqueeze(0),
                 target_strip_coords=target_strip_coords,
             )
             outputs = model.forward_from_encoded(

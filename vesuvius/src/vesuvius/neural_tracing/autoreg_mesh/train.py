@@ -19,6 +19,7 @@ from vesuvius.neural_tracing.autoreg_mesh.infer import infer_autoreg_mesh
 from vesuvius.neural_tracing.autoreg_mesh.losses import (
     _boundary_touch_fraction_from_sequence,
     _coarse_accuracy_metrics,
+    _first_strip_wrong_side_rate_from_sequence,
     _invalid_vertex_fraction_from_sequence,
     _l1_xyz_metric,
     _pred_oob_fraction_from_sequence,
@@ -342,6 +343,7 @@ def _evaluate_rollout_validation(
                 "seam_edge_error": float(_seam_edge_error_from_sequence(pred_xyz_padded, batch, band_width=seam_band_width).item()),
                 "coarse_exact_acc": float(coarse_metrics["coarse_exact_acc"].item()),
                 "triangle_flip_rate": float(_triangle_flip_rate_from_sequence(pred_xyz_padded, batch).item()),
+                "first_strip_wrong_side_rate": float(_first_strip_wrong_side_rate_from_sequence(pred_xyz_padded, batch).item()),
                 "pred_oob_fraction": float(_pred_oob_fraction_from_sequence(pred_xyz_padded, batch).item()),
                 "invalid_vertex_fraction": float(_invalid_vertex_fraction_from_sequence(pred_xyz_padded, batch).item()),
                 "boundary_touch_fraction": float(_boundary_touch_fraction_from_sequence(pred_xyz_padded, batch).item()),

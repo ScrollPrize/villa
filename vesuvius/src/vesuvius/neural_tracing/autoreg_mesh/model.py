@@ -84,6 +84,12 @@ def _batched_shared_rope_from_coords(
     )
 
 
+def _as_grid_tensor(value, *, device: torch.device, dtype: torch.dtype) -> Tensor:
+    if torch.is_tensor(value):
+        return value.to(device=device, dtype=dtype)
+    return torch.as_tensor(value, device=device, dtype=dtype)
+
+
 class RotarySelfAttention(nn.Module):
     def __init__(self, dim: int, num_heads: int, rope: MixedRopePositionEmbedding, dropout: float = 0.0) -> None:
         super().__init__()
@@ -234,6 +240,13 @@ class AutoregMeshModel(nn.Module):
         self.cross_attention_every_n_blocks = int(self.config["cross_attention_every_n_blocks"])
         self.pointer_temperature = float(self.config["pointer_temperature"])
         self.coarse_prediction_mode = str(self.config["coarse_prediction_mode"])
+        self.coarse_continuation_constraint_enabled = bool(self.config.get("coarse_continuation_constraint_enabled", True))
+        self.coarse_continuation_constraint_mode = str(self.config.get("coarse_continuation_constraint_mode", "hard_mask"))
+        self.coarse_continuation_forward_scale = float(self.config.get("coarse_continuation_forward_scale", 4.0))
+        self.coarse_continuation_backward_scale = float(self.config.get("coarse_continuation_backward_scale", 1.5))
+        self.coarse_continuation_lateral_scale = float(self.config.get("coarse_continuation_lateral_scale", 3.0))
+        self.coarse_continuation_min_radius_scale = float(self.config.get("coarse_continuation_min_radius_scale", 2.5))
+        self.coarse_continuation_empty_fallback = str(self.config.get("coarse_continuation_empty_fallback", "disable_for_token"))
         self.conditioning_feature_debias_mode = str(self.config["conditioning_feature_debias_mode"])
         self.conditioning_feature_debias_basis_source = str(self.config["conditioning_feature_debias_basis_source"])
         self.conditioning_feature_debias_components = int(self.config["conditioning_feature_debias_components"])
@@ -291,6 +304,8 @@ class AutoregMeshModel(nn.Module):
         )
         self.start_token = nn.Parameter(torch.zeros(self.decoder_dim))
         self.register_buffer("coarse_cell_starts", self._build_coarse_cell_starts(), persistent=False)
+        patch = torch.tensor(self.patch_size, dtype=torch.float32)
+        self.register_buffer("coarse_cell_centers", self.coarse_cell_starts + 0.5 * patch.view(1, 3), persistent=False)
 
         self.rope = MixedRopePositionEmbedding(
             self.head_dim,
@@ -381,6 +396,202 @@ class AutoregMeshModel(nn.Module):
         x_axis = (torch.arange(gx, device=device, dtype=dtype) + 0.5) * patch[2]
         coords = torch.stack(torch.meshgrid(z_axis, y_axis, x_axis, indexing="ij"), dim=-1).reshape(-1, 3)
         return self._normalize_xyz(coords)
+
+    def _default_split_axis_direction(self, direction: str, *, device: torch.device, dtype: torch.dtype) -> Tensor:
+        if direction == "left":
+            return torch.tensor([0.0, 0.0, 1.0], device=device, dtype=dtype)
+        if direction == "right":
+            return torch.tensor([0.0, 0.0, -1.0], device=device, dtype=dtype)
+        if direction == "up":
+            return torch.tensor([0.0, 1.0, 0.0], device=device, dtype=dtype)
+        if direction == "down":
+            return torch.tensor([0.0, -1.0, 0.0], device=device, dtype=dtype)
+        raise ValueError(f"unsupported direction {direction!r}")
+
+    def _frontier_anchor_and_direction(
+        self,
+        cond_grid: Tensor,
+        *,
+        direction: str,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        if direction == "left":
+            frontier = cond_grid[:, -1, :]
+            interior = cond_grid[:, -2, :] if int(cond_grid.shape[1]) > 1 else torch.full_like(frontier, float("nan"))
+        elif direction == "right":
+            frontier = cond_grid[:, 0, :]
+            interior = cond_grid[:, 1, :] if int(cond_grid.shape[1]) > 1 else torch.full_like(frontier, float("nan"))
+        elif direction == "up":
+            frontier = cond_grid[-1, :, :]
+            interior = cond_grid[-2, :, :] if int(cond_grid.shape[0]) > 1 else torch.full_like(frontier, float("nan"))
+        elif direction == "down":
+            frontier = cond_grid[0, :, :]
+            interior = cond_grid[1, :, :] if int(cond_grid.shape[0]) > 1 else torch.full_like(frontier, float("nan"))
+        else:
+            raise ValueError(f"unsupported direction {direction!r}")
+
+        valid = torch.isfinite(frontier).all(dim=-1) & torch.isfinite(interior).all(dim=-1)
+        outward = frontier - interior
+        return frontier, outward, valid
+
+    def _build_output_prefix_geometry(self, generation_inputs: dict[str, Tensor]) -> tuple[Tensor, Tensor]:
+        prefix_xyz = torch.zeros_like(generation_inputs["xyz"])
+        prefix_valid = torch.zeros_like(generation_inputs["geometry_valid_mask"], dtype=torch.bool)
+        if int(generation_inputs["xyz"].shape[1]) > 1:
+            prefix_xyz[:, :-1, :] = generation_inputs["xyz"][:, 1:, :]
+            prefix_valid[:, :-1] = generation_inputs["geometry_valid_mask"][:, 1:]
+        prefix_valid &= torch.isfinite(prefix_xyz).all(dim=-1)
+        return prefix_xyz, prefix_valid
+
+    def _build_strip_index_map(self, batch: dict, sequence_mask: Tensor) -> list[Tensor]:
+        index_maps: list[Tensor] = []
+        strip_positions = batch["target_strip_positions"]
+        for batch_idx in range(int(sequence_mask.shape[0])):
+            num_strips = int(batch["num_strips"][batch_idx].item())
+            strip_length = int(batch["strip_length"][batch_idx].item())
+            index_map = torch.full((num_strips, strip_length), -1, device=sequence_mask.device, dtype=torch.long)
+            for token_idx in range(int(sequence_mask.shape[1])):
+                if not bool(sequence_mask[batch_idx, token_idx].item()):
+                    continue
+                strip_idx = int(strip_positions[batch_idx, token_idx, 0].item())
+                within_idx = int(strip_positions[batch_idx, token_idx, 1].item())
+                if 0 <= strip_idx < num_strips and 0 <= within_idx < strip_length:
+                    index_map[strip_idx, within_idx] = token_idx
+            index_maps.append(index_map)
+        return index_maps
+
+    def _build_raw_coarse_continuation_mask(
+        self,
+        batch: dict,
+        generation_inputs: dict[str, Tensor],
+    ) -> Tensor | None:
+        if not bool(self.coarse_continuation_constraint_enabled):
+            return None
+        if str(self.coarse_continuation_constraint_mode) != "hard_mask":
+            return None
+        if "conditioning_grid_local" not in batch or "target_strip_positions" not in batch:
+            return None
+
+        sequence_mask = generation_inputs["sequence_mask"]
+        batch_size, target_len = sequence_mask.shape
+        dtype = generation_inputs["xyz"].dtype
+        device = generation_inputs["xyz"].device
+        coarse_centers = self.coarse_cell_centers.to(device=device, dtype=dtype)
+        raw_mask = torch.ones((batch_size, target_len, coarse_centers.shape[0]), device=device, dtype=torch.bool)
+        prefix_xyz, prefix_valid = self._build_output_prefix_geometry(generation_inputs)
+        index_maps = self._build_strip_index_map(batch, sequence_mask)
+        patch_norm = torch.linalg.norm(torch.tensor(self.patch_size, device=device, dtype=dtype))
+        eps = torch.tensor(1e-6, device=device, dtype=dtype)
+
+        for batch_idx in range(batch_size):
+            direction = str(batch["direction"][batch_idx])
+            cond_grid = _as_grid_tensor(batch["conditioning_grid_local"][batch_idx], device=device, dtype=dtype)
+            frontier, frontier_outward, frontier_valid = self._frontier_anchor_and_direction(cond_grid, direction=direction)
+            default_axis = self._default_split_axis_direction(direction, device=device, dtype=dtype)
+            index_map = index_maps[batch_idx]
+            for token_idx in range(target_len):
+                if not bool(sequence_mask[batch_idx, token_idx].item()):
+                    continue
+                strip_idx = int(batch["target_strip_positions"][batch_idx, token_idx, 0].item())
+                within_idx = int(batch["target_strip_positions"][batch_idx, token_idx, 1].item())
+                if not (0 <= within_idx < int(frontier.shape[0])):
+                    continue
+
+                frontier_anchor = frontier[within_idx]
+                outward = frontier_outward[within_idx]
+                outward_valid = bool(frontier_valid[within_idx].item())
+                anchor = frontier_anchor
+                direction_vec = outward
+                step = torch.linalg.norm(direction_vec)
+
+                if strip_idx > 0:
+                    prev_idx = int(index_map[strip_idx - 1, within_idx].item())
+                    if prev_idx >= 0 and bool(prefix_valid[batch_idx, prev_idx].item()):
+                        anchor = prefix_xyz[batch_idx, prev_idx]
+                        if strip_idx > 1:
+                            prior_idx = int(index_map[strip_idx - 2, within_idx].item())
+                            if prior_idx >= 0 and bool(prefix_valid[batch_idx, prior_idx].item()):
+                                direction_vec = prefix_xyz[batch_idx, prev_idx] - prefix_xyz[batch_idx, prior_idx]
+                            else:
+                                direction_vec = outward if outward_valid else default_axis
+                        else:
+                            direction_vec = outward if outward_valid else default_axis
+                        step = torch.linalg.norm(direction_vec)
+                    else:
+                        anchor = frontier_anchor
+                        direction_vec = outward if outward_valid else default_axis
+                        step = torch.linalg.norm(direction_vec)
+                elif not outward_valid:
+                    direction_vec = default_axis
+                    step = torch.linalg.norm(direction_vec)
+
+                if not bool(torch.isfinite(anchor).all().item()):
+                    anchor = torch.zeros_like(default_axis)
+
+                if not bool(torch.isfinite(direction_vec).all().item()) or float(step.item()) <= float(eps.item()):
+                    direction_vec = outward if outward_valid else default_axis
+                    step = torch.linalg.norm(direction_vec)
+                if not bool(torch.isfinite(direction_vec).all().item()) or float(step.item()) <= float(eps.item()):
+                    direction_vec = default_axis
+                    step = patch_norm
+
+                dir_unit = direction_vec / step.clamp(min=float(eps.item()))
+                local_step = torch.clamp(step, min=float(eps.item()))
+                delta = coarse_centers - anchor.view(1, 3)
+                forward = torch.einsum("nd,d->n", delta, dir_unit)
+                lateral = torch.linalg.norm(delta - forward.unsqueeze(-1) * dir_unit.view(1, 3), dim=-1)
+                radial = torch.linalg.norm(delta, dim=-1)
+                valid_tube = (
+                    (forward >= (-self.coarse_continuation_backward_scale * local_step)) &
+                    (forward <= (self.coarse_continuation_forward_scale * local_step)) &
+                    (lateral <= (self.coarse_continuation_lateral_scale * local_step))
+                )
+                valid_ball = radial <= (self.coarse_continuation_min_radius_scale * local_step)
+                raw_mask[batch_idx, token_idx] = valid_tube | valid_ball
+        return raw_mask
+
+    def _finalize_coarse_constraint_mask(
+        self,
+        raw_mask: Tensor | None,
+        *,
+        sequence_mask: Tensor,
+        target_coarse_ids: Tensor | None = None,
+        target_supervision_mask: Tensor | None = None,
+    ) -> tuple[Tensor | None, dict[str, Tensor]]:
+        zeros = sequence_mask.new_zeros((), dtype=torch.float32)
+        metrics = {
+            "coarse_constraint_keep_fraction": zeros,
+            "coarse_constraint_empty_rate": zeros,
+            "coarse_constraint_target_outside_rate": zeros,
+        }
+        if raw_mask is None:
+            return None, metrics
+
+        token_mask = sequence_mask.to(torch.bool)
+        if bool(token_mask.any()):
+            keep = raw_mask.to(torch.float32).sum(dim=-1) / float(raw_mask.shape[-1])
+            metrics["coarse_constraint_keep_fraction"] = keep[token_mask].mean()
+        else:
+            metrics["coarse_constraint_keep_fraction"] = zeros
+
+        empty_tokens = token_mask & (~raw_mask.any(dim=-1))
+        if bool(token_mask.any()):
+            metrics["coarse_constraint_empty_rate"] = empty_tokens.to(torch.float32)[token_mask].mean()
+
+        adjusted_mask = raw_mask.clone()
+        if str(self.coarse_continuation_empty_fallback) == "disable_for_token" and bool(empty_tokens.any()):
+            adjusted_mask[empty_tokens] = True
+
+        if target_coarse_ids is not None and target_supervision_mask is not None:
+            gt_mask = target_supervision_mask.to(torch.bool) & token_mask & (target_coarse_ids >= 0)
+            if bool(gt_mask.any()):
+                gt_inside = torch.gather(raw_mask, dim=-1, index=target_coarse_ids.clamp(min=0).unsqueeze(-1)).squeeze(-1)
+                target_outside = gt_mask & (~gt_inside)
+                metrics["coarse_constraint_target_outside_rate"] = target_outside.to(torch.float32)[gt_mask].mean()
+                if bool(target_outside.any()):
+                    outside_idx = torch.nonzero(target_outside, as_tuple=False)
+                    adjusted_mask[outside_idx[:, 0], outside_idx[:, 1], target_coarse_ids[target_outside]] = True
+
+        return adjusted_mask, metrics
 
     @torch.no_grad()
     def _build_conditioning_feature_debias_basis(self, *, device: torch.device) -> Tensor:
@@ -473,11 +684,26 @@ class AutoregMeshModel(nn.Module):
         x_memory = memory_5d.mean(dim=(1, 2))
         return z_memory, y_memory, x_memory
 
-    def _compute_coarse_outputs(self, hidden: Tensor, memory_tokens: Tensor) -> dict[str, Any]:
+    def _compute_coarse_outputs(
+        self,
+        hidden: Tensor,
+        memory_tokens: Tensor,
+        *,
+        coarse_valid_mask: Tensor | None = None,
+        coarse_constraint_metrics: dict[str, Tensor] | None = None,
+    ) -> dict[str, Any]:
+        zeros = hidden.new_zeros(())
+        coarse_constraint_metrics = coarse_constraint_metrics or {
+            "coarse_constraint_keep_fraction": zeros,
+            "coarse_constraint_empty_rate": zeros,
+            "coarse_constraint_target_outside_rate": zeros,
+        }
         if self.coarse_prediction_mode == "joint_pointer":
             pointer_q = F.normalize(self.pointer_query(hidden), dim=-1)
             pointer_k = F.normalize(self.pointer_key(memory_tokens), dim=-1)
             coarse_logits = torch.einsum("btd,bnd->btn", pointer_q, pointer_k) / self.pointer_temperature
+            if coarse_valid_mask is not None:
+                coarse_logits = coarse_logits.masked_fill(~coarse_valid_mask, torch.finfo(coarse_logits.dtype).min)
             pred_coarse_ids = coarse_logits.argmax(dim=-1)
             z_ids, y_ids, x_ids = self._unflatten_coarse_ids(pred_coarse_ids)
             return {
@@ -485,6 +711,9 @@ class AutoregMeshModel(nn.Module):
                 "coarse_axis_logits": None,
                 "pred_coarse_ids": pred_coarse_ids,
                 "pred_coarse_axis_ids": {"z": z_ids, "y": y_ids, "x": x_ids},
+                "coarse_constraint_joint_valid_mask": coarse_valid_mask,
+                "coarse_constraint_axis_valid_masks": None,
+                **coarse_constraint_metrics,
             }
 
         z_memory, y_memory, x_memory = self._factorized_axis_memory(memory_tokens)
@@ -497,6 +726,16 @@ class AutoregMeshModel(nn.Module):
         z_logits = torch.einsum("btd,bzd->btz", z_query, z_key) / self.pointer_temperature
         y_logits = torch.einsum("btd,byd->bty", y_query, y_key) / self.pointer_temperature
         x_logits = torch.einsum("btd,bxd->btx", x_query, x_key) / self.pointer_temperature
+        z_valid = y_valid = x_valid = None
+        if coarse_valid_mask is not None:
+            gz, gy, gx = self.coarse_grid_shape
+            mask_5d = coarse_valid_mask.reshape(coarse_valid_mask.shape[0], coarse_valid_mask.shape[1], gz, gy, gx)
+            z_valid = mask_5d.any(dim=(3, 4))
+            y_valid = mask_5d.any(dim=(2, 4))
+            x_valid = mask_5d.any(dim=(2, 3))
+            z_logits = z_logits.masked_fill(~z_valid, torch.finfo(z_logits.dtype).min)
+            y_logits = y_logits.masked_fill(~y_valid, torch.finfo(y_logits.dtype).min)
+            x_logits = x_logits.masked_fill(~x_valid, torch.finfo(x_logits.dtype).min)
         z_ids = z_logits.argmax(dim=-1)
         y_ids = y_logits.argmax(dim=-1)
         x_ids = x_logits.argmax(dim=-1)
@@ -506,6 +745,9 @@ class AutoregMeshModel(nn.Module):
             "coarse_axis_logits": {"z": z_logits, "y": y_logits, "x": x_logits},
             "pred_coarse_ids": pred_coarse_ids,
             "pred_coarse_axis_ids": {"z": z_ids, "y": y_ids, "x": x_ids},
+            "coarse_constraint_joint_valid_mask": coarse_valid_mask,
+            "coarse_constraint_axis_valid_masks": {"z": z_valid, "y": y_valid, "x": x_valid} if z_valid is not None else None,
+            **coarse_constraint_metrics,
         }
 
     def _soft_decode_local_xyz(
@@ -766,7 +1008,19 @@ class AutoregMeshModel(nn.Module):
 
         prompt_len = int(prompt["mask"].shape[1])
         hidden = x[:, prompt_len:, :]
-        coarse_outputs = self._compute_coarse_outputs(hidden, memory_tokens)
+        raw_coarse_valid_mask = self._build_raw_coarse_continuation_mask(batch, generation_inputs)
+        coarse_valid_mask, coarse_constraint_metrics = self._finalize_coarse_constraint_mask(
+            raw_coarse_valid_mask,
+            sequence_mask=generation_inputs["sequence_mask"],
+            target_coarse_ids=batch.get("target_coarse_ids"),
+            target_supervision_mask=batch.get("target_supervision_mask"),
+        )
+        coarse_outputs = self._compute_coarse_outputs(
+            hidden,
+            memory_tokens,
+            coarse_valid_mask=coarse_valid_mask,
+            coarse_constraint_metrics=coarse_constraint_metrics,
+        )
 
         max_bins = max(self.offset_num_bins)
         offset_logits = self.offset_head(hidden).reshape(hidden.shape[0], hidden.shape[1], 3, max_bins)
@@ -800,6 +1054,11 @@ class AutoregMeshModel(nn.Module):
             "memory_tokens": memory_tokens,
             "coarse_grid_shape": self.coarse_grid_shape,
             "coarse_prediction_mode": self.coarse_prediction_mode,
+            "coarse_constraint_joint_valid_mask": coarse_outputs["coarse_constraint_joint_valid_mask"],
+            "coarse_constraint_axis_valid_masks": coarse_outputs["coarse_constraint_axis_valid_masks"],
+            "coarse_constraint_keep_fraction": coarse_outputs["coarse_constraint_keep_fraction"],
+            "coarse_constraint_empty_rate": coarse_outputs["coarse_constraint_empty_rate"],
+            "coarse_constraint_target_outside_rate": coarse_outputs["coarse_constraint_target_outside_rate"],
         }
 
     def forward(
@@ -867,9 +1126,14 @@ def build_pseudo_inference_batch(
     prompt_tokens: dict[str, Tensor],
     prompt_anchor_xyz: Tensor,
     direction_id: Tensor,
+    direction: list[str],
+    conditioning_grid_local: list[Tensor],
+    strip_length: Tensor,
+    num_strips: Tensor,
     target_coarse_ids: Tensor,
     target_offset_bins: Tensor,
     target_xyz: Tensor,
+    target_strip_positions: Tensor,
     target_strip_coords: Tensor,
 ) -> dict[str, Tensor]:
     batch_size, target_len = target_coarse_ids.shape
@@ -879,10 +1143,16 @@ def build_pseudo_inference_batch(
         "prompt_anchor_xyz": prompt_anchor_xyz,
         "prompt_anchor_valid": torch.ones((batch_size,), device=prompt_anchor_xyz.device, dtype=torch.bool),
         "direction_id": direction_id,
+        "direction": direction,
+        "conditioning_grid_local": conditioning_grid_local,
+        "strip_length": strip_length,
+        "num_strips": num_strips,
         "target_coarse_ids": target_coarse_ids,
         "target_offset_bins": target_offset_bins,
         "target_valid_mask": target_coarse_ids >= 0,
         "target_xyz": target_xyz,
+        "target_strip_positions": target_strip_positions,
         "target_strip_coords": target_strip_coords,
         "target_mask": target_mask,
+        "target_supervision_mask": target_coarse_ids >= 0,
     }

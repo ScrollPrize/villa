@@ -111,6 +111,13 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "distance_aware_coarse_target_radius": 1,
     "distance_aware_coarse_target_sigma": 1.0,
     "distance_aware_coarse_target_loss": "soft_ce",
+    "coarse_continuation_constraint_enabled": True,
+    "coarse_continuation_constraint_mode": "hard_mask",
+    "coarse_continuation_forward_scale": 4.0,
+    "coarse_continuation_backward_scale": 1.5,
+    "coarse_continuation_lateral_scale": 3.0,
+    "coarse_continuation_min_radius_scale": 2.5,
+    "coarse_continuation_empty_fallback": "disable_for_token",
     "optimizer": {"name": "adamw", "learning_rate": 1e-4, "weight_decay": 1e-4},
     "scheduler": "constant",
     "scheduler_kwargs": {},
@@ -309,6 +316,20 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("distance_aware_coarse_target_sigma must be > 0")
     if str(cfg["distance_aware_coarse_target_loss"]) != "soft_ce":
         raise ValueError("distance_aware_coarse_target_loss must currently be 'soft_ce'")
+    if not isinstance(cfg.get("coarse_continuation_constraint_enabled"), bool):
+        raise ValueError("coarse_continuation_constraint_enabled must be a boolean")
+    if str(cfg["coarse_continuation_constraint_mode"]) != "hard_mask":
+        raise ValueError("coarse_continuation_constraint_mode must currently be 'hard_mask'")
+    if float(cfg["coarse_continuation_forward_scale"]) <= 0.0:
+        raise ValueError("coarse_continuation_forward_scale must be positive")
+    if float(cfg["coarse_continuation_backward_scale"]) < 0.0:
+        raise ValueError("coarse_continuation_backward_scale must be non-negative")
+    if float(cfg["coarse_continuation_lateral_scale"]) <= 0.0:
+        raise ValueError("coarse_continuation_lateral_scale must be positive")
+    if float(cfg["coarse_continuation_min_radius_scale"]) <= 0.0:
+        raise ValueError("coarse_continuation_min_radius_scale must be positive")
+    if str(cfg["coarse_continuation_empty_fallback"]) != "disable_for_token":
+        raise ValueError("coarse_continuation_empty_fallback must currently be 'disable_for_token'")
     if float(cfg["occupancy_loss_weight"]) < 0.0:
         raise ValueError("occupancy_loss_weight must be non-negative")
     if int(cfg["num_steps"]) <= 0:

@@ -147,8 +147,14 @@ def _coarse_pointer_loss(
         radius=int(distance_aware_radius),
         sigma=float(distance_aware_sigma),
     )
+    constraint_mask = outputs.get("coarse_constraint_joint_valid_mask")
+    if constraint_mask is not None:
+        neighbor_allowed = torch.gather(constraint_mask.to(torch.bool), dim=-1, index=neighbor_ids)
+        target_probs = torch.where(neighbor_allowed, target_probs, torch.zeros_like(target_probs))
+        target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
     log_probs = F.log_softmax(logits, dim=-1)
     gathered_log_probs = torch.gather(log_probs, dim=-1, index=neighbor_ids)
+    gathered_log_probs = torch.where(target_probs > 0, gathered_log_probs, torch.zeros_like(gathered_log_probs))
     per_token_loss = -(target_probs * gathered_log_probs).sum(dim=-1)
     coarse_loss = _masked_mean(per_token_loss, supervision_mask)
     coarse_target_entropy = _coarse_target_entropy(target_probs, supervision_mask)
@@ -194,8 +200,14 @@ def _factorized_coarse_pointer_loss(
             radius=int(distance_aware_radius),
             sigma=float(distance_aware_sigma),
         )
+        axis_valid_masks = outputs.get("coarse_constraint_axis_valid_masks")
+        if axis_valid_masks is not None and axis_valid_masks.get(axis_name) is not None:
+            neighbor_allowed = torch.gather(axis_valid_masks[axis_name].to(torch.bool), dim=-1, index=neighbor_ids)
+            target_probs = torch.where(neighbor_allowed, target_probs, torch.zeros_like(target_probs))
+            target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         log_probs = F.log_softmax(axis_logits, dim=-1)
         gathered_log_probs = torch.gather(log_probs, dim=-1, index=neighbor_ids)
+        gathered_log_probs = torch.where(target_probs > 0, gathered_log_probs, torch.zeros_like(gathered_log_probs))
         per_token_loss = -(target_probs * gathered_log_probs).sum(dim=-1)
         axis_losses[axis_name] = _masked_mean(per_token_loss, supervision_mask)
         axis_entropies[axis_name] = _coarse_target_entropy(target_probs, supervision_mask)
@@ -479,6 +491,69 @@ def _paired_seam_bands(example: dict, *, band_width: int) -> tuple[Tensor, Tenso
     else:
         raise ValueError(f"unsupported direction {direction!r}")
     return cond_band, pred_band, target_band, valid_band
+
+
+def _first_strip_wrong_side_rate_from_sequence(pred_xyz_sequence: Tensor, batch: dict) -> Tensor:
+    if not _geometry_batch_available(batch):
+        return pred_xyz_sequence.new_zeros(())
+    values = []
+    for example in _iter_geometry_examples(pred_xyz_sequence, batch):
+        direction = str(example["direction"])
+        pred_grid = example["pred_grid"]
+        cond_grid = example["conditioning_grid"]
+        pred_valid = torch.isfinite(pred_grid).all(dim=-1)
+        cond_valid = torch.isfinite(cond_grid).all(dim=-1)
+        if direction == "left":
+            frontier = cond_grid[:, -1, :]
+            interior = cond_grid[:, -2, :] if int(cond_grid.shape[1]) > 1 else torch.full_like(frontier, float("nan"))
+            pred_first = pred_grid[:, 0, :]
+            valid = cond_valid[:, -1] & pred_valid[:, 0]
+            if int(cond_grid.shape[1]) > 1:
+                valid &= cond_valid[:, -2]
+            default_dir = frontier.new_tensor([0.0, 0.0, 1.0])
+        elif direction == "right":
+            frontier = cond_grid[:, 0, :]
+            interior = cond_grid[:, 1, :] if int(cond_grid.shape[1]) > 1 else torch.full_like(frontier, float("nan"))
+            pred_first = pred_grid[:, -1, :]
+            valid = cond_valid[:, 0] & pred_valid[:, -1]
+            if int(cond_grid.shape[1]) > 1:
+                valid &= cond_valid[:, 1]
+            default_dir = frontier.new_tensor([0.0, 0.0, -1.0])
+        elif direction == "up":
+            frontier = cond_grid[-1, :, :]
+            interior = cond_grid[-2, :, :] if int(cond_grid.shape[0]) > 1 else torch.full_like(frontier, float("nan"))
+            pred_first = pred_grid[0, :, :]
+            valid = cond_valid[-1, :] & pred_valid[0, :]
+            if int(cond_grid.shape[0]) > 1:
+                valid &= cond_valid[-2, :]
+            default_dir = frontier.new_tensor([0.0, 1.0, 0.0])
+        elif direction == "down":
+            frontier = cond_grid[0, :, :]
+            interior = cond_grid[1, :, :] if int(cond_grid.shape[0]) > 1 else torch.full_like(frontier, float("nan"))
+            pred_first = pred_grid[-1, :, :]
+            valid = cond_valid[0, :] & pred_valid[-1, :]
+            if int(cond_grid.shape[0]) > 1:
+                valid &= cond_valid[1, :]
+            default_dir = frontier.new_tensor([0.0, -1.0, 0.0])
+        else:
+            raise ValueError(f"unsupported direction {direction!r}")
+
+        outward = frontier - interior
+        step = torch.linalg.norm(outward, dim=-1)
+        dir_unit = torch.where(
+            (step > 1e-6).unsqueeze(-1),
+            outward / step.clamp(min=1e-6).unsqueeze(-1),
+            default_dir.view(1, 3).expand_as(frontier),
+        )
+        step = torch.where(step > 1e-6, step, torch.ones_like(step))
+        displacement = pred_first - frontier
+        signed = (displacement * dir_unit).sum(dim=-1)
+        wrong = signed < (-0.1 * step)
+        if bool(valid.any()):
+            values.append(_masked_mean(wrong.to(dtype=pred_xyz_sequence.dtype), valid))
+    if not values:
+        return pred_xyz_sequence.new_zeros(())
+    return torch.stack(values).mean()
 
 
 def _seam_edge_error_from_sequence(pred_xyz_sequence: Tensor, batch: dict, *, band_width: int) -> Tensor:
@@ -904,6 +979,7 @@ def compute_autoreg_mesh_losses(
     coarse_acc_metrics = _coarse_accuracy_metrics(outputs, batch)
     xyz_l1_soft = _l1_xyz_metric(soft_xyz_for_loss.detach(), batch)
     xyz_l1_refined = _l1_xyz_metric(pred_xyz_refined.detach(), batch)
+    first_strip_wrong_side_rate_refined = _first_strip_wrong_side_rate_from_sequence(pred_xyz_refined.detach(), batch)
     pred_oob_fraction_refined = _pred_oob_fraction_from_sequence(pred_xyz_refined.detach(), batch)
     invalid_vertex_fraction_refined = _invalid_vertex_fraction_from_sequence(pred_xyz_refined.detach(), batch)
     boundary_touch_fraction_refined = _boundary_touch_fraction_from_sequence(pred_xyz_refined.detach(), batch)
@@ -930,6 +1006,9 @@ def compute_autoreg_mesh_losses(
         "coarse_axis_acc_z": coarse_acc_metrics["coarse_axis_acc_z"],
         "coarse_axis_acc_y": coarse_acc_metrics["coarse_axis_acc_y"],
         "coarse_axis_acc_x": coarse_acc_metrics["coarse_axis_acc_x"],
+        "coarse_constraint_keep_fraction": outputs.get("coarse_constraint_keep_fraction", total_loss.new_zeros(())),
+        "coarse_constraint_empty_rate": outputs.get("coarse_constraint_empty_rate", total_loss.new_zeros(())),
+        "coarse_constraint_target_outside_rate": outputs.get("coarse_constraint_target_outside_rate", total_loss.new_zeros(())),
         "offset_loss": offset_loss,
         "offset_loss_weight_active": total_loss.new_tensor(float(offset_loss_weight_active)),
         "stop_loss": stop_loss,
@@ -949,6 +1028,7 @@ def compute_autoreg_mesh_losses(
         "boundary_loss_weight_active": total_loss.new_tensor(float(boundary_loss_weight_active)),
         "triangle_flip_rate_soft": triangle_flip_rate_soft,
         "triangle_flip_rate_refined": triangle_flip_rate_refined,
+        "first_strip_wrong_side_rate_refined": first_strip_wrong_side_rate_refined,
         "pred_oob_fraction_refined": pred_oob_fraction_refined,
         "teacher_forced_pred_oob_fraction": pred_oob_fraction_refined,
         "teacher_forced_invalid_vertex_fraction": invalid_vertex_fraction_refined,
