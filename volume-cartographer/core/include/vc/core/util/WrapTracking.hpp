@@ -3,7 +3,9 @@
 #include <opencv2/core.hpp>
 #include "vc/core/util/Umbilicus.hpp"
 
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <random>
 #include <string>
 #include <vector>
@@ -87,7 +89,8 @@ private:
 
     // Umbilicus center cache (avoids repeated spline evaluation)
     mutable std::vector<cv::Vec3f> _center_cache;
-    mutable std::vector<bool> _center_cache_valid;
+    mutable std::vector<std::atomic<uint8_t>> _center_cache_valid;
+    mutable std::mutex _center_cache_mutex;
 
     // Helpers
     double normalize_theta(double raw_theta) const;  // Apply base offset

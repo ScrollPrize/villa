@@ -34,6 +34,7 @@ public:
 
     void startWatching();
     void stopWatching();
+    void applySettings();
 
     void markSegmentRecentlyEdited(const std::string& segmentId);
 

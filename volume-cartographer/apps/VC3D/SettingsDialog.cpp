@@ -125,7 +125,7 @@ void SettingsDialog::accept()
     settings.setValue(perf::PARALLEL_PROCESSES, spinParallelProcesses->value());
     settings.setValue(perf::ITERATION_COUNT, spinIterationCount->value());
     settings.setValue(perf::DOWNSCALE_OVERRIDE, cmbDownscaleOverride->currentIndex());
-    settings.setValue(perf::ENABLE_FILE_WATCHING, chkEnableFileWatching->isChecked() ? "1" : "0");
+    settings.setValue(perf::ENABLE_FILE_WATCHING, chkEnableFileWatching->isChecked());
 
     // Cache settings
     settings.setValue(perf::RAM_CACHE_SIZE_GB, spinRamCacheSizeGB->value());
@@ -166,4 +166,3 @@ std::vector<int> SettingsDialog::expandSettingToIntRange(const QString& setting)
 
     return res;
 }
-

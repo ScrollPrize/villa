@@ -336,6 +336,7 @@ void ViewerManager::setSurfacePatchSamplingStride(int stride, bool userInitiated
     stride = std::max(1, stride);
     if (userInitiated) {
         _surfacePatchStrideUserSet = true;
+        _targetRefinedStride = 0;
     }
     if (_surfacePatchSamplingStride == stride) {
         return;
@@ -496,23 +497,43 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
         // entries on 2K² surfaces for no visible win in intersection
         // drawing.
         int defaultStride;
+        int refinedStride;
         if (surfaceCount > 2500) {
             defaultStride = 32;
-            _targetRefinedStride = 16;
+            refinedStride = 16;
         } else if (surfaceCount >= 500) {
             defaultStride = 16;
-            _targetRefinedStride = 8;
+            refinedStride = 8;
         } else if (surfaceCount >= 100) {
             defaultStride = 8;
-            _targetRefinedStride = 4;
+            refinedStride = 4;
         } else if (surfaceCount >= 30) {
             defaultStride = 4;
-            _targetRefinedStride = 4;
+            refinedStride = 4;
         } else {
             defaultStride = 4;
-            _targetRefinedStride = 4;
+            refinedStride = 4;
         }
-        setSurfacePatchSamplingStride(defaultStride, false);
+
+        // Choose the coarse auto stride once per surface-count tier, then
+        // allow the completed async build to refine to refinedStride. Without
+        // this guard, every later prime resets the stride to defaultStride and
+        // handleSurfacePatchIndexPrimeFinished() immediately refines again,
+        // causing an endless rebuild loop.
+        const bool autoTierChanged =
+            !_surfacePatchAutoStrideInitialized ||
+            _surfacePatchAutoDefaultStride != defaultStride;
+        if (autoTierChanged) {
+            _surfacePatchAutoStrideInitialized = true;
+            _surfacePatchAutoDefaultStride = defaultStride;
+            setSurfacePatchSamplingStride(defaultStride, false);
+            if (defaultStride > refinedStride) {
+                _targetRefinedStride = refinedStride;
+            }
+        } else if (_surfacePatchSamplingStride == defaultStride &&
+                   defaultStride > refinedStride) {
+            _targetRefinedStride = refinedStride;
+        }
     }
 
     // Clear rebuild flag since we're about to do an async build

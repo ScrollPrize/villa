@@ -143,9 +143,12 @@ WrapTracker::WrapTracker(const core::util::Umbilicus& umbilicus, int rows, int c
     , _radial_slope_sample_counts(cols, 0)
     , _row_dirty(rows, 0)
     , _center_cache(umbilicus.volume_shape()[0])
-    , _center_cache_valid(umbilicus.volume_shape()[0], false)
+    , _center_cache_valid(umbilicus.volume_shape()[0])
 {
     // Cells are default-initialized by vector constructor
+    for (auto& valid : _center_cache_valid) {
+        valid.store(0, std::memory_order_relaxed);
+    }
 }
 
 cv::Vec3f WrapTracker::cached_center_at(int z_index) const {
@@ -153,9 +156,12 @@ cv::Vec3f WrapTracker::cached_center_at(int z_index) const {
         // Fallback for out-of-bounds (shouldn't happen with proper clipping)
         return _umbilicus.center_at(std::clamp(z_index, 0, static_cast<int>(_center_cache.size()) - 1));
     }
-    if (!_center_cache_valid[z_index]) {
-        _center_cache[z_index] = _umbilicus.center_at(z_index);
-        _center_cache_valid[z_index] = true;
+    if (!_center_cache_valid[z_index].load(std::memory_order_acquire)) {
+        std::lock_guard<std::mutex> lock(_center_cache_mutex);
+        if (!_center_cache_valid[z_index].load(std::memory_order_relaxed)) {
+            _center_cache[z_index] = _umbilicus.center_at(z_index);
+            _center_cache_valid[z_index].store(1, std::memory_order_release);
+        }
     }
     return _center_cache[z_index];
 }
@@ -211,7 +217,7 @@ void WrapTracker::set_cell(const cv::Vec2i& p, const cv::Vec3d& coord) {
     const double z_theta = clipped ? static_cast<double>(z_index) : z_value;
 
     SpiralCellState& cell = _cells[p[0] * _cols + p[1]];
-    cv::Vec3f center = _umbilicus.center_at(z_index);
+    cv::Vec3f center = cached_center_at(z_index);
     double dx = coord[0] - center[0];
     double dy = coord[1] - center[1];
 
@@ -861,6 +867,9 @@ bool UmbilicusEstimator::estimate_center(int row, cv::Vec2d* center_out, double*
     // Gather samples from this row and neighbors for more robust estimation
     const std::vector<Sample> samples = gather_samples_for_row(row);
     if (samples.empty()) {
+        return false;
+    }
+    if (static_cast<int>(samples.size()) <= _last_attempted_sample_count[row]) {
         return false;
     }
 

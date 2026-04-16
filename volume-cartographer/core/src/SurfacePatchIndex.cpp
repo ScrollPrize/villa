@@ -571,22 +571,24 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     impl_->patchCount = 0;
 
     // Eagerly load any surfaces whose TIFF data hasn't been loaded yet.
-    // This is safe because rebuild() typically runs on a background thread.
-    std::vector<SurfacePtr> loaded;
-    loaded.reserve(surfaces.size());
-    for (const auto& s : surfaces) {
+    std::vector<uint8_t> loadedFlags(surfaces.size(), 0);
+#pragma omp parallel for schedule(dynamic, 1)
+    for (size_t i = 0; i < surfaces.size(); ++i) {
+        const auto& s = surfaces[i];
         if (!s) {
             continue;
         }
         if (!s->isLoaded()) {
-            std::cout << "[SurfacePatchIndex] Loading surface: " << s->id << std::endl;
             s->rawPointsPtr();  // triggers ensureLoaded()
         }
-        if (s->isLoaded()) {
-            loaded.push_back(s);
-            std::cout << "[SurfacePatchIndex] Indexed surface: " << s->id << std::endl;
-        } else {
-            std::cout << "[SurfacePatchIndex] Failed to load surface: " << s->id << std::endl;
+        loadedFlags[i] = s->isLoaded() ? 1 : 0;
+    }
+
+    std::vector<SurfacePtr> loaded;
+    loaded.reserve(surfaces.size());
+    for (size_t i = 0; i < surfaces.size(); ++i) {
+        if (loadedFlags[i]) {
+            loaded.push_back(surfaces[i]);
         }
     }
     const size_t surfaceCount = loaded.size();

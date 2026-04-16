@@ -33,6 +33,7 @@
 #include <array>
 #include <iomanip>
 #include <cctype>
+#include <cstdint>
 #include <fstream>
 #include <iostream>
 #include <shared_mutex>
@@ -275,6 +276,44 @@ static float pointTo_seeded_neighbor(QuadSurface* surf,
     if (ptr_out)
         *ptr_out = ptr;
     return res;
+}
+
+static bool indexed_overlap_probe(QuadSurface& a, QuadSurface& b, SurfacePatchIndex* surface_patch_index, int max_iters)
+{
+    if (!intersect(a.bbox(), b.bbox()))
+        return false;
+
+    cv::Mat_<cv::Vec3f> points = a.rawPoints();
+    if (points.cols <= 0 || points.rows <= 0)
+        return false;
+
+    const int probes = std::max(10, max_iters / 10);
+    uint64_t seed = 1469598103934665603ULL;
+    auto mix = [&](const std::string& s) {
+        for (unsigned char ch : s) {
+            seed ^= ch;
+            seed *= 1099511628211ULL;
+        }
+    };
+    mix(a.id);
+    mix(b.id);
+    std::mt19937 rng(static_cast<uint32_t>(seed ^ (seed >> 32)));
+    std::uniform_int_distribution<int> rx(0, points.cols - 1);
+    std::uniform_int_distribution<int> ry(0, points.rows - 1);
+
+    for (int r = 0; r < probes; ++r) {
+        const int x = rx(rng);
+        const int y = ry(rng);
+        cv::Vec3f loc = points(y, x);
+        if (loc[0] == -1)
+            continue;
+
+        cv::Vec3f ptr(0, 0, 0);
+        if (b.pointTo(ptr, loc, 2.0f, max_iters, surface_patch_index) <= 2.0f)
+            return true;
+    }
+
+    return false;
 }
 
 static void copy(const SurfTrackerData &src, SurfTrackerData &tgt, const cv::Rect &roi_)
@@ -987,6 +1026,13 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     int fringe_full_rebuild_interval = params.value("fringe_full_rebuild_interval", 0);
     bool fringe_full_boundary = params.value("fringe_full_boundary", false);
     bool resume_mode = params.value("resume", false);
+    int resume_max_local_surfs = params.value("resume_max_local_surfs", 12);
+    if (resume_max_local_surfs < 0)
+        resume_max_local_surfs = 0;
+    int min_test_surface_neighbor_count =
+        params.value("min_test_surface_neighbor_count", resume_mode ? 2 : 1);
+    if (min_test_surface_neighbor_count < 1)
+        min_test_surface_neighbor_count = 1;
     if (force_retry_min_neighbors < 1)
         force_retry_min_neighbors = 0;
     if (force_retry_max < 1)
@@ -1114,6 +1160,8 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     std::cout << "  fringe_invalidate_interval: " << fringe_invalidate_interval << std::endl;
     std::cout << "  fringe_full_rebuild_interval: " << fringe_full_rebuild_interval << std::endl;
     std::cout << "  max_local_surfs: " << max_local_surfs << std::endl;
+    std::cout << "  resume_max_local_surfs: " << resume_max_local_surfs << std::endl;
+    std::cout << "  min_test_surface_neighbor_count: " << min_test_surface_neighbor_count << std::endl;
     std::cout << "  seed_pointto_from_neighbors: " << (seed_pointto_from_neighbors ? 1 : 0) << std::endl;
     std::cout << "  remap_use_inpaint: " << (remap_use_inpaint ? "true" : "false") << std::endl;
     if (enforce_z_range)
@@ -1134,29 +1182,68 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             if (surfs.contains(name))
                 overlapping_map[sm].insert(surfs[name]);
 
+    const bool need_resume_overlap_index = resume_mode && seed->overlappingIds().empty();
     SurfacePatchIndex patch_index;
     SurfacePatchIndex* patch_index_ptr = nullptr;
-    if (use_surface_patch_index) {
+    if (use_surface_patch_index || need_resume_overlap_index) {
         std::vector<SurfacePatchIndex::SurfacePtr> patch_surfaces;
-        patch_surfaces.reserve(surfs.size());
-        for (const auto& it : surfs)
-            patch_surfaces.emplace_back(SurfacePatchIndex::SurfacePtr(it.second, [](QuadSurface*) {}));
+        if (need_resume_overlap_index) {
+            patch_surfaces.reserve(surfs_v.size());
+            for (auto* sm : surfs_v) {
+                if (sm)
+                    patch_surfaces.emplace_back(SurfacePatchIndex::SurfacePtr(sm, [](QuadSurface*) {}));
+            }
+        } else {
+            patch_surfaces.reserve(surfs.size());
+            for (const auto& it : surfs)
+                patch_surfaces.emplace_back(SurfacePatchIndex::SurfacePtr(it.second, [](QuadSurface*) {}));
+        }
         patch_index.setSamplingStride(surface_patch_stride);
         patch_index.rebuild(patch_surfaces, surface_patch_bbox_pad);
         patch_index_ptr = &patch_index;
-        std::cout << "SurfacePatchIndex built for " << patch_surfaces.size() << " surfaces" << std::endl;
+        std::cout << "SurfacePatchIndex built for " << patch_surfaces.size() << " surfaces"
+                  << (need_resume_overlap_index ? " (resume overlap discovery)" : "") << std::endl;
     }
 
     // In resume mode, seed may not have overlapping.json - compute overlaps dynamically
     if (resume_mode && seed->overlappingIds().empty()) {
-        std::cout << "Computing overlaps for resumed seed surface..." << std::endl;
-        for (auto& sm : surfs_v) {
-            if (sm == seed) continue;
-            // Use patch_index_ptr for acceleration if available
-            if (overlap(*seed, *sm, 1000) || overlap(*sm, *seed, 1000)) {
-                overlapping_map[seed].insert(sm);
+        std::cout << "Computing overlaps for resumed seed surface using indexed parallel checks..." << std::endl;
+        std::vector<QuadSurface*> overlap_hits;
+        overlap_hits.reserve(surfs_v.size());
+        std::atomic<int> checked{0};
+        const int total = static_cast<int>(surfs_v.size());
+        auto overlap_start_time = std::chrono::steady_clock::now();
+
+#pragma omp parallel
+        {
+            std::vector<QuadSurface*> local_hits;
+#pragma omp for schedule(dynamic)
+            for (int idx = 0; idx < static_cast<int>(surfs_v.size()); ++idx) {
+                QuadSurface* sm = surfs_v[idx];
+                if (!sm || sm == seed)
+                    continue;
+
+                if (indexed_overlap_probe(*seed, *sm, patch_index_ptr, 150) ||
+                    indexed_overlap_probe(*sm, *seed, patch_index_ptr, 150)) {
+                    local_hits.push_back(sm);
+                }
+
+                const int done = checked.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (done == total || done % 25 == 0) {
+#pragma omp critical
+                    {
+                        const double elapsed = std::chrono::duration<double>(
+                            std::chrono::steady_clock::now() - overlap_start_time).count();
+                        const double rate = elapsed > 0.0 ? static_cast<double>(done) / elapsed : 0.0;
+                        printf("  resume overlap checks: %d/%d (%.1f/s)\n", done, total, rate);
+                    }
+                }
             }
+#pragma omp critical
+            overlap_hits.insert(overlap_hits.end(), local_hits.begin(), local_hits.end());
         }
+        for (auto* sm : overlap_hits)
+            overlapping_map[seed].insert(sm);
         std::cout << "Found " << overlapping_map[seed].size() << " overlapping surfaces for seed" << std::endl;
     } else {
         // Add seed's existing overlapping IDs if available
@@ -2194,6 +2281,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
 
     bool skip_inpaint_next_opt = skip_inpaint;
     for(int generation=0;generation<stop_gen;generation++) {
+        bool wrap_stats_refreshed_this_generation = false;
         const bool use_wrap_batch_refresh = (wrap_tracker && wrap_batch_refresh);
         bool fringe_rebuilt = false;
         bool misconnect_pruned = prune_misconnects(generation, use_wrap_batch_refresh);
@@ -2387,11 +2475,14 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                             local_surfs.insert(s);
                             local_counts[s] += 1;
                         }
-                    }
+            }
 
             std::vector<QuadSurface*> local_surfs_vec(local_surfs.begin(), local_surfs.end());
-            if (max_local_surfs > 0 &&
-                local_surfs_vec.size() > static_cast<size_t>(max_local_surfs)) {
+            int effective_max_local_surfs = max_local_surfs;
+            if (resume_prefilled && effective_max_local_surfs == 0)
+                effective_max_local_surfs = resume_max_local_surfs;
+            if (effective_max_local_surfs > 0 &&
+                local_surfs_vec.size() > static_cast<size_t>(effective_max_local_surfs)) {
                 // Prefer frequently-seen local surfaces when trimming.
                 std::sort(local_surfs_vec.begin(), local_surfs_vec.end(),
                           [&](QuadSurface* a, QuadSurface* b) {
@@ -2403,11 +2494,18 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                                   return a_count > b_count;
                               return a->id < b->id;
                           });
-                local_surfs_vec.resize(max_local_surfs);
+                local_surfs_vec.resize(effective_max_local_surfs);
             }
 
             SurfPtrSet local_surfs_filtered(local_surfs_vec.begin(), local_surfs_vec.end());
-            std::vector<QuadSurface*> test_surfs = local_surfs_vec;
+            std::vector<QuadSurface*> test_surfs;
+            test_surfs.reserve(local_surfs_vec.size());
+            for (auto* s : local_surfs_vec) {
+                const auto count_it = local_counts.find(s);
+                const int count = (count_it == local_counts.end()) ? 0 : count_it->second;
+                if (s == seed || count >= min_test_surface_neighbor_count)
+                    test_surfs.push_back(s);
+            }
 
             std::vector<QuadSurface*> ref_surfs = local_surfs_vec;
             std::sort(ref_surfs.begin(), ref_surfs.end(),
@@ -2545,7 +2643,30 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                     best_ref_seed = false;
                 } else if (used_area.width >=4 && used_area.height >= 4) {
                     cv::Vec2f tmp_loc_;
-                    cv::Rect used_th = used_area;
+                    const double cell_spacing = std::max(1e-9, static_cast<double>(step) * static_cast<double>(src_step));
+                    const int duplicate_radius_cells =
+                        std::max(2, static_cast<int>(std::ceil(static_cast<double>(duplicate_surface_th) / cell_spacing)) + 2);
+                    cv::Rect used_th(p[1] - duplicate_radius_cells,
+                                     p[0] - duplicate_radius_cells,
+                                     duplicate_radius_cells * 2 + 1,
+                                     duplicate_radius_cells * 2 + 1);
+                    used_th &= used_area;
+                    used_th &= cv::Rect(0, 0, points.cols, points.rows);
+                    const cv::Rect duplicate_bounds = used_area & cv::Rect(0, 0, points.cols, points.rows);
+                    if (used_th.width < 4 && duplicate_bounds.width >= 4) {
+                        const int grow = 4 - used_th.width;
+                        const int left = std::min(grow, used_th.x - duplicate_bounds.x);
+                        used_th.x -= left;
+                        used_th.width += left;
+                        used_th.width += std::min(grow - left, duplicate_bounds.br().x - used_th.br().x);
+                    }
+                    if (used_th.height < 4 && duplicate_bounds.height >= 4) {
+                        const int grow = 4 - used_th.height;
+                        const int top = std::min(grow, used_th.y - duplicate_bounds.y);
+                        used_th.y -= top;
+                        used_th.height += top;
+                        used_th.height += std::min(grow - top, duplicate_bounds.br().y - used_th.br().y);
+                    }
                     float dist = pointTo(tmp_loc_, points(used_th), best_coord, duplicate_surface_th, 1000, 1.0/(step*src_step));
                     tmp_loc_ += cv::Vec2f(used_th.x,used_th.y);
                     if (dist <= duplicate_surface_th) {
@@ -2852,6 +2973,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                     new_tracker->unwrap_row(row, state);
                 }
                 new_tracker->compute_statistics(state);
+                wrap_stats_refreshed_this_generation = true;
                 std::cout << "[WrapTracker] Rebuilt after mirror (repopulated "
                           << repopulated << " cells)" << std::endl;
                 wrap_tracker = std::move(new_tracker);
@@ -2906,7 +3028,14 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
         if (!global_steps_per_window)
             update_mapping = false;
 
-        if (generation % 250 == 0 || update_mapping /*|| generation < 10*/) {
+        bool save_generation_debug = (generation % 250 == 0 || update_mapping /*|| generation < 10*/);
+        if (resume_prefilled && generation == 0 && !update_mapping &&
+            !params.value("save_resume_gen0_debug", false)) {
+            save_generation_debug = false;
+            std::cout << "resume: skipping generation 0 HR debug surface save" << std::endl;
+        }
+
+        if (save_generation_debug) {
             {
                 cv::Mat_<cv::Vec3f> points_hr =
                     surftrack_genpoints_hr(data, state, points, used_area, step, src_step,
@@ -3000,6 +3129,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                         new_tracker->correct_wrap_from_neighbors(row, state);
                     }
                     new_tracker->compute_statistics(state);
+                    wrap_stats_refreshed_this_generation = true;
                     std::cout << "[WrapTracker] Rebuilt after mapping update (repopulated "
                               << repopulated << " cells)" << std::endl;
                     wrap_tracker = std::move(new_tracker);
@@ -3035,16 +3165,19 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
 
         // Update wrap tracking statistics periodically
         if (wrap_tracker && generation > 0 && generation % wrap_stats_update_interval == 0) {
-            std::cout << "[WrapTracker] Updating stats at gen " << generation << std::endl;
-            // Unwrap all rows with valid cells
-            for (int row = 0; row < h; ++row) {
-                wrap_tracker->unwrap_row(row, state);
+            if (!wrap_stats_refreshed_this_generation) {
+                std::cout << "[WrapTracker] Updating stats at gen " << generation << std::endl;
+                // Unwrap all rows with valid cells
+                for (int row = 0; row < h; ++row) {
+                    wrap_tracker->unwrap_row(row, state);
+                }
+                // Correct wrap errors using row-to-row consistency
+                for (int row = 0; row < h; ++row) {
+                    wrap_tracker->correct_wrap_from_neighbors(row, state);
+                }
+                wrap_tracker->compute_statistics(state);
+                wrap_stats_refreshed_this_generation = true;
             }
-            // Correct wrap errors using row-to-row consistency
-            for (int row = 0; row < h; ++row) {
-                wrap_tracker->correct_wrap_from_neighbors(row, state);
-            }
-            wrap_tracker->compute_statistics(state);
             if (wrap_debug_tif_interval > 0 && generation % wrap_debug_tif_interval == 0) {
                 try {
                     write_wrap_debug_tifs(state, used_area, generation, tgt_dir, wrap_tracker.get());

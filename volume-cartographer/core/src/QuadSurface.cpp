@@ -27,6 +27,7 @@
 #define _GNU_SOURCE
 #endif
 #include <fcntl.h>
+#include <stdio.h>
 #include <unistd.h>
 
 // Use libtiff for BigTIFF
@@ -210,8 +211,6 @@ void QuadSurface::ensureLoaded()
     _scale = loaded->_scale;
     _center = loaded->_center;
     _channels = std::move(loaded->_channels);
-
-    trimToValidBbox();
 
     // Keep existing bbox and meta if already set, otherwise take from loaded
     if (_bbox.low[0] == 0 && _bbox.high[0] == 0) {
@@ -400,6 +399,9 @@ bool QuadSurface::trimToValidBbox()
     const int bbW = c1 - c0 + 1;
     // Skip only if nothing to trim (bbox already matches grid exactly).
     if (bbH == rows && bbW == cols) return false;
+    const std::size_t origBytes = std::size_t(rows) * cols * sizeof(cv::Vec3f);
+    const std::size_t trimBytes = std::size_t(bbH) * bbW * sizeof(cv::Vec3f);
+    const double pctSaved = 1.0 - double(trimBytes) / double(origBytes);
     auto trimmed = std::make_unique<cv::Mat_<cv::Vec3f>>(
         (*_points)(cv::Rect(c0, r0, bbW, bbH)).clone());
     _points = std::move(trimmed);
@@ -412,6 +414,11 @@ bool QuadSurface::trimToValidBbox()
     _validMaskCache = cv::Mat_<uint8_t>();
     _validMaskAllValid = false;
     _normalCache = cv::Mat_<cv::Vec3f>();
+    std::fprintf(stderr,
+        "[SURF] trim %s %dx%d -> %dx%d  saved %zu MB (%.1f%%)\n",
+        id.c_str(), cols, rows, bbW, bbH,
+        (origBytes - trimBytes) / (1024 * 1024),
+        pctSaved * 100.0);
     return true;
 }
 
@@ -420,12 +427,18 @@ void QuadSurface::unloadPoints()
     if (path.empty()) return;  // No disk backing — can't reload.
     std::lock_guard<std::mutex> lock(_loadMutex);
     if (_needsLoad) return;    // Already unloaded.
+    std::size_t mb = 0;
+    if (_points) {
+        mb = static_cast<std::size_t>(_points->rows) * _points->cols
+             * sizeof(cv::Vec3f) / (1024 * 1024);
+    }
     _points.reset();
     _channels.clear();
     _validMaskCache = cv::Mat_<uint8_t>();
     _validMaskAllValid = false;
     _normalCache = cv::Mat_<cv::Vec3f>();
     _needsLoad = true;
+    std::fprintf(stderr, "[SURF] unload %s (%zu MB freed)\n", id.c_str(), mb);
 }
 
 void QuadSurface::unloadCaches()
@@ -1003,10 +1016,6 @@ void QuadSurface::invalidateMask()
 
 void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel)
 {
-    // Trim padding before serializing so the on-disk grid matches the in-RAM
-    // one. No-op if already trimmed or saving would save <25%.
-    trimToValidBbox();
-
     // Split the points matrix into x, y, z channels
     std::vector<cv::Mat> xyz;
     cv::split((*_points), xyz);

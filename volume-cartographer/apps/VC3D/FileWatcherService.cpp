@@ -19,6 +19,16 @@
 #include <QSignalBlocker>
 #include <QTreeWidgetItemIterator>
 
+namespace
+{
+bool isFileWatchingEnabled()
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    return settings.value(vc3d::settings::perf::ENABLE_FILE_WATCHING,
+                          vc3d::settings::perf::ENABLE_FILE_WATCHING_DEFAULT).toBool();
+}
+}
+
 FileWatcherService::FileWatcherService(CState* state, QObject* parent)
     : QObject(parent)
     , _state(state)
@@ -38,15 +48,13 @@ void FileWatcherService::startWatching()
         return;
     }
 
-    // Check if file watching is enabled in settings
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    if (!settings.value(vc3d::settings::perf::ENABLE_FILE_WATCHING, vc3d::settings::perf::ENABLE_FILE_WATCHING_DEFAULT).toBool()) {
+    // Stop any existing watches before honoring the current setting.
+    stopWatching();
+
+    if (!isFileWatchingEnabled()) {
         Logger()->info("File watching is disabled in settings");
         return;
     }
-
-    // Stop any existing watches
-    stopWatching();
 
     // Initialize inotify
     _inotifyFd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
@@ -125,10 +133,32 @@ void FileWatcherService::stopWatching()
     _pendingMoves.clear();
     _pendingVolumeAddAttempts.clear();
     _pendingVolumeAddRetries.clear();
+    _pendingEvents.clear();
+    _pendingSegmentUpdates.clear();
+}
+
+void FileWatcherService::applySettings()
+{
+    if (isFileWatchingEnabled()) {
+        if (_inotifyFd < 0) {
+            startWatching();
+        }
+        return;
+    }
+
+    if (_inotifyFd >= 0) {
+        Logger()->info("Stopping file watching because it is disabled in settings");
+    }
+    stopWatching();
 }
 
 void FileWatcherService::onInotifyEvent()
 {
+    if (!isFileWatchingEnabled()) {
+        applySettings();
+        return;
+    }
+
     char buffer[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
     ssize_t length = read(_inotifyFd, buffer, sizeof(buffer));
 
@@ -878,6 +908,7 @@ FileWatcherService::FileWatcherService(CState* state, QObject* parent)
 FileWatcherService::~FileWatcherService() = default;
 void FileWatcherService::startWatching() {}
 void FileWatcherService::stopWatching() {}
+void FileWatcherService::applySettings() {}
 void FileWatcherService::markSegmentRecentlyEdited(const std::string&) {}
 
 #endif // __linux__

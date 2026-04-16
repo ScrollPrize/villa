@@ -9,6 +9,7 @@
 #include "adaptive/CAdaptiveVolumeViewer.hpp"
 #include "CVolumeViewerView.hpp"
 #include "CommandLineToolRunner.hpp"
+#include "FileWatcherService.hpp"
 #include "SettingsDialog.hpp"
 #include "S3BrowserDialog.hpp"
 #include "segmentation/SegmentationModule.hpp"
@@ -1710,6 +1711,10 @@ void MenuActionController::showSettingsDialog()
 
     auto* dialog = new SettingsDialog(_window);
     dialog->exec();
+
+    if (_window->_fileWatcher) {
+        _window->_fileWatcher->applySettings();
+    }
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     bool showDirHints = settings.value(vc3d::settings::viewer::SHOW_DIRECTION_HINTS,

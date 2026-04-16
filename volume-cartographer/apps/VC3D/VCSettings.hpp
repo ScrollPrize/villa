@@ -182,7 +182,7 @@ namespace perf {
     constexpr int PARALLEL_PROCESSES_DEFAULT = 8;
     constexpr int ITERATION_COUNT_DEFAULT = 1000;
     constexpr int DOWNSCALE_OVERRIDE_DEFAULT = 0;
-    constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
+    constexpr bool ENABLE_FILE_WATCHING_DEFAULT = false;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
 
     // IO thread count is not configurable — it tracks
