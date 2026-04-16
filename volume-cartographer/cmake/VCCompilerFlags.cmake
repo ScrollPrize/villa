@@ -53,11 +53,15 @@ elseif(CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${VC_LTO_FLAGS} ${VC_LINKER_FLAGS} ${VC_THINLTO_CACHE_FLAGS} -Wl,--compress-debug-sections=zlib")
     endif()
 elseif(CMAKE_BUILD_TYPE STREQUAL "MinSizeRel")
+    # -fno-omit-frame-pointer: keep frame pointers so `perf record --call-graph fp`
+    # can unwind call stacks cheaply (DWARF unwinding is slow and often fails to
+    # resolve symbols in heavily-templated code, leaving samples attributed to
+    # the wrong function).
     if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Oz -g1 ${VC_SIZE_FLAGS}")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Oz -g1 -fno-omit-frame-pointer ${VC_SIZE_FLAGS}")
         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${VC_LINKER_FLAGS} ${VC_SIZE_LINKER_FLAGS}")
     else()
-        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Os -g1")
+        set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Os -g1 -fno-omit-frame-pointer")
         set(CMAKE_EXE_LINKER_FLAGS "${CMAKE_EXE_LINKER_FLAGS} ${VC_LINKER_FLAGS}")
     endif()
 endif()

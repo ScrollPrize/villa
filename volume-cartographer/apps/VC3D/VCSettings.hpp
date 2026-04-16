@@ -139,9 +139,6 @@ namespace viewer {
     // Recent remote volume URLs
     constexpr auto REMOTE_RECENT_URLS = "viewer/remote_recent_urls";
 
-    // Local cache directory for network-mounted volpkgs
-    constexpr auto NETWORK_CACHE_DIR = "viewer/network_cache_dir";
-
     // Audio/UX
     constexpr auto PLAY_SOUND_AFTER_SEG_RUN = "viewer/play_sound_after_seg_run";
     constexpr auto USERNAME = "viewer/username";

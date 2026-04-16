@@ -4410,39 +4410,8 @@ void CWindow::OpenVolume(const QString& path)
                                label, mountInfo.cacheDir);
             } else {
                 statusBar()->showMessage(
-                    tr("Detected %1 mount \u2014 local disk cache enabled automatically")
-                        .arg(QString::fromStdString(label)), 8000);
-                Logger()->info("Detected network filesystem ({}); auto disk cache enabled",
-                               label);
-            }
-
-            // Offer custom cache directory override (skip if s3fs already caching)
-            if (mountInfo.cacheDir.empty()) {
-                auto reply = QMessageBox::question(
-                    this, tr("Network Volume Detected"),
-                    tr("This volume package is on a network filesystem (%1).\n\n"
-                       "Local disk caching is enabled automatically (%2/network_cache/).\n"
-                       "Would you like to choose a custom cache directory instead?")
-                        .arg(QString::fromStdString(label), vc3d::defaultCacheBase()),
-                    QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
-
-                if (reply == QMessageBox::Yes) {
-                    using namespace vc3d::settings;
-                    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                    QString lastDir = settings.value(viewer::NETWORK_CACHE_DIR).toString();
-                    if (lastDir.isEmpty()) {
-                        lastDir = vc3d::defaultCacheBase() + "/network_cache";
-                    }
-
-                    QString cacheDir = QFileDialog::getExistingDirectory(
-                        this, tr("Select Local Cache Directory"), lastDir);
-
-                    if (!cacheDir.isEmpty()) {
-                        settings.setValue(viewer::NETWORK_CACHE_DIR, cacheDir);
-                        Logger()->info("Network cache custom dir: {} (fs: {})",
-                                       cacheDir.toStdString(), label);
-                    }
-                }
+                    tr("Detected %1 mount").arg(QString::fromStdString(label)), 8000);
+                Logger()->info("Detected network filesystem ({})", label);
             }
         }
     }

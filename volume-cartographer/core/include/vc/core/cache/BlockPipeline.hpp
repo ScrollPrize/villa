@@ -128,7 +128,8 @@ public:
         size_t ioPending = 0;             // download + encode + load
         size_t downloadPending = 0;        // s3 → staged ChunkData queue
         size_t encodePending = 0;          // staged ChunkData → h265 disk queue
-        size_t loadPending = 0;            // disk → ram queue
+        size_t loadPending = 0;            // disk → staged bytes queue
+        size_t decodePending = 0;          // staged bytes → decoded + block cache
         uint64_t shardHits = 0;            // loader found shard in RAM cache
         uint64_t shardMisses = 0;          // loader had to read shard from disk
         size_t shardCacheBytes = 0;        // current shard cache occupancy
@@ -148,25 +149,32 @@ private:
     std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels_;
     std::unique_ptr<VolumeSource> source_;
     DecompressFn decompress_;
-    // Three fully independent pools — each specialised for one stage so no
+    // Four fully independent pools — each specialised for one stage so no
     // stage can starve another.
     //   downloaderPool_ : s3 fetch + source decode + re-chunk → staged
     //     ChunkData. Network-bound. Never touches disk or block cache.
     //   encodePool_     : take staged ChunkData → h265 encode → disk.
     //     CPU-bound. Never touches the network or block cache.
-    //   loaderPool_     : disk read → h265 decode → insert block cache.
-    //     Mixed disk/CPU. Never touches the network.
+    //   loaderPool_     : disk read (or shard-cache memcpy) → staged
+    //     compressed bytes. I/O-bound. Never decodes.
+    //   decodePool_     : take staged compressed bytes → h265 decode →
+    //     insert blocks, fire chunk-ready callbacks. Pure CPU.
     // Submission in fetchInteractive triages on the disk shard index:
-    // present → loaderPool_ directly; absent → downloaderPool_, whose
-    // completion forwards to encodePool_, whose completion forwards to
-    // loaderPool_.
+    // present → loaderPool_, whose completion forwards to decodePool_;
+    // absent → downloaderPool_, whose completion forwards to encodePool_,
+    // whose completion forwards to loaderPool_.
     IOPool downloaderPool_;
     IOPool encodePool_;
     IOPool loaderPool_;
+    IOPool decodePool_;
     // Hand-off buffer between downloader and encoder. Download inserts
     // (key → decoded ChunkData) after assembling, encoder takes it out.
     mutable std::mutex encodeStagingMutex_;
     std::unordered_map<ChunkKey, ChunkDataPtr, ChunkKeyHash> encodeStaging_;
+    // Hand-off buffer between loader and decoder. Loader inserts
+    // (key → compressed inner-chunk bytes); decoder pops and decodes.
+    mutable std::mutex decodeStagingMutex_;
+    std::unordered_map<ChunkKey, std::vector<uint8_t>, ChunkKeyHash> decodeStaging_;
 
     // Shard-level LRU cache of compressed canonical h265 shard files.
     // Populated on loader misses. Bytes-budgeted; when exceeded the

@@ -12,6 +12,7 @@
 #include "vc/core/types/SampleParams.hpp"
 #include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/cache/ChunkKey.hpp"
+#include <cstring>
 #include <unordered_set>
 
 #include <opencv2/imgproc.hpp>
@@ -243,6 +244,9 @@ void CAdaptiveVolumeViewer::onSurfaceChanged(const std::string& name,
 {
     if (_surfName != name) return;
     _surfWeak = surf;
+    // Any surface change (swap or in-place edit) invalidates the cached
+    // gen() output — geometry may have shifted.
+    _genCacheDirty = true;
 
     if (!surf) {
         _scene->clear();
@@ -484,8 +488,6 @@ void CAdaptiveVolumeViewer::submitRender()
             &lightP,  // sampler uses lightP for volumetric and lighting paths
             lvlOutPtr, lvlOutStride);
     } else {
-        cv::Mat_<cv::Vec3f> coords;
-        cv::Mat_<cv::Vec3f> normals;
         // surf->gen treats offset as the TOP-LEFT of the rendered region in
         // scaled surface units, but camera.surfacePtr is the CENTRE of the
         // view (matching sceneToSurface). Shift by half the viewport so the
@@ -495,9 +497,29 @@ void CAdaptiveVolumeViewer::submitRender()
                          _camera.surfacePtr[1] * _camera.scale - float(fbH) * 0.5f,
                          _camera.zOff);
         const bool wantComposite = _compositeSettings.enabled;
-        surf->gen(&coords, wantComposite ? &normals : nullptr,
-                  cv::Size(fbW, fbH), cv::Vec3f(0, 0, 0),
-                  _camera.scale, offset);
+        const bool cacheHit =
+            !_genCacheDirty
+            && _genCacheSurfKey == surf.get()
+            && _genCacheFbW == fbW
+            && _genCacheFbH == fbH
+            && _genCacheScale == _camera.scale
+            && _genCacheOffset == offset
+            && _genCacheWantComposite == wantComposite
+            && !_genCoords.empty();
+        if (!cacheHit) {
+            surf->gen(&_genCoords, wantComposite ? &_genNormals : nullptr,
+                      cv::Size(fbW, fbH), cv::Vec3f(0, 0, 0),
+                      _camera.scale, offset);
+            _genCacheSurfKey = surf.get();
+            _genCacheFbW = fbW;
+            _genCacheFbH = fbH;
+            _genCacheScale = _camera.scale;
+            _genCacheOffset = offset;
+            _genCacheWantComposite = wantComposite;
+            _genCacheDirty = false;
+        }
+        cv::Mat_<cv::Vec3f>& coords = _genCoords;
+        cv::Mat_<cv::Vec3f>& normals = _genNormals;
 
         if (!coords.empty()) {
             int numLayers = 1, zStart = 0;
@@ -1116,8 +1138,8 @@ void CAdaptiveVolumeViewer::renderIntersections()
     fp.roiY = planeRoi.y;
     fp.roiW = planeRoi.width;
     fp.roiH = planeRoi.height;
-    fp.opacity = _intersectionOpacity;
-    fp.thickness = _intersectionThickness;
+    fp.opacityQ = int(std::lround(_intersectionOpacity * 1000.0f));
+    fp.thicknessQ = int(std::lround(_intersectionThickness * 1000.0f));
     fp.patchCount = patchIndex->patchCount();
     fp.surfaceCount = patchIndex->surfaceCount();
     size_t th = 0;
@@ -1140,8 +1162,22 @@ void CAdaptiveVolumeViewer::renderIntersections()
     // Group path segments by color for batched drawing.
     std::unordered_map<QRgb, QPainterPath> groupedPaths;
     std::unordered_map<QRgb, QColor> groupedColors;
-    auto isFinitePoint = [](const QPointF& p) {
-        return std::isfinite(p.x()) && std::isfinite(p.y());
+    // Bitwise finite check: matches repo convention (see feedback_ffast_math).
+    // Finite iff exponent bits are not all 1s.
+    auto isFiniteScalar = [](double v) {
+        uint64_t bits;
+        std::memcpy(&bits, &v, sizeof(bits));
+        return (bits & 0x7FF0000000000000ULL) != 0x7FF0000000000000ULL;
+    };
+    auto isFinitePoint = [&](const QPointF& p) {
+        return isFiniteScalar(p.x()) && isFiniteScalar(p.y());
+    };
+    // volumeToScene() locks _surfWeak and dynamic_casts on every call. We
+    // already have `plane` cached from the top of this function, so inline
+    // the projection once per segment endpoint here.
+    auto planeToScene = [&](const cv::Vec3f& volPoint) {
+        cv::Vec3f proj = plane->project(volPoint, 1.0, 1.0);
+        return surfaceToScene(proj[0], proj[1]);
     };
 
     for (const auto& [target, segments] : intersections) {
@@ -1170,8 +1206,8 @@ void CAdaptiveVolumeViewer::renderIntersections()
         if (baseColor.alpha() <= 0) continue;
 
         for (const auto& seg : segments) {
-            QPointF a = volumeToScene(seg.world[0]);
-            QPointF b = volumeToScene(seg.world[1]);
+            QPointF a = planeToScene(seg.world[0]);
+            QPointF b = planeToScene(seg.world[1]);
             if (!isFinitePoint(a) || !isFinitePoint(b)) continue;
             QPainterPath& path = groupedPaths[baseColor.rgba()];
             path.moveTo(a);
@@ -1282,6 +1318,14 @@ void CAdaptiveVolumeViewer::updateStatusLabel()
 {
     if (!_lbl || !_volume) return;
 
+    // Throttle to ~10 Hz. Building the status string (arg/concat) and
+    // pulling cache stats locks several mutexes; doing it every frame at
+    // 60+ fps shows up in profiles. Interactive feedback is unchanged at
+    // human timescales.
+    auto now = std::chrono::steady_clock::now();
+    if (now - _lastStatusUpdate < std::chrono::milliseconds(100)) return;
+    _lastStatusUpdate = now;
+
     QString status = QString("%1x 1:%2 z=%3")
         .arg(static_cast<double>(_camera.scale), 0, 'f', 2)
         .arg(1 << _camera.dsScaleIdx)
@@ -1307,20 +1351,22 @@ void CAdaptiveVolumeViewer::updateStatusLabel()
             .arg(unit);
 
         if (s.sharded) {
-            status += QString(" | dl %1sh w %2sh dlq %3 enq %4 ldq %5 neg %6")
+            status += QString(" | dl %1sh w %2sh dlq %3 enq %4 ldq %5 dcq %6 neg %7")
                 .arg(s.iceFetches)
                 .arg(s.diskWrites)
                 .arg(s.downloadPending)
                 .arg(s.encodePending)
                 .arg(s.loadPending)
+                .arg(s.decodePending)
                 .arg(s.negativeCount);
         } else {
-            status += QString(" | dl %1 w %2 dlq %3 enq %4 ldq %5 neg %6")
+            status += QString(" | dl %1 w %2 dlq %3 enq %4 ldq %5 dcq %6 neg %7")
                 .arg(s.iceFetches)
                 .arg(s.diskWrites)
                 .arg(s.downloadPending)
                 .arg(s.encodePending)
                 .arg(s.loadPending)
+                .arg(s.decodePending)
                 .arg(s.negativeCount);
         }
     }

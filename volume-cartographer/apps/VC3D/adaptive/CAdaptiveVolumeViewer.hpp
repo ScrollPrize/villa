@@ -304,6 +304,7 @@ private:
     vc::Sampling _samplingMethod = vc::Sampling::Trilinear;
     bool _highlightDownscaled = false;
     QString _lastStatusText;
+    std::chrono::steady_clock::time_point _lastStatusUpdate{};
     std::chrono::steady_clock::time_point _lastStretchScan{};
     cv::Ptr<cv::CLAHE> _claheCache;
     int _claheCacheTile = -1;
@@ -312,6 +313,20 @@ private:
     std::array<uint32_t, 256> _deferredCmapLut{};
     std::string _deferredCmapId;
     bool _deferredCmapValid = false;
+
+    // Cache for surf->gen() output. QuadSurface's gen does cv::warpAffine
+    // + cv::remap under the hood (~13% of render time when it runs every
+    // frame). Most frames are identical camera state — we can reuse the
+    // coords/normals buffers when the cache key matches.
+    cv::Mat_<cv::Vec3f> _genCoords;
+    cv::Mat_<cv::Vec3f> _genNormals;
+    int _genCacheFbW = 0;
+    int _genCacheFbH = 0;
+    float _genCacheScale = 0.0f;
+    cv::Vec3f _genCacheOffset{0, 0, 0};
+    bool _genCacheWantComposite = false;
+    Surface* _genCacheSurfKey = nullptr;
+    bool _genCacheDirty = true;
 
 public:
     // Re-reads perf/interaction settings from disk into cached members.
@@ -347,8 +362,10 @@ private:
     // Intersection cache fingerprint: skip the whole rebuild if nothing changed.
     struct IntersectFingerprint {
         int roiX = 0, roiY = 0, roiW = 0, roiH = 0;
-        float opacity = -1.0f;
-        float thickness = -1.0f;
+        // Quantized to 0.001 to avoid spurious cache misses from
+        // sub-slider float jitter.
+        int opacityQ = -1;
+        int thicknessQ = -1;
         size_t patchCount = 0;
         size_t surfaceCount = 0;
         size_t targetHash = 0;

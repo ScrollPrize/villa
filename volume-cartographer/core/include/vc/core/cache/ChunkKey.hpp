@@ -38,7 +38,12 @@ struct ChunkKey {
 struct ChunkKeyHash {
     size_t operator()(const ChunkKey& k) const noexcept
     {
-        return utils::hash_combine_values(k.level, k.iz, k.iy, k.ix);
+        const uint64_t hi = (uint64_t(uint32_t(k.level)) << 40)
+                          ^ (uint64_t(uint32_t(k.iz)) << 20)
+                          ^  uint64_t(uint32_t(k.iy));
+        const uint64_t lo = (uint64_t(uint32_t(k.iy)) << 32)
+                          |  uint64_t(uint32_t(k.ix));
+        return size_t(hi ^ (lo * 0x9E3779B97F4A7C15ULL));
     }
 };
 
@@ -56,7 +61,12 @@ struct ShardKey {
 struct ShardKeyHash {
     size_t operator()(const ShardKey& k) const noexcept
     {
-        return utils::hash_combine_values(k.level, k.sz, k.sy, k.sx);
+        const uint64_t hi = (uint64_t(uint32_t(k.level)) << 40)
+                          ^ (uint64_t(uint32_t(k.sz)) << 20)
+                          ^  uint64_t(uint32_t(k.sy));
+        const uint64_t lo = (uint64_t(uint32_t(k.sy)) << 32)
+                          |  uint64_t(uint32_t(k.sx));
+        return size_t(hi ^ (lo * 0x9E3779B97F4A7C15ULL));
     }
 };
 

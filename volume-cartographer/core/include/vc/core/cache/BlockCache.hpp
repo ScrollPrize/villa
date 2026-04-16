@@ -4,7 +4,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -31,7 +33,15 @@ struct BlockKey {
 struct BlockKeyHash {
     size_t operator()(const BlockKey& k) const noexcept
     {
-        return utils::hash_combine_values(k.level, k.bz, k.by, k.bx);
+        // Pack into two 64-bit words and mix with a single prime multiply.
+        // Avoids the chained-XOR bias of the older boost-style combine,
+        // which clustered spatially-adjacent keys onto nearby buckets.
+        const uint64_t hi = (uint64_t(uint32_t(k.level)) << 40)
+                          ^ (uint64_t(uint32_t(k.bz)) << 20)
+                          ^  uint64_t(uint32_t(k.by));
+        const uint64_t lo = (uint64_t(uint32_t(k.by)) << 32)
+                          |  uint64_t(uint32_t(k.bx));
+        return size_t(hi ^ (lo * 0x9E3779B97F4A7C15ULL));
     }
 };
 
@@ -74,6 +84,16 @@ public:
     // Lookup. Returns null if not cached. On hit, marks the block recently used.
     [[nodiscard]] BlockPtr get(const BlockKey& key) noexcept;
 
+    // Peek: like get() but does not touch the recently-used bit. For
+    // "is this resident?" queries that shouldn't affect eviction order.
+    [[nodiscard]] bool contains(const BlockKey& key) const noexcept;
+
+    // Batch peek: one lock acquisition for N lookups. Used by the
+    // fetchInteractive triage path, which checks ~hundreds-of-thousands
+    // of keys per second during viewport changes.
+    void containsBatch(const std::vector<BlockKey>& keys,
+                       std::vector<uint8_t>& out) const;
+
     // Insert, copying kBlockBytes from `src`. Evicts NRU entries if full.
     void put(const BlockKey& key, const uint8_t* src) noexcept;
 
@@ -93,15 +113,21 @@ private:
     Block* arena_ = nullptr;
     size_t arenaBytes_ = 0;
 
-    mutable std::mutex mutex_;
+    // shared_mutex: get()/contains()/size() take a shared lock so the render
+    // thread and the 4 worker pools can read concurrently; put()/clear()
+    // take the exclusive lock. usedBits_ is atomic so mutations from get()
+    // (setUsed on hit) and the clock sweep are lock-free.
+    mutable std::shared_mutex mutex_;
     std::unordered_map<BlockKey, size_t, BlockKeyHash> map_;
 
     std::vector<BlockKey> slotKey_;
     // Parallel bitmasks (1 bit per slot): "occupied" (has valid key) and
     // "used" (clock-sweep NRU flag). Packs 2.5M slots into 310 KB each
-    // vs. ~2.5 MB for a byte-per-slot vector.
+    // vs. ~2.5 MB for a byte-per-slot vector. occupiedBits_ is guarded by
+    // mutex_; usedBits_ is atomic per word so get() can set it lock-free.
     std::vector<uint64_t> occupiedBits_;
-    std::vector<uint64_t> usedBits_;
+    std::unique_ptr<std::atomic<uint64_t>[]> usedBits_;
+    size_t usedBitsWords_ = 0;
     size_t occupiedCount_ = 0;
     size_t clockHand_ = 0;
 
@@ -117,10 +143,13 @@ private:
         if (v) occupiedBits_[bitWord(i)] |= bitMask(i);
         else   occupiedBits_[bitWord(i)] &= ~bitMask(i);
     }
-    bool isUsed(size_t i) const noexcept { return (usedBits_[bitWord(i)] >> (i & 63u)) & 1u; }
+    bool isUsed(size_t i) const noexcept {
+        return (usedBits_[bitWord(i)].load(std::memory_order_relaxed) >> (i & 63u)) & 1u;
+    }
     void setUsed(size_t i, bool v) noexcept {
-        if (v) usedBits_[bitWord(i)] |= bitMask(i);
-        else   usedBits_[bitWord(i)] &= ~bitMask(i);
+        const uint64_t m = bitMask(i);
+        if (v) usedBits_[bitWord(i)].fetch_or(m, std::memory_order_relaxed);
+        else   usedBits_[bitWord(i)].fetch_and(~m, std::memory_order_relaxed);
     }
 };
 

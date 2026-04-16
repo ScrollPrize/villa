@@ -2,6 +2,7 @@
 
 #include <opencv2/imgproc.hpp>
 #include <algorithm>
+#include <array>
 #include <cmath>
 
 namespace vc {
@@ -67,15 +68,22 @@ void applyPostProcess(cv::Mat_<uint8_t>& img, const PostProcessParams& params)
 
         // Skip if window covers full range (identity transform)
         if (windowLowInt > 0 || windowHighInt < 255) {
-            const float windowSpan = std::max(
-                1.0f, static_cast<float>(windowHighInt - windowLowInt));
-
-            uint8_t lut_data[256];
-            for (int i = 0; i < 256; i++) {
-                float v = (static_cast<float>(i) - static_cast<float>(windowLowInt)) / windowSpan;
-                lut_data[i] = static_cast<uint8_t>(std::clamp(v * 255.0f, 0.0f, 255.0f));
+            // Window/level LUT depends only on windowLow/windowHigh (integer-
+            // quantized). Cache per-thread; caller hits this path every tile.
+            thread_local std::array<uint8_t, 256> cachedLut;
+            thread_local int cachedLo = -1;
+            thread_local int cachedHi = -1;
+            if (windowLowInt != cachedLo || windowHighInt != cachedHi) {
+                const float windowSpan = std::max(
+                    1.0f, static_cast<float>(windowHighInt - windowLowInt));
+                for (int i = 0; i < 256; i++) {
+                    float v = (static_cast<float>(i) - static_cast<float>(windowLowInt)) / windowSpan;
+                    cachedLut[i] = static_cast<uint8_t>(std::clamp(v * 255.0f, 0.0f, 255.0f));
+                }
+                cachedLo = windowLowInt;
+                cachedHi = windowHighInt;
             }
-            cv::Mat lut(1, 256, CV_8U, lut_data);
+            cv::Mat lut(1, 256, CV_8U, cachedLut.data());
             cv::LUT(img, lut, img);
         }
     }

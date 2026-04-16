@@ -185,21 +185,37 @@ BlockPipeline::BlockPipeline(
     , diskLevels_(std::move(diskLevels))
     , source_(std::move(source))
     , decompress_(std::move(decompress))
-    // Thread sizing: oversubscribe the I/O-bound pools (download & load)
-    // to 2× hardware_concurrency so a worker is always ready when a chunk
-    // lands. The encode pool is pure CPU x265 work — size it to exactly
-    // hardware_concurrency so a burst of encodes doesn't thrash cores.
-    , downloaderPool_(config_.ioThreads > 0
-                  ? config_.ioThreads
-                  : (std::thread::hardware_concurrency()
-                     ? 2 * static_cast<int>(std::thread::hardware_concurrency())
-                     : 16))
-    , encodePool_(std::thread::hardware_concurrency()
-                     ? static_cast<int>(std::thread::hardware_concurrency())
-                     : 8)
-    , loaderPool_(std::thread::hardware_concurrency()
-                     ? 2 * static_cast<int>(std::thread::hardware_concurrency())
-                     : 16)
+    // Thread sizing. Loader is pure I/O wait (disk read or shard-cache
+    // memcpy) — oversubscribe heavily so it can keep the disk queue full
+    // even when many threads are blocked on io_wait. The CPU-bound pools
+    // (encode, decode) stay near hw so concurrent decode never runs more
+    // threads than cores. CLI tools (e.g. vc_zarr_prefetch) can still
+    // override the downloader count via setIOThreads().
+    //   downloader: HTTP fetch + re-chunk (I/O bound, keep-alive pool)
+    //   encode    : h265 encode → disk (CPU, cold-miss only)
+    //   loader    : shard-cache memcpy or disk read → staged bytes (I/O)
+    //   decode    : h265 decode + block insert (pure CPU, caps work rate)
+    , downloaderPool_([&] {
+        if (config_.ioThreads > 0) return config_.ioThreads;
+        unsigned hw = std::thread::hardware_concurrency();
+        return hw ? static_cast<int>(hw) : 8;
+    }())
+    , encodePool_([] {
+        unsigned hw = std::thread::hardware_concurrency();
+        return hw ? static_cast<int>(hw) : 8;
+    }())
+    , loaderPool_([] {
+        unsigned hw = std::thread::hardware_concurrency();
+        // 16× hw: loader is almost entirely pread() io_wait. Observed
+        // disk utilisation was ~1% at 4× — we're leaving most of the
+        // device's queue depth on the table. Each worker's stack is
+        // virtual-only until touched, so going wide is cheap.
+        return hw ? 16 * static_cast<int>(hw) : 128;
+    }())
+    , decodePool_([] {
+        unsigned hw = std::thread::hardware_concurrency();
+        return hw ? static_cast<int>(hw) : 8;
+    }())
     , blockCache_([&] {
         // Reserve a small residency floor per pyramid level so a coarse
         // fallback image is always available even under heavy fine-level
@@ -371,16 +387,15 @@ BlockPipeline::BlockPipeline(
             loaderPool_.updateInteractive(loaderKeys, targetLevel);
         });
 
-    // Loader: disk → decode → block cache. Never touches the network.
-    // When there's no canonical disk tier (local filesystem source used
-    // directly), the loader pulls from the source instead — the source
-    // itself lives on disk so the "disk → RAM" framing still applies.
+    // Loader: read compressed bytes for `key` (shard RAM cache or disk),
+    // stage them for decodePool_. Pure I/O + memcpy — no CPU-heavy work
+    // so this pool can be oversubscribed to keep the disk queue full.
     loaderPool_.setFetchFunc([this](const ShardKey& shard) -> IOPool::FetchResult {
         ChunkKey key{shard.level, shard.sz, shard.sy, shard.sx};
         if (isNegativeCached(key)) return {};
 
         auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
-        ChunkDataPtr decoded;
+        std::vector<uint8_t> compressed;
 
         if (dz) {
             if (diskShardMarksChunkEmpty(*dz, key)) {
@@ -409,14 +424,12 @@ BlockPipeline::BlockPipeline(
             }
             if (innerBytes && !innerBytes->empty()) {
                 statColdHits_.fetch_add(1, std::memory_order_relaxed);
-                std::vector<uint8_t> buf(
+                compressed.assign(
                     reinterpret_cast<const uint8_t*>(innerBytes->data()),
                     reinterpret_cast<const uint8_t*>(innerBytes->data() + innerBytes->size()));
-                decoded = decodeCanonicalH265(buf);
             }
         } else if (source_) {
             // Local source, no disk tier: treat the source files as disk.
-            std::vector<uint8_t> compressed;
             try { compressed = source_->fetch(key); } catch (...) { return {}; }
             if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) {
                 // Same rule as the downloader: only poison the negative
@@ -431,15 +444,63 @@ BlockPipeline::BlockPipeline(
                 return {};
             }
             statColdHits_.fetch_add(1, std::memory_order_relaxed);
-            if (decompress_) decoded = decompress_(compressed, key);
         }
 
+        if (compressed.empty()) return {};
+
+        // Stage compressed bytes for decodePool_ so the loader worker can
+        // immediately serve the next I/O request while CPU decode proceeds
+        // in parallel. Decode concurrency is bounded by decodePool_ size.
+        {
+            std::lock_guard stage(decodeStagingMutex_);
+            decodeStaging_[key] = std::move(compressed);
+        }
+        // Non-empty FetchResult so IOPool fires the completion callback,
+        // which forwards this key to decodePool_. Payload unused.
+        IOPool::FetchResult result;
+        result.emplace_back(key, std::vector<uint8_t>{});
+        return result;
+    });
+
+    loaderPool_.setCompletionCallback(
+        [this](IOPool::FetchResult&& res) {
+            if (res.empty()) return;
+            std::vector<ChunkKey> decodeKeys;
+            decodeKeys.reserve(res.size());
+            for (auto& [k, _] : res) decodeKeys.push_back(k);
+            const int targetLevel = decodeKeys.front().level;
+            decodePool_.updateInteractive(decodeKeys, targetLevel);
+        });
+
+    decodePool_.setShardMapper(shardMapper);
+
+    // Decoder: staged compressed bytes → h265 decode → block cache insert →
+    // fire chunk-ready callbacks. Pure CPU; concurrency here caps CPU load.
+    decodePool_.setFetchFunc([this](const ShardKey& shard) -> IOPool::FetchResult {
+        ChunkKey key{shard.level, shard.sz, shard.sy, shard.sx};
+        std::vector<uint8_t> compressed;
+        {
+            std::lock_guard stage(decodeStagingMutex_);
+            auto it = decodeStaging_.find(key);
+            if (it == decodeStaging_.end()) return {};
+            compressed = std::move(it->second);
+            decodeStaging_.erase(it);
+        }
+        if (compressed.empty()) return {};
+
+        ChunkDataPtr decoded;
+        auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
+        if (dz) {
+            decoded = decodeCanonicalH265(compressed);
+        } else if (decompress_) {
+            decoded = decompress_(compressed, key);
+        }
         if (!decoded) return {};
 
         insertChunkAsBlocks(key, *decoded);
         if (!chunkArrivedFlag_.exchange(true, std::memory_order_acq_rel)) {
             // Snapshot callbacks under lock and release before firing so
-            // a slow listener can't serialize the loader hot path or
+            // a slow listener can't serialize the decode hot path or
             // deadlock with add/remove calls that need the same mutex.
             std::vector<ChunkReadyCallback> snapshot;
             {
@@ -453,7 +514,7 @@ BlockPipeline::BlockPipeline(
         return {};
     });
 
-    loaderPool_.setCompletionCallback(
+    decodePool_.setCompletionCallback(
         [](IOPool::FetchResult&&) {
             // Work already done inside the fetch func.
         });
@@ -585,6 +646,7 @@ skipPassthrough:
     downloaderPool_.start();
     encodePool_.start();
     loaderPool_.start();
+    decodePool_.start();
 }
 
 BlockPipeline::~BlockPipeline() {
@@ -596,11 +658,13 @@ BlockPipeline::~BlockPipeline() {
     downloaderPool_.cancelPending();
     encodePool_.cancelPending();
     loaderPool_.cancelPending();
+    decodePool_.cancelPending();
     // Stop upstream-first so no new work lands in downstream queues while
     // we're trying to drain them.
     downloaderPool_.stop();
     encodePool_.stop();
     loaderPool_.stop();
+    decodePool_.stop();
     auto cold = statColdHits_.load();
     auto ice = statIceFetches_.load();
     if (cold > 0 || ice > 0) {
@@ -636,12 +700,55 @@ void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targ
     // loader pool (fast, CPU-bound decode), chunks that need fetching go
     // to the downloader pool (slow, network-bound). The two pools are
     // fully independent so the loader can't be starved by in-flight S3
-    // work.
+    // work. Before either, skip chunks already resident in the block
+    // cache — otherwise IOPool re-queues every viewport chunk every frame
+    // (Done shards are re-queueable for eviction recovery) and loader
+    // workers endlessly re-decode data we already have.
+    constexpr int kMaxL = 16;
+    std::array<int, kMaxL> bpcZ{}, bpcY{}, bpcX{};
+    std::array<bool, kMaxL> shapeCached{};
+    auto chunkToFirstBlock = [&](const ChunkKey& k) -> BlockKey {
+        if (k.level < 0 || k.level >= kMaxL) return {-1, 0, 0, 0};
+        if (!shapeCached[k.level] && source_) {
+            auto csk = source_->chunkShape(k.level);
+            if (csk[0] > 0) {
+                bpcZ[k.level] = csk[0] / kBlockSize;
+                bpcY[k.level] = csk[1] / kBlockSize;
+                bpcX[k.level] = csk[2] / kBlockSize;
+            }
+            shapeCached[k.level] = true;
+        }
+        const int z = bpcZ[k.level], y = bpcY[k.level], x = bpcX[k.level];
+        if (z <= 0 || y <= 0 || x <= 0) return {-1, 0, 0, 0};
+        return {k.level, k.iz * z, k.iy * y, k.ix * x};
+    };
+
+    // Build the per-key BlockKey list and batch-query the block cache with
+    // a single mutex acquisition, amortising ~hundreds-of-thousands of
+    // per-frame lookups down to one.
+    std::vector<BlockKey> blockKeys;
+    blockKeys.reserve(keys.size());
+    for (const auto& key : keys) blockKeys.push_back(chunkToFirstBlock(key));
+    std::vector<uint8_t> resident;
+    blockCache_.containsBatch(blockKeys, resident);
+
+    // Snapshot the empty-chunks set once so the per-key check avoids
+    // hammering emptyChunksMutex_ from the render thread.
+    std::unordered_set<ChunkKey, ChunkKeyHash> emptySnapshot;
+    {
+        std::lock_guard lk(emptyChunksMutex_);
+        emptySnapshot = emptyChunks_;
+    }
+
     std::vector<ChunkKey> loaderKeys, downloaderKeys;
     loaderKeys.reserve(keys.size());
     downloaderKeys.reserve(keys.size());
-    for (const auto& key : keys) {
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto& key = keys[i];
         if (isNegativeCached(key)) continue;
+        if (emptySnapshot.count(key)) continue;
+        if (blockKeys[i].level >= 0 && resident[i]) continue;
+
         auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
         const bool diskPresent = dz
             && dz->is_sharded()
@@ -808,9 +915,14 @@ void BlockPipeline::clearAll() {
     downloaderPool_.cancelPending();
     encodePool_.cancelPending();
     loaderPool_.cancelPending();
+    decodePool_.cancelPending();
     {
         std::lock_guard lk(encodeStagingMutex_);
         encodeStaging_.clear();
+    }
+    {
+        std::lock_guard lk(decodeStagingMutex_);
+        decodeStaging_.clear();
     }
     {
         std::lock_guard lk(shardCacheMutex_);
@@ -858,17 +970,28 @@ bool BlockPipeline::isNegativeCached(const ChunkKey& key) const {
 
 size_t BlockPipeline::countAvailable(const std::vector<ChunkKey>& keys) const {
     size_t n = 0;
-    auto cs = source_ ? source_->chunkShape(0) : std::array<int, 3>{0, 0, 0};
+    if (!source_) return 0;
+    // Cache chunk shape per level. chunkShape() is virtual and typically
+    // hits a std::array lookup; avoiding the per-key call matters when
+    // countAvailable is invoked with thousands of keys per frame.
+    constexpr int kMaxL = 16;
+    std::array<int, kMaxL> bpcZ{}, bpcY{}, bpcX{};
+    std::array<bool, kMaxL> shapeCached{};
     for (const auto& key : keys) {
         if (isNegativeCached(key)) { n++; continue; }
-        auto csk = source_ ? source_->chunkShape(key.level) : cs;
-        if (csk[0] <= 0) continue;
-        int bpcZ = csk[0] / kBlockSize;
-        int bpcY = csk[1] / kBlockSize;
-        int bpcX = csk[2] / kBlockSize;
-        if (bpcZ <= 0 || bpcY <= 0 || bpcX <= 0) continue;
-        BlockKey bk{key.level, key.iz * bpcZ, key.iy * bpcY, key.ix * bpcX};
-        if (const_cast<BlockCache&>(blockCache_).get(bk)) n++;
+        if (key.level < 0 || key.level >= kMaxL) continue;
+        if (!shapeCached[key.level]) {
+            auto csk = source_->chunkShape(key.level);
+            if (csk[0] <= 0) { shapeCached[key.level] = true; continue; }
+            bpcZ[key.level] = csk[0] / kBlockSize;
+            bpcY[key.level] = csk[1] / kBlockSize;
+            bpcX[key.level] = csk[2] / kBlockSize;
+            shapeCached[key.level] = true;
+        }
+        const int z = bpcZ[key.level], y = bpcY[key.level], x = bpcX[key.level];
+        if (z <= 0 || y <= 0 || x <= 0) continue;
+        BlockKey bk{key.level, key.iz * z, key.iy * y, key.ix * x};
+        if (blockCache_.contains(bk)) n++;
     }
     return n;
 }
@@ -902,7 +1025,8 @@ auto BlockPipeline::stats() const -> Stats {
     s.downloadPending = downloaderPool_.pendingCount();
     s.encodePending = encodePool_.pendingCount();
     s.loadPending = loaderPool_.pendingCount();
-    s.ioPending = s.downloadPending + s.encodePending + s.loadPending;
+    s.decodePending = decodePool_.pendingCount();
+    s.ioPending = s.downloadPending + s.encodePending + s.loadPending + s.decodePending;
     s.shardHits = statShardHits_.load(std::memory_order_relaxed);
     s.shardMisses = statShardMisses_.load(std::memory_order_relaxed);
     {

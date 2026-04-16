@@ -1,5 +1,6 @@
 #include "vc/core/cache/BlockCache.hpp"
 
+#include <bit>
 #include <cstring>
 #include <new>
 #include <stdexcept>
@@ -47,7 +48,9 @@ BlockCache::BlockCache(Config cfg)
     slotKey_.assign(nSlots_, kEmptyKey);
     const size_t words = (nSlots_ + 63u) / 64u;
     occupiedBits_.assign(words, 0);
-    usedBits_.assign(words, 0);
+    usedBitsWords_ = words;
+    usedBits_ = std::unique_ptr<std::atomic<uint64_t>[]>(
+        new std::atomic<uint64_t>[words]());
     // Default max_load_factor of 1.0 means libstdc++ sizes the bucket array
     // at 2x insertion count. At 2.5M slots that's ~40 MB of extra buckets.
     // Push the load factor to 1.0 before reserving so the reserve matches
@@ -66,17 +69,34 @@ BlockCache::~BlockCache()
 
 BlockPtr BlockCache::get(const BlockKey& key) noexcept
 {
-    std::lock_guard lock(mutex_);
+    std::shared_lock lock(mutex_);
     if (auto it = map_.find(key); it != map_.end()) {
-        setUsed(it->second, true);
+        setUsed(it->second, true);  // lock-free atomic fetch_or
         return &arena_[it->second];
     }
     return nullptr;
 }
 
+bool BlockCache::contains(const BlockKey& key) const noexcept
+{
+    std::shared_lock lock(mutex_);
+    return map_.find(key) != map_.end();
+}
+
+void BlockCache::containsBatch(const std::vector<BlockKey>& keys,
+                               std::vector<uint8_t>& out) const
+{
+    out.assign(keys.size(), 0);
+    if (keys.empty()) return;
+    std::shared_lock lock(mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (map_.find(keys[i]) != map_.end()) out[i] = 1;
+    }
+}
+
 void BlockCache::put(const BlockKey& key, const uint8_t* src) noexcept
 {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     // Degenerate config (cache size rounded below one block) — bail
     // instead of dividing by zero in the slot-assignment arithmetic.
     if (nSlots_ == 0) return;
@@ -90,11 +110,50 @@ void BlockCache::put(const BlockKey& key, const uint8_t* src) noexcept
 
     size_t slot;
     if (occupiedCount_ < nSlots_) {
-        slot = clockHand_;
-        while (isOccupied(slot)) slot = (slot + 1) % nSlots_;
-        setOccupied(slot, true);
-        occupiedCount_++;
-        clockHand_ = (slot + 1) % nSlots_;
+        // Find first unoccupied slot starting at clockHand_. Scan 64 slots
+        // at a time via the occupancy bitmap: pick the first 64-bit word
+        // whose complement has a set bit, then ctz the position. O(nSlots_/64)
+        // worst case, O(1) when sparse — vs. O(nSlots_) scalar while-loop.
+        const size_t words = occupiedBits_.size();
+        const size_t startWord = clockHand_ / 64u;
+        const size_t startBit = clockHand_ % 64u;
+        auto findFree = [&](size_t w) -> std::pair<bool, size_t> {
+            uint64_t mask = ~occupiedBits_[w];
+            if (w == startWord && startBit > 0) {
+                mask &= ~((uint64_t(1) << startBit) - 1);
+            }
+            if (mask) {
+                size_t bit = static_cast<size_t>(std::countr_zero(mask));
+                size_t s = w * 64u + bit;
+                if (s < nSlots_) return {true, s};
+            }
+            return {false, 0};
+        };
+        bool found = false;
+        for (size_t w = startWord; w < words; ++w) {
+            auto [ok, s] = findFree(w);
+            if (ok) { slot = s; found = true; break; }
+        }
+        if (!found) {
+            // Wrap.
+            for (size_t w = 0; w <= startWord; ++w) {
+                uint64_t mask = ~occupiedBits_[w];
+                if (w == startWord) {
+                    mask &= (startBit == 0) ? 0 : ((uint64_t(1) << startBit) - 1);
+                }
+                if (mask) {
+                    size_t bit = static_cast<size_t>(std::countr_zero(mask));
+                    size_t s = w * 64u + bit;
+                    if (s < nSlots_) { slot = s; found = true; break; }
+                }
+            }
+        }
+        if (!found) { slot = reclaimSlotLocked(); }
+        else {
+            setOccupied(slot, true);
+            occupiedCount_++;
+            clockHand_ = (slot + 1) % nSlots_;
+        }
     } else {
         slot = reclaimSlotLocked();
     }
@@ -138,17 +197,18 @@ size_t BlockCache::reclaimSlotLocked()
 
 size_t BlockCache::size() const noexcept
 {
-    std::lock_guard lock(mutex_);
+    std::shared_lock lock(mutex_);
     return occupiedCount_;
 }
 
 void BlockCache::clear()
 {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     map_.clear();
     std::fill(slotKey_.begin(), slotKey_.end(), kEmptyKey);
     std::fill(occupiedBits_.begin(), occupiedBits_.end(), 0);
-    std::fill(usedBits_.begin(), usedBits_.end(), 0);
+    for (size_t i = 0; i < usedBitsWords_; ++i)
+        usedBits_[i].store(0, std::memory_order_relaxed);
     occupiedCount_ = 0;
     clockHand_ = 0;
     levelOccupied_.fill(0);

@@ -31,17 +31,17 @@ void AdaptiveCamera::recalcPyramidLevel(int numScales) noexcept
         dsScaleIdx = std::min(dsScaleIdx, numScales - 1);
     }
 
-    // std::pow is called per frame; for the handful of integer dsScaleIdx
-    // values we see in practice (0..~12) a tiny LUT is exact and free.
-    static constexpr float kInvPow2[] = {
-        1.0f, 1.0f/2, 1.0f/4, 1.0f/8, 1.0f/16, 1.0f/32, 1.0f/64,
-        1.0f/128, 1.0f/256, 1.0f/512, 1.0f/1024, 1.0f/2048, 1.0f/4096,
-        1.0f/8192, 1.0f/16384, 1.0f/32768,
+    // Integer dsScaleIdx up to the pyramid depth. 24 entries covers any
+    // realistic volume (2^24 = 16M × native voxel).
+    static constexpr float kInvPow2[24] = {
+        1.0f,        1.0f/2,      1.0f/4,       1.0f/8,
+        1.0f/16,     1.0f/32,     1.0f/64,      1.0f/128,
+        1.0f/256,    1.0f/512,    1.0f/1024,    1.0f/2048,
+        1.0f/4096,   1.0f/8192,   1.0f/16384,   1.0f/32768,
+        1.0f/65536,  1.0f/131072, 1.0f/262144,  1.0f/524288,
+        1.0f/1048576,1.0f/2097152,1.0f/4194304, 1.0f/8388608,
     };
-    constexpr int kTableSize = int(sizeof(kInvPow2) / sizeof(kInvPow2[0]));
-    dsScale = (dsScaleIdx >= 0 && dsScaleIdx < kTableSize)
-        ? kInvPow2[dsScaleIdx]
-        : std::pow(2.0f, -dsScaleIdx);
+    dsScale = kInvPow2[std::clamp(dsScaleIdx, 0, 23)];
 }
 
 // Predefined zoom stops where TILE_PX/scale is a "nice" number, eliminating

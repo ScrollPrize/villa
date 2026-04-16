@@ -1386,10 +1386,18 @@ static RemoteChunkFetchResult fetchRemoteChunkKeys(
     // Use a condition_variable to wake up when chunks arrive instead of
     // sleep-polling.  The cache fires its ChunkReadyCallback on the IO
     // thread each time a chunk finishes; we signal the CV from there.
-    std::mutex cvMtx;
-    std::condition_variable cv;
+    // BlockPipeline fires listeners from a snapshot taken under lock, so
+    // removeChunkReadyListener() does not stop an already-snapshotted call
+    // from running after we return. Keep the cv+mutex alive via shared_ptr
+    // so any in-flight callback can safely signal a no-op on a detached
+    // state rather than touch a destroyed stack variable.
+    struct WaitState {
+        std::mutex mtx;
+        std::condition_variable cv;
+    };
+    auto state = std::make_shared<WaitState>();
     auto listenerId = cache->addChunkReadyListener(
-        [&cv](const vc::cache::ChunkKey&) { cv.notify_one(); });
+        [state](const vc::cache::ChunkKey&) { state->cv.notify_one(); });
 
     cache->fetchInteractive(keys);
 
@@ -1399,8 +1407,8 @@ static RemoteChunkFetchResult fetchRemoteChunkKeys(
 
     while (available < keys.size()) {
         {
-            std::unique_lock<std::mutex> lk(cvMtx);
-            cv.wait_for(lk, std::chrono::milliseconds(200));
+            std::unique_lock<std::mutex> lk(state->mtx);
+            state->cv.wait_for(lk, std::chrono::milliseconds(200));
         }
         available = cache->countAvailable(keys);
         const auto stats = cache->stats();

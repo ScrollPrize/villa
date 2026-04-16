@@ -94,13 +94,9 @@ void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
 {
     if (vol && _cacheSizeBytes > 0) {
         vol->setCacheBudget(_cacheSizeBytes);
-
-        // One IO thread per hardware thread. Each IOPool worker does
-        // fetch + decode + block split, all CPU-bound work that scales
-        // with core count.
-        unsigned hw = std::thread::hardware_concurrency();
-        if (hw == 0) hw = 8;
-        vol->setIOThreads(static_cast<int>(hw));
+        // Leave ioThreads at default (0) so BlockPipeline's interactive
+        // sizing (half hw download/load, quarter hw encode) kicks in.
+        // CLI tools can still force a full-hw count via setIOThreads.
     }
 }
 

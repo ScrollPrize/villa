@@ -489,9 +489,12 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     _targetRefinedStride = 0;  // Reset refinement target
 
     if (!_surfacePatchStrideUserSet) {
-        // Floor at stride 2 for every tier — stride 1 produces one entry
-        // per cell and blows up the rtree (~4M entries per 2K² surface)
-        // without any visible benefit for overlay intersection drawing.
+        // TODO: re-enable finer strides (2, and eventually 1) once
+        // SurfacePatchIndex rebuild + rtree mutation are cheap enough that
+        // the higher entry count doesn't stall the GUI. Right now 4 is the
+        // floor across every tier — lower strides produce millions of
+        // entries on 2K² surfaces for no visible win in intersection
+        // drawing.
         int defaultStride;
         if (surfaceCount > 2500) {
             defaultStride = 32;
@@ -504,12 +507,10 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
             _targetRefinedStride = 4;
         } else if (surfaceCount >= 30) {
             defaultStride = 4;
-            _targetRefinedStride = 2;
+            _targetRefinedStride = 4;
         } else {
-            // Was: defaultStride=2, _targetRefinedStride=1. Stride 1 was
-            // the hot rebuild — keep stride 2 throughout.
-            defaultStride = 2;
-            _targetRefinedStride = 2;
+            defaultStride = 4;
+            _targetRefinedStride = 4;
         }
         setSurfacePatchSamplingStride(defaultStride, false);
     }
@@ -589,28 +590,14 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     _indexedSurfaceIds.insert(_pendingSurfacePatchIndexSurfaceIds.begin(),
                               _pendingSurfacePatchIndexSurfaceIds.end());
 
-    // Process any surfaces that were removed during the async rebuild.
-    // We stored the shared_ptr at queue time since the surface may no longer
-    // be available by ID lookup after deletion.
-    for (const auto& [id, surf] : _surfacesQueuedForRemovalDuringRebuild) {
-        if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surf)) {
-            _surfacePatchIndex.removeSurface(quad);
-        }
-        _indexedSurfaceIds.erase(id);
-    }
+    // If surfaces were added or removed during the async rebuild, re-prime
+    // instead of doing incremental remove/update on the main thread. The
+    // rebuild runs on a worker thread; per-surface rtree mutations here
+    // were a measurable main-thread stall (~14% of profile) on segments
+    // with large coords grids.
+    const bool queuesDirty = !_surfacesQueuedForRemovalDuringRebuild.empty()
+                          || !_surfacesQueuedDuringRebuildIds.empty();
     _surfacesQueuedForRemovalDuringRebuild.clear();
-
-    // Merge any surfaces that were added during the async rebuild
-    for (const std::string& queuedId : _surfacesQueuedDuringRebuildIds) {
-        auto surf = _state ? _state->surface(queuedId) : nullptr;
-        if (auto queued = std::dynamic_pointer_cast<QuadSurface>(surf)) {
-            if (_surfacePatchIndex.updateSurface(queued)) {
-                _indexedSurfaceIds.insert(queuedId);
-                qCInfo(lcViewerManager) << "Indexed queued surface" << queuedId.c_str()
-                                        << "after async rebuild";
-            }
-        }
-    }
     _surfacesQueuedDuringRebuildIds.clear();
 
     qCInfo(lcViewerManager) << "Asynchronously rebuilt SurfacePatchIndex for"
@@ -618,35 +605,20 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
                             << "at stride" << _surfacePatchSamplingStride;
     forEachViewer([](CTiledVolumeViewer* v) { v->renderIntersections(); });
 
-    // Check if progressive refinement is needed
-    if (_targetRefinedStride > 0 && _surfacePatchSamplingStride > _targetRefinedStride) {
-        qCInfo(lcViewerManager) << "Starting progressive refinement from stride"
-                                << _surfacePatchSamplingStride << "to" << _targetRefinedStride;
-        const int targetStride = _targetRefinedStride;
-        _targetRefinedStride = 0;  // Clear target to prevent infinite loop
-        setSurfacePatchSamplingStride(targetStride, false);
-
-        // Trigger another async rebuild at the refined stride
-        // Collect current surfaces - shared_ptrs keep surfaces alive
-        std::vector<SurfacePatchIndex::SurfacePtr> surfacesForTask;
-        std::vector<std::string> surfaceIdsForTask;
-        if (_state) {
-            for (const auto& surf : _state->surfaces()) {
-                if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surf)) {
-                    surfacesForTask.push_back(quad);
-                    surfaceIdsForTask.push_back(surf->id);
-                }
-            }
+    // Check if progressive refinement is needed. Queued changes also fall
+    // through this path by re-priming at the (possibly same) current stride.
+    const bool refineRequested =
+        _targetRefinedStride > 0 && _surfacePatchSamplingStride > _targetRefinedStride;
+    if (refineRequested || queuesDirty) {
+        if (refineRequested) {
+            qCInfo(lcViewerManager) << "Starting progressive refinement from stride"
+                                    << _surfacePatchSamplingStride << "to" << _targetRefinedStride;
+            const int targetStride = _targetRefinedStride;
+            _targetRefinedStride = 0;  // Clear target to prevent infinite loop
+            setSurfacePatchSamplingStride(targetStride, false);
         }
-        _pendingSurfacePatchIndexSurfaceIds = surfaceIdsForTask;
-
-        auto future = QtConcurrent::run([surfacesForTask, targetStride]() -> std::shared_ptr<SurfacePatchIndex> {
-            auto index = std::make_shared<SurfacePatchIndex>();
-            index->setSamplingStride(targetStride);
-            index->rebuild(surfacesForTask);
-            return index;
-        });
-        _surfacePatchIndexWatcher->setFuture(future);
+        _pendingSurfacePatchIndexSurfaceIds.clear();
+        primeSurfacePatchIndicesAsync();
     } else {
         _pendingSurfacePatchIndexSurfaceIds.clear();
     }

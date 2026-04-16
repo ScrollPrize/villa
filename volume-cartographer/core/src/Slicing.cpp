@@ -308,8 +308,16 @@ void appendChunksForCoordsSurface(BlockPipeline& cache, int level,
     // for steeply oblique surface patches).
     const int stride = (coords.rows > 256) ? 8 : 1;
 
-    std::unordered_set<vc::cache::ChunkKey, vc::cache::ChunkKeyHash> seen;
-    seen.reserve(512);
+    // Thread-local dedup set to avoid heap churn across frames. Cleared on
+    // entry; capacity grows monotonically with the largest surface ever seen
+    // on this thread, which is exactly what we want (amortizes allocations).
+    thread_local std::unordered_set<vc::cache::ChunkKey, vc::cache::ChunkKeyHash> seen;
+    seen.clear();
+    const size_t sampleEstimate =
+        size_t((coords.rows + stride - 1) / stride) *
+        size_t((coords.cols + stride - 1) / stride);
+    // Rough: spatial coherence keeps unique-chunk count ≪ sample count.
+    seen.reserve(std::max<size_t>(512, sampleEstimate / 8));
 
     for (int r = 0; r < coords.rows; r += stride) {
         const cv::Vec3f* row = coords.ptr<cv::Vec3f>(r);
@@ -659,19 +667,94 @@ VC_FORCE_INLINE bool trySampleNB(BlockSampler<uint8_t>& s, float vz, float vy, f
             v110f = float(b[kStrideZ + kStrideY]);
             v111f = float(b[kStrideZ + kStrideY + 1]);
         } else {
-            uint8_t v000, v100, v010, v110, v001, v101, v011, v111;
-            if (!s.sampleIntNB(iz,     iy,     ix,     v000)) return false;
-            if (!s.sampleIntNB(iz + 1, iy,     ix,     v100)) return false;
-            if (!s.sampleIntNB(iz,     iy + 1, ix,     v010)) return false;
-            if (!s.sampleIntNB(iz + 1, iy + 1, ix,     v110)) return false;
-            if (!s.sampleIntNB(iz,     iy,     ix + 1, v001)) return false;
-            if (!s.sampleIntNB(iz + 1, iy,     ix + 1, v101)) return false;
-            if (!s.sampleIntNB(iz,     iy + 1, ix + 1, v011)) return false;
-            if (!s.sampleIntNB(iz + 1, iy + 1, ix + 1, v111)) return false;
-            v000f = float(v000); v100f = float(v100);
-            v010f = float(v010); v110f = float(v110);
-            v001f = float(v001); v101f = float(v101);
-            v011f = float(v011); v111f = float(v111);
+            // Slow path: at least one axis's high corner crosses a block
+            // boundary. In the common case only ONE axis crosses (~80% of
+            // slow-path samples); specialize to 2 block lookups instead of
+            // 8 independent sampleIntNB calls.
+            const bool zCross = (lz == kBlockMask);
+            const bool yCross = (ly == kBlockMask);
+            const bool xCross = (lx == kBlockMask);
+            const int nCross = int(zCross) + int(yCross) + int(xCross);
+
+            // Full-bounds guard for the specialized paths. Near-image-edge
+            // samples fall through to the generic 8-call path so we don't
+            // duplicate its bounds handling here.
+            const bool edgeInBounds =
+                iz >= 0 && iy >= 0 && ix >= 0
+                && iz + 1 < s.shape.sz && iy + 1 < s.shape.sy && ix + 1 < s.shape.sx;
+
+            auto loadFromBlock = [](const uint8_t* b, int tz, int ty, int tx) {
+                return float(b[size_t(tz) * kStrideZ + size_t(ty) * kStrideY + size_t(tx)]);
+            };
+
+            if (nCross == 1 && edgeInBounds) {
+                const int bz = iz >> kBlockShift;
+                const int by = iy >> kBlockShift;
+                const int bx = ix >> kBlockShift;
+                if (zCross) {
+                    s.tryUpdateBlockNonBlocking(bz, by, bx);
+                    if (!s.data) return false;
+                    const uint8_t* bA = s.data;
+                    v000f = loadFromBlock(bA, lz,     ly,     lx);
+                    v001f = loadFromBlock(bA, lz,     ly,     lx + 1);
+                    v010f = loadFromBlock(bA, lz,     ly + 1, lx);
+                    v011f = loadFromBlock(bA, lz,     ly + 1, lx + 1);
+                    s.tryUpdateBlockNonBlocking(bz + 1, by, bx);
+                    if (!s.data) return false;
+                    const uint8_t* bB = s.data;
+                    v100f = loadFromBlock(bB, 0,      ly,     lx);
+                    v101f = loadFromBlock(bB, 0,      ly,     lx + 1);
+                    v110f = loadFromBlock(bB, 0,      ly + 1, lx);
+                    v111f = loadFromBlock(bB, 0,      ly + 1, lx + 1);
+                } else if (yCross) {
+                    s.tryUpdateBlockNonBlocking(bz, by, bx);
+                    if (!s.data) return false;
+                    const uint8_t* bA = s.data;
+                    v000f = loadFromBlock(bA, lz,     ly,     lx);
+                    v001f = loadFromBlock(bA, lz,     ly,     lx + 1);
+                    v100f = loadFromBlock(bA, lz + 1, ly,     lx);
+                    v101f = loadFromBlock(bA, lz + 1, ly,     lx + 1);
+                    s.tryUpdateBlockNonBlocking(bz, by + 1, bx);
+                    if (!s.data) return false;
+                    const uint8_t* bB = s.data;
+                    v010f = loadFromBlock(bB, lz,     0,      lx);
+                    v011f = loadFromBlock(bB, lz,     0,      lx + 1);
+                    v110f = loadFromBlock(bB, lz + 1, 0,      lx);
+                    v111f = loadFromBlock(bB, lz + 1, 0,      lx + 1);
+                } else {  // xCross
+                    s.tryUpdateBlockNonBlocking(bz, by, bx);
+                    if (!s.data) return false;
+                    const uint8_t* bA = s.data;
+                    v000f = loadFromBlock(bA, lz,     ly,     lx);
+                    v010f = loadFromBlock(bA, lz,     ly + 1, lx);
+                    v100f = loadFromBlock(bA, lz + 1, ly,     lx);
+                    v110f = loadFromBlock(bA, lz + 1, ly + 1, lx);
+                    s.tryUpdateBlockNonBlocking(bz, by, bx + 1);
+                    if (!s.data) return false;
+                    const uint8_t* bB = s.data;
+                    v001f = loadFromBlock(bB, lz,     ly,     0);
+                    v011f = loadFromBlock(bB, lz,     ly + 1, 0);
+                    v101f = loadFromBlock(bB, lz + 1, ly,     0);
+                    v111f = loadFromBlock(bB, lz + 1, ly + 1, 0);
+                }
+            } else {
+                // 2- or 3-axis crossing, or image-edge adjacent: fall back
+                // to per-corner sampleIntNB (handles OOB, negative indices,
+                // multi-block fetch uniformly).
+                uint8_t v000, v100, v010, v110, v001, v101, v011, v111;
+                if (!s.sampleIntNB(iz,     iy,     ix,     v000)) return false;
+                if (!s.sampleIntNB(iz + 1, iy,     ix,     v100)) return false;
+                if (!s.sampleIntNB(iz,     iy + 1, ix,     v010)) return false;
+                if (!s.sampleIntNB(iz + 1, iy + 1, ix,     v110)) return false;
+                if (!s.sampleIntNB(iz,     iy,     ix + 1, v001)) return false;
+                if (!s.sampleIntNB(iz + 1, iy,     ix + 1, v101)) return false;
+                if (!s.sampleIntNB(iz,     iy + 1, ix + 1, v011)) return false;
+                if (!s.sampleIntNB(iz + 1, iy + 1, ix + 1, v111)) return false;
+                v000f = float(v000); v100f = float(v100);
+                v010f = float(v010); v110f = float(v110);
+                v001f = float(v001); v101f = float(v101);
+                v011f = float(v011); v111f = float(v111);
+            }
         }
 
         float fz = vz - float(iz), fy = vy - float(iy), fx = vx - float(ix);
@@ -923,6 +1006,36 @@ void sampleCompositeAdaptiveImpl(
         scales[i] = (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f;
     }
 
+    // Parse compositeMethod once. Pixel loop previously did string compare
+    // per pixel for the LayerStorage path; convert to a small enum up front.
+    enum class LayerAgg : uint8_t { Median, MinAbs, Mean };
+    const LayerAgg layerAgg = (compositeMethod == "median") ? LayerAgg::Median
+                            : (compositeMethod == "minabs") ? LayerAgg::MinAbs
+                            : LayerAgg::Mean;
+
+    // UI caps composite layers at 16 front + 16 behind + center = 33. Bound
+    // once at the function level so the per-pixel loop and the bounds
+    // precheck both see the same compile-time-friendly trip count.
+    constexpr int kMaxLayers = 33;
+    const int nLHoisted = numLayers > kMaxLayers ? kMaxLayers : numLayers;
+
+    // Hoist lightParams fields into locals so the inner pixel loop doesn't
+    // reload them through the pointer each iteration.
+    const bool lightingEnabled = lightParams && lightParams->lightingEnabled;
+    const int  lightNormalSource = lightParams ? lightParams->lightNormalSource : 0;
+
+    // Volumetric-mode exp LUTs: exp(-extN * k) for k in [0..255]. extN is
+    // constant per call (from lightParams->blExtinction/255). Pre-computing
+    // 256 entries replaces 2*numLayers std::exp() calls per pixel with two
+    // cached table lookups.
+    alignas(64) float volExpLUT[256];
+    if constexpr (AMode == AccumMode2::Volumetric) {
+        const float extinction = lightParams ? lightParams->blExtinction : 1.5f;
+        const float extN = extinction / 255.0f;
+        for (int k = 0; k < 256; ++k)
+            volExpLUT[k] = std::exp(-extN * float(k));
+    }
+
     #pragma omp parallel
     {
         // Lazy per-level samplers: construct the level-0 sampler eagerly
@@ -940,6 +1053,35 @@ void sampleCompositeAdaptiveImpl(
         };
         std::vector<float> layerVals;
         if constexpr (AMode == AccumMode2::LayerStorage) layerVals.resize(numLayers);
+
+        // Hoist desiredLevel sampler's shape out of the per-pixel loop.
+        // In hot paths we dereference sh0 once per pixel for bounds; putting
+        // it in a local makes sure the compiler hoists past the per-layer
+        // loop.
+        VolumeShape sh0{};
+        if (nSamplers > 0) sh0 = sampler(0).shape;
+        const float sh0xF = float(sh0.sx), sh0yF = float(sh0.sy), sh0zF = float(sh0.sz);
+
+        // Ratios for scaling desiredLevel-sampler coords into coarser-level
+        // coords: scalesRatio[i] = scales[i] / scales[0] = 1 / 2^i. Used in
+        // the fallback loop so the hot path never computes scales[i]/endScale.
+        float scalesRatio[32] = {};
+        for (int i = 0; i < nSamplers && i < 32; i++)
+            scalesRatio[i] = (i > 0) ? 1.0f / float(1 << i) : 1.0f;
+
+        // When there's no per-pixel normals map (common case: plane viewer),
+        // nrm is constant across every pixel and the pre-scaled step vector
+        // (sdx,sdy,sdz) can be computed once here instead of per pixel.
+        const cv::Vec3f constNrm =
+            planeNormal ? *planeNormal : cv::Vec3f(0, 0, 0);
+        const float endScale0 = scales[0];
+        const float sdxConst = constNrm[0] * zStep * endScale0;
+        const float sdyConst = constNrm[1] * zStep * endScale0;
+        const float sdzConst = constNrm[2] * zStep * endScale0;
+        const float zOffStart = float(zStart) * zStep;
+        const float wxNrmStartConst = constNrm[0] * zOffStart;
+        const float wyNrmStartConst = constNrm[1] * zOffStart;
+        const float wzNrmStartConst = constNrm[2] * zOffStart;
 
         // Tile the output into 32x32 blocks. Most pixels in a tile map
         // into the same 1-4 level-0 blocks, so the sampler's slot cache
@@ -986,8 +1128,9 @@ void sampleCompositeAdaptiveImpl(
                     // emission. Materials with high density in front of the
                     // light end up darker (self-shadowing), which reveals
                     // micro-structure — fibers, ink, crackle — as relief.
+                    // Extinction is baked into volExpLUT once above; keep
+                    // the rest of the volumetric constants per-pixel-local.
                     const CompositeParams* p = lightParams;
-                    const float extinction = p ? p->blExtinction : 1.5f;
                     const float emissionScale = p ? p->blEmission : 1.5f;
                     const float ambient = p ? p->blAmbient : 0.1f;
                     const float diffuse = p ? p->lightDiffuse : 1.0f;
@@ -996,7 +1139,6 @@ void sampleCompositeAdaptiveImpl(
                     const float lDy = p ? p->lightDirY : 0.5f;
                     const float lDz = p ? p->lightDirZ : 0.707f;
 
-                    const float extN = extinction / 255.0f;
                     const float emiN = emissionScale / 255.0f;
 
                     const float vdx = nrm[0] * zStep;
@@ -1034,18 +1176,23 @@ void sampleCompositeAdaptiveImpl(
                             // Shadow ray: desired-level samples only. Missing
                             // chunks read as zero density (no shadow) — good
                             // enough while coarse levels stream in.
-                            float shadowAccum = 0.0f;
+                            int shadowAccum = 0;
                             float shx = svx, shy = svy, shz = svz;
                             for (int k = 1; k <= shadowSteps; k++) {
                                 shx += lDx; shy += lDy; shz += lDz;
                                 uint8_t sv = 0;
                                 trySampleNB<SMode>(*samplers[0],
                                     shz, shy, shx, sv);
-                                shadowAccum += float(sv);
+                                shadowAccum += int(sv);
                             }
-                            const float L = diffuse * std::exp(-extN * shadowAccum);
+                            // exp(-extN * x) via 256-entry LUT. shadowSteps
+                            // is capped so shadowAccum can exceed 255; clamp
+                            // saturates to the darkest entry (matches the
+                            // physical "fully opaque" limit).
+                            const int shIdx = shadowAccum < 255 ? shadowAccum : 255;
+                            const float L = diffuse * volExpLUT[shIdx];
                             const float emission = float(v) * emiN * (L + ambient);
-                            const float layerT = std::exp(-extN * float(v));
+                            const float layerT = volExpLUT[v];
                             accumC += emission * transmittance * (1.0f - layerT);
                             transmittance *= layerT;
                             if (transmittance < 0.001f) break;
@@ -1064,59 +1211,66 @@ void sampleCompositeAdaptiveImpl(
                 int count=0;
                 // Incremental per-layer offset along the normal direction:
                 // one vector add per layer instead of 3 FMAs.
-                const float dx = nrm[0] * zStep;
-                const float dy = nrm[1] * zStep;
-                const float dz = nrm[2] * zStep;
-                float wx = base[0] + nrm[0] * float(zStart) * zStep;
-                float wy = base[1] + nrm[1] * float(zStart) * zStep;
-                float wz = base[2] + nrm[2] * float(zStart) * zStep;
+                const float endScale = endScale0;
+                // Pre-scale step + start into desiredLevel-sampler space so
+                // the per-layer hot loop becomes a pure add instead of
+                // multiplying three coords by endScale every iteration.
+                // When the caller supplied no per-pixel normals, sdx/sdy/sdz
+                // are pixel-independent — use the hoisted constants.
+                const float sdx = nrow ? (nrm[0] * zStep * endScale) : sdxConst;
+                const float sdy = nrow ? (nrm[1] * zStep * endScale) : sdyConst;
+                const float sdz = nrow ? (nrm[2] * zStep * endScale) : sdzConst;
+                const float wxNrmStart = nrow ? (nrm[0] * zOffStart) : wxNrmStartConst;
+                const float wyNrmStart = nrow ? (nrm[1] * zOffStart) : wyNrmStartConst;
+                const float wzNrmStart = nrow ? (nrm[2] * zOffStart) : wzNrmStartConst;
+                float swx = (base[0] + wxNrmStart) * endScale;
+                float swy = (base[1] + wyNrmStart) * endScale;
+                float swz = (base[2] + wzNrmStart) * endScale;
 
                 // Pixel-level bounds precheck at level 0: if the entire
                 // z-line fits in bounds, skip all per-sample float compares.
-                // Reserves 1-voxel margin for nearest rounding.
-                const auto& sh0 = sampler(0).shape;
-                const float endScale = scales[0];
-                const float fwx = wx * endScale, fwy = wy * endScale, fwz = wz * endScale;
-                const float tailFx = (wx + dx * float(numLayers - 1)) * endScale;
-                const float tailFy = (wy + dy * float(numLayers - 1)) * endScale;
-                const float tailFz = (wz + dz * float(numLayers - 1)) * endScale;
-                const float minFx = std::min(fwx, tailFx);
-                const float maxFx = std::max(fwx, tailFx);
-                const float minFy = std::min(fwy, tailFy);
-                const float maxFy = std::max(fwy, tailFy);
-                const float minFz = std::min(fwz, tailFz);
-                const float maxFz = std::max(fwz, tailFz);
-                const bool fullyInBounds = SMode == SampleMode::Nearest
-                    && minFx >= 0.5f && maxFx < float(sh0.sx) - 0.5f
-                    && minFy >= 0.5f && maxFy < float(sh0.sy) - 0.5f
-                    && minFz >= 0.5f && maxFz < float(sh0.sz) - 0.5f;
-
-                // UI caps composite layers at 16 front + 16 behind + center,
-                // so the loop trip count is always <= 33. Bound-clamping lets
-                // the unroller estimate the trip count and the branch
-                // predictor size the loop body accurately.
-                constexpr int kMaxLayers = 33;
-                int nL = numLayers;
-                if (nL > kMaxLayers) nL = kMaxLayers;
+                // Reserves 1-voxel margin for nearest rounding. Only the
+                // Nearest path uses the resulting flag, so compile the
+                // precheck out of the trilinear instantiation entirely.
+                bool fullyInBounds = false;
+                if constexpr (SMode == SampleMode::Nearest) {
+                    const float tailSx = swx + sdx * float(numLayers - 1);
+                    const float tailSy = swy + sdy * float(numLayers - 1);
+                    const float tailSz = swz + sdz * float(numLayers - 1);
+                    const float minSx = std::min(swx, tailSx);
+                    const float maxSx = std::max(swx, tailSx);
+                    const float minSy = std::min(swy, tailSy);
+                    const float maxSy = std::max(swy, tailSy);
+                    const float minSz = std::min(swz, tailSz);
+                    const float maxSz = std::max(swz, tailSz);
+                    fullyInBounds = minSx >= 0.5f && maxSx < sh0xF - 0.5f
+                                 && minSy >= 0.5f && maxSy < sh0yF - 0.5f
+                                 && minSz >= 0.5f && maxSz < sh0zF - 0.5f;
+                }
+                const int nL = nLHoisted;
                 #pragma clang loop unroll(enable) vectorize(enable)
                 for (int li=0; li<nL; li++) {
                     uint8_t v = 0;
                     bool got = false;
                     if (fullyInBounds) {
-                        // Hot path: skip per-sample bounds check. Scale
-                        // world coords into the desiredLevel sampler's
-                        // space (scales[0] = 1/2^desiredLevel).
+                        // Hot path: skip per-sample bounds check. Coords are
+                        // already in desiredLevel-sampler space.
                         got = trySampleNearestUnchecked(*samplers[0],
-                            wz * endScale, wy * endScale, wx * endScale, v);
+                            swz, swy, swx, v);
                     }
                     if (!got) {
                         // Fallback: either we're near a boundary or the
                         // desired-level block isn't resident yet. Walk the
                         // fallback chain from finest to coarsest — adaptive
                         // sampling fills in from whichever level is ready.
+                        // Coarser levels need coords at their own scale;
+                        // the ratio scales[i]/endScale applied to the
+                        // already-scaled swx/swy/swz gets us there without
+                        // re-deriving from base.
                         for (int i=0; i<nSamplers; i++) {
-                            float scl = scales[i];
-                            if (trySampleNB<SMode>(sampler(i), wz*scl, wy*scl, wx*scl, v)) {
+                            const float r = scalesRatio[i];
+                            if (trySampleNB<SMode>(sampler(i),
+                                swz * r, swy * r, swx * r, v)) {
                                 if (uint8_t(i) > pxLevel) pxLevel = uint8_t(i);
                                 break;
                             }
@@ -1126,7 +1280,7 @@ void sampleCompositeAdaptiveImpl(
                     else if constexpr (AMode == AccumMode2::Min) { mn = std::min(mn, float(v)); }
                     else if constexpr (AMode == AccumMode2::Mean) { accum += float(v); count++; }
                     else { layerVals[li] = float(v); }
-                    wx += dx; wy += dy; wz += dz;
+                    swx += sdx; swy += sdy; swz += sdz;
                 }
 
                 float val = 0.f;
@@ -1134,7 +1288,7 @@ void sampleCompositeAdaptiveImpl(
                 else if constexpr (AMode == AccumMode2::Min) val = mn;
                 else if constexpr (AMode == AccumMode2::Mean) val = count ? accum * (1.0f/float(count)) : 0.f;
                 else {
-                    if (compositeMethod == "median") {
+                    if (layerAgg == LayerAgg::Median) {
                         // For the small N we see in practice (<=~33 layers),
                         // insertion-sort-up-to-the-median beats nth_element:
                         // its introselect setup costs more than sorting a
@@ -1144,7 +1298,7 @@ void sampleCompositeAdaptiveImpl(
                                           layerVals.begin() + numLayers/2 + 1,
                                           layerVals.end());
                         val = layerVals[numLayers/2];
-                    } else if (compositeMethod == "minabs") {
+                    } else if (layerAgg == LayerAgg::MinAbs) {
                         // Hoist abs(best-127.5) out of the loop and use std::fabs
                         // (hardware fabs opcode vs. std::abs's integer-path).
                         float best = layerVals[0];
@@ -1161,9 +1315,9 @@ void sampleCompositeAdaptiveImpl(
                         val = s * invN;
                     }
                 }
-                if (lightParams && lightParams->lightingEnabled) {
+                if (lightingEnabled) {
                     cv::Vec3f lnrm;
-                    if (lightParams->lightNormalSource == 1) {
+                    if (lightNormalSource == 1) {
                         // Volume-gradient normal: six cheap samples around
                         // base in the desired-level sampler's space. Reveals
                         // local density variation (fibers, ink, crackle)
