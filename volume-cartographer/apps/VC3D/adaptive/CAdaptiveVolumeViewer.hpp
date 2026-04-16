@@ -82,7 +82,7 @@ public:
     // --- Settings passthrough ---
     void setCompositeRenderSettings(const CompositeRenderSettings& s) {
         _compositeSettings = s;
-        submitRender();
+        scheduleRender();
     }
     const CompositeRenderSettings& compositeRenderSettings() const override { return _compositeSettings; }
     bool isCompositeEnabled() const override { return _compositeSettings.enabled; }
@@ -91,8 +91,8 @@ public:
     void setVolumeWindow(float low, float high);
     float volumeWindowLow() const { return _windowLow; }
     float volumeWindowHigh() const { return _windowHigh; }
-    void setBaseColormap(const std::string& id) { _baseColormapId = id; submitRender(); }
-    void setStretchValues(bool) { submitRender(); }
+    void setBaseColormap(const std::string& id) { _baseColormapId = id; scheduleRender(); }
+    void setStretchValues(bool) { scheduleRender(); }
 
     // --- Display stubs ---
     void setResetViewOnSurfaceChange(bool v) { _resetViewOnSurfaceChange = v; }

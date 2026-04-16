@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <filesystem>
 #include <iterator>
 #include <mutex>
@@ -371,8 +372,9 @@ public:
 
     mutable cv::Mat_<uint8_t> _validMaskCache;
     // Set when _validMaskCache contains no 0s — gen() can skip the
-    // validity warp + per-pixel invalidation pass entirely.
-    mutable bool _validMaskAllValid = false;
+    // validity warp + per-pixel invalidation pass entirely. Atomic
+    // because gen() can be called from concurrent OMP threads.
+    mutable std::atomic<bool> _validMaskAllValid{false};
     mutable cv::Mat_<cv::Vec3f> _normalCache;
     cv::Vec2f _scale;
 

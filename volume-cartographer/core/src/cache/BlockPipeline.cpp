@@ -108,9 +108,12 @@ std::shared_ptr<std::vector<std::byte>> BlockPipeline::shardBytesFor(
     // 256 loader threads contending on shardCacheMutex_, skipping the
     // map + lock for same-shard hits saves ~1-2% total CPU per profile.
     // The shared_ptr keeps bytes alive even if the LRU evicts them.
+    // Qualify with `this` so a volume swap (pipeline destroyed + recreated)
+    // doesn't serve stale data from the old pipeline's shard cache.
+    thread_local const BlockPipeline* tlOwner = nullptr;
     thread_local ShardKey tlLastShard{-1, -1, -1, -1};
     thread_local std::shared_ptr<std::vector<std::byte>> tlLastBytes;
-    if (tlLastShard == sk && tlLastBytes) {
+    if (tlOwner == this && tlLastShard == sk && tlLastBytes) {
         statShardHits_.fetch_add(1, std::memory_order_relaxed);
         return tlLastBytes;
     }
@@ -123,6 +126,7 @@ std::shared_ptr<std::vector<std::byte>> BlockPipeline::shardBytesFor(
             shardCacheLru_.splice(shardCacheLru_.begin(),
                                    shardCacheLru_, it->second);
             statShardHits_.fetch_add(1, std::memory_order_relaxed);
+            tlOwner = this;
             tlLastShard = sk;
             tlLastBytes = it->second->bytes;
             return it->second->bytes;
@@ -148,6 +152,7 @@ std::shared_ptr<std::vector<std::byte>> BlockPipeline::shardBytesFor(
         return it->second->bytes;
     }
     shardCacheInsertLocked(sk, bytes);
+    tlOwner = this;
     tlLastShard = sk;
     tlLastBytes = bytes;
     return bytes;
@@ -1056,8 +1061,11 @@ size_t BlockPipeline::countAvailable(const std::vector<ChunkKey>& keys) const {
         }
         const int z = bpcZ[key.level], y = bpcY[key.level], x = bpcX[key.level];
         if (z <= 0 || y <= 0 || x <= 0) continue;
-        BlockKey bk{key.level, key.iz * z, key.iy * y, key.ix * x};
-        if (blockCache_.contains(bk)) n++;
+        // Check first + last block (matches fetchInteractive's two-block
+        // probe) so partial eviction doesn't report the chunk as available.
+        BlockKey first{key.level, key.iz * z, key.iy * y, key.ix * x};
+        BlockKey last{key.level, key.iz * z + z - 1, key.iy * y + y - 1, key.ix * x + x - 1};
+        if (blockCache_.contains(first) && blockCache_.contains(last)) n++;
     }
     return n;
 }
