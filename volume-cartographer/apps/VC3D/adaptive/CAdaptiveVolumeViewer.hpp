@@ -286,6 +286,11 @@ private:
     float _windowLow = 0.0f;
     float _windowHigh = 255.0f;
     std::string _baseColormapId;
+    // Flattened-view z-scroll translation direction (unit vector in world
+    // space). Captured at each shift+scroll from the surface normal under
+    // the view center so the translation is rigid — plain zoom never
+    // exposes curvature drift.
+    cv::Vec3f _zOffWorldDir{0.0f, 0.0f, 0.0f};
 
     // LUT cache: rebuild only when inputs change.
     std::array<uint32_t, 256> _cachedLut{};
@@ -337,6 +342,8 @@ private:
     bool _genCacheWantComposite = false;
     Surface* _genCacheSurfKey = nullptr;
     bool _genCacheDirty = true;
+    float _genCacheZOff = 0.0f;
+    cv::Vec3f _genCacheZOffDir{0.0f, 0.0f, 0.0f};
 
 public:
     // Re-reads perf/interaction settings from disk into cached members.
