@@ -19,6 +19,7 @@ from vesuvius.neural_tracing.autoreg_mesh.losses import (
     _build_distance_aware_coarse_targets,
     _geometry_metric_loss,
     _geometry_sd_loss,
+    _masked_mean,
     _seam_edge_loss_from_sequence,
     _sequence_to_grid_torch,
     _triangle_barrier_loss_from_sequence,
@@ -773,6 +774,46 @@ def test_occupancy_metric_uses_refined_predictions() -> None:
     )
 
     assert refined_losses["occupancy_metric"].item() < wrong_losses["occupancy_metric"].item()
+
+
+def test_masked_mean_ignores_nan_values_outside_mask() -> None:
+    values = torch.tensor([1.0, float("nan"), 3.0], dtype=torch.float32)
+    mask = torch.tensor([True, False, True], dtype=torch.bool)
+
+    result = _masked_mean(values, mask)
+
+    assert torch.isfinite(result)
+    assert result.item() == pytest.approx(2.0)
+
+
+def test_occupancy_metric_uses_full_grid_length_not_supervision_count() -> None:
+    batch = autoreg_mesh_collate([_make_sample("left")])
+    batch["target_supervision_mask"][0, 0] = False
+    outputs = {
+        "coarse_logits": torch.zeros((1, batch["target_xyz"].shape[1], 8), dtype=torch.float32),
+        "offset_logits": torch.zeros((1, batch["target_xyz"].shape[1], 3, 4), dtype=torch.float32),
+        "stop_logits": torch.zeros((1, batch["target_xyz"].shape[1]), dtype=torch.float32),
+        "pred_refine_residual": torch.zeros_like(batch["target_xyz"]),
+        "pred_xyz": batch["target_xyz"].clone(),
+        "pred_xyz_soft": batch["target_xyz"].clone(),
+        "pred_xyz_refined": batch["target_xyz"].clone(),
+        "pred_coarse_ids": batch["target_coarse_ids"].clone(),
+        "pred_coarse_axis_ids": {
+            "z": torch.zeros_like(batch["target_coarse_ids"]),
+            "y": torch.zeros_like(batch["target_coarse_ids"]),
+            "x": torch.zeros_like(batch["target_coarse_ids"]),
+        },
+        "coarse_grid_shape": (2, 2, 2),
+    }
+
+    losses = compute_autoreg_mesh_losses(
+        outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+        occupancy_loss_weight=1.0,
+    )
+
+    assert torch.isfinite(losses["occupancy_metric"])
 
 
 def test_position_refine_loss_is_gated_by_step_weight(tmp_path: Path) -> None:

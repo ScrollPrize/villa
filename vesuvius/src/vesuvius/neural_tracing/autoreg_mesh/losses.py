@@ -11,7 +11,8 @@ from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid
 def _masked_mean(values: Tensor, mask: Tensor) -> Tensor:
     mask = mask.to(dtype=values.dtype)
     denom = mask.sum().clamp(min=1.0)
-    return (values * mask).sum() / denom
+    safe_values = torch.where(mask > 0, torch.nan_to_num(values, nan=0.0, posinf=0.0, neginf=0.0), torch.zeros_like(values))
+    return safe_values.sum() / denom
 
 
 def _build_distance_aware_coarse_targets(
@@ -714,15 +715,14 @@ def _geometry_sd_loss_from_sequence(pred_xyz_sequence: Tensor, batch: dict) -> T
 
 def _occupancy_metric(outputs: dict, batch: dict) -> Tensor:
     pred_xyz = outputs.get("pred_xyz_refined", outputs["pred_xyz"]).detach().cpu()
-    target_mask = batch["target_supervision_mask"].detach().cpu()
     volume = batch["volume"]
     device = volume.device
     losses = []
     for batch_idx in range(pred_xyz.shape[0]):
-        count = int(target_mask[batch_idx].sum().item())
+        grid_shape = tuple(int(v) for v in batch["target_grid_shape"][batch_idx].tolist())
+        count = int(grid_shape[0] * grid_shape[1])
         if count <= 0:
             continue
-        grid_shape = tuple(int(v) for v in batch["target_grid_shape"][batch_idx].tolist())
         pred_grid = pred_xyz[batch_idx, :count].numpy()
         pred_grid = pred_grid.reshape(grid_shape[0], grid_shape[1], 3)
         target_grid = batch["target_grid_local"][batch_idx].detach().cpu().numpy()
