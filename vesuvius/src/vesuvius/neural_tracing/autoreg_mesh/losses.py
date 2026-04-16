@@ -323,7 +323,7 @@ def _pred_oob_fraction_from_sequence(pred_xyz_sequence: Tensor, batch: dict) -> 
     mask = _sequence_token_mask(pred_xyz_sequence, batch)
     finite = _prediction_finite_mask(pred_xyz_sequence)
     max_coord = _crop_max_coord(pred_xyz_sequence, batch)
-    oob = finite & (((pred_xyz_sequence < 0.0) | (pred_xyz_sequence >= max_coord.view(1, 1, 3))).any(dim=-1))
+    oob = finite & (((pred_xyz_sequence < 0.0) | (pred_xyz_sequence > max_coord.view(1, 1, 3))).any(dim=-1))
     return _masked_mean(oob.to(dtype=pred_xyz_sequence.dtype), mask)
 
 

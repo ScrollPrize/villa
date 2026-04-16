@@ -204,6 +204,7 @@ def _fast_prefilter_plan(
         masked_local,
         volume_shape=volume_shape,
         direction=str(direction),
+        frontier_band_width=int(frontier_band_width),
     )
     if _should_reject_boundary_stats(boundary_stats):
         return False, boundary_stats
@@ -667,6 +668,7 @@ class AutoregMeshDataset(Dataset):
             serialized["target_grid_local"],
             volume_shape=self.crop_size,
             direction=str(serialized["direction"]),
+            frontier_band_width=int(self.config["frontier_band_width"]),
         )
         if _should_reject_boundary_stats(boundary_stats):
             return None

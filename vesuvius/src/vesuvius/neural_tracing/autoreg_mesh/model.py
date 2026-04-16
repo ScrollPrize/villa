@@ -345,6 +345,12 @@ class AutoregMeshModel(nn.Module):
         self.register_buffer("conditioning_feature_debias_basis", debias_basis, persistent=False)
         self.last_conditioning_feature_debias_norm_ratio: float = 1.0
 
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.backbone is not None:
+            self.backbone.eval()
+        return self
+
     def _normalize_xyz(self, xyz: Tensor) -> Tensor:
         shape = torch.tensor(self.input_shape, device=xyz.device, dtype=xyz.dtype)
         return (2.0 * (xyz / torch.clamp(shape - 1.0, min=1.0))) - 1.0

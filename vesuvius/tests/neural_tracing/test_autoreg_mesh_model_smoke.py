@@ -17,6 +17,7 @@ from vesuvius.neural_tracing.autoreg_mesh.config import validate_autoreg_mesh_co
 from vesuvius.neural_tracing.autoreg_mesh.dataset import (
     _apply_volume_only_augmentation,
     _compute_target_boundary_stats,
+    _fast_prefilter_plan,
     _should_reject_boundary_stats,
     autoreg_mesh_collate,
 )
@@ -450,6 +451,20 @@ def test_debias_autoreg_mesh_model_forward_and_losses_are_finite(tmp_path: Path)
     assert outputs["coarse_logits"].shape[-1] == 8
     for value in losses.values():
         assert torch.isfinite(value)
+
+
+def test_model_train_keeps_frozen_backbone_in_eval_mode(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "tiny_dinovol.pt"
+    _write_local_guide_checkpoint(checkpoint)
+    model = AutoregMeshModel(_make_config(checkpoint))
+
+    assert model.backbone is not None
+    assert model.backbone.training is False
+
+    model.train()
+
+    assert model.training is True
+    assert model.backbone.training is False
 
 
 def test_debias_projection_reduces_energy_in_learned_basis(tmp_path: Path) -> None:
@@ -1290,6 +1305,62 @@ def test_boundary_loss_and_oob_metrics_increase_outside_crop() -> None:
     assert outside_losses["boundary_loss"].item() > inside_losses["boundary_loss"].item()
     assert outside_losses["pred_oob_fraction_refined"].item() > inside_losses["pred_oob_fraction_refined"].item()
     assert torch.isfinite(outside_losses["loss"])
+
+
+def test_boundary_vertices_are_not_counted_as_oob() -> None:
+    batch = autoreg_mesh_collate([_make_sample("left")])
+    max_coord = torch.tensor([15.9999, 15.9999, 15.9999], dtype=torch.float32).view(1, 1, 3)
+    boundary_pred = max_coord.expand_as(batch["target_xyz"]).clone()
+    outputs = {
+        "coarse_logits": torch.zeros((1, batch["target_xyz"].shape[1], 8), dtype=torch.float32),
+        "offset_logits": torch.zeros((1, batch["target_xyz"].shape[1], 3, 4), dtype=torch.float32),
+        "stop_logits": torch.zeros((1, batch["target_xyz"].shape[1]), dtype=torch.float32),
+        "pred_refine_residual": torch.zeros_like(batch["target_xyz"]),
+        "pred_xyz": boundary_pred,
+        "pred_xyz_soft": boundary_pred,
+        "pred_xyz_refined": boundary_pred,
+        "pred_coarse_ids": batch["target_coarse_ids"].clone(),
+        "pred_coarse_axis_ids": {
+            "z": torch.zeros_like(batch["target_coarse_ids"]),
+            "y": torch.zeros_like(batch["target_coarse_ids"]),
+            "x": torch.zeros_like(batch["target_coarse_ids"]),
+        },
+        "coarse_grid_shape": (2, 2, 2),
+    }
+
+    losses = compute_autoreg_mesh_losses(
+        outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+    )
+
+    assert losses["pred_oob_fraction_refined"].item() == pytest.approx(0.0)
+    assert losses["teacher_forced_boundary_touch_fraction"].item() == pytest.approx(1.0)
+
+
+def test_fast_prefilter_respects_frontier_band_width() -> None:
+    surface_local = _make_surface(5, 5, z_offset=4.0, y_offset=2.0, x_offset=2.0)
+    surface_local[:, 2, 0] = -1.0
+
+    valid_band1, _ = _fast_prefilter_plan(
+        surface_local,
+        direction="left",
+        conditioning_count=1,
+        frontier_band_width=1,
+        surface_downsample_factor=1,
+        volume_shape=(16, 16, 16),
+    )
+    valid_band2, _ = _fast_prefilter_plan(
+        surface_local,
+        direction="left",
+        conditioning_count=1,
+        frontier_band_width=2,
+        surface_downsample_factor=1,
+        volume_shape=(16, 16, 16),
+    )
+
+    assert valid_band1 is True
+    assert valid_band2 is False
 
 
 def test_volume_only_augmentation_changes_volume_without_touching_geometry() -> None:
