@@ -107,9 +107,18 @@ struct BlockSampler {
         return (uint64_t(uint32_t(bz)) << 42) | (uint64_t(uint32_t(by)) << 21) | uint64_t(uint32_t(bx));
     }
 
-    VC_FORCE_INLINE int slotIndex(int bz, int by, int bx) const {
-        uint32_t h = uint32_t(bz) * 73856093u ^ uint32_t(by) * 19349663u ^ uint32_t(bx) * 83492791u;
+    // Cheap finalizer over the already-packed key. Reuses packKey's output
+    // instead of re-hashing the three int coords with three multiplies;
+    // the xor-fold mixes all three 21/22-bit axis fields into the low bits.
+    VC_FORCE_INLINE int slotIndexFromKey(uint64_t key) const {
+        uint64_t h = key ^ (key >> 21) ^ (key >> 42);
+        h ^= h >> 15;
+        h *= 0x2545F4914F6CDD1DULL;
         return int(h) & kSlotMask;
+    }
+
+    VC_FORCE_INLINE int slotIndex(int bz, int by, int bx) const {
+        return slotIndexFromKey(packKey(bz, by, bx));
     }
 
     // Fetch the block pointer for (bz, by, bx). Non-blocking: returns null
@@ -123,7 +132,7 @@ struct BlockSampler {
         uint64_t key = packKey(bz, by, bx);
         if (key == lastKey) [[likely]] return;
 
-        int idx = slotIndex(bz, by, bx);
+        int idx = slotIndexFromKey(key);
         HotSlot& slot = slots[idx];
         if (slot.key == key) [[likely]] {
             data = slot.data;

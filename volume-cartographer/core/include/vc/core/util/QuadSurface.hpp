@@ -370,6 +370,9 @@ public:
     void writeValidMask(const cv::Mat& img = cv::Mat());
 
     mutable cv::Mat_<uint8_t> _validMaskCache;
+    // Set when _validMaskCache contains no 0s — gen() can skip the
+    // validity warp + per-pixel invalidation pass entirely.
+    mutable bool _validMaskAllValid = false;
     mutable cv::Mat_<cv::Vec3f> _normalCache;
     cv::Vec2f _scale;
 

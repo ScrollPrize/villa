@@ -839,7 +839,10 @@ void CAdaptiveVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     _scene->setSceneRect(0, 0, w, h);
 
     _cachedStretchValid = false;
-    submitRender();
+    // Zoom can fire as fast as the keyboard repeats. scheduleRender()
+    // coalesces bursts into the 60 fps render timer so we don't render
+    // dozens of intermediate frames the user never sees.
+    scheduleRender();
 }
 
 void CAdaptiveVolumeViewer::adjustZoomByFactor(float factor)

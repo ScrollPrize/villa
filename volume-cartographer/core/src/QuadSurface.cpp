@@ -11,6 +11,7 @@
 #include <opencv2/imgcodecs.hpp>
 
 #include <array>
+#include <cstring>
 #include <iostream>
 #include <system_error>
 #include <cmath>
@@ -415,6 +416,7 @@ bool QuadSurface::trimToValidBbox()
     _bounds = {0, 0, bbW - 1, bbH - 1};
     _bbox = {{-1, -1, -1}, {-1, -1, -1}};  // World bbox cached, needs recompute.
     _validMaskCache = cv::Mat_<uint8_t>();
+    _validMaskAllValid = false;
     _normalCache = cv::Mat_<cv::Vec3f>();
     std::fprintf(stderr,
         "[SURF] trim %s %dx%d -> %dx%d  saved %zu MB (%.1f%%)\n",
@@ -437,6 +439,7 @@ void QuadSurface::unloadPoints()
     _points.reset();
     _channels.clear();
     _validMaskCache = cv::Mat_<uint8_t>();
+    _validMaskAllValid = false;
     _normalCache = cv::Mat_<cv::Vec3f>();
     _needsLoad = true;
     std::fprintf(stderr, "[SURF] unload %s (%zu MB freed)\n", id.c_str(), mb);
@@ -445,6 +448,7 @@ void QuadSurface::unloadPoints()
 void QuadSurface::unloadCaches()
 {
     _validMaskCache = cv::Mat_<uint8_t>();
+    _validMaskAllValid = false;
     _normalCache = cv::Mat_<cv::Vec3f>();
     // Release loaded channel pixel data but keep the keys so channel(name)
     // still knows which channels exist on disk and can lazy-reload them.
@@ -476,17 +480,27 @@ cv::Mat_<uint8_t> QuadSurface::validMask() const
     //  - Bitwise & / | so the compiler emits straight-line NEON, no early exit.
     // Inf is treated as valid here (was rejected by std::isfinite); coordinates
     // never go to ±Inf in the surface pipeline, so this is a safe relaxation.
+    // Per-row "any invalid" accumulator for the all-valid fast path in
+    // gen() below. OR-reduced across threads after the loop.
+    std::vector<uint8_t> anyInvalidPerRow(rows, 0);
 #pragma omp parallel for schedule(dynamic, 16)
     for (int j = 0; j < rows; ++j) {
         const cv::Vec3f* __restrict__ row = (*_points)[j];
         uint8_t* __restrict__ dst = mask[j];
+        uint8_t rowAnyInvalid = 0;
         for (int i = 0; i < cols; ++i) {
             const float a = row[i][0], b = row[i][1], c = row[i][2];
             const int nan = (a != a) | (b != b) | (c != c);
             const int sent = (a == -1.f) & (b == -1.f) & (c == -1.f);
-            dst[i] = (nan | sent) ? uint8_t(0) : uint8_t(255);
+            const uint8_t invalid = (nan | sent) ? uint8_t(1) : uint8_t(0);
+            dst[i] = invalid ? uint8_t(0) : uint8_t(255);
+            rowAnyInvalid |= invalid;
         }
+        anyInvalidPerRow[j] = rowAnyInvalid;
     }
+    uint8_t anyInvalid = 0;
+    for (uint8_t v : anyInvalidPerRow) anyInvalid |= v;
+    _validMaskAllValid = (anyInvalid == 0);
     _validMaskCache = mask;
     return mask;
 }
@@ -523,6 +537,7 @@ void QuadSurface::invalidateCache()
 
     _bbox = {{-1, -1, -1}, {-1, -1, -1}};
     _validMaskCache = cv::Mat_<uint8_t>();
+    _validMaskAllValid = false;
 }
 
 void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
@@ -564,7 +579,10 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     cv::Mat A = cv::getAffineTransform(srcf.data(), dstf.data());
 
     // --- build a source validity mask (255 if point is valid) -------------
+    // Trigger the cache build + set _validMaskAllValid before deciding
+    // whether we need the validity warp below.
     cv::Mat valid_src = validMask();
+    const bool skipValidity = _validMaskAllValid;
 
     // --- warp coords with seam-safe border (replicate) -------------------
     cv::Mat_<cv::Vec3f> coords_big;
@@ -572,9 +590,13 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
                 cv::INTER_LINEAR, cv::BORDER_REPLICATE);
 
     // --- warp validity with constant 0 (no replicate leakage) -----------
+    // Skip entirely when the source mask is all-valid: the cropped region
+    // can only contain 255s (the 4px halo that would hold 0s is discarded).
     cv::Mat valid_big;
-    cv::warpAffine(valid_src, valid_big, A, size + cv::Size(8, 8),
-                cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
+    if (!skipValidity) {
+        cv::warpAffine(valid_src, valid_big, A, size + cv::Size(8, 8),
+                    cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
+    }
 
     // --- normals: warp cached source-grid normals -------------------
     cv::Mat_<cv::Vec3f> normals_big;
@@ -622,21 +644,44 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     // Mat header. Skips ~48MB/frame of memcpy for a 1920x1080 composite.
     cv::Rect inner(4, 4, w, h);
     *coords = coords_big(inner);
-    cv::Mat valid = valid_big(inner);
     if (need_normals) {
         *normals = normals_big(inner);
     }
 
     // --- invalidate out-of-footprint pixels (kill GUI leakage) ----------
+    // When the source mask is all-valid the cropped image has no 0s, so
+    // skip the invalidation pass entirely. Otherwise walk coords + normals
+    // once together (fused vs OpenCV's valid==0 + setTo pair of passes).
     const cv::Vec3f qnan(std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN());
-    coords->setTo(qnan, valid == 0);
-    if (need_normals) normals->setTo(qnan, valid == 0);
+    if (!skipValidity) {
+        cv::Mat valid = valid_big(inner);
+        const bool doNormals = need_normals;
+        for (int j = 0; j < h; ++j) {
+            const uint8_t* __restrict__ v = valid.ptr<uint8_t>(j);
+            cv::Vec3f* __restrict__ crow = coords->ptr<cv::Vec3f>(j);
+            cv::Vec3f* __restrict__ nrow = doNormals
+                ? normals->ptr<cv::Vec3f>(j) : nullptr;
+            for (int i = 0; i < w; ++i) {
+                if (!v[i]) {
+                    crow[i] = qnan;
+                    if (doNormals) nrow[i] = qnan;
+                }
+            }
+        }
+    }
 
     // --- apply offset along normals only where normals are valid --------
     if (need_normals && ul[2] != 0.0f) {
         const float off = ul[2];
+        // Bitwise isnan: exponent all-ones + non-zero mantissa. Safe under
+        // -ffast-math which otherwise folds `x == x` to constant true.
+        auto isNanBitwise = [](float f) {
+            uint32_t bits;
+            std::memcpy(&bits, &f, sizeof(bits));
+            return (bits & 0x7F800000u) == 0x7F800000u && (bits & 0x7FFFFFu) != 0;
+        };
         for (int j = 0; j < h; ++j) {
             // Row pointers skip cv::Mat::at()'s bounds-check overhead and
             // let the compiler hoist the row-base arithmetic out of the
@@ -645,10 +690,7 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
             cv::Vec3f* crow = coords->ptr<cv::Vec3f>(j);
             for (int i = 0; i < w; ++i) {
                 const cv::Vec3f& n = nrow[i];
-                // -ffast-math makes std::isfinite unreliable (and slow).
-                // `x == x` is false only for NaN; we only need to skip NaN
-                // here — inf would still produce a finite offset if rare.
-                if (n[0] == n[0] && n[1] == n[1] && n[2] == n[2]) {
+                if (!isNanBitwise(n[0]) && !isNanBitwise(n[1]) && !isNanBitwise(n[2])) {
                     crow[i][0] += n[0] * off;
                     crow[i][1] += n[1] * off;
                     crow[i][2] += n[2] * off;
@@ -966,6 +1008,7 @@ void QuadSurface::invalidateMask()
     // Clear from memory
     _channels.erase("mask");
     _validMaskCache = cv::Mat_<uint8_t>();
+    _validMaskAllValid = false;
 
     // Delete from disk
     if (!path.empty()) {
