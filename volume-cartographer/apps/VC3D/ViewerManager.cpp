@@ -539,39 +539,12 @@ void ViewerManager::rebuildSurfacePatchIndexIfNeeded()
     if (!_surfacePatchIndexNeedsRebuild) {
         return;
     }
-    _surfacePatchIndexNeedsRebuild = false;
-
-    if (!_state) {
-        _surfacePatchIndex.clear();
-        _indexedSurfaceIds.clear();
-        qCInfo(lcViewerManager) << "SurfacePatchIndex cleared (no surface collection)";
-        return;
-    }
-
-    std::vector<SurfacePatchIndex::SurfacePtr> surfaces;
-    std::vector<std::string> surfaceIds;
-    // Track seen surfaces to avoid duplicates (e.g., "segmentation" alias)
-    std::unordered_set<SurfacePatchIndex::SurfacePtr> seenSurfaces;
-    for (const auto& surf : _state->surfaces()) {
-        if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surf)) {
-            if (seenSurfaces.insert(quad).second) {
-                surfaces.push_back(quad);
-                surfaceIds.push_back(surf->id);
-            }
-        }
-    }
-
-    if (surfaces.empty()) {
-        _surfacePatchIndex.clear();
-        _indexedSurfaceIds.clear();
-        qCInfo(lcViewerManager) << "SurfacePatchIndex cleared (no QuadSurfaces to index)";
-        return;
-    }
-
-    qCInfo(lcViewerManager) << "Rebuilding SurfacePatchIndex for" << surfaces.size() << "surfaces";
-    _surfacePatchIndex.rebuild(surfaces);
-    _indexedSurfaceIds.clear();
-    _indexedSurfaceIds.insert(surfaceIds.begin(), surfaceIds.end());
+    // Called from the render hot path via surfacePatchIndex(). Do not do
+    // a synchronous rtree rebuild here — a 2K² surface takes seconds and
+    // would freeze the GUI. primeSurfacePatchIndicesAsync() clears the
+    // flag inside itself; readers will see the stale-but-valid index
+    // until the worker swap completes.
+    primeSurfacePatchIndicesAsync();
 }
 
 void ViewerManager::handleSurfacePatchIndexPrimeFinished()
@@ -637,40 +610,23 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
     const bool asyncRebuildInProgress = _surfacePatchIndexWatcher &&
                                         _surfacePatchIndexWatcher->isRunning();
 
-    // Flush any pending cell updates
-    if (_surfacePatchIndex.hasPendingUpdates(quad)) {
-        bool flushed = _surfacePatchIndex.flushPendingUpdates(quad);
-        if (flushed) {
-            _indexedSurfaceIds.insert(surfId);
-        }
-        _surfacePatchIndexNeedsRebuild = _surfacePatchIndexNeedsRebuild && !flushed;
-        return flushed;
+    if (asyncRebuildInProgress) {
+        // An async rebuild is already running; tell it to re-prime when it
+        // finishes so this surface's changes land without blocking main.
+        _surfacesQueuedDuringRebuildIds.push_back(surfId);
+        return true;
     }
 
-    // First-time indexing
-    if (!alreadyIndexed) {
-        // If async rebuild is in progress, queue this surface for later
-        // Don't add to current tree - it will be replaced when rebuild finishes
-        if (asyncRebuildInProgress) {
-            _surfacesQueuedDuringRebuildIds.push_back(surfId);
-            qCInfo(lcViewerManager)
-                << "Queued surface" << surfId.c_str()
-                << "for indexing after async rebuild completes";
-            return true;
-        }
-
-        bool updated = _surfacePatchIndex.updateSurface(quad);
-        if (updated) {
-            _indexedSurfaceIds.insert(surfId);
-            qCInfo(lcViewerManager)
-                << "Indexed surface" << surfId.c_str()
-                << "into SurfacePatchIndex (first time)";
-        }
-        _surfacePatchIndexNeedsRebuild = _surfacePatchIndexNeedsRebuild && !updated;
-        return updated;
-    }
-
-    // Already indexed and no pending updates - nothing to do
+    // No async work in flight. Previously we ran updateSurface /
+    // flushPendingUpdates / insertCells synchronously on the main thread —
+    // a full rtree insert pass for a large segment costs ~3% of a frame
+    // and shows up as a visible GUI stall when many surfaces load in
+    // quick succession. Defer to the async primer instead: mark dirty and
+    // kick off a worker-thread rebuild. Main stays responsive; the new
+    // surface's entries become visible one rebuild cycle later.
+    _indexedSurfaceIds.erase(surfId);  // will be re-populated by async primer
+    _surfacePatchIndexNeedsRebuild = true;
+    primeSurfacePatchIndicesAsync();
     return true;
 }
 
