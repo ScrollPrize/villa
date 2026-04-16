@@ -914,7 +914,7 @@ static AccumMode2 accumModeFor(const std::string& m) {
     if (m == "max") return AccumMode2::Max;
     if (m == "min") return AccumMode2::Min;
     if (m == "volumetric") return AccumMode2::Volumetric;
-    if (m == "median" || m == "alpha" || m == "minabs") return AccumMode2::LayerStorage;
+    if (m == "median" || m == "alpha" || m == "beerLambert" || m == "minabs") return AccumMode2::LayerStorage;
     return AccumMode2::Mean;
 }
 
@@ -1017,9 +1017,11 @@ void sampleCompositeAdaptiveImpl(
 
     // Parse compositeMethod once. Pixel loop previously did string compare
     // per pixel for the LayerStorage path; convert to a small enum up front.
-    enum class LayerAgg : uint8_t { Median, MinAbs, Mean };
+    enum class LayerAgg : uint8_t { Median, MinAbs, Alpha, BeerLambert, Mean };
     const LayerAgg layerAgg = (compositeMethod == "median") ? LayerAgg::Median
                             : (compositeMethod == "minabs") ? LayerAgg::MinAbs
+                            : (compositeMethod == "alpha") ? LayerAgg::Alpha
+                            : (compositeMethod == "beerLambert") ? LayerAgg::BeerLambert
                             : LayerAgg::Mean;
 
     // UI caps composite layers at 16 front + 16 behind + center = 33. Bound
@@ -1304,23 +1306,70 @@ void sampleCompositeAdaptiveImpl(
                         // few dozen floats. partial_sort gives us exactly
                         // that for small N without branching on size.
                         std::partial_sort(layerVals.begin(),
-                                          layerVals.begin() + numLayers/2 + 1,
-                                          layerVals.end());
-                        val = layerVals[numLayers/2];
+                                          layerVals.begin() + nL/2 + 1,
+                                          layerVals.begin() + nL);
+                        val = layerVals[nL/2];
                     } else if (layerAgg == LayerAgg::MinAbs) {
                         // Hoist abs(best-127.5) out of the loop and use std::fabs
                         // (hardware fabs opcode vs. std::abs's integer-path).
                         float best = layerVals[0];
                         float bestAbs = std::fabs(best - 127.5f);
-                        for (int i=1; i<numLayers; i++) {
+                        for (int i=1; i<nL; i++) {
                             const float d = std::fabs(layerVals[i] - 127.5f);
                             if (d < bestAbs) { best = layerVals[i]; bestAbs = d; }
                         }
                         val = best;
+                    } else if (layerAgg == LayerAgg::Alpha) {
+                        const CompositeParams* p = lightParams;
+                        const float alphaMin = p ? p->alphaMin * 255.0f : 0.0f;
+                        const float alphaMax = p ? p->alphaMax * 255.0f : 255.0f;
+                        const float alphaOpacity = p ? p->alphaOpacity : 1.0f;
+                        const float alphaCutoff = p ? p->alphaCutoff : 1.0f;
+                        const float range = alphaMax - alphaMin;
+                        if (range != 0.0f) {
+                            const float invRange = 1.0f / range;
+                            const float offset = alphaMin / range;
+                            float alpha = 0.0f;
+                            float valueAcc = 0.0f;
+                            for (int i=0; i<nL; i++) {
+                                float normalized = layerVals[i] * invRange - offset;
+                                if (normalized <= 0.0f) continue;
+                                if (normalized > 1.0f) normalized = 1.0f;
+                                if (alpha >= alphaCutoff) break;
+
+                                float opacity = normalized * alphaOpacity;
+                                if (opacity > 1.0f) opacity = 1.0f;
+                                const float weight = (1.0f - alpha) * opacity;
+                                valueAcc += weight * normalized;
+                                alpha += weight;
+                            }
+                            val = valueAcc * 255.0f;
+                        }
+                    } else if (layerAgg == LayerAgg::BeerLambert) {
+                        const CompositeParams* p = lightParams;
+                        const float extinctionScaled = (p ? p->blExtinction : 1.5f) / 255.0f;
+                        const float emissionScaled = (p ? p->blEmission : 1.5f) / 255.0f;
+                        const float ambient = p ? p->blAmbient : 0.1f;
+                        float transmittance = 1.0f;
+                        float accumulatedColor = 0.0f;
+
+                        for (int i=0; i<nL; i++) {
+                            const float value = layerVals[i];
+                            if (value < 0.255f) continue;
+
+                            const float emission = value * emissionScaled;
+                            const float layerTransmittance = std::exp(-extinctionScaled * value);
+                            accumulatedColor += emission * transmittance * (1.0f - layerTransmittance);
+                            transmittance *= layerTransmittance;
+                            if (transmittance < 0.001f) break;
+                        }
+
+                        accumulatedColor += ambient * transmittance;
+                        val = std::min(255.0f, accumulatedColor * 255.0f);
                     } else {
-                        float s=0.f; for (float v : layerVals) s += v;
+                        float s=0.f; for (int i=0; i<nL; i++) s += layerVals[i];
                         // Replace divide with multiply by pre-computed reciprocal.
-                        const float invN = numLayers>0 ? 1.0f/float(numLayers) : 0.f;
+                        const float invN = nL>0 ? 1.0f/float(nL) : 0.f;
                         val = s * invN;
                     }
                 }

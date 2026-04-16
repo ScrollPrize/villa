@@ -40,7 +40,6 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/RemoteScroll.hpp"
-#include "FocusHistoryManager.hpp"
 
 #define MAX_RECENT_VOLPKG 10
 
@@ -63,7 +62,6 @@ class QTemporaryDir;
 class QStandardItemModel;
 class FileWatcherService;
 class AxisAlignedSliceController;
-class FocusHistoryManager;
 class SegmentationCommandHandler;
 
 class CWindow : public QMainWindow
@@ -141,8 +139,10 @@ private:
                                        bool reloadSurfaces = true);
     void updateNormalGridAvailability();
     void toggleVolumeOverlayVisibility();
-    bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId, bool addToHistory = false);
+    bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId);
     bool centerFocusOnCursor();
+    void recenterPlaneViewersOn(const cv::Vec3f& position);
+    bool recenterViewersOnCurrentFocus();
     void setSegmentationCursorMirroring(bool enabled);
     bool segmentationCursorMirroringEnabled() const { return _mirrorCursorToSegmentation; }
     void updateSurfaceOverlayDropdown();
@@ -264,7 +264,6 @@ private:
     std::unique_ptr<FileWatcherService> _fileWatcher;
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
     bool _maskRenderInProgress{false};
-    FocusHistoryManager _focusHistory;
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
     std::shared_ptr<QuadSurface> _transformPreviewSourceSurface;
     std::shared_ptr<QuadSurface> _transformPreviewSurface;

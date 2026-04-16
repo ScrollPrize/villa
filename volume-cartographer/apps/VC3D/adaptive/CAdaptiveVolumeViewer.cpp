@@ -23,8 +23,10 @@
 #include <QLabel>
 #include <QGraphicsScene>
 #include <QGraphicsPathItem>
+#include <QGraphicsEllipseItem>
 #include <QMdiSubWindow>
 #include <QPainterPath>
+#include <QPen>
 #include <QWindowStateChangeEvent>
 #include <QApplication>
 #include <QPointer>
@@ -242,7 +244,21 @@ void CAdaptiveVolumeViewer::onSurfaceChanged(const std::string& name,
                                               const std::shared_ptr<Surface>& surf,
                                               bool /*isEditUpdate*/)
 {
-    if (_surfName != name) return;
+    const bool isCurrentSurface = (_surfName == name);
+    const bool isIntersectionTarget =
+        _intersectTgts.count(name) != 0 ||
+        (_intersectTgts.count("visible_segmentation") != 0 &&
+         (name == "segmentation" || _highlightedSurfaceIds.count(name) != 0));
+
+    if (!isCurrentSurface) {
+        if (isIntersectionTarget) {
+            invalidateIntersect(name);
+            _lastIntersectFp = {};
+            renderIntersections();
+        }
+        return;
+    }
+
     _surfWeak = surf;
     // Any surface change (swap or in-place edit) invalidates the cached
     // gen() output — geometry may have shifted.
@@ -255,6 +271,7 @@ void CAdaptiveVolumeViewer::onSurfaceChanged(const std::string& name,
         // pointers to. Drop the dangling handles so the next
         // invalidateIntersect() doesn't double-free.
         _intersectionItems.clear();
+        _focusMarker = nullptr;
         _lastIntersectFp = {};
         return;
     }
@@ -312,27 +329,25 @@ void CAdaptiveVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
 
     auto surf = _surfWeak.lock();
     auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
-    if (!plane) return;
 
-    plane->setOrigin(poi->p);
-    if (cv::norm(poi->n) > 0.5)
-        plane->setNormal(poi->n);
+    if (plane) {
+        plane->setOrigin(poi->p);
+        if (cv::norm(poi->n) > 0.5)
+            plane->setNormal(poi->n);
 
-    // Check if data bounds just became valid
-    if (!_hadValidDataBounds && _volume) {
-        const auto& db = _volume->dataBounds();
-        if (db.valid) {
-            _hadValidDataBounds = true;
-            // Recompute content bounds with new data
-            OnVolumeChanged(_volume);
+        // Check if data bounds just became valid
+        if (!_hadValidDataBounds && _volume) {
+            const auto& db = _volume->dataBounds();
+            if (db.valid) {
+                _hadValidDataBounds = true;
+                // Recompute content bounds with new data
+                OnVolumeChanged(_volume);
+            }
         }
     }
 
-    // Center on focus
-    cv::Vec3f proj = plane->project(poi->p, 1.0, 1.0);
-    _camera.surfacePtr[0] = proj[0];
-    _camera.surfacePtr[1] = proj[1];
-
+    updateFocusMarker(poi);
+    emit overlaysUpdated();
     scheduleRender();
 }
 
@@ -342,9 +357,17 @@ void CAdaptiveVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
 
 void CAdaptiveVolumeViewer::scheduleRender()
 {
+    syncCameraTransform();
     _renderPending = true;
     if (!_renderTimer->isActive())
         _renderTimer->start();
+}
+
+void CAdaptiveVolumeViewer::syncCameraTransform()
+{
+    _camSurfX = _camera.surfacePtr[0];
+    _camSurfY = _camera.surfacePtr[1];
+    _camScale = _camera.scale;
 }
 
 
@@ -758,11 +781,11 @@ void CAdaptiveVolumeViewer::submitRender()
     }
 
     // Update camera tracking for coordinate conversions
-    _camSurfX = _camera.surfacePtr[0];
-    _camSurfY = _camera.surfacePtr[1];
-    _camScale = _camera.scale;
+    syncCameraTransform();
 
+    updateFocusMarker();
     renderIntersections();
+    emit overlaysUpdated();
     // update() schedules a deferred repaint via the event loop; repaint()
     // blocks the UI thread synchronously until paintEvent returns, which
     // stalls every frame during pans/zooms.
@@ -770,9 +793,61 @@ void CAdaptiveVolumeViewer::submitRender()
     updateStatusLabel();
 }
 
-void CAdaptiveVolumeViewer::renderVisible(bool /*force*/)
+void CAdaptiveVolumeViewer::renderVisible(bool force)
 {
-    scheduleRender();
+    if (!force) {
+        scheduleRender();
+        return;
+    }
+
+    if (_renderTimer && _renderTimer->isActive()) {
+        _renderTimer->stop();
+    }
+    _renderPending = false;
+    submitRender();
+    updateStatusLabel();
+}
+
+void CAdaptiveVolumeViewer::centerOnVolumePoint(const cv::Vec3f& point, bool forceRender)
+{
+    auto surf = _surfWeak.lock();
+    if (!surf) {
+        return;
+    }
+
+    cv::Vec2f surfacePoint(0.0f, 0.0f);
+    bool haveSurfacePoint = false;
+    if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
+        const cv::Vec3f projected = plane->project(point, 1.0, 1.0);
+        surfacePoint = {projected[0], projected[1]};
+        haveSurfacePoint = true;
+    } else if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
+        cv::Vec3f ptr = quad->pointer();
+        auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+        if (quad->pointTo(ptr, point, 4.0f, 100, patchIndex) >= 0.0f) {
+            const cv::Vec3f loc = quad->loc(ptr);
+            surfacePoint = {loc[0], loc[1]};
+            haveSurfacePoint = true;
+        }
+    }
+
+    if (!haveSurfacePoint ||
+        !std::isfinite(surfacePoint[0]) ||
+        !std::isfinite(surfacePoint[1])) {
+        return;
+    }
+
+    _camera.surfacePtr[0] = surfacePoint[0];
+    _camera.surfacePtr[1] = surfacePoint[1];
+    _cachedStretchValid = false;
+    syncCameraTransform();
+
+    if (forceRender) {
+        renderVisible(true);
+    } else {
+        scheduleRender();
+    }
+    emit overlaysUpdated();
 }
 
 // ============================================================================
@@ -792,6 +867,7 @@ void CAdaptiveVolumeViewer::panByF(float dx, float dy)
 
     _cachedStretchValid = false;
     scheduleRender();
+    emit overlaysUpdated();
 }
 
 void CAdaptiveVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
@@ -845,6 +921,7 @@ void CAdaptiveVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     // coalesces bursts into the 60 fps render timer so we don't render
     // dozens of intermediate frames the user never sees.
     scheduleRender();
+    emit overlaysUpdated();
 }
 
 void CAdaptiveVolumeViewer::adjustZoomByFactor(float factor)
@@ -930,6 +1007,7 @@ void CAdaptiveVolumeViewer::onResized()
     }
     _scene->setSceneRect(0, 0, w, h);
     scheduleRender();
+    emit overlaysUpdated();
 }
 
 void CAdaptiveVolumeViewer::onCursorMove(QPointF scenePos)
@@ -1037,6 +1115,14 @@ QPointF CAdaptiveVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
         cv::Vec3f proj = plane->project(volPoint, 1.0, 1.0);
         return surfaceToScene(proj[0], proj[1]);
     }
+    if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
+        cv::Vec3f ptr = quad->pointer();
+        auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+        float dist = quad->pointTo(ptr, volPoint, 4.0f, 100, patchIndex);
+        if (dist < 0.0f) return {};
+        cv::Vec3f loc = quad->loc(ptr);
+        return surfaceToScene(loc[0], loc[1]);
+    }
     return {};
 }
 
@@ -1048,6 +1134,38 @@ cv::Vec3f CAdaptiveVolumeViewer::sceneToVolume(const QPointF& scenePoint) const
     cv::Vec3f surfLoc = {sp[0], sp[1], 0};
     cv::Vec3f ptr(0, 0, 0);
     return surf->coord(ptr, surfLoc);
+}
+
+void CAdaptiveVolumeViewer::updateFocusMarker(POI* poi)
+{
+    if (!_scene) return;
+    if (!poi && _state) {
+        poi = _state->poi("focus");
+    }
+    if (!poi || !_surfWeak.lock()) {
+        if (_focusMarker) _focusMarker->hide();
+        return;
+    }
+
+    if (!_focusMarker || !_focusMarker->scene()) {
+        auto* marker = new QGraphicsEllipseItem(-10.0, -10.0, 20.0, 20.0);
+        QPen pen(QColor(50, 255, 215), 3.0, Qt::DashDotLine, Qt::RoundCap, Qt::RoundJoin);
+        pen.setCosmetic(true);
+        marker->setPen(pen);
+        marker->setBrush(Qt::NoBrush);
+        marker->setZValue(110.0);
+        _scene->addItem(marker);
+        _focusMarker = marker;
+    }
+
+    const QPointF scenePos = volumeToScene(poi->p);
+    if (!std::isfinite(scenePos.x()) || !std::isfinite(scenePos.y())) {
+        _focusMarker->hide();
+        return;
+    }
+
+    _focusMarker->setPos(scenePos);
+    _focusMarker->show();
 }
 
 // ============================================================================
@@ -1070,6 +1188,50 @@ constexpr std::array<QRgb, 12> kIntersectionPalette = {
     qRgb(140, 255, 220), qRgb(200, 255, 140), qRgb(255, 180, 120),
     qRgb(180, 200, 255), qRgb(255, 140, 180), qRgb(160, 255, 180),
 };
+constexpr int kIntersectionZ = 100;
+constexpr int kHighlightedIntersectionZ = 110;
+constexpr int kActiveIntersectionZ = 120;
+constexpr float kActiveIntersectionOpacityScale = 1.2f;
+constexpr float kActiveIntersectionWidthScale = 1.3f;
+constexpr float kActiveIntersectionMinWidthDelta = 0.75f;
+
+struct IntersectionStyle {
+    QRgb color = 0;
+    int z = kIntersectionZ;
+    int widthQ = 0;
+
+    bool operator==(const IntersectionStyle& other) const
+    {
+        return color == other.color && z == other.z && widthQ == other.widthQ;
+    }
+};
+
+struct IntersectionStyleHash {
+    size_t operator()(const IntersectionStyle& style) const
+    {
+        size_t h = std::hash<QRgb>{}(style.color);
+        h ^= std::hash<int>{}(style.z) + 0x9e3779b9u + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(style.widthQ) + 0x9e3779b9u + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+QColor activeSegmentationColorForView(const std::string& surfName)
+{
+    if (surfName == "seg yz" || surfName == "yz plane") {
+        return QColor(Qt::yellow);
+    }
+    if (surfName == "seg xz" || surfName == "xz plane") {
+        return QColor(Qt::red);
+    }
+    return QColor(255, 140, 0);
+}
+
+float activeSegmentationIntersectionWidth(float baseWidth)
+{
+    return std::max(baseWidth * kActiveIntersectionWidthScale,
+                    baseWidth + kActiveIntersectionMinWidthDelta);
+}
 }
 
 void CAdaptiveVolumeViewer::invalidateIntersect(const std::string&)
@@ -1137,21 +1299,44 @@ void CAdaptiveVolumeViewer::renderIntersections()
                       std::max(1, int(std::ceil(maxX - minX))),
                       std::max(1, int(std::ceil(maxY - minY)))};
 
+    auto activeSeg = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
+
     // Skip the rebuild entirely if nothing material has changed.
     IntersectFingerprint fp;
     fp.roiX = planeRoi.x;
     fp.roiY = planeRoi.y;
     fp.roiW = planeRoi.width;
     fp.roiH = planeRoi.height;
+    auto quantizeVec = [](const cv::Vec3f& v) {
+        return std::array<int, 3>{
+            int(std::lround(v[0] * 1000.0f)),
+            int(std::lround(v[1] * 1000.0f)),
+            int(std::lround(v[2] * 1000.0f)),
+        };
+    };
+    fp.planeOriginQ = quantizeVec(plane->origin());
+    fp.planeNormalQ = quantizeVec(plane->normal({}, {}));
+    fp.planeBasisXQ = quantizeVec(plane->basisX());
+    fp.planeBasisYQ = quantizeVec(plane->basisY());
     fp.opacityQ = int(std::lround(_intersectionOpacity * 1000.0f));
     fp.thicknessQ = int(std::lround(_intersectionThickness * 1000.0f));
     fp.patchCount = patchIndex->patchCount();
     fp.surfaceCount = patchIndex->surfaceCount();
     size_t th = 0;
+    size_t gh = 0;
     for (const auto& t : targets) {
         th ^= std::hash<const void*>{}(t.get()) + 0x9e3779b9u + (th << 6) + (th >> 2);
+        gh ^= std::hash<const void*>{}(t.get()) ^
+              (std::hash<uint64_t>{}(patchIndex->generation(t)) + 0x9e3779b9u);
     }
     fp.targetHash = th;
+    fp.targetGenerationHash = gh;
+    fp.activeSegHash = activeSeg ? std::hash<const void*>{}(activeSeg.get()) : 0;
+    size_t hh = 0;
+    for (const auto& id : _highlightedSurfaceIds) {
+        hh ^= std::hash<std::string>{}(id) + 0x9e3779b9u + (hh << 6) + (hh >> 2);
+    }
+    fp.highlightedSurfaceHash = hh;
     fp.valid = true;
     if (_lastIntersectFp == fp && !_intersectionItems.empty()) {
         return;
@@ -1162,11 +1347,11 @@ void CAdaptiveVolumeViewer::renderIntersections()
     auto intersections = patchIndex->computePlaneIntersections(*plane, planeRoi, targets);
     if (intersections.empty()) { /* kept cleared by invalidate above */ return; }
 
-    auto activeSeg = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
-
-    // Group path segments by color for batched drawing.
-    std::unordered_map<QRgb, QPainterPath> groupedPaths;
-    std::unordered_map<QRgb, QColor> groupedColors;
+    // Group path segments by draw style for batched drawing. Active
+    // segmentation gets its own z so it always renders above other
+    // intersection overlays.
+    std::unordered_map<IntersectionStyle, QPainterPath, IntersectionStyleHash> groupedPaths;
+    std::unordered_map<IntersectionStyle, QColor, IntersectionStyleHash> groupedColors;
     // Bitwise finite check: matches repo convention (see feedback_ffast_math).
     // Finite iff exponent bits are not all 1s.
     auto isFiniteScalar = [](double v) {
@@ -1189,10 +1374,17 @@ void CAdaptiveVolumeViewer::renderIntersections()
         if (!target || segments.empty()) continue;
 
         QColor baseColor;
+        int zValue = kIntersectionZ;
+        float opacity = _intersectionOpacity;
+        float penWidth = _intersectionThickness;
         if (target == activeSeg) {
-            baseColor = QColor(255, 255, 255);
+            baseColor = activeSegmentationColorForView(_surfName);
+            zValue = kActiveIntersectionZ;
+            opacity *= kActiveIntersectionOpacityScale;
+            penWidth = activeSegmentationIntersectionWidth(penWidth);
         } else if (_highlightedSurfaceIds.count(target->id)) {
             baseColor = QColor(0, 220, 255);
+            zValue = kHighlightedIntersectionZ;
         } else {
             const auto& id = target->id;
             auto it = _surfaceColorAssignments.find(id);
@@ -1207,32 +1399,37 @@ void CAdaptiveVolumeViewer::renderIntersections()
             }
             baseColor = QColor::fromRgba(kIntersectionPalette[idx % kIntersectionPalette.size()]);
         }
-        baseColor.setAlphaF(std::clamp(_intersectionOpacity, 0.0f, 1.0f));
+        baseColor.setAlphaF(std::clamp(opacity, 0.0f, 1.0f));
         if (baseColor.alpha() <= 0) continue;
 
         for (const auto& seg : segments) {
             QPointF a = planeToScene(seg.world[0]);
             QPointF b = planeToScene(seg.world[1]);
             if (!isFinitePoint(a) || !isFinitePoint(b)) continue;
-            QPainterPath& path = groupedPaths[baseColor.rgba()];
+            const IntersectionStyle style{
+                baseColor.rgba(),
+                zValue,
+                int(std::lround(std::max(0.0f, penWidth) * 1000.0f)),
+            };
+            QPainterPath& path = groupedPaths[style];
             path.moveTo(a);
             path.lineTo(b);
-            groupedColors[baseColor.rgba()] = baseColor;
+            groupedColors[style] = baseColor;
         }
     }
 
     _intersectionItems.reserve(groupedPaths.size());
-    for (const auto& [key, path] : groupedPaths) {
+    for (const auto& [style, path] : groupedPaths) {
         if (path.isEmpty()) continue;
         auto* item = new QGraphicsPathItem(path);
-        QPen pen(groupedColors[key]);
-        pen.setWidthF(_intersectionThickness);
+        QPen pen(groupedColors[style]);
+        pen.setWidthF(static_cast<qreal>(style.widthQ) / 1000.0);
         pen.setCapStyle(Qt::RoundCap);
         pen.setJoinStyle(Qt::RoundJoin);
         pen.setCosmetic(true);
         item->setPen(pen);
         item->setBrush(Qt::NoBrush);
-        item->setZValue(100.0);
+        item->setZValue(style.z);
         _scene->addItem(item);
         _intersectionItems.push_back(item);
     }

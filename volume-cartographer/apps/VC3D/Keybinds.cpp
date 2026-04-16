@@ -196,20 +196,12 @@ const KeyPressDef CenterFocusOnCursor{
     Qt::NoModifier,
     false
 };
-const KeyPressDef FocusHistoryBack{
-    "focus_history_back",
+const KeyPressDef RecenterFocus{
+    "recenter_focus",
     kSectionNavigation,
-    "Step backward in focus history",
-    Qt::Key_F,
+    "Recenter on current focus point",
+    Qt::Key_X,
     Qt::NoModifier,
-    false
-};
-const KeyPressDef FocusHistoryForward{
-    "focus_history_forward",
-    kSectionNavigation,
-    "Step forward in focus history",
-    Qt::Key_F,
-    Qt::ControlModifier,
     false
 };
 const KeyPressDef SliceStepDecrease{
@@ -496,8 +488,7 @@ QString buildKeybindsHelpText()
         { kSectionViewerControls, "Pan view", HelpKeyType::Literal, nullptr, nullptr, "Arrow Keys" },
 
         { kSectionNavigation, keypress::CenterFocusOnCursor.description, HelpKeyType::KeyPress, nullptr, &keypress::CenterFocusOnCursor, nullptr },
-        { kSectionNavigation, keypress::FocusHistoryBack.description, HelpKeyType::KeyPress, nullptr, &keypress::FocusHistoryBack, nullptr },
-        { kSectionNavigation, keypress::FocusHistoryForward.description, HelpKeyType::KeyPress, nullptr, &keypress::FocusHistoryForward, nullptr },
+        { kSectionNavigation, keypress::RecenterFocus.description, HelpKeyType::KeyPress, nullptr, &keypress::RecenterFocus, nullptr },
 
         { kSectionSegments, shortcuts::CycleNextSegment.description, HelpKeyType::Shortcut, &shortcuts::CycleNextSegment, nullptr, nullptr },
         { kSectionSegments, shortcuts::CyclePrevSegment.description, HelpKeyType::Shortcut, &shortcuts::CyclePrevSegment, nullptr, nullptr },
