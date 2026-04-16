@@ -2270,6 +2270,24 @@ bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, 
     return true;
 }
 
+void CWindow::recenterPlaneViewersOn(const cv::Vec3f& position)
+{
+    if (!_viewerManager) {
+        return;
+    }
+
+    _viewerManager->forEachViewer([&position](CTiledVolumeViewer* viewer) {
+        if (!viewer) {
+            return;
+        }
+
+        const std::string name = viewer->surfName();
+        if (name == "xy plane" || name == "seg xz" || name == "seg yz") {
+            viewer->centerOnVolumePoint(position, true);
+        }
+    });
+}
+
 bool CWindow::centerFocusOnCursor()
 {
     if (!_state || !mdiArea) {
@@ -5080,6 +5098,11 @@ void CWindow::onFocusPOIChanged(std::string name, POI* poi)
         }
 
         _axisAlignedSliceController->applyOrientation();
+
+        const cv::Vec3f focusPosition = poi->p;
+        QTimer::singleShot(0, this, [this, focusPosition]() {
+            recenterPlaneViewersOn(focusPosition);
+        });
     }
 }
 

@@ -64,6 +64,7 @@ public:
     void renderIntersections() override;
     void invalidateVis() {}
     void invalidateIntersect(const std::string& = "") override;
+    void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false);
 
     // --- Accessors ---
     std::string surfName() const override { return _surfName; }
@@ -96,14 +97,14 @@ public:
 
     // --- Display stubs ---
     void setResetViewOnSurfaceChange(bool v) { _resetViewOnSurfaceChange = v; }
-    void setShowDirectionHints(bool) {}
-    bool isShowDirectionHints() const override { return false; }
-    void setShowSurfaceNormals(bool) {}
-    bool isShowSurfaceNormals() const override { return false; }
-    float normalArrowLengthScale() const override { return 1.0f; }
-    int normalMaxArrows() const override { return 0; }
-    void setNormalArrowLengthScale(float) {}
-    void setNormalMaxArrows(int) {}
+    void setShowDirectionHints(bool on) { _showDirectionHints = on; emit overlaysUpdated(); }
+    bool isShowDirectionHints() const override { return _showDirectionHints; }
+    void setShowSurfaceNormals(bool on) { _showSurfaceNormals = on; emit overlaysUpdated(); }
+    bool isShowSurfaceNormals() const override { return _showSurfaceNormals; }
+    float normalArrowLengthScale() const override { return _normalArrowLengthScale; }
+    int normalMaxArrows() const override { return _normalMaxArrows; }
+    void setNormalArrowLengthScale(float scale) { _normalArrowLengthScale = scale; emit overlaysUpdated(); }
+    void setNormalMaxArrows(int maxArrows) { _normalMaxArrows = maxArrows; emit overlaysUpdated(); }
 
     // --- Overlay volume stubs ---
     void setOverlayVolume(std::shared_ptr<Volume>) {}
@@ -245,10 +246,12 @@ signals:
 private:
     void submitRender();
     void scheduleRender();
+    void syncCameraTransform();
 
     // Framebuffer coordinate conversions
     QPointF surfaceToScene(float surfX, float surfY) const;
     cv::Vec2f sceneToSurface(const QPointF& scenePos) const;
+    void updateFocusMarker(POI* poi = nullptr);
 
     void panByF(float dx, float dy);
     void zoomStepsAt(int steps, const QPointF& scenePos);
@@ -303,6 +306,10 @@ private:
     float _zScrollSensitivity = 1.0f;
     vc::Sampling _samplingMethod = vc::Sampling::Trilinear;
     bool _highlightDownscaled = false;
+    bool _showDirectionHints = true;
+    bool _showSurfaceNormals = false;
+    float _normalArrowLengthScale = 1.0f;
+    int _normalMaxArrows = 32;
     QString _lastStatusText;
     std::chrono::steady_clock::time_point _lastStatusUpdate{};
     std::chrono::steady_clock::time_point _lastStretchScan{};
@@ -351,6 +358,7 @@ private:
 
     // --- Overlay groups (stored for VolumeViewerBase interface) ---
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
+    QGraphicsItem* _focusMarker = nullptr;
 
     // --- Intersection overlay ---
     std::set<std::string> _intersectTgts;
@@ -365,6 +373,10 @@ private:
     // Intersection cache fingerprint: skip the whole rebuild if nothing changed.
     struct IntersectFingerprint {
         int roiX = 0, roiY = 0, roiW = 0, roiH = 0;
+        std::array<int, 3> planeOriginQ{};
+        std::array<int, 3> planeNormalQ{};
+        std::array<int, 3> planeBasisXQ{};
+        std::array<int, 3> planeBasisYQ{};
         // Quantized to 0.001 to avoid spurious cache misses from
         // sub-slider float jitter.
         int opacityQ = -1;
