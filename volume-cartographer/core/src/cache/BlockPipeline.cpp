@@ -725,30 +725,49 @@ void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targ
     constexpr int kMaxL = 16;
     std::array<int, kMaxL> bpcZ{}, bpcY{}, bpcX{};
     std::array<bool, kMaxL> shapeCached{};
-    auto chunkToFirstBlock = [&](const ChunkKey& k) -> BlockKey {
-        if (k.level < 0 || k.level >= kMaxL) return {-1, 0, 0, 0};
-        if (!shapeCached[k.level] && source_) {
-            auto csk = source_->chunkShape(k.level);
+    auto ensureShapeCached = [&](int level) {
+        if (level < 0 || level >= kMaxL) return;
+        if (!shapeCached[level] && source_) {
+            auto csk = chunkShape(level);
             if (csk[0] > 0) {
-                bpcZ[k.level] = csk[0] / kBlockSize;
-                bpcY[k.level] = csk[1] / kBlockSize;
-                bpcX[k.level] = csk[2] / kBlockSize;
+                bpcZ[level] = csk[0] / kBlockSize;
+                bpcY[level] = csk[1] / kBlockSize;
+                bpcX[level] = csk[2] / kBlockSize;
             }
-            shapeCached[k.level] = true;
+            shapeCached[level] = true;
         }
-        const int z = bpcZ[k.level], y = bpcY[k.level], x = bpcX[k.level];
-        if (z <= 0 || y <= 0 || x <= 0) return {-1, 0, 0, 0};
-        return {k.level, k.iz * z, k.iy * y, k.ix * x};
     };
 
-    // Build the per-key BlockKey list and batch-query the block cache with
-    // a single mutex acquisition, amortising ~hundreds-of-thousands of
-    // per-frame lookups down to one.
-    std::vector<BlockKey> blockKeys;
-    blockKeys.reserve(keys.size());
-    for (const auto& key : keys) blockKeys.push_back(chunkToFirstBlock(key));
+    // Build per-key BlockKey pairs (first + last block of each chunk) and
+    // batch-query the block cache. Checking two blocks instead of one
+    // catches partial eviction: if the first block survives the clock
+    // sweep but interior blocks were reclaimed, a single-block check
+    // would falsely skip the chunk, leaving visual holes until the first
+    // block is also evicted.
+    std::vector<BlockKey> probeKeys;
+    probeKeys.reserve(keys.size() * 2);
+    for (const auto& key : keys) {
+        if (key.level < 0 || key.level >= kMaxL) {
+            probeKeys.push_back({-1, 0, 0, 0});
+            probeKeys.push_back({-1, 0, 0, 0});
+            continue;
+        }
+        ensureShapeCached(key.level);
+        const int z = bpcZ[key.level], y = bpcY[key.level], x = bpcX[key.level];
+        if (z <= 0 || y <= 0 || x <= 0) {
+            probeKeys.push_back({-1, 0, 0, 0});
+            probeKeys.push_back({-1, 0, 0, 0});
+            continue;
+        }
+        // First block of the chunk
+        probeKeys.push_back({key.level, key.iz * z, key.iy * y, key.ix * x});
+        // Last block of the chunk
+        probeKeys.push_back({key.level, key.iz * z + z - 1,
+                                        key.iy * y + y - 1,
+                                        key.ix * x + x - 1});
+    }
     std::vector<uint8_t> resident;
-    blockCache_.containsBatch(blockKeys, resident);
+    blockCache_.containsBatch(probeKeys, resident);
 
     // Snapshot the empty-chunks set once so the per-key check avoids
     // hammering emptyChunksMutex_ from the render thread.
@@ -765,7 +784,10 @@ void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targ
         const auto& key = keys[i];
         if (isNegativeCached(key)) continue;
         if (emptySnapshot.count(key)) continue;
-        if (blockKeys[i].level >= 0 && resident[i]) continue;
+        // Both first and last block of the chunk must be resident to
+        // consider the chunk fully cached. See comment above probeKeys.
+        if (probeKeys[i * 2].level >= 0
+            && resident[i * 2] && resident[i * 2 + 1]) continue;
 
         auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
         const bool diskPresent = dz

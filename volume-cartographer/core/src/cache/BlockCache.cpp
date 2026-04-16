@@ -78,6 +78,11 @@ BlockCache::BlockCache(Config cfg)
 
 BlockCache::~BlockCache()
 {
+    // Stop the background prefault thread BEFORE unmapping the arena it's
+    // madvise()-ing. jthread dtor requests stop + joins, so after this
+    // line no madvise calls are in flight.
+    if (prefaultThread_.joinable())
+        prefaultThread_ = {};  // request_stop + join via dtor of old thread
     if (arena_) {
         ::munmap(arena_, arenaBytes_);
         arena_ = nullptr;
