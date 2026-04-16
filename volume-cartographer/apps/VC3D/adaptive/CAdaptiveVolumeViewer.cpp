@@ -1191,14 +1191,18 @@ constexpr std::array<QRgb, 12> kIntersectionPalette = {
 constexpr int kIntersectionZ = 100;
 constexpr int kHighlightedIntersectionZ = 110;
 constexpr int kActiveIntersectionZ = 120;
+constexpr float kActiveIntersectionOpacityScale = 1.2f;
+constexpr float kActiveIntersectionWidthScale = 1.3f;
+constexpr float kActiveIntersectionMinWidthDelta = 0.75f;
 
 struct IntersectionStyle {
     QRgb color = 0;
     int z = kIntersectionZ;
+    int widthQ = 0;
 
     bool operator==(const IntersectionStyle& other) const
     {
-        return color == other.color && z == other.z;
+        return color == other.color && z == other.z && widthQ == other.widthQ;
     }
 };
 
@@ -1207,6 +1211,7 @@ struct IntersectionStyleHash {
     {
         size_t h = std::hash<QRgb>{}(style.color);
         h ^= std::hash<int>{}(style.z) + 0x9e3779b9u + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(style.widthQ) + 0x9e3779b9u + (h << 6) + (h >> 2);
         return h;
     }
 };
@@ -1220,6 +1225,12 @@ QColor activeSegmentationColorForView(const std::string& surfName)
         return QColor(Qt::red);
     }
     return QColor(255, 140, 0);
+}
+
+float activeSegmentationIntersectionWidth(float baseWidth)
+{
+    return std::max(baseWidth * kActiveIntersectionWidthScale,
+                    baseWidth + kActiveIntersectionMinWidthDelta);
 }
 }
 
@@ -1364,9 +1375,13 @@ void CAdaptiveVolumeViewer::renderIntersections()
 
         QColor baseColor;
         int zValue = kIntersectionZ;
+        float opacity = _intersectionOpacity;
+        float penWidth = _intersectionThickness;
         if (target == activeSeg) {
             baseColor = activeSegmentationColorForView(_surfName);
             zValue = kActiveIntersectionZ;
+            opacity *= kActiveIntersectionOpacityScale;
+            penWidth = activeSegmentationIntersectionWidth(penWidth);
         } else if (_highlightedSurfaceIds.count(target->id)) {
             baseColor = QColor(0, 220, 255);
             zValue = kHighlightedIntersectionZ;
@@ -1384,14 +1399,18 @@ void CAdaptiveVolumeViewer::renderIntersections()
             }
             baseColor = QColor::fromRgba(kIntersectionPalette[idx % kIntersectionPalette.size()]);
         }
-        baseColor.setAlphaF(std::clamp(_intersectionOpacity, 0.0f, 1.0f));
+        baseColor.setAlphaF(std::clamp(opacity, 0.0f, 1.0f));
         if (baseColor.alpha() <= 0) continue;
 
         for (const auto& seg : segments) {
             QPointF a = planeToScene(seg.world[0]);
             QPointF b = planeToScene(seg.world[1]);
             if (!isFinitePoint(a) || !isFinitePoint(b)) continue;
-            const IntersectionStyle style{baseColor.rgba(), zValue};
+            const IntersectionStyle style{
+                baseColor.rgba(),
+                zValue,
+                int(std::lround(std::max(0.0f, penWidth) * 1000.0f)),
+            };
             QPainterPath& path = groupedPaths[style];
             path.moveTo(a);
             path.lineTo(b);
@@ -1404,7 +1423,7 @@ void CAdaptiveVolumeViewer::renderIntersections()
         if (path.isEmpty()) continue;
         auto* item = new QGraphicsPathItem(path);
         QPen pen(groupedColors[style]);
-        pen.setWidthF(_intersectionThickness);
+        pen.setWidthF(static_cast<qreal>(style.widthQ) / 1000.0);
         pen.setCapStyle(Qt::RoundCap);
         pen.setJoinStyle(Qt::RoundJoin);
         pen.setCosmetic(true);
