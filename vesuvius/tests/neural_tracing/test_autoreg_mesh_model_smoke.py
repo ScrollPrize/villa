@@ -382,6 +382,24 @@ class _DummySamplingInferenceModel(torch.nn.Module):
         return starts + (offset_bins.to(torch.float32) + 0.5) * widths.view(1, 1, 3)
 
 
+class _ModeTrackingInferenceModel(_DummySamplingInferenceModel):
+    def __init__(self) -> None:
+        super().__init__()
+        self.training_flags: list[tuple[str, bool]] = []
+
+    def encode_conditioning(self, volume, vol_tokens=None):
+        self.training_flags.append(("encode_conditioning", bool(self.training)))
+        return super().encode_conditioning(volume, vol_tokens=vol_tokens)
+
+    def forward_from_encoded(self, batch, *, memory_tokens, memory_patch_centers):
+        self.training_flags.append(("forward_from_encoded", bool(self.training)))
+        return super().forward_from_encoded(
+            batch,
+            memory_tokens=memory_tokens,
+            memory_patch_centers=memory_patch_centers,
+        )
+
+
 def test_autoreg_mesh_model_forward_and_losses_are_finite(tmp_path: Path) -> None:
     checkpoint = tmp_path / "tiny_dinovol.pt"
     _write_local_guide_checkpoint(checkpoint)
@@ -774,6 +792,25 @@ def test_infer_rejects_nonpositive_max_steps() -> None:
         infer_autoreg_mesh(model, sample, max_steps=0)
     with pytest.raises(ValueError, match="max_steps"):
         infer_autoreg_mesh(model, sample, max_steps=-1)
+
+
+def test_infer_runs_under_eval_mode_and_restores_training_state() -> None:
+    model = _ModeTrackingInferenceModel()
+    model.train()
+    sample = _make_sample("left")
+
+    result = infer_autoreg_mesh(
+        model,
+        sample,
+        max_steps=1,
+        stop_probability_threshold=1.1,
+        greedy=True,
+    )
+
+    assert model.training is True
+    assert result["predicted_continuation_vertices_local"].shape[0] == 1
+    assert model.training_flags
+    assert all(flag is False for _, flag in model.training_flags)
 
 
 def test_autoreg_mesh_inference_uses_sampled_xyz_for_non_greedy_rollout(monkeypatch) -> None:
