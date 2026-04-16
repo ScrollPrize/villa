@@ -17,7 +17,7 @@
 #include <QVBoxLayout>
 #include <QVariant>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 Q_LOGGING_CATEGORY(lcSegWidget, "vc.segmentation.widget")
 
@@ -88,6 +88,8 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::pushPullStepChanged);
     connect(_editingPanel, &SegmentationEditingPanel::alphaPushPullConfigChanged,
             this, &SegmentationWidget::alphaPushPullConfigChanged);
+    connect(_editingPanel, &SegmentationEditingPanel::editScaleChanged,
+            this, &SegmentationWidget::editScaleChanged);
     connect(_editingPanel, &SegmentationEditingPanel::smoothingStrengthChanged,
             this, &SegmentationWidget::smoothingStrengthChanged);
     connect(_editingPanel, &SegmentationEditingPanel::smoothingIterationsChanged,
@@ -110,8 +112,6 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::editApprovedMaskChanged);
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::editUnapprovedMaskChanged,
             this, &SegmentationWidget::editUnapprovedMaskChanged);
-    connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::autoApproveEditsChanged,
-            this, &SegmentationWidget::autoApproveEditsChanged);
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::autoApprovalEnabledChanged,
             this, &SegmentationWidget::autoApprovalEnabledChanged);
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::autoApprovalRadiusChanged,
@@ -260,6 +260,7 @@ float SegmentationWidget::pushPullRadius() const { return _editingPanel->pushPul
 float SegmentationWidget::pushPullSigma() const { return _editingPanel->pushPullSigma(); }
 float SegmentationWidget::pushPullStep() const { return _editingPanel->pushPullStep(); }
 AlphaPushPullConfig SegmentationWidget::alphaPushPullConfig() const { return _editingPanel->alphaPushPullConfig(); }
+float SegmentationWidget::editScale() const { return _editingPanel->editScale(); }
 float SegmentationWidget::smoothingStrength() const { return _editingPanel->smoothingStrength(); }
 int SegmentationWidget::smoothingIterations() const { return _editingPanel->smoothingIterations(); }
 bool SegmentationWidget::showHoverMarker() const { return _editingPanel->showHoverMarker(); }
@@ -272,6 +273,7 @@ void SegmentationWidget::setPushPullRadius(float value) { _editingPanel->setPush
 void SegmentationWidget::setPushPullSigma(float value) { _editingPanel->setPushPullSigma(value); }
 void SegmentationWidget::setPushPullStep(float value) { _editingPanel->setPushPullStep(value); }
 void SegmentationWidget::setAlphaPushPullConfig(const AlphaPushPullConfig& config) { _editingPanel->setAlphaPushPullConfig(config); }
+void SegmentationWidget::setEditScale(float value) { _editingPanel->setEditScale(value); }
 void SegmentationWidget::setSmoothingStrength(float value) { _editingPanel->setSmoothingStrength(value); }
 void SegmentationWidget::setSmoothingIterations(int value) { _editingPanel->setSmoothingIterations(value); }
 void SegmentationWidget::setShowHoverMarker(bool enabled) { _editingPanel->setShowHoverMarker(enabled); }
@@ -281,7 +283,6 @@ void SegmentationWidget::setShowHoverMarker(bool enabled) { _editingPanel->setSh
 bool SegmentationWidget::showApprovalMask() const { return _approvalMaskPanel->showApprovalMask(); }
 bool SegmentationWidget::editApprovedMask() const { return _approvalMaskPanel->editApprovedMask(); }
 bool SegmentationWidget::editUnapprovedMask() const { return _approvalMaskPanel->editUnapprovedMask(); }
-bool SegmentationWidget::autoApproveEdits() const { return _approvalMaskPanel->autoApproveEdits(); }
 bool SegmentationWidget::autoApprovalEnabled() const { return _approvalMaskPanel->autoApprovalEnabled(); }
 float SegmentationWidget::autoApprovalRadius() const { return _approvalMaskPanel->autoApprovalRadius(); }
 float SegmentationWidget::autoApprovalThreshold() const { return _approvalMaskPanel->autoApprovalThreshold(); }
@@ -295,7 +296,6 @@ QColor SegmentationWidget::approvalBrushColor() const { return _approvalMaskPane
 void SegmentationWidget::setShowApprovalMask(bool enabled) { _approvalMaskPanel->setShowApprovalMask(enabled); syncUiState(); }
 void SegmentationWidget::setEditApprovedMask(bool enabled) { _approvalMaskPanel->setEditApprovedMask(enabled); }
 void SegmentationWidget::setEditUnapprovedMask(bool enabled) { _approvalMaskPanel->setEditUnapprovedMask(enabled); }
-void SegmentationWidget::setAutoApproveEdits(bool enabled) { _approvalMaskPanel->setAutoApproveEdits(enabled); }
 void SegmentationWidget::setAutoApprovalEnabled(bool enabled) { _approvalMaskPanel->setAutoApprovalEnabled(enabled); }
 void SegmentationWidget::setAutoApprovalRadius(float radius) { _approvalMaskPanel->setAutoApprovalRadius(radius); }
 void SegmentationWidget::setAutoApprovalThreshold(float threshold) { _approvalMaskPanel->setAutoApprovalThreshold(threshold); }
@@ -393,7 +393,7 @@ QString SegmentationWidget::customParamsText() const { return _customParamsPanel
 QString SegmentationWidget::customParamsProfile() const { return _customParamsPanel->customParamsProfile(); }
 bool SegmentationWidget::customParamsValid() const { return _customParamsPanel->customParamsValid(); }
 QString SegmentationWidget::customParamsError() const { return _customParamsPanel->customParamsError(); }
-std::optional<nlohmann::json> SegmentationWidget::customParamsJson() const { return _customParamsPanel->customParamsJson(); }
+utils::Json SegmentationWidget::customParamsJson() const { return _customParamsPanel->customParamsJson(); }
 
 // --- Neural tracer delegations ---
 

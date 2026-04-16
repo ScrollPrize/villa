@@ -529,10 +529,10 @@ public:
                 throw std::runtime_error("Invalid GridStore file: metadata out of bounds.");
             }
             std::string meta_str(meta_start, json_meta_size);
-            meta_ = nlohmann::json::parse(meta_str);
+            meta_ = utils::Json::parse(meta_str);
         }
     }
-    nlohmann::json meta_;
+    utils::Json meta_;
 
 private:
     char* write_bucket(char* current, const std::vector<int>& bucket, const std::unordered_map<int, uint32_t>& path_offsets) const {
@@ -816,7 +816,7 @@ private:
  
 GridStore::GridStore(const cv::Rect& bounds, int cell_size)
     : pimpl_(std::make_unique<GridStoreImpl>(bounds, cell_size)) {}
- 
+
 GridStore::GridStore(const std::string& path)
     : pimpl_(std::make_unique<GridStoreImpl>(cv::Rect(), 1)) { // Use a dummy cell_size to avoid division by zero
     pimpl_->load_mmap(path);

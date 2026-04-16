@@ -6,7 +6,7 @@
 
 #include <boost/program_options.hpp>
 #include <opencv2/opencv.hpp>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 #include <fstream>
 #include <atomic>
 #include <chrono>
@@ -16,12 +16,10 @@
 
 #include <omp.h>
 
-#include <xtensor/containers/xarray.hpp>
-#include <xtensor/containers/xtensor.hpp>
 
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/cache/SimpleCacheFactory.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 #include <vc/core/util/GridStore.hpp>
 #include "vc/core/util/NormalGridGenerate.hpp"
 #include "vc/core/util/Thinning.hpp"
@@ -35,7 +33,7 @@ enum class SliceDirection { XY, XZ, YZ };
 
 namespace {
 
-using json = nlohmann::json;
+using Json = utils::Json;
 
 struct DirectionMetrics {
     std::string direction;
@@ -138,7 +136,7 @@ static vc::core::util::NormalGridSliceDirection to_normal_grid_direction(SliceDi
 }
 
 static void write_metrics_json(const fs::path& path, const RunMetrics& metrics) {
-    json out;
+    Json out;
     out["mode"] = "generate";
     out["input"] = metrics.inputPath;
     out["output"] = metrics.outputPath;
@@ -151,15 +149,19 @@ static void write_metrics_json(const fs::path& path, const RunMetrics& metrics) 
     out["verify_grid_save"] = metrics.verifyGridSave;
     out["omp_threads"] = metrics.ompThreads;
     out["cache_budget_bytes"] = metrics.cacheBudgetBytes;
-    out["level_shape_zyx"] = metrics.levelShape;
+    {
+        Json arr = Json::array();
+        for (auto v : metrics.levelShape) arr.push_back(static_cast<int64_t>(v));
+        out["level_shape_zyx"] = std::move(arr);
+    }
     out["total_slices_all_dirs"] = metrics.totalSlicesAllDirs;
     out["total_processed_all_dirs"] = metrics.totalProcessedAllDirs;
     out["total_skipped_all_dirs"] = metrics.totalSkippedAllDirs;
     out["total_seconds"] = metrics.totalSeconds;
-    out["directions"] = json::array();
+    out["directions"] = Json::array();
 
     for (const auto& dir : metrics.directions) {
-        json d;
+        Json d;
         d["direction"] = dir.direction;
         d["num_slices"] = dir.numSlices;
         d["sampled_slices"] = dir.sampledSlices;
@@ -177,9 +179,9 @@ static void write_metrics_json(const fs::path& path, const RunMetrics& metrics) 
         d["source_chunks_touched"] = dir.sourceChunksTouched;
         d["bytes_per_slice"] = dir.bytesPerSlice;
         d["estimated_batch_bytes"] = dir.estimatedBatchBytes;
-        d["timings"] = json::object();
+        d["timings"] = Json::object();
         for (const auto& [name, total] : dir.timingTotals) {
-            json t;
+            Json t;
             t["total_seconds"] = total;
             const size_t count = dir.timingCounts.contains(name) ? dir.timingCounts.at(name) : 0;
             t["count"] = count;
@@ -493,7 +495,7 @@ void run_generate(const po::variables_map& vm) {
     fs::create_directories(output_fs_path / "xz_img");
     fs::create_directories(output_fs_path / "yz_img");
 
-    json metadata;
+    Json metadata;
     metadata["spiral-step"] = spiral_step;
     metadata["grid-step"] = grid_step;
     metadata["sparse-volume"] = sparse_volume;
@@ -502,7 +504,7 @@ void run_generate(const po::variables_map& vm) {
     metadata["preview-every"] = preview_every;
     metadata["verify-grid-save"] = verify_grid_save;
     std::ofstream o(output_fs_path / "metadata.json");
-    o << std::setw(4) << metadata << std::endl;
+    o << metadata.dump(4) << std::endl;
 
     int num_threads = omp_get_max_threads();
     if (num_threads == 0) num_threads = 1;
@@ -522,7 +524,7 @@ void run_generate(const po::variables_map& vm) {
         256ull * 1024ull * 1024ull,
         std::max<size_t>(64ull * 1024ull * 1024ull, max_estimated_batch_bytes / 2));
 
-    auto cache = vc::cache::createSimpleTieredCache(ds.get(), cache_budget_bytes, ds->path());
+    auto cache = vc::cache::openFilesystemPipeline(ds.get(), cache_budget_bytes, ds->path());
 
     RunMetrics run_metrics;
     run_metrics.inputPath = input_path;
@@ -642,125 +644,57 @@ void run_generate(const po::variables_map& vm) {
                 }
 
                 if (!assembled_slices.empty()) {
-                    const auto read_start = std::chrono::steady_clock::now();
-
+                    std::array<size_t, 3> slab_shape;
+                    cv::Vec3i slab_offset;
                     switch (dir) {
                     case SliceDirection::XY:
-                        for (size_t chunk_y = 0; chunk_y < chunk_count_y; ++chunk_y) {
-                            const int dst_row_offset = static_cast<int>(chunk_y * source_chunk_shape[1]);
-                            const size_t valid_rows = std::min(
-                                source_chunk_shape[1],
-                                shape[1] - static_cast<size_t>(dst_row_offset));
-                            for (size_t chunk_x = 0; chunk_x < chunk_count_x; ++chunk_x) {
-                                const int dst_col_offset = static_cast<int>(chunk_x * source_chunk_shape[2]);
-                                const size_t valid_cols = std::min(
-                                    source_chunk_shape[2],
-                                    shape[2] - static_cast<size_t>(dst_col_offset));
-                                auto chunk = cache->getBlocking(vc::cache::ChunkKey{
-                                    0,
-                                    static_cast<int>(source_chunk_plan.sourceChunkIndex),
-                                    static_cast<int>(chunk_y),
-                                    static_cast<int>(chunk_x),
-                                });
-                                if (!chunk) {
-                                    continue;
-                                }
-                                const auto* chunk_data = chunk->data<uint8_t>();
-                                for (auto& assembled : assembled_slices) {
-                                    vc::core::util::copyBinarySliceRegionFromChunk(
-                                        chunk_data,
-                                        chunk->shape,
-                                        to_normal_grid_direction(dir),
-                                        assembled.localSliceIndex,
-                                        valid_rows,
-                                        valid_cols,
-                                        dst_row_offset,
-                                        dst_col_offset,
-                                        assembled.binarySlice,
-                                        assembled.anyNonZero);
-                                }
-                            }
-                        }
+                        slab_shape = {source_chunk_shape[0], shape[1], shape[2]};
+                        slab_offset = {
+                            static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[0]),
+                            0,
+                            0,
+                        };
                         break;
                     case SliceDirection::XZ:
-                        for (size_t chunk_z = 0; chunk_z < chunk_count_z; ++chunk_z) {
-                            const int dst_row_offset = static_cast<int>(chunk_z * source_chunk_shape[0]);
-                            const size_t valid_rows = std::min(
-                                source_chunk_shape[0],
-                                shape[0] - static_cast<size_t>(dst_row_offset));
-                            for (size_t chunk_x = 0; chunk_x < chunk_count_x; ++chunk_x) {
-                                const int dst_col_offset = static_cast<int>(chunk_x * source_chunk_shape[2]);
-                                const size_t valid_cols = std::min(
-                                    source_chunk_shape[2],
-                                    shape[2] - static_cast<size_t>(dst_col_offset));
-                                auto chunk = cache->getBlocking(vc::cache::ChunkKey{
-                                    0,
-                                    static_cast<int>(chunk_z),
-                                    static_cast<int>(source_chunk_plan.sourceChunkIndex),
-                                    static_cast<int>(chunk_x),
-                                });
-                                if (!chunk) {
-                                    continue;
-                                }
-                                const auto* chunk_data = chunk->data<uint8_t>();
-                                for (auto& assembled : assembled_slices) {
-                                    vc::core::util::copyBinarySliceRegionFromChunk(
-                                        chunk_data,
-                                        chunk->shape,
-                                        to_normal_grid_direction(dir),
-                                        assembled.localSliceIndex,
-                                        valid_rows,
-                                        valid_cols,
-                                        dst_row_offset,
-                                        dst_col_offset,
-                                        assembled.binarySlice,
-                                        assembled.anyNonZero);
-                                }
-                            }
-                        }
+                        slab_shape = {shape[0], source_chunk_shape[1], shape[2]};
+                        slab_offset = {
+                            0,
+                            static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[1]),
+                            0,
+                        };
                         break;
                     case SliceDirection::YZ:
-                        for (size_t chunk_z = 0; chunk_z < chunk_count_z; ++chunk_z) {
-                            const int dst_row_offset = static_cast<int>(chunk_z * source_chunk_shape[0]);
-                            const size_t valid_rows = std::min(
-                                source_chunk_shape[0],
-                                shape[0] - static_cast<size_t>(dst_row_offset));
-                            for (size_t chunk_y = 0; chunk_y < chunk_count_y; ++chunk_y) {
-                                const int dst_col_offset = static_cast<int>(chunk_y * source_chunk_shape[1]);
-                                const size_t valid_cols = std::min(
-                                    source_chunk_shape[1],
-                                    shape[1] - static_cast<size_t>(dst_col_offset));
-                                auto chunk = cache->getBlocking(vc::cache::ChunkKey{
-                                    0,
-                                    static_cast<int>(chunk_z),
-                                    static_cast<int>(chunk_y),
-                                    static_cast<int>(source_chunk_plan.sourceChunkIndex),
-                                });
-                                if (!chunk) {
-                                    continue;
-                                }
-                                const auto* chunk_data = chunk->data<uint8_t>();
-                                for (auto& assembled : assembled_slices) {
-                                    vc::core::util::copyBinarySliceRegionFromChunk(
-                                        chunk_data,
-                                        chunk->shape,
-                                        to_normal_grid_direction(dir),
-                                        assembled.localSliceIndex,
-                                        valid_rows,
-                                        valid_cols,
-                                        dst_row_offset,
-                                        dst_col_offset,
-                                        assembled.binarySlice,
-                                        assembled.anyNonZero);
-                                }
-                            }
-                        }
+                        slab_shape = {shape[0], shape[1], source_chunk_shape[2]};
+                        slab_offset = {
+                            0,
+                            0,
+                            static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[2]),
+                        };
                         break;
                     }
+                    // Clip slab to actual volume extents so we do not read past the end.
+                    for (int axis = 0; axis < 3; ++axis) {
+                        const size_t end = static_cast<size_t>(slab_offset[axis]) + slab_shape[axis];
+                        if (end > shape[axis]) {
+                            slab_shape[axis] = shape[axis] - static_cast<size_t>(slab_offset[axis]);
+                        }
+                    }
 
+                    const auto read_start = std::chrono::steady_clock::now();
+                    Array3D<uint8_t> chunk_data(slab_shape);
+                    readArea3D(chunk_data, slab_offset, cache.get(), 0);
                     dir_metrics.timingTotals["read_chunk"] += std::chrono::duration<double>(
                         std::chrono::steady_clock::now() - read_start).count();
                     dir_metrics.timingCounts["read_chunk"] += 1;
+
+                    for (auto& assembled : assembled_slices) {
+                        const bool any_nonzero = vc::core::util::extractBinarySliceFromChunk(
+                            chunk_data,
+                            to_normal_grid_direction(dir),
+                            assembled.localSliceIndex,
+                            assembled.binarySlice);
+                        assembled.anyNonZero = assembled.anyNonZero || any_nonzero;
+                    }
                 }
 
                 std::vector<ThreadSliceStats> thread_stats(static_cast<size_t>(num_threads));

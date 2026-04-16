@@ -42,14 +42,14 @@ AlphaPushPullConfig sanitizeAlphaConfig(const AlphaPushPullConfig& config)
 {
     AlphaPushPullConfig sanitized = config;
 
-    sanitized.start = std::clamp(sanitized.start, -128.0f, 128.0f);
-    sanitized.stop = std::clamp(sanitized.stop, -128.0f, 128.0f);
+    sanitized.start = std::clamp(sanitized.start, -512.0f, 512.0f);
+    sanitized.stop = std::clamp(sanitized.stop, -512.0f, 512.0f);
     if (sanitized.start > sanitized.stop) {
         std::swap(sanitized.start, sanitized.stop);
     }
 
     const float minStep = 0.05f;
-    const float maxStep = 20.0f;
+    const float maxStep = 80.0f;
     const float magnitude = std::clamp(std::fabs(sanitized.step), minStep, maxStep);
     sanitized.step = (sanitized.step < 0.0f) ? -magnitude : magnitude;
 
@@ -59,9 +59,9 @@ AlphaPushPullConfig sanitizeAlphaConfig(const AlphaPushPullConfig& config)
         sanitized.high = std::min(1.0f, sanitized.low + 0.05f);
     }
 
-    sanitized.borderOffset = std::clamp(sanitized.borderOffset, -20.0f, 20.0f);
-    sanitized.blurRadius = std::clamp(sanitized.blurRadius, 0, 15);
-    sanitized.perVertexLimit = std::clamp(sanitized.perVertexLimit, 0.0f, 128.0f);
+    sanitized.borderOffset = std::clamp(sanitized.borderOffset, -80.0f, 80.0f);
+    sanitized.blurRadius = std::clamp(sanitized.blurRadius, 0, 63);
+    sanitized.perVertexLimit = std::clamp(sanitized.perVertexLimit, 0.0f, 512.0f);
 
     return sanitized;
 }
@@ -114,7 +114,7 @@ SegmentationEditingPanel::SegmentationEditingPanel(const QString& settingsGroup,
     auto* ppRadiusLabel = new QLabel(tr("Radius"), pushParent);
     _spinPushPullRadius = new QDoubleSpinBox(pushParent);
     _spinPushPullRadius->setDecimals(2);
-    _spinPushPullRadius->setRange(0.25, 128.0);
+    _spinPushPullRadius->setRange(0.25, 512.0);
     _spinPushPullRadius->setSingleStep(0.25);
     pushGrid->addWidget(ppRadiusLabel, 0, 0);
     pushGrid->addWidget(_spinPushPullRadius, 0, 1);
@@ -122,7 +122,7 @@ SegmentationEditingPanel::SegmentationEditingPanel(const QString& settingsGroup,
     auto* ppSigmaLabel = new QLabel(tr("Sigma"), pushParent);
     _spinPushPullSigma = new QDoubleSpinBox(pushParent);
     _spinPushPullSigma->setDecimals(2);
-    _spinPushPullSigma->setRange(0.05, 64.0);
+    _spinPushPullSigma->setRange(0.05, 256.0);
     _spinPushPullSigma->setSingleStep(0.1);
     pushGrid->addWidget(ppSigmaLabel, 0, 2);
     pushGrid->addWidget(_spinPushPullSigma, 0, 3);
@@ -130,7 +130,7 @@ SegmentationEditingPanel::SegmentationEditingPanel(const QString& settingsGroup,
     auto* pushPullLabel = new QLabel(tr("Step"), pushParent);
     _spinPushPullStep = new QDoubleSpinBox(pushParent);
     _spinPushPullStep->setDecimals(2);
-    _spinPushPullStep->setRange(0.05, 40.0);
+    _spinPushPullStep->setRange(0.05, 400.0);
     _spinPushPullStep->setSingleStep(0.05);
     pushGrid->addWidget(pushPullLabel, 1, 0);
     pushGrid->addWidget(_spinPushPullStep, 1, 1);
@@ -187,13 +187,13 @@ SegmentationEditingPanel::SegmentationEditingPanel(const QString& settingsGroup,
     };
 
     int alphaRow = 0;
-    addAlphaControl(tr("Start"), _spinAlphaStart, -64.0, 64.0, 0.5, alphaRow, 0,
+    addAlphaControl(tr("Start"), _spinAlphaStart, -256.0, 256.0, 0.5, alphaRow, 0,
                     tr("Beginning distance (along the brush normal) where alpha sampling starts."));
-    addAlphaControl(tr("Stop"), _spinAlphaStop, -64.0, 64.0, 0.5, alphaRow++, 1,
+    addAlphaControl(tr("Stop"), _spinAlphaStop, -256.0, 256.0, 0.5, alphaRow++, 1,
                     tr("Ending distance for alpha sampling; the search stops once this depth is reached."));
-    addAlphaControl(tr("Sample step"), _spinAlphaStep, 0.05, 20.0, 0.05, alphaRow, 0,
+    addAlphaControl(tr("Sample step"), _spinAlphaStep, 0.05, 80.0, 0.05, alphaRow, 0,
                     tr("Spacing between alpha samples inside the start/stop range; smaller steps follow fine features."));
-    addAlphaControl(tr("Border offset"), _spinAlphaBorder, -20.0, 20.0, 0.1, alphaRow++, 1,
+    addAlphaControl(tr("Border offset"), _spinAlphaBorder, -80.0, 80.0, 0.1, alphaRow++, 1,
                     tr("Extra offset applied after the alpha front is located, keeping a safety margin."));
     addAlphaControl(tr("Opacity low"), _spinAlphaLow, 0.0, 255.0, 1.0, alphaRow, 0,
                     tr("Lower bound of the opacity window; voxels below this behave as transparent."));
@@ -201,14 +201,14 @@ SegmentationEditingPanel::SegmentationEditingPanel(const QString& settingsGroup,
                     tr("Upper bound of the opacity window; voxels above this are fully opaque."));
 
     const QString blurTooltip = tr("Gaussian blur radius for each sampled slice; higher values smooth noisy volumes before thresholding.");
-    addAlphaIntControl(tr("Blur radius"), _spinAlphaBlurRadius, 0, 15, 1, alphaRow++, 0, blurTooltip);
+    addAlphaIntControl(tr("Blur radius"), _spinAlphaBlurRadius, 0, 63, 1, alphaRow++, 0, blurTooltip);
 
     _chkAlphaPerVertex = new QCheckBox(tr("Independent per-vertex stops"), _alphaPushPullPanel);
     _chkAlphaPerVertex->setToolTip(tr("Move every vertex within the brush independently to the alpha threshold without Gaussian weighting."));
     alphaGrid->addWidget(_chkAlphaPerVertex, alphaRow++, 0, 1, 4);
 
     const QString perVertexLimitTip = tr("Maximum additional distance (world units) a vertex may exceed relative to the smallest movement in the brush when independent stops are enabled.");
-    addAlphaControl(tr("Per-vertex limit"), _spinAlphaPerVertexLimit, 0.0, 128.0, 0.25, alphaRow++, 0, perVertexLimitTip);
+    addAlphaControl(tr("Per-vertex limit"), _spinAlphaPerVertexLimit, 0.0, 512.0, 0.25, alphaRow++, 0, perVertexLimitTip);
 
     alphaGrid->setColumnStretch(1, 1);
     alphaGrid->setColumnStretch(3, 1);
@@ -259,6 +259,19 @@ SegmentationEditingPanel::SegmentationEditingPanel(const QString& settingsGroup,
     pushPullRow->setSpacing(12);
     pushPullRow->addWidget(_groupPushPull, 1);
     falloffLayout->addLayout(pushPullRow);
+
+    auto* scaleRow = new QHBoxLayout();
+    auto* scaleLabel = new QLabel(tr("Scale"), falloffParent);
+    _spinEditScale = new QDoubleSpinBox(falloffParent);
+    _spinEditScale->setDecimals(1);
+    _spinEditScale->setRange(0.1, 40.0);
+    _spinEditScale->setSingleStep(0.1);
+    _spinEditScale->setToolTip(tr("Multiplier for all editing movement (drag, line brush, push/pull). "
+                                  "A value of 2.0 moves everything twice as far per mouse pixel."));
+    scaleRow->addWidget(scaleLabel);
+    scaleRow->addWidget(_spinEditScale);
+    scaleRow->addStretch(1);
+    falloffLayout->addLayout(scaleRow);
 
     auto* smoothingRow = new QHBoxLayout();
     auto* smoothStrengthLabel = new QLabel(tr("Smoothing strength"), falloffParent);
@@ -333,6 +346,11 @@ SegmentationEditingPanel::SegmentationEditingPanel(const QString& settingsGroup,
     connect(_spinPushPullStep, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         setPushPullStep(static_cast<float>(value));
         emit pushPullStepChanged(_pushPullStep);
+    });
+
+    connect(_spinEditScale, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        setEditScale(static_cast<float>(value));
+        emit editScaleChanged(_editScale);
     });
 
     auto onAlphaValueChanged = [this](auto updater) {
@@ -446,7 +464,7 @@ void SegmentationEditingPanel::setShowHoverMarker(bool enabled)
 
 void SegmentationEditingPanel::setDragRadius(float value)
 {
-    const float clamped = std::clamp(value, 0.25f, 128.0f);
+    const float clamped = std::clamp(value, 0.25f, 512.0f);
     if (std::fabs(clamped - _dragRadiusSteps) < kFloatEpsilon) {
         return;
     }
@@ -460,7 +478,7 @@ void SegmentationEditingPanel::setDragRadius(float value)
 
 void SegmentationEditingPanel::setDragSigma(float value)
 {
-    const float clamped = std::clamp(value, 0.05f, 64.0f);
+    const float clamped = std::clamp(value, 0.05f, 256.0f);
     if (std::fabs(clamped - _dragSigmaSteps) < kFloatEpsilon) {
         return;
     }
@@ -474,7 +492,7 @@ void SegmentationEditingPanel::setDragSigma(float value)
 
 void SegmentationEditingPanel::setLineRadius(float value)
 {
-    const float clamped = std::clamp(value, 0.25f, 128.0f);
+    const float clamped = std::clamp(value, 0.25f, 512.0f);
     if (std::fabs(clamped - _lineRadiusSteps) < kFloatEpsilon) {
         return;
     }
@@ -488,7 +506,7 @@ void SegmentationEditingPanel::setLineRadius(float value)
 
 void SegmentationEditingPanel::setLineSigma(float value)
 {
-    const float clamped = std::clamp(value, 0.05f, 64.0f);
+    const float clamped = std::clamp(value, 0.05f, 256.0f);
     if (std::fabs(clamped - _lineSigmaSteps) < kFloatEpsilon) {
         return;
     }
@@ -502,7 +520,7 @@ void SegmentationEditingPanel::setLineSigma(float value)
 
 void SegmentationEditingPanel::setPushPullRadius(float value)
 {
-    const float clamped = std::clamp(value, 0.25f, 128.0f);
+    const float clamped = std::clamp(value, 0.25f, 512.0f);
     if (std::fabs(clamped - _pushPullRadiusSteps) < kFloatEpsilon) {
         return;
     }
@@ -516,7 +534,7 @@ void SegmentationEditingPanel::setPushPullRadius(float value)
 
 void SegmentationEditingPanel::setPushPullSigma(float value)
 {
-    const float clamped = std::clamp(value, 0.05f, 64.0f);
+    const float clamped = std::clamp(value, 0.05f, 256.0f);
     if (std::fabs(clamped - _pushPullSigmaSteps) < kFloatEpsilon) {
         return;
     }
@@ -530,7 +548,7 @@ void SegmentationEditingPanel::setPushPullSigma(float value)
 
 void SegmentationEditingPanel::setPushPullStep(float value)
 {
-    const float clamped = std::clamp(value, 0.05f, 40.0f);
+    const float clamped = std::clamp(value, 0.05f, 400.0f);
     if (std::fabs(clamped - _pushPullStep) < kFloatEpsilon) {
         return;
     }
@@ -539,6 +557,20 @@ void SegmentationEditingPanel::setPushPullStep(float value)
     if (_spinPushPullStep) {
         const QSignalBlocker blocker(_spinPushPullStep);
         _spinPushPullStep->setValue(static_cast<double>(_pushPullStep));
+    }
+}
+
+void SegmentationEditingPanel::setEditScale(float value)
+{
+    const float clamped = std::clamp(value, 0.1f, 40.0f);
+    if (std::fabs(clamped - _editScale) < kFloatEpsilon) {
+        return;
+    }
+    _editScale = clamped;
+    writeSetting(QStringLiteral("edit_scale"), _editScale);
+    if (_spinEditScale) {
+        const QSignalBlocker blocker(_spinEditScale);
+        _spinEditScale->setValue(static_cast<double>(_editScale));
     }
 }
 
@@ -673,15 +705,18 @@ void SegmentationEditingPanel::restoreSettings(QSettings& settings)
     _pushPullSigmaSteps = settings.value(segmentation::PUSH_PULL_SIGMA_STEPS, _dragSigmaSteps).toFloat();
     _showHoverMarker = settings.value(segmentation::SHOW_HOVER_MARKER, _showHoverMarker).toBool();
 
-    _dragRadiusSteps = std::clamp(_dragRadiusSteps, 0.25f, 128.0f);
-    _dragSigmaSteps = std::clamp(_dragSigmaSteps, 0.05f, 64.0f);
-    _lineRadiusSteps = std::clamp(_lineRadiusSteps, 0.25f, 128.0f);
-    _lineSigmaSteps = std::clamp(_lineSigmaSteps, 0.05f, 64.0f);
-    _pushPullRadiusSteps = std::clamp(_pushPullRadiusSteps, 0.25f, 128.0f);
-    _pushPullSigmaSteps = std::clamp(_pushPullSigmaSteps, 0.05f, 64.0f);
+    _dragRadiusSteps = std::clamp(_dragRadiusSteps, 0.25f, 512.0f);
+    _dragSigmaSteps = std::clamp(_dragSigmaSteps, 0.05f, 256.0f);
+    _lineRadiusSteps = std::clamp(_lineRadiusSteps, 0.25f, 512.0f);
+    _lineSigmaSteps = std::clamp(_lineSigmaSteps, 0.05f, 256.0f);
+    _pushPullRadiusSteps = std::clamp(_pushPullRadiusSteps, 0.25f, 512.0f);
+    _pushPullSigmaSteps = std::clamp(_pushPullSigmaSteps, 0.05f, 256.0f);
 
     _pushPullStep = settings.value(segmentation::PUSH_PULL_STEP, _pushPullStep).toFloat();
-    _pushPullStep = std::clamp(_pushPullStep, 0.05f, 40.0f);
+    _pushPullStep = std::clamp(_pushPullStep, 0.05f, 400.0f);
+
+    _editScale = settings.value(segmentation::EDIT_SCALE, _editScale).toFloat();
+    _editScale = std::clamp(_editScale, 0.1f, 40.0f);
 
     AlphaPushPullConfig storedAlpha = _alphaPushPullConfig;
     storedAlpha.start = settings.value(segmentation::PUSH_PULL_ALPHA_START, storedAlpha.start).toFloat();
@@ -761,6 +796,12 @@ void SegmentationEditingPanel::syncUiState(bool editingEnabled, bool growthInPro
         const QSignalBlocker blocker(_spinPushPullStep);
         _spinPushPullStep->setValue(static_cast<double>(_pushPullStep));
         _spinPushPullStep->setEnabled(editingActive);
+    }
+
+    if (_spinEditScale) {
+        const QSignalBlocker blocker(_spinEditScale);
+        _spinEditScale->setValue(static_cast<double>(_editScale));
+        _spinEditScale->setEnabled(editingActive);
     }
 
     if (_lblAlphaInfo) {

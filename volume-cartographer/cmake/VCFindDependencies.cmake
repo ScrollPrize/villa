@@ -19,43 +19,10 @@ endfunction()
 # ---- utils is now vendored in utils/ and added via add_subdirectory() ------
 # (see top-level CMakeLists.txt)
 
-# ---- xtl / xsimd / xtensor (chunk buffer type, used throughout) --------------
-set(XTENSOR_USE_XSIMD 1)
-
-FetchContent_Declare(
-    xtl
-    GIT_REPOSITORY https://github.com/xtensor-stack/xtl.git
-    GIT_TAG        0.8.1
-)
-FetchContent_Declare(
-    xsimd
-    GIT_REPOSITORY https://github.com/xtensor-stack/xsimd.git
-    GIT_TAG        13.2.0
-)
-FetchContent_Declare(
-    xtensor
-    GIT_REPOSITORY https://github.com/xtensor-stack/xtensor.git
-    GIT_TAG        0.27.1
-)
-FetchContent_MakeAvailable(xtl xsimd xtensor)
-foreach(_dep xtl xsimd xtensor)
-    vc_suppress_warnings("${${_dep}_SOURCE_DIR}")
-endforeach()
-
-# xtensor sets cxx_std_20 INTERFACE which can downgrade our C++23; upgrade it
-set_property(TARGET xtensor PROPERTY INTERFACE_COMPILE_FEATURES cxx_std_23)
-
-# Mark xtensor-stack headers as SYSTEM to suppress warnings from -Weverything
-foreach(_target xtl xsimd xtensor)
-    get_target_property(_inc_dirs ${_target} INTERFACE_INCLUDE_DIRECTORIES)
-    if(_inc_dirs)
-        set_target_properties(${_target} PROPERTIES INTERFACE_INCLUDE_DIRECTORIES "")
-        target_include_directories(${_target} SYSTEM INTERFACE ${_inc_dirs})
-    endif()
-endforeach()
+# ---- xtensor removed — replaced by core/include/vc/core/types/Array3D.hpp ----
 
 # ---- Qt (apps / utils) -------------------------------------------------------
-find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network Concurrent)
+find_package(Qt6 QUIET REQUIRED COMPONENTS Widgets Gui Core Network Concurrent OpenGLWidgets)
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)
@@ -134,17 +101,13 @@ if (VC_USE_OPENMP)
     else()
         find_package(OpenMP REQUIRED)
     endif()
-    set(XTENSOR_USE_OPENMP 1)
 else()
     message(STATUS "OpenMP support disabled")
-    set(XTENSOR_USE_OPENMP 0)
     include_directories(${CMAKE_SOURCE_DIR}/core/openmp_stub)
     add_library(openmp_stub INTERFACE)
     add_library(OpenMP::OpenMP_CXX ALIAS openmp_stub)
     add_library(OpenMP::OpenMP_C  ALIAS openmp_stub)
 endif()
-
-# ---- xtensor/xsimd (already fetched above) -----------------------------------
 
 # ---- nlohmann/json -----------------------------------------------------------
 FetchContent_Declare(
@@ -162,34 +125,12 @@ if (NOT json_POPULATED)
 endif()
 
 # ---- c-blosc (compression for zarr chunks) -----------------------------------
-set(BUILD_TESTS      OFF CACHE BOOL "" FORCE)
-set(BUILD_FUZZERS    OFF CACHE BOOL "" FORCE)
-set(BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
-set(BUILD_SHARED     OFF CACHE BOOL "" FORCE)
-set(BUILD_STATIC     ON  CACHE BOOL "" FORCE)
-set(PREFER_EXTERNAL_ZLIB OFF CACHE BOOL "" FORCE)
-set(PREFER_EXTERNAL_ZSTD OFF CACHE BOOL "" FORCE)
-set(PREFER_EXTERNAL_LZ4  OFF CACHE BOOL "" FORCE)
-set(DEACTIVATE_SNAPPY ON CACHE BOOL "" FORCE)
-# c-blosc has cmake_minimum_required < 3.5; newer CMake rejects it.
-if(NOT DEFINED CMAKE_POLICY_VERSION_MINIMUM)
-    set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "" FORCE)
-endif()
-FetchContent_Declare(
-    c-blosc
-    DOWNLOAD_EXTRACT_TIMESTAMP ON
-    URL https://github.com/Blosc/c-blosc/archive/refs/tags/v1.21.6.tar.gz
-)
-FetchContent_GetProperties(c-blosc)
-if(NOT c-blosc_POPULATED)
-    FetchContent_Populate(c-blosc)
-    add_subdirectory(${c-blosc_SOURCE_DIR} ${c-blosc_BINARY_DIR} EXCLUDE_FROM_ALL)
-    vc_suppress_warnings("${c-blosc_SOURCE_DIR}")
-    # GCC 15+ defaults to C23 where `bool` is a keyword, breaking blosc's
-    # `typedef _Bool bool`.  Pin blosc_static to C17 to avoid this.
-    if(TARGET blosc_static)
-        set_target_properties(blosc_static PROPERTIES C_STANDARD 17 C_STANDARD_REQUIRED ON)
-    endif()
+# Use system-installed libblosc instead of building from source.
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(BLOSC REQUIRED IMPORTED_TARGET blosc)
+# Alias so existing target_link_libraries(... blosc_static) still works
+if(NOT TARGET blosc_static)
+    add_library(blosc_static ALIAS PkgConfig::BLOSC)
 endif()
 
 # ---- CURL (for HTTP chunk source / remote volumes) ---------------------------

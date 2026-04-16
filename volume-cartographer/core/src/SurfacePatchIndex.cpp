@@ -163,16 +163,18 @@ struct CellKey {
 
 struct SurfacePatchIndex::Impl {
     struct PatchRecord {
-        SurfacePtr surface;
+        // Raw pointer: the SurfaceRecord in surfaceRecords owns the
+        // shared_ptr and outlives every PatchRecord that references it.
+        QuadSurface* surface = nullptr;
         int i = 0;
         int j = 0;
-        int stride = 1;
+        // NOTE: stride is not stored — it is always equal to
+        // SurfacePatchIndex::Impl::samplingStride (global per-index).
 
         bool operator==(const PatchRecord& other) const noexcept {
-            return surface.get() == other.surface.get() &&
+            return surface == other.surface &&
                    i == other.i &&
-                   j == other.j &&
-                   stride == other.stride;
+                   j == other.j;
         }
     };
 
@@ -181,10 +183,51 @@ struct SurfacePatchIndex::Impl {
     using Entry = std::pair<Box3, PatchRecord>;
     using PatchTree = bgi::rtree<Entry, bgi::quadratic<32>>;
 
+    // Volume-wide quantization domain for cachedBoxes compression.
+    // All bboxes inserted into the rtree are snapped (quantize-then-dequantize)
+    // so on-disk bytes match rtree::remove's operator== lookup exactly.
+    // 101000-unit span / 65535 steps ≈ 1.54 unit precision, plenty for cell-
+    // granularity spatial queries (cells are typically 2+ units wide).
+    static constexpr float kQLow = -1000.0f;
+    static constexpr float kQHigh = 100000.0f;
+    static constexpr float kQRange = kQHigh - kQLow;
+
+    struct QBox {
+        uint16_t lo[3];
+        uint16_t hi[3];
+    };
+
+    static uint16_t qEnc(float v) noexcept {
+        float t = (v - kQLow) * (65535.0f / kQRange);
+        if (t < 0.0f) return 0;
+        if (t > 65535.0f) return 65535;
+        return static_cast<uint16_t>(t + 0.5f);
+    }
+    static float qDec(uint16_t c) noexcept {
+        return kQLow + float(c) * (kQRange / 65535.0f);
+    }
+    static QBox boxQuantize(const Box3& b) noexcept {
+        QBox q;
+        q.lo[0] = qEnc(b.min_corner().get<0>());
+        q.lo[1] = qEnc(b.min_corner().get<1>());
+        q.lo[2] = qEnc(b.min_corner().get<2>());
+        q.hi[0] = qEnc(b.max_corner().get<0>());
+        q.hi[1] = qEnc(b.max_corner().get<1>());
+        q.hi[2] = qEnc(b.max_corner().get<2>());
+        return q;
+    }
+    static Box3 boxDequantize(const QBox& q) noexcept {
+        return Box3(Point3(qDec(q.lo[0]), qDec(q.lo[1]), qDec(q.lo[2])),
+                    Point3(qDec(q.hi[0]), qDec(q.hi[1]), qDec(q.hi[2])));
+    }
+    static Box3 boxSnap(const Box3& b) noexcept {
+        return boxDequantize(boxQuantize(b));
+    }
+
     std::unique_ptr<PatchTree> tree;
     struct CellEntry {
         bool hasPatch = false;
-        std::optional<Entry> patch;
+        Entry patch{Box3(Point3(0,0,0), Point3(0,0,0)), PatchRecord{}};
     };
 
     struct SurfaceCellMask {
@@ -192,7 +235,12 @@ struct SurfacePatchIndex::Impl {
         int cols = 0;
         int activeCount = 0;
         std::vector<uint8_t> states;
-        std::unordered_map<std::size_t, Entry> cachedEntries;
+        // Dense vector of each cell's quantized R-tree Box3 (keyed by flat cell
+        // index). Dense because after the on-load trim, >95% of cells are
+        // active, making the map overhead (~52B/entry) far more costly than
+        // the empty-slot cost of a dense array (12B/cell).
+        // Validity is determined by states[] bits, not by a sentinel QBox.
+        std::vector<QBox> cachedBoxes;
         std::unordered_set<std::size_t> pendingCells;  // Cells needing R-tree update
 
         void clear()
@@ -201,7 +249,8 @@ struct SurfacePatchIndex::Impl {
             cols = 0;
             activeCount = 0;
             states.clear();
-            cachedEntries.clear();
+            cachedBoxes.clear();
+            cachedBoxes.shrink_to_fit();
             pendingCells.clear();
         }
 
@@ -214,14 +263,16 @@ struct SurfacePatchIndex::Impl {
                 clear();
                 return;
             }
-            if (rows == rowCount && cols == colCount && states.size() == required) {
+            const std::size_t requiredBytes = (required + 7u) / 8u;
+            if (rows == rowCount && cols == colCount && states.size() == requiredBytes
+                && cachedBoxes.size() == required) {
                 return;
             }
             rows = rowCount;
             cols = colCount;
             activeCount = 0;
-            states.assign(required, 0);
-            cachedEntries.clear();
+            states.assign(requiredBytes, 0);
+            cachedBoxes.assign(required, QBox{});
             pendingCells.clear();
         }
 
@@ -240,7 +291,8 @@ struct SurfacePatchIndex::Impl {
             if (!validIndex(row, col)) {
                 return false;
             }
-            return states[index(row, col)] != 0;
+            const std::size_t idx = index(row, col);
+            return (states[idx >> 3] >> (idx & 7u)) & 1u;
         }
 
         void setActive(int row, int col, bool active)
@@ -249,53 +301,42 @@ struct SurfacePatchIndex::Impl {
                 return;
             }
             const std::size_t idx = index(row, col);
-            const uint8_t next = active ? 1u : 0u;
-            const uint8_t prev = states[idx];
-            if (prev == next) {
+            const std::size_t byte = idx >> 3;
+            const uint8_t bit = static_cast<uint8_t>(1u << (idx & 7u));
+            const bool prev = (states[byte] & bit) != 0;
+            if (prev == active) {
                 return;
             }
-            states[idx] = next;
-            activeCount += active ? 1 : -1;
+            if (active) {
+                states[byte] |= bit;
+                ++activeCount;
+            } else {
+                states[byte] &= static_cast<uint8_t>(~bit);
+                --activeCount;
+            }
         }
 
-        Entry* entryAt(int row, int col)
+        std::optional<Box3> bboxAt(int row, int col) const
         {
-            if (!validIndex(row, col)) {
-                return nullptr;
+            if (!validIndex(row, col) || !isActive(row, col)) {
+                return std::nullopt;
             }
-            auto it = cachedEntries.find(index(row, col));
-            if (it == cachedEntries.end()) {
-                return nullptr;
-            }
-            return &it->second;
+            return boxDequantize(cachedBoxes[index(row, col)]);
         }
 
-        const Entry* entryAt(int row, int col) const
-        {
-            if (!validIndex(row, col)) {
-                return nullptr;
-            }
-            auto it = cachedEntries.find(index(row, col));
-            if (it == cachedEntries.end()) {
-                return nullptr;
-            }
-            return &it->second;
-        }
-
-        void storeEntry(int row, int col, const Entry& entry)
+        void storeBox(int row, int col, const Box3& box)
         {
             if (!validIndex(row, col)) {
                 return;
             }
-            cachedEntries.insert_or_assign(index(row, col), entry);
+            cachedBoxes[index(row, col)] = boxQuantize(box);
         }
 
-        void eraseEntry(int row, int col)
+        void eraseBox(int row, int col)
         {
-            if (!validIndex(row, col)) {
-                return;
-            }
-            cachedEntries.erase(index(row, col));
+            // No-op: validity tracked via states[]. Leaving stale bytes in
+            // cachedBoxes is fine because bboxAt() checks isActive() first.
+            (void)row; (void)col;
         }
 
         bool empty() const
@@ -381,6 +422,7 @@ struct SurfacePatchIndex::Impl {
                                float bboxPadding,
                                CellEntry& outEntry);
     static bool loadPatchCorners(const PatchRecord& rec,
+                                 int stride,
                                  std::array<cv::Vec3f, 4>& outCorners);
     static Entry buildEntryFromCorners(const PatchRecord& rec,
                                        const std::array<cv::Vec3f, 4>& corners,
@@ -405,11 +447,11 @@ struct SurfacePatchIndex::Impl {
 
     bool flushPendingSurface(const SurfacePtr& surface, SurfaceCellMask& mask);
 
-    static PatchHit evaluatePatch(const PatchRecord& rec, const cv::Vec3f& point) {
+    static PatchHit evaluatePatch(const PatchRecord& rec, int stride, const cv::Vec3f& point) {
         PatchHit best;
 
         std::array<cv::Vec3f, 4> corners;
-        if (!loadPatchCorners(rec, corners)) {
+        if (!loadPatchCorners(rec, stride, corners)) {
             return best;
         }
 
@@ -586,7 +628,8 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
             for (auto& cell : perSurfaceCells[i]) {
                 rec->mask.setActive(cell.first.rowIndex(), cell.first.colIndex(), cell.second.hasPatch);
                 if (cell.second.hasPatch) {
-                    rec->mask.storeEntry(cell.first.rowIndex(), cell.first.colIndex(), *cell.second.patch);
+                    rec->mask.storeBox(cell.first.rowIndex(), cell.first.colIndex(),
+                                       cell.second.patch.first);
                 }
             }
         }
@@ -608,7 +651,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     for (auto& cells : perSurfaceCells) {
         for (auto& cell : cells) {
             if (cell.second.hasPatch) {
-                entries.push_back(std::move(*cell.second.patch));
+                entries.push_back(std::move(cell.second.patch));
             }
         }
     }
@@ -637,6 +680,16 @@ bool SurfacePatchIndex::empty() const
     return !impl_ || !impl_->tree || impl_->patchCount == 0;
 }
 
+size_t SurfacePatchIndex::patchCount() const
+{
+    return impl_ ? impl_->patchCount : 0;
+}
+
+size_t SurfacePatchIndex::surfaceCount() const
+{
+    return impl_ ? impl_->surfaceRecords.size() : 0;
+}
+
 std::optional<SurfacePatchIndex::LookupResult>
 SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const SurfacePtr& targetSurface) const
 {
@@ -651,6 +704,7 @@ SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const Su
 
     const float toleranceSq = tol * tol;
     SurfacePatchIndex::LookupResult best;
+    QuadSurface* bestSurfaceRaw = nullptr;
     float bestDistSq = toleranceSq;
     bool found = false;
     struct SurfaceInfo {
@@ -671,16 +725,16 @@ SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const Su
 
     auto processEntry = [&](const Impl::Entry& entry) {
         const Impl::PatchRecord& rec = entry.second;
-        if (targetSurface && rec.surface.get() != targetSurface.get()) {
+        if (targetSurface && rec.surface != targetSurface.get()) {
             return;
         }
 
-        Impl::PatchHit hit = Impl::evaluatePatch(rec, worldPoint);
+        Impl::PatchHit hit = Impl::evaluatePatch(rec, impl_->samplingStride, worldPoint);
         if (!hit.valid || hit.distSq > bestDistSq) {
             return;
         }
 
-        const SurfaceInfo& info = ensureSurfaceInfo(rec.surface.get());
+        const SurfaceInfo& info = ensureSurfaceInfo(rec.surface);
         const float absX = static_cast<float>(rec.i) + hit.u;
         const float absY = static_cast<float>(rec.j) + hit.v;
         cv::Vec3f ptr = {
@@ -689,7 +743,7 @@ SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const Su
             0.0f
         };
 
-        best.surface = rec.surface;
+        bestSurfaceRaw = rec.surface;
         best.ptr = ptr;
         bestDistSq = hit.distSq;
         found = true;
@@ -703,6 +757,10 @@ SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const Su
         return std::nullopt;
     }
 
+    if (auto srIt = impl_->surfaceRecords.find(bestSurfaceRaw);
+        srIt != impl_->surfaceRecords.end()) {
+        best.surface = srIt->second.surface;
+    }
     best.distance = std::sqrt(bestDistSq);
     return best;
 }
@@ -712,6 +770,12 @@ void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
                                        std::vector<TriangleCandidate>& outCandidates) const
 {
     outCandidates.clear();
+    // Rough upper bound: keep whatever capacity the vector already had.
+    // A typical viewport has a few thousand triangle candidates; a small
+    // reserve avoids 3-4 reallocations during the push_back loop.
+    if (outCandidates.capacity() < 2048) {
+        outCandidates.reserve(2048);
+    }
     forEachTriangle(bounds, targetSurface, [&](const TriangleCandidate& candidate) {
         outCandidates.push_back(candidate);
     });
@@ -724,6 +788,9 @@ void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
     outCandidates.clear();
     if (targetSurfaces.empty()) {
         return;
+    }
+    if (outCandidates.capacity() < 2048) {
+        outCandidates.reserve(2048);
     }
     forEachTriangle(bounds, targetSurfaces, [&](const TriangleCandidate& candidate) {
         outCandidates.push_back(candidate);
@@ -767,19 +834,20 @@ void SurfacePatchIndex::forEachTriangleImpl(
         float cy;
         int rows;
         int cols;
+        SurfacePtr ownedPtr;  // Shared ownership for TriangleCandidate
     };
     std::unordered_map<QuadSurface*, SurfaceCache> surfaceCacheMap;
     surfaceCacheMap.reserve(filterSurfaces ? filterSurfaces->size() : 4);
 
     auto emitFromPatch = [&](const Impl::Entry& entry) {
         const Impl::PatchRecord& rec = entry.second;
-        if (targetSurface && rec.surface.get() != targetSurface.get()) {
+        if (targetSurface && rec.surface != targetSurface.get()) {
             return;
         }
         if (filterSurfaces) {
             bool found = false;
             for (const auto& s : *filterSurfaces) {
-                if (s.get() == rec.surface.get()) {
+                if (s.get() == rec.surface) {
                     found = true;
                     break;
                 }
@@ -789,27 +857,32 @@ void SurfacePatchIndex::forEachTriangleImpl(
             }
         }
 
-        // Load corners once for both triangles (avoids redundant matrix reads)
-        std::array<cv::Vec3f, 4> corners;
-        if (!Impl::loadPatchCorners(rec, corners)) {
-            return;
-        }
-
         // Precompute surface params for the quad (use cached center*scale offsets)
         const float baseX = static_cast<float>(rec.i);
         const float baseY = static_cast<float>(rec.j);
-        const int stride = std::max(1, rec.stride);
+        const int stride = std::max(1, impl_->samplingStride);
+
+        // Load corners once for both triangles (avoids redundant matrix reads)
+        std::array<cv::Vec3f, 4> corners;
+        if (!Impl::loadPatchCorners(rec, stride, corners)) {
+            return;
+        }
 
         // Get or create cached surface metadata
-        auto cacheIt = surfaceCacheMap.find(rec.surface.get());
+        auto cacheIt = surfaceCacheMap.find(rec.surface);
         if (cacheIt == surfaceCacheMap.end()) {
+            auto srIt = impl_->surfaceRecords.find(rec.surface);
+            if (srIt == impl_->surfaceRecords.end()) {
+                return;
+            }
             const cv::Vec3f center = rec.surface->center();
             const cv::Vec2f scale = rec.surface->scale();
             const cv::Mat_<cv::Vec3f>* points = rec.surface->rawPointsPtr();
             const int rows = points ? points->rows : 0;
             const int cols = points ? points->cols : 0;
-            cacheIt = surfaceCacheMap.emplace(rec.surface.get(),
-                SurfaceCache{center[0] * scale[0], center[1] * scale[1], rows, cols}).first;
+            cacheIt = surfaceCacheMap.emplace(rec.surface,
+                SurfaceCache{center[0] * scale[0], center[1] * scale[1],
+                             rows, cols, srIt->second.surface}).first;
         }
         const SurfaceCache& cache = cacheIt->second;
 
@@ -830,7 +903,7 @@ void SurfacePatchIndex::forEachTriangleImpl(
         // Triangle 1: corners[1,2,3], params[1,2,3]
         for (int triIdx = 0; triIdx < 2; ++triIdx) {
             TriangleCandidate candidate;
-            candidate.surface = rec.surface;
+            candidate.surface = cache.ownedPtr;
             candidate.i = rec.i;
             candidate.j = rec.j;
             candidate.triangleIndex = triIdx;
@@ -872,21 +945,28 @@ bool SurfacePatchIndex::Impl::removeSurfaceEntries(const SurfacePtr& surface)
 
     auto it = surfaceRecords.find(surface.get());
     if (it == surfaceRecords.end() || it->second.mask.empty()) {
+        // Short-circuit: the surface was never actually indexed (or was
+        // already removed). Avoid the full mask walk and log nothing.
         return false;
     }
 
     SurfaceCellMask& mask = it->second.mask;
 
-    // Iterate only over cached entries instead of entire grid (O(active) vs O(rows*cols))
-    if (tree && !mask.cachedEntries.empty()) {
-        for (const auto& [idx, entry] : mask.cachedEntries) {
-            if (tree->remove(entry) && patchCount > 0) {
-                --patchCount;
+    // Walk active cells via states bitset, use dense cachedBoxes for each.
+    if (tree && mask.activeCount > 0 && !mask.cachedBoxes.empty()) {
+        for (int row = 0; row < mask.rows; ++row) {
+            for (int col = 0; col < mask.cols; ++col) {
+                if (!mask.isActive(row, col)) continue;
+                const QBox& qb = mask.cachedBoxes[mask.index(row, col)];
+                PatchRecord rec{surface.get(), col, row};
+                if (tree->remove(Entry(boxDequantize(qb), rec)) && patchCount > 0) {
+                    --patchCount;
+                }
             }
         }
     }
 
-    // Clear the mask entirely (faster than individual eraseEntry calls)
+    // Clear the mask entirely (faster than individual eraseBox calls)
     mask.clear();
     surfaceRecords.erase(it);
 
@@ -899,14 +979,19 @@ bool SurfacePatchIndex::Impl::removeSurfaceEntries(const SurfacePtr& surface)
 
 void SurfacePatchIndex::Impl::removeSurfaceEntriesFromTree(const SurfacePtr& surface, SurfaceCellMask& mask)
 {
-    if (!surface || mask.cachedEntries.empty()) {
+    if (!surface || mask.cachedBoxes.empty() || mask.activeCount == 0) {
         return;
     }
 
     if (tree) {
-        for (const auto& [idx, entry] : mask.cachedEntries) {
-            if (tree->remove(entry) && patchCount > 0) {
-                --patchCount;
+        for (int row = 0; row < mask.rows; ++row) {
+            for (int col = 0; col < mask.cols; ++col) {
+                if (!mask.isActive(row, col)) continue;
+                const QBox& qb = mask.cachedBoxes[mask.index(row, col)];
+                PatchRecord rec{surface.get(), col, row};
+                if (tree->remove(Entry(boxDequantize(qb), rec)) && patchCount > 0) {
+                    --patchCount;
+                }
             }
         }
     }
@@ -1190,12 +1275,12 @@ SurfacePatchIndex::Impl::makePatchEntry(const CellKey& key) const
     }
 
     PatchRecord rec;
-    rec.surface = key.surface;
+    rec.surface = key.surface.get();
     rec.i = key.colIndex();
     rec.j = key.rowIndex();
 
     std::array<cv::Vec3f, 4> corners;
-    if (!loadPatchCorners(rec, corners)) {
+    if (!loadPatchCorners(rec, samplingStride, corners)) {
         return std::nullopt;
     }
 
@@ -1227,7 +1312,9 @@ SurfacePatchIndex::Impl::Entry SurfacePatchIndex::Impl::buildEntryFromCorners(
 
     Point3 min_pt(low[0], low[1], low[2]);
     Point3 max_pt(high[0], high[1], high[2]);
-    return Entry(Box3(min_pt, max_pt), rec);
+    // Snap through the cachedBoxes quantization grid so this Box3 matches
+    // (bit-for-bit) what we'll later look up via bboxAt() in tree->remove.
+    return Entry(boxSnap(Box3(min_pt, max_pt)), rec);
 }
 
 SurfacePatchIndex::Impl::SurfaceCellMask&
@@ -1260,6 +1347,7 @@ SurfacePatchIndex::Impl::ensureMask(const SurfacePtr& surface)
 }
 
 bool SurfacePatchIndex::Impl::loadPatchCorners(const PatchRecord& rec,
+                                               int stride,
                                                std::array<cv::Vec3f, 4>& outCorners)
 {
     if (!rec.surface) {
@@ -1277,7 +1365,7 @@ bool SurfacePatchIndex::Impl::loadPatchCorners(const PatchRecord& rec,
 
     const int row = rec.j;
     const int col = rec.i;
-    const int stride = std::max(1, rec.stride);
+    stride = std::max(1, stride);
 
     // Clamp stride to not exceed bounds
     const int effectiveColStride = std::min(stride, cols - 1 - col);
@@ -1327,10 +1415,9 @@ bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
     }
 
     PatchRecord rec;
-    rec.surface = surface;
+    rec.surface = surface.get();
     rec.i = col;
     rec.j = row;
-    rec.stride = stride;
 
     std::array<cv::Vec3f, 4> corners = {p00, p10, p11, p01};
     outEntry.patch = buildEntryFromCorners(rec, corners, bboxPadding);
@@ -1345,15 +1432,15 @@ void SurfacePatchIndex::Impl::removeCellEntry(SurfaceCellMask& mask,
                                               int col)
 {
     if (!surface || !mask.isActive(row, col)) {
-        mask.eraseEntry(row, col);
+        mask.eraseBox(row, col);
         return;
     }
 
     bool removed = false;
     if (tree) {
-        const Entry* cachedEntry = mask.entryAt(row, col);
-        if (cachedEntry) {
-            removed = tree->remove(*cachedEntry);
+        if (auto cachedBox = mask.bboxAt(row, col)) {
+            PatchRecord rec{surface.get(), col, row};
+            removed = tree->remove(Entry(*cachedBox, rec));
         } else {
             if (auto entry = makePatchEntry(CellKey(surface, row, col))) {
                 removed = tree->remove(*entry);
@@ -1365,7 +1452,7 @@ void SurfacePatchIndex::Impl::removeCellEntry(SurfaceCellMask& mask,
     }
 
     mask.setActive(row, col, false);
-    mask.eraseEntry(row, col);
+    mask.eraseBox(row, col);
 }
 
 void SurfacePatchIndex::Impl::insertCells(const std::vector<std::pair<CellKey, CellEntry>>& cells)
@@ -1384,12 +1471,12 @@ void SurfacePatchIndex::Impl::insertCells(const std::vector<std::pair<CellKey, C
         const int col = cell.first.colIndex();
 
         if (cell.second.hasPatch) {
-            toInsert.push_back(*cell.second.patch);
+            toInsert.push_back(cell.second.patch);
             mask.setActive(row, col, true);
-            mask.storeEntry(row, col, *cell.second.patch);
+            mask.storeBox(row, col, cell.second.patch.first);
         } else {
             mask.setActive(row, col, false);
-            mask.eraseEntry(row, col);
+            mask.eraseBox(row, col);
         }
     }
 
@@ -1589,11 +1676,12 @@ bool SurfacePatchIndex::Impl::flushPendingSurface(const SurfacePtr& surface, Sur
 
         // Remove old entry if it exists
         if (mask.isActive(row, col)) {
-            if (const Entry* cachedEntry = mask.entryAt(row, col)) {
-                toRemove.push_back(*cachedEntry);
+            if (auto cachedBox = mask.bboxAt(row, col)) {
+                PatchRecord rec{surface.get(), col, row};
+                toRemove.emplace_back(*cachedBox, rec);
             }
             mask.setActive(row, col, false);
-            mask.eraseEntry(row, col);
+            mask.eraseBox(row, col);
             if (patchCount > 0) {
                 --patchCount;
             }

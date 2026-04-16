@@ -2,9 +2,7 @@
 
 #include <QWidget>
 
-#include <optional>
-
-#include <nlohmann/json_fwd.hpp>
+#include "utils/Json.hpp"
 
 class JsonProfileEditor;
 class QSettings;
@@ -21,7 +19,7 @@ public:
     [[nodiscard]] QString customParamsProfile() const { return _customParamsProfile; }
     [[nodiscard]] bool customParamsValid() const { return _customParamsError.isEmpty(); }
     [[nodiscard]] QString customParamsError() const { return _customParamsError; }
-    [[nodiscard]] std::optional<nlohmann::json> customParamsJson() const;
+    [[nodiscard]] utils::Json customParamsJson() const;
 
     void restoreSettings(QSettings& settings);
     void syncUiState(bool editingEnabled);
@@ -30,7 +28,7 @@ private:
     void writeSetting(const QString& key, const QVariant& value);
     void handleCustomParamsEdited();
     void validateCustomParamsText();
-    [[nodiscard]] std::optional<nlohmann::json> parseCustomParams(QString* error) const;
+    [[nodiscard]] utils::Json parseCustomParams(QString* error) const;
     [[nodiscard]] QString paramsTextForProfile(const QString& profile) const;
     void applyCustomParamsProfile(const QString& profile, bool persist, bool fromUi);
 

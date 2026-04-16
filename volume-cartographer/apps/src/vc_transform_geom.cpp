@@ -8,7 +8,7 @@
 #include "vc/core/util/Surface.hpp"
 
 #include <boost/program_options.hpp>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -24,7 +24,7 @@
 #include <vector>
 
 namespace po = boost::program_options;
-using json = nlohmann::json;
+using Json = utils::Json;
 
 struct AffineTransform {
     cv::Mat_<double> M; // 4x4
@@ -181,20 +181,18 @@ static AffineTransform load_affine_json(const std::string& filename) {
     if (!std::filesystem::is_regular_file(p))
         throw std::runtime_error("affine path is not a regular file: " + filename);
 
-    std::ifstream f(filename);
-    if (!f.is_open()) throw std::runtime_error("cannot open affine file: " + filename);
-    json j;
+    Json j;
     try {
-        f >> j;
+        j = Json::parse_file(filename);
     } catch (const std::exception& e) {
         throw std::runtime_error("failed to parse affine file '" + filename + "': " + e.what());
     }
     if (!j.contains("transformation_matrix")) return t; // identity
-    auto mat = j["transformation_matrix"];
+    const Json& mat = j["transformation_matrix"];
     if (mat.size() != 3 && mat.size() != 4) throw std::runtime_error("affine must be 3x4 or 4x4");
     for (int r = 0; r < (int)mat.size(); ++r) {
         if (mat[r].size() != 4) throw std::runtime_error("affine rows must have 4 cols");
-        for (int c = 0; c < 4; ++c) t.M(r,c) = mat[r][c].get<double>();
+        for (int c = 0; c < 4; ++c) t.M(r,c) = mat[r][c].get_double();
     }
     if (mat.size() == 4) {
         const double a30 = t.M(3,0), a31 = t.M(3,1), a32 = t.M(3,2), a33 = t.M(3,3);
@@ -470,7 +468,7 @@ static int run_tifxyz(const std::filesystem::path& inDir,
     // area_cm2 intentionally remains unchanged for cross-volume registration
     // workflows where physical scale is defined by the target volume context.
     const double area_vx2 = vc::surface::computeSurfaceAreaVox2(*P);
-    (*surf->meta)["area_vx2"] = area_vx2;
+    surf->meta["area_vx2"] = area_vx2;
 
     try {
         std::filesystem::path out = outDir;

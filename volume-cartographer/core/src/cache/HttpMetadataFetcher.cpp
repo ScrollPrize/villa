@@ -1,133 +1,88 @@
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/cache/CacheDebugLog.hpp"
 
+#include <utils/zarr.hpp>
+
 #include <cstdio>
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <memory>
 #include <optional>
 #include <sstream>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include <utils/hash.hpp>
-
-#ifdef VC_USE_CURL
-#include <curl/curl.h>
-#endif
+#include <utils/http_fetch.hpp>
 
 namespace vc::cache {
 
-static constexpr const char* kRemoteSourceFile = ".remote_source.json";
+// ---------------------------------------------------------------------------
+// HttpClient factory — creates a configured client for S3 requests.
+// Thread-safe: HttpClient uses an internal mutex.
+// ---------------------------------------------------------------------------
 
-// ---- curl helpers -----------------------------------------------------------
-
-#ifdef VC_USE_CURL
-static size_t stringWriteCallback(
-    char* ptr, size_t size, size_t nmemb, void* userdata)
-{
-    auto* str = static_cast<std::string*>(userdata);
-    str->append(ptr, size * nmemb);
-    return size * nmemb;
+static utils::HttpClient makeClient(const HttpAuth& auth, int timeoutSec = 30) {
+    utils::HttpClient::Config cfg;
+    cfg.aws_auth = auth;
+    cfg.transfer_timeout = std::chrono::seconds{timeoutSec};
+    cfg.connect_timeout = std::chrono::seconds{5};
+    cfg.max_retries = 2;
+    return utils::HttpClient(std::move(cfg));
 }
-#endif
+
+// ---------------------------------------------------------------------------
+// httpGetString — fetch URL body as string
+// ---------------------------------------------------------------------------
 
 std::string httpGetString(const std::string& url, const HttpAuth& auth)
 {
-#ifdef VC_USE_CURL
-    // Thread-local CURL handle: reuses TCP+TLS connections across requests
-    thread_local CURL* curl = [] {
-        CURL* c = curl_easy_init();
-        if (c) {
-            curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
-            curl_easy_setopt(c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
-        }
-        return c;
-    }();
-    if (!curl) return {};
+    auto c = makeClient(auth, 30);
+    auto resp = c.get(url);
 
-    // Reset clears all options but keeps the connection alive
-    curl_easy_reset(curl);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+    if (resp.ok())
+        return std::string(resp.body_string());
 
-    std::string response;
+    if (resp.status_code >= 400) {
+        auto body = std::string(resp.body_string());
 
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stringWriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-#if CURL_AT_LEAST_VERSION(7, 85, 0)
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
-#else
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-#endif
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    // Don't use FAILONERROR — we check HTTP codes ourselves to distinguish
-    // 403 (auth error) from 404 (not found)
-
-    auto authGuard = applyCurlAuth(curl, auth);
-
-    CURLcode res = curl_easy_perform(curl);
-
-    if (res != CURLE_OK) {
-        std::fprintf(stderr, "[httpGetString] curl error %d for %s: %s\n",
-                     res, url.c_str(), curl_easy_strerror(res));
-        return {};
-    }
-
-    long httpCode = 0;
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
-
-    if (httpCode >= 400) {
-        // Check for S3 auth/token errors in response body
-        // S3 returns 400 for expired tokens, 403 for access denied
-        bool isAuthError = (httpCode == 401 || httpCode == 403);
-        if (!isAuthError && !response.empty()) {
-            // S3 returns XML errors like <Code>ExpiredToken</Code>
-            isAuthError = response.find("ExpiredToken") != std::string::npos ||
-                          response.find("AccessDenied") != std::string::npos ||
-                          response.find("InvalidAccessKeyId") != std::string::npos ||
-                          response.find("SignatureDoesNotMatch") != std::string::npos ||
-                          response.find("TokenRefreshRequired") != std::string::npos ||
-                          response.find("InvalidToken") != std::string::npos;
+        bool isAuthErr = (resp.status_code == 401 || resp.status_code == 403);
+        if (!isAuthErr && !body.empty()) {
+            isAuthErr = body.find("ExpiredToken") != std::string::npos ||
+                        body.find("AccessDenied") != std::string::npos ||
+                        body.find("InvalidAccessKeyId") != std::string::npos ||
+                        body.find("SignatureDoesNotMatch") != std::string::npos ||
+                        body.find("TokenRefreshRequired") != std::string::npos ||
+                        body.find("InvalidToken") != std::string::npos;
         }
 
-        if (isAuthError) {
-            // Try to extract the S3 error message
-            std::string errMsg = "Access denied (HTTP " + std::to_string(httpCode) + ")";
-            auto msgStart = response.find("<Message>");
-            auto msgEnd = response.find("</Message>");
+        if (isAuthErr) {
+            std::string errMsg = "Access denied (HTTP " + std::to_string(resp.status_code) + ")";
+            auto msgStart = body.find("<Message>");
+            auto msgEnd = body.find("</Message>");
             if (msgStart != std::string::npos && msgEnd != std::string::npos) {
-                msgStart += 9;  // strlen("<Message>")
-                errMsg = response.substr(msgStart, msgEnd - msgStart) +
-                         " (HTTP " + std::to_string(httpCode) + ")";
+                msgStart += 9;
+                errMsg = body.substr(msgStart, msgEnd - msgStart) +
+                         " (HTTP " + std::to_string(resp.status_code) + ")";
             }
             throw std::runtime_error(errMsg + ". Check your AWS credentials.");
         }
 
-        // 5xx — server error, throw so callers know it's transient
-        if (httpCode >= 500) {
+        if (resp.status_code >= 500) {
             throw std::runtime_error(
-                "HTTP server error " + std::to_string(httpCode) + " fetching " + url);
+                "HTTP server error " + std::to_string(resp.status_code) + " fetching " + url);
         }
 
-        // 404, 400, etc. — treat as "not found"
         return {};
     }
 
-    return response;
-#else
-    (void)url;
-    (void)auth;
     return {};
-#endif
 }
 
-// ---- S3 listing -------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// s3ListObjects — S3 ListObjectsV2 with delimiter
+// ---------------------------------------------------------------------------
 
-// Simple XML tag extraction — finds all occurrences of <tag>...</tag> in xml
 static std::vector<std::string> extractXmlTags(const std::string& xml, const std::string& tag)
 {
     std::vector<std::string> results;
@@ -146,13 +101,8 @@ static std::vector<std::string> extractXmlTags(const std::string& xml, const std
     return results;
 }
 
-// Parse S3 HTTPS URL into bucket host and prefix.
-// Input: "https://bucket.s3.region.amazonaws.com/some/prefix/"
-// Output: bucketHost = "https://bucket.s3.region.amazonaws.com"
-//         prefix = "some/prefix/"
 static bool parseS3Url(const std::string& url, std::string& bucketHost, std::string& prefix)
 {
-    // Find scheme
     auto schemeEnd = url.find("://");
     if (schemeEnd == std::string::npos) return false;
     auto pathStart = url.find('/', schemeEnd + 3);
@@ -170,237 +120,113 @@ S3ListResult s3ListObjects(const std::string& httpsBaseUrl, const HttpAuth& auth
 {
     S3ListResult result;
 
-#ifdef VC_USE_CURL
     std::string bucketHost, prefix;
-    if (!parseS3Url(httpsBaseUrl, bucketHost, prefix)) {
+    if (!parseS3Url(httpsBaseUrl, bucketHost, prefix))
         return result;
-    }
 
-    // Build ListObjectsV2 URL — use a temporary curl handle for URL encoding only
-    CURL* tmpCurl = curl_easy_init();
+    // URL-encode the prefix manually (simple: just encode spaces and special chars)
+    // For simplicity, build the URL directly — S3 prefixes are typically clean paths.
     std::string listUrl = bucketHost + "/?list-type=2&delimiter=/";
-    if (!prefix.empty() && tmpCurl) {
-        char* encoded = curl_easy_escape(
-            tmpCurl, prefix.c_str(), static_cast<int>(prefix.size()));
-        listUrl += "&prefix=";
-        listUrl += encoded;
-        curl_free(encoded);
-    } else if (!prefix.empty()) {
+    if (!prefix.empty()) {
         listUrl += "&prefix=" + prefix;
     }
-    if (tmpCurl) curl_easy_cleanup(tmpCurl);
 
     if (auto* log = cacheDebugLog())
         std::fprintf(log, "[S3] ListObjects: %s\n", listUrl.c_str());
 
-    // Thread-local CURL handle without FAILONERROR so we can log the status
-    thread_local CURL* curl = [] {
-        CURL* c = curl_easy_init();
-        if (c) {
-            curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
-            curl_easy_setopt(c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
-        }
-        return c;
-    }();
+    auto client = makeClient(auth, 30);
+    auto resp = client.get(listUrl);
 
-    std::string xml;
-    {
-        if (!curl) {
-            if (auto* log = cacheDebugLog())
-                std::fprintf(log, "[S3] Failed to init curl\n");
-            return result;
+    if (auto* log = cacheDebugLog())
+        std::fprintf(log, "[S3] ListObjects HTTP %ld\n", resp.status_code);
+
+    if (!resp.ok()) {
+        auto body = std::string(resp.body_string());
+        if (auto* log = cacheDebugLog()) {
+            if (!body.empty())
+                std::fprintf(log, "[S3] Response: %.500s\n", body.c_str());
         }
 
-        // Reset clears all options but keeps the connection alive
-        curl_easy_reset(curl);
-        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
-
-        curl_easy_setopt(curl, CURLOPT_URL, listUrl.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, stringWriteCallback);
-        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &xml);
-        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-#if CURL_AT_LEAST_VERSION(7, 85, 0)
-        curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
-#else
-        curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-#endif
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 30L);
-        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-
-        auto authGuard = applyCurlAuth(curl, auth);
-
-        CURLcode res = curl_easy_perform(curl);
-
-        long httpCode = 0;
-        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
-
-        if (res != CURLE_OK) {
-            if (auto* log = cacheDebugLog())
-                std::fprintf(log, "[S3] ListObjects curl error: %s\n",
-                             curl_easy_strerror(res));
-            return result;
-        }
-
-        if (httpCode != 200) {
-            if (auto* log = cacheDebugLog()) {
-                std::fprintf(log, "[S3] ListObjects HTTP %ld\n", httpCode);
-                if (!xml.empty()) {
-                    std::fprintf(log, "[S3] Response: %.500s\n", xml.c_str());
-                }
-            }
-
-            // Detect auth errors so callers can prompt for fresh credentials
-            if (httpCode == 400 || httpCode == 401 || httpCode == 403) {
-                // Check for known S3 auth error codes in the XML body
-                auto codes = extractXmlTags(xml, "Code");
-                for (const auto& code : codes) {
-                    if (code == "ExpiredToken" || code == "AccessDenied" ||
-                        code == "InvalidAccessKeyId" || code == "SignatureDoesNotMatch" ||
-                        code == "TokenRefreshRequired" || code == "InvalidToken") {
-                        result.authError = true;
-                        auto msgs = extractXmlTags(xml, "Message");
-                        if (!msgs.empty()) result.errorMessage = msgs.front();
-                        break;
-                    }
-                }
-                // If no specific code found but it's a 401/403, still flag as auth
-                if (!result.authError && (httpCode == 401 || httpCode == 403)) {
+        if (resp.status_code == 400 || resp.status_code == 401 || resp.status_code == 403) {
+            auto codes = extractXmlTags(body, "Code");
+            for (const auto& code : codes) {
+                if (code == "ExpiredToken" || code == "AccessDenied" ||
+                    code == "InvalidAccessKeyId" || code == "SignatureDoesNotMatch" ||
+                    code == "TokenRefreshRequired" || code == "InvalidToken") {
                     result.authError = true;
-                    result.errorMessage = "HTTP " + std::to_string(httpCode);
+                    auto msgs = extractXmlTags(body, "Message");
+                    if (!msgs.empty()) result.errorMessage = msgs.front();
+                    break;
                 }
             }
-
-            return result;
+            if (!result.authError && (resp.status_code == 401 || resp.status_code == 403)) {
+                result.authError = true;
+                result.errorMessage = "HTTP " + std::to_string(resp.status_code);
+            }
         }
-    }
-
-    if (xml.empty()) {
-        if (auto* log = cacheDebugLog())
-            std::fprintf(log, "[S3] ListObjects returned empty response\n");
         return result;
     }
 
-    // Parse <CommonPrefixes><Prefix>...</Prefix></CommonPrefixes>
-    // The S3 response nests Prefix inside CommonPrefixes, but our simple
-    // extractor just gets all <Prefix> tags directly. Filter for the ones
-    // that start with our prefix.
+    auto xml = std::string(resp.body_string());
+
     for (const auto& p : extractXmlTags(xml, "Prefix")) {
         if (prefix.empty() || p.rfind(prefix, 0) == 0) {
-            // Strip the parent prefix to get just the subdirectory name
             std::string relative = p.substr(prefix.size());
-            // Remove trailing slash
-            while (!relative.empty() && relative.back() == '/') {
+            while (!relative.empty() && relative.back() == '/')
                 relative.pop_back();
-            }
-            if (!relative.empty()) {
+            if (!relative.empty())
                 result.prefixes.push_back(relative);
-            }
         }
     }
 
-    // Parse <Contents><Key>...</Key></Contents>
     for (const auto& k : extractXmlTags(xml, "Key")) {
         if (prefix.empty() || k.rfind(prefix, 0) == 0) {
             std::string relative = k.substr(prefix.size());
-            if (!relative.empty()) {
+            if (!relative.empty())
                 result.objects.push_back(relative);
-            }
         }
     }
 
     if (auto* log = cacheDebugLog())
         std::fprintf(log, "[S3] Found %zu prefixes, %zu objects\n",
                      result.prefixes.size(), result.objects.size());
-#else
-    (void)httpsBaseUrl;
-    (void)auth;
-#endif
 
     return result;
 }
 
-// ---- HTTP file download -----------------------------------------------------
-
-#ifdef VC_USE_CURL
-static size_t fileWriteCallback(char* ptr, size_t size, size_t nmemb, void* userdata)
-{
-    auto* fp = static_cast<std::FILE*>(userdata);
-    return std::fwrite(ptr, size, nmemb, fp);
-}
-#endif
+// ---------------------------------------------------------------------------
+// httpDownloadFile — download URL to local file atomically
+// ---------------------------------------------------------------------------
 
 bool httpDownloadFile(const std::string& url, const std::filesystem::path& dest, const HttpAuth& auth)
 {
-#ifdef VC_USE_CURL
     namespace fs = std::filesystem;
 
-    // Write to temp file, then atomic rename
+    auto client = makeClient(auth, 120);
+    auto resp = client.get(url);
+
+    if (!resp.ok())
+        return false;
+
     auto tempPath = dest;
     tempPath += ".tmp";
     fs::create_directories(dest.parent_path());
 
     std::FILE* fp = std::fopen(tempPath.c_str(), "wb");
     if (!fp) return false;
-
-    // Thread-local CURL handle: reuses TCP+TLS connections across requests
-    thread_local CURL* curl = [] {
-        CURL* c = curl_easy_init();
-        if (c) {
-            curl_easy_setopt(c, CURLOPT_NOSIGNAL, 1L);
-            curl_easy_setopt(c, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
-        }
-        return c;
-    }();
-    if (!curl) {
-        std::fclose(fp);
-        return false;
-    }
-
-    // Reset clears all options but keeps the connection alive
-    curl_easy_reset(curl);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
-
-    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, fileWriteCallback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-#if CURL_AT_LEAST_VERSION(7, 85, 0)
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS_STR, "http,https");
-#else
-    curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTP | CURLPROTO_HTTPS);
-#endif
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, 120L);
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-    curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
-
-    auto authGuard = applyCurlAuth(curl, auth);
-
-    CURLcode res = curl_easy_perform(curl);
+    std::fwrite(resp.body.data(), 1, resp.body.size(), fp);
     std::fclose(fp);
 
-    if (res != CURLE_OK) {
-        std::error_code ec;
-        fs::remove(tempPath, ec);
-        return false;
-    }
-
-    // Atomic rename
     std::error_code ec;
     fs::rename(tempPath, dest, ec);
     return !ec;
-#else
-    (void)url;
-    (void)dest;
-    (void)auth;
-    return false;
-#endif
 }
 
-// ---- metadata fetcher -------------------------------------------------------
+// ---------------------------------------------------------------------------
+// metadata fetcher
+// ---------------------------------------------------------------------------
+
+static constexpr const char* kRemoteSourceFile = ".remote_source.json";
 
 std::string normalizeRemoteUrl(const std::string& url)
 {
@@ -413,9 +239,7 @@ static std::string deriveRemoteVolumeName(const std::string& url)
 {
     std::string u = normalizeRemoteUrl(url);
     auto pos = u.rfind('/');
-    if (pos != std::string::npos) {
-        return u.substr(pos + 1);
-    }
+    if (pos != std::string::npos) return u.substr(pos + 1);
     return u;
 }
 
@@ -449,16 +273,42 @@ static std::optional<std::string> readRemoteSourceMarker(
     const std::filesystem::path& stagingDir)
 {
     auto markerJson = readFile(stagingDir / kRemoteSourceFile);
-    if (markerJson.empty()) {
-        return std::nullopt;
-    }
+    if (markerJson.empty()) return std::nullopt;
 
     try {
-        auto marker = nlohmann::json::parse(markerJson);
-        if (!marker.contains("url") || !marker["url"].is_string()) {
-            return std::nullopt;
-        }
-        return normalizeRemoteUrl(marker["url"].get<std::string>());
+        auto marker = utils::Json::parse(markerJson);
+        if (!marker.contains("url") || !marker["url"].is_string()) return std::nullopt;
+        return normalizeRemoteUrl(marker["url"].get_string());
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+// Read any persisted source shard config from the marker. Only returns a
+// config when this cache was created for a v3-sharded source — v2 sources
+// write enabled=false (or omit the field) so we never mistake them.
+static std::optional<ShardConfig> readRemoteShardConfig(
+    const std::filesystem::path& stagingDir)
+{
+    auto markerJson = readFile(stagingDir / kRemoteSourceFile);
+    if (markerJson.empty()) return std::nullopt;
+    try {
+        auto marker = utils::Json::parse(markerJson);
+        auto* sc = json_find(marker, "shard_config");
+        if (!sc || !sc->is_object()) return std::nullopt;
+        ShardConfig cfg;
+        auto* en = json_find(*sc, "enabled");
+        if (en && en->is_boolean()) cfg.enabled = en->get_bool();
+        if (!cfg.enabled) return cfg;
+        auto* shape = json_find(*sc, "shape");
+        if (!shape || !shape->is_array()) return std::nullopt;
+        if (shape->size() != 3) return std::nullopt;
+        cfg.shardShape = {
+            int((*shape)[0].get_int()),
+            int((*shape)[1].get_int()),
+            int((*shape)[2].get_int()),
+        };
+        return cfg;
     } catch (...) {
         return std::nullopt;
     }
@@ -466,15 +316,26 @@ static std::optional<std::string> readRemoteSourceMarker(
 
 static void writeRemoteSourceMarker(
     const std::filesystem::path& stagingDir,
-    const std::string& baseUrl)
+    const std::string& baseUrl,
+    const ShardConfig* shardConfig = nullptr)
 {
-    nlohmann::json marker;
+    utils::Json marker;
     marker["url"] = baseUrl;
+    if (shardConfig) {
+        utils::Json sc;
+        sc["enabled"] = shardConfig->enabled;
+        if (shardConfig->enabled) {
+            utils::JsonArray shape;
+            shape.push_back(utils::Json(shardConfig->shardShape[0]));
+            shape.push_back(utils::Json(shardConfig->shardShape[1]));
+            shape.push_back(utils::Json(shardConfig->shardShape[2]));
+            sc["shape"] = utils::Json(std::move(shape));
+        }
+        marker["shard_config"] = std::move(sc);
+    }
     writeFile(stagingDir / kRemoteSourceFile, marker.dump(2));
 }
 
-// Check if staging dir already has valid cached metadata (meta.json + at least 0/.zarray).
-// If so, return the info without hitting the network.
 static std::optional<RemoteZarrInfo> tryLoadCachedMetadata(
     const std::string& baseUrl,
     const std::filesystem::path& stagingDir)
@@ -493,32 +354,58 @@ static std::optional<RemoteZarrInfo> tryLoadCachedMetadata(
 
     auto metaPath = stagingDir / "meta.json";
     auto level0Zarray = stagingDir / "0" / ".zarray";
-    if (!fs::exists(metaPath) || !fs::exists(level0Zarray)) {
+    if (!fs::exists(metaPath) || !fs::exists(level0Zarray))
         return std::nullopt;
-    }
 
-    // Count cached levels
     int numLevels = 0;
     for (int lvl = 0; lvl < 20; lvl++) {
-        if (fs::exists(stagingDir / std::to_string(lvl) / ".zarray")) {
+        if (fs::exists(stagingDir / std::to_string(lvl) / ".zarray"))
             numLevels++;
-        } else {
+        else
             break;
-        }
     }
 
     if (numLevels == 0) return std::nullopt;
 
-    // Parse delimiter from level 0
     std::string delimiter = ".";
     auto zarray0 = readFile(level0Zarray);
     if (!zarray0.empty()) {
         try {
-            auto j = nlohmann::json::parse(zarray0);
-            if (j.contains("dimension_separator")) {
-                delimiter = j["dimension_separator"].get<std::string>();
-            }
+            auto j = utils::Json::parse(zarray0);
+            if (j.contains("dimension_separator"))
+                delimiter = j["dimension_separator"].get_string();
         } catch (...) {}
+    }
+
+    // Recover the source shard config from the marker file we wrote during
+    // the live metadata fetch. Reading the local `0/zarr.json` is WRONG
+    // here — that's our own canonical output format, not the source's
+    // metadata; doing so flipped v2-chunked sources into sharded mode and
+    // made every subsequent chunk fetch 404 against the real S3 layout.
+    //
+    // If the marker is missing the shard_config field entirely (pre-fix
+    // staging dir), we can't trust the cached metadata: a v3-sharded
+    // source would silently come back up in non-sharded mode and every
+    // chunk fetch would 404. Force a live re-fetch in that case.
+    auto recovered = readRemoteShardConfig(stagingDir);
+    if (!recovered) {
+        if (auto* log = cacheDebugLog())
+            std::fprintf(log,
+                "[REMOTE] Marker at %s lacks shard_config (pre-upgrade cache); re-fetching\n",
+                stagingDir.c_str());
+        return std::nullopt;
+    }
+    ShardConfig shardConfig = *recovered;
+    if (auto* log = cacheDebugLog()) {
+        if (shardConfig.enabled)
+            std::fprintf(log,
+                "[REMOTE] Recovered shard config from marker: shape=[%d, %d, %d]\n",
+                shardConfig.shardShape[0],
+                shardConfig.shardShape[1],
+                shardConfig.shardShape[2]);
+        else
+            std::fprintf(log,
+                "[REMOTE] Marker reports source is not sharded\n");
     }
 
     if (auto* log = cacheDebugLog())
@@ -529,7 +416,8 @@ static std::optional<RemoteZarrInfo> tryLoadCachedMetadata(
         .url = baseUrl,
         .stagingDir = stagingDir,
         .delimiter = delimiter,
-        .numLevels = numLevels
+        .numLevels = numLevels,
+        .shardConfig = shardConfig
     };
 }
 
@@ -539,23 +427,21 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
     const HttpAuth& auth)
 {
     const std::string baseUrl = normalizeRemoteUrl(url);
-
     const std::string volumeName = deriveRemoteVolumeName(baseUrl);
     const std::string volumeId = deriveRemoteVolumeId(baseUrl);
     auto stagingDir = stagingRoot / volumeId;
 
-    // Clean up stale sibling .chunks dir from older code path
     {
         auto staleChunks = stagingRoot / (volumeId + ".chunks");
         std::error_code ec;
-        if (std::filesystem::exists(staleChunks, ec)) {
+        if (std::filesystem::exists(staleChunks, ec))
             std::filesystem::remove_all(staleChunks, ec);
-        }
     }
 
-    // Try cached metadata first — avoids network round-trips on subsequent opens
     if (auto cached = tryLoadCachedMetadata(baseUrl, stagingDir)) {
-        writeRemoteSourceMarker(stagingDir, baseUrl);
+        // Preserve the existing shard config entry so we don't downgrade
+        // the marker back to "unknown" on the rewrite.
+        writeRemoteSourceMarker(stagingDir, baseUrl, &cached->shardConfig);
         return *cached;
     }
 
@@ -565,97 +451,152 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
         std::fprintf(log, "[REMOTE] Fetching metadata for %s -> %s\n",
                      baseUrl.c_str(), stagingDir.c_str());
 
-    // Fetch .zgroup
     auto zgroup = httpGetString(baseUrl + "/.zgroup", auth);
-    if (!zgroup.empty()) {
+    if (!zgroup.empty())
         writeFile(stagingDir / ".zgroup", zgroup);
-    } else {
-        // Synthesize minimal .zgroup
+    else
         writeFile(stagingDir / ".zgroup", R"({"zarr_format":2})");
-    }
 
-    // Fetch .zattrs (optional, may 404)
     auto zattrs = httpGetString(baseUrl + "/.zattrs", auth);
-    if (!zattrs.empty()) {
+    if (!zattrs.empty())
         writeFile(stagingDir / ".zattrs", zattrs);
-    }
 
-    // Probe levels concurrently in batches of 8.
-    // Most volumes have fewer than 8 pyramid levels, so the first batch
-    // typically discovers all of them in a single round-trip.
     std::string delimiter = ".";
     int numLevels = 0;
-    nlohmann::json level0Meta;
+    utils::Json level0Meta;
+    ShardConfig shardConfig;
+    bool isV3 = false;
 
     constexpr int kBatchSize = 8;
     constexpr int kMaxLevels = 20;
 
-    for (int batchStart = 0; batchStart < kMaxLevels; batchStart += kBatchSize) {
-        int batchEnd = std::min(batchStart + kBatchSize, kMaxLevels);
+    auto probeLevels = [&](const char* urlSuffix, auto&& onLevel) -> int {
+        int found = 0;
+        for (int batchStart = 0; batchStart < kMaxLevels; batchStart += kBatchSize) {
+            int batchEnd = std::min(batchStart + kBatchSize, kMaxLevels);
 
-        // Launch async probes for this batch
-        std::vector<std::future<std::string>> futures;
-        futures.reserve(batchEnd - batchStart);
-        for (int lvl = batchStart; lvl < batchEnd; lvl++) {
-            std::string lvlUrl = baseUrl + "/" + std::to_string(lvl) + "/.zarray";
-            futures.push_back(std::async(std::launch::async,
-                [lvlUrl, &auth]() { return httpGetString(lvlUrl, auth); }));
-        }
-
-        // Collect results in order
-        bool batchHadMiss = false;
-        for (int i = 0; i < static_cast<int>(futures.size()); i++) {
-            int lvl = batchStart + i;
-            auto zarray = futures[i].get();
-
-            if (zarray.empty()) {
-                if (auto* log = cacheDebugLog())
-                    std::fprintf(log, "[REMOTE] Level %d: no .zarray\n", lvl);
-                batchHadMiss = true;
-                break;  // Stop at first gap — levels must be contiguous
+            std::vector<std::future<std::string>> futures;
+            futures.reserve(batchEnd - batchStart);
+            for (int lvl = batchStart; lvl < batchEnd; lvl++) {
+                std::string lvlUrl = baseUrl + "/" + std::to_string(lvl) + "/" + urlSuffix;
+                futures.push_back(std::async(std::launch::async,
+                    [lvlUrl, &auth]() { return httpGetString(lvlUrl, auth); }));
             }
 
+            bool batchHadMiss = false;
+            for (int i = 0; i < static_cast<int>(futures.size()); i++) {
+                int lvl = batchStart + i;
+                auto response = futures[i].get();
+
+                if (response.empty()) {
+                    if (auto* log = cacheDebugLog())
+                        std::fprintf(log, "[REMOTE] Level %d: no %s\n", lvl, urlSuffix);
+                    batchHadMiss = true;
+                    break;
+                }
+
+                if (!onLevel(lvl, std::move(response))) {
+                    batchHadMiss = true;
+                    break;
+                }
+                found++;
+            }
+
+            if (batchHadMiss) break;
+        }
+        return found;
+    };
+
+    numLevels = probeLevels(".zarray", [&](int lvl, std::string zarray) -> bool {
+        auto levelDir = stagingDir / std::to_string(lvl);
+        writeFile(levelDir / ".zarray", zarray);
+
+        if (auto* log = cacheDebugLog())
+            std::fprintf(log, "[REMOTE] Level %d: fetched .zarray (%zu bytes)\n",
+                         lvl, zarray.size());
+
+        if (lvl == 0) {
+            try {
+                level0Meta = utils::Json::parse(zarray);
+                if (level0Meta.contains("dimension_separator"))
+                    delimiter = level0Meta["dimension_separator"].get_string();
+            } catch (const std::exception& e) {
+                if (auto* log = cacheDebugLog())
+                    std::fprintf(log, "[REMOTE] Warning: failed to parse level 0 .zarray: %s\n", e.what());
+            }
+        }
+        return true;
+    });
+
+    if (numLevels == 0) {
+        if (auto* log = cacheDebugLog())
+            std::fprintf(log, "[REMOTE] No zarr v2 levels found, trying zarr v3...\n");
+
+        numLevels = probeLevels("zarr.json", [&](int lvl, std::string zarrJson) -> bool {
+            utils::ZarrMetadata meta;
+            try {
+                meta = utils::detail::parse_zarr_json(zarrJson);
+            } catch (const std::exception& e) {
+                if (auto* log = cacheDebugLog())
+                    std::fprintf(log, "[REMOTE] Level %d: parse_zarr_json failed: %s\n", lvl, e.what());
+                return false;
+            }
+
+            if (meta.version != utils::ZarrVersion::v3 || meta.node_type != "array") {
+                if (auto* log = cacheDebugLog())
+                    std::fprintf(log, "[REMOTE] Level %d: zarr.json is not zarr v3 array\n", lvl);
+                return false;
+            }
+
+            // v2 emission for the VcDataset reader. For sharded v3 the v2
+            // "chunks" is the finest granularity (inner chunk shape).
+            utils::ZarrMetadata v2meta = meta;
+            v2meta.version = utils::ZarrVersion::v2;
+            if (meta.shard_config && meta.shard_config->sub_chunks.size() >= 3) {
+                v2meta.chunks = meta.shard_config->sub_chunks;
+            }
+            std::string synthesized = utils::detail::serialize_zarray(v2meta);
             auto levelDir = stagingDir / std::to_string(lvl);
-            writeFile(levelDir / ".zarray", zarray);
-            numLevels++;
+            writeFile(levelDir / ".zarray", synthesized);
+            isV3 = true;
 
             if (auto* log = cacheDebugLog())
-                std::fprintf(log, "[REMOTE] Level %d: fetched .zarray (%zu bytes)\n",
-                             lvl, zarray.size());
+                std::fprintf(log, "[REMOTE] Level %d: fetched zarr.json (v3), synthesized .zarray (%zu bytes)\n",
+                             lvl, synthesized.size());
 
-            // Parse level 0 for shape and delimiter
             if (lvl == 0) {
-                try {
-                    level0Meta = nlohmann::json::parse(zarray);
-                    if (level0Meta.contains("dimension_separator")) {
-                        delimiter = level0Meta["dimension_separator"].get<std::string>();
-                    }
-                } catch (const std::exception& e) {
+                level0Meta = utils::Json::parse(synthesized);
+                delimiter = meta.dimension_separator.empty() ? "/" : meta.dimension_separator;
+                if (meta.shard_config && meta.chunks.size() >= 3) {
+                    shardConfig.enabled = true;
+                    shardConfig.shardShape = {
+                        int(meta.chunks[0]), int(meta.chunks[1]), int(meta.chunks[2])
+                    };
                     if (auto* log = cacheDebugLog())
-                        std::fprintf(log, "[REMOTE] Warning: failed to parse level 0 .zarray: %s\n", e.what());
+                        std::fprintf(log, "[REMOTE] Shard config: shape=[%d, %d, %d]\n",
+                                     shardConfig.shardShape[0],
+                                     shardConfig.shardShape[1],
+                                     shardConfig.shardShape[2]);
                 }
             }
-        }
-
-        // If any level in this batch was missing, no need to probe further
-        if (batchHadMiss) break;
+            return true;
+        });
     }
 
     if (numLevels == 0) {
-        throw std::runtime_error("No zarr levels found at " + baseUrl);
+        throw std::runtime_error("No zarr levels found at " + baseUrl +
+                                 " (tried both v2 .zarray and v3 zarr.json)");
     }
 
-    // Synthesize meta.json from level 0 shape
     int width = 0, height = 0, slices = 0;
     if (level0Meta.contains("shape") && level0Meta["shape"].is_array() &&
         level0Meta["shape"].size() >= 3) {
-        // zarr shape is [z, y, x]
-        slices = level0Meta["shape"][0].get<int>();
-        height = level0Meta["shape"][1].get<int>();
-        width  = level0Meta["shape"][2].get<int>();
+        slices = level0Meta["shape"][0].get_int();
+        height = level0Meta["shape"][1].get_int();
+        width  = level0Meta["shape"][2].get_int();
     }
 
-    nlohmann::json meta;
+    utils::Json meta;
     meta["uuid"] = volumeId;
     meta["name"] = volumeName;
     meta["type"] = "vol";
@@ -668,17 +609,19 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
     meta["max"] = 255;
 
     writeFile(stagingDir / "meta.json", meta.dump(2));
-    writeRemoteSourceMarker(stagingDir, baseUrl);
+    writeRemoteSourceMarker(stagingDir, baseUrl, &shardConfig);
 
     if (auto* log = cacheDebugLog())
-        std::fprintf(log, "[REMOTE] Metadata complete: %d levels, shape=[%d, %d, %d] delimiter='%s'\n",
-                     numLevels, slices, height, width, delimiter.c_str());
+        std::fprintf(log, "[REMOTE] Metadata complete: %d levels, shape=[%d, %d, %d] delimiter='%s'%s\n",
+                     numLevels, slices, height, width, delimiter.c_str(),
+                     isV3 ? " (zarr v3)" : "");
 
     return RemoteZarrInfo{
         .url = baseUrl,
         .stagingDir = stagingDir,
         .delimiter = delimiter,
-        .numLevels = numLevels
+        .numLevels = numLevels,
+        .shardConfig = shardConfig
     };
 }
 

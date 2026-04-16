@@ -2,6 +2,25 @@
 #include "spiral_common.hpp"
 #include "spiral_ceres.hpp"
 
+#include "utils/Json.hpp"
+
+void to_json(utils::Json& j, const SpiralPoint& p) {
+    j = utils::Json::object();
+    j["pos"] = utils::Json::array();
+    j["pos"].push_back(p.pos[0]);
+    j["pos"].push_back(p.pos[1]);
+    j["pos"].push_back(p.pos[2]);
+    j["winding"] = p.winding;
+}
+
+void from_json(const utils::Json& j, SpiralPoint& p) {
+    std::vector<double> pos_vec = j.at("pos").get_double_array();
+    if (pos_vec.size() == 3) {
+        p.pos = cv::Vec3d(pos_vec[0], pos_vec[1], pos_vec[2]);
+    }
+    p.winding = j.at("winding").get_double();
+}
+
 void visualize_spiral(
     const std::vector<SpiralPoint>& all_points,
     const cv::Size& slice_size,

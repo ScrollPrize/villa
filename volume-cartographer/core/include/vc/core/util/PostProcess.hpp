@@ -14,6 +14,8 @@ struct PostProcessParams {
     bool removeSmallComponents = false;
     int minComponentSize = 50;
     uint8_t isoCutoff = 0;
+
+    constexpr PostProcessParams() noexcept = default;
 };
 
 // Apply grayscale post-processing pipeline in canonical order:

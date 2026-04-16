@@ -1,4 +1,5 @@
 #include "vc/core/types/VolumePkg.hpp"
+#include <iostream>
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/SampleParams.hpp"
 #include "vc/core/util/QuadSurface.hpp"

@@ -3,6 +3,8 @@
 #include "ViewerOverlayControllerBase.hpp"
 
 #include <QColor>
+#include <QFutureWatcher>
+#include <QImage>
 #include <chrono>
 #include <deque>
 #include <map>
@@ -158,6 +160,10 @@ public:
     void setApprovalMaskOpacity(int opacity);
     [[nodiscard]] int approvalMaskOpacity() const { return _approvalMaskOpacity; }
 
+    // Snapshot approval mask images for thread-safe access (QImage is implicitly shared / COW)
+    [[nodiscard]] QImage pendingApprovalMaskImage() const { return _pendingApprovalMaskImage; }
+    [[nodiscard]] QImage savedApprovalMaskImage() const { return _savedApprovalMaskImage; }
+
 protected:
     bool isOverlayEnabledFor(VolumeViewerBase* viewer) const override;
     void collectPrimitives(VolumeViewerBase* viewer,
@@ -178,7 +184,7 @@ private:
                                   VolumeViewerBase* viewer,
                                   ViewerOverlayControllerBase::OverlayBuilder& builder) const;
     void buildSurfaceOverlapOverlay(VolumeViewerBase* viewer,
-                                    ViewerOverlayControllerBase::OverlayBuilder& builder) const;
+                                    ViewerOverlayControllerBase::OverlayBuilder& builder);
 
     ViewerOverlayControllerBase::PathPrimitive buildMaskPrimitive(const State& state) const;
     bool shouldShowMask(const State& state) const;
@@ -244,6 +250,16 @@ private:
         uint64_t surfaceVersion{0};                         // Surface content version
     };
     mutable std::map<VolumeViewerBase*, OverlapCache> _overlapCaches;
+
+    // Async overlap computation
+    struct PendingOverlapResult {
+        VolumeViewerBase* viewer{nullptr};
+        OverlapCache cache;
+    };
+    QFutureWatcher<QImage>* _overlapWatcher{nullptr};
+    PendingOverlapResult _pendingOverlap;
+    bool _overlapComputeRunning{false};
+    void handleOverlapComputeFinished();
 
     // Deferred refresh timer - fires after throttle window to apply pending state
     QTimer* _deferredRefreshTimer{nullptr};

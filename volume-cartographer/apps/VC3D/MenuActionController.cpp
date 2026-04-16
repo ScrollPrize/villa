@@ -1,14 +1,16 @@
 #include "MenuActionController.hpp"
 
+#include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "VCSettings.hpp"
 #include "CWindow.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
 #include "segmentation/SegmentationModule.hpp"
-#include "tiled/CTiledVolumeViewer.hpp"
+#include "adaptive/CAdaptiveVolumeViewer.hpp"
 #include "CVolumeViewerView.hpp"
 #include "CommandLineToolRunner.hpp"
 #include "SettingsDialog.hpp"
+#include "S3BrowserDialog.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "ui_VCMain.h"
 #include "Keybinds.hpp"
@@ -58,7 +60,7 @@
 #include <QUrl>
 #include <QVBoxLayout>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -143,6 +145,9 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _attachRemoteZarrAct = new QAction(QObject::tr("Attach Remote &Zarr..."), this);
     connect(_attachRemoteZarrAct, &QAction::triggered, this, &MenuActionController::attachRemoteZarr);
 
+    _browseS3Act = new QAction(QObject::tr("&Browse S3..."), this);
+    connect(_browseS3Act, &QAction::triggered, this, &MenuActionController::browseS3);
+
     _settingsAct = new QAction(QObject::tr("Settings"), this);
     connect(_settingsAct, &QAction::triggered, this, &MenuActionController::showSettingsDialog);
 
@@ -197,6 +202,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addAction(_openLocalZarrAct);
     _fileMenu->addAction(_openRemoteAct);
     _fileMenu->addAction(_attachRemoteZarrAct);
+    _fileMenu->addAction(_browseS3Act);
 
     _recentMenu = new QMenu(QObject::tr("Open &recent volpkg"), _fileMenu);
     _recentMenu->setEnabled(false);
@@ -542,6 +548,38 @@ void MenuActionController::openRemoteVolume()
     openRemoteUrl(url.trimmed(), false);
 }
 
+void MenuActionController::browseS3()
+{
+    if (!_window) return;
+
+    // Get the most recent S3 URL as starting point
+    QStringList recentUrls = loadRecentRemoteUrls();
+    QString startUrl;
+    for (const auto& u : recentUrls) {
+        if (u.startsWith("s3://")) {
+            startUrl = u;
+            break;
+        }
+    }
+
+    // Resolve auth before opening the dialog
+    // Use a dummy s3:// URL to trigger AWS credential resolution
+    QString probeUrl = startUrl.isEmpty() ? QStringLiteral("s3://probe") : startUrl;
+    vc::cache::HttpAuth auth;
+    QString authError;
+    if (!tryResolveRemoteAuth(probeUrl, &auth, true, &authError)) {
+        return;
+    }
+
+    S3BrowserDialog dialog(auth, startUrl, _window);
+    if (dialog.exec() != QDialog::Accepted) return;
+
+    QString selected = dialog.selectedUrl();
+    if (selected.isEmpty()) return;
+
+    openRemoteUrl(selected, false);
+}
+
 void MenuActionController::attachRemoteZarr()
 {
     if (!_window) return;
@@ -588,31 +626,22 @@ bool MenuActionController::tryResolveRemoteAuth(const QString& url,
     }
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    authOut->awsSigv4 = true;
-    authOut->region = resolved.awsRegion;
+    *authOut = vc::cache::loadAwsCredentials();
+    if (authOut->region.empty()) authOut->region = resolved.awsRegion;
 
-    auto getEnv = [](const char* name) -> std::string {
-        const char* v = std::getenv(name);
-        return v ? v : "";
-    };
-
-    authOut->accessKey = getEnv("AWS_ACCESS_KEY_ID");
-    authOut->secretKey = getEnv("AWS_SECRET_ACCESS_KEY");
-    authOut->sessionToken = getEnv("AWS_SESSION_TOKEN");
-
-    if (authOut->accessKey.empty() || authOut->secretKey.empty()) {
+    if (authOut->access_key.empty() || authOut->secret_key.empty()) {
         const auto savedAccess = settings.value(vc3d::settings::aws::ACCESS_KEY).toString();
         const auto savedSecret = settings.value(vc3d::settings::aws::SECRET_KEY).toString();
         const auto savedToken = settings.value(vc3d::settings::aws::SESSION_TOKEN).toString();
 
         if (!savedAccess.isEmpty() && !savedSecret.isEmpty()) {
-            authOut->accessKey = savedAccess.toStdString();
-            authOut->secretKey = savedSecret.toStdString();
-            authOut->sessionToken = savedToken.toStdString();
+            authOut->access_key = savedAccess.toStdString();
+            authOut->secret_key = savedSecret.toStdString();
+            authOut->session_token = savedToken.toStdString();
         }
     }
 
-    if (!authOut->accessKey.empty() && !authOut->secretKey.empty()) {
+    if (!authOut->access_key.empty() && !authOut->secret_key.empty()) {
         return true;
     }
 
@@ -660,9 +689,9 @@ bool MenuActionController::tryResolveRemoteAuth(const QString& url,
         return false;
     }
 
-    authOut->accessKey = accessKey.trimmed().toStdString();
-    authOut->secretKey = secretKey.trimmed().toStdString();
-    authOut->sessionToken = sessionToken.trimmed().toStdString();
+    authOut->access_key = accessKey.trimmed().toStdString();
+    authOut->secret_key = secretKey.trimmed().toStdString();
+    authOut->session_token = sessionToken.trimmed().toStdString();
 
     settings.setValue(vc3d::settings::aws::ACCESS_KEY, accessKey.trimmed());
     settings.setValue(vc3d::settings::aws::SECRET_KEY, secretKey.trimmed());
@@ -673,7 +702,7 @@ bool MenuActionController::tryResolveRemoteAuth(const QString& url,
 QString MenuActionController::remoteCacheDirectory() const
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    QString defaultCache = QDir::homePath() + "/.VC3D/remote_cache";
+    QString defaultCache = vc3d::defaultCacheBase() + "/remote_cache";
     QString cacheDir = settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR, defaultCache).toString();
     QDir().mkpath(cacheDir);
     return cacheDir;
@@ -694,37 +723,34 @@ void MenuActionController::persistAttachedRemoteVolume(const QString& url, const
         return;
     }
 
-    nlohmann::json root = {
-        {"version", 1},
-        {"volumes", nlohmann::json::array()}
+    utils::Json root = {
+        {"version", utils::Json(1)},
+        {"volumes", utils::Json::array()}
     };
 
     try {
         if (QFileInfo::exists(registryPath)) {
-            std::ifstream input(registryPath.toStdString());
-            if (input.good()) {
-                input >> root;
-            }
+            root = utils::Json::parse_file(registryPath.toStdString());
         }
     } catch (const std::exception& e) {
         Logger()->warn("Failed reading remote volume registry '{}': {}", registryPath.toStdString(), e.what());
         root = {
-            {"version", 1},
-            {"volumes", nlohmann::json::array()}
+            {"version", utils::Json(1)},
+            {"volumes", utils::Json::array()}
         };
     }
 
     if (!root.is_object()) {
-        root = nlohmann::json::object();
+        root = utils::Json::object();
     }
     if (!root.contains("volumes") || !root["volumes"].is_array()) {
-        root["volumes"] = nlohmann::json::array();
+        root["volumes"] = utils::Json::array();
     }
     root["version"] = 1;
 
     const std::string urlStd = url.trimmed().toStdString();
     const std::string idStd = volume->id();
-    nlohmann::json updated = nlohmann::json::array();
+    utils::Json updated = utils::Json::array();
     bool replaced = false;
 
     for (const auto& entry : root["volumes"]) {
@@ -768,13 +794,9 @@ void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
         return;
     }
 
-    nlohmann::json root;
+    utils::Json root;
     try {
-        std::ifstream input(registryPath.toStdString());
-        if (!input.good()) {
-            return;
-        }
-        input >> root;
+        root = utils::Json::parse_file(registryPath.toStdString());
     } catch (const std::exception& e) {
         Logger()->warn("Failed to parse remote volume registry '{}': {}", registryPath.toStdString(), e.what());
         if (_window->statusBar()) {
@@ -783,8 +805,7 @@ void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
         return;
     }
 
-    const auto volumesIt = root.find("volumes");
-    if (volumesIt == root.end() || !volumesIt->is_array() || volumesIt->empty()) {
+    if (!root.contains("volumes") || !root["volumes"].is_array() || root["volumes"].empty()) {
         return;
     }
 
@@ -793,7 +814,7 @@ void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
     int attachedCount = 0;
     int skippedCount = 0;
 
-    for (const auto& entry : *volumesIt) {
+    for (const auto& entry : root["volumes"]) {
         if (!entry.is_object()) {
             continue;
         }
@@ -1068,14 +1089,10 @@ void MenuActionController::openRemoteZarr(
     auto* watcher = new QFutureWatcher<std::shared_ptr<Volume>>(this);
 
     connect(watcher, &QFutureWatcher<std::shared_ptr<Volume>>::finished, this,
-        [this, watcher, httpsUrl, cachePath]() {
+        [this, watcher, httpsUrl, cachePath, auth]() {
             watcher->deleteLater();
             _openRemoteAct->setEnabled(true);
 
-            // Check for exception before calling result() — Qt wraps
-            // task exceptions in QUnhandledException which can bypass
-            // catch(std::exception&) in signal/slot dispatch and call
-            // std::terminate instead.
             auto future = watcher->future();
             QString errorMsg;
 
@@ -1098,6 +1115,9 @@ void MenuActionController::openRemoteZarr(
                                 .arg(QString::fromStdString(vol->id())),
                             5000);
                     }
+
+                    // Offer to load remote segments
+                    promptAndLoadRemoteSegments(auth, cachePath);
                     return;
                 } catch (const std::exception& e) {
                     errorMsg = extractExceptionMessage(e);
@@ -1174,12 +1194,139 @@ void MenuActionController::openRemoteZarr(
     watcher->setFuture(future);
 }
 
-// Scroll discovery result that can be passed between threads
+// Result struct for background volume+segment loading
 struct ScrollOpenResult {
     std::shared_ptr<Volume> volume;
     std::vector<std::pair<std::string, std::shared_ptr<Surface>>> surfaces;
     std::string errorMsg;
 };
+
+void MenuActionController::promptAndLoadRemoteSegments(
+    const vc::cache::HttpAuth& auth,
+    const std::string& cachePath)
+{
+    bool ok = false;
+    QString segUrl = QInputDialog::getText(
+        _window,
+        QObject::tr("Remote Segments"),
+        QObject::tr("Enter S3/HTTPS URL of directory containing segments\n"
+                     "(leave empty to skip):"),
+        QLineEdit::Normal, QString(), &ok);
+
+    if (!ok || segUrl.trimmed().isEmpty())
+        return;
+
+    auto segResolved = vc::resolveRemoteUrl(segUrl.trimmed().toStdString());
+    vc::cache::HttpAuth segAuth = auth;
+    if (segResolved.useAwsSigv4 && segAuth.region.empty())
+        segAuth.region = segResolved.awsRegion;
+
+    std::string segBaseUrl = segResolved.httpsUrl;
+    while (!segBaseUrl.empty() && segBaseUrl.back() == '/')
+        segBaseUrl.pop_back();
+
+    if (_window->statusBar())
+        _window->statusBar()->showMessage(QObject::tr("Discovering remote segments..."));
+
+    // Probe the URL for segment subdirectories
+    auto* s3Watcher = new QFutureWatcher<vc::cache::S3ListResult>(this);
+    connect(s3Watcher, &QFutureWatcher<vc::cache::S3ListResult>::finished, this,
+        [this, s3Watcher, segBaseUrl, segAuth, cachePath]() {
+            s3Watcher->deleteLater();
+
+            vc::cache::S3ListResult extList;
+            try {
+                extList = s3Watcher->result();
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[RemoteSegments] s3ListObjects failed: %s\n", e.what());
+                if (_window->statusBar())
+                    _window->statusBar()->showMessage(
+                        QObject::tr("Failed to list segments: %1").arg(e.what()), 5000);
+                return;
+            }
+
+            if (extList.prefixes.empty()) {
+                if (_window->statusBar())
+                    _window->statusBar()->showMessage(
+                        QObject::tr("No segment directories found at that URL"), 5000);
+                return;
+            }
+
+            std::fprintf(stderr, "[RemoteSegments] Found %zu segments\n", extList.prefixes.size());
+
+            // Store remote scroll state for on-demand downloads
+            _window->_remoteScroll.baseUrl = segBaseUrl;
+            _window->_remoteScroll.segmentsBaseUrl = segBaseUrl;
+            _window->_remoteScroll.cachePath = cachePath;
+            _window->_remoteScroll.auth = segAuth;
+            _window->_remoteScroll.segSource = vc::RemoteSegmentSource::Direct;
+            _window->_remoteScroll.active = true;
+
+            // Download metadata + load cached surfaces on background thread
+            auto segIds = extList.prefixes;
+            auto* loadWatcher = new QFutureWatcher<ScrollOpenResult>(this);
+            connect(loadWatcher, &QFutureWatcher<ScrollOpenResult>::finished, this,
+                [this, loadWatcher, segIds]() {
+                    loadWatcher->deleteLater();
+
+                    ScrollOpenResult result;
+                    try {
+                        result = loadWatcher->result();
+                    } catch (const std::exception& e) {
+                        if (_window->statusBar())
+                            _window->statusBar()->showMessage(
+                                QObject::tr("Failed to load segments: %1").arg(e.what()), 5000);
+                        return;
+                    }
+
+                    _window->setRemoteStubs(segIds, result.surfaces);
+                    _window->UpdateView();
+
+                    int cached = static_cast<int>(result.surfaces.size());
+                    int total = static_cast<int>(segIds.size());
+                    if (_window->statusBar())
+                        _window->statusBar()->showMessage(
+                            QObject::tr("Loaded %1/%2 segments (rest on-demand)")
+                                .arg(cached).arg(total), 5000);
+                });
+
+            auto loadFuture = QtConcurrent::run(
+                [segBaseUrl, segIds, cachePath, segAuth]() -> ScrollOpenResult {
+                    ScrollOpenResult result;
+                    std::filesystem::path cacheDir = cachePath;
+                    for (const auto& segId : segIds) {
+                        try {
+                            vc::downloadRemoteSegmentMetadataOnly(
+                                segBaseUrl, segId, cacheDir, segAuth,
+                                vc::RemoteSegmentSource::Direct);
+
+                            if (vc::isRemoteSegmentFullyCached(
+                                    cacheDir, segId, vc::RemoteSegmentSource::Direct)) {
+                                // "Direct" uses "paths" subdir
+                                auto localDir = cacheDir / "paths" / segId;
+                                auto seg = Segmentation::New(localDir);
+                                if (seg && seg->canLoadSurface()) {
+                                    auto surf = seg->loadSurface();
+                                    if (surf)
+                                        result.surfaces.emplace_back(segId, surf);
+                                }
+                            }
+                        } catch (const std::exception& e) {
+                            std::fprintf(stderr, "[RemoteSegments] Failed to process segment %s: %s\n",
+                                         segId.c_str(), e.what());
+                        }
+                    }
+                    return result;
+                });
+            loadWatcher->setFuture(loadFuture);
+        });
+
+    auto s3Future = QtConcurrent::run(
+        [segBaseUrl, segAuth]() -> vc::cache::S3ListResult {
+            return vc::cache::s3ListObjects(segBaseUrl + "/", segAuth);
+        });
+    s3Watcher->setFuture(s3Future);
+}
 
 void MenuActionController::openRemoteScroll(
     const std::string& httpsUrl,
@@ -1245,18 +1392,18 @@ void MenuActionController::openRemoteScroll(
                     return;
                 }
 
-                freshAuth.accessKey = accessKey.trimmed().toStdString();
-                freshAuth.secretKey = secretKey.trimmed().toStdString();
-                freshAuth.sessionToken = sessionToken.trimmed().toStdString();
+                freshAuth.access_key = accessKey.trimmed().toStdString();
+                freshAuth.secret_key = secretKey.trimmed().toStdString();
+                freshAuth.session_token = sessionToken.trimmed().toStdString();
 
                 // Save the fresh credentials
                 QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
                 settings.setValue(vc3d::settings::aws::ACCESS_KEY,
-                                  QString::fromStdString(freshAuth.accessKey));
+                                  QString::fromStdString(freshAuth.access_key));
                 settings.setValue(vc3d::settings::aws::SECRET_KEY,
-                                  QString::fromStdString(freshAuth.secretKey));
+                                  QString::fromStdString(freshAuth.secret_key));
                 settings.setValue(vc3d::settings::aws::SESSION_TOKEN,
-                                  QString::fromStdString(freshAuth.sessionToken));
+                                  QString::fromStdString(freshAuth.session_token));
 
                 // Retry discovery with fresh credentials.
                 // Use QTimer::singleShot to break the call stack and limit
@@ -1316,10 +1463,14 @@ void MenuActionController::openRemoteScroll(
             auto continueWithPhase2 = [this, auth, cachePath](
                 vc::RemoteScrollInfo scrollInfo, const std::string& volumeName) {
 
-            // Phase 2: Open volume + download segments on background thread
+            // Phase 2: Open volume + fetch segment metadata on background
+            // thread.  Only downloads meta.json for each segment (fast, tiny
+            // files).  Segments whose TIFFs are already cached get loaded
+            // immediately; the rest appear as stubs that download on demand
+            // when the user selects them.
             if (_window->statusBar()) {
                 _window->statusBar()->showMessage(
-                    QObject::tr("Opening remote scroll (volume: %1, %2 segments)...")
+                    QObject::tr("Opening remote scroll (volume: %1, discovering %2 segments)...")
                         .arg(QString::fromStdString(volumeName))
                         .arg(scrollInfo.segmentIds.size()));
             }
@@ -1355,9 +1506,16 @@ void MenuActionController::openRemoteScroll(
 
                     _window->setVolume(result.volume);
 
-                    if (!result.surfaces.empty()) {
-                        _window->setRemoteSurfaces(result.surfaces);
-                    }
+                    // Store remote scroll state for on-demand downloads
+                    _window->_remoteScroll.baseUrl = scrollInfo.baseUrl;
+                    _window->_remoteScroll.segmentsBaseUrl = scrollInfo.segmentsBaseUrl;
+                    _window->_remoteScroll.cachePath = cachePath;
+                    _window->_remoteScroll.auth = scrollInfo.auth;
+                    _window->_remoteScroll.segSource = scrollInfo.segmentSource;
+                    _window->_remoteScroll.active = true;
+
+                    // Use lazy loading: show all segments, load only cached ones
+                    _window->setRemoteStubs(scrollInfo.segmentIds, result.surfaces);
 
                     // Populate volume combo with all discovered volumes
                     if (_window->volSelect && scrollInfo.volumeNames.size() > 1) {
@@ -1383,11 +1541,14 @@ void MenuActionController::openRemoteScroll(
 
                     _window->UpdateView();
 
+                    int cachedCount = static_cast<int>(result.surfaces.size());
+                    int totalCount = static_cast<int>(scrollInfo.segmentIds.size());
                     if (_window->statusBar()) {
                         _window->statusBar()->showMessage(
-                            QObject::tr("Opened remote scroll: %1 (%2 segments)")
+                            QObject::tr("Opened remote scroll: %1 (%2/%3 segments cached, rest on-demand)")
                                 .arg(QString::fromStdString(result.volume->id()))
-                                .arg(result.surfaces.size()),
+                                .arg(cachedCount)
+                                .arg(totalCount),
                             5000);
                     }
                 });
@@ -1418,28 +1579,36 @@ void MenuActionController::openRemoteScroll(
                         const std::string& dlBase = (segSource == vc::RemoteSegmentSource::Direct)
                             ? segBaseUrl : baseUrl;
 
-                        // Download and load segments
+                        // For Direct sources the on-demand download in CWindow
+                        // uses flat cachePath (no volpkgName nesting). Match that
+                        // layout here so preloaded segments are found on-demand.
+                        const std::filesystem::path segCache =
+                            (segSource == vc::RemoteSegmentSource::Direct)
+                                ? std::filesystem::path(cachePath) : volpkgCache;
+
+                        // Lazy loading: only download meta.json for each segment,
+                        // and fully load only those whose TIFFs are already cached.
                         for (const auto& segId : segIds) {
                             try {
-                                auto localDir = vc::downloadRemoteSegment(
-                                    dlBase, segId, volpkgCache, scrollAuth, segSource);
+                                // Download metadata only (fast)
+                                vc::downloadRemoteSegmentMetadataOnly(
+                                    dlBase, segId, segCache, scrollAuth, segSource);
 
-                                // Check that meta.json exists (download succeeded)
-                                if (!std::filesystem::exists(localDir / "meta.json")) {
-                                    std::fprintf(stderr, "[RemoteScroll] Skipping segment %s: no meta.json\n",
-                                                 segId.c_str());
-                                    continue;
-                                }
-
-                                auto seg = Segmentation::New(localDir);
-                                if (seg && seg->canLoadSurface()) {
-                                    auto surf = seg->loadSurface();
-                                    if (surf) {
-                                        result.surfaces.emplace_back(segId, surf);
+                                // If TIFFs are already cached, load the surface
+                                if (vc::isRemoteSegmentFullyCached(segCache, segId, segSource)) {
+                                    const char* subdir = (segSource == vc::RemoteSegmentSource::Segments)
+                                        ? "segments" : "paths";
+                                    auto localDir = segCache / subdir / segId;
+                                    auto seg = Segmentation::New(localDir);
+                                    if (seg && seg->canLoadSurface()) {
+                                        auto surf = seg->loadSurface();
+                                        if (surf) {
+                                            result.surfaces.emplace_back(segId, surf);
+                                        }
                                     }
                                 }
                             } catch (const std::exception& e) {
-                                std::fprintf(stderr, "[RemoteScroll] Failed to load segment %s: %s\n",
+                                std::fprintf(stderr, "[RemoteScroll] Failed to process segment %s: %s\n",
                                              segId.c_str(), e.what());
                             }
                         }
@@ -1465,8 +1634,7 @@ void MenuActionController::openRemoteScroll(
                 if (segOk && !segUrl.trimmed().isEmpty()) {
                     auto segResolved = vc::resolveRemoteUrl(segUrl.trimmed().toStdString());
                     vc::cache::HttpAuth segAuth = auth;
-                    if (segResolved.useAwsSigv4 && !segAuth.awsSigv4) {
-                        segAuth.awsSigv4 = true;
+                    if (segResolved.useAwsSigv4 && segAuth.region.empty()) {
                         segAuth.region = segResolved.awsRegion;
                     }
 
@@ -1682,21 +1850,19 @@ void MenuActionController::generateReviewReport()
 
     for (const auto& id : _window->_state->vpkg()->getLoadedSurfaceIDs()) {
         auto surf = _window->_state->vpkg()->getSurface(id);
-        if (!surf || !surf->meta) {
+        if (!surf || surf->meta.is_null()) {
             continue;
         }
 
-        nlohmann::json* meta = surf->meta.get();
-        const auto tags = vc::json::tags_or_empty(meta);
-        const auto itReviewed = tags.find("reviewed");
-        if (itReviewed == tags.end() || !itReviewed->is_object()) {
+        const auto tags = vc::json::tags_or_empty(surf->meta);
+        if (!tags.contains("reviewed") || !tags["reviewed"].is_object()) {
             continue;
         }
 
-        const nlohmann::json& reviewed = *itReviewed;
+        const auto& reviewed = tags["reviewed"];
 
         QString reviewDate = "Unknown";
-        const std::string reviewDateRaw = vc::json::string_or(&reviewed, "date", std::string{});
+        const std::string reviewDateRaw = vc::json::string_or(reviewed, "date", std::string{});
         if (!reviewDateRaw.empty()) {
             reviewDate = QString::fromStdString(reviewDateRaw).left(10);
         } else {
@@ -1707,12 +1873,12 @@ void MenuActionController::generateReviewReport()
         }
 
         QString username = "Unknown";
-        const std::string reviewerUser = vc::json::string_or(&reviewed, "user", std::string{});
+        const std::string reviewerUser = vc::json::string_or(reviewed, "user", std::string{});
         if (!reviewerUser.empty()) {
             username = QString::fromStdString(reviewerUser);
         }
 
-        const double area = vc::json::number_or(meta, "area_cm2", 0.0);
+        const double area = vc::json::number_or(surf->meta, "area_cm2", 0.0);
 
         dailyStats[reviewDate][username].totalArea += area;
         dailyStats[reviewDate][username].surfaceCount++;

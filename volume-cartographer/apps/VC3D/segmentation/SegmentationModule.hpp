@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QColor>
+#include <QFuture>
 #include <QObject>
 #include <QElapsedTimer>
 #include <QPointer>
@@ -19,7 +20,7 @@
 
 #include <opencv2/core.hpp>
 
-#include "../tiled/CTiledVolumeViewer.hpp"
+#include "../adaptive/CAdaptiveVolumeViewer.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "growth/SegmentationGrowth.hpp"
 #include "SegmentationPushPullConfig.hpp"
@@ -35,7 +36,10 @@ inline constexpr int kStatusLong = 5000;
 
 
 class CState;
-class CTiledVolumeViewer;
+class CAdaptiveVolumeViewer;
+#ifndef CTiledVolumeViewer
+#define CTiledVolumeViewer CAdaptiveVolumeViewer
+#endif
 class PlaneSurface;
 class Surface;
 class QuadSurface;
@@ -77,6 +81,7 @@ public:
     void setPushPullRadius(float radiusSteps);
     void setPushPullSigma(float sigmaSteps);
     void setPushPullStepMultiplier(float multiplier);
+    void setEditScale(float scale);
     void setSmoothingStrength(float strength);
     void setSmoothingIterations(int iterations);
     void setAlphaPushPullConfig(const AlphaPushPullConfig& config);
@@ -89,14 +94,12 @@ public:
     [[nodiscard]] bool showApprovalMask() const { return _showApprovalMask; }
     [[nodiscard]] bool editApprovedMask() const { return _editApprovedMask; }
     [[nodiscard]] bool editUnapprovedMask() const { return _editUnapprovedMask; }
-    [[nodiscard]] bool autoApproveEdits() const { return _autoApprovalEnabled; }
     [[nodiscard]] bool autoApprovalEnabled() const { return _autoApprovalEnabled; }
     [[nodiscard]] float autoApprovalRadius() const { return _autoApprovalRadius; }
     [[nodiscard]] float autoApprovalThreshold() const { return _autoApprovalThreshold; }
     [[nodiscard]] float autoApprovalMaxDistance() const { return _autoApprovalMaxDistance; }
 
     [[nodiscard]] bool isEditingApprovalMask() const { return _editApprovedMask || _editUnapprovedMask; }
-    void setAutoApproveEdits(bool enabled);
     void setAutoApprovalEnabled(bool enabled);
     void setAutoApprovalRadius(float radius);
     void setAutoApprovalThreshold(float threshold);
@@ -390,6 +393,11 @@ private:
     QTimer* _autosaveTimer{nullptr};
     bool _pendingAutosave{false};
     bool _autosaveNotifiedFailure{false};
+
+    // Async save state
+    QFuture<void> _saveFuture;
+    bool _saveInProgress{false};
+    bool _dirtyAfterSave{false};
 
     // Correction points auto-save
     static constexpr int kCorrectionsSaveDelayMs = 2000;

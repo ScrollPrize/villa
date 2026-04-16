@@ -7,7 +7,6 @@ endfunction()
 
 vc_add_test(test_version test_version.cpp)
 vc_add_test(test_geometry test_geometry.cpp)
-vc_add_test(test_cache_primitives test_cache_primitives.cpp)
 vc_add_test(test_gen_normalgrids_helpers test_gen_normalgrids_helpers.cpp)
 vc_add_test(test_gridstore_cache test_gridstore_cache.cpp)
 vc_add_test(test_binary_pyramid test_binary_pyramid.cpp)

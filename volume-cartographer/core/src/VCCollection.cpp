@@ -3,113 +3,114 @@
 #include <algorithm>
 #include <vector>
 #include <fstream>
-#include <nlohmann/json.hpp>
 
-NLOHMANN_JSON_NAMESPACE_BEGIN
-template <>
-struct adl_serializer<cv::Vec3f> {
-    static void to_json(json& j, const cv::Vec3f& v) {
-        j = {v[0], v[1], v[2]};
-    }
+using Json = utils::Json;
 
-    static void from_json(const json& j, cv::Vec3f& v) {
-        j.at(0).get_to(v[0]);
-        j.at(1).get_to(v[1]);
-        j.at(2).get_to(v[2]);
-    }
-};
-
-template <>
-struct adl_serializer<cv::Vec2f> {
-    static void to_json(json& j, const cv::Vec2f& v) {
-        j = {v[0], v[1]};
-    }
-
-    static void from_json(const json& j, cv::Vec2f& v) {
-        j.at(0).get_to(v[0]);
-        j.at(1).get_to(v[1]);
-    }
-};
-NLOHMANN_JSON_NAMESPACE_END
- 
 #define VC_POINTCOLLECTIONS_JSON_VERSION "1"
 
+// -- Vec3f/Vec2f helpers --
+static Json vec3f_to_json(const cv::Vec3f& v) {
+    auto a = Json::array();
+    a.push_back(Json((double)v[0]));
+    a.push_back(Json((double)v[1]));
+    a.push_back(Json((double)v[2]));
+    return a;
+}
 
+static cv::Vec3f vec3f_from_json(const Json& j) {
+    return {j.at(0).get_float(), j.at(1).get_float(), j.at(2).get_float()};
+}
 
-using json = nlohmann::json;
- 
-void to_json(json& j, const ColPoint& p) {
-    j = json{
-        {"p", p.p},
-        {"creation_time", p.creation_time}
+static Json vec2f_to_json(const cv::Vec2f& v) {
+    auto a = Json::array();
+    a.push_back(Json((double)v[0]));
+    a.push_back(Json((double)v[1]));
+    return a;
+}
+
+static cv::Vec2f vec2f_from_json(const Json& j) {
+    return {j.at(0).get_float(), j.at(1).get_float()};
+}
+
+// -- to_json / from_json --
+void to_json(Json& j, const ColPoint& p) {
+    j = Json{
+        {"p", vec3f_to_json(p.p)},
+        {"creation_time", Json((int64_t)p.creation_time)}
     };
     if (!std::isnan(p.winding_annotation)) {
-        j["wind_a"] = p.winding_annotation;
+        j["wind_a"] = (double)p.winding_annotation;
     } else {
         j["wind_a"] = nullptr;
     }
 }
- 
-void from_json(const json& j, ColPoint& p) {
-    j.at("p").get_to(p.p);
+
+void from_json(const Json& j, ColPoint& p) {
+    p.p = vec3f_from_json(j.at("p"));
     if (j.contains("wind_a") && !j.at("wind_a").is_null()) {
-        j.at("wind_a").get_to(p.winding_annotation);
+        p.winding_annotation = j.at("wind_a").get_float();
     } else {
         p.winding_annotation = std::nan("");
     }
     if (j.contains("creation_time")) {
-        j.at("creation_time").get_to(p.creation_time);
+        p.creation_time = j.at("creation_time").get_int64();
     } else {
         p.creation_time = 0;
     }
 }
- 
-void to_json(json& j, const CollectionMetadata& m) {
-    j = json{
-        {"winding_is_absolute", m.absolute_winding_number}
+
+void to_json(Json& j, const CollectionMetadata& m) {
+    j = Json{
+        {"winding_is_absolute", Json(m.absolute_winding_number)}
     };
 }
- 
-void from_json(const json& j, CollectionMetadata& m) {
-    j.at("winding_is_absolute").get_to(m.absolute_winding_number);
-}
- 
-void to_json(json& j, const VCCollection::Collection& c) {
-   json points_obj = json::object();
-   for(const auto& pair : c.points) {
-       points_obj[std::to_string(pair.first)] = pair.second;
-   }
 
-    j = json{
-        {"name", c.name},
-        {"points", points_obj},
-        {"metadata", c.metadata},
-        {"color", c.color}
+void from_json(const Json& j, CollectionMetadata& m) {
+    m.absolute_winding_number = j.at("winding_is_absolute").get_bool();
+}
+
+void to_json(Json& j, const VCCollection::Collection& c) {
+    Json points_obj = Json::object();
+    for (const auto& pair : c.points) {
+        Json pj;
+        to_json(pj, pair.second);
+        points_obj[std::to_string(pair.first)] = pj;
+    }
+
+    Json metadata_j;
+    to_json(metadata_j, c.metadata);
+
+    j = Json{
+        {"name", Json(c.name)},
+        {"points", std::move(points_obj)},
+        {"metadata", std::move(metadata_j)},
+        {"color", vec3f_to_json(c.color)}
     };
 
     if (c.anchor2d.has_value()) {
-        j["anchor2d"] = c.anchor2d.value();
+        j["anchor2d"] = vec2f_to_json(c.anchor2d.value());
     }
 }
- 
-void from_json(const json& j, VCCollection::Collection& c) {
-    j.at("name").get_to(c.name);
 
-    json points_obj = j.at("points");
+void from_json(const Json& j, VCCollection::Collection& c) {
+    c.name = j.at("name").get_string();
+
+    const Json& points_obj = j.at("points");
     if (points_obj.is_object()) {
-        for (auto& [id_str, point_json] : points_obj.items()) {
-            uint64_t id = std::stoull(id_str);
-            ColPoint p = point_json.get<ColPoint>();
+        for (auto it = points_obj.begin(); it != points_obj.end(); ++it) {
+            uint64_t id = std::stoull(it.key());
+            ColPoint p;
+            from_json(*it, p);
             p.id = id;
             c.points[id] = p;
         }
     }
 
-    j.at("metadata").get_to(c.metadata);
-    j.at("color").get_to(c.color);
+    from_json(j.at("metadata"), c.metadata);
+    c.color = vec3f_from_json(j.at("color"));
 
     if (j.contains("anchor2d") && !j.at("anchor2d").is_null()) {
-        c.anchor2d = j.at("anchor2d").get<cv::Vec2f>();
+        c.anchor2d = vec2f_from_json(j.at("anchor2d"));
     } else {
         c.anchor2d = std::nullopt;
     }
@@ -135,7 +136,8 @@ ColPoint VCCollection::addPoint(const std::string& collectionName, const cv::Vec
     new_point.id = getNextPointId();
     new_point.collectionId = collection_id;
     new_point.p = point;
-    new_point.creation_time = QDateTime::currentMSecsSinceEpoch();
+    new_point.creation_time = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
     
     _collections[collection_id].points[new_point.id] = new_point;
     _points[new_point.id] = new_point;
@@ -154,7 +156,8 @@ void VCCollection::addPoints(const std::string& collectionName, const std::vecto
         new_point.id = getNextPointId();
         new_point.collectionId = collection_id;
         new_point.p = p;
-        new_point.creation_time = QDateTime::currentMSecsSinceEpoch();
+        new_point.creation_time = static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count());
         collection_points[new_point.id] = new_point;
         _points[new_point.id] = new_point;
         emit pointAdded(new_point);
@@ -340,14 +343,16 @@ void VCCollection::autoFillWindingNumbers(uint64_t collectionId, WindingFillMode
  
 bool VCCollection::saveToJSON(const std::string& filename) const
 {
-    json j;
-   j["vc_pointcollections_json_version"] = VC_POINTCOLLECTIONS_JSON_VERSION;
-    json collections_obj = json::object();
-    for(const auto& pair : _collections) {
-        collections_obj[std::to_string(pair.first)] = pair.second;
+    Json j;
+    j["vc_pointcollections_json_version"] = VC_POINTCOLLECTIONS_JSON_VERSION;
+    Json collections_obj = Json::object();
+    for (const auto& pair : _collections) {
+        Json cj;
+        to_json(cj, pair.second);
+        collections_obj[std::to_string(pair.first)] = cj;
     }
     j["collections"] = collections_obj;
- 
+
     std::ofstream o(filename);
     if (!o.is_open()) {
         qWarning() << "Failed to open file for writing: " << QString::fromStdString(filename);
@@ -360,16 +365,10 @@ bool VCCollection::saveToJSON(const std::string& filename) const
  
 bool VCCollection::loadFromJSON(const std::string& filename)
 {
-    std::ifstream i(filename);
-    if (!i.is_open()) {
-        qWarning() << "Failed to open file for reading: " << QString::fromStdString(filename);
-        return false;
-    }
-
-    json j;
+    Json j;
     try {
-        i >> j;
-    } catch (json::parse_error& e) {
+        j = Json::parse_file(filename);
+    } catch (const std::exception& e) {
         qWarning() << "Failed to parse JSON: " << e.what();
         return false;
     }
@@ -377,18 +376,19 @@ bool VCCollection::loadFromJSON(const std::string& filename)
     clearAll();
 
     try {
-       if (!j.contains("vc_pointcollections_json_version") || j.at("vc_pointcollections_json_version").get<std::string>() != VC_POINTCOLLECTIONS_JSON_VERSION) {
-           throw std::runtime_error("JSON file has incorrect version or is missing version info.");
-       }
+        if (!j.contains("vc_pointcollections_json_version") || j.at("vc_pointcollections_json_version").get_string() != VC_POINTCOLLECTIONS_JSON_VERSION) {
+            throw std::runtime_error("JSON file has incorrect version or is missing version info.");
+        }
 
-        json collections_obj = j.at("collections");
+        const Json& collections_obj = j.at("collections");
         if (!collections_obj.is_object()) {
             return false;
         }
 
-        for (auto& [id_str, col_json] : collections_obj.items()) {
-           uint64_t id = std::stoull(id_str);
-            Collection col = col_json.get<Collection>();
+        for (auto it = collections_obj.begin(); it != collections_obj.end(); ++it) {
+            uint64_t id = std::stoull(it.key());
+            Collection col;
+            from_json(*it, col);
             col.id = id;
             _collections[col.id] = col;
             for (auto& point_pair : _collections.at(col.id).points) {
@@ -396,7 +396,7 @@ bool VCCollection::loadFromJSON(const std::string& filename)
             }
         }
 
-    } catch (json::exception& e) {
+    } catch (const std::exception& e) {
         qWarning() << "Failed to extract data from JSON: " << e.what();
         return false;
     }
@@ -441,11 +441,13 @@ bool VCCollection::saveToSegmentPath(const std::filesystem::path& segmentPath) c
     auto filePath = segmentPath / "corrections.json";
 
     // Filter to only collections with anchor2d set
-    json collections_obj = json::object();
+    Json collections_obj = Json::object();
     int anchoredCount = 0;
     for (const auto& pair : _collections) {
         if (pair.second.anchor2d.has_value()) {
-            collections_obj[std::to_string(pair.first)] = pair.second;
+            Json cj;
+            to_json(cj, pair.second);
+            collections_obj[std::to_string(pair.first)] = cj;
             anchoredCount++;
         }
     }
@@ -460,7 +462,7 @@ bool VCCollection::saveToSegmentPath(const std::filesystem::path& segmentPath) c
         return true;
     }
 
-    json j;
+    Json j;
     j["vc_pointcollections_json_version"] = VC_POINTCOLLECTIONS_JSON_VERSION;
     j["collections"] = collections_obj;
 
@@ -529,28 +531,22 @@ bool VCCollection::loadFromSegmentPath(const std::filesystem::path& segmentPath)
         return true;
     }
 
-    std::ifstream i(filePath);
-    if (!i.is_open()) {
-        qWarning() << "Failed to open corrections file for reading:" << QString::fromStdString(filePath.string());
-        return false;
-    }
-
-    json j;
+    Json j;
     try {
-        i >> j;
-    } catch (json::parse_error& e) {
+        j = Json::parse_file(filePath);
+    } catch (const std::exception& e) {
         qWarning() << "Failed to parse corrections JSON:" << e.what();
         return false;
     }
 
     try {
         if (!j.contains("vc_pointcollections_json_version") ||
-            j.at("vc_pointcollections_json_version").get<std::string>() != VC_POINTCOLLECTIONS_JSON_VERSION) {
+            j.at("vc_pointcollections_json_version").get_string() != VC_POINTCOLLECTIONS_JSON_VERSION) {
             qWarning() << "Corrections file has incorrect version";
             return false;
         }
 
-        json collections_obj = j.at("collections");
+        const Json& collections_obj = j.at("collections");
         if (!collections_obj.is_object()) {
             return false;
         }
@@ -558,14 +554,15 @@ bool VCCollection::loadFromSegmentPath(const std::filesystem::path& segmentPath)
         std::vector<uint64_t> addedCollectionIds;
         int loadedCount = 0;
 
-        for (auto& [id_str, col_json] : collections_obj.items()) {
-            Collection col = col_json.get<Collection>();
+        for (auto it = collections_obj.begin(); it != collections_obj.end(); ++it) {
+            Collection col;
+            from_json(*it, col);
             // Only load collections with anchor2d set
             if (!col.anchor2d.has_value()) {
                 continue;
             }
 
-            uint64_t id = std::stoull(id_str);
+            uint64_t id = std::stoull(it.key());
             col.id = id;
             _collections[col.id] = col;
             for (auto& point_pair : _collections.at(col.id).points) {
@@ -593,7 +590,7 @@ bool VCCollection::loadFromSegmentPath(const std::filesystem::path& segmentPath)
 
         qInfo() << "Loaded" << loadedCount << "anchored correction collections from" << QString::fromStdString(filePath.string());
 
-    } catch (json::exception& e) {
+    } catch (const std::exception& e) {
         qWarning() << "Failed to extract data from corrections JSON:" << e.what();
         return false;
     }
@@ -630,9 +627,9 @@ uint64_t VCCollection::findOrCreateCollectionByName(const std::string& name)
 
     uint64_t new_id = getNextCollectionId();
     cv::Vec3f color = {
-        (float)rand() / RAND_MAX,
-        (float)rand() / RAND_MAX,
-        (float)rand() / RAND_MAX
+        static_cast<float>(rand()) / static_cast<float>(RAND_MAX),
+        static_cast<float>(rand()) / static_cast<float>(RAND_MAX),
+        static_cast<float>(rand()) / static_cast<float>(RAND_MAX)
     };
     _collections[new_id] = {new_id, name, {}, {}, color};
     emit collectionsAdded({new_id});

@@ -2,6 +2,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/DateTime.hpp"
+#include "utils/Json.hpp"
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <cmath>
@@ -239,10 +240,10 @@ std::vector<AreaResult> SurfaceAreaCalculator::calculateAreas(
         // Persist to meta
         try {
             auto* surf = sm.get();
-            if (!surf->meta) surf->meta = std::make_unique<nlohmann::json>();
-            (*surf->meta)["area_vx2"] = area_vx2;
-            (*surf->meta)["area_cm2"] = area_cm2;
-            (*surf->meta)["date_last_modified"] = get_surface_time_str();
+            if (surf->meta.is_null()) surf->meta = utils::Json::object();
+            surf->meta["area_vx2"] = area_vx2;
+            surf->meta["area_cm2"] = area_cm2;
+            surf->meta["date_last_modified"] = get_surface_time_str();
             surf->save_meta();
             result.areaVx2 = area_vx2;
             result.areaCm2 = area_cm2;

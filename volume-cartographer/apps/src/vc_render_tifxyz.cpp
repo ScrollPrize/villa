@@ -1,6 +1,7 @@
+#include <iostream>
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
-#include "vc/core/cache/SimpleCacheFactory.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/Tiff.hpp"
@@ -10,7 +11,7 @@
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VcDataset.hpp"
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include <opencv2/imgproc.hpp>
 #include <fstream>
@@ -33,7 +34,7 @@
 #include <omp.h>
 
 namespace po = boost::program_options;
-using json = nlohmann::json;
+using Json = utils::Json;
 
 // ============================================================
 // Logging infrastructure
@@ -117,7 +118,7 @@ static AffineTransform loadAffineTransform(const std::string& filename)
     if (!file.is_open())
         throw std::runtime_error("Cannot open affine transform file: " + filename);
     try {
-        json j; file >> j;
+        Json j = Json::parse_file(filename);
         if (j.contains("transformation_matrix")) {
             auto mat = j["transformation_matrix"];
             if (mat.size() != 3 && mat.size() != 4)
@@ -126,7 +127,7 @@ static AffineTransform loadAffineTransform(const std::string& filename)
                 if (mat[row].size() != 4)
                     throw std::runtime_error("Each row must have 4 elements");
                 for (int col = 0; col < 4; col++)
-                    transform.matrix(row, col) = mat[row][col].get<double>();
+                    transform.matrix(row, col) = mat[row][col].get_double();
             }
             if (mat.size() == 4) {
                 if (std::abs(transform.matrix(3,0)) > 1e-12 ||
@@ -136,7 +137,7 @@ static AffineTransform loadAffineTransform(const std::string& filename)
                     throw std::runtime_error("Bottom affine row must be [0,0,0,1]");
             }
         }
-    } catch (json::parse_error&) {
+    } catch (const std::exception&) {
         throw std::runtime_error("Error parsing affine transform file: " + filename);
     }
     return transform;
@@ -433,10 +434,9 @@ static std::string loadCachedRemoteUrl(const std::filesystem::path& volumePath)
     if (!file.is_open()) return {};
 
     try {
-        json marker;
-        file >> marker;
+        Json marker = Json::parse_file(markerPath);
         if (marker.contains("url") && marker["url"].is_string())
-            return marker["url"].get<std::string>();
+            return marker["url"].get_string();
     } catch (...) {
     }
     return {};
@@ -537,7 +537,7 @@ static std::vector<vc::cache::ChunkKey> collectPrefetchKeysForRows(
 }
 
 static bool prefetchChunkKeys(
-    vc::cache::TieredChunkCache* cache,
+    vc::cache::BlockPipeline* cache,
     const std::vector<vc::cache::ChunkKey>& keys)
 {
     if (!cache || keys.empty()) return true;
@@ -548,7 +548,7 @@ static bool prefetchChunkKeys(
     size_t lastAvailable = available;
     size_t idleRetries = 0;
 
-    cache->prefetch(keys);
+    cache->fetchInteractive(keys);
 
     while (available < keys.size()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
@@ -585,7 +585,7 @@ static bool prefetchChunkKeys(
                           available, keys.size());
                 return false;
             }
-            cache->prefetch(keys);
+            cache->fetchInteractive(keys);
         } else {
             idleRetries = 0;
         }
@@ -626,7 +626,7 @@ static std::vector<cv::Mat> processRawSlices(std::vector<cv::Mat_<T>>& raw, int 
 template <typename T, typename WriteFn>
 static void renderBands(
     QuadSurface* surf, vc::VcDataset* ds,
-    vc::cache::TieredChunkCache* cache, int level,
+    vc::cache::BlockPipeline* cache, int level,
     const cv::Size& fullSize, const cv::Rect& crop, const cv::Size& tgtSize,
     float renderScale, float scaleSeg, float dsScale,
     bool hasAffine, const AffineTransform& aff,
@@ -742,7 +742,7 @@ static void writeTifBand(std::vector<TiffWriter>& writers,
 template <typename T>
 static void renderTiles(
     QuadSurface* surf, vc::VcDataset* ds,
-    vc::cache::TieredChunkCache* cache, int level,
+    vc::cache::BlockPipeline* cache, int level,
     const cv::Size& fullSize, const cv::Rect& crop, const cv::Size& tgtSize,
     float renderScale, float scaleSeg, float dsScale,
     bool hasAffine, const AffineTransform& aff,
@@ -1061,19 +1061,14 @@ static void renderTiles(
 
 static std::optional<double> readVolumeVoxelSize(const std::filesystem::path& volPath)
 {
-    using json = nlohmann::json;
     auto tryFile = [](const std::filesystem::path& p, const char* key) -> std::optional<double> {
         if (!std::filesystem::exists(p)) return std::nullopt;
         try {
-            auto j = json::parse(std::ifstream(p));
-            if (key) {
-                if (j.contains(key) && j[key].is_object())
-                    j = j[key];
-                else
-                    return std::nullopt;
-            }
-            if (j.contains("voxelsize") && j["voxelsize"].is_number())
-                return j["voxelsize"].get<double>();
+            Json j = Json::parse_file(p.string());
+            Json sub = key ? (j.is_object() && j.contains(key) ? j[key] : Json{}) : j;
+            if (key && !sub.is_object()) return std::nullopt;
+            if (sub.is_object() && sub.contains("voxelsize") && sub["voxelsize"].is_number())
+                return sub["voxelsize"].get_double();
         } catch (...) {}
         return std::nullopt;
     };
@@ -1328,8 +1323,8 @@ int main(int argc, char *argv[])
     const int cacheLevel = useRemoteCache ? group_idx : 0;
 
     const size_t cache_bytes = parsed["cache-gb"].as<size_t>() * 1024ull * 1024ull * 1024ull;
-    std::unique_ptr<vc::cache::TieredChunkCache> ownedChunkCache;
-    vc::cache::TieredChunkCache* chunk_cache = nullptr;
+    std::unique_ptr<vc::cache::BlockPipeline> ownedChunkCache;
+    vc::cache::BlockPipeline* chunk_cache = nullptr;
 
     if (useRemoteCache) {
         const std::string expectedId = vc::cache::deriveRemoteVolumeId(remoteUrl);
@@ -1346,7 +1341,7 @@ int main(int argc, char *argv[])
 
         try {
             remoteVolume = Volume::NewFromUrl(remoteUrl, vol_path.parent_path());
-            remoteVolume->setCacheBudget(cache_bytes, 0);
+            remoteVolume->setCacheBudget(cache_bytes);
             if (!pathsEquivalent(remoteVolume->path(), vol_path)) {
                 logPrintf(stderr,
                           "Error: remote cache path mismatch; refusing to use staged cache '%s' because remote metadata resolved to '%s'\n",
@@ -1368,7 +1363,7 @@ int main(int argc, char *argv[])
     } else {
         ownedDs = std::make_unique<vc::VcDataset>(vol_path / std::to_string(group_idx));
         ds = ownedDs.get();
-        ownedChunkCache = vc::cache::createSimpleTieredCache(ds, cache_bytes, ds->path());
+        ownedChunkCache = vc::cache::openFilesystemPipeline(ds, cache_bytes, ds->path());
         chunk_cache = ownedChunkCache.get();
     }
 

@@ -17,11 +17,11 @@
 #endif
 
 // Zarr
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 #include "vc/core/types/VcDataset.hpp"
 
 namespace po = boost::program_options;
-using json = nlohmann::json;
+using Json = utils::Json;
 
 // Forward declaration for skeletonization utility used by coherence helpers
 static cv::Mat skeletonize_mask(const cv::Mat& bin);
@@ -1185,33 +1185,44 @@ int main(int argc, char** argv) {
             std::cout << std::endl;
 
             // Write attributes and OME-NGFF multiscales metadata
-            nlohmann::json attrs;
-            attrs["axes"] = nlohmann::json::array({
-                nlohmann::json{{"name","z"},{"type","space"},{"unit","pixel"}},
-                nlohmann::json{{"name","y"},{"type","space"},{"unit","pixel"}},
-                nlohmann::json{{"name","x"},{"type","space"},{"unit","pixel"}}
-            });
-            attrs["canvas_size"] = {static_cast<int>(X), static_cast<int>(Y)};
+            utils::Json attrs;
+            utils::Json axes_arr = utils::Json::array();
+            axes_arr.push_back(utils::Json({{"name","z"},{"type","space"},{"unit","pixel"}}));
+            axes_arr.push_back(utils::Json({{"name","y"},{"type","space"},{"unit","pixel"}}));
+            axes_arr.push_back(utils::Json({{"name","x"},{"type","space"},{"unit","pixel"}}));
+            attrs["axes"] = axes_arr;
+            {
+                utils::Json cs = utils::Json::array();
+                cs.push_back(static_cast<int>(X));
+                cs.push_back(static_cast<int>(Y));
+                attrs["canvas_size"] = cs;
+            }
             attrs["note_axes_order"] = "ZYX (slice, row, col)";
             attrs["source_zarr"] = in_root.string();
 
-            nlohmann::json multiscale;
+            utils::Json multiscale;
             multiscale["version"] = "0.4";
             multiscale["name"] = "ced2d";
             multiscale["axes"] = attrs["axes"];
-            multiscale["datasets"] = nlohmann::json::array();
+            multiscale["datasets"] = utils::Json::array();
             for (int level = 0; level <= 5; ++level) {
-                nlohmann::json dset;
+                utils::Json dset;
                 dset["path"] = std::to_string(level);
                 double s = std::pow(2.0, level);
-                dset["coordinateTransformations"] = nlohmann::json::array({
-                    nlohmann::json{{"type","scale"},{"scale", nlohmann::json::array({s, s, s})}},
-                    nlohmann::json{{"type","translation"},{"translation", nlohmann::json::array({0.0, 0.0, 0.0})}}
-                });
+                utils::Json scale_arr = utils::Json::array();
+                scale_arr.push_back(s); scale_arr.push_back(s); scale_arr.push_back(s);
+                utils::Json trans_arr = utils::Json::array();
+                trans_arr.push_back(0.0); trans_arr.push_back(0.0); trans_arr.push_back(0.0);
+                utils::Json ct = utils::Json::array();
+                ct.push_back(utils::Json({{"type","scale"},{"scale", scale_arr}}));
+                ct.push_back(utils::Json({{"type","translation"},{"translation", trans_arr}}));
+                dset["coordinateTransformations"] = ct;
                 multiscale["datasets"].push_back(dset);
             }
-            multiscale["metadata"] = nlohmann::json{{"downsampling_method","mean"}};
-            attrs["multiscales"] = nlohmann::json::array({multiscale});
+            multiscale["metadata"] = utils::Json({{"downsampling_method","mean"}});
+            utils::Json ms_arr = utils::Json::array();
+            ms_arr.push_back(multiscale);
+            attrs["multiscales"] = ms_arr;
             vc::writeZarrAttributes(out_root, attrs);
 
             // Build additional pyramid levels by mean pooling 2x2x2 from previous level (as uint8)

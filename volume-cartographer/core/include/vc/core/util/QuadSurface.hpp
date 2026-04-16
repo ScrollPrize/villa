@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <filesystem>
 #include <iterator>
 #include <mutex>
@@ -277,7 +278,7 @@ public:
     // Load from path with meta.json - lazy loading (only loads meta, loads points on first access)
     explicit QuadSurface(const std::filesystem::path &path_);
     // Load from path with provided meta json - lazy loading
-    QuadSurface(const std::filesystem::path &path_, const nlohmann::json &json);
+    QuadSurface(const std::filesystem::path &path_, const utils::Json &json);
     ~QuadSurface() override;
 
     // Ensure points are loaded (for lazy loading constructors)
@@ -307,6 +308,24 @@ public:
     Rect3D bbox();
 
     bool isLoaded() const { return !_needsLoad; }
+
+    // Drop derived caches (validity mask, etc.) without unloading _points.
+    // Called when this surface is no longer the active editing target so
+    // RAM is reserved for the segment the user is currently working on.
+    void unloadCaches();
+
+    // True iff this surface was loaded from disk and can be safely unloaded.
+    bool canUnload() const { return !path.empty(); }
+
+    // Drop _points and all derived caches; ensureLoaded() will re-read from
+    // disk on next access. No-op for in-memory-only surfaces.
+    void unloadPoints();
+
+    // Crop _points to the bounding box of valid (non-sentinel) cells.
+    // Shifts _center so existing ptr-space coords still resolve to the same
+    // world positions. Returns true if a trim was applied. No-op if the trim
+    // would save less than 25%.
+    bool trimToValidBbox();
 
     virtual cv::Mat_<cv::Vec3f> rawPoints() { ensureLoaded(); return *_points; }
     virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { ensureLoaded(); return _points.get(); }
@@ -352,8 +371,11 @@ public:
     void writeValidMask(const cv::Mat& img = cv::Mat());
 
     mutable cv::Mat_<uint8_t> _validMaskCache;
+    // Set when _validMaskCache contains no 0s — gen() can skip the
+    // validity warp + per-pixel invalidation pass entirely. Atomic
+    // because gen() can be called from concurrent OMP threads.
+    mutable std::atomic<bool> _validMaskAllValid{false};
     mutable cv::Mat_<cv::Vec3f> _normalCache;
-
     cv::Vec2f _scale;
 
     void setChannel(const std::string& name, const cv::Mat& channel);

@@ -20,7 +20,7 @@
 namespace
 {
 constexpr int kServiceStartTimeoutMs = 300000; // 5 minutes for torch compilation
-constexpr int kServiceStopTimeoutMs = 5000;    // 5 seconds to gracefully stop
+constexpr int kServiceStopTimeoutMs = 500;     // 500ms then kill
 const QString kDenseLatestSentinel = QStringLiteral("extrap_displacement_latest");
 const QString kCopyLatestSentinel = QStringLiteral("copy_displacement_latest");
 

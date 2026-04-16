@@ -63,10 +63,10 @@ private slots:
     void onSelectionChanged(const QItemSelection &selected, const QItemSelection &deselected);
     void onNewNameClicked();
     void onNameEdited(const QString &name);
-    void onAbsoluteWindingChanged(int state);
+    void onAbsoluteWindingChanged(Qt::CheckState state);
     void onColorButtonClicked();
     void onWindingEdited(double value);
-    void onWindingEnabledChanged(int state);
+    void onWindingEnabledChanged(Qt::CheckState state);
     void onFillWindingPlusClicked();
     void onFillWindingMinusClicked();
     void onFillWindingEqualsClicked();

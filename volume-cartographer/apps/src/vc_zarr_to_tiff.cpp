@@ -7,7 +7,7 @@
 #include <iomanip>
 #include <string>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -17,7 +17,7 @@
 
 namespace po = boost::program_options;
 namespace fs = std::filesystem;
-using json = nlohmann::json;
+using Json = utils::Json;
 
 static uint16_t parseCompression(const std::string& s)
 {

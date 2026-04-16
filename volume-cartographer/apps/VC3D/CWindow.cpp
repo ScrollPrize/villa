@@ -1,7 +1,14 @@
 #include "CWindow.hpp"
+#include <iostream>
+#include "RamStats.hpp"
 
 #include <cstdlib>
+#include <functional>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
+#include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "WindowRangeWidget.hpp"
 #include "VCSettings.hpp"
 #include "Keybinds.hpp"
@@ -39,6 +46,7 @@
 #include <QRegularExpressionValidator>
 #include <QDockWidget>
 #include <QLabel>
+#include <QDoubleSpinBox>
 #include <QSpinBox>
 #include <QSizePolicy>
 #include <QProcess>
@@ -52,7 +60,7 @@
 #include <QDebug>
 #include <QScrollArea>
 #include <QSignalBlocker>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 #include <QGraphicsSimpleTextItem>
 #include <QPointer>
 #include <QPen>
@@ -112,7 +120,7 @@
 #include "vc/core/util/Render.hpp"
 #include "vc/core/util/NetworkFilesystem.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
-#include "vc/core/cache/DiskStore.hpp"
+#include <utils/zarr.hpp>
 
 
 
@@ -159,31 +167,21 @@ vc::cache::HttpAuth authForRemoteTransformSource(const QString& source)
         return auth;
     }
 
-    auto getEnv = [](const char* name) -> std::string {
-        const char* value = std::getenv(name);
-        return value ? value : "";
-    };
-
-    auth.region = resolved.awsRegion;
-    auth.accessKey = getEnv("AWS_ACCESS_KEY_ID");
-    auth.secretKey = getEnv("AWS_SECRET_ACCESS_KEY");
-    auth.sessionToken = getEnv("AWS_SESSION_TOKEN");
-
-    if (auth.accessKey.empty() || auth.secretKey.empty()) {
+    auth = vc::cache::loadAwsCredentials();
+    if (auth.region.empty())
+        auth.region = resolved.awsRegion;
+    // Fall back to saved QSettings if ~/.aws/ files had nothing
+    if (auth.access_key.empty() || auth.secret_key.empty()) {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         const auto savedAccess = settings.value(vc3d::settings::aws::ACCESS_KEY).toString();
         const auto savedSecret = settings.value(vc3d::settings::aws::SECRET_KEY).toString();
         const auto savedToken = settings.value(vc3d::settings::aws::SESSION_TOKEN).toString();
 
         if (!savedAccess.isEmpty() && !savedSecret.isEmpty()) {
-            auth.accessKey = savedAccess.toStdString();
-            auth.secretKey = savedSecret.toStdString();
-            auth.sessionToken = savedToken.toStdString();
+            auth.access_key = savedAccess.toStdString();
+            auth.secret_key = savedSecret.toStdString();
+            auth.session_token = savedToken.toStdString();
         }
-    }
-
-    if (!auth.accessKey.empty() && !auth.secretKey.empty()) {
-        auth.awsSigv4 = true;
     }
 
     return auth;
@@ -335,13 +333,7 @@ cv::Matx44d loadAffineTransformMatrix(const std::filesystem::path& path)
         throw std::runtime_error("transform.json not found");
     }
 
-    std::ifstream input(path);
-    if (!input.is_open()) {
-        throw std::runtime_error("failed to open transform.json");
-    }
-
-    nlohmann::json json;
-    input >> json;
+    utils::Json json = utils::Json::parse_file(path);
 
     if (!json.contains("transformation_matrix")) {
         throw std::runtime_error("transform.json is missing transformation_matrix");
@@ -359,7 +351,7 @@ cv::Matx44d loadAffineTransformMatrix(const std::filesystem::path& path)
             throw std::runtime_error("each transformation_matrix row must have 4 values");
         }
         for (int col = 0; col < 4; ++col) {
-            matrix(row, col) = rowJson.at(col).get<double>();
+            matrix(row, col) = rowJson.at(col).get_double();
         }
     }
 
@@ -471,16 +463,25 @@ void refreshTransformedSurfaceState(QuadSurface* surface)
 
     surface->invalidateCache();
 
-    if (!surface->meta || !surface->meta->is_object()) {
-        surface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
+    if (surface->meta.is_null() || !surface->meta.is_object()) {
+        surface->meta = utils::Json::object();
     }
 
     const auto bbox = surface->bbox();
-    (*surface->meta)["bbox"] = {
-        {bbox.low[0], bbox.low[1], bbox.low[2]},
-        {bbox.high[0], bbox.high[1], bbox.high[2]}
-    };
-    (*surface->meta)["scale"] = {surface->scale()[0], surface->scale()[1]};
+    {
+        auto lo = utils::Json::array();
+        lo.push_back(bbox.low[0]); lo.push_back(bbox.low[1]); lo.push_back(bbox.low[2]);
+        auto hi = utils::Json::array();
+        hi.push_back(bbox.high[0]); hi.push_back(bbox.high[1]); hi.push_back(bbox.high[2]);
+        auto bb = utils::Json::array();
+        bb.push_back(std::move(lo)); bb.push_back(std::move(hi));
+        surface->meta["bbox"] = std::move(bb);
+    }
+    {
+        auto sc = utils::Json::array();
+        sc.push_back(surface->scale()[0]); sc.push_back(surface->scale()[1]);
+        surface->meta["scale"] = std::move(sc);
+    }
 }
 
 std::shared_ptr<QuadSurface> cloneSurfaceForTransform(const std::shared_ptr<QuadSurface>& source)
@@ -490,9 +491,7 @@ std::shared_ptr<QuadSurface> cloneSurfaceForTransform(const std::shared_ptr<Quad
     }
 
     auto clone = std::make_shared<QuadSurface>(source->rawPoints(), source->scale());
-    clone->meta = source->meta
-        ? std::make_unique<nlohmann::json>(*source->meta)
-        : std::make_unique<nlohmann::json>(nlohmann::json::object());
+    clone->meta = source->meta.is_null() ? utils::Json::object() : source->meta;
     clone->id = source->id;
     clone->path = source->path;
     clone->setOverlappingIds(source->overlappingIds());
@@ -506,57 +505,14 @@ std::shared_ptr<QuadSurface> cloneSurfaceForTransform(const std::shared_ptr<Quad
 
 void primeRemoteLevel5WithDialog(CWindow* window, const std::shared_ptr<Volume>& volume)
 {
-    if (!window || !volume || !volume->needsRemoteLevel5Prime()) {
-        return;
-    }
-
-    QProgressDialog progress(window->tr("Downloading remote level 5 overview..."),
-                             QString(),
-                             0,
-                             0,
-                             window);
-    progress.setWindowTitle(window->tr("Caching Remote Overview"));
-    progress.setWindowModality(Qt::ApplicationModal);
-    progress.setMinimumDuration(0);
-    progress.setAutoClose(false);
-    progress.setAutoReset(false);
-    progress.setCancelButton(nullptr);
-    progress.show();
-
-    try {
-        volume->primeRemoteLevel5Blocking([&](size_t completed, size_t total) {
-            const int safeTotal = total > static_cast<size_t>(std::numeric_limits<int>::max())
-                                      ? std::numeric_limits<int>::max()
-                                      : static_cast<int>(total);
-            const int safeCompleted =
-                completed > static_cast<size_t>(safeTotal)
-                    ? safeTotal
-                    : static_cast<int>(completed);
-
-            progress.setMaximum(std::max(0, safeTotal));
-            progress.setValue(safeCompleted);
-            progress.setLabelText(
-                window->tr("Downloading remote level 5 overview (%1/%2 chunks)...")
-                    .arg(completed)
-                    .arg(total));
-            QApplication::processEvents(QEventLoop::ExcludeUserInputEvents);
-        });
-
-        progress.setValue(progress.maximum());
-        if (window->statusBar()) {
-            window->statusBar()->showMessage(
-                window->tr("Cached remote level 5 overview for '%1'.")
-                    .arg(QString::fromStdString(volume->id())),
-                5000);
-        }
-    } catch (const std::exception& e) {
-        progress.hide();
-        QMessageBox::warning(
-            window,
-            window->tr("Remote Overview Cache"),
-            window->tr("Attached the remote volume, but failed to cache level 5 locally:\n%1")
-                .arg(QString::fromUtf8(e.what())));
-    }
+    if (!window || !volume) return;
+    // Level-5 is loaded automatically into the BlockCache resident region
+    // when the BlockPipeline is first created. Trigger it asynchronously.
+    auto* watcher = new QFutureWatcher<void>(window);
+    QObject::connect(watcher, &QFutureWatcher<void>::finished, watcher, &QObject::deleteLater);
+    watcher->setFuture(QtConcurrent::run([volume]() {
+        (void)volume->tieredCache();
+    }));
 }
 
 } // namespace
@@ -671,6 +627,20 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _windowStateSaveTimer->setInterval(500);
     connect(_windowStateSaveTimer, &QTimer::timeout, this, &CWindow::saveWindowState);
 
+    // Periodic glibc heap trim: returns sbrk-grown segments back to the OS
+    // once they're no longer in use. Cheap (~µs) when nothing to trim.
+    // Also dumps a RAM stats line for live monitoring. malloc_trim is a
+    // glibc extension — skipped on macOS / non-glibc libc.
+    auto* trimTimer = new QTimer(this);
+    trimTimer->setInterval(1000);
+    connect(trimTimer, &QTimer::timeout, this, [this]() {
+#if defined(__GLIBC__)
+        ::malloc_trim(0);
+#endif
+        vc3d::ramstats::dumpOnce(_viewerManager.get(), _state);
+    });
+    trimTimer->start();
+
     const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     _mirrorCursorToSegmentation = settings.value(vc3d::settings::viewer::MIRROR_CURSOR_TO_SEGMENTATION,
                                                   vc3d::settings::viewer::MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT).toBool();
@@ -687,13 +657,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _cacheSizeBytes = cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
     std::cout << "chunk cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
 
-    // Disk cache size from settings
-    size_t diskCacheSizeGB = settings.value(vc3d::settings::perf::DISK_CACHE_SIZE_GB,
-                                            vc3d::settings::perf::DISK_CACHE_SIZE_GB_DEFAULT).toULongLong();
-    size_t diskCacheSizeBytes = diskCacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
-    std::cout << "disk cache budget is " << diskCacheSizeGB << " gigabytes" << std::endl;
-
-    _state = new CState(_cacheSizeBytes, diskCacheSizeBytes, this);
+    _state = new CState(_cacheSizeBytes, this);
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
 
@@ -911,15 +875,28 @@ CWindow::CWindow(size_t cacheSizeGB) :
                std::max(height(), minWindowSize.height()));
     }
 
-    // If enabled, auto open the last used volpkg
+    // If enabled, auto open the last used volume (local or remote, deferred so window shows first)
     if (settings.value(vc3d::settings::volpkg::AUTO_OPEN, vc3d::settings::volpkg::AUTO_OPEN_DEFAULT).toInt() != 0) {
 
         QStringList files = settings.value(vc3d::settings::volpkg::RECENT).toStringList();
+        QStringList remoteUrls = settings.value(vc3d::settings::viewer::REMOTE_RECENT_URLS).toStringList();
 
         if (!files.empty() && !files.at(0).isEmpty()) {
-            if (_menuController) {
-                _menuController->openVolpkgAt(files[0]);
-            }
+            // Local volpkg available — open it
+            QString path = files[0];
+            QTimer::singleShot(0, this, [this, path]() {
+                if (_menuController) {
+                    _menuController->openVolpkgAt(path);
+                }
+            });
+        } else if (!remoteUrls.empty() && !remoteUrls.at(0).isEmpty()) {
+            // No local volpkg but have a recent remote URL — open it
+            QString url = remoteUrls[0];
+            QTimer::singleShot(0, this, [this, url]() {
+                if (_menuController) {
+                    _menuController->openRemoteUrl(url, false);
+                }
+            });
         }
     }
 
@@ -1126,7 +1103,12 @@ CWindow::CWindow(size_t cacheSizeGB) :
 // Destructor
 CWindow::~CWindow()
 {
-
+    // Backstop in case ~CWindow is reached without closeEvent firing (e.g.
+    // if the app is torn down programmatically). Same rationale as the
+    // closeEvent hook — skip SurfacePatchIndex removal during teardown.
+    if (_viewerManager) {
+        _viewerManager->beginShutdown();
+    }
     if (_fileWatcher) {
         _fileWatcher->stopWatching();
     }
@@ -2023,6 +2005,115 @@ void CWindow::setRemoteSurfaces(const std::vector<std::pair<std::string, std::sh
     refreshTransformsPanelState();
 }
 
+void CWindow::setRemoteStubs(
+    const std::vector<std::string>& segmentIds,
+    const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& cachedSurfaces)
+{
+    if (_surfacePanel) {
+        _surfacePanel->loadRemoteStubs(segmentIds, cachedSurfaces);
+    }
+
+    // Activate the first cached surface if available
+    if (_state && !cachedSurfaces.empty()) {
+        const auto& [firstId, firstSurf] = cachedSurfaces.front();
+        _state->setSurface("segmentation", firstSurf);
+        _state->setActiveSurface(firstId, std::dynamic_pointer_cast<QuadSurface>(firstSurf));
+        _state->emitSurfacesChanged();
+    }
+
+    emit _state->surfacesLoaded();
+    refreshTransformsPanelState();
+}
+
+void CWindow::downloadRemoteSegmentOnDemand(const QString& segmentId)
+{
+    const std::string segId = segmentId.toStdString();
+    const std::string dlBase = (_remoteScroll.segSource == vc::RemoteSegmentSource::Direct)
+        ? _remoteScroll.segmentsBaseUrl : _remoteScroll.baseUrl;
+    const std::string cachePath = _remoteScroll.cachePath;
+    const auto auth = _remoteScroll.auth;
+    const auto segSource = _remoteScroll.segSource;
+
+    if (statusBar()) {
+        statusBar()->showMessage(
+            tr("Downloading segment %1...").arg(segmentId));
+    }
+
+    auto* watcher = new QFutureWatcher<std::shared_ptr<QuadSurface>>(this);
+    // Capture the current session URL so the completion handler can detect
+    // a stale result if the user closed/switched volumes during download.
+    const std::string expectedBaseUrl = _remoteScroll.baseUrl;
+    connect(watcher, &QFutureWatcher<std::shared_ptr<QuadSurface>>::finished, this,
+        [this, watcher, segId, expectedBaseUrl]() {
+            watcher->deleteLater();
+            // If the remote scroll session changed, silently discard the
+            // result — applying a segment from a previous dataset to the
+            // current CState would corrupt surface state.
+            if (_remoteScroll.baseUrl != expectedBaseUrl) {
+                return;
+            }
+            std::shared_ptr<QuadSurface> surf;
+            try {
+                surf = watcher->result();
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "[RemoteScroll] Download failed for %s: %s\n",
+                    segId.c_str(), e.what());
+            }
+
+            if (surf) {
+                if (statusBar()) {
+                    statusBar()->showMessage(
+                        tr("Downloaded segment %1").arg(QString::fromStdString(segId)), 3000);
+                }
+                if (_surfacePanel) {
+                    _surfacePanel->replaceStubWithSurface(segId, surf);
+                }
+            } else {
+                if (statusBar()) {
+                    statusBar()->showMessage(
+                        tr("Failed to download segment %1").arg(QString::fromStdString(segId)), 5000);
+                }
+                // Reset the stub state so user can retry
+                if (_surfacePanel) {
+                    _surfacePanel->replaceStubWithSurface(segId, nullptr);
+                }
+            }
+        });
+
+    const std::string baseUrl = _remoteScroll.baseUrl;
+
+    auto future = QtConcurrent::run(
+        [dlBase, baseUrl, segId, cachePath, auth, segSource]() -> std::shared_ptr<QuadSurface> {
+            // Cache-root layout MUST match MenuActionController::promptAndLoadRemoteSegments
+            // so previously-preloaded segments are reused on demand instead
+            // of re-downloaded into a second location.
+            //   Direct sources: flat → cachePath/paths/<segId>
+            //   Segments/Paths (full volpkg): nested → cachePath/<volpkgName>/{paths|segments}/<segId>
+            std::filesystem::path segmentRoot = cachePath;
+            if (segSource != vc::RemoteSegmentSource::Direct) {
+                std::string volpkgName = baseUrl;
+                while (!volpkgName.empty() && volpkgName.back() == '/') volpkgName.pop_back();
+                auto slash = volpkgName.rfind('/');
+                if (slash != std::string::npos) volpkgName = volpkgName.substr(slash + 1);
+                segmentRoot = std::filesystem::path(cachePath) / volpkgName;
+            }
+
+            auto localDir = vc::downloadRemoteSegment(
+                dlBase, segId, segmentRoot, auth, segSource);
+
+            if (!std::filesystem::exists(localDir / "meta.json")) {
+                return nullptr;
+            }
+
+            auto seg = Segmentation::New(localDir);
+            if (seg && seg->canLoadSurface()) {
+                return seg->loadSurface();
+            }
+            return nullptr;
+        });
+    watcher->setFuture(future);
+}
+
 void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
                                             bool reloadSurfaces)
 {
@@ -2421,6 +2512,8 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onFetchRemoteChunks(segmentId.toStdString());
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::remoteSegmentDownloadRequested,
+            this, &CWindow::downloadRemoteSegmentOnDemand);
 
     connect(_surfacePanel.get(), &SurfacePanelController::growSeedsRequested,
             this, [this](const QString& segmentId, bool isExpand, bool isRandomSeed) {
@@ -2595,11 +2688,6 @@ void CWindow::CreateWidgets(void)
     });
     _segmentationCommandHandler->setClearSelectionCallback([this]() {
         clearSurfaceSelection();
-    });
-    _segmentationCommandHandler->setWaitForIndexRebuildCallback([this]() {
-        if (_viewerManager) {
-            _viewerManager->waitForPendingIndexRebuild();
-        }
     });
     _segmentationCommandHandler->setRestoreSelectionCallback([this](const std::string& id) {
         if (treeWidgetSurfaces) {
@@ -2851,10 +2939,97 @@ void CWindow::CreateWidgets(void)
     };
 
     using namespace vc3d::settings;
-    addViewerGroup(tr("View"),
+    auto* viewGroup = addViewerGroup(tr("View"),
                    detachScrollContents(ui.scrollAreaView, ui.dockWidgetViewContents),
                    viewer::GROUP_VIEW_EXPANDED,
                    viewer::GROUP_VIEW_EXPANDED_DEFAULT);
+
+    // Interpolation + highlight-downscaled live inside the View group so
+    // all display-affecting toggles sit together.
+    auto* viewExtrasLayout = viewGroup ? viewGroup->contentLayout() : viewerControlsLayout;
+
+    // Interpolation method selector
+    {
+        auto* interpWidget = new QWidget;
+        auto* interpLayout = new QHBoxLayout(interpWidget);
+        interpLayout->setContentsMargins(2, 2, 2, 2);
+        interpLayout->addWidget(new QLabel(tr("Interpolation")));
+        auto* cmbInterp = new QComboBox;
+        cmbInterp->addItem(tr("Nearest"));
+        cmbInterp->addItem(tr("Trilinear"));
+        cmbInterp->addItem(tr("Tricubic"));
+        cmbInterp->addItem(tr("Lanczos"));
+        cmbInterp->setCurrentIndex(settings.value(perf::INTERPOLATION_METHOD, 1).toInt());
+        interpLayout->addWidget(cmbInterp);
+        connect(cmbInterp, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int idx) {
+            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
+            s.setValue(vc3d::settings::perf::INTERPOLATION_METHOD, idx);
+            _viewerManager->forEachViewer([](CTiledVolumeViewer* v) {
+                v->reloadPerfSettings();
+                v->update();
+            });
+        });
+        viewExtrasLayout->addWidget(interpWidget);
+    }
+
+    // Highlight downscaled chunks — tints pixels that rendered against a
+    // coarser pyramid level than the zoom-level target (green → red).
+    {
+        auto* chkHighlight = new QCheckBox(tr("Highlight downscaled chunks"));
+        chkHighlight->setToolTip(
+            tr("Tint pixels sourced from a coarser pyramid level than the current zoom "
+               "target. Green = 1 level coarser; red = 5+ levels coarser. Untinted pixels "
+               "rendered at the requested resolution."));
+        chkHighlight->setChecked(
+            settings.value("viewer_controls/highlight_downscaled", false).toBool());
+        connect(chkHighlight, &QCheckBox::toggled, this, [this](bool on) {
+            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
+            s.setValue("viewer_controls/highlight_downscaled", on);
+            if (_viewerManager) {
+                _viewerManager->forEachViewer([](CTiledVolumeViewer* v) {
+                    v->reloadPerfSettings();
+                    v->renderVisible(true);
+                });
+            }
+        });
+        viewExtrasLayout->addWidget(chkHighlight);
+    }
+
+    // Navigation sensitivity controls
+    {
+        auto* navWidget = new QWidget;
+        auto* navLayout = new QGridLayout(navWidget);
+        navLayout->setContentsMargins(2, 2, 2, 2);
+        navLayout->setVerticalSpacing(2);
+
+        auto addSpin = [&](int row, const QString& label, const char* settingsKey, float defaultVal) {
+            navLayout->addWidget(new QLabel(label), row, 0);
+            auto* spin = new QDoubleSpinBox;
+            spin->setRange(0.1, 100.0);
+            spin->setSingleStep(0.1);
+            spin->setDecimals(1);
+            spin->setValue(settings.value(settingsKey, defaultVal).toDouble());
+            navLayout->addWidget(spin, row, 1);
+            connect(spin, &QDoubleSpinBox::valueChanged, this, [this, settingsKey](double v) {
+                QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
+                s.setValue(settingsKey, v);
+                if (_viewerManager) {
+                    _viewerManager->forEachViewer([](CTiledVolumeViewer* v) {
+                        v->reloadPerfSettings();
+                    });
+                }
+            });
+        };
+        addSpin(0, tr("Pan sensitivity"), viewer::PAN_SENSITIVITY, viewer::PAN_SENSITIVITY_DEFAULT);
+        addSpin(1, tr("Zoom sensitivity"), viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT);
+        addSpin(2, tr("Z-scroll sensitivity"), viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT);
+
+        addViewerGroup(tr("Navigation"),
+                       navWidget,
+                       "viewer_controls/group_navigation_expanded",
+                       true);
+    }
+
     addViewerGroup(tr("Overlay"),
                    detachScrollContents(ui.scrollAreaOverlay, ui.dockWidgetOverlayContents),
                    viewer::GROUP_OVERLAY_EXPANDED,
@@ -3473,6 +3648,7 @@ void CWindow::CreateWidgets(void)
             case 2: method = "min"; break;
             case 3: method = "alpha"; break;
             case 4: method = "beerLambert"; break;
+            case 5: method = "volumetric"; break;
         }
 
         if (auto* viewer = segmentationViewer()) {
@@ -3596,6 +3772,7 @@ void CWindow::CreateWidgets(void)
         if (auto* viewer = segmentationViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.lightAzimuth = static_cast<float>(value);
+            s.params.updateLightDir();
             viewer->setCompositeRenderSettings(s);
         }
     });
@@ -3605,6 +3782,7 @@ void CWindow::CreateWidgets(void)
         if (auto* viewer = segmentationViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.lightElevation = static_cast<float>(value);
+            s.params.updateLightDir();
             viewer->setCompositeRenderSettings(s);
         }
     });
@@ -3627,11 +3805,22 @@ void CWindow::CreateWidgets(void)
         }
     });
 
-    // Connect Volume Gradients checkbox
+    // Connect Volume Gradients checkbox — switches the lighting normal
+    // source between mesh-interpolated (0) and per-sample volume gradient (1).
     connect(ui.chkUseVolumeGradients, &QCheckBox::toggled, this, [this](bool checked) {
         if (auto* viewer = segmentationViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.useVolumeGradients = checked;
+            s.params.lightNormalSource = checked ? 1 : 0;
+            viewer->setCompositeRenderSettings(s);
+        }
+    });
+
+    // Connect Shadow Steps spinbox (Volumetric method)
+    connect(ui.spinShadowSteps, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (auto* viewer = segmentationViewer()) {
+            auto s = viewer->compositeRenderSettings();
+            s.params.shadowSteps = std::clamp(value, 1, 64);
             viewer->setCompositeRenderSettings(s);
         }
     });
@@ -3814,6 +4003,99 @@ void CWindow::CreateWidgets(void)
     ui.spinMinComponentSize->setEnabled(ui.chkRemoveSmallComponents->isChecked());
     ui.lblMinComponentSize->setEnabled(ui.chkRemoveSmallComponents->isChecked());
 
+    // CLAHE postprocessing — applied to every viewer
+    auto setClaheEnabled = [this](bool on) {
+        ui.spinClaheClipLimit->setEnabled(on);
+        ui.spinClaheTileSize->setEnabled(on);
+        ui.lblClaheClipLimit->setEnabled(on);
+        ui.lblClaheTileSize->setEnabled(on);
+    };
+    setClaheEnabled(ui.chkClaheEnabled->isChecked());
+
+    connect(ui.chkClaheEnabled, &QCheckBox::toggled, this, [this, setClaheEnabled](bool checked) {
+        setClaheEnabled(checked);
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([checked](CTiledVolumeViewer* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.postClaheEnabled = checked;
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+
+    connect(ui.spinClaheClipLimit, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([value](CTiledVolumeViewer* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.postClaheClipLimit = static_cast<float>(value);
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+
+    connect(ui.spinClaheTileSize, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([value](CTiledVolumeViewer* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.postClaheTileSize = std::clamp(value, 2, 64);
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+
+    // Raking light — heightfield post-process
+    auto setRakingEnabled = [this](bool on) {
+        ui.spinRakingAzimuth->setEnabled(on);
+        ui.spinRakingElevation->setEnabled(on);
+        ui.spinRakingStrength->setEnabled(on);
+        ui.spinRakingDepthScale->setEnabled(on);
+        ui.lblRakingAzimuth->setEnabled(on);
+        ui.lblRakingElevation->setEnabled(on);
+        ui.lblRakingStrength->setEnabled(on);
+        ui.lblRakingDepth->setEnabled(on);
+    };
+    setRakingEnabled(ui.chkRakingEnabled->isChecked());
+
+    connect(ui.chkRakingEnabled, &QCheckBox::toggled, this, [this, setRakingEnabled](bool checked) {
+        setRakingEnabled(checked);
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([checked](CTiledVolumeViewer* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.postRakingEnabled = checked;
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+    connect(ui.spinRakingAzimuth, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([v](CTiledVolumeViewer* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.postRakingAzimuth = float(v);
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+    connect(ui.spinRakingElevation, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([v](CTiledVolumeViewer* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.postRakingElevation = float(v);
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+    connect(ui.spinRakingStrength, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([v](CTiledVolumeViewer* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.postRakingStrength = std::clamp(float(v), 0.0f, 1.0f);
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+    connect(ui.spinRakingDepthScale, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        if (!_viewerManager) return;
+        _viewerManager->forEachViewer([v](CTiledVolumeViewer* viewer) {
+            auto s = viewer->compositeRenderSettings();
+            s.postRakingDepthScale = std::max(0.01f, float(v));
+            viewer->setCompositeRenderSettings(s);
+        });
+    });
+
+
     bool resetViewOnSurfaceChange = settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
                                                    vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
     if (_viewerManager) {
@@ -3929,6 +4211,14 @@ void CWindow::saveWindowState()
 
 void CWindow::closeEvent(QCloseEvent* event)
 {
+    // Tell ViewerManager to stop maintaining the SurfacePatchIndex. The
+    // CState teardown below iterates every tracked surface and sets it to
+    // nullptr, which would otherwise trigger an O(N) rtree->remove() per
+    // surface — easily 10+ seconds on a flattened segment with millions
+    // of cells.
+    if (_viewerManager) {
+        _viewerManager->beginShutdown();
+    }
     saveWindowState();
     event->accept();
 }
@@ -4129,51 +4419,8 @@ void CWindow::OpenVolume(const QString& path)
                                label, mountInfo.cacheDir);
             } else {
                 statusBar()->showMessage(
-                    tr("Detected %1 mount \u2014 local disk cache enabled automatically")
-                        .arg(QString::fromStdString(label)), 8000);
-                Logger()->info("Detected network filesystem ({}); auto disk cache enabled",
-                               label);
-            }
-
-            // Offer custom cache directory override (skip if s3fs already caching)
-            if (mountInfo.cacheDir.empty()) {
-                auto reply = QMessageBox::question(
-                    this, tr("Network Volume Detected"),
-                    tr("This volume package is on a network filesystem (%1).\n\n"
-                       "Local disk caching is enabled automatically (~/.VC3D/network_cache/).\n"
-                       "Would you like to choose a custom cache directory instead?")
-                        .arg(QString::fromStdString(label)),
-                    QMessageBox::Yes | QMessageBox::No, QMessageBox::No);
-
-                if (reply == QMessageBox::Yes) {
-                    using namespace vc3d::settings;
-                    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                    QString lastDir = settings.value(viewer::NETWORK_CACHE_DIR).toString();
-                    if (lastDir.isEmpty()) {
-                        lastDir = QDir::homePath() + "/.VC3D/network_cache";
-                    }
-
-                    QString cacheDir = QFileDialog::getExistingDirectory(
-                        this, tr("Select Local Cache Directory"), lastDir);
-
-                    if (!cacheDir.isEmpty()) {
-                        settings.setValue(viewer::NETWORK_CACHE_DIR, cacheDir);
-
-                        vc::cache::DiskStore::Config dsCfg;
-                        dsCfg.root = fs::path(cacheDir.toStdString());
-                        dsCfg.directMode = false;
-                        dsCfg.persistent = true;
-                        auto diskStore = std::make_shared<vc::cache::DiskStore>(std::move(dsCfg));
-
-                        for (const auto& volId : _state->vpkg()->volumeIDs()) {
-                            auto vol = _state->vpkg()->volume(volId);
-                            vol->setDiskStore(diskStore);
-                        }
-
-                        Logger()->info("Network cache custom dir: {} (fs: {})",
-                                       cacheDir.toStdString(), label);
-                    }
-                }
+                    tr("Detected %1 mount").arg(QString::fromStdString(label)), 8000);
+                Logger()->info("Detected network filesystem ({})", label);
             }
         }
     }
@@ -4369,6 +4616,8 @@ void CWindow::CloseVolume(void)
         _surfacePanel->resetTagUi();
     }
 
+    _remoteScroll.active = false;
+
     // Update UI
     UpdateView();
     if (treeWidgetSurfaces) {
@@ -4553,22 +4802,41 @@ void CWindow::onEditMaskPressed(void)
 
     std::filesystem::path path = surf->path/"mask.tif";
 
-    if (!std::filesystem::exists(path)) {
-        cv::Mat_<uint8_t> mask;
-        cv::Mat_<cv::Vec3f> coords; // Not used after generation
-
-        // Generate the binary mask at raw points resolution
-        render_binary_mask(surf.get(), mask, coords, 1.0f);
-
-        // Save just the mask as single layer
-        cv::imwrite(path.string(), mask);
-
-        // Update metadata
-        (*surf->meta)["date_last_modified"] = get_surface_time_str();
-        surf->save_meta();
+    // If mask already exists, just open it
+    if (std::filesystem::exists(path)) {
+        QDesktopServices::openUrl(QUrl::fromLocalFile(path.string().c_str()));
+        return;
     }
 
-    QDesktopServices::openUrl(QUrl::fromLocalFile(path.string().c_str()));
+    if (_maskRenderInProgress)
+        return;
+    _maskRenderInProgress = true;
+    ui.btnEditMask->setEnabled(false);
+    ui.btnAppendMask->setEnabled(false);
+    statusBar()->showMessage(tr("Rendering mask..."));
+
+    auto* watcher = new QFutureWatcher<void>(this);
+    connect(watcher, &QFutureWatcher<void>::finished, this,
+            [this, watcher, surf, path]() {
+                watcher->deleteLater();
+                _maskRenderInProgress = false;
+                ui.btnEditMask->setEnabled(true);
+                ui.btnAppendMask->setEnabled(true);
+
+                statusBar()->showMessage(tr("Mask saved"), 3000);
+                QDesktopServices::openUrl(QUrl::fromLocalFile(
+                    QString::fromStdString(path.string())));
+            });
+
+    watcher->setFuture(QtConcurrent::run([surf, path]() {
+        cv::Mat_<uint8_t> mask;
+        cv::Mat_<cv::Vec3f> coords;
+        render_binary_mask(surf.get(), mask, coords, 1.0f);
+        cv::imwrite(path.string(), mask);
+
+        surf->meta["date_last_modified"] = get_surface_time_str();
+        surf->save_meta();
+    }));
 }
 
 void CWindow::onAppendMaskPressed(void)
@@ -4583,80 +4851,85 @@ void CWindow::onAppendMaskPressed(void)
         return;
     }
 
+    if (_maskRenderInProgress)
+        return;
+    _maskRenderInProgress = true;
+    ui.btnEditMask->setEnabled(false);
+    ui.btnAppendMask->setEnabled(false);
+    statusBar()->showMessage(tr("Rendering mask..."));
+
     std::filesystem::path path = surf->path/"mask.tif";
+    auto volume = _state->currentVolume();
 
-    cv::Mat_<uint8_t> mask;
-    cv::Mat_<uint8_t> img;
-    std::vector<cv::Mat> existing_layers;
+    auto* watcher = new QFutureWatcher<QString>(this);
+    connect(watcher, &QFutureWatcher<QString>::finished, this,
+            [this, watcher, path]() {
+                watcher->deleteLater();
+                _maskRenderInProgress = false;
+                ui.btnEditMask->setEnabled(true);
+                ui.btnAppendMask->setEnabled(true);
 
-    vc::VcDataset* ds = _state->currentVolume()->zarrDataset(0);
+                try {
+                    QString msg = watcher->result();
+                    statusBar()->showMessage(msg, 3000);
+                    QDesktopServices::openUrl(QUrl::fromLocalFile(
+                        QString::fromStdString(path.string())));
+                } catch (const std::exception& e) {
+                    QMessageBox::critical(this, tr("Error"),
+                                         tr("Failed to render surface: %1").arg(e.what()));
+                    statusBar()->clearMessage();
+                }
+            });
 
-    try {
-        // Find the segmentation viewer and check if composite is enabled
-        // Check if mask.tif exists
+    watcher->setFuture(QtConcurrent::run([surf, volume, path]() -> QString {
+        cv::Mat_<uint8_t> mask;
+        cv::Mat_<uint8_t> img;
+        std::vector<cv::Mat> existing_layers;
+
         if (std::filesystem::exists(path)) {
-            // Load existing mask
             cv::imreadmulti(path.string(), existing_layers, cv::IMREAD_UNCHANGED);
 
-            if (existing_layers.empty()) {
-                QMessageBox::warning(this, tr("Error"), tr("Could not read existing mask file."));
-                return;
-            }
+            if (existing_layers.empty())
+                throw std::runtime_error("Could not read existing mask file.");
 
-            // Use the first layer as the mask
             mask = existing_layers[0];
             cv::Size maskSize = mask.size();
 
             {
-                // Single-layer rendering - use same approach as render_binary_mask
                 cv::Size rawSize = surf->rawPointsPtr()->size();
                 cv::Vec3f ptr(0, 0, 0);
                 cv::Vec3f offset(-rawSize.width/2.0f, -rawSize.height/2.0f, 0);
-
-                // Use surface's scale so sx = _scale/_scale = 1.0, sampling 1:1 from raw points
                 float surfScale = surf->scale()[0];
                 cv::Mat_<cv::Vec3f> coords;
                 surf->gen(&coords, nullptr, maskSize, ptr, surfScale, offset);
-
-                render_image_from_coords(coords, img, _state->currentVolume().get());
+                render_image_from_coords(coords, img, volume.get());
             }
             cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
 
-            // Append the new image layer to existing layers
             existing_layers.push_back(img);
-
-            // Save all layers
             imwritemulti(path.string(), existing_layers);
 
-            statusBar()->showMessage(
-                tr("Appended surface image to existing mask (now %1 layers)").arg(existing_layers.size()), 3000);
+            QString msg = QString("Appended surface image to existing mask (now %1 layers)")
+                              .arg(existing_layers.size());
+
+            surf->meta["date_last_modified"] = get_surface_time_str();
+            surf->save_meta();
+            return msg;
 
         } else {
-            // No existing mask, generate both mask and image at raw points resolution
             cv::Mat_<cv::Vec3f> coords;
             render_binary_mask(surf.get(), mask, coords, 1.0f);
-            cv::Size maskSize = mask.size();
-
-            render_surface_image(surf.get(), mask, img, _state->currentVolume().get(), 0, 1.0f);
+            render_surface_image(surf.get(), mask, img, volume.get(), 0, 1.0f);
             cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
 
-            // Save as new multi-layer TIFF
             std::vector<cv::Mat> layers = {mask, img};
             imwritemulti(path.string(), layers);
 
-            statusBar()->showMessage(tr("Created new surface mask with image data"), 3000);
+            surf->meta["date_last_modified"] = get_surface_time_str();
+            surf->save_meta();
+            return QString("Created new surface mask with image data");
         }
-
-        // Update metadata
-        (*surf->meta)["date_last_modified"] = get_surface_time_str();
-        surf->save_meta();
-
-        QDesktopServices::openUrl(QUrl::fromLocalFile(path.string().c_str()));
-
-    } catch (const std::exception& e) {
-        QMessageBox::critical(this, tr("Error"),
-                            tr("Failed to render surface: %1").arg(e.what()));
-    }
+    }));
 }
 
 QString CWindow::getCurrentVolumePath() const

@@ -20,7 +20,7 @@ bool nearlyEqual(float lhs, float rhs)
 
 void SegmentationModule::setDragRadius(float radiusSteps)
 {
-    const float sanitized = std::clamp(radiusSteps, 0.25f, 128.0f);
+    const float sanitized = std::clamp(radiusSteps, 0.25f, 512.0f);
     if (nearlyEqual(sanitized, _dragRadiusSteps)) {
         return;
     }
@@ -35,7 +35,7 @@ void SegmentationModule::setDragRadius(float radiusSteps)
 
 void SegmentationModule::setDragSigma(float sigmaSteps)
 {
-    const float sanitized = std::clamp(sigmaSteps, 0.05f, 64.0f);
+    const float sanitized = std::clamp(sigmaSteps, 0.05f, 256.0f);
     if (nearlyEqual(sanitized, _dragSigmaSteps)) {
         return;
     }
@@ -50,7 +50,7 @@ void SegmentationModule::setDragSigma(float sigmaSteps)
 
 void SegmentationModule::setLineRadius(float radiusSteps)
 {
-    const float sanitized = std::clamp(radiusSteps, 0.25f, 128.0f);
+    const float sanitized = std::clamp(radiusSteps, 0.25f, 512.0f);
     if (nearlyEqual(sanitized, _lineRadiusSteps)) {
         return;
     }
@@ -65,7 +65,7 @@ void SegmentationModule::setLineRadius(float radiusSteps)
 
 void SegmentationModule::setLineSigma(float sigmaSteps)
 {
-    const float sanitized = std::clamp(sigmaSteps, 0.05f, 64.0f);
+    const float sanitized = std::clamp(sigmaSteps, 0.05f, 256.0f);
     if (nearlyEqual(sanitized, _lineSigmaSteps)) {
         return;
     }
@@ -80,7 +80,7 @@ void SegmentationModule::setLineSigma(float sigmaSteps)
 
 void SegmentationModule::setPushPullRadius(float radiusSteps)
 {
-    const float sanitized = std::clamp(radiusSteps, 0.25f, 128.0f);
+    const float sanitized = std::clamp(radiusSteps, 0.25f, 512.0f);
     if (nearlyEqual(sanitized, _pushPullRadiusSteps)) {
         return;
     }
@@ -95,7 +95,7 @@ void SegmentationModule::setPushPullRadius(float radiusSteps)
 
 void SegmentationModule::setPushPullSigma(float sigmaSteps)
 {
-    const float sanitized = std::clamp(sigmaSteps, 0.05f, 64.0f);
+    const float sanitized = std::clamp(sigmaSteps, 0.05f, 256.0f);
     if (nearlyEqual(sanitized, _pushPullSigmaSteps)) {
         return;
     }
@@ -153,7 +153,7 @@ void SegmentationModule::useFalloff(FalloffTool tool)
 
 void SegmentationModule::setPushPullStepMultiplier(float multiplier)
 {
-    const float sanitized = std::clamp(multiplier, 0.05f, 40.0f);
+    const float sanitized = std::clamp(multiplier, 0.05f, 400.0f);
     if (_pushPullTool && std::fabs(sanitized - _pushPullTool->stepMultiplier()) < kFloatEpsilon) {
         if (_widget && std::fabs(_widget->pushPullStep() - sanitized) >= kFloatEpsilon) {
             _widget->setPushPullStep(sanitized);
@@ -165,6 +165,17 @@ void SegmentationModule::setPushPullStepMultiplier(float multiplier)
     }
     if (_widget && std::fabs(_widget->pushPullStep() - sanitized) >= kFloatEpsilon) {
         _widget->setPushPullStep(sanitized);
+    }
+}
+
+void SegmentationModule::setEditScale(float scale)
+{
+    const float clamped = std::clamp(scale, 0.1f, 40.0f);
+    if (_editManager) {
+        _editManager->setEditScale(clamped);
+    }
+    if (_widget && std::fabs(_widget->editScale() - clamped) >= kFloatEpsilon) {
+        _widget->setEditScale(clamped);
     }
 }
 

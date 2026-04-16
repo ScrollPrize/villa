@@ -52,6 +52,8 @@ public:
     void rebuild(const std::vector<SurfacePtr>& surfaces, float bboxPadding = 0.0f);
     void clear();
     bool empty() const;
+    size_t patchCount() const;
+    size_t surfaceCount() const;
 
     std::optional<LookupResult> locate(const cv::Vec3f& worldPoint,
                                        float tolerance,

@@ -7,6 +7,10 @@ set(srcs
     VCAppMain.cpp
     CState.cpp
     CState.hpp
+    SurfaceLRU.cpp
+    SurfaceLRU.hpp
+    RamStats.cpp
+    RamStats.hpp
     Keybinds.cpp
     Keybinds.hpp
     CWindow.cpp
@@ -107,6 +111,8 @@ set(srcs
     SurfacePanelController.hpp
     MenuActionController.cpp
     MenuActionController.hpp
+    S3BrowserDialog.cpp
+    S3BrowserDialog.hpp
     segmentation/SegmentationModule.cpp
     segmentation/SegmentationModule.hpp
     segmentation/growth/SegmentationCorrections.cpp
@@ -133,22 +139,8 @@ set(srcs
     CPointCollectionWidget.cpp
     elements/COutlinedTextItem.hpp
     elements/COutlinedTextItem.cpp
-    tiled/CTiledVolumeViewer.cpp
-    tiled/CTiledVolumeViewer.hpp
-    tiled/TiledViewerCamera.cpp
-    tiled/TiledViewerCamera.hpp
-    tiled/TileScene.cpp
-    tiled/TileScene.hpp
-    tiled/TileRenderer.cpp
-    tiled/TileRenderer.hpp
-    tiled/TileRenderController.cpp
-    tiled/TileRenderController.hpp
-    tiled/SliceCache.cpp
-    tiled/SliceCache.hpp
-    tiled/RenderPool.cpp
-    tiled/RenderPool.hpp
-    tiled/PostProcess.cpp
-    tiled/PostProcess.hpp
+    adaptive/CAdaptiveVolumeViewer.cpp
+    adaptive/CAdaptiveVolumeViewer.hpp
 )
 
 if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)
@@ -164,7 +156,6 @@ target_include_directories(VC3D
         ${CMAKE_SOURCE_DIR}/libs/edt
         ${CMAKE_SOURCE_DIR}/libs/cc3d
         ${CMAKE_SOURCE_DIR}/libs/djikstra3d
-        ${CMAKE_SOURCE_DIR}/libs/c-blosc/blosc
 )
 
 # Avahi for mDNS service discovery (Linux only)
@@ -181,7 +172,14 @@ else()
     target_compile_definitions(VC3D PRIVATE VC_HAVE_AVAHI=0)
 endif()
 
+find_package(mimalloc QUIET)
+if(mimalloc_FOUND)
+    target_compile_definitions(VC3D PRIVATE VC_HAVE_MIMALLOC=1)
+endif()
+
 target_link_libraries(VC3D
+    # mimalloc first so its symbols win malloc/free resolution.
+    $<$<BOOL:${mimalloc_FOUND}>:mimalloc>
     vc_core
     vc_ui
     vc_tracer
@@ -191,7 +189,12 @@ target_link_libraries(VC3D
     Qt6::Gui
     Qt6::Widgets
     Qt6::Network
+    Qt6::OpenGLWidgets
     opencv_ximgproc
     $<$<BOOL:${AVAHI_FOUND}>:PkgConfig::AVAHI>
     blosc_static
 )
+
+if(VC_USE_PCH)
+    target_precompile_headers(VC3D REUSE_FROM vc_core)
+endif()

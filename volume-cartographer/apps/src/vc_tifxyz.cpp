@@ -112,10 +112,10 @@ int main(int argc, char* argv[]) {
 
     // Recalculate and update the surface area
     double area = vc::surface::computeSurfaceAreaVox2(surf->rawPoints());
-    if (!surf->meta) {
-        surf->meta = std::make_unique<nlohmann::json>();
+    if (surf->meta.is_null()) {
+        surf->meta = utils::Json::object();
     }
-    (*surf->meta)["area"] = area;
+    surf->meta["area"] = area;
 
     surf->save(output_path, true);
     std::cout << "Saved transformed surface to: " << output_path << std::endl;

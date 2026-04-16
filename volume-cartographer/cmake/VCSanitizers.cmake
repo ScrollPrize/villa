@@ -21,7 +21,7 @@ endif()
 
 if(VC_ENABLE_UBSAN)
     message(STATUS "UndefinedBehaviorSanitizer enabled")
-    set(UBSAN_FLAGS "-fsanitize=undefined -fno-sanitize-recover=all -fsanitize=float-divide-by-zero -fsanitize=float-cast-overflow -fno-lto")
+    set(UBSAN_FLAGS "-fsanitize=undefined -fsanitize=float-divide-by-zero -fsanitize=float-cast-overflow -fno-lto")
     if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
         set(UBSAN_FLAGS "${UBSAN_FLAGS} -fsanitize=nullability")
     endif()

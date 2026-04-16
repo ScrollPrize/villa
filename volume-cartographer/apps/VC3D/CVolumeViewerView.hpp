@@ -8,13 +8,13 @@ class CVolumeViewerView : public QGraphicsView
     
 public:
     CVolumeViewerView(QWidget* parent = 0);
-    void mouseReleaseEvent(QMouseEvent *event);
-    void mousePressEvent(QMouseEvent *event);
-    void mouseMoveEvent(QMouseEvent *event);
-    void wheelEvent(QWheelEvent *event);
-    void scrollContentsBy(int dx, int dy);
-    void keyPressEvent(QKeyEvent *event);
-    void keyReleaseEvent(QKeyEvent *event);
+    void mouseReleaseEvent(QMouseEvent *event) override;
+    void mousePressEvent(QMouseEvent *event) override;
+    void mouseMoveEvent(QMouseEvent *event) override;
+    void wheelEvent(QWheelEvent *event) override;
+    void scrollContentsBy(int dx, int dy) override;
+    void keyPressEvent(QKeyEvent *event) override;
+    void keyReleaseEvent(QKeyEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
     /// Set physical voxel size (units per scene-unit, e.g. µm/pixel).
     /// Call this after you load your Zarr spacing metadata.
@@ -34,6 +34,7 @@ signals:
     void sendMousePress(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void sendMouseMove(QPointF, Qt::MouseButtons, Qt::KeyboardModifiers);
     void sendMouseRelease(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
+    void sendKeyPress(int key, Qt::KeyboardModifiers modifiers);
     void sendKeyRelease(int key, Qt::KeyboardModifiers modifiers);
     
 protected:
@@ -42,6 +43,13 @@ protected:
     bool _left_button_pressed = false;
     /// Draw our scalebar on every repaint
     void drawForeground(QPainter* painter, const QRectF& sceneRect) override;
+    /// Paint framebuffer directly, bypassing QGraphicsPixmapItem
+    void drawBackground(QPainter* painter, const QRectF& rect) override;
+
+public:
+    void setDirectFramebuffer(const QImage* fb) { _directFb = fb; }
+private:
+    const QImage* _directFb = nullptr;
 
  private:
     /// Round “ideal” length to 1,2 or 5 × 10^n
@@ -51,6 +59,7 @@ protected:
     double m_vx = 32.0, m_vy = 32.0;
     bool _middleButtonPanEnabled = true;
     bool _scrollPanDisabled = false;
+    int _wheelAccum = 0;  // fractional wheel delta accumulator
 
     // Scalebar cache — avoid recomputing font/text every frame
     mutable QFont _cachedFont;

@@ -6,7 +6,7 @@
 #include <optional>
 
 #include <opencv2/core/types.hpp>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include "vc/core/util/GridStore.hpp"
 
@@ -43,7 +43,7 @@ namespace vc::core::util {
         void resetCacheStats() const;
 
     public:
-        const nlohmann::json& metadata() const;
+        const utils::Json& metadata() const;
 
     private:
         struct pimpl;

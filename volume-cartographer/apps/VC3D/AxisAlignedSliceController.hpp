@@ -12,7 +12,10 @@ class QSpinBox;
 class CState;
 class ViewerManager;
 class PlaneSlicingOverlayController;
-class CTiledVolumeViewer;
+class CAdaptiveVolumeViewer;
+#ifndef CTiledVolumeViewer
+#define CTiledVolumeViewer CAdaptiveVolumeViewer
+#endif
 class Surface;
 
 class AxisAlignedSliceController : public QObject

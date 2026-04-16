@@ -1,4 +1,5 @@
 #include "support.hpp"
+#include <iostream>
 #include "spiral_ceres.hpp"
 #include "vc/core/util/LifeTime.hpp"
 

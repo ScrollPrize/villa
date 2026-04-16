@@ -10,12 +10,15 @@
 #include <opencv2/calib3d.hpp>
 #include <opencv2/imgcodecs.hpp>
 
-#include <nlohmann/json.hpp>
+#include <array>
+#include <cstring>
+#include <iostream>
 #include <system_error>
 #include <cmath>
 #include <limits>
 #include <cerrno>
 #include <algorithm>
+#include <thread>
 #include <vector>
 #include <fstream>
 #include <iomanip>
@@ -147,9 +150,10 @@ QuadSurface::QuadSurface(cv::Mat_<cv::Vec3f> *points, const cv::Vec2f &scale)
 }
 
 namespace {
-static Rect3D rect_from_json(const nlohmann::json &json)
+static Rect3D rect_from_json(const utils::Json &json)
 {
-    return {{json[0][0],json[0][1],json[0][2]},{json[1][0],json[1][1],json[1][2]}};
+    return {{json[0][0].get_float(),json[0][1].get_float(),json[0][2].get_float()},
+            {json[1][0].get_float(),json[1][1].get_float(),json[1][2].get_float()}};
 }
 } // anonymous namespace
 
@@ -158,20 +162,20 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_)
     path = path_;
     id = path_.filename().string();
     auto metaPath = path_ / "meta.json";
-    meta = std::make_unique<nlohmann::json>(vc::json::load_json_file(metaPath));
+    meta = vc::json::load_json_file(metaPath);
 
-    if (meta->contains("bbox"))
-        _bbox = rect_from_json((*meta)["bbox"]);
+    if (meta.contains("bbox"))
+        _bbox = rect_from_json(meta["bbox"]);
 
     _maskTimestamp = readMaskTimestamp(path);
     _needsLoad = true;  // Points will be loaded lazily
 }
 
-QuadSurface::QuadSurface(const std::filesystem::path &path_, const nlohmann::json &json)
+QuadSurface::QuadSurface(const std::filesystem::path &path_, const utils::Json &json)
 {
     path = path_;
     id = path_.filename().string();
-    meta = std::make_unique<nlohmann::json>(json);
+    meta = json;
 
     if (json.contains("bbox"))
         _bbox = rect_from_json(json["bbox"]);
@@ -195,6 +199,8 @@ void QuadSurface::ensureLoaded()
         return;
     }
 
+    std::fprintf(stderr, "[SURF] load %s (from %s)\n",
+                 id.c_str(), path.string().c_str());
     auto loaded = load_quad_from_tifxyz(path.string());
     if (!loaded) {
         throw std::runtime_error("Failed to load surface from: " + path.string());
@@ -207,6 +213,8 @@ void QuadSurface::ensureLoaded()
     _scale = loaded->_scale;
     _center = loaded->_center;
     _channels = std::move(loaded->_channels);
+
+    trimToValidBbox();
 
     // Keep existing bbox and meta if already set, otherwise take from loaded
     if (_bbox.low[0] == 0 && _bbox.high[0] == 0) {
@@ -294,21 +302,14 @@ cv::Vec3f QuadSurface::gridNormal(int row, int col) const
     if (row < 0 || row >= _points->rows || col < 0 || col >= _points->cols)
         return {NAN, NAN, NAN};
 
-    // Build normal cache on first access
-    if (_normalCache.empty() || _normalCache.size() != _points->size()) {
-        _normalCache.create(_points->rows, _points->cols);
-        for (int r = 0; r < _points->rows; r++) {
-            for (int c = 0; c < _points->cols; c++) {
-                if ((*_points)(r, c)[0] == -1.f) {
-                    _normalCache(r, c) = {NAN, NAN, NAN};
-                } else {
-                    _normalCache(r, c) = grid_normal(*_points, cv::Vec3f(static_cast<float>(c), static_cast<float>(r), 0.0f));
-                }
-            }
-        }
+    // Recompute on every call instead of caching the full grid (~48 MB
+    // per surface). grid_normal() is cheap (bilinear tangents + cross).
+    if ((*_points)(row, col)[0] == -1.f) {
+        return {NAN, NAN, NAN};
     }
-
-    return _normalCache(row, col);
+    return grid_normal(*_points, cv::Vec3f(static_cast<float>(col),
+                                           static_cast<float>(row),
+                                           0.0f));
 }
 
 void QuadSurface::setChannel(const std::string& name, const cv::Mat& channel)
@@ -375,6 +376,87 @@ int QuadSurface::countValidQuads() const
     return static_cast<int>(std::distance(range.begin(), range.end()));
 }
 
+bool QuadSurface::trimToValidBbox()
+{
+    if (!_points || _points->empty()) return false;
+    const int rows = _points->rows;
+    const int cols = _points->cols;
+    int r0 = rows, r1 = -1, c0 = cols, c1 = -1;
+    for (int r = 0; r < rows; r++) {
+        const cv::Vec3f* row = (*_points)[r];
+        int rc0 = cols, rc1 = -1;
+        for (int c = 0; c < cols; c++) {
+            if (row[c][0] != -1.f) {
+                if (c < rc0) rc0 = c;
+                rc1 = c;
+            }
+        }
+        if (rc1 >= 0) {
+            if (r < r0) r0 = r;
+            r1 = r;
+            if (rc0 < c0) c0 = rc0;
+            if (rc1 > c1) c1 = rc1;
+        }
+    }
+    if (r1 < 0 || c1 < 0) return false;
+    const int bbH = r1 - r0 + 1;
+    const int bbW = c1 - c0 + 1;
+    // Skip only if nothing to trim (bbox already matches grid exactly).
+    if (bbH == rows && bbW == cols) return false;
+    const std::size_t origBytes = std::size_t(rows) * cols * sizeof(cv::Vec3f);
+    const std::size_t trimBytes = std::size_t(bbH) * bbW * sizeof(cv::Vec3f);
+    const double pctSaved = 1.0 - double(trimBytes) / double(origBytes);
+    auto trimmed = std::make_unique<cv::Mat_<cv::Vec3f>>(
+        (*_points)(cv::Rect(c0, r0, bbW, bbH)).clone());
+    _points = std::move(trimmed);
+    // Shift center: after cropping by (c0, r0), the new grid index 0
+    // corresponds to the old index (c0, r0), so we must subtract.
+    _center[0] -= float(c0) / _scale[0];
+    _center[1] -= float(r0) / _scale[1];
+    _bounds = {0, 0, bbW - 1, bbH - 1};
+    _bbox = {{-1, -1, -1}, {-1, -1, -1}};  // World bbox cached, needs recompute.
+    _validMaskCache = cv::Mat_<uint8_t>();
+    _validMaskAllValid = false;
+    _normalCache = cv::Mat_<cv::Vec3f>();
+    std::fprintf(stderr,
+        "[SURF] trim %s %dx%d -> %dx%d  saved %zu MB (%.1f%%)\n",
+        id.c_str(), cols, rows, bbW, bbH,
+        (origBytes - trimBytes) / (1024 * 1024),
+        pctSaved * 100.0);
+    return true;
+}
+
+void QuadSurface::unloadPoints()
+{
+    if (path.empty()) return;  // No disk backing — can't reload.
+    std::lock_guard<std::mutex> lock(_loadMutex);
+    if (_needsLoad) return;    // Already unloaded.
+    std::size_t mb = 0;
+    if (_points) {
+        mb = static_cast<std::size_t>(_points->rows) * _points->cols
+             * sizeof(cv::Vec3f) / (1024 * 1024);
+    }
+    _points.reset();
+    _channels.clear();
+    _validMaskCache = cv::Mat_<uint8_t>();
+    _validMaskAllValid = false;
+    _normalCache = cv::Mat_<cv::Vec3f>();
+    _needsLoad = true;
+    std::fprintf(stderr, "[SURF] unload %s (%zu MB freed)\n", id.c_str(), mb);
+}
+
+void QuadSurface::unloadCaches()
+{
+    _validMaskCache = cv::Mat_<uint8_t>();
+    _validMaskAllValid = false;
+    _normalCache = cv::Mat_<cv::Vec3f>();
+    // Release loaded channel pixel data but keep the keys so channel(name)
+    // still knows which channels exist on disk and can lazy-reload them.
+    for (auto& [_, mat] : _channels) {
+        mat.release();
+    }
+}
+
 cv::Mat_<uint8_t> QuadSurface::validMask() const
 {
     const_cast<QuadSurface*>(this)->ensureLoaded();
@@ -392,15 +474,33 @@ cv::Mat_<uint8_t> QuadSurface::validMask() const
     const int cols = _points->cols;
     cv::Mat_<uint8_t> mask(rows, cols);
 
-#pragma omp parallel for schedule(dynamic, 1)
+    // Tight per-row loop:
+    //  - NaN check via self-inequality (NaN != NaN) — no math.h call, branchless.
+    //  - Sentinel check is a contiguous-byte equality against (-1, -1, -1).
+    //  - Bitwise & / | so the compiler emits straight-line NEON, no early exit.
+    // Inf is treated as valid here (was rejected by std::isfinite); coordinates
+    // never go to ±Inf in the surface pipeline, so this is a safe relaxation.
+    // Per-row "any invalid" accumulator for the all-valid fast path in
+    // gen() below. OR-reduced across threads after the loop.
+    std::vector<uint8_t> anyInvalidPerRow(rows, 0);
+#pragma omp parallel for schedule(dynamic, 16)
     for (int j = 0; j < rows; ++j) {
+        const cv::Vec3f* __restrict__ row = (*_points)[j];
+        uint8_t* __restrict__ dst = mask[j];
+        uint8_t rowAnyInvalid = 0;
         for (int i = 0; i < cols; ++i) {
-            const cv::Vec3f& p = (*_points)(j, i);
-            const bool ok = std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
-                           !(p[0] == -1.f && p[1] == -1.f && p[2] == -1.f);
-            mask(j, i) = ok ? 255 : 0;
+            const float a = row[i][0], b = row[i][1], c = row[i][2];
+            const int nan = (a != a) | (b != b) | (c != c);
+            const int sent = (a == -1.f) & (b == -1.f) & (c == -1.f);
+            const uint8_t invalid = (nan | sent) ? uint8_t(1) : uint8_t(0);
+            dst[i] = invalid ? uint8_t(0) : uint8_t(255);
+            rowAnyInvalid |= invalid;
         }
+        anyInvalidPerRow[j] = rowAnyInvalid;
     }
+    uint8_t anyInvalid = 0;
+    for (uint8_t v : anyInvalidPerRow) anyInvalid |= v;
+    _validMaskAllValid = (anyInvalid == 0);
     _validMaskCache = mask;
     return mask;
 }
@@ -437,7 +537,7 @@ void QuadSurface::invalidateCache()
 
     _bbox = {{-1, -1, -1}, {-1, -1, -1}};
     _validMaskCache = cv::Mat_<uint8_t>();
-    _normalCache = cv::Mat_<cv::Vec3f>();
+    _validMaskAllValid = false;
 }
 
 void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
@@ -479,7 +579,10 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     cv::Mat A = cv::getAffineTransform(srcf.data(), dstf.data());
 
     // --- build a source validity mask (255 if point is valid) -------------
+    // Trigger the cache build + set _validMaskAllValid before deciding
+    // whether we need the validity warp below.
     cv::Mat valid_src = validMask();
+    const bool skipValidity = _validMaskAllValid;
 
     // --- warp coords with seam-safe border (replicate) -------------------
     cv::Mat_<cv::Vec3f> coords_big;
@@ -487,61 +590,110 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
                 cv::INTER_LINEAR, cv::BORDER_REPLICATE);
 
     // --- warp validity with constant 0 (no replicate leakage) -----------
+    // Skip entirely when the source mask is all-valid: the cropped region
+    // can only contain 255s (the 4px halo that would hold 0s is discarded).
     cv::Mat valid_big;
-    cv::warpAffine(valid_src, valid_big, A, size + cv::Size(8, 8),
-                cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
+    if (!skipValidity) {
+        cv::warpAffine(valid_src, valid_big, A, size + cv::Size(8, 8),
+                    cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
+    }
 
-    // --- normals: sample on SOURCE grid -------------------
+    // --- normals: warp cached source-grid normals -------------------
     cv::Mat_<cv::Vec3f> normals_big;
     if (need_normals) {
-        normals_big.create(size + cv::Size(8, 8));
-        normals_big.setTo(cv::Vec3f(std::numeric_limits<float>::quiet_NaN(),
-                                    std::numeric_limits<float>::quiet_NaN(),
-                                    std::numeric_limits<float>::quiet_NaN()));
-        for (int j = 0; j < h; ++j) {
-            const double y = oy + (j + 4.0) * sy;
-            for (int i = 0; i < w; ++i) {
-                const double x = ox + (i + 4.0) * sx;
-                const int jj = j + 4, ii = i + 4;
-                if (valid_big.at<uint8_t>(jj, ii)) {
-                    normals_big(jj, ii) = grid_normal(*_points,
-                        cv::Vec3f(static_cast<float>(x),
-                                static_cast<float>(y),
-                                0.0f));
+        // Build source-grid normal cache once per surface. Subsequent gen()
+        // calls (panning, zooming) reuse it. Cleared by unloadCaches() when
+        // a different surface becomes active.
+        if (_normalCache.empty() || _normalCache.size() != _points->size()) {
+            _normalCache.create(_points->rows, _points->cols);
+            const cv::Vec3f qn(std::numeric_limits<float>::quiet_NaN(),
+                               std::numeric_limits<float>::quiet_NaN(),
+                               std::numeric_limits<float>::quiet_NaN());
+            const int rows = _points->rows;
+            const int cols = _points->cols;
+            // Border rows/cols: no ±1 neighbors, fill with NaN sentinel.
+            if (rows > 0) {
+                cv::Vec3f* top = _normalCache[0];
+                cv::Vec3f* bot = _normalCache[rows - 1];
+                for (int c = 0; c < cols; c++) { top[c] = qn; bot[c] = qn; }
+            }
+            #pragma omp parallel for schedule(dynamic, 16)
+            for (int r = 1; r < rows - 1; r++) {
+                cv::Vec3f* dst = _normalCache[r];
+                const cv::Vec3f* row = (*_points)[r];
+                dst[0] = qn;
+                dst[cols - 1] = qn;
+                for (int c = 1; c < cols - 1; c++) {
+                    if (row[c][0] == -1.f) {
+                        dst[c] = qn;
+                    } else {
+                        dst[c] = grid_normal_int(*_points, r, c);
+                    }
                 }
             }
         }
+        const cv::Scalar qnScalar(std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::quiet_NaN(),
+                                  std::numeric_limits<float>::quiet_NaN());
+        cv::warpAffine(_normalCache, normals_big, A, size + cv::Size(8, 8),
+                       cv::INTER_NEAREST, cv::BORDER_CONSTANT, qnScalar);
     }
 
     // --- crop away the 4px halo ----------------------------------------
+    // Take views, not clones: ref-counted buffers stay alive via the shared
+    // Mat header. Skips ~48MB/frame of memcpy for a 1920x1080 composite.
     cv::Rect inner(4, 4, w, h);
-    *coords = coords_big(inner).clone();
-    cv::Mat valid = valid_big(inner).clone();
+    *coords = coords_big(inner);
     if (need_normals) {
-        *normals = normals_big(inner).clone();
+        *normals = normals_big(inner);
     }
 
     // --- invalidate out-of-footprint pixels (kill GUI leakage) ----------
+    // When the source mask is all-valid the cropped image has no 0s, so
+    // skip the invalidation pass entirely. Otherwise walk coords + normals
+    // once together (fused vs OpenCV's valid==0 + setTo pair of passes).
     const cv::Vec3f qnan(std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN());
-    for (int j = 0; j < h; ++j) {
-        const uint8_t* mv = valid.ptr<uint8_t>(j);
-        for (int i = 0; i < w; ++i) {
-            if (!mv[i]) {
-                (*coords)(j, i) = qnan;
-                if (need_normals) (*normals)(j, i) = qnan;
+    if (!skipValidity) {
+        cv::Mat valid = valid_big(inner);
+        const bool doNormals = need_normals;
+        for (int j = 0; j < h; ++j) {
+            const uint8_t* __restrict__ v = valid.ptr<uint8_t>(j);
+            cv::Vec3f* __restrict__ crow = coords->ptr<cv::Vec3f>(j);
+            cv::Vec3f* __restrict__ nrow = doNormals
+                ? normals->ptr<cv::Vec3f>(j) : nullptr;
+            for (int i = 0; i < w; ++i) {
+                if (!v[i]) {
+                    crow[i] = qnan;
+                    if (doNormals) nrow[i] = qnan;
+                }
             }
         }
     }
 
     // --- apply offset along normals only where normals are valid --------
     if (need_normals && ul[2] != 0.0f) {
+        const float off = ul[2];
+        // Bitwise isnan: exponent all-ones + non-zero mantissa. Safe under
+        // -ffast-math which otherwise folds `x == x` to constant true.
+        auto isNanBitwise = [](float f) {
+            uint32_t bits;
+            std::memcpy(&bits, &f, sizeof(bits));
+            return (bits & 0x7F800000u) == 0x7F800000u && (bits & 0x7FFFFFu) != 0;
+        };
         for (int j = 0; j < h; ++j) {
+            // Row pointers skip cv::Mat::at()'s bounds-check overhead and
+            // let the compiler hoist the row-base arithmetic out of the
+            // inner loop. This runs per rendered pixel every frame.
+            const cv::Vec3f* nrow = normals->ptr<cv::Vec3f>(j);
+            cv::Vec3f* crow = coords->ptr<cv::Vec3f>(j);
             for (int i = 0; i < w; ++i) {
-                const cv::Vec3f n = (*normals)(j, i);
-                if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2])) {
-                    (*coords)(j, i) += n * ul[2];
+                const cv::Vec3f& n = nrow[i];
+                if (!isNanBitwise(n[0]) && !isNanBitwise(n[1]) && !isNanBitwise(n[2])) {
+                    crow[i][0] += n[0] * off;
+                    crow[i][1] += n[1] * off;
+                    crow[i][2] += n[2] * off;
                 }
             }
         }
@@ -575,9 +727,13 @@ static float search_min_loc(const cv::Mat_<E> &points, cv::Vec2f &loc, cv::Vec3f
     float best = sdist(val, tgt);
     float res;
 
-    //TODO check maybe add more search patterns, compare motion estimatino for video compression, x264/x265, ...
-    std::vector<cv::Vec2f> search = {{0,-1},{0,1},{-1,-1},{-1,0},{-1,1},{1,-1},{1,0},{1,1}};
-    // std::vector<cv::Vec2f> search = {{0,-1},{0,1},{-1,0},{1,0}};
+    // 8-neighbor search offsets: hold in a static constexpr-ish array
+    // instead of allocating a fresh vector per call. pointTo() calls
+    // this up to ~10*max_iters times per navigation click.
+    static const std::array<cv::Vec2f, 8> search = {
+        cv::Vec2f{0,-1}, cv::Vec2f{0,1},
+        cv::Vec2f{-1,-1}, cv::Vec2f{-1,0}, cv::Vec2f{-1,1},
+        cv::Vec2f{1,-1},  cv::Vec2f{1,0},  cv::Vec2f{1,1}};
     cv::Vec2f step = init_step;
 
     while (changed) {
@@ -852,6 +1008,7 @@ void QuadSurface::invalidateMask()
     // Clear from memory
     _channels.erase("mask");
     _validMaskCache = cv::Mat_<uint8_t>();
+    _validMaskAllValid = false;
 
     // Delete from disk
     if (!path.empty()) {
@@ -863,6 +1020,10 @@ void QuadSurface::invalidateMask()
 
 void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel)
 {
+    // Trim padding before serializing so the on-disk grid matches the in-RAM
+    // one. No-op if already trimmed or saving would save <25%.
+    trimToValidBbox();
+
     // Split the points matrix into x, y, z channels
     std::vector<cv::Mat> xyz;
     cv::split((*_points), xyz);
@@ -978,19 +1139,27 @@ void QuadSurface::saveSnapshot(int maxBackups)
     writeDataToDirectory(snapshot_dest, "mask");
 
     // Write metadata - create a copy so we don't modify the original
-    nlohmann::json snapshotMeta;
-    if (meta) {
-        snapshotMeta = *meta;
+    utils::Json snapshotMeta = meta;
+    {
+        auto lo = utils::Json::array();
+        lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
+        auto hi = utils::Json::array();
+        hi.push_back(bbox().high[0]); hi.push_back(bbox().high[1]); hi.push_back(bbox().high[2]);
+        auto bb = utils::Json::array();
+        bb.push_back(std::move(lo)); bb.push_back(std::move(hi));
+        snapshotMeta["bbox"] = std::move(bb);
     }
-    snapshotMeta["bbox"] = {{bbox().low[0], bbox().low[1], bbox().low[2]},
-                            {bbox().high[0], bbox().high[1], bbox().high[2]}};
     snapshotMeta["type"] = "seg";
     snapshotMeta["uuid"] = id;
     snapshotMeta["format"] = "tifxyz";
-    snapshotMeta["scale"] = {_scale[0], _scale[1]};
+    {
+        auto sc = utils::Json::array();
+        sc.push_back(_scale[0]); sc.push_back(_scale[1]);
+        snapshotMeta["scale"] = std::move(sc);
+    }
 
     std::ofstream o(snapshot_dest / "meta.json");
-    o << std::setw(4) << snapshotMeta << std::endl;
+    o << snapshotMeta.dump(4) << std::endl;
     o.close();
 
     // Copy mask.tif and generations.tif if they exist on disk
@@ -1019,8 +1188,11 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
     if (!force_overwrite && std::filesystem::exists(final_path))
         throw std::runtime_error("path already exists!");
 
-    // Save to temporary location first for atomic operation
-    std::filesystem::path temp_path = target_path.parent_path() / ".tmp" / target_path.filename();
+    // Save to temporary location first for atomic operation.
+    // Use a unique suffix so concurrent saves to the same path don't collide.
+    auto tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+    std::string tmp_dir_name = ".tmp_" + std::to_string(tid);
+    std::filesystem::path temp_path = target_path.parent_path() / tmp_dir_name / target_path.filename();
     std::filesystem::create_directories(temp_path.parent_path());
 
     // Temporarily set path for any operations that might need it
@@ -1043,18 +1215,26 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
     }
 
     // Prepare and write metadata
-    if (!meta)
-        meta = std::make_unique<nlohmann::json>();
-
-    (*meta)["bbox"] = {{bbox().low[0], bbox().low[1], bbox().low[2]},
-                       {bbox().high[0], bbox().high[1], bbox().high[2]}};
-    (*meta)["type"] = "seg";
-    (*meta)["uuid"] = uuid;
-    (*meta)["format"] = "tifxyz";
-    (*meta)["scale"] = {_scale[0], _scale[1]};
+    {
+        auto lo = utils::Json::array();
+        lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
+        auto hi = utils::Json::array();
+        hi.push_back(bbox().high[0]); hi.push_back(bbox().high[1]); hi.push_back(bbox().high[2]);
+        auto bb = utils::Json::array();
+        bb.push_back(std::move(lo)); bb.push_back(std::move(hi));
+        meta["bbox"] = std::move(bb);
+    }
+    meta["type"] = "seg";
+    meta["uuid"] = uuid;
+    meta["format"] = "tifxyz";
+    {
+        auto sc = utils::Json::array();
+        sc.push_back(_scale[0]); sc.push_back(_scale[1]);
+        meta["scale"] = std::move(sc);
+    }
 
     std::ofstream o(path / "meta.json.tmp");
-    o << std::setw(4) << (*meta) << std::endl;
+    o << meta.dump(4) << std::endl;
     o.close();
 
     // Rename to make creation atomic
@@ -1112,6 +1292,13 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
         std::filesystem::rename(temp_path, final_path);
     }
 
+    // Clean up the per-thread temp parent directory if empty
+    {
+        std::error_code ec;
+        std::filesystem::remove(temp_path.parent_path(), ec);
+        // Ignore errors - directory might not be empty or might not exist
+    }
+
     // Update the path to the final canonical location
     path = final_path;
     id = uuid;
@@ -1119,13 +1306,13 @@ void QuadSurface::save(const std::string &path_, const std::string &uuid, bool f
 
 void QuadSurface::save_meta()
 {
-    if (!meta)
+    if (meta.is_null())
         throw std::runtime_error("can't save_meta() without metadata!");
     if (path.empty())
         throw std::runtime_error("no storage path for QuadSurface");
 
     std::ofstream o(path/"meta.json.tmp");
-    o << std::setw(4) << (*meta) << std::endl;
+    o << meta.dump(4) << std::endl;
 
     //rename to make creation atomic
     std::filesystem::rename(path/"meta.json.tmp", path/"meta.json");
@@ -1274,12 +1461,8 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path, int 
     };
 
     // Read meta first (scale, uuid, etc.)
-    std::ifstream meta_f((std::filesystem::path(path)/"meta.json").string());
-    if (!meta_f.is_open() || !meta_f.good()) {
-        throw std::runtime_error("Cannot open meta.json at: " + path);
-    }
-    nlohmann::json metadata = nlohmann::json::parse(meta_f);
-    cv::Vec2f scale = {metadata["scale"][0].get<float>(), metadata["scale"][1].get<float>()};
+    auto metadata = utils::Json::parse_file(std::filesystem::path(path)/"meta.json");
+    cv::Vec2f scale = {metadata["scale"][0].get_float(), metadata["scale"][1].get_float()};
 
     auto points = std::make_unique<cv::Mat_<cv::Vec3f>>();
     int W=0, H=0;
@@ -1413,8 +1596,8 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path, int 
 
     auto surf = std::make_unique<QuadSurface>(points.release(), scale);
     surf->path = path;
-    surf->id   = metadata["uuid"];
-    surf->meta = std::make_unique<nlohmann::json>(metadata);
+    surf->id   = metadata["uuid"].get_string();
+    surf->meta = metadata;
 
     // Register extra channels lazily (left as OpenCV-based on-demand load).
     for (const auto& entry : std::filesystem::directory_iterator(path)) {
@@ -1904,11 +2087,14 @@ void QuadSurface::flipV()
 
 // Overlapping JSON file utilities
 void write_overlapping_json(const std::filesystem::path& seg_path, const std::set<std::string>& overlapping_names) {
-    nlohmann::json overlap_json;
-    overlap_json["overlapping"] = std::vector<std::string>(overlapping_names.begin(), overlapping_names.end());
+    auto overlap_json = utils::Json::object();
+    auto arr = utils::Json::array();
+    for (const auto& n : overlapping_names)
+        arr.push_back(n);
+    overlap_json["overlapping"] = std::move(arr);
 
     std::ofstream o(seg_path / "overlapping.json");
-    o << std::setw(4) << overlap_json << std::endl;
+    o << overlap_json.dump(4) << std::endl;
 }
 
 std::set<std::string> read_overlapping_json(const std::filesystem::path& seg_path) {
@@ -1916,13 +2102,11 @@ std::set<std::string> read_overlapping_json(const std::filesystem::path& seg_pat
     std::filesystem::path json_path = seg_path / "overlapping.json";
 
     if (std::filesystem::exists(json_path)) {
-        std::ifstream i(json_path);
-        nlohmann::json overlap_json;
-        i >> overlap_json;
+        auto overlap_json = utils::Json::parse_file(json_path);
 
         if (overlap_json.contains("overlapping")) {
             for (const auto& name : overlap_json["overlapping"]) {
-                overlapping.insert(name.get<std::string>());
+                overlapping.insert(name.get_string());
             }
         }
     }

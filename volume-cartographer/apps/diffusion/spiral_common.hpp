@@ -1,7 +1,7 @@
 #pragma once
 
 #include "common.hpp"
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 struct SpiralIntersection;
 
@@ -46,21 +46,8 @@ void visualize_spiral(
     bool draw_winding_text
 );
 
-inline void to_json(nlohmann::json& j, const SpiralPoint& p) {
-    j = nlohmann::json{
-        {"pos", {p.pos[0], p.pos[1], p.pos[2]}},
-        {"winding", p.winding}
-    };
-}
-
-inline void from_json(const nlohmann::json& j, SpiralPoint& p) {
-    std::vector<double> pos_vec;
-    j.at("pos").get_to(pos_vec);
-    if (pos_vec.size() == 3) {
-        p.pos = cv::Vec3d(pos_vec[0], pos_vec[1], pos_vec[2]);
-    }
-    j.at("winding").get_to(p.winding);
-}
+void to_json(utils::Json& j, const SpiralPoint& p);
+void from_json(const utils::Json& j, SpiralPoint& p);
 
 struct SpiralIntersection {
     int point_idx1;
