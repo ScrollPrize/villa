@@ -133,6 +133,9 @@ bool SegmentationOverlayController::State::operator==(const State& rhs) const
            correctionDragActive == rhs.correctionDragActive &&
            vec3fEqual(correctionDragStart, rhs.correctionDragStart) &&
            vec3fEqual(correctionDragCurrent, rhs.correctionDragCurrent) &&
+           snapDragActive == rhs.snapDragActive &&
+           vec3fEqual(snapDragStart, rhs.snapDragStart) &&
+           vec3fEqual(snapDragCurrent, rhs.snapDragCurrent) &&
            approvalMaskMode == rhs.approvalMaskMode &&
            approvalStrokeActive == rhs.approvalStrokeActive &&
            approvalStrokeSegments == rhs.approvalStrokeSegments &&
@@ -707,6 +710,33 @@ void SegmentationOverlayController::collectPrimitives(VolumeViewerBase* viewer,
         // Draw a small circle at the current (target) position
         ViewerOverlayControllerBase::OverlayStyle targetStyle;
         targetStyle.penColor = QColor(100, 255, 100);  // Green for target
+        targetStyle.brushColor = QColor(100, 255, 100, 180);
+        targetStyle.penWidth = 2.0;
+        targetStyle.z = 101.0;
+        builder.addCircle(currentScene, 8.0, true, targetStyle);
+    }
+
+    // Snap-to-boundary drag preview — same red line + start/end markers as the
+    // old correction drag.
+    if (state.snapDragActive) {
+        const QPointF startScene = viewer->volumeToScene(state.snapDragStart);
+        const QPointF currentScene = viewer->volumeToScene(state.snapDragCurrent);
+
+        ViewerOverlayControllerBase::OverlayStyle lineStyle;
+        lineStyle.penColor = QColor(255, 80, 80);
+        lineStyle.penWidth = 3.0;
+        lineStyle.z = 100.0;
+        builder.addLineStrip({startScene, currentScene}, false, lineStyle);
+
+        ViewerOverlayControllerBase::OverlayStyle anchorStyle;
+        anchorStyle.penColor = QColor(255, 200, 100);
+        anchorStyle.brushColor = QColor(255, 200, 100, 180);
+        anchorStyle.penWidth = 2.0;
+        anchorStyle.z = 101.0;
+        builder.addCircle(startScene, 8.0, true, anchorStyle);
+
+        ViewerOverlayControllerBase::OverlayStyle targetStyle;
+        targetStyle.penColor = QColor(100, 255, 100);
         targetStyle.brushColor = QColor(100, 255, 100, 180);
         targetStyle.penWidth = 2.0;
         targetStyle.z = 101.0;

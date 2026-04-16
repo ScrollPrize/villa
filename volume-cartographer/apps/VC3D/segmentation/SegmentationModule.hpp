@@ -54,6 +54,7 @@ class SegmentationLineTool;
 class SegmentationPushPullTool;
 class ApprovalMaskBrushTool;
 class CellReoptimizationTool;
+class SnapToBoundaryTool;
 
 class SegmentationModule : public QObject
 {
@@ -118,6 +119,12 @@ public:
     [[nodiscard]] float approvalBrushDepth() const { return _approvalBrushDepth; }
     [[nodiscard]] QColor approvalBrushColor() const { return _approvalBrushColor; }
     void undoApprovalStroke();
+
+    // Snap-to-boundary tool: click-drag on a misaligned intersection line in a
+    // slice viewer pushes local active-surface vertices along their normals
+    // until they land on a papyrus iso-crossing.
+    void setSnapToBoundaryMode(bool enabled);
+    [[nodiscard]] bool snapToBoundaryMode() const { return _snapToBoundaryMode; }
 
     // Cell reoptimization
     void setCellReoptimizationMode(bool enabled);
@@ -191,6 +198,7 @@ signals:
 
 private:
     friend class SegmentationLineTool;
+    friend class SnapToBoundaryTool;
     friend class SegmentationPushPullTool;
     friend class ApprovalMaskBrushTool;
     friend class SegmentationBrushTool;
@@ -370,6 +378,8 @@ private:
     std::unique_ptr<SegmentationPushPullTool> _pushPullTool;
     std::unique_ptr<ApprovalMaskBrushTool> _approvalTool;
     std::unique_ptr<CellReoptimizationTool> _cellReoptTool;
+    std::unique_ptr<SnapToBoundaryTool> _snapTool;
+    bool _snapToBoundaryMode{false};
 
     bool _showApprovalMask{false};
     bool _cellReoptMode{false};

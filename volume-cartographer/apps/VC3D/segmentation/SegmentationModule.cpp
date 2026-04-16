@@ -6,6 +6,7 @@
 #include "tools/SegmentationEditManager.hpp"
 #include "SegmentationWidget.hpp"
 #include "tools/SegmentationLineTool.hpp"
+#include "tools/SnapToBoundaryTool.hpp"
 #include "tools/SegmentationPushPullTool.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
 #include "tools/CellReoptimizationTool.hpp"
@@ -152,6 +153,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     _approvalTool = std::make_unique<ApprovalMaskBrushTool>(*this, _editManager, _widget);
 
     _cellReoptTool = std::make_unique<CellReoptimizationTool>(*this, _editManager, _overlay, _pointCollection, this);
+    _snapTool = std::make_unique<SnapToBoundaryTool>(*this, _editManager, _state);
     connect(_cellReoptTool.get(), &CellReoptimizationTool::statusMessage,
             this, [this](const QString& msg, int timeout) {
                 emit statusMessageRequested(msg, timeout);
@@ -863,6 +865,21 @@ void SegmentationModule::undoApprovalStroke()
     }
 }
 
+void SegmentationModule::setSnapToBoundaryMode(bool enabled)
+{
+    if (_snapToBoundaryMode == enabled) {
+        return;
+    }
+    _snapToBoundaryMode = enabled;
+    if (!enabled && _snapTool) {
+        _snapTool->cancel();
+    }
+    emit statusMessageRequested(
+        enabled ? tr("Snap-to-boundary: ON (click-drag intersection line in a slice viewer)")
+                : tr("Snap-to-boundary: OFF"),
+        2000);
+}
+
 void SegmentationModule::setCellReoptimizationMode(bool enabled)
 {
     if (_cellReoptMode == enabled) {
@@ -1096,6 +1113,15 @@ void SegmentationModule::refreshOverlay()
         state.correctionDragActive = true;
         state.correctionDragStart = _correctionDrag.startWorld;
         state.correctionDragCurrent = _correctionDrag.currentWorld;
+    }
+
+    if (_snapTool && _snapTool->isActive()) {
+        const auto& pts = _snapTool->previewWorldPoints();
+        if (pts.size() == 2) {
+            state.snapDragActive = true;
+            state.snapDragStart = pts[0];
+            state.snapDragCurrent = pts[1];
+        }
     }
 
     if (!hasSession) {

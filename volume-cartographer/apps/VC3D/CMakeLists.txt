@@ -84,6 +84,8 @@ set(srcs
     segmentation/tools/SegmentationTool.hpp
     segmentation/tools/SegmentationBrushTool.cpp
     segmentation/tools/SegmentationBrushTool.hpp
+    segmentation/tools/SnapToBoundaryTool.cpp
+    segmentation/tools/SnapToBoundaryTool.hpp
     segmentation/SegmentationModule_Falloff.cpp
     segmentation/SegmentationModule_Input.cpp
     segmentation/SegmentationModule_Session.cpp

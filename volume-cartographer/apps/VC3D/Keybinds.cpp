@@ -261,6 +261,14 @@ const KeyPressDef LineDrawHold{
     Qt::NoModifier,
     true
 };
+const KeyPressDef SnapToBoundaryToggle{
+    "snap_to_boundary_toggle",
+    kSectionSegEditing,
+    "Toggle snap-to-boundary tool (click-drag intersection line onto papyrus iso)",
+    Qt::Key_B,
+    Qt::NoModifier,
+    true
+};
 const KeyPressDef GrowSegmentation{
     "grow_segmentation",
     kSectionSegGrowth,
@@ -495,6 +503,7 @@ QString buildKeybindsHelpText()
 
         { kSectionSegEditing, keypress::SegmentationUndo.description, HelpKeyType::KeyPress, nullptr, &keypress::SegmentationUndo, nullptr },
         { kSectionSegEditing, keypress::LineDrawHold.description, HelpKeyType::KeyPress, nullptr, &keypress::LineDrawHold, nullptr },
+        { kSectionSegEditing, keypress::SnapToBoundaryToggle.description, HelpKeyType::KeyPress, nullptr, &keypress::SnapToBoundaryToggle, nullptr },
         { kSectionSegEditing, keypress::ToggleAnnotation.description, HelpKeyType::KeyPress, nullptr, &keypress::ToggleAnnotation, nullptr },
         { kSectionSegEditing, "Add correction point", HelpKeyType::Literal, nullptr, nullptr, "  Click" },
         { kSectionSegEditing, "Move existing correction point", HelpKeyType::Literal, nullptr, nullptr, "  Shift+Drag" },

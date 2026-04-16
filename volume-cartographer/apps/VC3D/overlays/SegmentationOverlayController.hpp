@@ -64,6 +64,11 @@ public:
         cv::Vec3f correctionDragStart{0.0f, 0.0f, 0.0f};
         cv::Vec3f correctionDragCurrent{0.0f, 0.0f, 0.0f};
 
+        // Snap-to-boundary drag state - mirrors the correction drag preview.
+        bool snapDragActive{false};
+        cv::Vec3f snapDragStart{0.0f, 0.0f, 0.0f};
+        cv::Vec3f snapDragCurrent{0.0f, 0.0f, 0.0f};
+
         // Approval mask state - cylinder brush model
         // Radius = circle in plane views (XY/XZ/YZ), rectangle width in flattened view
         // Depth = cylinder thickness, rectangle height in flattened view

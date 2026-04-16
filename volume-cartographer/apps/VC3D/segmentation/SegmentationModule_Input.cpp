@@ -8,6 +8,7 @@
 #include "tools/SegmentationEditManager.hpp"
 #include "tools/SegmentationLineTool.hpp"
 #include "tools/SegmentationPushPullTool.hpp"
+#include "tools/SnapToBoundaryTool.hpp"
 #include "SegmentationWidget.hpp"
 #include "../overlays/SegmentationOverlayController.hpp"
 #include "../Keybinds.hpp"
@@ -98,6 +99,24 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
             return true;
         }
         _lineDrawKeyActive = false;
+    }
+
+    if (event->key() == vc3d::keybinds::keypress::SnapToBoundaryToggle.key && !event->isAutoRepeat()) {
+        if (_editingEnabled && !_growthInProgress && _editManager && _editManager->hasSession()) {
+            setSnapToBoundaryMode(!_snapToBoundaryMode);
+            event->accept();
+            return true;
+        }
+        // Surface the reason the toggle was rejected so the user knows why
+        // pressing B did nothing.
+        QString why;
+        if (!_editingEnabled) why = tr("Snap-to-boundary: enable segmentation editing first.");
+        else if (_growthInProgress) why = tr("Snap-to-boundary: wait for growth to finish.");
+        else if (!_editManager) why = tr("Snap-to-boundary: no edit manager.");
+        else why = tr("Snap-to-boundary: no active segmentation session.");
+        emit statusMessageRequested(why, 2500);
+        event->accept();
+        return true;
     }
 
     if (!event->isAutoRepeat() && event->key() == vc3d::keybinds::keypress::GrowSegmentation.key &&
@@ -310,6 +329,17 @@ void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
         return;
     }
 
+    // Snap-to-boundary mode hijacks left-click drag in slice viewers.
+    if (_snapToBoundaryMode && isLeftButton && _snapTool) {
+        if (modifiers.testFlag(Qt::ControlModifier) || modifiers.testFlag(Qt::AltModifier)) {
+            return;
+        }
+        if (_snapTool->startStroke(viewer, worldPos)) {
+            refreshOverlay();
+        }
+        return;
+    }
+
     if (isLeftButton && isNearRotationHandle(viewer, worldPos)) {
         return;
     }
@@ -489,6 +519,17 @@ void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
         return;
     }
 
+    if (_snapTool && _snapTool->isActive()) {
+        if (buttons.testFlag(Qt::LeftButton)) {
+            _snapTool->extendStroke(worldPos);
+        } else {
+            // Pointer left without a release event — drop the stroke.
+            _snapTool->cancel();
+        }
+        refreshOverlay();
+        return;
+    }
+
     if (_drag.active) {
         updateDrag(worldPos);
         return;
@@ -547,6 +588,13 @@ void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
             _lineTool->extendStroke(worldPos, true);
             _lineTool->finishStroke(_lineDrawKeyActive);
         }
+        return;
+    }
+
+    if (_snapTool && _snapTool->isActive() && button == Qt::LeftButton) {
+        _snapTool->extendStroke(worldPos);
+        _snapTool->applyStroke();
+        refreshOverlay();
         return;
     }
 
