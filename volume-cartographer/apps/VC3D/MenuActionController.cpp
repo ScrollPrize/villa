@@ -145,6 +145,9 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _attachRemoteZarrAct = new QAction(QObject::tr("Attach Remote &Zarr..."), this);
     connect(_attachRemoteZarrAct, &QAction::triggered, this, &MenuActionController::attachRemoteZarr);
 
+    _attachRemoteSegmentsAct = new QAction(QObject::tr("Attach Remote &Segments..."), this);
+    connect(_attachRemoteSegmentsAct, &QAction::triggered, this, &MenuActionController::attachRemoteSegments);
+
     _browseS3Act = new QAction(QObject::tr("&Browse S3..."), this);
     connect(_browseS3Act, &QAction::triggered, this, &MenuActionController::browseS3);
 
@@ -202,6 +205,7 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addAction(_openLocalZarrAct);
     _fileMenu->addAction(_openRemoteAct);
     _fileMenu->addAction(_attachRemoteZarrAct);
+    _fileMenu->addAction(_attachRemoteSegmentsAct);
     _fileMenu->addAction(_browseS3Act);
 
     _recentMenu = new QMenu(QObject::tr("Open &recent volpkg"), _fileMenu);
@@ -578,6 +582,37 @@ void MenuActionController::browseS3()
     if (selected.isEmpty()) return;
 
     openRemoteUrl(selected, false);
+}
+
+void MenuActionController::attachRemoteSegments()
+{
+    if (!_window || !_window->_state) return;
+
+    auto volume = _window->_state->currentVolume();
+    if (!volume) {
+        QMessageBox::warning(_window,
+                             QObject::tr("No Volume Loaded"),
+                             QObject::tr("Open a remote volume first before attaching remote segments."));
+        return;
+    }
+    if (!volume->isRemote()) {
+        QMessageBox::warning(_window,
+                             QObject::tr("Not a Remote Volume"),
+                             QObject::tr("Remote segments can only be attached to a remote volume."));
+        return;
+    }
+
+    const auto auth = volume->remoteAuth();
+    // Volume::NewFromUrl stages the volume at `cacheRoot / volumeId`, and
+    // promptAndLoadRemoteSegments expects the original cacheRoot (it builds
+    // `cacheRoot / "paths" / segId` for each segment). Going up one level
+    // recovers it; if path() is already the root (shouldn't happen for
+    // remote volumes), fall back to it.
+    auto volPath = volume->path();
+    const std::string cachePath = volPath.has_parent_path()
+        ? volPath.parent_path().string()
+        : volPath.string();
+    promptAndLoadRemoteSegments(auth, cachePath);
 }
 
 void MenuActionController::attachRemoteZarr()
