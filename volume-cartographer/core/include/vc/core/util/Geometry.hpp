@@ -4,6 +4,7 @@
 
 // Geometry utility functions
 cv::Vec3f grid_normal(const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &loc);
+cv::Vec3f grid_normal(const cv::Mat_<cv::Vec3d> &points, const cv::Vec3f &loc);
 
 // Fast path for integer grid coordinates: skips bilinear interpolation
 // and uses only the four immediate ±1 neighbors. Caller must ensure

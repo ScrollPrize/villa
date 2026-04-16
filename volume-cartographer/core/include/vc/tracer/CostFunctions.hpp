@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <memory>
+#include <string>
 #include <utility>
 
 
@@ -53,7 +55,6 @@ struct NormalFitQualityWeightField {
     NormalFitQualityWeightField(const NormalFitQualityWeightField&) = delete;
     NormalFitQualityWeightField& operator=(const NormalFitQualityWeightField&) = delete;
 
-    // Canonical XYZ input.
     template <typename E>
     inline double weight_xyz(const E& x, const E& y, const E& z) const {
         const double xx = unjet(x);
@@ -63,7 +64,6 @@ struct NormalFitQualityWeightField {
     }
 
     inline double weight_xyz_d(double x, double y, double z) const {
-        // Convert canonical XYZ to dataset ZYX coordinate space.
         const double dz = z * static_cast<double>(_scale);
         const double dy = y * static_cast<double>(_scale);
         const double dx = x * static_cast<double>(_scale);
@@ -76,9 +76,7 @@ struct NormalFitQualityWeightField {
         const double rms = std::clamp(rms_u8 / 255.0, 0.0, 1.0);
         const double frac = std::clamp(frac_u8 / 255.0, 0.0, 1.0);
 
-        // rms weighting: 0 -> 1, 0.5 -> 0
         const double w_rms = std::clamp(1.0 - (rms / 0.5), 0.0, 1.0);
-        // frac-short weighting: 0 -> 1, 1 -> 0
         const double w_frac = std::clamp(1.0 - frac, 0.0, 1.0);
         return w_rms * w_frac;
     }
@@ -101,18 +99,27 @@ private:
     CachedChunked3dInterpolator<uint8_t, passTroughComputor> _interp_frac;
 };
 
+template <typename T>
+inline bool is_invalid_point(const T* const p) {
+    return val(p[0]) == -1 && val(p[1]) == -1 && val(p[2]) == -1;
+}
+
+template <typename T>
+inline T angle_diff_deg_t(const T& a_deg, const T& b_deg) {
+    const T diff_rad = (a_deg - b_deg) * T(M_PI / 180.0);
+    return atan2(sin(diff_rad), cos(diff_rad)) * T(180.0 / M_PI);
+}
+
 struct DistLoss {
     DistLoss(float dist, float w) : _d(dist), _w(w) {};
     template <typename T>
     bool operator()(const T* const a, const T* const b, T* residual) const {
-        if (val(a[0]) == -1 && val(a[1]) == -1 && val(a[2]) == -1) {
+        if (is_invalid_point(a)) {
             residual[0] = T(0);
-            std::cout << "invalid DistLoss CORNER" << std::endl;
             return true;
         }
-        if (val(b[0]) == -1 && val(b[1]) == -1 && val(b[2]) == -1) {
+        if (is_invalid_point(b)) {
             residual[0] = T(0);
-            std::cout << "invalid DistLoss CORNER" << std::endl;
             return true;
         }
 
@@ -151,14 +158,12 @@ struct DistLoss2D {
     DistLoss2D(float dist, float w) : _d(dist), _w(w) {};
     template <typename T>
     bool operator()(const T* const a, const T* const b, T* residual) const {
-        if (val(a[0]) == -1 && val(a[1]) == -1 && val(a[2]) == -1) {
+        if (is_invalid_point(a)) {
             residual[0] = T(0);
-            std::cout << "invalid DistLoss2D CORNER" << std::endl;
             return true;
         }
-        if (val(b[0]) == -1 && val(b[1]) == -1 && val(b[2]) == -1) {
+        if (is_invalid_point(b)) {
             residual[0] = T(0);
-            std::cout << "invalid DistLoss2D CORNER" << std::endl;
             return true;
         }
 
@@ -1697,5 +1702,462 @@ struct AntiFlipbackLoss {
     cv::Vec3d _anchor;
     cv::Vec3d _normal;
     double _threshold;
+    double _w;
+};
+
+// ============================================================================
+// SDT-based Ceres Cost Functions for Neural Tracer Integration
+// ============================================================================
+
+// Forward declaration for SDT field data holder
+// This struct wraps the SDT prediction data needed by the cost functions
+struct SdtFieldData {
+    const float* sdt_data;          // Pointer to SDT array data (ZYX order)
+    int sdt_shape[3];               // Shape: [D, H, W] in ZYX order
+    cv::Vec3f min_corner_xyz;       // Full-res XYZ of array origin
+    float scale_factor;             // 2^volume_scale for coordinate conversion
+    cv::Vec3f forward_dir;          // Normalized growth direction
+    cv::Vec3f center_xyz;           // Center position (for forward loss)
+    float normal_sign;              // +1 or -1 based on conditioning orientation
+
+    // Sample SDT with trilinear interpolation at world position (returns NaN if out of bounds)
+    float sample(const cv::Vec3f& world_pos_xyz) const {
+        cv::Vec3f local_fullres = world_pos_xyz - min_corner_xyz;
+        cv::Vec3f local_model = local_fullres / scale_factor;
+
+        float x = local_model[0];
+        float y = local_model[1];
+        float z = local_model[2];
+
+        int D = sdt_shape[0], H = sdt_shape[1], W = sdt_shape[2];
+        if (x < 0 || x >= W-1 || y < 0 || y >= H-1 || z < 0 || z >= D-1)
+            return std::numeric_limits<float>::quiet_NaN();
+
+        int x0 = (int)x, y0 = (int)y, z0 = (int)z;
+        int x1 = x0 + 1, y1 = y0 + 1, z1 = z0 + 1;
+        float xf = x - x0, yf = y - y0, zf = z - z0;
+
+        // Array indexing: [z][y][x] -> z*H*W + y*W + x
+        auto idx = [&](int zi, int yi, int xi) { return zi * H * W + yi * W + xi; };
+
+        float c000 = sdt_data[idx(z0, y0, x0)], c001 = sdt_data[idx(z0, y0, x1)];
+        float c010 = sdt_data[idx(z0, y1, x0)], c011 = sdt_data[idx(z0, y1, x1)];
+        float c100 = sdt_data[idx(z1, y0, x0)], c101 = sdt_data[idx(z1, y0, x1)];
+        float c110 = sdt_data[idx(z1, y1, x0)], c111 = sdt_data[idx(z1, y1, x1)];
+
+        float c00 = c000 * (1-xf) + c001 * xf;
+        float c01 = c010 * (1-xf) + c011 * xf;
+        float c10 = c100 * (1-xf) + c101 * xf;
+        float c11 = c110 * (1-xf) + c111 * xf;
+
+        float c0 = c00 * (1-yf) + c01 * yf;
+        float c1 = c10 * (1-yf) + c11 * yf;
+
+        return c0 * (1-zf) + c1 * zf;
+    }
+
+    // Compute gradient via central differences (in full-res XYZ space)
+    cv::Vec3f gradient(const cv::Vec3f& world_pos_xyz) const {
+        const float h = scale_factor;  // Step in full-res = 1 model voxel
+
+        float dx = sample(world_pos_xyz + cv::Vec3f(h,0,0)) - sample(world_pos_xyz - cv::Vec3f(h,0,0));
+        float dy = sample(world_pos_xyz + cv::Vec3f(0,h,0)) - sample(world_pos_xyz - cv::Vec3f(0,h,0));
+        float dz = sample(world_pos_xyz + cv::Vec3f(0,0,h)) - sample(world_pos_xyz - cv::Vec3f(0,0,h));
+
+        if (std::isnan(dx) || std::isnan(dy) || std::isnan(dz) ||
+            std::isinf(dx) || std::isinf(dy) || std::isinf(dz)) {
+            return cv::Vec3f(0, 0, 0);
+        }
+
+        return cv::Vec3f(dx, dy, dz) / (2 * h);
+    }
+};
+
+// ============================================================================
+// SDT Field Adapters - Make SDT data compatible with FiberDirectionLoss/NormalDirectionLoss
+// These adapters implement operator()(z, y, x) -> cv::Vec3f in ZYX order,
+// matching the interface of Chunked3dVec3fFromUint8
+// ============================================================================
+
+// Adapter for SDT gradient as normal direction field
+// Returns the normalized SDT gradient (which points normal to the surface) in ZYX order
+struct SdtNormalFieldAdapter {
+    const SdtFieldData* sdt;
+
+    explicit SdtNormalFieldAdapter(const SdtFieldData* sdt_field) : sdt(sdt_field) {}
+
+    cv::Vec3f operator()(double z, double y, double x) const {
+        if (!sdt) return cv::Vec3f(0, 0, 0);
+
+        // Convert ZYX coordinates to XYZ for SdtFieldData
+        cv::Vec3f pos_xyz(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+        cv::Vec3f grad_xyz = sdt->gradient(pos_xyz);
+
+        float len = cv::norm(grad_xyz);
+        if (len < 1e-6f) return cv::Vec3f(0, 0, 0);
+
+        // Normalize and apply sign for consistent orientation
+        cv::Vec3f normal_xyz = (sdt->normal_sign * grad_xyz) / len;
+
+        // Convert XYZ to ZYX order for return (matches Chunked3dVec3fFromUint8 convention)
+        return cv::Vec3f(normal_xyz[2], normal_xyz[1], normal_xyz[0]);
+    }
+
+    cv::Vec3f operator()(cv::Vec3d p) const {
+        return operator()(p[0], p[1], p[2]);
+    }
+};
+
+// Adapter for SDT-derived fiber direction (tangent to surface)
+// Projects a tangent hint onto the surface tangent plane (perpendicular to gradient)
+// The hint should be the expected fiber direction (e.g. from patch geometry)
+struct SdtFiberFieldAdapter {
+    const SdtFieldData* sdt;
+    cv::Vec3f tangent_hint_xyz;  // Approximate fiber direction in XYZ order
+
+    SdtFiberFieldAdapter(const SdtFieldData* sdt_field, const cv::Vec3f& hint_xyz)
+        : sdt(sdt_field), tangent_hint_xyz(hint_xyz) {}
+
+    cv::Vec3f operator()(double z, double y, double x) const {
+        if (!sdt) return cv::Vec3f(0, 0, 0);
+
+        // Convert ZYX coordinates to XYZ for SdtFieldData
+        cv::Vec3f pos_xyz(static_cast<float>(x), static_cast<float>(y), static_cast<float>(z));
+        cv::Vec3f grad_xyz = sdt->gradient(pos_xyz);
+
+        float grad_len = cv::norm(grad_xyz);
+        if (grad_len < 1e-6f) return cv::Vec3f(0, 0, 0);
+
+        // Normalize gradient to get surface normal
+        cv::Vec3f normal_xyz = grad_xyz / grad_len;
+
+        // Project hint onto tangent plane: hint - (hint . normal) * normal
+        float dot = tangent_hint_xyz.dot(normal_xyz);
+        cv::Vec3f fiber_xyz = tangent_hint_xyz - dot * normal_xyz;
+
+        float fiber_len = cv::norm(fiber_xyz);
+        if (fiber_len < 1e-6f) return cv::Vec3f(0, 0, 0);
+
+        // Normalize the fiber direction
+        fiber_xyz /= fiber_len;
+
+        // Convert XYZ to ZYX order for return
+        return cv::Vec3f(fiber_xyz[2], fiber_xyz[1], fiber_xyz[0]);
+    }
+
+    cv::Vec3f operator()(cv::Vec3d p) const {
+        return operator()(p[0], p[1], p[2]);
+    }
+};
+
+// SDT Surface Loss: Soft penalty for deviation from SDT=0 surface
+// Encourages points to lie on the predicted surface but doesn't hard-gate
+struct SdtSurfaceLoss {
+    const SdtFieldData& sdt_field;
+    double _w;
+
+    SdtSurfaceLoss(const SdtFieldData& field, double w) : sdt_field(field), _w(w) {}
+
+    template <typename T>
+    bool operator()(const T* const p, T* residual) const {
+        // Sample SDT at current point position (non-differentiable in position for sampling)
+        cv::Vec3f pos(val(p[0]), val(p[1]), val(p[2]));
+        float sdt_val = sdt_field.sample(pos);
+
+        if (std::isnan(sdt_val)) {
+            residual[0] = T(0);
+            return true;
+        }
+
+        // Soft penalty: weight * |sdt_value|
+        // Use smooth abs: sqrt(x^2 + eps) for better gradients near zero
+        residual[0] = T(_w) * T(std::abs(sdt_val));
+
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const SdtFieldData& field, double w = 1.0) {
+        return new ceres::AutoDiffCostFunction<SdtSurfaceLoss, 1, 3>(
+            new SdtSurfaceLoss(field, w));
+    }
+};
+
+// SDT Normal Loss: Aligns surface normal with SDT gradient direction
+// The sign is determined from conditioning to ensure consistent orientation
+struct SdtNormalLoss {
+    const SdtFieldData& sdt_field;
+    double _w;
+
+    SdtNormalLoss(const SdtFieldData& field, double w) : sdt_field(field), _w(w) {}
+
+    template <typename T>
+    bool operator()(const T* const l_base, const T* const l_u_off, const T* const l_v_off, T* residual) const {
+        // Compute surface normal from the three points (cross product of tangent vectors)
+        // Points are in XYZ order
+        T patch_u_disp[3] = {
+            l_u_off[0] - l_base[0],
+            l_u_off[1] - l_base[1],
+            l_u_off[2] - l_base[2]
+        };
+        T patch_v_disp[3] = {
+            l_v_off[0] - l_base[0],
+            l_v_off[1] - l_base[1],
+            l_v_off[2] - l_base[2]
+        };
+
+        // Cross product: u × v gives surface normal
+        T patch_normal[3] = {
+            patch_u_disp[1] * patch_v_disp[2] - patch_u_disp[2] * patch_v_disp[1],
+            patch_u_disp[2] * patch_v_disp[0] - patch_u_disp[0] * patch_v_disp[2],
+            patch_u_disp[0] * patch_v_disp[1] - patch_u_disp[1] * patch_v_disp[0]
+        };
+
+        T patch_normal_length = sqrt(patch_normal[0] * patch_normal[0] +
+                                      patch_normal[1] * patch_normal[1] +
+                                      patch_normal[2] * patch_normal[2] + T(1e-12));
+
+        // Sample SDT gradient at base point (non-differentiable)
+        cv::Vec3f base_pos(val(l_base[0]), val(l_base[1]), val(l_base[2]));
+        cv::Vec3f grad = sdt_field.gradient(base_pos);
+
+        float grad_len = cv::norm(grad);
+        if (grad_len < 1e-6f) {
+            residual[0] = T(0);
+            return true;
+        }
+
+        // Normalize gradient and apply sign
+        cv::Vec3f target_normal = (sdt_field.normal_sign * grad) / grad_len;
+
+        // Dot product between computed surface normal and target normal
+        // Use abs since we want alignment regardless of which way the cross product went
+        T dot = (patch_normal[0] * T(target_normal[0]) +
+                 patch_normal[1] * T(target_normal[1]) +
+                 patch_normal[2] * T(target_normal[2])) / patch_normal_length;
+
+        T abs_dot = ceres::abs(dot);
+
+        // Penalty: weight * (1 - |dot|) - zero when perfectly aligned
+        residual[0] = T(_w) * (T(1) - abs_dot);
+
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const SdtFieldData& field, double w = 1.0) {
+        return new ceres::AutoDiffCostFunction<SdtNormalLoss, 1, 3, 3, 3>(
+            new SdtNormalLoss(field, w));
+    }
+};
+
+// SDT Forward Loss: Ensures point moves forward relative to growth direction
+// Penalizes backward movement through the conditioning region
+struct SdtForwardLoss {
+    const SdtFieldData& sdt_field;
+    double _min_forward_dist;
+    double _w;
+
+    SdtForwardLoss(const SdtFieldData& field, double min_forward_dist, double w)
+        : sdt_field(field), _min_forward_dist(min_forward_dist), _w(w) {}
+
+    template <typename T>
+    bool operator()(const T* const p, T* residual) const {
+        // Compute displacement from center
+        T disp[3] = {
+            p[0] - T(sdt_field.center_xyz[0]),
+            p[1] - T(sdt_field.center_xyz[1]),
+            p[2] - T(sdt_field.center_xyz[2])
+        };
+
+        // Project onto forward direction
+        T forward_dist = disp[0] * T(sdt_field.forward_dir[0]) +
+                         disp[1] * T(sdt_field.forward_dir[1]) +
+                         disp[2] * T(sdt_field.forward_dir[2]);
+
+        // Penalty when forward_dist < min_forward_dist
+        // Use softplus for smooth gradient: log(1 + exp(-x)) where x = forward_dist - min
+        T deficit = T(_min_forward_dist) - forward_dist;
+
+        // Softplus with clamping for numerical stability
+        T softplus_val;
+        if (val(deficit) > T(20)) {
+            softplus_val = deficit;
+        } else if (val(deficit) < T(-20)) {
+            softplus_val = T(0);
+        } else {
+            softplus_val = log(T(1) + exp(deficit));
+        }
+
+        residual[0] = T(_w) * softplus_val;
+
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const SdtFieldData& field, double min_forward_dist, double w = 1.0) {
+        return new ceres::AutoDiffCostFunction<SdtForwardLoss, 1, 3>(
+            new SdtForwardLoss(field, min_forward_dist, w));
+    }
+};
+
+struct TangentOrthogonalityLossAnalytic {
+    TangentOrthogonalityLossAnalytic(const cv::Vec3f& center, double w)
+        : _center(center), _w(w) {}
+
+    template <typename T>
+    bool operator()(const T* const p_prev, const T* const p_curr, const T* const p_next, T* residual) const {
+        if (is_invalid_point(p_prev) || is_invalid_point(p_curr) || is_invalid_point(p_next)) {
+            residual[0] = T(0);
+            return true;
+        }
+
+        const T tx = p_next[0] - p_prev[0];
+        const T ty = p_next[1] - p_prev[1];
+        const T rx = p_curr[0] - T(_center[0]);
+        const T ry = p_curr[1] - T(_center[1]);
+        const T tnorm = sqrt(tx * tx + ty * ty);
+        const T rnorm = sqrt(rx * rx + ry * ry);
+        if (val(tnorm) <= 0.0 || val(rnorm) <= 0.0) {
+            residual[0] = T(0);
+            return true;
+        }
+
+        const T dot = (tx * rx + ty * ry) / (tnorm * rnorm);
+        residual[0] = T(_w) * dot;
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const cv::Vec3f& center, float w = 1.0f) {
+        return new ceres::AutoDiffCostFunction<TangentOrthogonalityLossAnalytic, 1, 3, 3, 3>(
+            new TangentOrthogonalityLossAnalytic(center, w));
+    }
+
+    cv::Vec3f _center;
+    double _w;
+};
+
+struct AngleStepLossAnalytic {
+    AngleStepLossAnalytic(const cv::Vec3f& center, double expected_dtheta_deg, double w)
+        : _center(center), _expected_dtheta_deg(expected_dtheta_deg), _w(w) {}
+
+    template <typename T>
+    bool operator()(const T* const p_prev, const T* const p_curr, T* residual) const {
+        if (is_invalid_point(p_prev) || is_invalid_point(p_curr)) {
+            residual[0] = T(0);
+            return true;
+        }
+
+        const T dx0 = p_prev[0] - T(_center[0]);
+        const T dy0 = p_prev[1] - T(_center[1]);
+        const T dx1 = p_curr[0] - T(_center[0]);
+        const T dy1 = p_curr[1] - T(_center[1]);
+
+        const T theta0 = atan2(dy0, dx0);
+        const T theta1 = atan2(dy1, dx1);
+        const T diff = atan2(sin(theta1 - theta0), cos(theta1 - theta0));
+        const T diff_deg = diff * T(180.0 / M_PI);
+
+        residual[0] = T(_w) * (diff_deg - T(_expected_dtheta_deg));
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const cv::Vec3f& center, double expected_dtheta_deg, float w = 1.0f) {
+        return new ceres::AutoDiffCostFunction<AngleStepLossAnalytic, 1, 3, 3>(
+            new AngleStepLossAnalytic(center, expected_dtheta_deg, w));
+    }
+
+    cv::Vec3f _center;
+    double _expected_dtheta_deg;
+    double _w;
+};
+
+struct RadialSlopeLossAnalytic {
+    RadialSlopeLossAnalytic(const cv::Vec3f& center,
+                            const cv::Vec3f& center_other,
+                            double expected_slope,
+                            double w)
+        : _center(center),
+          _center_other(center_other),
+          _expected_slope(expected_slope),
+          _w(w) {}
+
+    template <typename T>
+    bool operator()(const T* const p_curr, const T* const p_other, T* residual) const {
+        if (is_invalid_point(p_curr) || is_invalid_point(p_other)) {
+            residual[0] = T(0);
+            return true;
+        }
+
+        const T dx0 = p_curr[0] - T(_center[0]);
+        const T dy0 = p_curr[1] - T(_center[1]);
+        const T dx1 = p_other[0] - T(_center_other[0]);
+        const T dy1 = p_other[1] - T(_center_other[1]);
+        const T r0 = sqrt(dx0 * dx0 + dy0 * dy0);
+        const T r1 = sqrt(dx1 * dx1 + dy1 * dy1);
+        const T dz = p_other[2] - p_curr[2];
+
+        if (std::abs(val(dz)) < 1e-6) {
+            residual[0] = T(0);
+            return true;
+        }
+
+        const T slope = (r1 - r0) / dz;
+        residual[0] = T(_w) * (slope - T(_expected_slope));
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const cv::Vec3f& center,
+                                       const cv::Vec3f& center_other,
+                                       double expected_slope,
+                                       float w = 1.0f) {
+        return new ceres::AutoDiffCostFunction<RadialSlopeLossAnalytic, 1, 3, 3>(
+            new RadialSlopeLossAnalytic(center, center_other, expected_slope, w));
+    }
+
+    cv::Vec3f _center;
+    cv::Vec3f _center_other;
+    double _expected_slope;
+    double _w;
+};
+
+struct AngleColumnLossAnalytic {
+    AngleColumnLossAnalytic(const cv::Vec3f& center,
+                            double expected_theta_deg,
+                            double base_theta_offset,
+                            double w)
+        : _center(center),
+          _expected_theta_deg(expected_theta_deg),
+          _base_theta_offset(base_theta_offset),
+          _w(w) {}
+
+    template <typename T>
+    bool operator()(const T* const p, T* residual) const {
+        if (is_invalid_point(p)) {
+            residual[0] = T(0);
+            return true;
+        }
+
+        const T dx = p[0] - T(_center[0]);
+        const T dy = p[1] - T(_center[1]);
+        T theta_deg = atan2(dy, dx) * T(180.0 / M_PI);
+        if (val(theta_deg) < 0.0) {
+            theta_deg += T(360.0);
+        }
+        theta_deg += T(_base_theta_offset);
+
+        const T diff_deg = angle_diff_deg_t(theta_deg, T(_expected_theta_deg));
+        residual[0] = T(_w) * diff_deg;
+        return true;
+    }
+
+    static ceres::CostFunction* Create(const cv::Vec3f& center,
+                                       double expected_theta_deg,
+                                       double base_theta_offset,
+                                       float w = 1.0f) {
+        return new ceres::AutoDiffCostFunction<AngleColumnLossAnalytic, 1, 3>(
+            new AngleColumnLossAnalytic(center, expected_theta_deg, base_theta_offset, w));
+    }
+
+    cv::Vec3f _center;
+    double _expected_theta_deg;
+    double _base_theta_offset;
     double _w;
 };

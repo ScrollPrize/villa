@@ -34,6 +34,8 @@ add_library(vc_core
         src/Geometry.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
+        src/WrapTracking.cpp
+        src/Fringe.cpp
         src/render/AdaptiveCamera.cpp
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
@@ -145,7 +147,14 @@ endif()
 add_library(vc_flattening src/ABFFlattening.cpp)
 target_link_libraries(vc_flattening PUBLIC vc_core OpenABF)
 
-add_library(vc_tracer src/GrowPatch.cpp src/GrowSurface.cpp src/NeuralTracerConnection.cpp src/ChunkedTensor.cpp)
+add_library(vc_tracer
+        src/GrowPatch.cpp
+        src/GrowSurface.cpp
+        src/SurfaceHelpers.cpp
+        src/WrapTrackingLosses.cpp
+        src/NeuralTracerConnection.cpp
+        src/ChunkedTensor.cpp
+)
 target_link_libraries(vc_tracer PUBLIC vc_core vc_ui Ceres::ceres Qt6::Core)
 target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
 if(VC_USE_PCH)
