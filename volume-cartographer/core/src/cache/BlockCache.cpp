@@ -45,6 +45,23 @@ BlockCache::BlockCache(Config cfg)
     // Block lookups are spatially scattered — tell kernel not to read-ahead.
     ::madvise(arena_, arenaBytes_, MADV_RANDOM);
 
+    // Pre-fault arena pages in 1 GB increments on a background thread.
+    // First-touch page faults are expensive (kernel context switch per 4 KB
+    // page); when the cache fills during rendering, thousands of faults stall
+    // the decode/insert path. MADV_POPULATE_WRITE (Linux 5.14+) commits the
+    // physical pages without touching data, so they're ready when put()
+    // memcpys into them.
+    if (arenaBytes_ > 0) {
+        prefaultThread_ = std::jthread([ptr = reinterpret_cast<uint8_t*>(arena_),
+                                        total = arenaBytes_](std::stop_token stop) {
+            constexpr size_t kChunk = size_t(1) << 30;  // 1 GB
+            for (size_t off = 0; off < total && !stop.stop_requested(); off += kChunk) {
+                size_t len = std::min(kChunk, total - off);
+                ::madvise(ptr + off, len, MADV_POPULATE_WRITE);
+            }
+        });
+    }
+
     slotKey_.assign(nSlots_, kEmptyKey);
     const size_t words = (nSlots_ + 63u) / 64u;
     occupiedBits_.assign(words, 0);

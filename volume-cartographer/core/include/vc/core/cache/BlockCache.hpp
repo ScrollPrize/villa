@@ -7,6 +7,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -126,9 +127,12 @@ private:
     size_t nSlots_ = 0;
 
     // Contiguous mmap'd arena of Block objects. Virtual region is sized at
-    // startup; physical pages commit only on first touch of each slot.
+    // startup; a background thread pre-faults pages in 1 GB increments via
+    // madvise(MADV_POPULATE_WRITE) so first-touch page faults don't stall
+    // the render thread as the cache fills.
     Block* arena_ = nullptr;
     size_t arenaBytes_ = 0;
+    std::jthread prefaultThread_;
 
     // shared_mutex: get()/contains()/size() take a shared lock so the render
     // thread and the 4 worker pools can read concurrently; put()/clear()
