@@ -244,7 +244,21 @@ void CAdaptiveVolumeViewer::onSurfaceChanged(const std::string& name,
                                               const std::shared_ptr<Surface>& surf,
                                               bool /*isEditUpdate*/)
 {
-    if (_surfName != name) return;
+    const bool isCurrentSurface = (_surfName == name);
+    const bool isIntersectionTarget =
+        _intersectTgts.count(name) != 0 ||
+        (_intersectTgts.count("visible_segmentation") != 0 &&
+         (name == "segmentation" || _highlightedSurfaceIds.count(name) != 0));
+
+    if (!isCurrentSurface) {
+        if (isIntersectionTarget) {
+            invalidateIntersect(name);
+            _lastIntersectFp = {};
+            renderIntersections();
+        }
+        return;
+    }
+
     _surfWeak = surf;
     // Any surface change (swap or in-place edit) invalidates the cached
     // gen() output — geometry may have shifted.
@@ -1174,6 +1188,39 @@ constexpr std::array<QRgb, 12> kIntersectionPalette = {
     qRgb(140, 255, 220), qRgb(200, 255, 140), qRgb(255, 180, 120),
     qRgb(180, 200, 255), qRgb(255, 140, 180), qRgb(160, 255, 180),
 };
+constexpr int kIntersectionZ = 100;
+constexpr int kHighlightedIntersectionZ = 110;
+constexpr int kActiveIntersectionZ = 120;
+
+struct IntersectionStyle {
+    QRgb color = 0;
+    int z = kIntersectionZ;
+
+    bool operator==(const IntersectionStyle& other) const
+    {
+        return color == other.color && z == other.z;
+    }
+};
+
+struct IntersectionStyleHash {
+    size_t operator()(const IntersectionStyle& style) const
+    {
+        size_t h = std::hash<QRgb>{}(style.color);
+        h ^= std::hash<int>{}(style.z) + 0x9e3779b9u + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+QColor activeSegmentationColorForView(const std::string& surfName)
+{
+    if (surfName == "seg yz" || surfName == "yz plane") {
+        return QColor(Qt::yellow);
+    }
+    if (surfName == "seg xz" || surfName == "xz plane") {
+        return QColor(Qt::red);
+    }
+    return QColor(255, 140, 0);
+}
 }
 
 void CAdaptiveVolumeViewer::invalidateIntersect(const std::string&)
@@ -1241,6 +1288,8 @@ void CAdaptiveVolumeViewer::renderIntersections()
                       std::max(1, int(std::ceil(maxX - minX))),
                       std::max(1, int(std::ceil(maxY - minY)))};
 
+    auto activeSeg = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
+
     // Skip the rebuild entirely if nothing material has changed.
     IntersectFingerprint fp;
     fp.roiX = planeRoi.x;
@@ -1263,10 +1312,20 @@ void CAdaptiveVolumeViewer::renderIntersections()
     fp.patchCount = patchIndex->patchCount();
     fp.surfaceCount = patchIndex->surfaceCount();
     size_t th = 0;
+    size_t gh = 0;
     for (const auto& t : targets) {
         th ^= std::hash<const void*>{}(t.get()) + 0x9e3779b9u + (th << 6) + (th >> 2);
+        gh ^= std::hash<const void*>{}(t.get()) ^
+              (std::hash<uint64_t>{}(patchIndex->generation(t)) + 0x9e3779b9u);
     }
     fp.targetHash = th;
+    fp.targetGenerationHash = gh;
+    fp.activeSegHash = activeSeg ? std::hash<const void*>{}(activeSeg.get()) : 0;
+    size_t hh = 0;
+    for (const auto& id : _highlightedSurfaceIds) {
+        hh ^= std::hash<std::string>{}(id) + 0x9e3779b9u + (hh << 6) + (hh >> 2);
+    }
+    fp.highlightedSurfaceHash = hh;
     fp.valid = true;
     if (_lastIntersectFp == fp && !_intersectionItems.empty()) {
         return;
@@ -1277,11 +1336,11 @@ void CAdaptiveVolumeViewer::renderIntersections()
     auto intersections = patchIndex->computePlaneIntersections(*plane, planeRoi, targets);
     if (intersections.empty()) { /* kept cleared by invalidate above */ return; }
 
-    auto activeSeg = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
-
-    // Group path segments by color for batched drawing.
-    std::unordered_map<QRgb, QPainterPath> groupedPaths;
-    std::unordered_map<QRgb, QColor> groupedColors;
+    // Group path segments by draw style for batched drawing. Active
+    // segmentation gets its own z so it always renders above other
+    // intersection overlays.
+    std::unordered_map<IntersectionStyle, QPainterPath, IntersectionStyleHash> groupedPaths;
+    std::unordered_map<IntersectionStyle, QColor, IntersectionStyleHash> groupedColors;
     // Bitwise finite check: matches repo convention (see feedback_ffast_math).
     // Finite iff exponent bits are not all 1s.
     auto isFiniteScalar = [](double v) {
@@ -1304,10 +1363,13 @@ void CAdaptiveVolumeViewer::renderIntersections()
         if (!target || segments.empty()) continue;
 
         QColor baseColor;
+        int zValue = kIntersectionZ;
         if (target == activeSeg) {
-            baseColor = QColor(255, 255, 255);
+            baseColor = activeSegmentationColorForView(_surfName);
+            zValue = kActiveIntersectionZ;
         } else if (_highlightedSurfaceIds.count(target->id)) {
             baseColor = QColor(0, 220, 255);
+            zValue = kHighlightedIntersectionZ;
         } else {
             const auto& id = target->id;
             auto it = _surfaceColorAssignments.find(id);
@@ -1329,25 +1391,26 @@ void CAdaptiveVolumeViewer::renderIntersections()
             QPointF a = planeToScene(seg.world[0]);
             QPointF b = planeToScene(seg.world[1]);
             if (!isFinitePoint(a) || !isFinitePoint(b)) continue;
-            QPainterPath& path = groupedPaths[baseColor.rgba()];
+            const IntersectionStyle style{baseColor.rgba(), zValue};
+            QPainterPath& path = groupedPaths[style];
             path.moveTo(a);
             path.lineTo(b);
-            groupedColors[baseColor.rgba()] = baseColor;
+            groupedColors[style] = baseColor;
         }
     }
 
     _intersectionItems.reserve(groupedPaths.size());
-    for (const auto& [key, path] : groupedPaths) {
+    for (const auto& [style, path] : groupedPaths) {
         if (path.isEmpty()) continue;
         auto* item = new QGraphicsPathItem(path);
-        QPen pen(groupedColors[key]);
+        QPen pen(groupedColors[style]);
         pen.setWidthF(_intersectionThickness);
         pen.setCapStyle(Qt::RoundCap);
         pen.setJoinStyle(Qt::RoundJoin);
         pen.setCosmetic(true);
         item->setPen(pen);
         item->setBrush(Qt::NoBrush);
-        item->setZValue(100.0);
+        item->setZValue(style.z);
         _scene->addItem(item);
         _intersectionItems.push_back(item);
     }

@@ -597,7 +597,7 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     }
 }
 
-bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::SurfacePtr& quad, bool /*isEditUpdate*/)
+bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::SurfacePtr& quad, bool isEditUpdate)
 {
     if (!quad) {
         return false;
@@ -609,6 +609,24 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
     // Check if async rebuild is in progress
     const bool asyncRebuildInProgress = _surfacePatchIndexWatcher &&
                                         _surfacePatchIndexWatcher->isRunning();
+
+    // Editing tools queue the exact touched cells as vertices move. Flush those
+    // cells into the current index immediately so plane intersections update
+    // without turning every brush/push-pull tick into a global async rebuild.
+    if (_surfacePatchIndex.hasPendingUpdates(quad)) {
+        const bool flushed = _surfacePatchIndex.flushPendingUpdates(quad);
+        if (flushed) {
+            _indexedSurfaceIds.insert(surfId);
+            qCInfo(lcViewerManager) << "Flushed pending SurfacePatchIndex cells for"
+                                    << surfId.c_str();
+        }
+        _surfacePatchIndexNeedsRebuild = _surfacePatchIndexNeedsRebuild && !flushed;
+        return flushed;
+    }
+
+    if (isEditUpdate && alreadyIndexed) {
+        return true;
+    }
 
     if (asyncRebuildInProgress) {
         // An async rebuild is already running; tell it to re-prime when it

@@ -384,6 +384,8 @@ private:
         size_t patchCount = 0;
         size_t surfaceCount = 0;
         size_t targetHash = 0;
+        size_t activeSegHash = 0;
+        size_t highlightedSurfaceHash = 0;
         bool valid = false;
         bool operator==(const IntersectFingerprint&) const = default;
     };
