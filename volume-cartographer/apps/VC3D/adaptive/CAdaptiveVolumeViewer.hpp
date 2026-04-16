@@ -310,6 +310,9 @@ private:
     int _claheCacheTile = -1;
     double _claheCacheClip = -1.0;
     cv::Mat _rakingGx, _rakingGy;
+    // Reused gray-domain buffer for CLAHE / raking post-pass. Allocated
+    // once, resized on viewport change — avoids fbH×fbW alloc every frame.
+    cv::Mat_<uint8_t> _grayBuf;
     std::array<uint32_t, 256> _deferredCmapLut{};
     std::string _deferredCmapId;
     bool _deferredCmapValid = false;

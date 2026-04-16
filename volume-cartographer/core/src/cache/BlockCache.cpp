@@ -97,6 +97,16 @@ void BlockCache::containsBatch(const std::vector<BlockKey>& keys,
 void BlockCache::put(const BlockKey& key, const uint8_t* src) noexcept
 {
     std::unique_lock lock(mutex_);
+    putLocked(key, src);
+}
+
+void BlockCache::BatchPut::put(const BlockKey& key, const uint8_t* src) noexcept
+{
+    cache_.putLocked(key, src);
+}
+
+void BlockCache::putLocked(const BlockKey& key, const uint8_t* src) noexcept
+{
     // Degenerate config (cache size rounded below one block) — bail
     // instead of dividing by zero in the slot-assignment arithmetic.
     if (nSlots_ == 0) return;

@@ -279,7 +279,10 @@ void CAdaptiveVolumeViewer::onSurfaceChanged(const std::string& name,
         }
     }
 
-    submitRender();
+    // Coalesce rapid surface updates (e.g. paint strokes emit surfaceChanged
+    // on every edit) through the 60fps render timer. A burst of 30 edits
+    // used to fire 30 full submitRender calls; now it fires one per tick.
+    scheduleRender();
 }
 
 void CAdaptiveVolumeViewer::onSurfaceWillBeDeleted(const std::string& /*name*/,
@@ -618,7 +621,9 @@ void CAdaptiveVolumeViewer::submitRender()
     // CLAHE post-pass — runs on grayscale before any colormap is applied.
     // When a colormap is selected we also run the colormap LUT here.
     if (postGrayDomain) {
-        cv::Mat_<uint8_t> gray(fbH, fbW);
+        // Reuse the member buffer; create() is a no-op when size matches.
+        _grayBuf.create(fbH, fbW);
+        cv::Mat_<uint8_t>& gray = _grayBuf;
         for (int y = 0; y < fbH; y++) {
             const uint32_t* row = fbBits + size_t(y) * size_t(fbStride);
             uint8_t* dst = gray.ptr<uint8_t>(y);

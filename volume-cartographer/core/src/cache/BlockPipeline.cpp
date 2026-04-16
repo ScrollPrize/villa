@@ -903,6 +903,9 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
     const int baseBx = key.ix * bxN;
 
     uint8_t tmp[kBlockBytes];
+    // One unique_lock covers all 512 inserts for a 128³ canonical chunk
+    // instead of 512 separate lock/unlock pairs.
+    BlockCache::BatchPut batch(blockCache_);
     for (int bi = 0; bi < bzN; ++bi) {
         for (int bj = 0; bj < byN; ++bj) {
             for (int bk = 0; bk < bxN; ++bk) {
@@ -916,7 +919,7 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
                     }
                 }
                 BlockKey bkKey{key.level, baseBz + bi, baseBy + bj, baseBx + bk};
-                blockCache_.put(bkKey, tmp);
+                batch.put(bkKey, tmp);
             }
         }
     }

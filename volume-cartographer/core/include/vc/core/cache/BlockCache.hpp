@@ -97,12 +97,29 @@ public:
     // Insert, copying kBlockBytes from `src`. Evicts NRU entries if full.
     void put(const BlockKey& key, const uint8_t* src) noexcept;
 
+    // Scoped batch-put: take the unique_lock once, call put() many times,
+    // release on destruction. Eliminates 512 lock/unlock pairs per 128³
+    // chunk insert in the sampler hot path.
+    class BatchPut {
+    public:
+        explicit BatchPut(BlockCache& cache) noexcept
+            : cache_(cache), lock_(cache.mutex_) {}
+        BatchPut(const BatchPut&) = delete;
+        BatchPut& operator=(const BatchPut&) = delete;
+        void put(const BlockKey& key, const uint8_t* src) noexcept;
+    private:
+        BlockCache& cache_;
+        std::unique_lock<std::shared_mutex> lock_;
+    };
+
     [[nodiscard]] size_t capacity() const noexcept { return nSlots_; }
     [[nodiscard]] size_t size() const noexcept;
 
     void clear();
 
 private:
+    // Body of put()/BatchPut::put — assumes unique_lock on mutex_ is held.
+    void putLocked(const BlockKey& key, const uint8_t* src) noexcept;
     [[nodiscard]] size_t reclaimSlotLocked();
 
     Config config_;
