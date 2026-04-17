@@ -23,9 +23,11 @@ from vesuvius.neural_tracing.datasets.common import (
     ChunkPatch,
     OfflineCacheMiss,
     open_zarr,
+    open_zarr_group,
     _compute_wrap_order_stats,
     _extract_wrap_ids,
     _parse_z_range,
+    _read_volume_crop,
     _read_volume_crop_from_patch,
     _segment_overlaps_z_range,
     _trim_to_world_bbox,
@@ -414,6 +416,23 @@ def _find_patches_world_chunks(config, patch_size_zyx):
             auth_json_path=volume_auth_json, config=config,
         )
 
+        # For scale augmentation: open the zarr Group so we can access
+        # alternate pyramid levels per-sample.  Only when enabled
+        # (scale_aug_prob > 0) to avoid the extra open for normal training.
+        _vol_group = None
+        if float(config.get("scale_aug_prob", 0.0)) > 0:
+            try:
+                _vol_group = open_zarr_group(
+                    volume_path,
+                    auth_json_path=volume_auth_json, config=config,
+                )
+            except Exception as e:
+                warnings.warn(
+                    f"Could not open zarr group for scale aug "
+                    f"(dataset_idx={dataset_idx}): {e}; "
+                    f"scale augmentation disabled for this dataset."
+                )
+
         # Load and retarget segments. Per neural tracer convention, z_range
         # is specified in retargeted (volume) coordinate space — same space
         # as segments AFTER retarget — so we do NOT scale it here. Users
@@ -496,6 +515,7 @@ def _find_patches_world_chunks(config, patch_size_zyx):
                 dataset_idx=dataset_idx,
                 dataset_name=_ds_name,
                 dataset_local_idx=_local_i,
+                volume_group=_vol_group,
             ))
 
     return patches
@@ -560,6 +580,12 @@ class TifxyzLasagnaDataset(Dataset):
         )
 
         self.max_surfaces_per_patch = int(config.get("max_surfaces_per_patch", 8))
+        self.scale_aug_prob = float(config.get("scale_aug_prob", 0.0))
+        self.scale_aug_factor = int(config.get("scale_aug_factor", 2))
+        # Per-instance flag: when True, every sample uses scale aug.
+        # The train loop creates two dataset instances (one with this
+        # True, one False) and picks per-batch.
+        self.scale_aug_active = False
         # Emits per-surface raw geometry (``surface_geometry``) in the
         # __getitem__ output when True. Used by lasagna3d dataset vis to
         # draw normal arrows and per-wrap labels from the exact tensors
@@ -801,6 +827,29 @@ class TifxyzLasagnaDataset(Dataset):
         z0, z1, y0, y1, x0, x1 = patch.world_bbox
         crop_size = tuple(int(v) for v in self.patch_size_zyx)
         label_size = tuple(int(v) for v in self.label_patch_size_zyx)
+
+        # --- Scale augmentation decision ---
+        # When active, CT is read from a coarser zarr level (wider FOV,
+        # same tensor shape).  GT is computed at *original* crop_size at
+        # full res — zero extra memory.  The train loop pools GT to
+        # crop_size/f and pastes it at a random offset inside the
+        # crop_size target tensor.
+        f = 1  # effective scale factor (1 = no aug)
+        use_scale_aug = (
+            self.scale_aug_active
+            and self.scale_aug_prob > 0
+            and patch.volume_group is not None
+        )
+        _aug_arr = None
+        if use_scale_aug:
+            aug_level = patch.scale + 1
+            try:
+                _aug_arr = patch.volume_group[str(aug_level)]
+                f = self.scale_aug_factor
+            except (KeyError, IndexError):
+                use_scale_aug = False
+                f = 1
+
         # Label region origin in world coords (sized label_patch_size).
         label_min = np.array([z0, y0, x0], dtype=np.int64)
         # Place the label region inside the (larger) CT crop.
@@ -826,26 +875,38 @@ class TifxyzLasagnaDataset(Dataset):
                 [(crop_size[i] - label_size[i]) // 2 for i in range(3)],
                 dtype=np.int64,
             )
-        # CT read origin: shift so the label region lands at paste_off
-        # inside the P-sized volume we build below.
+        # GT read origin in full-res coords.
         min_corner = label_min - paste_off
         max_corner = min_corner + np.array(crop_size, dtype=np.int64)
 
-        # Read CT crop normalized to [0, 1] via uint8/255, matching the
-        # `lasagna/eval_unet_3d.tiled_infer_3d` and `train_unet_3d`
-        # input distribution. This keeps train_tifxyz training and
-        # `lasagna3d dataset vis` inference consistent with each other
-        # and with old `train_unet_3d` checkpoints.
-        vol_crop = _read_volume_crop_from_patch(
-            patch, crop_size=crop_size,
-            min_corner=min_corner, max_corner=max_corner,
-            image_normalization="unit",
-        )
+        # --- CT read ---
+        if use_scale_aug:
+            # CT from the coarser zarr level.  One voxel at level+1 =
+            # f voxels at the base level.  We read crop_size voxels
+            # covering f× the world extent, centered on the GT region.
+            gt_center = min_corner + np.array(crop_size, dtype=np.int64) // 2
+            ct_world_half = np.array(crop_size, dtype=np.int64) * f // 2
+            ct_world_min = gt_center - ct_world_half
+            ct_min = ct_world_min // f
+            ct_max = ct_min + np.array(crop_size, dtype=np.int64)
+            vol_crop = _read_volume_crop(
+                _aug_arr, crop_size=crop_size,
+                min_corner=ct_min, max_corner=ct_max,
+                image_normalization="unit",
+            )
+        else:
+            vol_crop = _read_volume_crop_from_patch(
+                patch, crop_size=crop_size,
+                min_corner=min_corner, max_corner=max_corner,
+                image_normalization="unit",
+            )
 
         # Per-patch chain info (wrap_idx → chain/pos/has_prev/has_next/label)
         chain_info_full = build_patch_chains(patch, self.max_surfaces_per_patch)
 
-        # Per-surface: voxelize mask and collect raw normals for splatting
+        # Per-surface: voxelize mask and collect raw normals for splatting.
+        # Always at crop_size in full-res coords (scale aug only affects
+        # the CT read; GT runs at original resolution).
         surface_masks = []
         all_normal_points = []
         all_normals_zyx = []
@@ -955,6 +1016,7 @@ class TifxyzLasagnaDataset(Dataset):
                 "idx": patch.dataset_local_idx,
                 "dataset_idx": patch.dataset_idx,
                 "dataset_name": patch.dataset_name,
+                "scale_aug_factor": f,
             },
         }
         if self.include_geometry:

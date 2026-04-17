@@ -85,6 +85,8 @@ for a full 6-scroll example.
 | `volume_scale` | per-dataset | yes | Resolution level in the zarr group (0 = full res) |
 | `segments_path` | per-dataset | yes | Local path to tifxyz segment directories |
 | `z_range` | per-dataset | recommended | `[z_min, z_max]` -- safe Z-slice range; excludes regions outside the scroll |
+| `scale_aug_prob` | top-level | no | Per-sample probability of scale augmentation (default `0.0` = off) |
+| `scale_aug_factor` | top-level | no | Scale augmentation downscale factor (default `2`) |
 
 ### Volume path formats
 
@@ -171,6 +173,7 @@ python lasagna/train_tifxyz.py \
 | `--wandb-entity` | None | W&B entity/user |
 | `--wandb-run-name` | None | W&B run name |
 | `--wandb-tags` | None | Comma-separated W&B tags |
+| `--no-himag-filter` | off | Disable hi-mag sample filtering entirely |
 
 ### Multi-GPU (DDP)
 
@@ -220,6 +223,43 @@ Samples with high gradient magnitude (surfaces very close together) are
 filtered using a sliding-window hysteresis: disabled when ≥75 of the last
 100 samples are above threshold, re-enabled when <50 are above. This
 prevents training from being dominated by pathological tight-surface regions.
+
+### Scale augmentation
+
+Per-batch augmentation that randomly reads CT data from a coarser zarr
+pyramid level, giving the model a wider field of view at lower effective
+resolution. GT labels (EDT, cos, grad_mag, direction) are derived at
+**full resolution** in the proportionally larger world region, then
+valid-pooled to match the CT tensor shape in the train loop. This ensures
+clean GT without thin-line artifacts from pooling masks before EDT.
+
+The decision is **per-batch** (all samples in a batch use the same scale).
+Implemented via two DataLoaders — one normal, one always scale-aug — with
+a per-step coin flip in the train loop.
+
+Enabled via config keys:
+
+```json
+{
+    "scale_aug_prob": 0.2,
+    "scale_aug_factor": 2
+}
+```
+
+| Config key | Default | Description |
+|------------|---------|-------------|
+| `scale_aug_prob` | `0.0` | Per-batch probability of applying scale augmentation (0 = off) |
+| `scale_aug_factor` | `2` | Downscale factor (2 = read from zarr level `scale+1`, 2× coarser) |
+
+When active on a batch:
+- CT is read from zarr level `scale + 1` (same tensor shape, 2× larger world region)
+- Surface masks and tensor moments are voxelized at full resolution in the
+  larger region — `compute_batch_targets` (EDT, cos, grad_mag) runs at full res
+- Final targets and masks are valid-pooled / max-pooled to `crop_size` in the
+  train loop after `compute_batch_targets`
+- The zarr Group is opened once per dataset at init (only when `scale_aug_prob > 0`)
+- Falls back to no augmentation if the target zarr level doesn't exist
+- A second dataset instance + DataLoader is created for the scale-aug path
 
 ### Read-error resilience
 

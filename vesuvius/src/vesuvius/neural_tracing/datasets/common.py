@@ -393,6 +393,65 @@ def open_zarr(path, scale=None, auth_json_path=None, config=None):
     return zarr.open(path, path=str(scale), mode='r')
 
 
+def open_zarr_group(path, auth_json_path=None, config=None):
+    """Open a zarr volume as a root Group (all pyramid levels accessible).
+
+    Same store setup as :func:`open_zarr` but returns the root
+    ``zarr.Group`` instead of a specific scale level.  Use
+    ``group[str(level)]`` to access individual pyramid arrays.
+
+    This is used for scale augmentation where we need to read from
+    multiple pyramid levels per sample.
+    """
+    import aiohttp
+
+    path = str(path)
+    config = {} if config is None else config
+
+    is_http = path.startswith(_HTTP_PREFIXES)
+    is_s3 = path.startswith('s3://')
+
+    if is_http or is_s3:
+        cache_dir = config.get('volume_cache_dir')
+        if not cache_dir:
+            raise ValueError(
+                f"Remote volume path {path!r} requires 'volume_cache_dir' in config."
+            )
+        cache_dir = str(_resolve_config_relative_path(cache_dir, config) or cache_dir)
+        offline = bool(config.get('volume_cache_offline', False))
+        retry_budget = float(config.get('volume_cache_retry_seconds', 0.0))
+
+    if is_http:
+        storage_opts = {}
+        store_exceptions = (KeyError, FileNotFoundError)
+        if auth_json_path:
+            username, password = _load_http_basic_auth(auth_json_path, config)
+            storage_opts['client_kwargs'] = {'auth': aiohttp.BasicAuth(username, password)}
+        remote = zarr.storage.FsspecStore.from_url(
+            path.rstrip('/'), storage_options=storage_opts,
+            read_only=True, allowed_exceptions=store_exceptions,
+        )
+        store = _DiskCacheStore(
+            remote, cache_dir, url=path,
+            offline=offline, retry_budget_seconds=retry_budget,
+        )
+        return zarr.open(store, mode='r')
+
+    if is_s3:
+        remote = zarr.storage.FsspecStore.from_url(
+            path.rstrip('/'), storage_options={'anon': False},
+            read_only=True,
+        )
+        store = _DiskCacheStore(
+            remote, cache_dir, url=path,
+            offline=offline, retry_budget_seconds=retry_budget,
+        )
+        return zarr.open(store, mode='r')
+
+    # Local path.
+    return zarr.open(path, mode='r')
+
+
 def _parse_z_range(z_range):
     if z_range is None:
         return None
@@ -618,24 +677,19 @@ def _compute_wrap_order_stats(wrap):
     }
 
 
-def _read_volume_crop_from_patch(patch, crop_size, min_corner, max_corner,
-                                 image_normalization: str = "zscore"):
-    """Read a CT crop and normalize it.
+def _read_volume_crop(volume_arr, crop_size, min_corner, max_corner,
+                      image_normalization: str = "zscore"):
+    """Read a CT crop from a zarr Array and normalize it.
 
-    image_normalization:
-        "zscore" — per-crop zero-mean unit-std (default; back-compat).
-        "unit"   — uint8 / 255 → float in [0, 1] (matches the existing
-                   `lasagna/eval_unet_3d.tiled_infer_3d` and
-                   `lasagna/train_unet_3d` training/inference paths,
-                   so models trained or evaluated in either pipeline
-                   see the same input distribution).
+    Args:
+        volume_arr: zarr.Array to read from (a specific pyramid level).
+        crop_size: (Z, Y, X) shape of the output crop.
+        min_corner: (3,) int64 array — ZYX origin in volume coordinates.
+        max_corner: (3,) int64 array — ZYX end (exclusive) in volume coordinates.
+        image_normalization: ``"zscore"`` or ``"unit"`` (uint8/255).
     """
-    volume = patch.volume
-    if isinstance(volume, zarr.Group):
-        volume = volume[str(patch.scale)]
-
-    vol_crop = np.zeros(crop_size, dtype=volume.dtype)
-    vol_shape = volume.shape
+    vol_crop = np.zeros(crop_size, dtype=volume_arr.dtype)
+    vol_shape = volume_arr.shape
     src_starts = np.maximum(min_corner, 0)
     src_ends = np.minimum(max_corner, np.array(vol_shape, dtype=np.int64))
     dst_starts = src_starts - min_corner
@@ -646,7 +700,7 @@ def _read_volume_crop_from_patch(patch, crop_size, min_corner, max_corner,
             dst_starts[0]:dst_ends[0],
             dst_starts[1]:dst_ends[1],
             dst_starts[2]:dst_ends[2],
-        ] = volume[
+        ] = volume_arr[
             src_starts[0]:src_ends[0],
             src_starts[1]:src_ends[1],
             src_starts[2]:src_ends[2],
@@ -660,6 +714,20 @@ def _read_volume_crop_from_patch(patch, crop_size, min_corner, max_corner,
         f"Unknown image_normalization '{image_normalization}' "
         f"(expected 'zscore' or 'unit')."
     )
+
+
+def _read_volume_crop_from_patch(patch, crop_size, min_corner, max_corner,
+                                 image_normalization: str = "zscore"):
+    """Read a CT crop from a patch's volume and normalize it.
+
+    Thin wrapper around :func:`_read_volume_crop` that resolves the zarr
+    Array from ``patch.volume`` / ``patch.scale``.
+    """
+    volume = patch.volume
+    if isinstance(volume, zarr.Group):
+        volume = volume[str(patch.scale)]
+    return _read_volume_crop(volume, crop_size, min_corner, max_corner,
+                             image_normalization)
 
 
 def _validate_result_tensors(result: dict, idx: int, enabled: bool):
@@ -1186,6 +1254,7 @@ class ChunkPatch:
     dataset_idx: int = -1                  # index into config["datasets"] (-1 = unknown)
     dataset_name: str = ""                 # human-readable dataset name
     dataset_local_idx: int = -1            # per-dataset patch index (stable within a cache)
+    volume_group: Any = None               # zarr.Group for multi-level access (scale augmentation)
 
     @property
     def wrap_count(self) -> int:

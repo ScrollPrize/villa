@@ -6,6 +6,8 @@
     "overlap_fraction": 0.25,
     "chunk_pad": 20.0,
     "same_surface_threshold": 2.0,
+    "scale_aug_prob": 0.5,
+    "scale_aug_factor": 2,
     "datasets": [
         {
             "__volume_path": "s3://volpkgs/PHerc0139.volpkg/volumes/2um_ds2_raw.zarr/",

@@ -623,7 +623,7 @@ def derive_cos_gradmag_validity(
             # use_prev and use_next branches.
             frac = d_lo / (spacing + 1e-6)
             cos_full = 0.5 + 0.5 * torch.cos(2.0 * math.pi * frac)
-            grad_mag_full = 1.0 / (spacing + 1e-6)
+            grad_mag_full = (1.0 / (spacing + 1e-6)).clamp(max=0.5)
 
             cos_out = torch.where(local_valid, cos_full, cos_out)
             grad_mag_out = torch.where(local_valid, grad_mag_full, grad_mag_out)

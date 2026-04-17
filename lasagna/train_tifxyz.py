@@ -847,6 +847,24 @@ def train(
     train_dataset = Subset(full_dataset, train_indices)
     val_dataset = Subset(full_dataset, val_indices)
 
+    # Scale augmentation: second dataset instance with scale_aug_active.
+    # GT is emitted at 2× resolution; pooling happens in the train loop
+    # AFTER compute_batch_targets so EDT/cos run at full res.
+    scale_aug_enabled = full_dataset.scale_aug_prob > 0
+    scale_aug_factor = full_dataset.scale_aug_factor
+    train_dataset_aug = None
+    if scale_aug_enabled:
+        if is_main:
+            print(f"{TAG} building scale-aug dataset (f={scale_aug_factor})...",
+                  flush=True)
+        full_dataset_aug = TifxyzLasagnaDataset(
+            config, apply_augmentation=False,
+            include_geometry=True,
+            include_patch_ref=True,
+        )
+        full_dataset_aug.scale_aug_active = True
+        train_dataset_aug = Subset(full_dataset_aug, train_indices)
+
     if is_dist:
         train_sampler = DistributedSampler(
             train_dataset, num_replicas=world_size, rank=rank,
@@ -861,6 +879,17 @@ def train(
             num_workers=num_workers, pin_memory=True,
             collate_fn=collate_variable_surfaces,
         )
+        if train_dataset_aug is not None:
+            train_sampler_aug = DistributedSampler(
+                train_dataset_aug, num_replicas=world_size, rank=rank,
+                shuffle=True, drop_last=True,
+            )
+            train_loader_aug = DataLoader(
+                train_dataset_aug, batch_size=batch_size,
+                sampler=train_sampler_aug,
+                num_workers=num_workers, pin_memory=True,
+                collate_fn=collate_variable_surfaces,
+            )
         val_loader = DataLoader(
             val_dataset, batch_size=1, sampler=val_sampler,
             num_workers=num_workers,
@@ -874,14 +903,21 @@ def train(
             num_workers=num_workers, pin_memory=True,
             collate_fn=collate_variable_surfaces,
         )
+        if train_dataset_aug is not None:
+            train_loader_aug = DataLoader(
+                train_dataset_aug, batch_size=batch_size, shuffle=True,
+                num_workers=num_workers, pin_memory=True,
+                collate_fn=collate_variable_surfaces,
+            )
         val_loader = DataLoader(
             val_dataset, batch_size=1, shuffle=False,
             num_workers=num_workers,
             collate_fn=collate_variable_surfaces,
         )
     if is_main:
+        aug_str = f" (scale_aug f={scale_aug_factor})" if scale_aug_enabled else ""
         print(f"{TAG} {n_train} train / {n_val} val patches "
-              f"(world_size={world_size})", flush=True)
+              f"(world_size={world_size}){aug_str}", flush=True)
 
     # Model
     model, norm_type, upsample_mode = build_model(
@@ -1095,24 +1131,58 @@ def train(
             train_sampler.set_epoch(epoch)
         epoch_losses: List[float] = []
 
+        # Two-iterator setup for per-batch scale augmentation.
+        iter_normal = iter(train_loader)
+        iter_aug = None
+        if scale_aug_enabled:
+            if is_dist and hasattr(train_loader_aug, 'sampler'):
+                train_loader_aug.sampler.set_epoch(epoch)
+            iter_aug = iter(train_loader_aug)
+        steps_per_epoch = len(train_loader)
+
         if is_main:
             train_iter = tqdm(
-                train_loader,
+                range(steps_per_epoch),
                 desc=f"epoch {epoch + 1}/{epochs} train",
                 dynamic_ncols=True,
                 mininterval=0.0, miniters=1,
             )
         else:
-            train_iter = train_loader
+            train_iter = range(steps_per_epoch)
 
         n_seen = 0
         n_skipped = 0
         n_read_err = 0
         n_hi_mag = 0
+        n_scale_aug = 0
         n_surfaces_pre = 0
         n_surfaces_post = 0
 
-        for batch in train_iter:
+        for _step_i in train_iter:
+            # Per-batch scale-aug decision.  In DDP all ranks must
+            # agree, so rank 0 draws and broadcasts.
+            if scale_aug_enabled:
+                if is_dist:
+                    flag = torch.zeros(1, dtype=torch.long, device=device)
+                    if rank == 0:
+                        flag[0] = int(np.random.random() < full_dataset.scale_aug_prob)
+                    dist.broadcast(flag, src=0)
+                    use_aug = bool(flag.item())
+                else:
+                    use_aug = np.random.random() < full_dataset.scale_aug_prob
+            else:
+                use_aug = False
+
+            if use_aug:
+                batch = next(iter_aug, None)
+                if batch is None:
+                    iter_aug = iter(train_loader_aug)
+                    batch = next(iter_aug, None)
+            else:
+                batch = next(iter_normal, None)
+                if batch is None:
+                    iter_normal = iter(train_loader)
+                    batch = next(iter_normal, None)
             # All samples this rank raised in __getitem__ (transient
             # zarr/S3 read errors). Coordinate with other ranks so
             # that if ANY rank is empty, all skip this step.
@@ -1152,7 +1222,61 @@ def train(
                 same_surface_threshold=same_surface_threshold,
             )
 
+            # Scale aug: pool GT from crop_size → crop_size/f, then paste
+            # into a crop_size-shaped tensor at a random offset.  The
+            # surrounding region has validity=0 → unsupervised context.
+            if use_aug:
+                sf = scale_aug_factor
+                v = validity  # (B, 1, Z, Y, X)
+                v_count = F.avg_pool3d(v, kernel_size=sf, stride=sf)
+
+                # Valid-pool value tensors (avg only over valid voxels).
+                tgt_sm = (
+                    F.avg_pool3d(targets * v, sf, sf)
+                    / v_count.clamp(min=1e-8)
+                )
+                daw_sm = (
+                    F.avg_pool3d(dir_axis_weight * v, sf, sf)
+                    / v_count.clamp(min=1e-8)
+                )
+                # Max-pool binary masks (any-valid / any-present).
+                val_sm = F.max_pool3d(v, sf, sf)
+                dsp_sm = F.max_pool3d(dir_sparse_mask, sf, sf)
+                ddn_sm = F.max_pool3d(dir_dense_mask, sf, sf)
+
+                # Paste pooled block at a random offset inside
+                # crop_size-shaped tensors. Same concept as
+                # label_patch_size < patch_size.
+                sm_shape = tgt_sm.shape[2:]  # (Z/f, Y/f, X/f)
+                full_shape = image.shape[2:]  # (Z, Y, X) = crop_size
+                off = [
+                    int(np.random.randint(0, full_shape[d] - sm_shape[d] + 1))
+                    for d in range(3)
+                ]
+                sz, sy, sx = (
+                    slice(off[0], off[0] + sm_shape[0]),
+                    slice(off[1], off[1] + sm_shape[1]),
+                    slice(off[2], off[2] + sm_shape[2]),
+                )
+
+                B_ = image.shape[0]
+                targets      = torch.zeros(B_, 8, *full_shape, device=device)
+                validity     = torch.zeros(B_, 1, *full_shape, device=device)
+                dir_sparse_mask = torch.zeros(B_, 1, *full_shape, device=device)
+                dir_dense_mask  = torch.zeros(B_, 1, *full_shape, device=device)
+                dir_axis_weight = torch.zeros(B_, 6, *full_shape, device=device)
+
+                targets[:, :, sz, sy, sx]         = tgt_sm
+                validity[:, :, sz, sy, sx]        = val_sm
+                dir_sparse_mask[:, :, sz, sy, sx] = dsp_sm
+                dir_dense_mask[:, :, sz, sy, sx]  = ddn_sm
+                dir_axis_weight[:, :, sz, sy, sx] = daw_sm
+
+                del tgt_sm, val_sm, dsp_sm, ddn_sm, daw_sm
+                n_scale_aug += 1
+
             n_seen += 1
+            B = batch["image"].shape[0]
             for mg in _merge_groups:
                 n_surfaces_pre += len(mg)
                 n_surfaces_post += len(set(int(x) for x in mg))
@@ -1364,7 +1488,7 @@ def train(
 
             running = sum(epoch_losses[-20:]) / min(len(epoch_losses), 20)
             if is_main:
-                train_iter.set_postfix(
+                postfix = dict(
                     loss=f"{loss.item():.4f}",
                     avg20=f"{running:.4f}",
                     skip=f"{100.0 * n_skipped / max(n_seen, 1):.1f}%",
@@ -1373,6 +1497,9 @@ def train(
                     hifilt="on" if himag_enabled else "OFF",
                     merge=f"{100.0 * (1.0 - n_surfaces_post / max(n_surfaces_pre, 1)):.1f}%",
                 )
+                if n_scale_aug > 0:
+                    postfix["saug"] = n_scale_aug
+                train_iter.set_postfix(**postfix)
 
             if global_step % 10 == 0:
                 log_scalar("train/loss", loss.item(), global_step)
@@ -1393,6 +1520,13 @@ def train(
                     global_step,
                 )
                 log_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+                if n_scale_aug > 0:
+                    total_samples = n_seen * B
+                    log_scalar(
+                        "train/scale_aug_frac",
+                        n_scale_aug / max(total_samples, 1),
+                        global_step,
+                    )
 
             if global_step % 100 == 0:
                 _log_vis(log_images, "train", image, pred, targets, cos_mask, global_step)
