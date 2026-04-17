@@ -6,6 +6,7 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/render/PostProcess.hpp"
 #include "vc/core/util/Slicing.hpp"
@@ -1111,6 +1112,23 @@ void CAdaptiveVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton bu
 void CAdaptiveVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button,
                                           Qt::KeyboardModifiers modifiers)
 {
+    if (_bboxMode && _surfName == "segmentation") {
+        if (button == Qt::LeftButton) {
+            auto surf = _surfWeak.lock();
+            if (!dynamic_cast<QuadSurface*>(surf.get())) {
+                return;
+            }
+            const cv::Vec2f sp = sceneToSurface(scenePos);
+            if (!std::isfinite(sp[0]) || !std::isfinite(sp[1])) {
+                return;
+            }
+            _bboxStartSurf = QPointF(sp[0], sp[1]);
+            _activeBBoxSurfRect = QRectF(_bboxStartSurf, _bboxStartSurf).normalized();
+            emit overlaysUpdated();
+        }
+        return;
+    }
+
     cv::Vec3f p = sceneToVolume(scenePos);
     cv::Vec3f n(0, 0, 1);
     emit sendMousePressVolume(p, n, button, modifiers);
@@ -1119,6 +1137,24 @@ void CAdaptiveVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton butto
 void CAdaptiveVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons buttons,
                                          Qt::KeyboardModifiers modifiers)
 {
+    if (_bboxMode && _surfName == "segmentation") {
+        _lastScenePos = scenePos;
+        if (_activeBBoxSurfRect && (buttons & Qt::LeftButton)) {
+            auto surf = _surfWeak.lock();
+            if (!dynamic_cast<QuadSurface*>(surf.get())) {
+                return;
+            }
+            const cv::Vec2f sp = sceneToSurface(scenePos);
+            if (!std::isfinite(sp[0]) || !std::isfinite(sp[1])) {
+                return;
+            }
+            const QPointF cur(sp[0], sp[1]);
+            _activeBBoxSurfRect = QRectF(_bboxStartSurf, cur).normalized();
+            emit overlaysUpdated();
+        }
+        return;
+    }
+
     cv::Vec3f p = sceneToVolume(scenePos);
     emit sendMouseMoveVolume(p, buttons, modifiers);
 }
@@ -1126,6 +1162,18 @@ void CAdaptiveVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons butto
 void CAdaptiveVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton button,
                                             Qt::KeyboardModifiers modifiers)
 {
+    if (_bboxMode && _surfName == "segmentation") {
+        if (button == Qt::LeftButton && _activeBBoxSurfRect) {
+            const QRectF rSurf = _activeBBoxSurfRect->normalized();
+            const int idx = static_cast<int>(_selections.size());
+            const QColor color = QColor::fromHsv((idx * 53) % 360, 200, 255);
+            _selections.push_back({rSurf, color});
+            _activeBBoxSurfRect.reset();
+            emit overlaysUpdated();
+        }
+        return;
+    }
+
     cv::Vec3f p = sceneToVolume(scenePos);
     emit sendMouseReleaseVolume(p, button, modifiers);
 }
@@ -1167,6 +1215,39 @@ cv::Vec2f CAdaptiveVolumeViewer::sceneToSurface(const QPointF& scenePos) const
     float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
     return {(static_cast<float>(vp.x()) - vpCx) / _camScale + _camSurfX,
             (static_cast<float>(vp.y()) - vpCy) / _camScale + _camSurfY};
+}
+
+QRectF CAdaptiveVolumeViewer::surfaceRectToSceneRect(const QRectF& surfRect) const
+{
+    const QRectF r = surfRect.normalized();
+    return QRectF(surfaceToScene(static_cast<float>(r.left()), static_cast<float>(r.top())),
+                  surfaceToScene(static_cast<float>(r.right()), static_cast<float>(r.bottom())))
+        .normalized();
+}
+
+QRectF CAdaptiveVolumeViewer::sceneRectToSurfaceRect(const QRectF& sceneRect) const
+{
+    const QRectF r = sceneRect.normalized();
+    const std::array<QPointF, 4> corners = {
+        r.topLeft(),
+        r.topRight(),
+        r.bottomLeft(),
+        r.bottomRight(),
+    };
+
+    float minX = std::numeric_limits<float>::max();
+    float minY = std::numeric_limits<float>::max();
+    float maxX = std::numeric_limits<float>::lowest();
+    float maxY = std::numeric_limits<float>::lowest();
+    for (const auto& corner : corners) {
+        const cv::Vec2f sp = sceneToSurface(corner);
+        minX = std::min(minX, sp[0]);
+        minY = std::min(minY, sp[1]);
+        maxX = std::max(maxX, sp[0]);
+        maxY = std::max(maxY, sp[1]);
+    }
+
+    return QRectF(QPointF(minX, minY), QPointF(maxX, maxY)).normalized();
 }
 
 QPointF CAdaptiveVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
@@ -1237,6 +1318,175 @@ void CAdaptiveVolumeViewer::updateFocusMarker(POI* poi)
 cv::Vec2f CAdaptiveVolumeViewer::sceneToSurfaceCoords(const QPointF& scenePos) const
 {
     return sceneToSurface(scenePos);
+}
+
+void CAdaptiveVolumeViewer::setBBoxMode(bool enabled)
+{
+    _bboxMode = enabled;
+    if (!enabled && _activeBBoxSurfRect) {
+        _activeBBoxSurfRect.reset();
+        emit overlaysUpdated();
+    }
+}
+
+std::optional<QRectF> CAdaptiveVolumeViewer::activeBBoxSceneRect() const
+{
+    if (!_activeBBoxSurfRect) {
+        return std::nullopt;
+    }
+    return surfaceRectToSceneRect(*_activeBBoxSurfRect);
+}
+
+auto CAdaptiveVolumeViewer::selections() const -> std::vector<std::pair<QRectF, QColor>>
+{
+    std::vector<std::pair<QRectF, QColor>> out;
+    out.reserve(_selections.size());
+    for (const auto& selection : _selections) {
+        out.emplace_back(surfaceRectToSceneRect(selection.surfRect), selection.color);
+    }
+    return out;
+}
+
+void CAdaptiveVolumeViewer::clearSelections()
+{
+    if (_selections.empty() && !_activeBBoxSurfRect) {
+        return;
+    }
+    _selections.clear();
+    _activeBBoxSurfRect.reset();
+    emit overlaysUpdated();
+}
+
+QuadSurface* CAdaptiveVolumeViewer::makeBBoxFilteredSurfaceFromSceneRect(const QRectF& sceneRect)
+{
+    if (_surfName != "segmentation") {
+        return nullptr;
+    }
+
+    auto surf = _surfWeak.lock();
+    auto* quad = dynamic_cast<QuadSurface*>(surf.get());
+    if (!quad) {
+        return nullptr;
+    }
+
+    const cv::Mat_<cv::Vec3f>* srcPtr = quad->rawPointsPtr();
+    if (!srcPtr || srcPtr->empty()) {
+        return nullptr;
+    }
+    const cv::Mat_<cv::Vec3f>& src = *srcPtr;
+    const int height = src.rows;
+    const int width = src.cols;
+
+    QRectF rSurf = sceneRectToSurfaceRect(sceneRect).normalized();
+    if (!std::isfinite(rSurf.left()) || !std::isfinite(rSurf.top()) ||
+        !std::isfinite(rSurf.right()) || !std::isfinite(rSurf.bottom())) {
+        return nullptr;
+    }
+
+    const double cx = width * 0.5;
+    const double cy = height * 0.5;
+    const cv::Vec2f scale = quad->scale();
+    if (scale[0] == 0.0f || scale[1] == 0.0f) {
+        return nullptr;
+    }
+
+    int i0 = std::max(0, static_cast<int>(std::floor(cx + rSurf.left() * scale[0])));
+    int i1 = std::min(width - 1, static_cast<int>(std::ceil(cx + rSurf.right() * scale[0])));
+    int j0 = std::max(0, static_cast<int>(std::floor(cy + rSurf.top() * scale[1])));
+    int j1 = std::min(height - 1, static_cast<int>(std::ceil(cy + rSurf.bottom() * scale[1])));
+    if (i0 > i1 || j0 > j1) {
+        return nullptr;
+    }
+
+    const int outW = i1 - i0 + 1;
+    const int outH = j1 - j0 + 1;
+    cv::Mat_<cv::Vec3f> cropped(outH, outW, cv::Vec3f(-1.0f, -1.0f, -1.0f));
+
+    for (int j = j0; j <= j1; ++j) {
+        for (int i = i0; i <= i1; ++i) {
+            const cv::Vec3f& p = src(j, i);
+            if (p[0] == -1.0f && p[1] == -1.0f && p[2] == -1.0f) {
+                continue;
+            }
+            const double u = (i - cx) / scale[0];
+            const double v = (j - cy) / scale[1];
+            if (u >= rSurf.left() && u <= rSurf.right() &&
+                v >= rSurf.top() && v <= rSurf.bottom()) {
+                cropped(j - j0, i - i0) = p;
+            }
+        }
+    }
+
+    cv::Mat_<cv::Vec3f> cleaned = clean_surface_outliers(cropped);
+
+    auto countValidInCol = [&](int c) {
+        int count = 0;
+        for (int r = 0; r < cleaned.rows; ++r) {
+            if (cleaned(r, c)[0] != -1.0f) {
+                ++count;
+            }
+        }
+        return count;
+    };
+    auto countValidInRow = [&](int r) {
+        int count = 0;
+        for (int c = 0; c < cleaned.cols; ++c) {
+            if (cleaned(r, c)[0] != -1.0f) {
+                ++count;
+            }
+        }
+        return count;
+    };
+
+    const int minValidCol = std::max(1, std::min(3, cleaned.rows));
+    const int minValidRow = std::max(1, std::min(3, cleaned.cols));
+    int left = 0;
+    int right = cleaned.cols - 1;
+    int top = 0;
+    int bottom = cleaned.rows - 1;
+    while (left <= right && countValidInCol(left) < minValidCol) {
+        ++left;
+    }
+    while (right >= left && countValidInCol(right) < minValidCol) {
+        --right;
+    }
+    while (top <= bottom && countValidInRow(top) < minValidRow) {
+        ++top;
+    }
+    while (bottom >= top && countValidInRow(bottom) < minValidRow) {
+        --bottom;
+    }
+
+    if (left > right || top > bottom) {
+        left = cleaned.cols;
+        right = -1;
+        top = cleaned.rows;
+        bottom = -1;
+        for (int j = 0; j < cleaned.rows; ++j) {
+            for (int i = 0; i < cleaned.cols; ++i) {
+                if (cleaned(j, i)[0] != -1.0f) {
+                    left = std::min(left, i);
+                    right = std::max(right, i);
+                    top = std::min(top, j);
+                    bottom = std::max(bottom, j);
+                }
+            }
+        }
+        if (right < 0 || bottom < 0) {
+            return nullptr;
+        }
+    }
+
+    const int finalW = right - left + 1;
+    const int finalH = bottom - top + 1;
+    cv::Mat_<cv::Vec3f> finalPts(finalH, finalW, cv::Vec3f(-1.0f, -1.0f, -1.0f));
+    for (int j = top; j <= bottom; ++j) {
+        for (int i = left; i <= right; ++i) {
+            finalPts(j - top, i - left) = cleaned(j, i);
+        }
+    }
+
+    return new QuadSurface(finalPts, quad->scale());
 }
 
 // ============================================================================
