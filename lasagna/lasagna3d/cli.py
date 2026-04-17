@@ -58,6 +58,11 @@ def main() -> None:
                           "to render (e.g. `--idx 17,42,108`). Bypasses "
                           "--num-samples/--seed shuffle and scans exactly "
                           "those patches, in order, in every dataset.")
+    vis.add_argument("--dataset", type=str, default=None,
+                     help="Restrict to a single dataset by index or name "
+                          "(e.g. `--dataset 2` or `--dataset PHercParis4`). "
+                          "Matches the [N] index or the display name shown "
+                          "in training logs.")
     vis.add_argument("--same-surface-threshold", type=float, default=None,
                      help="Opt-in voxel-median distance threshold for the "
                           "same-surface merge inside compute_patch_labels. "
@@ -131,6 +136,7 @@ def main() -> None:
             inference_tile_size=args.inference_tile_size,
             explicit_indices=_parse_idx(args.idx),
             same_surface_threshold=args.same_surface_threshold,
+            dataset_filter=args.dataset,
         )
         return
 

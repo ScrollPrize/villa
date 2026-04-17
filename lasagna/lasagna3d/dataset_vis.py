@@ -1798,6 +1798,7 @@ def run_dataset_vis(
     inference_tile_size: int | None = None,
     explicit_indices: list[int] | None = None,
     same_surface_threshold: float | None = None,
+    dataset_filter: str | None = None,
 ) -> None:
     """Render visualization JPEGs for samples from each dataset.
 
@@ -1851,6 +1852,17 @@ def run_dataset_vis(
             continue
 
         ds_name = _dataset_display_name(ds_entry, ds_idx)
+
+        # --dataset filter: match by index (e.g. "2") or name substring
+        # (e.g. "PHercParis4").
+        if dataset_filter is not None:
+            try:
+                if int(dataset_filter) != ds_idx:
+                    continue
+            except ValueError:
+                if dataset_filter not in ds_name:
+                    continue
+
         print(f"{TAG} [{ds_idx}] building dataset '{ds_name}'", flush=True)
 
         sub_config = dict(config)

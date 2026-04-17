@@ -1183,6 +1183,9 @@ class ChunkPatch:
     world_bbox: Tuple[float, ...]          # (z_min, z_max, y_min, y_max, x_min, x_max)
     wraps: List[Dict]                      # [{"segment": Tifxyz, "bbox_2d": tuple, "wrap_id": int, "segment_idx": int}, ...]
     segments: List[Tifxyz]                 # All segments (for lookup by segment_idx)
+    dataset_idx: int = -1                  # index into config["datasets"] (-1 = unknown)
+    dataset_name: str = ""                 # human-readable dataset name
+    dataset_local_idx: int = -1            # per-dataset patch index (stable within a cache)
 
     @property
     def wrap_count(self) -> int:
