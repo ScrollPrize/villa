@@ -96,13 +96,17 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "scheduled_sampling_enabled": False,
     "scheduled_sampling_mode": "linear_full_token_greedy",
     "scheduled_sampling_pattern": "stripwise_full_strip_greedy",
-    "scheduled_sampling_max_prob": 0.10,
-    "scheduled_sampling_start_step": 0,
-    "scheduled_sampling_ramp_steps": 0,
+    "scheduled_sampling_max_prob": 0.15,
+    "scheduled_sampling_start_step": 5000,
+    "scheduled_sampling_ramp_steps": 10000,
     "position_refine_enabled": True,
     "position_refine_loss": "huber",
     "position_refine_weight": 0.05,
-    "position_refine_start_step": 5000,
+    "position_refine_start_step": 10000,
+    "position_refine_ramp_steps": 10000,
+    "position_refine_max_residual": 0.25,
+    "geometry_use_refine_start_step": 15000,
+    "geometry_use_refine_ramp_steps": 10000,
     "xyz_soft_loss_enabled": True,
     "xyz_soft_loss_weight": 1.0,
     "xyz_soft_loss_start_step": 0,
@@ -116,9 +120,10 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "triangle_barrier_weight": 0.1,
     "triangle_barrier_start_step": 0,
     "triangle_barrier_margin": 0.05,
-    "boundary_loss_enabled": False,
-    "boundary_loss_weight": 0.0,
-    "boundary_loss_start_step": 0,
+    "boundary_loss_enabled": True,
+    "boundary_loss_weight": 0.01,
+    "boundary_loss_start_step": 10000,
+    "boundary_loss_ramp_steps": 10000,
     "geometry_metric_enabled": True,
     "geometry_metric_weight": 0.01,
     "geometry_metric_start_step": 2000,
@@ -297,6 +302,14 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("position_refine_weight must be non-negative")
     if int(cfg["position_refine_start_step"]) < 0:
         raise ValueError("position_refine_start_step must be >= 0")
+    if int(cfg["position_refine_ramp_steps"]) < 0:
+        raise ValueError("position_refine_ramp_steps must be >= 0")
+    if float(cfg["position_refine_max_residual"]) <= 0.0:
+        raise ValueError("position_refine_max_residual must be > 0")
+    if int(cfg["geometry_use_refine_start_step"]) < 0:
+        raise ValueError("geometry_use_refine_start_step must be >= 0")
+    if int(cfg["geometry_use_refine_ramp_steps"]) < 0:
+        raise ValueError("geometry_use_refine_ramp_steps must be >= 0")
     if str(cfg["xyz_soft_loss"]) != "huber":
         raise ValueError("xyz_soft_loss must currently be 'huber'")
     if float(cfg["xyz_soft_loss_weight"]) < 0.0:
@@ -321,6 +334,8 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("boundary_loss_weight must be non-negative")
     if int(cfg["boundary_loss_start_step"]) < 0:
         raise ValueError("boundary_loss_start_step must be >= 0")
+    if int(cfg["boundary_loss_ramp_steps"]) < 0:
+        raise ValueError("boundary_loss_ramp_steps must be >= 0")
     if str(cfg["geometry_metric_loss"]) != "huber":
         raise ValueError("geometry_metric_loss must currently be 'huber'")
     if float(cfg["geometry_metric_weight"]) < 0.0:

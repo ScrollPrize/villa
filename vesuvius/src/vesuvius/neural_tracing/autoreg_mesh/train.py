@@ -269,6 +269,15 @@ def _mean_metric_dict(metric_dicts: list[dict[str, float]], *, prefix: str) -> d
     return {f"{prefix}{key}": value / float(len(metric_dicts)) for key, value in sums.items()}
 
 
+def _linear_ramp_value(*, global_step: int, start_step: int, ramp_steps: int, max_value: float) -> float:
+    if int(global_step) < int(start_step):
+        return 0.0
+    if int(ramp_steps) <= 0:
+        return float(max_value)
+    progress = min(1.0, max(0.0, float(global_step - start_step) / float(ramp_steps)))
+    return float(max_value) * progress
+
+
 def _mean_batch_sample_metrics(batch: dict, *, prefix: str = "") -> dict[str, float]:
     metrics = {}
     if "target_invalid_fraction" in batch:
@@ -365,23 +374,38 @@ def _evaluate_rollout_validation(
 def _scheduled_sampling_prob(cfg: dict, *, global_step: int) -> float:
     if not bool(cfg.get("scheduled_sampling_enabled", False)):
         return 0.0
-    start_step = int(cfg.get("scheduled_sampling_start_step", 0))
-    if global_step < start_step:
-        return 0.0
-    max_prob = float(cfg.get("scheduled_sampling_max_prob", 0.0))
-    ramp_steps = int(cfg.get("scheduled_sampling_ramp_steps", 0))
-    if ramp_steps <= 0:
-        return max_prob
-    progress = min(1.0, max(0.0, float(global_step - start_step) / float(ramp_steps)))
-    return max_prob * progress
+    return _linear_ramp_value(
+        global_step=global_step,
+        start_step=int(cfg.get("scheduled_sampling_start_step", 0)),
+        ramp_steps=int(cfg.get("scheduled_sampling_ramp_steps", 0)),
+        max_value=float(cfg.get("scheduled_sampling_max_prob", 0.0)),
+    )
 
 
 def _position_refine_weight_active(cfg: dict, *, global_step: int) -> float:
     if not bool(cfg.get("position_refine_enabled", True)):
         return 0.0
-    if int(global_step) < int(cfg.get("position_refine_start_step", 5000)):
+    return _linear_ramp_value(
+        global_step=global_step,
+        start_step=int(cfg.get("position_refine_start_step", 5000)),
+        ramp_steps=int(cfg.get("position_refine_ramp_steps", 0)),
+        max_value=float(cfg.get("position_refine_weight", 0.0)),
+    )
+
+
+def _geometry_use_refine_mix_active(cfg: dict, *, global_step: int) -> float:
+    if not bool(cfg.get("position_refine_enabled", True)):
         return 0.0
-    return float(cfg.get("position_refine_weight", 0.0))
+    start_step = max(
+        int(cfg.get("position_refine_start_step", 5000)),
+        int(cfg.get("geometry_use_refine_start_step", 5000)),
+    )
+    return _linear_ramp_value(
+        global_step=global_step,
+        start_step=start_step,
+        ramp_steps=int(cfg.get("geometry_use_refine_ramp_steps", 0)),
+        max_value=1.0,
+    )
 
 
 def _xyz_soft_loss_weight_active(cfg: dict, *, global_step: int) -> float:
@@ -409,8 +433,14 @@ def _triangle_barrier_weight_active(cfg: dict, *, global_step: int) -> float:
 
 
 def _boundary_loss_weight_active(cfg: dict, *, global_step: int) -> float:
-    del cfg, global_step
-    return 0.0
+    if not bool(cfg.get("boundary_loss_enabled", False)):
+        return 0.0
+    return _linear_ramp_value(
+        global_step=global_step,
+        start_step=int(cfg.get("boundary_loss_start_step", 0)),
+        ramp_steps=int(cfg.get("boundary_loss_ramp_steps", 0)),
+        max_value=float(cfg.get("boundary_loss_weight", 0.0)),
+    )
 
 
 def _geometry_metric_weight_active(cfg: dict, *, global_step: int) -> float:
@@ -898,6 +928,7 @@ def _evaluate_validation(
             occupancy_loss_weight=float(cfg.get("occupancy_loss_weight", 0.0)),
             offset_loss_weight_active=_offset_loss_weight_active(cfg, global_step=global_step),
             position_refine_weight_active=_position_refine_weight_active(cfg, global_step=global_step),
+            geometry_use_refine_mix_active=_geometry_use_refine_mix_active(cfg, global_step=global_step),
             position_refine_loss_type=str(cfg.get("position_refine_loss", "huber")),
             xyz_soft_loss_weight_active=_xyz_soft_loss_weight_active(cfg, global_step=global_step),
             xyz_soft_loss_type=str(cfg.get("xyz_soft_loss", "huber")),
@@ -1050,6 +1081,7 @@ def run_autoreg_mesh_training(
             scheduled_sampling_prob = _scheduled_sampling_prob(cfg, global_step=global_step)
             offset_loss_weight_active = _offset_loss_weight_active(cfg, global_step=global_step)
             position_refine_weight_active = _position_refine_weight_active(cfg, global_step=global_step)
+            geometry_use_refine_mix_active = _geometry_use_refine_mix_active(cfg, global_step=global_step)
             xyz_soft_loss_weight_active = _xyz_soft_loss_weight_active(cfg, global_step=global_step)
             seam_loss_weight_active = _seam_loss_weight_active(cfg, global_step=global_step)
             triangle_barrier_weight_active = _triangle_barrier_weight_active(cfg, global_step=global_step)
@@ -1071,6 +1103,7 @@ def run_autoreg_mesh_training(
                 occupancy_loss_weight=float(cfg.get("occupancy_loss_weight", 0.0)),
                 offset_loss_weight_active=offset_loss_weight_active,
                 position_refine_weight_active=position_refine_weight_active,
+                geometry_use_refine_mix_active=geometry_use_refine_mix_active,
                 position_refine_loss_type=str(cfg.get("position_refine_loss", "huber")),
                 xyz_soft_loss_weight_active=xyz_soft_loss_weight_active,
                 xyz_soft_loss_type=str(cfg.get("xyz_soft_loss", "huber")),
@@ -1110,6 +1143,7 @@ def run_autoreg_mesh_training(
             metrics["scheduled_sampling_prob"] = float(scheduled_sampling_prob)
             metrics["offset_loss_weight_active"] = float(offset_loss_weight_active)
             metrics["position_refine_weight_active"] = float(position_refine_weight_active)
+            metrics["geometry_use_refine_mix_active"] = float(geometry_use_refine_mix_active)
             metrics["xyz_soft_loss_weight_active"] = float(xyz_soft_loss_weight_active)
             metrics["seam_loss_weight_active"] = float(seam_loss_weight_active)
             metrics["triangle_barrier_weight_active"] = float(triangle_barrier_weight_active)

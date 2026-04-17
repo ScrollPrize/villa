@@ -37,13 +37,17 @@ from vesuvius.neural_tracing.autoreg_mesh.model import AutoregMeshModel
 from vesuvius.neural_tracing.autoreg_mesh.model import _batched_rope_from_coords
 from vesuvius.neural_tracing.autoreg_mesh.serialization import deserialize_continuation_grid, serialize_split_conditioning_example
 from vesuvius.neural_tracing.autoreg_mesh.train import (
+    _boundary_loss_weight_active,
     _choose_best_xy_slice,
+    _geometry_use_refine_mix_active,
     _edge_segment_on_z_slice,
     _geometry_metric_weight_active,
     _geometry_sd_weight_active,
     _make_xy_slice_overlay_canvas,
+    _position_refine_weight_active,
     _rasterize_grid_on_xy_slice,
     _restrict_dataset_samples,
+    _scheduled_sampling_prob,
     _scheduled_sampling_feedback_state,
     run_autoreg_mesh_training,
 )
@@ -614,6 +618,18 @@ def test_position_refine_head_is_zero_initialized() -> None:
     model = AutoregMeshModel(_make_cached_token_config())
     assert torch.count_nonzero(model.position_refine_head.weight).item() == 0
     assert torch.count_nonzero(model.position_refine_head.bias).item() == 0
+
+
+def test_position_refine_residual_is_bounded_by_configured_scale() -> None:
+    model = AutoregMeshModel(_make_cached_token_config())
+    with torch.no_grad():
+        model.position_refine_head.bias.fill_(100.0)
+    batch = autoreg_mesh_collate([_make_sample_with_cached_tokens("left")])
+    batch = _move_batch(batch, torch.device("cpu"))
+
+    outputs = model(batch)
+
+    assert outputs["pred_refine_residual"].abs().max().item() == pytest.approx(0.25, rel=1e-4)
 
 
 def test_scheduled_sampling_uses_stripwise_replacement() -> None:
@@ -1404,19 +1420,19 @@ def test_geometry_metric_loss_is_near_zero_on_isometric_copy_and_higher_on_stret
         {"pred_xyz_soft": batch["target_xyz"].clone(), "pred_refine_residual": zero_like},
         batch,
         loss_type="huber",
-        include_refine_residual=False,
+        refine_mix=0.0,
     )
     translated_loss = _geometry_metric_loss(
         {"pred_xyz_soft": translated, "pred_refine_residual": zero_like},
         batch,
         loss_type="huber",
-        include_refine_residual=False,
+        refine_mix=0.0,
     )
     stretched_loss = _geometry_metric_loss(
         {"pred_xyz_soft": stretched, "pred_refine_residual": zero_like},
         batch,
         loss_type="huber",
-        include_refine_residual=False,
+        refine_mix=0.0,
     )
 
     assert exact_loss.item() == pytest.approx(0.0, abs=1e-8)
@@ -1434,17 +1450,17 @@ def test_geometry_sd_loss_is_near_zero_on_isometric_copy_and_higher_on_stretch()
     exact_loss = _geometry_sd_loss(
         {"pred_xyz_soft": batch["target_xyz"].clone(), "pred_refine_residual": zero_like},
         batch,
-        include_refine_residual=False,
+        refine_mix=0.0,
     )
     translated_loss = _geometry_sd_loss(
         {"pred_xyz_soft": translated, "pred_refine_residual": zero_like},
         batch,
-        include_refine_residual=False,
+        refine_mix=0.0,
     )
     stretched_loss = _geometry_sd_loss(
         {"pred_xyz_soft": stretched, "pred_refine_residual": zero_like},
         batch,
-        include_refine_residual=False,
+        refine_mix=0.0,
     )
 
     assert exact_loss.item() == pytest.approx(0.0, abs=1e-6)
@@ -1459,14 +1475,14 @@ def test_geometry_sd_loss_stays_finite_for_degenerate_prediction() -> None:
     loss = _geometry_sd_loss(
         {"pred_xyz_soft": collapsed, "pred_refine_residual": zero_like},
         batch,
-        include_refine_residual=False,
+        refine_mix=0.0,
     )
 
     assert torch.isfinite(loss)
     assert loss.item() >= 0.0
 
 
-def test_xyz_soft_loss_is_near_zero_on_ground_truth_and_excludes_residual_before_refine() -> None:
+def test_xyz_soft_loss_tracks_geometry_refine_mix() -> None:
     batch = autoreg_mesh_collate([_make_sample("left")])
     outputs = {
         "coarse_logits": torch.zeros((1, batch["target_xyz"].shape[1], 8), dtype=torch.float32),
@@ -1490,18 +1506,30 @@ def test_xyz_soft_loss_is_near_zero_on_ground_truth_and_excludes_residual_before
         batch,
         offset_num_bins=(4, 4, 4),
         xyz_soft_loss_weight_active=1.0,
-        position_refine_weight_active=0.0,
+        geometry_use_refine_mix_active=0.0,
+    )
+    partial_losses = compute_autoreg_mesh_losses(
+        outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+        xyz_soft_loss_weight_active=1.0,
+        geometry_use_refine_mix_active=0.5,
     )
     on_losses = compute_autoreg_mesh_losses(
         outputs,
         batch,
         offset_num_bins=(4, 4, 4),
         xyz_soft_loss_weight_active=1.0,
-        position_refine_weight_active=0.05,
+        geometry_use_refine_mix_active=1.0,
     )
 
     assert off_losses["xyz_soft_loss"].item() == pytest.approx(0.0, abs=1e-6)
+    assert partial_losses["xyz_soft_loss"].item() > off_losses["xyz_soft_loss"].item()
+    assert partial_losses["xyz_soft_loss"].item() < on_losses["xyz_soft_loss"].item()
     assert on_losses["xyz_soft_loss"].item() > off_losses["xyz_soft_loss"].item()
+    assert off_losses["geometry_use_refine_mix_active"].item() == pytest.approx(0.0)
+    assert partial_losses["geometry_use_refine_mix_active"].item() == pytest.approx(0.5)
+    assert on_losses["geometry_use_refine_mix_active"].item() == pytest.approx(1.0)
 
 
 def test_seam_edge_loss_is_near_zero_on_ground_truth_and_increases_when_displaced() -> None:
@@ -1662,8 +1690,8 @@ def test_boundary_loss_and_oob_metrics_increase_outside_crop() -> None:
     assert inside_losses["boundary_loss"].item() >= 0.0
     assert outside_losses["boundary_loss"].item() > inside_losses["boundary_loss"].item()
     assert outside_losses["pred_oob_fraction_refined"].item() > inside_losses["pred_oob_fraction_refined"].item()
-    assert outside_losses["loss"].item() == pytest.approx(inside_losses["loss"].item())
-    assert outside_losses["boundary_loss_weight_active"].item() == pytest.approx(0.0)
+    assert outside_losses["loss"].item() > inside_losses["loss"].item()
+    assert outside_losses["boundary_loss_weight_active"].item() == pytest.approx(1.0)
     assert torch.isfinite(outside_losses["loss"])
 
 
@@ -1882,18 +1910,16 @@ def test_spatial_augmentation_keeps_direction_and_strip_positions_stable(monkeyp
 
 
 def test_scheduled_sampling_probability_progression() -> None:
-    from vesuvius.neural_tracing.autoreg_mesh.train import _scheduled_sampling_prob
-
     config = _make_cached_token_config()
     config["scheduled_sampling_enabled"] = True
-    config["scheduled_sampling_max_prob"] = 0.10
-    config["scheduled_sampling_start_step"] = 10
-    config["scheduled_sampling_ramp_steps"] = 20
+    config["scheduled_sampling_max_prob"] = 0.15
+    config["scheduled_sampling_start_step"] = 5000
+    config["scheduled_sampling_ramp_steps"] = 10000
 
     assert _scheduled_sampling_prob(config, global_step=0) == pytest.approx(0.0)
-    assert _scheduled_sampling_prob(config, global_step=10) == pytest.approx(0.0)
-    assert _scheduled_sampling_prob(config, global_step=20) == pytest.approx(0.05)
-    assert _scheduled_sampling_prob(config, global_step=40) == pytest.approx(0.10)
+    assert _scheduled_sampling_prob(config, global_step=5000) == pytest.approx(0.0)
+    assert _scheduled_sampling_prob(config, global_step=10000) == pytest.approx(0.075)
+    assert _scheduled_sampling_prob(config, global_step=15000) == pytest.approx(0.15)
 
 
 def test_scheduled_sampling_feedback_state_tracks_offset_and_refine_steps() -> None:
@@ -1901,6 +1927,7 @@ def test_scheduled_sampling_feedback_state_tracks_offset_and_refine_steps() -> N
     config["offset_loss_start_step"] = 2
     config["position_refine_weight"] = 0.05
     config["position_refine_start_step"] = 5
+    config["position_refine_ramp_steps"] = 0
 
     assert _scheduled_sampling_feedback_state(config, global_step=0) == (False, False)
     assert _scheduled_sampling_feedback_state(config, global_step=2) == (True, False)
@@ -1923,12 +1950,52 @@ def test_scheduled_sampling_enabled_smoke_train_runs(tmp_path: Path) -> None:
     assert result["history"][-1]["scheduled_sampling_prob"] >= 0.0
 
 
-def test_position_refine_weight_activates_after_start_step(tmp_path: Path) -> None:
+def test_position_refine_weight_ramps_after_start_step() -> None:
+    config = _make_cached_token_config()
+    config["position_refine_enabled"] = True
+    config["position_refine_weight"] = 0.05
+    config["position_refine_start_step"] = 10000
+    config["position_refine_ramp_steps"] = 10000
+
+    assert _position_refine_weight_active(config, global_step=0) == pytest.approx(0.0)
+    assert _position_refine_weight_active(config, global_step=10000) == pytest.approx(0.0)
+    assert _position_refine_weight_active(config, global_step=15000) == pytest.approx(0.025)
+    assert _position_refine_weight_active(config, global_step=20000) == pytest.approx(0.05)
+
+
+def test_geometry_use_refine_mix_ramps_after_start_step() -> None:
+    config = _make_cached_token_config()
+    config["position_refine_enabled"] = True
+    config["position_refine_start_step"] = 10000
+    config["geometry_use_refine_start_step"] = 15000
+    config["geometry_use_refine_ramp_steps"] = 10000
+
+    assert _geometry_use_refine_mix_active(config, global_step=10000) == pytest.approx(0.0)
+    assert _geometry_use_refine_mix_active(config, global_step=15000) == pytest.approx(0.0)
+    assert _geometry_use_refine_mix_active(config, global_step=20000) == pytest.approx(0.5)
+    assert _geometry_use_refine_mix_active(config, global_step=25000) == pytest.approx(1.0)
+
+
+def test_boundary_loss_weight_ramps_after_start_step() -> None:
+    config = _make_cached_token_config()
+    config["boundary_loss_enabled"] = True
+    config["boundary_loss_weight"] = 0.01
+    config["boundary_loss_start_step"] = 10000
+    config["boundary_loss_ramp_steps"] = 10000
+
+    assert _boundary_loss_weight_active(config, global_step=0) == pytest.approx(0.0)
+    assert _boundary_loss_weight_active(config, global_step=10000) == pytest.approx(0.0)
+    assert _boundary_loss_weight_active(config, global_step=15000) == pytest.approx(0.005)
+    assert _boundary_loss_weight_active(config, global_step=20000) == pytest.approx(0.01)
+
+
+def test_position_refine_weight_activates_immediately_when_ramp_disabled(tmp_path: Path) -> None:
     config = _make_cached_token_config()
     config["out_dir"] = str(tmp_path / "runs_refine")
     config["position_refine_enabled"] = True
     config["position_refine_weight"] = 0.05
     config["position_refine_start_step"] = 1
+    config["position_refine_ramp_steps"] = 0
     dataset = _make_training_dataset()
 
     result = run_autoreg_mesh_training(config, dataset=dataset, device="cpu", max_steps=2)
@@ -2040,6 +2107,15 @@ def test_distance_aware_target_default_config_values() -> None:
     assert validated["conditioning_feature_debias_basis_source"] == "zero_volume_svd"
     assert validated["conditioning_feature_debias_components"] == 16
     assert validated["scheduled_sampling_pattern"] == "stripwise_full_strip_greedy"
+    assert validated["scheduled_sampling_max_prob"] == pytest.approx(0.15)
+    assert validated["scheduled_sampling_start_step"] == 5000
+    assert validated["scheduled_sampling_ramp_steps"] == 10000
+    assert validated["position_refine_weight"] == pytest.approx(0.05)
+    assert validated["position_refine_start_step"] == 10000
+    assert validated["position_refine_ramp_steps"] == 10000
+    assert validated["position_refine_max_residual"] == pytest.approx(0.25)
+    assert validated["geometry_use_refine_start_step"] == 15000
+    assert validated["geometry_use_refine_ramp_steps"] == 10000
     assert validated["xyz_soft_loss_enabled"] is True
     assert validated["xyz_soft_loss_weight"] == pytest.approx(1.0)
     assert validated["seam_loss_enabled"] is True
@@ -2047,9 +2123,10 @@ def test_distance_aware_target_default_config_values() -> None:
     assert validated["triangle_barrier_enabled"] is True
     assert validated["triangle_barrier_weight"] == pytest.approx(0.1)
     assert validated["triangle_barrier_margin"] == pytest.approx(0.05)
-    assert validated["boundary_loss_enabled"] is False
-    assert validated["boundary_loss_weight"] == pytest.approx(0.0)
-    assert validated["boundary_loss_start_step"] == 0
+    assert validated["boundary_loss_enabled"] is True
+    assert validated["boundary_loss_weight"] == pytest.approx(0.01)
+    assert validated["boundary_loss_start_step"] == 10000
+    assert validated["boundary_loss_ramp_steps"] == 10000
     assert validated["rollout_val_examples_per_log"] == 1
     assert validated["rollout_val_max_steps"] is None
     assert validated["wandb_log_xy_slice_images"] is True
@@ -2079,6 +2156,34 @@ def test_distance_aware_target_default_config_values() -> None:
     assert validated["spatial_augmentation"]["transpose_axes"] == [0, 1, 2]
     assert validated["volume_only_augmentation"]["enabled"] is True
     assert validated["volume_only_augmentation"]["gamma_prob"] == pytest.approx(0.4)
+
+
+def test_new_refine_ramp_config_validation_rejects_invalid_values() -> None:
+    config = _make_cached_token_config()
+
+    config["position_refine_ramp_steps"] = -1
+    with pytest.raises(ValueError, match="position_refine_ramp_steps"):
+        validate_autoreg_mesh_config(config)
+
+    config = _make_cached_token_config()
+    config["position_refine_max_residual"] = 0.0
+    with pytest.raises(ValueError, match="position_refine_max_residual"):
+        validate_autoreg_mesh_config(config)
+
+    config = _make_cached_token_config()
+    config["geometry_use_refine_start_step"] = -1
+    with pytest.raises(ValueError, match="geometry_use_refine_start_step"):
+        validate_autoreg_mesh_config(config)
+
+    config = _make_cached_token_config()
+    config["geometry_use_refine_ramp_steps"] = -1
+    with pytest.raises(ValueError, match="geometry_use_refine_ramp_steps"):
+        validate_autoreg_mesh_config(config)
+
+    config = _make_cached_token_config()
+    config["boundary_loss_ramp_steps"] = -1
+    with pytest.raises(ValueError, match="boundary_loss_ramp_steps"):
+        validate_autoreg_mesh_config(config)
 
 
 def test_anisotropic_surface_downsample_factor_validates() -> None:
@@ -2349,6 +2454,20 @@ def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     assert result["geometry_sd_enabled"] is True
     assert result["geometry_sd_weight"] == pytest.approx(0.005)
     assert result["geometry_sd_start_step"] == 2000
+    assert result["position_refine_weight"] == pytest.approx(0.05)
+    assert result["position_refine_start_step"] == 10000
+    assert result["position_refine_ramp_steps"] == 10000
+    assert result["position_refine_max_residual"] == pytest.approx(0.25)
+    assert result["geometry_use_refine_start_step"] == 15000
+    assert result["geometry_use_refine_ramp_steps"] == 10000
+    assert result["boundary_loss_enabled"] is True
+    assert result["boundary_loss_weight"] == pytest.approx(0.01)
+    assert result["boundary_loss_start_step"] == 10000
+    assert result["boundary_loss_ramp_steps"] == 10000
+    assert result["scheduled_sampling_start_step"] == 5000
+    assert result["scheduled_sampling_ramp_steps"] == 10000
+    assert result["scheduled_sampling_max_prob"] == pytest.approx(0.15)
+    assert result["cond_percent"] == []
     assert result["distance_aware_coarse_targets_enabled"] is True
     assert result["distance_aware_coarse_target_radius"] == 1
     assert result["distance_aware_coarse_target_sigma"] == pytest.approx(1.0)

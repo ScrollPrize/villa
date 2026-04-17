@@ -275,18 +275,22 @@ def _position_refine_loss(outputs: dict, batch: dict, *, loss_type: str) -> Tens
     return _masked_mean(per_token, batch["target_supervision_mask"])
 
 
-def _soft_geometry_xyz(outputs: dict, *, include_refine_residual: bool) -> Tensor:
+def _soft_geometry_xyz(outputs: dict, *, refine_mix: float) -> Tensor:
     if "pred_xyz_soft" in outputs:
         pred_xyz_soft = outputs["pred_xyz_soft"]
     elif "pred_xyz_refined" in outputs:
         pred_xyz_soft = outputs["pred_xyz_refined"]
     else:
         pred_xyz_soft = outputs["pred_xyz"]
-    if bool(include_refine_residual):
-        return pred_xyz_soft
     if "pred_refine_residual" not in outputs:
         return pred_xyz_soft
-    return pred_xyz_soft - outputs["pred_refine_residual"]
+    base_xyz = pred_xyz_soft - outputs["pred_refine_residual"]
+    refine_mix = min(1.0, max(0.0, float(refine_mix)))
+    if refine_mix <= 0.0:
+        return base_xyz
+    if refine_mix >= 1.0:
+        return pred_xyz_soft
+    return base_xyz + refine_mix * outputs["pred_refine_residual"]
 
 
 def _geometry_batch_available(batch: dict) -> bool:
@@ -733,10 +737,10 @@ def _geometry_metric_loss(
     batch: dict,
     *,
     loss_type: str,
-    include_refine_residual: bool,
+    refine_mix: float,
 ) -> Tensor:
     return _geometry_metric_loss_from_sequence(
-        _soft_geometry_xyz(outputs, include_refine_residual=include_refine_residual),
+        _soft_geometry_xyz(outputs, refine_mix=refine_mix),
         batch,
         loss_type=loss_type,
     )
@@ -795,10 +799,10 @@ def _geometry_sd_loss(
     outputs: dict,
     batch: dict,
     *,
-    include_refine_residual: bool,
+    refine_mix: float,
 ) -> Tensor:
     return _geometry_sd_loss_from_sequence(
-        _soft_geometry_xyz(outputs, include_refine_residual=include_refine_residual),
+        _soft_geometry_xyz(outputs, refine_mix=refine_mix),
         batch,
     )
 
@@ -870,6 +874,7 @@ def compute_autoreg_mesh_losses(
     occupancy_loss_weight: float = 0.0,
     offset_loss_weight_active: float = 1.0,
     position_refine_weight_active: float = 0.0,
+    geometry_use_refine_mix_active: float = 0.0,
     position_refine_loss_type: str = "huber",
     xyz_soft_loss_weight_active: float = 0.0,
     xyz_soft_loss_type: str = "huber",
@@ -915,8 +920,7 @@ def compute_autoreg_mesh_losses(
     stop_loss = _stop_loss(outputs, batch)
     total_loss = coarse_loss + float(offset_loss_weight_active) * offset_loss + stop_loss
     coarse_excess_nll = coarse_loss - coarse_target_entropy
-    include_refine_residual = float(position_refine_weight_active) > 0.0
-    soft_xyz_for_loss = _soft_geometry_xyz(outputs, include_refine_residual=include_refine_residual)
+    soft_xyz_for_loss = _soft_geometry_xyz(outputs, refine_mix=float(geometry_use_refine_mix_active))
     if str(xyz_soft_loss_type) != "huber":
         raise ValueError(f"Unsupported xyz_soft_loss={xyz_soft_loss_type!r}")
     xyz_soft_mask = batch["target_supervision_mask"] & _prediction_finite_mask(soft_xyz_for_loss)
@@ -952,6 +956,8 @@ def compute_autoreg_mesh_losses(
         total_loss = total_loss + float(triangle_barrier_weight_active) * triangle_barrier_loss
 
     boundary_loss = _boundary_loss(outputs, batch)
+    if float(boundary_loss_weight_active) > 0.0:
+        total_loss = total_loss + float(boundary_loss_weight_active) * boundary_loss
 
     geometry_metric_loss = total_loss.new_zeros(())
     if float(geometry_metric_weight_active) > 0.0:
@@ -959,7 +965,7 @@ def compute_autoreg_mesh_losses(
             outputs,
             batch,
             loss_type=geometry_metric_loss_type,
-            include_refine_residual=include_refine_residual,
+            refine_mix=float(geometry_use_refine_mix_active),
         )
         total_loss = total_loss + float(geometry_metric_weight_active) * geometry_metric_loss
 
@@ -968,7 +974,7 @@ def compute_autoreg_mesh_losses(
         geometry_sd_loss = _geometry_sd_loss(
             outputs,
             batch,
-            include_refine_residual=include_refine_residual,
+            refine_mix=float(geometry_use_refine_mix_active),
         )
         total_loss = total_loss + float(geometry_sd_weight_active) * geometry_sd_loss
 
@@ -1011,6 +1017,7 @@ def compute_autoreg_mesh_losses(
         "stop_loss": stop_loss,
         "refine_loss": refine_loss,
         "refine_loss_weight_active": total_loss.new_tensor(float(position_refine_weight_active)),
+        "geometry_use_refine_mix_active": total_loss.new_tensor(float(geometry_use_refine_mix_active)),
         "xyz_soft_loss": xyz_soft_loss,
         "xyz_soft_loss_weight_active": total_loss.new_tensor(float(xyz_soft_loss_weight_active)),
         "xyz_l1_soft": xyz_l1_soft,
@@ -1022,7 +1029,7 @@ def compute_autoreg_mesh_losses(
         "triangle_barrier_loss": triangle_barrier_loss,
         "triangle_barrier_weight_active": total_loss.new_tensor(float(triangle_barrier_weight_active)),
         "boundary_loss": boundary_loss,
-        "boundary_loss_weight_active": total_loss.new_zeros(()),
+        "boundary_loss_weight_active": total_loss.new_tensor(float(boundary_loss_weight_active)),
         "triangle_flip_rate_soft": triangle_flip_rate_soft,
         "triangle_flip_rate_refined": triangle_flip_rate_refined,
         "first_strip_wrong_side_rate_refined": first_strip_wrong_side_rate_refined,

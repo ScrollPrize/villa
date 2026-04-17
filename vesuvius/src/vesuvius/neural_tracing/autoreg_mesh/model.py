@@ -355,6 +355,7 @@ class AutoregMeshModel(nn.Module):
             self.pointer_key_x = nn.Linear(self.decoder_dim, self.decoder_dim, bias=False)
         self.offset_head = nn.Linear(self.decoder_dim, 3 * max(self.offset_num_bins), bias=True)
         self.stop_head = nn.Linear(self.decoder_dim, 1, bias=True)
+        self.position_refine_max_residual = float(self.config.get("position_refine_max_residual", 0.25))
         self.position_refine_head = nn.Linear(self.decoder_dim, 3, bias=True)
         nn.init.zeros_(self.position_refine_head.weight)
         nn.init.zeros_(self.position_refine_head.bias)
@@ -1030,7 +1031,7 @@ class AutoregMeshModel(nn.Module):
             pred_offset_bins.append(offset_logits[:, :, axis, :bins].argmax(dim=-1))
         pred_offset_bins_tensor = torch.stack(pred_offset_bins, dim=-1)
         pred_xyz_bin_center = self.decode_local_xyz(coarse_outputs["pred_coarse_ids"], pred_offset_bins_tensor)
-        pred_refine_residual = self.position_refine_head(hidden)
+        pred_refine_residual = torch.tanh(self.position_refine_head(hidden)) * float(self.position_refine_max_residual)
         pred_xyz_soft = self._soft_decode_local_xyz(
             coarse_outputs["coarse_logits"],
             coarse_outputs["coarse_axis_logits"],

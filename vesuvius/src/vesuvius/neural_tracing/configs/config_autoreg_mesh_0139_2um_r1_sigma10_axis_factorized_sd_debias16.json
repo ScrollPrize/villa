@@ -20,8 +20,8 @@
   ],
   "sample_mode": "wrap",
   "cond_percent": [
-    0.1,
-    0.5
+    0.3,
+    0.6
   ],
   "overlap_fraction": 0.25,
   "chunk_pad": 20.0,
@@ -55,12 +55,12 @@
   "scheduled_sampling_enabled": true,
   "scheduled_sampling_mode": "linear_full_token_greedy",
   "scheduled_sampling_pattern": "stripwise_full_strip_greedy",
-  "scheduled_sampling_max_prob": 0.2,
-  "scheduled_sampling_start_step": 0,
-  "scheduled_sampling_ramp_steps": 5000,
+  "scheduled_sampling_max_prob": 0.15,
+  "scheduled_sampling_start_step": 5000,
+  "scheduled_sampling_ramp_steps": 10000,
   "position_refine_enabled": true,
   "position_refine_loss": "huber",
-  "position_refine_weight": 0.5,
+  "position_refine_weight": 0.05,
   "position_refine_start_step": 10000,
   "xyz_soft_loss_enabled": true,
   "xyz_soft_loss_weight": 1.0,
@@ -75,9 +75,9 @@
   "triangle_barrier_weight": 0.1,
   "triangle_barrier_start_step": 0,
   "triangle_barrier_margin": 0.05,
-  "boundary_loss_enabled": false,
-  "boundary_loss_weight": 0.0,
-  "boundary_loss_start_step": 0,
+  "boundary_loss_enabled": true,
+  "boundary_loss_weight": 0.01,
+  "boundary_loss_start_step": 10000,
   "geometry_metric_enabled": true,
   "geometry_metric_weight": 0.001,
   "geometry_metric_start_step": 6000,
@@ -122,5 +122,10 @@
   "wandb_resume": true,
   "wandb_log_images": true,
   "wandb_image_frequency": 1000,
-  "offset_loss_weight": 0.2
+  "offset_loss_weight": 0.2,
+  "position_refine_ramp_steps": 10000,
+  "position_refine_max_residual": 0.25,
+  "geometry_use_refine_start_step": 15000,
+  "geometry_use_refine_ramp_steps": 10000,
+  "boundary_loss_ramp_steps": 10000
 }
