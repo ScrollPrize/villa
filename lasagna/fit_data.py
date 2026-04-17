@@ -9,6 +9,8 @@ import torch
 import torch.nn.functional as F
 import zarr
 
+from lasagna_volume import LasagnaVolume
+
 
 @dataclass(frozen=True)
 class CorrPoints3D:
@@ -27,7 +29,9 @@ class FitData3D:
 	corr_points: CorrPoints3D | None
 	winding_volume: torch.Tensor | None  # (1, 1, Z, Y, X) float32 on GPU
 	origin_fullres: tuple[float, float, float]  # (x0, y0, z0) in fullres voxels
-	spacing: tuple[float, float, float]          # (sx, sy, sz) voxel size in fullres units
+	spacing: tuple[float, float, float]          # (sx, sy, sz) voxel size in fullres units (cos channel)
+	channel_spacing: dict[str, tuple[float, float, float]] | None = None  # per-channel override
+	source_to_base: float = 1.0                  # source-to-base factor for tifxyz coord conversion
 	winding_min: float | None = None     # min valid winding value (from zarr metadata)
 	winding_max: float | None = None     # max valid winding value (from zarr metadata)
 	grad_mag_scale: float = 255.0                # encoding scale for grad_mag channel
@@ -40,6 +44,18 @@ class FitData3D:
 			raise ValueError("FitData3D.cos must be (1,1,Z,Y,X)")
 		_, _, z, y, x = self.cos.shape
 		return int(z), int(y), int(x)
+
+	def _spacing_for(self, channel: str) -> tuple[float, float, float]:
+		"""Return spacing for a specific channel."""
+		if self.channel_spacing and channel in self.channel_spacing:
+			return self.channel_spacing[channel]
+		return self.spacing
+
+	def _size_of(self, t: torch.Tensor | None) -> tuple[int, int, int]:
+		"""Return (Z, Y, X) from a (1,1,Z,Y,X) tensor."""
+		if t is None:
+			return self.size
+		return int(t.shape[2]), int(t.shape[3]), int(t.shape[4])
 
 	def grid_sample_fullres(self, xyz_fullres: torch.Tensor) -> "FitData3D":
 		"""Sample at fullres positions.
@@ -64,25 +80,28 @@ class FitData3D:
 
 		dev = xyz_fullres.device
 		offset = torch.tensor(self.origin_fullres, dtype=torch.float32, device=dev)
-		inv_scale = torch.tensor([1.0 / s for s in self.spacing], dtype=torch.float32, device=dev)
 
-		def _gs(t: torch.Tensor | None, decode) -> torch.Tensor | None:
+		def _gs(t: torch.Tensor | None, decode, channel: str) -> torch.Tensor | None:
 			if t is None:
 				return None
+			sp = self._spacing_for(channel)
+			inv_scale = torch.tensor([1.0 / s for s in sp], dtype=torch.float32, device=dev)
 			vol = t.squeeze(0)  # (1, Z, Y, X) — C=1
 			out_u8 = grid_sample_3d_u8(vol, xyz_fullres, offset, inv_scale)  # (1, D, H, W) u8
 			return decode(out_u8.float()).unsqueeze(0)  # (1, 1, D, H, W) float32
 
 		return FitData3D(
-			cos=_gs(self.cos, lambda t: t / 255.0),
-			grad_mag=_gs(self.grad_mag, lambda t: t / self.grad_mag_scale),
-			nx=_gs(self.nx, lambda t: (t - 128.0) / 127.0),
-			ny=_gs(self.ny, lambda t: (t - 128.0) / 127.0),
-			pred_dt=_gs(self.pred_dt, lambda t: t.sqrt()),
+			cos=_gs(self.cos, lambda t: t / 255.0, "cos"),
+			grad_mag=_gs(self.grad_mag, lambda t: t / self.grad_mag_scale, "grad_mag"),
+			nx=_gs(self.nx, lambda t: (t - 128.0) / 127.0, "nx"),
+			ny=_gs(self.ny, lambda t: (t - 128.0) / 127.0, "ny"),
+			pred_dt=_gs(self.pred_dt, lambda t: t.sqrt(), "pred_dt"),
 			corr_points=self.corr_points,
 			winding_volume=self.winding_volume,
 			origin_fullres=self.origin_fullres,
 			spacing=self.spacing,
+			channel_spacing=self.channel_spacing,
+			source_to_base=self.source_to_base,
 			winding_min=self.winding_min,
 			winding_max=self.winding_max,
 			grad_mag_scale=self.grad_mag_scale,
@@ -90,32 +109,37 @@ class FitData3D:
 		)
 
 	def _grid_sample_torch(self, xyz_fullres: torch.Tensor) -> "FitData3D":
-		Z, Y, X = self.size
-		grid = xyz_fullres.clone()
-		grid[..., 0] = (grid[..., 0] - self.origin_fullres[0]) / self.spacing[0]
-		grid[..., 1] = (grid[..., 1] - self.origin_fullres[1]) / self.spacing[1]
-		grid[..., 2] = (grid[..., 2] - self.origin_fullres[2]) / self.spacing[2]
-		grid[..., 0] = grid[..., 0] / max(1, X - 1) * 2 - 1
-		grid[..., 1] = grid[..., 1] / max(1, Y - 1) * 2 - 1
-		grid[..., 2] = grid[..., 2] / max(1, Z - 1) * 2 - 1
-		grid_5d = grid.unsqueeze(0)
+		def _make_grid(channel: str, t: torch.Tensor | None) -> torch.Tensor:
+			sp = self._spacing_for(channel)
+			Z, Y, X = self._size_of(t)
+			g = xyz_fullres.clone()
+			g[..., 0] = (g[..., 0] - self.origin_fullres[0]) / sp[0]
+			g[..., 1] = (g[..., 1] - self.origin_fullres[1]) / sp[1]
+			g[..., 2] = (g[..., 2] - self.origin_fullres[2]) / sp[2]
+			g[..., 0] = g[..., 0] / max(1, X - 1) * 2 - 1
+			g[..., 1] = g[..., 1] / max(1, Y - 1) * 2 - 1
+			g[..., 2] = g[..., 2] / max(1, Z - 1) * 2 - 1
+			return g
 
-		def _gs(t: torch.Tensor | None, decode) -> torch.Tensor | None:
+		def _gs(t: torch.Tensor | None, decode, channel: str) -> torch.Tensor | None:
 			if t is None:
 				return None
+			grid_5d = _make_grid(channel, t).unsqueeze(0)
 			t_f = decode(t.float())
 			return F.grid_sample(t_f, grid_5d, mode="bilinear", padding_mode="zeros", align_corners=True)
 
 		return FitData3D(
-			cos=_gs(self.cos, lambda t: t / 255.0),
-			grad_mag=_gs(self.grad_mag, lambda t: t / self.grad_mag_scale),
-			nx=_gs(self.nx, lambda t: (t - 128.0) / 127.0),
-			ny=_gs(self.ny, lambda t: (t - 128.0) / 127.0),
-			pred_dt=_gs(self.pred_dt, lambda t: t.sqrt()),
+			cos=_gs(self.cos, lambda t: t / 255.0, "cos"),
+			grad_mag=_gs(self.grad_mag, lambda t: t / self.grad_mag_scale, "grad_mag"),
+			nx=_gs(self.nx, lambda t: (t - 128.0) / 127.0, "nx"),
+			ny=_gs(self.ny, lambda t: (t - 128.0) / 127.0, "ny"),
+			pred_dt=_gs(self.pred_dt, lambda t: t.sqrt(), "pred_dt"),
 			corr_points=self.corr_points,
 			winding_volume=self.winding_volume,
 			origin_fullres=self.origin_fullres,
 			spacing=self.spacing,
+			channel_spacing=self.channel_spacing,
+			source_to_base=self.source_to_base,
 			winding_min=self.winding_min,
 			winding_max=self.winding_max,
 			grad_mag_scale=self.grad_mag_scale,
@@ -225,7 +249,6 @@ def load_3d_for_model(
 	cuda_gridsample: bool = True,
 ) -> FitData3D:
 	"""Load 3D data auto-cropped around model mesh bbox. Optionally blurs."""
-	scaledown = float(model.params.scaledown)
 	with torch.no_grad():
 		xyz = model._grid_xyz()
 		mesh_bbox = (xyz[..., 0].min().item(), xyz[..., 1].min().item(), xyz[..., 2].min().item(),
@@ -234,11 +257,10 @@ def load_3d_for_model(
 		  f"min=({mesh_bbox[0]:.0f},{mesh_bbox[1]:.0f},{mesh_bbox[2]:.0f}) "
 		  f"max=({mesh_bbox[3]:.0f},{mesh_bbox[4]:.0f},{mesh_bbox[5]:.0f})", flush=True)
 	prep = get_preprocessed_params(path)
-	crop = auto_crop_for_mesh(mesh_bbox, prep["volume_extent_fullres"]) if prep else None
-	if crop is not None:
-		print(f"[fit_data] auto-crop: x={crop[0]} y={crop[1]} z={crop[2]} "
-			  f"w={crop[3]} h={crop[4]} d={crop[5]}", flush=True)
-	data = load_3d(path=path, device=device, downscale=scaledown, crop=crop, cuda_gridsample=cuda_gridsample)
+	crop = auto_crop_for_mesh(mesh_bbox, prep["volume_extent_fullres"])
+	print(f"[fit_data] auto-crop: x={crop[0]} y={crop[1]} z={crop[2]} "
+		  f"w={crop[3]} h={crop[4]} d={crop[5]}", flush=True)
+	data = load_3d(path=path, device=device, crop=crop, cuda_gridsample=cuda_gridsample)
 	if blur_sigma > 0:
 		blur_3d(data, sigma=blur_sigma)
 		print(f"[fit_data] blurred data sigma={blur_sigma}", flush=True)
@@ -375,129 +397,115 @@ def blur_3d(data: FitData3D, sigma: float) -> None:
 	_blur_normals_tensor(data, _blur_separable)
 
 
-def get_preprocessed_params(path: str) -> dict | None:
-	"""Probe preprocessed zarr metadata for scaledown and volume extent.
+def get_preprocessed_params(path: str) -> dict:
+	"""Probe .lasagna.json metadata for scaledown and volume extent.
 
-	Returns dict with keys 'scaledown', 'volume_extent_fullres', or None.
+	Returns dict with keys 'scaledown', 'volume_extent_fullres'.
 	"""
-	p = Path(path)
-	s = str(p)
-	is_omezarr = (
-		s.endswith(".zarr")
-		or s.endswith(".ome.zarr")
-		or (".zarr/" in s)
-		or (".ome.zarr/" in s)
-	)
-	if not is_omezarr:
-		return None
-	try:
-		zsrc = zarr.open(s, mode="r")
-	except Exception:
-		return None
-	if not (isinstance(zsrc, zarr.Array) and int(len(zsrc.shape)) == 4 and int(zsrc.shape[0]) >= 4):
-		return None
-	params = dict(getattr(zsrc, "attrs", {}).get("preprocess_params", {}) or {})
-	if not params:
-		return None
-	ds = float(params["scaledown"])
-	ds_i = max(1, int(round(ds)))
-	C_all, Z_all, Y_all, X_all = (int(v) for v in zsrc.shape)
-	volume_extent_fullres = (X_all * ds_i, Y_all * ds_i, Z_all * ds_i)
-	return {"scaledown": ds, "volume_extent_fullres": volume_extent_fullres}
+	vol = LasagnaVolume.load(path)
+	# Use finest-resolution group to determine volume extent
+	min_sd = min(g.scaledown for g in vol.groups.values())
+	# Find a group at finest resolution, open its zarr to get spatial dims
+	for g in vol.groups.values():
+		if g.scaledown == min_sd:
+			zarr_path = str(vol.path.parent / g.zarr_path)
+			zsrc = zarr.open(zarr_path, mode="r")
+			if not isinstance(zsrc, zarr.Array):
+				raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
+			C, Z, Y, X = (int(v) for v in zsrc.shape)
+			volume_extent_fullres = (X * min_sd, Y * min_sd, Z * min_sd)
+			return {"scaledown": float(min_sd), "volume_extent_fullres": volume_extent_fullres}
+	raise ValueError(f"no groups in {path}")
 
 
 def load_3d(
 	*,
 	path: str,
 	device: torch.device,
-	downscale: float = 4.0,
 	crop: tuple[int, int, int, int, int, int] | None = None,
 	cuda_gridsample: bool = True,
 ) -> FitData3D:
-	"""Load 3D sub-volume from preprocessed zarr.
+	"""Load 3D sub-volume from .lasagna.json manifest.
 
-	crop: (x0, y0, z0, w, h, d) in fullres voxel coords, or None for full volume.
+	crop: (x0, y0, z0, w, h, d) in source-volume voxel coords, or None for full volume.
 	"""
-	p = Path(path)
-	s = str(p)
-	is_omezarr = (
-		s.endswith(".zarr")
-		or s.endswith(".ome.zarr")
-		or (".zarr/" in s)
-		or (".ome.zarr/" in s)
-	)
-	if not is_omezarr:
-		raise ValueError(f"load_3d requires zarr input, got: {s}")
+	vol = LasagnaVolume.load(path)
+	gmag_enc = vol.grad_mag_encode_scale
 
-	try:
-		zsrc = zarr.open(s, mode="r")
-	except Exception as e:
-		raise ValueError(f"cannot open zarr at {p.resolve()}: {e}") from e
-	if not isinstance(zsrc, zarr.Array):
-		raise ValueError(f"expected zarr.Array at {p.resolve()}, got {type(zsrc)}")
-	if int(len(zsrc.shape)) != 4:
-		raise ValueError(f"expected 4D CZYX zarr, got shape={zsrc.shape}")
-
-	params = dict(getattr(zsrc, "attrs", {}).get("preprocess_params", {}) or {})
-	if not params:
-		raise ValueError("preprocessed zarr missing preprocess_params")
-
-	channels = [str(v) for v in (params.get("channels", []) or [])]
-	if not channels:
-		channels = ["cos", "grad_mag", "nx", "ny"]
-	ci = {name: i for i, name in enumerate(channels)}
-
+	# Resolve which channels are available
+	all_ch = vol.all_channels()
 	req = ["cos", "grad_mag", "nx", "ny"]
-	miss = [k for k in req if k not in ci]
+	miss = [k for k in req if k not in all_ch]
 	if miss:
-		raise ValueError(f"preprocessed zarr missing required channels: {miss}; available={channels}")
+		raise ValueError(f"lasagna volume missing required channels: {miss}; available={all_ch}")
 
-	ds_meta = float(params["scaledown"])
-	ds_i = max(1, int(round(ds_meta)))
-	gmag_enc = float(params.get("grad_mag_encode_scale", 255.0))
-	if gmag_enc <= 0.0:
-		raise ValueError(f"invalid grad_mag_encode_scale: {gmag_enc}")
+	def _read_channel(name: str) -> torch.Tensor:
+		"""Read a single channel from its group zarr."""
+		group, ch_idx = vol.channel_group(name)
+		zarr_path = str(vol.path.parent / group.zarr_path)
+		zsrc = zarr.open(zarr_path, mode="r")
+		if not isinstance(zsrc, zarr.Array):
+			raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
+		shape = tuple(int(v) for v in zsrc.shape)
+		if len(shape) != 4:
+			raise ValueError(f"expected 4D CZYX zarr at {zarr_path}, got shape={shape}")
 
-	shape_czyx = tuple(int(v) for v in zsrc.shape)
-	C_all, Z_all, Y_all, X_all = shape_czyx
+		ds_i = group.scaledown
+		C, Z_all, Y_all, X_all = shape
 
-	# Determine read bounds (crop is in fullres voxels, zarr is downscaled by ds_i)
-	if crop is not None:
-		x0, y0, z0, cw, ch, cd = (int(v) for v in crop)
-		x0v = max(0, x0 // ds_i)
-		y0v = max(0, y0 // ds_i)
-		z0v = max(0, z0 // ds_i)
-		x1v = min(X_all, (x0 + cw + ds_i - 1) // ds_i)
-		y1v = min(Y_all, (y0 + ch + ds_i - 1) // ds_i)
-		z1v = min(Z_all, (z0 + cd + ds_i - 1) // ds_i)
-		origin_fullres = (float(x0v * ds_i), float(y0v * ds_i), float(z0v * ds_i))
-	else:
-		x0v, y0v, z0v = 0, 0, 0
-		x1v, y1v, z1v = X_all, Y_all, Z_all
-		origin_fullres = (0.0, 0.0, 0.0)
+		if crop is not None:
+			x0, y0, z0, cw, ch, cd = (int(v) for v in crop)
+			x0v = max(0, x0 // ds_i)
+			y0v = max(0, y0 // ds_i)
+			z0v = max(0, z0 // ds_i)
+			x1v = min(X_all, (x0 + cw + ds_i - 1) // ds_i)
+			y1v = min(Y_all, (y0 + ch + ds_i - 1) // ds_i)
+			z1v = min(Z_all, (z0 + cd + ds_i - 1) // ds_i)
+		else:
+			x0v, y0v, z0v = 0, 0, 0
+			x1v, y1v, z1v = X_all, Y_all, Z_all
 
-	spacing = (float(ds_meta), float(ds_meta), float(ds_meta))
+		print(f"[fit_data] read {name} from {group.zarr_path} ch_idx={ch_idx} "
+			  f"scaledown={ds_i} shape={shape} "
+			  f"z=[{z0v}:{z1v}] y=[{y0v}:{y1v}] x=[{x0v}:{x1v}]", flush=True)
 
-	print(f"[fit_data] load_3d: zarr shape={shape_czyx}, reading "
-		  f"z=[{z0v}:{z1v}] y=[{y0v}:{y1v}] x=[{x0v}:{x1v}], "
-		  f"origin={origin_fullres}, spacing={spacing}", flush=True)
-
-	n_voxels = (z1v - z0v) * (y1v - y0v) * (x1v - x0v)
-	n_channels = 4 + (1 if "pred_dt" in ci else 0)
-	est_bytes = n_voxels * n_channels * 1  # uint8
-	print(f"[fit_data] estimated GPU memory for data: {est_bytes / 2**30:.2f} GiB "
-		  f"({n_channels} uint8 channels, {z1v-z0v}x{y1v-y0v}x{x1v-x0v} voxels)", flush=True)
-
-	def _read_ch(name: str) -> torch.Tensor:
-		a = np.asarray(zsrc[ci[name], z0v:z1v, y0v:y1v, x0v:x1v])
+		a = np.asarray(zsrc[ch_idx, z0v:z1v, y0v:y1v, x0v:x1v])
 		t = torch.from_numpy(a).to(device=device, dtype=torch.uint8)
 		return t.unsqueeze(0).unsqueeze(0)  # (1, 1, Z, Y, X)
 
-	cos_t = _read_ch("cos")
-	mag_t = _read_ch("grad_mag")
-	nx_t = _read_ch("nx")
-	ny_t = _read_ch("ny")
-	pred_dt_t = _read_ch("pred_dt") if "pred_dt" in ci else None
+	cos_t = _read_channel("cos")
+	mag_t = _read_channel("grad_mag")
+	nx_t = _read_channel("nx")
+	ny_t = _read_channel("ny")
+	pred_dt_t = _read_channel("pred_dt") if "pred_dt" in all_ch else None
+
+	# Build per-channel spacing from group scaledowns
+	# Primary spacing = cos channel spacing (finest expected resolution)
+	cos_group, _ = vol.channel_group("cos")
+	primary_sd = float(cos_group.scaledown)
+	primary_spacing = (primary_sd, primary_sd, primary_sd)
+
+	channel_spacing: dict[str, tuple[float, float, float]] = {}
+	for name in ["cos", "grad_mag", "nx", "ny"] + (["pred_dt"] if pred_dt_t is not None else []):
+		g, _ = vol.channel_group(name)
+		sd = float(g.scaledown)
+		channel_spacing[name] = (sd, sd, sd)
+
+	# Origin in source-volume coords
+	if crop is not None:
+		x0, y0, z0 = (int(v) for v in crop[:3])
+		# Align to finest resolution grid
+		finest_sd = min(g.scaledown for g in vol.groups.values())
+		origin_fullres = (
+			float((x0 // finest_sd) * finest_sd),
+			float((y0 // finest_sd) * finest_sd),
+			float((z0 // finest_sd) * finest_sd),
+		)
+	else:
+		origin_fullres = (0.0, 0.0, 0.0)
+
+	print(f"[fit_data] load_3d: origin={origin_fullres} primary_spacing={primary_spacing} "
+		  f"source_to_base={vol.source_to_base}", flush=True)
 
 	return FitData3D(
 		cos=cos_t,
@@ -508,7 +516,9 @@ def load_3d(
 		corr_points=None,
 		winding_volume=None,
 		origin_fullres=origin_fullres,
-		spacing=spacing,
+		spacing=primary_spacing,
+		channel_spacing=channel_spacing,
+		source_to_base=vol.source_to_base,
 		grad_mag_scale=gmag_enc,
 		cuda_gridsample=cuda_gridsample,
 	)

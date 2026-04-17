@@ -42,7 +42,7 @@ _announce_file: Path | None = None
 
 
 def _list_datasets() -> list[dict[str, str]]:
-    """Return available .zarr directories from _data_dir."""
+    """Return available .lasagna.json and .zarr datasets from _data_dir."""
     if not _data_dir:
         return []
     data_path = Path(_data_dir)
@@ -50,7 +50,9 @@ def _list_datasets() -> list[dict[str, str]]:
         return []
     datasets = []
     for entry in sorted(data_path.iterdir()):
-        if entry.is_dir() and entry.name.endswith(".zarr"):
+        if entry.is_file() and entry.name.endswith(".lasagna.json"):
+            datasets.append({"name": entry.name, "path": str(entry.resolve())})
+        elif entry.is_dir() and entry.name.endswith(".zarr"):
             datasets.append({"name": entry.name, "path": str(entry.resolve())})
     return datasets
 

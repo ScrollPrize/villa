@@ -202,3 +202,8 @@ PYTHONPATH=$SRC/vesuvius/src time python $SRC/lasagna/preprocess_cos_omezarr.py 
 
 
 CUDA_VISIBLE_DEVICES=6,7 PYTHONPATH=$SRC/vesuvius/src/:$SRC/lasagna/ torchrun --nproc_per_node=2 --rdzv-backend=c10d --rdzv-endpoint=127.0.0.1:29527 $SRC/lasagna/train_tifxyz.py --config $SRC/lasagna/configs/tifxyz_train_s3_srv.json --run-name lasagna_cont_tifxyz_1e-5_dev6,7 --patch-size 320 --w-cos 1.0 --w-mag 100.0 --w-dir 100.0 --num-workers 4 --batch-size 1 --model-patch-size 320 --lr 2e-5 --w-smooth 100.0 --label-patch-size 192 --weights runs/tifxyz3d/20260415_230919_normals_scratch/model_current.pt --wandb
+
+# new json output
+
+PYTHONPATH=$SRC/vesuvius/src time python $SRC/lasagna/preprocess_cos_omezarr.py predict3d --input $VOL/volumes/20260411134726-2.400um-0.2m-78keV-masked.z
+arr/2/ --tile-size 320 --overlap 80 --border 20 --unet-checkpoint ../runs/20260416_003919_tifxyz_s3_cont_n/model_best.pt --crop 2700 2100 13500 2000 2000 2000 --output las_001.lasagna.json

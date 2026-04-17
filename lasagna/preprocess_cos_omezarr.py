@@ -796,43 +796,37 @@ def _infer_tiled_3d(
 	overlap: int = 64,
 	border: int = 16,
 	out_channels: int = 8,
-	scaledown: int = 1,
+	cos_scaledown: int = 2,
+	other_scaledown: int = 4,
 	tmp_dir: str | None = None,
 	output_sigmoid: bool = True,
-) -> np.ndarray:
-	"""Run 3D UNet inference on a volume using overlapping tiles with linear blending.
+) -> tuple[np.ndarray, np.ndarray]:
+	"""Run 3D UNet inference with dual-resolution accumulators.
 
-	Lazy zarr reads per tile, memmap accumulator on disk, sigmoid + optional
-	downscale applied per tile on GPU.
-
-	Args:
-		model: 3D UNet model in eval mode.
-		zarr_arr: zarr array (Z, Y, X), read lazily per tile.
-		crop_slices: (z0, z1, y0, y1, x0, x1) crop region in zarr coords.
-		device: torch device for inference.
-		tile_size: cube tile edge length.
-		overlap: tile overlap in voxels.
-		border: hard-discard border at tile edges.
-		out_channels: number of model output channels.
-		scaledown: spatial downscale factor applied per tile (must divide
-			tile_size, stride, and border evenly).
+	Channel 0 (cos) is accumulated at cos_scaledown resolution.
+	Channels 1..out_channels-1 are accumulated at other_scaledown resolution.
 
 	Returns:
-		(out_channels, Z_out, Y_out, X_out) float32 numpy array of
-		sigmoid-activated (and optionally downscaled) predictions.
+		(cos_result, other_result) where:
+		  cos_result:   (1, Z_fine, Y_fine, X_fine) float32
+		  other_result: (out_channels-1, Z_coarse, Y_coarse, X_coarse) float32
 	"""
 	z0, z1, y0, y1, x0, x1 = crop_slices
 	nz, ny, nx = z1 - z0, y1 - y0, x1 - x0
 	volume_shape = tuple(int(v) for v in zarr_arr.shape)
 
-	sd = max(1, int(scaledown))
+	sd_fine = max(1, int(cos_scaledown))
+	sd_coarse = max(1, int(other_scaledown))
+	# Use finest scaledown for tiling alignment
+	sd_min = min(sd_fine, sd_coarse)
 	stride = max(1, tile_size - overlap)
 
 	# Validate alignment
-	if sd > 1:
-		for name, val in [("tile_size", tile_size), ("stride", stride), ("border", border)]:
-			if val % sd != 0:
-				raise ValueError(f"{name}={val} must be divisible by scaledown={sd}")
+	for sd_label, sd_val in [("cos_scaledown", sd_fine), ("other_scaledown", sd_coarse)]:
+		if sd_val > 1:
+			for name, val in [("tile_size", tile_size), ("stride", stride), ("border", border)]:
+				if val % sd_val != 0:
+					raise ValueError(f"{name}={val} must be divisible by {sd_label}={sd_val}")
 
 	# Padded crop dimensions (border on each side)
 	pad0 = max(0, int(border))
@@ -840,16 +834,16 @@ def _infer_tiled_3d(
 	Yp = ny + 2 * pad0
 	Xp = nx + 2 * pad0
 
-	# Round up to scaledown-multiple
-	if sd > 1:
-		Zp = ((Zp + sd - 1) // sd) * sd
-		Yp = ((Yp + sd - 1) // sd) * sd
-		Xp = ((Xp + sd - 1) // sd) * sd
+	# Round up to coarsest scaledown-multiple
+	sd_max = max(sd_fine, sd_coarse)
+	if sd_max > 1:
+		Zp = ((Zp + sd_max - 1) // sd_max) * sd_max
+		Yp = ((Yp + sd_max - 1) // sd_max) * sd_max
+		Xp = ((Xp + sd_max - 1) // sd_max) * sd_max
 
-	# Output dimensions
-	Zo = Zp // sd
-	Yo = Yp // sd
-	Xo = Xp // sd
+	# Output dimensions for each accumulator
+	Zo_f, Yo_f, Xo_f = Zp // sd_fine, Yp // sd_fine, Xp // sd_fine
+	Zo_c, Yo_c, Xo_c = Zp // sd_coarse, Yp // sd_coarse, Xp // sd_coarse
 
 	ov_eff = max(0, overlap - 2 * border)
 
@@ -893,37 +887,40 @@ def _infer_tiled_3d(
 		rz_full[:, None, None] * ry_full[None, :, None] * rx_full[None, None, :]
 	).to(device)  # (tile, tile, tile)
 
-	# Precompute downscaled weight (or full-res weight) as numpy for accumulation
-	if sd > 1:
-		w_lr = _pyrdown3d(w_full.unsqueeze(0), factor=sd).squeeze(0).cpu().numpy()  # (tile//sd, tile//sd, tile//sd)
-	else:
-		w_lr = w_full.cpu().numpy()  # (tile, tile, tile)
+	# Precompute downscaled weights for each accumulator
+	w_fine = (_pyrdown3d(w_full.unsqueeze(0), factor=sd_fine).squeeze(0).cpu().numpy()
+			  if sd_fine > 1 else w_full.cpu().numpy())
+	w_coarse = (_pyrdown3d(w_full.unsqueeze(0), factor=sd_coarse).squeeze(0).cpu().numpy()
+				if sd_coarse > 1 else w_full.cpu().numpy())
 
-	# Memmap accumulators — place next to output to avoid /tmp (often tmpfs) overflow
-	if tmp_dir:
-		acc_path = os.path.join(tmp_dir, ".predict3d_acc.tmp")
-		wsum_path = os.path.join(tmp_dir, ".predict3d_wsum.tmp")
-	else:
-		acc_path = tempfile.mktemp(suffix=".acc")
-		wsum_path = tempfile.mktemp(suffix=".wsum")
+	# Memmap accumulators — place next to output to avoid /tmp overflow
+	def _make_memmap(suffix, shape):
+		if tmp_dir:
+			p = os.path.join(tmp_dir, f".predict3d_{suffix}.tmp")
+		else:
+			p = tempfile.mktemp(suffix=f".{suffix}")
+		mm = np.memmap(p, dtype=np.float32, mode="w+", shape=shape)
+		try:
+			os.unlink(p)
+		except OSError:
+			pass
+		return mm
 
-	acc_shape = (out_channels, Zo, Yo, Xo)
-	wsum_shape = (1, Zo, Yo, Xo)
+	n_other = out_channels - 1
+	acc_fine = _make_memmap("acc_fine", (1, Zo_f, Yo_f, Xo_f))
+	wsum_fine = _make_memmap("wsum_fine", (1, Zo_f, Yo_f, Xo_f))
+	acc_coarse = _make_memmap("acc_coarse", (n_other, Zo_c, Yo_c, Xo_c))
+	wsum_coarse = _make_memmap("wsum_coarse", (1, Zo_c, Yo_c, Xo_c))
+
+	fine_bytes = (np.prod(acc_fine.shape) + np.prod(wsum_fine.shape)) * 4
+	coarse_bytes = (np.prod(acc_coarse.shape) + np.prod(wsum_coarse.shape)) * 4
 	print(
-		f"[predict3d] memmap accumulator shape={acc_shape} "
-		f"({np.prod(acc_shape) * 4 / (1024**3):.2f} GiB) + wsum "
-		f"({np.prod(wsum_shape) * 4 / (1024**3):.2f} GiB)",
+		f"[predict3d] accumulators: fine ({1},{Zo_f},{Yo_f},{Xo_f}) sd={sd_fine} "
+		f"({fine_bytes / (1024**3):.2f} GiB) + "
+		f"coarse ({n_other},{Zo_c},{Yo_c},{Xo_c}) sd={sd_coarse} "
+		f"({coarse_bytes / (1024**3):.2f} GiB)",
 		flush=True,
 	)
-	acc = np.memmap(acc_path, dtype=np.float32, mode="w+", shape=acc_shape)
-	wsum = np.memmap(wsum_path, dtype=np.float32, mode="w+", shape=wsum_shape)
-
-	# Delete temp files immediately — memmap keeps them open, OS cleans up after
-	try:
-		os.unlink(acc_path)
-		os.unlink(wsum_path)
-	except OSError:
-		pass
 
 	total_tiles = len(z_positions) * len(y_positions) * len(x_positions)
 	done = 0
@@ -946,11 +943,10 @@ def _infer_tiled_3d(
 
 				with torch.inference_mode(), torch.autocast(device_type=device.type, dtype=torch.bfloat16):
 					pred = model(tile_t)
-				# Model returns dict {"output": tensor} or plain tensor
 				if isinstance(pred, dict):
 					pred = pred["output"]
 
-				# Diagnostics: check for NaN at each stage
+				# Diagnostics
 				raw_nan = torch.isnan(pred).sum().item()
 				if raw_nan > 0 or done == 0:
 					print(flush=True)
@@ -970,29 +966,35 @@ def _infer_tiled_3d(
 				else:
 					pred = pred.float().clamp(0.0, 1.0)
 
-				# Apply blend weight on GPU
-				pred_w = pred[0] * w_full  # (C, tz, ty, tx)
+				# Split channels and accumulate at different resolutions
+				pred_cos = pred[0, 0:1] * w_full    # (1, tz, ty, tx)
+				pred_other = pred[0, 1:] * w_full    # (C-1, tz, ty, tx)
 
-				# Downscale on GPU if needed
-				if sd > 1:
-					pred_w = _pyrdown3d(pred_w, factor=sd)  # (C, tz/sd, ty/sd, tx/sd)
+				# Downscale cos channel
+				if sd_fine > 1:
+					pred_cos = _pyrdown3d(pred_cos, factor=sd_fine)
+				cos_np = pred_cos.cpu().numpy()
+				ts_f = tile_size // sd_fine
+				azl_f, ayl_f, axl_f = tz // sd_fine, ty // sd_fine, tx // sd_fine
+				azr_f = min(azl_f + ts_f, Zo_f)
+				ayr_f = min(ayl_f + ts_f, Yo_f)
+				axr_f = min(axl_f + ts_f, Xo_f)
+				pz_f, py_f, px_f = azr_f - azl_f, ayr_f - ayl_f, axr_f - axl_f
+				acc_fine[:, azl_f:azr_f, ayl_f:ayr_f, axl_f:axr_f] += cos_np[:, :pz_f, :py_f, :px_f]
+				wsum_fine[0, azl_f:azr_f, ayl_f:ayr_f, axl_f:axr_f] += w_fine[:pz_f, :py_f, :px_f]
 
-				pred_np = pred_w.cpu().numpy()  # (C, tz_out, ty_out, tx_out)
-
-				# Accumulator coords in output space
-				azl = tz // sd
-				ayl = ty // sd
-				axl = tx // sd
-				ts_out = tile_size // sd
-				azr = min(azl + ts_out, Zo)
-				ayr = min(ayl + ts_out, Yo)
-				axr = min(axl + ts_out, Xo)
-				pzo = azr - azl
-				pyo = ayr - ayl
-				pxo = axr - axl
-
-				acc[:, azl:azr, ayl:ayr, axl:axr] += pred_np[:, :pzo, :pyo, :pxo]
-				wsum[0, azl:azr, ayl:ayr, axl:axr] += w_lr[:pzo, :pyo, :pxo]
+				# Downscale other channels
+				if sd_coarse > 1:
+					pred_other = _pyrdown3d(pred_other, factor=sd_coarse)
+				other_np = pred_other.cpu().numpy()
+				ts_c = tile_size // sd_coarse
+				azl_c, ayl_c, axl_c = tz // sd_coarse, ty // sd_coarse, tx // sd_coarse
+				azr_c = min(azl_c + ts_c, Zo_c)
+				ayr_c = min(ayl_c + ts_c, Yo_c)
+				axr_c = min(axl_c + ts_c, Xo_c)
+				pz_c, py_c, px_c = azr_c - azl_c, ayr_c - ayl_c, axr_c - axl_c
+				acc_coarse[:, azl_c:azr_c, ayl_c:ayr_c, axl_c:axr_c] += other_np[:, :pz_c, :py_c, :px_c]
+				wsum_coarse[0, azl_c:azr_c, ayl_c:ayr_c, axl_c:axr_c] += w_coarse[:pz_c, :py_c, :px_c]
 
 				done += 1
 				elapsed = max(1e-6, time.time() - t0)
@@ -1013,19 +1015,20 @@ def _infer_tiled_3d(
 	print(f"[predict3d] inference done in {time.time() - t0:.1f}s ({total_tiles} tiles)", flush=True)
 
 	# Normalize
-	acc /= np.maximum(wsum, 1e-7)
+	acc_fine /= np.maximum(wsum_fine, 1e-7)
+	acc_coarse /= np.maximum(wsum_coarse, 1e-7)
 
-	# Trim padding (border // sd on each side) back to crop-sized output
-	b_out = pad0 // sd
-	nz_out = nz // sd if sd > 1 else nz
-	ny_out = ny // sd if sd > 1 else ny
-	nx_out = nx // sd if sd > 1 else nx
-	result = np.array(acc[:, b_out:b_out + nz_out, b_out:b_out + ny_out, b_out:b_out + nx_out])
+	# Trim padding back to crop-sized output
+	b_f = pad0 // sd_fine
+	b_c = pad0 // sd_coarse
+	nz_f, ny_f, nx_f = nz // sd_fine, ny // sd_fine, nx // sd_fine
+	nz_c, ny_c, nx_c = nz // sd_coarse, ny // sd_coarse, nx // sd_coarse
 
-	# Clean up memmaps
-	del acc, wsum
+	result_fine = np.array(acc_fine[:, b_f:b_f + nz_f, b_f:b_f + ny_f, b_f:b_f + nx_f])
+	result_coarse = np.array(acc_coarse[:, b_c:b_c + nz_c, b_c:b_c + ny_c, b_c:b_c + nx_c])
 
-	return result
+	del acc_fine, wsum_fine, acc_coarse, wsum_coarse
+	return result_fine, result_coarse
 
 
 def run_preprocess_3d(
@@ -1038,7 +1041,9 @@ def run_preprocess_3d(
 	tile_size: int,
 	overlap: int,
 	border: int,
-	scaledown: int,
+	cos_scaledown: int = 2,
+	scaledown: int = 4,
+	source_to_base: float = 1.0,
 	pred_dt_path: str | None = None,
 	chunk_z: int = 32,
 	chunk_yx: int = 32,
@@ -1046,14 +1051,19 @@ def run_preprocess_3d(
 	edt_chunk_yx: int = 448,
 	calibrate_norm: bool = False,
 ) -> None:
-	"""Run 3D UNet inference on a volume and write preprocessed zarr.
+	"""Run 3D UNet inference and write .lasagna.json with per-group zarrs.
 
-	Output format matches fit_data.load_3d(): channels [cos, grad_mag, nx, ny]
-	(+ optional pred_dt) as uint8 with preprocess_params metadata.
+	Output: <output_dir>/<name>.lasagna.json + cos.zarr, prediction.zarr, pred_dt.zarr
 
-	Memory-efficient: reads tiles lazily from zarr, accumulates in a
-	disk-backed memmap, and post-processes in Z-chunks.
+	cos channel is stored at cos_scaledown resolution.
+	grad_mag, nx, ny are stored at scaledown resolution.
+	pred_dt (if provided) is stored at scaledown resolution.
 	"""
+	from lasagna_volume import LasagnaVolume, ChannelGroup
+
+	if not output_path.endswith(".lasagna.json"):
+		raise ValueError(f"output must be .lasagna.json, got: {output_path}")
+
 	a_in = zarr.open(str(input_path), mode="r")
 	if not hasattr(a_in, "shape"):
 		raise ValueError(f"input must point to a zarr array, got: {input_path}")
@@ -1067,8 +1077,6 @@ def run_preprocess_3d(
 	nx_dim = x1 - x0
 	if nz <= 0 or ny <= 0 or nx_dim <= 0:
 		raise ValueError(f"empty crop: x=[{x0},{x1}) y=[{y0},{y1}) z=[{z0},{z1}) in shape={sh}")
-	if scaledown <= 0:
-		raise ValueError("scaledown must be >= 1")
 
 	if device is None:
 		device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1076,31 +1084,59 @@ def run_preprocess_3d(
 
 	print(
 		f"[predict3d] input={input_path} shape={sh} "
-		f"crop=({x0},{y0},{z0},{nx_dim},{ny},{nz}) scaledown={scaledown}",
+		f"crop=({x0},{y0},{z0},{nx_dim},{ny},{nz}) "
+		f"cos_scaledown={cos_scaledown} scaledown={scaledown}",
 		flush=True,
 	)
 
-	# Output dimensions
-	full_out_z = _ds_size(sh[0], scaledown)
-	full_out_y = _ds_size(sh[1], scaledown)
-	full_out_x = _ds_size(sh[2], scaledown)
+	out_dir = os.path.dirname(os.path.abspath(output_path))
+	os.makedirs(out_dir, exist_ok=True)
 
-	oz0 = _ds_index(z0, scaledown)
-	oy0 = _ds_index(y0, scaledown)
-	ox0 = _ds_index(x0, scaledown)
-	out_nz = _ds_size(nz, scaledown)
-	out_ny = _ds_size(ny, scaledown)
-	out_nx = _ds_size(nx_dim, scaledown)
-	oz1 = min(full_out_z, oz0 + out_nz)
-	oy1 = min(full_out_y, oy0 + out_ny)
-	ox1 = min(full_out_x, ox0 + out_nx)
-	wz = oz1 - oz0
-	wy = oy1 - oy0
-	wx = ox1 - ox0
+	# Derive zarr name prefix from JSON filename: "s5.lasagna.json" → "s5_"
+	json_stem = os.path.basename(output_path).removesuffix(".lasagna.json")
+	prefix = f"{json_stem}_" if json_stem else ""
 
-	channel_names: list[str] = ["cos", "grad_mag", "nx", "ny"]
+	# Output dimensions for each resolution
+	cos_sd = max(1, int(cos_scaledown))
+	other_sd = max(1, int(scaledown))
 
-	# Validate pred-dt
+	full_cos_z = _ds_size(sh[0], cos_sd)
+	full_cos_y = _ds_size(sh[1], cos_sd)
+	full_cos_x = _ds_size(sh[2], cos_sd)
+
+	full_other_z = _ds_size(sh[0], other_sd)
+	full_other_y = _ds_size(sh[1], other_sd)
+	full_other_x = _ds_size(sh[2], other_sd)
+
+	# Crop offsets for each resolution
+	cos_oz0 = _ds_index(z0, cos_sd)
+	cos_oy0 = _ds_index(y0, cos_sd)
+	cos_ox0 = _ds_index(x0, cos_sd)
+	cos_oz1 = min(full_cos_z, cos_oz0 + _ds_size(nz, cos_sd))
+	cos_oy1 = min(full_cos_y, cos_oy0 + _ds_size(ny, cos_sd))
+	cos_ox1 = min(full_cos_x, cos_ox0 + _ds_size(nx_dim, cos_sd))
+
+	other_oz0 = _ds_index(z0, other_sd)
+	other_oy0 = _ds_index(y0, other_sd)
+	other_ox0 = _ds_index(x0, other_sd)
+	other_oz1 = min(full_other_z, other_oz0 + _ds_size(nz, other_sd))
+	other_oy1 = min(full_other_y, other_oy0 + _ds_size(ny, other_sd))
+	other_ox1 = min(full_other_x, other_ox0 + _ds_size(nx_dim, other_sd))
+
+	# Load or create the .lasagna.json manifest
+	json_path = Path(output_path)
+	if json_path.exists():
+		vol = LasagnaVolume.load(json_path)
+		print(f"[predict3d] loaded existing manifest: {output_path}", flush=True)
+	else:
+		vol = LasagnaVolume(
+			path=json_path.resolve(),
+			source_to_base=source_to_base,
+			crop_xyzwhd=(int(x0), int(y0), int(z0), int(nx_dim), int(ny), int(nz))
+				if crop_xyzwhd is not None else None,
+		)
+
+	# Validate pred-dt source
 	if pred_dt_path:
 		pred_dt_path = pred_dt_path.rstrip("/")
 		_pred_check = zarr.open(str(pred_dt_path), mode="r")
@@ -1111,86 +1147,65 @@ def run_preprocess_3d(
 			raise ValueError(f"pred-dt array must be 3D (Z,Y,X), got shape {_pred_shape}")
 		print(f"[predict3d] pred-dt={pred_dt_path} shape={_pred_shape}", flush=True)
 		del _pred_check, _pred_shape
-		channel_names.append("pred_dt")
 
-	n_ch = len(channel_names)
-	expected_shape = (n_ch, full_out_z, full_out_y, full_out_x)
-	chunk_sizes = (
-		1,
-		min(full_out_z, max(1, chunk_z)),
-		min(full_out_y, max(1, chunk_yx)),
-		min(full_out_x, max(1, chunk_yx)),
-	)
-
-	# --- Resume logic: reuse existing zarr if shape matches ---
-	arr = None
-	skip_pred_dt = False
-	skip_inference = False
-	if os.path.exists(output_path):
-		try:
-			arr = zarr.open(str(output_path), mode="r+")
-			if hasattr(arr, "shape") and tuple(int(v) for v in arr.shape) == expected_shape:
-				print(f"[predict3d] resuming: existing zarr matches shape {expected_shape}", flush=True)
-				# Check pred_dt: sample middle Z-slab in crop region
-				if pred_dt_path:
-					pred_dt_ch = channel_names.index("pred_dt")
-					sample_z = (oz0 + oz1) // 2
-					sample = np.asarray(arr[pred_dt_ch, sample_z, oy0:oy1, ox0:ox1])
-					if np.any(sample != 0):
-						skip_pred_dt = True
-						print(f"[predict3d] resuming: pred_dt (ch{pred_dt_ch}) has data, skipping Phase 1", flush=True)
-				# Check inference: sample cos channel in crop region
-				sample_z = (oz0 + oz1) // 2
-				sample = np.asarray(arr[0, sample_z, oy0:oy1, ox0:ox1])
-				if np.any(sample != 0):
-					skip_inference = True
-					print(f"[predict3d] resuming: cos (ch0) has data, skipping Phase 2+3", flush=True)
-			else:
-				existing_shape = tuple(int(v) for v in arr.shape) if hasattr(arr, "shape") else "group"
-				print(f"[predict3d] existing zarr shape {existing_shape} != {expected_shape}, recreating", flush=True)
-				arr = None
-		except Exception:
-			arr = None
-
-	if arr is None:
-		arr = zarr.open(
-			str(output_path),
-			mode="w",
-			shape=expected_shape,
-			chunks=chunk_sizes,
-			dtype=np.uint8,
-			fill_value=0,
-			zarr_format=2,
+	def _chunk_sizes(n_ch, full_z, full_y, full_x):
+		return (
+			1,
+			min(full_z, max(1, chunk_z)),
+			min(full_y, max(1, chunk_yx)),
+			min(full_x, max(1, chunk_yx)),
 		)
-		arr.attrs["preprocess_params"] = {
-			"scaledown": int(scaledown),
-			"grad_mag_encode_scale": 1000.0,
-			"channels": channel_names,
-			"crop_xyzwhd": [int(x0), int(y0), int(z0), int(nx_dim), int(ny), int(nz)],
-			"output_full_scaled": True,
-			"source": "predict3d",
-		}
 
-	print(
-		f"[predict3d] output {output_path} shape={expected_shape} "
-		f"crop=[{oz0}:{oz1},{oy0}:{oy1},{ox0}:{ox1}]",
-		flush=True,
-	)
+	# --- Helper: open or create a group zarr ---
+	def _open_group_zarr(zarr_name, n_ch, full_z, full_y, full_x):
+		zarr_path = os.path.join(out_dir, zarr_name)
+		expected = (n_ch, full_z, full_y, full_x)
+		cs = _chunk_sizes(n_ch, full_z, full_y, full_x)
+		if os.path.exists(zarr_path):
+			arr = zarr.open(str(zarr_path), mode="r+")
+			if hasattr(arr, "shape") and tuple(int(v) for v in arr.shape) == expected:
+				return arr
+			print(f"[predict3d] {zarr_name} shape mismatch, recreating", flush=True)
+		return zarr.open(str(zarr_path), mode="w", shape=expected, chunks=cs,
+						 dtype=np.uint8, fill_value=0, zarr_format=2)
 
-	# --- Phase 1: pred_dt (runs first so GPU OOM fails fast) ---
+	# --- Helper: check if a zarr already has data ---
+	def _zarr_has_data(arr, oz0, oz1, oy0, oy1):
+		sample_z = (oz0 + oz1) // 2
+		sample = np.asarray(arr[0, sample_z, oy0:oy1, :])
+		return np.any(sample != 0)
+
+	# Open group zarrs
+	cos_arr = _open_group_zarr(f"{prefix}cos.zarr", 1, full_cos_z, full_cos_y, full_cos_x)
+	pred_arr = _open_group_zarr(f"{prefix}prediction.zarr", 3, full_other_z, full_other_y, full_other_x)
+
+	# --- Resume logic ---
+	skip_inference = _zarr_has_data(cos_arr, cos_oz0, cos_oz1, cos_oy0, cos_oy1)
+	if skip_inference:
+		print(f"[predict3d] resuming: cos.zarr has data, skipping inference", flush=True)
+
+	skip_pred_dt = False
+	if pred_dt_path:
+		dt_arr = _open_group_zarr(f"{prefix}pred_dt.zarr", 1, full_other_z, full_other_y, full_other_x)
+		if _zarr_has_data(dt_arr, other_oz0, other_oz1, other_oy0, other_oy1):
+			skip_pred_dt = True
+			print(f"[predict3d] resuming: pred_dt.zarr has data, skipping Phase 1", flush=True)
+
+	# --- Phase 1: pred_dt ---
 	if pred_dt_path and not skip_pred_dt:
-		pred_dt_ch = channel_names.index("pred_dt")
 		_compute_pred_dt_channel(
 			pred_path=pred_dt_path,
-			output_arr=arr,
-			channel_idx=pred_dt_ch,
-			ref_z=full_out_z, ref_y=full_out_y, ref_x=full_out_x,
-			scaledown=scaledown,
+			output_arr=dt_arr,
+			channel_idx=0,
+			ref_z=full_other_z, ref_y=full_other_y, ref_x=full_other_x,
+			scaledown=other_sd,
 			crop_xyzwhd=[int(x0), int(y0), int(z0), int(nx_dim), int(ny), int(nz)]
 				if crop_xyzwhd is not None else None,
 			chunk_depth=edt_chunk_depth,
 			chunk_yx=edt_chunk_yx,
 		)
+		vol.update_group("pred_dt", ChannelGroup(
+			zarr_path=f"{prefix}pred_dt.zarr", scaledown=other_sd, channels=["pred_dt"]))
 
 	# --- Phase 2: tiled 3D inference ---
 	if not skip_inference:
@@ -1205,67 +1220,86 @@ def run_preprocess_3d(
 				tile_size=tile_size,
 			)
 
-		out_dir = os.path.dirname(os.path.abspath(output_path))
-		pred = _infer_tiled_3d(
+		pred_cos, pred_other = _infer_tiled_3d(
 			model, a_in,
 			crop_slices=(z0, z1, y0, y1, x0, x1),
 			device=torch_device,
 			tile_size=tile_size,
 			overlap=overlap,
 			border=border,
-			scaledown=scaledown,
+			cos_scaledown=cos_sd,
+			other_scaledown=other_sd,
 			tmp_dir=out_dir,
 			output_sigmoid=_output_sigmoid,
-		)  # (8, out_nz, out_ny, out_nx) float32, activated to [0,1]
+		)
 		del model
 		torch.cuda.empty_cache()
 
-		# Diagnostic: verify inference produced meaningful data
+		# Diagnostic
 		print(
-			f"[predict3d] inference result shape={pred.shape} "
-			f"min={pred.min():.4f} max={pred.max():.4f} mean={pred.mean():.4f}",
+			f"[predict3d] cos result shape={pred_cos.shape} "
+			f"min={pred_cos.min():.4f} max={pred_cos.max():.4f}",
 			flush=True,
 		)
-		for ci in range(min(pred.shape[0], 8)):
-			ch = pred[ci]
-			print(
-				f"  ch{ci}: min={ch.min():.4f} max={ch.max():.4f} "
-				f"mean={ch.mean():.4f} nonzero={np.count_nonzero(ch)}/{ch.size}",
-				flush=True,
-			)
+		print(
+			f"[predict3d] other result shape={pred_other.shape} "
+			f"min={pred_other.min():.4f} max={pred_other.max():.4f}",
+			flush=True,
+		)
 
-		# --- Phase 3: post-process and write channels 0–3 ---
+		# --- Phase 3: post-process and write ---
+		cos_wz = cos_oz1 - cos_oz0
+		cos_wy = cos_oy1 - cos_oy0
+		cos_wx = cos_ox1 - cos_ox0
+		other_wz = other_oz1 - other_oz0
+		other_wy = other_oy1 - other_oy0
+		other_wx = other_ox1 - other_ox0
+
+		# Write cos channel to cos.zarr
 		post_chunk_z = max(1, chunk_z)
-		for zs in range(0, wz, post_chunk_z):
-			ze = min(wz, zs + post_chunk_z)
-			# Channels 0-1: cos, grad_mag — simple uint8 encode
-			cos_slab = pred[0, zs:ze, :wy, :wx]
-			gm_slab = pred[1, zs:ze, :wy, :wx]
-			arr[0, oz0 + zs:oz0 + ze, oy0:oy1, ox0:ox1] = np.clip(
+		for zs in range(0, cos_wz, post_chunk_z):
+			ze = min(cos_wz, zs + post_chunk_z)
+			cos_slab = pred_cos[0, zs:ze, :cos_wy, :cos_wx]
+			cos_arr[0, cos_oz0 + zs:cos_oz0 + ze, cos_oy0:cos_oy1, cos_ox0:cos_ox1] = np.clip(
 				cos_slab * 255.0, 0.0, 255.0).astype(np.uint8)
-			arr[1, oz0 + zs:oz0 + ze, oy0:oy1, ox0:ox1] = np.clip(
+		del pred_cos
+
+		# Write grad_mag, nx, ny to prediction.zarr
+		# pred_other channels: [grad_mag(0), dir0z(1), dir1z(2), dir0y(3), dir1y(4), dir0x(5), dir1x(6)]
+		for zs in range(0, other_wz, post_chunk_z):
+			ze = min(other_wz, zs + post_chunk_z)
+			# grad_mag
+			gm_slab = pred_other[0, zs:ze, :other_wy, :other_wx]
+			pred_arr[0, other_oz0 + zs:other_oz0 + ze, other_oy0:other_oy1, other_ox0:other_ox1] = np.clip(
 				gm_slab * 1000.0, 0.0, 255.0).astype(np.uint8)
 
-			# Channels 2-7: dir channels -> normal estimation -> nx, ny uint8
-			d0z = pred[2, zs:ze, :wy, :wx]
-			d1z = pred[3, zs:ze, :wy, :wx]
-			d0y = pred[4, zs:ze, :wy, :wx]
-			d1y = pred[5, zs:ze, :wy, :wx]
-			d0x = pred[6, zs:ze, :wy, :wx]
-			d1x = pred[7, zs:ze, :wy, :wx]
+			# Direction channels -> normal estimation
+			d0z = pred_other[1, zs:ze, :other_wy, :other_wx]
+			d1z = pred_other[2, zs:ze, :other_wy, :other_wx]
+			d0y = pred_other[3, zs:ze, :other_wy, :other_wx]
+			d1y = pred_other[4, zs:ze, :other_wy, :other_wx]
+			d0x = pred_other[5, zs:ze, :other_wy, :other_wx]
+			d1x = pred_other[6, zs:ze, :other_wy, :other_wx]
 			_, _, _, nx_n, ny_n, nz_n = _estimate_normal(d0z, d1z, d0y, d1y, d0x, d1x)
 			# Flip to +z hemisphere
 			flip = np.where(nz_n < 0, -1.0, 1.0)
 			nx_n = nx_n * flip
 			ny_n = ny_n * flip
-			arr[2, oz0 + zs:oz0 + ze, oy0:oy1, ox0:ox1] = np.clip(
+			pred_arr[1, other_oz0 + zs:other_oz0 + ze, other_oy0:other_oy1, other_ox0:other_ox1] = np.clip(
 				np.round(nx_n * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
-			arr[3, oz0 + zs:oz0 + ze, oy0:oy1, ox0:ox1] = np.clip(
+			pred_arr[2, other_oz0 + zs:other_oz0 + ze, other_oy0:other_oy1, other_ox0:other_ox1] = np.clip(
 				np.round(ny_n * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
+		del pred_other
 
-		del pred
+		# Update manifest with cos and prediction groups
+		vol.update_group("cos", ChannelGroup(
+			zarr_path=f"{prefix}cos.zarr", scaledown=cos_sd, channels=["cos"]))
+		vol.update_group("prediction", ChannelGroup(
+			zarr_path=f"{prefix}prediction.zarr", scaledown=other_sd, channels=["grad_mag", "nx", "ny"]))
 
-	print("[predict3d] done.", flush=True)
+	# Always save the manifest (in case only pred_dt was updated)
+	vol.save()
+	print(f"[predict3d] done. manifest: {output_path}", flush=True)
 
 
 _N_WORKERS = min(16, os.cpu_count() or 4)
@@ -1965,17 +1999,20 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		pass
 
 	p = argparse.ArgumentParser(
-		description="Run 3D UNet inference on a volume and write preprocessed zarr with cos/grad_mag/nx/ny channels.",
+		description="Run 3D UNet inference and write .lasagna.json with per-group zarrs (cos, prediction, pred_dt).",
 		formatter_class=argparse.ArgumentDefaultsHelpFormatter,
 	)
 	p.add_argument("--input", required=True, help="Input zarr array (3D ZYX).")
-	p.add_argument("--output", required=True, help="Output zarr path.")
+	p.add_argument("--output", required=True, help="Output .lasagna.json path.")
 	p.add_argument("--unet-checkpoint", required=True, help="3D UNet checkpoint (.pt).")
 	p.add_argument("--tile-size", type=int, default=256,
 		help="Tile size, must be compatible with model architecture.")
 	p.add_argument("--overlap", type=int, default=64, help="Tile overlap in voxels.")
 	p.add_argument("--border", type=int, default=16, help="Hard discard border at tile edges.")
-	p.add_argument("--scaledown", type=int, default=4, help="Output downsample factor.")
+	p.add_argument("--cos-scaledown", type=int, default=2, help="Downsample factor for cos channel.")
+	p.add_argument("--scaledown", type=int, default=4, help="Downsample factor for other channels.")
+	p.add_argument("--source-to-base", type=float, default=1.0,
+		help="Source volume to base (VC3D) coordinate factor.")
 	p.add_argument("--crop", "--crop-xyzwhd", dest="crop_xyzwhd", type=int, nargs=6, default=None,
 		metavar=("X", "Y", "Z", "W", "H", "D"), help="Crop region: x y z w h d.")
 	p.add_argument("--pred-dt", default=None, help="Prediction zarr for distance-to-surface channel.")
@@ -1997,7 +2034,9 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		tile_size=int(args.tile_size),
 		overlap=int(args.overlap),
 		border=int(args.border),
+		cos_scaledown=int(args.cos_scaledown),
 		scaledown=int(args.scaledown),
+		source_to_base=float(args.source_to_base),
 		pred_dt_path=str(args.pred_dt) if args.pred_dt else None,
 		chunk_z=int(args.chunk_z),
 		chunk_yx=int(args.chunk_yx),

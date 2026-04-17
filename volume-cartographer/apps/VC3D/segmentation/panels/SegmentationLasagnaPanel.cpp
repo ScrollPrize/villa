@@ -106,7 +106,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     auto* browseLayout = new QHBoxLayout(browseWidget);
     browseLayout->setContentsMargins(0, 0, 0, 0);
     _dataInputEdit = new QLineEdit(browseWidget);
-    _dataInputEdit->setPlaceholderText(tr("Path to input data (.zarr)"));
+    _dataInputEdit->setPlaceholderText(tr("Path to input data (.lasagna.json)"));
     _dataInputBrowse = new QToolButton(browseWidget);
     _dataInputBrowse->setText(QStringLiteral("..."));
     browseLayout->addWidget(_dataInputEdit, 1);
@@ -121,7 +121,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
 
     _connectionGroup->addRow(tr("Data:"), [&](QHBoxLayout* row) {
         row->addWidget(_dataInputStack, 1);
-    }, tr("Input data zarr (e.g. s5_cos.zarr) required by the lasagna."));
+    }, tr("Input data (.lasagna.json) required by the lasagna."));
 
     panelLayout->addWidget(_connectionGroup);
 
@@ -404,8 +404,9 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     connect(_dataInputBrowse, &QToolButton::clicked, this, [this]() {
         QString initial = _lasagnaDataInputPath.isEmpty()
             ? QDir::homePath() : QFileInfo(_lasagnaDataInputPath).absolutePath();
-        QString path = QFileDialog::getExistingDirectory(
-            this, tr("Select input data (.zarr directory)"), initial);
+        QString path = QFileDialog::getOpenFileName(
+            this, tr("Select lasagna volume (.lasagna.json)"), initial,
+            tr("Lasagna volumes (*.lasagna.json);;All files (*)"));
         if (!path.isEmpty()) {
             _lasagnaDataInputPath = path;
             _dataInputEdit->setText(path);

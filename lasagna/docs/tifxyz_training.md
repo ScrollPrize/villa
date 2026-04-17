@@ -476,6 +476,80 @@ dataset samples with the same chain labels wired into the training loop.
 Use it to sanity-check chain ordering before long runs.
 
 
+## 3D Inference (predict3d)
+
+Run 3D UNet inference on a CT volume and write a `.lasagna.json` manifest with per-group zarr arrays:
+
+```bash
+python lasagna/preprocess_cos_omezarr.py predict3d \
+    --input vol.zarr --output pred.lasagna.json \
+    --unet-checkpoint model_best.pt \
+    --cos-scaledown 2 --scaledown 4
+
+# Add pred-dt channel later (updates existing JSON, leaves cos/prediction untouched):
+python lasagna/preprocess_cos_omezarr.py predict3d \
+    --input vol.zarr --output pred.lasagna.json \
+    --unet-checkpoint model_best.pt \
+    --pred-dt pred_surface.zarr
+```
+
+### predict3d CLI flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--input` | required | Input zarr array (3D ZYX) |
+| `--output` | required | Output `.lasagna.json` path |
+| `--unet-checkpoint` | required | 3D UNet checkpoint (.pt) |
+| `--cos-scaledown` | 2 | Downsample factor for cos channel (half scale) |
+| `--scaledown` | 4 | Downsample factor for other channels (quarter scale) |
+| `--source-to-base` | 1.0 | Source volume to VC3D base coordinate factor |
+| `--tile-size` | 256 | Inference tile size |
+| `--overlap` | 64 | Tile overlap in voxels |
+| `--border` | 16 | Hard discard border at tile edges |
+| `--crop` | none | Crop region: x y z w h d |
+| `--pred-dt` | none | Source zarr for distance-to-surface channel |
+| `--device` | auto | Device (cuda/cpu) |
+| `--chunk-z` | 32 | Output zarr chunk size along Z |
+| `--chunk-yx` | 32 | Output zarr chunk size for Y and X |
+| `--calibrate-norm` | off | Calibrate InstanceNorm before inference |
+
+### Lasagna volume format (.lasagna.json)
+
+Output is a JSON manifest describing channel groups, each stored in a separate zarr:
+
+```json
+{
+  "version": 1,
+  "source_to_base": 1.0,
+  "crop_xyzwhd": [0, 0, 0, 4000, 4000, 4000],
+  "grad_mag_encode_scale": 1000.0,
+  "groups": {
+    "cos": {
+      "zarr": "cos.zarr",
+      "scaledown": 2,
+      "channels": ["cos"]
+    },
+    "prediction": {
+      "zarr": "prediction.zarr",
+      "scaledown": 4,
+      "channels": ["grad_mag", "nx", "ny"]
+    },
+    "pred_dt": {
+      "zarr": "pred_dt.zarr",
+      "scaledown": 4,
+      "channels": ["pred_dt"]
+    }
+  }
+}
+```
+
+- **`source_to_base`**: Factor from source volume voxels to base (VC3D) voxels. Default 1.0 (source = base). Set to 4 if source is 4x coarser than the VC3D coordinate system.
+- **`scaledown`** per group: Downsample factor relative to the source volume.
+- **`channels`**: Ordered list — position = channel index in the CZYX zarr.
+- Zarr paths are relative to the JSON file's directory.
+- Updating a single group (e.g., adding pred_dt) leaves other groups untouched.
+
+
 ## Implementation Files
 
 | File | Purpose |
@@ -483,7 +557,9 @@ Use it to sanity-check chain ordering before long runs.
 | `lasagna/train_tifxyz.py` | Training script and CLI (DDP, W&B, hi-mag filtering, partial reinit) |
 | `lasagna/tifxyz_lasagna_dataset.py` | `TifxyzLasagnaDataset` (CT crops, surface voxelization, augmentation) and `build_patch_chains()` (multi-chain ordering) |
 | `lasagna/tifxyz_labels.py` | `compute_patch_labels()`, `chains_from_surface_info()`, `derive_cos_gradmag_validity()` (GPU, chain-aware) |
-| `lasagna/preprocess_cos_omezarr.py` | Inference: per-axis 2D preprocessing and tiled 3D `predict3d` mode |
+| `lasagna/lasagna_volume.py` | `.lasagna.json` manifest read/write: `LasagnaVolume`, `ChannelGroup` dataclasses |
+| `lasagna/preprocess_cos_omezarr.py` | Inference: per-axis 2D preprocessing and tiled 3D `predict3d` mode (writes `.lasagna.json`) |
+| `lasagna/fit_data.py` | `load_3d()` reads `.lasagna.json`, `FitData3D` with per-channel spacing and `grid_sample_fullres()` |
 | `lasagna/scripts/download_omezarr.py` | Parallel S3 OME-Zarr chunk downloader with progress display |
 | `lasagna/lasagna3d/` | `python -m lasagna3d` analysis CLI — see [`lasagna3d_cli.md`](lasagna3d_cli.md) |
 | `vesuvius/src/vesuvius/models/build/build_network_from_config.py` | `NetworkFromConfig` — shared encoder + decoder/task-heads UNet builder |
