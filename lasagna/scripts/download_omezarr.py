@@ -92,11 +92,13 @@ class Stats:
         self.downloaded = 0
         self.failed = 0
         self.bytes_downloaded = 0
+        self.noremote = 0
         self.scan_done = False
         self._lock = threading.Lock()
         self._t0 = time.monotonic()
         self._byte_samples: collections.deque[tuple[float, int]] = collections.deque()
         self._first_download_t: float | None = None
+        self.noremote_keys: dict[int, set[str]] = {}  # level → set of chunk keys absent on S3
 
     def snapshot(self) -> dict:
         now = time.monotonic()
@@ -135,6 +137,41 @@ class Stats:
                 if self._first_download_t is None:
                     self._first_download_t = now
                 self._byte_samples.append((now, kwargs["bytes_downloaded"]))
+
+    def add_noremote(self, level: int, chunk_key: str) -> None:
+        with self._lock:
+            self.noremote_keys.setdefault(level, set()).add(chunk_key)
+
+    def is_noremote(self, level: int, chunk_key: str) -> bool:
+        with self._lock:
+            return chunk_key in self.noremote_keys.get(level, set())
+
+
+def _noremote_path(local_root: str, level: int) -> str:
+    return os.path.join(local_root, ".dl_cache", f"{level}.noremote.json")
+
+
+def _load_noremote(local_root: str, levels: list[int]) -> dict[int, set[str]]:
+    result: dict[int, set[str]] = {}
+    for lvl in levels:
+        p = _noremote_path(local_root, lvl)
+        if os.path.isfile(p):
+            with open(p) as f:
+                result[lvl] = set(json.load(f))
+        else:
+            result[lvl] = set()
+    return result
+
+
+def _save_noremote(local_root: str, noremote: dict[int, set[str]]) -> None:
+    for lvl, keys in noremote.items():
+        if not keys:
+            continue
+        p = _noremote_path(local_root, lvl)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w") as f:
+            json.dump(sorted(keys), f)
+            f.write("\n")
 
 
 # ---------------------------------------------------------------------------
@@ -354,7 +391,8 @@ def _scanner(
 ) -> None:
     base_scale = multiscales.get(0, [1.0, 1.0, 1.0])
 
-    all_items: list[tuple[str, str]] = []
+    # (level, s3_key, local_path, chunk_key_within_level)
+    all_items: list[tuple[int, str, str, str]] = []
     for lvl, meta in sorted(levels_meta.items()):
         level_bbox = None
         if bbox_zyx_level0 is not None:
@@ -367,19 +405,22 @@ def _scanner(
         for iz, iy, ix in chunk_indices:
             s3key = _chunk_s3_key(level_prefix, dim_sep, iz, iy, ix)
             lpath = _chunk_local_path(local_level, dim_sep, iz, iy, ix)
-            all_items.append((s3key, lpath))
+            ckey = _chunk_key(dim_sep, iz, iy, ix)
+            all_items.append((lvl, s3key, lpath, ckey))
 
     stats.inc(total_chunks=len(all_items))
     random.shuffle(all_items)
 
-    for s3key, lpath in all_items:
+    for lvl, s3key, lpath, ckey in all_items:
         if stop_event.is_set():
             break
         if os.path.isfile(lpath) and os.path.getsize(lpath) > 0:
             stats.inc(scanned=1, local=1)
+        elif stats.is_noremote(lvl, ckey):
+            stats.inc(scanned=1, local=1, noremote=1)
         else:
             stats.inc(scanned=1, remote=1)
-            download_queue.put((s3key, lpath))
+            download_queue.put((lvl, s3key, lpath, ckey))
 
     stats.scan_done = True
 
@@ -394,6 +435,8 @@ def _download_one(
     local_path: str,
     anon: bool,
     stats: Stats,
+    level: int = 0,
+    chunk_key: str = "",
     max_retries: int = 3,
 ) -> bool:
     for attempt in range(max_retries):
@@ -411,6 +454,7 @@ def _download_one(
         except botocore.exceptions.ClientError as e:
             code = e.response.get("Error", {}).get("Code", "")
             if code in ("NoSuchKey", "404"):
+                stats.add_noremote(level, chunk_key)
                 stats.inc(downloaded=1)
                 return True
             if attempt == max_retries - 1:
@@ -621,7 +665,11 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- Run ---
     st = Stats()
-    dl_queue: queue.Queue[tuple[str, str] | None] = queue.Queue(maxsize=10000)
+    st.noremote_keys = _load_noremote(local_root, levels)
+    n_cached_noremote = sum(len(v) for v in st.noremote_keys.values())
+    if n_cached_noremote:
+        print(f"Loaded {n_cached_noremote} cached noremote keys", file=sys.stderr)
+    dl_queue: queue.Queue[tuple[int, str, str, str] | None] = queue.Queue(maxsize=10000)
     stop_evt = threading.Event()
 
     scanner_thread = threading.Thread(
@@ -651,8 +699,9 @@ def main(argv: list[str] | None = None) -> int:
                     continue
                 if item is None:
                     break
-                s3key, lpath = item
-                fut = pool.submit(_download_one, bucket, s3key, lpath, anon, st)
+                lvl, s3key, lpath, ckey = item
+                fut = pool.submit(_download_one, bucket, s3key, lpath, anon, st,
+                                  level=lvl, chunk_key=ckey)
                 futures.append(fut)
             for f in as_completed(futures):
                 f.result()
@@ -665,6 +714,8 @@ def main(argv: list[str] | None = None) -> int:
 
     stop_evt.set()
     scanner_thread.join(timeout=5)
+
+    _save_noremote(local_root, st.noremote_keys)
 
     snap = st.snapshot()
     sys.stderr.write("\n")
