@@ -4004,13 +4004,15 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
         // new 2D points we might add to the patch (and later find the corresponding 3D point for)
         for(const auto& p : fringe)
         {
-            for(const auto& n : neighs)
-                if (bounds.contains(cv::Point(p+n))
-                    && (trace_params.state(p+n) & STATE_PROCESSING) == 0
-                    && (trace_params.state(p+n) & STATE_LOC_VALID) == 0) {
-                    trace_params.state(p+n) |= STATE_PROCESSING;
-                    cands.push_back(p+n);
+            for(const auto& n : neighs) {
+                const cv::Vec2i pn = p + n;
+                if (bounds.contains(cv::Point(pn[1], pn[0]))
+                    && (trace_params.state(pn) & STATE_PROCESSING) == 0
+                    && (trace_params.state(pn) & STATE_LOC_VALID) == 0) {
+                    trace_params.state(pn) |= STATE_PROCESSING;
+                    cands.push_back(pn);
                 }
+            }
         }
         std::cout << "gen " << generation << " processing " << cands.size() << " fringe cands (total done " << succ << " fringe: " << fringe.size() << ")" << std::endl;
         fringe.resize(0);

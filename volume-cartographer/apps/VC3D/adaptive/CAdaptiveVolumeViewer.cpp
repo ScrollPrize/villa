@@ -124,6 +124,7 @@ CAdaptiveVolumeViewer::~CAdaptiveVolumeViewer()
         _volume->tieredCache()->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
     }
+    unregisterOverlayChunkListener();
 }
 
 // ============================================================================
@@ -144,6 +145,96 @@ Surface* CAdaptiveVolumeViewer::currentSurface() const
         return shared ? shared.get() : nullptr;
     }
     return _state->surfaceRaw(_surfName);
+}
+
+void CAdaptiveVolumeViewer::unregisterOverlayChunkListener()
+{
+    if (_overlayChunkCbId != 0 && _overlayVolume && _overlayVolume->tieredCache()) {
+        _overlayVolume->tieredCache()->removeChunkReadyListener(_overlayChunkCbId);
+    }
+    _overlayChunkCbId = 0;
+}
+
+void CAdaptiveVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
+{
+    if (_overlayVolume == volume) {
+        return;
+    }
+
+    unregisterOverlayChunkListener();
+    _overlayVolume = std::move(volume);
+
+    if (_overlayVolume && _overlayVolume->numScales() >= 1) {
+        auto* cache = _overlayVolume->tieredCache();
+        if (cache) {
+            QPointer<CAdaptiveVolumeViewer> guard(this);
+            std::weak_ptr<Volume> overlayWeak = _overlayVolume;
+            _overlayChunkCbId = cache->addChunkReadyListener(
+                [guard, overlayWeak](const vc::cache::ChunkKey&) {
+                    QMetaObject::invokeMethod(qApp, [guard, overlayWeak]() {
+                        if (!guard) return;
+                        auto vol = overlayWeak.lock();
+                        if (!vol || guard->_overlayVolume != vol) return;
+                        if (auto* c = vol->tieredCache()) {
+                            c->clearChunkArrivedFlag();
+                        }
+                        guard->scheduleRender();
+                    }, Qt::QueuedConnection);
+                });
+        }
+    }
+
+    scheduleRender();
+}
+
+void CAdaptiveVolumeViewer::setOverlayOpacity(float opacity)
+{
+    const float clamped = std::clamp(opacity, 0.0f, 1.0f);
+    if (std::abs(clamped - _overlayOpacity) < 1e-6f) {
+        return;
+    }
+    _overlayOpacity = clamped;
+    if (_overlayVolume) {
+        scheduleRender();
+    }
+}
+
+void CAdaptiveVolumeViewer::setOverlayColormap(const std::string& colormapId)
+{
+    if (_overlayColormapId == colormapId) {
+        return;
+    }
+    _overlayColormapId = colormapId;
+    if (_overlayVolume) {
+        scheduleRender();
+    }
+}
+
+void CAdaptiveVolumeViewer::setOverlayThreshold(float threshold)
+{
+    setOverlayWindow(std::max(threshold, 0.0f), _overlayWindowHigh);
+}
+
+void CAdaptiveVolumeViewer::setOverlayWindow(float low, float high)
+{
+    constexpr float kMaxOverlayValue = 255.0f;
+    const float clampedLow = std::clamp(low, 0.0f, kMaxOverlayValue);
+    float clampedHigh = std::clamp(high, 0.0f, kMaxOverlayValue);
+    if (clampedHigh <= clampedLow) {
+        clampedHigh = std::min(kMaxOverlayValue, clampedLow + 1.0f);
+    }
+
+    const bool unchanged = std::abs(clampedLow - _overlayWindowLow) < 1e-6f &&
+                           std::abs(clampedHigh - _overlayWindowHigh) < 1e-6f;
+    if (unchanged) {
+        return;
+    }
+
+    _overlayWindowLow = clampedLow;
+    _overlayWindowHigh = clampedHigh;
+    if (_overlayVolume) {
+        scheduleRender();
+    }
 }
 
 // ============================================================================
@@ -471,6 +562,13 @@ void CAdaptiveVolumeViewer::submitRender()
     sp.level = _camera.dsScaleIdx;
     sp.method = _samplingMethod;
 
+    const cv::Mat_<cv::Vec3f>* overlayCoords = nullptr;
+    cv::Vec3f overlayOrigin(0.0f, 0.0f, 0.0f);
+    cv::Vec3f overlayVxStep(0.0f, 0.0f, 0.0f);
+    cv::Vec3f overlayVyStep(0.0f, 0.0f, 0.0f);
+    cv::Vec3f overlayPlaneNormal(0.0f, 0.0f, 1.0f);
+    bool haveOverlayPlane = false;
+
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
         cv::Vec3f vx = plane->basisX();
         cv::Vec3f vy = plane->basisY();
@@ -484,6 +582,11 @@ void CAdaptiveVolumeViewer::submitRender()
                          + plane->origin() + n * _camera.zOff;
         cv::Vec3f vx_step = vx / _camera.scale;
         cv::Vec3f vy_step = vy / _camera.scale;
+        overlayOrigin = origin;
+        overlayVxStep = vx_step;
+        overlayVyStep = vy_step;
+        overlayPlaneNormal = n;
+        haveOverlayPlane = true;
 
         int numLayers = 1, zStart = 0;
         float zStep = 1.0f;
@@ -596,6 +699,7 @@ void CAdaptiveVolumeViewer::submitRender()
         cv::Mat_<cv::Vec3f>& normals = _genNormals;
 
         if (!coords.empty()) {
+            overlayCoords = &coords;
             int numLayers = 1, zStart = 0;
             float zStep = 1.0f;
             const cv::Mat_<cv::Vec3f>* pNormals = nullptr;
@@ -788,6 +892,14 @@ void CAdaptiveVolumeViewer::submitRender()
             }
         }
     }
+
+    renderOverlayVolume(
+        fbBits, fbStride, fbW, fbH,
+        overlayCoords,
+        haveOverlayPlane ? &overlayOrigin : nullptr,
+        haveOverlayPlane ? &overlayVxStep : nullptr,
+        haveOverlayPlane ? &overlayVyStep : nullptr,
+        haveOverlayPlane ? &overlayPlaneNormal : nullptr);
 
     if (highlightDownscaled && lvlOutPtr
         && _levelBuffer.rows == fbH && _levelBuffer.cols == fbW) {
@@ -1309,6 +1421,108 @@ void CAdaptiveVolumeViewer::updateFocusMarker(POI* poi)
 
     _focusMarker->setPos(scenePos);
     _focusMarker->show();
+}
+
+void CAdaptiveVolumeViewer::renderOverlayVolume(uint32_t* fbBits,
+                                                int fbStride,
+                                                int fbW,
+                                                int fbH,
+                                                const cv::Mat_<cv::Vec3f>* coords,
+                                                const cv::Vec3f* origin,
+                                                const cv::Vec3f* vxStep,
+                                                const cv::Vec3f* vyStep,
+                                                const cv::Vec3f* planeNormal)
+{
+    if (!fbBits || fbW <= 0 || fbH <= 0 || !_overlayVolume || _overlayOpacity <= 0.0f) {
+        return;
+    }
+
+    const bool hasCoords = coords && !coords->empty();
+    const bool hasPlane = origin && vxStep && vyStep && planeNormal;
+    if (!hasCoords && !hasPlane) {
+        return;
+    }
+
+    const int overlayLevels = static_cast<int>(_overlayVolume->numScales());
+    if (overlayLevels <= 0) {
+        return;
+    }
+    auto* overlayCache = _overlayVolume->tieredCache();
+    if (!overlayCache) {
+        return;
+    }
+
+    const int desiredLevel = std::clamp(_camera.dsScaleIdx, 0, overlayLevels - 1);
+
+    if (_cachedOverlayWindowLow != _overlayWindowLow ||
+        _cachedOverlayWindowHigh != _overlayWindowHigh ||
+        _cachedOverlayColormapId != _overlayColormapId) {
+        vc::buildWindowLevelColormapLut(
+            _cachedOverlayLut, _overlayWindowLow, _overlayWindowHigh, _overlayColormapId);
+
+        const int low = static_cast<int>(std::clamp(_overlayWindowLow, 0.0f, 255.0f));
+        for (int i = 0; i < low; ++i) {
+            _cachedOverlayLut[i] = 0u;
+        }
+        // The adaptive sampler returns lut[0] for missing chunks. Keeping
+        // zero transparent prevents an unloaded overlay from darkening the
+        // streamed base volume while its chunks are still arriving.
+        _cachedOverlayLut[0] = 0u;
+
+        _cachedOverlayWindowLow = _overlayWindowLow;
+        _cachedOverlayWindowHigh = _overlayWindowHigh;
+        _cachedOverlayColormapId = _overlayColormapId;
+    }
+
+    if (_overlayBufferW != fbW || _overlayBufferH != fbH) {
+        _overlayBuffer.assign(size_t(fbW) * size_t(fbH), 0u);
+        _overlayBufferW = fbW;
+        _overlayBufferH = fbH;
+    }
+
+    sampleAdaptiveARGB32(
+        _overlayBuffer.data(), fbW,
+        overlayCache, desiredLevel, overlayLevels,
+        hasCoords ? coords : nullptr,
+        hasPlane ? origin : nullptr,
+        hasPlane ? vxStep : nullptr,
+        hasPlane ? vyStep : nullptr,
+        nullptr,
+        hasPlane ? planeNormal : nullptr,
+        1, 0, 1.0f,
+        fbW, fbH, std::string(), _cachedOverlayLut.data(), vc::Sampling::Nearest,
+        nullptr, nullptr, 0);
+
+    const int alpha = static_cast<int>(std::lround(std::clamp(_overlayOpacity, 0.0f, 1.0f) * 256.0f));
+    if (alpha <= 0) {
+        return;
+    }
+    const int invAlpha = 256 - std::min(alpha, 256);
+
+    #pragma omp parallel for
+    for (int y = 0; y < fbH; ++y) {
+        uint32_t* dst = fbBits + size_t(y) * size_t(fbStride);
+        const uint32_t* src = _overlayBuffer.data() + size_t(y) * size_t(fbW);
+        for (int x = 0; x < fbW; ++x) {
+            const uint32_t ov = src[x];
+            if (ov == 0u) {
+                continue;
+            }
+
+            const uint32_t base = dst[x];
+            const uint32_t br = (base >> 16) & 0xFFu;
+            const uint32_t bg = (base >> 8) & 0xFFu;
+            const uint32_t bb = base & 0xFFu;
+            const uint32_t or_ = (ov >> 16) & 0xFFu;
+            const uint32_t og = (ov >> 8) & 0xFFu;
+            const uint32_t ob = ov & 0xFFu;
+
+            const uint32_t r = (br * uint32_t(invAlpha) + or_ * uint32_t(alpha)) >> 8;
+            const uint32_t g = (bg * uint32_t(invAlpha) + og * uint32_t(alpha)) >> 8;
+            const uint32_t b = (bb * uint32_t(invAlpha) + ob * uint32_t(alpha)) >> 8;
+            dst[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
 }
 
 // ============================================================================

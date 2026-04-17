@@ -70,10 +70,11 @@ public:
     // ---- Border tracking (for expansion triggers) ----
     void checkBorderContact(const cv::Vec2i& neighbor, cv::Size grid_size);
     void clearBorderFlags();
+    bool atLeftBorder() const { return _at_left_border; }
     bool atRightBorder() const { return _at_right_border; }
     bool atTopBorder() const { return _at_top_border; }
     bool atBottomBorder() const { return _at_bottom_border; }
-    bool atAnyBorder() const { return _at_right_border || _at_top_border || _at_bottom_border; }
+    bool atAnyBorder() const { return _at_left_border || _at_right_border || _at_top_border || _at_bottom_border; }
 
     // ---- Grid resize (called during expansion) ----
     void resize(cv::Size new_size, cv::Rect copy_roi);
@@ -102,6 +103,7 @@ private:
     GridContext _ctx;
     mutable std::shared_mutex _mutex;
 
+    bool _at_left_border = false;
     bool _at_right_border = false;
     bool _at_top_border = false;
     bool _at_bottom_border = false;

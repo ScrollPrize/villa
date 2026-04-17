@@ -16,6 +16,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/tracer/Tracer.hpp"
 
 #include <QtConcurrent/QtConcurrent>
 
@@ -53,6 +54,15 @@ const QString kDenseLatestSentinel = QStringLiteral("extrap_displacement_latest"
 
 namespace
 {
+struct SurfaceTrackerGrowthJob {
+    QuadSurface* resumeSurface{nullptr};
+    std::filesystem::path sourceDir;
+    utils::Json params;
+    float voxelSize{1.0f};
+    int steps{0};
+    bool cleanupTargetDir{false};
+};
+
 QString cacheRootForVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
 {
     if (!pkg) {
@@ -61,6 +71,83 @@ QString cacheRootForVolumePkg(const std::shared_ptr<VolumePkg>& pkg)
 
     const QString base = QString::fromStdString(pkg->getVolpkgDirectory());
     return QDir(base).filePath(QStringLiteral("cache"));
+}
+
+QString surfaceTrackerSourceDirFromParams(const utils::Json& params)
+{
+    static constexpr const char* kKeys[] = {
+        "surface_tifxyz_dir",
+        "surface_tifxyz_folder",
+        "source_tifxyz_dir",
+        "source_tifxyz_folder",
+        "tifxyz_source_dir",
+        "tifxyz_dir",
+        "tifxyz_folder",
+        "src_dir",
+        "src-dir",
+        "source_dir",
+        "source_folder",
+    };
+
+    if (params.is_null()) {
+        return {};
+    }
+
+    for (const char* key : kKeys) {
+        try {
+            if (params.contains(key) && params[key].is_string()) {
+                return QString::fromStdString(params[key].get_string()).trimmed();
+            }
+        } catch (...) {
+        }
+    }
+
+    return {};
+}
+
+void appendGrowthDirectionString(utils::Json& directions,
+                                 SegmentationGrowthDirection direction)
+{
+    switch (direction) {
+    case SegmentationGrowthDirection::Up:
+        directions.push_back(utils::Json("up"));
+        break;
+    case SegmentationGrowthDirection::Down:
+        directions.push_back(utils::Json("down"));
+        break;
+    case SegmentationGrowthDirection::Left:
+        directions.push_back(utils::Json("left"));
+        break;
+    case SegmentationGrowthDirection::Right:
+        directions.push_back(utils::Json("right"));
+        break;
+    case SegmentationGrowthDirection::All:
+    default:
+        directions.push_back(utils::Json("all"));
+        break;
+    }
+}
+
+utils::Json growthDirectionsJson(const std::vector<SegmentationGrowthDirection>& directions)
+{
+    utils::Json out = utils::Json::array();
+    if (directions.empty()) {
+        appendGrowthDirectionString(out, SegmentationGrowthDirection::All);
+        return out;
+    }
+
+    bool addedAll = false;
+    for (const auto direction : directions) {
+        if (direction == SegmentationGrowthDirection::All) {
+            if (!addedAll) {
+                appendGrowthDirectionString(out, direction);
+                addedAll = true;
+            }
+            continue;
+        }
+        appendGrowthDirectionString(out, direction);
+    }
+    return out;
 }
 
 // NOTE: SegmentationGrowth.cpp has an equivalent ensureGenerationsChannel with a bool
@@ -97,6 +184,132 @@ void ensureSurfaceMetaObject(QuadSurface* surface)
     }
 
     surface->meta = utils::Json::object();
+}
+
+TracerGrowthResult runSurfaceTrackerGrowth(SurfaceTrackerGrowthJob job)
+{
+    TracerGrowthResult result;
+
+    if (!job.resumeSurface) {
+        result.error = QObject::tr("Segmentation surface is not available.");
+        return result;
+    }
+
+    std::error_code ec;
+    if (job.sourceDir.empty() || !std::filesystem::is_directory(job.sourceDir, ec)) {
+        const QString reason = ec
+            ? QStringLiteral(" (%1)").arg(QString::fromStdString(ec.message()))
+            : QString();
+        result.error = QObject::tr("Surface tracker source folder is not available: %1%2")
+                           .arg(QString::fromStdString(job.sourceDir.string()), reason);
+        return result;
+    }
+
+    ensureGenerationsChannel(job.resumeSurface);
+
+    job.params["resume"] = true;
+    if (!job.params.contains("generations") && !job.params.contains("grow_steps")) {
+        job.params["generations"] = std::max(1, job.steps);
+    }
+
+    std::filesystem::path targetDir;
+    try {
+        if (job.params.contains("tgt_dir") && job.params["tgt_dir"].is_string()) {
+            targetDir = job.params["tgt_dir"].get_string();
+        }
+    } catch (...) {
+        targetDir.clear();
+    }
+
+    if (targetDir.empty()) {
+        targetDir = std::filesystem::temp_directory_path() /
+                    ("vc3d_growsurface_" + QUuid::createUuid().toString(QUuid::WithoutBraces).toStdString());
+        job.params["tgt_dir"] = targetDir.string();
+        job.cleanupTargetDir = true;
+    }
+
+    std::filesystem::create_directories(targetDir, ec);
+    if (ec) {
+        result.error = QObject::tr("Failed to create surface tracker work folder: %1")
+                           .arg(QString::fromStdString(ec.message()));
+        return result;
+    }
+
+    auto cleanup = [&]() {
+        if (!job.cleanupTargetDir || targetDir.empty()) {
+            return;
+        }
+        std::error_code cleanupEc;
+        std::filesystem::remove_all(targetDir, cleanupEc);
+        if (cleanupEc) {
+            qCInfo(lcSegGrowth) << "Failed to remove surface tracker work folder"
+                                << QString::fromStdString(targetDir.string())
+                                << QString::fromStdString(cleanupEc.message());
+        }
+    };
+
+    std::vector<std::unique_ptr<QuadSurface>> ownedSurfaces;
+    std::vector<QuadSurface*> surfaces;
+    surfaces.push_back(job.resumeSurface);
+
+    try {
+        job.resumeSurface->readOverlappingJson();
+    } catch (const std::exception& ex) {
+        qCInfo(lcSegGrowth) << "Surface tracker could not read active overlap metadata:" << ex.what();
+    }
+
+    try {
+        for (const auto& entry : std::filesystem::directory_iterator(job.sourceDir)) {
+            if (!entry.is_directory()) {
+                continue;
+            }
+
+            const std::filesystem::path segmentPath = entry.path();
+            if (segmentPath.filename() == job.resumeSurface->id) {
+                continue;
+            }
+
+            const std::filesystem::path metaPath = segmentPath / "meta.json";
+            if (!std::filesystem::exists(metaPath)) {
+                continue;
+            }
+
+            utils::Json meta = utils::Json::parse_file(metaPath);
+            if (!meta.contains("bbox")) {
+                continue;
+            }
+            if (meta.value("format", std::string{"NONE"}) != "tifxyz") {
+                continue;
+            }
+
+            auto surface = std::make_unique<QuadSurface>(segmentPath, meta);
+            surface->readOverlappingJson();
+            surfaces.push_back(surface.get());
+            ownedSurfaces.push_back(std::move(surface));
+        }
+
+        qCInfo(lcSegGrowth) << "Calling grow_surf_from_surfs()"
+                            << "sourceDir" << QString::fromStdString(job.sourceDir.string())
+                            << "surfaceCount" << static_cast<int>(surfaces.size())
+                            << "params" << QString::fromStdString(job.params.dump());
+
+        result.surface = grow_surf_from_surfs(job.resumeSurface,
+                                              surfaces,
+                                              job.params,
+                                              job.voxelSize);
+        if (!result.surface) {
+            result.error = QObject::tr("Surface tracker did not return a surface.");
+        } else {
+            result.statusMessage = QObject::tr("Surface tracker growth complete.");
+        }
+    } catch (const std::exception& ex) {
+        result.error = QObject::tr("Surface tracker growth failed: %1").arg(ex.what());
+    } catch (...) {
+        result.error = QObject::tr("Surface tracker growth failed.");
+    }
+
+    cleanup();
+    return result;
 }
 
 
@@ -1377,6 +1590,95 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         return true;
     }
 
+    if (method == SegmentationGrowthMethod::SurfaceTracker) {
+        if (!_context.widget->customParamsValid()) {
+            const QString errorText = _context.widget->customParamsError();
+            const QString message = errorText.isEmpty()
+                ? tr("Custom params JSON is invalid. Fix the contents and try again.")
+                : tr("Custom params JSON is invalid: %1").arg(errorText);
+            showStatus(message, kStatusLong);
+            return false;
+        }
+
+        utils::Json params = _context.widget->customParamsJson();
+        if (params.is_null()) {
+            params = utils::Json::object();
+        }
+
+        std::vector<SegmentationGrowthDirection> directions;
+        if (auto overrideDirs = _context.module->takeShortcutDirectionOverride()) {
+            directions = std::move(*overrideDirs);
+        } else if (direction != SegmentationGrowthDirection::All) {
+            directions = {direction};
+        } else {
+            directions = _context.widget->allowedGrowthDirections();
+        }
+        if (directions.empty()) {
+            directions = {SegmentationGrowthDirection::All};
+        }
+
+        if (!params.contains("growth_directions")) {
+            params["growth_directions"] = growthDirectionsJson(directions);
+        }
+
+        const QString sourceDirFromJson = surfaceTrackerSourceDirFromParams(params);
+        std::filesystem::path sourceDir;
+        if (!sourceDirFromJson.isEmpty()) {
+            sourceDir = sourceDirFromJson.toStdString();
+            if (sourceDir.is_relative() && volumeContext.package) {
+                sourceDir = std::filesystem::path(volumeContext.package->getVolpkgDirectory()) / sourceDir;
+            }
+        } else if (volumeContext.package) {
+            sourceDir = std::filesystem::path(volumeContext.package->getVolpkgDirectory()) /
+                        volumeContext.package->getSegmentationDirectory();
+        }
+
+        if (sourceDir.empty()) {
+            showStatus(tr("Surface tracker requires a tifxyz source folder in custom params."), kStatusLong);
+            return false;
+        }
+
+        const int sanitizedSteps = std::max(1, steps);
+        const float voxelSize = volumeContext.activeVolume
+            ? static_cast<float>(volumeContext.activeVolume->voxelSize())
+            : 1.0f;
+
+        SurfaceTrackerGrowthJob job;
+        job.resumeSurface = segmentationSurface.get();
+        job.sourceDir = sourceDir;
+        job.params = std::move(params);
+        job.voxelSize = voxelSize;
+        job.steps = sanitizedSteps;
+
+        qCInfo(lcSegGrowth) << "Surface tracker requested"
+                            << segmentationGrowthDirectionToString(direction)
+                            << "steps" << sanitizedSteps
+                            << "sourceDir" << QString::fromStdString(sourceDir.string());
+
+        _running = true;
+        _context.module->setGrowthInProgress(true);
+
+        ActiveRequest pending;
+        pending.volumeContext = volumeContext;
+        pending.growthVolume = volumeContext.activeVolume;
+        pending.growthVolumeId = volumeContext.activeVolumeId;
+        pending.segmentationSurface = segmentationSurface;
+        pending.growthVoxelSize = voxelSize;
+        pending.usingCorrections = false;
+        pending.inpaintOnly = false;
+        pending.surfaceTracker = true;
+        _activeRequest = std::move(pending);
+
+        showStatus(tr("Running surface-tracker growth..."), kStatusMedium);
+
+        auto future = QtConcurrent::run(runSurfaceTrackerGrowth, std::move(job));
+        _watcher = std::make_unique<QFutureWatcher<TracerGrowthResult>>(this);
+        connect(_watcher.get(), &QFutureWatcher<TracerGrowthResult>::finished,
+                this, &SegmentationGrower::onFutureFinished);
+        _watcher->setFuture(future);
+        return true;
+    }
+
     std::shared_ptr<Volume> growthVolume;
     std::string growthVolumeId = volumeContext.requestedVolumeId;
 
@@ -2112,7 +2414,8 @@ void SegmentationGrower::onFutureFinished()
     };
 
     if (!result.error.isEmpty()) {
-        qCInfo(lcSegGrowth) << "Tracer growth error" << result.error;
+        qCInfo(lcSegGrowth) << (request.surfaceTracker ? "Surface tracker growth error" : "Tracer growth error")
+                             << result.error;
         cleanupDisplacementTemporarySurfaces(request.segmentationSurface
                                                  ? request.segmentationSurface->path
                                                  : std::filesystem::path());
@@ -2235,11 +2538,15 @@ void SegmentationGrower::onFutureFinished()
     }
 
     if (!result.surface) {
-        qCInfo(lcSegGrowth) << "Tracer growth returned null surface";
+        qCInfo(lcSegGrowth) << (request.surfaceTracker ? "Surface tracker growth returned null surface"
+                                                       : "Tracer growth returned null surface");
         cleanupDisplacementTemporarySurfaces(request.segmentationSurface
                                                  ? request.segmentationSurface->path
                                                  : std::filesystem::path());
-        showStatus(tr("Tracer growth did not return a surface."), kStatusMedium);
+        showStatus(request.surfaceTracker
+                       ? tr("Surface tracker did not return a surface.")
+                       : tr("Tracer growth did not return a surface."),
+                   kStatusMedium);
         finalize(false);
         return;
     }
@@ -2633,7 +2940,8 @@ void SegmentationGrower::onFutureFinished()
         _context.module->clearPendingCorrections();
     }
 
-    qCInfo(lcSegGrowth) << "Tracer growth completed successfully";
+    qCInfo(lcSegGrowth) << (request.surfaceTracker ? "Surface tracker growth completed successfully"
+                                                   : "Tracer growth completed successfully");
     cleanupDisplacementTemporarySurfaces(surfaceToPersist ? surfaceToPersist->path : std::filesystem::path());
     delete result.surface;
 
@@ -2642,6 +2950,8 @@ void SegmentationGrower::onFutureFinished()
         message = result.statusMessage;
     } else if (request.usingCorrections) {
         message = tr("Corrections applied; tracer growth complete.");
+    } else if (request.surfaceTracker) {
+        message = tr("Surface tracker growth complete.");
     } else if (request.inpaintOnly) {
         message = tr("Tracer inpainting complete.");
     } else {

@@ -22,6 +22,7 @@ enum class SegmentationGrowthMethod {
     Tracer = 0,
     Corrections = 1,
     Extrapolation = 2,
+    SurfaceTracker = 3,
 };
 
 inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
@@ -33,6 +34,8 @@ inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
         return QStringLiteral("Corrections");
     case SegmentationGrowthMethod::Extrapolation:
         return QStringLiteral("Extrapolation");
+    case SegmentationGrowthMethod::SurfaceTracker:
+        return QStringLiteral("Surface Tracker");
     }
     return QStringLiteral("Unknown");
 }
@@ -44,6 +47,9 @@ inline SegmentationGrowthMethod segmentationGrowthMethodFromInt(int value)
     }
     if (value == static_cast<int>(SegmentationGrowthMethod::Extrapolation)) {
         return SegmentationGrowthMethod::Extrapolation;
+    }
+    if (value == static_cast<int>(SegmentationGrowthMethod::SurfaceTracker)) {
+        return SegmentationGrowthMethod::SurfaceTracker;
     }
     return SegmentationGrowthMethod::Tracer;
 }

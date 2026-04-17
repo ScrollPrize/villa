@@ -68,9 +68,11 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
     auto* methodLabel = new QLabel(tr("Method:"), _groupGrowth);
     _comboGrowthMethod = new QComboBox(_groupGrowth);
     _comboGrowthMethod->addItem(tr("Tracer"), static_cast<int>(SegmentationGrowthMethod::Tracer));
+    _comboGrowthMethod->addItem(tr("Surface tracker"), static_cast<int>(SegmentationGrowthMethod::SurfaceTracker));
     _comboGrowthMethod->addItem(tr("Extrapolation"), static_cast<int>(SegmentationGrowthMethod::Extrapolation));
     _comboGrowthMethod->setToolTip(tr("Select the growth algorithm:\n"
                                       "- Tracer: Neural-guided growth using volume data\n"
+                                      "- Surface tracker: Surface-to-surface growth using tifxyz segments\n"
                                       "- Extrapolation: Simple polynomial extrapolation from boundary points"));
     methodRow->addWidget(methodLabel);
     methodRow->addWidget(_comboGrowthMethod);

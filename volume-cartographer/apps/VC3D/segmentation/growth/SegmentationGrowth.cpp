@@ -418,7 +418,10 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
     int targetGenerations = startGen;
 
     if (requestedSteps > 0) {
-        targetGenerations = startGen + requestedSteps;
+        // GrowPatch treats generations as an exclusive stop after incrementing
+        // the current generation. Preserve all resume points and add one to
+        // keep the UI step count equal to the number of new growth iterations.
+        targetGenerations = startGen + requestedSteps + 1;
     }
 
     if (targetGenerations < startGen) {
@@ -429,11 +432,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
     }
 
     params["generations"] = targetGenerations;
-    int rewindGen = -1;
-    if (startGen > 1) {
-        rewindGen = startGen - 1;
-    }
-    params["rewind_gen"] = rewindGen;
+    params["rewind_gen"] = -1;
     params["cache_root"] = context.cacheRoot.toStdString();
     if (!context.normalGridPath.isEmpty()) {
         params["normal_grid_path"] = context.normalGridPath.toStdString();

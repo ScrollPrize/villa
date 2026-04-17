@@ -6,6 +6,7 @@
 
 #include <array>
 #include <chrono>
+#include <cstdint>
 #include <memory>
 #include <map>
 #include <set>
@@ -106,12 +107,12 @@ public:
     void setNormalArrowLengthScale(float scale) { _normalArrowLengthScale = scale; emit overlaysUpdated(); }
     void setNormalMaxArrows(int maxArrows) { _normalMaxArrows = maxArrows; emit overlaysUpdated(); }
 
-    // --- Overlay volume stubs ---
-    void setOverlayVolume(std::shared_ptr<Volume>) {}
-    void setOverlayOpacity(float) {}
-    void setOverlayColormap(const std::string&) {}
-    void setOverlayThreshold(float) {}
-    void setOverlayWindow(float, float) {}
+    // --- Overlay volume ---
+    void setOverlayVolume(std::shared_ptr<Volume> volume);
+    void setOverlayOpacity(float opacity);
+    void setOverlayColormap(const std::string& colormapId);
+    void setOverlayThreshold(float threshold);
+    void setOverlayWindow(float low, float high);
 
     // --- Segmentation stubs ---
     void setSegmentationEditActive(bool) {}
@@ -254,6 +255,16 @@ private:
     QRectF surfaceRectToSceneRect(const QRectF& surfRect) const;
     QRectF sceneRectToSurfaceRect(const QRectF& sceneRect) const;
     void updateFocusMarker(POI* poi = nullptr);
+    void renderOverlayVolume(uint32_t* fbBits,
+                             int fbStride,
+                             int fbW,
+                             int fbH,
+                             const cv::Mat_<cv::Vec3f>* coords,
+                             const cv::Vec3f* origin,
+                             const cv::Vec3f* vxStep,
+                             const cv::Vec3f* vyStep,
+                             const cv::Vec3f* planeNormal);
+    void unregisterOverlayChunkListener();
 
     void panByF(float dx, float dy);
     void zoomStepsAt(int steps, const QPointF& scenePos);
@@ -288,6 +299,18 @@ private:
     float _windowLow = 0.0f;
     float _windowHigh = 255.0f;
     std::string _baseColormapId;
+    std::shared_ptr<Volume> _overlayVolume;
+    float _overlayOpacity{0.5f};
+    std::string _overlayColormapId;
+    float _overlayWindowLow{0.0f};
+    float _overlayWindowHigh{255.0f};
+    std::vector<uint32_t> _overlayBuffer;
+    int _overlayBufferW = 0;
+    int _overlayBufferH = 0;
+    std::array<uint32_t, 256> _cachedOverlayLut{};
+    float _cachedOverlayWindowLow = -1.0f;
+    float _cachedOverlayWindowHigh = -1.0f;
+    std::string _cachedOverlayColormapId;
     // Flattened-view z-scroll translation direction (unit vector in world
     // space). Captured at each shift+scroll from the surface normal under
     // the view center so the translation is rigid — plain zoom never
@@ -413,6 +436,7 @@ private:
 
     // --- Chunk-ready listener ---
     vc::cache::BlockPipeline::ChunkReadyCallbackId _chunkCbId = 0;
+    vc::cache::BlockPipeline::ChunkReadyCallbackId _overlayChunkCbId = 0;
     bool _hadValidDataBounds = false;
     bool _dirtyWhileMinimized = false;
 };
