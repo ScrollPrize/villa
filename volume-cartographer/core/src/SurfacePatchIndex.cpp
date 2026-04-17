@@ -515,13 +515,13 @@ SurfacePatchIndex::Impl::collectEntriesForSurface(const SurfacePtr& surface,
     if (!surface) {
         return result;
     }
-    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->empty()) {
+    const cv::Mat_<cv::Vec3f> points = surface->rawPointsShared();
+    if (points.empty()) {
         return result;
     }
 
-    const int rows = points->rows;
-    const int cols = points->cols;
+    const int rows = points.rows;
+    const int cols = points.cols;
     const int cellRowCount = rows - 1;
     const int cellColCount = cols - 1;
     if (cellRowCount <= 0 || cellColCount <= 0) {
@@ -550,7 +550,7 @@ SurfacePatchIndex::Impl::collectEntriesForSurface(const SurfacePtr& surface,
     for (int j = rowStart; j < rowEnd; j += samplingStride) {
         for (int i = colStart; i < colEnd; i += samplingStride) {
             CellEntry entry;
-            if (!buildCellEntry(surface, *points, i, j, samplingStride, bboxPadding, entry)) {
+            if (!buildCellEntry(surface, points, i, j, samplingStride, bboxPadding, entry)) {
                 continue;
             }
 
@@ -578,10 +578,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
         if (!s) {
             continue;
         }
-        if (!s->isLoaded()) {
-            s->rawPointsPtr();  // triggers ensureLoaded()
-        }
-        loadedFlags[i] = s->isLoaded() ? 1 : 0;
+        loadedFlags[i] = !s->rawPointsShared().empty() ? 1 : 0;
     }
 
     std::vector<SurfacePtr> loaded;
@@ -879,9 +876,9 @@ void SurfacePatchIndex::forEachTriangleImpl(
             }
             const cv::Vec3f center = rec.surface->center();
             const cv::Vec2f scale = rec.surface->scale();
-            const cv::Mat_<cv::Vec3f>* points = rec.surface->rawPointsPtr();
-            const int rows = points ? points->rows : 0;
-            const int cols = points ? points->cols : 0;
+            const cv::Mat_<cv::Vec3f> points = rec.surface->rawPointsShared();
+            const int rows = points.rows;
+            const int cols = points.cols;
             cacheIt = surfaceCacheMap.emplace(rec.surface,
                 SurfaceCache{center[0] * scale[0], center[1] * scale[1],
                              rows, cols, srIt->second.surface}).first;
@@ -1165,8 +1162,8 @@ bool SurfacePatchIndex::updateSurface(const SurfacePtr& surface)
     if (!impl_ || !surface) {
         return false;
     }
-    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->rows < 2 || points->cols < 2) {
+    const cv::Mat_<cv::Vec3f> points = surface->rawPointsShared();
+    if (points.rows < 2 || points.cols < 2) {
         return false;
     }
 
@@ -1174,9 +1171,9 @@ bool SurfacePatchIndex::updateSurface(const SurfacePtr& surface)
                                                 impl_->bboxPadding,
                                                 impl_->samplingStride,
                                                 0,
-                                                points->rows - 1,
+                                                points.rows - 1,
                                                 0,
-                                                points->cols - 1);
+                                                points.cols - 1);
     const bool updated = impl_->replaceSurfaceEntries(surface, std::move(cells));
     if (updated) {
         ++impl_->surfaceGenerations[surface.get()];
@@ -1194,13 +1191,13 @@ bool SurfacePatchIndex::updateSurfaceRegion(const SurfacePtr& surface,
         return false;
     }
 
-    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->rows < 2 || points->cols < 2) {
+    const cv::Mat_<cv::Vec3f> points = surface->rawPointsShared();
+    if (points.rows < 2 || points.cols < 2) {
         return false;
     }
 
-    const int cellRowCount = points->rows - 1;
-    const int cellColCount = points->cols - 1;
+    const int cellRowCount = points.rows - 1;
+    const int cellColCount = points.cols - 1;
     rowStart = std::max(0, rowStart);
     rowEnd = std::min(cellRowCount, rowEnd);
     colStart = std::max(0, colStart);
@@ -1318,9 +1315,9 @@ SurfacePatchIndex::Impl::Entry SurfacePatchIndex::Impl::buildEntryFromCorners(
 SurfacePatchIndex::Impl::SurfaceCellMask&
 SurfacePatchIndex::Impl::ensureMask(const SurfacePtr& surface)
 {
-    const cv::Mat_<cv::Vec3f>* points = surface ? surface->rawPointsPtr() : nullptr;
-    const int rowCount = points ? std::max(0, points->rows - 1) : 0;
-    const int colCount = points ? std::max(0, points->cols - 1) : 0;
+    const cv::Mat_<cv::Vec3f> points = surface ? surface->rawPointsShared() : cv::Mat_<cv::Vec3f>();
+    const int rowCount = std::max(0, points.rows - 1);
+    const int colCount = std::max(0, points.cols - 1);
 
     auto it = surfaceRecords.find(surface.get());
     if (it != surfaceRecords.end()) {
@@ -1351,12 +1348,12 @@ bool SurfacePatchIndex::Impl::loadPatchCorners(const PatchRecord& rec,
     if (!rec.surface) {
         return false;
     }
-    const cv::Mat_<cv::Vec3f>* points = rec.surface->rawPointsPtr();
-    if (!points) {
+    const cv::Mat_<cv::Vec3f> points = rec.surface->rawPointsShared();
+    if (points.empty()) {
         return false;
     }
-    const int rows = points->rows;
-    const int cols = points->cols;
+    const int rows = points.rows;
+    const int cols = points.cols;
     if (rows < 2 || cols < 2) {
         return false;
     }
@@ -1373,10 +1370,10 @@ bool SurfacePatchIndex::Impl::loadPatchCorners(const PatchRecord& rec,
         return false;
     }
 
-    const cv::Vec3f& p00 = (*points)(row, col);
-    const cv::Vec3f& p10 = (*points)(row, col + effectiveColStride);
-    const cv::Vec3f& p01 = (*points)(row + effectiveRowStride, col);
-    const cv::Vec3f& p11 = (*points)(row + effectiveRowStride, col + effectiveColStride);
+    const cv::Vec3f& p00 = points(row, col);
+    const cv::Vec3f& p10 = points(row, col + effectiveColStride);
+    const cv::Vec3f& p01 = points(row + effectiveRowStride, col);
+    const cv::Vec3f& p11 = points(row + effectiveRowStride, col + effectiveColStride);
 
     if (p00[0] == -1.0f || p10[0] == -1.0f || p01[0] == -1.0f || p11[0] == -1.0f) {
         return false;
@@ -1548,16 +1545,16 @@ void SurfacePatchIndex::queueCellUpdateForVertex(const SurfacePtr& surface, int 
         return;
     }
 
-    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->rows < 2 || points->cols < 2) {
+    const cv::Mat_<cv::Vec3f> points = surface->rawPointsShared();
+    if (points.rows < 2 || points.cols < 2) {
         return;
     }
 
     // A vertex at (row, col) affects cells at:
     // (row-1, col-1), (row-1, col), (row, col-1), (row, col)
     // Cells are indexed by their top-left vertex
-    const int cellRowCount = points->rows - 1;
-    const int cellColCount = points->cols - 1;
+    const int cellRowCount = points.rows - 1;
+    const int cellColCount = points.cols - 1;
 
     const int rowStart = std::max(0, vertexRow - 1);
     const int rowEnd = std::min(cellRowCount, vertexRow + 1);
@@ -1577,13 +1574,13 @@ void SurfacePatchIndex::queueCellRangeUpdate(const SurfacePtr& surface,
         return;
     }
 
-    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->rows < 2 || points->cols < 2) {
+    const cv::Mat_<cv::Vec3f> points = surface->rawPointsShared();
+    if (points.rows < 2 || points.cols < 2) {
         return;
     }
 
-    const int cellRowCount = points->rows - 1;
-    const int cellColCount = points->cols - 1;
+    const int cellRowCount = points.rows - 1;
+    const int cellColCount = points.cols - 1;
 
     // Clamp to valid cell range
     rowStart = std::max(0, rowStart);
@@ -1651,8 +1648,8 @@ bool SurfacePatchIndex::Impl::flushPendingSurface(const SurfacePtr& surface, Sur
         return false;
     }
 
-    const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
-    if (!points || points->rows < 2 || points->cols < 2) {
+    const cv::Mat_<cv::Vec3f> points = surface->rawPointsShared();
+    if (points.rows < 2 || points.cols < 2) {
         mask.clearAllPending();
         return false;
     }
@@ -1684,7 +1681,7 @@ bool SurfacePatchIndex::Impl::flushPendingSurface(const SurfacePtr& surface, Sur
 
         // Build new entry
         CellEntry entry;
-        if (buildCellEntry(surface, *points, col, row, stride, bboxPadding, entry)) {
+        if (buildCellEntry(surface, points, col, row, stride, bboxPadding, entry)) {
             toInsert.emplace_back(CellKey(surface, row, col), std::move(entry));
         }
     }

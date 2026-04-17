@@ -154,6 +154,16 @@ static void add_int_atomic(int& target, int value) {
     target += value;
 }
 
+static std::atomic<uint64_t> g_point_to_bbox_rejects{0};
+
+static uint64_t point_to_bbox_rejects_snapshot() {
+    return g_point_to_bbox_rejects.load(std::memory_order_relaxed);
+}
+
+static void reset_point_to_bbox_rejects() {
+    g_point_to_bbox_rejects.store(0, std::memory_order_relaxed);
+}
+
 struct ScopedMs {
     explicit ScopedMs(double& total_ms)
         : total_ms_(total_ms)
@@ -184,6 +194,49 @@ struct ScopedAtomicMs {
 
 static void print_ms(std::ostream& os, const char* label, double ms) {
     os << ' ' << label << '=' << std::fixed << std::setprecision(1) << ms << "ms";
+}
+
+static void print_count(std::ostream& os, const char* label, uint64_t count) {
+    os << ' ' << label << '=' << count;
+}
+
+static QuadSurface::PointToStats point_to_stats_delta(const QuadSurface::PointToStats& end,
+                                                      const QuadSurface::PointToStats& start) {
+    QuadSurface::PointToStats delta;
+    delta.calls = end.calls - start.calls;
+    delta.initial_hits = end.initial_hits - start.initial_hits;
+    delta.index_queries = end.index_queries - start.index_queries;
+    delta.index_candidate_cells = end.index_candidate_cells - start.index_candidate_cells;
+    delta.index_candidate_searches = end.index_candidate_searches - start.index_candidate_searches;
+    delta.index_hits = end.index_hits - start.index_hits;
+    delta.index_near_returns = end.index_near_returns - start.index_near_returns;
+    delta.point_index_queries = end.point_index_queries - start.point_index_queries;
+    delta.point_index_hits = end.point_index_hits - start.point_index_hits;
+    delta.random_fallbacks = end.random_fallbacks - start.random_fallbacks;
+    delta.random_iterations = end.random_iterations - start.random_iterations;
+    delta.random_invalid_skips = end.random_invalid_skips - start.random_invalid_skips;
+    delta.random_rescue_scans = end.random_rescue_scans - start.random_rescue_scans;
+    delta.random_hits = end.random_hits - start.random_hits;
+    delta.misses = end.misses - start.misses;
+    return delta;
+}
+
+static void add_point_to_stats(QuadSurface::PointToStats& dst, const QuadSurface::PointToStats& src) {
+    dst.calls += src.calls;
+    dst.initial_hits += src.initial_hits;
+    dst.index_queries += src.index_queries;
+    dst.index_candidate_cells += src.index_candidate_cells;
+    dst.index_candidate_searches += src.index_candidate_searches;
+    dst.index_hits += src.index_hits;
+    dst.index_near_returns += src.index_near_returns;
+    dst.point_index_queries += src.point_index_queries;
+    dst.point_index_hits += src.point_index_hits;
+    dst.random_fallbacks += src.random_fallbacks;
+    dst.random_iterations += src.random_iterations;
+    dst.random_invalid_skips += src.random_invalid_skips;
+    dst.random_rescue_scans += src.random_rescue_scans;
+    dst.random_hits += src.random_hits;
+    dst.misses += src.misses;
 }
 
 struct OptimizerTiming {
@@ -311,8 +364,10 @@ struct GrowthTimingTotals {
     double expand_bounds_fringe_ms{0.0};
     double expand_area_scan_ms{0.0};
     double inliers_write_ms{0.0};
+    uint64_t point_to_bbox_rejects{0};
 
     OptimizerTiming optimizer;
+    QuadSurface::PointToStats point_to_stats;
 
     void reset() {
         *this = GrowthTimingTotals{};
@@ -359,6 +414,25 @@ struct GrowthTimingTotals {
         print_ms(std::cout, "local_solve", candidate_local_solve_ms);
         print_ms(std::cout, "post_attach", candidate_post_attach_ms);
         print_ms(std::cout, "commit", candidate_commit_ms);
+        std::cout << std::endl;
+
+        std::cout << "[Timing] pointToStats";
+        print_count(std::cout, "calls", point_to_stats.calls);
+        print_count(std::cout, "bbox_rejects", point_to_bbox_rejects);
+        print_count(std::cout, "initial_hits", point_to_stats.initial_hits);
+        print_count(std::cout, "index_queries", point_to_stats.index_queries);
+        print_count(std::cout, "index_candidate_cells", point_to_stats.index_candidate_cells);
+        print_count(std::cout, "index_candidate_searches", point_to_stats.index_candidate_searches);
+        print_count(std::cout, "index_hits", point_to_stats.index_hits);
+        print_count(std::cout, "index_near_returns", point_to_stats.index_near_returns);
+        print_count(std::cout, "point_index_queries", point_to_stats.point_index_queries);
+        print_count(std::cout, "point_index_hits", point_to_stats.point_index_hits);
+        print_count(std::cout, "random_fallbacks", point_to_stats.random_fallbacks);
+        print_count(std::cout, "random_iterations", point_to_stats.random_iterations);
+        print_count(std::cout, "random_invalid_skips", point_to_stats.random_invalid_skips);
+        print_count(std::cout, "random_rescue_scans", point_to_stats.random_rescue_scans);
+        print_count(std::cout, "random_hits", point_to_stats.random_hits);
+        print_count(std::cout, "misses", point_to_stats.misses);
         std::cout << std::endl;
 
         std::cout << "[Timing] wrap stats_count=" << wrap_stats_count;
@@ -532,6 +606,34 @@ static float pointTo_seeded_neighbor(QuadSurface* surf,
                                      SurfacePatchIndex* surface_patch_index,
                                      cv::Vec3f* ptr_out)
 {
+    auto bbox_excludes_threshold = [](const Rect3D& bbox, const cv::Vec3f& point, float threshold) {
+        if (bbox.low[0] == -1.0f || bbox.high[0] == -1.0f)
+            return false;
+
+        double dist_sq = 0.0;
+        for (int d = 0; d < 3; ++d) {
+            if (!std::isfinite(bbox.low[d]) || !std::isfinite(bbox.high[d]) || !std::isfinite(point[d]))
+                return false;
+            if (point[d] < bbox.low[d]) {
+                const double delta = static_cast<double>(bbox.low[d]) - static_cast<double>(point[d]);
+                dist_sq += delta * delta;
+            } else if (point[d] > bbox.high[d]) {
+                const double delta = static_cast<double>(point[d]) - static_cast<double>(bbox.high[d]);
+                dist_sq += delta * delta;
+            }
+        }
+
+        const double threshold_sq = static_cast<double>(threshold) * static_cast<double>(threshold);
+        return dist_sq > threshold_sq;
+    };
+
+    if (surf && bbox_excludes_threshold(surf->bbox(), target, th)) {
+        g_point_to_bbox_rejects.fetch_add(1, std::memory_order_relaxed);
+        if (ptr_out)
+            *ptr_out = surf->pointer();
+        return std::nextafter(th, std::numeric_limits<float>::infinity());
+    }
+
     cv::Vec3f ptr;
     if (!seed_pointto_from_neighbors ||
         !seed_ptr_from_neighbors(surf, data, state, p, target, &ptr)) {
@@ -2618,9 +2720,13 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     bool skip_inpaint_next_opt = skip_inpaint;
     GrowthTimingTotals timing_totals;
     int timing_report_start_generation = 0;
+    QuadSurface::resetPointToStats();
+    reset_point_to_bbox_rejects();
     for(int generation=0;generation<stop_gen;generation++) {
         const auto generation_timing_start = std::chrono::steady_clock::now();
         const double point_to_generation_start_ms = pointTo_total_ms;
+        const QuadSurface::PointToStats point_to_generation_start_stats = QuadSurface::pointToStatsSnapshot();
+        const uint64_t point_to_bbox_generation_start = point_to_bbox_rejects_snapshot();
         bool generation_timing_finished = false;
         auto finish_generation_timing = [&](bool force_report) {
             if (generation_timing_finished)
@@ -2629,6 +2735,11 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             timing_totals.generations++;
             timing_totals.generation_total_ms += elapsed_ms(generation_timing_start);
             timing_totals.point_to_ms += pointTo_total_ms - point_to_generation_start_ms;
+            add_point_to_stats(timing_totals.point_to_stats,
+                               point_to_stats_delta(QuadSurface::pointToStatsSnapshot(),
+                                                    point_to_generation_start_stats));
+            timing_totals.point_to_bbox_rejects +=
+                point_to_bbox_rejects_snapshot() - point_to_bbox_generation_start;
             const bool interval_report = timing_report_interval > 0 &&
                                          generation > 0 &&
                                          (generation % timing_report_interval) == 0;
@@ -3035,30 +3146,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                     best_ref_seed = false;
                 } else if (used_area.width >=4 && used_area.height >= 4) {
                     cv::Vec2f tmp_loc_;
-                    const double cell_spacing = std::max(1e-9, static_cast<double>(step) * static_cast<double>(src_step));
-                    const int duplicate_radius_cells =
-                        std::max(2, static_cast<int>(std::ceil(static_cast<double>(duplicate_surface_th) / cell_spacing)) + 2);
-                    cv::Rect used_th(p[1] - duplicate_radius_cells,
-                                     p[0] - duplicate_radius_cells,
-                                     duplicate_radius_cells * 2 + 1,
-                                     duplicate_radius_cells * 2 + 1);
-                    used_th &= used_area;
-                    used_th &= cv::Rect(0, 0, points.cols, points.rows);
-                    const cv::Rect duplicate_bounds = used_area & cv::Rect(0, 0, points.cols, points.rows);
-                    if (used_th.width < 4 && duplicate_bounds.width >= 4) {
-                        const int grow = 4 - used_th.width;
-                        const int left = std::min(grow, used_th.x - duplicate_bounds.x);
-                        used_th.x -= left;
-                        used_th.width += left;
-                        used_th.width += std::min(grow - left, duplicate_bounds.br().x - used_th.br().x);
-                    }
-                    if (used_th.height < 4 && duplicate_bounds.height >= 4) {
-                        const int grow = 4 - used_th.height;
-                        const int top = std::min(grow, used_th.y - duplicate_bounds.y);
-                        used_th.y -= top;
-                        used_th.height += top;
-                        used_th.height += std::min(grow - top, duplicate_bounds.br().y - used_th.br().y);
-                    }
+                    cv::Rect used_th = used_area & cv::Rect(0, 0, points.cols, points.rows);
                     float dist = pointTo(tmp_loc_, points(used_th), best_coord, duplicate_surface_th, 1000, 1.0/(step*src_step));
                     tmp_loc_ += cv::Vec2f(used_th.x,used_th.y);
                     if (dist <= duplicate_surface_th) {
@@ -3691,10 +3779,15 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                     }
                 }
             }
-            // Orient normals toward mesh centroid before estimation
+            // Orient normals toward known umbilicus when available; otherwise use
+            // the sample centroid while bootstrapping the first centers.
             {
                 ScopedMs timer(timing_totals.umbilicus_orient_ms);
-                umbilicus_estimator->orient_normals_to_centroid();
+                if (umbilicus_ptr) {
+                    umbilicus_estimator->orient_normals_to_umbilicus(*umbilicus_ptr);
+                } else {
+                    umbilicus_estimator->orient_normals_to_centroid();
+                }
             }
             // Scan rows that have wrapped around and estimate centers
             int centers_estimated = 0;

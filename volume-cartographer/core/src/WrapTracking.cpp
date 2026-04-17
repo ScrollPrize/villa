@@ -987,6 +987,18 @@ core::util::Umbilicus UmbilicusEstimator::build_umbilicus(const cv::Vec3i& volum
     return core::util::Umbilicus::FromPoints(std::move(points), volume_shape);
 }
 
+void UmbilicusEstimator::orient_normals_to_umbilicus(const core::util::Umbilicus& umbilicus) {
+    const auto to_umbilicus = [&umbilicus](const Sample& sample) -> cv::Vec2d {
+        const cv::Vec3f point(static_cast<float>(sample.point_xy[0]),
+                              static_cast<float>(sample.point_xy[1]),
+                              static_cast<float>(sample.z));
+        const cv::Vec3f to_center = umbilicus.vector_to_umbilicus(point);
+        return cv::Vec2d(to_center[0], to_center[1]);
+    };
+
+    orient_normals_to_target("umbilicus", to_umbilicus);
+}
+
 void UmbilicusEstimator::orient_normals_to_centroid() {
     // Compute centroid of all sampled surface points
     cv::Vec2d centroid(0, 0);
@@ -1002,29 +1014,44 @@ void UmbilicusEstimator::orient_normals_to_centroid() {
     if (total_samples < 10) return;
     centroid /= static_cast<double>(total_samples);
 
-    // Count normals pointing toward vs away from centroid
+    const auto to_centroid = [centroid](const Sample& sample) {
+        return centroid - sample.point_xy;
+    };
+
+    orient_normals_to_target("centroid", to_centroid);
+}
+
+void UmbilicusEstimator::orient_normals_to_target(
+    const char* target_name,
+    const std::function<cv::Vec2d(const Sample&)>& target_fn) {
+    // Count normals pointing toward vs away from target
     int toward_count = 0;
     int away_count = 0;
 
     for (const auto& row_samples : _samples_per_row) {
         for (const auto& s : row_samples) {
-            cv::Vec2d to_centroid = centroid - s.point_xy;
-            double dist = cv::norm(to_centroid);
+            cv::Vec2d to_target = target_fn(s);
+            if (!std::isfinite(to_target[0]) || !std::isfinite(to_target[1])) {
+                continue;
+            }
+            double dist = cv::norm(to_target);
             if (dist < 1e-6) continue;
-            to_centroid /= dist;
+            to_target /= dist;
 
-            // Positive dot = normal points toward centroid
-            double dot = to_centroid[0] * s.normal_xy[0] + to_centroid[1] * s.normal_xy[1];
+            // Positive dot = normal points toward target
+            double dot = to_target[0] * s.normal_xy[0] + to_target[1] * s.normal_xy[1];
             if (dot > 0) toward_count++;
             else away_count++;
         }
     }
 
-    // Normals should point TOWARD the centroid (toward umbilicus)
+    if (toward_count + away_count < 10) return;
+
+    // Normals should point TOWARD the target
     // If majority point away, flip all normals
     if (away_count > toward_count) {
         std::cout << "[UmbilicusEstimator] Flipping normals: " << away_count
-                  << " away vs " << toward_count << " toward centroid" << std::endl;
+                  << " away vs " << toward_count << " toward " << target_name << std::endl;
         for (auto& row_samples : _samples_per_row) {
             for (auto& s : row_samples) {
                 s.normal_xy = -s.normal_xy;

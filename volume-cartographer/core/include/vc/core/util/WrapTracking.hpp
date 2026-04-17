@@ -4,6 +4,7 @@
 #include "vc/core/util/Umbilicus.hpp"
 
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -122,6 +123,10 @@ public:
     // Re-estimate rows that haven't met threshold yet (if more samples available)
     int retry_pending_rows();
 
+    // Orient all sample normals to point toward the provided umbilicus
+    // Should be called before estimation to ensure consistent normal direction
+    void orient_normals_to_umbilicus(const core::util::Umbilicus& umbilicus);
+
     // Orient all sample normals to point toward the mesh centroid
     // Should be called before estimation to ensure consistent normal direction
     void orient_normals_to_centroid();
@@ -192,6 +197,8 @@ private:
     double score_center(const std::vector<Sample>& samples,
                         const SampleStats& stats,
                         const cv::Vec2d& center) const;
+    void orient_normals_to_target(const char* target_name,
+                                  const std::function<cv::Vec2d(const Sample&)>& target_fn);
     std::vector<Sample> filter_samples_for_estimate(const std::vector<Sample>& samples) const;
     bool center_passes_sanity(const std::vector<Sample>& samples,
                               const SampleStats& stats,

@@ -11,6 +11,7 @@
 #include <opencv2/imgcodecs.hpp>
 
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <iostream>
 #include <system_error>
@@ -132,6 +133,85 @@ static cv::Vec3f nominal_loc(const cv::Vec3f &nominal, const cv::Vec3f &internal
     return nominal + cv::Vec3f(internal[0]/scale[0], internal[1]/scale[1], internal[2]);
 }
 
+namespace {
+
+struct PointToAtomicStats {
+    std::atomic<uint64_t> calls{0};
+    std::atomic<uint64_t> initial_hits{0};
+    std::atomic<uint64_t> index_queries{0};
+    std::atomic<uint64_t> index_candidate_cells{0};
+    std::atomic<uint64_t> index_candidate_searches{0};
+    std::atomic<uint64_t> index_hits{0};
+    std::atomic<uint64_t> index_near_returns{0};
+    std::atomic<uint64_t> point_index_queries{0};
+    std::atomic<uint64_t> point_index_hits{0};
+    std::atomic<uint64_t> random_fallbacks{0};
+    std::atomic<uint64_t> random_iterations{0};
+    std::atomic<uint64_t> random_invalid_skips{0};
+    std::atomic<uint64_t> random_rescue_scans{0};
+    std::atomic<uint64_t> random_hits{0};
+    std::atomic<uint64_t> misses{0};
+};
+
+PointToAtomicStats g_point_to_stats;
+
+static void point_to_stat_add(std::atomic<uint64_t>& target, uint64_t value = 1)
+{
+    target.fetch_add(value, std::memory_order_relaxed);
+}
+
+static uint64_t point_to_stat_load(const std::atomic<uint64_t>& target)
+{
+    return target.load(std::memory_order_relaxed);
+}
+
+static void point_to_stat_reset(std::atomic<uint64_t>& target)
+{
+    target.store(0, std::memory_order_relaxed);
+}
+
+} // namespace
+
+QuadSurface::PointToStats QuadSurface::pointToStatsSnapshot()
+{
+    PointToStats stats;
+    stats.calls = point_to_stat_load(g_point_to_stats.calls);
+    stats.initial_hits = point_to_stat_load(g_point_to_stats.initial_hits);
+    stats.index_queries = point_to_stat_load(g_point_to_stats.index_queries);
+    stats.index_candidate_cells = point_to_stat_load(g_point_to_stats.index_candidate_cells);
+    stats.index_candidate_searches = point_to_stat_load(g_point_to_stats.index_candidate_searches);
+    stats.index_hits = point_to_stat_load(g_point_to_stats.index_hits);
+    stats.index_near_returns = point_to_stat_load(g_point_to_stats.index_near_returns);
+    stats.point_index_queries = point_to_stat_load(g_point_to_stats.point_index_queries);
+    stats.point_index_hits = point_to_stat_load(g_point_to_stats.point_index_hits);
+    stats.random_fallbacks = point_to_stat_load(g_point_to_stats.random_fallbacks);
+    stats.random_iterations = point_to_stat_load(g_point_to_stats.random_iterations);
+    stats.random_invalid_skips = point_to_stat_load(g_point_to_stats.random_invalid_skips);
+    stats.random_rescue_scans = point_to_stat_load(g_point_to_stats.random_rescue_scans);
+    stats.random_hits = point_to_stat_load(g_point_to_stats.random_hits);
+    stats.misses = point_to_stat_load(g_point_to_stats.misses);
+    return stats;
+}
+
+void QuadSurface::resetPointToStats()
+{
+    point_to_stat_reset(g_point_to_stats.calls);
+    point_to_stat_reset(g_point_to_stats.initial_hits);
+    point_to_stat_reset(g_point_to_stats.index_queries);
+    point_to_stat_reset(g_point_to_stats.index_candidate_cells);
+    point_to_stat_reset(g_point_to_stats.index_candidate_searches);
+    point_to_stat_reset(g_point_to_stats.index_hits);
+    point_to_stat_reset(g_point_to_stats.index_near_returns);
+    point_to_stat_reset(g_point_to_stats.point_index_queries);
+    point_to_stat_reset(g_point_to_stats.point_index_hits);
+    point_to_stat_reset(g_point_to_stats.random_fallbacks);
+    point_to_stat_reset(g_point_to_stats.random_iterations);
+    point_to_stat_reset(g_point_to_stats.random_invalid_skips);
+    point_to_stat_reset(g_point_to_stats.random_rescue_scans);
+    point_to_stat_reset(g_point_to_stats.random_hits);
+    point_to_stat_reset(g_point_to_stats.misses);
+}
+
 QuadSurface::QuadSurface(const cv::Mat_<cv::Vec3f> &points, const cv::Vec2f &scale)
 {
     _points = std::make_unique<cv::Mat_<cv::Vec3f>>(points.clone());
@@ -168,7 +248,7 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_)
         _bbox = rect_from_json(meta["bbox"]);
 
     _maskTimestamp = readMaskTimestamp(path);
-    _needsLoad = true;  // Points will be loaded lazily
+    _needsLoad.store(true, std::memory_order_release);  // Points will be loaded lazily
 }
 
 QuadSurface::QuadSurface(const std::filesystem::path &path_, const utils::Json &json)
@@ -181,13 +261,13 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_, const utils::Json &
         _bbox = rect_from_json(json["bbox"]);
 
     _maskTimestamp = readMaskTimestamp(path);
-    _needsLoad = true;  // Points will be loaded lazily
+    _needsLoad.store(true, std::memory_order_release);  // Points will be loaded lazily
 }
 
 void QuadSurface::ensureLoaded()
 {
     // Fast path: already loaded (no lock needed for read)
-    if (!_needsLoad) {
+    if (!_needsLoad.load(std::memory_order_acquire)) {
         return;
     }
 
@@ -195,10 +275,15 @@ void QuadSurface::ensureLoaded()
     std::lock_guard<std::mutex> lock(_loadMutex);
 
     // Double-check after acquiring lock (another thread may have loaded)
-    if (!_needsLoad) {
+    if (!_needsLoad.load(std::memory_order_acquire)) {
         return;
     }
 
+    loadFromDiskUnlocked();
+}
+
+void QuadSurface::loadFromDiskUnlocked()
+{
     auto loaded = load_quad_from_tifxyz(path.string());
     if (!loaded) {
         throw std::runtime_error("Failed to load surface from: " + path.string());
@@ -220,7 +305,20 @@ void QuadSurface::ensureLoaded()
     _maskTimestamp = readMaskTimestamp(path);
 
     // Mark as loaded (after all data is set)
-    _needsLoad = false;
+    _needsLoad.store(false, std::memory_order_release);
+}
+
+cv::Mat_<cv::Vec3f> QuadSurface::rawPointsShared() const
+{
+    auto* self = const_cast<QuadSurface*>(this);
+    std::lock_guard<std::mutex> lock(self->_loadMutex);
+    if (self->_needsLoad.load(std::memory_order_acquire)) {
+        self->loadFromDiskUnlocked();
+    }
+    if (!self->_points) {
+        return {};
+    }
+    return *self->_points;
 }
 
 QuadSurface::~QuadSurface() = default;
@@ -426,7 +524,7 @@ void QuadSurface::unloadPoints()
 {
     if (path.empty()) return;  // No disk backing — can't reload.
     std::lock_guard<std::mutex> lock(_loadMutex);
-    if (_needsLoad) return;    // Already unloaded.
+    if (_needsLoad.load(std::memory_order_acquire)) return;    // Already unloaded.
     std::size_t mb = 0;
     if (_points) {
         mb = static_cast<std::size_t>(_points->rows) * _points->cols
@@ -437,7 +535,7 @@ void QuadSurface::unloadPoints()
     _validMaskCache = cv::Mat_<uint8_t>();
     _validMaskAllValid = false;
     _normalCache = cv::Mat_<cv::Vec3f>();
-    _needsLoad = true;
+    _needsLoad.store(true, std::memory_order_release);
     std::fprintf(stderr, "[SURF] unload %s (%zu MB freed)\n", id.c_str(), mb);
 }
 
@@ -831,6 +929,7 @@ float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f
 float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters,
                            SurfacePatchIndex* surfaceIndex, PointIndex* pointIndex)
 {
+    point_to_stat_add(g_point_to_stats.calls);
     ensureLoaded();
     cv::Vec2f loc = cv::Vec2f(ptr[0], ptr[1]) + cv::Vec2f(_center[0]*_scale[0], _center[1]*_scale[1]);
     cv::Vec3f _out;
@@ -843,6 +942,7 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
     float dist = search_min_loc(*_points, loc, _out, tgt, step_small, _scale[0]*0.1);
 
     if (dist < th && dist >= 0) {
+        point_to_stat_add(g_point_to_stats.initial_hits);
         ptr = cv::Vec3f(loc[0], loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
         return dist;
     }
@@ -854,50 +954,21 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
 
     // Try accelerated search using spatial indices
     if (surfaceIndex && !surfaceIndex->empty()) {
-        // Use R-tree to find candidate triangles near target
-        const float searchRadius = std::max(th * 4.0f, 100.0f);
-        Rect3D bounds;
-        bounds.low = tgt - cv::Vec3f(searchRadius, searchRadius, searchRadius);
-        bounds.high = tgt + cv::Vec3f(searchRadius, searchRadius, searchRadius);
-
-        std::vector<std::pair<int, int>> candidateCells;
-        surfaceIndex->forEachTriangle(bounds, SurfacePatchIndex::SurfacePtr{nullptr}, [&](const SurfacePatchIndex::TriangleCandidate& tri) {
-            // Filter to only triangles from this surface
-            if (tri.surface.get() == this) {
-                candidateCells.emplace_back(tri.j, tri.i);
-            }
-        });
-
-        // Search from each candidate cell
-        for (const auto& [row, col] : candidateCells) {
-            if (col < 1 || col >= _points->cols - 1 || row < 1 || row >= _points->rows - 1) {
-                continue;
-            }
-            if ((*_points)(row, col)[0] == -1) {
-                continue;
-            }
-
-            loc = {static_cast<float>(col), static_cast<float>(row)};
-            dist = search_min_loc(*_points, loc, _out, tgt, step_small, _scale[0]*0.1);
-
-            if (dist < th && dist >= 0) {
-                ptr = cv::Vec3f(loc[0], loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
-                return dist;
-            } else if (dist >= 0 && dist < min_dist) {
-                min_loc = loc;
-                min_dist = dist;
-            }
+        point_to_stat_add(g_point_to_stats.index_queries);
+        SurfacePatchIndex::SurfacePtr targetSurface(this, [](QuadSurface*) {});
+        if (auto hit = surfaceIndex->locate(tgt, th, targetSurface)) {
+            point_to_stat_add(g_point_to_stats.index_hits);
+            ptr = hit->ptr;
+            return hit->distance;
         }
 
-        // If we found something decent with R-tree, return it
-        if (min_dist < th * 2.0f) {
-            ptr = cv::Vec3f(min_loc[0], min_loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
-            return min_dist;
-        }
+        point_to_stat_add(g_point_to_stats.misses);
+        return std::nextafter(th, std::numeric_limits<float>::infinity());
     }
 
     // Try point index for a better starting hint
     if (pointIndex && !pointIndex->empty()) {
+        point_to_stat_add(g_point_to_stats.point_index_queries);
         auto nearest = pointIndex->nearest(tgt, th * 4.0f);
         if (nearest) {
             // Use nearest point as starting location hint
@@ -909,6 +980,7 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
                 loc = cv::Vec2f(hint_ptr[0], hint_ptr[1]) + cv::Vec2f(_center[0]*_scale[0], _center[1]*_scale[1]);
                 dist = search_min_loc(*_points, loc, _out, tgt, step_small, _scale[0]*0.1);
                 if (dist < th && dist >= 0) {
+                    point_to_stat_add(g_point_to_stats.point_index_hits);
                     ptr = cv::Vec3f(loc[0], loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
                     return dist;
                 } else if (dist >= 0 && dist < min_dist) {
@@ -920,6 +992,7 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
     }
 
     // Fall back to random sampling if indices didn't help
+    point_to_stat_add(g_point_to_stats.random_fallbacks);
     int r_full = 0;
     int skip_count = 0;
     for(int r=0; r<10*max_iters && r_full<max_iters; r++) {
@@ -928,6 +1001,7 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
         if ((*_points)(loc[1],loc[0])[0] == -1) {
             skip_count++;
             if (skip_count > max_iters / 10) {
+                point_to_stat_add(g_point_to_stats.random_rescue_scans);
                 cv::Vec2f dir = { (float)(rand() % 3 - 1), (float)(rand() % 3 - 1) };
                 if (dir[0] == 0 && dir[1] == 0) dir = {1, 0};
 
@@ -950,18 +1024,24 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
                         first_valid_found = false;
                     }
                 }
-                if ((*_points)(loc[1],loc[0])[0] == -1) continue; // if we didn't find a valid point
+                if ((*_points)(loc[1],loc[0])[0] == -1) {
+                    point_to_stat_add(g_point_to_stats.random_invalid_skips);
+                    continue; // if we didn't find a valid point
+                }
             } else {
+                point_to_stat_add(g_point_to_stats.random_invalid_skips);
                 continue;
             }
         }
 
         r_full++;
+        point_to_stat_add(g_point_to_stats.random_iterations);
 
         float dist = search_min_loc(*_points, loc, _out, tgt, step_large, _scale[0]*0.1);
 
         if (dist < th && dist >= 0) {
             dist = search_min_loc((*_points), loc, _out, tgt, step_small, _scale[0]*0.1);
+            point_to_stat_add(g_point_to_stats.random_hits);
             ptr = cv::Vec3f(loc[0], loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
             return dist;
         } else if (dist >= 0 && dist < min_dist) {
@@ -970,6 +1050,7 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
         }
     }
 
+    point_to_stat_add(g_point_to_stats.misses);
     ptr = cv::Vec3f(min_loc[0], min_loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
     return min_dist;
 }

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <filesystem>
 #include <iterator>
 #include <mutex>
@@ -292,6 +293,27 @@ public:
     // Get normal directly from grid coordinates (avoids expensive pointTo lookup)
     cv::Vec3f gridNormal(int row, int col) const;
     void gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) const override;
+
+    struct PointToStats {
+        uint64_t calls = 0;
+        uint64_t initial_hits = 0;
+        uint64_t index_queries = 0;
+        uint64_t index_candidate_cells = 0;
+        uint64_t index_candidate_searches = 0;
+        uint64_t index_hits = 0;
+        uint64_t index_near_returns = 0;
+        uint64_t point_index_queries = 0;
+        uint64_t point_index_hits = 0;
+        uint64_t random_fallbacks = 0;
+        uint64_t random_iterations = 0;
+        uint64_t random_invalid_skips = 0;
+        uint64_t random_rescue_scans = 0;
+        uint64_t random_hits = 0;
+        uint64_t misses = 0;
+    };
+    static PointToStats pointToStatsSnapshot();
+    static void resetPointToStats();
+
     float pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int max_iters = 1000,
                   class SurfacePatchIndex* surfaceIndex = nullptr, class PointIndex* pointIndex = nullptr) override;
     cv::Size size();
@@ -307,7 +329,7 @@ public:
     void save_meta();
     Rect3D bbox();
 
-    bool isLoaded() const { return !_needsLoad; }
+    bool isLoaded() const { return !_needsLoad.load(std::memory_order_acquire); }
 
     // Drop derived caches (validity mask, etc.) without unloading _points.
     // Called when this surface is no longer the active editing target so
@@ -330,6 +352,7 @@ public:
     virtual cv::Mat_<cv::Vec3f> rawPoints() { ensureLoaded(); return *_points; }
     virtual cv::Mat_<cv::Vec3f> *rawPointsPtr() { ensureLoaded(); return _points.get(); }
     virtual const cv::Mat_<cv::Vec3f> *rawPointsPtr() const { const_cast<QuadSurface*>(this)->ensureLoaded(); return _points.get(); }
+    cv::Mat_<cv::Vec3f> rawPointsShared() const;
 
     // Grid iteration helpers
     ValidPointRange<cv::Vec3f> validPoints() { ensureLoaded(); return ValidPointRange<cv::Vec3f>(_points.get()); }
@@ -430,10 +453,11 @@ protected:
     std::optional<std::filesystem::file_time_type> _maskTimestamp;
 
 private:
+    void loadFromDiskUnlocked();
     // Write surface data to directory without modifying state. skipChannel can be used to exclude a channel.
     void writeDataToDirectory(const std::filesystem::path& dir, const std::string& skipChannel = "");
     // Flag for lazy loading - true if points need to be loaded from path
-    bool _needsLoad = false;
+    std::atomic<bool> _needsLoad{false};
     // Mutex to protect lazy loading from concurrent access
     mutable std::mutex _loadMutex;
 };
