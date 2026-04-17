@@ -1287,6 +1287,11 @@ def train(
                 dir_dense_mask  = torch.zeros(B_, 1, *full_shape, device=device)
                 dir_axis_weight = torch.zeros(B_, 6, *full_shape, device=device)
 
+                # grad_mag = 1/spacing was computed at full res. At the
+                # pooled (coarser) scale, distances are f× smaller in
+                # voxel units, so grad_mag should be f× larger.
+                tgt_sm[:, 1:2] *= sf
+
                 targets[:, :, sz, sy, sx]         = tgt_sm
                 validity[:, :, sz, sy, sx]        = val_sm
                 dir_sparse_mask[:, :, sz, sy, sx] = dsp_sm
@@ -1451,7 +1456,11 @@ def train(
 
                 # Per-channel losses — weighted by grad_mag GT (closer surfaces → higher weight)
                 # Normalize so 20 vx spacing (grad_mag=0.05) → weight 1.0
-                cos_mag_weight = targets[:, 1:2] * 20.0
+                # For scale-aug: grad_mag was already scaled by f, so
+                # divide weight by f to keep per-voxel contribution
+                # comparable to non-aug samples.
+                _mag_weight_scale = (1.0 / scale_aug_factor) if use_aug else 1.0
+                cos_mag_weight = targets[:, 1:2] * 20.0 * _mag_weight_scale
                 loss_cos = scale_loss_mse(pred[:, 0:1], targets[:, 0:1], mask=cos_mask, weight=cos_mag_weight)
                 loss_mag = scale_loss_l1(pred[:, 1:2], targets[:, 1:2], mask=cos_mask, weight=cos_mag_weight)
                 loss_dir_sparse = scale_loss_mse(
@@ -1483,14 +1492,15 @@ def train(
                     t_pred = decode_to_tensor(
                         pred[:, 2:8].detach().permute(1, 0, 2, 3, 4)
                     )
-                    t_gt_batch = batch["tensor_moments"].to(
-                        device, non_blocking=True,
+                    # Use the (pooled+pasted for scale-aug) direction
+                    # targets decoded back to tensor form — always
+                    # spatially aligned with pred and dir_sparse_mask.
+                    t_gt_batch = decode_to_tensor(
+                        targets[:, 2:8].detach().permute(1, 0, 2, 3, 4)
                     )
-                    if bad:
-                        t_gt_batch = t_gt_batch.index_select(0, keep)
                     dir_angle_deg_sparse = tensor_unsigned_angle_deg(
                         t_pred,
-                        t_gt_batch.permute(1, 0, 2, 3, 4),
+                        t_gt_batch,
                         mask=dir_sparse_mask[:, 0],
                     ).item()
 
