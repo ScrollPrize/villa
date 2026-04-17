@@ -1246,9 +1246,34 @@ def train(
 
                 # Paste pooled block at the offset chosen by the dataset
                 # (aligned with the CT read so GT and CT match).
+                # Transform offset by the spatial augmentation (flips +
+                # rot90) that was applied to the image and GT tensors.
                 sm_shape = tgt_sm.shape[2:]  # (Z/f, Y/f, X/f)
                 full_shape = image.shape[2:]  # (Z, Y, X) = crop_size
-                off = batch["patch_info"][0]["scale_aug_offset"]
+                off = list(batch["patch_info"][0]["scale_aug_offset"])
+                aug = batch.get("_aug")
+                if aug:
+                    fz, fy, fx, k = aug
+                    if fz:
+                        off[0] = full_shape[0] - sm_shape[0] - off[0]
+                    if fy:
+                        off[1] = full_shape[1] - sm_shape[1] - off[1]
+                    if fx:
+                        off[2] = full_shape[2] - sm_shape[2] - off[2]
+                    # rot90 k times in (Y, X) plane:
+                    # k=1: (oy, ox) → (S_x - sm_x - ox, oy)
+                    # k=2: (oy, ox) → (S_y - sm_y - oy, S_x - sm_x - ox)
+                    # k=3: (oy, ox) → (ox, S_y - sm_y - oy)
+                    for _ in range(k % 4):
+                        oy, ox = off[1], off[2]
+                        sy_full, sx_full = full_shape[1], full_shape[2]
+                        sm_y, sm_x = sm_shape[1], sm_shape[2]
+                        off[1] = sx_full - sm_x - ox
+                        off[2] = oy
+                        # After rot90, sm_shape Y and X swap for
+                        # the next rotation step.  But since
+                        # crop_size is cubic and sm_shape is cubic
+                        # (crop_size/f), they stay the same.
                 sz, sy, sx = (
                     slice(off[0], off[0] + sm_shape[0]),
                     slice(off[1], off[1] + sm_shape[1]),
