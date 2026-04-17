@@ -723,6 +723,7 @@ def train(
     wandb_run_name: Optional[str] = None,
     wandb_tags: Optional[List[str]] = None,
     reinit_decoder_scales: int = 0,
+    himag_filter: bool = True,
 ) -> None:
     rank, local_rank, world_size, is_dist = _init_distributed()
     is_main = rank == 0
@@ -1086,7 +1087,7 @@ def train(
     HIMAG_DISABLE_ABOVE = 75  # disable when >= this many of window are above
     HIMAG_ENABLE_ABOVE = 50   # re-enable when < this many of window are above
     himag_flags: "deque[int]" = deque(maxlen=HIMAG_WINDOW)
-    himag_enabled = True
+    himag_enabled = himag_filter
 
     for epoch in range(epochs):
         model.train()
@@ -1232,7 +1233,9 @@ def train(
                 himag_flags.extend([1] * global_above + [0] * global_below)
                 window_above = sum(himag_flags)
                 prev_enabled = himag_enabled
-                if himag_enabled:
+                if not himag_filter:
+                    pass  # permanently disabled via --no-himag-filter
+                elif himag_enabled:
                     # Disable when ≥75% of the 100-sample window is
                     # above threshold — the filter is starving the
                     # loss and needs to let the model recover.
@@ -1259,9 +1262,14 @@ def train(
                         pi = batch["patch_info"][b]
                         seg = pi.get("segment_uuid", "?")
                         idx_b = pi.get("idx", "?")
+                        ds_name = pi.get("dataset_name", "?")
+                        ds_idx = pi.get("dataset_idx", "?")
+                        bbox = pi.get("world_bbox", ())
+                        bbox_str = ",".join(str(int(v)) for v in bbox) if bbox else "?"
                         print(
                             f"{TAG} hi-mag skip step={global_step} "
-                            f"seg={seg} idx={idx_b} "
+                            f"ds=[{ds_idx}]{ds_name} idx={idx_b} "
+                            f"seg={seg} bbox={bbox_str} "
                             f"mag_loss={per_mag_vals[b]:.4f}",
                             flush=True,
                         )
@@ -1680,6 +1688,10 @@ def main() -> None:
                         help="W&B entity/user (default: user's default).")
     parser.add_argument("--wandb-run-name", type=str, default=None,
                         help="W&B run name (default: <timestamp>_<run_name>).")
+    parser.add_argument("--no-himag-filter", action="store_true",
+                        help="Disable hi-mag sample filtering entirely. "
+                             "All samples are kept regardless of grad_mag "
+                             "loss magnitude.")
     parser.add_argument("--wandb-tags", type=str, default=None,
                         help="Comma-separated list of W&B run tags.")
     args = parser.parse_args()
@@ -1718,6 +1730,7 @@ def main() -> None:
             if args.wandb_tags else None
         ),
         reinit_decoder_scales=args.reinit_decoder_scales,
+        himag_filter=not args.no_himag_filter,
     )
 
 

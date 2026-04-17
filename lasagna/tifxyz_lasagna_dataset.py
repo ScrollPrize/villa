@@ -390,6 +390,16 @@ def _find_patches_world_chunks(config, patch_size_zyx):
         if volume_path is None:
             continue
 
+        # Derive a short human-readable dataset name for logging/vis.
+        _ds_name = ""
+        _seg_p = dataset.get("segments_path")
+        if _seg_p:
+            _ds_name = Path(_seg_p).parent.name
+        if not _ds_name and volume_path:
+            _ds_name = Path(str(volume_path).rstrip("/")).name
+        if not _ds_name:
+            _ds_name = f"dataset{dataset_idx}"
+
         volume_scale = int(dataset["volume_scale"])
         segments_path = dataset.get("segments_path")
         if not segments_path:
@@ -465,7 +475,7 @@ def _find_patches_world_chunks(config, patch_size_zyx):
         )
 
         # Convert chunk dicts to ChunkPatch objects (dataset_rowcol_cond.py:332-349)
-        for chunk in chunk_results:
+        for _local_i, chunk in enumerate(chunk_results):
             wraps_in_chunk = []
             for w in chunk["wraps"]:
                 seg_idx = w["segment_idx"]
@@ -483,6 +493,9 @@ def _find_patches_world_chunks(config, patch_size_zyx):
                 world_bbox=tuple(chunk["bbox_3d"]),
                 wraps=wraps_in_chunk,
                 segments=scaled_segments,
+                dataset_idx=dataset_idx,
+                dataset_name=_ds_name,
+                dataset_local_idx=_local_i,
             ))
 
     return patches
@@ -939,7 +952,9 @@ class TifxyzLasagnaDataset(Dataset):
             "patch_info": {
                 "segment_uuid": str(patch.wraps[0]["segment"].uuid) if patch.wraps else "",
                 "world_bbox": patch.world_bbox,
-                "idx": int(idx),
+                "idx": patch.dataset_local_idx,
+                "dataset_idx": patch.dataset_idx,
+                "dataset_name": patch.dataset_name,
             },
         }
         if self.include_geometry:
