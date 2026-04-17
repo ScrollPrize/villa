@@ -880,13 +880,25 @@ class TifxyzLasagnaDataset(Dataset):
         max_corner = min_corner + np.array(crop_size, dtype=np.int64)
 
         # --- CT read ---
+        scale_aug_offset = None
         if use_scale_aug:
             # CT from the coarser zarr level.  One voxel at level+1 =
             # f voxels at the base level.  We read crop_size voxels
-            # covering f× the world extent, centered on the GT region.
-            gt_center = min_corner + np.array(crop_size, dtype=np.int64) // 2
-            ct_world_half = np.array(crop_size, dtype=np.int64) * f // 2
-            ct_world_min = gt_center - ct_world_half
+            # covering f× the world extent.
+            #
+            # The pooled GT (crop_size/f) will be pasted at a random
+            # offset inside the crop_size output tensor.  We pick that
+            # offset here and shift the CT read so the GT region lands
+            # at that offset within the CT tensor.
+            pooled_size = np.array([c // f for c in crop_size], dtype=np.int64)
+            scale_aug_offset = np.array(
+                [int(np.random.randint(0, crop_size[d] - pooled_size[d] + 1))
+                 for d in range(3)],
+                dtype=np.int64,
+            )
+            # CT world origin: shift so GT lands at scale_aug_offset
+            # (in output-tensor coords) within the CT tensor.
+            ct_world_min = min_corner - scale_aug_offset * f
             ct_min = ct_world_min // f
             ct_max = ct_min + np.array(crop_size, dtype=np.int64)
             vol_crop = _read_volume_crop(
@@ -1017,6 +1029,7 @@ class TifxyzLasagnaDataset(Dataset):
                 "dataset_idx": patch.dataset_idx,
                 "dataset_name": patch.dataset_name,
                 "scale_aug_factor": f,
+                "scale_aug_offset": scale_aug_offset,  # (3,) int64 or None
             },
         }
         if self.include_geometry:

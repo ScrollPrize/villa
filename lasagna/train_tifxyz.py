@@ -117,6 +117,7 @@ from tifxyz_labels import (
     decode_to_tensor,
     tensor_unsigned_angle_deg,
 )
+from gpu_pause import GpuPauseServer
 from tifxyz_lasagna_dataset import (
     TifxyzLasagnaDataset,
     augment_batch_inplace,
@@ -972,6 +973,24 @@ def train(
     scale_loss_mse = ScaleSpaceLoss3D(mse_loss, num_scales=5)
     scale_loss_l1 = ScaleSpaceLoss3D(smooth_l1_loss, num_scales=5)
 
+    # GPU pause/resume server — allows other apps to reclaim the GPU.
+    pause_server = GpuPauseServer() if is_main else None
+
+    def _gpu_offload():
+        model.cpu()
+        for s in optimizer.state.values():
+            for k, v in s.items():
+                if isinstance(v, torch.Tensor):
+                    s[k] = v.cpu()
+        torch.cuda.empty_cache()
+
+    def _gpu_reload():
+        model.to(device)
+        for s in optimizer.state.values():
+            for k, v in s.items():
+                if isinstance(v, torch.Tensor):
+                    s[k] = v.to(device)
+
     writer = SummaryWriter(log_dir=str(run_dir)) if is_main else None
     best_val_loss = float("inf")
     global_step = 0
@@ -1244,15 +1263,36 @@ def train(
                 dsp_sm = F.max_pool3d(dir_sparse_mask, sf, sf)
                 ddn_sm = F.max_pool3d(dir_dense_mask, sf, sf)
 
-                # Paste pooled block at a random offset inside
-                # crop_size-shaped tensors. Same concept as
-                # label_patch_size < patch_size.
+                # Paste pooled block at the offset chosen by the dataset
+                # (aligned with the CT read so GT and CT match).
+                # Transform offset by the spatial augmentation (flips +
+                # rot90) that was applied to the image and GT tensors.
                 sm_shape = tgt_sm.shape[2:]  # (Z/f, Y/f, X/f)
                 full_shape = image.shape[2:]  # (Z, Y, X) = crop_size
-                off = [
-                    int(np.random.randint(0, full_shape[d] - sm_shape[d] + 1))
-                    for d in range(3)
-                ]
+                off = list(batch["patch_info"][0]["scale_aug_offset"])
+                aug = batch.get("_aug")
+                if aug:
+                    fz, fy, fx, k = aug
+                    if fz:
+                        off[0] = full_shape[0] - sm_shape[0] - off[0]
+                    if fy:
+                        off[1] = full_shape[1] - sm_shape[1] - off[1]
+                    if fx:
+                        off[2] = full_shape[2] - sm_shape[2] - off[2]
+                    # rot90 k times in (Y, X) plane:
+                    # k=1: (oy, ox) → (S_x - sm_x - ox, oy)
+                    # k=2: (oy, ox) → (S_y - sm_y - oy, S_x - sm_x - ox)
+                    # k=3: (oy, ox) → (ox, S_y - sm_y - oy)
+                    for _ in range(k % 4):
+                        oy, ox = off[1], off[2]
+                        sy_full, sx_full = full_shape[1], full_shape[2]
+                        sm_y, sm_x = sm_shape[1], sm_shape[2]
+                        off[1] = sx_full - sm_x - ox
+                        off[2] = oy
+                        # After rot90, sm_shape Y and X swap for
+                        # the next rotation step.  But since
+                        # crop_size is cubic and sm_shape is cubic
+                        # (crop_size/f), they stay the same.
                 sz, sy, sx = (
                     slice(off[0], off[0] + sm_shape[0]),
                     slice(off[1], off[1] + sm_shape[1]),
@@ -1265,6 +1305,11 @@ def train(
                 dir_sparse_mask = torch.zeros(B_, 1, *full_shape, device=device)
                 dir_dense_mask  = torch.zeros(B_, 1, *full_shape, device=device)
                 dir_axis_weight = torch.zeros(B_, 6, *full_shape, device=device)
+
+                # grad_mag = 1/spacing was computed at full res. At the
+                # pooled (coarser) scale, distances are f× smaller in
+                # voxel units, so grad_mag should be f× larger.
+                tgt_sm[:, 1:2] *= sf
 
                 targets[:, :, sz, sy, sx]         = tgt_sm
                 validity[:, :, sz, sy, sx]        = val_sm
@@ -1430,7 +1475,11 @@ def train(
 
                 # Per-channel losses — weighted by grad_mag GT (closer surfaces → higher weight)
                 # Normalize so 20 vx spacing (grad_mag=0.05) → weight 1.0
-                cos_mag_weight = targets[:, 1:2] * 20.0
+                # For scale-aug: grad_mag was already scaled by f, so
+                # divide weight by f to keep per-voxel contribution
+                # comparable to non-aug samples.
+                _mag_weight_scale = (1.0 / scale_aug_factor) if use_aug else 1.0
+                cos_mag_weight = targets[:, 1:2] * 20.0 * _mag_weight_scale
                 loss_cos = scale_loss_mse(pred[:, 0:1], targets[:, 0:1], mask=cos_mask, weight=cos_mag_weight)
                 loss_mag = scale_loss_l1(pred[:, 1:2], targets[:, 1:2], mask=cos_mask, weight=cos_mag_weight)
                 loss_dir_sparse = scale_loss_mse(
@@ -1462,14 +1511,15 @@ def train(
                     t_pred = decode_to_tensor(
                         pred[:, 2:8].detach().permute(1, 0, 2, 3, 4)
                     )
-                    t_gt_batch = batch["tensor_moments"].to(
-                        device, non_blocking=True,
+                    # Use the (pooled+pasted for scale-aug) direction
+                    # targets decoded back to tensor form — always
+                    # spatially aligned with pred and dir_sparse_mask.
+                    t_gt_batch = decode_to_tensor(
+                        targets[:, 2:8].detach().permute(1, 0, 2, 3, 4)
                     )
-                    if bad:
-                        t_gt_batch = t_gt_batch.index_select(0, keep)
                     dir_angle_deg_sparse = tensor_unsigned_angle_deg(
                         t_pred,
-                        t_gt_batch.permute(1, 0, 2, 3, 4),
+                        t_gt_batch,
                         mask=dir_sparse_mask[:, 0],
                     ).item()
 
@@ -1481,6 +1531,9 @@ def train(
             scaler.update()
             if global_step < warmup_steps:
                 warmup_scheduler.step()
+
+            if pause_server:
+                pause_server.check(_gpu_offload, _gpu_reload)
 
             epoch_losses.append(loss.item())
             if not math.isfinite(loss.item()):
@@ -1602,6 +1655,8 @@ def train(
                 flush=True,
             )
 
+    if pause_server is not None:
+        pause_server.close()
     if writer is not None:
         writer.close()
     if wandb_run is not None:
