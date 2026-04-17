@@ -1,6 +1,35 @@
 # from pytorch3dunet
 
-from torch import optim
+from torch import nn, optim
+
+
+def _iter_embedding_parameter_ids(model):
+    embedding_param_ids = set()
+    for module in model.modules():
+        if isinstance(module, nn.Embedding):
+            for parameter in module.parameters(recurse=False):
+                embedding_param_ids.add(id(parameter))
+    return embedding_param_ids
+
+
+def _build_muon_param_groups(model):
+    embedding_param_ids = _iter_embedding_parameter_ids(model)
+    muon_params = []
+    aux_adamw_params = []
+    for parameter in model.parameters():
+        if not parameter.requires_grad:
+            continue
+        if parameter.ndim >= 2 and id(parameter) not in embedding_param_ids:
+            muon_params.append(parameter)
+        else:
+            aux_adamw_params.append(parameter)
+
+    groups = []
+    if muon_params:
+        groups.append({"params": muon_params, "use_muon": True})
+    if aux_adamw_params:
+        groups.append({"params": aux_adamw_params, "use_muon": False})
+    return groups
 
 
 
@@ -88,9 +117,43 @@ def create_optimizer(optimizer_config, model):
         from pytorch_optimizer import AdaBelief
         optimizer = AdaBelief(model.parameters(), weight_decay=weight_decay)
 
-    elif optim_name == 'muon' : 
-        from pytorch_optimizer import Muon
-        optimizer = Muon(model.parameters(), weight_decay=weight_decay)
+    elif optim_name == 'muon':
+        try:
+            from pytorch_optimizer import Muon
+        except ImportError as exc:
+            raise ImportError(
+                "optimizer.name='muon' requires the 'pytorch-optimizer' package. "
+                "Install the project with the 'models' extra."
+            ) from exc
+
+        momentum = optimizer_config.get('momentum', 0.95)
+        weight_decouple = optimizer_config.get('weight_decouple', True)
+        nesterov = optimizer_config.get('nesterov', True)
+        ns_steps = optimizer_config.get('ns_steps', 5)
+        use_adjusted_lr = optimizer_config.get('use_adjusted_lr', False)
+        adamw_lr = optimizer_config.get('adamw_lr', 3e-4)
+        adamw_betas = tuple(optimizer_config.get('adamw_betas', (0.9, 0.95)))
+        adamw_wd = optimizer_config.get('adamw_wd', weight_decay)
+        adamw_eps = optimizer_config.get('adamw_eps', 1e-10)
+        maximize = optimizer_config.get('maximize', False)
+        param_groups = _build_muon_param_groups(model)
+        if not param_groups:
+            raise ValueError("Muon optimizer requires at least one trainable parameter")
+        optimizer = Muon(
+            param_groups,
+            lr=optimizer_config.get('learning_rate', 2e-2),
+            momentum=momentum,
+            weight_decay=weight_decay,
+            weight_decouple=weight_decouple,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+            use_adjusted_lr=use_adjusted_lr,
+            adamw_lr=adamw_lr,
+            adamw_betas=adamw_betas,
+            adamw_wd=adamw_wd,
+            adamw_eps=adamw_eps,
+            maximize=maximize,
+        )
     
     elif optim_name == 'shampoo' :
         from pytorch_optimizer import Shampoo

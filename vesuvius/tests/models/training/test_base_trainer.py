@@ -1,4 +1,6 @@
+import builtins
 import torch
+import pytest
 from types import SimpleNamespace
 
 from vesuvius.models.training.optimizers import create_optimizer
@@ -66,3 +68,68 @@ def test_create_optimizer_adamw_honors_eps_override():
 
     assert isinstance(optimizer, torch.optim.AdamW)
     assert optimizer.defaults["eps"] == 1e-4
+
+
+def test_create_optimizer_muon_groups_params_and_honors_kwargs():
+    class _TinyMuonModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.embed = torch.nn.Embedding(8, 4)
+            self.linear = torch.nn.Linear(4, 3)
+            self.norm = torch.nn.LayerNorm(3)
+            self.extra_bias = torch.nn.Parameter(torch.zeros(3))
+
+    model = _TinyMuonModel()
+    optimizer = create_optimizer(
+        {
+            "name": "muon",
+            "learning_rate": 0.02,
+            "momentum": 0.9,
+            "weight_decay": 0.01,
+            "weight_decouple": True,
+            "nesterov": False,
+            "ns_steps": 7,
+            "use_adjusted_lr": True,
+            "adamw_lr": 3e-4,
+            "adamw_betas": (0.8, 0.9),
+            "adamw_wd": 0.02,
+            "adamw_eps": 1e-9,
+        },
+        model,
+    )
+
+    assert optimizer.__class__.__name__ == "Muon"
+    muon_groups = [group for group in optimizer.param_groups if group.get("use_muon") is True]
+    aux_groups = [group for group in optimizer.param_groups if group.get("use_muon") is False]
+    assert len(muon_groups) == 1
+    assert len(aux_groups) == 1
+
+    muon_param_ids = {id(param) for param in muon_groups[0]["params"]}
+    aux_param_ids = {id(param) for param in aux_groups[0]["params"]}
+    assert id(model.linear.weight) in muon_param_ids
+    assert id(model.embed.weight) in aux_param_ids
+    assert id(model.linear.bias) in aux_param_ids
+    assert id(model.norm.weight) in aux_param_ids
+    assert id(model.extra_bias) in aux_param_ids
+    assert muon_groups[0]["momentum"] == pytest.approx(0.9)
+    assert muon_groups[0]["ns_steps"] == 7
+    assert muon_groups[0]["nesterov"] is False
+    assert muon_groups[0]["use_adjusted_lr"] is True
+    assert aux_groups[0]["lr"] == pytest.approx(3e-4)
+    assert aux_groups[0]["betas"] == (0.8, 0.9)
+    assert aux_groups[0]["weight_decay"] == pytest.approx(0.02)
+    assert aux_groups[0]["eps"] == pytest.approx(1e-9)
+
+
+def test_create_optimizer_muon_missing_dependency_raises_clear_error(monkeypatch: pytest.MonkeyPatch):
+    real_import = builtins.__import__
+
+    def _fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "pytorch_optimizer":
+            raise ModuleNotFoundError("No module named 'pytorch_optimizer'")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _fake_import)
+    model = torch.nn.Linear(4, 2)
+    with pytest.raises(ImportError, match="optimizer.name='muon'"):
+        create_optimizer({"name": "muon", "learning_rate": 0.02}, model)

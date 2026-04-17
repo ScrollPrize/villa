@@ -441,9 +441,48 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
     cfg["volume_only_augmentation"] = volume_only_aug
 
     optimizer = dict(cfg.get("optimizer") or {})
-    optimizer.setdefault("name", "adamw")
-    optimizer.setdefault("learning_rate", 1e-4)
+    optimizer_name = str(optimizer.get("name", "adamw")).lower()
+    optimizer["name"] = optimizer_name
+    if optimizer_name == "muon":
+        optimizer.setdefault("learning_rate", 0.02)
+        optimizer.setdefault("momentum", 0.95)
+        optimizer.setdefault("weight_decouple", True)
+        optimizer.setdefault("nesterov", True)
+        optimizer.setdefault("ns_steps", 5)
+        optimizer.setdefault("use_adjusted_lr", False)
+        optimizer.setdefault("adamw_lr", 3e-4)
+        optimizer.setdefault("adamw_betas", [0.9, 0.95])
+        optimizer.setdefault("adamw_wd", optimizer.get("weight_decay", 1e-4))
+        optimizer.setdefault("adamw_eps", 1e-10)
+        optimizer.setdefault("maximize", False)
+    else:
+        optimizer.setdefault("learning_rate", 1e-4)
     optimizer.setdefault("weight_decay", 1e-4)
+    if float(optimizer["learning_rate"]) <= 0.0:
+        raise ValueError("optimizer.learning_rate must be positive")
+    if float(optimizer["weight_decay"]) < 0.0:
+        raise ValueError("optimizer.weight_decay must be non-negative")
+    if optimizer_name == "muon":
+        if float(optimizer["momentum"]) < 0.0 or float(optimizer["momentum"]) >= 1.0:
+            raise ValueError("optimizer.momentum must be within [0, 1)")
+        if int(optimizer["ns_steps"]) < 1:
+            raise ValueError("optimizer.ns_steps must be >= 1")
+        if float(optimizer["adamw_lr"]) <= 0.0:
+            raise ValueError("optimizer.adamw_lr must be positive")
+        adamw_betas = optimizer.get("adamw_betas")
+        if not isinstance(adamw_betas, (list, tuple)) or len(adamw_betas) != 2:
+            raise ValueError("optimizer.adamw_betas must be a length-2 sequence")
+        adamw_betas = [float(v) for v in adamw_betas]
+        if any(beta < 0.0 or beta >= 1.0 for beta in adamw_betas):
+            raise ValueError("optimizer.adamw_betas entries must be within [0, 1)")
+        optimizer["adamw_betas"] = adamw_betas
+        if float(optimizer["adamw_wd"]) < 0.0:
+            raise ValueError("optimizer.adamw_wd must be non-negative")
+        if float(optimizer["adamw_eps"]) <= 0.0:
+            raise ValueError("optimizer.adamw_eps must be positive")
+        for key in ("weight_decouple", "nesterov", "use_adjusted_lr", "maximize"):
+            if not isinstance(optimizer[key], bool):
+                raise ValueError(f"optimizer.{key} must be a boolean")
     cfg["optimizer"] = optimizer
     return cfg
 

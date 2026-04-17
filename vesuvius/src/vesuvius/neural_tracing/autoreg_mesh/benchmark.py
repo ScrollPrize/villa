@@ -105,6 +105,7 @@ def run_autoreg_mesh_benchmark(
         "device": str(device),
         "dataset_length": int(len(dataset)),
         "sample_count": int(sample_count),
+        "optimizer_name": str(cfg.get("optimizer", {}).get("name", "adamw")),
         "pointer_temperature": float(cfg.get("pointer_temperature", 0.25)),
         "coarse_prediction_mode": str(cfg.get("coarse_prediction_mode", "joint_pointer")),
         "conditioning_feature_debias_mode": str(cfg.get("conditioning_feature_debias_mode", "none")),
@@ -139,6 +140,16 @@ def run_autoreg_mesh_benchmark(
         "forward_ms": float(forward_ms),
         "infer_ms": float(infer_ms),
     }
+    if result["optimizer_name"] == "muon":
+        optimizer_cfg = dict(cfg.get("optimizer") or {})
+        result.update(
+            {
+                "muon_momentum": float(optimizer_cfg.get("momentum", 0.95)),
+                "muon_ns_steps": int(optimizer_cfg.get("ns_steps", 5)),
+                "muon_adamw_lr": float(optimizer_cfg.get("adamw_lr", 3e-4)),
+                "muon_weight_decouple": bool(optimizer_cfg.get("weight_decouple", True)),
+            }
+        )
     if int(training_steps) > 0:
         bench_cfg = dict(cfg)
         bench_cfg["wandb_project"] = None

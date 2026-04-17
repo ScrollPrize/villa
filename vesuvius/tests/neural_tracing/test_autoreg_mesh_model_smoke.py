@@ -301,6 +301,26 @@ def _make_factorized_cached_token_config() -> dict:
     return config
 
 
+def _make_muon_cached_token_config() -> dict:
+    config = _make_cached_token_config()
+    config["optimizer"] = {
+        "name": "muon",
+        "learning_rate": 0.02,
+        "momentum": 0.95,
+        "weight_decay": 0.01,
+        "weight_decouple": True,
+        "nesterov": True,
+        "ns_steps": 5,
+        "use_adjusted_lr": False,
+        "adamw_lr": 3e-4,
+        "adamw_betas": [0.9, 0.95],
+        "adamw_wd": 0.01,
+        "adamw_eps": 1e-10,
+        "maximize": False,
+    }
+    return config
+
+
 def _make_large_cached_token_config() -> dict:
     config = _make_cached_token_config()
     config["input_shape"] = [32, 32, 32]
@@ -650,6 +670,21 @@ def test_axis_factorized_autoreg_mesh_model_forward_and_losses_are_finite() -> N
     assert torch.isfinite(losses["coarse_x_loss"])
     for value in losses.values():
         assert torch.isfinite(value)
+
+
+def test_muon_autoreg_mesh_config_validates_and_training_smoke_runs(tmp_path: Path) -> None:
+    config = _make_muon_cached_token_config()
+    validated = validate_autoreg_mesh_config(config)
+    assert validated["optimizer"]["name"] == "muon"
+    assert validated["optimizer"]["momentum"] == pytest.approx(0.95)
+    assert validated["optimizer"]["adamw_betas"] == [0.9, 0.95]
+
+    config["out_dir"] = str(tmp_path / "runs_muon")
+    dataset = _make_training_dataset()
+    result = run_autoreg_mesh_training(config, dataset=dataset, device="cpu", max_steps=2)
+
+    assert len(result["history"]) == 2
+    assert torch.isfinite(torch.tensor(result["history"][-1]["loss"]))
 
 
 def test_debias_autoreg_mesh_model_forward_and_losses_are_finite(tmp_path: Path) -> None:
@@ -2462,6 +2497,21 @@ def test_rope_config_validation_rejects_invalid_values() -> None:
     with pytest.raises(ValueError, match="coarse_continuation_empty_fallback"):
         validate_autoreg_mesh_config(bad_constraint_fallback)
 
+    bad_muon_momentum = _make_muon_cached_token_config()
+    bad_muon_momentum["optimizer"]["momentum"] = 1.0
+    with pytest.raises(ValueError, match="optimizer.momentum"):
+        validate_autoreg_mesh_config(bad_muon_momentum)
+
+    bad_muon_betas = _make_muon_cached_token_config()
+    bad_muon_betas["optimizer"]["adamw_betas"] = [0.9]
+    with pytest.raises(ValueError, match="optimizer.adamw_betas"):
+        validate_autoreg_mesh_config(bad_muon_betas)
+
+    bad_muon_bool = _make_muon_cached_token_config()
+    bad_muon_bool["optimizer"]["weight_decouple"] = "yes"
+    with pytest.raises(ValueError, match="optimizer.weight_decouple"):
+        validate_autoreg_mesh_config(bad_muon_bool)
+
 
 def test_autoreg_mesh_ddp_cpu_smoke_writes_checkpoints_on_rank_zero_only(tmp_path: Path) -> None:
     port = _find_free_port()
@@ -2563,6 +2613,26 @@ def test_autoreg_mesh_training_microbenchmark_smoke_returns_expected_keys() -> N
     assert result["startup_ms"] >= 0.0
     assert result["mean_train_step_ms"] >= 0.0
     assert result["samples_per_sec_effective"] >= 0.0
+
+
+def test_autoreg_mesh_muon_benchmark_reports_optimizer_fields() -> None:
+    config = _make_muon_cached_token_config()
+    dataset = _make_training_dataset()
+
+    result = run_autoreg_mesh_benchmark(
+        config,
+        dataset=dataset,
+        device="cpu",
+        sample_count=1,
+        training_steps=1,
+    )
+
+    assert result["optimizer_name"] == "muon"
+    assert result["muon_momentum"] == pytest.approx(0.95)
+    assert result["muon_ns_steps"] == 5
+    assert result["muon_adamw_lr"] == pytest.approx(3e-4)
+    assert result["muon_weight_decouple"] is True
+    assert result["mean_train_step_ms"] >= 0.0
 
 
 def test_autoreg_mesh_ddp_cpu_benchmark_smoke(tmp_path: Path) -> None:
