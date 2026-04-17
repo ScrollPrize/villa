@@ -67,6 +67,15 @@ uInt checkedUInt(size_t value, const char* name)
     return static_cast<uInt>(value);
 }
 
+void requireExactByteCount(size_t actual, size_t expected, const char* context)
+{
+    if (actual != expected) {
+        throw std::runtime_error(
+            std::string(context) + " byte count mismatch: expected " +
+            std::to_string(expected) + ", got " + std::to_string(actual));
+    }
+}
+
 std::vector<std::byte> bloscCompress(std::span<const std::byte> input,
                                      const CompressorConfig& cfg)
 {
@@ -103,6 +112,7 @@ std::vector<std::byte> bloscDecompress(std::span<const std::byte> input, size_t 
         }
         throw std::runtime_error("blosc_decompress failed with code " + std::to_string(rc));
     }
+    requireExactByteCount(static_cast<size_t>(rc), outputSize, "blosc_decompress");
     return output;
 }
 
@@ -173,6 +183,8 @@ std::vector<std::byte> lz4Decompress(std::span<const std::byte> input, size_t ou
     if (rc < 0) {
         throw std::runtime_error("LZ4_decompress_safe failed");
     }
+    requireExactByteCount(static_cast<size_t>(rc), originalSize, "LZ4_decompress_safe");
+    requireExactByteCount(originalSize, outputSize, "LZ4 original size");
     return output;
 }
 
@@ -217,6 +229,7 @@ std::vector<std::byte> gzipDecompress(std::span<const std::byte> input, size_t o
     if (rc != Z_STREAM_END && rc != Z_OK) {
         throw std::runtime_error("gzip inflate failed with code " + std::to_string(rc));
     }
+    requireExactByteCount(stream.total_out, outputSize, "gzip inflate");
     return output;
 }
 
@@ -443,6 +456,10 @@ const std::string& VcDataset::delimiter() const { return impl_->delimiter_; }
 void VcDataset::decompress(std::span<const uint8_t> compressed,
                             void* output, size_t nElements) const
 {
+    if (impl_->dtypeSize_ != 0 &&
+        nElements > std::numeric_limits<size_t>::max() / impl_->dtypeSize_) {
+        throw std::runtime_error("decompress output byte count overflows size_t");
+    }
     const size_t outBytes = nElements * impl_->dtypeSize_;
     const auto input = std::span<const std::byte>(
         reinterpret_cast<const std::byte*>(compressed.data()),
@@ -450,6 +467,7 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
 
     switch (impl_->compressor_.id) {
         case CompressorId::None:
+            requireExactByteCount(compressed.size(), outBytes, "uncompressed chunk");
             std::memcpy(output, compressed.data(), outBytes);
             break;
 
@@ -464,6 +482,7 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
                 throw std::runtime_error("blosc_decompress failed with code " +
                                           std::to_string(ret));
             }
+            requireExactByteCount(static_cast<size_t>(ret), outBytes, "blosc_decompress");
             break;
         }
 
@@ -473,6 +492,7 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
                 throw std::runtime_error(
                     std::string("ZSTD_decompress failed: ") + ZSTD_getErrorName(ret));
             }
+            requireExactByteCount(ret, outBytes, "ZSTD_decompress");
             break;
         }
 
