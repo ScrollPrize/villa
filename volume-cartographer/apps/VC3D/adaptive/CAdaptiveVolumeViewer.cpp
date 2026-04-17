@@ -519,10 +519,16 @@ void CAdaptiveVolumeViewer::submitRender()
         // view (matching sceneToSurface). Shift by half the viewport so the
         // rendered pixels and the mouse→surface math agree — without this
         // every edit lands up-left of the cursor by half the viewport.
+        // Don't pass zOff into surf->gen — its per-pixel-normal offset makes
+        // zoom expose curvature drift on a non-planar surface. Instead build
+        // the base (unoffset) coords here and apply zOff as a single rigid
+        // world-space translation in _zOffWorldDir below.
         cv::Vec3f offset(_camera.surfacePtr[0] * _camera.scale - float(fbW) * 0.5f,
                          _camera.surfacePtr[1] * _camera.scale - float(fbH) * 0.5f,
-                         _camera.zOff);
+                         0.0f);
         const bool wantComposite = _compositeSettings.enabled;
+        // Always request normals so shift+scroll can sample the view-center
+        // normal without a separate gen pass.
         const bool cacheHit =
             !_genCacheDirty
             && _genCacheSurfKey == surf.get()
@@ -531,17 +537,58 @@ void CAdaptiveVolumeViewer::submitRender()
             && _genCacheScale == _camera.scale
             && _genCacheOffset == offset
             && _genCacheWantComposite == wantComposite
+            && _genCacheZOff == _camera.zOff
+            && _genCacheZOffDir == _zOffWorldDir
             && !_genCoords.empty();
         if (!cacheHit) {
-            surf->gen(&_genCoords, wantComposite ? &_genNormals : nullptr,
+            surf->gen(&_genCoords, &_genNormals,
                       cv::Size(fbW, fbH), cv::Vec3f(0, 0, 0),
                       _camera.scale, offset);
+            // Lazy-capture the translation direction when zOff was set by a
+            // path that didn't populate _zOffWorldDir (adjustSurfaceOffset
+            // via Ctrl+./Ctrl+, shortcuts, or any other non-Shift-scroll
+            // source). Without this, those offsets would be silent no-ops
+            // until the user first Shift-scrolled.
+            if (_camera.zOff != 0.0f &&
+                _zOffWorldDir[0] == 0.0f && _zOffWorldDir[1] == 0.0f && _zOffWorldDir[2] == 0.0f &&
+                !_genNormals.empty()) {
+                const int cy = _genNormals.rows / 2;
+                const int cx = _genNormals.cols / 2;
+                const cv::Vec3f n = _genNormals(cy, cx);
+                if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2])) {
+                    const float len = static_cast<float>(cv::norm(n));
+                    if (len > 1e-6f) {
+                        _zOffWorldDir = n / len;
+                    }
+                }
+            }
+            // Apply z-offset as a rigid world-space translation using the
+            // cached direction. On cache hits _genCoords is already shifted
+            // — avoid double-applying by only running this on cache miss.
+            if (_camera.zOff != 0.0f &&
+                (_zOffWorldDir[0] != 0.0f || _zOffWorldDir[1] != 0.0f || _zOffWorldDir[2] != 0.0f) &&
+                !_genCoords.empty()) {
+                const cv::Vec3f tr = _zOffWorldDir * _camera.zOff;
+                const int rows = _genCoords.rows;
+                const int cols = _genCoords.cols;
+                for (int y = 0; y < rows; ++y) {
+                    cv::Vec3f* row = _genCoords.ptr<cv::Vec3f>(y);
+                    for (int x = 0; x < cols; ++x) {
+                        cv::Vec3f& p = row[x];
+                        // Skip invalid sentinels (NaN or -1 marker).
+                        if (p[0] != p[0] || p[0] == -1.0f) continue;
+                        p += tr;
+                    }
+                }
+            }
             _genCacheSurfKey = surf.get();
             _genCacheFbW = fbW;
             _genCacheFbH = fbH;
             _genCacheScale = _camera.scale;
             _genCacheOffset = offset;
             _genCacheWantComposite = wantComposite;
+            _genCacheZOff = _camera.zOff;
+            _genCacheZOffDir = _zOffWorldDir;
             _genCacheDirty = false;
         }
         cv::Mat_<cv::Vec3f>& coords = _genCoords;
@@ -973,11 +1020,26 @@ void CAdaptiveVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMo
             focus->surfaceId = _surfName;
             _state->setPOI("focus", focus);
         } else {
-            // Direct z-offset
+            // Direct z-offset — rigid translation along the surface normal at
+            // view center (captured fresh each shift+scroll).
             float maxZ = 10000.0f;
             if (_volume) {
                 auto [w, h, d] = _volume->shape();
                 maxZ = static_cast<float>(std::max({w, h, d}));
+            }
+            // Capture the translation direction from the normal at view
+            // center. _genNormals is populated every render (we always
+            // request normals on the flattened path).
+            if (!_genNormals.empty()) {
+                const int cy = _genNormals.rows / 2;
+                const int cx = _genNormals.cols / 2;
+                const cv::Vec3f n = _genNormals(cy, cx);
+                if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2])) {
+                    const float len = static_cast<float>(cv::norm(n));
+                    if (len > 1e-6f) {
+                        _zOffWorldDir = n / len;
+                    }
+                }
             }
             _camera.zOff = std::clamp(_camera.zOff + dz, -maxZ, maxZ);
             scheduleRender();
@@ -1469,6 +1531,7 @@ void CAdaptiveVolumeViewer::adjustSurfaceOffset(float dn)
 void CAdaptiveVolumeViewer::resetSurfaceOffsets()
 {
     _camera.zOff = 0.0f;
+    _zOffWorldDir = cv::Vec3f(0.0f, 0.0f, 0.0f);
     scheduleRender();
 }
 
