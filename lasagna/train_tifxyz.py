@@ -1244,15 +1244,11 @@ def train(
                 dsp_sm = F.max_pool3d(dir_sparse_mask, sf, sf)
                 ddn_sm = F.max_pool3d(dir_dense_mask, sf, sf)
 
-                # Paste pooled block at a random offset inside
-                # crop_size-shaped tensors. Same concept as
-                # label_patch_size < patch_size.
+                # Paste pooled block at the offset chosen by the dataset
+                # (aligned with the CT read so GT and CT match).
                 sm_shape = tgt_sm.shape[2:]  # (Z/f, Y/f, X/f)
                 full_shape = image.shape[2:]  # (Z, Y, X) = crop_size
-                off = [
-                    int(np.random.randint(0, full_shape[d] - sm_shape[d] + 1))
-                    for d in range(3)
-                ]
+                off = batch["patch_info"][0]["scale_aug_offset"]
                 sz, sy, sx = (
                     slice(off[0], off[0] + sm_shape[0]),
                     slice(off[1], off[1] + sm_shape[1]),
