@@ -183,12 +183,56 @@ def _factorized_coarse_pointer_loss(
         "y": int(coarse_grid_shape[1]),
         "x": int(coarse_grid_shape[2]),
     }
+    conditional_logits = outputs.get("coarse_axis_conditional_logits")
+    conditional_valid_masks = outputs.get("coarse_constraint_conditional_valid_masks")
+    axis_valid_masks = outputs.get("coarse_constraint_axis_valid_masks")
     axis_losses: dict[str, Tensor] = {}
     axis_entropies: dict[str, Tensor] = {}
 
     for axis_name in ("z", "y", "x"):
-        axis_logits = outputs["coarse_axis_logits"][axis_name]
         axis_target = axis_targets[axis_name]
+        axis_allowed_mask = None
+        if axis_name == "z" or conditional_logits is None:
+            axis_logits = outputs["coarse_axis_logits"][axis_name]
+            if axis_valid_masks is not None:
+                axis_allowed_mask = axis_valid_masks.get(axis_name)
+        elif axis_name == "y":
+            z_target = axis_targets["z"].clamp(min=0, max=max(axis_sizes["z"] - 1, 0))
+            axis_logits = torch.gather(
+                conditional_logits["y"],
+                dim=2,
+                index=z_target.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, axis_sizes["y"]),
+            ).squeeze(2)
+            if conditional_valid_masks is not None and conditional_valid_masks.get("y") is not None:
+                axis_allowed_mask = torch.gather(
+                    conditional_valid_masks["y"].to(torch.bool),
+                    dim=2,
+                    index=z_target.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, axis_sizes["y"]),
+                ).squeeze(2)
+        else:
+            z_target = axis_targets["z"].clamp(min=0, max=max(axis_sizes["z"] - 1, 0))
+            y_target = axis_targets["y"].clamp(min=0, max=max(axis_sizes["y"] - 1, 0))
+            gathered_z = torch.gather(
+                conditional_logits["x"],
+                dim=2,
+                index=z_target.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, axis_sizes["y"], axis_sizes["x"]),
+            ).squeeze(2)
+            axis_logits = torch.gather(
+                gathered_z,
+                dim=2,
+                index=y_target.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, axis_sizes["x"]),
+            ).squeeze(2)
+            if conditional_valid_masks is not None and conditional_valid_masks.get("x") is not None:
+                gathered_valid_z = torch.gather(
+                    conditional_valid_masks["x"].to(torch.bool),
+                    dim=2,
+                    index=z_target.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, axis_sizes["y"], axis_sizes["x"]),
+                ).squeeze(2)
+                axis_allowed_mask = torch.gather(
+                    gathered_valid_z,
+                    dim=2,
+                    index=y_target.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, axis_sizes["x"]),
+                ).squeeze(2)
         if not bool(distance_aware_enabled):
             axis_losses[axis_name] = _hard_axis_pointer_loss(axis_logits, axis_target, supervision_mask)
             axis_entropies[axis_name] = axis_logits.new_zeros(())
@@ -200,9 +244,8 @@ def _factorized_coarse_pointer_loss(
             radius=int(distance_aware_radius),
             sigma=float(distance_aware_sigma),
         )
-        axis_valid_masks = outputs.get("coarse_constraint_axis_valid_masks")
-        if axis_valid_masks is not None and axis_valid_masks.get(axis_name) is not None:
-            neighbor_allowed = torch.gather(axis_valid_masks[axis_name].to(torch.bool), dim=-1, index=neighbor_ids)
+        if axis_allowed_mask is not None:
+            neighbor_allowed = torch.gather(axis_allowed_mask.to(torch.bool), dim=-1, index=neighbor_ids)
             target_probs = torch.where(neighbor_allowed, target_probs, torch.zeros_like(target_probs))
             target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
         log_probs = F.log_softmax(axis_logits, dim=-1)
@@ -369,8 +412,10 @@ def _boundary_loss(outputs: dict, batch: dict) -> Tensor:
     pred_xyz = outputs.get("pred_xyz_refined", outputs["pred_xyz"])
     mask = batch.get("target_supervision_mask", _sequence_token_mask(pred_xyz, batch)) & _prediction_finite_mask(pred_xyz)
     max_coord = _crop_max_coord(pred_xyz, batch)
-    per_axis = F.softplus(-pred_xyz) + F.softplus(pred_xyz - max_coord.view(1, 1, 3))
-    per_token = per_axis.sum(dim=-1)
+    outside_low = (-pred_xyz).clamp_min(0.0)
+    outside_high = (pred_xyz - max_coord.view(1, 1, 3)).clamp_min(0.0)
+    outside_dist = outside_low + outside_high
+    per_token = F.smooth_l1_loss(outside_dist, torch.zeros_like(outside_dist), reduction="none").sum(dim=-1)
     return _masked_mean(per_token, mask)
 
 

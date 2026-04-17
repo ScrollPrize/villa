@@ -240,6 +240,7 @@ class AutoregMeshModel(nn.Module):
         self.cross_attention_every_n_blocks = int(self.config["cross_attention_every_n_blocks"])
         self.pointer_temperature = float(self.config["pointer_temperature"])
         self.coarse_prediction_mode = str(self.config["coarse_prediction_mode"])
+        self.axis_factorized_head_variant = str(self.config.get("axis_factorized_head_variant", "conditional"))
         self.coarse_continuation_constraint_enabled = bool(self.config.get("coarse_continuation_constraint_enabled", True))
         self.coarse_continuation_constraint_mode = str(self.config.get("coarse_continuation_constraint_mode", "hard_mask"))
         self.coarse_continuation_forward_scale = float(self.config.get("coarse_continuation_forward_scale", 4.0))
@@ -344,6 +345,8 @@ class AutoregMeshModel(nn.Module):
             self.pointer_key_z = None
             self.pointer_key_y = None
             self.pointer_key_x = None
+            self.pointer_condition_embed_z = None
+            self.pointer_condition_embed_y = None
         else:
             self.pointer_query = None
             self.pointer_key = None
@@ -353,6 +356,10 @@ class AutoregMeshModel(nn.Module):
             self.pointer_key_z = nn.Linear(self.decoder_dim, self.decoder_dim, bias=False)
             self.pointer_key_y = nn.Linear(self.decoder_dim, self.decoder_dim, bias=False)
             self.pointer_key_x = nn.Linear(self.decoder_dim, self.decoder_dim, bias=False)
+            self.pointer_condition_embed_z = nn.Embedding(self.coarse_grid_shape[0], self.decoder_dim)
+            self.pointer_condition_embed_y = nn.Embedding(self.coarse_grid_shape[1], self.decoder_dim)
+            nn.init.zeros_(self.pointer_condition_embed_z.weight)
+            nn.init.zeros_(self.pointer_condition_embed_y.weight)
         self.offset_head = nn.Linear(self.decoder_dim, 3 * max(self.offset_num_bins), bias=True)
         self.stop_head = nn.Linear(self.decoder_dim, 1, bias=True)
         self.position_refine_max_residual = float(self.config.get("position_refine_max_residual", 0.25))
@@ -677,13 +684,33 @@ class AutoregMeshModel(nn.Module):
         _, gy, gx = self.coarse_grid_shape
         return (z * (gy * gx)) + (y * gx) + x
 
-    def _factorized_axis_memory(self, memory_tokens: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def _factorized_axis_memory(self, memory_tokens: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         gz, gy, gx = self.coarse_grid_shape
         memory_5d = memory_tokens.reshape(memory_tokens.shape[0], gz, gy, gx, memory_tokens.shape[-1])
         z_memory = memory_5d.mean(dim=(2, 3))
-        y_memory = memory_5d.mean(dim=(1, 3))
-        x_memory = memory_5d.mean(dim=(1, 2))
-        return z_memory, y_memory, x_memory
+        y_memory = memory_5d.mean(dim=3)
+        x_memory = memory_5d
+        return memory_5d, z_memory, y_memory, x_memory
+
+    def _gather_conditional_y_values(self, values: Tensor, z_ids: Tensor) -> Tensor:
+        z_ids = z_ids.clamp(min=0, max=max(values.shape[2] - 1, 0))
+        index = z_ids.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, values.shape[-1])
+        return torch.gather(values, dim=2, index=index).squeeze(2)
+
+    def _gather_conditional_x_values(self, values: Tensor, z_ids: Tensor, y_ids: Tensor) -> Tensor:
+        z_ids = z_ids.clamp(min=0, max=max(values.shape[2] - 1, 0))
+        y_ids = y_ids.clamp(min=0, max=max(values.shape[3] - 1, 0))
+        gathered_z = torch.gather(
+            values,
+            dim=2,
+            index=z_ids.unsqueeze(-1).unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, values.shape[3], values.shape[4]),
+        ).squeeze(2)
+        gathered_y = torch.gather(
+            gathered_z,
+            dim=2,
+            index=y_ids.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, gathered_z.shape[-1]),
+        ).squeeze(2)
+        return gathered_y
 
     def _compute_coarse_outputs(
         self,
@@ -717,37 +744,65 @@ class AutoregMeshModel(nn.Module):
                 **coarse_constraint_metrics,
             }
 
-        z_memory, y_memory, x_memory = self._factorized_axis_memory(memory_tokens)
+        if self.axis_factorized_head_variant != "conditional":
+            raise ValueError(
+                "axis_factorized coarse mode requires axis_factorized_head_variant='conditional', "
+                f"got {self.axis_factorized_head_variant!r}"
+            )
+
+        _, z_memory, y_memory, x_memory = self._factorized_axis_memory(memory_tokens)
         z_query = F.normalize(self.pointer_query_z(hidden), dim=-1)
-        y_query = F.normalize(self.pointer_query_y(hidden), dim=-1)
-        x_query = F.normalize(self.pointer_query_x(hidden), dim=-1)
+        y_query_base = self.pointer_query_y(hidden)
+        x_query_base = self.pointer_query_x(hidden)
         z_key = F.normalize(self.pointer_key_z(z_memory), dim=-1)
         y_key = F.normalize(self.pointer_key_y(y_memory), dim=-1)
         x_key = F.normalize(self.pointer_key_x(x_memory), dim=-1)
         z_logits = torch.einsum("btd,bzd->btz", z_query, z_key) / self.pointer_temperature
-        y_logits = torch.einsum("btd,byd->bty", y_query, y_key) / self.pointer_temperature
-        x_logits = torch.einsum("btd,bxd->btx", x_query, x_key) / self.pointer_temperature
+        gz, gy, gx = self.coarse_grid_shape
+        y_logits_given_z = hidden.new_empty(hidden.shape[0], hidden.shape[1], gz, gy)
+        x_logits_given_zy = hidden.new_empty(hidden.shape[0], hidden.shape[1], gz, gy, gx)
+        z_cond = self.pointer_condition_embed_z.weight.to(device=hidden.device, dtype=hidden.dtype)
+        y_cond = self.pointer_condition_embed_y.weight.to(device=hidden.device, dtype=hidden.dtype)
+        for z_idx in range(gz):
+            y_query = F.normalize(y_query_base + z_cond[z_idx].view(1, 1, -1), dim=-1)
+            y_logits_given_z[:, :, z_idx, :] = torch.einsum("btd,byd->bty", y_query, y_key[:, z_idx, :, :]) / self.pointer_temperature
+            x_query = F.normalize(
+                x_query_base.unsqueeze(2) + z_cond[z_idx].view(1, 1, 1, -1) + y_cond.view(1, 1, gy, -1),
+                dim=-1,
+            )
+            x_logits_given_zy[:, :, z_idx, :, :] = torch.einsum(
+                "btyd,byxd->btyx",
+                x_query,
+                x_key[:, z_idx, :, :, :],
+            ) / self.pointer_temperature
         z_valid = y_valid = x_valid = None
+        y_valid_given_z = x_valid_given_zy = None
         if coarse_valid_mask is not None:
-            gz, gy, gx = self.coarse_grid_shape
             mask_5d = coarse_valid_mask.reshape(coarse_valid_mask.shape[0], coarse_valid_mask.shape[1], gz, gy, gx)
             z_valid = mask_5d.any(dim=(3, 4))
-            y_valid = mask_5d.any(dim=(2, 4))
-            x_valid = mask_5d.any(dim=(2, 3))
+            y_valid_given_z = mask_5d.any(dim=4)
+            x_valid_given_zy = mask_5d
             z_logits = z_logits.masked_fill(~z_valid, torch.finfo(z_logits.dtype).min)
-            y_logits = y_logits.masked_fill(~y_valid, torch.finfo(y_logits.dtype).min)
-            x_logits = x_logits.masked_fill(~x_valid, torch.finfo(x_logits.dtype).min)
+            y_logits_given_z = y_logits_given_z.masked_fill(~y_valid_given_z, torch.finfo(y_logits_given_z.dtype).min)
+            x_logits_given_zy = x_logits_given_zy.masked_fill(~x_valid_given_zy, torch.finfo(x_logits_given_zy.dtype).min)
         z_ids = z_logits.argmax(dim=-1)
+        y_logits = self._gather_conditional_y_values(y_logits_given_z, z_ids)
         y_ids = y_logits.argmax(dim=-1)
+        x_logits = self._gather_conditional_x_values(x_logits_given_zy, z_ids, y_ids)
         x_ids = x_logits.argmax(dim=-1)
+        if y_valid_given_z is not None:
+            y_valid = self._gather_conditional_y_values(y_valid_given_z, z_ids)
+            x_valid = self._gather_conditional_x_values(x_valid_given_zy, z_ids, y_ids)
         pred_coarse_ids = self._flatten_coarse_axis_ids(z_ids, y_ids, x_ids)
         return {
             "coarse_logits": None,
             "coarse_axis_logits": {"z": z_logits, "y": y_logits, "x": x_logits},
+            "coarse_axis_conditional_logits": {"z": z_logits, "y": y_logits_given_z, "x": x_logits_given_zy},
             "pred_coarse_ids": pred_coarse_ids,
             "pred_coarse_axis_ids": {"z": z_ids, "y": y_ids, "x": x_ids},
             "coarse_constraint_joint_valid_mask": coarse_valid_mask,
             "coarse_constraint_axis_valid_masks": {"z": z_valid, "y": y_valid, "x": x_valid} if z_valid is not None else None,
+            "coarse_constraint_conditional_valid_masks": {"z": z_valid, "y": y_valid_given_z, "x": x_valid_given_zy} if z_valid is not None else None,
             **coarse_constraint_metrics,
         }
 
@@ -755,6 +810,7 @@ class AutoregMeshModel(nn.Module):
         self,
         coarse_logits: Tensor | None,
         coarse_axis_logits: dict[str, Tensor] | None,
+        coarse_axis_conditional_logits: dict[str, Tensor] | None,
         offset_logits: Tensor,
         pred_refine_residual: Tensor,
     ) -> Tensor:
@@ -765,20 +821,34 @@ class AutoregMeshModel(nn.Module):
             coarse_starts = self.coarse_cell_starts.to(device=coarse_logits.device, dtype=coarse_logits.dtype)
             expected_coarse_start = torch.einsum("btn,nc->btc", coarse_probs, coarse_starts)
         else:
-            if coarse_axis_logits is None:
-                raise ValueError("coarse_axis_logits are required for axis_factorized mode")
-            expected_starts = []
-            for axis_name, size, patch in zip(
-                ("z", "y", "x"),
-                self.coarse_grid_shape,
-                self.patch_size,
-                strict=True,
-            ):
-                axis_logits = coarse_axis_logits[axis_name]
-                axis_probs = torch.softmax(axis_logits, dim=-1)
-                axis_positions = torch.arange(size, device=axis_logits.device, dtype=axis_logits.dtype)
-                expected_starts.append(torch.einsum("btn,n->bt", axis_probs, axis_positions) * float(patch))
-            expected_coarse_start = torch.stack(expected_starts, dim=-1)
+            if coarse_axis_conditional_logits is not None:
+                z_logits = coarse_axis_conditional_logits["z"]
+                y_logits_given_z = coarse_axis_conditional_logits["y"]
+                x_logits_given_zy = coarse_axis_conditional_logits["x"]
+                z_probs = torch.softmax(z_logits, dim=-1)
+                y_probs_given_z = torch.softmax(y_logits_given_z, dim=-1)
+                x_probs_given_zy = torch.softmax(x_logits_given_zy, dim=-1)
+                joint_probs = z_probs.unsqueeze(-1).unsqueeze(-1) * y_probs_given_z.unsqueeze(-1) * x_probs_given_zy
+                coarse_starts = self.coarse_cell_starts.reshape(*self.coarse_grid_shape, 3).to(
+                    device=z_logits.device,
+                    dtype=z_logits.dtype,
+                )
+                expected_coarse_start = torch.einsum("btzyx,zyxc->btc", joint_probs, coarse_starts)
+            else:
+                if coarse_axis_logits is None:
+                    raise ValueError("coarse_axis_logits are required for axis_factorized mode")
+                expected_starts = []
+                for axis_name, size, patch in zip(
+                    ("z", "y", "x"),
+                    self.coarse_grid_shape,
+                    self.patch_size,
+                    strict=True,
+                ):
+                    axis_logits = coarse_axis_logits[axis_name]
+                    axis_probs = torch.softmax(axis_logits, dim=-1)
+                    axis_positions = torch.arange(size, device=axis_logits.device, dtype=axis_logits.dtype)
+                    expected_starts.append(torch.einsum("btn,n->bt", axis_probs, axis_positions) * float(patch))
+                expected_coarse_start = torch.stack(expected_starts, dim=-1)
 
         expected_offsets = []
         for axis, bins in enumerate(self.offset_num_bins):
@@ -1035,6 +1105,7 @@ class AutoregMeshModel(nn.Module):
         pred_xyz_soft = self._soft_decode_local_xyz(
             coarse_outputs["coarse_logits"],
             coarse_outputs["coarse_axis_logits"],
+            coarse_outputs.get("coarse_axis_conditional_logits"),
             offset_logits,
             pred_refine_residual,
         )
@@ -1043,6 +1114,7 @@ class AutoregMeshModel(nn.Module):
         return {
             "coarse_logits": coarse_outputs["coarse_logits"],
             "coarse_axis_logits": coarse_outputs["coarse_axis_logits"],
+            "coarse_axis_conditional_logits": coarse_outputs.get("coarse_axis_conditional_logits"),
             "offset_logits": offset_logits,
             "stop_logits": stop_logits,
             "pred_coarse_ids": coarse_outputs["pred_coarse_ids"],
@@ -1055,8 +1127,10 @@ class AutoregMeshModel(nn.Module):
             "memory_tokens": memory_tokens,
             "coarse_grid_shape": self.coarse_grid_shape,
             "coarse_prediction_mode": self.coarse_prediction_mode,
+            "axis_factorized_head_variant": self.axis_factorized_head_variant,
             "coarse_constraint_joint_valid_mask": coarse_outputs["coarse_constraint_joint_valid_mask"],
             "coarse_constraint_axis_valid_masks": coarse_outputs["coarse_constraint_axis_valid_masks"],
+            "coarse_constraint_conditional_valid_masks": coarse_outputs.get("coarse_constraint_conditional_valid_masks"),
             "coarse_constraint_keep_fraction": coarse_outputs["coarse_constraint_keep_fraction"],
             "coarse_constraint_empty_rate": coarse_outputs["coarse_constraint_empty_rate"],
             "coarse_constraint_target_outside_rate": coarse_outputs["coarse_constraint_target_outside_rate"],

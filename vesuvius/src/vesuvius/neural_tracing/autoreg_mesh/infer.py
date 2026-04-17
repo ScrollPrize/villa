@@ -186,10 +186,20 @@ def infer_autoreg_mesh(
             )
 
             if str(outputs.get("coarse_prediction_mode", getattr(model, "coarse_prediction_mode", "joint_pointer"))) == "axis_factorized":
-                coarse_axis_ids = {}
-                for axis_name in ("z", "y", "x"):
-                    axis_logits = outputs["coarse_axis_logits"][axis_name][0, current_len - 1]
-                    coarse_axis_ids[axis_name] = int(_sample_from_logits(axis_logits, greedy=greedy).item())
+                conditional_logits = outputs.get("coarse_axis_conditional_logits")
+                if conditional_logits is not None:
+                    z_logits = conditional_logits["z"][0, current_len - 1]
+                    z_id = int(_sample_from_logits(z_logits, greedy=greedy).item())
+                    y_logits = conditional_logits["y"][0, current_len - 1, z_id]
+                    y_id = int(_sample_from_logits(y_logits, greedy=greedy).item())
+                    x_logits = conditional_logits["x"][0, current_len - 1, z_id, y_id]
+                    x_id = int(_sample_from_logits(x_logits, greedy=greedy).item())
+                    coarse_axis_ids = {"z": z_id, "y": y_id, "x": x_id}
+                else:
+                    coarse_axis_ids = {}
+                    for axis_name in ("z", "y", "x"):
+                        axis_logits = outputs["coarse_axis_logits"][axis_name][0, current_len - 1]
+                        coarse_axis_ids[axis_name] = int(_sample_from_logits(axis_logits, greedy=greedy).item())
                 coarse_id = int(
                     model._flatten_coarse_axis_ids(
                         torch.tensor(coarse_axis_ids["z"], dtype=torch.long, device=device),

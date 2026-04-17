@@ -193,6 +193,18 @@ def _checkpoint_coarse_prediction_mode(ckpt_payload: dict | None) -> str:
     return "joint_pointer"
 
 
+def _checkpoint_axis_factorized_head_variant(ckpt_payload: dict | None) -> str | None:
+    checkpoint_mode = _checkpoint_coarse_prediction_mode(ckpt_payload)
+    if checkpoint_mode != "axis_factorized":
+        return None
+    if ckpt_payload is None:
+        return "independent"
+    ckpt_config = ckpt_payload.get("config", {})
+    if isinstance(ckpt_config, dict):
+        return str(ckpt_config.get("axis_factorized_head_variant", "independent"))
+    return "independent"
+
+
 def _validate_checkpoint_compatibility(cfg: dict, ckpt_payload: dict | None) -> None:
     if ckpt_payload is None:
         return
@@ -203,6 +215,14 @@ def _validate_checkpoint_compatibility(cfg: dict, ckpt_payload: dict | None) -> 
             "load_ckpt uses incompatible coarse_prediction_mode: "
             f"checkpoint={checkpoint_mode!r} current_config={expected_mode!r}"
         )
+    if expected_mode == "axis_factorized":
+        expected_variant = str(cfg.get("axis_factorized_head_variant", "conditional"))
+        checkpoint_variant = _checkpoint_axis_factorized_head_variant(ckpt_payload)
+        if checkpoint_variant != expected_variant:
+            raise ValueError(
+                "load_ckpt uses incompatible axis_factorized_head_variant: "
+                f"checkpoint={checkpoint_variant!r} current_config={expected_variant!r}"
+            )
 
 
 def _make_checkpoint_payload(
