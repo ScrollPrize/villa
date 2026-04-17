@@ -261,6 +261,51 @@ When active on a batch:
 - Falls back to no augmentation if the target zarr level doesn't exist
 - A second dataset instance + DataLoader is created for the scale-aug path
 
+### GPU pause/resume
+
+Training supports pausing to free the GPU for other applications.
+A Unix domain socket at `~/.gpu_pause.sock` accepts commands.
+
+Control from another terminal:
+
+```bash
+python lasagna/gpu_pause.py pause    # finish batch, offload to CPU, reply ok
+python lasagna/gpu_pause.py resume   # reload to GPU, reply ok
+python lasagna/gpu_pause.py status   # prints "running" or "paused"
+```
+
+Protocol: text over Unix socket, version handshake (`gpu_pause v1`), then
+one command per connection (`pause`, `resume`, `status`).
+
+Integration into other training scripts:
+
+```python
+from gpu_pause import GpuPauseServer
+
+pause_server = GpuPauseServer()
+
+def offload():
+    model.cpu()
+    for s in optimizer.state.values():
+        for k, v in s.items():
+            if isinstance(v, torch.Tensor):
+                s[k] = v.cpu()
+    torch.cuda.empty_cache()
+
+def reload():
+    model.to(device)
+    for s in optimizer.state.values():
+        for k, v in s.items():
+            if isinstance(v, torch.Tensor):
+                s[k] = v.to(device)
+
+# After each optimizer step:
+pause_server.check(offload, reload)
+
+# At exit:
+pause_server.close()
+```
+
 ### Read-error resilience
 
 S3/zarr transient read errors (PermissionError, OSError, ConnectionError,

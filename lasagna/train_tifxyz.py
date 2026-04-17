@@ -117,6 +117,7 @@ from tifxyz_labels import (
     decode_to_tensor,
     tensor_unsigned_angle_deg,
 )
+from gpu_pause import GpuPauseServer
 from tifxyz_lasagna_dataset import (
     TifxyzLasagnaDataset,
     augment_batch_inplace,
@@ -972,6 +973,24 @@ def train(
     scale_loss_mse = ScaleSpaceLoss3D(mse_loss, num_scales=5)
     scale_loss_l1 = ScaleSpaceLoss3D(smooth_l1_loss, num_scales=5)
 
+    # GPU pause/resume server — allows other apps to reclaim the GPU.
+    pause_server = GpuPauseServer() if is_main else None
+
+    def _gpu_offload():
+        model.cpu()
+        for s in optimizer.state.values():
+            for k, v in s.items():
+                if isinstance(v, torch.Tensor):
+                    s[k] = v.cpu()
+        torch.cuda.empty_cache()
+
+    def _gpu_reload():
+        model.to(device)
+        for s in optimizer.state.values():
+            for k, v in s.items():
+                if isinstance(v, torch.Tensor):
+                    s[k] = v.to(device)
+
     writer = SummaryWriter(log_dir=str(run_dir)) if is_main else None
     best_val_loss = float("inf")
     global_step = 0
@@ -1513,6 +1532,9 @@ def train(
             if global_step < warmup_steps:
                 warmup_scheduler.step()
 
+            if pause_server:
+                pause_server.check(_gpu_offload, _gpu_reload)
+
             epoch_losses.append(loss.item())
             if not math.isfinite(loss.item()):
                 print(f"{TAG} NaN/Inf at step {global_step}: loss={loss.item()}", flush=True)
@@ -1633,6 +1655,8 @@ def train(
                 flush=True,
             )
 
+    if pause_server is not None:
+        pause_server.close()
     if writer is not None:
         writer.close()
     if wandb_run is not None:
