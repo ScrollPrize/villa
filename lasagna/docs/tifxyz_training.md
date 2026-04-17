@@ -85,6 +85,9 @@ for a full 6-scroll example.
 | `volume_scale` | per-dataset | yes | Resolution level in the zarr group (0 = full res) |
 | `segments_path` | per-dataset | yes | Local path to tifxyz segment directories |
 | `z_range` | per-dataset | recommended | `[z_min, z_max]` -- safe Z-slice range; excludes regions outside the scroll |
+| `cache_scale` | per-dataset | no | Volume scale used for patch-finding/caching (default = `volume_scale`). Set to match another dataset entry's `volume_scale` to share its patch cache when using `transform`. |
+| `transform` | per-dataset | no | Inline 3×4 affine matrix (XYZ, row-major) mapping segment coords → volume level-0 coords (after optional inversion). Enables cross-volume training. |
+| `transform_invert` | per-dataset | no | If `true`, invert the `transform` matrix before applying (default `false`). |
 | `scale_aug_prob` | top-level | no | Per-sample probability of scale augmentation (default `0.0` = off) |
 | `scale_aug_factor` | top-level | no | Scale augmentation downscale factor (default `2`) |
 
@@ -117,6 +120,40 @@ How it works:
   fast
 
 For best performance, use an NVMe-backed path for `volume_cache_dir`.
+
+
+## Cross-Volume Training
+
+When a higher-resolution scan of the same scroll becomes available, you can
+reuse existing GT surfaces (tifxyz) with the new volume by providing an affine
+transform that maps between coordinate systems.
+
+```json
+{
+    "volume_path": "s3://bucket/new_scan.zarr",
+    "volume_scale": 2,
+    "cache_scale": 0,
+    "segments_path": "/path/to/same/tifxyz",
+    "z_range": [1000, 9250],
+    "transform": [
+        [a00, a01, a02, t0],
+        [a10, a11, a12, t1],
+        [a20, a21, a22, t2]
+    ],
+    "transform_invert": true
+}
+```
+
+- The `transform` is a 3×4 affine matrix in XYZ order (same as `transform.json`
+  from volume registration). It maps segment coordinates to volume level-0
+  coordinates after optional inversion.
+- `transform_invert: true` inverts the matrix before applying — use this when
+  the transform.json maps new→old but you need old→new.
+- `cache_scale` should match the `volume_scale` of the original dataset entry
+  that uses the same `segments_path`. This ensures the patch cache is shared:
+  patches are tiled in cache-scale coordinates, and the affine is applied at
+  data-loading time to map coordinates to the target volume.
+- `z_range` is in cache-scale coordinates (matching the original entry).
 
 
 ## Running Training

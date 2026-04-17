@@ -46,6 +46,86 @@ TAG = "[tifxyz_lasagna_dataset]"
 
 
 # ---------------------------------------------------------------------------
+# Cross-volume affine transform helpers
+# ---------------------------------------------------------------------------
+
+def _parse_transform(dataset: dict) -> np.ndarray | None:
+    """Parse inline 3×4 affine from dataset config, optionally inverting.
+
+    Returns (3, 4) float64 ndarray in XYZ order (matching transform.json
+    convention), or None if no transform is specified.
+    """
+    raw = dataset.get("transform")
+    if raw is None:
+        return None
+    m = np.array(raw, dtype=np.float64)
+    if m.shape != (3, 4):
+        raise ValueError(f"transform must be (3,4), got {m.shape}")
+    if dataset.get("transform_invert", False):
+        m4 = np.eye(4, dtype=np.float64)
+        m4[:3, :] = m
+        m4 = np.linalg.inv(m4)
+        m = m4[:3, :]
+    return m
+
+
+def _build_cache_to_volume_zyx(
+    transform_xyz: np.ndarray,
+    cache_scale: int,
+    volume_scale: int,
+) -> np.ndarray:
+    """Build a combined 3×4 affine: cache-scale ZYX → volume reading-level ZYX.
+
+    Steps (in XYZ):
+      1. scale up by 2^cache_scale  (cache coords → source level-0)
+      2. apply transform_xyz        (source level-0 → target level-0)
+      3. scale down by 2^volume_scale (target level-0 → reading level)
+
+    Then convert from XYZ to ZYX convention for internal use.
+    """
+    up = float(2 ** cache_scale)
+    down = 1.0 / float(2 ** volume_scale)
+
+    # Compose in 4×4 XYZ space
+    m4 = np.eye(4, dtype=np.float64)
+    m4[:3, :] = transform_xyz
+    # Pre-multiply by scale-up (acts on input): multiply columns 0-2 by up
+    m4[:3, :3] *= up
+    m4[:3, 3] *= 1.0  # translation is already at level-0
+    # Post-multiply by scale-down (acts on output): multiply rows 0-2 by down
+    m4[:3, :] *= down
+
+    # Convert XYZ→ZYX: swap rows 0↔2, swap columns 0↔2
+    # Row swap: output is (z, y, x) instead of (x, y, z)
+    m4_zyx = m4.copy()
+    m4_zyx[0, :], m4_zyx[2, :] = m4[2, :].copy(), m4[0, :].copy()
+    # Column swap: input is (z, y, x) instead of (x, y, z)
+    m4_zyx[:, 0], m4_zyx[:, 2] = m4_zyx[:, 2].copy(), m4_zyx[:, 0].copy()
+
+    return m4_zyx[:3, :].astype(np.float64)
+
+
+def _apply_affine_zyx(affine_3x4: np.ndarray, zyx: np.ndarray) -> np.ndarray:
+    """Apply a 3×4 affine (ZYX convention) to an array of ZYX points.
+
+    Parameters
+    ----------
+    affine_3x4 : (3, 4) array
+    zyx : (..., 3) array
+
+    Returns
+    -------
+    (..., 3) array — transformed points
+    """
+    shape = zyx.shape
+    pts = zyx.reshape(-1, 3).astype(np.float64)
+    ones = np.ones((pts.shape[0], 1), dtype=np.float64)
+    homo = np.hstack([pts, ones])  # (N, 4)
+    out = (affine_3x4 @ homo.T).T  # (N, 3)
+    return out.astype(np.float32).reshape(shape)
+
+
+# ---------------------------------------------------------------------------
 # Multi-channel trilinear splatting
 # ---------------------------------------------------------------------------
 
@@ -403,9 +483,23 @@ def _find_patches_world_chunks(config, patch_size_zyx):
             _ds_name = f"dataset{dataset_idx}"
 
         volume_scale = int(dataset["volume_scale"])
+        cache_scale = int(dataset.get("cache_scale", volume_scale))
         segments_path = dataset.get("segments_path")
         if not segments_path:
             continue
+
+        # Cross-volume affine transform (optional).
+        _transform_xyz = _parse_transform(dataset)
+        _cache_to_vol = None
+        if _transform_xyz is not None:
+            _cache_to_vol = _build_cache_to_volume_zyx(
+                _transform_xyz, cache_scale, volume_scale,
+            )
+            print(
+                f"{TAG} dataset_idx={dataset_idx} cross-volume transform: "
+                f"cache_scale={cache_scale} volume_scale={volume_scale}",
+                flush=True,
+            )
 
         # Open zarr volume (handles local, S3, HTTPS with caching)
         volume_auth_json = dataset.get(
@@ -433,12 +527,11 @@ def _find_patches_world_chunks(config, patch_size_zyx):
                     f"scale augmentation disabled for this dataset."
                 )
 
-        # Load and retarget segments. Per neural tracer convention, z_range
-        # is specified in retargeted (volume) coordinate space — same space
-        # as segments AFTER retarget — so we do NOT scale it here. Users
-        # whose volume_scale differs from what their z_range targets should
-        # either align volume_scale or update z_range to match.
-        retarget_factor = 2 ** volume_scale
+        # Load and retarget segments.  Use cache_scale for retargeting so
+        # that the patch cache is shared with entries that use the same
+        # segments_path at the same cache_scale.  z_range is in cache_scale
+        # coordinates (same convention as original datasets).
+        retarget_factor = 2 ** cache_scale
         z_range = _parse_z_range(dataset.get("z_range"))
         dataset_segments = list(tifxyz.load_folder(segments_path))
         scaled_segments = []
@@ -460,7 +553,7 @@ def _find_patches_world_chunks(config, patch_size_zyx):
 
         # Scale-normalize patch counts (dataset_rowcol_cond.py:297-309)
         if scale_normalize:
-            count_scale = float(2 ** (volume_scale - ref_scale))
+            count_scale = float(2 ** (cache_scale - ref_scale))
             count_scale_sq = count_scale * count_scale
         else:
             count_scale_sq = 1.0
@@ -516,6 +609,7 @@ def _find_patches_world_chunks(config, patch_size_zyx):
                 dataset_name=_ds_name,
                 dataset_local_idx=_local_i,
                 volume_group=_vol_group,
+                cache_to_volume=_cache_to_vol,
             ))
 
     return patches
@@ -748,10 +842,14 @@ class TifxyzLasagnaDataset(Dataset):
             return _empty()
         x_full, y_full, z_full = trimmed
 
-        # Build (H, W, 3) ZYX grid in world coordinates
+        # Build (H, W, 3) ZYX grid in world coordinates.
+        # If a cross-volume transform is present, map from cache-scale
+        # coords to the target volume's reading-level coords.
         zyx_world = np.stack(
             [z_full, y_full, x_full], axis=-1,
         ).astype(np.float32)
+        if patch.cache_to_volume is not None:
+            zyx_world = _apply_affine_zyx(patch.cache_to_volume, zyx_world)
 
         # Convert to local coordinates
         min_corner_f = min_corner.astype(np.float32)
@@ -851,7 +949,15 @@ class TifxyzLasagnaDataset(Dataset):
                 f = 1
 
         # Label region origin in world coords (sized label_patch_size).
-        label_min = np.array([z0, y0, x0], dtype=np.int64)
+        # When a cross-volume transform is present, world_bbox is in
+        # cache-scale coords; map to volume reading-level coords.
+        label_min_f = np.array([z0, y0, x0], dtype=np.float64)
+        if patch.cache_to_volume is not None:
+            label_min_f = _apply_affine_zyx(
+                patch.cache_to_volume,
+                label_min_f.reshape(1, 3),
+            ).reshape(3).astype(np.float64)
+        label_min = np.round(label_min_f).astype(np.int64)
         # Place the label region inside the (larger) CT crop.
         # paste_off ∈ [-L/2, P - L/2] allows up to half of the GT to
         # be cropped off either edge during training; val/eval uses

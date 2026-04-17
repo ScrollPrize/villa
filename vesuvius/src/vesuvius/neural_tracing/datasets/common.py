@@ -1255,6 +1255,7 @@ class ChunkPatch:
     dataset_name: str = ""                 # human-readable dataset name
     dataset_local_idx: int = -1            # per-dataset patch index (stable within a cache)
     volume_group: Any = None               # zarr.Group for multi-level access (scale augmentation)
+    cache_to_volume: Any = None            # (3,4) ndarray affine: cache-scale ZYX → volume reading-level ZYX (cross-volume transform)
 
     @property
     def wrap_count(self) -> int:
