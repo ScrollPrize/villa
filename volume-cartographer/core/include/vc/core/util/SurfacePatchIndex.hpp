@@ -88,9 +88,7 @@ public:
         const PlaneSurface& plane,
         const cv::Rect& planeRoi,
         const std::unordered_set<SurfacePtr>& targets,
-        float clipTolerance = 1e-4f,
-        std::vector<TriangleCandidate>* triangleBuf = nullptr,
-        std::unordered_map<SurfacePtr, std::vector<size_t>>* surfaceBuf = nullptr) const;
+        float clipTolerance = 1e-4f) const;
 
     bool updateSurface(const SurfacePtr& surface);
     bool updateSurfaceRegion(const SurfacePtr& surface,
@@ -122,10 +120,17 @@ public:
     void setGeneration(const SurfacePtr& surface, uint64_t gen);
 
 private:
+    struct NoPatchFilter {
+        template <typename Box>
+        bool operator()(const Box&) const { return true; }
+    };
+
+    template <typename Visitor, typename PatchFilter = NoPatchFilter>
     void forEachTriangleImpl(const Rect3D& bounds,
                              const SurfacePtr& targetSurface,
                              const std::unordered_set<SurfacePtr>* filterSurfaces,
-                             const std::function<void(const TriangleCandidate&)>& visitor) const;
+                             Visitor&& visitor,
+                             PatchFilter&& patchFilter = NoPatchFilter{}) const;
 
     struct Impl;
     std::unique_ptr<Impl> impl_;

@@ -775,7 +775,7 @@ void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
     if (outCandidates.capacity() < 2048) {
         outCandidates.reserve(2048);
     }
-    forEachTriangle(bounds, targetSurface, [&](const TriangleCandidate& candidate) {
+    forEachTriangleImpl(bounds, targetSurface, nullptr, [&](const TriangleCandidate& candidate) {
         outCandidates.push_back(candidate);
     });
 }
@@ -791,7 +791,7 @@ void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
     if (outCandidates.capacity() < 2048) {
         outCandidates.reserve(2048);
     }
-    forEachTriangle(bounds, targetSurfaces, [&](const TriangleCandidate& candidate) {
+    forEachTriangleImpl(bounds, nullptr, &targetSurfaces, [&](const TriangleCandidate& candidate) {
         outCandidates.push_back(candidate);
     });
 }
@@ -800,6 +800,7 @@ void SurfacePatchIndex::forEachTriangle(const Rect3D& bounds,
                                         const SurfacePtr& targetSurface,
                                         const std::function<void(const TriangleCandidate&)>& visitor) const
 {
+    if (!visitor) return;
     forEachTriangleImpl(bounds, targetSurface, nullptr, visitor);
 }
 
@@ -807,19 +808,21 @@ void SurfacePatchIndex::forEachTriangle(const Rect3D& bounds,
                                         const std::unordered_set<SurfacePtr>& targetSurfaces,
                                         const std::function<void(const TriangleCandidate&)>& visitor) const
 {
-    if (targetSurfaces.empty()) {
+    if (!visitor || targetSurfaces.empty()) {
         return;
     }
     forEachTriangleImpl(bounds, nullptr, &targetSurfaces, visitor);
 }
 
+template <typename Visitor, typename PatchFilter>
 void SurfacePatchIndex::forEachTriangleImpl(
     const Rect3D& bounds,
     const SurfacePtr& targetSurface,
     const std::unordered_set<SurfacePtr>* filterSurfaces,
-    const std::function<void(const TriangleCandidate&)>& visitor) const
+    Visitor&& visitor,
+    PatchFilter&& patchFilter) const
 {
-    if (!visitor || !impl_ || !impl_->tree) {
+    if (!impl_ || !impl_->tree) {
         return;
     }
 
@@ -854,6 +857,12 @@ void SurfacePatchIndex::forEachTriangleImpl(
             if (!found) {
                 return;
             }
+        }
+        // Optional caller-supplied bbox-level reject (e.g. plane-vs-bbox).
+        // Runs before the expensive loadPatchCorners call. With the default
+        // NoPatchFilter the compiler folds this away.
+        if (!patchFilter(entry.first)) {
+            return;
         }
 
         // Precompute surface params for the quad (use cached center*scale offsets)
@@ -1777,9 +1786,7 @@ SurfacePatchIndex::computePlaneIntersections(
     const PlaneSurface& plane,
     const cv::Rect& planeRoi,
     const std::unordered_set<SurfacePtr>& targets,
-    float clipTolerance,
-    std::vector<TriangleCandidate>* triangleBuf,
-    std::unordered_map<SurfacePtr, std::vector<size_t>>* surfaceBuf) const
+    float clipTolerance) const
 {
     std::unordered_map<SurfacePtr, std::vector<TriangleSegment>> result;
     if (empty() || targets.empty()) {
@@ -1819,50 +1826,66 @@ SurfacePatchIndex::computePlaneIntersections(
     viewBbox.low -= cv::Vec3f(padding, padding, padding);
     viewBbox.high += cv::Vec3f(padding, padding, padding);
 
-    // Query triangles from R-tree
-    std::vector<TriangleCandidate> localTriBuf;
-    auto& triangles = triangleBuf ? *triangleBuf : localTriBuf;
-    queryTriangles(viewBbox, targets, triangles);
-
-    // Group triangles by surface
-    std::unordered_map<SurfacePtr, std::vector<size_t>> localSurfBuf;
-    auto& bySurface = surfaceBuf ? *surfaceBuf : localSurfBuf;
-    for (auto& [surf, indices] : bySurface) {
-        indices.clear();
-    }
-    for (size_t idx = 0; idx < triangles.size(); ++idx) {
-        const auto& surface = triangles[idx].surface;
-        if (surface) {
-            bySurface[surface].push_back(idx);
-        }
+    // Pre-create per-target buckets so the visitor lookup is a single
+    // pointer-keyed find (no allocation, no rehash) per triangle.
+    std::unordered_map<const QuadSurface*, std::vector<TriangleSegment>*> buckets;
+    buckets.reserve(targets.size());
+    for (const auto& t : targets) {
+        if (t) buckets.emplace(t.get(), &result[t]);
     }
 
-    // Clip triangles per surface in parallel
-    for (const auto& target : targets) {
-        const auto it = bySurface.find(target);
-        if (it == bySurface.end()) {
-            continue;
-        }
-        const auto& indices = it->second;
-        const size_t n = indices.size();
+    // Patch-level reject: skip patches whose bbox lies entirely on one
+    // side of the plane. plane.scalarp(p) returns signed distance from
+    // plane to point; if all 8 bbox corners share the same side of the
+    // plane (and clear the tolerance), the patch can't intersect.
+    //
+    // R-tree boxes are quantized through boxSnap (16-bit per axis over
+    // ~101000 units → ~1.54 units/step). The stored lo/hi can each
+    // shift by up to half a step inward, shrinking the box by up to
+    // one full step per axis vs the true patch bbox. We expand the
+    // box by one step on every side before the corner test so a
+    // genuinely-intersecting patch is never wrongly rejected.
+    constexpr float kQuantPad = 1.6f;  // > one quant step (~1.541)
+    auto bboxStraddlesPlane = [&](const Impl::Box3& box) {
+        const auto& lo = box.min_corner();
+        const auto& hi = box.max_corner();
+        const float lox = lo.get<0>() - kQuantPad;
+        const float loy = lo.get<1>() - kQuantPad;
+        const float loz = lo.get<2>() - kQuantPad;
+        const float hix = hi.get<0>() + kQuantPad;
+        const float hiy = hi.get<1>() + kQuantPad;
+        const float hiz = hi.get<2>() + kQuantPad;
+        const float d000 = plane.scalarp({lox, loy, loz});
+        const float d100 = plane.scalarp({hix, loy, loz});
+        const float d010 = plane.scalarp({lox, hiy, loz});
+        const float d110 = plane.scalarp({hix, hiy, loz});
+        const float d001 = plane.scalarp({lox, loy, hiz});
+        const float d101 = plane.scalarp({hix, loy, hiz});
+        const float d011 = plane.scalarp({lox, hiy, hiz});
+        const float d111 = plane.scalarp({hix, hiy, hiz});
+        const float dmin = std::min({d000, d100, d010, d110, d001, d101, d011, d111});
+        const float dmax = std::max({d000, d100, d010, d110, d001, d101, d011, d111});
+        return dmin <= clipTolerance && dmax >= -clipTolerance;
+    };
 
-        std::vector<std::optional<TriangleSegment>> clipResults(n);
-        #pragma omp parallel for schedule(dynamic, 64)
-        for (size_t k = 0; k < n; ++k) {
-            clipResults[k] =
-                clipTriangleToPlane(triangles[indices[k]], plane, clipTolerance);
-        }
+    // Fused visitor: for every triangle the R-tree spits out, clip it
+    // against the plane right there and append the resulting segment to
+    // the per-surface bucket. Skips the intermediate TriangleCandidate
+    // vector and the bySurface grouping pass entirely.
+    forEachTriangleImpl(viewBbox, nullptr, &targets,
+        [&](const TriangleCandidate& tri) {
+            auto seg = clipTriangleToPlane(tri, plane, clipTolerance);
+            if (!seg) return;
+            auto it = buckets.find(tri.surface.get());
+            if (it == buckets.end()) return;
+            it->second->push_back(std::move(*seg));
+        },
+        bboxStraddlesPlane);
 
-        std::vector<TriangleSegment> segments;
-        segments.reserve(n);
-        for (auto& r : clipResults) {
-            if (r) {
-                segments.push_back(std::move(*r));
-            }
-        }
-        if (!segments.empty()) {
-            result[target] = std::move(segments);
-        }
+    // Drop empty entries that were pre-created but never received a segment.
+    for (auto it = result.begin(); it != result.end(); ) {
+        if (it->second.empty()) it = result.erase(it);
+        else ++it;
     }
 
     return result;
