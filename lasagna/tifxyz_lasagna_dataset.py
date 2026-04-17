@@ -1143,6 +1143,7 @@ class TifxyzLasagnaDataset(Dataset):
                 "segment_uuid": str(patch.wraps[0]["segment"].uuid) if patch.wraps else "",
                 "world_bbox": patch.world_bbox,
                 "idx": patch.dataset_local_idx,
+                "global_idx": idx,
                 "dataset_idx": patch.dataset_idx,
                 "dataset_name": patch.dataset_name,
                 "scale_aug_factor": f,

@@ -211,6 +211,11 @@ python lasagna/train_tifxyz.py \
 | `--wandb-run-name` | None | W&B run name |
 | `--wandb-tags` | None | Comma-separated W&B tags |
 | `--no-himag-filter` | off | Disable hi-mag sample filtering entirely |
+| `--no-deform` | off | Disable per-sample GT deformation refinement |
+| `--deform-stride` | 8 | Deformation grid stride (grid = label_patch_size / stride) |
+| `--deform-inner-iters` | 100 | Inner optimization iterations per training step |
+| `--deform-inner-lr` | 0.1 | SGD learning rate for deformation inner loop |
+| `--deform-max-frac` | 0.3 | Max displacement as fraction of inter-surface distance |
 
 ### Multi-GPU (DDP)
 
@@ -297,6 +302,38 @@ When active on a batch:
 - The zarr Group is opened once per dataset at init (only when `scale_aug_prob > 0`)
 - Falls back to no augmentation if the target zarr level doesn't exist
 - A second dataset instance + DataLoader is created for the scale-aug path
+
+### GT deformation refinement
+
+Per-sample learnable deformation of the cos and grad_mag GT labels. The neural
+tracer GT surfaces are not perfectly accurate (smoothed, artifacts). A low-res
+volumetric displacement field per sample is optimized during training to warp the
+GT closer to what the model predicts, effectively refining the GT.
+
+**How it works:**
+- Each sample gets a `(3, G, G, G)` displacement field (default G = patch_size/8 = 24)
+- Every training step (non-scale-aug), the deformation is optimized for N inner
+  iterations (default 100) to minimize cos + grad_mag loss between the model's
+  prediction and the warped GT
+- Displacement magnitude is clamped to 0.3 × inter-surface distance (from grad_mag)
+- The warp is applied only to cos and grad_mag channels (not direction)
+- Deformations are stored in pre-augmentation GT space; spatial augmentation
+  (flips/rot90) is applied/reversed automatically
+- Skipped for scale-aug batches (different coordinate frame)
+
+**Storage:**
+- Disk-backed via numpy memmap: `run_dir/deformations/<key>.bin`
+- Keyed by `(segments_path, dataset_idx)` for portability across config changes
+- Float16 on disk (~83KB per sample), converted to float32 on GPU
+- Automatically persisted — resume loads existing deformations
+
+**Visualization:**
+- TensorBoard/W&B shows both `{channel}_gt` (original) and `{channel}_gt_deformed`
+  for cos and grad_mag
+- `train/deform_mean` and `train/deform_max` track displacement magnitude
+
+**CLI flags:** `--no-deform`, `--deform-stride`, `--deform-inner-iters`,
+`--deform-inner-lr`, `--deform-max-frac` (see table above).
 
 ### GPU pause/resume
 

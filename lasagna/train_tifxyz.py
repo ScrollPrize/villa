@@ -669,10 +669,247 @@ def build_model(
 
 
 # ---------------------------------------------------------------------------
+# Training-adaptive GT deformation
+# ---------------------------------------------------------------------------
+
+
+class DeformationStore:
+    """Per-sample low-res deformation fields, disk-backed via np.memmap.
+
+    Each dataset config entry gets its own memmap file keyed by
+    ``segments_path`` and ``dataset_idx`` for portability.  Deformations
+    are stored as float16 to halve disk/memory use and converted to
+    float32 only when loaded onto GPU.
+    """
+
+    def __init__(
+        self,
+        dataset,       # TifxyzLasagnaDataset — has .patches list
+        grid_size: int,
+        run_dir: Path,
+    ):
+        self.grid_size = grid_size
+        self.deform_dir = run_dir / "deformations"
+        self.deform_dir.mkdir(parents=True, exist_ok=True)
+
+        # Group patches by (segments_path, dataset_idx) and count.
+        from collections import OrderedDict
+        groups: OrderedDict[str, int] = OrderedDict()
+        # Map global patch idx -> (group_key, local_idx)
+        self._index: list[tuple[str, int]] = []
+
+        # We need the segments_path per patch.  It's on the config but
+        # not on ChunkPatch directly.  Build from config datasets list.
+        ds_key_map: dict[int, str] = {}   # dataset_idx -> segments_path
+        for di, ds in enumerate(dataset.config["datasets"]):
+            sp = ds.get("segments_path", "")
+            if sp:
+                ds_key_map[di] = sp
+
+        for patch in dataset.patches:
+            sp = ds_key_map.get(patch.dataset_idx, f"unknown_{patch.dataset_idx}")
+            key = self._make_key(sp, patch.dataset_idx)
+            if key not in groups:
+                groups[key] = 0
+            local_i = patch.dataset_local_idx
+            # Ensure count covers this index
+            groups[key] = max(groups[key], local_i + 1)
+
+        # Second pass: build index
+        for patch in dataset.patches:
+            sp = ds_key_map.get(patch.dataset_idx, f"unknown_{patch.dataset_idx}")
+            key = self._make_key(sp, patch.dataset_idx)
+            self._index.append((key, patch.dataset_local_idx))
+
+        # Open/create memmaps
+        shape_tail = (3, grid_size, grid_size, grid_size)
+        self._memmaps: dict[str, np.memmap] = {}
+        for key, count in groups.items():
+            path = self.deform_dir / f"{key}.bin"
+            shape = (count, *shape_tail)
+            expected_bytes = int(np.prod(shape)) * 2  # float16
+            if path.exists() and path.stat().st_size == expected_bytes:
+                mm = np.memmap(path, dtype=np.float16, mode="r+", shape=shape)
+            else:
+                mm = np.memmap(path, dtype=np.float16, mode="w+", shape=shape)
+            self._memmaps[key] = mm
+
+    @staticmethod
+    def _make_key(segments_path: str, dataset_idx: int) -> str:
+        sanitized = segments_path.replace("/", "_").strip("_")
+        return f"{sanitized}__ds{dataset_idx}"
+
+    def get(self, global_indices: list[int]) -> torch.Tensor:
+        """Load deformations for batch, returns (B, 3, G, G, G) float32."""
+        out = []
+        for gi in global_indices:
+            key, li = self._index[gi]
+            arr = np.array(self._memmaps[key][li], dtype=np.float32)
+            out.append(torch.from_numpy(arr))
+        return torch.stack(out)
+
+    def put(self, global_indices: list[int], deforms: torch.Tensor):
+        """Write optimized deformations back as float16."""
+        arr = deforms.detach().cpu().to(torch.float16).numpy()
+        for i, gi in enumerate(global_indices):
+            key, li = self._index[gi]
+            self._memmaps[key][li] = arr[i]
+
+    def flush(self):
+        for mm in self._memmaps.values():
+            mm.flush()
+
+
+def _augment_deform(deform, flip_z, flip_y, flip_x, k):
+    """Transform deformation field to match spatial augmentation.
+
+    deform: (B, 3, G, G, G) with channels (dz, dy, dx).
+    All ops are differentiable (index permutations + negation).
+    """
+    d = deform
+    if flip_z:
+        d = torch.flip(d, [2])
+        d = torch.cat([-d[:, 0:1], d[:, 1:3]], dim=1)
+    if flip_y:
+        d = torch.flip(d, [3])
+        d = torch.cat([d[:, 0:1], -d[:, 1:2], d[:, 2:3]], dim=1)
+    if flip_x:
+        d = torch.flip(d, [4])
+        d = torch.cat([d[:, 0:2], -d[:, 2:3]], dim=1)
+    for _ in range(k % 4):
+        d = torch.rot90(d, 1, dims=(3, 4))
+        # (dy, dx) -> (-dx, dy)
+        d = torch.cat([d[:, 0:1], -d[:, 2:3], d[:, 1:2]], dim=1)
+    return d
+
+
+def _unaugment_deform(deform, flip_z, flip_y, flip_x, k):
+    """Inverse of _augment_deform: augmented space -> pre-aug storage space."""
+    d = deform
+    # Undo rot90: apply 4-k times
+    for _ in range((4 - k) % 4):
+        d = torch.rot90(d, 1, dims=(3, 4))
+        d = torch.cat([d[:, 0:1], -d[:, 2:3], d[:, 1:2]], dim=1)
+    # Undo flips (self-inverse, reverse order)
+    if flip_x:
+        d = torch.cat([d[:, 0:2], -d[:, 2:3]], dim=1)
+        d = torch.flip(d, [4])
+    if flip_y:
+        d = torch.cat([d[:, 0:1], -d[:, 1:2], d[:, 2:3]], dim=1)
+        d = torch.flip(d, [3])
+    if flip_z:
+        d = torch.cat([-d[:, 0:1], d[:, 1:3]], dim=1)
+        d = torch.flip(d, [2])
+    return d
+
+
+def _build_warp_grid(deform_full, device):
+    """Build a normalized sampling grid from a full-res displacement field.
+
+    deform_full: (B, 3, Z, Y, X) displacement in voxel units (dz, dy, dx).
+    Returns grid suitable for F.grid_sample: (B, Z, Y, X, 3) in [-1, 1].
+    """
+    B, _, Z, Y, X = deform_full.shape
+    gz = torch.arange(Z, device=device, dtype=torch.float32)
+    gy = torch.arange(Y, device=device, dtype=torch.float32)
+    gx = torch.arange(X, device=device, dtype=torch.float32)
+    grid_z, grid_y, grid_x = torch.meshgrid(gz, gy, gx, indexing="ij")
+    # grid_sample expects (x, y, z) order in last dim
+    base = torch.stack([grid_x, grid_y, grid_z], dim=-1)  # (Z, Y, X, 3)
+    base = base.unsqueeze(0).expand(B, -1, -1, -1, -1)
+    # Convert displacement (dz, dy, dx) -> (dx, dy, dz)
+    disp = deform_full.permute(0, 2, 3, 4, 1).flip(-1)
+    grid = base + disp
+    # Normalize each axis to [-1, 1]
+    grid[..., 0] = 2.0 * grid[..., 0] / max(X - 1, 1) - 1.0
+    grid[..., 1] = 2.0 * grid[..., 1] / max(Y - 1, 1) - 1.0
+    grid[..., 2] = 2.0 * grid[..., 2] / max(Z - 1, 1) - 1.0
+    return grid
+
+
+def _apply_warp(cos_gm, validity, deform_full):
+    """Warp cos/grad_mag targets and validity mask using displacement field.
+
+    cos_gm:      (B, 2, Z, Y, X) — channels [cos, grad_mag]
+    validity:    (B, 1, Z, Y, X)
+    deform_full: (B, 3, Z, Y, X) — displacement in voxel units
+
+    Returns (warped_cos_gm, warped_validity).
+    """
+    grid = _build_warp_grid(deform_full, cos_gm.device)
+    warped_cg = F.grid_sample(
+        cos_gm, grid, mode="bilinear", padding_mode="zeros", align_corners=True,
+    )
+    warped_v = F.grid_sample(
+        validity, grid, mode="bilinear", padding_mode="zeros", align_corners=True,
+    )
+    return warped_cg, warped_v
+
+
+def _deform_inner_loop(
+    pred_cos_gm,   # (B, 2, Z, Y, X) detached model prediction
+    targets,       # (B, 8, Z, Y, X) original targets
+    validity,      # (B, 1, Z, Y, X) original validity
+    deform,        # (B, 3, G, G, G) current deformation (requires_grad)
+    n_iters: int,
+    inner_lr: float,
+    max_frac: float,
+    scale_loss_mse_fn,
+    scale_loss_l1_fn,
+):
+    """Optimize the deformation field to minimize cos+grad_mag loss.
+
+    Runs in float32 (autocast disabled) for stable gradients on the
+    small deformation tensor.
+
+    Returns the optimized deform tensor (still on GPU, with grad detached).
+    """
+    G = deform.shape[-1]
+    device = pred_cos_gm.device
+
+    # Cast everything to float32 for stable inner loop
+    pred_f = pred_cos_gm.float()
+    cos_gm_orig = targets[:, 0:2].float()
+    val_f = validity.float()
+
+    # Pre-compute max displacement from original grad_mag
+    with torch.no_grad():
+        gm_ds = F.adaptive_avg_pool3d(cos_gm_orig[:, 1:2], (G, G, G))
+        max_disp = max_frac / gm_ds.clamp(min=0.02)  # (B, 1, G, G, G)
+
+    inner_opt = torch.optim.SGD([deform], lr=inner_lr)
+    Z, Y, X = targets.shape[2:]
+
+    with torch.amp.autocast("cuda", enabled=False):
+        for _ in range(n_iters):
+            inner_opt.zero_grad()
+            deform_full = F.interpolate(
+                deform, size=(Z, Y, X), mode="trilinear", align_corners=False,
+            )
+            warped_cg, warped_v = _apply_warp(cos_gm_orig, val_f, deform_full)
+            cos_w = warped_cg[:, 1:2] * 20.0
+            loss = (
+                scale_loss_mse_fn(pred_f[:, 0:1], warped_cg[:, 0:1], mask=warped_v, weight=cos_w)
+                + scale_loss_l1_fn(pred_f[:, 1:2], warped_cg[:, 1:2], mask=warped_v, weight=cos_w)
+            )
+            loss.backward()
+            inner_opt.step()
+
+            # Project to valid range
+            with torch.no_grad():
+                disp_mag = deform.norm(dim=1, keepdim=True).clamp(min=1e-6)
+                scale = (max_disp / disp_mag).clamp(max=1.0)
+                deform.data.mul_(scale)
+
+    return deform.detach()
+
+
+# ---------------------------------------------------------------------------
 # Visualization
 # ---------------------------------------------------------------------------
 
-def _log_vis(log_images, tag, image, pred, targets, mask, step):
+def _log_vis(log_images, tag, image, pred, targets, mask, step,
+             targets_deformed=None):
     with torch.no_grad():
         b = min(4, image.size(0))
         mid_z = pred.size(2) // 2
@@ -686,6 +923,10 @@ def _log_vis(log_images, tag, image, pred, targets, mask, step):
             t = targets[:b, i:i+1, mid_z]
             log_images(f"{tag}/{name}_pred", p.clamp(0, 1), step)
             log_images(f"{tag}/{name}_gt", (t * m).clamp(0, 1), step)
+            # Show deformed GT for cos and grad_mag
+            if targets_deformed is not None and i < 2:
+                td = targets_deformed[:b, i:i+1, mid_z]
+                log_images(f"{tag}/{name}_gt_deformed", (td * m).clamp(0, 1), step)
 
         log_images(f"{tag}/validity", m, step)
 
@@ -725,6 +966,11 @@ def train(
     wandb_tags: Optional[List[str]] = None,
     reinit_decoder_scales: int = 0,
     himag_filter: bool = True,
+    deform_enabled: bool = True,
+    deform_stride: int = 8,
+    deform_inner_iters: int = 100,
+    deform_inner_lr: float = 0.1,
+    deform_max_frac: float = 0.3,
 ) -> None:
     rank, local_rank, world_size, is_dist = _init_distributed()
     is_main = rank == 0
@@ -797,6 +1043,11 @@ def train(
         "output_sigmoid": output_sigmoid,
         "precision": precision,
         "same_surface_threshold": same_surface_threshold,
+        "deform_enabled": deform_enabled,
+        "deform_stride": deform_stride,
+        "deform_inner_iters": deform_inner_iters,
+        "deform_inner_lr": deform_inner_lr,
+        "deform_max_frac": deform_max_frac,
         "cmd": " ".join(sys.argv),
     }
     if is_main:
@@ -919,6 +1170,27 @@ def train(
         aug_str = f" (scale_aug f={scale_aug_factor})" if scale_aug_enabled else ""
         print(f"{TAG} {n_train} train / {n_val} val patches "
               f"(world_size={world_size}){aug_str}", flush=True)
+
+    # GT deformation store (disk-backed, per-sample low-res warp fields)
+    deform_store: DeformationStore | None = None
+    deform_grid_size = 0
+    if deform_enabled:
+        deform_grid_size = effective_label_patch // deform_stride
+        if deform_grid_size < 2:
+            raise ValueError(
+                f"deform_stride={deform_stride} too large for "
+                f"label_patch_size={effective_label_patch}"
+            )
+        deform_store = DeformationStore(
+            full_dataset, deform_grid_size, run_dir,
+        )
+        if is_main:
+            print(
+                f"{TAG} deformation enabled: grid={deform_grid_size}³, "
+                f"stride={deform_stride}, inner_iters={deform_inner_iters}, "
+                f"inner_lr={deform_inner_lr}, max_frac={deform_max_frac}",
+                flush=True,
+            )
 
     # Model
     model, norm_type, upsample_mode = build_model(
@@ -1473,6 +1745,49 @@ def train(
                     image = image.index_select(0, keep)
                     batch = _filter_batch(batch, keep_list)
 
+                # --- GT deformation inner loop ---
+                targets_deformed = None
+                if deform_store is not None and not use_aug:
+                    batch_global_idxs = [
+                        pi["global_idx"] for pi in batch["patch_info"]
+                    ]
+                    deform_batch = deform_store.get(batch_global_idxs).to(device)
+                    aug = batch.get("_aug", (False, False, False, 0))
+                    fz, fy, fx, kk = aug
+                    deform_aug = _augment_deform(deform_batch, fz, fy, fx, kk)
+                    deform_aug.requires_grad_(True)
+
+                    deform_opt = _deform_inner_loop(
+                        pred_cos_gm=pred[:, 0:2].detach(),
+                        targets=targets,
+                        validity=cos_mask,
+                        deform=deform_aug,
+                        n_iters=deform_inner_iters,
+                        inner_lr=deform_inner_lr,
+                        max_frac=deform_max_frac,
+                        scale_loss_mse_fn=scale_loss_mse,
+                        scale_loss_l1_fn=scale_loss_l1,
+                    )
+
+                    # Apply final warp to cos/grad_mag targets
+                    with torch.no_grad():
+                        Z, Y, X = targets.shape[2:]
+                        df = F.interpolate(
+                            deform_opt, size=(Z, Y, X),
+                            mode="trilinear", align_corners=False,
+                        )
+                        warped_cg, warped_v = _apply_warp(
+                            targets[:, 0:2], cos_mask, df,
+                        )
+                        targets_deformed = targets.clone()
+                        targets_deformed[:, 0:2] = warped_cg
+                        targets = targets_deformed
+                        cos_mask = warped_v
+
+                    # Store back (un-augment first)
+                    deform_preaugm = _unaugment_deform(deform_opt, fz, fy, fx, kk)
+                    deform_store.put(batch_global_idxs, deform_preaugm)
+
                 # Per-channel losses — weighted by grad_mag GT (closer surfaces → higher weight)
                 # Normalize so 20 vx spacing (grad_mag=0.05) → weight 1.0
                 # For scale-aug: grad_mag was already scaled by f, so
@@ -1573,6 +1888,16 @@ def train(
                     global_step,
                 )
                 log_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+                if targets_deformed is not None:
+                    # Log deformation magnitude stats
+                    batch_global_idxs_log = [
+                        pi["global_idx"] for pi in batch["patch_info"]
+                    ]
+                    _d = deform_store.get(batch_global_idxs_log)
+                    _d_mag = _d.norm(dim=1)  # (B, G, G, G)
+                    log_scalar("train/deform_mean", _d_mag.mean().item(), global_step)
+                    log_scalar("train/deform_max", _d_mag.max().item(), global_step)
+                    del _d, _d_mag
                 if n_scale_aug > 0:
                     total_samples = n_seen * B
                     log_scalar(
@@ -1582,7 +1907,8 @@ def train(
                     )
 
             if global_step % 100 == 0:
-                _log_vis(log_images, "train", image, pred, targets, cos_mask, global_step)
+                _log_vis(log_images, "train", image, pred, targets, cos_mask, global_step,
+                         targets_deformed=targets_deformed)
                 aug = batch.get("_aug")
                 if aug and is_main:
                     fz, fy, fx, kk = aug
@@ -1633,6 +1959,8 @@ def train(
                         "out_channels": 8,
                     }
                     torch.save(ckpt_data, run_dir / "model_current.pt")
+                    if deform_store is not None:
+                        deform_store.flush()
                     is_best = last_val_loss < best_val_loss
                     if is_best:
                         best_val_loss = last_val_loss
@@ -1900,6 +2228,19 @@ def main() -> None:
                              "loss magnitude.")
     parser.add_argument("--wandb-tags", type=str, default=None,
                         help="Comma-separated list of W&B run tags.")
+    parser.add_argument("--no-deform", action="store_true",
+                        help="Disable per-sample GT deformation refinement.")
+    parser.add_argument("--deform-stride", type=int, default=8,
+                        help="Deformation grid stride. Grid size = "
+                             "label_patch_size / stride (default 8 → 24³).")
+    parser.add_argument("--deform-inner-iters", type=int, default=100,
+                        help="Inner optimization iterations for deformation "
+                             "per training step.")
+    parser.add_argument("--deform-inner-lr", type=float, default=0.1,
+                        help="SGD learning rate for inner deformation loop.")
+    parser.add_argument("--deform-max-frac", type=float, default=0.3,
+                        help="Max displacement as fraction of inter-surface "
+                             "distance.")
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -1937,6 +2278,11 @@ def main() -> None:
         ),
         reinit_decoder_scales=args.reinit_decoder_scales,
         himag_filter=not args.no_himag_filter,
+        deform_enabled=not args.no_deform,
+        deform_stride=args.deform_stride,
+        deform_inner_iters=args.deform_inner_iters,
+        deform_inner_lr=args.deform_inner_lr,
+        deform_max_frac=args.deform_max_frac,
     )
 
 
