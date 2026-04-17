@@ -147,9 +147,17 @@ void Volume::zarrOpen()
             const int expectedHeight = ceilDivPow2(baseHeight, levelInt);
             const int expectedWidth = ceilDivPow2(baseWidth, levelInt);
 
-            if (static_cast<int>(shape[0]) != expectedSlices ||
-                static_cast<int>(shape[1]) != expectedHeight ||
-                static_cast<int>(shape[2]) != expectedWidth) {
+            // Canonical format pads each level's shape to a multiple of the
+            // inner chunk size (128³), independently per level. Accept any
+            // zarr_shape that exceeds expected by less than one chunk —
+            // anything larger indicates real corruption.
+            constexpr int kMaxPerLevelPad = 128;
+            auto padOK = [](long long actual, long long expected) {
+                return actual >= expected && actual - expected < kMaxPerLevelPad;
+            };
+            if (!padOK(shape[0], expectedSlices) ||
+                !padOK(shape[1], expectedHeight) ||
+                !padOK(shape[2], expectedWidth)) {
                 throw std::runtime_error(
                     "zarr level " + std::to_string(levelInt) + " shape [z,y,x]=("
                     + std::to_string(shape[0]) + ", " + std::to_string(shape[1]) + ", " + std::to_string(shape[2])
@@ -187,9 +195,15 @@ void Volume::zarrOpen()
             const int expectedHeight = ceilDivPow2(_height, static_cast<int>(level));
             const int expectedWidth = ceilDivPow2(_width, static_cast<int>(level));
 
-            if (static_cast<int>(shape[0]) != expectedSlices ||
-                static_cast<int>(shape[1]) != expectedHeight ||
-                static_cast<int>(shape[2]) != expectedWidth) {
+            // Same tolerance as the auto-generated path: canonical caches pad
+            // each level independently to the next 128-boundary.
+            constexpr int kMaxPerLevelPad = 128;
+            auto padOK = [](long long actual, long long expected) {
+                return actual >= expected && actual - expected < kMaxPerLevelPad;
+            };
+            if (!padOK(shape[0], expectedSlices) ||
+                !padOK(shape[1], expectedHeight) ||
+                !padOK(shape[2], expectedWidth)) {
                 throw std::runtime_error(
                     "zarr level " + std::to_string(level) + " shape [z,y,x]=("
                     + std::to_string(shape[0]) + ", " + std::to_string(shape[1]) + ", " + std::to_string(shape[2])
@@ -566,23 +580,6 @@ int Volume::samplePlaneBestEffort(cv::Mat_<uint8_t>& out,
     if (!out.empty())
         applyOptionalPostProcess(out, params);
     return lvl;
-}
-
-int Volume::samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
-                                         const cv::Vec3f& origin,
-                                         const cv::Vec3f& vx_step,
-                                         const cv::Vec3f& vy_step,
-                                         int width, int height,
-                                         const vc::SampleParams& params,
-                                         const uint32_t lut[256])
-{
-    const int nScales = static_cast<int>(numScales());
-    const int desired = std::clamp(params.level, 0, std::max(0, nScales - 1));
-    samplePlaneAdaptiveARGB32(outBuf, outStride, tieredCache(),
-                              desired, nScales,
-                              origin, vx_step, vy_step,
-                              width, height, lut, params.method);
-    return desired;
 }
 
 int Volume::samplePlaneCompositeBestEffortARGB32(

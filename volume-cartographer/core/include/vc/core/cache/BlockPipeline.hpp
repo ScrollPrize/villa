@@ -181,16 +181,33 @@ private:
     // least-recently-used shard is evicted. shared_ptr on the buffer so
     // concurrent loaders can serve from the same shard without the cache
     // mutex blocking them.
-    mutable std::mutex shardCacheMutex_;
+    //
+    // Sharded by hash(ShardKey) to reduce mutex contention: with N loader
+    // threads all hitting the same mutex, the LRU splice on every hit
+    // serializes the hot fetch path. kShardCacheBuckets=16 drops contention
+    // to ~1/16 for uniformly distributed shard accesses.
+    //
+    // Budget is SHARED across buckets via the atomic shardCacheGlobalBytes_
+    // counter: any bucket can hold as much as it wants so long as the total
+    // stays under shardCacheBytes. An insert that pushes the global over
+    // budget evicts LRU entries from its OWN bucket until under — preserves
+    // per-bucket LRU semantics while making capacity fluid across uneven
+    // hash distributions (avoids the per-bucket cap starving a hot bucket).
     struct ShardCacheEntry {
         ShardKey key;
         std::shared_ptr<std::vector<std::byte>> bytes;
     };
-    std::list<ShardCacheEntry> shardCacheLru_;  // front = most recent
-    std::unordered_map<ShardKey,
-                       std::list<ShardCacheEntry>::iterator,
-                       ShardKeyHash> shardCacheMap_;
-    size_t shardCacheTotalBytes_ = 0;
+    static constexpr size_t kShardCacheBuckets = 16;
+    struct ShardCacheBucket {
+        mutable std::mutex mutex;
+        std::list<ShardCacheEntry> lru;  // front = most recent
+        std::unordered_map<ShardKey,
+                           std::list<ShardCacheEntry>::iterator,
+                           ShardKeyHash> map;
+        size_t bytes = 0;
+    };
+    mutable std::array<ShardCacheBucket, kShardCacheBuckets> shardCacheBuckets_;
+    std::atomic<size_t> shardCacheGlobalBytes_{0};
     // Hits/misses so the status bar can surface them.
     std::atomic<uint64_t> statShardHits_{0};
     std::atomic<uint64_t> statShardMisses_{0};
@@ -205,8 +222,12 @@ private:
     std::shared_ptr<std::vector<std::byte>> shardBytesFor(
         const ChunkKey& key, utils::ZarrArray& dz);
 
-    // Insert into the shard cache, evicting LRU until under budget.
-    void shardCacheInsertLocked(const ShardKey& sk,
+    // Map ShardKey → bucket index in shardCacheBuckets_.
+    static size_t shardCacheBucketIndex(const ShardKey& sk) noexcept;
+    // Insert into a specific bucket, evicting per-bucket LRU until under its
+    // share of the total budget.
+    void shardCacheInsertLocked(ShardCacheBucket& b,
+                                const ShardKey& sk,
                                 std::shared_ptr<std::vector<std::byte>> bytes);
 
     BlockCache blockCache_;
@@ -240,10 +261,29 @@ private:
     std::atomic<ChunkReadyCallbackId> nextListenerId_{1};
     std::atomic<bool> chunkArrivedFlag_{false};
 
+    // fetchInteractive dedup: the renderer calls fetchInteractive every
+    // frame, but when the viewport is idle the keys + targetLevel are
+    // identical back-to-back, and identical across multiple viewers. A
+    // commutative XOR hash of (key, targetLevel) + the BlockCache eviction
+    // version is enough to detect "nothing has changed since we last did
+    // the expensive probe/classify/updateInteractive work" and skip.
+    // Guarded by fetchInteractiveDedupMutex_ so cross-viewer calls
+    // serialize their compare-and-update of the stored state — without it
+    // two identical calls could both see a stale match and each do the
+    // work, defeating the dedup.
+    mutable std::mutex fetchInteractiveDedupMutex_;
+    uint64_t lastFetchInteractiveHash_ = 0;
+    uint64_t lastFetchInteractiveEviction_ = 0;
+    int lastFetchInteractiveTargetLevel_ = -1;
+    bool haveLastFetchInteractive_ = false;
+
     mutable std::mutex dataBoundsMutex_;
     DataBoundsL0 dataBoundsL0_;
 
-    mutable std::atomic<uint64_t> statBlockHits_{0};
+    // Hits from the empty-chunk canonical zero block (cold path in blockAt).
+    // The hot-path block hit counter lives in BlockCache::shards_ — a single
+    // atomic here saturated a cacheline under 12-thread render.
+    mutable std::atomic<uint64_t> statEmptyHits_{0};
     std::atomic<uint64_t> statColdHits_{0};
     std::atomic<uint64_t> statIceFetches_{0};
     std::atomic<uint64_t> statDiskWrites_{0};

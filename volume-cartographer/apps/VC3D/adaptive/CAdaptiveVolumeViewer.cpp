@@ -172,13 +172,18 @@ void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
         std::weak_ptr<Volume> volumeWeak = _volume;
         _chunkCbId = cache->addChunkReadyListener(
             [guard, volumeWeak](const vc::cache::ChunkKey&) {
+                // The pipeline's chunkArrivedFlag_ is edge-triggered via
+                // atomic exchange — this callback only fires when the flag
+                // flips false→true. Deferring the clear to submitRender (on
+                // the 16ms render timer) ensures every subsequent arrival in
+                // the same tick window finds the flag already set and takes
+                // the exchange=true/return-early branch — no listener fire,
+                // no cross-thread event post. One wake per 16ms tick max,
+                // instead of one per chunk burst.
                 QMetaObject::invokeMethod(qApp, [guard, volumeWeak]() {
                     if (!guard) return;
                     auto vol = volumeWeak.lock();
                     if (!vol || guard->_volume != vol) return;
-                    if (auto* c = vol->tieredCache()) {
-                        c->clearChunkArrivedFlag();
-                    }
                     guard->scheduleRender();
                 }, Qt::QueuedConnection);
             });
@@ -385,6 +390,14 @@ void CAdaptiveVolumeViewer::reloadPerfSettings()
 
 void CAdaptiveVolumeViewer::submitRender()
 {
+    // Re-arm the chunk-arrival edge detector for the next tick window.
+    // Any chunk that decodes during this render will set the flag again and
+    // fire exactly one post-event to trigger the next render. See the
+    // addChunkReadyListener callback above for why the clear lives here.
+    if (_volume) {
+        if (auto* c = _volume->tieredCache()) c->clearChunkArrivedFlag();
+    }
+
     const CompositeParams& lightP = _compositeSettings.params;
     const bool rakingEnabled = _compositeSettings.postRakingEnabled;
     const float rakingAz = _compositeSettings.postRakingAzimuth;

@@ -712,6 +712,12 @@ static inline cv::Vec2f mul(const cv::Vec2f &a, const cv::Vec2f &b)
     return{a[0]*b[0],a[1]*b[1]};
 }
 
+// Gauss-Newton was tried here (2026-04) with full regression coverage
+// (vc_coord_regression against synthetic + three real tifxyz segments).
+// Result: neutral on performance, no reliable accuracy gain. The 8-neighbour
+// halving below is well-tuned for scroll-surface topology (folds, twists,
+// noise) where Newton's linear-regime assumption doesn't hold. See
+// vc_coord_regression for the harness if you want to try again.
 template <typename E>
 static float search_min_loc(const cv::Mat_<E> &points, cv::Vec2f &loc, cv::Vec3f &out, cv::Vec3f tgt, cv::Vec2f init_step, float min_step_x)
 {

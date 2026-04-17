@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -104,10 +105,17 @@ public:
     class BatchPut {
     public:
         explicit BatchPut(BlockCache& cache) noexcept
-            : cache_(cache), lock_(cache.mutex_) {}
+            : cache_(cache), lock_(cache.arenaMutex_) {}
         BatchPut(const BatchPut&) = delete;
         BatchPut& operator=(const BatchPut&) = delete;
         void put(const BlockKey& key, const uint8_t* src) noexcept;
+
+        // Reserve an arena slot for `key` without copying. Caller writes
+        // exactly kBlockBytes into the returned 16-byte-aligned buffer.
+        // Skips the src→tmp→arena double copy that put() performs — use
+        // this when the producer can assemble the block directly at its
+        // final destination.
+        [[nodiscard]] uint8_t* acquire(const BlockKey& key) noexcept;
     private:
         BlockCache& cache_;
         std::unique_lock<std::shared_mutex> lock_;
@@ -116,11 +124,26 @@ public:
     [[nodiscard]] size_t capacity() const noexcept { return nSlots_; }
     [[nodiscard]] size_t size() const noexcept;
 
+    // Sum of per-shard hit counters. Relaxed read — stats are diagnostic,
+    // not load-bearing, so tearing across shards is fine.
+    [[nodiscard]] uint64_t blockHits() const noexcept;
+
+    // Monotonic counter bumped on every slot reclaim (clock-sweep eviction)
+    // and on clear(). Callers that cache "nothing has changed since last
+    // check" decisions (e.g. fetchInteractive's dedup) read this to detect
+    // evictions without needing the cache mutex.
+    [[nodiscard]] uint64_t evictionVersion() const noexcept {
+        return evictionVersion_.load(std::memory_order_relaxed);
+    }
+
     void clear();
 
 private:
-    // Body of put()/BatchPut::put — assumes unique_lock on mutex_ is held.
+    // Body of put()/BatchPut::put — assumes unique_lock on arenaMutex_ is held.
     void putLocked(const BlockKey& key, const uint8_t* src) noexcept;
+    // Reserve a slot (overwrite if key exists, else allocate/reclaim). Returns
+    // SIZE_MAX iff nSlots_==0. Updates shard map/slotKey_/occupancy.
+    [[nodiscard]] size_t acquireSlotLocked(const BlockKey& key) noexcept;
     [[nodiscard]] size_t reclaimSlotLocked();
 
     Config config_;
@@ -134,18 +157,47 @@ private:
     size_t arenaBytes_ = 0;
     std::jthread prefaultThread_;
 
-    // shared_mutex: get()/contains()/size() take a shared lock so the render
-    // thread and the 4 worker pools can read concurrently; put()/clear()
-    // take the exclusive lock. usedBits_ is atomic so mutations from get()
-    // (setUsed on hit) and the clock sweep are lock-free.
-    mutable std::shared_mutex mutex_;
-    std::unordered_map<BlockKey, size_t, BlockKeyHash> map_;
+    // Sharded reader lock: the map is split into N shards by hash, each with
+    // its own shared_mutex. get()/contains() lock only the relevant shard,
+    // so 12 concurrent render threads rarely collide on the same cache line.
+    // Previously a single shared_mutex served every reader — even with
+    // multiple readers allowed in parallel, the CAS-based reader counter on
+    // that lock's cache line saturated with atomic traffic under hot render
+    // (~54% of CPU was in pthread_rwlock_rd{lock,unlock} atomics).
+    //
+    // Writers (put/acquire/reclaim/clear) hold `arenaMutex_` exclusively for
+    // the arena bookkeeping (slotKey_, occupiedBits_, clockHand_, levelOccupied_,
+    // occupiedCount_) and take the relevant shard's unique_lock briefly to
+    // insert/erase its map entry. The nested order is always arenaMutex_
+    // before shard — readers never take arenaMutex_, so no deadlock path.
+    static constexpr size_t kShards = 32;  // power of 2
+    static_assert(std::has_single_bit(kShards), "kShards must be a power of 2");
+    // alignas(64): each shard owns one cacheline's worth of frequently-written
+    // state (mutex + hit counter) so shards don't false-share. Previously a
+    // single global statBlockHits_.fetch_add on every get() hit cost ~12% of
+    // total CPU under 12-thread render — the atomic traffic ping-ponged one
+    // cacheline across all cores. Per-shard counters eliminate that.
+    struct alignas(64) MapShard {
+        mutable std::shared_mutex mutex;
+        std::unordered_map<BlockKey, size_t, BlockKeyHash> map;
+        std::atomic<uint64_t> hits{0};
+    };
+    std::array<MapShard, kShards> shards_;
+    static size_t shardIndex(const BlockKey& k) noexcept {
+        return BlockKeyHash{}(k) & (kShards - 1);
+    }
+
+    // arenaMutex_: protects arena bookkeeping (slotKey_, occupiedBits_,
+    // clockHand_, occupiedCount_, levelOccupied_). Readers do NOT take this
+    // lock — they only touch shards_[i].mutex. Write paths take arenaMutex_
+    // exclusively, then take the relevant shard lock for map updates.
+    mutable std::shared_mutex arenaMutex_;
 
     std::vector<BlockKey> slotKey_;
     // Parallel bitmasks (1 bit per slot): "occupied" (has valid key) and
     // "used" (clock-sweep NRU flag). Packs 2.5M slots into 310 KB each
     // vs. ~2.5 MB for a byte-per-slot vector. occupiedBits_ is guarded by
-    // mutex_; usedBits_ is atomic per word so get() can set it lock-free.
+    // arenaMutex_; usedBits_ is atomic per word so get() can set it lock-free.
     std::vector<uint64_t> occupiedBits_;
     std::unique_ptr<std::atomic<uint64_t>[]> usedBits_;
     size_t usedBitsWords_ = 0;
@@ -156,6 +208,12 @@ private:
     // occupancy <= floor are protected from the clock sweep.
     std::array<size_t, kMaxLevels> levelOccupied_{};
     std::array<size_t, kMaxLevels> levelFloor_{};
+
+    // Bumped every time a slot is reclaimed (eviction) or the whole cache
+    // is cleared. Readers use this to invalidate "last-seen" caches
+    // (fetchInteractive dedup) without needing any cache lock. Relaxed atomic —
+    // we only need monotonicity, not ordering against the slot writes.
+    std::atomic<uint64_t> evictionVersion_{0};
 
     static constexpr size_t bitWord(size_t i) noexcept { return i >> 6; }
     static constexpr uint64_t bitMask(size_t i) noexcept { return uint64_t(1) << (i & 63u); }

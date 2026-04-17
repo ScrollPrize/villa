@@ -81,31 +81,6 @@ void samplePlane(cv::Mat_<uint8_t>& out, vc::cache::BlockPipeline* cache, int le
                  const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
                  int width, int height, vc::Sampling method);
 
-// Adaptive plane sampling: per-pixel level fallback. For each pixel, tries the
-// desired level first; if that chunk isn't in hot cache, falls back to coarser
-// levels. This means half the image can be full-res while the rest is still loading.
-// Returns the coarsest level actually used (for prefetch decisions).
-int samplePlaneAdaptiveARGB32(uint32_t* outBuf, int outStride,
-                               vc::cache::BlockPipeline* cache,
-                               int desiredLevel, int numLevels,
-                               const cv::Vec3f& origin,
-                               const cv::Vec3f& vx_step,
-                               const cv::Vec3f& vy_step,
-                               int width, int height,
-                               const uint32_t lut[256],
-                               vc::Sampling method = vc::Sampling::Nearest);
-
-// Adaptive coords sampling: per-pixel level fallback for QuadSurface.
-// Same as samplePlaneAdaptiveARGB32 but takes pre-computed coords matrix.
-// Non-blocking: missing chunks skipped (rendered as lut[0]).
-void sampleCoordsAdaptiveARGB32(
-    uint32_t* outBuf, int outStride,
-    vc::cache::BlockPipeline* cache,
-    int desiredLevel, int numLevels,
-    const cv::Mat_<cv::Vec3f>& coords,
-    const uint32_t lut[256],
-    vc::Sampling method = vc::Sampling::Nearest);
-
 // Unified composite-capable adaptive sampler with per-pixel level fallback.
 // One entry point for plane/coords and composite/non-composite rendering:
 //   - Plane mode: pass coords=nullptr and origin/vx_step/vy_step/planeNormal.

@@ -42,7 +42,7 @@ class PlaneSurface;
 #define CTiledVolumeViewer CAdaptiveVolumeViewer
 
 // Adaptive per-pixel volume viewer. Renders a PlaneSurface via
-// samplePlaneAdaptiveARGB32 directly to a viewport-sized framebuffer,
+// sampleAdaptiveARGB32 directly to a viewport-sized framebuffer,
 // with composite post-process (CLAHE, raking light), intersections,
 // and overlays.
 class CAdaptiveVolumeViewer : public QWidget, public VolumeViewerBase

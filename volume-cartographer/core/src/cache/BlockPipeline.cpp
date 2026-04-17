@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -68,33 +70,48 @@ ShardKey BlockPipeline::canonicalShardKey(const ChunkKey& key) const noexcept
     return sk;
 }
 
+size_t BlockPipeline::shardCacheBucketIndex(const ShardKey& sk) noexcept {
+    // ShardKeyHash is already a good mix; take low bits mod bucket count.
+    return ShardKeyHash{}(sk) & (kShardCacheBuckets - 1);
+}
+
 void BlockPipeline::shardCacheInsertLocked(
+    ShardCacheBucket& b,
     const ShardKey& sk,
     std::shared_ptr<std::vector<std::byte>> bytes)
 {
     if (!bytes || bytes->empty()) return;
-    const size_t budget = config_.shardCacheBytes;
-    if (budget == 0) return;
+    const size_t totalBudget = config_.shardCacheBytes;
+    if (totalBudget == 0) return;
     const size_t entrySize = bytes->size();
-    if (entrySize > budget) return;  // single shard too big for budget
+    if (entrySize > totalBudget) return;  // single shard too big for total
 
-    // Remove existing entry for this key, if any.
-    if (auto it = shardCacheMap_.find(sk); it != shardCacheMap_.end()) {
-        shardCacheTotalBytes_ -= it->second->bytes ? it->second->bytes->size() : 0;
-        shardCacheLru_.erase(it->second);
-        shardCacheMap_.erase(it);
+    // Replace any existing entry for this key — release its bytes from
+    // both bucket and global counters before accounting the new one.
+    if (auto it = b.map.find(sk); it != b.map.end()) {
+        const size_t oldSize = it->second->bytes ? it->second->bytes->size() : 0;
+        b.bytes -= oldSize;
+        shardCacheGlobalBytes_.fetch_sub(oldSize, std::memory_order_relaxed);
+        b.lru.erase(it->second);
+        b.map.erase(it);
     }
-    // Evict LRU until we fit.
-    while (!shardCacheLru_.empty()
-           && shardCacheTotalBytes_ + entrySize > budget) {
-        auto& victim = shardCacheLru_.back();
-        shardCacheTotalBytes_ -= victim.bytes ? victim.bytes->size() : 0;
-        shardCacheMap_.erase(victim.key);
-        shardCacheLru_.pop_back();
+    // Evict LRU from THIS bucket until global total + new entry fits budget.
+    // Evicting from our own bucket (rather than scanning all) preserves LRU
+    // within a bucket; buckets that have been recently active naturally
+    // retain their entries because unrelated buckets aren't touched here.
+    while (!b.lru.empty()
+        && shardCacheGlobalBytes_.load(std::memory_order_relaxed) + entrySize > totalBudget) {
+        auto& victim = b.lru.back();
+        const size_t vSize = victim.bytes ? victim.bytes->size() : 0;
+        b.bytes -= vSize;
+        shardCacheGlobalBytes_.fetch_sub(vSize, std::memory_order_relaxed);
+        b.map.erase(victim.key);
+        b.lru.pop_back();
     }
-    shardCacheLru_.push_front({sk, std::move(bytes)});
-    shardCacheMap_[sk] = shardCacheLru_.begin();
-    shardCacheTotalBytes_ += entrySize;
+    b.lru.push_front({sk, std::move(bytes)});
+    b.map[sk] = b.lru.begin();
+    b.bytes += entrySize;
+    shardCacheGlobalBytes_.fetch_add(entrySize, std::memory_order_relaxed);
 }
 
 std::shared_ptr<std::vector<std::byte>> BlockPipeline::shardBytesFor(
@@ -102,12 +119,13 @@ std::shared_ptr<std::vector<std::byte>> BlockPipeline::shardBytesFor(
 {
     if (config_.shardCacheBytes == 0) return nullptr;
     const ShardKey sk = canonicalShardKey(key);
+    auto& bucket = shardCacheBuckets_[shardCacheBucketIndex(sk)];
 
     // Thread-local "last shard seen" cache. Loader workers routinely
     // process runs of adjacent chunks that fall in the same shard; with
-    // 256 loader threads contending on shardCacheMutex_, skipping the
-    // map + lock for same-shard hits saves ~1-2% total CPU per profile.
-    // The shared_ptr keeps bytes alive even if the LRU evicts them.
+    // 256 loader threads contending on the cache, skipping the map+lock
+    // for same-shard hits saves ~1-2% total CPU per profile. The
+    // shared_ptr keeps bytes alive even if the LRU evicts them.
     // Qualify with `this` so a volume swap (pipeline destroyed + recreated)
     // doesn't serve stale data from the old pipeline's shard cache.
     thread_local const BlockPipeline* tlOwner = nullptr;
@@ -118,13 +136,12 @@ std::shared_ptr<std::vector<std::byte>> BlockPipeline::shardBytesFor(
         return tlLastBytes;
     }
 
-    // Fast path: hit under the cache mutex, move entry to LRU head.
+    // Fast path: hit under the bucket mutex, move entry to LRU head.
     {
-        std::lock_guard lk(shardCacheMutex_);
-        auto it = shardCacheMap_.find(sk);
-        if (it != shardCacheMap_.end()) {
-            shardCacheLru_.splice(shardCacheLru_.begin(),
-                                   shardCacheLru_, it->second);
+        std::lock_guard lk(bucket.mutex);
+        auto it = bucket.map.find(sk);
+        if (it != bucket.map.end()) {
+            bucket.lru.splice(bucket.lru.begin(), bucket.lru, it->second);
             statShardHits_.fetch_add(1, std::memory_order_relaxed);
             tlOwner = this;
             tlLastShard = sk;
@@ -140,18 +157,17 @@ std::shared_ptr<std::vector<std::byte>> BlockPipeline::shardBytesFor(
     if (!raw || raw->empty()) return nullptr;
     auto bytes = std::make_shared<std::vector<std::byte>>(std::move(*raw));
 
-    std::lock_guard lk(shardCacheMutex_);
+    std::lock_guard lk(bucket.mutex);
     // Another thread may have raced us to populate this shard; prefer
     // the entry already in the cache to keep `shared_ptr` identity
     // consistent across concurrent reads.
-    if (auto it = shardCacheMap_.find(sk); it != shardCacheMap_.end()) {
-        shardCacheLru_.splice(shardCacheLru_.begin(),
-                               shardCacheLru_, it->second);
+    if (auto it = bucket.map.find(sk); it != bucket.map.end()) {
+        bucket.lru.splice(bucket.lru.begin(), bucket.lru, it->second);
         tlLastShard = sk;
         tlLastBytes = it->second->bytes;
         return it->second->bytes;
     }
-    shardCacheInsertLocked(sk, bytes);
+    shardCacheInsertLocked(bucket, sk, bytes);
     tlOwner = this;
     tlLastShard = sk;
     tlLastBytes = bytes;
@@ -167,27 +183,38 @@ static ChunkDataPtr decodeCanonicalH265(const std::vector<uint8_t>& compressed) 
     auto dims = utils::video_header_dims(bytes);
     utils::VideoCodecParams vp;
     vp.depth = dims[0]; vp.height = dims[1]; vp.width = dims[2];
-    size_t n = size_t(dims[0]) * dims[1] * dims[2];
-    auto decoded = utils::video_decode(bytes, n, vp);
+    const size_t n = size_t(dims[0]) * dims[1] * dims[2];
     auto out = std::make_shared<ChunkData>();
     out->shape = {int(dims[0]), int(dims[1]), int(dims[2])};
     out->elementSize = 1;
-    out->bytes.resize(decoded.size());
-    std::memcpy(out->bytes.data(), decoded.data(), decoded.size());
+    out->bytes.resize(n);
+    // Zero-copy: decoder writes straight into ChunkData::bytes. Saves one
+    // ~2 MiB std::vector<std::byte> allocation + zero-init + memcpy per
+    // chunk vs. the std::vector-returning video_decode — this path runs
+    // on every decoded chunk so the allocation churn was a primary
+    // driver of worker-thread page-fault / swap pressure.
+    utils::video_decode_into(
+        bytes,
+        std::span<std::byte>(reinterpret_cast<std::byte*>(out->bytes.data()), n),
+        vp);
     return out;
 }
 
-// Encode decoded chunk bytes as canonical h265. qp/air_clamp/shift_n come
-// from the pipeline's configured encodeParams (default qp=36).
-static std::vector<std::byte> encodeCanonicalH265(
+// Encode decoded chunk bytes as canonical h265 into a thread-local output
+// buffer, returned by reference. Caller must consume the bytes before
+// the next call on the same thread. Capacity grows once to the largest
+// chunk ever seen on this thread and stays — no per-chunk allocation.
+static const std::vector<std::byte>& encodeCanonicalH265(
     const ChunkData& chunk, const utils::VideoCodecParams& base) {
+    thread_local std::vector<std::byte> tlEncoded;
     utils::VideoCodecParams vp = base;
     vp.depth = chunk.shape[0];
     vp.height = chunk.shape[1];
     vp.width = chunk.shape[2];
-    return utils::video_encode(
+    utils::video_encode_into(
         {reinterpret_cast<const std::byte*>(chunk.rawData()), chunk.totalBytes()},
-        vp);
+        vp, tlEncoded);
+    return tlEncoded;
 }
 
 // Does `bytes` already carry the canonical VC3D/h265 magic header?
@@ -350,8 +377,12 @@ BlockPipeline::BlockPipeline(
             std::vector<ChunkKey> encodeKeys;
             encodeKeys.reserve(res.size());
             for (auto& [key, _] : res) encodeKeys.push_back(key);
-            const int targetLevel = encodeKeys.front().level;
-            encodePool_.updateInteractive(encodeKeys, targetLevel);
+            // submit appends (O(N) in new keys); updateInteractive would
+            // reshuffle the whole encoder queue (O(Q)) and reset served
+            // counters, neither of which makes sense for inter-stage
+            // handoffs — the viewport priority comes from the renderer's
+            // fetchInteractive call upstream, not from completions.
+            encodePool_.submit(encodeKeys);
         });
 
     // Encoder: take staged ChunkData → h265 encode → disk write → forward
@@ -373,7 +404,7 @@ BlockPipeline::BlockPipeline(
         }
         if (!decoded) return {};
 
-        auto h265 = encodeCanonicalH265(*decoded, config_.encodeParams);
+        const auto& h265 = encodeCanonicalH265(*decoded, config_.encodeParams);
         zarrWriteChunk(*dz, key,
             reinterpret_cast<const uint8_t*>(h265.data()), h265.size());
         statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
@@ -386,12 +417,14 @@ BlockPipeline::BlockPipeline(
             }
             // Shard file grew on disk; drop the stale cached copy so the
             // loader re-reads it next time.
-            std::lock_guard lk(shardCacheMutex_);
-            if (auto it = shardCacheMap_.find(sk); it != shardCacheMap_.end()) {
-                shardCacheTotalBytes_ -= it->second->bytes
-                    ? it->second->bytes->size() : 0;
-                shardCacheLru_.erase(it->second);
-                shardCacheMap_.erase(it);
+            auto& bucket = shardCacheBuckets_[shardCacheBucketIndex(sk)];
+            std::lock_guard lk(bucket.mutex);
+            if (auto it = bucket.map.find(sk); it != bucket.map.end()) {
+                const size_t sz = it->second->bytes ? it->second->bytes->size() : 0;
+                bucket.bytes -= sz;
+                shardCacheGlobalBytes_.fetch_sub(sz, std::memory_order_relaxed);
+                bucket.lru.erase(it->second);
+                bucket.map.erase(it);
             }
         }
 
@@ -406,8 +439,7 @@ BlockPipeline::BlockPipeline(
             std::vector<ChunkKey> loaderKeys;
             loaderKeys.reserve(res.size());
             for (auto& [key, _] : res) loaderKeys.push_back(key);
-            const int targetLevel = loaderKeys.front().level;
-            loaderPool_.updateInteractive(loaderKeys, targetLevel);
+            loaderPool_.submit(loaderKeys);
         });
 
     // Loader: read compressed bytes for `key` (shard RAM cache or disk),
@@ -491,8 +523,7 @@ BlockPipeline::BlockPipeline(
             std::vector<ChunkKey> decodeKeys;
             decodeKeys.reserve(res.size());
             for (auto& [k, _] : res) decodeKeys.push_back(k);
-            const int targetLevel = decodeKeys.front().level;
-            decodePool_.updateInteractive(decodeKeys, targetLevel);
+            decodePool_.submit(decodeKeys);
         });
 
     decodePool_.setShardMapper(shardMapper);
@@ -639,12 +670,14 @@ BlockPipeline::BlockPipeline(
                         std::lock_guard lk(writtenShardsMutex_);
                         writtenShards_.insert(sk);
                     }
-                    std::lock_guard lk(shardCacheMutex_);
-                    if (auto it = shardCacheMap_.find(sk); it != shardCacheMap_.end()) {
-                        shardCacheTotalBytes_ -= it->second->bytes
-                            ? it->second->bytes->size() : 0;
-                        shardCacheLru_.erase(it->second);
-                        shardCacheMap_.erase(it);
+                    auto& bucket = shardCacheBuckets_[shardCacheBucketIndex(sk)];
+                    std::lock_guard lk(bucket.mutex);
+                    if (auto it = bucket.map.find(sk); it != bucket.map.end()) {
+                        const size_t sz = it->second->bytes ? it->second->bytes->size() : 0;
+                        bucket.bytes -= sz;
+                        shardCacheGlobalBytes_.fetch_sub(sz, std::memory_order_relaxed);
+                        bucket.lru.erase(it->second);
+                        bucket.map.erase(it);
                     }
                 }
 
@@ -660,8 +693,7 @@ BlockPipeline::BlockPipeline(
                 std::vector<ChunkKey> keys;
                 keys.reserve(res.size());
                 for (auto& [k, _] : res) keys.push_back(k);
-                const int level = keys.front().level;
-                loaderPool_.updateInteractive(keys, level);
+                loaderPool_.submit(keys);
             });
     }
 skipPassthrough:
@@ -719,6 +751,31 @@ void BlockPipeline::bloomClear() noexcept {
 
 void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targetLevel) {
     if (keys.empty()) return;
+    // Dedup: the renderer calls this every frame, and viewport-idle frames
+    // pass the same keys + targetLevel as the previous call. When the
+    // BlockCache hasn't evicted anything since the last submit, nothing
+    // downstream would change — the expensive containsBatch, emptyChunks
+    // snapshot, classification, and (most importantly) IOPool queue
+    // rebuilds would reproduce their previous outputs. Skip.
+    {
+        // Commutative hash so order-insensitive dedup works across
+        // render paths that enumerate chunks in different orders.
+        uint64_t h = uint64_t(uint32_t(targetLevel)) * 0x9E3779B97F4A7C15ULL;
+        ChunkKeyHash kh;
+        for (const auto& k : keys) h ^= kh(k);
+        const uint64_t evictionNow = blockCache_.evictionVersion();
+        std::lock_guard lk(fetchInteractiveDedupMutex_);
+        if (haveLastFetchInteractive_
+            && lastFetchInteractiveHash_ == h
+            && lastFetchInteractiveEviction_ == evictionNow
+            && lastFetchInteractiveTargetLevel_ == targetLevel) {
+            return;
+        }
+        lastFetchInteractiveHash_ = h;
+        lastFetchInteractiveEviction_ = evictionNow;
+        lastFetchInteractiveTargetLevel_ = targetLevel;
+        haveLastFetchInteractive_ = true;
+    }
     // Triage by disk presence: chunks already on disk go straight to the
     // loader pool (fast, CPU-bound decode), chunks that need fetching go
     // to the downloader pool (slow, network-bound). The two pools are
@@ -816,11 +873,9 @@ BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
     // Hot path: try the block cache first. Most samples hit a resident
     // block, so emptyChunksMutex_ never needs to be acquired — previously
     // every blockAt() call took that mutex before the cache lookup.
-    auto b = blockCache_.get(key);
-    if (b) {
-        statBlockHits_.fetch_add(1, std::memory_order_relaxed);
-        return b;
-    }
+    // BlockCache::get() now owns the hit counter (per-shard, no contention);
+    // we no longer bump statBlockHits_ here on the fast path.
+    if (auto b = blockCache_.get(key); b) return b;
     // Miss: could be an "empty chunk" (all-zero canonical chunk that we
     // don't store). Canonical chunks are 128³ = 8x8x8 blocks of 16³ —
     // reverse-map the block coord to its enclosing chunk and check.
@@ -831,7 +886,7 @@ BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
             // One canonical zero block shared by every caller asking for
             // a block inside any empty chunk — no arena consumption.
             static constinit Block kZeroBlock{};
-            statBlockHits_.fetch_add(1, std::memory_order_relaxed);
+            statEmptyHits_.fetch_add(1, std::memory_order_relaxed);
             return &kZeroBlock;
         }
     }
@@ -908,7 +963,16 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
     const int bzN = cz / kBlockSize;
     const int byN = cy / kBlockSize;
     const int bxN = cx / kBlockSize;
-    if (bzN * kBlockSize != cz || byN * kBlockSize != cy || bxN * kBlockSize != cx) return;
+    // Blocks are the fixed 16³ storage/render unit; chunk dims must be a
+    // multiple of kBlockSize so blocks tile the chunk cleanly. Enforced
+    // up-front in FileSystemSource::discoverLevels — reaching here with a
+    // misaligned chunk means a new source path slipped past the check.
+    if (bzN * kBlockSize != cz || byN * kBlockSize != cy || bxN * kBlockSize != cx) {
+        std::fprintf(stderr,
+                     "[FATAL] chunk dims must be multiples of %d, got %dx%dx%d (key L%d %d/%d/%d)\n",
+                     kBlockSize, cz, cy, cx, key.level, key.iz, key.iy, key.ix);
+        std::abort();
+    }
 
     // Zero-chunk shortcut: VcDecompressor already scanned the decoded bytes
     // and set isEmpty when every voxel is zero. Record the canonical chunk
@@ -929,14 +993,17 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
     const int baseBy = key.iy * byN;
     const int baseBx = key.ix * bxN;
 
-    uint8_t tmp[kBlockBytes];
     // One unique_lock covers all 512 inserts for a 128³ canonical chunk
-    // instead of 512 separate lock/unlock pairs.
+    // instead of 512 separate lock/unlock pairs. acquire() returns the
+    // arena slot directly so we write the 16³ block straight into its
+    // final destination — no tmp buffer, no double copy.
     BlockCache::BatchPut batch(blockCache_);
     for (int bi = 0; bi < bzN; ++bi) {
         for (int bj = 0; bj < byN; ++bj) {
             for (int bk = 0; bk < bxN; ++bk) {
-                uint8_t* dst = tmp;
+                BlockKey bkKey{key.level, baseBz + bi, baseBy + bj, baseBx + bk};
+                uint8_t* dst = batch.acquire(bkKey);
+                if (!dst) continue;
                 for (int lz = 0; lz < kBlockSize; ++lz) {
                     const uint8_t* zRow = src + (bi * kBlockSize + lz) * strideZ;
                     for (int ly = 0; ly < kBlockSize; ++ly) {
@@ -945,8 +1012,6 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
                         dst += kBlockSize;
                     }
                 }
-                BlockKey bkKey{key.level, baseBz + bi, baseBy + bj, baseBx + bk};
-                batch.put(bkKey, tmp);
             }
         }
     }
@@ -959,10 +1024,13 @@ void BlockPipeline::clearMemory() {
         std::lock_guard elk(emptyChunksMutex_);
         emptyChunks_.clear();
     }
-    std::lock_guard lk(shardCacheMutex_);
-    shardCacheLru_.clear();
-    shardCacheMap_.clear();
-    shardCacheTotalBytes_ = 0;
+    for (auto& bucket : shardCacheBuckets_) {
+        std::lock_guard lk(bucket.mutex);
+        bucket.lru.clear();
+        bucket.map.clear();
+        bucket.bytes = 0;
+    }
+    shardCacheGlobalBytes_.store(0, std::memory_order_relaxed);
 }
 
 void BlockPipeline::clearAll() {
@@ -978,12 +1046,13 @@ void BlockPipeline::clearAll() {
         std::lock_guard lk(decodeStagingMutex_);
         decodeStaging_.clear();
     }
-    {
-        std::lock_guard lk(shardCacheMutex_);
-        shardCacheLru_.clear();
-        shardCacheMap_.clear();
-        shardCacheTotalBytes_ = 0;
+    for (auto& bucket : shardCacheBuckets_) {
+        std::lock_guard lk(bucket.mutex);
+        bucket.lru.clear();
+        bucket.map.clear();
+        bucket.bytes = 0;
     }
+    shardCacheGlobalBytes_.store(0, std::memory_order_relaxed);
     blockCache_.clear();
     {
         std::lock_guard elk(emptyChunksMutex_);
@@ -1091,7 +1160,10 @@ void BlockPipeline::clearChunkArrivedFlag() noexcept {
 
 auto BlockPipeline::stats() const -> Stats {
     Stats s;
-    s.blockHits = statBlockHits_.load(std::memory_order_relaxed);
+    // Hot path hits live in BlockCache's per-shard counters; empty-chunk
+    // canonical-zero hits are separate (cold path).
+    s.blockHits = blockCache_.blockHits()
+                + statEmptyHits_.load(std::memory_order_relaxed);
     s.coldHits = statColdHits_.load(std::memory_order_relaxed);
     s.iceFetches = statIceFetches_.load(std::memory_order_relaxed);
     s.misses = statMisses_.load(std::memory_order_relaxed);
@@ -1103,10 +1175,13 @@ auto BlockPipeline::stats() const -> Stats {
     s.ioPending = s.downloadPending + s.encodePending + s.loadPending + s.decodePending;
     s.shardHits = statShardHits_.load(std::memory_order_relaxed);
     s.shardMisses = statShardMisses_.load(std::memory_order_relaxed);
-    {
-        std::lock_guard lk(shardCacheMutex_);
-        s.shardCacheBytes = shardCacheTotalBytes_;
-        s.shardCacheEntries = shardCacheLru_.size();
+    // Global byte count is an atomic so we don't need the per-bucket locks
+    // to read it. Entry count still needs the per-bucket walk.
+    s.shardCacheBytes = shardCacheGlobalBytes_.load(std::memory_order_relaxed);
+    s.shardCacheEntries = 0;
+    for (auto& bucket : shardCacheBuckets_) {
+        std::lock_guard lk(bucket.mutex);
+        s.shardCacheEntries += bucket.lru.size();
     }
     s.diskWrites = statDiskWrites_.load(std::memory_order_relaxed);
     {

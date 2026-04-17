@@ -66,22 +66,36 @@ DecompressFn makeVcDecompressor(const std::vector<vc::VcDataset*>& datasets)
             vp.height = dims[1];
             vp.width = dims[2];
 
-            auto decoded = utils::video_decode(
-                std::span<const std::byte>(
-                    reinterpret_cast<const std::byte*>(compressed.data()),
-                    compressed.size()),
-                size_t(dims[0]) * dims[1] * dims[2], vp);
-
+            const size_t decodedSize = size_t(dims[0]) * dims[1] * dims[2];
             int cz = static_cast<int>(chunkShape[0]);
             int cy = static_cast<int>(chunkShape[1]);
             int cx = static_cast<int>(chunkShape[2]);
-            size_t copySize = std::min(decoded.size(), chunkSize);
 
             auto result = acquireChunkData(chunkSize);
             result->shape = {cz, cy, cx};
             result->elementSize = 1;
 
-            std::memcpy(result->rawData(), decoded.data(), copySize);
+            // Decode straight into the result buffer when it matches; saves
+            // one 2 MiB allocation + memcpy per chunk on the hot path.
+            // Fall back to a temp buffer when the shapes mismatch (rare).
+            if (decodedSize == chunkSize) {
+                utils::video_decode_into(
+                    std::span<const std::byte>(
+                        reinterpret_cast<const std::byte*>(compressed.data()),
+                        compressed.size()),
+                    std::span<std::byte>(
+                        reinterpret_cast<std::byte*>(result->rawData()),
+                        chunkSize),
+                    vp);
+            } else {
+                auto decoded = utils::video_decode(
+                    std::span<const std::byte>(
+                        reinterpret_cast<const std::byte*>(compressed.data()),
+                        compressed.size()),
+                    decodedSize, vp);
+                std::memcpy(result->rawData(), decoded.data(),
+                            std::min(decoded.size(), chunkSize));
+            }
             result->isEmpty = isChunkEmpty(result->rawData(), chunkSize);
             return result;
         }
