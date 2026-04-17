@@ -33,6 +33,7 @@ using vc::cache::BlockKey;
 using vc::cache::BlockPtr;
 using vc::cache::BlockPipeline;
 using vc::cache::kBlockSize;
+using vc::cache::kMaxLevels;
 
 constexpr int kBlockShift = 4;       // log2(16)
 constexpr int kBlockMask = 15;
@@ -85,14 +86,21 @@ struct VolumeShape {
 // block cache only — never blocks on disk or network. Missing blocks make
 // sampleInt return 0 (black) for that voxel. Viewport-demand fetches feed
 // the cache asynchronously via BlockPipeline::fetchInteractive.
-template<typename T, int kSlots = 1024>
+template<typename T, int kSlots = 4096>
 struct BlockSampler {
     static_assert((kSlots & (kSlots - 1)) == 0, "kSlots must be power of 2");
     static constexpr int kSlotMask = kSlots - 1;
 
-    // Hot slot: packed key + data pointer, 16 bytes. 512 * 16 = 8KB, fits
-    // comfortably in L1D. The shared_ptr (refcounting keep-alive) lives
-    // in a cold parallel array, touched only on miss.
+    // Hot slot: packed key + data pointer, 16 bytes. 4096 slots × 16B = 64KB.
+    // Fits in L2 with room to spare; L1D (typically 32-64KB) takes collisions.
+    // Raised from 1024 because the 12-thread render's per-thread working set
+    // is 1400-2700 unique blocks per frame — at 1024 slots the direct-mapped
+    // cache collided hard, and every collision miss fell through to blockAt,
+    // taking a BlockCache shard shared_lock. The shard shared_lock release
+    // (CAS-rel on its reader counter) was ~9% of CPU. 4096 slots hold the
+    // full working set so most lookups stay in the sampler's private cache.
+    // The shared_ptr (refcounting keep-alive) lives in a cold parallel array,
+    // touched only on miss.
     struct HotSlot {
         uint64_t key = UINT64_MAX;
         const T* data = nullptr;
@@ -983,9 +991,9 @@ void sampleSingleLayerAdaptiveImpl(
         }
     }
 
-    float scales[32] = {};
+    float scales[kMaxLevels] = {};
     const int nSamplersTotal = numLevels - desiredLevel;
-    for (int i = 0; i < nSamplersTotal && i < 32; i++) {
+    for (int i = 0; i < nSamplersTotal && i < kMaxLevels; i++) {
         int lvl = desiredLevel + i;
         scales[i] = (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f;
     }
@@ -1001,7 +1009,7 @@ void sampleSingleLayerAdaptiveImpl(
 
     runRenderThreads([&](int /*tid*/) {
         const int nSamplers = numLevels - desiredLevel;
-        std::array<std::optional<BlockSampler<uint8_t>>, 32> samplers;
+        std::array<std::optional<BlockSampler<uint8_t>>, kMaxLevels> samplers;
         if (nSamplers > 0) samplers[0].emplace(cache, desiredLevel);
         auto sampler = [&](int i) -> BlockSampler<uint8_t>& {
             if (!samplers[i].has_value())
@@ -1013,8 +1021,8 @@ void sampleSingleLayerAdaptiveImpl(
         if (nSamplers > 0) sh0 = sampler(0).shape;
         const float sh0xF = float(sh0.sx), sh0yF = float(sh0.sy), sh0zF = float(sh0.sz);
 
-        float scalesRatio[32] = {};
-        for (int i = 0; i < nSamplers && i < 32; i++)
+        float scalesRatio[kMaxLevels] = {};
+        for (int i = 0; i < nSamplers && i < kMaxLevels; i++)
             scalesRatio[i] = (i > 0) ? 1.0f / float(1 << i) : 1.0f;
 
         const cv::Vec3f constNrm = planeNormal ? *planeNormal : cv::Vec3f(0, 0, 0);
@@ -1207,21 +1215,30 @@ void sampleCompositeAdaptiveImpl(
 
     // Precompute per-level scale factor once (1.0 / 2^lvl). Hoists the
     // integer shift + int->float convert + fdiv out of the hot inner loop.
-    float scales[32] = {};
+    float scales[kMaxLevels] = {};
     const int nSamplersTotal = numLevels - desiredLevel;
-    for (int i = 0; i < nSamplersTotal && i < 32; i++) {
+    for (int i = 0; i < nSamplersTotal && i < kMaxLevels; i++) {
         int lvl = desiredLevel + i;
         scales[i] = (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f;
     }
 
     // Parse compositeMethod once. Pixel loop previously did string compare
     // per pixel for the LayerStorage path; convert to a small enum up front.
-    enum class LayerAgg : uint8_t { Median, MinAbs, Alpha, BeerLambert, Mean };
+    // Max and Min also reach here when preprocess is enabled — the per-ray
+    // layer preprocess needs layerVals[] populated, which Max/Min's direct
+    // accumulate path skips.
+    enum class LayerAgg : uint8_t { Median, MinAbs, Alpha, BeerLambert, Mean, Max, Min };
     const LayerAgg layerAgg = (compositeMethod == "median") ? LayerAgg::Median
                             : (compositeMethod == "minabs") ? LayerAgg::MinAbs
                             : (compositeMethod == "alpha") ? LayerAgg::Alpha
                             : (compositeMethod == "beerLambert") ? LayerAgg::BeerLambert
+                            : (compositeMethod == "max") ? LayerAgg::Max
+                            : (compositeMethod == "min") ? LayerAgg::Min
                             : LayerAgg::Mean;
+
+    // Per-ray layer preprocess flags (applied before the aggregation below).
+    const bool preNormalize = lightParams && lightParams->preNormalizeLayers;
+    const bool preHistEq    = lightParams && lightParams->preHistEqLayers;
 
     // UI caps composite layers at 64 front + 64 behind + center = 129. Bound
     // once at the function level so the per-pixel loop and the bounds
@@ -1263,7 +1280,7 @@ void sampleCompositeAdaptiveImpl(
         // ~4KB hot slot cache; we don't want to pay that cost for levels
         // we never touch.
         const int nSamplers = numLevels - desiredLevel;
-        std::array<std::optional<BlockSampler<uint8_t>>, 32> samplers;
+        std::array<std::optional<BlockSampler<uint8_t>>, kMaxLevels> samplers;
         if (nSamplers > 0) samplers[0].emplace(cache, desiredLevel);
         auto sampler = [&](int i) -> BlockSampler<uint8_t>& {
             if (!samplers[i].has_value())
@@ -1284,8 +1301,8 @@ void sampleCompositeAdaptiveImpl(
         // Ratios for scaling desiredLevel-sampler coords into coarser-level
         // coords: scalesRatio[i] = scales[i] / scales[0] = 1 / 2^i. Used in
         // the fallback loop so the hot path never computes scales[i]/endScale.
-        float scalesRatio[32] = {};
-        for (int i = 0; i < nSamplers && i < 32; i++)
+        float scalesRatio[kMaxLevels] = {};
+        for (int i = 0; i < nSamplers && i < kMaxLevels; i++)
             scalesRatio[i] = (i > 0) ? 1.0f / float(1 << i) : 1.0f;
 
         // When there's no per-pixel normals map (common case: plane viewer),
@@ -1583,22 +1600,134 @@ void sampleCompositeAdaptiveImpl(
                 else if constexpr (AMode == AccumMode2::Min) val = mn;
                 else if constexpr (AMode == AccumMode2::Mean) val = count ? accum * (1.0f/float(count)) : 0.f;
                 else {
+                    // Per-ray layer preprocess: runs only in LayerStorage
+                    // mode (we need all N layerVals to compute stats). When
+                    // the user enables it for Max/Min/Mean, dispatchComposite
+                    // routes the method through LayerStorage so this runs
+                    // before the aggregation below.
+                    //
+                    // Void handling: missing-block samples land in layerVals
+                    // as 0, and the iso cutoff threshold zeros out anything
+                    // below it. Both get treated as "no data" here — they
+                    // don't contribute to normalize min/max or to the hist-eq
+                    // CDF (a ray with 100 voids + 29 real samples used to
+                    // push the CDF toward max and blow the render out white),
+                    // and they stay at 0 through the remap so the aggregation
+                    // sees the same voids as without preprocess.
+                    // Only build the void mask when preprocess is active;
+                    // otherwise keep existing aggregation behavior (no void
+                    // filtering) so enabling iso-cutoff alone doesn't silently
+                    // change Max/Min/Mean results.
+                    const bool preprocessActive = preNormalize || preHistEq;
+                    const uint8_t isoCut = lightParams ? lightParams->isoCutoff : 0;
+                    const float  isoF   = float(isoCut);
+                    alignas(64) uint8_t voidMask[kMaxLayers];
+                    int nValid = 0;
+                    if (preprocessActive) {
+                        for (int i = 0; i < nL; ++i) {
+                            // Iso cutoff: <= cutoff → void. Captures both the
+                            // user's explicit threshold and the implicit
+                            // missing-block zero case (isoCut=0 still treats 0
+                            // as void so block holes don't pollute the stats).
+                            if (layerVals[i] <= isoF) {
+                                layerVals[i] = 0.f;
+                                voidMask[i] = 1;
+                            } else {
+                                voidMask[i] = 0;
+                                ++nValid;
+                            }
+                        }
+                    }
+
+                    if (preNormalize && nValid >= 2) {
+                        float mnL = 0.f, mxL = 0.f;
+                        bool first = true;
+                        for (int i = 0; i < nL; ++i) {
+                            if (voidMask[i]) continue;
+                            const float v = layerVals[i];
+                            if (first) { mnL = mxL = v; first = false; }
+                            else {
+                                if (v < mnL) mnL = v;
+                                if (v > mxL) mxL = v;
+                            }
+                        }
+                        const float range = mxL - mnL;
+                        if (range > 1e-4f) {
+                            const float scl = 255.0f / range;
+                            for (int i = 0; i < nL; ++i) {
+                                if (voidMask[i]) continue;
+                                layerVals[i] = (layerVals[i] - mnL) * scl;
+                            }
+                        }
+                    }
+                    if (preHistEq && nValid >= 2) {
+                        // Build a 256-bin histogram from the N layer values,
+                        // compute the CDF, remap each sample through it.
+                        // Classic single-image hist-eq formula, applied to
+                        // the N-sample ray: out = 255 * (cdf[v] - cdfMin) /
+                        // (nValid - cdfMin). Void samples are skipped so
+                        // they don't dominate the CDF.
+                        uint32_t hist[256] = {0};
+                        for (int i = 0; i < nL; ++i) {
+                            if (voidMask[i]) continue;
+                            float v = layerVals[i];
+                            if (v < 0.f) v = 0.f; else if (v > 255.f) v = 255.f;
+                            hist[uint8_t(v)]++;
+                        }
+                        uint32_t cdf[256];
+                        uint32_t cum = 0;
+                        for (int k = 0; k < 256; ++k) {
+                            cum += hist[k];
+                            cdf[k] = cum;
+                        }
+                        uint32_t cdfMin = 0;
+                        for (int k = 0; k < 256; ++k) {
+                            if (cdf[k] > 0) { cdfMin = cdf[k]; break; }
+                        }
+                        const float denom = float(nValid - int(cdfMin));
+                        if (denom > 0.5f) {
+                            const float scl = 255.0f / denom;
+                            for (int i = 0; i < nL; ++i) {
+                                if (voidMask[i]) continue;
+                                float v = layerVals[i];
+                                if (v < 0.f) v = 0.f; else if (v > 255.f) v = 255.f;
+                                layerVals[i] = float(int(cdf[uint8_t(v)]) - int(cdfMin)) * scl;
+                            }
+                        }
+                    }
+
                     if (layerAgg == LayerAgg::Median) {
                         // For the small N we see in practice (<=~129 layers),
                         // insertion-sort-up-to-the-median beats nth_element:
                         // its introselect setup costs more than sorting a
                         // few dozen floats. partial_sort gives us exactly
                         // that for small N without branching on size.
-                        std::partial_sort(layerVals.begin(),
-                                          layerVals.begin() + nL/2 + 1,
-                                          layerVals.begin() + nL);
-                        val = layerVals[nL/2];
+                        if (preprocessActive && nValid > 0) {
+                            // Pack non-void values to the front, sort those
+                            // only. Voids included would drag the median
+                            // toward 0 whenever the ray sees block misses.
+                            int k = 0;
+                            for (int i = 0; i < nL; ++i) {
+                                if (!voidMask[i]) layerVals[k++] = layerVals[i];
+                            }
+                            std::partial_sort(layerVals.begin(),
+                                              layerVals.begin() + k/2 + 1,
+                                              layerVals.begin() + k);
+                            val = layerVals[k/2];
+                        } else {
+                            std::partial_sort(layerVals.begin(),
+                                              layerVals.begin() + nL/2 + 1,
+                                              layerVals.begin() + nL);
+                            val = layerVals[nL/2];
+                        }
                     } else if (layerAgg == LayerAgg::MinAbs) {
                         // Hoist abs(best-127.5) out of the loop and use std::fabs
                         // (hardware fabs opcode vs. std::abs's integer-path).
-                        float best = layerVals[0];
-                        float bestAbs = std::fabs(best - 127.5f);
-                        for (int i=1; i<nL; i++) {
+                        // Skip voids when preprocess is active so block misses
+                        // (distance 127.5 from mid) don't win over real data.
+                        float best = 0.f, bestAbs = std::numeric_limits<float>::max();
+                        for (int i = 0; i < nL; ++i) {
+                            if (preprocessActive && voidMask[i]) continue;
                             const float d = std::fabs(layerVals[i] - 127.5f);
                             if (d < bestAbs) { best = layerVals[i]; bestAbs = d; }
                         }
@@ -1650,11 +1779,44 @@ void sampleCompositeAdaptiveImpl(
 
                         accumulatedColor += ambient * transmittance;
                         val = std::min(255.0f, accumulatedColor * 255.0f);
+                    } else if (layerAgg == LayerAgg::Max) {
+                        // Max isn't affected by voids (0 never beats a real
+                        // sample) so no void gating needed here.
+                        float m = layerVals[0];
+                        for (int i=1; i<nL; i++) if (layerVals[i] > m) m = layerVals[i];
+                        val = m;
+                    } else if (layerAgg == LayerAgg::Min) {
+                        // Without void gating, Min collapses to 0 as soon as
+                        // a single block is missing. Seed from the first
+                        // valid value instead when preprocess is on.
+                        if (preprocessActive && nValid > 0) {
+                            float m = std::numeric_limits<float>::max();
+                            for (int i = 0; i < nL; ++i) {
+                                if (voidMask[i]) continue;
+                                if (layerVals[i] < m) m = layerVals[i];
+                            }
+                            val = m;
+                        } else {
+                            float m = layerVals[0];
+                            for (int i=1; i<nL; i++) if (layerVals[i] < m) m = layerVals[i];
+                            val = m;
+                        }
                     } else {
-                        float s=0.f; for (int i=0; i<nL; i++) s += layerVals[i];
-                        // Replace divide with multiply by pre-computed reciprocal.
-                        const float invN = nL>0 ? 1.0f/float(nL) : 0.f;
-                        val = s * invN;
+                        // Mean: skip voids when preprocess is active so block
+                        // holes don't pull the average toward 0. Fall back to
+                        // the plain averaging when preprocess is off to keep
+                        // existing behavior identical.
+                        if (preprocessActive) {
+                            float s = 0.f;
+                            for (int i = 0; i < nL; ++i) {
+                                if (!voidMask[i]) s += layerVals[i];
+                            }
+                            val = nValid > 0 ? s / float(nValid) : 0.f;
+                        } else {
+                            float s=0.f; for (int i=0; i<nL; i++) s += layerVals[i];
+                            const float invN = nL>0 ? 1.0f/float(nL) : 0.f;
+                            val = s * invN;
+                        }
                     }
                 }
                 if (lightingEnabled) {
@@ -1716,7 +1878,17 @@ void dispatchCompositeAdaptive(
     uint8_t* levelOut,
     int levelStride)
 {
-    const AccumMode2 mode = accumModeFor(method);
+    AccumMode2 mode = accumModeFor(method);
+    // Per-ray layer preprocess (normalize / hist-eq over N composite samples)
+    // needs the full layer array; force LayerStorage so the kernel stores all
+    // N values in layerVals before the preprocess + aggregation stages run.
+    // The fast Max/Min/Mean direct-accumulate paths skip storage, so they
+    // can't support preprocess without a detour through LayerStorage.
+    const bool preprocessActive = lightParams &&
+        (lightParams->preNormalizeLayers || lightParams->preHistEqLayers);
+    if (preprocessActive && mode != AccumMode2::Volumetric) {
+        mode = AccumMode2::LayerStorage;
+    }
     // nL=1 reduces Max/Min/Mean to the single sampled value (all three
     // collapse: max(x)=min(x)=mean(x)=x). Dispatch to the specialized kernel
     // to skip the layer loop, accumulator setup, and finalize switch — the
@@ -1724,8 +1896,10 @@ void dispatchCompositeAdaptive(
     // sub-modes (Alpha, BeerLambert, Median, MinAbs) apply a tone-mapping
     // transform to the single sample rather than returning it raw; Volumetric
     // is excluded because its shadow-ray + transmittance integration doesn't
-    // degenerate to a single sample.
-    const bool singleLayerFast = numLayers <= 1
+    // degenerate to a single sample. Preprocess is also excluded — with a
+    // single sample the per-ray normalize collapses to 0 and hist-eq to a
+    // single bin, neither of which is useful.
+    const bool singleLayerFast = numLayers <= 1 && !preprocessActive
         && (mode == AccumMode2::Max
          || mode == AccumMode2::Min
          || mode == AccumMode2::Mean);

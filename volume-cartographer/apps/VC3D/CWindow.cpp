@@ -3885,6 +3885,22 @@ void CWindow::CreateWidgets(void)
         }
     });
 
+    // Per-ray layer preprocess (applied to N composite samples before composite method)
+    connect(ui.chkPreNormalizeLayers, &QCheckBox::toggled, this, [this](bool checked) {
+        if (auto* viewer = segmentationViewer()) {
+            auto s = viewer->compositeRenderSettings();
+            s.params.preNormalizeLayers = checked;
+            viewer->setCompositeRenderSettings(s);
+        }
+    });
+    connect(ui.chkPreHistEqLayers, &QCheckBox::toggled, this, [this](bool checked) {
+        if (auto* viewer = segmentationViewer()) {
+            auto s = viewer->compositeRenderSettings();
+            s.params.preHistEqLayers = checked;
+            viewer->setCompositeRenderSettings(s);
+        }
+    });
+
     // Connect ISO Cutoff slider - applies to all viewers (segmentation, XY, XZ, YZ)
     connect(ui.sliderIsoCutoff, &QSlider::valueChanged, this, [this](int value) {
         ui.lblIsoCutoffValue->setText(QString::number(value));

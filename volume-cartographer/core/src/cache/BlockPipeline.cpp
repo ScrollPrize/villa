@@ -835,7 +835,7 @@ void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targ
     // hammering emptyChunksMutex_ from the render thread.
     std::unordered_set<ChunkKey, ChunkKeyHash> emptySnapshot;
     {
-        std::lock_guard lk(emptyChunksMutex_);
+        std::shared_lock lk(emptyChunksMutex_);
         emptySnapshot = emptyChunks_;
     }
 
@@ -879,9 +879,12 @@ BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
     // Miss: could be an "empty chunk" (all-zero canonical chunk that we
     // don't store). Canonical chunks are 128³ = 8x8x8 blocks of 16³ —
     // reverse-map the block coord to its enclosing chunk and check.
+    // Shared-lock the empty-chunks set: readers in the miss path dominate
+    // (12 render threads × every miss), writers only fire when a new
+    // all-zero chunk is discovered during decode.
     const ChunkKey chunkKey{key.level, key.bz / 8, key.by / 8, key.bx / 8};
     {
-        std::lock_guard lk(emptyChunksMutex_);
+        std::shared_lock lk(emptyChunksMutex_);
         if (emptyChunks_.count(chunkKey)) {
             // One canonical zero block shared by every caller asking for
             // a block inside any empty chunk — no arena consumption.
@@ -980,7 +983,7 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
     // blockAt() will hand out a shared static zero block for every inner
     // block of this chunk. Saves ~2 MB of arena per empty 128³ chunk.
     if (chunk.isEmpty) {
-        std::lock_guard lk(emptyChunksMutex_);
+        std::unique_lock lk(emptyChunksMutex_);
         emptyChunks_.insert(key);
         return;
     }
@@ -1021,7 +1024,7 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
 void BlockPipeline::clearMemory() {
     blockCache_.clear();
     {
-        std::lock_guard elk(emptyChunksMutex_);
+        std::unique_lock elk(emptyChunksMutex_);
         emptyChunks_.clear();
     }
     for (auto& bucket : shardCacheBuckets_) {
@@ -1055,7 +1058,7 @@ void BlockPipeline::clearAll() {
     shardCacheGlobalBytes_.store(0, std::memory_order_relaxed);
     blockCache_.clear();
     {
-        std::lock_guard elk(emptyChunksMutex_);
+        std::unique_lock elk(emptyChunksMutex_);
         emptyChunks_.clear();
     }
     bloomClear();
@@ -1113,7 +1116,7 @@ size_t BlockPipeline::countAvailable(const std::vector<ChunkKey>& keys) const {
     // would report them as unavailable and wait loops would stall.
     std::unordered_set<ChunkKey, ChunkKeyHash> emptySnap;
     {
-        std::lock_guard lk(emptyChunksMutex_);
+        std::shared_lock lk(emptyChunksMutex_);
         emptySnap = emptyChunks_;
     }
     for (const auto& key : keys) {

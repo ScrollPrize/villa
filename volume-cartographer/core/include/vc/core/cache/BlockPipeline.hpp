@@ -9,6 +9,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -244,7 +245,12 @@ private:
     // 512 identical zero blocks in the arena. blockAt() returns a pointer
     // to a single static zero-block when the block's canonical chunk is
     // in this set.
-    mutable std::mutex emptyChunksMutex_;
+    // shared_mutex: blockAt's miss path reads emptyChunks_ under shared_lock,
+    // while insertChunkAsBlocks/clear take unique_lock. Under 12-thread render
+    // into freshly-panned regions, every miss hits this mutex; a plain
+    // std::mutex serialised 12 readers and spent ~19% of CPU in
+    // futex_wait → queued_spin_lock_slowpath.
+    mutable std::shared_mutex emptyChunksMutex_;
     std::unordered_set<ChunkKey, ChunkKeyHash> emptyChunks_;
 
     // Negative cache (same design as before).

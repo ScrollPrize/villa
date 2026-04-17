@@ -388,6 +388,24 @@ void CAdaptiveVolumeViewer::reloadPerfSettings()
     _highlightDownscaled = s.value("viewer_controls/highlight_downscaled", false).toBool();
 }
 
+void CAdaptiveVolumeViewer::recordRenderTick()
+{
+    _renderTimestamps[_renderTimestampHead] = std::chrono::steady_clock::now();
+    _renderTimestampHead = (_renderTimestampHead + 1) % kFpsRingSize;
+    if (_renderTimestampCount < kFpsRingSize) ++_renderTimestampCount;
+}
+
+float CAdaptiveVolumeViewer::measuredFps() const
+{
+    if (_renderTimestampCount < 2) return 0.0f;
+    const int newestIdx = (_renderTimestampHead + kFpsRingSize - 1) % kFpsRingSize;
+    const int oldestIdx = (_renderTimestampHead + kFpsRingSize - _renderTimestampCount) % kFpsRingSize;
+    const auto span = _renderTimestamps[newestIdx] - _renderTimestamps[oldestIdx];
+    const double seconds = std::chrono::duration<double>(span).count();
+    if (seconds <= 1e-6) return 0.0f;
+    return float(double(_renderTimestampCount - 1) / seconds);
+}
+
 void CAdaptiveVolumeViewer::submitRender()
 {
     // Re-arm the chunk-arrival edge detector for the next tick window.
@@ -397,6 +415,7 @@ void CAdaptiveVolumeViewer::submitRender()
     if (_volume) {
         if (auto* c = _volume->tieredCache()) c->clearChunkArrivedFlag();
     }
+    recordRenderTick();
 
     const CompositeParams& lightP = _compositeSettings.params;
     const bool rakingEnabled = _compositeSettings.postRakingEnabled;
@@ -1608,6 +1627,11 @@ void CAdaptiveVolumeViewer::updateStatusLabel()
         .arg(static_cast<double>(_camera.scale), 0, 'f', 2)
         .arg(1 << _camera.dsScaleIdx)
         .arg(static_cast<double>(_camera.zOff), 0, 'f', 1);
+
+    const float fps = measuredFps();
+    if (fps > 0.0f) {
+        status += QString(" | %1 fps").arg(static_cast<double>(fps), 0, 'f', 1);
+    }
 
     if (_volume->tieredCache()) {
         auto s = _volume->tieredCache()->stats();

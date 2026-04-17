@@ -1122,6 +1122,26 @@
          <property name="value"><double>4.0</double></property>
         </widget>
        </item>
+       <item row="16" column="0" colspan="2">
+        <widget class="QCheckBox" name="chkPreNormalizeLayers">
+         <property name="text">
+          <string>Pre-normalize layers</string>
+         </property>
+         <property name="toolTip">
+          <string>Min-max stretch the N sampled composite layers to [0,255] per pixel before compositing. Cancels per-ray brightness drift from z-axis volume variation.</string>
+         </property>
+        </widget>
+       </item>
+       <item row="16" column="2" colspan="2">
+        <widget class="QCheckBox" name="chkPreHistEqLayers">
+         <property name="text">
+          <string>Pre-histeq layers</string>
+         </property>
+         <property name="toolTip">
+          <string>CDF-based histogram equalization over the N sampled composite layers per pixel before compositing. Flattens per-ray contrast — strongest effect, can clip uniform rays.</string>
+         </property>
+        </widget>
+       </item>
       </layout>
      </item>
      <item>

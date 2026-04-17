@@ -317,6 +317,15 @@ private:
     int _normalMaxArrows = 32;
     QString _lastStatusText;
     std::chrono::steady_clock::time_point _lastStatusUpdate{};
+    // FPS tracking — ring buffer of recent submitRender() timestamps.
+    // Status label reads the newest minus the oldest to get an averaged
+    // fps number; single-frame interval is too noisy to display.
+    static constexpr int kFpsRingSize = 32;
+    std::array<std::chrono::steady_clock::time_point, kFpsRingSize> _renderTimestamps{};
+    int _renderTimestampHead = 0;
+    int _renderTimestampCount = 0;
+    void recordRenderTick();
+    float measuredFps() const;
     std::chrono::steady_clock::time_point _lastStretchScan{};
     cv::Ptr<cv::CLAHE> _claheCache;
     int _claheCacheTile = -1;

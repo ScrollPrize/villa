@@ -63,6 +63,15 @@ endif()
 
 include(ProcessorCount)
 ProcessorCount(NPROC)
+# ProcessorCount() reads nproc / sched_getaffinity on Linux — on some
+# containers/CI or cpuset-limited shells it returns 1 even though the
+# machine has many cores (observed here: nproc=1 vs lscpu CPU(s)=12).
+# Fall back to cmake_host_system_information which reads the kernel's
+# NUMBER_OF_LOGICAL_CORES; only accept that if it's strictly larger.
+cmake_host_system_information(RESULT NPROC_LOGICAL QUERY NUMBER_OF_LOGICAL_CORES)
+if(NPROC_LOGICAL AND NPROC_LOGICAL GREATER NPROC)
+    set(NPROC ${NPROC_LOGICAL})
+endif()
 if(NOT NPROC OR NPROC EQUAL 0)
     set(NPROC 4)
 endif()

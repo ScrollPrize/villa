@@ -50,6 +50,20 @@ struct CompositeParams {
     // Pre-processing
     uint8_t isoCutoff = 0;           // Highpass filter: values below this are set to 0
 
+    // Per-ray layer preprocess (applied to the N sampled composite layers
+    // for each pixel before the composite method runs). Cancels z-axis
+    // brightness drift so the composite averages evenly across a ray that
+    // crosses bright and dark strata.
+    //
+    // preNormalizeLayers: min-max stretch the N layer values to [0, 255].
+    //   Preserves per-ray structure, eliminates absolute brightness offset.
+    // preHistEqLayers:   CDF-based histogram equalization over the N layer
+    //   values. Flattens per-ray contrast; strongest effect, can clip out
+    //   true structure if the ray is genuinely uniform.
+    // Both can be chained (normalize → equalize).
+    bool preNormalizeLayers = false;
+    bool preHistEqLayers = false;
+
     // Recompute lightDir from lightAzimuth/lightElevation (degrees)
     void updateLightDir() noexcept {
         float azRad = lightAzimuth * (std::numbers::pi_v<float> / 180.0f);
