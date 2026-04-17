@@ -950,14 +950,25 @@ class TifxyzLasagnaDataset(Dataset):
 
         # Label region origin in world coords (sized label_patch_size).
         # When a cross-volume transform is present, world_bbox is in
-        # cache-scale coords; map to volume reading-level coords.
-        label_min_f = np.array([z0, y0, x0], dtype=np.float64)
+        # cache-scale coords.  The transform includes rotation, so we
+        # must transform all 8 bbox corners to find the axis-aligned
+        # bounding box in reading-level space, then center the crop on it.
         if patch.cache_to_volume is not None:
-            label_min_f = _apply_affine_zyx(
-                patch.cache_to_volume,
-                label_min_f.reshape(1, 3),
-            ).reshape(3).astype(np.float64)
-        label_min = np.round(label_min_f).astype(np.int64)
+            corners_zyx = np.array([
+                [z, y, x]
+                for z in (z0, z1)
+                for y in (y0, y1)
+                for x in (x0, x1)
+            ], dtype=np.float64)
+            corners_vol = _apply_affine_zyx(patch.cache_to_volume, corners_zyx)
+            aabb_min = corners_vol.min(axis=0)
+            aabb_max = corners_vol.max(axis=0)
+            aabb_center = (aabb_min + aabb_max) / 2.0
+            label_min = np.round(
+                aabb_center - np.array(label_size, dtype=np.float64) / 2.0
+            ).astype(np.int64)
+        else:
+            label_min = np.array([z0, y0, x0], dtype=np.int64)
         # Place the label region inside the (larger) CT crop.
         # paste_off ∈ [-L/2, P - L/2] allows up to half of the GT to
         # be cropped off either edge during training; val/eval uses

@@ -1692,6 +1692,7 @@ def _evaluate(
     losses_smooth: list[float] = []
     angles_sparse_deg: list[float] = []
     vis_done = False
+    _vis_acc: list[tuple] = []  # accumulate (image, pred, targets, mask) for multi-sample vis
 
     val_iter = loader
     if verbose:
@@ -1767,13 +1768,29 @@ def _evaluate(
             if verbose:
                 val_iter.set_postfix(loss=f"{loss.item():.4f}")
 
-            # Vis batch is captured only on rank 0 — that rank's
-            # first batch is what gets rendered downstream.
-            if not vis_done and is_main:
-                _log_vis(log_images, "val", image, pred, targets, cos_mask, global_step)
+            # Accumulate up to 4 samples for visualization (rank 0 only).
+            if not vis_done and is_main and len(_vis_acc) < 4:
+                _vis_acc.append((
+                    image.detach().cpu(),
+                    pred.detach().cpu(),
+                    targets.detach().cpu(),
+                    cos_mask.detach().cpu(),
+                ))
                 if vis_batch_out is not None:
                     vis_batch_out.append(batch)
-                vis_done = True
+                if len(_vis_acc) >= 4:
+                    vis_done = True
+
+    # Log assembled val visualization (up to 4 samples concatenated).
+    if _vis_acc and is_main:
+        _log_vis(
+            log_images, "val",
+            torch.cat([a[0] for a in _vis_acc], dim=0).to(device),
+            torch.cat([a[1] for a in _vis_acc], dim=0).to(device),
+            torch.cat([a[2] for a in _vis_acc], dim=0).to(device),
+            torch.cat([a[3] for a in _vis_acc], dim=0).to(device),
+            global_step,
+        )
 
     # Per-rank means → cross-rank average. Each rank's val shard is
     # roughly the same size (DistributedSampler pads to equal length).
