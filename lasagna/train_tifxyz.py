@@ -684,7 +684,8 @@ class DeformationStore:
 
     def __init__(
         self,
-        dataset,       # TifxyzLasagnaDataset — has .patches list
+        patches: list,   # list of ChunkPatch from dataset.patches
+        config: dict,    # the parsed JSON config (has "datasets" key)
         grid_size: int,
         run_dir: Path,
     ):
@@ -701,12 +702,12 @@ class DeformationStore:
         # We need the segments_path per patch.  It's on the config but
         # not on ChunkPatch directly.  Build from config datasets list.
         ds_key_map: dict[int, str] = {}   # dataset_idx -> segments_path
-        for di, ds in enumerate(dataset.config["datasets"]):
+        for di, ds in enumerate(config["datasets"]):
             sp = ds.get("segments_path", "")
             if sp:
                 ds_key_map[di] = sp
 
-        for patch in dataset.patches:
+        for patch in patches:
             sp = ds_key_map.get(patch.dataset_idx, f"unknown_{patch.dataset_idx}")
             key = self._make_key(sp, patch.dataset_idx)
             if key not in groups:
@@ -716,7 +717,7 @@ class DeformationStore:
             groups[key] = max(groups[key], local_i + 1)
 
         # Second pass: build index
-        for patch in dataset.patches:
+        for patch in patches:
             sp = ds_key_map.get(patch.dataset_idx, f"unknown_{patch.dataset_idx}")
             key = self._make_key(sp, patch.dataset_idx)
             self._index.append((key, patch.dataset_local_idx))
@@ -909,7 +910,7 @@ def _deform_inner_loop(
 # ---------------------------------------------------------------------------
 
 def _log_vis(log_images, tag, image, pred, targets, mask, step,
-             targets_deformed=None):
+             targets_original=None):
     with torch.no_grad():
         b = min(4, image.size(0))
         mid_z = pred.size(2) // 2
@@ -923,10 +924,10 @@ def _log_vis(log_images, tag, image, pred, targets, mask, step,
             t = targets[:b, i:i+1, mid_z]
             log_images(f"{tag}/{name}_pred", p.clamp(0, 1), step)
             log_images(f"{tag}/{name}_gt", (t * m).clamp(0, 1), step)
-            # Show deformed GT for cos and grad_mag
-            if targets_deformed is not None and i < 2:
-                td = targets_deformed[:b, i:i+1, mid_z]
-                log_images(f"{tag}/{name}_gt_deformed", (td * m).clamp(0, 1), step)
+            # Show original (pre-deformation) GT for cos and grad_mag
+            if targets_original is not None and i < 2:
+                to = targets_original[:b, i:i+1, mid_z]
+                log_images(f"{tag}/{name}_gt_original", (to * m).clamp(0, 1), step)
 
         log_images(f"{tag}/validity", m, step)
 
@@ -1182,7 +1183,7 @@ def train(
                 f"label_patch_size={effective_label_patch}"
             )
         deform_store = DeformationStore(
-            full_dataset, deform_grid_size, run_dir,
+            full_dataset.patches, config, deform_grid_size, run_dir,
         )
         if is_main:
             print(
@@ -1214,14 +1215,17 @@ def train(
     model_core = model.module if is_dist else model
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-5)
 
-    # LR warmup + cosine decay
+    # LR warmup + per-step cosine decay
     warmup_steps = 200
+    total_steps = epochs * len(train_loader)
     def lr_lambda(step):
         if step < warmup_steps:
             return step / max(warmup_steps, 1)
         return 1.0
     warmup_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    cosine_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(total_steps, 1),
+    )
 
     # Precision
     if precision == "bf16":
@@ -1391,6 +1395,7 @@ def train(
         device_type=device_type,
         world_size=world_size,
         is_main=is_main,
+        deform_store=deform_store,
     )
     if _init_vis_batch:
         _log_full_vis(_init_vis_batch[0], "val", global_step)
@@ -1746,6 +1751,7 @@ def train(
                     batch = _filter_batch(batch, keep_list)
 
                 # --- GT deformation inner loop ---
+                targets_original = targets
                 targets_deformed = None
                 if deform_store is not None and not use_aug:
                     batch_global_idxs = [
@@ -1846,6 +1852,8 @@ def train(
             scaler.update()
             if global_step < warmup_steps:
                 warmup_scheduler.step()
+            else:
+                cosine_scheduler.step()
 
             if pause_server:
                 pause_server.check(_gpu_offload, _gpu_reload)
@@ -1908,7 +1916,7 @@ def train(
 
             if global_step % 100 == 0:
                 _log_vis(log_images, "train", image, pred, targets, cos_mask, global_step,
-                         targets_deformed=targets_deformed)
+                         targets_original=targets_original if targets_deformed is not None else None)
                 aug = batch.get("_aug")
                 if aug and is_main:
                     fz, fy, fx, kk = aug
@@ -1972,8 +1980,6 @@ def train(
                 if is_dist:
                     dist.barrier()
 
-        cosine_scheduler.step()
-
         mean_train = sum(epoch_losses) / max(len(epoch_losses), 1)
         if is_main:
             print(
@@ -1982,6 +1988,28 @@ def train(
                 f"lr={optimizer.param_groups[0]['lr']:.2e}",
                 flush=True,
             )
+
+    # Final checkpoint at end of training
+    if is_main:
+        ckpt_data = {
+            "state_dict": model_core.state_dict(),
+            "norm_type": norm_type,
+            "upsample_mode": upsample_mode,
+            "output_sigmoid": output_sigmoid,
+            "precision": precision,
+            "patch_size": patch_size,
+            "in_channels": 1,
+            "out_channels": 8,
+        }
+        torch.save(ckpt_data, run_dir / "model_current.pt")
+        if last_val_loss < best_val_loss:
+            best_val_loss = last_val_loss
+            torch.save(ckpt_data, run_dir / "model_best.pt")
+        if deform_store is not None:
+            deform_store.flush()
+        print(f"{TAG} saved final checkpoint (val={last_val_loss:.4f})", flush=True)
+    if is_dist:
+        dist.barrier()
 
     if pause_server is not None:
         pause_server.close()
@@ -2010,6 +2038,7 @@ def _evaluate(
     device_type: str = "cuda",
     world_size: int = 1,
     is_main: bool = True,
+    deform_store: "DeformationStore | None" = None,
 ):
     model.eval()
     losses = []
@@ -2098,11 +2127,27 @@ def _evaluate(
 
             # Accumulate up to 4 samples for visualization (rank 0 only).
             if not vis_done and is_main and len(_vis_acc) < 4:
+                # Apply stored deformation for vis (no inner loop)
+                targets_orig_vis = targets
+                targets_vis = targets
+                if deform_store is not None:
+                    batch_gidxs = [pi["global_idx"] for pi in batch["patch_info"]]
+                    d = deform_store.get(batch_gidxs).to(device)
+                    if d.abs().max() > 0:
+                        Z, Y, X = targets.shape[2:]
+                        df = F.interpolate(
+                            d, size=(Z, Y, X),
+                            mode="trilinear", align_corners=False,
+                        )
+                        w_cg, w_v = _apply_warp(targets[:, 0:2], validity, df)
+                        targets_vis = targets.clone()
+                        targets_vis[:, 0:2] = w_cg
                 _vis_acc.append((
                     image.detach().cpu(),
                     pred.detach().cpu(),
-                    targets.detach().cpu(),
+                    targets_vis.detach().cpu(),
                     cos_mask.detach().cpu(),
+                    targets_orig_vis.detach().cpu(),
                 ))
                 if vis_batch_out is not None:
                     vis_batch_out.append(batch)
@@ -2111,6 +2156,7 @@ def _evaluate(
 
     # Log assembled val visualization (up to 4 samples concatenated).
     if _vis_acc and is_main:
+        has_deform = any(a[4] is not a[2] for a in _vis_acc)
         _log_vis(
             log_images, "val",
             torch.cat([a[0] for a in _vis_acc], dim=0).to(device),
@@ -2118,6 +2164,10 @@ def _evaluate(
             torch.cat([a[2] for a in _vis_acc], dim=0).to(device),
             torch.cat([a[3] for a in _vis_acc], dim=0).to(device),
             global_step,
+            targets_original=(
+                torch.cat([a[4] for a in _vis_acc], dim=0).to(device)
+                if has_deform else None
+            ),
         )
 
     # Per-rank means → cross-rank average. Each rank's val shard is
