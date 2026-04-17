@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from vesuvius.neural_tracing.autoreg_mesh.config import load_autoreg_mesh_config
 from vesuvius.neural_tracing.autoreg_mesh.dataset import AutoregMeshDataset, autoreg_mesh_collate
 from vesuvius.neural_tracing.autoreg_mesh.infer import infer_autoreg_mesh
 from vesuvius.neural_tracing.autoreg_mesh.model import AutoregMeshModel
+from vesuvius.neural_tracing.autoreg_mesh.train import run_autoreg_mesh_training
 
 
 def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
@@ -54,6 +56,7 @@ def run_autoreg_mesh_benchmark(
     model: AutoregMeshModel | None = None,
     device: str | torch.device | None = None,
     sample_count: int = 32,
+    training_steps: int = 0,
 ) -> dict:
     cfg = validate_autoreg_mesh_config(config)
     dataset = dataset or AutoregMeshDataset(cfg)
@@ -98,7 +101,7 @@ def run_autoreg_mesh_benchmark(
     forward_ms = _measure_ms(_forward, device=device)
     infer_ms = _measure_ms(_infer, device=device)
 
-    return {
+    result = {
         "device": str(device),
         "dataset_length": int(len(dataset)),
         "sample_count": int(sample_count),
@@ -136,16 +139,59 @@ def run_autoreg_mesh_benchmark(
         "forward_ms": float(forward_ms),
         "infer_ms": float(infer_ms),
     }
+    if int(training_steps) > 0:
+        bench_cfg = dict(cfg)
+        bench_cfg["wandb_project"] = None
+        bench_cfg["val_fraction"] = 0.0
+        bench_cfg["save_final_checkpoint"] = False
+        bench_cfg["ckpt_at_step_zero"] = False
+        bench_cfg["log_frequency"] = max(int(training_steps) + 1, int(cfg.get("log_frequency", 100)))
+        bench_cfg["ckpt_frequency"] = max(int(training_steps) + 1, int(cfg.get("ckpt_frequency", 5000)))
+        with tempfile.TemporaryDirectory(prefix="autoreg_mesh_bench_") as tmpdir:
+            bench_cfg["out_dir"] = tmpdir
+            start = time.perf_counter()
+            train_result = run_autoreg_mesh_training(
+                bench_cfg,
+                dataset=dataset,
+                model=None,
+                device=device,
+                max_steps=int(training_steps),
+            )
+            elapsed_ms = 1000.0 * (time.perf_counter() - start)
+        startup_ms = float(train_result.get("startup_ms", 0.0))
+        measured_train_ms = max(0.0, elapsed_ms - startup_ms)
+        mean_train_step_ms = measured_train_ms / float(max(1, int(training_steps)))
+        world_size = int(train_result.get("world_size", 1))
+        per_rank_batch_size = int(cfg["batch_size"])
+        effective_global_batch_size = int(per_rank_batch_size * world_size)
+        result.update(
+            {
+                "training_steps": int(training_steps),
+                "rank": int(train_result.get("rank", 0)),
+                "world_size": world_size,
+                "per_rank_batch_size": per_rank_batch_size,
+                "effective_global_batch_size": effective_global_batch_size,
+                "startup_ms": startup_ms,
+                "mean_train_step_ms": mean_train_step_ms,
+                "samples_per_sec_effective": (
+                    (effective_global_batch_size * 1000.0 / mean_train_step_ms)
+                    if mean_train_step_ms > 0.0 else 0.0
+                ),
+            }
+        )
+    return result
 
 
 @click.command()
 @click.argument("config_path", type=click.Path(exists=True))
 @click.option("--sample-count", default=32, type=int, show_default=True)
 @click.option("--device", default=None, type=str)
-def benchmark(config_path: str, sample_count: int, device: str | None) -> None:
+@click.option("--training-steps", default=0, type=int, show_default=True)
+def benchmark(config_path: str, sample_count: int, device: str | None, training_steps: int) -> None:
     cfg = load_autoreg_mesh_config(Path(config_path))
-    result = run_autoreg_mesh_benchmark(cfg, sample_count=sample_count, device=device)
-    print(json.dumps(result, indent=2, sort_keys=True))
+    result = run_autoreg_mesh_benchmark(cfg, sample_count=sample_count, device=device, training_steps=training_steps)
+    if int(result.get("world_size", 1)) <= 1 or int(result.get("rank", 0)) == 0:
+        print(json.dumps(result, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

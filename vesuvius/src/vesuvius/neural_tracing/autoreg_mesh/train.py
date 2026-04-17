@@ -1,15 +1,22 @@
 from __future__ import annotations
 
+import functools
 import importlib
 import json
+import os
 import random
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import click
 import numpy as np
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data.distributed import DistributedSampler
 from tqdm import tqdm
 
 from vesuvius.models.training.optimizers import create_optimizer
@@ -31,11 +38,120 @@ from vesuvius.neural_tracing.autoreg_mesh.model import AutoregMeshModel
 from vesuvius.neural_tracing.autoreg_mesh.serialization import deserialize_continuation_grid
 
 
+@dataclass
+class _DistributedRuntime:
+    is_distributed: bool
+    rank: int
+    local_rank: int
+    world_size: int
+    device: torch.device
+    backend: str | None
+    initialized_process_group: bool
+
+    @property
+    def is_main_process(self) -> bool:
+        return int(self.rank) == 0
+
+
 def _seed_everything(seed: int) -> None:
     random.seed(int(seed))
     np.random.seed(int(seed))
     torch.manual_seed(int(seed))
     torch.cuda.manual_seed_all(int(seed))
+
+
+def _initialize_distributed_runtime(device: str | torch.device | None = None) -> _DistributedRuntime:
+    env_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    requested_device = torch.device(device) if device is not None else None
+    if env_world_size <= 1:
+        runtime_device = requested_device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        return _DistributedRuntime(
+            is_distributed=False,
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            device=runtime_device,
+            backend=None,
+            initialized_process_group=False,
+        )
+
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    if requested_device is not None and requested_device.type != "cuda":
+        runtime_device = requested_device
+        backend = "gloo"
+    elif torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        runtime_device = torch.device("cuda", local_rank)
+        backend = "nccl"
+    else:
+        runtime_device = torch.device("cpu")
+        backend = "gloo"
+
+    initialized = False
+    if not dist.is_available():
+        raise RuntimeError("torch.distributed is required when WORLD_SIZE > 1")
+    if not dist.is_initialized():
+        dist.init_process_group(backend=backend, init_method="env://")
+        initialized = True
+    return _DistributedRuntime(
+        is_distributed=True,
+        rank=int(dist.get_rank()),
+        local_rank=int(local_rank),
+        world_size=int(dist.get_world_size()),
+        device=runtime_device,
+        backend=str(backend),
+        initialized_process_group=initialized,
+    )
+
+
+def _unwrap_model(model):
+    return model.module if isinstance(model, DDP) else model
+
+
+def _wrap_model_for_ddp(model: AutoregMeshModel, runtime: _DistributedRuntime):
+    if not runtime.is_distributed:
+        return model
+    ddp_kwargs = {
+        "device_ids": [runtime.local_rank] if runtime.device.type == "cuda" else None,
+        "output_device": runtime.local_rank if runtime.device.type == "cuda" else None,
+        "find_unused_parameters": False,
+        "broadcast_buffers": False,
+    }
+    return DDP(model, **ddp_kwargs)
+
+
+def _seed_worker(worker_id: int, *, base_seed: int, rank: int) -> None:
+    worker_seed = int(base_seed) + (int(rank) * 1000) + int(worker_id)
+    random.seed(worker_seed)
+    np.random.seed(worker_seed % (2**32))
+    torch.manual_seed(worker_seed)
+
+
+def _metric_dict_mean_across_ranks(
+    metrics: dict[str, float],
+    *,
+    device: torch.device,
+    runtime: _DistributedRuntime,
+) -> dict[str, float]:
+    if not runtime.is_distributed or not metrics:
+        return dict(metrics)
+    keys = sorted(metrics.keys())
+    values = torch.tensor([float(metrics[key]) for key in keys], device=device, dtype=torch.float64)
+    dist.all_reduce(values, op=dist.ReduceOp.SUM)
+    values = values / float(runtime.world_size)
+    return {key: float(value.item()) for key, value in zip(keys, values, strict=True)}
+
+
+def _distributed_all_finite(value: float, *, device: torch.device, runtime: _DistributedRuntime) -> bool:
+    finite = torch.tensor(1 if np.isfinite(float(value)) else 0, device=device, dtype=torch.int32)
+    if runtime.is_distributed:
+        dist.all_reduce(finite, op=dist.ReduceOp.MIN)
+    return bool(int(finite.item()) == 1)
+
+
+def _maybe_barrier(runtime: _DistributedRuntime) -> None:
+    if runtime.is_distributed:
+        dist.barrier()
 
 
 def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
@@ -53,10 +169,12 @@ def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
     return moved
 
 
-def _next_batch(iterator, dataloader):
+def _next_batch(iterator, dataloader, *, on_reset=None):
     try:
         batch = next(iterator)
     except StopIteration:
+        if on_reset is not None:
+            on_reset()
         iterator = iter(dataloader)
         batch = next(iterator)
     return batch, iterator
@@ -139,17 +257,21 @@ def _make_dataloader(
     num_workers: int,
     shuffle: bool,
     seed: int,
+    sampler=None,
+    worker_init_fn=None,
 ) -> DataLoader:
     generator = torch.Generator()
     generator.manual_seed(int(seed))
     return DataLoader(
         dataset,
         batch_size=int(batch_size),
-        shuffle=bool(shuffle),
+        shuffle=bool(shuffle and sampler is None),
+        sampler=sampler,
         num_workers=int(num_workers),
         collate_fn=autoreg_mesh_collate,
         persistent_workers=bool(num_workers > 0),
         generator=generator,
+        worker_init_fn=worker_init_fn,
     )
 
 
@@ -213,12 +335,15 @@ def _make_checkpoint_payload(
     config: dict,
     step: int,
 ) -> dict:
+    raw_model = _unwrap_model(model)
     payload = {
-        "model": model.state_dict(),
+        "model": raw_model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "config": config,
         "step": int(step),
         "wandb_run_id": config.get("wandb_run_id"),
+        "distributed_world_size": int(dist.get_world_size()) if dist.is_available() and dist.is_initialized() else 1,
+        "distributed_backend": dist.get_backend() if dist.is_available() and dist.is_initialized() else None,
     }
     if scheduler is not None:
         payload["lr_scheduler"] = scheduler.state_dict()
@@ -931,7 +1056,8 @@ def run_autoreg_mesh_training(
     max_steps: int | None = None,
 ) -> dict:
     cfg = validate_autoreg_mesh_config(config)
-    _seed_everything(int(cfg["seed"]))
+    runtime = _initialize_distributed_runtime(device)
+    _seed_everything(int(cfg["seed"]) + int(runtime.rank))
 
     out_dir = Path(cfg["out_dir"]).expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -944,31 +1070,44 @@ def run_autoreg_mesh_training(
         seed=int(cfg["seed"]),
         val_fraction=float(cfg.get("val_fraction", 0.0)),
     )
+    train_worker_init = functools.partial(_seed_worker, base_seed=int(cfg["seed"]), rank=int(runtime.rank))
+    val_worker_init = functools.partial(_seed_worker, base_seed=int(cfg["seed"]) + 1, rank=0)
+    train_sampler = None
+    if runtime.is_distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=int(runtime.world_size),
+            rank=int(runtime.rank),
+            shuffle=True,
+            drop_last=False,
+            seed=int(cfg["seed"]),
+        )
     train_dataloader = _make_dataloader(
         train_dataset,
         batch_size=int(cfg["batch_size"]),
         num_workers=int(cfg["num_workers"]),
-        shuffle=True,
+        shuffle=not runtime.is_distributed,
         seed=int(cfg["seed"]),
+        sampler=train_sampler,
+        worker_init_fn=train_worker_init,
     )
     val_dataloader = None
-    if val_dataset is not None:
+    if val_dataset is not None and runtime.is_main_process:
         val_dataloader = _make_dataloader(
             val_dataset,
             batch_size=int(cfg["batch_size"]),
             num_workers=int(cfg["val_num_workers"]),
             shuffle=False,
             seed=int(cfg["seed"]) + 1,
+            worker_init_fn=val_worker_init,
         )
 
     if model is None:
         model = AutoregMeshModel(cfg)
+    raw_model = model.to(runtime.device)
+    raw_model.train()
 
-    device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
-    model = model.to(device)
-    model.train()
-
-    optimizer = create_optimizer(dict(cfg["optimizer"]), model)
+    optimizer = create_optimizer(dict(cfg["optimizer"]), raw_model)
     scheduler = None
     scheduler_name = str(cfg.get("scheduler", "constant")).lower()
     total_steps = int(max_steps or cfg["num_steps"])
@@ -991,7 +1130,7 @@ def run_autoreg_mesh_training(
 
     start_step = 0
     if preloaded_ckpt is not None:
-        model.load_state_dict(preloaded_ckpt["model"])
+        raw_model.load_state_dict(preloaded_ckpt["model"])
         if not bool(cfg.get("load_weights_only", False)):
             start_step = int(preloaded_ckpt.get("step", 0))
             if "optimizer" in preloaded_ckpt:
@@ -999,14 +1138,18 @@ def run_autoreg_mesh_training(
             if scheduler is not None and "lr_scheduler" in preloaded_ckpt:
                 scheduler.load_state_dict(preloaded_ckpt["lr_scheduler"])
 
-    wandb = _maybe_import_wandb(cfg)
+    train_model = _wrap_model_for_ddp(raw_model, runtime)
+    wandb = _maybe_import_wandb(cfg) if runtime.is_main_process else None
     wandb_run = None
     saved_checkpoints: list[str] = []
     final_checkpoint_path = None
     history: list[dict[str, float]] = []
+    startup_started = time.perf_counter()
+    progress_bar = None
+    startup_ms = 0.0
 
     try:
-        if wandb is not None:
+        if wandb is not None and runtime.is_main_process:
             wandb_kwargs = {
                 "project": cfg["wandb_project"],
                 "config": cfg,
@@ -1025,26 +1168,41 @@ def run_autoreg_mesh_training(
             if active_run_id is not None:
                 cfg["wandb_run_id"] = str(active_run_id)
 
-        if bool(cfg.get("ckpt_at_step_zero", False)) and start_step == 0:
+        if bool(cfg.get("ckpt_at_step_zero", False)) and start_step == 0 and runtime.is_main_process:
             ckpt_path = _save_checkpoint(
                 out_dir=out_dir,
                 filename="ckpt_000000.pth",
-                model=model,
+                model=raw_model,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 config=cfg,
                 step=0,
             )
             saved_checkpoints.append(str(ckpt_path))
+        if runtime.is_distributed:
+            _maybe_barrier(runtime)
 
+        train_sampler_epoch = 0
+        if train_sampler is not None:
+            train_sampler.set_epoch(train_sampler_epoch)
+        def _on_train_iterator_reset():
+            nonlocal train_sampler_epoch
+            if train_sampler is not None:
+                train_sampler_epoch += 1
+                train_sampler.set_epoch(train_sampler_epoch)
         train_iterator = iter(train_dataloader)
         val_iterator = iter(val_dataloader) if val_dataloader is not None else None
         global_step = int(start_step)
-        progress_bar = tqdm(total=max(0, total_steps - global_step), desc="autoreg_mesh", leave=False)
+        progress_bar = tqdm(total=max(0, total_steps - global_step), desc="autoreg_mesh", leave=False) if runtime.is_main_process else None
+        startup_ms = 1000.0 * (time.perf_counter() - startup_started)
 
         while global_step < total_steps:
-            raw_batch, train_iterator = _next_batch(train_iterator, train_dataloader)
-            batch = _move_batch_to_device(raw_batch, device)
+            raw_batch, train_iterator = _next_batch(
+                train_iterator,
+                train_dataloader,
+                on_reset=_on_train_iterator_reset if train_sampler is not None else None,
+            )
+            batch = _move_batch_to_device(raw_batch, runtime.device)
 
             optimizer.zero_grad(set_to_none=True)
             scheduled_sampling_prob = _scheduled_sampling_prob(cfg, global_step=global_step)
@@ -1057,7 +1215,7 @@ def run_autoreg_mesh_training(
             geometry_metric_weight_active = _geometry_metric_weight_active(cfg, global_step=global_step)
             geometry_sd_weight_active = _geometry_sd_weight_active(cfg, global_step=global_step)
             offset_feedback_enabled, refine_feedback_enabled = _scheduled_sampling_feedback_state(cfg, global_step=global_step)
-            outputs = model(
+            outputs = train_model(
                 batch,
                 scheduled_sampling_prob=scheduled_sampling_prob,
                 scheduled_sampling_pattern=str(cfg.get("scheduled_sampling_pattern", "stripwise_full_strip_greedy")),
@@ -1093,10 +1251,10 @@ def run_autoreg_mesh_training(
                 raise RuntimeError(f"Encountered non-finite training loss at step {global_step}: {loss.item()}")
 
             loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float(cfg["grad_clip"]))
+            grad_norm = torch.nn.utils.clip_grad_norm_(train_model.parameters(), max_norm=float(cfg["grad_clip"]))
             grad_norm_value = float(grad_norm.detach().item() if torch.is_tensor(grad_norm) else grad_norm)
             skipped_step = 0.0
-            if np.isfinite(grad_norm_value):
+            if _distributed_all_finite(grad_norm_value, device=runtime.device, runtime=runtime):
                 optimizer.step()
                 if scheduler is not None:
                     scheduler.step()
@@ -1120,50 +1278,52 @@ def run_autoreg_mesh_training(
             metrics.update(_mean_batch_sample_metrics(batch, prefix="train_"))
             if skipped_step > 0.0:
                 metrics["skipped_step_nonfinite_grad"] = skipped_step
+            metrics = _metric_dict_mean_across_ranks(metrics, device=runtime.device, runtime=runtime)
 
-            should_run_validation = (
-                val_dataloader is not None and
+            should_run_validation_step = (
+                val_dataset is not None and
                 global_step % int(cfg["log_frequency"]) == 0
             )
+            should_run_validation = runtime.is_main_process and val_dataloader is not None and should_run_validation_step
             if should_run_validation:
                 val_metrics, val_iterator = _evaluate_validation(
-                    model=model,
+                    model=raw_model,
                     dataloader=val_dataloader,
                     iterator=val_iterator,
                     cfg=cfg,
-                    device=device,
+                    device=runtime.device,
                     global_step=global_step,
                 )
                 metrics.update(val_metrics)
                 metrics.update(
                     _evaluate_rollout_validation(
-                        model=model,
+                        model=raw_model,
                         dataset=val_dataset,
                         cfg=cfg,
                     )
                 )
 
             wandb_payload = dict(metrics)
-            should_log_projection_images = (
-                wandb is not None and
+            should_log_projection_images_step = (
                 bool(cfg.get("wandb_log_images", True)) and
                 global_step % int(cfg["wandb_image_frequency"]) == 0
             )
-            should_log_xy_images = (
-                wandb is not None and
+            should_log_xy_images_step = (
                 bool(cfg.get("wandb_log_images", True)) and
                 bool(cfg.get("wandb_log_xy_slice_images", True)) and
                 global_step % int(cfg["wandb_xy_slice_image_frequency"]) == 0
             )
+            should_log_projection_images = runtime.is_main_process and wandb is not None and should_log_projection_images_step
+            should_log_xy_images = runtime.is_main_process and wandb is not None and should_log_xy_images_step
             if should_log_projection_images or should_log_xy_images:
                 raw_val_sample = None
                 val_infer = None
                 need_val_visual = val_dataset is not None and len(val_dataset) > 0
                 if need_val_visual:
                     raw_val_sample = val_dataset[0]
-                    model.eval()
-                    val_infer = infer_autoreg_mesh(model, raw_val_sample, greedy=True)
-                    model.train()
+                    raw_model.eval()
+                    val_infer = infer_autoreg_mesh(raw_model, raw_val_sample, greedy=True)
+                    raw_model.train()
 
             if should_log_projection_images:
                 train_projection_image = wandb.Image(
@@ -1201,32 +1361,44 @@ def run_autoreg_mesh_training(
                         caption=f"step={global_step} val xy slice",
                     )
 
-            history.append(dict(metrics))
-            if wandb is not None:
+            if runtime.is_main_process:
+                history.append(dict(metrics))
+            if wandb is not None and runtime.is_main_process:
                 wandb.log(wandb_payload, step=global_step)
 
-            progress_bar.set_postfix({"loss": f"{metrics['loss']:.4f}"})
-            progress_bar.update(1)
+            if progress_bar is not None:
+                progress_bar.set_postfix({"loss": f"{metrics['loss']:.4f}"})
+                progress_bar.update(1)
 
-            if global_step % int(cfg["ckpt_frequency"]) == 0:
+            should_write_checkpoint_step = (global_step % int(cfg["ckpt_frequency"]) == 0)
+            should_write_checkpoint = runtime.is_main_process and should_write_checkpoint_step
+            if should_write_checkpoint:
                 ckpt_path = _save_checkpoint(
                     out_dir=out_dir,
                     filename=f"ckpt_{global_step:06}.pth",
-                    model=model,
+                    model=raw_model,
                     optimizer=optimizer,
                     scheduler=scheduler,
                     config=cfg,
                     step=global_step,
                 )
                 saved_checkpoints.append(str(ckpt_path))
+            if runtime.is_distributed and (
+                should_run_validation_step or
+                should_log_projection_images_step or
+                should_log_xy_images_step or
+                should_write_checkpoint_step
+            ):
+                _maybe_barrier(runtime)
 
-        progress_bar.close()
+        if progress_bar is not None:
+            progress_bar.close()
 
-        if bool(cfg.get("save_final_checkpoint", True)):
+        if bool(cfg.get("save_final_checkpoint", True)) and runtime.is_main_process:
             final_ckpt = _save_checkpoint(
                 out_dir=out_dir,
                 filename="final.pth",
-                model=model,
+                model=raw_model,
                 optimizer=optimizer,
                 scheduler=scheduler,
                 config=cfg,
@@ -1236,19 +1408,29 @@ def run_autoreg_mesh_training(
             saved_checkpoints.append(final_checkpoint_path)
 
         return {
-            "model": model,
+            "model": raw_model,
             "optimizer": optimizer,
-            "history": history,
-            "final_metrics": history[-1] if history else {},
+            "history": history if runtime.is_main_process else [],
+            "final_metrics": history[-1] if history and runtime.is_main_process else {},
             "start_step": start_step,
             "wandb_run_id": cfg.get("wandb_run_id"),
-            "checkpoint_paths": saved_checkpoints,
-            "final_checkpoint_path": final_checkpoint_path,
+            "checkpoint_paths": saved_checkpoints if runtime.is_main_process else [],
+            "final_checkpoint_path": final_checkpoint_path if runtime.is_main_process else None,
             "out_dir": str(out_dir),
+            "is_main_process": runtime.is_main_process,
+            "rank": int(runtime.rank),
+            "world_size": int(runtime.world_size),
+            "device": str(runtime.device),
+            "startup_ms": float(startup_ms),
         }
     finally:
-        if wandb is not None:
+        if progress_bar is not None:
+            progress_bar.close()
+        if wandb is not None and runtime.is_main_process:
             wandb.finish()
+        if runtime.is_distributed and dist.is_available() and dist.is_initialized():
+            if runtime.initialized_process_group:
+                dist.destroy_process_group()
 
 
 @click.command()
@@ -1256,7 +1438,8 @@ def run_autoreg_mesh_training(
 def train(config_path: str) -> None:
     cfg = load_autoreg_mesh_config(Path(config_path))
     result = run_autoreg_mesh_training(cfg)
-    print(json.dumps(result["final_metrics"], indent=2, sort_keys=True))
+    if bool(result.get("is_main_process", True)):
+        print(json.dumps(result["final_metrics"], indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":

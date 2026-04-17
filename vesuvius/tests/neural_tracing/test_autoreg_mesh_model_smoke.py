@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
+import os
+import socket
 import sys
 from pathlib import Path
 
 import numpy as np
 import pytest
 import torch
+import torch.multiprocessing as mp
 import tifffile
 from torch.utils.data import Dataset
 
@@ -41,7 +45,10 @@ from vesuvius.neural_tracing.autoreg_mesh.train import (
     _edge_segment_on_z_slice,
     _geometry_metric_weight_active,
     _geometry_sd_weight_active,
+    _initialize_distributed_runtime,
     _make_xy_slice_overlay_canvas,
+    _metric_dict_mean_across_ranks,
+    _next_batch,
     _rasterize_grid_on_xy_slice,
     _restrict_dataset_samples,
     _scheduled_sampling_feedback_state,
@@ -381,6 +388,107 @@ class _FakeWandbModule:
 
     def Image(self, data, caption=None):
         return _FakeWandbImage(data, caption=caption)
+
+
+class _RecordingWandbModule:
+    def __init__(self, rank: int, log_path: Path) -> None:
+        self.rank = int(rank)
+        self.log_path = Path(log_path)
+        self.run = None
+        self._log = {"init_calls": 0, "log_calls": 0, "finish_calls": 0}
+
+    def init(self, **kwargs):
+        self._log["init_calls"] += 1
+        self._log["init_kwargs"] = dict(kwargs)
+        self.run = type("_Run", (), {"id": f"rank-{self.rank}"})()
+        self.log_path.write_text(json.dumps(self._log))
+        return self.run
+
+    def log(self, data, step=None):
+        self._log["log_calls"] += 1
+        self._log["last_step"] = step
+        self.log_path.write_text(json.dumps(self._log))
+
+    def finish(self):
+        self._log["finish_calls"] += 1
+        self.run = None
+        self.log_path.write_text(json.dumps(self._log))
+
+    def Image(self, data, caption=None):
+        return _FakeWandbImage(data, caption=caption)
+
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _ddp_env(rank: int, world_size: int, port: int) -> dict[str, str]:
+    return {
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": str(int(port)),
+        "WORLD_SIZE": str(int(world_size)),
+        "RANK": str(int(rank)),
+        "LOCAL_RANK": str(int(rank)),
+    }
+
+
+def _ddp_training_worker(rank: int, world_size: int, port: int, tmpdir: str) -> None:
+    old_env = {key: os.environ.get(key) for key in ("MASTER_ADDR", "MASTER_PORT", "WORLD_SIZE", "RANK", "LOCAL_RANK")}
+    os.environ.update(_ddp_env(rank, world_size, port))
+    try:
+        config = _make_cached_token_config()
+        config.update(
+            {
+                "out_dir": str(Path(tmpdir) / "ddp_train"),
+                "wandb_project": "mesh-ddp",
+                "wandb_log_images": False,
+                "save_final_checkpoint": False,
+                "ckpt_frequency": 1,
+                "val_fraction": 0.5,
+                "log_frequency": 1,
+            }
+        )
+        sys.modules["wandb"] = _RecordingWandbModule(rank, Path(tmpdir) / f"wandb_rank{rank}.json")
+        result = run_autoreg_mesh_training(config, dataset=_make_training_dataset(), device="cpu", max_steps=1)
+        summary = {
+            "rank": int(result["rank"]),
+            "world_size": int(result["world_size"]),
+            "is_main_process": bool(result["is_main_process"]),
+            "history_len": int(len(result["history"])),
+            "checkpoint_paths": list(result["checkpoint_paths"]),
+            "startup_ms": float(result["startup_ms"]),
+        }
+        (Path(tmpdir) / f"rank{rank}.json").write_text(json.dumps(summary))
+    finally:
+        sys.modules.pop("wandb", None)
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def _ddp_benchmark_worker(rank: int, world_size: int, port: int, tmpdir: str) -> None:
+    old_env = {key: os.environ.get(key) for key in ("MASTER_ADDR", "MASTER_PORT", "WORLD_SIZE", "RANK", "LOCAL_RANK")}
+    os.environ.update(_ddp_env(rank, world_size, port))
+    try:
+        result = run_autoreg_mesh_benchmark(
+            _make_cached_token_config(),
+            dataset=_make_training_dataset(),
+            model=AutoregMeshModel(_make_cached_token_config()).eval(),
+            device="cpu",
+            sample_count=1,
+            training_steps=1,
+        )
+        (Path(tmpdir) / f"bench_rank{rank}.json").write_text(json.dumps(result))
+    finally:
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def _make_training_dataset() -> _ListDataset:
@@ -1907,6 +2015,45 @@ def test_scheduled_sampling_feedback_state_tracks_offset_and_refine_steps() -> N
     assert _scheduled_sampling_feedback_state(config, global_step=5) == (True, True)
 
 
+def test_distributed_runtime_defaults_to_single_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in ("WORLD_SIZE", "RANK", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"):
+        monkeypatch.delenv(key, raising=False)
+
+    runtime = _initialize_distributed_runtime(device="cpu")
+
+    assert runtime.is_distributed is False
+    assert runtime.rank == 0
+    assert runtime.world_size == 1
+    assert runtime.is_main_process is True
+    assert str(runtime.device) == "cpu"
+
+
+def test_metric_dict_mean_across_ranks_is_noop_single_process() -> None:
+    runtime = _initialize_distributed_runtime(device="cpu")
+    metrics = {"loss": 1.25, "grad_norm": 3.5}
+
+    reduced = _metric_dict_mean_across_ranks(metrics, device=torch.device("cpu"), runtime=runtime)
+
+    assert reduced == metrics
+
+
+def test_next_batch_calls_reset_callback_when_iterator_recycles() -> None:
+    dataloader = torch.utils.data.DataLoader([1], batch_size=1, shuffle=False)
+    iterator = iter(dataloader)
+    calls = {"count": 0}
+
+    _ = next(iterator)
+    batch, iterator = _next_batch(
+        iterator,
+        dataloader,
+        on_reset=lambda: calls.__setitem__("count", calls["count"] + 1),
+    )
+
+    assert calls["count"] == 1
+    assert list(batch.numpy()) == [1]
+    assert iterator is not None
+
+
 def test_scheduled_sampling_enabled_smoke_train_runs(tmp_path: Path) -> None:
     config = _make_cached_token_config()
     config["out_dir"] = str(tmp_path / "runs_sched")
@@ -2316,6 +2463,42 @@ def test_rope_config_validation_rejects_invalid_values() -> None:
         validate_autoreg_mesh_config(bad_constraint_fallback)
 
 
+def test_autoreg_mesh_ddp_cpu_smoke_writes_checkpoints_on_rank_zero_only(tmp_path: Path) -> None:
+    port = _find_free_port()
+    mp.spawn(_ddp_training_worker, args=(2, port, str(tmp_path)), nprocs=2, join=True)
+
+    rank0 = json.loads((tmp_path / "rank0.json").read_text())
+    rank1 = json.loads((tmp_path / "rank1.json").read_text())
+
+    assert rank0["world_size"] == 2
+    assert rank1["world_size"] == 2
+    assert rank0["is_main_process"] is True
+    assert rank1["is_main_process"] is False
+    assert rank0["history_len"] == 1
+    assert rank1["history_len"] == 0
+    assert len(rank0["checkpoint_paths"]) == 1
+    assert rank1["checkpoint_paths"] == []
+    ckpt_path = Path(rank0["checkpoint_paths"][0])
+    assert ckpt_path.exists()
+
+    wandb_rank0 = json.loads((tmp_path / "wandb_rank0.json").read_text())
+    assert wandb_rank0["init_calls"] == 1
+    assert wandb_rank0["log_calls"] >= 1
+    assert wandb_rank0["finish_calls"] == 1
+    assert not (tmp_path / "wandb_rank1.json").exists()
+
+    resume_config = _make_cached_token_config()
+    resume_config.update(
+        {
+            "out_dir": str(tmp_path / "resume_single"),
+            "load_ckpt": str(ckpt_path),
+            "save_final_checkpoint": False,
+        }
+    )
+    resume_result = run_autoreg_mesh_training(resume_config, dataset=_make_training_dataset(), device="cpu", max_steps=2)
+    assert resume_result["start_step"] == 1
+
+
 def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     config = _make_cached_token_config()
     dataset = _make_training_dataset()
@@ -2359,6 +2542,41 @@ def test_autoreg_mesh_benchmark_smoke_returns_expected_keys() -> None:
     assert result["rope_rescale_coords"] == pytest.approx(2.0)
     assert result["forward_ms"] >= 0.0
     assert result["infer_ms"] >= 0.0
+
+
+def test_autoreg_mesh_training_microbenchmark_smoke_returns_expected_keys() -> None:
+    config = _make_cached_token_config()
+    dataset = _make_training_dataset()
+
+    result = run_autoreg_mesh_benchmark(
+        config,
+        dataset=dataset,
+        device="cpu",
+        sample_count=1,
+        training_steps=1,
+    )
+
+    assert result["training_steps"] == 1
+    assert result["world_size"] == 1
+    assert result["per_rank_batch_size"] == int(config["batch_size"])
+    assert result["effective_global_batch_size"] == int(config["batch_size"])
+    assert result["startup_ms"] >= 0.0
+    assert result["mean_train_step_ms"] >= 0.0
+    assert result["samples_per_sec_effective"] >= 0.0
+
+
+def test_autoreg_mesh_ddp_cpu_benchmark_smoke(tmp_path: Path) -> None:
+    port = _find_free_port()
+    mp.spawn(_ddp_benchmark_worker, args=(2, port, str(tmp_path)), nprocs=2, join=True)
+
+    rank0 = json.loads((tmp_path / "bench_rank0.json").read_text())
+    rank1 = json.loads((tmp_path / "bench_rank1.json").read_text())
+
+    assert rank0["world_size"] == 2
+    assert rank1["world_size"] == 2
+    assert rank0["training_steps"] == 1
+    assert rank0["mean_train_step_ms"] >= 0.0
+    assert rank0["samples_per_sec_effective"] >= 0.0
 
 
 def test_debias_benchmark_reports_settings_and_norm_ratio(tmp_path: Path) -> None:
