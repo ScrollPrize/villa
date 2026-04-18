@@ -684,6 +684,10 @@ def append_extension_to_grid(
     )
 
 
+def demote_previous_seam(provenance: np.ndarray) -> None:
+    provenance[provenance == 2] = 1
+
+
 def _current_frontier_length(grid_zyx: np.ndarray, direction: str) -> int:
     return int(grid_zyx.shape[0]) if direction in {"left", "right"} else int(grid_zyx.shape[1])
 
@@ -914,14 +918,16 @@ def extend_tifxyz_mesh(
     total_windows = 0
     total_fitted_windows = 0
     total_skipped_windows = 0
+    stop_reason = "max_extension_iters"
 
     for iteration_idx in range(int(max_extension_iters)):
         iteration_started = perf_counter()
         if iteration_idx > 0:
-            working_provenance[working_provenance == 2] = 1
+            demote_previous_seam(working_provenance)
         frontier_length = _current_frontier_length(working_grid, direction)
         windows = _window_ranges(frontier_length, int(window_strip_length), int(window_overlap))
         if not windows:
+            stop_reason = "no_windows"
             break
         max_predict_strips_seen = 0
         crop_read_ms = 0.0
@@ -986,6 +992,7 @@ def extend_tifxyz_mesh(
                 )
             )
         if not payloads:
+            stop_reason = "all_windows_crop_fit_failed"
             break
         fitted_window_count = len(payloads)
         skipped_window_count = len(windows) - fitted_window_count
@@ -1024,6 +1031,7 @@ def extend_tifxyz_mesh(
         )
         valid_new_vertices = int(np.isfinite(extension_grid).all(axis=-1).sum())
         if valid_new_vertices <= 0:
+            stop_reason = "zero_growth_iteration"
             break
         working_grid, working_provenance = append_extension_to_grid(
             working_grid=working_grid,
@@ -1054,6 +1062,9 @@ def extend_tifxyz_mesh(
         total_fitted_windows += fitted_window_count
         total_skipped_windows += skipped_window_count
 
+    final_predicted_nonseam_vertex_count = int((working_provenance == 1).sum())
+    final_seam_vertex_count = int((working_provenance == 2).sum())
+
     vertices, faces, colors = grid_to_colored_mesh(working_grid, working_provenance)
     mesh_path = write_colored_ply(out_path / f"{surface_uuid}_merged.ply", vertices, faces, colors)
     preview_paths = _save_projection_images(working_grid, working_provenance, out_path)
@@ -1074,6 +1085,8 @@ def extend_tifxyz_mesh(
         "final_vertex_count": int(np.isfinite(working_grid).all(axis=-1).sum()),
         "predicted_vertex_count": int(np.isfinite(working_grid).all(axis=-1).sum() - np.isfinite(grid_zyx).all(axis=-1).sum()),
         "cumulative_predicted_vertex_count": int(np.isfinite(working_grid).all(axis=-1).sum() - np.isfinite(grid_zyx).all(axis=-1).sum()),
+        "final_predicted_nonseam_vertex_count": final_predicted_nonseam_vertex_count,
+        "final_seam_vertex_count": final_seam_vertex_count,
         "mesh_path": str(mesh_path),
         "preview_paths": preview_paths,
         "tifxyz_path": str(tifxyz_path_out),
@@ -1084,6 +1097,8 @@ def extend_tifxyz_mesh(
         "total_windows": int(total_windows),
         "total_fitted_windows": int(total_fitted_windows),
         "total_skipped_windows": int(total_skipped_windows),
+        "iterations_completed": int(len(iteration_stats)),
+        "stop_reason": stop_reason,
         "windows_per_second_overall": (
             float(total_fitted_windows) * 1000.0 / max(1e-6, 1000.0 * (perf_counter() - total_started))
         ),

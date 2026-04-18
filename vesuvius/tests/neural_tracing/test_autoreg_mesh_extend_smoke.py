@@ -18,6 +18,7 @@ from vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz import (
     build_extension_sample,
     choose_source_tifxyz,
     choose_growth_direction,
+    demote_previous_seam,
     extend_tifxyz_mesh,
     finalize_iteration_extension,
     grid_to_colored_mesh,
@@ -104,6 +105,12 @@ def test_merge_window_prediction_averages_overlaps() -> None:
     assert np.allclose(extension, 2.0)
     assert np.all(provenance[:, 0] == 2)
     assert np.all(provenance[:, 1] == 1)
+
+
+def test_demote_previous_seam_converts_old_seam_to_predicted() -> None:
+    provenance = np.array([[0, 2, 1], [2, 2, 0]], dtype=np.uint8)
+    demote_previous_seam(provenance)
+    assert np.array_equal(provenance, np.array([[0, 1, 1], [1, 1, 0]], dtype=np.uint8))
 
 
 def test_build_extension_sample_has_required_fields() -> None:
@@ -269,6 +276,7 @@ def test_two_iteration_rollout_appends_geometry_twice(tmp_path: Path, monkeypatc
         autoreg_checkpoint="ckpt",
         out_dir=tmp_path,
         device="cpu",
+        grow_direction="left",
         prompt_strips=3,
         predict_strips_per_iter=2,
         window_strip_length=4,
@@ -282,6 +290,63 @@ def test_two_iteration_rollout_appends_geometry_twice(tmp_path: Path, monkeypatc
     assert result["iteration_stats"][1]["valid_new_vertices"] > 0
     assert result["cumulative_predicted_vertex_count"] > result["iteration_stats"][0]["valid_new_vertices"]
     assert result["iteration_stats"][1]["peak_batch_size_used"] == 2
+    assert result["final_predicted_nonseam_vertex_count"] > 0
+    assert result["final_seam_vertex_count"] > 0
+    assert result["final_predicted_nonseam_vertex_count"] > result["final_seam_vertex_count"]
+    assert result["iterations_completed"] == 2
+    assert result["stop_reason"] == "max_extension_iters"
+
+
+def test_zero_growth_iteration_stops_cleanly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = _make_surface(8, 10)
+    volume = np.zeros((256, 256, 256), dtype=np.float32)
+
+    def _fake_read_tifxyz(path, load_mask=True, validate=True):
+        del path, load_mask, validate
+        return surface
+
+    def _fake_open_volume(uri):
+        del uri
+        return volume
+
+    def _fake_load_model(*, dino_backbone, autoreg_checkpoint, device):
+        del dino_backbone, autoreg_checkpoint, device
+        return _FakeBatchModel(), {"patch_size": [8, 8, 8], "offset_num_bins": [4, 4, 4], "frontier_band_width": 4}
+
+    call_counter = {"count": 0}
+
+    def _fake_batched(*args, **kwargs):
+        del args, kwargs
+        call_counter["count"] += 1
+        if call_counter["count"] == 1:
+            grid = np.ones((4, 2, 3), dtype=np.float32)
+            return [{"window": SimpleNamespace(start=0, end=4), "continuation_grid_world": grid, "predicted_vertex_count": 8, "stop_count": 0}], 0.0, 1
+        empty = np.full((4, 2, 3), np.nan, dtype=np.float32)
+        return [{"window": SimpleNamespace(start=0, end=4), "continuation_grid_world": empty, "predicted_vertex_count": 0, "stop_count": 0}], 0.0, 1
+
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz.read_tifxyz", _fake_read_tifxyz)
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz._open_zarr_volume", _fake_open_volume)
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz._load_autoreg_model", _fake_load_model)
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz.infer_extension_windows_batched", _fake_batched)
+
+    result = extend_tifxyz_mesh(
+        tifxyz_path="dummy",
+        volume_uri="s3://dummy",
+        dino_backbone="backbone",
+        autoreg_checkpoint="ckpt",
+        out_dir=tmp_path,
+        device="cpu",
+        grow_direction="left",
+        prompt_strips=3,
+        predict_strips_per_iter=2,
+        window_strip_length=4,
+        window_overlap=2,
+        window_batch_size=2,
+        max_extension_iters=3,
+    )
+
+    assert result["iterations_completed"] == 1
+    assert result["stop_reason"] == "zero_growth_iteration"
 
 
 def test_surface_grid_conversion_marks_invalid_as_nan() -> None:
