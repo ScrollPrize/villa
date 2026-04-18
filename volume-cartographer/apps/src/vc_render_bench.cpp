@@ -47,7 +47,8 @@ static double renderPlaneTile(
     int tileW, int tileH,
     int level)
 {
-    cv::Mat_<uint8_t> gray;
+    cv::Mat_<uint8_t> gray(tileH, tileW);
+    gray.setTo(0);
     vc::SampleParams sp;
     sp.level = level;
     sp.method = (level >= 3) ? vc::Sampling::Nearest : vc::Sampling::Trilinear;
@@ -73,7 +74,8 @@ static double renderCoordTile(
               cv::Vec3f(0, 0, 0), scale,
               {surfX * scale, surfY * scale, zOff});
 
-    cv::Mat_<uint8_t> gray;
+    cv::Mat_<uint8_t> gray(tileH, tileW);
+    gray.setTo(0);
     vc::SampleParams sp;
     sp.level = level;
     sp.method = (level >= 3) ? vc::Sampling::Nearest : vc::Sampling::Trilinear;
