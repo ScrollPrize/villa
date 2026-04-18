@@ -25,6 +25,7 @@
 #include <cstring>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -149,7 +150,9 @@ static bool isRemoteUrl(const std::string& path) {
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: vc_render_bench <volume_path_or_url> [--tile-size N] [--io-threads N] [--hot-gb N]\n");
+        fprintf(stderr, "Usage: vc_render_bench <volume_path_or_url> "
+                        "[--tile-size N] [--io-threads N] [--hot-gb N] "
+                        "[--warmup-block N]\n");
         return 1;
     }
 
@@ -157,6 +160,12 @@ int main(int argc, char** argv)
     int tileSize = 256;
     int ioThreads = 8;
     int hotGb = 8;
+    // --warmup-block: before the timed tests run, keep issuing warmup
+    // tiles while BlockPipeline has pending IO, then block until the
+    // pipeline drains.  Needed for codecs like c3d where the encode
+    // pool takes far longer than the bench's default 100-tile warmup.
+    // 0 disables (default preserves legacy behaviour).
+    int warmupBlockSec = 0;
 
     for (int i = 2; i < argc; i++) {
         if (strcmp(argv[i], "--tile-size") == 0 && i + 1 < argc)
@@ -165,6 +174,8 @@ int main(int argc, char** argv)
             ioThreads = atoi(argv[++i]);
         else if (strcmp(argv[i], "--hot-gb") == 0 && i + 1 < argc)
             hotGb = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--warmup-block") == 0 && i + 1 < argc)
+            warmupBlockSec = atoi(argv[++i]);
         else {
             fprintf(stderr, "Unknown option: %s\n", argv[i]);
             return 1;
@@ -236,6 +247,53 @@ int main(int argc, char** argv)
             renderPlaneTile(vol.get(), tileOrigin, vxStep, vyStep, tileW, tileH, 0);
         }
         printf("  Done.\n\n");
+    }
+
+    // ==== Blocking warmup: drain BlockPipeline IO before timed tests ====
+    //
+    // samplePlaneBestEffort is non-blocking — the 100-tile warmup above
+    // issues fetches and returns.  With c3d's slower encode pool, the
+    // main thread finishes those 100 tiles while hundreds of chunks are
+    // still mid-pipeline.  If the timed tests then run immediately, every
+    // sample returns 0 and the numbers mean nothing.  --warmup-block N
+    // keeps issuing tiles + sleeping for up to N seconds until
+    // stats.ioPending drops to 0.
+    if (warmupBlockSec > 0) {
+        printf("Blocking warmup: waiting for pipeline drain (up to %ds)...\n",
+               warmupBlockSec);
+        auto* bp = vol->tieredCache();
+        auto [origin, vxStep, vyStep] = makePlaneParams(0, 0, 0, 1.0f);
+        auto tStart = Clock::now();
+        int lastPending = -1;
+        size_t bytesAtStart = bp ? bp->stats().diskBytes : 0;
+        while (true) {
+            auto elapsed = std::chrono::duration<double>(Clock::now() - tStart).count();
+            if (elapsed >= warmupBlockSec) break;
+            if (!bp) break;
+            auto s = bp->stats();
+            if (s.ioPending == 0) break;
+            if (int(s.ioPending) != lastPending) {
+                printf("  pending IO: %zu  disk: %.1f MB\n",
+                       s.ioPending, double(s.diskBytes) / (1024.0 * 1024.0));
+                lastPending = int(s.ioPending);
+            }
+            // Re-issue tiles so new chunk requests keep the pipeline fed.
+            for (int i = 0; i < 25; i++) {
+                float offX = (float)((i % 5) - 2) * tileW;
+                float offY = (float)((i / 5) - 2) * tileH;
+                cv::Vec3f tileOrigin = origin + vxStep * offX + vyStep * offY;
+                renderPlaneTile(vol.get(), tileOrigin, vxStep, vyStep, tileW, tileH, 0);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        }
+        if (bp) {
+            auto s = bp->stats();
+            size_t grew = s.diskBytes >= bytesAtStart
+                ? s.diskBytes - bytesAtStart : 0;
+            printf("  Drained. Pending: %zu, disk +%.1f MB (now %.1f MB)\n\n",
+                   s.ioPending, double(grew) / (1024.0 * 1024.0),
+                   double(s.diskBytes) / (1024.0 * 1024.0));
+        }
     }
 
     // ==== Test 1: 100 tiles at zoom level 0 (full res) ====
