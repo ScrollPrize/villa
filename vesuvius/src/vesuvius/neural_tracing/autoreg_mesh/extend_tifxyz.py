@@ -66,6 +66,15 @@ class ExtensionWindowPayload:
     predict_strips: int
 
 
+@dataclass(frozen=True)
+class FittedWindowPlan:
+    window: ExtensionWindow
+    prompt_grid: np.ndarray
+    min_corner: np.ndarray
+    prompt_strips: int
+    predict_strips: int
+
+
 class VolumeCropCache:
     def __init__(self, max_items: int = 8) -> None:
         self.max_items = max(1, int(max_items))
@@ -302,6 +311,21 @@ def choose_source_tifxyz(root: str | Path, *, prompt_strips: int, predict_strips
     return best_path
 
 
+def _parse_int_list(value: str | None) -> list[int]:
+    if value is None or str(value).strip() == "":
+        return []
+    values = []
+    for part in str(value).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        parsed = int(part)
+        if parsed <= 0:
+            raise ValueError("batch sizes must be positive")
+        values.append(parsed)
+    return values
+
+
 def _extract_prompt_window(grid_zyx: np.ndarray, direction: str, *, prompt_strips: int, window: ExtensionWindow) -> np.ndarray:
     if direction == "left":
         return grid_zyx[window.start:window.end, -int(prompt_strips):, :]
@@ -316,6 +340,51 @@ def _dummy_target_grid(prompt_grid: np.ndarray, direction: str, predict_strips: 
     if direction in {"left", "right"}:
         return np.full((prompt_grid.shape[0], int(predict_strips), 3), np.nan, dtype=np.float32)
     return np.full((int(predict_strips), prompt_grid.shape[1], 3), np.nan, dtype=np.float32)
+
+
+def _fit_window_for_crop(
+    grid_zyx: np.ndarray,
+    *,
+    direction: str,
+    window: ExtensionWindow,
+    prompt_strips: int,
+    predict_strips: int,
+    crop_size: tuple[int, int, int],
+    max_crop_fit_retries: int,
+    min_window_strip_length: int = 4,
+) -> FittedWindowPlan | None:
+    local_prompt_strips = int(prompt_strips)
+    local_predict_strips = int(predict_strips)
+    local_window = ExtensionWindow(int(window.start), int(window.end))
+    min_window_strip_length = max(1, min(int(min_window_strip_length), local_window.end - local_window.start))
+    prompt_grid = _extract_prompt_window(grid_zyx, direction, prompt_strips=local_prompt_strips, window=local_window)
+    for _retry in range(max(1, int(max_crop_fit_retries) * 8)):
+        predicted_envelope = _estimate_extension_points(prompt_grid, direction, local_predict_strips)
+        crop_points = np.concatenate([prompt_grid.reshape(-1, 3), predicted_envelope.reshape(-1, 3)], axis=0)
+        min_corner = _crop_min_corner_for_points(crop_points, crop_size)
+        if min_corner is not None:
+            return FittedWindowPlan(
+                window=local_window,
+                prompt_grid=prompt_grid,
+                min_corner=np.asarray(min_corner, dtype=np.int64),
+                prompt_strips=local_prompt_strips,
+                predict_strips=local_predict_strips,
+            )
+        window_len = local_window.end - local_window.start
+        if window_len > min_window_strip_length:
+            shorter = max(min_window_strip_length, window_len - 8)
+            local_window = ExtensionWindow(local_window.start, local_window.start + shorter)
+            prompt_grid = _extract_prompt_window(grid_zyx, direction, prompt_strips=local_prompt_strips, window=local_window)
+            continue
+        if local_prompt_strips > 2:
+            local_prompt_strips -= 1
+            prompt_grid = _extract_prompt_window(grid_zyx, direction, prompt_strips=local_prompt_strips, window=local_window)
+            continue
+        if local_predict_strips > 1:
+            local_predict_strips -= 1
+            continue
+        break
+    return None
 
 
 def build_extension_sample(
@@ -934,61 +1003,45 @@ def extend_tifxyz_mesh(
         crop_fit_failed_count = 0
         payloads: list[ExtensionWindowPayload] = []
         for window in windows:
-            local_prompt_strips = int(prompt_strips)
-            prompt_grid = _extract_prompt_window(working_grid, direction, prompt_strips=local_prompt_strips, window=window)
-            fitted = False
-            local_predict_strips = int(predict_strips_per_iter)
-            local_window = ExtensionWindow(window.start, window.end)
-            for _retry in range(max(1, int(max_crop_fit_retries) * 8)):
-                predicted_envelope = _estimate_extension_points(prompt_grid, direction, local_predict_strips)
-                crop_points = np.concatenate([prompt_grid.reshape(-1, 3), predicted_envelope.reshape(-1, 3)], axis=0)
-                min_corner = _crop_min_corner_for_points(crop_points, crop_size)
-                if min_corner is not None:
-                    fitted = True
-                    break
-                window_len = local_window.end - local_window.start
-                if window_len > 16:
-                    shorter = max(16, window_len - 8)
-                    local_window = ExtensionWindow(local_window.start, local_window.start + shorter)
-                    prompt_grid = _extract_prompt_window(working_grid, direction, prompt_strips=local_prompt_strips, window=local_window)
-                    continue
-                if local_prompt_strips > 2:
-                    local_prompt_strips -= 1
-                    prompt_grid = _extract_prompt_window(working_grid, direction, prompt_strips=local_prompt_strips, window=local_window)
-                    continue
-                if local_predict_strips > 1:
-                    local_predict_strips -= 1
-                    continue
-                break
-            if not fitted:
+            fitted_plan = _fit_window_for_crop(
+                working_grid,
+                direction=direction,
+                window=window,
+                prompt_strips=int(prompt_strips),
+                predict_strips=int(predict_strips_per_iter),
+                crop_size=crop_size,
+                max_crop_fit_retries=int(max_crop_fit_retries),
+                min_window_strip_length=4,
+            )
+            if fitted_plan is None:
                 crop_fit_failed_count += 1
                 continue
-            max_predict_strips_seen = max(max_predict_strips_seen, int(local_predict_strips))
+            max_predict_strips_seen = max(max_predict_strips_seen, int(fitted_plan.predict_strips))
             t1 = perf_counter()
-            volume_crop = _read_volume_crop(volume, min_corner, crop_size, cache=cache)
+            volume_crop = _read_volume_crop(volume, fitted_plan.min_corner, crop_size, cache=cache)
             crop_read_ms += 1000.0 * (perf_counter() - t1)
             sample = build_extension_sample(
-                prompt_grid_world=prompt_grid,
+                prompt_grid_world=fitted_plan.prompt_grid,
                 direction=direction,
-                min_corner=min_corner,
+                min_corner=fitted_plan.min_corner,
                 crop_size=crop_size,
                 patch_size=tuple(int(v) for v in model_cfg["patch_size"]),
                 offset_num_bins=tuple(int(v) for v in model_cfg["offset_num_bins"]),
                 frontier_band_width=int(model_cfg.get("frontier_band_width", 4)),
-                predict_strips=local_predict_strips,
+                predict_strips=fitted_plan.predict_strips,
                 volume_crop=volume_crop,
                 wrap_metadata={"segment_uuid": surface_uuid, "source_tifxyz": str(tifxyz_path)},
             )
             payloads.append(
                 ExtensionWindowPayload(
-                    window=local_window,
+                    window=fitted_plan.window,
                     sample=sample,
                     direction=direction,
                     target_grid_shape=tuple(int(v) for v in sample["target_grid_shape"].tolist()),
                     strip_length=int(sample["strip_length"].item()),
                     num_strips=int(sample["num_strips"].item()),
-                    prompt_strips=local_prompt_strips,
-                    predict_strips=local_predict_strips,
+                    prompt_strips=fitted_plan.prompt_strips,
+                    predict_strips=fitted_plan.predict_strips,
                 )
             )
         if not payloads:
@@ -1113,6 +1166,87 @@ def extend_tifxyz_mesh(
     return summary
 
 
+def run_extension_benchmark_suite(
+    *,
+    tifxyz_path: str | Path,
+    volume_uri: str,
+    dino_backbone: str,
+    autoreg_checkpoint: str,
+    out_dir: str | Path,
+    device: str,
+    prompt_strips: int,
+    predict_strips_per_iter: int,
+    window_strip_length: int,
+    window_overlap: int,
+    window_batch_sizes: list[int],
+    long_rollout_iters: int,
+    max_crop_fit_retries: int,
+    grow_direction: str | None = None,
+) -> dict[str, Any]:
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    batch_sizes = list(dict.fromkeys(int(v) for v in window_batch_sizes))
+    if not batch_sizes:
+        raise ValueError("window_batch_sizes must be non-empty for benchmark suite")
+    serial_runs = []
+    for batch_size in batch_sizes:
+        run_dir = out_path / f"batch_{batch_size}_iter1"
+        summary = extend_tifxyz_mesh(
+            tifxyz_path=tifxyz_path,
+            volume_uri=volume_uri,
+            dino_backbone=dino_backbone,
+            autoreg_checkpoint=autoreg_checkpoint,
+            out_dir=run_dir,
+            device=device,
+            grow_direction=grow_direction,
+            prompt_strips=prompt_strips,
+            predict_strips_per_iter=predict_strips_per_iter,
+            window_strip_length=window_strip_length,
+            window_overlap=window_overlap,
+            window_batch_size=batch_size,
+            max_extension_iters=1,
+            max_crop_fit_retries=max_crop_fit_retries,
+        )
+        serial_runs.append(summary)
+
+    candidate_runs = [run for run in serial_runs if int(run.get("predicted_vertex_count", 0)) > 0]
+    best_run = max(
+        candidate_runs or serial_runs,
+        key=lambda item: (
+            float(item.get("windows_per_second_overall", 0.0)),
+            int(item.get("predicted_vertex_count", 0)),
+            -int(item.get("window_batch_size", 1)),
+        ),
+    )
+    long_rollout_dir = out_path / f"batch_{int(best_run['window_batch_size'])}_iter{int(long_rollout_iters)}"
+    long_rollout = extend_tifxyz_mesh(
+        tifxyz_path=tifxyz_path,
+        volume_uri=volume_uri,
+        dino_backbone=dino_backbone,
+        autoreg_checkpoint=autoreg_checkpoint,
+        out_dir=long_rollout_dir,
+        device=device,
+        grow_direction=grow_direction,
+        prompt_strips=prompt_strips,
+        predict_strips_per_iter=predict_strips_per_iter,
+        window_strip_length=window_strip_length,
+        window_overlap=window_overlap,
+        window_batch_size=int(best_run["window_batch_size"]),
+        max_extension_iters=int(long_rollout_iters),
+        max_crop_fit_retries=max_crop_fit_retries,
+    )
+    suite = {
+        "tifxyz_path": str(tifxyz_path),
+        "serial_baselines": serial_runs,
+        "best_batch_run": best_run,
+        "long_rollout": long_rollout,
+    }
+    suite_path = out_path / "benchmark_suite.json"
+    suite_path.write_text(json.dumps(suite, indent=2))
+    suite["benchmark_suite_path"] = str(suite_path)
+    return suite
+
+
 @click.command()
 @click.option("--tifxyz-path", type=click.Path(exists=True, path_type=Path), required=False)
 @click.option("--tifxyz-root", type=click.Path(exists=True, path_type=Path), required=False)
@@ -1129,6 +1263,8 @@ def extend_tifxyz_mesh(
 @click.option("--window-batch-size", type=int, default=4, show_default=True)
 @click.option("--max-extension-iters", type=int, default=4, show_default=True)
 @click.option("--max-crop-fit-retries", type=int, default=3, show_default=True)
+@click.option("--benchmark-window-batch-sizes", type=str, default=None)
+@click.option("--benchmark-long-rollout-iters", type=int, default=3, show_default=True)
 def main(
     tifxyz_path: Path | None,
     tifxyz_root: Path | None,
@@ -1145,6 +1281,8 @@ def main(
     window_batch_size: int,
     max_extension_iters: int,
     max_crop_fit_retries: int,
+    benchmark_window_batch_sizes: str | None,
+    benchmark_long_rollout_iters: int,
 ) -> None:
     if (tifxyz_path is None) == (tifxyz_root is None):
         raise click.UsageError("provide exactly one of --tifxyz-path or --tifxyz-root")
@@ -1156,22 +1294,41 @@ def main(
             predict_strips=predict_strips_per_iter,
             crop_size=(128, 128, 128),
         )
-    result = extend_tifxyz_mesh(
-        tifxyz_path=selected_tifxyz,
-        volume_uri=volume_uri,
-        dino_backbone=str(dinov2_backbone),
-        autoreg_checkpoint=str(autoreg_ckpt),
-        out_dir=out_dir,
-        device=device,
-        grow_direction=None if grow_direction == "auto" else grow_direction,
-        prompt_strips=prompt_strips,
-        predict_strips_per_iter=predict_strips_per_iter,
-        window_strip_length=window_strip_length,
-        window_overlap=window_overlap,
-        window_batch_size=window_batch_size,
-        max_extension_iters=max_extension_iters,
-        max_crop_fit_retries=max_crop_fit_retries,
-    )
+    benchmark_batch_sizes = _parse_int_list(benchmark_window_batch_sizes)
+    if benchmark_batch_sizes:
+        result = run_extension_benchmark_suite(
+            tifxyz_path=selected_tifxyz,
+            volume_uri=volume_uri,
+            dino_backbone=str(dinov2_backbone),
+            autoreg_checkpoint=str(autoreg_ckpt),
+            out_dir=out_dir,
+            device=device,
+            grow_direction=None if grow_direction == "auto" else grow_direction,
+            prompt_strips=prompt_strips,
+            predict_strips_per_iter=predict_strips_per_iter,
+            window_strip_length=window_strip_length,
+            window_overlap=window_overlap,
+            window_batch_sizes=benchmark_batch_sizes,
+            long_rollout_iters=benchmark_long_rollout_iters,
+            max_crop_fit_retries=max_crop_fit_retries,
+        )
+    else:
+        result = extend_tifxyz_mesh(
+            tifxyz_path=selected_tifxyz,
+            volume_uri=volume_uri,
+            dino_backbone=str(dinov2_backbone),
+            autoreg_checkpoint=str(autoreg_ckpt),
+            out_dir=out_dir,
+            device=device,
+            grow_direction=None if grow_direction == "auto" else grow_direction,
+            prompt_strips=prompt_strips,
+            predict_strips_per_iter=predict_strips_per_iter,
+            window_strip_length=window_strip_length,
+            window_overlap=window_overlap,
+            window_batch_size=window_batch_size,
+            max_extension_iters=max_extension_iters,
+            max_crop_fit_retries=max_crop_fit_retries,
+        )
     print(json.dumps(result, indent=2, sort_keys=True))
 
 

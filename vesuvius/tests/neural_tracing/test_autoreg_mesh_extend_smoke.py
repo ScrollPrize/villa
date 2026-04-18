@@ -11,7 +11,9 @@ import torch
 from vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz import (
     _crop_min_corner_for_points,
     _extract_prompt_window,
+    _fit_window_for_crop,
     _open_zarr_volume,
+    _parse_int_list,
     _render_projection,
     _surface_grid_zyx,
     _window_ranges,
@@ -24,6 +26,7 @@ from vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz import (
     grid_to_colored_mesh,
     infer_extension_windows_batched,
     merge_window_prediction,
+    run_extension_benchmark_suite,
     write_colored_ply,
 )
 from vesuvius.tifxyz import Tifxyz
@@ -58,9 +61,48 @@ def test_window_ranges_are_deterministic() -> None:
     assert [(window.start, window.end) for window in windows] == [(0, 8), (6, 14), (12, 20)]
 
 
+def test_parse_int_list_handles_csv() -> None:
+    assert _parse_int_list("1, 2,4") == [1, 2, 4]
+    assert _parse_int_list("") == []
+    with pytest.raises(ValueError):
+        _parse_int_list("0,2")
+
+
 def test_crop_min_corner_rejects_oversize_envelope() -> None:
     points = np.array([[0.0, 0.0, 0.0], [256.0, 32.0, 32.0]], dtype=np.float32)
     assert _crop_min_corner_for_points(points, (128, 128, 128)) is None
+
+
+def test_fit_window_for_crop_shrinks_below_sixteen_strips() -> None:
+    rows, cols = 32, 12
+    row_axis = np.arange(rows, dtype=np.float32)[:, None]
+    col_axis = np.arange(cols, dtype=np.float32)[None, :]
+    row_grid = np.broadcast_to(row_axis, (rows, cols))
+    col_grid = np.broadcast_to(col_axis, (rows, cols))
+    grid = np.stack(
+        [
+            16.0 + 24.0 * row_grid,
+            32.0 + 2.0 * row_grid,
+            48.0 + 2.0 * col_grid,
+        ],
+        axis=-1,
+    ).astype(np.float32)
+
+    fitted = _fit_window_for_crop(
+        grid,
+        direction="left",
+        window=SimpleNamespace(start=0, end=24),
+        prompt_strips=3,
+        predict_strips=2,
+        crop_size=(128, 128, 128),
+        max_crop_fit_retries=3,
+        min_window_strip_length=4,
+    )
+
+    assert fitted is not None
+    assert fitted.window.end - fitted.window.start == 4
+    assert fitted.prompt_strips == 3
+    assert fitted.predict_strips == 2
 
 
 def test_choose_growth_direction_prefers_valid_boundary() -> None:
@@ -347,6 +389,45 @@ def test_zero_growth_iteration_stops_cleanly(tmp_path: Path, monkeypatch: pytest
 
     assert result["iterations_completed"] == 1
     assert result["stop_reason"] == "zero_growth_iteration"
+
+
+def test_extension_benchmark_suite_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    call_log = []
+
+    def _fake_extend(**kwargs):
+        batch_size = int(kwargs["window_batch_size"])
+        max_iters = int(kwargs["max_extension_iters"])
+        call_log.append((batch_size, max_iters))
+        return {
+            "window_batch_size": batch_size,
+            "predicted_vertex_count": 10 * batch_size,
+            "windows_per_second_overall": float(batch_size),
+            "summary_path": str(tmp_path / f"summary_{batch_size}_{max_iters}.json"),
+            "iteration_stats": [{"valid_new_vertices": batch_size * max_iters}],
+        }
+
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz.extend_tifxyz_mesh", _fake_extend)
+
+    suite = run_extension_benchmark_suite(
+        tifxyz_path="dummy",
+        volume_uri="s3://dummy",
+        dino_backbone="backbone",
+        autoreg_checkpoint="ckpt",
+        out_dir=tmp_path,
+        device="cpu",
+        prompt_strips=3,
+        predict_strips_per_iter=2,
+        window_strip_length=4,
+        window_overlap=2,
+        window_batch_sizes=[1, 2, 4],
+        long_rollout_iters=3,
+        max_crop_fit_retries=2,
+    )
+
+    assert call_log == [(1, 1), (2, 1), (4, 1), (4, 3)]
+    assert suite["best_batch_run"]["window_batch_size"] == 4
+    assert suite["long_rollout"]["window_batch_size"] == 4
+    assert Path(suite["benchmark_suite_path"]).exists()
 
 
 def test_surface_grid_conversion_marks_invalid_as_nan() -> None:
