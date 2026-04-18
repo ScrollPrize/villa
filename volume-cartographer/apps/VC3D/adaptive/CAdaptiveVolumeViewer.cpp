@@ -406,12 +406,20 @@ void CAdaptiveVolumeViewer::scheduleRender()
     }
 }
 
+// Toggle to re-enable progressive rendering during pan/zoom. The motion-
+// time resolution drop felt visually jarring in practice, so it's off by
+// default — but the plumbing (submitRender level bump, idle-timer catch-
+// up, 30 fps interactive coalesce) stays in place so it can be switched
+// back on with a single recompile.
+static constexpr bool kProgressiveRenderingEnabled = false;
+
 void CAdaptiveVolumeViewer::beginInteraction()
 {
     // Called from any event path that represents live user motion (pan
     // drag, zoom wheel). Marks _interactive so the next submitRender
     // picks the progressive pyramid level, and arms the idle timer so a
     // full-res render fires once motion stops.
+    if (!kProgressiveRenderingEnabled) return;
     _interactive = true;
     _interactionIdleTimer->start();
 }

@@ -233,9 +233,53 @@ private:
         }
     };
 
+    // Per-shard lock-free open-addressing hash table. Writers are still
+    // serialized by arenaMutex_ (single writer globally), so the insert /
+    // erase paths just atomic-store entries with release semantics.
+    // Readers probe lock-free with acquire-loads and verify the returned
+    // slot via slotKeyPacked_ — that verify catches the ~1/2^32 hash-tag
+    // collisions as well as racing writer modifications.
+    //
+    // Replaces the prior FastRwLock + std::unordered_map: reads take zero
+    // locks now, just a couple of atomic loads per probe step. On heavy
+    // composite workloads with ~25% L2-miss rate, every miss previously
+    // went through the shard rwlock (~40-70 cycles per pair uncontended,
+    // much worse under the 12-thread coherence storm). This path has no
+    // rwlock tax at all.
+    //
+    // Entry layout (64 bits):
+    //   [63:62] state: 00 empty, 10 occupied, 01 tombstone
+    //   [61:32] arena slot index (30 bits — supports 1B slots, we use ≤3M)
+    //   [31: 0] 32-bit hash of the BlockKey
+    // Empty is all-zero; ctor memset suffices.
+    static constexpr uint64_t kEntryEmpty = 0ull;
+    static constexpr uint64_t kEntryOccupied = 0x8000000000000000ull;
+    static constexpr uint64_t kEntryTombstone = 0x4000000000000000ull;
+    static constexpr uint64_t kEntryStateMask = 0xC000000000000000ull;
+    static constexpr uint64_t kEntrySlotMask = 0x3FFFFFFF00000000ull;
+    static constexpr int kEntrySlotShift = 32;
+    static constexpr uint64_t kEntryHashMask = 0x00000000FFFFFFFFull;
+    static uint32_t shardMapHash(const BlockKey& k) noexcept {
+        // Different mixer from BlockKeyHash + l2Index so shard-map slots
+        // don't cluster with either of those.
+        uint64_t h = packBlockKey(k) * 0xD6E8FEB86659FD93ull;
+        h ^= h >> 32;
+        uint32_t r = uint32_t(h);
+        return r == 0 ? 1u : r;  // reserve 0 for "empty-signifier"; shift anything that lands there
+    }
+    static uint64_t makeOccupiedEntry(uint32_t slot, uint32_t hash) noexcept {
+        return kEntryOccupied | (uint64_t(slot) << kEntrySlotShift) | uint64_t(hash);
+    }
+
+    // 2^18 = 256K slots per shard × 8 B = 2 MB per shard × 32 shards = 64 MB.
+    // With max arena ~2.5M slots / 32 shards ≈ 80K entries per shard, load
+    // factor peaks at ~0.3 → short probe chains, fast lookups.
+    static constexpr size_t kShardMapBits = 18;
+    static constexpr size_t kShardMapSize = size_t(1) << kShardMapBits;
+    static constexpr size_t kShardMapMask = kShardMapSize - 1;
+
     struct alignas(64) MapShard {
-        mutable FastRwLock mutex;
-        std::unordered_map<BlockKey, size_t, BlockKeyHash> map;
+        std::unique_ptr<std::atomic<uint64_t>[]> table;
         std::atomic<uint64_t> hits{0};
     };
     std::array<MapShard, kShards> shards_;

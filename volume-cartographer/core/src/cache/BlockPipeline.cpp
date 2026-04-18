@@ -835,21 +835,14 @@ void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targ
     std::vector<uint8_t> resident;
     blockCache_.containsBatch(probeKeys, resident);
 
-    // Snapshot the empty-chunks set once so the per-key check avoids
-    // hammering emptyChunksMutex_ from the render thread.
-    std::unordered_set<ChunkKey, ChunkKeyHash> emptySnapshot;
-    {
-        std::shared_lock lk(emptyChunksMutex_);
-        emptySnapshot = emptyChunks_;
-    }
-
+    // Empty-chunks lookup is now lock-free per probe — no snapshot needed.
     std::vector<ChunkKey> loaderKeys, downloaderKeys;
     loaderKeys.reserve(keys.size());
     downloaderKeys.reserve(keys.size());
     for (size_t i = 0; i < keys.size(); ++i) {
         const auto& key = keys[i];
         if (isNegativeCached(key)) continue;
-        if (emptySnapshot.count(key)) continue;
+        if (isEmptyChunk(key)) continue;
         // Both first and last block of the chunk must be resident to
         // consider the chunk fully cached. See comment above probeKeys.
         if (probeKeys[i * 2].level >= 0
@@ -882,27 +875,21 @@ BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
     if (auto b = blockCache_.get(key); b) return b;
     // Miss: could be an "empty chunk" (all-zero canonical chunk that we
     // don't store). Canonical chunks are 128³ = 8x8x8 blocks of 16³ —
-    // reverse-map the block coord to its enclosing chunk and check.
-    // Shared-lock the empty-chunks set: readers in the miss path dominate
-    // (12 render threads × every miss), writers only fire when a new
-    // all-zero chunk is discovered during decode.
+    // reverse-map the block coord to its enclosing chunk and check via
+    // the lock-free hash set. No rwlock — every blockAt miss used to hit
+    // pthread_rwlock_rdlock here.
     const ChunkKey chunkKey{key.level, key.bz / 8, key.by / 8, key.bx / 8};
-    {
-        std::shared_lock lk(emptyChunksMutex_);
-        if (emptyChunks_.count(chunkKey)) {
-            // One canonical zero block shared by every caller asking for
-            // a block inside any empty chunk — no arena consumption.
-            static constinit Block kZeroBlock{};
-            // Per-thread local accumulator flushed every 1024 hits. A single
-            // global atomic fetch_add here burned ~5%+ of CPU on hot render
-            // workloads (12 threads ping-ponging one cacheline per miss).
-            // Sampling trades exact counts for 1000x less atomic traffic —
-            // stats are diagnostic, so an approximate count is fine.
-            thread_local uint64_t localEmptyHits = 0;
-            if ((++localEmptyHits & 1023) == 0)
-                statEmptyHits_.fetch_add(1024, std::memory_order_relaxed);
-            return &kZeroBlock;
-        }
+    if (isEmptyChunk(chunkKey)) {
+        // One canonical zero block shared by every caller asking for
+        // a block inside any empty chunk — no arena consumption.
+        static constinit Block kZeroBlock{};
+        // Per-thread local accumulator flushed every 1024 hits. A single
+        // global atomic fetch_add here burned ~5%+ of CPU on hot render
+        // workloads (12 threads ping-ponging one cacheline per miss).
+        thread_local uint64_t localEmptyHits = 0;
+        if ((++localEmptyHits & 1023) == 0)
+            statEmptyHits_.fetch_add(1024, std::memory_order_relaxed);
+        return &kZeroBlock;
     }
     thread_local uint64_t localMisses = 0;
     if ((++localMisses & 1023) == 0)
@@ -996,8 +983,7 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
     // blockAt() will hand out a shared static zero block for every inner
     // block of this chunk. Saves ~2 MB of arena per empty 128³ chunk.
     if (chunk.isEmpty) {
-        std::unique_lock lk(emptyChunksMutex_);
-        emptyChunks_.insert(key);
+        addEmptyChunk(key);
         return;
     }
 
@@ -1036,10 +1022,7 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
 
 void BlockPipeline::clearMemory() {
     blockCache_.clear();
-    {
-        std::unique_lock elk(emptyChunksMutex_);
-        emptyChunks_.clear();
-    }
+    clearEmptyChunks();
     for (auto& bucket : shardCacheBuckets_) {
         std::lock_guard lk(bucket.mutex);
         bucket.lru.clear();
@@ -1070,10 +1053,7 @@ void BlockPipeline::clearAll() {
     }
     shardCacheGlobalBytes_.store(0, std::memory_order_relaxed);
     blockCache_.clear();
-    {
-        std::unique_lock elk(emptyChunksMutex_);
-        emptyChunks_.clear();
-    }
+    clearEmptyChunks();
     bloomClear();
     std::lock_guard lock(negativeMutex_);
     negativeCache_.clear();
@@ -1123,18 +1103,10 @@ size_t BlockPipeline::countAvailable(const std::vector<ChunkKey>& keys) const {
     constexpr int kMaxL = 16;
     std::array<int, kMaxL> bpcZ{}, bpcY{}, bpcX{};
     std::array<bool, kMaxL> shapeCached{};
-    // Snapshot emptyChunks_ once for the batch so we don't re-acquire the
-    // mutex per key. Zero chunks are recorded here by insertChunkAsBlocks
-    // and have no block-cache entry, so without this check countAvailable
-    // would report them as unavailable and wait loops would stall.
-    std::unordered_set<ChunkKey, ChunkKeyHash> emptySnap;
-    {
-        std::shared_lock lk(emptyChunksMutex_);
-        emptySnap = emptyChunks_;
-    }
+    // Empty-chunk probe is now lock-free — no snapshot needed.
     for (const auto& key : keys) {
         if (isNegativeCached(key)) { n++; continue; }
-        if (emptySnap.count(key)) { n++; continue; }
+        if (isEmptyChunk(key)) { n++; continue; }
         if (key.level < 0 || key.level >= kMaxL) continue;
         if (!shapeCached[key.level]) {
             auto csk = chunkShape(key.level);

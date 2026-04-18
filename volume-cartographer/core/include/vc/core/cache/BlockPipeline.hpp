@@ -252,13 +252,71 @@ private:
     // 512 identical zero blocks in the arena. blockAt() returns a pointer
     // to a single static zero-block when the block's canonical chunk is
     // in this set.
-    // shared_mutex: blockAt's miss path reads emptyChunks_ under shared_lock,
-    // while insertChunkAsBlocks/clear take unique_lock. Under 12-thread render
-    // into freshly-panned regions, every miss hits this mutex; a plain
-    // std::mutex serialised 12 readers and spent ~19% of CPU in
-    // futex_wait → queued_spin_lock_slowpath.
-    mutable std::shared_mutex emptyChunksMutex_;
-    std::unordered_set<ChunkKey, ChunkKeyHash> emptyChunks_;
+    //
+    // Lock-free hash set. Readers probe with acquire-atomic-loads; writers
+    // (insertChunkAsBlocks / clear) serialize via emptyChunksWriteMutex_
+    // and publish with release-atomic-stores. Every blockAt miss used to
+    // take a shared_mutex → ~2% of CPU in pthread_rwlock at the 12-thread
+    // render path; now just one atomic load per probe step. Entries: 64
+    // bits = [state:2 | chunkHash:62]. False positives on chunkHash are
+    // OK — an "empty" hit is cheap (returns the static zero block) and
+    // correctness is unaffected because the arena still holds the
+    // authoritative data if it's there. In practice false positives are
+    // vanishingly rare (62-bit hash).
+    static constexpr size_t kEmptyChunksBits = 14;  // 16K slots × 8 B = 128 KB
+    static constexpr size_t kEmptyChunksSize = size_t(1) << kEmptyChunksBits;
+    static constexpr size_t kEmptyChunksMask = kEmptyChunksSize - 1;
+    static constexpr uint64_t kEmptyChunksStateMask = 0xC000000000000000ull;
+    static constexpr uint64_t kEmptyChunksOccupied  = 0x8000000000000000ull;
+    static constexpr uint64_t kEmptyChunksHashMask  = 0x3FFFFFFFFFFFFFFFull;
+    std::array<std::atomic<uint64_t>, kEmptyChunksSize> emptyChunksTable_{};
+    mutable std::mutex emptyChunksWriteMutex_;
+    // Lock-free probe for "is this chunk known to be all-zero?".
+    [[nodiscard]] bool isEmptyChunk(const ChunkKey& k) const noexcept {
+        const uint64_t fh = emptyChunkFullHash(k);
+        size_t idx = fh & kEmptyChunksMask;
+        for (size_t probe = 0; probe < kEmptyChunksSize; ++probe) {
+            const uint64_t e = emptyChunksTable_[(idx + probe) & kEmptyChunksMask]
+                                  .load(std::memory_order_acquire);
+            if (e == 0) return false;  // empty → end of probe
+            if ((e & kEmptyChunksStateMask) == kEmptyChunksOccupied
+                && (e & kEmptyChunksHashMask) == fh) {
+                return true;
+            }
+            // mismatched hash: keep probing
+        }
+        return false;
+    }
+    void addEmptyChunk(const ChunkKey& k) noexcept {
+        std::lock_guard lk(emptyChunksWriteMutex_);
+        const uint64_t fh = emptyChunkFullHash(k);
+        size_t idx = fh & kEmptyChunksMask;
+        const uint64_t entry = kEmptyChunksOccupied | fh;
+        for (size_t probe = 0; probe < kEmptyChunksSize; ++probe) {
+            const size_t pos = (idx + probe) & kEmptyChunksMask;
+            const uint64_t e = emptyChunksTable_[pos].load(std::memory_order_relaxed);
+            if (e == 0) {
+                emptyChunksTable_[pos].store(entry, std::memory_order_release);
+                return;
+            }
+            if ((e & kEmptyChunksHashMask) == fh) return;  // already present
+        }
+        // Table full — in practice won't happen, we have 16K slots.
+    }
+    void clearEmptyChunks() noexcept {
+        std::lock_guard lk(emptyChunksWriteMutex_);
+        for (auto& e : emptyChunksTable_) e.store(0, std::memory_order_relaxed);
+    }
+    static uint64_t emptyChunkFullHash(const ChunkKey& k) noexcept {
+        // 62-bit hash of (level, iz, iy, ix). Collision rate 1/2^62 —
+        // negligible even over the program's lifetime.
+        uint64_t h = ChunkKeyHash{}(k);
+        h = (h ^ (h >> 31)) * 0x9E3779B97F4A7C15ull;
+        h = (h ^ (h >> 27)) * 0xBF58476D1CE4E5B9ull;
+        h ^= h >> 32;
+        h &= kEmptyChunksHashMask;
+        return h == 0 ? 1 : h;  // reserve 0 for "empty slot" sentinel
+    }
 
     // Negative cache (same design as before).
     static constexpr size_t kBloomBits = 65536;

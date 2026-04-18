@@ -88,14 +88,10 @@ BlockCache::BlockCache(Config cfg)
     usedBitsWords_ = words;
     usedBits_ = std::unique_ptr<std::atomic<uint64_t>[]>(
         new std::atomic<uint64_t>[words]());
-    // Default max_load_factor of 1.0 means libstdc++ sizes the bucket array
-    // at 2x insertion count. At 2.5M slots that's ~40 MB of extra buckets.
-    // Push the load factor to 1.0 before reserving so the reserve matches
-    // actual need. Each shard gets 1/kShards of total capacity.
-    const size_t perShard = (nSlots_ + kShards - 1) / kShards;
+    // Per-shard lock-free hash table. Allocate zero-initialized.
     for (auto& s : shards_) {
-        s.map.max_load_factor(1.0f);
-        s.map.reserve(perShard);
+        s.table = std::unique_ptr<std::atomic<uint64_t>[]>(
+            new std::atomic<uint64_t>[kShardMapSize]());
     }
 }
 
@@ -135,39 +131,51 @@ BlockPtr BlockCache::get(const BlockKey& key) noexcept
         }
     }
 
-    // Slow path: shard shared_lock + unordered_map lookup. Populate L2 on
-    // success so subsequent lookups for this key go lock-free. Round-robin
-    // counter picks which way to overwrite — the counter is non-atomic
-    // since races are benign (worst case we evict a slightly-less-ideal
-    // entry).
+    // Slow path: probe the shard's lock-free hash table. Each entry is an
+    // atomic<uint64_t>; an acquire-load tells us empty / occupied / tombstone
+    // + a 32-bit hash + the arena slot. Empty == end of probe chain.
+    // On hash match, verify via slotKeyPacked_ — a match means the arena
+    // slot still holds this key (catches both 1/2^32 hash collisions and
+    // races against writers that moved blocks around).
     const size_t sh = shardIndex(key);
     MapShard& shard = shards_[sh];
-    std::shared_lock lock(shard.mutex);
-    if (auto it = shard.map.find(key); it != shard.map.end()) {
-        const size_t slot = it->second;
-        setUsed(slot, true);
-        shard.hits.fetch_add(1, std::memory_order_relaxed);
-        if (tag != 0) {
-            const size_t setIdx = l2Index(packed, kL2Bits);
-            std::atomic<uint64_t>* set = &l2_[setIdx * kL2Ways];
-            // Prefer an empty slot if one is visible; otherwise evict via
-            // round-robin. The empty-slot scan is free since the cacheline
-            // is already hot from the probe above.
-            size_t wayToUse = kL2Ways;
-            for (size_t way = 0; way < kL2Ways; ++way) {
-                if (set[way].load(std::memory_order_relaxed) == kL2Empty) {
-                    wayToUse = way; break;
+    const uint32_t mh = shardMapHash(key);
+    size_t idx = mh & kShardMapMask;
+    for (size_t probe = 0; probe < kShardMapSize; ++probe) {
+        const uint64_t e = shard.table[(idx + probe) & kShardMapMask]
+                                .load(std::memory_order_acquire);
+        if (e == kEntryEmpty) break;  // not in table
+        if ((e & kEntryStateMask) == kEntryOccupied
+            && uint32_t(e & kEntryHashMask) == mh) {
+            const uint32_t slot = uint32_t((e & kEntrySlotMask) >> kEntrySlotShift);
+            if (slot < nSlots_
+                && slotKeyPacked_[slot].load(std::memory_order_acquire) == packed) {
+                setUsed(slot, true);
+                shard.hits.fetch_add(1, std::memory_order_relaxed);
+                if (tag != 0) {
+                    // Populate L2 for next lookup.
+                    const size_t setIdx = l2Index(packed, kL2Bits);
+                    std::atomic<uint64_t>* set = &l2_[setIdx * kL2Ways];
+                    size_t wayToUse = kL2Ways;
+                    for (size_t way = 0; way < kL2Ways; ++way) {
+                        if (set[way].load(std::memory_order_relaxed) == kL2Empty) {
+                            wayToUse = way; break;
+                        }
+                    }
+                    if (wayToUse == kL2Ways) {
+                        const uint8_t c = l2RrCounters_[setIdx];
+                        l2RrCounters_[setIdx] = uint8_t((c + 1u) & (kL2Ways - 1u));
+                        wayToUse = c & (kL2Ways - 1u);
+                    }
+                    set[wayToUse].store((uint64_t(tag) << 32) | uint32_t(slot),
+                                        std::memory_order_release);
                 }
+                return &arena_[slot];
             }
-            if (wayToUse == kL2Ways) {
-                const uint8_t c = l2RrCounters_[setIdx];
-                l2RrCounters_[setIdx] = uint8_t((c + 1u) & (kL2Ways - 1u));
-                wayToUse = c & (kL2Ways - 1u);
-            }
-            set[wayToUse].store((uint64_t(tag) << 32) | uint32_t(slot),
-                                std::memory_order_release);
+            // Hash matched but slot's packed-key doesn't — keep probing
+            // for a deeper colliding entry (rare).
         }
-        return &arena_[slot];
+        // tombstone or hash-mismatch: keep probing.
     }
     return nullptr;
 }
@@ -182,10 +190,25 @@ uint64_t BlockCache::blockHits() const noexcept
 
 bool BlockCache::contains(const BlockKey& key) const noexcept
 {
+    const uint64_t packed = packBlockKey(key);
     const size_t sh = shardIndex(key);
     const MapShard& shard = shards_[sh];
-    std::shared_lock lock(shard.mutex);
-    return shard.map.find(key) != shard.map.end();
+    const uint32_t mh = shardMapHash(key);
+    size_t idx = mh & kShardMapMask;
+    for (size_t probe = 0; probe < kShardMapSize; ++probe) {
+        const uint64_t e = shard.table[(idx + probe) & kShardMapMask]
+                                .load(std::memory_order_acquire);
+        if (e == kEntryEmpty) return false;
+        if ((e & kEntryStateMask) == kEntryOccupied
+            && uint32_t(e & kEntryHashMask) == mh) {
+            const uint32_t slot = uint32_t((e & kEntrySlotMask) >> kEntrySlotShift);
+            if (slot < nSlots_
+                && slotKeyPacked_[slot].load(std::memory_order_acquire) == packed) {
+                return true;
+            }
+        }
+    }
+    return false;
 }
 
 void BlockCache::containsBatch(const std::vector<BlockKey>& keys,
@@ -193,21 +216,10 @@ void BlockCache::containsBatch(const std::vector<BlockKey>& keys,
 {
     out.assign(keys.size(), 0);
     if (keys.empty()) return;
-    // Group by shard so each shard's lock is acquired exactly once across
-    // the batch. With N input keys over kShards shards, naive per-key
-    // locking costs ~N/kShards lock pairs per shard; grouping drops that to 1.
-    std::array<std::vector<size_t>, kShards> idxByShard;
+    // Lock-free probe path — no grouping needed since reads don't take
+    // any lock now. We just delegate to contains() per key.
     for (size_t i = 0; i < keys.size(); ++i) {
-        idxByShard[shardIndex(keys[i])].push_back(i);
-    }
-    for (size_t sh = 0; sh < kShards; ++sh) {
-        auto& idx = idxByShard[sh];
-        if (idx.empty()) continue;
-        std::shared_lock lock(shards_[sh].mutex);
-        const auto& m = shards_[sh].map;
-        for (size_t i : idx) {
-            if (m.find(keys[i]) != m.end()) out[i] = 1;
-        }
+        if (contains(keys[i])) out[i] = 1;
     }
 }
 
@@ -237,15 +249,25 @@ size_t BlockCache::acquireSlotLocked(const BlockKey& key) noexcept
 
     const size_t sh = shardIndex(key);
     MapShard& shard = shards_[sh];
+    const uint64_t packedKey = packBlockKey(key);
+    const uint32_t mh = shardMapHash(key);
+    // Probe the shard's lock-free table for an existing entry. Writers are
+    // serialized via arenaMutex_ so no writer-writer contention.
     {
-        // Shared lookup first — if the key already lives in its shard, just
-        // bump the used bit. Writers normally hold arenaMutex_ exclusively,
-        // so competing writers never collide here, but readers may still be
-        // probing the shard concurrently.
-        std::shared_lock rlock(shard.mutex);
-        if (auto it = shard.map.find(key); it != shard.map.end()) {
-            setUsed(it->second, true);
-            return it->second;
+        size_t idx = mh & kShardMapMask;
+        for (size_t probe = 0; probe < kShardMapSize; ++probe) {
+            const uint64_t e = shard.table[(idx + probe) & kShardMapMask]
+                                    .load(std::memory_order_acquire);
+            if (e == kEntryEmpty) break;
+            if ((e & kEntryStateMask) == kEntryOccupied
+                && uint32_t(e & kEntryHashMask) == mh) {
+                const uint32_t existing = uint32_t((e & kEntrySlotMask) >> kEntrySlotShift);
+                if (existing < nSlots_
+                    && slotKeyPacked_[existing].load(std::memory_order_acquire) == packedKey) {
+                    setUsed(existing, true);
+                    return existing;
+                }
+            }
         }
     }
 
@@ -300,11 +322,22 @@ size_t BlockCache::acquireSlotLocked(const BlockKey& key) noexcept
     }
 
     setUsed(slot, true);
-    const uint64_t packed = packBlockKey(key);
+    const uint64_t packed = packedKey;
     slotKeyPacked_[slot].store(packed, std::memory_order_release);
+    // Insert into the lock-free shard table: probe linearly, replace first
+    // empty-or-tombstone slot with an occupied entry. Readers are lock-
+    // free; the release-store publishes our entry to concurrent probes.
     {
-        std::unique_lock wlock(shard.mutex);
-        shard.map[key] = slot;
+        size_t idx = mh & kShardMapMask;
+        const uint64_t newEntry = makeOccupiedEntry(uint32_t(slot), mh);
+        for (size_t probe = 0; probe < kShardMapSize; ++probe) {
+            const size_t pos = (idx + probe) & kShardMapMask;
+            const uint64_t e = shard.table[pos].load(std::memory_order_relaxed);
+            if (e == kEntryEmpty || (e & kEntryStateMask) == kEntryTombstone) {
+                shard.table[pos].store(newEntry, std::memory_order_release);
+                break;
+            }
+        }
     }
     if (key.level >= 0 && key.level < kMaxLevels)
         levelOccupied_[key.level]++;
@@ -360,10 +393,26 @@ size_t BlockCache::reclaimSlotLocked()
             if (k.level >= 0 && k.level < kMaxLevels
                 && levelOccupied_[k.level] > 0)
                 levelOccupied_[k.level]--;
+            // Erase from the shard's lock-free table: probe for the
+            // matching (hash, slot) entry and mark it tombstone. Linear
+            // probing requires tombstones to preserve later entries'
+            // reachability.
             {
                 const size_t sh = shardIndex(k);
-                std::unique_lock wlock(shards_[sh].mutex);
-                shards_[sh].map.erase(k);
+                auto& shard = shards_[sh];
+                const uint32_t mh = shardMapHash(k);
+                size_t idx = mh & kShardMapMask;
+                for (size_t probe = 0; probe < kShardMapSize; ++probe) {
+                    const size_t pos = (idx + probe) & kShardMapMask;
+                    const uint64_t e = shard.table[pos].load(std::memory_order_relaxed);
+                    if (e == kEntryEmpty) break;
+                    if ((e & kEntryStateMask) == kEntryOccupied
+                        && uint32_t(e & kEntryHashMask) == mh
+                        && uint32_t((e & kEntrySlotMask) >> kEntrySlotShift) == uint32_t(i)) {
+                        shard.table[pos].store(kEntryTombstone, std::memory_order_release);
+                        break;
+                    }
+                }
             }
             // Invalidate slot FIRST so any in-flight L2 reader verifies
             // against an empty packed-key. If a stale L2 entry still points
@@ -403,8 +452,8 @@ void BlockCache::clear()
 {
     std::unique_lock lock(arenaMutex_);
     for (auto& s : shards_) {
-        std::unique_lock slock(s.mutex);
-        s.map.clear();
+        for (size_t i = 0; i < kShardMapSize; ++i)
+            s.table[i].store(kEntryEmpty, std::memory_order_relaxed);
         s.hits.store(0, std::memory_order_relaxed);
     }
     for (size_t i = 0; i < nSlots_; ++i)
