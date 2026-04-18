@@ -104,7 +104,13 @@ std::vector<std::byte> c3d_decode(std::span<const std::byte> compressed,
 
     // Decode needs a 32-byte-aligned output; std::vector doesn't guarantee
     // that so decode into an aligned staging buffer then copy out.
+    // Zero the staging buffer first — c3d's byte-progressive decode can
+    // leave regions of the output untouched if the input is truncated or
+    // only carries a coarser LOD prefix.  Zeroing guarantees any such
+    // regions come out as black pixels rather than uninitialized memory
+    // (visible as noise in the rendered tiles).
     AlignedBuf staging(out_size);
+    std::memset(staging.p, 0, out_size);
     c3d_chunk_decode(in, in_len, /*ctx=*/nullptr, staging.p);
     std::vector<std::byte> out(out_size);
     std::memcpy(out.data(), staging.p, out_size);

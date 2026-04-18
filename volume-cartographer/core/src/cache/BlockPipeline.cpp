@@ -849,9 +849,12 @@ BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
         return b;
     }
     // Miss: could be an "empty chunk" (all-zero canonical chunk that we
-    // don't store). Canonical chunks are 128³ = 8x8x8 blocks of 16³ —
-    // reverse-map the block coord to its enclosing chunk and check.
-    const ChunkKey chunkKey{key.level, key.bz / 8, key.by / 8, key.bx / 8};
+    // don't store).  Canonical chunks are (canonical_side / block_side)
+    // blocks along each axis — 8 for h265 (128³ / 16³), 16 for c3d
+    // (256³ / 16³).  Reverse-map the block coord to its enclosing
+    // canonical-chunk index by dividing by that ratio.
+    const int cps = canonicalChunkSide(config_.codec) / kBlockSize;
+    const ChunkKey chunkKey{key.level, key.bz / cps, key.by / cps, key.bx / cps};
     {
         std::lock_guard lk(emptyChunksMutex_);
         if (emptyChunks_.count(chunkKey)) {
