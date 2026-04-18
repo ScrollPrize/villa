@@ -17,6 +17,7 @@
 #include <zstd.h>
 #include <lz4.h>
 #include <zlib.h>
+#include <c3d.h>
 
 namespace vc {
 
@@ -24,7 +25,7 @@ namespace vc {
 // Compressor configuration (parsed from .zarray JSON)
 // ============================================================================
 
-enum class CompressorId { None, Blosc, Zstd, Lz4, Gzip };
+enum class CompressorId { None, Blosc, Zstd, Lz4, Gzip, C3d };
 
 struct CompressorConfig {
     CompressorId id = CompressorId::None;
@@ -199,6 +200,38 @@ std::vector<std::byte> gzipCompress(std::span<const std::byte> input, const Comp
     return output;
 }
 
+std::vector<std::byte> c3dDecompress(std::span<const std::byte> input, size_t outputSize)
+{
+    static constexpr size_t kC3dChunkBytes =
+        static_cast<size_t>(C3D_CHUNK_SIDE) * C3D_CHUNK_SIDE * C3D_CHUNK_SIDE;
+
+    const auto* in = reinterpret_cast<const uint8_t*>(input.data());
+    if (outputSize != kC3dChunkBytes) {
+        throw std::runtime_error(
+            "c3d codec requires 256^3 u8 chunks, got outputSize=" +
+            std::to_string(outputSize));
+    }
+    if (!c3d_is_chunk(in, input.size())) {
+        throw std::runtime_error("c3d codec: input missing C3DC magic");
+    }
+    if (!c3d_chunk_validate(in, input.size())) {
+        throw std::runtime_error("c3d codec: chunk failed structural validation");
+    }
+
+    std::vector<std::byte> output(outputSize);
+    // SELF-context chunks only on this path. EXTERNAL-context chunks (c3dx
+    // ctx block) would need the ctx bytes supplied here; that's a follow-up.
+    c3d_chunk_decode(in, input.size(), /*ctx=*/nullptr,
+                     reinterpret_cast<uint8_t*>(output.data()));
+    return output;
+}
+
+std::vector<std::byte> c3dCompress(std::span<const std::byte> /*input*/,
+                                   const CompressorConfig& /*cfg*/)
+{
+    throw std::runtime_error("c3d compress not yet wired; use c3d_zarr_to_c3d.py to author");
+}
+
 std::vector<std::byte> gzipDecompress(std::span<const std::byte> input, size_t outputSize)
 {
     z_stream stream{};
@@ -235,6 +268,8 @@ std::vector<std::byte> decompressBytes(const CompressorConfig& cfg,
         return lz4Decompress(input, outputSize);
     case CompressorId::Gzip:
         return gzipDecompress(input, outputSize);
+    case CompressorId::C3d:
+        return c3dDecompress(input, outputSize);
     }
 
     throw std::runtime_error("unsupported zarr compressor");
@@ -254,6 +289,8 @@ std::vector<std::byte> compressBytes(const CompressorConfig& cfg,
         return lz4Compress(input, cfg);
     case CompressorId::Gzip:
         return gzipCompress(input, cfg);
+    case CompressorId::C3d:
+        return c3dCompress(input, cfg);
     }
 
     throw std::runtime_error("unsupported zarr compressor");
@@ -308,6 +345,7 @@ static CompressorConfig compressorFromMeta(const utils::ZarrMetadata& meta, int 
         if (cc.name == "zstd")  { cfg.id = CompressorId::Zstd;  return cfg; }
         if (cc.name == "lz4")   { cfg.id = CompressorId::Lz4;   return cfg; }
         if (cc.name == "gzip" || cc.name == "zlib") { cfg.id = CompressorId::Gzip; return cfg; }
+        if (cc.name == "c3d")   { cfg.id = CompressorId::C3d;   return cfg; }
     }
 
     cfg.id = CompressorId::None;
