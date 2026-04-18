@@ -17,7 +17,7 @@
 #include <zstd.h>
 #include <lz4.h>
 #include <zlib.h>
-#include <c3d.h>
+#include <utils/c3d_codec.hpp>
 
 namespace vc {
 
@@ -37,6 +37,8 @@ struct CompressorConfig {
     int blosc_blocksize = 0;
     // Zstd/Gzip level
     int level = 3;
+    // c3d target compression ratio (> 1.0). Default 10 ≈ 46 dB on scroll CT.
+    float c3d_target_ratio = 10.0f;
 };
 
 namespace {
@@ -202,34 +204,16 @@ std::vector<std::byte> gzipCompress(std::span<const std::byte> input, const Comp
 
 std::vector<std::byte> c3dDecompress(std::span<const std::byte> input, size_t outputSize)
 {
-    static constexpr size_t kC3dChunkBytes =
-        static_cast<size_t>(C3D_CHUNK_SIDE) * C3D_CHUNK_SIDE * C3D_CHUNK_SIDE;
-
-    const auto* in = reinterpret_cast<const uint8_t*>(input.data());
-    if (outputSize != kC3dChunkBytes) {
-        throw std::runtime_error(
-            "c3d codec requires 256^3 u8 chunks, got outputSize=" +
-            std::to_string(outputSize));
-    }
-    if (!c3d_is_chunk(in, input.size())) {
-        throw std::runtime_error("c3d codec: input missing C3DC magic");
-    }
-    if (!c3d_chunk_validate(in, input.size())) {
-        throw std::runtime_error("c3d codec: chunk failed structural validation");
-    }
-
-    std::vector<std::byte> output(outputSize);
-    // SELF-context chunks only on this path. EXTERNAL-context chunks (c3dx
-    // ctx block) would need the ctx bytes supplied here; that's a follow-up.
-    c3d_chunk_decode(in, input.size(), /*ctx=*/nullptr,
-                     reinterpret_cast<uint8_t*>(output.data()));
-    return output;
+    utils::C3dCodecParams p;
+    return utils::c3d_decode(input, outputSize, p);
 }
 
-std::vector<std::byte> c3dCompress(std::span<const std::byte> /*input*/,
-                                   const CompressorConfig& /*cfg*/)
+std::vector<std::byte> c3dCompress(std::span<const std::byte> input,
+                                   const CompressorConfig& cfg)
 {
-    throw std::runtime_error("c3d compress not yet wired; use c3d_zarr_to_c3d.py to author");
+    utils::C3dCodecParams p;
+    p.target_ratio = cfg.c3d_target_ratio;
+    return utils::c3d_encode(input, p);
 }
 
 std::vector<std::byte> gzipDecompress(std::span<const std::byte> input, size_t outputSize)
@@ -345,7 +329,15 @@ static CompressorConfig compressorFromMeta(const utils::ZarrMetadata& meta, int 
         if (cc.name == "zstd")  { cfg.id = CompressorId::Zstd;  return cfg; }
         if (cc.name == "lz4")   { cfg.id = CompressorId::Lz4;   return cfg; }
         if (cc.name == "gzip" || cc.name == "zlib") { cfg.id = CompressorId::Gzip; return cfg; }
-        if (cc.name == "c3d")   { cfg.id = CompressorId::C3d;   return cfg; }
+        if (cc.name == "c3d")   {
+            cfg.id = CompressorId::C3d;
+            if (cc.configuration && cc.configuration->is_object()
+                && cc.configuration->contains("target_ratio")) {
+                cfg.c3d_target_ratio = cc.configuration->value(
+                    "target_ratio", cfg.c3d_target_ratio);
+            }
+            return cfg;
+        }
     }
 
     cfg.id = CompressorId::None;
