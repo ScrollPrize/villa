@@ -345,11 +345,17 @@ private:
     // FPS tracking — ring buffer of recent submitRender() timestamps.
     // Status label reads the newest minus the oldest to get an averaged
     // fps number; single-frame interval is too noisy to display.
+    // FPS ring stores per-frame render DURATIONS (seconds), not render
+    // timestamps. The reported value is 1 / mean(duration) — i.e., the
+    // theoretical framerate we would sustain at our measured render
+    // cost. Decouples the readout from user-input pacing so an idle
+    // viewer doesn't read 0 FPS and a held-button pan doesn't read the
+    // timer interval as "60 fps".
     static constexpr int kFpsRingSize = 32;
-    std::array<std::chrono::steady_clock::time_point, kFpsRingSize> _renderTimestamps{};
-    int _renderTimestampHead = 0;
-    int _renderTimestampCount = 0;
-    void recordRenderTick();
+    std::array<double, kFpsRingSize> _renderDurationsSec{};
+    int _renderDurationHead = 0;
+    int _renderDurationCount = 0;
+    void recordRenderDuration(double seconds);
     float measuredFps() const;
     std::chrono::steady_clock::time_point _lastStretchScan{};
     cv::Ptr<cv::CLAHE> _claheCache;

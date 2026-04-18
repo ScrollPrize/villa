@@ -449,22 +449,22 @@ void CAdaptiveVolumeViewer::reloadPerfSettings()
     _highlightDownscaled = s.value("viewer_controls/highlight_downscaled", false).toBool();
 }
 
-void CAdaptiveVolumeViewer::recordRenderTick()
+void CAdaptiveVolumeViewer::recordRenderDuration(double seconds)
 {
-    _renderTimestamps[_renderTimestampHead] = std::chrono::steady_clock::now();
-    _renderTimestampHead = (_renderTimestampHead + 1) % kFpsRingSize;
-    if (_renderTimestampCount < kFpsRingSize) ++_renderTimestampCount;
+    if (seconds <= 0.0) return;
+    _renderDurationsSec[_renderDurationHead] = seconds;
+    _renderDurationHead = (_renderDurationHead + 1) % kFpsRingSize;
+    if (_renderDurationCount < kFpsRingSize) ++_renderDurationCount;
 }
 
 float CAdaptiveVolumeViewer::measuredFps() const
 {
-    if (_renderTimestampCount < 2) return 0.0f;
-    const int newestIdx = (_renderTimestampHead + kFpsRingSize - 1) % kFpsRingSize;
-    const int oldestIdx = (_renderTimestampHead + kFpsRingSize - _renderTimestampCount) % kFpsRingSize;
-    const auto span = _renderTimestamps[newestIdx] - _renderTimestamps[oldestIdx];
-    const double seconds = std::chrono::duration<double>(span).count();
-    if (seconds <= 1e-6) return 0.0f;
-    return float(double(_renderTimestampCount - 1) / seconds);
+    if (_renderDurationCount == 0) return 0.0f;
+    double sum = 0.0;
+    for (int i = 0; i < _renderDurationCount; ++i) sum += _renderDurationsSec[i];
+    const double avg = sum / double(_renderDurationCount);
+    if (avg <= 1e-6) return 0.0f;
+    return float(1.0 / avg);
 }
 
 void CAdaptiveVolumeViewer::submitRender()
@@ -476,7 +476,7 @@ void CAdaptiveVolumeViewer::submitRender()
     if (_volume) {
         if (auto* c = _volume->tieredCache()) c->clearChunkArrivedFlag();
     }
-    recordRenderTick();
+    const auto renderT0 = std::chrono::steady_clock::now();
 
     const CompositeParams& lightP = _compositeSettings.params;
     const bool rakingEnabled = _compositeSettings.postRakingEnabled;
@@ -964,6 +964,8 @@ void CAdaptiveVolumeViewer::submitRender()
     // blocks the UI thread synchronously until paintEvent returns, which
     // stalls every frame during pans/zooms.
     _view->viewport()->update();
+    const auto renderDt = std::chrono::steady_clock::now() - renderT0;
+    recordRenderDuration(std::chrono::duration<double>(renderDt).count());
     updateStatusLabel();
 }
 
