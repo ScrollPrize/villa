@@ -214,7 +214,7 @@ python lasagna/train_tifxyz.py \
 | `--no-deform` | off | Disable per-sample GT deformation refinement |
 | `--deform-stride` | 8 | Deformation grid stride (grid = label_patch_size / stride) |
 | `--deform-inner-iters` | 100 | Inner optimization iterations per training step |
-| `--deform-inner-lr` | 0.1 | SGD learning rate for deformation inner loop |
+| `--deform-inner-lr` | 1000 | Start LR for deformation inner loop (ramps to 100x on log scale) |
 | `--deform-max-frac` | 0.3 | Max displacement as fraction of inter-surface distance |
 
 ### Multi-GPU (DDP)

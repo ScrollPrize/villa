@@ -722,8 +722,8 @@ class DeformationStore:
             key = self._make_key(sp, patch.dataset_idx)
             self._index.append((key, patch.dataset_local_idx))
 
-        # Open/create memmaps
-        shape_tail = (3, grid_size, grid_size, grid_size)
+        # Open/create memmaps — scalar offset (1, G, G, G) per sample
+        shape_tail = (1, grid_size, grid_size, grid_size)
         self._memmaps: dict[str, np.memmap] = {}
         for key, count in groups.items():
             path = self.deform_dir / f"{key}.bin"
@@ -741,7 +741,7 @@ class DeformationStore:
         return f"{sanitized}__ds{dataset_idx}"
 
     def get(self, global_indices: list[int]) -> torch.Tensor:
-        """Load deformations for batch, returns (B, 3, G, G, G) float32."""
+        """Load deformations for batch, returns (B, 1, G, G, G) float32 scalar offsets."""
         out = []
         for gi in global_indices:
             key, li = self._index[gi]
@@ -762,46 +762,106 @@ class DeformationStore:
 
 
 def _augment_deform(deform, flip_z, flip_y, flip_x, k):
-    """Transform deformation field to match spatial augmentation.
+    """Transform scalar deformation field to match spatial augmentation.
 
-    deform: (B, 3, G, G, G) with channels (dz, dy, dx).
-    All ops are differentiable (index permutations + negation).
+    deform: (B, 1, G, G, G) scalar offset (sign-invariant under flips).
+    Only spatial permutations needed — no component sign changes.
     """
     d = deform
     if flip_z:
         d = torch.flip(d, [2])
-        d = torch.cat([-d[:, 0:1], d[:, 1:3]], dim=1)
     if flip_y:
         d = torch.flip(d, [3])
-        d = torch.cat([d[:, 0:1], -d[:, 1:2], d[:, 2:3]], dim=1)
     if flip_x:
         d = torch.flip(d, [4])
-        d = torch.cat([d[:, 0:2], -d[:, 2:3]], dim=1)
-    for _ in range(k % 4):
-        d = torch.rot90(d, 1, dims=(3, 4))
-        # (dy, dx) -> (-dx, dy)
-        d = torch.cat([d[:, 0:1], -d[:, 2:3], d[:, 1:2]], dim=1)
+    if k % 4:
+        d = torch.rot90(d, k % 4, dims=(3, 4))
     return d
 
 
 def _unaugment_deform(deform, flip_z, flip_y, flip_x, k):
     """Inverse of _augment_deform: augmented space -> pre-aug storage space."""
     d = deform
-    # Undo rot90: apply 4-k times
-    for _ in range((4 - k) % 4):
-        d = torch.rot90(d, 1, dims=(3, 4))
-        d = torch.cat([d[:, 0:1], -d[:, 2:3], d[:, 1:2]], dim=1)
-    # Undo flips (self-inverse, reverse order)
+    if (4 - k) % 4:
+        d = torch.rot90(d, (4 - k) % 4, dims=(3, 4))
     if flip_x:
-        d = torch.cat([d[:, 0:2], -d[:, 2:3]], dim=1)
         d = torch.flip(d, [4])
     if flip_y:
-        d = torch.cat([d[:, 0:1], -d[:, 1:2], d[:, 2:3]], dim=1)
         d = torch.flip(d, [3])
     if flip_z:
-        d = torch.cat([-d[:, 0:1], d[:, 1:3]], dim=1)
         d = torch.flip(d, [2])
     return d
+
+
+def _compute_normal_field(cos_targets, grid_size):
+    """Compute unit normal direction at deformation grid resolution.
+
+    The spatial gradient of the cos channel points along the surface
+    normal (perpendicular to iso-surfaces of the cos field).
+
+    Args:
+        cos_targets: (B, 1, Z, Y, X) cos channel from targets
+        grid_size: G — deformation grid resolution per axis
+
+    Returns: (B, 3, G, G, G) unit normals in (dz, dy, dx) order
+    """
+    cos_ds = F.adaptive_avg_pool3d(cos_targets, (grid_size, grid_size, grid_size))
+    cos_pad = F.pad(cos_ds, (1, 1, 1, 1, 1, 1), mode="replicate")
+    gz = (cos_pad[:, :, 2:, 1:-1, 1:-1] - cos_pad[:, :, :-2, 1:-1, 1:-1]) / 2
+    gy = (cos_pad[:, :, 1:-1, 2:, 1:-1] - cos_pad[:, :, 1:-1, :-2, 1:-1]) / 2
+    gx = (cos_pad[:, :, 1:-1, 1:-1, 2:] - cos_pad[:, :, 1:-1, 1:-1, :-2]) / 2
+    normals = torch.cat([gz, gy, gx], dim=1)  # (B, 3, G, G, G)
+    norm = normals.norm(dim=1, keepdim=True).clamp(min=1e-8)
+    return normals / norm
+
+
+def _enforce_positive_jacobian(deform_scalar, normal_dir):
+    """Scale back scalar deformation where the warp Jacobian folds.
+
+    Computes the 3x3 Jacobian of the displacement field (scalar * normal)
+    at the coarse grid via central finite differences, checks
+    det(I + J) > 0.  Where non-positive, halves the scalar iteratively.
+
+    Args:
+        deform_scalar: (B, 1, G, G, G) scalar offsets (modified in-place)
+        normal_dir: (B, 3, G, G, G) unit normals
+    """
+    disp = deform_scalar * normal_dir  # (B, 3, G, G, G)
+    disp_pad = F.pad(disp, (1, 1, 1, 1, 1, 1), mode="replicate")
+    # Jacobian J[i,j] = d(disp_i)/d(x_j), central finite diffs
+    # i = component (0=z, 1=y, 2=x), j = spatial axis
+    dz = (disp_pad[:, :, 2:, 1:-1, 1:-1] - disp_pad[:, :, :-2, 1:-1, 1:-1]) / 2
+    dy = (disp_pad[:, :, 1:-1, 2:, 1:-1] - disp_pad[:, :, 1:-1, :-2, 1:-1]) / 2
+    dx = (disp_pad[:, :, 1:-1, 1:-1, 2:] - disp_pad[:, :, 1:-1, 1:-1, :-2]) / 2
+    # det(I + J) where J columns are (dz, dy, dx)
+    # I + J has rows for each component, columns for each spatial axis
+    # Row i, col j = delta_ij + J[i,j]
+    a00 = 1 + dz[:, 0]; a01 = dy[:, 0]; a02 = dx[:, 0]
+    a10 = dz[:, 1]; a11 = 1 + dy[:, 1]; a12 = dx[:, 1]
+    a20 = dz[:, 2]; a21 = dy[:, 2]; a22 = 1 + dx[:, 2]
+    det = (a00 * (a11 * a22 - a12 * a21)
+           - a01 * (a10 * a22 - a12 * a20)
+           + a02 * (a10 * a21 - a11 * a20))
+    # Where det <= 0, scale back scalar
+    bad = det <= 0  # (B, G, G, G)
+    if bad.any():
+        # Halve scalar at bad locations (repeat until positive or 8 tries)
+        for _ in range(8):
+            deform_scalar.data[bad.unsqueeze(1).expand_as(deform_scalar)] *= 0.5
+            disp = deform_scalar * normal_dir
+            disp_pad = F.pad(disp, (1, 1, 1, 1, 1, 1), mode="replicate")
+            dz = (disp_pad[:, :, 2:, 1:-1, 1:-1] - disp_pad[:, :, :-2, 1:-1, 1:-1]) / 2
+            dy = (disp_pad[:, :, 1:-1, 2:, 1:-1] - disp_pad[:, :, 1:-1, :-2, 1:-1]) / 2
+            dx = (disp_pad[:, :, 1:-1, 1:-1, 2:] - disp_pad[:, :, 1:-1, 1:-1, :-2]) / 2
+            a00 = 1 + dz[:, 0]; a01 = dy[:, 0]; a02 = dx[:, 0]
+            a10 = dz[:, 1]; a11 = 1 + dy[:, 1]; a12 = dx[:, 1]
+            a20 = dz[:, 2]; a21 = dy[:, 2]; a22 = 1 + dx[:, 2]
+            det = (a00 * (a11 * a22 - a12 * a21)
+                   - a01 * (a10 * a22 - a12 * a20)
+                   + a02 * (a10 * a21 - a11 * a20))
+            bad = det <= 0
+            if not bad.any():
+                break
 
 
 def _build_warp_grid(deform_full, device):
@@ -851,19 +911,24 @@ def _deform_inner_loop(
     pred_cos_gm,   # (B, 2, Z, Y, X) detached model prediction
     targets,       # (B, 8, Z, Y, X) original targets
     validity,      # (B, 1, Z, Y, X) original validity
-    deform,        # (B, 3, G, G, G) current deformation (requires_grad)
+    deform,        # (B, 1, G, G, G) scalar offset (requires_grad)
     n_iters: int,
     inner_lr: float,
     max_frac: float,
     scale_loss_mse_fn,
     scale_loss_l1_fn,
 ):
-    """Optimize the deformation field to minimize cos+grad_mag loss.
+    """Optimize a normal-aligned scalar deformation field.
 
-    Runs in float32 (autocast disabled) for stable gradients on the
-    small deformation tensor.
+    The deformation is parameterized as a scalar offset per grid point,
+    multiplied by the local surface normal direction (computed from the
+    cos channel gradient).  This constrains motion along normals and
+    greatly reduces self-intersection risk.
 
-    Returns the optimized deform tensor (still on GPU, with grad detached).
+    Uses a log-space LR ramp from ``inner_lr`` to ``inner_lr * 10000``
+    and tracks the best (lowest loss) deformation seen at any iteration.
+
+    Returns the best deform tensor (B, 1, G, G, G) on GPU, grad detached.
     """
     G = deform.shape[-1]
     device = pred_cos_gm.device
@@ -873,19 +938,40 @@ def _deform_inner_loop(
     cos_gm_orig = targets[:, 0:2].float()
     val_f = validity.float()
 
-    # Pre-compute max displacement from original grad_mag
+    # Compute normal direction from cos gradient at grid resolution
+    with torch.no_grad():
+        normal_dir = _compute_normal_field(cos_gm_orig[:, 0:1], G)
+
+    # Pre-compute max scalar displacement from original grad_mag
+    # and a validity mask at grid resolution (only deform where GT exists)
     with torch.no_grad():
         gm_ds = F.adaptive_avg_pool3d(cos_gm_orig[:, 1:2], (G, G, G))
         max_disp = max_frac / gm_ds.clamp(min=0.02)  # (B, 1, G, G, G)
+        val_ds = F.adaptive_avg_pool3d(val_f, (G, G, G))
+        valid_mask = (val_ds > 0.01).float()  # (B, 1, G, G, G)
 
     inner_opt = torch.optim.SGD([deform], lr=inner_lr)
     Z, Y, X = targets.shape[2:]
 
+    # Log-space LR ramp: inner_lr → inner_lr * 10000
+    lr_log_start = math.log10(inner_lr)
+    lr_log_end = math.log10(inner_lr * 10000.0)
+
+    best_loss = float("inf")
+    best_deform = deform.detach().clone()
+
     with torch.amp.autocast("cuda", enabled=False):
-        for _ in range(n_iters):
+        for it in range(n_iters):
+            frac = it / max(n_iters - 1, 1)
+            lr_now = 10 ** (lr_log_start + frac * (lr_log_end - lr_log_start))
+            for pg in inner_opt.param_groups:
+                pg["lr"] = lr_now
+
             inner_opt.zero_grad()
+            # Scalar × normal → 3D displacement
+            disp_3d = deform * normal_dir  # (B, 3, G, G, G)
             deform_full = F.interpolate(
-                deform, size=(Z, Y, X), mode="trilinear", align_corners=False,
+                disp_3d, size=(Z, Y, X), mode="trilinear", align_corners=False,
             )
             warped_cg, warped_v = _apply_warp(cos_gm_orig, val_f, deform_full)
             cos_w = warped_cg[:, 1:2] * 20.0
@@ -896,13 +982,19 @@ def _deform_inner_loop(
             loss.backward()
             inner_opt.step()
 
-            # Project to valid range
+            # Clamp scalar magnitude, zero outside valid region,
+            # and enforce positive Jacobian
             with torch.no_grad():
-                disp_mag = deform.norm(dim=1, keepdim=True).clamp(min=1e-6)
-                scale = (max_disp / disp_mag).clamp(max=1.0)
-                deform.data.mul_(scale)
+                deform.data.clamp_(-max_disp, max_disp)
+                deform.data.mul_(valid_mask)
+                _enforce_positive_jacobian(deform, normal_dir)
 
-    return deform.detach()
+                cur_loss = loss.item()
+                if cur_loss < best_loss:
+                    best_loss = cur_loss
+                    best_deform = deform.detach().clone()
+
+    return best_deform
 
 
 # ---------------------------------------------------------------------------
@@ -970,7 +1062,7 @@ def train(
     deform_enabled: bool = True,
     deform_stride: int = 8,
     deform_inner_iters: int = 100,
-    deform_inner_lr: float = 0.1,
+    deform_inner_lr: float = 1000.0,
     deform_max_frac: float = 0.3,
 ) -> None:
     rank, local_rank, world_size, is_dist = _init_distributed()
@@ -1396,6 +1488,9 @@ def train(
         world_size=world_size,
         is_main=is_main,
         deform_store=deform_store,
+        deform_inner_iters=deform_inner_iters,
+        deform_inner_lr=deform_inner_lr,
+        deform_max_frac=deform_max_frac,
     )
     if _init_vis_batch:
         _log_full_vis(_init_vis_batch[0], "val", global_step)
@@ -1777,9 +1872,14 @@ def train(
 
                     # Apply final warp to cos/grad_mag targets
                     with torch.no_grad():
+                        G = deform_opt.shape[-1]
+                        normal_dir = _compute_normal_field(
+                            targets[:, 0:1].float(), G,
+                        )
+                        disp_3d = deform_opt * normal_dir
                         Z, Y, X = targets.shape[2:]
                         df = F.interpolate(
-                            deform_opt, size=(Z, Y, X),
+                            disp_3d, size=(Z, Y, X),
                             mode="trilinear", align_corners=False,
                         )
                         warped_cg, warped_v = _apply_warp(
@@ -1896,16 +1996,17 @@ def train(
                     global_step,
                 )
                 log_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
-                if targets_deformed is not None:
-                    # Log deformation magnitude stats
+                if deform_store is not None:
+                    # Log deformation magnitude stats (from stored values,
+                    # regardless of whether this step applied deformation)
                     batch_global_idxs_log = [
                         pi["global_idx"] for pi in batch["patch_info"]
                     ]
                     _d = deform_store.get(batch_global_idxs_log)
-                    _d_mag = _d.norm(dim=1)  # (B, G, G, G)
-                    log_scalar("train/deform_mean", _d_mag.mean().item(), global_step)
-                    log_scalar("train/deform_max", _d_mag.max().item(), global_step)
-                    del _d, _d_mag
+                    _d_abs = _d.abs()  # (B, 1, G, G, G) scalar offset
+                    log_scalar("train/deform_mean", _d_abs.mean().item(), global_step)
+                    log_scalar("train/deform_max", _d_abs.max().item(), global_step)
+                    del _d, _d_abs
                 if n_scale_aug > 0:
                     total_samples = n_seen * B
                     log_scalar(
@@ -1950,6 +2051,7 @@ def train(
                     device_type=device_type,
                     world_size=world_size,
                     is_main=is_main,
+                    deform_store=deform_store,
                 )
                 if _vis_batch:
                     _log_full_vis(_vis_batch[0], "val", global_step)
@@ -2039,6 +2141,9 @@ def _evaluate(
     world_size: int = 1,
     is_main: bool = True,
     deform_store: "DeformationStore | None" = None,
+    deform_inner_iters: int = 100,
+    deform_inner_lr: float = 1000.0,
+    deform_max_frac: float = 0.3,
 ):
     model.eval()
     losses = []
@@ -2049,7 +2154,7 @@ def _evaluate(
     losses_smooth: list[float] = []
     angles_sparse_deg: list[float] = []
     vis_done = False
-    _vis_acc: list[tuple] = []  # accumulate (image, pred, targets, mask) for multi-sample vis
+    _vis_acc: list[tuple] = []  # accumulate (image, pred, targets, mask, targets_orig) for vis
 
     val_iter = loader
     if verbose:
@@ -2058,8 +2163,6 @@ def _evaluate(
     with torch.no_grad(), torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_autocast):
         for batch in val_iter:
             if batch is None:
-                # Transient read error on this val shard sample —
-                # no grad sync in val so each rank skips independently.
                 continue
             image = batch["image"].to(device)
             (
@@ -2080,6 +2183,44 @@ def _evaluate(
 
             cos_mask = validity
             dir_mask = ((dir_sparse_mask + dir_dense_mask) > 0.5).float()
+
+            # Deformation inner loop (same as training)
+            targets_original = targets
+            if deform_store is not None:
+                batch_gidxs = [pi["global_idx"] for pi in batch["patch_info"]]
+                deform_batch = deform_store.get(batch_gidxs).to(device)
+                deform_batch.requires_grad_(True)
+
+                with torch.enable_grad():
+                    deform_opt = _deform_inner_loop(
+                        pred[:, 0:2].detach(),
+                        targets, cos_mask,
+                        deform_batch,
+                        n_iters=deform_inner_iters,
+                        inner_lr=deform_inner_lr,
+                        max_frac=deform_max_frac,
+                        scale_loss_mse_fn=scale_loss_mse,
+                        scale_loss_l1_fn=scale_loss_l1,
+                    )
+
+                G = deform_opt.shape[-1]
+                normal_dir = _compute_normal_field(
+                    targets[:, 0:1].float(), G,
+                )
+                disp_3d = deform_opt * normal_dir
+                Z, Y, X = targets.shape[2:]
+                df = F.interpolate(
+                    disp_3d, size=(Z, Y, X),
+                    mode="trilinear", align_corners=False,
+                )
+                warped_cg, warped_v = _apply_warp(
+                    targets[:, 0:2], cos_mask, df,
+                )
+                targets = targets.clone()
+                targets[:, 0:2] = warped_cg
+                cos_mask = warped_v
+
+                deform_store.put(batch_gidxs, deform_opt)
 
             loss_cos = scale_loss_mse(pred[:, 0:1], targets[:, 0:1], mask=cos_mask)
             loss_mag = scale_loss_l1(pred[:, 1:2], targets[:, 1:2], mask=cos_mask)
@@ -2127,27 +2268,12 @@ def _evaluate(
 
             # Accumulate up to 4 samples for visualization (rank 0 only).
             if not vis_done and is_main and len(_vis_acc) < 4:
-                # Apply stored deformation for vis (no inner loop)
-                targets_orig_vis = targets
-                targets_vis = targets
-                if deform_store is not None:
-                    batch_gidxs = [pi["global_idx"] for pi in batch["patch_info"]]
-                    d = deform_store.get(batch_gidxs).to(device)
-                    if d.abs().max() > 0:
-                        Z, Y, X = targets.shape[2:]
-                        df = F.interpolate(
-                            d, size=(Z, Y, X),
-                            mode="trilinear", align_corners=False,
-                        )
-                        w_cg, w_v = _apply_warp(targets[:, 0:2], validity, df)
-                        targets_vis = targets.clone()
-                        targets_vis[:, 0:2] = w_cg
                 _vis_acc.append((
                     image.detach().cpu(),
                     pred.detach().cpu(),
-                    targets_vis.detach().cpu(),
+                    targets.detach().cpu(),           # deformed (or original if no deform)
                     cos_mask.detach().cpu(),
-                    targets_orig_vis.detach().cpu(),
+                    targets_original.detach().cpu(),  # always the original
                 ))
                 if vis_batch_out is not None:
                     vis_batch_out.append(batch)
@@ -2156,7 +2282,6 @@ def _evaluate(
 
     # Log assembled val visualization (up to 4 samples concatenated).
     if _vis_acc and is_main:
-        has_deform = any(a[4] is not a[2] for a in _vis_acc)
         _log_vis(
             log_images, "val",
             torch.cat([a[0] for a in _vis_acc], dim=0).to(device),
@@ -2166,7 +2291,7 @@ def _evaluate(
             global_step,
             targets_original=(
                 torch.cat([a[4] for a in _vis_acc], dim=0).to(device)
-                if has_deform else None
+                if deform_store is not None else None
             ),
         )
 
@@ -2286,8 +2411,9 @@ def main() -> None:
     parser.add_argument("--deform-inner-iters", type=int, default=100,
                         help="Inner optimization iterations for deformation "
                              "per training step.")
-    parser.add_argument("--deform-inner-lr", type=float, default=0.1,
-                        help="SGD learning rate for inner deformation loop.")
+    parser.add_argument("--deform-inner-lr", type=float, default=1000.0,
+                        help="Start LR for inner deformation loop "
+                             "(ramps to 100x on log scale).")
     parser.add_argument("--deform-max-frac", type=float, default=0.3,
                         help="Max displacement as fraction of inter-surface "
                              "distance.")
