@@ -474,6 +474,22 @@ struct ZarrMetadata {
     return true;
 }
 
+/// Structural check: zarr v3, sharded, with 256^3 inner chunks (c3d codec
+/// atom). As with is_canonical_vc3d, this only checks shape; the inner
+/// bytes still need a C3DC magic-check before decode.
+[[nodiscard]] inline bool is_canonical_c3d(const ZarrMetadata& m) noexcept {
+    if (m.version != ZarrVersion::v3) return false;
+    if (!m.shard_config) return false;
+    const auto& sc = *m.shard_config;
+    if (sc.sub_chunks.size() < 3) return false;
+    if (sc.sub_chunks[0] != 256 || sc.sub_chunks[1] != 256 || sc.sub_chunks[2] != 256)
+        return false;
+    if (m.chunks.size() < 3) return false;
+    for (int d = 0; d < 3; ++d) if (m.chunks[d] % 256 != 0) return false;
+    if (m.dtype != ZarrDtype::uint8) return false;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Store abstraction
 // ---------------------------------------------------------------------------
