@@ -1,11 +1,13 @@
 {
     "volume_cache_dir": "/ephemeral/hendrik/zarr_cache",
     "volume_cache_retry_seconds": 600,
-    "patch_size": 192,
     "volume_cache_offline": false,
+    "patch_size": 192,
     "overlap_fraction": 0.25,
     "chunk_pad": 20.0,
     "same_surface_threshold": 2.0,
+    "scale_aug_prob": 0.5,
+    "scale_aug_factor": 2,
     "datasets": [
         {
             "__volume_path": "s3://volpkgs/PHerc0139.volpkg/volumes/2um_ds2_raw.zarr/",
@@ -43,6 +45,19 @@
             "volume_scale": 1,
             "segments_path": "/ephemeral/hendrik/nt_dataset_022026/PHerc0500p2/tifxyz",
             "z_range": [1700, 6000]
+        },
+        {
+            "volume_path": "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr",
+            "volume_scale": 2,
+            "cache_scale": 0,
+            "segments_path": "/ephemeral/hendrik/nt_dataset_022026/PHercParis4/tifxyz",
+            "z_range": [1000, 9250],
+            "transform": [
+                [-0.23841071793061291, -0.19362400462393486, 0.0021338753748049444, 11024.043667710986],
+                [-0.19369582314244563, 0.23850010646891293, -0.003964264465841007, 2861.834433287773],
+                [-0.0008390736081137979, 0.004538179336261518, 0.30657436617414124, -9057.070809768327]
+            ],
+            "transform_invert": true
         }
     ]
 }

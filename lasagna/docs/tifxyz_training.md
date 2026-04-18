@@ -85,6 +85,9 @@ for a full 6-scroll example.
 | `volume_scale` | per-dataset | yes | Resolution level in the zarr group (0 = full res) |
 | `segments_path` | per-dataset | yes | Local path to tifxyz segment directories |
 | `z_range` | per-dataset | recommended | `[z_min, z_max]` -- safe Z-slice range; excludes regions outside the scroll |
+| `cache_scale` | per-dataset | no | Volume scale used for patch-finding/caching (default = `volume_scale`). Set to match another dataset entry's `volume_scale` to share its patch cache when using `transform`. |
+| `transform` | per-dataset | no | Inline 3×4 affine matrix (XYZ, row-major) mapping segment coords → volume level-0 coords (after optional inversion). Enables cross-volume training. |
+| `transform_invert` | per-dataset | no | If `true`, invert the `transform` matrix before applying (default `false`). |
 | `scale_aug_prob` | top-level | no | Per-sample probability of scale augmentation (default `0.0` = off) |
 | `scale_aug_factor` | top-level | no | Scale augmentation downscale factor (default `2`) |
 
@@ -117,6 +120,40 @@ How it works:
   fast
 
 For best performance, use an NVMe-backed path for `volume_cache_dir`.
+
+
+## Cross-Volume Training
+
+When a higher-resolution scan of the same scroll becomes available, you can
+reuse existing GT surfaces (tifxyz) with the new volume by providing an affine
+transform that maps between coordinate systems.
+
+```json
+{
+    "volume_path": "s3://bucket/new_scan.zarr",
+    "volume_scale": 2,
+    "cache_scale": 0,
+    "segments_path": "/path/to/same/tifxyz",
+    "z_range": [1000, 9250],
+    "transform": [
+        [a00, a01, a02, t0],
+        [a10, a11, a12, t1],
+        [a20, a21, a22, t2]
+    ],
+    "transform_invert": true
+}
+```
+
+- The `transform` is a 3×4 affine matrix in XYZ order (same as `transform.json`
+  from volume registration). It maps segment coordinates to volume level-0
+  coordinates after optional inversion.
+- `transform_invert: true` inverts the matrix before applying — use this when
+  the transform.json maps new→old but you need old→new.
+- `cache_scale` should match the `volume_scale` of the original dataset entry
+  that uses the same `segments_path`. This ensures the patch cache is shared:
+  patches are tiled in cache-scale coordinates, and the affine is applied at
+  data-loading time to map coordinates to the target volume.
+- `z_range` is in cache-scale coordinates (matching the original entry).
 
 
 ## Running Training
@@ -174,6 +211,11 @@ python lasagna/train_tifxyz.py \
 | `--wandb-run-name` | None | W&B run name |
 | `--wandb-tags` | None | Comma-separated W&B tags |
 | `--no-himag-filter` | off | Disable hi-mag sample filtering entirely |
+| `--no-deform` | off | Disable per-sample GT deformation refinement |
+| `--deform-stride` | 8 | Deformation grid stride (grid = label_patch_size / stride) |
+| `--deform-inner-iters` | 100 | Inner optimization iterations per training step |
+| `--deform-inner-lr` | 1000 | Start LR for deformation inner loop (ramps to 100x on log scale) |
+| `--deform-max-frac` | 0.3 | Max displacement as fraction of inter-surface distance |
 
 ### Multi-GPU (DDP)
 
@@ -260,6 +302,38 @@ When active on a batch:
 - The zarr Group is opened once per dataset at init (only when `scale_aug_prob > 0`)
 - Falls back to no augmentation if the target zarr level doesn't exist
 - A second dataset instance + DataLoader is created for the scale-aug path
+
+### GT deformation refinement
+
+Per-sample learnable deformation of the cos and grad_mag GT labels. The neural
+tracer GT surfaces are not perfectly accurate (smoothed, artifacts). A low-res
+volumetric displacement field per sample is optimized during training to warp the
+GT closer to what the model predicts, effectively refining the GT.
+
+**How it works:**
+- Each sample gets a `(3, G, G, G)` displacement field (default G = patch_size/8 = 24)
+- Every training step (non-scale-aug), the deformation is optimized for N inner
+  iterations (default 100) to minimize cos + grad_mag loss between the model's
+  prediction and the warped GT
+- Displacement magnitude is clamped to 0.3 × inter-surface distance (from grad_mag)
+- The warp is applied only to cos and grad_mag channels (not direction)
+- Deformations are stored in pre-augmentation GT space; spatial augmentation
+  (flips/rot90) is applied/reversed automatically
+- Skipped for scale-aug batches (different coordinate frame)
+
+**Storage:**
+- Disk-backed via numpy memmap: `run_dir/deformations/<key>.bin`
+- Keyed by `(segments_path, dataset_idx)` for portability across config changes
+- Float16 on disk (~83KB per sample), converted to float32 on GPU
+- Automatically persisted — resume loads existing deformations
+
+**Visualization:**
+- TensorBoard/W&B shows both `{channel}_gt` (original) and `{channel}_gt_deformed`
+  for cos and grad_mag
+- `train/deform_mean` and `train/deform_max` track displacement magnitude
+
+**CLI flags:** `--no-deform`, `--deform-stride`, `--deform-inner-iters`,
+`--deform-inner-lr`, `--deform-max-frac` (see table above).
 
 ### GPU pause/resume
 
