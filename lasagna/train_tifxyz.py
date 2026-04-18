@@ -32,7 +32,12 @@ import os as _os
 _os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True",
 )
-del _os
+# Limit per-process thread pools to avoid 2000%+ CPU per dataloader worker.
+# Must be set before importing numpy, blosc, torch, etc.
+for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+           "BLOSC_NTHREADS", "NUMEXPR_MAX_THREADS", "NUMBA_NUM_THREADS"):
+    _os.environ.setdefault(_k, "4")
+del _k, _os
 
 # Pre-warm numba LLVM runtime before any other imports. torch pulls in
 # opt_einsum, whose backends/__init__.py eagerly imports
@@ -1059,6 +1064,7 @@ def train(
     wandb_tags: Optional[List[str]] = None,
     reinit_decoder_scales: int = 0,
     himag_filter: bool = True,
+    num_loss_scales: int = 5,
     deform_enabled: bool = True,
     deform_stride: int = 8,
     deform_inner_iters: int = 100,
@@ -1221,7 +1227,7 @@ def train(
         )
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, sampler=train_sampler,
-            num_workers=num_workers, pin_memory=True,
+            num_workers=num_workers, pin_memory=True, timeout=120,
             collate_fn=collate_variable_surfaces,
         )
         if train_dataset_aug is not None:
@@ -1232,31 +1238,30 @@ def train(
             train_loader_aug = DataLoader(
                 train_dataset_aug, batch_size=batch_size,
                 sampler=train_sampler_aug,
-                num_workers=num_workers, pin_memory=True,
+                num_workers=num_workers, pin_memory=True, timeout=120,
                 collate_fn=collate_variable_surfaces,
             )
         val_loader = DataLoader(
             val_dataset, batch_size=1, sampler=val_sampler,
-            num_workers=num_workers,
+            num_workers=num_workers, timeout=120,
             collate_fn=collate_variable_surfaces,
         )
     else:
         train_sampler = None
-        val_sampler = None
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True,
-            num_workers=num_workers, pin_memory=True,
+            num_workers=num_workers, pin_memory=True, timeout=120,
             collate_fn=collate_variable_surfaces,
         )
         if train_dataset_aug is not None:
             train_loader_aug = DataLoader(
                 train_dataset_aug, batch_size=batch_size, shuffle=True,
-                num_workers=num_workers, pin_memory=True,
+                num_workers=num_workers, pin_memory=True, timeout=120,
                 collate_fn=collate_variable_surfaces,
             )
         val_loader = DataLoader(
             val_dataset, batch_size=1, shuffle=False,
-            num_workers=num_workers,
+            num_workers=num_workers, timeout=120,
             collate_fn=collate_variable_surfaces,
         )
     if is_main:
@@ -1338,8 +1343,8 @@ def train(
     # Losses
     mse_loss = MaskedMSE()
     smooth_l1_loss = MaskedSmoothL1()
-    scale_loss_mse = ScaleSpaceLoss3D(mse_loss, num_scales=5)
-    scale_loss_l1 = ScaleSpaceLoss3D(smooth_l1_loss, num_scales=5)
+    scale_loss_mse = ScaleSpaceLoss3D(mse_loss, num_scales=num_loss_scales)
+    scale_loss_l1 = ScaleSpaceLoss3D(smooth_l1_loss, num_scales=num_loss_scales)
 
     # GPU pause/resume server — allows other apps to reclaim the GPU.
     pause_server = GpuPauseServer() if is_main else None
@@ -1470,6 +1475,8 @@ def train(
             print(f"{TAG} full_vis ({tag}) render failed at step "
                   f"{step}: {e}", flush=True)
 
+    VIS_SAMPLES = 8
+
     # Initial eval before training so we see init/load performance.
     if is_main:
         print(f"{TAG} running pre-training eval at step 0...", flush=True)
@@ -1491,6 +1498,7 @@ def train(
         deform_inner_iters=deform_inner_iters,
         deform_inner_lr=deform_inner_lr,
         deform_max_frac=deform_max_frac,
+        vis_samples=VIS_SAMPLES,
     )
     if _init_vis_batch:
         _log_full_vis(_init_vis_batch[0], "val", global_step)
@@ -1564,16 +1572,22 @@ def train(
             else:
                 use_aug = False
 
-            if use_aug:
-                batch = next(iter_aug, None)
-                if batch is None:
-                    iter_aug = iter(train_loader_aug)
+            try:
+                if use_aug:
                     batch = next(iter_aug, None)
-            else:
-                batch = next(iter_normal, None)
-                if batch is None:
-                    iter_normal = iter(train_loader)
+                    if batch is None:
+                        iter_aug = iter(train_loader_aug)
+                        batch = next(iter_aug, None)
+                else:
                     batch = next(iter_normal, None)
+                    if batch is None:
+                        iter_normal = iter(train_loader)
+                        batch = next(iter_normal, None)
+            except Exception as _dl_err:
+                # DataLoader timeout or worker crash — treat as read error.
+                print(f"{TAG} dataloader error: {type(_dl_err).__name__}: {_dl_err}",
+                      flush=True)
+                batch = None
             # All samples this rank raised in __getitem__ (transient
             # zarr/S3 read errors). Coordinate with other ranks so
             # that if ANY rank is empty, all skip this step.
@@ -1619,6 +1633,17 @@ def train(
             if use_aug:
                 sf = scale_aug_factor
                 v = validity  # (B, 1, Z, Y, X)
+                # If any spatial dim is smaller than the pool kernel,
+                # pad to at least sf so avg_pool3d doesn't crash.
+                pad_needed = [max(0, sf - v.shape[d]) for d in (4, 3, 2)]  # x, y, z
+                if any(p > 0 for p in pad_needed):
+                    _p = (0, pad_needed[0], 0, pad_needed[1], 0, pad_needed[2])
+                    v = F.pad(v, _p, value=0)
+                    targets = F.pad(targets, _p, value=0)
+                    dir_sparse_mask = F.pad(dir_sparse_mask, _p, value=0)
+                    dir_dense_mask = F.pad(dir_dense_mask, _p, value=0)
+                    dir_axis_weight = F.pad(dir_axis_weight, _p, value=0)
+                    validity = v
                 v_count = F.avg_pool3d(v, kernel_size=sf, stride=sf)
 
                 # Valid-pool value tensors (avg only over valid voxels).
@@ -2052,6 +2077,7 @@ def train(
                     world_size=world_size,
                     is_main=is_main,
                     deform_store=deform_store,
+                    vis_samples=VIS_SAMPLES,
                 )
                 if _vis_batch:
                     _log_full_vis(_vis_batch[0], "val", global_step)
@@ -2144,6 +2170,7 @@ def _evaluate(
     deform_inner_iters: int = 100,
     deform_inner_lr: float = 1000.0,
     deform_max_frac: float = 0.3,
+    vis_samples: int = 8,
 ):
     model.eval()
     losses = []
@@ -2154,7 +2181,7 @@ def _evaluate(
     losses_smooth: list[float] = []
     angles_sparse_deg: list[float] = []
     vis_done = False
-    _vis_acc: list[tuple] = []  # accumulate (image, pred, targets, mask, targets_orig) for vis
+    _vis_acc: list[tuple] = []  # accumulated on every rank, gathered to rank 0
 
     val_iter = loader
     if verbose:
@@ -2266,21 +2293,32 @@ def _evaluate(
             if verbose:
                 val_iter.set_postfix(loss=f"{loss.item():.4f}")
 
-            # Accumulate up to 4 samples for visualization (rank 0 only).
-            if not vis_done and is_main and len(_vis_acc) < 4:
+            # Accumulate vis samples on every rank (gathered to rank 0 below).
+            if not vis_done and len(_vis_acc) < vis_samples:
                 _vis_acc.append((
                     image.detach().cpu(),
                     pred.detach().cpu(),
-                    targets.detach().cpu(),           # deformed (or original if no deform)
+                    targets.detach().cpu(),
                     cos_mask.detach().cpu(),
-                    targets_original.detach().cpu(),  # always the original
+                    targets_original.detach().cpu(),
                 ))
                 if vis_batch_out is not None:
                     vis_batch_out.append(batch)
-                if len(_vis_acc) >= 4:
+                if len(_vis_acc) >= vis_samples:
                     vis_done = True
 
-    # Log assembled val visualization (up to 4 samples concatenated).
+    # Gather vis samples from all ranks to rank 0.
+    if world_size > 1:
+        # Each rank sends its list of tuples; rank 0 collects all.
+        all_vis: list[list[tuple]] | None = [None] * world_size if is_main else None
+        dist.gather_object(_vis_acc, all_vis, dst=0)
+        if is_main and all_vis is not None:
+            _vis_acc = []
+            for rank_vis in all_vis:
+                if rank_vis:
+                    _vis_acc.extend(rank_vis)
+            _vis_acc = _vis_acc[:vis_samples]
+
     if _vis_acc and is_main:
         _log_vis(
             log_images, "val",
@@ -2403,6 +2441,8 @@ def main() -> None:
                              "loss magnitude.")
     parser.add_argument("--wandb-tags", type=str, default=None,
                         help="Comma-separated list of W&B run tags.")
+    parser.add_argument("--num-loss-scales", type=int, default=5,
+                        help="Number of scales in scale-space loss (1 = no multi-scale).")
     parser.add_argument("--no-deform", action="store_true",
                         help="Disable per-sample GT deformation refinement.")
     parser.add_argument("--deform-stride", type=int, default=8,
@@ -2454,6 +2494,7 @@ def main() -> None:
         ),
         reinit_decoder_scales=args.reinit_decoder_scales,
         himag_filter=not args.no_himag_filter,
+        num_loss_scales=args.num_loss_scales,
         deform_enabled=not args.no_deform,
         deform_stride=args.deform_stride,
         deform_inner_iters=args.deform_inner_iters,
