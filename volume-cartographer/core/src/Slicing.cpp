@@ -942,22 +942,26 @@ void sampleSingleLayerAdaptiveImpl(
     auto levelScale = [](int lvl) { return (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f; };
     const float zOffConst = float(zStart) * zStep;
 
+    // TF LUTs only materialized when the feature is actually on. The
+    // fused sample loop and the output site both check a bool and
+    // skip the LUT indirection when inactive, so we don't even pay the
+    // 256-entry identity-fill for the default (disabled) case.
     alignas(64) uint8_t preTfLut[256];
-    buildTfLut256(
-        lightParams && lightParams->preTfEnabled,
-        lightParams ? lightParams->preTfX1 : 85,
-        lightParams ? lightParams->preTfY1 : 85,
-        lightParams ? lightParams->preTfX2 : 170,
-        lightParams ? lightParams->preTfY2 : 170,
-        preTfLut);
+    const bool preTfOn = lightParams && lightParams->preTfEnabled;
+    if (preTfOn) {
+        buildTfLut256(true,
+            lightParams->preTfX1, lightParams->preTfY1,
+            lightParams->preTfX2, lightParams->preTfY2,
+            preTfLut);
+    }
     alignas(64) uint8_t postTfLut[256];
-    buildTfLut256(
-        lightParams && lightParams->postTfEnabled,
-        lightParams ? lightParams->postTfX1 : 85,
-        lightParams ? lightParams->postTfY1 : 85,
-        lightParams ? lightParams->postTfX2 : 170,
-        lightParams ? lightParams->postTfY2 : 170,
-        postTfLut);
+    const bool postTfOn = lightParams && lightParams->postTfEnabled;
+    if (postTfOn) {
+        buildTfLut256(true,
+            lightParams->postTfX1, lightParams->postTfY1,
+            lightParams->postTfX2, lightParams->postTfY2,
+            postTfLut);
+    }
 
     // Prefetch the chunks the sampled plane touches. Same as the multi-layer
     // version but the bbox collapses to the single-z-slab defined by zStart.
@@ -1118,7 +1122,7 @@ void sampleSingleLayerAdaptiveImpl(
                         }
                     }
                 }
-                float val = float(v);
+                float val = float(preTfOn ? preTfLut[v] : v);
 
                 if (lightingEnabled) {
                     cv::Vec3f lnrm;
@@ -1148,7 +1152,7 @@ void sampleSingleLayerAdaptiveImpl(
                     val *= computeLightingFactor(lnrm, *lightParams);
                 }
                 if (val < 0.f) val = 0.f; if (val > 255.f) val = 255.f;
-                outRow[x] = lut[postTfLut[uint8_t(val)]];
+                outRow[x] = postTfOn ? lut[postTfLut[uint8_t(val)]] : lut[uint8_t(val)];
                 if (lvlRow) lvlRow[x] = pxLevel;
             }
         }
@@ -1301,28 +1305,26 @@ void sampleCompositeAdaptiveImpl(
     const bool lightingEnabled = lightParams && lightParams->lightingEnabled;
     const int  lightNormalSource = lightParams ? lightParams->lightNormalSource : 0;
 
-    // Pre-TF LUT: materialized once per render from lightParams. Identity
-    // when preTfEnabled is off, so the per-sample lookup stays a no-op
-    // without needing a branch in the inner loop. 256 bytes = one cacheline-
-    // worth of L1D.
+    // TF LUTs only materialized when actually enabled — the fused sample
+    // loop and the output site both branch on preTfOn/postTfOn and skip
+    // the LUT indirection when off, so we don't pay the 256-entry fill
+    // in the common default-off case.
     alignas(64) uint8_t preTfLut[256];
-    buildTfLut256(
-        lightParams && lightParams->preTfEnabled,
-        lightParams ? lightParams->preTfX1 : 85,
-        lightParams ? lightParams->preTfY1 : 85,
-        lightParams ? lightParams->preTfX2 : 170,
-        lightParams ? lightParams->preTfY2 : 170,
-        preTfLut);
-    // Post-TF LUT: applied to the composite output before the display
-    // colormap. Same identity-on-disable property as preTfLut.
+    const bool preTfOn = lightParams && lightParams->preTfEnabled;
+    if (preTfOn) {
+        buildTfLut256(true,
+            lightParams->preTfX1, lightParams->preTfY1,
+            lightParams->preTfX2, lightParams->preTfY2,
+            preTfLut);
+    }
     alignas(64) uint8_t postTfLut[256];
-    buildTfLut256(
-        lightParams && lightParams->postTfEnabled,
-        lightParams ? lightParams->postTfX1 : 85,
-        lightParams ? lightParams->postTfY1 : 85,
-        lightParams ? lightParams->postTfX2 : 170,
-        lightParams ? lightParams->postTfY2 : 170,
-        postTfLut);
+    const bool postTfOn = lightParams && lightParams->postTfEnabled;
+    if (postTfOn) {
+        buildTfLut256(true,
+            lightParams->postTfX1, lightParams->postTfY1,
+            lightParams->postTfX2, lightParams->postTfY2,
+            postTfLut);
+    }
 
     // Volumetric-mode exp LUTs: exp(-extN * k) for k in [0..255]. extN is
     // constant per call (from lightParams->blExtinction/255). Pre-computing
@@ -1572,97 +1574,88 @@ void sampleCompositeAdaptiveImpl(
                     // fuses into a single run-length scan over the packed
                     // block-key array, and the inner byte-load loop is
                     // tight enough that clang pipelines it aggressively.
-                    alignas(64) int64_t bkey[kMaxLayers];
-                    alignas(64) int16_t offset[kMaxLayers];
-                    for (int li = 0; li < nL; ++li) {
-                        const int iz = int(swz + 0.5f);
-                        const int iy = int(swy + 0.5f);
-                        const int ix = int(swx + 0.5f);
-                        const int bz = iz >> kBlockShift;
-                        const int by = iy >> kBlockShift;
-                        const int bx = ix >> kBlockShift;
-                        // 20 bits per axis is well beyond any realistic
-                        // block count (2^20 × 16 = 16M voxels/axis).
-                        bkey[li] = (int64_t(bz) << 40)
-                                 | (int64_t(by) << 20)
-                                 |  int64_t(bx);
-                        const int lz = iz & kBlockMask;
-                        const int ly = iy & kBlockMask;
-                        const int lx = ix & kBlockMask;
-                        offset[li] = int16_t(lz * kStrideZ
-                                           + ly * kStrideY
-                                           + lx);
-                        swx += sdx; swy += sdy; swz += sdz;
-                    }
-
-                    int li = 0;
-                    while (li < nL) {
-                        const int64_t key = bkey[li];
-                        const int bz = int((key >> 40) & ((int64_t(1) << 20) - 1));
-                        const int by = int((key >> 20) & ((int64_t(1) << 20) - 1));
-                        const int bx = int( key        & ((int64_t(1) << 20) - 1));
-                        s0.tryUpdateBlockNonBlocking(bz, by, bx);
-                        const uint8_t* cdata = s0.data;
-                        // Run-length extend: find the largest liEnd such that
-                        // bkey[li..liEnd) are all equal to key. Consecutive
-                        // z-samples at zStep=1 typically share a block for
-                        // ~16 layers, so this loop iterates ~16x per block
-                        // transition. Scalar version was ~20% of the composite
-                        // kernel's CPU (perf showed the backward-branch target
-                        // hot). The 4-wide block below issues all 4 compares
-                        // before the branch — bitwise `&` (not `&&`) prevents
-                        // short-circuit so clang can schedule them in parallel
-                        // across the Oryon wide OoO pipeline.
-                        int liEnd = li + 1;
-                        while (liEnd + 4 <= nL) {
-                            const int e0 = bkey[liEnd    ] == key;
-                            const int e1 = bkey[liEnd + 1] == key;
-                            const int e2 = bkey[liEnd + 2] == key;
-                            const int e3 = bkey[liEnd + 3] == key;
-                            if ((e0 & e1 & e2 & e3) == 0) break;
-                            liEnd += 4;
-                        }
-                        while (liEnd < nL && bkey[liEnd] == key) ++liEnd;
-                        const int runLen = liEnd - li;
-                        if (cdata) {
-                            // Tight same-block inner loop: N byte loads
-                            // into accumulator. Clang pipelines 4 per
-                            // cycle comfortably on ARM — benchmarked
-                            // identical to a manual 4-wide unroll so
-                            // we keep the simpler scalar form.
-                            if constexpr (AMode == AccumMode2::Max) {
-                                uint8_t m = uint8_t(mx);
-                                for (int i = li; i < liEnd; ++i) {
-                                    const uint8_t v = preTfLut[cdata[offset[i]]];
-                                    m = v > m ? v : m;
-                                }
-                                mx = float(m);
-                            } else if constexpr (AMode == AccumMode2::Min) {
-                                uint8_t m = uint8_t(mn);
-                                for (int i = li; i < liEnd; ++i) {
-                                    const uint8_t v = preTfLut[cdata[offset[i]]];
-                                    m = v < m ? v : m;
-                                }
-                                mn = float(m);
-                            } else if constexpr (AMode == AccumMode2::Mean) {
-                                int sum = 0;
-                                for (int i = li; i < liEnd; ++i) {
-                                    sum += int(preTfLut[cdata[offset[i]]]);
-                                }
-                                accum += float(sum);
-                                count += runLen;
-                            } else {
-                                for (int i = li; i < liEnd; ++i) {
-                                    layerVals[i] = float(preTfLut[cdata[offset[i]]]);
-                                }
+                    // Fused coord-compute + block-change check + sample.
+                    // The prior two-pass version (precompute bkey[]/offset[],
+                    // then 4-wide SIMD run-length scan, then inner sample
+                    // loop) spent ~17% of the composite kernel's CPU inside
+                    // the SIMD scan alone. Fusing into a single per-layer
+                    // loop eliminates the scan entirely plus the stack
+                    // arrays: the block-change check becomes an int-compare
+                    // against the previous layer's (bz,by,bx) tuple carried
+                    // in registers. When Pre-TF is disabled (common case)
+                    // the inner path skips the extra LUT lookup as a bonus.
+                    int prevBz = std::numeric_limits<int>::min();
+                    int prevBy = 0, prevBx = 0;
+                    const uint8_t* cdata = nullptr;
+                    if constexpr (AMode == AccumMode2::Max
+                               || AMode == AccumMode2::Min
+                               || AMode == AccumMode2::Mean) {
+                        // Direct accumulators — keep the running value in
+                        // a register across the whole ray. No per-layer
+                        // write to layerVals[].
+                        [[maybe_unused]] uint8_t mM = uint8_t(mx);
+                        [[maybe_unused]] uint8_t mm = uint8_t(mn);
+                        [[maybe_unused]] int sumAcc = 0;
+                        [[maybe_unused]] int cnt = 0;
+                        for (int li = 0; li < nL; ++li) {
+                            const int iz = int(swz + 0.5f);
+                            const int iy = int(swy + 0.5f);
+                            const int ix = int(swx + 0.5f);
+                            const int bz = iz >> kBlockShift;
+                            const int by = iy >> kBlockShift;
+                            const int bx = ix >> kBlockShift;
+                            if (bz != prevBz || by != prevBy || bx != prevBx) {
+                                prevBz = bz; prevBy = by; prevBx = bx;
+                                s0.tryUpdateBlockNonBlocking(bz, by, bx);
+                                cdata = s0.data;
                             }
-                        } else if constexpr (AMode == AccumMode2::Mean) {
-                            // Missing block → 0 voxels count toward mean
-                            count += runLen;
-                        } else if constexpr (AMode == AccumMode2::LayerStorage) {
-                            for (int i = li; i < liEnd; ++i) layerVals[i] = 0.f;
+                            swx += sdx; swy += sdy; swz += sdz;
+                            if constexpr (AMode == AccumMode2::Mean) {
+                                cnt++;
+                            }
+                            if (!cdata) continue;
+                            const int lz = iz & kBlockMask;
+                            const int ly = iy & kBlockMask;
+                            const int lx = ix & kBlockMask;
+                            const uint8_t raw = cdata[lz * kStrideZ
+                                                    + ly * kStrideY + lx];
+                            const uint8_t v = preTfOn ? preTfLut[raw] : raw;
+                            if constexpr (AMode == AccumMode2::Max) {
+                                mM = v > mM ? v : mM;
+                            } else if constexpr (AMode == AccumMode2::Min) {
+                                mm = v < mm ? v : mm;
+                            } else {
+                                sumAcc += int(v);
+                            }
                         }
-                        li = liEnd;
+                        if constexpr (AMode == AccumMode2::Max)  mx = float(mM);
+                        else if constexpr (AMode == AccumMode2::Min) mn = float(mm);
+                        else { accum += float(sumAcc); count += cnt; }
+                    } else {
+                        // LayerStorage: emit one float per layer into
+                        // layerVals[] for the downstream composite method.
+                        for (int li = 0; li < nL; ++li) {
+                            const int iz = int(swz + 0.5f);
+                            const int iy = int(swy + 0.5f);
+                            const int ix = int(swx + 0.5f);
+                            const int bz = iz >> kBlockShift;
+                            const int by = iy >> kBlockShift;
+                            const int bx = ix >> kBlockShift;
+                            if (bz != prevBz || by != prevBy || bx != prevBx) {
+                                prevBz = bz; prevBy = by; prevBx = bx;
+                                s0.tryUpdateBlockNonBlocking(bz, by, bx);
+                                cdata = s0.data;
+                            }
+                            swx += sdx; swy += sdy; swz += sdz;
+                            if (!cdata) { layerVals[li] = 0.f; continue; }
+                            const int lz = iz & kBlockMask;
+                            const int ly = iy & kBlockMask;
+                            const int lx = ix & kBlockMask;
+                            const uint8_t raw = cdata[lz * kStrideZ
+                                                    + ly * kStrideY + lx];
+                            const uint8_t v = preTfOn ? preTfLut[raw] : raw;
+                            layerVals[li] = float(v);
+                        }
                     }
                 } else {
                     // Near-edge / partial-miss path: keep the original
@@ -1678,7 +1671,7 @@ void sampleCompositeAdaptiveImpl(
                                 break;
                             }
                         }
-                        v = preTfLut[v];
+                        if (preTfOn) v = preTfLut[v];
                         if constexpr (AMode == AccumMode2::Max) { mx = std::max(mx, float(v)); }
                         else if constexpr (AMode == AccumMode2::Min) { mn = std::min(mn, float(v)); }
                         else if constexpr (AMode == AccumMode2::Mean) { accum += float(v); count++; }
@@ -2220,7 +2213,7 @@ void sampleCompositeAdaptiveImpl(
                     val *= computeLightingFactor(lnrm, *lightParams);
                 }
                 if (val < 0.f) val = 0.f; if (val > 255.f) val = 255.f;
-                outRow[x] = lut[postTfLut[uint8_t(val)]];
+                outRow[x] = postTfOn ? lut[postTfLut[uint8_t(val)]] : lut[uint8_t(val)];
                 if (lvlRow) lvlRow[x] = pxLevel;
             }
         }
