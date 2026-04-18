@@ -113,6 +113,9 @@ struct ChunkSampler {
         int iz = -1, iy = -1, ix = -1;
         vc::cache::ChunkDataPtr chunk;
         const T* data = nullptr;
+        int shift = 0;          // 0 = native level, >0 = coarser by this many levels
+        size_t fs0 = 0, fs1 = 0;  // strides for this slot's actual chunk
+        int coarseOriginZ = 0, coarseOriginY = 0, coarseOriginX = 0;  // chunk origin in coarse voxels
     };
 
     const CacheParams& p;
@@ -121,7 +124,7 @@ struct ChunkSampler {
     Slot slots[kSlots];
     int mru = 0;  // most-recently-used slot index
     const T* data = nullptr;  // current data pointer
-    size_t s0 = 0, s1 = 0;   // strides (s2 is always 1, eliminated)
+    size_t s0 = 0, s1 = 0;   // strides for native-level chunks (s2 is always 1, eliminated)
 
     ChunkSampler(const CacheParams& p_, vc::cache::TieredChunkCache& cache_, int level_)
         : p(p_), cache(cache_), level(level_)
@@ -157,11 +160,50 @@ struct ChunkSampler {
         // Miss: evict LRU (slot furthest from mru in ring)
         int victim = (mru + 1) % kSlots;
         auto& v = slots[victim];
-        v.chunk = cache.getBlocking(vc::cache::ChunkKey{level, iz, iy, ix});
+        vc::cache::ChunkKey key{level, iz, iy, ix};
+        v.chunk = cache.getBlocking(key);
+
+        if (v.chunk) {
+            v.shift = 0;
+            v.fs0 = s0;
+            v.fs1 = s1;
+        } else {
+            // Fallback: try coarser levels
+            auto [coarse, actualLvl] = cache.getBestAvailable(key);
+            if (coarse) {
+                v.chunk = coarse;
+                v.shift = actualLvl - level;
+                auto cs = cache.chunkShape(actualLvl);
+                v.fs0 = static_cast<size_t>(cs[1]) * cs[2];
+                v.fs1 = static_cast<size_t>(cs[2]);
+                auto coarseKey = key.coarsen(actualLvl);
+                auto coarseCs = cache.chunkShape(actualLvl);
+                v.coarseOriginZ = coarseKey.iz * coarseCs[0];
+                v.coarseOriginY = coarseKey.iy * coarseCs[1];
+                v.coarseOriginX = coarseKey.ix * coarseCs[2];
+            }
+        }
+
         v.iz = iz; v.iy = iy; v.ix = ix;
         v.data = v.chunk ? v.chunk->template data<T>() : nullptr;
         mru = victim;
         data = v.data;
+    }
+
+    // Sample a voxel from the current slot, handling coarse-level fallback.
+    // (iz, iy, ix) are fine-level voxel coordinates.
+    T sampleFromSlot(int iz, int iy, int ix) const {
+        auto& slot = slots[mru];
+        if (slot.shift == 0) {
+            return data[p.localZ(iz) * s0 + p.localY(iy) * s1 + p.localX(ix)];
+        }
+        // Remap fine-level voxel to coarse chunk local offset
+        int sh = slot.shift;
+        auto cs = cache.chunkShape(level + sh);
+        int cz = std::clamp((iz >> sh) - slot.coarseOriginZ, 0, cs[0] - 1);
+        int cy = std::clamp((iy >> sh) - slot.coarseOriginY, 0, cs[1] - 1);
+        int cx = std::clamp((ix >> sh) - slot.coarseOriginX, 0, cs[2] - 1);
+        return data[cz * slot.fs0 + cy * slot.fs1 + cx];
     }
 
     bool inBounds(float vz, float vy, float vx) const {
@@ -179,7 +221,7 @@ struct ChunkSampler {
         updateChunk(p.chunkZ(iz), p.chunkY(iy), p.chunkX(ix));
         if (!data) return 0;
 
-        return data[p.localZ(iz) * s0 + p.localY(iy) * s1 + p.localX(ix)];
+        return sampleFromSlot(iz, iy, ix);
     }
 
     T sampleInt(int iz, int iy, int ix) {
@@ -189,7 +231,7 @@ struct ChunkSampler {
         updateChunk(p.chunkZ(iz), p.chunkY(iy), p.chunkX(ix));
         if (!data) return 0;
 
-        return data[p.localZ(iz) * s0 + p.localY(iy) * s1 + p.localX(ix)];
+        return sampleFromSlot(iz, iy, ix);
     }
 
     float sampleTrilinear(float vz, float vy, float vx) {
@@ -239,7 +281,13 @@ struct ChunkSampler {
             updateChunk(ciz0, ciy0, cix0);
             if (!data) return 0;
 
-            // Local stride copies — s2 is always 1, eliminated
+            auto& slot = slots[mru];
+            if (slot.shift > 0) {
+                // Coarse fallback — use per-voxel path for correct remapping
+                return sampleTrilinear(vz, vy, vx);
+            }
+
+            // Native level fast path — direct memory access with +1 offsets
             const size_t ls0 = s0, ls1 = s1;
             int lz0 = p.localZ(iz), ly0 = p.localY(iy), lx0 = p.localX(ix);
             int lz1 = lz0 + 1, ly1 = ly0 + 1, lx1 = lx0 + 1;
@@ -592,6 +640,28 @@ static void readArea3DImpl(xt::xtensor<T, 3, xt::layout_type::column_major>& out
             std::min(to[2], chunk_offset[2] + p.cx)
         };
 
+        // Fallback to coarser level if chunk is missing
+        vc::cache::ChunkDataPtr fallbackPtr;
+        int fallbackShift = 0;
+        int fbOriginZ = 0, fbOriginY = 0, fbOriginX = 0;
+        size_t fbS0 = 0, fbS1 = 0;
+
+        if (!chunkPtr) {
+            vc::cache::ChunkKey key{level, cz, cy, cx};
+            auto [coarse, actualLvl] = cache->getBestAvailable(key);
+            if (coarse) {
+                fallbackPtr = coarse;
+                fallbackShift = actualLvl - level;
+                auto cs = cache->chunkShape(actualLvl);
+                fbS0 = static_cast<size_t>(cs[1]) * cs[2];
+                fbS1 = static_cast<size_t>(cs[2]);
+                auto coarseKey = key.coarsen(actualLvl);
+                fbOriginZ = coarseKey.iz * cs[0];
+                fbOriginY = coarseKey.iy * cs[1];
+                fbOriginX = coarseKey.ix * cs[2];
+            }
+        }
+
         if (chunkPtr) {
             const T* chunkData = chunkPtr->data<T>();
             int strideZ = p.cy * p.cx;
@@ -603,6 +673,19 @@ static void readArea3DImpl(xt::xtensor<T, 3, xt::layout_type::column_major>& out
                         int ly = y - chunk_offset[1];
                         int lx = x - chunk_offset[2];
                         out(z - offset[0], y - offset[1], x - offset[2]) = chunkData[lz * strideZ + ly * strideY + lx];
+                    }
+                }
+            }
+        } else if (fallbackPtr) {
+            const T* fbData = fallbackPtr->data<T>();
+            auto cs = cache->chunkShape(level + fallbackShift);
+            for (int z = copy_from_start[0]; z < copy_from_end[0]; ++z) {
+                for (int y = copy_from_start[1]; y < copy_from_end[1]; ++y) {
+                    for (int x = copy_from_start[2]; x < copy_from_end[2]; ++x) {
+                        int fz = std::clamp((z >> fallbackShift) - fbOriginZ, 0, cs[0] - 1);
+                        int fy = std::clamp((y >> fallbackShift) - fbOriginY, 0, cs[1] - 1);
+                        int fx = std::clamp((x >> fallbackShift) - fbOriginX, 0, cs[2] - 1);
+                        out(z - offset[0], y - offset[1], x - offset[2]) = fbData[fz * fbS0 + fy * fbS1 + fx];
                     }
                 }
             }
