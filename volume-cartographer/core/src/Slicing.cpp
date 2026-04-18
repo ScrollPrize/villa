@@ -206,6 +206,29 @@ struct BlockSampler {
                 data = slot.data;
                 return;
             }
+            // Slice L1: freshly-landed blocks at active pyramid levels.
+            // Plain-memory binary search saves the atomic-heavy
+            // BlockCache::get / isEmptyChunk probes for the first access
+            // of hot data. The slice may contain multiple entries for a
+            // given packedKey (one per pipeline); scan the run looking
+            // for a pipeline match.
+            if (!frame->slice.empty()) {
+                auto it = std::lower_bound(
+                    frame->slice.begin(), frame->slice.end(), key,
+                    [](const vc::cache::SliceEntry& e, std::uint64_t k) {
+                        return e.packedKey < k;
+                    });
+                while (it != frame->slice.end() && it->packedKey == key) {
+                    if (it->pipeline == &cache && it->block) {
+                        slotBlocks[idx] = const_cast<BlockPtr>(it->block);
+                        slot.data = reinterpret_cast<const T*>(it->block->data);
+                        slot.key  = key;
+                        data = slot.data;
+                        return;
+                    }
+                    ++it;
+                }
+            }
         }
 
         BlockKey bk{level, bz, by, bx};
@@ -454,7 +477,7 @@ void prefetchRegion(BlockPipeline& cache, int level,
     keys.clear();
     appendChunksForRegion(cache, level, minVx, minVy, minVz,
                           maxVx, maxVy, maxVz, keys);
-    if (!keys.empty()) cache.fetchInteractive(keys, level);
+    if (!keys.empty()) TickCoordinator::enqueuePrefetchGlobal(&cache, keys, level);
 }
 
 // prefetchCoordsRegion / prefetchPlaneRegion: inputs are already in
@@ -1032,7 +1055,7 @@ void sampleSingleLayerAdaptiveImpl(
                                          std::min(numLevels, int(vc::cache::kMaxLevels)),
                                          viewCenterL0);
             }
-            cache.fetchInteractive(keys, desiredLevel);
+            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel);
         }
     } else {
         cv::Vec3f p0 = *origin + (*planeNormal) * zOffConst;
@@ -1060,7 +1083,7 @@ void sampleSingleLayerAdaptiveImpl(
                                          std::min(numLevels, int(vc::cache::kMaxLevels)),
                                          viewCenterL0);
             }
-            cache.fetchInteractive(keys, desiredLevel);
+            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel);
         }
     }
     }  // skipPrefetch guard
@@ -1259,7 +1282,7 @@ void sampleCompositeAdaptiveImpl(
                                          std::min(numLevels, int(vc::cache::kMaxLevels)),
                                          viewCenterL0);
             }
-            cache.fetchInteractive(keys, desiredLevel);
+            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel);
         }
     } else {
         cv::Vec3f p0 = *origin + (*planeNormal) * zMin;
@@ -1287,7 +1310,7 @@ void sampleCompositeAdaptiveImpl(
                                          std::min(numLevels, int(vc::cache::kMaxLevels)),
                                          viewCenterL0);
             }
-            cache.fetchInteractive(keys, desiredLevel);
+            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel);
         }
     }
     }  // skipPrefetch guard

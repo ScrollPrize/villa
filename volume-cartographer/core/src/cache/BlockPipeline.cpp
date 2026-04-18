@@ -1019,7 +1019,7 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
             }
         }
     }
-    TickCoordinator::notifyChunkLanded(key);
+    TickCoordinator::notifyChunkLanded(this, key);
 }
 
 

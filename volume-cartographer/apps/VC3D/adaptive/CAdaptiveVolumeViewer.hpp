@@ -437,4 +437,9 @@ private:
     vc::cache::BlockPipeline::ChunkReadyCallbackId _chunkCbId = 0;
     bool _hadValidDataBounds = false;
     bool _dirtyWhileMinimized = false;
+
+    // TickCoordinator viewport slot. Acquired lazily on first publish and
+    // released in the destructor. -1 means "no slot" (either coordinator
+    // missing, or allocation table was full at ctor time).
+    int _tickViewportSlot = -1;
 };

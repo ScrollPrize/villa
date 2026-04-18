@@ -12,6 +12,7 @@
 #include "vc/core/types/SampleParams.hpp"
 #include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/cache/ChunkKey.hpp"
+#include "vc/core/cache/TickCoordinator.hpp"
 #include <cstring>
 #include <unordered_set>
 
@@ -153,6 +154,10 @@ CAdaptiveVolumeViewer::~CAdaptiveVolumeViewer()
     if (_chunkCbId != 0 && _volume && _volume->tieredCache()) {
         _volume->tieredCache()->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
+    }
+    if (_tickViewportSlot >= 0) {
+        vc::cache::TickCoordinator::releaseViewportSlotGlobal(_tickViewportSlot);
+        _tickViewportSlot = -1;
     }
 }
 
@@ -490,6 +495,21 @@ void CAdaptiveVolumeViewer::submitRender()
     int fbW = _framebuffer.width();
     int fbH = _framebuffer.height();
     if (fbW <= 0 || fbH <= 0) return;
+
+    // Publish viewport snapshot for the tick coordinator. Used by
+    // prefetch coalescing (so the tick drain knows which pipelines/levels
+    // are in use) and future slice scoping. Slot is lazy-allocated here
+    // and released in the destructor.
+    if (_tickViewportSlot < 0) {
+        _tickViewportSlot = vc::cache::TickCoordinator::acquireViewportSlotGlobal();
+    }
+    if (_tickViewportSlot >= 0) {
+        vc::cache::ViewportSnapshot vs;
+        vs.active = true;
+        vs.level = _camera.dsScaleIdx;
+        vs.pipeline = _volume->tieredCache();
+        vc::cache::TickCoordinator::publishViewportGlobal(_tickViewportSlot, vs);
+    }
 
     // Level buffer is only consumed by the downscale-highlight debug
     // overlay below; when the overlay is off, pass a null pointer to the
