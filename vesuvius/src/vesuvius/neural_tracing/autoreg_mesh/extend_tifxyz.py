@@ -12,9 +12,15 @@ import numpy as np
 import torch
 import zarr
 
-from vesuvius.neural_tracing.autoreg_mesh.infer import infer_autoreg_mesh
-from vesuvius.neural_tracing.autoreg_mesh.model import AutoregMeshModel
-from vesuvius.neural_tracing.autoreg_mesh.serialization import serialize_split_conditioning_example
+from vesuvius.neural_tracing.autoreg_mesh.dataset import autoreg_mesh_collate
+from vesuvius.neural_tracing.autoreg_mesh.infer import (
+    _build_target_strip_coords,
+    _build_target_strip_positions,
+    _sample_from_logits,
+    infer_autoreg_mesh,
+)
+from vesuvius.neural_tracing.autoreg_mesh.model import AutoregMeshModel, build_pseudo_inference_batch
+from vesuvius.neural_tracing.autoreg_mesh.serialization import deserialize_continuation_grid, serialize_split_conditioning_example
 from vesuvius.tifxyz import Tifxyz, read_tifxyz, write_tifxyz
 
 
@@ -37,9 +43,27 @@ class ExtensionIterationStats:
     valid_new_vertices: int
     fitted_window_count: int
     skipped_window_count: int
+    crop_fit_failed_count: int
+    empty_prediction_count: int
+    model_stop_count: int
     crop_read_ms: float
     encode_decode_ms: float
     merge_ms: float
+    iteration_wall_ms: float
+    windows_per_second: float
+    peak_batch_size_used: int
+
+
+@dataclass(frozen=True)
+class ExtensionWindowPayload:
+    window: ExtensionWindow
+    sample: dict[str, Any]
+    direction: str
+    target_grid_shape: tuple[int, int]
+    strip_length: int
+    num_strips: int
+    prompt_strips: int
+    predict_strips: int
 
 
 class VolumeCropCache:
@@ -294,7 +318,7 @@ def _dummy_target_grid(prompt_grid: np.ndarray, direction: str, predict_strips: 
     return np.full((int(predict_strips), prompt_grid.shape[1], 3), np.nan, dtype=np.float32)
 
 
-def build_extension_batch(
+def build_extension_sample(
     *,
     prompt_grid_world: np.ndarray,
     direction: str,
@@ -310,6 +334,7 @@ def build_extension_batch(
     min_corner = np.asarray(min_corner, dtype=np.float32)
     prompt_grid_local = np.asarray(prompt_grid_world, dtype=np.float32) - min_corner.reshape(1, 1, 3)
     dummy_target_local = _dummy_target_grid(prompt_grid_local, direction, predict_strips)
+    frontier_band_width = int(prompt_grid_local.shape[1] if direction in {"left", "right"} else prompt_grid_local.shape[0])
     serialized = serialize_split_conditioning_example(
         cond_zyxs_local=prompt_grid_local,
         masked_zyxs_local=dummy_target_local,
@@ -317,7 +342,7 @@ def build_extension_batch(
         volume_shape=crop_size,
         patch_size=patch_size,
         offset_num_bins=offset_num_bins,
-        frontier_band_width=int(frontier_band_width),
+        frontier_band_width=frontier_band_width,
     )
     world_bbox = (
         float(min_corner[0]),
@@ -328,28 +353,49 @@ def build_extension_batch(
         float(min_corner[2] + crop_size[2]),
     )
     return {
-        "volume": torch.from_numpy(np.asarray(volume_crop, dtype=np.float32)[None, None, ...]),
+        "volume": torch.from_numpy(np.asarray(volume_crop, dtype=np.float32)[None, ...]),
         "vol_tokens": None,
         "prompt_tokens": {
-            "coarse_ids": torch.from_numpy(serialized["prompt_tokens"]["coarse_ids"][None, ...]).to(torch.long),
-            "offset_bins": torch.from_numpy(serialized["prompt_tokens"]["offset_bins"][None, ...]).to(torch.long),
-            "xyz": torch.from_numpy(serialized["prompt_tokens"]["xyz"][None, ...]).to(torch.float32),
-            "strip_positions": torch.from_numpy(serialized["prompt_tokens"]["strip_positions"][None, ...]).to(torch.long),
-            "strip_coords": torch.from_numpy(serialized["prompt_tokens"]["strip_coords"][None, ...]).to(torch.float32),
-            "mask": torch.ones((1, int(serialized["prompt_tokens"]["coarse_ids"].shape[0])), dtype=torch.bool),
-            "valid_mask": torch.from_numpy(serialized["prompt_tokens"]["valid_mask"][None, ...]).to(torch.bool),
+            "coarse_ids": torch.from_numpy(serialized["prompt_tokens"]["coarse_ids"]).to(torch.long),
+            "offset_bins": torch.from_numpy(serialized["prompt_tokens"]["offset_bins"]).to(torch.long),
+            "xyz": torch.from_numpy(serialized["prompt_tokens"]["xyz"]).to(torch.float32),
+            "strip_positions": torch.from_numpy(serialized["prompt_tokens"]["strip_positions"]).to(torch.long),
+            "strip_coords": torch.from_numpy(serialized["prompt_tokens"]["strip_coords"]).to(torch.float32),
+            "valid_mask": torch.from_numpy(serialized["prompt_tokens"]["valid_mask"]).to(torch.bool),
         },
-        "prompt_anchor_xyz": torch.from_numpy(serialized["prompt_anchor_xyz"][None, ...]).to(torch.float32),
-        "prompt_anchor_valid": torch.tensor([bool(serialized["prompt_anchor_valid"])], dtype=torch.bool),
-        "direction": [str(direction)],
-        "direction_id": torch.tensor([int(serialized["direction_id"])], dtype=torch.long),
-        "conditioning_grid_local": [torch.from_numpy(serialized["conditioning_grid_local"]).to(torch.float32)],
-        "strip_length": torch.tensor([int(serialized["strip_length"])], dtype=torch.long),
-        "num_strips": torch.tensor([int(serialized["num_strips"])], dtype=torch.long),
-        "target_grid_shape": torch.tensor([tuple(int(v) for v in serialized["target_grid_shape"])], dtype=torch.long),
-        "min_corner": torch.from_numpy(min_corner[None, ...]).to(torch.float32),
-        "world_bbox": torch.tensor([world_bbox], dtype=torch.float32),
-        "wrap_metadata": [dict(wrap_metadata)],
+        "prompt_meta": {
+            **serialized["prompt_meta"],
+            "conditioning_shape": tuple(int(v) for v in serialized["conditioning_grid_local"].shape[:2]),
+            "surface_sampling_mode": "stored",
+            "spatial_augmented": False,
+            "spatial_mirror_axes": [],
+            "spatial_axis_order": [0, 1, 2],
+        },
+        "conditioning_grid_local": torch.from_numpy(serialized["conditioning_grid_local"]).to(torch.float32),
+        "prompt_anchor_xyz": torch.from_numpy(serialized["prompt_anchor_xyz"]).to(torch.float32),
+        "prompt_anchor_valid": torch.tensor(bool(serialized["prompt_anchor_valid"]), dtype=torch.bool),
+        "prompt_grid_local": torch.from_numpy(serialized["prompt_grid_local"]).to(torch.float32),
+        "target_coarse_ids": torch.from_numpy(serialized["target_coarse_ids"]).to(torch.long),
+        "target_offset_bins": torch.from_numpy(serialized["target_offset_bins"]).to(torch.long),
+        "target_valid_mask": torch.from_numpy(serialized["target_valid_mask"]).to(torch.bool),
+        "target_invalid_mask": torch.from_numpy(~serialized["target_valid_mask"]).to(torch.bool),
+        "target_stop": torch.from_numpy(serialized["target_stop"]).to(torch.float32),
+        "target_xyz": torch.from_numpy(serialized["target_xyz"]).to(torch.float32),
+        "target_bin_center_xyz": torch.from_numpy(serialized["target_bin_center_xyz"]).to(torch.float32),
+        "target_strip_positions": torch.from_numpy(serialized["target_strip_positions"]).to(torch.long),
+        "target_strip_coords": torch.from_numpy(serialized["target_strip_coords"]).to(torch.float32),
+        "target_grid_local": torch.from_numpy(serialized["target_grid_local"]).to(torch.float32),
+        "target_invalid_fraction": torch.tensor(0.0, dtype=torch.float32),
+        "frontier_invalid_fraction": torch.tensor(0.0, dtype=torch.float32),
+        "touches_crop_boundary": torch.tensor(False, dtype=torch.bool),
+        "direction": str(direction),
+        "direction_id": torch.tensor(int(serialized["direction_id"]), dtype=torch.long),
+        "strip_length": torch.tensor(int(serialized["strip_length"]), dtype=torch.long),
+        "num_strips": torch.tensor(int(serialized["num_strips"]), dtype=torch.long),
+        "min_corner": torch.from_numpy(min_corner).to(torch.float32),
+        "world_bbox": torch.tensor(world_bbox, dtype=torch.float32),
+        "target_grid_shape": torch.tensor(tuple(int(v) for v in serialized["target_grid_shape"]), dtype=torch.long),
+        "wrap_metadata": dict(wrap_metadata),
     }
 
 
@@ -363,6 +409,205 @@ def _initialize_extension_arrays(grid_zyx: np.ndarray, direction: str, predict_s
     sums = np.zeros(extension_shape, dtype=np.float64)
     counts = np.zeros(seam_shape, dtype=np.int32)
     return sums, counts
+
+
+def _move_batch_to_device(batch: dict, device: torch.device) -> dict:
+    moved: dict[str, Any] = {}
+    for key, value in batch.items():
+        if torch.is_tensor(value):
+            moved[key] = value.to(device)
+        elif key == "prompt_tokens":
+            moved[key] = {
+                inner_key: inner_value.to(device) if torch.is_tensor(inner_value) else inner_value
+                for inner_key, inner_value in value.items()
+            }
+        elif key in {"conditioning_grid_local", "wrap_metadata", "prompt_meta", "direction", "prompt_grid_local", "target_grid_local"}:
+            if key == "conditioning_grid_local":
+                moved[key] = [item.to(device) if torch.is_tensor(item) else item for item in value]
+            else:
+                moved[key] = value
+        else:
+            moved[key] = value
+    return moved
+
+
+def _window_bucket_key(payload: ExtensionWindowPayload) -> tuple[Any, ...]:
+    sample = payload.sample
+    return (
+        payload.direction,
+        tuple(int(v) for v in payload.target_grid_shape),
+        int(payload.strip_length),
+        int(payload.num_strips),
+        tuple(int(v) for v in sample["volume"].shape),
+    )
+
+
+def _iter_window_batches(payloads: list[ExtensionWindowPayload], *, window_batch_size: int) -> list[list[ExtensionWindowPayload]]:
+    grouped: OrderedDict[tuple[Any, ...], list[ExtensionWindowPayload]] = OrderedDict()
+    for payload in payloads:
+        grouped.setdefault(_window_bucket_key(payload), []).append(payload)
+    batches: list[list[ExtensionWindowPayload]] = []
+    for group in grouped.values():
+        for start in range(0, len(group), max(1, int(window_batch_size))):
+            batches.append(group[start:start + max(1, int(window_batch_size))])
+    return batches
+
+
+def _decode_single_step_from_outputs(
+    model,
+    outputs: dict,
+    *,
+    sample_idx: int,
+    step_idx: int,
+    greedy: bool,
+) -> tuple[int, list[int], np.ndarray, float]:
+    if str(outputs.get("coarse_prediction_mode", getattr(model, "coarse_prediction_mode", "joint_pointer"))) == "axis_factorized":
+        coarse_axis_ids = {}
+        for axis_name in ("z", "y", "x"):
+            axis_logits = outputs["coarse_axis_logits"][axis_name][sample_idx, step_idx]
+            coarse_axis_ids[axis_name] = int(_sample_from_logits(axis_logits, greedy=greedy).item())
+        coarse_id = int(
+            model._flatten_coarse_axis_ids(
+                torch.tensor(coarse_axis_ids["z"], dtype=torch.long, device=outputs["stop_logits"].device),
+                torch.tensor(coarse_axis_ids["y"], dtype=torch.long, device=outputs["stop_logits"].device),
+                torch.tensor(coarse_axis_ids["x"], dtype=torch.long, device=outputs["stop_logits"].device),
+            ).item()
+        )
+    else:
+        coarse_logits = outputs["coarse_logits"][sample_idx, step_idx]
+        coarse_id = int(_sample_from_logits(coarse_logits, greedy=greedy).item())
+    offset_bins = []
+    for axis, bins in enumerate(model.offset_num_bins):
+        axis_logits = outputs["offset_logits"][sample_idx, step_idx, axis, :bins]
+        offset_bins.append(int(_sample_from_logits(axis_logits, greedy=greedy).item()))
+    offset_tensor = torch.tensor(offset_bins, dtype=torch.long, device=outputs["stop_logits"].device).view(1, 1, 3)
+    coarse_tensor = torch.tensor([[coarse_id]], dtype=torch.long, device=outputs["stop_logits"].device)
+    bin_center_xyz = model.decode_local_xyz(coarse_tensor, offset_tensor)[0, 0].detach().cpu().numpy()
+    refine_residual = outputs.get("pred_refine_residual")
+    sampled_xyz = bin_center_xyz + refine_residual[sample_idx, step_idx].detach().cpu().numpy() if refine_residual is not None else bin_center_xyz
+    stop_prob = float(torch.sigmoid(outputs["stop_logits"][sample_idx, step_idx]).item())
+    return coarse_id, offset_bins, sampled_xyz.astype(np.float32, copy=False), stop_prob
+
+
+def infer_extension_windows_batched(
+    model,
+    payloads: list[ExtensionWindowPayload],
+    *,
+    window_batch_size: int,
+    device: torch.device,
+    greedy: bool = True,
+    stop_probability_threshold: float | None = 1.1,
+) -> tuple[list[dict[str, Any]], float, int]:
+    if not payloads:
+        return [], 0.0, 0
+    results: list[dict[str, Any]] = []
+    total_encode_decode_ms = 0.0
+    peak_batch_size = 0
+    for payload_batch in _iter_window_batches(payloads, window_batch_size=window_batch_size):
+        peak_batch_size = max(peak_batch_size, len(payload_batch))
+        raw_samples = [payload.sample for payload in payload_batch]
+        batch = autoreg_mesh_collate(raw_samples)
+        batch = _move_batch_to_device(batch, device)
+        t0 = perf_counter()
+        encoded = model.encode_conditioning(batch["volume"], vol_tokens=batch.get("vol_tokens"))
+        target_shapes = [tuple(int(v) for v in sample["target_grid_shape"].tolist()) for sample in raw_samples]
+        total_vertices = [int(shape[0] * shape[1]) for shape in target_shapes]
+        max_steps = max(total_vertices)
+        all_target_strip_coords = []
+        all_target_strip_positions = []
+        for shape, direction in zip(target_shapes, batch["direction"], strict=True):
+            all_target_strip_coords.append(_build_target_strip_coords(direction, shape, device=device))
+            all_target_strip_positions.append(_build_target_strip_positions(direction, shape, device=device))
+        generated_coarse = [[] for _ in payload_batch]
+        generated_offsets = [[] for _ in payload_batch]
+        generated_xyz = [[] for _ in payload_batch]
+        generated_stop_probs = [[] for _ in payload_batch]
+        active = [True for _ in payload_batch]
+        for step_idx in range(max_steps):
+            if not any(active):
+                break
+            current_len = step_idx + 1
+            batch_size = len(payload_batch)
+            target_coarse_ids = torch.full((batch_size, current_len), -100, dtype=torch.long, device=device)
+            target_offset_bins = torch.full((batch_size, current_len, 3), -100, dtype=torch.long, device=device)
+            target_xyz = torch.zeros((batch_size, current_len, 3), dtype=torch.float32, device=device)
+            target_strip_positions = torch.zeros((batch_size, current_len, 2), dtype=torch.long, device=device)
+            target_strip_coords = torch.zeros((batch_size, current_len, 2), dtype=torch.float32, device=device)
+            for batch_idx in range(batch_size):
+                history_len = min(len(generated_coarse[batch_idx]), current_len - 1)
+                if history_len > 0:
+                    target_coarse_ids[batch_idx, :history_len] = torch.tensor(generated_coarse[batch_idx], dtype=torch.long, device=device)
+                    target_offset_bins[batch_idx, :history_len] = torch.tensor(generated_offsets[batch_idx], dtype=torch.long, device=device)
+                    target_xyz[batch_idx, :history_len] = torch.tensor(np.asarray(generated_xyz[batch_idx]), dtype=torch.float32, device=device)
+                target_strip_positions[batch_idx, :current_len] = all_target_strip_positions[batch_idx][:current_len]
+                target_strip_coords[batch_idx, :current_len] = all_target_strip_coords[batch_idx][:current_len]
+            pseudo_batch = build_pseudo_inference_batch(
+                prompt_tokens=batch["prompt_tokens"],
+                prompt_anchor_xyz=batch["prompt_anchor_xyz"],
+                direction_id=batch["direction_id"],
+                direction=batch["direction"],
+                conditioning_grid_local=batch["conditioning_grid_local"],
+                strip_length=batch["strip_length"],
+                num_strips=batch["num_strips"],
+                target_coarse_ids=target_coarse_ids,
+                target_offset_bins=target_offset_bins,
+                target_xyz=target_xyz,
+                target_strip_positions=target_strip_positions,
+                target_strip_coords=target_strip_coords,
+            )
+            outputs = model.forward_from_encoded(
+                pseudo_batch,
+                memory_tokens=encoded["memory_tokens"],
+                memory_patch_centers=encoded["memory_patch_centers"],
+            )
+            for batch_idx, is_active in enumerate(active):
+                if not is_active:
+                    continue
+                if step_idx >= total_vertices[batch_idx]:
+                    active[batch_idx] = False
+                    continue
+                coarse_id, offset_bins, xyz, stop_prob = _decode_single_step_from_outputs(
+                    model,
+                    outputs,
+                    sample_idx=batch_idx,
+                    step_idx=current_len - 1,
+                    greedy=greedy,
+                )
+                generated_coarse[batch_idx].append(coarse_id)
+                generated_offsets[batch_idx].append(offset_bins)
+                generated_xyz[batch_idx].append(xyz)
+                generated_stop_probs[batch_idx].append(stop_prob)
+                if stop_probability_threshold is not None and stop_prob >= float(stop_probability_threshold):
+                    active[batch_idx] = False
+                elif len(generated_xyz[batch_idx]) >= total_vertices[batch_idx]:
+                    active[batch_idx] = False
+        total_encode_decode_ms += 1000.0 * (perf_counter() - t0)
+        for batch_idx, payload in enumerate(payload_batch):
+            predicted_xyz_local = np.asarray(generated_xyz[batch_idx], dtype=np.float32)
+            padded_xyz = predicted_xyz_local
+            if predicted_xyz_local.shape[0] < total_vertices[batch_idx]:
+                padded_xyz = np.full((total_vertices[batch_idx], 3), np.nan, dtype=np.float32)
+                if predicted_xyz_local.shape[0] > 0:
+                    padded_xyz[: predicted_xyz_local.shape[0]] = predicted_xyz_local
+            continuation_grid_local = deserialize_continuation_grid(
+                padded_xyz,
+                direction=payload.direction,
+                grid_shape=payload.target_grid_shape,
+            )
+            min_corner = raw_samples[batch_idx]["min_corner"].detach().cpu().numpy().astype(np.float32, copy=False)
+            continuation_grid_world = continuation_grid_local.copy()
+            finite = np.isfinite(continuation_grid_world).all(axis=-1)
+            continuation_grid_world[finite] += min_corner
+            results.append(
+                {
+                    "window": payload.window,
+                    "direction": payload.direction,
+                    "continuation_grid_world": continuation_grid_world,
+                    "predicted_vertex_count": int(np.isfinite(continuation_grid_world).all(axis=-1).sum()),
+                    "stop_count": int(sum(1 for value in generated_stop_probs[batch_idx] if stop_probability_threshold is not None and value >= float(stop_probability_threshold))),
+                }
+            )
+    return results, total_encode_decode_ms, peak_batch_size
 
 
 def merge_window_prediction(
@@ -623,6 +868,7 @@ def extend_tifxyz_mesh(
     predict_strips_per_iter: int = 8,
     window_strip_length: int = 64,
     window_overlap: int = 16,
+    window_batch_size: int = 4,
     max_extension_iters: int = 4,
     max_crop_fit_retries: int = 3,
 ) -> dict[str, Any]:
@@ -630,6 +876,7 @@ def extend_tifxyz_mesh(
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
 
+    total_started = perf_counter()
     timings: dict[str, float] = {}
     t0 = perf_counter()
     surface = read_tifxyz(tifxyz_path, load_mask=True, validate=True).use_stored_resolution()
@@ -664,19 +911,22 @@ def extend_tifxyz_mesh(
     iteration_stats: list[ExtensionIterationStats] = []
     working_grid = grid_zyx.copy()
     working_provenance = provenance.copy()
+    total_windows = 0
+    total_fitted_windows = 0
+    total_skipped_windows = 0
 
     for iteration_idx in range(int(max_extension_iters)):
+        iteration_started = perf_counter()
+        if iteration_idx > 0:
+            working_provenance[working_provenance == 2] = 1
         frontier_length = _current_frontier_length(working_grid, direction)
         windows = _window_ranges(frontier_length, int(window_strip_length), int(window_overlap))
         if not windows:
             break
-        sums, counts = _initialize_extension_arrays(working_grid, direction, int(predict_strips_per_iter))
+        max_predict_strips_seen = 0
         crop_read_ms = 0.0
-        encode_decode_ms = 0.0
-        merge_ms = 0.0
-        fitted_window_count = 0
-        skipped_window_count = 0
-
+        crop_fit_failed_count = 0
+        payloads: list[ExtensionWindowPayload] = []
         for window in windows:
             local_prompt_strips = int(prompt_strips)
             prompt_grid = _extract_prompt_window(working_grid, direction, prompt_strips=local_prompt_strips, window=window)
@@ -705,15 +955,13 @@ def extend_tifxyz_mesh(
                     continue
                 break
             if not fitted:
-                skipped_window_count += 1
+                crop_fit_failed_count += 1
                 continue
-            fitted_window_count += 1
-
+            max_predict_strips_seen = max(max_predict_strips_seen, int(local_predict_strips))
             t1 = perf_counter()
             volume_crop = _read_volume_crop(volume, min_corner, crop_size, cache=cache)
             crop_read_ms += 1000.0 * (perf_counter() - t1)
-
-            batch = build_extension_batch(
+            sample = build_extension_sample(
                 prompt_grid_world=prompt_grid,
                 direction=direction,
                 min_corner=min_corner,
@@ -725,25 +973,47 @@ def extend_tifxyz_mesh(
                 volume_crop=volume_crop,
                 wrap_metadata={"segment_uuid": surface_uuid, "source_tifxyz": str(tifxyz_path)},
             )
-
-            t1 = perf_counter()
-            result = infer_autoreg_mesh(
-                model,
-                batch,
-                max_steps=None,
-                stop_probability_threshold=1.1,
-                greedy=True,
+            payloads.append(
+                ExtensionWindowPayload(
+                    window=local_window,
+                    sample=sample,
+                    direction=direction,
+                    target_grid_shape=tuple(int(v) for v in sample["target_grid_shape"].tolist()),
+                    strip_length=int(sample["strip_length"].item()),
+                    num_strips=int(sample["num_strips"].item()),
+                    prompt_strips=local_prompt_strips,
+                    predict_strips=local_predict_strips,
+                )
             )
-            encode_decode_ms += 1000.0 * (perf_counter() - t1)
-            pred_grid_world = np.asarray(result["continuation_grid_world"], dtype=np.float32)
-
+        if not payloads:
+            break
+        fitted_window_count = len(payloads)
+        skipped_window_count = len(windows) - fitted_window_count
+        sums, counts = _initialize_extension_arrays(working_grid, direction, max_predict_strips_seen)
+        merge_ms = 0.0
+        batched_results, encode_decode_ms, peak_batch_size = infer_extension_windows_batched(
+            model,
+            payloads,
+            window_batch_size=int(window_batch_size),
+            device=device_obj,
+            greedy=True,
+            stop_probability_threshold=1.1,
+        )
+        empty_prediction_count = 0
+        model_stop_count = 0
+        for result in batched_results:
+            if int(result["predicted_vertex_count"]) <= 0:
+                empty_prediction_count += 1
+                continue
+            if int(result["stop_count"]) > 0:
+                model_stop_count += 1
             t1 = perf_counter()
             merge_window_prediction(
                 sums=sums,
                 counts=counts,
-                pred_grid_world=pred_grid_world,
+                pred_grid_world=np.asarray(result["continuation_grid_world"], dtype=np.float32),
                 direction=direction,
-                window=local_window,
+                window=result["window"],
             )
             merge_ms += 1000.0 * (perf_counter() - t1)
 
@@ -769,11 +1039,20 @@ def extend_tifxyz_mesh(
                 valid_new_vertices=valid_new_vertices,
                 fitted_window_count=fitted_window_count,
                 skipped_window_count=skipped_window_count,
+                crop_fit_failed_count=crop_fit_failed_count,
+                empty_prediction_count=empty_prediction_count,
+                model_stop_count=model_stop_count,
                 crop_read_ms=crop_read_ms,
                 encode_decode_ms=encode_decode_ms,
                 merge_ms=merge_ms,
+                iteration_wall_ms=1000.0 * (perf_counter() - iteration_started),
+                windows_per_second=(float(fitted_window_count) * 1000.0 / max(1e-6, (crop_read_ms + encode_decode_ms + merge_ms))),
+                peak_batch_size_used=int(peak_batch_size),
             )
         )
+        total_windows += len(windows)
+        total_fitted_windows += fitted_window_count
+        total_skipped_windows += skipped_window_count
 
     vertices, faces, colors = grid_to_colored_mesh(working_grid, working_provenance)
     mesh_path = write_colored_ply(out_path / f"{surface_uuid}_merged.ply", vertices, faces, colors)
@@ -794,11 +1073,20 @@ def extend_tifxyz_mesh(
         "original_vertex_count": int(np.isfinite(grid_zyx).all(axis=-1).sum()),
         "final_vertex_count": int(np.isfinite(working_grid).all(axis=-1).sum()),
         "predicted_vertex_count": int(np.isfinite(working_grid).all(axis=-1).sum() - np.isfinite(grid_zyx).all(axis=-1).sum()),
+        "cumulative_predicted_vertex_count": int(np.isfinite(working_grid).all(axis=-1).sum() - np.isfinite(grid_zyx).all(axis=-1).sum()),
         "mesh_path": str(mesh_path),
         "preview_paths": preview_paths,
         "tifxyz_path": str(tifxyz_path_out),
         "timings_ms": timings,
         "iteration_stats": [vars(item) for item in iteration_stats],
+        "window_batch_size": int(window_batch_size),
+        "total_wall_ms": 1000.0 * (perf_counter() - total_started),
+        "total_windows": int(total_windows),
+        "total_fitted_windows": int(total_fitted_windows),
+        "total_skipped_windows": int(total_skipped_windows),
+        "windows_per_second_overall": (
+            float(total_fitted_windows) * 1000.0 / max(1e-6, 1000.0 * (perf_counter() - total_started))
+        ),
         "trimmed_bbox_rc": list(trimmed_bbox_rc),
         "crop_cache_hits": int(cache.hits),
         "crop_cache_misses": int(cache.misses),
@@ -823,6 +1111,7 @@ def extend_tifxyz_mesh(
 @click.option("--predict-strips-per-iter", type=int, default=8, show_default=True)
 @click.option("--window-strip-length", type=int, default=64, show_default=True)
 @click.option("--window-overlap", type=int, default=16, show_default=True)
+@click.option("--window-batch-size", type=int, default=4, show_default=True)
 @click.option("--max-extension-iters", type=int, default=4, show_default=True)
 @click.option("--max-crop-fit-retries", type=int, default=3, show_default=True)
 def main(
@@ -838,6 +1127,7 @@ def main(
     predict_strips_per_iter: int,
     window_strip_length: int,
     window_overlap: int,
+    window_batch_size: int,
     max_extension_iters: int,
     max_crop_fit_retries: int,
 ) -> None:
@@ -863,6 +1153,7 @@ def main(
         predict_strips_per_iter=predict_strips_per_iter,
         window_strip_length=window_strip_length,
         window_overlap=window_overlap,
+        window_batch_size=window_batch_size,
         max_extension_iters=max_extension_iters,
         max_crop_fit_retries=max_crop_fit_retries,
     )

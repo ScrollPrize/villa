@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz import (
     _crop_min_corner_for_points,
@@ -14,12 +15,13 @@ from vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz import (
     _render_projection,
     _surface_grid_zyx,
     _window_ranges,
-    build_extension_batch,
+    build_extension_sample,
     choose_source_tifxyz,
     choose_growth_direction,
     extend_tifxyz_mesh,
     finalize_iteration_extension,
     grid_to_colored_mesh,
+    infer_extension_windows_batched,
     merge_window_prediction,
     write_colored_ply,
 )
@@ -104,10 +106,10 @@ def test_merge_window_prediction_averages_overlaps() -> None:
     assert np.all(provenance[:, 1] == 1)
 
 
-def test_build_extension_batch_has_required_fields() -> None:
+def test_build_extension_sample_has_required_fields() -> None:
     grid = _make_surface_grid(6, 6)
     prompt_grid = grid[:, -3:, :]
-    batch = build_extension_batch(
+    sample = build_extension_sample(
         prompt_grid_world=prompt_grid,
         direction="left",
         min_corner=np.array([0.0, 0.0, 0.0], dtype=np.float32),
@@ -120,11 +122,166 @@ def test_build_extension_batch_has_required_fields() -> None:
         wrap_metadata={"segment_uuid": "synthetic"},
     )
 
-    assert batch["volume"].shape == (1, 1, 128, 128, 128)
-    assert set(batch["prompt_tokens"].keys()) == {"coarse_ids", "offset_bins", "xyz", "strip_positions", "strip_coords", "mask", "valid_mask"}
-    assert batch["prompt_tokens"]["coarse_ids"].ndim == 2
-    assert batch["target_grid_shape"].shape == (1, 2)
-    assert batch["direction"] == ["left"]
+    assert sample["volume"].shape == (1, 128, 128, 128)
+    assert set(sample["prompt_tokens"].keys()) == {"coarse_ids", "offset_bins", "xyz", "strip_positions", "strip_coords", "valid_mask"}
+    assert sample["prompt_tokens"]["coarse_ids"].ndim == 1
+    assert sample["target_grid_shape"].shape == (2,)
+    assert sample["direction"] == "left"
+
+
+class _FakeBatchModel:
+    def __init__(self) -> None:
+        self.offset_num_bins = (4, 4, 4)
+        self.coarse_prediction_mode = "joint_pointer"
+        self.coarse_grid_shape = (2, 2, 2)
+        self._param = np.zeros((), dtype=np.float32)
+
+    def encode_conditioning(self, volume, vol_tokens=None):
+        del vol_tokens
+        batch_size = int(volume.shape[0])
+        device = volume.device
+        return {
+            "memory_tokens": torch.zeros((batch_size, 8, 4), device=device, dtype=torch.float32),
+            "memory_patch_centers": torch.zeros((batch_size, 8, 3), device=device, dtype=torch.float32),
+        }
+
+    def forward_from_encoded(self, batch, *, memory_tokens, memory_patch_centers):
+        del memory_tokens, memory_patch_centers
+        device = batch["target_coarse_ids"].device
+        batch_size, target_len = batch["target_coarse_ids"].shape
+        coarse_logits = torch.full((batch_size, target_len, 8), -8.0, device=device)
+        coarse_logits[:, :, 3] = 8.0
+        offset_logits = torch.full((batch_size, target_len, 3, 4), -6.0, device=device)
+        offset_logits[:, :, :, 1] = 6.0
+        pred_coarse_ids = torch.full((batch_size, target_len), 3, dtype=torch.long, device=device)
+        pred_offset_bins = torch.ones((batch_size, target_len, 3), dtype=torch.long, device=device)
+        pred_xyz = self.decode_local_xyz(pred_coarse_ids, pred_offset_bins)
+        pred_refine_residual = torch.zeros((batch_size, target_len, 3), dtype=torch.float32, device=device)
+        return {
+            "coarse_logits": coarse_logits,
+            "coarse_axis_logits": None,
+            "offset_logits": offset_logits,
+            "stop_logits": torch.full((batch_size, target_len), -8.0, dtype=torch.float32, device=device),
+            "pred_coarse_ids": pred_coarse_ids,
+            "pred_coarse_axis_ids": {
+                "z": torch.zeros((batch_size, target_len), dtype=torch.long, device=device),
+                "y": torch.ones((batch_size, target_len), dtype=torch.long, device=device),
+                "x": torch.ones((batch_size, target_len), dtype=torch.long, device=device),
+            },
+            "pred_offset_bins": pred_offset_bins,
+            "pred_refine_residual": pred_refine_residual,
+            "pred_xyz": pred_xyz,
+            "pred_xyz_soft": pred_xyz,
+            "pred_xyz_refined": pred_xyz,
+            "coarse_grid_shape": self.coarse_grid_shape,
+            "coarse_prediction_mode": self.coarse_prediction_mode,
+        }
+
+    def decode_local_xyz(self, coarse_ids: torch.Tensor, offset_bins: torch.Tensor) -> torch.Tensor:
+        coarse = coarse_ids.to(torch.long)
+        gyx = self.coarse_grid_shape[1] * self.coarse_grid_shape[2]
+        z = coarse // gyx
+        rem = coarse % gyx
+        y = rem // self.coarse_grid_shape[2]
+        x = rem % self.coarse_grid_shape[2]
+        starts = torch.stack([z, y, x], dim=-1).to(torch.float32) * 8.0
+        widths = torch.tensor([2.0, 2.0, 2.0], device=coarse.device, dtype=torch.float32)
+        return starts + (offset_bins.to(torch.float32) + 0.5) * widths.view(1, 1, 3)
+
+
+def _make_window_payloads() -> list:
+    grid = _make_surface_grid(8, 10)
+    prompt_a = grid[:4, -3:, :]
+    prompt_b = grid[2:6, -3:, :]
+    sample_a = build_extension_sample(
+        prompt_grid_world=prompt_a,
+        direction="left",
+        min_corner=np.array([0.0, 0.0, 0.0], dtype=np.float32),
+        crop_size=(128, 128, 128),
+        patch_size=(8, 8, 8),
+        offset_num_bins=(4, 4, 4),
+        frontier_band_width=3,
+        predict_strips=2,
+        volume_crop=np.zeros((128, 128, 128), dtype=np.float32),
+        wrap_metadata={"segment_uuid": "synthetic_a"},
+    )
+    sample_b = build_extension_sample(
+        prompt_grid_world=prompt_b,
+        direction="left",
+        min_corner=np.array([4.0, 4.0, 4.0], dtype=np.float32),
+        crop_size=(128, 128, 128),
+        patch_size=(8, 8, 8),
+        offset_num_bins=(4, 4, 4),
+        frontier_band_width=3,
+        predict_strips=2,
+        volume_crop=np.zeros((128, 128, 128), dtype=np.float32),
+        wrap_metadata={"segment_uuid": "synthetic_b"},
+    )
+    from vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz import ExtensionWindow, ExtensionWindowPayload
+    return [
+        ExtensionWindowPayload(ExtensionWindow(0, 4), sample_a, "left", (4, 2), 4, 2, 3, 2),
+        ExtensionWindowPayload(ExtensionWindow(2, 6), sample_b, "left", (4, 2), 4, 2, 3, 2),
+    ]
+
+
+def test_batched_extension_inference_matches_serial() -> None:
+    model = _FakeBatchModel()
+    payloads = _make_window_payloads()
+
+    serial_results, _, _ = infer_extension_windows_batched(model, payloads, window_batch_size=1, device=torch.device("cpu"))
+    batched_results, _, peak_batch_size = infer_extension_windows_batched(model, payloads, window_batch_size=2, device=torch.device("cpu"))
+
+    assert peak_batch_size == 2
+    assert len(serial_results) == len(batched_results) == 2
+    for serial, batched in zip(serial_results, batched_results, strict=True):
+        np.testing.assert_allclose(serial["continuation_grid_world"], batched["continuation_grid_world"])
+        assert serial["window"] == batched["window"]
+
+
+def test_two_iteration_rollout_appends_geometry_twice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = _make_surface(8, 10)
+    volume = np.zeros((256, 256, 256), dtype=np.float32)
+
+    def _fake_read_tifxyz(path, load_mask=True, validate=True):
+        del path, load_mask, validate
+        return surface
+
+    def _fake_open_volume(uri):
+        del uri
+        return volume
+
+    class _FakeModel:
+        def eval(self):
+            return self
+
+    def _fake_load_model(*, dino_backbone, autoreg_checkpoint, device):
+        del dino_backbone, autoreg_checkpoint, device
+        return _FakeBatchModel(), {"patch_size": [8, 8, 8], "offset_num_bins": [4, 4, 4], "frontier_band_width": 4}
+
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz.read_tifxyz", _fake_read_tifxyz)
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz._open_zarr_volume", _fake_open_volume)
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz._load_autoreg_model", _fake_load_model)
+
+    result = extend_tifxyz_mesh(
+        tifxyz_path="dummy",
+        volume_uri="s3://dummy",
+        dino_backbone="backbone",
+        autoreg_checkpoint="ckpt",
+        out_dir=tmp_path,
+        device="cpu",
+        prompt_strips=3,
+        predict_strips_per_iter=2,
+        window_strip_length=4,
+        window_overlap=2,
+        window_batch_size=2,
+        max_extension_iters=2,
+    )
+
+    assert len(result["iteration_stats"]) == 2
+    assert result["iteration_stats"][0]["valid_new_vertices"] > 0
+    assert result["iteration_stats"][1]["valid_new_vertices"] > 0
+    assert result["cumulative_predicted_vertex_count"] > result["iteration_stats"][0]["valid_new_vertices"]
+    assert result["iteration_stats"][1]["peak_batch_size_used"] == 2
 
 
 def test_surface_grid_conversion_marks_invalid_as_nan() -> None:
@@ -204,46 +361,13 @@ def test_extend_tifxyz_mesh_synthetic_end_to_end(tmp_path: Path, monkeypatch: py
         del uri
         return volume
 
-    class _FakeModel:
-        def eval(self):
-            return self
-
     def _fake_load_model(*, dino_backbone, autoreg_checkpoint, device):
         del dino_backbone, autoreg_checkpoint, device
-        return _FakeModel(), {"patch_size": [8, 8, 8], "offset_num_bins": [16, 16, 16], "frontier_band_width": 4}
-
-    def _fake_infer(model, batch, *, max_steps=None, stop_probability_threshold=None, greedy=True):
-        del model, max_steps, stop_probability_threshold, greedy
-        direction = batch["direction"][0]
-        cond = batch["conditioning_grid_local"][0].numpy()
-        if direction == "left":
-            boundary = cond[:, -1, :]
-            previous = cond[:, -2, :]
-            step = boundary - previous
-            continuation = np.stack([boundary + float(i + 1) * step for i in range(8)], axis=1)
-        elif direction == "right":
-            boundary = cond[:, 0, :]
-            previous = cond[:, 1, :]
-            step = boundary - previous
-            continuation = np.stack([boundary + float(i + 1) * step for i in range(8)], axis=1)
-        elif direction == "up":
-            boundary = cond[-1, :, :]
-            previous = cond[-2, :, :]
-            step = boundary - previous
-            continuation = np.stack([boundary + float(i + 1) * step for i in range(8)], axis=0)
-        else:
-            boundary = cond[0, :, :]
-            previous = cond[1, :, :]
-            step = boundary - previous
-            continuation = np.stack([boundary + float(i + 1) * step for i in range(8)], axis=0)
-        min_corner = batch["min_corner"][0].numpy()
-        continuation_world = continuation + min_corner.reshape(1, 1, 3)
-        return {"continuation_grid_world": continuation_world}
+        return _FakeBatchModel(), {"patch_size": [8, 8, 8], "offset_num_bins": [4, 4, 4], "frontier_band_width": 4}
 
     monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz.read_tifxyz", _fake_read_tifxyz)
     monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz._open_zarr_volume", _fake_open_volume)
     monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz._load_autoreg_model", _fake_load_model)
-    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz.infer_autoreg_mesh", _fake_infer)
 
     result = extend_tifxyz_mesh(
         tifxyz_path="dummy",
