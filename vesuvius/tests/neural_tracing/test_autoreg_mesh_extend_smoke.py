@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import os
+import socket
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -7,16 +10,25 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+import torch.multiprocessing as mp
 
 from vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz import (
+    ExtensionInferenceRuntime,
+    _DistributedInferRuntime,
+    _flatten_gathered_window_results,
+    _initialize_distributed_infer_runtime,
+    _shard_fitted_window_plans,
     _crop_min_corner_for_points,
     _extract_prompt_window,
+    _fit_child_candidate_recursive,
     _fit_window_for_crop,
     _open_zarr_volume,
+    _plan_extension_windows,
     _parse_int_list,
     _render_projection,
     _surface_grid_zyx,
     _window_ranges,
+    ExtensionWindowCandidate,
     build_extension_sample,
     choose_source_tifxyz,
     choose_growth_direction,
@@ -56,6 +68,22 @@ def _make_surface(rows: int = 10, cols: int = 12) -> Tifxyz:
     )
 
 
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _ddp_env(rank: int, world_size: int, port: int) -> dict[str, str]:
+    return {
+        "MASTER_ADDR": "127.0.0.1",
+        "MASTER_PORT": str(int(port)),
+        "WORLD_SIZE": str(int(world_size)),
+        "RANK": str(int(rank)),
+        "LOCAL_RANK": str(int(rank)),
+    }
+
+
 def test_window_ranges_are_deterministic() -> None:
     windows = _window_ranges(20, 8, 2)
     assert [(window.start, window.end) for window in windows] == [(0, 8), (6, 14), (12, 20)]
@@ -66,6 +94,94 @@ def test_parse_int_list_handles_csv() -> None:
     assert _parse_int_list("") == []
     with pytest.raises(ValueError):
         _parse_int_list("0,2")
+
+
+def test_distributed_infer_runtime_defaults_to_single_process(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in ("WORLD_SIZE", "RANK", "LOCAL_RANK", "MASTER_ADDR", "MASTER_PORT"):
+        monkeypatch.delenv(key, raising=False)
+
+    runtime = _initialize_distributed_infer_runtime(enabled=False, device="cpu")
+
+    assert runtime.is_distributed is False
+    assert runtime.rank == 0
+    assert runtime.world_size == 1
+    assert runtime.is_main_process is True
+    assert str(runtime.device) == "cpu"
+
+
+def test_distributed_infer_runtime_resolves_env_driven_gloo(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MASTER_ADDR", "127.0.0.1")
+    monkeypatch.setenv("MASTER_PORT", "29501")
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("RANK", "1")
+    monkeypatch.setenv("LOCAL_RANK", "1")
+    monkeypatch.setattr("torch.cuda.is_available", lambda: False)
+    monkeypatch.setattr("torch.distributed.is_available", lambda: True)
+    monkeypatch.setattr("torch.distributed.is_initialized", lambda: False)
+    monkeypatch.setattr("torch.distributed.init_process_group", lambda backend, init_method: None)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda: 1)
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda: 2)
+
+    runtime = _initialize_distributed_infer_runtime(enabled=True, device="cpu")
+
+    assert runtime.is_distributed is True
+    assert runtime.rank == 1
+    assert runtime.world_size == 2
+    assert runtime.backend == "gloo"
+    assert str(runtime.device) == "cpu"
+
+
+def test_shard_fitted_window_plans_is_strided() -> None:
+    plans = [
+        SimpleNamespace(window=SimpleNamespace(start=idx, end=idx + 2), prompt_strips=3, predict_strips=2)
+        for idx in range(6)
+    ]
+    runtime = _DistributedInferRuntime(
+        is_distributed=True,
+        rank=1,
+        local_rank=1,
+        world_size=3,
+        device=torch.device("cpu"),
+        backend="gloo",
+        initialized_process_group=False,
+    )
+
+    shard = _shard_fitted_window_plans(plans, runtime=runtime, shard_mode="strided")
+
+    assert [global_index for global_index, _ in shard] == [1, 4]
+
+
+def test_flatten_gathered_window_results_preserves_global_order() -> None:
+    gathered_payloads = [
+        {
+            "rank": 0,
+            "fitted_window_count": 2,
+            "results": [
+                {"global_index": 0, "window": SimpleNamespace(start=0, end=2)},
+                {"global_index": 4, "window": SimpleNamespace(start=4, end=6)},
+            ],
+        },
+        {
+            "rank": 1,
+            "fitted_window_count": 2,
+            "results": [
+                {"global_index": 1, "window": SimpleNamespace(start=1, end=3)},
+                {"global_index": 3, "window": SimpleNamespace(start=3, end=5)},
+            ],
+        },
+        {
+            "rank": 2,
+            "fitted_window_count": 1,
+            "results": [
+                {"global_index": 2, "window": SimpleNamespace(start=2, end=4)},
+            ],
+        },
+    ]
+
+    flattened, per_rank_counts = _flatten_gathered_window_results(gathered_payloads)
+
+    assert per_rank_counts == [2, 2, 1]
+    assert [result["global_index"] for result in flattened] == [0, 1, 2, 3, 4]
 
 
 def test_crop_min_corner_rejects_oversize_envelope() -> None:
@@ -103,6 +219,193 @@ def test_fit_window_for_crop_shrinks_below_sixteen_strips() -> None:
     assert fitted.window.end - fitted.window.start == 4
     assert fitted.prompt_strips == 3
     assert fitted.predict_strips == 2
+
+
+def test_plan_extension_windows_retiles_parent_span_densely() -> None:
+    rows, cols = 24, 12
+    row_axis = np.arange(rows, dtype=np.float32)[:, None]
+    col_axis = np.arange(cols, dtype=np.float32)[None, :]
+    row_grid = np.broadcast_to(row_axis, (rows, cols))
+    col_grid = np.broadcast_to(col_axis, (rows, cols))
+    grid = np.stack(
+        [
+            16.0 + 24.0 * row_grid,
+            32.0 + 2.0 * row_grid,
+            48.0 + 2.0 * col_grid,
+        ],
+        axis=-1,
+    ).astype(np.float32)
+
+    plans, stats = _plan_extension_windows(
+        grid,
+        direction="left",
+        window_strip_length=24,
+        window_overlap=0,
+        prompt_strips=3,
+        predict_strips=2,
+        crop_size=(128, 128, 128),
+        max_crop_fit_retries=3,
+    )
+
+    spans = [(plan.window.start, plan.window.end) for plan in plans]
+    assert stats["parent_window_count"] == 1
+    assert stats["child_window_count"] > 1
+    assert stats["deduped_child_window_count"] == len(spans)
+    assert spans[0][0] == 0
+    assert spans[-1][1] == 24
+    assert len(spans) >= 10
+    assert max(spans[idx + 1][0] - spans[idx][0] for idx in range(len(spans) - 1)) <= 2
+
+
+def test_plan_extension_windows_dedupes_overlapping_parent_children() -> None:
+    rows, cols = 12, 12
+    row_axis = np.arange(rows, dtype=np.float32)[:, None]
+    col_axis = np.arange(cols, dtype=np.float32)[None, :]
+    row_grid = np.broadcast_to(row_axis, (rows, cols))
+    col_grid = np.broadcast_to(col_axis, (rows, cols))
+    grid = np.stack(
+        [
+            16.0 + 24.0 * row_grid,
+            32.0 + 2.0 * row_grid,
+            48.0 + 2.0 * col_grid,
+        ],
+        axis=-1,
+    ).astype(np.float32)
+
+    plans, stats = _plan_extension_windows(
+        grid,
+        direction="left",
+        window_strip_length=8,
+        window_overlap=4,
+        prompt_strips=3,
+        predict_strips=2,
+        crop_size=(128, 128, 128),
+        max_crop_fit_retries=3,
+    )
+
+    spans = [(plan.window.start, plan.window.end) for plan in plans]
+    assert stats["parent_window_count"] == 2
+    assert stats["child_window_count"] > stats["deduped_child_window_count"]
+    assert spans == sorted(set(spans))
+    assert (4, 8) in spans
+
+
+def test_plan_extension_windows_recovers_failing_first_parent(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_fit(
+        grid_zyx,
+        *,
+        direction,
+        window,
+        prompt_strips,
+        predict_strips,
+        crop_size,
+        max_crop_fit_retries,
+        min_window_strip_length,
+    ):
+        del grid_zyx, direction, crop_size, max_crop_fit_retries, min_window_strip_length
+        width = window.end - window.start
+        if width >= 32 and window.start == 0:
+            return None
+        prompt_grid = np.zeros((width, prompt_strips, 3), dtype=np.float32)
+        return SimpleNamespace(
+            window=window,
+            prompt_grid=prompt_grid,
+            min_corner=np.zeros(3, dtype=np.int64),
+            prompt_strips=prompt_strips,
+            predict_strips=predict_strips,
+        )
+
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz._fit_window_for_crop", _fake_fit)
+
+    plans, stats = _plan_extension_windows(
+        np.zeros((96, 8, 3), dtype=np.float32),
+        direction="left",
+        window_strip_length=48,
+        window_overlap=16,
+        prompt_strips=3,
+        predict_strips=2,
+        crop_size=(128, 128, 128),
+        max_crop_fit_retries=3,
+    )
+
+    spans = [(plan.window.start, plan.window.end) for plan in plans]
+    covered = np.zeros(96, dtype=bool)
+    for start, end in spans:
+        covered[start:end] = True
+    assert stats["parent_window_count"] == 3
+    assert spans[0][0] == 0
+    assert covered[:32].all()
+
+
+def test_fit_child_candidate_recursive_splits_to_width_two(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _fake_fit(
+        grid_zyx,
+        *,
+        direction,
+        window,
+        prompt_strips,
+        predict_strips,
+        crop_size,
+        max_crop_fit_retries,
+        min_window_strip_length,
+    ):
+        del grid_zyx, direction, crop_size, max_crop_fit_retries, min_window_strip_length
+        width = window.end - window.start
+        if width == 4:
+            return None
+        if width == 2 and window.start in {0, 2}:
+            prompt_grid = np.zeros((width, prompt_strips, 3), dtype=np.float32)
+            return SimpleNamespace(
+                window=window,
+                prompt_grid=prompt_grid,
+                min_corner=np.zeros(3, dtype=np.int64),
+                prompt_strips=prompt_strips,
+                predict_strips=predict_strips,
+            )
+        return None
+
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz._fit_window_for_crop", _fake_fit)
+
+    plans, failed_leaf_count = _fit_child_candidate_recursive(
+        np.zeros((8, 8, 3), dtype=np.float32),
+        direction="left",
+        candidate=ExtensionWindowCandidate(window=SimpleNamespace(start=0, end=4), prompt_strips=3, predict_strips=2),
+        crop_size=(128, 128, 128),
+        max_crop_fit_retries=3,
+        min_child_window_strip_length=2,
+    )
+
+    spans = [(plan.window.start, plan.window.end) for plan in plans]
+    assert spans == [(0, 2), (2, 4)]
+    assert failed_leaf_count == 1
+
+
+def test_extension_inference_runtime_compile_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeRuntimeModel:
+        def encode_conditioning(self, volume, vol_tokens=None):
+            del volume, vol_tokens
+            return {"ok": True}
+
+        def forward_from_encoded(self, batch, *, memory_tokens, memory_patch_centers):
+            del batch, memory_tokens, memory_patch_centers
+            return {"ok": True}
+
+    monkeypatch.setattr("torch.compile", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("compile boom")))
+
+    runtime = ExtensionInferenceRuntime(
+        _FakeRuntimeModel(),
+        device=torch.device("cuda"),
+        fast_infer=True,
+        compile_infer=True,
+        amp_dtype="bf16",
+    )
+
+    assert runtime.fast_infer_enabled is True
+    assert runtime.compile_infer_requested is True
+    assert runtime.compile_infer_actual is False
+    assert "compile boom" in str(runtime.compile_infer_failure)
+    assert runtime.amp_dtype == torch.bfloat16
+    assert runtime.encode_conditioning(None) == {"ok": True}
 
 
 def test_choose_growth_direction_prefers_valid_boundary() -> None:
@@ -268,9 +571,76 @@ def _make_window_payloads() -> list:
     )
     from vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz import ExtensionWindow, ExtensionWindowPayload
     return [
-        ExtensionWindowPayload(ExtensionWindow(0, 4), sample_a, "left", (4, 2), 4, 2, 3, 2),
-        ExtensionWindowPayload(ExtensionWindow(2, 6), sample_b, "left", (4, 2), 4, 2, 3, 2),
+        ExtensionWindowPayload(0, ExtensionWindow(0, 4), sample_a, "left", (4, 2), 4, 2, 3, 2),
+        ExtensionWindowPayload(1, ExtensionWindow(2, 6), sample_b, "left", (4, 2), 4, 2, 3, 2),
     ]
+
+
+def _distributed_extension_worker(rank: int, world_size: int, port: int, tmpdir: str) -> None:
+    import vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz as ext
+
+    old_env = {key: os.environ.get(key) for key in ("MASTER_ADDR", "MASTER_PORT", "WORLD_SIZE", "RANK", "LOCAL_RANK")}
+    os.environ.update(_ddp_env(rank, world_size, port))
+    original_read = ext.read_tifxyz
+    original_open = ext._open_zarr_volume
+    original_load = ext._load_autoreg_model
+    try:
+        surface = _make_surface(8, 10)
+        volume = np.zeros((256, 256, 256), dtype=np.float32)
+
+        def _fake_read_tifxyz(path, load_mask=True, validate=True):
+            del path, load_mask, validate
+            return surface
+
+        def _fake_open_volume(uri):
+            del uri
+            return volume
+
+        def _fake_load_model(*, dino_backbone, autoreg_checkpoint, device):
+            del dino_backbone, autoreg_checkpoint, device
+            return _FakeBatchModel(), {"patch_size": [8, 8, 8], "offset_num_bins": [4, 4, 4], "frontier_band_width": 4}
+
+        ext.read_tifxyz = _fake_read_tifxyz
+        ext._open_zarr_volume = _fake_open_volume
+        ext._load_autoreg_model = _fake_load_model
+
+        result = ext.extend_tifxyz_mesh(
+            tifxyz_path="dummy",
+            volume_uri="s3://dummy",
+            dino_backbone="backbone",
+            autoreg_checkpoint="ckpt",
+            out_dir=Path(tmpdir) / "distributed_extend",
+            device="cpu",
+            grow_direction="left",
+            prompt_strips=3,
+            predict_strips_per_iter=2,
+            window_strip_length=4,
+            window_overlap=2,
+            window_batch_size=2,
+            max_extension_iters=1,
+            distributed_infer=True,
+            show_progress=False,
+            fast_infer=True,
+            compile_infer=False,
+        )
+        payload = {
+            "rank": int(rank),
+            "predicted_vertex_count": int(result["predicted_vertex_count"]),
+            "distributed_infer_enabled": bool(result["distributed_infer_enabled"]),
+            "distributed_world_size": int(result["distributed_world_size"]),
+            "mesh_path_exists": bool(Path(result["mesh_path"]).exists()),
+            "summary_path_exists": bool(Path(result["summary_path"]).exists()),
+        }
+        (Path(tmpdir) / f"distributed_rank{rank}.json").write_text(json.dumps(payload))
+    finally:
+        ext.read_tifxyz = original_read
+        ext._open_zarr_volume = original_open
+        ext._load_autoreg_model = original_load
+        for key, value in old_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 def test_batched_extension_inference_matches_serial() -> None:
@@ -278,7 +648,14 @@ def test_batched_extension_inference_matches_serial() -> None:
     payloads = _make_window_payloads()
 
     serial_results, _, _ = infer_extension_windows_batched(model, payloads, window_batch_size=1, device=torch.device("cpu"))
-    batched_results, _, peak_batch_size = infer_extension_windows_batched(model, payloads, window_batch_size=2, device=torch.device("cpu"))
+    batched_results, _, peak_batch_size = infer_extension_windows_batched(
+        model,
+        payloads,
+        window_batch_size=2,
+        device=torch.device("cpu"),
+        fast_infer=True,
+        compile_infer=False,
+    )
 
     assert peak_batch_size == 2
     assert len(serial_results) == len(batched_results) == 2
@@ -389,6 +766,20 @@ def test_zero_growth_iteration_stops_cleanly(tmp_path: Path, monkeypatch: pytest
 
     assert result["iterations_completed"] == 1
     assert result["stop_reason"] == "zero_growth_iteration"
+
+
+def test_distributed_extension_inference_cpu_gloo(tmp_path: Path) -> None:
+    port = _find_free_port()
+    mp.spawn(_distributed_extension_worker, args=(2, port, str(tmp_path)), nprocs=2, join=True)
+
+    rank0 = json.loads((tmp_path / "distributed_rank0.json").read_text())
+    rank1 = json.loads((tmp_path / "distributed_rank1.json").read_text())
+
+    assert rank0["distributed_infer_enabled"] is True
+    assert rank0["distributed_world_size"] == 2
+    assert rank0["predicted_vertex_count"] == rank1["predicted_vertex_count"]
+    assert rank0["mesh_path_exists"] is True
+    assert rank0["summary_path_exists"] is True
 
 
 def test_extension_benchmark_suite_smoke(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -535,5 +926,18 @@ def test_extend_tifxyz_mesh_synthetic_end_to_end(tmp_path: Path, monkeypatch: py
     assert Path(result["summary_path"]).exists()
     assert result["iteration_stats"][0]["fitted_window_count"] >= 1
     assert result["iteration_stats"][0]["skipped_window_count"] >= 0
+    assert result["iteration_stats"][0]["new_band_frontier_coverage_fraction"] >= 0.9
+    assert result["iteration_stats"][0]["new_band_max_gap"] <= 2
+    assert result["iteration_stats"][0]["new_band_gap_spans"] == []
+    assert result["iteration_stats"][0]["first_uncovered_frontier_index"] is None
+    assert result["iteration_stats"][0]["child_window_count"] >= result["iteration_stats"][0]["parent_window_count"]
+    assert result["fast_infer_enabled"] is True
+    assert result["distributed_infer_enabled"] is False
+    assert result["distributed_world_size"] == 1
+    assert result["per_rank_fitted_window_counts"] == [result["total_fitted_windows"]]
+    assert result["gather_ms"] == pytest.approx(0.0)
+    assert result["compile_infer_requested"] is False
+    assert result["compile_infer_actual"] is False
+    assert result["encode_decode_ms_per_fitted_window"] is not None
     for preview in result["preview_paths"]:
         assert Path(preview).exists()

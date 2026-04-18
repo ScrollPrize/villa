@@ -211,10 +211,10 @@ def infer_autoreg_mesh(
                 offset_bins.append(int(_sample_from_logits(axis_logits, greedy=greedy).item()))
             offset_tensor = torch.tensor(offset_bins, dtype=torch.long, device=device).view(1, 1, 3)
             coarse_tensor = torch.tensor([[coarse_id]], dtype=torch.long, device=device)
-            bin_center_xyz = model.decode_local_xyz(coarse_tensor, offset_tensor)[0, 0].detach().cpu().numpy()
+            bin_center_xyz = model.decode_local_xyz(coarse_tensor, offset_tensor)[0, 0].detach().to(torch.float32).cpu().numpy()
             refine_residual = outputs.get("pred_refine_residual")
             if refine_residual is not None:
-                sampled_xyz = bin_center_xyz + refine_residual[0, current_len - 1].detach().cpu().numpy()
+                sampled_xyz = bin_center_xyz + refine_residual[0, current_len - 1].detach().to(torch.float32).cpu().numpy()
             else:
                 sampled_xyz = bin_center_xyz
             stop_prob = float(torch.sigmoid(outputs["stop_logits"][0, current_len - 1]).item())
