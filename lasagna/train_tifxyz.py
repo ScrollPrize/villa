@@ -398,6 +398,110 @@ def direction_smoothness_loss(
     return (_avg(gz, mz) + _avg(gy, my) + _avg(gx, mx)) / 3.0
 
 
+def sorted_distribution_loss(pred_cos, gt_cos, validity, grad_mag,
+                             window=40, stride=30, grad_mag_min=0.05):
+    """Phase-invariant distribution matching via sort-based 1D Wasserstein.
+
+    Extracts overlapping 3D windows, keeps only windows with sufficient
+    GT grad_mag density (surfaces present), sorts pred and GT cos values
+    within each window, computes L1 between sorted vectors.
+
+    Each window's contribution is weighted by its mean grad_mag (closer
+    surfaces → higher weight), matching the per-voxel weighting used
+    by the main cos loss.
+    """
+    B, C, Z, Y, X = pred_cos.shape
+    losses = []
+    weights = []
+
+    for z0 in range(0, Z - window + 1, stride):
+        for y0 in range(0, Y - window + 1, stride):
+            for x0 in range(0, X - window + 1, stride):
+                z1, y1, x1 = z0 + window, y0 + window, x0 + window
+
+                v = validity[:, :, z0:z1, y0:y1, x0:x1]
+                gm = grad_mag[:, :, z0:z1, y0:y1, x0:x1]
+
+                v_sum = v.sum().clamp(min=1)
+                gm_mean = (gm * v).sum() / v_sum
+                if gm_mean < grad_mag_min:
+                    continue
+
+                mask = v[:, 0] > 0.5
+                p = pred_cos[:, 0, z0:z1, y0:y1, x0:x1]
+                g = gt_cos[:, 0, z0:z1, y0:y1, x0:x1]
+
+                # Weight = mean grad_mag × 20 (same normalization as cos loss)
+                w = gm_mean * 20.0
+
+                for b in range(B):
+                    m = mask[b]
+                    if m.sum() < 10:
+                        continue
+                    p_sorted = torch.sort(p[b][m])[0]
+                    g_sorted = torch.sort(g[b][m])[0]
+                    losses.append(F.l1_loss(p_sorted, g_sorted))
+                    weights.append(w)
+
+    if not losses:
+        return pred_cos.new_zeros(1).squeeze()
+    losses_t = torch.stack(losses)
+    weights_t = torch.stack(weights)
+    return (losses_t * weights_t).sum() / weights_t.sum().clamp(min=1e-8)
+
+
+def fft_magnitude_loss(pred_cos, gt_cos, validity, grad_mag,
+                       block=16, stride=12, grad_mag_min=0.05):
+    """Phase-invariant frequency loss via FFT magnitude matching.
+
+    Computes 3D rFFT on overlapping blocks of pred and GT cos,
+    compares magnitude spectra (L1). Phase is discarded entirely.
+    DC component excluded (mean already supervised by cos MSE).
+    Weighted by mean grad_mag per block (same as cos loss weighting).
+    """
+    B, C, Z, Y, X = pred_cos.shape
+    losses = []
+    weights = []
+
+    for z0 in range(0, Z - block + 1, stride):
+        for y0 in range(0, Y - block + 1, stride):
+            for x0 in range(0, X - block + 1, stride):
+                z1, y1, x1 = z0 + block, y0 + block, x0 + block
+
+                v = validity[:, :, z0:z1, y0:y1, x0:x1]
+                # Only fully-valid blocks
+                if v.min() < 0.5:
+                    continue
+
+                gm = grad_mag[:, :, z0:z1, y0:y1, x0:x1]
+                gm_mean = gm.mean()
+                if gm_mean < grad_mag_min:
+                    continue
+
+                p = pred_cos[:, 0, z0:z1, y0:y1, x0:x1]
+                g = gt_cos[:, 0, z0:z1, y0:y1, x0:x1]
+
+                fft_p = torch.fft.rfftn(p, dim=(-3, -2, -1))
+                fft_g = torch.fft.rfftn(g, dim=(-3, -2, -1))
+                mag_p = fft_p.abs()
+                mag_g = fft_g.abs()
+
+                # Exclude DC (mean already supervised by cos MSE)
+                mag_p[:, 0, 0, 0] = 0
+                mag_g[:, 0, 0, 0] = 0
+
+                loss = F.l1_loss(mag_p, mag_g)
+                w = gm_mean * 20.0
+                losses.append(loss)
+                weights.append(w)
+
+    if not losses:
+        return pred_cos.new_zeros(1).squeeze()
+    losses_t = torch.stack(losses)
+    weights_t = torch.stack(weights)
+    return (losses_t * weights_t).sum() / weights_t.sum().clamp(min=1e-8)
+
+
 class MaskedMSE(nn.Module):
     def forward(self, pred, target, mask=None, weight=None):
         diff = (pred - target) ** 2
@@ -1064,6 +1168,7 @@ def train(
     wandb_tags: Optional[List[str]] = None,
     reinit_decoder_scales: int = 0,
     himag_filter: bool = True,
+    w_dist: float = 0.0,
     num_loss_scales: int = 5,
     deform_enabled: bool = True,
     deform_stride: int = 8,
@@ -1499,6 +1604,7 @@ def train(
         deform_inner_lr=deform_inner_lr,
         deform_max_frac=deform_max_frac,
         vis_samples=VIS_SAMPLES,
+        w_dist=w_dist,
     )
     if _init_vis_batch:
         _log_full_vis(_init_vis_batch[0], "val", global_step)
@@ -1937,12 +2043,20 @@ def train(
                     mask=dir_dense_mask, weight=dir_axis_weight,
                 )
                 loss_smooth = direction_smoothness_loss(pred[:, 2:8], dir_mask)
+                loss_dist = (
+                    sorted_distribution_loss(
+                        pred[:, 0:1], targets_original[:, 0:1],
+                        cos_mask, targets_original[:, 1:2],
+                    )
+                    if w_dist > 0 else pred.new_zeros(1).squeeze()
+                )
                 loss = (
                     w_cos * loss_cos
                     + w_mag * loss_mag
                     + w_dir * loss_dir_sparse
                     + w_dir_dense * loss_dir_dense
                     + w_smooth * loss_smooth
+                    + w_dist * loss_dist
                 )
 
                 # Sign-invariant unsigned angular error on sparse
@@ -2015,6 +2129,10 @@ def train(
                 log_scalar(
                     "train/loss_smooth", loss_smooth.item(), global_step,
                 )
+                if w_dist > 0:
+                    log_scalar(
+                        "train/loss_dist", loss_dist.item(), global_step,
+                    )
                 log_scalar(
                     "train/dir_angle_deg_sparse",
                     dir_angle_deg_sparse,
@@ -2171,6 +2289,7 @@ def _evaluate(
     deform_inner_lr: float = 1000.0,
     deform_max_frac: float = 0.3,
     vis_samples: int = 8,
+    w_dist: float = 0.0,
 ):
     model.eval()
     losses = []
@@ -2201,12 +2320,15 @@ def _evaluate(
                 same_surface_threshold=same_surface_threshold,
             )
 
-            if validity.sum() == 0:
-                continue
-
+            # Always run forward pass even if validity is empty — DDP
+            # broadcasts buffers on every forward, so all ranks must
+            # call model() the same number of times.
             results = model(image)
             raw_pred = results["output"]
             pred = torch.sigmoid(raw_pred) if output_sigmoid else raw_pred
+
+            if validity.sum() == 0:
+                continue
 
             cos_mask = validity
             dir_mask = ((dir_sparse_mask + dir_dense_mask) > 0.5).float()
@@ -2260,12 +2382,20 @@ def _evaluate(
                 mask=dir_dense_mask, weight=dir_axis_weight,
             )
             loss_smooth = direction_smoothness_loss(pred[:, 2:8], dir_mask)
+            loss_dist = (
+                sorted_distribution_loss(
+                    pred[:, 0:1], targets_original[:, 0:1],
+                    cos_mask, targets_original[:, 1:2],
+                )
+                if w_dist > 0 else pred.new_zeros(1).squeeze()
+            )
             loss = (
                 w_cos * loss_cos
                 + w_mag * loss_mag
                 + w_dir * loss_dir_sparse
                 + w_dir_dense * loss_dir_dense
                 + w_smooth * loss_smooth
+                + w_dist * loss_dist
             )
             losses.append(loss.item())
             losses_cos.append(loss_cos.item())
@@ -2441,6 +2571,9 @@ def main() -> None:
                              "loss magnitude.")
     parser.add_argument("--wandb-tags", type=str, default=None,
                         help="Comma-separated list of W&B run tags.")
+    parser.add_argument("--w-dist", type=float, default=0.0,
+                        help="Weight on sort-based distribution loss for cos "
+                             "(phase-invariant). 0 = off.")
     parser.add_argument("--num-loss-scales", type=int, default=5,
                         help="Number of scales in scale-space loss (1 = no multi-scale).")
     parser.add_argument("--no-deform", action="store_true",
@@ -2494,6 +2627,7 @@ def main() -> None:
         ),
         reinit_decoder_scales=args.reinit_decoder_scales,
         himag_filter=not args.no_himag_filter,
+        w_dist=args.w_dist,
         num_loss_scales=args.num_loss_scales,
         deform_enabled=not args.no_deform,
         deform_stride=args.deform_stride,
