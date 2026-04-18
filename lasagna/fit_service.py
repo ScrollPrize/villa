@@ -357,33 +357,37 @@ def _run_optimization(body: dict[str, Any]) -> None:
             kwargs["progress_fn"] = _wrapped_progress
             return _orig_optimize(**kwargs)
 
+        # Pause training if running (free GPU for optimization)
+        from gpu_pause import gpu_pause_context
+
         opt_mod.optimize = _patched_optimize
-        try:
-            import fit as fit_mod
-            _job.set_running("loading", 0, 0, 0.0)
-            fit_mod.main([cfg_path])
-        finally:
-            opt_mod.optimize = _orig_optimize
+        with gpu_pause_context():
+            try:
+                import fit as fit_mod
+                _job.set_running("loading", 0, 0, 0.0)
+                fit_mod.main([cfg_path])
+            finally:
+                opt_mod.optimize = _orig_optimize
 
-        if _job.cancelled:
-            _job.set_error("cancelled")
-            return
+            if _job.cancelled:
+                _job.set_error("cancelled")
+                return
 
-        # Export to tifxyz
-        _job.set_running("exporting", 0, 0, 0.0)
-        import fit2tifxyz
-        export_argv = ["--input", str(model_output), "--output", str(output_dir)]
-        if body.get("single_segment"):
-            export_argv.append("--single-segment")
-        if body.get("copy_model"):
-            export_argv.append("--copy-model")
-        output_name = body.get("output_name")
-        if output_name:
-            export_argv.extend(["--output-name", str(output_name)])
-        voxel_size_um = config.get("voxel_size_um")
-        if voxel_size_um is not None:
-            export_argv.extend(["--voxel-size-um", str(float(voxel_size_um))])
-        fit2tifxyz.main(export_argv)
+            # Export to tifxyz
+            _job.set_running("exporting", 0, 0, 0.0)
+            import fit2tifxyz
+            export_argv = ["--input", str(model_output), "--output", str(output_dir)]
+            if body.get("single_segment"):
+                export_argv.append("--single-segment")
+            if body.get("copy_model"):
+                export_argv.append("--copy-model")
+            output_name = body.get("output_name")
+            if output_name:
+                export_argv.extend(["--output-name", str(output_name)])
+            voxel_size_um = config.get("voxel_size_um")
+            if voxel_size_um is not None:
+                export_argv.extend(["--voxel-size-um", str(float(voxel_size_um))])
+            fit2tifxyz.main(export_argv)
 
         # Clean up intermediate files (but keep results_tmp for download)
         import shutil
@@ -549,17 +553,19 @@ class _Handler(BaseHTTPRequestHandler):
                         data_input = str(candidate)
 
             import lasagna_analyze
-            lasagna_analyze.export_vis_obj(
-                model_path=str(model_input),
-                data_path=str(data_input),
-                output_dir=tmp_dir,
-                slices=body.get("slices", []),
-                channels=body.get("channels", []),
-                losses=body.get("losses", []),
-                include_mesh=bool(body.get("include_mesh", True)),
-                include_connections=bool(body.get("include_connections", True)),
-                device=body.get("device", "cuda"),
-            )
+            from gpu_pause import gpu_pause_context
+            with gpu_pause_context():
+                lasagna_analyze.export_vis_obj(
+                    model_path=str(model_input),
+                    data_path=str(data_input),
+                    output_dir=tmp_dir,
+                    slices=body.get("slices", []),
+                    channels=body.get("channels", []),
+                    losses=body.get("losses", []),
+                    include_mesh=bool(body.get("include_mesh", True)),
+                    include_connections=bool(body.get("include_connections", True)),
+                    device=body.get("device", "cuda"),
+                )
 
             # Package as tar.gz
             buf = io.BytesIO()

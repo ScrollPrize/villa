@@ -1191,6 +1191,13 @@ def run_preprocess_3d(
 			skip_pred_dt = True
 			print(f"[predict3d] resuming: pred_dt.zarr has data, skipping Phase 1", flush=True)
 
+	# --- Pause training if running (free GPU) ---
+	from gpu_pause import gpu_pause_context
+	_needs_gpu = (pred_dt_path and not skip_pred_dt) or not skip_inference
+	_gpu_ctx = gpu_pause_context() if _needs_gpu else None
+	if _gpu_ctx is not None:
+		_gpu_ctx.__enter__()
+
 	# --- Phase 1: pred_dt ---
 	if pred_dt_path and not skip_pred_dt:
 		_compute_pred_dt_channel(
@@ -1296,6 +1303,10 @@ def run_preprocess_3d(
 			zarr_path=f"{prefix}cos.zarr", scaledown=cos_sd, channels=["cos"]))
 		vol.update_group("prediction", ChannelGroup(
 			zarr_path=f"{prefix}prediction.zarr", scaledown=other_sd, channels=["grad_mag", "nx", "ny"]))
+
+	# --- Resume training ---
+	if _gpu_ctx is not None:
+		_gpu_ctx.__exit__(None, None, None)
 
 	# Always save the manifest (in case only pred_dt was updated)
 	vol.save()

@@ -242,6 +242,50 @@ def gpu_pause_client(
     return reply.decode().strip()
 
 
+class gpu_pause_context:
+    """Context manager that pauses a running training process for the duration.
+
+    If no training is running (socket not found, connection refused), does nothing.
+    On exit, resumes training if it was paused by this context.
+
+    Usage::
+
+        with gpu_pause_context():
+            # GPU is free for inference / optimization
+            ...
+    """
+
+    def __init__(self, socket_path: str = DEFAULT_SOCKET_PATH, timeout: float = 300.0):
+        self._socket_path = socket_path
+        self._timeout = timeout
+        self._did_pause = False
+
+    def __enter__(self):
+        try:
+            result = gpu_pause_client("pause", self._socket_path, self._timeout)
+            if result == "ok":
+                self._did_pause = True
+                print("[gpu_pause] paused training", flush=True)
+            elif result == "already_paused":
+                print("[gpu_pause] training already paused", flush=True)
+            else:
+                print(f"[gpu_pause] pause returned: {result}", flush=True)
+        except (FileNotFoundError, ConnectionRefusedError):
+            pass  # no training running
+        except Exception as e:
+            print(f"[gpu_pause] pause failed: {e}", flush=True)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if self._did_pause:
+            try:
+                result = gpu_pause_client("resume", self._socket_path, self._timeout)
+                print(f"[gpu_pause] resumed training ({result})", flush=True)
+            except Exception as e:
+                print(f"[gpu_pause] resume failed: {e}", flush=True)
+        return False
+
+
 if __name__ == "__main__":
     if len(sys.argv) < 2 or sys.argv[1] not in ("pause", "resume", "status"):
         print(f"Usage: {sys.argv[0]} pause|resume|status", file=sys.stderr)
