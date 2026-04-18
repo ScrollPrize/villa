@@ -188,7 +188,7 @@ static ChunkDataPtr decodeCanonicalH265(const std::vector<uint8_t>& compressed) 
     utils::VideoCodecParams vp;
     vp.depth = dims[0]; vp.height = dims[1]; vp.width = dims[2];
     const size_t n = size_t(dims[0]) * dims[1] * dims[2];
-    auto out = std::make_unique<ChunkData>();
+    auto out = vc::cache::acquireChunkData();
     out->shape = {int(dims[0]), int(dims[1]), int(dims[2])};
     out->elementSize = 1;
     out->bytes.resize(n);
@@ -912,7 +912,7 @@ ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey) {
     int sy0 = cy0 / scs[1], sy1 = (cy1 + scs[1] - 1) / scs[1];
     int sx0 = cx0 / scs[2], sx1 = (cx1 + scs[2] - 1) / scs[2];
 
-    auto out = std::make_unique<ChunkData>();
+    auto out = vc::cache::acquireChunkData();
     out->shape = {C, C, C};
     out->elementSize = 1;
     out->bytes.assign(size_t(C) * C * C, 0);
