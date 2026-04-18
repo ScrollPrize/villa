@@ -86,20 +86,22 @@ struct VolumeShape {
 // block cache only — never blocks on disk or network. Missing blocks make
 // sampleInt return 0 (black) for that voxel. Viewport-demand fetches feed
 // the cache asynchronously via BlockPipeline::fetchInteractive.
-template<typename T, int kSlots = 4096>
+template<typename T, int kSlots = 16384>
 struct BlockSampler {
     static_assert((kSlots & (kSlots - 1)) == 0, "kSlots must be power of 2");
     static constexpr int kSlotMask = kSlots - 1;
 
-    // Hot slot: packed key + data pointer, 16 bytes. 4096 slots × 16B = 64KB.
-    // Fits in L2 with room to spare; L1D (typically 32-64KB) takes collisions.
-    // Raised from 1024 because the 12-thread render's per-thread working set
-    // is 1400-2700 unique blocks per frame — at 1024 slots the direct-mapped
-    // cache collided hard, and every collision miss fell through to blockAt,
-    // taking a BlockCache shard shared_lock. The shard shared_lock release
-    // (CAS-rel on its reader counter) was ~9% of CPU. 4096 slots hold the
-    // full working set so most lookups stay in the sampler's private cache.
-    // The shared_ptr (refcounting keep-alive) lives in a cold parallel array,
+    // Hot slot: packed key + data pointer, 16 bytes. 16384 slots × 16B =
+    // 256 KB per sampler — fits in L2D on Oryon (typically 1-2 MB/core).
+    // Sized up from 4096 after observing heavy Max-composite workloads
+    // (65 layers × 1M pixels, ~500K unique blocks across the frame)
+    // sending ~25% of lookups to the BlockCache slow path. The slow
+    // path's pthread_rwlock_rdlock/unlock chain was ~44% of CPU in those
+    // frames. Quadrupling the per-thread cache drops the direct-mapped
+    // collision rate roughly 4× by lowering occupancy, and keeps far
+    // more of the hot working set in the per-sampler private cache
+    // (where lookups are 2 instructions, no atomics).
+    // The BlockPtr (non-owning) lives in a cold parallel array,
     // touched only on miss.
     struct HotSlot {
         uint64_t key = UINT64_MAX;
@@ -682,7 +684,9 @@ public:
         // ever shares it.
         std::lock_guard<std::mutex> callLock(callMutex_);
         body_ = std::function<void(int)>(std::forward<Body>(body));
-        for (int i = 0; i < nWorkers; ++i) startSem_.release();
+        // Batched start: glibc collapses counting_semaphore::release(N)
+        // into a single futex_wake(n=N) syscall, vs. N separate syscalls.
+        startSem_.release(nWorkers);
         body_(0);
         for (int i = 0; i < nWorkers; ++i) doneSem_.acquire();
     }
@@ -708,7 +712,7 @@ private:
 
     ~RenderThreadPool() {
         shutdown_.store(true, std::memory_order_release);
-        for (size_t i = 0; i < workers_.size(); ++i) startSem_.release();
+        startSem_.release(int(workers_.size()));
         // jthread destructor joins automatically.
     }
 
@@ -903,7 +907,11 @@ static AccumMode2 accumModeFor(const std::string& m) {
     if (m == "max") return AccumMode2::Max;
     if (m == "min") return AccumMode2::Min;
     if (m == "volumetric") return AccumMode2::Volumetric;
-    if (m == "median" || m == "alpha" || m == "beerLambert" || m == "minabs") return AccumMode2::LayerStorage;
+    if (m == "median" || m == "alpha" || m == "beerLambert" || m == "minabs"
+        || m == "dvr" || m == "firstHitIso" || m == "devFromMean"
+        || m == "emissionDvr" || m == "maxAboveIso" || m == "gammaWeighted"
+        || m == "gradientMag" || m == "pbrIso" || m == "shadedDvr")
+        return AccumMode2::LayerStorage;
     return AccumMode2::Mean;
 }
 
@@ -928,13 +936,35 @@ void sampleSingleLayerAdaptiveImpl(
     const uint32_t lut[256],
     const CompositeParams* lightParams,
     uint8_t* levelOut,
-    int levelStride)
+    int levelStride,
+    bool skipPrefetch = false)
 {
     auto levelScale = [](int lvl) { return (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f; };
     const float zOffConst = float(zStart) * zStep;
 
+    alignas(64) uint8_t preTfLut[256];
+    buildTfLut256(
+        lightParams && lightParams->preTfEnabled,
+        lightParams ? lightParams->preTfX1 : 85,
+        lightParams ? lightParams->preTfY1 : 85,
+        lightParams ? lightParams->preTfX2 : 170,
+        lightParams ? lightParams->preTfY2 : 170,
+        preTfLut);
+    alignas(64) uint8_t postTfLut[256];
+    buildTfLut256(
+        lightParams && lightParams->postTfEnabled,
+        lightParams ? lightParams->postTfX1 : 85,
+        lightParams ? lightParams->postTfY1 : 85,
+        lightParams ? lightParams->postTfX2 : 170,
+        lightParams ? lightParams->postTfY2 : 170,
+        postTfLut);
+
     // Prefetch the chunks the sampled plane touches. Same as the multi-layer
     // version but the bbox collapses to the single-z-slab defined by zStart.
+    // When skipPrefetch is set, the caller is asserting that coords haven't
+    // changed since the prior frame — the fetchInteractive queue is already
+    // seeded, and rerunning the enumeration is pure overhead.
+    if (!skipPrefetch) {
     cv::Vec3f viewCenterL0(0, 0, 0);
     bool haveCenter = false;
     if (coords) {
@@ -990,6 +1020,7 @@ void sampleSingleLayerAdaptiveImpl(
             cache.fetchInteractive(keys, desiredLevel);
         }
     }
+    }  // skipPrefetch guard
 
     float scales[kMaxLevels] = {};
     const int nSamplersTotal = numLevels - desiredLevel;
@@ -1117,7 +1148,7 @@ void sampleSingleLayerAdaptiveImpl(
                     val *= computeLightingFactor(lnrm, *lightParams);
                 }
                 if (val < 0.f) val = 0.f; if (val > 255.f) val = 255.f;
-                outRow[x] = lut[uint8_t(val)];
+                outRow[x] = lut[postTfLut[uint8_t(val)]];
                 if (lvlRow) lvlRow[x] = pxLevel;
             }
         }
@@ -1139,7 +1170,8 @@ void sampleCompositeAdaptiveImpl(
     const uint32_t lut[256],
     const CompositeParams* lightParams,
     uint8_t* levelOut,
-    int levelStride)
+    int levelStride,
+    bool skipPrefetch = false)
 {
     auto levelScale = [](int lvl) { return (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f; };
     const float zLo = float(zStart) * zStep;
@@ -1147,6 +1179,9 @@ void sampleCompositeAdaptiveImpl(
     const float zMin = std::min(zLo, zHi), zMax = std::max(zLo, zHi);
 
     // Prefetch covered bbox across all fallback levels.
+    // Skip entirely when the caller knows coords are unchanged since the
+    // prior frame — same rationale as in sampleSingleLayerAdaptiveImpl.
+    if (!skipPrefetch) {
     cv::Vec3f viewCenterL0(0, 0, 0);
     bool haveCenter = false;
     if (coords) {
@@ -1212,6 +1247,7 @@ void sampleCompositeAdaptiveImpl(
             cache.fetchInteractive(keys, desiredLevel);
         }
     }
+    }  // skipPrefetch guard
 
     // Precompute per-level scale factor once (1.0 / 2^lvl). Hoists the
     // integer shift + int->float convert + fdiv out of the hot inner loop.
@@ -1227,13 +1263,27 @@ void sampleCompositeAdaptiveImpl(
     // Max and Min also reach here when preprocess is enabled — the per-ray
     // layer preprocess needs layerVals[] populated, which Max/Min's direct
     // accumulate path skips.
-    enum class LayerAgg : uint8_t { Median, MinAbs, Alpha, BeerLambert, Mean, Max, Min };
+    enum class LayerAgg : uint8_t {
+        Median, MinAbs, Alpha, BeerLambert, Mean, Max, Min,
+        Dvr, FirstHitIso, DevFromMean,
+        EmissionDvr, MaxAboveIso, GammaWeighted, GradientMag,
+        PbrIso, ShadedDvr
+    };
     const LayerAgg layerAgg = (compositeMethod == "median") ? LayerAgg::Median
                             : (compositeMethod == "minabs") ? LayerAgg::MinAbs
                             : (compositeMethod == "alpha") ? LayerAgg::Alpha
                             : (compositeMethod == "beerLambert") ? LayerAgg::BeerLambert
                             : (compositeMethod == "max") ? LayerAgg::Max
                             : (compositeMethod == "min") ? LayerAgg::Min
+                            : (compositeMethod == "dvr") ? LayerAgg::Dvr
+                            : (compositeMethod == "firstHitIso") ? LayerAgg::FirstHitIso
+                            : (compositeMethod == "devFromMean") ? LayerAgg::DevFromMean
+                            : (compositeMethod == "emissionDvr") ? LayerAgg::EmissionDvr
+                            : (compositeMethod == "maxAboveIso") ? LayerAgg::MaxAboveIso
+                            : (compositeMethod == "gammaWeighted") ? LayerAgg::GammaWeighted
+                            : (compositeMethod == "gradientMag") ? LayerAgg::GradientMag
+                            : (compositeMethod == "pbrIso") ? LayerAgg::PbrIso
+                            : (compositeMethod == "shadedDvr") ? LayerAgg::ShadedDvr
                             : LayerAgg::Mean;
 
     // Per-ray layer preprocess flags (applied before the aggregation below).
@@ -1250,6 +1300,29 @@ void sampleCompositeAdaptiveImpl(
     // reload them through the pointer each iteration.
     const bool lightingEnabled = lightParams && lightParams->lightingEnabled;
     const int  lightNormalSource = lightParams ? lightParams->lightNormalSource : 0;
+
+    // Pre-TF LUT: materialized once per render from lightParams. Identity
+    // when preTfEnabled is off, so the per-sample lookup stays a no-op
+    // without needing a branch in the inner loop. 256 bytes = one cacheline-
+    // worth of L1D.
+    alignas(64) uint8_t preTfLut[256];
+    buildTfLut256(
+        lightParams && lightParams->preTfEnabled,
+        lightParams ? lightParams->preTfX1 : 85,
+        lightParams ? lightParams->preTfY1 : 85,
+        lightParams ? lightParams->preTfX2 : 170,
+        lightParams ? lightParams->preTfY2 : 170,
+        preTfLut);
+    // Post-TF LUT: applied to the composite output before the display
+    // colormap. Same identity-on-disable property as preTfLut.
+    alignas(64) uint8_t postTfLut[256];
+    buildTfLut256(
+        lightParams && lightParams->postTfEnabled,
+        lightParams ? lightParams->postTfX1 : 85,
+        lightParams ? lightParams->postTfY1 : 85,
+        lightParams ? lightParams->postTfX2 : 170,
+        lightParams ? lightParams->postTfY2 : 170,
+        postTfLut);
 
     // Volumetric-mode exp LUTs: exp(-extN * k) for k in [0..255]. extN is
     // constant per call (from lightParams->blExtinction/255). Pre-computing
@@ -1530,7 +1603,25 @@ void sampleCompositeAdaptiveImpl(
                         const int bx = int( key        & ((int64_t(1) << 20) - 1));
                         s0.tryUpdateBlockNonBlocking(bz, by, bx);
                         const uint8_t* cdata = s0.data;
+                        // Run-length extend: find the largest liEnd such that
+                        // bkey[li..liEnd) are all equal to key. Consecutive
+                        // z-samples at zStep=1 typically share a block for
+                        // ~16 layers, so this loop iterates ~16x per block
+                        // transition. Scalar version was ~20% of the composite
+                        // kernel's CPU (perf showed the backward-branch target
+                        // hot). The 4-wide block below issues all 4 compares
+                        // before the branch — bitwise `&` (not `&&`) prevents
+                        // short-circuit so clang can schedule them in parallel
+                        // across the Oryon wide OoO pipeline.
                         int liEnd = li + 1;
+                        while (liEnd + 4 <= nL) {
+                            const int e0 = bkey[liEnd    ] == key;
+                            const int e1 = bkey[liEnd + 1] == key;
+                            const int e2 = bkey[liEnd + 2] == key;
+                            const int e3 = bkey[liEnd + 3] == key;
+                            if ((e0 & e1 & e2 & e3) == 0) break;
+                            liEnd += 4;
+                        }
                         while (liEnd < nL && bkey[liEnd] == key) ++liEnd;
                         const int runLen = liEnd - li;
                         if (cdata) {
@@ -1542,27 +1633,27 @@ void sampleCompositeAdaptiveImpl(
                             if constexpr (AMode == AccumMode2::Max) {
                                 uint8_t m = uint8_t(mx);
                                 for (int i = li; i < liEnd; ++i) {
-                                    const uint8_t v = cdata[offset[i]];
+                                    const uint8_t v = preTfLut[cdata[offset[i]]];
                                     m = v > m ? v : m;
                                 }
                                 mx = float(m);
                             } else if constexpr (AMode == AccumMode2::Min) {
                                 uint8_t m = uint8_t(mn);
                                 for (int i = li; i < liEnd; ++i) {
-                                    const uint8_t v = cdata[offset[i]];
+                                    const uint8_t v = preTfLut[cdata[offset[i]]];
                                     m = v < m ? v : m;
                                 }
                                 mn = float(m);
                             } else if constexpr (AMode == AccumMode2::Mean) {
                                 int sum = 0;
                                 for (int i = li; i < liEnd; ++i) {
-                                    sum += int(cdata[offset[i]]);
+                                    sum += int(preTfLut[cdata[offset[i]]]);
                                 }
                                 accum += float(sum);
                                 count += runLen;
                             } else {
                                 for (int i = li; i < liEnd; ++i) {
-                                    layerVals[i] = float(cdata[offset[i]]);
+                                    layerVals[i] = float(preTfLut[cdata[offset[i]]]);
                                 }
                             }
                         } else if constexpr (AMode == AccumMode2::Mean) {
@@ -1587,6 +1678,7 @@ void sampleCompositeAdaptiveImpl(
                                 break;
                             }
                         }
+                        v = preTfLut[v];
                         if constexpr (AMode == AccumMode2::Max) { mx = std::max(mx, float(v)); }
                         else if constexpr (AMode == AccumMode2::Min) { mn = std::min(mn, float(v)); }
                         else if constexpr (AMode == AccumMode2::Mean) { accum += float(v); count++; }
@@ -1801,6 +1893,275 @@ void sampleCompositeAdaptiveImpl(
                             for (int i=1; i<nL; i++) if (layerVals[i] < m) m = layerVals[i];
                             val = m;
                         }
+                    } else if (layerAgg == LayerAgg::Dvr) {
+                        // Front-to-back emissive volume rendering. Each layer
+                        // contributes emission proportional to its (Pre-TF'd)
+                        // intensity; opacity is intensity/255. Pre-TF sculpts
+                        // the intensity→opacity curve so a user can isolate
+                        // the ink-density band.
+                        float color = 0.f;
+                        float trans = 1.f;
+                        const float ambient = lightParams ? lightParams->dvrAmbient : 0.f;
+                        for (int i = 0; i < nL; ++i) {
+                            if (preprocessActive && voidMask[i]) continue;
+                            const float I = layerVals[i];
+                            const float op = I * (1.f/255.f);
+                            color += I * trans * op;
+                            trans *= (1.f - op);
+                            if (trans < 0.001f) break;
+                        }
+                        color += ambient * trans;
+                        val = color;
+                    } else if (layerAgg == LayerAgg::FirstHitIso) {
+                        // First voxel above isoCutoff along the ray. Shaded
+                        // later by the lighting block below (which already
+                        // supports lightNormalSource=1 = volume gradient
+                        // normal) — so the rendered result is a surface-
+                        // topology view of the first density boundary.
+                        const uint8_t isoCut = lightParams ? lightParams->isoCutoff : 0;
+                        const float isoFHit = float(isoCut);
+                        float hit = 0.f;
+                        for (int i = 0; i < nL; ++i) {
+                            if (layerVals[i] > isoFHit) { hit = layerVals[i]; break; }
+                        }
+                        val = hit;
+                    } else if (layerAgg == LayerAgg::DevFromMean) {
+                        // Mean absolute deviation from the ray mean, over
+                        // layers above isoCutoff (or over non-void layers
+                        // when preprocess is active). Surfaces per-ray
+                        // outliers — ink, voids, cracks — relative to a
+                        // locally-estimated papyrus baseline. Float math
+                        // is fine: max sum is kMaxLayers * 255 ≈ 33K, well
+                        // below float's 24-bit mantissa — and dropping the
+                        // float↔double fcvt chain let clang keep the two
+                        // passes in the FPU pipeline rather than bouncing
+                        // through double registers per sample.
+                        const uint8_t isoCut = lightParams ? lightParams->isoCutoff : 0;
+                        const float isoFDev = float(isoCut);
+                        float sum = 0.f;
+                        int n = 0;
+                        for (int i = 0; i < nL; ++i) {
+                            if (preprocessActive && voidMask[i]) continue;
+                            if (!preprocessActive && layerVals[i] <= isoFDev) continue;
+                            sum += layerVals[i];
+                            ++n;
+                        }
+                        if (n > 0) {
+                            const float invN = 1.f / float(n);
+                            const float m = sum * invN;
+                            float dev = 0.f;
+                            for (int i = 0; i < nL; ++i) {
+                                if (preprocessActive && voidMask[i]) continue;
+                                if (!preprocessActive && layerVals[i] <= isoFDev) continue;
+                                dev += std::fabs(layerVals[i] - m);
+                            }
+                            val = dev * invN;
+                        } else {
+                            val = 0.f;
+                        }
+                    } else if (layerAgg == LayerAgg::EmissionDvr) {
+                        // Emission-only DVR: every layer contributes
+                        // emission ∝ I² / 255 with no absorption, so ink
+                        // behind papyrus still reaches the ray total. Good
+                        // complement to `dvr` when you want a transmissive
+                        // integrator rather than a front-to-back one.
+                        float color = 0.f;
+                        for (int i = 0; i < nL; ++i) {
+                            if (preprocessActive && voidMask[i]) continue;
+                            const float I = layerVals[i];
+                            color += I * I * (1.f/255.f);
+                        }
+                        val = color;
+                    } else if (layerAgg == LayerAgg::MaxAboveIso) {
+                        // Max of samples strictly above isoCutoff. Like
+                        // plain Max but ignores air/substrate, so the
+                        // composite tracks the brightest papyrus/ink voxel
+                        // the ray crosses without being pinned by the
+                        // highest-contrast fiber tip off-sheet.
+                        const uint8_t isoCut = lightParams ? lightParams->isoCutoff : 0;
+                        const float isoFMax = float(isoCut);
+                        float m = 0.f;
+                        for (int i = 0; i < nL; ++i) {
+                            if (preprocessActive && voidMask[i]) continue;
+                            const float v = layerVals[i];
+                            if (v > isoFMax && v > m) m = v;
+                        }
+                        val = m;
+                    } else if (layerAgg == LayerAgg::GammaWeighted) {
+                        // sum(w*I) / sum(w) with w = max(0, I-iso)^2. The
+                        // quadratic weight amplifies ink's small density
+                        // offset relative to papyrus while still behaving
+                        // like a mean (not a max, so robust to outliers).
+                        const uint8_t isoCut = lightParams ? lightParams->isoCutoff : 0;
+                        const float isoFGw = float(isoCut);
+                        float sumWI = 0.f, sumW = 0.f;
+                        for (int i = 0; i < nL; ++i) {
+                            if (preprocessActive && voidMask[i]) continue;
+                            const float I = layerVals[i];
+                            const float d = I - isoFGw;
+                            if (d <= 0.f) continue;
+                            const float w = d * d;
+                            sumWI += w * I;
+                            sumW  += w;
+                        }
+                        val = sumW > 0.f ? sumWI / sumW : 0.f;
+                    } else if (layerAgg == LayerAgg::GradientMag) {
+                        // Peak |∂I/∂z| along the ray via central difference.
+                        // Lights up where a crack edge / ink boundary is
+                        // crossed; picks the sharpest intensity step in the
+                        // column. Scaled ×8 so a typical step shows up at
+                        // full brightness — raw gradients cluster low.
+                        float best = 0.f;
+                        for (int i = 1; i < nL - 1; ++i) {
+                            const float g = std::fabs(
+                                layerVals[i + 1] - layerVals[i - 1]) * 0.5f;
+                            if (g > best) best = g;
+                        }
+                        val = best * 8.f;
+                    } else if (layerAgg == LayerAgg::PbrIso) {
+                        // Cook-Torrance BRDF at the first voxel above iso.
+                        // Unlike FirstHitIso (which Lambertian-shades via
+                        // the generic lighting block using the base-pixel
+                        // gradient), this samples the 3D gradient at the
+                        // hit's actual z position and runs the full GGX +
+                        // Schlick Fresnel + Smith-Schlick BRDF with user-
+                        // tunable roughness/metallic. Carbonized papyrus
+                        // sits at F0≈0.7 at metallic=1 (carbon reflectance).
+                        const uint8_t isoCut = lightParams ? lightParams->isoCutoff : 0;
+                        const float isoFPbr = float(isoCut);
+                        int hitIdx = -1;
+                        float hitVal = 0.f;
+                        for (int i = 0; i < nL; ++i) {
+                            if (layerVals[i] > isoFPbr) {
+                                hitIdx = i; hitVal = layerVals[i]; break;
+                            }
+                        }
+                        val = hitVal;
+                        if (hitIdx >= 0 && lightParams) {
+                            const float zHit = float(zStart + hitIdx) * zStep;
+                            const float hx = (base[0] + nrm[0] * zHit) * endScale;
+                            const float hy = (base[1] + nrm[1] * zHit) * endScale;
+                            const float hz = (base[2] + nrm[2] * zHit) * endScale;
+                            uint8_t gx0=0, gx1=0, gy0=0, gy1=0, gz0=0, gz1=0;
+                            const bool gok =
+                                trySampleNB<SMode>(*samplers[0], hz, hy, hx - 1.f, gx0)
+                             && trySampleNB<SMode>(*samplers[0], hz, hy, hx + 1.f, gx1)
+                             && trySampleNB<SMode>(*samplers[0], hz, hy - 1.f, hx, gy0)
+                             && trySampleNB<SMode>(*samplers[0], hz, hy + 1.f, hx, gy1)
+                             && trySampleNB<SMode>(*samplers[0], hz - 1.f, hy, hx, gz0)
+                             && trySampleNB<SMode>(*samplers[0], hz + 1.f, hy, hx, gz1);
+                            if (gok) {
+                                // Outward normal = gradient dense→sparse.
+                                float nx = float(gx0) - float(gx1);
+                                float ny = float(gy0) - float(gy1);
+                                float nz = float(gz0) - float(gz1);
+                                const float nlen = std::sqrt(nx*nx + ny*ny + nz*nz);
+                                if (nlen > 1e-3f) {
+                                    nx /= nlen; ny /= nlen; nz /= nlen;
+                                    const float lx = lightParams->lightDirX;
+                                    const float ly = lightParams->lightDirY;
+                                    const float lz = lightParams->lightDirZ;
+                                    // View direction: opposite the slab normal.
+                                    float vx = -nrm[0], vy = -nrm[1], vz = -nrm[2];
+                                    const float vlen = std::sqrt(vx*vx + vy*vy + vz*vz);
+                                    if (vlen > 1e-3f) { vx /= vlen; vy /= vlen; vz /= vlen; }
+                                    // Half vector.
+                                    float hhx = lx + vx, hhy = ly + vy, hhz = lz + vz;
+                                    const float hlen = std::sqrt(hhx*hhx + hhy*hhy + hhz*hhz);
+                                    if (hlen > 1e-3f) { hhx /= hlen; hhy /= hlen; hhz /= hlen; }
+                                    const float NdotL = std::max(0.f, nx*lx + ny*ly + nz*lz);
+                                    const float NdotV = std::max(1e-3f, nx*vx + ny*vy + nz*vz);
+                                    const float NdotH = std::max(0.f, nx*hhx + ny*hhy + nz*hhz);
+                                    const float VdotH = std::max(0.f, vx*hhx + vy*hhy + vz*hhz);
+                                    const float rough = std::max(0.05f,
+                                        std::min(1.f, lightParams->pbrRoughness));
+                                    const float metal = std::max(0.f,
+                                        std::min(1.f, lightParams->pbrMetallic));
+                                    const float a  = rough * rough;
+                                    const float a2 = a * a;
+                                    // GGX normal distribution.
+                                    const float denom = (NdotH*NdotH*(a2-1.f) + 1.f);
+                                    const float D = a2 / std::max(1e-6f,
+                                        3.14159265f * denom * denom);
+                                    // Schlick Fresnel. F0 interpolates from
+                                    // dielectric (0.04) to carbon (~0.7).
+                                    const float F0 = 0.04f + (0.66f) * metal;
+                                    const float F  = F0 + (1.f - F0) *
+                                        std::pow(1.f - VdotH, 5.f);
+                                    // Smith-Schlick geometry.
+                                    const float k  = (rough + 1.f) * (rough + 1.f) / 8.f;
+                                    const float gL = NdotL / (NdotL * (1.f - k) + k);
+                                    const float gV = NdotV / (NdotV * (1.f - k) + k);
+                                    const float G  = gL * gV;
+                                    const float spec = D * F * G /
+                                        std::max(1e-6f, 4.f * NdotL * NdotV);
+                                    const float kd = (1.f - F) * (1.f - metal);
+                                    const float albedo = hitVal * (1.f/255.f);
+                                    const float diff = kd * albedo * (1.f/3.14159265f);
+                                    const float Li = lightParams->lightDiffuse;
+                                    const float Ia = lightParams->lightAmbient;
+                                    const float shaded =
+                                        (diff + spec) * NdotL * Li + Ia * albedo;
+                                    val = shaded * 255.f;
+                                }
+                            }
+                        }
+                    } else if (layerAgg == LayerAgg::ShadedDvr) {
+                        // Front-to-back DVR where each voxel's emission is
+                        // weighted by a Lambertian factor computed from the
+                        // 3D gradient at that voxel. Self-shadowing reveals
+                        // surface topology INSIDE the volume (papyrus
+                        // layering) rather than the first-hit boundary.
+                        // Cost: 6 extra samples per layer × nL layers, so
+                        // this is ~7× the sample count of plain DVR — use
+                        // it sparingly.
+                        float color = 0.f;
+                        float trans = 1.f;
+                        const float ambient = lightParams ? lightParams->dvrAmbient : 0.f;
+                        const float lx = lightParams ? lightParams->lightDirX : 0.f;
+                        const float ly = lightParams ? lightParams->lightDirY : 0.f;
+                        const float lz = lightParams ? lightParams->lightDirZ : 1.f;
+                        const float Li = lightParams ? lightParams->lightDiffuse : 0.7f;
+                        const float Ia = lightParams ? lightParams->lightAmbient : 0.3f;
+                        const uint8_t isoCutSd = lightParams ? lightParams->isoCutoff : 0;
+                        const float isoFSd = float(isoCutSd);
+                        for (int i = 0; i < nL; ++i) {
+                            if (preprocessActive && voidMask[i]) continue;
+                            const float I = layerVals[i];
+                            if (I <= isoFSd) continue;
+                            // Sample gradient at this layer's world position.
+                            const float zL = float(zStart + i) * zStep;
+                            const float sx = (base[0] + nrm[0] * zL) * endScale;
+                            const float sy = (base[1] + nrm[1] * zL) * endScale;
+                            const float sz = (base[2] + nrm[2] * zL) * endScale;
+                            uint8_t gx0=0, gx1=0, gy0=0, gy1=0, gz0=0, gz1=0;
+                            const bool gok =
+                                trySampleNB<SMode>(*samplers[0], sz, sy, sx - 1.f, gx0)
+                             && trySampleNB<SMode>(*samplers[0], sz, sy, sx + 1.f, gx1)
+                             && trySampleNB<SMode>(*samplers[0], sz, sy - 1.f, sx, gy0)
+                             && trySampleNB<SMode>(*samplers[0], sz, sy + 1.f, sx, gy1)
+                             && trySampleNB<SMode>(*samplers[0], sz - 1.f, sy, sx, gz0)
+                             && trySampleNB<SMode>(*samplers[0], sz + 1.f, sy, sx, gz1);
+                            float shade = Ia;
+                            if (gok) {
+                                float nx = float(gx0) - float(gx1);
+                                float ny = float(gy0) - float(gy1);
+                                float nz = float(gz0) - float(gz1);
+                                const float nlen = std::sqrt(nx*nx + ny*ny + nz*nz);
+                                if (nlen > 1e-3f) {
+                                    nx /= nlen; ny /= nlen; nz /= nlen;
+                                    const float NdotL = std::max(0.f,
+                                        nx*lx + ny*ly + nz*lz);
+                                    shade = Ia + Li * NdotL;
+                                }
+                            }
+                            const float op = I * (1.f/255.f);
+                            color += I * shade * trans * op;
+                            trans *= (1.f - op);
+                            if (trans < 0.001f) break;
+                        }
+                        color += ambient * trans;
+                        val = color;
                     } else {
                         // Mean: skip voids when preprocess is active so block
                         // holes don't pull the average toward 0. Fall back to
@@ -1819,7 +2180,12 @@ void sampleCompositeAdaptiveImpl(
                         }
                     }
                 }
-                if (lightingEnabled) {
+                // PbrIso and ShadedDvr run their own per-hit / per-sample
+                // shading inside the finalize switch above — skip the generic
+                // Lambertian multiplier here so we don't double-shade.
+                const bool selfShaded = (layerAgg == LayerAgg::PbrIso
+                                      || layerAgg == LayerAgg::ShadedDvr);
+                if (lightingEnabled && !selfShaded) {
                     cv::Vec3f lnrm;
                     if (lightNormalSource == 1) {
                         // Volume-gradient normal: six cheap samples around
@@ -1854,13 +2220,14 @@ void sampleCompositeAdaptiveImpl(
                     val *= computeLightingFactor(lnrm, *lightParams);
                 }
                 if (val < 0.f) val = 0.f; if (val > 255.f) val = 255.f;
-                outRow[x] = lut[uint8_t(val)];
+                outRow[x] = lut[postTfLut[uint8_t(val)]];
                 if (lvlRow) lvlRow[x] = pxLevel;
             }
         }
         }  // while tiles
     });
 }
+
 
 template<SampleMode SMode>
 void dispatchCompositeAdaptive(
@@ -1876,7 +2243,8 @@ void dispatchCompositeAdaptive(
     const uint32_t lut[256],
     const CompositeParams* lightParams,
     uint8_t* levelOut,
-    int levelStride)
+    int levelStride,
+    bool skipPrefetch)
 {
     AccumMode2 mode = accumModeFor(method);
     // Per-ray layer preprocess (normalize / hist-eq over N composite samples)
@@ -1907,7 +2275,7 @@ void dispatchCompositeAdaptive(
         sampleSingleLayerAdaptiveImpl<SMode>(
             outBuf, outStride, cache, desiredLevel, numLevels,
             coords, origin, vx_step, vy_step, normals, planeNormal,
-            zStart, zStep, w, h, lut, lightParams, levelOut, levelStride);
+            zStart, zStep, w, h, lut, lightParams, levelOut, levelStride, skipPrefetch);
         return;
     }
     switch (mode) {
@@ -1915,27 +2283,27 @@ void dispatchCompositeAdaptive(
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::Max>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride, skipPrefetch); break;
         case AccumMode2::Min:
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::Min>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride, skipPrefetch); break;
         case AccumMode2::LayerStorage:
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::LayerStorage>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride, skipPrefetch); break;
         case AccumMode2::Volumetric:
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::Volumetric>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride, skipPrefetch); break;
         default:
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::Mean>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride, skipPrefetch); break;
     }
 }
 
@@ -1956,7 +2324,8 @@ void sampleAdaptiveARGB32(
     vc::Sampling method,
     const CompositeParams* lightParams,
     uint8_t* levelOut,
-    int levelStride)
+    int levelStride,
+    bool skipPrefetch)
 {
     if (numLayers <= 0) numLayers = 1;
     // Composite rendering forces Nearest: averaging N layers already
@@ -1968,12 +2337,12 @@ void sampleAdaptiveARGB32(
         dispatchCompositeAdaptive<SampleMode::Nearest>(
             outBuf, outStride, *cache, desiredLevel, numLevels,
             coords, origin, vx_step, vy_step, normals, planeNormal,
-            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams, levelOut, levelStride);
+            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams, levelOut, levelStride, skipPrefetch);
     } else {
         dispatchCompositeAdaptive<SampleMode::Trilinear>(
             outBuf, outStride, *cache, desiredLevel, numLevels,
             coords, origin, vx_step, vy_step, normals, planeNormal,
-            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams, levelOut, levelStride);
+            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams, levelOut, levelStride, skipPrefetch);
     }
 }
 

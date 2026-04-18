@@ -71,7 +71,18 @@ BlockCache::BlockCache(Config cfg)
         });
     }
 
-    slotKey_.assign(nSlots_, kEmptyKey);
+    slotKeyPacked_ = std::unique_ptr<std::atomic<uint64_t>[]>(
+        new std::atomic<uint64_t>[nSlots_]);
+    for (size_t i = 0; i < nSlots_; ++i)
+        slotKeyPacked_[i].store(UINT64_MAX, std::memory_order_relaxed);
+
+    // 8-way set-associative L2; see BlockCache.hpp for sizing rationale.
+    l2_ = std::unique_ptr<std::atomic<uint64_t>[]>(
+        new std::atomic<uint64_t>[kL2Size]);
+    for (size_t i = 0; i < kL2Size; ++i)
+        l2_[i].store(kL2Empty, std::memory_order_relaxed);
+    l2RrCounters_ = std::unique_ptr<uint8_t[]>(new uint8_t[kL2Sets]());
+
     const size_t words = (nSlots_ + 63u) / 64u;
     occupiedBits_.assign(words, 0);
     usedBitsWords_ = words;
@@ -103,15 +114,60 @@ BlockCache::~BlockCache()
 
 BlockPtr BlockCache::get(const BlockKey& key) noexcept
 {
+    // 8-way set-associative L2 fast path: probe 8 entries in one cacheline
+    // for a matching tag, verify via slotKeyPacked_. Lock-free throughout.
+    // The verify check still catches keyTag32 collisions (1/2^32) and
+    // eviction/reassignment races.
+    const uint64_t packed = packBlockKey(key);
+    const uint32_t tag = keyTag32(packed);
+    if (tag != 0) {  // tag==0 collides with kL2Empty; skip L2 for that key
+        const size_t setIdx = l2Index(packed, kL2Bits);
+        std::atomic<uint64_t>* set = &l2_[setIdx * kL2Ways];
+        for (size_t way = 0; way < kL2Ways; ++way) {
+            const uint64_t entry = set[way].load(std::memory_order_acquire);
+            if (uint32_t(entry >> 32) != tag) continue;
+            const uint32_t slot = uint32_t(entry);
+            if (slot < nSlots_ &&
+                slotKeyPacked_[slot].load(std::memory_order_acquire) == packed) {
+                setUsed(slot, true);
+                return &arena_[slot];
+            }
+        }
+    }
+
+    // Slow path: shard shared_lock + unordered_map lookup. Populate L2 on
+    // success so subsequent lookups for this key go lock-free. Round-robin
+    // counter picks which way to overwrite — the counter is non-atomic
+    // since races are benign (worst case we evict a slightly-less-ideal
+    // entry).
     const size_t sh = shardIndex(key);
     MapShard& shard = shards_[sh];
     std::shared_lock lock(shard.mutex);
     if (auto it = shard.map.find(key); it != shard.map.end()) {
-        setUsed(it->second, true);  // lock-free atomic fetch_or
-        // Per-shard hit counter: 12-thread render used to hammer one global
-        // atomic here, costing ~12% of total CPU from cacheline ping-pong.
+        const size_t slot = it->second;
+        setUsed(slot, true);
         shard.hits.fetch_add(1, std::memory_order_relaxed);
-        return &arena_[it->second];
+        if (tag != 0) {
+            const size_t setIdx = l2Index(packed, kL2Bits);
+            std::atomic<uint64_t>* set = &l2_[setIdx * kL2Ways];
+            // Prefer an empty slot if one is visible; otherwise evict via
+            // round-robin. The empty-slot scan is free since the cacheline
+            // is already hot from the probe above.
+            size_t wayToUse = kL2Ways;
+            for (size_t way = 0; way < kL2Ways; ++way) {
+                if (set[way].load(std::memory_order_relaxed) == kL2Empty) {
+                    wayToUse = way; break;
+                }
+            }
+            if (wayToUse == kL2Ways) {
+                const uint8_t c = l2RrCounters_[setIdx];
+                l2RrCounters_[setIdx] = uint8_t((c + 1u) & (kL2Ways - 1u));
+                wayToUse = c & (kL2Ways - 1u);
+            }
+            set[wayToUse].store((uint64_t(tag) << 32) | uint32_t(slot),
+                                std::memory_order_release);
+        }
+        return &arena_[slot];
     }
     return nullptr;
 }
@@ -244,13 +300,35 @@ size_t BlockCache::acquireSlotLocked(const BlockKey& key) noexcept
     }
 
     setUsed(slot, true);
-    slotKey_[slot] = key;
+    const uint64_t packed = packBlockKey(key);
+    slotKeyPacked_[slot].store(packed, std::memory_order_release);
     {
         std::unique_lock wlock(shard.mutex);
         shard.map[key] = slot;
     }
     if (key.level >= 0 && key.level < kMaxLevels)
         levelOccupied_[key.level]++;
+    // Populate L2 for this key so the very first get() after insert goes
+    // lock-free. Same empty-preferred / round-robin-fallback placement as
+    // the slow-path populate in get().
+    const uint32_t tag = keyTag32(packed);
+    if (tag != 0) {
+        const size_t setIdx = l2Index(packed, kL2Bits);
+        std::atomic<uint64_t>* set = &l2_[setIdx * kL2Ways];
+        size_t wayToUse = kL2Ways;
+        for (size_t way = 0; way < kL2Ways; ++way) {
+            if (set[way].load(std::memory_order_relaxed) == kL2Empty) {
+                wayToUse = way; break;
+            }
+        }
+        if (wayToUse == kL2Ways) {
+            const uint8_t c = l2RrCounters_[setIdx];
+            l2RrCounters_[setIdx] = uint8_t((c + 1u) & (kL2Ways - 1u));
+            wayToUse = c & (kL2Ways - 1u);
+        }
+        set[wayToUse].store((uint64_t(tag) << 32) | uint32_t(slot),
+                            std::memory_order_release);
+    }
     return slot;
 }
 
@@ -272,7 +350,8 @@ size_t BlockCache::reclaimSlotLocked()
         size_t i = clockHand_;
         clockHand_ = (clockHand_ + 1) % nSlots_;
         if (!isOccupied(i)) continue;
-        const BlockKey& k = slotKey_[i];
+        const uint64_t pk = slotKeyPacked_[i].load(std::memory_order_relaxed);
+        const BlockKey k = unpackBlockKey(pk);
         const bool protectedSlot =
             (k.level >= 0 && k.level < kMaxLevels)
             && (levelOccupied_[k.level] <= levelFloor_[k.level]);
@@ -286,7 +365,27 @@ size_t BlockCache::reclaimSlotLocked()
                 std::unique_lock wlock(shards_[sh].mutex);
                 shards_[sh].map.erase(k);
             }
-            slotKey_[i] = kEmptyKey;
+            // Invalidate slot FIRST so any in-flight L2 reader verifies
+            // against an empty packed-key. If a stale L2 entry still points
+            // here, the verify load will mismatch → reader falls through.
+            slotKeyPacked_[i].store(UINT64_MAX, std::memory_order_release);
+            // Clear the L2 entry in whichever way holds this (tag, slot)
+            // pair — best effort, only touch entries that still match
+            // both the tag and the slot index so we don't invalidate an
+            // unrelated block.
+            const uint32_t oldTag = keyTag32(pk);
+            if (oldTag != 0) {
+                const size_t setIdx = l2Index(pk, kL2Bits);
+                std::atomic<uint64_t>* set = &l2_[setIdx * kL2Ways];
+                for (size_t way = 0; way < kL2Ways; ++way) {
+                    const uint64_t cur = set[way].load(std::memory_order_relaxed);
+                    if (uint32_t(cur >> 32) == oldTag &&
+                        uint32_t(cur) == uint32_t(i)) {
+                        set[way].store(kL2Empty, std::memory_order_release);
+                        break;
+                    }
+                }
+            }
             evictionVersion_.fetch_add(1, std::memory_order_relaxed);
             return i;
         }
@@ -308,7 +407,10 @@ void BlockCache::clear()
         s.map.clear();
         s.hits.store(0, std::memory_order_relaxed);
     }
-    std::fill(slotKey_.begin(), slotKey_.end(), kEmptyKey);
+    for (size_t i = 0; i < nSlots_; ++i)
+        slotKeyPacked_[i].store(UINT64_MAX, std::memory_order_relaxed);
+    for (size_t i = 0; i < kL2Size; ++i)
+        l2_[i].store(kL2Empty, std::memory_order_relaxed);
     std::fill(occupiedBits_.begin(), occupiedBits_.end(), 0);
     for (size_t i = 0; i < usedBitsWords_; ++i)
         usedBits_[i].store(0, std::memory_order_relaxed);

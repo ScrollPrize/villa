@@ -81,7 +81,15 @@ public:
     VCCollection* pointCollection() const override { return _pointCollection; }
 
     // --- Settings passthrough ---
+    // Equality guards: Qt UI routinely fires value-changed signals even
+    // when the user's action rounds to the same stored value (e.g. a
+    // drag-release that reports the current spinbox value). Without the
+    // guard we'd queue a real render for every no-op signal — the 16 ms
+    // coalesce timer still fires, but it triggers a full frame for zero
+    // visible change. Skipping identical settings keeps the pipeline
+    // idle when nothing actually changed.
     void setCompositeRenderSettings(const CompositeRenderSettings& s) {
+        if (_compositeSettings == s) return;
         _compositeSettings = s;
         scheduleRender();
     }
@@ -92,7 +100,11 @@ public:
     void setVolumeWindow(float low, float high);
     float volumeWindowLow() const { return _windowLow; }
     float volumeWindowHigh() const { return _windowHigh; }
-    void setBaseColormap(const std::string& id) { _baseColormapId = id; scheduleRender(); }
+    void setBaseColormap(const std::string& id) {
+        if (_baseColormapId == id) return;
+        _baseColormapId = id;
+        scheduleRender();
+    }
     void setStretchValues(bool) { scheduleRender(); }
 
     // --- Display stubs ---
@@ -264,6 +276,19 @@ private:
     QLabel* _lbl = nullptr;
     QTimer* _renderTimer = nullptr;
     bool _renderPending = false;
+
+    // Progressive rendering: during live interaction (pan drag, zoom wheel
+    // events) we render at +1 pyramid level for faster frames. When the
+    // user stops interacting, an idle timer fires and we kick a full-res
+    // render to catch up. This trades a slightly-softer image during
+    // motion for materially lower frame time, which in turn makes pans/
+    // zooms feel smoother without touching the sample kernel.
+    QTimer* _interactionIdleTimer = nullptr;
+    bool _interactive = false;
+    // Increment on every interactive event; submitRender captures the
+    // value before dispatching. If it changes while a render is in flight
+    // we know the user acted again and we should keep rendering.
+    void beginInteraction();
 
     // --- Framebuffer ---
     QImage _framebuffer;

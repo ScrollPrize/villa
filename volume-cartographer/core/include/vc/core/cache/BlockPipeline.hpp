@@ -66,7 +66,7 @@ public:
         Config config,
         std::unique_ptr<VolumeSource> source,
         DecompressFn decompress,
-        std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels = {});
+        std::vector<std::unique_ptr<utils::ZarrArray>> diskLevels = {});
 
     ~BlockPipeline();
 
@@ -147,7 +147,7 @@ public:
 
 private:
     Config config_;
-    std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels_;
+    std::vector<std::unique_ptr<utils::ZarrArray>> diskLevels_;
     std::unique_ptr<VolumeSource> source_;
     DecompressFn decompress_;
     // Four fully independent pools — each specialised for one stage so no
@@ -220,7 +220,14 @@ private:
     // Pull the whole shard file for `key` through the LRU cache. First
     // hit from any thread reads the file once; subsequent hits just bump
     // the LRU head and return the shared buffer.
-    std::shared_ptr<std::vector<std::byte>> shardBytesFor(
+    //
+    // Returns a raw pointer valid until the calling thread next invokes
+    // shardBytesFor() — a per-thread shared_ptr keeps the bytes alive
+    // across the caller's brief synchronous use. Returning a raw pointer
+    // instead of shared_ptr eliminates ~2 refcount atomics per call that
+    // were cache-line ping-ponging under 12-thread decode (perf showed
+    // the shared_ptr dtor's LDADDAL at ~20% of total CPU).
+    const std::vector<std::byte>* shardBytesFor(
         const ChunkKey& key, utils::ZarrArray& dz);
 
     // Map ShardKey → bucket index in shardCacheBuckets_.

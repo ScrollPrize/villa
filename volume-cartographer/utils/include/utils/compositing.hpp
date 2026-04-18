@@ -18,7 +18,16 @@ enum class CompositingMethod : std::uint8_t {
     max,
     min,
     alpha,
-    beer_lambert
+    beer_lambert,
+    dvr,
+    first_hit_iso,
+    dev_from_mean,
+    emission_dvr,
+    max_above_iso,
+    gamma_weighted,
+    gradient_mag,
+    pbr_iso,
+    shaded_dvr
 };
 
 // ---------------------------------------------------------------------------
@@ -59,6 +68,15 @@ struct CompositeParams {
     if (name == "min")          return CompositingMethod::min;
     if (name == "alpha")        return CompositingMethod::alpha;
     if (name == "beerLambert")  return CompositingMethod::beer_lambert;
+    if (name == "dvr")          return CompositingMethod::dvr;
+    if (name == "firstHitIso")  return CompositingMethod::first_hit_iso;
+    if (name == "devFromMean")  return CompositingMethod::dev_from_mean;
+    if (name == "emissionDvr")  return CompositingMethod::emission_dvr;
+    if (name == "maxAboveIso")  return CompositingMethod::max_above_iso;
+    if (name == "gammaWeighted") return CompositingMethod::gamma_weighted;
+    if (name == "gradientMag")  return CompositingMethod::gradient_mag;
+    if (name == "pbrIso")       return CompositingMethod::pbr_iso;
+    if (name == "shadedDvr")    return CompositingMethod::shaded_dvr;
     return CompositingMethod::mean;
 }
 
@@ -202,11 +220,115 @@ inline void value_stretch(std::span<float> data) noexcept {
     return accumulated + ambient * transmittance;
 }
 
+/// Front-to-back emissive DVR. Opacity = density/255; emission = density.
+/// Mirrors the per-layer integration used in VC3D's interactive viewer.
+[[nodiscard]] inline float composite_dvr(
+    std::span<const float> layers, float ambient = 0.0f) noexcept
+{
+    float color = 0.0f;
+    float trans = 1.0f;
+    for (float I : layers) {
+        const float op = I * (1.0f / 255.0f);
+        color += I * trans * op;
+        trans *= (1.0f - op);
+        if (trans < 0.001f) break;
+    }
+    return color + ambient * trans;
+}
+
+/// First-hit iso: return the first layer value strictly greater than
+/// iso_cutoff. Returns 0 when no layer exceeds the threshold. Does not
+/// apply any shading — the caller is expected to multiply by an external
+/// lighting factor.
+[[nodiscard]] inline float composite_first_hit_iso(
+    std::span<const float> layers, float iso_cutoff) noexcept
+{
+    for (float I : layers) {
+        if (I > iso_cutoff) return I;
+    }
+    return 0.0f;
+}
+
+/// Mean absolute deviation from the ray mean, computed over layers strictly
+/// greater than iso_cutoff. Measures how much the ray deviates from its own
+/// local average — useful for surfacing ink / void outliers against a papyrus
+/// baseline.
+[[nodiscard]] inline float composite_dev_from_mean(
+    std::span<const float> layers, float iso_cutoff) noexcept
+{
+    double sum = 0.0;
+    int n = 0;
+    for (float I : layers) {
+        if (I > iso_cutoff) { sum += double(I); ++n; }
+    }
+    if (n == 0) return 0.0f;
+    const float m = float(sum / double(n));
+    double dev = 0.0;
+    for (float I : layers) {
+        if (I > iso_cutoff) dev += std::fabs(I - m);
+    }
+    return float(dev / double(n));
+}
+
+/// Emission-only DVR: sum(I * I / 255) — no absorption, so layers behind
+/// others still contribute. Complement to `dvr`.
+[[nodiscard]] inline float composite_emission_dvr(
+    std::span<const float> layers) noexcept
+{
+    float sum = 0.0f;
+    for (float I : layers) sum += I * I * (1.0f / 255.0f);
+    return sum;
+}
+
+/// Max of samples strictly greater than iso_cutoff. Like `max` but ignores
+/// air/substrate — useful when iso separates the density band of interest
+/// from background noise.
+[[nodiscard]] inline float composite_max_above_iso(
+    std::span<const float> layers, float iso_cutoff) noexcept
+{
+    float m = 0.0f;
+    for (float I : layers) {
+        if (I > iso_cutoff && I > m) m = I;
+    }
+    return m;
+}
+
+/// sum(w*I) / sum(w) with w = max(0, I - iso)². Quadratic weight amplifies
+/// the density offset of ink relative to papyrus while staying a mean
+/// (robust to single-voxel outliers that max/first-hit pick up).
+[[nodiscard]] inline float composite_gamma_weighted(
+    std::span<const float> layers, float iso_cutoff) noexcept
+{
+    float sumWI = 0.0f, sumW = 0.0f;
+    for (float I : layers) {
+        const float d = I - iso_cutoff;
+        if (d <= 0.0f) continue;
+        const float w = d * d;
+        sumWI += w * I;
+        sumW  += w;
+    }
+    return sumW > 0.0f ? sumWI / sumW : 0.0f;
+}
+
+/// Peak |∂I/∂z| via central difference, ×8 gain. Lights up sharp intensity
+/// steps along the ray (cracks, ink/papyrus boundaries).
+[[nodiscard]] inline float composite_gradient_mag(
+    std::span<const float> layers) noexcept
+{
+    if (layers.size() < 3) return 0.0f;
+    float best = 0.0f;
+    for (std::size_t i = 1; i + 1 < layers.size(); ++i) {
+        const float g = std::fabs(layers[i + 1] - layers[i - 1]) * 0.5f;
+        if (g > best) best = g;
+    }
+    return best * 8.0f;
+}
+
 // ---------------------------------------------------------------------------
 // Stack compositing (dispatch by method)
 // ---------------------------------------------------------------------------
 
-[[nodiscard]] constexpr float composite_stack(
+[[nodiscard]] inline float composite_stack(
     std::span<const float> layers,
     CompositingMethod method,
     const CompositeParams& params = {}) noexcept
@@ -224,6 +346,29 @@ inline void value_stretch(std::span<float> data) noexcept {
         case CompositingMethod::beer_lambert:
             return composite_beer_lambert(
                 layers, params.extinction, params.emission, params.ambient);
+        case CompositingMethod::dvr:
+            return composite_dvr(layers, params.ambient);
+        case CompositingMethod::first_hit_iso:
+            return composite_first_hit_iso(layers, float(params.iso_cutoff));
+        case CompositingMethod::dev_from_mean:
+            return composite_dev_from_mean(layers, float(params.iso_cutoff));
+        case CompositingMethod::emission_dvr:
+            return composite_emission_dvr(layers);
+        case CompositingMethod::max_above_iso:
+            return composite_max_above_iso(layers, float(params.iso_cutoff));
+        case CompositingMethod::gamma_weighted:
+            return composite_gamma_weighted(layers, float(params.iso_cutoff));
+        case CompositingMethod::gradient_mag:
+            return composite_gradient_mag(layers);
+        case CompositingMethod::pbr_iso:
+            // The batch renderer lacks view/light/gradient context needed
+            // for Cook-Torrance; fall back to first-hit intensity so the
+            // CLI still produces a sensible output for this method.
+            return composite_first_hit_iso(layers, float(params.iso_cutoff));
+        case CompositingMethod::shaded_dvr:
+            // Same: no per-sample gradient context here — fall back to plain
+            // absorptive DVR so the CLI produces a usable image.
+            return composite_dvr(layers, params.ambient);
     }
     return 0.0f;
 }

@@ -63,7 +63,13 @@ struct ChunkData {
     [[nodiscard]] constexpr int strideX() const noexcept { return 1; }
 };
 
-using ChunkDataPtr = std::shared_ptr<ChunkData>;
+// Single-owner semantics: a ChunkData moves through decode → staging →
+// insertion as one object, never shared across threads after decode
+// completes. Switching from shared_ptr to unique_ptr removes ~2 refcount
+// atomic RMWs per chunk (creation + destruction) from the background
+// decode pipeline; under heavy scroll decode that was visible as
+// cas4_rel / ldadd4_acq ambient traffic on the perf callgraph.
+using ChunkDataPtr = std::unique_ptr<ChunkData>;
 
 // Callback signature for decompressing raw bytes into ChunkData.
 // The cache itself is compression-agnostic; the caller provides this.

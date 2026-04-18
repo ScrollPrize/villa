@@ -64,6 +64,38 @@ struct CompositeParams {
     bool preNormalizeLayers = false;
     bool preHistEqLayers = false;
 
+    // Piecewise-linear 4-knot transfer functions with fixed endpoints at
+    // (0,0) and (255,255); only the two middle knots (x1,y1)(x2,y2) are
+    // user-settable. When the enable flag is off, the LUT is identity.
+    //
+    // preTf:  applied to every sampled u8 voxel BEFORE layer storage /
+    //         preprocess / compositing. Lets you cut air (y below some x),
+    //         isolate an intensity band, or compress dynamic range before
+    //         per-ray normalization runs.
+    // postTf: applied to the final composite output value (before the
+    //         existing 2D postprocess stages: stretch, CLAHE, raking).
+    //         Lets you remap the composite's output intensity curve.
+    bool preTfEnabled = false;
+    uint8_t preTfX1 = 85, preTfY1 = 85;
+    uint8_t preTfX2 = 170, preTfY2 = 170;
+    bool postTfEnabled = false;
+    uint8_t postTfX1 = 85, postTfY1 = 85;
+    uint8_t postTfX2 = 170, postTfY2 = 170;
+
+    // Ambient term for the `dvr` composite method. Added to the final
+    // transmittance-weighted color so voids don't stay pitch-black in the
+    // rendered output. 0 disables; 1-255 adds a flat background.
+    float dvrAmbient = 0.0f;
+
+    // PBR Cook-Torrance parameters for the `pbrIso` composite method.
+    // roughness: 0 = mirror-smooth, 1 = fully diffuse (Lambertian).
+    // metallic:  0 = dielectric (Fresnel F0=0.04), 1 = metal (F0≈0.7 —
+    //            carbon-like, the only material in a carbonized scroll).
+    // Uses lightDir + lightDiffuse + lightAmbient from the existing
+    // lighting block for the light direction + intensity knobs.
+    float pbrRoughness = 0.5f;
+    float pbrMetallic = 0.0f;
+
     // Recompute lightDir from lightAzimuth/lightElevation (degrees)
     void updateLightDir() noexcept {
         float azRad = lightAzimuth * (std::numbers::pi_v<float> / 180.0f);
@@ -144,6 +176,17 @@ float compositeLayerStack(
 // Utility: check if method requires all layer values to be stored
 // (as opposed to running accumulator like max/min)
 bool methodRequiresLayerStorage(const std::string& method) noexcept;
+
+// Build a 256-entry u8→u8 LUT from a 4-knot piecewise-linear transfer
+// function with implicit endpoints (0,0) and (255,255). When `enabled` is
+// false, writes the identity mapping. Knot x coordinates are clamped and
+// sorted internally, so the caller does not need to pre-sort; degenerate
+// runs (x1 == x2) collapse to a step. Safe for tight rendering loops — a
+// 256-byte array fits trivially in L1D.
+void buildTfLut256(bool enabled,
+                   uint8_t x1, uint8_t y1,
+                   uint8_t x2, uint8_t y2,
+                   uint8_t lut[256]) noexcept;
 
 // Compute directional lighting factor for a surface normal
 // Returns a multiplier (0-1) based on Lambertian diffuse lighting

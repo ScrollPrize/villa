@@ -1151,6 +1151,24 @@ void MenuActionController::openRemoteZarr(
                             5000);
                     }
 
+                    // If the user previously attached a remote-segments dir
+                    // to this exact zarr URL, auto-re-attach it silently.
+                    // Otherwise offer the prompt.
+                    {
+                        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+                        const QString prevZarr = settings.value(
+                            vc3d::settings::viewer::LAST_REMOTE_SEGMENTS_FOR_ZARR)
+                                .toString();
+                        const QString prevSeg = settings.value(
+                            vc3d::settings::viewer::LAST_REMOTE_SEGMENTS_URL)
+                                .toString();
+                        const QString currentZarr = QString::fromStdString(httpsUrl);
+                        if (!prevSeg.isEmpty() && prevZarr == currentZarr) {
+                            loadRemoteSegmentsWithUrl(prevSeg, auth, cachePath,
+                                                       currentZarr);
+                            return;
+                        }
+                    }
                     // Offer to load remote segments
                     promptAndLoadRemoteSegments(auth, cachePath);
                     return;
@@ -1251,7 +1269,25 @@ void MenuActionController::promptAndLoadRemoteSegments(
     if (!ok || segUrl.trimmed().isEmpty())
         return;
 
-    auto segResolved = vc::resolveRemoteUrl(segUrl.trimmed().toStdString());
+    QString zarrUrl;
+    if (_window && _window->_state) {
+        if (auto vol = _window->_state->currentVolume())
+            zarrUrl = QString::fromStdString(vol->remoteUrl());
+    }
+    loadRemoteSegmentsWithUrl(segUrl, auth, cachePath, zarrUrl);
+}
+
+void MenuActionController::loadRemoteSegmentsWithUrl(
+    const QString& segUrlIn,
+    const vc::cache::HttpAuth& auth,
+    const std::string& cachePath,
+    const QString& zarrUrl)
+{
+    const QString segUrlTrim = segUrlIn.trimmed();
+    if (segUrlTrim.isEmpty())
+        return;
+
+    auto segResolved = vc::resolveRemoteUrl(segUrlTrim.toStdString());
     vc::cache::HttpAuth segAuth = auth;
     if (segResolved.useAwsSigv4 && segAuth.region.empty())
         segAuth.region = segResolved.awsRegion;
@@ -1266,7 +1302,7 @@ void MenuActionController::promptAndLoadRemoteSegments(
     // Probe the URL for segment subdirectories
     auto* s3Watcher = new QFutureWatcher<vc::cache::S3ListResult>(this);
     connect(s3Watcher, &QFutureWatcher<vc::cache::S3ListResult>::finished, this,
-        [this, s3Watcher, segBaseUrl, segAuth, cachePath]() {
+        [this, s3Watcher, segBaseUrl, segAuth, cachePath, zarrUrl]() {
             s3Watcher->deleteLater();
 
             vc::cache::S3ListResult extList;
@@ -1296,6 +1332,16 @@ void MenuActionController::promptAndLoadRemoteSegments(
             _window->_remoteScroll.auth = segAuth;
             _window->_remoteScroll.segSource = vc::RemoteSegmentSource::Direct;
             _window->_remoteScroll.active = true;
+
+            // Persist (zarrUrl → segmentsUrl) so the next auto-open of the
+            // same remote zarr can re-attach without prompting the user.
+            if (!zarrUrl.isEmpty()) {
+                QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+                settings.setValue(vc3d::settings::viewer::LAST_REMOTE_SEGMENTS_URL,
+                                  QString::fromStdString(segBaseUrl));
+                settings.setValue(vc3d::settings::viewer::LAST_REMOTE_SEGMENTS_FOR_ZARR,
+                                  zarrUrl);
+            }
 
             // Download metadata + load cached surfaces on background thread
             auto segIds = extList.prefixes;

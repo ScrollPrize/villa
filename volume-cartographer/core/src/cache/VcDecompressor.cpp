@@ -27,7 +27,7 @@ static bool isChunkEmpty(const uint8_t* data, size_t n)
 
 static ChunkDataPtr acquireChunkData(size_t bytesNeeded)
 {
-    auto result = std::make_shared<ChunkData>();
+    auto result = std::make_unique<ChunkData>();
     result->resizeBytes(bytesNeeded);
     return result;
 }

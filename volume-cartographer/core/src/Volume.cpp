@@ -296,7 +296,7 @@ size_t Volume::numScales() const noexcept {
 std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
 {
     if (zarrDs_.empty()) return nullptr;
-    std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels;
+    std::vector<std::unique_ptr<utils::ZarrArray>> diskLevels;
 
     // Build level metadata from our zarr datasets
     std::vector<vc::cache::FileSystemSource::LevelMeta> levels;
@@ -341,7 +341,7 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
             for (int lvl = 0; lvl < nLevels; lvl++) {
                 auto lvlPath = path_ / std::to_string(lvl);
                 if (std::filesystem::exists(lvlPath / "zarr.json")) {
-                    diskLevels[lvl] = std::make_shared<utils::ZarrArray>(
+                    diskLevels[lvl] = std::make_unique<utils::ZarrArray>(
                         utils::ZarrArray::open(lvlPath));
                 } else {
                     auto shape = source->levelShape(lvl);
@@ -356,7 +356,7 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
                     utils::ShardConfig sc;
                     sc.sub_chunks = {128, 128, 128};
                     meta.shard_config = std::move(sc);
-                    diskLevels[lvl] = std::make_shared<utils::ZarrArray>(
+                    diskLevels[lvl] = std::make_unique<utils::ZarrArray>(
                         utils::ZarrArray::create(lvlPath, std::move(meta)));
                 }
             }

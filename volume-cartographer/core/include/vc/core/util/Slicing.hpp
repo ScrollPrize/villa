@@ -110,7 +110,15 @@ void sampleAdaptiveARGB32(
     // tagged with the *coarsest* pyramid-level offset used while sampling
     // (0 = desired level, 1..N = fallback depth). Stride is in bytes.
     uint8_t* levelOut = nullptr,
-    int levelStride = 0);
+    int levelStride = 0,
+    // When true, skip the per-frame chunk enumeration + sort + fetchInteractive
+    // that the kernel normally runs before dispatching tiles. Intended for
+    // callers that can prove the coords haven't changed since the last
+    // render (e.g. QuadSurface gen cache hit) — the prior frame already
+    // queued the needed blocks, so rerunning the enumeration is pure
+    // overhead. No correctness impact on block residency: the per-sample
+    // adaptive fallback still handles any block not yet loaded.
+    bool skipPrefetch = false);
 
 // Fused plane composite: inline coords + nearest-neighbor per layer + composite + LUT → ARGB32.
 // No coord matrix allocation. For PlaneSurface composite rendering.

@@ -114,7 +114,7 @@ void BlockPipeline::shardCacheInsertLocked(
     shardCacheGlobalBytes_.fetch_add(entrySize, std::memory_order_relaxed);
 }
 
-std::shared_ptr<std::vector<std::byte>> BlockPipeline::shardBytesFor(
+const std::vector<std::byte>* BlockPipeline::shardBytesFor(
     const ChunkKey& key, utils::ZarrArray& dz)
 {
     if (config_.shardCacheBytes == 0) return nullptr;
@@ -125,7 +125,10 @@ std::shared_ptr<std::vector<std::byte>> BlockPipeline::shardBytesFor(
     // process runs of adjacent chunks that fall in the same shard; with
     // 256 loader threads contending on the cache, skipping the map+lock
     // for same-shard hits saves ~1-2% total CPU per profile. The
-    // shared_ptr keeps bytes alive even if the LRU evicts them.
+    // shared_ptr keeps bytes alive even if the LRU evicts them — we
+    // return a raw pointer to the bytes so callers don't bump the
+    // shared_ptr refcount (that was ~20% of CPU under 12-thread decode
+    // because all threads hit the same canonical shard's control block).
     // Qualify with `this` so a volume swap (pipeline destroyed + recreated)
     // doesn't serve stale data from the old pipeline's shard cache.
     thread_local const BlockPipeline* tlOwner = nullptr;
@@ -133,7 +136,7 @@ std::shared_ptr<std::vector<std::byte>> BlockPipeline::shardBytesFor(
     thread_local std::shared_ptr<std::vector<std::byte>> tlLastBytes;
     if (tlOwner == this && tlLastShard == sk && tlLastBytes) {
         statShardHits_.fetch_add(1, std::memory_order_relaxed);
-        return tlLastBytes;
+        return tlLastBytes.get();
     }
 
     // Fast path: hit under the bucket mutex, move entry to LRU head.
@@ -146,7 +149,7 @@ std::shared_ptr<std::vector<std::byte>> BlockPipeline::shardBytesFor(
             tlOwner = this;
             tlLastShard = sk;
             tlLastBytes = it->second->bytes;
-            return it->second->bytes;
+            return tlLastBytes.get();
         }
     }
 
@@ -163,15 +166,16 @@ std::shared_ptr<std::vector<std::byte>> BlockPipeline::shardBytesFor(
     // consistent across concurrent reads.
     if (auto it = bucket.map.find(sk); it != bucket.map.end()) {
         bucket.lru.splice(bucket.lru.begin(), bucket.lru, it->second);
+        tlOwner = this;
         tlLastShard = sk;
         tlLastBytes = it->second->bytes;
-        return it->second->bytes;
+        return tlLastBytes.get();
     }
     shardCacheInsertLocked(bucket, sk, bytes);
     tlOwner = this;
     tlLastShard = sk;
-    tlLastBytes = bytes;
-    return bytes;
+    tlLastBytes = std::move(bytes);
+    return tlLastBytes.get();
 }
 
 // Decode a canonical h265 chunk from disk bytes. Uses the video header for
@@ -184,7 +188,7 @@ static ChunkDataPtr decodeCanonicalH265(const std::vector<uint8_t>& compressed) 
     utils::VideoCodecParams vp;
     vp.depth = dims[0]; vp.height = dims[1]; vp.width = dims[2];
     const size_t n = size_t(dims[0]) * dims[1] * dims[2];
-    auto out = std::make_shared<ChunkData>();
+    auto out = std::make_unique<ChunkData>();
     out->shape = {int(dims[0]), int(dims[1]), int(dims[2])};
     out->elementSize = 1;
     out->bytes.resize(n);
@@ -230,7 +234,7 @@ BlockPipeline::BlockPipeline(
     Config config,
     std::unique_ptr<VolumeSource> source,
     DecompressFn decompress,
-    std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels)
+    std::vector<std::unique_ptr<utils::ZarrArray>> diskLevels)
     : config_(std::move(config))
     , diskLevels_(std::move(diskLevels))
     , source_(std::move(source))
@@ -889,11 +893,20 @@ BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
             // One canonical zero block shared by every caller asking for
             // a block inside any empty chunk — no arena consumption.
             static constinit Block kZeroBlock{};
-            statEmptyHits_.fetch_add(1, std::memory_order_relaxed);
+            // Per-thread local accumulator flushed every 1024 hits. A single
+            // global atomic fetch_add here burned ~5%+ of CPU on hot render
+            // workloads (12 threads ping-ponging one cacheline per miss).
+            // Sampling trades exact counts for 1000x less atomic traffic —
+            // stats are diagnostic, so an approximate count is fine.
+            thread_local uint64_t localEmptyHits = 0;
+            if ((++localEmptyHits & 1023) == 0)
+                statEmptyHits_.fetch_add(1024, std::memory_order_relaxed);
             return &kZeroBlock;
         }
     }
-    statMisses_.fetch_add(1, std::memory_order_relaxed);
+    thread_local uint64_t localMisses = 0;
+    if ((++localMisses & 1023) == 0)
+        statMisses_.fetch_add(1024, std::memory_order_relaxed);
     return nullptr;
 }
 
@@ -912,7 +925,7 @@ ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey) {
     int sy0 = cy0 / scs[1], sy1 = (cy1 + scs[1] - 1) / scs[1];
     int sx0 = cx0 / scs[2], sx1 = (cx1 + scs[2] - 1) / scs[2];
 
-    auto out = std::make_shared<ChunkData>();
+    auto out = std::make_unique<ChunkData>();
     out->shape = {C, C, C};
     out->elementSize = 1;
     out->bytes.assign(size_t(C) * C * C, 0);
