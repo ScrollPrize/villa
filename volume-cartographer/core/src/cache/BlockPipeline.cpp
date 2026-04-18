@@ -1,4 +1,5 @@
 #include "vc/core/cache/BlockPipeline.hpp"
+#include "vc/core/cache/TickCoordinator.hpp"
 #include "vc/core/cache/VolumeSource.hpp"
 #include "vc/core/cache/CacheDebugLog.hpp"
 #include "vc/core/cache/VcDecompressor.hpp"
@@ -984,6 +985,7 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
     // block of this chunk. Saves ~2 MB of arena per empty 128³ chunk.
     if (chunk.isEmpty) {
         addEmptyChunk(key);
+        TickCoordinator::notifyEmptyChunkNoted(key);
         return;
     }
 
@@ -1017,6 +1019,7 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
             }
         }
     }
+    TickCoordinator::notifyChunkLanded(key);
 }
 
 

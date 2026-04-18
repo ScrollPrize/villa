@@ -25,6 +25,17 @@ struct ChunkKey {
 
     constexpr bool operator!=(const ChunkKey& o) const noexcept { return !(*this == o); }
 
+    // Lexicographic ordering on (level, iz, iy, ix). Used for sorted
+    // vectors that support binary_search against a known-empty set
+    // in the tick-published FrameState.
+    constexpr auto operator<=>(const ChunkKey& o) const noexcept
+    {
+        if (auto c = level <=> o.level; c != 0) return c;
+        if (auto c = iz    <=> o.iz;    c != 0) return c;
+        if (auto c = iy    <=> o.iy;    c != 0) return c;
+        return ix <=> o.ix;
+    }
+
     // Return the equivalent key at a coarser pyramid level.
     // Each level halves spatial resolution, so chunk indices halve.
     [[nodiscard]] constexpr ChunkKey coarsen(int targetLevel) const noexcept

@@ -699,6 +699,8 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _cacheSizeBytes = cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
     std::cout << "chunk cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
 
+    _tickCoordinator = std::make_unique<vc::cache::TickCoordinator>();
+
     _state = new CState(_cacheSizeBytes, this);
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);

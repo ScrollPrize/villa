@@ -4,6 +4,7 @@
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/cache/BlockCache.hpp"
 #include "vc/core/cache/BlockPipeline.hpp"
+#include "vc/core/cache/TickCoordinator.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -32,8 +33,17 @@ using vc::cache::Block;
 using vc::cache::BlockKey;
 using vc::cache::BlockPtr;
 using vc::cache::BlockPipeline;
+using vc::cache::ChunkKey;
+using vc::cache::FrameState;
 using vc::cache::kBlockSize;
 using vc::cache::kMaxLevels;
+using vc::cache::TickCoordinator;
+
+// Shared static zero-block for chunks known to be all-zero. Using one
+// instance keeps the cold-cache footprint at 4 KiB instead of one per
+// sampler; the BlockPipeline already uses an identical pattern for its
+// own empty-chunk short-circuit path.
+inline constinit Block kSliceZeroBlock{};
 
 constexpr int kBlockShift = 4;       // log2(16)
 constexpr int kBlockMask = 15;
@@ -111,6 +121,10 @@ struct BlockSampler {
     BlockPipeline& cache;
     int level;
     VolumeShape shape;
+    // Frame snapshot captured at construction; released in the destructor.
+    // When non-null we can bypass `cache.blockAt` on known-empty chunks
+    // via a plain-memory binary search instead of an atomic probe loop.
+    const FrameState* frame;
     HotSlot slots[kSlots];
     BlockPtr slotBlocks[kSlots];  // cold: refcount keep-alive
     // Last-block (bz,by,bx) cache as separate ints. Most pixels in a tile
@@ -124,7 +138,15 @@ struct BlockSampler {
     const T* data = nullptr;
 
     BlockSampler(BlockPipeline& c, int lvl)
-        : cache(c), level(lvl), shape(c, lvl) {}
+        : cache(c), level(lvl), shape(c, lvl),
+          frame(TickCoordinator::currentFrameGlobal()) {}
+
+    ~BlockSampler() {
+        TickCoordinator::releaseFrameGlobal(frame);
+    }
+
+    BlockSampler(const BlockSampler&) = delete;
+    BlockSampler& operator=(const BlockSampler&) = delete;
 
     VC_FORCE_INLINE static uint64_t packKey(int bz, int by, int bx) {
         return (uint64_t(uint32_t(bz)) << 42) | (uint64_t(uint32_t(by)) << 21) | uint64_t(uint32_t(bx));
@@ -167,6 +189,23 @@ struct BlockSampler {
         if (slot.key == key) [[likely]] {
             data = slot.data;
             return;
+        }
+
+        // Known-empty chunk short-circuit. FrameState::emptyChunkKeys is
+        // a sorted vector published once per tick by TickCoordinator; a
+        // binary search is plain memory, vs. the atomic probe loop inside
+        // BlockPipeline::blockAt. Canonical chunks are 128³ = 8 blocks per
+        // axis, so chunk coord = block coord >> 3.
+        if (frame) {
+            const ChunkKey ck{level, bz >> 3, by >> 3, bx >> 3};
+            if (std::binary_search(frame->emptyChunkKeys.begin(),
+                                   frame->emptyChunkKeys.end(), ck)) {
+                slotBlocks[idx] = &kSliceZeroBlock;
+                slot.data = reinterpret_cast<const T*>(kSliceZeroBlock.data);
+                slot.key  = key;
+                data = slot.data;
+                return;
+            }
         }
 
         BlockKey bk{level, bz, by, bx};
