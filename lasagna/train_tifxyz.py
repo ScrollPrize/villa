@@ -1220,8 +1220,6 @@ def _cage_deform_inner_loop(
     n_iters: int,
     inner_lr: float,
     max_frac: float,
-    scale_loss_mse_fn,
-    scale_loss_l1_fn,
     coord_scale: float = 1.0,   # multiply ctrl_pos for multi-scale GT
     verbose: bool = False,      # print per-iteration stats
     bracket_frac: torch.Tensor = None,  # (B, Z, Y, X) from compute_batch_targets
@@ -1472,10 +1470,14 @@ def _cage_deform_inner_loop(
         _grid_z, _grid_y, _grid_x = torch.meshgrid(_gz, _gy, _gx, indexing="ij")
         warp_base = torch.stack([_grid_x, _grid_y, _grid_z], dim=-1).unsqueeze(0)  # (1,Z,Y,X,3)
 
-        # Flatten voxel_indices for embedding_bag
+        # Dense valid-only: extract only voxels with nonzero weights
         K_total = voxel_indices.shape[-1]
-        _eb_idx = voxel_indices.reshape(-1, K_total)  # (ZYX, K)
-        _eb_wgt = voxel_weights.reshape(-1, K_total)  # (ZYX, K)
+        _flat_idx = voxel_indices.reshape(-1, K_total)  # (ZYX, K)
+        _flat_wgt = voxel_weights.reshape(-1, K_total)  # (ZYX, K)
+        _has_weight = _flat_wgt.abs().sum(-1) > 1e-8    # (ZYX,)
+        valid_flat_pos = _has_weight.nonzero(as_tuple=True)[0]  # (N_valid,)
+        w8 = _flat_wgt[valid_flat_pos].contiguous()     # (N_valid, K)
+        idx8 = _flat_idx[valid_flat_pos].contiguous()   # (N_valid, K)
 
         with torch.amp.autocast("cuda", enabled=False):
             for it in range(n_iters):
@@ -1486,8 +1488,10 @@ def _cage_deform_inner_loop(
 
                 inner_opt.zero_grad()
 
-                # Fast inner loop: gather + weighted sum
-                offset_vol = (_eb_wgt * ctrl_all[_eb_idx]).sum(dim=-1).reshape(Z, Y, X)
+                # Fast inner loop: dense valid-only gather + weighted sum
+                offset_flat = torch.zeros(Z * Y * X, device=device)
+                offset_flat[valid_flat_pos] = (w8 * ctrl_all[idx8]).sum(-1)
+                offset_vol = offset_flat.reshape(Z, Y, X)
                 disp_3ch = offset_vol.unsqueeze(0) * normal_vol  # (3, Z, Y, X)
 
                 # Inline warp (skip _build_warp_grid — reuse cached base)
@@ -1542,7 +1546,9 @@ def _cage_deform_inner_loop(
 
         # Apply best offsets
         with torch.no_grad():
-            offset_best = (voxel_weights * best_b_ctrl[voxel_indices]).sum(dim=-1)
+            offset_flat = torch.zeros(Z * Y * X, device=device)
+            offset_flat[valid_flat_pos] = (w8 * best_b_ctrl[idx8]).sum(-1)
+            offset_best = offset_flat.reshape(Z, Y, X)
             disp_best = (offset_best.unsqueeze(0) * normal_vol).unsqueeze(0)
             w_cg, w_v = _apply_warp(cos_gm_orig[b:b+1], val_f[b:b+1], disp_best)
             best_warped_cg[b:b+1] = w_cg
@@ -2965,8 +2971,6 @@ def train(
                         n_iters=deform_inner_iters,
                         inner_lr=deform_inner_lr,
                         max_frac=deform_max_frac,
-                        scale_loss_mse_fn=scale_loss_mse,
-                        scale_loss_l1_fn=scale_loss_l1,
                         bracket_frac=_bracket_frac,
                         bracket_lo=_bracket_lo,
                         bracket_hi=_bracket_hi,
@@ -3338,8 +3342,6 @@ def _evaluate(
                         n_iters=deform_inner_iters,
                         inner_lr=deform_inner_lr,
                         max_frac=deform_max_frac,
-                        scale_loss_mse_fn=scale_loss_mse,
-                        scale_loss_l1_fn=scale_loss_l1,
                         bracket_frac=_bracket_frac,
                         bracket_lo=_bracket_lo,
                         bracket_hi=_bracket_hi,

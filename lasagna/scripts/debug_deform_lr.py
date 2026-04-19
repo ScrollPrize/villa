@@ -36,9 +36,9 @@ if _LASAGNA_DIR not in sys.path:
 from train_tifxyz import (
     build_model,
     compute_batch_targets,
+    ScaleSpaceLoss3D,
     MaskedMSE,
     MaskedSmoothL1,
-    ScaleSpaceLoss3D,
     _cage_deform_inner_loop,
 )
 from tifxyz_lasagna_dataset import (
@@ -73,7 +73,7 @@ def main():
     parser.add_argument("--weights", type=str, required=True)
     parser.add_argument("--patch-size", type=int, default=192)
     parser.add_argument("--n-batches", type=int, default=5)
-    parser.add_argument("--n-iters", type=int, default=100)
+    parser.add_argument("--n-iters", type=int, default=50)
     parser.add_argument("--max-frac", type=float, default=0.3)
     parser.add_argument("--lr-start", type=float, default=1e3)
     parser.add_argument("--lr-end", type=float, default=1e5)
@@ -203,8 +203,6 @@ def main():
             n_iters=args.n_iters,
             inner_lr=args.lr_start,
             max_frac=args.max_frac,
-            scale_loss_mse_fn=scale_loss_mse,
-            scale_loss_l1_fn=scale_loss_l1,
             verbose=True,
             bracket_frac=_bfrac,
             bracket_lo=_blo,
