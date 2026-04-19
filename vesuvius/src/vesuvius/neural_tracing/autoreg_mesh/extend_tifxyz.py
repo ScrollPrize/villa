@@ -25,7 +25,12 @@ from vesuvius.neural_tracing.autoreg_mesh.infer import (
     _sample_from_logits,
     infer_autoreg_mesh,
 )
-from vesuvius.neural_tracing.autoreg_mesh.model import AutoregMeshModel, build_pseudo_inference_batch
+from vesuvius.neural_tracing.autoreg_mesh.model import (
+    GENERATED_TOKEN_TYPE,
+    START_TOKEN_TYPE,
+    AutoregMeshModel,
+    build_pseudo_inference_batch,
+)
 from vesuvius.neural_tracing.autoreg_mesh.serialization import deserialize_continuation_grid, serialize_split_conditioning_example
 from vesuvius.tifxyz import Tifxyz, read_tifxyz, write_tifxyz
 
@@ -1239,6 +1244,158 @@ def infer_extension_windows_batched(
     return results, total_encode_decode_ms, peak_batch_size
 
 
+def infer_extension_windows_batched_cached(
+    model,
+    payloads: list[ExtensionWindowPayload],
+    *,
+    window_batch_size: int,
+    device: torch.device,
+    greedy: bool = True,
+    stop_probability_threshold: float | None = None,
+    progress_desc: str | None = None,
+    show_progress: bool | None = None,
+    fast_infer: bool = True,
+    compile_infer: bool = False,
+    amp_dtype: str = "bf16",
+    runtime: ExtensionInferenceRuntime | None = None,
+) -> tuple[list[dict[str, Any]], float, int]:
+    if not payloads:
+        return [], 0.0, 0
+    results: list[dict[str, Any]] = []
+    total_encode_decode_ms = 0.0
+    peak_batch_size = 0
+    runtime = runtime or ExtensionInferenceRuntime(
+        model, device=device, fast_infer=fast_infer, compile_infer=compile_infer, amp_dtype=amp_dtype,
+    )
+    payload_batches = _iter_window_batches(payloads, window_batch_size=window_batch_size)
+    batch_iter = _progress_iter(
+        payload_batches, total=len(payload_batches),
+        desc=progress_desc or "infer batches", show_progress=show_progress,
+    )
+    raw_model = model.module if hasattr(model, "module") else model
+    with runtime.inference_context():
+        for payload_batch in batch_iter:
+            batch_size = len(payload_batch)
+            peak_batch_size = max(peak_batch_size, batch_size)
+            raw_samples = [payload.sample for payload in payload_batch]
+            batch = autoreg_mesh_collate(raw_samples)
+            batch = _move_batch_to_device(batch, device)
+            t0 = perf_counter()
+            with runtime.autocast_context():
+                encoded = runtime.encode_conditioning(batch["volume"], vol_tokens=batch.get("vol_tokens"))
+            memory_tokens = encoded["memory_tokens"]
+            memory_patch_centers = encoded["memory_patch_centers"]
+            with runtime.autocast_context():
+                _, cache = raw_model.init_kv_cache(
+                    batch, memory_tokens=memory_tokens, memory_patch_centers=memory_patch_centers,
+                )
+            target_shapes = [tuple(int(v) for v in s["target_grid_shape"].tolist()) for s in raw_samples]
+            total_vertices = [int(sh[0] * sh[1]) for sh in target_shapes]
+            max_steps = max(total_vertices)
+            all_strip_coords = []
+            for shape, direction in zip(target_shapes, batch["direction"], strict=True):
+                all_strip_coords.append(_build_target_strip_coords(direction, shape, device=device))
+
+            prev_coarse = torch.full((batch_size, 1), -100, dtype=torch.long, device=device)
+            prev_offset = torch.full((batch_size, 1, 3), -100, dtype=torch.long, device=device)
+            prev_xyz = batch["prompt_anchor_xyz"].unsqueeze(1)
+            prev_valid = torch.ones((batch_size, 1), dtype=torch.bool, device=device)
+            ones = torch.ones((batch_size, 1), dtype=torch.bool, device=device)
+
+            generated_coarse = [[] for _ in range(batch_size)]
+            generated_offsets = [[] for _ in range(batch_size)]
+            generated_xyz = [[] for _ in range(batch_size)]
+            generated_stop_probs = [[] for _ in range(batch_size)]
+            active = [True] * batch_size
+
+            for step_idx in range(max_steps):
+                if not any(active):
+                    break
+                token_type = torch.full(
+                    (batch_size, 1),
+                    START_TOKEN_TYPE if step_idx == 0 else GENERATED_TOKEN_TYPE,
+                    dtype=torch.long, device=device,
+                )
+                step_coords = torch.zeros((batch_size, 1, 2), dtype=torch.float32, device=device)
+                for bi in range(batch_size):
+                    if step_idx < len(all_strip_coords[bi]):
+                        step_coords[bi, 0] = all_strip_coords[bi][step_idx]
+
+                with runtime.autocast_context():
+                    embedding, coords = raw_model._build_input_embeddings(
+                        coarse_ids=prev_coarse,
+                        offset_bins=prev_offset,
+                        xyz=prev_xyz,
+                        strip_coords=step_coords,
+                        direction_id=batch["direction_id"],
+                        token_type=token_type,
+                        sequence_mask=ones,
+                        geometry_valid_mask=prev_valid,
+                        memory_tokens=memory_tokens,
+                    )
+                    outputs, cache = raw_model.step_from_encoded_cached(
+                        token_embedding=embedding,
+                        token_coords=coords,
+                        cache=cache,
+                        memory_tokens=memory_tokens,
+                    )
+
+                new_coarse_ids = []
+                new_offsets = []
+                new_xyz_list = []
+                for bi, is_active in enumerate(active):
+                    if not is_active or step_idx >= total_vertices[bi]:
+                        active[bi] = False
+                        new_coarse_ids.append(0)
+                        new_offsets.append([0, 0, 0])
+                        new_xyz_list.append(np.zeros(3, dtype=np.float32))
+                        continue
+                    coarse_id, offset_bins, xyz, stop_prob = _decode_single_step_from_outputs(
+                        raw_model, outputs, sample_idx=bi, step_idx=0, greedy=greedy,
+                    )
+                    generated_coarse[bi].append(coarse_id)
+                    generated_offsets[bi].append(offset_bins)
+                    generated_xyz[bi].append(xyz)
+                    generated_stop_probs[bi].append(stop_prob)
+                    new_coarse_ids.append(coarse_id)
+                    new_offsets.append(offset_bins)
+                    new_xyz_list.append(xyz)
+                    if stop_probability_threshold is not None and stop_prob >= float(stop_probability_threshold):
+                        active[bi] = False
+                    elif len(generated_xyz[bi]) >= total_vertices[bi]:
+                        active[bi] = False
+
+                prev_coarse = torch.tensor(new_coarse_ids, dtype=torch.long, device=device).unsqueeze(1)
+                prev_offset = torch.tensor(new_offsets, dtype=torch.long, device=device).unsqueeze(1)
+                prev_xyz = torch.tensor(np.array(new_xyz_list), dtype=torch.float32, device=device).unsqueeze(1)
+                prev_valid = ones
+
+            total_encode_decode_ms += 1000.0 * (perf_counter() - t0)
+            for bi, payload in enumerate(payload_batch):
+                predicted_xyz_local = np.asarray(generated_xyz[bi], dtype=np.float32)
+                padded_xyz = predicted_xyz_local
+                if predicted_xyz_local.shape[0] < total_vertices[bi]:
+                    padded_xyz = np.full((total_vertices[bi], 3), np.nan, dtype=np.float32)
+                    if predicted_xyz_local.shape[0] > 0:
+                        padded_xyz[: predicted_xyz_local.shape[0]] = predicted_xyz_local
+                continuation_grid_local = deserialize_continuation_grid(
+                    padded_xyz, direction=payload.direction, grid_shape=payload.target_grid_shape,
+                )
+                min_corner = raw_samples[bi]["min_corner"].detach().cpu().numpy().astype(np.float32, copy=False)
+                continuation_grid_world = continuation_grid_local.copy()
+                finite = np.isfinite(continuation_grid_world).all(axis=-1)
+                continuation_grid_world[finite] += min_corner
+                results.append({
+                    "global_index": int(payload.global_index),
+                    "window": payload.window,
+                    "direction": payload.direction,
+                    "continuation_grid_world": continuation_grid_world,
+                    "predicted_vertex_count": int(np.isfinite(continuation_grid_world).all(axis=-1).sum()),
+                    "stop_count": int(sum(1 for v in generated_stop_probs[bi] if stop_probability_threshold is not None and v >= float(stop_probability_threshold))),
+                })
+    return results, total_encode_decode_ms, peak_batch_size
+
+
 def merge_window_prediction(
     *,
     sums: np.ndarray,
@@ -1757,7 +1914,7 @@ def extend_tifxyz_mesh(
             local_results: list[dict[str, Any]] = []
             encode_decode_ms = 0.0
             if payloads:
-                local_results, encode_decode_ms, local_peak_batch_size = infer_extension_windows_batched(
+                local_results, encode_decode_ms, local_peak_batch_size = infer_extension_windows_batched_cached(
                     model,
                     payloads,
                     window_batch_size=int(window_batch_size),
