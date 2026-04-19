@@ -96,7 +96,7 @@
 
   "mixed_precision": "bf16",
 
-  "batch_size": 8,
+  "batch_size": 32,
   "num_workers": 14,
   "val_num_workers": 2,
   "val_fraction": 0.05,
@@ -108,14 +108,14 @@
   "_comment_muon": "Muon for decoder block internals. Output heads (offset, stop, refine, pointer) automatically routed to AdamW by _build_muon_param_groups. AdamW fallback LR slightly higher than baseline to compensate for more params on AdamW.",
   "optimizer": {
     "name": "muon",
-    "learning_rate": 0.02,
+    "learning_rate": 0.04,
     "momentum": 0.95,
     "weight_decay": 0.01,
     "weight_decouple": true,
     "nesterov": true,
     "ns_steps": 5,
     "use_adjusted_lr": false,
-    "adamw_lr": 0.0004,
+    "adamw_lr": 0.0016,
     "adamw_betas": [0.9, 0.95],
     "adamw_wd": 0.01,
     "adamw_eps": 1e-10,

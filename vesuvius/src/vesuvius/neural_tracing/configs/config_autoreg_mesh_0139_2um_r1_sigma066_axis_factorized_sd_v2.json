@@ -96,7 +96,7 @@
 
   "mixed_precision": "bf16",
 
-  "batch_size": 8,
+  "batch_size": 32,
   "num_workers": 14,
   "val_num_workers": 2,
   "val_fraction": 0.05,
@@ -106,7 +106,7 @@
   "num_steps": 100000,
   "optimizer": {
     "name": "adamw",
-    "learning_rate": 0.0002,
+    "learning_rate": 0.0008,
     "weight_decay": 0.01,
     "betas": [0.9, 0.95]
   },
