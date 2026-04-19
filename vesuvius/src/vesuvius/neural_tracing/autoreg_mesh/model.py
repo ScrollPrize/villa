@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import math
 from typing import Any
 
@@ -19,6 +20,15 @@ from vesuvius.neural_tracing.autoreg_mesh.serialization import IGNORE_INDEX
 PROMPT_TOKEN_TYPE = 0
 GENERATED_TOKEN_TYPE = 1
 START_TOKEN_TYPE = 2
+
+
+@dataclasses.dataclass
+class KVCache:
+    """Per-layer KV cache for O(N) autoregressive inference."""
+
+    self_attn_kv: list[tuple[Tensor, Tensor]]
+    cross_attn_kv: list[tuple[Tensor, Tensor] | None]
+    seq_len: int
 
 _ROPE_DTYPE_ALIASES = {
     "fp32": torch.float32,
@@ -124,6 +134,28 @@ class RotarySelfAttention(nn.Module):
         out = out.transpose(1, 2).reshape(batch_size, seq_len, dim)
         return self.proj(out)
 
+    def forward_cached(
+        self,
+        x: Tensor,
+        coords: Tensor,
+        cached_k: Tensor | None,
+        cached_v: Tensor | None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        batch_size, seq_len, dim = x.shape
+        qkv = self.qkv(x).reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv.unbind(0)
+        sin, cos = _batched_rope_from_coords(self.rope, coords)
+        q = apply_rotary_embedding(q, (sin, cos)).type_as(v)
+        k = apply_rotary_embedding(k, (sin, cos)).type_as(v)
+        if cached_k is not None:
+            k = torch.cat([cached_k, k], dim=2)
+            v = torch.cat([cached_v, v], dim=2)
+        q = q * self.scale
+        out = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+        out = out.transpose(1, 2).reshape(batch_size, seq_len, dim)
+        return self.proj(out), k, v
+
 
 class CrossAttention(nn.Module):
     def __init__(
@@ -173,6 +205,34 @@ class CrossAttention(nn.Module):
         out = out.transpose(1, 2).reshape(batch_size, seq_len, dim)
         return self.out_proj(out)
 
+    def precompute_kv(self, memory: Tensor, *, memory_coords: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        batch_size = int(memory.shape[0])
+        memory_len = int(memory.shape[1])
+        k = self.k_proj(memory).reshape(batch_size, memory_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = self.v_proj(memory).reshape(batch_size, memory_len, self.num_heads, self.head_dim).transpose(1, 2)
+        if self.use_rope and memory_coords is not None:
+            rope_dtype = self.rope.periods.dtype
+            k_sins, k_coss = [], []
+            for coords in memory_coords:
+                s, c = self.rope.get_embed_from_coords(coords.to(dtype=rope_dtype))
+                k_sins.append(s)
+                k_coss.append(c)
+            k_sin = torch.stack(k_sins, dim=0)
+            k_cos = torch.stack(k_coss, dim=0)
+            k = apply_rotary_embedding(k, (k_sin, k_cos)).type_as(v)
+        return k, v
+
+    def forward_cached(self, x: Tensor, precomputed_k: Tensor, precomputed_v: Tensor, *, query_coords: Tensor | None = None) -> Tensor:
+        batch_size, seq_len, dim = x.shape
+        q = self.q_proj(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        if self.use_rope and query_coords is not None:
+            q_sin, q_cos = _batched_rope_from_coords(self.rope, query_coords)
+            q = apply_rotary_embedding(q, (q_sin, q_cos)).type_as(precomputed_v)
+        q = q * self.scale
+        out = F.scaled_dot_product_attention(q, precomputed_k, precomputed_v, attn_mask=None, dropout_p=0.0, is_causal=False)
+        out = out.transpose(1, 2).reshape(batch_size, seq_len, dim)
+        return self.out_proj(out)
+
 
 class FeedForward(nn.Module):
     def __init__(self, dim: int, mlp_ratio: float = 4.0, dropout: float = 0.0) -> None:
@@ -219,6 +279,21 @@ class DecoderBlock(nn.Module):
             x = x + self.cross_attn(self.norm2(x), memory=memory, query_coords=coords, memory_coords=memory_coords)
         x = x + self.ffn(self.norm3(x))
         return x
+
+    def forward_cached(
+        self,
+        x: Tensor,
+        coords: Tensor,
+        self_attn_cache: tuple[Tensor, Tensor] | None,
+        cross_attn_cache: tuple[Tensor, Tensor] | None,
+    ) -> tuple[Tensor, tuple[Tensor, Tensor]]:
+        residual = self.self_attn.forward_cached(self.norm1(x), coords, self_attn_cache[0] if self_attn_cache else None, self_attn_cache[1] if self_attn_cache else None)
+        sa_out, new_k, new_v = residual
+        x = x + sa_out
+        if self.cross_attn is not None and cross_attn_cache is not None:
+            x = x + self.cross_attn.forward_cached(self.norm2(x), cross_attn_cache[0], cross_attn_cache[1], query_coords=coords)
+        x = x + self.ffn(self.norm3(x))
+        return x, (new_k, new_v)
 
 
 class AutoregMeshModel(nn.Module):
@@ -1133,6 +1208,99 @@ class AutoregMeshModel(nn.Module):
         max_coord = torch.tensor(self.input_shape, device=coarse_ids.device, dtype=torch.float32) - 1e-4
         coords = torch.maximum(coords, torch.zeros_like(coords))
         return torch.minimum(coords, max_coord.view(1, 1, 3))
+
+    @torch.no_grad()
+    def init_kv_cache(
+        self,
+        batch: dict,
+        *,
+        memory_tokens: Tensor,
+        memory_patch_centers: Tensor,
+    ) -> tuple[Tensor, KVCache]:
+        prompt = batch["prompt_tokens"]
+        prompt_token_type = torch.full_like(prompt["coarse_ids"], PROMPT_TOKEN_TYPE)
+        prompt_embeddings, prompt_coords = self._build_input_embeddings(
+            coarse_ids=prompt["coarse_ids"],
+            offset_bins=prompt["offset_bins"],
+            xyz=prompt["xyz"],
+            strip_coords=prompt["strip_coords"],
+            direction_id=batch["direction_id"],
+            token_type=prompt_token_type,
+            sequence_mask=prompt["mask"],
+            geometry_valid_mask=prompt["valid_mask"],
+            memory_tokens=memory_tokens,
+        )
+        seq_mask = prompt["mask"]
+        attn_mask = self._build_attention_mask(seq_mask, dtype=prompt_embeddings.dtype)
+        x = prompt_embeddings
+        self_attn_kv: list[tuple[Tensor, Tensor]] = []
+        cross_attn_kv: list[tuple[Tensor, Tensor] | None] = []
+        for block in self.blocks:
+            batch_size, seq_len, dim = x.shape
+            qkv = block.self_attn.qkv(block.norm1(x)).reshape(batch_size, seq_len, 3, block.self_attn.num_heads, block.self_attn.head_dim)
+            qkv = qkv.permute(2, 0, 3, 1, 4)
+            q, k, v = qkv.unbind(0)
+            sin, cos = _batched_rope_from_coords(block.self_attn.rope, prompt_coords)
+            q = apply_rotary_embedding(q, (sin, cos)).type_as(v)
+            k = apply_rotary_embedding(k, (sin, cos)).type_as(v)
+            self_attn_kv.append((k, v))
+            q = q * block.self_attn.scale
+            sa_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
+            sa_out = sa_out.transpose(1, 2).reshape(batch_size, seq_len, dim)
+            x = x + block.self_attn.proj(sa_out)
+            if block.cross_attn is not None:
+                ca_k, ca_v = block.cross_attn.precompute_kv(memory_tokens, memory_coords=memory_patch_centers)
+                cross_attn_kv.append((ca_k, ca_v))
+                x = x + block.cross_attn.forward_cached(block.norm2(x), ca_k, ca_v, query_coords=prompt_coords)
+            else:
+                cross_attn_kv.append(None)
+            x = x + block.ffn(block.norm3(x))
+            x = x * seq_mask.unsqueeze(-1).to(dtype=x.dtype)
+        x = self.final_norm(x)
+        cache = KVCache(self_attn_kv=self_attn_kv, cross_attn_kv=cross_attn_kv, seq_len=int(seq_mask.shape[1]))
+        return x, cache
+
+    @torch.no_grad()
+    def step_from_encoded_cached(
+        self,
+        *,
+        token_embedding: Tensor,
+        token_coords: Tensor,
+        cache: KVCache,
+        memory_tokens: Tensor,
+    ) -> tuple[dict[str, Any], KVCache]:
+        x = token_embedding
+        new_self_attn_kv: list[tuple[Tensor, Tensor]] = []
+        for layer_idx, block in enumerate(self.blocks):
+            x, (new_k, new_v) = block.forward_cached(
+                x,
+                token_coords,
+                cache.self_attn_kv[layer_idx],
+                cache.cross_attn_kv[layer_idx],
+            )
+            new_self_attn_kv.append((new_k, new_v))
+        x = self.final_norm(x)
+        hidden = x
+        coarse_outputs = self._compute_coarse_outputs(hidden, memory_tokens)
+        max_bins = max(self.offset_num_bins)
+        offset_logits = self.offset_head(hidden).reshape(hidden.shape[0], hidden.shape[1], 3, max_bins)
+        stop_logits = self.stop_head(hidden).squeeze(-1)
+        pred_refine_residual = self.position_refine_head(hidden)
+        new_cache = KVCache(
+            self_attn_kv=new_self_attn_kv,
+            cross_attn_kv=cache.cross_attn_kv,
+            seq_len=cache.seq_len + int(token_embedding.shape[1]),
+        )
+        return {
+            "coarse_logits": coarse_outputs.get("coarse_logits"),
+            "coarse_axis_logits": coarse_outputs.get("coarse_axis_logits"),
+            "offset_logits": offset_logits,
+            "stop_logits": stop_logits,
+            "pred_coarse_ids": coarse_outputs["pred_coarse_ids"],
+            "pred_coarse_axis_ids": coarse_outputs["pred_coarse_axis_ids"],
+            "pred_refine_residual": pred_refine_residual,
+            "coarse_prediction_mode": self.coarse_prediction_mode,
+        }, new_cache
 
 
 def build_pseudo_inference_batch(
