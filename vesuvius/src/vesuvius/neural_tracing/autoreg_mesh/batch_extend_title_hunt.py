@@ -573,6 +573,7 @@ def _process_surface(
     dry_run_max_calls_per_direction: int,
     distributed_infer: bool,
     extend_directions: list[str] | None = None,
+    target_vertex_spacing: float = 0.0,
 ) -> dict[str, Any]:
     _active_directions = set(extend_directions or ["up", "down"])
     relative_surface_id = str(surface["relative_surface_id"])
@@ -606,6 +607,7 @@ def _process_surface(
             surface["local_path"],
             paths.scaled_input_dir,
             coordinate_scale_factor=float(coordinate_scale_factor),
+            target_vertex_spacing=float(target_vertex_spacing),
         )
         state = _update_surface_state(
             state=state,
@@ -713,6 +715,7 @@ def run_batch_extend_title_hunt(
     show_progress: bool,
     dry_run_max_calls_per_direction: int,
     distributed_infer: bool,
+    target_vertex_spacing: float = 0.0,
 ) -> dict[str, Any]:
     _require_aws_env()
     local_source_root.mkdir(parents=True, exist_ok=True)
@@ -763,6 +766,7 @@ def run_batch_extend_title_hunt(
             dry_run_mode=is_dry_run_surface,
             dry_run_max_calls_per_direction=int(dry_run_max_calls_per_direction),
             distributed_infer=bool(distributed_infer),
+            target_vertex_spacing=float(target_vertex_spacing),
         )
         processed.append(
             {
@@ -811,6 +815,7 @@ def run_batch_extend_title_hunt(
 @click.option("--distributed-infer/--no-distributed-infer", default=False, show_default=True)
 @click.option("--surface-filter", type=str, default=None, help="Only process surfaces whose relative_surface_id contains this substring")
 @click.option("--extend-directions", type=str, default="up,down", show_default=True, help="Comma-separated directions to extend (e.g. 'up' or 'up,down')")
+@click.option("--target-vertex-spacing", type=float, default=0.0, show_default=True, help="If >0, resample the lattice so vertex spacing matches this (voxels). Set to 20 to match training data.")
 def main(
     source_s3_uri: str,
     output_s3_uri: str,
@@ -830,6 +835,7 @@ def main(
     distributed_infer: bool,
     surface_filter: str | None,
     extend_directions: str,
+    target_vertex_spacing: float,
 ) -> None:
     result = run_batch_extend_title_hunt(
         source_s3_uri=source_s3_uri,
@@ -850,6 +856,7 @@ def main(
         distributed_infer=bool(distributed_infer),
         surface_filter=surface_filter,
         extend_directions=[d.strip() for d in str(extend_directions).split(",") if d.strip()],
+        target_vertex_spacing=float(target_vertex_spacing),
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 
