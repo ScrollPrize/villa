@@ -2263,6 +2263,7 @@ def train(
         world_size=world_size,
         is_main=is_main,
         deform_store=deform_store,
+        deform_enabled=deform_enabled,
         deform_inner_iters=deform_inner_iters,
         deform_inner_lr=deform_inner_lr,
         deform_max_frac=deform_max_frac,
@@ -2979,6 +2980,10 @@ def train(
                     world_size=world_size,
                     is_main=is_main,
                     deform_store=deform_store,
+                    deform_enabled=deform_enabled,
+                    deform_inner_iters=deform_inner_iters,
+                    deform_inner_lr=deform_inner_lr,
+                    deform_max_frac=deform_max_frac,
                     vis_samples=VIS_SAMPLES,
                     refine=refine,
                 )
@@ -3072,6 +3077,7 @@ def _evaluate(
     world_size: int = 1,
     is_main: bool = True,
     deform_store: "DeformationStore | None" = None,
+    deform_enabled: bool = False,
     deform_inner_iters: int = 100,
     deform_inner_lr: float = 1000.0,
     deform_max_frac: float = 0.3,
@@ -3127,44 +3133,31 @@ def _evaluate(
             cos_mask = validity
             dir_mask = ((dir_sparse_mask + dir_dense_mask) > 0.5).float()
 
-            # Deformation inner loop (same as training)
+            # Cage deformation (same as training)
             targets_original = targets
             cos_mask_original = cos_mask
-            if deform_store is not None:
-                batch_gidxs = [pi["global_idx"] for pi in batch["patch_info"]]
-                deform_batch = deform_store.get(batch_gidxs).to(device)
-                deform_batch.requires_grad_(True)
-
+            cage_deform_active = (
+                deform_enabled
+                and "cage_ctrl_pos" in batch
+                and batch["cage_ctrl_pos"] is not None
+            )
+            if cage_deform_active:
                 with torch.enable_grad():
-                    deform_opt = _deform_inner_loop(
-                        pred[:, 0:2].detach(),
-                        targets, cos_mask,
-                        deform_batch,
+                    warped_cg, warped_v = _cage_deform_inner_loop(
+                        pred_cos_gm=pred[:, 0:2].detach(),
+                        targets=targets,
+                        validity=cos_mask,
+                        batch=batch,
+                        dts_batch=_batch_dts,
                         n_iters=deform_inner_iters,
                         inner_lr=deform_inner_lr,
                         max_frac=deform_max_frac,
                         scale_loss_mse_fn=scale_loss_mse,
                         scale_loss_l1_fn=scale_loss_l1,
                     )
-
-                G = deform_opt.shape[-1]
-                normal_dir = _compute_normal_field(
-                    targets[:, 0:1].float(), G,
-                )
-                disp_3d = deform_opt * normal_dir
-                Z, Y, X = targets.shape[2:]
-                df = F.interpolate(
-                    disp_3d, size=(Z, Y, X),
-                    mode="trilinear", align_corners=False,
-                )
-                warped_cg, warped_v = _apply_warp(
-                    targets[:, 0:2], cos_mask, df,
-                )
                 targets = targets.clone()
                 targets[:, 0:2] = warped_cg
                 cos_mask = warped_v
-
-                deform_store.put(batch_gidxs, deform_opt)
 
             loss_cos = scale_loss_mse(pred[:, 0:1], targets[:, 0:1], mask=cos_mask)
             loss_mag = scale_loss_l1(pred[:, 1:2], targets[:, 1:2], mask=cos_mask)
