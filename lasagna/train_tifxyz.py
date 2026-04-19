@@ -32,7 +32,12 @@ import os as _os
 _os.environ.setdefault(
     "PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True",
 )
-del _os
+# Limit per-process thread pools to avoid 2000%+ CPU per dataloader worker.
+# Must be set before importing numpy, blosc, torch, etc.
+for _k in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS",
+           "BLOSC_NTHREADS", "NUMEXPR_MAX_THREADS", "NUMBA_NUM_THREADS"):
+    _os.environ.setdefault(_k, "4")
+del _k, _os
 
 # Pre-warm numba LLVM runtime before any other imports. torch pulls in
 # opt_einsum, whose backends/__init__.py eagerly imports
@@ -391,6 +396,110 @@ def direction_smoothness_loss(
         return num / denom
 
     return (_avg(gz, mz) + _avg(gy, my) + _avg(gx, mx)) / 3.0
+
+
+def sorted_distribution_loss(pred_cos, gt_cos, validity, grad_mag,
+                             window=40, stride=30, grad_mag_min=0.05):
+    """Phase-invariant distribution matching via sort-based 1D Wasserstein.
+
+    Extracts overlapping 3D windows, keeps only windows with sufficient
+    GT grad_mag density (surfaces present), sorts pred and GT cos values
+    within each window, computes L1 between sorted vectors.
+
+    Each window's contribution is weighted by its mean grad_mag (closer
+    surfaces → higher weight), matching the per-voxel weighting used
+    by the main cos loss.
+    """
+    B, C, Z, Y, X = pred_cos.shape
+    losses = []
+    weights = []
+
+    for z0 in range(0, Z - window + 1, stride):
+        for y0 in range(0, Y - window + 1, stride):
+            for x0 in range(0, X - window + 1, stride):
+                z1, y1, x1 = z0 + window, y0 + window, x0 + window
+
+                v = validity[:, :, z0:z1, y0:y1, x0:x1]
+                gm = grad_mag[:, :, z0:z1, y0:y1, x0:x1]
+
+                v_sum = v.sum().clamp(min=1)
+                gm_mean = (gm * v).sum() / v_sum
+                if gm_mean < grad_mag_min:
+                    continue
+
+                mask = v[:, 0] > 0.5
+                p = pred_cos[:, 0, z0:z1, y0:y1, x0:x1]
+                g = gt_cos[:, 0, z0:z1, y0:y1, x0:x1]
+
+                # Weight = mean grad_mag × 20 (same normalization as cos loss)
+                w = gm_mean * 20.0
+
+                for b in range(B):
+                    m = mask[b]
+                    if m.sum() < 10:
+                        continue
+                    p_sorted = torch.sort(p[b][m])[0]
+                    g_sorted = torch.sort(g[b][m])[0]
+                    losses.append(F.l1_loss(p_sorted, g_sorted))
+                    weights.append(w)
+
+    if not losses:
+        return pred_cos.new_zeros(1).squeeze()
+    losses_t = torch.stack(losses)
+    weights_t = torch.stack(weights)
+    return (losses_t * weights_t).sum() / weights_t.sum().clamp(min=1e-8)
+
+
+def fft_magnitude_loss(pred_cos, gt_cos, validity, grad_mag,
+                       block=16, stride=12, grad_mag_min=0.05):
+    """Phase-invariant frequency loss via FFT magnitude matching.
+
+    Computes 3D rFFT on overlapping blocks of pred and GT cos,
+    compares magnitude spectra (L1). Phase is discarded entirely.
+    DC component excluded (mean already supervised by cos MSE).
+    Weighted by mean grad_mag per block (same as cos loss weighting).
+    """
+    B, C, Z, Y, X = pred_cos.shape
+    losses = []
+    weights = []
+
+    for z0 in range(0, Z - block + 1, stride):
+        for y0 in range(0, Y - block + 1, stride):
+            for x0 in range(0, X - block + 1, stride):
+                z1, y1, x1 = z0 + block, y0 + block, x0 + block
+
+                v = validity[:, :, z0:z1, y0:y1, x0:x1]
+                # Only fully-valid blocks
+                if v.min() < 0.5:
+                    continue
+
+                gm = grad_mag[:, :, z0:z1, y0:y1, x0:x1]
+                gm_mean = gm.mean()
+                if gm_mean < grad_mag_min:
+                    continue
+
+                p = pred_cos[:, 0, z0:z1, y0:y1, x0:x1]
+                g = gt_cos[:, 0, z0:z1, y0:y1, x0:x1]
+
+                fft_p = torch.fft.rfftn(p.float(), dim=(-3, -2, -1))
+                fft_g = torch.fft.rfftn(g.float(), dim=(-3, -2, -1))
+                mag_p = fft_p.abs()
+                mag_g = fft_g.abs()
+
+                # Exclude DC (mean already supervised by cos MSE)
+                mag_p[:, 0, 0, 0] = 0
+                mag_g[:, 0, 0, 0] = 0
+
+                loss = F.l1_loss(mag_p, mag_g)
+                w = gm_mean * 20.0
+                losses.append(loss)
+                weights.append(w)
+
+    if not losses:
+        return pred_cos.new_zeros(1).squeeze()
+    losses_t = torch.stack(losses)
+    weights_t = torch.stack(weights)
+    return (losses_t * weights_t).sum() / weights_t.sum().clamp(min=1e-8)
 
 
 class MaskedMSE(nn.Module):
@@ -1059,6 +1168,9 @@ def train(
     wandb_tags: Optional[List[str]] = None,
     reinit_decoder_scales: int = 0,
     himag_filter: bool = True,
+    w_dist: float = 0.0,
+    w_fft: float = 0.0,
+    num_loss_scales: int = 5,
     deform_enabled: bool = True,
     deform_stride: int = 8,
     deform_inner_iters: int = 100,
@@ -1221,7 +1333,7 @@ def train(
         )
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, sampler=train_sampler,
-            num_workers=num_workers, pin_memory=True,
+            num_workers=num_workers, pin_memory=True, timeout=120,
             collate_fn=collate_variable_surfaces,
         )
         if train_dataset_aug is not None:
@@ -1232,31 +1344,30 @@ def train(
             train_loader_aug = DataLoader(
                 train_dataset_aug, batch_size=batch_size,
                 sampler=train_sampler_aug,
-                num_workers=num_workers, pin_memory=True,
+                num_workers=num_workers, pin_memory=True, timeout=120,
                 collate_fn=collate_variable_surfaces,
             )
         val_loader = DataLoader(
             val_dataset, batch_size=1, sampler=val_sampler,
-            num_workers=num_workers,
+            num_workers=num_workers, timeout=120,
             collate_fn=collate_variable_surfaces,
         )
     else:
         train_sampler = None
-        val_sampler = None
         train_loader = DataLoader(
             train_dataset, batch_size=batch_size, shuffle=True,
-            num_workers=num_workers, pin_memory=True,
+            num_workers=num_workers, pin_memory=True, timeout=120,
             collate_fn=collate_variable_surfaces,
         )
         if train_dataset_aug is not None:
             train_loader_aug = DataLoader(
                 train_dataset_aug, batch_size=batch_size, shuffle=True,
-                num_workers=num_workers, pin_memory=True,
+                num_workers=num_workers, pin_memory=True, timeout=120,
                 collate_fn=collate_variable_surfaces,
             )
         val_loader = DataLoader(
             val_dataset, batch_size=1, shuffle=False,
-            num_workers=num_workers,
+            num_workers=num_workers, timeout=120,
             collate_fn=collate_variable_surfaces,
         )
     if is_main:
@@ -1338,19 +1449,22 @@ def train(
     # Losses
     mse_loss = MaskedMSE()
     smooth_l1_loss = MaskedSmoothL1()
-    scale_loss_mse = ScaleSpaceLoss3D(mse_loss, num_scales=5)
-    scale_loss_l1 = ScaleSpaceLoss3D(smooth_l1_loss, num_scales=5)
+    scale_loss_mse = ScaleSpaceLoss3D(mse_loss, num_scales=num_loss_scales)
+    scale_loss_l1 = ScaleSpaceLoss3D(smooth_l1_loss, num_scales=num_loss_scales)
 
     # GPU pause/resume server — allows other apps to reclaim the GPU.
     pause_server = GpuPauseServer() if is_main else None
 
     def _gpu_offload():
+        import gc
         model.cpu()
         for s in optimizer.state.values():
             for k, v in s.items():
                 if isinstance(v, torch.Tensor):
                     s[k] = v.cpu()
+        gc.collect()
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
     def _gpu_reload():
         model.to(device)
@@ -1470,6 +1584,8 @@ def train(
             print(f"{TAG} full_vis ({tag}) render failed at step "
                   f"{step}: {e}", flush=True)
 
+    VIS_SAMPLES = 8
+
     # Initial eval before training so we see init/load performance.
     if is_main:
         print(f"{TAG} running pre-training eval at step 0...", flush=True)
@@ -1491,6 +1607,9 @@ def train(
         deform_inner_iters=deform_inner_iters,
         deform_inner_lr=deform_inner_lr,
         deform_max_frac=deform_max_frac,
+        vis_samples=VIS_SAMPLES,
+        w_dist=w_dist,
+        w_fft=w_fft,
     )
     if _init_vis_batch:
         _log_full_vis(_init_vis_batch[0], "val", global_step)
@@ -1564,16 +1683,22 @@ def train(
             else:
                 use_aug = False
 
-            if use_aug:
-                batch = next(iter_aug, None)
-                if batch is None:
-                    iter_aug = iter(train_loader_aug)
+            try:
+                if use_aug:
                     batch = next(iter_aug, None)
-            else:
-                batch = next(iter_normal, None)
-                if batch is None:
-                    iter_normal = iter(train_loader)
+                    if batch is None:
+                        iter_aug = iter(train_loader_aug)
+                        batch = next(iter_aug, None)
+                else:
                     batch = next(iter_normal, None)
+                    if batch is None:
+                        iter_normal = iter(train_loader)
+                        batch = next(iter_normal, None)
+            except Exception as _dl_err:
+                # DataLoader timeout or worker crash — treat as read error.
+                print(f"{TAG} dataloader error: {type(_dl_err).__name__}: {_dl_err}",
+                      flush=True)
+                batch = None
             # All samples this rank raised in __getitem__ (transient
             # zarr/S3 read errors). Coordinate with other ranks so
             # that if ANY rank is empty, all skip this step.
@@ -1619,6 +1744,17 @@ def train(
             if use_aug:
                 sf = scale_aug_factor
                 v = validity  # (B, 1, Z, Y, X)
+                # If any spatial dim is smaller than the pool kernel,
+                # pad to at least sf so avg_pool3d doesn't crash.
+                pad_needed = [max(0, sf - v.shape[d]) for d in (4, 3, 2)]  # x, y, z
+                if any(p > 0 for p in pad_needed):
+                    _p = (0, pad_needed[0], 0, pad_needed[1], 0, pad_needed[2])
+                    v = F.pad(v, _p, value=0)
+                    targets = F.pad(targets, _p, value=0)
+                    dir_sparse_mask = F.pad(dir_sparse_mask, _p, value=0)
+                    dir_dense_mask = F.pad(dir_dense_mask, _p, value=0)
+                    dir_axis_weight = F.pad(dir_axis_weight, _p, value=0)
+                    validity = v
                 v_count = F.avg_pool3d(v, kernel_size=sf, stride=sf)
 
                 # Valid-pool value tensors (avg only over valid voxels).
@@ -1847,6 +1983,7 @@ def train(
 
                 # --- GT deformation inner loop ---
                 targets_original = targets
+                cos_mask_original = cos_mask
                 targets_deformed = None
                 if deform_store is not None and not use_aug:
                     batch_global_idxs = [
@@ -1912,12 +2049,28 @@ def train(
                     mask=dir_dense_mask, weight=dir_axis_weight,
                 )
                 loss_smooth = direction_smoothness_loss(pred[:, 2:8], dir_mask)
+                loss_dist = (
+                    sorted_distribution_loss(
+                        pred[:, 0:1], targets_original[:, 0:1],
+                        cos_mask, targets_original[:, 1:2],
+                    )
+                    if w_dist > 0 else pred.new_zeros(1).squeeze()
+                )
+                loss_fft = (
+                    fft_magnitude_loss(
+                        pred[:, 0:1], targets_original[:, 0:1],
+                        cos_mask_original, targets_original[:, 1:2],
+                    )
+                    if w_fft > 0 else pred.new_zeros(1).squeeze()
+                )
                 loss = (
                     w_cos * loss_cos
                     + w_mag * loss_mag
                     + w_dir * loss_dir_sparse
                     + w_dir_dense * loss_dir_dense
                     + w_smooth * loss_smooth
+                    + w_dist * loss_dist
+                    + w_fft * loss_fft
                 )
 
                 # Sign-invariant unsigned angular error on sparse
@@ -1990,6 +2143,14 @@ def train(
                 log_scalar(
                     "train/loss_smooth", loss_smooth.item(), global_step,
                 )
+                if w_dist > 0:
+                    log_scalar(
+                        "train/loss_dist", loss_dist.item(), global_step,
+                    )
+                if w_fft > 0:
+                    log_scalar(
+                        "train/loss_fft", loss_fft.item(), global_step,
+                    )
                 log_scalar(
                     "train/dir_angle_deg_sparse",
                     dir_angle_deg_sparse,
@@ -2052,6 +2213,7 @@ def train(
                     world_size=world_size,
                     is_main=is_main,
                     deform_store=deform_store,
+                    vis_samples=VIS_SAMPLES,
                 )
                 if _vis_batch:
                     _log_full_vis(_vis_batch[0], "val", global_step)
@@ -2144,6 +2306,9 @@ def _evaluate(
     deform_inner_iters: int = 100,
     deform_inner_lr: float = 1000.0,
     deform_max_frac: float = 0.3,
+    vis_samples: int = 8,
+    w_dist: float = 0.0,
+    w_fft: float = 0.0,
 ):
     model.eval()
     losses = []
@@ -2154,7 +2319,7 @@ def _evaluate(
     losses_smooth: list[float] = []
     angles_sparse_deg: list[float] = []
     vis_done = False
-    _vis_acc: list[tuple] = []  # accumulate (image, pred, targets, mask, targets_orig) for vis
+    _vis_acc: list[tuple] = []  # accumulated on every rank, gathered to rank 0
 
     val_iter = loader
     if verbose:
@@ -2174,18 +2339,22 @@ def _evaluate(
                 same_surface_threshold=same_surface_threshold,
             )
 
-            if validity.sum() == 0:
-                continue
-
+            # Always run forward pass even if validity is empty — DDP
+            # broadcasts buffers on every forward, so all ranks must
+            # call model() the same number of times.
             results = model(image)
             raw_pred = results["output"]
             pred = torch.sigmoid(raw_pred) if output_sigmoid else raw_pred
+
+            if validity.sum() == 0:
+                continue
 
             cos_mask = validity
             dir_mask = ((dir_sparse_mask + dir_dense_mask) > 0.5).float()
 
             # Deformation inner loop (same as training)
             targets_original = targets
+            cos_mask_original = cos_mask
             if deform_store is not None:
                 batch_gidxs = [pi["global_idx"] for pi in batch["patch_info"]]
                 deform_batch = deform_store.get(batch_gidxs).to(device)
@@ -2233,12 +2402,28 @@ def _evaluate(
                 mask=dir_dense_mask, weight=dir_axis_weight,
             )
             loss_smooth = direction_smoothness_loss(pred[:, 2:8], dir_mask)
+            loss_dist = (
+                sorted_distribution_loss(
+                    pred[:, 0:1], targets_original[:, 0:1],
+                    cos_mask, targets_original[:, 1:2],
+                )
+                if w_dist > 0 else pred.new_zeros(1).squeeze()
+            )
+            loss_fft = (
+                fft_magnitude_loss(
+                    pred[:, 0:1], targets_original[:, 0:1],
+                    cos_mask_original, targets_original[:, 1:2],
+                )
+                if w_fft > 0 else pred.new_zeros(1).squeeze()
+            )
             loss = (
                 w_cos * loss_cos
                 + w_mag * loss_mag
                 + w_dir * loss_dir_sparse
                 + w_dir_dense * loss_dir_dense
                 + w_smooth * loss_smooth
+                + w_dist * loss_dist
+                + w_fft * loss_fft
             )
             losses.append(loss.item())
             losses_cos.append(loss_cos.item())
@@ -2266,21 +2451,32 @@ def _evaluate(
             if verbose:
                 val_iter.set_postfix(loss=f"{loss.item():.4f}")
 
-            # Accumulate up to 4 samples for visualization (rank 0 only).
-            if not vis_done and is_main and len(_vis_acc) < 4:
+            # Accumulate vis samples on every rank (gathered to rank 0 below).
+            if not vis_done and len(_vis_acc) < vis_samples:
                 _vis_acc.append((
                     image.detach().cpu(),
                     pred.detach().cpu(),
-                    targets.detach().cpu(),           # deformed (or original if no deform)
+                    targets.detach().cpu(),
                     cos_mask.detach().cpu(),
-                    targets_original.detach().cpu(),  # always the original
+                    targets_original.detach().cpu(),
                 ))
                 if vis_batch_out is not None:
                     vis_batch_out.append(batch)
-                if len(_vis_acc) >= 4:
+                if len(_vis_acc) >= vis_samples:
                     vis_done = True
 
-    # Log assembled val visualization (up to 4 samples concatenated).
+    # Gather vis samples from all ranks to rank 0.
+    if world_size > 1:
+        # Each rank sends its list of tuples; rank 0 collects all.
+        all_vis: list[list[tuple]] | None = [None] * world_size if is_main else None
+        dist.gather_object(_vis_acc, all_vis, dst=0)
+        if is_main and all_vis is not None:
+            _vis_acc = []
+            for rank_vis in all_vis:
+                if rank_vis:
+                    _vis_acc.extend(rank_vis)
+            _vis_acc = _vis_acc[:vis_samples]
+
     if _vis_acc and is_main:
         _log_vis(
             log_images, "val",
@@ -2403,6 +2599,14 @@ def main() -> None:
                              "loss magnitude.")
     parser.add_argument("--wandb-tags", type=str, default=None,
                         help="Comma-separated list of W&B run tags.")
+    parser.add_argument("--w-dist", type=float, default=0.0,
+                        help="Weight on sort-based distribution loss for cos "
+                             "(phase-invariant). 0 = off.")
+    parser.add_argument("--w-fft", type=float, default=0.0,
+                        help="Weight on FFT magnitude loss for cos "
+                             "(phase-invariant frequency matching). 0 = off.")
+    parser.add_argument("--num-loss-scales", type=int, default=5,
+                        help="Number of scales in scale-space loss (1 = no multi-scale).")
     parser.add_argument("--no-deform", action="store_true",
                         help="Disable per-sample GT deformation refinement.")
     parser.add_argument("--deform-stride", type=int, default=8,
@@ -2454,6 +2658,9 @@ def main() -> None:
         ),
         reinit_decoder_scales=args.reinit_decoder_scales,
         himag_filter=not args.no_himag_filter,
+        w_dist=args.w_dist,
+        w_fft=args.w_fft,
+        num_loss_scales=args.num_loss_scales,
         deform_enabled=not args.no_deform,
         deform_stride=args.deform_stride,
         deform_inner_iters=args.deform_inner_iters,

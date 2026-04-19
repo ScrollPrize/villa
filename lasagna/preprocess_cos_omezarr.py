@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import os as _os
+_os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+del _os
+
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
