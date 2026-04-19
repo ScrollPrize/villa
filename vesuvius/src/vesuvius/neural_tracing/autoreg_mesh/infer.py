@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,43 @@ from vesuvius.neural_tracing.autoreg_mesh.serialization import (
     deserialize_full_grid,
 )
 from vesuvius.tifxyz import Tifxyz, write_tifxyz
+
+
+@dataclasses.dataclass
+class GeometricValidationConfig:
+    """Configuration for per-vertex geometric checks during inference."""
+
+    enabled: bool = True
+    oob_action: str = "resample"
+    distance_action: str = "resample"
+    flip_action: str = "flag"
+    max_distance_scale: float = 2.0
+    max_resample_attempts: int = 5
+
+
+def _check_oob(xyz: np.ndarray, input_shape: tuple[int, int, int]) -> bool:
+    return bool(np.all(xyz >= 0.0) and all(float(xyz[i]) < float(input_shape[i]) for i in range(3)))
+
+
+def _check_distance(new_xyz: np.ndarray, prev_xyz: np.ndarray | None, *, max_dist: float) -> bool:
+    if prev_xyz is None:
+        return True
+    return bool(float(np.linalg.norm(new_xyz - prev_xyz)) <= max_dist)
+
+
+def _validate_vertex(
+    xyz: np.ndarray,
+    prev_xyz: np.ndarray | None,
+    *,
+    input_shape: tuple[int, int, int],
+    max_dist: float,
+    config: GeometricValidationConfig,
+) -> tuple[bool, str | None]:
+    if not _check_oob(xyz, input_shape):
+        return False, "oob"
+    if not _check_distance(xyz, prev_xyz, max_dist=max_dist):
+        return False, "distance"
+    return True, None
 
 
 def _to_single_batch(sample_or_batch: dict) -> dict:
@@ -329,6 +367,7 @@ def infer_autoreg_mesh_cached(
     top_p: float | None = None,
     save_path: str | Path | None = None,
     uuid: str | None = None,
+    geometric_validation: GeometricValidationConfig | None = None,
 ) -> dict:
     was_training = bool(model.training)
     model.eval()
@@ -365,6 +404,7 @@ def infer_autoreg_mesh_cached(
         _, cache = model.init_kv_cache(init_batch, memory_tokens=memory_tokens, memory_patch_centers=memory_patch_centers)
 
         all_target_strip_coords = _build_target_strip_coords(direction, target_grid_shape, device=device)
+        geometric_flags: list[tuple[int, str]] = []
         out_coarse = np.empty(max_steps, dtype=np.int64)
         out_coarse_axes: dict[str, np.ndarray] = {
             "z": np.empty(max_steps, dtype=np.int64),
@@ -442,6 +482,23 @@ def infer_autoreg_mesh_cached(
                 sampled_xyz = bin_center_xyz
             stop_prob = float(torch.sigmoid(outputs["stop_logits"][0, 0]).item())
 
+            if geometric_validation is not None and geometric_validation.enabled:
+                patch_diag = float(np.linalg.norm(model.patch_size if hasattr(model.patch_size, '__len__') else [model.patch_size]*3))
+                max_dist = geometric_validation.max_distance_scale * patch_diag
+                prev_xyz_np = out_xyz[step_idx - 1] if step_idx > 0 else None
+                valid, reason = _validate_vertex(
+                    sampled_xyz, prev_xyz_np,
+                    input_shape=tuple(int(v) for v in model.input_shape),
+                    max_dist=max_dist,
+                    config=geometric_validation,
+                )
+                if not valid:
+                    action = getattr(geometric_validation, f"{reason}_action", "flag")
+                    if action == "stop":
+                        break
+                    if action == "flag":
+                        geometric_flags.append((step_idx, reason))
+
             out_coarse[step_idx] = coarse_id
             for axis_name in ("z", "y", "x"):
                 out_coarse_axes[axis_name][step_idx] = coarse_axis_ids[axis_name]
@@ -502,6 +559,7 @@ def infer_autoreg_mesh_cached(
             "full_grid_world": full_grid_world,
             "stop_probabilities": out_stop_probs[:actual_steps].copy(),
             "saved_tifxyz_path": None if tifxyz_path is None else str(tifxyz_path),
+            "geometric_flags": geometric_flags,
         }
         if str(getattr(model, "coarse_prediction_mode", "joint_pointer")) == "axis_factorized":
             result["predicted_coarse_axis_ids"] = {
