@@ -253,11 +253,59 @@ def _select_dry_run_surfaces(surfaces: list[dict[str, str]], *, count: int) -> l
     return selected
 
 
+def _measure_vertex_spacing(z: np.ndarray, y: np.ndarray, x: np.ndarray, mask: np.ndarray) -> float:
+    h, w = mask.shape
+    mid_r, mid_c = h // 2, w // 2
+    window = min(50, h // 4, w // 4)
+    dists = []
+    for r in range(max(0, mid_r - window), min(h - 1, mid_r + window)):
+        for c in range(max(0, mid_c - window), min(w, mid_c + window)):
+            if mask[r, c] and mask[r + 1, c]:
+                d = float(np.sqrt((z[r+1,c]-z[r,c])**2 + (y[r+1,c]-y[r,c])**2 + (x[r+1,c]-x[r,c])**2))
+                dists.append(d)
+            if c + 1 < w and mask[r, c] and mask[r, c + 1]:
+                d = float(np.sqrt((z[r,c+1]-z[r,c])**2 + (y[r,c+1]-y[r,c])**2 + (x[r,c+1]-x[r,c])**2))
+                dists.append(d)
+    return float(np.median(dists)) if dists else 1.0
+
+
+def _resample_grid(z: np.ndarray, y: np.ndarray, x: np.ndarray, mask: np.ndarray, *, factor: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    from scipy.ndimage import zoom
+    factor = max(1, int(factor))
+    if factor == 1:
+        return z.copy(), y.copy(), x.copy(), mask.copy()
+    h, w = z.shape
+    new_h, new_w = h * factor, w * factor
+    fill_z = np.where(mask, z, np.nan).astype(np.float64)
+    fill_y = np.where(mask, y, np.nan).astype(np.float64)
+    fill_x = np.where(mask, x, np.nan).astype(np.float64)
+    mask_f = mask.astype(np.float64)
+    zoomed_mask = zoom(mask_f, factor, order=1)
+    zoomed_z = np.full_like(zoomed_mask, np.nan)
+    zoomed_y = np.full_like(zoomed_mask, np.nan)
+    zoomed_x = np.full_like(zoomed_mask, np.nan)
+    weight = zoom(mask_f, factor, order=1)
+    weight = np.clip(weight, 0, None)
+    valid_weight = weight > 0.01
+    for arr, fill in [(zoomed_z, fill_z), (zoomed_y, fill_y), (zoomed_x, fill_x)]:
+        safe = np.where(mask, fill, 0.0)
+        numer = zoom(safe * mask_f, factor, order=1)
+        arr[valid_weight] = numer[valid_weight] / weight[valid_weight]
+    new_mask = valid_weight & np.isfinite(zoomed_z) & np.isfinite(zoomed_y) & np.isfinite(zoomed_x)
+    return (
+        np.where(new_mask, zoomed_z, -1.0).astype(np.float32),
+        np.where(new_mask, zoomed_y, -1.0).astype(np.float32),
+        np.where(new_mask, zoomed_x, -1.0).astype(np.float32),
+        new_mask,
+    )
+
+
 def _scale_stored_tifxyz(
     source_dir: str | Path,
     output_dir: str | Path,
     *,
     coordinate_scale_factor: float,
+    target_vertex_spacing: float = 20.0,
 ) -> Path:
     source = read_tifxyz(source_dir, load_mask=True, validate=True).use_stored_resolution()
     valid_mask = source._mask.copy() if source._mask is not None else np.ones_like(source._x, dtype=bool)
@@ -267,15 +315,29 @@ def _scale_stored_tifxyz(
     scaled_x[valid_mask] *= float(coordinate_scale_factor)
     scaled_y[valid_mask] *= float(coordinate_scale_factor)
     scaled_z[valid_mask] *= float(coordinate_scale_factor)
+
+    current_spacing = _measure_vertex_spacing(scaled_z, scaled_y, scaled_x, valid_mask)
+    resample_factor = max(1, int(round(current_spacing / float(target_vertex_spacing))))
+    if resample_factor > 1:
+        print("[resample] vertex spacing=%.1f, target=%.1f, resampling %dx (grid %s -> %s)" % (
+            current_spacing, target_vertex_spacing, resample_factor,
+            valid_mask.shape,
+            (valid_mask.shape[0] * resample_factor, valid_mask.shape[1] * resample_factor),
+        ))
+        scaled_z, scaled_y, scaled_x, valid_mask = _resample_grid(
+            scaled_z, scaled_y, scaled_x, valid_mask, factor=resample_factor,
+        )
+
     scaled_bbox = None
     if source.bbox is not None:
         scaled_bbox = tuple(float(v) * float(coordinate_scale_factor) for v in source.bbox)
+    new_scale = tuple(float(v) / float(max(1, resample_factor)) for v in source._scale)
     scaled_surface = Tifxyz(
         _x=scaled_x,
         _y=scaled_y,
         _z=scaled_z,
         uuid=source.uuid,
-        _scale=tuple(float(v) for v in source._scale),
+        _scale=new_scale,
         bbox=scaled_bbox,
         area=None if source.area is None else float(source.area) * float(coordinate_scale_factor) * float(coordinate_scale_factor),
         extra=dict(source.extra),
