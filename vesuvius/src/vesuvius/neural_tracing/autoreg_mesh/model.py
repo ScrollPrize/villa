@@ -449,13 +449,14 @@ class AutoregMeshModel(nn.Module):
             num_strips = int(batch["num_strips"][batch_idx].item())
             strip_length = int(batch["strip_length"][batch_idx].item())
             index_map = torch.full((num_strips, strip_length), -1, device=sequence_mask.device, dtype=torch.long)
-            for token_idx in range(int(sequence_mask.shape[1])):
-                if not bool(sequence_mask[batch_idx, token_idx].item()):
-                    continue
-                strip_idx = int(strip_positions[batch_idx, token_idx, 0].item())
-                within_idx = int(strip_positions[batch_idx, token_idx, 1].item())
-                if 0 <= strip_idx < num_strips and 0 <= within_idx < strip_length:
-                    index_map[strip_idx, within_idx] = token_idx
+            valid = sequence_mask[batch_idx]
+            s_idx = strip_positions[batch_idx, :, 0]
+            w_idx = strip_positions[batch_idx, :, 1]
+            in_range = valid & (s_idx >= 0) & (s_idx < num_strips) & (w_idx >= 0) & (w_idx < strip_length)
+            if in_range.any():
+                token_indices = torch.arange(int(sequence_mask.shape[1]), device=sequence_mask.device, dtype=torch.long)
+                flat_idx = s_idx[in_range] * strip_length + w_idx[in_range]
+                index_map.view(-1).scatter_(0, flat_idx, token_indices[in_range])
             index_maps.append(index_map)
         return index_maps
 
@@ -476,11 +477,12 @@ class AutoregMeshModel(nn.Module):
         dtype = generation_inputs["xyz"].dtype
         device = generation_inputs["xyz"].device
         coarse_centers = self.coarse_cell_centers.to(device=device, dtype=dtype)
-        raw_mask = torch.ones((batch_size, target_len, coarse_centers.shape[0]), device=device, dtype=torch.bool)
+        num_cells = coarse_centers.shape[0]
+        raw_mask = torch.ones((batch_size, target_len, num_cells), device=device, dtype=torch.bool)
         prefix_xyz, prefix_valid = self._build_output_prefix_geometry(generation_inputs)
         index_maps = self._build_strip_index_map(batch, sequence_mask)
         patch_norm = torch.linalg.norm(torch.tensor(self.patch_size, device=device, dtype=dtype))
-        eps = torch.tensor(1e-6, device=device, dtype=dtype)
+        eps = 1e-6
 
         for batch_idx in range(batch_size):
             direction = str(batch["direction"][batch_idx])
@@ -488,65 +490,77 @@ class AutoregMeshModel(nn.Module):
             frontier, frontier_outward, frontier_valid = self._frontier_anchor_and_direction(cond_grid, direction=direction)
             default_axis = self._default_split_axis_direction(direction, device=device, dtype=dtype)
             index_map = index_maps[batch_idx]
-            for token_idx in range(target_len):
-                if not bool(sequence_mask[batch_idx, token_idx].item()):
-                    continue
-                strip_idx = int(batch["target_strip_positions"][batch_idx, token_idx, 0].item())
-                within_idx = int(batch["target_strip_positions"][batch_idx, token_idx, 1].item())
-                if not (0 <= within_idx < int(frontier.shape[0])):
-                    continue
+            num_strips = int(index_map.shape[0])
+            strip_length = int(index_map.shape[1])
 
-                frontier_anchor = frontier[within_idx]
-                outward = frontier_outward[within_idx]
-                outward_valid = bool(frontier_valid[within_idx].item())
-                anchor = frontier_anchor
-                direction_vec = outward
-                step = torch.linalg.norm(direction_vec)
+            strip_idx_all = batch["target_strip_positions"][batch_idx, :, 0]
+            within_idx_all = batch["target_strip_positions"][batch_idx, :, 1]
+            token_valid = sequence_mask[batch_idx] & (within_idx_all >= 0) & (within_idx_all < int(frontier.shape[0]))
 
-                if strip_idx > 0:
-                    prev_idx = int(index_map[strip_idx - 1, within_idx].item())
-                    if prev_idx >= 0 and bool(prefix_valid[batch_idx, prev_idx].item()):
-                        anchor = prefix_xyz[batch_idx, prev_idx]
-                        if strip_idx > 1:
-                            prior_idx = int(index_map[strip_idx - 2, within_idx].item())
-                            if prior_idx >= 0 and bool(prefix_valid[batch_idx, prior_idx].item()):
-                                direction_vec = prefix_xyz[batch_idx, prev_idx] - prefix_xyz[batch_idx, prior_idx]
-                            else:
-                                direction_vec = outward if outward_valid else default_axis
-                        else:
-                            direction_vec = outward if outward_valid else default_axis
-                        step = torch.linalg.norm(direction_vec)
-                    else:
-                        anchor = frontier_anchor
-                        direction_vec = outward if outward_valid else default_axis
-                        step = torch.linalg.norm(direction_vec)
-                elif not outward_valid:
-                    direction_vec = default_axis
-                    step = torch.linalg.norm(direction_vec)
+            safe_within = within_idx_all.clamp(0, int(frontier.shape[0]) - 1)
+            frontier_anchor_all = frontier[safe_within]
+            outward_all = frontier_outward[safe_within]
+            outward_valid_all = frontier_valid[safe_within]
 
-                if not bool(torch.isfinite(anchor).all().item()):
-                    anchor = torch.zeros_like(default_axis)
+            flat_map = index_map.reshape(-1)
+            prev_strip = (strip_idx_all - 1).clamp(min=0)
+            prior_strip = (strip_idx_all - 2).clamp(min=0)
+            safe_within_map = within_idx_all.clamp(0, strip_length - 1)
+            prev_flat = prev_strip * strip_length + safe_within_map
+            prior_flat = prior_strip * strip_length + safe_within_map
+            prev_flat = prev_flat.clamp(0, flat_map.shape[0] - 1)
+            prior_flat = prior_flat.clamp(0, flat_map.shape[0] - 1)
+            prev_token_idx = flat_map[prev_flat]
+            prior_token_idx = flat_map[prior_flat]
 
-                if not bool(torch.isfinite(direction_vec).all().item()) or float(step.item()) <= float(eps.item()):
-                    direction_vec = outward if outward_valid else default_axis
-                    step = torch.linalg.norm(direction_vec)
-                if not bool(torch.isfinite(direction_vec).all().item()) or float(step.item()) <= float(eps.item()):
-                    direction_vec = default_axis
-                    step = patch_norm
+            safe_prev_tok = prev_token_idx.clamp(min=0)
+            safe_prior_tok = prior_token_idx.clamp(min=0)
+            prev_xyz = prefix_xyz[batch_idx][safe_prev_tok]
+            prior_xyz = prefix_xyz[batch_idx][safe_prior_tok]
+            prev_valid_lookup = prefix_valid[batch_idx][safe_prev_tok] & (prev_token_idx >= 0)
+            prior_valid_lookup = prefix_valid[batch_idx][safe_prior_tok] & (prior_token_idx >= 0)
 
-                dir_unit = direction_vec / step.clamp(min=float(eps.item()))
-                local_step = torch.clamp(step, min=float(eps.item()))
-                delta = coarse_centers - anchor.view(1, 3)
-                forward = torch.einsum("nd,d->n", delta, dir_unit)
-                lateral = torch.linalg.norm(delta - forward.unsqueeze(-1) * dir_unit.view(1, 3), dim=-1)
-                radial = torch.linalg.norm(delta, dim=-1)
-                valid_tube = (
-                    (forward >= (-self.coarse_continuation_backward_scale * local_step)) &
-                    (forward <= (self.coarse_continuation_forward_scale * local_step)) &
-                    (lateral <= (self.coarse_continuation_lateral_scale * local_step))
-                )
-                valid_ball = radial <= (self.coarse_continuation_min_radius_scale * local_step)
-                raw_mask[batch_idx, token_idx] = valid_tube | valid_ball
+            has_prev = (strip_idx_all > 0) & prev_valid_lookup
+            has_prior = has_prev & (strip_idx_all > 1) & prior_valid_lookup
+
+            anchor = torch.where(has_prev.unsqueeze(-1), prev_xyz, frontier_anchor_all)
+            outward_or_default = torch.where(outward_valid_all.unsqueeze(-1), outward_all, default_axis.unsqueeze(0))
+            computed_dir = prev_xyz - prior_xyz
+            direction_vec = torch.where(has_prior.unsqueeze(-1), computed_dir, outward_or_default)
+            direction_vec = torch.where(
+                ((strip_idx_all == 0) & ~outward_valid_all).unsqueeze(-1),
+                default_axis.unsqueeze(0).expand_as(direction_vec),
+                direction_vec,
+            )
+
+            anchor_finite = torch.isfinite(anchor).all(dim=-1)
+            anchor = torch.where(anchor_finite.unsqueeze(-1), anchor, torch.zeros_like(anchor))
+
+            step = torch.linalg.norm(direction_vec, dim=-1)
+            dir_finite = torch.isfinite(direction_vec).all(dim=-1)
+            bad_dir = ~dir_finite | (step <= eps)
+            direction_vec = torch.where(bad_dir.unsqueeze(-1), outward_or_default, direction_vec)
+            step = torch.where(bad_dir, torch.linalg.norm(outward_or_default, dim=-1), step)
+            still_bad = ~torch.isfinite(direction_vec).all(dim=-1) | (step <= eps)
+            direction_vec = torch.where(still_bad.unsqueeze(-1), default_axis.unsqueeze(0).expand_as(direction_vec), direction_vec)
+            step = torch.where(still_bad, patch_norm.expand_as(step), step)
+
+            step = step.clamp(min=eps)
+            dir_unit = direction_vec / step.unsqueeze(-1)
+
+            delta = coarse_centers.unsqueeze(0) - anchor.unsqueeze(1)
+            fwd = (delta * dir_unit.unsqueeze(1)).sum(dim=-1)
+            lateral = (delta - fwd.unsqueeze(-1) * dir_unit.unsqueeze(1)).norm(dim=-1)
+            radial = delta.norm(dim=-1)
+            local_step = step.unsqueeze(1)
+            valid_tube = (
+                (fwd >= (-self.coarse_continuation_backward_scale * local_step))
+                & (fwd <= (self.coarse_continuation_forward_scale * local_step))
+                & (lateral <= (self.coarse_continuation_lateral_scale * local_step))
+            )
+            valid_ball = radial <= (self.coarse_continuation_min_radius_scale * local_step)
+            mask_all = (valid_tube | valid_ball) | ~token_valid.unsqueeze(-1)
+            raw_mask[batch_idx] = mask_all
         return raw_mask
 
     def _finalize_coarse_constraint_mask(
