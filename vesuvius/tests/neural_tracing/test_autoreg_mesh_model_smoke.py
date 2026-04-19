@@ -2480,11 +2480,21 @@ def test_factorized_distance_aware_coarse_loss_prefers_nearby_axis_cells() -> No
     assert near_loss.item() < far_loss.item()
 
 
-def test_mixed_precision_is_rejected_until_supported() -> None:
+def test_mixed_precision_config_validation() -> None:
     config = _make_cached_token_config()
     config["mixed_precision"] = "bf16"
-    with pytest.raises(ValueError, match="does not implement mixed precision"):
-        validate_autoreg_mesh_config(config)
+    validated = validate_autoreg_mesh_config(config)
+    assert validated["mixed_precision"] == "bf16"
+
+    config2 = _make_cached_token_config()
+    config2["mixed_precision"] = "no"
+    validated2 = validate_autoreg_mesh_config(config2)
+    assert validated2["mixed_precision"] == "no"
+
+    config3 = _make_cached_token_config()
+    config3["mixed_precision"] = "fp16"
+    with pytest.raises(ValueError, match="mixed_precision"):
+        validate_autoreg_mesh_config(config3)
 
 
 def test_rope_default_config_values() -> None:

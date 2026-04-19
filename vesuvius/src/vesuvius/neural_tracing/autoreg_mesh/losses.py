@@ -778,6 +778,8 @@ def _inverse_2x2(matrix: Tensor, *, det_floor: float) -> Tensor:
 
 
 def _symmetric_dirichlet_from_gram(pred_gram: Tensor, target_gram: Tensor, *, eps: float = 1e-4) -> Tensor:
+    pred_gram = pred_gram.float()
+    target_gram = target_gram.float()
     pred_reg = _regularize_2x2_gram(pred_gram, eps=eps)
     target_reg = _regularize_2x2_gram(target_gram, eps=eps)
     det_floor = float(eps) * float(eps)

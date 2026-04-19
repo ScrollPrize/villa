@@ -180,6 +180,14 @@ def _next_batch(iterator, dataloader, *, on_reset=None):
     return batch, iterator
 
 
+@dataclass
+class _SpatialSplitRecord:
+    sample_index: int
+    source_key: tuple[Any, ...]
+    world_bbox: tuple[float, float, float, float, float, float]
+    chunk_id: tuple[int, int, int] | None
+
+
 def _split_indices(num_items: int, *, seed: int, val_fraction: float) -> tuple[list[int], list[int]]:
     if num_items <= 0:
         raise ValueError("autoreg_mesh training requires a non-empty dataset")
@@ -191,6 +199,160 @@ def _split_indices(num_items: int, *, seed: int, val_fraction: float) -> tuple[l
     rng = np.random.default_rng(int(seed))
     indices = rng.permutation(num_items).tolist()
     return indices[num_val:], indices[:num_val]
+
+
+def _patch_source_key(patch) -> tuple[Any, ...]:
+    volume = getattr(patch, "volume", None)
+    volume_store = getattr(volume, "store", None)
+    volume_path = getattr(volume, "path", None)
+    store_path = getattr(volume_store, "path", None)
+    if volume_path is not None:
+        source_id = str(volume_path)
+    elif store_path is not None:
+        source_id = str(store_path)
+    else:
+        source_id = f"volume_object:{id(volume)}"
+    return (source_id, int(getattr(patch, "scale", 0)))
+
+
+def _expanded_bboxes_overlap(
+    bbox_a: tuple[float, float, float, float, float, float],
+    bbox_b: tuple[float, float, float, float, float, float],
+    *,
+    margin_voxels: float,
+) -> bool:
+    margin = float(margin_voxels)
+    return (
+        (float(bbox_a[0]) - margin) < (float(bbox_b[1]) + margin) and
+        (float(bbox_b[0]) - margin) < (float(bbox_a[1]) + margin) and
+        (float(bbox_a[2]) - margin) < (float(bbox_b[3]) + margin) and
+        (float(bbox_b[2]) - margin) < (float(bbox_a[3]) + margin) and
+        (float(bbox_a[4]) - margin) < (float(bbox_b[5]) + margin) and
+        (float(bbox_b[4]) - margin) < (float(bbox_a[5]) + margin)
+    )
+
+
+def _build_spatial_split_records(dataset: AutoregMeshDataset) -> list[_SpatialSplitRecord]:
+    records: list[_SpatialSplitRecord] = []
+    for sample_idx, sample_key in enumerate(dataset.sample_index):
+        patch_idx, wrap_idx = sample_key
+        patch = dataset.patches[int(patch_idx)]
+        records.append(
+            _SpatialSplitRecord(
+                sample_index=int(sample_idx),
+                source_key=_patch_source_key(patch),
+                world_bbox=tuple(float(v) for v in patch.world_bbox),
+                chunk_id=tuple(int(v) for v in patch.chunk_id) if getattr(patch, "chunk_id", None) is not None else None,
+            )
+        )
+    return records
+
+
+def _build_spatial_split_groups(
+    dataset: AutoregMeshDataset,
+    *,
+    margin_voxels: float,
+) -> list[list[int]]:
+    records = _build_spatial_split_records(dataset)
+    if not records:
+        return []
+    parents = list(range(len(records)))
+
+    def _find(idx: int) -> int:
+        while parents[idx] != idx:
+            parents[idx] = parents[parents[idx]]
+            idx = parents[idx]
+        return idx
+
+    def _union(left: int, right: int) -> None:
+        root_left = _find(left)
+        root_right = _find(right)
+        if root_left != root_right:
+            parents[root_right] = root_left
+
+    grouped_by_source: dict[tuple[Any, ...], list[_SpatialSplitRecord]] = {}
+    for record in records:
+        grouped_by_source.setdefault(record.source_key, []).append(record)
+
+    for source_records in grouped_by_source.values():
+        ordered = sorted(source_records, key=lambda record: record.world_bbox[0])
+        active: list[_SpatialSplitRecord] = []
+        for record in ordered:
+            current_z_min = float(record.world_bbox[0])
+            active = [
+                other for other in active
+                if (float(other.world_bbox[1]) + float(margin_voxels)) > (current_z_min - float(margin_voxels))
+            ]
+            for other in active:
+                if _expanded_bboxes_overlap(record.world_bbox, other.world_bbox, margin_voxels=margin_voxels):
+                    _union(record.sample_index, other.sample_index)
+            active.append(record)
+
+    groups: dict[int, list[int]] = {}
+    for record in records:
+        groups.setdefault(_find(record.sample_index), []).append(int(record.sample_index))
+    return [sorted(indices) for _, indices in sorted(groups.items(), key=lambda item: min(item[1]))]
+
+
+def _split_spatial_groups(
+    groups: list[list[int]],
+    *,
+    seed: int,
+    val_fraction: float,
+) -> tuple[list[int], list[int]]:
+    if not groups:
+        raise ValueError("autoreg_mesh training requires a non-empty dataset")
+    if len(groups) < 2 or float(val_fraction) <= 0.0:
+        train_indices = [idx for group in groups for idx in group]
+        return sorted(train_indices), []
+    num_val_groups = int(round(len(groups) * float(val_fraction)))
+    num_val_groups = max(1, min(num_val_groups, len(groups) - 1))
+    rng = np.random.default_rng(int(seed))
+    order = rng.permutation(len(groups)).tolist()
+    val_group_ids = set(order[:num_val_groups])
+    train_indices, val_indices = [], []
+    for group_idx, group in enumerate(groups):
+        if group_idx in val_group_ids:
+            val_indices.extend(group)
+        else:
+            train_indices.extend(group)
+    return sorted(train_indices), sorted(val_indices)
+
+
+def _spatial_split_diagnostics(groups: list[list[int]], train_indices: list[int], val_indices: list[int], *, total_items: int) -> dict[str, float]:
+    train_groups = [group for group in groups if any(idx in train_indices for idx in group)]
+    val_groups = [group for group in groups if any(idx in val_indices for idx in group)]
+    train_sizes = [len(group) for group in train_groups]
+    val_sizes = [len(group) for group in val_groups]
+    all_sizes = [len(group) for group in groups]
+    return {
+        "num_train_groups": float(len(train_groups)),
+        "num_val_groups": float(len(val_groups)),
+        "mean_train_group_size": float(np.mean(train_sizes)) if train_sizes else 0.0,
+        "mean_val_group_size": float(np.mean(val_sizes)) if val_sizes else 0.0,
+        "max_group_size": float(max(all_sizes)) if all_sizes else 0.0,
+        "val_fraction_actual": (float(len(val_indices)) / float(max(total_items, 1))) if total_items > 0 else 0.0,
+    }
+
+
+def _find_cross_split_bbox_overlap(
+    dataset: AutoregMeshDataset,
+    train_indices: list[int],
+    val_indices: list[int],
+    *,
+    margin_voxels: float,
+) -> tuple[int, int] | None:
+    records = _build_spatial_split_records(dataset)
+    train_records = [records[int(idx)] for idx in train_indices]
+    val_records = [records[int(idx)] for idx in val_indices]
+    val_by_source: dict[tuple[Any, ...], list[_SpatialSplitRecord]] = {}
+    for record in val_records:
+        val_by_source.setdefault(record.source_key, []).append(record)
+    for train_record in train_records:
+        for val_record in val_by_source.get(train_record.source_key, ()):
+            if _expanded_bboxes_overlap(train_record.world_bbox, val_record.world_bbox, margin_voxels=margin_voxels):
+                return train_record.sample_index, val_record.sample_index
+    return None
 
 
 def _restrict_dataset_samples(dataset: Dataset, selected_indices: list[int]) -> Dataset:
@@ -217,11 +379,35 @@ def _clone_autoreg_mesh_dataset(
     )
 
 
-def _split_dataset(dataset: Dataset, *, cfg: dict, seed: int, val_fraction: float) -> tuple[Dataset, Dataset | None]:
+def _split_dataset(dataset: Dataset, *, cfg: dict, seed: int, val_fraction: float) -> tuple[Dataset, Dataset | None, dict[str, float]]:
     total = len(dataset)
+    split_diagnostics: dict[str, float] = {}
     train_indices, val_indices = _split_indices(total, seed=seed, val_fraction=val_fraction)
 
     if isinstance(dataset, AutoregMeshDataset):
+        if str(cfg.get("val_split_mode", "spatial_groups")) == "spatial_groups":
+            groups = _build_spatial_split_groups(
+                dataset,
+                margin_voxels=float(cfg.get("validation_leakage_margin_voxels", 0.0)),
+            )
+            if float(val_fraction) > 0.0 and len(groups) < 2:
+                raise ValueError(
+                    "autoreg_mesh leakage-safe spatial split collapsed into fewer than two groups; "
+                    "unable to form a held-out validation set"
+                )
+            train_indices, val_indices = _split_spatial_groups(groups, seed=seed, val_fraction=val_fraction)
+            split_diagnostics = _spatial_split_diagnostics(groups, train_indices, val_indices, total_items=total)
+            overlap_pair = _find_cross_split_bbox_overlap(
+                dataset,
+                train_indices,
+                val_indices,
+                margin_voxels=float(cfg.get("validation_leakage_margin_voxels", 0.0)),
+            )
+            if overlap_pair is not None:
+                raise RuntimeError(
+                    "autoreg_mesh spatial validation split still has leakage between train and val; "
+                    f"overlapping sample indices={overlap_pair}"
+                )
         patch_metadata = dataset.export_patch_metadata()
         train_dataset = _restrict_dataset_samples(
             _clone_autoreg_mesh_dataset(
@@ -233,7 +419,7 @@ def _split_dataset(dataset: Dataset, *, cfg: dict, seed: int, val_fraction: floa
             train_indices,
         )
         if not val_indices:
-            return train_dataset, None
+            return train_dataset, None, split_diagnostics
         val_dataset = _restrict_dataset_samples(
             _clone_autoreg_mesh_dataset(
                 cfg,
@@ -243,11 +429,11 @@ def _split_dataset(dataset: Dataset, *, cfg: dict, seed: int, val_fraction: floa
             ),
             val_indices,
         )
-        return train_dataset, val_dataset
+        return train_dataset, val_dataset, split_diagnostics
 
     if not val_indices:
-        return dataset, None
-    return Subset(dataset, train_indices), Subset(dataset, val_indices)
+        return dataset, None, split_diagnostics
+    return Subset(dataset, train_indices), Subset(dataset, val_indices), split_diagnostics
 
 
 def _make_dataloader(
@@ -344,6 +530,7 @@ def _make_checkpoint_payload(
         "wandb_run_id": config.get("wandb_run_id"),
         "distributed_world_size": int(dist.get_world_size()) if dist.is_available() and dist.is_initialized() else 1,
         "distributed_backend": dist.get_backend() if dist.is_available() and dist.is_initialized() else None,
+        "mixed_precision": str(config.get("mixed_precision", "no")),
     }
     if scheduler is not None:
         payload["lr_scheduler"] = scheduler.state_dict()
@@ -1011,35 +1198,38 @@ def _evaluate_validation(
     global_step: int,
 ) -> tuple[dict[str, float], Any]:
     model.eval()
+    amp_enabled = str(cfg.get("mixed_precision", "no")).lower() != "no" and device.type == "cuda"
+    amp_dtype = torch.bfloat16 if amp_enabled else torch.float32
     metric_dicts: list[dict[str, float]] = []
     for _ in range(int(cfg["val_batches_per_log"])):
         raw_batch, iterator = _next_batch(iterator, dataloader)
         batch = _move_batch_to_device(raw_batch, device)
-        outputs = model(batch, scheduled_sampling_prob=0.0)
-        loss_dict = compute_autoreg_mesh_losses(
-            outputs,
-            batch,
-            offset_num_bins=tuple(int(v) for v in cfg["offset_num_bins"]),
-            occupancy_loss_weight=float(cfg.get("occupancy_loss_weight", 0.0)),
-            offset_loss_weight_active=_offset_loss_weight_active(cfg, global_step=global_step),
-            position_refine_weight_active=_position_refine_weight_active(cfg, global_step=global_step),
-            position_refine_loss_type=str(cfg.get("position_refine_loss", "huber")),
-            xyz_soft_loss_weight_active=_xyz_soft_loss_weight_active(cfg, global_step=global_step),
-            xyz_soft_loss_type=str(cfg.get("xyz_soft_loss", "huber")),
-            seam_loss_weight_active=_seam_loss_weight_active(cfg, global_step=global_step),
-            seam_loss_type=str(cfg.get("seam_loss", "edge_huber")),
-            seam_band_width=int(cfg.get("seam_band_width", 1)),
-            triangle_barrier_weight_active=_triangle_barrier_weight_active(cfg, global_step=global_step),
-            triangle_barrier_margin=float(cfg.get("triangle_barrier_margin", 0.05)),
-            boundary_loss_weight_active=_boundary_loss_weight_active(cfg, global_step=global_step),
-            geometry_metric_weight_active=_geometry_metric_weight_active(cfg, global_step=global_step),
-            geometry_metric_loss_type=str(cfg.get("geometry_metric_loss", "huber")),
-            geometry_sd_weight_active=_geometry_sd_weight_active(cfg, global_step=global_step),
-            distance_aware_coarse_targets_enabled=bool(cfg.get("distance_aware_coarse_targets_enabled", True)),
-            distance_aware_coarse_target_radius=int(cfg.get("distance_aware_coarse_target_radius", 1)),
-            distance_aware_coarse_target_sigma=float(cfg.get("distance_aware_coarse_target_sigma", 1.0)),
-            distance_aware_coarse_target_loss=str(cfg.get("distance_aware_coarse_target_loss", "soft_ce")),
-        )
+        with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_enabled):
+            outputs = model(batch, scheduled_sampling_prob=0.0)
+            loss_dict = compute_autoreg_mesh_losses(
+                outputs,
+                batch,
+                offset_num_bins=tuple(int(v) for v in cfg["offset_num_bins"]),
+                occupancy_loss_weight=float(cfg.get("occupancy_loss_weight", 0.0)),
+                offset_loss_weight_active=_offset_loss_weight_active(cfg, global_step=global_step),
+                position_refine_weight_active=_position_refine_weight_active(cfg, global_step=global_step),
+                position_refine_loss_type=str(cfg.get("position_refine_loss", "huber")),
+                xyz_soft_loss_weight_active=_xyz_soft_loss_weight_active(cfg, global_step=global_step),
+                xyz_soft_loss_type=str(cfg.get("xyz_soft_loss", "huber")),
+                seam_loss_weight_active=_seam_loss_weight_active(cfg, global_step=global_step),
+                seam_loss_type=str(cfg.get("seam_loss", "edge_huber")),
+                seam_band_width=int(cfg.get("seam_band_width", 1)),
+                triangle_barrier_weight_active=_triangle_barrier_weight_active(cfg, global_step=global_step),
+                triangle_barrier_margin=float(cfg.get("triangle_barrier_margin", 0.05)),
+                boundary_loss_weight_active=_boundary_loss_weight_active(cfg, global_step=global_step),
+                geometry_metric_weight_active=_geometry_metric_weight_active(cfg, global_step=global_step),
+                geometry_metric_loss_type=str(cfg.get("geometry_metric_loss", "huber")),
+                geometry_sd_weight_active=_geometry_sd_weight_active(cfg, global_step=global_step),
+                distance_aware_coarse_targets_enabled=bool(cfg.get("distance_aware_coarse_targets_enabled", True)),
+                distance_aware_coarse_target_radius=int(cfg.get("distance_aware_coarse_target_radius", 1)),
+                distance_aware_coarse_target_sigma=float(cfg.get("distance_aware_coarse_target_sigma", 1.0)),
+                distance_aware_coarse_target_loss=str(cfg.get("distance_aware_coarse_target_loss", "soft_ce")),
+            )
         metrics = _loss_dict_to_metrics(loss_dict)
         metrics.update(_mean_batch_sample_metrics(batch))
         metric_dicts.append(metrics)
@@ -1064,7 +1254,7 @@ def run_autoreg_mesh_training(
 
     if dataset is None:
         dataset = AutoregMeshDataset(cfg)
-    train_dataset, val_dataset = _split_dataset(
+    train_dataset, val_dataset, split_diagnostics = _split_dataset(
         dataset,
         cfg=cfg,
         seed=int(cfg["seed"]),
@@ -1195,6 +1385,8 @@ def run_autoreg_mesh_training(
         global_step = int(start_step)
         progress_bar = tqdm(total=max(0, total_steps - global_step), desc="autoreg_mesh", leave=False) if runtime.is_main_process else None
         startup_ms = 1000.0 * (time.perf_counter() - startup_started)
+        amp_enabled = str(cfg.get("mixed_precision", "no")).lower() != "no" and runtime.device.type == "cuda"
+        amp_dtype = torch.bfloat16 if amp_enabled else torch.float32
 
         while global_step < total_steps:
             raw_batch, train_iterator = _next_batch(
@@ -1215,37 +1407,38 @@ def run_autoreg_mesh_training(
             geometry_metric_weight_active = _geometry_metric_weight_active(cfg, global_step=global_step)
             geometry_sd_weight_active = _geometry_sd_weight_active(cfg, global_step=global_step)
             offset_feedback_enabled, refine_feedback_enabled = _scheduled_sampling_feedback_state(cfg, global_step=global_step)
-            outputs = train_model(
-                batch,
-                scheduled_sampling_prob=scheduled_sampling_prob,
-                scheduled_sampling_pattern=str(cfg.get("scheduled_sampling_pattern", "stripwise_full_strip_greedy")),
-                scheduled_sampling_offset_feedback_enabled=offset_feedback_enabled,
-                scheduled_sampling_refine_feedback_enabled=refine_feedback_enabled,
-            )
-            loss_dict = compute_autoreg_mesh_losses(
-                outputs,
-                batch,
-                offset_num_bins=tuple(int(v) for v in cfg["offset_num_bins"]),
-                occupancy_loss_weight=float(cfg.get("occupancy_loss_weight", 0.0)),
-                offset_loss_weight_active=offset_loss_weight_active,
-                position_refine_weight_active=position_refine_weight_active,
-                position_refine_loss_type=str(cfg.get("position_refine_loss", "huber")),
-                xyz_soft_loss_weight_active=xyz_soft_loss_weight_active,
-                xyz_soft_loss_type=str(cfg.get("xyz_soft_loss", "huber")),
-                seam_loss_weight_active=seam_loss_weight_active,
-                seam_loss_type=str(cfg.get("seam_loss", "edge_huber")),
-                seam_band_width=int(cfg.get("seam_band_width", 1)),
-                triangle_barrier_weight_active=triangle_barrier_weight_active,
-                triangle_barrier_margin=float(cfg.get("triangle_barrier_margin", 0.05)),
-                boundary_loss_weight_active=boundary_loss_weight_active,
-                geometry_metric_weight_active=geometry_metric_weight_active,
-                geometry_metric_loss_type=str(cfg.get("geometry_metric_loss", "huber")),
-                geometry_sd_weight_active=geometry_sd_weight_active,
-                distance_aware_coarse_targets_enabled=bool(cfg.get("distance_aware_coarse_targets_enabled", True)),
-                distance_aware_coarse_target_radius=int(cfg.get("distance_aware_coarse_target_radius", 1)),
-                distance_aware_coarse_target_sigma=float(cfg.get("distance_aware_coarse_target_sigma", 1.0)),
-                distance_aware_coarse_target_loss=str(cfg.get("distance_aware_coarse_target_loss", "soft_ce")),
-            )
+            with torch.autocast(device_type=runtime.device.type, dtype=amp_dtype, enabled=amp_enabled):
+                outputs = train_model(
+                    batch,
+                    scheduled_sampling_prob=scheduled_sampling_prob,
+                    scheduled_sampling_pattern=str(cfg.get("scheduled_sampling_pattern", "stripwise_full_strip_greedy")),
+                    scheduled_sampling_offset_feedback_enabled=offset_feedback_enabled,
+                    scheduled_sampling_refine_feedback_enabled=refine_feedback_enabled,
+                )
+                loss_dict = compute_autoreg_mesh_losses(
+                    outputs,
+                    batch,
+                    offset_num_bins=tuple(int(v) for v in cfg["offset_num_bins"]),
+                    occupancy_loss_weight=float(cfg.get("occupancy_loss_weight", 0.0)),
+                    offset_loss_weight_active=offset_loss_weight_active,
+                    position_refine_weight_active=position_refine_weight_active,
+                    position_refine_loss_type=str(cfg.get("position_refine_loss", "huber")),
+                    xyz_soft_loss_weight_active=xyz_soft_loss_weight_active,
+                    xyz_soft_loss_type=str(cfg.get("xyz_soft_loss", "huber")),
+                    seam_loss_weight_active=seam_loss_weight_active,
+                    seam_loss_type=str(cfg.get("seam_loss", "edge_huber")),
+                    seam_band_width=int(cfg.get("seam_band_width", 1)),
+                    triangle_barrier_weight_active=triangle_barrier_weight_active,
+                    triangle_barrier_margin=float(cfg.get("triangle_barrier_margin", 0.05)),
+                    boundary_loss_weight_active=boundary_loss_weight_active,
+                    geometry_metric_weight_active=geometry_metric_weight_active,
+                    geometry_metric_loss_type=str(cfg.get("geometry_metric_loss", "huber")),
+                    geometry_sd_weight_active=geometry_sd_weight_active,
+                    distance_aware_coarse_targets_enabled=bool(cfg.get("distance_aware_coarse_targets_enabled", True)),
+                    distance_aware_coarse_target_radius=int(cfg.get("distance_aware_coarse_target_radius", 1)),
+                    distance_aware_coarse_target_sigma=float(cfg.get("distance_aware_coarse_target_sigma", 1.0)),
+                    distance_aware_coarse_target_loss=str(cfg.get("distance_aware_coarse_target_loss", "soft_ce")),
+                )
             loss = loss_dict["loss"]
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Encountered non-finite training loss at step {global_step}: {loss.item()}")
@@ -1276,6 +1469,7 @@ def run_autoreg_mesh_training(
             metrics["geometry_sd_weight_active"] = float(geometry_sd_weight_active)
             metrics["step"] = float(global_step)
             metrics.update(_mean_batch_sample_metrics(batch, prefix="train_"))
+            metrics.update(split_diagnostics)
             if skipped_step > 0.0:
                 metrics["skipped_step_nonfinite_grad"] = skipped_step
             metrics = _metric_dict_mean_across_ranks(metrics, device=runtime.device, runtime=runtime)
@@ -1422,6 +1616,7 @@ def run_autoreg_mesh_training(
             "world_size": int(runtime.world_size),
             "device": str(runtime.device),
             "startup_ms": float(startup_ms),
+            "split_diagnostics": dict(split_diagnostics),
         }
     finally:
         if progress_bar is not None:

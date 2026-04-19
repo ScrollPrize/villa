@@ -144,6 +144,8 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "num_workers": 0,
     "val_num_workers": 0,
     "val_fraction": 0.1,
+    "val_split_mode": "spatial_groups",
+    "validation_leakage_margin_voxels": 0.0,
     "val_batches_per_log": 4,
     "rollout_val_examples_per_log": 1,
     "rollout_val_max_steps": None,
@@ -380,6 +382,10 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("val_num_workers must be non-negative")
     if float(cfg["val_fraction"]) < 0.0 or float(cfg["val_fraction"]) > 1.0:
         raise ValueError("val_fraction must be within [0, 1]")
+    if str(cfg["val_split_mode"]) not in {"random_samples", "spatial_groups"}:
+        raise ValueError("val_split_mode must be one of {'random_samples', 'spatial_groups'}")
+    if float(cfg["validation_leakage_margin_voxels"]) < 0.0:
+        raise ValueError("validation_leakage_margin_voxels must be non-negative")
     if int(cfg["val_batches_per_log"]) <= 0:
         raise ValueError("val_batches_per_log must be positive")
     if int(cfg["rollout_val_examples_per_log"]) <= 0:
@@ -392,10 +398,8 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("ckpt_frequency must be positive")
     if float(cfg["grad_clip"]) <= 0.0:
         raise ValueError("grad_clip must be positive")
-    if str(cfg["mixed_precision"]).lower() != "no":
-        raise ValueError(
-            "autoreg_mesh currently does not implement mixed precision; set mixed_precision='no'"
-        )
+    if str(cfg["mixed_precision"]).lower() not in {"no", "bf16"}:
+        raise ValueError("mixed_precision must be one of {'no', 'bf16'}")
     if cfg["out_dir"] is None or str(cfg["out_dir"]).strip() == "":
         raise ValueError("out_dir must be a non-empty path")
     if cfg.get("load_ckpt") is not None and str(cfg["load_ckpt"]).strip() == "":
