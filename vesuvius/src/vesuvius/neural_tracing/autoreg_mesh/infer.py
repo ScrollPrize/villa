@@ -170,7 +170,9 @@ def infer_autoreg_mesh(
     sample_or_batch: dict,
     *,
     max_steps: int | None = None,
-    stop_probability_threshold: float | None = 0.5,
+    stop_probability_threshold: float | None = None,
+    min_steps: int = 0,
+    stop_only_at_strip_boundary: bool = False,
     greedy: bool = True,
     temperature: float = 1.0,
     top_k: int | None = None,
@@ -280,9 +282,18 @@ def infer_autoreg_mesh(
             bin_center_xyz = model.decode_local_xyz(coarse_tensor, offset_tensor)[0, 0].detach().to(torch.float32).cpu().numpy()
             refine_residual = outputs.get("pred_refine_residual")
             if refine_residual is not None:
-                sampled_xyz = bin_center_xyz + refine_residual[0, current_len - 1].detach().to(torch.float32).cpu().numpy()
+                res = refine_residual[0, current_len - 1].detach().to(torch.float32).cpu().numpy()
+                if hasattr(model, "patch_size"):
+                    patch_diag = float(np.linalg.norm(model.patch_size))
+                    res_norm = float(np.linalg.norm(res))
+                    if res_norm > patch_diag:
+                        res = res * (patch_diag / res_norm)
+                sampled_xyz = bin_center_xyz + res
             else:
                 sampled_xyz = bin_center_xyz
+            if hasattr(model, "input_shape"):
+                crop_max = np.array(model.input_shape, dtype=np.float32) - 1e-4
+                sampled_xyz = np.clip(sampled_xyz, 0.0, crop_max)
             stop_prob = float(torch.sigmoid(outputs["stop_logits"][0, current_len - 1].float()).item())
 
             buf_coarse_ids[0, step_idx] = coarse_id
@@ -297,7 +308,15 @@ def infer_autoreg_mesh(
             out_stop_probs[step_idx] = stop_prob
             actual_steps = step_idx + 1
 
-            if stop_probability_threshold is not None and stop_prob >= float(stop_probability_threshold):
+            strip_len = int(batch["strip_length"][0].item()) if "strip_length" in batch else 1
+            is_strip_boundary = ((step_idx + 1) % max(strip_len, 1) == 0)
+            can_stop = (
+                stop_probability_threshold is not None
+                and actual_steps >= int(min_steps)
+                and stop_prob >= float(stop_probability_threshold)
+                and (not stop_only_at_strip_boundary or is_strip_boundary)
+            )
+            if can_stop:
                 break
 
         predicted_xyz_local = out_xyz[:actual_steps].copy()
@@ -360,7 +379,9 @@ def infer_autoreg_mesh_cached(
     sample_or_batch: dict,
     *,
     max_steps: int | None = None,
-    stop_probability_threshold: float | None = 0.5,
+    stop_probability_threshold: float | None = None,
+    min_steps: int = 0,
+    stop_only_at_strip_boundary: bool = False,
     greedy: bool = True,
     temperature: float = 1.0,
     top_k: int | None = None,
@@ -477,9 +498,16 @@ def infer_autoreg_mesh_cached(
             bin_center_xyz = model.decode_local_xyz(coarse_tensor, offset_tensor)[0, 0].detach().to(torch.float32).cpu().numpy()
             refine_residual = outputs.get("pred_refine_residual")
             if refine_residual is not None:
-                sampled_xyz = bin_center_xyz + refine_residual[0, 0].detach().to(torch.float32).cpu().numpy()
+                res = refine_residual[0, 0].detach().to(torch.float32).cpu().numpy()
+                patch_diag = float(np.linalg.norm(model.patch_size))
+                res_norm = float(np.linalg.norm(res))
+                if res_norm > patch_diag:
+                    res = res * (patch_diag / res_norm)
+                sampled_xyz = bin_center_xyz + res
             else:
                 sampled_xyz = bin_center_xyz
+            crop_max = np.array(model.input_shape, dtype=np.float32) - 1e-4
+            sampled_xyz = np.clip(sampled_xyz, 0.0, crop_max)
             stop_prob = float(torch.sigmoid(outputs["stop_logits"][0, 0].float()).item())
 
             if geometric_validation is not None and geometric_validation.enabled:
@@ -513,7 +541,15 @@ def infer_autoreg_mesh_cached(
             prev_xyz = torch.tensor(sampled_xyz, dtype=torch.float32, device=device).view(1, 1, 3)
             prev_valid = torch.ones((1, 1), dtype=torch.bool, device=device)
 
-            if stop_probability_threshold is not None and stop_prob >= float(stop_probability_threshold):
+            strip_len = int(batch["strip_length"][0].item()) if "strip_length" in batch else 1
+            is_strip_boundary = ((actual_steps) % max(strip_len, 1) == 0)
+            can_stop = (
+                stop_probability_threshold is not None
+                and actual_steps >= int(min_steps)
+                and stop_prob >= float(stop_probability_threshold)
+                and (not stop_only_at_strip_boundary or is_strip_boundary)
+            )
+            if can_stop:
                 break
 
         predicted_xyz_local = out_xyz[:actual_steps].copy()

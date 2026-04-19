@@ -988,11 +988,17 @@ def _decode_single_step_from_outputs(
     coarse_tensor = torch.tensor([[coarse_id]], dtype=torch.long, device=device)
     bin_center_xyz = model.decode_local_xyz(coarse_tensor, offset_tensor)[0, 0].detach().to(torch.float32).cpu().numpy()
     refine_residual = outputs.get("pred_refine_residual")
-    sampled_xyz = (
-        bin_center_xyz + refine_residual[sample_idx, step_idx].detach().to(torch.float32).cpu().numpy()
-        if refine_residual is not None
-        else bin_center_xyz
-    )
+    if refine_residual is not None:
+        res = refine_residual[sample_idx, step_idx].detach().to(torch.float32).cpu().numpy()
+        patch_diag = float(np.linalg.norm(model.patch_size))
+        res_norm = float(np.linalg.norm(res))
+        if res_norm > patch_diag:
+            res = res * (patch_diag / res_norm)
+        sampled_xyz = bin_center_xyz + res
+    else:
+        sampled_xyz = bin_center_xyz
+    crop_max = np.array(model.input_shape, dtype=np.float32) - 1e-4
+    sampled_xyz = np.clip(sampled_xyz, 0.0, crop_max)
     stop_prob = float(torch.sigmoid(outputs["stop_logits"][sample_idx, step_idx].float()).item())
     return coarse_id, offset_bins, sampled_xyz.astype(np.float32, copy=False), stop_prob
 
@@ -1004,7 +1010,7 @@ def infer_extension_windows_batched(
     window_batch_size: int,
     device: torch.device,
     greedy: bool = True,
-    stop_probability_threshold: float | None = 1.1,
+    stop_probability_threshold: float | None = None,
     progress_desc: str | None = None,
     show_progress: bool | None = None,
     fast_infer: bool = True,
@@ -1660,7 +1666,7 @@ def extend_tifxyz_mesh(
                     window_batch_size=int(window_batch_size),
                     device=device_obj,
                     greedy=True,
-                    stop_probability_threshold=1.1,
+                    stop_probability_threshold=None,
                     progress_desc=f"iter {iteration_idx + 1} infer",
                     show_progress=local_show_progress,
                     fast_infer=bool(fast_infer),
