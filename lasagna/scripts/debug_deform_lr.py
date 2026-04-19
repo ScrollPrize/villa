@@ -1,7 +1,4 @@
-"""DEBUG: Test cage deformation — hard-offset sanity check.
-
-Applies a fixed 5-voxel offset along X to all control points and
-saves separate TIFF images for each channel (no optimization).
+"""DEBUG: Test cage deformation inner loop on several batches.
 
 Usage:
   python lasagna/scripts/debug_deform_lr.py --config lasagna/configs/tifxyz_train_s3.json \
@@ -39,8 +36,10 @@ if _LASAGNA_DIR not in sys.path:
 from train_tifxyz import (
     build_model,
     compute_batch_targets,
-    _build_cage_displacement,
-    _apply_warp,
+    MaskedMSE,
+    MaskedSmoothL1,
+    ScaleSpaceLoss3D,
+    _cage_deform_inner_loop,
 )
 from tifxyz_lasagna_dataset import (
     TifxyzLasagnaDataset,
@@ -69,13 +68,15 @@ def _save_separate_tifs(slices_dict, output_dir, prefix):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Debug cage deformation (hard offset)")
+    parser = argparse.ArgumentParser(description="Debug cage deformation")
     parser.add_argument("--config", type=str, required=True)
     parser.add_argument("--weights", type=str, required=True)
     parser.add_argument("--patch-size", type=int, default=192)
-    parser.add_argument("--n-batches", type=int, default=3)
-    parser.add_argument("--offset", type=float, default=5.0,
-                        help="Hard offset in voxels to apply to all ctrl points")
+    parser.add_argument("--n-batches", type=int, default=5)
+    parser.add_argument("--n-iters", type=int, default=1000)
+    parser.add_argument("--max-frac", type=float, default=0.3)
+    parser.add_argument("--lr-start", type=float, default=1e3)
+    parser.add_argument("--lr-end", type=float, default=1e7)
     parser.add_argument("--output-dir", type=str, default="tmp/debug_deform")
     args = parser.parse_args()
 
@@ -112,10 +113,22 @@ def main():
     model, _, _ = build_model(args.patch_size, device, args.weights)
     model.eval()
 
-    output_dir = Path(args.output_dir)
-    hard_offset = args.offset
-    print(f"{TAG} hard offset = {hard_offset} voxels, output → {output_dir}")
+    mse_loss = MaskedMSE()
+    smooth_l1_loss = MaskedSmoothL1()
+    scale_loss_mse = ScaleSpaceLoss3D(mse_loss, num_scales=5)
+    scale_loss_l1 = ScaleSpaceLoss3D(smooth_l1_loss, num_scales=5)
 
+    # Override inner loop LR range via lr-end
+    # _cage_deform_inner_loop uses inner_lr * 100 as default end;
+    # here we set it by adjusting the ratio
+    lr_ratio = args.lr_end / args.lr_start
+
+    output_dir = Path(args.output_dir)
+    print(f"{TAG} cage deform: n_iters={args.n_iters}, max_frac={args.max_frac}, "
+          f"LR {args.lr_start:.0f} -> {args.lr_end:.0f}")
+    print(f"{TAG} testing on {args.n_batches} batches, images -> {output_dir}")
+
+    results_summary = []
     n_done = 0
     for batch in loader:
         if batch is None:
@@ -139,7 +152,7 @@ def main():
 
         with torch.no_grad(), torch.amp.autocast("cuda", dtype=torch.bfloat16):
             res = model(image)
-            pred = res["output"].float()
+            pred = res["output"]
 
         pi = batch["patch_info"][0]
         label = f"batch {n_done}  ds={pi.get('dataset_name','')}  idx={pi.get('idx','')}"
@@ -154,80 +167,100 @@ def main():
             n_done += 1
             continue
 
-        cage_ctrl_pos = batch["cage_ctrl_pos"]
-        cage_ctrl_normals = batch["cage_ctrl_normals"]
-        cage_grid_rc = batch["cage_grid_rc"]
-        cage_grid_rc_w = batch["cage_grid_rc_w"]
+        n_ctrl = sum(
+            cp.numel() // 3 for cp in batch["cage_ctrl_pos"][0]
+        )
+        n_surf = len(batch["cage_ctrl_pos"][0])
 
-        b = 0
-        ctrl_pos_list = [cp.to(device) for cp in cage_ctrl_pos[b]]
-        ctrl_normals_list = [cn.to(device) for cn in cage_ctrl_normals[b]]
-        grid_rc_list = [rc.to(device) for rc in cage_grid_rc[b]]
-        grid_rc_w_list = [w.to(device) for w in cage_grid_rc_w[b]]
-        dts_b = _dts[b]
-        N_surf = len(ctrl_pos_list)
-
-        # Real surface masks + chain info for bracket routing
-        masks_b = batch["surface_masks"][b].to(device)
-        N_masks = masks_b.shape[0]
-        surf_masks_b = [masks_b[i] > 0.5 for i in range(min(N_masks, N_surf))]
-        chain_info_b = batch["surface_chain_info"][b]
-
-        # Hard offset: set all control point offsets to args.offset
-        ctrl_offsets = []
-        for s in range(N_surf):
-            cp = ctrl_pos_list[s]
-            n_pts = cp.shape[0] * cp.shape[1] if cp.dim() >= 2 else 0
-            ctrl_offsets.append(
-                torch.full((n_pts,), hard_offset, device=device, dtype=torch.float32)
-            )
-
-        n_ctrl = sum(o.numel() for o in ctrl_offsets)
-        print(f"\n  {label}")
-        print(f"  surfaces={N_surf}, ctrl_points={n_ctrl}")
-
-        Z, Y, X = targets.shape[2:]
+        # Compute loss BEFORE deformation
+        pred_f = pred[:, 0:2].float().detach()
+        cos_gm_orig = targets[:, 0:2].float()
+        val_f = validity.float()
         with torch.no_grad():
-            disp = _build_cage_displacement(
-                ctrl_offsets, ctrl_pos_list, ctrl_normals_list,
-                grid_rc_list, grid_rc_w_list,
-                dts_b, validity[b:b+1].float(), (Z, Y, X),
-                surface_masks=surf_masks_b,
-                bracket_frac=_bfrac[b], bracket_lo=_blo[b], bracket_hi=_bhi[b],
-            )
-            print(f"  disp nonzero: {(disp.abs() > 1e-6).sum().item()}")
-            print(f"  disp abs max: {disp.abs().max().item():.2f}")
-            print(f"  disp abs mean (where >0): "
-                  f"{disp[disp.abs() > 1e-6].abs().mean().item():.2f}"
-                  if (disp.abs() > 1e-6).any() else "  disp is all zero!")
-
-            warped_cg, warped_v = _apply_warp(
-                targets[b:b+1, 0:2].float(),
-                validity[b:b+1].float(),
-                disp,
+            cos_w = cos_gm_orig[:, 1:2] * 20.0
+            loss_before = (
+                scale_loss_mse(pred_f[:, 0:1], cos_gm_orig[:, 0:1],
+                               mask=val_f, weight=cos_w).item()
+                + scale_loss_l1(pred_f[:, 1:2], cos_gm_orig[:, 1:2],
+                                mask=val_f, weight=cos_w).item()
             )
 
-        # Save separate tifs
+        print(f"\n{'='*70}")
+        print(f"  {label}")
+        print(f"  surfaces={n_surf}, ctrl_points={n_ctrl}, "
+              f"valid_frac={val_f.mean():.3f}, loss_before={loss_before:.6f}")
+        print(f"{'='*70}")
+
+        print(f"  {'iter':>4s}  {'lr':>10s}  {'loss':>10s}  {'best':>10s}  "
+              f"{'|off|_mean':>10s}  {'|off|_max':>10s}  {'grad_mean':>10s}")
+
+        warped_cg, warped_v, improvement = _cage_deform_inner_loop(
+            pred_cos_gm=pred_f,
+            targets=targets,
+            validity=validity,
+            batch=batch,
+            dts_batch=_dts,
+            n_iters=args.n_iters,
+            inner_lr=args.lr_start,
+            max_frac=args.max_frac,
+            scale_loss_mse_fn=scale_loss_mse,
+            scale_loss_l1_fn=scale_loss_l1,
+            verbose=True,
+            bracket_frac=_bfrac,
+            bracket_lo=_blo,
+            bracket_hi=_bhi,
+        )
+
+        # Compute loss AFTER deformation
+        with torch.no_grad():
+            cos_w_after = warped_cg[:, 1:2] * 20.0
+            loss_after = (
+                scale_loss_mse(pred_f[:, 0:1], warped_cg[:, 0:1],
+                               mask=warped_v, weight=cos_w_after).item()
+                + scale_loss_l1(pred_f[:, 1:2], warped_cg[:, 1:2],
+                                mask=warped_v, weight=cos_w_after).item()
+            )
+
+        print(f"  loss_before={loss_before:.6f}  loss_after={loss_after:.6f}  "
+              f"improvement={improvement:.4f}")
+
+        # Build deformed targets for visualization
+        with torch.no_grad():
+            targets_deformed = targets.clone()
+            targets_deformed[:, 0:2] = warped_cg
+
+        # Save images
+        b = 0
+        Z = targets.shape[2]
         mid_z = Z // 2
         prefix = f"batch_{n_done:03d}"
         slices = {
             "ct": image[b, 0, mid_z].float().cpu().numpy(),
-            "pred_cos": pred[b, 0, mid_z].cpu().numpy(),
-            "pred_mag": pred[b, 1, mid_z].cpu().numpy(),
+            "pred_cos": pred[b, 0, mid_z].float().cpu().numpy(),
+            "pred_mag": pred[b, 1, mid_z].float().cpu().numpy(),
             "gt_cos_orig": targets[b, 0, mid_z].float().cpu().numpy(),
             "gt_mag_orig": targets[b, 1, mid_z].float().cpu().numpy(),
             "gt_cos_deformed": warped_cg[0, 0, mid_z].cpu().numpy(),
             "gt_mag_deformed": warped_cg[0, 1, mid_z].cpu().numpy(),
             "validity_orig": validity[b, 0, mid_z].float().cpu().numpy(),
             "validity_deformed": warped_v[0, 0, mid_z].cpu().numpy(),
-            "disp_z": disp[0, 0, mid_z].cpu().numpy() / max(hard_offset, 1) * 0.5 + 0.5,
-            "disp_y": disp[0, 1, mid_z].cpu().numpy() / max(hard_offset, 1) * 0.5 + 0.5,
-            "disp_x": disp[0, 2, mid_z].cpu().numpy() / max(hard_offset, 1) * 0.5 + 0.5,
         }
         _save_separate_tifs(slices, output_dir, prefix)
+
+        results_summary.append((label, loss_before, loss_after, improvement))
         n_done += 1
 
-    print(f"\n{TAG} done. {n_done} batches processed.", flush=True)
+    # Summary
+    print(f"\n{'='*70}")
+    print(f"  SUMMARY  ({n_done} batches, {args.n_iters} iters)")
+    print(f"{'='*70}")
+    print(f"  {'batch':<45s}  {'before':>10s}  {'after':>10s}  {'ratio':>8s}")
+    for label, lb, la, imp in results_summary:
+        print(f"  {label:<45s}  {lb:10.6f}  {la:10.6f}  {imp:8.4f}")
+    if results_summary:
+        avg_imp = sum(r[3] for r in results_summary) / len(results_summary)
+        print(f"  {'AVERAGE':<45s}  {'':>10s}  {'':>10s}  {avg_imp:8.4f}")
+    print()
 
 
 if __name__ == "__main__":

@@ -862,15 +862,28 @@ def _apply_warp(cos_gm, validity, deform_full):
     validity:    (B, 1, Z, Y, X)
     deform_full: (B, 3, Z, Y, X) — displacement in voxel units
 
-    Returns (warped_cos_gm, warped_validity).
+    Returns (warped_cos_gm, warped_validity).  The validity mask is
+    hard-thresholded so edge voxels that sampled partially from
+    outside the valid region are excluded.
     """
     grid = _build_warp_grid(deform_full, cos_gm.device)
+    # Zero GT outside validity before warping so bilinear interpolation
+    # near validity edges only mixes valid values with zeros (not with
+    # arbitrary out-of-mask GT values).
+    cos_gm_masked = cos_gm * validity
     warped_cg = F.grid_sample(
-        cos_gm, grid, mode="bilinear", padding_mode="zeros", align_corners=True,
+        cos_gm_masked, grid, mode="bilinear", padding_mode="zeros",
+        align_corners=True,
     )
     warped_v = F.grid_sample(
-        validity, grid, mode="bilinear", padding_mode="zeros", align_corners=True,
+        validity, grid, mode="bilinear", padding_mode="zeros",
+        align_corners=True,
     )
+    # Hard threshold: exclude edge voxels that interpolated with
+    # invalid (zero) regions.  Small epsilon for float precision.
+    warped_v = (warped_v >= 1.0 - 1e-6).float()
+    # Zero GT where mask is invalid so edge artifacts don't leak.
+    warped_cg = warped_cg * warped_v
     return warped_cg, warped_v
 
 
