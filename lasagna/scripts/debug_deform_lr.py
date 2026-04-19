@@ -73,10 +73,10 @@ def main():
     parser.add_argument("--weights", type=str, required=True)
     parser.add_argument("--patch-size", type=int, default=192)
     parser.add_argument("--n-batches", type=int, default=5)
-    parser.add_argument("--n-iters", type=int, default=1000)
+    parser.add_argument("--n-iters", type=int, default=100)
     parser.add_argument("--max-frac", type=float, default=0.3)
     parser.add_argument("--lr-start", type=float, default=1e3)
-    parser.add_argument("--lr-end", type=float, default=1e7)
+    parser.add_argument("--lr-end", type=float, default=1e5)
     parser.add_argument("--output-dir", type=str, default="tmp/debug_deform")
     args = parser.parse_args()
 

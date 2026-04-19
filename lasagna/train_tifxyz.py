@@ -1273,33 +1273,197 @@ def _cage_deform_inner_loop(
         surf_masks_b = [masks_b[i] > 0.5 for i in range(min(N_masks, N_surf))]
         chain_info_b = batch["surface_chain_info"][b] if "surface_chain_info" in batch else None
 
-        # Initialize per-surface control point offsets (zero)
-        ctrl_offsets = []
+        # --- Pre-compute per-voxel cage weights (constant across iters) ---
+        # For each voxel: which ctrl_offsets indices contribute and with
+        # what weight.  Combines bilinear quad-corner gather, EDT FT
+        # propagation, and bracket routing into a single (Z,Y,X,K)
+        # index+weight tensor.  The inner loop then just does:
+        #   offset_vol = (voxel_weights * ctrl_all[voxel_indices]).sum(-1)
+        from tifxyz_labels import edt_torch_with_indices
+
+        # Build flat ctrl_offsets index offset per surface
+        surf_ctrl_offset = []  # start index of each surface in flat array
+        total_ctrl = 0
         for s in range(N_surf):
+            surf_ctrl_offset.append(total_ctrl)
             cp = ctrl_pos_list[s]
             n_pts = cp.shape[0] * cp.shape[1] if cp.dim() >= 2 else 0
-            off = torch.zeros(n_pts, device=device, dtype=torch.float32,
-                              requires_grad=True)
-            ctrl_offsets.append(off)
+            total_ctrl += n_pts
 
-        if not ctrl_offsets or all(o.numel() == 0 for o in ctrl_offsets):
+        if total_ctrl == 0:
             continue
 
-        # Compute max displacement from grad_mag
-        gm = cos_gm_orig[b, 1:2]  # (1, Z, Y, X)
+        # Per-surface: compute on-surface bilinear indices + weights,
+        # then propagate via FT to all voxels.
+        # Result per surface: (Z, Y, X, 4) indices and weights into
+        # the flat ctrl array.
+        K = 4  # 4 bilinear corners per surface
+        surf_voxel_idx = []   # per-surface (Z, Y, X, 4) int
+        surf_voxel_wgt = []   # per-surface (Z, Y, X, 4) float
+
+        for s in range(N_surf):
+            cp = ctrl_pos_list[s]
+            rc = grid_rc_list[s]
+            rc_w = grid_rc_w_list[s]
+            base = surf_ctrl_offset[s]
+
+            if cp.numel() == 0:
+                surf_voxel_idx.append(torch.zeros(Z, Y, X, K, device=device, dtype=torch.long))
+                surf_voxel_wgt.append(torch.zeros(Z, Y, X, K, device=device))
+                continue
+
+            H_s, W_s = cp.shape[:2]
+            rc_mask = rc_w > 0.01
+
+            # On-surface: bilinear corner indices + weights
+            idx_vol = torch.zeros(Z, Y, X, K, device=device, dtype=torch.long)
+            wgt_vol = torch.zeros(Z, Y, X, K, device=device)
+
+            if rc_mask.any():
+                r_frac = rc[0][rc_mask]
+                c_frac = rc[1][rc_mask]
+                r0 = r_frac.long().clamp(0, H_s - 2)
+                c0 = c_frac.long().clamp(0, W_s - 2)
+                dr = (r_frac - r0.float()).clamp(0, 1)
+                dc = (c_frac - c0.float()).clamp(0, 1)
+
+                w4 = torch.stack([
+                    (1 - dr) * (1 - dc),
+                    (1 - dr) * dc,
+                    dr * (1 - dc),
+                    dr * dc,
+                ], dim=-1)  # (M, 4)
+                i4 = torch.stack([
+                    r0 * W_s + c0,
+                    r0 * W_s + (c0 + 1).clamp(max=W_s - 1),
+                    (r0 + 1).clamp(max=H_s - 1) * W_s + c0,
+                    (r0 + 1).clamp(max=H_s - 1) * W_s + (c0 + 1).clamp(max=W_s - 1),
+                ], dim=-1) + base  # (M, 4) — offset into flat ctrl array
+
+                idx_vol[rc_mask] = i4
+                wgt_vol[rc_mask] = w4
+
+            # Propagate via FT: fill all voxels from nearest rc-valid
+            if rc_mask.any():
+                _, ft_rc = edt_torch_with_indices((~rc_mask).to(torch.uint8))
+                idx_vol = idx_vol[ft_rc[0], ft_rc[1], ft_rc[2]]
+                wgt_vol = wgt_vol[ft_rc[0], ft_rc[1], ft_rc[2]]
+
+            # Second FT: from real surface mask to all voxels
+            if surf_masks_b is not None and s < len(surf_masks_b):
+                real_mask = surf_masks_b[s].bool()
+                if real_mask.any() and not real_mask.all():
+                    _, ft_s = edt_torch_with_indices((~real_mask).to(torch.uint8))
+                    idx_vol = idx_vol[ft_s[0], ft_s[1], ft_s[2]]
+                    wgt_vol = wgt_vol[ft_s[0], ft_s[1], ft_s[2]]
+
+            surf_voxel_idx.append(idx_vol)
+            surf_voxel_wgt.append(wgt_vol)
+
+        # Combine bracket routing: per-voxel 8 indices + 8 weights
+        # (4 from lo surface × bracket weight + 4 from hi surface × bracket weight)
+        _bf = bracket_frac[b] if bracket_frac is not None else None
+        _bl = bracket_lo[b] if bracket_lo is not None else None
+        _bh = bracket_hi[b] if bracket_hi is not None else None
+
+        if _bf is not None and _bl is not None and _bh is not None:
+            valid_bracket = _bl >= 0
+            lo = _bl.clamp(0, N_surf - 1)
+            hi = _bh.clamp(0, N_surf - 1)
+            frac = _bf
+
+            # Stack per-surface idx/wgt
+            all_idx = torch.stack([sv.view(Z*Y*X, K) for sv in surf_voxel_idx])  # (N_surf, ZYX, 4)
+            all_wgt = torch.stack([sv.view(Z*Y*X, K) for sv in surf_voxel_wgt])  # (N_surf, ZYX, 4)
+
+            flat_pos = torch.arange(Z*Y*X, device=device)
+            lo_flat = lo.reshape(-1)
+            hi_flat = hi.reshape(-1)
+
+            # (ZYX, 4) from lo and hi surfaces
+            idx_lo = all_idx[lo_flat, flat_pos]  # (ZYX, 4)
+            wgt_lo = all_wgt[lo_flat, flat_pos] * (1 - frac).reshape(-1, 1)
+            idx_hi = all_idx[hi_flat, flat_pos]
+            wgt_hi = all_wgt[hi_flat, flat_pos] * frac.reshape(-1, 1)
+
+            # Combine: 8 entries per voxel
+            voxel_indices = torch.cat([idx_lo, idx_hi], dim=-1).reshape(Z, Y, X, 2*K)  # (Z,Y,X,8)
+            voxel_weights = torch.cat([wgt_lo, wgt_hi], dim=-1).reshape(Z, Y, X, 2*K)
+
+            # Zero out invalid voxels
+            voxel_weights[~valid_bracket] = 0
+        else:
+            # Fallback: nearest surface
+            dt_stack = torch.stack(dts_b[:N_surf], dim=0)
+            _, nearest = dt_stack.min(dim=0)
+            del dt_stack
+            all_idx = torch.stack([sv.view(Z*Y*X, K) for sv in surf_voxel_idx])
+            all_wgt = torch.stack([sv.view(Z*Y*X, K) for sv in surf_voxel_wgt])
+            flat_pos = torch.arange(Z*Y*X, device=device)
+            n_flat = nearest.reshape(-1)
+            voxel_indices = all_idx[n_flat, flat_pos].reshape(Z, Y, X, K)
+            voxel_weights = all_wgt[n_flat, flat_pos].reshape(Z, Y, X, K)
+
+        # Pre-compute per-voxel normal direction (also constant)
+        # Blend normals the same way as offsets
+        nrm_vols = []
+        for s in range(N_surf):
+            cn = ctrl_normals_list[s]
+            if cn.numel() == 0:
+                nrm_vols.append(torch.zeros(3, Z, Y, X, device=device))
+                continue
+            # Use same FT-propagated lookup but for normals
+            # Gather normals at on-surface positions, propagate
+            H_s, W_s = cn.shape[:2]
+            rc = grid_rc_list[s]
+            rc_w = grid_rc_w_list[s]
+            _, nrm_vol = _gather_cage_on_surface(
+                torch.zeros(H_s * W_s, device=device),  # dummy offsets
+                cn, rc, rc_w, H_s, W_s, (Z, Y, X),
+            )
+            rc_mask = rc_w > 0.01
+            if rc_mask.any():
+                _, ft_rc = edt_torch_with_indices((~rc_mask).to(torch.uint8))
+                nrm_vol = nrm_vol[:, ft_rc[0], ft_rc[1], ft_rc[2]]
+            if surf_masks_b is not None and s < len(surf_masks_b):
+                real_mask = surf_masks_b[s].bool()
+                if real_mask.any() and not real_mask.all():
+                    _, ft_s = edt_torch_with_indices((~real_mask).to(torch.uint8))
+                    nrm_vol = nrm_vol[:, ft_s[0], ft_s[1], ft_s[2]]
+            nrm_vols.append(nrm_vol)
+
+        # Blend normals using same bracket routing
+        nrm_stack = torch.stack(nrm_vols, dim=0)  # (N_surf, 3, Z, Y, X)
+        if _bf is not None and _bl is not None:
+            nrm_flat = nrm_stack.reshape(N_surf, 3, -1)  # (N_surf, 3, ZYX)
+            lo_flat = lo.reshape(-1)
+            hi_flat = hi.reshape(-1)
+            flat_pos = torch.arange(Z*Y*X, device=device)
+            nrm_lo = nrm_flat[lo_flat, :, flat_pos].reshape(Z, Y, X, 3).permute(3, 0, 1, 2)
+            nrm_hi = nrm_flat[hi_flat, :, flat_pos].reshape(Z, Y, X, 3).permute(3, 0, 1, 2)
+            normal_vol = (1 - _bf).unsqueeze(0) * nrm_lo + _bf.unsqueeze(0) * nrm_hi
+            normal_vol[:, ~valid_bracket] = 0
+        else:
+            n_flat = nearest.reshape(-1)
+            nrm_flat = nrm_stack.reshape(N_surf, 3, -1)
+            normal_vol = nrm_flat[n_flat, :, flat_pos].reshape(Z, Y, X, 3).permute(3, 0, 1, 2)
+        norm = normal_vol.norm(dim=0, keepdim=True).clamp(min=1e-8)
+        normal_vol = normal_vol / norm  # (3, Z, Y, X) — constant
+
+        # --- Initialize ctrl_offsets ---
+        ctrl_all = torch.zeros(total_ctrl, device=device, dtype=torch.float32,
+                               requires_grad=True)
+
+        gm = cos_gm_orig[b, 1:2]
         max_disp_scalar = float(max_frac / max(gm.max().item(), 0.02))
 
-        inner_opt = torch.optim.SGD(
-            [o for o in ctrl_offsets if o.numel() > 0],
-            lr=inner_lr,
-        )
-
+        inner_opt = torch.optim.SGD([ctrl_all], lr=inner_lr)
         lr_log_start = math.log10(max(inner_lr, 1e-10))
         lr_log_end = math.log10(max(inner_lr * 100.0, 1e-6))
 
         best_b_loss = float("inf")
         initial_b_loss = float("inf")
-        best_b_offsets = [o.detach().clone() for o in ctrl_offsets]
+        best_b_ctrl = ctrl_all.detach().clone()
 
         with torch.amp.autocast("cuda", enabled=False):
             for it in range(n_iters):
@@ -1310,18 +1474,9 @@ def _cage_deform_inner_loop(
 
                 inner_opt.zero_grad()
 
-                # Build displacement from cage
-                _bf = bracket_frac[b] if bracket_frac is not None else None
-                _bl = bracket_lo[b] if bracket_lo is not None else None
-                _bh = bracket_hi[b] if bracket_hi is not None else None
-                disp = _build_cage_displacement(
-                    ctrl_offsets, ctrl_pos_list, ctrl_normals_list,
-                    grid_rc_list, grid_rc_w_list,
-                    dts_b, val_f[b:b+1], (Z, Y, X),
-                    coord_scale=coord_scale,
-                    surface_masks=surf_masks_b,
-                    bracket_frac=_bf, bracket_lo=_bl, bracket_hi=_bh,
-                )  # (1, 3, Z, Y, X)
+                # Fast inner loop: gather + weighted sum + grid_sample
+                offset_vol = (voxel_weights * ctrl_all[voxel_indices]).sum(dim=-1)  # (Z,Y,X)
+                disp = (offset_vol.unsqueeze(0) * normal_vol).unsqueeze(0)  # (1,3,Z,Y,X)
 
                 warped_cg, warped_v = _apply_warp(
                     cos_gm_orig[b:b+1], val_f[b:b+1], disp,
@@ -1341,29 +1496,24 @@ def _cage_deform_inner_loop(
                 inner_opt.step()
 
                 with torch.no_grad():
-                    for o in ctrl_offsets:
-                        o.data.clamp_(-max_disp_scalar, max_disp_scalar)
+                    ctrl_all.data.clamp_(-max_disp_scalar, max_disp_scalar)
 
                     cur = loss.item()
                     if it == 0:
                         initial_b_loss = cur
                     if cur < best_b_loss:
                         best_b_loss = cur
-                        best_b_offsets = [o.detach().clone() for o in ctrl_offsets]
+                        best_b_ctrl = ctrl_all.detach().clone()
 
                     if verbose and (it % 10 == 0 or it == n_iters - 1):
-                        d_abs = torch.cat([o.abs() for o in ctrl_offsets])
-                        grad_norms = [
-                            o.grad.abs().mean().item() if o.grad is not None else 0.0
-                            for o in ctrl_offsets
-                        ]
-                        mean_grad = sum(grad_norms) / max(len(grad_norms), 1)
+                        d_abs = ctrl_all.abs()
+                        grad_mean = ctrl_all.grad.abs().mean().item() if ctrl_all.grad is not None else 0.0
                         print(
                             f"  b={b} it={it:4d}  lr={lr_now:10.1f}  "
                             f"loss={cur:10.6f}  best={best_b_loss:10.6f}  "
                             f"|off|_mean={d_abs.mean().item():.4f}  "
                             f"|off|_max={d_abs.max().item():.4f}  "
-                            f"grad_mean={mean_grad:.2e}",
+                            f"grad_mean={grad_mean:.2e}",
                             flush=True,
                         )
 
@@ -1372,14 +1522,8 @@ def _cage_deform_inner_loop(
 
         # Apply best offsets
         with torch.no_grad():
-            disp_best = _build_cage_displacement(
-                best_b_offsets, ctrl_pos_list, ctrl_normals_list,
-                grid_rc_list, grid_rc_w_list,
-                dts_b, val_f[b:b+1], (Z, Y, X),
-                coord_scale=coord_scale,
-                surface_masks=surf_masks_b,
-                bracket_frac=_bf, bracket_lo=_bl, bracket_hi=_bh,
-            )
+            offset_best = (voxel_weights * best_b_ctrl[voxel_indices]).sum(dim=-1)
+            disp_best = (offset_best.unsqueeze(0) * normal_vol).unsqueeze(0)
             w_cg, w_v = _apply_warp(cos_gm_orig[b:b+1], val_f[b:b+1], disp_best)
             best_warped_cg[b:b+1] = w_cg
             best_warped_v[b:b+1] = w_v
