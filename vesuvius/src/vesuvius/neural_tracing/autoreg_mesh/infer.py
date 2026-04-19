@@ -103,6 +103,33 @@ def _build_target_strip_positions(direction: str, grid_shape: tuple[int, int], *
     return torch.tensor(positions, dtype=torch.long, device=device)
 
 
+def _joint_sample_from_axis_logits(
+    z_logits: Tensor,
+    y_logits: Tensor,
+    x_logits: Tensor,
+    *,
+    coarse_grid_shape: tuple[int, int, int],
+    joint_valid_mask: Tensor | None = None,
+    greedy: bool,
+    temperature: float = 1.0,
+    top_k: int | None = None,
+    top_p: float | None = None,
+) -> tuple[int, dict[str, int]]:
+    gz, gy, gx = coarse_grid_shape
+    joint = z_logits.float()[:, None, None] + y_logits.float()[None, :, None] + x_logits.float()[None, None, :]
+    flat = joint.reshape(-1)
+    if joint_valid_mask is not None:
+        mask = joint_valid_mask.reshape(-1).to(torch.bool)
+        if mask.any():
+            flat = flat.masked_fill(~mask, float("-inf"))
+    flat_id = int(_sample_from_logits(flat, greedy=greedy, temperature=temperature, top_k=top_k, top_p=top_p).item())
+    z_id = flat_id // (gy * gx)
+    rem = flat_id % (gy * gx)
+    y_id = rem // gx
+    x_id = rem % gx
+    return flat_id, {"z": z_id, "y": y_id, "x": x_id}
+
+
 def _sample_from_logits(
     logits: Tensor,
     *,
@@ -254,19 +281,23 @@ def infer_autoreg_mesh(
 
             sampling_kwargs = dict(greedy=greedy, temperature=temperature, top_k=top_k, top_p=top_p)
             if str(outputs.get("coarse_prediction_mode", getattr(model, "coarse_prediction_mode", "joint_pointer"))) == "axis_factorized":
-                coarse_axis_ids = {}
-                for axis_name in ("z", "y", "x"):
-                    axis_logits = outputs["coarse_axis_logits"][axis_name][0, current_len - 1].float()
-                    coarse_axis_ids[axis_name] = int(_sample_from_logits(axis_logits, **sampling_kwargs).item())
-                coarse_id = int(
-                    model._flatten_coarse_axis_ids(
-                        torch.tensor(coarse_axis_ids["z"], dtype=torch.long, device=device),
-                        torch.tensor(coarse_axis_ids["y"], dtype=torch.long, device=device),
-                        torch.tensor(coarse_axis_ids["x"], dtype=torch.long, device=device),
-                    ).item()
+                joint_mask = outputs.get("coarse_constraint_joint_valid_mask")
+                step_mask = joint_mask[0, current_len - 1] if joint_mask is not None else None
+                coarse_id, coarse_axis_ids = _joint_sample_from_axis_logits(
+                    outputs["coarse_axis_logits"]["z"][0, current_len - 1],
+                    outputs["coarse_axis_logits"]["y"][0, current_len - 1],
+                    outputs["coarse_axis_logits"]["x"][0, current_len - 1],
+                    coarse_grid_shape=tuple(int(v) for v in model.coarse_grid_shape),
+                    joint_valid_mask=step_mask,
+                    **sampling_kwargs,
                 )
             else:
                 coarse_logits = outputs["coarse_logits"][0, current_len - 1].float()
+                joint_mask = outputs.get("coarse_constraint_joint_valid_mask")
+                if joint_mask is not None:
+                    step_mask = joint_mask[0, current_len - 1].to(torch.bool)
+                    if step_mask.any():
+                        coarse_logits = coarse_logits.masked_fill(~step_mask, float("-inf"))
                 coarse_id = int(_sample_from_logits(coarse_logits, **sampling_kwargs).item())
                 coarse_axis_ids = {
                     "z": int(outputs["pred_coarse_axis_ids"]["z"][0, current_len - 1].item()),
@@ -468,16 +499,12 @@ def infer_autoreg_mesh_cached(
 
             sampling_kwargs = dict(greedy=greedy, temperature=temperature, top_k=top_k, top_p=top_p)
             if str(outputs.get("coarse_prediction_mode", getattr(model, "coarse_prediction_mode", "joint_pointer"))) == "axis_factorized":
-                coarse_axis_ids = {}
-                for axis_name in ("z", "y", "x"):
-                    axis_logits = outputs["coarse_axis_logits"][axis_name][0, 0].float()
-                    coarse_axis_ids[axis_name] = int(_sample_from_logits(axis_logits, **sampling_kwargs).item())
-                coarse_id = int(
-                    model._flatten_coarse_axis_ids(
-                        torch.tensor(coarse_axis_ids["z"], dtype=torch.long, device=device),
-                        torch.tensor(coarse_axis_ids["y"], dtype=torch.long, device=device),
-                        torch.tensor(coarse_axis_ids["x"], dtype=torch.long, device=device),
-                    ).item()
+                coarse_id, coarse_axis_ids = _joint_sample_from_axis_logits(
+                    outputs["coarse_axis_logits"]["z"][0, 0],
+                    outputs["coarse_axis_logits"]["y"][0, 0],
+                    outputs["coarse_axis_logits"]["x"][0, 0],
+                    coarse_grid_shape=tuple(int(v) for v in model.coarse_grid_shape),
+                    **sampling_kwargs,
                 )
             else:
                 coarse_logits = outputs["coarse_logits"][0, 0].float()

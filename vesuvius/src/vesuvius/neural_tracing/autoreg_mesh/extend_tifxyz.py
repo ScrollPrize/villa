@@ -21,6 +21,7 @@ from vesuvius.neural_tracing.autoreg_mesh.dataset import autoreg_mesh_collate
 from vesuvius.neural_tracing.autoreg_mesh.infer import (
     _build_target_strip_coords,
     _build_target_strip_positions,
+    _joint_sample_from_axis_logits,
     _sample_from_logits,
     infer_autoreg_mesh,
 )
@@ -966,19 +967,23 @@ def _decode_single_step_from_outputs(
 ) -> tuple[int, list[int], np.ndarray, float]:
     device = outputs["stop_logits"].device
     if str(outputs.get("coarse_prediction_mode", getattr(model, "coarse_prediction_mode", "joint_pointer"))) == "axis_factorized":
-        coarse_axis_ids = {}
-        for axis_name in ("z", "y", "x"):
-            axis_logits = outputs["coarse_axis_logits"][axis_name][sample_idx, step_idx].float()
-            coarse_axis_ids[axis_name] = int(_sample_from_logits(axis_logits, greedy=greedy).item())
-        coarse_id = int(
-            model._flatten_coarse_axis_ids(
-                torch.tensor(coarse_axis_ids["z"], dtype=torch.long, device=device),
-                torch.tensor(coarse_axis_ids["y"], dtype=torch.long, device=device),
-                torch.tensor(coarse_axis_ids["x"], dtype=torch.long, device=device),
-            ).item()
+        joint_mask = outputs.get("coarse_constraint_joint_valid_mask")
+        step_mask = joint_mask[sample_idx, step_idx] if joint_mask is not None else None
+        coarse_id, coarse_axis_ids = _joint_sample_from_axis_logits(
+            outputs["coarse_axis_logits"]["z"][sample_idx, step_idx],
+            outputs["coarse_axis_logits"]["y"][sample_idx, step_idx],
+            outputs["coarse_axis_logits"]["x"][sample_idx, step_idx],
+            coarse_grid_shape=tuple(int(v) for v in model.coarse_grid_shape),
+            joint_valid_mask=step_mask,
+            greedy=greedy,
         )
     else:
         coarse_logits = outputs["coarse_logits"][sample_idx, step_idx].float()
+        joint_mask = outputs.get("coarse_constraint_joint_valid_mask")
+        if joint_mask is not None:
+            step_mask = joint_mask[sample_idx, step_idx].to(torch.bool)
+            if step_mask.any():
+                coarse_logits = coarse_logits.masked_fill(~step_mask, float("-inf"))
         coarse_id = int(_sample_from_logits(coarse_logits, greedy=greedy).item())
     offset_bins = []
     for axis, bins in enumerate(model.offset_num_bins):
