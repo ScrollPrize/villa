@@ -1465,6 +1465,18 @@ def _cage_deform_inner_loop(
         initial_b_loss = float("inf")
         best_b_ctrl = ctrl_all.detach().clone()
 
+        # Pre-compute warp grid base (identity meshgrid — constant)
+        _gz = torch.arange(Z, device=device, dtype=torch.float32)
+        _gy = torch.arange(Y, device=device, dtype=torch.float32)
+        _gx = torch.arange(X, device=device, dtype=torch.float32)
+        _grid_z, _grid_y, _grid_x = torch.meshgrid(_gz, _gy, _gx, indexing="ij")
+        warp_base = torch.stack([_grid_x, _grid_y, _grid_z], dim=-1).unsqueeze(0)  # (1,Z,Y,X,3)
+
+        # Flatten voxel_indices for embedding_bag
+        K_total = voxel_indices.shape[-1]
+        _eb_idx = voxel_indices.reshape(-1, K_total)  # (ZYX, K)
+        _eb_wgt = voxel_weights.reshape(-1, K_total)  # (ZYX, K)
+
         with torch.amp.autocast("cuda", enabled=False):
             for it in range(n_iters):
                 frac_it = it / max(n_iters - 1, 1)
@@ -1474,24 +1486,32 @@ def _cage_deform_inner_loop(
 
                 inner_opt.zero_grad()
 
-                # Fast inner loop: gather + weighted sum + grid_sample
-                offset_vol = (voxel_weights * ctrl_all[voxel_indices]).sum(dim=-1)  # (Z,Y,X)
-                disp = (offset_vol.unsqueeze(0) * normal_vol).unsqueeze(0)  # (1,3,Z,Y,X)
+                # Fast inner loop: gather + weighted sum
+                offset_vol = (_eb_wgt * ctrl_all[_eb_idx]).sum(dim=-1).reshape(Z, Y, X)
+                disp_3ch = offset_vol.unsqueeze(0) * normal_vol  # (3, Z, Y, X)
 
-                warped_cg, warped_v = _apply_warp(
-                    cos_gm_orig[b:b+1], val_f[b:b+1], disp,
-                )
+                # Inline warp (skip _build_warp_grid — reuse cached base)
+                disp_grid = disp_3ch.permute(1, 2, 3, 0).flip(-1).unsqueeze(0)  # (1,Z,Y,X,3) dz,dy,dx→dx,dy,dz
+                grid = warp_base + disp_grid
+                grid[..., 0] = 2.0 * grid[..., 0] / max(X - 1, 1) - 1.0
+                grid[..., 1] = 2.0 * grid[..., 1] / max(Y - 1, 1) - 1.0
+                grid[..., 2] = 2.0 * grid[..., 2] / max(Z - 1, 1) - 1.0
+
+                cos_gm_masked = cos_gm_orig[b:b+1] * val_f[b:b+1]
+                warped_cg = F.grid_sample(cos_gm_masked, grid, mode="bilinear",
+                                          padding_mode="zeros", align_corners=True)
+                warped_v = F.grid_sample(val_f[b:b+1], grid, mode="bilinear",
+                                         padding_mode="zeros", align_corners=True)
+                warped_v = (warped_v >= 1.0 - 1e-6).float()
+                warped_cg = warped_cg * warped_v
+
+                # Single-scale L1 loss (fast)
                 cos_w = warped_cg[:, 1:2] * 20.0
-                loss = (
-                    scale_loss_mse_fn(
-                        pred_f[b:b+1, 0:1], warped_cg[:, 0:1],
-                        mask=warped_v, weight=cos_w,
-                    )
-                    + scale_loss_l1_fn(
-                        pred_f[b:b+1, 1:2], warped_cg[:, 1:2],
-                        mask=warped_v, weight=cos_w,
-                    )
-                )
+                diff_cos = (pred_f[b:b+1, 0:1] - warped_cg[:, 0:1]).abs() * warped_v * cos_w
+                diff_mag = (pred_f[b:b+1, 1:2] - warped_cg[:, 1:2]).abs() * warped_v * cos_w
+                n_valid = warped_v.sum().clamp(min=1)
+                loss = (diff_cos.sum() + diff_mag.sum()) / n_valid
+
                 loss.backward()
                 inner_opt.step()
 
