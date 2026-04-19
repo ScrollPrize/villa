@@ -1537,37 +1537,54 @@ def _pick_refine_mode(
 
     Returns (mode_index, scale_sequence) where scale_sequence is a
     list of (offset, has_prior) tuples.
+
+    Probability split (when all scales available):
+      1/3  single-scale  (modes 0–2, ~11% each)
+      1/2  cross-scale chains  (modes 3–5, ~17% each)
+      1/6  self-refine N→N  (mode 6)
+
+    Modes requiring unavailable offsets are excluded and their weight
+    redistributed to the remaining modes.
     """
+    # Weights: [m0, m1, m2, m3, m4, m5, m6]
+    #           single-scale   chains        self-refine
+    base_weights = np.array([2, 2, 2, 3, 3, 3, 1], dtype=np.float64)
+
+    def _draw():
+        # Filter modes to those whose offsets are all available
+        feasible = np.zeros(7, dtype=np.float64)
+        for mi in range(6):
+            needed = {off for off, _ in REFINE_MODES_FIXED[mi]}
+            if needed.issubset(available_offsets):
+                feasible[mi] = base_weights[mi]
+        # Mode 6: needs at least one available offset
+        if available_offsets:
+            feasible[6] = base_weights[6]
+        total = feasible.sum()
+        if total == 0:
+            return 1, 0  # fallback: scale 0 only
+        probs = feasible / total
+        mode_idx = int(np.random.choice(7, p=probs))
+        refine_n = int(np.random.choice(
+            sorted(available_offsets),
+        )) if available_offsets else 0
+        return mode_idx, refine_n
+
     if is_dist:
         buf = torch.zeros(2, dtype=torch.long, device=device)
         if rank == 0:
-            mode_idx = int(np.random.randint(0, 7))
-            # For mode 6 (self-refine), pick N from available offsets
-            refine_n = int(np.random.choice(
-                sorted(available_offsets),
-            )) if available_offsets else 0
-            buf[0] = mode_idx
-            buf[1] = refine_n
+            buf[0], buf[1] = _draw()
         dist.broadcast(buf, src=0)
         mode_idx = int(buf[0].item())
         refine_n = int(buf[1].item())
     else:
-        mode_idx = int(np.random.randint(0, 7))
-        refine_n = int(np.random.choice(
-            sorted(available_offsets),
-        )) if available_offsets else 0
+        mode_idx, refine_n = _draw()
 
     if mode_idx < 6:
         seq = REFINE_MODES_FIXED[mode_idx]
     else:
         # Mode 6: self-refinement N → N
         seq = [(refine_n, False), (refine_n, True)]
-
-    # Check availability: all offsets in the sequence must be available.
-    # If not, fall back to mode 1 (scale 0 only).
-    needed = {off for off, _ in seq}
-    if not needed.issubset(available_offsets):
-        seq = [(0, False)]
 
     return mode_idx, seq
 
@@ -1774,14 +1791,19 @@ def run_refine_chain(
                     continue
                 ct, tgt, val, dsm, ddm, daw = scale_data[:6]
 
-            # Build prior from previous pass
+            # Resample previous prediction to this scale (always, for vis)
             prior_resampled = None
+            if prev_pred is not None:
+                prior_resampled = _resample_prior(
+                    prev_pred.detach(), prev_offset, offset, P,
+                )
+
+            # Build model input
             if refine:
-                if has_prior and prev_pred is not None:
-                    prior_resampled = _resample_prior(
-                        prev_pred.detach(), prev_offset, offset, P,
-                    )
-                model_in = _build_refine_input(ct, prior_resampled, offset)
+                if has_prior and prior_resampled is not None:
+                    model_in = _build_refine_input(ct, prior_resampled, offset)
+                else:
+                    model_in = _build_refine_input(ct, None, offset)
             else:
                 model_in = ct
 
@@ -1797,6 +1819,17 @@ def run_refine_chain(
                     mode="trilinear", align_corners=False,
                 )
 
+            # Resample prior to GT resolution for vis
+            prior_for_vis = None
+            if prior_resampled is not None:
+                pr = prior_resampled
+                if pr.shape[2:] != tgt.shape[2:]:
+                    pr = F.interpolate(
+                        pr, size=tgt.shape[2:],
+                        mode="trilinear", align_corners=False,
+                    )
+                prior_for_vis = pr.detach().cpu()
+
             results.append({
                 "offset": offset,
                 "has_prior": has_prior,
@@ -1804,8 +1837,7 @@ def run_refine_chain(
                 "gt": tgt.detach().cpu(),
                 "validity": val.detach().cpu(),
                 "ct": ct.detach().cpu(),
-                "prior": (prior_resampled.detach().cpu()
-                          if prior_resampled is not None else None),
+                "prior_resampled": prior_for_vis,
             })
 
             prev_pred = pred
@@ -2619,6 +2651,12 @@ def train(
             # Intensity augmentation on CT only (spatial is already done).
             image = augment_intensity(image)
 
+            # Defaults for logging variables that may not be set by
+            # both the refine and non-refine paths.
+            cage_deform_active = False
+            deform_improvement = 1.0
+            mode_idx = -1
+
             # --- Multi-scale refinement path ---
             if refine:
                 mode_idx, scale_seq = _pick_refine_mode(
@@ -2635,6 +2673,11 @@ def train(
                     dir_sparse_mask = dir_sparse_mask[:B_eff]
                     dir_dense_mask = dir_dense_mask[:B_eff]
                     dir_axis_weight = dir_axis_weight[:B_eff]
+                    _batch_dts = _batch_dts[:B_eff]
+                    if _bracket_frac is not None:
+                        _bracket_frac = _bracket_frac[:B_eff]
+                        _bracket_lo = _bracket_lo[:B_eff]
+                        _bracket_hi = _bracket_hi[:B_eff]
                     batch = _filter_batch(batch, list(range(B_eff)))
 
                 # Save scale-0 GT
@@ -2693,6 +2736,7 @@ def train(
                             deform_enabled
                             and cage_key in batch
                             and batch[cage_key] is not None
+                            and f"cage_grid_rc{cage_suffix}" in batch
                         )
                         if cage_active_pass:
                             cs = {-1: 0.5, 0: 1.0, 1: 2.0}.get(offset, 1.0)
@@ -2714,8 +2758,6 @@ def train(
                                 n_iters=deform_inner_iters,
                                 inner_lr=deform_inner_lr,
                                 max_frac=deform_max_frac,
-                                scale_loss_mse_fn=scale_loss_mse,
-                                scale_loss_l1_fn=scale_loss_l1,
                                 coord_scale=cs,
                                 bracket_frac=pass_bfrac,
                                 bracket_lo=pass_blo,
@@ -2769,7 +2811,15 @@ def train(
                         prev_pred = pred_pass
                         prev_offset = offset
 
+                    # All passes skipped (no scale data available)
+                    if prev_pred is None:
+                        n_skipped += 1
+                        continue
+
                     # Set variables for logging (use last pass values)
+                    cage_deform_active = cage_active_pass
+                    if cage_active_pass:
+                        deform_improvement = _deform_improv
                     pred = prev_pred
                     loss = total_loss
                     loss_cos = l_cos
@@ -2917,6 +2967,11 @@ def train(
                     dir_dense_mask = dir_dense_mask.index_select(0, keep)
                     dir_axis_weight = dir_axis_weight.index_select(0, keep)
                     image = image.index_select(0, keep)
+                    _batch_dts = [_batch_dts[i] for i in keep_list]
+                    if _bracket_frac is not None:
+                        _bracket_frac = _bracket_frac.index_select(0, keep)
+                        _bracket_lo = _bracket_lo.index_select(0, keep)
+                        _bracket_hi = _bracket_hi.index_select(0, keep)
                     batch = _filter_batch(batch, keep_list)
 
                 # --- GT deformation (cage transform) ---

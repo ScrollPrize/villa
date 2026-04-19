@@ -1364,7 +1364,16 @@ class TifxyzLasagnaDataset(Dataset):
                 try:
                     arr_m1 = _vol_group[str(target_level_m1)]
                 except (KeyError, IndexError):
-                    pass
+                    # Log once per dataset to help diagnose missing levels
+                    _miss_key = f"_warned_m1_{patch.dataset_idx}"
+                    if not getattr(self, _miss_key, False):
+                        avail = sorted(k for k in _vol_group.keys()
+                                       if not k.startswith("."))
+                        print(f"[tifxyz_dataset] coarse level {target_level_m1} "
+                              f"not in zarr group (base={patch.scale}, "
+                              f"available={avail}, ds={patch.dataset_name})",
+                              flush=True)
+                        setattr(self, _miss_key, True)
 
             if arr_m1 is not None:
                 coarse_offset = np.array(
@@ -1594,12 +1603,12 @@ def collate_variable_surfaces(batch):
         "surface_chain_info": surface_chain_info,  # list of list[dict]
         "patch_info": patch_infos,
     }
-    if "cage_ctrl_pos" in batch[0]:
+    if all("cage_ctrl_pos" in b for b in batch):
         out["cage_ctrl_pos"] = [b["cage_ctrl_pos"] for b in batch]
         out["cage_ctrl_normals"] = [b["cage_ctrl_normals"] for b in batch]
         out["cage_grid_rc"] = [b["cage_grid_rc"] for b in batch]
         out["cage_grid_rc_w"] = [b["cage_grid_rc_w"] for b in batch]
-    if "surface_masks_fine" in batch[0]:
+    if all("surface_masks_fine" in b for b in batch):
         out["surface_masks_fine"] = [b["surface_masks_fine"] for b in batch]
         out["tensor_moments_fine"] = torch.stack(
             [b["tensor_moments_fine"] for b in batch],
@@ -1607,15 +1616,15 @@ def collate_variable_surfaces(batch):
         out["normals_valid_fine"] = torch.stack(
             [b["normals_valid_fine"] for b in batch],
         )
-    if "cage_ctrl_pos_fine" in batch[0]:
+    if all("cage_ctrl_pos_fine" in b for b in batch):
         out["cage_ctrl_pos_fine"] = [b["cage_ctrl_pos_fine"] for b in batch]
         out["cage_ctrl_normals_fine"] = [b["cage_ctrl_normals_fine"] for b in batch]
         out["cage_grid_rc_fine"] = [b["cage_grid_rc_fine"] for b in batch]
         out["cage_grid_rc_w_fine"] = [b["cage_grid_rc_w_fine"] for b in batch]
-    # Coarse scale (-1) data
-    if "image_m1" in batch[0]:
+    # Coarse scale (-1) data — only if ALL samples have it
+    if all("image_m1" in b for b in batch):
         out["image_m1"] = torch.stack([b["image_m1"] for b in batch])
-    if "surface_masks_m1" in batch[0]:
+    if all("surface_masks_m1" in b for b in batch):
         out["surface_masks_m1"] = [b["surface_masks_m1"] for b in batch]
         out["tensor_moments_m1"] = torch.stack(
             [b["tensor_moments_m1"] for b in batch],
@@ -1623,13 +1632,13 @@ def collate_variable_surfaces(batch):
         out["normals_valid_m1"] = torch.stack(
             [b["normals_valid_m1"] for b in batch],
         )
-    if "cage_ctrl_pos_m1" in batch[0]:
+    if all("cage_ctrl_pos_m1" in b for b in batch):
         out["cage_ctrl_pos_m1"] = [b["cage_ctrl_pos_m1"] for b in batch]
         out["cage_ctrl_normals_m1"] = [b["cage_ctrl_normals_m1"] for b in batch]
         out["cage_grid_rc_m1"] = [b["cage_grid_rc_m1"] for b in batch]
         out["cage_grid_rc_w_m1"] = [b["cage_grid_rc_w_m1"] for b in batch]
-    # Fine CT image
-    if "image_p1" in batch[0]:
+    # Fine CT image — only if ALL samples have it
+    if all("image_p1" in b for b in batch):
         out["image_p1"] = torch.stack([b["image_p1"] for b in batch])
     if "surface_geometry" in batch[0]:
         out["surface_geometry"] = [b["surface_geometry"] for b in batch]

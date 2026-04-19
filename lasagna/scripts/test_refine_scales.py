@@ -53,10 +53,52 @@ def _to_u8(arr):
     return (np.clip(arr, 0, 1) * 255).astype(np.uint8)
 
 
-def _save_chain_tif(passes, chain_name, aug_str, sample_idx, output_dir):
+def _compute_z_indices(passes, patch_info, patch_size):
+    """Compute per-pass z-indices that map to the same world z-position.
+
+    Reference: mid-z of the scale-0 volume.
+    """
+    P = patch_size
+    pi0 = patch_info[0]
+    world_min = pi0["world_min"]
+    ref_world_z = float(world_min[0]) + P / 2.0  # base mid in world coords
+
+    z_indices = []
+    for p in passes:
+        offset = p["offset"]
+        pZ = p["pred"].shape[2]
+        if offset == 0:
+            z_idx = pZ // 2
+        elif offset == -1:
+            coarse_offset = pi0.get("coarse_offset")
+            if coarse_offset is not None:
+                base_center_z = float(world_min[0]) + P / 2.0
+                coarse_min_z = (base_center_z - P) / 2.0 + float(coarse_offset[0]) / 2.0
+                # world_z = coarse_min_z * 2 + z_idx * 2
+                z_idx = int(round((ref_world_z - coarse_min_z * 2) / 2.0))
+            else:
+                z_idx = pZ // 2
+        elif offset == 1:
+            fine_offset = pi0.get("fine_offset")
+            if fine_offset is not None:
+                # world_z = (world_min[0] + fine_offset[0]) + z_idx * 0.5
+                z_idx = int(round((ref_world_z - float(world_min[0]) - float(fine_offset[0])) * 2.0))
+            else:
+                z_idx = pZ // 2
+        else:
+            z_idx = pZ // 2
+        z_indices.append(max(0, min(z_idx, pZ - 1)))
+    return z_indices
+
+
+def _save_chain_tif(passes, chain_name, aug_str, sample_idx, output_dir,
+                    patch_info=None, patch_size=192):
     """Save multi-row TIF: one row per pass in the chain.
 
-    Each row: CT | pred_cos | gt_cos | diff | prior_cos (if available)
+    Each row: CT | resampled_prior | gt_cos | pred_cos | pred_diff | prior_diff
+    resampled_prior = previous pass's prediction resampled to this scale.
+    prior_diff = |resampled_prior - gt| tests cross-scale alignment.
+    All rows use the same world z-position for spatial comparability.
     """
     try:
         from PIL import Image
@@ -66,49 +108,42 @@ def _save_chain_tif(passes, chain_name, aug_str, sample_idx, output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Compute z-indices aligned to the same world position
+    if patch_info is not None:
+        z_indices = _compute_z_indices(passes, patch_info, patch_size)
+    else:
+        z_indices = [p["pred"].shape[2] // 2 for p in passes]
+
     rows = []
-    for pi, p in enumerate(passes):
+    for pi, (p, mid) in enumerate(zip(passes, z_indices)):
         pred = p["pred"]
         gt = p["gt"]
         val = p["validity"]
         ct = p["ct"]
-        prior = p.get("prior")
-
-        pZ = pred.shape[2]
-        mid = pZ // 2
+        prior = p.get("prior_resampled")  # resampled prev pred, always computed
 
         pred_cos = pred[0, 0, mid].float().numpy()
         gt_cos = gt[0, 0, mid].float().numpy()
         val_np = val[0, 0, mid].float().numpy()
-        diff = np.abs(pred_cos - gt_cos) * val_np
+        pred_diff = np.abs(pred_cos - gt_cos) * val_np
 
-        # CT might be at different resolution — resize to match pred
-        ct_slice = ct[0, 0, ct.shape[2] // 2].float().numpy()
-        if ct_slice.shape != pred_cos.shape:
-            ct_t = torch.as_tensor(ct_slice).unsqueeze(0).unsqueeze(0).float()
-            ct_t = F.interpolate(ct_t, size=pred_cos.shape, mode="bilinear",
-                                 align_corners=False)
-            ct_slice = ct_t[0, 0].numpy()
+        ct_slice = ct[0, 0, mid].float().numpy()
+
+        # Resampled prior prediction from previous pass
+        if prior is not None:
+            prior_cos = prior[0, 0, mid].float().numpy()
+        else:
+            prior_cos = np.zeros_like(pred_cos)
+        prior_diff = np.abs(prior_cos - gt_cos) * val_np
 
         panels = [
             _to_u8(ct_slice),
-            _to_u8(pred_cos),
+            _to_u8(prior_cos),
             _to_u8(gt_cos),
-            _to_u8(diff),
+            _to_u8(pred_cos),
+            _to_u8(pred_diff),
+            _to_u8(prior_diff),
         ]
-
-        # Prior (resampled output from previous pass fed as input)
-        if prior is not None:
-            prior_cos = prior[0, 0, prior.shape[2] // 2].float().numpy()
-            if prior_cos.shape != pred_cos.shape:
-                pr_t = torch.as_tensor(prior_cos).unsqueeze(0).unsqueeze(0).float()
-                pr_t = F.interpolate(pr_t, size=pred_cos.shape, mode="bilinear",
-                                     align_corners=False)
-                prior_cos = pr_t[0, 0].numpy()
-            panels.append(_to_u8(prior_cos))
-        else:
-            # Empty panel for alignment
-            panels.append(np.zeros_like(panels[0]))
 
         row_img = np.concatenate(panels, axis=1)
         rows.append(row_img)
@@ -250,7 +285,8 @@ def main():
                   f"{pi:4d}  {p['offset']:>3d}  {mse_cos:10.6f}  {l1_mag:10.6f}",
                   flush=True)
 
-        _save_chain_tif(mode_results, chain_name, aug_str, si, output_dir)
+        _save_chain_tif(mode_results, chain_name, aug_str, si, output_dir,
+                        patch_info=batch["patch_info"], patch_size=patch_size)
 
     print("\nDone.", flush=True)
 

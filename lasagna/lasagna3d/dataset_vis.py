@@ -355,11 +355,24 @@ def _load_model(model_path: str, patch_size: int, device):
     from train_tifxyz import build_model
     key = (model_path, patch_size, str(device))
     if key not in _MODEL_CACHE:
+        # Auto-detect refine mode: check checkpoint metadata first,
+        # then fall back to inspecting the first conv weight shape.
+        ckpt = torch.load(model_path, map_location="cpu", weights_only=False)
+        is_refine = False
+        if isinstance(ckpt, dict):
+            is_refine = bool(ckpt.get("refine", False))
+            if not is_refine:
+                sd = ckpt.get("state_dict", ckpt)
+                for k, v in sd.items():
+                    if "conv" in k and v.dim() == 5 and v.shape[1] == 11:
+                        is_refine = True
+                        break
         model, _, _ = build_model(
             patch_size=patch_size, device=str(device), weights=model_path,
-            strict=True,
+            strict=True, refine=is_refine,
         )
         model.eval()
+        model._is_refine = is_refine
         _MODEL_CACHE[key] = model
     return _MODEL_CACHE[key]
 
@@ -513,6 +526,19 @@ def _compute_inference_output(batch, training_output, model_path, device,
         validity_t = torch.from_numpy(validity_np).view(1, 1, *validity_np.shape).to(device)
         normals_valid_t = torch.from_numpy(normals_valid_np).view(
             1, 1, *normals_valid_np.shape).to(device)
+
+        # Refine models expect 11ch input; wrap 1ch CT with zero prior.
+        # Detect via _is_refine flag (set by _load_model) or by checking
+        # whether the first conv expects more than 1 input channel.
+        _needs_refine_wrap = getattr(model, "_is_refine", False)
+        if not _needs_refine_wrap:
+            for p in model.parameters():
+                if p.dim() == 5 and p.shape[1] == 11:
+                    _needs_refine_wrap = True
+                    break
+        if _needs_refine_wrap and img_for_model.shape[1] == 1:
+            from train_tifxyz import _build_refine_input
+            img_for_model = _build_refine_input(img_for_model, None, 0)
 
         with torch.no_grad(), torch.amp.autocast(
             device_type=device.type, dtype=torch.bfloat16, enabled=True,
