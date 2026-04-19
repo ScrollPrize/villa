@@ -762,9 +762,12 @@ class AutoregMeshModel(nn.Module):
     def _factorized_axis_memory(self, memory_tokens: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         gz, gy, gx = self.coarse_grid_shape
         memory_5d = memory_tokens.reshape(memory_tokens.shape[0], gz, gy, gx, memory_tokens.shape[-1])
-        z_memory = memory_5d.mean(dim=(2, 3))
-        y_memory = memory_5d.mean(dim=(1, 3))
-        x_memory = memory_5d.mean(dim=(1, 2))
+        # Compute in float32: averaging 256+ bf16 values loses precision that
+        # propagates into pointer keys and gets amplified by temperature scaling.
+        mem_f = memory_5d.float()
+        z_memory = mem_f.mean(dim=(2, 3))
+        y_memory = mem_f.mean(dim=(1, 3))
+        x_memory = mem_f.mean(dim=(1, 2))
         return z_memory, y_memory, x_memory
 
     def _compute_coarse_outputs(
@@ -782,11 +785,17 @@ class AutoregMeshModel(nn.Module):
             "coarse_constraint_target_outside_rate": zeros,
         }
         if self.coarse_prediction_mode == "joint_pointer":
-            pointer_q = F.normalize(self.pointer_query(hidden), dim=-1)
-            pointer_k = F.normalize(self.pointer_key(memory_tokens), dim=-1)
-            coarse_logits = torch.einsum("btd,bnd->btn", pointer_q, pointer_k) / self.pointer_temperature
-            if coarse_valid_mask is not None:
-                coarse_logits = coarse_logits.masked_fill(~coarse_valid_mask, torch.finfo(coarse_logits.dtype).min)
+            # Compute pointer attention in float32: autocast casts einsum inputs
+            # to bf16 which, after temperature scaling (/0.25 = 4x amplification),
+            # introduces enough noise to flip the argmax on a peaked distribution.
+            with torch.autocast(device_type=hidden.device.type, enabled=False):
+                hidden_f = hidden.float()
+                mem_f = memory_tokens.float()
+                pointer_q = F.normalize(self.pointer_query(hidden_f), dim=-1)
+                pointer_k = F.normalize(self.pointer_key(mem_f), dim=-1)
+                coarse_logits = torch.einsum("btd,bnd->btn", pointer_q, pointer_k) / self.pointer_temperature
+                if coarse_valid_mask is not None:
+                    coarse_logits = coarse_logits.masked_fill(~coarse_valid_mask, torch.finfo(coarse_logits.dtype).min)
             pred_coarse_ids = coarse_logits.argmax(dim=-1)
             z_ids, y_ids, x_ids = self._unflatten_coarse_ids(pred_coarse_ids)
             return {
@@ -800,37 +809,41 @@ class AutoregMeshModel(nn.Module):
             }
 
         z_memory, y_memory, x_memory = self._factorized_axis_memory(memory_tokens)
-        z_query = F.normalize(self.pointer_query_z(hidden), dim=-1)
-        y_query = F.normalize(self.pointer_query_y(hidden), dim=-1)
-        x_query = F.normalize(self.pointer_query_x(hidden), dim=-1)
-        z_key = F.normalize(self.pointer_key_z(z_memory), dim=-1)
-        y_key = F.normalize(self.pointer_key_y(y_memory), dim=-1)
-        x_key = F.normalize(self.pointer_key_x(x_memory), dim=-1)
-        z_logits = torch.einsum("btd,bzd->btz", z_query, z_key) / self.pointer_temperature
-        y_logits = torch.einsum("btd,byd->bty", y_query, y_key) / self.pointer_temperature
-        x_logits = torch.einsum("btd,bxd->btx", x_query, x_key) / self.pointer_temperature
-        z_valid = y_valid = x_valid = None
-        if coarse_valid_mask is not None:
+        # Pointer attention in float32 — see joint_pointer branch comment above.
+        # _factorized_axis_memory already returns float32 tensors.
+        with torch.autocast(device_type=hidden.device.type, enabled=False):
+            hidden_f = hidden.float()
+            z_query = F.normalize(self.pointer_query_z(hidden_f), dim=-1)
+            y_query = F.normalize(self.pointer_query_y(hidden_f), dim=-1)
+            x_query = F.normalize(self.pointer_query_x(hidden_f), dim=-1)
+            z_key = F.normalize(self.pointer_key_z(z_memory), dim=-1)
+            y_key = F.normalize(self.pointer_key_y(y_memory), dim=-1)
+            x_key = F.normalize(self.pointer_key_x(x_memory), dim=-1)
+            z_logits = torch.einsum("btd,bzd->btz", z_query, z_key) / self.pointer_temperature
+            y_logits = torch.einsum("btd,byd->bty", y_query, y_key) / self.pointer_temperature
+            x_logits = torch.einsum("btd,bxd->btx", x_query, x_key) / self.pointer_temperature
+            z_valid = y_valid = x_valid = None
+            if coarse_valid_mask is not None:
+                gz, gy, gx = self.coarse_grid_shape
+                mask_5d = coarse_valid_mask.reshape(coarse_valid_mask.shape[0], coarse_valid_mask.shape[1], gz, gy, gx)
+                z_valid = mask_5d.any(dim=(3, 4))
+                y_valid = mask_5d.any(dim=(2, 4))
+                x_valid = mask_5d.any(dim=(2, 3))
+                z_logits = z_logits.masked_fill(~z_valid, torch.finfo(z_logits.dtype).min)
+                y_logits = y_logits.masked_fill(~y_valid, torch.finfo(y_logits.dtype).min)
+                x_logits = x_logits.masked_fill(~x_valid, torch.finfo(x_logits.dtype).min)
             gz, gy, gx = self.coarse_grid_shape
-            mask_5d = coarse_valid_mask.reshape(coarse_valid_mask.shape[0], coarse_valid_mask.shape[1], gz, gy, gx)
-            z_valid = mask_5d.any(dim=(3, 4))
-            y_valid = mask_5d.any(dim=(2, 4))
-            x_valid = mask_5d.any(dim=(2, 3))
-            z_logits = z_logits.masked_fill(~z_valid, torch.finfo(z_logits.dtype).min)
-            y_logits = y_logits.masked_fill(~y_valid, torch.finfo(y_logits.dtype).min)
-            x_logits = x_logits.masked_fill(~x_valid, torch.finfo(x_logits.dtype).min)
-        gz, gy, gx = self.coarse_grid_shape
-        joint = (
-            z_logits[..., :, None, None]
-            + y_logits[..., None, :, None]
-            + x_logits[..., None, None, :]
-        )
-        if coarse_valid_mask is not None:
-            joint = joint.masked_fill(
-                ~coarse_valid_mask.view(*joint.shape[:2], gz, gy, gx),
-                torch.finfo(joint.dtype).min,
+            joint = (
+                z_logits[..., :, None, None]
+                + y_logits[..., None, :, None]
+                + x_logits[..., None, None, :]
             )
-        flat = joint.reshape(*joint.shape[:2], -1).argmax(dim=-1)
+            if coarse_valid_mask is not None:
+                joint = joint.masked_fill(
+                    ~coarse_valid_mask.view(*joint.shape[:2], gz, gy, gx),
+                    torch.finfo(joint.dtype).min,
+                )
+            flat = joint.reshape(*joint.shape[:2], -1).argmax(dim=-1)
         z_ids = flat // (gy * gx)
         rem = flat % (gy * gx)
         y_ids = rem // gx
