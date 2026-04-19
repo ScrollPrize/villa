@@ -244,6 +244,9 @@ def compute_batch_targets(
         edt_torch, edt_torch_with_indices, detect_same_surface_groups,
     )
 
+    all_dts_batch: list[list[torch.Tensor]] = []  # per-sample per-surface EDTs
+    all_fts_batch: list[list[torch.Tensor] | None] = []
+
     for b in range(B):
         # Convert surface masks to CUDA bool tensors
         masks_b = surface_masks_list[b].to(device)  # (N, Z, Y, X)
@@ -315,6 +318,14 @@ def compute_batch_targets(
             list(result.get("merged_chain_info", surface_chain_info_batch[b]))
         )
 
+        # EDT for cage deformation — always needed (backfill if not computed)
+        if dts is None:
+            dts = []
+            for m in cuda_masks:
+                dts.append(edt_torch((~m).to(torch.uint8)))
+        all_dts_batch.append(dts)
+        all_fts_batch.append(fts)
+
     targets = torch.stack(all_targets, dim=0)       # (B, 8, Z, Y, X)
     validity = torch.stack(all_validity, dim=0).unsqueeze(1).float()  # (B, 1, Z, Y, X)
     dir_sparse_mask = torch.stack(all_sparse_masks, dim=0).unsqueeze(1).float()
@@ -325,6 +336,7 @@ def compute_batch_targets(
         targets, validity,
         dir_sparse_mask, dir_dense_mask, dir_axis_weight,
         merge_groups_batch, merged_masks_batch, merged_chain_info_batch,
+        all_dts_batch,
     )
 
 
@@ -1042,6 +1054,293 @@ def _apply_warp(cos_gm, validity, deform_full):
     return warped_cg, warped_v
 
 
+# ---------------------------------------------------------------------------
+# Cage deformation: surface control points → volume displacement
+# ---------------------------------------------------------------------------
+
+def _splat_to_volume(pts: torch.Tensor, vals: torch.Tensor,
+                     shape: Tuple[int, int, int]) -> torch.Tensor:
+    """Trilinear splat values at fractional 3D positions into a volume.
+
+    Args:
+        pts: (N, 3) float — ZYX positions
+        vals: (N,) or (N, C) float — values to splat
+        shape: (Z, Y, X)
+
+    Returns: (Z, Y, X) or (C, Z, Y, X) volume with weight-normalized values
+    """
+    Z, Y, X = shape
+    device = pts.device
+    is_1d = vals.dim() == 1
+    if is_1d:
+        vals = vals.unsqueeze(1)  # (N, 1)
+    C = vals.shape[1]
+
+    vol = torch.zeros(C, Z, Y, X, device=device, dtype=vals.dtype)
+    wgt = torch.zeros(1, Z, Y, X, device=device, dtype=vals.dtype)
+
+    # Clamp to valid range
+    pz = pts[:, 0].clamp(0, Z - 1.001)
+    py = pts[:, 1].clamp(0, Y - 1.001)
+    px = pts[:, 2].clamp(0, X - 1.001)
+
+    z0 = pz.long()
+    y0 = py.long()
+    x0 = px.long()
+    dz = pz - z0.float()
+    dy = py - y0.float()
+    dx = px - x0.float()
+
+    for oz in range(2):
+        wz = dz if oz else (1 - dz)
+        zi = (z0 + oz).clamp(0, Z - 1)
+        for oy in range(2):
+            wy = dy if oy else (1 - dy)
+            yi = (y0 + oy).clamp(0, Y - 1)
+            for ox in range(2):
+                wx = dx if ox else (1 - dx)
+                xi = (x0 + ox).clamp(0, X - 1)
+                w = wz * wy * wx  # (N,)
+                idx = zi * Y * X + yi * X + xi  # (N,)
+                for c in range(C):
+                    vol.view(C, -1)[c].scatter_add_(0, idx, w * vals[:, c])
+                wgt.view(-1).scatter_add_(0, idx, w)
+
+    # Weight-normalize
+    mask = wgt > 0
+    for c in range(C):
+        vol[c][mask[0]] /= wgt[0][mask[0]]
+
+    if is_1d:
+        return vol[0]
+    return vol
+
+
+def _build_cage_displacement(
+    ctrl_offsets_list: list,      # per-surface list of (N_s,) tensors
+    ctrl_pos_list: list,          # per-surface list of (H_s, W_s, 3) tensors
+    ctrl_normals_list: list,      # per-surface list of (H_s, W_s, 3) tensors
+    grid_rc_list: list,           # per-surface list of (2, Z, Y, X) tensors
+    grid_rc_w_list: list,         # per-surface list of (Z, Y, X) tensors
+    dts: list,                    # per-surface EDT list of (Z, Y, X) tensors
+    validity: torch.Tensor,       # (1, Z, Y, X)
+    volume_shape: Tuple[int, int, int],
+):
+    """Build a displacement field from cage control point offsets.
+
+    For each surface, splats the scalar offsets and normals onto a
+    per-surface volume. Then blends across surfaces using EDT
+    distances (nearest-surface routing).
+
+    Returns: (1, 3, Z, Y, X) displacement in voxel units
+    """
+    Z, Y, X = volume_shape
+    device = validity.device
+    N_surf = len(ctrl_offsets_list)
+
+    if N_surf == 0:
+        return torch.zeros(1, 3, Z, Y, X, device=device)
+
+    # Per-surface splatted offset and normal volumes
+    offset_vols = []
+    normal_vols = []
+    for s in range(N_surf):
+        cp = ctrl_pos_list[s]  # (H_s, W_s, 3) or (0,0,3)
+        if cp.numel() == 0:
+            offset_vols.append(torch.zeros(Z, Y, X, device=device))
+            normal_vols.append(torch.zeros(3, Z, Y, X, device=device))
+            continue
+        cn = ctrl_normals_list[s]  # (H_s, W_s, 3)
+        co = ctrl_offsets_list[s]  # (N_s,) where N_s = H_s * W_s
+
+        # Flatten control points
+        H_s, W_s = cp.shape[:2]
+        pts_flat = cp.reshape(-1, 3)          # (N, 3)
+        nrm_flat = cn.reshape(-1, 3)          # (N, 3)
+
+        # Validity: only use points inside the volume
+        in_vol = (
+            (pts_flat[:, 0] >= -0.5) & (pts_flat[:, 0] < Z - 0.5) &
+            (pts_flat[:, 1] >= -0.5) & (pts_flat[:, 1] < Y - 0.5) &
+            (pts_flat[:, 2] >= -0.5) & (pts_flat[:, 2] < X - 0.5)
+        )
+        if not in_vol.any():
+            offset_vols.append(torch.zeros(Z, Y, X, device=device))
+            normal_vols.append(torch.zeros(3, Z, Y, X, device=device))
+            continue
+
+        pts_v = pts_flat[in_vol]
+        nrm_v = nrm_flat[in_vol]
+        off_v = co[in_vol]
+
+        # Splat offsets and normals
+        off_vol = _splat_to_volume(pts_v, off_v, (Z, Y, X))
+        nrm_vol = _splat_to_volume(pts_v, nrm_v, (Z, Y, X))
+        offset_vols.append(off_vol)
+        normal_vols.append(nrm_vol)
+
+    # Blend across surfaces using EDT-based nearest-surface routing
+    if N_surf == 1:
+        offset_blend = offset_vols[0]
+        normal_blend = normal_vols[0]
+    else:
+        # Stack EDTs and find nearest surface per voxel
+        dt_stack = torch.stack(dts[:N_surf], dim=0)  # (N_surf, Z, Y, X)
+        dt_min, nearest = dt_stack.min(dim=0)  # (Z, Y, X)
+
+        # Weighted blend: use softmin over EDT distances for smooth blending
+        # (sharper than linear, avoids discontinuities at surface boundaries)
+        weights = F.softmax(-dt_stack * 5.0, dim=0)  # (N_surf, Z, Y, X)
+
+        offset_stack = torch.stack(offset_vols, dim=0)  # (N_surf, Z, Y, X)
+        offset_blend = (weights * offset_stack).sum(dim=0)  # (Z, Y, X)
+
+        normal_stack = torch.stack(normal_vols, dim=0)  # (N_surf, 3, Z, Y, X)
+        normal_blend = (weights.unsqueeze(1) * normal_stack).sum(dim=0)  # (3, Z, Y, X)
+
+    # Normalize blended normal
+    norm = normal_blend.norm(dim=0, keepdim=True).clamp(min=1e-8)
+    normal_blend = normal_blend / norm
+
+    # Displacement = offset * normal, masked by validity (squeeze to 3D)
+    val_3d = validity.squeeze()  # (Z, Y, X) — remove batch+channel dims
+    if val_3d.dim() == 0:
+        val_3d = val_3d.unsqueeze(0).unsqueeze(0).unsqueeze(0)
+    disp = (offset_blend.unsqueeze(0) * normal_blend) * val_3d.unsqueeze(0)  # (3, Z, Y, X)
+    return disp.unsqueeze(0)  # (1, 3, Z, Y, X)
+
+
+def _cage_deform_inner_loop(
+    pred_cos_gm: torch.Tensor,   # (B, 2, Z, Y, X) detached model prediction
+    targets: torch.Tensor,       # (B, 8, Z, Y, X) original targets
+    validity: torch.Tensor,      # (B, 1, Z, Y, X) original validity
+    batch: dict,                 # batch dict with cage data
+    dts_batch: list,             # per-sample list of per-surface EDT lists
+    n_iters: int,
+    inner_lr: float,
+    max_frac: float,
+    scale_loss_mse_fn,
+    scale_loss_l1_fn,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Optimize cage control point offsets for GT deformation.
+
+    Uses tifxyz quad mesh control points with direct surface normals.
+    Offsets are zero-initialized each step (no persistence).
+
+    Returns (warped_cos_gm, warped_validity) for the best iteration.
+    """
+    B = pred_cos_gm.shape[0]
+    device = pred_cos_gm.device
+    Z, Y, X = targets.shape[2:]
+
+    pred_f = pred_cos_gm.float()
+    cos_gm_orig = targets[:, 0:2].float()
+    val_f = validity.float()
+
+    best_loss = float("inf")
+    best_warped_cg = cos_gm_orig.clone()
+    best_warped_v = val_f.clone()
+
+    # Process each sample in batch independently (control points vary per sample)
+    for b in range(B):
+        cage_ctrl_pos = batch.get("cage_ctrl_pos")
+        cage_ctrl_normals = batch.get("cage_ctrl_normals")
+        cage_grid_rc = batch.get("cage_grid_rc")
+        cage_grid_rc_w = batch.get("cage_grid_rc_w")
+
+        if cage_ctrl_pos is None or b >= len(cage_ctrl_pos):
+            continue
+
+        ctrl_pos_list = [cp.to(device) for cp in cage_ctrl_pos[b]]
+        ctrl_normals_list = [cn.to(device) for cn in cage_ctrl_normals[b]]
+        grid_rc_list = [rc.to(device) for rc in cage_grid_rc[b]]
+        grid_rc_w_list = [w.to(device) for w in cage_grid_rc_w[b]]
+        dts_b = dts_batch[b]
+        N_surf = len(ctrl_pos_list)
+
+        # Initialize per-surface control point offsets (zero)
+        ctrl_offsets = []
+        for s in range(N_surf):
+            cp = ctrl_pos_list[s]
+            n_pts = cp.shape[0] * cp.shape[1] if cp.dim() >= 2 else 0
+            off = torch.zeros(n_pts, device=device, dtype=torch.float32,
+                              requires_grad=True)
+            ctrl_offsets.append(off)
+
+        if not ctrl_offsets or all(o.numel() == 0 for o in ctrl_offsets):
+            continue
+
+        # Compute max displacement from grad_mag
+        gm = cos_gm_orig[b, 1:2]  # (1, Z, Y, X)
+        max_disp_scalar = float(max_frac / max(gm.max().item(), 0.02))
+
+        inner_opt = torch.optim.SGD(
+            [o for o in ctrl_offsets if o.numel() > 0],
+            lr=inner_lr,
+        )
+
+        lr_log_start = math.log10(max(inner_lr, 1e-10))
+        lr_log_end = math.log10(max(inner_lr * 10000.0, 1e-6))
+
+        best_b_loss = float("inf")
+        best_b_offsets = [o.detach().clone() for o in ctrl_offsets]
+
+        with torch.amp.autocast("cuda", enabled=False):
+            for it in range(n_iters):
+                frac_it = it / max(n_iters - 1, 1)
+                lr_now = 10 ** (lr_log_start + frac_it * (lr_log_end - lr_log_start))
+                for pg in inner_opt.param_groups:
+                    pg["lr"] = lr_now
+
+                inner_opt.zero_grad()
+
+                # Build displacement from cage
+                disp = _build_cage_displacement(
+                    ctrl_offsets, ctrl_pos_list, ctrl_normals_list,
+                    grid_rc_list, grid_rc_w_list,
+                    dts_b, val_f[b:b+1], (Z, Y, X),
+                )  # (1, 3, Z, Y, X)
+
+                warped_cg, warped_v = _apply_warp(
+                    cos_gm_orig[b:b+1], val_f[b:b+1], disp,
+                )
+                cos_w = warped_cg[:, 1:2] * 20.0
+                loss = (
+                    scale_loss_mse_fn(
+                        pred_f[b:b+1, 0:1], warped_cg[:, 0:1],
+                        mask=warped_v, weight=cos_w,
+                    )
+                    + scale_loss_l1_fn(
+                        pred_f[b:b+1, 1:2], warped_cg[:, 1:2],
+                        mask=warped_v, weight=cos_w,
+                    )
+                )
+                loss.backward()
+                inner_opt.step()
+
+                with torch.no_grad():
+                    for o in ctrl_offsets:
+                        o.data.clamp_(-max_disp_scalar, max_disp_scalar)
+
+                    cur = loss.item()
+                    if cur < best_b_loss:
+                        best_b_loss = cur
+                        best_b_offsets = [o.detach().clone() for o in ctrl_offsets]
+
+        # Apply best offsets
+        with torch.no_grad():
+            disp_best = _build_cage_displacement(
+                best_b_offsets, ctrl_pos_list, ctrl_normals_list,
+                grid_rc_list, grid_rc_w_list,
+                dts_b, val_f[b:b+1], (Z, Y, X),
+            )
+            w_cg, w_v = _apply_warp(cos_gm_orig[b:b+1], val_f[b:b+1], disp_best)
+            best_warped_cg[b:b+1] = w_cg
+            best_warped_v[b:b+1] = w_v
+
+    return best_warped_cg, best_warped_v
+
+
 def _deform_inner_loop(
     pred_cos_gm,   # (B, 2, Z, Y, X) detached model prediction
     targets,       # (B, 8, Z, Y, X) original targets
@@ -1453,7 +1752,7 @@ def _get_gt_at_offset(
         (
             tgt_fine, val_fine,
             dsm_fine, ddm_fine, daw_fine,
-            _, _, _,
+            _, _, _, _,
         ) = compute_batch_targets_fn(
             fine_batch, device,
             same_surface_threshold=same_surface_threshold,
@@ -1745,25 +2044,15 @@ def train(
               f"(world_size={world_size}){aug_str}", flush=True)
 
     # GT deformation store (disk-backed, per-sample low-res warp fields)
-    deform_store: DeformationStore | None = None
-    deform_grid_size = 0
-    if deform_enabled:
-        deform_grid_size = effective_label_patch // deform_stride
-        if deform_grid_size < 2:
-            raise ValueError(
-                f"deform_stride={deform_stride} too large for "
-                f"label_patch_size={effective_label_patch}"
-            )
-        deform_store = DeformationStore(
-            full_dataset.patches, config, deform_grid_size, run_dir,
+    # Cage deformation uses tifxyz surface control points (no persistence)
+    deform_store = None  # legacy grid deform store — unused with cage deform
+    if deform_enabled and is_main:
+        print(
+            f"{TAG} cage deformation enabled: "
+            f"inner_iters={deform_inner_iters}, "
+            f"inner_lr={deform_inner_lr}, max_frac={deform_max_frac}",
+            flush=True,
         )
-        if is_main:
-            print(
-                f"{TAG} deformation enabled: grid={deform_grid_size}³, "
-                f"stride={deform_stride}, inner_iters={deform_inner_iters}, "
-                f"inner_lr={deform_inner_lr}, max_frac={deform_max_frac}",
-                flush=True,
-            )
 
     # Model
     model, norm_type, upsample_mode = build_model(
@@ -2104,6 +2393,7 @@ def train(
                 targets, validity,
                 dir_sparse_mask, dir_dense_mask, dir_axis_weight,
                 _merge_groups, _merged_masks, _merged_chain_info,
+                _batch_dts,
             ) = compute_batch_targets(
                 batch, device,
                 same_surface_threshold=same_surface_threshold,
@@ -2461,55 +2751,33 @@ def train(
                     image = image.index_select(0, keep)
                     batch = _filter_batch(batch, keep_list)
 
-                # --- GT deformation inner loop ---
+                # --- GT deformation (cage transform) ---
                 targets_original = targets
                 cos_mask_original = cos_mask
                 targets_deformed = None
-                if deform_store is not None and not use_aug:
-                    batch_global_idxs = [
-                        pi["global_idx"] for pi in batch["patch_info"]
-                    ]
-                    deform_batch = deform_store.get(batch_global_idxs).to(device)
-                    aug = batch.get("_aug", (False, False, False, 0))
-                    fz, fy, fx, kk = aug
-                    deform_aug = _augment_deform(deform_batch, fz, fy, fx, kk)
-                    deform_aug.requires_grad_(True)
-
-                    deform_opt = _deform_inner_loop(
+                cage_deform_active = (
+                    deform_enabled and not use_aug
+                    and "cage_ctrl_pos" in batch
+                    and batch["cage_ctrl_pos"] is not None
+                )
+                if cage_deform_active:
+                    warped_cg, warped_v = _cage_deform_inner_loop(
                         pred_cos_gm=pred[:, 0:2].detach(),
                         targets=targets,
                         validity=cos_mask,
-                        deform=deform_aug,
+                        batch=batch,
+                        dts_batch=_batch_dts,
                         n_iters=deform_inner_iters,
                         inner_lr=deform_inner_lr,
                         max_frac=deform_max_frac,
                         scale_loss_mse_fn=scale_loss_mse,
                         scale_loss_l1_fn=scale_loss_l1,
                     )
-
-                    # Apply final warp to cos/grad_mag targets
                     with torch.no_grad():
-                        G = deform_opt.shape[-1]
-                        normal_dir = _compute_normal_field(
-                            targets[:, 0:1].float(), G,
-                        )
-                        disp_3d = deform_opt * normal_dir
-                        Z, Y, X = targets.shape[2:]
-                        df = F.interpolate(
-                            disp_3d, size=(Z, Y, X),
-                            mode="trilinear", align_corners=False,
-                        )
-                        warped_cg, warped_v = _apply_warp(
-                            targets[:, 0:2], cos_mask, df,
-                        )
                         targets_deformed = targets.clone()
                         targets_deformed[:, 0:2] = warped_cg
                         targets = targets_deformed
                         cos_mask = warped_v
-
-                    # Store back (un-augment first)
-                    deform_preaugm = _unaugment_deform(deform_opt, fz, fy, fx, kk)
-                    deform_store.put(batch_global_idxs, deform_preaugm)
 
                 # Per-channel losses — weighted by grad_mag GT (closer surfaces → higher weight)
                 # Normalize so 20 vx spacing (grad_mag=0.05) → weight 1.0
@@ -2518,8 +2786,24 @@ def train(
                 # comparable to non-aug samples.
                 _mag_weight_scale = (1.0 / scale_aug_factor) if use_aug else 1.0
                 cos_mag_weight = targets[:, 1:2] * 20.0 * _mag_weight_scale
-                loss_cos = scale_loss_mse(pred[:, 0:1], targets[:, 0:1], mask=cos_mask, weight=cos_mag_weight)
-                loss_mag = scale_loss_l1(pred[:, 1:2], targets[:, 1:2], mask=cos_mask, weight=cos_mag_weight)
+                if cage_deform_active:
+                    # Split: 0.9 weight on deformed GT + 0.1 on original GT
+                    cos_mag_weight_orig = targets_original[:, 1:2] * 20.0
+                    loss_cos = (
+                        0.9 * scale_loss_mse(pred[:, 0:1], targets[:, 0:1],
+                                             mask=cos_mask, weight=cos_mag_weight)
+                        + 0.1 * scale_loss_mse(pred[:, 0:1], targets_original[:, 0:1],
+                                               mask=cos_mask_original, weight=cos_mag_weight_orig)
+                    )
+                    loss_mag = (
+                        0.9 * scale_loss_l1(pred[:, 1:2], targets[:, 1:2],
+                                            mask=cos_mask, weight=cos_mag_weight)
+                        + 0.1 * scale_loss_l1(pred[:, 1:2], targets_original[:, 1:2],
+                                              mask=cos_mask_original, weight=cos_mag_weight_orig)
+                    )
+                else:
+                    loss_cos = scale_loss_mse(pred[:, 0:1], targets[:, 0:1], mask=cos_mask, weight=cos_mag_weight)
+                    loss_mag = scale_loss_l1(pred[:, 1:2], targets[:, 1:2], mask=cos_mask, weight=cos_mag_weight)
                 loss_dir_sparse = scale_loss_mse(
                     pred[:, 2:8], targets[:, 2:8],
                     mask=dir_sparse_mask, weight=dir_axis_weight,
@@ -2820,6 +3104,7 @@ def _evaluate(
                 targets, validity,
                 dir_sparse_mask, dir_dense_mask, dir_axis_weight,
                 _merge_groups, _merged_masks, _merged_chain_info,
+                _batch_dts,
             ) = compute_batch_targets(
                 batch, device,
                 same_surface_threshold=same_surface_threshold,

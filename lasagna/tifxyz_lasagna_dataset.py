@@ -822,6 +822,10 @@ class TifxyzLasagnaDataset(Dataset):
                 "mask": mask,
                 "points_local": empty_pts,
                 "normals_zyx": empty_pts.copy(),
+                "ctrl_pos_stored": np.zeros((0, 0, 3), dtype=np.float32),
+                "ctrl_normals_stored": np.zeros((0, 0, 3), dtype=np.float32),
+                "grid_rc_vol": np.zeros((2,) + crop_size_tuple, dtype=np.float32),
+                "grid_rc_weight": np.zeros(crop_size_tuple, dtype=np.float32),
             }
 
         seg = wrap["segment"]
@@ -898,8 +902,62 @@ class TifxyzLasagnaDataset(Dataset):
             zyx_local, crop_size_tuple, valid,
         )
 
-        # Compute normals from the grid
+        # Compute normals from the grid (full-res)
         normals_zyx = _estimate_grid_normals(zyx_world)
+
+        # Stored-resolution control points for cage deformation.
+        # The stored-res grid is at ~20vx spacing — each vertex is a
+        # cage control point.  Convert to local coords for the
+        # training-loop cage weight computation.
+        zyx_stored_world = np.stack(
+            [z_s, y_s, x_s], axis=-1,
+        ).astype(np.float32)
+        if patch.cache_to_volume is not None:
+            zyx_stored_world = _apply_affine_zyx(
+                patch.cache_to_volume, zyx_stored_world,
+            )
+        if coord_scale != 1:
+            zyx_stored_local = (
+                zyx_stored_world * float(coord_scale) - min_corner_f
+            )
+        else:
+            zyx_stored_local = zyx_stored_world - min_corner_f
+        normals_stored = _estimate_grid_normals(zyx_stored_world)
+
+        # Build a grid-coordinate volume: for each surface voxel,
+        # what is its (r_stored_frac, c_stored_frac) in the stored-res
+        # quad mesh?  Splat stored-res row/col values at each full-res
+        # vertex position.  This uses valid grid points only.
+        H_full, W_full = zyx_local.shape[:2]
+        H_s, W_s = x_s.shape
+        if H_full > 1 and W_full > 1 and H_s > 0 and W_s > 0:
+            # Full-res index → stored-res fractional coordinate
+            r_stored_map = np.linspace(
+                0, H_s - 1, H_full, dtype=np.float32,
+            )[:, None].repeat(W_full, axis=1)
+            c_stored_map = np.linspace(
+                0, W_s - 1, W_full, dtype=np.float32,
+            )[None, :].repeat(H_full, axis=0)
+            # Splat (r_stored, c_stored) onto the 3D volume at
+            # full-res vertex positions
+            rc_vals = np.stack(
+                [r_stored_map[valid], c_stored_map[valid]], axis=-1,
+            ).astype(np.float32)
+            pts_for_rc = zyx_local[valid].astype(np.float32)
+            if pts_for_rc.shape[0] > 0:
+                grid_rc_vol, grid_rc_weight = _splat_multichannel(
+                    pts_for_rc, rc_vals, crop_size_tuple,
+                )
+            else:
+                grid_rc_vol = np.zeros(
+                    (2,) + crop_size_tuple, dtype=np.float32,
+                )
+                grid_rc_weight = np.zeros(crop_size_tuple, dtype=np.float32)
+        else:
+            grid_rc_vol = np.zeros(
+                (2,) + crop_size_tuple, dtype=np.float32,
+            )
+            grid_rc_weight = np.zeros(crop_size_tuple, dtype=np.float32)
 
         # Raw normals are the single source of truth for direction
         # supervision. The 6-channel double-angle encoding is derived
@@ -918,6 +976,11 @@ class TifxyzLasagnaDataset(Dataset):
             "mask": surface_mask,
             "points_local": pts_local,
             "normals_zyx": normals_used,
+            # Cage deformation data
+            "ctrl_pos_stored": zyx_stored_local,     # (H_s, W_s, 3) local coords
+            "ctrl_normals_stored": normals_stored,   # (H_s, W_s, 3) unit normals
+            "grid_rc_vol": grid_rc_vol,              # (2, Z, Y, X) stored-res (r, c) per surface voxel
+            "grid_rc_weight": grid_rc_weight,        # (Z, Y, X) splat weight (>0 where valid)
         }
 
     def __getitem__(self, idx):
@@ -1065,6 +1128,11 @@ class TifxyzLasagnaDataset(Dataset):
         all_normals_zyx = []
         kept_wrap_indices: list[int] = []
         surface_geometry: list[dict] = []
+        # Cage deformation: per-surface control points + grid-coord volume
+        cage_ctrl_pos: list[np.ndarray] = []      # (H_s, W_s, 3) per surface
+        cage_ctrl_normals: list[np.ndarray] = []  # (H_s, W_s, 3) per surface
+        cage_grid_rc: list[np.ndarray] = []       # (2, Z, Y, X) per surface
+        cage_grid_rc_w: list[np.ndarray] = []     # (Z, Y, X) per surface
 
         for wrap_idx, wrap in enumerate(patch.wraps[:self.max_surfaces_per_patch]):
             wrap_out = self._extract_and_voxelize_wrap(
@@ -1078,6 +1146,10 @@ class TifxyzLasagnaDataset(Dataset):
                 if pts_local.shape[0] > 0:
                     all_normal_points.append(pts_local)
                     all_normals_zyx.append(wrap_out["normals_zyx"])
+                cage_ctrl_pos.append(wrap_out["ctrl_pos_stored"])
+                cage_ctrl_normals.append(wrap_out["ctrl_normals_stored"])
+                cage_grid_rc.append(wrap_out["grid_rc_vol"])
+                cage_grid_rc_w.append(wrap_out["grid_rc_weight"])
                 if self.include_geometry:
                     surface_geometry.append({
                         "wrap_idx": wrap_idx,
@@ -1233,6 +1305,20 @@ class TifxyzLasagnaDataset(Dataset):
                 "fine_offset": fine_offset,             # (3,) int64 or None
             },
         }
+        # Cage deformation: per-surface control point grids + coordinate maps
+        if cage_ctrl_pos:
+            sample["cage_ctrl_pos"] = [
+                torch.as_tensor(cp, dtype=torch.float32) for cp in cage_ctrl_pos
+            ]
+            sample["cage_ctrl_normals"] = [
+                torch.as_tensor(cn, dtype=torch.float32) for cn in cage_ctrl_normals
+            ]
+            sample["cage_grid_rc"] = [
+                torch.as_tensor(rc, dtype=torch.float32) for rc in cage_grid_rc
+            ]
+            sample["cage_grid_rc_w"] = [
+                torch.as_tensor(w, dtype=torch.float32) for w in cage_grid_rc_w
+            ]
         if self.refine_mode and surface_masks_fine_arr is not None:
             sample["surface_masks_fine"] = torch.as_tensor(
                 surface_masks_fine_arr, dtype=torch.float32,
@@ -1280,6 +1366,11 @@ def collate_variable_surfaces(batch):
         "surface_chain_info": surface_chain_info,  # list of list[dict]
         "patch_info": patch_infos,
     }
+    if "cage_ctrl_pos" in batch[0]:
+        out["cage_ctrl_pos"] = [b["cage_ctrl_pos"] for b in batch]
+        out["cage_ctrl_normals"] = [b["cage_ctrl_normals"] for b in batch]
+        out["cage_grid_rc"] = [b["cage_grid_rc"] for b in batch]
+        out["cage_grid_rc_w"] = [b["cage_grid_rc_w"] for b in batch]
     if "surface_masks_fine" in batch[0]:
         out["surface_masks_fine"] = [b["surface_masks_fine"] for b in batch]
         out["tensor_moments_fine"] = torch.stack(
