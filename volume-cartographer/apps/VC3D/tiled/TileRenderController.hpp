@@ -78,6 +78,11 @@ public:
     void setProgressiveEnabled(bool enabled) { _progressiveEnabled = enabled; }
     bool progressiveEnabled() const { return _progressiveEnabled; }
 
+    // Render delay: hold off rendering after view changes to give chunk
+    // prefetching a head start, avoiding low-res flash. 0 = immediate.
+    void setRenderDelayMs(int ms) { _renderDelayMs = ms; }
+    int renderDelayMs() const { return _renderDelayMs; }
+
     // For the next epoch-changing render, keep the old frame visible until the
     // visible tile set for the new epoch has been resolved.
     void setAtomicNextEpochSwap(bool enabled) { _atomicNextEpochSwap = enabled; }
@@ -118,6 +123,8 @@ private:
     SliceCache _cache;
     RenderPool* _renderPool;  // shared, not owned
     QTimer* _tickTimer;
+    QTimer* _renderDelayTimer = nullptr;
+    int _renderDelayMs = 500;
 
     std::shared_ptr<std::atomic<uint64_t>> _currentEpoch = std::make_shared<std::atomic<uint64_t>>(0);
     int _controllerId;

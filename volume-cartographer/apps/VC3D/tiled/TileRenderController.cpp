@@ -25,6 +25,17 @@ TileRenderController::TileRenderController(TileScene* tileScene, RenderPool* sha
     connect(_tickTimer, &QTimer::timeout, this, &TileRenderController::tick);
     // Not started here — ensureTickRunning() starts it when work arrives.
 
+    // Render delay timer: single-shot, fires once after the delay to flush
+    // pending render state.  Restarted on each scheduleRender() call so
+    // rapid view changes coalesce into one delayed render.
+    _renderDelayTimer = new QTimer(this);
+    _renderDelayTimer->setSingleShot(true);
+    connect(_renderDelayTimer, &QTimer::timeout, this, [this]() {
+        if (_pendingDirty) {
+            ensureTickRunning();
+        }
+    });
+
     // When a tile completes, wake the tick timer so it drains on the next cycle.
     // Don't call drainResults directly — the tick consolidates all drain + refinement
     // work, avoiding redundant lock acquisitions and double-draining.
@@ -207,7 +218,15 @@ void TileRenderController::scheduleRender(
     _pendingBuildParams = buildParams;
     _pendingViewportRect = viewportRect;
     _pendingDirty = true;
-    ensureTickRunning();
+
+    if (_renderDelayMs > 0) {
+        // Restart the delay timer — keeps the old frame visible while chunks
+        // prefetch, avoiding a low-res flash.  Each new call resets the timer
+        // so rapid view changes coalesce into one delayed render.
+        _renderDelayTimer->start(_renderDelayMs);
+    } else {
+        ensureTickRunning();
+    }
 }
 
 void TileRenderController::cancelAll()
@@ -292,8 +311,9 @@ void TileRenderController::drainResults()
         emit sceneNeedsUpdate();
     }
 
-    // Process pending viewport change (coalesced)
-    if (_pendingDirty) {
+    // Process pending viewport change (coalesced).
+    // Skip if the render delay timer is still running — give chunks time to load.
+    if (_pendingDirty && !_renderDelayTimer->isActive()) {
         _pendingDirty = false;
         onCameraChanged(_pendingCamera, _pendingSurface,
                         _pendingVolume, _pendingBuildParams, _pendingViewportRect);
