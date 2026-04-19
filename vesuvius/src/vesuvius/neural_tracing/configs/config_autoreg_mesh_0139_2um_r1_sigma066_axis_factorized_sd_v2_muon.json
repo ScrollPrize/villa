@@ -1,0 +1,140 @@
+{
+  "seed": 0,
+  "out_dir": "/ephemeral/checkpoints/autoreg_mesh_0139_2um_r1_sigma066_axis_factorized_sd_v2_muon",
+  "datasets": [
+    {
+      "volume_path": "/ephemeral/2um_surf_dataset/images/139.zarr",
+      "volume_scale": 0,
+      "segments_path": "/ephemeral/2um_surf_dataset/tifxyz/0139"
+    }
+  ],
+  "crop_size": [128, 128, 128],
+  "input_shape": [128, 128, 128],
+  "sample_mode": "wrap",
+  "cond_percent": [0.1, 0.5],
+  "overlap_fraction": 0.25,
+  "chunk_pad": 20.0,
+  "force_recompute_patches": false,
+  "use_stored_resolution_only": true,
+  "surface_downsample_factor": 1,
+  "frontier_band_width": 4,
+  "dinov2_backbone": "/ephemeral/dinov2_ckpts/shift005_jitter005_step_342500.pt/checkpoint_step_342500.pt",
+  "patch_size": [8, 8, 8],
+  "offset_num_bins": [16, 16, 16],
+
+  "_comment_offset": "Early ramp-on over 12k steps with low weight. Muon heads now route to AdamW automatically, but still avoid the step-4000 shock.",
+  "offset_loss_start_step": 1000,
+  "offset_loss_ramp_steps": 12000,
+  "offset_loss_weight": 0.1,
+
+  "_comment_offset_da": "Soft offset targets: critical for Muon stability. Hard 16-bin CE with orthogonalized momentum is too brittle.",
+  "distance_aware_offset_targets_enabled": true,
+  "distance_aware_offset_target_radius": 1,
+  "distance_aware_offset_target_sigma": 0.75,
+
+  "decoder_dim": 768,
+  "decoder_depth": 16,
+  "decoder_num_heads": 16,
+  "cross_attention_every_n_blocks": 1,
+  "decoder_mlp_ratio": 4.0,
+  "decoder_dropout": 0.0,
+  "pointer_temperature": 0.25,
+  "coarse_prediction_mode": "axis_factorized",
+
+  "_comment_ss": "Conservative scheduled sampling. Offset feedback fully decoupled and delayed to 20k — only enabled after offset head is reliable under teacher forcing.",
+  "scheduled_sampling_enabled": true,
+  "scheduled_sampling_mode": "linear_full_token_greedy",
+  "scheduled_sampling_pattern": "stripwise_full_strip_greedy",
+  "scheduled_sampling_max_prob": 0.15,
+  "scheduled_sampling_start_step": 0,
+  "scheduled_sampling_ramp_steps": 8000,
+  "scheduled_sampling_offset_feedback_start_step": 20000,
+
+  "position_refine_enabled": true,
+  "position_refine_loss": "huber",
+  "position_refine_weight": 0.5,
+  "position_refine_start_step": 10000,
+
+  "xyz_soft_loss_enabled": true,
+  "xyz_soft_loss_weight": 1.0,
+  "xyz_soft_loss_start_step": 0,
+  "xyz_soft_loss": "huber",
+
+  "seam_loss_enabled": true,
+  "seam_loss_weight": 0.25,
+  "seam_loss_start_step": 0,
+  "seam_loss": "edge_huber",
+  "seam_band_width": 1,
+
+  "triangle_barrier_enabled": true,
+  "triangle_barrier_weight": 0.1,
+  "triangle_barrier_start_step": 0,
+  "triangle_barrier_margin": 0.05,
+
+  "boundary_loss_enabled": false,
+  "boundary_loss_weight": 0.0,
+  "boundary_loss_start_step": 0,
+
+  "geometry_metric_enabled": true,
+  "geometry_metric_weight": 0.001,
+  "geometry_metric_start_step": 6000,
+  "geometry_metric_loss": "huber",
+
+  "geometry_sd_enabled": true,
+  "geometry_sd_weight": 0.0005,
+  "geometry_sd_start_step": 7000,
+
+  "distance_aware_coarse_targets_enabled": true,
+  "distance_aware_coarse_target_radius": 1,
+  "distance_aware_coarse_target_sigma": 0.66,
+  "distance_aware_coarse_target_loss": "soft_ce",
+
+  "_comment_joint": "Joint-valid aux loss from step 4k. Helps Muon's fast coarse convergence also respect joint validity.",
+  "joint_valid_aux_loss_enabled": true,
+  "joint_valid_aux_loss_weight": 0.25,
+  "joint_valid_aux_loss_start_step": 4000,
+
+  "mixed_precision": "bf16",
+
+  "batch_size": 8,
+  "num_workers": 14,
+  "val_num_workers": 2,
+  "val_fraction": 0.05,
+  "val_batches_per_log": 1,
+  "rollout_val_examples_per_log": 1,
+  "rollout_val_max_steps": null,
+  "num_steps": 100000,
+
+  "_comment_muon": "Muon for decoder block internals. Output heads (offset, stop, refine, pointer) automatically routed to AdamW by _build_muon_param_groups. AdamW fallback LR slightly higher than baseline to compensate for more params on AdamW.",
+  "optimizer": {
+    "name": "muon",
+    "learning_rate": 0.02,
+    "momentum": 0.95,
+    "weight_decay": 0.01,
+    "weight_decouple": true,
+    "nesterov": true,
+    "ns_steps": 5,
+    "use_adjusted_lr": false,
+    "adamw_lr": 0.0004,
+    "adamw_betas": [0.9, 0.95],
+    "adamw_wd": 0.01,
+    "adamw_eps": 1e-10,
+    "maximize": false
+  },
+  "scheduler": "warmup_poly",
+  "scheduler_kwargs": {
+    "warmup_steps": 5000,
+    "exponent": 1.0
+  },
+  "grad_clip": 1.0,
+  "log_frequency": 200,
+  "ckpt_frequency": 10000,
+  "ckpt_at_step_zero": false,
+  "save_final_checkpoint": true,
+  "wandb_project": "autoreg-mesh",
+  "wandb_entity": "vesuvius-challenge",
+  "wandb_run_name": "autoreg-mesh-0139-2um-r1-s066-axis-sd-v2-muon",
+  "wandb_resume": true,
+  "wandb_log_images": true,
+  "wandb_image_frequency": 1000
+}
