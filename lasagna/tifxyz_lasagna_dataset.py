@@ -467,6 +467,7 @@ def _find_patches_world_chunks(config, patch_size_zyx):
     target_size = tuple(int(v) for v in patch_size_zyx)
 
     patches = []
+    volume_groups = {}  # {dataset_idx: zarr.Group} for multi-scale CT reads
     for dataset_idx, dataset in enumerate(config["datasets"]):
         volume_path = dataset.get("volume_path")
         if volume_path is None:
@@ -510,21 +511,25 @@ def _find_patches_world_chunks(config, patch_size_zyx):
             auth_json_path=volume_auth_json, config=config,
         )
 
-        # For scale augmentation: open the zarr Group so we can access
-        # alternate pyramid levels per-sample.  Only when enabled
-        # (scale_aug_prob > 0) to avoid the extra open for normal training.
+        # For scale augmentation or refinement mode: open the zarr Group
+        # so we can access alternate pyramid levels per-sample.
         _vol_group = None
-        if float(config.get("scale_aug_prob", 0.0)) > 0:
+        _need_group = (
+            float(config.get("scale_aug_prob", 0.0)) > 0
+            or bool(config.get("refine_mode", False))
+        )
+        if _need_group:
             try:
                 _vol_group = open_zarr_group(
                     volume_path,
                     auth_json_path=volume_auth_json, config=config,
                 )
+                volume_groups[dataset_idx] = _vol_group
             except Exception as e:
                 warnings.warn(
-                    f"Could not open zarr group for scale aug "
+                    f"Could not open zarr group for scale aug/refine "
                     f"(dataset_idx={dataset_idx}): {e}; "
-                    f"scale augmentation disabled for this dataset."
+                    f"multi-level access disabled for this dataset."
                 )
 
         # Load and retarget segments.  Use cache_scale for retargeting so
@@ -612,7 +617,7 @@ def _find_patches_world_chunks(config, patch_size_zyx):
                 cache_to_volume=_cache_to_vol,
             ))
 
-    return patches
+    return patches, volume_groups
 
 
 # ---------------------------------------------------------------------------
@@ -644,6 +649,7 @@ class TifxyzLasagnaDataset(Dataset):
         apply_augmentation: bool = True,
         include_geometry: bool = False,
         include_patch_ref: bool = False,
+        refine_mode: bool = False,
     ):
         # Normalize patch_size to 3-element ZYX array (CT read size).
         patch_size_zyx = np.asarray(config["patch_size"], dtype=np.int32).reshape(-1)
@@ -690,6 +696,9 @@ class TifxyzLasagnaDataset(Dataset):
         # downstream code (e.g. lasagna3d dataset vis) can re-read fresh
         # CT crops at different sizes for inference.
         self.include_patch_ref = bool(include_patch_ref)
+        # Multi-scale refinement mode: also voxelize surfaces at 2×
+        # resolution for a random subregion, returned as _fine keys.
+        self.refine_mode = bool(refine_mode)
 
         # Augmentation
         if apply_augmentation:
@@ -703,7 +712,9 @@ class TifxyzLasagnaDataset(Dataset):
 
         # Find patches using world-chunk method. Tiling + chunk cache
         # are keyed off the (small) label region, not the CT read size.
-        self.patches = _find_patches_world_chunks(config, self.label_patch_size_zyx)
+        self.patches, self.volume_groups = _find_patches_world_chunks(
+            config, self.label_patch_size_zyx,
+        )
 
         print(f"{TAG} loaded {len(self.patches)} patches")
 
@@ -773,7 +784,8 @@ class TifxyzLasagnaDataset(Dataset):
     def __len__(self):
         return len(self.patches)
 
-    def _extract_and_voxelize_wrap(self, patch, wrap, min_corner, crop_size):
+    def _extract_and_voxelize_wrap(self, patch, wrap, min_corner, crop_size,
+                                    coord_scale=1):
         """Extract a wrap surface, voxelize it, and compute direction channels.
 
         This is the **single source of truth** for turning one wrap into its
@@ -781,6 +793,13 @@ class TifxyzLasagnaDataset(Dataset):
         visualization path (``lasagna3d dataset vis``) call this method and
         build their output from the returned dict — the vis never
         re-implements the upsample/trim/voxelize logic.
+
+        Args:
+            coord_scale: coordinate multiplier for multi-resolution
+                voxelization.  When > 1, world coordinates are scaled
+                by this factor before computing local positions, so
+                the output grid has finer resolution.  ``min_corner``
+                must already be in the scaled coordinate system.
 
         Returns a dict with keys:
             mask          (Z, Y, X) float32 — binary voxelization
@@ -851,9 +870,14 @@ class TifxyzLasagnaDataset(Dataset):
         if patch.cache_to_volume is not None:
             zyx_world = _apply_affine_zyx(patch.cache_to_volume, zyx_world)
 
-        # Convert to local coordinates
+        # Convert to local coordinates.  When coord_scale > 1, scale
+        # world coords to the finer grid before subtracting min_corner
+        # (which is already in scaled coords).
         min_corner_f = min_corner.astype(np.float32)
-        zyx_local = zyx_world - min_corner_f
+        if coord_scale != 1:
+            zyx_local = zyx_world * float(coord_scale) - min_corner_f
+        else:
+            zyx_local = zyx_world - min_corner_f
 
         # Compute validity mask (finite + within crop bounds)
         valid = (
@@ -1121,6 +1145,53 @@ class TifxyzLasagnaDataset(Dataset):
         # Padding mask: where CT data actually exists (non-zero after crop)
         padding_mask = np.ones(crop_size, dtype=np.float32)
 
+        # --- Fine-resolution voxelization for multi-scale refinement ---
+        # Re-voxelize at 2× resolution for a random P/2 subregion.
+        fine_offset = None
+        surface_masks_fine_arr = None
+        tensor_moments_fine_vol = None
+        normals_valid_fine_vol = None
+        if self.refine_mode and num_surfaces > 0:
+            P = crop_size[0]  # cubic
+            half_P = P // 2
+            # Random offset: fine subregion start within the base P region
+            fine_offset = np.array(
+                [int(np.random.randint(0, half_P + 1)) for _ in range(3)],
+                dtype=np.int64,
+            )
+            fine_crop = (P, P, P)  # P fine voxels = P/2 base voxels
+            fine_min = (min_corner + fine_offset).astype(np.float32) * 2.0
+
+            fine_masks = []
+            fine_normal_pts = []
+            fine_normals_zyx = []
+            for wi_local, wi_global in enumerate(kept_wrap_indices):
+                wrap = patch.wraps[wi_global]
+                w_out = self._extract_and_voxelize_wrap(
+                    patch, wrap, fine_min, fine_crop, coord_scale=2,
+                )
+                fine_masks.append(w_out["mask"])
+                if w_out["points_local"].shape[0] > 0:
+                    fine_normal_pts.append(w_out["points_local"])
+                    fine_normals_zyx.append(w_out["normals_zyx"])
+
+            surface_masks_fine_arr = np.stack(fine_masks, axis=0)
+
+            if fine_normal_pts:
+                pts_f = np.concatenate(fine_normal_pts, axis=0)
+                nrm_f = np.concatenate(fine_normals_zyx, axis=0)
+                tvals_f = _tensor_moments_from_normals_zyx(nrm_f)
+                tensor_moments_fine_vol, normals_valid_fine_vol = (
+                    _splat_multichannel(pts_f, tvals_f, fine_crop)
+                )
+            else:
+                tensor_moments_fine_vol = np.zeros(
+                    (6,) + fine_crop, dtype=np.float32,
+                )
+                normals_valid_fine_vol = np.zeros(
+                    fine_crop, dtype=np.float32,
+                )
+
         # Convert to tensors
         vol_crop_t = torch.as_tensor(
             np.asarray(vol_crop, dtype=np.float32)
@@ -1130,6 +1201,14 @@ class TifxyzLasagnaDataset(Dataset):
         tensor_moments_t = torch.as_tensor(tensor_moments_vol, dtype=torch.float32)
         normals_valid_t = torch.as_tensor(normals_valid_vol, dtype=torch.float32).unsqueeze(0)
         padding_mask_t = torch.as_tensor(padding_mask, dtype=torch.float32).unsqueeze(0)
+
+        # World center and min in base-level voxels for multi-scale CT reads.
+        bbox = patch.world_bbox  # (z_min, z_max, y_min, y_max, x_min, x_max)
+        world_center = np.array([
+            (bbox[0] + bbox[1]) / 2.0,
+            (bbox[2] + bbox[3]) / 2.0,
+            (bbox[4] + bbox[5]) / 2.0,
+        ], dtype=np.float64)
 
         sample = {
             "image": vol_crop_t,                        # (1, Z, Y, X)
@@ -1142,14 +1221,28 @@ class TifxyzLasagnaDataset(Dataset):
             "patch_info": {
                 "segment_uuid": str(patch.wraps[0]["segment"].uuid) if patch.wraps else "",
                 "world_bbox": patch.world_bbox,
+                "world_center": world_center,           # (3,) float64 — base-level voxels
+                "world_min": min_corner,                # (3,) int64 — CT read origin
+                "scale": patch.scale,                   # zarr level
                 "idx": patch.dataset_local_idx,
                 "global_idx": idx,
                 "dataset_idx": patch.dataset_idx,
                 "dataset_name": patch.dataset_name,
                 "scale_aug_factor": f,
-                "scale_aug_offset": scale_aug_offset,  # (3,) int64 or None
+                "scale_aug_offset": scale_aug_offset,   # (3,) int64 or None
+                "fine_offset": fine_offset,             # (3,) int64 or None
             },
         }
+        if self.refine_mode and surface_masks_fine_arr is not None:
+            sample["surface_masks_fine"] = torch.as_tensor(
+                surface_masks_fine_arr, dtype=torch.float32,
+            )
+            sample["tensor_moments_fine"] = torch.as_tensor(
+                tensor_moments_fine_vol, dtype=torch.float32,
+            )
+            sample["normals_valid_fine"] = torch.as_tensor(
+                normals_valid_fine_vol, dtype=torch.float32,
+            ).unsqueeze(0)
         if self.include_geometry:
             sample["surface_geometry"] = surface_geometry
         if self.include_patch_ref:
@@ -1187,6 +1280,14 @@ def collate_variable_surfaces(batch):
         "surface_chain_info": surface_chain_info,  # list of list[dict]
         "patch_info": patch_infos,
     }
+    if "surface_masks_fine" in batch[0]:
+        out["surface_masks_fine"] = [b["surface_masks_fine"] for b in batch]
+        out["tensor_moments_fine"] = torch.stack(
+            [b["tensor_moments_fine"] for b in batch],
+        )
+        out["normals_valid_fine"] = torch.stack(
+            [b["normals_valid_fine"] for b in batch],
+        )
     if "surface_geometry" in batch[0]:
         out["surface_geometry"] = [b["surface_geometry"] for b in batch]
     if "_patch" in batch[0]:

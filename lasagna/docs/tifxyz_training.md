@@ -216,6 +216,7 @@ python lasagna/train_tifxyz.py \
 | `--deform-inner-iters` | 100 | Inner optimization iterations per training step |
 | `--deform-inner-lr` | 1000 | Start LR for deformation inner loop (ramps to 100x on log scale) |
 | `--deform-max-frac` | 0.3 | Max displacement as fraction of inter-surface distance |
+| `--refine` | off | Enable multi-scale refinement mode (11ch input, disables scale_aug) |
 
 ### Multi-GPU (DDP)
 
@@ -334,6 +335,50 @@ GT closer to what the model predicts, effectively refining the GT.
 
 **CLI flags:** `--no-deform`, `--deform-stride`, `--deform-inner-iters`,
 `--deform-inner-lr`, `--deform-max-frac` (see table above).
+
+### Multi-scale refinement mode
+
+Enable with `--refine`. The model takes 11 input channels (CT + 8ch prior
+prediction + validity mask + scale indicator) and learns to refine its own
+output across scales.
+
+**Mutually exclusive with scale augmentation** — `--refine` forces
+`scale_aug_prob=0`.
+
+**7 training modes** (chosen uniformly per batch):
+
+| Mode | Passes | Batch size | Description |
+|------|--------|-----------|-------------|
+| 0 | 1 | full | Scale -1 only (coarser, 0.5x) |
+| 1 | 1 | full | Scale 0 only (base, 1x) |
+| 2 | 1 | full | Scale +1 only (finer, 2x) |
+| 3 | 2 | half | Chain -1 -> 0 |
+| 4 | 2 | half | Chain 0 -> +1 |
+| 5 | 2 | half | Chain -1 -> +1 |
+| 6 | 2 | half | Self-refinement N -> N |
+
+Every forward pass in a chain is supervised. The prior from the first pass
+is detached before feeding into the second pass.
+
+**Scale channel values:** 0.5 (coarser), 1.0 (base), 2.0 (finer). Always
+active, even when no prior is provided.
+
+**GT at different scales:**
+- Scale -1: avg_pool from scale-0 GT
+- Scale 0: native from dataset
+- Scale +1: native fine-resolution voxelization (dataset computes at 2x for
+  a random subregion)
+
+**Checkpoint loading:** When loading a 1-channel checkpoint with `--refine`,
+the stem conv is expanded from 1 to 11 input channels (channel 0 from
+checkpoint, channels 1-10 zero-initialized).
+
+**Test tool:**
+```bash
+python lasagna/scripts/test_refine_scales.py \
+    --config config.json --weights model.pt \
+    --num-samples 5 --output-dir tmp/refine_test
+```
 
 ### GPU pause/resume
 

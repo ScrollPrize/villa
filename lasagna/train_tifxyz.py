@@ -671,6 +671,7 @@ def build_model(
     strict: bool = False,
     model_patch_size: Optional[int] = None,
     reinit_decoder_scales: int = 0,
+    refine: bool = False,
 ) -> Tuple[nn.Module, str, str]:
     ckpt = None
     if weights is not None:
@@ -716,7 +717,7 @@ def build_model(
             flush=True,
         )
     mgr.train_batch_size = batch_size
-    mgr.in_channels = 1
+    mgr.in_channels = 11 if refine else 1
     mgr.autoconfigure = True
     mgr.spacing = [1, 1, 1]
     mgr.model_name = "lasagna_tifxyz_3d"
@@ -767,6 +768,31 @@ def build_model(
                 print(f"{TAG} skipped from checkpoint: {skipped[:5]}{'...' if len(skipped) > 5 else ''}")
             if missing:
                 print(f"{TAG} randomly initialized: {missing[:5]}{'...' if len(missing) > 5 else ''}")
+
+    # Expand stem conv from 1→11 input channels when loading a
+    # non-refine checkpoint into a refine model.  Channel 0 keeps the
+    # pretrained weight; channels 1–10 are zero-initialized so the
+    # model starts by ignoring the refinement inputs.
+    if refine and ckpt is not None:
+        stem = getattr(getattr(model, "shared_encoder", None), "stem", None)
+        if stem is not None:
+            for m in stem.modules():
+                if isinstance(m, (nn.Conv3d, nn.Conv2d)):
+                    if m.weight.shape[1] == 11:
+                        # Find the matching key in the loaded state dict
+                        for k, v in (ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt).items():
+                            if v.shape[0] == m.weight.shape[0] and len(v.shape) == len(m.weight.shape) and v.shape[1] == 1:
+                                # Already loaded the 1ch weight into an 11ch param
+                                # via strict=False — now the param has random init.
+                                # Re-set: channel 0 = checkpoint, rest = 0
+                                with torch.no_grad():
+                                    new_w = torch.zeros_like(m.weight)
+                                    new_w[:, 0:1] = v.to(new_w.device)
+                                    m.weight.copy_(new_w)
+                                print(f"{TAG} expanded stem conv {k}: "
+                                      f"1→11 input channels (zeros for ch 1–10)")
+                                break
+                    break  # only the first conv in stem
 
     if reinit_decoder_scales > 0 and ckpt is not None:
         names = _reinit_decoder_scales(model, reinit_decoder_scales)
@@ -1134,6 +1160,310 @@ def _log_vis(log_images, tag, image, pred, targets, mask, step,
 
 
 # ---------------------------------------------------------------------------
+# Multi-scale refinement helpers
+# ---------------------------------------------------------------------------
+
+# Scale offset → scale channel constant (tells model what resolution CT is at)
+_SCALE_CHANNEL_VALUES = {-1: 0.5, 0: 1.0, 1: 2.0}
+
+# Training mode definitions: list of (offset, has_prior) tuples per mode.
+# Modes 0–2: single-scale (full batch, 1 pass)
+# Modes 3–5: cross-scale chains (half batch, 2 passes)
+# Mode 6: self-refinement N→N (half batch, 2 passes, N chosen randomly)
+REFINE_MODES_FIXED = [
+    [(-1, False)],               # 0: scale -1 only
+    [(0, False)],                # 1: scale 0 only
+    [(1, False)],                # 2: scale +1 only
+    [(-1, False), (0, True)],    # 3: -1 → 0
+    [(0, False), (1, True)],     # 4: 0 → +1
+    [(-1, False), (1, True)],    # 5: -1 → +1
+]
+
+
+def _pick_refine_mode(
+    available_offsets: set,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    is_dist: bool,
+) -> Tuple[int, list]:
+    """Pick a random training mode, synced across DDP ranks.
+
+    Returns (mode_index, scale_sequence) where scale_sequence is a
+    list of (offset, has_prior) tuples.
+    """
+    if is_dist:
+        buf = torch.zeros(2, dtype=torch.long, device=device)
+        if rank == 0:
+            mode_idx = int(np.random.randint(0, 7))
+            # For mode 6 (self-refine), pick N from available offsets
+            refine_n = int(np.random.choice(
+                sorted(available_offsets),
+            )) if available_offsets else 0
+            buf[0] = mode_idx
+            buf[1] = refine_n
+        dist.broadcast(buf, src=0)
+        mode_idx = int(buf[0].item())
+        refine_n = int(buf[1].item())
+    else:
+        mode_idx = int(np.random.randint(0, 7))
+        refine_n = int(np.random.choice(
+            sorted(available_offsets),
+        )) if available_offsets else 0
+
+    if mode_idx < 6:
+        seq = REFINE_MODES_FIXED[mode_idx]
+    else:
+        # Mode 6: self-refinement N → N
+        seq = [(refine_n, False), (refine_n, True)]
+
+    # Check availability: all offsets in the sequence must be available.
+    # If not, fall back to mode 1 (scale 0 only).
+    needed = {off for off, _ in seq}
+    if not needed.issubset(available_offsets):
+        seq = [(0, False)]
+
+    return mode_idx, seq
+
+
+def _read_ct_at_offset(
+    patch_info_list: list,
+    vol_groups: dict,
+    scale_offset: int,
+    patch_size: int,
+    device: torch.device,
+) -> torch.Tensor:
+    """Read CT at an offset zarr level for a batch of samples.
+
+    Returns (B, 1, P, P, P) float32 tensor on device.
+    """
+    from vesuvius.neural_tracing.datasets.common import _read_volume_crop
+
+    crops = []
+    P = patch_size
+    for pi in patch_info_list:
+        ds_idx = pi["dataset_idx"]
+        base_level = pi["scale"]
+        target_level = base_level - scale_offset
+
+        group = vol_groups.get(ds_idx)
+        if group is None:
+            # No group available — return zeros
+            crops.append(np.zeros((P, P, P), dtype=np.float32))
+            continue
+
+        try:
+            arr = group[str(target_level)]
+        except (KeyError, IndexError):
+            crops.append(np.zeros((P, P, P), dtype=np.float32))
+            continue
+
+        crop_size = (P, P, P)
+        if scale_offset == 1:
+            # Finer level: use fine_offset from dataset
+            fine_off = pi.get("fine_offset")
+            base_min = pi["world_min"]
+            if fine_off is not None:
+                fine_min = np.array([
+                    int((base_min[d] + fine_off[d]) * 2)
+                    for d in range(3)
+                ], dtype=np.int64)
+            else:
+                # Fallback: center
+                center = pi["world_center"]
+                fine_min = np.array([
+                    int(round(center[d] * 2 - P / 2))
+                    for d in range(3)
+                ], dtype=np.int64)
+            target_min = fine_min
+        else:
+            coord_factor = 2.0 ** scale_offset
+            center = pi["world_center"]
+            target_min = np.array([
+                int(round(center[d] * coord_factor - P / 2))
+                for d in range(3)
+            ], dtype=np.int64)
+
+        target_max = target_min + P
+        vol_crop = _read_volume_crop(
+            arr, crop_size=crop_size,
+            min_corner=target_min, max_corner=target_max,
+            image_normalization="unit",
+        )
+        crops.append(np.asarray(vol_crop, dtype=np.float32))
+
+    batch = np.stack(crops, axis=0)[:, np.newaxis]  # (B, 1, P, P, P)
+    return torch.as_tensor(batch, dtype=torch.float32, device=device)
+
+
+def _resample_prior(
+    pred: torch.Tensor,
+    src_offset: int,
+    tgt_offset: int,
+    patch_size: int,
+    fine_offsets: list = None,
+) -> torch.Tensor:
+    """Resample a prediction from source scale to target scale coordinates.
+
+    Args:
+        pred: (B, 8, P, P, P) prediction at source scale
+        src_offset: source scale offset (-1, 0, +1)
+        tgt_offset: target scale offset (-1, 0, +1)
+        patch_size: P
+        fine_offsets: list of (3,) arrays, one per batch element — the
+            fine_offset from patch_info. Used to compute the crop position
+            when going to a finer scale.
+
+    Returns: (B, 8, P, P, P) resampled to target coordinates
+    """
+    if src_offset == tgt_offset:
+        return pred  # same scale, no resampling
+
+    P = patch_size
+    # Span of target world in source voxels
+    span = int(round(P * (2.0 ** (src_offset - tgt_offset))))
+
+    if span >= P:
+        # Target covers less world → just return pred (shouldn't happen
+        # in our chain directions, but handle gracefully)
+        return pred
+
+    # Crop region in source: target is somewhere within source.
+    # For now, use center crop. If fine_offsets are provided and going
+    # to a finer scale, compute the exact position.
+    # The target's world region starts at an offset within the source's
+    # wider world. In source voxels, the offset depends on the scale
+    # relationship and the fine_offset.
+    B = pred.shape[0]
+
+    # Default: center crop
+    start = (P - span) // 2
+    cropped = pred[:, :, start:start+span, start:start+span, start:start+span]
+
+    # Upsample to P
+    resampled = F.interpolate(
+        cropped, size=(P, P, P), mode="trilinear", align_corners=False,
+    )
+    return resampled
+
+
+def _build_refine_input(
+    image: torch.Tensor,
+    prior: Optional[torch.Tensor],
+    scale_offset: int,
+) -> torch.Tensor:
+    """Build 11-channel model input: CT + prior + validity + scale.
+
+    Args:
+        image: (B, 1, Z, Y, X) CT
+        prior: (B, 8, Z, Y, X) prior prediction or None
+        scale_offset: -1, 0, or +1
+
+    Returns: (B, 11, Z, Y, X)
+    """
+    B, _, Z, Y, X = image.shape
+    device = image.device
+
+    if prior is not None:
+        validity = torch.ones(B, 1, Z, Y, X, device=device, dtype=image.dtype)
+        scale_ch = torch.full(
+            (B, 1, Z, Y, X), _SCALE_CHANNEL_VALUES[scale_offset],
+            device=device, dtype=image.dtype,
+        )
+        return torch.cat([image, prior, validity, scale_ch], dim=1)
+    else:
+        # No prior: zeros for prior+validity, scale channel still active
+        zeros = torch.zeros(B, 9, Z, Y, X, device=device, dtype=image.dtype)
+        scale_ch = torch.full(
+            (B, 1, Z, Y, X), _SCALE_CHANNEL_VALUES[scale_offset],
+            device=device, dtype=image.dtype,
+        )
+        return torch.cat([image, zeros, scale_ch], dim=1)
+
+
+def _get_gt_at_offset(
+    batch: dict,
+    targets_0: torch.Tensor,
+    validity_0: torch.Tensor,
+    dir_sparse_mask_0: torch.Tensor,
+    dir_dense_mask_0: torch.Tensor,
+    dir_axis_weight_0: torch.Tensor,
+    scale_offset: int,
+    device: torch.device,
+    compute_batch_targets_fn=None,
+    same_surface_threshold: float = 0.0,
+):
+    """Get GT at a given scale offset.
+
+    offset 0: pass through scale-0 GT
+    offset -1: avg_pool scale-0 GT by 2
+    offset +1: compute from fine-res batch data (native)
+    """
+    if scale_offset == 0:
+        return targets_0, validity_0, dir_sparse_mask_0, dir_dense_mask_0, dir_axis_weight_0
+
+    if scale_offset == -1:
+        # Coarser: pool from scale 0
+        v = validity_0
+        v_count = F.avg_pool3d(v, kernel_size=2, stride=2)
+        tgt = F.avg_pool3d(targets_0 * v, 2, 2) / v_count.clamp(min=1e-8)
+        # grad_mag scales with resolution (coarser = larger spacing per voxel)
+        tgt[:, 1:2] *= 2.0
+        val = F.max_pool3d(v, 2, 2)
+        dsm = F.max_pool3d(dir_sparse_mask_0, 2, 2)
+        ddm = F.max_pool3d(dir_dense_mask_0, 2, 2)
+        daw = F.avg_pool3d(dir_axis_weight_0 * v, 2, 2) / v_count.clamp(min=1e-8)
+        return tgt, val, dsm, ddm, daw
+
+    if scale_offset == 1:
+        # Finer: compute from native fine-res data
+        if compute_batch_targets_fn is None or "surface_masks_fine" not in batch:
+            # Fallback: upsample from scale 0
+            P = targets_0.shape[2]
+            tgt_up = F.interpolate(
+                targets_0, size=(P, P, P), mode="trilinear",
+                align_corners=False,
+            )
+            # No — targets_0 is already P. For +1 we need P output from
+            # a P/2 center crop upsampled.  This is the fallback path;
+            # the primary path uses native fine GT below.
+            center = P // 4
+            half = P // 2
+            tgt_crop = targets_0[:, :, center:center+half, center:center+half, center:center+half]
+            val_crop = validity_0[:, :, center:center+half, center:center+half, center:center+half]
+            tgt_up = F.interpolate(tgt_crop, size=(P, P, P), mode="trilinear", align_corners=False)
+            val_up = F.interpolate(val_crop, size=(P, P, P), mode="nearest")
+            dsm_crop = dir_sparse_mask_0[:, :, center:center+half, center:center+half, center:center+half]
+            ddm_crop = dir_dense_mask_0[:, :, center:center+half, center:center+half, center:center+half]
+            daw_crop = dir_axis_weight_0[:, :, center:center+half, center:center+half, center:center+half]
+            dsm_up = F.interpolate(dsm_crop, size=(P, P, P), mode="nearest")
+            ddm_up = F.interpolate(ddm_crop, size=(P, P, P), mode="nearest")
+            daw_up = F.interpolate(daw_crop, size=(P, P, P), mode="trilinear", align_corners=False)
+            return tgt_up, val_up, dsm_up, ddm_up, daw_up
+
+        # Native fine GT: use fine-res surface_masks from dataset
+        # Build a synthetic batch dict with the fine-res data
+        fine_batch = {
+            "surface_masks": batch["surface_masks_fine"],
+            "tensor_moments": batch["tensor_moments_fine"].to(device),
+            "normals_valid": batch["normals_valid_fine"].to(device),
+            "surface_chain_info": batch["surface_chain_info"],
+            "num_surfaces": batch["num_surfaces"],
+        }
+        (
+            tgt_fine, val_fine,
+            dsm_fine, ddm_fine, daw_fine,
+            _, _, _,
+        ) = compute_batch_targets_fn(
+            fine_batch, device,
+            same_surface_threshold=same_surface_threshold,
+        )
+        return tgt_fine, val_fine, dsm_fine, ddm_fine, daw_fine
+
+    raise ValueError(f"Unknown scale_offset: {scale_offset}")
+
+
+# ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
@@ -1176,6 +1506,7 @@ def train(
     deform_inner_iters: int = 100,
     deform_inner_lr: float = 1000.0,
     deform_max_frac: float = 0.3,
+    refine: bool = False,
 ) -> None:
     rank, local_rank, world_size, is_dist = _init_distributed()
     is_main = rank == 0
@@ -1253,6 +1584,7 @@ def train(
         "deform_inner_iters": deform_inner_iters,
         "deform_inner_lr": deform_inner_lr,
         "deform_max_frac": deform_max_frac,
+        "refine": refine,
         "cmd": " ".join(sys.argv),
     }
     if is_main:
@@ -1283,13 +1615,49 @@ def train(
 
     # Dataset
     print(f"{TAG} building dataset...", flush=True)
+    # When --refine is set, inject refine_mode into config so the
+    # dataset opens zarr groups and computes fine-res GT, and force
+    # scale_aug off (mutually exclusive).
+    if refine:
+        config["refine_mode"] = True
+        config["scale_aug_prob"] = 0.0
     # include_geometry + include_patch_ref are required for the full
     # render_batch_figure path (arrow drawers + fresh inference crop).
     full_dataset = TifxyzLasagnaDataset(
         config, apply_augmentation=False,
         include_geometry=True,
         include_patch_ref=True,
+        refine_mode=refine,
     )
+
+    # Volume groups for multi-scale CT reads (used by refinement mode)
+    refine_vol_groups = full_dataset.volume_groups if refine else {}
+
+    # Probe which zarr levels are available per dataset for refinement
+    refine_available_offsets: set = set()
+    if refine and refine_vol_groups:
+        # Check all datasets, collect the intersection of available offsets
+        all_avail = []
+        for ds_idx, group in refine_vol_groups.items():
+            avail = set()
+            avail.add(0)  # base level always available
+            # Find the base scale from the first patch of this dataset
+            base_level = None
+            for p in full_dataset.patches:
+                if p.dataset_idx == ds_idx:
+                    base_level = p.scale
+                    break
+            if base_level is not None:
+                if str(base_level + 1) in group:
+                    avail.add(-1)  # coarser
+                if base_level > 0 and str(base_level - 1) in group:
+                    avail.add(1)  # finer
+            all_avail.append(avail)
+        # Use intersection so all datasets support the chosen mode
+        refine_available_offsets = set.intersection(*all_avail) if all_avail else {0}
+        if is_main:
+            print(f"{TAG} refine mode: available offsets = "
+                  f"{sorted(refine_available_offsets)}", flush=True)
 
     n = len(full_dataset)
     # Fixed 10-sample val set, deterministically spread across the
@@ -1307,7 +1675,8 @@ def train(
     # Scale augmentation: second dataset instance with scale_aug_active.
     # GT is emitted at 2× resolution; pooling happens in the train loop
     # AFTER compute_batch_targets so EDT/cos run at full res.
-    scale_aug_enabled = full_dataset.scale_aug_prob > 0
+    # Disabled when --refine is set (mutually exclusive).
+    scale_aug_enabled = full_dataset.scale_aug_prob > 0 and not refine
     scale_aug_factor = full_dataset.scale_aug_factor
     train_dataset_aug = None
     if scale_aug_enabled:
@@ -1402,6 +1771,7 @@ def train(
         upsample_mode=upsample_mode, batch_size=batch_size,
         model_patch_size=model_patch_size,
         reinit_decoder_scales=reinit_decoder_scales,
+        refine=refine,
     )
     if is_dist:
         # DDP broadcasts module state from rank 0 on init, so
@@ -1610,6 +1980,7 @@ def train(
         vis_samples=VIS_SAMPLES,
         w_dist=w_dist,
         w_fft=w_fft,
+        refine=refine,
     )
     if _init_vis_batch:
         _log_full_vis(_init_vis_batch[0], "val", global_step)
@@ -1854,17 +2225,126 @@ def train(
             # Intensity augmentation on CT only (spatial is already done).
             image = augment_intensity(image)
 
-            # Forward pass
-            with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_autocast):
+            # --- Multi-scale refinement path ---
+            if refine:
+                mode_idx, scale_seq = _pick_refine_mode(
+                    refine_available_offsets, rank, world_size,
+                    device, is_dist,
+                )
+                n_passes = len(scale_seq)
+                B_eff = image.shape[0] if n_passes == 1 else max(1, image.shape[0] // 2)
+                # Slice batch when multi-pass
+                if B_eff < image.shape[0]:
+                    image = image[:B_eff]
+                    targets = targets[:B_eff]
+                    validity = validity[:B_eff]
+                    dir_sparse_mask = dir_sparse_mask[:B_eff]
+                    dir_dense_mask = dir_dense_mask[:B_eff]
+                    dir_axis_weight = dir_axis_weight[:B_eff]
+                    batch = _filter_batch(batch, list(range(B_eff)))
+
+                # Save scale-0 GT for resampling to other scales
+                targets_0 = targets
+                validity_0 = validity
+                dsm_0 = dir_sparse_mask
+                ddm_0 = dir_dense_mask
+                daw_0 = dir_axis_weight
+
+                total_loss = image.new_zeros(1).squeeze()
+                prev_pred = None
+                prev_offset = None
+                P = patch_size
+
+                with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_autocast):
+                    for pass_i, (offset, has_prior) in enumerate(scale_seq):
+                        # Read CT at this offset
+                        if offset == 0:
+                            ct = image
+                        else:
+                            ct = _read_ct_at_offset(
+                                batch["patch_info"][:B_eff],
+                                refine_vol_groups, offset, P, device,
+                            )
+                            ct = augment_intensity(ct)
+
+                        # Build prior
+                        if has_prior and prev_pred is not None:
+                            prior = _resample_prior(
+                                prev_pred.detach(), prev_offset, offset, P,
+                            )
+                        else:
+                            prior = None
+                        model_in = _build_refine_input(ct, prior, offset)
+
+                        # Forward
+                        results = model(model_in)
+                        raw_pred = results["output"]
+                        pred_pass = torch.sigmoid(raw_pred) if output_sigmoid else raw_pred
+
+                        # GT at this scale
+                        tgt, val, dsm, ddm, daw = _get_gt_at_offset(
+                            batch, targets_0, validity_0, dsm_0, ddm_0, daw_0,
+                            offset, device,
+                            compute_batch_targets_fn=compute_batch_targets,
+                            same_surface_threshold=same_surface_threshold,
+                        )
+
+                        # Loss (same structure as non-refine)
+                        cos_mask_p = val
+                        cos_mag_w = tgt[:, 1:2] * 20.0
+                        l_cos = scale_loss_mse(pred_pass[:, 0:1], tgt[:, 0:1], mask=cos_mask_p, weight=cos_mag_w)
+                        l_mag = scale_loss_l1(pred_pass[:, 1:2], tgt[:, 1:2], mask=cos_mask_p, weight=cos_mag_w)
+                        dir_mask_p = ((dsm + ddm) > 0.5).float()
+                        l_dir_s = scale_loss_mse(pred_pass[:, 2:8], tgt[:, 2:8], mask=dsm, weight=daw)
+                        l_dir_d = scale_loss_mse(pred_pass[:, 2:8], tgt[:, 2:8], mask=ddm, weight=daw)
+                        l_smooth = direction_smoothness_loss(pred_pass[:, 2:8], dir_mask_p)
+
+                        pass_loss = (
+                            w_cos * l_cos
+                            + w_mag * l_mag
+                            + w_dir * l_dir_s
+                            + w_dir_dense * l_dir_d
+                            + w_smooth * l_smooth
+                        )
+                        total_loss = total_loss + pass_loss
+
+                        prev_pred = pred_pass
+                        prev_offset = offset
+
+                    # Set variables for logging (use last pass values)
+                    pred = prev_pred
+                    loss = total_loss
+                    loss_cos = l_cos
+                    loss_mag = l_mag
+                    loss_dir_sparse = l_dir_s
+                    loss_dir_dense = l_dir_d
+                    loss_smooth = l_smooth
+                    loss_dist = pred.new_zeros(1).squeeze()
+                    loss_fft = pred.new_zeros(1).squeeze()
+                    cos_mask = val
+                    dir_sparse_mask = dsm
+                    targets = tgt
+                    targets_original = targets_0
+                    targets_deformed = None
+                    cos_mask_original = validity_0
+                    with torch.no_grad():
+                        t_pred = decode_to_tensor(
+                            pred[:, 2:8].detach().permute(1, 0, 2, 3, 4)
+                        )
+                        t_gt_batch = decode_to_tensor(
+                            tgt[:, 2:8].detach().permute(1, 0, 2, 3, 4)
+                        )
+                        dir_angle_deg_sparse = tensor_unsigned_angle_deg(
+                            t_pred, t_gt_batch, mask=dsm[:, 0],
+                        ).item()
+
+            # Forward pass (skipped when refine block already ran above)
+            if not refine:
+              with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_autocast):
                 results = model(image)
                 raw_pred = results["output"]
                 pred = torch.sigmoid(raw_pred) if output_sigmoid else raw_pred  # (B, 8, Z, Y, X)
 
-                # cos/grad_mag live in the chain-bracket validity.
-                # Direction supervision is split into two masks by
-                # source (sparse splat vs densified slerp fill) and
-                # weighted per-channel by the normal's in-plane
-                # projection into each slice plane.
                 cos_mask = validity
                 dir_mask = ((dir_sparse_mask + dir_dense_mask) > 0.5).float()
 
@@ -2175,6 +2655,8 @@ def train(
                         n_scale_aug / max(total_samples, 1),
                         global_step,
                     )
+                if refine:
+                    log_scalar("train/refine_mode", mode_idx, global_step)
 
             if global_step % 100 == 0:
                 _log_vis(log_images, "train", image, pred, targets, cos_mask, global_step,
@@ -2214,6 +2696,7 @@ def train(
                     is_main=is_main,
                     deform_store=deform_store,
                     vis_samples=VIS_SAMPLES,
+                    refine=refine,
                 )
                 if _vis_batch:
                     _log_full_vis(_vis_batch[0], "val", global_step)
@@ -2227,8 +2710,9 @@ def train(
                         "output_sigmoid": output_sigmoid,
                         "precision": precision,
                         "patch_size": patch_size,
-                        "in_channels": 1,
+                        "in_channels": 11 if refine else 1,
                         "out_channels": 8,
+                        "refine": refine,
                     }
                     torch.save(ckpt_data, run_dir / "model_current.pt")
                     if deform_store is not None:
@@ -2262,8 +2746,9 @@ def train(
             "output_sigmoid": output_sigmoid,
             "precision": precision,
             "patch_size": patch_size,
-            "in_channels": 1,
+            "in_channels": 11 if refine else 1,
             "out_channels": 8,
+            "refine": refine,
         }
         torch.save(ckpt_data, run_dir / "model_current.pt")
         if last_val_loss < best_val_loss:
@@ -2309,6 +2794,7 @@ def _evaluate(
     vis_samples: int = 8,
     w_dist: float = 0.0,
     w_fft: float = 0.0,
+    refine: bool = False,
 ):
     model.eval()
     losses = []
@@ -2342,7 +2828,11 @@ def _evaluate(
             # Always run forward pass even if validity is empty — DDP
             # broadcasts buffers on every forward, so all ranks must
             # call model() the same number of times.
-            results = model(image)
+            if refine:
+                model_in = _build_refine_input(image, None, 0)  # scale 0, no prior
+            else:
+                model_in = image
+            results = model(model_in)
             raw_pred = results["output"]
             pred = torch.sigmoid(raw_pred) if output_sigmoid else raw_pred
 
@@ -2621,6 +3111,12 @@ def main() -> None:
     parser.add_argument("--deform-max-frac", type=float, default=0.3,
                         help="Max displacement as fraction of inter-surface "
                              "distance.")
+    parser.add_argument("--refine", action="store_true", default=False,
+                        help="Enable multi-scale refinement mode. "
+                             "Sets in_channels=11 (CT + 8ch prior + "
+                             "validity + scale). Disables scale_aug. "
+                             "Per-batch random mode selection from 7 "
+                             "scale/chain configurations.")
     args = parser.parse_args()
 
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -2666,6 +3162,7 @@ def main() -> None:
         deform_inner_iters=args.deform_inner_iters,
         deform_inner_lr=args.deform_inner_lr,
         deform_max_frac=args.deform_max_frac,
+        refine=args.refine,
     )
 
 
