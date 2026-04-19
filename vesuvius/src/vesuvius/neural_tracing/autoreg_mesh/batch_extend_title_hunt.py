@@ -536,18 +536,20 @@ def _process_surface(
             extra={"scaled_input_path": str(scaled_input_path)},
         )
 
-    if str(state.get("status")) in {"scaled", "up_running"} and "up" in _active_directions:
-        state = _update_surface_state(
-            state=state,
-            status="up_running",
-            manifest_jsonl_path=manifest_jsonl_path,
-        )
-        up_input = Path(state["scaled_input_path"])
-        up_output_dir = paths.output_dir / "up_stage"
-        up_result = _run_direction_to_exhaustion(
-            input_tifxyz_path=up_input,
-            output_dir=up_output_dir,
-            direction="up",
+    current_input = Path(state["scaled_input_path"])
+    direction_summaries: dict[str, dict] = {}
+    for direction in _active_directions:
+        stage_status = f"{direction}_running"
+        done_status = f"{direction}_done"
+        if str(state.get("status")) not in {"scaled", stage_status} and str(state.get("status")) not in {prev_done for prev_done in [f"{d}_done" for d in _active_directions]}:
+            if str(state.get("status")) != "scaled":
+                continue
+        state = _update_surface_state(state=state, status=stage_status, manifest_jsonl_path=manifest_jsonl_path)
+        stage_output_dir = paths.output_dir / f"{direction}_stage"
+        stage_result = _run_direction_to_exhaustion(
+            input_tifxyz_path=current_input,
+            output_dir=stage_output_dir,
+            direction=direction,
             volume_uri=volume_uri,
             dino_backbone=dino_backbone,
             autoreg_checkpoint=autoreg_checkpoint,
@@ -558,88 +560,48 @@ def _process_surface(
             distributed_infer=bool(distributed_infer),
             enforce_dry_run_quality_gate=bool(dry_run_mode),
         )
-        up_final_tifxyz = up_result.final_tifxyz_path
-        up_summary = up_result.stage_summary
-        _write_json(paths.summaries_dir / "summary_up.json", up_summary)
+        current_input = stage_result.final_tifxyz_path
+        summary_path = paths.summaries_dir / f"summary_{direction}.json"
+        _write_json(summary_path, stage_result.stage_summary)
+        direction_summaries[direction] = stage_result.stage_summary
         state = _update_surface_state(
             state=state,
-            status="up_done",
+            status=done_status,
             manifest_jsonl_path=manifest_jsonl_path,
-            extra={"up_final_tifxyz_path": str(up_final_tifxyz), "summary_up_path": str(paths.summaries_dir / "summary_up.json")},
+            extra={f"{direction}_final_tifxyz_path": str(current_input), f"summary_{direction}_path": str(summary_path)},
         )
 
-    if "up" not in _active_directions and str(state.get("status")) == "scaled":
-        state = _update_surface_state(state=state, status="up_done", manifest_jsonl_path=manifest_jsonl_path, extra={"up_final_tifxyz_path": str(state["scaled_input_path"])})
-    if str(state.get("status")) in {"up_done", "down_running"} and "down" in _active_directions:
-        state = _update_surface_state(
-            state=state,
-            status="down_running",
-            manifest_jsonl_path=manifest_jsonl_path,
-        )
-        down_input = Path(state["up_final_tifxyz_path"])
-        down_output_dir = paths.output_dir / "down_stage"
-        down_result = _run_direction_to_exhaustion(
-            input_tifxyz_path=down_input,
-            output_dir=down_output_dir,
-            direction="down",
-            volume_uri=volume_uri,
-            dino_backbone=dino_backbone,
-            autoreg_checkpoint=autoreg_checkpoint,
-            window_batch_size=window_batch_size,
-            max_extension_iters_per_call=max_extension_iters_per_call,
-            show_progress=show_progress,
-            max_calls=int(dry_run_max_calls_per_direction) if dry_run_mode else None,
+    write_tifxyz(paths.final_tifxyz_dir, read_tifxyz(current_input, load_mask=True, validate=True).use_stored_resolution(), overwrite=True)
+    last_dir = _active_directions[-1] if _active_directions else "none"
+    last_summary = direction_summaries.get(last_dir, {"final": {}})
+    first_summary = direction_summaries.get(_active_directions[0], {"final": {}}) if _active_directions else {"final": {}}
+    manifest = {
+        "relative_surface_id": relative_surface_id,
+        "timestamp_suffix": str(state["timestamp_suffix"]),
+        "coordinate_scale_factor": float(coordinate_scale_factor),
+        "source_s3_uri": str(state["source_s3_uri"]),
+        "source_local_path": str(state["source_local_path"]),
+        "local_output_dir": str(paths.output_dir),
+        "s3_surface_prefix": paths.s3_surface_prefix,
+        "final_tifxyz_dir": str(paths.final_tifxyz_dir),
+        "directions": list(_active_directions),
+        "direction_summaries": {d: s.get("final", {}) for d, s in direction_summaries.items()},
+        "extension_preset": first_summary.get("extension_preset") or _title_hunt_extension_preset(
+            window_batch_size=int(window_batch_size),
+            show_progress=bool(show_progress),
             distributed_infer=bool(distributed_infer),
-            enforce_dry_run_quality_gate=bool(dry_run_mode),
-        )
-        down_final_tifxyz = down_result.final_tifxyz_path
-        down_summary = down_result.stage_summary
-        _write_json(paths.summaries_dir / "summary_down.json", down_summary)
-        write_tifxyz(paths.final_tifxyz_dir, read_tifxyz(down_final_tifxyz, load_mask=True, validate=True).use_stored_resolution(), overwrite=True)
-        state = _update_surface_state(
-            state=state,
-            status="down_done",
-            manifest_jsonl_path=manifest_jsonl_path,
-            extra={"down_final_tifxyz_path": str(paths.final_tifxyz_dir), "summary_down_path": str(paths.summaries_dir / "summary_down.json")},
-        )
-
-    if "down" not in _active_directions and str(state.get("status")) == "up_done":
-        state = _update_surface_state(state=state, status="down_done", manifest_jsonl_path=manifest_jsonl_path, extra={"down_final_tifxyz_path": state.get("up_final_tifxyz_path", ""), "summary_down_path": ""})
-    if str(state.get("status")) in {"down_done", "uploaded"}:
-        summary_up = json.loads(Path(state["summary_up_path"]).read_text())
-        summary_down = json.loads(Path(state["summary_down_path"]).read_text())
-        manifest = {
-            "relative_surface_id": relative_surface_id,
-            "timestamp_suffix": str(state["timestamp_suffix"]),
-            "coordinate_scale_factor": float(coordinate_scale_factor),
-            "source_s3_uri": str(state["source_s3_uri"]),
-            "source_local_path": str(state["source_local_path"]),
-            "local_output_dir": str(paths.output_dir),
-            "s3_surface_prefix": paths.s3_surface_prefix,
-            "final_tifxyz_dir": str(paths.final_tifxyz_dir),
-            "summary_up": summary_up["final"],
-            "summary_down": summary_down["final"],
-            "extension_preset": summary_up.get("extension_preset") or _title_hunt_extension_preset(
-                window_batch_size=int(window_batch_size),
-                show_progress=bool(show_progress),
-                distributed_infer=bool(distributed_infer),
-            ),
-            "summary_up_path": str(paths.summaries_dir / "summary_up.json"),
-            "summary_down_path": str(paths.summaries_dir / "summary_down.json"),
-            "final_predicted_vertex_count": int(summary_down["final"].get("predicted_vertex_count", 0)),
-            "final_stop_reason_up": str(summary_up["final"].get("stop_reason")),
-            "final_stop_reason_down": str(summary_down["final"].get("stop_reason")),
-            "up_call_count": int(summary_up["call_count"]),
-            "down_call_count": int(summary_down["call_count"]),
-        }
-        _write_json(paths.manifest_path, manifest)
-        _upload_surface_output(paths)
-        state = _update_surface_state(
-            state=state,
-            status="uploaded",
-            manifest_jsonl_path=manifest_jsonl_path,
-            extra={"manifest_path": str(paths.manifest_path), "s3_surface_prefix": paths.s3_surface_prefix},
-        )
+        ),
+        "final_predicted_vertex_count": int(last_summary.get("final", {}).get("predicted_vertex_count", 0)),
+        "direction_call_counts": {d: int(s.get("call_count", 0)) for d, s in direction_summaries.items()},
+    }
+    _write_json(paths.manifest_path, manifest)
+    _upload_surface_output(paths)
+    state = _update_surface_state(
+        state=state,
+        status="uploaded",
+        manifest_jsonl_path=manifest_jsonl_path,
+        extra={"manifest_path": str(paths.manifest_path), "s3_surface_prefix": paths.s3_surface_prefix},
+    )
 
     return state
 
