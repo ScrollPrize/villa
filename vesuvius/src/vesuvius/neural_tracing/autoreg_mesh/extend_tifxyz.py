@@ -344,6 +344,72 @@ def _trim_grid_to_valid_bbox(grid_zyx: np.ndarray, provenance: np.ndarray | None
     return trimmed_grid, trimmed_provenance, (int(rows[0]), int(rows[-1]), int(cols[0]), int(cols[-1]))
 
 
+def _smooth_frontier(grid_zyx: np.ndarray, direction: str, *, max_row_deviation: int = 8) -> np.ndarray:
+    grid = grid_zyx.copy()
+    valid = np.isfinite(grid).all(axis=-1)
+    h, w = valid.shape
+
+    if direction in {"up", "left"}:
+        first_valid = np.full(w if direction == "up" else h, -1, dtype=np.int64)
+        axis_size = h if direction == "up" else w
+        for i in range(w if direction == "up" else h):
+            col = valid[:, i] if direction == "up" else valid[i, :]
+            indices = np.where(col)[0]
+            if len(indices) > 0:
+                first_valid[i] = indices[0]
+    else:
+        first_valid = np.full(w if direction == "down" else h, -1, dtype=np.int64)
+        axis_size = h if direction == "down" else w
+        for i in range(w if direction == "down" else h):
+            col = valid[:, i] if direction == "down" else valid[i, :]
+            indices = np.where(col)[0]
+            if len(indices) > 0:
+                first_valid[i] = indices[-1]
+
+    has_data = first_valid >= 0
+    if has_data.sum() < 3:
+        return grid
+
+    kernel = 15
+    half = kernel // 2
+    median_frontier = np.full_like(first_valid, -1)
+    for i in range(len(first_valid)):
+        if not has_data[i]:
+            continue
+        lo = max(0, i - half)
+        hi = min(len(first_valid), i + half + 1)
+        neighbors = first_valid[lo:hi]
+        neighbors = neighbors[neighbors >= 0]
+        if len(neighbors) > 0:
+            median_frontier[i] = int(np.median(neighbors))
+
+    smoothed_count = 0
+    for i in range(len(first_valid)):
+        if not has_data[i] or median_frontier[i] < 0:
+            continue
+        dev = abs(int(first_valid[i]) - int(median_frontier[i]))
+        if dev > int(max_row_deviation):
+            old_row = int(first_valid[i])
+            target_row = int(median_frontier[i])
+            if direction in {"up", "left"}:
+                if old_row < target_row:
+                    if direction == "up":
+                        grid[old_row:target_row, i, :] = np.nan
+                    else:
+                        grid[i, old_row:target_row, :] = np.nan
+            else:
+                if old_row > target_row:
+                    if direction == "down":
+                        grid[target_row + 1:old_row + 1, i, :] = np.nan
+                    else:
+                        grid[i, target_row + 1:old_row + 1, :] = np.nan
+            smoothed_count += 1
+
+    if smoothed_count > 0:
+        _log(f"[frontier-smooth] trimmed {smoothed_count} jagged frontier vertices (max_row_deviation={max_row_deviation})")
+    return grid
+
+
 def _parse_s3_uri(uri: str) -> tuple[str, str]:
     if not str(uri).startswith("s3://"):
         raise ValueError(f"expected s3:// URI, got {uri!r}")
@@ -456,12 +522,32 @@ def _crop_min_corner_for_points(points_zyx: np.ndarray, crop_size: tuple[int, in
     if not bool(np.any(finite)):
         return None
     valid_points = np.asarray(points_zyx[finite], dtype=np.float32)
-    low = valid_points.min(axis=0) - float(margin)
-    high = valid_points.max(axis=0) + float(margin)
-    extent = high - low
     crop = np.asarray(crop_size, dtype=np.float32)
-    if np.any(extent >= crop):
-        return None
+
+    for _trim_pass in range(3):
+        low = valid_points.min(axis=0) - float(margin)
+        high = valid_points.max(axis=0) + float(margin)
+        extent = high - low
+        if not np.any(extent >= crop):
+            break
+        over = extent - crop
+        worst_axis = int(np.argmax(over))
+        if over[worst_axis] <= 0:
+            break
+        axis_vals = valid_points[:, worst_axis]
+        med = float(np.median(axis_vals))
+        dist = np.abs(axis_vals - med)
+        keep = dist <= float(crop[worst_axis]) * 0.45
+        if keep.sum() < max(3, int(len(valid_points) * 0.5)):
+            return None
+        valid_points = valid_points[keep]
+    else:
+        low = valid_points.min(axis=0) - float(margin)
+        high = valid_points.max(axis=0) + float(margin)
+        extent = high - low
+        if np.any(extent >= crop):
+            return None
+
     center = 0.5 * (low + high)
     min_corner = np.floor(center - 0.5 * crop).astype(np.int64)
     return min_corner
@@ -1525,6 +1611,12 @@ def extend_tifxyz_mesh(
             surface_uuid = str(surface.uuid or Path(tifxyz_path).name)
             provenance = np.zeros(grid_zyx.shape[:2], dtype=np.uint8)
             grid_zyx, provenance, trimmed_bbox_rc = _trim_grid_to_valid_bbox(grid_zyx, provenance)
+            pre_direction = None if grow_direction in {None, "", "auto"} else str(grow_direction)
+            if pre_direction is not None:
+                grid_zyx = _smooth_frontier(grid_zyx, pre_direction)
+            else:
+                for d in ["up", "down", "left", "right"]:
+                    grid_zyx = _smooth_frontier(grid_zyx, d)
             direction = choose_growth_direction(
                 grid_zyx,
                 prompt_strips=int(prompt_strips),
