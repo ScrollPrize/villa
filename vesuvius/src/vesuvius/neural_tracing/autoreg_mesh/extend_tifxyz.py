@@ -406,7 +406,7 @@ def _smooth_frontier(grid_zyx: np.ndarray, direction: str, *, max_row_deviation:
             smoothed_count += 1
 
     if smoothed_count > 0:
-        _log(f"[frontier-smooth] trimmed {smoothed_count} jagged frontier vertices (max_row_deviation={max_row_deviation})")
+        print(f"[frontier-smooth] trimmed {smoothed_count} jagged frontier vertices (max_row_deviation={max_row_deviation})")
     return grid
 
 
