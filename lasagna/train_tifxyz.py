@@ -481,8 +481,8 @@ def fft_magnitude_loss(pred_cos, gt_cos, validity, grad_mag,
                 p = pred_cos[:, 0, z0:z1, y0:y1, x0:x1]
                 g = gt_cos[:, 0, z0:z1, y0:y1, x0:x1]
 
-                fft_p = torch.fft.rfftn(p, dim=(-3, -2, -1))
-                fft_g = torch.fft.rfftn(g, dim=(-3, -2, -1))
+                fft_p = torch.fft.rfftn(p.float(), dim=(-3, -2, -1))
+                fft_g = torch.fft.rfftn(g.float(), dim=(-3, -2, -1))
                 mag_p = fft_p.abs()
                 mag_g = fft_g.abs()
 
@@ -1169,6 +1169,7 @@ def train(
     reinit_decoder_scales: int = 0,
     himag_filter: bool = True,
     w_dist: float = 0.0,
+    w_fft: float = 0.0,
     num_loss_scales: int = 5,
     deform_enabled: bool = True,
     deform_stride: int = 8,
@@ -1455,12 +1456,15 @@ def train(
     pause_server = GpuPauseServer() if is_main else None
 
     def _gpu_offload():
+        import gc
         model.cpu()
         for s in optimizer.state.values():
             for k, v in s.items():
                 if isinstance(v, torch.Tensor):
                     s[k] = v.cpu()
+        gc.collect()
         torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
     def _gpu_reload():
         model.to(device)
@@ -1605,6 +1609,7 @@ def train(
         deform_max_frac=deform_max_frac,
         vis_samples=VIS_SAMPLES,
         w_dist=w_dist,
+        w_fft=w_fft,
     )
     if _init_vis_batch:
         _log_full_vis(_init_vis_batch[0], "val", global_step)
@@ -1978,6 +1983,7 @@ def train(
 
                 # --- GT deformation inner loop ---
                 targets_original = targets
+                cos_mask_original = cos_mask
                 targets_deformed = None
                 if deform_store is not None and not use_aug:
                     batch_global_idxs = [
@@ -2050,6 +2056,13 @@ def train(
                     )
                     if w_dist > 0 else pred.new_zeros(1).squeeze()
                 )
+                loss_fft = (
+                    fft_magnitude_loss(
+                        pred[:, 0:1], targets_original[:, 0:1],
+                        cos_mask_original, targets_original[:, 1:2],
+                    )
+                    if w_fft > 0 else pred.new_zeros(1).squeeze()
+                )
                 loss = (
                     w_cos * loss_cos
                     + w_mag * loss_mag
@@ -2057,6 +2070,7 @@ def train(
                     + w_dir_dense * loss_dir_dense
                     + w_smooth * loss_smooth
                     + w_dist * loss_dist
+                    + w_fft * loss_fft
                 )
 
                 # Sign-invariant unsigned angular error on sparse
@@ -2132,6 +2146,10 @@ def train(
                 if w_dist > 0:
                     log_scalar(
                         "train/loss_dist", loss_dist.item(), global_step,
+                    )
+                if w_fft > 0:
+                    log_scalar(
+                        "train/loss_fft", loss_fft.item(), global_step,
                     )
                 log_scalar(
                     "train/dir_angle_deg_sparse",
@@ -2290,6 +2308,7 @@ def _evaluate(
     deform_max_frac: float = 0.3,
     vis_samples: int = 8,
     w_dist: float = 0.0,
+    w_fft: float = 0.0,
 ):
     model.eval()
     losses = []
@@ -2335,6 +2354,7 @@ def _evaluate(
 
             # Deformation inner loop (same as training)
             targets_original = targets
+            cos_mask_original = cos_mask
             if deform_store is not None:
                 batch_gidxs = [pi["global_idx"] for pi in batch["patch_info"]]
                 deform_batch = deform_store.get(batch_gidxs).to(device)
@@ -2389,6 +2409,13 @@ def _evaluate(
                 )
                 if w_dist > 0 else pred.new_zeros(1).squeeze()
             )
+            loss_fft = (
+                fft_magnitude_loss(
+                    pred[:, 0:1], targets_original[:, 0:1],
+                    cos_mask_original, targets_original[:, 1:2],
+                )
+                if w_fft > 0 else pred.new_zeros(1).squeeze()
+            )
             loss = (
                 w_cos * loss_cos
                 + w_mag * loss_mag
@@ -2396,6 +2423,7 @@ def _evaluate(
                 + w_dir_dense * loss_dir_dense
                 + w_smooth * loss_smooth
                 + w_dist * loss_dist
+                + w_fft * loss_fft
             )
             losses.append(loss.item())
             losses_cos.append(loss_cos.item())
@@ -2574,6 +2602,9 @@ def main() -> None:
     parser.add_argument("--w-dist", type=float, default=0.0,
                         help="Weight on sort-based distribution loss for cos "
                              "(phase-invariant). 0 = off.")
+    parser.add_argument("--w-fft", type=float, default=0.0,
+                        help="Weight on FFT magnitude loss for cos "
+                             "(phase-invariant frequency matching). 0 = off.")
     parser.add_argument("--num-loss-scales", type=int, default=5,
                         help="Number of scales in scale-space loss (1 = no multi-scale).")
     parser.add_argument("--no-deform", action="store_true",
@@ -2628,6 +2659,7 @@ def main() -> None:
         reinit_decoder_scales=args.reinit_decoder_scales,
         himag_filter=not args.no_himag_filter,
         w_dist=args.w_dist,
+        w_fft=args.w_fft,
         num_loss_scales=args.num_loss_scales,
         deform_enabled=not args.no_deform,
         deform_stride=args.deform_stride,
