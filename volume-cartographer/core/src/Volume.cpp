@@ -260,8 +260,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     auto resolved = vc::resolveRemoteUrl(url);
     vc::cache::HttpAuth auth = authIn;
     if (resolved.useAwsSigv4 && !auth.awsSigv4) {
-        // Caller didn't provide auth — populate from env vars
-        auth.awsSigv4 = true;
+        // Caller didn't provide auth — try env vars, fall back to anonymous
         auth.region = resolved.awsRegion;
         auto getEnv = [](const char* name) -> std::string {
             const char* v = std::getenv(name);
@@ -270,6 +269,9 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
         auth.accessKey = getEnv("AWS_ACCESS_KEY_ID");
         auth.secretKey = getEnv("AWS_SECRET_ACCESS_KEY");
         auth.sessionToken = getEnv("AWS_SESSION_TOKEN");
+        // Only enable SigV4 if credentials are actually available.
+        // Empty credentials → anonymous unsigned HTTPS request (public buckets).
+        auth.awsSigv4 = !auth.accessKey.empty() && !auth.secretKey.empty();
     } else if (resolved.useAwsSigv4 && auth.awsSigv4 && auth.region.empty()) {
         auth.region = resolved.awsRegion;
     }
