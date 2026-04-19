@@ -252,6 +252,9 @@ def main():
     parser.add_argument("--patch-size", type=int, default=192)
     parser.add_argument("--label-patch-size", type=int, default=None)
     parser.add_argument("--workers", type=int, default=128)
+    parser.add_argument("--refine", action="store_true",
+                        help="Also fetch coarse (scale+1) and fine (scale-1) "
+                             "chunks for multi-scale refinement training.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Only discover and count chunks, don't download.")
     args = parser.parse_args()
@@ -260,6 +263,8 @@ def main():
         config = json.load(f)
     config["patch_size"] = args.patch_size
     config["label_patch_size"] = args.label_patch_size or args.patch_size
+    if args.refine:
+        config["refine_mode"] = True
 
     cache_dir = config.get("volume_cache_dir")
     if not cache_dir:
@@ -295,6 +300,7 @@ def main():
 
     scale_aug_enabled = float(config.get("scale_aug_prob", 0)) > 0
     scale_aug_factor = int(config.get("scale_aug_factor", 2))
+    refine_mode = bool(config.get("refine_mode", False))
 
     # --- Detect chunk key format by reading one chunk via logging store ---
     # Monkey-patch briefly: read a single voxel from each volume to see
@@ -318,7 +324,14 @@ def main():
         uri = ds_uri_map.get(patch.dataset_idx)
         if not uri or not uri.startswith("s3://"):
             continue
-        for sc in [patch.scale] + ([patch.scale + 1] if scale_aug_enabled else []):
+        extra_scales = []
+        if scale_aug_enabled:
+            extra_scales.append(patch.scale + 1)
+        if refine_mode:
+            extra_scales.append(patch.scale + 1)  # coarse
+            if patch.scale - 1 >= 0:
+                extra_scales.append(patch.scale - 1)  # fine
+        for sc in [patch.scale] + list(set(extra_scales)):
             vk = (uri, sc)
             if vk in seen_vol_keys:
                 continue
@@ -391,24 +404,37 @@ def main():
 
     # Collect volume metadata (shape, chunks) from the already-opened arrays
     vol_meta: dict[tuple[str, int], tuple] = {}  # (uri, scale) -> (shape, chunks)
+    def _add_vol_meta(uri, scale, arr):
+        vk = (uri, scale)
+        if vk not in vol_meta:
+            chunks = arr.chunks if hasattr(arr, 'chunks') else arr.metadata.chunk_grid.chunk_shape
+            vol_meta[vk] = (arr.shape, chunks)
     for patch in dataset.patches:
         uri = ds_uri_map.get(patch.dataset_idx)
         if not uri:
             continue
-        vk = (uri, patch.scale)
-        if vk not in vol_meta:
-            arr = patch.volume
-            chunks = arr.chunks if hasattr(arr, 'chunks') else arr.metadata.chunk_grid.chunk_shape
-            vol_meta[vk] = (arr.shape, chunks)
-        if scale_aug_enabled and patch.volume_group is not None:
-            vk_aug = (uri, patch.scale + 1)
-            if vk_aug not in vol_meta:
+        _add_vol_meta(uri, patch.scale, patch.volume)
+        if patch.volume_group is not None:
+            # Scale aug: coarser level
+            if scale_aug_enabled:
                 try:
-                    aug_arr = patch.volume_group[str(patch.scale + 1)]
-                    chunks = aug_arr.chunks if hasattr(aug_arr, 'chunks') else aug_arr.metadata.chunk_grid.chunk_shape
-                    vol_meta[vk_aug] = (aug_arr.shape, chunks)
+                    _add_vol_meta(uri, patch.scale + 1,
+                                  patch.volume_group[str(patch.scale + 1)])
                 except (KeyError, IndexError):
                     pass
+            # Refine: coarser + finer levels
+            if refine_mode:
+                try:
+                    _add_vol_meta(uri, patch.scale + 1,
+                                  patch.volume_group[str(patch.scale + 1)])
+                except (KeyError, IndexError):
+                    pass
+                if patch.scale - 1 >= 0:
+                    try:
+                        _add_vol_meta(uri, patch.scale - 1,
+                                      patch.volume_group[str(patch.scale - 1)])
+                    except (KeyError, IndexError):
+                        pass
 
     # Enumerate chunks per volume/scale
     chunks_needed: dict[tuple[str, int], set[tuple[int, int, int]]] = collections.defaultdict(set)
@@ -467,6 +493,41 @@ def main():
                 chunks_needed[vk_aug].update(
                     _enumerate_chunk_indices(shape_aug, chk_aug, cmin, cmax)
                 )
+
+        # Refine multi-scale: coarse (scale+1) and fine (scale-1)
+        if refine_mode:
+            base_center = (worst_min + worst_max) // 2
+
+            # Coarse (zarr level+1): P coarse voxels, each = 2 base voxels.
+            # coarse_min = (base_center - P) // 2 + coarse_offset // 2
+            # coarse_offset in [0, P//2), so worst-case envelope:
+            vk_m1 = (uri, patch.scale + 1)
+            meta_m1 = vol_meta.get(vk_m1)
+            if meta_m1:
+                shape_m1, chk_m1 = meta_m1
+                coarse_min_worst = (base_center - P) // 2
+                coarse_max_worst = coarse_min_worst + P // 4 + P
+                cmin = np.clip(coarse_min_worst, 0, np.array(shape_m1) - 1)
+                cmax = np.clip(coarse_max_worst, 1, np.array(shape_m1))
+                chunks_needed[vk_m1].update(
+                    _enumerate_chunk_indices(shape_m1, chk_m1, cmin, cmax)
+                )
+
+            # Fine (zarr level-1): P fine voxels, each = 0.5 base voxels.
+            # fine_ct_min = (base_min + fine_offset) * 2
+            # fine_offset in [0, P//2], so worst-case envelope:
+            if patch.scale - 1 >= 0:
+                vk_p1 = (uri, patch.scale - 1)
+                meta_p1 = vol_meta.get(vk_p1)
+                if meta_p1:
+                    shape_p1, chk_p1 = meta_p1
+                    fine_min_worst = worst_min * 2
+                    fine_max_worst = (worst_max + P // 2) * 2 + P
+                    cmin = np.clip(fine_min_worst, 0, np.array(shape_p1) - 1)
+                    cmax = np.clip(fine_max_worst, 1, np.array(shape_p1))
+                    chunks_needed[vk_p1].update(
+                        _enumerate_chunk_indices(shape_p1, chk_p1, cmin, cmax)
+                    )
 
         if (i + 1) % 2000 == 0 or i == n_patches - 1:
             elapsed = time.monotonic() - t_scan
