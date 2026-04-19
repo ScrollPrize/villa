@@ -107,7 +107,6 @@ class RotarySelfAttention(nn.Module):
             raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
         self.num_heads = int(num_heads)
         self.head_dim = int(dim // num_heads)
-        self.scale = self.head_dim ** -0.5
         self.rope = rope
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim, bias=True)
@@ -122,7 +121,6 @@ class RotarySelfAttention(nn.Module):
         sin, cos = _batched_rope_from_coords(self.rope, coords)
         q = apply_rotary_embedding(q, (sin, cos)).type_as(v)
         k = apply_rotary_embedding(k, (sin, cos)).type_as(v)
-        q = q * self.scale
         out = F.scaled_dot_product_attention(
             q,
             k,
@@ -151,7 +149,6 @@ class RotarySelfAttention(nn.Module):
         if cached_k is not None:
             k = torch.cat([cached_k, k], dim=2)
             v = torch.cat([cached_v, v], dim=2)
-        q = q * self.scale
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
         out = out.transpose(1, 2).reshape(batch_size, seq_len, dim)
         return self.proj(out), k, v
@@ -172,7 +169,6 @@ class CrossAttention(nn.Module):
             raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
         self.num_heads = int(num_heads)
         self.head_dim = int(dim // num_heads)
-        self.scale = self.head_dim ** -0.5
         self.rope = rope
         self.use_rope = bool(use_rope and rope is not None)
         self.q_proj = nn.Linear(dim, dim, bias=True)
@@ -193,7 +189,6 @@ class CrossAttention(nn.Module):
             (q_sin, q_cos), (k_sin, k_cos) = _batched_shared_rope_from_coords(self.rope, query_coords, memory_coords)
             q = apply_rotary_embedding(q, (q_sin, q_cos)).type_as(v)
             k = apply_rotary_embedding(k, (k_sin, k_cos)).type_as(v)
-        q = q * self.scale
         out = F.scaled_dot_product_attention(
             q,
             k,
@@ -228,7 +223,6 @@ class CrossAttention(nn.Module):
         if self.use_rope and query_coords is not None:
             q_sin, q_cos = _batched_rope_from_coords(self.rope, query_coords)
             q = apply_rotary_embedding(q, (q_sin, q_cos)).type_as(precomputed_v)
-        q = q * self.scale
         out = F.scaled_dot_product_attention(q, precomputed_k, precomputed_v, attn_mask=None, dropout_p=0.0, is_causal=False)
         out = out.transpose(1, 2).reshape(batch_size, seq_len, dim)
         return self.out_proj(out)
@@ -1257,7 +1251,6 @@ class AutoregMeshModel(nn.Module):
             q = apply_rotary_embedding(q, (sin, cos)).type_as(v)
             k = apply_rotary_embedding(k, (sin, cos)).type_as(v)
             self_attn_kv.append((k, v))
-            q = q * block.self_attn.scale
             sa_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
             sa_out = sa_out.transpose(1, 2).reshape(batch_size, seq_len, dim)
             x = x + block.self_attn.proj(sa_out)
