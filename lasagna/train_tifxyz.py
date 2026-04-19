@@ -246,6 +246,9 @@ def compute_batch_targets(
 
     all_dts_batch: list[list[torch.Tensor]] = []  # per-sample per-surface EDTs
     all_fts_batch: list[list[torch.Tensor] | None] = []
+    all_bracket_frac: list[torch.Tensor] = []
+    all_bracket_lo: list[torch.Tensor] = []
+    all_bracket_hi: list[torch.Tensor] = []
 
     for b in range(B):
         # Convert surface masks to CUDA bool tensors
@@ -326,17 +329,26 @@ def compute_batch_targets(
         all_dts_batch.append(dts)
         all_fts_batch.append(fts)
 
+        # Bracket routing info for cage deformation
+        all_bracket_frac.append(result["bracket_frac"])
+        all_bracket_lo.append(result["bracket_lo"])
+        all_bracket_hi.append(result["bracket_hi"])
+
     targets = torch.stack(all_targets, dim=0)       # (B, 8, Z, Y, X)
     validity = torch.stack(all_validity, dim=0).unsqueeze(1).float()  # (B, 1, Z, Y, X)
     dir_sparse_mask = torch.stack(all_sparse_masks, dim=0).unsqueeze(1).float()
     dir_dense_mask = torch.stack(all_dense_masks, dim=0).unsqueeze(1).float()
     dir_axis_weight = torch.stack(all_axis_weight, dim=0)  # (B, 6, Z, Y, X)
+    bracket_frac = torch.stack(all_bracket_frac, dim=0)    # (B, Z, Y, X)
+    bracket_lo = torch.stack(all_bracket_lo, dim=0)        # (B, Z, Y, X)
+    bracket_hi = torch.stack(all_bracket_hi, dim=0)        # (B, Z, Y, X)
 
     return (
         targets, validity,
         dir_sparse_mask, dir_dense_mask, dir_axis_weight,
         merge_groups_batch, merged_masks_batch, merged_chain_info_batch,
         all_dts_batch,
+        bracket_frac, bracket_lo, bracket_hi,
     )
 
 
@@ -816,200 +828,8 @@ def build_model(
 
 
 # ---------------------------------------------------------------------------
-# Training-adaptive GT deformation
+# Warp helpers (used by cage deformation)
 # ---------------------------------------------------------------------------
-
-
-class DeformationStore:
-    """Per-sample low-res deformation fields, disk-backed via np.memmap.
-
-    Each dataset config entry gets its own memmap file keyed by
-    ``segments_path`` and ``dataset_idx`` for portability.  Deformations
-    are stored as float16 to halve disk/memory use and converted to
-    float32 only when loaded onto GPU.
-    """
-
-    def __init__(
-        self,
-        patches: list,   # list of ChunkPatch from dataset.patches
-        config: dict,    # the parsed JSON config (has "datasets" key)
-        grid_size: int,
-        run_dir: Path,
-    ):
-        self.grid_size = grid_size
-        self.deform_dir = run_dir / "deformations"
-        self.deform_dir.mkdir(parents=True, exist_ok=True)
-
-        # Group patches by (segments_path, dataset_idx) and count.
-        from collections import OrderedDict
-        groups: OrderedDict[str, int] = OrderedDict()
-        # Map global patch idx -> (group_key, local_idx)
-        self._index: list[tuple[str, int]] = []
-
-        # We need the segments_path per patch.  It's on the config but
-        # not on ChunkPatch directly.  Build from config datasets list.
-        ds_key_map: dict[int, str] = {}   # dataset_idx -> segments_path
-        for di, ds in enumerate(config["datasets"]):
-            sp = ds.get("segments_path", "")
-            if sp:
-                ds_key_map[di] = sp
-
-        for patch in patches:
-            sp = ds_key_map.get(patch.dataset_idx, f"unknown_{patch.dataset_idx}")
-            key = self._make_key(sp, patch.dataset_idx)
-            if key not in groups:
-                groups[key] = 0
-            local_i = patch.dataset_local_idx
-            # Ensure count covers this index
-            groups[key] = max(groups[key], local_i + 1)
-
-        # Second pass: build index
-        for patch in patches:
-            sp = ds_key_map.get(patch.dataset_idx, f"unknown_{patch.dataset_idx}")
-            key = self._make_key(sp, patch.dataset_idx)
-            self._index.append((key, patch.dataset_local_idx))
-
-        # Open/create memmaps — scalar offset (1, G, G, G) per sample
-        shape_tail = (1, grid_size, grid_size, grid_size)
-        self._memmaps: dict[str, np.memmap] = {}
-        for key, count in groups.items():
-            path = self.deform_dir / f"{key}.bin"
-            shape = (count, *shape_tail)
-            expected_bytes = int(np.prod(shape)) * 2  # float16
-            if path.exists() and path.stat().st_size == expected_bytes:
-                mm = np.memmap(path, dtype=np.float16, mode="r+", shape=shape)
-            else:
-                mm = np.memmap(path, dtype=np.float16, mode="w+", shape=shape)
-            self._memmaps[key] = mm
-
-    @staticmethod
-    def _make_key(segments_path: str, dataset_idx: int) -> str:
-        sanitized = segments_path.replace("/", "_").strip("_")
-        return f"{sanitized}__ds{dataset_idx}"
-
-    def get(self, global_indices: list[int]) -> torch.Tensor:
-        """Load deformations for batch, returns (B, 1, G, G, G) float32 scalar offsets."""
-        out = []
-        for gi in global_indices:
-            key, li = self._index[gi]
-            arr = np.array(self._memmaps[key][li], dtype=np.float32)
-            out.append(torch.from_numpy(arr))
-        return torch.stack(out)
-
-    def put(self, global_indices: list[int], deforms: torch.Tensor):
-        """Write optimized deformations back as float16."""
-        arr = deforms.detach().cpu().to(torch.float16).numpy()
-        for i, gi in enumerate(global_indices):
-            key, li = self._index[gi]
-            self._memmaps[key][li] = arr[i]
-
-    def flush(self):
-        for mm in self._memmaps.values():
-            mm.flush()
-
-
-def _augment_deform(deform, flip_z, flip_y, flip_x, k):
-    """Transform scalar deformation field to match spatial augmentation.
-
-    deform: (B, 1, G, G, G) scalar offset (sign-invariant under flips).
-    Only spatial permutations needed — no component sign changes.
-    """
-    d = deform
-    if flip_z:
-        d = torch.flip(d, [2])
-    if flip_y:
-        d = torch.flip(d, [3])
-    if flip_x:
-        d = torch.flip(d, [4])
-    if k % 4:
-        d = torch.rot90(d, k % 4, dims=(3, 4))
-    return d
-
-
-def _unaugment_deform(deform, flip_z, flip_y, flip_x, k):
-    """Inverse of _augment_deform: augmented space -> pre-aug storage space."""
-    d = deform
-    if (4 - k) % 4:
-        d = torch.rot90(d, (4 - k) % 4, dims=(3, 4))
-    if flip_x:
-        d = torch.flip(d, [4])
-    if flip_y:
-        d = torch.flip(d, [3])
-    if flip_z:
-        d = torch.flip(d, [2])
-    return d
-
-
-def _compute_normal_field(cos_targets, grid_size):
-    """Compute unit normal direction at deformation grid resolution.
-
-    The spatial gradient of the cos channel points along the surface
-    normal (perpendicular to iso-surfaces of the cos field).
-
-    Args:
-        cos_targets: (B, 1, Z, Y, X) cos channel from targets
-        grid_size: G — deformation grid resolution per axis
-
-    Returns: (B, 3, G, G, G) unit normals in (dz, dy, dx) order
-    """
-    cos_ds = F.adaptive_avg_pool3d(cos_targets, (grid_size, grid_size, grid_size))
-    cos_pad = F.pad(cos_ds, (1, 1, 1, 1, 1, 1), mode="replicate")
-    gz = (cos_pad[:, :, 2:, 1:-1, 1:-1] - cos_pad[:, :, :-2, 1:-1, 1:-1]) / 2
-    gy = (cos_pad[:, :, 1:-1, 2:, 1:-1] - cos_pad[:, :, 1:-1, :-2, 1:-1]) / 2
-    gx = (cos_pad[:, :, 1:-1, 1:-1, 2:] - cos_pad[:, :, 1:-1, 1:-1, :-2]) / 2
-    normals = torch.cat([gz, gy, gx], dim=1)  # (B, 3, G, G, G)
-    norm = normals.norm(dim=1, keepdim=True).clamp(min=1e-8)
-    return normals / norm
-
-
-def _enforce_positive_jacobian(deform_scalar, normal_dir):
-    """Scale back scalar deformation where the warp Jacobian folds.
-
-    Computes the 3x3 Jacobian of the displacement field (scalar * normal)
-    at the coarse grid via central finite differences, checks
-    det(I + J) > 0.  Where non-positive, halves the scalar iteratively.
-
-    Args:
-        deform_scalar: (B, 1, G, G, G) scalar offsets (modified in-place)
-        normal_dir: (B, 3, G, G, G) unit normals
-    """
-    disp = deform_scalar * normal_dir  # (B, 3, G, G, G)
-    disp_pad = F.pad(disp, (1, 1, 1, 1, 1, 1), mode="replicate")
-    # Jacobian J[i,j] = d(disp_i)/d(x_j), central finite diffs
-    # i = component (0=z, 1=y, 2=x), j = spatial axis
-    dz = (disp_pad[:, :, 2:, 1:-1, 1:-1] - disp_pad[:, :, :-2, 1:-1, 1:-1]) / 2
-    dy = (disp_pad[:, :, 1:-1, 2:, 1:-1] - disp_pad[:, :, 1:-1, :-2, 1:-1]) / 2
-    dx = (disp_pad[:, :, 1:-1, 1:-1, 2:] - disp_pad[:, :, 1:-1, 1:-1, :-2]) / 2
-    # det(I + J) where J columns are (dz, dy, dx)
-    # I + J has rows for each component, columns for each spatial axis
-    # Row i, col j = delta_ij + J[i,j]
-    a00 = 1 + dz[:, 0]; a01 = dy[:, 0]; a02 = dx[:, 0]
-    a10 = dz[:, 1]; a11 = 1 + dy[:, 1]; a12 = dx[:, 1]
-    a20 = dz[:, 2]; a21 = dy[:, 2]; a22 = 1 + dx[:, 2]
-    det = (a00 * (a11 * a22 - a12 * a21)
-           - a01 * (a10 * a22 - a12 * a20)
-           + a02 * (a10 * a21 - a11 * a20))
-    # Where det <= 0, scale back scalar
-    bad = det <= 0  # (B, G, G, G)
-    if bad.any():
-        # Halve scalar at bad locations (repeat until positive or 8 tries)
-        for _ in range(8):
-            deform_scalar.data[bad.unsqueeze(1).expand_as(deform_scalar)] *= 0.5
-            disp = deform_scalar * normal_dir
-            disp_pad = F.pad(disp, (1, 1, 1, 1, 1, 1), mode="replicate")
-            dz = (disp_pad[:, :, 2:, 1:-1, 1:-1] - disp_pad[:, :, :-2, 1:-1, 1:-1]) / 2
-            dy = (disp_pad[:, :, 1:-1, 2:, 1:-1] - disp_pad[:, :, 1:-1, :-2, 1:-1]) / 2
-            dx = (disp_pad[:, :, 1:-1, 1:-1, 2:] - disp_pad[:, :, 1:-1, 1:-1, :-2]) / 2
-            a00 = 1 + dz[:, 0]; a01 = dy[:, 0]; a02 = dx[:, 0]
-            a10 = dz[:, 1]; a11 = 1 + dy[:, 1]; a12 = dx[:, 1]
-            a20 = dz[:, 2]; a21 = dy[:, 2]; a22 = 1 + dx[:, 2]
-            det = (a00 * (a11 * a22 - a12 * a21)
-                   - a01 * (a10 * a22 - a12 * a20)
-                   + a02 * (a10 * a21 - a11 * a20))
-            bad = det <= 0
-            if not bad.any():
-                break
-
 
 def _build_warp_grid(deform_full, device):
     """Build a normalized sampling grid from a full-res displacement field.
@@ -1106,34 +926,134 @@ def _splat_to_volume(pts: torch.Tensor, vals: torch.Tensor,
                     vol.view(C, -1)[c].scatter_add_(0, idx, w * vals[:, c])
                 wgt.view(-1).scatter_add_(0, idx, w)
 
-    # Weight-normalize
-    mask = wgt > 0
-    for c in range(C):
-        vol[c][mask[0]] /= wgt[0][mask[0]]
+    # Weight-normalize (out-of-place to preserve autograd graph)
+    wgt_safe = wgt.detach().clamp(min=1e-8)
+    vol = vol / wgt_safe
 
     if is_1d:
         return vol[0]
     return vol
 
 
+def _compute_edts_at_scale(
+    surface_masks: list,
+    scale_offset: int,
+    device: torch.device,
+) -> list:
+    """Compute per-surface EDTs from surface masks at a given scale.
+
+    offset 0: masks at full resolution, EDT directly.
+    offset -1 (coarser): max_pool masks by 2, then EDT on pooled.
+    offset +1 (finer): masks already at fine resolution, EDT directly.
+    """
+    from tifxyz_labels import edt_torch
+
+    dts = []
+    for mask in surface_masks:
+        m = mask.to(device)
+        if m.dim() == 2:
+            # (H, W) → skip, not a 3D mask
+            continue
+        if scale_offset == -1:
+            # Pool to half resolution
+            m_4d = m.float().unsqueeze(0).unsqueeze(0)
+            m_pooled = F.max_pool3d(m_4d, kernel_size=2, stride=2)
+            m = m_pooled.squeeze() > 0.5
+        dt = edt_torch((~m).to(torch.uint8))
+        dts.append(dt)
+    return dts
+
+
+def _gather_cage_on_surface(
+    co: torch.Tensor,       # (H_s * W_s,) offsets (requires_grad)
+    cn: torch.Tensor,       # (H_s, W_s, 3) normals
+    rc: torch.Tensor,       # (2, Z, Y, X) — (r_frac, c_frac) on surface
+    rc_w: torch.Tensor,     # (Z, Y, X) — >0 where surface exists
+    H_s: int, W_s: int,
+    volume_shape: Tuple[int, int, int],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Bilinear gather of cage offsets/normals at surface voxels.
+
+    Returns (off_vol, nrm_vol) with values only at surface voxels
+    (where rc_w > 0).  off_vol is differentiable w.r.t. co.
+    """
+    Z, Y, X = volume_shape
+    device = co.device
+    has_rc = rc_w > 0.01
+
+    off_vol = torch.zeros(Z, Y, X, device=device, dtype=co.dtype)
+    nrm_vol = torch.zeros(3, Z, Y, X, device=device, dtype=cn.dtype)
+
+    if not has_rc.any():
+        return off_vol, nrm_vol
+
+    r_frac = rc[0][has_rc]
+    c_frac = rc[1][has_rc]
+
+    r0 = r_frac.long().clamp(0, H_s - 2)
+    c0 = c_frac.long().clamp(0, W_s - 2)
+    dr = (r_frac - r0.float()).clamp(0, 1)
+    dc = (c_frac - c0.float()).clamp(0, 1)
+
+    w_tl = (1 - dr) * (1 - dc)
+    w_tr = (1 - dr) * dc
+    w_bl = dr * (1 - dc)
+    w_br = dr * dc
+
+    idx_tl = r0 * W_s + c0
+    idx_tr = r0 * W_s + (c0 + 1).clamp(max=W_s - 1)
+    idx_bl = (r0 + 1).clamp(max=H_s - 1) * W_s + c0
+    idx_br = (r0 + 1).clamp(max=H_s - 1) * W_s + (c0 + 1).clamp(max=W_s - 1)
+
+    gathered_off = (
+        w_tl * co[idx_tl] + w_tr * co[idx_tr]
+        + w_bl * co[idx_bl] + w_br * co[idx_br]
+    )
+
+    nrm_flat = cn.reshape(-1, 3)
+    gathered_nrm = (
+        w_tl.unsqueeze(1) * nrm_flat[idx_tl]
+        + w_tr.unsqueeze(1) * nrm_flat[idx_tr]
+        + w_bl.unsqueeze(1) * nrm_flat[idx_bl]
+        + w_br.unsqueeze(1) * nrm_flat[idx_br]
+    )
+
+    off_vol[has_rc] = gathered_off
+    nrm_vol[:, has_rc] = gathered_nrm.t()
+    return off_vol, nrm_vol
+
+
 def _build_cage_displacement(
-    ctrl_offsets_list: list,      # per-surface list of (N_s,) tensors
+    ctrl_offsets_list: list,      # per-surface list of (H_s*W_s,) tensors
     ctrl_pos_list: list,          # per-surface list of (H_s, W_s, 3) tensors
     ctrl_normals_list: list,      # per-surface list of (H_s, W_s, 3) tensors
     grid_rc_list: list,           # per-surface list of (2, Z, Y, X) tensors
     grid_rc_w_list: list,         # per-surface list of (Z, Y, X) tensors
     dts: list,                    # per-surface EDT list of (Z, Y, X) tensors
-    validity: torch.Tensor,       # (1, Z, Y, X)
+    validity: torch.Tensor,       # (1, Z, Y, X) or (1, 1, Z, Y, X)
     volume_shape: Tuple[int, int, int],
+    coord_scale: float = 1.0,    # multiply ctrl_pos by this for multi-scale
+    surface_masks: list = None,   # per-surface bool (Z,Y,X) — real voxelized masks
+    bracket_frac: torch.Tensor = None,  # (Z,Y,X) — d_lo/(d_lo+d_hi) from derive_cos_gradmag_validity
+    bracket_lo: torch.Tensor = None,    # (Z,Y,X) int — lo surface index
+    bracket_hi: torch.Tensor = None,    # (Z,Y,X) int — hi surface index
 ):
     """Build a displacement field from cage control point offsets.
 
-    For each surface, splats the scalar offsets and normals onto a
-    per-surface volume. Then blends across surfaces using EDT
-    distances (nearest-surface routing).
+    1. Per surface: bilinear gather of offsets/normals at surface voxels
+       from quad corners via grid_rc_vol.
+    2. EDT feature transform: propagate on-surface values to ALL voxels
+       (each voxel gets its nearest-surface-voxel's offset/normal).
+    3. Chain-based bracket routing (same as derive_cos_gradmag_validity):
+       linear blend between chain-adjacent surfaces using d_lo/(d_lo+d_hi).
 
-    Returns: (1, 3, Z, Y, X) displacement in voxel units
+    Gradients flow from every voxel → nearest-surface gather → bilinear
+    quad-corner gather → ctrl_offsets.
+
+    Returns: (1, 3, Z, Y, X) displacement in voxel units.
     """
+    from tifxyz_labels import edt_torch_with_indices, chains_from_surface_info
+
     Z, Y, X = volume_shape
     device = validity.device
     N_surf = len(ctrl_offsets_list)
@@ -1141,73 +1061,141 @@ def _build_cage_displacement(
     if N_surf == 0:
         return torch.zeros(1, 3, Z, Y, X, device=device)
 
-    # Per-surface splatted offset and normal volumes
-    offset_vols = []
-    normal_vols = []
+    # --- Step 1: On-surface bilinear gather per surface ---
+    surf_off = []   # (Z, Y, X) values only at rc_w > 0
+    surf_nrm = []   # (3, Z, Y, X) values only at rc_w > 0
     for s in range(N_surf):
-        cp = ctrl_pos_list[s]  # (H_s, W_s, 3) or (0,0,3)
-        if cp.numel() == 0:
-            offset_vols.append(torch.zeros(Z, Y, X, device=device))
-            normal_vols.append(torch.zeros(3, Z, Y, X, device=device))
-            continue
-        cn = ctrl_normals_list[s]  # (H_s, W_s, 3)
-        co = ctrl_offsets_list[s]  # (N_s,) where N_s = H_s * W_s
+        cp = ctrl_pos_list[s]
+        cn = ctrl_normals_list[s]
+        co = ctrl_offsets_list[s]
+        rc = grid_rc_list[s]
+        rc_w = grid_rc_w_list[s]
 
-        # Flatten control points
+        if cp.numel() == 0 or co.numel() == 0:
+            surf_off.append(torch.zeros(Z, Y, X, device=device))
+            surf_nrm.append(torch.zeros(3, Z, Y, X, device=device))
+            continue
+
         H_s, W_s = cp.shape[:2]
-        pts_flat = cp.reshape(-1, 3)          # (N, 3)
-        nrm_flat = cn.reshape(-1, 3)          # (N, 3)
-
-        # Validity: only use points inside the volume
-        in_vol = (
-            (pts_flat[:, 0] >= -0.5) & (pts_flat[:, 0] < Z - 0.5) &
-            (pts_flat[:, 1] >= -0.5) & (pts_flat[:, 1] < Y - 0.5) &
-            (pts_flat[:, 2] >= -0.5) & (pts_flat[:, 2] < X - 0.5)
+        off_vol, nrm_vol = _gather_cage_on_surface(
+            co, cn, rc, rc_w, H_s, W_s, volume_shape,
         )
-        if not in_vol.any():
-            offset_vols.append(torch.zeros(Z, Y, X, device=device))
-            normal_vols.append(torch.zeros(3, Z, Y, X, device=device))
+        surf_off.append(off_vol)
+        surf_nrm.append(nrm_vol)
+
+    # --- Step 2: Propagate to ALL voxels via EDT feature transform ---
+    # Two-stage: (a) fill gaps within each surface (rc splat misses
+    # some rasterized voxels), then (b) propagate from the complete
+    # surface to all voxels (respecting surface identity for bracket
+    # routing).
+    full_off = []
+    full_nrm = []
+    for s in range(N_surf):
+        rc_mask = grid_rc_w_list[s] > 0.01
+        if surface_masks is not None and s < len(surface_masks):
+            real_mask = surface_masks[s].bool()
+        else:
+            real_mask = rc_mask
+
+        if not rc_mask.any():
+            full_off.append(surf_off[s])
+            full_nrm.append(surf_nrm[s])
             continue
 
-        pts_v = pts_flat[in_vol]
-        nrm_v = nrm_flat[in_vol]
-        off_v = co[in_vol]
+        # (a) Fill gaps on the surface: for rasterized voxels without
+        # rc data, copy from nearest rc-valid voxel.
+        _, ft_rc = edt_torch_with_indices((~rc_mask).to(torch.uint8))
+        filled_off = surf_off[s][ft_rc[0], ft_rc[1], ft_rc[2]]
+        filled_nrm = surf_nrm[s][:, ft_rc[0], ft_rc[1], ft_rc[2]]
 
-        # Splat offsets and normals
-        off_vol = _splat_to_volume(pts_v, off_v, (Z, Y, X))
-        nrm_vol = _splat_to_volume(pts_v, nrm_v, (Z, Y, X))
-        offset_vols.append(off_vol)
-        normal_vols.append(nrm_vol)
+        # (b) Propagate from the real surface mask to ALL voxels.
+        # This respects surface identity for correct bracket routing.
+        if real_mask.any() and not real_mask.all():
+            _, ft_surf = edt_torch_with_indices(
+                (~real_mask).to(torch.uint8),
+            )
+            full_off.append(filled_off[ft_surf[0], ft_surf[1], ft_surf[2]])
+            full_nrm.append(filled_nrm[:, ft_surf[0], ft_surf[1], ft_surf[2]])
+        else:
+            full_off.append(filled_off)
+            full_nrm.append(filled_nrm)
 
-    # Blend across surfaces using EDT-based nearest-surface routing
-    if N_surf == 1:
-        offset_blend = offset_vols[0]
-        normal_blend = normal_vols[0]
+    # --- Step 3: Blend using pre-computed bracket routing ---
+    # bracket_frac, bracket_lo, bracket_hi come from
+    # derive_cos_gradmag_validity — guarantees identical routing
+    # to the GT computation.
+    if bracket_frac is None or bracket_lo is None or bracket_hi is None:
+        # Fallback: no routing info, just use nearest surface
+        dt_stack = torch.stack(dts[:N_surf], dim=0)
+        _, nearest = dt_stack.min(dim=0)
+        del dt_stack
+        zz = torch.arange(Z, device=device).view(-1,1,1).expand_as(nearest)
+        yy = torch.arange(Y, device=device).view(1,-1,1).expand_as(nearest)
+        xx = torch.arange(X, device=device).view(1,1,-1).expand_as(nearest)
+        offset_out = torch.stack(full_off, dim=0)[nearest, zz, yy, xx]
+        _nrm_s = torch.stack(full_nrm, dim=0)  # (N_surf, 3, Z, Y, X)
+        _nrm_flat = _nrm_s.reshape(N_surf, -1)
+        _fidx = (zz * Y * X + yy * X + xx).reshape(-1)
+        _nflt = nearest.reshape(-1)
+        normal_out = torch.stack([
+            _nrm_flat[_nflt, c * Z * Y * X + _fidx].reshape(Z, Y, X)
+            for c in range(3)
+        ], dim=0)
     else:
-        # Stack EDTs and find nearest surface per voxel
-        dt_stack = torch.stack(dts[:N_surf], dim=0)  # (N_surf, Z, Y, X)
-        dt_min, nearest = dt_stack.min(dim=0)  # (Z, Y, X)
+        valid_bracket = bracket_lo >= 0
+        # Stack full_off/nrm for indexed gather
+        off_stack = torch.stack(full_off, dim=0)  # (N_surf, Z, Y, X)
+        nrm_stack = torch.stack(full_nrm, dim=0)  # (N_surf, 3, Z, Y, X)
 
-        # Weighted blend: use softmin over EDT distances for smooth blending
-        # (sharper than linear, avoids discontinuities at surface boundaries)
-        weights = F.softmax(-dt_stack * 5.0, dim=0)  # (N_surf, Z, Y, X)
+        # Clamp indices to valid range
+        lo = bracket_lo.clamp(0, N_surf - 1)
+        hi = bracket_hi.clamp(0, N_surf - 1)
 
-        offset_stack = torch.stack(offset_vols, dim=0)  # (N_surf, Z, Y, X)
-        offset_blend = (weights * offset_stack).sum(dim=0)  # (Z, Y, X)
+        # Gather lo and hi offsets/normals
+        # Advanced indexing: off_stack[lo, z, y, x]
+        zz = torch.arange(Z, device=device).view(-1, 1, 1).expand_as(lo)
+        yy = torch.arange(Y, device=device).view(1, -1, 1).expand_as(lo)
+        xx = torch.arange(X, device=device).view(1, 1, -1).expand_as(lo)
 
-        normal_stack = torch.stack(normal_vols, dim=0)  # (N_surf, 3, Z, Y, X)
-        normal_blend = (weights.unsqueeze(1) * normal_stack).sum(dim=0)  # (3, Z, Y, X)
+        off_lo = off_stack[lo, zz, yy, xx]  # (Z, Y, X)
+        off_hi = off_stack[hi, zz, yy, xx]
+
+        # nrm_stack is (N_surf, 3, Z, Y, X) — need to gather on dim 0
+        # Reshape to (N_surf, 3*Z*Y*X), gather, reshape back
+        nrm_flat = nrm_stack.reshape(N_surf, -1)  # (N_surf, 3*Z*Y*X)
+        flat_idx = (zz * Y * X + yy * X + xx).reshape(-1)  # (Z*Y*X,)
+        # For each of 3 channels, offset the flat index
+        nrm_lo_parts = []
+        nrm_hi_parts = []
+        for c in range(3):
+            cidx = c * Z * Y * X + flat_idx  # (Z*Y*X,)
+            lo_flat = lo.reshape(-1)
+            hi_flat = hi.reshape(-1)
+            nrm_lo_parts.append(nrm_flat[lo_flat, cidx].reshape(Z, Y, X))
+            nrm_hi_parts.append(nrm_flat[hi_flat, cidx].reshape(Z, Y, X))
+        nrm_lo = torch.stack(nrm_lo_parts, dim=0)  # (3, Z, Y, X)
+        nrm_hi = torch.stack(nrm_hi_parts, dim=0)
+
+        frac = bracket_frac
+        offset_out = (1 - frac) * off_lo + frac * off_hi
+        normal_out = (1 - frac).unsqueeze(0) * nrm_lo + frac.unsqueeze(0) * nrm_hi
+
+        # Zero where bracket routing didn't claim
+        offset_out = torch.where(valid_bracket, offset_out,
+                                 torch.zeros_like(offset_out))
+        normal_out = torch.where(valid_bracket.unsqueeze(0), normal_out,
+                                 torch.zeros_like(normal_out))
 
     # Normalize blended normal
-    norm = normal_blend.norm(dim=0, keepdim=True).clamp(min=1e-8)
-    normal_blend = normal_blend / norm
+    norm = normal_out.norm(dim=0, keepdim=True).clamp(min=1e-8)
+    normal_out = normal_out / norm
 
-    # Displacement = offset * normal, masked by validity (squeeze to 3D)
-    val_3d = validity.squeeze()  # (Z, Y, X) — remove batch+channel dims
+    # Displacement = offset * normal
+    val_3d = validity.squeeze()
     if val_3d.dim() == 0:
         val_3d = val_3d.unsqueeze(0).unsqueeze(0).unsqueeze(0)
-    disp = (offset_blend.unsqueeze(0) * normal_blend) * val_3d.unsqueeze(0)  # (3, Z, Y, X)
-    return disp.unsqueeze(0)  # (1, 3, Z, Y, X)
+    disp = (offset_out.unsqueeze(0) * normal_out) * val_3d.unsqueeze(0)
+    return disp.unsqueeze(0)
 
 
 def _cage_deform_inner_loop(
@@ -1221,13 +1209,19 @@ def _cage_deform_inner_loop(
     max_frac: float,
     scale_loss_mse_fn,
     scale_loss_l1_fn,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    coord_scale: float = 1.0,   # multiply ctrl_pos for multi-scale GT
+    verbose: bool = False,      # print per-iteration stats
+    bracket_frac: torch.Tensor = None,  # (B, Z, Y, X) from compute_batch_targets
+    bracket_lo: torch.Tensor = None,
+    bracket_hi: torch.Tensor = None,
+) -> Tuple[torch.Tensor, torch.Tensor, float]:
     """Optimize cage control point offsets for GT deformation.
 
     Uses tifxyz quad mesh control points with direct surface normals.
     Offsets are zero-initialized each step (no persistence).
 
-    Returns (warped_cos_gm, warped_validity) for the best iteration.
+    Returns (warped_cos_gm, warped_validity, improvement_ratio) where
+    improvement_ratio = best_loss / initial_loss (≤ 1 means improvement).
     """
     B = pred_cos_gm.shape[0]
     device = pred_cos_gm.device
@@ -1240,6 +1234,8 @@ def _cage_deform_inner_loop(
     best_loss = float("inf")
     best_warped_cg = cos_gm_orig.clone()
     best_warped_v = val_f.clone()
+    initial_losses: list[float] = []
+    best_losses: list[float] = []
 
     # Process each sample in batch independently (control points vary per sample)
     for b in range(B):
@@ -1257,6 +1253,12 @@ def _cage_deform_inner_loop(
         grid_rc_w_list = [w.to(device) for w in cage_grid_rc_w[b]]
         dts_b = dts_batch[b]
         N_surf = len(ctrl_pos_list)
+
+        # Real surface masks + chain info for bracket routing
+        masks_b = batch["surface_masks"][b].to(device)
+        N_masks = masks_b.shape[0]
+        surf_masks_b = [masks_b[i] > 0.5 for i in range(min(N_masks, N_surf))]
+        chain_info_b = batch["surface_chain_info"][b] if "surface_chain_info" in batch else None
 
         # Initialize per-surface control point offsets (zero)
         ctrl_offsets = []
@@ -1280,9 +1282,10 @@ def _cage_deform_inner_loop(
         )
 
         lr_log_start = math.log10(max(inner_lr, 1e-10))
-        lr_log_end = math.log10(max(inner_lr * 10000.0, 1e-6))
+        lr_log_end = math.log10(max(inner_lr * 100.0, 1e-6))
 
         best_b_loss = float("inf")
+        initial_b_loss = float("inf")
         best_b_offsets = [o.detach().clone() for o in ctrl_offsets]
 
         with torch.amp.autocast("cuda", enabled=False):
@@ -1295,10 +1298,16 @@ def _cage_deform_inner_loop(
                 inner_opt.zero_grad()
 
                 # Build displacement from cage
+                _bf = bracket_frac[b] if bracket_frac is not None else None
+                _bl = bracket_lo[b] if bracket_lo is not None else None
+                _bh = bracket_hi[b] if bracket_hi is not None else None
                 disp = _build_cage_displacement(
                     ctrl_offsets, ctrl_pos_list, ctrl_normals_list,
                     grid_rc_list, grid_rc_w_list,
                     dts_b, val_f[b:b+1], (Z, Y, X),
+                    coord_scale=coord_scale,
+                    surface_masks=surf_masks_b,
+                    bracket_frac=_bf, bracket_lo=_bl, bracket_hi=_bh,
                 )  # (1, 3, Z, Y, X)
 
                 warped_cg, warped_v = _apply_warp(
@@ -1323,9 +1332,30 @@ def _cage_deform_inner_loop(
                         o.data.clamp_(-max_disp_scalar, max_disp_scalar)
 
                     cur = loss.item()
+                    if it == 0:
+                        initial_b_loss = cur
                     if cur < best_b_loss:
                         best_b_loss = cur
                         best_b_offsets = [o.detach().clone() for o in ctrl_offsets]
+
+                    if verbose and (it % 10 == 0 or it == n_iters - 1):
+                        d_abs = torch.cat([o.abs() for o in ctrl_offsets])
+                        grad_norms = [
+                            o.grad.abs().mean().item() if o.grad is not None else 0.0
+                            for o in ctrl_offsets
+                        ]
+                        mean_grad = sum(grad_norms) / max(len(grad_norms), 1)
+                        print(
+                            f"  b={b} it={it:4d}  lr={lr_now:10.1f}  "
+                            f"loss={cur:10.6f}  best={best_b_loss:10.6f}  "
+                            f"|off|_mean={d_abs.mean().item():.4f}  "
+                            f"|off|_max={d_abs.max().item():.4f}  "
+                            f"grad_mean={mean_grad:.2e}",
+                            flush=True,
+                        )
+
+        initial_losses.append(initial_b_loss)
+        best_losses.append(best_b_loss)
 
         # Apply best offsets
         with torch.no_grad():
@@ -1333,102 +1363,20 @@ def _cage_deform_inner_loop(
                 best_b_offsets, ctrl_pos_list, ctrl_normals_list,
                 grid_rc_list, grid_rc_w_list,
                 dts_b, val_f[b:b+1], (Z, Y, X),
+                coord_scale=coord_scale,
+                surface_masks=surf_masks_b,
+                bracket_frac=_bf, bracket_lo=_bl, bracket_hi=_bh,
             )
             w_cg, w_v = _apply_warp(cos_gm_orig[b:b+1], val_f[b:b+1], disp_best)
             best_warped_cg[b:b+1] = w_cg
             best_warped_v[b:b+1] = w_v
 
-    return best_warped_cg, best_warped_v
-
-
-def _deform_inner_loop(
-    pred_cos_gm,   # (B, 2, Z, Y, X) detached model prediction
-    targets,       # (B, 8, Z, Y, X) original targets
-    validity,      # (B, 1, Z, Y, X) original validity
-    deform,        # (B, 1, G, G, G) scalar offset (requires_grad)
-    n_iters: int,
-    inner_lr: float,
-    max_frac: float,
-    scale_loss_mse_fn,
-    scale_loss_l1_fn,
-):
-    """Optimize a normal-aligned scalar deformation field.
-
-    The deformation is parameterized as a scalar offset per grid point,
-    multiplied by the local surface normal direction (computed from the
-    cos channel gradient).  This constrains motion along normals and
-    greatly reduces self-intersection risk.
-
-    Uses a log-space LR ramp from ``inner_lr`` to ``inner_lr * 10000``
-    and tracks the best (lowest loss) deformation seen at any iteration.
-
-    Returns the best deform tensor (B, 1, G, G, G) on GPU, grad detached.
-    """
-    G = deform.shape[-1]
-    device = pred_cos_gm.device
-
-    # Cast everything to float32 for stable inner loop
-    pred_f = pred_cos_gm.float()
-    cos_gm_orig = targets[:, 0:2].float()
-    val_f = validity.float()
-
-    # Compute normal direction from cos gradient at grid resolution
-    with torch.no_grad():
-        normal_dir = _compute_normal_field(cos_gm_orig[:, 0:1], G)
-
-    # Pre-compute max scalar displacement from original grad_mag
-    # and a validity mask at grid resolution (only deform where GT exists)
-    with torch.no_grad():
-        gm_ds = F.adaptive_avg_pool3d(cos_gm_orig[:, 1:2], (G, G, G))
-        max_disp = max_frac / gm_ds.clamp(min=0.02)  # (B, 1, G, G, G)
-        val_ds = F.adaptive_avg_pool3d(val_f, (G, G, G))
-        valid_mask = (val_ds > 0.01).float()  # (B, 1, G, G, G)
-
-    inner_opt = torch.optim.SGD([deform], lr=inner_lr)
-    Z, Y, X = targets.shape[2:]
-
-    # Log-space LR ramp: inner_lr → inner_lr * 10000
-    lr_log_start = math.log10(inner_lr)
-    lr_log_end = math.log10(inner_lr * 10000.0)
-
-    best_loss = float("inf")
-    best_deform = deform.detach().clone()
-
-    with torch.amp.autocast("cuda", enabled=False):
-        for it in range(n_iters):
-            frac = it / max(n_iters - 1, 1)
-            lr_now = 10 ** (lr_log_start + frac * (lr_log_end - lr_log_start))
-            for pg in inner_opt.param_groups:
-                pg["lr"] = lr_now
-
-            inner_opt.zero_grad()
-            # Scalar × normal → 3D displacement
-            disp_3d = deform * normal_dir  # (B, 3, G, G, G)
-            deform_full = F.interpolate(
-                disp_3d, size=(Z, Y, X), mode="trilinear", align_corners=False,
-            )
-            warped_cg, warped_v = _apply_warp(cos_gm_orig, val_f, deform_full)
-            cos_w = warped_cg[:, 1:2] * 20.0
-            loss = (
-                scale_loss_mse_fn(pred_f[:, 0:1], warped_cg[:, 0:1], mask=warped_v, weight=cos_w)
-                + scale_loss_l1_fn(pred_f[:, 1:2], warped_cg[:, 1:2], mask=warped_v, weight=cos_w)
-            )
-            loss.backward()
-            inner_opt.step()
-
-            # Clamp scalar magnitude, zero outside valid region,
-            # and enforce positive Jacobian
-            with torch.no_grad():
-                deform.data.clamp_(-max_disp, max_disp)
-                deform.data.mul_(valid_mask)
-                _enforce_positive_jacobian(deform, normal_dir)
-
-                cur_loss = loss.item()
-                if cur_loss < best_loss:
-                    best_loss = cur_loss
-                    best_deform = deform.detach().clone()
-
-    return best_deform
+    # Improvement ratio: best / initial (≤ 1 = improved)
+    if initial_losses and all(il > 0 for il in initial_losses):
+        improvement = sum(best_losses) / sum(initial_losses)
+    else:
+        improvement = 1.0
+    return best_warped_cg, best_warped_v, improvement
 
 
 # ---------------------------------------------------------------------------
@@ -1752,7 +1700,7 @@ def _get_gt_at_offset(
         (
             tgt_fine, val_fine,
             dsm_fine, ddm_fine, daw_fine,
-            _, _, _, _,
+            _, _, _, _, _, _, _,
         ) = compute_batch_targets_fn(
             fine_batch, device,
             same_surface_threshold=same_surface_threshold,
@@ -1802,7 +1750,7 @@ def train(
     num_loss_scales: int = 5,
     deform_enabled: bool = True,
     deform_stride: int = 8,
-    deform_inner_iters: int = 100,
+    deform_inner_iters: int = 50,
     deform_inner_lr: float = 1000.0,
     deform_max_frac: float = 0.3,
     refine: bool = False,
@@ -2045,7 +1993,6 @@ def train(
 
     # GT deformation store (disk-backed, per-sample low-res warp fields)
     # Cage deformation uses tifxyz surface control points (no persistence)
-    deform_store = None  # legacy grid deform store — unused with cage deform
     if deform_enabled and is_main:
         print(
             f"{TAG} cage deformation enabled: "
@@ -2262,7 +2209,6 @@ def train(
         device_type=device_type,
         world_size=world_size,
         is_main=is_main,
-        deform_store=deform_store,
         deform_enabled=deform_enabled,
         deform_inner_iters=deform_inner_iters,
         deform_inner_lr=deform_inner_lr,
@@ -2395,6 +2341,7 @@ def train(
                 dir_sparse_mask, dir_dense_mask, dir_axis_weight,
                 _merge_groups, _merged_masks, _merged_chain_info,
                 _batch_dts,
+                _bracket_frac, _bracket_lo, _bracket_hi,
             ) = compute_batch_targets(
                 batch, device,
                 same_surface_threshold=same_surface_threshold,
@@ -2580,11 +2527,80 @@ def train(
                             same_surface_threshold=same_surface_threshold,
                         )
 
-                        # Loss (same structure as non-refine)
+                        # Cage deformation at this scale
+                        tgt_orig_pass = tgt
+                        val_orig_pass = val
+                        cage_active_pass = (
+                            deform_enabled
+                            and "cage_ctrl_pos" in batch
+                            and batch["cage_ctrl_pos"] is not None
+                        )
+                        if cage_active_pass:
+                            # Compute fresh EDTs at this scale
+                            if offset == 0:
+                                pass_dts = _batch_dts
+                            else:
+                                # Get surface masks at this scale
+                                masks_key = (
+                                    "surface_masks_fine" if offset == 1
+                                    else "surface_masks"
+                                )
+                                pass_dts = []
+                                for b_i in range(B_eff):
+                                    masks_b = batch[masks_key][b_i].to(device)
+                                    N_s = masks_b.shape[0]
+                                    dts_b = _compute_edts_at_scale(
+                                        [masks_b[si] > 0.5 for si in range(N_s)],
+                                        offset if masks_key == "surface_masks" else 0,
+                                        device,
+                                    )
+                                    pass_dts.append(dts_b)
+
+                            cs = {-1: 0.5, 0: 1.0, 1: 2.0}.get(offset, 1.0)
+                            # Bracket routing only available at scale 0
+                            _pbf = _bracket_frac if offset == 0 else None
+                            _pbl = _bracket_lo if offset == 0 else None
+                            _pbh = _bracket_hi if offset == 0 else None
+                            warped_cg_p, warped_v_p, _deform_improv = _cage_deform_inner_loop(
+                                pred_cos_gm=pred_pass[:, 0:2].detach(),
+                                targets=tgt,
+                                validity=val,
+                                batch=batch,
+                                dts_batch=pass_dts,
+                                n_iters=deform_inner_iters,
+                                inner_lr=deform_inner_lr,
+                                max_frac=deform_max_frac,
+                                scale_loss_mse_fn=scale_loss_mse,
+                                scale_loss_l1_fn=scale_loss_l1,
+                                coord_scale=cs,
+                                bracket_frac=_pbf,
+                                bracket_lo=_pbl,
+                                bracket_hi=_pbh,
+                            )
+                            tgt = tgt.clone()
+                            tgt[:, 0:2] = warped_cg_p
+                            val = warped_v_p
+
+                        # Loss with 0.9/0.1 split when deformed
                         cos_mask_p = val
                         cos_mag_w = tgt[:, 1:2] * 20.0
-                        l_cos = scale_loss_mse(pred_pass[:, 0:1], tgt[:, 0:1], mask=cos_mask_p, weight=cos_mag_w)
-                        l_mag = scale_loss_l1(pred_pass[:, 1:2], tgt[:, 1:2], mask=cos_mask_p, weight=cos_mag_w)
+                        if cage_active_pass:
+                            cos_mag_w_orig = tgt_orig_pass[:, 1:2] * 20.0
+                            l_cos = (
+                                0.9 * scale_loss_mse(pred_pass[:, 0:1], tgt[:, 0:1],
+                                                     mask=cos_mask_p, weight=cos_mag_w)
+                                + 0.1 * scale_loss_mse(pred_pass[:, 0:1], tgt_orig_pass[:, 0:1],
+                                                       mask=val_orig_pass, weight=cos_mag_w_orig)
+                            )
+                            l_mag = (
+                                0.9 * scale_loss_l1(pred_pass[:, 1:2], tgt[:, 1:2],
+                                                    mask=cos_mask_p, weight=cos_mag_w)
+                                + 0.1 * scale_loss_l1(pred_pass[:, 1:2], tgt_orig_pass[:, 1:2],
+                                                      mask=val_orig_pass, weight=cos_mag_w_orig)
+                            )
+                        else:
+                            l_cos = scale_loss_mse(pred_pass[:, 0:1], tgt[:, 0:1], mask=cos_mask_p, weight=cos_mag_w)
+                            l_mag = scale_loss_l1(pred_pass[:, 1:2], tgt[:, 1:2], mask=cos_mask_p, weight=cos_mag_w)
                         dir_mask_p = ((dsm + ddm) > 0.5).float()
                         l_dir_s = scale_loss_mse(pred_pass[:, 2:8], tgt[:, 2:8], mask=dsm, weight=daw)
                         l_dir_d = scale_loss_mse(pred_pass[:, 2:8], tgt[:, 2:8], mask=ddm, weight=daw)
@@ -2757,12 +2773,13 @@ def train(
                 cos_mask_original = cos_mask
                 targets_deformed = None
                 cage_deform_active = (
-                    deform_enabled and not use_aug
+                    deform_enabled
                     and "cage_ctrl_pos" in batch
                     and batch["cage_ctrl_pos"] is not None
                 )
+                deform_improvement = 1.0
                 if cage_deform_active:
-                    warped_cg, warped_v = _cage_deform_inner_loop(
+                    warped_cg, warped_v, deform_improvement = _cage_deform_inner_loop(
                         pred_cos_gm=pred[:, 0:2].detach(),
                         targets=targets,
                         validity=cos_mask,
@@ -2773,6 +2790,9 @@ def train(
                         max_frac=deform_max_frac,
                         scale_loss_mse_fn=scale_loss_mse,
                         scale_loss_l1_fn=scale_loss_l1,
+                        bracket_frac=_bracket_frac,
+                        bracket_lo=_bracket_lo,
+                        bracket_hi=_bracket_hi,
                     )
                     with torch.no_grad():
                         targets_deformed = targets.clone()
@@ -2922,17 +2942,6 @@ def train(
                     global_step,
                 )
                 log_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
-                if deform_store is not None:
-                    # Log deformation magnitude stats (from stored values,
-                    # regardless of whether this step applied deformation)
-                    batch_global_idxs_log = [
-                        pi["global_idx"] for pi in batch["patch_info"]
-                    ]
-                    _d = deform_store.get(batch_global_idxs_log)
-                    _d_abs = _d.abs()  # (B, 1, G, G, G) scalar offset
-                    log_scalar("train/deform_mean", _d_abs.mean().item(), global_step)
-                    log_scalar("train/deform_max", _d_abs.max().item(), global_step)
-                    del _d, _d_abs
                 if n_scale_aug > 0:
                     total_samples = n_seen * B
                     log_scalar(
@@ -2942,6 +2951,8 @@ def train(
                     )
                 if refine:
                     log_scalar("train/refine_mode", mode_idx, global_step)
+                if cage_deform_active:
+                    log_scalar("train/deform_improvement", deform_improvement, global_step)
 
             if global_step % 100 == 0:
                 _log_vis(log_images, "train", image, pred, targets, cos_mask, global_step,
@@ -2979,7 +2990,6 @@ def train(
                     device_type=device_type,
                     world_size=world_size,
                     is_main=is_main,
-                    deform_store=deform_store,
                     deform_enabled=deform_enabled,
                     deform_inner_iters=deform_inner_iters,
                     deform_inner_lr=deform_inner_lr,
@@ -3006,8 +3016,6 @@ def train(
                         "refine": refine,
                     }
                     torch.save(ckpt_data, run_dir / "model_current.pt")
-                    if deform_store is not None:
-                        deform_store.flush()
                     is_best = last_val_loss < best_val_loss
                     if is_best:
                         best_val_loss = last_val_loss
@@ -3045,8 +3053,6 @@ def train(
         if last_val_loss < best_val_loss:
             best_val_loss = last_val_loss
             torch.save(ckpt_data, run_dir / "model_best.pt")
-        if deform_store is not None:
-            deform_store.flush()
         print(f"{TAG} saved final checkpoint (val={last_val_loss:.4f})", flush=True)
     if is_dist:
         dist.barrier()
@@ -3078,9 +3084,8 @@ def _evaluate(
     device_type: str = "cuda",
     world_size: int = 1,
     is_main: bool = True,
-    deform_store: "DeformationStore | None" = None,
     deform_enabled: bool = False,
-    deform_inner_iters: int = 100,
+    deform_inner_iters: int = 50,
     deform_inner_lr: float = 1000.0,
     deform_max_frac: float = 0.3,
     vis_samples: int = 8,
@@ -3093,6 +3098,7 @@ def _evaluate(
     losses_cos: list[float] = []
     losses_mag: list[float] = []
     losses_dir_sparse: list[float] = []
+    deform_improvements: list[float] = []
     losses_dir_dense: list[float] = []
     losses_smooth: list[float] = []
     angles_sparse_deg: list[float] = []
@@ -3113,6 +3119,7 @@ def _evaluate(
                 dir_sparse_mask, dir_dense_mask, dir_axis_weight,
                 _merge_groups, _merged_masks, _merged_chain_info,
                 _batch_dts,
+                _bracket_frac, _bracket_lo, _bracket_hi,
             ) = compute_batch_targets(
                 batch, device,
                 same_surface_threshold=same_surface_threshold,
@@ -3145,7 +3152,7 @@ def _evaluate(
             )
             if cage_deform_active:
                 with torch.enable_grad():
-                    warped_cg, warped_v = _cage_deform_inner_loop(
+                    warped_cg, warped_v, _val_deform_improv = _cage_deform_inner_loop(
                         pred_cos_gm=pred[:, 0:2].detach(),
                         targets=targets,
                         validity=cos_mask,
@@ -3156,10 +3163,14 @@ def _evaluate(
                         max_frac=deform_max_frac,
                         scale_loss_mse_fn=scale_loss_mse,
                         scale_loss_l1_fn=scale_loss_l1,
+                        bracket_frac=_bracket_frac,
+                        bracket_lo=_bracket_lo,
+                        bracket_hi=_bracket_hi,
                     )
                 targets = targets.clone()
                 targets[:, 0:2] = warped_cg
                 cos_mask = warped_v
+                deform_improvements.append(_val_deform_improv)
 
             loss_cos = scale_loss_mse(pred[:, 0:1], targets[:, 0:1], mask=cos_mask)
             loss_mag = scale_loss_l1(pred[:, 1:2], targets[:, 1:2], mask=cos_mask)
@@ -3257,7 +3268,7 @@ def _evaluate(
             global_step,
             targets_original=(
                 torch.cat([a[4] for a in _vis_acc], dim=0).to(device)
-                if deform_store is not None else None
+                if deform_enabled else None
             ),
         )
 
@@ -3287,6 +3298,9 @@ def _evaluate(
     global_ang = _allreduce_mean(local_ang, world_size, device)
     if angles_sparse_deg or world_size > 1:
         log_scalar("val/dir_angle_deg_sparse", global_ang, global_step)
+    if deform_improvements:
+        mean_improv = sum(deform_improvements) / len(deform_improvements)
+        log_scalar("val/deform_improvement", mean_improv, global_step)
     return global_means["val/loss"]
 
 
@@ -3382,7 +3396,7 @@ def main() -> None:
     parser.add_argument("--deform-stride", type=int, default=8,
                         help="Deformation grid stride. Grid size = "
                              "label_patch_size / stride (default 8 → 24³).")
-    parser.add_argument("--deform-inner-iters", type=int, default=100,
+    parser.add_argument("--deform-inner-iters", type=int, default=50,
                         help="Inner optimization iterations for deformation "
                              "per training step.")
     parser.add_argument("--deform-inner-lr", type=float, default=1000.0,

@@ -444,6 +444,9 @@ def derive_cos_gradmag_validity(
     torch.Tensor,
     torch.Tensor,
     Optional[torch.Tensor],
+    torch.Tensor,   # bracket_frac (Z, Y, X) — d_lo/(d_lo+d_hi)
+    torch.Tensor,   # bracket_lo   (Z, Y, X) int — lo surface index
+    torch.Tensor,   # bracket_hi   (Z, Y, X) int — hi surface index
 ]:
     """Derive cos / grad_mag / validity for all voxels bracketed between
     chain-adjacent surfaces; optionally also a densified second-moment
@@ -493,6 +496,9 @@ def derive_cos_gradmag_validity(
     cos_out = torch.zeros(shape, device=device)
     grad_mag_out = torch.zeros(shape, device=device)
     valid_out = torch.zeros(shape, dtype=torch.bool, device=device)
+    bracket_frac = torch.zeros(shape, device=device)
+    bracket_lo = torch.full(shape, -1, dtype=torch.long, device=device)
+    bracket_hi = torch.full(shape, -1, dtype=torch.long, device=device)
 
     want_dir = fts is not None and tensor_moments is not None
     if want_dir:
@@ -501,7 +507,7 @@ def derive_cos_gradmag_validity(
         t_dense = None
 
     if N_total == 0:
-        return cos_out, grad_mag_out, valid_out, t_dense
+        return cos_out, grad_mag_out, valid_out, t_dense, bracket_frac, bracket_lo, bracket_hi
 
     # Global "which surface is nearest" across ALL surfaces (any chain).
     # This decides, for each voxel, which surface's bracketing logic applies.
@@ -627,6 +633,16 @@ def derive_cos_gradmag_validity(
 
             cos_out = torch.where(local_valid, cos_full, cos_out)
             grad_mag_out = torch.where(local_valid, grad_mag_full, grad_mag_out)
+            # Bracket routing info for cage deformation
+            lo_idx = torch.where(use_prev,
+                                 torch.tensor(prev_idx if has_prev else surf_idx, device=device),
+                                 torch.tensor(surf_idx, device=device))
+            hi_idx = torch.where(use_prev,
+                                 torch.tensor(surf_idx, device=device),
+                                 torch.tensor(next_idx if has_next else surf_idx, device=device))
+            bracket_frac = torch.where(local_valid, frac, bracket_frac)
+            bracket_lo = torch.where(local_valid, lo_idx, bracket_lo)
+            bracket_hi = torch.where(local_valid, hi_idx, bracket_hi)
             valid_out |= local_valid
 
             # Second-moment tensor linear blend — uses the SAME
@@ -675,7 +691,7 @@ def derive_cos_gradmag_validity(
                 t_dense = torch.where(local_valid_b, t_blend, t_dense)
                 del t_lo, t_hi, t_blend
 
-    return cos_out, grad_mag_out, valid_out, t_dense
+    return cos_out, grad_mag_out, valid_out, t_dense, bracket_frac, bracket_lo, bracket_hi
 
 
 # ---------------------------------------------------------------------------
@@ -969,6 +985,9 @@ def compute_patch_labels(
             "merge_groups": [],
             "merged_surface_masks": [],
             "merged_chain_info": [],
+            "bracket_frac": torch.zeros(shape, device=device),
+            "bracket_lo": torch.full(shape, -1, dtype=torch.long, device=device),
+            "bracket_hi": torch.full(shape, -1, dtype=torch.long, device=device),
         }
 
     # EDT of complement for each surface — reuse precomputed if caller
@@ -1041,11 +1060,12 @@ def compute_patch_labels(
         merge_groups = list(range(N))
 
     chains = chains_from_surface_info(surface_chain_info)
-    cos, grad_mag, valid, t_dense = derive_cos_gradmag_validity(
-        dts, surface_masks, chains,
-        fts=fts,
-        tensor_moments=tensor_moments if want_dir else None,
-    )
+    cos, grad_mag, valid, t_dense, bracket_frac, bracket_lo, bracket_hi = \
+        derive_cos_gradmag_validity(
+            dts, surface_masks, chains,
+            fts=fts,
+            tensor_moments=tensor_moments if want_dir else None,
+        )
 
     targets = torch.zeros(8, *shape, device=device)
     targets[0] = cos
@@ -1106,4 +1126,7 @@ def compute_patch_labels(
         "merge_groups": merge_groups,
         "merged_surface_masks": list(surface_masks),
         "merged_chain_info": list(surface_chain_info),
+        "bracket_frac": bracket_frac,
+        "bracket_lo": bracket_lo,
+        "bracket_hi": bracket_hi,
     }

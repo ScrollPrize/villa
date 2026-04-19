@@ -180,7 +180,7 @@ def _save_grid(results_per_mode, sample_idx, output_dir, patch_size):
             )
             canvas.paste(cell_img, (x0, y0))
 
-    out_path = output_dir / f"sample_{sample_idx:04d}.png"
+    out_path = output_dir / f"sample_{sample_idx:04d}.tif"
     canvas.save(str(out_path))
     print(f"  saved {out_path}", flush=True)
 
@@ -263,7 +263,7 @@ def main():
         (
             targets, validity,
             dir_sparse_mask, dir_dense_mask, dir_axis_weight,
-            _, _, _,
+            _, _, _, _, _, _, _,
         ) = compute_batch_targets(
             batch, device,
             same_surface_threshold=same_surface_threshold,

@@ -632,6 +632,7 @@ def _compute_training_output(
             targets, validity,
             dir_sparse_mask, dir_dense_mask, _dir_axis_weight,
             merge_groups_batch, merged_masks_batch, merged_chain_info_batch,
+            _dts, _bfrac, _blo, _bhi,
         ) = compute_batch_targets(
             batch, device,
             same_surface_threshold=same_surface_threshold,
