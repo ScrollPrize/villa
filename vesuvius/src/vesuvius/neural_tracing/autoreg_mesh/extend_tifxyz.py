@@ -964,27 +964,28 @@ def _decode_single_step_from_outputs(
     step_idx: int,
     greedy: bool,
 ) -> tuple[int, list[int], np.ndarray, float]:
+    device = outputs["stop_logits"].device
     if str(outputs.get("coarse_prediction_mode", getattr(model, "coarse_prediction_mode", "joint_pointer"))) == "axis_factorized":
         coarse_axis_ids = {}
         for axis_name in ("z", "y", "x"):
-            axis_logits = outputs["coarse_axis_logits"][axis_name][sample_idx, step_idx]
+            axis_logits = outputs["coarse_axis_logits"][axis_name][sample_idx, step_idx].float()
             coarse_axis_ids[axis_name] = int(_sample_from_logits(axis_logits, greedy=greedy).item())
         coarse_id = int(
             model._flatten_coarse_axis_ids(
-                torch.tensor(coarse_axis_ids["z"], dtype=torch.long, device=outputs["stop_logits"].device),
-                torch.tensor(coarse_axis_ids["y"], dtype=torch.long, device=outputs["stop_logits"].device),
-                torch.tensor(coarse_axis_ids["x"], dtype=torch.long, device=outputs["stop_logits"].device),
+                torch.tensor(coarse_axis_ids["z"], dtype=torch.long, device=device),
+                torch.tensor(coarse_axis_ids["y"], dtype=torch.long, device=device),
+                torch.tensor(coarse_axis_ids["x"], dtype=torch.long, device=device),
             ).item()
         )
     else:
-        coarse_logits = outputs["coarse_logits"][sample_idx, step_idx]
+        coarse_logits = outputs["coarse_logits"][sample_idx, step_idx].float()
         coarse_id = int(_sample_from_logits(coarse_logits, greedy=greedy).item())
     offset_bins = []
     for axis, bins in enumerate(model.offset_num_bins):
-        axis_logits = outputs["offset_logits"][sample_idx, step_idx, axis, :bins]
+        axis_logits = outputs["offset_logits"][sample_idx, step_idx, axis, :bins].float()
         offset_bins.append(int(_sample_from_logits(axis_logits, greedy=greedy).item()))
-    offset_tensor = torch.tensor(offset_bins, dtype=torch.long, device=outputs["stop_logits"].device).view(1, 1, 3)
-    coarse_tensor = torch.tensor([[coarse_id]], dtype=torch.long, device=outputs["stop_logits"].device)
+    offset_tensor = torch.tensor(offset_bins, dtype=torch.long, device=device).view(1, 1, 3)
+    coarse_tensor = torch.tensor([[coarse_id]], dtype=torch.long, device=device)
     bin_center_xyz = model.decode_local_xyz(coarse_tensor, offset_tensor)[0, 0].detach().to(torch.float32).cpu().numpy()
     refine_residual = outputs.get("pred_refine_residual")
     sampled_xyz = (
@@ -992,7 +993,7 @@ def _decode_single_step_from_outputs(
         if refine_residual is not None
         else bin_center_xyz
     )
-    stop_prob = float(torch.sigmoid(outputs["stop_logits"][sample_idx, step_idx]).item())
+    stop_prob = float(torch.sigmoid(outputs["stop_logits"][sample_idx, step_idx].float()).item())
     return coarse_id, offset_bins, sampled_xyz.astype(np.float32, copy=False), stop_prob
 
 

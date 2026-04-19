@@ -682,7 +682,7 @@ class AutoregMeshModel(nn.Module):
 
         return adjusted_mask, metrics
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _build_conditioning_feature_debias_basis(self, *, device: torch.device) -> Tensor:
         if self.conditioning_feature_debias_basis_source != "zero_volume_svd":
             raise ValueError(
@@ -1209,7 +1209,7 @@ class AutoregMeshModel(nn.Module):
         coords = torch.maximum(coords, torch.zeros_like(coords))
         return torch.minimum(coords, max_coord.view(1, 1, 3))
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def init_kv_cache(
         self,
         batch: dict,
@@ -1260,7 +1260,7 @@ class AutoregMeshModel(nn.Module):
         cache = KVCache(self_attn_kv=self_attn_kv, cross_attn_kv=cross_attn_kv, seq_len=int(seq_mask.shape[1]))
         return x, cache
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def step_from_encoded_cached(
         self,
         *,

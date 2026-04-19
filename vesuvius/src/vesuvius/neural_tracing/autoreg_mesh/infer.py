@@ -164,7 +164,7 @@ def _build_tifxyz_from_grid(full_grid_world: np.ndarray, *, uuid: str) -> Tifxyz
     )
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def infer_autoreg_mesh(
     model,
     sample_or_batch: dict,
@@ -254,7 +254,7 @@ def infer_autoreg_mesh(
             if str(outputs.get("coarse_prediction_mode", getattr(model, "coarse_prediction_mode", "joint_pointer"))) == "axis_factorized":
                 coarse_axis_ids = {}
                 for axis_name in ("z", "y", "x"):
-                    axis_logits = outputs["coarse_axis_logits"][axis_name][0, current_len - 1]
+                    axis_logits = outputs["coarse_axis_logits"][axis_name][0, current_len - 1].float()
                     coarse_axis_ids[axis_name] = int(_sample_from_logits(axis_logits, **sampling_kwargs).item())
                 coarse_id = int(
                     model._flatten_coarse_axis_ids(
@@ -264,7 +264,7 @@ def infer_autoreg_mesh(
                     ).item()
                 )
             else:
-                coarse_logits = outputs["coarse_logits"][0, current_len - 1]
+                coarse_logits = outputs["coarse_logits"][0, current_len - 1].float()
                 coarse_id = int(_sample_from_logits(coarse_logits, **sampling_kwargs).item())
                 coarse_axis_ids = {
                     "z": int(outputs["pred_coarse_axis_ids"]["z"][0, current_len - 1].item()),
@@ -273,7 +273,7 @@ def infer_autoreg_mesh(
                 }
             offset_bins_list = []
             for axis, bins in enumerate(model.offset_num_bins):
-                axis_logits = outputs["offset_logits"][0, current_len - 1, axis, :bins]
+                axis_logits = outputs["offset_logits"][0, current_len - 1, axis, :bins].float()
                 offset_bins_list.append(int(_sample_from_logits(axis_logits, **sampling_kwargs).item()))
             offset_tensor = torch.tensor(offset_bins_list, dtype=torch.long, device=device).view(1, 1, 3)
             coarse_tensor = torch.tensor([[coarse_id]], dtype=torch.long, device=device)
@@ -283,7 +283,7 @@ def infer_autoreg_mesh(
                 sampled_xyz = bin_center_xyz + refine_residual[0, current_len - 1].detach().to(torch.float32).cpu().numpy()
             else:
                 sampled_xyz = bin_center_xyz
-            stop_prob = float(torch.sigmoid(outputs["stop_logits"][0, current_len - 1]).item())
+            stop_prob = float(torch.sigmoid(outputs["stop_logits"][0, current_len - 1].float()).item())
 
             buf_coarse_ids[0, step_idx] = coarse_id
             buf_offset_bins[0, step_idx] = torch.tensor(offset_bins_list, dtype=torch.long, device=device)
@@ -354,7 +354,7 @@ def infer_autoreg_mesh(
         model.train(was_training)
 
 
-@torch.no_grad()
+@torch.inference_mode()
 def infer_autoreg_mesh_cached(
     model,
     sample_or_batch: dict,
@@ -449,7 +449,7 @@ def infer_autoreg_mesh_cached(
             if str(outputs.get("coarse_prediction_mode", getattr(model, "coarse_prediction_mode", "joint_pointer"))) == "axis_factorized":
                 coarse_axis_ids = {}
                 for axis_name in ("z", "y", "x"):
-                    axis_logits = outputs["coarse_axis_logits"][axis_name][0, 0]
+                    axis_logits = outputs["coarse_axis_logits"][axis_name][0, 0].float()
                     coarse_axis_ids[axis_name] = int(_sample_from_logits(axis_logits, **sampling_kwargs).item())
                 coarse_id = int(
                     model._flatten_coarse_axis_ids(
@@ -459,7 +459,7 @@ def infer_autoreg_mesh_cached(
                     ).item()
                 )
             else:
-                coarse_logits = outputs["coarse_logits"][0, 0]
+                coarse_logits = outputs["coarse_logits"][0, 0].float()
                 coarse_id = int(_sample_from_logits(coarse_logits, **sampling_kwargs).item())
                 coarse_axis_ids = {
                     "z": int(outputs["pred_coarse_axis_ids"]["z"][0, 0].item()),
@@ -469,18 +469,18 @@ def infer_autoreg_mesh_cached(
 
             offset_bins_list = []
             for axis, bins in enumerate(model.offset_num_bins):
-                axis_logits = outputs["offset_logits"][0, 0, axis, :bins]
+                axis_logits = outputs["offset_logits"][0, 0, axis, :bins].float()
                 offset_bins_list.append(int(_sample_from_logits(axis_logits, **sampling_kwargs).item()))
 
             offset_tensor = torch.tensor(offset_bins_list, dtype=torch.long, device=device).view(1, 1, 3)
             coarse_tensor = torch.tensor([[coarse_id]], dtype=torch.long, device=device)
-            bin_center_xyz = model.decode_local_xyz(coarse_tensor, offset_tensor)[0, 0].detach().cpu().numpy()
+            bin_center_xyz = model.decode_local_xyz(coarse_tensor, offset_tensor)[0, 0].detach().to(torch.float32).cpu().numpy()
             refine_residual = outputs.get("pred_refine_residual")
             if refine_residual is not None:
-                sampled_xyz = bin_center_xyz + refine_residual[0, 0].detach().cpu().numpy()
+                sampled_xyz = bin_center_xyz + refine_residual[0, 0].detach().to(torch.float32).cpu().numpy()
             else:
                 sampled_xyz = bin_center_xyz
-            stop_prob = float(torch.sigmoid(outputs["stop_logits"][0, 0]).item())
+            stop_prob = float(torch.sigmoid(outputs["stop_logits"][0, 0].float()).item())
 
             if geometric_validation is not None and geometric_validation.enabled:
                 patch_diag = float(np.linalg.norm(model.patch_size if hasattr(model.patch_size, '__len__') else [model.patch_size]*3))
