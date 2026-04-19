@@ -305,7 +305,7 @@ def _scale_stored_tifxyz(
     output_dir: str | Path,
     *,
     coordinate_scale_factor: float,
-    target_vertex_spacing: float = 20.0,
+    target_vertex_spacing: float = 0.0,
 ) -> Path:
     source = read_tifxyz(source_dir, load_mask=True, validate=True).use_stored_resolution()
     valid_mask = source._mask.copy() if source._mask is not None else np.ones_like(source._x, dtype=bool)
@@ -316,8 +316,10 @@ def _scale_stored_tifxyz(
     scaled_y[valid_mask] *= float(coordinate_scale_factor)
     scaled_z[valid_mask] *= float(coordinate_scale_factor)
 
-    current_spacing = _measure_vertex_spacing(scaled_z, scaled_y, scaled_x, valid_mask)
-    resample_factor = max(1, int(round(current_spacing / float(target_vertex_spacing))))
+    resample_factor = 1
+    if float(target_vertex_spacing) > 0:
+        current_spacing = _measure_vertex_spacing(scaled_z, scaled_y, scaled_x, valid_mask)
+        resample_factor = max(1, int(round(current_spacing / float(target_vertex_spacing))))
     if resample_factor > 1:
         print("[resample] vertex spacing=%.1f, target=%.1f, resampling %dx (grid %s -> %s)" % (
             current_spacing, target_vertex_spacing, resample_factor,
