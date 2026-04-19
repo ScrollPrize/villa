@@ -2985,6 +2985,8 @@ def train(
                     deform_inner_lr=deform_inner_lr,
                     deform_max_frac=deform_max_frac,
                     vis_samples=VIS_SAMPLES,
+                    w_dist=w_dist,
+                    w_fft=w_fft,
                     refine=refine,
                 )
                 if _vis_batch:
