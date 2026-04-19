@@ -495,7 +495,9 @@ def _process_surface(
     dry_run_mode: bool,
     dry_run_max_calls_per_direction: int,
     distributed_infer: bool,
+    extend_directions: list[str] | None = None,
 ) -> dict[str, Any]:
+    _active_directions = set(extend_directions or ["up", "down"])
     relative_surface_id = str(surface["relative_surface_id"])
     state_path = state_root / f"{_safe_state_name(relative_surface_id)}.json"
     state = _load_surface_state(state_path)
@@ -534,7 +536,7 @@ def _process_surface(
             extra={"scaled_input_path": str(scaled_input_path)},
         )
 
-    if str(state.get("status")) in {"scaled", "up_running"}:
+    if str(state.get("status")) in {"scaled", "up_running"} and "up" in _active_directions:
         state = _update_surface_state(
             state=state,
             status="up_running",
@@ -566,7 +568,9 @@ def _process_surface(
             extra={"up_final_tifxyz_path": str(up_final_tifxyz), "summary_up_path": str(paths.summaries_dir / "summary_up.json")},
         )
 
-    if str(state.get("status")) in {"up_done", "down_running"}:
+    if "up" not in _active_directions and str(state.get("status")) == "scaled":
+        state = _update_surface_state(state=state, status="up_done", manifest_jsonl_path=manifest_jsonl_path, extra={"up_final_tifxyz_path": str(state["scaled_input_path"])})
+    if str(state.get("status")) in {"up_done", "down_running"} and "down" in _active_directions:
         state = _update_surface_state(
             state=state,
             status="down_running",
@@ -599,6 +603,8 @@ def _process_surface(
             extra={"down_final_tifxyz_path": str(paths.final_tifxyz_dir), "summary_down_path": str(paths.summaries_dir / "summary_down.json")},
         )
 
+    if "down" not in _active_directions and str(state.get("status")) == "up_done":
+        state = _update_surface_state(state=state, status="down_done", manifest_jsonl_path=manifest_jsonl_path, extra={"down_final_tifxyz_path": state.get("up_final_tifxyz_path", ""), "summary_down_path": ""})
     if str(state.get("status")) in {"down_done", "uploaded"}:
         summary_up = json.loads(Path(state["summary_up_path"]).read_text())
         summary_down = json.loads(Path(state["summary_down_path"]).read_text())
@@ -653,6 +659,8 @@ def run_batch_extend_title_hunt(
     window_batch_size: int,
     dry_run_surface_count: int,
     auto_continue: bool,
+    surface_filter: str | None = None,
+    extend_directions: list[str] | None = None,
     show_progress: bool,
     dry_run_max_calls_per_direction: int,
     distributed_infer: bool,
@@ -668,6 +676,8 @@ def run_batch_extend_title_hunt(
     for prefix_name in dry_run_prefixes:
         _sync_title_hunt_prefix(source_s3_uri=source_s3_uri, prefix_name=prefix_name, local_source_root=local_source_root)
     dry_run_surfaces = _discover_local_surfaces(local_source_root, prefixes=dry_run_prefixes)
+    if surface_filter is not None:
+        dry_run_surfaces = [s for s in dry_run_surfaces if str(surface_filter) in s["relative_surface_id"]]
     dry_run_surfaces = _select_dry_run_surfaces(dry_run_surfaces, count=int(dry_run_surface_count))
     dry_run_ids = {item["relative_surface_id"] for item in dry_run_surfaces}
     ordered_surfaces = list(dry_run_surfaces)
@@ -676,6 +686,8 @@ def run_batch_extend_title_hunt(
         for prefix_name in remaining_prefixes:
             _sync_title_hunt_prefix(source_s3_uri=source_s3_uri, prefix_name=prefix_name, local_source_root=local_source_root)
         surfaces = _discover_local_surfaces(local_source_root, prefixes=prefixes)
+        if surface_filter is not None:
+            surfaces = [s for s in surfaces if str(surface_filter) in s["relative_surface_id"]]
         ordered_surfaces.extend([surface for surface in surfaces if surface["relative_surface_id"] not in dry_run_ids])
     else:
         surfaces = list(dry_run_surfaces)
@@ -692,6 +704,7 @@ def run_batch_extend_title_hunt(
             dino_backbone=dino_backbone,
             autoreg_checkpoint=autoreg_checkpoint,
             local_output_root=local_output_root,
+            extend_directions=extend_directions or ["up", "down"],
             state_root=state_root,
             manifest_jsonl_path=manifest_jsonl_path,
             coordinate_scale_factor=coordinate_scale_factor,
@@ -747,6 +760,8 @@ def run_batch_extend_title_hunt(
 @click.option("--auto-continue/--stop-after-dry-run", default=True, show_default=True)
 @click.option("--show-progress/--no-show-progress", default=True, show_default=True)
 @click.option("--distributed-infer/--no-distributed-infer", default=False, show_default=True)
+@click.option("--surface-filter", type=str, default=None, help="Only process surfaces whose relative_surface_id contains this substring")
+@click.option("--extend-directions", type=str, default="up,down", show_default=True, help="Comma-separated directions to extend (e.g. 'up' or 'up,down')")
 def main(
     source_s3_uri: str,
     output_s3_uri: str,
@@ -764,6 +779,8 @@ def main(
     auto_continue: bool,
     show_progress: bool,
     distributed_infer: bool,
+    surface_filter: str | None,
+    extend_directions: str,
 ) -> None:
     result = run_batch_extend_title_hunt(
         source_s3_uri=source_s3_uri,
@@ -782,6 +799,8 @@ def main(
         auto_continue=bool(auto_continue),
         show_progress=bool(show_progress),
         distributed_infer=bool(distributed_infer),
+        surface_filter=surface_filter,
+        extend_directions=[d.strip() for d in str(extend_directions).split(",") if d.strip()],
     )
     print(json.dumps(result, indent=2, sort_keys=True))
 
