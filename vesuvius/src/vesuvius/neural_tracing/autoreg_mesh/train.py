@@ -750,13 +750,23 @@ def _joint_valid_aux_loss_weight_active(cfg: dict, *, global_step: int) -> float
 
 
 def _offset_loss_weight_active(cfg: dict, *, global_step: int) -> float:
-    if int(global_step) < int(cfg.get("offset_loss_start_step", 0)):
+    start = int(cfg.get("offset_loss_start_step", 0))
+    if int(global_step) < start:
         return 0.0
-    return float(cfg.get("offset_loss_weight", 1.0))
+    ramp = int(cfg.get("offset_loss_ramp_steps", 0))
+    final = float(cfg.get("offset_loss_weight", 1.0))
+    if ramp <= 0:
+        return final
+    t = min(1.0, float(int(global_step) - start) / float(ramp))
+    return final * t
 
 
 def _scheduled_sampling_feedback_state(cfg: dict, *, global_step: int) -> tuple[bool, bool]:
-    offset_feedback_enabled = _offset_loss_weight_active(cfg, global_step=global_step) > 0.0
+    offset_feedback_start = cfg.get("scheduled_sampling_offset_feedback_start_step")
+    if offset_feedback_start is None:
+        offset_feedback_enabled = _offset_loss_weight_active(cfg, global_step=global_step) > 0.0
+    else:
+        offset_feedback_enabled = int(global_step) >= int(offset_feedback_start)
     refine_feedback_enabled = _position_refine_weight_active(cfg, global_step=global_step) > 0.0
     return bool(offset_feedback_enabled), bool(offset_feedback_enabled and refine_feedback_enabled)
 
@@ -1238,6 +1248,9 @@ def _evaluate_validation(
                 distance_aware_coarse_target_sigma=float(cfg.get("distance_aware_coarse_target_sigma", 1.0)),
                 distance_aware_coarse_target_loss=str(cfg.get("distance_aware_coarse_target_loss", "soft_ce")),
                 joint_valid_aux_loss_weight_active=_joint_valid_aux_loss_weight_active(cfg, global_step=global_step),
+                distance_aware_offset_targets_enabled=bool(cfg.get("distance_aware_offset_targets_enabled", False)),
+                distance_aware_offset_target_radius=int(cfg.get("distance_aware_offset_target_radius", 1)),
+                distance_aware_offset_target_sigma=float(cfg.get("distance_aware_offset_target_sigma", 0.75)),
             )
         metrics = _loss_dict_to_metrics(loss_dict)
         metrics.update(_mean_batch_sample_metrics(batch))
@@ -1449,6 +1462,9 @@ def run_autoreg_mesh_training(
                     distance_aware_coarse_target_sigma=float(cfg.get("distance_aware_coarse_target_sigma", 1.0)),
                     distance_aware_coarse_target_loss=str(cfg.get("distance_aware_coarse_target_loss", "soft_ce")),
                     joint_valid_aux_loss_weight_active=joint_valid_aux_loss_weight_active,
+                    distance_aware_offset_targets_enabled=bool(cfg.get("distance_aware_offset_targets_enabled", False)),
+                    distance_aware_offset_target_radius=int(cfg.get("distance_aware_offset_target_radius", 1)),
+                    distance_aware_offset_target_sigma=float(cfg.get("distance_aware_offset_target_sigma", 0.75)),
                 )
             loss = loss_dict["loss"]
             if not torch.isfinite(loss):

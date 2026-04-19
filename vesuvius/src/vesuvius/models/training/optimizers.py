@@ -12,17 +12,34 @@ def _iter_embedding_parameter_ids(model):
     return embedding_param_ids
 
 
+_MUON_ADAMW_FORCE_PATTERNS = (
+    "offset_head",
+    "stop_head",
+    "position_refine_head",
+    "pointer_query",
+    "pointer_key",
+    "memory_proj",
+    "memory_coord_mlp",
+    "start_token",
+)
+
+
 def _build_muon_param_groups(model):
     embedding_param_ids = _iter_embedding_parameter_ids(model)
     muon_params = []
     aux_adamw_params = []
-    for parameter in model.parameters():
+    for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if parameter.ndim >= 2 and id(parameter) not in embedding_param_ids:
-            muon_params.append(parameter)
-        else:
+        force_adamw = (
+            parameter.ndim < 2
+            or id(parameter) in embedding_param_ids
+            or any(pat in name for pat in _MUON_ADAMW_FORCE_PATTERNS)
+        )
+        if force_adamw:
             aux_adamw_params.append(parameter)
+        else:
+            muon_params.append(parameter)
 
     groups = []
     if muon_params:

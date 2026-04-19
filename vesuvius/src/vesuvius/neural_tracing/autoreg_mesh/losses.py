@@ -283,7 +283,15 @@ def _coarse_accuracy_metrics(outputs: dict, batch: dict) -> dict[str, Tensor]:
     }
 
 
-def _offset_bin_loss(outputs: dict, batch: dict, offset_num_bins: tuple[int, int, int]) -> Tensor:
+def _offset_bin_loss(
+    outputs: dict,
+    batch: dict,
+    offset_num_bins: tuple[int, int, int],
+    *,
+    distance_aware_enabled: bool = False,
+    distance_aware_radius: int = 1,
+    distance_aware_sigma: float = 0.75,
+) -> Tensor:
     logits = outputs["offset_logits"]
     targets = batch["target_offset_bins"]
     mask = batch["target_supervision_mask"]
@@ -291,14 +299,48 @@ def _offset_bin_loss(outputs: dict, batch: dict, offset_num_bins: tuple[int, int
     for axis, bins in enumerate(offset_num_bins):
         axis_logits = logits[:, :, axis, :bins]
         axis_targets = targets[:, :, axis]
-        axis_loss = F.cross_entropy(
-            axis_logits.reshape(-1, bins),
-            axis_targets.reshape(-1),
-            ignore_index=IGNORE_INDEX,
-            reduction="none",
-        ).reshape_as(axis_targets)
-        total = total + _masked_mean(axis_loss, mask)
+        if not bool(distance_aware_enabled):
+            axis_loss = F.cross_entropy(
+                axis_logits.reshape(-1, bins),
+                axis_targets.reshape(-1),
+                ignore_index=IGNORE_INDEX,
+                reduction="none",
+            ).reshape_as(axis_targets)
+            total = total + _masked_mean(axis_loss, mask)
+        else:
+            neighbor_ids, target_probs = _build_distance_aware_axis_targets(
+                axis_targets,
+                mask,
+                axis_size=int(bins),
+                radius=int(distance_aware_radius),
+                sigma=float(distance_aware_sigma),
+            )
+            log_probs = F.log_softmax(axis_logits, dim=-1)
+            gathered_log_probs = torch.gather(log_probs, dim=-1, index=neighbor_ids)
+            gathered_log_probs = torch.where(target_probs > 0, gathered_log_probs, torch.zeros_like(gathered_log_probs))
+            per_token_loss = -(target_probs * gathered_log_probs).sum(dim=-1)
+            total = total + _masked_mean(per_token_loss, mask)
     return total / float(len(offset_num_bins))
+
+
+def _offset_accuracy_metrics(outputs: dict, batch: dict, offset_num_bins: tuple[int, int, int]) -> dict[str, Tensor]:
+    logits = outputs["offset_logits"]
+    targets = batch["target_offset_bins"]
+    mask = batch["target_supervision_mask"]
+    pred_bins = []
+    bin_errors = []
+    for axis, bins in enumerate(offset_num_bins):
+        pred = logits[:, :, axis, :bins].argmax(dim=-1)
+        pred_bins.append(pred)
+        bin_errors.append((pred - targets[:, :, axis]).abs().to(dtype=torch.float32))
+    exact_match = torch.ones_like(mask, dtype=torch.bool)
+    for axis in range(len(offset_num_bins)):
+        exact_match = exact_match & (pred_bins[axis] == targets[:, :, axis])
+    mean_bin_error = torch.stack(bin_errors).mean(dim=0)
+    return {
+        "offset_exact_acc": _masked_mean(exact_match.to(dtype=torch.float32), mask),
+        "offset_mean_bin_error": _masked_mean(mean_bin_error, mask),
+    }
 
 
 def _stop_loss(outputs: dict, batch: dict) -> Tensor:
@@ -931,6 +973,9 @@ def compute_autoreg_mesh_losses(
     distance_aware_coarse_target_sigma: float = 1.0,
     distance_aware_coarse_target_loss: str = "soft_ce",
     joint_valid_aux_loss_weight_active: float = 0.0,
+    distance_aware_offset_targets_enabled: bool = False,
+    distance_aware_offset_target_radius: int = 1,
+    distance_aware_offset_target_sigma: float = 0.75,
 ) -> dict[str, Tensor]:
     coarse_prediction_mode = str(outputs.get("coarse_prediction_mode", "joint_pointer"))
     axis_loss_metrics = {
@@ -964,7 +1009,12 @@ def compute_autoreg_mesh_losses(
             distance_aware_radius=int(distance_aware_coarse_target_radius),
             distance_aware_sigma=float(distance_aware_coarse_target_sigma),
         )
-    offset_loss = _offset_bin_loss(outputs, batch, offset_num_bins=offset_num_bins)
+    offset_loss = _offset_bin_loss(
+        outputs, batch, offset_num_bins=offset_num_bins,
+        distance_aware_enabled=bool(distance_aware_offset_targets_enabled),
+        distance_aware_radius=int(distance_aware_offset_target_radius),
+        distance_aware_sigma=float(distance_aware_offset_target_sigma),
+    )
     stop_loss = _stop_loss(outputs, batch)
     total_loss = coarse_loss + float(offset_loss_weight_active) * offset_loss + stop_loss
     if float(joint_valid_aux_loss_weight_active) > 0.0:
@@ -1029,6 +1079,7 @@ def compute_autoreg_mesh_losses(
 
     pred_xyz_refined = outputs.get("pred_xyz_refined", outputs["pred_xyz"])
     coarse_acc_metrics = _coarse_accuracy_metrics(outputs, batch)
+    offset_acc_metrics = _offset_accuracy_metrics(outputs, batch, offset_num_bins=offset_num_bins)
     xyz_l1_soft = _l1_xyz_metric(soft_xyz_for_loss.detach(), batch)
     xyz_l1_refined = _l1_xyz_metric(pred_xyz_refined.detach(), batch)
     first_strip_wrong_side_rate_refined = _first_strip_wrong_side_rate_from_sequence(pred_xyz_refined.detach(), batch)
@@ -1065,6 +1116,8 @@ def compute_autoreg_mesh_losses(
         "coarse_constraint_target_outside_rate": outputs.get("coarse_constraint_target_outside_rate", total_loss.new_zeros(())),
         "offset_loss": offset_loss,
         "offset_loss_weight_active": total_loss.new_tensor(float(offset_loss_weight_active)),
+        "offset_exact_acc": offset_acc_metrics["offset_exact_acc"],
+        "offset_mean_bin_error": offset_acc_metrics["offset_mean_bin_error"],
         "stop_loss": stop_loss,
         "refine_loss": refine_loss,
         "refine_loss_weight_active": total_loss.new_tensor(float(position_refine_weight_active)),
