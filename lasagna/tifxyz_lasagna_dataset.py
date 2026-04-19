@@ -517,6 +517,7 @@ def _find_patches_world_chunks(config, patch_size_zyx):
         _need_group = (
             float(config.get("scale_aug_prob", 0.0)) > 0
             or bool(config.get("refine_mode", False))
+            or int(config.get("scale_offset", 0)) != 0
         )
         if _need_group:
             try:
@@ -650,6 +651,7 @@ class TifxyzLasagnaDataset(Dataset):
         include_geometry: bool = False,
         include_patch_ref: bool = False,
         refine_mode: bool = False,
+        scale_offset: int = 0,
     ):
         # Normalize patch_size to 3-element ZYX array (CT read size).
         patch_size_zyx = np.asarray(config["patch_size"], dtype=np.int32).reshape(-1)
@@ -699,6 +701,9 @@ class TifxyzLasagnaDataset(Dataset):
         # Multi-scale refinement mode: also voxelize surfaces at 2×
         # resolution for a random subregion, returned as _fine keys.
         self.refine_mode = bool(refine_mode)
+        # Scale offset: -1 (coarser, 2× world), 0 (base), +1 (finer, 0.5× world)
+        self.scale_offset = int(scale_offset)
+        config["scale_offset"] = self.scale_offset
 
         # Augmentation
         if apply_augmentation:
@@ -874,9 +879,9 @@ class TifxyzLasagnaDataset(Dataset):
         if patch.cache_to_volume is not None:
             zyx_world = _apply_affine_zyx(patch.cache_to_volume, zyx_world)
 
-        # Convert to local coordinates.  When coord_scale > 1, scale
-        # world coords to the finer grid before subtracting min_corner
-        # (which is already in scaled coords).
+        # Convert to local coordinates.  When coord_scale != 1, scale
+        # world coords to the target grid (finer if >1, coarser if <1)
+        # before subtracting min_corner (which is already in scaled coords).
         min_corner_f = min_corner.astype(np.float32)
         if coord_scale != 1:
             zyx_local = zyx_world * float(coord_scale) - min_corner_f
@@ -1117,6 +1122,69 @@ class TifxyzLasagnaDataset(Dataset):
                 image_normalization="unit",
             )
 
+        # --- Multi-scale offset: override CT + voxelization coords ---
+        # For scale_offset != 0, re-read CT from a different zarr level
+        # and adjust min_corner so voxelization covers the right world
+        # region at P resolution.
+        voxel_coord_scale = 1
+        scale_rand_offset = None  # random offset within the wider/narrower region
+        if self.scale_offset != 0 and patch.volume_group is not None:
+            base_center = min_corner + np.array(crop_size, dtype=np.int64) // 2
+            P = crop_size[0]
+
+            if self.scale_offset == -1:
+                # Coarser: P voxels covering 2× world.
+                # Each coarse voxel = 2 base voxels.
+                target_level = patch.scale + 1
+                # Random offset: where within the 2× region the base crop sits
+                scale_rand_offset = np.array(
+                    [int(np.random.randint(0, max(P // 2, 1))) for _ in range(3)],
+                    dtype=np.int64,
+                )
+                # Coarse region center in base voxels
+                coarse_center_base = base_center  # centered on same patch
+                # Coarse min in coarse voxels (each = 2 base)
+                coarse_min_coarse = (coarse_center_base - P) // 2 + scale_rand_offset // 2
+                ct_min = coarse_min_coarse
+                ct_max = ct_min + P
+                # Voxelization: world coords × 0.5 to convert to coarse voxels
+                voxel_coord_scale = 0.5
+                # min_corner for voxelization = coarse_min in coarse-voxel space
+                min_corner = ct_min.astype(np.int64)
+                crop_size = (P, P, P)
+
+            elif self.scale_offset == 1:
+                # Finer: P voxels covering 0.5× world.
+                target_level = patch.scale - 1
+                if target_level < 0:
+                    target_level = 0
+                # Random offset: where within the base region the fine crop sits
+                half_P = P // 2
+                scale_rand_offset = np.array(
+                    [int(np.random.randint(0, max(half_P, 1) + 1)) for _ in range(3)],
+                    dtype=np.int64,
+                )
+                # Fine region in base voxels: starts at min_corner + scale_rand_offset
+                fine_start_base = min_corner + scale_rand_offset
+                # Fine min in fine voxels (each = 0.5 base)
+                ct_min = (fine_start_base * 2).astype(np.int64)
+                ct_max = ct_min + P
+                voxel_coord_scale = 2
+                min_corner = ct_min.astype(np.int64)
+                crop_size = (P, P, P)
+
+            # Read CT from the target zarr level
+            try:
+                target_arr = patch.volume_group[str(target_level)]
+                vol_crop = _read_volume_crop(
+                    target_arr, crop_size=crop_size,
+                    min_corner=ct_min, max_corner=ct_max,
+                    image_normalization="unit",
+                )
+            except (KeyError, IndexError):
+                # Level not available — return zeros
+                vol_crop = np.zeros(crop_size, dtype=np.float32)
+
         # Per-patch chain info (wrap_idx → chain/pos/has_prev/has_next/label)
         chain_info_full = build_patch_chains(patch, self.max_surfaces_per_patch)
 
@@ -1137,6 +1205,7 @@ class TifxyzLasagnaDataset(Dataset):
         for wrap_idx, wrap in enumerate(patch.wraps[:self.max_surfaces_per_patch]):
             wrap_out = self._extract_and_voxelize_wrap(
                 patch, wrap, min_corner, crop_size,
+                coord_scale=voxel_coord_scale,
             )
             mask = wrap_out["mask"]
             if np.any(mask > 0):
@@ -1223,7 +1292,7 @@ class TifxyzLasagnaDataset(Dataset):
         surface_masks_fine_arr = None
         tensor_moments_fine_vol = None
         normals_valid_fine_vol = None
-        if self.refine_mode and num_surfaces > 0:
+        if self.refine_mode and num_surfaces > 0 and self.scale_offset == 0:
             P = crop_size[0]  # cubic
             half_P = P // 2
             # Random offset: fine subregion start within the base P region
@@ -1237,6 +1306,10 @@ class TifxyzLasagnaDataset(Dataset):
             fine_masks = []
             fine_normal_pts = []
             fine_normals_zyx = []
+            fine_cage_ctrl_pos = []
+            fine_cage_ctrl_normals = []
+            fine_cage_grid_rc = []
+            fine_cage_grid_rc_w = []
             for wi_local, wi_global in enumerate(kept_wrap_indices):
                 wrap = patch.wraps[wi_global]
                 w_out = self._extract_and_voxelize_wrap(
@@ -1246,6 +1319,10 @@ class TifxyzLasagnaDataset(Dataset):
                 if w_out["points_local"].shape[0] > 0:
                     fine_normal_pts.append(w_out["points_local"])
                     fine_normals_zyx.append(w_out["normals_zyx"])
+                fine_cage_ctrl_pos.append(w_out["ctrl_pos_stored"])
+                fine_cage_ctrl_normals.append(w_out["ctrl_normals_stored"])
+                fine_cage_grid_rc.append(w_out["grid_rc_vol"])
+                fine_cage_grid_rc_w.append(w_out["grid_rc_weight"])
 
             surface_masks_fine_arr = np.stack(fine_masks, axis=0)
 
@@ -1263,6 +1340,105 @@ class TifxyzLasagnaDataset(Dataset):
                 normals_valid_fine_vol = np.zeros(
                     fine_crop, dtype=np.float32,
                 )
+
+        # --- Coarse-resolution data for multi-scale refinement ---
+        # Re-voxelize at 0.5× resolution covering 2× world extent.
+        coarse_offset = None
+        surface_masks_m1_arr = None
+        tensor_moments_m1_vol = None
+        normals_valid_m1_vol = None
+        image_m1_crop = None
+        image_p1_crop = None
+        cage_ctrl_pos_m1: list = []
+        cage_ctrl_normals_m1: list = []
+        cage_grid_rc_m1: list = []
+        cage_grid_rc_w_m1: list = []
+        if self.refine_mode and num_surfaces > 0 and self.scale_offset == 0:
+            P = crop_size[0]
+            _vol_group = getattr(patch, "volume_group", None)
+
+            # --- Coarse scale (-1): P voxels covering 2× world ---
+            target_level_m1 = patch.scale + 1
+            arr_m1 = None
+            if _vol_group is not None:
+                try:
+                    arr_m1 = _vol_group[str(target_level_m1)]
+                except (KeyError, IndexError):
+                    pass
+
+            if arr_m1 is not None:
+                coarse_offset = np.array(
+                    [int(np.random.randint(0, max(P // 2, 1)))
+                     for _ in range(3)],
+                    dtype=np.int64,
+                )
+                base_center = min_corner + P // 2
+                coarse_min = (
+                    (base_center - P) // 2 + coarse_offset // 2
+                ).astype(np.int64)
+                coarse_max = coarse_min + P
+                coarse_crop = (P, P, P)
+
+                # Read coarse CT
+                image_m1_crop = _read_volume_crop(
+                    arr_m1, crop_size=coarse_crop,
+                    min_corner=coarse_min, max_corner=coarse_max,
+                    image_normalization="unit",
+                )
+
+                # Voxelize surfaces at coarse scale
+                m1_masks = []
+                m1_normal_pts = []
+                m1_normals_zyx = []
+                for wi_global in kept_wrap_indices:
+                    wrap = patch.wraps[wi_global]
+                    w_out = self._extract_and_voxelize_wrap(
+                        patch, wrap, coarse_min, coarse_crop,
+                        coord_scale=0.5,
+                    )
+                    m1_masks.append(w_out["mask"])
+                    if w_out["points_local"].shape[0] > 0:
+                        m1_normal_pts.append(w_out["points_local"])
+                        m1_normals_zyx.append(w_out["normals_zyx"])
+                    cage_ctrl_pos_m1.append(w_out["ctrl_pos_stored"])
+                    cage_ctrl_normals_m1.append(w_out["ctrl_normals_stored"])
+                    cage_grid_rc_m1.append(w_out["grid_rc_vol"])
+                    cage_grid_rc_w_m1.append(w_out["grid_rc_weight"])
+
+                surface_masks_m1_arr = np.stack(m1_masks, axis=0)
+
+                if m1_normal_pts:
+                    pts_m1 = np.concatenate(m1_normal_pts, axis=0)
+                    nrm_m1 = np.concatenate(m1_normals_zyx, axis=0)
+                    tvals_m1 = _tensor_moments_from_normals_zyx(nrm_m1)
+                    tensor_moments_m1_vol, normals_valid_m1_vol = (
+                        _splat_multichannel(pts_m1, tvals_m1, coarse_crop)
+                    )
+                else:
+                    tensor_moments_m1_vol = np.zeros(
+                        (6,) + coarse_crop, dtype=np.float32,
+                    )
+                    normals_valid_m1_vol = np.zeros(
+                        coarse_crop, dtype=np.float32,
+                    )
+
+            # --- Fine CT (+1): read from zarr level-1 ---
+            if fine_offset is not None and _vol_group is not None:
+                target_level_p1 = patch.scale - 1
+                if target_level_p1 >= 0:
+                    try:
+                        arr_p1 = _vol_group[str(target_level_p1)]
+                        fine_ct_min = (
+                            (min_corner + fine_offset) * 2
+                        ).astype(np.int64)
+                        fine_ct_max = fine_ct_min + P
+                        image_p1_crop = _read_volume_crop(
+                            arr_p1, crop_size=(P, P, P),
+                            min_corner=fine_ct_min, max_corner=fine_ct_max,
+                            image_normalization="unit",
+                        )
+                    except (KeyError, IndexError):
+                        pass
 
         # Convert to tensors
         vol_crop_t = torch.as_tensor(
@@ -1303,6 +1479,8 @@ class TifxyzLasagnaDataset(Dataset):
                 "scale_aug_factor": f,
                 "scale_aug_offset": scale_aug_offset,   # (3,) int64 or None
                 "fine_offset": fine_offset,             # (3,) int64 or None
+                "scale_offset": self.scale_offset,     # -1, 0, or +1
+                "scale_rand_offset": scale_rand_offset,  # (3,) int64 or None
             },
         }
         # Cage deformation: per-surface control point grids + coordinate maps
@@ -1329,6 +1507,56 @@ class TifxyzLasagnaDataset(Dataset):
             sample["normals_valid_fine"] = torch.as_tensor(
                 normals_valid_fine_vol, dtype=torch.float32,
             ).unsqueeze(0)
+            sample["cage_ctrl_pos_fine"] = [
+                torch.as_tensor(cp, dtype=torch.float32)
+                for cp in fine_cage_ctrl_pos
+            ]
+            sample["cage_ctrl_normals_fine"] = [
+                torch.as_tensor(cn, dtype=torch.float32)
+                for cn in fine_cage_ctrl_normals
+            ]
+            sample["cage_grid_rc_fine"] = [
+                torch.as_tensor(rc, dtype=torch.float32)
+                for rc in fine_cage_grid_rc
+            ]
+            sample["cage_grid_rc_w_fine"] = [
+                torch.as_tensor(w, dtype=torch.float32)
+                for w in fine_cage_grid_rc_w
+            ]
+        if self.refine_mode and image_p1_crop is not None:
+            sample["image_p1"] = torch.as_tensor(
+                np.asarray(image_p1_crop, dtype=np.float32),
+            ).unsqueeze(0)
+        if self.refine_mode and surface_masks_m1_arr is not None:
+            sample["image_m1"] = torch.as_tensor(
+                np.asarray(image_m1_crop, dtype=np.float32),
+            ).unsqueeze(0)
+            sample["surface_masks_m1"] = torch.as_tensor(
+                surface_masks_m1_arr, dtype=torch.float32,
+            )
+            sample["tensor_moments_m1"] = torch.as_tensor(
+                tensor_moments_m1_vol, dtype=torch.float32,
+            )
+            sample["normals_valid_m1"] = torch.as_tensor(
+                normals_valid_m1_vol, dtype=torch.float32,
+            ).unsqueeze(0)
+            sample["cage_ctrl_pos_m1"] = [
+                torch.as_tensor(cp, dtype=torch.float32)
+                for cp in cage_ctrl_pos_m1
+            ]
+            sample["cage_ctrl_normals_m1"] = [
+                torch.as_tensor(cn, dtype=torch.float32)
+                for cn in cage_ctrl_normals_m1
+            ]
+            sample["cage_grid_rc_m1"] = [
+                torch.as_tensor(rc, dtype=torch.float32)
+                for rc in cage_grid_rc_m1
+            ]
+            sample["cage_grid_rc_w_m1"] = [
+                torch.as_tensor(w, dtype=torch.float32)
+                for w in cage_grid_rc_w_m1
+            ]
+            sample["patch_info"]["coarse_offset"] = coarse_offset
         if self.include_geometry:
             sample["surface_geometry"] = surface_geometry
         if self.include_patch_ref:
@@ -1379,6 +1607,30 @@ def collate_variable_surfaces(batch):
         out["normals_valid_fine"] = torch.stack(
             [b["normals_valid_fine"] for b in batch],
         )
+    if "cage_ctrl_pos_fine" in batch[0]:
+        out["cage_ctrl_pos_fine"] = [b["cage_ctrl_pos_fine"] for b in batch]
+        out["cage_ctrl_normals_fine"] = [b["cage_ctrl_normals_fine"] for b in batch]
+        out["cage_grid_rc_fine"] = [b["cage_grid_rc_fine"] for b in batch]
+        out["cage_grid_rc_w_fine"] = [b["cage_grid_rc_w_fine"] for b in batch]
+    # Coarse scale (-1) data
+    if "image_m1" in batch[0]:
+        out["image_m1"] = torch.stack([b["image_m1"] for b in batch])
+    if "surface_masks_m1" in batch[0]:
+        out["surface_masks_m1"] = [b["surface_masks_m1"] for b in batch]
+        out["tensor_moments_m1"] = torch.stack(
+            [b["tensor_moments_m1"] for b in batch],
+        )
+        out["normals_valid_m1"] = torch.stack(
+            [b["normals_valid_m1"] for b in batch],
+        )
+    if "cage_ctrl_pos_m1" in batch[0]:
+        out["cage_ctrl_pos_m1"] = [b["cage_ctrl_pos_m1"] for b in batch]
+        out["cage_ctrl_normals_m1"] = [b["cage_ctrl_normals_m1"] for b in batch]
+        out["cage_grid_rc_m1"] = [b["cage_grid_rc_m1"] for b in batch]
+        out["cage_grid_rc_w_m1"] = [b["cage_grid_rc_w_m1"] for b in batch]
+    # Fine CT image
+    if "image_p1" in batch[0]:
+        out["image_p1"] = torch.stack([b["image_p1"] for b in batch])
     if "surface_geometry" in batch[0]:
         out["surface_geometry"] = [b["surface_geometry"] for b in batch]
     if "_patch" in batch[0]:
@@ -1563,4 +1815,226 @@ def augment_batch_inplace(batch: dict) -> dict:
 
     batch["tensor_moments"] = new_tensor
     batch["normals_valid"] = new_normals_valid
+
+    # --- Augment cage deformation data ---
+    if "cage_ctrl_pos" in batch and batch["cage_ctrl_pos"] is not None:
+        for b_idx in range(B):
+            if b_idx >= len(batch["cage_ctrl_pos"]):
+                break
+            # ctrl_pos: list of (H_s, W_s, 3) per surface — transform as points
+            # ctrl_normals: list of (H_s, W_s, 3) per surface — transform as normals
+            for s in range(len(batch["cage_ctrl_pos"][b_idx])):
+                cp = batch["cage_ctrl_pos"][b_idx][s].clone()  # (H_s, W_s, 3) ZYX
+                cn = batch["cage_ctrl_normals"][b_idx][s].clone()
+                if cp.numel() == 0:
+                    continue
+                if flip_z:
+                    cp[..., 0] = (Z - 1) - cp[..., 0]
+                    cn[..., 0] *= -1.0
+                if flip_y:
+                    cp[..., 1] = (Y - 1) - cp[..., 1]
+                    cn[..., 1] *= -1.0
+                if flip_x:
+                    cp[..., 2] = (X - 1) - cp[..., 2]
+                    cn[..., 2] *= -1.0
+                for _ in range(k % 4):
+                    y_new = (Y - 1) - cp[..., 2].clone()
+                    x_new = cp[..., 1].clone()
+                    cp[..., 1] = y_new
+                    cp[..., 2] = x_new
+                    ny_new = -cn[..., 2].clone()
+                    nx_new = cn[..., 1].clone()
+                    cn[..., 1] = ny_new
+                    cn[..., 2] = nx_new
+                batch["cage_ctrl_pos"][b_idx][s] = cp
+                batch["cage_ctrl_normals"][b_idx][s] = cn
+
+            # grid_rc: list of (2, Z, Y, X) — spatial flip/rot
+            # grid_rc_w: list of (Z, Y, X) — spatial flip/rot
+            for s in range(len(batch["cage_grid_rc"][b_idx])):
+                batch["cage_grid_rc"][b_idx][s] = _flip_rot(
+                    batch["cage_grid_rc"][b_idx][s], (1, 2, 3),
+                )
+                batch["cage_grid_rc_w"][b_idx][s] = _flip_rot(
+                    batch["cage_grid_rc_w"][b_idx][s], (0, 1, 2),
+                )
+
+    # --- Augment fine-resolution fields ---
+    if "surface_masks_fine" in batch and batch["surface_masks_fine"] is not None:
+        batch["surface_masks_fine"] = [
+            _flip_rot(m, (1, 2, 3)) for m in batch["surface_masks_fine"]
+        ]
+    if "tensor_moments_fine" in batch and batch["tensor_moments_fine"] is not None:
+        # Same spatial + component transform as base tensor_moments
+        tmf = _flip_rot(batch["tensor_moments_fine"], (2, 3, 4))
+        # Re-splat from augmented fine geometry would be ideal, but we
+        # don't have fine geometry stored. Apply the same component
+        # permutation as the no-geometry path.
+        sgn_xy = 1.0
+        sgn_xz = 1.0
+        sgn_yz = 1.0
+        if flip_x:
+            sgn_xy = -sgn_xy
+            sgn_xz = -sgn_xz
+        if flip_y:
+            sgn_xy = -sgn_xy
+            sgn_yz = -sgn_yz
+        if flip_z:
+            sgn_xz = -sgn_xz
+            sgn_yz = -sgn_yz
+        tmf[:, 3] = tmf[:, 3] * sgn_xy
+        tmf[:, 4] = tmf[:, 4] * sgn_xz
+        tmf[:, 5] = tmf[:, 5] * sgn_yz
+        for _ in range(k % 4):
+            nx2_old = tmf[:, 0].clone()
+            ny2_old = tmf[:, 1].clone()
+            nxny_old = tmf[:, 3].clone()
+            nxnz_old = tmf[:, 4].clone()
+            nynz_old = tmf[:, 5].clone()
+            tmf[:, 0] = ny2_old
+            tmf[:, 1] = nx2_old
+            tmf[:, 3] = -nxny_old
+            tmf[:, 4] = nynz_old
+            tmf[:, 5] = -nxnz_old
+        batch["tensor_moments_fine"] = tmf
+    if "normals_valid_fine" in batch and batch["normals_valid_fine"] is not None:
+        batch["normals_valid_fine"] = _flip_rot(
+            batch["normals_valid_fine"], (2, 3, 4),
+        )
+
+    # Fine cage data — same transform as base cage data but at fine resolution
+    if "cage_ctrl_pos_fine" in batch and batch["cage_ctrl_pos_fine"] is not None:
+        # Fine resolution spatial dims (may differ from base Z, Y, X)
+        for b_idx in range(B):
+            if b_idx >= len(batch["cage_ctrl_pos_fine"]):
+                break
+            # Get fine spatial size from grid_rc_fine
+            if batch["cage_grid_rc_fine"][b_idx]:
+                fZ = batch["cage_grid_rc_fine"][b_idx][0].shape[1]
+                fY = batch["cage_grid_rc_fine"][b_idx][0].shape[2]
+                fX = batch["cage_grid_rc_fine"][b_idx][0].shape[3]
+            else:
+                fZ, fY, fX = Z, Y, X
+            for s in range(len(batch["cage_ctrl_pos_fine"][b_idx])):
+                cp = batch["cage_ctrl_pos_fine"][b_idx][s].clone()
+                cn = batch["cage_ctrl_normals_fine"][b_idx][s].clone()
+                if cp.numel() == 0:
+                    continue
+                if flip_z:
+                    cp[..., 0] = (fZ - 1) - cp[..., 0]
+                    cn[..., 0] *= -1.0
+                if flip_y:
+                    cp[..., 1] = (fY - 1) - cp[..., 1]
+                    cn[..., 1] *= -1.0
+                if flip_x:
+                    cp[..., 2] = (fX - 1) - cp[..., 2]
+                    cn[..., 2] *= -1.0
+                for _ in range(k % 4):
+                    y_new = (fY - 1) - cp[..., 2].clone()
+                    x_new = cp[..., 1].clone()
+                    cp[..., 1] = y_new
+                    cp[..., 2] = x_new
+                    ny_new = -cn[..., 2].clone()
+                    nx_new = cn[..., 1].clone()
+                    cn[..., 1] = ny_new
+                    cn[..., 2] = nx_new
+                batch["cage_ctrl_pos_fine"][b_idx][s] = cp
+                batch["cage_ctrl_normals_fine"][b_idx][s] = cn
+
+            for s in range(len(batch["cage_grid_rc_fine"][b_idx])):
+                batch["cage_grid_rc_fine"][b_idx][s] = _flip_rot(
+                    batch["cage_grid_rc_fine"][b_idx][s], (1, 2, 3),
+                )
+                batch["cage_grid_rc_w_fine"][b_idx][s] = _flip_rot(
+                    batch["cage_grid_rc_w_fine"][b_idx][s], (0, 1, 2),
+                )
+
+    # --- Augment coarse-resolution fields (_m1) ---
+    if "image_m1" in batch and batch["image_m1"] is not None:
+        batch["image_m1"] = _flip_rot(batch["image_m1"], (2, 3, 4))
+    if "image_p1" in batch and batch["image_p1"] is not None:
+        batch["image_p1"] = _flip_rot(batch["image_p1"], (2, 3, 4))
+    if "surface_masks_m1" in batch and batch["surface_masks_m1"] is not None:
+        batch["surface_masks_m1"] = [
+            _flip_rot(m, (1, 2, 3)) for m in batch["surface_masks_m1"]
+        ]
+    if "tensor_moments_m1" in batch and batch["tensor_moments_m1"] is not None:
+        tmm = _flip_rot(batch["tensor_moments_m1"], (2, 3, 4))
+        sgn_xy = 1.0
+        sgn_xz = 1.0
+        sgn_yz = 1.0
+        if flip_x:
+            sgn_xy = -sgn_xy
+            sgn_xz = -sgn_xz
+        if flip_y:
+            sgn_xy = -sgn_xy
+            sgn_yz = -sgn_yz
+        if flip_z:
+            sgn_xz = -sgn_xz
+            sgn_yz = -sgn_yz
+        tmm[:, 3] = tmm[:, 3] * sgn_xy
+        tmm[:, 4] = tmm[:, 4] * sgn_xz
+        tmm[:, 5] = tmm[:, 5] * sgn_yz
+        for _ in range(k % 4):
+            nx2_old = tmm[:, 0].clone()
+            ny2_old = tmm[:, 1].clone()
+            nxny_old = tmm[:, 3].clone()
+            nxnz_old = tmm[:, 4].clone()
+            nynz_old = tmm[:, 5].clone()
+            tmm[:, 0] = ny2_old
+            tmm[:, 1] = nx2_old
+            tmm[:, 3] = -nxny_old
+            tmm[:, 4] = nynz_old
+            tmm[:, 5] = -nxnz_old
+        batch["tensor_moments_m1"] = tmm
+    if "normals_valid_m1" in batch and batch["normals_valid_m1"] is not None:
+        batch["normals_valid_m1"] = _flip_rot(
+            batch["normals_valid_m1"], (2, 3, 4),
+        )
+
+    # Coarse cage data — same transform as base but at coarse resolution
+    if "cage_ctrl_pos_m1" in batch and batch["cage_ctrl_pos_m1"] is not None:
+        for b_idx in range(B):
+            if b_idx >= len(batch["cage_ctrl_pos_m1"]):
+                break
+            if batch["cage_grid_rc_m1"][b_idx]:
+                mZ = batch["cage_grid_rc_m1"][b_idx][0].shape[1]
+                mY = batch["cage_grid_rc_m1"][b_idx][0].shape[2]
+                mX = batch["cage_grid_rc_m1"][b_idx][0].shape[3]
+            else:
+                mZ, mY, mX = Z, Y, X
+            for s in range(len(batch["cage_ctrl_pos_m1"][b_idx])):
+                cp = batch["cage_ctrl_pos_m1"][b_idx][s].clone()
+                cn = batch["cage_ctrl_normals_m1"][b_idx][s].clone()
+                if cp.numel() == 0:
+                    continue
+                if flip_z:
+                    cp[..., 0] = (mZ - 1) - cp[..., 0]
+                    cn[..., 0] *= -1.0
+                if flip_y:
+                    cp[..., 1] = (mY - 1) - cp[..., 1]
+                    cn[..., 1] *= -1.0
+                if flip_x:
+                    cp[..., 2] = (mX - 1) - cp[..., 2]
+                    cn[..., 2] *= -1.0
+                for _ in range(k % 4):
+                    y_new = (mY - 1) - cp[..., 2].clone()
+                    x_new = cp[..., 1].clone()
+                    cp[..., 1] = y_new
+                    cp[..., 2] = x_new
+                    ny_new = -cn[..., 2].clone()
+                    nx_new = cn[..., 1].clone()
+                    cn[..., 1] = ny_new
+                    cn[..., 2] = nx_new
+                batch["cage_ctrl_pos_m1"][b_idx][s] = cp
+                batch["cage_ctrl_normals_m1"][b_idx][s] = cn
+
+            for s in range(len(batch["cage_grid_rc_m1"][b_idx])):
+                batch["cage_grid_rc_m1"][b_idx][s] = _flip_rot(
+                    batch["cage_grid_rc_m1"][b_idx][s], (1, 2, 3),
+                )
+                batch["cage_grid_rc_w_m1"][b_idx][s] = _flip_rot(
+                    batch["cage_grid_rc_w_m1"][b_idx][s], (0, 1, 2),
+                )
+
     return batch

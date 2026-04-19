@@ -891,90 +891,6 @@ def _apply_warp(cos_gm, validity, deform_full):
 # Cage deformation: surface control points → volume displacement
 # ---------------------------------------------------------------------------
 
-def _splat_to_volume(pts: torch.Tensor, vals: torch.Tensor,
-                     shape: Tuple[int, int, int]) -> torch.Tensor:
-    """Trilinear splat values at fractional 3D positions into a volume.
-
-    Args:
-        pts: (N, 3) float — ZYX positions
-        vals: (N,) or (N, C) float — values to splat
-        shape: (Z, Y, X)
-
-    Returns: (Z, Y, X) or (C, Z, Y, X) volume with weight-normalized values
-    """
-    Z, Y, X = shape
-    device = pts.device
-    is_1d = vals.dim() == 1
-    if is_1d:
-        vals = vals.unsqueeze(1)  # (N, 1)
-    C = vals.shape[1]
-
-    vol = torch.zeros(C, Z, Y, X, device=device, dtype=vals.dtype)
-    wgt = torch.zeros(1, Z, Y, X, device=device, dtype=vals.dtype)
-
-    # Clamp to valid range
-    pz = pts[:, 0].clamp(0, Z - 1.001)
-    py = pts[:, 1].clamp(0, Y - 1.001)
-    px = pts[:, 2].clamp(0, X - 1.001)
-
-    z0 = pz.long()
-    y0 = py.long()
-    x0 = px.long()
-    dz = pz - z0.float()
-    dy = py - y0.float()
-    dx = px - x0.float()
-
-    for oz in range(2):
-        wz = dz if oz else (1 - dz)
-        zi = (z0 + oz).clamp(0, Z - 1)
-        for oy in range(2):
-            wy = dy if oy else (1 - dy)
-            yi = (y0 + oy).clamp(0, Y - 1)
-            for ox in range(2):
-                wx = dx if ox else (1 - dx)
-                xi = (x0 + ox).clamp(0, X - 1)
-                w = wz * wy * wx  # (N,)
-                idx = zi * Y * X + yi * X + xi  # (N,)
-                for c in range(C):
-                    vol.view(C, -1)[c].scatter_add_(0, idx, w * vals[:, c])
-                wgt.view(-1).scatter_add_(0, idx, w)
-
-    # Weight-normalize (out-of-place to preserve autograd graph)
-    wgt_safe = wgt.detach().clamp(min=1e-8)
-    vol = vol / wgt_safe
-
-    if is_1d:
-        return vol[0]
-    return vol
-
-
-def _compute_edts_at_scale(
-    surface_masks: list,
-    scale_offset: int,
-    device: torch.device,
-) -> list:
-    """Compute per-surface EDTs from surface masks at a given scale.
-
-    offset 0: masks at full resolution, EDT directly.
-    offset -1 (coarser): max_pool masks by 2, then EDT on pooled.
-    offset +1 (finer): masks already at fine resolution, EDT directly.
-    """
-    from tifxyz_labels import edt_torch
-
-    dts = []
-    for mask in surface_masks:
-        m = mask.to(device)
-        if m.dim() == 2:
-            # (H, W) → skip, not a 3D mask
-            continue
-        if scale_offset == -1:
-            # Pool to half resolution
-            m_4d = m.float().unsqueeze(0).unsqueeze(0)
-            m_pooled = F.max_pool3d(m_4d, kernel_size=2, stride=2)
-            m = m_pooled.squeeze() > 0.5
-        dt = edt_torch((~m).to(torch.uint8))
-        dts.append(dt)
-    return dts
 
 
 def _gather_cage_on_surface(
@@ -1656,74 +1572,68 @@ def _pick_refine_mode(
     return mode_idx, seq
 
 
-def _read_ct_at_offset(
-    patch_info_list: list,
-    vol_groups: dict,
+def _get_scale_data_from_batch(
+    batch: dict,
     scale_offset: int,
-    patch_size: int,
     device: torch.device,
-) -> torch.Tensor:
-    """Read CT at an offset zarr level for a batch of samples.
+    same_surface_threshold: float = 0.0,
+) -> tuple:
+    """Extract CT image and compute GT at a given scale from batch data.
 
-    Returns (B, 1, P, P, P) float32 tensor on device.
+    The batch must contain multi-scale data produced by the dataset
+    (image_m1, surface_masks_m1, etc. for scale -1; image_p1,
+    surface_masks_fine, etc. for scale +1).
+
+    Returns (ct, targets, validity, dsm, ddm, daw, dts, bfrac, blo, bhi).
     """
-    from vesuvius.neural_tracing.datasets.common import _read_volume_crop
+    if scale_offset == 0:
+        raise ValueError("Use the base batch data directly for scale 0")
 
-    crops = []
-    P = patch_size
-    for pi in patch_info_list:
-        ds_idx = pi["dataset_idx"]
-        base_level = pi["scale"]
-        target_level = base_level - scale_offset
+    if scale_offset == -1:
+        ct = batch.get("image_m1")
+        masks_key = "surface_masks_m1"
+        tm_key = "tensor_moments_m1"
+        nv_key = "normals_valid_m1"
+    elif scale_offset == 1:
+        ct = batch.get("image_p1")
+        masks_key = "surface_masks_fine"
+        tm_key = "tensor_moments_fine"
+        nv_key = "normals_valid_fine"
+    else:
+        raise ValueError(f"Unknown scale_offset: {scale_offset}")
 
-        group = vol_groups.get(ds_idx)
-        if group is None:
-            # No group available — return zeros
-            crops.append(np.zeros((P, P, P), dtype=np.float32))
-            continue
+    if ct is None or masks_key not in batch:
+        return None  # data not available at this scale
 
-        try:
-            arr = group[str(target_level)]
-        except (KeyError, IndexError):
-            crops.append(np.zeros((P, P, P), dtype=np.float32))
-            continue
+    ct = ct.to(device, non_blocking=True)
 
-        crop_size = (P, P, P)
-        if scale_offset == 1:
-            # Finer level: use fine_offset from dataset
-            fine_off = pi.get("fine_offset")
-            base_min = pi["world_min"]
-            if fine_off is not None:
-                fine_min = np.array([
-                    int((base_min[d] + fine_off[d]) * 2)
-                    for d in range(3)
-                ], dtype=np.int64)
-            else:
-                # Fallback: center
-                center = pi["world_center"]
-                fine_min = np.array([
-                    int(round(center[d] * 2 - P / 2))
-                    for d in range(3)
-                ], dtype=np.int64)
-            target_min = fine_min
-        else:
-            coord_factor = 2.0 ** scale_offset
-            center = pi["world_center"]
-            target_min = np.array([
-                int(round(center[d] * coord_factor - P / 2))
-                for d in range(3)
-            ], dtype=np.int64)
+    # Build a synthetic batch for compute_batch_targets
+    scale_batch = {
+        "image": ct,
+        "surface_masks": batch[masks_key],
+        "tensor_moments": batch[tm_key].to(device),
+        "normals_valid": batch[nv_key].to(device),
+        "surface_chain_info": batch["surface_chain_info"],
+        "num_surfaces": batch["num_surfaces"],
+    }
+    # Cage data at this scale (for deformation)
+    cage_suffix = "_m1" if scale_offset == -1 else "_fine"
+    if f"cage_ctrl_pos{cage_suffix}" in batch:
+        scale_batch["cage_ctrl_pos"] = batch[f"cage_ctrl_pos{cage_suffix}"]
+        scale_batch["cage_ctrl_normals"] = batch[f"cage_ctrl_normals{cage_suffix}"]
+        scale_batch["cage_grid_rc"] = batch[f"cage_grid_rc{cage_suffix}"]
+        scale_batch["cage_grid_rc_w"] = batch[f"cage_grid_rc_w{cage_suffix}"]
 
-        target_max = target_min + P
-        vol_crop = _read_volume_crop(
-            arr, crop_size=crop_size,
-            min_corner=target_min, max_corner=target_max,
-            image_normalization="unit",
-        )
-        crops.append(np.asarray(vol_crop, dtype=np.float32))
-
-    batch = np.stack(crops, axis=0)[:, np.newaxis]  # (B, 1, P, P, P)
-    return torch.as_tensor(batch, dtype=torch.float32, device=device)
+    (
+        targets, validity,
+        dsm, ddm, daw,
+        _, _, _,
+        dts, bfrac, blo, bhi,
+    ) = compute_batch_targets(
+        scale_batch, device,
+        same_surface_threshold=same_surface_threshold,
+    )
+    return ct, targets, validity, dsm, ddm, daw, dts, bfrac, blo, bhi
 
 
 def _resample_prior(
@@ -1811,86 +1721,97 @@ def _build_refine_input(
         return torch.cat([image, zeros, scale_ch], dim=1)
 
 
-def _get_gt_at_offset(
+
+def run_refine_chain(
+    model,
     batch: dict,
-    targets_0: torch.Tensor,
-    validity_0: torch.Tensor,
-    dir_sparse_mask_0: torch.Tensor,
-    dir_dense_mask_0: torch.Tensor,
-    dir_axis_weight_0: torch.Tensor,
-    scale_offset: int,
+    image: torch.Tensor,           # (B, 1, Z, Y, X) CT at scale 0
+    targets_0: torch.Tensor,       # (B, 8, Z, Y, X) GT at scale 0
+    validity_0: torch.Tensor,      # (B, 1, Z, Y, X)
+    dsm_0: torch.Tensor,
+    ddm_0: torch.Tensor,
+    daw_0: torch.Tensor,
+    scale_seq: list,               # [(offset, has_prior), ...]
+    vol_groups: dict,              # unused, kept for API compat
+    patch_size: int,
     device: torch.device,
-    compute_batch_targets_fn=None,
-    same_surface_threshold: float = 0.0,
-):
-    """Get GT at a given scale offset.
+    amp_dtype,
+    output_sigmoid: bool = False,
+    same_surface_threshold: float = None,
+    refine: bool = True,
+) -> list:
+    """Run a multi-scale refinement chain through the model.
 
-    offset 0: pass through scale-0 GT
-    offset -1: avg_pool scale-0 GT by 2
-    offset +1: compute from fine-res batch data (native)
+    Shared between training and test scripts.  Returns a list of
+    per-pass dicts with keys: offset, has_prior, pred, gt, validity,
+    each as detached CPU tensors.
+
+    CT and GT at non-zero scales are read from the batch's multi-scale
+    data (image_m1/p1, surface_masks_m1/fine, etc.) which were produced
+    by the dataset and augmented by augment_batch_inplace.
     """
-    if scale_offset == 0:
-        return targets_0, validity_0, dir_sparse_mask_0, dir_dense_mask_0, dir_axis_weight_0
+    results = []
+    prev_pred = None
+    prev_offset = None
+    P = patch_size
 
-    if scale_offset == -1:
-        # Coarser: pool from scale 0
-        v = validity_0
-        v_count = F.avg_pool3d(v, kernel_size=2, stride=2)
-        tgt = F.avg_pool3d(targets_0 * v, 2, 2) / v_count.clamp(min=1e-8)
-        # grad_mag scales with resolution (coarser = larger spacing per voxel)
-        tgt[:, 1:2] *= 2.0
-        val = F.max_pool3d(v, 2, 2)
-        dsm = F.max_pool3d(dir_sparse_mask_0, 2, 2)
-        ddm = F.max_pool3d(dir_dense_mask_0, 2, 2)
-        daw = F.avg_pool3d(dir_axis_weight_0 * v, 2, 2) / v_count.clamp(min=1e-8)
-        return tgt, val, dsm, ddm, daw
+    with torch.no_grad(), torch.amp.autocast(
+        device_type="cuda", dtype=amp_dtype, enabled=True,
+    ):
+        for offset, has_prior in scale_seq:
+            # CT + GT at this scale
+            if offset == 0:
+                ct = image
+                tgt, val = targets_0, validity_0
+                dsm, ddm, daw = dsm_0, ddm_0, daw_0
+            else:
+                scale_data = _get_scale_data_from_batch(
+                    batch, offset, device,
+                    same_surface_threshold=same_surface_threshold or 0.0,
+                )
+                if scale_data is None:
+                    # Scale not available — skip this pass
+                    continue
+                ct, tgt, val, dsm, ddm, daw = scale_data[:6]
 
-    if scale_offset == 1:
-        # Finer: compute from native fine-res data
-        if compute_batch_targets_fn is None or "surface_masks_fine" not in batch:
-            # Fallback: upsample from scale 0
-            P = targets_0.shape[2]
-            tgt_up = F.interpolate(
-                targets_0, size=(P, P, P), mode="trilinear",
-                align_corners=False,
-            )
-            # No — targets_0 is already P. For +1 we need P output from
-            # a P/2 center crop upsampled.  This is the fallback path;
-            # the primary path uses native fine GT below.
-            center = P // 4
-            half = P // 2
-            tgt_crop = targets_0[:, :, center:center+half, center:center+half, center:center+half]
-            val_crop = validity_0[:, :, center:center+half, center:center+half, center:center+half]
-            tgt_up = F.interpolate(tgt_crop, size=(P, P, P), mode="trilinear", align_corners=False)
-            val_up = F.interpolate(val_crop, size=(P, P, P), mode="nearest")
-            dsm_crop = dir_sparse_mask_0[:, :, center:center+half, center:center+half, center:center+half]
-            ddm_crop = dir_dense_mask_0[:, :, center:center+half, center:center+half, center:center+half]
-            daw_crop = dir_axis_weight_0[:, :, center:center+half, center:center+half, center:center+half]
-            dsm_up = F.interpolate(dsm_crop, size=(P, P, P), mode="nearest")
-            ddm_up = F.interpolate(ddm_crop, size=(P, P, P), mode="nearest")
-            daw_up = F.interpolate(daw_crop, size=(P, P, P), mode="trilinear", align_corners=False)
-            return tgt_up, val_up, dsm_up, ddm_up, daw_up
+            # Build prior from previous pass
+            prior_resampled = None
+            if refine:
+                if has_prior and prev_pred is not None:
+                    prior_resampled = _resample_prior(
+                        prev_pred.detach(), prev_offset, offset, P,
+                    )
+                model_in = _build_refine_input(ct, prior_resampled, offset)
+            else:
+                model_in = ct
 
-        # Native fine GT: use fine-res surface_masks from dataset
-        # Build a synthetic batch dict with the fine-res data
-        fine_batch = {
-            "surface_masks": batch["surface_masks_fine"],
-            "tensor_moments": batch["tensor_moments_fine"].to(device),
-            "normals_valid": batch["normals_valid_fine"].to(device),
-            "surface_chain_info": batch["surface_chain_info"],
-            "num_surfaces": batch["num_surfaces"],
-        }
-        (
-            tgt_fine, val_fine,
-            dsm_fine, ddm_fine, daw_fine,
-            _, _, _, _, _, _, _,
-        ) = compute_batch_targets_fn(
-            fine_batch, device,
-            same_surface_threshold=same_surface_threshold,
-        )
-        return tgt_fine, val_fine, dsm_fine, ddm_fine, daw_fine
+            # Forward
+            raw = model(model_in)["output"]
+            pred = torch.sigmoid(raw) if output_sigmoid else raw
 
-    raise ValueError(f"Unknown scale_offset: {scale_offset}")
+            # Match pred to GT resolution for non-zero offsets
+            pred_matched = pred
+            if pred.shape[2:] != tgt.shape[2:]:
+                pred_matched = F.interpolate(
+                    pred, size=tgt.shape[2:],
+                    mode="trilinear", align_corners=False,
+                )
+
+            results.append({
+                "offset": offset,
+                "has_prior": has_prior,
+                "pred": pred_matched.detach().cpu(),
+                "gt": tgt.detach().cpu(),
+                "validity": val.detach().cpu(),
+                "ct": ct.detach().cpu(),
+                "prior": (prior_resampled.detach().cpu()
+                          if prior_resampled is not None else None),
+            })
+
+            prev_pred = pred
+            prev_offset = offset
+
+    return results
 
 
 # ---------------------------------------------------------------------------
@@ -2060,31 +1981,39 @@ def train(
         refine_mode=refine,
     )
 
-    # Volume groups for multi-scale CT reads (used by refinement mode)
+    # Multi-scale datasets for refinement mode
     refine_vol_groups = full_dataset.volume_groups if refine else {}
-
-    # Probe which zarr levels are available per dataset for refinement
-    refine_available_offsets: set = set()
-    if refine and refine_vol_groups:
-        # Check all datasets, collect the intersection of available offsets
-        all_avail = []
-        for ds_idx, group in refine_vol_groups.items():
-            avail = set()
-            avail.add(0)  # base level always available
-            # Find the base scale from the first patch of this dataset
-            base_level = None
-            for p in full_dataset.patches:
-                if p.dataset_idx == ds_idx:
-                    base_level = p.scale
-                    break
-            if base_level is not None:
-                if str(base_level + 1) in group:
-                    avail.add(-1)  # coarser
-                if base_level > 0 and str(base_level - 1) in group:
-                    avail.add(1)  # finer
-            all_avail.append(avail)
-        # Use intersection so all datasets support the chosen mode
-        refine_available_offsets = set.intersection(*all_avail) if all_avail else {0}
+    dataset_m1 = None  # coarser scale
+    dataset_p1 = None  # finer scale
+    refine_available_offsets: set = {0}
+    if refine:
+        # Build datasets at scale -1 and +1
+        config_m1 = {**config, "scale_offset": -1}
+        config_p1 = {**config, "scale_offset": 1}
+        try:
+            dataset_m1 = TifxyzLasagnaDataset(
+                config_m1, apply_augmentation=False,
+                include_geometry=True, include_patch_ref=True,
+                refine_mode=False, scale_offset=-1,
+            )
+            refine_available_offsets.add(-1)
+            if is_main:
+                print(f"{TAG} scale -1 dataset: {len(dataset_m1)} patches", flush=True)
+        except Exception as e:
+            if is_main:
+                print(f"{TAG} scale -1 dataset unavailable: {e}", flush=True)
+        try:
+            dataset_p1 = TifxyzLasagnaDataset(
+                config_p1, apply_augmentation=False,
+                include_geometry=True, include_patch_ref=True,
+                refine_mode=False, scale_offset=1,
+            )
+            refine_available_offsets.add(1)
+            if is_main:
+                print(f"{TAG} scale +1 dataset: {len(dataset_p1)} patches", flush=True)
+        except Exception as e:
+            if is_main:
+                print(f"{TAG} scale +1 dataset unavailable: {e}", flush=True)
         if is_main:
             print(f"{TAG} refine mode: available offsets = "
                   f"{sorted(refine_available_offsets)}", flush=True)
@@ -2169,6 +2098,50 @@ def train(
             num_workers=num_workers, timeout=120,
             collate_fn=collate_variable_surfaces,
         )
+    # Multi-scale loaders for refinement chains
+    train_loader_m1 = None
+    train_loader_p1 = None
+    if refine and dataset_m1 is not None:
+        train_m1 = Subset(dataset_m1, train_indices)
+        if is_dist:
+            sampler_m1 = DistributedSampler(
+                train_m1, num_replicas=world_size, rank=rank,
+                shuffle=True, drop_last=True,
+            )
+            train_loader_m1 = DataLoader(
+                train_m1, batch_size=max(1, batch_size // 2),
+                sampler=sampler_m1,
+                num_workers=num_workers, pin_memory=True, timeout=120,
+                collate_fn=collate_variable_surfaces,
+            )
+        else:
+            train_loader_m1 = DataLoader(
+                train_m1, batch_size=max(1, batch_size // 2),
+                shuffle=True,
+                num_workers=num_workers, pin_memory=True, timeout=120,
+                collate_fn=collate_variable_surfaces,
+            )
+    if refine and dataset_p1 is not None:
+        train_p1 = Subset(dataset_p1, train_indices)
+        if is_dist:
+            sampler_p1 = DistributedSampler(
+                train_p1, num_replicas=world_size, rank=rank,
+                shuffle=True, drop_last=True,
+            )
+            train_loader_p1 = DataLoader(
+                train_p1, batch_size=max(1, batch_size // 2),
+                sampler=sampler_p1,
+                num_workers=num_workers, pin_memory=True, timeout=120,
+                collate_fn=collate_variable_surfaces,
+            )
+        else:
+            train_loader_p1 = DataLoader(
+                train_p1, batch_size=max(1, batch_size // 2),
+                shuffle=True,
+                num_workers=num_workers, pin_memory=True, timeout=120,
+                collate_fn=collate_variable_surfaces,
+            )
+
     if is_main:
         aug_str = f" (scale_aug f={scale_aug_factor})" if scale_aug_enabled else ""
         print(f"{TAG} {n_train} train / {n_val} val patches "
@@ -2664,7 +2637,7 @@ def train(
                     dir_axis_weight = dir_axis_weight[:B_eff]
                     batch = _filter_batch(batch, list(range(B_eff)))
 
-                # Save scale-0 GT for resampling to other scales
+                # Save scale-0 GT
                 targets_0 = targets
                 validity_0 = validity
                 dsm_0 = dir_sparse_mask
@@ -2678,14 +2651,23 @@ def train(
 
                 with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_autocast):
                     for pass_i, (offset, has_prior) in enumerate(scale_seq):
-                        # Read CT at this offset
+                        # CT + GT at this scale from batch data
                         if offset == 0:
                             ct = image
+                            tgt, val = targets_0, validity_0
+                            dsm, ddm, daw = dsm_0, ddm_0, daw_0
+                            pass_dts = _batch_dts
+                            pass_bfrac = _bracket_frac
+                            pass_blo = _bracket_lo
+                            pass_bhi = _bracket_hi
                         else:
-                            ct = _read_ct_at_offset(
-                                batch["patch_info"][:B_eff],
-                                refine_vol_groups, offset, P, device,
+                            scale_data = _get_scale_data_from_batch(
+                                batch, offset, device,
+                                same_surface_threshold=same_surface_threshold or 0.0,
                             )
+                            if scale_data is None:
+                                continue
+                            ct, tgt, val, dsm, ddm, daw, pass_dts, pass_bfrac, pass_blo, pass_bhi = scale_data
                             ct = augment_intensity(ct)
 
                         # Build prior
@@ -2702,53 +2684,32 @@ def train(
                         raw_pred = results["output"]
                         pred_pass = torch.sigmoid(raw_pred) if output_sigmoid else raw_pred
 
-                        # GT at this scale
-                        tgt, val, dsm, ddm, daw = _get_gt_at_offset(
-                            batch, targets_0, validity_0, dsm_0, ddm_0, daw_0,
-                            offset, device,
-                            compute_batch_targets_fn=compute_batch_targets,
-                            same_surface_threshold=same_surface_threshold,
-                        )
-
                         # Cage deformation at this scale
                         tgt_orig_pass = tgt
                         val_orig_pass = val
+                        cage_suffix = {-1: "_m1", 0: "", 1: "_fine"}.get(offset, "")
+                        cage_key = f"cage_ctrl_pos{cage_suffix}" if offset != 0 else "cage_ctrl_pos"
                         cage_active_pass = (
                             deform_enabled
-                            and "cage_ctrl_pos" in batch
-                            and batch["cage_ctrl_pos"] is not None
+                            and cage_key in batch
+                            and batch[cage_key] is not None
                         )
                         if cage_active_pass:
-                            # Compute fresh EDTs at this scale
-                            if offset == 0:
-                                pass_dts = _batch_dts
-                            else:
-                                # Get surface masks at this scale
-                                masks_key = (
-                                    "surface_masks_fine" if offset == 1
-                                    else "surface_masks"
-                                )
-                                pass_dts = []
-                                for b_i in range(B_eff):
-                                    masks_b = batch[masks_key][b_i].to(device)
-                                    N_s = masks_b.shape[0]
-                                    dts_b = _compute_edts_at_scale(
-                                        [masks_b[si] > 0.5 for si in range(N_s)],
-                                        offset if masks_key == "surface_masks" else 0,
-                                        device,
-                                    )
-                                    pass_dts.append(dts_b)
-
                             cs = {-1: 0.5, 0: 1.0, 1: 2.0}.get(offset, 1.0)
-                            # Bracket routing only available at scale 0
-                            _pbf = _bracket_frac if offset == 0 else None
-                            _pbl = _bracket_lo if offset == 0 else None
-                            _pbh = _bracket_hi if offset == 0 else None
+                            # Build a batch view with scale-appropriate cage data
+                            if offset != 0:
+                                deform_batch = dict(batch)
+                                deform_batch["cage_ctrl_pos"] = batch[f"cage_ctrl_pos{cage_suffix}"]
+                                deform_batch["cage_ctrl_normals"] = batch[f"cage_ctrl_normals{cage_suffix}"]
+                                deform_batch["cage_grid_rc"] = batch[f"cage_grid_rc{cage_suffix}"]
+                                deform_batch["cage_grid_rc_w"] = batch[f"cage_grid_rc_w{cage_suffix}"]
+                            else:
+                                deform_batch = batch
                             warped_cg_p, warped_v_p, _deform_improv = _cage_deform_inner_loop(
                                 pred_cos_gm=pred_pass[:, 0:2].detach(),
                                 targets=tgt,
                                 validity=val,
-                                batch=batch,
+                                batch=deform_batch,
                                 dts_batch=pass_dts,
                                 n_iters=deform_inner_iters,
                                 inner_lr=deform_inner_lr,
@@ -2756,13 +2717,20 @@ def train(
                                 scale_loss_mse_fn=scale_loss_mse,
                                 scale_loss_l1_fn=scale_loss_l1,
                                 coord_scale=cs,
-                                bracket_frac=_pbf,
-                                bracket_lo=_pbl,
-                                bracket_hi=_pbh,
+                                bracket_frac=pass_bfrac,
+                                bracket_lo=pass_blo,
+                                bracket_hi=pass_bhi,
                             )
                             tgt = tgt.clone()
                             tgt[:, 0:2] = warped_cg_p
                             val = warped_v_p
+
+                        # Match pred to GT resolution for non-zero offsets
+                        if pred_pass.shape[2:] != tgt.shape[2:]:
+                            pred_pass = F.interpolate(
+                                pred_pass, size=tgt.shape[2:],
+                                mode="trilinear", align_corners=False,
+                            )
 
                         # Loss with 0.9/0.1 split when deformed
                         cos_mask_p = val
