@@ -346,7 +346,8 @@ def _scale_stored_tifxyz(
         interp_method=source.interp_method,
         resolution="stored",
     )
-    return write_tifxyz(output_dir, scaled_surface, overwrite=True)
+    path = write_tifxyz(output_dir, scaled_surface, overwrite=True)
+    return path, int(resample_factor)
 
 
 def _compact_extension_summary(summary: dict[str, Any]) -> dict[str, Any]:
@@ -415,6 +416,10 @@ def _run_direction_to_exhaustion(
     max_calls: int | None = None,
     distributed_infer: bool = False,
     enforce_dry_run_quality_gate: bool = False,
+    prompt_strips_override: int | None = None,
+    predict_strips_override: int | None = None,
+    window_strip_length_override: int | None = None,
+    window_overlap_override: int | None = None,
 ) -> DirectionRunResult:
     current_input = Path(input_tifxyz_path)
     call_idx = 0
@@ -425,6 +430,14 @@ def _run_direction_to_exhaustion(
         show_progress=bool(show_progress),
         distributed_infer=bool(distributed_infer),
     )
+    if prompt_strips_override is not None:
+        preset["prompt_strips"] = int(prompt_strips_override)
+    if predict_strips_override is not None:
+        preset["predict_strips_per_iter"] = int(predict_strips_override)
+    if window_strip_length_override is not None:
+        preset["window_strip_length"] = int(window_strip_length_override)
+    if window_overlap_override is not None:
+        preset["window_overlap"] = int(window_overlap_override)
     while True:
         call_dir = output_dir / f"{direction}_call_{call_idx:03d}"
         _log(f"[extend:{direction}] call {call_idx:03d} input={current_input}")
@@ -584,9 +597,10 @@ def _process_surface(
     if str(state.get("status")) == "uploaded":
         return state
 
+    resample_factor = 1
     if str(state.get("status")) == "downloaded":
         _log(f"[surface] scaling {relative_surface_id}")
-        scaled_input_path = _scale_stored_tifxyz(
+        scaled_input_path, resample_factor = _scale_stored_tifxyz(
             surface["local_path"],
             paths.scaled_input_dir,
             coordinate_scale_factor=float(coordinate_scale_factor),
@@ -595,11 +609,16 @@ def _process_surface(
             state=state,
             status="scaled",
             manifest_jsonl_path=manifest_jsonl_path,
-            extra={"scaled_input_path": str(scaled_input_path)},
+            extra={"scaled_input_path": str(scaled_input_path), "resample_factor": int(resample_factor)},
         )
+    resample_factor = int(state.get("resample_factor", 1))
 
     current_input = Path(state["scaled_input_path"])
     direction_summaries: dict[str, dict] = {}
+    scaled_window_strip_length = int(TITLE_HUNT_WINDOW_STRIP_LENGTH) * resample_factor
+    scaled_window_overlap = int(TITLE_HUNT_WINDOW_OVERLAP) * resample_factor
+    scaled_prompt_strips = int(TITLE_HUNT_PROMPT_STRIPS) * resample_factor
+    scaled_predict_strips = int(TITLE_HUNT_PREDICT_STRIPS_PER_ITER) * resample_factor
     for direction in _active_directions:
         stage_status = f"{direction}_running"
         done_status = f"{direction}_done"
@@ -621,6 +640,10 @@ def _process_surface(
             max_calls=int(dry_run_max_calls_per_direction) if dry_run_mode else None,
             distributed_infer=bool(distributed_infer),
             enforce_dry_run_quality_gate=bool(dry_run_mode),
+            prompt_strips_override=scaled_prompt_strips if resample_factor > 1 else None,
+            predict_strips_override=scaled_predict_strips if resample_factor > 1 else None,
+            window_strip_length_override=scaled_window_strip_length if resample_factor > 1 else None,
+            window_overlap_override=scaled_window_overlap if resample_factor > 1 else None,
         )
         current_input = stage_result.final_tifxyz_path
         summary_path = paths.summaries_dir / f"summary_{direction}.json"
