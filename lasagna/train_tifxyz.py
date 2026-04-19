@@ -2213,7 +2213,12 @@ def train(
                     world_size=world_size,
                     is_main=is_main,
                     deform_store=deform_store,
+                    deform_inner_iters=deform_inner_iters,
+                    deform_inner_lr=deform_inner_lr,
+                    deform_max_frac=deform_max_frac,
                     vis_samples=VIS_SAMPLES,
+                    w_dist=w_dist,
+                    w_fft=w_fft,
                 )
                 if _vis_batch:
                     _log_full_vis(_vis_batch[0], "val", global_step)
