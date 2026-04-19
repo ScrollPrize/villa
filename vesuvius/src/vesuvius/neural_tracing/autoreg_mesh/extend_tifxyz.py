@@ -1873,16 +1873,12 @@ def extend_tifxyz_mesh(
             max_predict_strips_seen = max(int(plan.predict_strips) for plan in fitted_window_plans)
             crop_read_ms = 0.0
             payloads: list[ExtensionWindowPayload] = []
-            payload_iter = _progress_iter(
-                sharded_plans,
-                total=len(sharded_plans),
-                desc=f"iter {iteration_idx + 1} build",
-                show_progress=local_show_progress,
-            )
-            for global_index, fitted_plan in payload_iter:
+
+            def _build_one_payload(args):
+                global_index, fitted_plan = args
                 t1 = perf_counter()
                 volume_crop = _read_volume_crop(volume, fitted_plan.min_corner, crop_size, cache=cache)
-                crop_read_ms += 1000.0 * (perf_counter() - t1)
+                read_ms = 1000.0 * (perf_counter() - t1)
                 sample = build_extension_sample(
                     prompt_grid_world=fitted_plan.prompt_grid,
                     direction=direction,
@@ -1895,19 +1891,29 @@ def extend_tifxyz_mesh(
                     volume_crop=volume_crop,
                     wrap_metadata={"segment_uuid": surface_uuid, "source_tifxyz": str(tifxyz_path)},
                 )
-                payloads.append(
-                    ExtensionWindowPayload(
-                        global_index=int(global_index),
-                        window=fitted_plan.window,
-                        sample=sample,
-                        direction=direction,
-                        target_grid_shape=tuple(int(v) for v in sample["target_grid_shape"].tolist()),
-                        strip_length=int(sample["strip_length"].item()),
-                        num_strips=int(sample["num_strips"].item()),
-                        prompt_strips=fitted_plan.prompt_strips,
-                        predict_strips=fitted_plan.predict_strips,
-                    )
-                )
+                return ExtensionWindowPayload(
+                    global_index=int(global_index),
+                    window=fitted_plan.window,
+                    sample=sample,
+                    direction=direction,
+                    target_grid_shape=tuple(int(v) for v in sample["target_grid_shape"].tolist()),
+                    strip_length=int(sample["strip_length"].item()),
+                    num_strips=int(sample["num_strips"].item()),
+                    prompt_strips=fitted_plan.prompt_strips,
+                    predict_strips=fitted_plan.predict_strips,
+                ), read_ms
+
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(8, max(1, len(sharded_plans)))) as pool:
+                build_results = list(_progress_iter(
+                    pool.map(_build_one_payload, sharded_plans),
+                    total=len(sharded_plans),
+                    desc=f"iter {iteration_idx + 1} build",
+                    show_progress=local_show_progress,
+                ))
+            for payload, read_ms in build_results:
+                crop_read_ms += read_ms
+                payloads.append(payload)
 
             local_fitted_window_count = int(len(payloads))
             local_peak_batch_size = 0
