@@ -568,46 +568,6 @@ class AutoregMeshDataset(Dataset):
             )
         return self._base_dataset._extract_wrap_world_surface(patch, wrap, require_all_valid=True)
 
-    def _serialize_candidate_plan(
-        self,
-        *,
-        patch_idx: int,
-        wrap_idx: int,
-        patch,
-        surface_zyx: np.ndarray,
-        direction: str,
-        conditioning_count: int,
-        effective_surface_downsample_factor,
-        use_stored_surface: bool,
-    ) -> tuple[dict | None, dict | None]:
-        conditioning = create_split_conditioning_from_surface_grid(
-            self._base_dataset,
-            idx=0,
-            patch_idx=patch_idx,
-            wrap_idx=wrap_idx,
-            patch=patch,
-            surface_zyx=surface_zyx,
-            cond_direction=str(direction),
-            conditioning_count=int(conditioning_count),
-        )
-        if conditioning is None:
-            return None, None
-        min_corner = np.asarray(conditioning["min_corner"], dtype=np.int64)
-        cond_local = np.asarray(conditioning["cond_zyxs_unperturbed"], dtype=np.float32) - min_corner[None, None, :]
-        masked_local = np.asarray(conditioning["masked_zyxs"], dtype=np.float32) - min_corner[None, None, :]
-        serialized = serialize_split_conditioning_example(
-            cond_zyxs_local=cond_local,
-            masked_zyxs_local=masked_local,
-            direction=str(conditioning["cond_direction"]).lower(),
-            volume_shape=self.crop_size,
-            patch_size=self.config["patch_size"],
-            offset_num_bins=self.config["offset_num_bins"],
-            frontier_band_width=int(self.config["frontier_band_width"]),
-            surface_downsample_factor=effective_surface_downsample_factor,
-            use_stored_resolution_only=use_stored_surface,
-        )
-        return conditioning, serialized
-
     def _build_valid_split_plans(self) -> dict[tuple[int, int], tuple[dict, ...]]:
         valid_plans: dict[tuple[int, int], tuple[dict, ...]] = {}
         iterator = self.sample_index
@@ -711,17 +671,17 @@ class AutoregMeshDataset(Dataset):
         surface_zyx = self._extract_surface_for_plan(patch, wrap, use_stored_surface=use_stored_surface)
         if surface_zyx is None:
             return None
-        conditioning, serialized = self._serialize_candidate_plan(
+        conditioning = create_split_conditioning_from_surface_grid(
+            self._base_dataset,
+            idx=0,
             patch_idx=int(patch_idx),
             wrap_idx=int(wrap_idx),
             patch=patch,
             surface_zyx=surface_zyx,
-            direction=str(split_plan["direction"]),
+            cond_direction=str(split_plan["direction"]),
             conditioning_count=int(split_plan["conditioning_count"]),
-            effective_surface_downsample_factor=effective_surface_downsample_factor,
-            use_stored_surface=use_stored_surface,
         )
-        if conditioning is None or serialized is None:
+        if conditioning is None:
             return None
 
         min_corner = np.asarray(conditioning["min_corner"], dtype=np.int64)

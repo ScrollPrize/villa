@@ -5,6 +5,7 @@ import os
 import socket
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -41,8 +42,11 @@ from vesuvius.neural_tracing.autoreg_mesh.model import AutoregMeshModel
 from vesuvius.neural_tracing.autoreg_mesh.model import _batched_rope_from_coords
 from vesuvius.neural_tracing.autoreg_mesh.serialization import deserialize_continuation_grid, serialize_split_conditioning_example
 from vesuvius.neural_tracing.autoreg_mesh.train import (
+    _build_spatial_split_groups,
     _choose_best_xy_slice,
     _edge_segment_on_z_slice,
+    _expanded_bboxes_overlap,
+    _find_cross_split_bbox_overlap,
     _geometry_metric_weight_active,
     _geometry_sd_weight_active,
     _initialize_distributed_runtime,
@@ -52,6 +56,7 @@ from vesuvius.neural_tracing.autoreg_mesh.train import (
     _rasterize_grid_on_xy_slice,
     _restrict_dataset_samples,
     _scheduled_sampling_feedback_state,
+    _split_dataset,
     run_autoreg_mesh_training,
 )
 from vesuvius.neural_tracing.datasets.triplet_resampling import choose_replacement_index
@@ -363,6 +368,41 @@ class _SplitCloneAutoregDataset:
         self._apply_volume_only_augmentation = bool(apply_volume_only_augmentation)
         self._apply_spatial_augmentation = bool(apply_spatial_augmentation)
         self._patch_metadata = patch_metadata or {"sample_index": tuple(self.sample_index)}
+
+    def __len__(self) -> int:
+        return len(self.sample_index)
+
+    def export_patch_metadata(self):
+        return dict(self._patch_metadata)
+
+
+def _make_fake_patch(source: str, chunk_id: tuple[int, int, int], world_bbox: tuple[float, float, float, float, float, float]):
+    return SimpleNamespace(
+        volume=SimpleNamespace(path=str(source)),
+        scale=0,
+        chunk_id=tuple(int(v) for v in chunk_id),
+        world_bbox=tuple(float(v) for v in world_bbox),
+    )
+
+
+class _LeakageSplitAutoregDataset:
+    def __init__(self, patch_metadata=None) -> None:
+        if patch_metadata is None:
+            self.patches = [
+                _make_fake_patch("volA", (0, 0, 0), (0.0, 64.0, 0.0, 64.0, 0.0, 64.0)),
+                _make_fake_patch("volA", (0, 1, 0), (0.0, 64.0, 32.0, 96.0, 0.0, 64.0)),
+                _make_fake_patch("volA", (0, 2, 0), (0.0, 64.0, 128.0, 192.0, 0.0, 64.0)),
+                _make_fake_patch("volA", (0, 3, 0), (0.0, 64.0, 224.0, 288.0, 0.0, 64.0)),
+            ]
+            self.sample_index = [(0, 0), (0, 1), (1, 0), (2, 0), (3, 0)]
+            self._patch_metadata = {
+                "patches": self.patches,
+                "sample_index": tuple(self.sample_index),
+            }
+        else:
+            self._patch_metadata = dict(patch_metadata)
+            self.patches = list(self._patch_metadata["patches"])
+            self.sample_index = list(self._patch_metadata["sample_index"])
 
     def __len__(self) -> int:
         return len(self.sample_index)
@@ -1050,7 +1090,7 @@ def test_autoreg_mesh_inference_uses_sampled_xyz_for_non_greedy_rollout(monkeypa
     monkeypatch.setattr(
         autoreg_mesh_infer,
         "_sample_from_logits",
-        lambda logits, *, greedy: next(sampled),
+        lambda logits, *, greedy, temperature=1.0, top_k=None, top_p=None: next(sampled),
     )
 
     result = infer_autoreg_mesh(
@@ -1104,6 +1144,7 @@ def test_split_dataset_honors_disabled_train_volume_augmentation(tmp_path: Path)
     _write_local_guide_checkpoint(checkpoint)
     config = validate_autoreg_mesh_config(_make_config(checkpoint))
     config["volume_only_augmentation"]["enabled"] = False
+    config["val_split_mode"] = "random_samples"
 
     dataset = _SplitCloneAutoregDataset(apply_volume_only_augmentation=False, apply_spatial_augmentation=False)
     clone_calls: list[tuple[bool, bool]] = []
@@ -1121,7 +1162,7 @@ def test_split_dataset_honors_disabled_train_volume_augmentation(tmp_path: Path)
     try:
         train_module.AutoregMeshDataset = _SplitCloneAutoregDataset
         train_module._clone_autoreg_mesh_dataset = _fake_clone
-        train_dataset, val_dataset = train_module._split_dataset(
+        train_dataset, val_dataset, split_diagnostics = train_module._split_dataset(
             dataset,
             cfg=config,
             seed=0,
@@ -1134,6 +1175,66 @@ def test_split_dataset_honors_disabled_train_volume_augmentation(tmp_path: Path)
     assert clone_calls == [(True, False), (False, False)]
     assert train_dataset is not None
     assert val_dataset is not None
+    assert split_diagnostics == {}
+
+
+def test_expanded_bboxes_overlap_helper_distinguishes_overlap_and_gaps() -> None:
+    overlap_a = (0.0, 64.0, 0.0, 64.0, 0.0, 64.0)
+    overlap_b = (0.0, 64.0, 32.0, 96.0, 0.0, 64.0)
+    touching = (0.0, 64.0, 64.0, 128.0, 0.0, 64.0)
+    disjoint = (0.0, 64.0, 80.0, 144.0, 0.0, 64.0)
+
+    assert _expanded_bboxes_overlap(overlap_a, overlap_b, margin_voxels=0.0) is True
+    assert _expanded_bboxes_overlap(overlap_a, touching, margin_voxels=0.0) is False
+    assert _expanded_bboxes_overlap(overlap_a, touching, margin_voxels=1.0) is True
+    assert _expanded_bboxes_overlap(overlap_a, disjoint, margin_voxels=0.0) is False
+
+
+def test_build_spatial_split_groups_collapses_wraps_and_overlaps() -> None:
+    dataset = _LeakageSplitAutoregDataset()
+
+    groups = _build_spatial_split_groups(dataset, margin_voxels=0.0)
+
+    assert groups == [[0, 1, 2], [3], [4]]
+
+
+def test_split_dataset_spatial_groups_prevents_cross_split_bbox_overlap(tmp_path: Path) -> None:
+    from vesuvius.neural_tracing.autoreg_mesh import train as train_module
+
+    checkpoint = tmp_path / "tiny_dinovol.pt"
+    _write_local_guide_checkpoint(checkpoint)
+    config = validate_autoreg_mesh_config(_make_config(checkpoint))
+    config["val_split_mode"] = "spatial_groups"
+    config["validation_leakage_margin_voxels"] = 0.0
+
+    dataset = _LeakageSplitAutoregDataset()
+
+    def _fake_clone(cfg, patch_metadata, *, apply_spatial_augmentation: bool, apply_volume_only_augmentation: bool):
+        del cfg, apply_spatial_augmentation, apply_volume_only_augmentation
+        return _LeakageSplitAutoregDataset(patch_metadata=patch_metadata)
+
+    original_dataset_cls = train_module.AutoregMeshDataset
+    original_clone = train_module._clone_autoreg_mesh_dataset
+    try:
+        train_module.AutoregMeshDataset = _LeakageSplitAutoregDataset
+        train_module._clone_autoreg_mesh_dataset = _fake_clone
+        train_dataset, val_dataset, split_diagnostics = _split_dataset(
+            dataset,
+            cfg=config,
+            seed=0,
+            val_fraction=0.4,
+        )
+    finally:
+        train_module.AutoregMeshDataset = original_dataset_cls
+        train_module._clone_autoreg_mesh_dataset = original_clone
+
+    assert train_dataset is not None
+    assert val_dataset is not None
+    assert split_diagnostics["num_train_groups"] + split_diagnostics["num_val_groups"] == pytest.approx(3.0)
+    assert split_diagnostics["max_group_size"] == pytest.approx(3.0)
+    train_indices = [dataset.sample_index.index(item) for item in train_dataset.sample_index]
+    val_indices = [dataset.sample_index.index(item) for item in val_dataset.sample_index]
+    assert _find_cross_split_bbox_overlap(dataset, train_indices, val_indices, margin_voxels=0.0) is None
 
 
 def test_restrict_dataset_samples_prevents_cross_split_resampling() -> None:
@@ -2234,6 +2335,8 @@ def test_distance_aware_target_default_config_values() -> None:
     assert validated["boundary_loss_start_step"] == 0
     assert validated["rollout_val_examples_per_log"] == 1
     assert validated["rollout_val_max_steps"] is None
+    assert validated["val_split_mode"] == "spatial_groups"
+    assert validated["validation_leakage_margin_voxels"] == pytest.approx(0.0)
     assert validated["wandb_log_xy_slice_images"] is True
     assert validated["wandb_xy_slice_mode"] == "best_xy_slice"
     assert validated["wandb_xy_slice_line_thickness"] == 1
@@ -2496,6 +2599,16 @@ def test_rope_config_validation_rejects_invalid_values() -> None:
     bad_constraint_fallback["coarse_continuation_empty_fallback"] = "none"
     with pytest.raises(ValueError, match="coarse_continuation_empty_fallback"):
         validate_autoreg_mesh_config(bad_constraint_fallback)
+
+    bad_val_split_mode = _make_cached_token_config()
+    bad_val_split_mode["val_split_mode"] = "segment_uuid"
+    with pytest.raises(ValueError, match="val_split_mode"):
+        validate_autoreg_mesh_config(bad_val_split_mode)
+
+    bad_val_leakage_margin = _make_cached_token_config()
+    bad_val_leakage_margin["validation_leakage_margin_voxels"] = -1.0
+    with pytest.raises(ValueError, match="validation_leakage_margin_voxels"):
+        validate_autoreg_mesh_config(bad_val_leakage_margin)
 
     bad_muon_momentum = _make_muon_cached_token_config()
     bad_muon_momentum["optimizer"]["momentum"] = 1.0
