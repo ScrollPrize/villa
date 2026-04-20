@@ -67,11 +67,15 @@ class CrossFrameZarrDataset(Dataset):
         self.transform_json_url = _require_str(ds_cfg, "transform_json_url")
 
         shared_storage = dict(ds_cfg.get("storage_options") or {})
-        self.storage_options_image = dict(
-            ds_cfg.get("storage_options_image") or shared_storage
+        self.storage_options_image = _storage_options_for(
+            self.image_zarr_url,
+            ds_cfg.get("storage_options_image"),
+            shared_storage,
         )
-        self.storage_options_labels = dict(
-            ds_cfg.get("storage_options_labels") or shared_storage
+        self.storage_options_labels = _storage_options_for(
+            self.labels_zarr_url,
+            ds_cfg.get("storage_options_labels"),
+            shared_storage,
         )
 
         self.patch_size: Tuple[int, int, int] = tuple(int(v) for v in mgr.train_patch_size)
@@ -434,6 +438,24 @@ class CrossFrameZarrDataset(Dataset):
 
     def get_labeled_unlabeled_patch_indices(self) -> Tuple[List[int], List[int]]:
         return list(range(len(self._patches))), []
+
+
+def _storage_options_for(
+    url: str, explicit: Optional[dict], shared: dict
+) -> dict:
+    """Return protocol-appropriate storage options for ``url``.
+
+    ``shared`` (from ``dataset_config.storage_options``) is convenient for the
+    common S3 case (``{'anon': true}``), but options like ``anon`` blow up the
+    HTTPS fsspec backend. Filter the shared options by URL scheme; always honor
+    an explicit ``storage_options_image`` / ``storage_options_labels``.
+    """
+    if explicit:
+        return dict(explicit)
+    opts = dict(shared)
+    if url.startswith(("http://", "https://")):
+        opts.pop("anon", None)  # HTTP backend doesn't accept it
+    return opts
 
 
 def _require_str(mapping: dict, key: str) -> str:

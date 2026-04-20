@@ -226,6 +226,37 @@ def test_dispatcher_is_case_insensitive(identity_pair, monkeypatch):
     assert isinstance(built, CrossFrameZarrDataset)
 
 
+def test_shared_storage_options_filtered_by_protocol(identity_pair):
+    """HTTPS labels must not receive S3-only options like `anon`."""
+    from vesuvius.models.datasets.cross_frame_dataset import _storage_options_for
+
+    shared = {"anon": True, "default_cache_type": "none"}
+    s3_opts = _storage_options_for(
+        "s3://bucket/path.zarr/0", None, shared,
+    )
+    http_opts = _storage_options_for(
+        "https://example.com/path.zarr/0", None, shared,
+    )
+    local_opts = _storage_options_for(
+        "/tmp/something.zarr", None, shared,
+    )
+
+    assert s3_opts == shared
+    assert "anon" not in http_opts
+    assert http_opts.get("default_cache_type") == "none"
+    assert local_opts == shared  # no filtering for local paths
+
+
+def test_explicit_storage_options_bypass_filter():
+    from vesuvius.models.datasets.cross_frame_dataset import _storage_options_for
+
+    explicit = {"token": "anonymous"}
+    opts = _storage_options_for(
+        "https://example.com/path.zarr/0", explicit, {"anon": True},
+    )
+    assert opts == explicit
+
+
 def test_coarse_scan_level(tmp_path: Path):
     """A coarser OME-Zarr level can be used to speed up FG enumeration."""
     rng = np.random.default_rng(42)
