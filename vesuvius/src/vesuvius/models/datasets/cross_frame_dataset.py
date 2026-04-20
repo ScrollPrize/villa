@@ -37,6 +37,16 @@ from .zarr_dataset import PatchInfo
 logger = logging.getLogger(__name__)
 
 
+def _open_zarr_any(url: str, storage_options: Optional[dict]):
+    """Open a zarr at ``url``. Uses ``open_zarr`` for http(s)/s3 URLs and
+    ``zarr.open`` for local paths, because zarr rejects ``storage_options``
+    on non-fsspec paths even when the mapping is empty.
+    """
+    if url.startswith(("http://", "https://", "s3://")):
+        return open_zarr(url, mode="r", storage_options=storage_options or {})
+    return zarr.open(url, mode="r")
+
+
 def _resolve_zarr_array(obj) -> zarr.Array:
     """Return the underlying ``zarr.Array`` for a group-or-array object.
 
@@ -107,10 +117,10 @@ class CrossFrameZarrDataset(Dataset):
         )
 
         self._image_array = _resolve_zarr_array(
-            open_zarr(self.image_zarr_url, mode="r", storage_options=self.storage_options_image)
+            _open_zarr_any(self.image_zarr_url, self.storage_options_image)
         )
         self._labels_array = _resolve_zarr_array(
-            open_zarr(self.labels_zarr_url, mode="r", storage_options=self.storage_options_labels)
+            _open_zarr_any(self.labels_zarr_url, self.storage_options_labels)
         )
         self._image_shape = tuple(int(v) for v in self._image_array.shape[-3:])
         self._labels_shape = tuple(int(v) for v in self._labels_array.shape[-3:])
@@ -202,7 +212,7 @@ class CrossFrameZarrDataset(Dataset):
         parent = base_url.rsplit("/", 1)[0] if last.isdigit() else base_url
         scan_url = f"{parent}/{level}"
         scan = _resolve_zarr_array(
-            open_zarr(scan_url, mode="r", storage_options=self.storage_options_labels)
+            _open_zarr_any(scan_url, self.storage_options_labels)
         )
         scan_shape = tuple(int(v) for v in scan.shape[-3:])
         factor = tuple(
