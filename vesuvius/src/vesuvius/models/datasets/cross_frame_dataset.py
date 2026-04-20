@@ -38,6 +38,15 @@ from .zarr_dataset import PatchInfo
 logger = logging.getLogger(__name__)
 
 
+def _stage(msg: str) -> None:
+    """Print a dataset-stage line to stdout with immediate flush.
+
+    Used so operators can see exactly where __init__ is blocked (remote zarr
+    probe vs. transform.json fetch vs. coarse scan vs. cache load).
+    """
+    print(f"[CrossFrameZarrDataset] {msg}", flush=True)
+
+
 def _open_zarr_any(url: str, storage_options: Optional[dict]):
     """Open a zarr at ``url``. Uses ``open_zarr`` for http(s)/s3 URLs and
     ``zarr.open`` for local paths, because zarr rejects ``storage_options``
@@ -76,6 +85,9 @@ class CrossFrameZarrDataset(Dataset):
         self.image_zarr_url = _require_str(ds_cfg, "image_zarr_url")
         self.labels_zarr_url = _require_str(ds_cfg, "labels_zarr_url")
         self.transform_json_url = _require_str(ds_cfg, "transform_json_url")
+        _stage(f"init: image={self.image_zarr_url}")
+        _stage(f"init: labels={self.labels_zarr_url}")
+        _stage(f"init: transform={self.transform_json_url}")
 
         shared_storage = dict(ds_cfg.get("storage_options") or {})
         self.storage_options_image = _storage_options_for(
@@ -126,18 +138,25 @@ class CrossFrameZarrDataset(Dataset):
         self._scan_array: Optional[zarr.Array] = None
         self._handle_pid: Optional[int] = None
         self._atexit_pid: Optional[int] = None
+        self._debug_calls_remaining: int = self._DEBUG_CALLS_PER_PID
 
         # Shape metadata is read once in the parent process so the patch index
         # build doesn't have to hit the network (for S3 URLs) or disk (for local).
+        _stage("probing image zarr shape ...")
         image_probe = _resolve_zarr_array(
             _open_zarr_any(self.image_zarr_url, self.storage_options_image)
         )
+        self._image_shape = tuple(int(v) for v in image_probe.shape[-3:])
+        _stage(f"image shape = {self._image_shape}")
+        del image_probe
+
+        _stage("probing labels zarr shape ...")
         labels_probe = _resolve_zarr_array(
             _open_zarr_any(self.labels_zarr_url, self.storage_options_labels)
         )
-        self._image_shape = tuple(int(v) for v in image_probe.shape[-3:])
         self._labels_shape = tuple(int(v) for v in labels_probe.shape[-3:])
-        del image_probe, labels_probe
+        _stage(f"labels shape = {self._labels_shape}")
+        del labels_probe
 
         raw_scan_level = ds_cfg.get("labels_scan_level")
         self._scan_level: Optional[int] = (
@@ -145,13 +164,17 @@ class CrossFrameZarrDataset(Dataset):
         )
         self._scan_factor: Tuple[int, int, int] = (1, 1, 1)
         if self._scan_level is not None:
+            _stage(f"probing scan level {self._scan_level} ...")
             self._scan_factor = self._compute_scan_factor(self._scan_level)
+            _stage(f"scan factor = {self._scan_factor}")
 
+        _stage(f"reading transform.json ...")
         self._transform_doc = affine.read_transform_json(self.transform_json_url)
         self._matrix_xyz = self._transform_doc.matrix_xyz
         self._matrix_zyx_label_to_image = affine.label_to_image_zyx_matrix(
             self._matrix_xyz, invert=True
         )
+        _stage("transform loaded")
 
         self.normalization_scheme = getattr(mgr, "normalization_scheme", "zscore")
         self.intensity_properties = getattr(mgr, "intensity_properties", None) or {}
@@ -164,7 +187,9 @@ class CrossFrameZarrDataset(Dataset):
         # when both train and val datasets are built from the same config.
         self.data_path = getattr(mgr, "data_path", None)
         self._patches: List[Tuple[int, int, int]] = []
+        _stage("building patch index ...")
         self._build_patch_index()
+        _stage(f"patch index built: {len(self._patches)} patches")
 
         self.transforms = None
         if self.is_training:
@@ -247,6 +272,7 @@ class CrossFrameZarrDataset(Dataset):
         state["_scan_array"] = None
         state["_handle_pid"] = None
         state["_atexit_pid"] = None
+        state["_debug_calls_remaining"] = self._DEBUG_CALLS_PER_PID
         return state
 
     def _ensure_process_local_handles(self) -> None:
@@ -272,6 +298,11 @@ class CrossFrameZarrDataset(Dataset):
         self._image_array = None
         self._labels_array = None
         self._scan_array = None
+
+    # Per-worker __getitem__ diagnostics. These counters are reset by
+    # __getstate__ so each DataLoader worker reports a few timings from
+    # its own first calls and then stays quiet.
+    _DEBUG_CALLS_PER_PID: int = 2
 
     def _cache_path(self) -> Optional[Path]:
         if self.cache_dir is None:
@@ -306,13 +337,17 @@ class CrossFrameZarrDataset(Dataset):
     # ---------------------------------------------------------- indexing --
 
     def _build_patch_index(self) -> None:
+        cp = self._cache_path()
+        _stage(f"cache path: {cp}")
         cached = self._load_cache()
         if cached is not None and len(cached) > 0:
             self._patches = [tuple(int(v) for v in row) for row in cached]
-            logger.info("Loaded %d patches from cache", len(self._patches))
+            _stage(f"loaded {len(self._patches)} patches from cache")
             return
 
+        _stage("no cache -- scanning foreground positions")
         self._ensure_process_local_handles()
+        _stage("handles opened for scan")
         positions = self._scan_foreground_positions()
         if not positions:
             raise RuntimeError(
@@ -321,6 +356,7 @@ class CrossFrameZarrDataset(Dataset):
             )
         self._patches = positions
         self._save_cache(np.asarray(positions, dtype=np.int64))
+        _stage(f"scan complete, cache saved to {cp}")
         # Release handles after the main-process scan so the DataLoader
         # workers don't inherit a live fsspec session via spawn pickling.
         self._close_handles()
@@ -344,15 +380,15 @@ class CrossFrameZarrDataset(Dataset):
         ps_c = (max(1, dz // fz), max(1, dy // fy), max(1, dx // fx))
         st_c = (max(1, sz // fz), max(1, sy // fy), max(1, sx // fx))
 
+        _stage(f"coarse scan: reading {self._scan_array.shape} into memory")
         coarse = np.asarray(self._scan_array[...])
         if self.valid_patch_value is None:
             coarse_mask = coarse > 0
         else:
             coarse_mask = coarse == self.valid_patch_value
-        logger.info(
-            "coarse scan: %d FG voxels / %d total (%.2f%%)",
-            int(coarse_mask.sum()), coarse_mask.size,
-            100.0 * coarse_mask.mean(),
+        _stage(
+            f"coarse scan: {int(coarse_mask.sum())} FG voxels "
+            f"/ {coarse_mask.size} total ({100.0 * coarse_mask.mean():.2f}%)"
         )
 
         cz, cy, cx = coarse_mask.shape
@@ -372,7 +408,7 @@ class CrossFrameZarrDataset(Dataset):
                     if not self._image_aabb_in_bounds(pos):
                         continue
                     candidates.append(pos)
-        logger.info("coarse scan kept %d candidate patches", len(candidates))
+        _stage(f"coarse scan kept {len(candidates)} candidate patches")
         return candidates
 
     def _scan_foreground_positions_full(self) -> List[Tuple[int, int, int]]:
@@ -436,15 +472,45 @@ class CrossFrameZarrDataset(Dataset):
         return len(self._patches)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        import time
+
+        debug = self._debug_calls_remaining > 0
+        if debug:
+            self._debug_calls_remaining -= 1
+            tag = f"[pid={os.getpid()} idx={index}]"
+            t_open_s = time.perf_counter()
+
         self._ensure_process_local_handles()
+        if debug:
+            t_open_e = time.perf_counter()
+            _stage(f"__getitem__ {tag}: handles ready ({1e3*(t_open_e-t_open_s):.1f} ms)")
+
         pos = self._patches[index]
         ps = self.patch_size
+
+        if debug:
+            start, stop = affine.label_patch_image_aabb(
+                self._matrix_zyx_label_to_image, pos, ps,
+                image_shape_zyx=self._image_shape, margin=0,
+            )
+            _stage(
+                f"__getitem__ {tag}: label pos={pos}, image AABB start={start} stop={stop} "
+                f"size={tuple(e - s for s, e in zip(start, stop))}"
+            )
+            t_label_s = time.perf_counter()
 
         slab = np.asarray(
             self._labels_array[pos[0]:pos[0] + ps[0], pos[1]:pos[1] + ps[1], pos[2]:pos[2] + ps[2]]
         )
         label_patch = pad_or_crop_3d(slab.astype(np.float32), ps)
         label_bin = (label_patch > 0).astype(np.float32)
+        if debug:
+            t_label_e = time.perf_counter()
+            _stage(
+                f"__getitem__ {tag}: label read+binarize {1e3*(t_label_e-t_label_s):.1f} ms "
+                f"(nonzero={int(label_bin.sum())})"
+            )
+            t_img_s = time.perf_counter()
 
         image_patch = affine.resample_image_to_label_grid(
             self._image_array,
@@ -452,9 +518,21 @@ class CrossFrameZarrDataset(Dataset):
             pos,
             ps,
         )
+        if debug:
+            t_img_e = time.perf_counter()
+            _stage(
+                f"__getitem__ {tag}: image resample {1e3*(t_img_e-t_img_s):.1f} ms "
+                f"(shape={image_patch.shape} dtype={image_patch.dtype} "
+                f"min={image_patch.min():.1f} max={image_patch.max():.1f})"
+            )
+            t_norm_s = time.perf_counter()
+
         if self.normalizer is not None:
             image_patch = self.normalizer.run(image_patch)
         image_patch = image_patch.astype(np.float32, copy=False)
+        if debug:
+            t_norm_e = time.perf_counter()
+            _stage(f"__getitem__ {tag}: normalize {1e3*(t_norm_e-t_norm_s):.1f} ms")
 
         padding_mask = np.ones(ps, dtype=np.float32)
 
@@ -470,7 +548,14 @@ class CrossFrameZarrDataset(Dataset):
         }
 
         if self.transforms is not None:
+            if debug:
+                t_aug_s = time.perf_counter()
             result = self.transforms(**result)
+            if debug:
+                t_aug_e = time.perf_counter()
+                _stage(f"__getitem__ {tag}: transforms {1e3*(t_aug_e-t_aug_s):.1f} ms")
+        if debug:
+            _stage(f"__getitem__ {tag}: DONE total {1e3*(time.perf_counter()-t_open_s):.1f} ms")
         return result
 
     # helpers preserved for compatibility with BaseTrainer ------------------
