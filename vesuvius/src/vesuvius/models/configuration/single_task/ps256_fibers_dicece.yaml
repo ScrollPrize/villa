@@ -45,7 +45,10 @@ tr_config:
 dataset_config:
   dataset_type: "cross_frame"
   image_zarr_url: "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/0"
-  labels_zarr_url: "https://dl.ash2txt.org/other/dev/meshes/s1a-fibers-230125-ome.zarr/0"
+  # Labels pulled to local disk with rsync:
+  #   rsync -aW rsync://dl.ash2txt.org/data/other/dev/meshes/s1a-fibers-230125-ome.zarr/ \
+  #             /ephemeral/fibers_labels/s1a-fibers-230125-ome.zarr/
+  labels_zarr_url: "/ephemeral/fibers_labels/s1a-fibers-230125-ome.zarr/0"
   transform_json_url: "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/transform.json"
   storage_options:
     anon: true
