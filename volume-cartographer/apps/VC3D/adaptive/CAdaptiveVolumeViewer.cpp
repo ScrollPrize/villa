@@ -200,7 +200,9 @@ void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
 
     if (_volume) {
         int nScales = static_cast<int>(_volume->numScales());
-        _camera.recalcPyramidLevel(nScales);
+        std::vector<float> sfs(nScales);
+        for (int i = 0; i < nScales; i++) sfs[i] = _volume->levelScaleFactor(i);
+        _camera.recalcPyramidLevel(nScales, sfs.data());
         double vs = _volume->voxelSize() / static_cast<double>(_camera.dsScale);
         _view->setVoxelSize(vs, vs);
     }
@@ -944,7 +946,10 @@ void CAdaptiveVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 
     if (_volume) {
         float oldDs = _camera.dsScale;
-        _camera.recalcPyramidLevel(static_cast<int>(_volume->numScales()));
+        int ns = static_cast<int>(_volume->numScales());
+        std::vector<float> sfs(ns);
+        for (int i = 0; i < ns; i++) sfs[i] = _volume->levelScaleFactor(i);
+        _camera.recalcPyramidLevel(ns, sfs.data());
         if (std::abs(_camera.dsScale - oldDs) > 1e-6f) {
             double vs = _volume->voxelSize() / static_cast<double>(_camera.dsScale);
             _view->setVoxelSize(vs, vs);
@@ -1653,8 +1658,12 @@ void CAdaptiveVolumeViewer::fitSurfaceInView()
 {
     _camera.surfacePtr = cv::Vec3f(0, 0, 0);
     _camera.scale = 0.5f;
-    if (_volume)
-        _camera.recalcPyramidLevel(static_cast<int>(_volume->numScales()));
+    if (_volume) {
+        int ns = static_cast<int>(_volume->numScales());
+        std::vector<float> sfs(ns);
+        for (int i = 0; i < ns; i++) sfs[i] = _volume->levelScaleFactor(i);
+        _camera.recalcPyramidLevel(ns, sfs.data());
+    }
     scheduleRender();
 }
 

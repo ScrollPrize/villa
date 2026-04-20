@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -688,6 +689,9 @@ BlockPipeline::~BlockPipeline() {
     encodePool_.stop();
     loaderPool_.stop();
     decodePool_.stop();
+    // Release cached data before member destructors run, so any shared_ptrs
+    // held by thread-locals or callbacks don't keep shard/block data alive.
+    clearMemory();
     auto cold = statColdHits_.load();
     auto ice = statIceFetches_.load();
     if (cold > 0 || ice > 0) {
@@ -1010,7 +1014,40 @@ std::array<int, 3> BlockPipeline::chunkShape(int level) const noexcept {
 }
 
 std::array<int, 3> BlockPipeline::levelShape(int level) const noexcept {
-    return source_ ? source_->levelShape(level) : std::array<int, 3>{0, 0, 0};
+    if (!source_) return {0, 0, 0};
+    auto shape = source_->levelShape(level);
+    // If this level doesn't physically exist (shape is zero), synthesize
+    // the expected shape from a level that does exist using scale factors.
+    // This allows bounds checks and coordinate transforms to work correctly
+    // for missing fine scales (e.g., scales 0-1 absent, only 2+ present).
+    if (shape[0] == 0 || shape[1] == 0 || shape[2] == 0) {
+        float sf = levelScaleFactor(level);
+        int nLevels = source_->numLevels();
+        for (int i = 0; i < nLevels; i++) {
+            auto refShape = source_->levelShape(i);
+            if (refShape[0] > 0 && refShape[1] > 0 && refShape[2] > 0) {
+                float refSf = levelScaleFactor(i);
+                float ratio = refSf / sf;  // e.g. 4.0/1.0 = 4 if ref is coarser
+                shape = {
+                    static_cast<int>(std::ceil(refShape[0] * ratio)),
+                    static_cast<int>(std::ceil(refShape[1] * ratio)),
+                    static_cast<int>(std::ceil(refShape[2] * ratio))
+                };
+                break;
+            }
+        }
+    }
+    return shape;
+}
+
+void BlockPipeline::setLevelScaleFactors(std::vector<float> factors) {
+    levelScaleFactors_ = std::move(factors);
+}
+
+float BlockPipeline::levelScaleFactor(int vectorIndex) const noexcept {
+    if (vectorIndex >= 0 && static_cast<size_t>(vectorIndex) < levelScaleFactors_.size())
+        return levelScaleFactors_[static_cast<size_t>(vectorIndex)];
+    return static_cast<float>(size_t{1} << vectorIndex);
 }
 
 void BlockPipeline::setDataBounds(int minX, int maxX, int minY, int maxY, int minZ, int maxZ) {

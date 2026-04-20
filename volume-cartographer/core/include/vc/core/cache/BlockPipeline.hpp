@@ -92,6 +92,11 @@ public:
     [[nodiscard]] std::array<int, 3> chunkShape(int level) const noexcept;
     [[nodiscard]] std::array<int, 3> levelShape(int level) const noexcept;
 
+    // OME-Zarr scale factor for a vector index (e.g. 4.0 for directory "2").
+    // Falls back to 2^vectorIndex if not set.
+    void setLevelScaleFactors(std::vector<float> factors);
+    [[nodiscard]] float levelScaleFactor(int vectorIndex) const noexcept;
+
     // --- Logical data bounds ---
     struct DataBoundsL0 {
         int minX = 0, maxX = 0;
@@ -146,6 +151,7 @@ public:
 
 private:
     Config config_;
+    std::vector<float> levelScaleFactors_;  // OME-Zarr scale per vector index
     std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels_;
     std::unique_ptr<VolumeSource> source_;
     DecompressFn decompress_;

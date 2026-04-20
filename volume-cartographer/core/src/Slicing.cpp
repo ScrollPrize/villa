@@ -310,7 +310,7 @@ void appendChunksForCoordsSurface(BlockPipeline& cache, int level,
     const int chunksY = (ls[1] + cs[1] - 1) / cs[1];
     const int chunksX = (ls[2] + cs[2] - 1) / cs[2];
 
-    const float scale = (level > 0) ? 1.0f / float(1 << level) : 1.0f;
+    const float scale = 1.0f / cache.levelScaleFactor(level);
     // Sub-sample stride: at native resolution, ~1 voxel per pixel and a
     // chunk is 128 voxels, so an 8-pixel stride still hits every chunk
     // the surface crosses (16 samples per chunk row → safe coverage even
@@ -792,7 +792,7 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
     // voxel space; scale to each level before enumerating chunks. Batch
     // everything into one fetchInteractive call — the IOPool's queue
     // rebuild is O(N) and we'd otherwise pay it once per level.
-    auto levelScale = [](int lvl) { return (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f; };
+    auto levelScale = [&cache](int lvl) { return 1.0f / cache.levelScaleFactor(lvl); };
     // Thread-local to avoid per-frame alloc/free.
     thread_local std::vector<vc::cache::ChunkKey> prefetchKeys;
     prefetchKeys.clear();
@@ -934,7 +934,7 @@ void sampleCompositeAdaptiveImpl(
     uint8_t* levelOut,
     int levelStride)
 {
-    auto levelScale = [](int lvl) { return (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f; };
+    auto levelScale = [&cache](int lvl) { return 1.0f / cache.levelScaleFactor(lvl); };
     const float zLo = float(zStart) * zStep;
     const float zHi = float(zStart + numLayers - 1) * zStep;
     const float zMin = std::min(zLo, zHi), zMax = std::max(zLo, zHi);
@@ -1006,14 +1006,16 @@ void sampleCompositeAdaptiveImpl(
         }
     }
 
-    // Precompute per-level scale factor once (1.0 / 2^lvl). Hoists the
-    // integer shift + int->float convert + fdiv out of the hot inner loop.
+    // Precompute per-level scale factor once. Hoists the
+    // scale-factor lookup out of the hot inner loop.
     float scales[32] = {};
     const int nSamplersTotal = numLevels - desiredLevel;
     for (int i = 0; i < nSamplersTotal && i < 32; i++) {
         int lvl = desiredLevel + i;
-        scales[i] = (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f;
+        scales[i] = 1.0f / cache.levelScaleFactor(lvl);
     }
+
+
 
     // Parse compositeMethod once. Pixel loop previously did string compare
     // per pixel for the LayerStorage path; convert to a small enum up front.
@@ -1078,7 +1080,7 @@ void sampleCompositeAdaptiveImpl(
         // the fallback loop so the hot path never computes scales[i]/endScale.
         float scalesRatio[32] = {};
         for (int i = 0; i < nSamplers && i < 32; i++)
-            scalesRatio[i] = (i > 0) ? 1.0f / float(1 << i) : 1.0f;
+            scalesRatio[i] = scales[i] / scales[0];
 
         // When there's no per-pixel normals map (common case: plane viewer),
         // nrm is constant across every pixel and the pre-scaled step vector
