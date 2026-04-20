@@ -224,10 +224,11 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
         auth = vc::cache::loadAwsCredentials();
         if (auth.region.empty())
             auth.region = resolved.awsRegion;
-        // Only enable SigV4 if credentials are actually available.
-        // Empty credentials → anonymous unsigned HTTPS request (public buckets).
+        // SigV4 is implicitly enabled when access_key is non-empty.
+        // If credentials are missing, clear them so the request proceeds
+        // unsigned (anonymous access for public buckets).
         if (auth.access_key.empty() || auth.secret_key.empty())
-            auth.awsSigv4 = false;
+            auth = {};  // anonymous — no SigV4
     } else if (resolved.useAwsSigv4 && auth.region.empty()) {
         auth.region = resolved.awsRegion;
     }

@@ -683,7 +683,7 @@ bool MenuActionController::tryResolveRemoteAuth(const QString& url,
     if (!allowPrompt) {
         // No credentials available and can't prompt — proceed with anonymous
         // access (unsigned HTTPS). Works for public S3 buckets.
-        authOut->awsSigv4 = false;
+        *authOut = {};  // anonymous — no SigV4
         return true;
     }
 
@@ -702,7 +702,7 @@ bool MenuActionController::tryResolveRemoteAuth(const QString& url,
 
     // Empty access key → anonymous access (public buckets)
     if (accessKey.trimmed().isEmpty()) {
-        authOut->awsSigv4 = false;
+        *authOut = {};  // anonymous — no SigV4
         return true;
     }
 

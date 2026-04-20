@@ -3021,10 +3021,12 @@ void CWindow::CreateWidgets(void)
         if (_state->pointCollection()) {
             const auto& cols = _state->pointCollection()->getAllCollections();
             if (!cols.empty()) {
-                nlohmann::json corr_json;
-                nlohmann::json cols_json = nlohmann::json::object();
+                utils::Json corr_json;
+                utils::Json cols_json = utils::Json::object();
                 for (const auto& [cid, col] : cols) {
-                    cols_json[std::to_string(cid)] = col;
+                    utils::Json col_json;
+                    to_json(col_json, col);
+                    cols_json[std::to_string(cid)] = col_json;
                 }
                 corr_json["collections"] = cols_json;
                 QJsonDocument corrDoc = QJsonDocument::fromJson(
