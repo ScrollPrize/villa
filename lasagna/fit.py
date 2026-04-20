@@ -352,6 +352,7 @@ def main(argv: list[str] | None = None) -> int:
 	opt_loss_dir.set_mask_zero_normals(opt_cfg.normal_mask_zero)
 
 	# Run optimization
+	seed_xyz = tuple(float(v) for v in data_cfg.seed) if data_cfg.seed is not None else None
 	optimizer.optimize(
 		model=mdl,
 		data=data,
@@ -361,6 +362,7 @@ def main(argv: list[str] | None = None) -> int:
 		progress_fn=_progress,
 		load_data_fn=_load_data,
 		volume_extent_fullres=volume_extent_fullres,
+		seed_xyz=seed_xyz,
 	)
 
 	if device.type == "cuda":

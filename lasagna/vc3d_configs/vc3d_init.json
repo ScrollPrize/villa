@@ -3,6 +3,7 @@
 		"normal": 1.0,
 		"step": 1.0,
 		"smooth": 0.0,
+		"station": 0.1,
 		"winding_density": 0.001,
 		"data": 4.0,
 		"data_plain": 2.0,
@@ -12,7 +13,7 @@
 	"stages": [
 		{
 			"name": "reopt",
-			"steps": 2000,
+			"steps": 1000,
 			"min_scaledown": 0,
 			"lr": [1.0, 0.1, 0.01, 0.001, 0.0001],
 			"params": ["mesh_ms","conn_offset_ms"],

@@ -268,6 +268,7 @@ def optimize(
 	progress_fn=None,
 	load_data_fn=None,
 	volume_extent_fullres: tuple[int, int, int] | None = None,
+	seed_xyz: tuple[float, float, float] | None = None,
 ) -> fit_data.FitData3D:
 
 	terms = {
@@ -383,11 +384,11 @@ def optimize(
 				row += f"  {pv[k]:10.4f}"
 			print(row)
 
-		# Station-keeping: snapshot center-of-mass reference for this stage
-		if _need_term("station", opt_cfg.eff) > 0:
-			with torch.no_grad():
-				res_st = model(data)
-			opt_loss_station.set_station_ref(res=res_st)
+		# Station-keeping: set seed point anchor (once, on first stage that uses it)
+		if _need_term("station", opt_cfg.eff) > 0 and seed_xyz is not None:
+			dev = data.cos.device
+			seed_t = torch.tensor(list(seed_xyz), device=dev, dtype=torch.float32)
+			opt_loss_station.set_seed(seed_t, data)
 
 		# Initial evaluation
 		with torch.no_grad():
