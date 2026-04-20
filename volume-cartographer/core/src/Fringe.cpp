@@ -12,7 +12,6 @@ void Fringe::init(cv::Size grid_size, const Config& config) {
     _config = config;
     _attempts = cv::Mat_<uint16_t>(grid_size, static_cast<uint16_t>(0));
     _fringe.clear();
-    _at_left_border = false;
     _at_right_border = false;
     _at_top_border = false;
     _at_bottom_border = false;
@@ -66,8 +65,6 @@ uint16_t Fringe::getAttempts(const cv::Vec2i& p) const {
 // ---- Border tracking ----
 
 void Fringe::checkBorderContact(const cv::Vec2i& pn, cv::Size grid_size) {
-    if (pn[1] < 0)
-        _at_left_border = true;
     if (pn[1] >= grid_size.width)
         _at_right_border = true;
     if (pn[0] < 0)
@@ -77,7 +74,6 @@ void Fringe::checkBorderContact(const cv::Vec2i& pn, cv::Size grid_size) {
 }
 
 void Fringe::clearBorderFlags() {
-    _at_left_border = false;
     _at_right_border = false;
     _at_top_border = false;
     _at_bottom_border = false;

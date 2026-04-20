@@ -110,6 +110,22 @@ inline T angle_diff_deg_t(const T& a_deg, const T& b_deg) {
     return atan2(sin(diff_rad), cos(diff_rad)) * T(180.0 / M_PI);
 }
 
+template <typename T>
+inline T theta_from_seam_rad_t(const T& dx, const T& dy, const cv::Vec2f& seam_direction) {
+    const T det = T(seam_direction[0]) * dy - T(seam_direction[1]) * dx;
+    const T dot = T(seam_direction[0]) * dx + T(seam_direction[1]) * dy;
+    return atan2(det, dot);
+}
+
+template <typename T>
+inline T theta_from_seam_deg_t(const T& dx, const T& dy, const cv::Vec2f& seam_direction) {
+    T theta_deg = theta_from_seam_rad_t(dx, dy, seam_direction) * T(180.0 / M_PI);
+    if (val(theta_deg) < 0.0) {
+        theta_deg += T(360.0);
+    }
+    return theta_deg;
+}
+
 struct DistLoss {
     DistLoss(float dist, float w) : _d(dist), _w(w) {};
     template <typename T>
@@ -2035,8 +2051,16 @@ struct TangentOrthogonalityLossAnalytic {
 };
 
 struct AngleStepLossAnalytic {
-    AngleStepLossAnalytic(const cv::Vec3f& center, double expected_dtheta_deg, double w)
-        : _center(center), _expected_dtheta_deg(expected_dtheta_deg), _w(w) {}
+    AngleStepLossAnalytic(const cv::Vec3f& center_prev,
+                          const cv::Vec3f& center_curr,
+                          const cv::Vec2f& seam_direction,
+                          double expected_dtheta_deg,
+                          double w)
+        : _center_prev(center_prev),
+          _center_curr(center_curr),
+          _seam_direction(seam_direction),
+          _expected_dtheta_deg(expected_dtheta_deg),
+          _w(w) {}
 
     template <typename T>
     bool operator()(const T* const p_prev, const T* const p_curr, T* residual) const {
@@ -2045,13 +2069,13 @@ struct AngleStepLossAnalytic {
             return true;
         }
 
-        const T dx0 = p_prev[0] - T(_center[0]);
-        const T dy0 = p_prev[1] - T(_center[1]);
-        const T dx1 = p_curr[0] - T(_center[0]);
-        const T dy1 = p_curr[1] - T(_center[1]);
+        const T dx0 = p_prev[0] - T(_center_prev[0]);
+        const T dy0 = p_prev[1] - T(_center_prev[1]);
+        const T dx1 = p_curr[0] - T(_center_curr[0]);
+        const T dy1 = p_curr[1] - T(_center_curr[1]);
 
-        const T theta0 = atan2(dy0, dx0);
-        const T theta1 = atan2(dy1, dx1);
+        const T theta0 = theta_from_seam_rad_t(dx0, dy0, _seam_direction);
+        const T theta1 = theta_from_seam_rad_t(dx1, dy1, _seam_direction);
         const T diff = atan2(sin(theta1 - theta0), cos(theta1 - theta0));
         const T diff_deg = diff * T(180.0 / M_PI);
 
@@ -2059,12 +2083,18 @@ struct AngleStepLossAnalytic {
         return true;
     }
 
-    static ceres::CostFunction* Create(const cv::Vec3f& center, double expected_dtheta_deg, float w = 1.0f) {
+    static ceres::CostFunction* Create(const cv::Vec3f& center_prev,
+                                       const cv::Vec3f& center_curr,
+                                       const cv::Vec2f& seam_direction,
+                                       double expected_dtheta_deg,
+                                       float w = 1.0f) {
         return new ceres::AutoDiffCostFunction<AngleStepLossAnalytic, 1, 3, 3>(
-            new AngleStepLossAnalytic(center, expected_dtheta_deg, w));
+            new AngleStepLossAnalytic(center_prev, center_curr, seam_direction, expected_dtheta_deg, w));
     }
 
-    cv::Vec3f _center;
+    cv::Vec3f _center_prev;
+    cv::Vec3f _center_curr;
+    cv::Vec2f _seam_direction;
     double _expected_dtheta_deg;
     double _w;
 };
@@ -2120,10 +2150,12 @@ struct RadialSlopeLossAnalytic {
 
 struct AngleColumnLossAnalytic {
     AngleColumnLossAnalytic(const cv::Vec3f& center,
+                            const cv::Vec2f& seam_direction,
                             double expected_theta_deg,
                             double base_theta_offset,
                             double w)
         : _center(center),
+          _seam_direction(seam_direction),
           _expected_theta_deg(expected_theta_deg),
           _base_theta_offset(base_theta_offset),
           _w(w) {}
@@ -2137,10 +2169,7 @@ struct AngleColumnLossAnalytic {
 
         const T dx = p[0] - T(_center[0]);
         const T dy = p[1] - T(_center[1]);
-        T theta_deg = atan2(dy, dx) * T(180.0 / M_PI);
-        if (val(theta_deg) < 0.0) {
-            theta_deg += T(360.0);
-        }
+        T theta_deg = theta_from_seam_deg_t(dx, dy, _seam_direction);
         theta_deg += T(_base_theta_offset);
 
         const T diff_deg = angle_diff_deg_t(theta_deg, T(_expected_theta_deg));
@@ -2149,14 +2178,16 @@ struct AngleColumnLossAnalytic {
     }
 
     static ceres::CostFunction* Create(const cv::Vec3f& center,
+                                       const cv::Vec2f& seam_direction,
                                        double expected_theta_deg,
                                        double base_theta_offset,
                                        float w = 1.0f) {
         return new ceres::AutoDiffCostFunction<AngleColumnLossAnalytic, 1, 3>(
-            new AngleColumnLossAnalytic(center, expected_theta_deg, base_theta_offset, w));
+            new AngleColumnLossAnalytic(center, seam_direction, expected_theta_deg, base_theta_offset, w));
     }
 
     cv::Vec3f _center;
+    cv::Vec2f _seam_direction;
     double _expected_theta_deg;
     double _base_theta_offset;
     double _w;

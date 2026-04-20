@@ -270,7 +270,7 @@ int clip_wrap_loss_z_index(
         non_finite = true;
         z_index = 0;
     } else {
-        z_index = static_cast<int>(z_value);
+        z_index = static_cast<int>(std::lround(z_value));
         if (z_index < 0 || z_index >= max_z) {
             clipped = true;
             z_index = std::clamp(z_index, 0, max_z - 1);
@@ -325,6 +325,7 @@ int add_wrap_losses(
     bool clipped = false;
     const int z_index = clip_wrap_loss_z_index(umbilicus, p, z_value, &clipped);
     cv::Vec3f center = wrap_tracker->cached_center_at(z_index);
+    const cv::Vec2f seam_direction = umbilicus.seam_direction_xy();
 
     // TangentOrthogonalityLoss - can apply immediately, only needs neighbors
     const float tangent_w = g_params.tangent_ortho_w * weight_scale;
@@ -354,6 +355,9 @@ int add_wrap_losses(
         wrap_tracker->has_sufficient_dtheta_samples(g_params.angle_step_min_pts)) {
         cv::Vec2i p_prev = {p[0], p[1] - 1};
         if (p_prev[1] >= 0 && (state(p_prev) & STATE_LOC_VALID)) {
+            bool clipped_prev = false;
+            const int z_index_prev = clip_wrap_loss_z_index(umbilicus, p_prev, points(p_prev)[2], &clipped_prev);
+            cv::Vec3f center_prev = wrap_tracker->cached_center_at(z_index_prev);
             if (weight_scale == 1.0f && !logged_angle_step_active) {
                 std::cout << "[WrapLoss] AngleStepLoss now active (w=" << angle_step_w_scaled
                           << ", dtheta/step=" << wrap_tracker->expected_dtheta_per_step()
@@ -365,7 +369,8 @@ int add_wrap_losses(
                 loss = new ceres::HuberLoss(g_params.angle_step_huber_delta);
             }
             problem.AddResidualBlock(
-                AngleStepLossAnalytic::Create(center, wrap_tracker->expected_dtheta_per_step(), angle_step_w_scaled),
+                AngleStepLossAnalytic::Create(center_prev, center, seam_direction,
+                                              wrap_tracker->expected_dtheta_per_step(), angle_step_w_scaled),
                 loss,
                 &points(p_prev)[0],
                 &points(p)[0]);
@@ -442,7 +447,8 @@ int add_wrap_losses(
                 loss = new ceres::HuberLoss(g_params.angle_column_huber_delta);
             }
             problem.AddResidualBlock(
-                AngleColumnLossAnalytic::Create(center, expected_theta, wrap_tracker->base_theta_offset(), angle_column_w_scaled),
+                AngleColumnLossAnalytic::Create(center, seam_direction, expected_theta,
+                                                wrap_tracker->base_theta_offset(), angle_column_w_scaled),
                 loss,
                 &points(p)[0]);
             count++;

@@ -15,7 +15,7 @@ namespace vc::wrap_tracking {
 
 // Per-cell spiral state
 struct SpiralCellState {
-    double theta_deg{0.0};            // Raw angle in [0, 360) from Umbilicus::theta
+    double theta_deg{0.0};            // Seed-normalized angle in [0, 360)
     double theta_unwrapped_deg{0.0};  // Monotonically increasing (or decreasing if flip_x)
     int wrap_index{0};                // floor(theta_unwrapped / 360)
     double wrap_frac{0.0};            // theta_unwrapped / 360 (fractional wraps)

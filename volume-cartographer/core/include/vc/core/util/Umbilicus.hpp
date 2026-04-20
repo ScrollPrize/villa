@@ -34,6 +34,7 @@ namespace vc::core::util {
         void set_seam_from_point(const cv::Vec3f& point);
         bool has_seam() const noexcept;
         SeamDirection seam_direction() const;
+        cv::Vec2f seam_direction_xy() const;
         std::pair<cv::Vec3f, cv::Vec3f> seam_segment(int z_index) const;
         const std::vector<cv::Vec3f>& seam_endpoints() const;
 

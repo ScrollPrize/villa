@@ -95,7 +95,7 @@ int clip_z_index(const cv::Vec2i& p, double z_value, int max_z, const char* cont
         non_finite = true;
         z_index = 0;
     } else {
-        z_index = static_cast<int>(z_value);
+        z_index = static_cast<int>(std::lround(z_value));
         if (z_index < 0 || z_index >= max_z) {
             clipped = true;
             z_index = std::clamp(z_index, 0, max_z - 1);
@@ -1024,39 +1024,45 @@ void UmbilicusEstimator::orient_normals_to_centroid() {
 void UmbilicusEstimator::orient_normals_to_target(
     const char* target_name,
     const std::function<cv::Vec2d(const Sample&)>& target_fn) {
-    // Count normals pointing toward vs away from target
     int toward_count = 0;
-    int away_count = 0;
+    int flipped_count = 0;
+    int ambiguous_count = 0;
 
-    for (const auto& row_samples : _samples_per_row) {
-        for (const auto& s : row_samples) {
+    for (auto& row_samples : _samples_per_row) {
+        for (auto& s : row_samples) {
             cv::Vec2d to_target = target_fn(s);
             if (!std::isfinite(to_target[0]) || !std::isfinite(to_target[1])) {
+                ambiguous_count++;
                 continue;
             }
             double dist = cv::norm(to_target);
-            if (dist < 1e-6) continue;
+            if (dist < 1e-6) {
+                ambiguous_count++;
+                continue;
+            }
             to_target /= dist;
 
             // Positive dot = normal points toward target
             double dot = to_target[0] * s.normal_xy[0] + to_target[1] * s.normal_xy[1];
-            if (dot > 0) toward_count++;
-            else away_count++;
+            if (dot < 0) {
+                s.normal_xy = -s.normal_xy;
+                flipped_count++;
+            } else if (dot > 0) {
+                toward_count++;
+            } else {
+                ambiguous_count++;
+            }
         }
     }
 
-    if (toward_count + away_count < 10) return;
-
-    // Normals should point TOWARD the target
-    // If majority point away, flip all normals
-    if (away_count > toward_count) {
-        std::cout << "[UmbilicusEstimator] Flipping normals: " << away_count
-                  << " away vs " << toward_count << " toward " << target_name << std::endl;
-        for (auto& row_samples : _samples_per_row) {
-            for (auto& s : row_samples) {
-                s.normal_xy = -s.normal_xy;
-            }
+    if (flipped_count > 0 && (_log_generation < 0 || _log_generation % 1000 == 0)) {
+        std::cout << "[UmbilicusEstimator] Oriented normals toward " << target_name
+                  << ": flipped=" << flipped_count
+                  << " already_toward=" << toward_count;
+        if (ambiguous_count > 0) {
+            std::cout << " ambiguous=" << ambiguous_count;
         }
+        std::cout << std::endl;
     }
 }
 

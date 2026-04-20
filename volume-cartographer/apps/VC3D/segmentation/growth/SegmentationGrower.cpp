@@ -105,51 +105,6 @@ QString surfaceTrackerSourceDirFromParams(const utils::Json& params)
     return {};
 }
 
-void appendGrowthDirectionString(utils::Json& directions,
-                                 SegmentationGrowthDirection direction)
-{
-    switch (direction) {
-    case SegmentationGrowthDirection::Up:
-        directions.push_back(utils::Json("up"));
-        break;
-    case SegmentationGrowthDirection::Down:
-        directions.push_back(utils::Json("down"));
-        break;
-    case SegmentationGrowthDirection::Left:
-        directions.push_back(utils::Json("left"));
-        break;
-    case SegmentationGrowthDirection::Right:
-        directions.push_back(utils::Json("right"));
-        break;
-    case SegmentationGrowthDirection::All:
-    default:
-        directions.push_back(utils::Json("all"));
-        break;
-    }
-}
-
-utils::Json growthDirectionsJson(const std::vector<SegmentationGrowthDirection>& directions)
-{
-    utils::Json out = utils::Json::array();
-    if (directions.empty()) {
-        appendGrowthDirectionString(out, SegmentationGrowthDirection::All);
-        return out;
-    }
-
-    bool addedAll = false;
-    for (const auto direction : directions) {
-        if (direction == SegmentationGrowthDirection::All) {
-            if (!addedAll) {
-                appendGrowthDirectionString(out, direction);
-                addedAll = true;
-            }
-            continue;
-        }
-        appendGrowthDirectionString(out, direction);
-    }
-    return out;
-}
-
 // NOTE: SegmentationGrowth.cpp has an equivalent ensureGenerationsChannel with a bool
 // return value. These two live in separate anonymous namespaces (different TUs) and
 // cannot easily be merged without a shared header; keep them in sync if modified.
@@ -1605,21 +1560,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             params = utils::Json::object();
         }
 
-        std::vector<SegmentationGrowthDirection> directions;
-        if (auto overrideDirs = _context.module->takeShortcutDirectionOverride()) {
-            directions = std::move(*overrideDirs);
-        } else if (direction != SegmentationGrowthDirection::All) {
-            directions = {direction};
-        } else {
-            directions = _context.widget->allowedGrowthDirections();
-        }
-        if (directions.empty()) {
-            directions = {SegmentationGrowthDirection::All};
-        }
-
-        if (!params.contains("growth_directions")) {
-            params["growth_directions"] = growthDirectionsJson(directions);
-        }
+        (void)_context.module->takeShortcutDirectionOverride();
 
         const QString sourceDirFromJson = surfaceTrackerSourceDirFromParams(params);
         std::filesystem::path sourceDir;

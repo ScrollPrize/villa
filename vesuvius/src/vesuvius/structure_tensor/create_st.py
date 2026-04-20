@@ -1,5 +1,6 @@
 #create_st.py
 import argparse
+import json
 import sys
 import warnings
 import torch
@@ -19,8 +20,17 @@ from vesuvius.image_proc.geometry.structure_tensor import (
     _get_gaussian_kernel_3d,
     _get_pavel_kernels_3d,
 )
+from scipy.ndimage import distance_transform_edt
 from numcodecs import Blosc
 from ._compile_utils import _maybe_compile_function
+
+_CUPYX_EDT_CACHE = {
+    "available": None,
+    "cp": None,
+    "edt": None,
+    "warned": False,
+}
+
 
 def _ceildiv(a: int, b: int) -> int:
     """Ceiling division for positives."""
@@ -43,6 +53,168 @@ def _dtype_unit_scale(np_dtype) -> float:
         return float(_np.iinfo(np_dtype).max)   # e.g., 255, 65535
     return 1.0  # float/bool: treat as already normalized
 
+
+def _load_umbilicus_points(path: str | Path) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load umbilicus control points as sorted z, x, y float32 arrays."""
+    with open(path, "r") as f:
+        data = json.load(f)
+
+    raw_points = data.get("control_points", data) if isinstance(data, dict) else data
+    points = []
+    for point in raw_points:
+        if isinstance(point, dict):
+            points.append((float(point["z"]), float(point["x"]), float(point["y"])))
+        else:
+            x, y, z = point[:3]
+            points.append((float(z), float(x), float(y)))
+
+    if len(points) < 1:
+        raise ValueError(f"Umbilicus file {path!s} does not contain any points")
+
+    pts = np.asarray(points, dtype=np.float32)
+    order = np.argsort(pts[:, 0], kind="stable")
+    pts = pts[order]
+    return pts[:, 0], pts[:, 1], pts[:, 2]
+
+
+def _orient_eigenvectors_to_umbilicus(
+    v_corrected: torch.Tensor,
+    bounds: tuple[int, int, int, int, int, int],
+    umbilicus: tuple[np.ndarray, np.ndarray, np.ndarray],
+) -> torch.Tensor:
+    """Orient normals toward an interpolated umbilicus while preserving handedness."""
+    z0, z1, y0, y1, x0, x1 = bounds
+    umb_z, umb_x, umb_y = umbilicus
+    device = v_corrected.device
+
+    z_coords = np.arange(z0, z1, dtype=np.float32)
+    center_x = np.interp(z_coords, umb_z, umb_x).astype(np.float32, copy=False)
+    center_y = np.interp(z_coords, umb_z, umb_y).astype(np.float32, copy=False)
+
+    center_x_t = torch.from_numpy(center_x).to(device=device).view(-1, 1, 1)
+    center_y_t = torch.from_numpy(center_y).to(device=device).view(-1, 1, 1)
+    y_t = torch.arange(y0, y1, device=device, dtype=torch.float32).view(1, -1, 1)
+    x_t = torch.arange(x0, x1, device=device, dtype=torch.float32).view(1, 1, -1)
+
+    # Tensor vector components are ordered z, y, x.  The umbilicus target is the
+    # same-z radial direction from each voxel toward the interpolated centerline.
+    dot = (
+        v_corrected[2, 1, ...] * (center_y_t - y_t)
+        + v_corrected[2, 2, ...] * (center_x_t - x_t)
+    )
+    flip = dot < 0
+    if flip.any():
+        v_corrected[0, :, flip] *= -1
+        v_corrected[2, :, flip] *= -1
+    return v_corrected
+
+
+def _prediction_to_binary_mask(volume: np.ndarray) -> np.ndarray:
+    """Convert a prediction patch to a boolean foreground mask."""
+    if volume.dtype == np.bool_:
+        return volume
+    if np.issubdtype(volume.dtype, np.integer):
+        return volume > 0
+
+    finite = volume[np.isfinite(volume)]
+    if finite.size == 0:
+        return np.zeros(volume.shape, dtype=bool)
+    if finite.min() >= 0.0 and finite.max() <= 1.0:
+        return volume >= 0.5
+    return volume > 0
+
+
+def _compute_signed_distance_transform(volume: np.ndarray) -> np.ndarray:
+    """Return outside-minus-inside SDT for a binary prediction patch."""
+    binary = _prediction_to_binary_mask(volume)
+    if not np.any(binary) or np.all(binary):
+        return np.zeros(binary.shape, dtype=np.float32)
+
+    inside = distance_transform_edt(binary)
+    outside = distance_transform_edt(~binary)
+    return (outside - inside).astype(np.float32, copy=False)
+
+
+def _resolve_cupyx_edt():
+    """Resolve the GPU EDT backend lazily so CPU-only installs still import."""
+    if _CUPYX_EDT_CACHE["available"] is not None:
+        return _CUPYX_EDT_CACHE
+
+    try:
+        import cupy as cp
+        from cupyx.scipy.ndimage import distance_transform_edt as cupyx_edt
+
+        if int(cp.cuda.runtime.getDeviceCount()) > 0:
+            _CUPYX_EDT_CACHE.update(
+                {
+                    "available": True,
+                    "cp": cp,
+                    "edt": cupyx_edt,
+                }
+            )
+            return _CUPYX_EDT_CACHE
+    except Exception:
+        pass
+
+    _CUPYX_EDT_CACHE.update({"available": False, "cp": None, "edt": None})
+    return _CUPYX_EDT_CACHE
+
+
+def _cupy_prediction_to_binary_mask(volume: np.ndarray, cp):
+    """CuPy equivalent of _prediction_to_binary_mask for GPU EDT input."""
+    arr = cp.asarray(volume)
+    if arr.dtype == np.bool_:
+        return arr
+    if np.issubdtype(arr.dtype, np.integer):
+        return arr > 0
+
+    finite = arr[cp.isfinite(arr)]
+    if finite.size == 0:
+        return cp.zeros(arr.shape, dtype=cp.bool_)
+    finite_min = float(finite.min().get())
+    finite_max = float(finite.max().get())
+    if finite_min >= 0.0 and finite_max <= 1.0:
+        return arr >= 0.5
+    return arr > 0
+
+
+def _compute_signed_distance_transform_torch(
+    volume: np.ndarray,
+    device: torch.device | str,
+) -> torch.Tensor:
+    """Return outside-minus-inside SDT as a float32 tensor on the target device."""
+    target_device = torch.device(device)
+    if target_device.type == "cuda" and torch.cuda.is_available():
+        backend = _resolve_cupyx_edt()
+        if backend["available"]:
+            cp = backend["cp"]
+            cupyx_edt = backend["edt"]
+            device_index = target_device.index
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            try:
+                with cp.cuda.Device(device_index):
+                    binary = _cupy_prediction_to_binary_mask(volume, cp)
+                    if not bool(cp.any(binary).get()) or bool(cp.all(binary).get()):
+                        sdt = cp.zeros(binary.shape, dtype=cp.float32)
+                    else:
+                        inside = cupyx_edt(binary, float64_distances=False)
+                        outside = cupyx_edt(~binary, float64_distances=False)
+                        sdt = (outside - inside).astype(cp.float32, copy=False)
+                    return torch.utils.dlpack.from_dlpack(sdt)
+            except Exception as exc:
+                if not _CUPYX_EDT_CACHE["warned"]:
+                    warnings.warn(
+                        "Falling back to SciPy signed distance transform because "
+                        f"CuPyX EDT failed: {exc}",
+                        RuntimeWarning,
+                    )
+                    _CUPYX_EDT_CACHE["warned"] = True
+
+    sdt_np = _compute_signed_distance_transform(volume)
+    return torch.from_numpy(sdt_np).to(target_device)
+
+
 class StructureTensorInferer(Inferer, nn.Module):
     """
     Inherits all of Inferer's I/O, patching, zarr & scheduling machinery,
@@ -53,6 +225,7 @@ class StructureTensorInferer(Inferer, nn.Module):
                  sigma: float = 1.0,
                  smooth_components: bool = False,
                  volume: int = None,  # Add volume attribute
+                 do_sdt: bool = False,
                  step_size: float = 1.0,
                  **kwargs):
         # --- Initialize Module first so register_buffer exists ---
@@ -79,6 +252,7 @@ class StructureTensorInferer(Inferer, nn.Module):
         self.sigma = sigma
         self.smooth_components = smooth_components
         self.volume = volume  # Initialize volume attribute
+        self.do_sdt = bool(do_sdt)
 
         # --- Auto-infer patch_size from the input Zarr's chunking if none given ---
         if self.patch_size is None:
@@ -221,6 +395,7 @@ class StructureTensorInferer(Inferer, nn.Module):
                 root_store.attrs['original_volume_shape'] = original_volume_shape
                 root_store.attrs['sigma'] = self.sigma
                 root_store.attrs['smooth_components'] = self.smooth_components
+                root_store.attrs['do_sdt'] = self.do_sdt
             except Exception as e:
                 print(f"Warning: Failed to write custom attributes: {e}")
             
@@ -353,21 +528,31 @@ class StructureTensorInferer(Inferer, nn.Module):
 
                     # --- robust channel handling: ensure [1,1,Z,Y,X] for conv3d ---
                     if input_src.ndim == 3:
-                        raw = input_src[za:zb, ya:yb, xa:xb].astype('float32')
+                        raw = input_src[za:zb, ya:yb, xa:xb]
                     else:
-                        raw = input_src[0, za:zb, ya:yb, xa:xb].astype('float32')
+                        raw = input_src[0, za:zb, ya:yb, xa:xb]
 
-                    x = torch.from_numpy(raw).to(self.device).unsqueeze(0).unsqueeze(0)  # [1,1,Z,Y,X]
+                    if self.do_sdt:
+                        if self.volume is not None:
+                            raw = raw == self.volume
+                        raw = np.asarray(raw)
+                        x = _compute_signed_distance_transform_torch(
+                            raw,
+                            self.device,
+                        ).unsqueeze(0).unsqueeze(0)
+                    else:
+                        raw = np.asarray(raw).astype('float32')
+                        x = torch.from_numpy(raw).to(self.device).unsqueeze(0).unsqueeze(0)  # [1,1,Z,Y,X]
 
-                    # Normalize to [0,1] by dtype max when NOT using a fiber mask
-                    if self.volume is None:
-                        scale = _dtype_unit_scale(input_src.dtype)
-                        # guard against weird dtypes; no-op for floats/bools (scale=1)
-                        x = x.float() / max(scale, 1e-8)
+                        # Normalize to [0,1] by dtype max when NOT using a fiber mask
+                        if self.volume is None:
+                            scale = _dtype_unit_scale(input_src.dtype)
+                            # guard against weird dtypes; no-op for floats/bools (scale=1)
+                            x = x.float() / max(scale, 1e-8)
 
-                    # Apply fiber-volume mask if needed
-                    if self.volume is not None:
-                        x = (x == float(self.volume)).float()
+                        # Apply fiber-volume mask if needed
+                        if self.volume is not None:
+                            x = (x == float(self.volume)).float()
 
                     # Compute over padded patch
                     with torch.no_grad():
@@ -539,6 +724,7 @@ def _finalize_structure_tensor_torch(
     ome_scale: str = "0",
     confidence_metric: str = "fa",
     keep_eigen: bool = False,
+    umbilicus_json: Optional[Union[str, Path]] = None,
 ):
     """
     Compute eigenvectors/eigenvalues from structure tensor. By default, write
@@ -568,6 +754,9 @@ def _finalize_structure_tensor_torch(
     src = root_store['structure_tensor']
     C, Z, Y, X = src.shape
     assert C == 6, f"Expect 6 channels, got {C}"
+    umbilicus = _load_umbilicus_points(umbilicus_json) if umbilicus_json else None
+    if verbose and umbilicus is not None:
+        print(f"[Eigen] orienting normals toward umbilicus: {umbilicus_json}")
 
     # chunk dims
     if chunk_size is None:
@@ -742,13 +931,20 @@ def _finalize_structure_tensor_torch(
         # back to original layout
         v_corrected = V_flat.permute(1,2,0).reshape(3,3,*eigvecs_block.shape[1:])
 
-        # Orient eigenvectors: keep right-handedness but align first vector toward +X on average.
-        # Compute sign from the first component of v0 averaged over the block
-        s = torch.sign(v_corrected[0, 0, ...].mean())
-        s = torch.tensor(1.0, device=v_corrected.device) if s == 0 else s
-        # Flip v0 and v2 together to preserve determinant > 0
-        v_corrected[0, ...] *= s
-        v_corrected[2, ...] *= s
+        if umbilicus is None:
+            # Orient eigenvectors: keep right-handedness but align first vector
+            # toward the legacy block-global direction.
+            s = torch.sign(v_corrected[0, 0, ...].mean())
+            s = torch.tensor(1.0, device=v_corrected.device) if s == 0 else s
+            # Flip v0 and v2 together to preserve determinant > 0
+            v_corrected[0, ...] *= s
+            v_corrected[2, ...] *= s
+        else:
+            v_corrected = _orient_eigenvectors_to_umbilicus(
+                v_corrected,
+                bounds,
+                umbilicus,
+            )
 
         # numpy views
         v_np = v_corrected.cpu().numpy()     # [3,3,dz,dy,dx]
@@ -836,6 +1032,8 @@ def main():
                         help='After computing Jxx…Jzz, apply a second Gaussian smoothing to each channel')
     parser.add_argument('--volume', type=int, default=None,
                         help='Volume ID for fiber-volume masking')
+    parser.add_argument('--do-sdt', action='store_true',
+                        help='Convert binary prediction patches to signed distance transforms before computing the structure tensor')
     
     # Patch processing arguments
     parser.add_argument('--patch_size', type=str, default=None, 
@@ -875,6 +1073,8 @@ def main():
                         help='Scalar confidence metric to export.')
     parser.add_argument('--keep-eigen', action='store_true', default=False,
                         help='Also keep raw eigenvectors/eigenvalues arrays.')
+    parser.add_argument('--umbilicus-json', type=str, default=None,
+                        help='JSON file with umbilicus control_points; when provided, orient normals toward the interpolated umbilicus.')
 
     # Other arguments
     parser.add_argument('--device', type=str, default='cuda', 
@@ -947,6 +1147,7 @@ def main():
             sigma=args.sigma,
             smooth_components=args.smooth_components,
             volume=args.volume,
+            do_sdt=args.do_sdt,
             num_parts=args.num_parts,
             part_id=args.part_id,
             overlap=args.overlap,
@@ -989,7 +1190,8 @@ def main():
                         compressor=compressor,
                         verbose=args.verbose,
                         swap_eigenvectors=args.swap_eigenvectors,
-                        device=args.device
+                        device=args.device,
+                        umbilicus_json=args.umbilicus_json,
                     )
                     print("\n--- All computations completed successfully ---")
                     print(f"Final output contains:")
@@ -1029,6 +1231,7 @@ def main():
                 ome_scale=args.ome_scale,
                 confidence_metric=args.confidence_metric,
                 keep_eigen=args.keep_eigen,
+                umbilicus_json=args.umbilicus_json,
             )
             
             print("\n--- Eigenanalysis Completed Successfully ---")

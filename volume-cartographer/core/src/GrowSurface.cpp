@@ -86,6 +86,8 @@ static float radial_slope_huber_delta;
 static int wrap_stats_update_interval;
 static int wrap_debug_tif_interval;
 static bool wrap_batch_refresh;
+static bool wrap_tracking_in_global;
+static float global_wrap_loss_scale;
 static int global_step_max_iters;
 
 static vc::core::util::Umbilicus::SeamDirection parse_umbilicus_seam(const std::string& seam) {
@@ -131,112 +133,6 @@ static GrowthWindingMode parse_growth_winding(const std::string& value, bool* va
         *valid_out = false;
     }
     return GrowthWindingMode::Legacy;
-}
-
-struct SurfaceGrowthDirections {
-    std::vector<cv::Vec2i> neighs;
-    bool custom{false};
-    bool allow_up{true};
-    bool allow_down{true};
-    bool allow_left{true};
-    bool allow_right{true};
-};
-
-static void append_unique_direction(std::vector<cv::Vec2i>& dirs, const cv::Vec2i& dir)
-{
-    for (const auto& existing : dirs) {
-        if (existing[0] == dir[0] && existing[1] == dir[1])
-            return;
-    }
-    dirs.push_back(dir);
-}
-
-static SurfaceGrowthDirections default_surface_growth_directions(int neighbor_connectivity)
-{
-    SurfaceGrowthDirections parsed;
-    parsed.neighs = {{1, 0}, {0, 1}, {-1, 0}, {0, -1}};
-    if (neighbor_connectivity == 8)
-        parsed.neighs.insert(parsed.neighs.end(), {{1, 1}, {1, -1}, {-1, 1}, {-1, -1}});
-    return parsed;
-}
-
-static SurfaceGrowthDirections parse_surface_growth_directions(const utils::Json& params,
-                                                               int neighbor_connectivity)
-{
-    SurfaceGrowthDirections parsed = default_surface_growth_directions(neighbor_connectivity);
-    if (!params.contains("growth_directions"))
-        return parsed;
-
-    parsed.custom = true;
-    parsed.neighs.clear();
-    parsed.allow_up = false;
-    parsed.allow_down = false;
-    parsed.allow_left = false;
-    parsed.allow_right = false;
-
-    const utils::Json& directions = params["growth_directions"];
-    if (!directions.is_array()) {
-        std::cerr << "growth_directions parameter must be an array of strings" << std::endl;
-        return default_surface_growth_directions(neighbor_connectivity);
-    }
-
-    auto mark = [&](const cv::Vec2i& dir) {
-        append_unique_direction(parsed.neighs, dir);
-        parsed.allow_down = parsed.allow_down || dir[0] > 0;
-        parsed.allow_up = parsed.allow_up || dir[0] < 0;
-        parsed.allow_right = parsed.allow_right || dir[1] > 0;
-        parsed.allow_left = parsed.allow_left || dir[1] < 0;
-    };
-
-    for (const auto& entry : directions) {
-        if (!entry.is_string()) {
-            std::cerr << "Ignoring non-string entry in growth_directions" << std::endl;
-            continue;
-        }
-
-        std::string normalized = to_lower_ascii(entry.get_string());
-        normalized.erase(std::remove_if(normalized.begin(), normalized.end(),
-                                        [](unsigned char ch) {
-                                            return ch == '-' || ch == '_' || std::isspace(ch) != 0;
-                                        }),
-                         normalized.end());
-
-        if (normalized.empty()) {
-            std::cerr << "Empty growth direction entry ignored" << std::endl;
-            continue;
-        }
-        if (normalized == "all" || normalized == "default") {
-            parsed = default_surface_growth_directions(neighbor_connectivity);
-            parsed.custom = true;
-            return parsed;
-        }
-        if (normalized == "down") {
-            mark({1, 0});
-        } else if (normalized == "right") {
-            mark({0, 1});
-        } else if (normalized == "up") {
-            mark({-1, 0});
-        } else if (normalized == "left") {
-            mark({0, -1});
-        } else if (normalized == "downright") {
-            mark({1, 1});
-        } else if (normalized == "downleft") {
-            mark({1, -1});
-        } else if (normalized == "upright") {
-            mark({-1, 1});
-        } else if (normalized == "upleft") {
-            mark({-1, -1});
-        } else {
-            std::cerr << "Unknown growth direction '" << entry.get_string() << "' ignored" << std::endl;
-        }
-    }
-
-    if (parsed.neighs.empty()) {
-        std::cerr << "No valid growth_directions entries; using defaults" << std::endl;
-        return default_surface_growth_directions(neighbor_connectivity);
-    }
-
-    return parsed;
 }
 
 static double wrap_angle_diff_deg(double delta) {
@@ -1009,17 +905,67 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                 }
     }
 
+    std::unique_ptr<vc::wrap_tracking::WrapTracker> global_wrap_tracker;
+    if (wrap_tracker && wrap_tracking_in_global && global_wrap_loss_scale > 0.0f) {
+        ScopedMs timer(optimizer_timer_target(&OptimizerTiming::opt_problem_ms));
+        try {
+            const auto& umbilicus = wrap_tracker->umbilicus();
+            global_wrap_tracker = std::make_unique<vc::wrap_tracking::WrapTracker>(
+                umbilicus, points_new.rows, points_new.cols, wrap_tracker->flip_x());
+
+            cv::Vec3d seed_coord = points_new(seed);
+            if (!std::isfinite(seed_coord[0]) ||
+                !std::isfinite(seed_coord[1]) ||
+                !std::isfinite(seed_coord[2]) ||
+                (seed_coord[0] == -1.0 && seed_coord[1] == -1.0 && seed_coord[2] == -1.0)) {
+                seed_coord = data.seed_coord;
+            }
+            global_wrap_tracker->initialize_from_seed(seed_coord, seed[1]);
+
+            int repopulated = 0;
+            for (int r = 0; r < points_new.rows; ++r) {
+                for (int c = 0; c < points_new.cols; ++c) {
+                    if (new_state(r, c) & STATE_LOC_VALID) {
+                        global_wrap_tracker->set_cell({r, c}, points_new(r, c));
+                        repopulated++;
+                    }
+                }
+            }
+            for (int row = 0; row < points_new.rows; ++row) {
+                global_wrap_tracker->unwrap_row(row, new_state);
+            }
+            for (int row = 0; row < points_new.rows; ++row) {
+                global_wrap_tracker->correct_wrap_from_neighbors(row, new_state);
+            }
+            global_wrap_tracker->compute_statistics(new_state);
+
+            std::cout << "optimizer: global wrap losses enabled"
+                      << " scale=" << global_wrap_loss_scale
+                      << " cells=" << repopulated << std::endl;
+        } catch (const std::exception& ex) {
+            std::cerr << "optimizer: disabling global wrap losses: " << ex.what() << std::endl;
+            global_wrap_tracker.reset();
+        }
+    }
+
     ceres::Problem problem;
 
     std::cout << "optimizer: using " << used_area.tl() << used_area.br() << std::endl;
 
     int fix_points = 0;
+    int global_wrap_res_count = 0;
     {
         ScopedMs timer(optimizer_timer_target(&OptimizerTiming::opt_problem_ms));
         for(int j=used_area.y;j<used_area.br().y;j++)
             for(int i=used_area.x;i<used_area.br().x;i++) {
                 if (!(new_state(j,i) & STATE_LOC_VALID)) continue;  // skip cells without valid locs
                 res_count += surftrack_add_global(sm_inp, {j,i}, data_inp, problem, new_state, points_new, step*src_step, LOSS_3D_INDIRECT | SURF_LOSS | OPTIMIZE_ALL);
+                if (global_wrap_tracker) {
+                    const int added = add_wrap_losses({j, i}, points_new, new_state, problem,
+                                                      global_wrap_tracker.get(), global_wrap_loss_scale);
+                    res_count += added;
+                    global_wrap_res_count += added;
+                }
                 fix_points++;
                 if (problem.HasParameterBlock(&data_inp.loc(sm_inp, {j,i})[0]))
                     problem.AddResidualBlock(LinChkDistLoss::Create(data_inp.loc(sm_inp, {j,i}), 1.0), nullptr, &data_inp.loc(sm_inp, {j,i})[0]);
@@ -1027,6 +973,9 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     }
 
     std::cout << "optimizer: num fix points " << fix_points << std::endl;
+    if (global_wrap_tracker) {
+        std::cout << "optimizer: global wrap residuals " << global_wrap_res_count << std::endl;
+    }
 
     data_inp.seed_loc = seed;
     data_inp.seed_coord = points_new(seed);
@@ -1503,6 +1452,12 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     bool use_surface_patch_index = params.value("use_surface_patch_index", false);
     int surface_patch_stride = params.value("surface_patch_stride", 1);
     float surface_patch_bbox_pad = params.value("surface_patch_bbox_pad", 0.0f);
+    bool surface_patch_cache = params.value("surface_patch_cache", true);
+    std::filesystem::path surface_patch_cache_dir = tgt_dir / ".surface_patch_index_cache";
+    if (params.contains("surface_patch_cache_dir") &&
+        params["surface_patch_cache_dir"].is_string()) {
+        surface_patch_cache_dir = params["surface_patch_cache_dir"].get_string();
+    }
     int max_local_surfs = params.value("max_local_surfs", 0);
     if (max_local_surfs < 0) max_local_surfs = 0;
 
@@ -1512,6 +1467,9 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     wrap_debug_tif_interval = params.value("wrap_debug_tif_interval", 500);
     if (wrap_debug_tif_interval < 1) wrap_debug_tif_interval = 0;
     wrap_batch_refresh = params.value("wrap_batch_refresh", true);
+    wrap_tracking_in_global = params.value("wrap_tracking_in_global", false);
+    global_wrap_loss_scale = params.value("global_wrap_loss_scale", inpaint_wrap_loss_scale);
+    if (global_wrap_loss_scale < 0.0f) global_wrap_loss_scale = 0.0f;
     global_step_max_iters = params.value("global_step_max_iters", 200);
     if (global_step_max_iters < 1) global_step_max_iters = 1;
 
@@ -1621,7 +1579,6 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
         std::cout << "warning: neighbor_connectivity must be 4 or 8; using 4" << std::endl;
         neighbor_connectivity = 4;
     }
-    SurfaceGrowthDirections growth_dirs = parse_surface_growth_directions(params, neighbor_connectivity);
     bool use_spread_out_ordering = false;
     if (candidate_ordering == "legacy") {
         use_spread_out_ordering = true;
@@ -1677,6 +1634,9 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     std::cout << "  use_surface_patch_index: " << use_surface_patch_index << std::endl;
     std::cout << "  surface_patch_stride: " << surface_patch_stride << std::endl;
     std::cout << "  surface_patch_bbox_pad: " << surface_patch_bbox_pad << std::endl;
+    std::cout << "  surface_patch_cache: " << (surface_patch_cache ? "true" : "false") << std::endl;
+    if (surface_patch_cache)
+        std::cout << "  surface_patch_cache_dir: " << surface_patch_cache_dir << std::endl;
     std::cout << "  straight_weight: " << straight_weight << std::endl;
     std::cout << "  straight_weight_3D: " << straight_weight_3D << std::endl;
     std::cout << "  straight_min_count: " << straight_min_count << std::endl;
@@ -1690,12 +1650,6 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     std::cout << "  candidate_ordering: " << candidate_ordering << std::endl;
     std::cout << "  candidate_min_dist: " << candidate_min_dist << std::endl;
     std::cout << "  neighbor_connectivity: " << neighbor_connectivity << std::endl;
-    if (growth_dirs.custom) {
-        std::cout << "  growth_directions:";
-        for (const auto& dir : growth_dirs.neighs)
-            std::cout << " (" << dir[0] << "," << dir[1] << ")";
-        std::cout << std::endl;
-    }
     std::cout << "  fringe_full_boundary: " << (fringe_full_boundary ? "true" : "false") << std::endl;
     std::cout << "  fringe_savable_dist: " << fringe_savable_dist << std::endl;
     std::cout << "  fringe_savable_metric: " << fringe_savable_metric << std::endl;
@@ -1715,6 +1669,8 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     std::cout << "  min_test_surface_neighbor_count: " << min_test_surface_neighbor_count << std::endl;
     std::cout << "  seed_pointto_from_neighbors: " << (seed_pointto_from_neighbors ? 1 : 0) << std::endl;
     std::cout << "  remap_use_inpaint: " << (remap_use_inpaint ? "true" : "false") << std::endl;
+    std::cout << "  wrap_tracking_in_global: " << (wrap_tracking_in_global ? "true" : "false") << std::endl;
+    std::cout << "  global_wrap_loss_scale: " << global_wrap_loss_scale << std::endl;
     if (enforce_z_range)
         std::cout << "  z_range: [" << z_min << ", " << z_max << "]" << std::endl;
 
@@ -1750,10 +1706,45 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                 patch_surfaces.emplace_back(SurfacePatchIndex::SurfacePtr(it.second, [](QuadSurface*) {}));
         }
         patch_index.setSamplingStride(surface_patch_stride);
-        patch_index.rebuild(patch_surfaces, surface_patch_bbox_pad);
+        bool cache_hit = false;
+        std::filesystem::path cache_path;
+        std::string cache_key;
+        if (surface_patch_cache) {
+            cache_key = SurfacePatchIndex::cacheKeyForSurfaces(
+                patch_surfaces, surface_patch_stride, surface_patch_bbox_pad);
+            cache_path = surface_patch_cache_dir / ("surface_patch_index_" + cache_key + ".bin");
+            const auto cache_load_start = std::chrono::steady_clock::now();
+            cache_hit = patch_index.loadCache(cache_path, patch_surfaces, cache_key);
+            const double cache_load_elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - cache_load_start).count();
+            std::cout << "SurfacePatchIndex cache "
+                      << (cache_hit ? "hit" : "miss")
+                      << " key=" << cache_key
+                      << " time=" << cache_load_elapsed << "s"
+                      << " path=" << cache_path << std::endl;
+        }
+        if (!cache_hit) {
+            const auto rebuild_start = std::chrono::steady_clock::now();
+            patch_index.rebuild(patch_surfaces, surface_patch_bbox_pad);
+            const double rebuild_elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - rebuild_start).count();
+            std::cout << "SurfacePatchIndex rebuild time=" << rebuild_elapsed << "s" << std::endl;
+            if (surface_patch_cache && !cache_path.empty()) {
+                const auto cache_save_start = std::chrono::steady_clock::now();
+                const bool saved = patch_index.saveCache(cache_path, cache_key);
+                const double cache_save_elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - cache_save_start).count();
+                std::cout << "SurfacePatchIndex cache save "
+                          << (saved ? "ok" : "failed")
+                          << " time=" << cache_save_elapsed << "s"
+                          << " path=" << cache_path << std::endl;
+            }
+        }
         patch_index_ptr = &patch_index;
         std::cout << "SurfacePatchIndex built for " << patch_surfaces.size() << " surfaces"
-                  << (need_resume_overlap_index ? " (resume overlap discovery)" : "") << std::endl;
+                  << (need_resume_overlap_index ? " (resume overlap discovery)" : "")
+                  << " patches=" << patch_index.patchCount()
+                  << (cache_hit ? " (cache)" : "") << std::endl;
     }
 
     // In resume mode, seed may not have overlapping.json - compute overlaps dynamically
@@ -1817,9 +1808,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
             seed_surface_name = seed->meta["seed_surface_name"].get_string();
     }
 
-    int stop_gen = params.value("generations", params.value("grow_steps", 100000));
-    if (stop_gen < 1)
-        stop_gen = 1;
+    int stop_gen = 100000;
     int closing_r = 20; //FIXME dont forget to reset!
 
     // Get sliding window scale from params (set earlier from JSON)
@@ -1848,7 +1837,10 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
 
     std::cout << "starting with size " << size << " seed " << cv::Vec2i(y0,x0) << std::endl;
 
-    std::vector<cv::Vec2i> neighs = growth_dirs.neighs;
+    std::vector<cv::Vec2i> neighs = {{1,0},{0,1},{-1,0},{0,-1}};
+    if (neighbor_connectivity == 8) {
+        neighs.insert(neighs.end(), {{1,1},{1,-1},{-1,1},{-1,-1}});
+    }
 
     Fringe fringe;
     {
@@ -4007,65 +3999,30 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                               cands.empty());
         const int max_width_cells = (max_width > 0) ? static_cast<int>(max_width / step) : w;
         const int max_height_cells = (max_height > 0) ? static_cast<int>(max_height / step) : h;
-        int expand_left = 0;
         int expand_right = 0;
         int expand_top = 0;
         int expand_bottom = 0;
         if (should_expand) {
-            if (!growth_dirs.custom) {
-                if (w < max_width_cells)
-                    expand_right = std::min(sliding_w, max_width_cells - w);
-                if (h < max_height_cells) {
-                    const int available_h = max_height_cells - h;
-                    const int expand_step = std::min(sliding_w, available_h);
-                    if (fringe.atTopBorder() && fringe.atBottomBorder()) {
-                        const int top_step = std::min(expand_step, available_h / 2);
-                        expand_top = top_step;
-                        expand_bottom = std::min(expand_step, available_h - top_step);
-                    } else if (fringe.atTopBorder()) {
-                        expand_top = expand_step;
-                    } else if (fringe.atBottomBorder()) {
-                        expand_bottom = expand_step;
-                    }
-                }
-            } else {
-                const bool no_border_hint = fringe.empty();
-                if (w < max_width_cells) {
-                    const int available_w = max_width_cells - w;
-                    const int expand_step = std::min(sliding_w, available_w);
-                    const bool want_left = growth_dirs.allow_left && (no_border_hint || fringe.atLeftBorder());
-                    const bool want_right = growth_dirs.allow_right && (no_border_hint || fringe.atRightBorder());
-                    if (want_left && want_right) {
-                        expand_left = std::min(expand_step, available_w / 2);
-                        expand_right = std::min(expand_step, available_w - expand_left);
-                    } else if (want_left) {
-                        expand_left = expand_step;
-                    } else if (want_right) {
-                        expand_right = expand_step;
-                    }
-                }
-                if (h < max_height_cells) {
-                    const int available_h = max_height_cells - h;
-                    const int expand_step = std::min(sliding_w, available_h);
-                    const bool want_top = growth_dirs.allow_up && (no_border_hint || fringe.atTopBorder());
-                    const bool want_bottom = growth_dirs.allow_down && (no_border_hint || fringe.atBottomBorder());
-                    if (want_top && want_bottom) {
-                        const int top_step = std::min(expand_step, available_h / 2);
-                        expand_top = top_step;
-                        expand_bottom = std::min(expand_step, available_h - top_step);
-                    } else if (want_top) {
-                        expand_top = expand_step;
-                    } else if (want_bottom) {
-                        expand_bottom = expand_step;
-                    }
+            if (w < max_width_cells)
+                expand_right = std::min(sliding_w, max_width_cells - w);
+            if (h < max_height_cells) {
+                const int available_h = max_height_cells - h;
+                const int expand_step = std::min(sliding_w, available_h);
+                if (fringe.atTopBorder() && fringe.atBottomBorder()) {
+                    const int top_step = std::min(expand_step, available_h / 2);
+                    expand_top = top_step;
+                    expand_bottom = std::min(expand_step, available_h - top_step);
+                } else if (fringe.atTopBorder()) {
+                    expand_top = expand_step;
+                } else if (fringe.atBottomBorder()) {
+                    expand_bottom = expand_step;
                 }
             }
         }
-        if (should_expand && (expand_left > 0 || expand_right > 0 || expand_top > 0 || expand_bottom > 0)) {
+        if (should_expand && (expand_right > 0 || expand_top > 0 || expand_bottom > 0)) {
             ScopedMs expand_total_timer(timing_totals.expand_total_ms);
             fringe.clearBorderFlags();
-            std::cout << "expanding by (left=" << expand_left
-                      << ", right=" << expand_right
+            std::cout << "expanding by (right=" << expand_right
                       << ", top=" << expand_top
                       << ", bottom=" << expand_bottom << ")" << std::endl;
 
@@ -4074,16 +4031,15 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
 
             const int old_w = w;
             const int old_h = h;
-            const int x_offset = expand_left;
             const int y_offset = expand_top;
             {
                 ScopedMs timer(timing_totals.expand_resize_ms);
-                w += (expand_left + expand_right);
+                w += expand_right;
                 h += (expand_top + expand_bottom);
                 size = {w,h};
                 bounds = {0,0,w-1,h-1};
 
-                cv::Rect copy_roi(x_offset, y_offset, old_w, old_h);
+                cv::Rect copy_roi(0, y_offset, old_w, old_h);
 
                 cv::Mat_<cv::Vec3d> old_points = points;
                 points = cv::Mat_<cv::Vec3d>(size, {-1,-1,-1});
@@ -4127,15 +4083,13 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                 }
             }
 
-            if (x_offset != 0 || y_offset != 0) {
+            if (y_offset != 0) {
                 ScopedMs timer(timing_totals.expand_shift_data_ms);
-                used_area.x += x_offset;
                 used_area.y += y_offset;
                 used_area_hr = {used_area.x*step_int, used_area.y*step_int, used_area.width*step_int, used_area.height*step_int};
-                x0 += x_offset;
                 y0 += y_offset;
-                auto shift_data = [&](SurfTrackerData& d, int dx, int dy) {
-                    if (dx == 0 && dy == 0)
+                auto shift_data_y = [&](SurfTrackerData& d, int dy) {
+                    if (dy == 0)
                         return;
                     SurfTrackerData old = d;
                     d._data.clear();
@@ -4144,23 +4098,18 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                     for (auto& it : old._data) {
                         cv::Vec2i loc = it.first.second;
                         loc[0] += dy;
-                        loc[1] += dx;
                         d._data[{it.first.first, loc}] = it.second;
                     }
                     for (auto& it : old._surfs) {
                         cv::Vec2i loc = it.first;
                         loc[0] += dy;
-                        loc[1] += dx;
                         d._surfs[loc] = it.second;
                     }
                     d.seed_loc[0] += dy;
-                    d.seed_loc[1] += dx;
                 };
-                shift_data(data, x_offset, y_offset);
-                for (auto& p : force_retry) {
-                    p[1] += x_offset;
+                shift_data_y(data, y_offset);
+                for (auto& p : force_retry)
                     p[0] += y_offset;
-                }
             }
 
             {
@@ -4195,18 +4144,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
 
             {
                 ScopedMs timer(timing_totals.expand_bounds_fringe_ms);
-                if (expand_left > 0 && expand_right > 0) {
-                    active_bounds = {0, closing_r + 5, w, h - closing_r - 10};
-                    static_bounds = {0, 0, 0, h};
-                } else if (expand_left > 0) {
-                    int overlap = 5;
-                    const int active_w = std::min(w, sliding_w + 2 * closing_r + 10 + overlap);
-                    active_bounds = {0,
-                                     closing_r + 5,
-                                     active_w,
-                                     h - closing_r - 10};
-                    static_bounds = {active_w, 0, std::max(0, w - active_w), h};
-                } else if (expand_right > 0) {
+                if (expand_right > 0) {
                     int overlap = 5;
                     active_bounds = {w-sliding_w-2*closing_r-10-overlap,
                                      closing_r+5,
@@ -4216,7 +4154,6 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                 } else {
                     active_bounds.y = closing_r+5;
                     active_bounds.height = h - closing_r - 10;
-                    active_bounds.width = std::min(active_bounds.width, w - active_bounds.x);
                     static_bounds.height = h;
                 }
 

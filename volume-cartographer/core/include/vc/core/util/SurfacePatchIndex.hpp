@@ -2,9 +2,11 @@
 
 #include <array>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -50,6 +52,14 @@ public:
     SurfacePatchIndex& operator=(const SurfacePatchIndex&) = delete;
 
     void rebuild(const std::vector<SurfacePtr>& surfaces, float bboxPadding = 0.0f);
+    static std::string cacheKeyForSurfaces(const std::vector<SurfacePtr>& surfaces,
+                                           int samplingStride,
+                                           float bboxPadding);
+    bool loadCache(const std::filesystem::path& cachePath,
+                   const std::vector<SurfacePtr>& surfaces,
+                   const std::string& expectedKey);
+    bool saveCache(const std::filesystem::path& cachePath,
+                   const std::string& cacheKey) const;
     void clear();
     bool empty() const;
     size_t patchCount() const;

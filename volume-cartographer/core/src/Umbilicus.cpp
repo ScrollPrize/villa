@@ -120,6 +120,14 @@ Umbilicus::SeamDirection Umbilicus::seam_direction() const
     return *seam_direction_hint_;
 }
 
+cv::Vec2f Umbilicus::seam_direction_xy() const
+{
+    if (!seam_direction_xy_) {
+        throw std::logic_error("Umbilicus seam direction requested before being set");
+    }
+    return *seam_direction_xy_;
+}
+
 std::pair<cv::Vec3f, cv::Vec3f> Umbilicus::seam_segment(int z_index) const
 {
     if (!seam_direction_xy_) {
@@ -269,8 +277,14 @@ std::vector<cv::Vec3f> Umbilicus::LoadJsonFile(const std::filesystem::path& path
             throw std::runtime_error("'points' member in umbilicus json must be an array");
         }
         array = &candidate;
+    } else if (document.contains("control_points")) {
+        const auto& candidate = document.at("control_points");
+        if (!candidate.is_array()) {
+            throw std::runtime_error("'control_points' member in umbilicus json must be an array");
+        }
+        array = &candidate;
     } else {
-        throw std::runtime_error("Umbilicus json root must be an array or contain a 'points' array");
+        throw std::runtime_error("Umbilicus json root must be an array or contain a 'points' or 'control_points' array");
     }
 
     std::vector<cv::Vec3f> points;

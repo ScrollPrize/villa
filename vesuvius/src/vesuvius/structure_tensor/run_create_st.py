@@ -117,6 +117,7 @@ def create_shared_output_store(args, input_shape, patch_size):
         root_store.attrs['overlap'] = args.overlap
         root_store.attrs['sigma'] = args.sigma
         root_store.attrs['smooth_components'] = args.smooth_components
+        root_store.attrs['do_sdt'] = args.do_sdt
         root_store.attrs['original_volume_shape'] = original_volume_shape
     except Exception as e:
         print(f"Warning: Failed to write custom attributes: {e}")
@@ -153,6 +154,8 @@ def run_structure_tensor_part(args, part_id, gpu_id, shared_output_path):
     cmd.extend(['--sigma', str(args.sigma)])
     if args.smooth_components:
         cmd.append('--smooth-components')
+    if args.do_sdt:
+        cmd.append('--do-sdt')
     if args.structure_tensor_only:
         cmd.append('--structure-tensor-only')
     if args.volume is not None:
@@ -204,7 +207,15 @@ def run_structure_tensor_part(args, part_id, gpu_id, shared_output_path):
     return rc == 0
 
 
-def run_eigenanalysis(zarr_path, chunk_size, compressor, verbose, swap_eigenvectors, num_workers):
+def run_eigenanalysis(
+    zarr_path,
+    chunk_size,
+    compressor,
+    verbose,
+    swap_eigenvectors,
+    num_workers,
+    umbilicus_json=None,
+):
     """Run eigenanalysis directly (no subprocess) to avoid duplicate prints."""
     from vesuvius.structure_tensor.create_st import _finalize_structure_tensor_torch
     print("\n--- Running Eigenanalysis ---")
@@ -225,6 +236,7 @@ def run_eigenanalysis(zarr_path, chunk_size, compressor, verbose, swap_eigenvect
         ome_scale=getattr(run_eigenanalysis, "_ome_scale", "0"),
         confidence_metric=getattr(run_eigenanalysis, "_confidence_metric", "fa"),
         keep_eigen=getattr(run_eigenanalysis, "_keep_eigen", False),
+        umbilicus_json=umbilicus_json,
     )
     print("Eigenanalysis completed successfully")
     return True
@@ -273,6 +285,8 @@ def parse_arguments():
                         help='After computing Jxx...Jzz, apply a second Gaussian smoothing to each channel')
     parser.add_argument('--volume', type=int, default=None,
                         help='Volume ID for fiber-volume masking')
+    parser.add_argument('--do-sdt', action='store_true',
+                        help='Convert binary prediction patches to signed distance transforms before computing the structure tensor')
     
     # Patch processing arguments
     parser.add_argument('--patch_size', type=str, default=None, 
@@ -308,6 +322,8 @@ def parse_arguments():
                         help='Confidence scalar to export (default: fa).')
     parser.add_argument('--keep-eigen', action='store_true',
                         help='Also write float32 eigenvectors/eigenvalues arrays.')
+    parser.add_argument('--umbilicus-json', type=str, default=None,
+                        help='JSON file with umbilicus control_points; when provided, orient normals toward the interpolated umbilicus.')
 
     # Multi-GPU arguments
     parser.add_argument('--gpus', type=str, default='all',
@@ -378,7 +394,8 @@ def main():
             compressor=compressor,
             verbose=args.verbose,
             swap_eigenvectors=args.swap_eigenvectors,
-            num_workers=args.num_workers
+            num_workers=args.num_workers,
+            umbilicus_json=args.umbilicus_json,
         )
         
         if success:
@@ -527,6 +544,7 @@ def main():
             verbose=args.verbose,
             swap_eigenvectors=args.swap_eigenvectors,
             num_workers=args.num_workers,
+            umbilicus_json=args.umbilicus_json,
         )
         if not ok:
             return 1
