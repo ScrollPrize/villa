@@ -1031,9 +1031,13 @@ class AutoregMeshDataset(Dataset):
         if not available_buckets:
             return None
         weight_cfg = _normalize_prefilter_sampling_weights(dict(self.config.get("prefilter_difficulty_sampling_weights", {})))
-        bucket_weights = np.asarray([float(weight_cfg[bucket]) for bucket in available_buckets], dtype=np.float64)
-        bucket_weights = bucket_weights / np.maximum(bucket_weights.sum(), 1e-8)
-        chosen_bucket = random.choices(available_buckets, weights=bucket_weights.tolist(), k=1)[0]
+        weighted_buckets = [bucket for bucket in available_buckets if float(weight_cfg.get(bucket, 0.0)) > 0.0]
+        if weighted_buckets:
+            bucket_weights = np.asarray([float(weight_cfg[bucket]) for bucket in weighted_buckets], dtype=np.float64)
+            bucket_weights = bucket_weights / np.maximum(bucket_weights.sum(), 1e-8)
+            chosen_bucket = random.choices(weighted_buckets, weights=bucket_weights.tolist(), k=1)[0]
+        else:
+            chosen_bucket = random.choice(available_buckets)
         split_plan = random.choice(plans_by_bucket[chosen_bucket])
         use_stored_surface = bool(split_plan["use_stored_surface"])
         effective_surface_downsample_factor = split_plan["effective_surface_downsample_factor"]

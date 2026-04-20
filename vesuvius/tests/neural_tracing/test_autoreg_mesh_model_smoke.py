@@ -2220,6 +2220,61 @@ def test_build_example_prefers_selected_difficulty_bucket(monkeypatch: pytest.Mo
     assert example["prompt_meta"]["frontier_band_width"] == 12
 
 
+def test_build_example_falls_back_when_only_zero_weight_buckets_are_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vesuvius.neural_tracing.autoreg_mesh.dataset import AutoregMeshDataset
+
+    dataset = AutoregMeshDataset.__new__(AutoregMeshDataset)
+    dataset.config = validate_autoreg_mesh_config(_make_cached_token_config())
+    dataset.config["prefilter_difficulty_sampling_weights"] = {"easy": 1.0, "medium": 0.0, "hard": 0.0}
+    dataset.apply_spatial_augmentation = False
+    dataset.apply_volume_only_augmentation = False
+    dataset.crop_size = (16, 16, 16)
+    dataset.sample_index = [(0, 0)]
+    dataset._base_dataset = SimpleNamespace()
+    dataset.patches = [SimpleNamespace(world_bbox=(0.0, 16.0, 0.0, 16.0, 0.0, 16.0), wraps=[{"segment": SimpleNamespace(_scale=None), "bbox_2d": (0, 0, 1, 1), "wrap_id": 0, "segment_idx": 0}])]
+    dataset._valid_split_plans = {
+        (0, 0): (
+            {
+                "direction": "left",
+                "conditioning_count": 2,
+                "conditioning_percent": 0.5,
+                "use_stored_surface": False,
+                "effective_surface_downsample_factor": 1,
+                "difficulty_bucket": "hard",
+                "valid_prompt_widths_clean": [],
+                "valid_prompt_widths_ragged": [12],
+            },
+        )
+    }
+    dataset._extract_surface_for_plan = lambda patch, wrap, use_stored_surface=False: _make_surface(4, 4, z_offset=4.0, y_offset=2.0, x_offset=3.0)
+    monkeypatch.setattr(
+        "vesuvius.neural_tracing.autoreg_mesh.dataset.create_split_conditioning_from_surface_grid",
+        lambda *args, **kwargs: {
+            "wrap": {"segment": SimpleNamespace(uuid="seg"), "bbox_2d": (0, 0, 1, 1), "wrap_id": 0, "segment_idx": 0},
+            "cond_direction": kwargs["cond_direction"],
+            "cond_zyxs_unperturbed": _make_surface(4, 2, z_offset=4.0, y_offset=2.0, x_offset=3.0),
+            "masked_zyxs": _make_surface(4, 2, z_offset=6.0, y_offset=2.0, x_offset=7.0),
+            "min_corner": np.zeros(3, dtype=np.int64),
+            "max_corner": np.asarray(dataset.crop_size, dtype=np.int64),
+        },
+    )
+    monkeypatch.setattr(
+        "vesuvius.neural_tracing.autoreg_mesh.dataset._read_volume_crop_from_patch",
+        lambda patch, crop_size, min_corner, max_corner: np.zeros(crop_size, dtype=np.float32),
+    )
+    monkeypatch.setattr("random.choice", lambda values: values[0])
+    monkeypatch.setattr(
+        "random.choices",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("weighted sampling should be skipped")),
+    )
+
+    example = dataset._build_example(0)
+
+    assert example is not None
+    assert example["prompt_meta"]["difficulty_bucket"] == "hard"
+    assert example["prompt_meta"]["frontier_band_width"] == 12
+
+
 def test_export_patch_metadata_preserves_prefilter_plan_metadata() -> None:
     from vesuvius.neural_tracing.autoreg_mesh.dataset import AutoregMeshDataset
 
