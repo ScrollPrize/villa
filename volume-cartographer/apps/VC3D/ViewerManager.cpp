@@ -481,37 +481,34 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
         _surfacePatchIndex.clear();
         _indexedSurfaceIds.clear();
         _surfacePatchIndexNeedsRebuild = false;
+        _surfacePatchStrideTiered = false;
+        _targetRefinedStride = 0;
         return;
     }
 
-    // Apply tiered default stride based on surface count (if not user-set)
+    // Apply tiered default stride only on the first prime per surface set.
+    // Subsequent primes (refinement step, edits) preserve the current stride
+    // and the (possibly already-consumed) refinement target. Without this
+    // gate the refinement loop ping-pongs between defaultStride and 1
+    // forever and the index is constantly torn down.
     const size_t surfaceCount = quadSurfaces.size();
-    _targetRefinedStride = 0;  // Reset refinement target
-
-    if (!_surfacePatchStrideUserSet) {
-        // TODO: re-enable finer strides (2, and eventually 1) once
-        // SurfacePatchIndex rebuild + rtree mutation are cheap enough that
-        // the higher entry count doesn't stall the GUI. Right now 4 is the
-        // floor across every tier — lower strides produce millions of
-        // entries on 2K² surfaces for no visible win in intersection
-        // drawing.
+    if (!_surfacePatchStrideUserSet && !_surfacePatchStrideTiered) {
+        // Coarse stride first for fast initial display, then refine all
+        // the way down to stride 1 in one async step.
         int defaultStride;
         if (surfaceCount > 2500) {
             defaultStride = 32;
-            _targetRefinedStride = 16;
         } else if (surfaceCount >= 500) {
             defaultStride = 16;
-            _targetRefinedStride = 8;
         } else if (surfaceCount >= 100) {
             defaultStride = 8;
-            _targetRefinedStride = 4;
         } else if (surfaceCount >= 30) {
             defaultStride = 4;
-            _targetRefinedStride = 4;
         } else {
-            defaultStride = 4;
-            _targetRefinedStride = 4;
+            defaultStride = 2;
         }
+        _targetRefinedStride = 1;
+        _surfacePatchStrideTiered = true;
         setSurfacePatchSamplingStride(defaultStride, false);
     }
 
