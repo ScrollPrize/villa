@@ -106,6 +106,7 @@
 #include "SurfaceAreaCalculator.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "LasagnaServiceManager.hpp"
+#include "segmentation/panels/SegmentationLasagnaPanel.hpp"
 #include "vc/core/Version.hpp"
 
 #include "vc/core/util/Logging.hpp"
@@ -874,6 +875,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     }
     // Ensure right-side tabified docks have a usable minimum size
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
+                               _lasagnaDock,
                                ui.dockWidgetDistanceTransform,
                                ui.dockWidgetDrawing }) {
         if (dock) {
@@ -889,6 +891,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     }
 
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
+                               _lasagnaDock,
                                ui.dockWidgetDistanceTransform,
                                ui.dockWidgetDrawing,
                                ui.dockWidgetVolumes,
@@ -2677,6 +2680,15 @@ void CWindow::CreateWidgets(void)
     _segmentationWidget->setNormalGridPathHint(initialHint);
     attachScrollAreaToDock(ui.dockWidgetSegmentation, _segmentationWidget, QStringLiteral("dockWidgetSegmentationContent"));
 
+    // Create Lasagna dock from the panel already constructed by SegmentationWidget
+    {
+        auto* panel = _segmentationWidget->lasagnaPanel();
+        panel->setVisible(true);
+        _lasagnaDock = new QDockWidget(tr("Lasagna Model"), this);
+        _lasagnaDock->setObjectName(QStringLiteral("dockWidgetLasagna"));
+        attachScrollAreaToDock(_lasagnaDock, panel, QStringLiteral("dockWidgetLasagnaContent"));
+        addDockWidget(Qt::RightDockWidgetArea, _lasagnaDock);
+    }
 
     _segmentationEdit = std::make_unique<SegmentationEditManager>(this);
     _segmentationEdit->setViewerManager(_viewerManager.get());
@@ -3143,7 +3155,8 @@ void CWindow::CreateWidgets(void)
     connect(_point_collection_widget, &CPointCollectionWidget::convertPointToAnchorRequested, this, &CWindow::onConvertPointToAnchor);
     connect(_point_collection_widget, &CPointCollectionWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
 
-    // Tab the docks - keep Segmentation, Seeding, Point Collections, and Drawing together
+    // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, and Drawing together
+    tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
     tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDrawing);

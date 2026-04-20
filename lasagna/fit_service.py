@@ -6,7 +6,7 @@ Start with:
 Endpoints:
     GET  /health          -> {"status": "ok"}
     GET  /status          -> current job state
-    GET  /datasets        -> available .zarr datasets from --data-dir
+    GET  /datasets        -> available .lasagna.json datasets from --data-dir
     POST /optimize        -> start an optimization job (JSON body)
     POST /stop            -> request cancellation of the running job
     POST /export_vis      -> export multi-layer OBJ visualization (JSON body)
@@ -31,6 +31,7 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 _data_dir: str | None = None  # Set via --data-dir CLI flag
+_gpu_pause_enabled: bool = True  # Set via --no-gpu-pause CLI flag
 
 
 # ---------------------------------------------------------------------------
@@ -42,7 +43,7 @@ _announce_file: Path | None = None
 
 
 def _list_datasets() -> list[dict[str, str]]:
-    """Return available .lasagna.json and .zarr datasets from _data_dir."""
+    """Return available .lasagna.json datasets from _data_dir."""
     if not _data_dir:
         return []
     data_path = Path(_data_dir)
@@ -51,8 +52,6 @@ def _list_datasets() -> list[dict[str, str]]:
     datasets = []
     for entry in sorted(data_path.iterdir()):
         if entry.is_file() and entry.name.endswith(".lasagna.json"):
-            datasets.append({"name": entry.name, "path": str(entry.resolve())})
-        elif entry.is_dir() and entry.name.endswith(".zarr"):
             datasets.append({"name": entry.name, "path": str(entry.resolve())})
     return datasets
 
@@ -357,11 +356,11 @@ def _run_optimization(body: dict[str, Any]) -> None:
             kwargs["progress_fn"] = _wrapped_progress
             return _orig_optimize(**kwargs)
 
-        # Pause training if running (free GPU for optimization)
+        from contextlib import nullcontext
         from gpu_pause import gpu_pause_context
 
         opt_mod.optimize = _patched_optimize
-        with gpu_pause_context():
+        with (gpu_pause_context() if _gpu_pause_enabled else nullcontext()):
             try:
                 import fit as fit_mod
                 _job.set_running("loading", 0, 0, 0.0)
@@ -553,8 +552,9 @@ class _Handler(BaseHTTPRequestHandler):
                         data_input = str(candidate)
 
             import lasagna_analyze
+            from contextlib import nullcontext
             from gpu_pause import gpu_pause_context
-            with gpu_pause_context():
+            with (gpu_pause_context() if _gpu_pause_enabled else nullcontext()):
                 lasagna_analyze.export_vis_obj(
                     model_path=str(model_input),
                     data_path=str(data_input),
@@ -607,17 +607,21 @@ class _Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    global _data_dir
+    global _data_dir, _gpu_pause_enabled
 
     p = argparse.ArgumentParser(description="Fit optimizer HTTP service for VC3D")
     p.add_argument("--port", type=int, default=0, help="Port (0 = auto-select)")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--data-dir", default=None,
-                   help="Directory containing .zarr datasets")
+                   help="Directory containing .lasagna.json datasets")
+    p.add_argument("--no-gpu-pause", action="store_true", default=False,
+                   help="Disable automatic GPU pause/resume of training")
     args = p.parse_args()
 
     if args.data_dir:
         _data_dir = str(Path(args.data_dir).resolve())
+    if args.no_gpu_pause:
+        _gpu_pause_enabled = False
 
     server = HTTPServer((args.host, args.port), _Handler)
     actual_port = server.server_address[1]
