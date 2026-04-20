@@ -13,6 +13,7 @@ transform checksum) tuple and cached on disk.
 
 from __future__ import annotations
 
+import atexit
 import hashlib
 import json
 import logging
@@ -116,26 +117,35 @@ class CrossFrameZarrDataset(Dataset):
             int(v) for v in ds_cfg.get("patch_stride", self.patch_size)
         )
 
-        self._image_array = _resolve_zarr_array(
+        # Zarr handles are opened lazily per-process (see
+        # ``_ensure_process_local_handles``). An fsspec/s3fs session pickled
+        # into a DataLoader worker does not survive fork/spawn cleanly, which
+        # is why dinovol uses the same per-PID reopen pattern.
+        self._image_array: Optional[zarr.Array] = None
+        self._labels_array: Optional[zarr.Array] = None
+        self._scan_array: Optional[zarr.Array] = None
+        self._handle_pid: Optional[int] = None
+        self._atexit_pid: Optional[int] = None
+
+        # Shape metadata is read once in the parent process so the patch index
+        # build doesn't have to hit the network (for S3 URLs) or disk (for local).
+        image_probe = _resolve_zarr_array(
             _open_zarr_any(self.image_zarr_url, self.storage_options_image)
         )
-        self._labels_array = _resolve_zarr_array(
+        labels_probe = _resolve_zarr_array(
             _open_zarr_any(self.labels_zarr_url, self.storage_options_labels)
         )
-        self._image_shape = tuple(int(v) for v in self._image_array.shape[-3:])
-        self._labels_shape = tuple(int(v) for v in self._labels_array.shape[-3:])
+        self._image_shape = tuple(int(v) for v in image_probe.shape[-3:])
+        self._labels_shape = tuple(int(v) for v in labels_probe.shape[-3:])
+        del image_probe, labels_probe
 
-        # Optional coarser OME-Zarr level used to speed up the FG scan over remote
-        # zarrs. The coarser array is opened by stripping the trailing ``/<n>``
-        # from ``labels_zarr_url`` (if present) and appending the requested level.
         raw_scan_level = ds_cfg.get("labels_scan_level")
         self._scan_level: Optional[int] = (
             int(raw_scan_level) if raw_scan_level is not None else None
         )
-        self._scan_array: Optional[zarr.Array] = None
         self._scan_factor: Tuple[int, int, int] = (1, 1, 1)
         if self._scan_level is not None:
-            self._scan_array, self._scan_factor = self._open_scan_array(self._scan_level)
+            self._scan_factor = self._compute_scan_factor(self._scan_level)
 
         self._transform_doc = affine.read_transform_json(self.transform_json_url)
         self._matrix_xyz = self._transform_doc.matrix_xyz
@@ -199,20 +209,18 @@ class CrossFrameZarrDataset(Dataset):
         )
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
 
-    def _open_scan_array(self, level: int) -> Tuple[zarr.Array, Tuple[int, int, int]]:
-        """Open the given OME-Zarr level under the labels URL's parent group.
-
-        Returns the array plus the per-axis downsample factor relative to
-        ``self._labels_array``. Level arrays are expected to share chunking
-        with ``labels_zarr_url`` (128^3 in this codebase).
-        """
+    def _scan_url(self, level: int) -> str:
+        """URL of the OME-Zarr level used for the FG scan."""
         base_url = self.labels_zarr_url.rstrip("/")
         # Strip trailing ``/<digit>`` so ``<base>/0`` -> ``<base>``.
         last = base_url.rsplit("/", 1)[-1]
         parent = base_url.rsplit("/", 1)[0] if last.isdigit() else base_url
-        scan_url = f"{parent}/{level}"
+        return f"{parent}/{level}"
+
+    def _compute_scan_factor(self, level: int) -> Tuple[int, int, int]:
+        """Probe the scan level once to compute the downsample factor."""
         scan = _resolve_zarr_array(
-            _open_zarr_any(scan_url, self.storage_options_labels)
+            _open_zarr_any(self._scan_url(level), self.storage_options_labels)
         )
         scan_shape = tuple(int(v) for v in scan.shape[-3:])
         factor = tuple(
@@ -220,10 +228,50 @@ class CrossFrameZarrDataset(Dataset):
             for full, s in zip(self._labels_shape, scan_shape)
         )
         logger.info(
-            "CrossFrameZarrDataset: scanning FG at level %d (%s, factor=%s)",
-            level, scan_url, factor,
+            "CrossFrameZarrDataset: will scan FG at level %d (%s, factor=%s)",
+            level, self._scan_url(level), factor,
         )
-        return scan, factor
+        return factor
+
+    # ------------------------------------------------- per-process handles --
+
+    def __getstate__(self) -> dict:
+        """Strip live zarr handles before pickling into DataLoader workers.
+
+        fsspec-backed stores (S3, HTTPS) keep asyncio loops and aiohttp
+        sessions that do not survive fork/spawn. Re-open them in the worker.
+        """
+        state = self.__dict__.copy()
+        state["_image_array"] = None
+        state["_labels_array"] = None
+        state["_scan_array"] = None
+        state["_handle_pid"] = None
+        state["_atexit_pid"] = None
+        return state
+
+    def _ensure_process_local_handles(self) -> None:
+        pid = os.getpid()
+        if self._handle_pid == pid and self._image_array is not None:
+            return
+        self._image_array = _resolve_zarr_array(
+            _open_zarr_any(self.image_zarr_url, self.storage_options_image)
+        )
+        self._labels_array = _resolve_zarr_array(
+            _open_zarr_any(self.labels_zarr_url, self.storage_options_labels)
+        )
+        if self._scan_level is not None:
+            self._scan_array = _resolve_zarr_array(
+                _open_zarr_any(self._scan_url(self._scan_level), self.storage_options_labels)
+            )
+        self._handle_pid = pid
+        if self._atexit_pid != pid:
+            atexit.register(self._close_handles)
+            self._atexit_pid = pid
+
+    def _close_handles(self) -> None:
+        self._image_array = None
+        self._labels_array = None
+        self._scan_array = None
 
     def _cache_path(self) -> Optional[Path]:
         if self.cache_dir is None:
@@ -264,6 +312,7 @@ class CrossFrameZarrDataset(Dataset):
             logger.info("Loaded %d patches from cache", len(self._patches))
             return
 
+        self._ensure_process_local_handles()
         positions = self._scan_foreground_positions()
         if not positions:
             raise RuntimeError(
@@ -272,9 +321,12 @@ class CrossFrameZarrDataset(Dataset):
             )
         self._patches = positions
         self._save_cache(np.asarray(positions, dtype=np.int64))
+        # Release handles after the main-process scan so the DataLoader
+        # workers don't inherit a live fsspec session via spawn pickling.
+        self._close_handles()
 
     def _scan_foreground_positions(self) -> List[Tuple[int, int, int]]:
-        if self._scan_array is not None:
+        if self._scan_level is not None:
             return self._scan_foreground_positions_coarse()
         return self._scan_foreground_positions_full()
 
@@ -384,6 +436,7 @@ class CrossFrameZarrDataset(Dataset):
         return len(self._patches)
 
     def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        self._ensure_process_local_handles()
         pos = self._patches[index]
         ps = self.patch_size
 
