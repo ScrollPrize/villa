@@ -741,14 +741,6 @@ def _geometry_sd_weight_active(cfg: dict, *, global_step: int) -> float:
     return float(cfg.get("geometry_sd_weight", 0.0))
 
 
-def _joint_valid_aux_loss_weight_active(cfg: dict, *, global_step: int) -> float:
-    if not bool(cfg.get("joint_valid_aux_loss_enabled", False)):
-        return 0.0
-    if int(global_step) < int(cfg.get("joint_valid_aux_loss_start_step", 0)):
-        return 0.0
-    return float(cfg.get("joint_valid_aux_loss_weight", 0.0))
-
-
 def _offset_loss_weight_active(cfg: dict, *, global_step: int) -> float:
     start = int(cfg.get("offset_loss_start_step", 0))
     if int(global_step) < start:
@@ -1247,7 +1239,6 @@ def _evaluate_validation(
                 distance_aware_coarse_target_radius=int(cfg.get("distance_aware_coarse_target_radius", 1)),
                 distance_aware_coarse_target_sigma=float(cfg.get("distance_aware_coarse_target_sigma", 1.0)),
                 distance_aware_coarse_target_loss=str(cfg.get("distance_aware_coarse_target_loss", "soft_ce")),
-                joint_valid_aux_loss_weight_active=_joint_valid_aux_loss_weight_active(cfg, global_step=global_step),
                 distance_aware_offset_targets_enabled=bool(cfg.get("distance_aware_offset_targets_enabled", False)),
                 distance_aware_offset_target_radius=int(cfg.get("distance_aware_offset_target_radius", 1)),
                 distance_aware_offset_target_sigma=float(cfg.get("distance_aware_offset_target_sigma", 0.75)),
@@ -1428,7 +1419,6 @@ def run_autoreg_mesh_training(
             boundary_loss_weight_active = _boundary_loss_weight_active(cfg, global_step=global_step)
             geometry_metric_weight_active = _geometry_metric_weight_active(cfg, global_step=global_step)
             geometry_sd_weight_active = _geometry_sd_weight_active(cfg, global_step=global_step)
-            joint_valid_aux_loss_weight_active = _joint_valid_aux_loss_weight_active(cfg, global_step=global_step)
             offset_feedback_enabled, refine_feedback_enabled = _scheduled_sampling_feedback_state(cfg, global_step=global_step)
             with torch.autocast(device_type=runtime.device.type, dtype=amp_dtype, enabled=amp_enabled):
                 outputs = train_model(
@@ -1461,7 +1451,6 @@ def run_autoreg_mesh_training(
                     distance_aware_coarse_target_radius=int(cfg.get("distance_aware_coarse_target_radius", 1)),
                     distance_aware_coarse_target_sigma=float(cfg.get("distance_aware_coarse_target_sigma", 1.0)),
                     distance_aware_coarse_target_loss=str(cfg.get("distance_aware_coarse_target_loss", "soft_ce")),
-                    joint_valid_aux_loss_weight_active=joint_valid_aux_loss_weight_active,
                     distance_aware_offset_targets_enabled=bool(cfg.get("distance_aware_offset_targets_enabled", False)),
                     distance_aware_offset_target_radius=int(cfg.get("distance_aware_offset_target_radius", 1)),
                     distance_aware_offset_target_sigma=float(cfg.get("distance_aware_offset_target_sigma", 0.75)),
@@ -1494,7 +1483,6 @@ def run_autoreg_mesh_training(
             metrics["boundary_loss_weight_active"] = float(boundary_loss_weight_active)
             metrics["geometry_metric_weight_active"] = float(geometry_metric_weight_active)
             metrics["geometry_sd_weight_active"] = float(geometry_sd_weight_active)
-            metrics["joint_valid_aux_loss_weight_active"] = float(joint_valid_aux_loss_weight_active)
             metrics["step"] = float(global_step)
             metrics.update(_mean_batch_sample_metrics(batch, prefix="train_"))
             metrics.update(split_diagnostics)

@@ -135,9 +135,6 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "distance_aware_offset_targets_enabled": False,
     "distance_aware_offset_target_radius": 1,
     "distance_aware_offset_target_sigma": 0.75,
-    "joint_valid_aux_loss_enabled": False,
-    "joint_valid_aux_loss_weight": 0.25,
-    "joint_valid_aux_loss_start_step": 0,
     "coarse_continuation_constraint_enabled": True,
     "coarse_continuation_constraint_mode": "hard_mask",
     "coarse_continuation_forward_scale": 4.0,
@@ -357,12 +354,6 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("distance_aware_offset_target_radius must be >= 0")
     if float(cfg["distance_aware_offset_target_sigma"]) <= 0.0:
         raise ValueError("distance_aware_offset_target_sigma must be > 0")
-    if not isinstance(cfg.get("joint_valid_aux_loss_enabled"), bool):
-        raise ValueError("joint_valid_aux_loss_enabled must be a boolean")
-    if float(cfg["joint_valid_aux_loss_weight"]) < 0.0:
-        raise ValueError("joint_valid_aux_loss_weight must be non-negative")
-    if int(cfg["joint_valid_aux_loss_start_step"]) < 0:
-        raise ValueError("joint_valid_aux_loss_start_step must be >= 0")
     if not isinstance(cfg.get("coarse_continuation_constraint_enabled"), bool):
         raise ValueError("coarse_continuation_constraint_enabled must be a boolean")
     if str(cfg["coarse_continuation_constraint_mode"]) != "hard_mask":

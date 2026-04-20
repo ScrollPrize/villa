@@ -89,11 +89,6 @@
   "distance_aware_coarse_target_sigma": 0.66,
   "distance_aware_coarse_target_loss": "soft_ce",
 
-  "_comment_joint": "Joint-valid aux loss from step 4k. Helps Muon's fast coarse convergence also respect joint validity.",
-  "joint_valid_aux_loss_enabled": true,
-  "joint_valid_aux_loss_weight": 0.25,
-  "joint_valid_aux_loss_start_step": 4000,
-
   "mixed_precision": "bf16",
 
   "batch_size": 32,

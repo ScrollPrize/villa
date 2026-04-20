@@ -217,48 +217,6 @@ def _factorized_coarse_pointer_loss(
     return coarse_loss, coarse_target_entropy, axis_losses
 
 
-def _factorized_joint_valid_coarse_loss(
-    outputs: dict,
-    batch: dict,
-    *,
-    distance_aware_radius: int,
-    distance_aware_sigma: float,
-) -> Tensor:
-    axis_logits = outputs.get("coarse_axis_logits")
-    if axis_logits is None:
-        return batch["target_xyz"].new_zeros(())
-    coarse_grid_shape = tuple(int(v) for v in outputs["coarse_grid_shape"])
-    gz, gy, gx = coarse_grid_shape
-    z_logits = axis_logits["z"]
-    y_logits = axis_logits["y"]
-    x_logits = axis_logits["x"]
-    joint_logits = (
-        z_logits[..., :, None, None]
-        + y_logits[..., None, :, None]
-        + x_logits[..., None, None, :]
-    ).reshape(*z_logits.shape[:2], gz * gy * gx)
-    constraint_mask = outputs.get("coarse_constraint_joint_valid_mask")
-    if constraint_mask is not None:
-        joint_logits = joint_logits.masked_fill(~constraint_mask.to(torch.bool), torch.finfo(joint_logits.dtype).min)
-    supervision_mask = batch["target_supervision_mask"]
-    neighbor_ids, target_probs = _build_distance_aware_coarse_targets(
-        batch["target_coarse_ids"],
-        supervision_mask,
-        coarse_grid_shape=coarse_grid_shape,
-        radius=int(distance_aware_radius),
-        sigma=float(distance_aware_sigma),
-    )
-    if constraint_mask is not None:
-        neighbor_allowed = torch.gather(constraint_mask.to(torch.bool), dim=-1, index=neighbor_ids)
-        target_probs = torch.where(neighbor_allowed, target_probs, torch.zeros_like(target_probs))
-        target_probs = target_probs / target_probs.sum(dim=-1, keepdim=True).clamp(min=1e-8)
-    log_probs = F.log_softmax(joint_logits.float(), dim=-1)
-    gathered_log_probs = torch.gather(log_probs, dim=-1, index=neighbor_ids)
-    gathered_log_probs = torch.where(target_probs > 0, gathered_log_probs, torch.zeros_like(gathered_log_probs))
-    per_token_loss = -(target_probs * gathered_log_probs).sum(dim=-1)
-    return _masked_mean(per_token_loss, supervision_mask)
-
-
 def _coarse_accuracy_metrics(outputs: dict, batch: dict) -> dict[str, Tensor]:
     if "pred_coarse_ids" not in outputs:
         zeros = batch["target_xyz"].new_zeros(())
@@ -972,7 +930,6 @@ def compute_autoreg_mesh_losses(
     distance_aware_coarse_target_radius: int = 1,
     distance_aware_coarse_target_sigma: float = 1.0,
     distance_aware_coarse_target_loss: str = "soft_ce",
-    joint_valid_aux_loss_weight_active: float = 0.0,
     distance_aware_offset_targets_enabled: bool = False,
     distance_aware_offset_target_radius: int = 1,
     distance_aware_offset_target_sigma: float = 0.75,
@@ -1001,14 +958,6 @@ def compute_autoreg_mesh_losses(
             distance_aware_sigma=distance_aware_coarse_target_sigma,
             distance_aware_loss_type=distance_aware_coarse_target_loss,
     )
-    joint_valid_aux_loss = batch["target_xyz"].new_zeros(())
-    if coarse_prediction_mode == "axis_factorized" and float(joint_valid_aux_loss_weight_active) > 0.0:
-        joint_valid_aux_loss = _factorized_joint_valid_coarse_loss(
-            outputs,
-            batch,
-            distance_aware_radius=int(distance_aware_coarse_target_radius),
-            distance_aware_sigma=float(distance_aware_coarse_target_sigma),
-        )
     offset_loss = _offset_bin_loss(
         outputs, batch, offset_num_bins=offset_num_bins,
         distance_aware_enabled=bool(distance_aware_offset_targets_enabled),
@@ -1017,8 +966,6 @@ def compute_autoreg_mesh_losses(
     )
     stop_loss = _stop_loss(outputs, batch)
     total_loss = coarse_loss + float(offset_loss_weight_active) * offset_loss + stop_loss
-    if float(joint_valid_aux_loss_weight_active) > 0.0:
-        total_loss = total_loss + float(joint_valid_aux_loss_weight_active) * joint_valid_aux_loss
     coarse_excess_nll = coarse_loss - coarse_target_entropy
     include_refine_residual = float(position_refine_weight_active) > 0.0
     soft_xyz_for_loss = _soft_geometry_xyz(outputs, include_refine_residual=include_refine_residual)
@@ -1100,8 +1047,6 @@ def compute_autoreg_mesh_losses(
     return {
         "loss": total_loss,
         "coarse_loss": coarse_loss,
-        "joint_valid_aux_loss": joint_valid_aux_loss,
-        "joint_valid_aux_loss_weight_active": total_loss.new_tensor(float(joint_valid_aux_loss_weight_active)),
         "coarse_target_entropy": coarse_target_entropy,
         "coarse_excess_nll": coarse_excess_nll,
         "coarse_z_loss": axis_loss_metrics["z"],

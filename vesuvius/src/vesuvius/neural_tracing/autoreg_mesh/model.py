@@ -832,23 +832,10 @@ class AutoregMeshModel(nn.Module):
                 z_logits = z_logits.masked_fill(~z_valid, torch.finfo(z_logits.dtype).min)
                 y_logits = y_logits.masked_fill(~y_valid, torch.finfo(y_logits.dtype).min)
                 x_logits = x_logits.masked_fill(~x_valid, torch.finfo(x_logits.dtype).min)
-            gz, gy, gx = self.coarse_grid_shape
-            joint = (
-                z_logits[..., :, None, None]
-                + y_logits[..., None, :, None]
-                + x_logits[..., None, None, :]
-            )
-            if coarse_valid_mask is not None:
-                joint = joint.masked_fill(
-                    ~coarse_valid_mask.view(*joint.shape[:2], gz, gy, gx),
-                    torch.finfo(joint.dtype).min,
-                )
-            flat = joint.reshape(*joint.shape[:2], -1).argmax(dim=-1)
-        z_ids = flat // (gy * gx)
-        rem = flat % (gy * gx)
-        y_ids = rem // gx
-        x_ids = rem % gx
-        pred_coarse_ids = flat
+        z_ids = z_logits.argmax(dim=-1)
+        y_ids = y_logits.argmax(dim=-1)
+        x_ids = x_logits.argmax(dim=-1)
+        pred_coarse_ids = self._flatten_coarse_axis_ids(z_ids, y_ids, x_ids)
         return {
             "coarse_logits": None,
             "coarse_axis_logits": {"z": z_logits, "y": y_logits, "x": x_logits},

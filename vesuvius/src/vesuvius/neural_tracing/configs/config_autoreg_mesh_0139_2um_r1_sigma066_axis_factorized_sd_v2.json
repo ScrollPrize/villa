@@ -89,11 +89,6 @@
   "distance_aware_coarse_target_sigma": 0.66,
   "distance_aware_coarse_target_loss": "soft_ce",
 
-  "_comment_joint": "Joint-valid auxiliary loss: trains factorized axes to agree under joint constraint mask. Active from step 5k.",
-  "joint_valid_aux_loss_enabled": true,
-  "joint_valid_aux_loss_weight": 0.2,
-  "joint_valid_aux_loss_start_step": 5000,
-
   "mixed_precision": "bf16",
 
   "batch_size": 32,
