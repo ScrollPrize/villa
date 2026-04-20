@@ -44,4 +44,21 @@ std::filesystem::path downloadRemoteSegment(
     const cache::HttpAuth& auth,
     RemoteSegmentSource source = RemoteSegmentSource::Segments);
 
+// Download only meta.json for a single remote segment (fast, tiny file).
+// Used for lazy loading: populate the segment list quickly without downloading
+// GBs of TIFF data.  Returns the local directory.  If meta.json already exists
+// locally, the download is skipped.
+std::filesystem::path downloadRemoteSegmentMetadataOnly(
+    const std::string& baseUrl,
+    const std::string& segmentId,
+    const std::filesystem::path& cacheDir,
+    const cache::HttpAuth& auth,
+    RemoteSegmentSource source = RemoteSegmentSource::Segments);
+
+// Check whether a segment's TIFF data (x.tif, y.tif, z.tif) is already cached.
+bool isRemoteSegmentFullyCached(
+    const std::filesystem::path& cacheDir,
+    const std::string& segmentId,
+    RemoteSegmentSource source);
+
 }  // namespace vc

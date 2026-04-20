@@ -1,3 +1,5 @@
+import ast
+import importlib
 import os
 import json
 import torch
@@ -25,6 +27,78 @@ except ImportError:
     HF_AVAILABLE = False
 
 __all__ = ['load_model', 'initialize_network', 'load_model_for_inference', 'load_model_from_checkpoint']
+
+
+def _iter_python_modules(folder: str, current_module: str):
+    """Yield `(file_path, module_name)` pairs for Python modules under `folder`."""
+
+    for root, dirnames, filenames in os.walk(folder):
+        dirnames[:] = [d for d in sorted(dirnames) if d != "__pycache__"]
+        rel_root = os.path.relpath(root, folder)
+        module_prefix = current_module
+        if rel_root != ".":
+            module_prefix = current_module + "." + ".".join(rel_root.split(os.sep))
+
+        for filename in sorted(filenames):
+            if not filename.endswith(".py"):
+                continue
+            file_path = os.path.join(root, filename)
+            module_name = module_prefix if filename == "__init__.py" else module_prefix + "." + filename[:-3]
+            yield file_path, module_name
+
+
+def _module_defines_class(file_path: str, class_name: str) -> bool:
+    """Return True when the Python file defines `class_name` at module scope."""
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as handle:
+            tree = ast.parse(handle.read(), filename=file_path)
+    except (OSError, SyntaxError, UnicodeDecodeError):
+        return False
+
+    return any(isinstance(node, ast.ClassDef) and node.name == class_name for node in tree.body)
+
+
+def resolve_python_class_exact(
+    folder: str,
+    class_name: str,
+    current_module: str,
+    *,
+    verbose: bool = False,
+    rank: int = 0,
+):
+    """Resolve a class by exact source-file match instead of importing the whole package tree."""
+
+    should_print = verbose and rank == 0
+    candidates = sorted(
+        (file_path, module_name)
+        for file_path, module_name in _iter_python_modules(folder, current_module)
+        if _module_defines_class(file_path, class_name)
+    )
+
+    if should_print:
+        print(f"Resolving {class_name} from {current_module}; candidates: {[module_name for _, module_name in candidates]}")
+
+    import_errors = []
+    for _, module_name in candidates:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:  # pragma: no cover - exercised indirectly in tests
+            import_errors.append((module_name, exc))
+            if should_print:
+                print(f"Skipping candidate module {module_name} due to import error: {exc!r}")
+            continue
+
+        if hasattr(module, class_name):
+            return getattr(module, class_name)
+
+    if import_errors:
+        formatted_errors = ", ".join(
+            f"{module_name}: {type(exc).__name__}: {exc}" for module_name, exc in import_errors
+        )
+        raise RuntimeError(f"Failed to import a module defining {class_name}: {formatted_errors}")
+
+    return None
 
 def initialize_network(architecture_class_name: str,
                       arch_init_kwargs: dict,
@@ -137,9 +211,11 @@ def load_model(model_folder: str, fold: Union[int, str] = 0, checkpoint_name: st
     except TypeError:
         # Fallback for older PyTorch versions that don't have weights_only parameter
         checkpoint = torch.load(checkpoint_file, map_location=torch.device('cpu'))
-    
+
     trainer_name = checkpoint['trainer_name']
     configuration_name = checkpoint['init_args']['configuration']
+    if should_print:
+        print(f"Checkpoint metadata: trainer_name={trainer_name}, configuration={configuration_name}")
     
     # Get configuration
     configuration_manager = plans_manager.get_configuration(configuration_name)
@@ -149,12 +225,18 @@ def load_model(model_folder: str, fold: Union[int, str] = 0, checkpoint_name: st
     label_manager = plans_manager.get_label_manager(dataset_json)
     
     # Build the network architecture (without deep supervision for inference)
-    # Try trainer class first, fallback to direct initialization
-    trainer_class = recursive_find_python_class(os.path.join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
-                                               trainer_name, 'nnunetv2.training.nnUNetTrainer')
+    trainer_class = resolve_python_class_exact(
+        os.path.join(nnunetv2.__path__[0], "training", "nnUNetTrainer"),
+        trainer_name,
+        "nnunetv2.training.nnUNetTrainer",
+        verbose=verbose,
+        rank=rank,
+    )
     
     network = None
     if trainer_class is not None:
+        if should_print:
+            print(f"Resolved trainer {trainer_name} from {trainer_class.__module__}")
         try:
             network = trainer_class.build_network_architecture(
                 configuration_manager.network_arch_class_name,
@@ -165,12 +247,13 @@ def load_model(model_folder: str, fold: Union[int, str] = 0, checkpoint_name: st
                 enable_deep_supervision=False
             )
         except Exception as e:
-            if verbose and should_print:
-                print(f"Error using trainer's build_network_architecture: {e}, falling back to direct initialization.")
+            raise RuntimeError(
+                f"Resolved trainer {trainer_name} but failed to build network architecture"
+            ) from e
     
-    # Fallback to direct network initialization if trainer approach failed
+    # Fallback to direct network initialization only if the trainer cannot be resolved.
     if network is None:
-        if verbose and should_print:
+        if should_print:
             print(f"Using direct network initialization (trainer class: {trainer_name}).")
         network = initialize_network(
             configuration_manager.network_arch_class_name,

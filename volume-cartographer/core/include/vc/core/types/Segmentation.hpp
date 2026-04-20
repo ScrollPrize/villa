@@ -3,7 +3,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 class Segmentation
@@ -12,6 +12,7 @@ public:
     explicit Segmentation(std::filesystem::path path);
     Segmentation(std::filesystem::path path, std::string uuid, std::string name);
     static std::shared_ptr<Segmentation> New(const std::filesystem::path& path);
+    ~Segmentation();
     static std::shared_ptr<Segmentation> New(const std::filesystem::path& path, const std::string& uuid, const std::string& name);
 
     [[nodiscard]] std::string id() const;
@@ -33,7 +34,7 @@ public:
 
 private:
     std::filesystem::path path_;
-    nlohmann::json metadata_;
+    utils::Json metadata_;
     std::shared_ptr<QuadSurface> surface_;
 
     void loadMetadata();

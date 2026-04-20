@@ -10,10 +10,10 @@
 #include <sstream>
 #include <stdexcept>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 #include <omp.h>
 
-using json = nlohmann::json;
+using Json = utils::Json;
 
 // ============================================================
 // writeZarrBand
@@ -322,7 +322,8 @@ void createPyramidDatasets(const std::filesystem::path& outDir,
 
     std::vector<size_t> prevShape = shape0;
     for (int level = 1; level <= 5; level++) {
-        std::vector<size_t> shape = {(prevShape[0]+1)/2, (prevShape[1]+1)/2, (prevShape[2]+1)/2};
+        // Keep Z fixed and halve only Y/X at each level (anisotropic scaling).
+        std::vector<size_t> shape = {prevShape[0], (prevShape[1]+1)/2, (prevShape[2]+1)/2};
         size_t chZ = std::min(shape[0], shape0[0]);
         std::vector<size_t> chunks = {chZ, std::min(CH, shape[1]), std::min(CW, shape[2])};
         vc::createZarrDataset(outDir, std::to_string(level), shape, chunks, dtype, "blosc");
@@ -338,9 +339,10 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
                     const std::filesystem::path& volPath, int groupIdx,
                     size_t baseZ, double sliceStep, double accumStep,
                     const std::string& accumTypeStr, size_t accumSamples,
-                    const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW)
+                    const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW,
+                    double baseVoxelSize, const std::string& voxelUnit)
 {
-    json attrs;
+    Json attrs;
     attrs["source_zarr"] = volPath.string();
     attrs["source_group"] = groupIdx;
     attrs["num_slices"] = baseZ;
@@ -350,31 +352,48 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
         attrs["accum_type"] = accumTypeStr;
         attrs["accum_samples"] = int(accumSamples);
     }
-    attrs["canvas_size"] = {canvasSize.width, canvasSize.height};
-    attrs["chunk_size"] = {int(CZ), int(CH), int(CW)};
+    {
+        Json cs = Json::array(); cs.push_back(canvasSize.width); cs.push_back(canvasSize.height);
+        attrs["canvas_size"] = std::move(cs);
+    }
+    {
+        Json ck = Json::array(); ck.push_back(int(CZ)); ck.push_back(int(CH)); ck.push_back(int(CW));
+        attrs["chunk_size"] = std::move(ck);
+    }
     attrs["note_axes_order"] = "ZYX (slice, row, col)";
 
-    json ms;
+    Json ms;
     ms["version"] = "0.4"; ms["name"] = "render";
-    ms["axes"] = json::array({
-        json{{"name","z"},{"type","space"}},
-        json{{"name","y"},{"type","space"}},
-        json{{"name","x"},{"type","space"}}
-    });
-    ms["datasets"] = json::array();
+    auto makeAxis = [&](const char* name) -> Json {
+        Json ax = Json{{"name", name}, {"type", "space"}};
+        if (!voxelUnit.empty()) ax["unit"] = voxelUnit;
+        return ax;
+    };
+    Json axes = Json::array();
+    axes.push_back(makeAxis("z"));
+    axes.push_back(makeAxis("y"));
+    axes.push_back(makeAxis("x"));
+    ms["axes"] = std::move(axes);
+    ms["datasets"] = Json::array();
     for (int l = 0; l <= 5; l++) {
-        double s = std::pow(2.0, l);
-        const double sz = 1.0;
-        ms["datasets"].push_back({
+        const double sYX = baseVoxelSize * std::pow(2.0, l);
+        const double sZ = baseVoxelSize;
+        Json scale_arr = Json::array();
+        scale_arr.push_back(sZ); scale_arr.push_back(sYX); scale_arr.push_back(sYX);
+        Json trans_arr = Json::array();
+        trans_arr.push_back(0.0); trans_arr.push_back(0.0); trans_arr.push_back(0.0);
+        Json transforms = Json::array();
+        transforms.push_back(Json{{"type","scale"},{"scale",std::move(scale_arr)}});
+        transforms.push_back(Json{{"type","translation"},{"translation",std::move(trans_arr)}});
+        ms["datasets"].push_back(Json{
             {"path", std::to_string(l)},
-            {"coordinateTransformations", json::array({
-                json{{"type","scale"},{"scale",json::array({sz,s,s})}},
-                json{{"type","translation"},{"translation",json::array({0.0,0.0,0.0})}}
-            })}
+            {"coordinateTransformations", std::move(transforms)}
         });
     }
-    ms["metadata"] = json{{"downsampling_method","mean"}};
-    attrs["multiscales"] = json::array({ms});
+    ms["metadata"] = Json{{"downsampling_method","mean"}};
+    Json multiscales = Json::array();
+    multiscales.push_back(std::move(ms));
+    attrs["multiscales"] = std::move(multiscales);
 
     vc::writeZarrAttributes(outDir, attrs);
 }

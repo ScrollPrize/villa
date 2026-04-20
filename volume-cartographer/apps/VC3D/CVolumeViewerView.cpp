@@ -73,9 +73,17 @@ void CVolumeViewerView::drawForeground(QPainter* p, const QRectF& sceneRect)
 }
 
 CVolumeViewerView::CVolumeViewerView(QWidget* parent) : QGraphicsView(parent)
-{ 
+{
     setMouseTracking(true);
 };
+
+void CVolumeViewerView::drawBackground(QPainter* painter, const QRectF& /*rect*/)
+{
+    if (_directFb && !_directFb->isNull()) {
+        painter->resetTransform();
+        painter->drawImage(0, 0, *_directFb);
+    }
+}
 
 void CVolumeViewerView::scrollContentsBy(int dx, int dy)
 {
@@ -85,16 +93,23 @@ void CVolumeViewerView::scrollContentsBy(int dx, int dy)
 
 void CVolumeViewerView::wheelEvent(QWheelEvent *event)
 {
-    // Get raw delta value and use smaller divisor for higher sensitivity
-    int num_degrees = event->angleDelta().y() / 8;
-    
-    QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
-    QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
+    // Accumulate fractional degrees so high-resolution trackpads and mice
+    // with fine scroll steps don't lose precision to integer truncation.
+    // Standard mice send 120 units (= 15 degrees) per notch.
+    _wheelAccum += event->angleDelta().y();
+    constexpr int kStepThreshold = 120;  // one notch = one step
+    int steps = _wheelAccum / kStepThreshold;
+    if (steps == 0) {
+        event->accept();
+        return;
+    }
+    _wheelAccum -= steps * kStepThreshold;
 
-    // Send the zoom event with a more sensitive delta value
-    // Changed from /15 to /5 to make it more responsive to small wheel movements
-    sendZoom(num_degrees/5, scene_loc, event->modifiers());
-    
+    // Pass viewport-relative mouse position directly (not scene coords).
+    // Scene coords depend on Qt scroll position which shifts when the
+    // tile grid is windowed, causing zoom-at-point to jump.
+    QPointF vp_loc = viewport()->mapFromGlobal(event->globalPosition());
+    sendZoom(steps, vp_loc, event->modifiers());
     event->accept();
 }
 
@@ -158,6 +173,7 @@ void CVolumeViewerView::keyPressEvent(QKeyEvent *event)
         case Qt::Key_Right:
         case Qt::Key_Up:
         case Qt::Key_Down:
+            emit sendKeyPress(event->key(), event->modifiers());
             event->accept();
             return;
         default:
@@ -219,8 +235,12 @@ void CVolumeViewerView::mousePressEvent(QMouseEvent *event)
 
 void CVolumeViewerView::resizeEvent(QResizeEvent *event)
 {
-    emit sendResized();
+    // Base class first so viewport()->size() reflects the new dimensions.
+    // Otherwise the tiled viewer's onResized reads the stale viewport size,
+    // leaves the framebuffer/sceneRect at the old dims, and subsequent mouse
+    // events map through an offset proportional to the resize delta.
     QGraphicsView::resizeEvent(event);
+    emit sendResized();
 }
 
 void CVolumeViewerView::mouseMoveEvent(QMouseEvent *event)

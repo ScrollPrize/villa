@@ -2,7 +2,7 @@
 
 #include "../SegmentationModule.hpp"
 #include "../../ViewerManager.hpp"
-#include "../../tiled/CTiledVolumeViewer.hpp"
+#include "../../adaptive/CAdaptiveVolumeViewer.hpp"
 #include "SegmentationEditManager.hpp"
 #include "../SegmentationWidget.hpp"
 #include "../../overlays/SegmentationOverlayController.hpp"
@@ -15,6 +15,7 @@
 #include <QCoreApplication>
 #include <QTimer>
 #include <QLoggingCategory>
+#include <QtConcurrent/QtConcurrent>
 
 #include <algorithm>
 #include <cmath>
@@ -34,7 +35,7 @@ namespace
 {
 constexpr int kPushPullIntervalMs = 16;       // ~60fps for smooth feedback
 constexpr int kPushPullIntervalMsFast = 16;   // Non-alpha mode: faster feedback
-constexpr int kPushPullIntervalMsSlow = 100;  // Alpha mode: more time for computation
+constexpr int kPushPullIntervalMsSlow = 33;   // Alpha mode: ~30fps for responsiveness
 constexpr float kAlphaMinStep = 0.05f;
 constexpr float kAlphaMaxStep = 20.0f;
 constexpr float kAlphaMinRange = 0.01f;
@@ -42,6 +43,7 @@ constexpr float kAlphaDefaultHighDelta = 0.05f;
 constexpr float kAlphaBorderLimit = 20.0f;
 constexpr int kAlphaBlurRadiusMax = 15;
 constexpr float kAlphaPerVertexLimitMax = 128.0f;
+constexpr std::size_t kAlphaPerVertexMaxSamples = 512;
 
 bool nearlyEqual(float lhs, float rhs)
 {
@@ -380,6 +382,9 @@ SegmentationPushPullTool::SegmentationPushPullTool(SegmentationModule& module,
     , _state(state)
 {
     ensureTimer();
+
+    QObject::connect(&_alphaWatcher, &QFutureWatcher<AlphaResult>::finished,
+                     &_module, [this]() { applyAlphaResult(); });
 }
 
 void SegmentationPushPullTool::setDependencies(SegmentationEditManager* editManager,
@@ -516,6 +521,13 @@ void SegmentationPushPullTool::stopAll()
     }
     _alphaOverrideActive = false;
     _activeAlphaEnabled = false;
+    _alphaComputePending = false;
+
+    // If an async computation is running, cancel it
+    if (_alphaComputeRunning) {
+        _alphaWatcher.cancel();
+        _alphaComputeRunning = false;
+    }
 
     // Clear cached position
     _cachedRow = -1;
@@ -529,7 +541,7 @@ void SegmentationPushPullTool::stopAll()
     // Finalize the edits and trigger final surface update
     if (wasActive && _editManager && _editManager->hasSession() && _state) {
         // Capture delta for undo before applyPreview() clears edited vertices
-        _module.captureUndoDelta();
+        (void)_module.captureUndoDelta();
 
         // Auto-approve edited regions before applyPreview() clears them
         if (_module.autoApprovalEnabled() && _overlay && _overlay->hasApprovalMaskData()) {
@@ -563,6 +575,13 @@ bool SegmentationPushPullTool::applyStepInternal()
     if (!_ppState.active || !_editManager || !_editManager->hasSession()) {
         qCWarning(lcSegPushPull) << "Push/pull aborted: tool inactive or no active editing session.";
         return false;
+    }
+
+    // If an async alpha computation is already running, note that another tick
+    // is needed and return — the watcher callback will re-launch.
+    if (_activeAlphaEnabled && _alphaComputeRunning) {
+        _alphaComputePending = true;
+        return true;
     }
 
     if (!_module.ensureHoverTarget()) {
@@ -638,147 +657,28 @@ bool SegmentationPushPullTool::applyStepInternal()
     }
     normal /= norm;
 
+    // --- Alpha mode: launch expensive computation on background thread ---
+    if (_activeAlphaEnabled) {
+        launchAlphaCompute();
+        return true;
+    }
+
+    // --- Non-alpha mode: synchronous step (cheap) ---
     cv::Vec3f targetWorld = centerWorld;
-    bool usedAlphaPushPull = false;
-    bool usedAlphaPushPullPerVertex = false;
-
-    if (_activeAlphaEnabled && _alphaConfig.perVertex) {
-        const auto& activeSamples = _editManager->activeDrag().samples;
-        if (!activeSamples.empty()) {
-            bool alphaUnavailable = false;
-
-            std::vector<cv::Vec3f> perVertexTargets;
-            perVertexTargets.reserve(activeSamples.size());
-            std::vector<float> perVertexMovements;
-            perVertexMovements.reserve(activeSamples.size());
-            bool anyMovement = false;
-            float minMovement = std::numeric_limits<float>::max();
-
-            for (const auto& sample : activeSamples) {
-                const cv::Vec3f& baseWorld = sample.baseWorld;
-
-                // Get normal directly from grid position (fast, no pointTo needed)
-                cv::Vec3f sampleNormal = baseSurface->gridNormal(sample.row, sample.col);
-                if (!isValidNormal(sampleNormal)) {
-                    sampleNormal = normal;  // Fallback to center normal
-                } else {
-                    const float sampleNorm = cv::norm(sampleNormal);
-                    if (sampleNorm > 1e-4f) {
-                        sampleNormal /= sampleNorm;
-                    } else {
-                        sampleNormal = normal;
-                    }
-                }
-
-                bool sampleUnavailable = false;
-                auto sampleTarget = computeAlphaTarget(baseWorld,
-                                 sampleNormal,
-                                 _ppState.direction,
-                                 baseSurface.get(),
-                                 hover.viewer,
-                                 &sampleUnavailable);
-                if (sampleUnavailable) {
-                    alphaUnavailable = true;
-                    break;
-                }
-
-                cv::Vec3f newWorld = baseWorld;
-                float movement = 0.0f;
-                if (sampleTarget) {
-                    newWorld = *sampleTarget;
-                    const cv::Vec3f delta = newWorld - baseWorld;
-                    movement = static_cast<float>(cv::norm(delta));
-                    if (movement >= 1e-4f) {
-                        anyMovement = true;
-                    }
-                }
-
-                perVertexTargets.push_back(newWorld);
-                perVertexMovements.push_back(movement);
-                minMovement = std::min(minMovement, movement);
-            }
-
-            const float perVertexLimit = std::max(0.0f, _alphaConfig.perVertexLimit);
-            if (perVertexLimit > 0.0f && !perVertexTargets.empty() && std::isfinite(minMovement)) {
-                const float maxAllowedMovement = minMovement + perVertexLimit;
-                for (std::size_t i = 0; i < perVertexTargets.size(); ++i) {
-                    if (perVertexMovements[i] > maxAllowedMovement + 1e-4f) {
-                        const cv::Vec3f& baseWorld = activeSamples[i].baseWorld;
-                        const cv::Vec3f delta = perVertexTargets[i] - baseWorld;
-                        const float length = perVertexMovements[i];
-                        if (length > 1e-6f) {
-                            const float scale = maxAllowedMovement / length;
-                            perVertexTargets[i] = baseWorld + delta * scale;
-                            perVertexMovements[i] = maxAllowedMovement;
-                            if (maxAllowedMovement >= 1e-4f) {
-                                anyMovement = true;
-                            }
-                        }
-                    }
-                }
-            }
-
-            if (alphaUnavailable) {
-                _editManager->cancelActiveDrag();
-                _samplesValid = false;
-                logFailure("Push/pull aborted: alpha push/pull unavailable for per-vertex samples");
-                return false;
-            }
-
-            if (!anyMovement) {
-                _editManager->cancelActiveDrag();
-                _samplesValid = false;
-                logFailure("Push/pull aborted: alpha push/pull produced no movement for per-vertex samples");
-                return false;
-            }
-
-            if (!_editManager->updateActiveDragTargets(perVertexTargets)) {
-                _editManager->cancelActiveDrag();
-                _samplesValid = false;
-                logFailure("Push/pull aborted: failed to update per-vertex drag targets");
-                return false;
-            }
-
-            usedAlphaPushPull = true;
-            usedAlphaPushPullPerVertex = true;
-        }
-    } else if (_activeAlphaEnabled) {
-        bool alphaUnavailable = false;
-        auto alphaTarget = computeAlphaTarget(centerWorld,
-                          normal,
-                          _ppState.direction,
-                          baseSurface.get(),
-                          hover.viewer,
-                          &alphaUnavailable);
-        if (alphaTarget) {
-            targetWorld = *alphaTarget;
-            usedAlphaPushPull = true;
-        } else if (!alphaUnavailable) {
-            _editManager->cancelActiveDrag();
-            _samplesValid = false;
-            logFailure("Push/pull aborted: alpha push/pull target unavailable");
-            return false;
-        }
+    const float stepWorld = _module.gridStepWorld() * _stepMultiplier;
+    if (stepWorld <= 0.0f) {
+        _editManager->cancelActiveDrag();
+        _samplesValid = false;
+        logFailure("Push/pull aborted: computed step size non-positive");
+        return false;
     }
+    targetWorld = centerWorld + normal * (static_cast<float>(_ppState.direction) * stepWorld);
 
-    if (!usedAlphaPushPull) {
-        const float stepWorld = _module.gridStepWorld() * _stepMultiplier;
-        if (stepWorld <= 0.0f) {
-            _editManager->cancelActiveDrag();
-            _samplesValid = false;
-            logFailure("Push/pull aborted: computed step size non-positive");
-            return false;
-        }
-        targetWorld = centerWorld + normal * (static_cast<float>(_ppState.direction) * stepWorld);
-    }
-
-    if (!usedAlphaPushPullPerVertex) {
-        if (!_editManager->updateActiveDrag(targetWorld)) {
-            _editManager->cancelActiveDrag();
-            _samplesValid = false;
-            logFailure("Push/pull aborted: failed to update drag target");
-            return false;
-        }
+    if (!_editManager->updateActiveDrag(targetWorld)) {
+        _editManager->cancelActiveDrag();
+        _samplesValid = false;
+        logFailure("Push/pull aborted: failed to update drag target");
+        return false;
     }
 
     // Update sample base positions for next tick (allows reusing samples)
@@ -793,9 +693,259 @@ bool SegmentationPushPullTool::applyStepInternal()
     }
 
     _module.refreshOverlay();
-    // Note: emitPendingChanges() removed here for performance - called in stopAll() instead
     _module.markAutosaveNeeded();
     return true;
+}
+
+void SegmentationPushPullTool::launchAlphaCompute()
+{
+    if (_alphaComputeRunning) {
+        _alphaComputePending = true;
+        return;
+    }
+
+    if (!_editManager || !_editManager->hasSession() || !_ppState.active) {
+        return;
+    }
+
+    if (!_module.ensureHoverTarget()) {
+        return;
+    }
+    const auto hover = _module.hoverInfo();
+    if (!hover.valid || !hover.viewer) {
+        return;
+    }
+
+    auto baseSurface = _editManager->baseSurface();
+    if (!baseSurface) {
+        return;
+    }
+
+    // Capture all inputs needed by the background thread on the main thread
+    std::shared_ptr<Volume> volume = hover.viewer->currentVolume();
+    if (!volume) {
+        return;
+    }
+
+    const size_t scaleCount = volume->numScales();
+    int datasetIndex = hover.viewer->datasetScaleIndex();
+    if (scaleCount == 0) {
+        datasetIndex = 0;
+    } else {
+        datasetIndex = std::clamp(datasetIndex, 0, static_cast<int>(scaleCount) - 1);
+    }
+
+    float scale = hover.viewer->datasetScaleFactor();
+    if (!std::isfinite(scale) || scale <= 0.0f) {
+        scale = 1.0f;
+    }
+    scale = std::max(scale, 0.25f);
+
+    const int direction = _ppState.direction;
+    const AlphaPushPullConfig config = _alphaConfig;
+    bool perVertex = config.perVertex;
+
+    // Snapshot per-vertex sample data from the active drag
+    struct SampleInput {
+        cv::Vec3f baseWorld;
+        cv::Vec3f normal;
+    };
+
+    std::vector<SampleInput> sampleInputs;
+    cv::Vec3f centerWorld(0, 0, 0);
+    cv::Vec3f centerNormal(0, 0, 0);
+
+    {
+        const int row = _cachedRow;
+        const int col = _cachedCol;
+
+        auto centerWorldOpt = _editManager->vertexWorldPosition(row, col);
+        if (!centerWorldOpt) {
+            return;
+        }
+        centerWorld = *centerWorldOpt;
+
+        centerNormal = baseSurface->gridNormal(row, col);
+        if (!isValidNormal(centerNormal)) {
+            auto* patchIndex = _module.viewerManager() ? _module.viewerManager()->surfacePatchIndex() : nullptr;
+            cv::Vec3f ptr(0, 0, 0);
+            baseSurface->pointTo(ptr, centerWorld, std::numeric_limits<float>::max(), 400, patchIndex);
+            if (const auto fallback = computeRobustNormal(baseSurface.get(), ptr, centerWorld, _editManager->activeDrag(), patchIndex)) {
+                centerNormal = *fallback;
+            } else {
+                return;
+            }
+        }
+        const float n = cv::norm(centerNormal);
+        if (n <= 1e-4f) {
+            return;
+        }
+        centerNormal /= n;
+
+        if (perVertex) {
+            const auto& activeSamples = _editManager->activeDrag().samples;
+            const std::size_t totalSamples = activeSamples.size();
+            // Fall back to single-target mode when too many vertices to keep
+            // background computation bounded and avoid blocking on stop.
+            if (totalSamples > kAlphaPerVertexMaxSamples) {
+                perVertex = false;
+            } else {
+                sampleInputs.reserve(totalSamples);
+                for (const auto& sample : activeSamples) {
+                    cv::Vec3f sampleNormal = baseSurface->gridNormal(sample.row, sample.col);
+                    if (!isValidNormal(sampleNormal)) {
+                        sampleNormal = centerNormal;
+                    } else {
+                        const float sn = cv::norm(sampleNormal);
+                        if (sn > 1e-4f) {
+                            sampleNormal /= sn;
+                        } else {
+                            sampleNormal = centerNormal;
+                        }
+                    }
+                    sampleInputs.push_back({sample.baseWorld, sampleNormal});
+                }
+            }
+        }
+    }
+
+    _alphaComputeRunning = true;
+    _alphaComputePending = false;
+
+    auto future = QtConcurrent::run(
+        [volume, datasetIndex, scale, direction, config, perVertex,
+         centerWorld, centerNormal, sampleInputs]() -> AlphaResult {
+
+        AlphaResult result;
+
+        if (perVertex && !sampleInputs.empty()) {
+            result.perVertex = true;
+
+            std::vector<cv::Vec3f> targets;
+            targets.reserve(sampleInputs.size());
+            std::vector<float> movements;
+            movements.reserve(sampleInputs.size());
+            bool anyMovement = false;
+            float minMovement = std::numeric_limits<float>::max();
+
+            for (const auto& si : sampleInputs) {
+                bool unavailable = false;
+                auto target = computeAlphaTargetStatic(
+                    si.baseWorld, si.normal, direction, config,
+                    volume, datasetIndex, scale, &unavailable);
+
+                if (unavailable) {
+                    return result;  // success = false
+                }
+
+                cv::Vec3f newWorld = si.baseWorld;
+                float movement = 0.0f;
+                if (target) {
+                    newWorld = *target;
+                    const cv::Vec3f delta = newWorld - si.baseWorld;
+                    movement = static_cast<float>(cv::norm(delta));
+                    if (movement >= 1e-4f) {
+                        anyMovement = true;
+                    }
+                }
+
+                targets.push_back(newWorld);
+                movements.push_back(movement);
+                minMovement = std::min(minMovement, movement);
+            }
+
+            // Apply per-vertex limit clamping
+            const float perVertexLimit = std::max(0.0f, config.perVertexLimit);
+            if (perVertexLimit > 0.0f && !targets.empty() && std::isfinite(minMovement)) {
+                const float maxAllowed = minMovement + perVertexLimit;
+                for (std::size_t i = 0; i < targets.size(); ++i) {
+                    if (movements[i] > maxAllowed + 1e-4f) {
+                        const cv::Vec3f delta = targets[i] - sampleInputs[i].baseWorld;
+                        const float length = movements[i];
+                        if (length > 1e-6f) {
+                            const float s = maxAllowed / length;
+                            targets[i] = sampleInputs[i].baseWorld + delta * s;
+                            movements[i] = maxAllowed;
+                            if (maxAllowed >= 1e-4f) {
+                                anyMovement = true;
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (!anyMovement) {
+                return result;  // success = false
+            }
+
+            result.perVertexTargets = std::move(targets);
+            result.success = true;
+        } else {
+            // Single-target alpha mode
+            bool unavailable = false;
+            auto target = computeAlphaTargetStatic(
+                centerWorld, centerNormal, direction, config,
+                volume, datasetIndex, scale, &unavailable);
+
+            if (target) {
+                result.singleTarget = *target;
+                result.success = true;
+            } else if (unavailable) {
+                // Volume unavailable — not an error, just skip
+                result.success = false;
+            }
+        }
+
+        return result;
+    });
+
+    _alphaWatcher.setFuture(future);
+}
+
+void SegmentationPushPullTool::applyAlphaResult()
+{
+    _alphaComputeRunning = false;
+
+    if (!_ppState.active || !_editManager || !_editManager->hasSession()) {
+        return;
+    }
+
+    const auto result = _alphaWatcher.result();
+
+    if (result.success) {
+        if (result.perVertex) {
+            if (!_editManager->updateActiveDragTargets(result.perVertexTargets)) {
+                qCWarning(lcSegPushPull) << "Alpha async: failed to update per-vertex drag targets";
+                _editManager->cancelActiveDrag();
+                _samplesValid = false;
+                return;
+            }
+        } else if (result.singleTarget) {
+            if (!_editManager->updateActiveDrag(*result.singleTarget)) {
+                qCWarning(lcSegPushPull) << "Alpha async: failed to update drag target";
+                _editManager->cancelActiveDrag();
+                _samplesValid = false;
+                return;
+            }
+        }
+
+        // Update sample base positions for next tick
+        _editManager->refreshActiveDragBasePositions();
+
+        // Trigger visual refresh on the main thread
+        if (_state) {
+            _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+        }
+
+        _module.refreshOverlay();
+        _module.markAutosaveNeeded();
+    }
+
+    // If another tick came in while we were computing, launch again
+    if (_alphaComputePending && _ppState.active) {
+        _alphaComputePending = false;
+        launchAlphaCompute();
+    }
 }
 
 void SegmentationPushPullTool::ensureTimer()
@@ -813,22 +963,20 @@ void SegmentationPushPullTool::ensureTimer()
     });
 }
 
-std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTarget(const cv::Vec3f& centerWorld,
-                                                const cv::Vec3f& normal,
-                                                int direction,
-                                                QuadSurface* surface,
-                                                CTiledVolumeViewer* viewer,
-                                                bool* outUnavailable) const
+std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTargetStatic(
+    const cv::Vec3f& centerWorld,
+    const cv::Vec3f& normal,
+    int direction,
+    const AlphaPushPullConfig& config,
+    const std::shared_ptr<Volume>& volume,
+    int datasetIndex,
+    float scale,
+    bool* outUnavailable)
 {
     if (outUnavailable) {
         *outUnavailable = false;
     }
 
-    if (!_activeAlphaEnabled || !viewer || !surface) {
-        return std::nullopt;
-    }
-
-    std::shared_ptr<Volume> volume = viewer->currentVolume();
     if (!volume) {
         if (outUnavailable) {
             *outUnavailable = true;
@@ -836,20 +984,7 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTarget(const cv::
         return std::nullopt;
     }
 
-    const size_t scaleCount = volume->numScales();
-    int datasetIndex = viewer->datasetScaleIndex();
-    if (scaleCount == 0) {
-        datasetIndex = 0;
-    } else {
-        datasetIndex = std::clamp(datasetIndex, 0, static_cast<int>(scaleCount) - 1);
-    }
-
-    float scale = viewer->datasetScaleFactor();
-    if (!std::isfinite(scale) || scale <= 0.0f) {
-        scale = 1.0f;
-    }
-
-    AlphaPushPullConfig cfg = sanitizeConfig(_alphaConfig);
+    AlphaPushPullConfig cfg = sanitizeConfig(config);
 
     cv::Vec3f orientedNormal = normal * static_cast<float>(direction);
     const float norm = cv::norm(orientedNormal);
@@ -865,7 +1000,6 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTarget(const cv::
     PlaneSurface plane(centerWorld, orientedNormal);
     cv::Mat_<cv::Vec3f> coords;
     plane.gen(&coords, nullptr, patchSize, cv::Vec3f(0, 0, 0), scale, cv::Vec3f(0, 0, 0));
-    coords *= scale;
 
     const cv::Point2i centerIndex(radius, radius);
     const float range = std::max(cfg.high - cfg.low, kAlphaMinRange);
@@ -877,17 +1011,22 @@ std::optional<cv::Vec3f> SegmentationPushPullTool::computeAlphaTarget(const cv::
     const float stop = cfg.stop;
     const float step = std::fabs(cfg.step);
 
+    // Pre-allocate mats reused across loop iterations to avoid per-tick allocations
+    cv::Mat_<cv::Vec3f> offsetMat(patchSize);
+    cv::Mat_<cv::Vec3f> offsetCoords(patchSize);
+    cv::Mat_<uint8_t> slice(patchSize);
+    cv::Mat sliceFloat(patchSize, CV_32F);
+
     for (float offset = start; offset <= stop + 1e-4f; offset += step) {
-        cv::Mat_<uint8_t> slice;
-        cv::Mat_<cv::Vec3f> offsetMat(patchSize, orientedNormal * (offset * scale));
+        offsetMat.setTo(orientedNormal * offset);
+        cv::add(coords, offsetMat, offsetCoords);
         vc::SampleParams sp;
         sp.level = datasetIndex;
-        volume->sample(slice, coords + offsetMat, sp);
+        volume->sample(slice, offsetCoords, sp);
         if (slice.empty()) {
             continue;
         }
 
-        cv::Mat sliceFloat;
         slice.convertTo(sliceFloat, CV_32F, 1.0 / 255.0);
         cv::GaussianBlur(sliceFloat, sliceFloat, cv::Size(kernel, kernel), 0);
 

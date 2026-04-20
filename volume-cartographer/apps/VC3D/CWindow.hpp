@@ -20,7 +20,7 @@
 
 #include "CPointCollectionWidget.hpp"
 #include "CState.hpp"
-#include "tiled/CTiledVolumeViewer.hpp"
+#include "adaptive/CAdaptiveVolumeViewer.hpp"
 #include "DrawingWidget.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
@@ -40,7 +40,6 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/RemoteScroll.hpp"
-#include "FocusHistoryManager.hpp"
 
 #define MAX_RECENT_VOLPKG 10
 
@@ -63,7 +62,6 @@ class QTemporaryDir;
 class QStandardItemModel;
 class FileWatcherService;
 class AxisAlignedSliceController;
-class FocusHistoryManager;
 class SegmentationCommandHandler;
 
 class CWindow : public QMainWindow
@@ -118,7 +116,7 @@ private:
     bool initializeCommandLineRunner(void);
 
     CTiledVolumeViewer *newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea);
-    void closeEvent(QCloseEvent* event);
+    void closeEvent(QCloseEvent* event) override;
 
     void setWidgetsEnabled(bool state);
 
@@ -132,12 +130,20 @@ private:
     bool attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
                                       const QString& preferredVolumeId = QString());
     void setRemoteSurfaces(const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& surfaces);
+    // Lazy loading: set remote stubs (segments listed but not yet downloaded)
+    void setRemoteStubs(
+        const std::vector<std::string>& segmentIds,
+        const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& cachedSurfaces);
+    // Download a single remote segment on demand (called when user selects a stub)
+    void downloadRemoteSegmentOnDemand(const QString& segmentId);
     void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
                                        bool reloadSurfaces = true);
     void updateNormalGridAvailability();
     void toggleVolumeOverlayVisibility();
-    bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId, bool addToHistory = false);
+    bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId);
     bool centerFocusOnCursor();
+    void recenterPlaneViewersOn(const cv::Vec3f& position);
+    bool recenterViewersOnCurrentFocus();
     void setSegmentationCursorMirroring(bool enabled);
     bool segmentationCursorMirroringEnabled() const { return _mirrorCursorToSegmentation; }
     void updateSurfaceOverlayDropdown();
@@ -245,9 +251,20 @@ private:
     bool _normalGridAvailable{false};
     QString _normalGridPath;
 
+    // Remote scroll state for on-demand segment downloading
+    struct RemoteScrollState {
+        std::string baseUrl;
+        std::string segmentsBaseUrl;
+        std::string cachePath;
+        vc::cache::HttpAuth auth;
+        vc::RemoteSegmentSource segSource = vc::RemoteSegmentSource::Segments;
+        bool active = false;
+    };
+    RemoteScrollState _remoteScroll;
+
     std::unique_ptr<FileWatcherService> _fileWatcher;
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
-    FocusHistoryManager _focusHistory;
+    bool _maskRenderInProgress{false};
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
     std::shared_ptr<QuadSurface> _transformPreviewSourceSurface;
     std::shared_ptr<QuadSurface> _transformPreviewSurface;

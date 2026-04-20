@@ -44,14 +44,21 @@ https://github.com/MIC-DKFZ/nnUNet
 """
 
 import functools
+import math
 
 import torch
 import torch.nn as nn
-from ..utilities.utils import get_pool_and_conv_props, get_n_blocks_per_stage
+import torch.nn.functional as F
+from ..utilities.utils import get_pool_and_conv_props, get_n_blocks_per_stage, pad_shape
 from .encoder import Encoder
 from .decoder import Decoder
 from .activations import SwiGLUBlock, GLUBlock
+from .simple_conv_blocks import ConvDropoutNormReLU
+from .guidance import TokenBook3D
 from .primus_wrapper import PrimusEncoder, PrimusDecoder
+from .mednext.factory import get_mednext_v1_config
+from .mednext_wrapper import MedNeXtEncoder, MedNeXtDecoder
+from .pretrained_backbones.dinov2 import build_dinov2_backbone, build_dinov2_decoder
 
 
 class LearnedMLPZProjection(nn.Module):
@@ -104,11 +111,16 @@ def get_activation_module(activation_str: str):
         raise ValueError(f"Unknown activation type: {activation_str}")
 
 class NetworkFromConfig(nn.Module):
-    def _read_projection_value(self, raw_cfg, target_info, model_config, key, default):
+    def _read_projection_value(self, raw_cfg, target_info, model_config, key, default, *, resolved_cfg=None, resolved_key=None):
         if isinstance(raw_cfg, dict) and key in raw_cfg:
             return raw_cfg[key]
         if key in target_info:
             return target_info[key]
+        if isinstance(resolved_cfg, dict):
+            if resolved_key is not None and resolved_key in resolved_cfg:
+                return resolved_cfg[resolved_key]
+            if key in resolved_cfg:
+                return resolved_cfg[key]
         return model_config.get(key, default)
 
     def _resolve_target_projection(self, target_name, target_info, model_config):
@@ -118,12 +130,38 @@ class NetworkFromConfig(nn.Module):
                 f"Target '{target_name}' z_projection must be a dict when provided, "
                 f"got {type(raw_cfg).__name__}"
             )
+        resolved_cfg = None
+        target_projection_cfg = model_config.get("target_z_projection")
+        if target_projection_cfg is not None:
+            if not isinstance(target_projection_cfg, dict):
+                raise TypeError(
+                    f"model_config.target_z_projection must be a dict when provided, "
+                    f"got {type(target_projection_cfg).__name__}"
+                )
+            resolved_cfg = target_projection_cfg.get(target_name)
+            if resolved_cfg is not None and not isinstance(resolved_cfg, dict):
+                raise TypeError(
+                    f"model_config.target_z_projection['{target_name}'] must be a dict when provided, "
+                    f"got {type(resolved_cfg).__name__}"
+                )
 
         mode_default = model_config.get("z_projection_mode", "none")
         if isinstance(raw_cfg, dict):
-            mode = raw_cfg.get("mode", mode_default)
+            if "mode" in raw_cfg:
+                mode = raw_cfg["mode"]
+            elif "z_projection_mode" in target_info:
+                mode = target_info["z_projection_mode"]
+            elif isinstance(resolved_cfg, dict) and "mode" in resolved_cfg:
+                mode = resolved_cfg["mode"]
+            else:
+                mode = mode_default
         else:
-            mode = target_info.get("z_projection_mode", mode_default)
+            if "z_projection_mode" in target_info:
+                mode = target_info["z_projection_mode"]
+            elif isinstance(resolved_cfg, dict) and "mode" in resolved_cfg:
+                mode = resolved_cfg["mode"]
+            else:
+                mode = mode_default
         mode = str(mode).strip().lower()
         if mode in {"", "none", "off", "false", "0"}:
             return None
@@ -141,7 +179,8 @@ class NetworkFromConfig(nn.Module):
         spec = {"mode": mode}
         if mode == "logsumexp":
             tau = float(self._read_projection_value(
-                raw_cfg, target_info, model_config, "z_projection_lse_tau", 1.0
+                raw_cfg, target_info, model_config, "z_projection_lse_tau", 1.0,
+                resolved_cfg=resolved_cfg, resolved_key="lse_tau"
             ))
             if tau <= 0:
                 raise ValueError(
@@ -151,17 +190,20 @@ class NetworkFromConfig(nn.Module):
         elif mode == "learned_mlp":
             default_depth = int(self.patch_size[0]) if len(self.patch_size) == 3 else None
             depth = self._read_projection_value(
-                raw_cfg, target_info, model_config, "z_projection_mlp_depth", default_depth
+                raw_cfg, target_info, model_config, "z_projection_mlp_depth", default_depth,
+                resolved_cfg=resolved_cfg, resolved_key="mlp_depth"
             )
             if depth is None:
                 raise ValueError(
                     f"Target '{target_name}' learned_mlp z-projection requires z_projection_mlp_depth"
                 )
             hidden = int(self._read_projection_value(
-                raw_cfg, target_info, model_config, "z_projection_mlp_hidden", 64
+                raw_cfg, target_info, model_config, "z_projection_mlp_hidden", 64,
+                resolved_cfg=resolved_cfg, resolved_key="mlp_hidden"
             ))
             dropout = float(self._read_projection_value(
-                raw_cfg, target_info, model_config, "z_projection_mlp_dropout", 0.0
+                raw_cfg, target_info, model_config, "z_projection_mlp_dropout", 0.0,
+                resolved_cfg=resolved_cfg, resolved_key="mlp_dropout"
             ))
             spec.update({
                 "mlp_depth": int(depth),
@@ -245,8 +287,77 @@ class NetworkFromConfig(nn.Module):
         self.save_config = False
         
         self.architecture_type = model_config.get("architecture_type", "unet")
+        self.pretrained_backbone = model_config.get("pretrained_backbone")
+        self.guide_backbone_name = model_config.get("guide_backbone")
+        self.guide_backbone_config_path = model_config.get("guide_backbone_config_path")
+        self.guide_fusion_stage = str(model_config.get("guide_fusion_stage", "input")).strip().lower()
+        self.guide_enabled = bool(self.guide_backbone_name)
+        self.guide_backbone = None
+        self.guide_tokenbook = None
+        self.guide_stage_tokenbooks = nn.ModuleDict()
+        self.guide_skip_projectors = nn.ModuleDict()
+        self.guide_stage_keys = None
+        self.guide_patch_grid = None
+        self.guide_skip_concat_projector_channels = None
+        self.guide_feature_gate_alpha = 1.0
+        self.guide_direct_output_mode = None
+        self.direct_segmentation_target_name = None
+        self.freeze_encoder = bool(model_config.get("freeze_encoder", False))
+        self.guide_freeze = bool(model_config.get("guide_freeze", True))
+        guide_compile_policy = str(model_config.get("guide_compile_policy", "off")).strip().lower()
+        if guide_compile_policy not in {"off", "backbone_only", "tokenbook_only", "all_guidance"}:
+            raise ValueError(
+                "guide_compile_policy must be one of "
+                "{'off', 'backbone_only', 'tokenbook_only', 'all_guidance'}"
+            )
+        self.guide_compile_policy = guide_compile_policy
         # Determine if deep supervision is requested
         ds_enabled = bool(getattr(mgr, 'enable_deep_supervision', False))
+
+        if self.guide_enabled:
+            if self.op_dims != 3:
+                raise ValueError("guide_backbone is only supported for 3D models in v1")
+            if self.pretrained_backbone:
+                raise ValueError("guide_backbone cannot be combined with pretrained_backbone in v1")
+            if self.architecture_type.lower().startswith("primus"):
+                raise ValueError("guide_backbone is not supported with primus architectures in v1")
+            if self.architecture_type.lower().startswith("mednext"):
+                raise ValueError("guide_backbone is not supported with mednext architectures in v1")
+            if self.guide_fusion_stage not in {"input", "input_gating", "feature_encoder", "feature_skip_concat", "direct_segmentation"}:
+                raise ValueError(
+                    "Unsupported guide_fusion_stage. Expected one of "
+                    "{'input', 'input_gating', 'feature_encoder', 'feature_skip_concat', 'direct_segmentation'}."
+                )
+            if self.guide_fusion_stage == "feature_encoder":
+                gate_alpha = float(model_config.get("guide_feature_gate_alpha", 1.0))
+                if not (0.0 <= gate_alpha <= 1.0):
+                    raise ValueError(
+                        f"guide_feature_gate_alpha must be in [0, 1], got {gate_alpha}"
+                    )
+                self.guide_feature_gate_alpha = gate_alpha
+            if self.guide_fusion_stage == "direct_segmentation" and ds_enabled:
+                raise ValueError("direct_segmentation does not support deep supervision")
+
+        if self.architecture_type.lower().startswith("mednext") and self.pretrained_backbone:
+            raise ValueError("pretrained_backbone cannot be combined with mednext architectures in v1")
+
+        if self.pretrained_backbone:
+            if ds_enabled:
+                print(
+                    "Warning: Deep supervision is enabled but the selected pretrained backbone path does not "
+                    "support multi-scale logits. Disabling deep supervision for this run."
+                )
+                setattr(mgr, "enable_deep_supervision", False)
+            self._init_pretrained_backbone(mgr, model_config)
+            return
+
+        if self._guide_uses_direct_segmentation():
+            self._init_direct_segmentation(model_config)
+            return
+
+        if self.architecture_type.lower().startswith("mednext"):
+            self._init_mednext(mgr, model_config)
+            return
 
         # Primus decoders do not emit multi-scale logits; block DS to avoid silent misconfiguration
         if self.architecture_type.lower().startswith("primus"):
@@ -563,6 +674,8 @@ class NetworkFromConfig(nn.Module):
             squeeze_excitation_add_maxpool=model_config.get("squeeze_excitation_add_maxpool", False),
             pool_type=model_config.get("pool_type", "conv")
         )
+        if self._guide_uses_skip_feature_concat():
+            self.guide_skip_concat_projector_channels = self._resolve_skip_concat_projector_channels(model_config)
         self.task_decoders = nn.ModuleDict()
         self.task_activations = nn.ModuleDict()
         self.task_heads = nn.ModuleDict()
@@ -603,11 +716,13 @@ class NetworkFromConfig(nn.Module):
 
         # If at least one task uses shared, build a single shared decoder trunk (features-only)
         if len(tasks_using_shared) > 0:
+            shared_decoder_skip_channels = self._decoder_skip_channels()
             self.shared_decoder = Decoder(
                 encoder=self.shared_encoder,
                 basic_block=model_config.get("basic_decoder_block", "ConvBlock"),
                 num_classes=None,  # features-only mode
                 n_conv_per_stage=model_config.get("n_conv_per_stage_decoder", [1] * (self.num_stages - 1)),
+                skip_channels=shared_decoder_skip_channels,
                 deep_supervision=False,
                 upsample_mode=self.upsample_mode,
             )
@@ -624,16 +739,20 @@ class NetworkFromConfig(nn.Module):
         for target_name in sorted(tasks_using_separate):
             out_channels = self.targets[target_name]["out_channels"]
             activation_str = self.targets[target_name].get("activation", "none")
+            decoder_skip_channels = self._decoder_skip_channels()
             self.task_decoders[target_name] = Decoder(
                 encoder=self.shared_encoder,
                 basic_block=model_config.get("basic_decoder_block", "ConvBlock"),
                 num_classes=out_channels,
                 n_conv_per_stage=model_config.get("n_conv_per_stage_decoder", [1] * (self.num_stages - 1)),
+                skip_channels=decoder_skip_channels,
                 deep_supervision=False,
                 upsample_mode=self.upsample_mode,
             )
             self.task_activations[target_name] = get_activation_module(activation_str)
             print(f"Task '{target_name}' configured with separate decoder ({out_channels} channels)")
+
+        self._init_guidance(model_config)
 
         # --------------------------------------------------------------------
         # Build final configuration snapshot.
@@ -679,13 +798,576 @@ class NetworkFromConfig(nn.Module):
             "target_z_projection": self.task_z_projection_cfg,
             "separate_decoders": len(tasks_using_separate) > 0,
             "num_pool_per_axis": getattr(self, 'num_pool_per_axis', None),
-            "must_be_divisible_by": getattr(self, 'must_be_divisible_by', None)
+            "must_be_divisible_by": getattr(self, 'must_be_divisible_by', None),
+            "guide_backbone": self.guide_backbone_name,
+            "guide_backbone_config_path": self.guide_backbone_config_path,
+            "guide_freeze": self.guide_freeze,
+            "guide_patch_grid": self.guide_patch_grid,
+            "guide_stage_keys": list(self.guide_stage_keys) if self.guide_stage_keys is not None else None,
+            "guide_skip_concat_projector_channels": (
+                list(self.guide_skip_concat_projector_channels)
+                if self._guide_uses_skip_feature_concat() and self.guide_skip_concat_projector_channels is not None
+                else None
+            ),
+            "guide_feature_gate_alpha": self.guide_feature_gate_alpha if self._guide_uses_encoder_feature_gating() else None,
+            "guide_tokenbook_tokens": getattr(self, "guide_tokenbook_tokens", None) if not self._guide_uses_skip_feature_concat() else None,
+            "guide_tokenbook_prototype_weighting": getattr(self, "guide_tokenbook_prototype_weighting", "mean") if not self._guide_uses_skip_feature_concat() else None,
+            "guide_tokenbook_weight_mlp_hidden": getattr(self, "guide_tokenbook_weight_mlp_hidden", None) if not self._guide_uses_skip_feature_concat() else None,
+            "guide_compile_policy": self.guide_compile_policy if self.guide_enabled else "off",
+            "guide_fusion_stage": self.guide_fusion_stage if self.guide_enabled else None,
         }
 
         print("NetworkFromConfig initialized with final configuration:")
         for k, v in self.final_config.items():
             print(f"  {k}: {v}")
+
+    def _guide_uses_input_gating(self) -> bool:
+        return self.guide_enabled and self.guide_fusion_stage in {"input", "input_gating"}
+
+    def _guide_uses_encoder_feature_gating(self) -> bool:
+        return self.guide_enabled and self.guide_fusion_stage == "feature_encoder"
+
+    def _guide_uses_skip_feature_concat(self) -> bool:
+        return self.guide_enabled and self.guide_fusion_stage == "feature_skip_concat"
+
+    def _guide_uses_direct_segmentation(self) -> bool:
+        return self.guide_enabled and self.guide_fusion_stage == "direct_segmentation"
+
+    def _resolve_skip_concat_projector_channels(self, model_config):
+        native_skip_channels = [int(ch) for ch in self.shared_encoder.output_channels]
+        configured = model_config.get("guide_skip_concat_projector_channels")
+        if configured is None:
+            return native_skip_channels
+
+        projector_channels = [int(ch) for ch in configured]
+        if len(projector_channels) != len(native_skip_channels):
+            raise ValueError(
+                "guide_skip_concat_projector_channels must have as many entries as encoder stages, "
+                f"got {len(projector_channels)} and {len(native_skip_channels)}."
+            )
+        if any(ch <= 0 for ch in projector_channels):
+            raise ValueError(
+                "guide_skip_concat_projector_channels entries must be > 0, "
+                f"got {projector_channels}."
+            )
+        return projector_channels
+
+    def _decoder_skip_channels(self):
+        if self._guide_uses_skip_feature_concat():
+            projector_channels = self.guide_skip_concat_projector_channels
+            if projector_channels is None:
+                projector_channels = [int(ch) for ch in self.shared_encoder.output_channels]
+            return [
+                int(native_ch) + int(projected_ch)
+                for native_ch, projected_ch in zip(self.shared_encoder.output_channels, projector_channels)
+            ]
+        return list(self.shared_encoder.output_channels)
+
+    def _init_guidance(self, model_config):
+        if not self.guide_enabled:
+            return
+
+        input_shape = tuple(model_config.get("input_shape", self.patch_size))
+        self.guide_backbone = build_dinov2_backbone(
+            self.guide_backbone_name,
+            input_channels=self.in_channels,
+            input_shape=input_shape,
+            config_path=self.guide_backbone_config_path,
+        )
+        if getattr(self.guide_backbone, "ndim", None) != 3:
+            raise ValueError("guide_backbone must resolve to a 3D Dinovol backbone")
+
+        patch_embed_size = tuple(int(v) for v in self.guide_backbone.patch_embed_size)
+        if any(size % patch != 0 for size, patch in zip(input_shape, patch_embed_size)):
+            raise ValueError(
+                f"Configured input_shape {input_shape} must be divisible by guide patch size {patch_embed_size}"
+            )
+
+        self.guide_patch_grid = tuple(size // patch for size, patch in zip(input_shape, patch_embed_size))
+        self.guide_tokenbook_tokens = None
+        self.guide_tokenbook_prototype_weighting = "mean"
+        self.guide_tokenbook_weight_mlp_hidden = None
+        if self._guide_uses_input_gating() or self._guide_uses_direct_segmentation():
+            default_token_count = int(math.prod(self.guide_patch_grid))
+            configured_token_count = model_config.get("guide_tokenbook_tokens")
+            if configured_token_count is None:
+                token_count = default_token_count
+            else:
+                token_count = int(configured_token_count)
+                if token_count <= 0:
+                    raise ValueError(f"guide_tokenbook_tokens must be > 0, got {token_count}")
+            self.guide_tokenbook_tokens = token_count
+            prototype_weighting = str(
+                model_config.get("guide_tokenbook_prototype_weighting", "mean")
+            ).strip().lower()
+            self.guide_tokenbook_prototype_weighting = prototype_weighting
+            self.guide_tokenbook_weight_mlp_hidden = model_config.get("guide_tokenbook_weight_mlp_hidden")
+            tokenbook_kwargs = {
+                "n_tokens": token_count,
+                "embed_dim": int(self.guide_backbone.embed_dim),
+                "dropout": float(model_config.get("guide_tokenbook_dropout", 0.0)),
+                "ema_decay": model_config.get("guide_tokenbook_ema_decay"),
+                "use_ema": bool(model_config.get("guide_tokenbook_use_ema", False)),
+                "prototype_weighting": prototype_weighting,
+                "weight_mlp_hidden": self.guide_tokenbook_weight_mlp_hidden,
+            }
+            self.guide_tokenbook = TokenBook3D(**tokenbook_kwargs)
+            self.guide_stage_keys = None
+        elif self._guide_uses_encoder_feature_gating():
+            default_token_count = int(math.prod(self.guide_patch_grid))
+            configured_token_count = model_config.get("guide_tokenbook_tokens")
+            if configured_token_count is None:
+                token_count = default_token_count
+            else:
+                token_count = int(configured_token_count)
+                if token_count <= 0:
+                    raise ValueError(f"guide_tokenbook_tokens must be > 0, got {token_count}")
+            self.guide_tokenbook_tokens = token_count
+            prototype_weighting = str(
+                model_config.get("guide_tokenbook_prototype_weighting", "mean")
+            ).strip().lower()
+            self.guide_tokenbook_prototype_weighting = prototype_weighting
+            self.guide_tokenbook_weight_mlp_hidden = model_config.get("guide_tokenbook_weight_mlp_hidden")
+            tokenbook_kwargs = {
+                "n_tokens": token_count,
+                "embed_dim": int(self.guide_backbone.embed_dim),
+                "dropout": float(model_config.get("guide_tokenbook_dropout", 0.0)),
+                "ema_decay": model_config.get("guide_tokenbook_ema_decay"),
+                "use_ema": bool(model_config.get("guide_tokenbook_use_ema", False)),
+                "prototype_weighting": prototype_weighting,
+                "weight_mlp_hidden": self.guide_tokenbook_weight_mlp_hidden,
+            }
+            self.guide_stage_keys = [f"enc_{stage_idx}" for stage_idx in range(self.num_stages)]
+            self.guide_stage_tokenbooks = nn.ModuleDict(
+                {
+                    stage_key: TokenBook3D(**tokenbook_kwargs)
+                    for stage_key in self.guide_stage_keys
+                }
+            )
+        elif self._guide_uses_skip_feature_concat():
+            self.guide_stage_keys = [f"enc_{stage_idx}" for stage_idx in range(self.num_stages)]
+            self.guide_skip_projectors = nn.ModuleDict(
+                {
+                    stage_key: ConvDropoutNormReLU(
+                        conv_op=self.conv_op,
+                        input_channels=int(self.guide_backbone.embed_dim),
+                        output_channels=int(self.guide_skip_concat_projector_channels[stage_idx]),
+                        kernel_size=1,
+                        stride=1,
+                        conv_bias=False,
+                        norm_op=self.norm_op,
+                        norm_op_kwargs=self.norm_op_kwargs,
+                        dropout_op=None,
+                        dropout_op_kwargs=None,
+                        nonlin=self.nonlin,
+                        nonlin_kwargs=self.nonlin_kwargs,
+                    )
+                    for stage_idx, stage_key in enumerate(self.guide_stage_keys)
+                }
+            )
+        self.guide_tokenbook_sample_rate = float(model_config.get("guide_tokenbook_sample_rate", 1.0))
+
+        if self.guide_freeze:
+            for parameter in self.guide_backbone.parameters():
+                parameter.requires_grad_(False)
+            self.guide_backbone.eval()
+
+    def _sample_guide_token_mask(self, guide_features):
+        if (not self.training) or self.guide_tokenbook_sample_rate >= 1.0:
+            return None
+
+        batch_size = guide_features.shape[0]
+        token_count = int(guide_features.shape[2] * guide_features.shape[3] * guide_features.shape[4])
+        mask = torch.rand(batch_size, token_count, device=guide_features.device) < self.guide_tokenbook_sample_rate
+        if mask.sum(dim=1).min().item() == 0:
+            random_indices = torch.randint(0, token_count, (batch_size,), device=guide_features.device)
+            mask[torch.arange(batch_size, device=guide_features.device), random_indices] = True
+        return mask
+
+    @staticmethod
+    def _compile_module_in_place(module: nn.Module) -> nn.Module:
+        compile_method = getattr(module, "compile", None)
+        if callable(compile_method):
+            compile_method()
+            return module
+        return torch.compile(module)
+
+    def _compile_guidance_submodules(self, *, device_type: str) -> list[str]:
+        if not self.guide_enabled or device_type != "cuda":
+            return []
+
+        compiled_modules: list[str] = []
+        compile_backbone = self.guide_compile_policy in {"backbone_only", "all_guidance"}
+        compile_tokenbooks = self.guide_compile_policy in {"tokenbook_only", "all_guidance"}
+
+        if compile_backbone and self.guide_backbone is not None:
+            self.guide_backbone = self._compile_module_in_place(self.guide_backbone)
+            compiled_modules.append("guide_backbone")
+
+        if compile_tokenbooks and self.guide_tokenbook is not None:
+            self.guide_tokenbook = self._compile_module_in_place(self.guide_tokenbook)
+            compiled_modules.append("guide_tokenbook")
+
+        if compile_tokenbooks and len(self.guide_stage_tokenbooks) > 0:
+            for stage_key in list(self.guide_stage_tokenbooks.keys()):
+                self.guide_stage_tokenbooks[stage_key] = self._compile_module_in_place(
+                    self.guide_stage_tokenbooks[stage_key]
+                )
+                compiled_modules.append(f"guide_tokenbook:{stage_key}")
+        if compile_tokenbooks and len(self.guide_skip_projectors) > 0:
+            for stage_key in list(self.guide_skip_projectors.keys()):
+                self.guide_skip_projectors[stage_key] = self._compile_module_in_place(
+                    self.guide_skip_projectors[stage_key]
+                )
+                compiled_modules.append(f"guide_projector:{stage_key}")
+        return compiled_modules
+
+    @torch.compiler.disable(reason="guided backbone compile failure")
+    def _compute_guide_features(self, x):
+        if self.guide_freeze:
+            with torch.inference_mode():
+                frozen_features = self.guide_backbone(x)[0]
+            return frozen_features.clone()
+        return self.guide_backbone(x)[0]
+
+    def _build_direct_segmentation_outputs(self, x):
+        if not self._guide_uses_direct_segmentation():
+            return {}, {}
+
+        guide_features = self._compute_guide_features(x)
+        token_mask = self._sample_guide_token_mask(guide_features)
+        guide_mask = self.guide_tokenbook(guide_features, token_mask=token_mask)
+        guide_probability = F.interpolate(
+            guide_mask,
+            size=x.shape[2:],
+            mode="trilinear",
+            align_corners=False,
+        ).clamp_(1e-6, 1.0 - 1e-6)
+        fg_logit = torch.logit(guide_probability)
+        bg_logit = torch.zeros_like(fg_logit)
+        logits = torch.cat([bg_logit, fg_logit], dim=1)
+        logits = self._apply_z_projection(self.direct_segmentation_target_name, logits)
+
+        results = {self.direct_segmentation_target_name: logits}
+        if self.direct_segmentation_target_name in self.task_activations and not self.training:
+            activation_fn = self.task_activations[self.direct_segmentation_target_name]
+            if activation_fn is not None:
+                results[self.direct_segmentation_target_name] = activation_fn(logits)
+        return results, {"guide_mask": guide_mask}
+
+    @torch.compiler.disable(reason="guided backbone compile failure")
+    def _apply_input_guidance(self, x):
+        if not self.guide_enabled:
+            return x, {}
+
+        guide_features = self._compute_guide_features(x)
+        token_mask = self._sample_guide_token_mask(guide_features)
+        guide_mask = self.guide_tokenbook(guide_features, token_mask=token_mask)
+        guide_for_input = F.interpolate(
+            guide_mask,
+            size=x.shape[2:],
+            mode="trilinear",
+            align_corners=False,
+        )
+        return x * guide_for_input, {"guide_mask": guide_mask}
+
+    def _get_encoder_stage_shapes(self, input_spatial_shape):
+        current_shape = [int(v) for v in input_spatial_shape]
+        stage_shapes = []
+        for stride in self.shared_encoder.strides:
+            current_shape = [
+                max(1, math.ceil(size / int(step)))
+                for size, step in zip(current_shape, stride)
+            ]
+            stage_shapes.append(tuple(current_shape))
+        return stage_shapes
+
+    @torch.compiler.disable(reason="guided backbone compile failure")
+    def _build_encoder_feature_guidance(self, x):
+        if not self._guide_uses_encoder_feature_gating():
+            return {}, {}
+
+        guide_features = self._compute_guide_features(x)
+        token_mask = self._sample_guide_token_mask(guide_features)
+        stage_shapes = self._get_encoder_stage_shapes(x.shape[2:])
+
+        feature_gates = {}
+        aux_outputs = {}
+        for stage_idx, stage_key in enumerate(self.guide_stage_keys or []):
+            stage_guide = self.guide_stage_tokenbooks[stage_key](guide_features, token_mask=token_mask)
+            target_shape = stage_shapes[stage_idx]
+            if stage_guide.shape[2:] != target_shape:
+                stage_guide = F.interpolate(
+                    stage_guide,
+                    size=target_shape,
+                    mode="trilinear",
+                    align_corners=False,
+                )
+            feature_gates[stage_key] = stage_guide
+            aux_outputs[stage_key] = stage_guide
+        return feature_gates, aux_outputs
+
+    @torch.compiler.disable(reason="guided backbone compile failure")
+    def _build_skip_concat_features(self, x, encoder_features):
+        if not self._guide_uses_skip_feature_concat():
+            return encoder_features, {}
+
+        guide_features = self._compute_guide_features(x)
+        augmented_features = []
+        for stage_idx, (stage_key, stage_feature) in enumerate(zip(self.guide_stage_keys or [], encoder_features)):
+            projected = self.guide_skip_projectors[stage_key](guide_features)
+            if projected.shape[2:] != stage_feature.shape[2:]:
+                projected = F.interpolate(
+                    projected,
+                    size=stage_feature.shape[2:],
+                    mode="trilinear",
+                    align_corners=False,
+                )
+            augmented_features.append(torch.cat([stage_feature, projected], dim=1))
+        return augmented_features, {}
     
+    def _init_pretrained_backbone(self, mgr, model_config):
+        print(f"--- Initializing pretrained backbone '{self.pretrained_backbone}' ---")
+        input_shape = tuple(model_config.get("input_shape", self.patch_size))
+        decoder_type = model_config.get("pretrained_decoder_type", "primus_patch_decode")
+        config_path = model_config.get("pretrained_backbone_config_path")
+
+        self.shared_encoder = build_dinov2_backbone(
+            self.pretrained_backbone,
+            input_channels=self.in_channels,
+            input_shape=input_shape,
+            config_path=config_path,
+        )
+        if self.freeze_encoder:
+            for parameter in self.shared_encoder.parameters():
+                parameter.requires_grad_(False)
+            self.shared_encoder.eval()
+            print("Encoder frozen — weights will not be updated during training")
+        self.task_decoders = nn.ModuleDict()
+        self.task_activations = nn.ModuleDict()
+        self.task_heads = nn.ModuleDict()
+
+        separate_decoders_default = model_config.get("separate_decoders", True)
+        decoder_head_channels = model_config.get("decoder_head_channels", 32)
+        tasks_using_shared, tasks_using_separate = set(), set()
+
+        for target_name, target_info in self.targets.items():
+            if 'out_channels' in target_info:
+                out_channels = target_info['out_channels']
+            elif 'channels' in target_info:
+                out_channels = target_info['channels']
+            else:
+                out_channels = self.in_channels
+                print(f"No channel specification found for task '{target_name}', defaulting to {out_channels} channels")
+            target_info["out_channels"] = out_channels
+            self._register_target_projection(target_name, target_info, model_config)
+
+            use_separate = target_info.get("separate_decoder", separate_decoders_default)
+            if use_separate:
+                tasks_using_separate.add(target_name)
+            else:
+                tasks_using_shared.add(target_name)
+
+        if len(tasks_using_shared) > 0:
+            self.shared_decoder = build_dinov2_decoder(decoder_type, self.shared_encoder, decoder_head_channels)
+            head_conv = nn.Conv2d if self.shared_encoder.ndim == 2 else nn.Conv3d
+            for target_name in sorted(tasks_using_shared):
+                out_ch = self.targets[target_name]["out_channels"]
+                self.task_heads[target_name] = head_conv(
+                    decoder_head_channels, out_ch, kernel_size=1, stride=1, padding=0, bias=True
+                )
+                activation_str = self.targets[target_name].get("activation", "none")
+                self.task_activations[target_name] = get_activation_module(activation_str)
+                print(
+                    f"Pretrained task '{target_name}' configured with shared {decoder_type} decoder + head ({out_ch} channels)"
+                )
+
+        for target_name in sorted(tasks_using_separate):
+            out_channels = self.targets[target_name]["out_channels"]
+            activation_str = self.targets[target_name].get("activation", "none")
+            self.task_decoders[target_name] = build_dinov2_decoder(
+                decoder_type,
+                self.shared_encoder,
+                out_channels,
+            )
+            self.task_activations[target_name] = get_activation_module(activation_str)
+            print(f"Pretrained task '{target_name}' configured with separate {decoder_type} decoder ({out_channels} channels)")
+
+        self.final_config = {
+            "model_name": self.mgr.model_name,
+            "architecture_type": self.architecture_type,
+            "pretrained_backbone": self.pretrained_backbone,
+            "pretrained_decoder_type": decoder_type,
+            "freeze_encoder": self.freeze_encoder,
+            "input_shape": input_shape,
+            "in_channels": self.in_channels,
+            "targets": self.targets,
+            "target_z_projection": self.task_z_projection_cfg,
+            "separate_decoders": len(tasks_using_separate) > 0,
+            "decoder_head_channels": decoder_head_channels,
+        }
+
+        print("Pretrained backbone network initialized with configuration:")
+        for k, v in self.final_config.items():
+            print(f"  {k}: {v}")
+
+    def _init_mednext(self, mgr, model_config):
+        if self.op_dims != 3:
+            raise ValueError("MedNeXt support is currently limited to 3D models in vesuvius")
+
+        architecture_name = str(self.architecture_type).strip().lower()
+        if architecture_name not in {"mednext_v1", "mednext_v2"}:
+            raise ValueError(
+                f"Unsupported mednext architecture_type {self.architecture_type!r}. "
+                "Expected one of {'mednext_v1', 'mednext_v2'}."
+            )
+
+        model_id = model_config.get("mednext_model_id")
+        if model_id in (None, ""):
+            raise ValueError("mednext_model_id must be explicitly set for mednext architectures")
+
+        base_cfg = get_mednext_v1_config(model_id)
+        width_factor = int(model_config.get("mednext_width_factor", 1))
+        if width_factor not in {1, 2}:
+            raise ValueError(f"mednext_width_factor must be 1 or 2, got {width_factor}")
+        if architecture_name == "mednext_v1" and width_factor != 1:
+            raise ValueError("mednext_width_factor is only supported for mednext_v2")
+
+        if architecture_name == "mednext_v2":
+            if "mednext_kernel_size" in model_config and int(model_config["mednext_kernel_size"]) != 3:
+                raise ValueError("mednext_v2 fixes the MedNeXt kernel size to 3")
+            kernel_size = 3
+            norm_type = "instance"
+            use_grn = True
+        else:
+            kernel_size = int(model_config.get("mednext_kernel_size", 3))
+            norm_type = "group"
+            use_grn = False
+        checkpoint_style = model_config.get("mednext_checkpoint_style", base_cfg["checkpoint_style"])
+        if checkpoint_style == "":
+            checkpoint_style = None
+
+        resolved_cfg = {
+            "model_id": base_cfg["model_id"],
+            "base_channels": int(base_cfg["n_channels"]) * width_factor,
+            "exp_r": list(base_cfg["exp_r"]) if isinstance(base_cfg["exp_r"], (list, tuple)) else [int(base_cfg["exp_r"])] * 9,
+            "block_counts": list(base_cfg["block_counts"]),
+            "kernel_size": kernel_size,
+            "checkpoint_style": checkpoint_style,
+            "norm_type": norm_type,
+            "grn": use_grn,
+            "width_factor": width_factor,
+        }
+
+        self.shared_encoder = MedNeXtEncoder(
+            input_channels=self.in_channels,
+            n_channels=resolved_cfg["base_channels"],
+            exp_r=resolved_cfg["exp_r"],
+            block_counts=resolved_cfg["block_counts"],
+            kernel_size=resolved_cfg["kernel_size"],
+            checkpoint_style=resolved_cfg["checkpoint_style"],
+            norm_type=resolved_cfg["norm_type"],
+            grn=resolved_cfg["grn"],
+            do_res=True,
+            do_res_up_down=True,
+        )
+        self.task_decoders = nn.ModuleDict()
+        self.task_activations = nn.ModuleDict()
+        self.task_heads = nn.ModuleDict()
+
+        ds_enabled = bool(getattr(mgr, "enable_deep_supervision", False))
+        separate_decoders_default = model_config.get("separate_decoders", ds_enabled)
+        tasks_using_separate = set()
+        tasks_using_shared = set()
+        for target_name, target_info in self.targets.items():
+            if "out_channels" in target_info:
+                out_channels = target_info["out_channels"]
+            elif "channels" in target_info:
+                out_channels = target_info["channels"]
+            else:
+                out_channels = self.in_channels
+                print(f"No channel specification found for task '{target_name}', defaulting to {out_channels} channels")
+            target_info["out_channels"] = out_channels
+            self._register_target_projection(target_name, target_info, model_config)
+            use_separate = target_info.get("separate_decoder", separate_decoders_default)
+            # Persist the resolved per-target decoder layout so strict checkpoint
+            # reloads can rebuild mixed shared/separate MedNeXt models exactly.
+            target_info["separate_decoder"] = bool(use_separate)
+            if use_separate:
+                tasks_using_separate.add(target_name)
+            else:
+                tasks_using_shared.add(target_name)
+
+        if ds_enabled and len(tasks_using_shared) > 0:
+            print(
+                "Deep supervision enabled: switching shared-decoder tasks to separate decoders for DS support:",
+                ", ".join(sorted(tasks_using_shared)),
+            )
+            tasks_using_separate.update(tasks_using_shared)
+            tasks_using_shared.clear()
+
+        if len(tasks_using_shared) > 0:
+            self.shared_decoder = MedNeXtDecoder(
+                encoder=self.shared_encoder,
+                num_classes=None,
+                deep_supervision=False,
+            )
+            head_in_ch = self.shared_encoder.output_channels[0]
+            for target_name in sorted(tasks_using_shared):
+                out_ch = self.targets[target_name]["out_channels"]
+                self.task_heads[target_name] = nn.Conv3d(head_in_ch, out_ch, kernel_size=1, stride=1, padding=0, bias=True)
+                activation_str = self.targets[target_name].get("activation", "none")
+                self.task_activations[target_name] = get_activation_module(activation_str)
+                print(f"MedNeXt task '{target_name}' configured with shared decoder + head ({out_ch} channels)")
+        else:
+            self.shared_decoder = None
+
+        for target_name in sorted(tasks_using_separate):
+            out_channels = self.targets[target_name]["out_channels"]
+            activation_str = self.targets[target_name].get("activation", "none")
+            self.task_decoders[target_name] = MedNeXtDecoder(
+                encoder=self.shared_encoder,
+                num_classes=out_channels,
+                deep_supervision=ds_enabled,
+            )
+            self.task_activations[target_name] = get_activation_module(activation_str)
+            print(f"MedNeXt task '{target_name}' configured with separate decoder ({out_channels} channels)")
+
+        mednext_pool_factors = []
+        encoder_strides = [tuple(int(v) for v in stride) for stride in self.shared_encoder.strides]
+        for prev_stride, next_stride in zip(encoder_strides[:-1], encoder_strides[1:]):
+            mednext_pool_factors.append([
+                int(next_dim // prev_dim) for prev_dim, next_dim in zip(prev_stride, next_stride)
+            ])
+
+        self.final_config = {
+            "model_name": self.mgr.model_name,
+            "architecture_type": self.architecture_type,
+            "mednext_model_id": resolved_cfg["model_id"],
+            "mednext_base_channels": resolved_cfg["base_channels"],
+            "mednext_exp_r": resolved_cfg["exp_r"],
+            "mednext_block_counts": resolved_cfg["block_counts"],
+            "mednext_kernel_size": resolved_cfg["kernel_size"],
+            "mednext_checkpoint_style": resolved_cfg["checkpoint_style"],
+            "mednext_norm_type": resolved_cfg["norm_type"],
+            "mednext_grn": resolved_cfg["grn"],
+            "mednext_width_factor": resolved_cfg["width_factor"],
+            "patch_size": self.patch_size,
+            "batch_size": self.batch_size,
+            "in_channels": self.in_channels,
+            "autoconfigure": self.autoconfigure,
+            "targets": self.targets,
+            "target_z_projection": self.task_z_projection_cfg,
+            "separate_decoders": len(tasks_using_separate) > 0,
+            "pool_op_kernel_sizes": mednext_pool_factors,
+            "strides": [list(v) for v in encoder_strides],
+            "enable_deep_supervision": ds_enabled,
+        }
+
+        print("MedNeXt network initialized with configuration:")
+        for k, v in self.final_config.items():
+            print(f"  {k}: {v}")
+
     def _init_primus(self, mgr, model_config):
         """
         Initialize Primus transformer architecture.
@@ -862,9 +1544,32 @@ class NetworkFromConfig(nn.Module):
             return False
         return True
 
-    def forward(self, x, return_mae_mask=False):
+    def train(self, mode: bool = True):
+        super().train(mode)
+        if self.pretrained_backbone and self.freeze_encoder and self.shared_encoder is not None:
+            self.shared_encoder.eval()
+        if self.guide_enabled and self.guide_freeze and self.guide_backbone is not None:
+            self.guide_backbone.eval()
+        return self
+
+    def forward(self, x, return_mae_mask=False, return_aux=False):
         # Check input channels and warn if mismatch
         self.check_input_channels(x)
+        aux_outputs = {}
+        encoder_feature_gates = None
+
+        if self._guide_uses_direct_segmentation():
+            if return_mae_mask:
+                raise RuntimeError("direct_segmentation does not support return_mae_mask")
+            results, aux_outputs = self._build_direct_segmentation_outputs(x)
+            if return_aux:
+                return results, aux_outputs
+            return results
+
+        if self._guide_uses_input_gating():
+            x, aux_outputs = self._apply_input_guidance(x)
+        elif self._guide_uses_encoder_feature_gating():
+            encoder_feature_gates, aux_outputs = self._build_encoder_feature_guidance(x)
 
         # Get features from encoder (works for both U-Net and Primus)
         # For MAE training with Primus, we need to get the mask
@@ -894,7 +1599,16 @@ class NetworkFromConfig(nn.Module):
                 )
         else:
             # Standard forward pass
-            features = self.shared_encoder(x)
+            if encoder_feature_gates is not None:
+                features = self.shared_encoder(
+                    x,
+                    feature_gates=encoder_feature_gates,
+                    feature_gate_alpha=self.guide_feature_gate_alpha,
+                )
+            else:
+                features = self.shared_encoder(x)
+            if self._guide_uses_skip_feature_concat():
+                features, aux_outputs = self._build_skip_concat_features(x, features)
             restoration_mask = None
         
         results = {}
@@ -934,5 +1648,71 @@ class NetworkFromConfig(nn.Module):
         
         # Return MAE mask if requested (for MAE training)
         if return_mae_mask:
+            if return_aux:
+                return results, restoration_mask, aux_outputs
             return results, restoration_mask
+        if return_aux:
+            return results, aux_outputs
         return results
+
+    def _init_direct_segmentation(self, model_config):
+        primary_targets = [
+            name for name, info in self.targets.items()
+            if not (info or {}).get("auxiliary_task", False)
+        ]
+        if len(primary_targets) != 1:
+            raise ValueError(
+                "direct_segmentation supports exactly one non-auxiliary target in v1, "
+                f"got {primary_targets}."
+            )
+
+        target_name = primary_targets[0]
+        target_info = self.targets[target_name]
+        configured_out_channels = target_info.get("out_channels", target_info.get("channels", 2))
+        if int(configured_out_channels) != 2:
+            raise ValueError(
+                "direct_segmentation expects a binary target configured with out_channels=2, "
+                f"got {configured_out_channels} for target '{target_name}'."
+            )
+        target_info["out_channels"] = 2
+        self._register_target_projection(target_name, target_info, model_config)
+        activation_str = target_info.get("activation", "none")
+
+        self.shared_encoder = None
+        self.shared_decoder = None
+        self.task_decoders = nn.ModuleDict()
+        self.task_heads = nn.ModuleDict()
+        self.task_activations = nn.ModuleDict({target_name: get_activation_module(activation_str)})
+        self.direct_segmentation_target_name = target_name
+        self.guide_direct_output_mode = "two_channel_logits"
+
+        self._init_guidance(model_config)
+
+        self.final_config = {
+            "model_name": self.mgr.model_name,
+            "architecture_type": "guide_only",
+            "patch_size": self.patch_size,
+            "batch_size": self.batch_size,
+            "in_channels": self.in_channels,
+            "autoconfigure": self.autoconfigure,
+            "targets": self.targets,
+            "target_z_projection": self.task_z_projection_cfg,
+            "guide_backbone": self.guide_backbone_name,
+            "guide_backbone_config_path": self.guide_backbone_config_path,
+            "guide_freeze": self.guide_freeze,
+            "guide_patch_grid": self.guide_patch_grid,
+            "guide_stage_keys": None,
+            "guide_skip_concat_projector_channels": None,
+            "guide_feature_gate_alpha": None,
+            "guide_tokenbook_tokens": getattr(self, "guide_tokenbook_tokens", None),
+            "guide_tokenbook_prototype_weighting": getattr(self, "guide_tokenbook_prototype_weighting", "mean"),
+            "guide_tokenbook_weight_mlp_hidden": getattr(self, "guide_tokenbook_weight_mlp_hidden", None),
+            "guide_compile_policy": self.guide_compile_policy,
+            "guide_fusion_stage": self.guide_fusion_stage,
+            "guide_direct_output_mode": self.guide_direct_output_mode,
+            "direct_segmentation_target_name": self.direct_segmentation_target_name,
+        }
+
+        print("NetworkFromConfig initialized with final configuration:")
+        for k, v in self.final_config.items():
+            print(f"  {k}: {v}")

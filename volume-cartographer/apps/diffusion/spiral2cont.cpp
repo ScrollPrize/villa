@@ -21,7 +21,7 @@
 #include <boost/graph/adjacency_list.hpp>
 #include <ceres/ceres.h>
 #include <opencv2/ximgproc.hpp>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include "vc/core/util/GridStore.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -52,14 +52,12 @@ int spiral2cont_main(
     double start_winding = vm["start-winding"].as<double>();
     double end_winding = vm["end-winding"].as<double>();
 
-    std::ifstream i(json_in_path);
-    nlohmann::json json_input;
-    i >> json_input;
+    utils::Json json_input = utils::Json::parse_file(json_in_path);
 
-    nlohmann::json json_collection;
+    utils::Json json_collection;
     bool collection_found = false;
     for (const auto& col : json_input) {
-        if (col["name"] == collection_name) {
+        if (col["name"].get_string() == collection_name) {
             json_collection = col;
             collection_found = true;
             break;
@@ -71,7 +69,20 @@ int spiral2cont_main(
         return 1;
     }
 
-    std::vector<std::vector<SpiralPoint>> all_spiral_wraps = json_collection["spirals"].get<std::vector<std::vector<SpiralPoint>>>();
+    std::vector<std::vector<SpiralPoint>> all_spiral_wraps;
+    {
+        const utils::Json& spirals_json = json_collection["spirals"];
+        for (size_t wi = 0; wi < spirals_json.size(); ++wi) {
+            std::vector<SpiralPoint> wrap;
+            const utils::Json& wrap_json = spirals_json[wi];
+            for (size_t pi = 0; pi < wrap_json.size(); ++pi) {
+                SpiralPoint sp;
+                from_json(wrap_json[pi], sp);
+                wrap.push_back(sp);
+            }
+            all_spiral_wraps.push_back(wrap);
+        }
+    }
 
     std::vector<SpiralPoint> target_spiral;
     for (const auto& spiral : all_spiral_wraps) {

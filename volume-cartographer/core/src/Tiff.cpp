@@ -285,10 +285,11 @@ bool mergeTiffParts(const std::string& outputPath, int numParts)
     }
 
     std::cout << "Merging " << groups.size() << " TIFF(s) from " << numParts << " parts..." << std::endl;
+    size_t failures = 0;
     for (auto& [finalPath, partFiles] : groups) {
         std::sort(partFiles.begin(), partFiles.end());
         TIFF* first = TIFFOpen(partFiles[0].c_str(), "r");
-        if (!first) { std::cerr << "Cannot open " << partFiles[0] << "\n"; continue; }
+        if (!first) { std::cerr << "Cannot open " << partFiles[0] << "\n"; failures++; continue; }
         uint32_t w, h, tw, th; uint16_t bps, spp, sf, comp;
         TIFFGetField(first, TIFFTAG_IMAGEWIDTH, &w);
         TIFFGetField(first, TIFFTAG_IMAGELENGTH, &h);
@@ -301,7 +302,7 @@ bool mergeTiffParts(const std::string& outputPath, int numParts)
         TIFFClose(first);
 
         TIFF* out = TIFFOpen(finalPath.c_str(), "w");
-        if (!out) { std::cerr << "Cannot create " << finalPath << "\n"; continue; }
+        if (!out) { std::cerr << "Cannot create " << finalPath << "\n"; failures++; continue; }
         TIFFSetField(out, TIFFTAG_IMAGEWIDTH, w); TIFFSetField(out, TIFFTAG_IMAGELENGTH, h);
         TIFFSetField(out, TIFFTAG_TILEWIDTH, tw); TIFFSetField(out, TIFFTAG_TILELENGTH, th);
         TIFFSetField(out, TIFFTAG_BITSPERSAMPLE, bps); TIFFSetField(out, TIFFTAG_SAMPLESPERPIXEL, spp);
@@ -329,6 +330,10 @@ bool mergeTiffParts(const std::string& outputPath, int numParts)
         TIFFWriteDirectory(out); TIFFClose(out);
         for (auto& pf : partFiles) std::filesystem::remove(pf);
         std::cout << "  " << finalPath.filename().string() << ": " << merged << " tiles from " << partFiles.size() << " parts\n";
+    }
+    if (failures > 0) {
+        std::cerr << "Merge failed: " << failures << " of " << groups.size() << " TIFF(s) could not be created.\n";
+        return false;
     }
     std::cout << "Merge complete.\n";
     return true;

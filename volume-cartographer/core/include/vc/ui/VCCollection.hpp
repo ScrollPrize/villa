@@ -1,7 +1,7 @@
 #pragma once
 
 #include <QObject>
-#include <QDateTime>
+#include <chrono>
 #include <opencv2/core.hpp>
 #include <string>
 #include <vector>
@@ -10,7 +10,7 @@
 #include <optional>
 #include <filesystem>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
  
 
  
@@ -20,7 +20,7 @@ struct ColPoint
     uint64_t collectionId;
     cv::Vec3f p = {0,0,0};
     float winding_annotation = NAN;
-    qint64 creation_time = 0;
+    int64_t creation_time = 0;
 };
  
 struct CollectionMetadata
@@ -107,12 +107,12 @@ private:
     uint64_t _next_collection_id = 1;
 };
  
-void to_json(nlohmann::json& j, const ColPoint& p);
-void from_json(const nlohmann::json& j, ColPoint& p);
- 
-void to_json(nlohmann::json& j, const CollectionMetadata& m);
-void from_json(const nlohmann::json& j, CollectionMetadata& m);
- 
-void to_json(nlohmann::json& j, const VCCollection::Collection& c);
-void from_json(const nlohmann::json& j, VCCollection::Collection& c);
+void to_json(utils::Json& j, const ColPoint& p);
+void from_json(const utils::Json& j, ColPoint& p);
+
+void to_json(utils::Json& j, const CollectionMetadata& m);
+void from_json(const utils::Json& j, CollectionMetadata& m);
+
+void to_json(utils::Json& j, const VCCollection::Collection& c);
+void from_json(const utils::Json& j, VCCollection::Collection& c);
  

@@ -1,3 +1,5 @@
+#include <cmath>
+#include <iostream>
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -5,14 +7,14 @@
 #include "vc/tracer/SurfaceModeling.hpp"
 
 #include "vc/core/types/VcDataset.hpp"
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include <opencv2/imgcodecs.hpp>
 #include <omp.h>
 
 
 
-using json = nlohmann::json;
+using Json = utils::Json;
 
 
 static inline float sdist(const cv::Vec3f &a, const cv::Vec3f &b)
@@ -84,16 +86,16 @@ float find_loc_wind_slow(cv::Vec2f &loc, float tgt_wind, const cv::Mat_<cv::Vec3
         if (r)
             cand = {static_cast<float>(rand_r(&sr) % points.cols), static_cast<float>(rand_r(&sr) % points.rows)};
         
-        if (std::isnan(winding(cand[1],cand[0])) || abs(winding(cand[1],cand[0])-tgt_wind) > 0.5)
+        if (std::isnan(winding(cand[1],cand[0])) || std::abs(winding(cand[1],cand[0])-tgt_wind) > 0.5)
             continue;
-        
+
         cv::Vec3f out_;
         float res = min_loc_plain(points, cand, out_, tgt, 4.0, 0.01);
-        
+
         if (res < 0)
             continue;
-        
-        if (std::isnan(winding(cand[1],cand[0])) || abs(winding(cand[1],cand[0])-tgt_wind) > 0.3)
+
+        if (std::isnan(winding(cand[1],cand[0])) || std::abs(winding(cand[1],cand[0])-tgt_wind) > 0.3)
             continue;
         
         if (res < th) {
@@ -346,8 +348,8 @@ int main(int argc, char *argv[])
         cv::Mat_<cv::Vec3f> points_hr = points_hr_grounding(wind_lr, points_lr, winds, surf_points, scale_factor);
         QuadSurface *surf_hr = new QuadSurface(points_hr, surfs[0]->_scale);
         std::filesystem::path tgt_dir = "./";
-        surf_hr->meta = std::make_unique<nlohmann::json>();
-        (*surf_hr->meta)["vc_tiffxyz_upscale_grounding_scale_factor"] = scale_factor;
+        surf_hr->meta = utils::Json::object();
+        surf_hr->meta["vc_tiffxyz_upscale_grounding_scale_factor"] = scale_factor;
         std::string name_prefix = "grounding_hr_";
         std::string uuid = name_prefix + time_str();
         std::filesystem::path seg_dir = tgt_dir / uuid;

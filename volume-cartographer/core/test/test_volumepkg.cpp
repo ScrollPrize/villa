@@ -7,7 +7,7 @@
 #include <string>
 #include <vector>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -40,7 +40,7 @@ private:
     fs::path path_;
 };
 
-void writeJson(const fs::path& path, const nlohmann::json& json)
+void writeJson(const fs::path& path, const utils::Json& json)
 {
     std::ofstream out(path);
     out << json.dump(2) << '\n';

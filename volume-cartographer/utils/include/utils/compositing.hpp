@@ -1,13 +1,9 @@
 #pragma once
 #include <span>
 #include <vector>
-#include <array>
 #include <cstddef>
 #include <cmath>
-#include <concepts>
 #include <algorithm>
-#include <numeric>
-#include <numbers>
 #include <string_view>
 #include <cstdint>
 
@@ -110,34 +106,6 @@ inline void value_stretch(std::span<float> data) noexcept {
     for (float& v : data) {
         v = (v - lo) * inv;
     }
-}
-
-// ---------------------------------------------------------------------------
-// Lighting helpers
-// ---------------------------------------------------------------------------
-
-/// Convert azimuth / elevation (radians) to a unit direction vector.
-[[nodiscard]] constexpr std::array<float, 3> spherical_to_direction(
-    float azimuth, float elevation) noexcept
-{
-    float ce = std::cos(elevation);
-    return {
-        ce * std::cos(azimuth),
-        ce * std::sin(azimuth),
-        std::sin(elevation)
-    };
-}
-
-/// Lambertian diffuse factor: max(dot(normal, light_dir), 0).
-[[nodiscard]] constexpr float lambertian_factor(
-    const std::array<float, 3>& normal,
-    float azimuth, float elevation) noexcept
-{
-    auto light = spherical_to_direction(azimuth, elevation);
-    float dot = normal[0] * light[0]
-              + normal[1] * light[1]
-              + normal[2] * light[2];
-    return dot > 0.0f ? dot : 0.0f;
 }
 
 // ---------------------------------------------------------------------------
@@ -258,37 +226,6 @@ inline void value_stretch(std::span<float> data) noexcept {
                 layers, params.extinction, params.emission, params.ambient);
     }
     return 0.0f;
-}
-
-/// Composite with per-layer surface normals (Beer-Lambert + Lambertian
-/// lighting).  Each layer's emission contribution is modulated by the
-/// diffuse lighting factor computed from its normal.
-[[nodiscard]] constexpr float composite_stack_lit(
-    std::span<const float> layers,
-    std::span<const std::array<float, 3>> normals,
-    const CompositeParams& params) noexcept
-{
-    if (layers.empty()) return params.ambient;
-
-    std::size_t n = layers.size();
-    if (normals.size() < n) n = normals.size();
-
-    float transmittance = 1.0f;
-    float accumulated   = 0.0f;
-
-    for (std::size_t i = 0; i < n; ++i) {
-        float density = layers[i];
-        float T = std::exp(-params.extinction * density);
-
-        float lf = lambertian_factor(
-            normals[i], params.light_azimuth, params.light_elevation);
-
-        accumulated   += params.emission * density * lf * transmittance;
-        transmittance *= T;
-
-        if (transmittance < 1e-6f) break;
-    }
-    return accumulated + params.ambient * transmittance;
 }
 
 // ---------------------------------------------------------------------------

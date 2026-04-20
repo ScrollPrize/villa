@@ -1,3 +1,9 @@
+// Override global new/delete with mimalloc if available. Must be included
+// in exactly ONE translation unit; the linker picks up the override symbols.
+#if defined(VC_HAVE_MIMALLOC)
+#include <mimalloc-new-delete.h>
+#endif
+
 #include <qapplication.h>
 #include <QCommandLineParser>
 
@@ -14,6 +20,9 @@
 #include <omp.h>
 #include <blosc.h>
 #include <cstdlib>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 #ifndef _WIN32
 #include <dlfcn.h>
 #include <sys/resource.h>
@@ -51,6 +60,16 @@ auto main(int argc, char* argv[]) -> int
     // On non-Linux, preinit_array is unavailable so set env vars at start of main.
     // This may be too late for some libraries that init in static constructors.
     setThreadPoliciesEarly();
+#endif
+
+#if defined(__GLIBC__) && !defined(VC_HAVE_MIMALLOC)
+    // Tune glibc's malloc to give freed pages back to the OS more aggressively.
+    // Lower M_MMAP_THRESHOLD pushes bigger allocations through mmap (returned
+    // independently on free), reducing main-heap fragmentation. Lower
+    // M_TRIM_THRESHOLD runs sbrk-trim more often. Only takes effect when
+    // mimalloc isn't overriding malloc.
+    ::mallopt(M_MMAP_THRESHOLD, 128 * 1024);
+    ::mallopt(M_TRIM_THRESHOLD, 128 * 1024);
 #endif
 
 #ifndef _WIN32

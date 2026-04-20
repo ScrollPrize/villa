@@ -53,6 +53,7 @@ class Decoder(nn.Module):
                  num_classes: Union[int, None],
                  n_conv_per_stage: Union[int, Tuple[int, ...], List[int]],
                  deep_supervision,
+                 skip_channels: Union[None, Tuple[int, ...], List[int]] = None,
                  nonlin_first: bool = False,
                  norm_op: Union[None, Type[nn.Module]] = None,
                  norm_op_kwargs: dict = None,
@@ -87,6 +88,21 @@ class Decoder(nn.Module):
         object.__setattr__(self, '_encoder_ref', encoder)
         self.num_classes = num_classes if num_classes is not None else 0
         n_stages_encoder = len(encoder.output_channels)
+        if skip_channels is None:
+            skip_channels = list(encoder.output_channels)
+        elif isinstance(skip_channels, tuple):
+            skip_channels = list(skip_channels)
+        else:
+            skip_channels = list(skip_channels)
+        assert len(skip_channels) == n_stages_encoder, (
+            "skip_channels must have as many entries as encoder.output_channels, "
+            f"got {len(skip_channels)} and {n_stages_encoder}"
+        )
+        self.skip_channels = [int(v) for v in skip_channels]
+        self.native_encoder_channels = [int(v) for v in encoder.output_channels]
+        self.bottleneck_input_channels = int(self.skip_channels[-1])
+        self.decoder_stage_input_channels = []
+        self.decoder_stage_output_channels = []
         if isinstance(n_conv_per_stage, int):
             n_conv_per_stage = [n_conv_per_stage] * (n_stages_encoder - 1)
         assert len(n_conv_per_stage) == n_stages_encoder - 1, "n_conv_per_stage must have as many entries as we have " \
@@ -108,26 +124,27 @@ class Decoder(nn.Module):
             transpconvs = []
             seg_layers = []
             for s in range(1, n_stages_encoder):
-                input_features_below = encoder.output_channels[-s]
-                input_features_skip = encoder.output_channels[-(s + 1)]
+                input_features_below = self.skip_channels[-1] if s == 1 else encoder.output_channels[-s]
+                input_features_skip_native = encoder.output_channels[-(s + 1)]
+                input_features_skip = self.skip_channels[-(s + 1)]
                 stride_for_transpconv = encoder.strides[-s]
                 if upsample_mode == "trilinear":
                     transpconvs.append(TrilinearUpsample3d(
-                        input_features_below, input_features_skip, stride_for_transpconv, bias=encoder.conv_bias))
+                        input_features_below, input_features_skip_native, stride_for_transpconv, bias=encoder.conv_bias))
                 elif upsample_mode == "pixelshuffle":
                     transpconvs.append(PixelShuffle3d(
-                        input_features_below, input_features_skip, stride_for_transpconv, bias=encoder.conv_bias))
+                        input_features_below, input_features_skip_native, stride_for_transpconv, bias=encoder.conv_bias))
                 else:
                     transpconvs.append(transpconv_op(
-                        input_features_below, input_features_skip, stride_for_transpconv, stride_for_transpconv,
+                        input_features_below, input_features_skip_native, stride_for_transpconv, stride_for_transpconv,
                         bias=encoder.conv_bias
                     ))
-                # input features to conv is 2x input_features_skip (concat input_features_skip with transpconv output)
+                conv_input_channels = input_features_skip_native + input_features_skip
                 stages.append(StackedResidualBlocks(
                     n_blocks=n_conv_per_stage[s - 1],
                     conv_op=encoder.conv_op,
-                    input_channels=2 * input_features_skip,
-                    output_channels=input_features_skip,
+                    input_channels=conv_input_channels,
+                    output_channels=input_features_skip_native,
                     kernel_size=encoder.kernel_sizes[-(s + 1)],
                     initial_stride=1,
                     conv_bias=conv_bias,
@@ -138,36 +155,39 @@ class Decoder(nn.Module):
                     nonlin=nonlin,
                     nonlin_kwargs=nonlin_kwargs,
                 ))
+                self.decoder_stage_input_channels.append(int(conv_input_channels))
+                self.decoder_stage_output_channels.append(int(input_features_skip_native))
 
                 # Only build segmentation layers if we are not in features-only mode
                 if not self.return_features_only:
                     # we always build the deep supervision outputs so that we can always load parameters. If we don't do this
                     # then a model trained with deep_supervision=True could not easily be loaded at inference time where
                     # deep supervision is not needed. It's just a convenience thing
-                    seg_layers.append(encoder.conv_op(input_features_skip, self.num_classes, 1, 1, 0, bias=True))
+                    seg_layers.append(encoder.conv_op(input_features_skip_native, self.num_classes, 1, 1, 0, bias=True))
 
         if basic_block == 'ConvBlock':
             stages = []
             transpconvs = []
             seg_layers = []
             for s in range(1, n_stages_encoder):
-                input_features_below = encoder.output_channels[-s]
-                input_features_skip = encoder.output_channels[-(s + 1)]
+                input_features_below = self.skip_channels[-1] if s == 1 else encoder.output_channels[-s]
+                input_features_skip_native = encoder.output_channels[-(s + 1)]
+                input_features_skip = self.skip_channels[-(s + 1)]
                 stride_for_transpconv = encoder.strides[-s]
                 if upsample_mode == "trilinear":
                     transpconvs.append(TrilinearUpsample3d(
-                        input_features_below, input_features_skip, stride_for_transpconv, bias=conv_bias))
+                        input_features_below, input_features_skip_native, stride_for_transpconv, bias=conv_bias))
                 elif upsample_mode == "pixelshuffle":
                     transpconvs.append(PixelShuffle3d(
-                        input_features_below, input_features_skip, stride_for_transpconv, bias=conv_bias))
+                        input_features_below, input_features_skip_native, stride_for_transpconv, bias=conv_bias))
                 else:
                     transpconvs.append(transpconv_op(
-                        input_features_below, input_features_skip, stride_for_transpconv, stride_for_transpconv,
+                        input_features_below, input_features_skip_native, stride_for_transpconv, stride_for_transpconv,
                         bias=conv_bias
                     ))
-                # input features to conv is 2x input_features_skip (concat input_features_skip with transpconv output)
+                conv_input_channels = input_features_skip_native + input_features_skip
                 stages.append(StackedConvBlocks(
-                    n_conv_per_stage[s - 1], encoder.conv_op, 2 * input_features_skip, input_features_skip,
+                    n_conv_per_stage[s - 1], encoder.conv_op, conv_input_channels, input_features_skip_native,
                     encoder.kernel_sizes[-(s + 1)], 1,
                     conv_bias,
                     norm_op,
@@ -178,13 +198,15 @@ class Decoder(nn.Module):
                     nonlin_kwargs,
                     nonlin_first
                 ))
+                self.decoder_stage_input_channels.append(int(conv_input_channels))
+                self.decoder_stage_output_channels.append(int(input_features_skip_native))
 
                 # Only build segmentation layers if we are not in features-only mode
                 if not self.return_features_only:
                     # we always build the deep supervision outputs so that we can always load parameters. If we don't do this
                     # then a model trained with deep_supervision=True could not easily be loaded at inference time where
                     # deep supervision is not needed. It's just a convenience thing
-                    seg_layers.append(encoder.conv_op(input_features_skip, self.num_classes, 1, 1, 0, bias=True))
+                    seg_layers.append(encoder.conv_op(input_features_skip_native, self.num_classes, 1, 1, 0, bias=True))
 
         self.stages = nn.ModuleList(stages)
         self.transpconvs = nn.ModuleList(transpconvs)

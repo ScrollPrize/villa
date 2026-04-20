@@ -19,7 +19,6 @@
 #include <ceres/ceres.h>
 #include <opencv2/ximgproc.hpp>
 
-#include <xtensor/containers/xarray.hpp>
 
 #include "vc/core/util/GridStore.hpp"
 #include "vc/ui/VCCollection.hpp"

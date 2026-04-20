@@ -1,6 +1,7 @@
 #include "ExtrapolationGrowth.hpp"
 
-#include <vc/core/cache/TieredChunkCache.hpp>
+#include "utils/Json.hpp"
+#include <vc/core/cache/BlockPipeline.hpp>
 #include <algorithm>
 #include <cmath>
 #include <vector>
@@ -14,7 +15,6 @@
 #include <opencv2/ximgproc.hpp>
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
-#include <xtensor/containers/xtensor.hpp>
 
 Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth)
 
@@ -37,7 +37,7 @@ SDTChunk* getOrComputeSDTChunk(SDTContext& ctx, const cv::Vec3f& worldPt) {
 
     // Load binary data from zarr
     cv::Vec3i size(cs, cs, cs);
-    xt::xtensor<uint8_t, 3, xt::layout_type::column_major> binaryData(
+    Array3D<uint8_t> binaryData(
         std::array<size_t, 3>{(size_t)cs, (size_t)cs, (size_t)cs});
     binaryData.fill(0);
 
@@ -60,7 +60,7 @@ SDTChunk* getOrComputeSDTChunk(SDTContext& ctx, const cv::Vec3f& worldPt) {
         // Zarr volumes are [z,y,x]; translate from world XYZ to ZYX for reading.
         cv::Vec3i clampedOriginZYX(clampedOrigin[2], clampedOrigin[1], clampedOrigin[0]);
         cv::Vec3i readSizeZYX(readSize[2], readSize[1], readSize[0]);
-        xt::xtensor<uint8_t, 3, xt::layout_type::column_major> readBuf(
+        Array3D<uint8_t> readBuf(
             std::array<size_t, 3>{(size_t)readSizeZYX[0], (size_t)readSizeZYX[1], (size_t)readSizeZYX[2]});
         readArea3D(readBuf, clampedOriginZYX, ctx.cache, ctx.level);
 
@@ -378,7 +378,7 @@ uint8_t* getOrLoadBinaryChunk(SkeletonPathContext& ctx, const cv::Vec3i& origin,
         // Zarr volumes are [z,y,x]; translate from world XYZ to ZYX for reading.
         cv::Vec3i clampedOriginZYX(clampedOrigin[2], clampedOrigin[1], clampedOrigin[0]);
         cv::Vec3i readSizeZYX(readSize[2], readSize[1], readSize[0]);
-        xt::xtensor<uint8_t, 3, xt::layout_type::column_major> readBuf(
+        Array3D<uint8_t> readBuf(
             std::array<size_t, 3>{static_cast<size_t>(readSizeZYX[0]),
                                   static_cast<size_t>(readSizeZYX[1]),
                                   static_cast<size_t>(readSizeZYX[2])});
@@ -1298,10 +1298,10 @@ TracerGrowthResult runExtrapolationGrowth(
     }
 
     // Copy metadata
-    if (surface->meta && surface->meta->is_object()) {
-        newSurface->meta = std::make_unique<nlohmann::json>(*surface->meta);
+    if (!surface->meta.is_null() && surface->meta.is_object()) {
+        newSurface->meta = surface->meta;
         // Update max_gen
-        (*newSurface->meta)["max_gen"] = static_cast<int>(baseGeneration + steps);
+        newSurface->meta["max_gen"] = static_cast<int>(baseGeneration + steps);
     }
 
     result.surface = newSurface;

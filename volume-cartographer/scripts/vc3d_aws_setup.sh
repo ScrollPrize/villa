@@ -117,7 +117,7 @@ XPRA_APT_PACKAGES=(
     gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly
     gstreamer1.0-libav
     # Native video encoder libraries (compiled into xpra C extensions)
-    libx264-dev libvpx-dev libopenh264-dev
+    libvpx-dev
 )
 
 # System prerequisites for fromscratch.sh (builds all VC3D deps from source)
@@ -294,8 +294,6 @@ echo "=== Verifying xpra ==="
 xpra --version
 cd /tmp
 python3 -c "from xpra.codecs.vpx import encoder; print('vpx encoder: OK')" 2>&1 || echo "vpx: not compiled"
-python3 -c "from xpra.codecs.x264 import encoder; print('x264 encoder: OK')" 2>&1 || echo "x264: not compiled"
-python3 -c "from xpra.codecs.openh264 import encoder; print('openh264 encoder: OK')" 2>&1 || echo "openh264: not compiled"
 python3 -c "from xpra.net.lz4.lz4 import compress; print('lz4: OK')" 2>&1 || echo "lz4: not compiled"
 REMOTE_XPRA_BUILD
     else
@@ -321,8 +319,6 @@ REMOTE_XPRA_BUILD
         xpra --version
         cd /tmp
         python3 -c "from xpra.codecs.vpx import encoder; print('vpx encoder: OK')" 2>&1 || warn "vpx: not compiled"
-        python3 -c "from xpra.codecs.x264 import encoder; print('x264 encoder: OK')" 2>&1 || warn "x264: not compiled"
-        python3 -c "from xpra.codecs.openh264 import encoder; print('openh264 encoder: OK')" 2>&1 || warn "openh264: not compiled"
         python3 -c "from xpra.net.lz4.lz4 import compress; print('lz4: OK')" 2>&1 || warn "lz4: not compiled"
     fi
 }
@@ -433,7 +429,7 @@ sudo apt-get install -y -qq \
     gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly \
     gstreamer1.0-libav \
-    libx264-dev libvpx-dev libopenh264-dev \
+    libvpx-dev \
     2>/dev/null || true
 
 sudo apt-get install -y -qq libgirepository-2.0-dev 2>/dev/null || \

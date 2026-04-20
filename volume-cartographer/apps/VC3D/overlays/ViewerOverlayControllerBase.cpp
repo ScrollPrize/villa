@@ -1,7 +1,7 @@
 #include "ViewerOverlayControllerBase.hpp"
 
 #include "../VolumeViewerBase.hpp"
-#include "../tiled/CTiledVolumeViewer.hpp"
+#include "../adaptive/CAdaptiveVolumeViewer.hpp"
 #include "../ViewerManager.hpp"
 #include "../elements/COutlinedTextItem.hpp"
 

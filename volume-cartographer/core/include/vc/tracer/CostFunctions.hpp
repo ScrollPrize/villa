@@ -1,6 +1,7 @@
 #pragma once
 
 #include "vc/core/types/ChunkedTensor.hpp"
+#include <iostream>
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/GridStore.hpp"
 
@@ -38,8 +39,8 @@ struct NormalFitQualityWeightField {
                                 const std::string& unique_id)
         : _passthrough_rms{unique_id + "_fit_rms"},
           _passthrough_frac{unique_id + "_fit_frac"},
-          _cacheRms(vc::cache::createSimpleTieredCache(rms_ds.get(), 128ULL << 20, rms_ds->path())),
-          _cacheFrac(vc::cache::createSimpleTieredCache(frac_ds.get(), 128ULL << 20, frac_ds->path())),
+          _cacheRms(vc::cache::openFilesystemPipeline(rms_ds.get(), 128ULL << 20, rms_ds->path())),
+          _cacheFrac(vc::cache::openFilesystemPipeline(frac_ds.get(), 128ULL << 20, frac_ds->path())),
           _rms(_passthrough_rms, rms_ds.get(), _cacheRms.get(), 0, cache_root),
           _frac(_passthrough_frac, frac_ds.get(), _cacheFrac.get(), 0, cache_root),
           _scale(scale),
@@ -89,8 +90,8 @@ private:
 
     passTroughComputor _passthrough_rms;
     passTroughComputor _passthrough_frac;
-    std::unique_ptr<vc::cache::TieredChunkCache> _cacheRms;
-    std::unique_ptr<vc::cache::TieredChunkCache> _cacheFrac;
+    std::unique_ptr<vc::cache::BlockPipeline> _cacheRms;
+    std::unique_ptr<vc::cache::BlockPipeline> _cacheFrac;
     Chunked3d<uint8_t, passTroughComputor> _rms;
     Chunked3d<uint8_t, passTroughComputor> _frac;
     float _scale;
@@ -397,6 +398,7 @@ struct LinChkDistLoss {
     LinChkDistLoss(const cv::Vec2d &p, float w) : _p(p), _w(w) {};
     template <typename T>
     bool operator()(const T* const p, T* residual) const {
+        using std::abs;
         T a = abs(p[0]-T(_p[0]));
         T b = abs(p[1]-T(_p[1]));
         if (a > T(0))
@@ -560,6 +562,7 @@ struct FiberDirectionLoss {
                                     + patch_u_disp_zyx[1] * patch_u_disp_zyx[1]
                                     + patch_u_disp_zyx[2] * patch_u_disp_zyx[2]
                                     + E(1e-12));
+        using std::abs;
         E const abs_dot = abs(patch_u_disp_zyx[0] * fiber_dir_zyx[0]
                               + patch_u_disp_zyx[1] * fiber_dir_zyx[1]
                               + patch_u_disp_zyx[2] * fiber_dir_zyx[2]) / patch_u_dist;
@@ -621,6 +624,7 @@ struct NormalDirectionLoss {
         };
         E const patch_normal_length = sqrt(patch_normal_zyx[0] * patch_normal_zyx[0] + patch_normal_zyx[1] * patch_normal_zyx[1] + patch_normal_zyx[2] * patch_normal_zyx[2]);
 
+        using std::abs;
         E const abs_dot = abs(patch_normal_zyx[0] * target_normal_zyx[0] + patch_normal_zyx[1] * target_normal_zyx[1] + patch_normal_zyx[2] * target_normal_zyx[2]) / patch_normal_length;
 
         E const weight_at_point = _maybe_weights ? E((*_maybe_weights)(unjet(l_base[2]), unjet(l_base[1]), unjet(l_base[0]))) : E(1);

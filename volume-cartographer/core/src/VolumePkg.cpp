@@ -85,7 +85,7 @@ bool VolumePkg::isRemote() const { return isRemote_; }
 
 std::string VolumePkg::name() const
 {
-    auto name = config_["name"].get<std::string>();
+    auto name = config_["name"].get_string();
     if (name != "NULL") {
         return name;
     }
@@ -93,7 +93,7 @@ std::string VolumePkg::name() const
     return "UnnamedVolume";
 }
 
-int VolumePkg::version() const { return config_["version"].get<int>(); }
+int VolumePkg::version() const { return config_["version"].get_int(); }
 
 bool VolumePkg::hasVolumes() const { return !volumes_.empty(); }
 
@@ -135,8 +135,14 @@ bool VolumePkg::isValidVolumeDirectory(const std::filesystem::path& dirpath) con
         return false;
     }
 
-    if (!std::filesystem::exists(dirpath / "meta.json") &&
-        !std::filesystem::exists(dirpath / "metadata.json")) {
+    // Accept meta.json, metadata.json, or zarr group markers (.zgroup/.zattrs).
+    // Volume::Volume() auto-generates metadata from zarr shapes when no
+    // meta.json exists, so we just need evidence this is a zarr volume.
+    bool hasMetadata = std::filesystem::exists(dirpath / "meta.json") ||
+                       std::filesystem::exists(dirpath / "metadata.json") ||
+                       std::filesystem::exists(dirpath / ".zgroup") ||
+                       std::filesystem::exists(dirpath / ".zattrs");
+    if (!hasMetadata) {
         return false;
     }
 
@@ -331,7 +337,7 @@ void VolumePkg::ensureSegmentScrollSource()
         return;
     }
 
-    auto scrollName = config_["name"].get<std::string>();
+    auto scrollName = config_["name"].get_string();
     auto vol = volumes_.begin()->second;
     auto volumeUuid = vol->id();
 
@@ -583,7 +589,7 @@ bool VolumePkg::addSingleSegmentation(const std::string& id)
     try {
         auto s = Segmentation::New(segPath);
         if (!volumes_.empty()) {
-            auto scrollName = config_["name"].get<std::string>();
+            auto scrollName = config_["name"].get_string();
             auto volumeUuid = volumes_.begin()->second->id();
             s->ensureScrollSource(scrollName, volumeUuid);
         }

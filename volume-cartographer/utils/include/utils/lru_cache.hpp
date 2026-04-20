@@ -33,7 +33,7 @@ public:
     // -- configuration ------------------------------------------------------
     struct Config {
         std::size_t max_bytes = 1ULL << 30;           // 1 GB default
-        double      evict_ratio = 15.0 / 16.0;        // hysteresis target
+        double      evict_target = 15.0 / 16.0;       // evict down to this fraction of max_bytes
         bool        promote_on_read = true;            // update generation on get()
         std::function<std::size_t(const V&)> size_fn = nullptr;
     };
@@ -63,33 +63,23 @@ public:
         std::shared_lock lock{mutex_};
         auto it = map_.find(key);
         if (it == map_.end()) {
-            misses_.fetch_add(1, std::memory_order_relaxed);
+            recordMiss();
             return std::nullopt;
         }
-        if (config_.promote_on_read) {
-            it->second.generation.store(generation_.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
-        }
-        hits_.fetch_add(1, std::memory_order_relaxed);
+        recordHit(it->second);
         return it->second.value;
     }
 
-    /// Non-blocking read returning a pointer to the stored value.
-    /// Returns nullptr on miss. The pointer is valid while the caller
-    /// holds no exclusive lock and the entry is not evicted.
-    /// For shared_ptr<T> values, callers should copy the shared_ptr
-    /// while the shared lock is held (which this method does internally).
+    /// Non-blocking read with fallback. Returns fallback on miss.
     [[nodiscard]] V get_or(const K& key, V fallback) const
     {
         std::shared_lock lock{mutex_};
         auto it = map_.find(key);
         if (it == map_.end()) {
-            misses_.fetch_add(1, std::memory_order_relaxed);
+            recordMiss();
             return fallback;
         }
-        if (config_.promote_on_read) {
-            it->second.generation.store(generation_.fetch_add(1, std::memory_order_relaxed), std::memory_order_relaxed);
-        }
-        hits_.fetch_add(1, std::memory_order_relaxed);
+        recordHit(it->second);
         return it->second.value;
     }
 
@@ -220,6 +210,34 @@ private:
         }
     };
 
+    // -- read helpers (batched stat updates to reduce atomic contention) ----
+    void recordMiss() const noexcept
+    {
+        thread_local int missCount = 0;
+        if (++missCount >= 256) {
+            misses_.fetch_add(256, std::memory_order_relaxed);
+            missCount = 0;
+        }
+    }
+
+    void recordHit(const Entry& entry) const noexcept
+    {
+        if (config_.promote_on_read) {
+            thread_local uint64_t localGen = 0;
+            if (++localGen >= 64) {
+                entry.generation.store(generation_.fetch_add(localGen, std::memory_order_relaxed), std::memory_order_relaxed);
+                localGen = 0;
+            } else {
+                entry.generation.store(generation_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            }
+        }
+        thread_local int hitCount = 0;
+        if (++hitCount >= 256) {
+            hits_.fetch_add(256, std::memory_order_relaxed);
+            hitCount = 0;
+        }
+    }
+
     // -- size computation ---------------------------------------------------
     [[nodiscard]] std::size_t compute_size(const V& v) const
     {
@@ -268,7 +286,7 @@ private:
     void evict()
     {
         const auto target = static_cast<std::size_t>(
-            static_cast<double>(config_.max_bytes) * config_.evict_ratio);
+            static_cast<double>(config_.max_bytes) * config_.evict_target);
 
         // Phase 1 -- collect candidates under shared lock.
         struct Candidate {
@@ -288,11 +306,15 @@ private:
             }
         }
 
-        // Sort oldest generation first.
-        std::sort(candidates.begin(), candidates.end(),
-                  [](const Candidate& a, const Candidate& b) {
-                      return a.generation < b.generation;
-                  });
+        // Partial sort: we need to evict (1 - evict_target) of entries; use 2x
+        // that as the candidate count to ensure enough entries after stale skips.
+        auto evictFraction = std::min(1.0, 2.0 * (1.0 - config_.evict_target));
+        auto evictCount = static_cast<size_t>(candidates.size() * evictFraction);
+        if (evictCount == 0) evictCount = 1;
+        if (evictCount > candidates.size()) evictCount = candidates.size();
+        std::nth_element(candidates.begin(), candidates.begin() + evictCount, candidates.end(),
+            [](const Candidate& a, const Candidate& b) { return a.generation < b.generation; });
+        candidates.resize(evictCount);  // Keep oldest candidates
 
         // Phase 2 -- evict under unique lock until under target.
         std::unique_lock lock{mutex_};
@@ -326,6 +348,152 @@ private:
     mutable std::atomic<std::uint64_t> hits_;
     mutable std::atomic<std::uint64_t> misses_;
     mutable std::atomic<std::uint64_t> evictions_;
+};
+
+// ---------------------------------------------------------------------------
+// ShardedLRUCache -- distributes keys across N independent LRUCache shards
+// to eliminate shared_mutex contention on concurrent reads.
+//
+// With a single LRUCache, even read-only shared_lock operations contend on
+// the internal atomic reader counter. With N shards, concurrent readers
+// hitting different shards never touch the same cache line.
+// ---------------------------------------------------------------------------
+template<typename K, typename V,
+         typename Hash     = std::hash<K>,
+         typename KeyEqual = std::equal_to<K>,
+         std::size_t NumShards = 16>
+class ShardedLRUCache final {
+public:
+    using Config = typename LRUCache<K, V, Hash, KeyEqual>::Config;
+
+    explicit ShardedLRUCache(Config config = {})
+    {
+        // Distribute byte budget evenly across shards
+        Config shardConfig = config;
+        shardConfig.max_bytes = std::max<std::size_t>(1, config.max_bytes / NumShards);
+        for (std::size_t i = 0; i < NumShards; i++) {
+            shards_[i].emplace(shardConfig);
+        }
+    }
+
+    ShardedLRUCache(const ShardedLRUCache&)            = delete;
+    ShardedLRUCache& operator=(const ShardedLRUCache&) = delete;
+
+    // -- read ---------------------------------------------------------------
+
+    [[nodiscard]] std::optional<V> get(const K& key) const
+    {
+        return shard(key).get(key);
+    }
+
+    /// Hot-path read: hash once for shard selection, then delegate to shard.
+    [[nodiscard]] V get_or(const K& key, V fallback) const
+    {
+        return shard(key).get_or(key, std::move(fallback));
+    }
+
+    [[nodiscard]] bool contains(const K& key) const noexcept
+    {
+        return shard(key).contains(key);
+    }
+
+    // -- write --------------------------------------------------------------
+
+    void put(const K& key, V value)
+    {
+        shard(key).put(key, std::move(value));
+    }
+
+    void put_pinned(const K& key, V value)
+    {
+        shard(key).put_pinned(key, std::move(value));
+    }
+
+    bool remove(const K& key)
+    {
+        return shard(key).remove(key);
+    }
+
+    void clear()
+    {
+        for (auto& s : shards_) s->clear();
+    }
+
+    // -- stats (aggregated) -------------------------------------------------
+
+    [[nodiscard]] std::size_t size() const noexcept
+    {
+        std::size_t total = 0;
+        for (const auto& s : shards_) total += s->size();
+        return total;
+    }
+
+    [[nodiscard]] std::size_t byte_size() const noexcept
+    {
+        std::size_t total = 0;
+        for (const auto& s : shards_) total += s->byte_size();
+        return total;
+    }
+
+    [[nodiscard]] std::size_t max_bytes() const noexcept
+    {
+        std::size_t total = 0;
+        for (const auto& s : shards_) total += s->max_bytes();
+        return total;
+    }
+
+    [[nodiscard]] std::uint64_t hits() const noexcept
+    {
+        std::uint64_t total = 0;
+        for (const auto& s : shards_) total += s->hits();
+        return total;
+    }
+
+    [[nodiscard]] std::uint64_t misses() const noexcept
+    {
+        std::uint64_t total = 0;
+        for (const auto& s : shards_) total += s->misses();
+        return total;
+    }
+
+    [[nodiscard]] std::uint64_t evictions() const noexcept
+    {
+        std::uint64_t total = 0;
+        for (const auto& s : shards_) total += s->evictions();
+        return total;
+    }
+
+    // -- batch operations ---------------------------------------------------
+
+    template<typename Iter>
+    [[nodiscard]] std::vector<K> missing_keys(Iter begin, Iter end) const
+    {
+        std::vector<K> result;
+        for (auto it = begin; it != end; ++it) {
+            if (!shard(*it).contains(*it)) {
+                result.push_back(*it);
+            }
+        }
+        return result;
+    }
+
+    template<typename F>
+    void for_each(F&& func) const
+    {
+        for (const auto& s : shards_) {
+            s->for_each(func);
+        }
+    }
+
+private:
+    [[nodiscard]] LRUCache<K, V, Hash, KeyEqual>& shard(const K& key) const noexcept
+    {
+        auto idx = Hash{}(key) % NumShards;
+        return *shards_[idx];
+    }
+
+    // Use std::optional to avoid requiring movability of LRUCache
+    mutable std::array<std::optional<LRUCache<K, V, Hash, KeyEqual>>, NumShards> shards_;
 };
 
 } // namespace utils

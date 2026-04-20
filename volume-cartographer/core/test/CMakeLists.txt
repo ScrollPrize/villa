@@ -7,7 +7,6 @@ endfunction()
 
 vc_add_test(test_version test_version.cpp)
 vc_add_test(test_geometry test_geometry.cpp)
-vc_add_test(test_cache_primitives test_cache_primitives.cpp)
 vc_add_test(test_gen_normalgrids_helpers test_gen_normalgrids_helpers.cpp)
 vc_add_test(test_gridstore_cache test_gridstore_cache.cpp)
 vc_add_test(test_binary_pyramid test_binary_pyramid.cpp)
@@ -15,6 +14,7 @@ vc_add_test(test_sparse_chunk_spool test_sparse_chunk_spool.cpp)
 vc_add_test(test_thinning_equivalence test_thinning_equivalence.cpp)
 vc_add_test(test_triangle_voxel_raster test_triangle_voxel_raster.cpp)
 vc_add_test(test_vc_gen_normalgrids_smoke test_vc_gen_normalgrids_smoke.cpp)
+vc_add_test(test_vc_ngrids_smoke test_vc_ngrids_smoke.cpp)
 vc_add_test(test_volumepkg test_volumepkg.cpp)
 vc_add_test(test_vcdataset test_vcdataset.cpp)
 vc_add_test(test_quad_surface test_quad_surface.cpp)
@@ -22,3 +22,7 @@ vc_add_test(test_quad_surface test_quad_surface.cpp)
 add_dependencies(test_vc_gen_normalgrids_smoke vc_gen_normalgrids)
 target_compile_definitions(test_vc_gen_normalgrids_smoke PRIVATE
     VC_GEN_NORMALGRIDS_BIN="$<TARGET_FILE:vc_gen_normalgrids>")
+add_dependencies(test_vc_ngrids_smoke vc_gen_normalgrids vc_ngrids)
+target_compile_definitions(test_vc_ngrids_smoke PRIVATE
+    VC_GEN_NORMALGRIDS_BIN="$<TARGET_FILE:vc_gen_normalgrids>"
+    VC_NGRIDS_BIN="$<TARGET_FILE:vc_ngrids>")

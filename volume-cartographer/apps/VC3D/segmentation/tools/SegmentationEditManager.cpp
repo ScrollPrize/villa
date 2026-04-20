@@ -5,6 +5,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
+#include "utils/Json.hpp"
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -25,10 +26,10 @@ void ensureSurfaceMetaObject(QuadSurface* surface)
     if (!surface) {
         return;
     }
-    if (surface->meta && surface->meta->is_object()) {
+    if (!surface->meta.is_null() && surface->meta.is_object()) {
         return;
     }
-    surface->meta = std::make_unique<nlohmann::json>(nlohmann::json::object());
+    surface->meta = utils::Json::object();
 }
 }
 
@@ -86,7 +87,7 @@ void SegmentationEditManager::setRadius(float radiusSteps)
     if (!std::isfinite(radiusSteps)) {
         return;
     }
-    _radiusSteps = std::clamp(radiusSteps, 0.25f, 128.0f);
+    _radiusSteps = std::clamp(radiusSteps, 0.25f, 512.0f);
 }
 
 void SegmentationEditManager::setSigma(float sigmaSteps)
@@ -94,7 +95,15 @@ void SegmentationEditManager::setSigma(float sigmaSteps)
     if (!std::isfinite(sigmaSteps)) {
         return;
     }
-    _sigmaSteps = std::clamp(sigmaSteps, 0.05f, 32.0f);
+    _sigmaSteps = std::clamp(sigmaSteps, 0.05f, 256.0f);
+}
+
+void SegmentationEditManager::setEditScale(float scale)
+{
+    if (!std::isfinite(scale)) {
+        return;
+    }
+    _editScale = std::clamp(scale, 0.1f, 10.0f);
 }
 
 const cv::Mat_<cv::Vec3f>& SegmentationEditManager::previewPoints() const
@@ -541,17 +550,18 @@ bool SegmentationEditManager::updateActiveDragTargets(const std::vector<cv::Vec3
 
     for (std::size_t i = 0; i < sampleCount; ++i) {
         const auto& sample = _activeDrag.samples[i];
-        const cv::Vec3f& newWorld = newWorldPositions[i];
-        if (isInvalidPoint(newWorld)) {
+        const cv::Vec3f& rawTarget = newWorldPositions[i];
+        if (isInvalidPoint(rawTarget)) {
             return false;
         }
 
-        (*_previewPoints)(sample.row, sample.col) = newWorld;
-        recordVertexEdit(sample.row, sample.col, newWorld);
+        const cv::Vec3f scaledWorld = sample.baseWorld + (rawTarget - sample.baseWorld) * _editScale;
+        (*_previewPoints)(sample.row, sample.col) = scaledWorld;
+        recordVertexEdit(sample.row, sample.col, scaledWorld);
         _recentTouched.push_back(GridKey{sample.row, sample.col});
 
         if (!centerUpdated && sample.row == centerKey.row && sample.col == centerKey.col) {
-            _activeDrag.targetWorld = newWorld;
+            _activeDrag.targetWorld = scaledWorld;
             centerUpdated = true;
         }
     }
@@ -971,13 +981,22 @@ bool SegmentationEditManager::buildActiveSamples(const std::pair<int, int>& grid
     }
 
     const float stepNorm = stepNormalization();
-    const float maxRadiusWorld = std::max(0.0f, _radiusSteps) * stepNorm;
+    // Samples beyond ~3σ pick up a Gaussian weight < 0.011, which is
+    // visually indistinguishable from zero but still costs a sample + a
+    // vertex update per iteration. Cap the effective radius to that band
+    // so a wide radius with a tight sigma doesn't silently burn work on
+    // cells that won't move.
+    const float sigmaCapSteps = std::max(0.0f, _sigmaSteps) * 3.0f;
+    const float effectiveRadiusSteps = (sigmaCapSteps > 0.0f)
+        ? std::min(std::max(0.0f, _radiusSteps), sigmaCapSteps)
+        : std::max(0.0f, _radiusSteps);
+    const float maxRadiusWorld = effectiveRadiusSteps * stepNorm;
     if (maxRadiusWorld <= 0.0f) {
         return false;
     }
     const float maxRadiusWorldSq = maxRadiusWorld * maxRadiusWorld;
 
-    const int gridExtent = std::max(1, static_cast<int>(std::ceil(_radiusSteps))) + 1;
+    const int gridExtent = std::max(1, static_cast<int>(std::ceil(effectiveRadiusSteps))) + 1;
     const int rowStart = std::max(0, centerRow - gridExtent);
     const int rowEnd = std::min(rows - 1, centerRow + gridExtent);
     const int colStart = std::max(0, centerCol - gridExtent);
@@ -1028,6 +1047,8 @@ void SegmentationEditManager::applyGaussianToSamples(const cv::Vec3f& delta)
     const float sigmaWorld = std::max(0.001f, _sigmaSteps * stepNorm);
     const float invTwoSigmaSq = 1.0f / (2.0f * sigmaWorld * sigmaWorld);
 
+    const cv::Vec3f scaledDelta = delta * _editScale;
+
     _recentTouched.clear();
     _recentTouched.reserve(_activeDrag.samples.size());
 
@@ -1037,7 +1058,7 @@ void SegmentationEditManager::applyGaussianToSamples(const cv::Vec3f& delta)
             weight = std::exp(-sample.distanceWorldSq * invTwoSigmaSq);
         }
 
-        cv::Vec3f newWorld = sample.baseWorld + delta * weight;
+        cv::Vec3f newWorld = sample.baseWorld + scaledDelta * weight;
         (*_previewPoints)(sample.row, sample.col) = newWorld;
         recordVertexEdit(sample.row, sample.col, newWorld);
         _recentTouched.push_back(GridKey{sample.row, sample.col});

@@ -117,6 +117,16 @@ class ConfigManager:
             labels = spec.get("labels")
             if labels is None:
                 labels = spec.get("label_paths")
+            if labels is None and "label" in spec:
+                singular_label = spec.get("label")
+                if singular_label in (None, ""):
+                    labels = {}
+                elif len(target_names) == 1:
+                    labels = {target_names[0]: singular_label}
+                else:
+                    raise ValueError(
+                        "Explicit volume entries that use singular 'label' require exactly one configured target"
+                    )
             if labels is None or labels == {}:
                 return True
             if not isinstance(labels, dict):
@@ -164,9 +174,65 @@ class ConfigManager:
         self.max_val_steps_per_epoch = int(self.tr_configs.get("max_val_steps_per_epoch", 50))
         self.train_num_dataloader_workers = int(self.tr_configs.get("num_dataloader_workers", 8))
         self.max_epoch = int(self.tr_configs.get("max_epoch", 5000))
+        self.val_every_n = int(self.tr_configs.get("val_every_n", 1))
+        self.early_stopping_patience = int(self.tr_configs.get("early_stopping_patience", 0))
+        self.save_gifs = bool(self.tr_configs.get("save_gifs", True))
+        compile_policy = str(self.tr_configs.get("compile_policy", "auto")).strip().lower()
+        if compile_policy not in {"auto", "off", "module", "ddp_wrapper"}:
+            raise ValueError(
+                "tr_config.compile_policy must be one of "
+                "{'auto', 'off', 'module', 'ddp_wrapper'}"
+            )
+        self.compile_policy = compile_policy
+        self.startup_timing = bool(self.tr_configs.get("startup_timing", False))
+        ddp_find_unused_parameters = self.tr_configs.get("ddp_find_unused_parameters", "auto")
+        if isinstance(ddp_find_unused_parameters, str):
+            ddp_find_unused_parameters_norm = ddp_find_unused_parameters.strip().lower()
+            if ddp_find_unused_parameters_norm not in {"auto", "true", "false"}:
+                raise ValueError(
+                    "tr_config.ddp_find_unused_parameters must be one of "
+                    "{'auto', true, false}"
+                )
+            self.ddp_find_unused_parameters = ddp_find_unused_parameters_norm
+        else:
+            self.ddp_find_unused_parameters = bool(ddp_find_unused_parameters)
+        ddp_static_graph = self.tr_configs.get("ddp_static_graph", "auto")
+        if isinstance(ddp_static_graph, str):
+            ddp_static_graph_norm = ddp_static_graph.strip().lower()
+            if ddp_static_graph_norm not in {"auto", "true", "false"}:
+                raise ValueError(
+                    "tr_config.ddp_static_graph must be one of "
+                    "{'auto', true, false}"
+                )
+            self.ddp_static_graph = ddp_static_graph_norm
+        else:
+            self.ddp_static_graph = bool(ddp_static_graph)
+        self.ddp_gradient_as_bucket_view = bool(
+            self.tr_configs.get("ddp_gradient_as_bucket_view", False)
+        )
         self.optimizer = self.tr_configs.get("optimizer", "SGD")
         self.initial_lr = float(self.tr_configs.get("initial_lr", 0.01))
         self.weight_decay = float(self.tr_configs.get("weight_decay", 0.00003))
+        self.guide_loss_weight = float(self.tr_configs.get("guide_loss_weight", 0.0))
+        self.guide_supervision_target = self.tr_configs.get("guide_supervision_target", None)
+
+        ema_cfg = deepcopy(getattr(self, "ema_config", {}) or {})
+        self.ema_enabled = bool(ema_cfg.get("enabled", False))
+        self.ema_decay = float(ema_cfg.get("decay", 0.999))
+        self.ema_start_step = int(ema_cfg.get("start_step", 0))
+        self.ema_update_every_steps = max(1, int(ema_cfg.get("update_every_steps", 1)))
+        self.ema_validate = bool(ema_cfg.get("validate", self.ema_enabled))
+        self.ema_save_in_checkpoint = bool(
+            ema_cfg.get("save_in_checkpoint", self.ema_enabled)
+        )
+        self.ema_config = {
+            "enabled": self.ema_enabled,
+            "decay": self.ema_decay,
+            "start_step": self.ema_start_step,
+            "update_every_steps": self.ema_update_every_steps,
+            "validate": self.ema_validate,
+            "save_in_checkpoint": self.ema_save_in_checkpoint,
+        }
         
         ### Dataset config ###
         self.min_labeled_ratio = float(self.dataset_config.get("min_labeled_ratio", 0.10))

@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <functional>
 #include <optional>
 #include <random>
 #include <limits>
@@ -40,6 +41,14 @@ struct MmappedData {
 
 class GridStore::GridStoreImpl {
 public:
+    struct QueryBucketRange {
+        int startX = 0;
+        int endX = -1;
+        int startY = 0;
+        int endY = -1;
+        bool empty = true;
+    };
+
     struct SegCacheEntry {
         std::shared_ptr<LineSegList> seglist;
         size_t decoded_bytes = 0;
@@ -79,47 +88,104 @@ public:
         }
     }
 
-    std::vector<std::shared_ptr<std::vector<cv::Point>>> get(const cv::Rect& query_rect) const {
-        std::vector<std::shared_ptr<std::vector<cv::Point>>> result;
+    QueryBucketRange queryBucketRange(const cv::Rect& query_rect) const {
+        QueryBucketRange range;
+        if (grid_size_.width <= 0 || grid_size_.height <= 0) {
+            return range;
+        }
+
         cv::Rect clamped_rect = query_rect & bounds_;
+        if (clamped_rect.width <= 0 || clamped_rect.height <= 0) {
+            return range;
+        }
 
         cv::Point start = (clamped_rect.tl() - bounds_.tl()) / cell_size_;
         cv::Point end = (clamped_rect.br() - bounds_.tl()) / cell_size_;
-        // Clamp to valid grid range — br() is exclusive so end can overshoot
-        end.x = std::min(end.x, grid_size_.width - 1);
-        end.y = std::min(end.y, grid_size_.height - 1);
+        start.x = std::clamp(start.x, 0, grid_size_.width - 1);
+        start.y = std::clamp(start.y, 0, grid_size_.height - 1);
+        end.x = std::clamp(end.x, 0, grid_size_.width - 1);
+        end.y = std::clamp(end.y, 0, grid_size_.height - 1);
+        if (start.x > end.x || start.y > end.y) {
+            return range;
+        }
+
+        range.startX = start.x;
+        range.endX = end.x;
+        range.startY = start.y;
+        range.endY = end.y;
+        range.empty = false;
+        return range;
+    }
+
+    void collect_query_results(const cv::Rect& query_rect, GridStore::QueryScratch& scratch) const {
+        scratch.ids.clear();
+        scratch.results.clear();
+        const QueryBucketRange range = queryBucketRange(query_rect);
+        if (range.empty) {
+            return;
+        }
 
         if (read_only_) {
-            std::unordered_set<size_t> offsets;
-            for (int y = start.y; y <= end.y; ++y) {
-                for (int x = start.x; x <= end.x; ++x) {
+            for (int y = range.startY; y <= range.endY; ++y) {
+                for (int x = range.startX; x <= range.endX; ++x) {
                     int index = y * grid_size_.width + x;
                     auto bucket_ptr = get_bucket_offsets(index);
                     if (bucket_ptr && !bucket_ptr->empty()) {
-                        offsets.insert(bucket_ptr->begin(), bucket_ptr->end());
+                        scratch.ids.insert(
+                            scratch.ids.end(),
+                            bucket_ptr->begin(),
+                            bucket_ptr->end());
                     }
                 }
             }
-            result.reserve(offsets.size());
-            for (size_t offset : offsets) {
-                result.push_back(get_points_from_offset(offset));
+            std::sort(scratch.ids.begin(), scratch.ids.end());
+            scratch.ids.erase(
+                std::unique(scratch.ids.begin(), scratch.ids.end()),
+                scratch.ids.end());
+
+            scratch.results.reserve(scratch.ids.size());
+            for (size_t offset : scratch.ids) {
+                scratch.results.push_back(get_points_from_offset(offset));
             }
         } else {
-            std::unordered_set<int> handles;
-            for (int y = start.y; y <= end.y; ++y) {
-                for (int x = start.x; x <= end.x; ++x) {
+            for (int y = range.startY; y <= range.endY; ++y) {
+                for (int x = range.startX; x <= range.endX; ++x) {
                     int index = y * grid_size_.width + x;
                     if (index >= 0 && index < grid_.size()) {
-                        handles.insert(grid_[index].begin(), grid_[index].end());
+                        scratch.ids.insert(
+                            scratch.ids.end(),
+                            grid_[index].begin(),
+                            grid_[index].end());
                     }
                 }
             }
-            result.reserve(handles.size());
-            for (int handle : handles) {
-                result.push_back(storage_[handle]->get());
+            std::sort(scratch.ids.begin(), scratch.ids.end());
+            scratch.ids.erase(
+                std::unique(scratch.ids.begin(), scratch.ids.end()),
+                scratch.ids.end());
+
+            scratch.results.reserve(scratch.ids.size());
+            for (size_t handle : scratch.ids) {
+                scratch.results.push_back(storage_[static_cast<size_t>(handle)]->get());
             }
         }
-        return result;
+    }
+
+    std::vector<std::shared_ptr<std::vector<cv::Point>>> get(const cv::Rect& query_rect) const {
+        GridStore::QueryScratch scratch;
+        collect_query_results(query_rect, scratch);
+        return std::move(scratch.results);
+    }
+
+    void forEach(
+        const cv::Rect& query_rect,
+        GridStore::QueryScratch& scratch,
+        const std::function<void(const std::shared_ptr<std::vector<cv::Point>>&)>& visitor) const
+    {
+        collect_query_results(query_rect, scratch);
+        for (const auto& path : scratch.results) {
+            visitor(path);
+        }
     }
 
     std::vector<std::shared_ptr<std::vector<cv::Point>>> get_all() const {
@@ -463,10 +529,10 @@ public:
                 throw std::runtime_error("Invalid GridStore file: metadata out of bounds.");
             }
             std::string meta_str(meta_start, json_meta_size);
-            meta_ = nlohmann::json::parse(meta_str);
+            meta_ = utils::Json::parse(meta_str);
         }
     }
-    nlohmann::json meta_;
+    utils::Json meta_;
 
 private:
     char* write_bucket(char* current, const std::vector<int>& bucket, const std::unordered_map<int, uint32_t>& path_offsets) const {
@@ -662,48 +728,27 @@ private:
             }
         } else { // Version 3
             const char* data_start = static_cast<const char*>(mmapped_data_->data);
-            const char* data_end = data_start + mmapped_data_->size;
-            const uint32_t* header_ptr = reinterpret_cast<const uint32_t*>(data_start);
-            uint32_t num_buckets = ntohl(header_ptr[7]);
-
-            if (static_cast<uint32_t>(index + 1) > num_buckets) {
-                throw std::runtime_error("GridStore V3: bucket index " + std::to_string(index) +
-                    " out of range (num_buckets=" + std::to_string(num_buckets) + ")");
-            }
-
-            // Validate bucket_indices array fits in mmap
-            size_t bucket_indices_size = (static_cast<size_t>(num_buckets) + 1) * sizeof(uint32_t);
-            const char* bucket_indices_end = data_start + buckets_offset_in_file_ + bucket_indices_size;
-            if (bucket_indices_end > data_end) {
-                throw std::runtime_error("GridStore V3: bucket indices array extends past end of file (buckets_offset=" +
-                    std::to_string(buckets_offset_in_file_) + " array_size=" + std::to_string(bucket_indices_size) +
-                    " file_size=" + std::to_string(mmapped_data_->size) + ")");
-            }
-
             const uint32_t* bucket_indices = reinterpret_cast<const uint32_t*>(data_start + buckets_offset_in_file_);
+            
             uint32_t start_idx = ntohl(bucket_indices[index]);
             uint32_t end_idx = ntohl(bucket_indices[index + 1]);
             uint32_t count = end_idx - start_idx;
 
             if (count > 0) {
+                const uint32_t* header_ptr = reinterpret_cast<const uint32_t*>(data_start);
+                uint32_t num_buckets = ntohl(header_ptr[7]);
+                // In V3, header[8] is the total number of paths in the storage, not the number of paths in all buckets combined.
+                // The total number of path offsets in the flat list is given by the last element of the bucket_indices array.
+                const uint32_t* bucket_indices = reinterpret_cast<const uint32_t*>(data_start + buckets_offset_in_file_);
                 uint32_t total_path_indices = ntohl(bucket_indices[num_buckets]);
 
                 if (start_idx + count > total_path_indices) {
-                    throw std::runtime_error("GridStore V3: bucket data out of bounds of flat path offset list "
-                        "(start=" + std::to_string(start_idx) + " count=" + std::to_string(count) +
-                        " total=" + std::to_string(total_path_indices) + ")");
+                    throw std::runtime_error("Bucket data is out of bounds of the flat path offset list.");
                 }
 
-                // Validate path_offsets_flat access fits in mmap
-                const char* path_offsets_start = bucket_indices_end;  // flat list follows bucket indices
-                const char* path_access_end = path_offsets_start + (static_cast<size_t>(start_idx) + count) * sizeof(uint32_t);
-                if (path_access_end > data_end) {
-                    throw std::runtime_error("GridStore V3: path offsets access extends past end of file "
-                        "(access_end=" + std::to_string(path_access_end - data_start) +
-                        " file_size=" + std::to_string(mmapped_data_->size) + ")");
-                }
+                size_t bucket_indices_size = (num_buckets + 1) * sizeof(uint32_t);
+                const uint32_t* path_offsets_flat = reinterpret_cast<const uint32_t*>(data_start + buckets_offset_in_file_ + bucket_indices_size);
 
-                const uint32_t* path_offsets_flat = reinterpret_cast<const uint32_t*>(path_offsets_start);
                 bucket_ptr->reserve(count);
                 for (uint32_t i = 0; i < count; ++i) {
                     bucket_ptr->push_back(ntohl(path_offsets_flat[start_idx + i]));
@@ -771,7 +816,7 @@ private:
  
 GridStore::GridStore(const cv::Rect& bounds, int cell_size)
     : pimpl_(std::make_unique<GridStoreImpl>(bounds, cell_size)) {}
- 
+
 GridStore::GridStore(const std::string& path)
     : pimpl_(std::make_unique<GridStoreImpl>(cv::Rect(), 1)) { // Use a dummy cell_size to avoid division by zero
     pimpl_->load_mmap(path);
@@ -793,6 +838,14 @@ std::vector<std::shared_ptr<std::vector<cv::Point>>> GridStore::get(const cv::Po
     int y = static_cast<int>(center.y - radius);
     int size = static_cast<int>(radius * 2);
     return get(cv::Rect(x, y, size, size));
+}
+
+void GridStore::forEach(
+    const cv::Rect& query_rect,
+    QueryScratch& scratch,
+    const std::function<void(const std::shared_ptr<std::vector<cv::Point>>&)>& visitor) const
+{
+    pimpl_->forEach(query_rect, scratch, visitor);
 }
 
 std::vector<std::shared_ptr<std::vector<cv::Point>>> GridStore::get_all() const {

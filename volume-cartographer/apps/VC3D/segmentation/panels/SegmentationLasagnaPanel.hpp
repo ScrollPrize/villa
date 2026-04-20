@@ -3,9 +3,8 @@
 #include <QWidget>
 
 #include <array>
-#include <optional>
 
-#include <nlohmann/json_fwd.hpp>
+#include "utils/Json.hpp"
 
 class QCheckBox;
 
@@ -45,7 +44,7 @@ public:
     [[nodiscard]] QString lasagnaDataInputPath() const { return _lasagnaDataInputPath; }
     /** Reads the selected config JSON file from disk and returns its contents. */
     [[nodiscard]] QString lasagnaConfigText() const;
-    [[nodiscard]] std::optional<nlohmann::json> lasagnaConfigJson() const;
+    [[nodiscard]] utils::Json lasagnaConfigJson() const;
     [[nodiscard]] LasagnaMode lasagnaMode() const { return static_cast<LasagnaMode>(_lasagnaMode); }
     [[nodiscard]] int newModelWidth() const;
     [[nodiscard]] int newModelHeight() const;

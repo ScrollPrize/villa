@@ -22,8 +22,10 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <random>
 
 namespace utils {
 
@@ -189,28 +191,14 @@ struct AwsAuth {
         if (auto* v = std::getenv("AWS_DEFAULT_REGION"))      auth.region = v;
         return auth;
     }
+
+    /// Full credential resolution. Tries in order:
+    ///   1. `aws configure export-credentials` (resolves SSO, assume-role, etc.)
+    ///   2. ~/.aws/credentials + ~/.aws/config INI files
+    ///   3. Environment variables
+    /// Respects AWS_PROFILE for methods 1 & 2.
+    [[nodiscard]] static AwsAuth load(const std::string& profile = "default");
 };
-
-/// Apply AWS SigV4 authentication to a CURL handle.
-/// The returned slist must outlive the curl_easy_perform() call.
-/// Pass nullptr for the return value if you don't need it (caller frees).
-[[nodiscard]] inline struct curl_slist* apply_aws_auth(CURL* curl, const AwsAuth& auth) {
-    if (auth.empty()) return nullptr;
-
-    std::string sigv4 = "aws:amz:" + auth.region + ":s3";
-    curl_easy_setopt(curl, CURLOPT_AWS_SIGV4, sigv4.c_str());
-
-    std::string userpwd = auth.access_key + ":" + auth.secret_key;
-    curl_easy_setopt(curl, CURLOPT_USERPWD, userpwd.c_str());
-
-    struct curl_slist* headers = nullptr;
-    if (!auth.session_token.empty()) {
-        std::string hdr = "x-amz-security-token: " + auth.session_token;
-        headers = curl_slist_append(headers, hdr.c_str());
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-    }
-    return headers;
-}
 
 // ---------------------------------------------------------------------------
 // HttpClient
@@ -227,29 +215,53 @@ public:
         std::string user_agent{"utils-http/1.0"};
     };
 
-    HttpClient()
-        : config_{}
-        , handle_(detail::make_curl())
-    {
-        if (!handle_)
-            throw std::runtime_error("http_fetch: failed to create curl handle");
-    }
+    HttpClient() = default;
 
     explicit HttpClient(Config config)
         : config_(std::move(config))
-        , handle_(detail::make_curl())
     {
-        if (!handle_)
-            throw std::runtime_error("http_fetch: failed to create curl handle");
     }
 
-    ~HttpClient() = default;
+    // Flip the process-global abort flag. Any in-flight curl_easy_perform
+    // returns CURLE_ABORTED_BY_CALLBACK on the next progress tick (sub-
+    // millisecond on an active socket) and pending retries bail. Use to
+    // make app shutdown effectively instantaneous regardless of S3 timeout.
+    static void abortAll() noexcept
+    {
+        abort_flag().store(true, std::memory_order_release);
+    }
 
-    HttpClient(const HttpClient&) = delete;
-    HttpClient& operator=(const HttpClient&) = delete;
+    // Reset the abort flag (e.g. for tests that re-use the process).
+    static void resetAbort() noexcept
+    {
+        abort_flag().store(false, std::memory_order_release);
+    }
 
-    HttpClient(HttpClient&&) noexcept = default;
-    HttpClient& operator=(HttpClient&&) noexcept = default;
+    [[nodiscard]] static bool isAborted() noexcept
+    {
+        return abort_flag().load(std::memory_order_acquire);
+    }
+
+private:
+    static std::atomic<bool>& abort_flag() noexcept
+    {
+        static std::atomic<bool> flag{false};
+        return flag;
+    }
+
+    static int xferinfo_callback(void* /*clientp*/,
+                                 curl_off_t, curl_off_t,
+                                 curl_off_t, curl_off_t) noexcept
+    {
+        // Acquire ordering pairs with the release store in abortAll() so
+        // termination is guaranteed to be observed promptly. On x86 this
+        // is free (plain load); relaxed would have worked there but is
+        // not formally guaranteed to see the abort bit in bounded time
+        // on weakly-ordered archs.
+        return abort_flag().load(std::memory_order_acquire) ? 1 : 0;
+    }
+
+public:
 
     // GET request
     [[nodiscard]] HttpResponse get(std::string_view url) const {
@@ -278,24 +290,96 @@ public:
         return perform(url, Method::PUT, data, content_type);
     }
 
-    // Check if URL exists (HEAD + check status)
-    [[nodiscard]] bool exists(std::string_view url) const {
-        return head(url).ok();
-    }
+    // PUT from file (streams from disk, constant memory)
+    [[nodiscard]] HttpResponse put_file(std::string_view url,
+                                         const std::filesystem::path& file_path,
+                                         std::string_view content_type = "application/octet-stream") const {
+        auto resolved = resolve_url(url);
 
-    // Download to file
-    bool download(std::string_view url, const std::filesystem::path& dest) const {
-        auto resp = get(url);
-        if (!resp.ok())
-            return false;
+        FILE* f = std::fopen(file_path.c_str(), "rb");
+        if (!f) throw std::runtime_error("put_file: cannot open " + file_path.string());
+        std::fseek(f, 0, SEEK_END);
+        auto file_size = std::ftell(f);
+        std::fseek(f, 0, SEEK_SET);
 
-        std::ofstream out(dest, std::ios::binary);
-        if (!out)
-            return false;
+        HttpResponse resp;
+        for (std::size_t attempt = 0; attempt <= config_.max_retries; ++attempt) {
+            if (isAborted()) { std::fclose(f); return resp; }
+            resp = HttpResponse{};
+            std::fseek(f, 0, SEEK_SET);
+            auto* curl = thread_handle();
+            curl_easy_reset(curl);
 
-        out.write(reinterpret_cast<const char*>(resp.body.data()),
-                  static_cast<std::streamsize>(resp.body.size()));
-        return out.good();
+            curl_easy_setopt(curl, CURLOPT_URL, resolved.c_str());
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT,
+                             static_cast<long>(config_.connect_timeout.count()));
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT,
+                             static_cast<long>(config_.transfer_timeout.count()));
+            curl_easy_setopt(curl, CURLOPT_USERAGENT, config_.user_agent.c_str());
+            // Keep TCP connections alive so back-to-back fetches against
+            // S3 don't pay the TLS handshake cost each time. curl_easy_reset
+            // preserves the connection cache and SSL session IDs, so we just
+            // need to ensure keepalive is on. Ping every 30s after 30s idle.
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L);
+            if (config_.follow_redirects) {
+                curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+                curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+            }
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+            curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp.body);
+            curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
+            curl_easy_setopt(curl, CURLOPT_HEADERDATA, &resp);
+            curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+            curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferinfo_callback);
+
+            auto auth_state = apply_auth(curl);
+
+            curl_easy_setopt(curl, CURLOPT_UPLOAD, 1L);
+            curl_easy_setopt(curl, CURLOPT_INFILESIZE_LARGE, static_cast<curl_off_t>(file_size));
+            curl_easy_setopt(curl, CURLOPT_READDATA, f);
+            // Default read function is fread — no CURLOPT_READFUNCTION needed
+
+            struct curl_slist* extra_headers = nullptr;
+            std::string ct_header;
+            if (!content_type.empty()) {
+                ct_header = "Content-Type: " + std::string{content_type};
+                extra_headers = curl_slist_append(extra_headers, ct_header.c_str());
+                if (auth_state.headers) {
+                    for (auto* node = auth_state.headers; node; node = node->next)
+                        extra_headers = curl_slist_append(extra_headers, node->data);
+                    curl_slist_free_all(auth_state.headers);
+                    auth_state.headers = nullptr;
+                }
+                curl_easy_setopt(curl, CURLOPT_HTTPHEADER, extra_headers);
+            }
+
+            auto code = curl_easy_perform(curl);
+            if (extra_headers) curl_slist_free_all(extra_headers);
+
+            if (code == CURLE_OK) {
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &resp.status_code);
+                if (resp.status_code >= 500 && attempt < config_.max_retries) {
+                    thread_local std::mt19937 rng{std::random_device{}()};
+                    std::uniform_int_distribution<unsigned> jitter(0, 100);
+                    std::this_thread::sleep_for(
+                        std::chrono::milliseconds(200 * (1u << attempt) + jitter(rng)));
+                    continue;
+                }
+                std::fclose(f);
+                return resp;
+            }
+            if (attempt < config_.max_retries) {
+                thread_local std::mt19937 rng{std::random_device{}()};
+                std::uniform_int_distribution<unsigned> jitter(0, 100);
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(200 * (1u << attempt) + jitter(rng)));
+                continue;
+            }
+        }
+        std::fclose(f);
+        return resp;
     }
 
 private:
@@ -428,19 +512,27 @@ private:
         return to_copy;
     }
 
+    [[nodiscard]] CURL* thread_handle() const {
+        thread_local detail::CurlHandle tl_handle{nullptr};
+        if (!tl_handle) {
+            tl_handle = detail::make_curl();
+        }
+        return tl_handle.get();
+    }
+
     [[nodiscard]] HttpResponse perform(std::string_view url,
                                         Method method,
                                         std::span<const std::byte> put_data,
                                         std::string_view content_type,
                                         std::string range = {}) const {
-        std::lock_guard lk(mu_);
         auto resolved = resolve_url(url);
         HttpResponse resp;
 
         for (std::size_t attempt = 0; attempt <= config_.max_retries; ++attempt) {
+            if (isAborted()) return resp;
             resp = HttpResponse{};
-            curl_easy_reset(handle_.get());
-            auto* curl = handle_.get();
+            auto* curl = thread_handle();
+            curl_easy_reset(curl);
 
             // URL
             curl_easy_setopt(curl, CURLOPT_URL, resolved.c_str());
@@ -451,6 +543,12 @@ private:
             curl_easy_setopt(curl, CURLOPT_TIMEOUT,
                              static_cast<long>(config_.transfer_timeout.count()));
 
+            // TCP keepalive: keeps idle-pooled connections from being torn
+            // down between bursts of S3 fetches so we reuse the TLS session.
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L);
+
             // Redirects
             if (config_.follow_redirects) {
                 curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -459,6 +557,12 @@ private:
 
             // User agent
             curl_easy_setopt(curl, CURLOPT_USERAGENT, config_.user_agent.c_str());
+
+            // Process-wide abort hook — returning non-zero from the xfer
+            // callback aborts the transfer immediately. Used for fast
+            // shutdown so the worker pool isn't stuck inside curl.
+            curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+            curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, xferinfo_callback);
 
             // Write callback (body)
             curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
@@ -528,27 +632,30 @@ private:
 
                 // Retry on 5xx server errors
                 if (resp.status_code >= 500 && attempt < config_.max_retries) {
+                    thread_local std::mt19937 rng{std::random_device{}()};
+                    std::uniform_int_distribution<unsigned> jitter(0, 100);
                     std::this_thread::sleep_for(
-                        std::chrono::milliseconds(200 * (1u << attempt)));
+                        std::chrono::milliseconds(200 * (1u << attempt) + jitter(rng)));
                     continue;
                 }
                 return resp;
             }
 
             // Retry on network / transient curl errors
-            if (attempt < config_.max_retries) {
+            if (attempt < config_.max_retries && !isAborted()) {
+                thread_local std::mt19937 rng{std::random_device{}()};
+                std::uniform_int_distribution<unsigned> jitter(0, 100);
                 std::this_thread::sleep_for(
-                    std::chrono::milliseconds(200 * (1u << attempt)));
+                    std::chrono::milliseconds(200 * (1u << attempt) + jitter(rng)));
                 continue;
             }
+            break;
         }
 
         return resp; // return last response even on failure
     }
 
     Config config_;
-    detail::CurlHandle handle_;
-    mutable std::mutex mu_;
 };
 
 } // namespace utils

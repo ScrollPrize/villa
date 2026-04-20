@@ -166,7 +166,7 @@ bool SegmentationLineTool::applyStroke(const std::vector<cv::Vec3f>& stroke)
     }
 
     // Capture delta for undo before applyPreview() clears edited vertices
-    _module.captureUndoDelta();
+    (void)_module.captureUndoDelta();
 
     // Auto-approve edited regions before applyPreview() clears them
     auto* overlay = _module.overlay();

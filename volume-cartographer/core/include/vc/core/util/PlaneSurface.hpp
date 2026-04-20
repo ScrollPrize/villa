@@ -16,7 +16,8 @@ public:
     float pointTo(cv::Vec3f &ptr, const cv::Vec3f &coord, float th, int max_iters = 1000,
                   class SurfacePatchIndex* surfaceIndex = nullptr, class PointIndex* pointIndex = nullptr) override { abort(); };
 
-    PlaneSurface() {};
+    PlaneSurface();
+    ~PlaneSurface() override;
     PlaneSurface(cv::Vec3f origin_, cv::Vec3f normal_);
 
     void gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) const override;
