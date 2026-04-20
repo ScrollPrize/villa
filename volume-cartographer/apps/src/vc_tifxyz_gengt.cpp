@@ -5,7 +5,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include <opencv2/imgcodecs.hpp>
 #include <boost/program_options.hpp>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 #include <iostream>
 #include <fstream>
 #include <vector>

@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 namespace vc {
 
@@ -79,11 +79,11 @@ std::vector<std::unique_ptr<VcDataset>> openZarrLevels(
     const std::filesystem::path& zarrRoot);
 
 // Read .zattrs JSON from a zarr group directory.
-nlohmann::json readZarrAttributes(const std::filesystem::path& groupPath);
+utils::Json readZarrAttributes(const std::filesystem::path& groupPath);
 
 // Write .zattrs JSON to a zarr group directory.
 void writeZarrAttributes(const std::filesystem::path& groupPath,
-                          const nlohmann::json& attrs);
+                          const utils::Json& attrs);
 
 // Open or create a zarr group + array for writing (used by Zarr.cpp).
 // Returns a VcDataset backed by a newly created zarr array with the given options.

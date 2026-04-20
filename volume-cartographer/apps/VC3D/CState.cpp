@@ -2,15 +2,15 @@
 #include "VCSettings.hpp"
 
 #include <algorithm>
+#include <thread>
 #include <QSettings>
 
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
 
-CState::CState(size_t cacheSizeBytes, size_t diskCacheSizeBytes, QObject* parent)
+CState::CState(size_t cacheSizeBytes, QObject* parent)
     : QObject(parent)
     , _cacheSizeBytes(cacheSizeBytes)
-    , _diskCacheSizeBytes(diskCacheSizeBytes)
 {
     _pointCollection = new VCCollection(this);
 
@@ -67,12 +67,21 @@ std::string CState::activeSurfaceId() const { return _activeSurfaceId; }
 
 void CState::setActiveSurface(const std::string& id, std::shared_ptr<QuadSurface> surf)
 {
+    // Drop derived caches on whichever surface was active before — we only
+    // keep them populated for the segment the user is currently editing.
+    auto prev = _activeSurface.lock();
+    if (prev && prev != surf) {
+        prev->unloadCaches();
+    }
     _activeSurfaceId = id;
     _activeSurface = surf;
 }
 
 void CState::clearActiveSurface()
 {
+    if (auto prev = _activeSurface.lock()) {
+        prev->unloadCaches();
+    }
     _activeSurface.reset();
     _activeSurfaceId.clear();
 }
@@ -84,23 +93,10 @@ size_t CState::cacheSizeBytes() const { return _cacheSizeBytes; }
 void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
 {
     if (vol && _cacheSizeBytes > 0) {
-        size_t hotBytes = _cacheSizeBytes * 8 / 10;
-        size_t warmBytes = _cacheSizeBytes - hotBytes;
-        vol->setCacheBudget(hotBytes, warmBytes);
-        vol->setDiskCacheMaxBytes(_diskCacheSizeBytes);
-
-        // Video codec recompression settings
-        using namespace vc3d::settings;
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        bool recompressEnabled = settings.value(perf::VIDEO_RECOMPRESS_ENABLED, perf::VIDEO_RECOMPRESS_ENABLED_DEFAULT).toBool();
-        int codecType = settings.value(perf::VIDEO_CODEC_TYPE, perf::VIDEO_CODEC_TYPE_DEFAULT).toInt();
-        int preset = settings.value(perf::VIDEO_QUALITY_PRESET, perf::VIDEO_QUALITY_PRESET_DEFAULT).toInt();
-        preset = std::clamp(preset, 0, perf::PRESET_COUNT - 1);
-        int qp = (codecType == 3) ? perf::PRESET_C3D_QUALITY[preset] : perf::PRESET_VIDEO_QP[preset];
-        vol->setVideoRecompression(recompressEnabled, codecType, qp);
-
-        int ioThreads = settings.value(perf::IO_THREADS, perf::IO_THREADS_DEFAULT).toInt();
-        vol->setIOThreads(std::clamp(ioThreads, 1, 100));
+        vol->setCacheBudget(_cacheSizeBytes);
+        // Leave ioThreads at default (0) so BlockPipeline's interactive
+        // sizing (half hw download/load, quarter hw encode) kicks in.
+        // CLI tools can still force a full-hw count via setIOThreads.
     }
 }
 

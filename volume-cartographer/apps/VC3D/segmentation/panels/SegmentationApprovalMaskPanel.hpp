@@ -26,7 +26,6 @@ public:
     [[nodiscard]] bool showApprovalMask() const { return _showApprovalMask; }
     [[nodiscard]] bool editApprovedMask() const { return _editApprovedMask; }
     [[nodiscard]] bool editUnapprovedMask() const { return _editUnapprovedMask; }
-    [[nodiscard]] bool autoApproveEdits() const { return _autoApprovalEnabled; }
     [[nodiscard]] bool autoApprovalEnabled() const { return _autoApprovalEnabled; }
     [[nodiscard]] float autoApprovalRadius() const { return _autoApprovalRadius; }
     [[nodiscard]] float autoApprovalThreshold() const { return _autoApprovalThreshold; }
@@ -41,7 +40,6 @@ public:
     void setShowApprovalMask(bool enabled);
     void setEditApprovedMask(bool enabled);
     void setEditUnapprovedMask(bool enabled);
-    void setAutoApproveEdits(bool enabled);
     void setAutoApprovalEnabled(bool enabled);
     void setAutoApprovalRadius(float radius);
     void setAutoApprovalThreshold(float threshold);
@@ -59,7 +57,6 @@ signals:
     void showApprovalMaskChanged(bool enabled);
     void editApprovedMaskChanged(bool enabled);
     void editUnapprovedMaskChanged(bool enabled);
-    void autoApproveEditsChanged(bool enabled);
     void autoApprovalEnabledChanged(bool enabled);
     void autoApprovalRadiusChanged(float radius);
     void autoApprovalThresholdChanged(float threshold);

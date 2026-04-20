@@ -31,13 +31,16 @@ public:
     void openVolpkgAt(const QString& path);
     void loadAttachedRemoteVolumesForCurrentPackage();
     void triggerTeleaInpaint();
+    void openRemoteUrl(const QString& url, bool isRetry = false);
 
 private slots:
     void openVolpkg();
     void openRecentVolpkg();
     void openLocalZarr();
     void openRemoteVolume();
+    void browseS3();
     void attachRemoteZarr();
+    void attachRemoteSegments();
     void openRecentRemoteVolume();
     void showSettingsDialog();
     void showAboutDialog();
@@ -64,10 +67,10 @@ private:
     void updateRecentRemoteList(const QString& url);
     void refreshRecentRemoteMenu();
     void ensureRecentRemoteActions();
-    void openRemoteUrl(const QString& url, bool isRetry = false);
     void attachRemoteZarrUrl(const QString& url, bool persistEntry = true);
     void openRemoteZarr(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
     void openRemoteScroll(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
+    void promptAndLoadRemoteSegments(const vc::cache::HttpAuth& auth, const std::string& cachePath);
     bool tryResolveRemoteAuth(const QString& url,
                               vc::cache::HttpAuth* authOut,
                               bool allowPrompt,
@@ -91,6 +94,8 @@ private:
     QAction* _openLocalZarrAct{nullptr};
     QAction* _openRemoteAct{nullptr};
     QAction* _attachRemoteZarrAct{nullptr};
+    QAction* _attachRemoteSegmentsAct{nullptr};
+    QAction* _browseS3Act{nullptr};
     std::array<QAction*, kMaxRecentVolpkg> _recentActs{};
     std::array<QAction*, kMaxRecentRemote> _recentRemoteActs{};
     QAction* _settingsAct{nullptr};

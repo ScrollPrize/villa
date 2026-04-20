@@ -454,41 +454,12 @@ TIFFCFG
 # NOTE: Imath and OpenEXR removed - VC3D doesn't use OpenEXR, disabled in OpenCV
 
 #------------------------------------------------------------------------------
-# OpenH264 (Cisco's H.264 codec - needed by c-blosc2 with H264 support)
-#------------------------------------------------------------------------------
-build_openh264() {
-    is_done openh264 && { log "OpenH264 already built, skipping"; return; }
-    log "Building OpenH264..."
-
-    local OPENH264_SRC="$PREFIX/thirdparty/openh264"
-
-    clone_repo "https://github.com/cisco/openh264" "$OPENH264_SRC" "master"
-
-    cd "$OPENH264_SRC"
-    # OpenH264 uses meson or make - use make for simplicity
-    make -j"$JOBS" \
-        CC="ccache clang" \
-        CXX="ccache clang++" \
-        AR="llvm-ar" \
-        CFLAGS="-O3 -march=native -fPIC" \
-        CXXFLAGS="-O3 -march=native -fPIC" \
-        LDFLAGS="-fuse-ld=lld" \
-        PREFIX="$PREFIX" \
-        BUILDTYPE=Release \
-        libraries
-
-    make PREFIX="$PREFIX" install-shared
-
-    mark_done openh264
-}
-
-#------------------------------------------------------------------------------
-# c-blosc2 (Blosc compression library v2 with H264 codec built-in)
+# c-blosc2 (Blosc compression library v2)
 # Using vendored fork: https://github.com/SuperOptimizer/c-blosc2
 #------------------------------------------------------------------------------
 build_blosc2() {
     is_done blosc2 && { log "c-blosc2 already built, skipping"; return; }
-    log "Building c-blosc2 (with H264 support)..."
+    log "Building c-blosc2..."
 
     local BLOSC2_SRC="$PREFIX/thirdparty/c-blosc2"
 
@@ -503,9 +474,7 @@ build_blosc2() {
         -DDEACTIVATE_ZLIB=OFF \
         -DDEACTIVATE_ZSTD=OFF \
         -DPREFER_EXTERNAL_ZLIB=ON \
-        -DPREFER_EXTERNAL_ZSTD=ON \
-        -DOPENH264_INCLUDE_DIR="$PREFIX/include" \
-        -DOPENH264_LIBRARY="$PREFIX/lib/libopenh264.so"
+        -DPREFER_EXTERNAL_ZSTD=ON
     ninja -j"$JOBS"
     ninja install
 
@@ -988,11 +957,11 @@ build_z5() {
 }
 
 #------------------------------------------------------------------------------
-# Python blosc2 (built from vendored c-blosc2 with openh264 support)
+# Python blosc2 (built from vendored c-blosc2)
 #------------------------------------------------------------------------------
 build_python_blosc2() {
     is_done python_blosc2 && { log "python-blosc2 already built, skipping"; return; }
-    log "Building python-blosc2 (with openh264 support)..."
+    log "Building python-blosc2..."
 
     local PYBLOSC2_SRC="$PREFIX/thirdparty/python-blosc2"
     local BLOSC2_SRC="$PREFIX/thirdparty/c-blosc2"
@@ -1010,7 +979,7 @@ build_python_blosc2() {
     # Install build dependencies first
     pip install scikit-build-core cython numpy setuptools --quiet
 
-    # Build python-blosc2 linking against our vendored c-blosc2 with openh264
+    # Build python-blosc2 linking against our vendored c-blosc2
     # USE_SYSTEM_BLOSC2=TRUE tells it to use our pre-built libblosc2
     USE_SYSTEM_BLOSC2=TRUE \
     BLOSC2_DIR="$PREFIX" \
@@ -1020,13 +989,12 @@ build_python_blosc2() {
     LD_LIBRARY_PATH="$PREFIX/lib:$LD_LIBRARY_PATH" \
     pip install . --no-cache-dir --no-build-isolation -v
 
-    # Verify openh264 codec is available
+    # Verify blosc2 is available
     LD_LIBRARY_PATH="$PREFIX/lib:$LD_LIBRARY_PATH" \
     python3 -c "
 import blosc2
 codecs = [str(c) for c in blosc2.compressor_list()]
 print('Available codecs:', codecs)
-# Check if openh264 is registered (codec 240)
 import ctypes
 lib = ctypes.CDLL('$PREFIX/lib/libblosc2.so')
 print('libblosc2 loaded successfully')
@@ -1036,11 +1004,11 @@ print('libblosc2 loaded successfully')
 }
 
 #------------------------------------------------------------------------------
-# Numcodecs (vendored fork with Blosc2/openh264 support)
+# Numcodecs (vendored fork with Blosc2 support)
 #------------------------------------------------------------------------------
 build_numcodecs() {
     is_done numcodecs && { log "numcodecs already built, skipping"; return; }
-    log "Building numcodecs (with Blosc2/openh264 support)..."
+    log "Building numcodecs (with Blosc2 support)..."
 
     local NUMCODECS_SRC="$PREFIX/thirdparty/numcodecs"
 
@@ -1060,20 +1028,17 @@ build_numcodecs() {
 from numcodecs import Blosc2
 codec = Blosc2(cname='zstd')
 print('Blosc2 codec available:', codec)
-# Test openh264 codec instantiation
-codec_h264 = Blosc2(cname='openh264')
-print('Blosc2 openh264 codec available:', codec_h264)
-" && log "numcodecs built with Blosc2/openh264 support" || warn "numcodecs verification had warnings"
+" && log "numcodecs built with Blosc2 support" || warn "numcodecs verification had warnings"
 
     mark_done numcodecs
 }
 
 #------------------------------------------------------------------------------
-# Zarr-Python (vendored fork with Blosc2/openh264 codec)
+# Zarr-Python (vendored fork with Blosc2 codec)
 #------------------------------------------------------------------------------
 build_zarr() {
     is_done zarr && { log "zarr-python already built, skipping"; return; }
-    log "Building zarr-python (with Blosc2/openh264 codec)..."
+    log "Building zarr-python (with Blosc2 codec)..."
 
     local ZARR_SRC="$PREFIX/thirdparty/zarr-python"
 
@@ -1091,10 +1056,7 @@ build_zarr() {
 from zarr.codecs import Blosc2Codec, Blosc2Cname
 codec = Blosc2Codec(cname=Blosc2Cname.zstd)
 print('Blosc2Codec available:', codec)
-# Test openh264 codec
-codec_h264 = Blosc2Codec(cname=Blosc2Cname.openh264)
-print('Blosc2Codec openh264 available:', codec_h264)
-" && log "zarr-python built with Blosc2/openh264 codec" || warn "zarr-python verification had warnings"
+" && log "zarr-python built with Blosc2 codec" || warn "zarr-python verification had warnings"
 
     mark_done zarr
 }
@@ -1271,8 +1233,7 @@ main() {
     # NOTE: libwebp, imath, openexr removed - not needed by VC3D
     build_tiff
 
-    # Data compression (blosc2 with H264 support)
-    build_openh264
+    # Data compression (blosc2)
     build_blosc2
 
     # Math libraries

@@ -246,10 +246,10 @@ TEST_CASE("LRUCache: concurrent mixed reads and writes") {
     CHECK_GT(cache.size(), 0u);
 }
 
-TEST_CASE("LRUCache: eviction respects evict_ratio hysteresis") {
+TEST_CASE("LRUCache: eviction respects evict_target hysteresis") {
     utils::LRUCache<int, int>::Config cfg;
     cfg.max_bytes = sizeof(int) * 4;
-    cfg.evict_ratio = 0.5;  // target = 50% of max = 2 entries worth
+    cfg.evict_target = 0.5;  // target = 50% of max = 2 entries worth
     cfg.size_fn = [](const int&) -> std::size_t { return sizeof(int); };
     utils::LRUCache<int, int> cache(cfg);
 
@@ -262,7 +262,7 @@ TEST_CASE("LRUCache: eviction respects evict_ratio hysteresis") {
     cache.put(5, 50);
 
     // After eviction, byte_size should be at or below target.
-    auto target = static_cast<std::size_t>(cfg.max_bytes * cfg.evict_ratio);
+    auto target = static_cast<std::size_t>(cfg.max_bytes * cfg.evict_target);
     CHECK_LE(cache.byte_size(), target + sizeof(int)); // +1 entry for the newly inserted
     CHECK_GT(cache.evictions(), 0u);
 }
@@ -310,7 +310,7 @@ TEST_CASE("LRUCache: update existing key updates bytes") {
 TEST_CASE("LRUCache: pinned entries not evicted even under heavy pressure") {
     utils::LRUCache<int, int>::Config cfg;
     cfg.max_bytes = sizeof(int) * 3;
-    cfg.evict_ratio = 0.5;
+    cfg.evict_target = 0.5;
     cfg.size_fn = [](const int&) -> std::size_t { return sizeof(int); };
     utils::LRUCache<int, int> cache(cfg);
 
@@ -372,7 +372,7 @@ TEST_CASE("LRUCache: HasByteSize concept path used when no size_fn") {
 TEST_CASE("LRUCache: HasByteSize eviction path") {
     utils::LRUCache<int, SizedValue>::Config cfg;
     cfg.max_bytes = 60;
-    cfg.evict_ratio = 0.5; // target = 30 bytes
+    cfg.evict_target = 0.5; // target = 30 bytes
     utils::LRUCache<int, SizedValue> cache(cfg);
 
     SizedValue v1;
@@ -513,7 +513,7 @@ TEST_CASE("LRUCache: missing_keys with empty range") {
 TEST_CASE("LRUCache: string cache eviction with size_fn") {
     utils::LRUCache<int, std::string>::Config cfg;
     cfg.max_bytes = 30;
-    cfg.evict_ratio = 15.0 / 16.0; // target = ~28 bytes
+    cfg.evict_target = 15.0 / 16.0; // target = ~28 bytes
     cfg.size_fn = [](const std::string& s) -> std::size_t { return s.size(); };
     utils::LRUCache<int, std::string> cache(cfg);
 
@@ -550,7 +550,7 @@ TEST_CASE("LRUCache: string cache miss tracking") {
 TEST_CASE("LRUCache: string cache pinned eviction") {
     utils::LRUCache<int, std::string>::Config cfg;
     cfg.max_bytes = 20;
-    cfg.evict_ratio = 0.5;
+    cfg.evict_target = 0.5;
     cfg.size_fn = [](const std::string& s) -> std::size_t { return s.size(); };
     utils::LRUCache<int, std::string> cache(cfg);
 
@@ -609,7 +609,7 @@ TEST_CASE("LRUCache: int cache no size_fn eviction") {
     // Test eviction with int type and no size_fn (sizeof(V) fallback)
     utils::LRUCache<int, int>::Config cfg;
     cfg.max_bytes = sizeof(int) * 3;
-    cfg.evict_ratio = 0.5;
+    cfg.evict_target = 0.5;
     // No size_fn set -- uses sizeof(int) fallback
     utils::LRUCache<int, int> cache(cfg);
 

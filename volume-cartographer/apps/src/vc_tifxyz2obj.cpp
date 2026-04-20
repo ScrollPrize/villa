@@ -5,7 +5,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include "vc/core/types/VcDataset.hpp"
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -15,7 +15,7 @@
 #include <limits>
 
 
-using json = nlohmann::json;
+using Json = utils::Json;
 
 // ---- small helpers ---------------------------------------------------------
 static inline bool finite3(const cv::Vec3f& v) {

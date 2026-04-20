@@ -91,12 +91,6 @@ public:
     void setClearSelectionCallback(std::function<void()> fn) { _clearSelectionCallback = std::move(fn); }
 
     /**
-     * Callback for waiting on pending index rebuilds.
-     * Used by onRenameSurface.
-     */
-    void setWaitForIndexRebuildCallback(std::function<void()> fn) { _waitForIndexRebuildCallback = std::move(fn); }
-
-    /**
      * Callback for restoring selection to a renamed surface by new ID.
      * Used by onRenameSurface after the folder rename.
      */
@@ -190,6 +184,5 @@ private:
     std::function<QString()> _normal3dZarrPathGetter;
     std::function<bool()> _isEditingCheck;
     std::function<void()> _clearSelectionCallback;
-    std::function<void()> _waitForIndexRebuildCallback;
     std::function<void(const std::string&)> _restoreSelectionCallback;
 };

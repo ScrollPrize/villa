@@ -5,13 +5,13 @@
 #include <string>
 
 #include <opencv2/core.hpp>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 //base surface class
 class Surface
 {
 public:
-    virtual ~Surface() = default;
+    virtual ~Surface();
 
     // Returns a default starting point for surface iteration.
     // Subclasses may override but default returns origin.
@@ -32,7 +32,7 @@ public:
     //coordgenerator relative to ptr&offset
     //needs to be deleted after use
     virtual void gen(cv::Mat_<cv::Vec3f> *coords, cv::Mat_<cv::Vec3f> *normals, cv::Size size, const cv::Vec3f &ptr, float scale, const cv::Vec3f &offset) const = 0;
-    std::unique_ptr<nlohmann::json> meta;
+    utils::Json meta;
     std::filesystem::path path;
     std::string id;
 };

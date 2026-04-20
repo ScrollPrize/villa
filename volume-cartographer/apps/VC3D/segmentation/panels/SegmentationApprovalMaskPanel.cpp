@@ -308,11 +308,6 @@ void SegmentationApprovalMaskPanel::setEditUnapprovedMask(bool enabled)
     syncUiState();
 }
 
-void SegmentationApprovalMaskPanel::setAutoApproveEdits(bool enabled)
-{
-    setAutoApprovalEnabled(enabled);
-}
-
 void SegmentationApprovalMaskPanel::setAutoApprovalEnabled(bool enabled)
 {
     if (_autoApprovalEnabled == enabled) {
@@ -323,7 +318,6 @@ void SegmentationApprovalMaskPanel::setAutoApprovalEnabled(bool enabled)
     if (!_restoringSettings) {
         writeSetting(QStringLiteral("auto_approval_enabled"), _autoApprovalEnabled);
         emit autoApprovalEnabledChanged(_autoApprovalEnabled);
-        emit autoApproveEditsChanged(_autoApprovalEnabled);
     }
     if (_chkAutoApproveEdits) {
         const QSignalBlocker blocker(_chkAutoApproveEdits);

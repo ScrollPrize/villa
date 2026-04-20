@@ -68,7 +68,7 @@ public:
     void exportLasagnaVis(const QJsonObject& config);
 
     /**
-     * Scan ~/.fit_services/*.json for running services.
+     * Scan ~/.fit_services for running service .json files.
      * Stale entries (dead PIDs) are removed.
      */
     static QJsonArray discoverServices();

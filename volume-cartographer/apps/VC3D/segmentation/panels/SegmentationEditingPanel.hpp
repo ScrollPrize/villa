@@ -31,6 +31,7 @@ public:
     [[nodiscard]] float pushPullSigma() const { return _pushPullSigmaSteps; }
     [[nodiscard]] float pushPullStep() const { return _pushPullStep; }
     [[nodiscard]] AlphaPushPullConfig alphaPushPullConfig() const { return _alphaPushPullConfig; }
+    [[nodiscard]] float editScale() const { return _editScale; }
     [[nodiscard]] float smoothingStrength() const { return _smoothStrength; }
     [[nodiscard]] int smoothingIterations() const { return _smoothIterations; }
     [[nodiscard]] bool showHoverMarker() const { return _showHoverMarker; }
@@ -44,6 +45,7 @@ public:
     void setPushPullSigma(float value);
     void setPushPullStep(float value);
     void setAlphaPushPullConfig(const AlphaPushPullConfig& config);
+    void setEditScale(float value);
     void setSmoothingStrength(float value);
     void setSmoothingIterations(int value);
     void setShowHoverMarker(bool enabled);
@@ -63,6 +65,7 @@ signals:
     void pushPullSigmaChanged(float value);
     void pushPullStepChanged(float value);
     void alphaPushPullConfigChanged();
+    void editScaleChanged(float value);
     void smoothingStrengthChanged(float value);
     void smoothingIterationsChanged(int value);
     void hoverMarkerToggled(bool enabled);
@@ -99,6 +102,7 @@ private:
     QSpinBox* _spinAlphaBlurRadius{nullptr};
     QDoubleSpinBox* _spinAlphaPerVertexLimit{nullptr};
     QLabel* _lblAlphaInfo{nullptr};
+    QDoubleSpinBox* _spinEditScale{nullptr};
     QDoubleSpinBox* _spinSmoothStrength{nullptr};
     QSpinBox* _spinSmoothIterations{nullptr};
     QPushButton* _btnApply{nullptr};
@@ -114,6 +118,7 @@ private:
     float _pushPullSigmaSteps{2.0f};
     float _pushPullStep{4.0f};
     AlphaPushPullConfig _alphaPushPullConfig{};
+    float _editScale{1.0f};
     float _smoothStrength{0.4f};
     int _smoothIterations{2};
     bool _showHoverMarker{true};

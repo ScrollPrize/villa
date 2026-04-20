@@ -1,11 +1,10 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include <nlohmann/json.hpp>
+#include <iostream>
 #include <fstream>
 
-
-using json = nlohmann::json;
+using Json = utils::Json;
 
 
 
@@ -40,11 +39,10 @@ int main(int argc, char *argv[])
             if (!std::filesystem::exists(meta_fn))
                 continue;
 
-            std::ifstream meta_f(meta_fn);
-            json meta;
+            Json meta;
             try {
-                meta = json::parse(meta_f);
-            } catch (const json::exception& e) {
+                meta = Json::parse_file(meta_fn);
+            } catch (const std::exception& e) {
                 std::cerr << "Error parsing meta.json for " << name << ": " << e.what() << std::endl;
                 continue;
             }
@@ -52,7 +50,7 @@ int main(int argc, char *argv[])
             if (!meta.count("bbox"))
                 continue;
 
-            if (meta.value("format","NONE") != "tifxyz")
+            if (meta.value("format", std::string{"NONE"}) != "tifxyz")
                 continue;
 
             QuadSurface other = QuadSurface(entry.path(), meta);

@@ -1,14 +1,33 @@
 #pragma once
 
 #include <QDir>
+#include <QFileInfo>
 #include <QString>
 
 namespace vc3d {
 
+// Prefer /ephemeral/VC3D when the host has local NVMe instance storage
+// mounted there (see scripts/build_dependencies.sh); fall back to ~/.VC3D.
+// Cached on first call because filesystem state doesn't change during a run.
+inline QString defaultCacheBase()
+{
+    static const QString base = []() {
+        const QString eph = QStringLiteral("/ephemeral");
+        QFileInfo fi(eph);
+        if (fi.isDir() && fi.isWritable()) {
+            QString p = eph + "/VC3D";
+            QDir().mkpath(p);
+            return p;
+        }
+        return QDir::homePath() + "/.VC3D";
+    }();
+    return base;
+}
+
 inline QString settingsFilePath()
 {
-    const QString homeDir = QDir::homePath();
-    const QString configDir = homeDir + "/.VC3D";
+    // Settings must stay in the user's home — /ephemeral is lost on stop.
+    const QString configDir = QDir::homePath() + "/.VC3D";
     QDir dir;
     if (!dir.exists(configDir)) {
         dir.mkpath(configDir);
@@ -44,12 +63,18 @@ namespace viewer {
     constexpr auto FWD_BACK_STEP_MS = "viewer/fwd_back_step_ms";
     constexpr auto CENTER_ON_ZOOM = "viewer/center_on_zoom";
     constexpr auto SCROLL_SPEED = "viewer/scroll_speed";
+    constexpr auto PAN_SENSITIVITY = "viewer/pan_sensitivity";
+    constexpr auto ZOOM_SENSITIVITY = "viewer/zoom_sensitivity";
+    constexpr auto ZSCROLL_SENSITIVITY = "viewer/zscroll_sensitivity";
     constexpr auto IMPACT_RANGE_STEPS = "viewer/impact_range_steps";
     constexpr auto SCAN_RANGE_STEPS = "viewer/scan_range_steps";
 
     constexpr int FWD_BACK_STEP_MS_DEFAULT = 25;
     constexpr bool CENTER_ON_ZOOM_DEFAULT = false;
     constexpr int SCROLL_SPEED_DEFAULT = -1;
+    constexpr float PAN_SENSITIVITY_DEFAULT = 1.0f;
+    constexpr float ZOOM_SENSITIVITY_DEFAULT = 1.0f;
+    constexpr float ZSCROLL_SENSITIVITY_DEFAULT = 1.0f;
     constexpr auto IMPACT_RANGE_STEPS_DEFAULT = "1-3, 5, 8, 11, 15, 20, 28, 40, 60, 100, 200";
     constexpr auto SCAN_RANGE_STEPS_DEFAULT = "1, 2, 5, 10, 20, 50, 100, 200, 500, 1000";
 
@@ -92,7 +117,7 @@ namespace viewer {
 
     constexpr int INTERSECTION_OPACITY_DEFAULT = 100;
     constexpr float INTERSECTION_THICKNESS_DEFAULT = 0.0f;
-    constexpr int INTERSECTION_SAMPLING_STRIDE_DEFAULT = 1;
+    constexpr int INTERSECTION_SAMPLING_STRIDE_DEFAULT = 2;
     constexpr int INTERSECTION_MAX_SURFACES_DEFAULT = 0;  // 0 = unlimited
 
     // Axis Overlays
@@ -108,13 +133,11 @@ namespace viewer {
 
     // Remote volume chunk cache directory
     constexpr auto REMOTE_CACHE_DIR = "viewer/remote_cache_dir";
-    // Default: ~/.VC3D/remote_cache (resolved at runtime via QDir::homePath())
+    // Default: vc3d::defaultCacheBase() + "/remote_cache" — uses /ephemeral
+    // when mounted, else ~/.VC3D.
 
     // Recent remote volume URLs
     constexpr auto REMOTE_RECENT_URLS = "viewer/remote_recent_urls";
-
-    // Local cache directory for network-mounted volpkgs
-    constexpr auto NETWORK_CACHE_DIR = "viewer/network_cache_dir";
 
     // Audio/UX
     constexpr auto PLAY_SOUND_AFTER_SEG_RUN = "viewer/play_sound_after_seg_run";
@@ -151,48 +174,20 @@ namespace perf {
     constexpr auto PARALLEL_PROCESSES = "perf/parallel_processes";
     constexpr auto ITERATION_COUNT = "perf/iteration_count";
     constexpr auto DOWNSCALE_OVERRIDE = "perf/downscale_override";
-    constexpr auto FAST_INTERPOLATION = "perf/fast_interpolation";
+    constexpr auto INTERPOLATION_METHOD = "viewer/interpolation_method";
     constexpr auto ENABLE_FILE_WATCHING = "perf/enable_file_watching";
     constexpr auto RAM_CACHE_SIZE_GB = "perf/ram_cache_size_gb";
-    constexpr auto DISK_CACHE_SIZE_GB = "perf/disk_cache_size_gb";
 
     constexpr int PRELOADED_SLICES_DEFAULT = 200;
     constexpr int PARALLEL_PROCESSES_DEFAULT = 8;
     constexpr int ITERATION_COUNT_DEFAULT = 1000;
     constexpr int DOWNSCALE_OVERRIDE_DEFAULT = 0;
-    constexpr bool FAST_INTERPOLATION_DEFAULT = false;
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
-    constexpr int DISK_CACHE_SIZE_GB_DEFAULT = 100;
 
-    // Video codec recompression for remote streaming
-    constexpr auto VIDEO_RECOMPRESS_ENABLED = "perf/video_recompress_enabled";
-    constexpr auto VIDEO_CODEC_TYPE = "perf/video_codec_type";  // 0=H264, 1=H265, 3=C3D
-    constexpr auto VIDEO_QUALITY_PRESET = "perf/video_quality_preset";
+    // IO thread count is not configurable — it tracks
+    // std::thread::hardware_concurrency() at runtime.
 
-    constexpr auto VIDEO_RECHUNK_32 = "perf/video_rechunk_32";
-
-    constexpr bool VIDEO_RECOMPRESS_ENABLED_DEFAULT = false;
-    constexpr int VIDEO_CODEC_TYPE_DEFAULT = 0;  // H264
-    constexpr int VIDEO_QUALITY_PRESET_DEFAULT = 3;  // Balanced
-    constexpr bool VIDEO_RECHUNK_32_DEFAULT = false;
-
-    // Quality preset → per-codec QP mapping
-    // Index: 0=Lossless, 1=Near-lossless, 2=High, 3=Balanced, 4=Compact, 5=Max compression
-    constexpr int PRESET_COUNT = 6;
-    // H.264/H.265/AV1 QP values (0=lossless uses 0)
-    constexpr int PRESET_VIDEO_QP[PRESET_COUNT] = {0, 18, 22, 28, 35, 42};
-    // C3D size divisor shift: 0=lossless, 1=lossless/2, 2=/4, 3=/8, 4=/16, 5=/32
-    constexpr int PRESET_C3D_QUALITY[PRESET_COUNT] = {0, 1, 2, 3, 4, 5};
-
-    // Number of background IO (download) threads
-    constexpr auto IO_THREADS = "perf/io_threads";
-    constexpr int IO_THREADS_DEFAULT = 8;
-
-    // Prefetch pyramid levels on remote volume open
-    // 0 = none, 1 = coarsest only (already pinned), 2 = coarsest 2, etc.
-    constexpr auto PREFETCH_LEVELS = "perf/prefetch_levels";
-    constexpr int PREFETCH_LEVELS_DEFAULT = 0;  // disabled
 }
 
 // -----------------------------------------------------------------------------
@@ -301,6 +296,9 @@ namespace segmentation {
     constexpr auto PUSH_PULL_ALPHA_RADIUS = "push_pull_alpha_radius";
     constexpr auto PUSH_PULL_ALPHA_LIMIT = "push_pull_alpha_limit";
     constexpr auto PUSH_PULL_ALPHA_PER_VERTEX = "push_pull_alpha_per_vertex";
+
+    // Edit scale
+    constexpr auto EDIT_SCALE = "edit_scale";
 
     // Smoothing
     constexpr auto SMOOTH_STRENGTH = "smooth_strength";

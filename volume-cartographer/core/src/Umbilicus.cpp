@@ -11,7 +11,7 @@
 #include <stdexcept>
 #include <string>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 namespace {
 
@@ -258,15 +258,9 @@ std::vector<cv::Vec3f> Umbilicus::LoadTextFile(std::istream& stream)
 
 std::vector<cv::Vec3f> Umbilicus::LoadJsonFile(const std::filesystem::path& path)
 {
-    std::ifstream stream(path);
-    if (!stream) {
-        throw std::runtime_error("Failed to open umbilicus json file: " + path.string());
-    }
+    utils::Json document = utils::Json::parse_file(path);
 
-    nlohmann::json document;
-    stream >> document;
-
-    const nlohmann::json* array = nullptr;
+    const utils::Json* array = nullptr;
     if (document.is_array()) {
         array = &document;
     } else if (document.contains("points")) {
@@ -292,16 +286,16 @@ std::vector<cv::Vec3f> Umbilicus::LoadJsonFile(const std::filesystem::path& path
             if (entry.size() < 3) {
                 throw std::runtime_error("Umbilicus json entry at index " + std::to_string(idx) + " expected three values");
             }
-            z = entry[0].get<double>();
-            y = entry[1].get<double>();
-            x = entry[2].get<double>();
+            z = entry[0].get_double();
+            y = entry[1].get_double();
+            x = entry[2].get_double();
         } else if (entry.is_object()) {
             if (!entry.contains("z") || !entry.contains("y") || !entry.contains("x")) {
                 throw std::runtime_error("Umbilicus json entry at index " + std::to_string(idx) + " missing z/y/x keys");
             }
-            z = entry.at("z").get<double>();
-            y = entry.at("y").get<double>();
-            x = entry.at("x").get<double>();
+            z = entry.at("z").get_double();
+            y = entry.at("y").get_double();
+            x = entry.at("x").get_double();
         } else {
             throw std::runtime_error("Umbilicus json entry at index " + std::to_string(idx) + " has unsupported type");
         }

@@ -663,6 +663,9 @@ class Volume:
         # Extract parent URL and segment ID
         parent_url = os.path.dirname(base_url)
         segment_id_str = os.path.basename(base_url)
+        # Remove .zarr extension if present (fixes URL construction bug)
+        if segment_id_str.endswith('.zarr'):
+            segment_id_str = segment_id_str[:-5]
         # Construct ink label path
         inklabel_filename = f"{segment_id_str}_inklabels.png"
         inklabel_url = os.path.join(parent_url, inklabel_filename)

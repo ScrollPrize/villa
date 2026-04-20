@@ -28,7 +28,7 @@
 #include <QToolButton>
 #include <QVBoxLayout>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include <iostream>
 
@@ -1035,19 +1035,19 @@ QString SegmentationLasagnaPanel::lasagnaConfigText() const
     return QString::fromUtf8(raw);
 }
 
-std::optional<nlohmann::json> SegmentationLasagnaPanel::lasagnaConfigJson() const
+utils::Json SegmentationLasagnaPanel::lasagnaConfigJson() const
 {
     QString text = lasagnaConfigText().trimmed();
-    if (text.isEmpty()) return std::nullopt;
+    if (text.isEmpty()) return utils::Json{};
 
     try {
         QByteArray utf8 = text.toUtf8();
-        nlohmann::json parsed = nlohmann::json::parse(
-            utf8.constData(), utf8.constData() + utf8.size());
+        utils::Json parsed = utils::Json::parse(
+            std::string_view(utf8.constData(), utf8.size()));
         if (parsed.is_object()) return parsed;
     } catch (...) {}
 
-    return std::nullopt;
+    return utils::Json{};
 }
 
 // ---------------------------------------------------------------------------

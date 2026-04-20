@@ -34,7 +34,7 @@
 #include <optional>
 #include <cstring>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 namespace fs = std::filesystem;
 namespace po = boost::program_options;
@@ -85,7 +85,7 @@ struct RunMetrics {
 };
 
 static void writeMetricsJson(const fs::path& path, const RunMetrics& metrics) {
-    nlohmann::json j;
+    utils::Json j;
     j["raster_mode"] = metrics.rasterMode;
     j["input"] = metrics.inputPath;
     j["output"] = metrics.outputPath;
@@ -551,14 +551,9 @@ static double parseVoxelSizeFromReference(const fs::path& ref) {
         }
 
         try {
-            std::ifstream in(metaPath);
-            if (!in) {
-                continue;
-            }
-            const auto meta = nlohmann::json::parse(in);
-            const auto it = meta.find("voxelsize");
-            if (it != meta.end() && it->is_number()) {
-                const double vox = it->get<double>();
+            const auto meta = utils::Json::parse_file(metaPath);
+            if (meta.contains("voxelsize") && meta["voxelsize"].is_number()) {
+                const double vox = meta["voxelsize"].get_double();
                 if (std::isfinite(vox) && vox > 0.0) {
                     return vox;
                 }
@@ -641,8 +636,8 @@ static std::pair<std::size_t, std::size_t> normalizeZRange(long long requestedMi
     return {zMin, zMax};
 }
 
-static nlohmann::json toJsonArray(const std::vector<std::string>& values) {
-    nlohmann::json result = nlohmann::json::array();
+static utils::Json toJsonArray(const std::vector<std::string>& values) {
+    utils::Json result = utils::Json::array();
     for (const auto& value : values) {
         result.push_back(value);
     }
@@ -1250,12 +1245,16 @@ static void writeSparseAttrs(const fs::path& outDir,
                             const fs::path* sourceRef,
                             int sourceGroup,
                             size_t maxLevel) {
-    nlohmann::json attrs;
+    utils::Json attrs;
     attrs["note_axes_order"] = "ZYX (slice, row, col)";
     attrs["num_slices"] = level0Shape[0];
-    attrs["chunk_size"] = {static_cast<long long>(level0Chunk[0]),
-                            static_cast<long long>(level0Chunk[1]),
-                            static_cast<long long>(level0Chunk[2])};
+    {
+        utils::Json cs = utils::Json::array();
+        cs.push_back(static_cast<int64_t>(level0Chunk[0]));
+        cs.push_back(static_cast<int64_t>(level0Chunk[1]));
+        cs.push_back(static_cast<int64_t>(level0Chunk[2]));
+        attrs["chunk_size"] = cs;
+    }
     attrs["isotropic_chunks"] = true;
     attrs["pyramid"] = true;
     attrs["pyramid_levels"] = static_cast<int>(maxLevel);
@@ -1266,37 +1265,39 @@ static void writeSparseAttrs(const fs::path& outDir,
         attrs["source_group"] = sourceGroup;
     }
 
-    nlohmann::json ms;
+    utils::Json ms;
     ms["version"] = "0.4";
     ms["name"] = "vc_tifxyz2zarr_sparse";
-    ms["axes"] = nlohmann::json::array({
-        nlohmann::json{{"name", "z"}, {"type", "space"}},
-        nlohmann::json{{"name", "y"}, {"type", "space"}},
-        nlohmann::json{{"name", "x"}, {"type", "space"}},
-    });
+    {
+        utils::Json axes = utils::Json::array();
+        axes.push_back(utils::Json({{"name", "z"}, {"type", "space"}}));
+        axes.push_back(utils::Json({{"name", "y"}, {"type", "space"}}));
+        axes.push_back(utils::Json({{"name", "x"}, {"type", "space"}}));
+        ms["axes"] = axes;
+    }
 
-    ms["datasets"] = nlohmann::json::array();
+    ms["datasets"] = utils::Json::array();
     for (int level = 0; level <= static_cast<int>(maxLevel); ++level) {
         const double scale = std::pow(2.0, static_cast<double>(level));
-        ms["datasets"].push_back({
-            {"path", std::to_string(level)},
-            {"coordinateTransformations", nlohmann::json::array({
-                {
-                    {"type", "scale"},
-                    {"scale", nlohmann::json::array({scale, scale, scale})},
-                },
-                {
-                    {"type", "translation"},
-                    {"translation", nlohmann::json::array({0.0, 0.0, 0.0})},
-                },
-            })}
-        });
+        utils::Json scale_arr = utils::Json::array();
+        scale_arr.push_back(scale); scale_arr.push_back(scale); scale_arr.push_back(scale);
+        utils::Json trans_arr = utils::Json::array();
+        trans_arr.push_back(0.0); trans_arr.push_back(0.0); trans_arr.push_back(0.0);
+        utils::Json ct = utils::Json::array();
+        ct.push_back(utils::Json({{"type", "scale"}, {"scale", scale_arr}}));
+        ct.push_back(utils::Json({{"type", "translation"}, {"translation", trans_arr}}));
+        utils::Json dset;
+        dset["path"] = std::to_string(level);
+        dset["coordinateTransformations"] = ct;
+        ms["datasets"].push_back(dset);
     }
-    ms["metadata"] = {{"downsampling_method", "nearest"},
-                       {"chunk_isotropic", true},
-                       {"spool_binary", true}};
+    ms["metadata"] = utils::Json({{"downsampling_method", "nearest"},
+                                   {"chunk_isotropic", true},
+                                   {"spool_binary", true}});
 
-    attrs["multiscales"] = nlohmann::json::array({ms});
+    utils::Json ms_arr = utils::Json::array();
+    ms_arr.push_back(ms);
+    attrs["multiscales"] = ms_arr;
 
     vc::writeZarrAttributes(outDir, attrs);
 }
@@ -1309,13 +1310,13 @@ static void writeVolumeMetadata(const fs::path& outDir,
                                const std::vector<std::string>& sourceSegments,
                                const std::vector<std::string>& sourceMeshes) {
     const std::string uuid = outDir.filename().string();
-    nlohmann::json meta;
+    utils::Json meta;
     meta["type"] = "vol";
     meta["uuid"] = uuid;
     meta["name"] = uuid;
-    meta["width"] = static_cast<long long>(level0Shape[2]);
-    meta["height"] = static_cast<long long>(level0Shape[1]);
-    meta["slices"] = static_cast<long long>(level0Shape[0]);
+    meta["width"] = static_cast<int64_t>(level0Shape[2]);
+    meta["height"] = static_cast<int64_t>(level0Shape[1]);
+    meta["slices"] = static_cast<int64_t>(level0Shape[0]);
     meta["voxelsize"] = voxelSize;
     meta["min"] = 0.0;
     meta["max"] = static_cast<double>(kSurfaceValue);
@@ -1334,7 +1335,7 @@ static void writeVolumeMetadata(const fs::path& outDir,
         meta["source_meshes"] = toJsonArray(sourceMeshes);
     }
     if (!sourceSegments.empty() || !sourceMeshes.empty()) {
-        meta["source_mesh_count"] = static_cast<long long>(
+        meta["source_mesh_count"] = static_cast<int64_t>(
             !sourceSegments.empty() ? sourceSegments.size() : sourceMeshes.size());
     }
     meta["rasterizer"] = "vc_tifxyz2zarr_sparse";

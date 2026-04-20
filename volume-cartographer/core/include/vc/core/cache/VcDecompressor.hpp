@@ -31,14 +31,4 @@ DecompressFn makeVcDecompressor(const std::vector<vc::VcDataset*>& datasets);
 // Convenience overload for a single dataset (level 0 only).
 DecompressFn makeVcDecompressor(vc::VcDataset* ds);
 
-// Create a RecompressFn that recompresses chunks using a video codec.
-// The function first decompresses the original data using the dataset's
-// decompressor, then re-encodes it with the specified video codec.
-//
-// codecType: 0=H264, 1=H265, 2=AV1
-// qp: quantization parameter (0-51)
-RecompressFn makeVideoRecompressor(
-    const std::vector<vc::VcDataset*>& datasets,
-    int codecType = 0, int qp = 26);
-
 }  // namespace vc::cache

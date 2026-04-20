@@ -4,7 +4,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include <opencv2/imgcodecs.hpp>
 #include <boost/program_options.hpp>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 #include <iostream>
 #include <fstream>
 
@@ -58,7 +58,7 @@ int main(int argc, char** argv)
     if (z_max == -1)
         z_min = (int)surface->bbox().high[2];
 
-    nlohmann::json metrics = calc_point_metrics(collection, surface.get(), z_min, z_max);
+    utils::Json metrics = calc_point_metrics(collection, surface.get(), z_min, z_max);
 
     if (vm.count("winding")) {
         std::string winding_path = vm["winding"].as<std::string>();
@@ -67,7 +67,7 @@ int main(int argc, char** argv)
             std::cerr << "Error: Failed to load winding from " << winding_path << std::endl;
             return 1;
         }
-        nlohmann::json winding_metrics = calc_point_winding_metrics(collection, surface.get(), winding, z_min, z_max);
+        utils::Json winding_metrics = calc_point_winding_metrics(collection, surface.get(), winding, z_min, z_max);
         metrics.update(winding_metrics);
     }
 

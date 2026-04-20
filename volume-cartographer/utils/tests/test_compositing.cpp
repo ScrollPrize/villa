@@ -97,22 +97,6 @@ TEST_CASE("beer_lambert single layer") {
     CHECK_NEAR(composite_beer_lambert(layers, ext, em, amb), 1.5f, 1e-4);
 }
 
-// ---- Lambertian lighting ---------------------------------------------------
-
-TEST_CASE("lambertian_factor") {
-    // Normal pointing up (z), light from directly above
-    std::array<float, 3> normal = {0.0f, 0.0f, 1.0f};
-    float factor = lambertian_factor(normal, 0.0f, static_cast<float>(M_PI / 2.0));
-    CHECK_NEAR(factor, 1.0f, 1e-4);
-}
-
-TEST_CASE("lambertian_factor perpendicular") {
-    // Normal pointing up, light from side
-    std::array<float, 3> normal = {0.0f, 0.0f, 1.0f};
-    float factor = lambertian_factor(normal, 0.0f, 0.0f);  // elevation 0
-    CHECK_NEAR(factor, 0.0f, 1e-4);
-}
-
 // ---- window_level, value_stretch, saturate ---------------------------------
 
 TEST_CASE("saturate") {

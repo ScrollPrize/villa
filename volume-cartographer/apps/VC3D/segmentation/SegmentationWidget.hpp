@@ -11,7 +11,7 @@
 #include "SegmentationCommon.hpp"
 #include "SegmentationPushPullConfig.hpp"
 
-#include <nlohmann/json_fwd.hpp>
+#include "utils/Json.hpp"
 
 #include "growth/SegmentationGrowth.hpp"
 
@@ -42,6 +42,7 @@ public:
     [[nodiscard]] float pushPullSigma() const;
     [[nodiscard]] float pushPullStep() const;
     [[nodiscard]] AlphaPushPullConfig alphaPushPullConfig() const;
+    [[nodiscard]] float editScale() const;
     [[nodiscard]] float smoothingStrength() const;
     [[nodiscard]] int smoothingIterations() const;
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const;
@@ -60,7 +61,7 @@ public:
     [[nodiscard]] QString customParamsProfile() const;
     [[nodiscard]] bool customParamsValid() const;
     [[nodiscard]] QString customParamsError() const;
-    [[nodiscard]] std::optional<nlohmann::json> customParamsJson() const;
+    [[nodiscard]] utils::Json customParamsJson() const;
     [[nodiscard]] bool showHoverMarker() const;
     [[nodiscard]] bool growthKeybindsEnabled() const;
     [[nodiscard]] QString normal3dZarrPath() const;
@@ -89,6 +90,7 @@ public:
     void setPushPullSigma(float value);
     void setPushPullStep(float value);
     void setAlphaPushPullConfig(const AlphaPushPullConfig& config);
+    void setEditScale(float value);
     void setSmoothingStrength(float value);
     void setSmoothingIterations(int value);
     void setGrowthMethod(SegmentationGrowthMethod method);
@@ -121,7 +123,6 @@ public:
     [[nodiscard]] bool showApprovalMask() const;
     [[nodiscard]] bool editApprovedMask() const;
     [[nodiscard]] bool editUnapprovedMask() const;
-    [[nodiscard]] bool autoApproveEdits() const;
     [[nodiscard]] bool autoApprovalEnabled() const;
     [[nodiscard]] float autoApprovalRadius() const;
     [[nodiscard]] float autoApprovalThreshold() const;
@@ -136,7 +137,6 @@ public:
     void setShowApprovalMask(bool enabled);
     void setEditApprovedMask(bool enabled);
     void setEditUnapprovedMask(bool enabled);
-    void setAutoApproveEdits(bool enabled);
     void setAutoApprovalEnabled(bool enabled);
     void setAutoApprovalRadius(float radius);
     void setAutoApprovalThreshold(float threshold);
@@ -206,6 +206,7 @@ signals:
     void growthMethodChanged(SegmentationGrowthMethod method);
     void pushPullStepChanged(float value);
     void alphaPushPullConfigChanged();
+    void editScaleChanged(float value);
     void smoothingStrengthChanged(float value);
     void smoothingIterationsChanged(int value);
     void growSurfaceRequested(SegmentationGrowthMethod method,
@@ -224,7 +225,6 @@ signals:
     void showApprovalMaskChanged(bool enabled);
     void editApprovedMaskChanged(bool enabled);
     void editUnapprovedMaskChanged(bool enabled);
-    void autoApproveEditsChanged(bool enabled);
     void autoApprovalEnabledChanged(bool enabled);
     void autoApprovalRadiusChanged(float radius);
     void autoApprovalThresholdChanged(float threshold);

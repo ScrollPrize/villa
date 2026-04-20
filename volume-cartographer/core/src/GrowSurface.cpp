@@ -1,6 +1,8 @@
 #include <omp.h>
 #include <random>
 
+#include "utils/Json.hpp"
+
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/core.hpp>
 #include <opencv2/imgproc.hpp>
@@ -1420,7 +1422,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     dbg_counter++;
 }
 
-QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurface*> &surfs_v, const nlohmann::json &params, float voxelsize)
+QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurface*> &surfs_v, const utils::Json &params, float voxelsize)
 {
     // Timing accumulator for pointTo calls (thread-safe via omp atomic)
     double pointTo_total_ms = 0.0;
@@ -1431,7 +1433,7 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
 
     std::cout << "global_steps_per_window: " << global_steps_per_window << std::endl;
     std::cout << "flip_x: " << flip_x << std::endl;
-    std::filesystem::path tgt_dir = params["tgt_dir"];
+    std::filesystem::path tgt_dir = params["tgt_dir"].get_string();
 
     std::unordered_map<std::string,QuadSurface*> surfs;
     float src_step = params.value("src_step", 20);
@@ -1471,8 +1473,8 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     if (params.contains("z_range")) {
         try {
             if (params["z_range"].is_array() && params["z_range"].size() == 2) {
-                z_min = params["z_range"][0].get<double>();
-                z_max = params["z_range"][1].get<double>();
+                z_min = params["z_range"][0].get_double();
+                z_max = params["z_range"][1].get_double();
                 if (z_min > z_max)
                     std::swap(z_min, z_max);
                 enforce_z_range = true;
@@ -1483,8 +1485,8 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
         }
     } else if (params.contains("z_min") && params.contains("z_max")) {
         try {
-            z_min = params["z_min"].get<double>();
-            z_max = params["z_max"].get<double>();
+            z_min = params["z_min"].get_double();
+            z_max = params["z_max"].get_double();
             if (z_min > z_max)
                 std::swap(z_min, z_max);
             enforce_z_range = true;
@@ -1528,9 +1530,9 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     std::ofstream approved_log(log_filename);
 
     for(auto &sm : surfs_v) {
-        if (sm->meta->contains("tags") && sm->meta->at("tags").contains("approved"))
+        if (sm->meta.contains("tags") && sm->meta.at("tags").contains("approved"))
             approved_sm.insert(sm);
-        if (!sm->meta->contains("tags") || !sm->meta->at("tags").contains("defective")) {
+        if (!sm->meta.contains("tags") || !sm->meta.at("tags").contains("defective")) {
             surfs[sm->id] = sm;
         }
     }
@@ -2184,23 +2186,27 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                                            /*inpaint=*/false, approved_weight_hr, prefer_approved_in_hr,
                                            /*parallel=*/params.value("hr_gen_parallel", false));
                 auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
-                dbg_surf->meta = std::make_unique<nlohmann::json>();
-                (*dbg_surf->meta)["vc_grow_seg_from_segments_params"] = params;
+                dbg_surf->meta = utils::Json::object();
+                dbg_surf->meta["vc_grow_seg_from_segments_params"] = utils::Json::parse(params.dump());
 
                 auto gen_channel = surftrack_generation_channel(generations, used_area, step);
                 if (!gen_channel.empty())
                     dbg_surf->setChannel("generations", gen_channel);
 
-                (*dbg_surf->meta)["max_gen"] = surftrack_max_generation(generations, used_area);
+                dbg_surf->meta["max_gen"] = surftrack_max_generation(generations, used_area);
 
                 // Use exact geometric area accumulated so far
                 const double area_exact_vx2 = area_accum_vox2;
                 const double area_exact_cm2 = area_exact_vx2 * double(voxelsize) * double(voxelsize) / 1e8;
-                (*dbg_surf->meta)["area_vx2"] = area_exact_vx2;
-                (*dbg_surf->meta)["area_cm2"] = area_exact_cm2;
-                (*dbg_surf->meta)["used_approved_segments"] = std::vector<std::string>(used_approved_names.begin(), used_approved_names.end());
-                (*dbg_surf->meta)["seed_surface_name"] = seed->id;
-                (*dbg_surf->meta)["seed_surface_id"] = seed->id;
+                dbg_surf->meta["area_vx2"] = area_exact_vx2;
+                dbg_surf->meta["area_cm2"] = area_exact_cm2;
+                {
+                    auto arr = utils::Json::array();
+                    for (const auto& n : used_approved_names) arr.push_back(n);
+                    dbg_surf->meta["used_approved_segments"] = std::move(arr);
+                }
+                dbg_surf->meta["seed_surface_name"] = seed->id;
+                dbg_surf->meta["seed_surface_id"] = seed->id;
                 std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str();
                 dbg_surf->save(tgt_dir / uuid, uuid);
                 delete dbg_surf;
@@ -2257,23 +2263,27 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
                                            /*inpaint=*/false, approved_weight_hr, prefer_approved_in_hr,
                                            /*parallel=*/params.value("hr_gen_parallel", false));
                 auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
-                dbg_surf->meta = std::make_unique<nlohmann::json>();
-                (*dbg_surf->meta)["vc_grow_seg_from_segments_params"] = params;
+                dbg_surf->meta = utils::Json::object();
+                dbg_surf->meta["vc_grow_seg_from_segments_params"] = utils::Json::parse(params.dump());
 
                 auto gen_channel = surftrack_generation_channel(generations, used_area, step);
                 if (!gen_channel.empty())
                     dbg_surf->setChannel("generations", gen_channel);
 
-                (*dbg_surf->meta)["max_gen"] = surftrack_max_generation(generations, used_area);
+                dbg_surf->meta["max_gen"] = surftrack_max_generation(generations, used_area);
 
                 std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str()+"_opt";
                 const double area_exact_vx2 = area_accum_vox2;
                 const double area_exact_cm2 = area_exact_vx2 * double(voxelsize) * double(voxelsize) / 1e8;
-                (*dbg_surf->meta)["area_vx2"] = area_exact_vx2;
-                (*dbg_surf->meta)["area_cm2"] = area_exact_cm2;
-                (*dbg_surf->meta)["used_approved_segments"] = std::vector<std::string>(used_approved_names.begin(), used_approved_names.end());
-                (*dbg_surf->meta)["seed_surface_name"] = seed->id;
-                (*dbg_surf->meta)["seed_surface_id"] = seed->id;
+                dbg_surf->meta["area_vx2"] = area_exact_vx2;
+                dbg_surf->meta["area_cm2"] = area_exact_cm2;
+                {
+                    auto arr = utils::Json::array();
+                    for (const auto& n : used_approved_names) arr.push_back(n);
+                    dbg_surf->meta["used_approved_segments"] = std::move(arr);
+                }
+                dbg_surf->meta["seed_surface_name"] = seed->id;
+                dbg_surf->meta["seed_surface_id"] = seed->id;
                 dbg_surf->save(tgt_dir / uuid, uuid);
                 delete dbg_surf;
             }
@@ -2367,13 +2377,17 @@ QuadSurface *grow_surf_from_surfs(QuadSurface *seed, const std::vector<QuadSurfa
     if (!gen_channel.empty())
         surf->setChannel("generations", gen_channel);
 
-    surf->meta = std::make_unique<nlohmann::json>();
-    (*surf->meta)["max_gen"] = surftrack_max_generation(generations, used_area);
-    (*surf->meta)["area_vx2"] = area_final_vox2;
-    (*surf->meta)["area_cm2"] = area_final_cm2;
-    (*surf->meta)["used_approved_segments"] = std::vector<std::string>(used_approved_names.begin(), used_approved_names.end());
-    (*surf->meta)["seed_surface_name"] = seed->id;
-    (*surf->meta)["seed_surface_id"] = seed->id;
+    surf->meta = utils::Json::object();
+    surf->meta["max_gen"] = surftrack_max_generation(generations, used_area);
+    surf->meta["area_vx2"] = area_final_vox2;
+    surf->meta["area_cm2"] = area_final_cm2;
+    {
+        auto arr = utils::Json::array();
+        for (const auto& n : used_approved_names) arr.push_back(n);
+        surf->meta["used_approved_segments"] = std::move(arr);
+    }
+    surf->meta["seed_surface_name"] = seed->id;
+    surf->meta["seed_surface_id"] = seed->id;
 
     std::cout << "pointTo total time: " << pointTo_total_ms << " ms" << std::endl;
 

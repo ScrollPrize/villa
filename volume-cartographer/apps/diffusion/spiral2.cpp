@@ -20,7 +20,7 @@
 #include <boost/graph/adjacency_list.hpp>
 #include <ceres/ceres.h>
 #include <opencv2/ximgproc.hpp>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 #include "vc/core/util/GridStore.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -330,13 +330,13 @@ int spiral2_main(
     }
 
     const auto& collections = point_collection.getAllCollections();
-    nlohmann::json json_output;
+    utils::Json json_output = utils::Json::array();
 
     for (const auto& [id, collection] : collections) {
         if (collection.name == umbilicus_set_name) continue;
         if (collection.name != "col3") continue;
 
-        nlohmann::json json_collection;
+        utils::Json json_collection = utils::Json::object();
         json_collection["name"] = collection.name;
         std::vector<std::vector<SpiralPoint>> all_spiral_wraps;
 
@@ -401,14 +401,26 @@ int spiral2_main(
         cv::imwrite(final_path, composite_vis);
         std::cout << "Saved final spiral visualization for " << collection.name << " to " << final_path << std::endl;
 
-        json_collection["spirals"] = all_spiral_wraps;
+        {
+            utils::Json spirals_arr = utils::Json::array();
+            for (const auto& wrap : all_spiral_wraps) {
+                utils::Json wrap_arr = utils::Json::array();
+                for (const auto& pt : wrap) {
+                    utils::Json j;
+                    to_json(j, pt);
+                    wrap_arr.push_back(j);
+                }
+                spirals_arr.push_back(wrap_arr);
+            }
+            json_collection["spirals"] = spirals_arr;
+        }
         json_output.push_back(json_collection);
     }
 
     if (vm.count("json-out")) {
         std::string json_out_path = vm["json-out"].as<std::string>();
         std::ofstream o(json_out_path);
-        o << std::setw(4) << json_output << std::endl;
+        o << json_output.dump(4) << std::endl;
         std::cout << "Saved spiral data to " << json_out_path << std::endl;
     }
     return 0;

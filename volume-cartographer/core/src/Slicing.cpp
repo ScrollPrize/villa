@@ -1,326 +1,236 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Compositing.hpp"
 #include "vc/core/types/Sampling.hpp"
-
-#include <xtensor/containers/xarray.hpp>
-#include <xtensor/containers/xtensor.hpp>
-#include <xtensor/generators/xbuilder.hpp>
-
 #include "vc/core/types/VcDataset.hpp"
-#include "vc/core/cache/ChunkData.hpp"
+#include "vc/core/cache/BlockCache.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 
 #include <opencv2/core.hpp>
-#include <opencv2/calib3d.hpp>
 
 #include <algorithm>
 #include <array>
-#include <cassert>
 #include <cmath>
-#include <climits>
+#include <cstdint>
 #include <limits>
-#include <unordered_set>
+#include <omp.h>
 
+#if defined(_MSC_VER)
+#define VC_FORCE_INLINE __forceinline
+#else
+#define VC_FORCE_INLINE __attribute__((always_inline)) inline
+#endif
 
-// ============================================================================
-// CacheParams — extract dataset constants once (ZYX ordering)
-// ============================================================================
+namespace {
 
-struct CacheParams {
-    int cz, cy, cx, sz, sy, sx;
-    int czShift, cyShift, cxShift, czMask, cyMask, cxMask;
-    bool pow2;  // true when all chunk dims are powers of two (fast path)
-    int chunksZ, chunksY, chunksX;
+using vc::cache::Block;
+using vc::cache::BlockKey;
+using vc::cache::BlockPtr;
+using vc::cache::BlockPipeline;
+using vc::cache::kBlockSize;
 
-    // Chunk index bounds from logical data extent.
-    // Chunks outside [dbMinC*, dbMaxC*] are in zero-padded regions.
-    int dbMinCz = 0, dbMaxCz = INT_MAX;
-    int dbMinCy = 0, dbMaxCy = INT_MAX;
-    int dbMinCx = 0, dbMaxCx = INT_MAX;
-    bool dbValid = false;
+constexpr int kBlockShift = 4;       // log2(16)
+constexpr int kBlockMask = 15;
+constexpr size_t kStrideY = kBlockSize;              // 16
+constexpr size_t kStrideZ = kBlockSize * kBlockSize; // 256
 
-    explicit CacheParams(vc::cache::TieredChunkCache* cache, int level) {
-        auto cs = cache->chunkShape(level);
-        cz = cs[0]; cy = cs[1]; cx = cs[2];
-        auto shape = cache->levelShape(level);
-        sz = shape[0]; sy = shape[1]; sx = shape[2];
+VC_FORCE_INLINE bool isnan_bitwise(float f) {
+    uint32_t u;
+    __builtin_memcpy(&u, &f, 4);
+    return (u & 0x7f800000u) == 0x7f800000u && (u & 0x007fffffu) != 0;
+}
 
-        auto isPow2 = [](int v) { return v > 0 && (v & (v - 1)) == 0; };
-        pow2 = isPow2(cz) && isPow2(cy) && isPow2(cx);
-        if (pow2) {
-            czShift = log2_pow2(cz); cyShift = log2_pow2(cy); cxShift = log2_pow2(cx);
-            czMask = cz - 1; cyMask = cy - 1; cxMask = cx - 1;
-        } else {
-            czShift = cyShift = cxShift = 0;
-            czMask = cyMask = cxMask = 0;
-        }
+VC_FORCE_INLINE bool isfinite_bitwise(float f) {
+    uint32_t u;
+    __builtin_memcpy(&u, &f, 4);
+    return (u & 0x7f800000u) != 0x7f800000u;
+}
 
-        chunksZ = (sz + cz - 1) / cz;
-        chunksY = (sy + cy - 1) / cy;
-        chunksX = (sx + cx - 1) / cx;
+template<typename T>
+VC_FORCE_INLINE void nt_store(T* dst, T val) {
+#if __has_builtin(__builtin_nontemporal_store)
+    __builtin_nontemporal_store(val, dst);
+#else
+    *dst = val;
+#endif
+}
 
-        // Compute chunk-level data bounds from level-0 bounds.
-        // Dilate by 1 chunk on each side — the level-0 bounds are already
-        // dilated by 1 coarsest voxel (32 pixels), but chunks are 128^3
-        // so an extra chunk of margin avoids clipping at boundaries.
-        auto db = cache->dataBounds();
-        if (db.valid) {
-            float scale = 1.0f / static_cast<float>(1 << level);
-            dbMinCx = std::max(0, chunkIdx(static_cast<int>(std::floor(db.minX * scale)), cx, cxShift) - 1);
-            dbMaxCx = std::min(chunksX - 1, chunkIdx(static_cast<int>(std::ceil(db.maxX * scale)), cx, cxShift) + 1);
-            dbMinCy = std::max(0, chunkIdx(static_cast<int>(std::floor(db.minY * scale)), cy, cyShift) - 1);
-            dbMaxCy = std::min(chunksY - 1, chunkIdx(static_cast<int>(std::ceil(db.maxY * scale)), cy, cyShift) + 1);
-            dbMinCz = std::max(0, chunkIdx(static_cast<int>(std::floor(db.minZ * scale)), cz, czShift) - 1);
-            dbMaxCz = std::min(chunksZ - 1, chunkIdx(static_cast<int>(std::ceil(db.maxZ * scale)), cz, czShift) + 1);
-            dbValid = true;
-        }
-    }
+VC_FORCE_INLINE void nt_store_u32(uint32_t* dst, uint32_t val) {
+#if __has_builtin(__builtin_nontemporal_store)
+    __builtin_nontemporal_store(val, dst);
+#else
+    *dst = val;
+#endif
+}
 
-    // Chunk index: shift for pow2, divide otherwise
-    inline int chunkIdx(int v, int c, int shift) const {
-        return pow2 ? (v >> shift) : (v / c);
-    }
+// Volume dimensions at a given level, used for bounds checks.
+struct VolumeShape {
+    int sz = 0, sy = 0, sx = 0;
+    float szf = 0.f, syf = 0.f, sxf = 0.f;
 
-    // Local offset within chunk: mask for pow2, modulo otherwise
-    inline int localOff(int v, int c, int mask) const {
-        return pow2 ? (v & mask) : (v % c);
-    }
-
-    // Convenience: chunk indices from voxel coords
-    inline int chunkZ(int iz) const { return pow2 ? (iz >> czShift) : (iz / cz); }
-    inline int chunkY(int iy) const { return pow2 ? (iy >> cyShift) : (iy / cy); }
-    inline int chunkX(int ix) const { return pow2 ? (ix >> cxShift) : (ix / cx); }
-
-    // Convenience: local offsets from voxel coords
-    inline int localZ(int iz) const { return pow2 ? (iz & czMask) : (iz % cz); }
-    inline int localY(int iy) const { return pow2 ? (iy & cyMask) : (iy % cy); }
-    inline int localX(int ix) const { return pow2 ? (ix & cxMask) : (ix % cx); }
-
-    static int log2_pow2(int v) {
-        int r = 0;
-        while ((v >> r) > 1) r++;
-        return r;
+    VolumeShape() = default;
+    explicit VolumeShape(BlockPipeline& cache, int level) {
+        auto s = cache.levelShape(level);
+        sz = s[0]; sy = s[1]; sx = s[2];
+        szf = float(sz); syf = float(sy); sxf = float(sx);
     }
 };
 
+// Direct-mapped block cache keyed by (bz, by, bx). On miss, consults the
+// block cache only — never blocks on disk or network. Missing blocks make
+// sampleInt return 0 (black) for that voxel. Viewport-demand fetches feed
+// the cache asynchronously via BlockPipeline::fetchInteractive.
+template<typename T, int kSlots = 1024>
+struct BlockSampler {
+    static_assert((kSlots & (kSlots - 1)) == 0, "kSlots must be power of 2");
+    static constexpr int kSlotMask = kSlots - 1;
 
-// ============================================================================
-// ChunkSampler — thread-local fast voxel access via raw pointer + strides
-// ============================================================================
-
-template<typename T, int kSlots = 16>
-struct ChunkSampler {
-    struct Slot {
-        int iz = -1, iy = -1, ix = -1;
-        vc::cache::ChunkDataPtr chunk;
+    // Hot slot: packed key + data pointer, 16 bytes. 512 * 16 = 8KB, fits
+    // comfortably in L1D. The shared_ptr (refcounting keep-alive) lives
+    // in a cold parallel array, touched only on miss.
+    struct HotSlot {
+        uint64_t key = UINT64_MAX;
         const T* data = nullptr;
-        int shift = 0;          // 0 = native level, >0 = coarser by this many levels
-        size_t fs0 = 0, fs1 = 0;  // strides for this slot's actual chunk
-        int coarseOriginZ = 0, coarseOriginY = 0, coarseOriginX = 0;  // chunk origin in coarse voxels
     };
 
-    const CacheParams& p;
-    vc::cache::TieredChunkCache& cache;
+    BlockPipeline& cache;
     int level;
-    Slot slots[kSlots];
-    int mru = 0;  // most-recently-used slot index
-    const T* data = nullptr;  // current data pointer
-    size_t s0 = 0, s1 = 0;   // strides for native-level chunks (s2 is always 1, eliminated)
+    VolumeShape shape;
+    HotSlot slots[kSlots];
+    BlockPtr slotBlocks[kSlots];  // cold: refcount keep-alive
+    uint64_t lastKey = UINT64_MAX;
+    const T* data = nullptr;
 
-    ChunkSampler(const CacheParams& p_, vc::cache::TieredChunkCache& cache_, int level_)
-        : p(p_), cache(cache_), level(level_)
-    {
-        s0 = static_cast<size_t>(p.cy) * p.cx;
-        s1 = static_cast<size_t>(p.cx);
+    BlockSampler(BlockPipeline& c, int lvl)
+        : cache(c), level(lvl), shape(c, lvl) {}
+
+    VC_FORCE_INLINE static uint64_t packKey(int bz, int by, int bx) {
+        return (uint64_t(uint32_t(bz)) << 42) | (uint64_t(uint32_t(by)) << 21) | uint64_t(uint32_t(bx));
     }
 
-    void updateChunk(int iz, int iy, int ix) {
-        // Quick reject: chunk is entirely in zero-padded region
-        if (p.dbValid && (iz < p.dbMinCz || iz > p.dbMaxCz ||
-                          iy < p.dbMinCy || iy > p.dbMaxCy ||
-                          ix < p.dbMinCx || ix > p.dbMaxCx)) {
-            data = nullptr;
+    // Cheap finalizer over the already-packed key. Reuses packKey's output
+    // instead of re-hashing the three int coords with three multiplies;
+    // the xor-fold mixes all three 21/22-bit axis fields into the low bits.
+    VC_FORCE_INLINE int slotIndexFromKey(uint64_t key) const {
+        uint64_t h = key ^ (key >> 21) ^ (key >> 42);
+        h ^= h >> 15;
+        h *= 0x2545F4914F6CDD1DULL;
+        return int(h) & kSlotMask;
+    }
+
+    VC_FORCE_INLINE int slotIndex(int bz, int by, int bx) const {
+        return slotIndexFromKey(packKey(bz, by, bx));
+    }
+
+    // Fetch the block pointer for (bz, by, bx). Non-blocking: returns null
+    // data if the block isn't resident in the cache.
+    VC_FORCE_INLINE void updateBlock(int bz, int by, int bx) {
+        tryUpdateBlockNonBlocking(bz, by, bx);
+    }
+
+    // Identical; kept for callers that want to be explicit about intent.
+    VC_FORCE_INLINE void tryUpdateBlockNonBlocking(int bz, int by, int bx) {
+        uint64_t key = packKey(bz, by, bx);
+        if (key == lastKey) [[likely]] return;
+
+        int idx = slotIndexFromKey(key);
+        HotSlot& slot = slots[idx];
+        if (slot.key == key) [[likely]] {
+            data = slot.data;
+            lastKey = key;
             return;
         }
-        // Check MRU slot first
-        auto& m = slots[mru];
-        if (m.iz == iz && m.iy == iy && m.ix == ix) {
-            data = m.data;
-            return;
-        }
-        // Linear scan remaining slots
-        for (int i = 0; i < kSlots; i++) {
-            if (i == mru) continue;
-            auto& s = slots[i];
-            if (s.iz == iz && s.iy == iy && s.ix == ix) {
-                mru = i;
-                data = s.data;
-                return;
-            }
-        }
-        // Miss: evict LRU (slot furthest from mru in ring)
-        int victim = (mru + 1) % kSlots;
-        auto& v = slots[victim];
-        vc::cache::ChunkKey key{level, iz, iy, ix};
-        v.chunk = cache.getBlocking(key);
 
-        if (v.chunk) {
-            v.shift = 0;
-            v.fs0 = s0;
-            v.fs1 = s1;
-        } else {
-            // Fallback: try coarser levels
-            auto [coarse, actualLvl] = cache.getBestAvailable(key);
-            if (coarse) {
-                v.chunk = coarse;
-                v.shift = actualLvl - level;
-                auto cs = cache.chunkShape(actualLvl);
-                v.fs0 = static_cast<size_t>(cs[1]) * cs[2];
-                v.fs1 = static_cast<size_t>(cs[2]);
-                auto coarseKey = key.coarsen(actualLvl);
-                auto coarseCs = cache.chunkShape(actualLvl);
-                v.coarseOriginZ = coarseKey.iz * coarseCs[0];
-                v.coarseOriginY = coarseKey.iy * coarseCs[1];
-                v.coarseOriginX = coarseKey.ix * coarseCs[2];
-            }
-        }
-
-        v.iz = iz; v.iy = iy; v.ix = ix;
-        v.data = v.chunk ? v.chunk->template data<T>() : nullptr;
-        mru = victim;
-        data = v.data;
+        BlockKey bk{level, bz, by, bx};
+        slotBlocks[idx] = cache.blockAt(bk);
+        slot.data = slotBlocks[idx] ? reinterpret_cast<const T*>(slotBlocks[idx]->data) : nullptr;
+        slot.key = key;
+        data = slot.data;
+        lastKey = key;
     }
 
-    // Sample a voxel from the current slot, handling coarse-level fallback.
-    // (iz, iy, ix) are fine-level voxel coordinates.
-    T sampleFromSlot(int iz, int iy, int ix) const {
-        auto& slot = slots[mru];
-        if (slot.shift == 0) {
-            return data[p.localZ(iz) * s0 + p.localY(iy) * s1 + p.localX(ix)];
-        }
-        // Remap fine-level voxel to coarse chunk local offset
-        int sh = slot.shift;
-        auto cs = cache.chunkShape(level + sh);
-        int cz = std::clamp((iz >> sh) - slot.coarseOriginZ, 0, cs[0] - 1);
-        int cy = std::clamp((iy >> sh) - slot.coarseOriginY, 0, cs[1] - 1);
-        int cx = std::clamp((ix >> sh) - slot.coarseOriginX, 0, cs[2] - 1);
-        return data[cz * slot.fs0 + cy * slot.fs1 + cx];
+    VC_FORCE_INLINE static size_t voxelOffset(int lz, int ly, int lx) {
+        return size_t(lz) * kStrideZ + size_t(ly) * kStrideY + size_t(lx);
     }
 
-    bool inBounds(float vz, float vy, float vx) const {
-        return vz >= 0 && vy >= 0 && vx >= 0 && vz < p.sz && vy < p.sy && vx < p.sx;
+    VC_FORCE_INLINE bool inBounds(float vz, float vy, float vx) const {
+        return vz >= 0 && vy >= 0 && vx >= 0
+            && vz < shape.szf && vy < shape.syf && vx < shape.sxf;
     }
 
-    T sampleNearest(float vz, float vy, float vx) {
-        int iz = static_cast<int>(vz + 0.5f);
-        int iy = static_cast<int>(vy + 0.5f);
-        int ix = static_cast<int>(vx + 0.5f);
-        if (iz >= p.sz) iz = p.sz - 1;
-        if (iy >= p.sy) iy = p.sy - 1;
-        if (ix >= p.sx) ix = p.sx - 1;
-
-        updateChunk(p.chunkZ(iz), p.chunkY(iy), p.chunkX(ix));
-        if (!data) return 0;
-
-        return sampleFromSlot(iz, iy, ix);
-    }
-
-    T sampleInt(int iz, int iy, int ix) {
-        if (iz < 0 || iy < 0 || ix < 0 || iz >= p.sz || iy >= p.sy || ix >= p.sx)
+    // Integer-coord fetch. Out-of-bounds and missing-block return 0.
+    VC_FORCE_INLINE T sampleInt(int iz, int iy, int ix) {
+        if (unsigned(iz) >= unsigned(shape.sz) ||
+            unsigned(iy) >= unsigned(shape.sy) ||
+            unsigned(ix) >= unsigned(shape.sx))
             return 0;
 
-        updateChunk(p.chunkZ(iz), p.chunkY(iy), p.chunkX(ix));
+        int bz = iz >> kBlockShift;
+        int by = iy >> kBlockShift;
+        int bx = ix >> kBlockShift;
+        updateBlock(bz, by, bx);
         if (!data) return 0;
 
-        return sampleFromSlot(iz, iy, ix);
+        int lz = iz & kBlockMask;
+        int ly = iy & kBlockMask;
+        int lx = ix & kBlockMask;
+        return data[voxelOffset(lz, ly, lx)];
     }
 
-    float sampleTrilinear(float vz, float vy, float vx) {
-        int iz = static_cast<int>(vz);
-        int iy = static_cast<int>(vy);
-        int ix = static_cast<int>(vx);
+    // Non-blocking version — skips blocks not yet in RAM.
+    VC_FORCE_INLINE bool sampleIntNB(int iz, int iy, int ix, T& out) {
+        if (unsigned(iz) >= unsigned(shape.sz) ||
+            unsigned(iy) >= unsigned(shape.sy) ||
+            unsigned(ix) >= unsigned(shape.sx)) {
+            out = 0; return true;
+        }
+        int bz = iz >> kBlockShift;
+        int by = iy >> kBlockShift;
+        int bx = ix >> kBlockShift;
+        tryUpdateBlockNonBlocking(bz, by, bx);
+        if (!data) return false;
+        int lz = iz & kBlockMask, ly = iy & kBlockMask, lx = ix & kBlockMask;
+        out = data[voxelOffset(lz, ly, lx)];
+        return true;
+    }
 
-        float c000 = sampleInt(iz, iy, ix);
-        float c100 = sampleInt(iz + 1, iy, ix);
-        float c010 = sampleInt(iz, iy + 1, ix);
+    VC_FORCE_INLINE T sampleNearest(float vz, float vy, float vx) {
+        int iz = int(vz + 0.5f);
+        int iy = int(vy + 0.5f);
+        int ix = int(vx + 0.5f);
+        if (iz >= shape.sz) iz = shape.sz - 1;
+        if (iy >= shape.sy) iy = shape.sy - 1;
+        if (ix >= shape.sx) ix = shape.sx - 1;
+        return sampleInt(iz, iy, ix);
+    }
+
+    VC_FORCE_INLINE float sampleTrilinear(float vz, float vy, float vx) {
+        int iz = int(vz);
+        int iy = int(vy);
+        int ix = int(vx);
+
+        float c000 = sampleInt(iz,     iy,     ix);
+        float c100 = sampleInt(iz + 1, iy,     ix);
+        float c010 = sampleInt(iz,     iy + 1, ix);
         float c110 = sampleInt(iz + 1, iy + 1, ix);
-        float c001 = sampleInt(iz, iy, ix + 1);
-        float c101 = sampleInt(iz + 1, iy, ix + 1);
-        float c011 = sampleInt(iz, iy + 1, ix + 1);
+        float c001 = sampleInt(iz,     iy,     ix + 1);
+        float c101 = sampleInt(iz + 1, iy,     ix + 1);
+        float c011 = sampleInt(iz,     iy + 1, ix + 1);
         float c111 = sampleInt(iz + 1, iy + 1, ix + 1);
 
-        float fz = vz - iz;
-        float fy = vy - iy;
-        float fx = vx - ix;
+        float fz = vz - float(iz);
+        float fy = vy - float(iy);
+        float fx = vx - float(ix);
 
         float c00 = std::fma(fx, c001 - c000, c000);
         float c01 = std::fma(fx, c011 - c010, c010);
         float c10 = std::fma(fx, c101 - c100, c100);
         float c11 = std::fma(fx, c111 - c110, c110);
-
-        float c0 = std::fma(fy, c01 - c00, c00);
-        float c1 = std::fma(fy, c11 - c10, c10);
-
+        float c0  = std::fma(fy, c01 - c00, c00);
+        float c1  = std::fma(fy, c11 - c10, c10);
         return std::fma(fz, c1 - c0, c0);
     }
 
-    // Fast path: when all 8 trilinear corners are in the same chunk
-    float sampleTrilinearFast(float vz, float vy, float vx) {
-        int iz = static_cast<int>(vz);
-        int iy = static_cast<int>(vy);
-        int ix = static_cast<int>(vx);
-
-        if (iz < 0 || iy < 0 || ix < 0 ||
-            iz + 1 >= p.sz || iy + 1 >= p.sy || ix + 1 >= p.sx)
-            return sampleTrilinear(vz, vy, vx);
-
-        int ciz0 = p.chunkZ(iz), ciz1 = p.chunkZ(iz + 1);
-        int ciy0 = p.chunkY(iy), ciy1 = p.chunkY(iy + 1);
-        int cix0 = p.chunkX(ix), cix1 = p.chunkX(ix + 1);
-
-        if (ciz0 == ciz1 && ciy0 == ciy1 && cix0 == cix1) {
-            updateChunk(ciz0, ciy0, cix0);
-            if (!data) return 0;
-
-            auto& slot = slots[mru];
-            if (slot.shift > 0) {
-                // Coarse fallback — use per-voxel path for correct remapping
-                return sampleTrilinear(vz, vy, vx);
-            }
-
-            // Native level fast path — direct memory access with +1 offsets
-            const size_t ls0 = s0, ls1 = s1;
-            int lz0 = p.localZ(iz), ly0 = p.localY(iy), lx0 = p.localX(ix);
-            int lz1 = lz0 + 1, ly1 = ly0 + 1, lx1 = lx0 + 1;
-
-            float c000 = data[lz0*ls0 + ly0*ls1 + lx0];
-            float c100 = data[lz1*ls0 + ly0*ls1 + lx0];
-            float c010 = data[lz0*ls0 + ly1*ls1 + lx0];
-            float c110 = data[lz1*ls0 + ly1*ls1 + lx0];
-            float c001 = data[lz0*ls0 + ly0*ls1 + lx1];
-            float c101 = data[lz1*ls0 + ly0*ls1 + lx1];
-            float c011 = data[lz0*ls0 + ly1*ls1 + lx1];
-            float c111 = data[lz1*ls0 + ly1*ls1 + lx1];
-
-            float fz = vz - iz;
-            float fy = vy - iy;
-            float fx = vx - ix;
-
-            float c00 = std::fma(fx, c001 - c000, c000);
-            float c01 = std::fma(fx, c011 - c010, c010);
-            float c10 = std::fma(fx, c101 - c100, c100);
-            float c11 = std::fma(fx, c111 - c110, c110);
-
-            float c0 = std::fma(fy, c01 - c00, c00);
-            float c1 = std::fma(fy, c11 - c10, c10);
-
-            return std::fma(fz, c1 - c0, c0);
-        }
-
-        return sampleTrilinear(vz, vy, vx);
-    }
-
-    // Catmull-Rom weight function for tricubic interpolation
-    static float catmullRom(float t) {
+    static VC_FORCE_INLINE float catmullRom(float t) {
         float at = std::abs(t);
         if (at < 1.0f) return 1.5f*at*at*at - 2.5f*at*at + 1.0f;
         if (at < 2.0f) return -0.5f*at*at*at + 2.5f*at*at - 4.0f*at + 2.0f;
@@ -328,443 +238,1417 @@ struct ChunkSampler {
     }
 
     float sampleTricubic(float vz, float vy, float vx) {
-        int iz = static_cast<int>(std::floor(vz));
-        int iy = static_cast<int>(std::floor(vy));
-        int ix = static_cast<int>(std::floor(vx));
-        float fz = vz - iz, fy = vy - iy, fx = vx - ix;
+        int iz = int(std::floor(vz));
+        int iy = int(std::floor(vy));
+        int ix = int(std::floor(vx));
+        float fz = vz - float(iz), fy = vy - float(iy), fx = vx - float(ix);
 
         float result = 0.0f;
         for (int dz = -1; dz <= 2; dz++) {
-            float wz = catmullRom(fz - dz);
+            float wz = catmullRom(fz - float(dz));
             for (int dy = -1; dy <= 2; dy++) {
-                float wy = catmullRom(fy - dy);
+                float wy = catmullRom(fy - float(dy));
                 float wzy = wz * wy;
                 for (int dx = -1; dx <= 2; dx++) {
-                    float wx = catmullRom(fx - dx);
-                    result += wzy * wx * static_cast<float>(sampleInt(iz+dz, iy+dy, ix+dx));
+                    float wx = catmullRom(fx - float(dx));
+                    result += wzy * wx * float(sampleInt(iz + dz, iy + dy, ix + dx));
                 }
             }
         }
-        return std::clamp(result, 0.0f, static_cast<float>(std::numeric_limits<T>::max()));
+        return std::clamp(result, 0.0f, float(std::numeric_limits<T>::max()));
     }
 };
 
+// Append the chunk keys that enclose a world-space bbox to `out`. Callers
+// that submit multiple regions/levels in one frame should accumulate into
+// a single vector and call cache.fetchInteractive(keys) exactly once —
+// every fetchInteractive call rebuilds the IOPool priority queue, so
+// batching matters.
+void appendChunksForRegion(BlockPipeline& cache, int level,
+                           float minVx, float minVy, float minVz,
+                           float maxVx, float maxVy, float maxVz,
+                           std::vector<vc::cache::ChunkKey>& out) {
+    auto cs = cache.chunkShape(level);
+    if (cs[0] <= 0) return;
+    auto ls = cache.levelShape(level);
+    int chunksZ = (ls[0] + cs[0] - 1) / cs[0];
+    int chunksY = (ls[1] + cs[1] - 1) / cs[1];
+    int chunksX = (ls[2] + cs[2] - 1) / cs[2];
 
-// ============================================================================
-// readVolumeImpl — unified inner loop
-// ============================================================================
+    int iMinX = std::max(0, int(std::floor(minVx)));
+    int iMinY = std::max(0, int(std::floor(minVy)));
+    int iMinZ = std::max(0, int(std::floor(minVz)));
+    int iMaxX = std::min(ls[2] - 1, int(std::ceil(maxVx)));
+    int iMaxY = std::min(ls[1] - 1, int(std::ceil(maxVy)));
+    int iMaxZ = std::min(ls[0] - 1, int(std::ceil(maxVz)));
+    if (iMinX > iMaxX || iMinY > iMaxY || iMinZ > iMaxZ) return;
 
-enum class SampleMode { Nearest, Trilinear, Tricubic };
+    int cMinX = iMinX / cs[2], cMaxX = iMaxX / cs[2];
+    int cMinY = iMinY / cs[1], cMaxY = iMaxY / cs[1];
+    int cMinZ = iMinZ / cs[0], cMaxZ = iMaxZ / cs[0];
 
-template<typename T, SampleMode Mode, typename NormalFn>
-static void readVolumeImpl(
-    cv::Mat_<T>& out,
-    vc::cache::TieredChunkCache& cache,
-    int level,
-    const CacheParams& p,
-    const cv::Mat_<cv::Vec3f>& coords,
-    NormalFn getNormal,
-    int numLayers,
-    float zStep,
-    int zStart,
-    const CompositeParams* params)
+    for (int iz = cMinZ; iz <= cMaxZ && iz < chunksZ; iz++)
+        for (int iy = cMinY; iy <= cMaxY && iy < chunksY; iy++)
+            for (int ix = cMinX; ix <= cMaxX && ix < chunksX; ix++)
+                out.push_back({level, iz, iy, ix});
+}
+
+// Surface-aware chunk enumeration. Bbox enumeration is correct for planes
+// (the plane really does span its bbox) but disastrous for curved surfaces:
+// a flattened scroll surface might span a 4000x4000x500 voxel bbox while
+// actually crossing only a few hundred chunks. The other thousands of
+// bbox-interior chunks are off-surface and would trigger pointless S3
+// fetches. Walk per-pixel coords, map each to its chunk, dedup.
+// Sub-sample to keep the dedup set cheap.
+void appendChunksForCoordsSurface(BlockPipeline& cache, int level,
+                                  const cv::Mat_<cv::Vec3f>& coords,
+                                  std::vector<vc::cache::ChunkKey>& out) {
+    auto cs = cache.chunkShape(level);
+    if (cs[0] <= 0 || cs[1] <= 0 || cs[2] <= 0) return;
+    auto ls = cache.levelShape(level);
+    const int chunksZ = (ls[0] + cs[0] - 1) / cs[0];
+    const int chunksY = (ls[1] + cs[1] - 1) / cs[1];
+    const int chunksX = (ls[2] + cs[2] - 1) / cs[2];
+
+    const float scale = (level > 0) ? 1.0f / float(1 << level) : 1.0f;
+    // Sub-sample stride: at native resolution, ~1 voxel per pixel and a
+    // chunk is 128 voxels, so an 8-pixel stride still hits every chunk
+    // the surface crosses (16 samples per chunk row → safe coverage even
+    // for steeply oblique surface patches).
+    const int stride = (coords.rows > 256) ? 8 : 1;
+
+    // Thread-local dedup set to avoid heap churn across frames. Cleared on
+    // entry; capacity grows monotonically with the largest surface ever seen
+    // on this thread, which is exactly what we want (amortizes allocations).
+    thread_local std::unordered_set<vc::cache::ChunkKey, vc::cache::ChunkKeyHash> seen;
+    seen.clear();
+    const size_t sampleEstimate =
+        size_t((coords.rows + stride - 1) / stride) *
+        size_t((coords.cols + stride - 1) / stride);
+    // Rough: spatial coherence keeps unique-chunk count ≪ sample count.
+    seen.reserve(std::max<size_t>(512, sampleEstimate / 8));
+
+    for (int r = 0; r < coords.rows; r += stride) {
+        const cv::Vec3f* row = coords.ptr<cv::Vec3f>(r);
+        for (int c = 0; c < coords.cols; c += stride) {
+            const cv::Vec3f& v = row[c];
+            // Skip NaN / zero-sentinel pixels (off-surface).
+            if (!isfinite_bitwise(v[0])) continue;
+            if (v[0] == 0.f && v[1] == 0.f && v[2] == 0.f) continue;
+            const int ix_ = int(std::floor(v[0] * scale));
+            const int iy_ = int(std::floor(v[1] * scale));
+            const int iz_ = int(std::floor(v[2] * scale));
+            if (ix_ < 0 || iy_ < 0 || iz_ < 0) continue;
+            const int cx = ix_ / cs[2];
+            const int cy = iy_ / cs[1];
+            const int cz = iz_ / cs[0];
+            if (cx >= chunksX || cy >= chunksY || cz >= chunksZ) continue;
+            vc::cache::ChunkKey k{level, cz, cy, cx};
+            if (seen.insert(k).second) out.push_back(k);
+        }
+    }
+}
+
+// Sort prefetch keys by 3D distance from the viewport-center voxel (in
+// level-0 space). The IOPool preserves submission order when rebuilding
+// the front of its priority queue, so center-most chunks land at the head
+// of the download/load queue and stream in first. `centerL0` is in level-0
+// voxel coordinates.
+void sortKeysByCenterDistance(std::vector<vc::cache::ChunkKey>& keys,
+                              const std::array<int, 3>* chunkShapesByLevel,
+                              int numLevels,
+                              const cv::Vec3f& centerL0) {
+    if (keys.size() < 2) return;
+    auto sqDist = [&](const vc::cache::ChunkKey& k) -> float {
+        if (k.level < 0 || k.level >= numLevels) return std::numeric_limits<float>::max();
+        const auto& cs = chunkShapesByLevel[k.level];
+        if (cs[0] <= 0) return std::numeric_limits<float>::max();
+        const float scale = float(1 << k.level);
+        // Chunk center in level-0 voxel space.
+        float cx = (float(k.ix) + 0.5f) * float(cs[2]) * scale;
+        float cy = (float(k.iy) + 0.5f) * float(cs[1]) * scale;
+        float cz = (float(k.iz) + 0.5f) * float(cs[0]) * scale;
+        float dx = cx - centerL0[0];
+        float dy = cy - centerL0[1];
+        float dz = cz - centerL0[2];
+        return dx*dx + dy*dy + dz*dz;
+    };
+    std::sort(keys.begin(), keys.end(),
+        [&](const vc::cache::ChunkKey& a, const vc::cache::ChunkKey& b) {
+            return sqDist(a) < sqDist(b);
+        });
+}
+
+// Convenience wrapper: single-region, single-level. Submits immediately.
+void prefetchRegion(BlockPipeline& cache, int level,
+                    float minVx, float minVy, float minVz,
+                    float maxVx, float maxVy, float maxVz) {
+    thread_local std::vector<vc::cache::ChunkKey> keys;
+    keys.clear();
+    appendChunksForRegion(cache, level, minVx, minVy, minVz,
+                          maxVx, maxVy, maxVz, keys);
+    if (!keys.empty()) cache.fetchInteractive(keys, level);
+}
+
+// prefetchCoordsRegion / prefetchPlaneRegion: inputs are already in
+// LEVEL-space voxels (callers either pass already-scaled args or operate
+// at a single level). For the world-space → multi-level adaptive path,
+// see samplePixelsAdaptiveARGB32 which scales per-level before prefetching.
+void prefetchCoordsRegion(BlockPipeline& cache, int level,
+                          const cv::Mat_<cv::Vec3f>& coords) {
+    // Unconditional min/max reductions so the vectorizer can fold the
+    // inner loop: invalid points are sentinels (usually NaN), and
+    // fminnm/fmaxnm on NEON treat NaN as "not a number, propagate the
+    // other operand" — same end result as a skip but no branch.
+    float minVx = FLT_MAX, minVy = FLT_MAX, minVz = FLT_MAX;
+    float maxVx = -FLT_MAX, maxVy = -FLT_MAX, maxVz = -FLT_MAX;
+    for (int r = 0; r < coords.rows; r++) {
+        const cv::Vec3f* row = coords.ptr<cv::Vec3f>(r);
+        for (int c = 0; c < coords.cols; c++) {
+            const auto& v = row[c];
+            minVx = std::fmin(minVx, v[0]); maxVx = std::fmax(maxVx, v[0]);
+            minVy = std::fmin(minVy, v[1]); maxVy = std::fmax(maxVy, v[1]);
+            minVz = std::fmin(minVz, v[2]); maxVz = std::fmax(maxVz, v[2]);
+        }
+    }
+    if (maxVx >= minVx)
+        prefetchRegion(cache, level, minVx, minVy, minVz, maxVx, maxVy, maxVz);
+}
+
+void prefetchPlaneRegion(BlockPipeline& cache, int level,
+                         const cv::Vec3f& origin,
+                         const cv::Vec3f& vx_step,
+                         const cv::Vec3f& vy_step,
+                         int w, int h) {
+    cv::Vec3f corners[4] = {
+        origin,
+        origin + vx_step * float(w - 1),
+        origin + vy_step * float(h - 1),
+        origin + vx_step * float(w - 1) + vy_step * float(h - 1),
+    };
+    float minVx = corners[0][0], maxVx = corners[0][0];
+    float minVy = corners[0][1], maxVy = corners[0][1];
+    float minVz = corners[0][2], maxVz = corners[0][2];
+    for (int i = 1; i < 4; i++) {
+        minVx = std::min(minVx, corners[i][0]); maxVx = std::max(maxVx, corners[i][0]);
+        minVy = std::min(minVy, corners[i][1]); maxVy = std::max(maxVy, corners[i][1]);
+        minVz = std::min(minVz, corners[i][2]); maxVz = std::max(maxVz, corners[i][2]);
+    }
+    prefetchRegion(cache, level, minVx, minVy, minVz, maxVx, maxVy, maxVz);
+}
+
+enum class SampleMode : std::uint8_t { Nearest, Trilinear, Tricubic };
+
+template<typename T, SampleMode Mode>
+VC_FORCE_INLINE T sampleOne(BlockSampler<T>& s, float vz, float vy, float vx) {
+    if constexpr (Mode == SampleMode::Nearest) {
+        if (!s.inBounds(vz, vy, vx)) return 0;
+        return s.sampleNearest(vz, vy, vx);
+    } else if constexpr (Mode == SampleMode::Trilinear) {
+        if (!s.inBounds(vz, vy, vx)) return 0;
+        float v = s.sampleTrilinear(vz, vy, vx);
+        if constexpr (std::is_same_v<T, uint16_t>) {
+            if (v < 0.f) v = 0.f; if (v > 65535.f) v = 65535.f;
+            return uint16_t(v + 0.5f);
+        } else {
+            if (v < 0.f) v = 0.f; if (v > 255.f) v = 255.f;
+            return T(v);
+        }
+    } else {
+        if (!s.inBounds(vz, vy, vx)) return 0;
+        float v = s.sampleTricubic(vz, vy, vx);
+        return T(v);
+    }
+}
+
+template<typename T, SampleMode Mode>
+void readVolumeImpl(cv::Mat_<T>& out, BlockPipeline& cache, int level,
+                    const cv::Mat_<cv::Vec3f>& coords)
 {
+    prefetchCoordsRegion(cache, level, coords);
+
     const int h = coords.rows;
     const int w = coords.cols;
-
-    out = cv::Mat_<T>(coords.size(), 0);
-
-    // Phase 1: Discover needed chunks and prefetch (single-threaded).
+    #pragma omp parallel
     {
-        const size_t totalChunks = static_cast<size_t>(p.chunksZ) * p.chunksY * p.chunksX;
-        std::vector<uint8_t> needed(totalChunks, 0);
-        int minIz = p.chunksZ, maxIz = -1;
-        int minIy = p.chunksY, maxIy = -1;
-        int minIx = p.chunksX, maxIx = -1;
-
-        auto markVoxel = [&](float vz, float vy, float vx) {
-            if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < p.sz && vy < p.sy && vx < p.sx)) return;
-            int iz = static_cast<int>(vz + 0.5f);
-            int iy = static_cast<int>(vy + 0.5f);
-            int ix = static_cast<int>(vx + 0.5f);
-            if (iz >= p.sz) iz = p.sz - 1;
-            if (iy >= p.sy) iy = p.sy - 1;
-            if (ix >= p.sx) ix = p.sx - 1;
-            int ciz = p.chunkZ(iz);
-            int ciy = p.chunkY(iy);
-            int cix = p.chunkX(ix);
-            // Skip chunks in zero-padded regions
-            if (p.dbValid && (ciz < p.dbMinCz || ciz > p.dbMaxCz ||
-                              ciy < p.dbMinCy || ciy > p.dbMaxCy ||
-                              cix < p.dbMinCx || cix > p.dbMaxCx)) return;
-            size_t idx = static_cast<size_t>(ciz) * p.chunksY * p.chunksX + static_cast<size_t>(ciy) * p.chunksX + cix;
-            if (!needed[idx]) {
-                needed[idx] = 1;
-                minIz = std::min(minIz, ciz); maxIz = std::max(maxIz, ciz);
-                minIy = std::min(minIy, ciy); maxIy = std::max(maxIy, ciy);
-                minIx = std::min(minIx, cix); maxIx = std::max(maxIx, cix);
+        BlockSampler<T> s(cache, level);
+        #pragma omp for schedule(dynamic, 16)
+        for (int y = 0; y < h; y++) {
+            const cv::Vec3f* row = coords.ptr<cv::Vec3f>(y);
+            T* outRow = out.template ptr<T>(y);
+            for (int x = 0; x < w; x++) {
+                const auto& c = row[x];
+                outRow[x] = sampleOne<T, Mode>(s, c[2], c[1], c[0]);
             }
+        }
+    }
+}
+
+} // namespace
+
+// ============================================================================
+// Public API
+// ============================================================================
+
+void readInterpolated3D(cv::Mat_<uint8_t>& out, BlockPipeline* cache, int level,
+                        const cv::Mat_<cv::Vec3f>& coords, bool nearest_neighbor) {
+    if (nearest_neighbor)
+        readVolumeImpl<uint8_t, SampleMode::Nearest>(out, *cache, level, coords);
+    else
+        readVolumeImpl<uint8_t, SampleMode::Trilinear>(out, *cache, level, coords);
+}
+
+void readInterpolated3D(cv::Mat_<uint16_t>& out, BlockPipeline* cache, int level,
+                        const cv::Mat_<cv::Vec3f>& coords, bool nearest_neighbor) {
+    if (nearest_neighbor)
+        readVolumeImpl<uint16_t, SampleMode::Nearest>(out, *cache, level, coords);
+    else
+        readVolumeImpl<uint16_t, SampleMode::Trilinear>(out, *cache, level, coords);
+}
+
+void readInterpolated3D(cv::Mat_<uint8_t>& out, BlockPipeline* cache, int level,
+                        const cv::Mat_<cv::Vec3f>& coords, vc::Sampling method) {
+    switch (method) {
+        case vc::Sampling::Nearest:
+            readVolumeImpl<uint8_t, SampleMode::Nearest>(out, *cache, level, coords); break;
+        case vc::Sampling::Tricubic:
+            readVolumeImpl<uint8_t, SampleMode::Tricubic>(out, *cache, level, coords); break;
+        default:
+            readVolumeImpl<uint8_t, SampleMode::Trilinear>(out, *cache, level, coords); break;
+    }
+}
+
+void readInterpolated3D(cv::Mat_<uint16_t>& out, BlockPipeline* cache, int level,
+                        const cv::Mat_<cv::Vec3f>& coords, vc::Sampling method) {
+    switch (method) {
+        case vc::Sampling::Nearest:
+            readVolumeImpl<uint16_t, SampleMode::Nearest>(out, *cache, level, coords); break;
+        case vc::Sampling::Tricubic:
+            readVolumeImpl<uint16_t, SampleMode::Tricubic>(out, *cache, level, coords); break;
+        default:
+            readVolumeImpl<uint16_t, SampleMode::Trilinear>(out, *cache, level, coords); break;
+    }
+}
+
+namespace {
+
+template<typename T>
+void readArea3DImpl(Array3D<T>& out, const cv::Vec3i& offset,
+                    BlockPipeline* cache, int level) {
+    int d = int(out.shape()[0]), h = int(out.shape()[1]), w = int(out.shape()[2]);
+    // Prefetch
+    prefetchRegion(*cache, level,
+                   float(offset[0]), float(offset[1]), float(offset[2]),
+                   float(offset[0] + w - 1), float(offset[1] + h - 1), float(offset[2] + d - 1));
+
+    #pragma omp parallel
+    {
+        BlockSampler<T> s(*cache, level);
+        #pragma omp for schedule(dynamic, 4) collapse(2)
+        for (int z = 0; z < d; z++) {
+            for (int y = 0; y < h; y++) {
+                int iz = offset[2] + z;
+                int iy = offset[1] + y;
+                for (int x = 0; x < w; x++) {
+                    int ix = offset[0] + x;
+                    out(z, y, x) = s.sampleInt(iz, iy, ix);
+                }
+            }
+        }
+    }
+}
+
+} // namespace
+
+void readArea3D(Array3D<uint8_t>& out, const cv::Vec3i& offset,
+                BlockPipeline* cache, int level) {
+    readArea3DImpl(out, offset, cache, level);
+}
+
+void readArea3D(Array3D<uint16_t>& out, const cv::Vec3i& offset,
+                BlockPipeline* cache, int level) {
+    readArea3DImpl(out, offset, cache, level);
+}
+
+// ----------------------------------------------------------------------------
+// Plane sampling (uint8 + ARGB32 variants)
+// ----------------------------------------------------------------------------
+
+namespace {
+
+template<SampleMode Mode>
+void samplePlaneImpl(cv::Mat_<uint8_t>& out, BlockPipeline& cache, int level,
+                     const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
+                     int w, int h) {
+    prefetchPlaneRegion(cache, level, origin, vx_step, vy_step, w, h);
+
+    #pragma omp parallel
+    {
+        BlockSampler<uint8_t> s(cache, level);
+        #pragma omp for schedule(dynamic, 16)
+        for (int y = 0; y < h; y++) {
+            uint8_t* outRow = out.ptr<uint8_t>(y);
+            cv::Vec3f base = origin + vy_step * float(y);
+            for (int x = 0; x < w; x++) {
+                cv::Vec3f c = base + vx_step * float(x);
+                outRow[x] = sampleOne<uint8_t, Mode>(s, c[2], c[1], c[0]);
+            }
+        }
+    }
+}
+
+} // namespace
+
+void samplePlane(cv::Mat_<uint8_t>& out, BlockPipeline* cache, int level,
+                 const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
+                 int w, int h, vc::Sampling method) {
+    switch (method) {
+        case vc::Sampling::Nearest:
+            samplePlaneImpl<SampleMode::Nearest>(out, *cache, level, origin, vx_step, vy_step, w, h); break;
+        case vc::Sampling::Tricubic:
+            samplePlaneImpl<SampleMode::Tricubic>(out, *cache, level, origin, vx_step, vy_step, w, h); break;
+        default:
+            samplePlaneImpl<SampleMode::Trilinear>(out, *cache, level, origin, vx_step, vy_step, w, h); break;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Adaptive plane/coords sampling (per-pixel level fallback, non-blocking)
+// ----------------------------------------------------------------------------
+
+namespace {
+
+// Attempt a non-blocking fetch at level L; returns true and writes LUT pixel
+// if all needed blocks are present. Trilinear path uses 8 corners.
+// Nearest sample with caller-guaranteed in-bounds coords. Caller must have
+// verified 0 <= v{z,y,x} < shape.{sz,sy,sx}. Skips all bounds checks.
+VC_FORCE_INLINE bool trySampleNearestUnchecked(BlockSampler<uint8_t>& s,
+                                               float vz, float vy, float vx,
+                                               uint8_t& out) {
+    int iz = int(vz + 0.5f), iy = int(vy + 0.5f), ix = int(vx + 0.5f);
+    if (iz >= s.shape.sz) iz = s.shape.sz - 1;
+    if (iy >= s.shape.sy) iy = s.shape.sy - 1;
+    if (ix >= s.shape.sx) ix = s.shape.sx - 1;
+    int bz = iz >> kBlockShift, by = iy >> kBlockShift, bx = ix >> kBlockShift;
+    s.tryUpdateBlockNonBlocking(bz, by, bx);
+    if (!s.data) return false;
+    int lz = iz & kBlockMask, ly = iy & kBlockMask, lx = ix & kBlockMask;
+    out = s.data[size_t(lz) * kStrideZ + size_t(ly) * kStrideY + size_t(lx)];
+    return true;
+}
+
+template<SampleMode Mode>
+VC_FORCE_INLINE bool trySampleNB(BlockSampler<uint8_t>& s, float vz, float vy, float vx,
+                                 uint8_t& out) {
+    if constexpr (Mode == SampleMode::Nearest) {
+        // Skip the float inBounds + per-axis clamp. sampleIntNB already
+        // rejects OOB via unsigned compare. Only need to guard negatives
+        // (truncation rounds small negatives to 0 incorrectly).
+        if (vz < 0.f || vy < 0.f || vx < 0.f) { out = 0; return true; }
+        int iz = int(vz + 0.5f), iy = int(vy + 0.5f), ix = int(vx + 0.5f);
+        return s.sampleIntNB(iz, iy, ix, out);
+    }
+    if (!s.inBounds(vz, vy, vx)) { out = 0; return true; }
+    {
+        int iz = int(vz), iy = int(vy), ix = int(vx);
+        float v000f, v100f, v010f, v110f, v001f, v101f, v011f, v111f;
+
+        // Fast path: all 8 corners share one block (the common case — ~82%
+        // of interior samples). Single block lookup, 8 direct reads.
+        const int lz = iz & kBlockMask;
+        const int ly = iy & kBlockMask;
+        const int lx = ix & kBlockMask;
+        if (lz != kBlockMask && ly != kBlockMask && lx != kBlockMask &&
+            iz >= 0 && iy >= 0 && ix >= 0 &&
+            iz + 1 < s.shape.sz && iy + 1 < s.shape.sy && ix + 1 < s.shape.sx) {
+            int bz = iz >> kBlockShift, by = iy >> kBlockShift, bx = ix >> kBlockShift;
+            s.tryUpdateBlockNonBlocking(bz, by, bx);
+            if (!s.data) return false;
+            const uint8_t* b = s.data + size_t(lz) * kStrideZ
+                                      + size_t(ly) * kStrideY
+                                      + size_t(lx);
+            v000f = float(b[0]);
+            v001f = float(b[1]);
+            v010f = float(b[kStrideY]);
+            v011f = float(b[kStrideY + 1]);
+            v100f = float(b[kStrideZ]);
+            v101f = float(b[kStrideZ + 1]);
+            v110f = float(b[kStrideZ + kStrideY]);
+            v111f = float(b[kStrideZ + kStrideY + 1]);
+        } else {
+            // Slow path: at least one axis's high corner crosses a block
+            // boundary. In the common case only ONE axis crosses (~80% of
+            // slow-path samples); specialize to 2 block lookups instead of
+            // 8 independent sampleIntNB calls.
+            const bool zCross = (lz == kBlockMask);
+            const bool yCross = (ly == kBlockMask);
+            const bool xCross = (lx == kBlockMask);
+            const int nCross = int(zCross) + int(yCross) + int(xCross);
+
+            // Full-bounds guard for the specialized paths. Near-image-edge
+            // samples fall through to the generic 8-call path so we don't
+            // duplicate its bounds handling here.
+            const bool edgeInBounds =
+                iz >= 0 && iy >= 0 && ix >= 0
+                && iz + 1 < s.shape.sz && iy + 1 < s.shape.sy && ix + 1 < s.shape.sx;
+
+            auto loadFromBlock = [](const uint8_t* b, int tz, int ty, int tx) {
+                return float(b[size_t(tz) * kStrideZ + size_t(ty) * kStrideY + size_t(tx)]);
+            };
+
+            if (nCross == 1 && edgeInBounds) {
+                const int bz = iz >> kBlockShift;
+                const int by = iy >> kBlockShift;
+                const int bx = ix >> kBlockShift;
+                if (zCross) {
+                    s.tryUpdateBlockNonBlocking(bz, by, bx);
+                    if (!s.data) return false;
+                    const uint8_t* bA = s.data;
+                    v000f = loadFromBlock(bA, lz,     ly,     lx);
+                    v001f = loadFromBlock(bA, lz,     ly,     lx + 1);
+                    v010f = loadFromBlock(bA, lz,     ly + 1, lx);
+                    v011f = loadFromBlock(bA, lz,     ly + 1, lx + 1);
+                    s.tryUpdateBlockNonBlocking(bz + 1, by, bx);
+                    if (!s.data) return false;
+                    const uint8_t* bB = s.data;
+                    v100f = loadFromBlock(bB, 0,      ly,     lx);
+                    v101f = loadFromBlock(bB, 0,      ly,     lx + 1);
+                    v110f = loadFromBlock(bB, 0,      ly + 1, lx);
+                    v111f = loadFromBlock(bB, 0,      ly + 1, lx + 1);
+                } else if (yCross) {
+                    s.tryUpdateBlockNonBlocking(bz, by, bx);
+                    if (!s.data) return false;
+                    const uint8_t* bA = s.data;
+                    v000f = loadFromBlock(bA, lz,     ly,     lx);
+                    v001f = loadFromBlock(bA, lz,     ly,     lx + 1);
+                    v100f = loadFromBlock(bA, lz + 1, ly,     lx);
+                    v101f = loadFromBlock(bA, lz + 1, ly,     lx + 1);
+                    s.tryUpdateBlockNonBlocking(bz, by + 1, bx);
+                    if (!s.data) return false;
+                    const uint8_t* bB = s.data;
+                    v010f = loadFromBlock(bB, lz,     0,      lx);
+                    v011f = loadFromBlock(bB, lz,     0,      lx + 1);
+                    v110f = loadFromBlock(bB, lz + 1, 0,      lx);
+                    v111f = loadFromBlock(bB, lz + 1, 0,      lx + 1);
+                } else {  // xCross
+                    s.tryUpdateBlockNonBlocking(bz, by, bx);
+                    if (!s.data) return false;
+                    const uint8_t* bA = s.data;
+                    v000f = loadFromBlock(bA, lz,     ly,     lx);
+                    v010f = loadFromBlock(bA, lz,     ly + 1, lx);
+                    v100f = loadFromBlock(bA, lz + 1, ly,     lx);
+                    v110f = loadFromBlock(bA, lz + 1, ly + 1, lx);
+                    s.tryUpdateBlockNonBlocking(bz, by, bx + 1);
+                    if (!s.data) return false;
+                    const uint8_t* bB = s.data;
+                    v001f = loadFromBlock(bB, lz,     ly,     0);
+                    v011f = loadFromBlock(bB, lz,     ly + 1, 0);
+                    v101f = loadFromBlock(bB, lz + 1, ly,     0);
+                    v111f = loadFromBlock(bB, lz + 1, ly + 1, 0);
+                }
+            } else {
+                // 2- or 3-axis crossing, or image-edge adjacent: fall back
+                // to per-corner sampleIntNB (handles OOB, negative indices,
+                // multi-block fetch uniformly).
+                uint8_t v000, v100, v010, v110, v001, v101, v011, v111;
+                if (!s.sampleIntNB(iz,     iy,     ix,     v000)) return false;
+                if (!s.sampleIntNB(iz + 1, iy,     ix,     v100)) return false;
+                if (!s.sampleIntNB(iz,     iy + 1, ix,     v010)) return false;
+                if (!s.sampleIntNB(iz + 1, iy + 1, ix,     v110)) return false;
+                if (!s.sampleIntNB(iz,     iy,     ix + 1, v001)) return false;
+                if (!s.sampleIntNB(iz + 1, iy,     ix + 1, v101)) return false;
+                if (!s.sampleIntNB(iz,     iy + 1, ix + 1, v011)) return false;
+                if (!s.sampleIntNB(iz + 1, iy + 1, ix + 1, v111)) return false;
+                v000f = float(v000); v100f = float(v100);
+                v010f = float(v010); v110f = float(v110);
+                v001f = float(v001); v101f = float(v101);
+                v011f = float(v011); v111f = float(v111);
+            }
+        }
+
+        float fz = vz - float(iz), fy = vy - float(iy), fx = vx - float(ix);
+        float c00 = std::fma(fx, v001f - v000f, v000f);
+        float c01 = std::fma(fx, v011f - v010f, v010f);
+        float c10 = std::fma(fx, v101f - v100f, v100f);
+        float c11 = std::fma(fx, v111f - v110f, v110f);
+        float c0  = std::fma(fy, c01 - c00, c00);
+        float c1  = std::fma(fy, c11 - c10, c10);
+        float v   = std::fma(fz, c1 - c0, c0);
+        if (v < 0.f) v = 0.f; if (v > 255.f) v = 255.f;
+        out = uint8_t(v);
+        return true;
+    }
+}
+
+template<SampleMode Mode>
+void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
+                                BlockPipeline& cache,
+                                int desiredLevel, int numLevels,
+                                const cv::Mat_<cv::Vec3f>* coords,  // may be nullptr
+                                const cv::Vec3f* origin, const cv::Vec3f* vx_step, const cv::Vec3f* vy_step,
+                                int w, int h, const uint32_t lut[256])
+{
+    // Pre-start fetches for all levels. Coords/origin are in world (level-0)
+    // voxel space; scale to each level before enumerating chunks. Batch
+    // everything into one fetchInteractive call — the IOPool's queue
+    // rebuild is O(N) and we'd otherwise pay it once per level.
+    auto levelScale = [](int lvl) { return (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f; };
+    // Thread-local to avoid per-frame alloc/free.
+    thread_local std::vector<vc::cache::ChunkKey> prefetchKeys;
+    prefetchKeys.clear();
+    cv::Vec3f viewCenterL0(0, 0, 0);
+    bool haveCenter = false;
+    if (coords) {
+        // Surface-aware enumeration: only the chunks the surface actually
+        // crosses, never the bbox interior.
+        for (int lvl = desiredLevel; lvl < numLevels; lvl++) {
+            appendChunksForCoordsSurface(cache, lvl, *coords, prefetchKeys);
+        }
+        const cv::Vec3f cv = (*coords)(coords->rows / 2, coords->cols / 2);
+        // Guard against the (0,0,0) off-surface sentinel — isfinite() accepts
+        // zero, which would bias the priority sort toward voxel origin
+        // instead of where the user is actually looking. Require a
+        // non-degenerate magnitude before trusting the center pixel.
+        if (isfinite_bitwise(cv[0])
+            && (cv[0] * cv[0] + cv[1] * cv[1] + cv[2] * cv[2]) > 0.25f) {
+            viewCenterL0 = cv;
+            haveCenter = true;
+        }
+    } else {
+        // Plane bbox from corners, compute once then scale per level.
+        cv::Vec3f p0 = *origin;
+        cv::Vec3f p1 = *origin + (*vx_step) * float(w-1) + (*vy_step) * float(h-1);
+        float minVx = std::min(p0[0], p1[0]), maxVx = std::max(p0[0], p1[0]);
+        float minVy = std::min(p0[1], p1[1]), maxVy = std::max(p0[1], p1[1]);
+        float minVz = std::min(p0[2], p1[2]), maxVz = std::max(p0[2], p1[2]);
+        for (int lvl = desiredLevel; lvl < numLevels; lvl++) {
+            float s = levelScale(lvl);
+            appendChunksForRegion(cache, lvl,
+                minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s,
+                prefetchKeys);
+        }
+        viewCenterL0 = *origin
+            + (*vx_step) * (float(w) * 0.5f)
+            + (*vy_step) * (float(h) * 0.5f);
+        haveCenter = true;
+    }
+    if (!prefetchKeys.empty()) {
+        if (haveCenter) {
+            std::array<std::array<int, 3>, vc::cache::kMaxLevels> shapes{};
+            for (int lvl = 0; lvl < numLevels && lvl < vc::cache::kMaxLevels; ++lvl)
+                shapes[lvl] = cache.chunkShape(lvl);
+            sortKeysByCenterDistance(prefetchKeys, shapes.data(),
+                                     std::min(numLevels, int(vc::cache::kMaxLevels)),
+                                     viewCenterL0);
+        }
+        cache.fetchInteractive(prefetchKeys, desiredLevel);
+    }
+
+    float scales[32] = {};
+    const int nSamplersTotal = numLevels - desiredLevel;
+    for (int i = 0; i < nSamplersTotal && i < 32; i++)
+        scales[i] = levelScale(desiredLevel + i);
+
+    #pragma omp parallel
+    {
+        const int nSamplers = numLevels - desiredLevel;
+        std::array<std::optional<BlockSampler<uint8_t>>, 32> samplers;
+        if (nSamplers > 0) samplers[0].emplace(cache, desiredLevel);
+        auto sampler = [&](int i) -> BlockSampler<uint8_t>& {
+            if (!samplers[i].has_value())
+                samplers[i].emplace(cache, desiredLevel + i);
+            return *samplers[i];
         };
 
-        if (numLayers == 1) {
-            for (int y = 0; y < h; y++) {
-                const auto* row = coords.ptr<cv::Vec3f>(y);
-                for (int x = 0; x < w; x++) {
-                    float vx = row[x][0], vy = row[x][1], vz = row[x][2];
-                    if constexpr (Mode == SampleMode::Tricubic) {
-                        if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < p.sz && vy < p.sy && vx < p.sx)) continue;
-                        int iz = static_cast<int>(std::floor(vz)), iy = static_cast<int>(std::floor(vy)), ix = static_cast<int>(std::floor(vx));
-                        for (int dz = -1; dz <= 2; dz++)
-                            for (int dy = -1; dy <= 2; dy++)
-                                for (int dx = -1; dx <= 2; dx++)
-                                    markVoxel(float(iz+dz), float(iy+dy), float(ix+dx));
-                    } else if constexpr (Mode == SampleMode::Trilinear) {
-                        if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < p.sz && vy < p.sy && vx < p.sx)) continue;
-                        int iz = static_cast<int>(vz), iy = static_cast<int>(vy), ix = static_cast<int>(vx);
-                        for (int dz = 0; dz <= 1; dz++)
-                            for (int dy = 0; dy <= 1; dy++)
-                                for (int dx = 0; dx <= 1; dx++)
-                                    markVoxel(float(iz+dz), float(iy+dy), float(ix+dx));
-                    } else {
-                        markVoxel(vz, vy, vx);
+        // Tile-major iteration: see note in sampleCompositeAdaptiveImpl.
+        constexpr int kTile = 32;
+        const int nTilesY = (h + kTile - 1) / kTile;
+        const int nTilesX = (w + kTile - 1) / kTile;
+        #pragma omp for schedule(dynamic, 1) collapse(2)
+        for (int tyi = 0; tyi < nTilesY; tyi++) {
+        for (int txi = 0; txi < nTilesX; txi++) {
+            const int ty = tyi * kTile;
+            const int tx = txi * kTile;
+            const int yEnd = std::min(ty + kTile, h);
+            const int xEnd = std::min(tx + kTile, w);
+        for (int y = ty; y < yEnd; y++) {
+            uint32_t* outRow = outBuf + size_t(y) * size_t(outStride);
+            // Row-base pointer hoisted out of the per-pixel loop. cv::Mat_()
+            // operator() recomputes the row offset on every call — cheap
+            // individually but it's on the per-pixel hot path.
+            const cv::Vec3f* crow = coords ? coords->ptr<cv::Vec3f>(y) : nullptr;
+            for (int x = tx; x < xEnd; x++) {
+                cv::Vec3f c;
+                if (crow) c = crow[x];
+                else      c = *origin + *vx_step * float(x) + *vy_step * float(y);
+
+                uint8_t pix = 0;
+                // Surfaces report NaN or (0,0,0) for undefined pixels —
+                // both produce a black output pixel.
+                const bool skip = !isfinite_bitwise(c[0])
+                    || (c[0] == 0.f && c[1] == 0.f && c[2] == 0.f);
+                if (!skip) {
+                    for (int i = 0; i < nSamplers; i++) {
+                        float scale = scales[i];
+                        float vx = c[0] * scale, vy = c[1] * scale, vz = c[2] * scale;
+                        if (trySampleNB<Mode>(sampler(i), vz, vy, vx, pix)) break;
                     }
                 }
-            }
-        } else {
-            std::vector<float> layerOffsets(numLayers);
-            for (int l = 0; l < numLayers; l++)
-                layerOffsets[l] = (zStart + l) * zStep;
-
-            for (int y = 0; y < h; y++) {
-                const auto* row = coords.ptr<cv::Vec3f>(y);
-                for (int x = 0; x < w; x++) {
-                    float bx = row[x][0], by = row[x][1], bz = row[x][2];
-                    if (!(bz >= 0 && by >= 0 && bx >= 0 && bz < p.sz && by < p.sy && bx < p.sx)) continue;
-                    cv::Vec3f n = getNormal(y, x);
-                    for (int l = 0; l < numLayers; l++) {
-                        float off = layerOffsets[l];
-                        markVoxel(bz + n[2]*off, by + n[1]*off, bx + n[0]*off);
-                    }
-                }
+                outRow[x] = lut[pix];
             }
         }
+        }  // tile x
+        }  // tile y
+    }
+}
 
-        // Collect needed chunk indices for parallel loading
-        std::vector<std::array<int,3>> neededChunks;
-        for (int cix = minIx; cix <= maxIx; cix++)
-            for (int ciy = minIy; ciy <= maxIy; ciy++)
-                for (int ciz = minIz; ciz <= maxIz; ciz++)
-                    if (needed[static_cast<size_t>(ciz) * p.chunksY * p.chunksX + static_cast<size_t>(ciy) * p.chunksX + cix])
-                        neededChunks.push_back({ciz, ciy, cix});
+// ----------------------------------------------------------------------------
+// Unified composite-capable adaptive sampler.
+// numLayers=1 + nullptr normals = non-composite (same cost as the plain
+// adaptive path, no per-layer overhead).
+// ----------------------------------------------------------------------------
 
-        // Load chunks — check if any are uncached before spawning threads.
-        bool anyMissing = false;
-        for (size_t ci = 0; ci < neededChunks.size(); ci++) {
-            if (!cache.get(vc::cache::ChunkKey{level, neededChunks[ci][0], neededChunks[ci][1], neededChunks[ci][2]})) {
-                anyMissing = true;
-                break;
-            }
+enum class AccumMode2 : std::uint8_t { Max, Min, Mean, LayerStorage, Volumetric };
+
+static AccumMode2 accumModeFor(const std::string& m) {
+    if (m == "max") return AccumMode2::Max;
+    if (m == "min") return AccumMode2::Min;
+    if (m == "volumetric") return AccumMode2::Volumetric;
+    if (m == "median" || m == "alpha" || m == "beerLambert" || m == "minabs") return AccumMode2::LayerStorage;
+    return AccumMode2::Mean;
+}
+
+template<SampleMode SMode, AccumMode2 AMode>
+void sampleCompositeAdaptiveImpl(
+    uint32_t* outBuf, int outStride,
+    BlockPipeline& cache, int desiredLevel, int numLevels,
+    const cv::Mat_<cv::Vec3f>* coords,
+    const cv::Vec3f* origin, const cv::Vec3f* vx_step, const cv::Vec3f* vy_step,
+    const cv::Mat_<cv::Vec3f>* normals,
+    const cv::Vec3f* planeNormal,
+    int numLayers, int zStart, float zStep,
+    int w, int h,
+    const std::string& compositeMethod,
+    const uint32_t lut[256],
+    const CompositeParams* lightParams,
+    uint8_t* levelOut,
+    int levelStride)
+{
+    auto levelScale = [](int lvl) { return (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f; };
+    const float zLo = float(zStart) * zStep;
+    const float zHi = float(zStart + numLayers - 1) * zStep;
+    const float zMin = std::min(zLo, zHi), zMax = std::max(zLo, zHi);
+
+    // Prefetch covered bbox across all fallback levels.
+    cv::Vec3f viewCenterL0(0, 0, 0);
+    bool haveCenter = false;
+    if (coords) {
+        // Surface-aware enumeration replaces bbox: a curved scroll surface
+        // spans a huge bbox while only crossing a few hundred chunks. Use
+        // the per-pixel coords to enqueue exactly the chunks the surface
+        // touches; bbox enumeration is left in place only to compute the
+        // view center fallback when the central pixel is NaN.
+        thread_local std::vector<vc::cache::ChunkKey> keys;
+        keys.clear();
+        for (int lvl = desiredLevel; lvl < numLevels; ++lvl) {
+            appendChunksForCoordsSurface(cache, lvl, *coords, keys);
         }
-
-        if (anyMissing) {
-            for (size_t ci = 0; ci < neededChunks.size(); ci++)
-                cache.getBlocking(vc::cache::ChunkKey{level, neededChunks[ci][0], neededChunks[ci][1], neededChunks[ci][2]});
+        const cv::Vec3f cvCenter = (*coords)(coords->rows / 2, coords->cols / 2);
+        // Guard against the (0,0,0) off-surface sentinel — see note in
+        // samplePixelsAdaptiveARGB32 above.
+        if (isfinite_bitwise(cvCenter[0])
+            && (cvCenter[0] * cvCenter[0] + cvCenter[1] * cvCenter[1]
+                + cvCenter[2] * cvCenter[2]) > 0.25f) {
+            viewCenterL0 = cvCenter;
+            haveCenter = true;
+        }
+        if (!keys.empty()) {
+            if (haveCenter) {
+                // Without a real center (viewCenterL0 would fall back to
+                // the (0,0,0) default), the distance sort would wrongly
+                // bias prefetch toward the volume origin.
+                std::array<std::array<int, 3>, vc::cache::kMaxLevels> shapes{};
+                for (int lvl = 0; lvl < numLevels && lvl < vc::cache::kMaxLevels; ++lvl)
+                    shapes[lvl] = cache.chunkShape(lvl);
+                sortKeysByCenterDistance(keys, shapes.data(),
+                                         std::min(numLevels, int(vc::cache::kMaxLevels)),
+                                         viewCenterL0);
+            }
+            cache.fetchInteractive(keys, desiredLevel);
+        }
+    } else {
+        cv::Vec3f p0 = *origin + (*planeNormal) * zMin;
+        cv::Vec3f p1 = *origin + (*vx_step)*float(w-1) + (*vy_step)*float(h-1) + (*planeNormal)*zMax;
+        float minVx=std::min(p0[0],p1[0]), maxVx=std::max(p0[0],p1[0]);
+        float minVy=std::min(p0[1],p1[1]), maxVy=std::max(p0[1],p1[1]);
+        float minVz=std::min(p0[2],p1[2]), maxVz=std::max(p0[2],p1[2]);
+        thread_local std::vector<vc::cache::ChunkKey> keys;
+        keys.clear();
+        for (int lvl=desiredLevel; lvl<numLevels; lvl++) {
+            float s = levelScale(lvl);
+            appendChunksForRegion(cache, lvl,
+                minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s, keys);
+        }
+        viewCenterL0 = *origin
+            + (*vx_step) * (float(w) * 0.5f)
+            + (*vy_step) * (float(h) * 0.5f);
+        haveCenter = true;
+        if (!keys.empty()) {
+            if (haveCenter) {
+                std::array<std::array<int, 3>, vc::cache::kMaxLevels> shapes{};
+                for (int lvl = 0; lvl < numLevels && lvl < vc::cache::kMaxLevels; ++lvl)
+                    shapes[lvl] = cache.chunkShape(lvl);
+                sortKeysByCenterDistance(keys, shapes.data(),
+                                         std::min(numLevels, int(vc::cache::kMaxLevels)),
+                                         viewCenterL0);
+            }
+            cache.fetchInteractive(keys, desiredLevel);
         }
     }
 
-    // Phase 2: Sample (all chunks already cached)
-    const bool isComposite = (numLayers > 1);
-    const bool isMin = params && (params->method == "min");
-    const bool isMax = params && (params->method == "max");
-    const bool isMean = params && (params->method == "mean");
-    const bool needsLayerStorage = params && methodRequiresLayerStorage(params->method);
-    const float firstLayerOffset = zStart * zStep;
+    // Precompute per-level scale factor once (1.0 / 2^lvl). Hoists the
+    // integer shift + int->float convert + fdiv out of the hot inner loop.
+    float scales[32] = {};
+    const int nSamplersTotal = numLevels - desiredLevel;
+    for (int i = 0; i < nSamplersTotal && i < 32; i++) {
+        int lvl = desiredLevel + i;
+        scales[i] = (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f;
+    }
 
+    // Parse compositeMethod once. Pixel loop previously did string compare
+    // per pixel for the LayerStorage path; convert to a small enum up front.
+    enum class LayerAgg : uint8_t { Median, MinAbs, Alpha, BeerLambert, Mean };
+    const LayerAgg layerAgg = (compositeMethod == "median") ? LayerAgg::Median
+                            : (compositeMethod == "minabs") ? LayerAgg::MinAbs
+                            : (compositeMethod == "alpha") ? LayerAgg::Alpha
+                            : (compositeMethod == "beerLambert") ? LayerAgg::BeerLambert
+                            : LayerAgg::Mean;
+
+    // UI caps composite layers at 16 front + 16 behind + center = 33. Bound
+    // once at the function level so the per-pixel loop and the bounds
+    // precheck both see the same compile-time-friendly trip count.
+    constexpr int kMaxLayers = 33;
+    const int nLHoisted = numLayers > kMaxLayers ? kMaxLayers : numLayers;
+
+    // Hoist lightParams fields into locals so the inner pixel loop doesn't
+    // reload them through the pointer each iteration.
+    const bool lightingEnabled = lightParams && lightParams->lightingEnabled;
+    const int  lightNormalSource = lightParams ? lightParams->lightNormalSource : 0;
+
+    // Volumetric-mode exp LUTs: exp(-extN * k) for k in [0..255]. extN is
+    // constant per call (from lightParams->blExtinction/255). Pre-computing
+    // 256 entries replaces 2*numLayers std::exp() calls per pixel with two
+    // cached table lookups.
+    alignas(64) float volExpLUT[256];
+    if constexpr (AMode == AccumMode2::Volumetric) {
+        const float extinction = lightParams ? lightParams->blExtinction : 1.5f;
+        const float extN = extinction / 255.0f;
+        for (int k = 0; k < 256; ++k)
+            volExpLUT[k] = std::exp(-extN * float(k));
+    }
+
+    #pragma omp parallel
     {
-        ChunkSampler<T> samplerNoPrefetch(p, cache, level);
-        ChunkSampler<T> samplerPrefetch(p, cache, level);
+        // Lazy per-level samplers: construct the level-0 sampler eagerly
+        // (always used) and leave higher levels unconstructed until the
+        // adaptive fallback actually needs them. Each sampler carries a
+        // ~4KB hot slot cache; we don't want to pay that cost for levels
+        // we never touch.
+        const int nSamplers = numLevels - desiredLevel;
+        std::array<std::optional<BlockSampler<uint8_t>>, 32> samplers;
+        if (nSamplers > 0) samplers[0].emplace(cache, desiredLevel);
+        auto sampler = [&](int i) -> BlockSampler<uint8_t>& {
+            if (!samplers[i].has_value())
+                samplers[i].emplace(cache, desiredLevel + i);
+            return *samplers[i];
+        };
+        std::vector<float> layerVals;
+        if constexpr (AMode == AccumMode2::LayerStorage) layerVals.resize(numLayers);
 
-        LayerStack stack;
-        if (needsLayerStorage) {
-            stack.values.resize(numLayers);
-        }
+        // Hoist desiredLevel sampler's shape out of the per-pixel loop.
+        // In hot paths we dereference sh0 once per pixel for bounds; putting
+        // it in a local makes sure the compiler hoists past the per-layer
+        // loop.
+        VolumeShape sh0{};
+        if (nSamplers > 0) sh0 = sampler(0).shape;
+        const float sh0xF = float(sh0.sx), sh0yF = float(sh0.sy), sh0zF = float(sh0.sz);
 
-        for (int y = 0; y < h; y++) {
-            const auto* coordRow = coords.template ptr<cv::Vec3f>(y);
-            auto* outRow = out.template ptr<T>(y);
-            for (int x = 0; x < w; x++) {
-                float base_vx = coordRow[x][0], base_vy = coordRow[x][1], base_vz = coordRow[x][2];
+        // Ratios for scaling desiredLevel-sampler coords into coarser-level
+        // coords: scalesRatio[i] = scales[i] / scales[0] = 1 / 2^i. Used in
+        // the fallback loop so the hot path never computes scales[i]/endScale.
+        float scalesRatio[32] = {};
+        for (int i = 0; i < nSamplers && i < 32; i++)
+            scalesRatio[i] = (i > 0) ? 1.0f / float(1 << i) : 1.0f;
 
-                if (numLayers == 1) {
-                    // Single-sample path
-                    if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0)) continue;
+        // When there's no per-pixel normals map (common case: plane viewer),
+        // nrm is constant across every pixel and the pre-scaled step vector
+        // (sdx,sdy,sdz) can be computed once here instead of per pixel.
+        const cv::Vec3f constNrm =
+            planeNormal ? *planeNormal : cv::Vec3f(0, 0, 0);
+        const float endScale0 = scales[0];
+        const float sdxConst = constNrm[0] * zStep * endScale0;
+        const float sdyConst = constNrm[1] * zStep * endScale0;
+        const float sdzConst = constNrm[2] * zStep * endScale0;
+        const float zOffStart = float(zStart) * zStep;
+        const float wxNrmStartConst = constNrm[0] * zOffStart;
+        const float wyNrmStartConst = constNrm[1] * zOffStart;
+        const float wzNrmStartConst = constNrm[2] * zOffStart;
 
-                    if constexpr (Mode == SampleMode::Trilinear) {
-                        if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
-                        float v = samplerNoPrefetch.sampleTrilinearFast(base_vz, base_vy, base_vx);
-                        if constexpr (std::is_same_v<T, uint16_t>) {
-                            if (v < 0.f) v = 0.f;
-                            if (v > 65535.f) v = 65535.f;
-                            outRow[x] = static_cast<uint16_t>(v + 0.5f);
-                        } else {
-                            outRow[x] = static_cast<T>(v);
+        // Tile the output into 32x32 blocks. Most pixels in a tile map
+        // into the same 1-4 level-0 blocks, so the sampler's slot cache
+        // stays hot — vs row-major which touches ~120 blocks across a
+        // row before cycling back to the same y-row.
+        constexpr int kTile = 32;
+        const int nTilesY = (h + kTile - 1) / kTile;
+        const int nTilesX = (w + kTile - 1) / kTile;
+        #pragma omp for schedule(dynamic, 1) collapse(2)
+        for (int tyi = 0; tyi < nTilesY; tyi++) {
+        for (int txi = 0; txi < nTilesX; txi++) {
+            const int ty = tyi * kTile;
+            const int tx = txi * kTile;
+            const int yEnd = std::min(ty + kTile, h);
+            const int xEnd = std::min(tx + kTile, w);
+        for (int y=ty; y<yEnd; y++) {
+            uint32_t* outRow = outBuf + size_t(y) * size_t(outStride);
+            uint8_t* lvlRow = levelOut ? (levelOut + size_t(y) * size_t(levelStride)) : nullptr;
+            const cv::Vec3f* crow = coords ? coords->ptr<cv::Vec3f>(y) : nullptr;
+            const cv::Vec3f* nrow = normals ? normals->ptr<cv::Vec3f>(y) : nullptr;
+            for (int x=tx; x<xEnd; x++) {
+                cv::Vec3f base = crow ? crow[x] : (*origin + *vx_step*float(x) + *vy_step*float(y));
+                // A surface can report NaN or (0,0,0) for "no data here" —
+                // both map to a black output pixel.
+                if (!isfinite_bitwise(base[0])
+                    || (base[0] == 0.f && base[1] == 0.f && base[2] == 0.f)) {
+                    outRow[x] = lut[0];
+                    if (lvlRow) lvlRow[x] = 0;
+                    continue;
+                }
+                cv::Vec3f nrm = nrow ? nrow[x] : (planeNormal ? *planeNormal : cv::Vec3f(0,0,0));
+                if (nrow && !isfinite_bitwise(nrm[0])) {
+                    outRow[x] = lut[0];
+                    if (lvlRow) lvlRow[x] = 0;
+                    continue;
+                }
+                uint8_t pxLevel = 0;
+
+                if constexpr (AMode == AccumMode2::Volumetric) {
+                    // Volumetric Beer-Lambert with secondary shadow rays.
+                    // Walks the view ray front-to-back through the slab;
+                    // at each view-ray sample, integrates density along a
+                    // shadow ray toward the light to attenuate the voxel's
+                    // emission. Materials with high density in front of the
+                    // light end up darker (self-shadowing), which reveals
+                    // micro-structure — fibers, ink, crackle — as relief.
+                    // Extinction is baked into volExpLUT once above; keep
+                    // the rest of the volumetric constants per-pixel-local.
+                    const CompositeParams* p = lightParams;
+                    const float emissionScale = p ? p->blEmission : 1.5f;
+                    const float ambient = p ? p->blAmbient : 0.1f;
+                    const float diffuse = p ? p->lightDiffuse : 1.0f;
+                    const int shadowSteps = p ? std::max(1, p->shadowSteps) : 8;
+                    const float lDx = p ? p->lightDirX : 0.5f;
+                    const float lDy = p ? p->lightDirY : 0.5f;
+                    const float lDz = p ? p->lightDirZ : 0.707f;
+
+                    const float emiN = emissionScale / 255.0f;
+
+                    const float vdx = nrm[0] * zStep;
+                    const float vdy = nrm[1] * zStep;
+                    const float vdz = nrm[2] * zStep;
+                    float wxV = base[0] + nrm[0] * float(zStart) * zStep;
+                    float wyV = base[1] + nrm[1] * float(zStart) * zStep;
+                    float wzV = base[2] + nrm[2] * float(zStart) * zStep;
+
+                    // All sampling happens at the desired (finest) level.
+                    // Sampler coords are world * scl0; one sampler-voxel
+                    // step along the light direction is just adding lDir
+                    // since it's a unit vector.
+                    const float scl0 = scales[0];
+                    float transmittance = 1.0f;
+                    float accumC = 0.0f;
+                    for (int li = 0; li < numLayers; li++) {
+                        const float svx = wxV * scl0;
+                        const float svy = wyV * scl0;
+                        const float svz = wzV * scl0;
+                        uint8_t v = 0;
+                        bool got = trySampleNearestUnchecked(*samplers[0],
+                            svz, svy, svx, v);
+                        if (!got) {
+                            for (int i = 0; i < nSamplers; i++) {
+                                float scl = scales[i];
+                                if (trySampleNB<SMode>(sampler(i),
+                                    wzV * scl, wyV * scl, wxV * scl, v)) {
+                                    if (uint8_t(i) > pxLevel) pxLevel = uint8_t(i);
+                                    break;
+                                }
+                            }
                         }
-                    } else if constexpr (Mode == SampleMode::Tricubic) {
-                        if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
-                        float v = samplerNoPrefetch.sampleTricubic(base_vz, base_vy, base_vx);
-                        if constexpr (std::is_same_v<T, uint16_t>) {
-                            if (v < 0.f) v = 0.f;
-                            if (v > 65535.f) v = 65535.f;
-                            outRow[x] = static_cast<uint16_t>(v + 0.5f);
-                        } else {
-                            outRow[x] = static_cast<T>(v);
+                        if (v > 0) {
+                            // Shadow ray: desired-level samples only. Missing
+                            // chunks read as zero density (no shadow) — good
+                            // enough while coarse levels stream in.
+                            int shadowAccum = 0;
+                            float shx = svx, shy = svy, shz = svz;
+                            for (int k = 1; k <= shadowSteps; k++) {
+                                shx += lDx; shy += lDy; shz += lDz;
+                                uint8_t sv = 0;
+                                trySampleNB<SMode>(*samplers[0],
+                                    shz, shy, shx, sv);
+                                shadowAccum += int(sv);
+                            }
+                            // exp(-extN * x) via 256-entry LUT. shadowSteps
+                            // is capped so shadowAccum can exceed 255; clamp
+                            // saturates to the darkest entry (matches the
+                            // physical "fully opaque" limit).
+                            const int shIdx = shadowAccum < 255 ? shadowAccum : 255;
+                            const float L = diffuse * volExpLUT[shIdx];
+                            const float emission = float(v) * emiN * (L + ambient);
+                            const float layerT = volExpLUT[v];
+                            accumC += emission * transmittance * (1.0f - layerT);
+                            transmittance *= layerT;
+                            if (transmittance < 0.001f) break;
                         }
-                    } else {
-                        if (!(base_vz < p.sz && base_vy < p.sy && base_vx < p.sx)) continue;
-                        if ((static_cast<int>(base_vz + 0.5f) | static_cast<int>(base_vy + 0.5f) | static_cast<int>(base_vx + 0.5f)) < 0) continue;
-                        outRow[x] = samplerNoPrefetch.sampleNearest(base_vz, base_vy, base_vx);
+                        wxV += vdx; wyV += vdy; wzV += vdz;
                     }
-                } else {
-                    // Composite path
-                    if (!(base_vz >= 0 && base_vy >= 0 && base_vx >= 0)) continue;
+                    accumC += ambient * transmittance;
+                    float vF = std::min(255.0f, accumC * 255.0f);
+                    if (vF < 0.f) vF = 0.f;
+                    outRow[x] = lut[uint8_t(vF)];
+                    if (lvlRow) lvlRow[x] = pxLevel;
+                    continue;
+                }
 
-                    cv::Vec3f n = getNormal(y, x);
-                    float nz = n[2], ny = n[1], nx = n[0];
+                float accum=0.f, mx=0.f, mn=255.f;
+                int count=0;
+                // Incremental per-layer offset along the normal direction:
+                // one vector add per layer instead of 3 FMAs.
+                const float endScale = endScale0;
+                // Pre-scale step + start into desiredLevel-sampler space so
+                // the per-layer hot loop becomes a pure add instead of
+                // multiplying three coords by endScale every iteration.
+                // When the caller supplied no per-pixel normals, sdx/sdy/sdz
+                // are pixel-independent — use the hoisted constants.
+                const float sdx = nrow ? (nrm[0] * zStep * endScale) : sdxConst;
+                const float sdy = nrow ? (nrm[1] * zStep * endScale) : sdyConst;
+                const float sdz = nrow ? (nrm[2] * zStep * endScale) : sdzConst;
+                const float wxNrmStart = nrow ? (nrm[0] * zOffStart) : wxNrmStartConst;
+                const float wyNrmStart = nrow ? (nrm[1] * zOffStart) : wyNrmStartConst;
+                const float wzNrmStart = nrow ? (nrm[2] * zOffStart) : wzNrmStartConst;
+                float swx = (base[0] + wxNrmStart) * endScale;
+                float swy = (base[1] + wyNrmStart) * endScale;
+                float swz = (base[2] + wzNrmStart) * endScale;
 
-                    float acc = isMin ? 255.0f : 0.0f;
-                    int validCount = 0;
-
-                    if (needsLayerStorage) {
-                        stack.validCount = 0;
+                // Pixel-level bounds precheck at level 0: if the entire
+                // z-line fits in bounds, skip all per-sample float compares.
+                // Reserves 1-voxel margin for nearest rounding. Only the
+                // Nearest path uses the resulting flag, so compile the
+                // precheck out of the trilinear instantiation entirely.
+                bool fullyInBounds = false;
+                if constexpr (SMode == SampleMode::Nearest) {
+                    const float tailSx = swx + sdx * float(numLayers - 1);
+                    const float tailSy = swy + sdy * float(numLayers - 1);
+                    const float tailSz = swz + sdz * float(numLayers - 1);
+                    const float minSx = std::min(swx, tailSx);
+                    const float maxSx = std::max(swx, tailSx);
+                    const float minSy = std::min(swy, tailSy);
+                    const float maxSy = std::max(swy, tailSy);
+                    const float minSz = std::min(swz, tailSz);
+                    const float maxSz = std::max(swz, tailSz);
+                    fullyInBounds = minSx >= 0.5f && maxSx < sh0xF - 0.5f
+                                 && minSy >= 0.5f && maxSy < sh0yF - 0.5f
+                                 && minSz >= 0.5f && maxSz < sh0zF - 0.5f;
+                }
+                const int nL = nLHoisted;
+                #pragma clang loop unroll(enable) vectorize(enable)
+                for (int li=0; li<nL; li++) {
+                    uint8_t v = 0;
+                    bool got = false;
+                    if (fullyInBounds) {
+                        // Hot path: skip per-sample bounds check. Coords are
+                        // already in desiredLevel-sampler space.
+                        got = trySampleNearestUnchecked(*samplers[0],
+                            swz, swy, swx, v);
                     }
-
-                    float dz = nz * zStep;
-                    float dy = ny * zStep;
-                    float dx = nx * zStep;
-
-                    float vz = base_vz + nz * firstLayerOffset;
-                    float vy = base_vy + ny * firstLayerOffset;
-                    float vx = base_vx + nx * firstLayerOffset;
-
-                    for (int layer = 0; layer < numLayers; layer++) {
-                        bool validSample = false;
-                        float value = 0;
-
-                        if (samplerPrefetch.inBounds(vz, vy, vx)) {
-                            uint8_t raw = samplerPrefetch.sampleNearest(vz, vy, vx);
-                            value = static_cast<float>(raw < params->isoCutoff ? 0 : raw);
-                            validSample = true;
-                        }
-
-                        vz += dz; vy += dy; vx += dx;
-
-                        if (validSample) {
-                            if (needsLayerStorage) {
-                                stack.values[stack.validCount++] = value;
-                            } else if (isMax) {
-                                acc = value > acc ? value : acc;
-                                validCount++;
-                            } else if (isMin) {
-                                acc = value < acc ? value : acc;
-                                validCount++;
-                            } else {
-                                acc += value;
-                                validCount++;
+                    if (!got) {
+                        // Fallback: either we're near a boundary or the
+                        // desired-level block isn't resident yet. Walk the
+                        // fallback chain from finest to coarsest — adaptive
+                        // sampling fills in from whichever level is ready.
+                        // Coarser levels need coords at their own scale;
+                        // the ratio scales[i]/endScale applied to the
+                        // already-scaled swx/swy/swz gets us there without
+                        // re-deriving from base.
+                        for (int i=0; i<nSamplers; i++) {
+                            const float r = scalesRatio[i];
+                            if (trySampleNB<SMode>(sampler(i),
+                                swz * r, swy * r, swx * r, v)) {
+                                if (uint8_t(i) > pxLevel) pxLevel = uint8_t(i);
+                                break;
                             }
                         }
                     }
-
-                    float result = 0.0f;
-                    if (needsLayerStorage) {
-                        result = compositeLayerStack(stack, *params);
-                    } else if (isMax || isMin) {
-                        result = acc;
-                    } else if (isMean && validCount > 0) {
-                        result = acc / static_cast<float>(validCount);
-                    }
-
-                    if (params->lightingEnabled) {
-                        float lightFactor = computeLightingFactor(n, *params);
-                        result *= lightFactor;
-                    }
-
-                    outRow[x] = static_cast<T>(std::max(0.0f, std::min(255.0f, result)));
+                    if constexpr (AMode == AccumMode2::Max) { mx = std::max(mx, float(v)); }
+                    else if constexpr (AMode == AccumMode2::Min) { mn = std::min(mn, float(v)); }
+                    else if constexpr (AMode == AccumMode2::Mean) { accum += float(v); count++; }
+                    else { layerVals[li] = float(v); }
+                    swx += sdx; swy += sdy; swz += sdz;
                 }
+
+                float val = 0.f;
+                if constexpr (AMode == AccumMode2::Max) val = mx;
+                else if constexpr (AMode == AccumMode2::Min) val = mn;
+                else if constexpr (AMode == AccumMode2::Mean) val = count ? accum * (1.0f/float(count)) : 0.f;
+                else {
+                    if (layerAgg == LayerAgg::Median) {
+                        // For the small N we see in practice (<=~33 layers),
+                        // insertion-sort-up-to-the-median beats nth_element:
+                        // its introselect setup costs more than sorting a
+                        // few dozen floats. partial_sort gives us exactly
+                        // that for small N without branching on size.
+                        std::partial_sort(layerVals.begin(),
+                                          layerVals.begin() + nL/2 + 1,
+                                          layerVals.begin() + nL);
+                        val = layerVals[nL/2];
+                    } else if (layerAgg == LayerAgg::MinAbs) {
+                        // Hoist abs(best-127.5) out of the loop and use std::fabs
+                        // (hardware fabs opcode vs. std::abs's integer-path).
+                        float best = layerVals[0];
+                        float bestAbs = std::fabs(best - 127.5f);
+                        for (int i=1; i<nL; i++) {
+                            const float d = std::fabs(layerVals[i] - 127.5f);
+                            if (d < bestAbs) { best = layerVals[i]; bestAbs = d; }
+                        }
+                        val = best;
+                    } else if (layerAgg == LayerAgg::Alpha) {
+                        const CompositeParams* p = lightParams;
+                        const float alphaMin = p ? p->alphaMin * 255.0f : 0.0f;
+                        const float alphaMax = p ? p->alphaMax * 255.0f : 255.0f;
+                        const float alphaOpacity = p ? p->alphaOpacity : 1.0f;
+                        const float alphaCutoff = p ? p->alphaCutoff : 1.0f;
+                        const float range = alphaMax - alphaMin;
+                        if (range != 0.0f) {
+                            const float invRange = 1.0f / range;
+                            const float offset = alphaMin / range;
+                            float alpha = 0.0f;
+                            float valueAcc = 0.0f;
+                            for (int i=0; i<nL; i++) {
+                                float normalized = layerVals[i] * invRange - offset;
+                                if (normalized <= 0.0f) continue;
+                                if (normalized > 1.0f) normalized = 1.0f;
+                                if (alpha >= alphaCutoff) break;
+
+                                float opacity = normalized * alphaOpacity;
+                                if (opacity > 1.0f) opacity = 1.0f;
+                                const float weight = (1.0f - alpha) * opacity;
+                                valueAcc += weight * normalized;
+                                alpha += weight;
+                            }
+                            val = valueAcc * 255.0f;
+                        }
+                    } else if (layerAgg == LayerAgg::BeerLambert) {
+                        const CompositeParams* p = lightParams;
+                        const float extinctionScaled = (p ? p->blExtinction : 1.5f) / 255.0f;
+                        const float emissionScaled = (p ? p->blEmission : 1.5f) / 255.0f;
+                        const float ambient = p ? p->blAmbient : 0.1f;
+                        float transmittance = 1.0f;
+                        float accumulatedColor = 0.0f;
+
+                        for (int i=0; i<nL; i++) {
+                            const float value = layerVals[i];
+                            if (value < 0.255f) continue;
+
+                            const float emission = value * emissionScaled;
+                            const float layerTransmittance = std::exp(-extinctionScaled * value);
+                            accumulatedColor += emission * transmittance * (1.0f - layerTransmittance);
+                            transmittance *= layerTransmittance;
+                            if (transmittance < 0.001f) break;
+                        }
+
+                        accumulatedColor += ambient * transmittance;
+                        val = std::min(255.0f, accumulatedColor * 255.0f);
+                    } else {
+                        float s=0.f; for (int i=0; i<nL; i++) s += layerVals[i];
+                        // Replace divide with multiply by pre-computed reciprocal.
+                        const float invN = nL>0 ? 1.0f/float(nL) : 0.f;
+                        val = s * invN;
+                    }
+                }
+                if (lightingEnabled) {
+                    cv::Vec3f lnrm;
+                    if (lightNormalSource == 1) {
+                        // Volume-gradient normal: six cheap samples around
+                        // base in the desired-level sampler's space. Reveals
+                        // local density variation (fibers, ink, crackle)
+                        // that a smoothed mesh normal can't.
+                        const float bx = base[0] * endScale;
+                        const float by = base[1] * endScale;
+                        const float bz = base[2] * endScale;
+                        uint8_t gx0=0, gx1=0, gy0=0, gy1=0, gz0=0, gz1=0;
+                        const bool gok =
+                            trySampleNB<SMode>(*samplers[0], bz, by, bx - 1.f, gx0)
+                         && trySampleNB<SMode>(*samplers[0], bz, by, bx + 1.f, gx1)
+                         && trySampleNB<SMode>(*samplers[0], bz, by - 1.f, bx, gy0)
+                         && trySampleNB<SMode>(*samplers[0], bz, by + 1.f, bx, gy1)
+                         && trySampleNB<SMode>(*samplers[0], bz - 1.f, by, bx, gz0)
+                         && trySampleNB<SMode>(*samplers[0], bz + 1.f, by, bx, gz1);
+                        if (gok) {
+                            // Gradient from dense → sparse: serves as an
+                            // outward-facing surface normal for Lambertian
+                            // shading.
+                            lnrm = cv::Vec3f(
+                                float(gx0) - float(gx1),
+                                float(gy0) - float(gy1),
+                                float(gz0) - float(gz1));
+                        } else {
+                            lnrm = nrm;
+                        }
+                    } else {
+                        lnrm = nrm;
+                    }
+                    val *= computeLightingFactor(lnrm, *lightParams);
+                }
+                if (val < 0.f) val = 0.f; if (val > 255.f) val = 255.f;
+                outRow[x] = lut[uint8_t(val)];
+                if (lvlRow) lvlRow[x] = pxLevel;
             }
         }
+        }  // tile x
+        }  // tile y
     }
 }
 
-
-// ============================================================================
-// readArea3DImpl
-// ============================================================================
-
-template<typename T>
-static void readArea3DImpl(xt::xtensor<T, 3, xt::layout_type::column_major>& out, const cv::Vec3i& offset, vc::cache::TieredChunkCache* cache, int level) {
-
-    CacheParams p(cache, level);
-
-    cv::Vec3i size = {(int)out.shape()[0], (int)out.shape()[1], (int)out.shape()[2]};
-    cv::Vec3i to = offset + size;
-
-    // Step 1: List all required chunks
-    std::vector<cv::Vec3i> chunks_to_process;
-    cv::Vec3i start_chunk = {offset[0] / p.cz, offset[1] / p.cy, offset[2] / p.cx};
-    cv::Vec3i end_chunk = {(to[0] - 1) / p.cz, (to[1] - 1) / p.cy, (to[2] - 1) / p.cx};
-
-    for (int cz = start_chunk[0]; cz <= end_chunk[0]; ++cz) {
-        for (int cy = start_chunk[1]; cy <= end_chunk[1]; ++cy) {
-            for (int cx = start_chunk[2]; cx <= end_chunk[2]; ++cx) {
-                chunks_to_process.push_back({cz, cy, cx});
-            }
-        }
-    }
-
-    // Step 2 & 3: Load and copy chunks (no inner OMP — called from parallel tile loop)
-    for (const auto& idx : chunks_to_process) {
-        int cz = idx[0], cy = idx[1], cx = idx[2];
-        auto chunkPtr = cache->getBlocking(vc::cache::ChunkKey{level, cz, cy, cx});
-
-        cv::Vec3i chunk_offset = {p.cz * cz, p.cy * cy, p.cx * cx};
-
-        cv::Vec3i copy_from_start = {
-            std::max(offset[0], chunk_offset[0]),
-            std::max(offset[1], chunk_offset[1]),
-            std::max(offset[2], chunk_offset[2])
-        };
-
-        cv::Vec3i copy_from_end = {
-            std::min(to[0], chunk_offset[0] + p.cz),
-            std::min(to[1], chunk_offset[1] + p.cy),
-            std::min(to[2], chunk_offset[2] + p.cx)
-        };
-
-        // Fallback to coarser level if chunk is missing
-        vc::cache::ChunkDataPtr fallbackPtr;
-        int fallbackShift = 0;
-        int fbOriginZ = 0, fbOriginY = 0, fbOriginX = 0;
-        size_t fbS0 = 0, fbS1 = 0;
-
-        if (!chunkPtr) {
-            vc::cache::ChunkKey key{level, cz, cy, cx};
-            auto [coarse, actualLvl] = cache->getBestAvailable(key);
-            if (coarse) {
-                fallbackPtr = coarse;
-                fallbackShift = actualLvl - level;
-                auto cs = cache->chunkShape(actualLvl);
-                fbS0 = static_cast<size_t>(cs[1]) * cs[2];
-                fbS1 = static_cast<size_t>(cs[2]);
-                auto coarseKey = key.coarsen(actualLvl);
-                fbOriginZ = coarseKey.iz * cs[0];
-                fbOriginY = coarseKey.iy * cs[1];
-                fbOriginX = coarseKey.ix * cs[2];
-            }
-        }
-
-        if (chunkPtr) {
-            const T* chunkData = chunkPtr->data<T>();
-            int strideZ = p.cy * p.cx;
-            int strideY = p.cx;
-            for (int z = copy_from_start[0]; z < copy_from_end[0]; ++z) {
-                for (int y = copy_from_start[1]; y < copy_from_end[1]; ++y) {
-                    for (int x = copy_from_start[2]; x < copy_from_end[2]; ++x) {
-                        int lz = z - chunk_offset[0];
-                        int ly = y - chunk_offset[1];
-                        int lx = x - chunk_offset[2];
-                        out(z - offset[0], y - offset[1], x - offset[2]) = chunkData[lz * strideZ + ly * strideY + lx];
-                    }
-                }
-            }
-        } else if (fallbackPtr) {
-            const T* fbData = fallbackPtr->data<T>();
-            auto cs = cache->chunkShape(level + fallbackShift);
-            for (int z = copy_from_start[0]; z < copy_from_end[0]; ++z) {
-                for (int y = copy_from_start[1]; y < copy_from_end[1]; ++y) {
-                    for (int x = copy_from_start[2]; x < copy_from_end[2]; ++x) {
-                        int fz = std::clamp((z >> fallbackShift) - fbOriginZ, 0, cs[0] - 1);
-                        int fy = std::clamp((y >> fallbackShift) - fbOriginY, 0, cs[1] - 1);
-                        int fx = std::clamp((x >> fallbackShift) - fbOriginX, 0, cs[2] - 1);
-                        out(z - offset[0], y - offset[1], x - offset[2]) = fbData[fz * fbS0 + fy * fbS1 + fx];
-                    }
-                }
-            }
-        } else {
-            for (int z = copy_from_start[0]; z < copy_from_end[0]; ++z) {
-                for (int y = copy_from_start[1]; y < copy_from_end[1]; ++y) {
-                    for (int x = copy_from_start[2]; x < copy_from_end[2]; ++x) {
-                        out(z - offset[0], y - offset[1], x - offset[2]) = 0;
-                    }
-                }
-            }
-        }
+template<SampleMode SMode>
+void dispatchCompositeAdaptive(
+    uint32_t* outBuf, int outStride,
+    BlockPipeline& cache, int desiredLevel, int numLevels,
+    const cv::Mat_<cv::Vec3f>* coords,
+    const cv::Vec3f* origin, const cv::Vec3f* vx_step, const cv::Vec3f* vy_step,
+    const cv::Mat_<cv::Vec3f>* normals,
+    const cv::Vec3f* planeNormal,
+    int numLayers, int zStart, float zStep,
+    int w, int h,
+    const std::string& method,
+    const uint32_t lut[256],
+    const CompositeParams* lightParams,
+    uint8_t* levelOut,
+    int levelStride)
+{
+    switch (accumModeFor(method)) {
+        case AccumMode2::Max:
+            sampleCompositeAdaptiveImpl<SMode, AccumMode2::Max>(
+                outBuf, outStride, cache, desiredLevel, numLevels,
+                coords, origin, vx_step, vy_step, normals, planeNormal,
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride); break;
+        case AccumMode2::Min:
+            sampleCompositeAdaptiveImpl<SMode, AccumMode2::Min>(
+                outBuf, outStride, cache, desiredLevel, numLevels,
+                coords, origin, vx_step, vy_step, normals, planeNormal,
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride); break;
+        case AccumMode2::LayerStorage:
+            sampleCompositeAdaptiveImpl<SMode, AccumMode2::LayerStorage>(
+                outBuf, outStride, cache, desiredLevel, numLevels,
+                coords, origin, vx_step, vy_step, normals, planeNormal,
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride); break;
+        case AccumMode2::Volumetric:
+            sampleCompositeAdaptiveImpl<SMode, AccumMode2::Volumetric>(
+                outBuf, outStride, cache, desiredLevel, numLevels,
+                coords, origin, vx_step, vy_step, normals, planeNormal,
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride); break;
+        default:
+            sampleCompositeAdaptiveImpl<SMode, AccumMode2::Mean>(
+                outBuf, outStride, cache, desiredLevel, numLevels,
+                coords, origin, vx_step, vy_step, normals, planeNormal,
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride); break;
     }
 }
 
-void readArea3D(xt::xtensor<uint8_t, 3, xt::layout_type::column_major>& out, const cv::Vec3i& offset, vc::cache::TieredChunkCache* cache, int level) {
-    readArea3DImpl(out, offset, cache, level);
+} // namespace
+
+void sampleAdaptiveARGB32(
+    uint32_t* outBuf, int outStride,
+    vc::cache::BlockPipeline* cache,
+    int desiredLevel, int numLevels,
+    const cv::Mat_<cv::Vec3f>* coords,
+    const cv::Vec3f* origin, const cv::Vec3f* vx_step, const cv::Vec3f* vy_step,
+    const cv::Mat_<cv::Vec3f>* normals,
+    const cv::Vec3f* planeNormal,
+    int numLayers, int zStart, float zStep,
+    int width, int height,
+    const std::string& compositeMethod,
+    const uint32_t lut[256],
+    vc::Sampling method,
+    const CompositeParams* lightParams,
+    uint8_t* levelOut,
+    int levelStride)
+{
+    if (numLayers <= 0) numLayers = 1;
+    // Composite rendering forces Nearest: averaging N layers already
+    // low-passes aliasing so per-voxel trilinear precision is wasted.
+    // Pin the template instantiation to SampleMode::Nearest so the entire
+    // inner loop compiles without any interp branch.
+    const bool composite = numLayers > 1;
+    if (composite || method == vc::Sampling::Nearest) {
+        dispatchCompositeAdaptive<SampleMode::Nearest>(
+            outBuf, outStride, *cache, desiredLevel, numLevels,
+            coords, origin, vx_step, vy_step, normals, planeNormal,
+            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams, levelOut, levelStride);
+    } else {
+        dispatchCompositeAdaptive<SampleMode::Trilinear>(
+            outBuf, outStride, *cache, desiredLevel, numLevels,
+            coords, origin, vx_step, vy_step, normals, planeNormal,
+            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams, levelOut, levelStride);
+    }
 }
 
-void readArea3D(xt::xtensor<uint16_t, 3, xt::layout_type::column_major>& out, const cv::Vec3i& offset, vc::cache::TieredChunkCache* cache, int level) {
-    readArea3DImpl(out, offset, cache, level);
-}
-
-
-// ============================================================================
-// Public API — thin wrappers around readVolumeImpl
-// ============================================================================
-
-template<typename T>
-static void readInterpolated3DImpl(cv::Mat_<T>& out, vc::cache::TieredChunkCache* cache, int level,
-                                   const cv::Mat_<cv::Vec3f>& coords,
-                                   vc::Sampling method) {
-    CacheParams p(cache, level);
-    auto noNormal = [](int, int) -> cv::Vec3f { return {}; };
-
+int samplePlaneAdaptiveARGB32(uint32_t* outBuf, int outStride,
+                              BlockPipeline* cache,
+                              int desiredLevel, int numLevels,
+                              const cv::Vec3f& origin,
+                              const cv::Vec3f& vx_step,
+                              const cv::Vec3f& vy_step,
+                              int w, int h,
+                              const uint32_t lut[256],
+                              vc::Sampling method)
+{
     switch (method) {
         case vc::Sampling::Nearest:
-            readVolumeImpl<T, SampleMode::Nearest>(out, *cache, level, p, coords,
-                noNormal, 1, 0.f, 0, nullptr);
-            break;
-        case vc::Sampling::Tricubic:
-            readVolumeImpl<T, SampleMode::Tricubic>(out, *cache, level, p, coords,
-                noNormal, 1, 0.f, 0, nullptr);
+            samplePixelsAdaptiveARGB32<SampleMode::Nearest>(
+                outBuf, outStride, *cache, desiredLevel, numLevels,
+                nullptr, &origin, &vx_step, &vy_step, w, h, lut);
             break;
         default:
-            readVolumeImpl<T, SampleMode::Trilinear>(out, *cache, level, p, coords,
-                noNormal, 1, 0.f, 0, nullptr);
+            samplePixelsAdaptiveARGB32<SampleMode::Trilinear>(
+                outBuf, outStride, *cache, desiredLevel, numLevels,
+                nullptr, &origin, &vx_step, &vy_step, w, h, lut);
+            break;
+    }
+    return desiredLevel;
+}
+
+void sampleCoordsAdaptiveARGB32(uint32_t* outBuf, int outStride,
+                                BlockPipeline* cache,
+                                int desiredLevel, int numLevels,
+                                const cv::Mat_<cv::Vec3f>& coords,
+                                const uint32_t lut[256],
+                                vc::Sampling method)
+{
+    int w = coords.cols, h = coords.rows;
+    switch (method) {
+        case vc::Sampling::Nearest:
+            samplePixelsAdaptiveARGB32<SampleMode::Nearest>(
+                outBuf, outStride, *cache, desiredLevel, numLevels,
+                &coords, nullptr, nullptr, nullptr, w, h, lut);
+            break;
+        default:
+            samplePixelsAdaptiveARGB32<SampleMode::Trilinear>(
+                outBuf, outStride, *cache, desiredLevel, numLevels,
+                &coords, nullptr, nullptr, nullptr, w, h, lut);
             break;
     }
 }
 
-// Legacy bool overloads (backward compatible)
-void readInterpolated3D(cv::Mat_<uint8_t>& out, vc::cache::TieredChunkCache* cache, int level,
-                        const cv::Mat_<cv::Vec3f>& coords, bool nearest_neighbor) {
-    readInterpolated3DImpl(out, cache, level, coords,
-                           nearest_neighbor ? vc::Sampling::Nearest : vc::Sampling::Trilinear);
+// ----------------------------------------------------------------------------
+// Composite rendering
+// ----------------------------------------------------------------------------
+
+namespace {
+
+enum class AccumMode : std::uint8_t { Max, Min, Mean, LayerStorage };
+
+static bool needsLayerStorage(const std::string& m) {
+    return m == "median" || m == "alpha" || m == "minabs";
 }
 
-void readInterpolated3D(cv::Mat_<uint16_t>& out, vc::cache::TieredChunkCache* cache, int level,
-                        const cv::Mat_<cv::Vec3f>& coords, bool nearest_neighbor) {
-    readInterpolated3DImpl(out, cache, level, coords,
-                           nearest_neighbor ? vc::Sampling::Nearest : vc::Sampling::Trilinear);
+template<typename T, SampleMode Mode>
+void readCompositeFastImpl(
+    cv::Mat_<uint8_t>& out,
+    BlockPipeline& cache,
+    int level,
+    const cv::Mat_<cv::Vec3f>& baseCoords,
+    const cv::Mat_<cv::Vec3f>& normals,
+    float zStep,
+    int zStart, int zEnd,
+    const CompositeParams& params)
+{
+    const int h = baseCoords.rows, w = baseCoords.cols;
+    const int numLayers = zEnd - zStart + 1;
+    AccumMode mode = AccumMode::Mean;
+    if (needsLayerStorage(params.method)) mode = AccumMode::LayerStorage;
+    else if (params.method == "max") mode = AccumMode::Max;
+    else if (params.method == "min") mode = AccumMode::Min;
+
+    // Prefetch all layers' coverage.
+    // Approximation: bbox of baseCoords ± numLayers * zStep in each normal direction.
+    prefetchCoordsRegion(cache, level, baseCoords);
+
+    #pragma omp parallel
+    {
+        BlockSampler<T> s(cache, level);
+        std::vector<float> layerVals(numLayers);
+        #pragma omp for schedule(dynamic, 16)
+        for (int y = 0; y < h; y++) {
+            const cv::Vec3f* bRow = baseCoords.ptr<cv::Vec3f>(y);
+            const cv::Vec3f* nRow = normals.ptr<cv::Vec3f>(y);
+            uint8_t* outRow = out.ptr<uint8_t>(y);
+            for (int x = 0; x < w; x++) {
+                const cv::Vec3f& base = bRow[x];
+                const cv::Vec3f& n = nRow[x];
+                if (!isfinite_bitwise(base[0]) || !isfinite_bitwise(n[0])) continue;
+
+                float accum = 0.f, mx = 0.f, mn = float(std::numeric_limits<T>::max());
+                int count = 0;
+                for (int li = 0; li < numLayers; li++) {
+                    float z = float(zStart + li) * zStep;
+                    float vx = base[0] + n[0] * z;
+                    float vy = base[1] + n[1] * z;
+                    float vz = base[2] + n[2] * z;
+                    float v = float(sampleOne<T, Mode>(s, vz, vy, vx));
+                    switch (mode) {
+                        case AccumMode::Max: mx = std::max(mx, v); break;
+                        case AccumMode::Min: mn = std::min(mn, v); break;
+                        case AccumMode::Mean: accum += v; count++; break;
+                        case AccumMode::LayerStorage: layerVals[li] = v; break;
+                    }
+                }
+
+                float val = 0.f;
+                switch (mode) {
+                    case AccumMode::Max:  val = mx; break;
+                    case AccumMode::Min:  val = mn; break;
+                    case AccumMode::Mean: val = count > 0 ? accum / float(count) : 0.f; break;
+                    case AccumMode::LayerStorage: {
+                        if (params.method == "median") {
+                            // partial_sort matches the other median path
+                            // (Slicing.cpp composite) and beats nth_element
+                            // at the small N we run with (<=~33).
+                            std::partial_sort(layerVals.begin(),
+                                              layerVals.begin() + numLayers / 2 + 1,
+                                              layerVals.end());
+                            val = layerVals[numLayers / 2];
+                        } else if (params.method == "minabs") {
+                            float best = layerVals[0];
+                            for (int i = 1; i < numLayers; i++)
+                                if (std::abs(layerVals[i] - 127.5f) < std::abs(best - 127.5f))
+                                    best = layerVals[i];
+                            val = best;
+                        } else {
+                            val = count > 0 ? accum / float(count) : 0.f;
+                        }
+                        break;
+                    }
+                }
+                if (val < 0.f) val = 0.f; if (val > 255.f) val = 255.f;
+                outRow[x] = uint8_t(val);
+            }
+        }
+    }
 }
 
-// New overloads accepting vc::Sampling enum
-void readInterpolated3D(cv::Mat_<uint8_t>& out, vc::cache::TieredChunkCache* cache, int level,
-                        const cv::Mat_<cv::Vec3f>& coords, vc::Sampling method) {
-    readInterpolated3DImpl(out, cache, level, coords, method);
-}
-
-void readInterpolated3D(cv::Mat_<uint16_t>& out, vc::cache::TieredChunkCache* cache, int level,
-                        const cv::Mat_<cv::Vec3f>& coords, vc::Sampling method) {
-    readInterpolated3DImpl(out, cache, level, coords, method);
-}
-
+} // namespace
 
 void readCompositeFast(
     cv::Mat_<uint8_t>& out,
-    vc::cache::TieredChunkCache* cache,
+    BlockPipeline* cache,
     int level,
     const cv::Mat_<cv::Vec3f>& baseCoords,
     const cv::Mat_<cv::Vec3f>& normals,
@@ -773,462 +1657,235 @@ void readCompositeFast(
     const CompositeParams& params,
     vc::Sampling method)
 {
-    CacheParams p(cache, level);
-
-    const bool hasNormals = !normals.empty() && normals.size() == baseCoords.size();
-    const int numLayers = zEnd - zStart + 1;
-
-    auto getNormal = [&](int y, int x) -> cv::Vec3f {
-        if (hasNormals) {
-            const cv::Vec3f& n = normals(y, x);
-            if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2])) {
-                return n;
-            }
-        }
-        return {1, 0, 0};
-    };
-
     switch (method) {
-        case vc::Sampling::Trilinear:
-            readVolumeImpl<uint8_t, SampleMode::Trilinear>(out, *cache, level, p, baseCoords,
-                getNormal, numLayers, zStep, zStart, &params);
-            break;
         case vc::Sampling::Tricubic:
-            readVolumeImpl<uint8_t, SampleMode::Tricubic>(out, *cache, level, p, baseCoords,
-                getNormal, numLayers, zStep, zStart, &params);
-            break;
+            readCompositeFastImpl<uint8_t, SampleMode::Tricubic>(out, *cache, level,
+                baseCoords, normals, zStep, zStart, zEnd, params); break;
+        case vc::Sampling::Trilinear:
+            readCompositeFastImpl<uint8_t, SampleMode::Trilinear>(out, *cache, level,
+                baseCoords, normals, zStep, zStart, zEnd, params); break;
         default:
-            readVolumeImpl<uint8_t, SampleMode::Nearest>(out, *cache, level, p, baseCoords,
-                getNormal, numLayers, zStep, zStart, &params);
-            break;
+            readCompositeFastImpl<uint8_t, SampleMode::Nearest>(out, *cache, level,
+                baseCoords, normals, zStep, zStart, zEnd, params); break;
     }
 }
 
-
-// ============================================================================
-// readMultiSlice — bulk multi-slice trilinear sampling
-// ============================================================================
-
-template<typename T>
-static void readMultiSliceImpl(
-    std::vector<cv::Mat_<T>>& out,
-    vc::cache::TieredChunkCache& cache,
-    int level,
-    const cv::Mat_<cv::Vec3f>& basePoints,
-    const cv::Mat_<cv::Vec3f>& stepDirs,
-    const std::vector<float>& offsets)
+void samplePlaneCompositeARGB32(
+    uint32_t* outBuf, int outStride,
+    BlockPipeline* cache, int level,
+    const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
+    const cv::Vec3f& normal, float zStep, int zStart, int numLayers,
+    int w, int h,
+    const std::string& compositeMethod,
+    const uint32_t lut[256])
 {
-    CacheParams p(&cache, level);
-    const int h = basePoints.rows;
-    const int w = basePoints.cols;
-    const int numSlices = static_cast<int>(offsets.size());
+    AccumMode mode = AccumMode::Mean;
+    if (needsLayerStorage(compositeMethod)) mode = AccumMode::LayerStorage;
+    else if (compositeMethod == "max") mode = AccumMode::Max;
+    else if (compositeMethod == "min") mode = AccumMode::Min;
 
-    out.resize(numSlices);
-    for (int s = 0; s < numSlices; s++)
-        out[s] = cv::Mat_<T>(basePoints.size(), 0);
+    // Prefetch outer bbox including all layers.
+    cv::Vec3f layerOffsetMin = normal * (float(zStart) * zStep);
+    cv::Vec3f layerOffsetMax = normal * (float(zStart + numLayers - 1) * zStep);
+    cv::Vec3f p0 = origin + layerOffsetMin;
+    cv::Vec3f p1 = origin + vx_step * float(w - 1) + vy_step * float(h - 1) + layerOffsetMax;
+    float minVx = std::min(p0[0], p1[0]), maxVx = std::max(p0[0], p1[0]);
+    float minVy = std::min(p0[1], p1[1]), maxVy = std::max(p0[1], p1[1]);
+    float minVz = std::min(p0[2], p1[2]), maxVz = std::max(p0[2], p1[2]);
+    prefetchRegion(*cache, level, minVx, minVy, minVz, maxVx, maxVy, maxVz);
 
-    if (numSlices == 0) return;
-
-    // Phase 1: Discover needed chunks and prefetch in parallel.
+    #pragma omp parallel
     {
-        const size_t totalChunks = static_cast<size_t>(p.chunksZ) * p.chunksY * p.chunksX;
-        std::vector<uint8_t> needed(totalChunks, 0);
-        int minIz = p.chunksZ, maxIz = -1;
-        int minIy = p.chunksY, maxIy = -1;
-        int minIx = p.chunksX, maxIx = -1;
-
-        auto markVoxel = [&](int iz, int iy, int ix) {
-            if (iz < 0 || iy < 0 || ix < 0 || iz >= p.sz || iy >= p.sy || ix >= p.sx) return;
-            int ciz = p.chunkZ(iz);
-            int ciy = p.chunkY(iy);
-            int cix = p.chunkX(ix);
-            size_t idx = static_cast<size_t>(ciz) * p.chunksY * p.chunksX + ciy * p.chunksX + cix;
-            if (!needed[idx]) {
-                needed[idx] = 1;
-                minIz = std::min(minIz, ciz); maxIz = std::max(maxIz, ciz);
-                minIy = std::min(minIy, ciy); maxIy = std::max(maxIy, ciy);
-                minIx = std::min(minIx, cix); maxIx = std::max(maxIx, cix);
-            }
-        };
-
-        const float fOff = offsets[0];
-        const float lOff = offsets[numSlices - 1];
+        BlockSampler<uint8_t> s(*cache, level);
+        std::vector<float> layerVals(numLayers);
+        #pragma omp for schedule(dynamic, 16)
         for (int y = 0; y < h; y++) {
+            uint32_t* outRow = outBuf + size_t(y) * size_t(outStride);
             for (int x = 0; x < w; x++) {
-                const cv::Vec3f& bp = basePoints(y, x);
-                const cv::Vec3f& sd = stepDirs(y, x);
-                if (std::isnan(bp[0])) continue;
+                cv::Vec3f base = origin + vx_step * float(x) + vy_step * float(y);
 
-                for (float off : {fOff, lOff}) {
-                    float vx = bp[0] + sd[0] * off;
-                    float vy = bp[1] + sd[1] * off;
-                    float vz = bp[2] + sd[2] * off;
-                    int iz = static_cast<int>(vz);
-                    int iy = static_cast<int>(vy);
-                    int ix = static_cast<int>(vx);
-                    for (int dz = 0; dz <= 1; dz++)
-                        for (int dy = 0; dy <= 1; dy++)
-                            for (int dx = 0; dx <= 1; dx++)
-                                markVoxel(iz+dz, iy+dy, ix+dx);
-                }
-            }
-        }
-
-        // Collect and load needed chunks
-        std::vector<std::array<int,3>> neededChunks;
-        for (int ciz = minIz; ciz <= maxIz; ciz++)
-            for (int ciy = minIy; ciy <= maxIy; ciy++)
-                for (int cix = minIx; cix <= maxIx; cix++)
-                    if (needed[static_cast<size_t>(ciz) * p.chunksY * p.chunksX + ciy * p.chunksX + cix])
-                        neededChunks.push_back({ciz, ciy, cix});
-
-        // Only spawn threads if any chunks are uncached
-        bool anyMissing = false;
-        for (size_t ci = 0; ci < neededChunks.size(); ci++) {
-            if (!cache.get(vc::cache::ChunkKey{level, neededChunks[ci][0], neededChunks[ci][1], neededChunks[ci][2]})) {
-                anyMissing = true;
-                break;
-            }
-        }
-
-        if (anyMissing) {
-            for (size_t ci = 0; ci < neededChunks.size(); ci++)
-                cache.getBlocking(vc::cache::ChunkKey{level, neededChunks[ci][0], neededChunks[ci][1], neededChunks[ci][2]});
-        }
-    }
-
-    // Phase 2: Sample (all chunks for this band already cached).
-    constexpr float maxVal = std::is_same_v<T, uint16_t> ? 65535.f : 255.f;
-    const float firstOff = offsets[0];
-    const float lastOff = offsets[numSlices - 1];
-    const int lsz = p.sz, lsy = p.sy, lsx = p.sx;
-
-    {
-        ChunkSampler<T, 2> sampler(p, cache, level);
-        const size_t ls0 = sampler.s0, ls1 = sampler.s1;
-
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                const cv::Vec3f& bp = basePoints(y, x);
-                const cv::Vec3f& sd = stepDirs(y, x);
-                if (std::isnan(bp[0])) continue;
-
-                float vx0 = bp[0] + sd[0] * firstOff;
-                float vy0 = bp[1] + sd[1] * firstOff;
-                float vz0 = bp[2] + sd[2] * firstOff;
-                float vx1 = bp[0] + sd[0] * lastOff;
-                float vy1 = bp[1] + sd[1] * lastOff;
-                float vz1 = bp[2] + sd[2] * lastOff;
-
-                float minVz = std::min(vz0, vz1);
-                float maxVz = std::max(vz0, vz1);
-                float minVy = std::min(vy0, vy1);
-                float maxVy = std::max(vy0, vy1);
-                float minVx = std::min(vx0, vx1);
-                float maxVx = std::max(vx0, vx1);
-
-                int izMin = static_cast<int>(minVz);
-                int izMax = static_cast<int>(maxVz) + 1;
-                int iyMin = static_cast<int>(minVy);
-                int iyMax = static_cast<int>(maxVy) + 1;
-                int ixMin = static_cast<int>(minVx);
-                int ixMax = static_cast<int>(maxVx) + 1;
-
-                bool allInBounds = minVz >= 0 && minVy >= 0 && minVx >= 0 &&
-                                   izMax < lsz && iyMax < lsy && ixMax < lsx &&
-                                   izMin >= 0 && iyMin >= 0 && ixMin >= 0;
-
-                bool singleChunk = allInBounds &&
-                    p.chunkZ(izMin) == p.chunkZ(izMax) &&
-                    p.chunkY(iyMin) == p.chunkY(iyMax) &&
-                    p.chunkX(ixMin) == p.chunkX(ixMax);
-
-                if (singleChunk) {
-                    int ciz = p.chunkZ(izMin);
-                    int ciy = p.chunkY(iyMin);
-                    int cix = p.chunkX(ixMin);
-                    sampler.updateChunk(ciz, ciy, cix);
-                    const T* __restrict__ d = sampler.data;
-                    if (!d) continue;
-
-                    for (int si = 0; si < numSlices; si++) {
-                        float off = offsets[si];
-                        float vx = bp[0] + sd[0] * off;
-                        float vy = bp[1] + sd[1] * off;
-                        float vz = bp[2] + sd[2] * off;
-
-                        int iz = static_cast<int>(vz);
-                        int iy = static_cast<int>(vy);
-                        int ix = static_cast<int>(vx);
-
-                        size_t base = p.localZ(iz)*ls0 + p.localY(iy)*ls1 + p.localX(ix);
-                        float c000 = d[base];
-                        float c100 = d[base + ls0];
-                        float c010 = d[base + ls1];
-                        float c110 = d[base + ls0 + ls1];
-                        float c001 = d[base + 1];
-                        float c101 = d[base + ls0 + 1];
-                        float c011 = d[base + ls1 + 1];
-                        float c111 = d[base + ls0 + ls1 + 1];
-
-                        float fz = vz - iz;
-                        float fy = vy - iy;
-                        float fx = vx - ix;
-
-                        float c00 = std::fma(fx, c001 - c000, c000);
-                        float c01 = std::fma(fx, c011 - c010, c010);
-                        float c10 = std::fma(fx, c101 - c100, c100);
-                        float c11 = std::fma(fx, c111 - c110, c110);
-
-                        float c0 = std::fma(fy, c01 - c00, c00);
-                        float c1 = std::fma(fy, c11 - c10, c10);
-
-                        float v = std::fma(fz, c1 - c0, c0);
-                        v = std::max(0.f, std::min(maxVal, v + 0.5f));
-                        out[si](y, x) = static_cast<T>(v);
-                    }
-                } else {
-                    for (int si = 0; si < numSlices; si++) {
-                        float off = offsets[si];
-                        float vx = bp[0] + sd[0] * off;
-                        float vy = bp[1] + sd[1] * off;
-                        float vz = bp[2] + sd[2] * off;
-
-                        if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < lsz && vy < lsy && vx < lsx))
-                            continue;
-
-                        float v = sampler.sampleTrilinearFast(vz, vy, vx);
-                        v = std::max(0.f, std::min(maxVal, v + 0.5f));
-                        out[si](y, x) = static_cast<T>(v);
+                float accum = 0.f, mx = 0.f, mn = 255.f;
+                int count = 0;
+                for (int li = 0; li < numLayers; li++) {
+                    float z = float(zStart + li) * zStep;
+                    float vx = base[0] + normal[0] * z;
+                    float vy = base[1] + normal[1] * z;
+                    float vz = base[2] + normal[2] * z;
+                    float v = float(sampleOne<uint8_t, SampleMode::Nearest>(s, vz, vy, vx));
+                    switch (mode) {
+                        case AccumMode::Max: mx = std::max(mx, v); break;
+                        case AccumMode::Min: mn = std::min(mn, v); break;
+                        case AccumMode::Mean: accum += v; count++; break;
+                        case AccumMode::LayerStorage: layerVals[li] = v; break;
                     }
                 }
+
+                float val = 0.f;
+                switch (mode) {
+                    case AccumMode::Max:  val = mx; break;
+                    case AccumMode::Min:  val = mn; break;
+                    case AccumMode::Mean: val = count > 0 ? accum / float(count) : 0.f; break;
+                    case AccumMode::LayerStorage: {
+                        if (compositeMethod == "median") {
+                            std::nth_element(layerVals.begin(),
+                                             layerVals.begin() + numLayers / 2,
+                                             layerVals.end());
+                            val = layerVals[numLayers / 2];
+                        } else if (compositeMethod == "minabs") {
+                            float best = layerVals[0];
+                            for (int i = 1; i < numLayers; i++)
+                                if (std::abs(layerVals[i] - 127.5f) < std::abs(best - 127.5f))
+                                    best = layerVals[i];
+                            val = best;
+                        } else {
+                            val = count > 0 ? accum / float(count) : 0.f;
+                        }
+                        break;
+                    }
+                }
+                if (val < 0.f) val = 0.f; if (val > 255.f) val = 255.f;
+                outRow[x] = lut[uint8_t(val)];
             }
         }
     }
-
 }
 
-void readMultiSlice(
-    std::vector<cv::Mat_<uint8_t>>& out,
-    vc::cache::TieredChunkCache* cache,
-    int level,
-    const cv::Mat_<cv::Vec3f>& basePoints,
-    const cv::Mat_<cv::Vec3f>& stepDirs,
-    const std::vector<float>& offsets)
-{
-    readMultiSliceImpl(out, *cache, level, basePoints, stepDirs, offsets);
-}
+// ----------------------------------------------------------------------------
+// Multi-slice readers
+// ----------------------------------------------------------------------------
 
-void readMultiSlice(
-    std::vector<cv::Mat_<uint16_t>>& out,
-    vc::cache::TieredChunkCache* cache,
-    int level,
-    const cv::Mat_<cv::Vec3f>& basePoints,
-    const cv::Mat_<cv::Vec3f>& stepDirs,
-    const std::vector<float>& offsets)
-{
-    readMultiSliceImpl(out, *cache, level, basePoints, stepDirs, offsets);
-}
-
-
-// ============================================================================
-// sampleTileSlices — single-threaded per-tile multi-slice sampler
-// Called from within an OMP thread; no internal OMP parallelism.
-// Same trilinear math as readMultiSliceImpl Phase 2.
-// ============================================================================
+namespace {
 
 template<typename T>
-static void sampleTileSlicesImpl(
+void readMultiSliceImpl(
     std::vector<cv::Mat_<T>>& out,
-    vc::cache::TieredChunkCache& cache,
+    BlockPipeline* cache,
     int level,
     const cv::Mat_<cv::Vec3f>& basePoints,
     const cv::Mat_<cv::Vec3f>& stepDirs,
     const std::vector<float>& offsets)
 {
-    CacheParams p(&cache, level);
-    const int h = basePoints.rows;
-    const int w = basePoints.cols;
-    const int numSlices = static_cast<int>(offsets.size());
+    const int h = basePoints.rows, w = basePoints.cols;
+    const int nSlices = int(offsets.size());
+    out.resize(nSlices);
+    for (int i = 0; i < nSlices; i++)
+        out[i].create(h, w);
 
-    out.resize(numSlices);
-    for (int s = 0; s < numSlices; s++)
-        out[s] = cv::Mat_<T>(basePoints.size(), 0);
-
-    if (numSlices == 0) return;
-
-    // Phase 1: Discover needed chunks and prefetch serially.
-    {
-        std::vector<std::array<int,3>> neededChunks;
-        neededChunks.reserve(16);
-
-        std::unordered_set<uint64_t> seen;
-        seen.reserve(16);
-        auto markVoxel = [&](int iz, int iy, int ix) {
-            if (iz < 0 || iy < 0 || ix < 0 || iz >= p.sz || iy >= p.sy || ix >= p.sx) return;
-            int ciz = p.chunkZ(iz);
-            int ciy = p.chunkY(iy);
-            int cix = p.chunkX(ix);
-            uint64_t key = (uint64_t(ciz) << 40) | (uint64_t(ciy) << 20) | uint64_t(cix);
-            if (!seen.insert(key).second) return;
-            neededChunks.push_back({ciz, ciy, cix});
-        };
-
-        const float fOff = offsets[0];
-        const float lOff = offsets[numSlices - 1];
-        for (int y = 0; y < h; y++) {
-            for (int x = 0; x < w; x++) {
-                const cv::Vec3f& bp = basePoints(y, x);
-                const cv::Vec3f& sd = stepDirs(y, x);
-                if (std::isnan(bp[0])) continue;
-
-                for (float off : {fOff, lOff}) {
-                    float vx = bp[0] + sd[0] * off;
-                    float vy = bp[1] + sd[1] * off;
-                    float vz = bp[2] + sd[2] * off;
-                    int iz = static_cast<int>(vz);
-                    int iy = static_cast<int>(vy);
-                    int ix = static_cast<int>(vx);
-                    for (int dz = 0; dz <= 1; dz++)
-                        for (int dy = 0; dy <= 1; dy++)
-                            for (int dx = 0; dx <= 1; dx++)
-                                markVoxel(iz+dz, iy+dy, ix+dx);
-                }
-            }
-        }
-
-        // Serial prefetch — we're already on an OMP thread
-        for (auto& c : neededChunks)
-            cache.getBlocking(vc::cache::ChunkKey{level, c[0], c[1], c[2]});
-    }
-
-    // Phase 2: Sample (single-threaded, all chunks already cached).
-    constexpr float maxVal = std::is_same_v<T, uint16_t> ? 65535.f : 255.f;
-    const float firstOff = offsets[0];
-    const float lastOff = offsets[numSlices - 1];
-    const int lsz = p.sz, lsy = p.sy, lsx = p.sx;
-
-    ChunkSampler<T, 8> sampler(p, cache, level);
-    const size_t ls0 = sampler.s0, ls1 = sampler.s1;
-
+    // Prefetch union bbox.
+    float minOff = *std::min_element(offsets.begin(), offsets.end());
+    float maxOff = *std::max_element(offsets.begin(), offsets.end());
+    float minVx = FLT_MAX, minVy = FLT_MAX, minVz = FLT_MAX;
+    float maxVx = -FLT_MAX, maxVy = -FLT_MAX, maxVz = -FLT_MAX;
     for (int y = 0; y < h; y++) {
+        const cv::Vec3f* bRow = basePoints.ptr<cv::Vec3f>(y);
+        const cv::Vec3f* sRow = stepDirs.ptr<cv::Vec3f>(y);
         for (int x = 0; x < w; x++) {
-            const cv::Vec3f& bp = basePoints(y, x);
-            const cv::Vec3f& sd = stepDirs(y, x);
-            if (std::isnan(bp[0])) continue;
+            if (!isfinite_bitwise(bRow[x][0])) continue;
+            cv::Vec3f lo = bRow[x] + sRow[x] * minOff;
+            cv::Vec3f hi = bRow[x] + sRow[x] * maxOff;
+            minVx = std::min(minVx, std::min(lo[0], hi[0]));
+            minVy = std::min(minVy, std::min(lo[1], hi[1]));
+            minVz = std::min(minVz, std::min(lo[2], hi[2]));
+            maxVx = std::max(maxVx, std::max(lo[0], hi[0]));
+            maxVy = std::max(maxVy, std::max(lo[1], hi[1]));
+            maxVz = std::max(maxVz, std::max(lo[2], hi[2]));
+        }
+    }
+    if (maxVx >= minVx)
+        prefetchRegion(*cache, level, minVx, minVy, minVz, maxVx, maxVy, maxVz);
 
-            float vx0 = bp[0] + sd[0] * firstOff;
-            float vy0 = bp[1] + sd[1] * firstOff;
-            float vz0 = bp[2] + sd[2] * firstOff;
-            float vx1 = bp[0] + sd[0] * lastOff;
-            float vy1 = bp[1] + sd[1] * lastOff;
-            float vz1 = bp[2] + sd[2] * lastOff;
-
-            float minVz = std::min(vz0, vz1);
-            float maxVz = std::max(vz0, vz1);
-            float minVy = std::min(vy0, vy1);
-            float maxVy = std::max(vy0, vy1);
-            float minVx = std::min(vx0, vx1);
-            float maxVx = std::max(vx0, vx1);
-
-            int izMin = static_cast<int>(minVz);
-            int izMax = static_cast<int>(maxVz) + 1;
-            int iyMin = static_cast<int>(minVy);
-            int iyMax = static_cast<int>(maxVy) + 1;
-            int ixMin = static_cast<int>(minVx);
-            int ixMax = static_cast<int>(maxVx) + 1;
-
-            bool allInBounds = minVz >= 0 && minVy >= 0 && minVx >= 0 &&
-                               izMax < lsz && iyMax < lsy && ixMax < lsx &&
-                               izMin >= 0 && iyMin >= 0 && ixMin >= 0;
-
-            bool singleChunk = allInBounds &&
-                p.chunkZ(izMin) == p.chunkZ(izMax) &&
-                p.chunkY(iyMin) == p.chunkY(iyMax) &&
-                p.chunkX(ixMin) == p.chunkX(ixMax);
-
-            if (singleChunk) {
-                int ciz = p.chunkZ(izMin);
-                int ciy = p.chunkY(iyMin);
-                int cix = p.chunkX(ixMin);
-                sampler.updateChunk(ciz, ciy, cix);
-                const T* __restrict__ d = sampler.data;
-                if (!d) continue;
-
-                for (int si = 0; si < numSlices; si++) {
-                    float off = offsets[si];
-                    float vx = bp[0] + sd[0] * off;
-                    float vy = bp[1] + sd[1] * off;
-                    float vz = bp[2] + sd[2] * off;
-
-                    int iz = static_cast<int>(vz);
-                    int iy = static_cast<int>(vy);
-                    int ix = static_cast<int>(vx);
-
-                    size_t base = p.localZ(iz)*ls0 + p.localY(iy)*ls1 + p.localX(ix);
-                    float c000 = d[base];
-                    float c100 = d[base + ls0];
-                    float c010 = d[base + ls1];
-                    float c110 = d[base + ls0 + ls1];
-                    float c001 = d[base + 1];
-                    float c101 = d[base + ls0 + 1];
-                    float c011 = d[base + ls1 + 1];
-                    float c111 = d[base + ls0 + ls1 + 1];
-
-                    float fz = vz - iz;
-                    float fy = vy - iy;
-                    float fx = vx - ix;
-
-                    float c00 = std::fma(fx, c001 - c000, c000);
-                    float c01 = std::fma(fx, c011 - c010, c010);
-                    float c10 = std::fma(fx, c101 - c100, c100);
-                    float c11 = std::fma(fx, c111 - c110, c110);
-
-                    float c0 = std::fma(fy, c01 - c00, c00);
-                    float c1 = std::fma(fy, c11 - c10, c10);
-
-                    float v = std::fma(fz, c1 - c0, c0);
-                    v = std::max(0.f, std::min(maxVal, v + 0.5f));
-                    out[si](y, x) = static_cast<T>(v);
-                }
-            } else {
-                for (int si = 0; si < numSlices; si++) {
-                    float off = offsets[si];
-                    float vx = bp[0] + sd[0] * off;
-                    float vy = bp[1] + sd[1] * off;
-                    float vz = bp[2] + sd[2] * off;
-
-                    if (!(vz >= 0 && vy >= 0 && vx >= 0 && vz < lsz && vy < lsy && vx < lsx))
-                        continue;
-
-                    float v = sampler.sampleTrilinearFast(vz, vy, vx);
-                    v = std::max(0.f, std::min(maxVal, v + 0.5f));
-                    out[si](y, x) = static_cast<T>(v);
+    #pragma omp parallel
+    {
+        BlockSampler<T> s(*cache, level);
+        #pragma omp for schedule(dynamic, 16)
+        for (int y = 0; y < h; y++) {
+            const cv::Vec3f* bRow = basePoints.ptr<cv::Vec3f>(y);
+            const cv::Vec3f* sRow = stepDirs.ptr<cv::Vec3f>(y);
+            for (int x = 0; x < w; x++) {
+                const cv::Vec3f& b = bRow[x];
+                const cv::Vec3f& d = sRow[x];
+                for (int i = 0; i < nSlices; i++) {
+                    float off = offsets[i];
+                    float vx = b[0] + d[0] * off;
+                    float vy = b[1] + d[1] * off;
+                    float vz = b[2] + d[2] * off;
+                    T val = 0;
+                    if (s.inBounds(vz, vy, vx)) {
+                        float v = s.sampleTrilinear(vz, vy, vx);
+                        if (v < 0.f) v = 0.f;
+                        float maxV = float(std::numeric_limits<T>::max());
+                        if (v > maxV) v = maxV;
+                        val = T(v + (std::is_same_v<T, uint16_t> ? 0.5f : 0.f));
+                    }
+                    out[i].template ptr<T>(y)[x] = val;
                 }
             }
         }
     }
 }
 
-void sampleTileSlices(
-    std::vector<cv::Mat_<uint8_t>>& out,
-    vc::cache::TieredChunkCache* cache,
+template<typename T>
+void sampleTileSlicesImpl(
+    std::vector<cv::Mat_<T>>& out,
+    BlockPipeline* cache,
     int level,
     const cv::Mat_<cv::Vec3f>& basePoints,
     const cv::Mat_<cv::Vec3f>& stepDirs,
     const std::vector<float>& offsets)
 {
-    sampleTileSlicesImpl(out, *cache, level, basePoints, stepDirs, offsets);
+    const int h = basePoints.rows, w = basePoints.cols;
+    const int nSlices = int(offsets.size());
+    out.resize(nSlices);
+    for (int i = 0; i < nSlices; i++) out[i].create(h, w);
+
+    BlockSampler<T> s(*cache, level);
+    for (int y = 0; y < h; y++) {
+        const cv::Vec3f* bRow = basePoints.ptr<cv::Vec3f>(y);
+        const cv::Vec3f* sRow = stepDirs.ptr<cv::Vec3f>(y);
+        for (int x = 0; x < w; x++) {
+            const cv::Vec3f& b = bRow[x];
+            const cv::Vec3f& d = sRow[x];
+            for (int i = 0; i < nSlices; i++) {
+                float off = offsets[i];
+                float vx = b[0] + d[0] * off;
+                float vy = b[1] + d[1] * off;
+                float vz = b[2] + d[2] * off;
+                T val = 0;
+                if (s.inBounds(vz, vy, vx)) {
+                    float v = s.sampleTrilinear(vz, vy, vx);
+                    if (v < 0.f) v = 0.f;
+                    float maxV = float(std::numeric_limits<T>::max());
+                    if (v > maxV) v = maxV;
+                    val = T(v + (std::is_same_v<T, uint16_t> ? 0.5f : 0.f));
+                }
+                out[i].template ptr<T>(y)[x] = val;
+            }
+        }
+    }
 }
 
-void sampleTileSlices(
-    std::vector<cv::Mat_<uint16_t>>& out,
-    vc::cache::TieredChunkCache* cache,
-    int level,
-    const cv::Mat_<cv::Vec3f>& basePoints,
-    const cv::Mat_<cv::Vec3f>& stepDirs,
-    const std::vector<float>& offsets)
-{
-    sampleTileSlicesImpl(out, *cache, level, basePoints, stepDirs, offsets);
+} // namespace
+
+void readMultiSlice(std::vector<cv::Mat_<uint8_t>>& out, BlockPipeline* cache, int level,
+                    const cv::Mat_<cv::Vec3f>& basePoints, const cv::Mat_<cv::Vec3f>& stepDirs,
+                    const std::vector<float>& offsets) {
+    readMultiSliceImpl(out, cache, level, basePoints, stepDirs, offsets);
 }
 
+void readMultiSlice(std::vector<cv::Mat_<uint16_t>>& out, BlockPipeline* cache, int level,
+                    const cv::Mat_<cv::Vec3f>& basePoints, const cv::Mat_<cv::Vec3f>& stepDirs,
+                    const std::vector<float>& offsets) {
+    readMultiSliceImpl(out, cache, level, basePoints, stepDirs, offsets);
+}
+
+void sampleTileSlices(std::vector<cv::Mat_<uint8_t>>& out, BlockPipeline* cache, int level,
+                      const cv::Mat_<cv::Vec3f>& basePoints, const cv::Mat_<cv::Vec3f>& stepDirs,
+                      const std::vector<float>& offsets) {
+    sampleTileSlicesImpl(out, cache, level, basePoints, stepDirs, offsets);
+}
+
+void sampleTileSlices(std::vector<cv::Mat_<uint16_t>>& out, BlockPipeline* cache, int level,
+                      const cv::Mat_<cv::Vec3f>& basePoints, const cv::Mat_<cv::Vec3f>& stepDirs,
+                      const std::vector<float>& offsets) {
+    sampleTileSlicesImpl(out, cache, level, basePoints, stepDirs, offsets);
+}

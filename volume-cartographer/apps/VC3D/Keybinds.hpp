@@ -51,8 +51,7 @@ extern const ShortcutDef CycleViewers;
 namespace keypress {
 extern const KeyPressDef ToggleVolumeOverlay;
 extern const KeyPressDef CenterFocusOnCursor;
-extern const KeyPressDef FocusHistoryBack;
-extern const KeyPressDef FocusHistoryForward;
+extern const KeyPressDef RecenterFocus;
 extern const KeyPressDef SliceStepDecrease;
 extern const KeyPressDef SliceStepIncrease;
 

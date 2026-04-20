@@ -14,25 +14,29 @@ add_library(vc_core
         src/Slicing.cpp
         src/Compositing.cpp
         src/PlaneSurface.cpp
+        src/Surface.cpp
         src/QuadSurface.cpp
         src/Render.cpp
         src/Tiff.cpp
         src/Zarr.cpp
         src/VcDataset.cpp
         src/NetworkFilesystem.cpp
-        src/cache/ChunkSource.cpp
-        src/cache/DiskStore.cpp
+        src/cache/VolumeSource.cpp
         src/cache/HttpMetadataFetcher.cpp
+        src/cache/BlockCache.cpp
         src/cache/IOPool.cpp
-        src/cache/TieredChunkCache.cpp
+        src/cache/BlockPipeline.cpp
         src/cache/VcDecompressor.cpp
-        src/cache/SimpleCacheFactory.cpp
+        src/LoadJson.cpp
         src/RemoteUrl.cpp
         src/RemoteScroll.cpp
         src/PostProcess.cpp
         src/Geometry.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
+        src/render/AdaptiveCamera.cpp
+        src/render/Colormaps.cpp
+        src/render/PostProcess.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )
 
@@ -44,14 +48,13 @@ target_link_libraries(vc_core
         opencv_calib3d
         opencv_video
         nlohmann_json::nlohmann_json
-        xtensor
         OpenMP::OpenMP_CXX
         TIFF::TIFF
         OpenABF
         CURL::libcurl
 )
 
-# utils header-only library + vendored blosc1 compression + video codec
+# utils header-only library + vendored video codec
 # WHOLE_ARCHIVE is needed because ThinLTO + lld can internalize symbols from
 # static archives before cross-archive references are resolved.
 target_link_libraries(vc_core PUBLIC
@@ -61,15 +64,14 @@ target_link_libraries(vc_core PUBLIC
 target_link_libraries(vc_core PRIVATE
     $<BUILD_INTERFACE:blosc_static>
 )
-target_include_directories(vc_core PRIVATE
-    ${CMAKE_SOURCE_DIR}/libs/c-blosc/blosc
-    ${CMAKE_BINARY_DIR}/libs/c-blosc/blosc
-    ${CMAKE_SOURCE_DIR}/libs/c-blosc/internal-complibs/zstd-1.5.6
-    ${CMAKE_SOURCE_DIR}/libs/c-blosc/internal-complibs/lz4-1.10.0
-    ${CMAKE_SOURCE_DIR}/libs/c-blosc/internal-complibs/zlib-1.3.1
-)
 
-target_compile_definitions(vc_core PUBLIC VC_USE_CURL)
+
+
+# Slicing.cpp is the hot sampling loop (87% of render time).
+# Force O3 + fast-math for maximum vectorization regardless of build type.
+set_source_files_properties(src/Slicing.cpp PROPERTIES
+    COMPILE_OPTIONS "-O3;-ffast-math"
+)
 
 # Precompiled headers for faster builds
 if(VC_USE_PCH)
@@ -128,11 +130,8 @@ target_precompile_headers(vc_core PRIVATE
     <opencv2/imgcodecs.hpp>
     # Boost (used by CLI apps)
     <boost/program_options.hpp>
-    # xtensor (chunk buffer type - heavy templates)
-    <xtensor/containers/xarray.hpp>
-    <xtensor/containers/xadapt.hpp>
-    <xtensor/views/xview.hpp>
-    <xtensor/generators/xbuilder.hpp>
+    # JSON (heavy templates, used in ~70 TUs)
+    <nlohmann/json.hpp>
 )
 endif()
 

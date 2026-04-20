@@ -166,6 +166,11 @@ class ZarrDataset(Dataset):
 
     def _discover_and_load_volumes(self) -> None:
         """Discover and load all OME-Zarr volumes."""
+        volumes_cfg = getattr(self.mgr, "dataset_config", {}).get("volumes")
+        if volumes_cfg:
+            self._load_explicit_volumes(volumes_cfg)
+            return
+
         images_dir = self.data_path / "images"
         labels_dir = self.data_path / "labels"
 
@@ -221,6 +226,128 @@ class ZarrDataset(Dataset):
                 "Loaded volume '%s': shape=%s, has_labels=%s",
                 volume_id, spatial_shape, has_any_label
             )
+
+    def _load_explicit_volumes(self, volumes_cfg) -> None:
+        """Load explicit volume specs from dataset_config.volumes."""
+        if isinstance(volumes_cfg, dict):
+            volume_specs = list(volumes_cfg.values())
+        elif isinstance(volumes_cfg, (list, tuple)):
+            volume_specs = list(volumes_cfg)
+        else:
+            raise ValueError("dataset_config.volumes must be a list or mapping")
+
+        image_id_counts: Dict[str, int] = {}
+        logger.info("Loading %d explicit volume specs", len(volume_specs))
+
+        for volume_idx, spec in enumerate(volume_specs):
+            if isinstance(spec, (str, Path)):
+                spec = {"image": spec}
+            if not isinstance(spec, dict):
+                raise ValueError("Each explicit volume entry must be a mapping or path string")
+
+            image_path = self._resolve_explicit_volume_path(
+                spec.get("image") or spec.get("image_path")
+            )
+            if image_path is None:
+                raise ValueError("Explicit volume entries must define 'image' or 'image_path'")
+            if not image_path.exists():
+                raise FileNotFoundError(f"Explicit image volume not found: {image_path}")
+
+            label_mapping = self._resolve_explicit_label_mapping(spec)
+            label_paths: Dict[str, Optional[Path]] = {}
+            label_arrays: Dict[str, Optional[zarr.Array]] = {}
+            has_any_label = False
+            for target in self.target_names:
+                label_path = self._resolve_explicit_volume_path(label_mapping.get(target))
+                if label_path is not None:
+                    if not label_path.exists():
+                        raise FileNotFoundError(f"Explicit label volume not found: {label_path}")
+                    label_paths[target] = label_path
+                    label_arrays[target] = self._open_zarr(label_path)
+                    has_any_label = True
+                else:
+                    if not self.allow_unlabeled_data:
+                        raise FileNotFoundError(
+                            f"Missing explicit label for target '{target}' in volume spec #{volume_idx}"
+                        )
+                    label_paths[target] = None
+                    label_arrays[target] = None
+
+            image_array = self._open_zarr(image_path)
+            spatial_shape = self._get_spatial_shape(image_array)
+            volume_id = self._derive_explicit_volume_id(
+                spec=spec,
+                image_path=image_path,
+                label_paths=label_paths,
+                image_id_counts=image_id_counts,
+            )
+
+            self._volumes.append(
+                VolumeInfo(
+                    volume_id=volume_id,
+                    image_path=image_path,
+                    image_array=image_array,
+                    label_paths=label_paths,
+                    label_arrays=label_arrays,
+                    spatial_shape=spatial_shape,
+                    has_labels=has_any_label,
+                )
+            )
+
+            logger.info(
+                "Loaded explicit volume '%s': image=%s shape=%s has_labels=%s",
+                volume_id,
+                image_path,
+                spatial_shape,
+                has_any_label,
+            )
+
+    def _resolve_explicit_label_mapping(self, spec: dict) -> Dict[str, Optional[str]]:
+        labels = spec.get("labels")
+        if labels is None:
+            labels = spec.get("label_paths")
+        if labels is not None:
+            if not isinstance(labels, dict):
+                raise ValueError("Explicit volume labels must be a mapping of target -> path")
+            return {str(k): v for k, v in labels.items()}
+
+        singular_label = spec.get("label")
+        if singular_label in (None, ""):
+            return {}
+        if len(self.target_names) != 1:
+            raise ValueError(
+                "Explicit volume entries that use singular 'label' require exactly one active target"
+            )
+        return {self.target_names[0]: singular_label}
+
+    def _resolve_explicit_volume_path(self, value) -> Optional[Path]:
+        if value in (None, ""):
+            return None
+        path = Path(value)
+        if path.is_absolute():
+            return path
+        config_path = getattr(self.mgr, "_config_path", None)
+        base_dir = Path(config_path).parent.resolve() if config_path is not None else self.data_path
+        return (base_dir / path).resolve()
+
+    def _derive_explicit_volume_id(
+        self,
+        *,
+        spec: dict,
+        image_path: Path,
+        label_paths: Dict[str, Optional[Path]],
+        image_id_counts: Dict[str, int],
+    ) -> str:
+        configured_id = spec.get("volume_id") or spec.get("name")
+        if configured_id not in (None, ""):
+            return str(configured_id)
+
+        base_id = image_path.stem
+        duplicate_idx = image_id_counts.get(base_id, 0)
+        image_id_counts[base_id] = duplicate_idx + 1
+        if duplicate_idx == 0:
+            return base_id
+        return f"{base_id}_{duplicate_idx}"
 
     def _open_zarr(self, path: Path) -> zarr.Array:
         """Open a zarr array at the configured resolution level."""
@@ -312,7 +439,7 @@ class ZarrDataset(Dataset):
         # No cache found - enumerate all patches without validation
         logger.warning(
             "No patch cache found. Enumerating all patches without validation. "
-            "Run `vesuvius.build_patch_cache --config <config.yaml>` to generate cache."
+            "Run `vesuvius.find_patches --config <config.yaml>` to generate cache."
         )
         self._enumerate_all_patches()
 

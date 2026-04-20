@@ -22,12 +22,12 @@
 #include <opencv2/core.hpp>
 #include <opencv2/imgcodecs.hpp>
 
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
 namespace fs = std::filesystem;
-using json = nlohmann::json;
+using Json = utils::Json;
 
 // ---------- utils ----------
 static std::string time_str() {
@@ -70,24 +70,24 @@ struct Bounds {
 // Extracts "scale" from json (number or array). Returns true if present.
 // - scale_json_out: original json value (preserved verbatim for meta.json)
 // - scale_for_save: a float to pass into QuadSurface (number or first array element)
-static bool extract_scale_from_json(const json& j, json& scale_json_out, float& scale_for_save) {
+static bool extract_scale_from_json(const Json& j, Json& scale_json_out, float& scale_for_save) {
     if (!j.contains("scale")) return false;
-    const auto& s = j["scale"];
+    const Json& s = j["scale"];
     if (s.is_number()) {
         scale_json_out = s;
-        scale_for_save = s.get<float>();
+        scale_for_save = s.get_float();
         return true;
     }
     if (s.is_array() && !s.empty() && s[0].is_number()) {
         scale_json_out = s;                 // preserve full array in meta
-        scale_for_save = s[0].get<float>(); // QuadSurface takes a single float
+        scale_for_save = s[0].get_float(); // QuadSurface takes a single float
         return true;
     }
     return false;
 }
 
 // If user overrides with --scale S, rewrite the json scale value (number or array)
-static void apply_scale_override(json& scale_json, float S) {
+static void apply_scale_override(Json& scale_json, float S) {
     if (scale_json.is_null()) { scale_json = S; return; }
     if (scale_json.is_number()) { scale_json = S; return; }
     if (scale_json.is_array()) {
@@ -101,18 +101,16 @@ static void apply_scale_override(json& scale_json, float S) {
 }
 
 static bool load_bounds_and_scale(const fs::path& p, Bounds& b,
-                                  json& scale_json_out, float& scale_for_save_out,
+                                  Json& scale_json_out, float& scale_for_save_out,
                                   std::string* why=nullptr)
 {
     if (!path_is_regular_file(p)) {
         if (why) *why = "bounds path is not a regular file (did you pass a directory?)";
         return false;
     }
-    std::ifstream f(p);
-    if (!f) { if (why) *why = "cannot open file"; return false; }
 
-    json j;
-    try { f >> j; }
+    Json j;
+    try { j = Json::parse_file(p); }
     catch (const std::exception& ex) { if (why) *why = std::string("json parse error: ") + ex.what(); return false; }
 
     auto arr_ok = [&](const char* key) {
@@ -127,8 +125,8 @@ static bool load_bounds_and_scale(const fs::path& p, Bounds& b,
         const auto& a = j["bbox"][0];
         const auto& c = j["bbox"][1];
 
-        float x0 = a[0].get<float>(), y0 = a[1].get<float>(), z0 = a[2].get<float>();
-        float x1 = c[0].get<float>(), y1 = c[1].get<float>(), z1 = c[2].get<float>();
+        float x0 = a[0].get_float(), y0 = a[1].get_float(), z0 = a[2].get_float();
+        float x1 = c[0].get_float(), y1 = c[1].get_float(), z1 = c[2].get_float();
 
         b.minx = std::min(x0, x1);  b.maxx = std::max(x0, x1);
         b.miny = std::min(y0, y1);  b.maxy = std::max(y0, y1);
@@ -136,12 +134,12 @@ static bool load_bounds_and_scale(const fs::path& p, Bounds& b,
     }
     // 2) { "min":[...], "max":[...] }
     else if (arr_ok("min") && arr_ok("max")) {
-        b.minx = j["min"][0].get<float>();
-        b.miny = j["min"][1].get<float>();
-        b.minz = j["min"][2].get<float>();
-        b.maxx = j["max"][0].get<float>();
-        b.maxy = j["max"][1].get<float>();
-        b.maxz = j["max"][2].get<float>();
+        b.minx = j["min"][0].get_float();
+        b.miny = j["min"][1].get_float();
+        b.minz = j["min"][2].get_float();
+        b.maxx = j["max"][0].get_float();
+        b.maxy = j["max"][1].get_float();
+        b.maxz = j["max"][2].get_float();
         if (b.minx > b.maxx) std::swap(b.minx, b.maxx);
         if (b.miny > b.maxy) std::swap(b.miny, b.maxy);
         if (b.minz > b.maxz) std::swap(b.minz, b.maxz);
@@ -149,12 +147,12 @@ static bool load_bounds_and_scale(const fs::path& p, Bounds& b,
     // 3) flat keys
     else if (j.contains("min_x") && j.contains("min_y") && j.contains("min_z") &&
              j.contains("max_x") && j.contains("max_y") && j.contains("max_z")) {
-        b.minx = j["min_x"].get<float>();
-        b.miny = j["min_y"].get<float>();
-        b.minz = j["min_z"].get<float>();
-        b.maxx = j["max_x"].get<float>();
-        b.maxy = j["max_y"].get<float>();
-        b.maxz = j["max_z"].get<float>();
+        b.minx = j["min_x"].get_float();
+        b.miny = j["min_y"].get_float();
+        b.minz = j["min_z"].get_float();
+        b.maxx = j["max_x"].get_float();
+        b.maxy = j["max_y"].get_float();
+        b.maxz = j["max_z"].get_float();
         if (b.minx > b.maxx) std::swap(b.minx, b.maxx);
         if (b.miny > b.maxy) std::swap(b.miny, b.maxy);
         if (b.minz > b.maxz) std::swap(b.minz, b.maxz);
@@ -175,27 +173,27 @@ static bool load_bounds_and_scale(const fs::path& p, Bounds& b,
 static bool patch_target_meta(const fs::path& target_dir,
                               const std::string& new_uuid,
                               const Bounds& B,
-                              const json& scale_json,   // preserved (or overridden) json value
+                              const Json& scale_json,   // preserved (or overridden) json value
                               std::string source_png_basename,
                               std::string* err = nullptr)
 {
     const fs::path meta_path = target_dir / "meta.json";
-    json j;
+    Json j;
 
     try {
-        std::ifstream in(meta_path);
-        if (!in) { if (err) *err = "cannot open " + meta_path.string(); return false; }
-        in >> j;
+        j = Json::parse_file(meta_path);
     } catch (const std::exception& ex) {
         if (err) *err = std::string("parse error in ") + meta_path.string() + ": " + ex.what();
         return false;
     }
 
     j["uuid"] = new_uuid;
-    j["bbox"] = json::array({
-        json::array({B.minx, B.miny, B.minz}),
-        json::array({B.maxx, B.maxy, B.maxz})
-    });
+    {
+        Json inner1 = Json::array(); inner1.push_back(B.minx); inner1.push_back(B.miny); inner1.push_back(B.minz);
+        Json inner2 = Json::array(); inner2.push_back(B.maxx); inner2.push_back(B.maxy); inner2.push_back(B.maxz);
+        Json bbox = Json::array(); bbox.push_back(std::move(inner1)); bbox.push_back(std::move(inner2));
+        j["bbox"] = std::move(bbox);
+    }
 
     // Preserve exact shape/type of scale if provided
     if (!scale_json.is_null()) {
@@ -221,7 +219,7 @@ static bool copy_and_patch_jsons(const fs::path& src_dir,
                                  const fs::path& dst_dir,
                                  const std::string& new_uuid,
                                  const Bounds& B,
-                                 const json& scale_json, // preserved (or overridden)
+                                 const Json& scale_json, // preserved (or overridden)
                                  const std::string& source_png_basename,
                                  std::string* err = nullptr)
 {
@@ -236,11 +234,9 @@ static bool copy_and_patch_jsons(const fs::path& src_dir,
         if (e.path().extension() != ".json") continue;
         if (e.path().filename() == "meta.json") continue; // don't clobber our meta.json
 
-        json j;
+        Json j;
         try {
-            std::ifstream in(e.path());
-            if (!in) { if (err) *err = "cannot open " + e.path().string(); return false; }
-            in >> j;
+            j = Json::parse_file(e.path());
         } catch (const std::exception& ex) {
             if (err) *err = std::string("parse error in ") + e.path().string() + ": " + ex.what();
             return false;
@@ -249,10 +245,10 @@ static bool copy_and_patch_jsons(const fs::path& src_dir,
         if (j.contains("uuid")) j["uuid"] = new_uuid;
 
         if (j.contains("bbox") && j["bbox"].is_array() && j["bbox"].size() == 2) {
-            j["bbox"] = {
-                {B.minx, B.miny, B.minz},
-                {B.maxx, B.maxy, B.maxz}
-            };
+            Json inner1 = Json::array(); inner1.push_back(B.minx); inner1.push_back(B.miny); inner1.push_back(B.minz);
+            Json inner2 = Json::array(); inner2.push_back(B.maxx); inner2.push_back(B.maxy); inner2.push_back(B.maxz);
+            Json bbox = Json::array(); bbox.push_back(std::move(inner1)); bbox.push_back(std::move(inner2));
+            j["bbox"] = std::move(bbox);
         }
 
         if (!scale_json.is_null() && j.contains("scale")) {
@@ -314,7 +310,7 @@ int main(int argc, char** argv) {
 
     // --- Bounds & (original) scale
     Bounds B;
-    json   scale_json = nullptr;
+    Json   scale_json = nullptr;
     float  scale_for_save = 1.0f;
 
     {

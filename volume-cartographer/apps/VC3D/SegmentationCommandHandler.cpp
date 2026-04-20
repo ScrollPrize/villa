@@ -13,6 +13,8 @@
 #include <memory>
 #include <filesystem>
 #include <limits>
+#include <mutex>
+#include <condition_variable>
 
 #include <QSettings>
 #include <QMessageBox>
@@ -59,13 +61,13 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/flattening/ABFFlattening.hpp"
-#include "vc/core/cache/TieredChunkCache.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/cache/ChunkKey.hpp"
 #include "vc/core/types/VcDataset.hpp"
 #include "ToolDialogs.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "elements/JsonProfilePresets.hpp"
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 
 // --------- locate executables (unified helper) --------------------------------
 
@@ -1362,7 +1364,7 @@ static std::vector<vc::cache::ChunkKey> collectRemoteChunkKeysForSurface(
 }
 
 static RemoteChunkFetchResult fetchRemoteChunkKeys(
-    vc::cache::TieredChunkCache* cache,
+    vc::cache::BlockPipeline* cache,
     const std::vector<vc::cache::ChunkKey>& keys,
     const std::shared_ptr<RemoteChunkFetchProgress>& progress)
 {
@@ -1381,14 +1383,33 @@ static RemoteChunkFetchResult fetchRemoteChunkKeys(
     result.initialAvailable = cache->countAvailable(keys);
     progress->availableKeys.store(result.initialAvailable, std::memory_order_relaxed);
 
-    cache->prefetch(keys);
+    // Use a condition_variable to wake up when chunks arrive instead of
+    // sleep-polling.  The cache fires its ChunkReadyCallback on the IO
+    // thread each time a chunk finishes; we signal the CV from there.
+    // BlockPipeline fires listeners from a snapshot taken under lock, so
+    // removeChunkReadyListener() does not stop an already-snapshotted call
+    // from running after we return. Keep the cv+mutex alive via shared_ptr
+    // so any in-flight callback can safely signal a no-op on a detached
+    // state rather than touch a destroyed stack variable.
+    struct WaitState {
+        std::mutex mtx;
+        std::condition_variable cv;
+    };
+    auto state = std::make_shared<WaitState>();
+    auto listenerId = cache->addChunkReadyListener(
+        [state](const vc::cache::ChunkKey&) { state->cv.notify_one(); });
+
+    cache->fetchInteractive(keys);
 
     size_t available = result.initialAvailable;
     size_t lastAvailable = available;
     int idleRetries = 0;
 
     while (available < keys.size()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        {
+            std::unique_lock<std::mutex> lk(state->mtx);
+            state->cv.wait_for(lk, std::chrono::milliseconds(200));
+        }
         available = cache->countAvailable(keys);
         const auto stats = cache->stats();
         progress->availableKeys.store(available, std::memory_order_relaxed);
@@ -1398,8 +1419,9 @@ static RemoteChunkFetchResult fetchRemoteChunkKeys(
 
         if (stats.ioPending == 0 && available == lastAvailable) {
             ++idleRetries;
-            cache->prefetch(keys);
+            cache->fetchInteractive(keys);
             if (idleRetries > 3) {
+                cache->removeChunkReadyListener(listenerId);
                 result.error = QObject::tr("Remote chunk fetch stalled at %1 / %2 chunks.")
                                    .arg(available).arg(keys.size());
                 return result;
@@ -1409,6 +1431,8 @@ static RemoteChunkFetchResult fetchRemoteChunkKeys(
         }
         lastAvailable = available;
     }
+
+    cache->removeChunkReadyListener(listenerId);
 
     result.success = true;
     result.fetchedKeys = keys.size() - result.initialAvailable;
@@ -1613,7 +1637,6 @@ void SegmentationCommandHandler::onFetchRemoteChunks(const std::string& segmentI
         progress.exec();
     }
     timer.stop();
-    watcher.waitForFinished();
 
     const auto result = watcher.result();
     if (!result.success) {
@@ -2263,8 +2286,8 @@ void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& s
         tempSurface = std::make_unique<QuadSurface>(croppedPoints, surface->scale());
         tempSurface->path = surface->path;
         tempSurface->id = surface->id;
-        if (surface->meta) {
-            tempSurface->meta = std::make_unique<nlohmann::json>(*surface->meta);
+        if (!surface->meta.is_null()) {
+            tempSurface->meta = surface->meta;
         }
         for (const auto& ch : croppedChannels) {
             tempSurface->setChannel(ch.name, ch.data);
@@ -2285,19 +2308,9 @@ void SegmentationCommandHandler::onCropSurfaceToValidRegion(const std::string& s
     }
     surface->invalidateCache();
 
-    if (tempSurface && tempSurface->meta) {
-        if (!surface->meta) {
-            surface->meta = std::make_unique<nlohmann::json>(*tempSurface->meta);
-        } else {
-            *surface->meta = *tempSurface->meta;
-        }
-        if (surface->meta) {
-            if (surf->meta) {
-                *surf->meta = *surface->meta;
-            } else {
-                surf->meta = std::make_unique<nlohmann::json>(*surface->meta);
-            }
-        }
+    if (tempSurface && !tempSurface->meta.is_null()) {
+        surface->meta = tempSurface->meta;
+        surf->meta = surface->meta;
     }
 
     // Bbox will be recalculated lazily (invalidateCache was already called)
@@ -4182,11 +4195,6 @@ void SegmentationCommandHandler::onRenameSurface(const QString& segmentId)
     std::string oldUuid = seg->id();
 
     // === Clean up the segment before renaming ===
-
-    // Wait for any pending index rebuild
-    if (_waitForIndexRebuildCallback) {
-        _waitForIndexRebuildCallback();
-    }
 
     // Clear from surface collection (including "segmentation" if it matches)
     if (_state) {

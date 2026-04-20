@@ -9,7 +9,7 @@
 #include <utility>
 #include <vector>
 
-#include <nlohmann/json_fwd.hpp>
+#include "utils/Json.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -188,7 +188,7 @@ struct SegmentationGrowthRequest {
     SegmentationCorrectionsPayload corrections;
     std::optional<std::pair<int, int>> correctionsZRange;
     std::vector<SegmentationDirectionFieldConfig> directionFields;
-    std::optional<nlohmann::json> customParams;
+    utils::Json customParams;
     bool inpaintOnly{false};
     // Extrapolation parameters
     int extrapolationPointCount{7};

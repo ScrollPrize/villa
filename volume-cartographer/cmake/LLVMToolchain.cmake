@@ -107,51 +107,70 @@ else()
     set(VC_THINLTO_CACHE_FLAGS "-Wl,--thinlto-cache-dir=${VC_THINLTO_CACHE_DIR} -Wl,--thinlto-cache-policy=cache_size_bytes=1g")
     set(VC_STRIP_FLAGS "-Wl,--strip-all")
 endif()
-
-# ---- Developer warnings ------------------------------------------------------
-if(VC_DEVELOPER_WARNINGS)
-    add_compile_options(
-        -Wall -Wextra -pedantic
-        -Wattributes -Wcast-align -Wcast-qual -Wchar-subscripts -Wcomment
-        -Wconversion -Wdelete-incomplete -Wdelete-non-virtual-dtor
-        -Wenum-compare -Wmain -Wmissing-field-initializers -Wmissing-noreturn
-        -Wold-style-cast -Woverloaded-virtual -Wpointer-arith
-        -Wtautological-compare -Wundef -Wuninitialized -Wunreachable-code
-        -Wunused -Wvla -Wunused-parameter
-        # -Weverything with sensible exclusions
-        -Weverything
-        # Compatibility (we use C++23)
-        -Wno-c++98-compat -Wno-c++98-compat-pedantic
-        -Wno-c++98-compat-local-type-template-args
-        -Wno-c++98-compat-unnamed-type-template-args
-        -Wno-c++98-compat-extra-semi
-        -Wno-c++11-compat -Wno-c++14-compat -Wno-c++17-compat -Wno-c++20-compat
-        -Wno-pre-c++14-compat -Wno-pre-c++17-compat
-        -Wno-pre-c++20-compat -Wno-pre-c++23-compat -Wno-pre-c++26-compat
-        # Noisy/unhelpful
-        -Wno-padded
-        -Wno-global-constructors -Wno-exit-time-destructors
-        -Wno-covered-switch-default -Wno-switch-enum
-        -Wno-float-equal
-        -Wno-missing-prototypes -Wno-missing-variable-declarations
-        -Wno-documentation -Wno-documentation-unknown-command
-        -Wno-shadow -Wno-shadow-field -Wno-shadow-field-in-constructor
-        -Wno-shadow-uncaptured-local
-        -Wno-implicit-int-conversion -Wno-implicit-float-conversion
-        -Wno-implicit-int-float-conversion -Wno-shorten-64-to-32
-        -Wno-sign-conversion -Wno-double-promotion
-        -Wno-disabled-macro-expansion -Wno-reserved-macro-identifier
-        -Wno-reserved-identifier
-        -Wno-newline-eof -Wno-extra-semi-stmt -Wno-extra-semi
-        -Wno-unsafe-buffer-usage -Wno-unsafe-buffer-usage-in-libc-call
-        -Wno-unsafe-buffer-usage-in-container
-        -Wno-weak-vtables -Wno-packed -Wno-missing-braces
-        -Wno-unused-template -Wno-unused-member-function
-        -Wno-ctad-maybe-unsupported -Wno-undefined-reinterpret-cast
-        -Wno-format-nonliteral
-        -Wno-nested-anon-types -Wno-gnu-anonymous-struct
-        -Wno-nan-infinity-disabled -Wno-switch-default
-        -Wno-thread-safety-negative -Wno-nrvo -Wno-unused-lambda-capture
-    )
-    message(STATUS "Developer warnings enabled (-Weverything with sensible exclusions)")
+option(VC_STRIP_BINARIES "Strip release binaries (disable for profiling)" ON)
+if(NOT VC_STRIP_BINARIES)
+    set(VC_STRIP_FLAGS "")
 endif()
+
+option(VC_VECTORIZATION_REPORT "Emit clang vectorization remarks during compile" OFF)
+if(VC_VECTORIZATION_REPORT)
+    add_compile_options(
+        -Rpass=loop-vectorize
+        -Rpass-missed=loop-vectorize
+        -Rpass-analysis=loop-vectorize
+        -Rpass=slp-vectorize
+        -Rpass-missed=slp-vectorize
+        -fsave-optimization-record
+    )
+    # ThinLTO defers vectorization to the link step; stream remarks from lld
+    # via llvm -mllvm flags. stderr carries each remark as it fires.
+    add_link_options(
+        -Wl,-mllvm,-pass-remarks=loop-vectorize
+        -Wl,-mllvm,-pass-remarks-missed=loop-vectorize
+        -Wl,-mllvm,-pass-remarks-analysis=loop-vectorize
+        -Wl,-mllvm,-pass-remarks=slp-vectorize
+        -Wl,-mllvm,-pass-remarks-missed=slp-vectorize
+    )
+    message(STATUS "Clang vectorization remarks enabled (compile + LTO link)")
+endif()
+
+add_compile_options(
+    -Weverything
+    # --- Noise: suppress (harmless, unfixable, or style-only) ---
+    -Wno-padded
+    -Wno-unsafe-buffer-usage -Wno-unsafe-buffer-usage-in-libc-call -Wno-unsafe-buffer-usage-in-container
+    -Wno-ctad-maybe-unsupported
+    -Wno-disabled-macro-expansion
+    -Wno-exit-time-destructors -Wno-global-constructors
+    -Wno-newline-eof -Wno-extra-semi -Wno-extra-semi-stmt
+    -Wno-weak-vtables -Wno-packed
+    -Wno-nrvo
+    -Wno-missing-prototypes -Wno-missing-variable-declarations
+    -Wno-reserved-identifier -Wno-reserved-macro-identifier
+    -Wno-covered-switch-default -Wno-switch-enum -Wno-switch-default
+    -Wno-source-uses-openmp
+    -Wno-old-style-cast
+    -Wno-zero-as-null-pointer-constant
+    -Wno-format-nonliteral
+    -Wno-comment
+    -Wno-documentation -Wno-documentation-unknown-command
+    -Wno-comma
+    -Wno-c++98-compat -Wno-c++98-compat-pedantic
+    -Wno-c++98-compat-local-type-template-args -Wno-c++98-compat-unnamed-type-template-args
+    -Wno-c++98-compat-extra-semi
+    -Wno-c++11-compat -Wno-c++14-compat -Wno-c++17-compat -Wno-c++20-compat
+    -Wno-pre-c++14-compat -Wno-pre-c++17-compat
+    -Wno-pre-c++20-compat -Wno-pre-c++23-compat -Wno-pre-c++26-compat
+    -Wno-nested-anon-types -Wno-gnu-anonymous-struct
+    # --- Keep enabled: correctness and performance warnings ---
+    # -Wsign-conversion -Wdouble-promotion -Wimplicit-int-float-conversion
+    # -Wfloat-equal -Wimplicit-float-conversion -Wfloat-conversion
+    # -Wshorten-64-to-32 -Wimplicit-int-conversion
+    # -Wshadow -Wshadow-field -Wshadow-field-in-constructor -Wshadow-uncaptured-local
+    # -Wunused-variable -Wunused-function -Wunused-parameter
+    # -Wsuggest-override -Wsuggest-destructor-override
+    # -Wreorder-ctor -Wconditional-uninitialized
+    # -Wrange-loop-bind-reference -Wunused-but-set-variable
+    # -Wmisleading-indentation -Wsign-compare
+)
+message(STATUS "Developer warnings enabled (-Weverything with sensible exclusions)")

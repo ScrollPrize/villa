@@ -2,6 +2,12 @@
 
 #include "Keybinds.hpp"
 
+// Qt compat: stateChanged(int) works on all Qt6 versions.
+// Lambda bridges to Qt::CheckState for the slot signature.
+#define CONNECT_CHECK_STATE(checkbox, receiver, slot) \
+    connect(checkbox, &QCheckBox::stateChanged, receiver, \
+            [receiver](int s) { receiver->slot(static_cast<Qt::CheckState>(s)); })
+
 #include <QStandardItem>
 #include <stdexcept>
 #include <vector>
@@ -15,8 +21,8 @@
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 
-#include <fstream>
-#include <nlohmann/json.hpp>
+#include <filesystem>
+#include "utils/Json.hpp"
 
 #include "vc/ui/VCCollection.hpp"
 
@@ -122,7 +128,7 @@ void CPointCollectionWidget::setupUi()
 
     layout->addWidget(_collection_metadata_group);
  
-    connect(_absolute_winding_checkbox, &QCheckBox::stateChanged, this, &CPointCollectionWidget::onAbsoluteWindingChanged);
+    CONNECT_CHECK_STATE(_absolute_winding_checkbox, this, onAbsoluteWindingChanged);
     connect(_color_button, &QPushButton::clicked, this, &CPointCollectionWidget::onColorButtonClicked);
     connect(_fill_winding_plus_button, &QPushButton::clicked, this, &CPointCollectionWidget::onFillWindingPlusClicked);
     connect(_fill_winding_minus_button, &QPushButton::clicked, this, &CPointCollectionWidget::onFillWindingMinusClicked);
@@ -150,7 +156,7 @@ void CPointCollectionWidget::setupUi()
 
     layout->addWidget(_point_metadata_group);
  
-    connect(_winding_enabled_checkbox, &QCheckBox::stateChanged, this, &CPointCollectionWidget::onWindingEnabledChanged);
+    CONNECT_CHECK_STATE(_winding_enabled_checkbox, this, onWindingEnabledChanged);
     connect(_winding_spinbox, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, &CPointCollectionWidget::onWindingEdited);
  
     layout->addStretch();
@@ -569,7 +575,7 @@ void CPointCollectionWidget::onNewNameClicked()
     selectCollection(new_id);
 }
 
-void CPointCollectionWidget::onAbsoluteWindingChanged(int state)
+void CPointCollectionWidget::onAbsoluteWindingChanged(Qt::CheckState state)
 {
     if (_selected_collection_id != 0) {
         const auto& collections = _point_collection->getAllCollections();
@@ -607,7 +613,7 @@ void CPointCollectionWidget::onWindingEdited(double value)
     }
 }
 
-void CPointCollectionWidget::onWindingEnabledChanged(int state)
+void CPointCollectionWidget::onWindingEnabledChanged(Qt::CheckState state)
 {
     if (_selected_point_id != 0) {
         auto point_opt = _point_collection->getPoint(_selected_point_id);
@@ -769,39 +775,44 @@ void CPointCollectionWidget::loadCorrPointsResults(const std::filesystem::path& 
     }
 
     try {
-        std::ifstream ifs(jsonPath);
-        if (!ifs.is_open()) {
+        if (!std::filesystem::exists(jsonPath)) {
             refreshTree();
             return;
         }
-        nlohmann::json j = nlohmann::json::parse(ifs);
+        utils::Json j = utils::Json::parse_file(jsonPath);
 
         if (j.contains("points") && j["points"].is_object()) {
-            for (auto& [key, val] : j["points"].items()) {
+            const auto& points = j["points"];
+            for (auto it = points.begin(); it != points.end(); ++it) {
+                const std::string key = it.key();
+                const auto& val = *it;
                 uint64_t pid = 0;
                 try { pid = std::stoull(key); } catch (...) { continue; }
                 CorrPointResult r;
                 if (val.contains("winding_obs") && val["winding_obs"].is_number()) {
-                    r.winding_obs = val["winding_obs"].get<float>();
+                    r.winding_obs = val["winding_obs"].get_float();
                 }
                 if (val.contains("winding_err") && val["winding_err"].is_number()) {
-                    r.winding_err = val["winding_err"].get<float>();
+                    r.winding_err = val["winding_err"].get_float();
                 }
                 if (val.contains("p") && val["p"].is_array() && val["p"].size() >= 3) {
-                    r.p[0] = val["p"][0].get<float>();
-                    r.p[1] = val["p"][1].get<float>();
-                    r.p[2] = val["p"][2].get<float>();
+                    r.p[0] = val["p"][0].get_float();
+                    r.p[1] = val["p"][1].get_float();
+                    r.p[2] = val["p"][2].get_float();
                 }
                 _corr_point_results[pid] = r;
             }
         }
 
         if (j.contains("collection_avgs") && j["collection_avgs"].is_object()) {
-            for (auto& [key, val] : j["collection_avgs"].items()) {
+            const auto& avgs = j["collection_avgs"];
+            for (auto it = avgs.begin(); it != avgs.end(); ++it) {
+                const std::string key = it.key();
+                const auto& val = *it;
                 uint64_t cid = 0;
                 try { cid = std::stoull(key); } catch (...) { continue; }
                 if (val.is_number()) {
-                    _corr_collection_avgs[cid] = val.get<float>();
+                    _corr_collection_avgs[cid] = val.get_float();
                 }
             }
         }

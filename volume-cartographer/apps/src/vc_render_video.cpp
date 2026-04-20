@@ -1,8 +1,6 @@
-#include <nlohmann/json.hpp>
+#include <iostream>
+#include "utils/Json.hpp"
 
-#include <xtensor/containers/xarray.hpp>
-#include <xtensor/io/xio.hpp>
-#include <xtensor/views/xview.hpp>
 
 #include "vc/core/types/VcDataset.hpp"
 
@@ -12,7 +10,7 @@
 #include <opencv2/videoio.hpp>
 
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/cache/SimpleCacheFactory.hpp"
+#include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 
@@ -22,10 +20,9 @@
 #include "vc/core/util/StreamOperators.hpp"
 
 using shape = std::vector<size_t>;
-using namespace xt::placeholders;
 
 
-using json = nlohmann::json;
+using Json = utils::Json;
 
 
 
@@ -98,7 +95,7 @@ int main(int argc, char *argv[])
 
     cv::Size tgt_size = {3840, 2160};
 
-    auto chunk_cache = vc::cache::createSimpleTieredCache(ds.get(), 10e9, ds->path());
+    auto chunk_cache = vc::cache::openFilesystemPipeline(ds.get(), 10e9, ds->path());
 
     cv::VideoWriter vid(tgt_fn, cv::VideoWriter::fourcc('H','F','Y','U'), 5, tgt_size);
 

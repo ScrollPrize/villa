@@ -4,6 +4,7 @@
 #include <QString>
 #include <QFutureWatcher>
 
+#include <atomic>
 #include <functional>
 #include <memory>
 #include <string>
@@ -13,10 +14,12 @@
 #include <opencv2/core.hpp>
 
 #include "vc/core/util/SurfacePatchIndex.hpp"
-#include "tiled/RenderPool.hpp"
 
 class QMdiArea;
-class CTiledVolumeViewer;
+class CAdaptiveVolumeViewer;
+#ifndef CTiledVolumeViewer
+#define CTiledVolumeViewer CAdaptiveVolumeViewer
+#endif
 class CState;
 class VCCollection;
 class SegmentationOverlayController;
@@ -46,7 +49,6 @@ public:
                                      QMdiArea* mdiArea);
 
     const std::vector<CTiledVolumeViewer*>& viewers() const { return _viewers; }
-    RenderPool* renderPool() { return &_renderPool; }
 
     void setSegmentationOverlay(SegmentationOverlayController* overlay);
     SegmentationOverlayController* segmentationOverlay() const { return _segmentationOverlay; }
@@ -106,7 +108,12 @@ public:
     SurfacePatchIndex* surfacePatchIndex();
     void refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface);
     void refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface, const cv::Rect& changedRegion);
-    void waitForPendingIndexRebuild();
+
+    // Stop maintaining the SurfacePatchIndex. Any subsequent
+    // surfaceWillBeDeleted signals will be ignored instead of triggering
+    // an O(N) rtree removal. Intended to be called from the close path so
+    // that tearing down thousands of cells doesn't block app exit.
+    void beginShutdown() noexcept { _shuttingDown = true; }
 
 signals:
     void viewerCreated(CTiledVolumeViewer* viewer);
@@ -126,8 +133,6 @@ private:
 
     CState* _state;
     VCCollection* _points;
-    RenderPool _renderPool;  // shared across all viewers
-    // Cache is obtained from Volume::tieredCache()
     SegmentationOverlayController* _segmentationOverlay{nullptr};
     PointsOverlayController* _pointsOverlay{nullptr};
     RawPointsOverlayController* _rawPointsOverlay{nullptr};
@@ -157,6 +162,7 @@ private:
     int _surfacePatchSamplingStride{1};
     bool _surfacePatchStrideUserSet{false};
     int _targetRefinedStride{0};  // 0 = no refinement pending
+    std::atomic<bool> _shuttingDown{false};
     int _intersectionMaxSurfaces{0};  // 0 = unlimited
 
     VolumeOverlayController* _volumeOverlay{nullptr};
@@ -168,6 +174,10 @@ private:
     std::vector<std::string> _surfacesQueuedDuringRebuildIds;
     std::vector<std::pair<std::string, std::shared_ptr<Surface>>> _surfacesQueuedForRemovalDuringRebuild;
     QFutureWatcher<std::shared_ptr<SurfacePatchIndex>>* _surfacePatchIndexWatcher{nullptr};
+
+    // Surfaces currently pinned in the LRU as "highlighted/visible".
+    // We track them so we can unpin the right set when highlights change.
+    std::vector<std::shared_ptr<QuadSurface>> _pinnedHighlightSurfaces;
 
     void rebuildSurfacePatchIndexIfNeeded();
 };

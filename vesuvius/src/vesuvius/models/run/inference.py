@@ -21,6 +21,27 @@ from vesuvius.models.run.tta import infer_with_tta
 from vesuvius.utils.k8s import get_tqdm_kwargs
 
 
+class _InferenceDeepSupervisionWrapper(torch.nn.Module):
+    """Collapse multi-scale train-time outputs to highest-resolution inference outputs."""
+
+    def __init__(self, network: torch.nn.Module):
+        super().__init__()
+        self.network = network
+        self.final_config = getattr(network, "final_config", None)
+
+    def _collapse(self, output):
+        if isinstance(output, dict):
+            return {key: self._collapse(value) for key, value in output.items()}
+        if isinstance(output, (list, tuple)):
+            if not output:
+                return output
+            return self._collapse(output[0])
+        return output
+
+    def forward(self, *args, **kwargs):
+        return self._collapse(self.network(*args, **kwargs))
+
+
 class Inferer():
     def __init__(self,
                  model_path: str = None,
@@ -328,6 +349,7 @@ class Inferer():
                 self.train_batch_size = model_config.get('train_batch_size', model_config.get('batch_size', 2))
                 self.in_channels = model_config.get('in_channels', 1)
                 self.autoconfigure = model_config.get('autoconfigure', False)
+                self.enable_deep_supervision = bool(model_config.get('enable_deep_supervision', False))
                 self.model_name = model_config.get('model_name', 'Model')
                 
                 # Set spacing based on patch size dimensions
@@ -363,6 +385,11 @@ class Inferer():
         model.load_state_dict(model_state_dict, strict=True)
         if self.verbose:
             print("Model weights loaded successfully")
+
+        if getattr(mgr, "enable_deep_supervision", False):
+            model = _InferenceDeepSupervisionWrapper(model)
+            if self.verbose:
+                print("Wrapped deep-supervision model for plain inference outputs")
 
         # Compile model for CUDA inference (provides 10-30% speedup via kernel fusion)
         # Note: 'reduce-overhead' mode uses CUDA graphs which can cause tensor reuse issues
@@ -671,19 +698,22 @@ class Inferer():
             except Exception as e:
                 raise RuntimeError(f"Failed to write patch at index {write_index}: {str(e)}")
 
+        def to_device(tensor):
+            return tensor.to(self.device, non_blocking=(self.device.type == 'cuda'))
+
         with tqdm(total=self.num_total_patches, desc=f"Inferring Part {self.part_id}", **get_tqdm_kwargs()) as pbar:
             with ThreadPoolExecutor(max_workers=max_workers) as executor:
                 futures = []
                 
                 for batch_data in self.dataloader:
                     if isinstance(batch_data, dict):
-                        input_batch = batch_data['data'].to(self.device)
+                        input_batch = to_device(batch_data['data'])
                         is_empty_flags = batch_data.get('is_empty', [False] * input_batch.shape[0])
                     elif isinstance(batch_data, (list, tuple)):
-                        input_batch = batch_data[0].to(self.device)
+                        input_batch = to_device(batch_data[0])
                         is_empty_flags = [False] * input_batch.shape[0]
                     else:
-                        input_batch = batch_data.to(self.device)
+                        input_batch = to_device(batch_data)
                         is_empty_flags = [False] * input_batch.shape[0]
                     
                     # the case that the batch is empty is valid, e.g. when the input volume is smaller than the patch size
@@ -694,7 +724,8 @@ class Inferer():
                     
                     batch_size = input_batch.shape[0]
                     output_shape = (batch_size, self.num_classes, *self.patch_size)
-                    output_batch = torch.zeros(output_shape, device=self.device, dtype=input_batch.dtype)
+                    output_dtype = torch.float16 if self.device.type == 'cuda' else input_batch.dtype
+                    output_batch = torch.zeros(output_shape, device=self.device, dtype=output_dtype)
                     
                     # Find non-empty patches that need model inference
                     non_empty_indices = [i for i, is_empty in enumerate(is_empty_flags) if not is_empty]
@@ -703,7 +734,7 @@ class Inferer():
                     if non_empty_indices:
                         non_empty_input = input_batch[non_empty_indices]
                         
-                        with torch.no_grad(), torch.amp.autocast('cuda'):
+                        with torch.inference_mode(), torch.amp.autocast('cuda'):
                             if self.do_tta:
                                 non_empty_output = infer_with_tta(
                                     self.model,
@@ -716,6 +747,7 @@ class Inferer():
                                 non_empty_output = self.model(non_empty_input)
                                 if self.is_multi_task:
                                     non_empty_output = self._concat_multi_task_outputs(non_empty_output)
+                        non_empty_output = non_empty_output.to(dtype=output_batch.dtype)
 
                         # Place non-empty patch outputs in the correct positions
                         for idx, original_idx in enumerate(non_empty_indices):
@@ -725,7 +757,7 @@ class Inferer():
                         if self.verbose:
                             print("Batch contains only empty patches, skipping model inference")
 
-                    output_np = output_batch.cpu().numpy().astype(np.float16)
+                    output_np = self._finalize_output_batch(output_batch)
                     current_batch_size = output_np.shape[0]
 
                     patch_indices = batch_data.get('index', list(range(current_batch_size)))
@@ -762,6 +794,11 @@ class Inferer():
         
         if self.current_patch_write_index != self.num_total_patches:
             print(f"Warning: Expected {self.num_total_patches} patches, but wrote {self.current_patch_write_index}.")
+
+    def _finalize_output_batch(self, output_batch):
+        if output_batch.dtype != torch.float16:
+            output_batch = output_batch.to(dtype=torch.float16)
+        return output_batch.cpu().numpy()
 
     def _run_inference(self):
         if self.verbose: print("Loading model...")

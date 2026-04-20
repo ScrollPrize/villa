@@ -1,6 +1,5 @@
 #pragma once
 
-#include <QImage>
 #include <QString>
 #include <opencv2/core.hpp>
 
@@ -8,37 +7,33 @@
 #include <string>
 #include <vector>
 
+#include "vc/core/render/Colormaps.hpp"
+
 namespace volume_viewer_cmaps
 {
 
-enum class OverlayColormapKind { OpenCv, Tint, DiscreteLut };
-enum class ColormapAudience { Shared, OverlayOnly };
-enum class EntryScope { SharedOnly, OverlayCompatible };
+// Re-export core types under the app-level namespace for backward compatibility.
+using vc::OverlayColormapKind;
+using vc::ColormapAudience;
+using vc::EntryScope;
+using vc::OverlayColormapSpec;
 
-struct OverlayColormapSpec
-{
-    std::string id;
-    QString label;
-    OverlayColormapKind kind;
-    ColormapAudience audience;
-    int opencvCode;
-    cv::Vec3f tint; // R, G, B in [0,1]
-    const uint32_t* discreteLut;
-};
-
+// Qt-specific entry with QString label for UI comboboxes.
 struct OverlayColormapEntry
 {
     QString label;
     std::string id;
 };
 
-const std::vector<OverlayColormapSpec>& specs();
-const OverlayColormapSpec& resolve(const std::string& id);
+// Re-export core functions.
+inline const std::vector<OverlayColormapSpec>& specs() noexcept { return vc::specs(); }
+inline const OverlayColormapSpec& resolve(const std::string& id) { return vc::resolve(id); }
+inline void makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& spec,
+                       uint32_t* outBuf, int outStride) {
+    vc::makeColors(values, spec, outBuf, outStride);
+}
 
-// Apply colormap and write directly into a QImage::Format_RGB32 buffer.
-// Avoids intermediate cv::Mat BGR and eliminates cvtColor conversions.
-QImage makeColors(const cv::Mat_<uint8_t>& values, const OverlayColormapSpec& spec);
-
+// Build Qt-specific entry lists with QString labels for UI comboboxes.
 const std::vector<OverlayColormapEntry>& entries(EntryScope scope = EntryScope::OverlayCompatible);
 
 } // namespace volume_viewer_cmaps

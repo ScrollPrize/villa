@@ -1,109 +1,87 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <cstdint>
+#include <deque>
 #include <functional>
+#include <mutex>
+#include <condition_variable>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "ChunkKey.hpp"
-#include <utils/priority_queue.hpp>
 
 namespace vc::cache {
 
-// Background I/O thread pool for async chunk fetching.
-// Tasks are prioritized: coarser pyramid level = higher priority.
-// Duplicate submissions for the same key are deduplicated.
+// Shard-level IO pool for interactive chunk fetches.
 //
-// Internally uses utils::DeduplicatingPriorityQueue for thread-safe
-// dedup + priority ordering, and std::jthread workers running consume_loop.
+// Work items are shards (or individual chunks for non-sharded datasets).
+// Callers submit ChunkKeys; the pool maps them to ShardKeys via a
+// caller-provided ShardMapper and deduplicates at the shard level.
 class IOPool {
 public:
-    // Callback signature: called from a worker thread when a chunk is fetched.
-    // (key, compressed bytes) — empty bytes means fetch failed.
-    using CompletionCallback =
-        std::function<void(const ChunkKey&, std::vector<uint8_t>&&)>;
+    using FetchResult = std::vector<std::pair<ChunkKey, std::vector<uint8_t>>>;
+    using FetchFunc = std::function<FetchResult(const ShardKey&)>;
 
-    // FetchFunc: the actual data fetching function (wraps ChunkSource::fetch).
-    // Called from worker threads. Must be thread-safe.
-    using FetchFunc = std::function<std::vector<uint8_t>(const ChunkKey&)>;
+    using CompletionCallback = std::function<void(FetchResult&&)>;
 
-    explicit IOPool(int numThreads = 4, size_t maxQueueSize = 1000);
+    using ShardMapper = std::function<ShardKey(const ChunkKey&)>;
+
+    explicit IOPool(int numThreads = 4);
     ~IOPool();
 
-    // Start worker threads. Must be called after setFetchFunc/setCompletionCallback.
     void start();
 
     IOPool(const IOPool&) = delete;
     IOPool& operator=(const IOPool&) = delete;
 
-    // Set the fetch function (typically wraps ChunkSource + DiskStore lookup).
+    void setShardMapper(ShardMapper fn);
     void setFetchFunc(FetchFunc fn);
-
-    // Set the completion callback (called from worker thread).
     void setCompletionCallback(CompletionCallback cb);
 
-    // Set the current epoch. Tasks from the current epoch get higher priority.
-    void setCurrentEpoch(uint64_t epoch);
-
-    // Submit a chunk for background fetching.
-    // Deduplicates: if the key is already queued or in-flight, this is a no-op.
-    void submit(const ChunkKey& key);
-
-    // Submit multiple keys at once (batch, reduces lock contention).
-    // Uses backpressure: cancels pending tasks if queue would overflow.
     void submit(const std::vector<ChunkKey>& keys);
 
-    // Submit keys without cancel-on-overflow (for background prefetch).
-    // Silently drops keys that don't fit in the queue.
-    void submitBackground(const std::vector<ChunkKey>& keys);
+    // Update interactive viewport. New shards get queued; old queued shards
+    // not in the new set get dropped. targetLevel is the pyramid level the
+    // viewer is currently displaying at — popNext gives it the highest
+    // weight so the user reaches that resolution fastest, while levels
+    // adjacent to it still make steady progress.
+    void updateInteractive(const std::vector<ChunkKey>& keys, int targetLevel = 0);
 
-    // Cancel all pending (not in-flight) tasks.
     void cancelPending();
 
-    // Number of pending + in-flight tasks.
-    [[nodiscard]] size_t pendingCount() const;
+    [[nodiscard]] size_t pendingCount() const noexcept;
 
-    // Gracefully stop all workers. Blocks until all threads exit.
     void stop();
 
 private:
-    // Internal task type — stored in the priority queue.
-    struct Task {
-        ChunkKey key;
-        uint64_t seq = 0;
-        uint64_t epoch = 0;
+    ShardKey popNext();
 
-        // Priority ordering: coarser level first, then newer epoch, then FIFO.
-        bool operator>(const Task& o) const noexcept
-        {
-            if (key.level != o.key.level) return key.level < o.key.level;
-            if (epoch != o.epoch) return epoch < o.epoch;
-            return seq > o.seq;
-        }
-    };
-
-    // Hash/Equal that operate only on the ChunkKey for dedup.
-    struct TaskHash {
-        size_t operator()(const Task& t) const noexcept {
-            return ChunkKeyHash()(t.key);
-        }
-    };
-    struct TaskEqual {
-        bool operator()(const Task& a, const Task& b) const noexcept {
-            return a.key == b.key;
-        }
-    };
-
-    using Queue = utils::DeduplicatingPriorityQueue<Task, TaskHash, TaskEqual, std::greater<Task>>;
-
+    ShardMapper shardMapper_;
     FetchFunc fetchFunc_;
     CompletionCallback onComplete_;
 
-    Queue queue_;
-    size_t maxQueueSize_;
-    std::atomic<uint64_t> nextSeq_{0};
-    std::atomic<uint64_t> currentEpoch_{0};
+    mutable std::mutex mutex_;
+    std::condition_variable cv_;
+
+    enum class ShardState : uint8_t { Queued, InFlight, Done };
+
+    std::unordered_map<ShardKey, ShardState, ShardKeyHash> shards_;
+    // One queue per pyramid level. popNext() drains the coarsest (highest
+    // level index) non-empty queue first, so low-res chunks stream in ahead
+    // of high-res for the same viewport.
+    std::array<std::deque<ShardKey>, kMaxLevels> queues_;
+    size_t queueTotal_ = 0;
+    // Per-level pops served so far. popNext picks the level with the
+    // smallest served/weight ratio among non-empty queues, yielding
+    // weighted round-robin instead of strict priority.
+    std::array<uint64_t, kMaxLevels> served_{};
+    // Zoom-target level; popNext weights levels by distance from this.
+    int targetLevel_ = 0;
+
+    bool shutdown_ = false;
 
     int numThreads_;
     std::vector<std::jthread> workers_;

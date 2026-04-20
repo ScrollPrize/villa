@@ -11,7 +11,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
-#include <nlohmann/json.hpp>
+#include "utils/Json.hpp"
 #include <boost/program_options.hpp>
 
 #include "vc/core/util/Surface.hpp"
@@ -23,7 +23,7 @@
 
 namespace po = boost::program_options;
 namespace fs = std::filesystem;
-using json = nlohmann::json;
+using Json = utils::Json;
 
 
 class SegmentRenderer {
@@ -398,9 +398,7 @@ private:
         } else if (source == "contributing" || source == "approved_patches" || source == "sequence") {
             fs::path meta_path = target_surf->path / "meta.json";
             if (fs::exists(meta_path)) {
-                std::ifstream meta_file(meta_path);
-                json meta_json;
-                meta_file >> meta_json;
+                Json meta_json = Json::parse_file(meta_path);
 
                 std::string json_key;
                 if (source == "contributing") {
@@ -412,7 +410,7 @@ private:
                 }
 
                 if (meta_json.contains(json_key)) {
-                    ids = meta_json[json_key].get<std::vector<std::string>>();
+                    ids = meta_json[json_key].get_string_array();
                 }
             }
         }

@@ -1,6 +1,6 @@
 #include "SegmentationModule.hpp"
 
-#include "tiled/CTiledVolumeViewer.hpp"
+#include "adaptive/CAdaptiveVolumeViewer.hpp"
 #include "tools/SegmentationBrushTool.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
 #include "tools/CellReoptimizationTool.hpp"
@@ -74,7 +74,7 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
 
     if (!event->isAutoRepeat()) {
         const bool undoRequested =
-            (event->matches(vc3d::keybinds::standard::Undo) == QKeySequence::ExactMatch) ||
+            event->matches(vc3d::keybinds::standard::Undo) ||
             (event->key() == vc3d::keybinds::keypress::SegmentationUndo.key &&
              (event->modifiers() & vc3d::keybinds::keypress::SegmentationUndo.modifiers) ==
                  vc3d::keybinds::keypress::SegmentationUndo.modifiers);

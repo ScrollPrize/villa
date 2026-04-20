@@ -90,9 +90,11 @@ public:
 
     void setRadius(float radiusSteps);
     void setSigma(float sigmaSteps);
+    void setEditScale(float scale);
 
     [[nodiscard]] float radius() const { return _radiusSteps; }
     [[nodiscard]] float sigma() const { return _sigmaSteps; }
+    [[nodiscard]] float editScale() const { return _editScale; }
 
     [[nodiscard]] bool hasPendingChanges() const { return _hasPendingEdits; }
     [[nodiscard]] const cv::Mat_<cv::Vec3f>& previewPoints() const;
@@ -149,6 +151,7 @@ private:
 
     float _radiusSteps{3.0f};
     float _sigmaSteps{1.5f};
+    float _editScale{1.0f};
     bool _hasPendingEdits{false};
     bool _pendingGrowthMarking{false};
 

@@ -1,0 +1,47 @@
+tr_setup:
+  model_name: "ps128_guided_dinovol_ink"
+
+tr_config:
+  patch_size: [128, 128, 128]
+  batch_size: 1
+  enable_deep_supervision: false
+  guide_loss_weight: 0.25
+  guide_supervision_target: "ink"
+
+model_config:
+  features_per_stage: [32, 64, 128, 256, 320]
+  n_stages: 5
+  n_blocks_per_stage: [1, 1, 1, 1, 1]
+  n_conv_per_stage_decoder: [1, 1, 1, 1]
+  kernel_sizes: [[3, 3, 3], [3, 3, 3], [3, 3, 3], [3, 3, 3], [3, 3, 3]]
+  strides: [[1, 1, 1], [2, 2, 2], [2, 2, 2], [2, 2, 2], [2, 2, 2]]
+  basic_encoder_block: "ConvBlock"
+  basic_decoder_block: "ConvBlock"
+  bottleneck_block: "BasicBlockD"
+  separate_decoders: true
+  input_shape: [128, 128, 128]
+  guide_backbone: "/home/giorgio/Projects/dino-vesuvius/dino-checkpoints/checkpoint_step_342500.pt"
+  guide_freeze: true
+  guide_tokenbook_tokens: 256
+  guide_tokenbook_dropout: 0.0
+  guide_tokenbook_sample_rate: 1.0
+  guide_tokenbook_ema_decay: null
+  guide_tokenbook_use_ema: false
+
+dataset_config:
+  min_labeled_ratio: 0.01
+  min_bbox_percent: 0.15
+  skip_patch_validation: false
+  normalization_scheme: "zscore"
+  ome_zarr_resolution: 0
+  bg_sampling_enabled: true
+  bg_to_fg_ratio: 0.10
+
+  targets:
+    ink:
+      out_channels: 2
+      activation: "none"
+      ignore_label: 2
+      losses:
+        - name: "nnUNet_DC_and_CE_loss"
+          weight: 1.0
