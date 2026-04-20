@@ -42,6 +42,7 @@ class LasagnaVolume:
 	source_to_base: float = 1.0
 	crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None
 	grad_mag_encode_scale: float = 1000.0
+	grad_mag_factor: float = 1.0
 	groups: dict[str, ChannelGroup] = field(default_factory=dict)
 
 	# --- queries ---
@@ -74,6 +75,7 @@ class LasagnaVolume:
 			"version": self.version,
 			"source_to_base": self.source_to_base,
 			"grad_mag_encode_scale": self.grad_mag_encode_scale,
+			"grad_mag_factor": self.grad_mag_factor,
 			"groups": {name: g.to_dict() for name, g in self.groups.items()},
 		}
 		if self.crop_xyzwhd is not None:
@@ -108,6 +110,7 @@ class LasagnaVolume:
 			source_to_base=float(d.get("source_to_base", 1.0)),
 			crop_xyzwhd=crop,
 			grad_mag_encode_scale=float(d.get("grad_mag_encode_scale", 1000.0)),
+			grad_mag_factor=float(d.get("grad_mag_factor", 1.0)),
 			groups=groups,
 		)
 

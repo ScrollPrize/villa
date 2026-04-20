@@ -48,6 +48,10 @@ std::string CState::currentVolumeId() const { return _currentVolumeId; }
 
 void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
+    // Clear shared block cache when switching volumes to avoid stale tiles
+    if (_blockCache) {
+        _blockCache->clear();
+    }
     _currentVolume = std::move(vol);
     applyCacheBudget(_currentVolume);
     resolveCurrentVolumeId();

@@ -284,6 +284,8 @@ def optimize(
 	}
 
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, data: fit_data.FitData3D) -> fit_data.FitData3D:
+		print(f"[optimizer] {label}: params={opt_cfg.params} steps={opt_cfg.steps} "
+			  f"lr={opt_cfg.lr} min_scaledown={opt_cfg.min_scaledown}", flush=True)
 		if opt_cfg.steps <= 0:
 			return data
 

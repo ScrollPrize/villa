@@ -442,7 +442,9 @@ def load_3d(
 	crop: (x0, y0, z0, w, h, d) in source-volume voxel coords, or None for full volume.
 	"""
 	vol = LasagnaVolume.load(path)
-	gmag_enc = vol.grad_mag_encode_scale
+	# Effective decode scale: encode_scale / factor
+	# Higher factor → larger decoded grad_mag values
+	gmag_enc = vol.grad_mag_encode_scale / vol.grad_mag_factor
 	s2b = vol.source_to_base
 
 	# Resolve which channels are available
