@@ -192,6 +192,12 @@ def _intersect_winding(
 # Loss
 # ---------------------------------------------------------------------------
 
+def _huber(x: torch.Tensor, delta: float = 1.0) -> torch.Tensor:
+    """Element-wise Huber loss: L2 for |x|<=delta, L1 for |x|>delta."""
+    abs_x = x.abs()
+    return torch.where(abs_x <= delta, 0.5 * x * x, delta * (abs_x - 0.5 * delta))
+
+
 def station_loss(
     *, res: fit_model.FitResult3D,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
@@ -204,23 +210,17 @@ def station_loss(
     zero = torch.zeros((), device=dev)
     ones = torch.ones(1, 1, 1, 1, device=dev)
 
+    dummy = (zero.view(1, 1, 1, 1),)
     if _seed is None or _n_gt is None:
-        return zero, (zero.view(1, 1, 1, 1),), (ones,)
+        return {
+            "station_n": (zero, dummy, (ones,)),
+            "station_t": (zero, dummy, (ones,)),
+        }
 
     seed = _seed.to(dev)
     n_gt = _n_gt.to(dev)
     d_center = (D - 1) // 2
     xyz_det = res.xyz_lr.detach()
-
-    # --- Sample GT normals at all mesh vertices (all non-differentiable) ---
-    with torch.no_grad():
-        gt_sampled = res.data.grid_sample_fullres(xyz_det)
-        gt_nx = gt_sampled.nx.squeeze(0).squeeze(0)  # (D, Hm, Wm)
-        gt_ny = gt_sampled.ny.squeeze(0).squeeze(0)
-        gt_nz = torch.sqrt((1.0 - gt_nx * gt_nx - gt_ny * gt_ny).clamp(min=0.0))
-        gt_normals = torch.stack([gt_nx, gt_ny, gt_nz], dim=-1)  # (D, Hm, Wm, 3)
-        gt_norm = gt_normals.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-        gt_normals = gt_normals / gt_norm
 
     # --- Intersect all windings (non-differentiable) ---
     with torch.no_grad():
@@ -234,29 +234,26 @@ def station_loss(
         station_loss._miss_count = getattr(station_loss, "_miss_count", 0) + 1
         if station_loss._miss_count <= 1 or station_loss._miss_count % 100 == 0:
             print(f"[station] WARNING: ray missed all windings (x{station_loss._miss_count})", flush=True)
-        return zero, (zero.view(1, 1, 1, 1),), (ones,)
+        return {
+            "station_n": (zero, dummy, (ones,)),
+            "station_t": (zero, dummy, (ones,)),
+        }
 
     # --- Normal-offset loss (from central winding, applied jointly) ---
-    # Proxy: shift every vertex by -offset along its per-vertex GT normal,
-    # oriented consistently with the intersection quad normal.
+    # Proxy: shift every vertex by -offset along the seed's GT normal (n_gt).
+    # Single direction for all vertices — no per-vertex orientation needed.
     loss_normal = zero
     with torch.no_grad():
         center_hit = [x for x in intersections if x[0] == d_center]
         if center_hit:
-            _, p_int_c, _, _, quad_n_c = center_hit[0]
+            _, p_int_c, _, _, _ = center_hit[0]
             offset = ((p_int_c - seed) * n_gt).sum()  # signed scalar
-
-            # Orient GT normals: use the hit quad's geometric normal compared
-            # to n_gt to get a single consistent sign for the whole mesh
-            flip = (quad_n_c * n_gt).sum().sign()  # scalar: +1 or -1
-            oriented_normals = gt_normals * flip  # (D, Hm, Wm, 3)
-
-            target_n = xyz_det - offset * oriented_normals
+            target_n = xyz_det - offset * n_gt  # broadcast (D, Hm, Wm, 3)
         else:
             target_n = None
 
     if target_n is not None:
-        loss_normal = ((res.xyz_lr - target_n) ** 2).mean()
+        loss_normal = _huber(res.xyz_lr - target_n).mean()
 
     # --- XY-centering loss (per-winding, independent) ---
     # Each winding's intersection gives a grid position. Shift all vertices
@@ -276,15 +273,16 @@ def station_loss(
             shift_vec = dh * raw_th + dw * raw_tw  # (3,)
             target_xy_d = xyz_det[d] + shift_vec  # (Hm, Wm, 3)
 
-        loss_xy = loss_xy + ((res.xyz_lr[d] - target_xy_d) ** 2).mean()
+        loss_xy = loss_xy + _huber(res.xyz_lr[d] - target_xy_d).mean()
         n_xy_hits += 1
 
     if n_xy_hits > 0:
         loss_xy = loss_xy / n_xy_hits
 
-    loss = loss_normal + loss_xy
-
-    # Dummy loss map/mask for visualization pipeline
-    lm = loss.detach().expand(D, 1, Hm, Wm)
     mask = res.mask_lr
-    return loss, (lm,), (mask,)
+    lm_n = loss_normal.detach().expand(D, 1, Hm, Wm)
+    lm_t = loss_xy.detach().expand(D, 1, Hm, Wm)
+    return {
+        "station_n": (loss_normal, (lm_n,), (mask,)),
+        "station_t": (loss_xy, (lm_t,), (mask,)),
+    }

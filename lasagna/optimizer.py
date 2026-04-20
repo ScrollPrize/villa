@@ -152,7 +152,8 @@ lambda_global: dict[str, float] = {
 	"pred_dt": 0.0,
 	"corr": 0.0,
 	"winding_vol": 0.0,
-	"station": 0.0,
+	"station_n": 0.0,
+	"station_t": 0.0,
 }
 
 
@@ -281,7 +282,7 @@ def optimize(
 		"pred_dt": {"loss": opt_loss_pred_dt.pred_dt_loss},
 		"corr": {"loss": opt_loss_corr.corr_loss},
 		"winding_vol": {"loss": opt_loss_winding_volume.winding_volume_loss},
-		"station": {"loss": opt_loss_station.station_loss},
+		"station": {"loss": opt_loss_station.station_loss, "sub": ["station_n", "station_t"]},
 	}
 
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, data: fit_data.FitData3D) -> fit_data.FitData3D:
@@ -385,23 +386,43 @@ def optimize(
 			print(row)
 
 		# Station-keeping: set seed point anchor (once, on first stage that uses it)
-		if _need_term("station", opt_cfg.eff) > 0 and seed_xyz is not None:
+		if (_need_term("station_n", opt_cfg.eff) > 0 or _need_term("station_t", opt_cfg.eff) > 0) and seed_xyz is not None:
 			dev = data.cos.device
 			seed_t = torch.tensor(list(seed_xyz), device=dev, dtype=torch.float32)
 			opt_loss_station.set_seed(seed_t, data)
 
 		# Initial evaluation
+		def _eval_terms(res_, eff_):
+			"""Evaluate all loss terms, handling both single and multi-loss returns."""
+			total = torch.zeros((), device=data.cos.device, dtype=data.cos.dtype)
+			tv: dict[str, float] = {}
+			for name, t in terms.items():
+				sub_names = t.get("sub")
+				if sub_names:
+					# Multi-loss: check if any sub-term has weight
+					if not any(_need_term(s, eff_) > 0 for s in sub_names):
+						continue
+				else:
+					if _need_term(name, eff_) == 0.0:
+						continue
+				result = t["loss"](res=res_)
+				if isinstance(result, dict):
+					for sub_name, (lv, lms, masks) in result.items():
+						w = _need_term(sub_name, eff_)
+						if w == 0.0:
+							continue
+						tv[sub_name] = float(lv.detach().cpu())
+						total = total + w * lv
+				else:
+					lv, lms, masks = result
+					w = _need_term(name, eff_)
+					tv[name] = float(lv.detach().cpu())
+					total = total + w * lv
+			return total, tv
+
 		with torch.no_grad():
 			res0 = model(data)
-			loss0 = torch.zeros((), device=data.cos.device, dtype=data.cos.dtype)
-			term_vals0: dict[str, float] = {}
-			for name, t in terms.items():
-				w = _need_term(name, opt_cfg.eff)
-				if w == 0.0:
-					continue
-				lv, lms, masks = t["loss"](res=res0)
-				term_vals0[name] = float(lv.detach().cpu())
-				loss0 = loss0 + w * lv
+			loss0, term_vals0 = _eval_terms(res0, opt_cfg.eff)
 			param_vals0: dict[str, float] = {}
 			for k, vs in all_params.items():
 				if len(vs) == 1 and vs[0].numel() == 1:
@@ -418,15 +439,7 @@ def optimize(
 
 		for step in range(max_steps):
 			res = model(data)
-			loss = torch.zeros((), device=data.cos.device, dtype=data.cos.dtype)
-			term_vals: dict[str, float] = {}
-			for name, t in terms.items():
-				w = _need_term(name, opt_cfg.eff)
-				if w == 0.0:
-					continue
-				lv, lms, masks = t["loss"](res=res)
-				term_vals[name] = float(lv.detach().cpu())
-				loss = loss + w * lv
+			loss, term_vals = _eval_terms(res, opt_cfg.eff)
 
 			opt.zero_grad(set_to_none=True)
 			loss.backward()
