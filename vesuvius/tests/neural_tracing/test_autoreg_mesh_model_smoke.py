@@ -15,6 +15,7 @@ import tifffile
 from torch.utils.data import Dataset
 
 import vesuvius.neural_tracing.autoreg_mesh.infer as autoreg_mesh_infer
+import vesuvius.neural_tracing.autoreg_mesh.model as autoreg_mesh_model_module
 from vesuvius.models.build.pretrained_backbones.dinovol_2_builder import build_dinovol_2_backbone
 from vesuvius.models.build.pretrained_backbones.rope import MixedRopePositionEmbedding
 from vesuvius.neural_tracing.autoreg_mesh.benchmark import run_autoreg_mesh_benchmark
@@ -38,8 +39,13 @@ from vesuvius.neural_tracing.autoreg_mesh.losses import (
     _triangle_barrier_loss_from_sequence,
     compute_autoreg_mesh_losses,
 )
-from vesuvius.neural_tracing.autoreg_mesh.model import AutoregMeshModel
-from vesuvius.neural_tracing.autoreg_mesh.model import _batched_rope_from_coords
+from vesuvius.neural_tracing.autoreg_mesh.model import (
+    ATTENTION_SCALING_LEGACY_DOUBLE_SCALED,
+    AutoregMeshModel,
+    CrossAttention,
+    RotarySelfAttention,
+    _batched_rope_from_coords,
+)
 from vesuvius.neural_tracing.autoreg_mesh.serialization import deserialize_continuation_grid, serialize_split_conditioning_example
 from vesuvius.neural_tracing.autoreg_mesh.train import (
     _build_spatial_split_groups,
@@ -797,6 +803,105 @@ def test_position_refine_head_is_zero_initialized() -> None:
     model = AutoregMeshModel(_make_cached_token_config())
     assert torch.count_nonzero(model.position_refine_head.weight).item() == 0
     assert torch.count_nonzero(model.position_refine_head.bias).item() == 0
+
+
+def test_legacy_attention_scaling_scales_queries_in_direct_attention_paths(monkeypatch: pytest.MonkeyPatch) -> None:
+    rope = MixedRopePositionEmbedding(12, ndim=3, num_heads=2, dtype=torch.float32)
+    coords = torch.tensor(
+        [[[0.1, 0.2, 0.3], [0.3, 0.4, 0.5], [0.6, 0.7, 0.8]]],
+        dtype=torch.float32,
+    )
+    memory_coords = torch.tensor(
+        [[[0.1, 0.0, 0.1], [0.2, 0.1, 0.2], [0.3, 0.2, 0.3], [0.4, 0.3, 0.4]]],
+        dtype=torch.float32,
+    )
+    x = torch.randn(1, 3, 24, dtype=torch.float32)
+    memory = torch.randn(1, 4, 24, dtype=torch.float32)
+
+    standard_self = RotarySelfAttention(24, 2, rope=rope, attention_scaling_mode="standard").eval()
+    legacy_self = RotarySelfAttention(
+        24,
+        2,
+        rope=rope,
+        attention_scaling_mode=ATTENTION_SCALING_LEGACY_DOUBLE_SCALED,
+    ).eval()
+    legacy_self.load_state_dict(standard_self.state_dict())
+
+    standard_cross = CrossAttention(24, 2, rope=rope, attention_scaling_mode="standard").eval()
+    legacy_cross = CrossAttention(
+        24,
+        2,
+        rope=rope,
+        attention_scaling_mode=ATTENTION_SCALING_LEGACY_DOUBLE_SCALED,
+    ).eval()
+    legacy_cross.load_state_dict(standard_cross.state_dict())
+
+    captured_queries: list[torch.Tensor] = []
+
+    def _fake_sdpa(q, k, v, **kwargs):
+        del k, v, kwargs
+        captured_queries.append(q.detach().clone())
+        return torch.zeros_like(q)
+
+    monkeypatch.setattr(autoreg_mesh_model_module.F, "scaled_dot_product_attention", _fake_sdpa)
+
+    standard_self(x, coords)
+    legacy_self(x, coords)
+    standard_self.forward_cached(x[:, :1], coords[:, :1], None, None)
+    legacy_self.forward_cached(x[:, :1], coords[:, :1], None, None)
+    standard_cross(x, memory, query_coords=coords, memory_coords=memory_coords)
+    legacy_cross(x, memory, query_coords=coords, memory_coords=memory_coords)
+    std_k, std_v = standard_cross.precompute_kv(memory, memory_coords=memory_coords)
+    leg_k, leg_v = legacy_cross.precompute_kv(memory, memory_coords=memory_coords)
+    standard_cross.forward_cached(x[:, :1], std_k, std_v, query_coords=coords[:, :1])
+    legacy_cross.forward_cached(x[:, :1], leg_k, leg_v, query_coords=coords[:, :1])
+
+    expected_scale = standard_self.head_dim ** -0.5
+    assert len(captured_queries) == 8
+    for idx in range(0, len(captured_queries), 2):
+        standard_q = captured_queries[idx]
+        legacy_q = captured_queries[idx + 1]
+        ratio = float(legacy_q.norm().item() / standard_q.norm().item())
+        assert ratio == pytest.approx(expected_scale, rel=1e-5)
+
+
+def test_legacy_attention_scaling_applies_in_init_kv_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    batch = autoreg_mesh_collate([_make_sample_with_cached_tokens("left")])
+    standard = AutoregMeshModel(_make_cached_token_config()).eval()
+    legacy_config = _make_cached_token_config()
+    legacy_config["attention_scaling_mode"] = ATTENTION_SCALING_LEGACY_DOUBLE_SCALED
+    legacy = AutoregMeshModel(legacy_config).eval()
+    legacy.load_state_dict(standard.state_dict())
+
+    standard_encoded = standard.encode_conditioning(batch["volume"], vol_tokens=batch["vol_tokens"])
+    legacy_encoded = legacy.encode_conditioning(batch["volume"], vol_tokens=batch["vol_tokens"])
+
+    captured_queries: list[torch.Tensor] = []
+
+    def _fake_sdpa(q, k, v, **kwargs):
+        del k, v, kwargs
+        captured_queries.append(q.detach().clone())
+        return torch.zeros_like(q)
+
+    monkeypatch.setattr(autoreg_mesh_model_module.F, "scaled_dot_product_attention", _fake_sdpa)
+
+    standard.init_kv_cache(
+        batch,
+        memory_tokens=standard_encoded["memory_tokens"],
+        memory_patch_centers=standard_encoded["memory_patch_centers"],
+    )
+    legacy.init_kv_cache(
+        batch,
+        memory_tokens=legacy_encoded["memory_tokens"],
+        memory_patch_centers=legacy_encoded["memory_patch_centers"],
+    )
+
+    expected_scale = standard.head_dim ** -0.5
+    half = len(captured_queries) // 2
+    assert half > 0
+    for standard_q, legacy_q in zip(captured_queries[:half], captured_queries[half:], strict=True):
+        ratio = float(legacy_q.norm().item() / standard_q.norm().item())
+        assert ratio == pytest.approx(expected_scale, rel=1e-5)
 
 
 def test_scheduled_sampling_uses_stripwise_replacement() -> None:

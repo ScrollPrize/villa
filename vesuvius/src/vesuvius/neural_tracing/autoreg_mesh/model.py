@@ -20,6 +20,8 @@ from vesuvius.neural_tracing.autoreg_mesh.serialization import IGNORE_INDEX
 PROMPT_TOKEN_TYPE = 0
 GENERATED_TOKEN_TYPE = 1
 START_TOKEN_TYPE = 2
+ATTENTION_SCALING_STANDARD = "standard"
+ATTENTION_SCALING_LEGACY_DOUBLE_SCALED = "legacy_double_scaled"
 
 
 @dataclasses.dataclass
@@ -100,8 +102,28 @@ def _as_grid_tensor(value, *, device: torch.device, dtype: torch.dtype) -> Tenso
     return torch.as_tensor(value, device=device, dtype=dtype)
 
 
+def _normalize_attention_scaling_mode(value: str | None) -> str:
+    mode = ATTENTION_SCALING_STANDARD if value is None else str(value)
+    if mode not in {ATTENTION_SCALING_STANDARD, ATTENTION_SCALING_LEGACY_DOUBLE_SCALED}:
+        raise ValueError(f"unsupported attention_scaling_mode {value!r}")
+    return mode
+
+
+def _scale_attention_queries(q: Tensor, *, head_dim: int, attention_scaling_mode: str) -> Tensor:
+    if attention_scaling_mode == ATTENTION_SCALING_LEGACY_DOUBLE_SCALED:
+        return q * (float(head_dim) ** -0.5)
+    return q
+
+
 class RotarySelfAttention(nn.Module):
-    def __init__(self, dim: int, num_heads: int, rope: MixedRopePositionEmbedding, dropout: float = 0.0) -> None:
+    def __init__(
+        self,
+        dim: int,
+        num_heads: int,
+        rope: MixedRopePositionEmbedding,
+        dropout: float = 0.0,
+        attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
+    ) -> None:
         super().__init__()
         if dim % num_heads != 0:
             raise ValueError(f"dim={dim} must be divisible by num_heads={num_heads}")
@@ -111,6 +133,14 @@ class RotarySelfAttention(nn.Module):
         self.qkv = nn.Linear(dim, dim * 3, bias=True)
         self.proj = nn.Linear(dim, dim, bias=True)
         self.dropout = float(dropout)
+        self.attention_scaling_mode = _normalize_attention_scaling_mode(attention_scaling_mode)
+
+    def _scale_queries(self, q: Tensor) -> Tensor:
+        return _scale_attention_queries(
+            q,
+            head_dim=self.head_dim,
+            attention_scaling_mode=self.attention_scaling_mode,
+        )
 
     def forward(self, x: Tensor, coords: Tensor, attn_mask: Tensor | None = None) -> Tensor:
         batch_size, seq_len, dim = x.shape
@@ -121,6 +151,7 @@ class RotarySelfAttention(nn.Module):
         sin, cos = _batched_rope_from_coords(self.rope, coords)
         q = apply_rotary_embedding(q, (sin, cos)).type_as(v)
         k = apply_rotary_embedding(k, (sin, cos)).type_as(v)
+        q = self._scale_queries(q)
         out = F.scaled_dot_product_attention(
             q,
             k,
@@ -149,6 +180,7 @@ class RotarySelfAttention(nn.Module):
         if cached_k is not None:
             k = torch.cat([cached_k, k], dim=2)
             v = torch.cat([cached_v, v], dim=2)
+        q = self._scale_queries(q)
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
         out = out.transpose(1, 2).reshape(batch_size, seq_len, dim)
         return self.proj(out), k, v
@@ -163,6 +195,7 @@ class CrossAttention(nn.Module):
         rope: MixedRopePositionEmbedding | None = None,
         use_rope: bool = True,
         dropout: float = 0.0,
+        attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
     ) -> None:
         super().__init__()
         if dim % num_heads != 0:
@@ -176,6 +209,14 @@ class CrossAttention(nn.Module):
         self.v_proj = nn.Linear(dim, dim, bias=True)
         self.out_proj = nn.Linear(dim, dim, bias=True)
         self.dropout = float(dropout)
+        self.attention_scaling_mode = _normalize_attention_scaling_mode(attention_scaling_mode)
+
+    def _scale_queries(self, q: Tensor) -> Tensor:
+        return _scale_attention_queries(
+            q,
+            head_dim=self.head_dim,
+            attention_scaling_mode=self.attention_scaling_mode,
+        )
 
     def forward(self, x: Tensor, memory: Tensor, *, query_coords: Tensor | None = None, memory_coords: Tensor | None = None) -> Tensor:
         batch_size, seq_len, dim = x.shape
@@ -189,6 +230,7 @@ class CrossAttention(nn.Module):
             (q_sin, q_cos), (k_sin, k_cos) = _batched_shared_rope_from_coords(self.rope, query_coords, memory_coords)
             q = apply_rotary_embedding(q, (q_sin, q_cos)).type_as(v)
             k = apply_rotary_embedding(k, (k_sin, k_cos)).type_as(v)
+        q = self._scale_queries(q)
         out = F.scaled_dot_product_attention(
             q,
             k,
@@ -223,6 +265,7 @@ class CrossAttention(nn.Module):
         if self.use_rope and query_coords is not None:
             q_sin, q_cos = _batched_rope_from_coords(self.rope, query_coords)
             q = apply_rotary_embedding(q, (q_sin, q_cos)).type_as(precomputed_v)
+        q = self._scale_queries(q)
         out = F.scaled_dot_product_attention(q, precomputed_k, precomputed_v, attn_mask=None, dropout_p=0.0, is_causal=False)
         out = out.transpose(1, 2).reshape(batch_size, seq_len, dim)
         return self.out_proj(out)
@@ -255,13 +298,27 @@ class DecoderBlock(nn.Module):
         dropout: float = 0.0,
         enable_cross_attention: bool = True,
         cross_attention_use_rope: bool = True,
+        attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
     ) -> None:
         super().__init__()
         self.norm1 = nn.LayerNorm(dim)
-        self.self_attn = RotarySelfAttention(dim, num_heads, rope=rope, dropout=dropout)
+        self.self_attn = RotarySelfAttention(
+            dim,
+            num_heads,
+            rope=rope,
+            dropout=dropout,
+            attention_scaling_mode=attention_scaling_mode,
+        )
         self.norm2 = nn.LayerNorm(dim)
         self.cross_attn = (
-            CrossAttention(dim, num_heads, rope=rope, use_rope=cross_attention_use_rope, dropout=dropout)
+            CrossAttention(
+                dim,
+                num_heads,
+                rope=rope,
+                use_rope=cross_attention_use_rope,
+                dropout=dropout,
+                attention_scaling_mode=attention_scaling_mode,
+            )
             if enable_cross_attention else None
         )
         self.norm3 = nn.LayerNorm(dim)
@@ -307,6 +364,7 @@ class AutoregMeshModel(nn.Module):
         self.decoder_num_heads = int(self.config["decoder_num_heads"])
         self.head_dim = self.decoder_dim // self.decoder_num_heads
         self.cross_attention_every_n_blocks = int(self.config["cross_attention_every_n_blocks"])
+        self.attention_scaling_mode = _normalize_attention_scaling_mode(self.config.get("attention_scaling_mode"))
         self.pointer_temperature = float(self.config["pointer_temperature"])
         self.coarse_prediction_mode = str(self.config["coarse_prediction_mode"])
         self.coarse_continuation_constraint_enabled = bool(self.config.get("coarse_continuation_constraint_enabled", True))
@@ -399,6 +457,7 @@ class AutoregMeshModel(nn.Module):
                     dropout=float(self.config["decoder_dropout"]),
                     enable_cross_attention=(block_idx % self.cross_attention_every_n_blocks == 0),
                     cross_attention_use_rope=bool(self.config.get("cross_attention_use_rope", True)),
+                    attention_scaling_mode=self.attention_scaling_mode,
                 )
                 for block_idx in range(self.decoder_depth)
             ]
@@ -1251,6 +1310,7 @@ class AutoregMeshModel(nn.Module):
             q = apply_rotary_embedding(q, (sin, cos)).type_as(v)
             k = apply_rotary_embedding(k, (sin, cos)).type_as(v)
             self_attn_kv.append((k, v))
+            q = block.self_attn._scale_queries(q)
             sa_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False)
             sa_out = sa_out.transpose(1, 2).reshape(batch_size, seq_len, dim)
             x = x + block.self_attn.proj(sa_out)

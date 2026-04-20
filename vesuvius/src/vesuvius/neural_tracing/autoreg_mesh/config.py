@@ -77,6 +77,7 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "decoder_depth": 6,
     "decoder_num_heads": 8,
     "cross_attention_every_n_blocks": 1,
+    "attention_scaling_mode": "standard",
     "decoder_mlp_ratio": 4.0,
     "decoder_dropout": 0.0,
     "pointer_temperature": 0.25,
@@ -258,6 +259,8 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         )
     if int(cfg["cross_attention_every_n_blocks"]) <= 0:
         raise ValueError("cross_attention_every_n_blocks must be positive")
+    if str(cfg["attention_scaling_mode"]) not in {"standard", "legacy_double_scaled"}:
+        raise ValueError("attention_scaling_mode must be one of {'standard', 'legacy_double_scaled'}")
     if float(cfg["pointer_temperature"]) <= 0.0:
         raise ValueError("pointer_temperature must be positive")
     if str(cfg["coarse_prediction_mode"]) not in {"joint_pointer", "axis_factorized"}:
