@@ -11,7 +11,14 @@ from typing import Any
 import click
 import numpy as np
 
-from vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz import extend_tifxyz_mesh
+from vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz import (
+    ATTENTION_SCALING_MODES,
+    ATTENTION_SCALING_STANDARD,
+    ExtensionStageResult,
+    evaluate_extension_planner,
+    extend_tifxyz_mesh,
+    run_extension_to_exhaustion,
+)
 from vesuvius.tifxyz import Tifxyz, list_tifxyz, read_tifxyz, write_tifxyz
 
 
@@ -30,6 +37,7 @@ TITLE_HUNT_PROMPT_STRIPS = 4
 TITLE_HUNT_PREDICT_STRIPS_PER_ITER = 1
 TITLE_HUNT_WINDOW_STRIP_LENGTH = 16
 TITLE_HUNT_WINDOW_OVERLAP = 8
+TITLE_HUNT_PREFLIGHT_MIN_FITTED_PLANS = 18
 TITLE_HUNT_DRY_RUN_MIN_FRONTIER_COVERAGE = 0.70
 TITLE_HUNT_DRY_RUN_MAX_GAP = 32
 REQUIRED_AWS_ENV = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
@@ -306,7 +314,7 @@ def _scale_stored_tifxyz(
     *,
     coordinate_scale_factor: float,
     target_vertex_spacing: float = 0.0,
-) -> Path:
+) -> tuple[Path, int]:
     source = read_tifxyz(source_dir, load_mask=True, validate=True).use_stored_resolution()
     valid_mask = source._mask.copy() if source._mask is not None else np.ones_like(source._x, dtype=bool)
     scaled_x = source._x.copy()
@@ -353,35 +361,17 @@ def _scale_stored_tifxyz(
 
 
 def _compact_extension_summary(summary: dict[str, Any]) -> dict[str, Any]:
-    keys = [
-        "direction",
-        "predicted_vertex_count",
-        "cumulative_predicted_vertex_count",
-        "final_predicted_nonseam_vertex_count",
-        "final_seam_vertex_count",
-        "new_band_frontier_coverage_fraction",
-        "new_band_cell_coverage_fraction",
-        "new_band_max_gap",
-        "new_band_gap_spans",
-        "first_uncovered_frontier_index",
-        "iterations_completed",
-        "stop_reason",
-        "window_batch_size",
-        "encode_decode_ms_per_fitted_window",
-        "crop_cache_hits",
-        "crop_cache_misses",
-        "total_wall_ms",
-        "fast_infer_enabled",
-        "compile_infer_requested",
-        "compile_infer_actual",
-        "amp_dtype",
-    ]
-    compact = {key: summary.get(key) for key in keys}
-    compact["summary_path"] = summary.get("summary_path")
-    return compact
+    return dict(summary)
 
 
-def _title_hunt_extension_preset(*, window_batch_size: int, show_progress: bool, distributed_infer: bool) -> dict[str, Any]:
+def _title_hunt_extension_preset(
+    *,
+    window_batch_size: int,
+    show_progress: bool,
+    distributed_infer: bool,
+    device: str = "cuda",
+    attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
+) -> dict[str, Any]:
     return {
         "prompt_strips": int(TITLE_HUNT_PROMPT_STRIPS),
         "predict_strips_per_iter": int(TITLE_HUNT_PREDICT_STRIPS_PER_ITER),
@@ -389,6 +379,7 @@ def _title_hunt_extension_preset(*, window_batch_size: int, show_progress: bool,
         "window_overlap": int(TITLE_HUNT_WINDOW_OVERLAP),
         "window_batch_size": int(window_batch_size),
         "max_crop_fit_retries": 3,
+        "device": str(device),
         "show_progress": bool(show_progress),
         "fast_infer": True,
         "compile_infer": False,
@@ -396,7 +387,118 @@ def _title_hunt_extension_preset(*, window_batch_size: int, show_progress: bool,
         "distributed_infer": bool(distributed_infer),
         "distributed_shard_mode": "strided",
         "distributed_gather_mode": "object",
+        "attention_scaling_mode": str(attention_scaling_mode),
     }
+
+
+def _title_hunt_preflight_candidates() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "restored_baseline",
+            "coordinate_scale_factor": 4.0,
+            "target_vertex_spacing": 0.0,
+            "prompt_strips": 4,
+            "predict_strips_per_iter": 1,
+            "window_strip_length": 16,
+            "window_overlap": 8,
+        },
+        {
+            "name": "expanded_context",
+            "coordinate_scale_factor": 4.0,
+            "target_vertex_spacing": 0.0,
+            "prompt_strips": 8,
+            "predict_strips_per_iter": 2,
+            "window_strip_length": 24,
+            "window_overlap": 12,
+        },
+        {
+            "name": "restored_resampled",
+            "coordinate_scale_factor": 4.0,
+            "target_vertex_spacing": 20.0,
+            "prompt_strips": 4,
+            "predict_strips_per_iter": 1,
+            "window_strip_length": 16,
+            "window_overlap": 8,
+        },
+    ]
+
+
+def _planner_candidate_sort_key(result: dict[str, Any]) -> tuple[float, float, float, int]:
+    return (
+        float(result.get("fitted_plans", 0)),
+        float(result.get("covered_frontier", 0)),
+        float(result.get("covered_frontier_fraction", 0.0)),
+        -int(result.get("planning_stats", {}).get("crop_fit_failed_count", 0)),
+    )
+
+
+def run_title_hunt_planner_preflight(
+    *,
+    source_tifxyz_path: str | Path,
+    output_dir: str | Path,
+    grow_direction: str = "decreasing-z",
+    max_crop_fit_retries: int = 3,
+    min_fitted_plans: int = TITLE_HUNT_PREFLIGHT_MIN_FITTED_PLANS,
+) -> dict[str, Any]:
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    candidate_results: list[dict[str, Any]] = []
+    fixed_lattice_direction: str | None = None
+    for candidate in _title_hunt_preflight_candidates():
+        candidate_dir = output_dir / str(candidate["name"])
+        scaled_path, resample_factor = _scale_stored_tifxyz(
+            source_tifxyz_path,
+            candidate_dir / "scaled_input_tifxyz",
+            coordinate_scale_factor=float(candidate["coordinate_scale_factor"]),
+            target_vertex_spacing=float(candidate["target_vertex_spacing"]),
+        )
+        scaled_prompt = int(candidate["prompt_strips"]) * int(resample_factor)
+        scaled_predict = int(candidate["predict_strips_per_iter"]) * int(resample_factor)
+        scaled_window = int(candidate["window_strip_length"]) * int(resample_factor)
+        scaled_overlap = int(candidate["window_overlap"]) * int(resample_factor)
+        requested_direction = str(grow_direction if fixed_lattice_direction is None else fixed_lattice_direction)
+        evaluation = evaluate_extension_planner(
+            tifxyz_path=scaled_path,
+            grow_direction=requested_direction,
+            prompt_strips=scaled_prompt,
+            predict_strips_per_iter=scaled_predict,
+            window_strip_length=scaled_window,
+            window_overlap=scaled_overlap,
+            max_crop_fit_retries=int(max_crop_fit_retries),
+        )
+        if fixed_lattice_direction is None:
+            fixed_lattice_direction = str(evaluation["direction"])
+        candidate_results.append(
+            {
+                **candidate,
+                "scaled_input_path": str(scaled_path),
+                "resample_factor": int(resample_factor),
+                "scaled_prompt_strips": int(scaled_prompt),
+                "scaled_predict_strips_per_iter": int(scaled_predict),
+                "scaled_window_strip_length": int(scaled_window),
+                "scaled_window_overlap": int(scaled_overlap),
+                **evaluation,
+            }
+        )
+    candidate_results.sort(key=_planner_candidate_sort_key, reverse=True)
+    best = candidate_results[0]
+    summary = {
+        "source_tifxyz_path": str(source_tifxyz_path),
+        "grow_direction": str(grow_direction),
+        "resolved_lattice_direction": str(fixed_lattice_direction or grow_direction),
+        "min_fitted_plans": int(min_fitted_plans),
+        "best_candidate": best,
+        "candidates": candidate_results,
+    }
+    summary_path = output_dir / "planner_preflight.json"
+    _write_json(summary_path, summary)
+    summary["planner_preflight_path"] = str(summary_path)
+    if int(best.get("fitted_plans", 0)) < int(min_fitted_plans):
+        raise RuntimeError(
+            f"planner preflight failed: best candidate {best['name']} only reached "
+            f"{best.get('fitted_plans', 0)} fitted plans"
+        )
+    return summary
 
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -416,21 +518,21 @@ def _run_direction_to_exhaustion(
     max_extension_iters_per_call: int,
     show_progress: bool,
     max_calls: int | None = None,
+    device: str = "cuda",
     distributed_infer: bool = False,
+    attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
     enforce_dry_run_quality_gate: bool = False,
     prompt_strips_override: int | None = None,
     predict_strips_override: int | None = None,
     window_strip_length_override: int | None = None,
     window_overlap_override: int | None = None,
 ) -> DirectionRunResult:
-    current_input = Path(input_tifxyz_path)
-    call_idx = 0
-    call_summaries: list[dict[str, Any]] = []
-    stage_stop_reason = "completed"
     preset = _title_hunt_extension_preset(
         window_batch_size=int(window_batch_size),
         show_progress=bool(show_progress),
         distributed_infer=bool(distributed_infer),
+        device=str(device),
+        attention_scaling_mode=str(attention_scaling_mode),
     )
     if prompt_strips_override is not None:
         preset["prompt_strips"] = int(prompt_strips_override)
@@ -440,54 +542,39 @@ def _run_direction_to_exhaustion(
         preset["window_strip_length"] = int(window_strip_length_override)
     if window_overlap_override is not None:
         preset["window_overlap"] = int(window_overlap_override)
-    while True:
-        call_dir = output_dir / f"{direction}_call_{call_idx:03d}"
-        _log(f"[extend:{direction}] call {call_idx:03d} input={current_input}")
-        summary = extend_tifxyz_mesh(
-            tifxyz_path=current_input,
-            volume_uri=volume_uri,
-            dino_backbone=dino_backbone,
-            autoreg_checkpoint=autoreg_checkpoint,
-            out_dir=call_dir,
-            device="cuda",
-            grow_direction=direction,
-            prompt_strips=int(preset["prompt_strips"]),
-            predict_strips_per_iter=int(preset["predict_strips_per_iter"]),
-            window_strip_length=int(preset["window_strip_length"]),
-            window_overlap=int(preset["window_overlap"]),
-            window_batch_size=int(preset["window_batch_size"]),
-            max_extension_iters=int(max_extension_iters_per_call),
-            max_crop_fit_retries=int(preset["max_crop_fit_retries"]),
-            show_progress=bool(preset["show_progress"]),
-            fast_infer=bool(preset["fast_infer"]),
-            compile_infer=bool(preset["compile_infer"]),
-            amp_dtype=str(preset["amp_dtype"]),
-            distributed_infer=bool(preset["distributed_infer"]),
-            distributed_shard_mode=str(preset["distributed_shard_mode"]),
-            distributed_gather_mode=str(preset["distributed_gather_mode"]),
-        )
-        compact_summary = _compact_extension_summary(summary)
-        call_summaries.append(compact_summary)
-        if enforce_dry_run_quality_gate:
-            _validate_dry_run_call(compact_summary, direction=direction, call_idx=call_idx)
-        current_input = Path(summary["tifxyz_path"])
-        if str(summary["stop_reason"]) != "max_extension_iters":
-            stage_stop_reason = str(summary["stop_reason"])
-            break
-        call_idx += 1
-        if max_calls is not None and call_idx >= int(max_calls):
-            stage_stop_reason = "max_calls_reached"
-            break
-    stage_summary = {
-        "direction": str(direction),
-        "call_count": int(len(call_summaries)),
-        "final_tifxyz_path": str(current_input),
-        "stage_stop_reason": str(stage_stop_reason),
-        "extension_preset": {key: value for key, value in preset.items() if key != "show_progress"},
-        "calls": call_summaries,
-        "final": call_summaries[-1],
-    }
-    return DirectionRunResult(final_tifxyz_path=current_input, stage_summary=stage_summary)
+    result = run_extension_to_exhaustion(
+        input_tifxyz_path=input_tifxyz_path,
+        output_dir=output_dir,
+        grow_direction=direction,
+        volume_uri=volume_uri,
+        dino_backbone=dino_backbone,
+        autoreg_checkpoint=autoreg_checkpoint,
+        device=str(preset["device"]),
+        prompt_strips=int(preset["prompt_strips"]),
+        predict_strips_per_iter=int(preset["predict_strips_per_iter"]),
+        window_strip_length=int(preset["window_strip_length"]),
+        window_overlap=int(preset["window_overlap"]),
+        window_batch_size=int(preset["window_batch_size"]),
+        max_extension_iters_per_call=int(max_extension_iters_per_call),
+        max_crop_fit_retries=int(preset["max_crop_fit_retries"]),
+        max_calls=max_calls,
+        show_progress=bool(preset["show_progress"]),
+        fast_infer=bool(preset["fast_infer"]),
+        compile_infer=bool(preset["compile_infer"]),
+        amp_dtype=str(preset["amp_dtype"]),
+        distributed_infer=bool(preset["distributed_infer"]),
+        distributed_shard_mode=str(preset["distributed_shard_mode"]),
+        distributed_gather_mode=str(preset["distributed_gather_mode"]),
+        attention_scaling_mode=str(preset["attention_scaling_mode"]),
+        call_validator=(
+            (lambda summary, call_idx: _validate_dry_run_call(summary, direction=direction, call_idx=call_idx))
+            if enforce_dry_run_quality_gate else None
+        ),
+        extend_impl=extend_tifxyz_mesh,
+    )
+    stage_summary = dict(result.stage_summary)
+    stage_summary["extension_preset"] = {key: value for key, value in preset.items() if key != "show_progress"}
+    return DirectionRunResult(final_tifxyz_path=result.final_tifxyz_path, stage_summary=stage_summary)
 
 
 def _validate_dry_run_call(summary: dict[str, Any], *, direction: str, call_idx: int) -> None:
@@ -554,6 +641,32 @@ def _new_surface_state(
     }
 
 
+def _normalize_direction_sequence(extend_directions: list[str] | None) -> list[str]:
+    values = extend_directions or ["up", "down"]
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        direction = str(value).strip()
+        if not direction:
+            continue
+        if direction in seen:
+            continue
+        seen.add(direction)
+        ordered.append(direction)
+    if not ordered:
+        raise ValueError("extend_directions must contain at least one direction")
+    return ordered
+
+
+def _count_valid_vertices(path: str | Path) -> int:
+    surface = read_tifxyz(path, load_mask=True, validate=True).use_stored_resolution()
+    mask = surface._mask
+    if mask is not None:
+        return int(np.asarray(mask, dtype=bool).sum())
+    valid = np.isfinite(surface._x) & np.isfinite(surface._y) & np.isfinite(surface._z)
+    return int(valid.sum())
+
+
 def _process_surface(
     *,
     surface: dict[str, str],
@@ -572,10 +685,12 @@ def _process_surface(
     dry_run_mode: bool,
     dry_run_max_calls_per_direction: int,
     distributed_infer: bool,
+    device: str = "cuda",
+    attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
     extend_directions: list[str] | None = None,
     target_vertex_spacing: float = 0.0,
 ) -> dict[str, Any]:
-    _active_directions = set(extend_directions or ["up", "down"])
+    active_directions = _normalize_direction_sequence(extend_directions)
     relative_surface_id = str(surface["relative_surface_id"])
     state_path = state_root / f"{_safe_state_name(relative_surface_id)}.json"
     state = _load_surface_state(state_path)
@@ -618,17 +733,22 @@ def _process_surface(
     resample_factor = int(state.get("resample_factor", 1))
 
     current_input = Path(state["scaled_input_path"])
-    direction_summaries: dict[str, dict] = {}
+    direction_summaries: dict[str, dict[str, Any]] = {}
     scaled_window_strip_length = int(TITLE_HUNT_WINDOW_STRIP_LENGTH) * resample_factor
     scaled_window_overlap = int(TITLE_HUNT_WINDOW_OVERLAP) * resample_factor
     scaled_prompt_strips = int(TITLE_HUNT_PROMPT_STRIPS) * resample_factor
     scaled_predict_strips = int(TITLE_HUNT_PREDICT_STRIPS_PER_ITER) * resample_factor
-    for direction in _active_directions:
+    for direction in active_directions:
+        final_key = f"{direction}_final_tifxyz_path"
+        summary_key = f"summary_{direction}_path"
+        existing_final = state.get(final_key)
+        existing_summary = state.get(summary_key)
+        if existing_final and existing_summary and Path(existing_final).exists() and Path(existing_summary).exists():
+            current_input = Path(existing_final)
+            direction_summaries[direction] = json.loads(Path(existing_summary).read_text())
+            continue
         stage_status = f"{direction}_running"
         done_status = f"{direction}_done"
-        if str(state.get("status")) not in {"scaled", stage_status} and str(state.get("status")) not in {prev_done for prev_done in [f"{d}_done" for d in _active_directions]}:
-            if str(state.get("status")) != "scaled":
-                continue
         state = _update_surface_state(state=state, status=stage_status, manifest_jsonl_path=manifest_jsonl_path)
         stage_output_dir = paths.output_dir / f"{direction}_stage"
         stage_result = _run_direction_to_exhaustion(
@@ -642,7 +762,9 @@ def _process_surface(
             max_extension_iters_per_call=max_extension_iters_per_call,
             show_progress=show_progress,
             max_calls=int(dry_run_max_calls_per_direction) if dry_run_mode else None,
+            device=str(device),
             distributed_infer=bool(distributed_infer),
+            attention_scaling_mode=str(attention_scaling_mode),
             enforce_dry_run_quality_gate=bool(dry_run_mode),
             prompt_strips_override=scaled_prompt_strips if resample_factor > 1 else None,
             predict_strips_override=scaled_predict_strips if resample_factor > 1 else None,
@@ -661,27 +783,39 @@ def _process_surface(
         )
 
     write_tifxyz(paths.final_tifxyz_dir, read_tifxyz(current_input, load_mask=True, validate=True).use_stored_resolution(), overwrite=True)
-    last_dir = _active_directions[-1] if _active_directions else "none"
+    original_vertex_count = _count_valid_vertices(state["scaled_input_path"])
+    final_vertex_count = _count_valid_vertices(paths.final_tifxyz_dir)
+    cumulative_predicted_vertex_count = max(0, int(final_vertex_count - original_vertex_count))
+    last_dir = active_directions[-1]
     last_summary = direction_summaries.get(last_dir, {"final": {}})
-    first_summary = direction_summaries.get(_active_directions[0], {"final": {}}) if _active_directions else {"final": {}}
+    first_summary = direction_summaries.get(active_directions[0], {"final": {}})
     manifest = {
         "relative_surface_id": relative_surface_id,
         "timestamp_suffix": str(state["timestamp_suffix"]),
         "coordinate_scale_factor": float(coordinate_scale_factor),
+        "target_vertex_spacing": float(target_vertex_spacing),
         "source_s3_uri": str(state["source_s3_uri"]),
         "source_local_path": str(state["source_local_path"]),
         "local_output_dir": str(paths.output_dir),
         "s3_surface_prefix": paths.s3_surface_prefix,
         "final_tifxyz_dir": str(paths.final_tifxyz_dir),
-        "directions": list(_active_directions),
+        "directions": list(active_directions),
         "direction_summaries": {d: s.get("final", {}) for d, s in direction_summaries.items()},
         "extension_preset": first_summary.get("extension_preset") or _title_hunt_extension_preset(
             window_batch_size=int(window_batch_size),
             show_progress=bool(show_progress),
             distributed_infer=bool(distributed_infer),
+            device=str(device),
+            attention_scaling_mode=str(attention_scaling_mode),
         ),
-        "final_predicted_vertex_count": int(last_summary.get("final", {}).get("predicted_vertex_count", 0)),
+        "attention_scaling_mode": str(attention_scaling_mode),
+        "resample_factor": int(resample_factor),
+        "original_vertex_count": int(original_vertex_count),
+        "final_vertex_count": int(final_vertex_count),
+        "final_predicted_vertex_count": int(cumulative_predicted_vertex_count),
+        "cumulative_predicted_vertex_count": int(cumulative_predicted_vertex_count),
         "direction_call_counts": {d: int(s.get("call_count", 0)) for d, s in direction_summaries.items()},
+        "final_stage_stop_reason": str(last_summary.get("stage_stop_reason", "")),
     }
     _write_json(paths.manifest_path, manifest)
     _upload_surface_output(paths)
@@ -715,6 +849,8 @@ def run_batch_extend_title_hunt(
     show_progress: bool,
     dry_run_max_calls_per_direction: int,
     distributed_infer: bool,
+    device: str = "cuda",
+    attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
     target_vertex_spacing: float = 0.0,
 ) -> dict[str, Any]:
     _require_aws_env()
@@ -763,9 +899,11 @@ def run_batch_extend_title_hunt(
             max_extension_iters_per_call=max_extension_iters_per_call,
             window_batch_size=window_batch_size,
             show_progress=show_progress,
+            device=str(device),
             dry_run_mode=is_dry_run_surface,
             dry_run_max_calls_per_direction=int(dry_run_max_calls_per_direction),
             distributed_infer=bool(distributed_infer),
+            attention_scaling_mode=str(attention_scaling_mode),
             target_vertex_spacing=float(target_vertex_spacing),
         )
         processed.append(
@@ -790,7 +928,9 @@ def run_batch_extend_title_hunt(
         "dry_run_prefix_count": len(dry_run_prefixes),
         "dry_run_max_calls_per_direction": int(dry_run_max_calls_per_direction),
         "auto_continue": bool(auto_continue),
+        "device": str(device),
         "distributed_infer": bool(distributed_infer),
+        "attention_scaling_mode": str(attention_scaling_mode),
         "processed": processed,
         "manifest_jsonl_path": str(manifest_jsonl_path),
     }
@@ -811,8 +951,10 @@ def run_batch_extend_title_hunt(
 @click.option("--dry-run-surface-count", type=int, default=DEFAULT_DRY_RUN_SURFACE_COUNT, show_default=True)
 @click.option("--dry-run-max-calls-per-direction", type=int, default=DEFAULT_DRY_RUN_MAX_CALLS_PER_DIRECTION, show_default=True)
 @click.option("--auto-continue/--stop-after-dry-run", default=True, show_default=True)
+@click.option("--device", type=str, default="cuda", show_default=True)
 @click.option("--show-progress/--no-show-progress", default=True, show_default=True)
 @click.option("--distributed-infer/--no-distributed-infer", default=False, show_default=True)
+@click.option("--attention-scaling-mode", type=click.Choice(list(ATTENTION_SCALING_MODES)), default=ATTENTION_SCALING_STANDARD, show_default=True)
 @click.option("--surface-filter", type=str, default=None, help="Only process surfaces whose relative_surface_id contains this substring")
 @click.option("--extend-directions", type=str, default="up,down", show_default=True, help="Comma-separated directions to extend (e.g. 'up' or 'up,down')")
 @click.option("--target-vertex-spacing", type=float, default=0.0, show_default=True, help="If >0, resample the lattice so vertex spacing matches this (voxels). Set to 20 to match training data.")
@@ -831,8 +973,10 @@ def main(
     dry_run_surface_count: int,
     dry_run_max_calls_per_direction: int,
     auto_continue: bool,
+    device: str,
     show_progress: bool,
     distributed_infer: bool,
+    attention_scaling_mode: str,
     surface_filter: str | None,
     extend_directions: str,
     target_vertex_spacing: float,
@@ -852,8 +996,10 @@ def main(
         dry_run_surface_count=int(dry_run_surface_count),
         dry_run_max_calls_per_direction=int(dry_run_max_calls_per_direction),
         auto_continue=bool(auto_continue),
+        device=str(device),
         show_progress=bool(show_progress),
         distributed_infer=bool(distributed_infer),
+        attention_scaling_mode=str(attention_scaling_mode),
         surface_filter=surface_filter,
         extend_directions=[d.strip() for d in str(extend_directions).split(",") if d.strip()],
         target_vertex_spacing=float(target_vertex_spacing),

@@ -9,6 +9,7 @@ import pytest
 from vesuvius.neural_tracing.autoreg_mesh.batch_extend_title_hunt import (
     SYNC_EXCLUDE_PATTERNS,
     TITLE_HUNT_PREDICT_STRIPS_PER_ITER,
+    TITLE_HUNT_PREFLIGHT_MIN_FITTED_PLANS,
     TITLE_HUNT_PROMPT_STRIPS,
     TITLE_HUNT_WINDOW_OVERLAP,
     TITLE_HUNT_WINDOW_STRIP_LENGTH,
@@ -24,6 +25,7 @@ from vesuvius.neural_tracing.autoreg_mesh.batch_extend_title_hunt import (
     _title_hunt_extension_preset,
     _write_json,
     run_batch_extend_title_hunt,
+    run_title_hunt_planner_preflight,
     _scale_stored_tifxyz,
 )
 from vesuvius.tifxyz import Tifxyz, read_tifxyz, write_tifxyz
@@ -75,13 +77,14 @@ def test_scale_stored_tifxyz_multiplies_coordinates_and_bbox(tmp_path: Path) -> 
     source_surface = _make_surface()
     source_dir = write_tifxyz(tmp_path / "source", source_surface, overwrite=True)
 
-    scaled_dir = _scale_stored_tifxyz(source_dir, tmp_path / "scaled", coordinate_scale_factor=4.0)
+    scaled_dir, resample_factor = _scale_stored_tifxyz(source_dir, tmp_path / "scaled", coordinate_scale_factor=4.0)
     scaled_surface = read_tifxyz(scaled_dir, load_mask=True, validate=True).use_stored_resolution()
 
     valid_mask = source_surface._mask
     np.testing.assert_allclose(scaled_surface._x[valid_mask], source_surface._x[valid_mask] * 4.0)
     np.testing.assert_allclose(scaled_surface._y[valid_mask], source_surface._y[valid_mask] * 4.0)
     np.testing.assert_allclose(scaled_surface._z[valid_mask], source_surface._z[valid_mask] * 4.0)
+    assert resample_factor == 1
     assert scaled_surface.get_scale_tuple() == source_surface.get_scale_tuple()
     assert scaled_surface.bbox == tuple(value * 4.0 for value in source_surface.bbox)
 
@@ -126,14 +129,22 @@ def test_aws_sync_exclude_args_cover_layers_and_zarr() -> None:
 
 
 def test_title_hunt_extension_preset_is_conservative() -> None:
-    preset = _title_hunt_extension_preset(window_batch_size=256, show_progress=False, distributed_infer=True)
+    preset = _title_hunt_extension_preset(
+        window_batch_size=256,
+        show_progress=False,
+        distributed_infer=True,
+        device="cpu",
+        attention_scaling_mode="legacy_double_scaled",
+    )
 
-    assert preset["prompt_strips"] == TITLE_HUNT_PROMPT_STRIPS == 6
+    assert preset["prompt_strips"] == TITLE_HUNT_PROMPT_STRIPS == 4
     assert preset["predict_strips_per_iter"] == TITLE_HUNT_PREDICT_STRIPS_PER_ITER == 1
     assert preset["window_strip_length"] == TITLE_HUNT_WINDOW_STRIP_LENGTH == 16
     assert preset["window_overlap"] == TITLE_HUNT_WINDOW_OVERLAP == 8
     assert preset["window_batch_size"] == 256
     assert preset["distributed_infer"] is True
+    assert preset["device"] == "cpu"
+    assert preset["attention_scaling_mode"] == "legacy_double_scaled"
 
 
 def test_run_direction_to_exhaustion_loops_until_stop_reason_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -145,7 +156,7 @@ def test_run_direction_to_exhaustion_loops_until_stop_reason_changes(tmp_path: P
         call_idx = call_counter["count"]
         call_counter["count"] += 1
         tifxyz_dir = write_tifxyz(Path(kwargs["out_dir"]) / "merged", surface, overwrite=True)
-        assert kwargs["prompt_strips"] == 6
+        assert kwargs["prompt_strips"] == 4
         assert kwargs["predict_strips_per_iter"] == 1
         assert kwargs["window_strip_length"] == 16
         assert kwargs["window_overlap"] == 8
@@ -194,7 +205,7 @@ def test_run_direction_to_exhaustion_loops_until_stop_reason_changes(tmp_path: P
     assert Path(result.final_tifxyz_path).exists()
     assert result.stage_summary["call_count"] == 2
     assert result.stage_summary["final"]["stop_reason"] == "zero_growth_iteration"
-    assert result.stage_summary["extension_preset"]["prompt_strips"] == 6
+    assert result.stage_summary["extension_preset"]["prompt_strips"] == 4
 
 
 def test_run_direction_to_exhaustion_stops_at_dry_run_call_cap(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -375,9 +386,139 @@ def test_process_surface_resumes_and_uploads_manifest(tmp_path: Path, monkeypatc
     assert manifest_path.exists()
     manifest = json.loads(manifest_path.read_text())
     assert manifest["coordinate_scale_factor"] == pytest.approx(4.0)
-    assert manifest["summary_up"]["predicted_vertex_count"] == 12
-    assert manifest["summary_down"]["predicted_vertex_count"] == 12
-    assert manifest["extension_preset"]["prompt_strips"] == 6
+    assert manifest["direction_summaries"]["up"]["predicted_vertex_count"] == 12
+    assert manifest["direction_summaries"]["down"]["predicted_vertex_count"] == 12
+    assert manifest["cumulative_predicted_vertex_count"] == 0
+    assert manifest["extension_preset"]["prompt_strips"] == 4
+
+
+def test_process_surface_preserves_direction_order_and_cumulative_counts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source_surface = _make_surface(rows=4, cols=5)
+    grown_surface = _make_surface(rows=4, cols=6)
+    source_dir = write_tifxyz(tmp_path / "source_order", source_surface, overwrite=True)
+    state_root = tmp_path / "state_order"
+    manifest_jsonl_path = state_root / "manifest.jsonl"
+    call_order: list[str] = []
+
+    def _fake_run_direction(**kwargs):
+        direction = kwargs["direction"]
+        call_order.append(direction)
+        out_dir = Path(kwargs["output_dir"]) / "merged"
+        surface = source_surface if direction == "down" else grown_surface
+        write_tifxyz(out_dir, surface, overwrite=True)
+        summary = {
+            "direction": direction,
+            "call_count": 1,
+            "final_tifxyz_path": str(out_dir),
+            "calls": [{"stop_reason": "zero_growth_iteration"}],
+            "final": {
+                "direction": direction,
+                "predicted_vertex_count": 3 if direction == "down" else 7,
+                "cumulative_predicted_vertex_count": 3 if direction == "down" else 10,
+                "final_predicted_nonseam_vertex_count": 6,
+                "final_seam_vertex_count": 1,
+                "new_band_frontier_coverage_fraction": 1.0,
+                "new_band_cell_coverage_fraction": 1.0,
+                "new_band_max_gap": 0,
+                "new_band_gap_spans": [],
+                "first_uncovered_frontier_index": None,
+                "iterations_completed": 1,
+                "stop_reason": "zero_growth_iteration",
+                "window_batch_size": 256,
+                "encode_decode_ms_per_fitted_window": 1.0,
+                "crop_cache_hits": 0,
+                "crop_cache_misses": 1,
+                "total_wall_ms": 1.0,
+                "fast_infer_enabled": True,
+                "compile_infer_requested": False,
+                "compile_infer_actual": False,
+                "amp_dtype": "bf16",
+            },
+        }
+        return type("FakeDirectionRun", (), {"final_tifxyz_path": out_dir, "stage_summary": summary})()
+
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.batch_extend_title_hunt._run_direction_to_exhaustion", _fake_run_direction)
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.batch_extend_title_hunt._upload_surface_output", lambda paths: None)
+
+    state = _process_surface(
+        surface={
+            "prefix_name": "title_hunt_rd1",
+            "relative_surface_id": "title_hunt_rd1/surface_b",
+            "local_path": str(source_dir),
+            "uuid": "surface_b",
+        },
+        source_s3_uri="s3://bucket/source",
+        output_s3_uri="s3://bucket/out",
+        volume_uri="s3://volume",
+        dino_backbone="backbone",
+        autoreg_checkpoint="ckpt",
+        local_output_root=tmp_path / "outputs_order",
+        state_root=state_root,
+        manifest_jsonl_path=manifest_jsonl_path,
+        coordinate_scale_factor=1.0,
+        max_extension_iters_per_call=16,
+        window_batch_size=256,
+        show_progress=False,
+        dry_run_mode=False,
+        dry_run_max_calls_per_direction=2,
+        distributed_infer=False,
+        extend_directions=["down", "up"],
+    )
+
+    manifest = json.loads(Path(state["manifest_path"]).read_text())
+    assert call_order == ["down", "up"]
+    assert manifest["directions"] == ["down", "up"]
+    assert manifest["cumulative_predicted_vertex_count"] == 4
+    assert manifest["final_predicted_vertex_count"] == 4
+
+
+def test_title_hunt_planner_preflight_picks_best_candidate(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    source_surface = _make_surface()
+    source_dir = write_tifxyz(tmp_path / "source_preflight", source_surface, overwrite=True)
+
+    def _fake_scale(source_dir, output_dir, *, coordinate_scale_factor, target_vertex_spacing=0.0):
+        del source_dir, coordinate_scale_factor
+        out_dir = Path(output_dir)
+        write_tifxyz(out_dir, source_surface, overwrite=True)
+        if target_vertex_spacing > 0:
+            return out_dir, 2
+        return out_dir, 1
+
+    def _fake_evaluate(**kwargs):
+        window = int(kwargs["window_strip_length"])
+        if window == 24:
+            fitted = 19
+            covered = 180
+        elif window == 32:
+            fitted = 18
+            covered = 170
+        else:
+            fitted = 9
+            covered = 90
+        return {
+            "direction": kwargs["grow_direction"],
+            "requested_direction": kwargs["grow_direction"],
+            "frontier_length": 200,
+            "fitted_plans": fitted,
+            "covered_frontier": covered,
+            "covered_frontier_fraction": covered / 200.0,
+            "planning_stats": {"crop_fit_failed_count": 10},
+            "fitted_plan_spans": [(0, covered)],
+            "covered_frontier_spans": [(0, covered)],
+            "trimmed_bbox_rc": [0, 4, 0, 5],
+        }
+
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.batch_extend_title_hunt._scale_stored_tifxyz", _fake_scale)
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.batch_extend_title_hunt.evaluate_extension_planner", _fake_evaluate)
+
+    summary = run_title_hunt_planner_preflight(
+        source_tifxyz_path=source_dir,
+        output_dir=tmp_path / "preflight",
+    )
+
+    assert summary["best_candidate"]["name"] == "expanded_context"
+    assert summary["best_candidate"]["fitted_plans"] >= TITLE_HUNT_PREFLIGHT_MIN_FITTED_PLANS
+    assert Path(summary["planner_preflight_path"]).exists()
 
 
 def test_run_batch_extend_title_hunt_stops_after_dry_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
