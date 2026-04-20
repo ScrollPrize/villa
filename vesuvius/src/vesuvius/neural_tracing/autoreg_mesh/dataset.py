@@ -167,6 +167,111 @@ def _should_reject_boundary_stats(
     )
 
 
+def _sample_frontier_band_width(config: dict) -> int:
+    choices = config.get("frontier_band_width_choices")
+    if choices is None:
+        return int(config["frontier_band_width"])
+    return int(random.choice(list(choices)))
+
+
+def _restore_single_prompt_strip(
+    corrupted_cond_local: np.ndarray,
+    original_cond_local: np.ndarray,
+    *,
+    direction: str,
+    frontier_band_width: int,
+) -> np.ndarray:
+    restored = np.asarray(corrupted_cond_local, dtype=np.float32).copy()
+    if direction == "left":
+        strip_idx = max(0, restored.shape[1] - int(frontier_band_width))
+        restored[:, strip_idx, :] = original_cond_local[:, strip_idx, :]
+    elif direction == "right":
+        strip_idx = min(restored.shape[1] - 1, int(frontier_band_width) - 1)
+        restored[:, strip_idx, :] = original_cond_local[:, strip_idx, :]
+    elif direction == "up":
+        strip_idx = max(0, restored.shape[0] - int(frontier_band_width))
+        restored[strip_idx, :, :] = original_cond_local[strip_idx, :, :]
+    elif direction == "down":
+        strip_idx = min(restored.shape[0] - 1, int(frontier_band_width) - 1)
+        restored[strip_idx, :, :] = original_cond_local[strip_idx, :, :]
+    else:
+        raise ValueError(f"unsupported direction {direction!r}")
+    return restored
+
+
+def _apply_ragged_frontier_augmentation(
+    cond_local: np.ndarray,
+    *,
+    direction: str,
+    frontier_band_width: int,
+    ragged_frontier_prob: float,
+    ragged_frontier_max_inset: int,
+    ragged_frontier_gap_length_choices: list[int] | None,
+    ragged_frontier_lowfreq_sigma: float,
+) -> tuple[np.ndarray, bool]:
+    cond = np.asarray(cond_local, dtype=np.float32).copy()
+    if float(ragged_frontier_prob) <= 0.0 or int(ragged_frontier_max_inset) <= 0:
+        return cond, False
+    if random.random() >= float(ragged_frontier_prob):
+        return cond, False
+    original = cond.copy()
+    if direction in {"left", "right"}:
+        frontier_len = int(cond.shape[0])
+        depth = int(cond.shape[1])
+    else:
+        frontier_len = int(cond.shape[1])
+        depth = int(cond.shape[0])
+    if frontier_len <= 0 or depth <= 1:
+        return cond, False
+
+    field = np.random.rand(frontier_len).astype(np.float32)
+    field = ndimage.gaussian_filter1d(field, sigma=float(ragged_frontier_lowfreq_sigma), mode="nearest")
+    field = field - float(field.min())
+    field = field / max(float(field.max()), 1e-6)
+    inset = np.rint(field * float(ragged_frontier_max_inset)).astype(np.int64)
+    inset = np.clip(inset, 0, max(0, depth - 1))
+
+    gap_choices = list(ragged_frontier_gap_length_choices or [])
+    if gap_choices:
+        span_count = 1 + int(random.random() < 0.35)
+        for _ in range(span_count):
+            span = int(random.choice(gap_choices))
+            if span <= 0:
+                continue
+            start = random.randint(0, max(0, frontier_len - 1))
+            end = min(frontier_len, start + span)
+            inset[start:end] = np.maximum(inset[start:end], max(1, min(depth - 1, int(ragged_frontier_max_inset))))
+
+    if direction == "left":
+        for row_idx, amount in enumerate(inset.tolist()):
+            if amount > 0:
+                cond[row_idx, depth - int(amount):, :] = np.nan
+    elif direction == "right":
+        for row_idx, amount in enumerate(inset.tolist()):
+            if amount > 0:
+                cond[row_idx, :int(amount), :] = np.nan
+    elif direction == "up":
+        for col_idx, amount in enumerate(inset.tolist()):
+            if amount > 0:
+                cond[depth - int(amount):, col_idx, :] = np.nan
+    elif direction == "down":
+        for col_idx, amount in enumerate(inset.tolist()):
+            if amount > 0:
+                cond[:int(amount), col_idx, :] = np.nan
+    else:
+        raise ValueError(f"unsupported direction {direction!r}")
+
+    prompt_grid = extract_frontier_prompt_band(cond, direction=str(direction), frontier_band_width=int(frontier_band_width))
+    if not bool(np.isfinite(prompt_grid).all(axis=-1).any()):
+        cond = _restore_single_prompt_strip(
+            cond,
+            original,
+            direction=str(direction),
+            frontier_band_width=int(frontier_band_width),
+        )
+    return cond, True
+
+
 def _fast_prefilter_plan(
     surface_local: np.ndarray,
     *,
@@ -697,6 +802,16 @@ class AutoregMeshDataset(Dataset):
             augmentation_cfg=self.config.get("spatial_augmentation", {}),
             enabled=self.apply_spatial_augmentation,
         )
+        frontier_band_width = _sample_frontier_band_width(self.config)
+        cond_local, ragged_frontier_applied = _apply_ragged_frontier_augmentation(
+            cond_local,
+            direction=str(conditioning["cond_direction"]).lower(),
+            frontier_band_width=int(frontier_band_width),
+            ragged_frontier_prob=float(self.config.get("ragged_frontier_prob", 0.0)),
+            ragged_frontier_max_inset=int(self.config.get("ragged_frontier_max_inset", 0)),
+            ragged_frontier_gap_length_choices=self.config.get("ragged_frontier_gap_length_choices"),
+            ragged_frontier_lowfreq_sigma=float(self.config.get("ragged_frontier_lowfreq_sigma", 12.0)),
+        )
         vol_crop = _apply_volume_only_augmentation(
             vol_crop,
             self.config.get("volume_only_augmentation", {}),
@@ -709,7 +824,7 @@ class AutoregMeshDataset(Dataset):
             volume_shape=self.crop_size,
             patch_size=self.config["patch_size"],
             offset_num_bins=self.config["offset_num_bins"],
-            frontier_band_width=int(self.config["frontier_band_width"]),
+            frontier_band_width=int(frontier_band_width),
             surface_downsample_factor=effective_surface_downsample_factor,
             use_stored_resolution_only=use_stored_surface,
         )
@@ -722,9 +837,9 @@ class AutoregMeshDataset(Dataset):
             serialized["target_grid_local"],
             volume_shape=self.crop_size,
             direction=str(serialized["direction"]),
-            frontier_band_width=int(self.config["frontier_band_width"]),
+            frontier_band_width=int(frontier_band_width),
         )
-        if _should_reject_boundary_stats(boundary_stats):
+        if (not bool(ragged_frontier_applied)) and _should_reject_boundary_stats(boundary_stats):
             return None
 
         sample_key = (int(patch_idx), int(wrap_idx))
@@ -761,6 +876,8 @@ class AutoregMeshDataset(Dataset):
                 "conditioning_shape": tuple(int(v) for v in serialized["conditioning_grid_local"].shape[:2]),
                 "sample_key": sample_key,
                 "surface_sampling_mode": "stored" if use_stored_surface else "full",
+                "frontier_band_width": int(frontier_band_width),
+                "ragged_frontier_applied": bool(ragged_frontier_applied),
                 "spatial_augmented": bool(spatial_aug_metadata["spatial_augmented"]),
                 "spatial_mirror_axes": list(spatial_aug_metadata["spatial_mirror_axes"]),
                 "spatial_axis_order": list(spatial_aug_metadata["spatial_axis_order"]),

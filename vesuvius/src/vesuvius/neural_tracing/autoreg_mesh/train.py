@@ -712,6 +712,14 @@ def _seam_loss_weight_active(cfg: dict, *, global_step: int) -> float:
     return float(cfg.get("seam_loss_weight", 0.0))
 
 
+def _seam_anchor_loss_weight_active(cfg: dict, *, global_step: int) -> float:
+    if float(cfg.get("seam_anchor_loss_weight", 0.0)) <= 0.0:
+        return 0.0
+    if int(global_step) < int(cfg.get("seam_anchor_start_step", 0)):
+        return 0.0
+    return float(cfg.get("seam_anchor_loss_weight", 0.0))
+
+
 def _triangle_barrier_weight_active(cfg: dict, *, global_step: int) -> float:
     if not bool(cfg.get("triangle_barrier_enabled", True)):
         return 0.0
@@ -721,8 +729,11 @@ def _triangle_barrier_weight_active(cfg: dict, *, global_step: int) -> float:
 
 
 def _boundary_loss_weight_active(cfg: dict, *, global_step: int) -> float:
-    del cfg, global_step
-    return 0.0
+    if not bool(cfg.get("boundary_loss_enabled", False)):
+        return 0.0
+    if int(global_step) < int(cfg.get("boundary_loss_start_step", 0)):
+        return 0.0
+    return float(cfg.get("boundary_loss_weight", 0.0))
 
 
 def _geometry_metric_weight_active(cfg: dict, *, global_step: int) -> float:
@@ -1219,6 +1230,8 @@ def _evaluate_validation(
                 seam_loss_weight_active=_seam_loss_weight_active(cfg, global_step=global_step),
                 seam_loss_type=str(cfg.get("seam_loss", "edge_huber")),
                 seam_band_width=int(cfg.get("seam_band_width", 1)),
+                seam_anchor_loss_weight_active=_seam_anchor_loss_weight_active(cfg, global_step=global_step),
+                seam_anchor_loss_type="huber",
                 triangle_barrier_weight_active=_triangle_barrier_weight_active(cfg, global_step=global_step),
                 triangle_barrier_margin=float(cfg.get("triangle_barrier_margin", 0.05)),
                 boundary_loss_weight_active=_boundary_loss_weight_active(cfg, global_step=global_step),
@@ -1402,6 +1415,7 @@ def run_autoreg_mesh_training(
             position_refine_weight_active = _position_refine_weight_active(cfg, global_step=global_step)
             xyz_soft_loss_weight_active = _xyz_soft_loss_weight_active(cfg, global_step=global_step)
             seam_loss_weight_active = _seam_loss_weight_active(cfg, global_step=global_step)
+            seam_anchor_loss_weight_active = _seam_anchor_loss_weight_active(cfg, global_step=global_step)
             triangle_barrier_weight_active = _triangle_barrier_weight_active(cfg, global_step=global_step)
             boundary_loss_weight_active = _boundary_loss_weight_active(cfg, global_step=global_step)
             geometry_metric_weight_active = _geometry_metric_weight_active(cfg, global_step=global_step)
@@ -1428,6 +1442,8 @@ def run_autoreg_mesh_training(
                     seam_loss_weight_active=seam_loss_weight_active,
                     seam_loss_type=str(cfg.get("seam_loss", "edge_huber")),
                     seam_band_width=int(cfg.get("seam_band_width", 1)),
+                    seam_anchor_loss_weight_active=seam_anchor_loss_weight_active,
+                    seam_anchor_loss_type="huber",
                     triangle_barrier_weight_active=triangle_barrier_weight_active,
                     triangle_barrier_margin=float(cfg.get("triangle_barrier_margin", 0.05)),
                     boundary_loss_weight_active=boundary_loss_weight_active,
@@ -1463,6 +1479,7 @@ def run_autoreg_mesh_training(
             metrics["position_refine_weight_active"] = float(position_refine_weight_active)
             metrics["xyz_soft_loss_weight_active"] = float(xyz_soft_loss_weight_active)
             metrics["seam_loss_weight_active"] = float(seam_loss_weight_active)
+            metrics["seam_anchor_loss_weight_active"] = float(seam_anchor_loss_weight_active)
             metrics["triangle_barrier_weight_active"] = float(triangle_barrier_weight_active)
             metrics["boundary_loss_weight_active"] = float(boundary_loss_weight_active)
             metrics["geometry_metric_weight_active"] = float(geometry_metric_weight_active)

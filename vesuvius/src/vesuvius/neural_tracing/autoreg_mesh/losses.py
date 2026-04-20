@@ -590,6 +590,26 @@ def _seam_edge_loss_from_sequence(pred_xyz_sequence: Tensor, batch: dict, *, ban
     return torch.stack(losses).mean()
 
 
+def _seam_anchor_loss_from_sequence(pred_xyz_sequence: Tensor, batch: dict, *, loss_type: str) -> Tensor:
+    if str(loss_type) != "huber":
+        raise ValueError(f"Unsupported seam_anchor_loss={loss_type!r}")
+    if not _geometry_batch_available(batch):
+        return pred_xyz_sequence.new_zeros(())
+    losses = []
+    for example in _iter_geometry_examples(pred_xyz_sequence, batch):
+        cond_band, pred_band, target_band, valid_band = _paired_seam_bands(example, band_width=1)
+        band_axis = 1 if str(example["direction"]) in {"left", "right"} else 0
+        pred_seam = pred_band.select(dim=band_axis, index=0)
+        target_seam = target_band.select(dim=band_axis, index=0)
+        seam_valid = valid_band.select(dim=band_axis, index=0)
+        per_vertex = F.smooth_l1_loss(pred_seam, target_seam, reduction="none").mean(dim=-1)
+        if bool(seam_valid.any()):
+            losses.append(_masked_mean(per_vertex, seam_valid))
+    if not losses:
+        return pred_xyz_sequence.new_zeros(())
+    return torch.stack(losses).mean()
+
+
 def _triangle_det_ratio(
     pred_p0: Tensor,
     pred_p1: Tensor,
@@ -878,6 +898,8 @@ def compute_autoreg_mesh_losses(
     seam_loss_weight_active: float = 0.0,
     seam_loss_type: str = "edge_huber",
     seam_band_width: int = 1,
+    seam_anchor_loss_weight_active: float = 0.0,
+    seam_anchor_loss_type: str = "huber",
     triangle_barrier_weight_active: float = 0.0,
     triangle_barrier_margin: float = 0.05,
     boundary_loss_weight_active: float = 0.0,
@@ -933,6 +955,7 @@ def compute_autoreg_mesh_losses(
         total_loss = total_loss + float(xyz_soft_loss_weight_active) * xyz_soft_loss
 
     seam_loss = total_loss.new_zeros(())
+    seam_anchor_loss = total_loss.new_zeros(())
     seam_edge_error_soft = _seam_edge_error_from_sequence(soft_xyz_for_loss.detach(), batch, band_width=int(seam_band_width))
     if float(seam_loss_weight_active) > 0.0:
         seam_loss = _seam_edge_loss_from_sequence(
@@ -942,6 +965,13 @@ def compute_autoreg_mesh_losses(
             loss_type=seam_loss_type,
         )
         total_loss = total_loss + float(seam_loss_weight_active) * seam_loss
+    if float(seam_anchor_loss_weight_active) > 0.0:
+        seam_anchor_loss = _seam_anchor_loss_from_sequence(
+            soft_xyz_for_loss,
+            batch,
+            loss_type=seam_anchor_loss_type,
+        )
+        total_loss = total_loss + float(seam_anchor_loss_weight_active) * seam_anchor_loss
 
     triangle_barrier_loss = total_loss.new_zeros(())
     triangle_flip_rate_soft = _triangle_flip_rate_from_sequence(soft_xyz_for_loss.detach(), batch)
@@ -1019,6 +1049,8 @@ def compute_autoreg_mesh_losses(
         "xyz_l1_refined": xyz_l1_refined,
         "seam_loss": seam_loss,
         "seam_loss_weight_active": total_loss.new_tensor(float(seam_loss_weight_active)),
+        "seam_anchor_loss": seam_anchor_loss,
+        "seam_anchor_loss_weight_active": total_loss.new_tensor(float(seam_anchor_loss_weight_active)),
         "seam_edge_error_soft": seam_edge_error_soft,
         "seam_edge_error_refined": seam_edge_error_refined,
         "triangle_barrier_loss": triangle_barrier_loss,

@@ -47,13 +47,31 @@ def _normalize_axis_list(name: str, value) -> list[int]:
     return axes
 
 
+def _normalize_positive_int_list(name: str, value, *, allow_none: bool = True) -> list[int] | None:
+    if value is None:
+        if allow_none:
+            return None
+        raise ValueError(f"{name} must be a non-empty sequence of positive integers")
+    if not isinstance(value, (list, tuple)) or len(value) == 0:
+        raise ValueError(f"{name} must be a non-empty sequence of positive integers")
+    normalized = [int(v) for v in value]
+    if any(int(v) <= 0 for v in normalized):
+        raise ValueError(f"{name} values must be positive, got {value!r}")
+    return normalized
+
+
 DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "seed": 0,
     "crop_size": [128, 128, 128],
     "sample_mode": "wrap",
     "frontier_band_width": 4,
+    "frontier_band_width_choices": None,
     "surface_downsample_factor": 1,
     "use_stored_resolution_only": False,
+    "ragged_frontier_prob": 0.0,
+    "ragged_frontier_max_inset": 0,
+    "ragged_frontier_gap_length_choices": None,
+    "ragged_frontier_lowfreq_sigma": 12.0,
     "prefilter_show_progress": True,
     "spatial_augmentation": {
         "enabled": True,
@@ -113,6 +131,8 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "seam_loss_start_step": 0,
     "seam_loss": "edge_huber",
     "seam_band_width": 1,
+    "seam_anchor_loss_weight": 0.0,
+    "seam_anchor_start_step": 0,
     "triangle_barrier_enabled": True,
     "triangle_barrier_weight": 0.1,
     "triangle_barrier_start_step": 0,
@@ -230,7 +250,23 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("prefilter_show_progress must be a boolean")
     if int(cfg["frontier_band_width"]) <= 0:
         raise ValueError("frontier_band_width must be positive")
+    cfg["frontier_band_width_choices"] = _normalize_positive_int_list(
+        "frontier_band_width_choices",
+        cfg.get("frontier_band_width_choices"),
+        allow_none=True,
+    )
     cfg["surface_downsample_factor"] = _normalize_surface_downsample_factor(cfg["surface_downsample_factor"])
+    if float(cfg.get("ragged_frontier_prob", 0.0)) < 0.0 or float(cfg.get("ragged_frontier_prob", 0.0)) > 1.0:
+        raise ValueError("ragged_frontier_prob must be within [0, 1]")
+    if int(cfg.get("ragged_frontier_max_inset", 0)) < 0:
+        raise ValueError("ragged_frontier_max_inset must be non-negative")
+    cfg["ragged_frontier_gap_length_choices"] = _normalize_positive_int_list(
+        "ragged_frontier_gap_length_choices",
+        cfg.get("ragged_frontier_gap_length_choices"),
+        allow_none=True,
+    )
+    if float(cfg.get("ragged_frontier_lowfreq_sigma", 12.0)) <= 0.0:
+        raise ValueError("ragged_frontier_lowfreq_sigma must be positive")
     if any(size <= 0 for size in cfg["input_shape"]):
         raise ValueError(f"input_shape must be positive, got {cfg['input_shape']!r}")
     if any(size <= 0 for size in cfg["patch_size"]):
@@ -316,6 +352,10 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("seam_loss_start_step must be >= 0")
     if int(cfg["seam_band_width"]) <= 0:
         raise ValueError("seam_band_width must be positive")
+    if float(cfg.get("seam_anchor_loss_weight", 0.0)) < 0.0:
+        raise ValueError("seam_anchor_loss_weight must be non-negative")
+    if int(cfg.get("seam_anchor_start_step", 0)) < 0:
+        raise ValueError("seam_anchor_start_step must be >= 0")
     if float(cfg["triangle_barrier_weight"]) < 0.0:
         raise ValueError("triangle_barrier_weight must be non-negative")
     if int(cfg["triangle_barrier_start_step"]) < 0:

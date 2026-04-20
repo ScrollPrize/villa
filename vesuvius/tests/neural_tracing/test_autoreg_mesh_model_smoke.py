@@ -19,12 +19,14 @@ import vesuvius.neural_tracing.autoreg_mesh.model as autoreg_mesh_model_module
 from vesuvius.models.build.pretrained_backbones.dinovol_2_builder import build_dinovol_2_backbone
 from vesuvius.models.build.pretrained_backbones.rope import MixedRopePositionEmbedding
 from vesuvius.neural_tracing.autoreg_mesh.benchmark import run_autoreg_mesh_benchmark
-from vesuvius.neural_tracing.autoreg_mesh.config import validate_autoreg_mesh_config
+from vesuvius.neural_tracing.autoreg_mesh.config import load_autoreg_mesh_config, validate_autoreg_mesh_config
 from vesuvius.neural_tracing.autoreg_mesh.dataset import (
+    _apply_ragged_frontier_augmentation,
     _apply_spatial_augmentation,
     _apply_volume_only_augmentation,
     _compute_target_boundary_stats,
     _fast_prefilter_plan,
+    _sample_frontier_band_width,
     _should_reject_boundary_stats,
     autoreg_mesh_collate,
 )
@@ -46,8 +48,13 @@ from vesuvius.neural_tracing.autoreg_mesh.model import (
     RotarySelfAttention,
     _batched_rope_from_coords,
 )
-from vesuvius.neural_tracing.autoreg_mesh.serialization import deserialize_continuation_grid, serialize_split_conditioning_example
+from vesuvius.neural_tracing.autoreg_mesh.serialization import (
+    deserialize_continuation_grid,
+    extract_frontier_prompt_band,
+    serialize_split_conditioning_example,
+)
 from vesuvius.neural_tracing.autoreg_mesh.train import (
+    _load_checkpoint_payload,
     _build_spatial_split_groups,
     _choose_best_xy_slice,
     _edge_segment_on_z_slice,
@@ -63,6 +70,7 @@ from vesuvius.neural_tracing.autoreg_mesh.train import (
     _restrict_dataset_samples,
     _scheduled_sampling_feedback_state,
     _split_dataset,
+    _validate_checkpoint_compatibility,
     run_autoreg_mesh_training,
 )
 from vesuvius.neural_tracing.datasets.triplet_resampling import choose_replacement_index
@@ -1509,6 +1517,57 @@ def test_position_refine_loss_is_gated_by_step_weight(tmp_path: Path) -> None:
     assert on_losses["loss"].item() >= off_losses["loss"].item()
 
 
+def test_seam_anchor_loss_only_uses_seam_adjacent_strip(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "tiny_dinovol.pt"
+    _write_local_guide_checkpoint(checkpoint)
+    config = _make_config(checkpoint)
+    model = AutoregMeshModel(config).eval()
+
+    batch = autoreg_mesh_collate([_make_sample("left")])
+    batch = _move_batch(batch, torch.device("cpu"))
+    outputs = model(batch)
+
+    seam_mask = batch["target_strip_positions"][:, :, 0] == 0
+    non_seam_mask = batch["target_strip_positions"][:, :, 0] == 1
+
+    seam_outputs = dict(outputs)
+    non_seam_outputs = dict(outputs)
+    for key in ("pred_xyz", "pred_xyz_soft", "pred_xyz_refined"):
+        seam_outputs[key] = outputs[key].clone()
+        non_seam_outputs[key] = outputs[key].clone()
+        seam_outputs[key][seam_mask] = seam_outputs[key][seam_mask] + 1.0
+        non_seam_outputs[key][non_seam_mask] = non_seam_outputs[key][non_seam_mask] + 1.0
+
+    base_losses = compute_autoreg_mesh_losses(
+        outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+        seam_anchor_loss_weight_active=1.0,
+        seam_anchor_loss_type="huber",
+    )
+    seam_losses = compute_autoreg_mesh_losses(
+        seam_outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+        seam_anchor_loss_weight_active=1.0,
+        seam_anchor_loss_type="huber",
+    )
+    non_seam_losses = compute_autoreg_mesh_losses(
+        non_seam_outputs,
+        batch,
+        offset_num_bins=(4, 4, 4),
+        seam_anchor_loss_weight_active=1.0,
+        seam_anchor_loss_type="huber",
+    )
+
+    assert seam_losses["seam_anchor_loss"].item() > base_losses["seam_anchor_loss"].item()
+    assert non_seam_losses["seam_anchor_loss"].item() == pytest.approx(
+        base_losses["seam_anchor_loss"].item(),
+        rel=1e-6,
+        abs=1e-6,
+    )
+
+
 def test_refine_target_matches_bin_center_residual(tmp_path: Path) -> None:
     checkpoint = tmp_path / "tiny_dinovol.pt"
     _write_local_guide_checkpoint(checkpoint)
@@ -2469,6 +2528,13 @@ def test_distance_aware_target_default_config_values() -> None:
     assert validated["spatial_augmentation"]["transpose_axes"] == [0, 1, 2]
     assert validated["volume_only_augmentation"]["enabled"] is True
     assert validated["volume_only_augmentation"]["gamma_prob"] == pytest.approx(0.4)
+    assert validated["frontier_band_width_choices"] is None
+    assert validated["ragged_frontier_prob"] == pytest.approx(0.0)
+    assert validated["ragged_frontier_max_inset"] == 0
+    assert validated["ragged_frontier_gap_length_choices"] is None
+    assert validated["ragged_frontier_lowfreq_sigma"] == pytest.approx(12.0)
+    assert validated["seam_anchor_loss_weight"] == pytest.approx(0.0)
+    assert validated["seam_anchor_start_step"] == 0
 
 
 def test_anisotropic_surface_downsample_factor_validates() -> None:
@@ -2477,6 +2543,39 @@ def test_anisotropic_surface_downsample_factor_validates() -> None:
     validated = validate_autoreg_mesh_config(config)
 
     assert validated["surface_downsample_factor"] == (2, 1)
+
+
+def test_frontier_band_width_choices_validate() -> None:
+    config = _make_cached_token_config()
+    config["frontier_band_width_choices"] = [4, 8, 12]
+    validated = validate_autoreg_mesh_config(config)
+
+    assert validated["frontier_band_width_choices"] == [4, 8, 12]
+
+
+def test_sample_frontier_band_width_uses_choices(monkeypatch: pytest.MonkeyPatch) -> None:
+    config = _make_cached_token_config()
+    config["frontier_band_width_choices"] = [4, 8, 12]
+    monkeypatch.setattr("random.choice", lambda values: values[-1])
+
+    assert _sample_frontier_band_width(config) == 12
+
+
+def test_ragged_frontier_augmentation_preserves_usable_prompt() -> None:
+    cond_grid = _make_surface(8, 12, z_offset=4.0, y_offset=2.0, x_offset=3.0)
+    augmented, applied = _apply_ragged_frontier_augmentation(
+        cond_grid,
+        direction="down",
+        frontier_band_width=4,
+        ragged_frontier_prob=1.0,
+        ragged_frontier_max_inset=6,
+        ragged_frontier_gap_length_choices=[4, 8],
+        ragged_frontier_lowfreq_sigma=2.0,
+    )
+
+    assert applied is True
+    prompt_band = extract_frontier_prompt_band(augmented, direction="down", frontier_band_width=4)
+    assert bool(np.isfinite(prompt_band).all(axis=-1).any())
 
 
 def test_distance_aware_coarse_loss_prefers_nearby_cells() -> None:
@@ -2689,6 +2788,41 @@ def test_rope_config_validation_rejects_invalid_values() -> None:
     bad_downsample["surface_downsample_factor"] = [2, 1, 1]
     with pytest.raises(ValueError, match="surface_downsample_factor"):
         validate_autoreg_mesh_config(bad_downsample)
+
+    bad_frontier_choices = _make_cached_token_config()
+    bad_frontier_choices["frontier_band_width_choices"] = [4, 0]
+    with pytest.raises(ValueError, match="frontier_band_width_choices"):
+        validate_autoreg_mesh_config(bad_frontier_choices)
+
+    bad_ragged_prob = _make_cached_token_config()
+    bad_ragged_prob["ragged_frontier_prob"] = 1.5
+    with pytest.raises(ValueError, match="ragged_frontier_prob"):
+        validate_autoreg_mesh_config(bad_ragged_prob)
+
+    bad_ragged_inset = _make_cached_token_config()
+    bad_ragged_inset["ragged_frontier_max_inset"] = -1
+    with pytest.raises(ValueError, match="ragged_frontier_max_inset"):
+        validate_autoreg_mesh_config(bad_ragged_inset)
+
+    bad_gap_choices = _make_cached_token_config()
+    bad_gap_choices["ragged_frontier_gap_length_choices"] = [8, -4]
+    with pytest.raises(ValueError, match="ragged_frontier_gap_length_choices"):
+        validate_autoreg_mesh_config(bad_gap_choices)
+
+    bad_ragged_sigma = _make_cached_token_config()
+    bad_ragged_sigma["ragged_frontier_lowfreq_sigma"] = 0.0
+    with pytest.raises(ValueError, match="ragged_frontier_lowfreq_sigma"):
+        validate_autoreg_mesh_config(bad_ragged_sigma)
+
+    bad_seam_anchor_weight = _make_cached_token_config()
+    bad_seam_anchor_weight["seam_anchor_loss_weight"] = -0.1
+    with pytest.raises(ValueError, match="seam_anchor_loss_weight"):
+        validate_autoreg_mesh_config(bad_seam_anchor_weight)
+
+    bad_seam_anchor_step = _make_cached_token_config()
+    bad_seam_anchor_step["seam_anchor_start_step"] = -1
+    with pytest.raises(ValueError, match="seam_anchor_start_step"):
+        validate_autoreg_mesh_config(bad_seam_anchor_step)
 
     bad_aug_prob = _make_cached_token_config()
     bad_aug_prob["volume_only_augmentation"] = {"enabled": True, "gamma_prob": 1.5}
@@ -3050,3 +3184,35 @@ def test_autoreg_mesh_resume_rejects_mismatched_coarse_prediction_mode(tmp_path:
     )
     with pytest.raises(ValueError, match="coarse_prediction_mode"):
         run_autoreg_mesh_training(second_config, dataset=dataset, device="cpu", max_steps=2)
+
+
+def test_ragged_retrain_config_loads() -> None:
+    config_path = Path(
+        "/home/giorgio/Projects/llm-tracer/villa/vesuvius/src/vesuvius/neural_tracing/configs/"
+        "config_autoreg_mesh_0139_2um_r1_sigma066_axis_factorized_sd_retrain_standard_ragged.json"
+    )
+    config = load_autoreg_mesh_config(config_path)
+
+    assert config["attention_scaling_mode"] == "standard"
+    assert config["coarse_prediction_mode"] == "axis_factorized"
+    assert config["frontier_band_width_choices"] == [4, 8, 12, 16]
+    assert config["ragged_frontier_prob"] == pytest.approx(0.7)
+    assert config["seam_anchor_loss_weight"] == pytest.approx(1.0)
+    assert config["load_ckpt"] is None
+    assert config["load_weights_only"] is False
+
+
+def test_legacy_finetune_config_is_checkpoint_compatible() -> None:
+    config_path = Path(
+        "/home/giorgio/Projects/llm-tracer/villa/vesuvius/src/vesuvius/neural_tracing/configs/"
+        "config_autoreg_mesh_0139_2um_r1_sigma066_axis_factorized_sd_finetune_legacy_ragged.json"
+    )
+    config = load_autoreg_mesh_config(config_path)
+    ckpt_payload = _load_checkpoint_payload(config["load_ckpt"])
+    _validate_checkpoint_compatibility(config, ckpt_payload)
+
+    assert config["attention_scaling_mode"] == "legacy_double_scaled"
+    assert config["coarse_prediction_mode"] == "axis_factorized"
+    assert config["load_weights_only"] is True
+    assert config["ragged_frontier_prob"] == pytest.approx(0.85)
+    assert config["frontier_band_width_choices"] == [8, 12, 16]
