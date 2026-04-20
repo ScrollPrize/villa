@@ -113,6 +113,8 @@ private:
     int totalChunksPerShard() const noexcept;
     std::vector<uint8_t> fetchFromShard(const ChunkKey& key);
     std::vector<uint8_t> httpGet(const std::string& url);
+    std::vector<uint8_t> httpGetRange(const std::string& url,
+                                      std::size_t offset, std::size_t length);
 
     std::string baseUrl_;
     std::string delimiter_;
