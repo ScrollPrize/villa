@@ -77,7 +77,12 @@ static inline bool c3d_is_chunk(const uint8_t *in, size_t n) {
 typedef void (*c3d_panic_fn)(const char *file, int line, const char *msg);
 void c3d_set_panic_hook(c3d_panic_fn hook);
 
-_Noreturn void c3d_panic(const char *file, int line, const char *msg);
+#ifdef __cplusplus
+[[noreturn]]
+#else
+_Noreturn
+#endif
+void c3d_panic(const char *file, int line, const char *msg);
 
 #define c3d_assert(cond)                                                      \
     do {                                                                      \
