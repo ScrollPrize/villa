@@ -2694,7 +2694,10 @@ def train(
 
                 with torch.amp.autocast(device_type=device_type, dtype=amp_dtype, enabled=use_autocast):
                     for pass_i, (offset, has_prior) in enumerate(scale_seq):
-                        # CT + GT at this scale from batch data
+                        # CT + GT at this scale from batch data.
+                        # Fall back to scale 0 if non-zero scale data
+                        # is unavailable (keeps all DDP ranks in sync).
+                        eff_offset = offset
                         if offset == 0:
                             ct = image
                             tgt, val = targets_0, validity_0
@@ -2709,18 +2712,27 @@ def train(
                                 same_surface_threshold=same_surface_threshold or 0.0,
                             )
                             if scale_data is None:
-                                continue
-                            ct, tgt, val, dsm, ddm, daw, pass_dts, pass_bfrac, pass_blo, pass_bhi = scale_data
-                            ct = augment_intensity(ct)
+                                # Fall back to scale 0
+                                eff_offset = 0
+                                ct = image
+                                tgt, val = targets_0, validity_0
+                                dsm, ddm, daw = dsm_0, ddm_0, daw_0
+                                pass_dts = _batch_dts
+                                pass_bfrac = _bracket_frac
+                                pass_blo = _bracket_lo
+                                pass_bhi = _bracket_hi
+                            else:
+                                ct, tgt, val, dsm, ddm, daw, pass_dts, pass_bfrac, pass_blo, pass_bhi = scale_data
+                                ct = augment_intensity(ct)
 
                         # Build prior
                         if has_prior and prev_pred is not None:
                             prior = _resample_prior(
-                                prev_pred.detach(), prev_offset, offset, P,
+                                prev_pred.detach(), prev_offset, eff_offset, P,
                             )
                         else:
                             prior = None
-                        model_in = _build_refine_input(ct, prior, offset)
+                        model_in = _build_refine_input(ct, prior, eff_offset)
 
                         # Forward
                         results = model(model_in)
@@ -2730,8 +2742,8 @@ def train(
                         # Cage deformation at this scale
                         tgt_orig_pass = tgt
                         val_orig_pass = val
-                        cage_suffix = {-1: "_m1", 0: "", 1: "_fine"}.get(offset, "")
-                        cage_key = f"cage_ctrl_pos{cage_suffix}" if offset != 0 else "cage_ctrl_pos"
+                        cage_suffix = {-1: "_m1", 0: "", 1: "_fine"}.get(eff_offset, "")
+                        cage_key = f"cage_ctrl_pos{cage_suffix}" if eff_offset != 0 else "cage_ctrl_pos"
                         cage_active_pass = (
                             deform_enabled
                             and cage_key in batch
@@ -2739,9 +2751,9 @@ def train(
                             and f"cage_grid_rc{cage_suffix}" in batch
                         )
                         if cage_active_pass:
-                            cs = {-1: 0.5, 0: 1.0, 1: 2.0}.get(offset, 1.0)
+                            cs = {-1: 0.5, 0: 1.0, 1: 2.0}.get(eff_offset, 1.0)
                             # Build a batch view with scale-appropriate cage data
-                            if offset != 0:
+                            if eff_offset != 0:
                                 deform_batch = dict(batch)
                                 deform_batch["cage_ctrl_pos"] = batch[f"cage_ctrl_pos{cage_suffix}"]
                                 deform_batch["cage_ctrl_normals"] = batch[f"cage_ctrl_normals{cage_suffix}"]
@@ -2809,12 +2821,7 @@ def train(
                         total_loss = total_loss + pass_loss
 
                         prev_pred = pred_pass
-                        prev_offset = offset
-
-                    # All passes skipped (no scale data available)
-                    if prev_pred is None:
-                        n_skipped += 1
-                        continue
+                        prev_offset = eff_offset
 
                     # Set variables for logging (use last pass values)
                     cage_deform_active = cage_active_pass

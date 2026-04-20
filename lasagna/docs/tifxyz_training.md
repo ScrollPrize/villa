@@ -383,9 +383,15 @@ python lasagna/scripts/test_refine_scales.py \
 ### GPU pause/resume
 
 Training supports pausing to free the GPU for other applications.
-A Unix domain socket at `~/.gpu_pause.sock` accepts commands.
+Multiple processes can chain: training → inference A pauses training →
+inference B pauses A → B finishes, A resumes → A finishes, training resumes.
 
-Control from another terminal:
+Each GPU-using process runs a `GpuPauseServer` on a PID-based Unix socket
+(`/tmp/gpu_pause.<pid>.sock`).  A stack file (`~/.gpu_owner_stack`) tracks
+the LIFO ownership order.  If a pausing process crashes, the paused process
+auto-resumes within 5 seconds (watchdog).
+
+Control from another terminal (auto-discovers current GPU owner):
 
 ```bash
 python lasagna/gpu_pause.py pause    # finish batch, offload to CPU, reply ok
