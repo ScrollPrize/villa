@@ -132,6 +132,97 @@ def label_to_image_zyx_matrix(matrix_xyz: np.ndarray, invert: bool = True) -> np
     return matrix_swap_xyz_zyx(m)
 
 
+def image_to_label_zyx_matrix(matrix_xyz: np.ndarray) -> np.ndarray:
+    """ZYX-ordered affine from image coords to label coords.
+
+    With ``p_fixed = M @ p_moving`` and labels=fixed, image=moving in our
+    pipeline, the forward direction ``label_xyz = M @ image_xyz`` maps each
+    image voxel to its corresponding label voxel.
+    """
+    return matrix_swap_xyz_zyx(matrix_xyz)
+
+
+def image_patch_label_aabb(
+    matrix_image_to_label_zyx: np.ndarray,
+    position_image_zyx: Tuple[int, int, int],
+    patch_shape_zyx: Tuple[int, int, int],
+    label_shape_zyx: Optional[Tuple[int, int, int]] = None,
+    margin: int = 1,
+) -> Tuple[Tuple[int, int, int], Tuple[int, int, int]]:
+    """Compute the label-volume AABB enclosing the forward-mapped image patch.
+
+    Mirror of ``label_patch_image_aabb`` but in the image→label direction.
+    """
+    return label_patch_image_aabb(
+        matrix_image_to_label_zyx,
+        position_image_zyx,
+        patch_shape_zyx,
+        image_shape_zyx=label_shape_zyx,
+        margin=margin,
+    )
+
+
+def resample_label_to_image_grid(
+    labels_array,
+    matrix_image_to_label_zyx: np.ndarray,
+    position_image_zyx: Tuple[int, int, int],
+    patch_shape_zyx: Tuple[int, int, int],
+    *,
+    order: int = 0,
+    cval: float = 0.0,
+) -> np.ndarray:
+    """Resample a patch of ``labels_array`` onto the image patch grid.
+
+    Default ``order=0`` (nearest neighbor) preserves binary label values.
+    The label slab fetched from disk is bounded by the forward-mapped AABB
+    of the image patch (much smaller than the image patch itself when the
+    image voxel size is finer than the label voxel size, which is the
+    typical fibers setting).
+    """
+    label_shape = tuple(labels_array.shape[-3:])
+    start, stop = image_patch_label_aabb(
+        matrix_image_to_label_zyx,
+        position_image_zyx,
+        patch_shape_zyx,
+        label_shape_zyx=label_shape,
+    )
+
+    if any(st >= sp for st, sp in zip(start, stop)):
+        return np.full(patch_shape_zyx, cval, dtype=np.float32)
+
+    slab = np.asarray(
+        labels_array[start[0]:stop[0], start[1]:stop[1], start[2]:stop[2]],
+        dtype=np.float32,
+    )
+
+    dz, dy, dx = patch_shape_zyx
+    zs = np.arange(dz, dtype=np.float64)
+    ys = np.arange(dy, dtype=np.float64)
+    xs = np.arange(dx, dtype=np.float64)
+    gz, gy, gx = np.meshgrid(zs, ys, xs, indexing="ij")
+    grid = np.stack(
+        [
+            gz + position_image_zyx[0],
+            gy + position_image_zyx[1],
+            gx + position_image_zyx[2],
+        ],
+        axis=0,
+    ).reshape(3, -1)
+
+    mapped = apply_affine_zyx(matrix_image_to_label_zyx, grid.T).T
+    mapped -= np.array(start, dtype=np.float64).reshape(3, 1)
+
+    resampled = ndimage.map_coordinates(
+        slab,
+        mapped,
+        order=order,
+        mode="constant",
+        cval=cval,
+        prefilter=False,
+    )
+    return resampled.reshape(patch_shape_zyx).astype(np.float32)
+
+
 def apply_affine_zyx(matrix_zyx: np.ndarray, points_zyx: np.ndarray) -> np.ndarray:
     """Apply a 4x4 ZYX affine to an ``(N, 3)`` array of ZYX points."""
     if matrix_zyx.shape != (4, 4):
@@ -259,9 +350,12 @@ __all__ = [
     "get_swap_matrix",
     "matrix_swap_xyz_zyx",
     "label_to_image_zyx_matrix",
+    "image_to_label_zyx_matrix",
     "apply_affine_zyx",
     "label_patch_image_aabb",
+    "image_patch_label_aabb",
     "resample_image_to_label_grid",
+    "resample_label_to_image_grid",
     "matrix_checksum",
 ]
 

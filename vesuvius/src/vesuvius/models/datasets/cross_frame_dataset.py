@@ -174,6 +174,9 @@ class CrossFrameZarrDataset(Dataset):
         self._matrix_zyx_label_to_image = affine.label_to_image_zyx_matrix(
             self._matrix_xyz, invert=True
         )
+        self._matrix_zyx_image_to_label = affine.image_to_label_zyx_matrix(
+            self._matrix_xyz
+        )
         _stage("transform loaded")
 
         self.normalization_scheme = getattr(mgr, "normalization_scheme", "zscore")
@@ -220,6 +223,7 @@ class CrossFrameZarrDataset(Dataset):
     def _cache_key(self) -> str:
         payload = json.dumps(
             {
+                "sampling_frame": "image",  # v2: patches are image-space starts
                 "labels_url": self.labels_zarr_url,
                 "image_url": self.image_zarr_url,
                 "patch_size": list(self.patch_size),
@@ -367,18 +371,19 @@ class CrossFrameZarrDataset(Dataset):
         return self._scan_foreground_positions_full()
 
     def _scan_foreground_positions_coarse(self) -> List[Tuple[int, int, int]]:
-        """Scan the whole labels volume at a coarser OME-Zarr level in one read."""
+        """Enumerate image-space patch positions whose corresponding label
+        region (after applying the forward transform) contains foreground.
+
+        Strategy: read the coarse label level in one go, find label voxels
+        with FG, map each to an image-space position via
+        ``label_to_image_zyx``, snap the candidate image position to a
+        patch-stride grid so the mapped image patch contains the FG label
+        voxel, dedupe, and filter by image bounds.
+        """
         assert self._scan_array is not None
         fz, fy, fx = self._scan_factor
-        dz, dy, dx = self.patch_size
-        sz, sy, sx = self.stride
-
-        # Patch size (and stride) in coarse-level voxels. Floor-divide to stay
-        # inside the coarse array; a coarse FG voxel always implies at least
-        # one scale-0 FG voxel within, so false-positives at volume edges are
-        # filtered by the full-resolution verify pass.
-        ps_c = (max(1, dz // fz), max(1, dy // fy), max(1, dx // fx))
-        st_c = (max(1, sz // fz), max(1, sy // fy), max(1, sx // fx))
+        ps = np.asarray(self.patch_size, dtype=np.int64)
+        st = np.asarray(self.stride, dtype=np.int64)
 
         _stage(f"coarse scan: reading {self._scan_array.shape} into memory")
         coarse = np.asarray(self._scan_array[...])
@@ -391,33 +396,58 @@ class CrossFrameZarrDataset(Dataset):
             f"/ {coarse_mask.size} total ({100.0 * coarse_mask.mean():.2f}%)"
         )
 
-        cz, cy, cx = coarse_mask.shape
-        candidates: List[Tuple[int, int, int]] = []
-        for zc in range(0, max(1, cz - ps_c[0] + 1), st_c[0]):
-            for yc in range(0, max(1, cy - ps_c[1] + 1), st_c[1]):
-                for xc in range(0, max(1, cx - ps_c[2] + 1), st_c[2]):
-                    block = coarse_mask[
-                        zc:zc + ps_c[0], yc:yc + ps_c[1], xc:xc + ps_c[2]
-                    ]
-                    if not block.any():
-                        continue
-                    # Coarse FG ratio (same threshold meaning at both levels).
-                    if block.mean() < self.min_labeled_ratio:
-                        continue
-                    pos = (zc * fz, yc * fy, xc * fx)
-                    if not self._image_aabb_in_bounds(pos):
-                        continue
-                    candidates.append(pos)
+        fg_coarse = np.argwhere(coarse_mask)
+        if fg_coarse.size == 0:
+            return []
+
+        # Upscale the coarse FG voxel centers into label-scale-0 voxel centers.
+        factor = np.asarray(self._scan_factor, dtype=np.float64)
+        fg_label = fg_coarse.astype(np.float64) * factor + 0.5 * factor
+        # Map each label center to its image-space voxel.
+        fg_image = affine.apply_affine_zyx(
+            self._matrix_zyx_label_to_image, fg_label
+        )
+
+        # Snap each image center to a stride-aligned patch START such that
+        # the image center sits inside the patch.
+        image_starts = np.floor(fg_image - ps / 2.0).astype(np.int64)
+        image_starts = (image_starts // st) * st
+
+        image_shape = np.asarray(self._image_shape, dtype=np.int64)
+        keep = np.all(
+            (image_starts >= 0) & (image_starts + ps <= image_shape), axis=1
+        )
+        image_starts = image_starts[keep]
+        if image_starts.size == 0:
+            return []
+
+        # Dedupe.
+        unique = np.unique(image_starts, axis=0)
+        _stage(
+            f"coarse scan: {fg_coarse.shape[0]} coarse FG -> "
+            f"{unique.shape[0]} unique image-space patch starts"
+        )
+
+        candidates = [tuple(int(v) for v in row) for row in unique]
         _stage(f"coarse scan kept {len(candidates)} candidate patches")
         return candidates
 
     def _scan_foreground_positions_full(self) -> List[Tuple[int, int, int]]:
+        """Full-resolution scan of the labels volume, emitting image-space
+        patch starts (one per label FG patch).
+
+        Kept as a fallback when ``labels_scan_level`` is not set. The coarse
+        path is strictly preferred for realistic volumes.
+        """
         dz, dy, dx = self.patch_size
         sz, sy, sx = self.stride
         lz, ly, lx = self._labels_shape
-        patch_vol = float(dz * dy * dx)
 
-        positions: List[Tuple[int, int, int]] = []
+        image_shape = np.asarray(self._image_shape, dtype=np.int64)
+        ps_arr = np.asarray(self.patch_size, dtype=np.int64)
+        st_arr = np.asarray(self.stride, dtype=np.int64)
+
+        seen: set = set()
         for z in range(0, max(1, lz - dz + 1), sz):
             for y in range(0, max(1, ly - dy + 1), sy):
                 for x in range(0, max(1, lx - dx + 1), sx):
@@ -426,22 +456,26 @@ class CrossFrameZarrDataset(Dataset):
                     )
                     if slab.shape != (dz, dy, dx):
                         continue
-                    if self.valid_patch_value is None:
-                        mask = slab > 0
-                    else:
-                        mask = slab == self.valid_patch_value
-                    n_fg = int(mask.sum())
-                    if n_fg == 0:
+                    mask = (
+                        slab > 0 if self.valid_patch_value is None
+                        else slab == self.valid_patch_value
+                    )
+                    if not mask.any():
                         continue
-                    if n_fg / patch_vol < self.min_labeled_ratio:
+                    # Center of this label patch -> image voxel -> snap.
+                    center_label = np.array(
+                        [z + dz / 2.0, y + dy / 2.0, x + dx / 2.0], dtype=np.float64
+                    )[None, :]
+                    center_image = affine.apply_affine_zyx(
+                        self._matrix_zyx_label_to_image, center_label
+                    )[0]
+                    start = np.floor(center_image - ps_arr / 2.0).astype(np.int64)
+                    start = (start // st_arr) * st_arr
+                    if np.any(start < 0) or np.any(start + ps_arr > image_shape):
                         continue
-                    if self._bbox_ratio(mask) < self.min_bbox_percent:
-                        continue
-                    if not self._image_aabb_in_bounds((z, y, x)):
-                        continue
-                    positions.append((z, y, x))
-        logger.info("Foreground scan found %d patches in labels volume", len(positions))
-        return positions
+                    seen.add(tuple(int(v) for v in start))
+        _stage(f"full scan kept {len(seen)} image-space patches")
+        return sorted(seen)
 
     @staticmethod
     def _bbox_ratio(mask: np.ndarray) -> float:
@@ -453,18 +487,23 @@ class CrossFrameZarrDataset(Dataset):
         bbox_vol = float(np.prod(maxs - mins + 1))
         return bbox_vol / float(mask.size) if mask.size else 0.0
 
-    def _image_aabb_in_bounds(self, position_zyx: Tuple[int, int, int]) -> bool:
-        start, stop = affine.label_patch_image_aabb(
-            self._matrix_zyx_label_to_image,
-            position_zyx,
+    def _image_patch_has_label_fg(self, position_image_zyx: Tuple[int, int, int]) -> bool:
+        """Check that the forward-mapped label AABB of an image patch has FG."""
+        start, stop = affine.image_patch_label_aabb(
+            self._matrix_zyx_image_to_label,
+            position_image_zyx,
             self.patch_size,
-            image_shape_zyx=None,
+            label_shape_zyx=self._labels_shape,
             margin=0,
         )
-        for s, e, limit in zip(start, stop, self._image_shape):
-            if s < 0 or e > limit:
-                return False
-        return True
+        if any(st >= sp for st, sp in zip(start, stop)):
+            return False
+        slab = np.asarray(
+            self._labels_array[start[0]:stop[0], start[1]:stop[1], start[2]:stop[2]]
+        )
+        if self.valid_patch_value is None:
+            return bool((slab > 0).any())
+        return bool((slab == self.valid_patch_value).any())
 
     # --------------------------------------------------- dataset interface --
 
@@ -485,54 +524,57 @@ class CrossFrameZarrDataset(Dataset):
             t_open_e = time.perf_counter()
             _stage(f"__getitem__ {tag}: handles ready ({1e3*(t_open_e-t_open_s):.1f} ms)")
 
-        pos = self._patches[index]
+        pos = self._patches[index]  # image-space patch start (ZYX)
         ps = self.patch_size
 
+        # Read the IMAGE patch natively -- it's already grid-aligned with the
+        # patch coords, so no interpolation needed. This is the fast path.
         if debug:
-            start, stop = affine.label_patch_image_aabb(
-                self._matrix_zyx_label_to_image, pos, ps,
-                image_shape_zyx=self._image_shape, margin=0,
-            )
-            _stage(
-                f"__getitem__ {tag}: label pos={pos}, image AABB start={start} stop={stop} "
-                f"size={tuple(e - s for s, e in zip(start, stop))}"
-            )
-            t_label_s = time.perf_counter()
-
-        slab = np.asarray(
-            self._labels_array[pos[0]:pos[0] + ps[0], pos[1]:pos[1] + ps[1], pos[2]:pos[2] + ps[2]]
-        )
-        label_patch = pad_or_crop_3d(slab.astype(np.float32), ps)
-        label_bin = (label_patch > 0).astype(np.float32)
-        if debug:
-            t_label_e = time.perf_counter()
-            _stage(
-                f"__getitem__ {tag}: label read+binarize {1e3*(t_label_e-t_label_s):.1f} ms "
-                f"(nonzero={int(label_bin.sum())})"
-            )
             t_img_s = time.perf_counter()
-
-        image_patch = affine.resample_image_to_label_grid(
-            self._image_array,
-            self._matrix_zyx_label_to_image,
-            pos,
-            ps,
+        slab = np.asarray(
+            self._image_array[pos[0]:pos[0] + ps[0], pos[1]:pos[1] + ps[1], pos[2]:pos[2] + ps[2]]
         )
+        image_patch = pad_or_crop_3d(slab.astype(np.float32), ps)
         if debug:
             t_img_e = time.perf_counter()
             _stage(
-                f"__getitem__ {tag}: image resample {1e3*(t_img_e-t_img_s):.1f} ms "
-                f"(shape={image_patch.shape} dtype={image_patch.dtype} "
+                f"__getitem__ {tag}: image read {1e3*(t_img_e-t_img_s):.1f} ms "
+                f"(pos={pos} shape={image_patch.shape} "
                 f"min={image_patch.min():.1f} max={image_patch.max():.1f})"
             )
-            t_norm_s = time.perf_counter()
 
         if self.normalizer is not None:
             image_patch = self.normalizer.run(image_patch)
         image_patch = image_patch.astype(np.float32, copy=False)
+
+        # Resample labels through the forward affine into the image grid.
+        # The label AABB fetched from disk is ~det(linear)^(1/3) smaller than
+        # the image patch, so this is tens of milliseconds, not seconds.
         if debug:
-            t_norm_e = time.perf_counter()
-            _stage(f"__getitem__ {tag}: normalize {1e3*(t_norm_e-t_norm_s):.1f} ms")
+            lbl_start, lbl_stop = affine.image_patch_label_aabb(
+                self._matrix_zyx_image_to_label, pos, ps,
+                label_shape_zyx=self._labels_shape, margin=1,
+            )
+            _stage(
+                f"__getitem__ {tag}: label AABB start={lbl_start} stop={lbl_stop} "
+                f"size={tuple(e - s for s, e in zip(lbl_start, lbl_stop))}"
+            )
+            t_lbl_s = time.perf_counter()
+
+        label_patch = affine.resample_label_to_image_grid(
+            self._labels_array,
+            self._matrix_zyx_image_to_label,
+            pos,
+            ps,
+            order=0,  # nearest neighbor preserves binary labels
+        )
+        label_bin = (label_patch > 0).astype(np.float32)
+        if debug:
+            t_lbl_e = time.perf_counter()
+            _stage(
+                f"__getitem__ {tag}: label resample {1e3*(t_lbl_e-t_lbl_s):.1f} ms "
+                f"(nonzero={int(label_bin.sum())})"
+            )
 
         padding_mask = np.ones(ps, dtype=np.float32)
 

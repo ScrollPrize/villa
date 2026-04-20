@@ -189,11 +189,11 @@ def test_translation_transform_resamples_correctly(tmp_path: Path):
     pos = sample["patch_info"]["position"]
     image_patch = sample["image"].numpy().squeeze(0)
 
-    # With M (XYZ) translating moving -> fixed by +[3,2,1],
-    # the inverse maps label ZYX -> image ZYX via shift by -[1,2,3] (after swap).
-    # So image coord = label coord - [1, 2, 3].
+    # Positions are now image-space starts. The image patch should equal the
+    # native image slab at that position (no interpolation happens on the
+    # image side with this sampling direction).
     z, y, x = pos
-    expected = image[z - 1:z - 1 + 16, y - 2:y - 2 + 16, x - 3:x - 3 + 16].astype(np.float32)
+    expected = image[z:z + 16, y:y + 16, x:x + 16].astype(np.float32)
     np.testing.assert_allclose(image_patch, expected, atol=1e-4)
 
 
@@ -285,8 +285,12 @@ def test_coarse_scan_level(tmp_path: Path):
     mgr.dataset_config["labels_scan_level"] = 1
 
     ds = CrossFrameZarrDataset(mgr, is_training=False)
-    assert len(ds) == 1
-    assert tuple(ds._patches[0]) == (16, 16, 16)
+    # 64 FG voxels in the coarse (16^3) view, each mapped to an image
+    # center then snapped to the stride=16 grid, dedupes to {0, 16}^3 = 8
+    # starts under the identity transform with patch_size=16.
+    assert len(ds) == 8
+    positions = {tuple(int(v) for v in p) for p in ds._patches}
+    assert (16, 16, 16) in positions
 
 
 def test_empty_labels_raise(tmp_path):
