@@ -1,0 +1,26 @@
+{
+	"base": {
+		"normal": 1.0,
+		"step": 1.0,
+		"smooth": 0.0,
+		"winding_density": 0.001,
+		"data": 4.0,
+		"data_plain": 2.0,
+		"pred_dt": 2.0,
+		"corr": 0.1
+	},
+	"stages": [
+		{
+			"name": "reopt",
+			"steps": 2000,
+			"min_scaledown": 0,
+			"lr": [1.0, 0.1, 0.01, 0.001, 0.0001],
+			"params": ["mesh_ms","conn_offset_ms"],
+			"w_fac": {
+				"data": 0.0,
+				"data_plain": 0.0,
+				"pred_dt" : 0.0
+			}
+		}
+	]
+}
