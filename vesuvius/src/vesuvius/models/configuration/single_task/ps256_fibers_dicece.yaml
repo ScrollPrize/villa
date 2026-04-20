@@ -28,7 +28,7 @@ tr_setup:
 tr_config:
   patch_size: [256, 256, 256]
   batch_size: 2
-  num_dataloader_workers: 14
+  num_dataloader_workers: 6
   enable_deep_supervision: false
   max_epoch: 1000
   max_steps_per_epoch: 250

@@ -190,6 +190,7 @@ class CrossFrameZarrDataset(Dataset):
         # when both train and val datasets are built from the same config.
         self.data_path = getattr(mgr, "data_path", None)
         self._patches: List[Tuple[int, int, int]] = []
+        self._valid_patches_cache: Optional[List[PatchInfo]] = None
         _stage("building patch index ...")
         self._build_patch_index()
         _stage(f"patch index built: {len(self._patches)} patches")
@@ -277,6 +278,8 @@ class CrossFrameZarrDataset(Dataset):
         state["_handle_pid"] = None
         state["_atexit_pid"] = None
         state["_debug_calls_remaining"] = self._DEBUG_CALLS_PER_PID
+        # PatchInfo cache is trivially re-derived; don't ship it to workers.
+        state["_valid_patches_cache"] = None
         return state
 
     def _ensure_process_local_handles(self) -> None:
@@ -433,34 +436,32 @@ class CrossFrameZarrDataset(Dataset):
 
         # Verify each candidate by forward-mapping the patch corners back to
         # label space and checking that the AABB is non-degenerate and inside
-        # the label volume. This catches positions where the coarse upscale +
-        # snap combination pushes the mapped label region out of bounds under
-        # rotation/shear (the Z-extent-zero case we saw in debug runs).
-        ps_c = np.asarray(self.patch_size, dtype=np.int64)
-        label_shape = np.asarray(self._labels_shape, dtype=np.int64)
+        # the label volume. Vectorised across all N candidates at once:
+        # build an (N*8, 3) point array, apply the affine once, reshape to
+        # (N, 8, 3), take min/max per patch, and mask.
+        n = unique.shape[0]
+        ps_c = np.asarray(self.patch_size, dtype=np.float64)
+        label_shape = np.asarray(self._labels_shape, dtype=np.float64)
         corners_offsets = np.array([
             [0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1],
             [1, 1, 0], [1, 0, 1], [0, 1, 1], [1, 1, 1],
-        ], dtype=np.float64)
-        keep_verified = np.ones(unique.shape[0], dtype=bool)
-        for i, start in enumerate(unique):
-            corners = corners_offsets * ps_c + start
-            mapped = affine.apply_affine_zyx(
-                self._matrix_zyx_image_to_label, corners.astype(np.float64)
-            )
-            lo = np.floor(mapped.min(axis=0)).astype(np.int64)
-            hi = np.ceil(mapped.max(axis=0)).astype(np.int64)
-            if np.any(hi <= lo):
-                keep_verified[i] = False
-                continue
-            lo = np.clip(lo, 0, label_shape)
-            hi = np.clip(hi, 0, label_shape)
-            if np.any(hi <= lo):
-                keep_verified[i] = False
+        ], dtype=np.float64)  # (8, 3)
+        corners = (
+            corners_offsets[None, :, :] * ps_c[None, None, :]
+            + unique.astype(np.float64)[:, None, :]
+        ).reshape(n * 8, 3)
+        mapped = affine.apply_affine_zyx(
+            self._matrix_zyx_image_to_label, corners
+        ).reshape(n, 8, 3)
+        lo = np.floor(mapped.min(axis=1))
+        hi = np.ceil(mapped.max(axis=1))
+        lo_clipped = np.clip(lo, 0.0, label_shape)
+        hi_clipped = np.clip(hi, 0.0, label_shape)
+        keep_verified = np.all(hi_clipped > lo_clipped, axis=1)
         unique = unique[keep_verified]
         _stage(
-            f"coarse scan: {keep_verified.sum()} / {len(keep_verified)} "
-            f"patches survive label-AABB verification"
+            f"coarse scan: {int(keep_verified.sum())} / {n} patches survive "
+            f"label-AABB verification"
         )
 
         candidates = [tuple(int(v) for v in row) for row in unique]
@@ -642,16 +643,23 @@ class CrossFrameZarrDataset(Dataset):
         """Return patch metadata as ``PatchInfo`` so BaseTrainer's
         split/leakage-prevention logic can read ``.volume_name`` and
         ``.position`` uniformly with ZarrDataset.
+
+        Cached on first access: callers like ``save_train_val_filenames``
+        do ``valid_patches[idx]`` inside a loop over 700k indices, so a
+        fresh build per access turned 1 startup step into 524e9 object
+        creations.
         """
-        return [
-            PatchInfo(
-                volume_index=0,
-                volume_name="fibers",
-                position=pos,
-                patch_size=self.patch_size,
-            )
-            for pos in self._patches
-        ]
+        if self._valid_patches_cache is None:
+            self._valid_patches_cache = [
+                PatchInfo(
+                    volume_index=0,
+                    volume_name="fibers",
+                    position=pos,
+                    patch_size=self.patch_size,
+                )
+                for pos in self._patches
+            ]
+        return self._valid_patches_cache
 
     @property
     def n_fg(self) -> int:
