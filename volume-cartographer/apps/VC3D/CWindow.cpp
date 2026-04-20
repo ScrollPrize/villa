@@ -67,7 +67,6 @@
 #include <QListView>
 #include <QFont>
 #include <QPainter>
-#include <chrono>
 #include <algorithm>
 #include <atomic>
 #include <cmath>

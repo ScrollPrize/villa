@@ -63,6 +63,7 @@ public:
 
     BlockPipeline(
         Config config,
+        BlockCache& blockCache,
         std::unique_ptr<VolumeSource> source,
         DecompressFn decompress,
         std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels = {});
@@ -215,7 +216,7 @@ private:
     void shardCacheInsertLocked(const ShardKey& sk,
                                 std::shared_ptr<std::vector<std::byte>> bytes);
 
-    BlockCache blockCache_;
+    BlockCache& blockCache_;
 
     // Assemble a canonical 128^3 chunk from one or more source chunks at
     // `canonKey.level`, rechunking as needed. Null if the canonical region
@@ -270,6 +271,7 @@ private:
 // Convenience: open a single-level BlockPipeline against a local zarr dataset
 // (no disk tier; filesystem serves as ice). Used by CLI tools, tracer, etc.
 std::unique_ptr<BlockPipeline> openFilesystemPipeline(
-    VcDataset* ds, size_t maxBytes, const std::filesystem::path& datasetPath);
+    VcDataset* ds, size_t maxBytes, const std::filesystem::path& datasetPath,
+    BlockCache* sharedCache = nullptr);
 
 }  // namespace vc::cache

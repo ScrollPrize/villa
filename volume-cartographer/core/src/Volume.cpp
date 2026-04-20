@@ -7,7 +7,6 @@
 #include <limits>
 #include <mutex>
 #include <optional>
-#include <thread>
 #include <unordered_map>
 
 #ifdef __aarch64__
@@ -430,8 +429,21 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
         fprintf(stderr, "[Volume] IO threads: %d\n", config.ioThreads);
     }
 
+    // Use the shared BlockCache if one was provided; otherwise create a
+    // local one (CLI tools, tests, etc.).
+    static thread_local std::unique_ptr<vc::cache::BlockCache> localBlockCache;
+    vc::cache::BlockCache* bc = sharedBlockCache_;
+    if (!bc) {
+        vc::cache::BlockCache::Config bcfg;
+        bcfg.bytes = cacheBudgetHot_;
+        for (auto& f : bcfg.levelFloor) f = 4096;
+        localBlockCache = std::make_unique<vc::cache::BlockCache>(bcfg);
+        bc = localBlockCache.get();
+    }
+
     auto pipeline = std::make_unique<vc::cache::BlockPipeline>(
         std::move(config),
+        *bc,
         std::move(source),
         std::move(decompress),
         std::move(diskLevels));
@@ -461,6 +473,11 @@ vc::cache::BlockPipeline* Volume::tieredCache()
 void Volume::setCacheBudget(size_t hotBytes)
 {
     cacheBudgetHot_ = hotBytes;
+}
+
+void Volume::setBlockCache(vc::cache::BlockCache* bc)
+{
+    sharedBlockCache_ = bc;
 }
 
 void Volume::setIOThreads(int count)

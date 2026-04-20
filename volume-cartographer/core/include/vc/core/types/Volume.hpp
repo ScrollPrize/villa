@@ -20,7 +20,7 @@
 // Forward declarations
 namespace vc { class VcDataset; }
 
-namespace vc::cache { class BlockPipeline; }
+namespace vc::cache { class BlockPipeline; class BlockCache; }
 namespace utils { class ZarrArray; }
 
 struct CompositeParams;
@@ -92,6 +92,10 @@ public:
 
     // Set cache budget (must be called before first tieredCache() access).
     void setCacheBudget(size_t hotBytes);
+
+    // Set a shared BlockCache that persists across volume switches.
+    // Must be called before first tieredCache() access.
+    void setBlockCache(vc::cache::BlockCache* bc);
 
     // Inject a local zarr array for the cold cache tier.
     // Must be called before first tieredCache() access.
@@ -181,6 +185,7 @@ protected:
     mutable std::unique_ptr<vc::cache::BlockPipeline> tieredCache_;
     mutable std::once_flag cacheOnce_;
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
+    vc::cache::BlockCache* sharedBlockCache_ = nullptr;
     int ioThreads_ = 0;  // 0 = use default
     utils::VideoCodecParams encodeParams_ = {.qp = 36};
 

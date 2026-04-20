@@ -94,9 +94,18 @@ void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
 {
     if (vol && _cacheSizeBytes > 0) {
         vol->setCacheBudget(_cacheSizeBytes);
-        // Leave ioThreads at default (0) so BlockPipeline's interactive
-        // sizing (half hw download/load, quarter hw encode) kicks in.
-        // CLI tools can still force a full-hw count via setIOThreads.
+
+        // Create the shared BlockCache on first use. It persists across
+        // volume switches — only the BlockPipeline is recreated, avoiding
+        // the expensive 10 GB mmap + prefault on every switch.
+        if (!_blockCache) {
+            vc::cache::BlockCache::Config bcfg;
+            bcfg.bytes = _cacheSizeBytes;
+            for (auto& f : bcfg.levelFloor) f = 4096;
+            const_cast<CState*>(this)->_blockCache =
+                std::make_unique<vc::cache::BlockCache>(bcfg);
+        }
+        vol->setBlockCache(_blockCache.get());
     }
 }
 
