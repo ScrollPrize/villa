@@ -44,6 +44,14 @@ LATTICE_GROW_DIRECTIONS = ("left", "right", "up", "down")
 Z_PROJECTED_GROW_DIRECTIONS = ("decreasing-z", "increasing-z")
 ALL_GROW_DIRECTIONS = ("auto",) + LATTICE_GROW_DIRECTIONS + Z_PROJECTED_GROW_DIRECTIONS
 ATTENTION_SCALING_MODES = (ATTENTION_SCALING_STANDARD, ATTENTION_SCALING_LEGACY_DOUBLE_SCALED)
+PLANNER_MODE_FAST = "fast"
+PLANNER_MODE_COVERAGE_FIRST = "coverage_first"
+PLANNER_MODES = (PLANNER_MODE_FAST, PLANNER_MODE_COVERAGE_FIRST)
+DEFAULT_COVERAGE_FIRST_PROMPT_LADDER = (8, 10, 12, 16)
+DEFAULT_COVERAGE_FIRST_PREDICT_LADDER = (1, 2)
+DEFAULT_COVERAGE_FIRST_WINDOW_LADDER = (16, 24, 32, 48, 64)
+DEFAULT_COVERAGE_FIRST_GAP_PROMPT_LADDER = (16, 20)
+DEFAULT_COVERAGE_FIRST_GAP_WINDOW_LADDER = (1, 2, 4, 8)
 
 
 @dataclass(frozen=True)
@@ -105,6 +113,31 @@ class ExtensionWindowCandidate:
     window: ExtensionWindow
     prompt_strips: int
     predict_strips: int
+
+
+@dataclass(frozen=True)
+class PlannerCandidateSpec:
+    phase: str
+    prompt_strips: int
+    predict_strips: int
+    window_strip_length: int
+    window_overlap: int
+
+
+@dataclass(frozen=True)
+class PlannerAtlasEntry:
+    spec: PlannerCandidateSpec
+    requested_window: ExtensionWindow
+    fitted_plan: FittedWindowPlan | None
+    frontier_interval: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class PlannerSelectionRecord:
+    spec: PlannerCandidateSpec
+    fitted_plan: FittedWindowPlan
+    new_coverage: int
+    redundant_overlap: int
 
 
 @dataclass(frozen=True)
@@ -762,6 +795,13 @@ def _progress_iter(iterable, *, total: int | None, desc: str, show_progress: boo
     return tqdm(iterable, total=total, desc=desc, dynamic_ncols=True, leave=False)
 
 
+def _normalize_planner_mode(value: str | None) -> str:
+    mode = PLANNER_MODE_FAST if value is None else str(value)
+    if mode not in PLANNER_MODES:
+        raise ValueError(f"unsupported planner_mode {value!r}")
+    return mode
+
+
 def _fit_window_for_crop(
     grid_zyx: np.ndarray,
     *,
@@ -1003,6 +1043,616 @@ def _plan_extension_windows(
         "deduped_child_window_count": int(len(deduped_candidates)),
         "crop_fit_failed_count": int(failed_leaf_count),
     }
+
+
+def _boundary_first_prompt_grid(prompt_grid: np.ndarray, direction: str) -> tuple[np.ndarray, int]:
+    if direction == "up":
+        return prompt_grid[::-1, :, :].copy(), 0
+    if direction == "down":
+        return prompt_grid.copy(), 0
+    if direction == "left":
+        return prompt_grid[:, ::-1, :].copy(), 1
+    if direction == "right":
+        return prompt_grid.copy(), 1
+    raise ValueError(f"unsupported direction {direction!r}")
+
+
+def _weighted_covariance(points: np.ndarray, weights: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    points = np.asarray(points, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    valid = np.isfinite(points).all(axis=1) & np.isfinite(weights) & (weights > 0.0)
+    if int(valid.sum()) <= 0:
+        return np.zeros(3, dtype=np.float32), np.eye(3, dtype=np.float32)
+    points = points[valid]
+    weights = weights[valid]
+    normalized = weights / max(float(weights.sum()), 1e-8)
+    mean = (points * normalized[:, None]).sum(axis=0)
+    centered = points - mean[None, :]
+    cov = (centered * normalized[:, None]).T @ centered
+    if not np.isfinite(cov).all():
+        return mean.astype(np.float32), np.eye(3, dtype=np.float32)
+    return mean.astype(np.float32), cov.astype(np.float32)
+
+
+def _weighted_pca_basis(points: np.ndarray, weights: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    _, cov = _weighted_covariance(points, weights)
+    try:
+        eigvals, eigvecs = np.linalg.eigh(np.asarray(cov, dtype=np.float64))
+    except np.linalg.LinAlgError:
+        return np.array([0.0, 0.0, 0.0], dtype=np.float32), np.eye(3, dtype=np.float32)
+    order = np.argsort(eigvals)
+    eigvecs = eigvecs[:, order]
+    eigvals = eigvals[order]
+    return eigvals.astype(np.float32), eigvecs.astype(np.float32)
+
+
+def _weighted_principal_direction(points: np.ndarray, weights: np.ndarray) -> np.ndarray:
+    _, eigvecs = _weighted_pca_basis(points, weights)
+    direction = eigvecs[:, -1]
+    norm = float(np.linalg.norm(direction))
+    if norm <= 1e-8:
+        return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    return (direction / norm).astype(np.float32)
+
+
+def _planner_boundary_and_raw_vectors(prompt_grid: np.ndarray, direction: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    oriented, continuation_axis = _boundary_first_prompt_grid(prompt_grid, direction)
+    if continuation_axis == 0:
+        boundary = oriented[0, :, :]
+        deltas = oriented[:-1, :, :] - oriented[1:, :, :]
+        depth_weights = np.exp(-np.arange(max(1, deltas.shape[0]), dtype=np.float32) / max(1.0, float(max(1, deltas.shape[0] - 1))))
+        valid = np.isfinite(deltas).all(axis=-1)
+        weighted = np.where(valid[..., None], deltas, 0.0)
+        raw_vectors = np.tensordot(depth_weights[: deltas.shape[0]], weighted, axes=(0, 0))
+        denom = np.tensordot(depth_weights[: deltas.shape[0]], valid.astype(np.float32), axes=(0, 0))
+    else:
+        boundary = oriented[:, 0, :]
+        deltas = oriented[:, :-1, :] - oriented[:, 1:, :]
+        depth_weights = np.exp(-np.arange(max(1, deltas.shape[1]), dtype=np.float32) / max(1.0, float(max(1, deltas.shape[1] - 1))))
+        valid = np.isfinite(deltas).all(axis=-1)
+        weighted = np.where(valid[..., None], deltas, 0.0)
+        raw_vectors = np.tensordot(weighted, depth_weights[: deltas.shape[1]], axes=([1], [0]))
+        denom = np.tensordot(valid.astype(np.float32), depth_weights[: deltas.shape[1]], axes=([1], [0]))
+    denom = np.maximum(np.asarray(denom, dtype=np.float32), 1e-6)
+    raw_vectors = np.asarray(raw_vectors, dtype=np.float32) / denom[..., None]
+    raw_vectors = np.where(np.isfinite(raw_vectors), raw_vectors, 0.0)
+    step_lengths = np.linalg.norm(raw_vectors, axis=-1).astype(np.float32)
+    return boundary.astype(np.float32), raw_vectors.astype(np.float32), step_lengths.astype(np.float32)
+
+
+def _surface_continuation_field(prompt_grid: np.ndarray, direction: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    oriented, continuation_axis = _boundary_first_prompt_grid(prompt_grid, direction)
+    boundary, raw_vectors, step_lengths = _planner_boundary_and_raw_vectors(prompt_grid, direction)
+    frontier_len = int(boundary.shape[0])
+    if frontier_len <= 0:
+        return boundary, raw_vectors, step_lengths
+    radius = min(6, max(2, frontier_len // 32))
+    if continuation_axis == 0:
+        depth_count = int(oriented.shape[0])
+        depth_weights = np.exp(-np.arange(depth_count, dtype=np.float32) / max(1.0, float(max(1, depth_count - 1))))
+    else:
+        depth_count = int(oriented.shape[1])
+        depth_weights = np.exp(-np.arange(depth_count, dtype=np.float32) / max(1.0, float(max(1, depth_count - 1))))
+    direction_vectors = np.zeros_like(boundary, dtype=np.float32)
+    positive_steps = step_lengths[step_lengths > 1e-6]
+    default_step = float(np.median(positive_steps)) if positive_steps.size > 0 else 1.0
+    adjusted_steps = step_lengths.copy()
+    for idx in range(frontier_len):
+        lo = max(0, idx - radius)
+        hi = min(frontier_len, idx + radius + 1)
+        frontier_offsets = np.arange(lo, hi, dtype=np.float32) - float(idx)
+        frontier_weights = np.exp(-np.square(frontier_offsets / max(1.0, float(radius) / 2.0))).astype(np.float32)
+        if continuation_axis == 0:
+            local_patch = oriented[:, lo:hi, :]
+            point_weights = (depth_weights[:, None] * frontier_weights[None, :]).reshape(-1)
+            points = local_patch.reshape(-1, 3)
+        else:
+            local_patch = oriented[lo:hi, :, :]
+            point_weights = (frontier_weights[:, None] * depth_weights[None, :]).reshape(-1)
+            points = local_patch.reshape(-1, 3)
+        valid_points = np.isfinite(points).all(axis=1) & np.isfinite(point_weights) & (point_weights > 0.0)
+        if int(valid_points.sum()) < 3:
+            direction_vectors[idx] = raw_vectors[idx]
+            if adjusted_steps[idx] <= 1e-6:
+                adjusted_steps[idx] = float(default_step)
+            continue
+        _, eigvecs = _weighted_pca_basis(points[valid_points], point_weights[valid_points])
+        normal = eigvecs[:, 0]
+        boundary_patch = boundary[lo:hi]
+        boundary_valid = np.isfinite(boundary_patch).all(axis=1)
+        if int(boundary_valid.sum()) >= 2:
+            tangent = _weighted_principal_direction(boundary_patch[boundary_valid], frontier_weights[boundary_valid])
+        else:
+            tangent = raw_vectors[idx]
+        tangent = tangent - normal * float(np.dot(normal, tangent))
+        tangent_norm = float(np.linalg.norm(tangent))
+        if tangent_norm <= 1e-8:
+            tangent = raw_vectors[idx]
+            tangent_norm = float(np.linalg.norm(tangent))
+        if tangent_norm <= 1e-8:
+            tangent = np.array([0.0, 1.0, 0.0], dtype=np.float32)
+            tangent_norm = 1.0
+        tangent = (tangent / tangent_norm).astype(np.float32)
+        continuation = np.cross(normal, tangent).astype(np.float32)
+        continuation_norm = float(np.linalg.norm(continuation))
+        if continuation_norm <= 1e-8:
+            continuation = raw_vectors[idx]
+            continuation_norm = float(np.linalg.norm(continuation))
+        if continuation_norm <= 1e-8:
+            continuation = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+            continuation_norm = 1.0
+        continuation = continuation / continuation_norm
+        if float(np.dot(continuation, raw_vectors[idx])) < 0.0:
+            continuation = -continuation
+        direction_vectors[idx] = continuation.astype(np.float32)
+        if adjusted_steps[idx] <= 1e-6:
+            adjusted_steps[idx] = float(default_step)
+    smooth_radius = min(4, max(1, frontier_len // 48))
+    smoothed_vectors = np.zeros_like(direction_vectors, dtype=np.float32)
+    smoothed_steps = adjusted_steps.copy()
+    for idx in range(frontier_len):
+        lo = max(0, idx - smooth_radius)
+        hi = min(frontier_len, idx + smooth_radius + 1)
+        local_vectors = direction_vectors[lo:hi].copy()
+        local_steps = adjusted_steps[lo:hi]
+        offsets = np.arange(lo, hi, dtype=np.float32) - float(idx)
+        local_weights = np.exp(-np.square(offsets / max(1.0, float(smooth_radius)))).astype(np.float32)
+        reference = raw_vectors[idx]
+        if float(np.linalg.norm(reference)) <= 1e-8:
+            reference = direction_vectors[idx]
+        for local_idx in range(local_vectors.shape[0]):
+            if float(np.dot(local_vectors[local_idx], reference)) < 0.0:
+                local_vectors[local_idx] = -local_vectors[local_idx]
+        vector = (local_vectors * local_weights[:, None]).sum(axis=0)
+        norm = float(np.linalg.norm(vector))
+        if norm <= 1e-8:
+            vector = direction_vectors[idx]
+            norm = max(1e-8, float(np.linalg.norm(vector)))
+        vector = (vector / norm).astype(np.float32)
+        if float(np.dot(vector, reference)) < 0.0:
+            vector = -vector
+        smoothed_vectors[idx] = vector
+        smoothed_steps[idx] = float((local_steps * local_weights).sum() / max(1e-8, float(local_weights.sum())))
+    return boundary.astype(np.float32), smoothed_vectors.astype(np.float32), smoothed_steps.astype(np.float32)
+
+
+def _estimate_extension_points_planner(
+    prompt_grid: np.ndarray,
+    direction: str,
+    predict_strips: int,
+    *,
+    planner_surrogate: str = "raw",
+) -> np.ndarray:
+    if str(planner_surrogate) == "raw":
+        return _estimate_extension_points(prompt_grid, direction, predict_strips)
+    boundary, continuation_vectors, step_lengths = _surface_continuation_field(prompt_grid, direction)
+    points = []
+    for step_idx in range(1, int(predict_strips) + 1):
+        points.append(boundary + (float(step_idx) * step_lengths[:, None] * continuation_vectors))
+    axis = 1 if _direction_axis(direction) == 1 else 0
+    return np.stack(points, axis=axis).astype(np.float32)
+
+
+def _frontier_mask_from_window(frontier_length: int, window: ExtensionWindow) -> np.ndarray:
+    mask = np.zeros(int(frontier_length), dtype=bool)
+    start = max(0, min(int(frontier_length), int(window.start)))
+    end = max(0, min(int(frontier_length), int(window.end)))
+    if end > start:
+        mask[start:end] = True
+    return mask
+
+
+def _true_spans_from_mask(mask: np.ndarray) -> list[tuple[int, int]]:
+    spans: list[tuple[int, int]] = []
+    start: int | None = None
+    for idx, value in enumerate(np.asarray(mask, dtype=bool).tolist() + [False]):
+        if value and start is None:
+            start = idx
+        elif (not value) and start is not None:
+            spans.append((int(start), int(idx)))
+            start = None
+    return spans
+
+
+def _window_ranges_for_intervals(
+    frontier_length: int,
+    window_length: int,
+    overlap: int,
+    frontier_intervals: list[tuple[int, int]] | None = None,
+) -> list[tuple[tuple[int, int] | None, ExtensionWindow]]:
+    if frontier_intervals is None:
+        return [(None, window) for window in _window_ranges(frontier_length, window_length, overlap)]
+    windows: list[tuple[tuple[int, int] | None, ExtensionWindow]] = []
+    for interval in frontier_intervals:
+        interval_start, interval_end = (int(interval[0]), int(interval[1]))
+        local_length = max(0, int(interval_end - interval_start))
+        for local_window in _window_ranges(local_length, window_length, overlap):
+            windows.append(
+                (
+                    (interval_start, interval_end),
+                    ExtensionWindow(int(interval_start + local_window.start), int(interval_start + local_window.end)),
+                )
+            )
+    return windows
+
+
+def _coverage_first_overlap_ladder(window_strip_length: int) -> list[int]:
+    window_strip_length = int(window_strip_length)
+    overlaps = {
+        max(0, min(window_strip_length - 1, int(round(float(window_strip_length) * fraction))))
+        for fraction in (0.25, 0.5, 0.75)
+    }
+    return sorted(overlaps)
+
+
+def _build_coverage_first_candidate_specs(
+    *,
+    phase: str,
+    prompt_ladder: tuple[int, ...] = DEFAULT_COVERAGE_FIRST_PROMPT_LADDER,
+    predict_ladder: tuple[int, ...] = DEFAULT_COVERAGE_FIRST_PREDICT_LADDER,
+    window_ladder: tuple[int, ...] = DEFAULT_COVERAGE_FIRST_WINDOW_LADDER,
+) -> list[PlannerCandidateSpec]:
+    specs: list[PlannerCandidateSpec] = []
+    for prompt_strips in prompt_ladder:
+        for predict_strips in predict_ladder:
+            for window_strip_length in window_ladder:
+                for window_overlap in _coverage_first_overlap_ladder(window_strip_length):
+                    specs.append(
+                        PlannerCandidateSpec(
+                            phase=str(phase),
+                            prompt_strips=int(prompt_strips),
+                            predict_strips=int(predict_strips),
+                            window_strip_length=int(window_strip_length),
+                            window_overlap=int(window_overlap),
+                        )
+                    )
+    return specs
+
+
+def _planner_candidate_spec_to_dict(spec: PlannerCandidateSpec) -> dict[str, Any]:
+    return {
+        "phase": str(spec.phase),
+        "prompt_strips": int(spec.prompt_strips),
+        "predict_strips": int(spec.predict_strips),
+        "window_strip_length": int(spec.window_strip_length),
+        "window_overlap": int(spec.window_overlap),
+    }
+
+
+def _planner_atlas_entry_to_dict(entry: PlannerAtlasEntry) -> dict[str, Any]:
+    fitted = entry.fitted_plan
+    return {
+        "spec": _planner_candidate_spec_to_dict(entry.spec),
+        "requested_window": [int(entry.requested_window.start), int(entry.requested_window.end)],
+        "frontier_interval": None if entry.frontier_interval is None else [int(entry.frontier_interval[0]), int(entry.frontier_interval[1])],
+        "admissible": bool(fitted is not None),
+        "fitted_window": None if fitted is None else [int(fitted.window.start), int(fitted.window.end)],
+        "predict_strips": None if fitted is None else int(fitted.predict_strips),
+    }
+
+
+def _planner_selection_record_to_dict(record: PlannerSelectionRecord) -> dict[str, Any]:
+    return {
+        "spec": _planner_candidate_spec_to_dict(record.spec),
+        "fitted_window": [int(record.fitted_plan.window.start), int(record.fitted_plan.window.end)],
+        "new_coverage": int(record.new_coverage),
+        "redundant_overlap": int(record.redundant_overlap),
+    }
+
+
+def _fit_candidate_window_exact(
+    grid_zyx: np.ndarray,
+    *,
+    direction: str,
+    window: ExtensionWindow,
+    prompt_strips: int,
+    predict_strips: int,
+    crop_size: tuple[int, int, int],
+    planner_surrogate: str = "surface_frame",
+) -> FittedWindowPlan | None:
+    prompt_grid = _extract_prompt_window(grid_zyx, direction, prompt_strips=int(prompt_strips), window=window)
+    if prompt_grid.size == 0 or np.isfinite(prompt_grid).all(axis=-1).sum() <= 1:
+        return None
+    predicted_envelope = _estimate_extension_points_planner(
+        prompt_grid,
+        direction,
+        int(predict_strips),
+        planner_surrogate=str(planner_surrogate),
+    )
+    crop_points = np.concatenate([prompt_grid.reshape(-1, 3), predicted_envelope.reshape(-1, 3)], axis=0)
+    min_corner = _crop_min_corner_for_points(crop_points, crop_size)
+    if min_corner is None:
+        return None
+    return FittedWindowPlan(
+        window=ExtensionWindow(int(window.start), int(window.end)),
+        prompt_grid=prompt_grid,
+        min_corner=np.asarray(min_corner, dtype=np.int64),
+        prompt_strips=int(prompt_strips),
+        predict_strips=int(predict_strips),
+    )
+
+
+def _fit_candidate_window_exact_cached(
+    grid_zyx: np.ndarray,
+    *,
+    direction: str,
+    window: ExtensionWindow,
+    prompt_strips: int,
+    predict_strips: int,
+    crop_size: tuple[int, int, int],
+    fit_cache: dict[tuple[Any, ...], FittedWindowPlan | None],
+    planner_surrogate: str = "surface_frame",
+) -> FittedWindowPlan | None:
+    key = (
+        str(direction),
+        int(prompt_strips),
+        int(predict_strips),
+        int(window.start),
+        int(window.end),
+        tuple(int(v) for v in crop_size),
+    )
+    if key not in fit_cache:
+        fit_cache[key] = _fit_candidate_window_exact(
+            grid_zyx,
+            direction=direction,
+            window=window,
+            prompt_strips=int(prompt_strips),
+            predict_strips=int(predict_strips),
+            crop_size=crop_size,
+            planner_surrogate=str(planner_surrogate),
+        )
+    return fit_cache[key]
+
+
+def _build_admissibility_atlas(
+    grid_zyx: np.ndarray,
+    *,
+    direction: str,
+    candidate_specs: list[PlannerCandidateSpec],
+    crop_size: tuple[int, int, int],
+    fit_cache: dict[tuple[Any, ...], FittedWindowPlan | None],
+    frontier_intervals: list[tuple[int, int]] | None = None,
+    planner_surrogate: str = "surface_frame",
+) -> tuple[list[PlannerAtlasEntry], dict[str, Any]]:
+    frontier_length = _current_frontier_length(grid_zyx, direction)
+    entries: list[PlannerAtlasEntry] = []
+    config_summaries: list[dict[str, Any]] = []
+    total_requested_windows = 0
+    total_admissible_windows = 0
+    total_failures = 0
+    for spec in candidate_specs:
+        requested_windows = _window_ranges_for_intervals(
+            frontier_length,
+            spec.window_strip_length,
+            spec.window_overlap,
+            frontier_intervals=frontier_intervals,
+        )
+        admissible_plans: list[FittedWindowPlan] = []
+        config_failures = 0
+        for interval, window in requested_windows:
+            fitted = _fit_candidate_window_exact_cached(
+                grid_zyx,
+                direction=direction,
+                window=window,
+                prompt_strips=spec.prompt_strips,
+                predict_strips=spec.predict_strips,
+                crop_size=crop_size,
+                fit_cache=fit_cache,
+                planner_surrogate=str(planner_surrogate),
+            )
+            entries.append(
+                PlannerAtlasEntry(
+                    spec=spec,
+                    requested_window=window,
+                    fitted_plan=fitted,
+                    frontier_interval=interval,
+                )
+            )
+            total_requested_windows += 1
+            if fitted is None:
+                config_failures += 1
+                total_failures += 1
+                continue
+            total_admissible_windows += 1
+            admissible_plans.append(fitted)
+        covered_frontier, covered_spans = _frontier_span_coverage(admissible_plans, frontier_length=frontier_length)
+        config_summaries.append(
+            {
+                "spec": _planner_candidate_spec_to_dict(spec),
+                "requested_window_count": int(len(requested_windows)),
+                "admissible_window_count": int(len(admissible_plans)),
+                "crop_fit_failed_count": int(config_failures),
+                "covered_frontier": int(covered_frontier),
+                "covered_frontier_fraction": (float(covered_frontier) / float(frontier_length)) if frontier_length > 0 else 0.0,
+                "covered_frontier_spans": covered_spans,
+            }
+        )
+    return entries, {
+        "frontier_length": int(frontier_length),
+        "requested_window_count": int(total_requested_windows),
+        "admissible_window_count": int(total_admissible_windows),
+        "crop_fit_failed_count": int(total_failures),
+        "candidate_specs": config_summaries,
+    }
+
+
+def _select_coverage_first_entries(
+    atlas_entries: list[PlannerAtlasEntry],
+    *,
+    frontier_length: int,
+    uncovered_mask: np.ndarray | None = None,
+) -> tuple[list[PlannerSelectionRecord], np.ndarray]:
+    remaining = [entry for entry in atlas_entries if entry.fitted_plan is not None]
+    uncovered = np.ones(int(frontier_length), dtype=bool) if uncovered_mask is None else np.asarray(uncovered_mask, dtype=bool).copy()
+    selected: list[PlannerSelectionRecord] = []
+    while remaining:
+        best_idx: int | None = None
+        best_key: tuple[int, int, int, int, int] | None = None
+        best_new = 0
+        best_overlap = 0
+        for idx, entry in enumerate(remaining):
+            assert entry.fitted_plan is not None
+            coverage_mask = _frontier_mask_from_window(frontier_length, entry.fitted_plan.window)
+            new_coverage = int(np.logical_and(coverage_mask, uncovered).sum())
+            if new_coverage <= 0:
+                continue
+            redundant_overlap = int(coverage_mask.sum()) - int(new_coverage)
+            key = (
+                int(new_coverage),
+                -int(redundant_overlap),
+                int(entry.spec.prompt_strips),
+                int(entry.spec.predict_strips),
+                int(entry.spec.window_strip_length),
+            )
+            if best_key is None or key > best_key:
+                best_idx = int(idx)
+                best_key = key
+                best_new = int(new_coverage)
+                best_overlap = int(redundant_overlap)
+        if best_idx is None:
+            break
+        chosen = remaining.pop(best_idx)
+        assert chosen.fitted_plan is not None
+        uncovered &= ~_frontier_mask_from_window(frontier_length, chosen.fitted_plan.window)
+        selected.append(
+            PlannerSelectionRecord(
+                spec=chosen.spec,
+                fitted_plan=chosen.fitted_plan,
+                new_coverage=int(best_new),
+                redundant_overlap=int(best_overlap),
+            )
+        )
+    return selected, uncovered
+
+
+def _plan_extension_windows_coverage_first(
+    grid_zyx: np.ndarray,
+    *,
+    direction: str,
+    crop_size: tuple[int, int, int],
+    frontier_intervals: list[tuple[int, int]] | None = None,
+) -> tuple[list[FittedWindowPlan], dict[str, Any], dict[str, Any]]:
+    fit_cache: dict[tuple[Any, ...], FittedWindowPlan | None] = {}
+    frontier_length = _current_frontier_length(grid_zyx, direction)
+    initial_uncovered = np.ones(frontier_length, dtype=bool)
+    if frontier_intervals is not None:
+        initial_uncovered[:] = False
+        for start, end in frontier_intervals:
+            initial_uncovered[max(0, int(start)):min(frontier_length, int(end))] = True
+    atlas_specs = _build_coverage_first_candidate_specs(phase="atlas")
+    atlas_entries, atlas_summary = _build_admissibility_atlas(
+        grid_zyx,
+        direction=direction,
+        candidate_specs=atlas_specs,
+        crop_size=crop_size,
+        fit_cache=fit_cache,
+        frontier_intervals=frontier_intervals,
+        planner_surrogate="surface_frame",
+    )
+    selected_records, uncovered = _select_coverage_first_entries(
+        atlas_entries,
+        frontier_length=frontier_length,
+        uncovered_mask=initial_uncovered,
+    )
+    initial_gap_spans = _true_spans_from_mask(uncovered)
+    gap_specs = _build_coverage_first_candidate_specs(
+        phase="gap_rescue",
+        prompt_ladder=DEFAULT_COVERAGE_FIRST_GAP_PROMPT_LADDER,
+        predict_ladder=DEFAULT_COVERAGE_FIRST_PREDICT_LADDER,
+        window_ladder=DEFAULT_COVERAGE_FIRST_GAP_WINDOW_LADDER,
+    )
+    rescue_entries: list[PlannerAtlasEntry] = []
+    rescue_summary: dict[str, Any] | None = None
+    if initial_gap_spans:
+        rescue_entries, rescue_summary = _build_admissibility_atlas(
+            grid_zyx,
+            direction=direction,
+            candidate_specs=gap_specs,
+            crop_size=crop_size,
+            fit_cache=fit_cache,
+            frontier_intervals=initial_gap_spans,
+            planner_surrogate="surface_frame",
+        )
+        rescue_selected, uncovered = _select_coverage_first_entries(
+            rescue_entries,
+            frontier_length=frontier_length,
+            uncovered_mask=uncovered,
+        )
+        selected_records.extend(rescue_selected)
+    selected_plans = _dedupe_fitted_window_plans([record.fitted_plan for record in selected_records])
+    covered_frontier, covered_spans = _frontier_span_coverage(selected_plans, frontier_length=frontier_length)
+    gap_spans = _true_spans_from_mask(uncovered)
+    planning_stats = {
+        "planner_mode": PLANNER_MODE_COVERAGE_FIRST,
+        "parent_window_count": int(atlas_summary["requested_window_count"]) + int(0 if rescue_summary is None else rescue_summary["requested_window_count"]),
+        "child_window_count": int(atlas_summary["admissible_window_count"]) + int(0 if rescue_summary is None else rescue_summary["admissible_window_count"]),
+        "deduped_child_window_count": int(len(selected_plans)),
+        "crop_fit_failed_count": int(atlas_summary["crop_fit_failed_count"]) + int(0 if rescue_summary is None else rescue_summary["crop_fit_failed_count"]),
+        "selected_candidate_count": int(len(selected_records)),
+        "covered_frontier": int(covered_frontier),
+        "covered_frontier_fraction": (float(covered_frontier) / float(frontier_length)) if frontier_length > 0 else 0.0,
+        "gap_spans": gap_spans,
+    }
+    diagnostics = {
+        "planner_mode": PLANNER_MODE_COVERAGE_FIRST,
+        "frontier_length": int(frontier_length),
+        "requested_direction": str(direction),
+        "atlas": {
+            **atlas_summary,
+            "entries": [_planner_atlas_entry_to_dict(entry) for entry in atlas_entries],
+        },
+        "selection": {
+            "selected": [_planner_selection_record_to_dict(record) for record in selected_records],
+            "covered_frontier": int(covered_frontier),
+            "covered_frontier_fraction": (float(covered_frontier) / float(frontier_length)) if frontier_length > 0 else 0.0,
+            "covered_frontier_spans": covered_spans,
+            "gap_spans": gap_spans,
+        },
+        "gap_rescue": None if rescue_summary is None else {
+            **rescue_summary,
+            "entries": [_planner_atlas_entry_to_dict(entry) for entry in rescue_entries],
+        },
+    }
+    return selected_plans, planning_stats, diagnostics
+
+
+def _plan_extension_windows_for_mode(
+    grid_zyx: np.ndarray,
+    *,
+    direction: str,
+    planner_mode: str,
+    window_strip_length: int,
+    window_overlap: int,
+    prompt_strips: int,
+    predict_strips: int,
+    crop_size: tuple[int, int, int],
+    max_crop_fit_retries: int,
+    frontier_intervals: list[tuple[int, int]] | None = None,
+    progress_desc: str | None = None,
+    show_progress: bool | None = None,
+) -> tuple[list[FittedWindowPlan], dict[str, Any], dict[str, Any] | None]:
+    planner_mode = _normalize_planner_mode(planner_mode)
+    if planner_mode == PLANNER_MODE_FAST:
+        plans, stats = _plan_extension_windows(
+            grid_zyx,
+            direction=direction,
+            window_strip_length=int(window_strip_length),
+            window_overlap=int(window_overlap),
+            prompt_strips=int(prompt_strips),
+            predict_strips=int(predict_strips),
+            crop_size=crop_size,
+            max_crop_fit_retries=int(max_crop_fit_retries),
+            progress_desc=progress_desc,
+            show_progress=show_progress,
+        )
+        return plans, {**stats, "planner_mode": planner_mode}, None
+    plans, stats, diagnostics = _plan_extension_windows_coverage_first(
+        grid_zyx,
+        direction=direction,
+        crop_size=crop_size,
+        frontier_intervals=frontier_intervals,
+    )
+    return plans, stats, diagnostics
 
 
 def build_extension_sample(
@@ -1863,7 +2513,9 @@ def extend_tifxyz_mesh(
     distributed_shard_mode: str = "strided",
     distributed_gather_mode: str = "object",
     attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
+    planner_mode: str = PLANNER_MODE_FAST,
 ) -> dict[str, Any]:
+    planner_mode = _normalize_planner_mode(planner_mode)
     if str(distributed_shard_mode) != "strided":
         raise ValueError(f"unsupported distributed_shard_mode {distributed_shard_mode!r}")
     if str(distributed_gather_mode) != "object":
@@ -1892,6 +2544,8 @@ def extend_tifxyz_mesh(
     per_rank_fitted_window_counts_total = [0 for _ in range(runtime.world_size)]
     summary: dict[str, Any] | None = None
     cached_infer_available = False
+    planner_diagnostics_payload: dict[str, Any] | None = None
+    planner_diagnostics_path: Path | None = None
 
     try:
         t0 = perf_counter()
@@ -1937,6 +2591,31 @@ def extend_tifxyz_mesh(
         requested_direction = root_state.get("requested_direction")
         original_vertex_count = int(root_state["original_vertex_count"])
 
+        if runtime.is_main_process and planner_mode == PLANNER_MODE_COVERAGE_FIRST:
+            planner_diagnostics_payload = {
+                "planner_mode": str(planner_mode),
+                "surface_uuid": str(surface_uuid),
+                "requested_direction": requested_direction,
+                "resolved_lattice_direction": str(direction),
+                "initial_preflight": _evaluate_extension_planner_on_grid(
+                    working_grid,
+                    tifxyz_path=str(tifxyz_path),
+                    requested_direction=str(requested_direction),
+                    resolved_direction=str(direction),
+                    trimmed_bbox_rc=trimmed_bbox_rc,
+                    planner_mode=str(planner_mode),
+                    prompt_strips=int(prompt_strips),
+                    predict_strips_per_iter=int(predict_strips_per_iter),
+                    window_strip_length=int(window_strip_length),
+                    window_overlap=int(window_overlap),
+                    max_crop_fit_retries=int(max_crop_fit_retries),
+                    crop_size=crop_size,
+                ),
+                "iterations": [],
+            }
+            planner_diagnostics_path = out_path / "planner_diagnostics.json"
+            planner_diagnostics_path.write_text(json.dumps(planner_diagnostics_payload, indent=2))
+
         volume = _open_zarr_volume(volume_uri)
         volume_shape = tuple(int(v) for v in volume.shape[-3:])
 
@@ -1967,27 +2646,31 @@ def extend_tifxyz_mesh(
         )
 
         iteration_stats: list[ExtensionIterationStats] = []
+        coverage_frontier_intervals: list[tuple[int, int]] | None = None
         stop_reason = "max_extension_iters"
         for iteration_idx in range(int(max_extension_iters)):
             iteration_started = perf_counter()
             if runtime.is_main_process:
                 if iteration_idx > 0:
                     demote_previous_seam(working_provenance)
-                fitted_window_plans, planning_stats = _plan_extension_windows(
+                fitted_window_plans, planning_stats, planning_diagnostics = _plan_extension_windows_for_mode(
                     working_grid,
                     direction=direction,
+                    planner_mode=str(planner_mode),
                     window_strip_length=int(window_strip_length),
                     window_overlap=int(window_overlap),
                     prompt_strips=int(prompt_strips),
                     predict_strips=int(predict_strips_per_iter),
                     crop_size=crop_size,
                     max_crop_fit_retries=int(max_crop_fit_retries),
+                    frontier_intervals=coverage_frontier_intervals if planner_mode == PLANNER_MODE_COVERAGE_FIRST else None,
                     progress_desc=f"iter {iteration_idx + 1} plan",
                     show_progress=local_show_progress,
                 )
                 planning_state = {
                     "fitted_window_plans": fitted_window_plans,
                     "planning_stats": planning_stats,
+                    "planning_diagnostics": planning_diagnostics,
                     "stop_reason": None,
                 }
                 if int(planning_stats["parent_window_count"]) <= 0:
@@ -2187,6 +2870,16 @@ def extend_tifxyz_mesh(
             if post_state["stop_reason"] is not None:
                 stop_reason = str(post_state["stop_reason"])
                 break
+            if runtime.is_main_process and planner_diagnostics_payload is not None:
+                iteration_diag = dict(planning_state.get("planning_diagnostics") or {})
+                iteration_diag["iteration_index"] = int(iteration_idx)
+                iteration_diag["frontier_intervals"] = None if coverage_frontier_intervals is None else [list(span) for span in coverage_frontier_intervals]
+                iteration_diag["post_iteration_gap_spans"] = list(iteration_stats[-1].new_band_gap_spans)
+                iteration_diag["post_iteration_coverage_fraction"] = float(iteration_stats[-1].new_band_frontier_coverage_fraction)
+                planner_diagnostics_payload["iterations"].append(iteration_diag)
+                planner_diagnostics_path.write_text(json.dumps(planner_diagnostics_payload, indent=2))
+            if planner_mode == PLANNER_MODE_COVERAGE_FIRST and runtime.is_main_process:
+                coverage_frontier_intervals = [tuple(int(v) for v in span) for span in iteration_stats[-1].new_band_gap_spans]
 
         if runtime.is_main_process:
             final_predicted_nonseam_vertex_count = int((working_provenance == 1).sum())
@@ -2215,6 +2908,7 @@ def extend_tifxyz_mesh(
                 "dino_backbone": str(dino_backbone),
                 "autoreg_checkpoint": str(autoreg_checkpoint),
                 "attention_scaling_mode": str(model_cfg.get("attention_scaling_mode", ATTENTION_SCALING_STANDARD)),
+                "planner_mode": str(planner_mode),
                 "original_vertex_count": int(original_vertex_count),
                 "final_vertex_count": int(np.isfinite(working_grid).all(axis=-1).sum()),
                 "predicted_vertex_count": int(np.isfinite(working_grid).all(axis=-1).sum() - int(original_vertex_count)),
@@ -2271,6 +2965,8 @@ def extend_tifxyz_mesh(
                 "gather_ms": float(total_gather_ms),
                 "rank_merge_input_count": int(total_rank_merge_input_count),
             }
+            if planner_diagnostics_path is not None:
+                summary["planner_diagnostics_path"] = str(planner_diagnostics_path)
             summary_path = out_path / "summary.json"
             summary_path.write_text(json.dumps(summary, indent=2))
             summary["summary_path"] = str(summary_path)
@@ -2285,6 +2981,7 @@ def _compact_extension_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "direction",
         "requested_direction",
         "attention_scaling_mode",
+        "planner_mode",
         "predicted_vertex_count",
         "cumulative_predicted_vertex_count",
         "final_predicted_nonseam_vertex_count",
@@ -2340,6 +3037,7 @@ def run_extension_to_exhaustion(
     distributed_shard_mode: str = "strided",
     distributed_gather_mode: str = "object",
     attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
+    planner_mode: str = PLANNER_MODE_FAST,
     call_validator=None,
     extend_impl=None,
 ) -> ExtensionStageResult:
@@ -2376,6 +3074,7 @@ def run_extension_to_exhaustion(
             distributed_shard_mode=str(distributed_shard_mode),
             distributed_gather_mode=str(distributed_gather_mode),
             attention_scaling_mode=str(attention_scaling_mode),
+            planner_mode=str(planner_mode),
         )
         compact_summary = _compact_extension_summary(summary)
         call_summaries.append(compact_summary)
@@ -2417,6 +3116,71 @@ def _frontier_span_coverage(plans: list[FittedWindowPlan], *, frontier_length: i
     return int(covered), merged
 
 
+def _evaluate_extension_planner_on_grid(
+    grid_zyx: np.ndarray,
+    *,
+    tifxyz_path: str | Path,
+    requested_direction: str,
+    resolved_direction: str,
+    trimmed_bbox_rc: tuple[int, int, int, int],
+    planner_mode: str,
+    prompt_strips: int,
+    predict_strips_per_iter: int,
+    window_strip_length: int,
+    window_overlap: int,
+    max_crop_fit_retries: int = 3,
+    crop_size: tuple[int, int, int] = (128, 128, 128),
+    frontier_intervals: list[tuple[int, int]] | None = None,
+) -> dict[str, Any]:
+    plans, stats, diagnostics = _plan_extension_windows_for_mode(
+        grid_zyx,
+        direction=str(resolved_direction),
+        planner_mode=str(planner_mode),
+        window_strip_length=int(window_strip_length),
+        window_overlap=int(window_overlap),
+        prompt_strips=int(prompt_strips),
+        predict_strips=int(predict_strips_per_iter),
+        crop_size=crop_size,
+        max_crop_fit_retries=int(max_crop_fit_retries),
+        frontier_intervals=frontier_intervals,
+    )
+    frontier_length = _current_frontier_length(grid_zyx, resolved_direction)
+    covered_frontier, merged_spans = _frontier_span_coverage(plans, frontier_length=frontier_length)
+    coverage_mask = np.zeros(int(frontier_length), dtype=bool)
+    for plan in plans:
+        coverage_mask |= _frontier_mask_from_window(frontier_length, plan.window)
+    if frontier_intervals is not None:
+        active_mask = np.zeros(int(frontier_length), dtype=bool)
+        for start, end in frontier_intervals:
+            active_mask[max(0, int(start)):min(int(frontier_length), int(end))] = True
+        uncovered_mask = active_mask & ~coverage_mask
+    else:
+        uncovered_mask = ~coverage_mask
+    result = {
+        "tifxyz_path": str(tifxyz_path),
+        "planner_mode": str(planner_mode),
+        "requested_direction": str(requested_direction),
+        "direction": str(resolved_direction),
+        "prompt_strips": int(prompt_strips),
+        "predict_strips_per_iter": int(predict_strips_per_iter),
+        "window_strip_length": int(window_strip_length),
+        "window_overlap": int(window_overlap),
+        "trimmed_bbox_rc": list(trimmed_bbox_rc),
+        "frontier_length": int(frontier_length),
+        "frontier_intervals": None if frontier_intervals is None else [(int(start), int(end)) for start, end in frontier_intervals],
+        "fitted_plans": int(len(plans)),
+        "fitted_plan_spans": [(int(plan.window.start), int(plan.window.end)) for plan in plans],
+        "covered_frontier": int(covered_frontier),
+        "covered_frontier_fraction": (float(covered_frontier) / float(frontier_length)) if frontier_length > 0 else 0.0,
+        "covered_frontier_spans": merged_spans,
+        "gap_spans": _true_spans_from_mask(uncovered_mask),
+        "planning_stats": stats,
+    }
+    if diagnostics is not None:
+        result["planner_diagnostics"] = diagnostics
+    return result
+
+
 def evaluate_extension_planner(
     *,
     tifxyz_path: str | Path,
@@ -2427,7 +3191,10 @@ def evaluate_extension_planner(
     window_overlap: int,
     max_crop_fit_retries: int = 3,
     crop_size: tuple[int, int, int] = (128, 128, 128),
+    planner_mode: str = PLANNER_MODE_FAST,
+    frontier_intervals: list[tuple[int, int]] | None = None,
 ) -> dict[str, Any]:
+    planner_mode = _normalize_planner_mode(planner_mode)
     surface = read_tifxyz(tifxyz_path, load_mask=True, validate=True).use_stored_resolution()
     grid_zyx = _surface_grid_zyx(surface)
     grid_zyx, _, trimmed_bbox_rc = _trim_grid_to_valid_bbox(grid_zyx, np.zeros(grid_zyx.shape[:2], dtype=np.uint8))
@@ -2438,35 +3205,21 @@ def evaluate_extension_planner(
         crop_size=crop_size,
         requested_direction=str(grow_direction),
     )
-    plans, stats = _plan_extension_windows(
+    return _evaluate_extension_planner_on_grid(
         resolved_grid,
-        direction=direction,
+        tifxyz_path=tifxyz_path,
+        requested_direction=str(grow_direction),
+        resolved_direction=str(direction),
+        trimmed_bbox_rc=tuple(int(v) for v in trimmed_bbox_rc),
+        planner_mode=str(planner_mode),
+        prompt_strips=int(prompt_strips),
+        predict_strips_per_iter=int(predict_strips_per_iter),
         window_strip_length=int(window_strip_length),
         window_overlap=int(window_overlap),
-        prompt_strips=int(prompt_strips),
-        predict_strips=int(predict_strips_per_iter),
-        crop_size=crop_size,
         max_crop_fit_retries=int(max_crop_fit_retries),
+        crop_size=crop_size,
+        frontier_intervals=frontier_intervals,
     )
-    frontier_length = _current_frontier_length(resolved_grid, direction)
-    covered_frontier, merged_spans = _frontier_span_coverage(plans, frontier_length=frontier_length)
-    return {
-        "tifxyz_path": str(tifxyz_path),
-        "requested_direction": str(grow_direction),
-        "direction": str(direction),
-        "prompt_strips": int(prompt_strips),
-        "predict_strips_per_iter": int(predict_strips_per_iter),
-        "window_strip_length": int(window_strip_length),
-        "window_overlap": int(window_overlap),
-        "trimmed_bbox_rc": list(trimmed_bbox_rc),
-        "frontier_length": int(frontier_length),
-        "fitted_plans": int(len(plans)),
-        "fitted_plan_spans": [(int(plan.window.start), int(plan.window.end)) for plan in plans],
-        "covered_frontier": int(covered_frontier),
-        "covered_frontier_fraction": (float(covered_frontier) / float(frontier_length)) if frontier_length > 0 else 0.0,
-        "covered_frontier_spans": merged_spans,
-        "planning_stats": stats,
-    }
 
 
 def run_extension_benchmark_suite(
@@ -2493,6 +3246,7 @@ def run_extension_benchmark_suite(
     distributed_shard_mode: str = "strided",
     distributed_gather_mode: str = "object",
     attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
+    planner_mode: str = PLANNER_MODE_FAST,
 ) -> dict[str, Any]:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -2525,6 +3279,7 @@ def run_extension_benchmark_suite(
             distributed_shard_mode=str(distributed_shard_mode),
             distributed_gather_mode=str(distributed_gather_mode),
             attention_scaling_mode=str(attention_scaling_mode),
+            planner_mode=str(planner_mode),
         )
         serial_runs.append(summary)
 
@@ -2561,6 +3316,7 @@ def run_extension_benchmark_suite(
         distributed_shard_mode=str(distributed_shard_mode),
         distributed_gather_mode=str(distributed_gather_mode),
         attention_scaling_mode=str(attention_scaling_mode),
+        planner_mode=str(planner_mode),
     )
     suite = {
         "tifxyz_path": str(tifxyz_path),
@@ -2596,6 +3352,7 @@ def run_extension_benchmark_suite(
 @click.option("--compile-infer/--no-compile-infer", default=False, show_default=True)
 @click.option("--amp-dtype", type=click.Choice(["bf16", "fp16"]), default="bf16", show_default=True)
 @click.option("--attention-scaling-mode", type=click.Choice(list(ATTENTION_SCALING_MODES)), default=ATTENTION_SCALING_STANDARD, show_default=True)
+@click.option("--planner-mode", type=click.Choice(list(PLANNER_MODES)), default=PLANNER_MODE_FAST, show_default=True)
 @click.option("--show-progress/--no-show-progress", default=None)
 @click.option("--distributed-infer/--no-distributed-infer", default=False, show_default=True)
 @click.option("--distributed-shard-mode", type=click.Choice(["strided"]), default="strided", show_default=True)
@@ -2624,6 +3381,7 @@ def main(
     compile_infer: bool,
     amp_dtype: str,
     attention_scaling_mode: str,
+    planner_mode: str,
     show_progress: bool | None,
     distributed_infer: bool,
     distributed_shard_mode: str,
@@ -2666,6 +3424,7 @@ def main(
             distributed_shard_mode=str(distributed_shard_mode),
             distributed_gather_mode=str(distributed_gather_mode),
             attention_scaling_mode=str(attention_scaling_mode),
+            planner_mode=str(planner_mode),
         )
     elif bool(run_to_exhaustion):
         result = run_extension_to_exhaustion(
@@ -2692,6 +3451,7 @@ def main(
             distributed_shard_mode=str(distributed_shard_mode),
             distributed_gather_mode=str(distributed_gather_mode),
             attention_scaling_mode=str(attention_scaling_mode),
+            planner_mode=str(planner_mode),
         )
         result = result.stage_summary
     else:
@@ -2718,6 +3478,7 @@ def main(
             distributed_shard_mode=str(distributed_shard_mode),
             distributed_gather_mode=str(distributed_gather_mode),
             attention_scaling_mode=str(attention_scaling_mode),
+            planner_mode=str(planner_mode),
         )
     if (not bool(distributed_infer)) or int(os.environ.get("RANK", "0")) == 0:
         print(json.dumps(result, indent=2, sort_keys=True))

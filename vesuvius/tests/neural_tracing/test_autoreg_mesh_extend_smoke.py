@@ -14,9 +14,17 @@ import torch.multiprocessing as mp
 
 from vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz import (
     ExtensionInferenceRuntime,
+    PlannerAtlasEntry,
+    PlannerCandidateSpec,
+    PlannerSelectionRecord,
+    PLANNER_MODE_COVERAGE_FIRST,
     _DistributedInferRuntime,
+    _build_admissibility_atlas,
     _flatten_gathered_window_results,
     _initialize_distributed_infer_runtime,
+    _plan_extension_windows_coverage_first,
+    _plan_extension_windows_for_mode,
+    _select_coverage_first_entries,
     _shard_fitted_window_plans,
     _crop_min_corner_for_points,
     _extract_prompt_window,
@@ -40,6 +48,7 @@ from vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz import (
     infer_extension_windows_batched_cached,
     merge_window_prediction,
     resolve_growth_direction,
+    evaluate_extension_planner,
     run_extension_benchmark_suite,
     write_colored_ply,
 )
@@ -312,6 +321,129 @@ def test_resolve_growth_direction_projects_world_z() -> None:
 
     assert decreasing == "down"
     assert increasing == "up"
+
+
+def test_coverage_first_admissibility_atlas_is_deterministic() -> None:
+    grid = _make_surface_grid(16, 24)
+    specs = [
+        PlannerCandidateSpec(
+            phase="atlas",
+            prompt_strips=8,
+            predict_strips=1,
+            window_strip_length=16,
+            window_overlap=8,
+        )
+    ]
+    atlas_a, summary_a = _build_admissibility_atlas(
+        grid,
+        direction="down",
+        candidate_specs=specs,
+        crop_size=(128, 128, 128),
+        fit_cache={},
+        planner_surrogate="surface_frame",
+    )
+    atlas_b, summary_b = _build_admissibility_atlas(
+        grid,
+        direction="down",
+        candidate_specs=specs,
+        crop_size=(128, 128, 128),
+        fit_cache={},
+        planner_surrogate="surface_frame",
+    )
+
+    assert summary_a == summary_b
+    assert [
+        (entry.requested_window.start, entry.requested_window.end, entry.fitted_plan is not None)
+        for entry in atlas_a
+    ] == [
+        (entry.requested_window.start, entry.requested_window.end, entry.fitted_plan is not None)
+        for entry in atlas_b
+    ]
+
+
+def test_coverage_first_selector_prefers_broader_union_coverage() -> None:
+    dummy_prompt = np.zeros((8, 3, 3), dtype=np.float32)
+    entries = [
+        PlannerAtlasEntry(
+            spec=PlannerCandidateSpec("atlas", 8, 1, 16, 8),
+            requested_window=SimpleNamespace(start=0, end=10),
+            fitted_plan=SimpleNamespace(window=SimpleNamespace(start=0, end=10), prompt_grid=dummy_prompt, min_corner=np.zeros(3), prompt_strips=8, predict_strips=1),
+        ),
+        PlannerAtlasEntry(
+            spec=PlannerCandidateSpec("atlas", 12, 1, 20, 8),
+            requested_window=SimpleNamespace(start=0, end=20),
+            fitted_plan=SimpleNamespace(window=SimpleNamespace(start=0, end=20), prompt_grid=dummy_prompt, min_corner=np.zeros(3), prompt_strips=12, predict_strips=1),
+        ),
+        PlannerAtlasEntry(
+            spec=PlannerCandidateSpec("atlas", 10, 1, 10, 4),
+            requested_window=SimpleNamespace(start=20, end=30),
+            fitted_plan=SimpleNamespace(window=SimpleNamespace(start=20, end=30), prompt_grid=dummy_prompt, min_corner=np.zeros(3), prompt_strips=10, predict_strips=1),
+        ),
+    ]
+
+    selected, uncovered = _select_coverage_first_entries(entries, frontier_length=30)
+
+    assert [(record.fitted_plan.window.start, record.fitted_plan.window.end) for record in selected] == [(0, 20), (20, 30)]
+    assert not bool(uncovered.any())
+
+
+def test_coverage_first_gap_rescue_targets_only_uncovered_intervals(monkeypatch: pytest.MonkeyPatch) -> None:
+    call_intervals: list[list[tuple[int, int]] | None] = []
+
+    def _fake_build_admissibility_atlas(grid_zyx, *, direction, candidate_specs, crop_size, fit_cache, frontier_intervals=None, planner_surrogate="surface_frame"):
+        del grid_zyx, direction, candidate_specs, crop_size, fit_cache, planner_surrogate
+        call_intervals.append(None if frontier_intervals is None else list(frontier_intervals))
+        return [], {
+            "frontier_length": 32,
+            "requested_window_count": 0,
+            "admissible_window_count": 0,
+            "crop_fit_failed_count": 0,
+            "candidate_specs": [],
+        }
+
+    selector_outputs = iter(
+        [
+            ([], np.array([False] * 8 + [True] * 4 + [False] * 8 + [True] * 4 + [False] * 8, dtype=bool)),
+            ([], np.array([False] * 8 + [True] * 4 + [False] * 8 + [True] * 4 + [False] * 8, dtype=bool)),
+        ]
+    )
+
+    def _fake_select(entries, *, frontier_length, uncovered_mask=None):
+        del entries, frontier_length, uncovered_mask
+        return next(selector_outputs)
+
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz._build_admissibility_atlas", _fake_build_admissibility_atlas)
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz._select_coverage_first_entries", _fake_select)
+
+    _plan_extension_windows_coverage_first(
+        _make_surface_grid(8, 32),
+        direction="down",
+        crop_size=(128, 128, 128),
+    )
+
+    assert call_intervals == [None, [(8, 12), (20, 24)]]
+
+
+def test_evaluate_extension_planner_coverage_first_returns_diagnostics(tmp_path: Path) -> None:
+    source_surface = _make_surface(8, 10)
+    from vesuvius.tifxyz import write_tifxyz
+
+    source_dir = write_tifxyz(tmp_path / "coverage_source", source_surface, overwrite=True)
+    evaluation = evaluate_extension_planner(
+        tifxyz_path=source_dir,
+        grow_direction="left",
+        planner_mode=PLANNER_MODE_COVERAGE_FIRST,
+        prompt_strips=8,
+        predict_strips_per_iter=1,
+        window_strip_length=24,
+        window_overlap=12,
+    )
+
+    assert evaluation["planner_mode"] == PLANNER_MODE_COVERAGE_FIRST
+    assert evaluation["direction"] == "left"
+    assert "planner_diagnostics" in evaluation
+    assert "atlas" in evaluation["planner_diagnostics"]
+    assert "selection" in evaluation["planner_diagnostics"]
 
 
 def test_plan_extension_windows_recovers_failing_first_parent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -988,3 +1120,45 @@ def test_extend_tifxyz_mesh_synthetic_end_to_end(tmp_path: Path, monkeypatch: py
     assert result["encode_decode_ms_per_fitted_window"] is not None
     for preview in result["preview_paths"]:
         assert Path(preview).exists()
+
+
+def test_extend_tifxyz_mesh_coverage_first_writes_planner_diagnostics(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    surface = _make_surface(8, 10)
+    volume = np.zeros((256, 256, 256), dtype=np.float32)
+
+    def _fake_read_tifxyz(path, load_mask=True, validate=True):
+        del path, load_mask, validate
+        return surface
+
+    def _fake_open_volume(uri):
+        del uri
+        return volume
+
+    def _fake_load_model(*, dino_backbone, autoreg_checkpoint, device):
+        del dino_backbone, autoreg_checkpoint, device
+        return _FakeBatchModel(), {"patch_size": [8, 8, 8], "offset_num_bins": [4, 4, 4], "frontier_band_width": 4}
+
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz.read_tifxyz", _fake_read_tifxyz)
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz._open_zarr_volume", _fake_open_volume)
+    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz._load_autoreg_model", _fake_load_model)
+
+    result = extend_tifxyz_mesh(
+        tifxyz_path="dummy",
+        volume_uri="s3://dummy",
+        dino_backbone="backbone",
+        autoreg_checkpoint="ckpt",
+        out_dir=tmp_path,
+        device="cpu",
+        grow_direction="left",
+        planner_mode=PLANNER_MODE_COVERAGE_FIRST,
+        max_extension_iters=1,
+        show_progress=False,
+    )
+
+    assert result["planner_mode"] == PLANNER_MODE_COVERAGE_FIRST
+    assert Path(result["planner_diagnostics_path"]).exists()
+    diagnostics = json.loads(Path(result["planner_diagnostics_path"]).read_text())
+    assert diagnostics["planner_mode"] == PLANNER_MODE_COVERAGE_FIRST
+    assert diagnostics["resolved_lattice_direction"] == "left"
+    assert "initial_preflight" in diagnostics
+    assert "iterations" in diagnostics
