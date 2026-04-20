@@ -1229,6 +1229,11 @@ int main(int argc, char** argv) {
         std::mutex enc_mtx;
         std::condition_variable enc_cv;
         bool enc_done = false;
+        // Bound enc_q so downloaders can't race ahead of the encode pool and
+        // pile up CHUNK_VOXELS-sized raw buffers (16 MiB each at 256³).
+        // Cap = 4 × encode workers keeps each encoder fed through normal
+        // pop/encode cycles while capping peak raw RAM at ~ENC_Q_CAP*16 MiB.
+        const size_t ENC_Q_CAP = std::max(8, encode_jobs * 4);
 
         // In-flight shard limiter: bounds how many ShardStates are live in
         // RAM at once (each holds up to 512 compressed chunk buffers ~ 30-40
@@ -1415,8 +1420,13 @@ int main(int argc, char** argv) {
                     continue;
                 }
 
-                std::lock_guard elk(enc_mtx);
-                enc_q.push_back({task.shard, task.job_idx, std::move(raw)});
+                {
+                    std::unique_lock elk(enc_mtx);
+                    enc_cv.wait(elk, [&]{
+                        return enc_q.size() < ENC_Q_CAP || enc_done;
+                    });
+                    enc_q.push_back({task.shard, task.job_idx, std::move(raw)});
+                }
                 enc_cv.notify_one();
             }
         };
@@ -1433,6 +1443,8 @@ int main(int argc, char** argv) {
                     task = std::move(enc_q.front());
                     enc_q.pop_front();
                 }
+                // Wake any downloader blocked on queue-full.
+                enc_cv.notify_one();
 
                 total_raw.fetch_add(CHUNK_VOXELS);
 
