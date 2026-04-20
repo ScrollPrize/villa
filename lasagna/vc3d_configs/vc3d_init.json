@@ -4,7 +4,7 @@
 		"step": 1.0,
 		"smooth": 0.0,
 		"station": 0.1,
-		"winding_density": 0.001,
+		"winding_density": 0.1,
 		"data": 4.0,
 		"data_plain": 2.0,
 		"pred_dt": 2.0,
@@ -15,7 +15,7 @@
 			"name": "reopt",
 			"steps": 1000,
 			"min_scaledown": 0,
-			"lr": [1.0, 0.1, 0.01, 0.001, 0.0001],
+			"lr": [100.0, 10.0, 1.0, 0.1, 0.01, 0.001],
 			"params": ["mesh_ms","conn_offset_ms"],
 			"w_fac": {
 				"data": 0.0,

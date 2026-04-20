@@ -258,8 +258,31 @@ def station_loss(
     if target_n is not None:
         loss_normal = ((res.xyz_lr - target_n) ** 2).mean()
 
-    # --- XY-centering loss: disabled for now ---
-    loss = loss_normal
+    # --- XY-centering loss (per-winding, independent) ---
+    # Each winding's intersection gives a grid position. Shift all vertices
+    # so the intersection moves toward the grid center.
+    h_mid = (Hm - 1) / 2.0
+    w_mid = (Wm - 1) / 2.0
+    loss_xy = zero
+    n_xy_hits = 0
+
+    for d, _, h_frac_val, w_frac_val, _ in intersections:
+        with torch.no_grad():
+            dh = h_frac_val - h_mid
+            dw = w_frac_val - w_mid
+            # Tangent directions from mesh finite differences
+            raw_th = (xyz_det[d, 1:, :, :] - xyz_det[d, :-1, :, :]).mean(dim=(0, 1))  # (3,)
+            raw_tw = (xyz_det[d, :, 1:, :] - xyz_det[d, :, :-1, :]).mean(dim=(0, 1))  # (3,)
+            shift_vec = dh * raw_th + dw * raw_tw  # (3,)
+            target_xy_d = xyz_det[d] + shift_vec  # (Hm, Wm, 3)
+
+        loss_xy = loss_xy + ((res.xyz_lr[d] - target_xy_d) ** 2).mean()
+        n_xy_hits += 1
+
+    if n_xy_hits > 0:
+        loss_xy = loss_xy / n_xy_hits
+
+    loss = loss_normal + loss_xy
 
     # Dummy loss map/mask for visualization pipeline
     lm = loss.detach().expand(D, 1, Hm, Wm)
