@@ -1,6 +1,8 @@
-# Binary fiber segmentation modeled after srf_2um/ps192_medial.yaml.
+# Binary fiber segmentation modeled after srf_2um/ps192_medial.yaml but at
+# 256^3 patches per user request.
 #
 # Differences vs ps192_medial.yaml:
+#   * patch_size: 256^3 (user-specified).
 #   * dataset_type: cross_frame -- labels and image live in different frames,
 #     bridged by transform.json; the dataset inverts it and resamples on the fly.
 #   * loss: nnUNet_DC_and_CE_loss. The repo only exposes a combined
@@ -9,9 +11,9 @@
 #     fall back to Dice+CE here.
 #   * wandb_project: fibers (separate from srf_2um).
 #
-# Invocation (8-GPU DDP, run once to kick off):
+# Invocation (8-GPU DDP):
 #   uv run vesuvius.train \
-#     --config src/vesuvius/models/configuration/single_task/ps192_fibers_dicece.yaml \
+#     --config src/vesuvius/models/configuration/single_task/ps256_fibers_dicece.yaml \
 #     --input /home/ubuntu/fibers_cache \
 #     --output /home/ubuntu/fibers_ckpts \
 #     --ddp --gpus 0,1,2,3,4,5,6,7 --nproc-per-node 8 \
@@ -20,11 +22,11 @@
 tr_setup:
   wandb_project: "fibers"
   wandb_entity: "vesuvius-challenge"
-  model_name: "ps192_fibers_dicece"
+  model_name: "ps256_fibers_dicece"
   tr_val_split: 0.85
 
 tr_config:
-  patch_size: [192, 192, 192]
+  patch_size: [256, 256, 256]
   batch_size: 2
   num_dataloader_workers: 14
   enable_deep_supervision: false
