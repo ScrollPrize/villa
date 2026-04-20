@@ -215,6 +215,7 @@ auto video_encode(std::span<const std::byte> raw, const VideoCodecParams& params
         }
     }
 
+    output.shrink_to_fit();
     return output;
 }
 
