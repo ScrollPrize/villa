@@ -343,14 +343,11 @@ class VCDataset(Dataset):
             array_chunks = tuple(array_obj.chunks)
             array_shape = tuple(array_obj.shape)
         elif isinstance(array_obj, _zarr.hierarchy.Group):
-            first_key = None
-            for key in array_obj.keys():
-                if isinstance(array_obj[key], _zarr.Array):
-                    first_key = key
-                    break
-            if first_key is None:
+            # Use level "0" to match what Volume.__getitem__ reads by default.
+            if "0" not in array_obj or not isinstance(array_obj["0"], _zarr.Array):
                 return None
-            sub = array_obj[first_key]
+            sub = array_obj["0"]
+            first_key = "0"
             array_url = use_path.rstrip('/') + '/' + first_key
             array_chunks = tuple(sub.chunks)
             array_shape = tuple(sub.shape)
