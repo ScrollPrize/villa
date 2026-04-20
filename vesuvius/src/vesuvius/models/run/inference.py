@@ -18,6 +18,7 @@ from pathlib import Path
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.run.external_models.load_resnet import try_load_external_resnet34_model
 from vesuvius.models.run.tta import infer_with_tta
+from vesuvius.models.run.patch_writer import BoundedPatchWriter
 from vesuvius.utils.k8s import get_tqdm_kwargs
 
 
@@ -61,6 +62,7 @@ class Inferer():
                  normalization_scheme: str = 'instance_zscore',
                  device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
                  num_dataloader_workers: int = 4,
+                 writer_workers: int = None,
                  verbose: bool = False,
                  skip_empty_patches: bool = True,  # Skip empty/homogeneous patches
                  # params to get passed to Volume 
@@ -94,6 +96,7 @@ class Inferer():
         self.input_format = input_format
         self.device = torch.device(device)
         self.num_dataloader_workers = num_dataloader_workers
+        self.writer_workers = writer_workers
         self.skip_empty_patches = skip_empty_patches
         self.scroll_id = scroll_id
         self.segment_id = segment_id
@@ -509,11 +512,22 @@ class Inferer():
             raise RuntimeError(
                 f"Dataset for part {self.part_id}/{self.num_parts} is empty (based on calculated coordinates in '{expected_attr_name}'). Check input data and partitioning.")
 
+        # Let the dataset decide whether to expose a filtered view (e.g. a Subset
+        # over non-empty patches when the input zarr's chunk occupancy has been
+        # pre-indexed). len(loader_dataset) drives tqdm and the written-count
+        # assertion below, so progress/ETA reflect only patches the model actually sees.
+        loader_dataset = self.dataset.active_view()
+        self.num_active_patches = len(loader_dataset)
         if self.verbose:
-            print(f"Total patches to process for part {self.part_id}: {self.num_total_patches}")
+            if self.num_active_patches != self.num_total_patches:
+                print(
+                    f"Pre-filtered to {self.num_active_patches} of {self.num_total_patches} patches "
+                    f"({100.0 * self.num_active_patches / self.num_total_patches:.1f}%)"
+                )
+            print(f"Total patches to process for part {self.part_id}: {self.num_active_patches}")
 
         self.dataloader = DataLoader(
-            self.dataset,
+            loader_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_dataloader_workers,
@@ -669,42 +683,43 @@ class Inferer():
 
     def _process_batches(self):
         numcodecs.blosc.use_threads = False
-        
+
         self.current_patch_write_index = 0
-        max_workers = min(16, os.cpu_count() or 4)
-        
+        max_workers = self.writer_workers if self.writer_workers is not None else min(16, os.cpu_count() or 4)
+
         zarr_path = os.path.join(self.output_dir, f"logits_part_{self.part_id}.zarr")
-        
+
         if not zarr_path:
             error_msg = f"Error: Empty zarr_path generated from output_dir='{self.output_dir}'"
             print(error_msg)
             raise ValueError(error_msg)
-        
-        # Verify we have a valid output store from _create_output_stores()
+
         if self.output_store is None:
             raise RuntimeError(f"Error: output_store is None. Make sure _create_output_stores() was called successfully.")
-            
+
         if self.verbose:
             print(f"Using existing output store: {zarr_path}")
             print(f"Output store shape: {self.output_store.shape}")
-        
-        # reference to the output store that will be shared by all threads
-        output_store = self.output_store
-        
-        def write_patch(write_index, patch_data):
-            try:
-                output_store[write_index] = patch_data
-                return write_index
-            except Exception as e:
-                raise RuntimeError(f"Failed to write patch at index {write_index}: {str(e)}")
+
+        progress_lock = threading.Lock()
 
         def to_device(tensor):
             return tensor.to(self.device, non_blocking=(self.device.type == 'cuda'))
 
-        with tqdm(total=self.num_total_patches, desc=f"Inferring Part {self.part_id}", **get_tqdm_kwargs()) as pbar:
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = []
-                
+        with tqdm(total=self.num_active_patches, desc=f"Inferring Part {self.part_id}", **get_tqdm_kwargs()) as pbar:
+            def on_progress():
+                with progress_lock:
+                    self.current_patch_write_index += 1
+                pbar.update(1)
+
+            with BoundedPatchWriter(
+                self.output_store,
+                max_workers=max_workers,
+                pbar=pbar,
+                on_progress=on_progress,
+            ) as writer:
+                if self.verbose:
+                    print(f"Writer pool: {writer.max_workers} workers, max in-flight: {writer.max_inflight}")
                 for batch_data in self.dataloader:
                     if isinstance(batch_data, dict):
                         input_batch = to_device(batch_data['data'])
@@ -761,39 +776,24 @@ class Inferer():
                     current_batch_size = output_np.shape[0]
 
                     patch_indices = batch_data.get('index', list(range(current_batch_size)))
-                    
+
                     for i in range(current_batch_size):
                         patch_data = output_np[i]  # Shape: (C, Z, Y, X)
                         write_index = patch_indices[i] if i < len(patch_indices) else i
-                        future = executor.submit(write_patch, write_index, patch_data)
-                        futures.append(future)
-                        
-                    completed = [f for f in futures if f.done()]
-                    for future in completed:
-                        try:
-                            result = future.result()
-                            if result is not None:  # Only update if write was successful
-                                pbar.update(1)
-                                self.current_patch_write_index += 1
-                        except Exception as e:
-                            print(f"Error processing future result: {e}")
-                    
-                    futures = [f for f in futures if not f.done()]
-                
-                for future in futures:
-                    try:
-                        result = future.result()
-                        if result is not None:
-                            pbar.update(1)
-                            self.current_patch_write_index += 1
-                    except Exception as e:
-                        print(f"Error processing future result: {e}")
-        
+                        writer.submit(write_index, patch_data)
+
+            total_wait = writer.total_wait_seconds
+            elapsed = writer.elapsed_seconds
+
+        if total_wait > 0:
+            pct = (total_wait / elapsed * 100.0) if elapsed > 0 else 0.0
+            print(f"Writer backpressure: {total_wait:.1f}s total wait ({pct:.1f}% of {elapsed:.1f}s wall clock)")
+
         if self.verbose:
             print(f"Finished writing {self.current_patch_write_index} patches.")
         
-        if self.current_patch_write_index != self.num_total_patches:
-            print(f"Warning: Expected {self.num_total_patches} patches, but wrote {self.current_patch_write_index}.")
+        if self.current_patch_write_index != self.num_active_patches:
+            print(f"Warning: Expected {self.num_active_patches} patches, but wrote {self.current_patch_write_index}.")
 
     def _finalize_output_batch(self, output_batch):
         if output_batch.dtype != torch.float16:
@@ -854,6 +854,9 @@ def main():
     parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda, cpu)')
     parser.add_argument('--num_workers', type=int, default=4,
                       help='Number of DataLoader workers. Use 0 in low /dev/shm environments (e.g. Docker).')
+    parser.add_argument('--writer_workers', type=int, default=None,
+                      help='Number of threads used to write patches to the output zarr. '
+                           'Default: min(16, cpu_count). Increase for S3 outputs to push more parallelism.')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
     parser.add_argument('--skip-empty-patches', dest='skip_empty_patches', action='store_true',
                       help='Skip patches that are empty (all values the same). Default: True')
@@ -920,6 +923,7 @@ def main():
         normalization_scheme=args.normalization,
         device=args.device,
         num_dataloader_workers=args.num_workers,
+        writer_workers=args.writer_workers,
         verbose=args.verbose,
         skip_empty_patches=args.skip_empty_patches,  # Skip empty patches flag
         # Pass Volume-specific parameters to VCDataset

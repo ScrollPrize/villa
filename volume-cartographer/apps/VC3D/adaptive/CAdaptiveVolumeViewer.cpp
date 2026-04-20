@@ -1313,10 +1313,15 @@ void CAdaptiveVolumeViewer::invalidateIntersect(const std::string&)
 void CAdaptiveVolumeViewer::renderIntersections()
 {
     auto surf = _surfWeak.lock();
-    auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
-    if (!plane || !_state || !_viewerManager || !_scene || !_view) {
+    if (!surf || !_state || !_viewerManager || !_scene || !_view) {
         invalidateIntersect();
         _lastIntersectFp = {};
+        return;
+    }
+
+    auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
+    if (!plane) {
+        renderFlattenedIntersections(surf);
         return;
     }
 
@@ -1497,6 +1502,121 @@ void CAdaptiveVolumeViewer::renderIntersections()
         item->setPen(pen);
         item->setBrush(Qt::NoBrush);
         item->setZValue(style.z);
+        _scene->addItem(item);
+        _intersectionItems.push_back(item);
+    }
+
+    _view->viewport()->update();
+}
+
+void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Surface>& surf)
+{
+    auto activeSeg = std::dynamic_pointer_cast<QuadSurface>(surf);
+    // Only the active segmentation viewer gets plane intersections drawn in UV.
+    // If the view hosts some other QuadSurface there's nothing to render.
+    if (!activeSeg || _state->surface("segmentation") != activeSeg) {
+        invalidateIntersect();
+        _lastIntersectFp = {};
+        return;
+    }
+
+    auto* patchIndex = _viewerManager->surfacePatchIndex();
+    if (!patchIndex || patchIndex->empty()) {
+        invalidateIntersect();
+        _lastIntersectFp = {};
+        return;
+    }
+
+    struct PlaneEntry {
+        std::shared_ptr<PlaneSurface> plane;
+        QColor color;
+    };
+    std::array<std::pair<const char*, QColor>, 3> kPlaneSpecs = {{
+        {"seg xy", QColor(255, 140, 0)}, // orange
+        {"seg xz", QColor(Qt::red)},
+        {"seg yz", QColor(Qt::yellow)},
+    }};
+    std::vector<PlaneEntry> planes;
+    planes.reserve(3);
+    for (const auto& [name, color] : kPlaneSpecs) {
+        if (!_intersectTgts.count(name)) continue;
+        if (auto p = std::dynamic_pointer_cast<PlaneSurface>(_state->surface(name))) {
+            planes.push_back({std::move(p), color});
+        }
+    }
+    if (planes.empty()) {
+        invalidateIntersect();
+        _lastIntersectFp = {};
+        return;
+    }
+
+    // Flattened view has no single plane — skip the plane-based fingerprint
+    // cache and just rebuild each call. Clipping one segment against three
+    // planes over the visible viewport is cheap.
+    invalidateIntersect();
+    _lastIntersectFp = {};
+
+    // Iterate every triangle of the active segment: a triangle's UV may sit
+    // anywhere on the flattened patch, so restricting by a viewport-derived
+    // 3D bbox would miss lines that belong on-screen but whose 3D vertices
+    // live elsewhere. One segment's triangle count is bounded enough for
+    // this to be cheap. Size the bbox to the volume so R-tree quantization
+    // (16-bit per axis over ~101000 units) can't drop valid cells.
+    Rect3D allBounds{cv::Vec3f(0, 0, 0), cv::Vec3f(1, 1, 1)};
+    if (_volume) {
+        auto [w, h, d] = _volume->shape();
+        allBounds.high = {static_cast<float>(w),
+                          static_cast<float>(h),
+                          static_cast<float>(d)};
+    }
+
+    auto isFiniteScalar = [](double v) {
+        uint64_t bits;
+        std::memcpy(&bits, &v, sizeof(bits));
+        return (bits & 0x7FF0000000000000ULL) != 0x7FF0000000000000ULL;
+    };
+    auto isFinitePoint = [&](const QPointF& p) {
+        return isFiniteScalar(p.x()) && isFiniteScalar(p.y());
+    };
+
+    const float clipTol = std::max(_intersectionThickness, 1e-4f);
+    std::vector<QPainterPath> paths(planes.size());
+
+    patchIndex->forEachTriangle(allBounds, activeSeg,
+        [&](const SurfacePatchIndex::TriangleCandidate& tri) {
+            for (size_t idx = 0; idx < planes.size(); ++idx) {
+                auto seg = SurfacePatchIndex::clipTriangleToPlane(
+                    tri, *planes[idx].plane, clipTol);
+                if (!seg) continue;
+                cv::Vec3f a = activeSeg->loc(seg->surfaceParams[0]);
+                cv::Vec3f b = activeSeg->loc(seg->surfaceParams[1]);
+                QPointF pa = surfaceToScene(a[0], a[1]);
+                QPointF pb = surfaceToScene(b[0], b[1]);
+                if (!isFinitePoint(pa) || !isFinitePoint(pb)) continue;
+                paths[idx].moveTo(pa);
+                paths[idx].lineTo(pb);
+            }
+        });
+
+    const float penWidth = std::max(_intersectionThickness,
+                                    kActiveIntersectionMinWidthDelta);
+    const float opacity = std::clamp(
+        _intersectionOpacity * kActiveIntersectionOpacityScale, 0.0f, 1.0f);
+
+    _intersectionItems.reserve(planes.size());
+    for (size_t idx = 0; idx < planes.size(); ++idx) {
+        if (paths[idx].isEmpty()) continue;
+        QColor color = planes[idx].color;
+        color.setAlphaF(opacity);
+        auto* item = new QGraphicsPathItem(paths[idx]);
+        QPen pen(color);
+        pen.setWidthF(static_cast<qreal>(penWidth));
+        pen.setCapStyle(Qt::RoundCap);
+        pen.setJoinStyle(Qt::RoundJoin);
+        pen.setCosmetic(true);
+        item->setPen(pen);
+        item->setBrush(Qt::NoBrush);
+        item->setZValue(kActiveIntersectionZ);
         _scene->addItem(item);
         _intersectionItems.push_back(item);
     }

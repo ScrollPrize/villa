@@ -90,7 +90,7 @@ public:
     void setIntersectionMaxSurfaces(int limit);
     int intersectionMaxSurfaces() const { return _intersectionMaxSurfaces; }
     void primeSurfacePatchIndicesAsync();
-    void resetStrideUserOverride() { _surfacePatchStrideUserSet = false; }
+    void resetStrideUserOverride() { _surfacePatchStrideUserSet = false; _surfacePatchStrideTiered = false; }
 
     bool resetDefaultFor(CTiledVolumeViewer* viewer) const;
     void setResetDefaultFor(CTiledVolumeViewer* viewer, bool value);
@@ -161,6 +161,7 @@ private:
     int _sliceStepSize{1};
     int _surfacePatchSamplingStride{1};
     bool _surfacePatchStrideUserSet{false};
+    bool _surfacePatchStrideTiered{false};  // tier code ran for current surface set
     int _targetRefinedStride{0};  // 0 = no refinement pending
     std::atomic<bool> _shuttingDown{false};
     int _intersectionMaxSurfaces{0};  // 0 = unlimited

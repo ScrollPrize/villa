@@ -253,6 +253,8 @@ private:
     cv::Vec2f sceneToSurface(const QPointF& scenePos) const;
     void updateFocusMarker(POI* poi = nullptr);
 
+    void renderFlattenedIntersections(const std::shared_ptr<Surface>& surf);
+
     void panByF(float dx, float dy);
     void zoomStepsAt(int steps, const QPointF& scenePos);
 
