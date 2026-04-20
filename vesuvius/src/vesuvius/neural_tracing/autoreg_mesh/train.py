@@ -1497,7 +1497,16 @@ def run_autoreg_mesh_training(
                     )
                 )
 
-            wandb_payload = dict(metrics)
+            wandb_payload = {}
+            for key, value in metrics.items():
+                if key.startswith("val_"):
+                    wandb_payload[f"val/{key[4:]}"] = value
+                elif key.startswith("rollout_val_"):
+                    wandb_payload[f"val/rollout_{key[12:]}"] = value
+                elif key.startswith("train_"):
+                    wandb_payload[f"train/{key[6:]}"] = value
+                else:
+                    wandb_payload[f"train/{key}"] = value
             should_log_projection_images_step = (
                 bool(cfg.get("wandb_log_images", True)) and
                 global_step % int(cfg["wandb_image_frequency"]) == 0
@@ -1524,17 +1533,17 @@ def run_autoreg_mesh_training(
                     _make_teacher_forced_prediction_canvas(batch, outputs, sample_idx=0),
                     caption=f"step={global_step} train teacher-forced",
                 )
-                wandb_payload["train_example"] = train_projection_image
-                wandb_payload["train_example_projection"] = train_projection_image
+                wandb_payload["train/example"] = train_projection_image
+                wandb_payload["train/example_projection"] = train_projection_image
                 if raw_val_sample is not None and val_infer is not None:
                     val_projection_image = wandb.Image(
                         _make_inference_prediction_canvas(raw_val_sample, val_infer),
                         caption=f"step={global_step} val autoregressive",
                     )
-                    wandb_payload["val_example"] = val_projection_image
-                    wandb_payload["val_example_projection"] = val_projection_image
+                    wandb_payload["val/example"] = val_projection_image
+                    wandb_payload["val/example_projection"] = val_projection_image
             if should_log_xy_images:
-                wandb_payload["train_example_xy"] = wandb.Image(
+                wandb_payload["train/example_xy"] = wandb.Image(
                     _make_teacher_forced_xy_slice_canvas(
                         batch,
                         outputs,
@@ -1545,7 +1554,7 @@ def run_autoreg_mesh_training(
                     caption=f"step={global_step} train xy slice",
                 )
                 if raw_val_sample is not None and val_infer is not None:
-                    wandb_payload["val_example_xy"] = wandb.Image(
+                    wandb_payload["val/example_xy"] = wandb.Image(
                         _make_inference_xy_slice_canvas(
                             raw_val_sample,
                             val_infer,
