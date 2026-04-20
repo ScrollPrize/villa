@@ -398,7 +398,8 @@ class BaseTrainer:
 
         Dispatches on ``mgr.dataset_config.dataset_type`` (default ``"zarr"``).
         """
-        dataset_type = (getattr(mgr, "dataset_config", {}) or {}).get("dataset_type", "zarr")
+        ds_cfg = getattr(mgr, "dataset_config", {}) or {}
+        dataset_type = str(ds_cfg.get("dataset_type", "zarr")).strip().lower()
         if dataset_type == "cross_frame":
             from vesuvius.models.datasets.cross_frame_dataset import CrossFrameZarrDataset
 

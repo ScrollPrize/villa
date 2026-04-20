@@ -31,6 +31,7 @@ from vesuvius.utils.utils import pad_or_crop_3d
 
 from ..augmentation.pipelines import create_training_transforms
 from ..training.normalization import get_normalization
+from .zarr_dataset import PatchInfo
 
 
 logger = logging.getLogger(__name__)
@@ -121,6 +122,11 @@ class CrossFrameZarrDataset(Dataset):
         self.normalizer = get_normalization(self.normalization_scheme, self.intensity_properties)
 
         self.cache_dir = self._resolve_cache_dir(ds_cfg)
+        # data_path is read by BaseTrainer._configure_dataloaders to decide
+        # whether train/val datasets share a source. Setting it to the mgr's
+        # data_path keeps the random-split path (no cross-dataset leakage scan)
+        # when both train and val datasets are built from the same config.
+        self.data_path = getattr(mgr, "data_path", None)
         self._patches: List[Tuple[int, int, int]] = []
         self._build_patch_index()
 
@@ -314,9 +320,18 @@ class CrossFrameZarrDataset(Dataset):
     # helpers preserved for compatibility with BaseTrainer ------------------
 
     @property
-    def valid_patches(self):
+    def valid_patches(self) -> List[PatchInfo]:
+        """Return patch metadata as ``PatchInfo`` so BaseTrainer's
+        split/leakage-prevention logic can read ``.volume_name`` and
+        ``.position`` uniformly with ZarrDataset.
+        """
         return [
-            {"position": pos, "patch_size": self.patch_size, "volume_name": "fibers"}
+            PatchInfo(
+                volume_index=0,
+                volume_name="fibers",
+                position=pos,
+                patch_size=self.patch_size,
+            )
             for pos in self._patches
         ]
 

@@ -197,6 +197,35 @@ def test_translation_transform_resamples_correctly(tmp_path: Path):
     np.testing.assert_allclose(image_patch, expected, atol=1e-4)
 
 
+def test_dispatcher_is_case_insensitive(identity_pair, monkeypatch):
+    """BaseTrainer._build_dataset_for_mgr must normalize dataset_type."""
+    from vesuvius.models.training import train as train_mod
+
+    class _Shim:
+        def __init__(self, mgr, **_):
+            self.mgr = mgr
+
+    monkeypatch.setattr(
+        train_mod, "ZarrDataset", _Shim, raising=False,
+    )
+
+    mgr = _make_mgr(
+        image_url=identity_pair.image_url,
+        labels_url=identity_pair.labels_url,
+        transform_url=identity_pair.tform_url,
+        cache_dir=identity_pair.root,
+    )
+    mgr.dataset_config["dataset_type"] = "Cross_Frame"
+
+    trainer_self = type("T", (), {})()
+    built = train_mod.BaseTrainer._build_dataset_for_mgr(
+        trainer_self, mgr=mgr, is_training=False
+    )
+    from vesuvius.models.datasets.cross_frame_dataset import CrossFrameZarrDataset
+
+    assert isinstance(built, CrossFrameZarrDataset)
+
+
 def test_empty_labels_raise(tmp_path):
     image = np.zeros((32, 32, 32), dtype=np.uint8)
     labels = np.zeros((32, 32, 32), dtype=np.uint8)
@@ -215,6 +244,36 @@ def test_empty_labels_raise(tmp_path):
     )
     with pytest.raises(RuntimeError, match="0 foreground patches"):
         CrossFrameZarrDataset(mgr, is_training=False)
+
+
+def test_valid_patches_expose_attributes(identity_pair):
+    """BaseTrainer's leakage-prevention code reads vp.volume_name / vp.position."""
+    mgr = _make_mgr(
+        image_url=identity_pair.image_url,
+        labels_url=identity_pair.labels_url,
+        transform_url=identity_pair.tform_url,
+        cache_dir=identity_pair.root,
+    )
+    ds = CrossFrameZarrDataset(mgr, is_training=False)
+    patches = ds.valid_patches
+    assert len(patches) == len(ds)
+    for vp in patches:
+        assert hasattr(vp, "volume_name")
+        assert hasattr(vp, "position")
+        assert vp.volume_name == "fibers"
+        assert isinstance(vp.position, tuple) and len(vp.position) == 3
+
+
+def test_data_path_exposed_for_same_source_split(identity_pair):
+    """data_path must match mgr.data_path so the trainer keeps the random-split path."""
+    mgr = _make_mgr(
+        image_url=identity_pair.image_url,
+        labels_url=identity_pair.labels_url,
+        transform_url=identity_pair.tform_url,
+        cache_dir=identity_pair.root,
+    )
+    ds = CrossFrameZarrDataset(mgr, is_training=False)
+    assert ds.data_path == mgr.data_path
 
 
 def test_out_of_bounds_patches_skipped(tmp_path):
