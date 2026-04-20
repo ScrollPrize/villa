@@ -2,9 +2,9 @@
 	"base": {
 		"normal": 1.0,
 		"step": 1.0,
-		"smooth": 0.0,
-		"station": 0.1,
-		"winding_density": 0.1,
+		"smooth": 0.01,
+		"station": 0.01,
+		"winding_density": 0.01,
 		"data": 4.0,
 		"data_plain": 2.0,
 		"pred_dt": 2.0,
