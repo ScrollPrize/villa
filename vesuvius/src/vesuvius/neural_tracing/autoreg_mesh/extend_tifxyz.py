@@ -25,6 +25,8 @@ from vesuvius.neural_tracing.autoreg_mesh.infer import (
     infer_autoreg_mesh,
 )
 from vesuvius.neural_tracing.autoreg_mesh.model import (
+    ATTENTION_SCALING_LEGACY_DOUBLE_SCALED,
+    ATTENTION_SCALING_STANDARD,
     GENERATED_TOKEN_TYPE,
     START_TOKEN_TYPE,
     AutoregMeshModel,
@@ -38,6 +40,10 @@ Color = tuple[int, int, int]
 ORIGINAL_COLOR: Color = (90, 180, 255)
 PREDICTED_COLOR: Color = (255, 140, 0)
 SEAM_COLOR: Color = (255, 0, 255)
+LATTICE_GROW_DIRECTIONS = ("left", "right", "up", "down")
+Z_PROJECTED_GROW_DIRECTIONS = ("decreasing-z", "increasing-z")
+ALL_GROW_DIRECTIONS = ("auto",) + LATTICE_GROW_DIRECTIONS + Z_PROJECTED_GROW_DIRECTIONS
+ATTENTION_SCALING_MODES = (ATTENTION_SCALING_STANDARD, ATTENTION_SCALING_LEGACY_DOUBLE_SCALED)
 
 
 @dataclass(frozen=True)
@@ -99,6 +105,12 @@ class ExtensionWindowCandidate:
     window: ExtensionWindow
     prompt_strips: int
     predict_strips: int
+
+
+@dataclass(frozen=True)
+class ExtensionStageResult:
+    final_tifxyz_path: Path
+    stage_summary: dict[str, Any]
 
 
 @dataclass
@@ -584,6 +596,87 @@ def _score_direction(grid_zyx: np.ndarray, direction: str, *, prompt_strips: int
     return float(valid_count) + 0.01 * step_norm
 
 
+def _mean_outward_world_z(grid_zyx: np.ndarray, direction: str, *, prompt_strips: int) -> float | None:
+    prompt_grid = _extract_prompt_window(
+        grid_zyx,
+        direction,
+        prompt_strips=int(prompt_strips),
+        window=ExtensionWindow(
+            0,
+            int(grid_zyx.shape[0] if direction in {"left", "right"} else grid_zyx.shape[1]),
+        ),
+    )
+    boundary, interior = _boundary_from_prompt(prompt_grid, direction)
+    valid = np.isfinite(boundary).all(axis=-1) & np.isfinite(interior).all(axis=-1)
+    if not bool(np.any(valid)):
+        return None
+    outward = boundary[valid] - interior[valid]
+    return float(outward[:, 0].mean())
+
+
+def resolve_growth_direction(
+    grid_zyx: np.ndarray,
+    *,
+    prompt_strips: int,
+    predict_strips: int,
+    crop_size: tuple[int, int, int],
+    requested_direction: str | None = None,
+) -> tuple[str, np.ndarray]:
+    requested = None if requested_direction in {None, "", "auto"} else str(requested_direction)
+    if requested is None:
+        smoothed = grid_zyx.copy()
+        for direction in LATTICE_GROW_DIRECTIONS:
+            smoothed = _smooth_frontier(smoothed, direction)
+        return choose_growth_direction(
+            smoothed,
+            prompt_strips=int(prompt_strips),
+            predict_strips=int(predict_strips),
+            crop_size=crop_size,
+            override=None,
+        ), smoothed
+
+    if requested in LATTICE_GROW_DIRECTIONS:
+        smoothed = _smooth_frontier(grid_zyx.copy(), requested)
+        return choose_growth_direction(
+            smoothed,
+            prompt_strips=int(prompt_strips),
+            predict_strips=int(predict_strips),
+            crop_size=crop_size,
+            override=requested,
+        ), smoothed
+
+    if requested not in Z_PROJECTED_GROW_DIRECTIONS:
+        raise ValueError(f"unsupported grow_direction {requested!r}")
+
+    candidates: list[tuple[float, float, str, np.ndarray]] = []
+    for direction in LATTICE_GROW_DIRECTIONS:
+        smoothed = _smooth_frontier(grid_zyx.copy(), direction)
+        score = _score_direction(
+            smoothed,
+            direction,
+            prompt_strips=int(prompt_strips),
+            predict_strips=int(predict_strips),
+            crop_size=crop_size,
+        )
+        if score <= -1e11:
+            continue
+        mean_outward_z = _mean_outward_world_z(smoothed, direction, prompt_strips=int(prompt_strips))
+        if mean_outward_z is None:
+            continue
+        candidates.append((float(mean_outward_z), float(score), str(direction), smoothed))
+
+    if not candidates:
+        raise RuntimeError(f"could not resolve a valid lattice direction for {requested!r}")
+
+    if requested == "decreasing-z":
+        mean_z, _score, direction, smoothed = min(candidates, key=lambda item: (item[0], -item[1], item[2]))
+    else:
+        mean_z, _score, direction, smoothed = max(candidates, key=lambda item: (item[0], item[1], item[2]))
+    if not np.isfinite(mean_z):
+        raise RuntimeError(f"resolved non-finite projected Z direction for {requested!r}")
+    return str(direction), smoothed
+
+
 def choose_growth_direction(grid_zyx: np.ndarray, *, prompt_strips: int, predict_strips: int, crop_size: tuple[int, int, int], override: str | None = None) -> str:
     directions = [str(override)] if override is not None else ["left", "right", "up", "down"]
     scores = {
@@ -1047,6 +1140,25 @@ def _iter_window_batches(payloads: list[ExtensionWindowPayload], *, window_batch
     return batches
 
 
+def _model_patch_diag(model) -> float | None:
+    patch_size = getattr(model, "patch_size", None)
+    if patch_size is None:
+        return None
+    return float(np.linalg.norm(np.asarray(patch_size, dtype=np.float32)))
+
+
+def _model_input_shape_array(model) -> np.ndarray | None:
+    input_shape = getattr(model, "input_shape", None)
+    if input_shape is None:
+        return None
+    return np.asarray(input_shape, dtype=np.float32)
+
+
+def _supports_cached_window_inference(model) -> bool:
+    raw_model = model.module if hasattr(model, "module") else model
+    return all(callable(getattr(raw_model, name, None)) for name in ("init_kv_cache", "_build_input_embeddings", "step_from_encoded_cached"))
+
+
 def _decode_single_step_from_outputs(
     model,
     outputs: dict,
@@ -1081,15 +1193,17 @@ def _decode_single_step_from_outputs(
     refine_residual = outputs.get("pred_refine_residual")
     if refine_residual is not None:
         res = refine_residual[sample_idx, step_idx].detach().to(torch.float32).cpu().numpy()
-        patch_diag = float(np.linalg.norm(model.patch_size))
+        patch_diag = _model_patch_diag(model)
         res_norm = float(np.linalg.norm(res))
-        if res_norm > patch_diag:
+        if patch_diag is not None and res_norm > patch_diag:
             res = res * (patch_diag / res_norm)
         sampled_xyz = bin_center_xyz + res
     else:
         sampled_xyz = bin_center_xyz
-    crop_max = np.array(model.input_shape, dtype=np.float32) - 1e-4
-    sampled_xyz = np.clip(sampled_xyz, 0.0, crop_max)
+    input_shape = _model_input_shape_array(model)
+    if input_shape is not None:
+        crop_max = input_shape - 1e-4
+        sampled_xyz = np.clip(sampled_xyz, 0.0, crop_max)
     stop_prob = float(torch.sigmoid(outputs["stop_logits"][sample_idx, step_idx].float()).item())
     return coarse_id, offset_bins, sampled_xyz.astype(np.float32, copy=False), stop_prob
 
@@ -1256,6 +1370,21 @@ def infer_extension_windows_batched_cached(
 ) -> tuple[list[dict[str, Any]], float, int]:
     if not payloads:
         return [], 0.0, 0
+    if not _supports_cached_window_inference(model):
+        return infer_extension_windows_batched(
+            model,
+            payloads,
+            window_batch_size=window_batch_size,
+            device=device,
+            greedy=greedy,
+            stop_probability_threshold=stop_probability_threshold,
+            progress_desc=progress_desc,
+            show_progress=show_progress,
+            fast_infer=fast_infer,
+            compile_infer=compile_infer,
+            amp_dtype=amp_dtype,
+            runtime=runtime,
+        )
     results: list[dict[str, Any]] = []
     total_encode_decode_ms = 0.0
     peak_batch_size = 0
@@ -1688,7 +1817,13 @@ def _build_tifxyz_from_grid(grid_zyx: np.ndarray, *, uuid: str, scale: tuple[flo
     )
 
 
-def _load_autoreg_model(*, dino_backbone: str, autoreg_checkpoint: str, device: torch.device) -> tuple[AutoregMeshModel, dict]:
+def _load_autoreg_model(
+    *,
+    dino_backbone: str,
+    autoreg_checkpoint: str,
+    device: torch.device,
+    attention_scaling_mode: str | None = None,
+) -> tuple[AutoregMeshModel, dict]:
     ckpt = torch.load(Path(autoreg_checkpoint), map_location="cpu", weights_only=False)
     cfg = dict(ckpt.get("config") or {})
     cfg["dinov2_backbone"] = str(dino_backbone)
@@ -1696,6 +1831,8 @@ def _load_autoreg_model(*, dino_backbone: str, autoreg_checkpoint: str, device: 
     cfg["wandb_project"] = None
     cfg["save_final_checkpoint"] = False
     cfg["cache_vol_tokens"] = False
+    if attention_scaling_mode is not None:
+        cfg["attention_scaling_mode"] = str(attention_scaling_mode)
     model = AutoregMeshModel(cfg)
     model.load_state_dict(ckpt["model"])
     model = model.to(device).eval()
@@ -1725,6 +1862,7 @@ def extend_tifxyz_mesh(
     distributed_infer: bool = False,
     distributed_shard_mode: str = "strided",
     distributed_gather_mode: str = "object",
+    attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
 ) -> dict[str, Any]:
     if str(distributed_shard_mode) != "strided":
         raise ValueError(f"unsupported distributed_shard_mode {distributed_shard_mode!r}")
@@ -1753,6 +1891,7 @@ def extend_tifxyz_mesh(
     total_rank_merge_input_count = 0
     per_rank_fitted_window_counts_total = [0 for _ in range(runtime.world_size)]
     summary: dict[str, Any] | None = None
+    cached_infer_available = False
 
     try:
         t0 = perf_counter()
@@ -1763,24 +1902,20 @@ def extend_tifxyz_mesh(
             surface_uuid = str(surface.uuid or Path(tifxyz_path).name)
             provenance = np.zeros(grid_zyx.shape[:2], dtype=np.uint8)
             grid_zyx, provenance, trimmed_bbox_rc = _trim_grid_to_valid_bbox(grid_zyx, provenance)
-            pre_direction = None if grow_direction in {None, "", "auto"} else str(grow_direction)
-            if pre_direction is not None:
-                grid_zyx = _smooth_frontier(grid_zyx, pre_direction)
-            else:
-                for d in ["up", "down", "left", "right"]:
-                    grid_zyx = _smooth_frontier(grid_zyx, d)
-            direction = choose_growth_direction(
+            requested_direction = None if grow_direction in {None, ""} else str(grow_direction)
+            direction, grid_zyx = resolve_growth_direction(
                 grid_zyx,
                 prompt_strips=int(prompt_strips),
                 predict_strips=int(predict_strips_per_iter),
                 crop_size=crop_size,
-                override=None if grow_direction in {None, "", "auto"} else str(grow_direction),
+                requested_direction=requested_direction,
             )
             root_state = {
                 "surface_scale": surface_scale,
                 "surface_uuid": surface_uuid,
                 "trimmed_bbox_rc": trimmed_bbox_rc,
                 "direction": direction,
+                "requested_direction": requested_direction,
                 "original_vertex_count": int(np.isfinite(grid_zyx).all(axis=-1).sum()),
             }
         else:
@@ -1799,18 +1934,30 @@ def extend_tifxyz_mesh(
         surface_uuid = str(root_state["surface_uuid"])
         trimmed_bbox_rc = tuple(int(v) for v in root_state["trimmed_bbox_rc"])
         direction = str(root_state["direction"])
+        requested_direction = root_state.get("requested_direction")
         original_vertex_count = int(root_state["original_vertex_count"])
 
         volume = _open_zarr_volume(volume_uri)
         volume_shape = tuple(int(v) for v in volume.shape[-3:])
 
         t0 = perf_counter()
-        model, model_cfg = _load_autoreg_model(
-            dino_backbone=str(dino_backbone),
-            autoreg_checkpoint=str(autoreg_checkpoint),
-            device=device_obj,
-        )
+        try:
+            model, model_cfg = _load_autoreg_model(
+                dino_backbone=str(dino_backbone),
+                autoreg_checkpoint=str(autoreg_checkpoint),
+                device=device_obj,
+                attention_scaling_mode=str(attention_scaling_mode),
+            )
+        except TypeError as exc:
+            if "attention_scaling_mode" not in str(exc):
+                raise
+            model, model_cfg = _load_autoreg_model(
+                dino_backbone=str(dino_backbone),
+                autoreg_checkpoint=str(autoreg_checkpoint),
+                device=device_obj,
+            )
         timings["load_model_ms"] = 1000.0 * (perf_counter() - t0) if runtime.is_main_process else 0.0
+        cached_infer_available = _supports_cached_window_inference(model)
         infer_runtime = ExtensionInferenceRuntime(
             model,
             device=device_obj,
@@ -2063,9 +2210,11 @@ def extend_tifxyz_mesh(
                 "surface_uuid": surface_uuid,
                 "source_tifxyz_path": str(tifxyz_path),
                 "direction": direction,
+                "requested_direction": requested_direction,
                 "volume_uri": str(volume_uri),
                 "dino_backbone": str(dino_backbone),
                 "autoreg_checkpoint": str(autoreg_checkpoint),
+                "attention_scaling_mode": str(model_cfg.get("attention_scaling_mode", ATTENTION_SCALING_STANDARD)),
                 "original_vertex_count": int(original_vertex_count),
                 "final_vertex_count": int(np.isfinite(working_grid).all(axis=-1).sum()),
                 "predicted_vertex_count": int(np.isfinite(working_grid).all(axis=-1).sum() - int(original_vertex_count)),
@@ -2099,6 +2248,8 @@ def extend_tifxyz_mesh(
                 "compile_infer_requested": bool(infer_runtime.compile_infer_requested),
                 "compile_infer_actual": bool(infer_runtime.compile_infer_actual),
                 "compile_infer_failure": infer_runtime.compile_infer_failure,
+                "cached_infer_available": bool(cached_infer_available),
+                "cached_infer_fallback_used": bool(not cached_infer_available),
                 "amp_dtype": (
                     "bf16" if infer_runtime.amp_dtype == torch.bfloat16 else "fp16" if infer_runtime.amp_dtype == torch.float16 else None
                 ),
@@ -2129,6 +2280,195 @@ def extend_tifxyz_mesh(
         _destroy_distributed_infer_runtime(runtime)
 
 
+def _compact_extension_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    keys = [
+        "direction",
+        "requested_direction",
+        "attention_scaling_mode",
+        "predicted_vertex_count",
+        "cumulative_predicted_vertex_count",
+        "final_predicted_nonseam_vertex_count",
+        "final_seam_vertex_count",
+        "new_band_frontier_coverage_fraction",
+        "new_band_cell_coverage_fraction",
+        "new_band_max_gap",
+        "new_band_gap_spans",
+        "first_uncovered_frontier_index",
+        "iterations_completed",
+        "stop_reason",
+        "window_batch_size",
+        "encode_decode_ms_per_fitted_window",
+        "crop_cache_hits",
+        "crop_cache_misses",
+        "total_wall_ms",
+        "fast_infer_enabled",
+        "compile_infer_requested",
+        "compile_infer_actual",
+        "compile_infer_failure",
+        "cached_infer_available",
+        "cached_infer_fallback_used",
+        "amp_dtype",
+    ]
+    compact = {key: summary.get(key) for key in keys}
+    compact["summary_path"] = summary.get("summary_path")
+    compact["tifxyz_path"] = summary.get("tifxyz_path")
+    return compact
+
+
+def run_extension_to_exhaustion(
+    *,
+    input_tifxyz_path: str | Path,
+    output_dir: str | Path,
+    grow_direction: str,
+    volume_uri: str,
+    dino_backbone: str,
+    autoreg_checkpoint: str,
+    device: str = "cuda",
+    prompt_strips: int = 8,
+    predict_strips_per_iter: int = 8,
+    window_strip_length: int = 64,
+    window_overlap: int = 16,
+    window_batch_size: int = 4,
+    max_extension_iters_per_call: int = 4,
+    max_crop_fit_retries: int = 3,
+    max_calls: int | None = None,
+    show_progress: bool | None = None,
+    fast_infer: bool = True,
+    compile_infer: bool = False,
+    amp_dtype: str = "bf16",
+    distributed_infer: bool = False,
+    distributed_shard_mode: str = "strided",
+    distributed_gather_mode: str = "object",
+    attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
+    call_validator=None,
+    extend_impl=None,
+) -> ExtensionStageResult:
+    current_input = Path(input_tifxyz_path)
+    output_dir = Path(output_dir)
+    call_idx = 0
+    call_summaries: list[dict[str, Any]] = []
+    stage_stop_reason = "completed"
+    resolved_direction: str | None = None
+    while True:
+        call_dir = output_dir / f"{grow_direction}_call_{call_idx:03d}"
+        requested_direction = str(grow_direction if call_idx == 0 or resolved_direction is None else resolved_direction)
+        extend_fn = extend_tifxyz_mesh if extend_impl is None else extend_impl
+        summary = extend_fn(
+            tifxyz_path=current_input,
+            volume_uri=volume_uri,
+            dino_backbone=dino_backbone,
+            autoreg_checkpoint=autoreg_checkpoint,
+            out_dir=call_dir,
+            device=device,
+            grow_direction=requested_direction,
+            prompt_strips=int(prompt_strips),
+            predict_strips_per_iter=int(predict_strips_per_iter),
+            window_strip_length=int(window_strip_length),
+            window_overlap=int(window_overlap),
+            window_batch_size=int(window_batch_size),
+            max_extension_iters=int(max_extension_iters_per_call),
+            max_crop_fit_retries=int(max_crop_fit_retries),
+            show_progress=show_progress,
+            fast_infer=bool(fast_infer),
+            compile_infer=bool(compile_infer),
+            amp_dtype=str(amp_dtype),
+            distributed_infer=bool(distributed_infer),
+            distributed_shard_mode=str(distributed_shard_mode),
+            distributed_gather_mode=str(distributed_gather_mode),
+            attention_scaling_mode=str(attention_scaling_mode),
+        )
+        compact_summary = _compact_extension_summary(summary)
+        call_summaries.append(compact_summary)
+        if resolved_direction is None:
+            resolved_direction = str(summary["direction"])
+        if callable(call_validator):
+            call_validator(compact_summary, call_idx)
+        current_input = Path(summary["tifxyz_path"])
+        if str(summary["stop_reason"]) != "max_extension_iters":
+            stage_stop_reason = str(summary["stop_reason"])
+            break
+        call_idx += 1
+        if max_calls is not None and call_idx >= int(max_calls):
+            stage_stop_reason = "max_calls_reached"
+            break
+    stage_summary = {
+        "requested_direction": str(grow_direction),
+        "direction": str(resolved_direction or grow_direction),
+        "call_count": int(len(call_summaries)),
+        "final_tifxyz_path": str(current_input),
+        "stage_stop_reason": str(stage_stop_reason),
+        "calls": call_summaries,
+        "final": call_summaries[-1],
+    }
+    return ExtensionStageResult(final_tifxyz_path=current_input, stage_summary=stage_summary)
+
+
+def _frontier_span_coverage(plans: list[FittedWindowPlan], *, frontier_length: int) -> tuple[int, list[tuple[int, int]]]:
+    if frontier_length <= 0 or not plans:
+        return 0, []
+    spans = sorted((int(plan.window.start), int(plan.window.end)) for plan in plans)
+    merged: list[tuple[int, int]] = []
+    for start, end in spans:
+        if not merged or start > merged[-1][1]:
+            merged.append((start, end))
+            continue
+        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    covered = sum(max(0, end - start) for start, end in merged)
+    return int(covered), merged
+
+
+def evaluate_extension_planner(
+    *,
+    tifxyz_path: str | Path,
+    grow_direction: str,
+    prompt_strips: int,
+    predict_strips_per_iter: int,
+    window_strip_length: int,
+    window_overlap: int,
+    max_crop_fit_retries: int = 3,
+    crop_size: tuple[int, int, int] = (128, 128, 128),
+) -> dict[str, Any]:
+    surface = read_tifxyz(tifxyz_path, load_mask=True, validate=True).use_stored_resolution()
+    grid_zyx = _surface_grid_zyx(surface)
+    grid_zyx, _, trimmed_bbox_rc = _trim_grid_to_valid_bbox(grid_zyx, np.zeros(grid_zyx.shape[:2], dtype=np.uint8))
+    direction, resolved_grid = resolve_growth_direction(
+        grid_zyx,
+        prompt_strips=int(prompt_strips),
+        predict_strips=int(predict_strips_per_iter),
+        crop_size=crop_size,
+        requested_direction=str(grow_direction),
+    )
+    plans, stats = _plan_extension_windows(
+        resolved_grid,
+        direction=direction,
+        window_strip_length=int(window_strip_length),
+        window_overlap=int(window_overlap),
+        prompt_strips=int(prompt_strips),
+        predict_strips=int(predict_strips_per_iter),
+        crop_size=crop_size,
+        max_crop_fit_retries=int(max_crop_fit_retries),
+    )
+    frontier_length = _current_frontier_length(resolved_grid, direction)
+    covered_frontier, merged_spans = _frontier_span_coverage(plans, frontier_length=frontier_length)
+    return {
+        "tifxyz_path": str(tifxyz_path),
+        "requested_direction": str(grow_direction),
+        "direction": str(direction),
+        "prompt_strips": int(prompt_strips),
+        "predict_strips_per_iter": int(predict_strips_per_iter),
+        "window_strip_length": int(window_strip_length),
+        "window_overlap": int(window_overlap),
+        "trimmed_bbox_rc": list(trimmed_bbox_rc),
+        "frontier_length": int(frontier_length),
+        "fitted_plans": int(len(plans)),
+        "fitted_plan_spans": [(int(plan.window.start), int(plan.window.end)) for plan in plans],
+        "covered_frontier": int(covered_frontier),
+        "covered_frontier_fraction": (float(covered_frontier) / float(frontier_length)) if frontier_length > 0 else 0.0,
+        "covered_frontier_spans": merged_spans,
+        "planning_stats": stats,
+    }
+
+
 def run_extension_benchmark_suite(
     *,
     tifxyz_path: str | Path,
@@ -2152,6 +2492,7 @@ def run_extension_benchmark_suite(
     distributed_infer: bool = False,
     distributed_shard_mode: str = "strided",
     distributed_gather_mode: str = "object",
+    attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
 ) -> dict[str, Any]:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -2183,6 +2524,7 @@ def run_extension_benchmark_suite(
             distributed_infer=bool(distributed_infer),
             distributed_shard_mode=str(distributed_shard_mode),
             distributed_gather_mode=str(distributed_gather_mode),
+            attention_scaling_mode=str(attention_scaling_mode),
         )
         serial_runs.append(summary)
 
@@ -2218,6 +2560,7 @@ def run_extension_benchmark_suite(
         distributed_infer=bool(distributed_infer),
         distributed_shard_mode=str(distributed_shard_mode),
         distributed_gather_mode=str(distributed_gather_mode),
+        attention_scaling_mode=str(attention_scaling_mode),
     )
     suite = {
         "tifxyz_path": str(tifxyz_path),
@@ -2239,17 +2582,20 @@ def run_extension_benchmark_suite(
 @click.option("--autoreg-ckpt", type=click.Path(exists=True, path_type=Path), required=True)
 @click.option("--out-dir", type=click.Path(path_type=Path), required=True)
 @click.option("--device", type=str, default="cuda", show_default=True)
-@click.option("--grow-direction", type=click.Choice(["auto", "left", "right", "up", "down"]), default="auto", show_default=True)
+@click.option("--grow-direction", type=click.Choice(list(ALL_GROW_DIRECTIONS)), default="auto", show_default=True)
 @click.option("--prompt-strips", type=int, default=8, show_default=True)
 @click.option("--predict-strips-per-iter", type=int, default=8, show_default=True)
 @click.option("--window-strip-length", type=int, default=64, show_default=True)
 @click.option("--window-overlap", type=int, default=16, show_default=True)
 @click.option("--window-batch-size", type=int, default=4, show_default=True)
 @click.option("--max-extension-iters", type=int, default=4, show_default=True)
+@click.option("--run-to-exhaustion/--single-call", default=False, show_default=True)
+@click.option("--max-calls", type=int, default=None)
 @click.option("--max-crop-fit-retries", type=int, default=3, show_default=True)
 @click.option("--fast-infer/--no-fast-infer", default=True, show_default=True)
 @click.option("--compile-infer/--no-compile-infer", default=False, show_default=True)
 @click.option("--amp-dtype", type=click.Choice(["bf16", "fp16"]), default="bf16", show_default=True)
+@click.option("--attention-scaling-mode", type=click.Choice(list(ATTENTION_SCALING_MODES)), default=ATTENTION_SCALING_STANDARD, show_default=True)
 @click.option("--show-progress/--no-show-progress", default=None)
 @click.option("--distributed-infer/--no-distributed-infer", default=False, show_default=True)
 @click.option("--distributed-shard-mode", type=click.Choice(["strided"]), default="strided", show_default=True)
@@ -2271,10 +2617,13 @@ def main(
     window_overlap: int,
     window_batch_size: int,
     max_extension_iters: int,
+    run_to_exhaustion: bool,
+    max_calls: int | None,
     max_crop_fit_retries: int,
     fast_infer: bool,
     compile_infer: bool,
     amp_dtype: str,
+    attention_scaling_mode: str,
     show_progress: bool | None,
     distributed_infer: bool,
     distributed_shard_mode: str,
@@ -2316,7 +2665,35 @@ def main(
             distributed_infer=bool(distributed_infer),
             distributed_shard_mode=str(distributed_shard_mode),
             distributed_gather_mode=str(distributed_gather_mode),
+            attention_scaling_mode=str(attention_scaling_mode),
         )
+    elif bool(run_to_exhaustion):
+        result = run_extension_to_exhaustion(
+            input_tifxyz_path=selected_tifxyz,
+            output_dir=out_dir,
+            grow_direction=str(grow_direction),
+            volume_uri=volume_uri,
+            dino_backbone=str(dinov2_backbone),
+            autoreg_checkpoint=str(autoreg_ckpt),
+            device=device,
+            prompt_strips=int(prompt_strips),
+            predict_strips_per_iter=int(predict_strips_per_iter),
+            window_strip_length=int(window_strip_length),
+            window_overlap=int(window_overlap),
+            window_batch_size=int(window_batch_size),
+            max_extension_iters_per_call=int(max_extension_iters),
+            max_crop_fit_retries=int(max_crop_fit_retries),
+            max_calls=max_calls,
+            show_progress=show_progress,
+            fast_infer=bool(fast_infer),
+            compile_infer=bool(compile_infer),
+            amp_dtype=str(amp_dtype),
+            distributed_infer=bool(distributed_infer),
+            distributed_shard_mode=str(distributed_shard_mode),
+            distributed_gather_mode=str(distributed_gather_mode),
+            attention_scaling_mode=str(attention_scaling_mode),
+        )
+        result = result.stage_summary
     else:
         result = extend_tifxyz_mesh(
             tifxyz_path=selected_tifxyz,
@@ -2340,6 +2717,7 @@ def main(
             distributed_infer=bool(distributed_infer),
             distributed_shard_mode=str(distributed_shard_mode),
             distributed_gather_mode=str(distributed_gather_mode),
+            attention_scaling_mode=str(attention_scaling_mode),
         )
     if (not bool(distributed_infer)) or int(os.environ.get("RANK", "0")) == 0:
         print(json.dumps(result, indent=2, sort_keys=True))

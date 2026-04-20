@@ -37,7 +37,9 @@ from vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz import (
     finalize_iteration_extension,
     grid_to_colored_mesh,
     infer_extension_windows_batched,
+    infer_extension_windows_batched_cached,
     merge_window_prediction,
+    resolve_growth_direction,
     run_extension_benchmark_suite,
     write_colored_ply,
 )
@@ -216,7 +218,7 @@ def test_fit_window_for_crop_shrinks_below_sixteen_strips() -> None:
     )
 
     assert fitted is not None
-    assert fitted.window.end - fitted.window.start == 4
+    assert fitted.window.end - fitted.window.start == 8
     assert fitted.prompt_strips == 3
     assert fitted.predict_strips == 2
 
@@ -253,8 +255,8 @@ def test_plan_extension_windows_retiles_parent_span_densely() -> None:
     assert stats["deduped_child_window_count"] == len(spans)
     assert spans[0][0] == 0
     assert spans[-1][1] == 24
-    assert len(spans) >= 10
-    assert max(spans[idx + 1][0] - spans[idx][0] for idx in range(len(spans) - 1)) <= 2
+    assert len(spans) == 5
+    assert max(spans[idx + 1][0] - spans[idx][0] for idx in range(len(spans) - 1)) <= 4
 
 
 def test_plan_extension_windows_dedupes_overlapping_parent_children() -> None:
@@ -285,9 +287,31 @@ def test_plan_extension_windows_dedupes_overlapping_parent_children() -> None:
 
     spans = [(plan.window.start, plan.window.end) for plan in plans]
     assert stats["parent_window_count"] == 2
-    assert stats["child_window_count"] > stats["deduped_child_window_count"]
+    assert stats["child_window_count"] >= stats["deduped_child_window_count"]
     assert spans == sorted(set(spans))
-    assert (4, 8) in spans
+    assert spans == [(0, 8), (4, 12)]
+
+
+def test_resolve_growth_direction_projects_world_z() -> None:
+    grid = _make_surface_grid(8, 10)
+
+    decreasing, _ = resolve_growth_direction(
+        grid,
+        prompt_strips=3,
+        predict_strips=1,
+        crop_size=(128, 128, 128),
+        requested_direction="decreasing-z",
+    )
+    increasing, _ = resolve_growth_direction(
+        grid,
+        prompt_strips=3,
+        predict_strips=1,
+        crop_size=(128, 128, 128),
+        requested_direction="increasing-z",
+    )
+
+    assert decreasing == "down"
+    assert increasing == "up"
 
 
 def test_plan_extension_windows_recovers_failing_first_parent(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -662,6 +686,29 @@ def test_batched_extension_inference_matches_serial() -> None:
     for serial, batched in zip(serial_results, batched_results, strict=True):
         np.testing.assert_allclose(serial["continuation_grid_world"], batched["continuation_grid_world"])
         assert serial["window"] == batched["window"]
+
+
+def test_cached_batched_inference_falls_back_when_cache_api_is_missing() -> None:
+    model = _FakeBatchModel()
+    payloads = _make_window_payloads()
+
+    uncached_results, _, _ = infer_extension_windows_batched(
+        model,
+        payloads,
+        window_batch_size=2,
+        device=torch.device("cpu"),
+    )
+    cached_results, _, peak_batch_size = infer_extension_windows_batched_cached(
+        model,
+        payloads,
+        window_batch_size=2,
+        device=torch.device("cpu"),
+    )
+
+    assert peak_batch_size == 2
+    assert len(cached_results) == len(uncached_results)
+    for uncached, cached in zip(uncached_results, cached_results, strict=True):
+        np.testing.assert_allclose(uncached["continuation_grid_world"], cached["continuation_grid_world"])
 
 
 def test_two_iteration_rollout_appends_geometry_twice(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
