@@ -84,6 +84,9 @@ class ExtensionIterationStats:
     iteration_wall_ms: float
     windows_per_second: float
     peak_batch_size_used: int
+    model_only_new_band_frontier_coverage_fraction: float
+    geometric_gap_fill_vertex_count: int
+    geometric_gap_fill_frontier_count: int
 
 
 @dataclass(frozen=True)
@@ -1057,6 +1060,100 @@ def _boundary_first_prompt_grid(prompt_grid: np.ndarray, direction: str) -> tupl
     raise ValueError(f"unsupported direction {direction!r}")
 
 
+def _frontier_boundary_and_interior_from_grid(grid_zyx: np.ndarray, direction: str) -> tuple[np.ndarray, np.ndarray]:
+    valid = np.isfinite(grid_zyx).all(axis=-1)
+    if direction in {"up", "down"}:
+        frontier_length = int(grid_zyx.shape[1])
+        boundary = np.full((frontier_length, 3), np.nan, dtype=np.float32)
+        interior = np.full((frontier_length, 3), np.nan, dtype=np.float32)
+        for frontier_idx in range(frontier_length):
+            rows = np.where(valid[:, frontier_idx])[0]
+            if direction == "down":
+                if len(rows) > 0:
+                    boundary[frontier_idx] = grid_zyx[int(rows[0]), frontier_idx]
+                if len(rows) > 1:
+                    interior[frontier_idx] = grid_zyx[int(rows[1]), frontier_idx]
+            else:
+                if len(rows) > 0:
+                    boundary[frontier_idx] = grid_zyx[int(rows[-1]), frontier_idx]
+                if len(rows) > 1:
+                    interior[frontier_idx] = grid_zyx[int(rows[-2]), frontier_idx]
+        return boundary, interior
+    frontier_length = int(grid_zyx.shape[0])
+    boundary = np.full((frontier_length, 3), np.nan, dtype=np.float32)
+    interior = np.full((frontier_length, 3), np.nan, dtype=np.float32)
+    for frontier_idx in range(frontier_length):
+        cols = np.where(valid[frontier_idx, :])[0]
+        if direction == "right":
+            if len(cols) > 0:
+                boundary[frontier_idx] = grid_zyx[frontier_idx, int(cols[-1])]
+            if len(cols) > 1:
+                interior[frontier_idx] = grid_zyx[frontier_idx, int(cols[-2])]
+        else:
+            if len(cols) > 0:
+                boundary[frontier_idx] = grid_zyx[frontier_idx, int(cols[0])]
+            if len(cols) > 1:
+                interior[frontier_idx] = grid_zyx[frontier_idx, int(cols[1])]
+    return boundary, interior
+
+
+def _smooth_frontier_scalar_field(values: np.ndarray, valid_mask: np.ndarray, *, radius: int) -> np.ndarray:
+    values = np.asarray(values, dtype=np.float32)
+    valid_mask = np.asarray(valid_mask, dtype=bool)
+    output = values.copy()
+    if int(valid_mask.sum()) <= 0:
+        return output
+    for idx in range(int(values.shape[0])):
+        lo = max(0, idx - int(radius))
+        hi = min(int(values.shape[0]), idx + int(radius) + 1)
+        local_valid = valid_mask[lo:hi]
+        if not bool(np.any(local_valid)):
+            continue
+        offsets = np.arange(lo, hi, dtype=np.float32) - float(idx)
+        weights = np.exp(-np.square(offsets / max(1.0, float(radius)))).astype(np.float32)
+        weights = weights[local_valid]
+        local_values = values[lo:hi][local_valid]
+        output[idx] = float((local_values * weights).sum() / max(1e-8, float(weights.sum())))
+    return output
+
+
+def _smooth_frontier_vector_field(vectors: np.ndarray, valid_mask: np.ndarray, *, radius: int) -> np.ndarray:
+    vectors = np.asarray(vectors, dtype=np.float32)
+    valid_mask = np.asarray(valid_mask, dtype=bool)
+    output = vectors.copy()
+    if int(valid_mask.sum()) <= 0:
+        return output
+    for idx in range(int(vectors.shape[0])):
+        lo = max(0, idx - int(radius))
+        hi = min(int(vectors.shape[0]), idx + int(radius) + 1)
+        local_valid = valid_mask[lo:hi]
+        if not bool(np.any(local_valid)):
+            continue
+        offsets = np.arange(lo, hi, dtype=np.float32) - float(idx)
+        weights = np.exp(-np.square(offsets / max(1.0, float(radius)))).astype(np.float32)
+        local_vectors = vectors[lo:hi][local_valid].copy()
+        local_weights = weights[local_valid]
+        reference = vectors[idx]
+        if not np.isfinite(reference).all() or float(np.linalg.norm(reference)) <= 1e-8:
+            reference = local_vectors[0]
+        for local_idx in range(local_vectors.shape[0]):
+            if float(np.dot(local_vectors[local_idx], reference)) < 0.0:
+                local_vectors[local_idx] = -local_vectors[local_idx]
+        combined = (local_vectors * local_weights[:, None]).sum(axis=0)
+        norm = float(np.linalg.norm(combined))
+        if norm <= 1e-8:
+            continue
+        output[idx] = (combined / norm).astype(np.float32)
+    return output
+
+
+def _nearest_valid_frontier_index(valid_mask: np.ndarray, idx: int) -> int | None:
+    valid_positions = np.where(np.asarray(valid_mask, dtype=bool))[0]
+    if len(valid_positions) <= 0:
+        return None
+    return int(valid_positions[np.argmin(np.abs(valid_positions - int(idx)))])
+
+
 def _weighted_covariance(points: np.ndarray, weights: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     points = np.asarray(points, dtype=np.float64)
     weights = np.asarray(weights, dtype=np.float64)
@@ -1214,6 +1311,84 @@ def _surface_continuation_field(prompt_grid: np.ndarray, direction: str) -> tupl
         smoothed_vectors[idx] = vector
         smoothed_steps[idx] = float((local_steps * local_weights).sum() / max(1e-8, float(local_weights.sum())))
     return boundary.astype(np.float32), smoothed_vectors.astype(np.float32), smoothed_steps.astype(np.float32)
+
+
+def _geometric_gap_fill_extension_field(
+    working_grid: np.ndarray,
+    *,
+    direction: str,
+    predict_strips: int,
+) -> np.ndarray:
+    boundary, interior = _frontier_boundary_and_interior_from_grid(working_grid, direction)
+    boundary_valid = np.isfinite(boundary).all(axis=-1)
+    interior_valid = np.isfinite(interior).all(axis=-1)
+    vec_valid = boundary_valid & interior_valid
+    raw_vectors = np.where(vec_valid[:, None], boundary - interior, 0.0).astype(np.float32)
+    step_lengths = np.linalg.norm(raw_vectors, axis=-1).astype(np.float32)
+    positive = step_lengths > 1e-6
+    default_step = float(np.median(step_lengths[positive])) if bool(np.any(positive)) else 1.0
+    step_lengths = np.where(positive, step_lengths, default_step).astype(np.float32)
+    vector_norm = np.linalg.norm(raw_vectors, axis=-1, keepdims=True).astype(np.float32)
+    unit_vectors = np.divide(
+        raw_vectors,
+        np.maximum(vector_norm, 1e-6),
+        out=np.zeros_like(raw_vectors, dtype=np.float32),
+        where=np.maximum(vector_norm, 1e-6) > 0.0,
+    )
+    smoothed_boundary = np.where(boundary_valid[:, None], boundary, 0.0).astype(np.float32)
+    for axis in range(3):
+        smoothed_boundary[:, axis] = _smooth_frontier_scalar_field(smoothed_boundary[:, axis], boundary_valid, radius=8)
+    smoothed_vectors = _smooth_frontier_vector_field(unit_vectors, vec_valid & (np.linalg.norm(unit_vectors, axis=-1) > 1e-6), radius=8)
+    smoothed_steps = _smooth_frontier_scalar_field(step_lengths, vec_valid, radius=8)
+    for idx in range(int(smoothed_boundary.shape[0])):
+        if not boundary_valid[idx]:
+            nearest = _nearest_valid_frontier_index(boundary_valid, idx)
+            if nearest is not None:
+                smoothed_boundary[idx] = smoothed_boundary[nearest]
+        vector_valid = float(np.linalg.norm(smoothed_vectors[idx])) > 1e-6 and np.isfinite(smoothed_vectors[idx]).all()
+        if not vector_valid:
+            nearest = _nearest_valid_frontier_index(vec_valid, idx)
+            if nearest is not None:
+                smoothed_vectors[idx] = smoothed_vectors[nearest]
+                smoothed_steps[idx] = smoothed_steps[nearest]
+            else:
+                smoothed_vectors[idx] = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+                smoothed_steps[idx] = float(default_step)
+    smoothed_steps = np.where(np.isfinite(smoothed_steps) & (smoothed_steps > 1e-6), smoothed_steps, default_step).astype(np.float32)
+    field_points = []
+    for step_idx in range(1, int(predict_strips) + 1):
+        field_points.append(smoothed_boundary + float(step_idx) * smoothed_steps[:, None] * smoothed_vectors)
+    if direction in {"up", "down"}:
+        return np.stack(field_points, axis=0).astype(np.float32)
+    return np.stack(field_points, axis=1).astype(np.float32)
+
+
+def _apply_geometric_gap_fill(
+    sums: np.ndarray,
+    counts: np.ndarray,
+    *,
+    working_grid: np.ndarray,
+    direction: str,
+) -> tuple[int, int]:
+    if direction in {"up", "down"}:
+        predict_strips = int(counts.shape[0])
+        frontier_mask = np.asarray(counts > 0).any(axis=0)
+        field = _geometric_gap_fill_extension_field(working_grid, direction=direction, predict_strips=predict_strips)
+        missing = counts <= 0
+    else:
+        predict_strips = int(counts.shape[1])
+        frontier_mask = np.asarray(counts > 0).any(axis=1)
+        field = _geometric_gap_fill_extension_field(working_grid, direction=direction, predict_strips=predict_strips)
+        missing = counts <= 0
+    valid = np.isfinite(field).all(axis=-1) & missing
+    if not bool(np.any(valid)):
+        return 0, 0
+    sums[valid] = field[valid].astype(np.float64)
+    counts[valid] = 1
+    filled_frontier_mask = np.asarray(counts > 0).any(axis=0 if direction in {"up", "down"} else 1)
+    geometric_frontier_count = int(np.logical_and(filled_frontier_mask, ~frontier_mask).sum())
+    geometric_vertex_count = int(valid.sum())
+    return geometric_vertex_count, geometric_frontier_count
 
 
 def _estimate_extension_points_planner(
@@ -2806,6 +2981,25 @@ def extend_tifxyz_mesh(
                     )
                     merge_ms += 1000.0 * (perf_counter() - t1)
 
+                (
+                    model_only_frontier_coverage_fraction,
+                    model_only_cell_coverage_fraction,
+                    model_only_max_gap,
+                    model_only_gap_spans,
+                    model_only_first_uncovered_frontier_index,
+                ) = _compute_new_band_coverage_metrics(
+                    counts,
+                    direction=direction,
+                )
+                geometric_gap_fill_vertex_count = 0
+                geometric_gap_fill_frontier_count = 0
+                if planner_mode == PLANNER_MODE_COVERAGE_FIRST and model_only_frontier_coverage_fraction < 1.0:
+                    geometric_gap_fill_vertex_count, geometric_gap_fill_frontier_count = _apply_geometric_gap_fill(
+                        sums,
+                        counts,
+                        working_grid=working_grid,
+                        direction=direction,
+                    )
                 extension_grid, extension_provenance = finalize_iteration_extension(
                     sums=sums,
                     counts=counts,
@@ -2855,6 +3049,9 @@ def extend_tifxyz_mesh(
                         iteration_wall_ms=1000.0 * (perf_counter() - iteration_started),
                         windows_per_second=(float(fitted_window_count) * 1000.0 / max(1e-6, (crop_read_ms_total + encode_decode_ms_total + merge_ms))),
                         peak_batch_size_used=peak_batch_size,
+                        model_only_new_band_frontier_coverage_fraction=model_only_frontier_coverage_fraction,
+                        geometric_gap_fill_vertex_count=int(geometric_gap_fill_vertex_count),
+                        geometric_gap_fill_frontier_count=int(geometric_gap_fill_frontier_count),
                     )
                     post_state = {"stop_reason": None, "iteration_stat": vars(stat)}
                     iteration_stats.append(stat)
@@ -2876,6 +3073,9 @@ def extend_tifxyz_mesh(
                 iteration_diag["frontier_intervals"] = None if coverage_frontier_intervals is None else [list(span) for span in coverage_frontier_intervals]
                 iteration_diag["post_iteration_gap_spans"] = list(iteration_stats[-1].new_band_gap_spans)
                 iteration_diag["post_iteration_coverage_fraction"] = float(iteration_stats[-1].new_band_frontier_coverage_fraction)
+                iteration_diag["model_only_frontier_coverage_fraction"] = float(iteration_stats[-1].model_only_new_band_frontier_coverage_fraction)
+                iteration_diag["geometric_gap_fill_vertex_count"] = int(iteration_stats[-1].geometric_gap_fill_vertex_count)
+                iteration_diag["geometric_gap_fill_frontier_count"] = int(iteration_stats[-1].geometric_gap_fill_frontier_count)
                 planner_diagnostics_payload["iterations"].append(iteration_diag)
                 planner_diagnostics_path.write_text(json.dumps(planner_diagnostics_payload, indent=2))
             if planner_mode == PLANNER_MODE_COVERAGE_FIRST and runtime.is_main_process:
@@ -2933,6 +3133,11 @@ def extend_tifxyz_mesh(
                 "new_band_max_gap": final_band_max_gap,
                 "new_band_gap_spans": final_band_gap_spans,
                 "first_uncovered_frontier_index": final_first_uncovered_frontier_index,
+                "model_only_new_band_frontier_coverage_fraction": (
+                    float(iteration_stats[-1].model_only_new_band_frontier_coverage_fraction) if iteration_stats else 0.0
+                ),
+                "geometric_gap_fill_vertex_count": int(sum(item.geometric_gap_fill_vertex_count for item in iteration_stats)),
+                "geometric_gap_fill_frontier_count": int(sum(item.geometric_gap_fill_frontier_count for item in iteration_stats)),
                 "iterations_completed": int(len(iteration_stats)),
                 "stop_reason": stop_reason,
                 "windows_per_second_overall": (
@@ -2994,6 +3199,9 @@ def _compact_extension_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "iterations_completed",
         "stop_reason",
         "window_batch_size",
+        "model_only_new_band_frontier_coverage_fraction",
+        "geometric_gap_fill_vertex_count",
+        "geometric_gap_fill_frontier_count",
         "encode_decode_ms_per_fitted_window",
         "crop_cache_hits",
         "crop_cache_misses",

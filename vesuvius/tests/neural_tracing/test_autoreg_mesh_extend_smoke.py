@@ -19,6 +19,7 @@ from vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz import (
     PlannerSelectionRecord,
     PLANNER_MODE_COVERAGE_FIRST,
     _DistributedInferRuntime,
+    _apply_geometric_gap_fill,
     _build_admissibility_atlas,
     _flatten_gathered_window_results,
     _initialize_distributed_infer_runtime,
@@ -422,6 +423,26 @@ def test_coverage_first_gap_rescue_targets_only_uncovered_intervals(monkeypatch:
     )
 
     assert call_intervals == [None, [(8, 12), (20, 24)]]
+
+
+def test_geometric_gap_fill_covers_ragged_frontier_columns() -> None:
+    grid = _make_surface_grid(6, 8)
+    grid[0, 1:-1, :] = np.nan
+    sums = np.zeros((1, grid.shape[1], 3), dtype=np.float64)
+    counts = np.zeros((1, grid.shape[1]), dtype=np.int32)
+    counts[0, :2] = 1
+    sums[0, :2] = grid[1, :2]
+
+    filled_vertices, filled_frontier = _apply_geometric_gap_fill(
+        sums,
+        counts,
+        working_grid=grid,
+        direction="down",
+    )
+
+    assert filled_vertices > 0
+    assert filled_frontier == grid.shape[1] - 2
+    assert np.all(counts[0] > 0)
 
 
 def test_evaluate_extension_planner_coverage_first_returns_diagnostics(tmp_path: Path) -> None:
