@@ -1142,6 +1142,12 @@ public:
         return extract_inner_chunk(*shard_data, inner_indices);
     }
 
+    // 4k-align chunk payloads inside shards so decoders can mmap the shard
+    // and hand direct pointers to the codec without buffering.  Index entries
+    // use the aligned offset; padding bytes between chunks are ignored by
+    // the reader (spec allows arbitrary gaps).
+    static constexpr std::uint64_t kShardChunkAlign = 4096;
+
     /// Write a complete shard given a set of inner chunk data.
     /// `inner_chunks` is indexed by linear inner chunk index (C-order).
     /// Missing inner chunks should be std::nullopt.
@@ -1156,7 +1162,7 @@ public:
         if (inner_chunks.size() != n_inner)
             throw std::runtime_error("zarr: wrong number of inner chunks for shard");
 
-        // Build shard data: [index][chunk0][chunk1]...
+        // Build shard data: [index][chunk0 padded to 4k][chunk1 padded to 4k]...
         std::vector<std::byte> shard_data;
         detail::ShardIndex index;
         index.entries.resize(n_inner);
@@ -1164,6 +1170,13 @@ public:
         // Index always at start — reserve space for it.
         const std::size_t index_size = n_inner * 16;
         shard_data.resize(index_size);
+
+        auto pad_to_align = [&]() {
+            auto n = shard_data.size();
+            auto aligned = (n + kShardChunkAlign - 1) & ~(kShardChunkAlign - 1);
+            if (aligned > n) shard_data.resize(aligned, std::byte{0});
+        };
+        pad_to_align();   // ensures first chunk lands on 4k boundary
 
         for (std::size_t i = 0; i < n_inner; ++i) {
             if (!inner_chunks[i]) {
@@ -1184,6 +1197,7 @@ public:
             index.entries[i].offset = shard_data.size();
             index.entries[i].nbytes  = write_data.size();
             shard_data.insert(shard_data.end(), write_data.begin(), write_data.end());
+            pad_to_align();
         }
 
         // Write index at start.
@@ -1247,9 +1261,16 @@ public:
         std::fstream f(p, std::ios::binary | std::ios::in | std::ios::out);
         if (!f) return;
 
-        // 1. Seek to EOF, append chunk data
+        // 1. Seek to EOF, round up to next 4k boundary, append chunk data.
+        //    Padding bytes (if any) are left uninitialised — ext4 zero-fills
+        //    them on sparse extension, and readers never look at them.
         f.seekp(0, std::ios::end);
-        auto chunk_offset = static_cast<std::uint64_t>(f.tellp());
+        auto eof_offset = static_cast<std::uint64_t>(f.tellp());
+        auto chunk_offset = (eof_offset + kShardChunkAlign - 1)
+                          & ~(kShardChunkAlign - 1);
+        if (chunk_offset != eof_offset) {
+            f.seekp(static_cast<std::streamoff>(chunk_offset));
+        }
         f.write(reinterpret_cast<const char*>(data.data()),
                 static_cast<std::streamsize>(data.size()));
 
