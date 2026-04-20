@@ -60,6 +60,19 @@ def _normalize_positive_int_list(name: str, value, *, allow_none: bool = True) -
     return normalized
 
 
+def _normalize_float_weights_dict(name: str, value, *, required_keys: tuple[str, ...]) -> dict[str, float]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{name} must be a mapping from bucket name to non-negative weight")
+    if set(value.keys()) != set(required_keys):
+        raise ValueError(f"{name} must contain exactly {required_keys!r}, got {tuple(value.keys())!r}")
+    normalized = {str(key): float(value[key]) for key in required_keys}
+    if any(weight < 0.0 for weight in normalized.values()):
+        raise ValueError(f"{name} weights must be non-negative")
+    if sum(normalized.values()) <= 0.0:
+        raise ValueError(f"{name} weights must sum to a positive value")
+    return normalized
+
+
 DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "seed": 0,
     "crop_size": [128, 128, 128],
@@ -72,6 +85,10 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "ragged_frontier_max_inset": 0,
     "ragged_frontier_gap_length_choices": None,
     "ragged_frontier_lowfreq_sigma": 12.0,
+    "prefilter_max_frontier_invalid_fraction": 0.5,
+    "prefilter_max_target_invalid_fraction": 0.75,
+    "prefilter_ragged_trials": 2,
+    "prefilter_difficulty_sampling_weights": {"easy": 0.45, "medium": 0.35, "hard": 0.20},
     "prefilter_show_progress": True,
     "spatial_augmentation": {
         "enabled": True,
@@ -229,7 +246,9 @@ def _resolve_rope_dtype(value):
 def setdefault_autoreg_mesh_config(config: dict) -> dict:
     merged = deepcopy(DEFAULT_AUTOREG_MESH_CONFIG)
     for key, value in dict(config or {}).items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+        if key == "prefilter_difficulty_sampling_weights":
+            merged[key] = deepcopy(value)
+        elif isinstance(value, dict) and isinstance(merged.get(key), dict):
             merged[key].update(value)
         else:
             merged[key] = value
@@ -267,6 +286,17 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
     )
     if float(cfg.get("ragged_frontier_lowfreq_sigma", 12.0)) <= 0.0:
         raise ValueError("ragged_frontier_lowfreq_sigma must be positive")
+    if float(cfg.get("prefilter_max_frontier_invalid_fraction", 0.5)) < 0.0 or float(cfg.get("prefilter_max_frontier_invalid_fraction", 0.5)) > 1.0:
+        raise ValueError("prefilter_max_frontier_invalid_fraction must be within [0, 1]")
+    if float(cfg.get("prefilter_max_target_invalid_fraction", 0.75)) < 0.0 or float(cfg.get("prefilter_max_target_invalid_fraction", 0.75)) > 1.0:
+        raise ValueError("prefilter_max_target_invalid_fraction must be within [0, 1]")
+    if int(cfg.get("prefilter_ragged_trials", 0)) < 0:
+        raise ValueError("prefilter_ragged_trials must be non-negative")
+    cfg["prefilter_difficulty_sampling_weights"] = _normalize_float_weights_dict(
+        "prefilter_difficulty_sampling_weights",
+        cfg.get("prefilter_difficulty_sampling_weights", {}),
+        required_keys=("easy", "medium", "hard"),
+    )
     if any(size <= 0 for size in cfg["input_shape"]):
         raise ValueError(f"input_shape must be positive, got {cfg['input_shape']!r}")
     if any(size <= 0 for size in cfg["patch_size"]):

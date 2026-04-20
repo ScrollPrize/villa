@@ -143,6 +143,7 @@ def _compute_target_boundary_stats(
     volume_shape: tuple[int, int, int],
     direction: str,
     frontier_band_width: int = 1,
+    prompt_valid_fraction: float | None = None,
 ) -> dict[str, float | bool]:
     valid_mask = _in_bounds_vertex_mask(target_grid_local, volume_shape=volume_shape)
     invalid_mask = ~valid_mask
@@ -153,18 +154,26 @@ def _compute_target_boundary_stats(
         "target_invalid_fraction": target_invalid_fraction,
         "frontier_invalid_fraction": frontier_invalid_fraction,
         "touches_crop_boundary": bool(invalid_mask.any()),
+        "prompt_valid_fraction": None if prompt_valid_fraction is None else float(prompt_valid_fraction),
     }
 
 
 def _should_reject_boundary_stats(
     boundary_stats: dict[str, float | bool],
     *,
-    max_target_invalid_fraction: float = 0.25,
-) -> bool:
-    del max_target_invalid_fraction
-    return (
-        float(boundary_stats["frontier_invalid_fraction"]) > 0.0
-    )
+    max_target_invalid_fraction: float = 0.75,
+    max_frontier_invalid_fraction: float = 0.5,
+) -> tuple[bool, str | None]:
+    prompt_valid_fraction = boundary_stats.get("prompt_valid_fraction")
+    if prompt_valid_fraction is not None and float(prompt_valid_fraction) <= 0.0:
+        return True, "no_valid_prompt"
+    if float(boundary_stats["target_invalid_fraction"]) >= 1.0:
+        return True, "target_all_invalid"
+    if float(boundary_stats["target_invalid_fraction"]) > float(max_target_invalid_fraction):
+        return True, "target_invalid_fraction"
+    if float(boundary_stats["frontier_invalid_fraction"]) > float(max_frontier_invalid_fraction):
+        return True, "frontier_invalid_fraction"
+    return False, None
 
 
 def _sample_frontier_band_width(config: dict) -> int:
@@ -272,6 +281,124 @@ def _apply_ragged_frontier_augmentation(
     return cond, True
 
 
+def _prefilter_prompt_valid_fraction(
+    cond_local: np.ndarray,
+    *,
+    direction: str,
+    frontier_band_width: int,
+    volume_shape: tuple[int, int, int],
+) -> float:
+    prompt_grid = extract_frontier_prompt_band(
+        cond_local,
+        direction=str(direction),
+        frontier_band_width=int(frontier_band_width),
+    )
+    prompt_valid_mask = _in_bounds_vertex_mask(prompt_grid, volume_shape=volume_shape)
+    return float(prompt_valid_mask.mean()) if prompt_valid_mask.size > 0 else 0.0
+
+
+def _evaluate_prefilter_trial(
+    cond_local: np.ndarray,
+    masked_local: np.ndarray,
+    *,
+    direction: str,
+    frontier_band_width: int,
+    volume_shape: tuple[int, int, int],
+    max_frontier_invalid_fraction: float,
+    max_target_invalid_fraction: float,
+) -> tuple[bool, dict[str, float | bool], str | None]:
+    prompt_valid_fraction = _prefilter_prompt_valid_fraction(
+        cond_local,
+        direction=str(direction),
+        frontier_band_width=int(frontier_band_width),
+        volume_shape=volume_shape,
+    )
+    if prompt_valid_fraction <= 0.0:
+        stats = _compute_target_boundary_stats(
+            masked_local,
+            volume_shape=volume_shape,
+            direction=str(direction),
+            frontier_band_width=int(frontier_band_width),
+            prompt_valid_fraction=0.0,
+        )
+        reject, reason = _should_reject_boundary_stats(
+            stats,
+            max_target_invalid_fraction=float(max_target_invalid_fraction),
+            max_frontier_invalid_fraction=float(max_frontier_invalid_fraction),
+        )
+        return False, stats, reason or "no_valid_prompt"
+    target_valid_fraction = float(_in_bounds_vertex_mask(masked_local, volume_shape=volume_shape).mean()) if masked_local.size > 0 else 0.0
+    stats = _compute_target_boundary_stats(
+        masked_local,
+        volume_shape=volume_shape,
+        direction=str(direction),
+        frontier_band_width=int(frontier_band_width),
+        prompt_valid_fraction=prompt_valid_fraction,
+    )
+    if target_valid_fraction <= 0.0:
+        reject, reason = _should_reject_boundary_stats(
+            stats,
+            max_target_invalid_fraction=float(max_target_invalid_fraction),
+            max_frontier_invalid_fraction=float(max_frontier_invalid_fraction),
+        )
+        if reason == "target_all_invalid":
+            return False, stats, "target_all_invalid"
+        return False, stats, "no_valid_target" if bool(reject) else None
+    reject, reason = _should_reject_boundary_stats(
+        stats,
+        max_target_invalid_fraction=float(max_target_invalid_fraction),
+        max_frontier_invalid_fraction=float(max_frontier_invalid_fraction),
+    )
+    return not bool(reject), stats, reason
+
+
+def _tested_frontier_band_widths(config: dict) -> list[int]:
+    choices = config.get("frontier_band_width_choices")
+    if choices is None:
+        return [int(config["frontier_band_width"])]
+    return sorted({int(v) for v in choices})
+
+
+def _normalize_prefilter_sampling_weights(weights: dict[str, float]) -> dict[str, float]:
+    total = float(sum(float(v) for v in weights.values()))
+    return {str(key): float(value) / max(total, 1e-8) for key, value in weights.items()}
+
+
+def _difficulty_bucket_from_stats(
+    *,
+    tested_widths: list[int],
+    valid_prompt_widths_clean: list[int],
+    valid_prompt_widths_ragged: list[int],
+    ragged_valid_count: int,
+    prefilter_ragged_trials: int,
+) -> str:
+    tested_widths = sorted({int(width) for width in tested_widths})
+    baseline_frontier_band_width = min(tested_widths) if tested_widths else None
+    valid_prompt_widths_clean = sorted({int(width) for width in valid_prompt_widths_clean})
+    valid_prompt_widths_ragged = sorted({int(width) for width in valid_prompt_widths_ragged})
+    clean_any = len(valid_prompt_widths_clean) > 0
+    ragged_any = len(valid_prompt_widths_ragged) > 0
+    if (not clean_any) and (not ragged_any):
+        return "impossible"
+    if ragged_any and int(prefilter_ragged_trials) > 0 and int(ragged_valid_count) < int(prefilter_ragged_trials):
+        return "hard"
+    if not clean_any:
+        return "hard"
+    if (
+        baseline_frontier_band_width is not None and
+        baseline_frontier_band_width in valid_prompt_widths_clean and
+        len(valid_prompt_widths_clean) == len(tested_widths)
+    ):
+        return "easy"
+    return "medium"
+
+
+def _mean_or_one(values: list[float], *, default: float = 1.0) -> float:
+    if not values:
+        return float(default)
+    return float(sum(float(v) for v in values) / float(len(values)))
+
+
 def _fast_prefilter_plan(
     surface_local: np.ndarray,
     *,
@@ -280,16 +407,18 @@ def _fast_prefilter_plan(
     frontier_band_width: int,
     surface_downsample_factor,
     volume_shape: tuple[int, int, int],
-) -> tuple[bool, dict[str, float | bool] | None]:
+    max_frontier_invalid_fraction: float = 0.5,
+    max_target_invalid_fraction: float = 0.75,
+) -> tuple[bool, dict[str, float | bool] | None, str | None]:
     cond_local, masked_local = _split_surface_grid(
         surface_local,
         direction=str(direction),
         conditioning_count=int(conditioning_count),
     )
     if cond_local is None or masked_local is None:
-        return False, None
+        return False, None, "split_failed"
     if cond_local.size == 0 or masked_local.size == 0:
-        return False, None
+        return False, None, "empty_split"
 
     cond_local = downsample_surface_grid(
         cond_local,
@@ -302,27 +431,18 @@ def _fast_prefilter_plan(
         surface_downsample_factor=surface_downsample_factor,
     )
     if cond_local.size == 0 or masked_local.size == 0:
-        return False, None
+        return False, None, "empty_downsampled_split"
 
-    prompt_grid = extract_frontier_prompt_band(
+    is_valid, boundary_stats, reject_reason = _evaluate_prefilter_trial(
         cond_local,
-        direction=str(direction),
-        frontier_band_width=int(frontier_band_width),
-    )
-    if not bool(_in_bounds_vertex_mask(prompt_grid, volume_shape=volume_shape).any()):
-        return False, None
-    if not bool(_in_bounds_vertex_mask(masked_local, volume_shape=volume_shape).any()):
-        return False, None
-
-    boundary_stats = _compute_target_boundary_stats(
         masked_local,
-        volume_shape=volume_shape,
         direction=str(direction),
+        volume_shape=volume_shape,
         frontier_band_width=int(frontier_band_width),
+        max_frontier_invalid_fraction=float(max_frontier_invalid_fraction),
+        max_target_invalid_fraction=float(max_target_invalid_fraction),
     )
-    if _should_reject_boundary_stats(boundary_stats):
-        return False, boundary_stats
-    return True, boundary_stats
+    return bool(is_valid), boundary_stats, reject_reason
 
 
 def _apply_volume_only_augmentation(volume: np.ndarray, augmentation_cfg: dict, *, enabled: bool) -> np.ndarray:
@@ -645,9 +765,39 @@ class AutoregMeshDataset(Dataset):
             for sample_key in self.sample_index
             if len(self._valid_split_plans.get(_sample_key(*sample_key), ())) > 0
         ]
+        difficulty_bucket_counts = {"easy": 0, "medium": 0, "hard": 0}
+        clean_only_plan_count = 0
+        ragged_only_plan_count = 0
+        multi_width_plan_count = 0
+        total_valid_width_count = 0
+        total_plan_count = 0
+        for plans in self._valid_split_plans.values():
+            for plan in plans:
+                bucket = str(plan.get("difficulty_bucket", "medium"))
+                if bucket in difficulty_bucket_counts:
+                    difficulty_bucket_counts[bucket] += 1
+                clean_widths = list(plan.get("valid_prompt_widths_clean", []))
+                ragged_widths = list(plan.get("valid_prompt_widths_ragged", []))
+                if clean_widths and not ragged_widths:
+                    clean_only_plan_count += 1
+                if ragged_widths and not clean_widths:
+                    ragged_only_plan_count += 1
+                valid_width_count = len(sorted(set(clean_widths + ragged_widths)))
+                if valid_width_count > 1:
+                    multi_width_plan_count += 1
+                total_valid_width_count += int(valid_width_count)
+                total_plan_count += 1
         self._prefilter_stats = {
             "num_samples_with_valid_plans": len(self.sample_index),
-            "num_total_valid_split_plans": int(sum(len(plans) for plans in self._valid_split_plans.values())),
+            "num_total_valid_split_plans": int(total_plan_count),
+            "difficulty_bucket_counts": difficulty_bucket_counts,
+            "clean_only_plan_count": int(clean_only_plan_count),
+            "ragged_only_plan_count": int(ragged_only_plan_count),
+            "multi_width_plan_count": int(multi_width_plan_count),
+            "avg_valid_prompt_width_count": (
+                float(total_valid_width_count) / float(total_plan_count) if total_plan_count > 0 else 0.0
+            ),
+            "prefilter_wall_seconds": float(getattr(self, "_prefilter_wall_seconds", 0.0)),
         }
         if not self.sample_index:
             raise RuntimeError("autoreg_mesh dataset prefilter removed every sample; no valid wrap splits remain")
@@ -675,6 +825,7 @@ class AutoregMeshDataset(Dataset):
 
     def _build_valid_split_plans(self) -> dict[tuple[int, int], tuple[dict, ...]]:
         valid_plans: dict[tuple[int, int], tuple[dict, ...]] = {}
+        prefilter_started = time.perf_counter()
         iterator = self.sample_index
         if bool(self.config.get("prefilter_show_progress", True)) and len(self.sample_index) > 0:
             iterator = tqdm(
@@ -695,6 +846,7 @@ class AutoregMeshDataset(Dataset):
             surface_local = np.asarray(surface_zyx, dtype=np.float32) - min_corner[None, None, :]
             h_grid, w_grid = surface_zyx.shape[:2]
             plan_list: list[dict] = []
+            tested_widths = _tested_frontier_band_widths(self.config)
             directions = []
             if w_grid >= 2:
                 directions.extend(["left", "right"])
@@ -707,15 +859,98 @@ class AutoregMeshDataset(Dataset):
                     self._base_dataset._cond_percent_min,
                     self._base_dataset._cond_percent_max,
                 ):
-                    is_valid, _boundary_stats = _fast_prefilter_plan(
+                    cond_local, masked_local = _split_surface_grid(
                         surface_local,
-                        direction=direction,
+                        direction=str(direction),
                         conditioning_count=int(conditioning_count),
-                        frontier_band_width=int(self.config["frontier_band_width"]),
-                        surface_downsample_factor=effective_surface_downsample_factor,
-                        volume_shape=self.crop_size,
                     )
-                    if not bool(is_valid):
+                    if cond_local is None or masked_local is None or cond_local.size == 0 or masked_local.size == 0:
+                        continue
+                    cond_local = downsample_surface_grid(
+                        cond_local,
+                        direction=str(direction),
+                        surface_downsample_factor=effective_surface_downsample_factor,
+                    )
+                    masked_local = downsample_surface_grid(
+                        masked_local,
+                        direction=str(direction),
+                        surface_downsample_factor=effective_surface_downsample_factor,
+                    )
+                    if cond_local.size == 0 or masked_local.size == 0:
+                        continue
+
+                    clean_frontier_values: list[float] = []
+                    clean_target_values: list[float] = []
+                    ragged_frontier_values: list[float] = []
+                    ragged_target_values: list[float] = []
+                    clean_reject_reason_counts: dict[str, int] = {}
+                    ragged_reject_reason_counts: dict[str, int] = {}
+                    valid_prompt_widths_clean: list[int] = []
+                    valid_prompt_widths_ragged: list[int] = []
+                    clean_valid_count = 0
+                    ragged_valid_count = 0
+
+                    for frontier_band_width in tested_widths:
+                        clean_valid, clean_stats, clean_reason = _evaluate_prefilter_trial(
+                            cond_local,
+                            masked_local,
+                            direction=str(direction),
+                            frontier_band_width=int(frontier_band_width),
+                            volume_shape=self.crop_size,
+                            max_frontier_invalid_fraction=float(self.config.get("prefilter_max_frontier_invalid_fraction", 0.5)),
+                            max_target_invalid_fraction=float(self.config.get("prefilter_max_target_invalid_fraction", 0.75)),
+                        )
+                        if clean_stats is not None:
+                            clean_frontier_values.append(float(clean_stats["frontier_invalid_fraction"]))
+                            clean_target_values.append(float(clean_stats["target_invalid_fraction"]))
+                        if clean_valid:
+                            valid_prompt_widths_clean.append(int(frontier_band_width))
+                            clean_valid_count += 1
+                        elif clean_reason is not None:
+                            clean_reject_reason_counts[str(clean_reason)] = clean_reject_reason_counts.get(str(clean_reason), 0) + 1
+
+                        ragged_trials = int(self.config.get("prefilter_ragged_trials", 0))
+                        if float(self.config.get("ragged_frontier_prob", 0.0)) > 0.0 and ragged_trials > 0:
+                            for _ in range(ragged_trials):
+                                ragged_cond_local, ragged_applied = _apply_ragged_frontier_augmentation(
+                                    cond_local,
+                                    direction=str(direction),
+                                    frontier_band_width=int(frontier_band_width),
+                                    ragged_frontier_prob=1.0,
+                                    ragged_frontier_max_inset=int(self.config.get("ragged_frontier_max_inset", 0)),
+                                    ragged_frontier_gap_length_choices=self.config.get("ragged_frontier_gap_length_choices"),
+                                    ragged_frontier_lowfreq_sigma=float(self.config.get("ragged_frontier_lowfreq_sigma", 12.0)),
+                                )
+                                if not bool(ragged_applied):
+                                    continue
+                                ragged_valid, ragged_stats, ragged_reason = _evaluate_prefilter_trial(
+                                    ragged_cond_local,
+                                    masked_local,
+                                    direction=str(direction),
+                                    frontier_band_width=int(frontier_band_width),
+                                    volume_shape=self.crop_size,
+                                    max_frontier_invalid_fraction=float(self.config.get("prefilter_max_frontier_invalid_fraction", 0.5)),
+                                    max_target_invalid_fraction=float(self.config.get("prefilter_max_target_invalid_fraction", 0.75)),
+                                )
+                                if ragged_stats is not None:
+                                    ragged_frontier_values.append(float(ragged_stats["frontier_invalid_fraction"]))
+                                    ragged_target_values.append(float(ragged_stats["target_invalid_fraction"]))
+                                if ragged_valid:
+                                    valid_prompt_widths_ragged.append(int(frontier_band_width))
+                                    ragged_valid_count += 1
+                                elif ragged_reason is not None:
+                                    ragged_reject_reason_counts[str(ragged_reason)] = ragged_reject_reason_counts.get(str(ragged_reason), 0) + 1
+
+                    valid_prompt_widths_clean = sorted(set(valid_prompt_widths_clean))
+                    valid_prompt_widths_ragged = sorted(set(valid_prompt_widths_ragged))
+                    difficulty_bucket = _difficulty_bucket_from_stats(
+                        tested_widths=tested_widths,
+                        valid_prompt_widths_clean=valid_prompt_widths_clean,
+                        valid_prompt_widths_ragged=valid_prompt_widths_ragged,
+                        ragged_valid_count=int(ragged_valid_count),
+                        prefilter_ragged_trials=int(self.config.get("prefilter_ragged_trials", 0)),
+                    )
+                    if difficulty_bucket == "impossible":
                         continue
                     plan_list.append(
                         {
@@ -724,6 +959,21 @@ class AutoregMeshDataset(Dataset):
                             "conditioning_percent": float(conditioning_count) / float(max(axis_size, 1)),
                             "use_stored_surface": bool(use_stored_surface),
                             "effective_surface_downsample_factor": effective_surface_downsample_factor,
+                            "difficulty_bucket": str(difficulty_bucket),
+                            "clean_frontier_invalid_fraction": min(clean_frontier_values) if clean_frontier_values else 1.0,
+                            "clean_target_invalid_fraction": min(clean_target_values) if clean_target_values else 1.0,
+                            "ragged_trial_frontier_invalid_fraction": _mean_or_one(ragged_frontier_values),
+                            "ragged_trial_target_invalid_fraction": _mean_or_one(ragged_target_values),
+                            "valid_prompt_widths_clean": valid_prompt_widths_clean,
+                            "valid_prompt_widths_ragged": valid_prompt_widths_ragged,
+                            "valid_prompt_width_range": (
+                                [min(valid_prompt_widths_clean + valid_prompt_widths_ragged), max(valid_prompt_widths_clean + valid_prompt_widths_ragged)]
+                                if (valid_prompt_widths_clean or valid_prompt_widths_ragged) else []
+                            ),
+                            "clean_valid_count": int(clean_valid_count),
+                            "ragged_valid_count": int(ragged_valid_count),
+                            "clean_reject_reason_counts": clean_reject_reason_counts,
+                            "ragged_reject_reason_counts": ragged_reject_reason_counts,
                         }
                     )
             if plan_list:
@@ -735,6 +985,7 @@ class AutoregMeshDataset(Dataset):
                 )
         if hasattr(iterator, "close"):
             iterator.close()
+        self._prefilter_wall_seconds = float(time.perf_counter() - prefilter_started)
         return valid_plans
 
     def _resolve_surface_sampling_plan(self, wrap: dict) -> tuple[bool, int | tuple[int, int]]:
@@ -770,7 +1021,19 @@ class AutoregMeshDataset(Dataset):
             return None
         patch = self.patches[patch_idx]
         wrap = patch.wraps[wrap_idx]
-        split_plan = random.choice(split_plans)
+        plans_by_bucket = {"easy": [], "medium": [], "hard": []}
+        for plan in split_plans:
+            bucket = str(plan.get("difficulty_bucket", "medium"))
+            if bucket in plans_by_bucket:
+                plans_by_bucket[bucket].append(plan)
+        available_buckets = [bucket for bucket, plans in plans_by_bucket.items() if plans]
+        if not available_buckets:
+            return None
+        weight_cfg = _normalize_prefilter_sampling_weights(dict(self.config.get("prefilter_difficulty_sampling_weights", {})))
+        bucket_weights = np.asarray([float(weight_cfg[bucket]) for bucket in available_buckets], dtype=np.float64)
+        bucket_weights = bucket_weights / np.maximum(bucket_weights.sum(), 1e-8)
+        chosen_bucket = random.choices(available_buckets, weights=bucket_weights.tolist(), k=1)[0]
+        split_plan = random.choice(plans_by_bucket[chosen_bucket])
         use_stored_surface = bool(split_plan["use_stored_surface"])
         effective_surface_downsample_factor = split_plan["effective_surface_downsample_factor"]
         surface_zyx = self._extract_surface_for_plan(patch, wrap, use_stored_surface=use_stored_surface)
@@ -802,7 +1065,10 @@ class AutoregMeshDataset(Dataset):
             augmentation_cfg=self.config.get("spatial_augmentation", {}),
             enabled=self.apply_spatial_augmentation,
         )
-        frontier_band_width = _sample_frontier_band_width(self.config)
+        valid_prompt_widths_clean = list(split_plan.get("valid_prompt_widths_clean", []))
+        valid_prompt_widths_ragged = list(split_plan.get("valid_prompt_widths_ragged", []))
+        width_candidates = valid_prompt_widths_clean if valid_prompt_widths_clean else valid_prompt_widths_ragged
+        frontier_band_width = int(random.choice(width_candidates)) if width_candidates else _sample_frontier_band_width(self.config)
         cond_local, ragged_frontier_applied = _apply_ragged_frontier_augmentation(
             cond_local,
             direction=str(conditioning["cond_direction"]).lower(),
@@ -839,7 +1105,12 @@ class AutoregMeshDataset(Dataset):
             direction=str(serialized["direction"]),
             frontier_band_width=int(frontier_band_width),
         )
-        if (not bool(ragged_frontier_applied)) and _should_reject_boundary_stats(boundary_stats):
+        reject, _reject_reason = _should_reject_boundary_stats(
+            boundary_stats,
+            max_frontier_invalid_fraction=float(self.config.get("prefilter_max_frontier_invalid_fraction", 0.5)),
+            max_target_invalid_fraction=float(self.config.get("prefilter_max_target_invalid_fraction", 0.75)),
+        )
+        if (not bool(ragged_frontier_applied)) and bool(reject):
             return None
 
         sample_key = (int(patch_idx), int(wrap_idx))
@@ -877,6 +1148,9 @@ class AutoregMeshDataset(Dataset):
                 "sample_key": sample_key,
                 "surface_sampling_mode": "stored" if use_stored_surface else "full",
                 "frontier_band_width": int(frontier_band_width),
+                "difficulty_bucket": str(split_plan.get("difficulty_bucket", "medium")),
+                "valid_prompt_widths_clean": list(valid_prompt_widths_clean),
+                "valid_prompt_widths_ragged": list(valid_prompt_widths_ragged),
                 "ragged_frontier_applied": bool(ragged_frontier_applied),
                 "spatial_augmented": bool(spatial_aug_metadata["spatial_augmented"]),
                 "spatial_mirror_axes": list(spatial_aug_metadata["spatial_mirror_axes"]),

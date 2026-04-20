@@ -25,9 +25,13 @@ from vesuvius.neural_tracing.autoreg_mesh.dataset import (
     _apply_spatial_augmentation,
     _apply_volume_only_augmentation,
     _compute_target_boundary_stats,
+    _evaluate_prefilter_trial,
     _fast_prefilter_plan,
+    _difficulty_bucket_from_stats,
+    _normalize_prefilter_sampling_weights,
     _sample_frontier_band_width,
     _should_reject_boundary_stats,
+    _tested_frontier_band_widths,
     autoreg_mesh_collate,
 )
 from vesuvius.neural_tracing.autoreg_mesh.infer import infer_autoreg_mesh
@@ -2000,7 +2004,9 @@ def test_target_boundary_stats_detect_invalid_frontier_and_reject() -> None:
 
     assert stats["frontier_invalid_fraction"] > 0.0
     assert stats["touches_crop_boundary"] is True
-    assert _should_reject_boundary_stats(stats) is True
+    reject, reason = _should_reject_boundary_stats(stats)
+    assert reject is True
+    assert reason == "frontier_invalid_fraction"
 
 
 def test_target_boundary_stats_reject_high_invalid_fraction() -> None:
@@ -2015,7 +2021,9 @@ def test_target_boundary_stats_reject_high_invalid_fraction() -> None:
 
     assert stats["target_invalid_fraction"] == pytest.approx(1.0)
     assert stats["frontier_invalid_fraction"] == pytest.approx(1.0)
-    assert _should_reject_boundary_stats(stats) is True
+    reject, reason = _should_reject_boundary_stats(stats)
+    assert reject is True
+    assert reason == "target_all_invalid"
 
 
 def test_target_boundary_stats_allow_truncated_continuation_away_from_frontier() -> None:
@@ -2030,7 +2038,252 @@ def test_target_boundary_stats_allow_truncated_continuation_away_from_frontier()
 
     assert stats["frontier_invalid_fraction"] == pytest.approx(0.0)
     assert stats["target_invalid_fraction"] > 0.0
-    assert _should_reject_boundary_stats(stats) is False
+    reject, reason = _should_reject_boundary_stats(stats)
+    assert reject is False
+    assert reason is None
+
+
+def test_thresholded_boundary_rejection_obeys_configured_limits() -> None:
+    reject, reason = _should_reject_boundary_stats(
+        {"frontier_invalid_fraction": 0.4, "target_invalid_fraction": 0.7, "touches_crop_boundary": True, "prompt_valid_fraction": 1.0},
+        max_frontier_invalid_fraction=0.5,
+        max_target_invalid_fraction=0.75,
+    )
+    assert reject is False
+    assert reason is None
+
+    reject, reason = _should_reject_boundary_stats(
+        {"frontier_invalid_fraction": 0.6, "target_invalid_fraction": 0.2, "touches_crop_boundary": True, "prompt_valid_fraction": 1.0},
+        max_frontier_invalid_fraction=0.5,
+        max_target_invalid_fraction=0.75,
+    )
+    assert reject is True
+    assert reason == "frontier_invalid_fraction"
+
+    reject, reason = _should_reject_boundary_stats(
+        {"frontier_invalid_fraction": 0.2, "target_invalid_fraction": 0.8, "touches_crop_boundary": True, "prompt_valid_fraction": 1.0},
+        max_frontier_invalid_fraction=0.5,
+        max_target_invalid_fraction=0.75,
+    )
+    assert reject is True
+    assert reason == "target_invalid_fraction"
+
+    reject, reason = _should_reject_boundary_stats(
+        {"frontier_invalid_fraction": 1.0, "target_invalid_fraction": 1.0, "touches_crop_boundary": True, "prompt_valid_fraction": 1.0},
+        max_frontier_invalid_fraction=0.5,
+        max_target_invalid_fraction=0.75,
+    )
+    assert reject is True
+    assert reason == "target_all_invalid"
+
+
+def test_prefilter_trial_prefers_target_all_invalid_reason() -> None:
+    cond_local = _make_surface(4, 2, z_offset=4.0, y_offset=2.0, x_offset=3.0)
+    masked_local = np.full((4, 2, 3), 48.0, dtype=np.float32)
+
+    is_valid, stats, reason = _evaluate_prefilter_trial(
+        cond_local,
+        masked_local,
+        direction="left",
+        frontier_band_width=2,
+        volume_shape=(16, 16, 16),
+        max_frontier_invalid_fraction=0.5,
+        max_target_invalid_fraction=0.75,
+    )
+
+    assert is_valid is False
+    assert stats["target_invalid_fraction"] == pytest.approx(1.0)
+    assert reason == "target_all_invalid"
+
+
+def test_prefilter_plan_survives_with_wider_prompt_width() -> None:
+    surface = _make_surface(10, 6, z_offset=4.0, y_offset=2.0, x_offset=3.0)
+    surface[:, 1, :] = np.array([64.0, 64.0, 64.0], dtype=np.float32)
+    is_valid_narrow, _stats_narrow, _reason_narrow = _fast_prefilter_plan(
+        surface,
+        direction="left",
+        conditioning_count=1,
+        frontier_band_width=1,
+        surface_downsample_factor=1,
+        volume_shape=(16, 16, 16),
+    )
+    is_valid_wide, _stats_wide, _reason_wide = _fast_prefilter_plan(
+        surface,
+        direction="left",
+        conditioning_count=1,
+        frontier_band_width=4,
+        surface_downsample_factor=1,
+        volume_shape=(16, 16, 16),
+    )
+
+    assert is_valid_narrow is False
+    assert is_valid_wide is True
+
+
+def test_prefilter_helpers_support_hard_bucket_for_ragged_only_survival() -> None:
+    bucket = _difficulty_bucket_from_stats(
+        tested_widths=[4, 8, 12],
+        valid_prompt_widths_clean=[],
+        valid_prompt_widths_ragged=[8],
+        ragged_valid_count=1,
+        prefilter_ragged_trials=2,
+    )
+    assert bucket == "hard"
+
+
+def test_prefilter_helpers_use_smallest_tested_width_as_easy_baseline() -> None:
+    bucket = _difficulty_bucket_from_stats(
+        tested_widths=[8, 12, 16],
+        valid_prompt_widths_clean=[8, 12, 16],
+        valid_prompt_widths_ragged=[],
+        ragged_valid_count=0,
+        prefilter_ragged_trials=2,
+    )
+    assert bucket == "easy"
+
+
+def test_prefilter_helpers_support_hard_bucket_for_fragile_ragged_survival() -> None:
+    bucket = _difficulty_bucket_from_stats(
+        tested_widths=[4, 8],
+        valid_prompt_widths_clean=[4],
+        valid_prompt_widths_ragged=[8],
+        ragged_valid_count=1,
+        prefilter_ragged_trials=2,
+    )
+    assert bucket == "hard"
+
+
+def test_prefilter_sampling_weights_normalize() -> None:
+    weights = _normalize_prefilter_sampling_weights({"easy": 0.45, "medium": 0.35, "hard": 0.20})
+    assert sum(weights.values()) == pytest.approx(1.0)
+    assert weights["easy"] > weights["hard"]
+
+
+def test_build_example_prefers_selected_difficulty_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
+    from vesuvius.neural_tracing.autoreg_mesh.dataset import AutoregMeshDataset
+
+    dataset = AutoregMeshDataset.__new__(AutoregMeshDataset)
+    dataset.config = validate_autoreg_mesh_config(_make_cached_token_config())
+    dataset.config["prefilter_difficulty_sampling_weights"] = {"easy": 0.0, "medium": 0.0, "hard": 1.0}
+    dataset.apply_spatial_augmentation = False
+    dataset.apply_volume_only_augmentation = False
+    dataset.crop_size = (16, 16, 16)
+    dataset.sample_index = [(0, 0)]
+    dataset._base_dataset = SimpleNamespace()
+    dataset.patches = [SimpleNamespace(world_bbox=(0.0, 16.0, 0.0, 16.0, 0.0, 16.0), wraps=[{"segment": SimpleNamespace(_scale=None), "bbox_2d": (0, 0, 1, 1), "wrap_id": 0, "segment_idx": 0}])]
+    dataset._valid_split_plans = {
+        (0, 0): (
+            {
+                "direction": "left",
+                "conditioning_count": 2,
+                "conditioning_percent": 0.5,
+                "use_stored_surface": False,
+                "effective_surface_downsample_factor": 1,
+                "difficulty_bucket": "easy",
+                "valid_prompt_widths_clean": [4],
+                "valid_prompt_widths_ragged": [],
+            },
+            {
+                "direction": "left",
+                "conditioning_count": 2,
+                "conditioning_percent": 0.5,
+                "use_stored_surface": False,
+                "effective_surface_downsample_factor": 1,
+                "difficulty_bucket": "hard",
+                "valid_prompt_widths_clean": [],
+                "valid_prompt_widths_ragged": [12],
+            },
+        )
+    }
+    dataset._extract_surface_for_plan = lambda patch, wrap, use_stored_surface=False: _make_surface(4, 4, z_offset=4.0, y_offset=2.0, x_offset=3.0)
+    monkeypatch.setattr(
+        "vesuvius.neural_tracing.autoreg_mesh.dataset.create_split_conditioning_from_surface_grid",
+        lambda *args, **kwargs: {
+            "wrap": {"segment": SimpleNamespace(uuid="seg"), "bbox_2d": (0, 0, 1, 1), "wrap_id": 0, "segment_idx": 0},
+            "cond_direction": kwargs["cond_direction"],
+            "cond_zyxs_unperturbed": _make_surface(4, 2, z_offset=4.0, y_offset=2.0, x_offset=3.0),
+            "masked_zyxs": _make_surface(4, 2, z_offset=6.0, y_offset=2.0, x_offset=7.0),
+            "min_corner": np.zeros(3, dtype=np.int64),
+            "max_corner": np.asarray(dataset.crop_size, dtype=np.int64),
+        },
+    )
+    monkeypatch.setattr(
+        "vesuvius.neural_tracing.autoreg_mesh.dataset._read_volume_crop_from_patch",
+        lambda patch, crop_size, min_corner, max_corner: np.zeros(crop_size, dtype=np.float32),
+    )
+    monkeypatch.setattr("random.choices", lambda population, weights=None, k=1: ["hard"])
+
+    example = dataset._build_example(0)
+
+    assert example is not None
+    assert example["prompt_meta"]["difficulty_bucket"] == "hard"
+    assert example["prompt_meta"]["frontier_band_width"] == 12
+
+
+def test_export_patch_metadata_preserves_prefilter_plan_metadata() -> None:
+    from vesuvius.neural_tracing.autoreg_mesh.dataset import AutoregMeshDataset
+
+    class _BaseDatasetStub:
+        def export_patch_metadata(self):
+            return {"base": "metadata"}
+
+    dataset = AutoregMeshDataset.__new__(AutoregMeshDataset)
+    dataset._base_dataset = _BaseDatasetStub()
+    dataset._valid_split_plans = {
+        (0, 0): (
+            {
+                "direction": "left",
+                "conditioning_count": 2,
+                "conditioning_percent": 0.5,
+                "use_stored_surface": False,
+                "effective_surface_downsample_factor": 1,
+                "difficulty_bucket": "medium",
+                "clean_frontier_invalid_fraction": 0.25,
+                "clean_target_invalid_fraction": 0.5,
+                "ragged_trial_frontier_invalid_fraction": 0.375,
+                "ragged_trial_target_invalid_fraction": 0.625,
+                "valid_prompt_widths_clean": [8],
+                "valid_prompt_widths_ragged": [12],
+                "valid_prompt_width_range": [8, 12],
+                "clean_valid_count": 1,
+                "ragged_valid_count": 1,
+                "clean_reject_reason_counts": {"frontier_invalid_fraction": 1},
+                "ragged_reject_reason_counts": {"target_invalid_fraction": 1},
+            },
+        ),
+    }
+    dataset._prefilter_stats = {
+        "num_samples_with_valid_plans": 1,
+        "num_total_valid_split_plans": 1,
+        "difficulty_bucket_counts": {"easy": 0, "medium": 1, "hard": 0},
+        "clean_only_plan_count": 0,
+        "ragged_only_plan_count": 0,
+        "multi_width_plan_count": 1,
+        "avg_valid_prompt_width_count": 2.0,
+        "prefilter_wall_seconds": 0.125,
+    }
+
+    metadata = dataset.export_patch_metadata()
+    exported_plan = metadata["autoreg_mesh_valid_split_plans"][(0, 0)][0]
+
+    assert metadata["base"] == "metadata"
+    for key in (
+        "difficulty_bucket",
+        "clean_frontier_invalid_fraction",
+        "clean_target_invalid_fraction",
+        "ragged_trial_frontier_invalid_fraction",
+        "ragged_trial_target_invalid_fraction",
+        "valid_prompt_widths_clean",
+        "valid_prompt_widths_ragged",
+        "valid_prompt_width_range",
+        "clean_valid_count",
+        "ragged_valid_count",
+        "clean_reject_reason_counts",
+        "ragged_reject_reason_counts",
+    ):
+        assert key in exported_plan
+    assert metadata["autoreg_mesh_prefilter_stats"]["difficulty_bucket_counts"]["medium"] == 1
+    assert metadata["autoreg_mesh_prefilter_stats"]["multi_width_plan_count"] == 1
 
 
 def test_boundary_loss_and_oob_metrics_increase_outside_crop() -> None:
@@ -2110,21 +2363,25 @@ def test_fast_prefilter_respects_frontier_band_width() -> None:
     surface_local = _make_surface(5, 5, z_offset=4.0, y_offset=2.0, x_offset=2.0)
     surface_local[:, 2, 0] = -1.0
 
-    valid_band1, _ = _fast_prefilter_plan(
+    valid_band1, _stats_band1, _reason_band1 = _fast_prefilter_plan(
         surface_local,
         direction="left",
         conditioning_count=1,
         frontier_band_width=1,
         surface_downsample_factor=1,
         volume_shape=(16, 16, 16),
+        max_frontier_invalid_fraction=0.0,
+        max_target_invalid_fraction=0.25,
     )
-    valid_band2, _ = _fast_prefilter_plan(
+    valid_band2, _stats_band2, _reason_band2 = _fast_prefilter_plan(
         surface_local,
         direction="left",
         conditioning_count=1,
         frontier_band_width=2,
         surface_downsample_factor=1,
         volume_shape=(16, 16, 16),
+        max_frontier_invalid_fraction=0.0,
+        max_target_invalid_fraction=0.25,
     )
 
     assert valid_band1 is True
@@ -2533,6 +2790,10 @@ def test_distance_aware_target_default_config_values() -> None:
     assert validated["ragged_frontier_max_inset"] == 0
     assert validated["ragged_frontier_gap_length_choices"] is None
     assert validated["ragged_frontier_lowfreq_sigma"] == pytest.approx(12.0)
+    assert validated["prefilter_max_frontier_invalid_fraction"] == pytest.approx(0.5)
+    assert validated["prefilter_max_target_invalid_fraction"] == pytest.approx(0.75)
+    assert validated["prefilter_ragged_trials"] == 2
+    assert validated["prefilter_difficulty_sampling_weights"] == {"easy": 0.45, "medium": 0.35, "hard": 0.20}
     assert validated["seam_anchor_loss_weight"] == pytest.approx(0.0)
     assert validated["seam_anchor_start_step"] == 0
 
@@ -2813,6 +3074,26 @@ def test_rope_config_validation_rejects_invalid_values() -> None:
     bad_ragged_sigma["ragged_frontier_lowfreq_sigma"] = 0.0
     with pytest.raises(ValueError, match="ragged_frontier_lowfreq_sigma"):
         validate_autoreg_mesh_config(bad_ragged_sigma)
+
+    bad_prefilter_frontier = _make_cached_token_config()
+    bad_prefilter_frontier["prefilter_max_frontier_invalid_fraction"] = 1.5
+    with pytest.raises(ValueError, match="prefilter_max_frontier_invalid_fraction"):
+        validate_autoreg_mesh_config(bad_prefilter_frontier)
+
+    bad_prefilter_target = _make_cached_token_config()
+    bad_prefilter_target["prefilter_max_target_invalid_fraction"] = -0.1
+    with pytest.raises(ValueError, match="prefilter_max_target_invalid_fraction"):
+        validate_autoreg_mesh_config(bad_prefilter_target)
+
+    bad_prefilter_trials = _make_cached_token_config()
+    bad_prefilter_trials["prefilter_ragged_trials"] = -1
+    with pytest.raises(ValueError, match="prefilter_ragged_trials"):
+        validate_autoreg_mesh_config(bad_prefilter_trials)
+
+    bad_prefilter_weights = _make_cached_token_config()
+    bad_prefilter_weights["prefilter_difficulty_sampling_weights"] = {"easy": 1.0, "medium": 0.0}
+    with pytest.raises(ValueError, match="prefilter_difficulty_sampling_weights"):
+        validate_autoreg_mesh_config(bad_prefilter_weights)
 
     bad_seam_anchor_weight = _make_cached_token_config()
     bad_seam_anchor_weight["seam_anchor_loss_weight"] = -0.1
