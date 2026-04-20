@@ -742,23 +742,13 @@ def _geometry_sd_weight_active(cfg: dict, *, global_step: int) -> float:
 
 
 def _offset_loss_weight_active(cfg: dict, *, global_step: int) -> float:
-    start = int(cfg.get("offset_loss_start_step", 0))
-    if int(global_step) < start:
+    if int(global_step) < int(cfg.get("offset_loss_start_step", 0)):
         return 0.0
-    ramp = int(cfg.get("offset_loss_ramp_steps", 0))
-    final = float(cfg.get("offset_loss_weight", 1.0))
-    if ramp <= 0:
-        return final
-    t = min(1.0, float(int(global_step) - start) / float(ramp))
-    return final * t
+    return float(cfg.get("offset_loss_weight", 1.0))
 
 
 def _scheduled_sampling_feedback_state(cfg: dict, *, global_step: int) -> tuple[bool, bool]:
-    offset_feedback_start = cfg.get("scheduled_sampling_offset_feedback_start_step")
-    if offset_feedback_start is None:
-        offset_feedback_enabled = _offset_loss_weight_active(cfg, global_step=global_step) > 0.0
-    else:
-        offset_feedback_enabled = int(global_step) >= int(offset_feedback_start)
+    offset_feedback_enabled = _offset_loss_weight_active(cfg, global_step=global_step) > 0.0
     refine_feedback_enabled = _position_refine_weight_active(cfg, global_step=global_step) > 0.0
     return bool(offset_feedback_enabled), bool(offset_feedback_enabled and refine_feedback_enabled)
 
@@ -1239,9 +1229,6 @@ def _evaluate_validation(
                 distance_aware_coarse_target_radius=int(cfg.get("distance_aware_coarse_target_radius", 1)),
                 distance_aware_coarse_target_sigma=float(cfg.get("distance_aware_coarse_target_sigma", 1.0)),
                 distance_aware_coarse_target_loss=str(cfg.get("distance_aware_coarse_target_loss", "soft_ce")),
-                distance_aware_offset_targets_enabled=bool(cfg.get("distance_aware_offset_targets_enabled", False)),
-                distance_aware_offset_target_radius=int(cfg.get("distance_aware_offset_target_radius", 1)),
-                distance_aware_offset_target_sigma=float(cfg.get("distance_aware_offset_target_sigma", 0.75)),
             )
         metrics = _loss_dict_to_metrics(loss_dict)
         metrics.update(_mean_batch_sample_metrics(batch))
@@ -1451,9 +1438,6 @@ def run_autoreg_mesh_training(
                     distance_aware_coarse_target_radius=int(cfg.get("distance_aware_coarse_target_radius", 1)),
                     distance_aware_coarse_target_sigma=float(cfg.get("distance_aware_coarse_target_sigma", 1.0)),
                     distance_aware_coarse_target_loss=str(cfg.get("distance_aware_coarse_target_loss", "soft_ce")),
-                    distance_aware_offset_targets_enabled=bool(cfg.get("distance_aware_offset_targets_enabled", False)),
-                    distance_aware_offset_target_radius=int(cfg.get("distance_aware_offset_target_radius", 1)),
-                    distance_aware_offset_target_sigma=float(cfg.get("distance_aware_offset_target_sigma", 0.75)),
                 )
             loss = loss_dict["loss"]
             if not torch.isfinite(loss):
@@ -1513,16 +1497,7 @@ def run_autoreg_mesh_training(
                     )
                 )
 
-            wandb_payload = {}
-            for key, value in metrics.items():
-                if key.startswith("val_"):
-                    wandb_payload[f"val/{key[4:]}"] = value
-                elif key.startswith("rollout_val_"):
-                    wandb_payload[f"val/rollout_{key[12:]}"] = value
-                elif key.startswith("train_"):
-                    wandb_payload[f"train/{key[6:]}"] = value
-                else:
-                    wandb_payload[f"train/{key}"] = value
+            wandb_payload = dict(metrics)
             should_log_projection_images_step = (
                 bool(cfg.get("wandb_log_images", True)) and
                 global_step % int(cfg["wandb_image_frequency"]) == 0
@@ -1549,17 +1524,17 @@ def run_autoreg_mesh_training(
                     _make_teacher_forced_prediction_canvas(batch, outputs, sample_idx=0),
                     caption=f"step={global_step} train teacher-forced",
                 )
-                wandb_payload["train/example"] = train_projection_image
-                wandb_payload["train/example_projection"] = train_projection_image
+                wandb_payload["train_example"] = train_projection_image
+                wandb_payload["train_example_projection"] = train_projection_image
                 if raw_val_sample is not None and val_infer is not None:
                     val_projection_image = wandb.Image(
                         _make_inference_prediction_canvas(raw_val_sample, val_infer),
                         caption=f"step={global_step} val autoregressive",
                     )
-                    wandb_payload["val/example"] = val_projection_image
-                    wandb_payload["val/example_projection"] = val_projection_image
+                    wandb_payload["val_example"] = val_projection_image
+                    wandb_payload["val_example_projection"] = val_projection_image
             if should_log_xy_images:
-                wandb_payload["train/example_xy"] = wandb.Image(
+                wandb_payload["train_example_xy"] = wandb.Image(
                     _make_teacher_forced_xy_slice_canvas(
                         batch,
                         outputs,
@@ -1570,7 +1545,7 @@ def run_autoreg_mesh_training(
                     caption=f"step={global_step} train xy slice",
                 )
                 if raw_val_sample is not None and val_infer is not None:
-                    wandb_payload["val/example_xy"] = wandb.Image(
+                    wandb_payload["val_example_xy"] = wandb.Image(
                         _make_inference_xy_slice_canvas(
                             raw_val_sample,
                             val_infer,

@@ -66,7 +66,6 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "offset_num_bins": [16, 16, 16],
     "offset_loss_weight": 1.0,
     "offset_loss_start_step": 0,
-    "offset_loss_ramp_steps": 0,
     "direction_order": ["left", "right", "up", "down"],
     "cache_vol_tokens": False,
     "vol_token_cache": None,
@@ -100,7 +99,6 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "scheduled_sampling_max_prob": 0.10,
     "scheduled_sampling_start_step": 0,
     "scheduled_sampling_ramp_steps": 0,
-    "scheduled_sampling_offset_feedback_start_step": None,
     "position_refine_enabled": True,
     "position_refine_loss": "huber",
     "position_refine_weight": 0.05,
@@ -132,9 +130,6 @@ DEFAULT_AUTOREG_MESH_CONFIG: dict = {
     "distance_aware_coarse_target_radius": 1,
     "distance_aware_coarse_target_sigma": 1.0,
     "distance_aware_coarse_target_loss": "soft_ce",
-    "distance_aware_offset_targets_enabled": False,
-    "distance_aware_offset_target_radius": 1,
-    "distance_aware_offset_target_sigma": 0.75,
     "coarse_continuation_constraint_enabled": True,
     "coarse_continuation_constraint_mode": "hard_mask",
     "coarse_continuation_forward_scale": 4.0,
@@ -245,8 +240,6 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("offset_loss_weight must be non-negative")
     if int(cfg["offset_loss_start_step"]) < 0:
         raise ValueError("offset_loss_start_step must be >= 0")
-    if int(cfg["offset_loss_ramp_steps"]) < 0:
-        raise ValueError("offset_loss_ramp_steps must be >= 0")
     if any(size % patch != 0 for size, patch in zip(cfg["input_shape"], cfg["patch_size"])):
         raise ValueError(
             f"input_shape {cfg['input_shape']!r} must be divisible by patch_size {cfg['patch_size']!r}"
@@ -300,8 +293,6 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("scheduled_sampling_start_step must be >= 0")
     if int(cfg["scheduled_sampling_ramp_steps"]) < 0:
         raise ValueError("scheduled_sampling_ramp_steps must be >= 0")
-    if cfg.get("scheduled_sampling_offset_feedback_start_step") is not None and int(cfg["scheduled_sampling_offset_feedback_start_step"]) < 0:
-        raise ValueError("scheduled_sampling_offset_feedback_start_step must be None or >= 0")
     if str(cfg["position_refine_loss"]) != "huber":
         raise ValueError("position_refine_loss must currently be 'huber'")
     if float(cfg["position_refine_weight"]) < 0.0:
@@ -348,12 +339,6 @@ def validate_autoreg_mesh_config(config: dict) -> dict:
         raise ValueError("distance_aware_coarse_target_sigma must be > 0")
     if str(cfg["distance_aware_coarse_target_loss"]) != "soft_ce":
         raise ValueError("distance_aware_coarse_target_loss must currently be 'soft_ce'")
-    if not isinstance(cfg.get("distance_aware_offset_targets_enabled"), bool):
-        raise ValueError("distance_aware_offset_targets_enabled must be a boolean")
-    if int(cfg["distance_aware_offset_target_radius"]) < 0:
-        raise ValueError("distance_aware_offset_target_radius must be >= 0")
-    if float(cfg["distance_aware_offset_target_sigma"]) <= 0.0:
-        raise ValueError("distance_aware_offset_target_sigma must be > 0")
     if not isinstance(cfg.get("coarse_continuation_constraint_enabled"), bool):
         raise ValueError("coarse_continuation_constraint_enabled must be a boolean")
     if str(cfg["coarse_continuation_constraint_mode"]) != "hard_mask":

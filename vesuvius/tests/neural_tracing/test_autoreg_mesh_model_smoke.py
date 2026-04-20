@@ -2851,39 +2851,39 @@ def test_autoreg_mesh_wandb_logging_includes_metrics_and_images(tmp_path: Path, 
     assert "config" in fake_wandb.init_calls[0]
     assert fake_wandb.logs[0]["step"] == 1
     logged = fake_wandb.logs[0]["data"]
-    assert "train/loss" in logged
-    assert "train/coarse_loss" in logged
-    assert "train/coarse_excess_nll" in logged
-    assert "train/xyz_soft_loss" in logged
-    assert "train/seam_loss" in logged
-    assert "train/triangle_barrier_loss" in logged
-    assert "train/xyz_l1_refined" in logged
-    assert "train/seam_edge_error_refined" in logged
-    assert "train/triangle_flip_rate_refined" in logged
-    assert "train/current_lr" in logged
-    assert "train/grad_norm" in logged
-    assert "val/loss" in logged
-    assert "val/rollout_xyz_l1_refined" in logged
-    assert "val/rollout_seam_edge_error" in logged
-    assert "val/rollout_triangle_flip_rate" in logged
-    assert "train/example" in logged
-    assert "train/example_projection" in logged
-    assert "train/example_xy" in logged
-    assert "val/example" in logged
-    assert "val/example_projection" in logged
-    assert "val/example_xy" in logged
-    assert isinstance(logged["train/example"], _FakeWandbImage)
-    assert isinstance(logged["train/example_projection"], _FakeWandbImage)
-    assert isinstance(logged["train/example_xy"], _FakeWandbImage)
-    assert isinstance(logged["val/example"], _FakeWandbImage)
-    assert isinstance(logged["val/example_projection"], _FakeWandbImage)
-    assert isinstance(logged["val/example_xy"], _FakeWandbImage)
-    assert logged["train/example"].data.ndim == 3
-    assert logged["train/example_projection"].data.ndim == 3
-    assert logged["train/example_xy"].data.ndim == 3
-    assert logged["val/example"].data.ndim == 3
-    assert logged["val/example_projection"].data.ndim == 3
-    assert logged["val/example_xy"].data.ndim == 3
+    assert "loss" in logged
+    assert "coarse_loss" in logged
+    assert "coarse_excess_nll" in logged
+    assert "xyz_soft_loss" in logged
+    assert "seam_loss" in logged
+    assert "triangle_barrier_loss" in logged
+    assert "xyz_l1_refined" in logged
+    assert "seam_edge_error_refined" in logged
+    assert "triangle_flip_rate_refined" in logged
+    assert "current_lr" in logged
+    assert "grad_norm" in logged
+    assert "val_loss" in logged
+    assert "rollout_val_xyz_l1_refined" in logged
+    assert "rollout_val_seam_edge_error" in logged
+    assert "rollout_val_triangle_flip_rate" in logged
+    assert "train_example" in logged
+    assert "train_example_projection" in logged
+    assert "train_example_xy" in logged
+    assert "val_example" in logged
+    assert "val_example_projection" in logged
+    assert "val_example_xy" in logged
+    assert isinstance(logged["train_example"], _FakeWandbImage)
+    assert isinstance(logged["train_example_projection"], _FakeWandbImage)
+    assert isinstance(logged["train_example_xy"], _FakeWandbImage)
+    assert isinstance(logged["val_example"], _FakeWandbImage)
+    assert isinstance(logged["val_example_projection"], _FakeWandbImage)
+    assert isinstance(logged["val_example_xy"], _FakeWandbImage)
+    assert logged["train_example"].data.ndim == 3
+    assert logged["train_example_projection"].data.ndim == 3
+    assert logged["train_example_xy"].data.ndim == 3
+    assert logged["val_example"].data.ndim == 3
+    assert logged["val_example_projection"].data.ndim == 3
+    assert logged["val_example_xy"].data.ndim == 3
     assert fake_wandb.finish_calls == 1
 
 
