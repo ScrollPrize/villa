@@ -226,6 +226,38 @@ def test_dispatcher_is_case_insensitive(identity_pair, monkeypatch):
     assert isinstance(built, CrossFrameZarrDataset)
 
 
+def test_coarse_scan_level(tmp_path: Path):
+    """A coarser OME-Zarr level can be used to speed up FG enumeration."""
+    rng = np.random.default_rng(42)
+    image = rng.integers(0, 255, size=(64, 64, 64), dtype=np.uint8)
+    labels = np.zeros((64, 64, 64), dtype=np.uint8)
+    labels[16:32, 16:32, 16:32] = 255
+
+    base = tmp_path / "labels.ome.zarr"
+    base.mkdir(parents=True)
+    group = zarr.open_group(str(base), mode="w")
+    group.create_dataset("0", data=labels, chunks=(16, 16, 16))
+    coarse = (labels[::4, ::4, ::4] > 0).astype(np.uint8)  # 16^3
+    group.create_dataset("1", data=coarse, chunks=(8, 8, 8))
+
+    image_path = tmp_path / "image.zarr"
+    tform_path = tmp_path / "transform.json"
+    _write_zarr_array(image_path, image, chunks=(16, 16, 16))
+    _write_identity_transform(tform_path)
+
+    mgr = _make_mgr(
+        image_url=str(image_path),
+        labels_url=str(base / "0"),
+        transform_url=str(tform_path),
+        cache_dir=tmp_path,
+    )
+    mgr.dataset_config["labels_scan_level"] = 1
+
+    ds = CrossFrameZarrDataset(mgr, is_training=False)
+    assert len(ds) == 1
+    assert tuple(ds._patches[0]) == (16, 16, 16)
+
+
 def test_empty_labels_raise(tmp_path):
     image = np.zeros((32, 32, 32), dtype=np.uint8)
     labels = np.zeros((32, 32, 32), dtype=np.uint8)

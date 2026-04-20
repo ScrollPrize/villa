@@ -111,6 +111,18 @@ class CrossFrameZarrDataset(Dataset):
         self._image_shape = tuple(int(v) for v in self._image_array.shape[-3:])
         self._labels_shape = tuple(int(v) for v in self._labels_array.shape[-3:])
 
+        # Optional coarser OME-Zarr level used to speed up the FG scan over remote
+        # zarrs. The coarser array is opened by stripping the trailing ``/<n>``
+        # from ``labels_zarr_url`` (if present) and appending the requested level.
+        raw_scan_level = ds_cfg.get("labels_scan_level")
+        self._scan_level: Optional[int] = (
+            int(raw_scan_level) if raw_scan_level is not None else None
+        )
+        self._scan_array: Optional[zarr.Array] = None
+        self._scan_factor: Tuple[int, int, int] = (1, 1, 1)
+        if self._scan_level is not None:
+            self._scan_array, self._scan_factor = self._open_scan_array(self._scan_level)
+
         self._transform_doc = affine.read_transform_json(self.transform_json_url)
         self._matrix_xyz = self._transform_doc.matrix_xyz
         self._matrix_zyx_label_to_image = affine.label_to_image_zyx_matrix(
@@ -167,10 +179,37 @@ class CrossFrameZarrDataset(Dataset):
                 "min_bbox_percent": self.min_bbox_percent,
                 "valid_patch_value": self.valid_patch_value,
                 "transform_checksum": affine.matrix_checksum(self._matrix_xyz),
+                "scan_level": self._scan_level,
             },
             sort_keys=True,
         )
         return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:16]
+
+    def _open_scan_array(self, level: int) -> Tuple[zarr.Array, Tuple[int, int, int]]:
+        """Open the given OME-Zarr level under the labels URL's parent group.
+
+        Returns the array plus the per-axis downsample factor relative to
+        ``self._labels_array``. Level arrays are expected to share chunking
+        with ``labels_zarr_url`` (128^3 in this codebase).
+        """
+        base_url = self.labels_zarr_url.rstrip("/")
+        # Strip trailing ``/<digit>`` so ``<base>/0`` -> ``<base>``.
+        last = base_url.rsplit("/", 1)[-1]
+        parent = base_url.rsplit("/", 1)[0] if last.isdigit() else base_url
+        scan_url = f"{parent}/{level}"
+        scan = _resolve_zarr_array(
+            open_zarr(scan_url, mode="r", storage_options=self.storage_options_labels)
+        )
+        scan_shape = tuple(int(v) for v in scan.shape[-3:])
+        factor = tuple(
+            max(1, int(round(full / s)))
+            for full, s in zip(self._labels_shape, scan_shape)
+        )
+        logger.info(
+            "CrossFrameZarrDataset: scanning FG at level %d (%s, factor=%s)",
+            level, scan_url, factor,
+        )
+        return scan, factor
 
     def _cache_path(self) -> Optional[Path]:
         if self.cache_dir is None:
@@ -221,6 +260,56 @@ class CrossFrameZarrDataset(Dataset):
         self._save_cache(np.asarray(positions, dtype=np.int64))
 
     def _scan_foreground_positions(self) -> List[Tuple[int, int, int]]:
+        if self._scan_array is not None:
+            return self._scan_foreground_positions_coarse()
+        return self._scan_foreground_positions_full()
+
+    def _scan_foreground_positions_coarse(self) -> List[Tuple[int, int, int]]:
+        """Scan the whole labels volume at a coarser OME-Zarr level in one read."""
+        assert self._scan_array is not None
+        fz, fy, fx = self._scan_factor
+        dz, dy, dx = self.patch_size
+        sz, sy, sx = self.stride
+
+        # Patch size (and stride) in coarse-level voxels. Floor-divide to stay
+        # inside the coarse array; a coarse FG voxel always implies at least
+        # one scale-0 FG voxel within, so false-positives at volume edges are
+        # filtered by the full-resolution verify pass.
+        ps_c = (max(1, dz // fz), max(1, dy // fy), max(1, dx // fx))
+        st_c = (max(1, sz // fz), max(1, sy // fy), max(1, sx // fx))
+
+        coarse = np.asarray(self._scan_array[...])
+        if self.valid_patch_value is None:
+            coarse_mask = coarse > 0
+        else:
+            coarse_mask = coarse == self.valid_patch_value
+        logger.info(
+            "coarse scan: %d FG voxels / %d total (%.2f%%)",
+            int(coarse_mask.sum()), coarse_mask.size,
+            100.0 * coarse_mask.mean(),
+        )
+
+        cz, cy, cx = coarse_mask.shape
+        candidates: List[Tuple[int, int, int]] = []
+        for zc in range(0, max(1, cz - ps_c[0] + 1), st_c[0]):
+            for yc in range(0, max(1, cy - ps_c[1] + 1), st_c[1]):
+                for xc in range(0, max(1, cx - ps_c[2] + 1), st_c[2]):
+                    block = coarse_mask[
+                        zc:zc + ps_c[0], yc:yc + ps_c[1], xc:xc + ps_c[2]
+                    ]
+                    if not block.any():
+                        continue
+                    # Coarse FG ratio (same threshold meaning at both levels).
+                    if block.mean() < self.min_labeled_ratio:
+                        continue
+                    pos = (zc * fz, yc * fy, xc * fx)
+                    if not self._image_aabb_in_bounds(pos):
+                        continue
+                    candidates.append(pos)
+        logger.info("coarse scan kept %d candidate patches", len(candidates))
+        return candidates
+
+    def _scan_foreground_positions_full(self) -> List[Tuple[int, int, int]]:
         dz, dy, dx = self.patch_size
         sz, sy, sx = self.stride
         lz, ly, lx = self._labels_shape
