@@ -5,7 +5,6 @@
 #include "vc/core/types/VcDataset.hpp"
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
@@ -202,6 +201,7 @@ static bool bytesAreCanonicalH265(const std::vector<uint8_t>& bytes) {
 
 BlockPipeline::BlockPipeline(
     Config config,
+    BlockCache& blockCache,
     std::unique_ptr<VolumeSource> source,
     DecompressFn decompress,
     std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels)
@@ -240,23 +240,18 @@ BlockPipeline::BlockPipeline(
         unsigned hw = std::thread::hardware_concurrency();
         return hw ? static_cast<int>(hw) : 8;
     }())
-    , blockCache_([&] {
-        // Reserve a small residency floor per pyramid level so a coarse
-        // fallback image is always available even under heavy fine-level
-        // pressure. 4096 blocks = 16 MiB per level = ~32 canonical 128^3
-        // chunks — enough for a viewport-worth at any level. Floors are
-        // clamped inside BlockCache if they'd overwhelm the arena.
-        BlockCache::Config bcfg;
-        bcfg.bytes = config_.bytes;
-        for (auto& f : bcfg.levelFloor) f = 4096;
-        return bcfg;
-      }())
+    , blockCache_(blockCache)
 {
     // Clear any stale process-wide HTTP abort flag from a previous
     // BlockPipeline's destructor. Without this, a volume swap during the
     // same session would leave the flag set and every subsequent curl
     // request would return CURLE_ABORTED_BY_CALLBACK → silent failure.
     utils::HttpClient::resetAbort();
+
+    // Clear the shared block cache so stale blocks from the previous volume
+    // don't appear in the new one. Physical pages are released via
+    // MADV_DONTNEED; the virtual mapping stays alive.
+    blockCache_.clear();
 
     // Scan the on-disk cache once at startup so the stats bar reports
     // actual usage instead of "0 GB / 0 shards" until we write something.
@@ -1167,7 +1162,8 @@ auto BlockPipeline::stats() const -> Stats {
 }
 
 std::unique_ptr<BlockPipeline> openFilesystemPipeline(
-    VcDataset* ds, size_t maxBytes, const std::filesystem::path& datasetPath)
+    VcDataset* ds, size_t maxBytes, const std::filesystem::path& datasetPath,
+    BlockCache* sharedCache)
 {
     FileSystemSource::LevelMeta lm;
     const auto& shape = ds->shape();
@@ -1179,8 +1175,18 @@ std::unique_ptr<BlockPipeline> openFilesystemPipeline(
     auto decompress = makeVcDecompressor(ds);
     BlockPipeline::Config cfg;
     cfg.bytes = maxBytes;
+
+    // CLI tools typically don't pass a shared cache — create a local one.
+    static thread_local std::unique_ptr<BlockCache> localCache;
+    if (!sharedCache) {
+        BlockCache::Config bcfg;
+        bcfg.bytes = maxBytes;
+        for (auto& f : bcfg.levelFloor) f = 4096;
+        localCache = std::make_unique<BlockCache>(bcfg);
+        sharedCache = localCache.get();
+    }
     return std::make_unique<BlockPipeline>(
-        std::move(cfg), std::move(source), std::move(decompress));
+        std::move(cfg), *sharedCache, std::move(source), std::move(decompress));
 }
 
 }  // namespace vc::cache
