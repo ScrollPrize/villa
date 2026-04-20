@@ -1484,6 +1484,8 @@ def _reconcile_extension_seam(
     seam_reconcile_band_width: int,
     seam_reconcile_smooth_radius: int,
     seam_reconcile_decay: float,
+    seam_reconcile_snap_weight: float = 0.35,
+    seam_reconcile_max_step_scale: float = 2.0,
 ) -> tuple[np.ndarray, np.ndarray, dict[str, float | int]]:
     reconciled_grid = extension_grid.copy()
     reconciled_provenance = extension_provenance.copy()
@@ -1503,26 +1505,38 @@ def _reconcile_extension_seam(
         }
     seam_idx = int(band_indices[0])
     outer_idx = int(band_indices[-1])
-    boundary, _interior = _frontier_boundary_and_interior_from_grid(working_grid, direction)
+    boundary, interior = _frontier_boundary_and_interior_from_grid(working_grid, direction)
     initial_grid = extension_grid.copy()
     seam_strip_pre = _get_extension_strip(reconciled_grid, direction, seam_idx)
     valid_boundary = np.isfinite(boundary).all(axis=-1)
     valid_pre = valid_boundary & np.isfinite(seam_strip_pre).all(axis=-1)
     seam_edge_error_pre = _seam_edge_error(boundary, seam_strip_pre)
 
+    local_step = np.linalg.norm(boundary - interior, axis=-1).astype(np.float32)
+    finite_step = np.isfinite(local_step) & (local_step > 1e-6)
+    default_step = float(np.median(local_step[finite_step])) if bool(np.any(finite_step)) else 1.0
+    local_step = np.where(finite_step, local_step, default_step).astype(np.float32)
+
     displacement = np.zeros_like(boundary, dtype=np.float32)
     displacement[valid_pre] = boundary[valid_pre] - seam_strip_pre[valid_pre]
-    smoothed_displacement = displacement.copy()
+    displacement_norm = np.linalg.norm(displacement, axis=-1).astype(np.float32)
+    max_displacement = np.asarray(local_step * float(max(seam_reconcile_max_step_scale, 0.0)), dtype=np.float32)
+    displacement_scale = np.ones_like(displacement_norm, dtype=np.float32)
+    clamp_mask = displacement_norm > max_displacement
+    displacement_scale[clamp_mask] = max_displacement[clamp_mask] / np.maximum(displacement_norm[clamp_mask], 1e-6)
+    clamped_displacement = displacement * displacement_scale[:, None]
+    smoothed_displacement = clamped_displacement.copy()
     if seam_reconcile_smooth_radius > 0:
         for axis_idx in range(3):
             smoothed_displacement[:, axis_idx] = _smooth_frontier_scalar_field(
-                displacement[:, axis_idx],
+                clamped_displacement[:, axis_idx],
                 valid_pre,
                 radius=int(seam_reconcile_smooth_radius),
             )
 
     seam_strip_post = seam_strip_pre.copy()
-    seam_strip_post[valid_boundary] = boundary[valid_boundary]
+    seam_weight = float(np.clip(seam_reconcile_snap_weight, 0.0, 1.0))
+    seam_strip_post[valid_boundary] = seam_strip_post[valid_boundary] + (smoothed_displacement[valid_boundary] * seam_weight)
     _set_extension_strip(reconciled_grid, direction, seam_idx, seam_strip_post)
 
     for depth, strip_idx in enumerate(band_indices[1:], start=1):
@@ -1530,7 +1544,7 @@ def _reconcile_extension_seam(
         valid_strip = valid_boundary & np.isfinite(strip).all(axis=-1)
         if not bool(np.any(valid_strip)):
             continue
-        weight = float(np.exp(-float(depth) / max(float(seam_reconcile_decay), 1e-6)))
+        weight = float(seam_weight * np.exp(-float(depth) / max(float(seam_reconcile_decay), 1e-6)))
         strip[valid_strip] = strip[valid_strip] + (smoothed_displacement[valid_strip] * weight)
         _set_extension_strip(reconciled_grid, direction, strip_idx, strip)
 
@@ -2875,6 +2889,8 @@ def extend_tifxyz_mesh(
     seam_reconcile_band_width: int = 8,
     seam_reconcile_smooth_radius: int = 8,
     seam_reconcile_decay: float = 2.0,
+    seam_reconcile_snap_weight: float = 0.35,
+    seam_reconcile_max_step_scale: float = 2.0,
 ) -> dict[str, Any]:
     planner_mode = _normalize_planner_mode(planner_mode)
     if str(distributed_shard_mode) != "strided":
@@ -3208,6 +3224,8 @@ def extend_tifxyz_mesh(
                         seam_reconcile_band_width=int(seam_reconcile_band_width),
                         seam_reconcile_smooth_radius=int(seam_reconcile_smooth_radius),
                         seam_reconcile_decay=float(seam_reconcile_decay),
+                        seam_reconcile_snap_weight=float(seam_reconcile_snap_weight),
+                        seam_reconcile_max_step_scale=float(seam_reconcile_max_step_scale),
                     )
                 (
                     new_band_frontier_coverage_fraction,
@@ -3492,6 +3510,8 @@ def run_extension_to_exhaustion(
     seam_reconcile_band_width: int = 8,
     seam_reconcile_smooth_radius: int = 8,
     seam_reconcile_decay: float = 2.0,
+    seam_reconcile_snap_weight: float = 0.35,
+    seam_reconcile_max_step_scale: float = 2.0,
     call_validator=None,
     extend_impl=None,
 ) -> ExtensionStageResult:
@@ -3533,6 +3553,8 @@ def run_extension_to_exhaustion(
             seam_reconcile_band_width=int(seam_reconcile_band_width),
             seam_reconcile_smooth_radius=int(seam_reconcile_smooth_radius),
             seam_reconcile_decay=float(seam_reconcile_decay),
+            seam_reconcile_snap_weight=float(seam_reconcile_snap_weight),
+            seam_reconcile_max_step_scale=float(seam_reconcile_max_step_scale),
         )
         compact_summary = _compact_extension_summary(summary)
         call_summaries.append(compact_summary)
@@ -3709,6 +3731,8 @@ def run_extension_benchmark_suite(
     seam_reconcile_band_width: int = 8,
     seam_reconcile_smooth_radius: int = 8,
     seam_reconcile_decay: float = 2.0,
+    seam_reconcile_snap_weight: float = 0.35,
+    seam_reconcile_max_step_scale: float = 2.0,
 ) -> dict[str, Any]:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -3746,6 +3770,8 @@ def run_extension_benchmark_suite(
             seam_reconcile_band_width=int(seam_reconcile_band_width),
             seam_reconcile_smooth_radius=int(seam_reconcile_smooth_radius),
             seam_reconcile_decay=float(seam_reconcile_decay),
+            seam_reconcile_snap_weight=float(seam_reconcile_snap_weight),
+            seam_reconcile_max_step_scale=float(seam_reconcile_max_step_scale),
         )
         serial_runs.append(summary)
 
@@ -3787,6 +3813,8 @@ def run_extension_benchmark_suite(
         seam_reconcile_band_width=int(seam_reconcile_band_width),
         seam_reconcile_smooth_radius=int(seam_reconcile_smooth_radius),
         seam_reconcile_decay=float(seam_reconcile_decay),
+        seam_reconcile_snap_weight=float(seam_reconcile_snap_weight),
+        seam_reconcile_max_step_scale=float(seam_reconcile_max_step_scale),
     )
     suite = {
         "tifxyz_path": str(tifxyz_path),
@@ -3827,6 +3855,8 @@ def run_extension_benchmark_suite(
 @click.option("--seam-reconcile-band-width", type=int, default=8, show_default=True)
 @click.option("--seam-reconcile-smooth-radius", type=int, default=8, show_default=True)
 @click.option("--seam-reconcile-decay", type=float, default=2.0, show_default=True)
+@click.option("--seam-reconcile-snap-weight", type=float, default=0.35, show_default=True)
+@click.option("--seam-reconcile-max-step-scale", type=float, default=2.0, show_default=True)
 @click.option("--show-progress/--no-show-progress", default=None)
 @click.option("--distributed-infer/--no-distributed-infer", default=False, show_default=True)
 @click.option("--distributed-shard-mode", type=click.Choice(["strided"]), default="strided", show_default=True)
@@ -3860,6 +3890,8 @@ def main(
     seam_reconcile_band_width: int,
     seam_reconcile_smooth_radius: int,
     seam_reconcile_decay: float,
+    seam_reconcile_snap_weight: float,
+    seam_reconcile_max_step_scale: float,
     show_progress: bool | None,
     distributed_infer: bool,
     distributed_shard_mode: str,
@@ -3907,6 +3939,8 @@ def main(
             seam_reconcile_band_width=int(seam_reconcile_band_width),
             seam_reconcile_smooth_radius=int(seam_reconcile_smooth_radius),
             seam_reconcile_decay=float(seam_reconcile_decay),
+            seam_reconcile_snap_weight=float(seam_reconcile_snap_weight),
+            seam_reconcile_max_step_scale=float(seam_reconcile_max_step_scale),
         )
     elif bool(run_to_exhaustion):
         result = run_extension_to_exhaustion(
@@ -3938,6 +3972,8 @@ def main(
             seam_reconcile_band_width=int(seam_reconcile_band_width),
             seam_reconcile_smooth_radius=int(seam_reconcile_smooth_radius),
             seam_reconcile_decay=float(seam_reconcile_decay),
+            seam_reconcile_snap_weight=float(seam_reconcile_snap_weight),
+            seam_reconcile_max_step_scale=float(seam_reconcile_max_step_scale),
         )
         result = result.stage_summary
     else:
@@ -3969,6 +4005,8 @@ def main(
             seam_reconcile_band_width=int(seam_reconcile_band_width),
             seam_reconcile_smooth_radius=int(seam_reconcile_smooth_radius),
             seam_reconcile_decay=float(seam_reconcile_decay),
+            seam_reconcile_snap_weight=float(seam_reconcile_snap_weight),
+            seam_reconcile_max_step_scale=float(seam_reconcile_max_step_scale),
         )
     if (not bool(distributed_infer)) or int(os.environ.get("RANK", "0")) == 0:
         print(json.dumps(result, indent=2, sort_keys=True))

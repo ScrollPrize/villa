@@ -664,15 +664,21 @@ def test_reconcile_extension_seam_snaps_true_touching_strip(direction, shape_bui
         seam_reconcile_band_width=3,
         seam_reconcile_smooth_radius=4,
         seam_reconcile_decay=2.0,
+        seam_reconcile_snap_weight=0.35,
+        seam_reconcile_max_step_scale=2.0,
     )
 
     if direction in {"left", "right"}:
-        np.testing.assert_allclose(reconciled_grid[:, seam_index, :], boundary)
+        pre_dist = np.linalg.norm(extension_grid[:, seam_index, :] - boundary, axis=-1)
+        post_dist = np.linalg.norm(reconciled_grid[:, seam_index, :] - boundary, axis=-1)
         assert np.all(reconciled_provenance[:, seam_index] == 2)
     else:
-        np.testing.assert_allclose(reconciled_grid[seam_index, :, :], boundary)
+        pre_dist = np.linalg.norm(extension_grid[seam_index, :, :] - boundary, axis=-1)
+        post_dist = np.linalg.norm(reconciled_grid[seam_index, :, :] - boundary, axis=-1)
         assert np.all(reconciled_provenance[seam_index, :] == 2)
-    assert metrics["seam_edge_error_post"] == pytest.approx(0.0)
+    assert float(np.nanmean(post_dist)) < float(np.nanmean(pre_dist))
+    assert metrics["seam_edge_error_post"] > 0.0
+    assert metrics["seam_edge_error_post"] < metrics["seam_edge_error_pre"]
     assert metrics["seam_edge_error_pre"] > 0.0
 
 
@@ -692,6 +698,8 @@ def test_reconcile_extension_seam_diffuses_displacement_monotonically() -> None:
         seam_reconcile_band_width=4,
         seam_reconcile_smooth_radius=0,
         seam_reconcile_decay=1.5,
+        seam_reconcile_snap_weight=0.35,
+        seam_reconcile_max_step_scale=2.0,
     )
 
     displacement_norms = [
@@ -1212,6 +1220,7 @@ def test_extend_tifxyz_mesh_synthetic_end_to_end(tmp_path: Path, monkeypatch: py
     assert "seam_edge_error_pre" in result
     assert "seam_edge_error_post" in result
     assert result["seam_edge_error_post"] <= result["seam_edge_error_pre"]
+    assert result["seam_edge_error_post"] > 0.0
     for preview in result["preview_paths"]:
         assert Path(preview).exists()
 
