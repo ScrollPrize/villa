@@ -14,6 +14,9 @@ import numpy as np
 from vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz import (
     ATTENTION_SCALING_MODES,
     ATTENTION_SCALING_STANDARD,
+    PLANNER_MODE_COVERAGE_FIRST,
+    PLANNER_MODE_FAST,
+    PLANNER_MODES,
     ExtensionStageResult,
     evaluate_extension_planner,
     extend_tifxyz_mesh,
@@ -38,6 +41,8 @@ TITLE_HUNT_PREDICT_STRIPS_PER_ITER = 1
 TITLE_HUNT_WINDOW_STRIP_LENGTH = 16
 TITLE_HUNT_WINDOW_OVERLAP = 8
 TITLE_HUNT_PREFLIGHT_MIN_FITTED_PLANS = 18
+TITLE_HUNT_CURRENT_TUNED_BASELINE_COVERAGE = 0.3016905071521456
+TITLE_HUNT_TARGET_COVERAGE = 0.45
 TITLE_HUNT_DRY_RUN_MIN_FRONTIER_COVERAGE = 0.70
 TITLE_HUNT_DRY_RUN_MAX_GAP = 32
 REQUIRED_AWS_ENV = ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN")
@@ -371,6 +376,7 @@ def _title_hunt_extension_preset(
     distributed_infer: bool,
     device: str = "cuda",
     attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
+    planner_mode: str = PLANNER_MODE_FAST,
 ) -> dict[str, Any]:
     return {
         "prompt_strips": int(TITLE_HUNT_PROMPT_STRIPS),
@@ -388,6 +394,7 @@ def _title_hunt_extension_preset(
         "distributed_shard_mode": "strided",
         "distributed_gather_mode": "object",
         "attention_scaling_mode": str(attention_scaling_mode),
+        "planner_mode": str(planner_mode),
     }
 
 
@@ -425,9 +432,9 @@ def _title_hunt_preflight_candidates() -> list[dict[str, Any]]:
 
 def _planner_candidate_sort_key(result: dict[str, Any]) -> tuple[float, float, float, int]:
     return (
-        float(result.get("fitted_plans", 0)),
         float(result.get("covered_frontier", 0)),
         float(result.get("covered_frontier_fraction", 0.0)),
+        float(result.get("fitted_plans", 0)),
         -int(result.get("planning_stats", {}).get("crop_fit_failed_count", 0)),
     )
 
@@ -437,66 +444,55 @@ def run_title_hunt_planner_preflight(
     source_tifxyz_path: str | Path,
     output_dir: str | Path,
     grow_direction: str = "decreasing-z",
+    planner_mode: str = PLANNER_MODE_COVERAGE_FIRST,
+    prompt_strips: int = TITLE_HUNT_PROMPT_STRIPS,
+    predict_strips_per_iter: int = TITLE_HUNT_PREDICT_STRIPS_PER_ITER,
+    window_strip_length: int = TITLE_HUNT_WINDOW_STRIP_LENGTH,
+    window_overlap: int = TITLE_HUNT_WINDOW_OVERLAP,
     max_crop_fit_retries: int = 3,
     min_fitted_plans: int = TITLE_HUNT_PREFLIGHT_MIN_FITTED_PLANS,
+    min_covered_frontier_fraction: float = TITLE_HUNT_CURRENT_TUNED_BASELINE_COVERAGE,
+    target_covered_frontier_fraction: float = TITLE_HUNT_TARGET_COVERAGE,
 ) -> dict[str, Any]:
+    planner_mode = str(planner_mode)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    candidate_results: list[dict[str, Any]] = []
-    fixed_lattice_direction: str | None = None
-    for candidate in _title_hunt_preflight_candidates():
-        candidate_dir = output_dir / str(candidate["name"])
-        scaled_path, resample_factor = _scale_stored_tifxyz(
-            source_tifxyz_path,
-            candidate_dir / "scaled_input_tifxyz",
-            coordinate_scale_factor=float(candidate["coordinate_scale_factor"]),
-            target_vertex_spacing=float(candidate["target_vertex_spacing"]),
-        )
-        scaled_prompt = int(candidate["prompt_strips"]) * int(resample_factor)
-        scaled_predict = int(candidate["predict_strips_per_iter"]) * int(resample_factor)
-        scaled_window = int(candidate["window_strip_length"]) * int(resample_factor)
-        scaled_overlap = int(candidate["window_overlap"]) * int(resample_factor)
-        requested_direction = str(grow_direction if fixed_lattice_direction is None else fixed_lattice_direction)
-        evaluation = evaluate_extension_planner(
-            tifxyz_path=scaled_path,
-            grow_direction=requested_direction,
-            prompt_strips=scaled_prompt,
-            predict_strips_per_iter=scaled_predict,
-            window_strip_length=scaled_window,
-            window_overlap=scaled_overlap,
-            max_crop_fit_retries=int(max_crop_fit_retries),
-        )
-        if fixed_lattice_direction is None:
-            fixed_lattice_direction = str(evaluation["direction"])
-        candidate_results.append(
-            {
-                **candidate,
-                "scaled_input_path": str(scaled_path),
-                "resample_factor": int(resample_factor),
-                "scaled_prompt_strips": int(scaled_prompt),
-                "scaled_predict_strips_per_iter": int(scaled_predict),
-                "scaled_window_strip_length": int(scaled_window),
-                "scaled_window_overlap": int(scaled_overlap),
-                **evaluation,
-            }
-        )
-    candidate_results.sort(key=_planner_candidate_sort_key, reverse=True)
-    best = candidate_results[0]
+    evaluation = evaluate_extension_planner(
+        tifxyz_path=source_tifxyz_path,
+        grow_direction=str(grow_direction),
+        planner_mode=str(planner_mode),
+        prompt_strips=int(prompt_strips),
+        predict_strips_per_iter=int(predict_strips_per_iter),
+        window_strip_length=int(window_strip_length),
+        window_overlap=int(window_overlap),
+        max_crop_fit_retries=int(max_crop_fit_retries),
+    )
+    best = dict(evaluation)
     summary = {
         "source_tifxyz_path": str(source_tifxyz_path),
         "grow_direction": str(grow_direction),
-        "resolved_lattice_direction": str(fixed_lattice_direction or grow_direction),
+        "planner_mode": str(planner_mode),
+        "resolved_lattice_direction": str(best["direction"]),
         "min_fitted_plans": int(min_fitted_plans),
+        "min_covered_frontier_fraction": float(min_covered_frontier_fraction),
+        "target_covered_frontier_fraction": float(target_covered_frontier_fraction),
+        "beats_tuned_baseline": bool(float(best.get("covered_frontier_fraction", 0.0)) > float(min_covered_frontier_fraction)),
+        "meets_target_coverage": bool(float(best.get("covered_frontier_fraction", 0.0)) >= float(target_covered_frontier_fraction)),
         "best_candidate": best,
-        "candidates": candidate_results,
+        "candidates": [best],
     }
     summary_path = output_dir / "planner_preflight.json"
     _write_json(summary_path, summary)
     summary["planner_preflight_path"] = str(summary_path)
-    if int(best.get("fitted_plans", 0)) < int(min_fitted_plans):
+    if str(planner_mode) == PLANNER_MODE_FAST and int(best.get("fitted_plans", 0)) < int(min_fitted_plans):
         raise RuntimeError(
-            f"planner preflight failed: best candidate {best['name']} only reached "
+            f"planner preflight failed: best candidate only reached "
             f"{best.get('fitted_plans', 0)} fitted plans"
+        )
+    if float(best.get("covered_frontier_fraction", 0.0)) <= float(min_covered_frontier_fraction):
+        raise RuntimeError(
+            "planner preflight failed to beat the current tuned baseline "
+            f"({best.get('covered_frontier_fraction', 0.0)} <= {float(min_covered_frontier_fraction)})"
         )
     return summary
 
@@ -521,6 +517,7 @@ def _run_direction_to_exhaustion(
     device: str = "cuda",
     distributed_infer: bool = False,
     attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
+    planner_mode: str = PLANNER_MODE_FAST,
     enforce_dry_run_quality_gate: bool = False,
     prompt_strips_override: int | None = None,
     predict_strips_override: int | None = None,
@@ -533,6 +530,7 @@ def _run_direction_to_exhaustion(
         distributed_infer=bool(distributed_infer),
         device=str(device),
         attention_scaling_mode=str(attention_scaling_mode),
+        planner_mode=str(planner_mode),
     )
     if prompt_strips_override is not None:
         preset["prompt_strips"] = int(prompt_strips_override)
@@ -566,6 +564,7 @@ def _run_direction_to_exhaustion(
         distributed_shard_mode=str(preset["distributed_shard_mode"]),
         distributed_gather_mode=str(preset["distributed_gather_mode"]),
         attention_scaling_mode=str(preset["attention_scaling_mode"]),
+        planner_mode=str(preset["planner_mode"]),
         call_validator=(
             (lambda summary, call_idx: _validate_dry_run_call(summary, direction=direction, call_idx=call_idx))
             if enforce_dry_run_quality_gate else None
@@ -687,6 +686,7 @@ def _process_surface(
     distributed_infer: bool,
     device: str = "cuda",
     attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
+    planner_mode: str = PLANNER_MODE_FAST,
     extend_directions: list[str] | None = None,
     target_vertex_spacing: float = 0.0,
 ) -> dict[str, Any]:
@@ -751,6 +751,24 @@ def _process_surface(
         done_status = f"{direction}_done"
         state = _update_surface_state(state=state, status=stage_status, manifest_jsonl_path=manifest_jsonl_path)
         stage_output_dir = paths.output_dir / f"{direction}_stage"
+        if str(planner_mode) == PLANNER_MODE_COVERAGE_FIRST:
+            preflight_summary = run_title_hunt_planner_preflight(
+                source_tifxyz_path=current_input,
+                output_dir=stage_output_dir / "preflight",
+                grow_direction=direction,
+                planner_mode=str(planner_mode),
+                prompt_strips=scaled_prompt_strips if resample_factor > 1 else TITLE_HUNT_PROMPT_STRIPS,
+                predict_strips_per_iter=scaled_predict_strips if resample_factor > 1 else TITLE_HUNT_PREDICT_STRIPS_PER_ITER,
+                window_strip_length=scaled_window_strip_length if resample_factor > 1 else TITLE_HUNT_WINDOW_STRIP_LENGTH,
+                window_overlap=scaled_window_overlap if resample_factor > 1 else TITLE_HUNT_WINDOW_OVERLAP,
+                max_crop_fit_retries=3,
+            )
+            state = _update_surface_state(
+                state=state,
+                status=stage_status,
+                manifest_jsonl_path=manifest_jsonl_path,
+                extra={f"planner_preflight_{direction}_path": str(preflight_summary["planner_preflight_path"])},
+            )
         stage_result = _run_direction_to_exhaustion(
             input_tifxyz_path=current_input,
             output_dir=stage_output_dir,
@@ -765,6 +783,7 @@ def _process_surface(
             device=str(device),
             distributed_infer=bool(distributed_infer),
             attention_scaling_mode=str(attention_scaling_mode),
+            planner_mode=str(planner_mode),
             enforce_dry_run_quality_gate=bool(dry_run_mode),
             prompt_strips_override=scaled_prompt_strips if resample_factor > 1 else None,
             predict_strips_override=scaled_predict_strips if resample_factor > 1 else None,
@@ -807,8 +826,10 @@ def _process_surface(
             distributed_infer=bool(distributed_infer),
             device=str(device),
             attention_scaling_mode=str(attention_scaling_mode),
+            planner_mode=str(planner_mode),
         ),
         "attention_scaling_mode": str(attention_scaling_mode),
+        "planner_mode": str(planner_mode),
         "resample_factor": int(resample_factor),
         "original_vertex_count": int(original_vertex_count),
         "final_vertex_count": int(final_vertex_count),
@@ -851,6 +872,7 @@ def run_batch_extend_title_hunt(
     distributed_infer: bool,
     device: str = "cuda",
     attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
+    planner_mode: str = PLANNER_MODE_FAST,
     target_vertex_spacing: float = 0.0,
 ) -> dict[str, Any]:
     _require_aws_env()
@@ -904,6 +926,7 @@ def run_batch_extend_title_hunt(
             dry_run_max_calls_per_direction=int(dry_run_max_calls_per_direction),
             distributed_infer=bool(distributed_infer),
             attention_scaling_mode=str(attention_scaling_mode),
+            planner_mode=str(planner_mode),
             target_vertex_spacing=float(target_vertex_spacing),
         )
         processed.append(
@@ -931,6 +954,7 @@ def run_batch_extend_title_hunt(
         "device": str(device),
         "distributed_infer": bool(distributed_infer),
         "attention_scaling_mode": str(attention_scaling_mode),
+        "planner_mode": str(planner_mode),
         "processed": processed,
         "manifest_jsonl_path": str(manifest_jsonl_path),
     }
@@ -955,6 +979,7 @@ def run_batch_extend_title_hunt(
 @click.option("--show-progress/--no-show-progress", default=True, show_default=True)
 @click.option("--distributed-infer/--no-distributed-infer", default=False, show_default=True)
 @click.option("--attention-scaling-mode", type=click.Choice(list(ATTENTION_SCALING_MODES)), default=ATTENTION_SCALING_STANDARD, show_default=True)
+@click.option("--planner-mode", type=click.Choice(list(PLANNER_MODES)), default=PLANNER_MODE_FAST, show_default=True)
 @click.option("--surface-filter", type=str, default=None, help="Only process surfaces whose relative_surface_id contains this substring")
 @click.option("--extend-directions", type=str, default="up,down", show_default=True, help="Comma-separated directions to extend (e.g. 'up' or 'up,down')")
 @click.option("--target-vertex-spacing", type=float, default=0.0, show_default=True, help="If >0, resample the lattice so vertex spacing matches this (voxels). Set to 20 to match training data.")
@@ -977,6 +1002,7 @@ def main(
     show_progress: bool,
     distributed_infer: bool,
     attention_scaling_mode: str,
+    planner_mode: str,
     surface_filter: str | None,
     extend_directions: str,
     target_vertex_spacing: float,
@@ -1000,6 +1026,7 @@ def main(
         show_progress=bool(show_progress),
         distributed_infer=bool(distributed_infer),
         attention_scaling_mode=str(attention_scaling_mode),
+        planner_mode=str(planner_mode),
         surface_filter=surface_filter,
         extend_directions=[d.strip() for d in str(extend_directions).split(",") if d.strip()],
         target_vertex_spacing=float(target_vertex_spacing),

@@ -8,9 +8,11 @@ import pytest
 
 from vesuvius.neural_tracing.autoreg_mesh.batch_extend_title_hunt import (
     SYNC_EXCLUDE_PATTERNS,
+    TITLE_HUNT_CURRENT_TUNED_BASELINE_COVERAGE,
     TITLE_HUNT_PREDICT_STRIPS_PER_ITER,
     TITLE_HUNT_PREFLIGHT_MIN_FITTED_PLANS,
     TITLE_HUNT_PROMPT_STRIPS,
+    TITLE_HUNT_TARGET_COVERAGE,
     TITLE_HUNT_WINDOW_OVERLAP,
     TITLE_HUNT_WINDOW_STRIP_LENGTH,
     _aws_sync_exclude_args,
@@ -135,6 +137,7 @@ def test_title_hunt_extension_preset_is_conservative() -> None:
         distributed_infer=True,
         device="cpu",
         attention_scaling_mode="legacy_double_scaled",
+        planner_mode="coverage_first",
     )
 
     assert preset["prompt_strips"] == TITLE_HUNT_PROMPT_STRIPS == 4
@@ -145,6 +148,7 @@ def test_title_hunt_extension_preset_is_conservative() -> None:
     assert preset["distributed_infer"] is True
     assert preset["device"] == "cpu"
     assert preset["attention_scaling_mode"] == "legacy_double_scaled"
+    assert preset["planner_mode"] == "coverage_first"
 
 
 def test_run_direction_to_exhaustion_loops_until_stop_reason_changes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -476,39 +480,22 @@ def test_title_hunt_planner_preflight_picks_best_candidate(tmp_path: Path, monke
     source_surface = _make_surface()
     source_dir = write_tifxyz(tmp_path / "source_preflight", source_surface, overwrite=True)
 
-    def _fake_scale(source_dir, output_dir, *, coordinate_scale_factor, target_vertex_spacing=0.0):
-        del source_dir, coordinate_scale_factor
-        out_dir = Path(output_dir)
-        write_tifxyz(out_dir, source_surface, overwrite=True)
-        if target_vertex_spacing > 0:
-            return out_dir, 2
-        return out_dir, 1
-
     def _fake_evaluate(**kwargs):
-        window = int(kwargs["window_strip_length"])
-        if window == 24:
-            fitted = 19
-            covered = 180
-        elif window == 32:
-            fitted = 18
-            covered = 170
-        else:
-            fitted = 9
-            covered = 90
         return {
+            "planner_mode": kwargs["planner_mode"],
             "direction": kwargs["grow_direction"],
             "requested_direction": kwargs["grow_direction"],
             "frontier_length": 200,
-            "fitted_plans": fitted,
-            "covered_frontier": covered,
-            "covered_frontier_fraction": covered / 200.0,
+            "fitted_plans": 25,
+            "covered_frontier": 180,
+            "covered_frontier_fraction": 180 / 200.0,
             "planning_stats": {"crop_fit_failed_count": 10},
-            "fitted_plan_spans": [(0, covered)],
-            "covered_frontier_spans": [(0, covered)],
+            "fitted_plan_spans": [(0, 180)],
+            "covered_frontier_spans": [(0, 180)],
             "trimmed_bbox_rc": [0, 4, 0, 5],
+            "planner_diagnostics": {"atlas": {}, "selection": {}},
         }
 
-    monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.batch_extend_title_hunt._scale_stored_tifxyz", _fake_scale)
     monkeypatch.setattr("vesuvius.neural_tracing.autoreg_mesh.batch_extend_title_hunt.evaluate_extension_planner", _fake_evaluate)
 
     summary = run_title_hunt_planner_preflight(
@@ -516,8 +503,12 @@ def test_title_hunt_planner_preflight_picks_best_candidate(tmp_path: Path, monke
         output_dir=tmp_path / "preflight",
     )
 
-    assert summary["best_candidate"]["name"] == "expanded_context"
+    assert summary["planner_mode"] == "coverage_first"
     assert summary["best_candidate"]["fitted_plans"] >= TITLE_HUNT_PREFLIGHT_MIN_FITTED_PLANS
+    assert summary["best_candidate"]["covered_frontier_fraction"] > TITLE_HUNT_CURRENT_TUNED_BASELINE_COVERAGE
+    assert summary["beats_tuned_baseline"] is True
+    assert summary["meets_target_coverage"] is True
+    assert summary["target_covered_frontier_fraction"] == pytest.approx(TITLE_HUNT_TARGET_COVERAGE)
     assert Path(summary["planner_preflight_path"]).exists()
 
 
