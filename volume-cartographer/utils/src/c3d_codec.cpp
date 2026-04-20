@@ -46,6 +46,22 @@ struct AlignedBuf {
 static bool is_aligned(const void* p) {
     return (reinterpret_cast<std::uintptr_t>(p) & (C3D_ALIGN - 1)) == 0;
 }
+
+// Thread-local c3d_decoder reuse.  c3d_decoder_new() allocates ~80 MiB of
+// scratch arenas; reusing across calls in the same worker thread saves
+// 50-100 ms/chunk per the c3d header note.  A c3d_decoder is not
+// thread-safe, so we bind one per worker thread.
+struct C3dDecoderDeleter {
+    void operator()(c3d_decoder* d) const noexcept {
+        if (d) c3d_decoder_free(d);
+    }
+};
+using DecoderPtr = std::unique_ptr<c3d_decoder, C3dDecoderDeleter>;
+
+static c3d_decoder* thread_decoder() {
+    thread_local DecoderPtr dec(c3d_decoder_new());
+    return dec.get();
+}
 }  // namespace
 
 std::vector<std::byte> c3d_encode(std::span<const std::byte> raw,
@@ -75,7 +91,6 @@ std::vector<std::byte> c3d_encode(std::span<const std::byte> raw,
     const std::size_t n = c3d_chunk_encode(
         in_ptr,
         params.target_ratio,
-        /*ctx=*/nullptr,
         reinterpret_cast<uint8_t*>(out.data()),
         out.size());
     out.resize(n);
@@ -111,7 +126,32 @@ std::vector<std::byte> c3d_decode(std::span<const std::byte> compressed,
     // (visible as noise in the rendered tiles).
     AlignedBuf staging(out_size);
     std::memset(staging.p, 0, out_size);
-    c3d_chunk_decode(in, in_len, /*ctx=*/nullptr, staging.p);
+    c3d_decoder_chunk_decode(thread_decoder(), in, in_len, staging.p);
+    std::vector<std::byte> out(out_size);
+    std::memcpy(out.data(), staging.p, out_size);
+    return out;
+}
+
+std::vector<std::byte> c3d_decode_lod(std::span<const std::byte> compressed,
+                                      std::uint8_t lod)
+{
+    if (lod > 5) {
+        throw std::runtime_error("c3d_decode_lod: lod must be in [0, 5]");
+    }
+    const auto* in  = reinterpret_cast<const uint8_t*>(compressed.data());
+    const std::size_t in_len = compressed.size();
+    if (!c3d_is_chunk(in, in_len)) {
+        throw std::runtime_error("c3d_decode_lod: input missing C3DC magic");
+    }
+    if (!c3d_chunk_validate(in, in_len)) {
+        throw std::runtime_error("c3d_decode_lod: structural validation failed");
+    }
+    const std::size_t side    = static_cast<std::size_t>(C3D_CHUNK_SIDE) >> lod;
+    const std::size_t out_size = side * side * side;
+
+    AlignedBuf staging(out_size);
+    std::memset(staging.p, 0, out_size);
+    c3d_decoder_chunk_decode_lod(thread_decoder(), in, in_len, lod, staging.p);
     std::vector<std::byte> out(out_size);
     std::memcpy(out.data(), staging.p, out_size);
     return out;

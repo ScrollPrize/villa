@@ -35,6 +35,14 @@ struct C3dCodecParams {
     std::span<const std::byte> compressed, std::size_t out_size,
     const C3dCodecParams& params);
 
+// LOD-scalable decode.  lod ∈ [0, 5]; output is (256 >> lod)^3 u8.
+// lod=0 is equivalent to c3d_decode.  Higher lod values decode a prefix
+// of the chunk's subbands (see c3d chunk header lod_offsets), producing
+// a coarser reconstruction.  Cheaper than full-decode when the caller
+// doesn't need the finest detail.
+[[nodiscard]] std::vector<std::byte> c3d_decode_lod(
+    std::span<const std::byte> compressed, std::uint8_t lod);
+
 // Magic sniff: buffer begins with "C3DC".
 [[nodiscard]] bool is_c3d_compressed(std::span<const std::byte> data) noexcept;
 

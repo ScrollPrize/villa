@@ -1466,9 +1466,6 @@ static void c3d_subband_scatter(float *buf,
 #define C3D_CHUNK_FIXED_SIZE 388u
 #define C3D_CHUNK_ALPHA_OFFSET 352u
 #define C3D_CHUNK_FLAGS_OFFSET 16u
-#define C3D_FLAG_LL_PREDICTED  0x01u   /* LL_5 is a residual; any reference source */
-#define C3D_FLAG_LL_FROM_CTX   0x02u   /* reference source = ctx->ll_reference */
-#define C3D_FLAG_LL_FROM_PREV  0x04u   /* reference source = decoded Morton-prev chunk */
 
 /* uint8 <-> α float in [0.40, 0.50] — clamp + linear map.  Q1 writes one
  * byte per subband; decoder reads it back for the Laplacian-optimal
@@ -1614,40 +1611,6 @@ static float c3d_adaptive_softness(float target_ratio) {
     return 0.60f;
 }
 
-/* c3d_ctx struct definition — used by §G/§H/§I encode/decode paths.
- * Full parse/serialise/builder implementation lives in §K. */
-struct c3d_ctx {
-    uint8_t  self_hash[16];
-    uint16_t block_size;
-
-    bool     has_laplacian_alpha;
-    float    laplacian_alpha[C3D_N_SUBBANDS];
-
-    bool     has_quantizer_baseline;
-    float    quantizer_baseline[C3D_N_SUBBANDS];
-
-    /* §T13: per-subband dead-zone ratio.  When set, overrides the kind-based
-     * c3d_dz_ratio_for_kind() (which currently returns a global 0.55 for
-     * every kind).  Per-subband values (36 scalars) allow the dead-zone
-     * width to be learned from a training corpus per subband, capturing
-     * distribution shape differences the kind-based table doesn't. */
-    bool     has_dz_ratio;
-    float    dz_ratio[C3D_N_SUBBANDS];
-
-    bool     has_freq_tables;
-    uint32_t denom_shifts[C3D_N_SUBBANDS];
-    uint32_t freqs[C3D_N_SUBBANDS][65];
-
-    /* §T1b LL_5 inter-chunk reference: 8³=512 f32 coefficients averaged
-     * across the training corpus.  When set, encoders subtract this
-     * reference from their own LL_5 (subband 0) before quantisation,
-     * lowering the LL_5 rate by ~30-50% on smooth CT data.  Decoder
-     * adds it back after dequant.  Applied only when chunk header
-     * flags bit 0 is set. */
-    bool     has_ll_reference;
-    float    ll_reference[512];        /* 8 × 8 × 8 — matches LL_5 size */
-};
-
 /* Number of subbands required to decode each LOD (prefix of canonical order). */
 static const unsigned c3d_n_subbands_for_lod[C3D_N_LODS] = {
     C3D_N_SUBBANDS,  /* LOD 0: all 36                          */
@@ -1722,23 +1685,6 @@ struct c3d_encoder {
     float    allocator_steps[C3D_N_SUBBANDS];
     bool     has_allocator_steps;
 
-    /* §T1b/§S2 — set by prepare_chunk when LL_5 reference was
-     * subtracted (prediction helped).  ll_prediction_source records
-     * which reference was used so the outer encode function can set
-     * the right chunk header flag bit (FROM_CTX vs FROM_PREV). */
-    bool     ll_prediction_active;
-    uint8_t  ll_prediction_source;   /* 1=ctx, 2=prev */
-
-    /* §S2 — Morton-neighbor LL_5 prediction state.  Opt-in via
-     * c3d_encoder_enable_inter_chunk().  When enabled, the encoder
-     * populates prev_ll5 after each encode and uses it as the
-     * reference for the next chunk (takes precedence over
-     * ctx->ll_reference).  Default OFF so the standalone chunk API
-     * stays byte-deterministic across reused-vs-fresh encoders. */
-    bool     inter_chunk_enabled;
-    float    prev_ll5[512];
-    bool     has_prev_ll5;
-
     /* §T14 — learned R-D slope for rate-control shortcut.  Tracks
      * d(log bytes)/d(log q) from consecutive estimator samples (EMA,
      * alpha=0.3).  Used to pick the next q via Newton-in-log-space
@@ -1747,6 +1693,11 @@ struct c3d_encoder {
      * straight line in log-log.  Seeded to -1.5 on first encode. */
     float    log_rd_slope;
     bool     has_log_rd_slope;
+
+    /* Lazy-allocated 16 MiB u8 scratch used by the _masked encode variants
+     * as the filled-input buffer (0-voxels replaced by global-min non-zero
+     * before the regular encode path). */
+    uint8_t *in_scratch;
 };
 
 struct c3d_decoder {
@@ -1765,13 +1716,6 @@ struct c3d_decoder {
     uint8_t          cached_ctx_id[16];
     bool             cached_valid;
 
-    /* §S2 — Morton-neighbor LL_5 prediction state.  Populated after
-     * each decode with the reconstructed LL_5 of that chunk.  Next
-     * chunk's decode uses this as the reference when its header flag
-     * C3D_FLAG_LL_PREDICTED is set.  Reset via
-     * c3d_decoder_reset_inter_chunk() when starting a fresh shard. */
-    float    prev_ll5[512];
-    bool     has_prev_ll5;
 };
 
 c3d_encoder *c3d_encoder_new(void) {
@@ -1797,12 +1741,9 @@ c3d_encoder *c3d_encoder_new(void) {
     e->last_target_ratio = 0.0f;
     e->has_fine_hist = false;
     e->has_allocator_steps = false;
-    e->ll_prediction_active = false;
-    e->ll_prediction_source = 0;
-    e->inter_chunk_enabled = false;
-    e->has_prev_ll5 = false;
     e->log_rd_slope = 0.0f;
     e->has_log_rd_slope = false;
+    e->in_scratch = NULL;   /* lazy-allocated on first _masked call */
     return e;
 }
 void c3d_encoder_free(c3d_encoder *e) {
@@ -1818,6 +1759,7 @@ void c3d_encoder_free(c3d_encoder *e) {
     }
     for (unsigned i = 0; i < C3D_OMP_MAX_THREADS; ++i)
         free(e->thread_out_scratch[i]);
+    free(e->in_scratch);
     free(e);
 }
 
@@ -1832,7 +1774,6 @@ c3d_decoder *c3d_decoder_new(void) {
     d->cached_tables = NULL;
     memset(d->cached_ctx_id, 0, 16);
     d->cached_valid = false;
-    d->has_prev_ll5 = false;
     return d;
 }
 void c3d_decoder_free(c3d_decoder *d) {
@@ -1849,15 +1790,15 @@ void c3d_decoder_free(c3d_decoder *d) {
  * Returns true if the chunk is nonempty (needs entropy payload); false if
  * uniform-after-centering (just emit the 352 B header with all-zero tables). */
 static bool c3d_prepare_chunk(const uint8_t *in, uint8_t *out,
-                              c3d_encoder *s, const c3d_ctx *ctx,
+                              c3d_encoder *s,
                               float *out_dc_offset, float *out_coeff_scale)
 {
     /* Header skeleton. */
     memcpy(out + 0, "C3DC", 4);
     c3d_write_u16_le(out + 4, 1u);
-    out[6] = 0; out[7] = 0;  /* context_mode = SELF, reserved */
+    out[6] = 0; out[7] = 0;  /* reserved, reserved */
     /* dc_offset, coeff_scale filled later. */
-    memset(out + 16, 0, 8 + 16);  /* reserved2 + context_id */
+    memset(out + 16, 0, 8 + 16);  /* reserved2 + reserved3 */
     /* Zero-fill tables (will be overwritten). */
     memset(out + 40, 0, C3D_CHUNK_FIXED_SIZE - 40);
 
@@ -1915,59 +1856,6 @@ static bool c3d_prepare_chunk(const uint8_t *in, uint8_t *out,
         }
         s->max_abs_per_subband[i] = mx;
         if (mx > max_abs) max_abs = mx;
-    }
-
-    /* §T1b + §S2 — LL_5 inter-chunk reference subtraction.
-     *
-     * Reference source (priority order):
-     *   §S2: s->prev_ll5 — Morton-neighbour's decoded LL_5, updated
-     *        after each encode.  Only set during shard-level sequential
-     *        encoding via c3d_shard_encode_all.
-     *   §T1b: ctx->ll_reference — corpus-average from ctx_builder.
-     *
-     * Applied only when the residual is smaller than the raw LL_5
-     * (opportunistic): for non-matching references (heterogeneous data,
-     * first chunk of a sequence with no prev_ll5), the raw values are
-     * kept and the flag stays off.  Runs AFTER max_abs scan so
-     * coeff_scale tracks the PRE-subtraction magnitudes (otherwise
-     * zeroing LL_5 drops coeff_scale and oversquashes every subband). */
-    const float *ll_ref = NULL;
-    uint8_t ll_source = 0;
-    if (s->inter_chunk_enabled && s->has_prev_ll5) {
-        ll_ref = s->prev_ll5;
-        ll_source = 2;  /* §S2 Morton-prev */
-    } else if (ctx && ctx->has_ll_reference) {
-        ll_ref = ctx->ll_reference;
-        ll_source = 1;  /* §T1b ctx-reference */
-    }
-    s->ll_prediction_active = false;
-    s->ll_prediction_source = 0;
-    if (ll_ref) {
-        size_t k = 0;
-        float mx_pred = 0.0f;
-        float scratch_ll[512];
-        for (unsigned z = 0; z < 8; ++z)
-        for (unsigned y = 0; y < 8; ++y)
-        for (unsigned x = 0; x < 8; ++x) {
-            size_t pos = z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x;
-            float resid = s->coeff_buf[pos] - ll_ref[k];
-            scratch_ll[k] = resid;
-            float a = fabsf(resid);
-            if (a > mx_pred) mx_pred = a;
-            k++;
-        }
-        if (mx_pred < s->max_abs_per_subband[0]) {
-            k = 0;
-            for (unsigned z = 0; z < 8; ++z)
-            for (unsigned y = 0; y < 8; ++y)
-            for (unsigned x = 0; x < 8; ++x) {
-                s->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x]
-                    = scratch_ll[k++];
-            }
-            s->max_abs_per_subband[0] = mx_pred;
-            s->ll_prediction_active = true;
-            s->ll_prediction_source = ll_source;
-        }
     }
 
     c3d_write_f32_le(out + 8, dc_offset);
@@ -2620,10 +2508,8 @@ static void c3d_rd_estimate_subband(const c3d_encoder *s, unsigned sidx,
 /* Lookup the effective "baseline step" for a subband — mirrors the emit-time
  * selection between ctx override, dynamic softness table, and the cached
  * default.  Used by the R-D allocator to centre its per-subband step grid. */
-static inline float c3d_emit_baseline(const c3d_encoder *s, const c3d_ctx *ctx,
-                                      unsigned i)
+static inline float c3d_emit_baseline(const c3d_encoder *s, unsigned i)
 {
-    if (ctx && ctx->has_quantizer_baseline) return ctx->quantizer_baseline[i];
     if (s->has_dyn_baselines)               return s->dyn_baselines[i];
     return c3d_subband_baseline(i);
 }
@@ -2635,7 +2521,7 @@ static inline float c3d_emit_baseline(const c3d_encoder *s, const c3d_ctx *ctx,
  * are internally consistent — sidesteps the calibration gap that sank the
  * fine-histogram-based first cut. */
 #define C3D_RD_NCAND 9
-static void c3d_rd_allocate_hybrid(c3d_encoder *s, const c3d_ctx *ctx,
+static void c3d_rd_allocate_hybrid(c3d_encoder *s,
                                    double target_bytes,
                                    float q_center,
                                    const double *actual_bytes_per_sb)
@@ -2659,7 +2545,7 @@ static void c3d_rd_allocate_hybrid(c3d_encoder *s, const c3d_ctx *ctx,
     #pragma omp parallel for schedule(dynamic,1)
     for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
         c3d_subband_info sb; c3d_subband_info_of(i, &sb);
-        float base_step = q_center * c3d_emit_baseline(s, ctx, i) * s->coeff_scale;
+        float base_step = q_center * c3d_emit_baseline(s, i) * s->coeff_scale;
         unsigned h = c3d_kind_h_count(sb.kind);
         double log_w = (double)(3u * (sb.level - 1u) + (3u - h)) * log((double)C3D_CDF97_GAIN_L_SQ)
                      + (double)h * log((double)C3D_CDF97_GAIN_H_SQ);
@@ -2729,7 +2615,7 @@ static void c3d_rd_allocate_hybrid(c3d_encoder *s, const c3d_ctx *ctx,
  *     Σ d_s(step_s) + λ · Σ r_s(step_s)
  * under a fixed byte target, using the fine-histogram cache (§I1). */
 #define C3D_RD_NCAND_LEGACY 10
-static void c3d_rd_allocate(c3d_encoder *s, const c3d_ctx *ctx,
+static void c3d_rd_allocate(c3d_encoder *s,
                             double target_bytes)
 {
     c3d_build_fine_hist(s);
@@ -2754,7 +2640,7 @@ static void c3d_rd_allocate(c3d_encoder *s, const c3d_ctx *ctx,
 
     float grid[C3D_N_SUBBANDS][C3D_RD_NCAND_LEGACY];
     for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
-        float base = c3d_emit_baseline(s, ctx, i) * s->coeff_scale;
+        float base = c3d_emit_baseline(s, i) * s->coeff_scale;
         float centre = q_seed * base;
         /* Factors: 1/8, 1/4, 1/2.5, 1/1.5, 1/1.1, 1.1, 1.5, 2.5, 4, 8. */
         static const float mults[C3D_RD_NCAND_LEGACY] = {
@@ -2848,8 +2734,7 @@ static void c3d_rd_allocate(c3d_encoder *s, const c3d_ctx *ctx,
 
 /* Cheap whole-chunk estimate: sum of per-subband estimates under the same
  * baseline / denom_shift / ctx-override logic as c3d_emit_entropy_at_q. */
-static double c3d_estimate_entropy_at_q(float q, const c3d_encoder *s,
-                                        const c3d_ctx *ctx)
+static double c3d_estimate_entropy_at_q(float q, const c3d_encoder *s)
 {
     double total = 0.0;
     /* 36 subbands, each an independent full quant-scan over its
@@ -2859,18 +2744,14 @@ static double c3d_estimate_entropy_at_q(float q, const c3d_encoder *s,
     for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
         c3d_subband_info sb;
         c3d_subband_info_of(i, &sb);
-        float baseline = (ctx && ctx->has_quantizer_baseline) ? ctx->quantizer_baseline[i]
-                       : s->has_dyn_baselines                 ? s->dyn_baselines[i]
-                                                              : c3d_subband_baseline(i);
+        float baseline = c3d_emit_baseline(s, i);
         float step = q * baseline * s->coeff_scale;
-        uint32_t denom_shift = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[i]
-                                                             : c3d_default_denom_shift(i);
-        float dz_ratio = (ctx && ctx->has_dz_ratio) ? ctx->dz_ratio[i]
-                       : c3d_dz_ratio_for_kind(c3d_kind_h_count(sb.kind));
+        uint32_t denom_shift = c3d_default_denom_shift(i);
+        float dz_ratio = c3d_dz_ratio_for_kind(c3d_kind_h_count(sb.kind));
         float max_abs = s->has_max_abs ? s->max_abs_per_subband[i] : s->coeff_scale;
         total += c3d_estimate_one_subband_bytes(
             s->coeff_buf, &sb, step, dz_ratio, denom_shift,
-            (ctx && ctx->has_freq_tables) ? ctx->freqs[i] : NULL,
+            NULL,
             max_abs);
     }
     return total;
@@ -2883,7 +2764,6 @@ static double c3d_estimate_entropy_at_q(float q, const c3d_encoder *s,
  * Writes entropy payload into out[352..], fills qmul/subband_offset/lod_offset
  * tables.  Returns total chunk size (352 + entropy bytes). */
 static size_t c3d_emit_entropy_at_q(float q, c3d_encoder *s,
-                                    const c3d_ctx *ctx,
                                     uint8_t *out, size_t out_cap)
 {
     uint8_t *qmul_ptr   = out + 40;
@@ -2910,22 +2790,18 @@ static size_t c3d_emit_entropy_at_q(float q, c3d_encoder *s,
             if (s->has_allocator_steps) {
                 step = s->allocator_steps[i];
             } else {
-                float baseline = (ctx && ctx->has_quantizer_baseline) ? ctx->quantizer_baseline[i]
-                               : s->has_dyn_baselines                 ? s->dyn_baselines[i]
-                                                                        : c3d_subband_baseline(i);
+                float baseline = c3d_emit_baseline(s, i);
                 step = q * baseline * s->coeff_scale;
             }
-            uint32_t denom_shift = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[i]
-                                                                  : c3d_default_denom_shift(i);
-            float dz_ratio = (ctx && ctx->has_dz_ratio) ? ctx->dz_ratio[i]
-                           : c3d_dz_ratio_for_kind(c3d_kind_h_count(sb.kind));
+            uint32_t denom_shift = c3d_default_denom_shift(i);
+            float dz_ratio = c3d_dz_ratio_for_kind(c3d_kind_h_count(sb.kind));
             c3d_write_f32_le(qmul_ptr + 4 * i, step);
             c3d_write_u32_le(suboff_ptr + 4 * i, (uint32_t)entropy_pos);
             float max_abs = s->has_max_abs ? s->max_abs_per_subband[i] : s->coeff_scale;
             float fitted_alpha = c3d_default_alpha(i);
             size_t bytes = c3d_encode_one_subband(
                 s->coeff_buf, &sb, step, dz_ratio, denom_shift,
-                (ctx && ctx->has_freq_tables) ? ctx->freqs[i] : NULL,
+                NULL,
                 s->sub_symbols, s->sub_escapes,
                 s->rans_scratch, rans_scratch_size,
                 out + C3D_CHUNK_FIXED_SIZE + entropy_pos,
@@ -3008,15 +2884,11 @@ static size_t c3d_emit_entropy_at_q(float q, c3d_encoder *s,
             if (s->has_allocator_steps) {
                 step = s->allocator_steps[i];
             } else {
-                float baseline = (ctx && ctx->has_quantizer_baseline) ? ctx->quantizer_baseline[i]
-                               : s->has_dyn_baselines                 ? s->dyn_baselines[i]
-                                                                        : c3d_subband_baseline(i);
+                float baseline = c3d_emit_baseline(s, i);
                 step = q * baseline * s->coeff_scale;
             }
-            uint32_t denom_shift = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[i]
-                                                                  : c3d_default_denom_shift(i);
-            float dz_ratio = (ctx && ctx->has_dz_ratio) ? ctx->dz_ratio[i]
-                           : c3d_dz_ratio_for_kind(c3d_kind_h_count(sb.kind));
+            uint32_t denom_shift = c3d_default_denom_shift(i);
+            float dz_ratio = c3d_dz_ratio_for_kind(c3d_kind_h_count(sb.kind));
             float max_abs = s->has_max_abs ? s->max_abs_per_subband[i] : s->coeff_scale;
 
             float fitted_alpha = c3d_default_alpha(i);
@@ -3024,7 +2896,7 @@ static size_t c3d_emit_entropy_at_q(float q, c3d_encoder *s,
             size_t slot_cap = sub_max_offset[i + 1] - sub_max_offset[i];
             size_t bytes = c3d_encode_one_subband(
                 s->coeff_buf, &sb, step, dz_ratio, denom_shift,
-                (ctx && ctx->has_freq_tables) ? ctx->freqs[i] : NULL,
+                NULL,
                 t_syms, t_esc, t_rans, rans_scratch_size,
                 slot, slot_cap,
                 max_abs, &fitted_alpha);
@@ -3066,20 +2938,8 @@ static size_t c3d_emit_entropy_at_q(float q, c3d_encoder *s,
     return C3D_CHUNK_FIXED_SIZE + entropy_pos;
 }
 
-/* Sets out[6] and out[24..40] based on ctx.  Called after c3d_prepare_chunk
- * has written placeholder values. */
-static void c3d_write_ctx_header_fields(uint8_t *out, const c3d_ctx *ctx) {
-    if (ctx) {
-        out[6] = 1;   /* EXTERNAL */
-        memcpy(out + 24, ctx->self_hash, 16);
-    } else {
-        out[6] = 0;
-        memset(out + 24, 0, 16);
-    }
-}
-
 /* Public: encode with an explicit q.  One pass, no rate control. */
-size_t c3d_chunk_encode_at_q(const uint8_t *in, float q, const c3d_ctx *ctx,
+size_t c3d_chunk_encode_at_q(const uint8_t *in, float q,
                              uint8_t *out, size_t out_cap)
 {
     c3d_assert(in && out);
@@ -3088,13 +2948,12 @@ size_t c3d_chunk_encode_at_q(const uint8_t *in, float q, const c3d_ctx *ctx,
     c3d_assert(q >= C3D_Q_MIN && q <= C3D_Q_MAX);
 
     c3d_encoder *e = c3d_encoder_new();
-    size_t r = c3d_encoder_chunk_encode_at_q(e, in, q, ctx, out, out_cap);
+    size_t r = c3d_encoder_chunk_encode_at_q(e, in, q, out, out_cap);
     c3d_encoder_free(e);
     return r;
 }
 
 size_t c3d_encoder_chunk_encode_at_q(c3d_encoder *e, const uint8_t *in, float q,
-                                     const c3d_ctx *ctx,
                                      uint8_t *out, size_t out_cap)
 {
     c3d_assert(e && in && out);
@@ -3106,16 +2965,9 @@ size_t c3d_encoder_chunk_encode_at_q(c3d_encoder *e, const uint8_t *in, float q,
     e->has_dyn_baselines = false;
 
     float dc, cs;
-    bool has_entropy = c3d_prepare_chunk(in, out, e, ctx, &dc, &cs);
-    c3d_write_ctx_header_fields(out, ctx);
-    if (e->ll_prediction_active) {
-        out[C3D_CHUNK_FLAGS_OFFSET] |= C3D_FLAG_LL_PREDICTED;
-        out[C3D_CHUNK_FLAGS_OFFSET] |= (e->ll_prediction_source == 2)
-                                      ? C3D_FLAG_LL_FROM_PREV
-                                      : C3D_FLAG_LL_FROM_CTX;
-    }
+    bool has_entropy = c3d_prepare_chunk(in, out, e, &dc, &cs);
     if (!has_entropy) return C3D_CHUNK_FIXED_SIZE;
-    return c3d_emit_entropy_at_q(q, e, ctx, out, out_cap);
+    return c3d_emit_entropy_at_q(q, e, out, out_cap);
 }
 
 /* Forward declaration — defined in §Q2 below but called by the encoder
@@ -3125,17 +2977,17 @@ static float c3d_denoise_strength(size_t in_len);
 /* Public: rate-controlled encode targeting `target_ratio`.
  * Uses log-space bisection on q, capped at 8 iterations.  Last attempt's
  * output is committed (may not be best if didn't converge). */
-size_t c3d_chunk_encode(const uint8_t *in, float target_ratio, const c3d_ctx *ctx,
+size_t c3d_chunk_encode(const uint8_t *in, float target_ratio,
                         uint8_t *out, size_t out_cap)
 {
     c3d_encoder *e = c3d_encoder_new();
-    size_t r = c3d_encoder_chunk_encode(e, in, target_ratio, ctx, out, out_cap);
+    size_t r = c3d_encoder_chunk_encode(e, in, target_ratio, out, out_cap);
     c3d_encoder_free(e);
     return r;
 }
 
 size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
-                                float target_ratio, const c3d_ctx *ctx,
+                                float target_ratio,
                                 uint8_t *out, size_t out_cap)
 {
     c3d_assert(e && in && out);
@@ -3152,14 +3004,7 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
     e->has_dyn_baselines = true;
 
     float dc, cs;
-    bool has_entropy = c3d_prepare_chunk(in, out, e, ctx, &dc, &cs);
-    c3d_write_ctx_header_fields(out, ctx);
-    if (e->ll_prediction_active) {
-        out[C3D_CHUNK_FLAGS_OFFSET] |= C3D_FLAG_LL_PREDICTED;
-        out[C3D_CHUNK_FLAGS_OFFSET] |= (e->ll_prediction_source == 2)
-                                      ? C3D_FLAG_LL_FROM_PREV
-                                      : C3D_FLAG_LL_FROM_CTX;
-    }
+    bool has_entropy = c3d_prepare_chunk(in, out, e, &dc, &cs);
     size_t total;
     if (!has_entropy) {
         return C3D_CHUNK_FIXED_SIZE;
@@ -3174,7 +3019,7 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
      * data.  The hybrid allocator below fires by default. */
     e->has_allocator_steps = false;
     if (getenv("C3D_RD_ALLOCATOR")) {
-        c3d_rd_allocate(e, ctx, target_bytes_d);
+        c3d_rd_allocate(e, target_bytes_d);
     }
 
     /* Warm-start q from the previous chunk when target_ratio hasn't changed.
@@ -3216,7 +3061,7 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
     double prev_log_q = 0.0, prev_log_b = 0.0;
     bool have_prev = false;
     for (int iter = 0; iter < 10 && !e->has_allocator_steps; ++iter) {
-        double est_bytes = c3d_estimate_entropy_at_q(q, e, ctx);
+        double est_bytes = c3d_estimate_entropy_at_q(q, e);
         double err = est_bytes - target_bytes_d;
         double rel = (err < 0 ? -err : err) / target_bytes_d;
         if (rel < 0.01) break;
@@ -3272,7 +3117,7 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
      * Disable via C3D_NO_RD=1 for speed-critical paths. */
     if (!e->has_allocator_steps && !getenv("C3D_NO_RD")) {
         /* Pass 1: emit at global q. */
-        total = c3d_emit_entropy_at_q(q, e, ctx, out, out_cap);
+        total = c3d_emit_entropy_at_q(q, e, out, out_cap);
         double target_entropy = (double)(total - C3D_CHUNK_FIXED_SIZE);
 
         /* Read actual per-subband bytes from the emitted header. */
@@ -3289,7 +3134,7 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
         }
 
         /* Pass 2: calibrated R-D optimization + re-emit. */
-        c3d_rd_allocate_hybrid(e, ctx, target_entropy, q, actual_sb);
+        c3d_rd_allocate_hybrid(e, target_entropy, q, actual_sb);
 
         /* §T3b: skip the second emit when the allocator's steps are within
          * ±1% of the global step everywhere — pass 1's output already
@@ -3297,10 +3142,7 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
          * where the global-q allocation is already R-D optimal. */
         bool degenerate = true;
         for (unsigned s = 0; s < C3D_N_SUBBANDS; ++s) {
-            float baseline = (ctx && ctx->has_quantizer_baseline)
-                            ? ctx->quantizer_baseline[s]
-                            : (e->has_dyn_baselines ? e->dyn_baselines[s]
-                                                    : c3d_subband_baseline(s));
+            float baseline = c3d_emit_baseline(e, s);
             float global_step = q * baseline * e->coeff_scale;
             float ratio = (global_step > 0.0f)
                         ? e->allocator_steps[s] / global_step : 1.0f;
@@ -3310,10 +3152,10 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
             e->has_allocator_steps = false;
             /* total + out are already from pass 1 with global steps. */
         } else {
-            total = c3d_emit_entropy_at_q(q, e, ctx, out, out_cap);
+            total = c3d_emit_entropy_at_q(q, e, out, out_cap);
         }
     } else {
-        total = c3d_emit_entropy_at_q(q, e, ctx, out, out_cap);
+        total = c3d_emit_entropy_at_q(q, e, out, out_cap);
     }
 
     /* In-loop denoiser (§Q2 v2): encoder picks the post-decode denoise alpha
@@ -3334,67 +3176,125 @@ size_t c3d_encoder_chunk_encode(c3d_encoder *e, const uint8_t *in,
     e->last_q = q;
     e->last_target_ratio = target_ratio;
 
-    /* §S2 — update prev_ll5 with this chunk's decoder-equivalent
-     * reconstructed LL_5, so the next chunk in Morton order can use
-     * it as a prediction reference.  Only runs when inter-chunk
-     * prediction has been explicitly enabled (shard-sequential mode)
-     * — standalone encodes stay byte-deterministic. */
-    if (e->inter_chunk_enabled && total > C3D_CHUNK_FIXED_SIZE) {
-        float step0   = c3d_read_f32_le(out + 40);   /* qmul[0] */
-        uint8_t av    = out[C3D_CHUNK_ALPHA_OFFSET + 0];
-        float alpha0  = av ? c3d_alpha_from_u8(av) : c3d_default_alpha(0);
-        float dz0     = c3d_dz_half_for_kind(0, step0);
-        const float *ref_used = NULL;
-        if (e->ll_prediction_active) {
-            ref_used = (e->ll_prediction_source == 2) ? e->prev_ll5
-                     : (e->ll_prediction_source == 1 && ctx) ? ctx->ll_reference
-                     : NULL;
-        }
-        float new_ll5[512];
-        size_t k = 0;
-        for (unsigned z = 0; z < 8; ++z)
-        for (unsigned y = 0; y < 8; ++y)
-        for (unsigned x = 0; x < 8; ++x) {
-            float resid = e->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
-            int32_t qv = c3d_quant(resid, step0, dz0);
-            float recon_resid = c3d_dequant(qv, step0, dz0, alpha0);
-            new_ll5[k] = ref_used ? recon_resid + ref_used[k] : recon_resid;
-            k++;
-        }
-        memcpy(e->prev_ll5, new_ll5, sizeof new_ll5);
-        e->has_prev_ll5 = true;
-    }
-
     return total;
 }
 
-void c3d_encoder_reset_inter_chunk(c3d_encoder *e) {
-    c3d_assert(e);
-    e->has_prev_ll5 = false;
-    e->last_q = 0.0f;
-    e->last_target_ratio = 0.0f;
-}
-
-void c3d_encoder_enable_inter_chunk(c3d_encoder *e, bool enabled) {
-    c3d_assert(e);
-    e->inter_chunk_enabled = enabled;
-    if (!enabled) e->has_prev_ll5 = false;
-}
-
 size_t c3d_chunk_encode_max_size(void) { return C3D_CHUNK_ENCODE_MAX_SIZE; }
+
+/* Fill `out` from `in`, replacing every voxel with value 0 by the minimum
+ * non-zero value found in `in`.  For scroll data preprocessed to zero all
+ * voxels below threshold, the minimum non-zero value is the threshold itself,
+ * so this reproduces floor-clamp semantics automatically — air and material
+ * sit at the same floor, so the DWT sees no boundary step and the detail
+ * bands stay concentrated near zero.  If the input contains no non-zero
+ * voxels, the output is a verbatim copy (the regular encoder's all-zero
+ * fast path handles that case cheaply). */
+static void c3d_fill_mask_ignore(const uint8_t *restrict in,
+                                 uint8_t *restrict out)
+{
+    uint8_t m_min = 0;
+    bool any_nonzero = false;
+    for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) {
+        uint8_t v = in[i];
+        if (v != 0) {
+            if (!any_nonzero || v < m_min) m_min = v;
+            any_nonzero = true;
+        }
+    }
+    if (!any_nonzero) {
+        memcpy(out, in, C3D_VOXELS_PER_CHUNK);
+        return;
+    }
+    for (size_t i = 0; i < C3D_VOXELS_PER_CHUNK; ++i) {
+        uint8_t v = in[i];
+        out[i] = v == 0 ? m_min : v;
+    }
+}
+
+/* Ensure e->in_scratch is allocated.  Called from the _masked entry points. */
+static void c3d_encoder_ensure_in_scratch(c3d_encoder *e) {
+    if (!e->in_scratch) {
+        e->in_scratch = aligned_alloc(C3D_ALIGN, C3D_VOXELS_PER_CHUNK);
+        c3d_assert(e->in_scratch);
+    }
+}
+
+/* Public: rate-controlled encode treating 0-valued voxels as don't-care.
+ *
+ * The encoder replaces every 0-voxel with the minimum non-zero value from
+ * the input before running the standard encode pipeline.  The output
+ * bitstream is a regular v1 chunk that any c3d decoder can read; no format
+ * changes, no version bump.
+ *
+ * Caller contract:
+ *   - Mark don't-care voxels by setting them to 0 in the input.
+ *   - At display / use time, re-apply your mask to re-zero those regions.
+ *     Small non-zero values (typically 1–3) may appear in previously-zero
+ *     regions due to wavelet ringing; either threshold them away or use
+ *     your own mask to gate decoded output.
+ *
+ * When is the win worth it?  When a meaningful fraction of voxels carry no
+ * information the caller cares about (e.g. air / void in CT scans).  On
+ * Vesuvius scroll data with ~40% air, c3d_encoder_chunk_encode_masked gives
+ * roughly +1 dB full-cube PSNR at matched target ratio vs compressing the
+ * raw noisy air region, and slightly better material-only PSNR.  The gain
+ * grows with air fraction. */
+size_t c3d_encoder_chunk_encode_masked(c3d_encoder *e, const uint8_t *in,
+                                       float target_ratio,
+                                       uint8_t *out, size_t out_cap)
+{
+    c3d_assert(e && in && out);
+    c3d_check_voxel_alignment(in);
+    c3d_encoder_ensure_in_scratch(e);
+    c3d_fill_mask_ignore(in, e->in_scratch);
+    return c3d_encoder_chunk_encode(e, e->in_scratch, target_ratio,
+                                    out, out_cap);
+}
+
+/* Public: _at_q variant of the masked encode — bypasses rate control, uses
+ * the given q directly.  Useful for R-D sweeps and deterministic tests. */
+size_t c3d_encoder_chunk_encode_masked_at_q(c3d_encoder *e, const uint8_t *in,
+                                            float q,
+                                            uint8_t *out, size_t out_cap)
+{
+    c3d_assert(e && in && out);
+    c3d_check_voxel_alignment(in);
+    c3d_encoder_ensure_in_scratch(e);
+    c3d_fill_mask_ignore(in, e->in_scratch);
+    return c3d_encoder_chunk_encode_at_q(e, e->in_scratch, q, out, out_cap);
+}
+
+/* Stateless wrappers — allocate a fresh encoder per call. */
+size_t c3d_chunk_encode_masked(const uint8_t *in, float target_ratio,
+                               uint8_t *out, size_t out_cap)
+{
+    c3d_encoder *e = c3d_encoder_new();
+    size_t r = c3d_encoder_chunk_encode_masked(e, in, target_ratio, out, out_cap);
+    c3d_encoder_free(e);
+    return r;
+}
+
+size_t c3d_chunk_encode_masked_at_q(const uint8_t *in, float q,
+                                    uint8_t *out, size_t out_cap)
+{
+    c3d_encoder *e = c3d_encoder_new();
+    size_t r = c3d_encoder_chunk_encode_masked_at_q(e, in, q, out, out_cap);
+    c3d_encoder_free(e);
+    return r;
+}
 
 /* §I3.  Batched multi-chunk encode — loop the single-chunk API. */
 void c3d_encoder_chunks_encode(c3d_encoder *e,
                                const uint8_t *const *inputs,
                                size_t n_chunks,
-                               float target_ratio, const c3d_ctx *ctx,
+                               float target_ratio,
                                uint8_t *const *outs,
                                size_t *out_sizes)
 {
     c3d_assert(e && inputs && outs && out_sizes);
     for (size_t i = 0; i < n_chunks; ++i) {
         out_sizes[i] = c3d_encoder_chunk_encode(
-            e, inputs[i], target_ratio, ctx, outs[i], C3D_CHUNK_ENCODE_MAX_SIZE);
+            e, inputs[i], target_ratio, outs[i], C3D_CHUNK_ENCODE_MAX_SIZE);
     }
 }
 
@@ -3729,7 +3629,7 @@ static void c3d_decode_one_subband(
 
 void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
                                   const uint8_t *in, size_t in_len, uint8_t lod,
-                                  const c3d_ctx *ctx, uint8_t *out)
+                                  uint8_t *out)
 {
     c3d_assert(d && in && out);
     c3d_check_voxel_alignment(out);
@@ -3738,14 +3638,6 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
     c3d_assert(memcmp(in, "C3DC", 4) == 0);
     uint16_t version = c3d_read_u16_le(in + 4);
     c3d_assert(version == 1);
-    uint8_t context_mode = in[6];
-    c3d_assert(context_mode == 0 || context_mode == 1);
-    if (context_mode == 1) {
-        c3d_assert(ctx != NULL);
-        uint8_t id[16];
-        c3d_ctx_id(ctx, id);
-        c3d_assert(memcmp(id, in + 24, 16) == 0);
-    }
 
     float dc_offset   = c3d_read_f32_le(in + 8);
     float coeff_scale = c3d_read_f32_le(in + 12);
@@ -3770,26 +3662,7 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
 
     unsigned n_sb = c3d_n_subbands_for_lod[lod];
 
-    /* Warm the per-subband EXTERNAL-table cache when the ctx changes.  All
-     * 36 tables rebuild in one batch so the per-chunk decode loop below can
-     * skip c3d_rans_build_tables on any subband that uses ctx freqs. */
     const c3d_rans_tables *cached_ext = NULL;
-    if (ctx && ctx->has_freq_tables) {
-        uint8_t ctx_id[16];
-        c3d_ctx_id(ctx, ctx_id);
-        if (!d->cached_valid || memcmp(d->cached_ctx_id, ctx_id, 16) != 0) {
-            if (!d->cached_tables)
-                d->cached_tables = calloc(C3D_N_SUBBANDS, sizeof *d->cached_tables);
-            c3d_assert(d->cached_tables);
-            for (unsigned sc = 0; sc < C3D_N_SUBBANDS; ++sc) {
-                c3d_rans_build_tables(&d->cached_tables[sc],
-                                      ctx->denom_shifts[sc], ctx->freqs[sc], 65);
-            }
-            memcpy(d->cached_ctx_id, ctx_id, 16);
-            d->cached_valid = true;
-        }
-        cached_ext = d->cached_tables;
-    }
 
     /* §T9 — quality-scalable truncation.  If `in_len` is shorter than the
      * emitted chunk (caller truncated for streaming / bandwidth-adaptive
@@ -3846,16 +3719,13 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
             c3d_subband_info_of(s, &sb);
             float step  = c3d_read_f32_le(qmul_ptr + 4 * s);
             float alpha;
-            if (ctx && ctx->has_laplacian_alpha) {
-                alpha = ctx->laplacian_alpha[s];
-            } else {
+            {
                 uint8_t av = alpha_ptr[s];
                 alpha = av ? c3d_alpha_from_u8(av) : c3d_default_alpha(s);
             }
-            const uint32_t *ext_freqs = (ctx && ctx->has_freq_tables) ? ctx->freqs[s] : NULL;
-            uint32_t ext_ds           = (ctx && ctx->has_freq_tables) ? ctx->denom_shifts[s] : 0u;
-            float dz_ratio = (ctx && ctx->has_dz_ratio) ? ctx->dz_ratio[s]
-                           : c3d_dz_ratio_for_kind(c3d_kind_h_count(sb.kind));
+            const uint32_t *ext_freqs = NULL;
+            uint32_t ext_ds           = 0u;
+            float dz_ratio = c3d_dz_ratio_for_kind(c3d_kind_h_count(sb.kind));
             uint32_t sub_start = c3d_read_u32_le(suboff_ptr + 4 * s);
             uint32_t sub_end   = (s + 1 < n_sb)
                                ? c3d_read_u32_le(suboff_ptr + 4 * (s + 1))
@@ -3877,46 +3747,6 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
         for (uint32_t y = sbz.y0; y < sbz.y0 + sbz.side; ++y)
         for (uint32_t x = sbz.x0; x < sbz.x0 + sbz.side; ++x)
             d->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x] = 0.0f;
-    }
-
-    /* §T1b + §S2 — add LL_5 reference back per the chunk's flag bits.
-     * FROM_PREV: decoder must have consumed the Morton-prev chunk
-     * already (shard-sequential decode).  FROM_CTX: decoder must have
-     * the ctx with has_ll_reference set.  Missing source → panic. */
-    uint8_t flags = in[C3D_CHUNK_FLAGS_OFFSET];
-    const float *ll_ref = NULL;
-    if (flags & C3D_FLAG_LL_PREDICTED) {
-        if (flags & C3D_FLAG_LL_FROM_PREV) {
-            c3d_assert(d->has_prev_ll5);
-            ll_ref = d->prev_ll5;
-        } else if (flags & C3D_FLAG_LL_FROM_CTX) {
-            c3d_assert(ctx && ctx->has_ll_reference);
-            ll_ref = ctx->ll_reference;
-        }
-    }
-    if (ll_ref) {
-        size_t k = 0;
-        for (unsigned z = 0; z < 8; ++z)
-        for (unsigned y = 0; y < 8; ++y)
-        for (unsigned x = 0; x < 8; ++x) {
-            d->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x]
-                += ll_ref[k++];
-        }
-    }
-
-    /* §S2 — snapshot this chunk's fully-reconstructed LL_5 for the next
-     * chunk's Morton-neighbor prediction.  Taken BEFORE IDWT so the
-     * residual + reference sum is available in coeff_buf at subband 0
-     * positions; after IDWT those positions would hold spatial data. */
-    if (lod == 0) {
-        size_t k = 0;
-        for (unsigned z = 0; z < 8; ++z)
-        for (unsigned y = 0; y < 8; ++y)
-        for (unsigned x = 0; x < 8; ++x) {
-            d->prev_ll5[k++] = d->coeff_buf[
-                z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
-        }
-        d->has_prev_ll5 = true;
     }
 
     unsigned n_synth = C3D_N_DWT_LEVELS - lod;
@@ -3961,14 +3791,9 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
 }
 
 void c3d_decoder_chunk_decode(c3d_decoder *d, const uint8_t *in, size_t in_len,
-                              const c3d_ctx *ctx, uint8_t *out)
+                              uint8_t *out)
 {
-    c3d_decoder_chunk_decode_lod(d, in, in_len, 0, ctx, out);
-}
-
-void c3d_decoder_reset_inter_chunk(c3d_decoder *d) {
-    c3d_assert(d);
-    d->has_prev_ll5 = false;
+    c3d_decoder_chunk_decode_lod(d, in, in_len, 0, out);
 }
 
 /* §I3.  Batched multi-chunk decode — loop the single-chunk API.  When all
@@ -3978,25 +3803,24 @@ void c3d_decoder_chunks_decode(c3d_decoder *d,
                                const uint8_t *const *ins,
                                const size_t *in_sizes,
                                size_t n_chunks,
-                               const c3d_ctx *ctx,
                                uint8_t *const *outs)
 {
     c3d_assert(d && ins && in_sizes && outs);
     for (size_t i = 0; i < n_chunks; ++i) {
-        c3d_decoder_chunk_decode_lod(d, ins[i], in_sizes[i], 0, ctx, outs[i]);
+        c3d_decoder_chunk_decode_lod(d, ins[i], in_sizes[i], 0, outs[i]);
     }
 }
 
 void c3d_chunk_decode_lod(const uint8_t *in, size_t in_len, uint8_t lod,
-                          const c3d_ctx *ctx, uint8_t *out)
+                          uint8_t *out)
 {
     c3d_decoder *d = c3d_decoder_new();
-    c3d_decoder_chunk_decode_lod(d, in, in_len, lod, ctx, out);
+    c3d_decoder_chunk_decode_lod(d, in, in_len, lod, out);
     c3d_decoder_free(d);
 }
 
-void c3d_chunk_decode(const uint8_t *in, size_t in_len, const c3d_ctx *ctx, uint8_t *out) {
-    c3d_chunk_decode_lod(in, in_len, 0, ctx, out);
+void c3d_chunk_decode(const uint8_t *in, size_t in_len, uint8_t *out) {
+    c3d_chunk_decode_lod(in, in_len, 0, out);
 }
 
 /* Cheap metadata peek — no entropy decode. */
@@ -4006,8 +3830,6 @@ void c3d_chunk_inspect(const uint8_t *in, size_t in_len, c3d_chunk_info *info) {
     c3d_assert(memcmp(in, "C3DC", 4) == 0);
     uint16_t version = c3d_read_u16_le(in + 4);
     c3d_assert(version == 1);
-    info->context_mode = in[6];
-    memcpy(info->context_id, in + 24, 16);
     info->dc_offset   = c3d_read_f32_le(in + 8);
     info->coeff_scale = c3d_read_f32_le(in + 12);
     const uint8_t *lodoff = in + 40 + 144 + 144;
@@ -4020,7 +3842,6 @@ bool c3d_chunk_validate(const uint8_t *in, size_t in_len) {
     if (!in || in_len < C3D_CHUNK_FIXED_SIZE)             return false;
     if (memcmp(in, "C3DC", 4) != 0)                       return false;
     if (c3d_read_u16_le(in + 4) != 1)                     return false;
-    if (in[6] > 1)                                         return false;   /* 0=SELF, 1=EXTERNAL */
 
     const uint8_t *suboff = in + 40 + 144;
     const uint8_t *lodoff = in + 40 + 144 + 144;
@@ -4057,405 +3878,6 @@ bool c3d_chunk_validate(const uint8_t *in, size_t in_len) {
     return true;
 }
 
-/* ========================================================================= *
- *  §J  Shard container (in-memory, Morton-indexed, no I/O)                  *
- * ========================================================================= *
- *
- * Shard file layout (PLAN §2.1):
- *    0       shard header (64 B)
- *    64      chunk index (4096 × 16 B = 64 KiB)  [Morton-ordered]
- *    65600   embedded .c3dx (0..65535 B, optional; ctx_offset/ctx_size in header)
- *    65600+ctx_size  chunk payloads (packed)
- *
- * In-memory representation tracks per-slot { data ptr, size, owned flag } so
- * the shard can hold a mix of borrowed (from parse) and owned (from put_chunk)
- * chunks. */
-
-#define C3D_SHARD_HEADER_SIZE  64u
-#define C3D_SHARD_INDEX_SIZE   (4096u * 16u)   /* 65 536 */
-#define C3D_SHARD_PAYLOADS_MIN_OFFSET (C3D_SHARD_HEADER_SIZE + C3D_SHARD_INDEX_SIZE)  /* 65 600 */
-
-typedef struct {
-    uint64_t      size;       /* 0 for ABSENT and ZERO                        */
-    uint64_t      raw_offset; /* for ABSENT: UINT64_MAX; for ZERO: 0; else arbitrary */
-    const uint8_t *data;      /* NULL for ABSENT/ZERO; else points at payload */
-    bool          owned;      /* true → free(data) on shard_free              */
-} c3d_shard_slot;
-
-/* Drop the `const` qualifier for calls into free().  Slots store `data` as
- * `const uint8_t *` because the common case (parsed shard) is a view into
- * caller-owned bytes.  When `owned` is set we allocated with malloc, so the
- * free call is legitimate; this wrapper encapsulates the cast to keep the
- * cast-qual warnings off the shipping build. */
-static inline void c3d_free_owned(const uint8_t *p) {
-    free((void *)(uintptr_t)p);
-}
-
-struct c3d_shard {
-    uint32_t       origin[3];
-    uint8_t        shard_lod;
-    c3d_shard_slot slots[4096];       /* indexed by Morton-12 of (cx, cy, cz)  */
-    /* Embedded context block.  ctx_bytes is the serialized form (owned);
-     * parsed_ctx is the parsed form (lazily built, owned). */
-    uint8_t       *ctx_bytes;
-    uint16_t       ctx_size;
-    c3d_ctx       *parsed_ctx;
-};
-
-static void c3d_shard_init(c3d_shard *s, const uint32_t origin[3], uint8_t shard_lod) {
-    memcpy(s->origin, origin, sizeof s->origin);
-    s->shard_lod = shard_lod;
-    for (unsigned i = 0; i < 4096; ++i) {
-        s->slots[i].size        = 0;
-        s->slots[i].raw_offset  = UINT64_MAX;
-        s->slots[i].data        = NULL;
-        s->slots[i].owned       = false;
-    }
-    s->ctx_bytes  = NULL;
-    s->ctx_size   = 0;
-    s->parsed_ctx = NULL;
-}
-
-c3d_shard *c3d_shard_new(const uint32_t origin[3], uint8_t shard_lod) {
-    c3d_shard *s = malloc(sizeof *s);
-    c3d_assert(s);
-    c3d_shard_init(s, origin, shard_lod);
-    return s;
-}
-
-void c3d_shard_free(c3d_shard *s) {
-    if (!s) return;
-    for (unsigned i = 0; i < 4096; ++i) {
-        if (s->slots[i].owned) c3d_free_owned(s->slots[i].data);
-    }
-    free(s->ctx_bytes);
-    c3d_ctx_free(s->parsed_ctx);
-    free(s);
-}
-
-/* Parse helper: validates header, populates slots.  If `deep_copy`, also
- * copies each chunk's payload bytes into heap allocations (slot.owned = true). */
-static void c3d_shard_parse_impl(c3d_shard *s, const uint8_t *in, size_t in_len,
-                                 bool deep_copy)
-{
-    c3d_assert(in_len >= C3D_SHARD_HEADER_SIZE + C3D_SHARD_INDEX_SIZE);
-    c3d_assert(memcmp(in, "C3DS", 4) == 0);
-    uint16_t version = c3d_read_u16_le(in + 4);
-    c3d_assert(version == 1);
-    uint8_t shard_lod = in[6];
-    uint32_t origin[3];
-    origin[0] = c3d_read_u32_le(in + 8);
-    origin[1] = c3d_read_u32_le(in + 12);
-    origin[2] = c3d_read_u32_le(in + 16);
-    uint64_t ctx_offset = c3d_read_u64_le(in + 20);
-    uint16_t ctx_size   = c3d_read_u16_le(in + 28);
-
-    c3d_shard_init(s, origin, shard_lod);
-
-    /* Embedded ctx support deferred; if present in the input, we'll copy its
-     * raw bytes so c3d_shard_serialize can emit them identically.  A future
-     * step 12 will parse them into a c3d_ctx. */
-    if (ctx_size > 0) {
-        c3d_assert(ctx_offset >= C3D_SHARD_PAYLOADS_MIN_OFFSET);
-        c3d_assert(ctx_offset + ctx_size <= in_len);
-        s->ctx_size  = ctx_size;
-        s->ctx_bytes = malloc(ctx_size);
-        c3d_assert(s->ctx_bytes);
-        memcpy(s->ctx_bytes, in + ctx_offset, ctx_size);
-    }
-
-    /* Index entries.  A PRESENT chunk has offset ≥ payloads-start-after-header.
-     * We require offset + size ≤ in_len for safety. */
-    const uint8_t *idx = in + C3D_SHARD_HEADER_SIZE;
-    for (unsigned m = 0; m < 4096; ++m) {
-        uint64_t off = c3d_read_u64_le(idx + 16 * m + 0);
-        uint64_t sz  = c3d_read_u64_le(idx + 16 * m + 8);
-        if (off == UINT64_MAX && sz == 0) {
-            /* ABSENT */
-            s->slots[m].raw_offset = UINT64_MAX;
-            s->slots[m].size       = 0;
-            s->slots[m].data       = NULL;
-            s->slots[m].owned      = false;
-        } else if (off == 0 && sz == 0) {
-            /* ZERO */
-            s->slots[m].raw_offset = 0;
-            s->slots[m].size       = 0;
-            s->slots[m].data       = NULL;
-            s->slots[m].owned      = false;
-        } else {
-            /* PRESENT */
-            c3d_assert(off >= C3D_SHARD_PAYLOADS_MIN_OFFSET);
-            c3d_assert(sz > 0);
-            c3d_assert(off + sz <= in_len);
-            s->slots[m].raw_offset = off;
-            s->slots[m].size       = sz;
-            if (deep_copy) {
-                uint8_t *buf = malloc(sz);
-                c3d_assert(buf);
-                memcpy(buf, in + off, sz);
-                s->slots[m].data  = buf;
-                s->slots[m].owned = true;
-            } else {
-                s->slots[m].data  = in + off;
-                s->slots[m].owned = false;
-            }
-        }
-    }
-}
-
-c3d_shard *c3d_shard_parse(const uint8_t *in, size_t in_len) {
-    c3d_shard *s = malloc(sizeof *s);
-    c3d_assert(s);
-    c3d_shard_parse_impl(s, in, in_len, false);
-    return s;
-}
-c3d_shard *c3d_shard_parse_copy(const uint8_t *in, size_t in_len) {
-    c3d_shard *s = malloc(sizeof *s);
-    c3d_assert(s);
-    c3d_shard_parse_impl(s, in, in_len, true);
-    return s;
-}
-
-/* Chunk slot accessors (Morton-indexed). */
-static unsigned c3d_shard_slot_idx(uint32_t cx, uint32_t cy, uint32_t cz) {
-    c3d_assert(cx < 16 && cy < 16 && cz < 16);
-    return (unsigned)c3d_morton12(cx, cy, cz);
-}
-
-c3d_chunk_state c3d_shard_chunk_state(const c3d_shard *s,
-                                      uint32_t cx, uint32_t cy, uint32_t cz)
-{
-    const c3d_shard_slot *sl = &s->slots[c3d_shard_slot_idx(cx, cy, cz)];
-    if (sl->size > 0)                                return C3D_CHUNK_PRESENT;
-    if (sl->raw_offset == 0 && sl->size == 0)        return C3D_CHUNK_ZERO;
-    return C3D_CHUNK_ABSENT;
-}
-
-uint32_t c3d_shard_chunk_count(const c3d_shard *s, c3d_chunk_state state) {
-    uint32_t n = 0;
-    for (unsigned i = 0; i < 4096; ++i) {
-        c3d_chunk_state st;
-        const c3d_shard_slot *sl = &s->slots[i];
-        if (sl->size > 0)                                st = C3D_CHUNK_PRESENT;
-        else if (sl->raw_offset == 0 && sl->size == 0)   st = C3D_CHUNK_ZERO;
-        else                                              st = C3D_CHUNK_ABSENT;
-        if (st == state) n++;
-    }
-    return n;
-}
-
-const uint8_t *c3d_shard_chunk_bytes(const c3d_shard *s,
-                                     uint32_t cx, uint32_t cy, uint32_t cz,
-                                     size_t *out_size)
-{
-    const c3d_shard_slot *sl = &s->slots[c3d_shard_slot_idx(cx, cy, cz)];
-    c3d_assert(sl->size > 0);   /* panic on ABSENT or ZERO per contract */
-    if (out_size) *out_size = (size_t)sl->size;
-    return sl->data;
-}
-
-void c3d_shard_put_chunk(c3d_shard *s,
-                         uint32_t cx, uint32_t cy, uint32_t cz,
-                         const uint8_t *in, size_t in_len)
-{
-    c3d_assert(in && in_len > 0);
-    c3d_shard_slot *sl = &s->slots[c3d_shard_slot_idx(cx, cy, cz)];
-    if (sl->owned) c3d_free_owned(sl->data);
-    uint8_t *buf = malloc(in_len);
-    c3d_assert(buf);
-    memcpy(buf, in, in_len);
-    sl->data       = buf;
-    sl->size       = in_len;
-    sl->raw_offset = 0;  /* will be recomputed on serialize */
-    sl->owned      = true;
-}
-
-void c3d_shard_mark_zero(c3d_shard *s, uint32_t cx, uint32_t cy, uint32_t cz) {
-    c3d_shard_slot *sl = &s->slots[c3d_shard_slot_idx(cx, cy, cz)];
-    if (sl->owned) c3d_free_owned(sl->data);
-    sl->data       = NULL;
-    sl->size       = 0;
-    sl->raw_offset = 0;  /* (0, 0) = ZERO sentinel */
-    sl->owned      = false;
-}
-
-/* c3d_shard_set_ctx and c3d_shard_ctx defined in §K after c3d_ctx struct. */
-
-size_t c3d_shard_max_serialized_size(const c3d_shard *s) {
-    size_t total = C3D_SHARD_HEADER_SIZE + C3D_SHARD_INDEX_SIZE + s->ctx_size;
-    for (unsigned i = 0; i < 4096; ++i) total += (size_t)s->slots[i].size;
-    return total;
-}
-
-size_t c3d_shard_serialize(const c3d_shard *s, uint8_t *out, size_t out_cap) {
-    size_t need = c3d_shard_max_serialized_size(s);
-    c3d_assert(out_cap >= need);
-
-    /* Header */
-    memcpy(out + 0, "C3DS", 4);
-    c3d_write_u16_le(out + 4, 1);
-    out[6] = s->shard_lod;
-    out[7] = 0;
-    c3d_write_u32_le(out + 8,  s->origin[0]);
-    c3d_write_u32_le(out + 12, s->origin[1]);
-    c3d_write_u32_le(out + 16, s->origin[2]);
-
-    uint64_t ctx_offset = (s->ctx_size > 0) ? C3D_SHARD_PAYLOADS_MIN_OFFSET : 0;
-    c3d_write_u64_le(out + 20, ctx_offset);
-    c3d_write_u16_le(out + 28, s->ctx_size);
-    memset(out + 30, 0, 34);  /* reserved2 */
-
-    /* Index (will overwrite after payloads are placed).  Start by zeroing;
-     * we'll fill slot by slot as we emit payloads. */
-    uint8_t *idx = out + C3D_SHARD_HEADER_SIZE;
-    /* Payload cursor: starts after header + index + ctx. */
-    uint64_t cursor = C3D_SHARD_PAYLOADS_MIN_OFFSET + s->ctx_size;
-
-    /* Copy embedded ctx. */
-    if (s->ctx_size > 0) {
-        memcpy(out + C3D_SHARD_PAYLOADS_MIN_OFFSET, s->ctx_bytes, s->ctx_size);
-    }
-
-    for (unsigned m = 0; m < 4096; ++m) {
-        const c3d_shard_slot *sl = &s->slots[m];
-        if (sl->size > 0) {
-            /* PRESENT */
-            c3d_write_u64_le(idx + 16 * m + 0, cursor);
-            c3d_write_u64_le(idx + 16 * m + 8, sl->size);
-            memcpy(out + cursor, sl->data, sl->size);
-            cursor += sl->size;
-        } else if (sl->raw_offset == 0 && sl->size == 0) {
-            /* ZERO sentinel */
-            c3d_write_u64_le(idx + 16 * m + 0, 0);
-            c3d_write_u64_le(idx + 16 * m + 8, 0);
-        } else {
-            /* ABSENT sentinel */
-            c3d_write_u64_le(idx + 16 * m + 0, UINT64_MAX);
-            c3d_write_u64_le(idx + 16 * m + 8, 0);
-        }
-    }
-
-    return (size_t)cursor;
-}
-
-/* --- Shard convenience wrappers ------------------------------------------ */
-
-void c3d_shard_encode_chunk(c3d_shard *s,
-                            uint32_t cx, uint32_t cy, uint32_t cz,
-                            const uint8_t *in, float target_ratio)
-{
-    uint8_t *buf = aligned_alloc(C3D_ALIGN, C3D_CHUNK_ENCODE_MAX_SIZE);
-    c3d_assert(buf);
-    const c3d_ctx *shard_ctx = c3d_shard_ctx(s);
-    size_t n = c3d_chunk_encode(in, target_ratio, shard_ctx, buf, C3D_CHUNK_ENCODE_MAX_SIZE);
-    c3d_shard_put_chunk(s, cx, cy, cz, buf, n);
-    free(buf);
-}
-
-/* --- Shard-level batch helpers ------------------------------------------- */
-
-void c3d_shard_auto_train_ctx(c3d_shard *s,
-                              const uint8_t *const *training_chunks,
-                              size_t n_training)
-{
-    c3d_assert(s && training_chunks);
-    if (n_training == 0) return;
-    c3d_ctx_builder *b = c3d_ctx_builder_new();
-    for (size_t i = 0; i < n_training; ++i) {
-        if (training_chunks[i]) c3d_ctx_builder_observe_chunk(b, training_chunks[i]);
-    }
-    c3d_ctx *ctx = c3d_ctx_builder_finish(b, /*include_freq_tables=*/true);
-    c3d_shard_set_ctx(s, ctx);
-    c3d_ctx_free(ctx);
-}
-
-void c3d_shard_encode_all(c3d_shard *s,
-                          const uint8_t *const *chunks,
-                          const uint32_t (*coords)[3],
-                          size_t n_chunks,
-                          float target_ratio)
-{
-    c3d_assert(s && chunks && coords);
-    if (n_chunks == 0) return;
-    /* Auto-train ctx if the caller hasn't provided one.  Use up to 64 of the
-     * input chunks as the training set — large enough to get stable freq
-     * tables and a representative LL_5 reference, small enough that ctx
-     * training is a small fraction of total encode time. */
-    if (!c3d_shard_ctx(s)) {
-        size_t n_train = n_chunks < 64 ? n_chunks : 64;
-        c3d_shard_auto_train_ctx(s, chunks, n_train);
-    }
-
-    /* §S2 — sort into Morton order and encode sequentially so each chunk's
-     * encode sees the previous chunk's decoded LL_5 as a neighbour
-     * prediction reference.  The encoder's prev_ll5 is reset at the start
-     * so the first chunk falls back to ctx->ll_reference (if any). */
-    size_t *order = malloc(n_chunks * sizeof *order);
-    uint32_t *morton = malloc(n_chunks * sizeof *morton);
-    c3d_assert(order && morton);
-    for (size_t i = 0; i < n_chunks; ++i) {
-        order[i]  = i;
-        morton[i] = c3d_morton12(coords[i][0], coords[i][1], coords[i][2]);
-    }
-    /* Insertion sort — plenty fast for 4096 entries, zero deps. */
-    for (size_t i = 1; i < n_chunks; ++i) {
-        size_t k = order[i];
-        uint32_t m = morton[k];
-        size_t j = i;
-        while (j > 0 && morton[order[j - 1]] > m) {
-            order[j] = order[j - 1];
-            --j;
-        }
-        order[j] = k;
-    }
-
-    c3d_encoder *enc = c3d_encoder_new();
-    c3d_encoder_enable_inter_chunk(enc, true);
-    c3d_encoder_reset_inter_chunk(enc);
-    uint8_t *buf = aligned_alloc(C3D_ALIGN, C3D_CHUNK_ENCODE_MAX_SIZE);
-    c3d_assert(buf);
-    const c3d_ctx *ctx = c3d_shard_ctx(s);
-    for (size_t i = 0; i < n_chunks; ++i) {
-        size_t ci = order[i];
-        size_t n = c3d_encoder_chunk_encode(enc, chunks[ci], target_ratio, ctx,
-                                             buf, C3D_CHUNK_ENCODE_MAX_SIZE);
-        c3d_shard_put_chunk(s, coords[ci][0], coords[ci][1], coords[ci][2], buf, n);
-    }
-    free(buf);
-    c3d_encoder_free(enc);
-    free(order);
-    free(morton);
-}
-
-void c3d_shard_decode_chunk_lod(const c3d_shard *s,
-                                uint32_t cx, uint32_t cy, uint32_t cz,
-                                uint8_t lod, uint8_t *out)
-{
-    c3d_assert(lod < C3D_N_LODS);
-    const c3d_shard_slot *sl = &s->slots[c3d_shard_slot_idx(cx, cy, cz)];
-    size_t out_side = (size_t)C3D_CHUNK_SIDE >> lod;
-    size_t out_vox  = out_side * out_side * out_side;
-
-    if (sl->size > 0) {
-        const c3d_ctx *shard_ctx = c3d_shard_ctx(s);
-        c3d_chunk_decode_lod(sl->data, (size_t)sl->size, lod, shard_ctx, out);
-        return;
-    }
-    if (sl->raw_offset == 0 && sl->size == 0) {
-        /* ZERO → fill with zero voxels. */
-        memset(out, 0, out_vox);
-        return;
-    }
-    /* ABSENT → panic per API contract. */
-    c3d_panic(__FILE__, __LINE__, "c3d_shard_decode_chunk on ABSENT slot");
-}
-
-void c3d_shard_decode_chunk(const c3d_shard *s,
-                            uint32_t cx, uint32_t cy, uint32_t cz,
-                            uint8_t *out)
-{
-    c3d_shard_decode_chunk_lod(s, cx, cy, cz, 0, out);
-}
 
 /* ========================================================================= *
  *  §13  c3d_downsample_chunk_2x (box 2^3 average)                           *
@@ -4480,407 +3902,4 @@ void c3d_downsample_chunk_2x(const uint8_t *in, uint32_t side, uint8_t *out) {
         if ((sum & 7u) == 4u && (rounded & 1u)) --rounded;
         out[z * half * half + y * half + x] = (uint8_t)rounded;
     }
-}
-
-size_t c3d_ctx_max_size(void) { return 65535; }
-
-/* ========================================================================= *
- *  §K  .c3dx context block parse/serialise + builder                         *
- * ========================================================================= *
- *
- * Wire format (PLAN §3.6):
- *    0   "C3DX"      char[4]
- *    4   version     u16       1
- *    6   block_size  u16       total including this header, ≤ 65535
- *    8   self_hash   u8[16]    c3d_hash128 of bytes [24..block_size)
- *   24   TLV records: u16 tag, u16 length_quads, u8 value[length_quads*4]
- *
- * v1 record tags:
- *   1 LAPLACIAN_ALPHA       36 × f32 in canonical subband order       (144 B = 36 quads)
- *   2 QUANTIZER_BASELINE    (not emitted by v1 builder; parser accepts)
- *   3 SUBBAND_FREQ_TABLES   concatenated 36 freq tables, 4-byte padded
- */
-
-#define C3D_TAG_LAPLACIAN_ALPHA     1u
-#define C3D_TAG_QUANTIZER_BASELINE  2u
-#define C3D_TAG_SUBBAND_FREQ_TABLES 3u
-#define C3D_TAG_LL_REFERENCE        4u   /* 512 × f32 = 2048 B = 512 quads */
-#define C3D_TAG_DZ_RATIO            5u   /* §T13: 36 × f32 = 144 B         */
-/* struct c3d_ctx defined in §G above. */
-
-/* --- Serialization helpers ----------------------------------------------- */
-
-/* Write a TLV record header (tag + length_quads) and return the offset past
- * the header; caller then writes `length_quads * 4` bytes of value. */
-static size_t c3d_write_tlv_header(uint8_t *out, size_t out_cap, size_t w,
-                                    uint16_t tag, uint16_t length_quads)
-{
-    c3d_assert(w + 4 + (size_t)length_quads * 4 <= out_cap);
-    c3d_write_u16_le(out + w + 0, tag);
-    c3d_write_u16_le(out + w + 2, length_quads);
-    return w + 4;
-}
-
-static size_t c3d_ctx_write_body(const c3d_ctx *ctx, uint8_t *out, size_t out_cap) {
-    c3d_assert(out_cap >= 24);
-    memcpy(out + 0, "C3DX", 4);
-    c3d_write_u16_le(out + 4, 1);
-    /* block_size and self_hash placeholder: overwritten by caller. */
-    memset(out + 6, 0, 2 + 16);
-
-    size_t w = 24;
-
-    if (ctx->has_laplacian_alpha) {
-        w = c3d_write_tlv_header(out, out_cap, w, C3D_TAG_LAPLACIAN_ALPHA, 36);
-        for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
-            c3d_write_f32_le(out + w, ctx->laplacian_alpha[i]); w += 4;
-        }
-    }
-    if (ctx->has_quantizer_baseline) {
-        w = c3d_write_tlv_header(out, out_cap, w, C3D_TAG_QUANTIZER_BASELINE, 36);
-        for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
-            c3d_write_f32_le(out + w, ctx->quantizer_baseline[i]); w += 4;
-        }
-    }
-    if (ctx->has_ll_reference) {
-        w = c3d_write_tlv_header(out, out_cap, w, C3D_TAG_LL_REFERENCE, 512);
-        for (unsigned i = 0; i < 512; ++i) {
-            c3d_write_f32_le(out + w, ctx->ll_reference[i]); w += 4;
-        }
-    }
-    if (ctx->has_dz_ratio) {
-        w = c3d_write_tlv_header(out, out_cap, w, C3D_TAG_DZ_RATIO, 36);
-        for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
-            c3d_write_f32_le(out + w, ctx->dz_ratio[i]); w += 4;
-        }
-    }
-    if (ctx->has_freq_tables) {
-        /* Serialize each subband's freq table back-to-back into a scratch, then
-         * emit as one TLV value with 4-byte padding. */
-        uint8_t *tmp = malloc(36 * 800);
-        c3d_assert(tmp);
-        size_t t = 0;
-        for (unsigned s = 0; s < C3D_N_SUBBANDS; ++s) {
-            t += c3d_freqs_serialise(ctx->denom_shifts[s], ctx->freqs[s],
-                                     tmp + t, 36 * 800 - t);
-        }
-        /* Pad to 4-byte boundary. */
-        size_t pad = (4u - (t & 3u)) & 3u;
-        memset(tmp + t, 0, pad);
-        size_t value_bytes = t + pad;
-        uint16_t length_quads = (uint16_t)(value_bytes / 4u);
-
-        w = c3d_write_tlv_header(out, out_cap, w, C3D_TAG_SUBBAND_FREQ_TABLES, length_quads);
-        c3d_assert(w + value_bytes <= out_cap);
-        memcpy(out + w, tmp, value_bytes);
-        w += value_bytes;
-        free(tmp);
-    }
-    return w;
-}
-
-size_t c3d_ctx_serialized_size(const c3d_ctx *ctx) {
-    c3d_assert(ctx);
-    return ctx->block_size;
-}
-
-size_t c3d_ctx_serialize(const c3d_ctx *ctx, uint8_t *out, size_t out_cap) {
-    c3d_assert(ctx && out);
-    c3d_assert(out_cap >= ctx->block_size);
-    size_t sz = c3d_ctx_write_body(ctx, out, out_cap);
-    c3d_assert(sz == ctx->block_size);
-    c3d_write_u16_le(out + 6, (uint16_t)sz);
-    memcpy(out + 8, ctx->self_hash, 16);
-    return sz;
-}
-
-void c3d_ctx_id(const c3d_ctx *ctx, uint8_t out[16]) {
-    c3d_assert(ctx && out);
-    memcpy(out, ctx->self_hash, 16);
-}
-
-void c3d_ctx_free(c3d_ctx *ctx) { free(ctx); }
-
-/* --- Ctx parse ----------------------------------------------------------- */
-
-c3d_ctx *c3d_ctx_parse(const uint8_t *in, size_t in_len) {
-    c3d_assert(in);
-    c3d_assert(in_len >= 24);
-    c3d_assert(memcmp(in, "C3DX", 4) == 0);
-    uint16_t version = c3d_read_u16_le(in + 4);
-    c3d_assert(version == 1);
-    uint16_t block_size = c3d_read_u16_le(in + 6);
-    c3d_assert(block_size >= 24 && block_size <= in_len);
-
-    /* Verify self_hash. */
-    uint8_t computed[16];
-    c3d_hash128(in + 24, (size_t)block_size - 24, computed);
-    c3d_assert(memcmp(computed, in + 8, 16) == 0);
-
-    c3d_ctx *ctx = calloc(1, sizeof *ctx);
-    c3d_assert(ctx);
-    memcpy(ctx->self_hash, computed, 16);
-    ctx->block_size = block_size;
-
-    /* Walk TLV records. */
-    size_t r = 24;
-    while (r < block_size) {
-        c3d_assert(r + 4 <= block_size);
-        uint16_t tag = c3d_read_u16_le(in + r + 0);
-        uint16_t lq  = c3d_read_u16_le(in + r + 2);
-        size_t vbytes = (size_t)lq * 4u;
-        c3d_assert(r + 4 + vbytes <= block_size);
-        const uint8_t *v = in + r + 4;
-
-        switch (tag) {
-        case C3D_TAG_LAPLACIAN_ALPHA:
-            c3d_assert(vbytes == C3D_N_SUBBANDS * 4u);
-            ctx->has_laplacian_alpha = true;
-            for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
-                ctx->laplacian_alpha[i] = c3d_read_f32_le(v + 4 * i);
-            }
-            break;
-        case C3D_TAG_QUANTIZER_BASELINE:
-            c3d_assert(vbytes == C3D_N_SUBBANDS * 4u);
-            ctx->has_quantizer_baseline = true;
-            for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
-                ctx->quantizer_baseline[i] = c3d_read_f32_le(v + 4 * i);
-            }
-            break;
-        case C3D_TAG_LL_REFERENCE:
-            c3d_assert(vbytes == 512u * 4u);
-            ctx->has_ll_reference = true;
-            for (unsigned i = 0; i < 512; ++i) {
-                ctx->ll_reference[i] = c3d_read_f32_le(v + 4 * i);
-            }
-            break;
-        case C3D_TAG_DZ_RATIO:
-            c3d_assert(vbytes == C3D_N_SUBBANDS * 4u);
-            ctx->has_dz_ratio = true;
-            for (unsigned i = 0; i < C3D_N_SUBBANDS; ++i) {
-                ctx->dz_ratio[i] = c3d_read_f32_le(v + 4 * i);
-            }
-            break;
-        case C3D_TAG_SUBBAND_FREQ_TABLES: {
-            ctx->has_freq_tables = true;
-            size_t rr = 0;
-            for (unsigned s = 0; s < C3D_N_SUBBANDS; ++s) {
-                uint32_t ds;
-                c3d_assert(rr < vbytes);
-                rr += c3d_freqs_parse(v + rr, vbytes - rr,
-                                      &ds, ctx->freqs[s]);
-                ctx->denom_shifts[s] = ds;
-            }
-            c3d_assert(rr <= vbytes);
-            /* Remaining vbytes - rr is zero padding; must be <4 and all-zero. */
-            c3d_assert(vbytes - rr < 4);
-            for (size_t k = rr; k < vbytes; ++k) c3d_assert(v[k] == 0);
-            break;
-        }
-        default:
-            /* Unknown tag: skip silently (forward-compatible). */
-            break;
-        }
-        r += 4 + vbytes;
-    }
-    c3d_assert(r == block_size);
-    return ctx;
-}
-
-/* --- Ctx builder --------------------------------------------------------- */
-
-struct c3d_ctx_builder {
-    uint64_t n_observed;
-    /* Per-subband symbol histograms, accumulated from all observed chunks at a
-     * fixed reference quantizer scalar (q_ref). */
-    uint32_t histograms[C3D_N_SUBBANDS][65];
-    float    q_ref;
-
-    /* §T1b — running sum of LL_5 coefficients across observed chunks.
-     * At builder_finish we divide by n_observed_nonempty to get the
-     * corpus-average LL_5 reference that chunks use for inter-chunk
-     * prediction. */
-    double   ll_sum[512];
-    uint64_t ll_n;
-
-    /* §T13 — per-subband dz_ratio to emit at finish.  Populated via
-     * c3d_ctx_builder_set_dz_ratio(); builder_finish() sets has_dz_ratio
-     * on the resulting ctx only when this array has been explicitly
-     * supplied by the caller (training tools / sweeps). */
-    bool     has_dz_ratio_override;
-    float    dz_ratio_override[C3D_N_SUBBANDS];
-
-    /* §T15 — per-subband Laplacian α override.  Same semantics as
-     * dz_ratio_override. */
-    bool     has_laplacian_alpha_override;
-    float    laplacian_alpha_override[C3D_N_SUBBANDS];
-};
-
-/* A moderate compression point used by the builder when accumulating histograms.
- * Picking q_ref too small → many distinct symbols → tables generalise poorly.
- * Picking too large → degenerate histograms that lose detail.  0.1 is a
- * reasonable middle ground matching "moderate" compression in our tests. */
-#define C3D_BUILDER_Q_REF 0.1f
-
-c3d_ctx_builder *c3d_ctx_builder_new(void) {
-    c3d_ctx_builder *b = calloc(1, sizeof *b);
-    c3d_assert(b);
-    b->q_ref = C3D_BUILDER_Q_REF;
-    return b;
-}
-
-void c3d_ctx_builder_free(c3d_ctx_builder *b) { free(b); }
-
-void c3d_ctx_builder_set_dz_ratio(c3d_ctx_builder *b, const float dz_ratio[36]) {
-    c3d_assert(b && dz_ratio);
-    memcpy(b->dz_ratio_override, dz_ratio, sizeof b->dz_ratio_override);
-    b->has_dz_ratio_override = true;
-}
-
-void c3d_ctx_builder_set_laplacian_alpha(c3d_ctx_builder *b,
-                                         const float alpha[36]) {
-    c3d_assert(b && alpha);
-    memcpy(b->laplacian_alpha_override, alpha, sizeof b->laplacian_alpha_override);
-    b->has_laplacian_alpha_override = true;
-}
-
-void c3d_ctx_builder_observe_chunk(c3d_ctx_builder *b, const uint8_t *in) {
-    c3d_assert(b);
-    c3d_check_voxel_alignment(in);
-
-    c3d_encoder *e = c3d_encoder_new();
-    uint8_t hdr_scratch[C3D_CHUNK_FIXED_SIZE];
-    float dc, cs;
-    bool nonempty = c3d_prepare_chunk(in, hdr_scratch, e, NULL, &dc, &cs);
-    if (nonempty) {
-        /* §T1b — accumulate the LL_5 subband (8³ block at origin) for
-         * the corpus-average reference.  coeff_buf has the raw post-DWT
-         * coefficients since ctx was NULL in prepare_chunk. */
-        size_t k = 0;
-        for (unsigned z = 0; z < 8; ++z)
-        for (unsigned y = 0; y < 8; ++y)
-        for (unsigned x = 0; x < 8; ++x) {
-            b->ll_sum[k++] += (double)e->coeff_buf[
-                z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
-        }
-        b->ll_n++;
-
-        for (unsigned sidx = 0; sidx < C3D_N_SUBBANDS; ++sidx) {
-            c3d_subband_info sb;
-            c3d_subband_info_of(sidx, &sb);
-            /* Match emit-time step = q * baseline * coeff_scale.  coeff_buf is
-             * now in raw (un-normalised) units so we must scale step into the
-             * same space. */
-            float step = b->q_ref * c3d_subband_baseline(sidx) * e->coeff_scale;
-            float dz_half = c3d_dz_half_for_kind(sb.kind, step);
-            bool prev_sign_zy[128 * 128];
-            memset(prev_sign_zy, 0, (size_t)sb.side * sb.side);   /* §T12 */
-            for (uint32_t z = sb.z0; z < sb.z0 + sb.side; ++z)
-            for (uint32_t y = sb.y0; y < sb.y0 + sb.side; ++y)
-            for (uint32_t x = sb.x0; x < sb.x0 + sb.side; ++x) {
-                float c = e->coeff_buf[z * C3D_STRIDE_Z + y * C3D_STRIDE_Y + x];
-                int32_t qv = c3d_quant(c, step, dz_half);
-                uint32_t esc_unused;
-                bool *sp = &prev_sign_zy[(y - sb.y0) * sb.side + (x - sb.x0)];
-                uint8_t sym = c3d_quant_to_symbol(qv, &esc_unused, sp);
-                b->histograms[sidx][sym]++;
-            }
-        }
-    }
-    c3d_encoder_free(e);
-    b->n_observed++;
-}
-
-c3d_ctx *c3d_ctx_builder_finish(c3d_ctx_builder *b, bool include_freq_tables) {
-    c3d_assert(b);
-    c3d_ctx *ctx = calloc(1, sizeof *ctx);
-    c3d_assert(ctx);
-
-    /* §T1b — corpus-average LL_5 reference (enabled whenever any nonempty
-     * chunk was observed).  Applied at encode/decode time iff the chunk
-     * header sets C3D_FLAG_LL_PREDICTED. */
-    if (b->ll_n > 0) {
-        ctx->has_ll_reference = true;
-        double inv = 1.0 / (double)b->ll_n;
-        for (unsigned i = 0; i < 512; ++i) {
-            ctx->ll_reference[i] = (float)(b->ll_sum[i] * inv);
-        }
-    }
-
-    if (include_freq_tables && b->n_observed > 0) {
-        ctx->has_freq_tables = true;
-        for (unsigned s = 0; s < C3D_N_SUBBANDS; ++s) {
-            uint32_t denom_shift = c3d_default_denom_shift(s);
-            /* Bump zero bins to 1 so every symbol has nonzero probability in
-             * the ctx table, but only when observations come from multiple
-             * chunks.  For a single-chunk observation the ctx matches the
-             * encoded chunk exactly and smoothing would only dilute freq[0]
-             * (adding 64 ones to a hist that sums to 262 K steals ≈0.02 bits
-             * per symbol on already-near-zero-cost subbands — a measured
-             * 10× regression on highly concentrated test chunks).  With
-             * multi-chunk observation the dilution is swamped by real
-             * symbol diversity and fallback-avoidance wins net. */
-            if (b->n_observed > 1) {
-                for (unsigned k = 0; k < 65; ++k)
-                    if (b->histograms[s][k] == 0) b->histograms[s][k] = 1;
-            }
-            c3d_normalise_freqs(b->histograms[s], denom_shift, ctx->freqs[s]);
-            ctx->denom_shifts[s] = denom_shift;
-        }
-    }
-
-    /* §T13 — propagate explicitly-supplied per-subband dz_ratio to the ctx. */
-    if (b->has_dz_ratio_override) {
-        ctx->has_dz_ratio = true;
-        memcpy(ctx->dz_ratio, b->dz_ratio_override,
-               sizeof ctx->dz_ratio);
-    }
-
-    /* §T15 — propagate per-subband Laplacian α override. */
-    if (b->has_laplacian_alpha_override) {
-        ctx->has_laplacian_alpha = true;
-        memcpy(ctx->laplacian_alpha, b->laplacian_alpha_override,
-               sizeof ctx->laplacian_alpha);
-    }
-
-    /* Compute block_size + self_hash by serializing to a scratch buffer with
-     * a zero placeholder for self_hash, then hashing bytes [24..block_size). */
-    uint8_t tmp[65535];
-    size_t sz = c3d_ctx_write_body(ctx, tmp, sizeof tmp);
-    c3d_assert(sz >= 24 && sz <= 65535);
-    c3d_write_u16_le(tmp + 6, (uint16_t)sz);
-    /* tmp[8..24) is still zero from the placeholder memset. */
-    c3d_hash128(tmp + 24, sz - 24, ctx->self_hash);
-    ctx->block_size = (uint16_t)sz;
-
-    c3d_ctx_builder_free(b);
-    return ctx;
-}
-
-/* --- Shard ↔ ctx wiring -------------------------------------------------- */
-
-void c3d_shard_set_ctx(c3d_shard *s, const c3d_ctx *ctx) {
-    c3d_assert(s);
-    free(s->ctx_bytes);    s->ctx_bytes = NULL; s->ctx_size = 0;
-    c3d_ctx_free(s->parsed_ctx); s->parsed_ctx = NULL;
-    if (!ctx) return;
-    size_t ctx_sz = c3d_ctx_serialized_size(ctx);
-    s->ctx_bytes = malloc(ctx_sz);
-    c3d_assert(s->ctx_bytes);
-    c3d_ctx_serialize(ctx, s->ctx_bytes, ctx_sz);
-    s->ctx_size = (uint16_t)ctx_sz;
-    s->parsed_ctx = c3d_ctx_parse(s->ctx_bytes, ctx_sz);
-}
-
-const c3d_ctx *c3d_shard_ctx(const c3d_shard *s) {
-    c3d_assert(s);
-    if (s->parsed_ctx != NULL) return s->parsed_ctx;
-    if (s->ctx_bytes != NULL) {
-        /* Lazily parse for shards constructed via c3d_shard_parse (non-copy).
-         * Cast away const for this cache fill; purely a memoisation. */
-        c3d_shard *mut = (c3d_shard *)(uintptr_t)s;
-        mut->parsed_ctx = c3d_ctx_parse(s->ctx_bytes, s->ctx_size);
-        return mut->parsed_ctx;
-    }
-    return NULL;
 }
