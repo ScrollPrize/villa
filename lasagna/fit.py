@@ -178,14 +178,14 @@ def main(argv: list[str] | None = None) -> int:
 
 	device = torch.device(data_cfg.device)
 
-	# Probe preprocessed zarr for scaledown and volume extent
+	# Probe preprocessed data for scaledown and volume extent (in base/VC3D coords)
 	prep_params = fit_data.get_preprocessed_params(str(data_cfg.input))
-	scaledown = data_cfg.downscale
-	volume_extent_fullres = None
-	if prep_params is not None:
-		scaledown = float(prep_params["scaledown"])
-		volume_extent_fullres = prep_params.get("volume_extent_fullres")
-		print(f"[fit] zarr scaledown={scaledown} volume_extent={volume_extent_fullres}", flush=True)
+	source_to_base = float(prep_params.get("source_to_base", 1.0))
+	# Model scaledown in base coords = channel_scaledown * source_to_base
+	scaledown = float(prep_params["scaledown"]) * source_to_base
+	volume_extent_fullres = prep_params.get("volume_extent_fullres")
+	print(f"[fit] scaledown={scaledown} (source_sd={prep_params['scaledown']} "
+		  f"source_to_base={source_to_base}) volume_extent={volume_extent_fullres}", flush=True)
 
 	# --- Init from seed (new model only) ---
 	is_new_model = model_cfg.model_input is None

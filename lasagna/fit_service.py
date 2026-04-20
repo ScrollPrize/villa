@@ -610,7 +610,7 @@ def main() -> None:
     global _data_dir, _gpu_pause_enabled
 
     p = argparse.ArgumentParser(description="Fit optimizer HTTP service for VC3D")
-    p.add_argument("--port", type=int, default=0, help="Port (0 = auto-select)")
+    p.add_argument("--port", type=int, default=9999, help="Port (default 9999)")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--data-dir", default=None,
                    help="Directory containing .lasagna.json datasets")

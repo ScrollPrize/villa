@@ -400,9 +400,12 @@ def blur_3d(data: FitData3D, sigma: float) -> None:
 def get_preprocessed_params(path: str) -> dict:
 	"""Probe .lasagna.json metadata for scaledown and volume extent.
 
-	Returns dict with keys 'scaledown', 'volume_extent_fullres'.
+	Returns dict with keys 'scaledown', 'volume_extent_fullres', 'source_to_base'.
+	volume_extent_fullres is in base (VC3D) coordinates.
+	scaledown is the finest channel scaledown relative to source volume.
 	"""
 	vol = LasagnaVolume.load(path)
+	s2b = vol.source_to_base
 	# Use finest-resolution group to determine volume extent
 	min_sd = min(g.scaledown for g in vol.groups.values())
 	# Find a group at finest resolution, open its zarr to get spatial dims
@@ -413,8 +416,17 @@ def get_preprocessed_params(path: str) -> dict:
 			if not isinstance(zsrc, zarr.Array):
 				raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
 			C, Z, Y, X = (int(v) for v in zsrc.shape)
-			volume_extent_fullres = (X * min_sd, Y * min_sd, Z * min_sd)
-			return {"scaledown": float(min_sd), "volume_extent_fullres": volume_extent_fullres}
+			# Extent in source coords, then scale to base (VC3D) coords
+			volume_extent_fullres = (
+				int(X * min_sd * s2b),
+				int(Y * min_sd * s2b),
+				int(Z * min_sd * s2b),
+			)
+			return {
+				"scaledown": float(min_sd),
+				"volume_extent_fullres": volume_extent_fullres,
+				"source_to_base": s2b,
+			}
 	raise ValueError(f"no groups in {path}")
 
 
@@ -479,33 +491,35 @@ def load_3d(
 	ny_t = _read_channel("ny")
 	pred_dt_t = _read_channel("pred_dt") if "pred_dt" in all_ch else None
 
-	# Build per-channel spacing from group scaledowns
-	# Primary spacing = cos channel spacing (finest expected resolution)
+	# Build per-channel spacing in base (VC3D) coordinates.
+	# spacing = channel_scaledown * source_to_base  (base voxels per zarr voxel)
+	s2b = vol.source_to_base
 	cos_group, _ = vol.channel_group("cos")
-	primary_sd = float(cos_group.scaledown)
+	primary_sd = float(cos_group.scaledown) * s2b
 	primary_spacing = (primary_sd, primary_sd, primary_sd)
 
 	channel_spacing: dict[str, tuple[float, float, float]] = {}
 	for name in ["cos", "grad_mag", "nx", "ny"] + (["pred_dt"] if pred_dt_t is not None else []):
 		g, _ = vol.channel_group(name)
-		sd = float(g.scaledown)
+		sd = float(g.scaledown) * s2b
 		channel_spacing[name] = (sd, sd, sd)
 
-	# Origin in source-volume coords
+	# Origin in base (VC3D) coords
 	if crop is not None:
 		x0, y0, z0 = (int(v) for v in crop[:3])
-		# Align to finest resolution grid
+		# Align to finest resolution grid (in base coords)
 		finest_sd = min(g.scaledown for g in vol.groups.values())
+		base_step = finest_sd * s2b
 		origin_fullres = (
-			float((x0 // finest_sd) * finest_sd),
-			float((y0 // finest_sd) * finest_sd),
-			float((z0 // finest_sd) * finest_sd),
+			float(int(x0 / base_step) * base_step),
+			float(int(y0 / base_step) * base_step),
+			float(int(z0 / base_step) * base_step),
 		)
 	else:
 		origin_fullres = (0.0, 0.0, 0.0)
 
 	print(f"[fit_data] load_3d: origin={origin_fullres} primary_spacing={primary_spacing} "
-		  f"source_to_base={vol.source_to_base}", flush=True)
+		  f"source_to_base={s2b}", flush=True)
 
 	return FitData3D(
 		cos=cos_t,
