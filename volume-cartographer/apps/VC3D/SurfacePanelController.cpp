@@ -92,6 +92,14 @@ SurfacePanelController::SurfacePanelController(const UiRefs& ui,
                 this, &SurfacePanelController::handleTreeSelectionChanged);
         connect(_ui.treeWidget, &QWidget::customContextMenuRequested,
                 this, &SurfacePanelController::showContextMenu);
+        connect(_ui.treeWidget, &QTreeWidget::itemDoubleClicked,
+                this, [this](QTreeWidgetItem* item, int /*column*/) {
+            if (!item) return;
+            const QString segId = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
+            if (!segId.isEmpty()) {
+                emit focusSurfaceRequested(segId);
+            }
+        });
     }
 }
 
@@ -870,6 +878,13 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
                 emit renameSurfaceRequested(segmentId);
             });
         }
+    }
+
+    if (selectedSegmentIds.size() == 1) {
+        QAction* focusAction = contextMenu.addAction(tr("Focus"));
+        connect(focusAction, &QAction::triggered, this, [this, segmentId]() {
+            emit focusSurfaceRequested(segmentId);
+        });
     }
 
     QAction* copyPathAction = contextMenu.addAction(tr("Copy Segment Path"));

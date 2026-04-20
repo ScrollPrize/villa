@@ -2550,6 +2550,20 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onRotateSurface(segmentId.toStdString());
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::focusSurfaceRequested,
+            this, [this](const QString& segmentId) {
+                if (!_state || !_state->vpkg()) return;
+                auto surf = _state->vpkg()->getSurface(segmentId.toStdString());
+                auto* quad = dynamic_cast<QuadSurface*>(surf.get());
+                if (!quad) return;
+                quad->ensureLoaded();
+                cv::Vec3f c = quad->center();
+                POI* poi = _state->poi("focus");
+                if (!poi) poi = new POI;
+                poi->p = c;
+                poi->n = {0, 0, 0};
+                _state->setPOI("focus", poi);
+            });
     connect(_surfacePanel.get(), &SurfacePanelController::alphaCompRefineRequested,
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onAlphaCompRefine(segmentId.toStdString());
