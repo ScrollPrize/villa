@@ -408,10 +408,13 @@ class CrossFrameZarrDataset(Dataset):
             self._matrix_zyx_label_to_image, fg_label
         )
 
-        # Snap each image center to a stride-aligned patch START such that
-        # the image center sits inside the patch.
-        image_starts = np.floor(fg_image - ps / 2.0).astype(np.int64)
-        image_starts = (image_starts // st) * st
+        # Snap each image center to the stride cell that CONTAINS it, so the
+        # resulting patch [start, start + ps) actually covers the image voxel
+        # that the label FG mapped to. (The old ``floor(c - ps/2) // st * st``
+        # snap could push the start so far that the patch no longer contained
+        # the FG voxel, producing empty label AABBs in __getitem__.)
+        image_centers = np.floor(fg_image).astype(np.int64)
+        image_starts = (image_centers // st) * st
 
         image_shape = np.asarray(self._image_shape, dtype=np.int64)
         keep = np.all(
@@ -426,6 +429,38 @@ class CrossFrameZarrDataset(Dataset):
         _stage(
             f"coarse scan: {fg_coarse.shape[0]} coarse FG -> "
             f"{unique.shape[0]} unique image-space patch starts"
+        )
+
+        # Verify each candidate by forward-mapping the patch corners back to
+        # label space and checking that the AABB is non-degenerate and inside
+        # the label volume. This catches positions where the coarse upscale +
+        # snap combination pushes the mapped label region out of bounds under
+        # rotation/shear (the Z-extent-zero case we saw in debug runs).
+        ps_c = np.asarray(self.patch_size, dtype=np.int64)
+        label_shape = np.asarray(self._labels_shape, dtype=np.int64)
+        corners_offsets = np.array([
+            [0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1],
+            [1, 1, 0], [1, 0, 1], [0, 1, 1], [1, 1, 1],
+        ], dtype=np.float64)
+        keep_verified = np.ones(unique.shape[0], dtype=bool)
+        for i, start in enumerate(unique):
+            corners = corners_offsets * ps_c + start
+            mapped = affine.apply_affine_zyx(
+                self._matrix_zyx_image_to_label, corners.astype(np.float64)
+            )
+            lo = np.floor(mapped.min(axis=0)).astype(np.int64)
+            hi = np.ceil(mapped.max(axis=0)).astype(np.int64)
+            if np.any(hi <= lo):
+                keep_verified[i] = False
+                continue
+            lo = np.clip(lo, 0, label_shape)
+            hi = np.clip(hi, 0, label_shape)
+            if np.any(hi <= lo):
+                keep_verified[i] = False
+        unique = unique[keep_verified]
+        _stage(
+            f"coarse scan: {keep_verified.sum()} / {len(keep_verified)} "
+            f"patches survive label-AABB verification"
         )
 
         candidates = [tuple(int(v) for v in row) for row in unique]

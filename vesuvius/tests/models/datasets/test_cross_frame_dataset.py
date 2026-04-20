@@ -285,12 +285,12 @@ def test_coarse_scan_level(tmp_path: Path):
     mgr.dataset_config["labels_scan_level"] = 1
 
     ds = CrossFrameZarrDataset(mgr, is_training=False)
-    # 64 FG voxels in the coarse (16^3) view, each mapped to an image
-    # center then snapped to the stride=16 grid, dedupes to {0, 16}^3 = 8
-    # starts under the identity transform with patch_size=16.
-    assert len(ds) == 8
-    positions = {tuple(int(v) for v in p) for p in ds._patches}
-    assert (16, 16, 16) in positions
+    # Under the identity transform, the 16^3 label FG cube at (16..32)^3
+    # maps to the single stride-aligned image patch at (16, 16, 16). The
+    # coarse scan enumerates 64 FG voxels in the 4x-downsampled view and
+    # they all snap to the same image start.
+    assert len(ds) == 1
+    assert tuple(ds._patches[0]) == (16, 16, 16)
 
 
 def test_empty_labels_raise(tmp_path):
