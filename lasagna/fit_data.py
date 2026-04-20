@@ -443,6 +443,7 @@ def load_3d(
 	"""
 	vol = LasagnaVolume.load(path)
 	gmag_enc = vol.grad_mag_encode_scale
+	s2b = vol.source_to_base
 
 	# Resolve which channels are available
 	all_ch = vol.all_channels()
@@ -462,7 +463,8 @@ def load_3d(
 		if len(shape) != 4:
 			raise ValueError(f"expected 4D CZYX zarr at {zarr_path}, got shape={shape}")
 
-		ds_i = group.scaledown
+		# Full base-to-zarr factor: crop is in base coords
+		ds_i = int(round(group.scaledown * s2b))
 		C, Z_all, Y_all, X_all = shape
 
 		if crop is not None:
@@ -478,7 +480,7 @@ def load_3d(
 			x1v, y1v, z1v = X_all, Y_all, Z_all
 
 		print(f"[fit_data] read {name} from {group.zarr_path} ch_idx={ch_idx} "
-			  f"scaledown={ds_i} shape={shape} "
+			  f"ds_base={ds_i} (sd={group.scaledown}*s2b={s2b}) shape={shape} "
 			  f"z=[{z0v}:{z1v}] y=[{y0v}:{y1v}] x=[{x0v}:{x1v}]", flush=True)
 
 		a = np.asarray(zsrc[ch_idx, z0v:z1v, y0v:y1v, x0v:x1v])
@@ -493,7 +495,6 @@ def load_3d(
 
 	# Build per-channel spacing in base (VC3D) coordinates.
 	# spacing = channel_scaledown * source_to_base  (base voxels per zarr voxel)
-	s2b = vol.source_to_base
 	cos_group, _ = vol.channel_group("cos")
 	primary_sd = float(cos_group.scaledown) * s2b
 	primary_spacing = (primary_sd, primary_sd, primary_sd)
