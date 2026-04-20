@@ -36,6 +36,11 @@ tr_config:
   optimizer: "SGD"
   initial_lr: 0.01
   weight_decay: 0.00003
+  # Skip torch.compile entirely: under DDP the first-compile phase was
+  # desyncing rank 0 (rank 0 stuck on CPU while ranks 1-7 blocked at the
+  # initial barrier). Plain eager-mode runs fine on H100 for this model size.
+  compile_policy: "off"
+  ddp_find_unused_parameters: false
 
 dataset_config:
   dataset_type: "cross_frame"
