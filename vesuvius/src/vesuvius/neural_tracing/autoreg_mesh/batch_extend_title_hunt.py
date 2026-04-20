@@ -377,6 +377,10 @@ def _title_hunt_extension_preset(
     device: str = "cuda",
     attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
     planner_mode: str = PLANNER_MODE_FAST,
+    seam_reconcile_enabled: bool = True,
+    seam_reconcile_band_width: int = 8,
+    seam_reconcile_smooth_radius: int = 8,
+    seam_reconcile_decay: float = 2.0,
 ) -> dict[str, Any]:
     return {
         "prompt_strips": int(TITLE_HUNT_PROMPT_STRIPS),
@@ -395,6 +399,10 @@ def _title_hunt_extension_preset(
         "distributed_gather_mode": "object",
         "attention_scaling_mode": str(attention_scaling_mode),
         "planner_mode": str(planner_mode),
+        "seam_reconcile_enabled": bool(seam_reconcile_enabled),
+        "seam_reconcile_band_width": int(seam_reconcile_band_width),
+        "seam_reconcile_smooth_radius": int(seam_reconcile_smooth_radius),
+        "seam_reconcile_decay": float(seam_reconcile_decay),
     }
 
 
@@ -518,6 +526,10 @@ def _run_direction_to_exhaustion(
     distributed_infer: bool = False,
     attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
     planner_mode: str = PLANNER_MODE_FAST,
+    seam_reconcile_enabled: bool = True,
+    seam_reconcile_band_width: int = 8,
+    seam_reconcile_smooth_radius: int = 8,
+    seam_reconcile_decay: float = 2.0,
     enforce_dry_run_quality_gate: bool = False,
     prompt_strips_override: int | None = None,
     predict_strips_override: int | None = None,
@@ -531,6 +543,10 @@ def _run_direction_to_exhaustion(
         device=str(device),
         attention_scaling_mode=str(attention_scaling_mode),
         planner_mode=str(planner_mode),
+        seam_reconcile_enabled=bool(seam_reconcile_enabled),
+        seam_reconcile_band_width=int(seam_reconcile_band_width),
+        seam_reconcile_smooth_radius=int(seam_reconcile_smooth_radius),
+        seam_reconcile_decay=float(seam_reconcile_decay),
     )
     if prompt_strips_override is not None:
         preset["prompt_strips"] = int(prompt_strips_override)
@@ -565,6 +581,10 @@ def _run_direction_to_exhaustion(
         distributed_gather_mode=str(preset["distributed_gather_mode"]),
         attention_scaling_mode=str(preset["attention_scaling_mode"]),
         planner_mode=str(preset["planner_mode"]),
+        seam_reconcile_enabled=bool(preset["seam_reconcile_enabled"]),
+        seam_reconcile_band_width=int(preset["seam_reconcile_band_width"]),
+        seam_reconcile_smooth_radius=int(preset["seam_reconcile_smooth_radius"]),
+        seam_reconcile_decay=float(preset["seam_reconcile_decay"]),
         call_validator=(
             (lambda summary, call_idx: _validate_dry_run_call(summary, direction=direction, call_idx=call_idx))
             if enforce_dry_run_quality_gate else None

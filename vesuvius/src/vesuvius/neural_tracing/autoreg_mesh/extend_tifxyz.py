@@ -87,6 +87,12 @@ class ExtensionIterationStats:
     model_only_new_band_frontier_coverage_fraction: float
     geometric_gap_fill_vertex_count: int
     geometric_gap_fill_frontier_count: int
+    seam_reconcile_vertex_count: int
+    seam_reconcile_frontier_count: int
+    seam_reconcile_mean_displacement: float
+    seam_reconcile_max_displacement: float
+    seam_edge_error_pre: float
+    seam_edge_error_post: float
 
 
 @dataclass(frozen=True)
@@ -1391,6 +1397,182 @@ def _apply_geometric_gap_fill(
     return geometric_vertex_count, geometric_frontier_count
 
 
+def _seam_axis(direction: str) -> int:
+    return 1 if direction in {"left", "right"} else 0
+
+
+def _seam_band_indices(direction: str, extension_shape: tuple[int, int, int], *, band_width: int) -> list[int]:
+    axis = _seam_axis(direction)
+    axis_size = int(extension_shape[axis])
+    band = max(1, min(int(band_width), axis_size))
+    if direction in {"left", "up"}:
+        return [int(idx) for idx in range(band)]
+    return [int(axis_size - 1 - idx) for idx in range(band)]
+
+
+def _get_extension_strip(grid: np.ndarray, direction: str, strip_idx: int) -> np.ndarray:
+    if direction in {"left", "right"}:
+        return grid[:, int(strip_idx), :].copy()
+    return grid[int(strip_idx), :, :].copy()
+
+
+def _set_extension_strip(grid: np.ndarray, direction: str, strip_idx: int, values: np.ndarray) -> None:
+    if direction in {"left", "right"}:
+        grid[:, int(strip_idx), :] = values
+        return
+    grid[int(strip_idx), :, :] = values
+
+
+def _seam_edge_error(boundary: np.ndarray, strip: np.ndarray) -> float:
+    valid = np.isfinite(boundary).all(axis=-1) & np.isfinite(strip).all(axis=-1)
+    if not bool(np.any(valid)):
+        return 0.0
+    return float(np.linalg.norm(strip[valid] - boundary[valid], axis=-1).mean())
+
+
+def _jacobi_relax_reconciled_band(
+    extension_grid: np.ndarray,
+    *,
+    direction: str,
+    band_indices: list[int],
+    fixed_strip_indices: set[int],
+    iterations: int = 3,
+) -> np.ndarray:
+    relaxed = extension_grid.copy()
+    if len(band_indices) <= 2:
+        return relaxed
+    axis = _seam_axis(direction)
+    band_position = {int(strip_idx): int(pos) for pos, strip_idx in enumerate(band_indices)}
+    for _ in range(int(iterations)):
+        updated = relaxed.copy()
+        for strip_idx in band_indices:
+            if int(strip_idx) in fixed_strip_indices:
+                continue
+            strip = _get_extension_strip(relaxed, direction, strip_idx)
+            strip_updated = strip.copy()
+            for frontier_idx in range(int(strip.shape[0])):
+                vertex = strip[frontier_idx]
+                if not np.isfinite(vertex).all():
+                    continue
+                neighbors: list[np.ndarray] = []
+                local_pos = band_position[int(strip_idx)]
+                if local_pos > 0:
+                    prev_strip = _get_extension_strip(relaxed, direction, band_indices[local_pos - 1])
+                    if np.isfinite(prev_strip[frontier_idx]).all():
+                        neighbors.append(prev_strip[frontier_idx])
+                if local_pos + 1 < len(band_indices):
+                    next_strip = _get_extension_strip(relaxed, direction, band_indices[local_pos + 1])
+                    if np.isfinite(next_strip[frontier_idx]).all():
+                        neighbors.append(next_strip[frontier_idx])
+                if frontier_idx > 0 and np.isfinite(strip[frontier_idx - 1]).all():
+                    neighbors.append(strip[frontier_idx - 1])
+                if frontier_idx + 1 < strip.shape[0] and np.isfinite(strip[frontier_idx + 1]).all():
+                    neighbors.append(strip[frontier_idx + 1])
+                if len(neighbors) >= 2:
+                    strip_updated[frontier_idx] = np.mean(np.stack(neighbors, axis=0), axis=0).astype(np.float32)
+            _set_extension_strip(updated, direction, strip_idx, strip_updated)
+        relaxed = updated
+    return relaxed
+
+
+def _reconcile_extension_seam(
+    working_grid: np.ndarray,
+    extension_grid: np.ndarray,
+    extension_provenance: np.ndarray,
+    *,
+    direction: str,
+    seam_reconcile_band_width: int,
+    seam_reconcile_smooth_radius: int,
+    seam_reconcile_decay: float,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float | int]]:
+    reconciled_grid = extension_grid.copy()
+    reconciled_provenance = extension_provenance.copy()
+    band_indices = _seam_band_indices(
+        direction,
+        tuple(int(v) for v in extension_grid.shape),
+        band_width=int(seam_reconcile_band_width),
+    )
+    if not band_indices:
+        return reconciled_grid, reconciled_provenance, {
+            "seam_reconcile_vertex_count": 0,
+            "seam_reconcile_frontier_count": 0,
+            "seam_reconcile_mean_displacement": 0.0,
+            "seam_reconcile_max_displacement": 0.0,
+            "seam_edge_error_pre": 0.0,
+            "seam_edge_error_post": 0.0,
+        }
+    seam_idx = int(band_indices[0])
+    outer_idx = int(band_indices[-1])
+    boundary, _interior = _frontier_boundary_and_interior_from_grid(working_grid, direction)
+    initial_grid = extension_grid.copy()
+    seam_strip_pre = _get_extension_strip(reconciled_grid, direction, seam_idx)
+    valid_boundary = np.isfinite(boundary).all(axis=-1)
+    valid_pre = valid_boundary & np.isfinite(seam_strip_pre).all(axis=-1)
+    seam_edge_error_pre = _seam_edge_error(boundary, seam_strip_pre)
+
+    displacement = np.zeros_like(boundary, dtype=np.float32)
+    displacement[valid_pre] = boundary[valid_pre] - seam_strip_pre[valid_pre]
+    smoothed_displacement = displacement.copy()
+    if seam_reconcile_smooth_radius > 0:
+        for axis_idx in range(3):
+            smoothed_displacement[:, axis_idx] = _smooth_frontier_scalar_field(
+                displacement[:, axis_idx],
+                valid_pre,
+                radius=int(seam_reconcile_smooth_radius),
+            )
+
+    seam_strip_post = seam_strip_pre.copy()
+    seam_strip_post[valid_boundary] = boundary[valid_boundary]
+    _set_extension_strip(reconciled_grid, direction, seam_idx, seam_strip_post)
+
+    for depth, strip_idx in enumerate(band_indices[1:], start=1):
+        strip = _get_extension_strip(reconciled_grid, direction, strip_idx)
+        valid_strip = valid_boundary & np.isfinite(strip).all(axis=-1)
+        if not bool(np.any(valid_strip)):
+            continue
+        weight = float(np.exp(-float(depth) / max(float(seam_reconcile_decay), 1e-6)))
+        strip[valid_strip] = strip[valid_strip] + (smoothed_displacement[valid_strip] * weight)
+        _set_extension_strip(reconciled_grid, direction, strip_idx, strip)
+
+    fixed_strip_indices = {seam_idx, outer_idx}
+    outer_anchor = _get_extension_strip(reconciled_grid, direction, outer_idx)
+    reconciled_grid = _jacobi_relax_reconciled_band(
+        reconciled_grid,
+        direction=direction,
+        band_indices=band_indices,
+        fixed_strip_indices=fixed_strip_indices,
+        iterations=3,
+    )
+    _set_extension_strip(reconciled_grid, direction, seam_idx, seam_strip_post)
+    _set_extension_strip(reconciled_grid, direction, outer_idx, outer_anchor)
+
+    reconciled_provenance = np.where(reconciled_provenance == 255, 255, 1).astype(np.uint8, copy=False)
+    if direction in {"left", "right"}:
+        reconciled_provenance[:, seam_idx] = np.where(reconciled_provenance[:, seam_idx] == 255, 255, 2)
+    else:
+        reconciled_provenance[seam_idx, :] = np.where(reconciled_provenance[seam_idx, :] == 255, 255, 2)
+
+    band_mask = np.zeros(reconciled_grid.shape[:2], dtype=bool)
+    if direction in {"left", "right"}:
+        band_mask[:, band_indices] = True
+    else:
+        band_mask[band_indices, :] = True
+    diff = reconciled_grid - initial_grid
+    changed_mask = band_mask & np.isfinite(initial_grid).all(axis=-1) & np.isfinite(reconciled_grid).all(axis=-1)
+    changed_norm = np.linalg.norm(diff, axis=-1)
+    changed_mask &= changed_norm > 1e-6
+    seam_edge_error_post = _seam_edge_error(boundary, _get_extension_strip(reconciled_grid, direction, seam_idx))
+    changed_values = changed_norm[changed_mask]
+    return reconciled_grid, reconciled_provenance, {
+        "seam_reconcile_vertex_count": int(changed_mask.sum()),
+        "seam_reconcile_frontier_count": int(valid_boundary.sum()),
+        "seam_reconcile_mean_displacement": float(changed_values.mean()) if changed_values.size > 0 else 0.0,
+        "seam_reconcile_max_displacement": float(changed_values.max()) if changed_values.size > 0 else 0.0,
+        "seam_edge_error_pre": float(seam_edge_error_pre),
+        "seam_edge_error_post": float(seam_edge_error_post),
+    }
+
+
 def _estimate_extension_points_planner(
     prompt_grid: np.ndarray,
     direction: str,
@@ -2689,6 +2871,10 @@ def extend_tifxyz_mesh(
     distributed_gather_mode: str = "object",
     attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
     planner_mode: str = PLANNER_MODE_FAST,
+    seam_reconcile_enabled: bool = True,
+    seam_reconcile_band_width: int = 8,
+    seam_reconcile_smooth_radius: int = 8,
+    seam_reconcile_decay: float = 2.0,
 ) -> dict[str, Any]:
     planner_mode = _normalize_planner_mode(planner_mode)
     if str(distributed_shard_mode) != "strided":
@@ -3005,6 +3191,24 @@ def extend_tifxyz_mesh(
                     counts=counts,
                     direction=direction,
                 )
+                seam_metrics = {
+                    "seam_reconcile_vertex_count": 0,
+                    "seam_reconcile_frontier_count": 0,
+                    "seam_reconcile_mean_displacement": 0.0,
+                    "seam_reconcile_max_displacement": 0.0,
+                    "seam_edge_error_pre": 0.0,
+                    "seam_edge_error_post": 0.0,
+                }
+                if bool(seam_reconcile_enabled) and bool(np.isfinite(extension_grid).all(axis=-1).any()):
+                    extension_grid, extension_provenance, seam_metrics = _reconcile_extension_seam(
+                        working_grid,
+                        extension_grid,
+                        extension_provenance,
+                        direction=direction,
+                        seam_reconcile_band_width=int(seam_reconcile_band_width),
+                        seam_reconcile_smooth_radius=int(seam_reconcile_smooth_radius),
+                        seam_reconcile_decay=float(seam_reconcile_decay),
+                    )
                 (
                     new_band_frontier_coverage_fraction,
                     new_band_cell_coverage_fraction,
@@ -3052,6 +3256,12 @@ def extend_tifxyz_mesh(
                         model_only_new_band_frontier_coverage_fraction=model_only_frontier_coverage_fraction,
                         geometric_gap_fill_vertex_count=int(geometric_gap_fill_vertex_count),
                         geometric_gap_fill_frontier_count=int(geometric_gap_fill_frontier_count),
+                        seam_reconcile_vertex_count=int(seam_metrics["seam_reconcile_vertex_count"]),
+                        seam_reconcile_frontier_count=int(seam_metrics["seam_reconcile_frontier_count"]),
+                        seam_reconcile_mean_displacement=float(seam_metrics["seam_reconcile_mean_displacement"]),
+                        seam_reconcile_max_displacement=float(seam_metrics["seam_reconcile_max_displacement"]),
+                        seam_edge_error_pre=float(seam_metrics["seam_edge_error_pre"]),
+                        seam_edge_error_post=float(seam_metrics["seam_edge_error_post"]),
                     )
                     post_state = {"stop_reason": None, "iteration_stat": vars(stat)}
                     iteration_stats.append(stat)
@@ -3076,6 +3286,12 @@ def extend_tifxyz_mesh(
                 iteration_diag["model_only_frontier_coverage_fraction"] = float(iteration_stats[-1].model_only_new_band_frontier_coverage_fraction)
                 iteration_diag["geometric_gap_fill_vertex_count"] = int(iteration_stats[-1].geometric_gap_fill_vertex_count)
                 iteration_diag["geometric_gap_fill_frontier_count"] = int(iteration_stats[-1].geometric_gap_fill_frontier_count)
+                iteration_diag["seam_reconcile_vertex_count"] = int(iteration_stats[-1].seam_reconcile_vertex_count)
+                iteration_diag["seam_reconcile_frontier_count"] = int(iteration_stats[-1].seam_reconcile_frontier_count)
+                iteration_diag["seam_reconcile_mean_displacement"] = float(iteration_stats[-1].seam_reconcile_mean_displacement)
+                iteration_diag["seam_reconcile_max_displacement"] = float(iteration_stats[-1].seam_reconcile_max_displacement)
+                iteration_diag["seam_edge_error_pre"] = float(iteration_stats[-1].seam_edge_error_pre)
+                iteration_diag["seam_edge_error_post"] = float(iteration_stats[-1].seam_edge_error_post)
                 planner_diagnostics_payload["iterations"].append(iteration_diag)
                 planner_diagnostics_path.write_text(json.dumps(planner_diagnostics_payload, indent=2))
             if planner_mode == PLANNER_MODE_COVERAGE_FIRST and runtime.is_main_process:
@@ -3138,6 +3354,26 @@ def extend_tifxyz_mesh(
                 ),
                 "geometric_gap_fill_vertex_count": int(sum(item.geometric_gap_fill_vertex_count for item in iteration_stats)),
                 "geometric_gap_fill_frontier_count": int(sum(item.geometric_gap_fill_frontier_count for item in iteration_stats)),
+                "seam_reconcile_vertex_count": int(sum(item.seam_reconcile_vertex_count for item in iteration_stats)),
+                "seam_reconcile_frontier_count": int(sum(item.seam_reconcile_frontier_count for item in iteration_stats)),
+                "seam_reconcile_mean_displacement": (
+                    float(sum(item.seam_reconcile_mean_displacement * item.seam_reconcile_vertex_count for item in iteration_stats) /
+                          max(1, sum(item.seam_reconcile_vertex_count for item in iteration_stats)))
+                    if iteration_stats else 0.0
+                ),
+                "seam_reconcile_max_displacement": (
+                    float(max(item.seam_reconcile_max_displacement for item in iteration_stats)) if iteration_stats else 0.0
+                ),
+                "seam_edge_error_pre": (
+                    float(sum(item.seam_edge_error_pre * max(1, item.seam_reconcile_frontier_count) for item in iteration_stats) /
+                          max(1, sum(max(1, item.seam_reconcile_frontier_count) for item in iteration_stats)))
+                    if iteration_stats else 0.0
+                ),
+                "seam_edge_error_post": (
+                    float(sum(item.seam_edge_error_post * max(1, item.seam_reconcile_frontier_count) for item in iteration_stats) /
+                          max(1, sum(max(1, item.seam_reconcile_frontier_count) for item in iteration_stats)))
+                    if iteration_stats else 0.0
+                ),
                 "iterations_completed": int(len(iteration_stats)),
                 "stop_reason": stop_reason,
                 "windows_per_second_overall": (
@@ -3202,6 +3438,12 @@ def _compact_extension_summary(summary: dict[str, Any]) -> dict[str, Any]:
         "model_only_new_band_frontier_coverage_fraction",
         "geometric_gap_fill_vertex_count",
         "geometric_gap_fill_frontier_count",
+        "seam_reconcile_vertex_count",
+        "seam_reconcile_frontier_count",
+        "seam_reconcile_mean_displacement",
+        "seam_reconcile_max_displacement",
+        "seam_edge_error_pre",
+        "seam_edge_error_post",
         "encode_decode_ms_per_fitted_window",
         "crop_cache_hits",
         "crop_cache_misses",
@@ -3246,6 +3488,10 @@ def run_extension_to_exhaustion(
     distributed_gather_mode: str = "object",
     attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
     planner_mode: str = PLANNER_MODE_FAST,
+    seam_reconcile_enabled: bool = True,
+    seam_reconcile_band_width: int = 8,
+    seam_reconcile_smooth_radius: int = 8,
+    seam_reconcile_decay: float = 2.0,
     call_validator=None,
     extend_impl=None,
 ) -> ExtensionStageResult:
@@ -3283,6 +3529,10 @@ def run_extension_to_exhaustion(
             distributed_gather_mode=str(distributed_gather_mode),
             attention_scaling_mode=str(attention_scaling_mode),
             planner_mode=str(planner_mode),
+            seam_reconcile_enabled=bool(seam_reconcile_enabled),
+            seam_reconcile_band_width=int(seam_reconcile_band_width),
+            seam_reconcile_smooth_radius=int(seam_reconcile_smooth_radius),
+            seam_reconcile_decay=float(seam_reconcile_decay),
         )
         compact_summary = _compact_extension_summary(summary)
         call_summaries.append(compact_summary)
@@ -3455,6 +3705,10 @@ def run_extension_benchmark_suite(
     distributed_gather_mode: str = "object",
     attention_scaling_mode: str = ATTENTION_SCALING_STANDARD,
     planner_mode: str = PLANNER_MODE_FAST,
+    seam_reconcile_enabled: bool = True,
+    seam_reconcile_band_width: int = 8,
+    seam_reconcile_smooth_radius: int = 8,
+    seam_reconcile_decay: float = 2.0,
 ) -> dict[str, Any]:
     out_path = Path(out_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -3488,6 +3742,10 @@ def run_extension_benchmark_suite(
             distributed_gather_mode=str(distributed_gather_mode),
             attention_scaling_mode=str(attention_scaling_mode),
             planner_mode=str(planner_mode),
+            seam_reconcile_enabled=bool(seam_reconcile_enabled),
+            seam_reconcile_band_width=int(seam_reconcile_band_width),
+            seam_reconcile_smooth_radius=int(seam_reconcile_smooth_radius),
+            seam_reconcile_decay=float(seam_reconcile_decay),
         )
         serial_runs.append(summary)
 
@@ -3525,6 +3783,10 @@ def run_extension_benchmark_suite(
         distributed_gather_mode=str(distributed_gather_mode),
         attention_scaling_mode=str(attention_scaling_mode),
         planner_mode=str(planner_mode),
+        seam_reconcile_enabled=bool(seam_reconcile_enabled),
+        seam_reconcile_band_width=int(seam_reconcile_band_width),
+        seam_reconcile_smooth_radius=int(seam_reconcile_smooth_radius),
+        seam_reconcile_decay=float(seam_reconcile_decay),
     )
     suite = {
         "tifxyz_path": str(tifxyz_path),
@@ -3561,6 +3823,10 @@ def run_extension_benchmark_suite(
 @click.option("--amp-dtype", type=click.Choice(["bf16", "fp16"]), default="bf16", show_default=True)
 @click.option("--attention-scaling-mode", type=click.Choice(list(ATTENTION_SCALING_MODES)), default=ATTENTION_SCALING_STANDARD, show_default=True)
 @click.option("--planner-mode", type=click.Choice(list(PLANNER_MODES)), default=PLANNER_MODE_FAST, show_default=True)
+@click.option("--seam-reconcile/--no-seam-reconcile", default=True, show_default=True)
+@click.option("--seam-reconcile-band-width", type=int, default=8, show_default=True)
+@click.option("--seam-reconcile-smooth-radius", type=int, default=8, show_default=True)
+@click.option("--seam-reconcile-decay", type=float, default=2.0, show_default=True)
 @click.option("--show-progress/--no-show-progress", default=None)
 @click.option("--distributed-infer/--no-distributed-infer", default=False, show_default=True)
 @click.option("--distributed-shard-mode", type=click.Choice(["strided"]), default="strided", show_default=True)
@@ -3590,6 +3856,10 @@ def main(
     amp_dtype: str,
     attention_scaling_mode: str,
     planner_mode: str,
+    seam_reconcile: bool,
+    seam_reconcile_band_width: int,
+    seam_reconcile_smooth_radius: int,
+    seam_reconcile_decay: float,
     show_progress: bool | None,
     distributed_infer: bool,
     distributed_shard_mode: str,
@@ -3633,6 +3903,10 @@ def main(
             distributed_gather_mode=str(distributed_gather_mode),
             attention_scaling_mode=str(attention_scaling_mode),
             planner_mode=str(planner_mode),
+            seam_reconcile_enabled=bool(seam_reconcile),
+            seam_reconcile_band_width=int(seam_reconcile_band_width),
+            seam_reconcile_smooth_radius=int(seam_reconcile_smooth_radius),
+            seam_reconcile_decay=float(seam_reconcile_decay),
         )
     elif bool(run_to_exhaustion):
         result = run_extension_to_exhaustion(
@@ -3660,6 +3934,10 @@ def main(
             distributed_gather_mode=str(distributed_gather_mode),
             attention_scaling_mode=str(attention_scaling_mode),
             planner_mode=str(planner_mode),
+            seam_reconcile_enabled=bool(seam_reconcile),
+            seam_reconcile_band_width=int(seam_reconcile_band_width),
+            seam_reconcile_smooth_radius=int(seam_reconcile_smooth_radius),
+            seam_reconcile_decay=float(seam_reconcile_decay),
         )
         result = result.stage_summary
     else:
@@ -3687,6 +3965,10 @@ def main(
             distributed_gather_mode=str(distributed_gather_mode),
             attention_scaling_mode=str(attention_scaling_mode),
             planner_mode=str(planner_mode),
+            seam_reconcile_enabled=bool(seam_reconcile),
+            seam_reconcile_band_width=int(seam_reconcile_band_width),
+            seam_reconcile_smooth_radius=int(seam_reconcile_smooth_radius),
+            seam_reconcile_decay=float(seam_reconcile_decay),
         )
     if (not bool(distributed_infer)) or int(os.environ.get("RANK", "0")) == 0:
         print(json.dumps(result, indent=2, sort_keys=True))

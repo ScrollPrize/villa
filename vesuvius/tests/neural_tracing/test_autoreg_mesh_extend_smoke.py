@@ -21,10 +21,12 @@ from vesuvius.neural_tracing.autoreg_mesh.extend_tifxyz import (
     _DistributedInferRuntime,
     _apply_geometric_gap_fill,
     _build_admissibility_atlas,
+    _frontier_boundary_and_interior_from_grid,
     _flatten_gathered_window_results,
     _initialize_distributed_infer_runtime,
     _plan_extension_windows_coverage_first,
     _plan_extension_windows_for_mode,
+    _reconcile_extension_seam,
     _select_coverage_first_entries,
     _shard_fitted_window_plans,
     _crop_min_corner_for_points,
@@ -635,6 +637,72 @@ def test_demote_previous_seam_converts_old_seam_to_predicted() -> None:
     assert np.array_equal(provenance, np.array([[0, 1, 1], [1, 1, 0]], dtype=np.uint8))
 
 
+@pytest.mark.parametrize(
+    ("direction", "shape_builder", "seam_index"),
+    [
+        ("left", lambda grid: (grid.shape[0], 3, 3), 0),
+        ("right", lambda grid: (grid.shape[0], 3, 3), 2),
+        ("up", lambda grid: (3, grid.shape[1], 3), 0),
+        ("down", lambda grid: (3, grid.shape[1], 3), 2),
+    ],
+)
+def test_reconcile_extension_seam_snaps_true_touching_strip(direction, shape_builder, seam_index) -> None:
+    working_grid = _make_surface_grid(6, 8)
+    boundary, _ = _frontier_boundary_and_interior_from_grid(working_grid, direction)
+    extension_grid = np.full(shape_builder(working_grid), np.nan, dtype=np.float32)
+    if direction in {"left", "right"}:
+        extension_grid[:] = (boundary[:, None, :] + np.array([5.0, 0.0, 0.0], dtype=np.float32)[None, None, :])
+    else:
+        extension_grid[:] = (boundary[None, :, :] + np.array([5.0, 0.0, 0.0], dtype=np.float32)[None, None, :])
+    extension_provenance = np.ones(extension_grid.shape[:2], dtype=np.uint8)
+
+    reconciled_grid, reconciled_provenance, metrics = _reconcile_extension_seam(
+        working_grid,
+        extension_grid,
+        extension_provenance,
+        direction=direction,
+        seam_reconcile_band_width=3,
+        seam_reconcile_smooth_radius=4,
+        seam_reconcile_decay=2.0,
+    )
+
+    if direction in {"left", "right"}:
+        np.testing.assert_allclose(reconciled_grid[:, seam_index, :], boundary)
+        assert np.all(reconciled_provenance[:, seam_index] == 2)
+    else:
+        np.testing.assert_allclose(reconciled_grid[seam_index, :, :], boundary)
+        assert np.all(reconciled_provenance[seam_index, :] == 2)
+    assert metrics["seam_edge_error_post"] == pytest.approx(0.0)
+    assert metrics["seam_edge_error_pre"] > 0.0
+
+
+def test_reconcile_extension_seam_diffuses_displacement_monotonically() -> None:
+    working_grid = _make_surface_grid(6, 8)
+    boundary, _ = _frontier_boundary_and_interior_from_grid(working_grid, "left")
+    extension_grid = np.zeros((working_grid.shape[0], 4, 3), dtype=np.float32)
+    for idx in range(extension_grid.shape[1]):
+        extension_grid[:, idx, :] = boundary + np.array([10.0 + idx, 0.0, 0.0], dtype=np.float32)
+    extension_provenance = np.ones(extension_grid.shape[:2], dtype=np.uint8)
+
+    reconciled_grid, _provenance, metrics = _reconcile_extension_seam(
+        working_grid,
+        extension_grid,
+        extension_provenance,
+        direction="left",
+        seam_reconcile_band_width=4,
+        seam_reconcile_smooth_radius=0,
+        seam_reconcile_decay=1.5,
+    )
+
+    displacement_norms = [
+        float(np.linalg.norm((reconciled_grid[:, idx, :] - extension_grid[:, idx, :]), axis=-1).mean())
+        for idx in range(4)
+    ]
+    assert displacement_norms[0] >= displacement_norms[1] >= displacement_norms[2]
+    assert metrics["seam_reconcile_vertex_count"] > 0
+    assert metrics["seam_reconcile_mean_displacement"] > 0.0
+
+
 def test_build_extension_sample_has_required_fields() -> None:
     grid = _make_surface_grid(6, 6)
     prompt_grid = grid[:, -3:, :]
@@ -1139,6 +1207,11 @@ def test_extend_tifxyz_mesh_synthetic_end_to_end(tmp_path: Path, monkeypatch: py
     assert result["compile_infer_requested"] is False
     assert result["compile_infer_actual"] is False
     assert result["encode_decode_ms_per_fitted_window"] is not None
+    assert "seam_reconcile_vertex_count" in result
+    assert "seam_reconcile_frontier_count" in result
+    assert "seam_edge_error_pre" in result
+    assert "seam_edge_error_post" in result
+    assert result["seam_edge_error_post"] <= result["seam_edge_error_pre"]
     for preview in result["preview_paths"]:
         assert Path(preview).exists()
 
