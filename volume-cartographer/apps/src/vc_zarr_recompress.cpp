@@ -994,6 +994,21 @@ int main(int argc, char** argv) {
         for (auto d : src_chunks) src_chunk_voxels *= d;
         size_t src_raw_bytes = is_u16 ? src_chunk_voxels * 2 : src_chunk_voxels;
 
+        // Source chunks must tile the output chunk evenly.  Output chunks
+        // larger than source (common: 128³ source → 256³ c3d output) are
+        // assembled by the downloader; sources larger than output are not
+        // supported by this tool.
+        for (int d = 0; d < 3; ++d) {
+            if (src_chunks[d] == 0 || CHUNK_DIM % src_chunks[d] != 0
+                || src_chunks[d] > CHUNK_DIM) {
+                fprintf(stderr,
+                    "level %d: incompatible source chunk shape [%zu,%zu,%zu] "
+                    "for output chunk dim %zu (must divide evenly and be <= output)\n",
+                    l, src_chunks[0], src_chunks[1], src_chunks[2], CHUNK_DIM);
+                return 1;
+            }
+        }
+
         // Shard grid dimensions
         size_t shard_nz = (shape[0] + SHARD_DIM - 1) / SHARD_DIM;
         size_t shard_ny = (shape[1] + SHARD_DIM - 1) / SHARD_DIM;
@@ -1005,11 +1020,15 @@ int main(int argc, char** argv) {
         // per shard.  Skipped in --one-shard mode: the coordinator already
         // filtered to this shard and the inner download loop falls back to
         // per-chunk GETs with 404 being cheap (~50 ms each, 128 parallel).
-        std::vector<size_t> chunk128 = {CHUNK_DIM, CHUNK_DIM, CHUNK_DIM};
+        // Occupancy mask is indexed by SOURCE chunk grid (that's what the
+        // S3 listing returns).  When source chunk size == output chunk
+        // size these two grids coincide; when src is smaller (e.g. 128³
+        // source → 256³ c3d output), one output chunk is "present" if
+        // any of its covering source chunks exists — checked below.
         std::vector<bool> occ_mask;
-        size_t occ_nz = (shape[0] + CHUNK_DIM - 1) / CHUNK_DIM;
-        size_t occ_ny = (shape[1] + CHUNK_DIM - 1) / CHUNK_DIM;
-        size_t occ_nx = (shape[2] + CHUNK_DIM - 1) / CHUNK_DIM;
+        size_t occ_nz = (shape[0] + src_chunks[0] - 1) / src_chunks[0];
+        size_t occ_ny = (shape[1] + src_chunks[1] - 1) / src_chunks[1];
+        size_t occ_nx = (shape[2] + src_chunks[2] - 1) / src_chunks[2];
         if (!occupancy_file.empty()) {
             // Substitute the level number if path contains {L}
             std::string p = occupancy_file;
@@ -1017,7 +1036,7 @@ int main(int argc, char** argv) {
             if (pos != std::string::npos) p.replace(pos, 3, std::to_string(l));
             occ_mask = load_occupancy_file(p, occ_nz, occ_ny, occ_nx);
         } else if (one_shard_arg.empty() && shard_file.empty()) {
-            occ_mask = build_occupancy_from_listing(*input, l, shape, chunk128, 64);
+            occ_mask = build_occupancy_from_listing(*input, l, shape, src_chunks, 64);
         }
 
         printf("  Source: chunks [%zu,%zu,%zu], compressor: %s, sep: '%s', dtype: %s\n",
@@ -1184,7 +1203,15 @@ int main(int argc, char** argv) {
         struct DownloadTask {
             std::shared_ptr<ShardState> shard;
             size_t job_idx;
-            std::string src_key;
+            // Base source-chunk coords that anchor this output chunk, plus
+            // the per-axis ratio (CHUNK_DIM / src_chunk_dim) of source
+            // chunks along each axis.  When ratio is {1,1,1} the worker
+            // reads exactly one source chunk (original 1:1 path); when it
+            // is {2,2,2} (typical: 128³ source → 256³ c3d output) the
+            // worker fetches 8 source chunks and assembles them into the
+            // output-chunk voxel grid.
+            size_t src_base_z, src_base_y, src_base_x;
+            size_t rz, ry, rx;
         };
 
         struct EncodeTask {
@@ -1300,42 +1327,82 @@ int main(int argc, char** argv) {
                     }
                 };
 
-                std::vector<std::byte> raw;
-                try {
-                    auto data = t_input->read(task.src_key);
-                    if (utils::is_video_compressed(
-                            std::span<const std::byte>(data))) {
-                        total_raw.fetch_add(CHUNK_VOXELS);
-                        total_compressed.fetch_add(data.size());
-                        processed_chunks.fetch_add(1);
-                        finalize_slot(RESULT_PASSTHROUGH, std::move(data));
-                        continue;
+                // Fast 1:1 passthrough when the source is already stored
+                // as an encoded VC3D chunk and the output chunk size
+                // matches.  Only valid when ratio is {1,1,1}.
+                if (task.rz == 1 && task.ry == 1 && task.rx == 1) {
+                    std::string src_key = level_prefix +
+                        std::to_string(task.src_base_z) + dim_sep +
+                        std::to_string(task.src_base_y) + dim_sep +
+                        std::to_string(task.src_base_x);
+                    try {
+                        auto data = t_input->read(src_key);
+                        if (utils::is_video_compressed(
+                                std::span<const std::byte>(data))) {
+                            total_raw.fetch_add(CHUNK_VOXELS);
+                            total_compressed.fetch_add(data.size());
+                            processed_chunks.fetch_add(1);
+                            finalize_slot(RESULT_PASSTHROUGH, std::move(data));
+                            continue;
+                        }
+                    } catch (...) {
+                        // fall through to the assemble path, which tolerates
+                        // missing source chunks via zero-fill.
                     }
-                    if (!compressor_id.empty()) {
-                        raw = decompress_blosc(data, src_raw_bytes);
-                    } else {
-                        raw = std::move(data);
-                    }
-                } catch (...) {
-                    finalize_slot(RESULT_NONE, {});
-                    continue;
                 }
 
-                if (is_u16) {
-                    size_t n = raw.size() / 2;
-                    auto* src = reinterpret_cast<const uint16_t*>(raw.data());
-                    for (size_t i = 0; i < n; i++) {
-                        raw[i] = static_cast<std::byte>(
-                            static_cast<uint8_t>(src[i] / 257));
+                // Assemble the output chunk by reading each covering source
+                // chunk and copying it into the right sub-region of a
+                // CHUNK_VOXELS buffer.  Missing source chunks (404 / throw
+                // on read) are left as the pre-zeroed default.
+                std::vector<std::byte> raw(CHUNK_VOXELS, std::byte{0});
+                const size_t sx = src_chunks[2];
+                const size_t sy = src_chunks[1];
+                const size_t sz = src_chunks[0];
+                for (size_t dz = 0; dz < task.rz; ++dz)
+                for (size_t dy = 0; dy < task.ry; ++dy)
+                for (size_t dx = 0; dx < task.rx; ++dx) {
+                    std::string src_key = level_prefix +
+                        std::to_string(task.src_base_z + dz) + dim_sep +
+                        std::to_string(task.src_base_y + dy) + dim_sep +
+                        std::to_string(task.src_base_x + dx);
+                    std::vector<std::byte> src_raw;
+                    try {
+                        auto data = t_input->read(src_key);
+                        if (!compressor_id.empty()) {
+                            src_raw = decompress_blosc(data, src_raw_bytes);
+                        } else {
+                            src_raw = std::move(data);
+                        }
+                    } catch (...) {
+                        continue;   // missing source chunk → zero sub-block
                     }
-                    raw.resize(n);
-                }
-                if (raw.size() < CHUNK_VOXELS) {
-                    std::vector<std::byte> padded(CHUNK_VOXELS, std::byte{0});
-                    std::memcpy(padded.data(), raw.data(), raw.size());
-                    raw = std::move(padded);
-                } else if (raw.size() > CHUNK_VOXELS) {
-                    raw.resize(CHUNK_VOXELS);
+
+                    if (is_u16) {
+                        size_t n = src_raw.size() / 2;
+                        auto* s16 = reinterpret_cast<const uint16_t*>(src_raw.data());
+                        for (size_t i = 0; i < n; ++i) {
+                            src_raw[i] = static_cast<std::byte>(
+                                static_cast<uint8_t>(s16[i] / 257));
+                        }
+                        src_raw.resize(n);
+                    }
+                    // Copy src_raw (sz × sy × sx) into raw at sub-offset
+                    // (dz*sz, dy*sy, dx*sx).  A row is sx bytes contiguous
+                    // in both src and dst; outer strides differ (dst row
+                    // stride is CHUNK_DIM, dst z-stride is CHUNK_DIM²).
+                    const size_t have_z = std::min(sz, src_raw.size() / (sy * sx));
+                    for (size_t z = 0; z < have_z; ++z) {
+                        for (size_t y = 0; y < sy; ++y) {
+                            const std::byte* src_row =
+                                src_raw.data() + (z * sy + y) * sx;
+                            std::byte* dst_row = raw.data()
+                                + ((dz * sz + z) * CHUNK_DIM
+                                   + (dy * sy + y)) * CHUNK_DIM
+                                + dx * sx;
+                            std::memcpy(dst_row, src_row, sx);
+                        }
+                    }
                 }
 
                 // Air-clamp is applied inside the codec (and the threshold is
@@ -1548,26 +1615,58 @@ int main(int argc, char** argv) {
                         size_t inner_idx = iz * CHUNKS_PER_SHARD * CHUNKS_PER_SHARD
                                          + iy * CHUNKS_PER_SHARD + ix;
                         if (cz >= out_nz || cy >= out_ny || cx >= out_nx) continue;
+                        size_t rz = CHUNK_DIM / src_chunks[0];
+                        size_t ry = CHUNK_DIM / src_chunks[1];
+                        size_t rx = CHUNK_DIM / src_chunks[2];
+                        size_t src_base_z = cz * rz;
+                        size_t src_base_y = cy * ry;
+                        size_t src_base_x = cx * rx;
+                        // Occupancy mask is indexed by source chunk grid;
+                        // output chunk is "present" if any covering source
+                        // chunk exists in the mask.
                         if (!occ_mask.empty()) {
-                            size_t flat = cz * out_ny * out_nx + cy * out_nx + cx;
-                            if (!occ_mask[flat]) {
+                            bool any = false;
+                            for (size_t dz = 0; dz < rz && !any; ++dz)
+                            for (size_t dy = 0; dy < ry && !any; ++dy)
+                            for (size_t dx = 0; dx < rx && !any; ++dx) {
+                                size_t sz0 = src_base_z + dz;
+                                size_t sy0 = src_base_y + dy;
+                                size_t sx0 = src_base_x + dx;
+                                if (sz0 >= occ_nz || sy0 >= occ_ny || sx0 >= occ_nx)
+                                    continue;
+                                if (occ_mask[sz0 * occ_ny * occ_nx
+                                             + sy0 * occ_nx + sx0])
+                                    any = true;
+                            }
+                            if (!any) {
                                 skipped_chunks.fetch_add(1);
                                 continue;
                             }
                         }
-                        std::string src_key = level_prefix +
-                            std::to_string(cz) + dim_sep +
-                            std::to_string(cy) + dim_sep +
-                            std::to_string(cx);
-                        if (!existing_input.empty()
-                            && !existing_input.count(src_key)) {
-                            continue;
+                        // existing_input is built from a listing of source
+                        // keys; when source chunks are smaller than output
+                        // chunks an output chunk exists if any covering
+                        // source chunk exists.
+                        if (!existing_input.empty()) {
+                            bool any = false;
+                            for (size_t dz = 0; dz < rz && !any; ++dz)
+                            for (size_t dy = 0; dy < ry && !any; ++dy)
+                            for (size_t dx = 0; dx < rx && !any; ++dx) {
+                                std::string sk = level_prefix +
+                                    std::to_string(src_base_z + dz) + dim_sep +
+                                    std::to_string(src_base_y + dy) + dim_sep +
+                                    std::to_string(src_base_x + dx);
+                                if (existing_input.count(sk)) any = true;
+                            }
+                            if (!any) continue;
                         }
                         size_t job_idx = shard->result_kind.size();
                         shard->result_kind.push_back(RESULT_NONE);
                         shard->result_data.emplace_back();
                         shard->result_inner_idx.push_back(inner_idx);
-                        tasks.push_back({shard, job_idx, std::move(src_key)});
+                        tasks.push_back({shard, job_idx,
+                                         src_base_z, src_base_y, src_base_x,
+                                         rz, ry, rx});
                     }
                 }
             }
