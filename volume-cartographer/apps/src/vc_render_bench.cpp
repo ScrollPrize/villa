@@ -274,10 +274,12 @@ int main(int argc, char** argv)
 
     // Plane oriented along +Z through the chosen centre (defaults to
     // volume centre). For sparse volumes, pass --center to point at a
-    // region with actual data.
-    const float cx = (centerVoxel[0] >= 0) ? centerVoxel[0] : shape[0] / 2.0f;
+    // region with actual data. --center is Z,Y,X (stored in that order
+    // in centerVoxel), but world coords below and Volume::shape() are
+    // X,Y,Z — so permute here.
+    const float cx = (centerVoxel[2] >= 0) ? centerVoxel[2] : shape[0] / 2.0f;
     const float cy = (centerVoxel[1] >= 0) ? centerVoxel[1] : shape[1] / 2.0f;
-    const float cz = (centerVoxel[2] >= 0) ? centerVoxel[2] : shape[2] / 2.0f;
+    const float cz = (centerVoxel[0] >= 0) ? centerVoxel[0] : shape[2] / 2.0f;
     printf("  Plane centre: %.1f, %.1f, %.1f\n\n", cx, cy, cz);
     PlaneSurface plane(cv::Vec3f(cx, cy, cz), cv::Vec3f(0, 0, 1));
 

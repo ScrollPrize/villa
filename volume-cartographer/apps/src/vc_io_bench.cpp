@@ -84,13 +84,17 @@ StatSnapshot snap(vc::cache::BlockPipeline* cache) {
 // level-0 voxel coords, -1 to use volume centre). Using a lattice (not
 // random) keeps runs deterministic and exercises shard-cache locality.
 std::vector<vc::cache::ChunkKey> enumerateRegion(
-    Volume& vol, vc::cache::BlockPipeline& cache, int level, int regionSize,
+    vc::cache::BlockPipeline& cache, int level, int regionSize,
     std::array<int, 3> centerVoxel)
 {
-    auto shape = vol.shape();
-    const int sz = std::max(1, shape[0] >> level);
-    const int sy = std::max(1, shape[1] >> level);
-    const int sx = std::max(1, shape[2] >> level);
+    // cache.levelShape(level) is ZYX and already scaled for `level`.
+    // Volume::shape() is XYZ, which swaps axes on anisotropic volumes
+    // and corrupts both the enqueued chunk range and the downstream
+    // cache-hit stats — don't use it here.
+    auto shape = cache.levelShape(level);
+    const int sz = std::max(1, shape[0]);
+    const int sy = std::max(1, shape[1]);
+    const int sx = std::max(1, shape[2]);
     auto cs = cache.chunkShape(level);
     if (cs[0] <= 0 || cs[1] <= 0 || cs[2] <= 0) return {};
     const int chunksZ = (sz + cs[0] - 1) / cs[0];
@@ -248,7 +252,7 @@ int main(int argc, char** argv)
         printf("  Center:       %d, %d, %d (level-0 voxel)\n",
                centerVoxel[0], centerVoxel[1], centerVoxel[2]);
     }
-    auto keys = enumerateRegion(*vol, *cache, level, regionSize, centerVoxel);
+    auto keys = enumerateRegion(*cache, level, regionSize, centerVoxel);
     if (keys.empty()) {
         fprintf(stderr, "Failed to enumerate chunks (bad level? empty volume?)\n");
         return 1;
