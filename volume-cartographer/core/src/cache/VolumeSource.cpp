@@ -283,9 +283,21 @@ std::vector<uint8_t> HttpSource::httpGetRange(const std::string& url,
         return {};
     }
     transientError_.store(false, std::memory_order_relaxed);
-    std::vector<uint8_t> result(resp.body.size());
-    if (!result.empty())
-        std::memcpy(result.data(), resp.body.data(), result.size());
+
+    // Servers are allowed to ignore Range and return 200 with the full
+    // resource (RFC 7233 §3.1). Detect that by body size > requested
+    // length and slice out [offset, offset+length) ourselves so the
+    // caller always sees the bytes it asked for.
+    const auto& body = resp.body;
+    std::vector<uint8_t> result;
+    if (body.size() > length && body.size() >= offset + length) {
+        result.resize(length);
+        std::memcpy(result.data(), body.data() + offset, length);
+    } else {
+        result.resize(body.size());
+        if (!body.empty())
+            std::memcpy(result.data(), body.data(), result.size());
+    }
     return result;
 }
 
