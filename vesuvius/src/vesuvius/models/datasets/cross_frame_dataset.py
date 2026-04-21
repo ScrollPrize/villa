@@ -209,12 +209,24 @@ class CrossFrameZarrDataset(Dataset):
         self._build_patch_index()
         _stage(f"patch index built: {len(self._patches)} patches")
 
+        # Detect skeleton-aware targets so augmentation adds a <target>_skel
+        # tensor that the composite MedialSurfaceRecall loss consumes.
+        skeleton_targets, skeleton_ignore_values = self._collect_skeleton_targets()
+
         self.transforms = None
         if self.is_training:
             self.transforms = create_training_transforms(
                 patch_size=self.patch_size,
                 no_spatial=bool(getattr(mgr, "no_spatial_augmentation", False)),
                 no_scaling=bool(getattr(mgr, "no_scaling_augmentation", False)),
+                skeleton_targets=skeleton_targets or None,
+                skeleton_ignore_values=skeleton_ignore_values or None,
+            )
+        elif skeleton_targets:
+            from ..augmentation.pipelines.training_transforms import create_validation_transforms
+            self.transforms = create_validation_transforms(
+                skeleton_targets=skeleton_targets,
+                skeleton_ignore_values=skeleton_ignore_values or None,
             )
 
         logger.info(
@@ -223,6 +235,34 @@ class CrossFrameZarrDataset(Dataset):
             self.labels_zarr_url, self._labels_shape,
             len(self._patches),
         )
+
+    # ------------------------------------------------ skeleton targets --
+
+    # Loss names that require a precomputed skeleton tensor alongside the
+    # label. Kept in sync with ZarrDataset._get_skeleton_targets.
+    _SKELETON_LOSSES = {
+        "MedialSurfaceRecall",
+        "SoftSkeletonRecallLoss",
+        "DC_SkelREC_and_CE_loss",
+    }
+
+    def _collect_skeleton_targets(self) -> Tuple[List[str], Dict[str, int]]:
+        skeleton_targets: List[str] = []
+        skeleton_ignore_values: Dict[str, int] = {}
+        for target_name, target_info in self.targets.items():
+            losses = target_info.get("losses") if isinstance(target_info, dict) else None
+            if not losses:
+                continue
+            if any(l.get("name") in self._SKELETON_LOSSES for l in losses):
+                skeleton_targets.append(target_name)
+                ignore_label = (
+                    target_info.get("ignore_label")
+                    or target_info.get("ignore_index")
+                    or target_info.get("ignore_value")
+                )
+                if ignore_label is not None:
+                    skeleton_ignore_values[target_name] = int(ignore_label)
+        return skeleton_targets, skeleton_ignore_values
 
     # -------------------------------------------------------------- cache --
 
