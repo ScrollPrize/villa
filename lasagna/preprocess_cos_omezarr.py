@@ -1026,20 +1026,23 @@ def _infer_tiled_3d(
 	print("", flush=True)
 	print(f"[predict3d] inference done in {time.time() - t0:.1f}s ({total_tiles} tiles)", flush=True)
 
-	# Normalize
+	# Normalize in-place on memmap (no RAM copy)
 	acc_fine /= np.maximum(wsum_fine, 1e-7)
 	acc_coarse /= np.maximum(wsum_coarse, 1e-7)
+	del wsum_fine, wsum_coarse
 
-	# Trim padding back to crop-sized output
+	# Return memmap-backed views (trimmed to crop region).
+	# The sliced views keep the underlying memmaps alive via refcount.
+	# Callers should iterate z-slabs sequentially and copy each slab to
+	# contiguous memory before processing — this keeps the access pattern
+	# linear and avoids materializing the full result in RAM.
 	b_f = pad0 // sd_fine
 	b_c = pad0 // sd_coarse
 	nz_f, ny_f, nx_f = nz // sd_fine, ny // sd_fine, nx // sd_fine
 	nz_c, ny_c, nx_c = nz // sd_coarse, ny // sd_coarse, nx // sd_coarse
 
-	result_fine = np.array(acc_fine[:, b_f:b_f + nz_f, b_f:b_f + ny_f, b_f:b_f + nx_f])
-	result_coarse = np.array(acc_coarse[:, b_c:b_c + nz_c, b_c:b_c + ny_c, b_c:b_c + nx_c])
-
-	del acc_fine, wsum_fine, acc_coarse, wsum_coarse
+	result_fine = acc_fine[:, b_f:b_f + nz_f, b_f:b_f + ny_f, b_f:b_f + nx_f]
+	result_coarse = acc_coarse[:, b_c:b_c + nz_c, b_c:b_c + ny_c, b_c:b_c + nx_c]
 	return result_fine, result_coarse
 
 
@@ -1418,6 +1421,8 @@ def run_preprocess_3d(
 		)
 
 		# --- Phase 3: post-process and write ---
+		# pred_cos / pred_other are memmap-backed views — iterate z-slabs
+		# sequentially for linear I/O and copy each slab to contiguous RAM.
 		cos_wz = cos_oz1 - cos_oz0
 		cos_wy = cos_oy1 - cos_oy0
 		cos_wx = cos_ox1 - cos_ox0
@@ -1425,32 +1430,36 @@ def run_preprocess_3d(
 		other_wy = other_oy1 - other_oy0
 		other_wx = other_ox1 - other_ox0
 
-		# Write cos channel to cos.zarr
 		post_chunk_z = max(1, chunk_z)
+		print(f"[predict3d] post-process: cos {cos_wz}×{cos_wy}×{cos_wx}, "
+			  f"other {other_wz}×{other_wy}×{other_wx}, "
+			  f"chunk_z={post_chunk_z}", flush=True)
+
+		# Write cos channel to cos.zarr
+		t_phase = time.time()
 		for zs in range(0, cos_wz, post_chunk_z):
 			ze = min(cos_wz, zs + post_chunk_z)
-			cos_slab = pred_cos[0, zs:ze, :cos_wy, :cos_wx]
+			cos_slab = np.ascontiguousarray(pred_cos[0, zs:ze, :cos_wy, :cos_wx])
 			cos_arr[0, cos_oz0 + zs:cos_oz0 + ze, cos_oy0:cos_oy1, cos_ox0:cos_ox1] = np.clip(
 				cos_slab * 255.0, 0.0, 255.0).astype(np.uint8)
 		del pred_cos
+		print(f"[predict3d] cos write: {time.time() - t_phase:.1f}s", flush=True)
 
 		# Write grad_mag, nx, ny to prediction.zarr
 		# pred_other channels: [grad_mag(0), dir0z(1), dir1z(2), dir0y(3), dir1y(4), dir0x(5), dir1x(6)]
+		t_phase = time.time()
 		for zs in range(0, other_wz, post_chunk_z):
 			ze = min(other_wz, zs + post_chunk_z)
+			# Read all channels for this z-slab into contiguous RAM
+			slab = np.ascontiguousarray(pred_other[:, zs:ze, :other_wy, :other_wx])
+
 			# grad_mag
-			gm_slab = pred_other[0, zs:ze, :other_wy, :other_wx]
 			pred_arr[0, other_oz0 + zs:other_oz0 + ze, other_oy0:other_oy1, other_ox0:other_ox1] = np.clip(
-				gm_slab * 1000.0, 0.0, 255.0).astype(np.uint8)
+				slab[0] * 1000.0, 0.0, 255.0).astype(np.uint8)
 
 			# Direction channels -> normal estimation
-			d0z = pred_other[1, zs:ze, :other_wy, :other_wx]
-			d1z = pred_other[2, zs:ze, :other_wy, :other_wx]
-			d0y = pred_other[3, zs:ze, :other_wy, :other_wx]
-			d1y = pred_other[4, zs:ze, :other_wy, :other_wx]
-			d0x = pred_other[5, zs:ze, :other_wy, :other_wx]
-			d1x = pred_other[6, zs:ze, :other_wy, :other_wx]
-			_, _, _, nx_n, ny_n, nz_n = _estimate_normal(d0z, d1z, d0y, d1y, d0x, d1x)
+			_, _, _, nx_n, ny_n, nz_n = _estimate_normal(
+				slab[1], slab[2], slab[3], slab[4], slab[5], slab[6])
 			# Flip to +z hemisphere
 			flip = np.where(nz_n < 0, -1.0, 1.0)
 			nx_n = nx_n * flip
@@ -1460,6 +1469,7 @@ def run_preprocess_3d(
 			pred_arr[2, other_oz0 + zs:other_oz0 + ze, other_oy0:other_oy1, other_ox0:other_ox1] = np.clip(
 				np.round(ny_n * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
 		del pred_other
+		print(f"[predict3d] other write: {time.time() - t_phase:.1f}s", flush=True)
 
 		# Update manifest with cos and prediction groups
 		vol.update_group("cos", ChannelGroup(
