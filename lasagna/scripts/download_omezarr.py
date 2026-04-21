@@ -49,10 +49,16 @@ _thread_local = threading.local()
 
 
 def _get_s3_client(anon: bool, region: str | None = None):
-    """Return a boto3 S3 client local to the calling thread."""
-    client = getattr(_thread_local, "s3_client", None)
-    if client is not None:
-        return client
+    """Return a boto3 S3 client local to the calling thread.
+
+    Caches per (anon, region) — a change in either creates a new client.
+    """
+    cache_key = (anon, region)
+    cached = getattr(_thread_local, "s3_client_cache", None)
+    if cached is not None:
+        key, client = cached
+        if key == cache_key:
+            return client
     cfg = botocore.config.Config(
         max_pool_connections=4,
         retries={"max_attempts": 0},
@@ -63,7 +69,7 @@ def _get_s3_client(anon: bool, region: str | None = None):
         cfg = cfg.merge(botocore.config.Config(signature_version=UNSIGNED))
     session = boto3.Session()
     client = session.client("s3", config=cfg, region_name=region)
-    _thread_local.s3_client = client
+    _thread_local.s3_client_cache = (cache_key, client)
     return client
 
 

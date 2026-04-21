@@ -1359,23 +1359,26 @@ def _find_zarr_group_root(path: str) -> Path | None:
 	return None
 
 
-def _auto_download(
-	input_path: str,
+def _download_one_path(
+	zarr_path: str,
 	crop_xyzwhd: tuple[int, int, int, int, int, int] | None,
-	pred_dt_path: str | None,
 ) -> None:
-	"""Auto-download input data from S3 if _download metadata is present.
+	"""Download chunks for a single zarr path from its S3 source.
 
-	Reads the zarr group's .zattrs for a ``_download`` key written by
-	``download_omezarr.py``.  If found, calls the downloader for the
-	needed scale levels and region.  If not found, raises with a clear
-	error message.
+	Walks up from *zarr_path* to find the group root with ``_download``
+	metadata.  Downloads only the level indicated by the path's trailing
+	numeric component (e.g. ``vol.zarr/2`` → scale 2).
 	"""
 	import json as _json
+	import sys as _sys
+	_lasagna_dir = str(Path(__file__).resolve().parent)
+	if _lasagna_dir not in _sys.path:
+		_sys.path.insert(0, _lasagna_dir)
+	from scripts.download_omezarr import download
 
-	# Walk up from input path to find the zarr group root with _download metadata.
-	# Per-level .zattrs may exist but won't have _download — keep walking up.
-	p = Path(str(input_path).rstrip("/")).resolve()
+	p = Path(str(zarr_path).rstrip("/")).resolve()
+
+	# Find group root with _download metadata
 	group_root = None
 	dl_meta = None
 	check = p
@@ -1393,49 +1396,54 @@ def _auto_download(
 
 	if group_root is None or dl_meta is None:
 		raise ValueError(
-			f"no _download metadata found walking up from {input_path} — "
+			f"no _download metadata found walking up from {zarr_path} — "
 			"run download_omezarr.py on this volume first "
 			"(it records the S3 source), or pass --no-download to skip"
 		)
 
-	source_uri = dl_meta["source"]
-	anon = dl_meta.get("anon", False)
-	region = dl_meta.get("region")
+	# Determine scale from path (e.g. vol.zarr/2 → scale 2)
+	scales: list[int] | None = None
+	if p.name.isdigit():
+		scales = [int(p.name)]
 
-	# Determine which scales to download (strip trailing slashes for name check)
-	scales: set[int] = set()
-	inp = Path(str(input_path).rstrip("/")).resolve()
-	if inp.name.isdigit():
-		scales.add(int(inp.name))
-	if pred_dt_path:
-		dt_p = Path(str(pred_dt_path).rstrip("/")).resolve()
-		if dt_p.name.isdigit():
-			scales.add(int(dt_p.name))
-
-	# Convert crop to bbox for downloader (crop is X,Y,Z,W,H,D → bbox is x0,y0,z0,x1,y1,z1)
+	# Convert crop to bbox (base coords)
 	bbox: tuple[int, int, int, int, int, int] | None = None
 	if crop_xyzwhd is not None:
 		x, y, z, w, h, d = crop_xyzwhd
 		bbox = (x, y, z, x + w, y + h, z + d)
 
-	import sys as _sys
-	_lasagna_dir = str(Path(__file__).resolve().parent)
-	if _lasagna_dir not in _sys.path:
-		_sys.path.insert(0, _lasagna_dir)
-	from scripts.download_omezarr import download
-	print(f"[predict3d] auto-downloading from {source_uri} "
-		  f"scales={sorted(scales) or 'all'} ...", flush=True)
+	source_uri = dl_meta["source"]
+	anon = dl_meta.get("anon", False)
+	region = dl_meta.get("region")
+
+	print(f"[predict3d] downloading {source_uri} "
+		  f"scales={scales or 'all'} dest={group_root} ...", flush=True)
 	ret = download(
 		source=source_uri,
 		dest=str(group_root),
-		scales=sorted(scales) if scales else None,
+		scales=scales,
 		bbox_xyzxyz=bbox,
 		anon=anon,
 		region=region,
 	)
 	if ret != 0:
-		raise RuntimeError(f"download_omezarr failed with exit code {ret}")
-	print("[predict3d] download complete", flush=True)
+		raise RuntimeError(f"download from {source_uri} failed (exit {ret})")
+
+
+def _auto_download(
+	input_path: str,
+	crop_xyzwhd: tuple[int, int, int, int, int, int] | None,
+	pred_dt_path: str | None,
+) -> None:
+	"""Auto-download input and pred-dt data from S3.
+
+	Each path is resolved independently to its own zarr group root —
+	they may come from different S3 sources.
+	"""
+	_download_one_path(input_path, crop_xyzwhd)
+	if pred_dt_path:
+		_download_one_path(pred_dt_path, crop_xyzwhd)
+	print("[predict3d] all downloads complete", flush=True)
 
 
 def _resolve_base_shape(
@@ -1465,23 +1473,26 @@ def _resolve_base_shape(
 		f = 2 ** scale
 		return (sh[0] * f, sh[1] * f, sh[2] * f)
 
-	# Auto-detect: try to find level 0 of the input's zarr group
+	# Auto-detect: find the finest available level in the input's zarr group
+	# and scale up to base (level 0) resolution.
 	try:
-		from vesuvius.neural_tracing.datasets.common import open_zarr_group
-		# input_path is like ".../scroll.zarr/2" — parent is the group
-		inp = Path(input_path)
+		inp = Path(str(input_path).rstrip("/"))
 		# Walk up to find the zarr root (directory containing .zgroup or .zattrs)
 		group_path = inp.parent if inp.name.isdigit() else inp
 		grp = zarr.open_group(str(group_path), mode="r")
-		# Find the largest (lowest-numbered) level
+		# Find the finest (lowest-numbered) level
 		level_keys = sorted(int(k) for k in grp.keys() if k.isdigit())
 		if level_keys:
-			level0 = grp[str(level_keys[0])]
-			sh = tuple(int(v) for v in level0.shape)
+			finest_lv = level_keys[0]
+			arr = grp[str(finest_lv)]
+			sh = tuple(int(v) for v in arr.shape)
 			if len(sh) == 3:
-				print(f"[predict3d] auto-detected base shape from level {level_keys[0]}: {sh}",
-					  flush=True)
-				return sh
+				# Scale up: level N shape × 2^N ≈ base shape
+				f = 2 ** finest_lv
+				base = (sh[0] * f, sh[1] * f, sh[2] * f)
+				print(f"[predict3d] auto-detected base shape: level {finest_lv} "
+					  f"shape={sh} × {f} → base={base}", flush=True)
+				return base
 	except Exception:
 		pass
 	return None
@@ -1534,20 +1545,44 @@ def run_preprocess_3d(
 	if len(sh) != 3:
 		raise ValueError(f"input array must be (Z,Y,X), got shape {sh}")
 
-	z0, z1, y0, y1, x0, x1 = _crop_xyzwhd_bounds(shape_zyx=sh, crop_xyzwhd=crop_xyzwhd)
+	# Resolve base shape first (needed to scale crop from base to input coords)
+	base_shape_zyx = _resolve_base_shape(input_path, base_ref, base_scale)
+	if base_shape_zyx is None:
+		raise ValueError(
+			"cannot determine base_shape_zyx — required for OME-Zarr output. "
+			"Pass --base-ref or ensure the input is inside an OME-Zarr group."
+		)
+
+	import math as _math
+	input_sd = max(1, round(base_shape_zyx[0] / sh[0]))
+
+	# crop_xyzwhd is in BASE coordinates — scale to input resolution
+	crop_input: tuple[int, int, int, int, int, int] | None = None
+	if crop_xyzwhd is not None:
+		bx, by, bz, bw, bh, bd = (int(v) for v in crop_xyzwhd)
+		crop_input = (
+			bx // input_sd, by // input_sd, bz // input_sd,
+			max(1, bw // input_sd), max(1, bh // input_sd), max(1, bd // input_sd),
+		)
+
+	z0, z1, y0, y1, x0, x1 = _crop_xyzwhd_bounds(shape_zyx=sh, crop_xyzwhd=crop_input)
 	nz = z1 - z0
 	ny = y1 - y0
 	nx_dim = x1 - x0
 	if nz <= 0 or ny <= 0 or nx_dim <= 0:
-		raise ValueError(f"empty crop: x=[{x0},{x1}) y=[{y0},{y1}) z=[{z0},{z1}) in shape={sh}")
+		raise ValueError(
+			f"empty crop: x=[{x0},{x1}) y=[{y0},{y1}) z=[{z0},{z1}) in shape={sh}\n"
+			f"  base crop={crop_xyzwhd} → input crop={crop_input} (input_sd={input_sd})"
+		)
 
 	if device is None:
 		device = "cuda" if torch.cuda.is_available() else "cpu"
 	torch_device = torch.device(device)
 
 	print(
-		f"[predict3d] input={input_path} shape={sh} "
-		f"crop=({x0},{y0},{z0},{nx_dim},{ny},{nz}) "
+		f"[predict3d] input={input_path} shape={sh} input_sd={input_sd}\n"
+		f"  base_shape={base_shape_zyx} base_crop={crop_xyzwhd}\n"
+		f"  input_crop=({x0},{y0},{z0},{nx_dim},{ny},{nz}) "
 		f"cos_scaledown={cos_scaledown} scaledown={scaledown}",
 		flush=True,
 	)
@@ -1571,7 +1606,7 @@ def run_preprocess_3d(
 	full_other_y = _ds_size(sh[1], other_sd)
 	full_other_x = _ds_size(sh[2], other_sd)
 
-	# Crop offsets for each resolution
+	# Crop offsets at each output resolution (in input-relative coords)
 	cos_oz0 = _ds_index(z0, cos_sd)
 	cos_oy0 = _ds_index(y0, cos_sd)
 	cos_ox0 = _ds_index(x0, cos_sd)
@@ -1586,18 +1621,7 @@ def run_preprocess_3d(
 	other_oy1 = min(full_other_y, other_oy0 + _ds_size(ny, other_sd))
 	other_ox1 = min(full_other_x, other_ox0 + _ds_size(nx_dim, other_sd))
 
-	# Resolve base shape (required for OME-Zarr output)
-	base_shape_zyx = _resolve_base_shape(input_path, base_ref, base_scale)
-	if base_shape_zyx is None:
-		raise ValueError(
-			"cannot determine base_shape_zyx — required for OME-Zarr output. "
-			"Pass --base-ref or ensure the input is inside an OME-Zarr group."
-		)
-	print(f"[predict3d] base_shape_zyx={base_shape_zyx}", flush=True)
-
-	# Compute effective scaledowns from base and OME-Zarr level numbers
-	import math as _math
-	input_sd = max(1, round(base_shape_zyx[0] / sh[0]))
+	# Effective scaledowns from base and OME-Zarr level numbers
 	effective_cos_sd = input_sd * cos_sd
 	effective_other_sd = input_sd * other_sd
 	cos_level = round(_math.log2(effective_cos_sd)) if effective_cos_sd > 1 else 0
@@ -1619,9 +1643,9 @@ def run_preprocess_3d(
 			source_to_base=source_to_base,
 			base_shape_zyx=base_shape_zyx,
 		)
-	# Record this crop (appends if new, deduplicates)
+	# Record this crop in base coordinates (appends if new, deduplicates)
 	if crop_xyzwhd is not None:
-		vol.add_crop((int(x0), int(y0), int(z0), int(nx_dim), int(ny), int(nz)))
+		vol.add_crop(tuple(int(v) for v in crop_xyzwhd))
 
 	# Validate pred-dt source and determine its scale relative to base
 	pred_dt_zarr = None
