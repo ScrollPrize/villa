@@ -16,6 +16,8 @@ vc_add_test(test_triangle_voxel_raster test_triangle_voxel_raster.cpp)
 vc_add_test(test_vc_gen_normalgrids_smoke test_vc_gen_normalgrids_smoke.cpp)
 vc_add_test(test_vc_ngrids_smoke test_vc_ngrids_smoke.cpp)
 vc_add_test(test_volumepkg test_volumepkg.cpp)
+vc_add_test(test_project test_project.cpp)
+vc_add_test(test_http_cancel test_http_cancel.cpp)
 vc_add_test(test_vcdataset test_vcdataset.cpp)
 vc_add_test(test_quad_surface test_quad_surface.cpp)
 

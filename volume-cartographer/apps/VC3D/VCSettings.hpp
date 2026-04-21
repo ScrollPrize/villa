@@ -35,6 +35,17 @@ inline QString settingsFilePath()
     return configDir + "/VC3D.ini";
 }
 
+// Autosaved "current project" JSON, persisted across sessions.
+inline QString currentProjectFilePath()
+{
+    const QString configDir = QDir::homePath() + "/.VC3D";
+    QDir dir;
+    if (!dir.exists(configDir)) {
+        dir.mkpath(configDir);
+    }
+    return configDir + "/current_project.json";
+}
+
 // =============================================================================
 // Setting Keys & Defaults
 // =============================================================================
@@ -53,6 +64,10 @@ namespace volpkg {
     constexpr auto RECENT = "volpkg/recent";
 
     constexpr bool AUTO_OPEN_DEFAULT = true;
+}
+
+namespace project {
+    constexpr auto RECENT = "project/recent";
 }
 
 // -----------------------------------------------------------------------------

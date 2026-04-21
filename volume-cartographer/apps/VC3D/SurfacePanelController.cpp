@@ -285,6 +285,23 @@ void SurfacePanelController::loadRemoteStubs(
     emit surfacesLoaded();
 }
 
+void SurfacePanelController::markAsRemoteStub(const std::string& segmentId)
+{
+    _remoteStubSegments.insert(segmentId);
+    if (!_ui.treeWidget) return;
+    const QString idQStr = QString::fromStdString(segmentId);
+    QTreeWidgetItemIterator it(_ui.treeWidget);
+    while (*it) {
+        if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() == idQStr) {
+            (*it)->setText(SURFACE_ID_COLUMN,
+                idQStr + QStringLiteral(" [remote]"));
+            (*it)->setForeground(SURFACE_ID_COLUMN, QBrush(Qt::gray));
+            break;
+        }
+        ++it;
+    }
+}
+
 void SurfacePanelController::replaceStubWithSurface(
     const std::string& segmentId,
     std::shared_ptr<Surface> surface)

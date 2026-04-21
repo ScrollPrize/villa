@@ -1772,10 +1772,9 @@ void SegmentationCommandHandler::onGrowSegmentFromSegment(const std::string& seg
 
     QString srcSegment = QString::fromStdString(surface->path.string());
 
-    std::filesystem::path volpkgPath = std::filesystem::path(_state->vpkgPath().toStdString());
-    std::filesystem::path tracesDir = volpkgPath / "traces";
-    std::filesystem::path jsonParamsPath = volpkgPath / "trace_params.json";
-    std::filesystem::path pathsDir = volpkgPath / "paths";
+    std::filesystem::path tracesDir = _state->segmentsPath("traces");
+    std::filesystem::path jsonParamsPath = _state->supportFilePath("trace_params.json");
+    std::filesystem::path pathsDir = _state->segmentsPath("paths");
 
     emit statusMessage(tr("Preparing to run grow_seg_from_segment..."), 2000);
 
@@ -1844,8 +1843,7 @@ void SegmentationCommandHandler::onAddOverlap(const std::string& segmentId)
     auto* surface = requireSurfaceAndRunner(segmentId, true);
     if (!surface) return;
 
-    std::filesystem::path volpkgPath = std::filesystem::path(_state->vpkgPath().toStdString());
-    std::filesystem::path pathsDir = volpkgPath / "paths";
+    std::filesystem::path pathsDir = _state->segmentsPath("paths");
     QString tifxyzPath = QString::fromStdString(surface->path.string());
 
     _cmdRunner->setAddOverlapParams(QString::fromStdString(pathsDir.string()), tifxyzPath);
@@ -1899,11 +1897,8 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
     }
 
     const QString surfacePath = QString::fromStdString(surf->path.string());
-    QString volpkgRoot = _state->vpkgPath();
-    if (volpkgRoot.isEmpty()) {
-        volpkgRoot = QString::fromStdString(_state->vpkg()->getVolpkgDirectory());
-    }
-    QString defaultOutputDir = QDir(volpkgRoot).filePath(QStringLiteral("paths"));
+    QString defaultOutputDir = QString::fromStdString(
+        _state->outputSegmentsPath().string());
 
     NeighborCopyDialog dlg(_parentWidget, surfacePath, volumeOptions, defaultVolumeId, defaultOutputDir);
     if (dlg.exec() != QDialog::Accepted) {
@@ -1929,7 +1924,8 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
     }
     outputDirPath = outDir.absolutePath();
 
-    const QString normalGridPath = QDir(volpkgRoot).filePath(QStringLiteral("normal_grids"));
+    const QString normalGridPath = QString::fromStdString(
+        _state->supportFilePath("normal_grids").string());
 
     QJsonObject pass1Params;
     pass1Params["normal_grid_path"] = normalGridPath;
@@ -2088,15 +2084,11 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
         return;
     }
 
-    QString volpkgRoot = _state->vpkgPath();
-    if (volpkgRoot.isEmpty()) {
-        volpkgRoot = QString::fromStdString(_state->vpkg()->getVolpkgDirectory());
-    }
-
     std::filesystem::path outputDirFs = surf->path.parent_path();
     QString outputDirPath = QString::fromStdString(outputDirFs.string());
     if (outputDirPath.isEmpty()) {
-        outputDirPath = QDir(volpkgRoot).filePath(QStringLiteral("paths"));
+        outputDirPath = QString::fromStdString(
+            _state->outputSegmentsPath().string());
     }
     QDir outDir(outputDirPath);
     if (!outDir.exists() && !outDir.mkpath(".")) {
@@ -2105,7 +2097,8 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
     }
     outputDirPath = outDir.absolutePath();
 
-    const QString normalGridPath = QDir(volpkgRoot).filePath(QStringLiteral("normal_grids"));
+    const QString normalGridPath = QString::fromStdString(
+        _state->supportFilePath("normal_grids").string());
 
     QJsonObject params;
     params["normal_grid_path"] = normalGridPath;
@@ -2480,8 +2473,7 @@ void SegmentationCommandHandler::onGrowSeeds(const std::string& segmentId, bool 
         return;
     }
 
-    std::filesystem::path volpkgPath = std::filesystem::path(_state->vpkgPath().toStdString());
-    std::filesystem::path pathsDir = volpkgPath / "paths";
+    std::filesystem::path pathsDir = _state->segmentsPath("paths");
 
     if (!std::filesystem::exists(pathsDir)) {
         QMessageBox::warning(_parentWidget, tr("Error"), tr("Paths directory not found in the volpkg"));
@@ -2489,7 +2481,7 @@ void SegmentationCommandHandler::onGrowSeeds(const std::string& segmentId, bool 
     }
 
     QString jsonFileName = isExpand ? "expand.json" : "seed.json";
-    std::filesystem::path jsonParamsPath = volpkgPath / jsonFileName.toStdString();
+    std::filesystem::path jsonParamsPath = _state->supportFilePath(jsonFileName.toStdString());
 
     if (!std::filesystem::exists(jsonParamsPath)) {
         QMessageBox::warning(_parentWidget, tr("Error"), tr("%1 not found in the volpkg").arg(jsonFileName));
@@ -3062,8 +3054,7 @@ void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentI
     const auto baseOutputName = QStringLiteral("labels_%1.zarr").arg(timestamp);
 
     std::error_code ec;
-    const std::filesystem::path volpkgDir(_state->vpkg()->getVolpkgDirectory());
-    const std::filesystem::path volumesDir = volpkgDir / "volumes";
+    const std::filesystem::path volumesDir = _state->volumesPath();
     std::filesystem::create_directories(volumesDir, ec);
     if (ec) {
         QMessageBox::critical(_parentWidget, tr("Error"),
@@ -3320,8 +3311,7 @@ void SegmentationCommandHandler::onAddIgnoreLabel()
     }
 
     std::error_code ec;
-    const std::filesystem::path volpkgDir(_state->vpkg()->getVolpkgDirectory());
-    const std::filesystem::path volumesDir = volpkgDir / "volumes";
+    const std::filesystem::path volumesDir = _state->volumesPath();
     std::filesystem::create_directories(volumesDir, ec);
     if (ec) {
         QMessageBox::critical(_parentWidget,
@@ -3674,16 +3664,20 @@ void SegmentationCommandHandler::onExportWidthChunks(const std::string& segmentI
     const QString segDir  = QString::fromStdString(surf->path.string());
     const QString segName = QString::fromStdString(segmentId);
 
-    QString volpkgRoot = _state->vpkg() ? QString::fromStdString(_state->vpkg()->getVolpkgDirectory()) : QString();
-    if (volpkgRoot.isEmpty()) {
-        QDir d(QFileInfo(segDir).absoluteDir());   // start at parent of the segment folder
-        while (!d.isRoot() && !d.dirName().endsWith(".volpkg")) d.cdUp();
-        volpkgRoot = d.dirName().endsWith(".volpkg") ? d.absolutePath()
-                                                    : QFileInfo(segDir).absolutePath();
+    QString exportRoot = configuredRoot;
+    if (exportRoot.isEmpty()) {
+        const auto p = _state->segmentsPath("export");
+        if (!p.empty()) {
+            exportRoot = QString::fromStdString(p.string());
+        } else {
+            // No project and no vpkg — fall back to segment's own parent.
+            QDir d(QFileInfo(segDir).absoluteDir());
+            while (!d.isRoot() && !d.dirName().endsWith(".volpkg")) d.cdUp();
+            const QString fallback = d.dirName().endsWith(".volpkg")
+                ? d.absolutePath() : QFileInfo(segDir).absolutePath();
+            exportRoot = QDir(fallback).filePath("export");
+        }
     }
-    const QString exportRoot = configuredRoot.isEmpty()
-        ? QDir(volpkgRoot).filePath("export")
-        : configuredRoot;
 
     QDir outRoot(exportRoot);
     if (!outRoot.exists() && !outRoot.mkpath(".")) {
@@ -3883,8 +3877,8 @@ void SegmentationCommandHandler::onReloadFromBackup(const QString& segmentId, in
 
     // Build paths
     namespace fs = std::filesystem;
-    fs::path volpkgRoot = _state->vpkg()->getVolpkgDirectory();
-    fs::path backupDir = volpkgRoot / "backups" / segIdStd / std::to_string(backupIndex);
+    fs::path backupDir = _state->supportFilePath("backups")
+                       / segIdStd / std::to_string(backupIndex);
     fs::path segmentDir = surf->path;
 
     if (!fs::exists(backupDir)) {
@@ -4026,9 +4020,8 @@ void SegmentationCommandHandler::onMoveSegmentToPaths(const QString& segmentId)
     }
 
     // Build paths
-    std::filesystem::path volpkgPath(_state->vpkg()->getVolpkgDirectory());
     std::filesystem::path currentPath = seg->path();
-    std::filesystem::path newPath = volpkgPath / "paths" / currentPath.filename();
+    std::filesystem::path newPath = _state->segmentsPath("paths") / currentPath.filename();
 
     // Check if destination exists
     if (std::filesystem::exists(newPath)) {
@@ -4177,7 +4170,6 @@ void SegmentationCommandHandler::onRenameSurface(const QString& segmentId)
     }
 
     // Check for name collision
-    std::filesystem::path volpkgPath(_state->vpkg()->getVolpkgDirectory());
     std::filesystem::path currentPath = seg->path();
     std::filesystem::path parentDir = currentPath.parent_path();
     std::filesystem::path newPath = parentDir / newId;

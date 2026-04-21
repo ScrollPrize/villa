@@ -221,6 +221,69 @@ bool VolumePkg::removeSingleVolume(const std::string& volumeIdOrDirName)
     return false;
 }
 
+bool VolumePkg::addVolumeAt(const std::filesystem::path& dirpath)
+{
+    if (!std::filesystem::exists(dirpath) || !std::filesystem::is_directory(dirpath)) {
+        Logger()->warn("addVolumeAt: not a directory: {}", dirpath.string());
+        return false;
+    }
+    if (!isValidVolumeDirectory(dirpath)) {
+        Logger()->warn("addVolumeAt: invalid volume dir: {}", dirpath.string());
+        return false;
+    }
+    try {
+        auto v = Volume::New(dirpath);
+        if (hasVolume(v->id())) {
+            Logger()->info("addVolumeAt: volume '{}' already loaded", v->id());
+            return false;
+        }
+        return addVolume(v);
+    } catch (const std::exception& e) {
+        Logger()->warn("addVolumeAt failed for '{}': {}", dirpath.string(), e.what());
+        return false;
+    }
+}
+
+bool VolumePkg::addSegmentationAt(const std::filesystem::path& dirpath,
+                                  const std::string& group)
+{
+    if (!std::filesystem::exists(dirpath) || !std::filesystem::is_directory(dirpath)) {
+        Logger()->warn("addSegmentationAt: not a directory: {}", dirpath.string());
+        return false;
+    }
+    const std::string groupName = group.empty() ? currentSegmentationDir_ : group;
+    try {
+        auto s = Segmentation::New(std::filesystem::canonical(dirpath));
+        auto [it, inserted] = segmentations_.emplace(s->id(), s);
+        if (!inserted) {
+            Logger()->warn("addSegmentationAt: segment '{}' already loaded", s->id());
+            return false;
+        }
+        segmentationDirectories_[s->id()] = groupName;
+        loadedSegmentationDirs_.insert(groupName);
+        if (!volumes_.empty()) {
+            auto scrollName = config_["name"].get_string();
+            auto volumeUuid = volumes_.begin()->second->id();
+            s->ensureScrollSource(scrollName, volumeUuid);
+        }
+        return true;
+    } catch (const std::exception& e) {
+        Logger()->warn("addSegmentationAt failed for '{}': {}",
+                       dirpath.string(), e.what());
+        return false;
+    }
+}
+
+std::vector<std::string>
+VolumePkg::segmentationIDsInGroup(const std::string& group) const
+{
+    std::vector<std::string> ids;
+    for (const auto& [segId, dir] : segmentationDirectories_) {
+        if (dir == group) ids.push_back(segId);
+    }
+    return ids;
+}
+
 bool VolumePkg::reloadSingleVolume(const std::string& volumeId)
 {
     auto it = volumes_.find(volumeId);

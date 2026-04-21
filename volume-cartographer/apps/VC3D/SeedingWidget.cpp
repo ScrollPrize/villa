@@ -981,10 +981,8 @@ void SeedingWidget::onRunSegmentationClicked()
             return;
         }
 
-        auto vol = fVpkg->volume();
-        std::filesystem::path vpkgPath = vol->path().parent_path().parent_path();
-        pathsDir = vpkgPath / "paths";
-        seedJsonPath = vpkgPath / "seed.json";
+        pathsDir = _state->segmentsPath("paths");
+        seedJsonPath = _state->supportFilePath("seed.json");
 
         if (!std::filesystem::exists(pathsDir)) {
             QMessageBox::warning(this, "Error", "Segmentation paths directory not found in volume package.");
@@ -1753,10 +1751,8 @@ void SeedingWidget::onExpandSeedsClicked()
             return;
         }
 
-        auto vol = fVpkg->volume();
-        std::filesystem::path vpkgPath = vol->path().parent_path().parent_path();
-        pathsDir = vpkgPath / "paths";
-        expandJsonPath = vpkgPath / "expand.json";
+        pathsDir = _state->segmentsPath("paths");
+        expandJsonPath = _state->supportFilePath("expand.json");
 
         if (!std::filesystem::exists(pathsDir)) {
             QMessageBox::warning(this, "Error", "Segmentation paths directory not found in volume package.");
@@ -2059,9 +2055,7 @@ void SeedingWidget::onNeuralTraceClicked()
         auto seg = fVpkg->segmentation(segID);
         pathsDir = seg->path().parent_path();
     } else if (fVpkg && fVpkg->hasVolumes()) {
-        auto vol = fVpkg->volume();
-        std::filesystem::path vpkgPath = vol->path().parent_path().parent_path();
-        pathsDir = vpkgPath / "paths";
+        pathsDir = _state->segmentsPath("paths");
     } else {
         QMessageBox::warning(this, "Error", "Could not determine output directory.");
         return;

@@ -45,6 +45,8 @@ set(srcs
     SeedingWidget.hpp
     DrawingWidget.cpp
     DrawingWidget.hpp
+    ProjectDockWidget.cpp
+    ProjectDockWidget.hpp
     segmentation/SegmentationCommon.hpp
     segmentation/SegmentationWidget.cpp
     segmentation/SegmentationWidget.hpp

@@ -2,6 +2,7 @@
 
 #include <QObject>
 #include <QString>
+#include <filesystem>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -9,8 +10,11 @@
 
 #include <opencv2/core.hpp>
 
+#include "vc/core/cache/HttpMetadataFetcher.hpp"
+#include "vc/core/types/Project.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/util/RemoteScroll.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/ui/VCCollection.hpp"
@@ -36,6 +40,37 @@ public:
     void setVpkg(std::shared_ptr<VolumePkg> pkg);
     QString vpkgPath() const;
     bool hasVpkg() const;
+
+    // --- Project (flexible JSON-backed descriptor; shadows vpkg for now) ---
+    std::shared_ptr<vc::Project> project() const;
+    void setProject(std::shared_ptr<vc::Project> proj);
+    bool hasProject() const;
+
+    // Path lookups that prefer the active Project, falling back to vpkg.
+    // Empty return means "not resolvable" — callers must check.
+    std::filesystem::path segmentsPath(const std::string& idOrName) const;
+    std::filesystem::path activeSegmentsPath() const;
+    std::filesystem::path outputSegmentsPath() const;
+    std::filesystem::path volumesPath() const;
+    std::vector<std::filesystem::path> allSegmentsPaths() const;
+    // Sibling file (e.g. seed.json, trace_params.json). Empty if nothing
+    // can resolve it (no project and no vpkg).
+    std::filesystem::path supportFilePath(const std::string& filename) const;
+
+    // --- Remote segment registry (for lazy list-then-click downloads) ---
+    // Populated when a remote SegmentsDir is loaded with metadata only.
+    // Looked up by CWindow::downloadRemoteSegmentOnDemand so the correct
+    // base URL / auth / cache / source layout is used per segment.
+    struct RemoteSegmentInfo {
+        std::string baseUrl;
+        std::string cachePath;
+        vc::cache::HttpAuth auth;
+        vc::RemoteSegmentSource source = vc::RemoteSegmentSource::Direct;
+    };
+    void registerRemoteSegment(const std::string& segId, RemoteSegmentInfo info);
+    void clearRemoteSegmentRegistry();
+    bool hasRemoteSegmentInfo(const std::string& segId) const;
+    RemoteSegmentInfo remoteSegmentInfo(const std::string& segId) const;
 
     // --- Current Volume ---
     std::shared_ptr<Volume> currentVolume() const;
@@ -81,6 +116,7 @@ public:
 
 signals:
     void vpkgChanged(std::shared_ptr<VolumePkg> vpkg);
+    void projectChanged(std::shared_ptr<vc::Project> project);
     void volumeChanged(std::shared_ptr<Volume> volume, const std::string& volumeId);
     void surfacesLoaded();
     void volumeClosing();
@@ -95,6 +131,8 @@ private:
     void resolveCurrentVolumeId();
 
     std::shared_ptr<VolumePkg> _vpkg;
+    std::shared_ptr<vc::Project> _project;
+    std::unordered_map<std::string, RemoteSegmentInfo> _remoteSegmentInfo;
     std::shared_ptr<Volume> _currentVolume;
     std::string _currentVolumeId;
     std::string _segmentationGrowthVolumeId;

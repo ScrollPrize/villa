@@ -46,6 +46,18 @@ public:
     bool removeSingleVolume(const std::string& volumeIdOrDirName);
     bool reloadSingleVolume(const std::string& volumeId);
 
+    // Load a volume / segmentation from an arbitrary on-disk path, bypassing
+    // the rigid rootDir_/volumes and rootDir_/paths layout. Used by Project
+    // data sources that live outside the volpkg tree.
+    bool addVolumeAt(const std::filesystem::path& dirpath);
+    bool addSegmentationAt(const std::filesystem::path& dirpath,
+                           const std::string& group);
+
+    // IDs of segmentations loaded under a given group (the `group` arg
+    // passed to addSegmentationAt, or the legacy subdir name like "paths").
+    [[nodiscard]] std::vector<std::string>
+        segmentationIDsInGroup(const std::string& group) const;
+
     void refreshSegmentations();
     static void setLoadFirstSegmentationDirectory(const std::string& dirName);
 

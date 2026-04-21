@@ -63,6 +63,7 @@ class QStandardItemModel;
 class FileWatcherService;
 class AxisAlignedSliceController;
 class SegmentationCommandHandler;
+class ProjectDockWidget;
 
 class CWindow : public QMainWindow
 {
@@ -262,6 +263,7 @@ private:
     RemoteScrollState _remoteScroll;
 
     std::unique_ptr<FileWatcherService> _fileWatcher;
+    ProjectDockWidget* _projectDock{nullptr};
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
     bool _maskRenderInProgress{false};
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
