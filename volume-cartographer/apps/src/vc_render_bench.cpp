@@ -1,21 +1,37 @@
-// vc_render_bench: Benchmark the volume rendering pipeline.
+// vc_render_bench: Benchmark the live VC3D plane-render path.
 //
-// Exercises the same sampling paths used by TileRenderer (fused plane,
-// coordinate-based, best-effort pyramid fallback) without Qt.
+// Exercises the fused ARGB32 sampler that VC3D's viewer actually uses
+// (samplePlaneCompositeBestEffortARGB32 → dispatchCompositeAdaptive →
+//  sampleSingleLayerAdaptiveImpl for nL=1), so before/after timings on this
+// bench match the hotspots the interactive profiler sees.
 //
 // Usage:
 //   vc_render_bench <volume_path_or_url> [options]
 //
-// Input can be:
-//   /path/to/volume                (local filesystem)
-//   s3://bucket/path/volume.zarr   (S3, uses AWS env credentials)
-//   s3+us-east-1://bucket/...      (S3 with explicit region)
-//   https://...                    (HTTP remote zarr)
-//
 // Options:
-//   --tile-size N    Tile size in pixels (default: 256)
-//   --io-threads N   I/O threads for chunk fetching (default: 8)
-//   --hot-gb N       Hot cache budget in GB (default: 8)
+//   --tile-size N       Tile size in pixels (default: 256)
+//   --io-threads N      I/O threads for chunk fetching (default: 8)
+//   --hot-gb N          Hot cache budget in GB (default: 8)
+//   --iters N           Iterations per test (default: 100)
+//   --warm-timeout N    Seconds to wait for cache warm-up (default: 60)
+//   --composite N       Number of composite layers (default: 1 = single slice)
+//
+// Determinism
+//   • Tile positions are computed from a fixed lattice (no RNG).
+//   • Every test phase starts from a drained IOPool (all prior-frame fetches
+//     resolved) so a given tile's timing reflects only steady-state work.
+//   • The hot-render phase pre-fetches the full tile set and waits for
+//     pipeline drain before timing — what it measures is pure sampler cost.
+//
+// What the phases mean
+//   • "Cold stream"  : every tile is fresh to the cache; times include
+//                      fetch+decode+render. Panning-from-zero behaviour.
+//   • "Hot render"   : all tiles fully cached; times are sampler cost only.
+//                      Steady-state in-viewport frame cost.
+//   • "Pan stream"   : tiles stream in as you slide; tile N's fetches start
+//                      while tile N-1 renders. Realistic panning.
+//   • "Z-scroll"     : same (x,y) at N successive z offsets; exercises
+//                      z-axis chunk boundaries and nearby-block hit rate.
 
 #include <algorithm>
 #include <chrono>
@@ -25,6 +41,7 @@
 #include <cstring>
 #include <numeric>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <opencv2/core.hpp>
@@ -34,120 +51,160 @@
 #include "vc/core/types/SampleParams.hpp"
 #include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/Slicing.hpp"
 
-using Clock = std::chrono::high_resolution_clock;
+using Clock = std::chrono::steady_clock;
 
-// Render one tile using the fused plane path (same as TileRenderer for PlaneSurface).
-// Returns the elapsed time in seconds.
-static double renderPlaneTile(
+namespace {
+
+// Fused ARGB32 plane render — same path CAdaptiveVolumeViewer hits on
+// every paint. Route through samplePlaneCompositeBestEffortARGB32 with
+// numLayers=1 so we reach dispatchCompositeAdaptive → the Nearest-mode
+// sampleSingleLayerAdaptiveImpl specialization that VC3D uses.
+// Returns elapsed seconds.
+double renderTileARGB32(
     Volume* vol,
+    uint32_t* outBuf,
     const cv::Vec3f& origin,
     const cv::Vec3f& vxStep,
     const cv::Vec3f& vyStep,
     int tileW, int tileH,
-    int level)
+    int level,
+    const uint32_t lut[256])
 {
-    cv::Mat_<uint8_t> gray;
-    vc::SampleParams sp;
-    sp.level = level;
-    sp.method = (level >= 3) ? vc::Sampling::Nearest : vc::Sampling::Trilinear;
-
-    auto t0 = Clock::now();
-    vol->samplePlaneBestEffort(gray, origin, vxStep, vyStep, tileW, tileH, sp);
-    auto t1 = Clock::now();
-
+    (void)level;  // level selection is handled by the adaptive dispatcher
+    const cv::Vec3f normal(0, 0, 1);  // single-layer: normal direction irrelevant
+    const auto t0 = Clock::now();
+    vol->samplePlaneCompositeBestEffortARGB32(
+        outBuf, tileW, origin, vxStep, vyStep, normal,
+        /*zStep=*/1.0f, /*zStart=*/0, /*numLayers=*/1,
+        tileW, tileH, "mean", lut);
+    const auto t1 = Clock::now();
     return std::chrono::duration<double>(t1 - t0).count();
 }
 
-// Render one tile using the coordinate-based path (for QuadSurface compatibility).
-static double renderCoordTile(
+// Fused ARGB32 composite render (numLayers>1) — routes through
+// sampleAdaptiveARGB32 so we hit the same code VC3D runs (vs. the legacy
+// samplePlaneCompositeARGB32 path). Matches CAdaptiveVolumeViewer.cpp:520.
+double renderTileCompositeARGB32(
     Volume* vol,
-    PlaneSurface& plane,
-    float surfX, float surfY, float zOff,
-    float scale,
+    uint32_t* outBuf,
+    const cv::Vec3f& origin,
+    const cv::Vec3f& vxStep,
+    const cv::Vec3f& vyStep,
+    const cv::Vec3f& normal,
+    int numLayers, int zStart, float zStep,
     int tileW, int tileH,
-    int level)
+    const uint32_t lut[256])
 {
-    cv::Mat_<cv::Vec3f> coords;
-    plane.gen(&coords, nullptr, cv::Size(tileW, tileH),
-              cv::Vec3f(0, 0, 0), scale,
-              {surfX * scale, surfY * scale, zOff});
-
-    cv::Mat_<uint8_t> gray;
-    vc::SampleParams sp;
-    sp.level = level;
-    sp.method = (level >= 3) ? vc::Sampling::Nearest : vc::Sampling::Trilinear;
-
-    auto t0 = Clock::now();
-    vol->sampleBestEffort(gray, coords, sp);
-    auto t1 = Clock::now();
-
+    const auto t0 = Clock::now();
+    // Mirror VC3D's path: Nearest for composite (averaging is the low-pass).
+    sampleAdaptiveARGB32(
+        outBuf, tileW, vol->tieredCache(),
+        /*desiredLevel=*/0, /*numLevels=*/int(vol->numScales()),
+        /*coords=*/nullptr, &origin, &vxStep, &vyStep,
+        /*normals=*/nullptr, &normal,
+        numLayers, zStart, zStep,
+        tileW, tileH, "mean", lut,
+        vc::Sampling::Nearest,
+        /*lightParams=*/nullptr,
+        /*levelOut=*/nullptr, /*levelStride=*/0);
+    const auto t1 = Clock::now();
     return std::chrono::duration<double>(t1 - t0).count();
 }
 
 struct BenchResult {
     std::string name;
-    int tileCount;
-    std::vector<double> times;  // per-tile seconds
+    std::vector<double> times;  // per-iteration seconds
 
+    int iterations() const { return static_cast<int>(times.size()); }
     double totalSec() const {
         return std::accumulate(times.begin(), times.end(), 0.0);
     }
-    double tilesPerSec() const {
-        return tileCount / totalSec();
+    double mean() const {
+        return iterations() ? totalSec() / iterations() : 0.0;
     }
-    double avgMs() const {
-        return totalSec() / tileCount * 1000.0;
-    }
-    double p99Ms() const {
+    double pct(double p) const {
+        if (times.empty()) return 0.0;
         auto sorted = times;
         std::sort(sorted.begin(), sorted.end());
-        int idx = std::max(0, (int)(sorted.size() * 0.99) - 1);
-        return sorted[idx] * 1000.0;
+        size_t idx = std::min(sorted.size() - 1,
+                              static_cast<size_t>(p * sorted.size()));
+        return sorted[idx];
+    }
+    double stdev() const {
+        if (iterations() < 2) return 0.0;
+        double m = mean();
+        double s = 0.0;
+        for (double t : times) s += (t - m) * (t - m);
+        return std::sqrt(s / (iterations() - 1));
     }
 };
 
-static void printResult(const BenchResult& r, int tileW, int tileH) {
-    double voxelsPerTile = (double)tileW * tileH;
-    double totalVoxels = voxelsPerTile * r.tileCount;
-    double totalSec = r.totalSec();
-    double voxelsPerSec = totalVoxels / totalSec;
-    double mbPerSec = voxelsPerSec / (1024.0 * 1024.0);  // 1 byte/voxel (uint8)
-
-    printf("  %-30s %6d tiles  %8.1f tiles/s  %6.2f ms/tile avg  %6.2f ms/tile p99  %8.1f Mvox/s  %7.1f MB/s\n",
-           r.name.c_str(), r.tileCount,
-           r.tilesPerSec(), r.avgMs(), r.p99Ms(),
-           voxelsPerSec / 1e6, mbPerSec);
+void printResult(const BenchResult& r) {
+    printf("  %-22s %4d iters  avg %6.2f ms  p50 %6.2f  p99 %6.2f  stdev %6.2f  throughput %7.1f fps\n",
+           r.name.c_str(), r.iterations(),
+           r.mean() * 1000.0,
+           r.pct(0.50) * 1000.0,
+           r.pct(0.99) * 1000.0,
+           r.stdev() * 1000.0,
+           1.0 / std::max(r.mean(), 1e-9));
 }
 
-static void printCacheStats(vc::cache::BlockPipeline* cache) {
-    auto s = cache->stats();
-    uint64_t total = s.blockHits + s.coldHits + s.iceFetches + s.misses;
-    if (total == 0) total = 1;
-
-    auto pct = [&](uint64_t n) { return 100.0 * n / total; };
-
-    printf("\n  Cache stats:\n");
-    printf("    Block hits: %8llu  (%5.1f%%)\n", (unsigned long long)s.blockHits, pct(s.blockHits));
-    printf("    Cold hits:  %8llu  (%5.1f%%)\n", (unsigned long long)s.coldHits, pct(s.coldHits));
-    printf("    Ice fetch:  %8llu  (%5.1f%%)\n", (unsigned long long)s.iceFetches, pct(s.iceFetches));
-    printf("    Misses:     %8llu  (%5.1f%%)\n", (unsigned long long)s.misses,  pct(s.misses));
-    printf("    Disk bytes: %8.1f MB\n", s.diskBytes / (1024.0 * 1024.0));
-    printf("    IO pending: %8zu\n", s.ioPending);
-    printf("    Disk writes:%8llu\n", (unsigned long long)s.diskWrites);
+// Block until the pipeline has no pending I/O or a timeout elapses. Returns
+// true if drained cleanly. Used to ensure bench phases start from a
+// reproducible cache state.
+bool waitForDrain(vc::cache::BlockPipeline* cache, double timeoutSec) {
+    if (!cache) return true;
+    const auto deadline = Clock::now() + std::chrono::duration<double>(timeoutSec);
+    while (Clock::now() < deadline) {
+        if (cache->stats().ioPending == 0) return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return cache->stats().ioPending == 0;
 }
 
-static bool isRemoteUrl(const std::string& path) {
+// Identity gray LUT so the LUT step is a straight passthrough and doesn't
+// inject colourmap cost into the sampler timing.
+void buildIdentityLut(uint32_t lut[256]) {
+    for (int i = 0; i < 256; ++i) {
+        const uint32_t v = static_cast<uint32_t>(i);
+        lut[i] = 0xFF000000u | (v << 16) | (v << 8) | v;
+    }
+}
+
+bool isRemoteUrl(const std::string& path) {
     return path.starts_with("s3://") ||
            path.starts_with("s3+") ||
            path.starts_with("http://") ||
            path.starts_with("https://");
 }
 
+// Deterministic lattice of tile origins around (cx, cy, cz). Returns
+// iterations positions as (panX, panY, zOff) in plane-local coords.
+struct TileSpec { float panX, panY, zOff; };
+std::vector<TileSpec> latticeTiles(int iterations, int tileW, int tileH) {
+    std::vector<TileSpec> out;
+    out.reserve(iterations);
+    // Fixed 10x10 grid around centre, walked in scan order. Falls back to
+    // wrapping for iterations>100 so the test length is tunable.
+    for (int i = 0; i < iterations; ++i) {
+        const int row = (i / 10) % 10 - 5;
+        const int col = (i % 10) - 5;
+        out.push_back({ float(col) * tileW, float(row) * tileH, 0.0f });
+    }
+    return out;
+}
+
+}  // namespace
+
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: vc_render_bench <volume_path_or_url> [--tile-size N] [--io-threads N] [--hot-gb N]\n");
+        fprintf(stderr,
+            "Usage: vc_render_bench <volume_path_or_url> [--tile-size N] "
+            "[--io-threads N] [--hot-gb N] [--iters N] [--warm-timeout N] "
+            "[--composite N]\n");
         return 1;
     }
 
@@ -155,179 +212,174 @@ int main(int argc, char** argv)
     int tileSize = 256;
     int ioThreads = 8;
     int hotGb = 8;
+    int iters = 100;
+    double warmTimeout = 60.0;
+    int compositeLayers = 1;
+    std::array<float, 3> centerVoxel = {-1.f, -1.f, -1.f};  // -1 = use geometric centre
 
     for (int i = 2; i < argc; i++) {
-        if (strcmp(argv[i], "--tile-size") == 0 && i + 1 < argc)
-            tileSize = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--io-threads") == 0 && i + 1 < argc)
-            ioThreads = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--hot-gb") == 0 && i + 1 < argc)
-            hotGb = atoi(argv[++i]);
-        else {
-            fprintf(stderr, "Unknown option: %s\n", argv[i]);
-            return 1;
+        std::string_view a = argv[i];
+        auto need = [&](const char* what) -> const char* {
+            if (i + 1 >= argc) {
+                fprintf(stderr, "%s requires a value\n", what);
+                std::exit(1);
+            }
+            return argv[++i];
+        };
+        if      (a == "--tile-size")    tileSize = std::atoi(need("--tile-size"));
+        else if (a == "--io-threads")   ioThreads = std::atoi(need("--io-threads"));
+        else if (a == "--hot-gb")       hotGb = std::atoi(need("--hot-gb"));
+        else if (a == "--iters")        iters = std::atoi(need("--iters"));
+        else if (a == "--warm-timeout") warmTimeout = std::atof(need("--warm-timeout"));
+        else if (a == "--composite")    compositeLayers = std::atoi(need("--composite"));
+        else if (a == "--center") {
+            const char* v = need("--center");
+            float z=-1, y=-1, x=-1;
+            if (std::sscanf(v, "%f,%f,%f", &z, &y, &x) != 3) {
+                fprintf(stderr, "--center expects Z,Y,X (got '%s')\n", v);
+                return 1;
+            }
+            centerVoxel = {z, y, x};
         }
+        else { fprintf(stderr, "Unknown option: %s\n", argv[i]); return 1; }
     }
 
     printf("vc_render_bench\n");
-    printf("  Volume:     %s\n", volumePath.c_str());
-    printf("  Tile size:  %d x %d\n", tileSize, tileSize);
-    printf("  IO threads: %d\n", ioThreads);
-    printf("  Hot cache:  %d GB\n", hotGb);
+    printf("  Volume:       %s\n", volumePath.c_str());
+    printf("  Tile size:    %d x %d\n", tileSize, tileSize);
+    printf("  IO threads:   %d\n", ioThreads);
+    printf("  Hot cache:    %d GB\n", hotGb);
+    printf("  Iterations:   %d\n", iters);
+    printf("  Warm timeout: %.1f s\n", warmTimeout);
+    printf("  Composite:    %d layer(s)\n", compositeLayers);
     printf("\n");
 
     // Open volume
     printf("Opening volume...\n");
-    auto t0 = Clock::now();
-
+    const auto t0 = Clock::now();
     std::shared_ptr<Volume> vol;
-    if (isRemoteUrl(volumePath)) {
-        vol = Volume::NewFromUrl(volumePath);
-    } else {
-        vol = Volume::New(volumePath);
-    }
-
-    vol->setCacheBudget((size_t)hotGb << 30);
+    if (isRemoteUrl(volumePath)) vol = Volume::NewFromUrl(volumePath);
+    else                          vol = Volume::New(volumePath);
+    vol->setCacheBudget(static_cast<size_t>(hotGb) << 30);
     vol->setIOThreads(ioThreads);
-
     auto shape = vol->shape();
-    int numLevels = (int)vol->numScales();
-    auto t1 = Clock::now();
+    const int numLevels = static_cast<int>(vol->numScales());
+    const auto t1 = Clock::now();
     printf("  Shape: %d x %d x %d  (%d pyramid levels)\n",
            shape[0], shape[1], shape[2], numLevels);
-    printf("  Open time: %.2f s\n\n", std::chrono::duration<double>(t1 - t0).count());
+    printf("  Open time: %.2f s\n\n",
+           std::chrono::duration<double>(t1 - t0).count());
 
-    // Set up a PlaneSurface centered in the volume
-    float cx = shape[0] / 2.0f;
-    float cy = shape[1] / 2.0f;
-    float cz = shape[2] / 2.0f;
+    auto* cache = vol->tieredCache();
 
+    // Plane oriented along +Z through the chosen centre (defaults to
+    // volume centre). For sparse volumes, pass --center to point at a
+    // region with actual data.
+    const float cx = (centerVoxel[0] >= 0) ? centerVoxel[0] : shape[0] / 2.0f;
+    const float cy = (centerVoxel[1] >= 0) ? centerVoxel[1] : shape[1] / 2.0f;
+    const float cz = (centerVoxel[2] >= 0) ? centerVoxel[2] : shape[2] / 2.0f;
+    printf("  Plane centre: %.1f, %.1f, %.1f\n\n", cx, cy, cz);
     PlaneSurface plane(cv::Vec3f(cx, cy, cz), cv::Vec3f(0, 0, 1));
 
-    // Helper: compute fused plane parameters for a given tile position and zoom
-    auto makePlaneParams = [&](float panX, float panY, float zOff, float scale)
-        -> std::tuple<cv::Vec3f, cv::Vec3f, cv::Vec3f>
-    {
-        float m = 1.0f / scale;
-        cv::Vec3f vx = plane.basisX();
-        cv::Vec3f vy = plane.basisY();
-        cv::Vec3f origin = plane.origin() + plane.normal(cv::Vec3f(0,0,0)) * zOff;
-        cv::Vec3f vxStep = vx * m;
-        cv::Vec3f vyStep = vy * m;
-        cv::Vec3f planeOrigin = vx * panX + vy * panY + origin;
-        return {planeOrigin, vxStep, vyStep};
+    const cv::Vec3f vx = plane.basisX();
+    const cv::Vec3f vy = plane.basisY();
+    const cv::Vec3f origin0 = plane.origin();
+    const cv::Vec3f normal = plane.normal(cv::Vec3f(0, 0, 0));
+
+    auto makeTileOrigin = [&](const TileSpec& t) -> cv::Vec3f {
+        return origin0 + vx * t.panX + vy * t.panY + normal * t.zOff;
     };
 
-    int tileW = tileSize;
-    int tileH = tileSize;
+    const int tileW = tileSize, tileH = tileSize;
+    std::vector<uint32_t> tileBuf(size_t(tileW) * tileH);
+    uint32_t lut[256]; buildIdentityLut(lut);
 
+    const auto tiles = latticeTiles(iters, tileW, tileH);
     std::vector<BenchResult> results;
 
-    // ==== Warmup: 100 tiles at default view ====
-    {
-        printf("Warmup: 100 tiles at center...\n");
-        auto [origin, vxStep, vyStep] = makePlaneParams(0, 0, 0, 1.0f);
-        for (int i = 0; i < 100; i++) {
-            float offX = (float)((i % 10) - 5) * tileW;
-            float offY = (float)((i / 10) - 5) * tileH;
-            cv::Vec3f tileOrigin = origin + vxStep * offX + vyStep * offY;
-            renderPlaneTile(vol.get(), tileOrigin, vxStep, vyStep, tileW, tileH, 0);
+    auto renderOneTile = [&](const TileSpec& t, int level) -> double {
+        cv::Vec3f tileOrigin = makeTileOrigin(t);
+        if (compositeLayers <= 1) {
+            return renderTileARGB32(vol.get(), tileBuf.data(),
+                tileOrigin, vx, vy, tileW, tileH, level, lut);
+        } else {
+            return renderTileCompositeARGB32(vol.get(), tileBuf.data(),
+                tileOrigin, vx, vy, normal,
+                compositeLayers, -compositeLayers / 2, 1.0f,
+                tileW, tileH, lut);
         }
-        printf("  Done.\n\n");
+    };
+
+    // ==== Phase 1: warmup + populate cache ====
+    printf("Warmup: streaming %d tiles into cache...\n", iters);
+    for (const auto& t : tiles) renderOneTile(t, 0);
+    if (!waitForDrain(cache, warmTimeout)) {
+        printf("  WARN: pipeline didn't fully drain in %.1fs "
+               "(pending=%zu); hot-render numbers may include I/O latency.\n",
+               warmTimeout, cache ? cache->stats().ioPending : 0);
+    } else {
+        printf("  Drained in %.2f s.\n",
+               std::chrono::duration<double>(Clock::now() - t1).count());
+    }
+    printf("\n");
+
+    // ==== Phase 2: Hot render — all tiles resident, pure sampler cost ====
+    {
+        BenchResult r; r.name = "Hot render";
+        for (const auto& t : tiles) r.times.push_back(renderOneTile(t, 0));
+        results.push_back(std::move(r));
     }
 
-    // ==== Test 1: 100 tiles at zoom level 0 (full res) ====
-    {
-        BenchResult r;
-        r.name = "Zoom 0 (full res)";
-        r.tileCount = 100;
-        auto [origin, vxStep, vyStep] = makePlaneParams(0, 0, 0, 1.0f);
-        for (int i = 0; i < 100; i++) {
-            float offX = (float)((i % 10) - 5) * tileW;
-            float offY = (float)((i / 10) - 5) * tileH;
-            cv::Vec3f tileOrigin = origin + vxStep * offX + vyStep * offY;
-            r.times.push_back(renderPlaneTile(vol.get(), tileOrigin, vxStep, vyStep, tileW, tileH, 0));
-        }
-        results.push_back(r);
+    // ==== Phase 3: Hot render, coarse level (pyramid) ====
+    if (numLevels >= 3) {
+        const int level = 2;
+        BenchResult r; r.name = "Hot render level 2";
+        for (const auto& t : tiles) r.times.push_back(renderOneTile(t, level));
+        results.push_back(std::move(r));
     }
 
-    // ==== Test 2: 100 tiles at zoom level 2 (4x downsampled) ====
+    // ==== Phase 4: Pan stream — slide +1 tileW per iter, fresh data each ====
+    // Pre-clear so tiles are cold. clearAll wipes caches but keeps disk.
+    if (cache) cache->clearAll();
     {
-        int level = std::min(2, numLevels - 1);
-        BenchResult r;
-        r.name = "Zoom 2 (4x downsample)";
-        r.tileCount = 100;
-        float scale = 1.0f / (1 << level);  // 0.25 at level 2
-        auto [origin, vxStep, vyStep] = makePlaneParams(0, 0, 0, scale);
-        for (int i = 0; i < 100; i++) {
-            float offX = (float)((i % 10) - 5) * tileW;
-            float offY = (float)((i / 10) - 5) * tileH;
-            cv::Vec3f tileOrigin = origin + vxStep * offX + vyStep * offY;
-            r.times.push_back(renderPlaneTile(vol.get(), tileOrigin, vxStep, vyStep, tileW, tileH, level));
+        BenchResult r; r.name = "Pan stream (cold)";
+        for (int i = 0; i < iters; ++i) {
+            TileSpec t{ float(i) * tileW, 0.0f, 0.0f };
+            r.times.push_back(renderOneTile(t, 0));
         }
-        results.push_back(r);
+        results.push_back(std::move(r));
     }
 
-    // ==== Test 3: Pan sequence (50 adjacent tiles) ====
+    // ==== Phase 5: Z-scroll — 20 z steps through centre ====
+    if (cache) cache->clearAll();
     {
-        BenchResult r;
-        r.name = "Pan (50 adjacent)";
-        r.tileCount = 50;
-        auto [origin, vxStep, vyStep] = makePlaneParams(0, 0, 0, 1.0f);
-        for (int i = 0; i < 50; i++) {
-            float offX = (float)i * tileW;
-            cv::Vec3f tileOrigin = origin + vxStep * offX;
-            r.times.push_back(renderPlaneTile(vol.get(), tileOrigin, vxStep, vyStep, tileW, tileH, 0));
+        BenchResult r; r.name = "Z-scroll (cold)";
+        for (int i = 0; i < std::min(iters, 50); ++i) {
+            TileSpec t{ 0.0f, 0.0f, float(i - 25) };
+            r.times.push_back(renderOneTile(t, 0));
         }
-        results.push_back(r);
-    }
-
-    // ==== Test 4: Z-scroll sequence (20 slices at same XY position) ====
-    {
-        BenchResult r;
-        r.name = "Z-scroll (20 slices)";
-        r.tileCount = 20;
-        for (int i = 0; i < 20; i++) {
-            float zOff = (float)(i - 10);
-            auto [origin, vxStep, vyStep] = makePlaneParams(0, 0, zOff, 1.0f);
-            r.times.push_back(renderPlaneTile(vol.get(), origin, vxStep, vyStep, tileW, tileH, 0));
-        }
-        results.push_back(r);
-    }
-
-    // ==== Test 5: Zoom sequence (10 tiles at 10 different zoom levels) ====
-    {
-        BenchResult r;
-        r.name = "Zoom sequence (10 levels)";
-        r.tileCount = 10;
-        for (int i = 0; i < 10; i++) {
-            // Scale from 0.1 to 4.0 in 10 steps
-            float scale = 0.1f + (4.0f - 0.1f) * i / 9.0f;
-            int level = 0;
-            // Pick appropriate pyramid level for this scale
-            float s = scale;
-            while (s < 0.5f && level + 1 < numLevels) {
-                s *= 2.0f;
-                level++;
-            }
-            auto [origin, vxStep, vyStep] = makePlaneParams(0, 0, 0, scale);
-            r.times.push_back(renderPlaneTile(vol.get(), origin, vxStep, vyStep, tileW, tileH, level));
-        }
-        results.push_back(r);
+        results.push_back(std::move(r));
     }
 
     // ==== Report ====
     printf("Results:\n");
-    printf("  %-30s %6s  %13s  %17s  %17s  %12s  %9s\n",
-           "Test", "Tiles", "Tiles/s", "Avg ms/tile", "P99 ms/tile", "Mvox/s", "MB/s");
-    printf("  %s\n", std::string(130, '-').c_str());
-    for (auto& r : results)
-        printResult(r, tileW, tileH);
+    for (const auto& r : results) printResult(r);
 
-    // Cache stats
-    auto* cache = vol->tieredCache();
-    if (cache)
-        printCacheStats(cache);
+    if (cache) {
+        auto s = cache->stats();
+        const uint64_t total = std::max<uint64_t>(1,
+            s.blockHits + s.coldHits + s.iceFetches + s.misses);
+        auto pct = [&](uint64_t n) { return 100.0 * n / total; };
+        printf("\nCache stats:\n");
+        printf("  Block hits:  %8llu  (%5.1f%%)\n", (unsigned long long)s.blockHits, pct(s.blockHits));
+        printf("  Cold hits:   %8llu  (%5.1f%%)\n", (unsigned long long)s.coldHits,  pct(s.coldHits));
+        printf("  Ice fetches: %8llu  (%5.1f%%)\n", (unsigned long long)s.iceFetches, pct(s.iceFetches));
+        printf("  Misses:      %8llu  (%5.1f%%)\n", (unsigned long long)s.misses,    pct(s.misses));
+        printf("  Shard hits:  %8llu    Shard misses: %llu\n",
+               (unsigned long long)s.shardHits, (unsigned long long)s.shardMisses);
+        printf("  Disk writes: %8llu    Disk bytes:   %.1f MB\n",
+               (unsigned long long)s.diskWrites, s.diskBytes / (1024.0 * 1024.0));
+    }
 
     printf("\nDone.\n");
     return 0;

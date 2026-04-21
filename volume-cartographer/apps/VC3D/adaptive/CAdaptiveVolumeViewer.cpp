@@ -12,6 +12,7 @@
 #include "vc/core/types/SampleParams.hpp"
 #include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/cache/ChunkKey.hpp"
+#include "vc/core/cache/TickCoordinator.hpp"
 #include <cstring>
 #include <unordered_set>
 
@@ -28,6 +29,8 @@
 #include <QPainterPath>
 #include <QPen>
 #include <QWindowStateChangeEvent>
+#include <QOpenGLWidget>
+#include <QSurfaceFormat>
 #include <QApplication>
 #include <QPointer>
 
@@ -47,6 +50,20 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
     , _viewerManager(manager)
 {
     _view = new CVolumeViewerView(this);
+    // GPU-backed paint device for the scene: all painter ops (QImage blit,
+    // overlay items, intersections) go through an OpenGL surface instead
+    // of Qt's CPU raster engine. The QImage framebuffer we populate in
+    // drawBackground becomes a GL texture upload + textured quad, and
+    // QGraphicsView compositing runs on the GPU rasterizer. Drops the
+    // CPU blit cost (was ~5% of frame per the perf map) and frees main-
+    // thread cycles for the sampling kernel.
+    {
+        QSurfaceFormat fmt;
+        fmt.setSwapInterval(0);  // disable vsync — we already coalesce at 16 ms
+        auto* gl = new QOpenGLWidget(_view);
+        gl->setFormat(fmt);
+        _view->setViewport(gl);
+    }
     fGraphicsView = _view;
     _view->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     _view->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -90,6 +107,21 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
         }
     });
 
+    // When the user stops actively panning / zooming, kick a full-res
+    // re-render to replace the progressive-level frame with a crisp one.
+    // 180 ms chosen to be comfortably past the typical debounce of wheel
+    // events + tail of a pan drag, so we don't flip to full-res in the
+    // middle of continued motion.
+    _interactionIdleTimer = new QTimer(this);
+    _interactionIdleTimer->setSingleShot(true);
+    _interactionIdleTimer->setInterval(180);
+    connect(_interactionIdleTimer, &QTimer::timeout, this, [this]() {
+        if (_interactive) {
+            _interactive = false;
+            scheduleRender();
+        }
+    });
+
 
     using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
@@ -122,6 +154,10 @@ CAdaptiveVolumeViewer::~CAdaptiveVolumeViewer()
     if (_chunkCbId != 0 && _volume && _volume->tieredCache()) {
         _volume->tieredCache()->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
+    }
+    if (_tickViewportSlot >= 0) {
+        vc::cache::TickCoordinator::releaseViewportSlotGlobal(_tickViewportSlot);
+        _tickViewportSlot = -1;
     }
 }
 
@@ -172,13 +208,18 @@ void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
         std::weak_ptr<Volume> volumeWeak = _volume;
         _chunkCbId = cache->addChunkReadyListener(
             [guard, volumeWeak](const vc::cache::ChunkKey&) {
+                // The pipeline's chunkArrivedFlag_ is edge-triggered via
+                // atomic exchange — this callback only fires when the flag
+                // flips false→true. Deferring the clear to submitRender (on
+                // the 16ms render timer) ensures every subsequent arrival in
+                // the same tick window finds the flag already set and takes
+                // the exchange=true/return-early branch — no listener fire,
+                // no cross-thread event post. One wake per 16ms tick max,
+                // instead of one per chunk burst.
                 QMetaObject::invokeMethod(qApp, [guard, volumeWeak]() {
                     if (!guard) return;
                     auto vol = volumeWeak.lock();
                     if (!vol || guard->_volume != vol) return;
-                    if (auto* c = vol->tieredCache()) {
-                        c->clearChunkArrivedFlag();
-                    }
                     guard->scheduleRender();
                 }, Qt::QueuedConnection);
             });
@@ -359,8 +400,33 @@ void CAdaptiveVolumeViewer::scheduleRender()
 {
     syncCameraTransform();
     _renderPending = true;
-    if (!_renderTimer->isActive())
+    if (!_renderTimer->isActive()) {
+        // 16 ms (~60 fps) for crisp idle frames; 33 ms (~30 fps) while the
+        // user is actively panning/zooming. At progressive +1 pyramid the
+        // preview is already blurrier than a settled frame, so 30 fps
+        // matches what the eye perceives during motion and halves the
+        // render work the kernel has to do under load.
+        _renderTimer->setInterval(_interactive ? 33 : 16);
         _renderTimer->start();
+    }
+}
+
+// Toggle to re-enable progressive rendering during pan/zoom. The motion-
+// time resolution drop felt visually jarring in practice, so it's off by
+// default — but the plumbing (submitRender level bump, idle-timer catch-
+// up, 30 fps interactive coalesce) stays in place so it can be switched
+// back on with a single recompile.
+static constexpr bool kProgressiveRenderingEnabled = false;
+
+void CAdaptiveVolumeViewer::beginInteraction()
+{
+    // Called from any event path that represents live user motion (pan
+    // drag, zoom wheel). Marks _interactive so the next submitRender
+    // picks the progressive pyramid level, and arms the idle timer so a
+    // full-res render fires once motion stops.
+    if (!kProgressiveRenderingEnabled) return;
+    _interactive = true;
+    _interactionIdleTimer->start();
 }
 
 void CAdaptiveVolumeViewer::syncCameraTransform()
@@ -383,8 +449,35 @@ void CAdaptiveVolumeViewer::reloadPerfSettings()
     _highlightDownscaled = s.value("viewer_controls/highlight_downscaled", false).toBool();
 }
 
+void CAdaptiveVolumeViewer::recordRenderDuration(double seconds)
+{
+    if (seconds <= 0.0) return;
+    _renderDurationsSec[_renderDurationHead] = seconds;
+    _renderDurationHead = (_renderDurationHead + 1) % kFpsRingSize;
+    if (_renderDurationCount < kFpsRingSize) ++_renderDurationCount;
+}
+
+float CAdaptiveVolumeViewer::measuredFps() const
+{
+    if (_renderDurationCount == 0) return 0.0f;
+    double sum = 0.0;
+    for (int i = 0; i < _renderDurationCount; ++i) sum += _renderDurationsSec[i];
+    const double avg = sum / double(_renderDurationCount);
+    if (avg <= 1e-6) return 0.0f;
+    return float(1.0 / avg);
+}
+
 void CAdaptiveVolumeViewer::submitRender()
 {
+    // Re-arm the chunk-arrival edge detector for the next tick window.
+    // Any chunk that decodes during this render will set the flag again and
+    // fire exactly one post-event to trigger the next render. See the
+    // addChunkReadyListener callback above for why the clear lives here.
+    if (_volume) {
+        if (auto* c = _volume->tieredCache()) c->clearChunkArrivedFlag();
+    }
+    const auto renderT0 = std::chrono::steady_clock::now();
+
     const CompositeParams& lightP = _compositeSettings.params;
     const bool rakingEnabled = _compositeSettings.postRakingEnabled;
     const float rakingAz = _compositeSettings.postRakingAzimuth;
@@ -403,15 +496,36 @@ void CAdaptiveVolumeViewer::submitRender()
     int fbH = _framebuffer.height();
     if (fbW <= 0 || fbH <= 0) return;
 
-    // Always populate the level buffer — the debug overlay is optional, but
-    // we need the per-pixel fallback depth to enqueue the missing high-res
-    // chunks below regardless of whether the overlay is shown.
-    if (_levelBuffer.rows != fbH || _levelBuffer.cols != fbW) {
-        _levelBuffer.create(fbH, fbW);
+    // Publish viewport snapshot for the tick coordinator. Used by
+    // prefetch coalescing (so the tick drain knows which pipelines/levels
+    // are in use) and future slice scoping. Slot is lazy-allocated here
+    // and released in the destructor.
+    if (_tickViewportSlot < 0) {
+        _tickViewportSlot = vc::cache::TickCoordinator::acquireViewportSlotGlobal();
     }
-    _levelBuffer.setTo(0);
-    uint8_t* lvlOutPtr = _levelBuffer.ptr<uint8_t>(0);
-    const int lvlOutStride = int(_levelBuffer.step1());
+    if (_tickViewportSlot >= 0) {
+        vc::cache::ViewportSnapshot vs;
+        vs.active = true;
+        vs.level = _camera.dsScaleIdx;
+        vs.pipeline = _volume->tieredCache();
+        vc::cache::TickCoordinator::publishViewportGlobal(_tickViewportSlot, vs);
+    }
+
+    // Level buffer is only consumed by the downscale-highlight debug
+    // overlay below; when the overlay is off, pass a null pointer to the
+    // kernel so it skips per-pixel level writes entirely, and skip the
+    // full-framebuffer setTo(0) memset here. At 1080p that memset is
+    // ~8 MB/frame of unnecessary bandwidth.
+    uint8_t* lvlOutPtr = nullptr;
+    int lvlOutStride = 0;
+    if (highlightDownscaled) {
+        if (_levelBuffer.rows != fbH || _levelBuffer.cols != fbW) {
+            _levelBuffer.create(fbH, fbW);
+        }
+        _levelBuffer.setTo(0);
+        lvlOutPtr = _levelBuffer.ptr<uint8_t>(0);
+        lvlOutStride = int(_levelBuffer.step1());
+    }
 
     auto* fbBits = reinterpret_cast<uint32_t*>(_framebuffer.bits());
     int fbStride = _framebuffer.bytesPerLine() / 4;
@@ -468,6 +582,14 @@ void CAdaptiveVolumeViewer::submitRender()
     // those pixels to whichever coarser level is resident — no whole-frame
     // resolution cycling, and cached fine chunks are used immediately.
     sp.level = _camera.dsScaleIdx;
+    // During live interaction (pan drag, zoom wheel) bump the pyramid
+    // level one step coarser. Each step halves the voxels read per
+    // sample, which cuts the ray-march cost ~2-4x for a still-coherent
+    // preview frame. The interaction-idle timer triggers a full-res
+    // render ~180 ms after motion stops.
+    if (_interactive) {
+        sp.level = std::min(sp.level + 1, std::max(0, numLevels - 1));
+    }
     sp.method = _samplingMethod;
 
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
@@ -617,8 +739,13 @@ void CAdaptiveVolumeViewer::submitRender()
                 pNormals, nullptr,
                 numLayers, zStart, zStep,
                 fbW, fbH, method, lut.data(), sampleMethod,
-            &lightP,  // sampler uses lightP for volumetric and lighting paths
-            lvlOutPtr, lvlOutStride);
+                &lightP,  // sampler uses lightP for volumetric and lighting paths
+                lvlOutPtr, lvlOutStride,
+                // Coords cached → prior frame already did the chunk
+                // enumeration + fetchInteractive for this exact geometry.
+                // The per-sample adaptive-fallback path still handles any
+                // block not yet resident, so correctness is preserved.
+                cacheHit);
         }
     }
 
@@ -837,6 +964,8 @@ void CAdaptiveVolumeViewer::submitRender()
     // blocks the UI thread synchronously until paintEvent returns, which
     // stalls every frame during pans/zooms.
     _view->viewport()->update();
+    const auto renderDt = std::chrono::steady_clock::now() - renderT0;
+    recordRenderDuration(std::chrono::duration<double>(renderDt).count());
     updateStatusLabel();
 }
 
@@ -913,6 +1042,7 @@ void CAdaptiveVolumeViewer::panByF(float dx, float dy)
     }
 
     _cachedStretchValid = false;
+    beginInteraction();
     scheduleRender();
     emit overlaysUpdated();
 }
@@ -967,6 +1097,7 @@ void CAdaptiveVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     // Zoom can fire as fast as the keyboard repeats. scheduleRender()
     // coalesces bursts into the 60 fps render timer so we don't render
     // dozens of intermediate frames the user never sees.
+    beginInteraction();
     scheduleRender();
     emit overlaysUpdated();
 }
@@ -1042,6 +1173,7 @@ void CAdaptiveVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMo
                 }
             }
             _camera.zOff = std::clamp(_camera.zOff + dz, -maxZ, maxZ);
+            beginInteraction();
             scheduleRender();
             updateStatusLabel();
         }
@@ -1657,8 +1789,11 @@ void CAdaptiveVolumeViewer::resetSurfaceOffsets()
 
 void CAdaptiveVolumeViewer::setVolumeWindow(float low, float high)
 {
-    _windowLow = std::clamp(low, 0.0f, 65535.0f);
-    _windowHigh = std::clamp(high, 0.0f, 65535.0f);
+    const float lo = std::clamp(low, 0.0f, 65535.0f);
+    const float hi = std::clamp(high, 0.0f, 65535.0f);
+    if (lo == _windowLow && hi == _windowHigh) return;
+    _windowLow = lo;
+    _windowHigh = hi;
     if (_volume) scheduleRender();
 }
 
@@ -1715,6 +1850,11 @@ void CAdaptiveVolumeViewer::updateStatusLabel()
         .arg(static_cast<double>(_camera.scale), 0, 'f', 2)
         .arg(1 << _camera.dsScaleIdx)
         .arg(static_cast<double>(_camera.zOff), 0, 'f', 1);
+
+    const float fps = measuredFps();
+    if (fps > 0.0f) {
+        status += QString(" | %1 fps").arg(static_cast<double>(fps), 0, 'f', 1);
+    }
 
     if (_volume->tieredCache()) {
         auto s = _volume->tieredCache()->stats();
