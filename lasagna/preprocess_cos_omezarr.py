@@ -659,10 +659,10 @@ def _release_memmap_pages(arr: np.ndarray, z0: int, z1: int) -> None:
 
 
 def _edt_read_worker(args):
-	"""Multiprocessing worker: open zarr, read chunk with overlap, binarize.
+	"""Multiprocessing worker: read chunk from zarr with overlap, binarize.
 
-	Each worker opens its own zarr handle (zarr3 is not safe for concurrent
-	reads from a shared handle).  Returns (chunk_index, binary_array).
+	Each worker opens its own zarr handle (zarr3 safe).
+	Returns (chunk_index, binary_bool_array).
 	"""
 	idx, pred_path, cz0, cz1, cy0, cy1, cx0, cx1, overlap, pZ, pY, pX = args
 	pred = zarr.open(str(pred_path), mode="r")
@@ -676,11 +676,55 @@ def _edt_read_worker(args):
 	return idx, (raw > 0)
 
 
+def _edt_write_worker(args):
+	"""Multiprocessing worker: downsample encoded uint8 and write to zarr.
+
+	Each worker opens its own zarr handle (zarr3 safe).
+	"""
+	(idx, dt_u8, out_path, out_level,
+	 cz0, cz1, cy0, cy1, cx0, cx1,
+	 overlap, pZ, pY, pX,
+	 pred_z0, pred_y0, pred_x0,
+	 out_z0, out_y0, out_x0,
+	 scaledown) = args
+
+	rz0 = max(0, cz0 - overlap)
+	ry0 = max(0, cy0 - overlap)
+	rx0 = max(0, cx0 - overlap)
+	sz, sy, sx = cz1 - cz0, cy1 - cy0, cx1 - cx0
+	center = dt_u8[cz0 - rz0:cz0 - rz0 + sz,
+				   cy0 - ry0:cy0 - ry0 + sy,
+				   cx0 - rx0:cx0 - rx0 + sx]
+
+	out_arr = zarr.open(str(out_path), mode="r+")[str(out_level)]
+	out_shape = tuple(int(v) for v in out_arr.shape)
+
+	for zl in range(0, sz, scaledown):
+		slc = center[zl]
+		if scaledown > 1:
+			oh = max(1, slc.shape[0] // scaledown)
+			ow = max(1, slc.shape[1] // scaledown)
+			slc = cv2.resize(slc, (ow, oh), interpolation=cv2.INTER_AREA)
+		ozi = out_z0 + (cz0 - pred_z0 + zl) // scaledown
+		oyi = out_y0 + (cy0 - pred_y0) // scaledown
+		oxi = out_x0 + (cx0 - pred_x0) // scaledown
+		oy_end = min(out_shape[1], oyi + slc.shape[0])
+		ox_end = min(out_shape[2], oxi + slc.shape[1])
+		wy = oy_end - oyi
+		wx = ox_end - oxi
+		if ozi < out_shape[0] and wy > 0 and wx > 0:
+			out_arr[ozi, oyi:oy_end, oxi:ox_end] = slc[:wy, :wx]
+
+	return idx
+
+
 def _compute_pred_dt_slab(
 	*,
 	pred_zarr,
 	pred_path: str,
 	output_level_arr,
+	output_omezarr_path: str,
+	output_level_key: str,
 	pred_z0: int, pred_z1: int,
 	pred_y0: int, pred_y1: int,
 	pred_x0: int, pred_x1: int,
@@ -688,6 +732,7 @@ def _compute_pred_dt_slab(
 	scaledown: int,
 	overlap: int = 48,
 	edt_chunk: int = 448,
+	ome_chunk: int = 32,
 	progress: dict | None = None,
 	read_workers: int = 0,
 ) -> None:
@@ -707,126 +752,147 @@ def _compute_pred_dt_slab(
 	_MAX_DT = 48
 	pZ, pY, pX = (int(v) for v in pred_zarr.shape)
 
-	# Build work list
+	# Align edt_chunk to output zarr chunk boundaries to avoid write collisions
+	# and enable per-chunk resume.  Output chunk in pred coords = ome_chunk * scaledown.
+	out_chunk_in_pred = max(1, scaledown) * max(1, ome_chunk)
+	if edt_chunk % out_chunk_in_pred != 0:
+		edt_chunk = max(out_chunk_in_pred, (edt_chunk // out_chunk_in_pred) * out_chunk_in_pred)
+	# Align region starts to output chunk boundaries (round down start, round up end)
+	aligned_z0 = (pred_z0 // out_chunk_in_pred) * out_chunk_in_pred
+	aligned_y0 = (pred_y0 // out_chunk_in_pred) * out_chunk_in_pred
+	aligned_x0 = (pred_x0 // out_chunk_in_pred) * out_chunk_in_pred
+	aligned_z1 = min(pZ, ((pred_z1 + out_chunk_in_pred - 1) // out_chunk_in_pred) * out_chunk_in_pred)
+	aligned_y1 = min(pY, ((pred_y1 + out_chunk_in_pred - 1) // out_chunk_in_pred) * out_chunk_in_pred)
+	aligned_x1 = min(pX, ((pred_x1 + out_chunk_in_pred - 1) // out_chunk_in_pred) * out_chunk_in_pred)
+
+	# Helper: check if an output chunk file already exists (zarr v2, dim_sep="/")
+	def _out_chunk_exists(cz0, cy0, cx0):
+		"""Check if the output zarr chunk for this pred-src region exists."""
+		ozi = out_z0 + (cz0 - pred_z0) // scaledown
+		oyi = out_y0 + (cy0 - pred_y0) // scaledown
+		oxi = out_x0 + (cx0 - pred_x0) // scaledown
+		iz = ozi // ome_chunk
+		iy = oyi // ome_chunk
+		ix = oxi // ome_chunk
+		chunk_path = os.path.join(output_omezarr_path, output_level_key, str(iz), str(iy), str(ix))
+		return os.path.isfile(chunk_path)
+
+	# Build work list, skipping chunks whose output already exists
 	work: list[tuple[int, int, int, int, int, int]] = []
-	for cz0 in range(pred_z0, pred_z1, edt_chunk):
-		cz1 = min(pred_z1, cz0 + edt_chunk)
-		for cy0 in range(pred_y0, pred_y1, edt_chunk):
-			cy1 = min(pred_y1, cy0 + edt_chunk)
-			for cx0 in range(pred_x0, pred_x1, edt_chunk):
-				cx1 = min(pred_x1, cx0 + edt_chunk)
+	skipped = 0
+	for cz0 in range(aligned_z0, aligned_z1, edt_chunk):
+		cz1 = min(aligned_z1, cz0 + edt_chunk)
+		for cy0 in range(aligned_y0, aligned_y1, edt_chunk):
+			cy1 = min(aligned_y1, cy0 + edt_chunk)
+			for cx0 in range(aligned_x0, aligned_x1, edt_chunk):
+				cx1 = min(aligned_x1, cx0 + edt_chunk)
+				if _out_chunk_exists(cz0, cy0, cx0):
+					skipped += 1
+					continue
 				work.append((cz0, cz1, cy0, cy1, cx0, cx1))
 
 	n_chunks = len(work)
+	if skipped > 0:
+		print(f"[pred_dt] skipped {skipped} already-processed chunks", flush=True)
 	if n_chunks == 0:
 		return
 
-	# Build args for multiprocessing workers
-	mp_args = []
-	for idx, (cz0, cz1, cy0, cy1, cx0, cx1) in enumerate(work):
-		mp_args.append((idx, pred_path, cz0, cz1, cy0, cy1, cx0, cx1, overlap, pZ, pY, pX))
-
 	t0 = time.time()
-	n_readers = min(read_workers if read_workers > 0 else max(1, (os.cpu_count() or 4) // 2),
+	n_workers = min(read_workers if read_workers > 0 else max(1, (os.cpu_count() or 4) // 2),
 				   n_chunks)
 
-	print(f"[pred_dt] {n_chunks} chunks, {n_readers} read workers, edt_chunk={edt_chunk}",
+	print(f"[pred_dt] {n_chunks} chunks to process, {n_workers} workers, edt_chunk={edt_chunk}",
 		  flush=True)
 
-	# --- Write function (CPU only — downsample + zarr write) ---
-	def _write_encoded(idx, dt_u8_np):
-		"""Downsample encoded uint8 and write to zarr (CPU only)."""
-		cz0, cz1, cy0, cy1, cx0, cx1 = work[idx]
-		rz0 = max(0, cz0 - overlap)
-		ry0 = max(0, cy0 - overlap)
-		rx0 = max(0, cx0 - overlap)
-		sz, sy, sx = cz1 - cz0, cy1 - cy0, cx1 - cx0
-		center = dt_u8_np[cz0 - rz0:cz0 - rz0 + sz,
-						  cy0 - ry0:cy0 - ry0 + sy,
-						  cx0 - rx0:cx0 - rx0 + sx]
-		for zl in range(0, sz, scaledown):
-			slc = center[zl]
-			if scaledown > 1:
-				oh = max(1, slc.shape[0] // scaledown)
-				ow = max(1, slc.shape[1] // scaledown)
-				slc = cv2.resize(slc, (ow, oh), interpolation=cv2.INTER_AREA)
-			ozi = out_z0 + (cz0 - pred_z0 + zl) // scaledown
-			oyi = out_y0 + (cy0 - pred_y0) // scaledown
-			oxi = out_x0 + (cx0 - pred_x0) // scaledown
-			oy_end = min(int(output_level_arr.shape[1]), oyi + slc.shape[0])
-			ox_end = min(int(output_level_arr.shape[2]), oxi + slc.shape[1])
-			wy = oy_end - oyi
-			wx = ox_end - oxi
-			if ozi < int(output_level_arr.shape[0]) and wy > 0 and wx > 0:
-				output_level_arr[ozi, oyi:oy_end, oxi:ox_end] = slc[:wy, :wx]
+	# --- 3-stage pipeline: processes READ → main GPU EDT → processes WRITE ---
+	# GPU must stay in the main process (CUDA can't fork).
+	# Readers prefetch in parallel, GPU processes in order, writers flush in parallel.
 
-	# --- Pipeline: parallel readers → GPU (EDT + encode) → CPU (downsample + write) ---
-	# EDT + signed encoding all on GPU. Only uint8 result transfers to CPU.
-	# GPU work on chunk N overlaps with CPU write of chunk N-1.
+	# Build read args
+	read_args = []
+	for idx, (cz0, cz1, cy0, cy1, cx0, cx1) in enumerate(work):
+		read_args.append((idx, pred_path, cz0, cz1, cy0, cy1, cx0, cx1, overlap, pZ, pY, pX))
+
+	# Pending read results (may arrive out of order)
 	pending: dict[int, np.ndarray] = {}
 	next_gpu_idx = 0
-	prev_write: tuple | None = None  # (idx, dt_u8_np) awaiting CPU write
-	gpu_stream = cp.cuda.Stream(non_blocking=True)
+	write_pool = _mp.Pool(processes=n_workers)
+	write_futures = []
+	done_count = [0]
 
-	def _flush_progress():
-		done_i = next_gpu_idx
-		if done_i == 0:
-			return
-		if progress is not None:
-			progress["edt_done"] = progress.get("edt_done", 0) + 1
-		elapsed = max(1e-6, time.time() - t0)
-		eta = elapsed / done_i * (n_chunks - done_i)
-		overall = ""
-		if progress is not None:
-			oe = max(1e-6, time.time() - progress["t0"])
-			frac = progress.get("tiles_done", 0) / max(1, progress.get("tiles_total", 1))
-			edt_frac = progress.get("edt_done", 0) / max(1, progress.get("edt_total_est", 1))
-			overall_frac = 0.7 * frac + 0.3 * edt_frac
-			if overall_frac > 0.01:
-				overall_eta = oe / overall_frac * (1.0 - overall_frac)
-				overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
-		print(f"\r[pred_dt] chunk {done_i}/{n_chunks} "
-			  f"({100.0 * done_i / n_chunks:.0f}%) "
-			  f"eta {int(eta // 60):02d}:{int(eta % 60):02d}"
-			  f"{overall}  ",
-			  end="", flush=True)
+	with _mp.Pool(processes=n_workers) as read_pool:
+		read_iter = read_pool.imap_unordered(_edt_read_worker, read_args)
 
-	with _mp.Pool(processes=n_readers) as pool:
-		result_iter = pool.imap_unordered(_edt_read_worker, mp_args)
-
-		for idx, binary in result_iter:
+		for idx, binary in read_iter:
 			pending[idx] = binary
 
+			# Process chunks in order on GPU as they become ready
 			while next_gpu_idx in pending:
 				cur_binary = pending.pop(next_gpu_idx)
+				cz0, cz1, cy0, cy1, cx0, cx1 = work[next_gpu_idx]
 
-				# GPU: EDT + signed encoding → uint8 (all on GPU)
-				with gpu_stream:
-					m_gpu = cp.asarray(cur_binary)
-					outer_dt = cnd.distance_transform_edt(~m_gpu)
-					inner_dt = cnd.distance_transform_edt(m_gpu)
-					outer_enc = (128 - cp.clip(cp.round(outer_dt), 1, _MAX_DT)).astype(cp.uint8)
-					inner_enc = (127 + cp.clip(cp.round(inner_dt), 1, _MAX_DT)).astype(cp.uint8)
-					dt_enc_gpu = cp.where(m_gpu, inner_enc, outer_enc)
-					del m_gpu, outer_dt, inner_dt, outer_enc, inner_enc
+				# GPU EDT + encode (main process only)
+				m_gpu = cp.asarray(cur_binary)
+				outer_dt = cnd.distance_transform_edt(~m_gpu)
+				inner_dt = cnd.distance_transform_edt(m_gpu)
+				outer_enc = (128 - cp.clip(cp.round(outer_dt), 1, _MAX_DT)).astype(cp.uint8)
+				inner_enc = (127 + cp.clip(cp.round(inner_dt), 1, _MAX_DT)).astype(cp.uint8)
+				dt_enc_gpu = cp.where(m_gpu, inner_enc, outer_enc)
+				dt_u8 = cp.asnumpy(dt_enc_gpu)
+				del m_gpu, outer_dt, inner_dt, outer_enc, inner_enc, dt_enc_gpu
 
-				# While GPU works, write PREVIOUS chunk to zarr (CPU)
-				if prev_write is not None:
-					_write_encoded(*prev_write)
-					_flush_progress()
+				# Dispatch write to worker process (parallel downsample + zarr write)
+				write_args = (
+					next_gpu_idx, dt_u8, output_omezarr_path, output_level_key,
+					cz0, cz1, cy0, cy1, cx0, cx1,
+					overlap, pZ, pY, pX,
+					pred_z0, pred_y0, pred_x0,
+					out_z0, out_y0, out_x0,
+					scaledown,
+				)
+				write_futures.append(write_pool.apply_async(_edt_write_worker, (write_args,)))
 
-				# Wait for GPU, transfer only the final uint8 to CPU
-				gpu_stream.synchronize()
-				dt_u8_np = cp.asnumpy(dt_enc_gpu)
-				del dt_enc_gpu
-
-				prev_write = (next_gpu_idx, dt_u8_np)
 				next_gpu_idx += 1
 
-	# Write last chunk
-	if prev_write is not None:
-		_write_encoded(*prev_write)
-		_flush_progress()
+				# Collect completed writes for progress
+				new_futures = []
+				for wf in write_futures:
+					if wf.ready():
+						wf.get()  # raise if error
+						done_count[0] += 1
+						if progress is not None:
+							progress["edt_done"] = progress.get("edt_done", 0) + 1
+					else:
+						new_futures.append(wf)
+				write_futures = new_futures
+
+				elapsed = max(1e-6, time.time() - t0)
+				gpu_done = next_gpu_idx
+				eta = elapsed / gpu_done * (n_chunks - gpu_done)
+				overall = ""
+				if progress is not None:
+					oe = max(1e-6, time.time() - progress["t0"])
+					frac = progress.get("tiles_done", 0) / max(1, progress.get("tiles_total", 1))
+					edt_frac = progress.get("edt_done", 0) / max(1, progress.get("edt_total_est", 1))
+					overall_frac = 0.7 * frac + 0.3 * edt_frac
+					if overall_frac > 0.01:
+						overall_eta = oe / overall_frac * (1.0 - overall_frac)
+						overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
+				print(f"\r[pred_dt] gpu {gpu_done}/{n_chunks} "
+					  f"written {done_count[0]}/{n_chunks} "
+					  f"({100.0 * gpu_done / n_chunks:.0f}%) "
+					  f"eta {int(eta // 60):02d}:{int(eta % 60):02d}"
+					  f"{overall}  ",
+					  end="", flush=True)
+
+	# Wait for remaining writes
+	for wf in write_futures:
+		wf.get()
+		done_count[0] += 1
+		if progress is not None:
+			progress["edt_done"] = progress.get("edt_done", 0) + 1
+	write_pool.close()
+	write_pool.join()
 
 	cp.get_default_memory_pool().free_all_blocks()
 	print(f"\r[pred_dt] {n_chunks} chunks in {time.time() - t0:.1f}s" + " " * 30,
@@ -1624,7 +1690,7 @@ def run_preprocess_3d(
 	base_ref: str | None = None,
 	base_scale: int | None = None,
 	n_levels: int = 5,
-	ome_chunk: int = 128,
+	ome_chunk: int = 32,
 ) -> None:
 	"""Run 3D UNet inference and write .lasagna.json with OME-Zarr pyramids.
 
@@ -1914,12 +1980,15 @@ def run_preprocess_3d(
 							pred_zarr=pred_dt_zarr,
 							pred_path=pred_dt_path,
 							output_level_arr=dt_lv_arr,
+							output_omezarr_path=dt_omezarr_path,
+							output_level_key=str(cos_level),
 							pred_z0=pdt_z0, pred_z1=pdt_z1,
 							pred_y0=pdt_y0, pred_y1=pdt_y1,
 							pred_x0=pdt_x0, pred_x1=pdt_x1,
 							out_z0=cos_oz0 + eff_out_zs,
 							out_y0=cos_oy0, out_x0=cos_ox0,
 							scaledown=pred_per_cos,
+							ome_chunk=oc,
 							progress=_progress,
 						)
 
@@ -2787,7 +2856,7 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 			 "needed chunks before inference.")
 	p.add_argument("--levels", type=int, default=5,
 		help="Number of OME-Zarr pyramid levels to generate (default 5).")
-	p.add_argument("--ome-chunk", type=int, default=128,
+	p.add_argument("--ome-chunk", type=int, default=32,
 		help="Chunk size for OME-Zarr output levels (default 128).")
 	args = p.parse_args(argv)
 
