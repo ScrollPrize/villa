@@ -966,13 +966,21 @@ public:
             auto it = registry.find(meta.compressor_id);
             if (it != registry.end()) codec = it->second;
         } else if (version == ZarrVersion::v3) {
-            // Look for bytes-to-bytes codecs in the pipeline.
-            for (const auto& cc : meta.codecs) {
-                if (cc.name != "bytes" && cc.name != "transpose" && cc.name != "sharding_indexed") {
-                    auto it = registry.find(cc.name);
-                    if (it != registry.end()) { codec = it->second; break; }
+            // Look for bytes-to-bytes codecs in the pipeline.  For sharded
+            // arrays the outer pipeline only has sharding_indexed; the real
+            // per-inner-chunk compressor lives in shard_config->sub_codecs.
+            auto scan = [&](const std::vector<ZarrCodecConfig>& cs) {
+                for (const auto& cc : cs) {
+                    if (cc.name != "bytes" && cc.name != "transpose"
+                        && cc.name != "sharding_indexed") {
+                        auto it = registry.find(cc.name);
+                        if (it != registry.end()) { codec = it->second; return true; }
+                    }
                 }
-            }
+                return false;
+            };
+            if (meta.shard_config) scan(meta.shard_config->sub_codecs);
+            if (!codec.decompress) scan(meta.codecs);
         }
 
         return ZarrArray(path, std::move(meta), std::move(codec), std::move(registry));
@@ -1055,8 +1063,14 @@ public:
 
     [[nodiscard]] std::optional<std::vector<std::byte>>
     read_chunk(std::span<const std::size_t> chunk_indices) const {
-        if (is_sharded())
-            return read_inner_chunk_from_shard(chunk_indices);
+        if (is_sharded()) {
+            auto raw = read_inner_chunk_from_shard(chunk_indices);
+            if (!raw) return std::nullopt;
+            if (codec_.decompress && needs_decompression()) {
+                return codec_.decompress(*raw, meta_.sub_chunk_byte_size());
+            }
+            return raw;
+        }
 
         auto raw = read_chunk_raw(chunk_indices);
         if (!raw) return std::nullopt;
@@ -1453,10 +1467,15 @@ private:
         if (meta_.version == ZarrVersion::v2)
             return !meta_.compressor_id.empty();
         // v3: check for bytes-to-bytes codecs in pipeline.
-        for (const auto& cc : meta_.codecs)
-            if (cc.name != "bytes" && cc.name != "transpose" && cc.name != "sharding_indexed")
-                return true;
-        return false;
+        auto has_bb = [](const std::vector<ZarrCodecConfig>& cs) {
+            for (const auto& cc : cs)
+                if (cc.name != "bytes" && cc.name != "transpose"
+                    && cc.name != "sharding_indexed")
+                    return true;
+            return false;
+        };
+        if (meta_.shard_config && has_bb(meta_.shard_config->sub_codecs)) return true;
+        return has_bb(meta_.codecs);
     }
 
     [[nodiscard]] bool needs_decompression() const noexcept {

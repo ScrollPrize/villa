@@ -323,22 +323,31 @@ static CompressorConfig compressorFromMeta(const utils::ZarrMetadata& meta, int 
         return cfg;
     }
 
-    // v3: walk codec pipeline for a bytes→bytes codec
-    for (const auto& cc : meta.codecs) {
-        if (cc.name == "blosc") { cfg.id = CompressorId::Blosc; return cfg; }
-        if (cc.name == "zstd")  { cfg.id = CompressorId::Zstd;  return cfg; }
-        if (cc.name == "lz4")   { cfg.id = CompressorId::Lz4;   return cfg; }
-        if (cc.name == "gzip" || cc.name == "zlib") { cfg.id = CompressorId::Gzip; return cfg; }
-        if (cc.name == "c3d")   {
-            cfg.id = CompressorId::C3d;
-            if (cc.configuration && cc.configuration->is_object()
-                && cc.configuration->contains("target_ratio")) {
-                cfg.c3d_target_ratio = cc.configuration->value(
-                    "target_ratio", cfg.c3d_target_ratio);
+    // v3: walk codec pipelines for a bytes→bytes codec.  For sharded
+    // arrays the outer codecs list has only sharding_indexed; the real
+    // per-inner-chunk compressor lives in shard_config->sub_codecs.
+    auto scan = [&](const std::vector<utils::ZarrCodecConfig>& codecs) -> bool {
+        for (const auto& cc : codecs) {
+            if (cc.name == "blosc") { cfg.id = CompressorId::Blosc; return true; }
+            if (cc.name == "zstd")  { cfg.id = CompressorId::Zstd;  return true; }
+            if (cc.name == "lz4")   { cfg.id = CompressorId::Lz4;   return true; }
+            if (cc.name == "gzip" || cc.name == "zlib") {
+                cfg.id = CompressorId::Gzip; return true;
             }
-            return cfg;
+            if (cc.name == "c3d") {
+                cfg.id = CompressorId::C3d;
+                if (cc.configuration && cc.configuration->is_object()
+                    && cc.configuration->contains("target_ratio")) {
+                    cfg.c3d_target_ratio = cc.configuration->value(
+                        "target_ratio", cfg.c3d_target_ratio);
+                }
+                return true;
+            }
         }
-    }
+        return false;
+    };
+    if (meta.shard_config && scan(meta.shard_config->sub_codecs)) return cfg;
+    if (scan(meta.codecs)) return cfg;
 
     cfg.id = CompressorId::None;
     return cfg;
@@ -383,11 +392,12 @@ struct VcDataset::Impl {
     // zstd, lz4, gzip). ZarrArray::open picks the right codec from meta.
     static utils::ZarrArray::CodecRegistry buildCodecRegistry(int dtypeSize) {
         utils::ZarrArray::CodecRegistry reg;
-        for (const char* name : {"blosc", "zstd", "lz4", "gzip", "zlib"}) {
+        for (const char* name : {"blosc", "zstd", "lz4", "gzip", "zlib", "c3d"}) {
             CompressorConfig cfg;
             if      (std::string(name) == "blosc") cfg.id = CompressorId::Blosc;
             else if (std::string(name) == "zstd")  cfg.id = CompressorId::Zstd;
             else if (std::string(name) == "lz4")   cfg.id = CompressorId::Lz4;
+            else if (std::string(name) == "c3d")   cfg.id = CompressorId::C3d;
             else                                   cfg.id = CompressorId::Gzip;
             cfg.blosc_typesize = dtypeSize;
             reg[name] = codecFromConfig(cfg);
