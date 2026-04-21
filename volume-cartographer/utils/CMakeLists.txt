@@ -85,6 +85,17 @@ target_compile_definitions(utils_video_codec PUBLIC UTILS_HAS_VIDEO_CODEC=1)
 set_target_properties(utils_video_codec PROPERTIES AUTOMOC OFF AUTORCC OFF AUTOUIC OFF)
 message(STATUS "Video codec: H.265 only (x265 + libde265)")
 
+# c3d volumetric codec (single-TU vendored library in libs/c3d).
+add_library(utils_c3d_codec STATIC src/c3d_codec.cpp)
+target_include_directories(utils_c3d_codec PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:include>
+)
+target_compile_features(utils_c3d_codec PUBLIC cxx_std_23)
+target_link_libraries(utils_c3d_codec PUBLIC c3d)
+target_compile_definitions(utils_c3d_codec PUBLIC UTILS_HAS_C3D_CODEC=1)
+set_target_properties(utils_c3d_codec PROPERTIES AUTOMOC OFF AUTORCC OFF AUTOUIC OFF)
+
 # Tests
 if(VC_BUILD_TESTS)
     enable_testing()

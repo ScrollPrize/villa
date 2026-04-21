@@ -17,6 +17,7 @@
 #include <zstd.h>
 #include <lz4.h>
 #include <zlib.h>
+#include <utils/c3d_codec.hpp>
 
 namespace vc {
 
@@ -24,7 +25,7 @@ namespace vc {
 // Compressor configuration (parsed from .zarray JSON)
 // ============================================================================
 
-enum class CompressorId { None, Blosc, Zstd, Lz4, Gzip };
+enum class CompressorId { None, Blosc, Zstd, Lz4, Gzip, C3d };
 
 struct CompressorConfig {
     CompressorId id = CompressorId::None;
@@ -36,6 +37,8 @@ struct CompressorConfig {
     int blosc_blocksize = 0;
     // Zstd/Gzip level
     int level = 3;
+    // c3d target compression ratio (> 1.0). Default 10 ≈ 46 dB on scroll CT.
+    float c3d_target_ratio = 10.0f;
 };
 
 namespace {
@@ -199,6 +202,20 @@ std::vector<std::byte> gzipCompress(std::span<const std::byte> input, const Comp
     return output;
 }
 
+std::vector<std::byte> c3dDecompress(std::span<const std::byte> input, size_t outputSize)
+{
+    utils::C3dCodecParams p;
+    return utils::c3d_decode(input, outputSize, p);
+}
+
+std::vector<std::byte> c3dCompress(std::span<const std::byte> input,
+                                   const CompressorConfig& cfg)
+{
+    utils::C3dCodecParams p;
+    p.target_ratio = cfg.c3d_target_ratio;
+    return utils::c3d_encode(input, p);
+}
+
 std::vector<std::byte> gzipDecompress(std::span<const std::byte> input, size_t outputSize)
 {
     z_stream stream{};
@@ -235,6 +252,8 @@ std::vector<std::byte> decompressBytes(const CompressorConfig& cfg,
         return lz4Decompress(input, outputSize);
     case CompressorId::Gzip:
         return gzipDecompress(input, outputSize);
+    case CompressorId::C3d:
+        return c3dDecompress(input, outputSize);
     }
 
     throw std::runtime_error("unsupported zarr compressor");
@@ -254,6 +273,8 @@ std::vector<std::byte> compressBytes(const CompressorConfig& cfg,
         return lz4Compress(input, cfg);
     case CompressorId::Gzip:
         return gzipCompress(input, cfg);
+    case CompressorId::C3d:
+        return c3dCompress(input, cfg);
     }
 
     throw std::runtime_error("unsupported zarr compressor");
@@ -302,13 +323,31 @@ static CompressorConfig compressorFromMeta(const utils::ZarrMetadata& meta, int 
         return cfg;
     }
 
-    // v3: walk codec pipeline for a bytes→bytes codec
-    for (const auto& cc : meta.codecs) {
-        if (cc.name == "blosc") { cfg.id = CompressorId::Blosc; return cfg; }
-        if (cc.name == "zstd")  { cfg.id = CompressorId::Zstd;  return cfg; }
-        if (cc.name == "lz4")   { cfg.id = CompressorId::Lz4;   return cfg; }
-        if (cc.name == "gzip" || cc.name == "zlib") { cfg.id = CompressorId::Gzip; return cfg; }
-    }
+    // v3: walk codec pipelines for a bytes→bytes codec.  For sharded
+    // arrays the outer codecs list has only sharding_indexed; the real
+    // per-inner-chunk compressor lives in shard_config->sub_codecs.
+    auto scan = [&](const std::vector<utils::ZarrCodecConfig>& codecs) -> bool {
+        for (const auto& cc : codecs) {
+            if (cc.name == "blosc") { cfg.id = CompressorId::Blosc; return true; }
+            if (cc.name == "zstd")  { cfg.id = CompressorId::Zstd;  return true; }
+            if (cc.name == "lz4")   { cfg.id = CompressorId::Lz4;   return true; }
+            if (cc.name == "gzip" || cc.name == "zlib") {
+                cfg.id = CompressorId::Gzip; return true;
+            }
+            if (cc.name == "c3d") {
+                cfg.id = CompressorId::C3d;
+                if (cc.configuration && cc.configuration->is_object()
+                    && cc.configuration->contains("target_ratio")) {
+                    cfg.c3d_target_ratio = cc.configuration->value(
+                        "target_ratio", cfg.c3d_target_ratio);
+                }
+                return true;
+            }
+        }
+        return false;
+    };
+    if (meta.shard_config && scan(meta.shard_config->sub_codecs)) return cfg;
+    if (scan(meta.codecs)) return cfg;
 
     cfg.id = CompressorId::None;
     return cfg;
@@ -353,11 +392,12 @@ struct VcDataset::Impl {
     // zstd, lz4, gzip). ZarrArray::open picks the right codec from meta.
     static utils::ZarrArray::CodecRegistry buildCodecRegistry(int dtypeSize) {
         utils::ZarrArray::CodecRegistry reg;
-        for (const char* name : {"blosc", "zstd", "lz4", "gzip", "zlib"}) {
+        for (const char* name : {"blosc", "zstd", "lz4", "gzip", "zlib", "c3d"}) {
             CompressorConfig cfg;
             if      (std::string(name) == "blosc") cfg.id = CompressorId::Blosc;
             else if (std::string(name) == "zstd")  cfg.id = CompressorId::Zstd;
             else if (std::string(name) == "lz4")   cfg.id = CompressorId::Lz4;
+            else if (std::string(name) == "c3d")   cfg.id = CompressorId::C3d;
             else                                   cfg.id = CompressorId::Gzip;
             cfg.blosc_typesize = dtypeSize;
             reg[name] = codecFromConfig(cfg);
@@ -487,6 +527,15 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
             std::memcpy(output, bytes.data(), outBytes);
             break;
         }
+
+        case CompressorId::C3d: {
+            const auto bytes = decompressBytes(impl_->compressor_, input, outBytes);
+            std::memcpy(output, bytes.data(), outBytes);
+            break;
+        }
+
+        default:
+            throw std::runtime_error("VcDataset::decompress: unhandled compressor");
     }
 }
 
