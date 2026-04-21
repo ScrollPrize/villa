@@ -37,8 +37,8 @@ struct CompressorConfig {
     int blosc_blocksize = 0;
     // Zstd/Gzip level
     int level = 3;
-    // c3d target compression ratio (> 1.0). Default 10 ≈ 46 dB on scroll CT.
-    float c3d_target_ratio = 10.0f;
+    // c3d target compression ratio (> 1.0). Default 50 ≈ 40 dB on scroll CT.
+    float c3d_target_ratio = 50.0f;
 };
 
 namespace {

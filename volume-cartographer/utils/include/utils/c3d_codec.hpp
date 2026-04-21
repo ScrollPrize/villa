@@ -18,11 +18,14 @@ namespace utils {
 struct C3dCodecParams {
     // Target compression ratio (> 1.0).  Rate control is a log-space
     // bisection on a single quantizer scalar; see libs/c3d/README.md.
-    // Reference points on scroll CT: 10 -> ~46 dB PSNR, 100 -> ~35 dB.
-    float target_ratio = 10.0f;
+    // Reference points on scroll CT: 10 -> ~46 dB PSNR, 50 -> ~40 dB,
+    // 100 -> ~35 dB.  Default 50 is the sweet spot for the disk cache:
+    // the visual-quality drop from 10 -> 50 is negligible on 8-bit
+    // scroll data but the shards are ~5x smaller.
+    float target_ratio = 50.0f;
 
-    // Cube dimensions.  Fixed at 256 for c3d; kept as fields so callers
-    // can use the same params-struct idiom as VideoCodecParams.
+    // Cube dimensions (canonical 256^3). Kept as fields so callers can
+    // reuse the same params-struct idiom across codecs.
     int depth  = 256;  // Z
     int height = 256;  // Y
     int width  = 256;  // X

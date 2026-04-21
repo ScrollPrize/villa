@@ -15,7 +15,7 @@
 #include "vc/core/types/SampleParams.hpp"
 #include "vc/core/cache/HttpMetadataFetcher.hpp"  // HttpAuth
 #include "vc/core/util/NetworkFilesystem.hpp"
-#include "utils/video_codec.hpp"
+#include "utils/c3d_codec.hpp"
 
 // Forward declarations
 namespace vc { class VcDataset; }
@@ -94,10 +94,11 @@ public:
     // Must be called before first tieredCache() access.
     void setIOThreads(int count);
 
-    // Override the H.265 encode params used when re-encoding non-canonical
-    // source chunks into the canonical disk cache. depth/height/width are
-    // ignored (filled per chunk). Must be called before first tieredCache().
-    void setEncodeParams(const utils::VideoCodecParams& params);
+    // Override the c3d encode params (target_ratio) used when re-encoding
+    // non-canonical source chunks into the canonical disk cache.
+    // depth/height/width are filled per-chunk. Must be called before
+    // first tieredCache().
+    void setEncodeParams(const utils::C3dCodecParams& params);
 
     // --- Sampling API ---
 
@@ -165,7 +166,7 @@ protected:
     mutable std::once_flag cacheOnce_;
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
     int ioThreads_ = 0;  // 0 = use default
-    utils::VideoCodecParams encodeParams_ = {.qp = 36};
+    utils::C3dCodecParams encodeParams_ = {};
 
     void ensureTieredCache() const;
 

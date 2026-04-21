@@ -15,7 +15,6 @@
 #include <set>
 #include <thread>
 #include <utils/http_fetch.hpp>
-#include <utils/video_codec.hpp>
 
 namespace vc::cache {
 
@@ -179,89 +178,52 @@ const std::vector<std::byte>* BlockPipeline::shardBytesFor(
     return tlLastBytes.get();
 }
 
-// Canonical-chunk side for a given codec: H265 = 128, C3d = 256.
-// c3d's codec atom is fixed at 256^3; h265 historically canonicalized to
-// 128^3. The chunk-grid enumeration in Slicing.cpp derives from this.
-static int canonicalChunkSide(BlockPipeline::Codec c) noexcept {
-    return c == BlockPipeline::Codec::C3d ? 256 : 128;
-}
+// Canonical-chunk side is fixed at 256: c3d's codec atom size. The chunk
+// grid enumeration in Slicing.cpp derives from this constant.
+static constexpr int kCanonicalChunkSide = 256;
 
-// Decode a canonical chunk from disk bytes. Dispatches by magic so mixed
-// on-disk formats are still readable (useful during migration). Falls
-// through to nullptr for unrecognised magic.
+// Decode a canonical c3d chunk from disk bytes. Returns null if the bytes
+// don't carry the C3DC magic (source corruption or wrong codec).
 static ChunkDataPtr decodeCanonicalChunk(const std::vector<uint8_t>& compressed) {
     std::span<const std::byte> bytes(
         reinterpret_cast<const std::byte*>(compressed.data()), compressed.size());
-    if (utils::is_video_compressed(bytes)) {
-        auto dims = utils::video_header_dims(bytes);
-        utils::VideoCodecParams vp;
-        vp.depth = dims[0]; vp.height = dims[1]; vp.width = dims[2];
-        const size_t n = size_t(dims[0]) * dims[1] * dims[2];
-        auto out = vc::cache::acquireChunkData();
-        out->shape = {int(dims[0]), int(dims[1]), int(dims[2])};
-        out->elementSize = 1;
-        out->bytes.resize(n);
-        // Zero-copy: decoder writes straight into ChunkData::bytes. Saves
-        // one ~2 MiB std::vector<std::byte> allocation + zero-init + memcpy
-        // per chunk vs. the std::vector-returning video_decode — this path
-        // runs on every decoded chunk so the allocation churn was a
-        // primary driver of worker-thread page-fault / swap pressure.
-        utils::video_decode_into(
-            bytes,
-            std::span<std::byte>(reinterpret_cast<std::byte*>(out->bytes.data()), n),
-            vp);
-        return out;
-    }
-    if (utils::is_c3d_compressed(bytes)) {
-        utils::C3dCodecParams p;
-        const std::size_t n = 256ULL * 256ULL * 256ULL;
-        auto decoded = utils::c3d_decode(bytes, n, p);
-        auto out = vc::cache::acquireChunkData();
-        out->shape = {256, 256, 256};
-        out->elementSize = 1;
-        out->bytes.resize(decoded.size());
-        std::memcpy(out->bytes.data(), decoded.data(), decoded.size());
-        return out;
-    }
-    return nullptr;
+    if (!utils::is_c3d_compressed(bytes)) return nullptr;
+    utils::C3dCodecParams p;
+    const std::size_t n = size_t(kCanonicalChunkSide)
+                        * size_t(kCanonicalChunkSide)
+                        * size_t(kCanonicalChunkSide);
+    auto decoded = utils::c3d_decode(bytes, n, p);
+    auto out = vc::cache::acquireChunkData();
+    out->shape = {kCanonicalChunkSide, kCanonicalChunkSide, kCanonicalChunkSide};
+    out->elementSize = 1;
+    out->bytes.resize(decoded.size());
+    std::memcpy(out->bytes.data(), decoded.data(), decoded.size());
+    return out;
 }
 
-// Encode decoded chunk bytes as canonical <codec> into a thread-local
-// output buffer, returned by reference. Caller must consume the bytes
-// before the next call on the same thread. Capacity grows once to the
-// largest chunk ever seen on this thread and stays — no per-chunk
-// allocation. For H265, qp/air_clamp/shift_n come from encodeParams;
-// for C3d, target_ratio comes from c3dEncodeParams.
+// Encode decoded chunk bytes as canonical c3d into a thread-local output
+// buffer, returned by reference. Caller must consume the bytes before the
+// next call on the same thread. Capacity grows once to the largest chunk
+// ever seen on this thread and stays — no per-chunk allocation.
 static const std::vector<std::byte>& encodeCanonicalChunk(
     const ChunkData& chunk, const BlockPipeline::Config& cfg) {
     thread_local std::vector<std::byte> tlEncoded;
     std::span<const std::byte> raw(
         reinterpret_cast<const std::byte*>(chunk.rawData()), chunk.totalBytes());
-    if (cfg.codec == BlockPipeline::Codec::C3d) {
-        utils::C3dCodecParams p = cfg.c3dEncodeParams;
-        p.depth = chunk.shape[0];
-        p.height = chunk.shape[1];
-        p.width = chunk.shape[2];
-        tlEncoded = utils::c3d_encode(raw, p);
-        return tlEncoded;
-    }
-    utils::VideoCodecParams vp = cfg.encodeParams;
-    vp.depth = chunk.shape[0];
-    vp.height = chunk.shape[1];
-    vp.width = chunk.shape[2];
-    utils::video_encode_into(raw, vp, tlEncoded);
+    utils::C3dCodecParams p = cfg.c3dEncodeParams;
+    p.depth = chunk.shape[0];
+    p.height = chunk.shape[1];
+    p.width = chunk.shape[2];
+    tlEncoded = utils::c3d_encode(raw, p);
     return tlEncoded;
 }
 
-// Does `bytes` carry the magic header matching the configured canonical
-// codec?  If so we can skip decode+re-encode and passthrough verbatim.
-static bool bytesAreCanonical(const std::vector<uint8_t>& bytes,
-                              BlockPipeline::Codec codec) {
+// Does `bytes` carry the C3DC magic header? If so we can skip
+// decode+re-encode and passthrough verbatim.
+static bool bytesAreCanonical(const std::vector<uint8_t>& bytes) {
     std::span<const std::byte> s(
         reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
-    return codec == BlockPipeline::Codec::C3d
-        ? utils::is_c3d_compressed(s)
-        : utils::is_video_compressed(s);
+    return utils::is_c3d_compressed(s);
 }
 
 BlockPipeline::BlockPipeline(
@@ -674,22 +636,19 @@ BlockPipeline::BlockPipeline(
                     return {};
                 }
 
-                // Sanity: bytes must already match the configured canonical
-                // codec's magic (VC3D for H265, C3DC for C3d). If not, the
+                // Sanity: bytes must carry the C3DC magic. If not, the
                 // source advertised canonical structure but serves blosc
                 // or raw — we can't use it. Mark the chunk negative so
                 // we stop re-fetching it every render; otherwise every
                 // fetchInteractive would re-queue it forever.
-                if (!bytesAreCanonical(bytes, config_.codec)) {
+                if (!bytesAreCanonical(bytes)) {
                     // Always log: these are source-level corruption events,
                     // not transient noise. Rate-limiting to 5 previously hid
                     // systemic codec-mismatch issues from users.
-                    const char* magic = (config_.codec == Codec::C3d)
-                        ? "C3DC" : "VC3D";
                     std::fprintf(stderr,
                         "[BlockPipeline] passthrough: chunk lvl=%d "
-                        "(%d,%d,%d) lacks %s magic — marking absent\n",
-                        key.level, key.iz, key.iy, key.ix, magic);
+                        "(%d,%d,%d) lacks C3DC magic — marking absent\n",
+                        key.level, key.iz, key.iy, key.ix);
                     bloomAdd(key);
                     {
                         std::lock_guard lock(negativeMutex_);
@@ -915,7 +874,7 @@ BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
     // canonical-chunk index and query via the lock-free hash set. No
     // rwlock on the miss path — every blockAt miss used to hit
     // pthread_rwlock_rdlock here.
-    const int cps = canonicalChunkSide(config_.codec) / kBlockSize;
+    const int cps = kCanonicalChunkSide / kBlockSize;
     const ChunkKey chunkKey{key.level, key.bz / cps, key.by / cps, key.bx / cps};
     if (isEmptyChunk(chunkKey)) {
         // One canonical zero block shared by every caller asking for
@@ -940,7 +899,7 @@ BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
 // entirely absent from the source.
 ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey) {
     if (!source_ || !decompress_) return nullptr;
-    const int C = canonicalChunkSide(config_.codec);
+    const int C = kCanonicalChunkSide;
     auto scs = source_->chunkShape(canonKey.level);
     if (scs[0] <= 0 || scs[1] <= 0 || scs[2] <= 0) return nullptr;
 
@@ -1112,7 +1071,7 @@ std::array<int, 3> BlockPipeline::chunkShape(int level) const noexcept {
     // 256³ c3d); returning the source shape would make Slicing.cpp's
     // chunk-key enumeration compute the wrong grid.
     if (level >= 0 && level < int(diskLevels_.size()) && diskLevels_[level]) {
-        const int C = canonicalChunkSide(config_.codec);
+        const int C = kCanonicalChunkSide;
         return {C, C, C};
     }
     return source_->chunkShape(level);

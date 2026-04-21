@@ -5,9 +5,6 @@
 #include <stdexcept>
 #include <vector>
 
-#if __has_include("utils/video_codec.hpp")
-#include "utils/video_codec.hpp"
-#endif
 
 namespace vc::cache {
 
@@ -49,57 +46,6 @@ DecompressFn makeVcDecompressor(const std::vector<vc::VcDataset*>& datasets)
         // Determine required buffer size upfront to reuse pooled buffers
         const auto dtype = ds.getDtype();
         size_t bufferBytes = (dtype == vc::VcDtype::uint16) ? chunkSize * 2 : chunkSize;
-
-#ifdef UTILS_HAS_VIDEO_CODEC
-        // Check for VC3D video codec magic header
-        if (utils::is_video_compressed(
-                std::span<const std::byte>(
-                    reinterpret_cast<const std::byte*>(compressed.data()),
-                    compressed.size()))) {
-            auto dims = utils::video_header_dims(
-                std::span<const std::byte>(
-                    reinterpret_cast<const std::byte*>(compressed.data()),
-                    compressed.size()));
-
-            utils::VideoCodecParams vp;
-            vp.depth = dims[0];
-            vp.height = dims[1];
-            vp.width = dims[2];
-
-            const size_t decodedSize = size_t(dims[0]) * dims[1] * dims[2];
-            int cz = static_cast<int>(chunkShape[0]);
-            int cy = static_cast<int>(chunkShape[1]);
-            int cx = static_cast<int>(chunkShape[2]);
-
-            auto result = acquireChunkData(chunkSize);
-            result->shape = {cz, cy, cx};
-            result->elementSize = 1;
-
-            // Decode straight into the result buffer when it matches; saves
-            // one 2 MiB allocation + memcpy per chunk on the hot path.
-            // Fall back to a temp buffer when the shapes mismatch (rare).
-            if (decodedSize == chunkSize) {
-                utils::video_decode_into(
-                    std::span<const std::byte>(
-                        reinterpret_cast<const std::byte*>(compressed.data()),
-                        compressed.size()),
-                    std::span<std::byte>(
-                        reinterpret_cast<std::byte*>(result->rawData()),
-                        chunkSize),
-                    vp);
-            } else {
-                auto decoded = utils::video_decode(
-                    std::span<const std::byte>(
-                        reinterpret_cast<const std::byte*>(compressed.data()),
-                        compressed.size()),
-                    decodedSize, vp);
-                std::memcpy(result->rawData(), decoded.data(),
-                            std::min(decoded.size(), chunkSize));
-            }
-            result->isEmpty = isChunkEmpty(result->rawData(), chunkSize);
-            return result;
-        }
-#endif
 
         int cz = static_cast<int>(chunkShape[0]);
         int cy = static_cast<int>(chunkShape[1]);
