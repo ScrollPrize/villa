@@ -278,6 +278,44 @@ def _logits_to_class_indices(logits_c_hw: np.ndarray) -> np.ndarray:
     return np.argmax(logits_c_hw, axis=0)
 
 
+# BGR channel (index) used for each foreground class: class 1 -> R,
+# class 2 -> G, class 3 -> B. Matches the GT palette so the same class
+# shows the same hue in GT and prediction.
+_FG_CHANNEL_ORDER_BGR = (2, 1, 0)  # R, G, B in BGR order
+
+
+def _softmax_probs(logits_c_hw: np.ndarray) -> np.ndarray:
+    """Numerically-stable softmax across channel 0, returning (C, H, W)."""
+    x = logits_c_hw.astype(np.float32, copy=False)
+    m = x.max(axis=0, keepdims=True)
+    e = np.exp(x - m)
+    return e / np.maximum(e.sum(axis=0, keepdims=True), 1e-12)
+
+
+def _logits_to_rgb_cloud(logits_c_hw: np.ndarray) -> np.ndarray:
+    """(C, H, W) logits -> (H, W, 3) BGR showing the softmax probability cloud.
+
+    Background (channel 0) is dropped so it renders black. Foreground
+    classes land in R/G/B (class 1 -> R, class 2 -> G, class 3 -> B) to
+    match the categorical GT palette; extra foreground classes cycle
+    through the same three channels. Soft / uncertain predictions show up
+    as dimmer pixels and color blends (the probability "cloud").
+    """
+    probs = _softmax_probs(logits_c_hw)  # (C, H, W), sums to 1 over axis 0
+    if probs.shape[0] <= 1:
+        return cv2.cvtColor(
+            np.clip(probs[0] * 255.0, 0, 255).astype(np.uint8), cv2.COLOR_GRAY2BGR
+        )
+    fg = probs[1:]  # drop background
+    h, w = fg.shape[1], fg.shape[2]
+    bgr = np.zeros((h, w, 3), dtype=np.float32)
+    for i in range(fg.shape[0]):
+        ch = _FG_CHANNEL_ORDER_BGR[i % 3]
+        # Use max so cycled channels don't erase each other for high C.
+        bgr[..., ch] = np.maximum(bgr[..., ch], fg[i])
+    return np.clip(bgr * 255.0, 0, 255).astype(np.uint8)
+
+
 def _vector_to_bgr(vector_3ch):
     """Map a 3×H×W vector field to a BGR image using directional colouring."""
     if vector_3ch.shape[0] != 3:
@@ -358,8 +396,9 @@ def convert_slice_to_bgr(
             return cv2.cvtColor(ch_8u, cv2.COLOR_GRAY2BGR)
 
         elif is_multiclass and slice_2d_or_3d.shape[0] >= 2:
-            # Multiclass prediction logits (C, H, W): argmax -> class indices.
-            return _indices_to_bgr(_logits_to_class_indices(slice_2d_or_3d))
+            # Multiclass prediction logits (C, H, W): softmax -> RGB
+            # probability cloud. Keeps the full confidence range visible.
+            return _logits_to_rgb_cloud(slice_2d_or_3d)
 
         elif slice_2d_or_3d.shape[0] == 3:
             # RGB or normal map - just transpose and scale
@@ -453,9 +492,13 @@ def _render_3d_volume_to_bgr(
         return _gray_volume_to_bgr(arr_np[0], value_range)
 
     if is_multiclass and arr_np.shape[0] >= 2:
-        # Multiclass pred logits (C, Z, H, W): argmax across channel 0.
-        class_idx = np.argmax(arr_np, axis=0)  # (Z, H, W)
-        return np.stack([_indices_to_bgr(class_idx[z]) for z in range(class_idx.shape[0])], axis=0)
+        # Multiclass pred logits (C, Z, H, W): softmax -> RGB probability
+        # cloud per slice. Uses the full confidence range instead of a
+        # hard argmax so uncertain regions are visible.
+        return np.stack(
+            [_logits_to_rgb_cloud(arr_np[:, z]) for z in range(arr_np.shape[1])],
+            axis=0,
+        )
 
     if arr_np.shape[0] == 3:
         rgb_zhwc = np.transpose(arr_np, (1, 2, 3, 0))
