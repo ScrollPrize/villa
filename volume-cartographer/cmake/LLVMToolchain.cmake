@@ -4,8 +4,21 @@ set(VC_DEVIRT_FLAGS "-fstrict-vtable-pointers")
 set(VC_DEVIRT_LTO_FLAGS "-fwhole-program-vtables")
 set(VC_AGGRESSIVE_MATH "-ffast-math -fno-finite-math-only -funroll-loops -ffp-contract=fast")
 
+# Additional unsafe / performance flags — all on top of devirt + fast-math.
+#   -fno-plt              : direct calls instead of PLT for exported symbols
+#   -fno-math-errno       : allow libm functions to not set errno
+#   -fomit-frame-pointer  : frees a register (redundant with -O3, made explicit)
+#   -freciprocal-math     : implied by -ffast-math, explicit for clarity
+# ARM-specific (when applicable, added below):
+#   -mcpu=native          : tune scheduling for the actual uarch
+#   -mno-outline-atomics  : inline LL/SC atomics instead of libcall wrappers
+set(VC_EXTRA_PERF_FLAGS "-fno-plt -fno-math-errno -fomit-frame-pointer")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
+    set(VC_EXTRA_PERF_FLAGS "${VC_EXTRA_PERF_FLAGS} -mcpu=native -mno-outline-atomics")
+endif()
+
 # Unsafe flags: devirtualization + aggressive math (can break correctness)
-set(VC_UNSAFE_CXX_FLAGS "${VC_DEVIRT_FLAGS} ${VC_DEVIRT_LTO_FLAGS} ${VC_AGGRESSIVE_MATH}")
+set(VC_UNSAFE_CXX_FLAGS "${VC_DEVIRT_FLAGS} ${VC_DEVIRT_LTO_FLAGS} ${VC_AGGRESSIVE_MATH} ${VC_EXTRA_PERF_FLAGS}")
 if(APPLE)
     set(VC_VISIBILITY_FLAGS "-fvisibility=hidden -fvisibility-inlines-hidden")
 else()
@@ -14,9 +27,9 @@ endif()
 
 # LLVM backend passes — aggressive, passed via linker for ThinLTO (ReleaseUnsafe only)
 string(CONCAT VC_LLVM_LINKER_PASSES
-    " -Wl,-mllvm,-inline-threshold=500"
-    " -Wl,-mllvm,-inlinehint-threshold=600"
-    " -Wl,-mllvm,-hot-callsite-threshold=500"
+    " -Wl,-mllvm,-inline-threshold=1000"
+    " -Wl,-mllvm,-inlinehint-threshold=1200"
+    " -Wl,-mllvm,-hot-callsite-threshold=1000"
     " -Wl,-mllvm,-polly"
     " -Wl,-mllvm,-polly-vectorizer=stripmine"
     " -Wl,-mllvm,-polly-tiling"
@@ -27,7 +40,9 @@ string(CONCAT VC_LLVM_LINKER_PASSES
     " -Wl,-mllvm,-enable-masked-interleaved-mem-accesses"
     " -Wl,-mllvm,-hot-cold-split"
     " -Wl,-mllvm,-enable-ext-tsp-block-placement"
-    " -Wl,-mllvm,-import-instr-limit=500"
+    " -Wl,-mllvm,-import-instr-limit=1000"
+    " -Wl,-O3"
+    " -Wl,--icf=all"
 )
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "arm64|aarch64")
@@ -48,6 +63,15 @@ endif()
 
 include(ProcessorCount)
 ProcessorCount(NPROC)
+# ProcessorCount() reads nproc / sched_getaffinity on Linux — on some
+# containers/CI or cpuset-limited shells it returns 1 even though the
+# machine has many cores (observed here: nproc=1 vs lscpu CPU(s)=12).
+# Fall back to cmake_host_system_information which reads the kernel's
+# NUMBER_OF_LOGICAL_CORES; only accept that if it's strictly larger.
+cmake_host_system_information(RESULT NPROC_LOGICAL QUERY NUMBER_OF_LOGICAL_CORES)
+if(NPROC_LOGICAL AND NPROC_LOGICAL GREATER NPROC)
+    set(NPROC ${NPROC_LOGICAL})
+endif()
 if(NOT NPROC OR NPROC EQUAL 0)
     set(NPROC 4)
 endif()
