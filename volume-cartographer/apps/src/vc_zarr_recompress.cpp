@@ -1,12 +1,12 @@
-// vc_zarr_recompress: Recompress zarr v2 volumes to zarr v3 with H265 + sharding.
+// vc_zarr_recompress: Recompress zarr v2 volumes to zarr v3 with c3d sharding.
 //
 // Reads zarr v2 chunks (blosc/zstd/raw) from S3 or local filesystem,
-// recompresses with H265 into zarr v3 shards (1024³ shards, 128³ inner chunks),
+// recompresses with c3d into zarr v3 shards (4096³ shards, 256³ inner chunks),
 // writes zarr v3 output to S3 or local filesystem.
 //
-// Each 128³ inner chunk is H265-encoded individually (VC3D header + H265
-// bitstream). Shards have a fixed 8192-byte index at the start (512 entries,
-// 16 bytes each: u64 offset + u64 size, little-endian).
+// Each 256³ inner chunk is c3d-encoded individually (C3DC header + c3d
+// bitstream). Shards have a fixed-size index at the start (16 bytes per
+// entry: u64 offset + u64 size, little-endian).
 //
 // Shard index encoding:
 //   (0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF) = missing chunk (not present)
@@ -16,7 +16,7 @@
 // Work is partitioned by output shard — each thread gets exclusive shards,
 // so no two threads ever read/write the same input chunks or output shards.
 //
-// All 6 pyramid levels (0-5) are processed in a single invocation.
+// All pyramid levels (0-5) are processed in a single invocation.
 //
 // Usage:
 //   vc_zarr_recompress <input> <output> [options]
@@ -27,26 +27,16 @@
 //   s3+us-east-1://bucket/...     (S3 with explicit region)
 //
 // Options:
-//   --qp N          H265 quantization parameter (0-51) [default: 36]
-//   --verify        Verify roundtrip (decode after encode)
-//   --jobs N        Outer worker threads (shards in flight) [default: 8]
-//   --inner-jobs K  Inner worker threads per shard (chunks in flight)
-//                   [default: hardware_concurrency]
-//   --bit-shift N   Right-shift input by N bits pre-encode (0..7, default 0).
-//                   Ultra-compression at the expense of signal quality; decode
-//                   left-shifts by N to restore range. Use only when aggressive
-//                   compression is needed (e.g. streaming 4-bit previews).
-//   --log FILE      Log completed shards to this file [default: none]
-//   --stats-pct N   Sample N% of encoded chunks and compute lossy-codec
-//                   quality metrics (MAE, RMSE, PSNR, percentiles).
-//                   Default 0 (disabled).  1-5 is cheap and representative.
-//   --air-clamp T   Physics-derived dark clamp: any voxel v <= T is snapped
-//                   to v = T before encoding.  Removes the air/void noise
-//                   band (reconstruction noise sitting around the air u8
-//                   value has no segmentation-relevant information) and
-//                   lets h265 compress those regions as near-constant.
-//                   Typical T for 78 keV BM18 scans: ~54 (air ~39 + 15
-//                   noise margin).  Default 0 (disabled).
+//   --target-ratio R  c3d target compression ratio [default: 50]
+//                     (50 ≈ 40 dB PSNR on scroll CT)
+//   --verify          Verify roundtrip (decode after encode)
+//   --jobs N          Outer worker threads (shards in flight) [default: 8]
+//   --inner-jobs K    Inner worker threads per shard (chunks in flight)
+//                     [default: hardware_concurrency]
+//   --log FILE        Log completed shards to this file [default: none]
+//   --stats-pct N     Sample N% of encoded chunks and compute lossy-codec
+//                     quality metrics (MAE, RMSE, PSNR, percentiles).
+//                     Default 0 (disabled). 1-5 is cheap and representative.
 
 #include <cstdio>
 #include <cstdlib>
@@ -73,7 +63,6 @@
 #include "utils/Json.hpp"
 #include <blosc.h>
 
-#include "utils/video_codec.hpp"
 #include "utils/c3d_codec.hpp"
 #include "utils/http_fetch.hpp"
 #include "utils/zarr.hpp"
@@ -81,19 +70,13 @@
 namespace fs = std::filesystem;
 using Json = utils::Json;
 
-// Codec selection (h265 default; c3d switches shard/chunk geometry and
-// encode backend). Set in main() before any worker spawns.
-enum class CodecKind { H265, C3d };
-static CodecKind g_codec = CodecKind::H265;
-
-// Shard/chunk geometry — non-const so main() can re-set them when
-// --codec c3d is passed (c3d's codec atom is 256^3, shard is 4096^3).
-// Threads only read these after main() has finalized them.
-static size_t SHARD_DIM = 1024;           // shard shape per axis (h265 default)
-static size_t CHUNK_DIM = 128;            // inner chunk shape per axis (h265 default)
-static size_t CHUNKS_PER_SHARD = 8;       // SHARD_DIM / CHUNK_DIM
-static size_t INNER_CHUNKS = 512;         // CHUNKS_PER_SHARD^3
-static size_t CHUNK_VOXELS = 128 * 128 * 128;
+// c3d canonical geometry: 4096³ shards with 256³ inner chunks.
+static constexpr size_t SHARD_DIM = 4096;
+static constexpr size_t CHUNK_DIM = 256;
+static constexpr size_t CHUNKS_PER_SHARD = SHARD_DIM / CHUNK_DIM;                 // 16
+static constexpr size_t INNER_CHUNKS = CHUNKS_PER_SHARD * CHUNKS_PER_SHARD
+                                     * CHUNKS_PER_SHARD;                          // 4096
+static constexpr size_t CHUNK_VOXELS = CHUNK_DIM * CHUNK_DIM * CHUNK_DIM;
 
 // ============================================================================
 // I/O abstraction: local filesystem or S3
@@ -391,7 +374,7 @@ static std::vector<std::byte> decompress_blosc(const std::vector<std::byte>& com
 // ============================================================================
 
 static std::string make_zarr_v3_metadata(const std::vector<size_t>& shape,
-                                         int qp, float target_ratio) {
+                                         float target_ratio) {
     utils::ZarrMetadata meta;
     meta.version = utils::ZarrVersion::v3;
     meta.shape = shape;
@@ -406,15 +389,9 @@ static std::string make_zarr_v3_metadata(const std::vector<size_t>& shape,
     sc.sub_chunks = {CHUNK_DIM, CHUNK_DIM, CHUNK_DIM};
 
     utils::ZarrCodecConfig codec_cfg;
-    if (g_codec == CodecKind::C3d) {
-        codec_cfg.name = "c3d";
-        codec_cfg.configuration = std::make_shared<utils::JsonValue>(
-            utils::JsonValue{{"target_ratio", Json((double)target_ratio)}});
-    } else {
-        codec_cfg.name = "h265";
-        codec_cfg.configuration = std::make_shared<utils::JsonValue>(
-            utils::JsonValue{{"qp", Json(qp)}});
-    }
+    codec_cfg.name = "c3d";
+    codec_cfg.configuration = std::make_shared<utils::JsonValue>(
+        utils::JsonValue{{"target_ratio", Json((double)target_ratio)}});
     sc.sub_codecs.push_back(codec_cfg);
     meta.shard_config = sc;
 
@@ -686,7 +663,7 @@ int main(int argc, char** argv) {
                   << "Input/output: local path or s3://bucket/path\n"
                   << "\n"
                   << "Options:\n"
-                  << "  --qp N           H265 quantization (0-51, lower=better) [36]\n"
+                  << "  --target-ratio R  c3d target compression ratio (>1.0). [50]\n"
                   << "  --verify         Verify roundtrip after encoding\n"
                   << "  --jobs N         Outer workers (shards in flight) [8]\n"
                   << "  --inner-jobs K   Inner workers per shard (chunks in flight)\n"
@@ -694,8 +671,6 @@ int main(int argc, char** argv) {
                   << "  --log FILE       Log completed shards to file\n"
                   << "  --stats-pct N    Sample N%% of chunks for quality metrics\n"
                   << "                   (MAE, RMSE, PSNR, percentiles).  [0 = off]\n"
-                  << "  --air-clamp T    Clamp voxels v<=T to T pre-encode. [0 = off]\n"
-                  << "  --bit-shift N    Right-shift input by N bits (0..7). [0 = off]\n"
                   << "  --levels CSV     Process only listed levels (e.g. 4,5). [default: all]\n"
                   << "  --rank N         VM index in fanout (0..world-1). [default: 0]\n"
                   << "  --world N        Total VM count for horizontal scaling. [default: 1]\n"
@@ -704,14 +679,11 @@ int main(int argc, char** argv) {
                   << "                          Skips occupancy and resume lists. Coordinator\n"
                   << "                          handles both. Use for per-shard process fanout.\n"
                   << "  --shard-file PATH       File of 'L/sz/sy/sx' lines — batch many shards\n"
-                  << "                          in one process (amortize x265 init + TCP reuse).\n"
+                  << "                          in one process (amortize encoder init + TCP reuse).\n"
                   << "  --encode-jobs N  Encode pool threads per worker [default: 2*cores]\n"
                   << "  --occupancy-file PATH  Binary bitmap of input chunk existence\n"
                   << "                          (nz*ny*nx bits). Skips S3 LIST entirely.\n"
-                  << "                          {L} in path is replaced by level number.\n"
-                  << "  --codec {h265|c3d}     Output codec. h265 -> 1024³ shards / 128³ chunks;\n"
-                  << "                          c3d -> 4096³ shards / 256³ chunks. [default: h265]\n"
-                  << "  --target-ratio R       c3d target compression ratio, > 1.0. [default: 10]\n";
+                  << "                          {L} in path is replaced by level number.\n";
         return 1;
     }
 
@@ -719,7 +691,6 @@ int main(int argc, char** argv) {
 
     std::string input_path = argv[1];
     std::string output_path = argv[2];
-    int qp = 36;
     bool verify = false;
     // Outer workers process shards in parallel. Since the per-shard work is
     // now mostly parallel internally (see --inner-jobs), a modest outer count
@@ -731,8 +702,6 @@ int main(int argc, char** argv) {
     int inner_jobs = std::max(1, (int)std::thread::hardware_concurrency());
     std::string log_path;
     int stats_pct = 0;
-    int air_clamp = 0;         // legacy high-clamp (snap v<=T to T). 0=off.
-    int shift_n = 0;           // right-shift input by N (ultra-compression, off by default)
     std::string levels_arg;    // empty = all discovered; else CSV of levels
     int rank = 0;              // this VM's index in the fanout (0..world-1)
     int world = 1;             // total VM count for horizontal scaling
@@ -740,19 +709,15 @@ int main(int argc, char** argv) {
     std::string shard_file;    // file of "L/sz/sy/sx" lines — batch in one process
     int encode_jobs = 0;       // 0 = 2*hw_concurrency (default)
     std::string occupancy_file; // external occupancy bitmap (coordinator-built)
-    std::string codec_arg = "h265"; // --codec {h265,c3d}
-    float target_ratio = 10.0f;     // c3d target compression ratio (>1.0)
+    float target_ratio = 50.0f; // c3d target compression ratio (>1.0)
 
     for (int i = 3; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--qp" && i + 1 < argc) qp = std::atoi(argv[++i]);
-        else if (arg == "--verify") verify = true;
+        if (arg == "--verify") verify = true;
         else if (arg == "--jobs" && i + 1 < argc) jobs = std::atoi(argv[++i]);
         else if (arg == "--inner-jobs" && i + 1 < argc) inner_jobs = std::atoi(argv[++i]);
         else if (arg == "--log" && i + 1 < argc) log_path = argv[++i];
         else if (arg == "--stats-pct" && i + 1 < argc) stats_pct = std::atoi(argv[++i]);
-        else if (arg == "--air-clamp" && i + 1 < argc) air_clamp = std::atoi(argv[++i]);
-        else if (arg == "--bit-shift" && i + 1 < argc) shift_n = std::atoi(argv[++i]);
         else if (arg == "--levels" && i + 1 < argc) levels_arg = argv[++i];
         else if (arg == "--rank" && i + 1 < argc) rank = std::atoi(argv[++i]);
         else if (arg == "--world" && i + 1 < argc) world = std::atoi(argv[++i]);
@@ -760,19 +725,22 @@ int main(int argc, char** argv) {
         else if (arg == "--shard-file" && i + 1 < argc) shard_file = argv[++i];
         else if (arg == "--encode-jobs" && i + 1 < argc) encode_jobs = std::atoi(argv[++i]);
         else if (arg == "--occupancy-file" && i + 1 < argc) occupancy_file = argv[++i];
-        else if (arg == "--codec" && i + 1 < argc) codec_arg = argv[++i];
         else if (arg == "--target-ratio" && i + 1 < argc) target_ratio = (float)std::atof(argv[++i]);
-    }
-    if (codec_arg == "c3d") {
-        g_codec = CodecKind::C3d;
-        SHARD_DIM = 4096;
-        CHUNK_DIM = 256;
-        CHUNKS_PER_SHARD = SHARD_DIM / CHUNK_DIM;                     // 16
-        INNER_CHUNKS = CHUNKS_PER_SHARD * CHUNKS_PER_SHARD * CHUNKS_PER_SHARD;  // 4096
-        CHUNK_VOXELS = CHUNK_DIM * CHUNK_DIM * CHUNK_DIM;
-    } else if (codec_arg != "h265") {
-        fprintf(stderr, "--codec must be 'h265' or 'c3d', got '%s'\n", codec_arg.c_str());
-        return 1;
+        else if (arg == "--codec" || arg == "--qp" || arg == "--air-clamp" || arg == "--bit-shift") {
+            // Legacy h265 flags: removed in the c3d-only switch. Fail fast
+            // so orchestration scripts that still pass them don't silently
+            // inherit --target-ratio defaults and produce mis-encoded data.
+            fprintf(stderr,
+                "Error: flag %s was removed along with the H.265 codec path.\n"
+                "       The recompress tool is c3d-only now; use --target-ratio "
+                "instead of --qp, and drop --codec / --air-clamp / --bit-shift.\n",
+                arg.c_str());
+            return 1;
+        }
+        else {
+            fprintf(stderr, "Error: unknown argument %s\n", arg.c_str());
+            return 1;
+        }
     }
     if (!(target_ratio > 1.0f)) {
         fprintf(stderr, "--target-ratio must be > 1.0, got %g\n", (double)target_ratio);
@@ -780,10 +748,6 @@ int main(int argc, char** argv) {
     }
     if (stats_pct < 0) stats_pct = 0;
     if (stats_pct > 100) stats_pct = 100;
-    if (air_clamp < 0) air_clamp = 0;
-    if (air_clamp > 255) air_clamp = 255;
-    if (shift_n < 0) shift_n = 0;
-    if (shift_n > 7) shift_n = 7;
     // In --one-shard mode, force the level filter to the shard's level.
     if (!one_shard_arg.empty()) {
         int ol = -1;
@@ -844,16 +808,9 @@ int main(int argc, char** argv) {
 
     printf("Input:  %s\n", input_path.c_str());
     printf("Output: %s\n", output_path.c_str());
-    if (g_codec == CodecKind::C3d) {
-        printf("Codec: c3d (target-ratio %.2f), shard: %zu³, chunk: %zu³\n",
-               (double)target_ratio, SHARD_DIM, CHUNK_DIM);
-    } else {
-        printf("Codec: h265 (QP %d), shard: %zu³, chunk: %zu³\n",
-               qp, SHARD_DIM, CHUNK_DIM);
-    }
+    printf("Codec: c3d (target-ratio %.2f), shard: %zu³, chunk: %zu³\n",
+           (double)target_ratio, SHARD_DIM, CHUNK_DIM);
     printf("Outer jobs: %d  |  Inner jobs/shard: %d\n", jobs, inner_jobs);
-    if (air_clamp > 0) printf("Air clamp: v <= %d -> %d\n", air_clamp, air_clamp);
-    if (shift_n > 0) printf("Bit-shift: %d (ultra-compression mode)\n", shift_n);
     if (world > 1) printf("Fanout: rank %d / world %d (sz %% %d == %d)\n",
                            rank, world, world, rank);
     printf("\n");
@@ -956,7 +913,7 @@ int main(int argc, char** argv) {
         // coordinator writes it once before fanning out workers).
         if (one_shard_arg.empty() && shard_file.empty()) {
             output->write_string(std::to_string(l) + "/zarr.json",
-                                  make_zarr_v3_metadata(shape, qp, target_ratio));
+                                  make_zarr_v3_metadata(shape, target_ratio));
         }
 
         // Reuse cached .zarray from discovery phase (saves a GET per worker).
@@ -1344,11 +1301,8 @@ int main(int argc, char** argv) {
                         std::to_string(task.src_base_x);
                     try {
                         auto data = t_input->read(src_key);
-                        std::span<const std::byte> s(data);
-                        bool matches = (g_codec == CodecKind::C3d)
-                            ? utils::is_c3d_compressed(s)
-                            : utils::is_video_compressed(s);
-                        if (matches) {
+                        if (utils::is_c3d_compressed(
+                                std::span<const std::byte>(data))) {
                             total_raw.fetch_add(CHUNK_VOXELS);
                             total_compressed.fetch_add(data.size());
                             processed_chunks.fetch_add(1);
@@ -1436,7 +1390,7 @@ int main(int argc, char** argv) {
             }
         };
 
-        // Encode worker: pop raw buffer, h265-encode, store, decrement
+        // Encode worker: pop raw buffer, c3d-encode, store, decrement
         // shard remaining; finalize on last chunk.
         auto enc_fn = [&]() {
             for (;;) {
@@ -1455,44 +1409,31 @@ int main(int argc, char** argv) {
 
                 std::vector<std::byte> compressed;
                 auto decode_cb = [&](std::vector<std::byte>& enc) {
-                    if (g_codec == CodecKind::C3d) {
-                        utils::C3dCodecParams p;
-                        p.target_ratio = target_ratio;
-                        p.depth = (int)CHUNK_DIM; p.height = (int)CHUNK_DIM; p.width = (int)CHUNK_DIM;
-                        return utils::c3d_decode(std::span<const std::byte>(enc),
-                                                 CHUNK_VOXELS, p);
-                    }
-                    utils::VideoCodecParams vp;
-                    vp.qp = qp; vp.depth = (int)CHUNK_DIM; vp.height = (int)CHUNK_DIM;
-                    vp.width = (int)CHUNK_DIM; vp.air_clamp = air_clamp; vp.shift_n = shift_n;
-                    return utils::video_decode(std::span<const std::byte>(enc),
-                                               CHUNK_VOXELS, vp);
-                };
-
-                if (g_codec == CodecKind::C3d) {
                     utils::C3dCodecParams p;
                     p.target_ratio = target_ratio;
-                    p.depth = (int)CHUNK_DIM; p.height = (int)CHUNK_DIM; p.width = (int)CHUNK_DIM;
+                    p.depth = (int)CHUNK_DIM;
+                    p.height = (int)CHUNK_DIM;
+                    p.width = (int)CHUNK_DIM;
+                    return utils::c3d_decode(std::span<const std::byte>(enc),
+                                             CHUNK_VOXELS, p);
+                };
+
+                {
+                    utils::C3dCodecParams p;
+                    p.target_ratio = target_ratio;
+                    p.depth = (int)CHUNK_DIM;
+                    p.height = (int)CHUNK_DIM;
+                    p.width = (int)CHUNK_DIM;
                     compressed = utils::c3d_encode(
                         std::span<const std::byte>(task.raw), p);
-                } else {
-                    utils::VideoCodecParams params;
-                    params.qp = qp;
-                    params.depth = (int)CHUNK_DIM;
-                    params.height = (int)CHUNK_DIM;
-                    params.width = (int)CHUNK_DIM;
-                    params.air_clamp = air_clamp;
-                    params.shift_n = shift_n;
-                    compressed = utils::video_encode(
-                        std::span<const std::byte>(task.raw), params);
                 }
                 total_compressed.fetch_add(compressed.size());
 
                 if (verify) {
                     auto decoded = decode_cb(compressed);
-                    // c3d is lossy — verify only makes strict sense for h265
-                    // lossless (qp=0). Keep strict memcmp to match existing
-                    // semantics; c3d users should rely on --stats-pct instead.
+                    // c3d is lossy; --verify's strict memcmp will almost
+                    // always fail. Kept for parity with the legacy flag;
+                    // --stats-pct is the meaningful quality check.
                     if (decoded.size() != task.raw.size() ||
                         std::memcmp(decoded.data(), task.raw.data(),
                                     task.raw.size()) != 0) {

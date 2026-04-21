@@ -21,7 +21,6 @@
 #include "VolumeSource.hpp"
 #include "IOPool.hpp"
 #include <utils/zarr.hpp>
-#include <utils/video_codec.hpp>
 #include <utils/c3d_codec.hpp>
 
 namespace vc { class VcDataset; }
@@ -35,11 +34,6 @@ namespace vc::cache {
 // to amortize S3 and codec overhead.
 class BlockPipeline {
 public:
-    // Which codec the canonical disk cache uses.  Governs both the encode
-    // path (re-compress non-canonical source chunks) and the chunk grid
-    // (H265 canonical = 128^3, C3d canonical = 256^3).
-    enum class Codec { H265, C3d };
-
     struct Config {
         size_t bytes = 10ULL << 30;          // 10 GiB block cache
         // RAM cache of compressed canonical shard files. The loader pool
@@ -52,27 +46,18 @@ public:
         // Defaults to hardware_concurrency(); see constructor.
         int ioThreads = 0;
 
-        // Canonical codec for the local disk cache (and expected canonical
-        // form of any passthrough source).  Default H265 preserves existing
-        // deployments; switching to C3d also changes the canonical chunk
-        // size to 256^3.
-        Codec codec = Codec::H265;
-        // H.265 encode parameters used when codec == H265.  depth/height/
-        // width are filled in per-chunk; qp/air_clamp/shift_n carry the
-        // configured values.  Default qp=36 matches the historical value.
-        utils::VideoCodecParams encodeParams = {.qp = 36};
-        // c3d encode parameters used when codec == C3d.  target_ratio is
-        // the only knob; 10 ≈ 46 dB PSNR on scroll CT.
+        // c3d encode parameters used when re-encoding non-canonical
+        // source chunks into the canonical 256³ disk cache.
+        // target_ratio is the only knob; 50 ≈ 40 dB PSNR on scroll CT.
         utils::C3dCodecParams c3dEncodeParams = {};
 
         // When non-zero, declares the source is byte-identical to our local
-        // canonical disk format: zarr v3, sharded with these dims, canonical
-        // inner chunks matching our codec.  The downloader then bypasses the
-        // encoder entirely — fetchWholeShard from source, write the bytes
-        // verbatim to disk, forward chunk keys directly to the loader.
-        // Local shard shape MUST match this for the byte-passthrough to be
-        // valid; the magic-bytes check on each inner chunk must match the
-        // configured codec (VC3D for H265, C3DC for C3d).
+        // canonical c3d disk format: zarr v3, 4096³ shards with 256³ inner
+        // C3DC chunks. The downloader then bypasses the encoder entirely —
+        // fetchWholeShard from source, write the bytes verbatim to disk,
+        // forward chunk keys directly to the loader. Local shard shape MUST
+        // match this for byte-passthrough to be valid; every inner chunk is
+        // magic-checked for "C3DC".
         std::array<int, 3> canonicalSourceShard = {0, 0, 0};
     };
 

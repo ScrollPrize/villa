@@ -56,16 +56,15 @@ target_link_libraries(vc_core
         CURL::libcurl
 )
 
-# utils header-only library + vendored video codec
+# utils header-only library + vendored c3d codec.
 # WHOLE_ARCHIVE is needed because ThinLTO + lld can internalize symbols from
 # static archives before cross-archive references are resolved.
 target_link_libraries(vc_core PUBLIC
     $<BUILD_INTERFACE:utils>
-    $<BUILD_INTERFACE:$<LINK_LIBRARY:WHOLE_ARCHIVE,utils_video_codec>>
+    $<BUILD_INTERFACE:$<LINK_LIBRARY:WHOLE_ARCHIVE,utils_c3d_codec>>
 )
 target_link_libraries(vc_core PRIVATE
     $<BUILD_INTERFACE:blosc_static>
-    $<BUILD_INTERFACE:utils_c3d_codec>
 )
 
 

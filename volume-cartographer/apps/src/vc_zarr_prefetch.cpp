@@ -1,17 +1,17 @@
-// vc_zarr_prefetch — pre-populate the local disk cache that vc3d uses
+// vc_zarr_prefetch — pre-populate the local c3d disk cache that vc3d uses
 // when streaming a remote zarr volume.
 //
 // Behaviour matches the live vc3d path for any source format:
-//   - canonical zarr v3 sharded with 128^3 inner H.265 chunks / 1024^3 shards
-//     or 256^3 inner c3d chunks / 4096^3 shards → byte-passthrough of each
-//     whole shard into the local sharded zarr (no decode/re-encode).
+//   - canonical zarr v3 sharded with 256^3 inner c3d chunks / 4096^3 shards
+//     → byte-passthrough of each whole shard into the local sharded zarr
+//     (no decode/re-encode).
 //   - anything else (zarr v2, raw, other chunk sizes, alternate codecs) →
 //     drive BlockPipeline end-to-end so chunks are downloaded, decoded,
-//     rechunked to canonical form, re-encoded, and written to the local zarr
-//     — exactly what vc3d does on a cache miss.
+//     rechunked to canonical 256^3, c3d-encoded, and written to the local
+//     zarr — exactly what vc3d does on a cache miss.
 //
-// --qp / --air-clamp / --bit-shift only affect the transcode path. Canonical
-// passthrough keeps the source's encoding bit-for-bit.
+// --target-ratio only affects the transcode path. Canonical passthrough
+// keeps the source's encoding bit-for-bit.
 
 #include <algorithm>
 #include <atomic>
@@ -42,7 +42,7 @@
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
-#include <utils/video_codec.hpp>
+#include <utils/c3d_codec.hpp>
 #include <utils/zarr.hpp>
 
 namespace po = boost::program_options;
@@ -99,52 +99,33 @@ std::vector<vc::cache::FileSystemSource::LevelMeta> levelMetasFromVolume(
 // Round-up integer division.
 int divUp(int a, int b) { return (a + b - 1) / b; }
 
-// Canonical codec family. "None" means we must transcode via BlockPipeline.
-enum class CanonicalCodec { None, H265, C3d };
-
-CanonicalCodec detectCanonicalCodec(const utils::ZarrMetadata& m) {
-    if (utils::is_canonical_c3d(m)) return CanonicalCodec::C3d;
-    if (utils::is_canonical_vc3d(m)) return CanonicalCodec::H265;
-    return CanonicalCodec::None;
-}
-
-const char* codecName(CanonicalCodec c) {
-    return c == CanonicalCodec::C3d ? "c3d"
-         : c == CanonicalCodec::H265 ? "h265" : "none";
-}
-
-// Open or create the local canonical disk zarr at <volumePath>/<level>/.
-// Mirrors Volume::createTieredCache() so vc3d sees an identical layout.
-// Geometry follows the requested codec:
-//   C3d : 4096³ shards, 256³ inner chunks, sub_codec "c3d"
-//   H265: 1024³ shards, 128³ inner chunks, sub_codec "h265"
-// If a zarr.json already exists, open it untouched — the caller is
-// responsible for verifying its codec matches before writing shards.
+// Open or create the local canonical c3d disk zarr at <volumePath>/<level>/.
+// Mirrors Volume::createTieredCache() so vc3d sees an identical layout:
+// 4096³ shards with 256³ inner C3DC chunks, sub_codec "c3d". If a
+// zarr.json already exists, open it untouched — the caller is responsible
+// for verifying its layout matches before writing shards.
 std::shared_ptr<utils::ZarrArray> openOrCreateDiskLevel(
-    const fs::path& volumePath, int level, std::array<int, 3> sourceShape,
-    CanonicalCodec codec)
+    const fs::path& volumePath, int level, std::array<int, 3> sourceShape)
 {
     auto lvlPath = volumePath / std::to_string(level);
     if (fs::exists(lvlPath / "zarr.json")) {
         return std::make_shared<utils::ZarrArray>(utils::ZarrArray::open(lvlPath));
     }
-    const int innerSide = (codec == CanonicalCodec::C3d) ? 256 : 128;
-    const int shardSide = (codec == CanonicalCodec::C3d) ? 4096 : 1024;
-    auto pad = [innerSide](int v) -> std::size_t {
-        return std::size_t((v + innerSide - 1) / innerSide * innerSide);
+    auto pad256 = [](int v) -> std::size_t {
+        return std::size_t((v + 255) / 256 * 256);
     };
     utils::ZarrMetadata meta;
     meta.version = utils::ZarrVersion::v3;
     meta.node_type = "array";
-    meta.shape = {pad(sourceShape[0]), pad(sourceShape[1]), pad(sourceShape[2])};
-    meta.chunks = {std::size_t(shardSide), std::size_t(shardSide), std::size_t(shardSide)};
+    meta.shape = {pad256(sourceShape[0]), pad256(sourceShape[1]), pad256(sourceShape[2])};
+    meta.chunks = {4096, 4096, 4096};
     meta.dtype = utils::ZarrDtype::uint8;
     meta.fill_value = 0;
     meta.chunk_key_encoding = "default";
     utils::ShardConfig sc;
-    sc.sub_chunks = {std::size_t(innerSide), std::size_t(innerSide), std::size_t(innerSide)};
+    sc.sub_chunks = {256, 256, 256};
     utils::ZarrCodecConfig cc;
-    cc.name = codecName(codec);
+    cc.name = "c3d";
     sc.sub_codecs.push_back(cc);
     meta.shard_config = std::move(sc);
     return std::make_shared<utils::ZarrArray>(
@@ -165,7 +146,6 @@ std::shared_ptr<utils::ZarrArray> openOrCreateDiskLevel(
 struct PassthroughLevel {
     int level;
     std::filesystem::path lvlPath;
-    CanonicalCodec codec;
 };
 
 void prefetchCanonicalLevels(
@@ -180,7 +160,6 @@ void prefetchCanonicalLevels(
         int level;
         int sz, sy, sx;
         const std::filesystem::path* lvlPath;
-        CanonicalCodec codec;
     };
     std::vector<Shard> queue;
     std::vector<std::uint64_t> perLevelTotal;
@@ -189,9 +168,8 @@ void prefetchCanonicalLevels(
     for (const auto& lvl : levels) {
         const auto shardsPerAxis = src.shardsPerAxis(lvl.level);
         std::fprintf(stderr,
-            "[prefetch] level %d  shardsPerAxis=%dx%dx%d  codec=%s\n",
-            lvl.level, shardsPerAxis[0], shardsPerAxis[1], shardsPerAxis[2],
-            codecName(lvl.codec));
+            "[prefetch] level %d  shardsPerAxis=%dx%dx%d  codec=c3d\n",
+            lvl.level, shardsPerAxis[0], shardsPerAxis[1], shardsPerAxis[2]);
         if (shardsPerAxis[0] <= 0 || shardsPerAxis[1] <= 0 || shardsPerAxis[2] <= 0) {
             std::fprintf(stderr,
                 "[prefetch] level %d: invalid shardsPerAxis — skipping\n", lvl.level);
@@ -220,7 +198,7 @@ void prefetchCanonicalLevels(
         for (int sz = 0; sz < shardsPerAxis[0]; ++sz)
         for (int sy = 0; sy < shardsPerAxis[1]; ++sy)
         for (int sx = 0; sx < shardsPerAxis[2]; ++sx) {
-            queue.push_back({lvl.level, sz, sy, sx, &lvl.lvlPath, lvl.codec});
+            queue.push_back({lvl.level, sz, sy, sx, &lvl.lvlPath});
             ++count;
         }
         perLevelTotal.push_back(count);
@@ -236,10 +214,10 @@ void prefetchCanonicalLevels(
     std::atomic<std::size_t> nextIdx{0};
     std::atomic<std::uint64_t> done{0}, written{0}, missing{0}, skipped{0};
     std::atomic<std::uint64_t> bytesWritten{0};
-    // Per-level flag: spot-check the first non-sentinel inner chunk's magic
-    // once per level. Sharded shards have a 16-byte-per-entry index at
-    // offset 0 (index_location=start); sentinel entries (~0,~0) mean the
-    // inner chunk is absent. Expected magic: H265 → "VC3D", C3d → "C3DC".
+    // Per-level flag: spot-check the first non-sentinel inner chunk's C3DC
+    // magic once per level. Sharded shards have a 16-byte-per-entry index
+    // at offset 0 (index_location=start); sentinel entries (~0,~0) mean
+    // the inner chunk is absent.
     std::vector<std::atomic<bool>> magicChecked(levels.size());
     for (auto& f : magicChecked) f.store(false, std::memory_order_relaxed);
     std::unordered_map<int, std::size_t> levelIndex;
@@ -280,7 +258,6 @@ void prefetchCanonicalLevels(
 
             const std::size_t li = levelIndex[s.level];
             if (!magicChecked[li].exchange(true, std::memory_order_acq_rel)) {
-                const char* expectMagic = (s.codec == CanonicalCodec::C3d) ? "C3DC" : "VC3D";
                 constexpr std::size_t kEntries = 512;
                 constexpr std::size_t kIndexBytes = kEntries * 16;
                 bool sampled = false;
@@ -295,12 +272,11 @@ void prefetchCanonicalLevels(
                         std::uint64_t n = rd64(e * 16 + 8);
                         if (off == ~std::uint64_t(0) || n < 4) continue;
                         if (off + n > bytes.size()) break;
-                        if (bytes[off + 0] != expectMagic[0] || bytes[off + 1] != expectMagic[1]
-                            || bytes[off + 2] != expectMagic[2] || bytes[off + 3] != expectMagic[3]) {
+                        if (bytes[off + 0] != 'C' || bytes[off + 1] != '3'
+                            || bytes[off + 2] != 'D' || bytes[off + 3] != 'C') {
                             throw std::runtime_error(
                                 "level " + std::to_string(s.level) +
-                                " shard inner chunk lacks " + expectMagic +
-                                " magic — source is not " + codecName(s.codec));
+                                " shard inner chunk lacks C3DC magic");
                         }
                         sampled = true;
                         break;
@@ -486,7 +462,7 @@ int main(int argc, char** argv) {
     std::string url;
     std::string cacheDirStr;
     std::string levelsArg = "0";
-    int qp = 36, airClamp = 0, bitShift = 0;
+    float targetRatio = 50.0f;
     int jobs = 0;
 
     po::options_description visible("Options");
@@ -497,12 +473,9 @@ int main(int argc, char** argv) {
         ("levels", po::value(&levelsArg)->default_value("0"),
             "comma-separated pyramid levels to prefetch in the given order, "
             "e.g. \"5,4,3,2,1,0\" prefetches coarsest first")
-        ("qp", po::value(&qp)->default_value(36),
-            "H.265 QP for transcoded chunks (0..51, lower=better)")
-        ("air-clamp", po::value(&airClamp)->default_value(0),
-            "voxels <= threshold snap to threshold pre-encode")
-        ("bit-shift", po::value(&bitShift)->default_value(0),
-            "right-shift voxels by N before encode (0..7)")
+        ("target-ratio", po::value(&targetRatio)->default_value(50.0f),
+            "c3d target compression ratio (transcoded chunks only; "
+            "50 ≈ 40 dB PSNR on scroll CT)")
         ("jobs", po::value(&jobs)->default_value(0),
             "concurrent IO jobs (0 = auto)");
 
@@ -528,14 +501,12 @@ int main(int argc, char** argv) {
     if (vm.count("help") || url.empty()) {
         std::cout <<
             "Usage: vc_zarr_prefetch <s3-or-https-url> "
-            "[--cache-dir PATH] [--levels 5,4,3,2,1,0] [--qp 36] "
-            "[--air-clamp 0] [--bit-shift 0] [--jobs N]\n\n"
+            "[--cache-dir PATH] [--levels 5,4,3,2,1,0] "
+            "[--target-ratio 50] [--jobs N]\n\n"
             << visible << "\n";
         return url.empty() ? 2 : 0;
     }
-    if (qp < 0 || qp > 51) { std::cerr << "qp out of range [0..51]\n"; return 2; }
-    if (bitShift < 0 || bitShift > 7) { std::cerr << "bit-shift out of range [0..7]\n"; return 2; }
-    if (airClamp < 0 || airClamp > 255) { std::cerr << "air-clamp out of range [0..255]\n"; return 2; }
+    if (targetRatio < 1.0f) { std::cerr << "target-ratio must be >= 1.0\n"; return 2; }
 
     // Parse comma-separated level list (preserves order; rejects duplicates).
     std::vector<int> levelOrder;
@@ -568,8 +539,8 @@ int main(int argc, char** argv) {
     auto vol = Volume::NewFromUrl(url, cacheDir);
     if (!vol) { std::cerr << "failed to open remote volume\n"; return 1; }
     if (jobs > 0) vol->setIOThreads(jobs);
-    utils::VideoCodecParams enc;
-    enc.qp = qp; enc.air_clamp = airClamp; enc.shift_n = bitShift;
+    utils::C3dCodecParams enc;
+    enc.target_ratio = targetRatio;
     vol->setEncodeParams(enc);
 
     const int availableLevels = static_cast<int>(vol->numScales());
@@ -600,7 +571,7 @@ int main(int argc, char** argv) {
     // Per-level info indexed by the actual pyramid level index. Only entries
     // for levels we'll touch get populated.
     const std::size_t nLevels = std::size_t(availableLevels);
-    std::vector<CanonicalCodec> levelCodec(nLevels, CanonicalCodec::None);
+    std::vector<bool> levelCanonicalC3d(nLevels, false);
     std::vector<std::array<int, 3>> levelShapes(nLevels, {0, 0, 0});
     std::vector<std::array<int, 3>> levelShardShapes(nLevels, {0, 0, 0});
     for (int lvl : levelOrder) {
@@ -609,26 +580,8 @@ int main(int argc, char** argv) {
             std::cerr << "no metadata at level " << lvl << " — stopping\n";
             return 1;
         }
-        CanonicalCodec srcCodec = detectCanonicalCodec(*meta);
-        // If a local level already exists, the passthrough only works when
-        // its on-disk codec matches the remote. A mismatch (e.g. legacy
-        // h265 cache vs. c3d remote) must fall back to transcode so the
-        // BlockPipeline can re-encode into whatever the local cache uses.
-        if (srcCodec != CanonicalCodec::None) {
-            auto lvlPath = vol->path() / std::to_string(lvl);
-            if (fs::exists(lvlPath / "zarr.json")) {
-                auto diskArr = utils::ZarrArray::open(lvlPath);
-                CanonicalCodec diskCodec = detectCanonicalCodec(diskArr.metadata());
-                if (diskCodec != srcCodec) {
-                    std::fprintf(stderr,
-                        "[prefetch] level %d  local cache is %s but source is %s — "
-                        "falling back to transcode\n",
-                        lvl, codecName(diskCodec), codecName(srcCodec));
-                    srcCodec = CanonicalCodec::None;
-                }
-            }
-        }
-        levelCodec[lvl] = srcCodec;
+        bool canonical = utils::is_canonical_c3d(*meta);
+        levelCanonicalC3d[lvl] = canonical;
         levelShapes[lvl] = {
             int(meta->shape[0]), int(meta->shape[1]), int(meta->shape[2])};
         if (meta->chunks.size() >= 3) {
@@ -639,11 +592,7 @@ int main(int argc, char** argv) {
             "[prefetch] level %d  shape=%dx%dx%d  shard=%dx%dx%d  %s\n",
             lvl, levelShapes[lvl][0], levelShapes[lvl][1], levelShapes[lvl][2],
             levelShardShapes[lvl][0], levelShardShapes[lvl][1], levelShardShapes[lvl][2],
-            srcCodec == CanonicalCodec::None
-                ? "non-canonical → transcode"
-                : (srcCodec == CanonicalCodec::C3d
-                    ? "canonical c3d → passthrough"
-                    : "canonical h265 → passthrough"));
+            canonical ? "canonical c3d → passthrough" : "non-canonical → transcode");
     }
 
     // Build a standalone HttpSource for the passthrough path. Mirrors the
@@ -662,7 +611,7 @@ int main(int argc, char** argv) {
         // for this volume — fall back to the shard shape we read from
         // the first canonical level's zarr.json.
         for (int lvl : levelOrder) {
-            if (levelCodec[lvl] == CanonicalCodec::None) continue;
+            if (!levelCanonicalC3d[lvl]) continue;
             vc::cache::ShardConfig sc;
             sc.enabled = true;
             sc.shardShape = levelShardShapes[lvl];
@@ -690,10 +639,9 @@ int main(int argc, char** argv) {
     // parallelism).
     std::vector<PassthroughLevel> passthroughLevels;
     for (int lvl : levelOrder) {
-        if (levelCodec[lvl] == CanonicalCodec::None) continue;
-        (void)openOrCreateDiskLevel(vol->path(), lvl, levelShapes[lvl], levelCodec[lvl]);
-        passthroughLevels.push_back({
-            lvl, vol->path() / std::to_string(lvl), levelCodec[lvl]});
+        if (!levelCanonicalC3d[lvl]) continue;
+        (void)openOrCreateDiskLevel(vol->path(), lvl, levelShapes[lvl]);
+        passthroughLevels.push_back({lvl, vol->path() / std::to_string(lvl)});
     }
     if (!passthroughLevels.empty() && !g_shutdown.load(std::memory_order_acquire)) {
         prefetchCanonicalLevels(passthroughSource, passthroughLevels, passthroughJobs);
@@ -701,7 +649,7 @@ int main(int argc, char** argv) {
 
     for (int lvl : levelOrder) {
         if (g_shutdown.load(std::memory_order_acquire)) break;
-        if (levelCodec[lvl] == CanonicalCodec::None) {
+        if (!levelCanonicalC3d[lvl]) {
             prefetchTranscodeLevel(pipeFor(), lvl, levelShapes[lvl]);
         }
     }

@@ -69,10 +69,13 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     if (auto* lbl = findChild<QLabel*>("labelIOThreads")) lbl->hide();
     if (spinIOThreads) spinIOThreads->hide();
 
-    // Hide removed recompression UI
+    // Hide removed recompression UI — the disk cache now always uses c3d.
     chkVideoRecompress->hide();
     cmbVideoQualityPreset->hide();
+    cmbVideoCodecType->hide();
     if (auto* label = findChild<QLabel*>("labelVideoQualityPreset"))
+        label->hide();
+    if (auto* label = findChild<QLabel*>("labelVideoCodecType"))
         label->hide();
 
     connect(btnBrowseRemoteCachePath, &QPushButton::clicked, this, [this]{

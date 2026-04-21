@@ -67,24 +67,6 @@ if(UTILS_COMPRESSION_LIBS)
     target_link_libraries(utils_compression INTERFACE ${UTILS_COMPRESSION_LIBS})
 endif()
 
-# H.265 video codec (x265 encoder + libde265 decoder)
-include(FindPkgConfig OPTIONAL)
-pkg_check_modules(LIBDE265 REQUIRED libde265)
-find_library(X265_LIB x265 REQUIRED)
-find_path(X265_INC x265.h REQUIRED)
-
-add_library(utils_video_codec STATIC src/video_codec.cpp)
-target_include_directories(utils_video_codec PUBLIC
-    $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-    $<INSTALL_INTERFACE:include>
-)
-target_compile_features(utils_video_codec PUBLIC cxx_std_23)
-target_link_libraries(utils_video_codec PUBLIC ${X265_LIB} ${LIBDE265_LIBRARIES})
-target_include_directories(utils_video_codec PRIVATE ${X265_INC} ${LIBDE265_INCLUDE_DIRS})
-target_compile_definitions(utils_video_codec PUBLIC UTILS_HAS_VIDEO_CODEC=1)
-set_target_properties(utils_video_codec PROPERTIES AUTOMOC OFF AUTORCC OFF AUTOUIC OFF)
-message(STATUS "Video codec: H.265 only (x265 + libde265)")
-
 # c3d volumetric codec (single-TU vendored library in libs/c3d).
 add_library(utils_c3d_codec STATIC src/c3d_codec.cpp)
 target_include_directories(utils_c3d_codec PUBLIC
