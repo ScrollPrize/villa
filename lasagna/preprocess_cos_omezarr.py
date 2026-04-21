@@ -1373,24 +1373,27 @@ def _auto_download(
 	"""
 	import json as _json
 
-	group_root = _find_zarr_group_root(input_path)
-	if group_root is None:
-		raise FileNotFoundError(
-			f"cannot find zarr group root for {input_path}; "
-			"pass --no-download to skip auto-download"
-		)
+	# Walk up from input path to find the zarr group root with _download metadata.
+	# Per-level .zattrs may exist but won't have _download — keep walking up.
+	p = Path(str(input_path).rstrip("/")).resolve()
+	group_root = None
+	dl_meta = None
+	check = p
+	for _ in range(5):
+		zattrs_path = check / ".zattrs"
+		if zattrs_path.is_file():
+			zattrs = _json.loads(zattrs_path.read_text(encoding="utf-8"))
+			if "_download" in zattrs:
+				group_root = check
+				dl_meta = zattrs["_download"]
+				break
+		if check.parent == check:
+			break
+		check = check.parent
 
-	zattrs_path = group_root / ".zattrs"
-	if not zattrs_path.is_file():
-		raise FileNotFoundError(
-			f"no .zattrs at {group_root}; "
-			"pass --no-download to skip auto-download"
-		)
-	zattrs = _json.loads(zattrs_path.read_text(encoding="utf-8"))
-	dl_meta = zattrs.get("_download")
-	if dl_meta is None:
+	if group_root is None or dl_meta is None:
 		raise ValueError(
-			f"no _download metadata in {zattrs_path} — "
+			f"no _download metadata found walking up from {input_path} — "
 			"run download_omezarr.py on this volume first "
 			"(it records the S3 source), or pass --no-download to skip"
 		)
@@ -1399,13 +1402,13 @@ def _auto_download(
 	anon = dl_meta.get("anon", False)
 	region = dl_meta.get("region")
 
-	# Determine which scales to download
+	# Determine which scales to download (strip trailing slashes for name check)
 	scales: set[int] = set()
-	inp = Path(input_path).resolve()
+	inp = Path(str(input_path).rstrip("/")).resolve()
 	if inp.name.isdigit():
 		scales.add(int(inp.name))
 	if pred_dt_path:
-		dt_p = Path(pred_dt_path).resolve()
+		dt_p = Path(str(pred_dt_path).rstrip("/")).resolve()
 		if dt_p.name.isdigit():
 			scales.add(int(dt_p.name))
 
