@@ -275,7 +275,7 @@ def optimize(
 	terms = {
 		"step": {"loss": opt_loss_step.step_loss},
 		"smooth": {"loss": opt_loss_smooth.smooth_loss},
-		"winding_density": {"loss": opt_loss_winding_density.winding_density_loss},
+		"winding_density": {"loss": opt_loss_winding_density.winding_density_loss, "min_depth": 2},
 		"normal": {"loss": opt_loss_dir.normal_loss},
 		"data": {"loss": opt_loss_data.data_loss},
 		"data_plain": {"loss": opt_loss_data.data_plain_loss},
@@ -396,7 +396,11 @@ def optimize(
 			"""Evaluate all loss terms, handling both single and multi-loss returns."""
 			total = torch.zeros((), device=data.cos.device, dtype=data.cos.dtype)
 			tv: dict[str, float] = {}
+			D = res_.xyz_lr.shape[0]
 			for name, t in terms.items():
+				min_d = t.get("min_depth", 1)
+				if D < min_d:
+					continue
 				sub_names = t.get("sub")
 				if sub_names:
 					# Multi-loss: check if any sub-term has weight

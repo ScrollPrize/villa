@@ -254,12 +254,27 @@ def main(argv: list[str] | None = None) -> int:
 	else:
 		print(f"[fit] corr_points: not found in config (type={type(corr_points_obj).__name__})", flush=True)
 
+	# Parse stages (before data loading so we know which channels to skip)
+	stages = optimizer.load_stages_cfg(cfg)
+
+	_skip_channels: set[str] = set()
+	_any_data = any(s.global_opt.eff.get("data", 0) > 0 or s.global_opt.eff.get("data_plain", 0) > 0
+					for s in stages)
+	_any_pred_dt = any(s.global_opt.eff.get("pred_dt", 0) > 0 for s in stages)
+	if not _any_data:
+		_skip_channels.add("cos")
+	if not _any_pred_dt:
+		_skip_channels.add("pred_dt")
+	if _skip_channels:
+		print(f"[fit] skipping channels: {sorted(_skip_channels)}", flush=True)
+
 	# --- Data loading (with auto-crop, blur, and reload support) ---
 	def _load_data() -> fit_data.FitData3D:
 		d = fit_data.load_3d_for_model(
 			path=str(data_cfg.input), device=device, model=mdl,
 			cuda_gridsample=data_cfg.cuda_gridsample,
 			erode_valid_mask=data_cfg.erode_valid_mask,
+			skip_channels=_skip_channels,
 		)
 		Z, Y, X = d.size
 		volume_extent = (
@@ -307,9 +322,6 @@ def main(argv: list[str] | None = None) -> int:
 		mean = xyz.mean(dim=(0, 1, 2)).cpu().numpy().tolist()
 		print(f"initial mesh: mean={[round(v, 1) for v in mean]} "
 			  f"min={[round(v, 1) for v in mn]} max={[round(v, 1) for v in mx]}")
-
-	# Parse stages
-	stages = optimizer.load_stages_cfg(cfg)
 
 	def _save_model(path: str) -> None:
 		if mdl.arc_enabled:

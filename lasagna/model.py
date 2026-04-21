@@ -76,7 +76,7 @@ class Model3D(nn.Module):
 		self.init_mode = str(init_mode)  # "arc" or "straight"
 		self.arc_enabled = self.init_mode == "arc"
 		self.straight_enabled = self.init_mode == "straight"
-		self.pyramid_d = bool(pyramid_d)
+		self.pyramid_d = bool(pyramid_d) and self.depth > 1
 
 		self.params = ModelParams3D(
 			mesh_step=int(mesh_step),
@@ -544,17 +544,21 @@ class Model3D(nn.Module):
 		Hm = self.mesh_h
 		Wm = self.mesh_w
 
-		# Target: cosine pattern along width
-		periods = max(1, Wm - 1)
-		xs = torch.linspace(0.0, float(periods), We, device=xyz_lr.device, dtype=torch.float32)
-		phase = (2.0 * torch.pi) * xs.view(1, 1, 1, We)
-		target_plain = 0.5 + 0.5 * torch.cos(phase).expand(D, 1, He, We)
+		# Target: cosine pattern along width (only meaningful when cos channel is loaded)
+		if data.cos is not None:
+			periods = max(1, Wm - 1)
+			xs = torch.linspace(0.0, float(periods), We, device=xyz_lr.device, dtype=torch.float32)
+			phase = (2.0 * torch.pi) * xs.view(1, 1, 1, We)
+			target_plain = 0.5 + 0.5 * torch.cos(phase).expand(D, 1, He, We)
 
-		amp_lr = self.amp.clamp(0.1, 1.0)
-		bias_lr = self.bias.clamp(0.0, 0.45)
-		amp_hr = F.interpolate(amp_lr, size=(He, We), mode="bilinear", align_corners=True)
-		bias_hr = F.interpolate(bias_lr, size=(He, We), mode="bilinear", align_corners=True)
-		target_mod = (bias_hr + amp_hr * (target_plain - 0.5)).clamp(0.0, 1.0)
+			amp_lr = self.amp.clamp(0.1, 1.0)
+			bias_lr = self.bias.clamp(0.0, 0.45)
+			amp_hr = F.interpolate(amp_lr, size=(He, We), mode="bilinear", align_corners=True)
+			bias_hr = F.interpolate(bias_lr, size=(He, We), mode="bilinear", align_corners=True)
+			target_mod = (bias_hr + amp_hr * (target_plain - 0.5)).clamp(0.0, 1.0)
+		else:
+			target_plain = torch.zeros(D, 1, He, We, device=xyz_lr.device)
+			target_mod = torch.zeros(D, 1, He, We, device=xyz_lr.device)
 
 		# Masking via grad_mag > 0
 		mask_hr = (data.grid_sample_fullres(xyz_hr.detach()).grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
