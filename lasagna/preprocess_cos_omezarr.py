@@ -668,80 +668,116 @@ def _compute_pred_dt_slab(
 	out_z0: int, out_y0: int, out_x0: int,
 	scaledown: int,
 	overlap: int = 48,
+	edt_chunk: int = 448,
+	progress: dict | None = None,
 ) -> None:
-	"""Compute signed distance-to-surface for one z-band.
+	"""Compute signed distance-to-surface for a region, chunked for GPU EDT.
 
-	Reads from pred_zarr with overlap, computes signed EDT, encodes to uint8,
-	downsamples, and writes to output_level_arr (3D).
+	Iterates sub-chunks of size *edt_chunk* in all 3 axes with *overlap*
+	padding (must be >= MAX_DT=48 for correct boundary distances).
+	Each sub-chunk: read → binarize → GPU EDT → signed encode → crop
+	overlap → downsample → write to *output_level_arr* (3D).
 	"""
-	pZ = int(pred_zarr.shape[0])
-	pY = int(pred_zarr.shape[1])
-	pX = int(pred_zarr.shape[2])
-
-	# Padded read range
-	read_z0 = max(0, pred_z0 - overlap)
-	read_z1 = min(pZ, pred_z1 + overlap)
-	read_y0 = max(0, pred_y0 - overlap)
-	read_y1 = min(pY, pred_y1 + overlap)
-	read_x0 = max(0, pred_x0 - overlap)
-	read_x1 = min(pX, pred_x1 + overlap)
-
-	chunk_np = np.asarray(pred_zarr[read_z0:read_z1, read_y0:read_y1, read_x0:read_x1])
-	binary = chunk_np > 0
-	del chunk_np
+	if not _HAS_CUPY:
+		raise ImportError("pred-dt requires CuPy for GPU EDT")
 
 	_MAX_DT = 48
+	pZ, pY, pX = (int(v) for v in pred_zarr.shape)
 
-	def _run_edt(mask_np):
-		if _HAS_CUPY:
-			cp.get_default_memory_pool().free_all_blocks()
-			try:
-				m_gpu = cp.asarray(mask_np)
-				d_gpu = cnd.distance_transform_edt(m_gpu)
-				d = cp.asnumpy(d_gpu).astype(np.float32)
-				del m_gpu, d_gpu
+	# Build chunk grid over the requested region
+	z_starts = list(range(pred_z0, pred_z1, edt_chunk))
+	y_starts = list(range(pred_y0, pred_y1, edt_chunk))
+	x_starts = list(range(pred_x0, pred_x1, edt_chunk))
+	n_chunks = len(z_starts) * len(y_starts) * len(x_starts)
+	chunk_i = 0
+	t0 = time.time()
+
+	for cz0 in z_starts:
+		cz1 = min(pred_z1, cz0 + edt_chunk)
+		for cy0 in y_starts:
+			cy1 = min(pred_y1, cy0 + edt_chunk)
+			for cx0 in x_starts:
+				cx1 = min(pred_x1, cx0 + edt_chunk)
+				chunk_i += 1
+
+				# Read with overlap padding
+				rz0 = max(0, cz0 - overlap)
+				rz1 = min(pZ, cz1 + overlap)
+				ry0 = max(0, cy0 - overlap)
+				ry1 = min(pY, cy1 + overlap)
+				rx0 = max(0, cx0 - overlap)
+				rx1 = min(pX, cx1 + overlap)
+
+				chunk_np = np.asarray(pred_zarr[rz0:rz1, ry0:ry1, rx0:rx1])
+				binary = chunk_np > 0
+				del chunk_np
+
+				# GPU signed EDT
 				cp.get_default_memory_pool().free_all_blocks()
-				return d
-			except cp.cuda.memory.OutOfMemoryError:
+				m_gpu = cp.asarray(binary)
+				outer_dt = cp.asnumpy(cnd.distance_transform_edt(~m_gpu)).astype(np.float32)
+				inner_dt = cp.asnumpy(cnd.distance_transform_edt(m_gpu)).astype(np.float32)
+				del m_gpu
 				cp.get_default_memory_pool().free_all_blocks()
-				if not _HAS_EDT:
-					raise
-		if _HAS_EDT:
-			return edt_mod.edt(mask_np, parallel=32).astype(np.float32)
-		raise ImportError("pred-dt requires CuPy (GPU) or 'edt' package (CPU)")
 
-	outer_dt = _run_edt(~binary)
-	inner_dt = _run_edt(binary)
+				# Signed encoding
+				outer_enc = (128 - np.clip(np.round(outer_dt), 1, _MAX_DT)).astype(np.uint8)
+				inner_enc = (127 + np.clip(np.round(inner_dt), 1, _MAX_DT)).astype(np.uint8)
+				dt_enc = np.where(binary, inner_enc, outer_enc)
+				del binary, outer_dt, inner_dt, outer_enc, inner_enc
 
-	outer_enc = (128 - np.clip(np.round(outer_dt), 1, _MAX_DT)).astype(np.uint8)
-	inner_enc = (127 + np.clip(np.round(inner_dt), 1, _MAX_DT)).astype(np.uint8)
-	dt_encoded = np.where(binary, inner_enc, outer_enc)
-	del binary, outer_dt, inner_dt, outer_enc, inner_enc
+				# Crop overlap to center region
+				pz = cz0 - rz0
+				py = cy0 - ry0
+				px = cx0 - rx0
+				sz = cz1 - cz0
+				sy = cy1 - cy0
+				sx = cx1 - cx0
+				center = dt_enc[pz:pz + sz, py:py + sy, px:px + sx]
+				del dt_enc
 
-	# Crop overlap padding to center
-	pad_z = pred_z0 - read_z0
-	pad_y = pred_y0 - read_y0
-	pad_x = pred_x0 - read_x0
-	center_z = pred_z1 - pred_z0
-	center_y = pred_y1 - pred_y0
-	center_x = pred_x1 - pred_x0
-	dt_u8 = dt_encoded[pad_z:pad_z + center_z, pad_y:pad_y + center_y, pad_x:pad_x + center_x]
-	del dt_encoded
+				# Downsample and write to output level array
+				for zl in range(0, sz, scaledown):
+					slc = center[zl]
+					if scaledown > 1:
+						oh = max(1, slc.shape[0] // scaledown)
+						ow = max(1, slc.shape[1] // scaledown)
+						slc = cv2.resize(slc, (ow, oh), interpolation=cv2.INTER_AREA)
+					# Output coords: map from pred coords to output level coords
+					ozi = out_z0 + (cz0 - pred_z0 + zl) // scaledown
+					oyi = out_y0 + (cy0 - pred_y0) // scaledown
+					oxi = out_x0 + (cx0 - pred_x0) // scaledown
+					oy1 = min(int(output_level_arr.shape[1]), oyi + slc.shape[0])
+					ox1 = min(int(output_level_arr.shape[2]), oxi + slc.shape[1])
+					wy = oy1 - oyi
+					wx = ox1 - oxi
+					if ozi < int(output_level_arr.shape[0]) and wy > 0 and wx > 0:
+						output_level_arr[ozi, oyi:oy1, oxi:ox1] = slc[:wy, :wx]
+				del center
 
-	# Downsample and write
-	for zf_local in range(0, center_z, scaledown):
-		slc = dt_u8[zf_local]
-		if scaledown > 1:
-			out_h = max(1, slc.shape[0] // scaledown)
-			out_w = max(1, slc.shape[1] // scaledown)
-			slc = cv2.resize(slc, (out_w, out_h), interpolation=cv2.INTER_AREA)
-		out_zi = out_z0 + zf_local // scaledown
-		out_y1 = min(int(output_level_arr.shape[1]), out_y0 + slc.shape[0])
-		out_x1 = min(int(output_level_arr.shape[2]), out_x0 + slc.shape[1])
-		wy = out_y1 - out_y0
-		wx = out_x1 - out_x0
-		if out_zi < int(output_level_arr.shape[0]) and wy > 0 and wx > 0:
-			output_level_arr[out_zi, out_y0:out_y1, out_x0:out_x1] = slc[:wy, :wx]
+				if progress is not None:
+					progress["edt_done"] = progress.get("edt_done", 0) + 1
+				elapsed = max(1e-6, time.time() - t0)
+				eta = elapsed / chunk_i * (n_chunks - chunk_i)
+				overall = ""
+				if progress is not None:
+					oe = max(1e-6, time.time() - progress["t0"])
+					frac = progress.get("tiles_done", 0) / max(1, progress.get("tiles_total", 1))
+					# Weight: tiles are ~70% of work, edt ~30% (rough)
+					edt_frac = progress.get("edt_done", 0) / max(1, progress.get("edt_total_est", 1))
+					overall_frac = 0.7 * frac + 0.3 * edt_frac
+					if overall_frac > 0.01:
+						overall_eta = oe / overall_frac * (1.0 - overall_frac)
+						overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
+				print(f"\r[pred_dt] chunk {chunk_i}/{n_chunks} "
+					  f"({100.0 * chunk_i / n_chunks:.0f}%) "
+					  f"eta {int(eta // 60):02d}:{int(eta % 60):02d}"
+					  f"{overall}  ",
+					  end="", flush=True)
+
+	if n_chunks > 0:
+		print(f"\r[pred_dt] {n_chunks} chunks in {time.time() - t0:.1f}s" + " " * 20,
+			  flush=True)
 
 
 def _compute_pred_dt_channel(
@@ -1086,6 +1122,7 @@ def _infer_tiled_3d(
 	output_sigmoid: bool = True,
 	on_z_complete=None,
 	skip_z_positions: int = 0,
+	progress: dict | None = None,
 ) -> tuple[np.ndarray, np.ndarray] | None:
 	"""Run 3D UNet inference with dual-resolution accumulators.
 
@@ -1223,6 +1260,9 @@ def _infer_tiled_3d(
 	done = skipped_tiles
 	t0 = time.time()
 	crop_offset = (z0, y0, x0)
+	if progress is not None:
+		progress["tiles_total"] = total_tiles
+		progress["tiles_done"] = done
 
 	for i_tz, tz in enumerate(z_positions):
 		if i_tz < skip_z_positions:
@@ -1297,11 +1337,21 @@ def _infer_tiled_3d(
 				wsum_coarse[0, azl_c:azr_c, ayl_c:ayr_c, axl_c:axr_c] += w_coarse[:pz_c, :py_c, :px_c]
 
 				done += 1
+				if progress is not None:
+					progress["tiles_done"] = done
 				elapsed = max(1e-6, time.time() - t0)
 				actual_done = done - skipped_tiles
 				per = elapsed / max(1, actual_done)
 				remaining = total_tiles - done
 				eta = max(0.0, per * remaining)
+				overall = ""
+				if progress is not None:
+					oe = max(1e-6, time.time() - progress["t0"])
+					frac = done / max(1, total_tiles)
+					overall_frac = 0.7 * frac  # tiles ~70% of total work
+					if overall_frac > 0.01:
+						overall_eta = oe / overall_frac * (1.0 - overall_frac)
+						overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
 				bar_w = 30
 				fill = int(round(done / max(1, total_tiles) * bar_w))
 				bar = "#" * fill + "-" * (bar_w - fill)
@@ -1309,7 +1359,8 @@ def _infer_tiled_3d(
 					f"\r[predict3d] [{bar}] {done}/{total_tiles} tiles "
 					f"({100.0 * done / max(1, total_tiles):.1f}%) "
 					f"eta {int(eta // 60):02d}:{int(eta % 60):02d} "
-					f"avg={1000.0 * per:.0f}ms/tile",
+					f"avg={1000.0 * per:.0f}ms/tile"
+					f"{overall}",
 					end="", flush=True,
 				)
 
@@ -1815,6 +1866,7 @@ def run_preprocess_3d(
 							out_z0=cos_oz0 + eff_out_zs,
 							out_y0=cos_oy0, out_x0=cos_ox0,
 							scaledown=pred_per_cos,
+							progress=_progress,
 						)
 
 			# Release memmap pages
@@ -1880,6 +1932,23 @@ def run_preprocess_3d(
 		_prev_flush_coarse[0] = max(_prev_flush_coarse[0], complete_z_c)
 
 	# --- Streaming inference + flush ---
+	# Shared progress tracker for unified ETA across tiles + EDT
+	_progress = {
+		"t0": time.time(),
+		"tiles_done": 0,
+		"tiles_total": 0,  # set by _infer_tiled_3d
+		"edt_done": 0,
+		"edt_total_est": 1,  # updated below
+	}
+	# Estimate total EDT chunks (for overall ETA weighting)
+	if pred_dt_zarr is not None:
+		_psh = tuple(int(v) for v in pred_dt_zarr.shape)
+		import math as _m2
+		_edt_nz = max(1, _m2.ceil((pred_z1_total := (cos_oz1 - cos_oz0) * effective_cos_sd // max(1, pred_sd)) / 448))
+		_edt_ny = max(1, _m2.ceil((_psh[1]) / 448))
+		_edt_nx = max(1, _m2.ceil((_psh[2]) / 448))
+		_progress["edt_total_est"] = _edt_nz * _edt_ny * _edt_nx
+
 	_infer_tiled_3d(
 		model, a_in,
 		crop_slices=(z0, z1, y0, y1, x0, x1),
@@ -1893,6 +1962,7 @@ def run_preprocess_3d(
 		output_sigmoid=_output_sigmoid,
 		on_z_complete=_on_z_complete,
 		skip_z_positions=skip_z_positions,
+		progress=_progress,
 	)
 	del model
 	torch.cuda.empty_cache()
