@@ -71,7 +71,8 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 				  scale: float, d: np.ndarray | None = None,
 				  model_source: Path | None = None,
 				  copy_model: bool = False, fit_config: dict | None = None,
-				  area: dict | None = None) -> None:
+				  area: dict | None = None,
+				  components: list[list[int]] | None = None) -> None:
 	out_dir.mkdir(parents=True, exist_ok=True)
 	if x.shape != y.shape or x.shape != z.shape:
 		raise ValueError("x/y/z must have identical shapes")
@@ -92,6 +93,8 @@ def _write_tifxyz(*, out_dir: Path, x: np.ndarray, y: np.ndarray, z: np.ndarray,
 			[float(np.nanmax(xf)), float(np.nanmax(yf)), float(np.nanmax(zf))],
 		],
 	}
+	if components is not None:
+		meta["components"] = components
 	if area is not None:
 		meta.update(area)
 	if model_source is not None:
@@ -172,11 +175,13 @@ def main(argv: list[str] | None = None) -> int:
 		d_all = np.full((Hm, total_w), -1.0, dtype=np.float32)
 
 		col = 0
+		components: list[list[int]] = []
 		for d in range(D):
 			x_all[:, col:col + Wm] = mesh_np[0, d]  # (Hm, Wm)
 			y_all[:, col:col + Wm] = mesh_np[1, d]
 			z_all[:, col:col + Wm] = mesh_np[2, d]
 			d_all[:, col:col + Wm] = float(d)
+			components.append([col, col + Wm])
 			col += Wm + BORDER_W
 
 		seg_name = cfg.output_name if cfg.output_name else f"{cfg.prefix}.tifxyz"
@@ -184,7 +189,7 @@ def main(argv: list[str] | None = None) -> int:
 		area = _get_area(x_all, y_all, z_all, xy_step_fullres, cfg.voxel_size_um)
 		_write_tifxyz(out_dir=out_dir, x=x_all, y=y_all, z=z_all, d=d_all, scale=meta_scale,
 					  model_source=Path(cfg.input), copy_model=cfg.copy_model, fit_config=fit_config,
-					  area=area)
+					  area=area, components=components if D > 1 else None)
 		_print_area(area)
 		if model_params is not None:
 			(out_dir / "model_params.json").write_text(json.dumps(model_params, indent=2) + "\n", encoding="utf-8")
