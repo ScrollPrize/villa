@@ -48,7 +48,13 @@ std::string CState::currentVolumeId() const { return _currentVolumeId; }
 
 void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
-    // Clear shared block cache when switching volumes to avoid stale tiles
+    // Stop old volume's pipeline IO and clear all caches to avoid stale tiles
+    if (_currentVolume) {
+        auto* oldPipeline = _currentVolume->tieredCache();
+        if (oldPipeline) {
+            oldPipeline->clearMemory();
+        }
+    }
     if (_blockCache) {
         _blockCache->clear();
     }
