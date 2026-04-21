@@ -157,28 +157,38 @@ def _first_filled_level_from_downscale(scaledown: int) -> int:
 
 
 def _process_slab_worker(args_tuple):
-	"""Multiprocessing worker: read one Z-slab, downsample, write all pyramid levels."""
+	"""Multiprocessing worker: read one Z-slab from source, write base level only."""
 	(input_path_str, out_path_str, ci,
 	 src_z0, src_z1, ys0, ys1, xs0, xs1,
 	 out_oz, out_oy, out_ox,
-	 first_filled_level, n_levels) = args_tuple
+	 first_filled_level) = args_tuple
 
 	src = zarr.open(input_path_str, mode="r")
 	slab = np.asarray(src[ci, src_z0:src_z1, ys0:ys1, xs0:xs1]).astype(np.uint8, copy=False)
 
 	dst_g = zarr.open_group(out_path_str, mode="r+")
+	dst_g[str(first_filled_level)][out_oz:out_oz + slab.shape[0],
+								   out_oy:out_oy + slab.shape[1],
+								   out_ox:out_ox + slab.shape[2]] = slab
 
-	cur = slab
-	oz, oy, ox = out_oz, out_oy, out_ox
-	dst_g[str(first_filled_level)][oz:oz + cur.shape[0], oy:oy + cur.shape[1], ox:ox + cur.shape[2]] = cur
 
-	for lv in range(first_filled_level + 1, n_levels):
-		sz, sy, sx = oz & 1, oy & 1, ox & 1
-		cur = cur[sz::2, sy::2, sx::2]
-		oz, oy, ox = oz // 2, oy // 2, ox // 2
-		if cur.size == 0:
-			break
-		dst_g[str(lv)][oz:oz + cur.shape[0], oy:oy + cur.shape[1], ox:ox + cur.shape[2]] = cur
+def _downsample_chunk_worker(args_tuple):
+	"""Multiprocessing worker: read one chunk-aligned region from level N,
+	downsample 2x, write to level N+1. Lock-free: each worker writes to
+	a unique chunk region at the target level."""
+	(out_path_str, src_level, dst_level,
+	 z0, z1, y0, y1, x0, x1) = args_tuple
+
+	g = zarr.open_group(out_path_str, mode="r+")
+	src_arr = g[str(src_level)]
+	slab = np.asarray(src_arr[z0:z1, y0:y1, x0:x1])
+	down = slab[::2, ::2, ::2]
+	if down.size == 0:
+		return
+	dz0, dy0, dx0 = z0 // 2, y0 // 2, x0 // 2
+	g[str(dst_level)][dz0:dz0 + down.shape[0],
+					  dy0:dy0 + down.shape[1],
+					  dx0:dx0 + down.shape[2]] = down
 
 
 def run(
@@ -254,8 +264,7 @@ def run(
 					fill_value=0,
 				)
 
-		# Align slabs to output chunk boundaries for zero write contention.
-		# Each slab is chunk-aligned in Z at the base level.
+		# --- Phase 1: Write base level in parallel (chunk-aligned, no contention) ---
 		cz = chunk
 		slab_ranges = []
 		for z_off in range(0, crop_z, cz):
@@ -267,14 +276,13 @@ def run(
 		print(f"{TAG} {ch}: {crop_z}×{ys1-ys0}×{xs1-xs0} ({sz_gb:.1f} Gvox), "
 			  f"{n_slabs} slabs, {workers} workers, {levels} levels", flush=True)
 
-		# Build work items for multiprocessing
 		work_items = []
 		for z_off, z_end in slab_ranges:
 			work_items.append((
 				str(input_path), str(out_path), ci,
 				zs0 + z_off, zs0 + z_end, ys0, ys1, xs0, xs1,
-				zs0 + z_off, ys0, xs0,  # output offsets = source offsets
-				first_filled_level, levels,
+				zs0 + z_off, ys0, xs0,
+				first_filled_level,
 			))
 
 		t0 = time.time()
@@ -285,7 +293,7 @@ def run(
 			while not _stop.is_set():
 				with lock:
 					d = done_count[0]
-				_print_progress(prefix=f"{TAG} {ch}", done=d, total=n_slabs, t0=t0)
+				_print_progress(prefix=f"{TAG} {ch} L{first_filled_level}", done=d, total=n_slabs, t0=t0)
 				_stop.wait(0.5)
 
 		_stop = threading.Event()
@@ -299,8 +307,53 @@ def run(
 
 		_stop.set()
 		prog.join(timeout=2)
-		_print_progress(prefix=f"{TAG} {ch}", done=n_slabs, total=n_slabs, t0=t0)
+		_print_progress(prefix=f"{TAG} {ch} L{first_filled_level}", done=n_slabs, total=n_slabs, t0=t0)
 		print("", flush=True)
+
+		# --- Phase 2: Build coarser pyramid levels, one level at a time ---
+		# Each level reads from the previous level and writes chunk-aligned
+		# regions. No contention: each worker writes to a unique chunk.
+		for lv in range(first_filled_level + 1, levels):
+			src_lv = lv - 1
+			src_shape = arrs_shapes[src_lv]
+			dst_shape = arrs_shapes[lv]
+			# Chunk-aligned work items at the SOURCE level (2× chunk so
+			# each worker produces exactly one chunk at the dest level).
+			cz2 = chunk * 2
+			ds_work = []
+			for z0 in range(0, src_shape[0], cz2):
+				z1 = min(src_shape[0], z0 + cz2)
+				for y0 in range(0, src_shape[1], cz2):
+					y1 = min(src_shape[1], y0 + cz2)
+					for x0 in range(0, src_shape[2], cz2):
+						x1 = min(src_shape[2], x0 + cz2)
+						ds_work.append((
+							str(out_path), src_lv, lv,
+							z0, z1, y0, y1, x0, x1,
+						))
+			n_ds = len(ds_work)
+			t_lv = time.time()
+			done_count[0] = 0
+
+			_stop2 = threading.Event()
+			def _prog2():
+				while not _stop2.is_set():
+					with lock:
+						d = done_count[0]
+					_print_progress(prefix=f"{TAG} {ch} L{lv}", done=d, total=n_ds, t0=t_lv)
+					_stop2.wait(0.5)
+			prog2 = threading.Thread(target=_prog2, daemon=True)
+			prog2.start()
+
+			with multiprocessing.Pool(processes=workers) as pool:
+				for _ in pool.imap_unordered(_downsample_chunk_worker, ds_work):
+					with lock:
+						done_count[0] += 1
+
+			_stop2.set()
+			prog2.join(timeout=2)
+			_print_progress(prefix=f"{TAG} {ch} L{lv}", done=n_ds, total=n_ds, t0=t_lv)
+			print("", flush=True)
 
 		# Write metadata
 		datasets = []
