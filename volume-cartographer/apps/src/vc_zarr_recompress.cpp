@@ -726,6 +726,21 @@ int main(int argc, char** argv) {
         else if (arg == "--encode-jobs" && i + 1 < argc) encode_jobs = std::atoi(argv[++i]);
         else if (arg == "--occupancy-file" && i + 1 < argc) occupancy_file = argv[++i];
         else if (arg == "--target-ratio" && i + 1 < argc) target_ratio = (float)std::atof(argv[++i]);
+        else if (arg == "--codec" || arg == "--qp" || arg == "--air-clamp" || arg == "--bit-shift") {
+            // Legacy h265 flags: removed in the c3d-only switch. Fail fast
+            // so orchestration scripts that still pass them don't silently
+            // inherit --target-ratio defaults and produce mis-encoded data.
+            fprintf(stderr,
+                "Error: flag %s was removed along with the H.265 codec path.\n"
+                "       The recompress tool is c3d-only now; use --target-ratio "
+                "instead of --qp, and drop --codec / --air-clamp / --bit-shift.\n",
+                arg.c_str());
+            return 1;
+        }
+        else {
+            fprintf(stderr, "Error: unknown argument %s\n", arg.c_str());
+            return 1;
+        }
     }
     if (!(target_ratio > 1.0f)) {
         fprintf(stderr, "--target-ratio must be > 1.0, got %g\n", (double)target_ratio);

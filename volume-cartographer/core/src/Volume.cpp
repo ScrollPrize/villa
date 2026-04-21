@@ -341,29 +341,56 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
                 return static_cast<size_t>((v + 255) / 256 * 256);
             };
 
+            auto createLevel = [&](const std::filesystem::path& lvlPath, int lvl) {
+                auto shape = source->levelShape(lvl);
+                utils::ZarrMetadata meta;
+                meta.version = utils::ZarrVersion::v3;
+                meta.node_type = "array";
+                meta.shape = {pad256(shape[0]), pad256(shape[1]), pad256(shape[2])};
+                meta.chunks = {4096, 4096, 4096};
+                meta.dtype = utils::ZarrDtype::uint8;
+                meta.fill_value = 0;
+                meta.chunk_key_encoding = "default";
+                utils::ShardConfig sc;
+                sc.sub_chunks = {256, 256, 256};
+                utils::ZarrCodecConfig cc;
+                cc.name = "c3d";
+                sc.sub_codecs.push_back(cc);
+                meta.shard_config = std::move(sc);
+                return std::make_unique<utils::ZarrArray>(
+                    utils::ZarrArray::create(lvlPath, std::move(meta)));
+            };
+
             for (int lvl = 0; lvl < nLevels; lvl++) {
                 auto lvlPath = path_ / std::to_string(lvl);
                 if (std::filesystem::exists(lvlPath / "zarr.json")) {
-                    diskLevels[lvl] = std::make_unique<utils::ZarrArray>(
+                    auto opened = std::make_unique<utils::ZarrArray>(
                         utils::ZarrArray::open(lvlPath));
+                    if (utils::is_canonical_c3d(opened->metadata())) {
+                        diskLevels[lvl] = std::move(opened);
+                    } else {
+                        // Legacy h265 (or any non-c3d) level from before the
+                        // codec switch. The decoder in BlockPipeline now only
+                        // accepts C3DC, so leaving stale entries in place
+                        // would silently mark chunks as "on disk" without
+                        // ever producing data. Nuke the level dir and create
+                        // a fresh c3d one; the remote source will repopulate.
+                        opened.reset();
+                        fprintf(stderr,
+                            "[Volume] level %d cache at %s is non-c3d — "
+                            "wiping and recreating as c3d\n",
+                            lvl, lvlPath.c_str());
+                        std::error_code ec;
+                        std::filesystem::remove_all(lvlPath, ec);
+                        if (ec) {
+                            throw std::runtime_error(
+                                "failed to remove stale non-c3d cache at "
+                                + lvlPath.string() + ": " + ec.message());
+                        }
+                        diskLevels[lvl] = createLevel(lvlPath, lvl);
+                    }
                 } else {
-                    auto shape = source->levelShape(lvl);
-                    utils::ZarrMetadata meta;
-                    meta.version = utils::ZarrVersion::v3;
-                    meta.node_type = "array";
-                    meta.shape = {pad256(shape[0]), pad256(shape[1]), pad256(shape[2])};
-                    meta.chunks = {4096, 4096, 4096};
-                    meta.dtype = utils::ZarrDtype::uint8;
-                    meta.fill_value = 0;
-                    meta.chunk_key_encoding = "default";
-                    utils::ShardConfig sc;
-                    sc.sub_chunks = {256, 256, 256};
-                    utils::ZarrCodecConfig cc;
-                    cc.name = "c3d";
-                    sc.sub_codecs.push_back(cc);
-                    meta.shard_config = std::move(sc);
-                    diskLevels[lvl] = std::make_unique<utils::ZarrArray>(
-                        utils::ZarrArray::create(lvlPath, std::move(meta)));
+                    diskLevels[lvl] = createLevel(lvlPath, lvl);
                 }
             }
             fprintf(stderr,
