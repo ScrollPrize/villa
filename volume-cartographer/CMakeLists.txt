@@ -42,6 +42,7 @@ include_directories(core/include)
 
 add_subdirectory(misc)
 add_subdirectory(libs/OpenABF)
+add_subdirectory(libs/c3d)
 
 add_subdirectory(utils)
 add_subdirectory(core)

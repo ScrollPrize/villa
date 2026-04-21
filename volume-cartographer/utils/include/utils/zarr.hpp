@@ -474,6 +474,22 @@ struct ZarrMetadata {
     return true;
 }
 
+/// Structural check: zarr v3, sharded, with 256^3 inner chunks (c3d codec
+/// atom). As with is_canonical_vc3d, this only checks shape; the inner
+/// bytes still need a C3DC magic-check before decode.
+[[nodiscard]] inline bool is_canonical_c3d(const ZarrMetadata& m) noexcept {
+    if (m.version != ZarrVersion::v3) return false;
+    if (!m.shard_config) return false;
+    const auto& sc = *m.shard_config;
+    if (sc.sub_chunks.size() < 3) return false;
+    if (sc.sub_chunks[0] != 256 || sc.sub_chunks[1] != 256 || sc.sub_chunks[2] != 256)
+        return false;
+    if (m.chunks.size() < 3) return false;
+    for (int d = 0; d < 3; ++d) if (m.chunks[d] % 256 != 0) return false;
+    if (m.dtype != ZarrDtype::uint8) return false;
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Store abstraction
 // ---------------------------------------------------------------------------
@@ -950,13 +966,21 @@ public:
             auto it = registry.find(meta.compressor_id);
             if (it != registry.end()) codec = it->second;
         } else if (version == ZarrVersion::v3) {
-            // Look for bytes-to-bytes codecs in the pipeline.
-            for (const auto& cc : meta.codecs) {
-                if (cc.name != "bytes" && cc.name != "transpose" && cc.name != "sharding_indexed") {
-                    auto it = registry.find(cc.name);
-                    if (it != registry.end()) { codec = it->second; break; }
+            // Look for bytes-to-bytes codecs in the pipeline.  For sharded
+            // arrays the outer pipeline only has sharding_indexed; the real
+            // per-inner-chunk compressor lives in shard_config->sub_codecs.
+            auto scan = [&](const std::vector<ZarrCodecConfig>& cs) {
+                for (const auto& cc : cs) {
+                    if (cc.name != "bytes" && cc.name != "transpose"
+                        && cc.name != "sharding_indexed") {
+                        auto it = registry.find(cc.name);
+                        if (it != registry.end()) { codec = it->second; return true; }
+                    }
                 }
-            }
+                return false;
+            };
+            if (meta.shard_config) scan(meta.shard_config->sub_codecs);
+            if (!codec.decompress) scan(meta.codecs);
         }
 
         return ZarrArray(path, std::move(meta), std::move(codec), std::move(registry));
@@ -1039,8 +1063,14 @@ public:
 
     [[nodiscard]] std::optional<std::vector<std::byte>>
     read_chunk(std::span<const std::size_t> chunk_indices) const {
-        if (is_sharded())
-            return read_inner_chunk_from_shard(chunk_indices);
+        if (is_sharded()) {
+            auto raw = read_inner_chunk_from_shard(chunk_indices);
+            if (!raw) return std::nullopt;
+            if (codec_.decompress && needs_decompression()) {
+                return codec_.decompress(*raw, meta_.sub_chunk_byte_size());
+            }
+            return raw;
+        }
 
         auto raw = read_chunk_raw(chunk_indices);
         if (!raw) return std::nullopt;
@@ -1126,6 +1156,12 @@ public:
         return extract_inner_chunk(*shard_data, inner_indices);
     }
 
+    // 4k-align chunk payloads inside shards so decoders can mmap the shard
+    // and hand direct pointers to the codec without buffering.  Index entries
+    // use the aligned offset; padding bytes between chunks are ignored by
+    // the reader (spec allows arbitrary gaps).
+    static constexpr std::uint64_t kShardChunkAlign = 4096;
+
     /// Write a complete shard given a set of inner chunk data.
     /// `inner_chunks` is indexed by linear inner chunk index (C-order).
     /// Missing inner chunks should be std::nullopt.
@@ -1140,7 +1176,7 @@ public:
         if (inner_chunks.size() != n_inner)
             throw std::runtime_error("zarr: wrong number of inner chunks for shard");
 
-        // Build shard data: [index][chunk0][chunk1]...
+        // Build shard data: [index][chunk0 padded to 4k][chunk1 padded to 4k]...
         std::vector<std::byte> shard_data;
         detail::ShardIndex index;
         index.entries.resize(n_inner);
@@ -1148,6 +1184,13 @@ public:
         // Index always at start — reserve space for it.
         const std::size_t index_size = n_inner * 16;
         shard_data.resize(index_size);
+
+        auto pad_to_align = [&]() {
+            auto n = shard_data.size();
+            auto aligned = (n + kShardChunkAlign - 1) & ~(kShardChunkAlign - 1);
+            if (aligned > n) shard_data.resize(aligned, std::byte{0});
+        };
+        pad_to_align();   // ensures first chunk lands on 4k boundary
 
         for (std::size_t i = 0; i < n_inner; ++i) {
             if (!inner_chunks[i]) {
@@ -1168,6 +1211,7 @@ public:
             index.entries[i].offset = shard_data.size();
             index.entries[i].nbytes  = write_data.size();
             shard_data.insert(shard_data.end(), write_data.begin(), write_data.end());
+            pad_to_align();
         }
 
         // Write index at start.
@@ -1231,9 +1275,16 @@ public:
         std::fstream f(p, std::ios::binary | std::ios::in | std::ios::out);
         if (!f) return;
 
-        // 1. Seek to EOF, append chunk data
+        // 1. Seek to EOF, round up to next 4k boundary, append chunk data.
+        //    Padding bytes (if any) are left uninitialised — ext4 zero-fills
+        //    them on sparse extension, and readers never look at them.
         f.seekp(0, std::ios::end);
-        auto chunk_offset = static_cast<std::uint64_t>(f.tellp());
+        auto eof_offset = static_cast<std::uint64_t>(f.tellp());
+        auto chunk_offset = (eof_offset + kShardChunkAlign - 1)
+                          & ~(kShardChunkAlign - 1);
+        if (chunk_offset != eof_offset) {
+            f.seekp(static_cast<std::streamoff>(chunk_offset));
+        }
         f.write(reinterpret_cast<const char*>(data.data()),
                 static_cast<std::streamsize>(data.size()));
 
@@ -1416,10 +1467,15 @@ private:
         if (meta_.version == ZarrVersion::v2)
             return !meta_.compressor_id.empty();
         // v3: check for bytes-to-bytes codecs in pipeline.
-        for (const auto& cc : meta_.codecs)
-            if (cc.name != "bytes" && cc.name != "transpose" && cc.name != "sharding_indexed")
-                return true;
-        return false;
+        auto has_bb = [](const std::vector<ZarrCodecConfig>& cs) {
+            for (const auto& cc : cs)
+                if (cc.name != "bytes" && cc.name != "transpose"
+                    && cc.name != "sharding_indexed")
+                    return true;
+            return false;
+        };
+        if (meta_.shard_config && has_bb(meta_.shard_config->sub_codecs)) return true;
+        return has_bb(meta_.codecs);
     }
 
     [[nodiscard]] bool needs_decompression() const noexcept {

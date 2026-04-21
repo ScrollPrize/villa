@@ -65,6 +65,7 @@ target_link_libraries(vc_core PUBLIC
 )
 target_link_libraries(vc_core PRIVATE
     $<BUILD_INTERFACE:blosc_static>
+    $<BUILD_INTERFACE:utils_c3d_codec>
 )
 
 
