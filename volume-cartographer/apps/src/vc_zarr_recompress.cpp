@@ -1333,8 +1333,10 @@ int main(int argc, char** argv) {
                 };
 
                 // Fast 1:1 passthrough when the source is already stored
-                // as an encoded VC3D chunk and the output chunk size
-                // matches.  Only valid when ratio is {1,1,1}.
+                // in our output codec and the output chunk size matches
+                // (ratio {1,1,1}). Matching input magic to the configured
+                // output codec avoids misinterpreting h265 bytes as c3d
+                // (or vice versa) as raw voxels downstream.
                 if (task.rz == 1 && task.ry == 1 && task.rx == 1) {
                     std::string src_key = level_prefix +
                         std::to_string(task.src_base_z) + dim_sep +
@@ -1342,8 +1344,11 @@ int main(int argc, char** argv) {
                         std::to_string(task.src_base_x);
                     try {
                         auto data = t_input->read(src_key);
-                        if (utils::is_video_compressed(
-                                std::span<const std::byte>(data))) {
+                        std::span<const std::byte> s(data);
+                        bool matches = (g_codec == CodecKind::C3d)
+                            ? utils::is_c3d_compressed(s)
+                            : utils::is_video_compressed(s);
+                        if (matches) {
                             total_raw.fetch_add(CHUNK_VOXELS);
                             total_compressed.fetch_add(data.size());
                             processed_chunks.fetch_add(1);
