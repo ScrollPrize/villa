@@ -366,3 +366,105 @@ def test_out_of_bounds_patches_skipped(tmp_path):
     # labels is 64^3 of ones -> 4^3 = 64 candidate patches, but image is 32^3 so only
     # positions in [0..16] x 3 are valid -> 2^3 = 8 patches
     assert len(ds) == 8
+
+
+# --- multi-class + ignore_label support -----------------------------------
+
+
+def _make_multiclass_pair(tmp_path: Path):
+    """Image + labels with values {0, 1, 2, 3}: two disjoint 16^3 cubes per
+    class (one of each in its own block), so FG enumeration can distinguish
+    valid_label_values=[1, 2] from the label==3 block."""
+    rng = np.random.default_rng(7)
+    image = rng.integers(0, 255, size=(64, 64, 64), dtype=np.uint8)
+    labels = np.zeros((64, 64, 64), dtype=np.uint8)
+    labels[0:16, 0:16, 0:16] = 1     # recto-ish cube
+    labels[16:32, 16:32, 16:32] = 2  # verso-ish cube
+    labels[32:48, 32:48, 32:48] = 3  # intersection-ish cube -> should be ignored
+    image_path = tmp_path / "image.zarr"
+    labels_path = tmp_path / "labels.zarr"
+    tform_path = tmp_path / "transform.json"
+    _write_zarr_array(image_path, image, chunks=(16, 16, 16))
+    _write_zarr_array(labels_path, labels, chunks=(16, 16, 16))
+    _write_identity_transform(tform_path)
+    return SimpleNamespace(
+        image=image, labels=labels,
+        image_url=str(image_path), labels_url=str(labels_path),
+        tform_url=str(tform_path), root=tmp_path,
+    )
+
+
+def test_valid_label_values_filters_fg(tmp_path: Path):
+    pair = _make_multiclass_pair(tmp_path)
+    mgr = _make_mgr(
+        image_url=pair.image_url,
+        labels_url=pair.labels_url,
+        transform_url=pair.tform_url,
+        cache_dir=pair.root,
+    )
+    mgr.dataset_config["valid_label_values"] = [1, 2]
+    ds = CrossFrameZarrDataset(mgr, is_training=False)
+    positions = set(tuple(p) for p in ds._patches)
+    # With identity transform and stride == patch_size == 16 the two valid
+    # blocks each collapse to a single patch start; the label==3 block must
+    # not produce a patch.
+    assert (0, 0, 0) in positions
+    assert (16, 16, 16) in positions
+    assert (32, 32, 32) not in positions
+    assert len(positions) == 2
+
+
+def test_binarize_labels_false_returns_multiclass(tmp_path: Path):
+    pair = _make_multiclass_pair(tmp_path)
+    mgr = _make_mgr(
+        image_url=pair.image_url,
+        labels_url=pair.labels_url,
+        transform_url=pair.tform_url,
+        cache_dir=pair.root,
+    )
+    mgr.dataset_config["valid_label_values"] = [1, 2]
+    # default binarize_labels = False when valid_label_values is set
+    ds = CrossFrameZarrDataset(mgr, is_training=False)
+    # Find the patch at (16, 16, 16) -- the "verso" block with label value 2.
+    idx = [i for i, p in enumerate(ds._patches) if tuple(p) == (16, 16, 16)][0]
+    sample = ds[idx]
+    label = sample["fibers"].numpy().squeeze(0)
+    # label is float32 but preserves integer values from the source
+    assert label.dtype == np.float32
+    unique = sorted(np.unique(label).tolist())
+    assert 2.0 in unique
+    # No spurious ones: original block is value 2, not 1
+    assert 1.0 not in unique
+    # And the shape matches the patch
+    assert label.shape == (16, 16, 16)
+
+
+def test_binarize_labels_default_binary_path_unchanged(identity_pair):
+    """Regression: without valid_label_values, labels are still binarized."""
+    mgr = _make_mgr(
+        image_url=identity_pair.image_url,
+        labels_url=identity_pair.labels_url,
+        transform_url=identity_pair.tform_url,
+        cache_dir=identity_pair.root,
+    )
+    ds = CrossFrameZarrDataset(mgr, is_training=False)
+    sample = ds[0]
+    label = sample["fibers"].numpy().squeeze(0)
+    assert set(np.unique(label).tolist()).issubset({0.0, 1.0})
+
+
+def test_binarize_labels_explicit_overrides_default(tmp_path: Path):
+    """Setting binarize_labels=True when valid_label_values is set still binarizes."""
+    pair = _make_multiclass_pair(tmp_path)
+    mgr = _make_mgr(
+        image_url=pair.image_url,
+        labels_url=pair.labels_url,
+        transform_url=pair.tform_url,
+        cache_dir=pair.root,
+    )
+    mgr.dataset_config["valid_label_values"] = [1, 2]
+    mgr.dataset_config["binarize_labels"] = True
+    ds = CrossFrameZarrDataset(mgr, is_training=False)
+    sample = ds[0]
+    label = sample["fibers"].numpy().squeeze(0)
+    assert set(np.unique(label).tolist()).issubset({0.0, 1.0})

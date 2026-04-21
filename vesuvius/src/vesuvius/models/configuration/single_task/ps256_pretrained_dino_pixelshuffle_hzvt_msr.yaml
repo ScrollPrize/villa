@@ -1,0 +1,62 @@
+# HZ / VT fiber segmentation using the dinovol-v2 backbone as a frozen
+# encoder + pixelshuffle-conv decoder head. 1-GPU, torch.compile on.
+#
+# Labels: {0=bg, 1=hz, 2=vt, 3=exclude}. Label 3 masked via `ignore_label: 3`.
+# Same dataset block as ps256_hzvt_msr.yaml.
+#
+# Invocation (1 GPU, GPU 7):
+#   uv run vesuvius.train \
+#     --config src/vesuvius/models/configuration/single_task/ps256_pretrained_dino_pixelshuffle_hzvt_msr.yaml \
+#     --input /home/ubuntu/fibers_cache \
+#     --output /ephemeral/hzvt_ckpts_pixelshuffle \
+#     --gpus 7 \
+#     --wandb-project fibers --wandb-entity vesuvius-challenge
+
+tr_setup:
+  wandb_project: "fibers"
+  wandb_entity: "vesuvius-challenge"
+  model_name: "ps256_pretrained_dino_pixelshuffle_hzvt_msr"
+  tr_val_split: 0.85
+
+tr_config:
+  patch_size: [256, 256, 256]
+  batch_size: 1
+  num_dataloader_workers: 6
+  enable_deep_supervision: false
+  max_epoch: 1000
+  max_steps_per_epoch: 250
+  max_val_steps_per_epoch: 50
+  optimizer: "SGD"
+  initial_lr: 0.01
+  weight_decay: 0.00003
+  compile_policy: "module"
+  ddp_find_unused_parameters: false
+
+model_config:
+  pretrained_backbone: "/ephemeral/outputs_v2_shift005_jitter105_r342500_paris4_20260416/checkpoint_step_352500.pt"
+  pretrained_decoder_type: "pixelshuffle_conv"
+  freeze_encoder: true
+  input_shape: [256, 256, 256]
+
+dataset_config:
+  dataset_type: "cross_frame"
+  image_zarr_url: "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/0"
+  labels_zarr_url: "/ephemeral/fibers_hzvt_labels/s1a-fibers-hzvt-05032025-ome.zarr/0"
+  transform_json_url: "s3://vesuvius-challenge-open-data/PHercParis4/volumes/20260411134726-2.400um-0.2m-78keV-masked.zarr/transform.json"
+  storage_options:
+    anon: true
+  labels_scan_level: 3
+  valid_label_values: [1, 2]
+  binarize_labels: false
+
+  min_labeled_ratio: 0.001
+  min_bbox_percent: 0.35
+  normalization_scheme: "zscore"
+  targets:
+    hzvt:
+      out_channels: 3
+      activation: "none"
+      ignore_label: 3
+      losses:
+        - name: "MedialSurfaceRecall"
+          weight: 1.0

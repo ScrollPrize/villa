@@ -123,6 +123,20 @@ class CrossFrameZarrDataset(Dataset):
         self.valid_patch_value: Optional[float] = (
             None if raw_valid_patch_value is None else float(raw_valid_patch_value)
         )
+        # Multi-class FG filter: a patch's coarse-scan cell must contain one of
+        # these label values. Useful when `ignore_label` removes a value from
+        # the training set but we still want to require real FG in patches.
+        raw_vlv = ds_cfg.get("valid_label_values")
+        self.valid_label_values: Optional[np.ndarray] = (
+            None if raw_vlv is None
+            else np.asarray([int(v) for v in raw_vlv], dtype=np.int64)
+        )
+        raw_binarize = ds_cfg.get("binarize_labels")
+        if raw_binarize is None:
+            # Default: binarize only when there's no explicit multi-class list.
+            self.binarize_labels = self.valid_label_values is None
+        else:
+            self.binarize_labels = bool(raw_binarize)
         self.min_labeled_ratio = float(getattr(mgr, "min_labeled_ratio", 0.01))
         self.min_bbox_percent = float(getattr(mgr, "min_bbox_percent", 0.15))
         self.stride: Tuple[int, int, int] = tuple(
@@ -232,6 +246,11 @@ class CrossFrameZarrDataset(Dataset):
                 "min_labeled_ratio": self.min_labeled_ratio,
                 "min_bbox_percent": self.min_bbox_percent,
                 "valid_patch_value": self.valid_patch_value,
+                "valid_label_values": (
+                    None if self.valid_label_values is None
+                    else [int(v) for v in self.valid_label_values]
+                ),
+                "binarize_labels": bool(self.binarize_labels),
                 "transform_checksum": affine.matrix_checksum(self._matrix_xyz),
                 "scan_level": self._scan_level,
             },
@@ -390,10 +409,12 @@ class CrossFrameZarrDataset(Dataset):
 
         _stage(f"coarse scan: reading {self._scan_array.shape} into memory")
         coarse = np.asarray(self._scan_array[...])
-        if self.valid_patch_value is None:
-            coarse_mask = coarse > 0
-        else:
+        if self.valid_patch_value is not None:
             coarse_mask = coarse == self.valid_patch_value
+        elif self.valid_label_values is not None:
+            coarse_mask = np.isin(coarse, self.valid_label_values)
+        else:
+            coarse_mask = coarse > 0
         _stage(
             f"coarse scan: {int(coarse_mask.sum())} FG voxels "
             f"/ {coarse_mask.size} total ({100.0 * coarse_mask.mean():.2f}%)"
@@ -492,10 +513,12 @@ class CrossFrameZarrDataset(Dataset):
                     )
                     if slab.shape != (dz, dy, dx):
                         continue
-                    mask = (
-                        slab > 0 if self.valid_patch_value is None
-                        else slab == self.valid_patch_value
-                    )
+                    if self.valid_patch_value is not None:
+                        mask = slab == self.valid_patch_value
+                    elif self.valid_label_values is not None:
+                        mask = np.isin(slab, self.valid_label_values)
+                    else:
+                        mask = slab > 0
                     if not mask.any():
                         continue
                     # Center of this label patch -> image voxel -> snap.
@@ -537,9 +560,11 @@ class CrossFrameZarrDataset(Dataset):
         slab = np.asarray(
             self._labels_array[start[0]:stop[0], start[1]:stop[1], start[2]:stop[2]]
         )
-        if self.valid_patch_value is None:
-            return bool((slab > 0).any())
-        return bool((slab == self.valid_patch_value).any())
+        if self.valid_patch_value is not None:
+            return bool((slab == self.valid_patch_value).any())
+        if self.valid_label_values is not None:
+            return bool(np.isin(slab, self.valid_label_values).any())
+        return bool((slab > 0).any())
 
     # --------------------------------------------------- dataset interface --
 
@@ -602,14 +627,17 @@ class CrossFrameZarrDataset(Dataset):
             self._matrix_zyx_image_to_label,
             pos,
             ps,
-            order=0,  # nearest neighbor preserves binary labels
+            order=0,  # nearest neighbor preserves integer labels
         )
-        label_bin = (label_patch > 0).astype(np.float32)
+        if self.binarize_labels:
+            label_out = (label_patch > 0).astype(np.float32)
+        else:
+            label_out = label_patch.astype(np.float32, copy=False)
         if debug:
             t_lbl_e = time.perf_counter()
             _stage(
                 f"__getitem__ {tag}: label resample {1e3*(t_lbl_e-t_lbl_s):.1f} ms "
-                f"(nonzero={int(label_bin.sum())})"
+                f"(nonzero={int((label_out != 0).sum())})"
             )
 
         padding_mask = np.ones(ps, dtype=np.float32)
@@ -617,10 +645,10 @@ class CrossFrameZarrDataset(Dataset):
         result: Dict[str, torch.Tensor] = {
             "image": torch.from_numpy(image_patch[np.newaxis, ...]),
             "padding_mask": torch.from_numpy(padding_mask[np.newaxis, ...]),
-            self.target_name: torch.from_numpy(label_bin[np.newaxis, ...]),
-            "is_unlabeled": bool(label_bin.sum() == 0),
+            self.target_name: torch.from_numpy(label_out[np.newaxis, ...]),
+            "is_unlabeled": bool((label_out != 0).sum() == 0),
             "patch_info": {
-                "volume_name": "fibers",
+                "volume_name": self.target_name,
                 "position": pos,
             },
         }
@@ -653,7 +681,7 @@ class CrossFrameZarrDataset(Dataset):
             self._valid_patches_cache = [
                 PatchInfo(
                     volume_index=0,
-                    volume_name="fibers",
+                    volume_name=self.target_name,
                     position=pos,
                     patch_size=self.patch_size,
                 )
