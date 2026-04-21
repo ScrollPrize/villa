@@ -543,8 +543,9 @@ def run_from_manifest(
 		a = zarr.open(zarr_path, mode="r")
 		params = dict(getattr(a, "attrs", {}).get("preprocess_params", {}))
 		params.setdefault("scaledown", group.scaledown)
-		if vol.crop_xyzwhd is not None:
-			params.setdefault("crop_xyzwhd", list(vol.crop_xyzwhd))
+		if vol.crops:
+			# Use the first crop for legacy converter compat
+			params.setdefault("crop_xyzwhd", list(vol.crops[0]))
 		# Channel names for this group
 		params["channels"] = group.channels
 

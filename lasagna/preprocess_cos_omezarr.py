@@ -1342,16 +1342,20 @@ def _infer_tiled_3d(
 
 
 def _find_zarr_group_root(path: str) -> Path | None:
-	"""Walk up from a zarr array path to find the group root (.zattrs or .zgroup)."""
-	p = Path(path).resolve()
-	# If path ends with a numeric level (e.g. vol.zarr/2), parent is the group
-	if p.name.isdigit():
-		candidate = p.parent
-	else:
-		candidate = p
-	for check in [candidate, candidate.parent]:
+	"""Walk up from a zarr array path to find the group root (.zattrs or .zgroup).
+
+	Handles trailing slashes, numeric level dirs, and nested structures
+	like ``volpkg/volumes/vol.zarr/2``.
+	"""
+	p = Path(str(path).rstrip("/")).resolve()
+	# Start from p itself, walk up until we find .zattrs or .zgroup
+	check = p
+	for _ in range(5):  # don't walk up forever
 		if (check / ".zattrs").is_file() or (check / ".zgroup").is_file():
 			return check
+		if check.parent == check:
+			break
+		check = check.parent
 	return None
 
 
@@ -1610,13 +1614,16 @@ def run_preprocess_3d(
 		vol = LasagnaVolume(
 			path=json_path.resolve(),
 			source_to_base=source_to_base,
-			crop_xyzwhd=(int(x0), int(y0), int(z0), int(nx_dim), int(ny), int(nz))
-				if crop_xyzwhd is not None else None,
 			base_shape_zyx=base_shape_zyx,
 		)
+	# Record this crop (appends if new, deduplicates)
+	if crop_xyzwhd is not None:
+		vol.add_crop((int(x0), int(y0), int(z0), int(nx_dim), int(ny), int(nz)))
 
-	# Validate pred-dt source
+	# Validate pred-dt source and determine its scale relative to base
 	pred_dt_zarr = None
+	pred_sd = 1       # pred zarr scaledown from base (1 = full res)
+	pred_per_cos = effective_cos_sd  # pred voxels per cos output voxel
 	if pred_dt_path:
 		pred_dt_path = pred_dt_path.rstrip("/")
 		pred_dt_zarr = zarr.open(str(pred_dt_path), mode="r")
@@ -1625,7 +1632,12 @@ def run_preprocess_3d(
 		_pred_shape = tuple(int(v) for v in pred_dt_zarr.shape)
 		if len(_pred_shape) != 3:
 			raise ValueError(f"pred-dt array must be 3D (Z,Y,X), got shape {_pred_shape}")
-		print(f"[predict3d] pred-dt={pred_dt_path} shape={_pred_shape}", flush=True)
+		# pred zarr scaledown relative to base
+		pred_sd = max(1, round(base_shape_zyx[0] / _pred_shape[0]))
+		# How many pred voxels per cos output voxel
+		pred_per_cos = max(1, effective_cos_sd // pred_sd)
+		print(f"[predict3d] pred-dt={pred_dt_path} shape={_pred_shape} "
+			  f"pred_sd={pred_sd} pred_per_cos={pred_per_cos}", flush=True)
 
 	# --- Create OME-Zarr outputs ---
 	oc = max(1, int(ome_chunk))
@@ -1750,23 +1762,32 @@ def run_preprocess_3d(
 
 					# --- pred_dt for this z-band ---
 					if pred_dt_zarr is not None and dt_lv_arr is not None:
-						# Map output z to pred zarr z (source resolution)
-						src_z0 = (cos_oz0 + eff_out_zs) * cos_sd
-						src_z1 = (cos_oz0 + eff_out_ze) * cos_sd
-						# Crop in pred zarr coords
-						p_y0 = y0 if crop_xyzwhd is not None else 0
-						p_y1 = (y0 + ny) if crop_xyzwhd is not None else int(pred_dt_zarr.shape[1])
-						p_x0 = x0 if crop_xyzwhd is not None else 0
-						p_x1 = (x0 + nx_dim) if crop_xyzwhd is not None else int(pred_dt_zarr.shape[2])
+						# cos output z → base z → pred_src z
+						# All coords go through base as common frame
+						base_z0 = (cos_oz0 + eff_out_zs) * effective_cos_sd
+						base_z1 = (cos_oz0 + eff_out_ze) * effective_cos_sd
+						pdt_z0 = base_z0 // pred_sd
+						pdt_z1 = base_z1 // pred_sd
+						# Crop YX: source coords → base → pred_src
+						if crop_xyzwhd is not None:
+							pdt_y0 = y0 * input_sd // pred_sd
+							pdt_y1 = (y0 + ny) * input_sd // pred_sd
+							pdt_x0 = x0 * input_sd // pred_sd
+							pdt_x1 = (x0 + nx_dim) * input_sd // pred_sd
+						else:
+							pdt_y0 = 0
+							pdt_y1 = int(pred_dt_zarr.shape[1])
+							pdt_x0 = 0
+							pdt_x1 = int(pred_dt_zarr.shape[2])
 						_compute_pred_dt_slab(
 							pred_zarr=pred_dt_zarr,
 							output_level_arr=dt_lv_arr,
-							pred_z0=src_z0, pred_z1=src_z1,
-							pred_y0=p_y0, pred_y1=p_y1,
-							pred_x0=p_x0, pred_x1=p_x1,
+							pred_z0=pdt_z0, pred_z1=pdt_z1,
+							pred_y0=pdt_y0, pred_y1=pdt_y1,
+							pred_x0=pdt_x0, pred_x1=pdt_x1,
 							out_z0=cos_oz0 + eff_out_zs,
 							out_y0=cos_oy0, out_x0=cos_ox0,
-							scaledown=cos_sd,
+							scaledown=pred_per_cos,
 						)
 
 			# Release memmap pages

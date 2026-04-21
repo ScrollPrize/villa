@@ -40,7 +40,7 @@ class LasagnaVolume:
 	path: Path
 	version: int = 1
 	source_to_base: float = 1.0
-	crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None
+	crops: list[tuple[int, int, int, int, int, int]] = field(default_factory=list)
 	base_shape_zyx: tuple[int, int, int] | None = None
 	grad_mag_encode_scale: float = 1000.0
 	grad_mag_factor: float = 1.0
@@ -79,8 +79,8 @@ class LasagnaVolume:
 			"grad_mag_factor": self.grad_mag_factor,
 			"groups": {name: g.to_dict() for name, g in self.groups.items()},
 		}
-		if self.crop_xyzwhd is not None:
-			d["crop_xyzwhd"] = list(self.crop_xyzwhd)
+		if self.crops:
+			d["crops"] = [list(c) for c in self.crops]
 		if self.base_shape_zyx is not None:
 			d["base_shape_zyx"] = list(self.base_shape_zyx)
 		self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -99,11 +99,22 @@ class LasagnaVolume:
 		version = int(d.get("version", 1))
 		if version != 1:
 			raise ValueError(f"unsupported lasagna volume version: {version}")
-		crop = d.get("crop_xyzwhd")
-		if crop is not None:
-			crop = tuple(int(v) for v in crop)
-			if len(crop) != 6:
-				raise ValueError(f"crop_xyzwhd must have 6 elements, got {len(crop)}")
+		# Load crops list (new format) or migrate from single crop_xyzwhd (old)
+		crops_raw = d.get("crops")
+		crops: list[tuple[int, int, int, int, int, int]] = []
+		if isinstance(crops_raw, list):
+			for c in crops_raw:
+				t = tuple(int(v) for v in c)
+				if len(t) != 6:
+					raise ValueError(f"each crop must have 6 elements, got {len(t)}")
+				crops.append(t)
+		else:
+			old_crop = d.get("crop_xyzwhd")
+			if old_crop is not None:
+				t = tuple(int(v) for v in old_crop)
+				if len(t) != 6:
+					raise ValueError(f"crop_xyzwhd must have 6 elements, got {len(t)}")
+				crops.append(t)
 		bshape = d.get("base_shape_zyx")
 		if bshape is not None:
 			bshape = tuple(int(v) for v in bshape)
@@ -116,12 +127,17 @@ class LasagnaVolume:
 			path=p.resolve(),
 			version=version,
 			source_to_base=float(d.get("source_to_base", 1.0)),
-			crop_xyzwhd=crop,
+			crops=crops,
 			base_shape_zyx=bshape,
 			grad_mag_encode_scale=float(d.get("grad_mag_encode_scale", 1000.0)),
 			grad_mag_factor=float(d.get("grad_mag_factor", 1.0)),
 			groups=groups,
 		)
+
+	def add_crop(self, crop: tuple[int, int, int, int, int, int]) -> None:
+		"""Append a crop region if not already present."""
+		if crop not in self.crops:
+			self.crops.append(crop)
 
 	def update_group(self, name: str, group: ChannelGroup) -> None:
 		"""Add or replace a group, then save."""
