@@ -816,21 +816,86 @@ def _compute_pred_dt_slab(
 	print(f"[pred_dt] {n_chunks} chunks to process, {n_workers} workers, edt_chunk={edt_chunk}",
 		  flush=True)
 
-	# --- 3-stage pipeline: processes READ → main GPU EDT → processes WRITE ---
-	# GPU must stay in the main process (CUDA can't fork).
-	# Readers prefetch in parallel, GPU processes in order, writers flush in parallel.
+	# --- Pipelined: parallel READ → streamed GPU (H2D|EDT|D2H) → parallel WRITE ---
+	# Three CUDA streams overlap transfers with compute:
+	#   stream_h2d: host→device transfer of next chunk
+	#   stream_compute: EDT + encode on current chunk
+	#   stream_d2h: device→host transfer of previous result
+	# Reader/writer processes run in parallel for I/O.
 
-	# Build read args
 	read_args = []
 	for idx, (cz0, cz1, cy0, cy1, cx0, cx1) in enumerate(work):
 		read_args.append((idx, pred_path, cz0, cz1, cy0, cy1, cx0, cx1, overlap, pZ, pY, pX))
 
-	# Pending read results (may arrive out of order)
 	pending: dict[int, np.ndarray] = {}
 	next_gpu_idx = 0
 	write_pool = _mp.Pool(processes=n_workers)
 	write_futures = []
 	done_count = [0]
+
+	stream_h2d = cp.cuda.Stream(non_blocking=True)
+	stream_compute = cp.cuda.Stream(non_blocking=True)
+	stream_d2h = cp.cuda.Stream(non_blocking=True)
+
+	# Pipeline state: staged GPU buffers
+	staged_gpu = None       # (idx, m_gpu) ready for compute after H2D done
+	computing = None        # (idx, dt_enc_gpu) being computed
+	transferring = None     # (idx, dt_enc_gpu, pinned_buf) being D2H transferred
+
+	def _gpu_encode(m_gpu):
+		"""EDT + signed encode on current compute stream. Returns uint8 GPU array."""
+		outer_dt = cnd.distance_transform_edt(~m_gpu)
+		inner_dt = cnd.distance_transform_edt(m_gpu)
+		outer_enc = (128 - cp.clip(cp.round(outer_dt), 1, _MAX_DT)).astype(cp.uint8)
+		inner_enc = (127 + cp.clip(cp.round(inner_dt), 1, _MAX_DT)).astype(cp.uint8)
+		result = cp.where(m_gpu, inner_enc, outer_enc)
+		del outer_dt, inner_dt, outer_enc, inner_enc
+		return result
+
+	def _dispatch_write(idx, dt_u8_np):
+		"""Send result to write worker pool."""
+		cz0, cz1, cy0, cy1, cx0, cx1 = work[idx]
+		wa = (idx, dt_u8_np, output_omezarr_path, output_level_key,
+			  cz0, cz1, cy0, cy1, cx0, cx1,
+			  overlap, pZ, pY, pX,
+			  pred_z0, pred_y0, pred_x0,
+			  out_z0, out_y0, out_x0, scaledown)
+		write_futures.append(write_pool.apply_async(_edt_write_worker, (wa,)))
+
+	def _collect_writes():
+		nonlocal write_futures
+		new = []
+		for wf in write_futures:
+			if wf.ready():
+				wf.get()
+				done_count[0] += 1
+				if progress is not None:
+					progress["edt_done"] = progress.get("edt_done", 0) + 1
+			else:
+				new.append(wf)
+		write_futures = new
+
+	def _print_progress():
+		gpu_done = next_gpu_idx
+		if gpu_done == 0:
+			return
+		elapsed = max(1e-6, time.time() - t0)
+		eta = elapsed / gpu_done * (n_chunks - gpu_done)
+		overall = ""
+		if progress is not None:
+			oe = max(1e-6, time.time() - progress["t0"])
+			frac = progress.get("tiles_done", 0) / max(1, progress.get("tiles_total", 1))
+			edt_frac = progress.get("edt_done", 0) / max(1, progress.get("edt_total_est", 1))
+			overall_frac = 0.7 * frac + 0.3 * edt_frac
+			if overall_frac > 0.01:
+				overall_eta = oe / overall_frac * (1.0 - overall_frac)
+				overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
+		print(f"\r[pred_dt] gpu {gpu_done}/{n_chunks} "
+			  f"written {done_count[0]}/{n_chunks} "
+			  f"({100.0 * gpu_done / n_chunks:.0f}%) "
+			  f"eta {int(eta // 60):02d}:{int(eta % 60):02d}"
+			  f"{overall}  ",
+			  end="", flush=True)
 
 	with _mp.Pool(processes=n_workers) as read_pool:
 		read_iter = read_pool.imap_unordered(_edt_read_worker, read_args)
@@ -838,66 +903,68 @@ def _compute_pred_dt_slab(
 		for idx, binary in read_iter:
 			pending[idx] = binary
 
-			# Process chunks in order on GPU as they become ready
 			while next_gpu_idx in pending:
 				cur_binary = pending.pop(next_gpu_idx)
-				cz0, cz1, cy0, cy1, cx0, cx1 = work[next_gpu_idx]
-
-				# GPU EDT + encode (main process only)
-				m_gpu = cp.asarray(cur_binary)
-				outer_dt = cnd.distance_transform_edt(~m_gpu)
-				inner_dt = cnd.distance_transform_edt(m_gpu)
-				outer_enc = (128 - cp.clip(cp.round(outer_dt), 1, _MAX_DT)).astype(cp.uint8)
-				inner_enc = (127 + cp.clip(cp.round(inner_dt), 1, _MAX_DT)).astype(cp.uint8)
-				dt_enc_gpu = cp.where(m_gpu, inner_enc, outer_enc)
-				dt_u8 = cp.asnumpy(dt_enc_gpu)
-				del m_gpu, outer_dt, inner_dt, outer_enc, inner_enc, dt_enc_gpu
-
-				# Dispatch write to worker process (parallel downsample + zarr write)
-				write_args = (
-					next_gpu_idx, dt_u8, output_omezarr_path, output_level_key,
-					cz0, cz1, cy0, cy1, cx0, cx1,
-					overlap, pZ, pY, pX,
-					pred_z0, pred_y0, pred_x0,
-					out_z0, out_y0, out_x0,
-					scaledown,
-				)
-				write_futures.append(write_pool.apply_async(_edt_write_worker, (write_args,)))
-
+				cur_idx = next_gpu_idx
 				next_gpu_idx += 1
 
-				# Collect completed writes for progress
-				new_futures = []
-				for wf in write_futures:
-					if wf.ready():
-						wf.get()  # raise if error
-						done_count[0] += 1
-						if progress is not None:
-							progress["edt_done"] = progress.get("edt_done", 0) + 1
-					else:
-						new_futures.append(wf)
-				write_futures = new_futures
+				# Stage 1: H2D transfer (async) — wait for previous H2D first
+				stream_h2d.synchronize()
+				with stream_h2d:
+					new_m_gpu = cp.asarray(cur_binary)
 
-				elapsed = max(1e-6, time.time() - t0)
-				gpu_done = next_gpu_idx
-				eta = elapsed / gpu_done * (n_chunks - gpu_done)
-				overall = ""
-				if progress is not None:
-					oe = max(1e-6, time.time() - progress["t0"])
-					frac = progress.get("tiles_done", 0) / max(1, progress.get("tiles_total", 1))
-					edt_frac = progress.get("edt_done", 0) / max(1, progress.get("edt_total_est", 1))
-					overall_frac = 0.7 * frac + 0.3 * edt_frac
-					if overall_frac > 0.01:
-						overall_eta = oe / overall_frac * (1.0 - overall_frac)
-						overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
-				print(f"\r[pred_dt] gpu {gpu_done}/{n_chunks} "
-					  f"written {done_count[0]}/{n_chunks} "
-					  f"({100.0 * gpu_done / n_chunks:.0f}%) "
-					  f"eta {int(eta // 60):02d}:{int(eta % 60):02d}"
-					  f"{overall}  ",
-					  end="", flush=True)
+				# Stage 2: if we have a staged buffer, start compute (async)
+				if staged_gpu is not None:
+					prev_idx, prev_m_gpu = staged_gpu
+					# Wait for previous compute to finish before reusing stream
+					stream_compute.synchronize()
+					with stream_compute:
+						# Wait for that buffer's H2D to be done
+						stream_compute.wait_event(stream_h2d.record())
+						prev_result = _gpu_encode(prev_m_gpu)
+						del prev_m_gpu
 
-	# Wait for remaining writes
+					# Stage 3: if we have a computing result, start D2H (async)
+					if computing is not None:
+						comp_idx, comp_result = computing
+						stream_d2h.synchronize()
+						with stream_d2h:
+							stream_d2h.wait_event(stream_compute.record())
+							dt_u8 = cp.asnumpy(comp_result)
+						# D2H is synchronous for asnumpy — result is ready
+						del comp_result
+						_dispatch_write(comp_idx, dt_u8)
+						_collect_writes()
+						_print_progress()
+
+					computing = (prev_idx, prev_result)
+
+				staged_gpu = (cur_idx, new_m_gpu)
+
+		# Drain pipeline: process staged buffer
+		if staged_gpu is not None:
+			s_idx, s_m_gpu = staged_gpu
+			stream_h2d.synchronize()
+			with stream_compute:
+				s_result = _gpu_encode(s_m_gpu)
+				del s_m_gpu
+			if computing is not None:
+				comp_idx, comp_result = computing
+				stream_compute.synchronize()
+				dt_u8 = cp.asnumpy(comp_result)
+				del comp_result
+				_dispatch_write(comp_idx, dt_u8)
+			computing = (s_idx, s_result)
+
+		# Drain: transfer last computed result
+		if computing is not None:
+			comp_idx, comp_result = computing
+			stream_compute.synchronize()
+			dt_u8 = cp.asnumpy(comp_result)
+			del comp_result
+			_dispatch_write(comp_idx, dt_u8)
+
+	# Wait for all writes
 	for wf in write_futures:
 		wf.get()
 		done_count[0] += 1
@@ -907,6 +974,7 @@ def _compute_pred_dt_slab(
 	write_pool.join()
 
 	cp.get_default_memory_pool().free_all_blocks()
+	_print_progress()
 	print(f"\r[pred_dt] {n_chunks} chunks in {time.time() - t0:.1f}s" + " " * 30,
 		  flush=True)
 
