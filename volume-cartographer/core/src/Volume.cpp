@@ -321,14 +321,14 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
 
     // Create chunk source: HTTP for remote volumes, filesystem for local
     std::unique_ptr<vc::cache::VolumeSource> source;
-    // Canonical codec for the local disk cache.  Default c3d; existing
-    // h265 caches are auto-detected by reading the per-level zarr.json
-    // and keep working.  Env override: VC3D_REMOTE_CODEC=h265|c3d.
-    auto remoteCodec = vc::cache::BlockPipeline::Codec::C3d;
+    // Canonical codec for the local disk cache (remote path only).
+    // Default c3d; existing h265 caches are auto-detected below and keep
+    // working. Env override: VC3D_REMOTE_CODEC=h265|c3d.
+    auto cacheCodec = vc::cache::BlockPipeline::Codec::C3d;
     if (const char* env = std::getenv("VC3D_REMOTE_CODEC")) {
         std::string v = env;
-        if (v == "h265") remoteCodec = vc::cache::BlockPipeline::Codec::H265;
-        else if (v == "c3d") remoteCodec = vc::cache::BlockPipeline::Codec::C3d;
+        if (v == "h265") cacheCodec = vc::cache::BlockPipeline::Codec::H265;
+        else if (v == "c3d") cacheCodec = vc::cache::BlockPipeline::Codec::C3d;
         else fprintf(stderr,
             "[Volume] VC3D_REMOTE_CODEC='%s' not recognised; using default c3d\n",
             env);
@@ -343,81 +343,91 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
         source = std::move(httpSource);
 
         // v3 sharded disk cache: path_/0/, path_/1/, ...
-        // Open if zarr.json exists, create if not.  Codec dictates geometry:
+        // Codec dictates geometry:
         //   c3d : 4096³ shards, 256³ inner chunks, sub_codec "c3d"
         //   h265: 1024³ shards, 128³ inner chunks (legacy default)
-        // Existing caches win: if a level's zarr.json is already c3d/h265,
-        // we infer the codec from its sub_chunks shape so mixed worlds
-        // keep working through a migration.
+        // Existing caches win: mixing codecs across levels doesn't
+        // work (canonical chunk side must be uniform), so we do a
+        // scan-before-create. Pass 1 opens every already-materialised
+        // zarr.json and tallies h265 / c3d; pass 2 uses the resolved
+        // final codec to create any missing levels. This prevents a
+        // partially-populated h265 cache from ending up mixed with
+        // newly-created c3d levels.
         {
-            int nLevels = source->numLevels();
+            const int nLevels = source->numLevels();
             diskLevels.resize(nLevels);
-
-            auto pad = [](int v, int chunk) -> size_t {
-                return static_cast<size_t>((v + chunk - 1) / chunk * chunk);
-            };
 
             int detected_h265 = 0, detected_c3d = 0;
             for (int lvl = 0; lvl < nLevels; lvl++) {
                 auto lvlPath = path_ / std::to_string(lvl);
-                if (std::filesystem::exists(lvlPath / "zarr.json")) {
-                    diskLevels[lvl] = std::make_unique<utils::ZarrArray>(
-                        utils::ZarrArray::open(lvlPath));
-                    const auto& m = diskLevels[lvl]->metadata();
-                    if (utils::is_canonical_c3d(m)) ++detected_c3d;
-                    else if (utils::is_canonical_vc3d(m)) ++detected_h265;
-                } else {
-                    const int innerSide = (remoteCodec ==
-                        vc::cache::BlockPipeline::Codec::C3d) ? 256 : 128;
-                    const int shardSide = (remoteCodec ==
-                        vc::cache::BlockPipeline::Codec::C3d) ? 4096 : 1024;
-                    const char* codecName = (remoteCodec ==
-                        vc::cache::BlockPipeline::Codec::C3d) ? "c3d" : "h265";
-
-                    auto shape = source->levelShape(lvl);
-                    utils::ZarrMetadata meta;
-                    meta.version = utils::ZarrVersion::v3;
-                    meta.node_type = "array";
-                    meta.shape = {pad(shape[0], innerSide),
-                                  pad(shape[1], innerSide),
-                                  pad(shape[2], innerSide)};
-                    meta.chunks = {(size_t)shardSide, (size_t)shardSide,
-                                   (size_t)shardSide};
-                    meta.dtype = utils::ZarrDtype::uint8;
-                    meta.fill_value = 0;
-                    meta.chunk_key_encoding = "default";
-                    utils::ShardConfig sc;
-                    sc.sub_chunks = {(size_t)innerSide, (size_t)innerSide,
-                                     (size_t)innerSide};
-                    // Record the sub-chunk codec so the zarr.json is
-                    // spec-compliant and later re-opens can detect the
-                    // codec from metadata (not just bytes).
-                    utils::ZarrCodecConfig cc;
-                    cc.name = codecName;
-                    sc.sub_codecs.push_back(cc);
-                    meta.shard_config = std::move(sc);
-                    diskLevels[lvl] = std::make_unique<utils::ZarrArray>(
-                        utils::ZarrArray::create(lvlPath, std::move(meta)));
-                }
+                if (!std::filesystem::exists(lvlPath / "zarr.json")) continue;
+                diskLevels[lvl] = std::make_unique<utils::ZarrArray>(
+                    utils::ZarrArray::open(lvlPath));
+                const auto& m = diskLevels[lvl]->metadata();
+                if (utils::is_canonical_c3d(m)) ++detected_c3d;
+                else if (utils::is_canonical_vc3d(m)) ++detected_h265;
             }
-            // If an existing cache disagrees with the requested codec,
-            // honour the on-disk format.  Mixing codecs across levels
-            // doesn't work (canonical chunk side must be uniform), so
-            // pick whichever codec the majority of levels are already in.
+            // Resolve the final codec before creating anything.
             if (detected_h265 > detected_c3d) {
-                remoteCodec = vc::cache::BlockPipeline::Codec::H265;
+                cacheCodec = vc::cache::BlockPipeline::Codec::H265;
             } else if (detected_c3d > 0) {
-                remoteCodec = vc::cache::BlockPipeline::Codec::C3d;
+                cacheCodec = vc::cache::BlockPipeline::Codec::C3d;
+            }
+
+            const int innerSide = (cacheCodec ==
+                vc::cache::BlockPipeline::Codec::C3d) ? 256 : 128;
+            const int shardSide = (cacheCodec ==
+                vc::cache::BlockPipeline::Codec::C3d) ? 4096 : 1024;
+            const char* codecName = (cacheCodec ==
+                vc::cache::BlockPipeline::Codec::C3d) ? "c3d" : "h265";
+            auto pad = [](int v, int chunk) -> size_t {
+                return static_cast<size_t>((v + chunk - 1) / chunk * chunk);
+            };
+
+            for (int lvl = 0; lvl < nLevels; lvl++) {
+                if (diskLevels[lvl]) continue;  // already opened above
+                auto lvlPath = path_ / std::to_string(lvl);
+                auto shape = source->levelShape(lvl);
+                utils::ZarrMetadata meta;
+                meta.version = utils::ZarrVersion::v3;
+                meta.node_type = "array";
+                meta.shape = {pad(shape[0], innerSide),
+                              pad(shape[1], innerSide),
+                              pad(shape[2], innerSide)};
+                meta.chunks = {(size_t)shardSide, (size_t)shardSide,
+                               (size_t)shardSide};
+                meta.dtype = utils::ZarrDtype::uint8;
+                meta.fill_value = 0;
+                meta.chunk_key_encoding = "default";
+                utils::ShardConfig sc;
+                sc.sub_chunks = {(size_t)innerSide, (size_t)innerSide,
+                                 (size_t)innerSide};
+                // Record the sub-chunk codec so the zarr.json is
+                // spec-compliant and later re-opens can detect the
+                // codec from metadata (not just bytes).
+                utils::ZarrCodecConfig cc;
+                cc.name = codecName;
+                sc.sub_codecs.push_back(cc);
+                meta.shard_config = std::move(sc);
+                diskLevels[lvl] = std::make_unique<utils::ZarrArray>(
+                    utils::ZarrArray::create(lvlPath, std::move(meta)));
             }
             fprintf(stderr,
                 "[Volume] Cold cache: %d levels at %s (codec: %s)\n",
-                nLevels, path_.c_str(),
-                remoteCodec == vc::cache::BlockPipeline::Codec::C3d
-                    ? "c3d" : "h265");
+                nLevels, path_.c_str(), codecName);
         }
     } else {
         source = std::make_unique<vc::cache::FileSystemSource>(
             path_, delimiter, std::move(levels));
+
+        // Derive codec from the source's inner-chunk geometry. A wrong
+        // guess here breaks BlockPipeline's empty-chunk reverse-mapping
+        // (ChunkKey{bz/cps, ...}) so neighbouring non-empty chunks can
+        // misclassify as empty. 256³ → c3d, otherwise h265 (128³).
+        auto srcChunk = source->chunkShape(0);
+        cacheCodec = (srcChunk[0] == 256)
+            ? vc::cache::BlockPipeline::Codec::C3d
+            : vc::cache::BlockPipeline::Codec::H265;
 
         // Network mount disk caching disabled — needs per-level conversion
         if (mountInfo_.type == vc::FilesystemType::NetworkMount) {
@@ -437,7 +447,7 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
     config.volumeId = id();
     config.bytes = cacheBudgetHot_;
     config.encodeParams = encodeParams_;
-    config.codec = remoteCodec;
+    config.codec = cacheCodec;
 
     // Canonical-passthrough detection. Remote sources whose shard layout
     // matches our local cache (same codec family + matching shard dim)
