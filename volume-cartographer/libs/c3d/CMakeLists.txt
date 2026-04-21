@@ -8,10 +8,13 @@ target_include_directories(c3d PUBLIC
 
 target_compile_features(c3d PRIVATE c_std_23)
 
-# c3d assumes -ffast-math / permissive math semantics; the codec's own
-# CMakeLists documents this as required for the documented PSNR/throughput.
+# The repo-wide policy (AGENTS.md §3.1) is strict IEEE math — no
+# -ffast-math / -Ofast. Keep it here too: c3d is a compression codec,
+# and relaxing FP semantics across compilers/architectures would make
+# encoded bytes non-reproducible between platforms. The upstream
+# throughput targets were measured with -ffast-math but the reference
+# decoder is fine without it.
 target_compile_options(c3d PRIVATE
-    -ffast-math
     -fno-math-errno
     -fno-trapping-math
     # Upstream vendored code — we don't own the style, silence the noise.

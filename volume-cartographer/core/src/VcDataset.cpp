@@ -527,6 +527,15 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
             std::memcpy(output, bytes.data(), outBytes);
             break;
         }
+
+        case CompressorId::C3d: {
+            const auto bytes = decompressBytes(impl_->compressor_, input, outBytes);
+            std::memcpy(output, bytes.data(), outBytes);
+            break;
+        }
+
+        default:
+            throw std::runtime_error("VcDataset::decompress: unhandled compressor");
     }
 }
 
