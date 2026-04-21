@@ -112,7 +112,10 @@ struct BlockSampler {
     // more of the hot working set in the per-sampler private cache
     // (where lookups are 2 instructions, no atomics).
     // The BlockPtr (non-owning) lives in a cold parallel array,
-    // touched only on miss.
+    // touched only on miss. Both arrays are heap-allocated so the
+    // sampler itself stays ~100 bytes — render workers stack an
+    // array<optional<BlockSampler>, kMaxLevels=8> and inline 384 KB
+    // per slot would blow past a macOS default pthread stack.
     struct HotSlot {
         uint64_t key = UINT64_MAX;
         const T* data = nullptr;
@@ -125,8 +128,8 @@ struct BlockSampler {
     // When non-null we can bypass `cache.blockAt` on known-empty chunks
     // via a plain-memory binary search instead of an atomic probe loop.
     const FrameState* frame;
-    HotSlot slots[kSlots];
-    BlockPtr slotBlocks[kSlots];  // cold: refcount keep-alive
+    std::unique_ptr<HotSlot[]> slots;
+    std::unique_ptr<BlockPtr[]> slotBlocks;  // cold: refcount keep-alive
     // Last-block (bz,by,bx) cache as separate ints. Most pixels in a tile
     // sample the same block, so comparing three ints lets us skip packKey's
     // 3 shifts + 2 ORs on every same-block call. lastBz=INT_MIN seeds a
@@ -139,7 +142,9 @@ struct BlockSampler {
 
     BlockSampler(BlockPipeline& c, int lvl)
         : cache(c), level(lvl), shape(c, lvl),
-          frame(TickCoordinator::currentFrameGlobal()) {}
+          frame(TickCoordinator::currentFrameGlobal()),
+          slots(std::make_unique<HotSlot[]>(kSlots)),
+          slotBlocks(std::make_unique<BlockPtr[]>(kSlots)) {}
 
     ~BlockSampler() {
         TickCoordinator::releaseFrameGlobal(frame);
@@ -1671,17 +1676,32 @@ void sampleCompositeAdaptiveImpl(
                                 s0.tryUpdateBlockNonBlocking(bz, by, bx);
                                 cdata = s0.data;
                             }
-                            swx += sdx; swy += sdy; swz += sdz;
-                            if constexpr (AMode == AccumMode2::Mean) {
-                                cnt++;
+                            if constexpr (AMode == AccumMode2::Mean) cnt++;
+                            uint8_t v;
+                            if (cdata) [[likely]] {
+                                const int lz = iz & kBlockMask;
+                                const int ly = iy & kBlockMask;
+                                const int lx = ix & kBlockMask;
+                                const uint8_t raw = cdata[lz * kStrideZ
+                                                        + ly * kStrideY + lx];
+                                v = preTfOn ? preTfLut[raw] : raw;
+                            } else {
+                                // Desired-level block hasn't landed yet —
+                                // fall back to coarser samplers so
+                                // progressive render shows smoothed data
+                                // instead of black until the fine chunk
+                                // arrives.
+                                uint8_t fv = 0;
+                                for (int i = 1; i < nSamplers; i++) {
+                                    const float r = scalesRatio[i];
+                                    if (trySampleNB<SMode>(sampler(i),
+                                            swz * r, swy * r, swx * r, fv)) {
+                                        if (uint8_t(i) > pxLevel) pxLevel = uint8_t(i);
+                                        break;
+                                    }
+                                }
+                                v = preTfOn ? preTfLut[fv] : fv;
                             }
-                            if (!cdata) continue;
-                            const int lz = iz & kBlockMask;
-                            const int ly = iy & kBlockMask;
-                            const int lx = ix & kBlockMask;
-                            const uint8_t raw = cdata[lz * kStrideZ
-                                                    + ly * kStrideY + lx];
-                            const uint8_t v = preTfOn ? preTfLut[raw] : raw;
                             if constexpr (AMode == AccumMode2::Max) {
                                 mM = v > mM ? v : mM;
                             } else if constexpr (AMode == AccumMode2::Min) {
@@ -1689,6 +1709,7 @@ void sampleCompositeAdaptiveImpl(
                             } else {
                                 sumAcc += int(v);
                             }
+                            swx += sdx; swy += sdy; swz += sdz;
                         }
                         if constexpr (AMode == AccumMode2::Max)  mx = float(mM);
                         else if constexpr (AMode == AccumMode2::Min) mn = float(mm);
@@ -1708,15 +1729,32 @@ void sampleCompositeAdaptiveImpl(
                                 s0.tryUpdateBlockNonBlocking(bz, by, bx);
                                 cdata = s0.data;
                             }
-                            swx += sdx; swy += sdy; swz += sdz;
-                            if (!cdata) { layerVals[li] = 0.f; continue; }
-                            const int lz = iz & kBlockMask;
-                            const int ly = iy & kBlockMask;
-                            const int lx = ix & kBlockMask;
-                            const uint8_t raw = cdata[lz * kStrideZ
-                                                    + ly * kStrideY + lx];
-                            const uint8_t v = preTfOn ? preTfLut[raw] : raw;
+                            uint8_t v;
+                            if (cdata) [[likely]] {
+                                const int lz = iz & kBlockMask;
+                                const int ly = iy & kBlockMask;
+                                const int lx = ix & kBlockMask;
+                                const uint8_t raw = cdata[lz * kStrideZ
+                                                        + ly * kStrideY + lx];
+                                v = preTfOn ? preTfLut[raw] : raw;
+                            } else {
+                                // Desired-level block missing — try
+                                // coarser samplers before falling back to
+                                // zero. Keeps progressive render showing
+                                // coarse data instead of flashing black.
+                                uint8_t fv = 0;
+                                for (int i = 1; i < nSamplers; i++) {
+                                    const float r = scalesRatio[i];
+                                    if (trySampleNB<SMode>(sampler(i),
+                                            swz * r, swy * r, swx * r, fv)) {
+                                        if (uint8_t(i) > pxLevel) pxLevel = uint8_t(i);
+                                        break;
+                                    }
+                                }
+                                v = preTfOn ? preTfLut[fv] : fv;
+                            }
                             layerVals[li] = float(v);
+                            swx += sdx; swy += sdy; swz += sdz;
                         }
                     }
                 } else {
