@@ -261,65 +261,39 @@ std::vector<uint8_t> HttpSource::httpGet(const std::string& url)
     return result;
 }
 
+std::vector<uint8_t> HttpSource::httpGetRange(const std::string& url,
+                                              std::size_t offset,
+                                              std::size_t length)
+{
+    if (length == 0) return {};
+    auto resp = client_->get_range(url, offset, length);
+    tl_last_was_absent = (resp.status_code == 404);
+    if (!resp.ok()) {
+        if (resp.status_code != 404) {
+            transientError_.store(true, std::memory_order_relaxed);
+            static std::atomic<int> errCount{0};
+            int n = errCount.fetch_add(1);
+            if (n < 5) {
+                std::fprintf(stderr,
+                             "[HTTP] GET_RANGE %s [%zu..%zu) -> status=%ld\n",
+                             url.c_str(), offset, offset + length,
+                             long(resp.status_code));
+            }
+        }
+        return {};
+    }
+    transientError_.store(false, std::memory_order_relaxed);
+    std::vector<uint8_t> result(resp.body.size());
+    if (!result.empty())
+        std::memcpy(result.data(), resp.body.data(), result.size());
+    return result;
+}
+
 std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
 {
     std::string url = shardUrl(key);
-
-    std::shared_ptr<std::vector<uint8_t>> shardData;
-    std::shared_ptr<utils::detail::ShardIndex> shardIndex;
-    {
-        std::lock_guard<std::mutex> lock(shardCacheMutex_);
-        if (auto it = shardCacheMap_.find(url); it != shardCacheMap_.end()) {
-            // LRU touch: move the hit to the front of the list.
-            shardCacheLru_.splice(shardCacheLru_.begin(), shardCacheLru_, it->second);
-            shardData = it->second->entry.bytes;
-            shardIndex = it->second->entry.index;
-        }
-    }
-
-    if (!shardData) {
-        auto raw = httpGet(url);
-        if (raw.empty()) return {};
-        shardData = std::make_shared<std::vector<uint8_t>>(std::move(raw));
-
-        constexpr size_t kShardCacheBudget = 256ull << 20;
-        std::lock_guard<std::mutex> lock(shardCacheMutex_);
-
-        // If another thread raced ahead and inserted the same url, reuse
-        // its entry (keep our download but let it fall out of scope).
-        if (auto it = shardCacheMap_.find(url); it != shardCacheMap_.end()) {
-            shardCacheLru_.splice(shardCacheLru_.begin(), shardCacheLru_, it->second);
-            shardData = it->second->entry.bytes;
-            shardIndex = it->second->entry.index;
-        } else {
-            shardCacheLru_.push_front({url, {shardData, {}}});
-            shardCacheMap_[url] = shardCacheLru_.begin();
-            shardCacheBytes_ += shardData->size();
-
-            // LRU eviction: drop oldest entries until we're under budget.
-            // Keep at least one entry so the just-inserted item survives
-            // even if it alone exceeds the budget.
-            while (shardCacheBytes_ > kShardCacheBudget
-                   && shardCacheLru_.size() > 1) {
-                auto& victim = shardCacheLru_.back();
-                shardCacheBytes_ -= victim.entry.bytes
-                    ? victim.entry.bytes->size() : 0;
-                shardCacheMap_.erase(victim.url);
-                shardCacheLru_.pop_back();
-            }
-
-            if (auto* log = cacheDebugLog())
-                std::fprintf(log, "[SHARD] Cached %s (%zu bytes, %d entries, cache=%zu, bytes=%zu)\n",
-                             url.c_str(), shardData->size(), totalChunksPerShard(),
-                             shardCacheMap_.size(), shardCacheBytes_);
-        }
-    }
-
     const int nChunks = totalChunksPerShard();
-    if (shardData->size() < size_t(nChunks) * 16) {
-        tl_last_was_absent = false;
-        return {};
-    }
+    if (nChunks <= 0) return {};
 
     const int inner = innerChunkIndex(key);
     if (inner < 0 || inner >= nChunks) {
@@ -327,22 +301,55 @@ std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
         return {};
     }
 
-    // Cache the parsed index alongside the bytes. Without this we were
-    // re-parsing ~16 KB (512 * 16 B) on every single inner-chunk fetch
-    // against the same shard.
+    // Phase 1: fetch + cache the parsed shard index.  The index lives at the
+    // head of the shard (zarr-v3 index_location=start) so one Range GET of
+    // nChunks*16 bytes gives us full chunk addressability.
+    std::shared_ptr<utils::detail::ShardIndex> shardIndex;
+    {
+        std::lock_guard<std::mutex> lock(shardCacheMutex_);
+        if (auto it = shardCacheMap_.find(url); it != shardCacheMap_.end()) {
+            shardCacheLru_.splice(shardCacheLru_.begin(), shardCacheLru_, it->second);
+            shardIndex = it->second->entry.index;
+        }
+    }
+
     if (!shardIndex) {
-        std::span<const std::byte> shardBytes(
-            reinterpret_cast<const std::byte*>(shardData->data()), shardData->size());
+        const std::size_t indexBytes = std::size_t(nChunks) * 16;
+        auto raw = httpGetRange(url, 0, indexBytes);
+        if (raw.size() != indexBytes) return {};
+
+        std::span<const std::byte> span(
+            reinterpret_cast<const std::byte*>(raw.data()), raw.size());
         auto parsed = std::make_shared<utils::detail::ShardIndex>(
-            utils::detail::ShardIndex::deserialize(shardBytes, size_t(nChunks)));
+            utils::detail::ShardIndex::deserialize(span, size_t(nChunks)));
+
+        constexpr size_t kShardIndexBudget = 64ull << 20;   // ~64 MiB of indices
         std::lock_guard<std::mutex> lock(shardCacheMutex_);
         if (auto it = shardCacheMap_.find(url); it != shardCacheMap_.end()) {
             if (!it->second->entry.index) it->second->entry.index = parsed;
             shardIndex = it->second->entry.index;
+            shardCacheLru_.splice(shardCacheLru_.begin(), shardCacheLru_, it->second);
         } else {
-            shardIndex = std::move(parsed);
+            shardCacheLru_.push_front({url, {/*bytes=*/{}, parsed}});
+            shardCacheMap_[url] = shardCacheLru_.begin();
+            shardCacheBytes_ += indexBytes;
+            shardIndex = parsed;
+
+            while (shardCacheBytes_ > kShardIndexBudget
+                   && shardCacheLru_.size() > 1) {
+                auto& victim = shardCacheLru_.back();
+                shardCacheBytes_ -= std::size_t(nChunks) * 16;
+                shardCacheMap_.erase(victim.url);
+                shardCacheLru_.pop_back();
+            }
+
+            if (auto* log = cacheDebugLog())
+                std::fprintf(log, "[SHARD] Cached index %s (%zu entries, cache=%zu)\n",
+                             url.c_str(), std::size_t(nChunks),
+                             shardCacheMap_.size());
         }
     }
+
     const auto& entry = shardIndex->entries[inner];
 
     if (entry.is_missing()
@@ -350,13 +357,13 @@ std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
         tl_last_was_absent = true;
         return {};
     }
-    if (entry.offset + entry.nbytes > shardData->size()) {
+    if (entry.nbytes == 0) {
         tl_last_was_absent = false;
         return {};
     }
 
-    return {shardData->data() + entry.offset,
-            shardData->data() + entry.offset + entry.nbytes};
+    // Phase 2: Range GET just the chunk's bytes.
+    return httpGetRange(url, entry.offset, entry.nbytes);
 }
 
 std::vector<uint8_t> HttpSource::fetch(const ChunkKey& key)

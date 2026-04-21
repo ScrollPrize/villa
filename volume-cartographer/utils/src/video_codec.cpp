@@ -222,6 +222,11 @@ void video_encode_into(
             std::memcpy(output.data() + old, nals[i].payload, nals[i].sizeBytes);
         }
     }
+
+    // Free slack capacity the encoder's resize pattern leaves behind —
+    // x265 output bursts to many MB then tapers, but the vector holds
+    // onto the peak allocation. On large batches that leak adds up.
+    output.shrink_to_fit();
 }
 
 auto video_encode(std::span<const std::byte> raw, const VideoCodecParams& params)
