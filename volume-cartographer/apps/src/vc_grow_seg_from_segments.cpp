@@ -164,7 +164,14 @@ int main(int argc, char *argv[])
             surfaces.push_back(sm);
         }
 
-    QuadSurface *surf = grow_surf_from_surfs(src, surfaces, params, voxelsize);
+    bool use_old_tracer = params.value("use_old_tracer", false);
+    if (use_old_tracer) {
+        std::cout << "use_old_tracer: true (using legacy vc_tracer_legacy growth loop)" << std::endl;
+    }
+
+    QuadSurface *surf = use_old_tracer
+        ? grow_surf_from_surfs_legacy(src, surfaces, params, voxelsize)
+        : grow_surf_from_surfs(src, surfaces, params, voxelsize);
 
     if (!surf)
         return EXIT_SUCCESS;
