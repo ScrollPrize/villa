@@ -717,6 +717,9 @@ def main(argv: list[str] | None = None) -> int:
 
     _save_noremote(local_root, st.noremote_keys)
 
+    # Store S3 source URI in local .zattrs so predict3d can re-download
+    _store_download_meta(local_root, remote_root, anon, args.region)
+
     snap = st.snapshot()
     sys.stderr.write("\n")
     print(
@@ -728,6 +731,50 @@ def main(argv: list[str] | None = None) -> int:
         file=sys.stderr,
     )
     return 1 if snap["failed"] else 0
+
+
+def _store_download_meta(local_root: str, source_uri: str, anon: bool,
+                         region: str | None = None) -> None:
+    """Write _download metadata into local .zattrs for later re-download."""
+    zattrs_path = os.path.join(local_root, ".zattrs")
+    if os.path.isfile(zattrs_path):
+        with open(zattrs_path) as f:
+            zattrs = json.load(f)
+    else:
+        zattrs = {}
+    dl_meta: dict = {"source": source_uri, "anon": anon}
+    if region:
+        dl_meta["region"] = region
+    zattrs["_download"] = dl_meta
+    _write_local_json(zattrs_path, zattrs)
+
+
+def download(
+    source: str,
+    dest: str,
+    *,
+    scales: list[int] | None = None,
+    bbox_xyzxyz: tuple[int, int, int, int, int, int] | None = None,
+    workers: int = 64,
+    anon: bool = False,
+    region: str | None = None,
+) -> int:
+    """Programmatic entry point — same as CLI but with keyword args.
+
+    Returns 0 on success, 1 on failure.
+    """
+    argv = [source, dest]
+    if scales is not None:
+        argv += ["--scales", ",".join(str(s) for s in scales)]
+    if bbox_xyzxyz is not None:
+        x0, y0, z0, x1, y1, z1 = bbox_xyzxyz
+        argv += ["--bbox", f"{x0},{y0},{z0},{x1},{y1},{z1}"]
+    if anon:
+        argv.append("--anon")
+    if region:
+        argv += ["--region", region]
+    argv += ["--workers", str(workers)]
+    return main(argv)
 
 
 if __name__ == "__main__":

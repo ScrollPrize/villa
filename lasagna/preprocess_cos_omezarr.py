@@ -1043,6 +1043,96 @@ def _infer_tiled_3d(
 	return result_fine, result_coarse
 
 
+def _find_zarr_group_root(path: str) -> Path | None:
+	"""Walk up from a zarr array path to find the group root (.zattrs or .zgroup)."""
+	p = Path(path).resolve()
+	# If path ends with a numeric level (e.g. vol.zarr/2), parent is the group
+	if p.name.isdigit():
+		candidate = p.parent
+	else:
+		candidate = p
+	for check in [candidate, candidate.parent]:
+		if (check / ".zattrs").is_file() or (check / ".zgroup").is_file():
+			return check
+	return None
+
+
+def _auto_download(
+	input_path: str,
+	crop_xyzwhd: tuple[int, int, int, int, int, int] | None,
+	pred_dt_path: str | None,
+) -> None:
+	"""Auto-download input data from S3 if _download metadata is present.
+
+	Reads the zarr group's .zattrs for a ``_download`` key written by
+	``download_omezarr.py``.  If found, calls the downloader for the
+	needed scale levels and region.  If not found, raises with a clear
+	error message.
+	"""
+	import json as _json
+
+	group_root = _find_zarr_group_root(input_path)
+	if group_root is None:
+		raise FileNotFoundError(
+			f"cannot find zarr group root for {input_path}; "
+			"pass --no-download to skip auto-download"
+		)
+
+	zattrs_path = group_root / ".zattrs"
+	if not zattrs_path.is_file():
+		raise FileNotFoundError(
+			f"no .zattrs at {group_root}; "
+			"pass --no-download to skip auto-download"
+		)
+	zattrs = _json.loads(zattrs_path.read_text(encoding="utf-8"))
+	dl_meta = zattrs.get("_download")
+	if dl_meta is None:
+		raise ValueError(
+			f"no _download metadata in {zattrs_path} — "
+			"run download_omezarr.py on this volume first "
+			"(it records the S3 source), or pass --no-download to skip"
+		)
+
+	source_uri = dl_meta["source"]
+	anon = dl_meta.get("anon", False)
+	region = dl_meta.get("region")
+
+	# Determine which scales to download
+	scales: set[int] = set()
+	inp = Path(input_path).resolve()
+	if inp.name.isdigit():
+		scales.add(int(inp.name))
+	if pred_dt_path:
+		dt_p = Path(pred_dt_path).resolve()
+		if dt_p.name.isdigit():
+			scales.add(int(dt_p.name))
+
+	# Convert crop to bbox for downloader (crop is X,Y,Z,W,H,D → bbox is x0,y0,z0,x1,y1,z1)
+	bbox: tuple[int, int, int, int, int, int] | None = None
+	if crop_xyzwhd is not None:
+		x, y, z, w, h, d = crop_xyzwhd
+		bbox = (x, y, z, x + w, y + h, z + d)
+
+	import sys as _sys
+	_lasagna_dir = str(Path(__file__).resolve().parent)
+	if _lasagna_dir not in _sys.path:
+		_sys.path.insert(0, _lasagna_dir)
+	from scripts.download_omezarr import download
+	print(f"[predict3d] auto-downloading from {source_uri} "
+		  f"scales={sorted(scales) or 'all'} ...", flush=True)
+	ret = download(
+		source=source_uri,
+		dest=str(group_root),
+		scales=sorted(scales) if scales else None,
+		bbox_xyzxyz=bbox,
+		anon=anon,
+		region=region,
+	)
+	if ret != 0:
+		raise RuntimeError(f"download_omezarr failed with exit code {ret}")
+	print("[predict3d] download complete", flush=True)
+
+
 def _resolve_base_shape(
 	input_path: str,
 	base_ref: str | None,
@@ -2113,7 +2203,18 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 			 "If omitted, auto-detect from input zarr group level 0.")
 	p.add_argument("--base-scale", type=int, default=None,
 		help="How many 2x downsamples the --base-ref zarr is from the true base.")
+	p.add_argument("--no-download", action="store_true", default=False,
+		help="Skip automatic S3 download of input data. By default, predict3d "
+			 "checks for _download metadata in the zarr's .zattrs and downloads "
+			 "needed chunks before inference.")
 	args = p.parse_args(argv)
+
+	if not args.no_download:
+		_auto_download(
+			input_path=str(args.input),
+			crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd else None,
+			pred_dt_path=str(args.pred_dt) if args.pred_dt else None,
+		)
 
 	run_preprocess_3d(
 		input_path=str(args.input),
