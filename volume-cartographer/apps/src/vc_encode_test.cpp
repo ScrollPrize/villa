@@ -1,15 +1,11 @@
-// vc_encode_test: A/B matrix comparing pre-encode transforms.
+// vc_encode_test: A/B matrix comparing per-codec quality/size points.
 //
-// Configs tested per chunk:
-//   baseline       — qp only
-//   dark-floor=32  — zero v<=32
-//   dark-floor=48  — zero v<=48
-//   ctu-qp         — per-CTU variance-adaptive QP (+8 on dark+smooth CTUs)
-//   df48 + ctu-qp  — combined
+// --codec h265 (default): sweeps air_clamp values at fixed QP (128³ chunks).
+// --codec c3d           : sweeps target_ratio values (256³ chunks).
 //
 // Reports avg encoded size, ratio, MAE, RMSE, PSNR vs original raw.
 //
-// Usage: vc_encode_test <chunks-dir> [--qp N] [--max K]
+// Usage: vc_encode_test <chunks-dir> [--codec {h265|c3d}] [--qp N] [--max K]
 
 #include <cstdio>
 #include <cstdlib>
@@ -22,15 +18,16 @@
 #include <vector>
 
 #include "utils/video_codec.hpp"
+#include "utils/c3d_codec.hpp"
 
 namespace fs = std::filesystem;
 
-static constexpr int CHUNK_DIM = 128;
-static constexpr size_t CHUNK_VOXELS = size_t(CHUNK_DIM) * CHUNK_DIM * CHUNK_DIM;
+enum class CodecKind { H265, C3d };
 
 struct Config {
     const char* name;
-    int air_clamp;   // 0 = off; codec snaps + post-decode zeros
+    int air_clamp;       // h265 only; 0 = off
+    float target_ratio;  // c3d only; > 1.0
 };
 
 struct Agg {
@@ -46,17 +43,27 @@ struct Agg {
 int main(int argc, char** argv)
 {
     if (argc < 2) {
-        fprintf(stderr, "Usage: vc_encode_test <chunks-dir> [--qp N] [--max K]\n");
+        fprintf(stderr, "Usage: vc_encode_test <chunks-dir> [--codec {h265|c3d}] [--qp N] [--max K]\n");
         return 1;
     }
     std::string dir = argv[1];
     int qp = 36;
     int max_chunks = 100000;
+    CodecKind codec = CodecKind::H265;
     for (int i = 2; i < argc; ++i) {
         std::string a = argv[i];
         if (a == "--qp" && i + 1 < argc) qp = std::atoi(argv[++i]);
         else if (a == "--max" && i + 1 < argc) max_chunks = std::atoi(argv[++i]);
+        else if (a == "--codec" && i + 1 < argc) {
+            std::string v = argv[++i];
+            if (v == "c3d")       codec = CodecKind::C3d;
+            else if (v == "h265") codec = CodecKind::H265;
+            else { fprintf(stderr, "--codec must be h265 or c3d\n"); return 1; }
+        }
     }
+
+    const int CHUNK_DIM = (codec == CodecKind::C3d) ? 256 : 128;
+    const size_t CHUNK_VOXELS = size_t(CHUNK_DIM) * CHUNK_DIM * CHUNK_DIM;
 
     std::vector<std::string> files;
     for (auto& e : fs::directory_iterator(dir)) {
@@ -65,16 +72,34 @@ int main(int argc, char** argv)
         files.push_back(e.path().string());
         if ((int)files.size() >= max_chunks) break;
     }
-    if (files.empty()) { fprintf(stderr, "No chunks in %s\n", dir.c_str()); return 1; }
-    printf("Chunks: %zu, qp: %d\n\n", files.size(), qp);
+    if (files.empty()) {
+        fprintf(stderr, "No chunks matching %d³ in %s\n", CHUNK_DIM, dir.c_str());
+        return 1;
+    }
+    if (codec == CodecKind::C3d) {
+        printf("Chunks: %zu (256³ c3d)\n\n", files.size());
+    } else {
+        printf("Chunks: %zu (128³ h265, qp %d)\n\n", files.size(), qp);
+    }
 
-    std::vector<Config> configs = {
-        {"baseline",     0},
-        {"air=32",       32},
-        {"air=48",       48},
-        {"air=64",       64},
-        {"air=72",       72},
-    };
+    std::vector<Config> configs;
+    if (codec == CodecKind::C3d) {
+        configs = {
+            {"ratio=5",    0,   5.0f},
+            {"ratio=10",   0,  10.0f},
+            {"ratio=25",   0,  25.0f},
+            {"ratio=50",   0,  50.0f},
+            {"ratio=100",  0, 100.0f},
+        };
+    } else {
+        configs = {
+            {"baseline",     0,  0.0f},
+            {"air=32",      32,  0.0f},
+            {"air=48",      48,  0.0f},
+            {"air=64",      64,  0.0f},
+            {"air=72",      72,  0.0f},
+        };
+    }
     std::vector<Agg> agg(configs.size());
 
     for (const auto& f : files) {
@@ -84,15 +109,25 @@ int main(int argc, char** argv)
         if (!fin) continue;
 
         for (size_t c = 0; c < configs.size(); ++c) {
-            utils::VideoCodecParams p;
-            p.qp = qp;
-            p.depth = CHUNK_DIM; p.height = CHUNK_DIM; p.width = CHUNK_DIM;
-            p.air_clamp = configs[c].air_clamp;
+            std::vector<std::byte> enc;
+            std::vector<std::byte> dec;
+            if (codec == CodecKind::C3d) {
+                utils::C3dCodecParams p;
+                p.target_ratio = configs[c].target_ratio;
+                p.depth = CHUNK_DIM; p.height = CHUNK_DIM; p.width = CHUNK_DIM;
+                enc = utils::c3d_encode(std::span<const std::byte>(orig), p);
+                dec = utils::c3d_decode(std::span<const std::byte>(enc), CHUNK_VOXELS, p);
+            } else {
+                utils::VideoCodecParams p;
+                p.qp = qp;
+                p.depth = CHUNK_DIM; p.height = CHUNK_DIM; p.width = CHUNK_DIM;
+                p.air_clamp = configs[c].air_clamp;
+                enc = utils::video_encode(std::span<const std::byte>(orig), p);
+                dec = utils::video_decode(std::span<const std::byte>(enc), CHUNK_VOXELS, p);
+            }
 
-            auto enc = utils::video_encode(std::span<const std::byte>(orig), p);
-            auto dec = utils::video_decode(std::span<const std::byte>(enc), CHUNK_VOXELS, p);
-
-            // Intended ground truth: original with v<=air_clamp zeroed.
+            // Intended ground truth: original with v<=air_clamp zeroed
+            // (c3d: air_clamp is always 0, so gt==a).
             // Material defined as orig > MAT_THRESH (fixed across configs for
             // apples-to-apples PSNR comparison).
             const int t = configs[c].air_clamp;
