@@ -730,13 +730,66 @@ def _compute_pred_dt_slab(
 	n_readers = min(read_workers if read_workers > 0 else max(1, (os.cpu_count() or 4) // 2),
 				   n_chunks)
 
-	# Launch reader pool — results come back as (idx, binary_array)
-	# imap_unordered for throughput, we reorder by idx
-	pending: dict[int, np.ndarray] = {}
-	next_gpu_idx = 0
-
 	print(f"[pred_dt] {n_chunks} chunks, {n_readers} read workers, edt_chunk={edt_chunk}",
 		  flush=True)
+
+	# --- Write function (CPU only — downsample + zarr write) ---
+	def _write_encoded(idx, dt_u8_np):
+		"""Downsample encoded uint8 and write to zarr (CPU only)."""
+		cz0, cz1, cy0, cy1, cx0, cx1 = work[idx]
+		rz0 = max(0, cz0 - overlap)
+		ry0 = max(0, cy0 - overlap)
+		rx0 = max(0, cx0 - overlap)
+		sz, sy, sx = cz1 - cz0, cy1 - cy0, cx1 - cx0
+		center = dt_u8_np[cz0 - rz0:cz0 - rz0 + sz,
+						  cy0 - ry0:cy0 - ry0 + sy,
+						  cx0 - rx0:cx0 - rx0 + sx]
+		for zl in range(0, sz, scaledown):
+			slc = center[zl]
+			if scaledown > 1:
+				oh = max(1, slc.shape[0] // scaledown)
+				ow = max(1, slc.shape[1] // scaledown)
+				slc = cv2.resize(slc, (ow, oh), interpolation=cv2.INTER_AREA)
+			ozi = out_z0 + (cz0 - pred_z0 + zl) // scaledown
+			oyi = out_y0 + (cy0 - pred_y0) // scaledown
+			oxi = out_x0 + (cx0 - pred_x0) // scaledown
+			oy_end = min(int(output_level_arr.shape[1]), oyi + slc.shape[0])
+			ox_end = min(int(output_level_arr.shape[2]), oxi + slc.shape[1])
+			wy = oy_end - oyi
+			wx = ox_end - oxi
+			if ozi < int(output_level_arr.shape[0]) and wy > 0 and wx > 0:
+				output_level_arr[ozi, oyi:oy_end, oxi:ox_end] = slc[:wy, :wx]
+
+	# --- Pipeline: parallel readers → GPU (EDT + encode) → CPU (downsample + write) ---
+	# EDT + signed encoding all on GPU. Only uint8 result transfers to CPU.
+	# GPU work on chunk N overlaps with CPU write of chunk N-1.
+	pending: dict[int, np.ndarray] = {}
+	next_gpu_idx = 0
+	prev_write: tuple | None = None  # (idx, dt_u8_np) awaiting CPU write
+	gpu_stream = cp.cuda.Stream(non_blocking=True)
+
+	def _flush_progress():
+		done_i = next_gpu_idx
+		if done_i == 0:
+			return
+		if progress is not None:
+			progress["edt_done"] = progress.get("edt_done", 0) + 1
+		elapsed = max(1e-6, time.time() - t0)
+		eta = elapsed / done_i * (n_chunks - done_i)
+		overall = ""
+		if progress is not None:
+			oe = max(1e-6, time.time() - progress["t0"])
+			frac = progress.get("tiles_done", 0) / max(1, progress.get("tiles_total", 1))
+			edt_frac = progress.get("edt_done", 0) / max(1, progress.get("edt_total_est", 1))
+			overall_frac = 0.7 * frac + 0.3 * edt_frac
+			if overall_frac > 0.01:
+				overall_eta = oe / overall_frac * (1.0 - overall_frac)
+				overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
+		print(f"\r[pred_dt] chunk {done_i}/{n_chunks} "
+			  f"({100.0 * done_i / n_chunks:.0f}%) "
+			  f"eta {int(eta // 60):02d}:{int(eta % 60):02d}"
+			  f"{overall}  ",
+			  end="", flush=True)
 
 	with _mp.Pool(processes=n_readers) as pool:
 		result_iter = pool.imap_unordered(_edt_read_worker, mp_args)
@@ -744,74 +797,38 @@ def _compute_pred_dt_slab(
 		for idx, binary in result_iter:
 			pending[idx] = binary
 
-			# Process chunks in order as they become available
 			while next_gpu_idx in pending:
-				binary = pending.pop(next_gpu_idx)
-				cz0, cz1, cy0, cy1, cx0, cx1 = work[next_gpu_idx]
+				cur_binary = pending.pop(next_gpu_idx)
 
-				# GPU signed EDT
-				cp.get_default_memory_pool().free_all_blocks()
-				m_gpu = cp.asarray(binary)
-				outer_dt = cp.asnumpy(cnd.distance_transform_edt(~m_gpu)).astype(np.float32)
-				inner_dt = cp.asnumpy(cnd.distance_transform_edt(m_gpu)).astype(np.float32)
-				del m_gpu
-				cp.get_default_memory_pool().free_all_blocks()
+				# GPU: EDT + signed encoding → uint8 (all on GPU)
+				with gpu_stream:
+					m_gpu = cp.asarray(cur_binary)
+					outer_dt = cnd.distance_transform_edt(~m_gpu)
+					inner_dt = cnd.distance_transform_edt(m_gpu)
+					outer_enc = (128 - cp.clip(cp.round(outer_dt), 1, _MAX_DT)).astype(cp.uint8)
+					inner_enc = (127 + cp.clip(cp.round(inner_dt), 1, _MAX_DT)).astype(cp.uint8)
+					dt_enc_gpu = cp.where(m_gpu, inner_enc, outer_enc)
+					del m_gpu, outer_dt, inner_dt, outer_enc, inner_enc
 
-				# Signed encoding
-				outer_enc = (128 - np.clip(np.round(outer_dt), 1, _MAX_DT)).astype(np.uint8)
-				inner_enc = (127 + np.clip(np.round(inner_dt), 1, _MAX_DT)).astype(np.uint8)
-				dt_enc = np.where(binary, inner_enc, outer_enc)
-				del binary, outer_dt, inner_dt, outer_enc, inner_enc
+				# While GPU works, write PREVIOUS chunk to zarr (CPU)
+				if prev_write is not None:
+					_write_encoded(*prev_write)
+					_flush_progress()
 
-				# Crop overlap to center region
-				rz0 = max(0, cz0 - overlap)
-				ry0 = max(0, cy0 - overlap)
-				rx0 = max(0, cx0 - overlap)
-				pzz = cz0 - rz0
-				pyy = cy0 - ry0
-				pxx = cx0 - rx0
-				sz, sy, sx = cz1 - cz0, cy1 - cy0, cx1 - cx0
-				center = dt_enc[pzz:pzz + sz, pyy:pyy + sy, pxx:pxx + sx]
-				del dt_enc
+				# Wait for GPU, transfer only the final uint8 to CPU
+				gpu_stream.synchronize()
+				dt_u8_np = cp.asnumpy(dt_enc_gpu)
+				del dt_enc_gpu
 
-				# Downsample and write
-				for zl in range(0, sz, scaledown):
-					slc = center[zl]
-					if scaledown > 1:
-						oh = max(1, slc.shape[0] // scaledown)
-						ow = max(1, slc.shape[1] // scaledown)
-						slc = cv2.resize(slc, (ow, oh), interpolation=cv2.INTER_AREA)
-					ozi = out_z0 + (cz0 - pred_z0 + zl) // scaledown
-					oyi = out_y0 + (cy0 - pred_y0) // scaledown
-					oxi = out_x0 + (cx0 - pred_x0) // scaledown
-					oy_end = min(int(output_level_arr.shape[1]), oyi + slc.shape[0])
-					ox_end = min(int(output_level_arr.shape[2]), oxi + slc.shape[1])
-					wy = oy_end - oyi
-					wx = ox_end - oxi
-					if ozi < int(output_level_arr.shape[0]) and wy > 0 and wx > 0:
-						output_level_arr[ozi, oyi:oy_end, oxi:ox_end] = slc[:wy, :wx]
-				del center
-
+				prev_write = (next_gpu_idx, dt_u8_np)
 				next_gpu_idx += 1
-				if progress is not None:
-					progress["edt_done"] = progress.get("edt_done", 0) + 1
-				elapsed = max(1e-6, time.time() - t0)
-				eta = elapsed / next_gpu_idx * (n_chunks - next_gpu_idx)
-				overall = ""
-				if progress is not None:
-					oe = max(1e-6, time.time() - progress["t0"])
-					frac = progress.get("tiles_done", 0) / max(1, progress.get("tiles_total", 1))
-					edt_frac = progress.get("edt_done", 0) / max(1, progress.get("edt_total_est", 1))
-					overall_frac = 0.7 * frac + 0.3 * edt_frac
-					if overall_frac > 0.01:
-						overall_eta = oe / overall_frac * (1.0 - overall_frac)
-						overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
-				print(f"\r[pred_dt] chunk {next_gpu_idx}/{n_chunks} "
-					  f"({100.0 * next_gpu_idx / n_chunks:.0f}%) "
-					  f"eta {int(eta // 60):02d}:{int(eta % 60):02d}"
-					  f"{overall}  ",
-					  end="", flush=True)
 
+	# Write last chunk
+	if prev_write is not None:
+		_write_encoded(*prev_write)
+		_flush_progress()
+
+	cp.get_default_memory_pool().free_all_blocks()
 	print(f"\r[pred_dt] {n_chunks} chunks in {time.time() - t0:.1f}s" + " " * 30,
 		  flush=True)
 
