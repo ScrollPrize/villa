@@ -132,17 +132,6 @@ public:
                               int width, int height,
                               const vc::SampleParams& params);
 
-    // Fused plane sampling + LUT: samples and writes ARGB32 directly,
-    // eliminating the intermediate cv::Mat and applyPostProcess pass.
-    // outBuf must have room for width*height pixels (outStride in uint32_t units).
-    int samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
-                                    const cv::Vec3f& origin,
-                                    const cv::Vec3f& vx_step,
-                                    const cv::Vec3f& vy_step,
-                                    int width, int height,
-                                    const vc::SampleParams& params,
-                                    const uint32_t lut[256]);
-
     // Fused plane composite: nearest-neighbor per layer + composite + LUT → ARGB32.
     // No coord matrix. For PlaneSurface composite rendering.
     int samplePlaneCompositeBestEffortARGB32(

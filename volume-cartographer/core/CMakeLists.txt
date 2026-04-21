@@ -24,8 +24,10 @@ add_library(vc_core
         src/cache/VolumeSource.cpp
         src/cache/HttpMetadataFetcher.cpp
         src/cache/BlockCache.cpp
+        src/cache/ChunkData.cpp
         src/cache/IOPool.cpp
         src/cache/BlockPipeline.cpp
+        src/cache/TickCoordinator.cpp
         src/cache/VcDecompressor.cpp
         src/LoadJson.cpp
         src/RemoteUrl.cpp

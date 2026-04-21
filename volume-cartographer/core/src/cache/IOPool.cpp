@@ -72,6 +72,7 @@ void IOPool::submit(const std::vector<ChunkKey>& keys)
     if (keys.empty()) return;
 
     int addedCount = 0;
+    int idleSnapshot = 0;
     {
         std::lock_guard lock(mutex_);
         if (shutdown_) return;
@@ -99,11 +100,13 @@ void IOPool::submit(const std::vector<ChunkKey>& keys)
             queueTotal_++;
             ++addedCount;
         }
+        idleSnapshot = idleCount_;
     }
-    // Wake exactly as many workers as we added items, capped at pool size.
-    // When we'd wake everyone anyway, one notify_all is a single futex op
-    // instead of N sequential notify_one futex_wake syscalls.
-    const int toWake = std::min(addedCount, numThreads_);
+    // Wake only workers actually asleep — busy workers will pick up new
+    // items on their next popNext iteration, so notifying them is a
+    // wasted futex_wake syscall.
+    const int toWake = std::min({addedCount, idleSnapshot, numThreads_});
+    if (toWake <= 0) return;
     if (toWake >= numThreads_) {
         cv_.notify_all();
     } else {
@@ -183,8 +186,13 @@ void IOPool::updateInteractive(const std::vector<ChunkKey>& keys, int targetLeve
             q.insert(q.end(), backlog[lvl].begin(), backlog[lvl].end());
             queueTotal_ += q.size();
         }
-        totalToWake = std::min<size_t>(queueTotal_, size_t(numThreads_));
+        // Clamp wake count by the number of workers actually asleep —
+        // see submit() for the reasoning.
+        totalToWake = std::min<size_t>({queueTotal_,
+                                        size_t(idleCount_),
+                                        size_t(numThreads_)});
     }
+    if (totalToWake == 0) return;
     if (totalToWake >= size_t(numThreads_)) {
         cv_.notify_all();
     } else {
@@ -195,9 +203,15 @@ void IOPool::updateInteractive(const std::vector<ChunkKey>& keys, int targetLeve
 ShardKey IOPool::popNext()
 {
     std::unique_lock lock(mutex_);
-    cv_.wait(lock, [this] {
-        return queueTotal_ > 0 || shutdown_;
-    });
+    if (queueTotal_ == 0 && !shutdown_) {
+        // Advertise idleness before blocking so producers can gate their
+        // notifies on "someone is actually waiting".
+        ++idleCount_;
+        cv_.wait(lock, [this] {
+            return queueTotal_ > 0 || shutdown_;
+        });
+        --idleCount_;
+    }
     if (shutdown_ && queueTotal_ == 0)
         throw std::runtime_error("IOPool shutdown");
 

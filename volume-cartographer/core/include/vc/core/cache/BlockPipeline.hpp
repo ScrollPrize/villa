@@ -9,6 +9,7 @@
 #include <list>
 #include <memory>
 #include <mutex>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -65,7 +66,7 @@ public:
         Config config,
         std::unique_ptr<VolumeSource> source,
         DecompressFn decompress,
-        std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels = {});
+        std::vector<std::unique_ptr<utils::ZarrArray>> diskLevels = {});
 
     ~BlockPipeline();
 
@@ -146,7 +147,7 @@ public:
 
 private:
     Config config_;
-    std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels_;
+    std::vector<std::unique_ptr<utils::ZarrArray>> diskLevels_;
     std::unique_ptr<VolumeSource> source_;
     DecompressFn decompress_;
     // Four fully independent pools — each specialised for one stage so no
@@ -181,16 +182,33 @@ private:
     // least-recently-used shard is evicted. shared_ptr on the buffer so
     // concurrent loaders can serve from the same shard without the cache
     // mutex blocking them.
-    mutable std::mutex shardCacheMutex_;
+    //
+    // Sharded by hash(ShardKey) to reduce mutex contention: with N loader
+    // threads all hitting the same mutex, the LRU splice on every hit
+    // serializes the hot fetch path. kShardCacheBuckets=16 drops contention
+    // to ~1/16 for uniformly distributed shard accesses.
+    //
+    // Budget is SHARED across buckets via the atomic shardCacheGlobalBytes_
+    // counter: any bucket can hold as much as it wants so long as the total
+    // stays under shardCacheBytes. An insert that pushes the global over
+    // budget evicts LRU entries from its OWN bucket until under — preserves
+    // per-bucket LRU semantics while making capacity fluid across uneven
+    // hash distributions (avoids the per-bucket cap starving a hot bucket).
     struct ShardCacheEntry {
         ShardKey key;
         std::shared_ptr<std::vector<std::byte>> bytes;
     };
-    std::list<ShardCacheEntry> shardCacheLru_;  // front = most recent
-    std::unordered_map<ShardKey,
-                       std::list<ShardCacheEntry>::iterator,
-                       ShardKeyHash> shardCacheMap_;
-    size_t shardCacheTotalBytes_ = 0;
+    static constexpr size_t kShardCacheBuckets = 16;
+    struct ShardCacheBucket {
+        mutable std::mutex mutex;
+        std::list<ShardCacheEntry> lru;  // front = most recent
+        std::unordered_map<ShardKey,
+                           std::list<ShardCacheEntry>::iterator,
+                           ShardKeyHash> map;
+        size_t bytes = 0;
+    };
+    mutable std::array<ShardCacheBucket, kShardCacheBuckets> shardCacheBuckets_;
+    std::atomic<size_t> shardCacheGlobalBytes_{0};
     // Hits/misses so the status bar can surface them.
     std::atomic<uint64_t> statShardHits_{0};
     std::atomic<uint64_t> statShardMisses_{0};
@@ -202,11 +220,22 @@ private:
     // Pull the whole shard file for `key` through the LRU cache. First
     // hit from any thread reads the file once; subsequent hits just bump
     // the LRU head and return the shared buffer.
-    std::shared_ptr<std::vector<std::byte>> shardBytesFor(
+    //
+    // Returns a raw pointer valid until the calling thread next invokes
+    // shardBytesFor() — a per-thread shared_ptr keeps the bytes alive
+    // across the caller's brief synchronous use. Returning a raw pointer
+    // instead of shared_ptr eliminates ~2 refcount atomics per call that
+    // were cache-line ping-ponging under 12-thread decode (perf showed
+    // the shared_ptr dtor's LDADDAL at ~20% of total CPU).
+    const std::vector<std::byte>* shardBytesFor(
         const ChunkKey& key, utils::ZarrArray& dz);
 
-    // Insert into the shard cache, evicting LRU until under budget.
-    void shardCacheInsertLocked(const ShardKey& sk,
+    // Map ShardKey → bucket index in shardCacheBuckets_.
+    static size_t shardCacheBucketIndex(const ShardKey& sk) noexcept;
+    // Insert into a specific bucket, evicting per-bucket LRU until under its
+    // share of the total budget.
+    void shardCacheInsertLocked(ShardCacheBucket& b,
+                                const ShardKey& sk,
                                 std::shared_ptr<std::vector<std::byte>> bytes);
 
     BlockCache blockCache_;
@@ -223,8 +252,71 @@ private:
     // 512 identical zero blocks in the arena. blockAt() returns a pointer
     // to a single static zero-block when the block's canonical chunk is
     // in this set.
-    mutable std::mutex emptyChunksMutex_;
-    std::unordered_set<ChunkKey, ChunkKeyHash> emptyChunks_;
+    //
+    // Lock-free hash set. Readers probe with acquire-atomic-loads; writers
+    // (insertChunkAsBlocks / clear) serialize via emptyChunksWriteMutex_
+    // and publish with release-atomic-stores. Every blockAt miss used to
+    // take a shared_mutex → ~2% of CPU in pthread_rwlock at the 12-thread
+    // render path; now just one atomic load per probe step. Entries: 64
+    // bits = [state:2 | chunkHash:62]. False positives on chunkHash are
+    // OK — an "empty" hit is cheap (returns the static zero block) and
+    // correctness is unaffected because the arena still holds the
+    // authoritative data if it's there. In practice false positives are
+    // vanishingly rare (62-bit hash).
+    static constexpr size_t kEmptyChunksBits = 14;  // 16K slots × 8 B = 128 KB
+    static constexpr size_t kEmptyChunksSize = size_t(1) << kEmptyChunksBits;
+    static constexpr size_t kEmptyChunksMask = kEmptyChunksSize - 1;
+    static constexpr uint64_t kEmptyChunksStateMask = 0xC000000000000000ull;
+    static constexpr uint64_t kEmptyChunksOccupied  = 0x8000000000000000ull;
+    static constexpr uint64_t kEmptyChunksHashMask  = 0x3FFFFFFFFFFFFFFFull;
+    std::array<std::atomic<uint64_t>, kEmptyChunksSize> emptyChunksTable_{};
+    mutable std::mutex emptyChunksWriteMutex_;
+    // Lock-free probe for "is this chunk known to be all-zero?".
+    [[nodiscard]] bool isEmptyChunk(const ChunkKey& k) const noexcept {
+        const uint64_t fh = emptyChunkFullHash(k);
+        size_t idx = fh & kEmptyChunksMask;
+        for (size_t probe = 0; probe < kEmptyChunksSize; ++probe) {
+            const uint64_t e = emptyChunksTable_[(idx + probe) & kEmptyChunksMask]
+                                  .load(std::memory_order_acquire);
+            if (e == 0) return false;  // empty → end of probe
+            if ((e & kEmptyChunksStateMask) == kEmptyChunksOccupied
+                && (e & kEmptyChunksHashMask) == fh) {
+                return true;
+            }
+            // mismatched hash: keep probing
+        }
+        return false;
+    }
+    void addEmptyChunk(const ChunkKey& k) noexcept {
+        std::lock_guard lk(emptyChunksWriteMutex_);
+        const uint64_t fh = emptyChunkFullHash(k);
+        size_t idx = fh & kEmptyChunksMask;
+        const uint64_t entry = kEmptyChunksOccupied | fh;
+        for (size_t probe = 0; probe < kEmptyChunksSize; ++probe) {
+            const size_t pos = (idx + probe) & kEmptyChunksMask;
+            const uint64_t e = emptyChunksTable_[pos].load(std::memory_order_relaxed);
+            if (e == 0) {
+                emptyChunksTable_[pos].store(entry, std::memory_order_release);
+                return;
+            }
+            if ((e & kEmptyChunksHashMask) == fh) return;  // already present
+        }
+        // Table full — in practice won't happen, we have 16K slots.
+    }
+    void clearEmptyChunks() noexcept {
+        std::lock_guard lk(emptyChunksWriteMutex_);
+        for (auto& e : emptyChunksTable_) e.store(0, std::memory_order_relaxed);
+    }
+    static uint64_t emptyChunkFullHash(const ChunkKey& k) noexcept {
+        // 62-bit hash of (level, iz, iy, ix). Collision rate 1/2^62 —
+        // negligible even over the program's lifetime.
+        uint64_t h = ChunkKeyHash{}(k);
+        h = (h ^ (h >> 31)) * 0x9E3779B97F4A7C15ull;
+        h = (h ^ (h >> 27)) * 0xBF58476D1CE4E5B9ull;
+        h ^= h >> 32;
+        h &= kEmptyChunksHashMask;
+        return h == 0 ? 1 : h;  // reserve 0 for "empty slot" sentinel
+    }
 
     // Negative cache (same design as before).
     static constexpr size_t kBloomBits = 65536;
@@ -240,10 +332,29 @@ private:
     std::atomic<ChunkReadyCallbackId> nextListenerId_{1};
     std::atomic<bool> chunkArrivedFlag_{false};
 
+    // fetchInteractive dedup: the renderer calls fetchInteractive every
+    // frame, but when the viewport is idle the keys + targetLevel are
+    // identical back-to-back, and identical across multiple viewers. A
+    // commutative XOR hash of (key, targetLevel) + the BlockCache eviction
+    // version is enough to detect "nothing has changed since we last did
+    // the expensive probe/classify/updateInteractive work" and skip.
+    // Guarded by fetchInteractiveDedupMutex_ so cross-viewer calls
+    // serialize their compare-and-update of the stored state — without it
+    // two identical calls could both see a stale match and each do the
+    // work, defeating the dedup.
+    mutable std::mutex fetchInteractiveDedupMutex_;
+    uint64_t lastFetchInteractiveHash_ = 0;
+    uint64_t lastFetchInteractiveEviction_ = 0;
+    int lastFetchInteractiveTargetLevel_ = -1;
+    bool haveLastFetchInteractive_ = false;
+
     mutable std::mutex dataBoundsMutex_;
     DataBoundsL0 dataBoundsL0_;
 
-    mutable std::atomic<uint64_t> statBlockHits_{0};
+    // Hits from the empty-chunk canonical zero block (cold path in blockAt).
+    // The hot-path block hit counter lives in BlockCache::shards_ — a single
+    // atomic here saturated a cacheline under 12-thread render.
+    mutable std::atomic<uint64_t> statEmptyHits_{0};
     std::atomic<uint64_t> statColdHits_{0};
     std::atomic<uint64_t> statIceFetches_{0};
     std::atomic<uint64_t> statDiskWrites_{0};
