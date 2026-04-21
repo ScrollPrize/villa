@@ -42,7 +42,7 @@ class PlaneSurface;
 #define CTiledVolumeViewer CAdaptiveVolumeViewer
 
 // Adaptive per-pixel volume viewer. Renders a PlaneSurface via
-// samplePlaneAdaptiveARGB32 directly to a viewport-sized framebuffer,
+// sampleAdaptiveARGB32 directly to a viewport-sized framebuffer,
 // with composite post-process (CLAHE, raking light), intersections,
 // and overlays.
 class CAdaptiveVolumeViewer : public QWidget, public VolumeViewerBase
@@ -81,7 +81,15 @@ public:
     VCCollection* pointCollection() const override { return _pointCollection; }
 
     // --- Settings passthrough ---
+    // Equality guards: Qt UI routinely fires value-changed signals even
+    // when the user's action rounds to the same stored value (e.g. a
+    // drag-release that reports the current spinbox value). Without the
+    // guard we'd queue a real render for every no-op signal — the 16 ms
+    // coalesce timer still fires, but it triggers a full frame for zero
+    // visible change. Skipping identical settings keeps the pipeline
+    // idle when nothing actually changed.
     void setCompositeRenderSettings(const CompositeRenderSettings& s) {
+        if (_compositeSettings == s) return;
         _compositeSettings = s;
         scheduleRender();
     }
@@ -92,7 +100,11 @@ public:
     void setVolumeWindow(float low, float high);
     float volumeWindowLow() const { return _windowLow; }
     float volumeWindowHigh() const { return _windowHigh; }
-    void setBaseColormap(const std::string& id) { _baseColormapId = id; scheduleRender(); }
+    void setBaseColormap(const std::string& id) {
+        if (_baseColormapId == id) return;
+        _baseColormapId = id;
+        scheduleRender();
+    }
     void setStretchValues(bool) { scheduleRender(); }
 
     // --- Display stubs ---
@@ -267,6 +279,19 @@ private:
     QTimer* _renderTimer = nullptr;
     bool _renderPending = false;
 
+    // Progressive rendering: during live interaction (pan drag, zoom wheel
+    // events) we render at +1 pyramid level for faster frames. When the
+    // user stops interacting, an idle timer fires and we kick a full-res
+    // render to catch up. This trades a slightly-softer image during
+    // motion for materially lower frame time, which in turn makes pans/
+    // zooms feel smoother without touching the sample kernel.
+    QTimer* _interactionIdleTimer = nullptr;
+    bool _interactive = false;
+    // Increment on every interactive event; submitRender captures the
+    // value before dispatching. If it changes while a render is in flight
+    // we know the user acted again and we should keep rendering.
+    void beginInteraction();
+
     // --- Framebuffer ---
     QImage _framebuffer;
     // Per-pixel pyramid-level tag (0 = desired, 1..5 = fallback depth).
@@ -319,6 +344,21 @@ private:
     int _normalMaxArrows = 32;
     QString _lastStatusText;
     std::chrono::steady_clock::time_point _lastStatusUpdate{};
+    // FPS tracking — ring buffer of recent submitRender() timestamps.
+    // Status label reads the newest minus the oldest to get an averaged
+    // fps number; single-frame interval is too noisy to display.
+    // FPS ring stores per-frame render DURATIONS (seconds), not render
+    // timestamps. The reported value is 1 / mean(duration) — i.e., the
+    // theoretical framerate we would sustain at our measured render
+    // cost. Decouples the readout from user-input pacing so an idle
+    // viewer doesn't read 0 FPS and a held-button pan doesn't read the
+    // timer interval as "60 fps".
+    static constexpr int kFpsRingSize = 32;
+    std::array<double, kFpsRingSize> _renderDurationsSec{};
+    int _renderDurationHead = 0;
+    int _renderDurationCount = 0;
+    void recordRenderDuration(double seconds);
+    float measuredFps() const;
     std::chrono::steady_clock::time_point _lastStretchScan{};
     cv::Ptr<cv::CLAHE> _claheCache;
     int _claheCacheTile = -1;
@@ -405,4 +445,9 @@ private:
     vc::cache::BlockPipeline::ChunkReadyCallbackId _chunkCbId = 0;
     bool _hadValidDataBounds = false;
     bool _dirtyWhileMinimized = false;
+
+    // TickCoordinator viewport slot. Acquired lazily on first publish and
+    // released in the destructor. -1 means "no slot" (either coordinator
+    // missing, or allocation table was full at ctor time).
+    int _tickViewportSlot = -1;
 };
