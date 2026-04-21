@@ -63,7 +63,24 @@ struct ChunkData {
     [[nodiscard]] constexpr int strideX() const noexcept { return 1; }
 };
 
-using ChunkDataPtr = std::shared_ptr<ChunkData>;
+// Custom deleter that returns released ChunkData objects to a per-thread
+// pool instead of freeing them. A decoded canonical chunk is ~2 MB, so
+// linux's malloc implementation routes the `bytes` vector through mmap —
+// every decode/discard cycle pays kernel page-zero + page-table edit +
+// memcg accounting cost (saw ~30% of CPU in kernel mm on heavy decode
+// runs). Recycling keeps the underlying std::vector capacity alive across
+// chunks on the same thread so the next decode reuses the backing pages.
+// Pool size is capped per-thread to keep memory usage bounded.
+struct ChunkDataPoolDeleter {
+    void operator()(ChunkData* p) const noexcept;
+};
+using ChunkDataPtr = std::unique_ptr<ChunkData, ChunkDataPoolDeleter>;
+
+// Factory: returns a reset-state ChunkData from the thread-local pool,
+// or heap-allocates a fresh one when the pool is empty. Producers should
+// use this instead of `std::make_unique<ChunkData>()` so the buffer
+// capacity recycles between decodes.
+[[nodiscard]] ChunkDataPtr acquireChunkData() noexcept;
 
 // Callback signature for decompressing raw bytes into ChunkData.
 // The cache itself is compression-agnostic; the caller provides this.

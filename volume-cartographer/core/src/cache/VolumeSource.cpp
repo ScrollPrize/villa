@@ -1,4 +1,5 @@
 #include "vc/core/cache/VolumeSource.hpp"
+#include "vc/core/cache/BlockCache.hpp"
 #include "vc/core/cache/CacheDebugLog.hpp"
 #include "vc/core/cache/CacheUtils.hpp"
 
@@ -83,6 +84,21 @@ void FileSystemSource::discoverLevels()
                 lm.shape = {int(meta.shape[0]), int(meta.shape[1]), int(meta.shape[2])};
             if (cs.size() >= 3)
                 lm.chunkShape = {int(cs[0]), int(cs[1]), int(cs[2])};
+            // 16³ blocks are the fixed storage unit; chunks must tile cleanly.
+            // Arbitrary multiples of 16 on each axis are fine (128³, 64³,
+            // 192³, non-cubic 32x128x128, etc.) — just not 100, 50, 96 etc.
+            for (int d = 0; d < 3; ++d) {
+                if (lm.chunkShape[d] <= 0 || lm.chunkShape[d] % kBlockSize != 0) {
+                    throw std::runtime_error(
+                        "zarr level " + std::to_string(lvl) + " at " +
+                        levelPath.string() + " has chunk shape " +
+                        std::to_string(lm.chunkShape[0]) + "x" +
+                        std::to_string(lm.chunkShape[1]) + "x" +
+                        std::to_string(lm.chunkShape[2]) +
+                        "; each axis must be a positive multiple of " +
+                        std::to_string(kBlockSize));
+                }
+            }
             levels_.push_back(lm);
         } catch (const std::exception& e) {
             if (auto* log = cacheDebugLog())

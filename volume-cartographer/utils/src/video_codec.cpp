@@ -93,8 +93,10 @@ void fill_y_plane(
 
 }  // namespace
 
-auto video_encode(std::span<const std::byte> raw, const VideoCodecParams& params)
-    -> std::vector<std::byte>
+void video_encode_into(
+    std::span<const std::byte> raw,
+    const VideoCodecParams& params,
+    std::vector<std::byte>& output)
 {
     const int Z = params.depth, Y = params.height, X = params.width;
     if (Z <= 0 || Y <= 0 || X <= 0)
@@ -173,7 +175,11 @@ auto video_encode(std::span<const std::byte> raw, const VideoCodecParams& params
     auto pic_guard = std::unique_ptr<x265_picture, void (*)(x265_picture*)>(
         pic, x265_picture_free);
 
-    std::vector<uint8_t> yBuf(padW * padH, 0);
+    // Thread-local Y-plane scratch. padW/padH can differ across calls when
+    // chunk dims vary between volume levels, so grow on demand; capacity
+    // sticks at the largest padW*padH this thread has ever encoded.
+    thread_local std::vector<uint8_t> yBuf;
+    yBuf.assign(size_t(padW) * padH, 0);
     pic->planes[0] = yBuf.data();
     pic->planes[1] = nullptr;
     pic->planes[2] = nullptr;
@@ -185,7 +191,9 @@ auto video_encode(std::span<const std::byte> raw, const VideoCodecParams& params
     const int air_clamp = std::max(0, std::min(255, params.air_clamp));
     const int shift_n = std::max(0, std::min(7, params.shift_n));
 
-    std::vector<std::byte> output;
+    // Clear the caller's buffer but retain capacity so streaming callers
+    // with a thread-local output vector don't reallocate on every chunk.
+    output.clear();
     write_header(output, params.qp, Z, Y, X, air_clamp, shift_n);
 
     x265_nal* nals = nullptr;
@@ -214,14 +222,20 @@ auto video_encode(std::span<const std::byte> raw, const VideoCodecParams& params
             std::memcpy(output.data() + old, nals[i].payload, nals[i].sizeBytes);
         }
     }
+}
 
+auto video_encode(std::span<const std::byte> raw, const VideoCodecParams& params)
+    -> std::vector<std::byte>
+{
+    std::vector<std::byte> output;
+    video_encode_into(raw, params, output);
     return output;
 }
 
-auto video_decode(
+void video_decode_into(
     std::span<const std::byte> compressed,
-    std::size_t out_size,
-    const VideoCodecParams& /*params*/) -> std::vector<std::byte>
+    std::span<std::byte> output,
+    const VideoCodecParams& /*params*/)
 {
     if (compressed.size() < HEADER_SIZE)
         throw std::runtime_error("video_decode: input too small for header");
@@ -232,8 +246,9 @@ auto video_decode(
     int Y = static_cast<int>(read_le32(compressed.data() + 12));
     int X = static_cast<int>(read_le32(compressed.data() + 16));
 
+    const std::size_t out_size = output.size();
     if (out_size != static_cast<std::size_t>(Z) * Y * X)
-        throw std::runtime_error("video_decode: out_size mismatch with header dimensions");
+        throw std::runtime_error("video_decode: output size mismatch with header dimensions");
 
     int air_clamp = static_cast<int>(static_cast<uint8_t>(compressed[20]));
     int shift_n = static_cast<int>(static_cast<uint8_t>(compressed[21]));
@@ -258,7 +273,13 @@ auto video_decode(
     }
     de265_reset(ctx);
 
-    std::vector<std::byte> output(out_size, std::byte{0});
+    // Caller owns `output`. Zero-fill so error paths where the decoder
+    // produces fewer than Z frames leave the tail as zero (matches the
+    // legacy allocate-and-init behaviour) — callers see a fully valid
+    // buffer even on partial decode. The saved cost relative to the
+    // previous implementation is one 2 MiB std::vector allocation + one
+    // 2 MiB memcpy per chunk; the zero-fill itself is unavoidable here.
+    std::memset(output.data(), 0, output.size());
     int framesDecoded = 0;
 
     auto extractFrames = [&]() {
@@ -304,7 +325,15 @@ auto video_decode(
             p[i] = v;
         }
     }
+}
 
+auto video_decode(
+    std::span<const std::byte> compressed,
+    std::size_t out_size,
+    const VideoCodecParams& params) -> std::vector<std::byte>
+{
+    std::vector<std::byte> output(out_size);
+    video_decode_into(compressed, std::span{output}, params);
     return output;
 }
 

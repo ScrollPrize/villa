@@ -51,12 +51,31 @@ struct VideoCodecParams {
 [[nodiscard]] std::vector<std::byte> video_encode(
     std::span<const std::byte> raw, const VideoCodecParams& params);
 
+// In-place variant: writes encoded bitstream into caller-owned `output`.
+// Replaces `output`'s contents (clears then fills). Allows callers to
+// reuse a thread-local buffer across chunks — eliminates the per-chunk
+// std::vector allocation that was a steady source of swap pressure
+// during streaming sessions.
+void video_encode_into(
+    std::span<const std::byte> raw,
+    const VideoCodecParams& params,
+    std::vector<std::byte>& output);
+
 // Decode an H.265 bitstream back to a 3D chunk.
 // Input: compressed bitstream bytes (VC3D header + H.265 NALUs).
 // out_size: expected decompressed size (depth * height * width).
 // Returns: raw uint8 voxel data in row-major (Z, Y, X) order.
 [[nodiscard]] std::vector<std::byte> video_decode(
     std::span<const std::byte> compressed, std::size_t out_size,
+    const VideoCodecParams& params);
+
+// Zero-copy variant: write decoded voxels directly into `output`. Avoids
+// the ~2 MiB interim allocation + zero-init + memcpy that the std::vector
+// return form does on every call. Caller pre-sizes `output` to match the
+// expected depth × height × width. Throws on header-size mismatch.
+void video_decode_into(
+    std::span<const std::byte> compressed,
+    std::span<std::byte> output,
     const VideoCodecParams& params);
 
 // Check if a compressed buffer has the VC3D video codec magic header.
