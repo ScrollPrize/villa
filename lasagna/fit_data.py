@@ -455,19 +455,27 @@ def load_3d(
 		raise ValueError(f"lasagna volume missing required channels: {miss}; available={all_ch}")
 
 	def _read_channel(name: str) -> torch.Tensor:
-		"""Read a single channel from its group zarr."""
+		"""Read a single channel from its group zarr.
+
+		Supports both 3D (Z,Y,X) OME-Zarr level arrays and legacy
+		4D (C,Z,Y,X) zarr arrays.
+		"""
 		group, ch_idx = vol.channel_group(name)
 		zarr_path = str(vol.path.parent / group.zarr_path)
 		zsrc = zarr.open(zarr_path, mode="r")
 		if not isinstance(zsrc, zarr.Array):
 			raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
 		shape = tuple(int(v) for v in zsrc.shape)
-		if len(shape) != 4:
-			raise ValueError(f"expected 4D CZYX zarr at {zarr_path}, got shape={shape}")
+		is_3d = len(shape) == 3
+		if not is_3d and len(shape) != 4:
+			raise ValueError(f"expected 3D or 4D zarr at {zarr_path}, got shape={shape}")
 
 		# Full base-to-zarr factor: crop is in base coords
 		ds_i = int(round(group.scaledown * s2b))
-		C, Z_all, Y_all, X_all = shape
+		if is_3d:
+			Z_all, Y_all, X_all = shape
+		else:
+			C, Z_all, Y_all, X_all = shape
 
 		if crop is not None:
 			x0, y0, z0, cw, ch, cd = (int(v) for v in crop)
@@ -485,7 +493,10 @@ def load_3d(
 			  f"ds_base={ds_i} (sd={group.scaledown}*s2b={s2b}) shape={shape} "
 			  f"z=[{z0v}:{z1v}] y=[{y0v}:{y1v}] x=[{x0v}:{x1v}]", flush=True)
 
-		a = np.asarray(zsrc[ch_idx, z0v:z1v, y0v:y1v, x0v:x1v])
+		if is_3d:
+			a = np.asarray(zsrc[z0v:z1v, y0v:y1v, x0v:x1v])
+		else:
+			a = np.asarray(zsrc[ch_idx, z0v:z1v, y0v:y1v, x0v:x1v])
 		t = torch.from_numpy(a).to(device=device, dtype=torch.uint8)
 		return t.unsqueeze(0).unsqueeze(0)  # (1, 1, Z, Y, X)
 
