@@ -43,6 +43,7 @@ class VCDataset(Dataset):
             # return_as_tensor: bool = True, # Forcing True below
             domain: Optional[str] = None,
             skip_empty_patches: bool = True,  # Whether to skip empty (homogeneous) patches
+            anon: bool = False,  # Use anonymous (unsigned) requests for S3 input paths
             ):
         """
         Dataset for nnUNet inference using the Volume class for data access and preprocessing.
@@ -84,6 +85,7 @@ class VCDataset(Dataset):
         self.mode = mode
         self.return_as_tensor = True # Dataset __getitem__ always returns tensors
         self.skip_empty_patches = skip_empty_patches
+        self.anon = anon
         self.empty_patches_skipped = 0  # Counter for skipped patches
         self.non_empty_mask = None  # Per-patch bool mask; populated below for infer mode with zarr input
 
@@ -199,7 +201,8 @@ class VCDataset(Dataset):
                 return_as_tensor=self.return_as_tensor, # Ensure Volume returns tensors directly
                 verbose=verbose,
                 domain=domain,
-                path=use_path
+                path=use_path,
+                anon=self.anon,
             )
 
             # Get shape and dtype from the primary resolution level (0)

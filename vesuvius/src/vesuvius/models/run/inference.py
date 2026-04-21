@@ -74,6 +74,7 @@ class Inferer():
                  compression_level: int = 1,
                  hf_token: str = None,
                  model_type: str = 'auto',
+                 input_anon: bool = False,
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -106,6 +107,7 @@ class Inferer():
         self.compression_level = compression_level
         self.hf_token = hf_token
         self.model_type = model_type
+        self.input_anon = input_anon
         self.model_patch_size = None
         self.num_classes = None
 
@@ -492,7 +494,8 @@ class Inferer():
             scroll_id=self.scroll_id,
             segment_id=self.segment_id,
             energy=self.energy,
-            resolution=self.resolution
+            resolution=self.resolution,
+            anon=self.input_anon,
         )
 
         expected_attr_name = 'all_positions'
@@ -837,6 +840,10 @@ def main():
     parser.add_argument('--model_path', type=str, required=True,
                       help='Path to nnUNet model folder, train.py .pth, or external model path (when enabled)')
     parser.add_argument('--input_dir', type=str, required=True, help='Path to the input Zarr volume')
+    parser.add_argument('--input_anon', action='store_true',
+                      help='Use anonymous (unsigned) S3 requests for the input volume. '
+                           'Required when reading from a public bucket while AWS credentials '
+                           'are configured for writes to a different bucket.')
     parser.add_argument('--output_dir', type=str, required=True, help='Path to store output predictions')
     parser.add_argument('--input_format', type=str, default='zarr', help='Input format (zarr, volume)')
     parser.add_argument('--tta_type', type=str, default='mirroring', choices=['mirroring', 'rotation'],
@@ -936,7 +943,8 @@ def main():
         compression_level=args.zarr_compression_level,
         # Pass Hugging Face parameters
         hf_token=args.hf_token,
-        model_type=args.model_type
+        model_type=args.model_type,
+        input_anon=args.input_anon,
     )
 
     try:
