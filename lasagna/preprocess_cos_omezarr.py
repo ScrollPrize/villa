@@ -658,9 +658,28 @@ def _release_memmap_pages(arr: np.ndarray, z0: int, z1: int) -> None:
 		pass  # best effort — non-critical
 
 
+def _edt_read_worker(args):
+	"""Multiprocessing worker: open zarr, read chunk with overlap, binarize.
+
+	Each worker opens its own zarr handle (zarr3 is not safe for concurrent
+	reads from a shared handle).  Returns (chunk_index, binary_array).
+	"""
+	idx, pred_path, cz0, cz1, cy0, cy1, cx0, cx1, overlap, pZ, pY, pX = args
+	pred = zarr.open(str(pred_path), mode="r")
+	rz0 = max(0, cz0 - overlap)
+	rz1 = min(pZ, cz1 + overlap)
+	ry0 = max(0, cy0 - overlap)
+	ry1 = min(pY, cy1 + overlap)
+	rx0 = max(0, cx0 - overlap)
+	rx1 = min(pX, cx1 + overlap)
+	raw = np.asarray(pred[rz0:rz1, ry0:ry1, rx0:rx1])
+	return idx, (raw > 0)
+
+
 def _compute_pred_dt_slab(
 	*,
 	pred_zarr,
+	pred_path: str,
 	output_level_arr,
 	pred_z0: int, pred_z1: int,
 	pred_y0: int, pred_y1: int,
@@ -670,47 +689,65 @@ def _compute_pred_dt_slab(
 	overlap: int = 48,
 	edt_chunk: int = 448,
 	progress: dict | None = None,
+	read_workers: int = 0,
 ) -> None:
 	"""Compute signed distance-to-surface for a region, chunked for GPU EDT.
 
-	Iterates sub-chunks of size *edt_chunk* in all 3 axes with *overlap*
-	padding (must be >= MAX_DT=48 for correct boundary distances).
-	Each sub-chunk: read → binarize → GPU EDT → signed encode → crop
-	overlap → downsample → write to *output_level_arr* (3D).
+	Pipeline: multiprocessing workers read+binarize chunks from zarr in
+	parallel (each opens its own handle to avoid zarr3 concurrency issues),
+	feeding a buffer of ready chunks.  The main process pulls chunks in
+	order and runs GPU EDT, keeping the GPU saturated while I/O happens
+	in the background.
 	"""
 	if not _HAS_CUPY:
 		raise ImportError("pred-dt requires CuPy for GPU EDT")
 
+	import multiprocessing as _mp
+
 	_MAX_DT = 48
 	pZ, pY, pX = (int(v) for v in pred_zarr.shape)
 
-	# Build chunk grid over the requested region
-	z_starts = list(range(pred_z0, pred_z1, edt_chunk))
-	y_starts = list(range(pred_y0, pred_y1, edt_chunk))
-	x_starts = list(range(pred_x0, pred_x1, edt_chunk))
-	n_chunks = len(z_starts) * len(y_starts) * len(x_starts)
-	chunk_i = 0
-	t0 = time.time()
-
-	for cz0 in z_starts:
+	# Build work list
+	work: list[tuple[int, int, int, int, int, int]] = []
+	for cz0 in range(pred_z0, pred_z1, edt_chunk):
 		cz1 = min(pred_z1, cz0 + edt_chunk)
-		for cy0 in y_starts:
+		for cy0 in range(pred_y0, pred_y1, edt_chunk):
 			cy1 = min(pred_y1, cy0 + edt_chunk)
-			for cx0 in x_starts:
+			for cx0 in range(pred_x0, pred_x1, edt_chunk):
 				cx1 = min(pred_x1, cx0 + edt_chunk)
-				chunk_i += 1
+				work.append((cz0, cz1, cy0, cy1, cx0, cx1))
 
-				# Read with overlap padding
-				rz0 = max(0, cz0 - overlap)
-				rz1 = min(pZ, cz1 + overlap)
-				ry0 = max(0, cy0 - overlap)
-				ry1 = min(pY, cy1 + overlap)
-				rx0 = max(0, cx0 - overlap)
-				rx1 = min(pX, cx1 + overlap)
+	n_chunks = len(work)
+	if n_chunks == 0:
+		return
 
-				chunk_np = np.asarray(pred_zarr[rz0:rz1, ry0:ry1, rx0:rx1])
-				binary = chunk_np > 0
-				del chunk_np
+	# Build args for multiprocessing workers
+	mp_args = []
+	for idx, (cz0, cz1, cy0, cy1, cx0, cx1) in enumerate(work):
+		mp_args.append((idx, pred_path, cz0, cz1, cy0, cy1, cx0, cx1, overlap, pZ, pY, pX))
+
+	t0 = time.time()
+	n_readers = min(read_workers if read_workers > 0 else max(1, (os.cpu_count() or 4) // 2),
+				   n_chunks)
+
+	# Launch reader pool — results come back as (idx, binary_array)
+	# imap_unordered for throughput, we reorder by idx
+	pending: dict[int, np.ndarray] = {}
+	next_gpu_idx = 0
+
+	print(f"[pred_dt] {n_chunks} chunks, {n_readers} read workers, edt_chunk={edt_chunk}",
+		  flush=True)
+
+	with _mp.Pool(processes=n_readers) as pool:
+		result_iter = pool.imap_unordered(_edt_read_worker, mp_args)
+
+		for idx, binary in result_iter:
+			pending[idx] = binary
+
+			# Process chunks in order as they become available
+			while next_gpu_idx in pending:
+				binary = pending.pop(next_gpu_idx)
+				cz0, cz1, cy0, cy1, cx0, cx1 = work[next_gpu_idx]
 
 				# GPU signed EDT
 				cp.get_default_memory_pool().free_all_blocks()
@@ -727,57 +764,56 @@ def _compute_pred_dt_slab(
 				del binary, outer_dt, inner_dt, outer_enc, inner_enc
 
 				# Crop overlap to center region
-				pz = cz0 - rz0
-				py = cy0 - ry0
-				px = cx0 - rx0
-				sz = cz1 - cz0
-				sy = cy1 - cy0
-				sx = cx1 - cx0
-				center = dt_enc[pz:pz + sz, py:py + sy, px:px + sx]
+				rz0 = max(0, cz0 - overlap)
+				ry0 = max(0, cy0 - overlap)
+				rx0 = max(0, cx0 - overlap)
+				pzz = cz0 - rz0
+				pyy = cy0 - ry0
+				pxx = cx0 - rx0
+				sz, sy, sx = cz1 - cz0, cy1 - cy0, cx1 - cx0
+				center = dt_enc[pzz:pzz + sz, pyy:pyy + sy, pxx:pxx + sx]
 				del dt_enc
 
-				# Downsample and write to output level array
+				# Downsample and write
 				for zl in range(0, sz, scaledown):
 					slc = center[zl]
 					if scaledown > 1:
 						oh = max(1, slc.shape[0] // scaledown)
 						ow = max(1, slc.shape[1] // scaledown)
 						slc = cv2.resize(slc, (ow, oh), interpolation=cv2.INTER_AREA)
-					# Output coords: map from pred coords to output level coords
 					ozi = out_z0 + (cz0 - pred_z0 + zl) // scaledown
 					oyi = out_y0 + (cy0 - pred_y0) // scaledown
 					oxi = out_x0 + (cx0 - pred_x0) // scaledown
-					oy1 = min(int(output_level_arr.shape[1]), oyi + slc.shape[0])
-					ox1 = min(int(output_level_arr.shape[2]), oxi + slc.shape[1])
-					wy = oy1 - oyi
-					wx = ox1 - oxi
+					oy_end = min(int(output_level_arr.shape[1]), oyi + slc.shape[0])
+					ox_end = min(int(output_level_arr.shape[2]), oxi + slc.shape[1])
+					wy = oy_end - oyi
+					wx = ox_end - oxi
 					if ozi < int(output_level_arr.shape[0]) and wy > 0 and wx > 0:
-						output_level_arr[ozi, oyi:oy1, oxi:ox1] = slc[:wy, :wx]
+						output_level_arr[ozi, oyi:oy_end, oxi:ox_end] = slc[:wy, :wx]
 				del center
 
+				next_gpu_idx += 1
 				if progress is not None:
 					progress["edt_done"] = progress.get("edt_done", 0) + 1
 				elapsed = max(1e-6, time.time() - t0)
-				eta = elapsed / chunk_i * (n_chunks - chunk_i)
+				eta = elapsed / next_gpu_idx * (n_chunks - next_gpu_idx)
 				overall = ""
 				if progress is not None:
 					oe = max(1e-6, time.time() - progress["t0"])
 					frac = progress.get("tiles_done", 0) / max(1, progress.get("tiles_total", 1))
-					# Weight: tiles are ~70% of work, edt ~30% (rough)
 					edt_frac = progress.get("edt_done", 0) / max(1, progress.get("edt_total_est", 1))
 					overall_frac = 0.7 * frac + 0.3 * edt_frac
 					if overall_frac > 0.01:
 						overall_eta = oe / overall_frac * (1.0 - overall_frac)
 						overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
-				print(f"\r[pred_dt] chunk {chunk_i}/{n_chunks} "
-					  f"({100.0 * chunk_i / n_chunks:.0f}%) "
+				print(f"\r[pred_dt] chunk {next_gpu_idx}/{n_chunks} "
+					  f"({100.0 * next_gpu_idx / n_chunks:.0f}%) "
 					  f"eta {int(eta // 60):02d}:{int(eta % 60):02d}"
 					  f"{overall}  ",
 					  end="", flush=True)
 
-	if n_chunks > 0:
-		print(f"\r[pred_dt] {n_chunks} chunks in {time.time() - t0:.1f}s" + " " * 20,
-			  flush=True)
+	print(f"\r[pred_dt] {n_chunks} chunks in {time.time() - t0:.1f}s" + " " * 30,
+		  flush=True)
 
 
 def _compute_pred_dt_channel(
@@ -1859,6 +1895,7 @@ def run_preprocess_3d(
 							pdt_x1 = int(pred_dt_zarr.shape[2])
 						_compute_pred_dt_slab(
 							pred_zarr=pred_dt_zarr,
+							pred_path=pred_dt_path,
 							output_level_arr=dt_lv_arr,
 							pred_z0=pdt_z0, pred_z1=pdt_z1,
 							pred_y0=pdt_y0, pred_y1=pdt_y1,
