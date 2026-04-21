@@ -2,7 +2,10 @@ import torch
 import numpy as np
 import zarr
 import os
+import fcntl
+import hashlib
 import multiprocessing
+import subprocess
 import threading
 import fsspec
 import numcodecs
@@ -43,6 +46,59 @@ class _InferenceDeepSupervisionWrapper(torch.nn.Module):
         return self._collapse(self.network(*args, **kwargs))
 
 
+DEFAULT_MODEL_CACHE_DIR = os.environ.get('VESUVIUS_MODEL_CACHE_DIR', '/tmp/vesuvius-models')
+
+
+def _resolve_model_path(model_path: str, cache_dir: str, verbose: bool = False) -> str:
+    """Resolve a model_path, downloading from S3 to a local cache if needed.
+
+    For s3:// URLs, runs `aws s3 sync` into `<cache_dir>/<sha256(url)>/` and
+    returns the local directory path. A `.done` sentinel marks successful
+    completion so re-runs reuse the cache. Concurrent downloads of the same
+    model are serialized with fcntl.flock on a per-model lockfile.
+
+    For non-S3 paths, returns the input unchanged.
+    """
+    if not isinstance(model_path, str) or not model_path.startswith('s3://'):
+        return model_path
+
+    os.makedirs(cache_dir, exist_ok=True)
+    key = hashlib.sha256(model_path.encode('utf-8')).hexdigest()[:16]
+    target = os.path.join(cache_dir, key)
+    done = target + '.done'
+    lock_path = target + '.lock'
+
+    if os.path.exists(done):
+        if verbose:
+            print(f"Model cache hit: {model_path} -> {target}")
+        return target
+
+    with open(lock_path, 'w') as lock_fh:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        # Re-check after acquiring the lock in case another process completed.
+        if os.path.exists(done):
+            if verbose:
+                print(f"Model cache hit after lock: {model_path} -> {target}")
+            return target
+
+        print(f"Downloading model from {model_path} to {target}")
+        os.makedirs(target, exist_ok=True)
+        result = subprocess.run(
+            ['aws', 's3', 'sync', model_path.rstrip('/') + '/', target],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"aws s3 sync failed for {model_path} (exit {result.returncode})"
+            )
+        # Sentinel written only after a successful sync so partial downloads
+        # never appear cached.
+        open(done, 'w').close()
+        print(f"Model cached at {target}")
+
+    return target
+
+
 class Inferer():
     def __init__(self,
                  model_path: str = None,
@@ -75,6 +131,7 @@ class Inferer():
                  hf_token: str = None,
                  model_type: str = 'auto',
                  input_anon: bool = False,
+                 model_cache_dir: str = DEFAULT_MODEL_CACHE_DIR,
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -108,6 +165,7 @@ class Inferer():
         self.hf_token = hf_token
         self.model_type = model_type
         self.input_anon = input_anon
+        self.model_cache_dir = model_cache_dir
         self.model_patch_size = None
         self.num_classes = None
 
@@ -164,6 +222,12 @@ class Inferer():
 
 
     def _load_model(self):
+        # Download+cache S3 model paths to a local directory before loading.
+        # hf:// URLs are handled by load_model_for_inference via huggingface_hub.
+        self.model_path = _resolve_model_path(
+            self.model_path, self.model_cache_dir, verbose=self.verbose
+        )
+
         # check if model_path is a Hugging Face model path (starts with "hf://")
         if isinstance(self.model_path, str) and self.model_path.startswith("hf://"):
             hf_model_path = self.model_path.replace("hf://", "")
@@ -889,6 +953,10 @@ def main():
     parser.add_argument('--model-type', type=str, default='auto',
                       choices=['auto', 'nnunet', 'train_py', 'resnet'],
                       help='Model loader type. Use "resnet" for external ink_model.py + .pth loading.')
+    parser.add_argument('--model_cache_dir', type=str, default=DEFAULT_MODEL_CACHE_DIR,
+                      help=f'Local directory used to cache models downloaded from S3. '
+                           f'Only applies when --model_path is an s3:// URL. '
+                           f'Default: {DEFAULT_MODEL_CACHE_DIR}')
     
     args = parser.parse_args()
     
@@ -945,6 +1013,7 @@ def main():
         hf_token=args.hf_token,
         model_type=args.model_type,
         input_anon=args.input_anon,
+        model_cache_dir=args.model_cache_dir,
     )
 
     try:
