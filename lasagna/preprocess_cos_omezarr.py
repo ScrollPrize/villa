@@ -754,9 +754,21 @@ def _compute_pred_dt_slab(
 
 	# Align edt_chunk to output zarr chunk boundaries to avoid write collisions
 	# and enable per-chunk resume.  Output chunk in pred coords = ome_chunk * scaledown.
+	# Use largest multiple of out_chunk_in_pred that fits in GPU memory.
+	# EDT needs ~12 bytes/voxel peak (bool + 2×float32 + uint8).
+	# Query available GPU memory to size chunks appropriately.
 	out_chunk_in_pred = max(1, scaledown) * max(1, ome_chunk)
-	if edt_chunk % out_chunk_in_pred != 0:
-		edt_chunk = max(out_chunk_in_pred, (edt_chunk // out_chunk_in_pred) * out_chunk_in_pred)
+	try:
+		_gpu_free = cp.cuda.Device().mem_info[0]
+		# Use at most 60% of free memory, 12 bytes per voxel
+		max_voxels = int(_gpu_free * 0.6 / 12)
+		max_side = max(out_chunk_in_pred, int(max_voxels ** (1.0 / 3.0)))
+	except Exception:
+		max_side = 512
+	edt_chunk = max(out_chunk_in_pred,
+					(min(edt_chunk, max_side) // out_chunk_in_pred) * out_chunk_in_pred)
+	print(f"[pred_dt] edt_chunk={edt_chunk} (out_chunk_in_pred={out_chunk_in_pred}, "
+		  f"gpu_free={_gpu_free / 2**30:.1f}GiB, max_side={max_side})", flush=True)
 	# Align region starts to output chunk boundaries (round down start, round up end)
 	aligned_z0 = (pred_z0 // out_chunk_in_pred) * out_chunk_in_pred
 	aligned_y0 = (pred_y0 // out_chunk_in_pred) * out_chunk_in_pred
