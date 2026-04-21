@@ -191,6 +191,17 @@ namespace perf {
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
 
+    // LOD synthesis method.  Selects how c3d chunks are decoded when a
+    // downscaled view is requested.  Value is one of:
+    //   "codec_synthesis"   — call c3d_chunk_decode_lod; codec-native filter.
+    //   "full_decode_box"   — full decode + box-average pool.
+    //   "full_decode_min"   — full decode + min pool.
+    //   "full_decode_max"   — full decode + max pool.
+    // Has no effect until the sampler calls into the LOD-synthesis path
+    // (no-op on the current multi-level zarr pyramid).
+    constexpr auto LOD_METHOD = "perf/lod_method";
+    constexpr auto LOD_METHOD_DEFAULT = "codec_synthesis";
+
     // IO thread count is not configurable — it tracks
     // std::thread::hardware_concurrency() at runtime.
 
