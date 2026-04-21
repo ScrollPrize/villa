@@ -230,6 +230,54 @@ def _apply_activation(array_np: np.ndarray, activation: Optional[str], *, is_sur
     return array_np
 
 
+# Categorical palette for multiclass segmentation visualization. Kept small
+# and stable: bg=black, class 1=red, class 2=green, class 3=grey (ignore),
+# classes 4+ cycle through distinct hues. Stored BGR for OpenCV.
+_SEG_PALETTE_BGR = np.array(
+    [
+        [0,   0,   0],    # 0: background
+        [0,   0,   255],  # 1: red
+        [0,   255, 0],    # 2: green
+        [128, 128, 128],  # 3: grey (conventional ignore slot)
+        [255, 0,   0],    # 4: blue
+        [0,   255, 255],  # 5: yellow
+        [255, 0,   255],  # 6: magenta
+        [255, 255, 0],    # 7: cyan
+        [0,   165, 255],  # 8: orange
+        [255, 255, 255],  # 9: white
+    ],
+    dtype=np.uint8,
+)
+
+
+def _is_multiclass_segmentation(task_cfg: Dict | None) -> bool:
+    """A target is multiclass seg when out_channels > 2 and the activation is
+    softmax-ish (``"none"`` / ``"softmax"``). out_channels == 2 is treated as
+    binary and handled by the existing grayscale branches.
+    """
+    if not task_cfg:
+        return False
+    out_channels = int(task_cfg.get("out_channels", 0) or 0)
+    if out_channels <= 2:
+        return False
+    activation = str(task_cfg.get("activation", "none") or "none").lower()
+    return activation in {"none", "softmax", "identity"}
+
+
+def _indices_to_bgr(indices_2d: np.ndarray) -> np.ndarray:
+    """Map a (H, W) integer array of class indices to a BGR uint8 image."""
+    idx = np.asarray(indices_2d)
+    if idx.ndim != 2:
+        raise ValueError(f"Expected (H, W), got shape {idx.shape}")
+    idx = np.clip(np.rint(idx).astype(np.int64), 0, len(_SEG_PALETTE_BGR) - 1)
+    return _SEG_PALETTE_BGR[idx]
+
+
+def _logits_to_class_indices(logits_c_hw: np.ndarray) -> np.ndarray:
+    """(C, H, W) -> (H, W) argmax across channels."""
+    return np.argmax(logits_c_hw, axis=0)
+
+
 def _vector_to_bgr(vector_3ch):
     """Map a 3×H×W vector field to a BGR image using directional colouring."""
     if vector_3ch.shape[0] != 3:
@@ -287,8 +335,11 @@ def convert_slice_to_bgr(
         or task_type == "surface_frame"
         or (slice_2d_or_3d.ndim >= 3 and slice_2d_or_3d.shape[0] == 9)
     )
+    is_multiclass = _is_multiclass_segmentation(task_cfg)
 
     if slice_2d_or_3d.ndim == 2:
+        if is_multiclass:
+            return _indices_to_bgr(slice_2d_or_3d)
         # Single channel - convert to BGR
         ch_8u = minmax_scale_to_8bit(slice_2d_or_3d, value_range=value_range)
         return cv2.cvtColor(ch_8u, cv2.COLOR_GRAY2BGR)
@@ -300,15 +351,21 @@ def convert_slice_to_bgr(
             except ValueError:
                 pass
         if slice_2d_or_3d.shape[0] == 1:
+            if is_multiclass:
+                return _indices_to_bgr(slice_2d_or_3d[0])
             # Single channel with channel dimension
             ch_8u = minmax_scale_to_8bit(slice_2d_or_3d[0], value_range=value_range)
             return cv2.cvtColor(ch_8u, cv2.COLOR_GRAY2BGR)
-        
+
+        elif is_multiclass and slice_2d_or_3d.shape[0] >= 2:
+            # Multiclass prediction logits (C, H, W): argmax -> class indices.
+            return _indices_to_bgr(_logits_to_class_indices(slice_2d_or_3d))
+
         elif slice_2d_or_3d.shape[0] == 3:
             # RGB or normal map - just transpose and scale
             rgb = np.transpose(slice_2d_or_3d, (1, 2, 0))
             return minmax_scale_to_8bit(rgb, value_range=value_range)
-        
+
         elif slice_2d_or_3d.shape[0] == 2:
             # Binary segmentation - use foreground channel (channel 1)
             ch_8u = minmax_scale_to_8bit(slice_2d_or_3d[1], value_range=value_range)
@@ -372,7 +429,11 @@ def _render_3d_volume_to_bgr(
         or (arr_np.ndim >= 4 and arr_np.shape[0] == 9)
     )
 
+    is_multiclass = _is_multiclass_segmentation(task_cfg)
+
     if arr_np.ndim == 3:
+        if is_multiclass:
+            return np.stack([_indices_to_bgr(arr_np[z]) for z in range(arr_np.shape[0])], axis=0)
         return _gray_volume_to_bgr(arr_np, value_range)
 
     if arr_np.ndim != 4:
@@ -385,7 +446,16 @@ def _render_3d_volume_to_bgr(
         )
 
     if arr_np.shape[0] == 1:
+        if is_multiclass:
+            return np.stack(
+                [_indices_to_bgr(arr_np[0, z]) for z in range(arr_np.shape[1])], axis=0
+            )
         return _gray_volume_to_bgr(arr_np[0], value_range)
+
+    if is_multiclass and arr_np.shape[0] >= 2:
+        # Multiclass pred logits (C, Z, H, W): argmax across channel 0.
+        class_idx = np.argmax(arr_np, axis=0)  # (Z, H, W)
+        return np.stack([_indices_to_bgr(class_idx[z]) for z in range(class_idx.shape[0])], axis=0)
 
     if arr_np.shape[0] == 3:
         rgb_zhwc = np.transpose(arr_np, (1, 2, 3, 0))
