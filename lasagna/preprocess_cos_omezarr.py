@@ -484,7 +484,13 @@ def _compute_pred_dt_channel(
 	chunk_yx: int = 256,
 	overlap: int = 64,
 ) -> None:
-	"""Compute distance-to-surface channel from a prediction zarr and write into output_arr."""
+	"""Compute signed distance-to-surface channel from a prediction zarr.
+
+	Encoding (uint8): outside=[80,127], inside=[128,175], no data=0.
+	Boundary jump is exactly 1 (127→128).
+	"""
+	# Overlap must cover MAX_DT (48) so chunk-boundary EDT is accurate
+	overlap = max(overlap, 48)
 	pred = zarr.open(str(pred_path), mode="r")
 	if not hasattr(pred, "shape"):
 		raise ValueError(f"pred-dt must point to a zarr array, got group: {pred_path}")
@@ -570,53 +576,57 @@ def _compute_pred_dt_channel(
 				chunk_np = np.asarray(pred[read_z0:read_z1, read_y0:read_y1, read_x0:read_x1])
 				print(f" {time.time() - t_read:.1f}s", flush=True)
 
-				# Binarize and compute distance transform
+				# Binarize and compute signed distance transform
 				binary = chunk_np > 0
 				del chunk_np
+				_MAX_DT = 48  # max distance in voxels for encoding
+
+				def _run_edt(mask_np):
+					"""Run EDT on a boolean mask, return float32 numpy."""
+					if _HAS_CUPY:
+						cp.get_default_memory_pool().free_all_blocks()
+						try:
+							m_gpu = cp.asarray(mask_np)
+							d_gpu = cnd.distance_transform_edt(m_gpu)
+							d = cp.asnumpy(d_gpu).astype(np.float32)
+							del m_gpu, d_gpu
+							cp.get_default_memory_pool().free_all_blocks()
+							return d
+						except cp.cuda.memory.OutOfMemoryError:
+							cp.get_default_memory_pool().free_all_blocks()
+							if not _HAS_EDT:
+								raise
+					if _HAS_EDT:
+						return edt_mod.edt(mask_np, parallel=32).astype(np.float32)
+					raise ImportError("pred-dt requires CuPy (GPU) or 'edt' package (CPU)")
+
+				nvoxels = binary.size
 				if _HAS_CUPY:
-					cp.get_default_memory_pool().free_all_blocks()
-					mempool = cp.get_default_memory_pool()
-					nvoxels = binary.size
-					# PBA 3D needs ~24 bytes/voxel (bool input + int64 encoded + int64 working + float64 output)
-					est_bytes = nvoxels * 24
 					gpu_free = cp.cuda.Device().mem_info[0]
 					print(
-						f"[pred_dt] chunk {chunk_i}/{n_chunks}  distance_transform_edt (GPU) "
-						f"voxels={nvoxels:,} est={est_bytes / 2**30:.1f}GiB "
-						f"free={gpu_free / 2**30:.1f}GiB pool_used={mempool.used_bytes() / 2**30:.2f}GiB ...",
+						f"[pred_dt] chunk {chunk_i}/{n_chunks}  signed EDT (GPU) "
+						f"voxels={nvoxels:,} free={gpu_free / 2**30:.1f}GiB ...",
 						end="", flush=True,
 					)
-					t_edt = time.time()
-					try:
-						binary_gpu = cp.asarray(binary)
-						dt_gpu = cnd.distance_transform_edt(~binary_gpu)
-						dt = cp.asnumpy(dt_gpu).astype(np.float32)
-						del binary_gpu, dt_gpu
-						cp.get_default_memory_pool().free_all_blocks()
-					except cp.cuda.memory.OutOfMemoryError as e:
-						cp.get_default_memory_pool().free_all_blocks()
-						gpu_free2 = cp.cuda.Device().mem_info[0]
-						gpu_total = cp.cuda.Device().mem_info[1]
-						print(flush=True)
-						print(
-							f"[pred_dt] GPU OOM!\n"
-							f"  chunk shape     : {binary.shape}\n"
-							f"  voxels          : {nvoxels:,}\n"
-							f"  est. GPU need   : {est_bytes / 2**30:.1f} GiB\n"
-							f"  GPU free/total  : {gpu_free2 / 2**30:.1f} / {gpu_total / 2**30:.1f} GiB\n"
-							f"  pool used       : {mempool.used_bytes() / 2**30:.2f} GiB\n"
-							f"  overlap={overlap} \u2192 max padded side = chunk + 2*overlap\n"
-							f"  Try reducing --edt-chunk-depth / --edt-chunk-yx or overlap.",
-							flush=True,
-						)
-						raise
-				elif _HAS_EDT:
-					print(f"[pred_dt] chunk {chunk_i}/{n_chunks}  distance_transform_edt (CPU) ...", end="", flush=True)
-					t_edt = time.time()
-					dt = edt_mod.edt(~binary, parallel=32).astype(np.float32)
 				else:
-					raise ImportError("pred-dt requires either CuPy (GPU) or the 'edt' package (CPU). Install with: pip install edt")
+					print(
+						f"[pred_dt] chunk {chunk_i}/{n_chunks}  signed EDT (CPU) ...",
+						end="", flush=True,
+					)
+				t_edt = time.time()
+				outer_dt = _run_edt(~binary)  # bg → distance to fg
+				inner_dt = _run_edt(binary)   # fg → distance to bg
 				print(f" {time.time() - t_edt:.1f}s", flush=True)
+
+				# Signed distance encoding:
+				#   Outside (binary=0): 128 - clip(round(outer_dt), 1, 48) → [80, 127]
+				#   Inside  (binary=1): 127 + clip(round(inner_dt), 1, 48) → [128, 175]
+				#   Boundary jump: 127 → 128 (exactly 1)
+				#   Value 0 = no data (zarr fill_value)
+				outer_enc = (128 - np.clip(np.round(outer_dt), 1, _MAX_DT)).astype(np.uint8)
+				inner_enc = (127 + np.clip(np.round(inner_dt), 1, _MAX_DT)).astype(np.uint8)
+				dt_encoded = np.where(binary, inner_enc, outer_enc)
+				del binary, outer_dt, inner_dt, outer_enc, inner_enc
 
 				# Crop off overlap padding to keep center region
 				pad_z = z_pos - read_z0
@@ -625,10 +635,8 @@ def _compute_pred_dt_channel(
 				center_z = z_chunk_end - z_pos
 				center_y = y_chunk_end - y_pos
 				center_x = x_chunk_end - x_pos
-				dt_center = dt[pad_z:pad_z + center_z, pad_y:pad_y + center_y, pad_x:pad_x + center_x]
-
-				# Clamp to 255, cast to uint8
-				dt_u8 = np.clip(dt_center, 0.0, 255.0).astype(np.uint8)
+				dt_u8 = dt_encoded[pad_z:pad_z + center_z, pad_y:pad_y + center_y, pad_x:pad_x + center_x]
+				del dt_encoded
 
 				# Downscale to output grid
 				# Z: subsample at scaledown spacing
@@ -1035,6 +1043,55 @@ def _infer_tiled_3d(
 	return result_fine, result_coarse
 
 
+def _resolve_base_shape(
+	input_path: str,
+	base_ref: str | None,
+	base_scale: int | None,
+) -> tuple[int, int, int] | None:
+	"""Resolve base_shape_zyx from --base-ref/--base-scale or auto-detect.
+
+	Three modes (checked in order):
+	1. base_ref + base_scale: read zarr shape, multiply by 2^base_scale
+	2. base_ref alone: zarr IS 1× base, use shape directly
+	3. Neither: try to open the input as a zarr group and read level 0
+	"""
+	if base_ref is not None:
+		ref = zarr.open(str(base_ref), mode="r")
+		if hasattr(ref, "shape"):
+			sh = tuple(int(v) for v in ref.shape)
+			# Strip leading channel dim if present
+			if len(sh) == 4:
+				sh = sh[1:]
+			if len(sh) != 3:
+				raise ValueError(f"--base-ref array must be 3D or 4D (CZYX), got shape={sh}")
+		else:
+			raise ValueError(f"--base-ref must point to a zarr array, got group: {base_ref}")
+		scale = base_scale if base_scale is not None else 0
+		f = 2 ** scale
+		return (sh[0] * f, sh[1] * f, sh[2] * f)
+
+	# Auto-detect: try to find level 0 of the input's zarr group
+	try:
+		from vesuvius.neural_tracing.datasets.common import open_zarr_group
+		# input_path is like ".../scroll.zarr/2" — parent is the group
+		inp = Path(input_path)
+		# Walk up to find the zarr root (directory containing .zgroup or .zattrs)
+		group_path = inp.parent if inp.name.isdigit() else inp
+		grp = zarr.open_group(str(group_path), mode="r")
+		# Find the largest (lowest-numbered) level
+		level_keys = sorted(int(k) for k in grp.keys() if k.isdigit())
+		if level_keys:
+			level0 = grp[str(level_keys[0])]
+			sh = tuple(int(v) for v in level0.shape)
+			if len(sh) == 3:
+				print(f"[predict3d] auto-detected base shape from level {level_keys[0]}: {sh}",
+					  flush=True)
+				return sh
+	except Exception:
+		pass
+	return None
+
+
 def run_preprocess_3d(
 	*,
 	input_path: str,
@@ -1054,6 +1111,8 @@ def run_preprocess_3d(
 	edt_chunk_depth: int = 448,
 	edt_chunk_yx: int = 448,
 	calibrate_norm: bool = False,
+	base_ref: str | None = None,
+	base_scale: int | None = None,
 ) -> None:
 	"""Run 3D UNet inference and write .lasagna.json with per-group zarrs.
 
@@ -1061,7 +1120,8 @@ def run_preprocess_3d(
 
 	cos channel is stored at cos_scaledown resolution.
 	grad_mag, nx, ny are stored at scaledown resolution.
-	pred_dt (if provided) is stored at scaledown resolution.
+	pred_dt (if provided) is stored at cos_scaledown resolution with signed
+	distance encoding: outside=[80,127], inside=[128,175], no data=0.
 	"""
 	from lasagna_volume import LasagnaVolume, ChannelGroup
 
@@ -1127,17 +1187,26 @@ def run_preprocess_3d(
 	other_oy1 = min(full_other_y, other_oy0 + _ds_size(ny, other_sd))
 	other_ox1 = min(full_other_x, other_ox0 + _ds_size(nx_dim, other_sd))
 
+	# Resolve base shape
+	base_shape_zyx = _resolve_base_shape(input_path, base_ref, base_scale)
+	if base_shape_zyx is not None:
+		print(f"[predict3d] base_shape_zyx={base_shape_zyx}", flush=True)
+
 	# Load or create the .lasagna.json manifest
 	json_path = Path(output_path)
 	if json_path.exists():
 		vol = LasagnaVolume.load(json_path)
 		print(f"[predict3d] loaded existing manifest: {output_path}", flush=True)
+		# Update base_shape if newly resolved
+		if base_shape_zyx is not None:
+			vol.base_shape_zyx = base_shape_zyx
 	else:
 		vol = LasagnaVolume(
 			path=json_path.resolve(),
 			source_to_base=source_to_base,
 			crop_xyzwhd=(int(x0), int(y0), int(z0), int(nx_dim), int(ny), int(nz))
 				if crop_xyzwhd is not None else None,
+			base_shape_zyx=base_shape_zyx,
 		)
 
 	# Validate pred-dt source
@@ -1190,8 +1259,8 @@ def run_preprocess_3d(
 
 	skip_pred_dt = False
 	if pred_dt_path:
-		dt_arr = _open_group_zarr(f"{prefix}pred_dt.zarr", 1, full_other_z, full_other_y, full_other_x)
-		if _zarr_has_data(dt_arr, other_oz0, other_oz1, other_oy0, other_oy1):
+		dt_arr = _open_group_zarr(f"{prefix}pred_dt.zarr", 1, full_cos_z, full_cos_y, full_cos_x)
+		if _zarr_has_data(dt_arr, cos_oz0, cos_oz1, cos_oy0, cos_oy1):
 			skip_pred_dt = True
 			print(f"[predict3d] resuming: pred_dt.zarr has data, skipping Phase 1", flush=True)
 
@@ -1202,21 +1271,21 @@ def run_preprocess_3d(
 	if _gpu_ctx is not None:
 		_gpu_ctx.__enter__()
 
-	# --- Phase 1: pred_dt ---
+	# --- Phase 1: pred_dt (at cos resolution) ---
 	if pred_dt_path and not skip_pred_dt:
 		_compute_pred_dt_channel(
 			pred_path=pred_dt_path,
 			output_arr=dt_arr,
 			channel_idx=0,
-			ref_z=full_other_z, ref_y=full_other_y, ref_x=full_other_x,
-			scaledown=other_sd,
+			ref_z=full_cos_z, ref_y=full_cos_y, ref_x=full_cos_x,
+			scaledown=cos_sd,
 			crop_xyzwhd=[int(x0), int(y0), int(z0), int(nx_dim), int(ny), int(nz)]
 				if crop_xyzwhd is not None else None,
 			chunk_depth=edt_chunk_depth,
 			chunk_yx=edt_chunk_yx,
 		)
 		vol.update_group("pred_dt", ChannelGroup(
-			zarr_path=f"{prefix}pred_dt.zarr", scaledown=other_sd, channels=["pred_dt"]))
+			zarr_path=f"{prefix}pred_dt.zarr", scaledown=cos_sd, channels=["pred_dt"]))
 
 	# --- Phase 2: tiled 3D inference ---
 	if not skip_inference:
@@ -2038,6 +2107,12 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 	p.add_argument("--edt-chunk-yx", type=int, default=256, help="EDT chunk size in Y/X (default 256).")
 	p.add_argument("--calibrate-norm", action="store_true", default=False,
 		help="Calibrate InstanceNorm running stats before inference for tile consistency.")
+	p.add_argument("--base-ref", default=None,
+		help="Reference zarr for base shape. If given with --base-scale N, "
+			 "base = ref_shape * 2^N. If given alone, ref IS base (1x). "
+			 "If omitted, auto-detect from input zarr group level 0.")
+	p.add_argument("--base-scale", type=int, default=None,
+		help="How many 2x downsamples the --base-ref zarr is from the true base.")
 	args = p.parse_args(argv)
 
 	run_preprocess_3d(
@@ -2058,6 +2133,8 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		edt_chunk_depth=int(args.edt_chunk_depth),
 		edt_chunk_yx=int(args.edt_chunk_yx),
 		calibrate_norm=bool(args.calibrate_norm),
+		base_ref=args.base_ref,
+		base_scale=args.base_scale,
 	)
 	return 0
 

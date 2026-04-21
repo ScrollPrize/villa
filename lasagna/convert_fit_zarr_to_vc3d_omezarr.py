@@ -191,6 +191,26 @@ def _downsample_chunk_worker(args_tuple):
 					  dx0:dx0 + down.shape[2]] = down
 
 
+def _upsample_chunk_worker(args_tuple):
+	"""Multiprocessing worker: read one chunk-aligned region from level N,
+	upsample 2x (nearest-neighbor), write to level N-1."""
+	(out_path_str, src_level, dst_level,
+	 z0, z1, y0, y1, x0, x1) = args_tuple
+
+	g = zarr.open_group(out_path_str, mode="r+")
+	slab = np.asarray(g[str(src_level)][z0:z1, y0:y1, x0:x1])
+	if slab.size == 0:
+		return
+	up = slab.repeat(2, axis=0).repeat(2, axis=1).repeat(2, axis=2)
+	dz0, dy0, dx0 = z0 * 2, y0 * 2, x0 * 2
+	dst = g[str(dst_level)]
+	# Clip to dest shape (in case source wasn't evenly divisible)
+	uz = min(up.shape[0], dst.shape[0] - dz0)
+	uy = min(up.shape[1], dst.shape[1] - dy0)
+	ux = min(up.shape[2], dst.shape[2] - dx0)
+	dst[dz0:dz0 + uz, dy0:dy0 + uy, dx0:dx0 + ux] = up[:uz, :uy, :ux]
+
+
 def run(
 	*,
 	input_path: str,
@@ -198,6 +218,7 @@ def run(
 	levels: int,
 	chunk: int,
 	workers: int = 0,
+	base_shape: tuple[int, int, int] | None = None,
 ) -> None:
 	if workers <= 0:
 		workers = max(1, multiprocessing.cpu_count())
@@ -232,7 +253,16 @@ def run(
 
 	channels = _channels_from_src(c_in=c_in, params=params)
 	ch_n = len(channels)
-	base_full_shape = (z_full, y_full, x_full)
+
+	# Base shape: explicit override, from zarr attrs, or from input zarr
+	if base_shape is not None:
+		base_full_shape = base_shape
+	else:
+		bs = params.get("base_shape_zyx")
+		if bs is not None and len(bs) == 3:
+			base_full_shape = tuple(int(v) for v in bs)
+		else:
+			base_full_shape = (z_full, y_full, x_full)
 	crop_z = zs1 - zs0
 
 	TAG = "[convert_fit_zarr_to_vc3d_omezarr]"
@@ -242,27 +272,24 @@ def run(
 		out_path = Path(f"{output_prefix}_{ch}.ome.zarr")
 		g = zarr.open_group(str(out_path), mode="w", zarr_format=2)
 
-		# Create all pyramid level arrays upfront
+		# Create all pyramid level arrays upfront.
+		# base_full_shape is level 0 (full res). Each level halves.
 		arrs_shapes: dict[int, tuple] = {}
 		for lv in range(levels):
-			if lv < first_filled_level:
-				sh = _shape_mul2(base_full_shape, first_filled_level - lv)
-			else:
-				sh = _shape_div2(base_full_shape, lv - first_filled_level)
+			sh = _shape_div2(base_full_shape, lv)
 			arrs_shapes[lv] = sh
-			if lv >= first_filled_level:
-				g.create_array(
-					str(lv),
-					shape=sh,
-					chunks=(
-						min(sh[0], chunk),
-						min(sh[1], chunk),
-						min(sh[2], chunk),
-					),
-					dtype=np.uint8,
-					overwrite=True,
-					fill_value=0,
-				)
+			g.create_array(
+				str(lv),
+				shape=sh,
+				chunks=(
+					min(sh[0], chunk),
+					min(sh[1], chunk),
+					min(sh[2], chunk),
+				),
+				dtype=np.uint8,
+				overwrite=True,
+				fill_value=0,
+			)
 
 		# --- Phase 1: Write base level in parallel (chunk-aligned, no contention) ---
 		cz = chunk
@@ -355,6 +382,47 @@ def run(
 			_print_progress(prefix=f"{TAG} {ch} L{lv}", done=n_ds, total=n_ds, t0=t_lv)
 			print("", flush=True)
 
+		# --- Phase 3: Upsample to fill levels below first_filled_level ---
+		for lv in range(first_filled_level - 1, -1, -1):
+			src_lv = lv + 1
+			src_shape = arrs_shapes[src_lv]
+			cz2 = chunk  # one source chunk → one dest 2×chunk region
+			us_work = []
+			for z0 in range(0, src_shape[0], cz2):
+				z1 = min(src_shape[0], z0 + cz2)
+				for y0 in range(0, src_shape[1], cz2):
+					y1 = min(src_shape[1], y0 + cz2)
+					for x0 in range(0, src_shape[2], cz2):
+						x1 = min(src_shape[2], x0 + cz2)
+						us_work.append((
+							str(out_path), src_lv, lv,
+							z0, z1, y0, y1, x0, x1,
+						))
+			if us_work:
+				n_us = len(us_work)
+				t_lv = time.time()
+				done_count[0] = 0
+
+				_stop3 = threading.Event()
+				def _prog3():
+					while not _stop3.is_set():
+						with lock:
+							d = done_count[0]
+						_print_progress(prefix=f"{TAG} {ch} L{lv} (upsample)", done=d, total=n_us, t0=t_lv)
+						_stop3.wait(0.5)
+				prog3 = threading.Thread(target=_prog3, daemon=True)
+				prog3.start()
+
+				with multiprocessing.Pool(processes=workers) as pool:
+					for _ in pool.imap_unordered(_upsample_chunk_worker, us_work):
+						with lock:
+							done_count[0] += 1
+
+				_stop3.set()
+				prog3.join(timeout=2)
+				_print_progress(prefix=f"{TAG} {ch} L{lv} (upsample)", done=n_us, total=n_us, t0=t_lv)
+				print("", flush=True)
+
 		# Write metadata
 		datasets = []
 		for lv in range(levels):
@@ -411,25 +479,139 @@ def run(
 	print("", flush=True)
 
 
+def run_from_manifest(
+	*,
+	manifest_path: str,
+	output_prefix: str,
+	levels: int,
+	chunk: int,
+	workers: int = 0,
+	channels: list[str] | None = None,
+	base_shape: tuple[int, int, int] | None = None,
+) -> None:
+	"""Convert channels from a .lasagna.json manifest to VC3D OME-Zarr pyramids.
+
+	Default channels: cos + pred_dt (if present).
+	base_shape from manifest's base_shape_zyx, or derived from finest zarr.
+	"""
+	from lasagna_volume import LasagnaVolume
+
+	vol = LasagnaVolume.load(manifest_path)
+	TAG = "[convert_fit_zarr_to_vc3d_omezarr]"
+
+	# Resolve base shape: explicit > manifest > derive from finest zarr
+	if base_shape is None:
+		base_shape = vol.base_shape_zyx
+	if base_shape is None:
+		# Derive from finest-resolution zarr × scaledown
+		min_sd = min(g.scaledown for g in vol.groups.values())
+		for g in vol.groups.values():
+			if g.scaledown == min_sd:
+				zarr_path = str(vol.path.parent / g.zarr_path)
+				a = zarr.open(zarr_path, mode="r")
+				sh = tuple(int(v) for v in a.shape)
+				if len(sh) == 4:
+					sh = sh[1:]
+				base_shape = (sh[0] * min_sd, sh[1] * min_sd, sh[2] * min_sd)
+				print(f"{TAG} derived base_shape={base_shape} from {g.zarr_path} "
+					  f"(shape={sh}, scaledown={min_sd})", flush=True)
+				break
+	if base_shape is None:
+		raise ValueError("Cannot determine base_shape: pass --base-shape or set base_shape_zyx in manifest")
+
+	# Select channels to convert
+	all_ch = vol.all_channels()
+	if channels is None:
+		channels = []
+		for name in ["cos", "pred_dt"]:
+			if name in all_ch:
+				channels.append(name)
+		if not channels:
+			channels = all_ch
+	print(f"{TAG} manifest: {manifest_path}", flush=True)
+	print(f"{TAG} base_shape={base_shape}, channels={channels}", flush=True)
+
+	# Convert each selected channel
+	for ch_name in channels:
+		group, ch_idx = vol.channel_group(ch_name)
+		zarr_path = str(vol.path.parent / group.zarr_path)
+
+		# Per-channel output: output_prefix_<channel>.ome.zarr
+		out_prefix = f"{output_prefix}_{ch_name}"
+
+		# Build per-channel preprocess_params so run() can read scaledown + crop
+		a = zarr.open(zarr_path, mode="r")
+		params = dict(getattr(a, "attrs", {}).get("preprocess_params", {}))
+		params.setdefault("scaledown", group.scaledown)
+		if vol.crop_xyzwhd is not None:
+			params.setdefault("crop_xyzwhd", list(vol.crop_xyzwhd))
+		# Channel names for this group
+		params["channels"] = group.channels
+
+		# Temporarily set attrs so run() can read them
+		# (run() reads from zarr attrs — if missing, write them)
+		if "preprocess_params" not in dict(getattr(a, "attrs", {})):
+			try:
+				aw = zarr.open(zarr_path, mode="r+")
+				aw.attrs["preprocess_params"] = params
+			except Exception:
+				pass  # read-only zarr, run() will use defaults
+
+		print(f"{TAG} converting {ch_name} (group={[k for k,v in vol.groups.items() if v is group][0]}, "
+			  f"ch_idx={ch_idx}, scaledown={group.scaledown})", flush=True)
+
+		run(
+			input_path=zarr_path,
+			output_prefix=out_prefix,
+			levels=levels,
+			chunk=chunk,
+			workers=workers,
+			base_shape=base_shape,
+		)
+
+
 def main(argv: list[str] | None = None) -> int:
 	p = argparse.ArgumentParser(
 		description="Convert fit zarr (C,Z,Y,X uint8) to per-channel VC3D OME-Zarr pyramids."
 	)
-	p.add_argument("--input", required=True, help="Input zarr array path (C,Z,Y,X uint8).")
-	p.add_argument("--output-prefix", required=True, help="Output prefix; files become <prefix>_<channel>.ome.zarr")
+	# Input: either --input (per-zarr) or --manifest (.lasagna.json)
+	inp = p.add_mutually_exclusive_group(required=True)
+	inp.add_argument("--input", help="Input zarr array path (C,Z,Y,X uint8).")
+	inp.add_argument("--manifest", help="Input .lasagna.json manifest.")
+	p.add_argument("--output-prefix", required=True,
+		help="Output prefix; files become <prefix>_<channel>.ome.zarr")
 	p.add_argument("--levels", type=int, default=5, help="Number of pyramid levels to create.")
 	p.add_argument("--chunk", type=int, default=32, help="Chunk size in x/y/z.")
 	p.add_argument("--workers", type=int, default=0,
 				   help="Number of parallel workers (default: cpu_count).")
+	p.add_argument("--base-shape", type=int, nargs=3, default=None,
+		metavar=("Z", "Y", "X"),
+		help="Explicit base (full-res) shape. Overrides manifest/zarr-derived shapes.")
+	p.add_argument("--channels", nargs="+", default=None,
+		help="Channel names to convert (manifest mode only). Default: cos + pred_dt.")
 	args = p.parse_args(argv)
 
-	run(
-		input_path=str(args.input),
-		output_prefix=str(args.output_prefix),
-		levels=int(args.levels),
-		chunk=int(args.chunk),
-		workers=int(args.workers),
-	)
+	bs = tuple(args.base_shape) if args.base_shape else None
+
+	if args.manifest:
+		run_from_manifest(
+			manifest_path=str(args.manifest),
+			output_prefix=str(args.output_prefix),
+			levels=int(args.levels),
+			chunk=int(args.chunk),
+			workers=int(args.workers),
+			channels=args.channels,
+			base_shape=bs,
+		)
+	else:
+		run(
+			input_path=str(args.input),
+			output_prefix=str(args.output_prefix),
+			levels=int(args.levels),
+			chunk=int(args.chunk),
+			workers=int(args.workers),
+			base_shape=bs,
+		)
 	return 0
 
 

@@ -41,6 +41,7 @@ class LasagnaVolume:
 	version: int = 1
 	source_to_base: float = 1.0
 	crop_xyzwhd: tuple[int, int, int, int, int, int] | None = None
+	base_shape_zyx: tuple[int, int, int] | None = None
 	grad_mag_encode_scale: float = 1000.0
 	grad_mag_factor: float = 1.0
 	groups: dict[str, ChannelGroup] = field(default_factory=dict)
@@ -80,6 +81,8 @@ class LasagnaVolume:
 		}
 		if self.crop_xyzwhd is not None:
 			d["crop_xyzwhd"] = list(self.crop_xyzwhd)
+		if self.base_shape_zyx is not None:
+			d["base_shape_zyx"] = list(self.base_shape_zyx)
 		self.path.parent.mkdir(parents=True, exist_ok=True)
 		self.path.write_text(json.dumps(d, indent=2) + "\n", encoding="utf-8")
 
@@ -101,6 +104,11 @@ class LasagnaVolume:
 			crop = tuple(int(v) for v in crop)
 			if len(crop) != 6:
 				raise ValueError(f"crop_xyzwhd must have 6 elements, got {len(crop)}")
+		bshape = d.get("base_shape_zyx")
+		if bshape is not None:
+			bshape = tuple(int(v) for v in bshape)
+			if len(bshape) != 3:
+				raise ValueError(f"base_shape_zyx must have 3 elements, got {len(bshape)}")
 		groups: dict[str, ChannelGroup] = {}
 		for name, gd in d.get("groups", {}).items():
 			groups[str(name)] = ChannelGroup.from_dict(gd)
@@ -109,6 +117,7 @@ class LasagnaVolume:
 			version=version,
 			source_to_base=float(d.get("source_to_base", 1.0)),
 			crop_xyzwhd=crop,
+			base_shape_zyx=bshape,
 			grad_mag_encode_scale=float(d.get("grad_mag_encode_scale", 1000.0)),
 			grad_mag_factor=float(d.get("grad_mag_factor", 1.0)),
 			groups=groups,
