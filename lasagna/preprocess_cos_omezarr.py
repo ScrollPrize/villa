@@ -810,7 +810,7 @@ def _compute_pred_dt_slab(
 		return
 
 	t0 = time.time()
-	n_workers = min(read_workers if read_workers > 0 else max(1, (os.cpu_count() or 4) // 2),
+	n_workers = min(read_workers if read_workers > 0 else max(1, os.cpu_count() or 4),
 				   n_chunks)
 
 	print(f"[pred_dt] {n_chunks} chunks to process, {n_workers} workers, edt_chunk={edt_chunk}",
