@@ -179,56 +179,89 @@ const std::vector<std::byte>* BlockPipeline::shardBytesFor(
     return tlLastBytes.get();
 }
 
-// Decode a canonical h265 chunk from disk bytes. Uses the video header for
-// dims; independent of any source VcDataset.
-static ChunkDataPtr decodeCanonicalH265(const std::vector<uint8_t>& compressed) {
-    std::span<const std::byte> bytes(
-        reinterpret_cast<const std::byte*>(compressed.data()), compressed.size());
-    if (!utils::is_video_compressed(bytes)) return nullptr;
-    auto dims = utils::video_header_dims(bytes);
-    utils::VideoCodecParams vp;
-    vp.depth = dims[0]; vp.height = dims[1]; vp.width = dims[2];
-    const size_t n = size_t(dims[0]) * dims[1] * dims[2];
-    auto out = vc::cache::acquireChunkData();
-    out->shape = {int(dims[0]), int(dims[1]), int(dims[2])};
-    out->elementSize = 1;
-    out->bytes.resize(n);
-    // Zero-copy: decoder writes straight into ChunkData::bytes. Saves one
-    // ~2 MiB std::vector<std::byte> allocation + zero-init + memcpy per
-    // chunk vs. the std::vector-returning video_decode — this path runs
-    // on every decoded chunk so the allocation churn was a primary
-    // driver of worker-thread page-fault / swap pressure.
-    utils::video_decode_into(
-        bytes,
-        std::span<std::byte>(reinterpret_cast<std::byte*>(out->bytes.data()), n),
-        vp);
-    return out;
+// Canonical-chunk side for a given codec: H265 = 128, C3d = 256.
+// c3d's codec atom is fixed at 256^3; h265 historically canonicalized to
+// 128^3. The chunk-grid enumeration in Slicing.cpp derives from this.
+static int canonicalChunkSide(BlockPipeline::Codec c) noexcept {
+    return c == BlockPipeline::Codec::C3d ? 256 : 128;
 }
 
-// Encode decoded chunk bytes as canonical h265 into a thread-local output
-// buffer, returned by reference. Caller must consume the bytes before
-// the next call on the same thread. Capacity grows once to the largest
-// chunk ever seen on this thread and stays — no per-chunk allocation.
-static const std::vector<std::byte>& encodeCanonicalH265(
-    const ChunkData& chunk, const utils::VideoCodecParams& base) {
+// Decode a canonical chunk from disk bytes. Dispatches by magic so mixed
+// on-disk formats are still readable (useful during migration). Falls
+// through to nullptr for unrecognised magic.
+static ChunkDataPtr decodeCanonicalChunk(const std::vector<uint8_t>& compressed) {
+    std::span<const std::byte> bytes(
+        reinterpret_cast<const std::byte*>(compressed.data()), compressed.size());
+    if (utils::is_video_compressed(bytes)) {
+        auto dims = utils::video_header_dims(bytes);
+        utils::VideoCodecParams vp;
+        vp.depth = dims[0]; vp.height = dims[1]; vp.width = dims[2];
+        const size_t n = size_t(dims[0]) * dims[1] * dims[2];
+        auto out = vc::cache::acquireChunkData();
+        out->shape = {int(dims[0]), int(dims[1]), int(dims[2])};
+        out->elementSize = 1;
+        out->bytes.resize(n);
+        // Zero-copy: decoder writes straight into ChunkData::bytes. Saves
+        // one ~2 MiB std::vector<std::byte> allocation + zero-init + memcpy
+        // per chunk vs. the std::vector-returning video_decode — this path
+        // runs on every decoded chunk so the allocation churn was a
+        // primary driver of worker-thread page-fault / swap pressure.
+        utils::video_decode_into(
+            bytes,
+            std::span<std::byte>(reinterpret_cast<std::byte*>(out->bytes.data()), n),
+            vp);
+        return out;
+    }
+    if (utils::is_c3d_compressed(bytes)) {
+        utils::C3dCodecParams p;
+        const std::size_t n = 256ULL * 256ULL * 256ULL;
+        auto decoded = utils::c3d_decode(bytes, n, p);
+        auto out = vc::cache::acquireChunkData();
+        out->shape = {256, 256, 256};
+        out->elementSize = 1;
+        out->bytes.resize(decoded.size());
+        std::memcpy(out->bytes.data(), decoded.data(), decoded.size());
+        return out;
+    }
+    return nullptr;
+}
+
+// Encode decoded chunk bytes as canonical <codec> into a thread-local
+// output buffer, returned by reference. Caller must consume the bytes
+// before the next call on the same thread. Capacity grows once to the
+// largest chunk ever seen on this thread and stays — no per-chunk
+// allocation. For H265, qp/air_clamp/shift_n come from encodeParams;
+// for C3d, target_ratio comes from c3dEncodeParams.
+static const std::vector<std::byte>& encodeCanonicalChunk(
+    const ChunkData& chunk, const BlockPipeline::Config& cfg) {
     thread_local std::vector<std::byte> tlEncoded;
-    utils::VideoCodecParams vp = base;
+    std::span<const std::byte> raw(
+        reinterpret_cast<const std::byte*>(chunk.rawData()), chunk.totalBytes());
+    if (cfg.codec == BlockPipeline::Codec::C3d) {
+        utils::C3dCodecParams p = cfg.c3dEncodeParams;
+        p.depth = chunk.shape[0];
+        p.height = chunk.shape[1];
+        p.width = chunk.shape[2];
+        tlEncoded = utils::c3d_encode(raw, p);
+        return tlEncoded;
+    }
+    utils::VideoCodecParams vp = cfg.encodeParams;
     vp.depth = chunk.shape[0];
     vp.height = chunk.shape[1];
     vp.width = chunk.shape[2];
-    utils::video_encode_into(
-        {reinterpret_cast<const std::byte*>(chunk.rawData()), chunk.totalBytes()},
-        vp, tlEncoded);
+    utils::video_encode_into(raw, vp, tlEncoded);
     return tlEncoded;
 }
 
-// Does `bytes` already carry the canonical VC3D/h265 magic header?
-// If so we can skip the decode+re-encode cycle and passthrough the bytes
-// to the canonical disk directly.
-static bool bytesAreCanonicalH265(const std::vector<uint8_t>& bytes) {
-    return utils::is_video_compressed(
-        std::span<const std::byte>(
-            reinterpret_cast<const std::byte*>(bytes.data()), bytes.size()));
+// Does `bytes` carry the magic header matching the configured canonical
+// codec?  If so we can skip decode+re-encode and passthrough verbatim.
+static bool bytesAreCanonical(const std::vector<uint8_t>& bytes,
+                              BlockPipeline::Codec codec) {
+    std::span<const std::byte> s(
+        reinterpret_cast<const std::byte*>(bytes.data()), bytes.size());
+    return codec == BlockPipeline::Codec::C3d
+        ? utils::is_c3d_compressed(s)
+        : utils::is_video_compressed(s);
 }
 
 BlockPipeline::BlockPipeline(
@@ -409,11 +442,11 @@ BlockPipeline::BlockPipeline(
         }
         if (!decoded) return {};
 
-        const auto& h265 = encodeCanonicalH265(*decoded, config_.encodeParams);
+        const auto& encoded = encodeCanonicalChunk(*decoded, config_);
         zarrWriteChunk(*dz, key,
-            reinterpret_cast<const uint8_t*>(h265.data()), h265.size());
+            reinterpret_cast<const uint8_t*>(encoded.data()), encoded.size());
         statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
-        statDiskBytes_.fetch_add(h265.size(), std::memory_order_relaxed);
+        statDiskBytes_.fetch_add(encoded.size(), std::memory_order_relaxed);
         if (dz->is_sharded()) {
             const ShardKey sk = canonicalShardKey(key);
             {
@@ -550,7 +583,7 @@ BlockPipeline::BlockPipeline(
         ChunkDataPtr decoded;
         auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
         if (dz) {
-            decoded = decodeCanonicalH265(compressed);
+            decoded = decodeCanonicalChunk(compressed);
         } else if (decompress_) {
             decoded = decompress_(compressed, key);
         }
@@ -641,21 +674,22 @@ BlockPipeline::BlockPipeline(
                     return {};
                 }
 
-                // Sanity: bytes must already be VC3D/H.265. If not, the
+                // Sanity: bytes must already match the configured canonical
+                // codec's magic (VC3D for H265, C3DC for C3d). If not, the
                 // source advertised canonical structure but serves blosc
                 // or raw — we can't use it. Mark the chunk negative so
                 // we stop re-fetching it every render; otherwise every
                 // fetchInteractive would re-queue it forever.
-                if (!utils::is_video_compressed(std::span<const std::byte>(
-                        reinterpret_cast<const std::byte*>(bytes.data()),
-                        bytes.size()))) {
+                if (!bytesAreCanonical(bytes, config_.codec)) {
                     // Always log: these are source-level corruption events,
                     // not transient noise. Rate-limiting to 5 previously hid
                     // systemic codec-mismatch issues from users.
+                    const char* magic = (config_.codec == Codec::C3d)
+                        ? "C3DC" : "VC3D";
                     std::fprintf(stderr,
                         "[BlockPipeline] passthrough: chunk lvl=%d "
-                        "(%d,%d,%d) lacks VC3D magic — marking absent\n",
-                        key.level, key.iz, key.iy, key.ix);
+                        "(%d,%d,%d) lacks %s magic — marking absent\n",
+                        key.level, key.iz, key.iy, key.ix, magic);
                     bloomAdd(key);
                     {
                         std::lock_guard lock(negativeMutex_);
@@ -875,11 +909,14 @@ BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
     // we no longer bump statBlockHits_ here on the fast path.
     if (auto b = blockCache_.get(key); b) return b;
     // Miss: could be an "empty chunk" (all-zero canonical chunk that we
-    // don't store). Canonical chunks are 128³ = 8x8x8 blocks of 16³ —
-    // reverse-map the block coord to its enclosing chunk and check via
-    // the lock-free hash set. No rwlock — every blockAt miss used to hit
+    // don't store). Canonical chunks are (canonical_side / block_side)
+    // blocks along each axis — 8 for h265 (128³ / 16³), 16 for c3d
+    // (256³ / 16³). Reverse-map the block coord to its enclosing
+    // canonical-chunk index and query via the lock-free hash set. No
+    // rwlock on the miss path — every blockAt miss used to hit
     // pthread_rwlock_rdlock here.
-    const ChunkKey chunkKey{key.level, key.bz / 8, key.by / 8, key.bx / 8};
+    const int cps = canonicalChunkSide(config_.codec) / kBlockSize;
+    const ChunkKey chunkKey{key.level, key.bz / cps, key.by / cps, key.bx / cps};
     if (isEmptyChunk(chunkKey)) {
         // One canonical zero block shared by every caller asking for
         // a block inside any empty chunk — no arena consumption.
@@ -903,7 +940,7 @@ BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
 // entirely absent from the source.
 ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey) {
     if (!source_ || !decompress_) return nullptr;
-    constexpr int C = 128;
+    const int C = canonicalChunkSide(config_.codec);
     auto scs = source_->chunkShape(canonKey.level);
     if (scs[0] <= 0 || scs[1] <= 0 || scs[2] <= 0) return nullptr;
 
@@ -1069,11 +1106,15 @@ int BlockPipeline::numLevels() const noexcept {
 std::array<int, 3> BlockPipeline::chunkShape(int level) const noexcept {
     if (!source_) return {0, 0, 0};
     // When a disk-tier exists for this level, chunks are canonicalized to
-    // 128³ by assembleCanonicalChunk / insertChunkAsBlocks. The source's
-    // native chunk size may differ (e.g., 256³); returning it would make
-    // Slicing.cpp's chunk-key enumeration compute the wrong grid.
-    if (level >= 0 && level < int(diskLevels_.size()) && diskLevels_[level])
-        return {128, 128, 128};
+    // the codec's native chunk size (H265=128³, C3d=256³) by
+    // assembleCanonicalChunk / insertChunkAsBlocks. The source's native
+    // chunk size may differ (e.g., 128³ h265 source re-canonicalized as
+    // 256³ c3d); returning the source shape would make Slicing.cpp's
+    // chunk-key enumeration compute the wrong grid.
+    if (level >= 0 && level < int(diskLevels_.size()) && diskLevels_[level]) {
+        const int C = canonicalChunkSide(config_.codec);
+        return {C, C, C};
+    }
     return source_->chunkShape(level);
 }
 
