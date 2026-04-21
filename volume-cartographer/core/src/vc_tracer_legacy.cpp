@@ -8,6 +8,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
 #include "vc/core/util/DateTime.hpp"
@@ -20,6 +21,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <chrono>
 #include <filesystem>
 #include <memory>
 #include <set>
@@ -862,7 +864,8 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat
 //this is basically just a reparametrization
 static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, cv::Rect used_area,
     cv::Rect static_bounds, float step, float src_step, const cv::Vec2i &seed, int closing_r, bool keep_inpainted = false,
-    const std::filesystem::path& tgt_dir = std::filesystem::path())
+    const std::filesystem::path& tgt_dir = std::filesystem::path(),
+    SurfacePatchIndex* legacy_surface_patch_index = nullptr)
 {
     std::cout << "optimizer: optimizing surface " << state.size() << " " << used_area <<  " " << static_bounds << std::endl;
 
@@ -888,10 +891,6 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
         options.linear_solver_type = ceres::SPARSE_SCHUR;
         options.sparse_linear_algebra_library_type = ceres::CUDA_SPARSE;
 
-        // Enable mixed precision for SPARSE_SCHUR
-        if (options.linear_solver_type == ceres::SPARSE_SCHUR) {
-            options.use_mixed_precision_solves = true;
-        }
     } else {
         std::cerr << "Warning: CUDA_SPARSE requested but Ceres was not built with CUDA sparse support. Falling back to default solver." << std::endl;
     }
@@ -899,7 +898,6 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     options.minimizer_progress_to_stdout = false;
     options.max_num_iterations = 100;
     options.num_threads = omp_get_max_threads();
-    options.use_nonmonotonic_steps = true;
 
     for(int j=used_area.y;j<used_area.br().y;j++)
         for(int i=used_area.x;i<used_area.br().x;i++)
@@ -1004,8 +1002,6 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
             }
 
     options.max_num_iterations = 1000;
-    options.use_nonmonotonic_steps = true;
-    options.use_inner_iterations = true;
     ceres::Solve(options, &problem, &summary);
     std::cout << summary.FullReport() << std::endl;
     std::cout << "optimizer: rms " << sqrt(summary.final_cost/summary.num_residual_blocks) << " count " << summary.num_residual_blocks << std::endl;
@@ -1071,7 +1067,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
 
                     for(auto &s : surfs) {
                         auto ptr = s->surface()->pointer();
-                        float res = s->surface()->pointTo(ptr, points_out(j, i), same_surface_th, 10);
+                        float res = s->surface()->pointTo(ptr, points_out(j, i), same_surface_th, 10,
+                                                           legacy_surface_patch_index);
                         if (res <= same_surface_th) {
                             mutex.lock();
                             data_out.surfs({j,i}).insert(s);
@@ -1127,7 +1124,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         mutex.unlock();
 
                         auto ptr = test_surf->surface()->pointer();
-                        if (test_surf->surface()->pointTo(ptr, points_out(j, i), same_surface_th, 10) > same_surface_th)
+                        if (test_surf->surface()->pointTo(ptr, points_out(j, i), same_surface_th, 10,
+                                                           legacy_surface_patch_index) > same_surface_th)
                             continue;
 
                         int count = 0;
@@ -1209,6 +1207,14 @@ static QuadSurface *grow_surf_from_surfs_legacy_impl(SurfaceMeta *seed, const st
     float src_step = params.value("src_step", 20);
     float step = params.value("step", 10);
     int max_width = params.value("max_width", 80000);
+    const bool legacy_use_surface_patch_index = params.value("legacy_use_surface_patch_index", false);
+    const int surface_patch_stride = params.value("surface_patch_stride", 1);
+    const float surface_patch_bbox_pad = params.value("surface_patch_bbox_pad", 0.0f);
+    const bool surface_patch_cache = params.value("surface_patch_cache", true);
+    std::filesystem::path surface_patch_cache_dir = tgt_dir / ".surface_patch_index_cache";
+    if (params.contains("surface_patch_cache_dir") && params["surface_patch_cache_dir"].is_string()) {
+        surface_patch_cache_dir = params["surface_patch_cache_dir"].get<std::string>();
+    }
 
     local_cost_inl_th = params.value("local_cost_inl_th", 0.2f);
     same_surface_th = params.value("same_surface_th", 2.0f);
@@ -1259,6 +1265,15 @@ static QuadSurface *grow_surf_from_surfs_legacy_impl(SurfaceMeta *seed, const st
     std::cout << "  z_loc_loss_w: " << z_loc_loss_w << std::endl;
     std::cout << "  dist_loss_2d_w: " << dist_loss_2d_w << std::endl;
     std::cout << "  dist_loss_3d_w: " << dist_loss_3d_w << std::endl;
+    std::cout << "  legacy_use_surface_patch_index: "
+              << (legacy_use_surface_patch_index ? "true" : "false") << std::endl;
+    if (legacy_use_surface_patch_index) {
+        std::cout << "  surface_patch_stride: " << surface_patch_stride << std::endl;
+        std::cout << "  surface_patch_bbox_pad: " << surface_patch_bbox_pad << std::endl;
+        std::cout << "  surface_patch_cache: " << (surface_patch_cache ? "true" : "false") << std::endl;
+        if (surface_patch_cache)
+            std::cout << "  surface_patch_cache_dir: " << surface_patch_cache_dir << std::endl;
+    }
     if (enforce_z_range)
         std::cout << "  z_range: [" << z_min << ", " << z_max << "]" << std::endl;
 
@@ -1289,6 +1304,65 @@ static QuadSurface *grow_surf_from_surfs_legacy_impl(SurfaceMeta *seed, const st
     std::cout << "total surface count (after defective filter): " << surfs.size() << std::endl;
     std::cout << "seed " << seed << " name " << seed->name() << " seed overlapping: "
               << seed->overlapping.size() << "/" << seed->overlapping_str.size() << std::endl;
+
+    SurfacePatchIndex legacy_patch_index;
+    SurfacePatchIndex* legacy_patch_index_ptr = nullptr;
+    if (legacy_use_surface_patch_index) {
+        std::vector<SurfacePatchIndex::SurfacePtr> patch_surfaces;
+        std::set<QuadSurface*> indexed_surfaces;
+        patch_surfaces.reserve(surfs.size() + 1);
+        auto append_index_surface = [&](SurfaceMeta* sm) {
+            if (!sm)
+                return;
+            QuadSurface* surf = sm->surface();
+            if (!surf || !indexed_surfaces.insert(surf).second)
+                return;
+            patch_surfaces.emplace_back(SurfacePatchIndex::SurfacePtr(surf, [](QuadSurface*) {}));
+        };
+        for (const auto& [_, sm] : surfs) {
+            append_index_surface(sm);
+        }
+        append_index_surface(seed);
+        legacy_patch_index.setSamplingStride(surface_patch_stride);
+        bool cache_hit = false;
+        std::filesystem::path cache_path;
+        std::string cache_key;
+        if (surface_patch_cache) {
+            cache_key = SurfacePatchIndex::cacheKeyForSurfaces(
+                patch_surfaces, surface_patch_stride, surface_patch_bbox_pad);
+            cache_path = surface_patch_cache_dir / ("surface_patch_index_" + cache_key + ".bin");
+            const auto cache_load_start = std::chrono::steady_clock::now();
+            cache_hit = legacy_patch_index.loadCache(cache_path, patch_surfaces, cache_key);
+            const double cache_load_elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - cache_load_start).count();
+            std::cout << "Legacy SurfacePatchIndex cache "
+                      << (cache_hit ? "hit" : "miss")
+                      << " key=" << cache_key
+                      << " time=" << cache_load_elapsed << "s"
+                      << " path=" << cache_path << std::endl;
+        }
+        if (!cache_hit) {
+            const auto rebuild_start = std::chrono::steady_clock::now();
+            legacy_patch_index.rebuild(patch_surfaces, surface_patch_bbox_pad);
+            const double rebuild_elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - rebuild_start).count();
+            std::cout << "Legacy SurfacePatchIndex rebuild time=" << rebuild_elapsed << "s" << std::endl;
+            if (surface_patch_cache && !cache_path.empty()) {
+                const auto cache_save_start = std::chrono::steady_clock::now();
+                const bool saved = legacy_patch_index.saveCache(cache_path, cache_key);
+                const double cache_save_elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - cache_save_start).count();
+                std::cout << "Legacy SurfacePatchIndex cache save "
+                          << (saved ? "ok" : "failed")
+                          << " time=" << cache_save_elapsed << "s"
+                          << " path=" << cache_path << std::endl;
+            }
+        }
+        legacy_patch_index_ptr = &legacy_patch_index;
+        std::cout << "Legacy SurfacePatchIndex built for " << patch_surfaces.size()
+                  << " surfaces patches=" << legacy_patch_index.patchCount()
+                  << (cache_hit ? " (cache)" : "") << std::endl;
+    }
 
     cv::Mat_<cv::Vec3f> seed_points = seed->surface()->rawPoints();
 
@@ -1357,7 +1431,7 @@ static QuadSurface *grow_surf_from_surfs_legacy_impl(SurfaceMeta *seed, const st
         std::cout << "testing " << p << " from cands: " << seed->overlapping.size() << coord << std::endl;
         for(auto s : seed->overlapping) {
             auto ptr = s->surface()->pointer();
-            if (s->surface()->pointTo(ptr, coord, same_surface_th) <= same_surface_th) {
+            if (s->surface()->pointTo(ptr, coord, same_surface_th, 1000, legacy_patch_index_ptr) <= same_surface_th) {
                 cv::Vec3f loc = s->surface()->loc_raw(ptr);
                 data.surfs(p).insert(s);
                 data.loc(s, p) = {loc[1], loc[0]};
@@ -1551,7 +1625,8 @@ static QuadSurface *grow_surf_from_surfs_legacy_impl(SurfaceMeta *seed, const st
                 for(auto test_surf : local_surfs) {
                     auto ptr = test_surf->surface()->pointer();
                     //FIXME this does not check geometry, only if its also on the surfaces (which might be good enough...)
-                    if (test_surf->surface()->pointTo(ptr, coord, same_surface_th, 10) <= same_surface_th) {
+                    if (test_surf->surface()->pointTo(ptr, coord, same_surface_th, 10,
+                                                       legacy_patch_index_ptr) <= same_surface_th) {
                         int count = 0;
                         int straight_count = 0;
                         state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
@@ -1631,7 +1706,8 @@ static QuadSurface *grow_surf_from_surfs_legacy_impl(SurfaceMeta *seed, const st
                         continue;
 
                     auto ptr = test_surf->surface()->pointer();
-                    if (test_surf->surface()->pointTo(ptr, best_coord, same_surface_th, 10) <= same_surface_th) {
+                    if (test_surf->surface()->pointTo(ptr, best_coord, same_surface_th, 10,
+                                                       legacy_patch_index_ptr) <= same_surface_th) {
                         cv::Vec3f loc = test_surf->surface()->loc_raw(ptr);
                         data_th.loc(test_surf, p) = {loc[1], loc[0]};
                         int count = 0;
@@ -1653,7 +1729,8 @@ static QuadSurface *grow_surf_from_surfs_legacy_impl(SurfaceMeta *seed, const st
                 //TODO only add/test if we have 2 neighs which both find locations
                 for(auto test_surf : more_local_surfs) {
                     auto ptr = test_surf->surface()->pointer();
-                    float res = test_surf->surface()->pointTo(ptr, best_coord, same_surface_th, 10);
+                    float res = test_surf->surface()->pointTo(ptr, best_coord, same_surface_th, 10,
+                                                               legacy_patch_index_ptr);
                     if (res <= same_surface_th) {
                         cv::Vec3f loc = test_surf->surface()->loc_raw(ptr);
                         cv::Vec3f coord = SurfTrackerData::lookup_int_loc(test_surf, {loc[1], loc[0]});
@@ -1796,7 +1873,8 @@ static QuadSurface *grow_surf_from_surfs_legacy_impl(SurfaceMeta *seed, const st
             cv::Mat_<cv::Vec3d> opt_points = points.clone();
 
             cv::Rect active = active_bounds & used_area;
-            optimize_surface_mapping(opt_data, opt_state, opt_points, active, static_bounds, step, src_step, {y0,x0}, closing_r, true, tgt_dir);
+            optimize_surface_mapping(opt_data, opt_state, opt_points, active, static_bounds, step, src_step,
+                                     {y0,x0}, closing_r, true, tgt_dir, legacy_patch_index_ptr);
             if (active.area() > 0) {
                 copy(opt_data, data, active);
                 opt_points(active).copyTo(points(active));
