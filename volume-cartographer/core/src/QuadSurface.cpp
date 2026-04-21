@@ -582,7 +582,6 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     // Trigger the cache build + set _validMaskAllValid before deciding
     // whether we need the validity warp below.
     cv::Mat valid_src = validMask();
-    const bool skipValidity = _validMaskAllValid;
 
     // --- warp coords with seam-safe border (replicate) -------------------
     cv::Mat_<cv::Vec3f> coords_big;
@@ -590,13 +589,11 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
                 cv::INTER_LINEAR, cv::BORDER_REPLICATE);
 
     // --- warp validity with constant 0 (no replicate leakage) -----------
-    // Skip entirely when the source mask is all-valid: the cropped region
-    // can only contain 255s (the 4px halo that would hold 0s is discarded).
+    // Always warp: even when all source points are valid, pixels outside the
+    // source grid must be invalidated (BORDER_REPLICATE extends edge values).
     cv::Mat valid_big;
-    if (!skipValidity) {
-        cv::warpAffine(valid_src, valid_big, A, size + cv::Size(8, 8),
-                    cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
-    }
+    cv::warpAffine(valid_src, valid_big, A, size + cv::Size(8, 8),
+                cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
 
     // --- normals: warp cached source-grid normals -------------------
     cv::Mat_<cv::Vec3f> normals_big;
@@ -655,7 +652,7 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     const cv::Vec3f qnan(std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN());
-    if (!skipValidity) {
+    {
         cv::Mat valid = valid_big(inner);
         const bool doNormals = need_normals;
         for (int j = 0; j < h; ++j) {
