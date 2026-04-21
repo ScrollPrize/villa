@@ -39,9 +39,8 @@ class FitData3D:
 
 	@property
 	def size(self) -> tuple[int, int, int]:
-		"""(Z, Y, X) spatial dimensions from first available channel."""
-		ref = self.cos if self.cos is not None else self.grad_mag
-		_, _, z, y, x = ref.shape
+		"""(Z, Y, X) spatial dimensions from grad_mag (always loaded)."""
+		_, _, z, y, x = self.grad_mag.shape
 		return int(z), int(y), int(x)
 
 	def _spacing_for(self, channel: str) -> tuple[float, float, float]:
@@ -501,8 +500,9 @@ def load_3d(
 
 	# Build per-channel spacing in base (VC3D) coordinates.
 	# spacing = channel_scaledown * source_to_base  (base voxels per zarr voxel)
-	cos_group, _ = vol.channel_group("cos")
-	primary_sd = float(cos_group.scaledown) * s2b
+	# Primary spacing always from grad_mag (always loaded, matches size())
+	gm_group, _ = vol.channel_group("grad_mag")
+	primary_sd = float(gm_group.scaledown) * s2b
 	primary_spacing = (primary_sd, primary_sd, primary_sd)
 
 	channel_spacing: dict[str, tuple[float, float, float]] = {}

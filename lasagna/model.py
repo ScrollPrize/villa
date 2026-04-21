@@ -559,6 +559,8 @@ class Model3D(nn.Module):
 		else:
 			target_plain = torch.zeros(D, 1, He, We, device=xyz_lr.device)
 			target_mod = torch.zeros(D, 1, He, We, device=xyz_lr.device)
+			amp_lr = self.amp.clamp(0.1, 1.0)
+			bias_lr = self.bias.clamp(0.0, 0.45)
 
 		# Masking via grad_mag > 0
 		mask_hr = (data.grid_sample_fullres(xyz_hr.detach()).grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
@@ -688,11 +690,11 @@ class Model3D(nn.Module):
 			scaledown=float(mp["scaledown"]),
 			z_step_eff=int(mp["z_step_eff"]),
 			volume_extent=mp.get("volume_extent"),
-			pyramid_d=True,
+			pyramid_d=bool(mp.get("pyramid_d", True)),
 		)
 		# Reconstruct pyramid from flat
 		n_scales = len(mdl.mesh_ms)
-		mdl.mesh_ms = cls._construct_pyramid_from_flat_3d(flat, n_scales, pyramid_d=True)
+		mdl.mesh_ms = cls._construct_pyramid_from_flat_3d(flat, n_scales, pyramid_d=mdl.pyramid_d)
 		# Load remaining state (skip mesh keys)
 		st_rest = {k: v for k, v in state_dict.items()
 				   if not k.startswith("mesh_ms.") and k != "mesh_flat"}
