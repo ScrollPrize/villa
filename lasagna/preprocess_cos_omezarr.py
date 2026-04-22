@@ -2523,14 +2523,6 @@ def run_preprocess_3d(
 						base_z1 = (cos_oz0 + eff_out_ze) * effective_cos_sd
 						pdt_z0 = base_z0 // pred_sd
 						pdt_z1 = base_z1 // pred_sd
-						# DEBUG: trace alignment
-						_ocp = max(1, pred_per_cos) * oc
-						print(f"\n[pred_dt DEBUG] eff_out_zs={eff_out_zs} eff_out_ze={eff_out_ze} "
-							  f"cos_oz0={cos_oz0} b_f={b_f} flush_from_f={flush_from_f} "
-							  f"flush_to_f={flush_to_f} "
-							  f"base_z0={base_z0} pdt_z0={pdt_z0} pdt_z1={pdt_z1} "
-							  f"ocp={_ocp} pdt_z0%ocp={pdt_z0 % _ocp}",
-							  flush=True)
 						# Crop YX: source coords → base → pred_src
 						if crop_xyzwhd is not None:
 							pdt_y0 = y0 * input_sd // pred_sd
