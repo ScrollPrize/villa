@@ -472,6 +472,823 @@ def run_preprocess(
 	)
 
 
+# ---------------------------------------------------------------------------
+# OME-Zarr helpers
+# ---------------------------------------------------------------------------
+
+def _zarr_chunk_path(level_path: str, sep: str, iz: int, iy: int, ix: int) -> str:
+	"""Filesystem path for a zarr chunk within a level directory."""
+	if sep == "/":
+		return os.path.join(level_path, str(iz), str(iy), str(ix))
+	return os.path.join(level_path, f"{iz}{sep}{iy}{sep}{ix}")
+
+
+def _atomic_zarr_write(omezarr_path: str, level: int,
+					   z0: int, y0: int, x0: int,
+					   z1: int, y1: int, x1: int,
+					   data: np.ndarray, chunk_size: int) -> None:
+	"""Write data to a temp zarr level, then atomically rename chunks into the real output."""
+	import shutil
+	sep = _omezarr_dim_sep(omezarr_path, level)
+	level_path = os.path.join(omezarr_path, str(level))
+	# Temp dir outside the OME-Zarr, in the parent output directory
+	out_dir = os.path.dirname(omezarr_path)
+	zarr_name = os.path.basename(omezarr_path)
+	tmp_path = os.path.join(out_dir, f".tmp.{zarr_name}.{level}.{os.getpid()}")
+
+	# Ensure temp level has .zarray metadata
+	os.makedirs(tmp_path, exist_ok=True)
+	zarray_src = os.path.join(level_path, ".zarray")
+	zarray_dst = os.path.join(tmp_path, ".zarray")
+	if not os.path.isfile(zarray_dst) and os.path.isfile(zarray_src):
+		shutil.copy2(zarray_src, zarray_dst)
+
+	# Write to temp level
+	tmp_arr = zarr.open(tmp_path, mode="r+")
+	tmp_arr[z0:z1, y0:y1, x0:x1] = data
+
+	# Rename each chunk file atomically into real output
+	for cz in range(z0, z1, chunk_size):
+		for cy in range(y0, y1, chunk_size):
+			for cx in range(x0, x1, chunk_size):
+				iz, iy, ix = cz // chunk_size, cy // chunk_size, cx // chunk_size
+				src = _zarr_chunk_path(tmp_path, sep, iz, iy, ix)
+				dst = _zarr_chunk_path(level_path, sep, iz, iy, ix)
+				if os.path.isfile(src):
+					os.makedirs(os.path.dirname(dst), exist_ok=True)
+					os.replace(src, dst)
+
+
+def _omezarr_dim_sep(omezarr_path: str, level: int) -> str:
+	"""Read dimension_separator from .zarray metadata. Defaults to '.'."""
+	import json as _json
+	zarray_path = os.path.join(omezarr_path, str(level), ".zarray")
+	try:
+		with open(zarray_path) as f:
+			return _json.load(f).get("dimension_separator", ".")
+	except Exception:
+		return "."
+
+
+_dim_sep_cache: dict[tuple[str, int], str] = {}
+
+
+def _omezarr_chunk_exists(omezarr_path: str, level: int, z: int, y: int, x: int, chunk_size: int) -> bool:
+	"""Check if an OME-Zarr chunk file exists on disk."""
+	key = (omezarr_path, level)
+	if key not in _dim_sep_cache:
+		_dim_sep_cache[key] = _omezarr_dim_sep(omezarr_path, level)
+	sep = _dim_sep_cache[key]
+	iz, iy, ix = z // chunk_size, y // chunk_size, x // chunk_size
+	if sep == "/":
+		chunk_path = os.path.join(omezarr_path, str(level), str(iz), str(iy), str(ix))
+	else:
+		chunk_path = os.path.join(omezarr_path, str(level), f"{iz}{sep}{iy}{sep}{ix}")
+	return os.path.isfile(chunk_path)
+
+
+def _omezarr_level_shape(
+	base_shape: tuple[int, int, int], level: int,
+) -> tuple[int, int, int]:
+	"""Shape at a given pyramid level (halving with ceil, like OME-Zarr)."""
+	z, y, x = (int(v) for v in base_shape)
+	for _ in range(max(0, int(level))):
+		z = max(1, (z + 1) // 2)
+		y = max(1, (y + 1) // 2)
+		x = max(1, (x + 1) // 2)
+	return z, y, x
+
+
+def _create_omezarr(
+	path: str,
+	base_shape_zyx: tuple[int, int, int],
+	first_level: int,
+	n_levels: int,
+	chunk: int,
+	channel_name: str,
+) -> zarr.Group:
+	"""Create an OME-Zarr group with pyramid level arrays.
+
+	Creates levels from ``first_level`` to ``n_levels - 1`` (coarser only).
+	Each level is a 3D (Z, Y, X) uint8 array.
+	"""
+	g = zarr.open_group(str(path), mode="w", zarr_format=2)
+	datasets = []
+	for lv in range(first_level, n_levels):
+		sh = _omezarr_level_shape(base_shape_zyx, lv)
+		g.create_array(
+			str(lv), shape=sh,
+			chunks=(min(sh[0], chunk), min(sh[1], chunk), min(sh[2], chunk)),
+			dtype=np.uint8, fill_value=0, overwrite=True,
+			chunk_key_encoding={"name": "v2", "separator": "/"},
+		)
+		datasets.append({
+			"path": str(lv),
+			"coordinateTransformations": [{"type": "scale", "scale": [float(2 ** lv)] * 3}],
+		})
+	g.attrs["multiscales"] = [{
+		"version": "0.4",
+		"name": channel_name,
+		"axes": [
+			{"name": "z", "type": "space", "unit": "pixel"},
+			{"name": "y", "type": "space", "unit": "pixel"},
+			{"name": "x", "type": "space", "unit": "pixel"},
+		],
+		"datasets": datasets,
+	}]
+	return g
+
+
+def _open_or_create_omezarr(
+	path: str,
+	base_shape_zyx: tuple[int, int, int],
+	first_level: int,
+	n_levels: int,
+	chunk: int,
+	channel_name: str,
+) -> zarr.Group:
+	"""Open existing OME-Zarr group or create a new one."""
+	if os.path.exists(path):
+		try:
+			g = zarr.open_group(str(path), mode="r+")
+			# Verify the data level exists and has correct shape
+			expected = _omezarr_level_shape(base_shape_zyx, first_level)
+			arr = g[str(first_level)]
+			if tuple(int(v) for v in arr.shape) == expected:
+				# Verify zarr format
+				import json as _json
+				zarray_path = os.path.join(path, str(first_level), ".zarray")
+				if os.path.isfile(zarray_path):
+					with open(zarray_path) as f:
+						meta = _json.load(f)
+					zfmt = meta.get("zarr_format", None)
+					if zfmt != 2:
+						raise ValueError(
+							f"{path} level {first_level} has zarr_format={zfmt}, expected 2. "
+							"Delete and re-create the output."
+						)
+				print(f"[predict3d] reusing existing {os.path.basename(path)} "
+					  f"(level {first_level} shape={expected})", flush=True)
+				return g
+		except (KeyError, ValueError):
+			raise
+		except Exception:
+			pass
+		print(f"[predict3d] {path} shape mismatch, recreating", flush=True)
+	print(f"[predict3d] creating new {os.path.basename(path)} "
+		  f"(levels {first_level}-{n_levels-1})", flush=True)
+	return _create_omezarr(path, base_shape_zyx, first_level, n_levels, chunk, channel_name)
+
+
+def _build_omezarr_pyramid(
+	omezarr_path: str,
+	data_level: int,
+	n_levels: int,
+	chunk: int,
+	workers: int = 0,
+	crop_zyx: tuple[int, int, int, int, int, int] | None = None,
+	label: str = "",
+) -> None:
+	"""Build coarser pyramid levels by parallel 2x downsampling.
+
+	Uses the same chunk-aligned multiprocessing approach as the VC3D
+	converter: each worker reads a 2×chunk region from level N and writes
+	one chunk to level N+1.  No write contention.
+	"""
+	import multiprocessing as _mp
+
+	from convert_fit_zarr_to_vc3d_omezarr import (
+		_downsample_chunk_worker, _print_progress,
+	)
+
+	if workers <= 0:
+		workers = max(1, _mp.cpu_count())
+
+	g = zarr.open_group(str(omezarr_path), mode="r+")
+
+	# Crop region at the data level (if given), halved for each coarser level
+	if crop_zyx is not None:
+		cz0_base, cy0_base, cx0_base, cz1_base, cy1_base, cx1_base = crop_zyx
+	else:
+		cz0_base = cy0_base = cx0_base = 0
+		cz1_base = cy1_base = cx1_base = None  # full extent
+
+	for lv in range(data_level + 1, n_levels):
+		src_shape = tuple(int(v) for v in g[str(lv - 1)].shape)
+		dst_shape = tuple(int(v) for v in g[str(lv)].shape)
+		cz2 = chunk * 2
+
+		# Scale crop to source level (halve per level above data_level)
+		levels_above = lv - 1 - data_level
+		scale = 2 ** levels_above
+		sz0 = (cz0_base // scale // cz2) * cz2 if cz1_base is not None else 0
+		sy0 = (cy0_base // scale // cz2) * cz2 if cy1_base is not None else 0
+		sx0 = (cx0_base // scale // cz2) * cz2 if cx1_base is not None else 0
+		sz1 = min(src_shape[0], ((cz1_base // scale + cz2 - 1) // cz2) * cz2) if cz1_base is not None else src_shape[0]
+		sy1 = min(src_shape[1], ((cy1_base // scale + cz2 - 1) // cz2) * cz2) if cy1_base is not None else src_shape[1]
+		sx1 = min(src_shape[2], ((cx1_base // scale + cz2 - 1) // cz2) * cz2) if cx1_base is not None else src_shape[2]
+
+		ds_work = []
+		skipped_ds = 0
+		for z0 in range(sz0, sz1, cz2):
+			z1 = min(sz1, z0 + cz2)
+			for y0 in range(sy0, sy1, cz2):
+				y1 = min(sy1, y0 + cz2)
+				for x0 in range(sx0, sx1, cz2):
+					x1 = min(sx1, x0 + cz2)
+					# Skip if dest chunk already exists
+					if _omezarr_chunk_exists(omezarr_path, lv, z0 // 2, y0 // 2, x0 // 2, chunk):
+						skipped_ds += 1
+						continue
+					ds_work.append((
+						str(omezarr_path), lv - 1, lv,
+						z0, z1, y0, y1, x0, x1,
+					))
+
+		n_ds = len(ds_work)
+		tag = f"[pyramid {label} L{lv}]" if label else f"[pyramid L{lv}]"
+		if skipped_ds > 0:
+			print(f"{tag} skipped {skipped_ds} existing chunks", flush=True)
+		if n_ds == 0:
+			continue
+
+		t_lv = time.time()
+		done_count = [0]
+		lock = threading.Lock()
+		_stop = threading.Event()
+		def _prog():
+			while not _stop.is_set():
+				with lock:
+					d = done_count[0]
+				_print_progress(prefix=tag, done=d, total=n_ds, t0=t_lv)
+				_stop.wait(0.5)
+		prog_thread = threading.Thread(target=_prog, daemon=True)
+		prog_thread.start()
+
+		with _mp.Pool(processes=min(workers, n_ds)) as pool:
+			for _ in pool.imap_unordered(_downsample_chunk_worker, ds_work):
+				with lock:
+					done_count[0] += 1
+
+		_stop.set()
+		prog_thread.join(timeout=2)
+		_print_progress(prefix=tag, done=n_ds, total=n_ds, t0=t_lv)
+		print("", flush=True)
+
+
+def _find_resume_z(omezarr_path: str, level: int) -> int:
+	"""Find the highest z-index with non-zero data in an OME-Zarr level.
+
+	Returns 0 if no data found or OME-Zarr doesn't exist.
+	Uses binary search on z-slabs for efficiency.
+	"""
+	if not os.path.exists(omezarr_path):
+		return 0
+	try:
+		g = zarr.open_group(str(omezarr_path), mode="r")
+		arr = g[str(level)]
+		z_total = int(arr.shape[0])
+		if z_total == 0:
+			return 0
+		# Binary search: find highest z with any non-zero data
+		lo, hi = 0, z_total
+		# Quick check: is there any data at all?
+		mid_z = z_total // 2
+		sample = np.asarray(arr[mid_z])
+		if not np.any(sample != 0):
+			# Check if there's data in the first half
+			sample = np.asarray(arr[0])
+			if not np.any(sample != 0):
+				return 0
+			hi = mid_z
+		# Binary search for the last z with data
+		while lo < hi - 1:
+			mid = (lo + hi) // 2
+			sample = np.asarray(arr[mid])
+			if np.any(sample != 0):
+				lo = mid
+			else:
+				hi = mid
+		return lo + 1  # return count of written z-slices
+	except Exception:
+		return 0
+
+
+import ctypes
+import ctypes.util
+
+_libc = None
+
+
+def _get_libc():
+	global _libc
+	if _libc is None:
+		_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+	return _libc
+
+
+def _release_memmap_pages(arr: np.ndarray, z0: int, z1: int) -> None:
+	"""Release memmap pages for z-slice range [z0, z1) via madvise(DONTNEED).
+
+	For a 4D array (C, Z, Y, X), z is axis 1. For the wsum arrays (1, Z, Y, X)
+	same layout. This frees both RAM and disk backing.
+	"""
+	if z1 <= z0 or not hasattr(arr, 'ctypes'):
+		return
+	try:
+		libc = _get_libc()
+		# Bytes per z-slice: product of dims after z * itemsize
+		# For shape (C, Z, Y, X), stride along z-axis
+		bytes_per_z = int(np.prod(arr.shape[2:])) * arr.shape[0] * arr.itemsize
+		offset = z0 * bytes_per_z
+		length = (z1 - z0) * bytes_per_z
+		page = 4096
+		aligned_offset = (offset // page) * page
+		aligned_end = ((offset + length + page - 1) // page) * page
+		aligned_length = aligned_end - aligned_offset
+		if aligned_length <= 0:
+			return
+		addr = ctypes.c_void_p(arr.ctypes.data + aligned_offset)
+		MADV_DONTNEED = 4
+		libc.madvise(addr, ctypes.c_size_t(aligned_length), ctypes.c_int(MADV_DONTNEED))
+	except Exception:
+		pass  # best effort — non-critical
+
+
+def _edt_reader_proc(pred_path, work_list, overlap, pZ, pY, pX,
+					  shm_in_names, shm_shapes, free_q, ready_q, work_q, stop_evt):
+	"""Reader process: grab chunk indices from work_q, free slots from free_q,
+	read zarr into shared memory, signal ready_q.  Module-level for pickling."""
+	import tensorstore as ts
+	import multiprocessing.shared_memory as _shm2
+	ctx = ts.Context({
+		'data_copy_concurrency': {'limit': 1},
+		'file_io_concurrency': {'limit': 4},
+	})
+	spec = {'driver': 'zarr', 'kvstore': {'driver': 'file',
+			'path': os.path.normpath(str(pred_path))}}
+	pred = ts.open(spec, read=True, open=True, context=ctx).result()
+	_n = 0; _t_wq = 0.0; _t_fq = 0.0; _t_read = 0.0; _t_copy = 0.0
+	while not stop_evt.is_set():
+		_t0 = time.monotonic()
+		try:
+			chunk_idx = work_q.get(timeout=0.1)
+		except Exception:
+			if work_q.empty():
+				break
+			continue
+		_t1 = time.monotonic()
+		slot = free_q.get()
+		_t2 = time.monotonic()
+
+		cz0, cz1, cy0, cy1, cx0, cx1 = work_list[chunk_idx]
+		rz0 = max(0, cz0 - overlap)
+		rz1 = min(pZ, cz1 + overlap)
+		ry0 = max(0, cy0 - overlap)
+		ry1 = min(pY, cy1 + overlap)
+		rx0 = max(0, cx0 - overlap)
+		rx1 = min(pX, cx1 + overlap)
+
+		raw = pred[rz0:rz1, ry0:ry1, rx0:rx1].read().result()
+		binary = (np.asarray(raw) > 0).astype(np.uint8)
+		del raw
+		_t3 = time.monotonic()
+
+		sm = _shm2.SharedMemory(name=shm_in_names[slot])
+		buf = np.ndarray(shm_shapes[slot], dtype=np.uint8, buffer=sm.buf)
+		ashp = binary.shape
+		buf[:ashp[0], :ashp[1], :ashp[2]] = binary
+		sm.close()
+		_t4 = time.monotonic()
+
+		ready_q.put((slot, chunk_idx, ashp))
+
+		_n += 1; _t_wq += _t1-_t0; _t_fq += _t2-_t1; _t_read += _t3-_t2; _t_copy += _t4-_t3
+		if _n % 20 == 0:
+			print(f"  [reader pid={os.getpid()}] n={_n} "
+				  f"work_q={1000*_t_wq/_n:.0f} free_q={1000*_t_fq/_n:.0f} "
+				  f"read={1000*_t_read/_n:.0f} copy={1000*_t_copy/_n:.0f}ms/chunk",
+				  flush=True)
+
+
+def _edt_writer_proc(out_path, out_level, work_list, overlap, pZ, pY, pX,
+					  pred_z0, pred_y0, pred_x0, out_z0, out_y0, out_x0,
+					  scaledown, shm_out_names, shm_out_shapes,
+					  write_q, free_q, stop_evt):
+	"""Writer process: grab results from write_q, downsample + write zarr from
+	shared memory, release slot to free_q.
+
+	Writes are atomic: each chunk is written to a temp zarr location first,
+	then the chunk file is renamed into the real output. A killed process
+	can never leave a half-written chunk in the output.
+	"""
+	import tensorstore as ts
+	import multiprocessing.shared_memory as _shm2
+	import json as _json
+	ctx = ts.Context({
+		'data_copy_concurrency': {'limit': 1},
+		'file_io_concurrency': {'limit': 4},
+	})
+	# Open the real output for reading shape info
+	level_path = os.path.normpath(os.path.join(str(out_path), str(out_level)))
+	spec = {'driver': 'zarr', 'kvstore': {'driver': 'file', 'path': level_path}}
+	out_arr = ts.open(spec, read=True, open=True, context=ctx).result()
+	out_vol_shape = tuple(out_arr.shape)
+
+	# Create a per-worker temp zarr dir for atomic writes (outside OME-Zarr)
+	_out_dir = os.path.dirname(os.path.normpath(str(out_path)))
+	_zarr_name = os.path.basename(os.path.normpath(str(out_path)))
+	tmp_level_path = os.path.join(_out_dir, f".tmp.{_zarr_name}.{out_level}.{os.getpid()}")
+	os.makedirs(tmp_level_path, exist_ok=True)
+	# Copy .zarray metadata so tensorstore can open it
+	zarray_src = os.path.join(level_path, ".zarray")
+	zarray_dst = os.path.join(tmp_level_path, ".zarray")
+	if os.path.isfile(zarray_src) and not os.path.isfile(zarray_dst):
+		import shutil
+		shutil.copy2(zarray_src, zarray_dst)
+	tmp_spec = {'driver': 'zarr', 'kvstore': {'driver': 'file', 'path': tmp_level_path}}
+	tmp_arr = ts.open(tmp_spec, read=True, write=True, open=True, context=ctx).result()
+
+	# Read dimension separator for chunk file naming
+	dim_sep = "/"
+	if os.path.isfile(zarray_src):
+		with open(zarray_src) as f:
+			dim_sep = _json.load(f).get("dimension_separator", ".")
+
+	_n = 0; _t_wq = 0.0; _t_shm = 0.0; _t_ds = 0.0; _t_wr = 0.0
+	while not stop_evt.is_set():
+		_tw0 = time.monotonic()
+		try:
+			item = write_q.get(timeout=0.1)
+		except Exception:
+			continue
+		if item is None:
+			break
+		_tw1 = time.monotonic()
+		slot, chunk_idx, ashp = item
+
+		cz0, cz1, cy0, cy1, cx0, cx1 = work_list[chunk_idx]
+		rz0 = max(0, cz0 - overlap)
+		ry0 = max(0, cy0 - overlap)
+		rx0 = max(0, cx0 - overlap)
+
+		sm = _shm2.SharedMemory(name=shm_out_names[slot])
+		buf = np.ndarray(shm_out_shapes[slot], dtype=np.uint8, buffer=sm.buf)
+		dt_u8 = buf[:ashp[0], :ashp[1], :ashp[2]].copy()
+		sm.close()
+		_tw2 = time.monotonic()
+
+		# Downsample all z-slices, assemble into a single 3D output block
+		sz, sy, sx = cz1 - cz0, cy1 - cy0, cx1 - cx0
+		center = dt_u8[cz0 - rz0:cz0 - rz0 + sz,
+					   cy0 - ry0:cy0 - ry0 + sy,
+					   cx0 - rx0:cx0 - rx0 + sx]
+		oyi_base = out_y0 + (cy0 - pred_y0) // scaledown
+		oxi_base = out_x0 + (cx0 - pred_x0) // scaledown
+		out_slices = []
+		for zl in range(0, sz, scaledown):
+			slc = center[zl]
+			if scaledown > 1:
+				oh = max(1, slc.shape[0] // scaledown)
+				ow = max(1, slc.shape[1] // scaledown)
+				slc = cv2.resize(slc, (ow, oh), interpolation=cv2.INTER_AREA)
+			out_slices.append(slc)
+		_tw3 = time.monotonic()
+
+		# Write to temp zarr, then rename chunk files into real output (atomic)
+		if out_slices:
+			block = np.stack(out_slices, axis=0)
+			ozi_start = out_z0 + (cz0 - pred_z0) // scaledown
+			oy_end = min(out_vol_shape[1], oyi_base + block.shape[1])
+			ox_end = min(out_vol_shape[2], oxi_base + block.shape[2])
+			wy = oy_end - oyi_base
+			wx = ox_end - oxi_base
+			oz_end = min(out_vol_shape[0], ozi_start + block.shape[0])
+			wz = oz_end - ozi_start
+			if wz > 0 and wy > 0 and wx > 0:
+				# Write to temp
+				tmp_arr[ozi_start:oz_end, oyi_base:oy_end, oxi_base:ox_end].write(
+					block[:wz, :wy, :wx]).result()
+
+				# Rename each chunk file from temp to real output
+				chunks = tmp_arr.chunk_layout.read_chunk.shape
+				if chunks is not None:
+					cs = [int(c) for c in chunks]
+				else:
+					cs = [32, 32, 32]  # fallback
+				for cz in range(ozi_start, oz_end, cs[0]):
+					for cy in range(oyi_base, oy_end, cs[1]):
+						for cx in range(oxi_base, ox_end, cs[2]):
+							iz, iy, ix = cz // cs[0], cy // cs[1], cx // cs[2]
+							if dim_sep == "/":
+								rel = os.path.join(str(iz), str(iy), str(ix))
+							else:
+								rel = f"{iz}{dim_sep}{iy}{dim_sep}{ix}"
+							src_file = os.path.join(tmp_level_path, rel)
+							dst_file = os.path.join(level_path, rel)
+							if os.path.isfile(src_file):
+								os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+								os.replace(src_file, dst_file)  # atomic on Linux
+		_tw4 = time.monotonic()
+
+		free_q.put(slot)
+
+		_n += 1
+		_t_wq += _tw1 - _tw0; _t_shm += _tw2 - _tw1
+		_t_ds += _tw3 - _tw2; _t_wr += _tw4 - _tw3
+		if _n % 20 == 0:
+			print(f"  [writer pid={os.getpid()}] n={_n} "
+				  f"wq={1000*_t_wq/_n:.0f} shm={1000*_t_shm/_n:.0f} "
+				  f"ds={1000*_t_ds/_n:.0f} write={1000*_t_wr/_n:.0f}ms/chunk",
+				  flush=True)
+
+
+
+
+def _compute_pred_dt_slab(
+	*,
+	pred_zarr,
+	pred_path: str,
+	output_level_arr,
+	output_omezarr_path: str,
+	output_level_key: str,
+	pred_z0: int, pred_z1: int,
+	pred_y0: int, pred_y1: int,
+	pred_x0: int, pred_x1: int,
+	out_z0: int, out_y0: int, out_x0: int,
+	scaledown: int,
+	overlap: int = 48,
+	edt_chunk: int = 448,
+	ome_chunk: int = 32,
+	progress: dict | None = None,
+	read_workers: int = 0,
+) -> None:
+	"""Compute signed distance-to-surface for a region, chunked for GPU EDT.
+
+	Pipeline: multiprocessing workers read+binarize chunks from zarr in
+	parallel (each opens its own handle to avoid zarr3 concurrency issues),
+	feeding a buffer of ready chunks.  The main process pulls chunks in
+	order and runs GPU EDT, keeping the GPU saturated while I/O happens
+	in the background.
+	"""
+	if not _HAS_CUPY:
+		raise ImportError("pred-dt requires CuPy for GPU EDT")
+
+	import multiprocessing as _mp
+
+	_MAX_DT = 48
+	pZ, pY, pX = (int(v) for v in pred_zarr.shape)
+
+	# Align edt_chunk to output zarr chunk boundaries to avoid write collisions
+	# and enable per-chunk resume.  Output chunk in pred coords = ome_chunk * scaledown.
+	# Use largest multiple of out_chunk_in_pred that fits in GPU memory.
+	# EDT needs ~12 bytes/voxel peak (bool + 2×float32 + uint8).
+	# Query available GPU memory to size chunks appropriately.
+	out_chunk_in_pred = max(1, scaledown) * max(1, ome_chunk)
+	try:
+		_gpu_free = cp.cuda.Device().mem_info[0]
+		# Use at most 60% of free memory, 12 bytes per voxel
+		max_voxels = int(_gpu_free * 0.6 / 12)
+		max_side = max(out_chunk_in_pred, int(max_voxels ** (1.0 / 3.0)))
+	except Exception:
+		max_side = 512
+	edt_chunk = max(out_chunk_in_pred,
+					(min(edt_chunk, max_side) // out_chunk_in_pred) * out_chunk_in_pred)
+	print(f"[pred_dt] edt_chunk={edt_chunk} (out_chunk_in_pred={out_chunk_in_pred}, "
+		  f"gpu_free={_gpu_free / 2**30:.1f}GiB, max_side={max_side})", flush=True)
+	# Validate alignment — caller must pass chunk-aligned coordinates
+	ocp = out_chunk_in_pred
+	for name, val, limit in [("pred_z0", pred_z0, pZ), ("pred_y0", pred_y0, pY), ("pred_x0", pred_x0, pX),
+							 ("pred_z1", pred_z1, pZ), ("pred_y1", pred_y1, pY), ("pred_x1", pred_x1, pX)]:
+		if val != limit and val % ocp != 0:
+			raise ValueError(
+				f"_compute_pred_dt_slab: {name}={val} not aligned to {ocp}. "
+				"Caller must pass chunk-aligned coordinates."
+			)
+
+	def _out_chunk_exists(cz0, cy0, cx0):
+		"""Check if the output zarr chunk for this pred-src region exists."""
+		ozi = out_z0 + (cz0 - pred_z0) // scaledown
+		oyi = out_y0 + (cy0 - pred_y0) // scaledown
+		oxi = out_x0 + (cx0 - pred_x0) // scaledown
+		return _omezarr_chunk_exists(output_omezarr_path, int(output_level_key),
+									 ozi, oyi, oxi, ome_chunk)
+
+	# Build work list, skipping chunks whose output already exists
+	work: list[tuple[int, int, int, int, int, int]] = []
+	skipped = 0
+	for cz0 in range(pred_z0, pred_z1, edt_chunk):
+		cz1 = min(pred_z1, cz0 + edt_chunk)
+		for cy0 in range(pred_y0, pred_y1, edt_chunk):
+			cy1 = min(pred_y1, cy0 + edt_chunk)
+			for cx0 in range(pred_x0, pred_x1, edt_chunk):
+				cx1 = min(pred_x1, cx0 + edt_chunk)
+				if _out_chunk_exists(cz0, cy0, cx0):
+					skipped += 1
+					continue
+				work.append((cz0, cz1, cy0, cy1, cx0, cx1))
+
+	n_chunks = len(work)
+	if skipped > 0:
+		print(f"[pred_dt] skipped {skipped} already-processed chunks", flush=True)
+	if n_chunks == 0:
+		return
+
+	t0 = time.time()
+	n_workers = min(read_workers if read_workers > 0 else max(1, (os.cpu_count() or 4) // 4),
+				   n_chunks)
+
+	print(f"[pred_dt] {n_chunks} chunks to process, {n_workers} workers, edt_chunk={edt_chunk}",
+		  flush=True)
+
+	# --- Shared-memory ring buffer pipeline ---
+	# No array pickling through IPC — only slot indices through queues.
+	# Readers write into shared memory, GPU reads from it, writers read from it.
+	import multiprocessing.shared_memory as _shm
+	from multiprocessing import Process, Queue, Event
+
+	N_SLOTS = 32  # ring buffer depth — enough to keep GPU fed
+	padded_side = edt_chunk + 2 * overlap  # max buffer dim per axis
+	buf_shape = (padded_side, padded_side, padded_side)
+	buf_bytes = int(np.prod(buf_shape))  # uint8
+
+	# Allocate shared memory slots (input bool + output uint8)
+	shm_in: list[_shm.SharedMemory] = []
+	shm_out: list[_shm.SharedMemory] = []
+	shm_in_names: list[str] = []
+	shm_out_names: list[str] = []
+	for i in range(N_SLOTS):
+		si = _shm.SharedMemory(create=True, size=buf_bytes)
+		so = _shm.SharedMemory(create=True, size=buf_bytes)
+		shm_in.append(si)
+		shm_out.append(so)
+		shm_in_names.append(si.name)
+		shm_out_names.append(so.name)
+
+	shm_shapes = [buf_shape] * N_SLOTS
+	shm_out_shapes = [buf_shape] * N_SLOTS
+
+	# Queues: free slots, read-ready, write-ready
+	free_q: Queue = Queue()
+	ready_q: Queue = Queue()
+	write_q: Queue = Queue()
+	stop_evt = Event()
+
+	# Seed free queue with (slot, chunk_idx) pairs
+	for chunk_idx in range(n_chunks):
+		# Assign to slots round-robin; readers will block on free_q when full
+		pass
+	# Actually: seed with empty slots, then feed chunk indices separately
+	work_q: Queue = Queue()  # chunk indices to process
+	for ci in range(n_chunks):
+		work_q.put(ci)
+	for s in range(N_SLOTS):
+		free_q.put(s)
+
+	# Launch reader and writer processes
+	n_readers = min(n_workers, n_chunks)
+	n_writers = min(n_workers, n_chunks)
+	readers = []
+	for _ in range(n_readers):
+		p = Process(target=_edt_reader_proc,
+					args=(pred_path, work, overlap, pZ, pY, pX,
+						  shm_in_names, shm_shapes, free_q, ready_q, work_q, stop_evt))
+		p.daemon = True
+		p.start()
+		readers.append(p)
+
+	writers = []
+	for _ in range(n_writers):
+		p = Process(target=_edt_writer_proc,
+					args=(output_omezarr_path, output_level_key, work, overlap, pZ, pY, pX,
+						  pred_z0, pred_y0, pred_x0, out_z0, out_y0, out_x0,
+						  scaledown, shm_out_names, shm_out_shapes,
+						  write_q, free_q, stop_evt))
+		p.daemon = True
+		p.start()
+		writers.append(p)
+
+	# Main process: pipelined GPU loop with 3 CUDA streams.
+	# stream_h2d uploads chunk N+1 while stream_compute runs EDT on chunk N
+	# and stream_d2h downloads chunk N-1's result.  All three overlap.
+	gpu_done = 0
+	_t_loop_sum = 0.0
+
+
+	BATCH = 8  # process this many chunks per GPU round-trip
+	stream_h2d = cp.cuda.Stream(non_blocking=True)
+	stream_d2h = cp.cuda.Stream(non_blocking=True)
+	_t_wait_sum = 0.0; _t_h2d_sum = 0.0; _t_edt_sum = 0.0; _t_d2h_sum = 0.0
+
+	while gpu_done < n_chunks:
+		# Collect a batch of ready chunks (up to BATCH, at least 1)
+		_tw0 = time.monotonic()
+		batch_items = []
+		batch_items.append(ready_q.get())  # block for at least one
+		while len(batch_items) < BATCH and not ready_q.empty():
+			try:
+				batch_items.append(ready_q.get_nowait())
+			except Exception:
+				break
+		_tw1 = time.monotonic()
+		B = len(batch_items)
+
+		# Batch H2D: async upload all chunks to GPU
+		gpu_binaries = []
+		with stream_h2d:
+			for slot, chunk_idx, ashp in batch_items:
+				sm = _shm.SharedMemory(name=shm_in_names[slot])
+				buf = np.ndarray(shm_shapes[slot], dtype=np.uint8, buffer=sm.buf)
+				gpu_binaries.append(cp.asarray(buf[:ashp[0], :ashp[1], :ashp[2]]))
+				sm.close()
+		h2d_evt = stream_h2d.record()
+		_th2d = time.monotonic()
+
+		# Batch EDT + encode on GPU (wait for H2D, then sequential per chunk)
+		gpu_results = []
+		cp.cuda.get_current_stream().wait_event(h2d_evt)
+		for m_gpu in gpu_binaries:
+			outer_dt = cnd.distance_transform_edt(~m_gpu)
+			inner_dt = cnd.distance_transform_edt(m_gpu)
+			outer_enc = (128 - cp.clip(cp.round(outer_dt), 1, _MAX_DT)).astype(cp.uint8)
+			inner_enc = (127 + cp.clip(cp.round(inner_dt), 1, _MAX_DT)).astype(cp.uint8)
+			gpu_results.append(cp.where(m_gpu, inner_enc, outer_enc))
+			del m_gpu, outer_dt, inner_dt, outer_enc, inner_enc
+		del gpu_binaries
+		compute_evt = cp.cuda.get_current_stream().record()
+		_tedt = time.monotonic()
+
+		# Batch D2H: async download all results to shared memory
+		with stream_d2h:
+			stream_d2h.wait_event(compute_evt)
+			for i, (slot, chunk_idx, ashp) in enumerate(batch_items):
+				sm_out = _shm.SharedMemory(name=shm_out_names[slot])
+				obuf = np.ndarray(shm_out_shapes[slot], dtype=np.uint8, buffer=sm_out.buf)
+				gpu_results[i].get(out=obuf[:ashp[0], :ashp[1], :ashp[2]])
+				sm_out.close()
+		stream_d2h.synchronize()
+		for i, (slot, chunk_idx, ashp) in enumerate(batch_items):
+			write_q.put((slot, chunk_idx, ashp))
+			gpu_done += 1
+		del gpu_results
+		_td2h = time.monotonic()
+
+		_t_wait_sum += _tw1 - _tw0
+		_t_h2d_sum += _th2d - _tw1
+		_t_edt_sum += _tedt - _th2d
+		_t_d2h_sum += _td2h - _tedt
+
+		if progress is not None:
+			progress["edt_done"] = progress.get("edt_done", 0) + 1
+		if gpu_done == 0:
+			continue
+		elapsed = max(1e-6, time.time() - t0)
+		eta = elapsed / gpu_done * (n_chunks - gpu_done)
+		overall = ""
+		if progress is not None:
+			oe = max(1e-6, time.time() - progress["t0"])
+			frac = progress.get("tiles_done", 0) / max(1, progress.get("tiles_total", 1))
+			edt_frac = progress.get("edt_done", 0) / max(1, progress.get("edt_total_est", 1))
+			overall_frac = 0.7 * frac + 0.3 * edt_frac
+			if overall_frac > 0.01:
+				overall_eta = oe / overall_frac * (1.0 - overall_frac)
+				overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
+		vox_per_chunk = edt_chunk ** 3
+		mvox_s = gpu_done * vox_per_chunk / elapsed / 1e6
+		print(f"\r[pred_dt] gpu {gpu_done}/{n_chunks} "
+			  f"({100.0 * gpu_done / n_chunks:.0f}%) "
+			  f"eta {int(eta // 60):02d}:{int(eta % 60):02d} "
+			  f"{mvox_s:.0f}Mvox/s "
+			  f"wait={1000*_t_wait_sum/gpu_done:.0f} "
+			  f"h2d={1000*_t_h2d_sum/gpu_done:.0f} "
+			  f"edt={1000*_t_edt_sum/gpu_done:.0f} "
+			  f"d2h={1000*_t_d2h_sum/gpu_done:.0f}ms "
+			  f"B={B}"
+			  f"{overall}  ",
+			  end="", flush=True)
+
+	# Signal writers to stop
+	for _ in writers:
+		write_q.put(None)
+	stop_evt.set()
+	for p in readers:
+		p.join(timeout=5)
+	for p in writers:
+		p.join(timeout=10)
+
+	# Cleanup shared memory
+	for si in shm_in:
+		si.close()
+		si.unlink()
+	for so in shm_out:
+		so.close()
+		so.unlink()
+
+	cp.get_default_memory_pool().free_all_blocks()
+	print(f"\r[pred_dt] {n_chunks} chunks in {time.time() - t0:.1f}s" + " " * 30,
+		  flush=True)
+
+
 def _compute_pred_dt_channel(
 	*,
 	pred_path: str,
@@ -484,7 +1301,13 @@ def _compute_pred_dt_channel(
 	chunk_yx: int = 256,
 	overlap: int = 64,
 ) -> None:
-	"""Compute distance-to-surface channel from a prediction zarr and write into output_arr."""
+	"""Compute signed distance-to-surface channel from a prediction zarr.
+
+	Encoding (uint8): outside=[80,127], inside=[128,175], no data=0.
+	Boundary jump is exactly 1 (127→128).
+	"""
+	# Overlap must cover MAX_DT (48) so chunk-boundary EDT is accurate
+	overlap = max(overlap, 48)
 	pred = zarr.open(str(pred_path), mode="r")
 	if not hasattr(pred, "shape"):
 		raise ValueError(f"pred-dt must point to a zarr array, got group: {pred_path}")
@@ -570,53 +1393,57 @@ def _compute_pred_dt_channel(
 				chunk_np = np.asarray(pred[read_z0:read_z1, read_y0:read_y1, read_x0:read_x1])
 				print(f" {time.time() - t_read:.1f}s", flush=True)
 
-				# Binarize and compute distance transform
+				# Binarize and compute signed distance transform
 				binary = chunk_np > 0
 				del chunk_np
+				_MAX_DT = 48  # max distance in voxels for encoding
+
+				def _run_edt(mask_np):
+					"""Run EDT on a boolean mask, return float32 numpy."""
+					if _HAS_CUPY:
+						cp.get_default_memory_pool().free_all_blocks()
+						try:
+							m_gpu = cp.asarray(mask_np)
+							d_gpu = cnd.distance_transform_edt(m_gpu)
+							d = cp.asnumpy(d_gpu).astype(np.float32)
+							del m_gpu, d_gpu
+							cp.get_default_memory_pool().free_all_blocks()
+							return d
+						except cp.cuda.memory.OutOfMemoryError:
+							cp.get_default_memory_pool().free_all_blocks()
+							if not _HAS_EDT:
+								raise
+					if _HAS_EDT:
+						return edt_mod.edt(mask_np, parallel=32).astype(np.float32)
+					raise ImportError("pred-dt requires CuPy (GPU) or 'edt' package (CPU)")
+
+				nvoxels = binary.size
 				if _HAS_CUPY:
-					cp.get_default_memory_pool().free_all_blocks()
-					mempool = cp.get_default_memory_pool()
-					nvoxels = binary.size
-					# PBA 3D needs ~24 bytes/voxel (bool input + int64 encoded + int64 working + float64 output)
-					est_bytes = nvoxels * 24
 					gpu_free = cp.cuda.Device().mem_info[0]
 					print(
-						f"[pred_dt] chunk {chunk_i}/{n_chunks}  distance_transform_edt (GPU) "
-						f"voxels={nvoxels:,} est={est_bytes / 2**30:.1f}GiB "
-						f"free={gpu_free / 2**30:.1f}GiB pool_used={mempool.used_bytes() / 2**30:.2f}GiB ...",
+						f"[pred_dt] chunk {chunk_i}/{n_chunks}  signed EDT (GPU) "
+						f"voxels={nvoxels:,} free={gpu_free / 2**30:.1f}GiB ...",
 						end="", flush=True,
 					)
-					t_edt = time.time()
-					try:
-						binary_gpu = cp.asarray(binary)
-						dt_gpu = cnd.distance_transform_edt(~binary_gpu)
-						dt = cp.asnumpy(dt_gpu).astype(np.float32)
-						del binary_gpu, dt_gpu
-						cp.get_default_memory_pool().free_all_blocks()
-					except cp.cuda.memory.OutOfMemoryError as e:
-						cp.get_default_memory_pool().free_all_blocks()
-						gpu_free2 = cp.cuda.Device().mem_info[0]
-						gpu_total = cp.cuda.Device().mem_info[1]
-						print(flush=True)
-						print(
-							f"[pred_dt] GPU OOM!\n"
-							f"  chunk shape     : {binary.shape}\n"
-							f"  voxels          : {nvoxels:,}\n"
-							f"  est. GPU need   : {est_bytes / 2**30:.1f} GiB\n"
-							f"  GPU free/total  : {gpu_free2 / 2**30:.1f} / {gpu_total / 2**30:.1f} GiB\n"
-							f"  pool used       : {mempool.used_bytes() / 2**30:.2f} GiB\n"
-							f"  overlap={overlap} \u2192 max padded side = chunk + 2*overlap\n"
-							f"  Try reducing --edt-chunk-depth / --edt-chunk-yx or overlap.",
-							flush=True,
-						)
-						raise
-				elif _HAS_EDT:
-					print(f"[pred_dt] chunk {chunk_i}/{n_chunks}  distance_transform_edt (CPU) ...", end="", flush=True)
-					t_edt = time.time()
-					dt = edt_mod.edt(~binary, parallel=32).astype(np.float32)
 				else:
-					raise ImportError("pred-dt requires either CuPy (GPU) or the 'edt' package (CPU). Install with: pip install edt")
+					print(
+						f"[pred_dt] chunk {chunk_i}/{n_chunks}  signed EDT (CPU) ...",
+						end="", flush=True,
+					)
+				t_edt = time.time()
+				outer_dt = _run_edt(~binary)  # bg → distance to fg
+				inner_dt = _run_edt(binary)   # fg → distance to bg
 				print(f" {time.time() - t_edt:.1f}s", flush=True)
+
+				# Signed distance encoding:
+				#   Outside (binary=0): 128 - clip(round(outer_dt), 1, 48) → [80, 127]
+				#   Inside  (binary=1): 127 + clip(round(inner_dt), 1, 48) → [128, 175]
+				#   Boundary jump: 127 → 128 (exactly 1)
+				#   Value 0 = no data (zarr fill_value)
+				outer_enc = (128 - np.clip(np.round(outer_dt), 1, _MAX_DT)).astype(np.uint8)
+				inner_enc = (127 + np.clip(np.round(inner_dt), 1, _MAX_DT)).astype(np.uint8)
+				dt_encoded = np.where(binary, inner_enc, outer_enc)
+				del binary, outer_dt, inner_dt, outer_enc, inner_enc
 
 				# Crop off overlap padding to keep center region
 				pad_z = z_pos - read_z0
@@ -625,10 +1452,8 @@ def _compute_pred_dt_channel(
 				center_z = z_chunk_end - z_pos
 				center_y = y_chunk_end - y_pos
 				center_x = x_chunk_end - x_pos
-				dt_center = dt[pad_z:pad_z + center_z, pad_y:pad_y + center_y, pad_x:pad_x + center_x]
-
-				# Clamp to 255, cast to uint8
-				dt_u8 = np.clip(dt_center, 0.0, 255.0).astype(np.uint8)
+				dt_u8 = dt_encoded[pad_z:pad_z + center_z, pad_y:pad_y + center_y, pad_x:pad_x + center_x]
+				del dt_encoded
 
 				# Downscale to output grid
 				# Z: subsample at scaledown spacing
@@ -804,11 +1629,24 @@ def _infer_tiled_3d(
 	other_scaledown: int = 4,
 	tmp_dir: str | None = None,
 	output_sigmoid: bool = True,
-) -> tuple[np.ndarray, np.ndarray]:
+	on_z_complete=None,
+	skip_z_positions: int = 0,
+	progress: dict | None = None,
+	is_tile_done=None,
+) -> tuple[np.ndarray, np.ndarray] | None:
 	"""Run 3D UNet inference with dual-resolution accumulators.
 
 	Channel 0 (cos) is accumulated at cos_scaledown resolution.
 	Channels 1..out_channels-1 are accumulated at other_scaledown resolution.
+
+	If *on_z_complete* is provided, it is called after each z-row of tiles
+	with ``(acc_fine, wsum_fine, acc_coarse, wsum_coarse, complete_z_padded,
+	pad0)``.  The callback should normalize, post-process, write output, and
+	release memmap pages for the flushed region.  When a callback is
+	provided the function returns ``None`` (output is consumed by the
+	callback).
+
+	*skip_z_positions* skips the first N z-positions (for resume).
 
 	Returns:
 		(cos_result, other_result) where:
@@ -926,14 +1764,29 @@ def _infer_tiled_3d(
 		flush=True,
 	)
 
-	total_tiles = len(z_positions) * len(y_positions) * len(x_positions)
-	done = 0
+	tiles_per_zrow = len(y_positions) * len(x_positions)
+	total_tiles = len(z_positions) * tiles_per_zrow
+	skipped_tiles = skip_z_positions * tiles_per_zrow
+	done = skipped_tiles
 	t0 = time.time()
 	crop_offset = (z0, y0, x0)
+	if progress is not None:
+		progress["tiles_total"] = total_tiles
+		progress["tiles_done"] = done
 
-	for tz in z_positions:
+	for i_tz, tz in enumerate(z_positions):
+		if i_tz < skip_z_positions:
+			continue  # resume: skip already-processed z-rows
+
 		for ty in y_positions:
 			for tx in x_positions:
+				# Skip tile if all output chunks it contributes to already exist
+				if is_tile_done is not None and is_tile_done(tz, ty, tx):
+					done += 1
+					if progress is not None:
+						progress["tiles_done"] = done
+					continue
+
 				# Read tile from zarr (lazy)
 				tile_np = _read_tile_zarr(
 					zarr_arr, volume_shape, crop_offset,
@@ -952,7 +1805,7 @@ def _infer_tiled_3d(
 
 				# Diagnostics
 				raw_nan = torch.isnan(pred).sum().item()
-				if raw_nan > 0 or done == 0:
+				if raw_nan > 0 or done == skipped_tiles:
 					print(flush=True)
 					print(
 						f"  tile {done}/{total_tiles} "
@@ -1001,9 +1854,21 @@ def _infer_tiled_3d(
 				wsum_coarse[0, azl_c:azr_c, ayl_c:ayr_c, axl_c:axr_c] += w_coarse[:pz_c, :py_c, :px_c]
 
 				done += 1
+				if progress is not None:
+					progress["tiles_done"] = done
 				elapsed = max(1e-6, time.time() - t0)
-				per = elapsed / done
-				eta = max(0.0, per * (total_tiles - done))
+				actual_done = done - skipped_tiles
+				per = elapsed / max(1, actual_done)
+				remaining = total_tiles - done
+				eta = max(0.0, per * remaining)
+				overall = ""
+				if progress is not None:
+					oe = max(1e-6, time.time() - progress["t0"])
+					frac = done / max(1, total_tiles)
+					overall_frac = 0.7 * frac  # tiles ~70% of total work
+					if overall_frac > 0.01:
+						overall_eta = oe / overall_frac * (1.0 - overall_frac)
+						overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
 				bar_w = 30
 				fill = int(round(done / max(1, total_tiles) * bar_w))
 				bar = "#" * fill + "-" * (bar_w - fill)
@@ -1011,28 +1876,194 @@ def _infer_tiled_3d(
 					f"\r[predict3d] [{bar}] {done}/{total_tiles} tiles "
 					f"({100.0 * done / max(1, total_tiles):.1f}%) "
 					f"eta {int(eta // 60):02d}:{int(eta % 60):02d} "
-					f"avg={1000.0 * per:.0f}ms/tile",
+					f"avg={1000.0 * per:.0f}ms/tile"
+					f"{overall}",
 					end="", flush=True,
 				)
 
-	print("", flush=True)
-	print(f"[predict3d] inference done in {time.time() - t0:.1f}s ({total_tiles} tiles)", flush=True)
+		# --- After all (ty, tx) for this tz: flush completed z-band ---
+		if on_z_complete is not None:
+			next_tz = z_positions[i_tz + 1] if i_tz + 1 < len(z_positions) else Zp
+			on_z_complete(acc_fine, wsum_fine, acc_coarse, wsum_coarse, next_tz, pad0)
 
-	# Normalize
+	print("", flush=True)
+	print(f"[predict3d] inference done in {time.time() - t0:.1f}s ({done - skipped_tiles} tiles)", flush=True)
+
+	# If streaming mode (callback), output was consumed incrementally
+	if on_z_complete is not None:
+		del acc_fine, wsum_fine, acc_coarse, wsum_coarse
+		return None
+
+	# Legacy mode: normalize and return full memmap views
 	acc_fine /= np.maximum(wsum_fine, 1e-7)
 	acc_coarse /= np.maximum(wsum_coarse, 1e-7)
+	del wsum_fine, wsum_coarse
 
-	# Trim padding back to crop-sized output
 	b_f = pad0 // sd_fine
 	b_c = pad0 // sd_coarse
 	nz_f, ny_f, nx_f = nz // sd_fine, ny // sd_fine, nx // sd_fine
 	nz_c, ny_c, nx_c = nz // sd_coarse, ny // sd_coarse, nx // sd_coarse
 
-	result_fine = np.array(acc_fine[:, b_f:b_f + nz_f, b_f:b_f + ny_f, b_f:b_f + nx_f])
-	result_coarse = np.array(acc_coarse[:, b_c:b_c + nz_c, b_c:b_c + ny_c, b_c:b_c + nx_c])
-
-	del acc_fine, wsum_fine, acc_coarse, wsum_coarse
+	result_fine = acc_fine[:, b_f:b_f + nz_f, b_f:b_f + ny_f, b_f:b_f + nx_f]
+	result_coarse = acc_coarse[:, b_c:b_c + nz_c, b_c:b_c + ny_c, b_c:b_c + nx_c]
 	return result_fine, result_coarse
+
+
+def _find_zarr_group_root(path: str) -> Path | None:
+	"""Walk up from a zarr array path to find the group root (.zattrs or .zgroup).
+
+	Handles trailing slashes, numeric level dirs, and nested structures
+	like ``volpkg/volumes/vol.zarr/2``.
+	"""
+	p = Path(str(path).rstrip("/")).resolve()
+	# Start from p itself, walk up until we find .zattrs or .zgroup
+	check = p
+	for _ in range(5):  # don't walk up forever
+		if (check / ".zattrs").is_file() or (check / ".zgroup").is_file():
+			return check
+		if check.parent == check:
+			break
+		check = check.parent
+	return None
+
+
+def _download_one_path(
+	zarr_path: str,
+	crop_xyzwhd: tuple[int, int, int, int, int, int] | None,
+) -> None:
+	"""Download chunks for a single zarr path from its S3 source.
+
+	Walks up from *zarr_path* to find the group root with ``_download``
+	metadata.  Downloads only the level indicated by the path's trailing
+	numeric component (e.g. ``vol.zarr/2`` → scale 2).
+	"""
+	import json as _json
+	import sys as _sys
+	_lasagna_dir = str(Path(__file__).resolve().parent)
+	if _lasagna_dir not in _sys.path:
+		_sys.path.insert(0, _lasagna_dir)
+	from scripts.download_omezarr import download
+
+	p = Path(str(zarr_path).rstrip("/")).resolve()
+
+	# Find group root with _download metadata
+	group_root = None
+	dl_meta = None
+	check = p
+	for _ in range(5):
+		zattrs_path = check / ".zattrs"
+		if zattrs_path.is_file():
+			zattrs = _json.loads(zattrs_path.read_text(encoding="utf-8"))
+			if "_download" in zattrs:
+				group_root = check
+				dl_meta = zattrs["_download"]
+				break
+		if check.parent == check:
+			break
+		check = check.parent
+
+	if group_root is None or dl_meta is None:
+		raise ValueError(
+			f"no _download metadata found walking up from {zarr_path} — "
+			"run download_omezarr.py on this volume first "
+			"(it records the S3 source), or pass --no-download to skip"
+		)
+
+	# Determine scale from path (e.g. vol.zarr/2 → scale 2)
+	scales: list[int] | None = None
+	if p.name.isdigit():
+		scales = [int(p.name)]
+
+	# Convert crop to bbox (base coords)
+	bbox: tuple[int, int, int, int, int, int] | None = None
+	if crop_xyzwhd is not None:
+		x, y, z, w, h, d = crop_xyzwhd
+		bbox = (x, y, z, x + w, y + h, z + d)
+
+	source_uri = dl_meta["source"]
+	anon = dl_meta.get("anon", False)
+	region = dl_meta.get("region")
+
+	print(f"[predict3d] downloading {source_uri} "
+		  f"scales={scales or 'all'} dest={group_root} ...", flush=True)
+	ret = download(
+		source=source_uri,
+		dest=str(group_root),
+		scales=scales,
+		bbox_xyzxyz=bbox,
+		anon=anon,
+		region=region,
+	)
+	if ret != 0:
+		raise RuntimeError(f"download from {source_uri} failed (exit {ret})")
+
+
+def _auto_download(
+	input_path: str,
+	crop_xyzwhd: tuple[int, int, int, int, int, int] | None,
+	pred_dt_path: str | None,
+) -> None:
+	"""Auto-download input and pred-dt data from S3.
+
+	Each path is resolved independently to its own zarr group root —
+	they may come from different S3 sources.
+	"""
+	_download_one_path(input_path, crop_xyzwhd)
+	if pred_dt_path:
+		_download_one_path(pred_dt_path, crop_xyzwhd)
+	print("[predict3d] all downloads complete", flush=True)
+
+
+def _resolve_base_shape(
+	input_path: str,
+	base_ref: str | None,
+	base_scale: int | None,
+) -> tuple[int, int, int] | None:
+	"""Resolve base_shape_zyx from --base-ref/--base-scale or auto-detect.
+
+	Three modes (checked in order):
+	1. base_ref + base_scale: read zarr shape, multiply by 2^base_scale
+	2. base_ref alone: zarr IS 1× base, use shape directly
+	3. Neither: try to open the input as a zarr group and read level 0
+	"""
+	if base_ref is not None:
+		ref = zarr.open(str(base_ref), mode="r")
+		if hasattr(ref, "shape"):
+			sh = tuple(int(v) for v in ref.shape)
+			# Strip leading channel dim if present
+			if len(sh) == 4:
+				sh = sh[1:]
+			if len(sh) != 3:
+				raise ValueError(f"--base-ref array must be 3D or 4D (CZYX), got shape={sh}")
+		else:
+			raise ValueError(f"--base-ref must point to a zarr array, got group: {base_ref}")
+		scale = base_scale if base_scale is not None else 0
+		f = 2 ** scale
+		return (sh[0] * f, sh[1] * f, sh[2] * f)
+
+	# Auto-detect: find the finest available level in the input's zarr group
+	# and scale up to base (level 0) resolution.
+	try:
+		inp = Path(str(input_path).rstrip("/"))
+		# Walk up to find the zarr root (directory containing .zgroup or .zattrs)
+		group_path = inp.parent if inp.name.isdigit() else inp
+		grp = zarr.open_group(str(group_path), mode="r")
+		# Find the finest (lowest-numbered) level
+		level_keys = sorted(int(k) for k in grp.keys() if k.isdigit())
+		if level_keys:
+			finest_lv = level_keys[0]
+			arr = grp[str(finest_lv)]
+			sh = tuple(int(v) for v in arr.shape)
+			if len(sh) == 3:
+				# Scale up: level N shape × 2^N ≈ base shape
+				f = 2 ** finest_lv
+				base = (sh[0] * f, sh[1] * f, sh[2] * f)
+				print(f"[predict3d] auto-detected base shape: level {finest_lv} "
+					  f"shape={sh} × {f} → base={base}", flush=True)
+				return base
+	except Exception:
+		pass
+	return None
 
 
 def run_preprocess_3d(
@@ -1054,14 +2085,21 @@ def run_preprocess_3d(
 	edt_chunk_depth: int = 448,
 	edt_chunk_yx: int = 448,
 	calibrate_norm: bool = False,
+	base_ref: str | None = None,
+	base_scale: int | None = None,
+	n_levels: int = 5,
+	ome_chunk: int = 32,
 ) -> None:
-	"""Run 3D UNet inference and write .lasagna.json with per-group zarrs.
+	"""Run 3D UNet inference and write .lasagna.json with OME-Zarr pyramids.
 
-	Output: <output_dir>/<name>.lasagna.json + cos.zarr, prediction.zarr, pred_dt.zarr
+	Output: <output_dir>/<name>.lasagna.json + per-channel .ome.zarr groups.
+	Streaming: tiles processed in z-order, completed z-bands flushed to
+	OME-Zarr progressively.  Memmap pages released after each flush.
 
 	cos channel is stored at cos_scaledown resolution.
 	grad_mag, nx, ny are stored at scaledown resolution.
-	pred_dt (if provided) is stored at scaledown resolution.
+	pred_dt (if provided) is stored at cos_scaledown resolution with signed
+	distance encoding: outside=[80,127], inside=[128,175], no data=0.
 	"""
 	from lasagna_volume import LasagnaVolume, ChannelGroup
 
@@ -1075,20 +2113,44 @@ def run_preprocess_3d(
 	if len(sh) != 3:
 		raise ValueError(f"input array must be (Z,Y,X), got shape {sh}")
 
-	z0, z1, y0, y1, x0, x1 = _crop_xyzwhd_bounds(shape_zyx=sh, crop_xyzwhd=crop_xyzwhd)
+	# Resolve base shape first (needed to scale crop from base to input coords)
+	base_shape_zyx = _resolve_base_shape(input_path, base_ref, base_scale)
+	if base_shape_zyx is None:
+		raise ValueError(
+			"cannot determine base_shape_zyx — required for OME-Zarr output. "
+			"Pass --base-ref or ensure the input is inside an OME-Zarr group."
+		)
+
+	import math as _math
+	input_sd = max(1, round(base_shape_zyx[0] / sh[0]))
+
+	# crop_xyzwhd is in BASE coordinates — scale to input resolution
+	crop_input: tuple[int, int, int, int, int, int] | None = None
+	if crop_xyzwhd is not None:
+		bx, by, bz, bw, bh, bd = (int(v) for v in crop_xyzwhd)
+		crop_input = (
+			bx // input_sd, by // input_sd, bz // input_sd,
+			max(1, bw // input_sd), max(1, bh // input_sd), max(1, bd // input_sd),
+		)
+
+	z0, z1, y0, y1, x0, x1 = _crop_xyzwhd_bounds(shape_zyx=sh, crop_xyzwhd=crop_input)
 	nz = z1 - z0
 	ny = y1 - y0
 	nx_dim = x1 - x0
 	if nz <= 0 or ny <= 0 or nx_dim <= 0:
-		raise ValueError(f"empty crop: x=[{x0},{x1}) y=[{y0},{y1}) z=[{z0},{z1}) in shape={sh}")
+		raise ValueError(
+			f"empty crop: x=[{x0},{x1}) y=[{y0},{y1}) z=[{z0},{z1}) in shape={sh}\n"
+			f"  base crop={crop_xyzwhd} → input crop={crop_input} (input_sd={input_sd})"
+		)
 
 	if device is None:
 		device = "cuda" if torch.cuda.is_available() else "cpu"
 	torch_device = torch.device(device)
 
 	print(
-		f"[predict3d] input={input_path} shape={sh} "
-		f"crop=({x0},{y0},{z0},{nx_dim},{ny},{nz}) "
+		f"[predict3d] input={input_path} shape={sh} input_sd={input_sd}\n"
+		f"  base_shape={base_shape_zyx} base_crop={crop_xyzwhd}\n"
+		f"  input_crop=({x0},{y0},{z0},{nx_dim},{ny},{nz}) "
 		f"cos_scaledown={cos_scaledown} scaledown={scaledown}",
 		flush=True,
 	)
@@ -1112,209 +2174,454 @@ def run_preprocess_3d(
 	full_other_y = _ds_size(sh[1], other_sd)
 	full_other_x = _ds_size(sh[2], other_sd)
 
-	# Crop offsets for each resolution
-	cos_oz0 = _ds_index(z0, cos_sd)
-	cos_oy0 = _ds_index(y0, cos_sd)
-	cos_ox0 = _ds_index(x0, cos_sd)
-	cos_oz1 = min(full_cos_z, cos_oz0 + _ds_size(nz, cos_sd))
-	cos_oy1 = min(full_cos_y, cos_oy0 + _ds_size(ny, cos_sd))
-	cos_ox1 = min(full_cos_x, cos_ox0 + _ds_size(nx_dim, cos_sd))
+	# OME-Zarr output chunk size (needed for crop rounding)
+	oc = max(1, int(ome_chunk))
 
-	other_oz0 = _ds_index(z0, other_sd)
-	other_oy0 = _ds_index(y0, other_sd)
-	other_ox0 = _ds_index(x0, other_sd)
-	other_oz1 = min(full_other_z, other_oz0 + _ds_size(nz, other_sd))
-	other_oy1 = min(full_other_y, other_oy0 + _ds_size(ny, other_sd))
-	other_ox1 = min(full_other_x, other_ox0 + _ds_size(nx_dim, other_sd))
+	# Crop offsets at each output resolution, rounded to ome_chunk boundaries
+	# so every write fills complete chunks (enables per-chunk skip on resume).
+	cos_oz0 = (_ds_index(z0, cos_sd) // oc) * oc
+	cos_oy0 = (_ds_index(y0, cos_sd) // oc) * oc
+	cos_ox0 = (_ds_index(x0, cos_sd) // oc) * oc
+	cos_oz1 = min(full_cos_z, ((_ds_index(z0, cos_sd) + _ds_size(nz, cos_sd) + oc - 1) // oc) * oc)
+	cos_oy1 = min(full_cos_y, ((_ds_index(y0, cos_sd) + _ds_size(ny, cos_sd) + oc - 1) // oc) * oc)
+	cos_ox1 = min(full_cos_x, ((_ds_index(x0, cos_sd) + _ds_size(nx_dim, cos_sd) + oc - 1) // oc) * oc)
+
+	other_oz0 = (_ds_index(z0, other_sd) // oc) * oc
+	other_oy0 = (_ds_index(y0, other_sd) // oc) * oc
+	other_ox0 = (_ds_index(x0, other_sd) // oc) * oc
+	other_oz1 = min(full_other_z, ((_ds_index(z0, other_sd) + _ds_size(nz, other_sd) + oc - 1) // oc) * oc)
+	other_oy1 = min(full_other_y, ((_ds_index(y0, other_sd) + _ds_size(ny, other_sd) + oc - 1) // oc) * oc)
+	other_ox1 = min(full_other_x, ((_ds_index(x0, other_sd) + _ds_size(nx_dim, other_sd) + oc - 1) // oc) * oc)
+
+	# Expand input crop to cover the rounded output chunk boundaries.
+	# The accumulator must produce data for every output chunk.
+	z0 = min(z0, cos_oz0 * cos_sd, other_oz0 * other_sd)
+	y0 = min(y0, cos_oy0 * cos_sd, other_oy0 * other_sd)
+	x0 = min(x0, cos_ox0 * cos_sd, other_ox0 * other_sd)
+	z1 = max(z1, min(sh[0], cos_oz1 * cos_sd), min(sh[0], other_oz1 * other_sd))
+	y1 = max(y1, min(sh[1], cos_oy1 * cos_sd), min(sh[1], other_oy1 * other_sd))
+	x1 = max(x1, min(sh[2], cos_ox1 * cos_sd), min(sh[2], other_ox1 * other_sd))
+	z0 = max(0, z0); y0 = max(0, y0); x0 = max(0, x0)
+	nz = z1 - z0; ny = y1 - y0; nx_dim = x1 - x0
+
+	# Recompute output region sizes with expanded crop
+	cos_wz = cos_oz1 - cos_oz0
+	cos_wy = cos_oy1 - cos_oy0
+	cos_wx = cos_ox1 - cos_ox0
+	other_wz = other_oz1 - other_oz0
+	other_wy = other_oy1 - other_oy0
+	other_wx = other_ox1 - other_ox0
+
+	# Effective scaledowns from base and OME-Zarr level numbers
+	effective_cos_sd = input_sd * cos_sd
+	effective_other_sd = input_sd * other_sd
+	cos_level = round(_math.log2(effective_cos_sd)) if effective_cos_sd > 1 else 0
+	other_level = round(_math.log2(effective_other_sd)) if effective_other_sd > 1 else 0
+	# Ensure enough levels
+	n_levels = max(n_levels, cos_level + 2, other_level + 2)
+	print(f"[predict3d] input_sd={input_sd} cos_level={cos_level} other_level={other_level} "
+		  f"n_levels={n_levels}", flush=True)
 
 	# Load or create the .lasagna.json manifest
 	json_path = Path(output_path)
 	if json_path.exists():
 		vol = LasagnaVolume.load(json_path)
 		print(f"[predict3d] loaded existing manifest: {output_path}", flush=True)
+		vol.base_shape_zyx = base_shape_zyx
 	else:
 		vol = LasagnaVolume(
 			path=json_path.resolve(),
 			source_to_base=source_to_base,
-			crop_xyzwhd=(int(x0), int(y0), int(z0), int(nx_dim), int(ny), int(nz))
-				if crop_xyzwhd is not None else None,
+			base_shape_zyx=base_shape_zyx,
 		)
+	# Record this crop in base coordinates (appends if new, deduplicates)
+	if crop_xyzwhd is not None:
+		vol.add_crop(tuple(int(v) for v in crop_xyzwhd))
 
-	# Validate pred-dt source
+	# Validate pred-dt source and determine its scale relative to base
+	pred_dt_zarr = None
+	pred_sd = 1       # pred zarr scaledown from base (1 = full res)
+	pred_per_cos = effective_cos_sd  # pred voxels per cos output voxel
 	if pred_dt_path:
 		pred_dt_path = pred_dt_path.rstrip("/")
-		_pred_check = zarr.open(str(pred_dt_path), mode="r")
-		if not hasattr(_pred_check, "shape"):
+		pred_dt_zarr = zarr.open(str(pred_dt_path), mode="r")
+		if not hasattr(pred_dt_zarr, "shape"):
 			raise ValueError(f"pred-dt must point to a zarr array, got group: {pred_dt_path}")
-		_pred_shape = tuple(int(v) for v in _pred_check.shape)
+		_pred_shape = tuple(int(v) for v in pred_dt_zarr.shape)
 		if len(_pred_shape) != 3:
 			raise ValueError(f"pred-dt array must be 3D (Z,Y,X), got shape {_pred_shape}")
-		print(f"[predict3d] pred-dt={pred_dt_path} shape={_pred_shape}", flush=True)
-		del _pred_check, _pred_shape
+		# pred zarr scaledown relative to base
+		pred_sd = max(1, round(base_shape_zyx[0] / _pred_shape[0]))
+		# How many pred voxels per cos output voxel
+		pred_per_cos = max(1, effective_cos_sd // pred_sd)
+		print(f"[predict3d] pred-dt={pred_dt_path} shape={_pred_shape} "
+			  f"pred_sd={pred_sd} pred_per_cos={pred_per_cos}", flush=True)
 
-	def _chunk_sizes(n_ch, full_z, full_y, full_x):
-		return (
-			1,
-			min(full_z, max(1, chunk_z)),
-			min(full_y, max(1, chunk_yx)),
-			min(full_x, max(1, chunk_yx)),
-		)
+	# --- Create OME-Zarr outputs ---
+	cos_omezarr_path = os.path.join(out_dir, f"{prefix}cos.ome.zarr")
+	gm_omezarr_path = os.path.join(out_dir, f"{prefix}grad_mag.ome.zarr")
+	nx_omezarr_path = os.path.join(out_dir, f"{prefix}nx.ome.zarr")
+	ny_omezarr_path = os.path.join(out_dir, f"{prefix}ny.ome.zarr")
+	dt_omezarr_path = os.path.join(out_dir, f"{prefix}pred_dt.ome.zarr") if pred_dt_path else None
 
-	# --- Helper: open or create a group zarr ---
-	def _open_group_zarr(zarr_name, n_ch, full_z, full_y, full_x):
-		zarr_path = os.path.join(out_dir, zarr_name)
-		expected = (n_ch, full_z, full_y, full_x)
-		cs = _chunk_sizes(n_ch, full_z, full_y, full_x)
-		if os.path.exists(zarr_path):
-			arr = zarr.open(str(zarr_path), mode="r+")
-			if hasattr(arr, "shape") and tuple(int(v) for v in arr.shape) == expected:
-				return arr
-			print(f"[predict3d] {zarr_name} shape mismatch, recreating", flush=True)
-		return zarr.open(str(zarr_path), mode="w", shape=expected, chunks=cs,
-						 dtype=np.uint8, fill_value=0, zarr_format=2)
+	cos_grp = _open_or_create_omezarr(cos_omezarr_path, base_shape_zyx, cos_level, n_levels, oc, "cos")
+	gm_grp = _open_or_create_omezarr(gm_omezarr_path, base_shape_zyx, other_level, n_levels, oc, "grad_mag")
+	nx_grp = _open_or_create_omezarr(nx_omezarr_path, base_shape_zyx, other_level, n_levels, oc, "nx")
+	ny_grp = _open_or_create_omezarr(ny_omezarr_path, base_shape_zyx, other_level, n_levels, oc, "ny")
+	dt_grp = _open_or_create_omezarr(dt_omezarr_path, base_shape_zyx, cos_level, n_levels, oc, "pred_dt") if dt_omezarr_path else None
 
-	# --- Helper: check if a zarr already has data ---
-	def _zarr_has_data(arr, oz0, oz1, oy0, oy1):
-		sample_z = (oz0 + oz1) // 2
-		sample = np.asarray(arr[0, sample_z, oy0:oy1, :])
-		return np.any(sample != 0)
+	# Level arrays (3D) for writing
+	cos_lv_arr = cos_grp[str(cos_level)]
+	gm_lv_arr = gm_grp[str(other_level)]
+	nx_lv_arr = nx_grp[str(other_level)]
+	ny_lv_arr = ny_grp[str(other_level)]
+	dt_lv_arr = dt_grp[str(cos_level)] if dt_grp else None
 
-	# Open group zarrs
-	cos_arr = _open_group_zarr(f"{prefix}cos.zarr", 1, full_cos_z, full_cos_y, full_cos_x)
-	pred_arr = _open_group_zarr(f"{prefix}prediction.zarr", 3, full_other_z, full_other_y, full_other_x)
+	# Resume is handled per-chunk: _is_tile_done skips tiles whose output
+	# chunks exist, and the flush skips writing existing chunks.
+	sd_fine = cos_sd
+	sd_coarse = other_sd
+	pad0 = max(0, int(border))
+	stride = max(1, tile_size - overlap)
 
-	# --- Resume logic ---
-	skip_inference = _zarr_has_data(cos_arr, cos_oz0, cos_oz1, cos_oy0, cos_oy1)
-	if skip_inference:
-		print(f"[predict3d] resuming: cos.zarr has data, skipping inference", flush=True)
-
-	skip_pred_dt = False
-	if pred_dt_path:
-		dt_arr = _open_group_zarr(f"{prefix}pred_dt.zarr", 1, full_other_z, full_other_y, full_other_x)
-		if _zarr_has_data(dt_arr, other_oz0, other_oz1, other_oy0, other_oy1):
-			skip_pred_dt = True
-			print(f"[predict3d] resuming: pred_dt.zarr has data, skipping Phase 1", flush=True)
+	_t_total_start = time.time()
 
 	# --- Pause training if running (free GPU) ---
 	from gpu_pause import gpu_pause_context
-	_needs_gpu = (pred_dt_path and not skip_pred_dt) or not skip_inference
-	_gpu_ctx = gpu_pause_context() if _needs_gpu else None
+	_gpu_ctx = gpu_pause_context()
 	if _gpu_ctx is not None:
 		_gpu_ctx.__enter__()
 
-	# --- Phase 1: pred_dt ---
-	if pred_dt_path and not skip_pred_dt:
-		_compute_pred_dt_channel(
-			pred_path=pred_dt_path,
-			output_arr=dt_arr,
-			channel_idx=0,
-			ref_z=full_other_z, ref_y=full_other_y, ref_x=full_other_x,
-			scaledown=other_sd,
-			crop_xyzwhd=[int(x0), int(y0), int(z0), int(nx_dim), int(ny), int(nz)]
-				if crop_xyzwhd is not None else None,
-			chunk_depth=edt_chunk_depth,
-			chunk_yx=edt_chunk_yx,
-		)
-		vol.update_group("pred_dt", ChannelGroup(
-			zarr_path=f"{prefix}pred_dt.zarr", scaledown=other_sd, channels=["pred_dt"]))
+	# --- Build model ---
+	model, _norm_type, _upsample_mode, _output_sigmoid = build_model_3d(
+		tile_size, str(torch_device), weights=str(unet3d_checkpoint))
+	model.eval()
 
-	# --- Phase 2: tiled 3D inference ---
-	if not skip_inference:
-		model, _norm_type, _upsample_mode, _output_sigmoid = build_model_3d(tile_size, str(torch_device), weights=str(unet3d_checkpoint))
-		model.eval()
-
-		if calibrate_norm:
-			_calibrate_instance_norm(
-				model, a_in,
-				crop_slices=(z0, z1, y0, y1, x0, x1),
-				device=torch_device,
-				tile_size=tile_size,
-			)
-
-		pred_cos, pred_other = _infer_tiled_3d(
+	if calibrate_norm:
+		_calibrate_instance_norm(
 			model, a_in,
 			crop_slices=(z0, z1, y0, y1, x0, x1),
 			device=torch_device,
 			tile_size=tile_size,
-			overlap=overlap,
-			border=border,
-			cos_scaledown=cos_sd,
-			other_scaledown=other_sd,
-			tmp_dir=out_dir,
-			output_sigmoid=_output_sigmoid,
-		)
-		del model
-		torch.cuda.empty_cache()
-
-		# Diagnostic
-		print(
-			f"[predict3d] cos result shape={pred_cos.shape} "
-			f"min={pred_cos.min():.4f} max={pred_cos.max():.4f}",
-			flush=True,
-		)
-		print(
-			f"[predict3d] other result shape={pred_other.shape} "
-			f"min={pred_other.min():.4f} max={pred_other.max():.4f}",
-			flush=True,
 		)
 
-		# --- Phase 3: post-process and write ---
-		cos_wz = cos_oz1 - cos_oz0
-		cos_wy = cos_oy1 - cos_oy0
-		cos_wx = cos_ox1 - cos_ox0
-		other_wz = other_oz1 - other_oz0
-		other_wy = other_oy1 - other_oy0
-		other_wx = other_ox1 - other_ox0
+	# --- Streaming flush callback ---
+	# Captures OME-Zarr arrays, offsets, pred_dt state from enclosing scope.
+	_prev_flush_fine = [0]   # accumulator z (fine res) already flushed
+	_prev_flush_coarse = [0]
+	_flush_t0 = [time.time()]
+	sd_ratio = other_sd // cos_sd
 
-		# Write cos channel to cos.zarr
-		post_chunk_z = max(1, chunk_z)
-		for zs in range(0, cos_wz, post_chunk_z):
-			ze = min(cos_wz, zs + post_chunk_z)
-			cos_slab = pred_cos[0, zs:ze, :cos_wy, :cos_wx]
-			cos_arr[0, cos_oz0 + zs:cos_oz0 + ze, cos_oy0:cos_oy1, cos_ox0:cos_ox1] = np.clip(
-				cos_slab * 255.0, 0.0, 255.0).astype(np.uint8)
-		del pred_cos
+	# Accumulator-to-output coordinate helpers
+	b_f = pad0 // sd_fine   # fine accumulator index where output starts
+	b_c = pad0 // sd_coarse
+	out_end_f = b_f + cos_wz   # fine accumulator index where output ends
+	out_end_c = b_c + other_wz
 
-		# Write grad_mag, nx, ny to prediction.zarr
-		# pred_other channels: [grad_mag(0), dir0z(1), dir1z(2), dir0y(3), dir1y(4), dir0x(5), dir1x(6)]
-		for zs in range(0, other_wz, post_chunk_z):
-			ze = min(other_wz, zs + post_chunk_z)
-			# grad_mag
-			gm_slab = pred_other[0, zs:ze, :other_wy, :other_wx]
-			pred_arr[0, other_oz0 + zs:other_oz0 + ze, other_oy0:other_oy1, other_ox0:other_ox1] = np.clip(
-				gm_slab * 1000.0, 0.0, 255.0).astype(np.uint8)
+	def _is_tile_done(tz, ty, tx):
+		"""Check if all output chunks this tile contributes to already exist."""
+		ts = tile_size
+		# Fine (cos) output range in OME-Zarr coords
+		fz0 = max(cos_oz0, tz // sd_fine - b_f + cos_oz0)
+		fz1 = min(cos_oz1, (tz + ts) // sd_fine - b_f + cos_oz0)
+		fy0 = max(cos_oy0, ty // sd_fine - b_f + cos_oy0)
+		fy1 = min(cos_oy1, (ty + ts) // sd_fine - b_f + cos_oy0)
+		fx0 = max(cos_ox0, tx // sd_fine - b_f + cos_ox0)
+		fx1 = min(cos_ox1, (tx + ts) // sd_fine - b_f + cos_ox0)
+		for z in range(fz0, fz1, oc):
+			for y in range(fy0, fy1, oc):
+				for x in range(fx0, fx1, oc):
+					if not _omezarr_chunk_exists(cos_omezarr_path, cos_level, z, y, x, oc):
+						return False
+		# Coarse (prediction) output range
+		cz0 = max(other_oz0, tz // sd_coarse - b_c + other_oz0)
+		cz1 = min(other_oz1, (tz + ts) // sd_coarse - b_c + other_oz0)
+		cy0 = max(other_oy0, ty // sd_coarse - b_c + other_oy0)
+		cy1 = min(other_oy1, (ty + ts) // sd_coarse - b_c + other_oy0)
+		cx0 = max(other_ox0, tx // sd_coarse - b_c + other_ox0)
+		cx1 = min(other_ox1, (tx + ts) // sd_coarse - b_c + other_ox0)
+		for z in range(cz0, cz1, oc):
+			for y in range(cy0, cy1, oc):
+				for x in range(cx0, cx1, oc):
+					if not _omezarr_chunk_exists(gm_omezarr_path, other_level, z, y, x, oc):
+						return False
+		return True
 
-			# Direction channels -> normal estimation
-			d0z = pred_other[1, zs:ze, :other_wy, :other_wx]
-			d1z = pred_other[2, zs:ze, :other_wy, :other_wx]
-			d0y = pred_other[3, zs:ze, :other_wy, :other_wx]
-			d1y = pred_other[4, zs:ze, :other_wy, :other_wx]
-			d0x = pred_other[5, zs:ze, :other_wy, :other_wx]
-			d1x = pred_other[6, zs:ze, :other_wy, :other_wx]
-			_, _, _, nx_n, ny_n, nz_n = _estimate_normal(d0z, d1z, d0y, d1y, d0x, d1x)
-			# Flip to +z hemisphere
-			flip = np.where(nz_n < 0, -1.0, 1.0)
-			nx_n = nx_n * flip
-			ny_n = ny_n * flip
-			pred_arr[1, other_oz0 + zs:other_oz0 + ze, other_oy0:other_oy1, other_ox0:other_ox1] = np.clip(
-				np.round(nx_n * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
-			pred_arr[2, other_oz0 + zs:other_oz0 + ze, other_oy0:other_oy1, other_ox0:other_ox1] = np.clip(
-				np.round(ny_n * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
-		del pred_other
+	def _on_z_complete(acc_fine, wsum_fine, acc_coarse, wsum_coarse,
+					   complete_z_padded, pad0_inner):
+		"""Flush completed z-bands to OME-Zarr, compute pred_dt, release pages."""
+		# --- Flush fine (cos + pred_dt) ---
+		complete_z_f = complete_z_padded // sd_fine
+		flush_from_f = max(_prev_flush_fine[0], b_f)
+		# Round flush point down to oc-aligned output z (complete chunks only).
+		# If complete_z_f reaches or exceeds out_end_f, flush everything (last band).
+		if complete_z_f >= out_end_f:
+			flush_to_f = out_end_f
+		else:
+			complete_out_z = complete_z_f - b_f  # in output coords
+			aligned_out_z = (complete_out_z // oc) * oc
+			flush_to_f = b_f + aligned_out_z
 
-		# Update manifest with cos and prediction groups
-		vol.update_group("cos", ChannelGroup(
-			zarr_path=f"{prefix}cos.zarr", scaledown=cos_sd, channels=["cos"]))
-		vol.update_group("prediction", ChannelGroup(
-			zarr_path=f"{prefix}prediction.zarr", scaledown=other_sd, channels=["grad_mag", "nx", "ny"]))
+		if flush_to_f > flush_from_f:
+			out_zs = flush_from_f - b_f   # output z-start
+			out_ze = flush_to_f - b_f     # output z-end
+			if out_ze > out_zs:
+				# Normalize accumulator in-place for this band
+				acc_band = acc_fine[:, flush_from_f:flush_to_f, :, :]
+				ws_band = wsum_fine[:, flush_from_f:flush_to_f, :, :]
+				acc_band /= np.maximum(ws_band, 1e-7)
+
+				eff_out_zs = out_zs
+				eff_out_ze = out_ze
+
+				if eff_out_ze > eff_out_zs:
+					local_from = 0
+					local_to = flush_to_f - flush_from_f
+					# Trim to crop region (Y, X)
+					yf = pad0_inner // sd_fine
+					xf = pad0_inner // sd_fine
+					oz = cos_oz0 + eff_out_zs
+					# Process per output chunk — skip any that already exist
+					cos_slab = None  # lazy: only compute if needed
+					n_skip_cos = 0
+					n_write_cos = 0
+					for dz in range(0, eff_out_ze - eff_out_zs, oc):
+						for dy in range(0, cos_wy, oc):
+							for dx in range(0, cos_wx, oc):
+								cz = oz + dz
+								cy = cos_oy0 + dy
+								cx = cos_ox0 + dx
+								if _omezarr_chunk_exists(cos_omezarr_path, cos_level, cz, cy, cx, oc):
+									n_skip_cos += 1
+									continue
+								# Compute slab lazily on first needed chunk
+								if cos_slab is None:
+									cos_slab = np.ascontiguousarray(
+										acc_band[0, local_from:local_to, yf:yf + cos_wy, xf:xf + cos_wx])
+									cos_slab = np.clip(cos_slab * 255.0, 0.0, 255.0).astype(np.uint8)
+								# Write just this chunk's region
+								cze = min(eff_out_ze - eff_out_zs, dz + oc)
+								cye = min(cos_wy, dy + oc)
+								cxe = min(cos_wx, dx + oc)
+								wz = cze - dz; wy = cye - dy; wx = cxe - dx
+								if wz > 0 and wy > 0 and wx > 0:
+									_atomic_zarr_write(cos_omezarr_path, cos_level,
+										cz, cy, cx, cz + wz, cy + wy, cx + wx,
+										cos_slab[dz:cze, dy:cye, dx:cxe], oc)
+								n_write_cos += 1
+
+					# --- pred_dt for this z-band ---
+					if pred_dt_zarr is not None and dt_lv_arr is not None:
+						# cos output z → base z → pred_src z
+						# All coords go through base as common frame
+						base_z0 = (cos_oz0 + eff_out_zs) * effective_cos_sd
+						base_z1 = (cos_oz0 + eff_out_ze) * effective_cos_sd
+						pdt_z0 = base_z0 // pred_sd
+						pdt_z1 = base_z1 // pred_sd
+						# DEBUG: trace alignment
+						_ocp = max(1, pred_per_cos) * oc
+						print(f"\n[pred_dt DEBUG] eff_out_zs={eff_out_zs} eff_out_ze={eff_out_ze} "
+							  f"cos_oz0={cos_oz0} b_f={b_f} flush_from_f={flush_from_f} "
+							  f"flush_to_f={flush_to_f} "
+							  f"base_z0={base_z0} pdt_z0={pdt_z0} pdt_z1={pdt_z1} "
+							  f"ocp={_ocp} pdt_z0%ocp={pdt_z0 % _ocp}",
+							  flush=True)
+						# Crop YX: source coords → base → pred_src
+						if crop_xyzwhd is not None:
+							pdt_y0 = y0 * input_sd // pred_sd
+							pdt_y1 = (y0 + ny) * input_sd // pred_sd
+							pdt_x0 = x0 * input_sd // pred_sd
+							pdt_x1 = (x0 + nx_dim) * input_sd // pred_sd
+						else:
+							pdt_y0 = 0
+							pdt_y1 = int(pred_dt_zarr.shape[1])
+							pdt_x0 = 0
+							pdt_x1 = int(pred_dt_zarr.shape[2])
+						_t_edt0 = time.time()
+						_compute_pred_dt_slab(
+							pred_zarr=pred_dt_zarr,
+							pred_path=pred_dt_path,
+							output_level_arr=dt_lv_arr,
+							output_omezarr_path=dt_omezarr_path,
+							output_level_key=str(cos_level),
+							pred_z0=pdt_z0, pred_z1=pdt_z1,
+							pred_y0=pdt_y0, pred_y1=pdt_y1,
+							pred_x0=pdt_x0, pred_x1=pdt_x1,
+							out_z0=cos_oz0 + eff_out_zs,
+							out_y0=cos_oy0, out_x0=cos_ox0,
+							scaledown=pred_per_cos,
+							ome_chunk=oc,
+							progress=_progress,
+						)
+						_t_edt_total[0] += time.time() - _t_edt0
+
+			# Release memmap pages
+			_release_memmap_pages(acc_fine, flush_from_f, flush_to_f)
+			_release_memmap_pages(wsum_fine, flush_from_f, flush_to_f)
+
+		_prev_flush_fine[0] = max(_prev_flush_fine[0], flush_to_f)
+
+		# --- Flush coarse (grad_mag, nx, ny) ---
+		complete_z_c = complete_z_padded // sd_coarse
+		flush_from_c = max(_prev_flush_coarse[0], b_c)
+		if complete_z_c >= out_end_c:
+			flush_to_c = out_end_c
+		else:
+			complete_out_zc = complete_z_c - b_c
+			aligned_out_zc = (complete_out_zc // oc) * oc
+			flush_to_c = b_c + aligned_out_zc
+
+		if flush_to_c > flush_from_c:
+			out_zs_c = flush_from_c - b_c
+			out_ze_c = flush_to_c - b_c
+			if out_ze_c > out_zs_c:
+				# Normalize
+				acc_band_c = acc_coarse[:, flush_from_c:flush_to_c, :, :]
+				ws_band_c = wsum_coarse[:, flush_from_c:flush_to_c, :, :]
+				acc_band_c /= np.maximum(ws_band_c, 1e-7)
+
+				eff_out_zs_c = out_zs_c
+				eff_out_ze_c = out_ze_c
+
+				if eff_out_ze_c > eff_out_zs_c:
+					oz_c = other_oz0 + eff_out_zs_c
+					# Process per output chunk — skip existing
+					slab = None  # lazy compute
+					n_skip_c = 0
+					n_write_c = 0
+					for dz in range(0, eff_out_ze_c - eff_out_zs_c, oc):
+						for dy in range(0, other_wy, oc):
+							for dx in range(0, other_wx, oc):
+								cz = oz_c + dz
+								cy = other_oy0 + dy
+								cx = other_ox0 + dx
+								# Check all 3 channels (gm, nx, ny) — if gm exists, assume all do
+								if _omezarr_chunk_exists(gm_omezarr_path, other_level, cz, cy, cx, oc):
+									n_skip_c += 1
+									continue
+								if slab is None:
+									local_from_c = 0
+									local_to_c = flush_to_c - flush_from_c
+									yc = pad0_inner // sd_coarse
+									xc = pad0_inner // sd_coarse
+									slab = np.ascontiguousarray(
+										acc_band_c[:, local_from_c:local_to_c, yc:yc + other_wy, xc:xc + other_wx])
+								cze = min(eff_out_ze_c - eff_out_zs_c, dz + oc)
+								cye = min(other_wy, dy + oc)
+								cxe = min(other_wx, dx + oc)
+								s = slab[:, dz:cze, dy:cye, dx:cxe]
+
+								# grad_mag
+								gm_u8 = np.clip(s[0] * 1000.0, 0.0, 255.0).astype(np.uint8)
+								wz = gm_u8.shape[0]; wy = gm_u8.shape[1]; wx = gm_u8.shape[2]
+								_atomic_zarr_write(gm_omezarr_path, other_level,
+									cz, cy, cx, cz + wz, cy + wy, cx + wx, gm_u8, oc)
+
+								# Normals
+								_, _, _, nx_n, ny_n, nz_n = _estimate_normal(
+									s[1], s[2], s[3], s[4], s[5], s[6])
+								flip = np.where(nz_n < 0, -1.0, 1.0)
+								nx_u8 = np.clip(np.round(nx_n * flip * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
+								ny_u8 = np.clip(np.round(ny_n * flip * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
+								_atomic_zarr_write(nx_omezarr_path, other_level,
+									cz, cy, cx, cz + wz, cy + wy, cx + wx, nx_u8, oc)
+								_atomic_zarr_write(ny_omezarr_path, other_level,
+									cz, cy, cx, cz + wz, cy + wy, cx + wx, ny_u8, oc)
+								n_write_c += 1
+
+			# Release memmap pages
+			_release_memmap_pages(acc_coarse, flush_from_c, flush_to_c)
+			_release_memmap_pages(wsum_coarse, flush_from_c, flush_to_c)
+
+		_prev_flush_coarse[0] = max(_prev_flush_coarse[0], flush_to_c)
+
+	_t_inference_start = time.time()
+	# --- Streaming inference + flush ---
+	# Shared progress tracker for unified ETA across tiles + EDT
+	_t_edt_total = [0.0]  # accumulated wall time in EDT calls
+	_progress = {
+		"t0": time.time(),
+		"tiles_done": 0,
+		"tiles_total": 0,  # set by _infer_tiled_3d
+		"edt_done": 0,
+		"edt_total_est": 1,  # updated below
+	}
+	# Estimate total EDT chunks (for overall ETA weighting)
+	if pred_dt_zarr is not None:
+		_psh = tuple(int(v) for v in pred_dt_zarr.shape)
+		import math as _m2
+		_edt_nz = max(1, _m2.ceil((pred_z1_total := (cos_oz1 - cos_oz0) * effective_cos_sd // max(1, pred_sd)) / 448))
+		_edt_ny = max(1, _m2.ceil((_psh[1]) / 448))
+		_edt_nx = max(1, _m2.ceil((_psh[2]) / 448))
+		_progress["edt_total_est"] = _edt_nz * _edt_ny * _edt_nx
+
+	_infer_tiled_3d(
+		model, a_in,
+		crop_slices=(z0, z1, y0, y1, x0, x1),
+		device=torch_device,
+		tile_size=tile_size,
+		overlap=overlap,
+		border=border,
+		cos_scaledown=cos_sd,
+		other_scaledown=other_sd,
+		tmp_dir=out_dir,
+		output_sigmoid=_output_sigmoid,
+		on_z_complete=_on_z_complete,
+		skip_z_positions=0,
+		progress=_progress,
+		is_tile_done=_is_tile_done,
+	)
+	del model
+	torch.cuda.empty_cache()
+
+	# --- Build pyramids ---
+	_t_inference_end = time.time()
+	_t_pyramid_start = time.time()
+	print("[predict3d] building OME-Zarr pyramids ...", flush=True)
+	cos_crop_zyx = (cos_oz0, cos_oy0, cos_ox0, cos_oz1, cos_oy1, cos_ox1)
+	other_crop_zyx = (other_oz0, other_oy0, other_ox0, other_oz1, other_oy1, other_ox1)
+	for path, data_lv, name, crop in [
+		(cos_omezarr_path, cos_level, "cos", cos_crop_zyx),
+		(gm_omezarr_path, other_level, "grad_mag", other_crop_zyx),
+		(nx_omezarr_path, other_level, "nx", other_crop_zyx),
+		(ny_omezarr_path, other_level, "ny", other_crop_zyx),
+	]:
+		_build_omezarr_pyramid(path, data_lv, n_levels, oc, crop_zyx=crop, label=name)
+	if dt_omezarr_path:
+		_build_omezarr_pyramid(dt_omezarr_path, cos_level, n_levels, oc, crop_zyx=cos_crop_zyx, label="pred_dt")
+
+	# --- Update manifest ---
+	vol.update_group("cos", ChannelGroup(
+		zarr_path=f"{prefix}cos.ome.zarr/{cos_level}", scaledown=cos_sd, channels=["cos"]))
+	vol.update_group("grad_mag", ChannelGroup(
+		zarr_path=f"{prefix}grad_mag.ome.zarr/{other_level}", scaledown=other_sd, channels=["grad_mag"]))
+	vol.update_group("nx", ChannelGroup(
+		zarr_path=f"{prefix}nx.ome.zarr/{other_level}", scaledown=other_sd, channels=["nx"]))
+	vol.update_group("ny", ChannelGroup(
+		zarr_path=f"{prefix}ny.ome.zarr/{other_level}", scaledown=other_sd, channels=["ny"]))
+	if pred_dt_path:
+		vol.update_group("pred_dt", ChannelGroup(
+			zarr_path=f"{prefix}pred_dt.ome.zarr/{cos_level}", scaledown=cos_sd, channels=["pred_dt"]))
 
 	# --- Resume training ---
 	if _gpu_ctx is not None:
 		_gpu_ctx.__exit__(None, None, None)
 
-	# Always save the manifest (in case only pred_dt was updated)
 	vol.save()
+	_t_total_end = time.time()
+	_t_inf_edt = _t_inference_end - _t_inference_start
+	_t_edt = _t_edt_total[0]
+	_t_inf = _t_inf_edt - _t_edt  # inference = total streaming phase minus EDT
+	_t_pyr = _t_total_end - _t_pyramid_start
+	_t_setup = _t_inference_start - _t_total_start
+	_t_total = _t_total_end - _t_total_start
 	print(f"[predict3d] done. manifest: {output_path}", flush=True)
+	print(f"[predict3d] timing: total={_t_total:.1f}s "
+		  f"setup={_t_setup:.1f}s ({100*_t_setup/max(1e-9,_t_total):.0f}%) "
+		  f"inference={_t_inf:.1f}s ({100*_t_inf/max(1e-9,_t_total):.0f}%) "
+		  f"edt={_t_edt:.1f}s ({100*_t_edt/max(1e-9,_t_total):.0f}%) "
+		  f"pyramid={_t_pyr:.1f}s ({100*_t_pyr/max(1e-9,_t_total):.0f}%)",
+		  flush=True)
 
 
 _N_WORKERS = min(16, os.cpu_count() or 4)
@@ -2038,7 +3345,28 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 	p.add_argument("--edt-chunk-yx", type=int, default=256, help="EDT chunk size in Y/X (default 256).")
 	p.add_argument("--calibrate-norm", action="store_true", default=False,
 		help="Calibrate InstanceNorm running stats before inference for tile consistency.")
+	p.add_argument("--base-ref", default=None,
+		help="Reference zarr for base shape. If given with --base-scale N, "
+			 "base = ref_shape * 2^N. If given alone, ref IS base (1x). "
+			 "If omitted, auto-detect from input zarr group level 0.")
+	p.add_argument("--base-scale", type=int, default=None,
+		help="How many 2x downsamples the --base-ref zarr is from the true base.")
+	p.add_argument("--no-download", action="store_true", default=False,
+		help="Skip automatic S3 download of input data. By default, predict3d "
+			 "checks for _download metadata in the zarr's .zattrs and downloads "
+			 "needed chunks before inference.")
+	p.add_argument("--levels", type=int, default=5,
+		help="Number of OME-Zarr pyramid levels to generate (default 5).")
+	p.add_argument("--ome-chunk", type=int, default=32,
+		help="Chunk size for OME-Zarr output levels (default 128).")
 	args = p.parse_args(argv)
+
+	if not args.no_download:
+		_auto_download(
+			input_path=str(args.input),
+			crop_xyzwhd=tuple(int(v) for v in args.crop_xyzwhd) if args.crop_xyzwhd else None,
+			pred_dt_path=str(args.pred_dt) if args.pred_dt else None,
+		)
 
 	run_preprocess_3d(
 		input_path=str(args.input),
@@ -2058,6 +3386,10 @@ def main_predict3d(argv: list[str] | None = None) -> int:
 		edt_chunk_depth=int(args.edt_chunk_depth),
 		edt_chunk_yx=int(args.edt_chunk_yx),
 		calibrate_norm=bool(args.calibrate_norm),
+		base_ref=args.base_ref,
+		base_scale=args.base_scale,
+		n_levels=int(args.levels),
+		ome_chunk=int(args.ome_chunk),
 	)
 	return 0
 
