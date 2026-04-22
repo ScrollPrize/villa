@@ -476,6 +476,18 @@ def run_preprocess(
 # OME-Zarr helpers
 # ---------------------------------------------------------------------------
 
+def _invalidate_pyramid_chunks(omezarr_path: str, data_level: int, n_levels: int,
+							   iz: int, iy: int, ix: int) -> None:
+	"""Delete coarser pyramid chunks that depend on data chunk (iz, iy, ix)."""
+	sep = _omezarr_dim_sep(omezarr_path, data_level)
+	for lv in range(data_level + 1, n_levels):
+		iz, iy, ix = iz // 2, iy // 2, ix // 2
+		level_path = os.path.join(omezarr_path, str(lv))
+		path = _zarr_chunk_path(level_path, sep, iz, iy, ix)
+		if os.path.isfile(path):
+			os.unlink(path)
+
+
 def _zarr_chunk_path(level_path: str, sep: str, iz: int, iy: int, ix: int) -> str:
 	"""Filesystem path for a zarr chunk within a level directory."""
 	if sep == "/":
@@ -486,8 +498,10 @@ def _zarr_chunk_path(level_path: str, sep: str, iz: int, iy: int, ix: int) -> st
 def _atomic_zarr_write(omezarr_path: str, level: int,
 					   z0: int, y0: int, x0: int,
 					   z1: int, y1: int, x1: int,
-					   data: np.ndarray, chunk_size: int) -> None:
-	"""Write data to a temp zarr level, then atomically rename chunks into the real output."""
+					   data: np.ndarray, chunk_size: int,
+					   n_levels: int = 0) -> None:
+	"""Write data to a temp zarr level, then atomically rename chunks into the real output.
+	If n_levels > 0, also invalidates coarser pyramid chunks that depend on the written data."""
 	import shutil
 	sep = _omezarr_dim_sep(omezarr_path, level)
 	level_path = os.path.join(omezarr_path, str(level))
@@ -517,6 +531,8 @@ def _atomic_zarr_write(omezarr_path: str, level: int,
 				if os.path.isfile(src):
 					os.makedirs(os.path.dirname(dst), exist_ok=True)
 					os.replace(src, dst)
+					if n_levels > 0:
+						_invalidate_pyramid_chunks(omezarr_path, level, n_levels, iz, iy, ix)
 
 
 def _omezarr_dim_sep(omezarr_path: str, level: int) -> str:
@@ -874,7 +890,7 @@ def _edt_reader_proc(pred_path, work_list, overlap, pZ, pY, pX,
 def _edt_writer_proc(out_path, out_level, work_list, overlap, pZ, pY, pX,
 					  pred_z0, pred_y0, pred_x0, out_z0, out_y0, out_x0,
 					  scaledown, shm_out_names, shm_out_shapes,
-					  write_q, free_q, stop_evt):
+					  write_q, free_q, stop_evt, n_levels=0):
 	"""Writer process: grab results from write_q, downsample + write zarr from
 	shared memory, release slot to free_q.
 
@@ -989,6 +1005,10 @@ def _edt_writer_proc(out_path, out_level, work_list, overlap, pZ, pY, pX,
 							if os.path.isfile(src_file):
 								os.makedirs(os.path.dirname(dst_file), exist_ok=True)
 								os.replace(src_file, dst_file)  # atomic on Linux
+								if n_levels > 0:
+									_invalidate_pyramid_chunks(
+										os.path.normpath(str(out_path)), int(out_level),
+										n_levels, iz, iy, ix)
 		_tw4 = time.monotonic()
 
 		free_q.put(slot)
@@ -1020,6 +1040,7 @@ def _compute_pred_dt_slab(
 	overlap: int = 48,
 	edt_chunk: int = 448,
 	ome_chunk: int = 32,
+	n_levels: int = 0,
 	progress: dict | None = None,
 	read_workers: int = 0,
 ) -> None:
@@ -1163,7 +1184,7 @@ def _compute_pred_dt_slab(
 					args=(output_omezarr_path, output_level_key, work, overlap, pZ, pY, pX,
 						  pred_z0, pred_y0, pred_x0, out_z0, out_y0, out_x0,
 						  scaledown, shm_out_names, shm_out_shapes,
-						  write_q, free_q, stop_evt))
+						  write_q, free_q, stop_evt, n_levels))
 		p.daemon = True
 		p.start()
 		writers.append(p)
@@ -1249,7 +1270,7 @@ def _compute_pred_dt_slab(
 			oe = max(1e-6, time.time() - progress["t0"])
 			frac = progress.get("tiles_done", 0) / max(1, progress.get("tiles_total", 1))
 			edt_frac = progress.get("edt_done", 0) / max(1, progress.get("edt_total_est", 1))
-			overall_frac = 0.7 * frac + 0.3 * edt_frac
+			overall_frac = 0.18 * frac + 0.67 * edt_frac
 			if overall_frac > 0.01:
 				overall_eta = oe / overall_frac * (1.0 - overall_frac)
 				overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
@@ -1865,7 +1886,7 @@ def _infer_tiled_3d(
 				if progress is not None:
 					oe = max(1e-6, time.time() - progress["t0"])
 					frac = done / max(1, total_tiles)
-					overall_frac = 0.7 * frac  # tiles ~70% of total work
+					overall_frac = 0.18 * frac  # tiles ~18% of total work
 					if overall_frac > 0.01:
 						overall_eta = oe / overall_frac * (1.0 - overall_frac)
 						overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
@@ -2407,7 +2428,7 @@ def run_preprocess_3d(
 								if wz > 0 and wy > 0 and wx > 0:
 									_atomic_zarr_write(cos_omezarr_path, cos_level,
 										cz, cy, cx, cz + wz, cy + wy, cx + wx,
-										cos_slab[dz:cze, dy:cye, dx:cxe], oc)
+										cos_slab[dz:cze, dy:cye, dx:cxe], oc, n_levels)
 								n_write_cos += 1
 
 					# --- pred_dt for this z-band ---
@@ -2451,6 +2472,7 @@ def run_preprocess_3d(
 							out_y0=cos_oy0, out_x0=cos_ox0,
 							scaledown=pred_per_cos,
 							ome_chunk=oc,
+							n_levels=n_levels,
 							progress=_progress,
 						)
 						_t_edt_total[0] += time.time() - _t_edt0
@@ -2515,7 +2537,7 @@ def run_preprocess_3d(
 								gm_u8 = np.clip(s[0] * 1000.0, 0.0, 255.0).astype(np.uint8)
 								wz = gm_u8.shape[0]; wy = gm_u8.shape[1]; wx = gm_u8.shape[2]
 								_atomic_zarr_write(gm_omezarr_path, other_level,
-									cz, cy, cx, cz + wz, cy + wy, cx + wx, gm_u8, oc)
+									cz, cy, cx, cz + wz, cy + wy, cx + wx, gm_u8, oc, n_levels)
 
 								# Normals
 								_, _, _, nx_n, ny_n, nz_n = _estimate_normal(
@@ -2524,9 +2546,9 @@ def run_preprocess_3d(
 								nx_u8 = np.clip(np.round(nx_n * flip * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
 								ny_u8 = np.clip(np.round(ny_n * flip * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
 								_atomic_zarr_write(nx_omezarr_path, other_level,
-									cz, cy, cx, cz + wz, cy + wy, cx + wx, nx_u8, oc)
+									cz, cy, cx, cz + wz, cy + wy, cx + wx, nx_u8, oc, n_levels)
 								_atomic_zarr_write(ny_omezarr_path, other_level,
-									cz, cy, cx, cz + wz, cy + wy, cx + wx, ny_u8, oc)
+									cz, cy, cx, cz + wz, cy + wy, cx + wx, ny_u8, oc, n_levels)
 								n_write_c += 1
 
 			# Release memmap pages
