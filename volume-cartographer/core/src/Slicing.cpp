@@ -788,6 +788,13 @@ void samplePixelsAdaptiveARGB32(uint32_t* outBuf, int outStride,
                                 const cv::Vec3f* origin, const cv::Vec3f* vx_step, const cv::Vec3f* vy_step,
                                 int w, int h, const uint32_t lut[256])
 {
+    if (numLevels <= 0 || desiredLevel >= numLevels) {
+        for (int y = 0; y < h; ++y) {
+            uint32_t* row = outBuf + size_t(y) * size_t(outStride);
+            for (int x = 0; x < w; ++x) row[x] = lut[0];
+        }
+        return;
+    }
     // Pre-start fetches for all levels. Coords/origin are in world (level-0)
     // voxel space; scale to each level before enumerating chunks. Batch
     // everything into one fetchInteractive call — the IOPool's queue
@@ -934,6 +941,14 @@ void sampleCompositeAdaptiveImpl(
     uint8_t* levelOut,
     int levelStride)
 {
+    if (numLevels <= 0 || desiredLevel >= numLevels) {
+        // No usable levels (broken/empty volume) — fill black.
+        for (int y = 0; y < h; ++y) {
+            uint32_t* row = outBuf + size_t(y) * size_t(outStride);
+            for (int x = 0; x < w; ++x) row[x] = lut[0];
+        }
+        return;
+    }
     auto levelScale = [&cache](int lvl) { return 1.0f / cache.levelScaleFactor(lvl); };
     const float zLo = float(zStart) * zStep;
     const float zHi = float(zStart + numLayers - 1) * zStep;
