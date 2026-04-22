@@ -105,7 +105,7 @@ std::vector<std::byte> c3d_encode(std::span<const std::byte> raw,
 
 std::vector<std::byte> c3d_decode(std::span<const std::byte> compressed,
                                   std::size_t out_size,
-                                  const C3dCodecParams& /*params*/)
+                                  const C3dCodecParams& params)
 {
     if (out_size != kC3dChunkBytes) {
         throw std::runtime_error(
@@ -123,18 +123,24 @@ std::vector<std::byte> c3d_decode(std::span<const std::byte> compressed,
         throw std::runtime_error("c3d_decode: structural validation failed");
     }
 
-    // Decode needs a 32-byte-aligned output; std::vector doesn't guarantee
-    // that so decode into an aligned staging buffer then copy out.
-    // Zero the staging buffer first — c3d's byte-progressive decode can
-    // leave regions of the output untouched if the input is truncated or
-    // only carries a coarser LOD prefix.  Zeroing guarantees any such
-    // regions come out as black pixels rather than uninitialized memory
-    // (visible as noise in the rendered tiles).
-    AlignedBuf staging(out_size);
-    std::memset(staging.p, 0, out_size);
-    c3d_decoder_chunk_decode(thread_decoder(), in, in_len, staging.p);
+    // Decoder needs 32-byte-aligned output. glibc's malloc returns page-
+    // aligned memory for 16 MiB allocations so the vector's storage is
+    // already aligned in practice; stage only on the fallback. No upfront
+    // memset — the decoder writes every output voxel (c3d.c:3659 for the
+    // lod_end==0 fast path, c3d.c:3778 otherwise, including the §T9
+    // truncated-entropy case where zero-fill happens in the coefficient
+    // buffer before the final output loop converts it to u8).
+    c3d_decoder* d = thread_decoder();
+    c3d_decoder_set_denoise(d, !params.skip_denoise);
     std::vector<std::byte> out(out_size);
-    std::memcpy(out.data(), staging.p, out_size);
+    uint8_t* out_ptr = reinterpret_cast<uint8_t*>(out.data());
+    if (is_aligned(out_ptr)) {
+        c3d_decoder_chunk_decode(d, in, in_len, out_ptr);
+    } else {
+        AlignedBuf staging(out_size);
+        c3d_decoder_chunk_decode(d, in, in_len, staging.p);
+        std::memcpy(out.data(), staging.p, out_size);
+    }
     return out;
 }
 
@@ -155,11 +161,21 @@ std::vector<std::byte> c3d_decode_lod(std::span<const std::byte> compressed,
     const std::size_t side    = static_cast<std::size_t>(C3D_CHUNK_SIDE) >> lod;
     const std::size_t out_size = side * side * side;
 
-    AlignedBuf staging(out_size);
-    std::memset(staging.p, 0, out_size);
-    c3d_decoder_chunk_decode_lod(thread_decoder(), in, in_len, lod, staging.p);
+    c3d_decoder* d = thread_decoder();
+    // The thread-local decoder persists denoise state across calls, and
+    // c3d_decode() toggles it per-invocation based on params.skip_denoise.
+    // Restore the default (denoise enabled) so this entrypoint's lod=0
+    // semantics don't silently inherit a prior c3d_decode(skip_denoise).
+    c3d_decoder_set_denoise(d, true);
     std::vector<std::byte> out(out_size);
-    std::memcpy(out.data(), staging.p, out_size);
+    uint8_t* out_ptr = reinterpret_cast<uint8_t*>(out.data());
+    if (is_aligned(out_ptr)) {
+        c3d_decoder_chunk_decode_lod(d, in, in_len, lod, out_ptr);
+    } else {
+        AlignedBuf staging(out_size);
+        c3d_decoder_chunk_decode_lod(d, in, in_len, lod, staging.p);
+        std::memcpy(out.data(), staging.p, out_size);
+    }
     return out;
 }
 

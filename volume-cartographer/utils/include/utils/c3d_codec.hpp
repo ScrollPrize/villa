@@ -29,6 +29,12 @@ struct C3dCodecParams {
     int depth  = 256;  // Z
     int height = 256;  // Y
     int width  = 256;  // X
+
+    // Skip libc3d's post-decode denoise blur (LOD 0 only).  Trades ~0.03 dB
+    // PSNR at the default r=50 for ~14% of decode CPU.  Set true for GUI
+    // tile rendering; leave false for archival / lossless-at-ratio reads.
+    // Ignored by encode.
+    bool skip_denoise = false;
 };
 
 [[nodiscard]] std::vector<std::byte> c3d_encode(
