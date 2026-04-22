@@ -1091,23 +1091,30 @@ def _compute_pred_dt_slab(
 	_MAX_DT = 48
 	pZ, pY, pX = (int(v) for v in pred_zarr.shape)
 
-	# Align edt_chunk to output zarr chunk boundaries to avoid write collisions
-	# and enable per-chunk resume.  Output chunk in pred coords = ome_chunk * scaledown.
-	# Use largest multiple of out_chunk_in_pred that fits in GPU memory.
-	# EDT needs ~12 bytes/voxel peak (bool + 2×float32 + uint8).
-	# Query available GPU memory to size chunks appropriately.
+	# EDT chunk = power-of-two multiple of out_chunk_in_pred that fits GPU memory.
+	# out_chunk_in_pred = ome_chunk * scaledown: pred voxels per output chunk.
+	# Peak GPU per chunk: ~12 bytes/voxel (bool + 2×float32 + uint8).
+	# Batch holds multiple chunks on GPU: inputs + results + one EDT working set.
+	BATCH = 8
 	out_chunk_in_pred = max(1, scaledown) * max(1, ome_chunk)
 	try:
 		_gpu_free = cp.cuda.Device().mem_info[0]
-		# Use at most 60% of free memory, 12 bytes per voxel
-		max_voxels = int(_gpu_free * 0.6 / 12)
-		max_side = max(out_chunk_in_pred, int(max_voxels ** (1.0 / 3.0)))
 	except Exception:
-		max_side = 512
-	edt_chunk = max(out_chunk_in_pred,
-					(min(edt_chunk, max_side) // out_chunk_in_pred) * out_chunk_in_pred)
-	print(f"[pred_dt] edt_chunk={edt_chunk} (out_chunk_in_pred={out_chunk_in_pred}, "
-		  f"gpu_free={_gpu_free / 2**30:.1f}GiB, max_side={max_side})", flush=True)
+		_gpu_free = 4 * 2**30
+	k = 1
+	while True:
+		next_k = k * 2
+		side = next_k * out_chunk_in_pred + 2 * overlap
+		# Memory: BATCH inputs (uint8) + BATCH results (uint8) + 1 EDT working set (12 bytes/vox)
+		mem = BATCH * side**3 * 2 + side**3 * 12
+		if mem > _gpu_free * 0.5:
+			break
+		k = next_k
+	edt_chunk = k * out_chunk_in_pred
+	_padded = edt_chunk + 2 * overlap
+	_peak_mb = (BATCH * _padded**3 * 2 + _padded**3 * 12) / 2**20
+	print(f"[pred_dt] edt_chunk={edt_chunk} ({k}x{out_chunk_in_pred}, "
+		  f"gpu_free={_gpu_free / 2**30:.1f}GiB, peak={_peak_mb:.0f}MB)", flush=True)
 	# Validate alignment — caller must pass chunk-aligned coordinates
 	ocp = out_chunk_in_pred
 	for name, val, limit in [("pred_z0", pred_z0, pZ), ("pred_y0", pred_y0, pY), ("pred_x0", pred_x0, pX),
@@ -1280,13 +1287,17 @@ def _compute_pred_dt_slab(
 			for i, (slot, chunk_idx, ashp) in enumerate(batch_items):
 				sm_out = _shm.SharedMemory(name=shm_out_names[slot])
 				obuf = np.ndarray(shm_out_shapes[slot], dtype=np.uint8, buffer=sm_out.buf)
-				gpu_results[i].get(out=obuf[:ashp[0], :ashp[1], :ashp[2]])
+				if ashp == shm_out_shapes[slot]:
+					gpu_results[i].get(out=obuf)
+				else:
+					obuf[:ashp[0], :ashp[1], :ashp[2]] = cp.asnumpy(gpu_results[i])
 				sm_out.close()
 		stream_d2h.synchronize()
 		for i, (slot, chunk_idx, ashp) in enumerate(batch_items):
 			write_q.put((slot, chunk_idx, ashp))
 			gpu_done += 1
 		del gpu_results
+		cp.get_default_memory_pool().free_all_blocks()
 		_td2h = time.monotonic()
 
 		_t_wait_sum += _tw1 - _tw0
@@ -1825,6 +1836,7 @@ def _infer_tiled_3d(
 	skipped_tiles = skip_z_positions * tiles_per_zrow
 	done = skipped_tiles
 	t0 = time.time()
+	_tile_time_sum = 0.0
 	crop_offset = (z0, y0, x0)
 	if progress is not None:
 		progress["tiles_total"] = total_tiles
@@ -1843,6 +1855,7 @@ def _infer_tiled_3d(
 						progress["tiles_done"] = done
 					continue
 
+				_tile_t0 = time.time()
 				# Read tile from zarr (lazy)
 				tile_np = _read_tile_zarr(
 					zarr_arr, volume_shape, crop_offset,
@@ -1909,12 +1922,13 @@ def _infer_tiled_3d(
 				acc_coarse[:, azl_c:azr_c, ayl_c:ayr_c, axl_c:axr_c] += other_np[:, :pz_c, :py_c, :px_c]
 				wsum_coarse[0, azl_c:azr_c, ayl_c:ayr_c, axl_c:axr_c] += w_coarse[:pz_c, :py_c, :px_c]
 
+				_tile_time_sum += time.time() - _tile_t0
 				done += 1
 				if progress is not None:
 					progress["tiles_done"] = done
 				elapsed = max(1e-6, time.time() - t0)
 				actual_done = done - skipped_tiles
-				per = elapsed / max(1, actual_done)
+				per = _tile_time_sum / max(1, actual_done)
 				remaining = total_tiles - done
 				eta = max(0.0, per * remaining)
 				overall = ""
@@ -2260,13 +2274,19 @@ def run_preprocess_3d(
 	z0 = max(0, z0); y0 = max(0, y0); x0 = max(0, x0)
 	nz = z1 - z0; ny = y1 - y0; nx_dim = x1 - x0
 
-	# Recompute output start offsets from expanded crop
-	cos_oz0 = _ds_index(z0, cos_sd)
-	cos_oy0 = _ds_index(y0, cos_sd)
-	cos_ox0 = _ds_index(x0, cos_sd)
-	other_oz0 = _ds_index(z0, other_sd)
-	other_oy0 = _ds_index(y0, other_sd)
-	other_ox0 = _ds_index(x0, other_sd)
+	# Recompute ALL output offsets from expanded crop
+	cos_oz0 = (_ds_index(z0, cos_sd) // oc) * oc
+	cos_oy0 = (_ds_index(y0, cos_sd) // oc) * oc
+	cos_ox0 = (_ds_index(x0, cos_sd) // oc) * oc
+	cos_oz1 = min(full_cos_z, ((_ds_index(z0, cos_sd) + _ds_size(nz, cos_sd) + oc - 1) // oc) * oc)
+	cos_oy1 = min(full_cos_y, ((_ds_index(y0, cos_sd) + _ds_size(ny, cos_sd) + oc - 1) // oc) * oc)
+	cos_ox1 = min(full_cos_x, ((_ds_index(x0, cos_sd) + _ds_size(nx_dim, cos_sd) + oc - 1) // oc) * oc)
+	other_oz0 = (_ds_index(z0, other_sd) // oc) * oc
+	other_oy0 = (_ds_index(y0, other_sd) // oc) * oc
+	other_ox0 = (_ds_index(x0, other_sd) // oc) * oc
+	other_oz1 = min(full_other_z, ((_ds_index(z0, other_sd) + _ds_size(nz, other_sd) + oc - 1) // oc) * oc)
+	other_oy1 = min(full_other_y, ((_ds_index(y0, other_sd) + _ds_size(ny, other_sd) + oc - 1) // oc) * oc)
+	other_ox1 = min(full_other_x, ((_ds_index(x0, other_sd) + _ds_size(nx_dim, other_sd) + oc - 1) // oc) * oc)
 
 	# Recompute output region sizes with expanded crop
 	cos_wz = cos_oz1 - cos_oz0
