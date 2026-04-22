@@ -476,6 +476,12 @@ def run_preprocess(
 # OME-Zarr helpers
 # ---------------------------------------------------------------------------
 
+def _omezarr_chunk_exists(omezarr_path: str, level: int, z: int, y: int, x: int, chunk_size: int) -> bool:
+	"""Check if an OME-Zarr chunk file exists on disk (zarr v2, dim_sep='/')."""
+	iz, iy, ix = z // chunk_size, y // chunk_size, x // chunk_size
+	return os.path.isfile(os.path.join(omezarr_path, str(level), str(iz), str(iy), str(ix)))
+
+
 def _omezarr_level_shape(
 	base_shape: tuple[int, int, int], level: int,
 ) -> tuple[int, int, int]:
@@ -555,28 +561,77 @@ def _build_omezarr_pyramid(
 	data_level: int,
 	n_levels: int,
 	chunk: int,
+	workers: int = 0,
 ) -> None:
-	"""Build coarser pyramid levels by 2x downsampling from the data level."""
+	"""Build coarser pyramid levels by parallel 2x downsampling.
+
+	Uses the same chunk-aligned multiprocessing approach as the VC3D
+	converter: each worker reads a 2×chunk region from level N and writes
+	one chunk to level N+1.  No write contention.
+	"""
+	import multiprocessing as _mp
+
+	from convert_fit_zarr_to_vc3d_omezarr import (
+		_downsample_chunk_worker, _print_progress,
+	)
+
+	if workers <= 0:
+		workers = max(1, _mp.cpu_count())
+
 	g = zarr.open_group(str(omezarr_path), mode="r+")
+
 	for lv in range(data_level + 1, n_levels):
-		src = g[str(lv - 1)]
-		dst = g[str(lv)]
-		sh = tuple(int(v) for v in src.shape)
+		src_shape = tuple(int(v) for v in g[str(lv - 1)].shape)
+		dst_shape = tuple(int(v) for v in g[str(lv)].shape)
 		cz2 = chunk * 2
-		t0 = time.time()
-		for z0 in range(0, sh[0], cz2):
-			z1 = min(sh[0], z0 + cz2)
-			for y0 in range(0, sh[1], cz2):
-				y1 = min(sh[1], y0 + cz2)
-				for x0 in range(0, sh[2], cz2):
-					x1 = min(sh[2], x0 + cz2)
-					slab = np.asarray(src[z0:z1, y0:y1, x0:x1])
-					down = slab[::2, ::2, ::2]
-					if down.size > 0:
-						dz, dy, dx = z0 // 2, y0 // 2, x0 // 2
-						dst[dz:dz + down.shape[0], dy:dy + down.shape[1], dx:dx + down.shape[2]] = down
-		print(f"[predict3d] pyramid L{lv} ({tuple(int(v) for v in dst.shape)}) "
-			  f"from L{lv-1} in {time.time() - t0:.1f}s", flush=True)
+
+		ds_work = []
+		skipped_ds = 0
+		for z0 in range(0, src_shape[0], cz2):
+			z1 = min(src_shape[0], z0 + cz2)
+			for y0 in range(0, src_shape[1], cz2):
+				y1 = min(src_shape[1], y0 + cz2)
+				for x0 in range(0, src_shape[2], cz2):
+					x1 = min(src_shape[2], x0 + cz2)
+					# Skip if dest chunk already exists
+					if _omezarr_chunk_exists(omezarr_path, lv, z0 // 2, y0 // 2, x0 // 2, chunk):
+						skipped_ds += 1
+						continue
+					ds_work.append((
+						str(omezarr_path), lv - 1, lv,
+						z0, z1, y0, y1, x0, x1,
+					))
+
+		n_ds = len(ds_work)
+		if skipped_ds > 0:
+			print(f"[predict3d] L{lv}: skipped {skipped_ds} existing chunks", flush=True)
+		if n_ds == 0:
+			continue
+
+		t_lv = time.time()
+		done_count = [0]
+		lock = threading.Lock()
+		TAG = "[predict3d]"
+
+		_stop = threading.Event()
+		def _prog():
+			while not _stop.is_set():
+				with lock:
+					d = done_count[0]
+				_print_progress(prefix=f"{TAG} L{lv} {dst_shape}", done=d, total=n_ds, t0=t_lv)
+				_stop.wait(0.5)
+		prog_thread = threading.Thread(target=_prog, daemon=True)
+		prog_thread.start()
+
+		with _mp.Pool(processes=min(workers, n_ds)) as pool:
+			for _ in pool.imap_unordered(_downsample_chunk_worker, ds_work):
+				with lock:
+					done_count[0] += 1
+
+		_stop.set()
+		prog_thread.join(timeout=2)
+		_print_progress(prefix=f"{TAG} L{lv} {dst_shape}", done=n_ds, total=n_ds, t0=t_lv)
+		print("", flush=True)
 
 
 def _find_resume_z(omezarr_path: str, level: int) -> int:
@@ -662,16 +717,27 @@ def _edt_reader_proc(pred_path, work_list, overlap, pZ, pY, pX,
 					  shm_in_names, shm_shapes, free_q, ready_q, work_q, stop_evt):
 	"""Reader process: grab chunk indices from work_q, free slots from free_q,
 	read zarr into shared memory, signal ready_q.  Module-level for pickling."""
+	import tensorstore as ts
 	import multiprocessing.shared_memory as _shm2
-	pred = zarr.open(str(pred_path), mode="r")
+	ctx = ts.Context({
+		'data_copy_concurrency': {'limit': 1},
+		'file_io_concurrency': {'limit': 4},
+	})
+	spec = {'driver': 'zarr', 'kvstore': {'driver': 'file',
+			'path': os.path.normpath(str(pred_path))}}
+	pred = ts.open(spec, read=True, open=True, context=ctx).result()
+	_n = 0; _t_wq = 0.0; _t_fq = 0.0; _t_read = 0.0; _t_copy = 0.0
 	while not stop_evt.is_set():
+		_t0 = time.monotonic()
 		try:
 			chunk_idx = work_q.get(timeout=0.1)
 		except Exception:
 			if work_q.empty():
 				break
 			continue
+		_t1 = time.monotonic()
 		slot = free_q.get()
+		_t2 = time.monotonic()
 
 		cz0, cz1, cy0, cy1, cx0, cx1 = work_list[chunk_idx]
 		rz0 = max(0, cz0 - overlap)
@@ -681,17 +747,26 @@ def _edt_reader_proc(pred_path, work_list, overlap, pZ, pY, pX,
 		rx0 = max(0, cx0 - overlap)
 		rx1 = min(pX, cx1 + overlap)
 
-		raw = np.asarray(pred[rz0:rz1, ry0:ry1, rx0:rx1])
-		binary = (raw > 0).astype(np.uint8)
+		raw = pred[rz0:rz1, ry0:ry1, rx0:rx1].read().result()
+		binary = (np.asarray(raw) > 0).astype(np.uint8)
 		del raw
+		_t3 = time.monotonic()
 
 		sm = _shm2.SharedMemory(name=shm_in_names[slot])
 		buf = np.ndarray(shm_shapes[slot], dtype=np.uint8, buffer=sm.buf)
 		ashp = binary.shape
 		buf[:ashp[0], :ashp[1], :ashp[2]] = binary
 		sm.close()
+		_t4 = time.monotonic()
 
 		ready_q.put((slot, chunk_idx, ashp))
+
+		_n += 1; _t_wq += _t1-_t0; _t_fq += _t2-_t1; _t_read += _t3-_t2; _t_copy += _t4-_t3
+		if _n % 20 == 0:
+			print(f"  [reader pid={os.getpid()}] n={_n} "
+				  f"work_q={1000*_t_wq/_n:.0f} free_q={1000*_t_fq/_n:.0f} "
+				  f"read={1000*_t_read/_n:.0f} copy={1000*_t_copy/_n:.0f}ms/chunk",
+				  flush=True)
 
 
 def _edt_writer_proc(out_path, out_level, work_list, overlap, pZ, pY, pX,
@@ -700,9 +775,17 @@ def _edt_writer_proc(out_path, out_level, work_list, overlap, pZ, pY, pX,
 					  write_q, free_q, stop_evt):
 	"""Writer process: grab results from write_q, downsample + write zarr from
 	shared memory, release slot to free_q.  Module-level for pickling."""
+	import tensorstore as ts
 	import multiprocessing.shared_memory as _shm2
-	out_arr = zarr.open(str(out_path), mode="r+")[str(out_level)]
-	out_vol_shape = tuple(int(v) for v in out_arr.shape)
+	ctx = ts.Context({
+		'data_copy_concurrency': {'limit': 1},
+		'file_io_concurrency': {'limit': 4},
+	})
+	# Open the specific level within the OME-Zarr group
+	level_path = os.path.normpath(os.path.join(str(out_path), str(out_level)))
+	spec = {'driver': 'zarr', 'kvstore': {'driver': 'file', 'path': level_path}}
+	out_arr = ts.open(spec, read=True, write=True, open=True, context=ctx).result()
+	out_vol_shape = tuple(out_arr.shape)
 
 	while not stop_evt.is_set():
 		try:
@@ -741,7 +824,7 @@ def _edt_writer_proc(out_path, out_level, work_list, overlap, pZ, pY, pX,
 			wy = oy_end - oyi
 			wx = ox_end - oxi
 			if ozi < out_vol_shape[0] and wy > 0 and wx > 0:
-				out_arr[ozi, oyi:oy_end, oxi:ox_end] = slc[:wy, :wx]
+				out_arr[ozi, oyi:oy_end, oxi:ox_end].write(slc[:wy, :wx]).result()
 
 		free_q.put(slot)
 
@@ -840,7 +923,7 @@ def _compute_pred_dt_slab(
 		return
 
 	t0 = time.time()
-	n_workers = min(read_workers if read_workers > 0 else max(1, os.cpu_count() or 4),
+	n_workers = min(read_workers if read_workers > 0 else max(1, (os.cpu_count() or 4) // 4),
 				   n_chunks)
 
 	print(f"[pred_dt] {n_chunks} chunks to process, {n_workers} workers, edt_chunk={edt_chunk}",
@@ -998,14 +1081,17 @@ def _compute_pred_dt_slab(
 			if overall_frac > 0.01:
 				overall_eta = oe / overall_frac * (1.0 - overall_frac)
 				overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
+		vox_per_chunk = edt_chunk ** 3
+		mvox_s = gpu_done * vox_per_chunk / elapsed / 1e6
 		print(f"\r[pred_dt] gpu {gpu_done}/{n_chunks} "
 			  f"({100.0 * gpu_done / n_chunks:.0f}%) "
 			  f"eta {int(eta // 60):02d}:{int(eta % 60):02d} "
+			  f"{mvox_s:.0f}Mvox/s "
 			  f"wait={1000*_t_wait_sum/gpu_done:.0f} "
 			  f"h2d={1000*_t_h2d_sum/gpu_done:.0f} "
 			  f"edt={1000*_t_edt_sum/gpu_done:.0f} "
-			  f"d2h={1000*_t_d2h_sum/gpu_done:.0f}ms/chunk "
-			  f"batch={B}"
+			  f"d2h={1000*_t_d2h_sum/gpu_done:.0f}ms "
+			  f"B={B}"
 			  f"{overall}  ",
 			  end="", flush=True)
 
@@ -1908,20 +1994,24 @@ def run_preprocess_3d(
 	full_other_y = _ds_size(sh[1], other_sd)
 	full_other_x = _ds_size(sh[2], other_sd)
 
-	# Crop offsets at each output resolution (in input-relative coords)
-	cos_oz0 = _ds_index(z0, cos_sd)
-	cos_oy0 = _ds_index(y0, cos_sd)
-	cos_ox0 = _ds_index(x0, cos_sd)
-	cos_oz1 = min(full_cos_z, cos_oz0 + _ds_size(nz, cos_sd))
-	cos_oy1 = min(full_cos_y, cos_oy0 + _ds_size(ny, cos_sd))
-	cos_ox1 = min(full_cos_x, cos_ox0 + _ds_size(nx_dim, cos_sd))
+	# OME-Zarr output chunk size (needed for crop rounding)
+	oc = max(1, int(ome_chunk))
 
-	other_oz0 = _ds_index(z0, other_sd)
-	other_oy0 = _ds_index(y0, other_sd)
-	other_ox0 = _ds_index(x0, other_sd)
-	other_oz1 = min(full_other_z, other_oz0 + _ds_size(nz, other_sd))
-	other_oy1 = min(full_other_y, other_oy0 + _ds_size(ny, other_sd))
-	other_ox1 = min(full_other_x, other_ox0 + _ds_size(nx_dim, other_sd))
+	# Crop offsets at each output resolution, rounded to ome_chunk boundaries
+	# so every write fills complete chunks (enables per-chunk skip on resume).
+	cos_oz0 = (_ds_index(z0, cos_sd) // oc) * oc
+	cos_oy0 = (_ds_index(y0, cos_sd) // oc) * oc
+	cos_ox0 = (_ds_index(x0, cos_sd) // oc) * oc
+	cos_oz1 = min(full_cos_z, ((_ds_index(z0, cos_sd) + _ds_size(nz, cos_sd) + oc - 1) // oc) * oc)
+	cos_oy1 = min(full_cos_y, ((_ds_index(y0, cos_sd) + _ds_size(ny, cos_sd) + oc - 1) // oc) * oc)
+	cos_ox1 = min(full_cos_x, ((_ds_index(x0, cos_sd) + _ds_size(nx_dim, cos_sd) + oc - 1) // oc) * oc)
+
+	other_oz0 = (_ds_index(z0, other_sd) // oc) * oc
+	other_oy0 = (_ds_index(y0, other_sd) // oc) * oc
+	other_ox0 = (_ds_index(x0, other_sd) // oc) * oc
+	other_oz1 = min(full_other_z, ((_ds_index(z0, other_sd) + _ds_size(nz, other_sd) + oc - 1) // oc) * oc)
+	other_oy1 = min(full_other_y, ((_ds_index(y0, other_sd) + _ds_size(ny, other_sd) + oc - 1) // oc) * oc)
+	other_ox1 = min(full_other_x, ((_ds_index(x0, other_sd) + _ds_size(nx_dim, other_sd) + oc - 1) // oc) * oc)
 
 	# Effective scaledowns from base and OME-Zarr level numbers
 	effective_cos_sd = input_sd * cos_sd
@@ -1969,7 +2059,6 @@ def run_preprocess_3d(
 			  f"pred_sd={pred_sd} pred_per_cos={pred_per_cos}", flush=True)
 
 	# --- Create OME-Zarr outputs ---
-	oc = max(1, int(ome_chunk))
 	cos_omezarr_path = os.path.join(out_dir, f"{prefix}cos.ome.zarr")
 	gm_omezarr_path = os.path.join(out_dir, f"{prefix}grad_mag.ome.zarr")
 	nx_omezarr_path = os.path.join(out_dir, f"{prefix}nx.ome.zarr")
@@ -2081,13 +2170,21 @@ def run_preprocess_3d(
 					# Trim to crop region (Y, X)
 					yf = pad0_inner // sd_fine
 					xf = pad0_inner // sd_fine
-					cos_slab = np.ascontiguousarray(
-						acc_band[0, local_from:local_to, yf:yf + cos_wy, xf:xf + cos_wx])
-					cos_u8 = np.clip(cos_slab * 255.0, 0.0, 255.0).astype(np.uint8)
 					oz = cos_oz0 + eff_out_zs
-					cos_lv_arr[oz:oz + cos_u8.shape[0],
-							   cos_oy0:cos_oy0 + cos_u8.shape[1],
-							   cos_ox0:cos_ox0 + cos_u8.shape[2]] = cos_u8
+					# Skip if all output chunks in this z-band already exist
+					all_exist = all(
+						_omezarr_chunk_exists(cos_omezarr_path, cos_level, oz + dz, cos_oy0 + dy, cos_ox0 + dx, oc)
+						for dz in range(0, eff_out_ze - eff_out_zs, oc)
+						for dy in range(0, cos_wy, oc)
+						for dx in range(0, cos_wx, oc)
+					)
+					if not all_exist:
+						cos_slab = np.ascontiguousarray(
+							acc_band[0, local_from:local_to, yf:yf + cos_wy, xf:xf + cos_wx])
+						cos_u8 = np.clip(cos_slab * 255.0, 0.0, 255.0).astype(np.uint8)
+						cos_lv_arr[oz:oz + cos_u8.shape[0],
+								   cos_oy0:cos_oy0 + cos_u8.shape[1],
+								   cos_ox0:cos_ox0 + cos_u8.shape[2]] = cos_u8
 
 					# --- pred_dt for this z-band ---
 					if pred_dt_zarr is not None and dt_lv_arr is not None:
@@ -2153,32 +2250,40 @@ def run_preprocess_3d(
 				eff_out_ze_c = eff_to_c - b_c
 
 				if eff_out_ze_c > eff_out_zs_c:
-					local_from_c = eff_from_c - flush_from_c
-					local_to_c = eff_to_c - flush_from_c
-					yc = pad0_inner // sd_coarse
-					xc = pad0_inner // sd_coarse
-					slab = np.ascontiguousarray(
-						acc_band_c[:, local_from_c:local_to_c, yc:yc + other_wy, xc:xc + other_wx])
-
-					# grad_mag
-					gm_u8 = np.clip(slab[0] * 1000.0, 0.0, 255.0).astype(np.uint8)
 					oz_c = other_oz0 + eff_out_zs_c
-					gm_lv_arr[oz_c:oz_c + gm_u8.shape[0],
-							  other_oy0:other_oy0 + gm_u8.shape[1],
-							  other_ox0:other_ox0 + gm_u8.shape[2]] = gm_u8
+					# Skip if all output chunks already exist
+					all_exist_c = all(
+						_omezarr_chunk_exists(gm_omezarr_path, other_level, oz_c + dz, other_oy0 + dy, other_ox0 + dx, oc)
+						for dz in range(0, eff_out_ze_c - eff_out_zs_c, oc)
+						for dy in range(0, other_wy, oc)
+						for dx in range(0, other_wx, oc)
+					)
+					if not all_exist_c:
+						local_from_c = eff_from_c - flush_from_c
+						local_to_c = eff_to_c - flush_from_c
+						yc = pad0_inner // sd_coarse
+						xc = pad0_inner // sd_coarse
+						slab = np.ascontiguousarray(
+							acc_band_c[:, local_from_c:local_to_c, yc:yc + other_wy, xc:xc + other_wx])
 
-					# Normals
-					_, _, _, nx_n, ny_n, nz_n = _estimate_normal(
-						slab[1], slab[2], slab[3], slab[4], slab[5], slab[6])
-					flip = np.where(nz_n < 0, -1.0, 1.0)
-					nx_u8 = np.clip(np.round(nx_n * flip * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
-					ny_u8 = np.clip(np.round(ny_n * flip * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
-					nx_lv_arr[oz_c:oz_c + nx_u8.shape[0],
-							  other_oy0:other_oy0 + nx_u8.shape[1],
-							  other_ox0:other_ox0 + nx_u8.shape[2]] = nx_u8
-					ny_lv_arr[oz_c:oz_c + ny_u8.shape[0],
-							  other_oy0:other_oy0 + ny_u8.shape[1],
-							  other_ox0:other_ox0 + ny_u8.shape[2]] = ny_u8
+						# grad_mag
+						gm_u8 = np.clip(slab[0] * 1000.0, 0.0, 255.0).astype(np.uint8)
+						gm_lv_arr[oz_c:oz_c + gm_u8.shape[0],
+								  other_oy0:other_oy0 + gm_u8.shape[1],
+								  other_ox0:other_ox0 + gm_u8.shape[2]] = gm_u8
+
+						# Normals
+						_, _, _, nx_n, ny_n, nz_n = _estimate_normal(
+							slab[1], slab[2], slab[3], slab[4], slab[5], slab[6])
+						flip = np.where(nz_n < 0, -1.0, 1.0)
+						nx_u8 = np.clip(np.round(nx_n * flip * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
+						ny_u8 = np.clip(np.round(ny_n * flip * 127.0 + 128.0), 0.0, 255.0).astype(np.uint8)
+						nx_lv_arr[oz_c:oz_c + nx_u8.shape[0],
+								  other_oy0:other_oy0 + nx_u8.shape[1],
+								  other_ox0:other_ox0 + nx_u8.shape[2]] = nx_u8
+						ny_lv_arr[oz_c:oz_c + ny_u8.shape[0],
+								  other_oy0:other_oy0 + ny_u8.shape[1],
+								  other_ox0:other_ox0 + ny_u8.shape[2]] = ny_u8
 
 			# Release memmap pages
 			_release_memmap_pages(acc_coarse, flush_from_c, flush_to_c)
