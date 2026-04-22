@@ -1045,7 +1045,9 @@ utils::Json SegmentationLasagnaPanel::lasagnaConfigJson() const
         utils::Json parsed = utils::Json::parse(
             std::string_view(utf8.constData(), utf8.size()));
         if (parsed.is_object()) return parsed;
-    } catch (...) {}
+    } catch (const std::exception& e) {
+        std::cerr << "[lasagna] ERROR: invalid config JSON: " << e.what() << std::endl;
+    }
 
     return utils::Json{};
 }
