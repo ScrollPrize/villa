@@ -376,6 +376,16 @@ public:
     // because gen() can be called from concurrent OMP threads.
     mutable std::atomic<bool> _validMaskAllValid{false};
     mutable cv::Mat_<cv::Vec3f> _normalCache;
+    // gen() scratch buffers reused across render ticks. At 1920×1080 each
+    // coords/normals Mat is ~170 MiB of cv::Vec3f; submitRender fires every
+    // 16-33 ms so fresh allocations burn GB/sec through the allocator and
+    // page-fault every frame. cv::warpAffine writes these as dst: OpenCV's
+    // Mat::create reuses the buffer when size+type match the existing alloc,
+    // so these stay at one buffer per surface after steady state is reached.
+    // mutable because gen() is const.
+    mutable cv::Mat_<cv::Vec3f> _genCoordsScratch;
+    mutable cv::Mat_<cv::Vec3f> _genNormalsScratch;
+    mutable cv::Mat_<uint8_t> _genValidScratch;
     cv::Vec2f _scale;
 
     void setChannel(const std::string& name, const cv::Mat& channel);

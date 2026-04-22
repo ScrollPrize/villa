@@ -20,6 +20,13 @@
 #include <unordered_map>
 #include <variant>
 
+#if !defined(_WIN32)
+#  include <fcntl.h>
+#  include <sys/mman.h>
+#  include <sys/stat.h>
+#  include <unistd.h>
+#endif
+
 #if __has_include("compression.hpp")
 #  include "compression.hpp"
 #  define UTILS_HAS_COMPRESSION 1
@@ -900,6 +907,66 @@ inline ZarrVersion detect_version(const std::filesystem::path& path) {
 
 } // namespace detail
 
+// Owns a block of bytes that was either mmap'd read-only from a file
+// (preferred on POSIX for shard files — kernel handles residency) or
+// heap-allocated (fallback). Non-copyable, movable. Static factories
+// make the ownership discriminator explicit at the call site.
+class ShardBytes final {
+public:
+    ShardBytes() = default;
+    ~ShardBytes() { release(); }
+    ShardBytes(const ShardBytes&) = delete;
+    ShardBytes& operator=(const ShardBytes&) = delete;
+    ShardBytes(ShardBytes&& o) noexcept { take(std::move(o)); }
+    ShardBytes& operator=(ShardBytes&& o) noexcept {
+        if (this != &o) { release(); take(std::move(o)); }
+        return *this;
+    }
+
+    static ShardBytes from_mmap(void* ptr, std::size_t n) noexcept {
+        ShardBytes b;
+        b.mapped_ = ptr;
+        b.size_ = n;
+        return b;
+    }
+    static ShardBytes from_vector(std::vector<std::byte> v) noexcept {
+        ShardBytes b;
+        b.size_ = v.size();
+        b.vec_ = std::move(v);
+        return b;
+    }
+
+    const std::byte* data() const noexcept {
+        return mapped_ ? static_cast<const std::byte*>(mapped_) : vec_.data();
+    }
+    std::size_t size() const noexcept { return size_; }
+    bool empty() const noexcept { return size_ == 0; }
+    std::span<const std::byte> span() const noexcept { return {data(), size_}; }
+    // True when the backing is an mmap rather than heap (diagnostic).
+    bool is_mmap() const noexcept { return mapped_ != nullptr; }
+
+private:
+    void release() noexcept {
+#if !defined(_WIN32)
+        if (mapped_) {
+            ::munmap(mapped_, size_);
+        }
+#endif
+        mapped_ = nullptr;
+        vec_.clear();
+        vec_.shrink_to_fit();
+        size_ = 0;
+    }
+    void take(ShardBytes&& o) noexcept {
+        mapped_ = o.mapped_; o.mapped_ = nullptr;
+        vec_ = std::move(o.vec_);
+        size_ = o.size_; o.size_ = 0;
+    }
+    void* mapped_ = nullptr;      // mmap region if non-null
+    std::vector<std::byte> vec_;  // otherwise heap-owned
+    std::size_t size_ = 0;
+};
+
 // ---------------------------------------------------------------------------
 // ZarrArray
 // ---------------------------------------------------------------------------
@@ -1576,7 +1643,13 @@ public:
     /// extract_inner_chunk() to pull out individual inner chunks — useful
     /// when a caller maintains an external shard-level cache and wants to
     /// serve many inner chunks from a single disk read.
-    [[nodiscard]] std::optional<std::vector<std::byte>>
+    ///
+    /// On POSIX the returned bytes are backed by a read-only mmap so the
+    /// kernel's page cache owns residency — under memory pressure unused
+    /// pages drop without touching our allocator. Inner chunks written
+    /// later invalidate the view (caller must drop/refresh); shard_mutex
+    /// serialises reads vs. write_inner_chunk_to_shard.
+    [[nodiscard]] std::optional<ShardBytes>
     read_whole_shard(std::span<const std::size_t> chunk_indices) const {
         if (!is_sharded()) return std::nullopt;
         const auto ndim = meta_.ndim();
@@ -1588,6 +1661,26 @@ public:
         auto key = chunk_key(shard_idx);
         auto p = root_ / key;
         std::lock_guard lock(shard_mutex_for(p));
+#if !defined(_WIN32)
+        int fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return std::nullopt;
+        struct stat st;
+        if (::fstat(fd, &st) < 0 || st.st_size <= 0) {
+            ::close(fd);
+            return std::nullopt;
+        }
+        const std::size_t sz = static_cast<std::size_t>(st.st_size);
+        void* ptr = ::mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+        // The mapping survives the fd close — no fd leak from a long-lived
+        // shard-cache entry.
+        ::close(fd);
+        if (ptr == MAP_FAILED) return std::nullopt;
+        // MADV_RANDOM: we parse the trailing index then hop to a specific
+        // inner-chunk offset. Sequential readahead would prefetch pages we
+        // never touch.
+        ::madvise(ptr, sz, MADV_RANDOM);
+        return ShardBytes::from_mmap(ptr, sz);
+#else
         std::ifstream f(p, std::ios::binary | std::ios::ate);
         if (!f) return std::nullopt;
         auto size = static_cast<std::streamsize>(f.tellg());
@@ -1596,7 +1689,8 @@ public:
         f.seekg(0);
         f.read(reinterpret_cast<char*>(data.data()), size);
         if (!f) return std::nullopt;
-        return data;
+        return ShardBytes::from_vector(std::move(data));
+#endif
     }
 
     /// Extract a single inner chunk from shard data.

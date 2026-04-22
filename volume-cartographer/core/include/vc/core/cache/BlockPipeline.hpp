@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -37,11 +38,15 @@ public:
     struct Config {
         size_t bytes = 10ULL << 30;          // 10 GiB block cache
         // RAM cache of compressed canonical shard files. The loader pool
-        // checks this before hitting disk; on a miss it reads the whole
-        // shard file once and caches it, so subsequent inner-chunk reads
-        // from the same shard are zero-syscall memcpy. Set to 0 to disable
-        // shard caching (loader goes straight to disk every time).
-        size_t shardCacheBytes = 1ULL << 30; // 1 GiB default
+        // checks this before hitting disk; on a miss it mmaps the whole
+        // shard file once and caches the handle, so subsequent inner-chunk
+        // reads from the same shard are zero-syscall memcpy from page
+        // cache. Since shards are mmap'd (not heap-allocated), a generous
+        // budget costs nothing beyond virtual-address space — the kernel
+        // drops unused pages under memory pressure automatically. Set
+        // to 0 to disable shard caching (loader goes straight to disk
+        // every time).
+        size_t shardCacheBytes = 4ULL << 30; // 4 GiB default
         std::string volumeId;
         // Defaults to hardware_concurrency(); see constructor.
         int ioThreads = 0;
@@ -50,6 +55,28 @@ public:
         // source chunks into the canonical 256³ disk cache.
         // target_ratio is the only knob; 50 ≈ 40 dB PSNR on scroll CT.
         utils::C3dCodecParams c3dEncodeParams = {};
+
+        // Backpressure ceiling on the downloader → encoder hand-off.
+        // Each staged chunk is one decoded canonical ChunkData (~16 MiB at
+        // 256³ u8). Without a cap the downloader pool floods RAM on a
+        // warm network / slow disk. 64 chunks ≈ 1 GiB max staged.
+        size_t maxEncodeStagingChunks = 64;
+
+        // Max concurrent dz.read_whole_shard() calls. Each returns a freshly-
+        // allocated std::vector<std::byte> sized to the shard file
+        // (~256 MiB on sharded c3d volumes). With many loader workers all
+        // reading freshly-written shards at once, in-flight shard bytes
+        // balloon past the shardCacheBytes LRU budget — that budget only
+        // caps *cached* shards, not reads in progress. 8 ≈ 2 GiB worst
+        // case in flight. Shutdown-aware.
+        size_t maxConcurrentShardReads = 8;
+
+        // Backpressure ceiling on the loader → decoder hand-off.
+        // decodeStaging_ holds compressed inner-chunk bytes awaiting
+        // decode (~200 KiB–2 MiB each depending on target_ratio). On
+        // heavy pans the loader can outrun the decoder and queue
+        // hundreds of MiB here. 256 MiB ≈ a few thousand chunks max.
+        size_t maxDecodeStagingBytes = 256ULL << 20;
 
         // When non-zero, declares the source is byte-identical to our local
         // canonical c3d disk format: zarr v3, 4096³ shards with 256³ inner
@@ -130,6 +157,10 @@ public:
         size_t encodePending = 0;          // staged ChunkData → h265 disk queue
         size_t loadPending = 0;            // disk → staged bytes queue
         size_t decodePending = 0;          // staged bytes → decoded + block cache
+        size_t encodeStagingChunks = 0;    // chunks sitting in encodeStaging_ (16 MiB ea)
+        size_t decodeStagingBytes = 0;     // bytes sitting in decodeStaging_ (compressed)
+        size_t inflightShardReads = 0;     // read_whole_shard calls currently in progress
+        size_t inflightShardBytes = 0;     // bytes held by in-progress shard reads
         uint64_t shardHits = 0;            // loader found shard in RAM cache
         uint64_t shardMisses = 0;          // loader had to read shard from disk
         size_t shardCacheBytes = 0;        // current shard cache occupancy
@@ -169,12 +200,28 @@ private:
     IOPool decodePool_;
     // Hand-off buffer between downloader and encoder. Download inserts
     // (key → decoded ChunkData) after assembling, encoder takes it out.
+    // CV gates the downloader when encodeStaging_ is at capacity so a
+    // fast network can't run RAM to swap while encode drains to disk.
     mutable std::mutex encodeStagingMutex_;
     std::unordered_map<ChunkKey, ChunkDataPtr, ChunkKeyHash> encodeStaging_;
+    std::condition_variable encodeStagingCv_;
+    std::atomic<bool> shuttingDown_{false};
+
+    // Backpressure for shardBytesFor() → dz.read_whole_shard(). Gates
+    // concurrent shard reads by count; tracks bytes separately for stats.
+    mutable std::mutex inflightShardMutex_;
+    std::condition_variable inflightShardCv_;
+    size_t inflightShardReads_ = 0;                 // guarded by inflightShardMutex_
+    std::atomic<size_t> inflightShardBytes_{0};
     // Hand-off buffer between loader and decoder. Loader inserts
     // (key → compressed inner-chunk bytes); decoder pops and decodes.
+    // CV gates the loader when decodeStagingBytesAtomic_ would exceed
+    // maxDecodeStagingBytes. Atomic counter avoids walking the map in
+    // the CV predicate (hot path).
     mutable std::mutex decodeStagingMutex_;
     std::unordered_map<ChunkKey, std::vector<uint8_t>, ChunkKeyHash> decodeStaging_;
+    std::condition_variable decodeStagingCv_;
+    std::atomic<size_t> decodeStagingBytesAtomic_{0};
 
     // Shard-level LRU cache of compressed canonical h265 shard files.
     // Populated on loader misses. Bytes-budgeted; when exceeded the
@@ -195,7 +242,7 @@ private:
     // hash distributions (avoids the per-bucket cap starving a hot bucket).
     struct ShardCacheEntry {
         ShardKey key;
-        std::shared_ptr<std::vector<std::byte>> bytes;
+        std::shared_ptr<utils::ShardBytes> bytes;
     };
     static constexpr size_t kShardCacheBuckets = 16;
     struct ShardCacheBucket {
@@ -226,7 +273,7 @@ private:
     // instead of shared_ptr eliminates ~2 refcount atomics per call that
     // were cache-line ping-ponging under 12-thread decode (perf showed
     // the shared_ptr dtor's LDADDAL at ~20% of total CPU).
-    const std::vector<std::byte>* shardBytesFor(
+    const utils::ShardBytes* shardBytesFor(
         const ChunkKey& key, utils::ZarrArray& dz);
 
     // Map ShardKey → bucket index in shardCacheBuckets_.
@@ -235,7 +282,7 @@ private:
     // share of the total budget.
     void shardCacheInsertLocked(ShardCacheBucket& b,
                                 const ShardKey& sk,
-                                std::shared_ptr<std::vector<std::byte>> bytes);
+                                std::shared_ptr<utils::ShardBytes> bytes);
 
     BlockCache blockCache_;
 

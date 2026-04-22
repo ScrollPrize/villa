@@ -5,6 +5,7 @@
 #include <QImage>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <map>
@@ -265,6 +266,41 @@ private:
     void scheduleRender();
     void syncCameraTransform();
 
+    // Async render pipeline. submitRender() is called on the main thread
+    // (Qt render timer). It snapshots what the worker needs, dispatches
+    // renderIntoFramebuffer() to QThreadPool, and returns immediately.
+    // The worker writes into _framebufferWork (double-buffer) so the paint
+    // event can keep reading _framebuffer. When the worker finishes it
+    // posts finishRenderOnMainThread() via QueuedConnection — that slot
+    // swaps the buffers and performs the main-thread-only scene updates.
+    //
+    // RenderContext is the immutable snapshot of viewer state that the
+    // worker reads. The body of renderIntoFramebuffer() must NEVER touch
+    // `_camera` / `_compositeSettings` / `_windowLow` / etc. directly —
+    // those are mutated on the main thread by input handlers and
+    // settings setters; reading them on a worker thread without a lock
+    // is a data race. Everything the worker needs from mutable state is
+    // copied into RenderContext in submitRender() before dispatch.
+    struct RenderContext {
+        AdaptiveCamera camera;
+        CompositeRenderSettings compositeSettings;
+        vc::Sampling samplingMethod;
+        bool interactive = false;
+        float windowLow = 0.0f;
+        float windowHigh = 255.0f;
+        std::string baseColormapId;
+        bool highlightDownscaled = false;
+        cv::Vec3f zOffWorldDir{0.0f, 0.0f, 0.0f};
+        // Strong references so the worker can't race against object
+        // teardown: _surfWeak / _volume could otherwise be reset on main
+        // mid-render. shared_ptr captures here keep them alive for the
+        // duration of the render.
+        std::shared_ptr<Surface> surf;
+        std::shared_ptr<Volume> volume;
+    };
+    void renderIntoFramebuffer(QImage& fb, const RenderContext& ctx);
+    Q_INVOKABLE void finishRenderOnMainThread();
+
     // Framebuffer coordinate conversions
     QPointF surfaceToScene(float surfX, float surfY) const;
     cv::Vec2f sceneToSurface(const QPointF& scenePos) const;
@@ -298,7 +334,20 @@ private:
     void beginInteraction();
 
     // --- Framebuffer ---
+    // _framebuffer — last committed frame, read by the view's paint path
+    // (CVolumeViewerView::drawBackground holds a pointer to it).
+    // _framebufferWork — scratch that the async worker writes into.
+    // finishRenderOnMainThread() does std::swap on the two QImages (main
+    // thread only, so no paint/swap race) to commit the new frame.
     QImage _framebuffer;
+    QImage _framebufferWork;
+    // Serialises render dispatch. Only one worker runs at a time; if
+    // submitRender fires while busy, the next render is queued via
+    // _renderPendingAfterWorker so we don't lose a frame's worth of
+    // state change (slider drag, camera pan).
+    std::atomic<bool> _renderWorkerBusy{false};
+    bool _renderPendingAfterWorker = false;
+    std::chrono::steady_clock::time_point _renderT0{};
     // Per-pixel pyramid-level tag (0 = desired, 1..5 = fallback depth).
     // Allocated lazily when "highlight downscaled chunks" is enabled.
     cv::Mat_<uint8_t> _levelBuffer;
@@ -463,6 +512,25 @@ private:
     // tick; the actual rtree + triangle-clip work runs once per tick
     // inside renderIntersectionsNow().
     bool _intersectionsDirty = false;
+
+    // Flattened-intersection worker state. The heavy rtree walk + triangle
+    // clip used to run on the main thread, blocking input processing on
+    // surfaces with millions of patches. We now dispatch it to a thread
+    // pool task; while a worker is in flight we skip scheduling another.
+    // Cooked paths are handed back via a queued QMetaObject::invokeMethod
+    // lambda and applied to the scene on the main thread.
+    std::atomic<bool> _flattenedWorkerBusy{false};
+    // Same for the plane-view intersection path (computePlaneIntersections
+    // + grouping). Async pattern is identical — worker computes the raw
+    // intersection segments, main thread builds QGraphicsPathItems.
+    std::atomic<bool> _planeWorkerBusy{false};
+    // Counts all background tasks that hold `this` (render worker,
+    // intersection workers). The destructor spins on this reaching zero
+    // before letting members go — otherwise a QThreadPool task still
+    // running inside renderIntoFramebuffer() or an intersection compute
+    // will dereference freed memory on app exit (observed as SIGSEGV
+    // at shutdown after a warm-cache session).
+    std::atomic<int> _backgroundWorkers{0};
 
     // --- Chunk-ready listener ---
     vc::cache::BlockPipeline::ChunkReadyCallbackId _chunkCbId = 0;

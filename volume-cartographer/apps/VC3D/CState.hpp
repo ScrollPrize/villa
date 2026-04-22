@@ -109,5 +109,6 @@ private:
     std::unordered_map<std::string, std::shared_ptr<Surface>> _surfs;
     std::unordered_map<std::string, std::unique_ptr<POI>> _pois;
 
-    SurfaceLRU _surfaceLRU{8};
+    // See SurfaceLRU default — 4 resident × ~170 MiB/surface cap.
+    SurfaceLRU _surfaceLRU{4};
 };

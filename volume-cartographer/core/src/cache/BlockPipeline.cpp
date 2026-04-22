@@ -78,7 +78,7 @@ size_t BlockPipeline::shardCacheBucketIndex(const ShardKey& sk) noexcept {
 void BlockPipeline::shardCacheInsertLocked(
     ShardCacheBucket& b,
     const ShardKey& sk,
-    std::shared_ptr<std::vector<std::byte>> bytes)
+    std::shared_ptr<utils::ShardBytes> bytes)
 {
     if (!bytes || bytes->empty()) return;
     const size_t totalBudget = config_.shardCacheBytes;
@@ -114,7 +114,7 @@ void BlockPipeline::shardCacheInsertLocked(
     shardCacheGlobalBytes_.fetch_add(entrySize, std::memory_order_relaxed);
 }
 
-const std::vector<std::byte>* BlockPipeline::shardBytesFor(
+const utils::ShardBytes* BlockPipeline::shardBytesFor(
     const ChunkKey& key, utils::ZarrArray& dz)
 {
     if (config_.shardCacheBytes == 0) return nullptr;
@@ -133,7 +133,7 @@ const std::vector<std::byte>* BlockPipeline::shardBytesFor(
     // doesn't serve stale data from the old pipeline's shard cache.
     thread_local const BlockPipeline* tlOwner = nullptr;
     thread_local ShardKey tlLastShard{-1, -1, -1, -1};
-    thread_local std::shared_ptr<std::vector<std::byte>> tlLastBytes;
+    thread_local std::shared_ptr<utils::ShardBytes> tlLastBytes;
     if (tlOwner == this && tlLastShard == sk && tlLastBytes) {
         statShardHits_.fetch_add(1, std::memory_order_relaxed);
         return tlLastBytes.get();
@@ -156,9 +156,36 @@ const std::vector<std::byte>* BlockPipeline::shardBytesFor(
     // Miss — do the disk read outside the cache lock so concurrent hits
     // on other shards aren't blocked behind our I/O.
     statShardMisses_.fetch_add(1, std::memory_order_relaxed);
+    // Gate concurrent whole-shard reads. Each call returns a ~256 MiB
+    // buffer; without the gate, 16×hw loader workers all missing at
+    // once hold tens of GiB of in-flight shard bytes. RAII guard
+    // decrements on every return path.
+    {
+        std::unique_lock lk(inflightShardMutex_);
+        inflightShardCv_.wait(lk, [this] {
+            return shuttingDown_.load(std::memory_order_acquire)
+                || inflightShardReads_ < config_.maxConcurrentShardReads;
+        });
+        if (shuttingDown_.load(std::memory_order_acquire)) return nullptr;
+        ++inflightShardReads_;
+    }
+    struct InflightGuard {
+        BlockPipeline* self;
+        size_t bytes = 0;
+        ~InflightGuard() {
+            self->inflightShardBytes_.fetch_sub(bytes, std::memory_order_relaxed);
+            {
+                std::lock_guard lk(self->inflightShardMutex_);
+                --self->inflightShardReads_;
+            }
+            self->inflightShardCv_.notify_one();
+        }
+    } guard{this};
     auto raw = dz.read_whole_shard(chunkIndices(key));
     if (!raw || raw->empty()) return nullptr;
-    auto bytes = std::make_shared<std::vector<std::byte>>(std::move(*raw));
+    guard.bytes = raw->size();
+    inflightShardBytes_.fetch_add(guard.bytes, std::memory_order_relaxed);
+    auto bytes = std::make_shared<utils::ShardBytes>(std::move(*raw));
 
     std::lock_guard lk(bucket.mutex);
     // Another thread may have raced us to populate this shard; prefer
@@ -257,11 +284,14 @@ BlockPipeline::BlockPipeline(
     }())
     , loaderPool_([] {
         unsigned hw = std::thread::hardware_concurrency();
-        // 16× hw: loader is almost entirely pread() io_wait. Observed
-        // disk utilisation was ~1% at 4× — we're leaving most of the
-        // device's queue depth on the table. Each worker's stack is
-        // virtual-only until touched, so going wide is cheap.
-        return hw ? 16 * static_cast<int>(hw) : 128;
+        // 4× hw: was 16× to max out disk queue depth, but read_whole_shard
+        // returns ~256 MiB per call on sharded volumes, so 192 parallel
+        // loader workers could hold tens of GiB of in-flight shard bytes
+        // and push the process into swap on 32 GiB machines. With
+        // maxConcurrentShardReads bounding the big allocations, the extra
+        // worker count is wasted threads — 4× is enough to keep the disk
+        // queue full past the backpressure gate.
+        return hw ? 4 * static_cast<int>(hw) : 32;
     }())
     , decodePool_([] {
         unsigned hw = std::thread::hardware_concurrency();
@@ -317,6 +347,13 @@ BlockPipeline::BlockPipeline(
     auto shardMapper = [](const ChunkKey& key) -> ShardKey {
         return {key.level, key.iz, key.iy, key.ix};
     };
+    // Label pool threads so perf / top can tell them apart. TASK_COMM_LEN
+    // caps names at 15 chars so short prefixes + worker index are best.
+    downloaderPool_.setThreadLabel("bpDl");
+    encodePool_.setThreadLabel("bpEnc");
+    loaderPool_.setThreadLabel("bpLd");
+    decodePool_.setThreadLabel("bpDec");
+
     downloaderPool_.setShardMapper(shardMapper);
     encodePool_.setShardMapper(shardMapper);
     loaderPool_.setShardMapper(shardMapper);
@@ -338,6 +375,19 @@ BlockPipeline::BlockPipeline(
             std::lock_guard lock(negativeMutex_);
             negativeCache_.insert(key);
             return {};
+        }
+
+        // Backpressure: wait until encodeStaging_ has room before paying
+        // the network + decode cost. Gating here (vs. after assemble)
+        // means a stalled encoder pool doesn't hold 16 MiB buffers per
+        // blocked downloader worker.
+        {
+            std::unique_lock lk(encodeStagingMutex_);
+            encodeStagingCv_.wait(lk, [this] {
+                return shuttingDown_.load(std::memory_order_acquire)
+                    || encodeStaging_.size() < config_.maxEncodeStagingChunks;
+            });
+            if (shuttingDown_.load(std::memory_order_acquire)) return {};
         }
 
         // Pull source chunks over the network and assemble a canonical
@@ -403,6 +453,7 @@ BlockPipeline::BlockPipeline(
             decoded = std::move(it->second);
             encodeStaging_.erase(it);
         }
+        encodeStagingCv_.notify_one();
         if (!decoded) return {};
 
         const auto& encoded = encodeCanonicalChunk(*decoded, config_);
@@ -473,7 +524,7 @@ BlockPipeline::BlockPipeline(
                         auto ips = m.sub_chunks_per_shard(d);
                         inner[d] = ips ? idx[d] % ips : idx[d];
                     }
-                    innerBytes = dz->extract_inner_chunk(*shardBytes, inner);
+                    innerBytes = dz->extract_inner_chunk(shardBytes->span(), inner);
                 }
             } else {
                 innerBytes = zarrReadChunk(*dz, key);
@@ -504,13 +555,41 @@ BlockPipeline::BlockPipeline(
 
         if (compressed.empty()) return {};
 
+        // Backpressure: wait if the decoder is already sitting on more
+        // compressed bytes than it can chew through. Gating here blocks
+        // one loader worker at a time (the bytes are already on its
+        // stack, but that's bounded by worker count × per-chunk size,
+        // vastly less than the unbounded queue would cost).
+        {
+            std::unique_lock stage(decodeStagingMutex_);
+            decodeStagingCv_.wait(stage, [this] {
+                return shuttingDown_.load(std::memory_order_acquire)
+                    || decodeStagingBytesAtomic_.load(std::memory_order_relaxed)
+                         < config_.maxDecodeStagingBytes;
+            });
+            if (shuttingDown_.load(std::memory_order_acquire)) return {};
+        }
+
         // Stage compressed bytes for decodePool_ so the loader worker can
         // immediately serve the next I/O request while CPU decode proceeds
         // in parallel. Decode concurrency is bounded by decodePool_ size.
+        // Replacing an existing entry must decrement its size from the
+        // atomic first — otherwise repeated loader re-queues of the same
+        // key leak the counter upward and eventually stall every loader
+        // worker on the backpressure CV with a map that's actually empty.
+        const size_t compressedSize = compressed.size();
         {
             std::lock_guard stage(decodeStagingMutex_);
-            decodeStaging_[key] = std::move(compressed);
+            auto [it, inserted] = decodeStaging_.try_emplace(
+                key, std::vector<uint8_t>{});
+            if (!inserted) {
+                decodeStagingBytesAtomic_.fetch_sub(
+                    it->second.size(), std::memory_order_relaxed);
+            }
+            it->second = std::move(compressed);
         }
+        decodeStagingBytesAtomic_.fetch_add(compressedSize,
+                                            std::memory_order_relaxed);
         // Non-empty FetchResult so IOPool fires the completion callback,
         // which forwards this key to decodePool_. Payload unused.
         IOPool::FetchResult result;
@@ -541,6 +620,9 @@ BlockPipeline::BlockPipeline(
             compressed = std::move(it->second);
             decodeStaging_.erase(it);
         }
+        decodeStagingBytesAtomic_.fetch_sub(compressed.size(),
+                                            std::memory_order_relaxed);
+        decodeStagingCv_.notify_one();
         if (compressed.empty()) return {};
 
         ChunkDataPtr decoded;
@@ -704,6 +786,12 @@ skipPassthrough:
 }
 
 BlockPipeline::~BlockPipeline() {
+    // Release any downloader workers blocked on the backpressure CV so
+    // pool.stop() can actually join them.
+    shuttingDown_.store(true, std::memory_order_release);
+    encodeStagingCv_.notify_all();
+    decodeStagingCv_.notify_all();
+    inflightShardCv_.notify_all();
     // Cancel any in-flight curl requests so workers don't sit inside
     // libcurl waiting for S3 timeouts during shutdown.
     utils::HttpClient::abortAll();
@@ -1165,6 +1253,17 @@ auto BlockPipeline::stats() const -> Stats {
     s.loadPending = loaderPool_.pendingCount();
     s.decodePending = decodePool_.pendingCount();
     s.ioPending = s.downloadPending + s.encodePending + s.loadPending + s.decodePending;
+    {
+        std::lock_guard lk(encodeStagingMutex_);
+        s.encodeStagingChunks = encodeStaging_.size();
+    }
+    s.decodeStagingBytes = decodeStagingBytesAtomic_.load(
+        std::memory_order_relaxed);
+    {
+        std::lock_guard lk(inflightShardMutex_);
+        s.inflightShardReads = inflightShardReads_;
+    }
+    s.inflightShardBytes = inflightShardBytes_.load(std::memory_order_relaxed);
     s.shardHits = statShardHits_.load(std::memory_order_relaxed);
     s.shardMisses = statShardMisses_.load(std::memory_order_relaxed);
     // Global byte count is an atomic so we don't need the per-bucket locks

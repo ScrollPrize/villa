@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <unordered_set>
 
+#if defined(__linux__) || defined(__APPLE__)
+#include <pthread.h>
+#endif
+
 namespace vc::cache {
 
 IOPool::IOPool(int numThreads)
@@ -14,7 +18,19 @@ void IOPool::start()
 {
     workers_.reserve(numThreads_);
     for (int i = 0; i < numThreads_; i++) {
-        workers_.emplace_back([this](std::stop_token stop) {
+        workers_.emplace_back([this, i](std::stop_token stop) {
+            if (!threadLabel_.empty()) {
+#if defined(__linux__)
+                // TASK_COMM_LEN = 16 incl. NUL. Truncate if needed.
+                char name[16];
+                std::snprintf(name, sizeof(name), "%s%d", threadLabel_.c_str(), i);
+                ::pthread_setname_np(::pthread_self(), name);
+#elif defined(__APPLE__)
+                char name[32];
+                std::snprintf(name, sizeof(name), "%s%d", threadLabel_.c_str(), i);
+                ::pthread_setname_np(name);
+#endif
+            }
             for (;;) {
                 ShardKey shard;
                 try {
