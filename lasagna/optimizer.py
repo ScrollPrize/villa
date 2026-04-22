@@ -17,6 +17,7 @@ import opt_loss_winding_density
 import opt_loss_corr
 import opt_loss_winding_volume
 import opt_loss_station
+import opt_loss_bend
 
 
 def _require_consumed_dict(*, where: str, cfg: dict) -> None:
@@ -154,6 +155,7 @@ lambda_global: dict[str, float] = {
 	"winding_vol": 0.0,
 	"station_n": 0.0,
 	"station_t": 0.0,
+	"bend": 0.0,
 }
 
 
@@ -283,6 +285,7 @@ def optimize(
 		"corr": {"loss": opt_loss_corr.corr_loss},
 		"winding_vol": {"loss": opt_loss_winding_volume.winding_volume_loss},
 		"station": {"loss": opt_loss_station.station_loss, "sub": ["station_n", "station_t"]},
+		"bend": {"loss": opt_loss_bend.bend_loss},
 	}
 
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, data: fit_data.FitData3D) -> fit_data.FitData3D:

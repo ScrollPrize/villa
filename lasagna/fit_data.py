@@ -55,26 +55,36 @@ class FitData3D:
 			return self.size
 		return int(t.shape[2]), int(t.shape[3]), int(t.shape[4])
 
-	def grid_sample_fullres(self, xyz_fullres: torch.Tensor) -> "FitData3D":
+	def grid_sample_fullres(self, xyz_fullres: torch.Tensor, *, diff: bool = False) -> "FitData3D":
 		"""Sample at fullres positions.
 
 		xyz_fullres: (D, H, W, 3) where last dim is (x, y, z) in fullres coords.
 		Returns FitData3D with float32 decoded values in (1, 1, D, H, W).
 		Uses custom CUDA uint8 kernel when cuda_gridsample=True, else PyTorch F.grid_sample.
+		diff=True: use differentiable CUDA kernel (gradients flow through xyz).
 		"""
 		if self.cuda_gridsample:
-			return self._grid_sample_cuda(xyz_fullres)
+			return self._grid_sample_cuda(xyz_fullres, diff=diff)
 		return self._grid_sample_torch(xyz_fullres)
 
-	def _grid_sample_cuda(self, xyz_fullres: torch.Tensor) -> "FitData3D":
+	def _grid_sample_cuda(self, xyz_fullres: torch.Tensor, *, diff: bool = False) -> "FitData3D":
 		import importlib.util, os
-		_spec = importlib.util.spec_from_file_location(
-			"grid_sample_3d_u8",
-			os.path.join(os.path.dirname(__file__), "grid_sample_3d_u8.py"),
-		)
-		_mod = importlib.util.module_from_spec(_spec)
-		_spec.loader.exec_module(_mod)
-		grid_sample_3d_u8 = _mod.grid_sample_3d_u8
+		if diff:
+			_spec = importlib.util.spec_from_file_location(
+				"grid_sample_3d_u8_diff",
+				os.path.join(os.path.dirname(__file__), "grid_sample_3d_u8_diff.py"),
+			)
+			_mod = importlib.util.module_from_spec(_spec)
+			_spec.loader.exec_module(_mod)
+			_kernel = _mod.grid_sample_3d_u8_diff
+		else:
+			_spec = importlib.util.spec_from_file_location(
+				"grid_sample_3d_u8",
+				os.path.join(os.path.dirname(__file__), "grid_sample_3d_u8.py"),
+			)
+			_mod = importlib.util.module_from_spec(_spec)
+			_spec.loader.exec_module(_mod)
+			_kernel = _mod.grid_sample_3d_u8
 
 		dev = xyz_fullres.device
 		offset = torch.tensor(self.origin_fullres, dtype=torch.float32, device=dev)
@@ -85,15 +95,17 @@ class FitData3D:
 			sp = self._spacing_for(channel)
 			inv_scale = torch.tensor([1.0 / s for s in sp], dtype=torch.float32, device=dev)
 			vol = t.squeeze(0)  # (1, Z, Y, X) — C=1
-			out_u8 = grid_sample_3d_u8(vol, xyz_fullres, offset, inv_scale)  # (1, D, H, W) u8
-			return decode(out_u8.float()).unsqueeze(0)  # (1, 1, D, H, W) float32
+			raw = _kernel(vol, xyz_fullres, offset, inv_scale)  # (1, D, H, W) float32
+			if not diff:
+				raw = raw.float()
+			return decode(raw).unsqueeze(0)  # (1, 1, D, H, W) float32
 
 		return FitData3D(
 			cos=_gs(self.cos, lambda t: t / 255.0, "cos"),
 			grad_mag=_gs(self.grad_mag, lambda t: t / self.grad_mag_scale, "grad_mag"),
 			nx=_gs(self.nx, lambda t: (t - 128.0) / 127.0, "nx"),
 			ny=_gs(self.ny, lambda t: (t - 128.0) / 127.0, "ny"),
-			pred_dt=_gs(self.pred_dt, lambda t: t.sqrt(), "pred_dt"),
+			pred_dt=_gs(self.pred_dt, lambda t: t, "pred_dt"),
 			corr_points=self.corr_points,
 			winding_volume=self.winding_volume,
 			origin_fullres=self.origin_fullres,
@@ -131,7 +143,7 @@ class FitData3D:
 			grad_mag=_gs(self.grad_mag, lambda t: t / self.grad_mag_scale, "grad_mag"),
 			nx=_gs(self.nx, lambda t: (t - 128.0) / 127.0, "nx"),
 			ny=_gs(self.ny, lambda t: (t - 128.0) / 127.0, "ny"),
-			pred_dt=_gs(self.pred_dt, lambda t: t.sqrt(), "pred_dt"),
+			pred_dt=_gs(self.pred_dt, lambda t: t, "pred_dt"),
 			corr_points=self.corr_points,
 			winding_volume=self.winding_volume,
 			origin_fullres=self.origin_fullres,
