@@ -491,7 +491,10 @@ def _atomic_zarr_write(omezarr_path: str, level: int,
 	import shutil
 	sep = _omezarr_dim_sep(omezarr_path, level)
 	level_path = os.path.join(omezarr_path, str(level))
-	tmp_path = level_path + f".tmp.{os.getpid()}"
+	# Temp dir outside the OME-Zarr, in the parent output directory
+	out_dir = os.path.dirname(omezarr_path)
+	zarr_name = os.path.basename(omezarr_path)
+	tmp_path = os.path.join(out_dir, f".tmp.{zarr_name}.{level}.{os.getpid()}")
 
 	# Ensure temp level has .zarray metadata
 	os.makedirs(tmp_path, exist_ok=True)
@@ -892,8 +895,10 @@ def _edt_writer_proc(out_path, out_level, work_list, overlap, pZ, pY, pX,
 	out_arr = ts.open(spec, read=True, open=True, context=ctx).result()
 	out_vol_shape = tuple(out_arr.shape)
 
-	# Create a per-worker temp zarr dir for atomic writes
-	tmp_level_path = level_path + f".tmp.{os.getpid()}"
+	# Create a per-worker temp zarr dir for atomic writes (outside OME-Zarr)
+	_out_dir = os.path.dirname(os.path.normpath(str(out_path)))
+	_zarr_name = os.path.basename(os.path.normpath(str(out_path)))
+	tmp_level_path = os.path.join(_out_dir, f".tmp.{_zarr_name}.{out_level}.{os.getpid()}")
 	os.makedirs(tmp_level_path, exist_ok=True)
 	# Copy .zarray metadata so tensorstore can open it
 	zarray_src = os.path.join(level_path, ".zarray")

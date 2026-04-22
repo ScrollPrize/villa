@@ -204,7 +204,10 @@ def _downsample_chunk_worker(args_tuple):
 	sep = meta.get("dimension_separator", ".")
 
 	# Write to temp level dir via tensorstore, then rename atomically
-	tmp_path = dst_level_path + f".tmp.{os.getpid()}"
+	# Temp dir outside the OME-Zarr, in the parent output directory
+	_conv_out_dir = os.path.dirname(os.path.normpath(out_path_str))
+	_conv_zarr_name = os.path.basename(os.path.normpath(out_path_str))
+	tmp_path = os.path.join(_conv_out_dir, f".tmp.{_conv_zarr_name}.{dst_level}.{os.getpid()}")
 	os.makedirs(tmp_path, exist_ok=True)
 	tmp_zarray = os.path.join(tmp_path, ".zarray")
 	if not os.path.isfile(tmp_zarray):
