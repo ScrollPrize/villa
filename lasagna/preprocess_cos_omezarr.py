@@ -643,6 +643,8 @@ def _build_omezarr_pyramid(
 	n_levels: int,
 	chunk: int,
 	workers: int = 0,
+	crop_zyx: tuple[int, int, int, int, int, int] | None = None,
+	label: str = "",
 ) -> None:
 	"""Build coarser pyramid levels by parallel 2x downsampling.
 
@@ -661,19 +663,36 @@ def _build_omezarr_pyramid(
 
 	g = zarr.open_group(str(omezarr_path), mode="r+")
 
+	# Crop region at the data level (if given), halved for each coarser level
+	if crop_zyx is not None:
+		cz0_base, cy0_base, cx0_base, cz1_base, cy1_base, cx1_base = crop_zyx
+	else:
+		cz0_base = cy0_base = cx0_base = 0
+		cz1_base = cy1_base = cx1_base = None  # full extent
+
 	for lv in range(data_level + 1, n_levels):
 		src_shape = tuple(int(v) for v in g[str(lv - 1)].shape)
 		dst_shape = tuple(int(v) for v in g[str(lv)].shape)
 		cz2 = chunk * 2
 
+		# Scale crop to source level (halve per level above data_level)
+		levels_above = lv - 1 - data_level
+		scale = 2 ** levels_above
+		sz0 = (cz0_base // scale // cz2) * cz2 if cz1_base is not None else 0
+		sy0 = (cy0_base // scale // cz2) * cz2 if cy1_base is not None else 0
+		sx0 = (cx0_base // scale // cz2) * cz2 if cx1_base is not None else 0
+		sz1 = min(src_shape[0], ((cz1_base // scale + cz2 - 1) // cz2) * cz2) if cz1_base is not None else src_shape[0]
+		sy1 = min(src_shape[1], ((cy1_base // scale + cz2 - 1) // cz2) * cz2) if cy1_base is not None else src_shape[1]
+		sx1 = min(src_shape[2], ((cx1_base // scale + cz2 - 1) // cz2) * cz2) if cx1_base is not None else src_shape[2]
+
 		ds_work = []
 		skipped_ds = 0
-		for z0 in range(0, src_shape[0], cz2):
-			z1 = min(src_shape[0], z0 + cz2)
-			for y0 in range(0, src_shape[1], cz2):
-				y1 = min(src_shape[1], y0 + cz2)
-				for x0 in range(0, src_shape[2], cz2):
-					x1 = min(src_shape[2], x0 + cz2)
+		for z0 in range(sz0, sz1, cz2):
+			z1 = min(sz1, z0 + cz2)
+			for y0 in range(sy0, sy1, cz2):
+				y1 = min(sy1, y0 + cz2)
+				for x0 in range(sx0, sx1, cz2):
+					x1 = min(sx1, x0 + cz2)
 					# Skip if dest chunk already exists
 					if _omezarr_chunk_exists(omezarr_path, lv, z0 // 2, y0 // 2, x0 // 2, chunk):
 						skipped_ds += 1
@@ -684,22 +703,21 @@ def _build_omezarr_pyramid(
 					))
 
 		n_ds = len(ds_work)
+		tag = f"[pyramid {label} L{lv}]" if label else f"[pyramid L{lv}]"
 		if skipped_ds > 0:
-			print(f"[predict3d] L{lv}: skipped {skipped_ds} existing chunks", flush=True)
+			print(f"{tag} skipped {skipped_ds} existing chunks", flush=True)
 		if n_ds == 0:
 			continue
 
 		t_lv = time.time()
 		done_count = [0]
 		lock = threading.Lock()
-		TAG = "[predict3d]"
-
 		_stop = threading.Event()
 		def _prog():
 			while not _stop.is_set():
 				with lock:
 					d = done_count[0]
-				_print_progress(prefix=f"{TAG} L{lv} {dst_shape}", done=d, total=n_ds, t0=t_lv)
+				_print_progress(prefix=tag, done=d, total=n_ds, t0=t_lv)
 				_stop.wait(0.5)
 		prog_thread = threading.Thread(target=_prog, daemon=True)
 		prog_thread.start()
@@ -711,7 +729,7 @@ def _build_omezarr_pyramid(
 
 		_stop.set()
 		prog_thread.join(timeout=2)
-		_print_progress(prefix=f"{TAG} L{lv} {dst_shape}", done=n_ds, total=n_ds, t0=t_lv)
+		_print_progress(prefix=tag, done=n_ds, total=n_ds, t0=t_lv)
 		print("", flush=True)
 
 
@@ -2261,6 +2279,8 @@ def run_preprocess_3d(
 	pad0 = max(0, int(border))
 	stride = max(1, tile_size - overlap)
 
+	_t_total_start = time.time()
+
 	# --- Pause training if running (free GPU) ---
 	from gpu_pause import gpu_pause_context
 	_gpu_ctx = gpu_pause_context()
@@ -2412,6 +2432,7 @@ def run_preprocess_3d(
 							pdt_y1 = int(pred_dt_zarr.shape[1])
 							pdt_x0 = 0
 							pdt_x1 = int(pred_dt_zarr.shape[2])
+						_t_edt0 = time.time()
 						_compute_pred_dt_slab(
 							pred_zarr=pred_dt_zarr,
 							pred_path=pred_dt_path,
@@ -2427,6 +2448,7 @@ def run_preprocess_3d(
 							ome_chunk=oc,
 							progress=_progress,
 						)
+						_t_edt_total[0] += time.time() - _t_edt0
 
 			# Release memmap pages
 			_release_memmap_pages(acc_fine, flush_from_f, flush_to_f)
@@ -2508,8 +2530,10 @@ def run_preprocess_3d(
 
 		_prev_flush_coarse[0] = max(_prev_flush_coarse[0], flush_to_c)
 
+	_t_inference_start = time.time()
 	# --- Streaming inference + flush ---
 	# Shared progress tracker for unified ETA across tiles + EDT
+	_t_edt_total = [0.0]  # accumulated wall time in EDT calls
 	_progress = {
 		"t0": time.time(),
 		"tiles_done": 0,
@@ -2546,16 +2570,20 @@ def run_preprocess_3d(
 	torch.cuda.empty_cache()
 
 	# --- Build pyramids ---
+	_t_inference_end = time.time()
+	_t_pyramid_start = time.time()
 	print("[predict3d] building OME-Zarr pyramids ...", flush=True)
-	for path, data_lv, name in [
-		(cos_omezarr_path, cos_level, "cos"),
-		(gm_omezarr_path, other_level, "grad_mag"),
-		(nx_omezarr_path, other_level, "nx"),
-		(ny_omezarr_path, other_level, "ny"),
+	cos_crop_zyx = (cos_oz0, cos_oy0, cos_ox0, cos_oz1, cos_oy1, cos_ox1)
+	other_crop_zyx = (other_oz0, other_oy0, other_ox0, other_oz1, other_oy1, other_ox1)
+	for path, data_lv, name, crop in [
+		(cos_omezarr_path, cos_level, "cos", cos_crop_zyx),
+		(gm_omezarr_path, other_level, "grad_mag", other_crop_zyx),
+		(nx_omezarr_path, other_level, "nx", other_crop_zyx),
+		(ny_omezarr_path, other_level, "ny", other_crop_zyx),
 	]:
-		_build_omezarr_pyramid(path, data_lv, n_levels, oc)
+		_build_omezarr_pyramid(path, data_lv, n_levels, oc, crop_zyx=crop, label=name)
 	if dt_omezarr_path:
-		_build_omezarr_pyramid(dt_omezarr_path, cos_level, n_levels, oc)
+		_build_omezarr_pyramid(dt_omezarr_path, cos_level, n_levels, oc, crop_zyx=cos_crop_zyx, label="pred_dt")
 
 	# --- Update manifest ---
 	vol.update_group("cos", ChannelGroup(
@@ -2575,7 +2603,20 @@ def run_preprocess_3d(
 		_gpu_ctx.__exit__(None, None, None)
 
 	vol.save()
+	_t_total_end = time.time()
+	_t_inf_edt = _t_inference_end - _t_inference_start
+	_t_edt = _t_edt_total[0]
+	_t_inf = _t_inf_edt - _t_edt  # inference = total streaming phase minus EDT
+	_t_pyr = _t_total_end - _t_pyramid_start
+	_t_setup = _t_inference_start - _t_total_start
+	_t_total = _t_total_end - _t_total_start
 	print(f"[predict3d] done. manifest: {output_path}", flush=True)
+	print(f"[predict3d] timing: total={_t_total:.1f}s "
+		  f"setup={_t_setup:.1f}s ({100*_t_setup/max(1e-9,_t_total):.0f}%) "
+		  f"inference={_t_inf:.1f}s ({100*_t_inf/max(1e-9,_t_total):.0f}%) "
+		  f"edt={_t_edt:.1f}s ({100*_t_edt/max(1e-9,_t_total):.0f}%) "
+		  f"pyramid={_t_pyr:.1f}s ({100*_t_pyr/max(1e-9,_t_total):.0f}%)",
+		  flush=True)
 
 
 _N_WORKERS = min(16, os.cpu_count() or 4)
