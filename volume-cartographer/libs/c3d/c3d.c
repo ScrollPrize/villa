@@ -1716,6 +1716,7 @@ struct c3d_decoder {
     uint8_t          cached_ctx_id[16];
     bool             cached_valid;
 
+    bool             denoise_enabled;
 };
 
 c3d_encoder *c3d_encoder_new(void) {
@@ -1774,7 +1775,12 @@ c3d_decoder *c3d_decoder_new(void) {
     d->cached_tables = NULL;
     memset(d->cached_ctx_id, 0, 16);
     d->cached_valid = false;
+    d->denoise_enabled = true;
     return d;
+}
+void c3d_decoder_set_denoise(c3d_decoder *d, bool enabled) {
+    c3d_assert(d);
+    d->denoise_enabled = enabled;
 }
 void c3d_decoder_free(c3d_decoder *d) {
     if (!d) return;
@@ -3755,8 +3761,9 @@ void c3d_decoder_chunk_decode_lod(c3d_decoder *d,
     /* Q2 post-decode denoiser at LOD 0 only.  In-loop: read the encoder-
      * chosen alpha from header byte 7.  If zero (old-format or encode_at_q
      * which doesn't set it), fall back to the ratio-based heuristic.
-     * Opt-out via C3D_DENOISE=0 for bench comparisons. */
-    if (lod == 0) {
+     * Opt-out via C3D_DENOISE=0 for bench comparisons, or per-decoder via
+     * c3d_decoder_set_denoise(d, false) for throughput-first callers. */
+    if (lod == 0 && d->denoise_enabled) {
         uint8_t hdr_dn = in[7];
         float denoise_alpha = hdr_dn ? ((float)hdr_dn / 400.0f)
                                      : c3d_denoise_strength(in_len);

@@ -62,6 +62,11 @@ public:
     // --- Rendering ---
     void renderVisible(bool force = false);
     void renderIntersections() override;
+    // Synchronous body of renderIntersections(). The public override just
+    // schedules a coalesced debounce so rapid-fire UI setters (opacity /
+    // thickness / surface-change / intersect-target slider) don't each
+    // pay the full rtree + triangle-clip cost on the main thread.
+    void renderIntersectionsNow();
     void invalidateVis() {}
     void invalidateIntersect(const std::string& = "") override;
     void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false);
@@ -436,10 +441,28 @@ private:
         size_t targetGenerationHash = 0;
         size_t activeSegHash = 0;
         size_t highlightedSurfaceHash = 0;
+        // Hash of the three seg xy/xz/yz plane poses for the flattened-
+        // view path. 0 on the plane-view path (which uses the
+        // plane{Origin,Normal,BasisX,BasisY}Q fields instead).
+        size_t flattenedPlanesHash = 0;
+        // Hash of everything surfaceToScene() consumes: _camSurfX/Y/Scale,
+        // framebuffer size, and the QGraphicsView affine. The flattened-
+        // view path emits scene coords directly from surface coords via
+        // surfaceToScene(), so a pan/zoom with no other fingerprint field
+        // changing must still force a rebuild — otherwise cached overlay
+        // items stay at stale scene positions. Plane view path gets it
+        // implicitly via roi{X,Y,W,H} (derived from _view->mapToScene)
+        // so cameraHash stays 0 there.
+        size_t cameraHash = 0;
         bool valid = false;
         bool operator==(const IntersectFingerprint&) const = default;
     };
     IntersectFingerprint _lastIntersectFp;
+    // Coalescing flag. renderIntersections() (public, called from UI
+    // setters) just sets this and reuses the existing _renderTimer
+    // tick; the actual rtree + triangle-clip work runs once per tick
+    // inside renderIntersectionsNow().
+    bool _intersectionsDirty = false;
 
     // --- Chunk-ready listener ---
     vc::cache::BlockPipeline::ChunkReadyCallbackId _chunkCbId = 0;

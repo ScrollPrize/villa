@@ -105,6 +105,10 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
             submitRender();
             updateStatusLabel();
         }
+        if (_intersectionsDirty) {
+            _intersectionsDirty = false;
+            renderIntersectionsNow();
+        }
     });
 
     // When the user stops actively panning / zooming, kick a full-res
@@ -1439,6 +1443,19 @@ void CAdaptiveVolumeViewer::invalidateIntersect(const std::string&)
 
 void CAdaptiveVolumeViewer::renderIntersections()
 {
+    // Coalesce rapid-fire UI setters (opacity / thickness / surface-
+    // change / slider drags) into one rtree + triangle-clip pass per
+    // render tick. The _renderTimer callback drains this flag at the
+    // same 16 ms boundary it kicks submitRender() on, so we reuse the
+    // existing tick instead of running a second timer.
+    _intersectionsDirty = true;
+    if (_renderTimer && !_renderTimer->isActive()) {
+        _renderTimer->start();
+    }
+}
+
+void CAdaptiveVolumeViewer::renderIntersectionsNow()
+{
     auto surf = _surfWeak.lock();
     if (!surf || !_state || !_viewerManager || !_scene || !_view) {
         invalidateIntersect();
@@ -1677,11 +1694,66 @@ void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<S
         return;
     }
 
-    // Flattened view has no single plane — skip the plane-based fingerprint
-    // cache and just rebuild each call. Clipping one segment against three
-    // planes over the visible viewport is cheap.
+    // Fingerprint covers the only things the triangle clip depends on:
+    // the 3 plane poses, the active segmentation identity + generation,
+    // opacity, thickness. Patch count is folded in so a segment edit
+    // that adds/removes patches still triggers a rebuild. When nothing
+    // material changed, the rtree + triangle-clip pass is skipped —
+    // that's the expensive work profiled at ~5% of main-thread CPU.
+    IntersectFingerprint fp;
+    auto mix = [](std::size_t s, std::size_t v) {
+        return s ^ (v + 0x9e3779b9u + (s << 6) + (s >> 2));
+    };
+    auto hashVec = [&](std::size_t s, const cv::Vec3f& v) {
+        for (int i = 0; i < 3; ++i)
+            s = mix(s, std::hash<int>{}(int(std::lround(v[i] * 1000.0f))));
+        return s;
+    };
+    std::size_t planesHash = 0;
+    for (const auto& e : planes) {
+        planesHash = hashVec(planesHash, e.plane->origin());
+        planesHash = hashVec(planesHash, e.plane->normal({}, {}));
+        planesHash = hashVec(planesHash, e.plane->basisX());
+        planesHash = hashVec(planesHash, e.plane->basisY());
+        planesHash = mix(planesHash,
+            std::hash<uint32_t>{}(uint32_t(e.color.rgba())));
+    }
+    fp.flattenedPlanesHash = planesHash;
+    fp.opacityQ = int(std::lround(_intersectionOpacity * 1000.0f));
+    fp.thicknessQ = int(std::lround(_intersectionThickness * 1000.0f));
+    fp.patchCount = patchIndex->patchCount();
+    fp.surfaceCount = patchIndex->surfaceCount();
+    fp.activeSegHash = std::hash<const void*>{}(activeSeg.get());
+    fp.targetGenerationHash = std::hash<uint64_t>{}(
+        patchIndex->generation(activeSeg));
+    // Fold the camera state into the fingerprint so pan/zoom invalidates
+    // the cache — surfaceToScene() below consumes all of this.
+    std::size_t cameraHash = 0;
+    auto hashInt = [&](std::size_t s, int v) {
+        return mix(s, std::hash<int>{}(v));
+    };
+    cameraHash = hashInt(cameraHash, int(std::lround(_camSurfX * 1000.0f)));
+    cameraHash = hashInt(cameraHash, int(std::lround(_camSurfY * 1000.0f)));
+    cameraHash = hashInt(cameraHash, int(std::lround(_camScale * 1000.0f)));
+    cameraHash = hashInt(cameraHash, _framebuffer.width());
+    cameraHash = hashInt(cameraHash, _framebuffer.height());
+    if (_view) {
+        const QTransform t = _view->transform();
+        auto q = [](qreal v) { return int(std::lround(v * 1000.0)); };
+        cameraHash = hashInt(cameraHash, q(t.m11()));
+        cameraHash = hashInt(cameraHash, q(t.m12()));
+        cameraHash = hashInt(cameraHash, q(t.m21()));
+        cameraHash = hashInt(cameraHash, q(t.m22()));
+        cameraHash = hashInt(cameraHash, q(t.dx()));
+        cameraHash = hashInt(cameraHash, q(t.dy()));
+    }
+    fp.cameraHash = cameraHash;
+    fp.valid = true;
+    if (_lastIntersectFp == fp && !_intersectionItems.empty()) {
+        return;
+    }
     invalidateIntersect();
-    _lastIntersectFp = {};
+    _lastIntersectFp = fp;
 
     // Iterate every triangle of the active segment: a triangle's UV may sit
     // anywhere on the flattened patch, so restricting by a viewport-derived

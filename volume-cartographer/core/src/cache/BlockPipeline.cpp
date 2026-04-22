@@ -189,6 +189,7 @@ static ChunkDataPtr decodeCanonicalChunk(const std::vector<uint8_t>& compressed)
         reinterpret_cast<const std::byte*>(compressed.data()), compressed.size());
     if (!utils::is_c3d_compressed(bytes)) return nullptr;
     utils::C3dCodecParams p;
+    p.skip_denoise = true;
     const std::size_t n = size_t(kCanonicalChunkSide)
                         * size_t(kCanonicalChunkSide)
                         * size_t(kCanonicalChunkSide);
