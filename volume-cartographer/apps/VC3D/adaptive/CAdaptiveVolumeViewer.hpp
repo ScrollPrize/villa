@@ -445,6 +445,15 @@ private:
         // view path. 0 on the plane-view path (which uses the
         // plane{Origin,Normal,BasisX,BasisY}Q fields instead).
         size_t flattenedPlanesHash = 0;
+        // Hash of everything surfaceToScene() consumes: _camSurfX/Y/Scale,
+        // framebuffer size, and the QGraphicsView affine. The flattened-
+        // view path emits scene coords directly from surface coords via
+        // surfaceToScene(), so a pan/zoom with no other fingerprint field
+        // changing must still force a rebuild — otherwise cached overlay
+        // items stay at stale scene positions. Plane view path gets it
+        // implicitly via roi{X,Y,W,H} (derived from _view->mapToScene)
+        // so cameraHash stays 0 there.
+        size_t cameraHash = 0;
         bool valid = false;
         bool operator==(const IntersectFingerprint&) const = default;
     };

@@ -161,13 +161,19 @@ std::vector<std::byte> c3d_decode_lod(std::span<const std::byte> compressed,
     const std::size_t side    = static_cast<std::size_t>(C3D_CHUNK_SIDE) >> lod;
     const std::size_t out_size = side * side * side;
 
+    c3d_decoder* d = thread_decoder();
+    // The thread-local decoder persists denoise state across calls, and
+    // c3d_decode() toggles it per-invocation based on params.skip_denoise.
+    // Restore the default (denoise enabled) so this entrypoint's lod=0
+    // semantics don't silently inherit a prior c3d_decode(skip_denoise).
+    c3d_decoder_set_denoise(d, true);
     std::vector<std::byte> out(out_size);
     uint8_t* out_ptr = reinterpret_cast<uint8_t*>(out.data());
     if (is_aligned(out_ptr)) {
-        c3d_decoder_chunk_decode_lod(thread_decoder(), in, in_len, lod, out_ptr);
+        c3d_decoder_chunk_decode_lod(d, in, in_len, lod, out_ptr);
     } else {
         AlignedBuf staging(out_size);
-        c3d_decoder_chunk_decode_lod(thread_decoder(), in, in_len, lod, staging.p);
+        c3d_decoder_chunk_decode_lod(d, in, in_len, lod, staging.p);
         std::memcpy(out.data(), staging.p, out_size);
     }
     return out;

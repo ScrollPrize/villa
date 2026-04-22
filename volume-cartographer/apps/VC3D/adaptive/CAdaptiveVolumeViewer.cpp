@@ -1726,6 +1726,28 @@ void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<S
     fp.activeSegHash = std::hash<const void*>{}(activeSeg.get());
     fp.targetGenerationHash = std::hash<uint64_t>{}(
         patchIndex->generation(activeSeg));
+    // Fold the camera state into the fingerprint so pan/zoom invalidates
+    // the cache — surfaceToScene() below consumes all of this.
+    std::size_t cameraHash = 0;
+    auto hashInt = [&](std::size_t s, int v) {
+        return mix(s, std::hash<int>{}(v));
+    };
+    cameraHash = hashInt(cameraHash, int(std::lround(_camSurfX * 1000.0f)));
+    cameraHash = hashInt(cameraHash, int(std::lround(_camSurfY * 1000.0f)));
+    cameraHash = hashInt(cameraHash, int(std::lround(_camScale * 1000.0f)));
+    cameraHash = hashInt(cameraHash, _framebuffer.width());
+    cameraHash = hashInt(cameraHash, _framebuffer.height());
+    if (_view) {
+        const QTransform t = _view->transform();
+        auto q = [](qreal v) { return int(std::lround(v * 1000.0)); };
+        cameraHash = hashInt(cameraHash, q(t.m11()));
+        cameraHash = hashInt(cameraHash, q(t.m12()));
+        cameraHash = hashInt(cameraHash, q(t.m21()));
+        cameraHash = hashInt(cameraHash, q(t.m22()));
+        cameraHash = hashInt(cameraHash, q(t.dx()));
+        cameraHash = hashInt(cameraHash, q(t.dy()));
+    }
+    fp.cameraHash = cameraHash;
     fp.valid = true;
     if (_lastIntersectFp == fp && !_intersectionItems.empty()) {
         return;
