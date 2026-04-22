@@ -309,6 +309,23 @@ def _run_optimization(body: dict[str, Any]) -> None:
 
         # Build argv for fit.py from the config dict.
         cfg = dict(config)
+
+        # Decode tifxyz data if present (offset mode — files sent as base64)
+        tifxyz_data = body.get("tifxyz_data")
+        if isinstance(tifxyz_data, dict):
+            tifxyz_dir = str(Path(tmp_dir) / "tifxyz_input")
+            Path(tifxyz_dir).mkdir(parents=True, exist_ok=True)
+            for fname, b64 in tifxyz_data.items():
+                (Path(tifxyz_dir) / fname).write_bytes(base64.b64decode(b64))
+            print(f"[fit-service] decoded tifxyz ({len(tifxyz_data)} files) to {tifxyz_dir}", flush=True)
+            # Set up tifxyz-init and external_surfaces pointing to local copy
+            args_section_pre = cfg.get("args", {})
+            if isinstance(args_section_pre, dict):
+                args_section_pre["tifxyz-init"] = tifxyz_dir
+            cfg["args"] = args_section_pre
+            offset_val = float(cfg.pop("offset_value", 1.0))
+            cfg["external_surfaces"] = [{"path": tifxyz_dir, "offset": offset_val}]
+
         args_section = dict(cfg.get("args", {}))
         args_section["input"] = str(data_input)
         if model_input:

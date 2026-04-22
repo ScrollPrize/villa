@@ -156,6 +156,7 @@ lambda_global: dict[str, float] = {
 	"station_n": 0.0,
 	"station_t": 0.0,
 	"bend": 0.0,
+	"ext_offset": 0.0,
 }
 
 
@@ -286,6 +287,7 @@ def optimize(
 		"winding_vol": {"loss": opt_loss_winding_volume.winding_volume_loss},
 		"station": {"loss": opt_loss_station.station_loss, "sub": ["station_n", "station_t"]},
 		"bend": {"loss": opt_loss_bend.bend_loss},
+		"ext_offset": {"loss": opt_loss_winding_density.ext_offset_loss},
 	}
 
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, data: fit_data.FitData3D) -> fit_data.FitData3D:
@@ -452,6 +454,7 @@ def optimize(
 			loss.backward()
 			opt.step()
 			model.update_conn_offsets()
+			model.update_ext_conn_offsets()
 			_t_steps_acc += 1
 			_done_steps[0] += 1
 

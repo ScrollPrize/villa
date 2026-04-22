@@ -437,6 +437,7 @@ int SegmentationWidget::newModelHeight() const { return _lasagnaPanel->newModelH
 int SegmentationWidget::newModelWindings() const { return _lasagnaPanel->newModelWindings(); }
 QString SegmentationWidget::seedPointText() const { return _lasagnaPanel->seedPointText(); }
 QString SegmentationWidget::newModelOutputName() const { return _lasagnaPanel->newModelOutputName(); }
+double SegmentationWidget::offsetValue() const { return _lasagnaPanel->offsetValue(); }
 
 void SegmentationWidget::setLasagnaDataInputPath(const QString& path) { _lasagnaPanel->setLasagnaDataInputPath(path); }
 void SegmentationWidget::setSeedFromFocus(int x, int y, int z) { _lasagnaPanel->setSeedFromFocus(x, y, z); }

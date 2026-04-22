@@ -301,6 +301,44 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     panelLayout->addWidget(_expandBtn);
 
     // =======================================================================
+    // Offset settings + action button
+    // =======================================================================
+    {
+        auto* sep = new QFrame(this);
+        sep->setFrameShape(QFrame::HLine);
+        sep->setFrameShadow(QFrame::Sunken);
+        panelLayout->addWidget(sep);
+    }
+
+    _offsetGroup = new CollapsibleSettingsGroup(tr("Offset Settings"), this);
+    auto* offsetContent = _offsetGroup->contentWidget();
+
+    _offsetGroup->addRow(tr("Config:"), [&](QHBoxLayout* row) {
+        _offsetConfigCombo = new QComboBox(offsetContent);
+        _offsetConfigCombo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        _offsetConfigBrowse = new QToolButton(offsetContent);
+        _offsetConfigBrowse->setText(QStringLiteral("..."));
+        _offsetConfigBrowse->setToolTip(tr("Browse for a JSON config file"));
+        row->addWidget(_offsetConfigCombo, 1);
+        row->addWidget(_offsetConfigBrowse);
+    }, tr("JSON config file for offset optimization."));
+
+    _offsetGroup->addRow(tr("Offset:"), [&](QHBoxLayout* row) {
+        _offsetValueSpin = new QDoubleSpinBox(offsetContent);
+        _offsetValueSpin->setRange(-5.0, 5.0);
+        _offsetValueSpin->setSingleStep(1.0);
+        _offsetValueSpin->setDecimals(2);
+        _offsetValueSpin->setValue(1.0);
+        _offsetValueSpin->setToolTip(tr("Target grad_mag integral offset (-1, 0, +1 typical)"));
+        row->addWidget(_offsetValueSpin);
+    }, tr("Offset in winding-integral space. 0=reoptimize in place, ±1=adjacent winding."));
+
+    panelLayout->addWidget(_offsetGroup);
+
+    _offsetBtn = new QPushButton(tr("Offset"), this);
+    panelLayout->addWidget(_offsetBtn);
+
+    // =======================================================================
     // Shared bottom area — stop buttons, progress
     // =======================================================================
     auto* btnRow = new QHBoxLayout();
@@ -511,6 +549,33 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         }
     });
 
+    // -- Offset config combo --
+    connect(_offsetConfigCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int index) {
+        if (_restoringSettings || index < 0) return;
+        QString path = _offsetConfigCombo->currentData().toString();
+        if (!path.isEmpty()) {
+            _offsetConfigFilePath = path;
+            writeSetting(QStringLiteral("lasagna_offset_config_file_path"), _offsetConfigFilePath);
+        }
+    });
+    connect(_offsetConfigBrowse, &QToolButton::clicked, this, [this]() {
+        QString initial = _offsetConfigFilePath.isEmpty()
+            ? QDir::homePath() : QFileInfo(_offsetConfigFilePath).absolutePath();
+        QString path = QFileDialog::getOpenFileName(
+            this, tr("Select optimizer config JSON file"), initial,
+            tr("JSON files (*.json);;All files (*)"));
+        if (!path.isEmpty()) {
+            _offsetConfigFilePath = path;
+            writeSetting(QStringLiteral("lasagna_offset_config_file_path"), _offsetConfigFilePath);
+            QFileInfo fi(path);
+            populateConfigCombo(_offsetConfigCombo, fi.absolutePath(), fi.fileName(), _offsetConfigFilePath);
+        }
+    });
+    connect(_offsetValueSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        writeSetting(QStringLiteral("lasagna_offset_value"), v);
+    });
+
     // -- Expand direction persistence --
     for (int i = 0; i < kExpandDirCount; ++i) {
         connect(_expandDirChecks[i], &QCheckBox::toggled, this, [this, i](bool checked) {
@@ -537,6 +602,10 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         _lasagnaMode = 2;
         triggerOptimization();
     });
+    connect(_offsetBtn, &QPushButton::clicked, this, [this]() {
+        _lasagnaMode = 3;
+        triggerOptimization();
+    });
 
     // -- Stop buttons --
     connect(_stopBtn, &QPushButton::clicked, this, [this]() {
@@ -555,6 +624,9 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     });
     connect(_reoptGroup, &CollapsibleSettingsGroup::toggled, this, [this](bool expanded) {
         writeSetting(QStringLiteral("group_lasagna_reopt_expanded"), expanded);
+    });
+    connect(_offsetGroup, &CollapsibleSettingsGroup::toggled, this, [this](bool expanded) {
+        writeSetting(QStringLiteral("group_lasagna_offset_expanded"), expanded);
     });
     connect(_expandGroup, &CollapsibleSettingsGroup::toggled, this, [this](bool expanded) {
         writeSetting(QStringLiteral("group_lasagna_expand_expanded"), expanded);
@@ -713,6 +785,7 @@ void SegmentationLasagnaPanel::triggerOptimization()
 {
     const QString& configPath = (_lasagnaMode == 1) ? _newModelConfigFilePath
                               : (_lasagnaMode == 2) ? _expandConfigFilePath
+                              : (_lasagnaMode == 3) ? _offsetConfigFilePath
                               : _reoptConfigFilePath;
 
     if (configPath.isEmpty()) {
@@ -838,6 +911,14 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
 
     // Expand settings
     _expandConfigFilePath = settings.value(QStringLiteral("lasagna_expand_config_file_path"), QString()).toString();
+
+    // Offset settings
+    _offsetConfigFilePath = settings.value(QStringLiteral("lasagna_offset_config_file_path"), QString()).toString();
+    if (_offsetValueSpin) {
+        const QSignalBlocker b(_offsetValueSpin);
+        _offsetValueSpin->setValue(
+            settings.value(QStringLiteral("lasagna_offset_value"), 1.0).toDouble());
+    }
     for (int i = 0; i < kExpandDirCount; ++i) {
         if (_expandDirChecks[i]) {
             const QSignalBlocker b(_expandDirChecks[i]);
@@ -880,6 +961,15 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
             _expandConfigCombo->addItem(fi.fileName(), _expandConfigFilePath);
         }
     }
+    if (!_offsetConfigFilePath.isEmpty()) {
+        QFileInfo fi(_offsetConfigFilePath);
+        if (fi.exists()) {
+            populateConfigCombo(_offsetConfigCombo, fi.absolutePath(), fi.fileName(), _offsetConfigFilePath);
+        } else if (_offsetConfigCombo) {
+            _offsetConfigCombo->clear();
+            _offsetConfigCombo->addItem(fi.fileName(), _offsetConfigFilePath);
+        }
+    }
 
     // Expand states
     if (_connectionGroup) {
@@ -897,6 +987,10 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
     if (_expandGroup) {
         _expandGroup->setExpanded(
             settings.value(QStringLiteral("group_lasagna_expand_expanded"), false).toBool());
+    }
+    if (_offsetGroup) {
+        _offsetGroup->setExpanded(
+            settings.value(QStringLiteral("group_lasagna_offset_expanded"), false).toBool());
     }
 
     _restoringSettings = false;
@@ -994,6 +1088,7 @@ QString SegmentationLasagnaPanel::lasagnaConfigText() const
 {
     const QString& path = (_lasagnaMode == 1) ? _newModelConfigFilePath
                         : (_lasagnaMode == 2) ? _expandConfigFilePath
+                        : (_lasagnaMode == 3) ? _offsetConfigFilePath
                         : _reoptConfigFilePath;
     if (path.isEmpty()) return {};
     QFile f(path);
@@ -1079,6 +1174,11 @@ QString SegmentationLasagnaPanel::seedPointText() const
 QString SegmentationLasagnaPanel::newModelOutputName() const
 {
     return _outputNameEdit ? _outputNameEdit->text().trimmed() : QString();
+}
+
+double SegmentationLasagnaPanel::offsetValue() const
+{
+    return _offsetValueSpin ? _offsetValueSpin->value() : 1.0;
 }
 
 void SegmentationLasagnaPanel::setSeedFromFocus(int x, int y, int z)

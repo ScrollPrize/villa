@@ -52,37 +52,43 @@ def winding_density_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tens
 	mc = F.interpolate(mc, size=(He, We), mode='nearest')
 	mask_conn_hr = mc.reshape(D, 3, 1, He, We).permute(0, 2, 3, 4, 1)  # (D, 1, He, We, 3)
 
-	def _strip_loss(start: torch.Tensor, end: torch.Tensor, sign: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-		"""Compute strip loss between two HR endpoint sets.
+	def _strip_loss(start: torch.Tensor, end: torch.Tensor, sign: torch.Tensor,
+				   target: float = 1.0) -> tuple[torch.Tensor, torch.Tensor]:
+		"""Compute strip loss between two endpoint sets.
 
-		start, end: (D, He, We, 3)
-		sign: (D, He, We) — +1 correct side, -1 wrong side
-		Returns: lm (D, He, We), strip_valid (D, He, We)
+		start, end: (D, H, W, 3)
+		sign: (D, H, W) — +1 correct side, -1 wrong side
+		target: target integral value (1.0 for inter-winding, arbitrary for ext offset)
+		Returns: lm (D, H, W), strip_valid (D, H, W)
 		"""
+		D_, H_, W_ = start.shape[:3]
 		t = torch.linspace(0.0, 1.0, strip_samples, device=device, dtype=dtype)
-		diff = end - start  # (D, He, We, 3)
-		strip = start.unsqueeze(-2) + t.view(1, 1, 1, -1, 1) * diff.unsqueeze(-2)  # (D, He, We, S, 3)
+		diff = end - start  # (D, H, W, 3)
+		strip = start.unsqueeze(-2) + t.view(1, 1, 1, -1, 1) * diff.unsqueeze(-2)  # (D, H, W, S, 3)
 
 		# Flatten strip into W for grid_sample
-		strip_flat = strip.reshape(D, He, We * strip_samples, 3)
+		strip_flat = strip.reshape(D_, H_, W_ * strip_samples, 3)
 		sampled = res.data.grid_sample_fullres(strip_flat)
-		mag = sampled.grad_mag.squeeze(0).squeeze(0)  # (D, He, We*S)
-		mag = mag.reshape(D, He, We, strip_samples)
+		mag = sampled.grad_mag.squeeze(0).squeeze(0)  # (D, H, W*S)
+		mag = mag.reshape(D_, H_, W_, strip_samples)
 
 		# Unsigned strip length (Euclidean distance between endpoints).
-		strip_len = torch.sqrt((diff * diff).sum(dim=-1) + 1e-12)  # (D, He, We)
+		strip_len = torch.sqrt((diff * diff).sum(dim=-1) + 1e-12)  # (D, H, W)
 
-		# Apply sign: wrong-side crossings produce negative integral (~-1.0 vs target +1.0)
+		# Apply sign: wrong-side crossings produce negative integral
 		signed_len = strip_len * sign
 
-		# Midpoint-rule line integral; target is 1.0 (one winding traversed)
-		integral = mag.mean(dim=-1) * signed_len  # (D, He, We)
-		lm = torch.log(integral.clamp(min=1e-4)) ** 2  # (D, He, We) — log-space: symmetric in ratio
+		# Midpoint-rule line integral
+		integral = mag.mean(dim=-1) * signed_len  # (D, H, W)
+
+		# Huber loss on (integral - target): handles target=0 and near-zero integrals
+		err = integral - target
+		lm = torch.where(err.abs() <= 1.0, 0.5 * err * err, err.abs() - 0.5)  # (D, H, W)
 
 		# Strip validity: all sample points must have grad_mag > 0
 		sv = (sampled.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=dtype)
-		sv = sv.reshape(D, He, We, strip_samples)
-		strip_valid = sv.amin(dim=-1)  # (D, He, We)
+		sv = sv.reshape(D_, H_, W_, strip_samples)
+		strip_valid = sv.amin(dim=-1)  # (D, H, W)
 
 		return lm, strip_valid
 
@@ -122,3 +128,68 @@ def winding_density_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, t
 	lm = 0.5 * (lm_prev + lm_next)
 	mask = (mask_prev + mask_next).clamp(max=1.0)
 	return loss, (lm,), (mask,)
+
+
+def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	"""External offset loss: grad_mag integral from model surface to external reference should equal target offset."""
+	if res.ext_conn is None or not res.ext_conn:
+		device = res.xyz_lr.device
+		z = torch.zeros((), device=device)
+		return z, (z.unsqueeze(0),), (z.unsqueeze(0),)
+
+	D, Hm, Wm, _ = res.xyz_lr.shape
+	device = res.xyz_lr.device
+	dtype = res.xyz_lr.dtype
+	strip_samples = max(2, int(res.params.subsample_mesh) + 1)
+
+	total_loss = torch.zeros((), device=device, dtype=dtype)
+	total_wsum = 0.0
+	all_lm = []
+	all_mask = []
+
+	for ext_pts, ext_mask, ext_sign, offset in res.ext_conn:
+		# ext_pts: (D, Hm, Wm, 3) — intersection points on external surface
+		# ext_mask: (D, 1, Hm, Wm) — validity
+		# ext_sign: (D, Hm, Wm) — ray direction sign
+		# offset: target grad_mag integral
+
+		# Build strip from model vertex to external intersection point
+		t = torch.linspace(0.0, 1.0, strip_samples, device=device, dtype=dtype)
+		start = res.xyz_lr                    # (D, Hm, Wm, 3)
+		end = ext_pts                         # (D, Hm, Wm, 3)
+		diff = end - start
+		strip = start.unsqueeze(-2) + t.view(1, 1, 1, -1, 1) * diff.unsqueeze(-2)
+
+		strip_flat = strip.reshape(D, Hm, Wm * strip_samples, 3)
+		sampled = res.data.grid_sample_fullres(strip_flat)
+		mag = sampled.grad_mag.squeeze(0).squeeze(0).reshape(D, Hm, Wm, strip_samples)
+
+		strip_len = torch.sqrt((diff * diff).sum(dim=-1) + 1e-12)
+		signed_len = strip_len * ext_sign
+		integral = mag.mean(dim=-1) * signed_len
+
+		# Huber loss on (integral - target)
+		err = integral - offset
+		lm = torch.where(err.abs() <= 1.0, 0.5 * err * err, err.abs() - 0.5)
+		lm = lm.unsqueeze(1)  # (D, 1, Hm, Wm)
+
+		# Validity: ext_mask AND all strip samples have grad_mag > 0
+		sv = (sampled.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=dtype)
+		sv = sv.reshape(D, Hm, Wm, strip_samples).amin(dim=-1).unsqueeze(1)
+		mask = ext_mask * sv
+
+		wsum = float(mask.sum().detach().cpu())
+		if wsum > 0.0:
+			total_loss = total_loss + (lm * mask).sum() / wsum
+			total_wsum += wsum
+		all_lm.append(lm)
+		all_mask.append(mask)
+
+	n_ext = len(res.ext_conn)
+	if n_ext > 1:
+		total_loss = total_loss / n_ext
+
+	# Average lm/mask for visualization
+	lm_avg = sum(all_lm) / n_ext
+	mask_avg = sum(all_mask).clamp(max=1.0) / n_ext
+	return total_loss, (lm_avg,), (mask_avg,)

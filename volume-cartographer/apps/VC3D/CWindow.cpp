@@ -2878,9 +2878,11 @@ void CWindow::CreateWidgets(void)
             segPath = activeSurface->path;
         }
 
-        // Model path — required for re-optimize, optional for new model
+        bool isOffsetMode = (_segmentationWidget->lasagnaMode() == SegmentationLasagnaPanel::LasagnaMode::Offset);
+
+        // Model path — required for re-optimize/expand, not for new/offset
         QString modelPath;
-        if (!isNewModel) {
+        if (!isNewModel && !isOffsetMode) {
             if (!segPath.empty()) {
                 auto modelFile = segPath / "model.pt";
                 if (std::filesystem::exists(modelFile)) {
@@ -3042,6 +3044,18 @@ void CWindow::CreateWidgets(void)
                       << " windings=" << nmN << std::endl;
         }
 
+        // --- Offset mode: inject windings=1 and offset_value into config ---
+        if (isOffsetMode && !segPath.empty()) {
+            double offsetVal = _segmentationWidget->offsetValue();
+
+            QJsonObject args = config[QStringLiteral("args")].toObject();
+            args[QStringLiteral("windings")] = 1;
+            config[QStringLiteral("args")] = args;
+            config[QStringLiteral("offset_value")] = offsetVal;
+
+            std::cerr << "[lasagna] offset mode: offset=" << offsetVal << std::endl;
+        }
+
         // Inject loaded point collections as corr_points
         if (_state->pointCollection()) {
             const auto& cols = _state->pointCollection()->getAllCollections();
@@ -3084,7 +3098,20 @@ void CWindow::CreateWidgets(void)
         }
         request[QStringLiteral("config")] = config;
 
-        if (!isNewModel) {
+        if (isOffsetMode && !segPath.empty()) {
+            // Offset mode: send tifxyz files as base64
+            QJsonObject tifxyzData;
+            for (const auto* fname : {"x.tif", "y.tif", "z.tif", "meta.json"}) {
+                auto filePath = segPath / fname;
+                if (!std::filesystem::exists(filePath)) continue;
+                QFile f(QString::fromStdString(filePath.string()));
+                if (f.open(QIODevice::ReadOnly)) {
+                    tifxyzData[QString::fromLatin1(fname)] =
+                        QString::fromLatin1(f.readAll().toBase64());
+                }
+            }
+            request[QStringLiteral("tifxyz_data")] = tifxyzData;
+        } else if (!isNewModel) {
             // Re-optimize / Expand: send model.pt as base64 data
             QFile modelFile(modelPath);
             if (!modelFile.open(QIODevice::ReadOnly)) {

@@ -146,6 +146,7 @@ def _build_parser() -> argparse.ArgumentParser:
 	cli_model.add_args(p)
 	cli_opt.add_args(p)
 	p.add_argument("--out-dir", default=None, help="Output directory for snapshots and debug")
+	p.add_argument("--tifxyz-init", default=None, help="Initialize model from tifxyz directory instead of model.pt or new model")
 	p.add_argument("--progress", action="store_true", default=False,
 		help="Print machine-readable PROGRESS lines to stdout")
 	return p
@@ -213,7 +214,17 @@ def main(argv: list[str] | None = None) -> int:
 		print(f"[fit] model size: depth={auto_depth} mesh_h={auto_mesh_h} mesh_w={auto_mesh_w}", flush=True)
 
 	# --- Construct / load model (before data, so we can compute bbox) ---
-	if is_new_model:
+	tifxyz_init = getattr(args, "tifxyz_init", None)
+	if tifxyz_init:
+		mdl = model.Model3D.from_tifxyz(
+			tifxyz_init, device=device,
+			mesh_step=model_cfg.mesh_step,
+			winding_step=model_cfg.winding_step,
+			subsample_mesh=model_cfg.subsample_mesh,
+			subsample_winding=model_cfg.subsample_winding,
+		)
+		print(f"[fit] initialized from tifxyz: {tifxyz_init}", flush=True)
+	elif is_new_model:
 		mdl = model.Model3D(
 			device=device,
 			depth=model_cfg.depth,
@@ -246,6 +257,18 @@ def main(argv: list[str] | None = None) -> int:
 	print(f"Model3D: depth={mdl.depth} mesh_h={mdl.mesh_h} mesh_w={mdl.mesh_w} "
 		  f"arc_enabled={mdl.arc_enabled}")
 
+	# Load external reference surfaces
+	ext_surfaces_cfg = cfg.pop("external_surfaces", None)
+	if isinstance(ext_surfaces_cfg, list) and ext_surfaces_cfg:
+		from tifxyz_io import load_tifxyz
+		for es in ext_surfaces_cfg:
+			es_path = str(es["path"])
+			es_offset = float(es.get("offset", 1.0))
+			xyz_ext, valid_ext, meta_ext = load_tifxyz(es_path, device=device)
+			idx = mdl.add_external_surface(xyz_ext, valid=valid_ext, offset=es_offset)
+			print(f"[fit] external surface {idx}: path={es_path} offset={es_offset} "
+				  f"shape={tuple(xyz_ext.shape)} valid={int(valid_ext.sum())}/{valid_ext.numel()}", flush=True)
+
 	# Parse correction points from config (injected by VC3D)
 	corr_points_obj = cfg.pop("corr_points", None)
 	corr_points_3d: fit_data.CorrPoints3D | None = None
@@ -254,6 +277,12 @@ def main(argv: list[str] | None = None) -> int:
 	else:
 		print(f"[fit] corr_points: not found in config (type={type(corr_points_obj).__name__})", flush=True)
 
+	# Strip non-stage keys before parsing stages
+	cfg.pop("args", None)
+	cfg.pop("voxel_size_um", None)
+	cfg.pop("external_surfaces", None)
+	cfg.pop("tifxyz_data", None)
+	cfg.pop("offset_value", None)
 	# Parse stages (before data loading so we know which channels to skip)
 	stages = optimizer.load_stages_cfg(cfg)
 
