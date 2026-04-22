@@ -117,6 +117,13 @@ void dumpOnce(ViewerManager* viewerManager, CState* state)
     size_t mi_commit = 0, mi_peak_commit = 0, mi_faults = 0;
     mi_process_info(&mi_elapsed, &mi_user, &mi_sys, &mi_rss, &mi_peak_rss,
                     &mi_commit, &mi_peak_commit, &mi_faults);
+    // mi_process_info underflows to huge uint64 values after mimalloc has
+    // begun teardown on shutdown. Anything bigger than 1 PiB is the bug.
+    constexpr size_t kMiSane = size_t(1) << 50;
+    if (mi_commit      > kMiSane) mi_commit      = 0;
+    if (mi_peak_commit > kMiSane) mi_peak_commit = 0;
+    if (mi_rss         > kMiSane) mi_rss         = 0;
+    if (mi_peak_rss    > kMiSane) mi_peak_rss    = 0;
     std::fprintf(stderr,
         "[RAM] rss=%ldMB hwm=%ldMB swap=%ldMB"
         " | mi_commit=%zuMB mi_peak_commit=%zuMB mi_peak_rss=%zuMB"

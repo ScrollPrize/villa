@@ -15,7 +15,12 @@ class QuadSurface;
 // regardless of their LRU position.
 class SurfaceLRU {
 public:
-    explicit SurfaceLRU(std::size_t maxResident = 8) : _maxResident(maxResident) {}
+    // 4 resident is enough for (a) the active segmentation, (b) whatever
+    // the viewer was just looking at, (c-d) nearby neighbours the user may
+    // click next. Higher values don't improve interactive feel but cost
+    // ~170 MiB per slot (a segment's _points Mat). Pinned surfaces are
+    // exempt from this cap.
+    explicit SurfaceLRU(std::size_t maxResident = 4) : _maxResident(maxResident) {}
 
     void setMaxResident(std::size_t n);
 

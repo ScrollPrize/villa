@@ -5,7 +5,12 @@
 #include <cstdlib>
 #include <functional>
 #if defined(__GLIBC__)
+#if defined(__GLIBC__)
 #include <malloc.h>
+#endif
+#if defined(VC_HAVE_MIMALLOC)
+#include <mimalloc.h>
+#endif
 #endif
 
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
@@ -668,14 +673,16 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _windowStateSaveTimer->setInterval(500);
     connect(_windowStateSaveTimer, &QTimer::timeout, this, &CWindow::saveWindowState);
 
-    // Periodic glibc heap trim: returns sbrk-grown segments back to the OS
-    // once they're no longer in use. Cheap (~µs) when nothing to trim.
-    // Also dumps a RAM stats line for live monitoring. malloc_trim is a
-    // glibc extension — skipped on macOS / non-glibc libc.
+    // Periodic heap trim: under mimalloc, mi_collect asks it to purge
+    // thread / segment caches and return freed pages to the OS. Under
+    // glibc, malloc_trim returns sbrk-grown segments. Also dumps a RAM
+    // stats line for live monitoring.
     auto* trimTimer = new QTimer(this);
     trimTimer->setInterval(1000);
     connect(trimTimer, &QTimer::timeout, this, [this]() {
-#if defined(__GLIBC__)
+#if defined(VC_HAVE_MIMALLOC)
+        mi_collect(false);
+#elif defined(__GLIBC__)
         ::malloc_trim(0);
 #endif
         vc3d::ramstats::dumpOnce(_viewerManager.get(), _state);

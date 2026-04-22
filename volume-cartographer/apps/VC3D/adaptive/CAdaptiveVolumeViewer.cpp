@@ -19,6 +19,7 @@
 #include <opencv2/imgproc.hpp>
 
 #include <QSettings>
+#include <QThreadPool>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QLabel>
@@ -155,6 +156,13 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
 
 CAdaptiveVolumeViewer::~CAdaptiveVolumeViewer()
 {
+    // Wait for any async workers (render, intersection compute) that hold
+    // `this`. Dropping to member destruction while one is in flight causes
+    // SIGSEGV on exit — observed on Qt app shutdown after a warm-cache
+    // session. Simple spin is fine; the common case is counter==0 on entry.
+    while (_backgroundWorkers.load(std::memory_order_acquire) > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     if (_chunkCbId != 0 && _volume && _volume->tieredCache()) {
         _volume->tieredCache()->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
@@ -480,8 +488,56 @@ void CAdaptiveVolumeViewer::submitRender()
     if (_volume) {
         if (auto* c = _volume->tieredCache()) c->clearChunkArrivedFlag();
     }
-    const auto renderT0 = std::chrono::steady_clock::now();
 
+    // Quick main-thread checks before dispatch. The worker can't check
+    // these safely — the shared_ptr from weak_ptr::lock() and the volume
+    // pointers need main-thread-stable reads.
+    auto surf = _surfWeak.lock();
+    if (!surf || !_volume || !_volume->zarrDataset()) return;
+    const int fbW = _framebuffer.width();
+    const int fbH = _framebuffer.height();
+    if (fbW <= 0 || fbH <= 0) return;
+
+    // Match the work buffer to the committed one so the worker can render
+    // at the same size. create() / assignment only happen on size change.
+    if (_framebufferWork.isNull() || _framebufferWork.width() != fbW
+        || _framebufferWork.height() != fbH
+        || _framebufferWork.format() != _framebuffer.format()) {
+        _framebufferWork = QImage(fbW, fbH, _framebuffer.format());
+    }
+
+    // Serialise: if a worker is already rendering, just note that another
+    // frame is pending. finishRenderOnMainThread() will reschedule once
+    // the in-flight worker commits.
+    if (_renderWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
+        _renderPendingAfterWorker = true;
+        return;
+    }
+    _renderT0 = std::chrono::steady_clock::now();
+
+    // Dispatch the whole render body to QThreadPool. The main thread
+    // returns immediately — Qt input events are no longer stalled behind
+    // the tile sample loop, the CLAHE pass, or the stretch scan.
+    _backgroundWorkers.fetch_add(1, std::memory_order_acq_rel);
+    QThreadPool::globalInstance()->start([this]() {
+        try {
+            renderIntoFramebuffer(_framebufferWork);
+        } catch (...) {
+            // Swallow render errors here; finishRenderOnMainThread still
+            // fires so the busy flag gets cleared and we don't deadlock
+            // the render timer.
+        }
+        QMetaObject::invokeMethod(this,
+            "finishRenderOnMainThread", Qt::QueuedConnection);
+        // Decrement last — the destructor spins on this reaching 0, so
+        // all `this` access (including the invokeMethod post above) must
+        // happen before we signal "worker done".
+        _backgroundWorkers.fetch_sub(1, std::memory_order_release);
+    });
+}
+
+void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb)
+{
     const CompositeParams& lightP = _compositeSettings.params;
     const bool rakingEnabled = _compositeSettings.postRakingEnabled;
     const float rakingAz = _compositeSettings.postRakingAzimuth;
@@ -496,8 +552,9 @@ void CAdaptiveVolumeViewer::submitRender()
     auto surf = _surfWeak.lock();
     if (!surf || !_volume || !_volume->zarrDataset()) return;
 
-    int fbW = _framebuffer.width();
-    int fbH = _framebuffer.height();
+    // fb size was validated on main thread before dispatch.
+    const int fbW = fb.width();
+    const int fbH = fb.height();
     if (fbW <= 0 || fbH <= 0) return;
 
     // Publish viewport snapshot for the tick coordinator. Used by
@@ -531,8 +588,8 @@ void CAdaptiveVolumeViewer::submitRender()
         lvlOutStride = int(_levelBuffer.step1());
     }
 
-    auto* fbBits = reinterpret_cast<uint32_t*>(_framebuffer.bits());
-    int fbStride = _framebuffer.bytesPerLine() / 4;
+    auto* fbBits = reinterpret_cast<uint32_t*>(fb.bits());
+    int fbStride = fb.bytesPerLine() / 4;
 
     // Build the render LUT. For stretch mode we use last frame's min/max
     // so the render is a single pass; we refresh the cached range by
@@ -958,19 +1015,47 @@ void CAdaptiveVolumeViewer::submitRender()
         }
     }
 
-    // Update camera tracking for coordinate conversions
-    syncCameraTransform();
+}
 
+void CAdaptiveVolumeViewer::finishRenderOnMainThread()
+{
+    // Guard against a mid-render resize: onResized() may have
+    // reallocated _framebuffer to a new viewport size while the worker
+    // was still writing to the work buffer at the old size. Swapping
+    // unconditionally would clobber the correctly-sized _framebuffer
+    // with a stale-sized image and leave the view drawing from the
+    // wrong size every frame after. Drop the stale render on the floor
+    // instead and re-schedule.
+    const bool sizesMatch = (_framebuffer.size() == _framebufferWork.size());
+    if (sizesMatch) {
+        std::swap(_framebuffer, _framebufferWork);
+    }
+
+    // Main-thread-only tail. syncCameraTransform writes Qt view state,
+    // updateFocusMarker / renderIntersections / overlaysUpdated all touch
+    // the scene graph, viewport()->update schedules a paint event.
+    syncCameraTransform();
     updateFocusMarker();
     renderIntersections();
     emit overlaysUpdated();
-    // update() schedules a deferred repaint via the event loop; repaint()
-    // blocks the UI thread synchronously until paintEvent returns, which
-    // stalls every frame during pans/zooms.
     _view->viewport()->update();
-    const auto renderDt = std::chrono::steady_clock::now() - renderT0;
+
+    const auto renderDt = std::chrono::steady_clock::now() - _renderT0;
     recordRenderDuration(std::chrono::duration<double>(renderDt).count());
     updateStatusLabel();
+
+    _renderWorkerBusy.store(false, std::memory_order_release);
+    // Re-schedule if a pending frame was queued OR if we discarded a
+    // stale-sized frame above — either way we owe the view a current
+    // render.
+    if (_renderPendingAfterWorker || !sizesMatch) {
+        _renderPendingAfterWorker = false;
+        // Queue the next frame on the render timer instead of calling
+        // submitRender recursively — keeps the dispatch on the Qt event
+        // loop and lets any batched setters that fired while the worker
+        // ran settle into state before we read it.
+        scheduleRender();
+    }
 }
 
 void CAdaptiveVolumeViewer::renderVisible(bool force)
@@ -1557,50 +1642,59 @@ void CAdaptiveVolumeViewer::renderIntersectionsNow()
     if (_lastIntersectFp == fp && !_intersectionItems.empty()) {
         return;
     }
+
+    // Serialise: one plane-intersection worker at a time. If another is
+    // still running, remember dirty and let the next render tick restart
+    // us. Don't clear the scene items here — leave the old overlay
+    // visible rather than blanking while we recompute.
+    if (_planeWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
+        _intersectionsDirty = true;
+        _lastIntersectFp = {};
+        return;
+    }
     invalidateIntersect();
     _lastIntersectFp = fp;
 
-    auto intersections = patchIndex->computePlaneIntersections(*plane, planeRoi, targets);
-    if (intersections.empty()) { /* kept cleared by invalidate above */ return; }
-
-    // Group path segments by draw style for batched drawing. Active
-    // segmentation gets its own z so it always renders above other
-    // intersection overlays.
-    std::unordered_map<IntersectionStyle, QPainterPath, IntersectionStyleHash> groupedPaths;
-    std::unordered_map<IntersectionStyle, QColor, IntersectionStyleHash> groupedColors;
-    // Bitwise finite check: matches repo convention (see feedback_ffast_math).
-    // Finite iff exponent bits are not all 1s.
-    auto isFiniteScalar = [](double v) {
-        uint64_t bits;
-        std::memcpy(&bits, &v, sizeof(bits));
-        return (bits & 0x7FF0000000000000ULL) != 0x7FF0000000000000ULL;
+    // Snapshot camera state for the worker's plane-to-scene projections.
+    struct PlaneCamSnapshot {
+        float camSurfX, camSurfY, camScale;
+        float vpCx, vpCy;
+        QTransform viewToScene;
     };
-    auto isFinitePoint = [&](const QPointF& p) {
-        return isFiniteScalar(p.x()) && isFiniteScalar(p.y());
-    };
-    // volumeToScene() locks _surfWeak and dynamic_casts on every call. We
-    // already have `plane` cached from the top of this function, so inline
-    // the projection once per segment endpoint here.
-    auto planeToScene = [&](const cv::Vec3f& volPoint) {
-        cv::Vec3f proj = plane->project(volPoint, 1.0, 1.0);
-        return surfaceToScene(proj[0], proj[1]);
+    PlaneCamSnapshot cam{
+        _camSurfX, _camSurfY, _camScale,
+        static_cast<float>(_framebuffer.width()) * 0.5f,
+        static_cast<float>(_framebuffer.height()) * 0.5f,
+        _view ? _view->transform().inverted() : QTransform(),
     };
 
-    for (const auto& [target, segments] : intersections) {
-        if (!target || segments.empty()) continue;
-
-        QColor baseColor;
-        int zValue = kIntersectionZ;
+    // Pre-resolve per-target styling on the main thread — it reads
+    // _surfaceColorAssignments / _nextColorIndex and touches the palette
+    // LUT, all of which we want to keep single-threaded. The worker's
+    // output is a flat list of styled segments; the scene rebuild then
+    // groups them by style into QPainterPaths.
+    struct TargetStyle {
+        QColor color;
+        int z;
+        float penWidth;
+    };
+    std::unordered_map<const void*, TargetStyle> targetStyles;
+    targetStyles.reserve(targets.size());
+    for (const auto& target : targets) {
+        if (!target) continue;
+        TargetStyle ts;
+        ts.z = kIntersectionZ;
         float opacity = _intersectionOpacity;
-        float penWidth = _intersectionThickness;
+        ts.penWidth = _intersectionThickness;
+        QColor baseColor;
         if (target == activeSeg) {
             baseColor = activeSegmentationColorForView(_surfName);
-            zValue = kActiveIntersectionZ;
+            ts.z = kActiveIntersectionZ;
             opacity *= kActiveIntersectionOpacityScale;
-            penWidth = activeSegmentationIntersectionWidth(penWidth);
+            ts.penWidth = activeSegmentationIntersectionWidth(ts.penWidth);
         } else if (_highlightedSurfaceIds.count(target->id)) {
             baseColor = QColor(0, 220, 255);
-            zValue = kHighlightedIntersectionZ;
+            ts.z = kHighlightedIntersectionZ;
         } else {
             const auto& id = target->id;
             auto it = _surfaceColorAssignments.find(id);
@@ -1616,41 +1710,103 @@ void CAdaptiveVolumeViewer::renderIntersectionsNow()
             baseColor = QColor::fromRgba(kIntersectionPalette[idx % kIntersectionPalette.size()]);
         }
         baseColor.setAlphaF(std::clamp(opacity, 0.0f, 1.0f));
-        if (baseColor.alpha() <= 0) continue;
+        ts.color = baseColor;
+        targetStyles.emplace(target.get(), ts);
+    }
 
-        for (const auto& seg : segments) {
-            QPointF a = planeToScene(seg.world[0]);
-            QPointF b = planeToScene(seg.world[1]);
-            if (!isFinitePoint(a) || !isFinitePoint(b)) continue;
-            const IntersectionStyle style{
-                baseColor.rgba(),
-                zValue,
-                int(std::lround(std::max(0.0f, penWidth) * 1000.0f)),
+    // Capture the plane by shared_ptr (reuse via _state is fine — shared
+    // ownership keeps it alive across the worker). patchIndex is owned by
+    // ViewerManager (app-lifetime).
+    auto planeSp = std::dynamic_pointer_cast<PlaneSurface>(
+        _state->surface(_surfName));
+    if (!planeSp) {
+        _planeWorkerBusy.store(false, std::memory_order_release);
+        return;
+    }
+
+    _backgroundWorkers.fetch_add(1, std::memory_order_acq_rel);
+    QThreadPool::globalInstance()->start(
+        [this, fp, planeSp, planeRoi, targets = std::move(targets),
+         targetStyles = std::move(targetStyles), cam, patchIndex]() mutable {
+            auto isFiniteScalar = [](double v) {
+                uint64_t bits;
+                std::memcpy(&bits, &v, sizeof(bits));
+                return (bits & 0x7FF0000000000000ULL) != 0x7FF0000000000000ULL;
             };
-            QPainterPath& path = groupedPaths[style];
-            path.moveTo(a);
-            path.lineTo(b);
-            groupedColors[style] = baseColor;
-        }
-    }
+            auto surfToScene = [&](float sx, float sy) -> QPointF {
+                const qreal vx = (sx - cam.camSurfX) * cam.camScale + cam.vpCx;
+                const qreal vy = (sy - cam.camSurfY) * cam.camScale + cam.vpCy;
+                return cam.viewToScene.map(QPointF(vx, vy));
+            };
+            auto planeToScene = [&](const cv::Vec3f& volPoint) {
+                cv::Vec3f proj = planeSp->project(volPoint, 1.0, 1.0);
+                return surfToScene(proj[0], proj[1]);
+            };
 
-    _intersectionItems.reserve(groupedPaths.size());
-    for (const auto& [style, path] : groupedPaths) {
-        if (path.isEmpty()) continue;
-        auto* item = new QGraphicsPathItem(path);
-        QPen pen(groupedColors[style]);
-        pen.setWidthF(static_cast<qreal>(style.widthQ) / 1000.0);
-        pen.setCapStyle(Qt::RoundCap);
-        pen.setJoinStyle(Qt::RoundJoin);
-        pen.setCosmetic(true);
-        item->setPen(pen);
-        item->setBrush(Qt::NoBrush);
-        item->setZValue(style.z);
-        _scene->addItem(item);
-        _intersectionItems.push_back(item);
-    }
+            // Heavy compute: rtree walk + per-patch triangle clip.
+            auto intersections = patchIndex->computePlaneIntersections(
+                *planeSp, planeRoi, targets);
 
-    _view->viewport()->update();
+            // Group by draw style — same output shape the main-thread apply
+            // step needs for batched QGraphicsPathItem creation.
+            std::unordered_map<IntersectionStyle, QPainterPath,
+                               IntersectionStyleHash> groupedPaths;
+            std::unordered_map<IntersectionStyle, QColor,
+                               IntersectionStyleHash> groupedColors;
+            for (const auto& [target, segments] : intersections) {
+                if (!target || segments.empty()) continue;
+                auto it = targetStyles.find(target.get());
+                if (it == targetStyles.end()) continue;
+                const auto& ts = it->second;
+                if (ts.color.alpha() <= 0) continue;
+                for (const auto& seg : segments) {
+                    QPointF a = planeToScene(seg.world[0]);
+                    QPointF b = planeToScene(seg.world[1]);
+                    if (!isFiniteScalar(a.x()) || !isFiniteScalar(a.y())
+                     || !isFiniteScalar(b.x()) || !isFiniteScalar(b.y()))
+                        continue;
+                    const IntersectionStyle style{
+                        ts.color.rgba(),
+                        ts.z,
+                        int(std::lround(std::max(0.0f, ts.penWidth) * 1000.0f)),
+                    };
+                    groupedPaths[style].moveTo(a);
+                    groupedPaths[style].lineTo(b);
+                    groupedColors[style] = ts.color;
+                }
+            }
+
+            // Post-back builds QGraphicsPathItems on the main thread.
+            QMetaObject::invokeMethod(this,
+                [this, fp,
+                 groupedPaths = std::move(groupedPaths),
+                 groupedColors = std::move(groupedColors)]() mutable {
+                    if (_lastIntersectFp == fp) {
+                        invalidateIntersect();
+                        _intersectionItems.reserve(groupedPaths.size());
+                        for (const auto& [style, path] : groupedPaths) {
+                            if (path.isEmpty()) continue;
+                            auto* item = new QGraphicsPathItem(path);
+                            QPen pen(groupedColors[style]);
+                            pen.setWidthF(
+                                static_cast<qreal>(style.widthQ) / 1000.0);
+                            pen.setCapStyle(Qt::RoundCap);
+                            pen.setJoinStyle(Qt::RoundJoin);
+                            pen.setCosmetic(true);
+                            item->setPen(pen);
+                            item->setBrush(Qt::NoBrush);
+                            item->setZValue(style.z);
+                            _scene->addItem(item);
+                            _intersectionItems.push_back(item);
+                        }
+                        if (_view) _view->viewport()->update();
+                    }
+                    _planeWorkerBusy.store(false,
+                                           std::memory_order_release);
+                },
+                Qt::QueuedConnection);
+            _backgroundWorkers.fetch_sub(1, std::memory_order_release);
+        });
 }
 
 void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Surface>& surf)
@@ -1755,12 +1911,22 @@ void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<S
     invalidateIntersect();
     _lastIntersectFp = fp;
 
-    // Iterate every triangle of the active segment: a triangle's UV may sit
-    // anywhere on the flattened patch, so restricting by a viewport-derived
-    // 3D bbox would miss lines that belong on-screen but whose 3D vertices
-    // live elsewhere. One segment's triangle count is bounded enough for
-    // this to be cheap. Size the bbox to the volume so R-tree quantization
-    // (16-bit per axis over ~101000 units) can't drop valid cells.
+    // Everything past this point is pure computation over `activeSeg`,
+    // `planes`, `patchIndex`, and a snapshot of the camera transform. We
+    // dispatch it to QThreadPool so the rtree walk + per-triangle plane
+    // clip don't block input processing — on the heavy workload
+    // (~1.97M patches) this pass was measurable stalls on the main
+    // thread. The result is posted back via invokeMethod(Queued) and
+    // applied to the scene on the main thread.
+    if (_flattenedWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
+        // A previous compute is still running. _intersectionsDirty will
+        // stay true; _renderTimer will re-enter here once the worker
+        // finishes and resets the flag.
+        _intersectionsDirty = true;
+        _lastIntersectFp = {};
+        return;
+    }
+
     Rect3D allBounds{cv::Vec3f(0, 0, 0), cv::Vec3f(1, 1, 1)};
     if (_volume) {
         auto [w, h, d] = _volume->shape();
@@ -1769,58 +1935,111 @@ void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<S
                           static_cast<float>(d)};
     }
 
-    auto isFiniteScalar = [](double v) {
-        uint64_t bits;
-        std::memcpy(&bits, &v, sizeof(bits));
-        return (bits & 0x7FF0000000000000ULL) != 0x7FF0000000000000ULL;
-    };
-    auto isFinitePoint = [&](const QPointF& p) {
-        return isFiniteScalar(p.x()) && isFiniteScalar(p.y());
-    };
-
     const float clipTol = std::max(_intersectionThickness, 1e-4f);
-    std::vector<QPainterPath> paths(planes.size());
 
-    patchIndex->forEachTriangle(allBounds, activeSeg,
-        [&](const SurfacePatchIndex::TriangleCandidate& tri) {
-            for (size_t idx = 0; idx < planes.size(); ++idx) {
-                auto seg = SurfacePatchIndex::clipTriangleToPlane(
-                    tri, *planes[idx].plane, clipTol);
-                if (!seg) continue;
-                cv::Vec3f a = activeSeg->loc(seg->surfaceParams[0]);
-                cv::Vec3f b = activeSeg->loc(seg->surfaceParams[1]);
-                QPointF pa = surfaceToScene(a[0], a[1]);
-                QPointF pb = surfaceToScene(b[0], b[1]);
-                if (!isFinitePoint(pa) || !isFinitePoint(pb)) continue;
-                paths[idx].moveTo(pa);
-                paths[idx].lineTo(pb);
-            }
-        });
+    // Snapshot camera state so the worker can call a pure surfaceToScene
+    // equivalent without touching Qt objects. _view->transform() /
+    // _framebuffer / _camSurfX/Y/Scale are all read here on the main
+    // thread.
+    struct CamSnapshot {
+        float camSurfX, camSurfY, camScale;
+        float vpCx, vpCy;
+        QTransform viewToScene;
+    };
+    CamSnapshot cam{
+        _camSurfX, _camSurfY, _camScale,
+        static_cast<float>(_framebuffer.width()) * 0.5f,
+        static_cast<float>(_framebuffer.height()) * 0.5f,
+        _view ? _view->transform().inverted() : QTransform(),
+    };
 
     const float penWidth = std::max(_intersectionThickness,
                                     kActiveIntersectionMinWidthDelta);
     const float opacity = std::clamp(
         _intersectionOpacity * kActiveIntersectionOpacityScale, 0.0f, 1.0f);
 
-    _intersectionItems.reserve(planes.size());
-    for (size_t idx = 0; idx < planes.size(); ++idx) {
-        if (paths[idx].isEmpty()) continue;
-        QColor color = planes[idx].color;
-        color.setAlphaF(opacity);
-        auto* item = new QGraphicsPathItem(paths[idx]);
-        QPen pen(color);
-        pen.setWidthF(static_cast<qreal>(penWidth));
-        pen.setCapStyle(Qt::RoundCap);
-        pen.setJoinStyle(Qt::RoundJoin);
-        pen.setCosmetic(true);
-        item->setPen(pen);
-        item->setBrush(Qt::NoBrush);
-        item->setZValue(kActiveIntersectionZ);
-        _scene->addItem(item);
-        _intersectionItems.push_back(item);
+    std::vector<QColor> colors;
+    colors.reserve(planes.size());
+    std::vector<std::shared_ptr<PlaneSurface>> planeSurfs;
+    planeSurfs.reserve(planes.size());
+    for (const auto& e : planes) {
+        colors.push_back(e.color);
+        planeSurfs.push_back(e.plane);
     }
 
-    _view->viewport()->update();
+    _backgroundWorkers.fetch_add(1, std::memory_order_acq_rel);
+    QThreadPool::globalInstance()->start(
+        [this, fp, allBounds, clipTol, cam,
+         activeSeg, patchIndex, planeSurfs = std::move(planeSurfs),
+         colors = std::move(colors), penWidth, opacity]() mutable {
+            auto isFiniteScalar = [](double v) {
+                uint64_t bits;
+                std::memcpy(&bits, &v, sizeof(bits));
+                return (bits & 0x7FF0000000000000ULL) != 0x7FF0000000000000ULL;
+            };
+            auto surfToScene = [&](float sx, float sy) -> QPointF {
+                const qreal vx = (sx - cam.camSurfX) * cam.camScale + cam.vpCx;
+                const qreal vy = (sy - cam.camSurfY) * cam.camScale + cam.vpCy;
+                // QGraphicsView::mapToScene(QPoint) == viewportTransform-inverse
+                // applied to the point. inverted() was captured on the main
+                // thread; apply it here without touching QGraphicsView.
+                return cam.viewToScene.map(QPointF(vx, vy));
+            };
+
+            std::vector<QPainterPath> paths(planeSurfs.size());
+            patchIndex->forEachTriangle(allBounds, activeSeg,
+                [&](const SurfacePatchIndex::TriangleCandidate& tri) {
+                    for (size_t idx = 0; idx < planeSurfs.size(); ++idx) {
+                        auto seg = SurfacePatchIndex::clipTriangleToPlane(
+                            tri, *planeSurfs[idx], clipTol);
+                        if (!seg) continue;
+                        cv::Vec3f a = activeSeg->loc(seg->surfaceParams[0]);
+                        cv::Vec3f b = activeSeg->loc(seg->surfaceParams[1]);
+                        QPointF pa = surfToScene(a[0], a[1]);
+                        QPointF pb = surfToScene(b[0], b[1]);
+                        if (!isFiniteScalar(pa.x()) || !isFiniteScalar(pa.y())
+                         || !isFiniteScalar(pb.x()) || !isFiniteScalar(pb.y()))
+                            continue;
+                        paths[idx].moveTo(pa);
+                        paths[idx].lineTo(pb);
+                    }
+                });
+
+            // Post back to main thread. Queued connection — if `this` is
+            // destroyed before the event fires, Qt drops it silently.
+            QMetaObject::invokeMethod(this,
+                [this, fp, paths = std::move(paths),
+                 colors = std::move(colors), penWidth, opacity]() mutable {
+                    // Bail if fingerprint changed while we were computing.
+                    // _renderTimer will notice _intersectionsDirty and
+                    // reschedule.
+                    if (_lastIntersectFp == fp) {
+                        invalidateIntersect();
+                        _intersectionItems.reserve(colors.size());
+                        for (size_t idx = 0; idx < paths.size(); ++idx) {
+                            if (paths[idx].isEmpty()) continue;
+                            QColor c = colors[idx];
+                            c.setAlphaF(opacity);
+                            auto* item = new QGraphicsPathItem(paths[idx]);
+                            QPen pen(c);
+                            pen.setWidthF(static_cast<qreal>(penWidth));
+                            pen.setCapStyle(Qt::RoundCap);
+                            pen.setJoinStyle(Qt::RoundJoin);
+                            pen.setCosmetic(true);
+                            item->setPen(pen);
+                            item->setBrush(Qt::NoBrush);
+                            item->setZValue(kActiveIntersectionZ);
+                            _scene->addItem(item);
+                            _intersectionItems.push_back(item);
+                        }
+                        if (_view) _view->viewport()->update();
+                    }
+                    _flattenedWorkerBusy.store(false,
+                                               std::memory_order_release);
+                },
+                Qt::QueuedConnection);
+            _backgroundWorkers.fetch_sub(1, std::memory_order_release);
+        });
 }
 
 bool CAdaptiveVolumeViewer::sceneToVolumePN(cv::Vec3f& p, cv::Vec3f& n,
@@ -1918,10 +2137,26 @@ void CAdaptiveVolumeViewer::updateStatusLabel()
     if (now - _lastStatusUpdate < std::chrono::milliseconds(100)) return;
     _lastStatusUpdate = now;
 
+    // Z display: for plane viewers, shift+scroll moves the 'focus' POI
+    // rather than writing _camera.zOff, so we show the plane's signed
+    // offset along its own normal from the world origin. For the
+    // segmentation (flattened) view, shift+scroll writes _camera.zOff
+    // directly, so show that.
+    float zDisplay = _camera.zOff;
+    if (auto surf = _surfWeak.lock()) {
+        if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
+            const cv::Vec3f n = plane->normal(cv::Vec3f(0, 0, 0), {});
+            const double len = cv::norm(n);
+            if (len > 1e-6) {
+                const cv::Vec3f nHat = n * static_cast<float>(1.0 / len);
+                zDisplay = plane->origin().dot(nHat);
+            }
+        }
+    }
     QString status = QString("%1x 1:%2 z=%3")
         .arg(static_cast<double>(_camera.scale), 0, 'f', 2)
         .arg(1 << _camera.dsScaleIdx)
-        .arg(static_cast<double>(_camera.zOff), 0, 'f', 1);
+        .arg(static_cast<double>(zDisplay), 0, 'f', 1);
 
     const float fps = measuredFps();
     if (fps > 0.0f) {

@@ -8,6 +8,11 @@
 
 #include <opencv2/core.hpp>
 
+#if defined(__linux__)
+#include <pthread.h>
+#include <cstdio>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -735,6 +740,14 @@ inline int renderThreadCount() {
     return n;
 }
 
+// When true, the render pool's main-thread participation (body(0)) is
+// skipped and the caller blocks until workers finish. Costs one worker
+// slot of render throughput per frame but keeps the main thread free for
+// input/event processing — on heavy surfaces that was enough to cause
+// visible input jank since the main thread was busy sampling instead of
+// dispatching events.
+constexpr bool kRenderMainThreadAsWorker = false;
+
 class RenderThreadPool {
 public:
     static RenderThreadPool& instance() {
@@ -754,7 +767,9 @@ public:
         // Batched start: glibc collapses counting_semaphore::release(N)
         // into a single futex_wake(n=N) syscall, vs. N separate syscalls.
         startSem_.release(nWorkers);
-        body_(0);
+        if constexpr (kRenderMainThreadAsWorker) {
+            body_(0);
+        }
         for (int i = 0; i < nWorkers; ++i) doneSem_.acquire();
     }
 
@@ -763,14 +778,27 @@ public:
 private:
     RenderThreadPool() {
         const int nT = renderThreadCount();
-        const int nWorkers = nT > 1 ? nT - 1 : 0;
+        // Size the worker pool so total tile-pulling agents == nT whether
+        // main thread participates or not.
+        const int nWorkers = kRenderMainThreadAsWorker
+            ? (nT > 1 ? nT - 1 : 0)
+            : nT;
         workers_.reserve(size_t(nWorkers));
-        for (int i = 1; i <= nWorkers; ++i) {
+        for (int i = 0; i < nWorkers; ++i) {
             workers_.emplace_back([this, i]() {
+#if defined(__linux__)
+                char name[16];
+                std::snprintf(name, sizeof(name), "vcRender%d", i);
+                ::pthread_setname_np(::pthread_self(), name);
+#endif
                 while (true) {
                     startSem_.acquire();
                     if (shutdown_.load(std::memory_order_acquire)) return;
-                    body_(i);
+                    // Bodies don't use tid (tile queue is atomic) so the
+                    // exact id doesn't matter; pass i+1 when main thread
+                    // is tid 0 to preserve the old convention for any
+                    // future caller that does care.
+                    body_(kRenderMainThreadAsWorker ? i + 1 : i);
                     doneSem_.release();
                 }
             });
