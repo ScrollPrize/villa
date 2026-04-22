@@ -5,12 +5,10 @@
 #include <cstdlib>
 #include <functional>
 #if defined(__GLIBC__)
-#if defined(__GLIBC__)
 #include <malloc.h>
 #endif
 #if defined(VC_HAVE_MIMALLOC)
 #include <mimalloc.h>
-#endif
 #endif
 
 #include "vc/core/cache/HttpMetadataFetcher.hpp"

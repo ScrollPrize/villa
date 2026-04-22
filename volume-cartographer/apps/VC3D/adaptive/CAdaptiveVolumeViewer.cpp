@@ -498,30 +498,56 @@ void CAdaptiveVolumeViewer::submitRender()
     const int fbH = _framebuffer.height();
     if (fbW <= 0 || fbH <= 0) return;
 
-    // Match the work buffer to the committed one so the worker can render
-    // at the same size. create() / assignment only happen on size change.
+    // Serialise: if a worker is already rendering, just note that another
+    // frame is pending. finishRenderOnMainThread() will reschedule once
+    // the in-flight worker commits. Must precede any _framebufferWork
+    // mutation — reassigning the QImage while the worker is writing to it
+    // would corrupt both the new and in-flight frames.
+    if (_renderWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
+        _renderPendingAfterWorker = true;
+        return;
+    }
+
+    // Now that we own the busy gate, it's safe to resize the work buffer
+    // — no worker is touching it. create() / assignment only happen on
+    // size/format change.
     if (_framebufferWork.isNull() || _framebufferWork.width() != fbW
         || _framebufferWork.height() != fbH
         || _framebufferWork.format() != _framebuffer.format()) {
         _framebufferWork = QImage(fbW, fbH, _framebuffer.format());
     }
-
-    // Serialise: if a worker is already rendering, just note that another
-    // frame is pending. finishRenderOnMainThread() will reschedule once
-    // the in-flight worker commits.
-    if (_renderWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
-        _renderPendingAfterWorker = true;
-        return;
-    }
     _renderT0 = std::chrono::steady_clock::now();
+
+    // Snapshot everything the worker will read that main-thread setters
+    // can write. Done under the busy gate so settings setters queue
+    // behind us on the event loop — the snapshot always reflects a
+    // self-consistent frame of state rather than a torn mid-setter view.
+    // Tick coordinator slot is also allocated here on main (avoids a
+    // teardown race with the destructor) before we publish inside the
+    // worker.
+    if (_tickViewportSlot < 0) {
+        _tickViewportSlot = vc::cache::TickCoordinator::acquireViewportSlotGlobal();
+    }
+    RenderContext ctx;
+    ctx.camera = _camera;
+    ctx.compositeSettings = _compositeSettings;
+    ctx.samplingMethod = _samplingMethod;
+    ctx.interactive = _interactive;
+    ctx.windowLow = _windowLow;
+    ctx.windowHigh = _windowHigh;
+    ctx.baseColormapId = _baseColormapId;
+    ctx.highlightDownscaled = _highlightDownscaled;
+    ctx.zOffWorldDir = _zOffWorldDir;
+    ctx.surf = std::move(surf);
+    ctx.volume = _volume;
 
     // Dispatch the whole render body to QThreadPool. The main thread
     // returns immediately — Qt input events are no longer stalled behind
     // the tile sample loop, the CLAHE pass, or the stretch scan.
     _backgroundWorkers.fetch_add(1, std::memory_order_acq_rel);
-    QThreadPool::globalInstance()->start([this]() {
+    QThreadPool::globalInstance()->start([this, ctx = std::move(ctx)]() {
         try {
-            renderIntoFramebuffer(_framebufferWork);
+            renderIntoFramebuffer(_framebufferWork, ctx);
         } catch (...) {
             // Swallow render errors here; finishRenderOnMainThread still
             // fires so the busy flag gets cleared and we don't deadlock
@@ -536,21 +562,30 @@ void CAdaptiveVolumeViewer::submitRender()
     });
 }
 
-void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb)
+void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
+                                                   const RenderContext& ctx)
 {
-    const CompositeParams& lightP = _compositeSettings.params;
-    const bool rakingEnabled = _compositeSettings.postRakingEnabled;
-    const float rakingAz = _compositeSettings.postRakingAzimuth;
-    const float rakingEl = _compositeSettings.postRakingElevation;
-    const float rakingStrength = std::clamp(_compositeSettings.postRakingStrength, 0.0f, 1.0f);
-    const float rakingDepth = std::max(0.01f, _compositeSettings.postRakingDepthScale);
+    // All reads of mutable viewer state go through `ctx` — `_camera`,
+    // `_compositeSettings`, `_windowLow`, `_baseColormapId`,
+    // `_highlightDownscaled`, `_samplingMethod`, `_interactive`,
+    // `_zOffWorldDir`, `_surfWeak`, `_volume` are all mutated by main-
+    // thread handlers and must not be touched from this worker thread.
+    // Per-render scratch caches (_genCoords, _cachedLut, _claheCache,
+    // etc.) are only touched here and are serialised by the
+    // _renderWorkerBusy gate so they remain safe without the snapshot.
+    const CompositeParams& lightP = ctx.compositeSettings.params;
+    const bool rakingEnabled = ctx.compositeSettings.postRakingEnabled;
+    const float rakingAz = ctx.compositeSettings.postRakingAzimuth;
+    const float rakingEl = ctx.compositeSettings.postRakingElevation;
+    const float rakingStrength = std::clamp(ctx.compositeSettings.postRakingStrength, 0.0f, 1.0f);
+    const float rakingDepth = std::max(0.01f, ctx.compositeSettings.postRakingDepthScale);
 
     // Debug overlay: paint a per-pixel gradient based on fallback-level depth.
     // Cached in reloadPerfSettings() instead of re-read from disk each frame.
-    const bool highlightDownscaled = _highlightDownscaled;
+    const bool highlightDownscaled = ctx.highlightDownscaled;
 
-    auto surf = _surfWeak.lock();
-    if (!surf || !_volume || !_volume->zarrDataset()) return;
+    const auto& surf = ctx.surf;
+    if (!surf || !ctx.volume || !ctx.volume->zarrDataset()) return;
 
     // fb size was validated on main thread before dispatch.
     const int fbW = fb.width();
@@ -559,16 +594,14 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb)
 
     // Publish viewport snapshot for the tick coordinator. Used by
     // prefetch coalescing (so the tick drain knows which pipelines/levels
-    // are in use) and future slice scoping. Slot is lazy-allocated here
-    // and released in the destructor.
-    if (_tickViewportSlot < 0) {
-        _tickViewportSlot = vc::cache::TickCoordinator::acquireViewportSlotGlobal();
-    }
+    // are in use) and future slice scoping. Slot allocation itself moved
+    // to submitRender (main thread) so the destructor's release doesn't
+    // race with a lazy-allocation here.
     if (_tickViewportSlot >= 0) {
         vc::cache::ViewportSnapshot vs;
         vs.active = true;
-        vs.level = _camera.dsScaleIdx;
-        vs.pipeline = _volume->tieredCache();
+        vs.level = ctx.camera.dsScaleIdx;
+        vs.pipeline = ctx.volume->tieredCache();
         vc::cache::TickCoordinator::publishViewportGlobal(_tickViewportSlot, vs);
     }
 
@@ -595,8 +628,8 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb)
     // so the render is a single pass; we refresh the cached range by
     // scanning the framebuffer after. A camera change invalidates the
     // cache and forces a 2-pass on the first frame after motion.
-    const bool stretch = _compositeSettings.postStretchValues;
-    const uint8_t isoCutoff = _compositeSettings.params.isoCutoff;
+    const bool stretch = ctx.compositeSettings.postStretchValues;
+    const uint8_t isoCutoff = ctx.compositeSettings.params.isoCutoff;
     auto applyIsoCutoff = [&](std::array<uint32_t, 256>& l, uint8_t cutoff) {
         if (cutoff == 0) return;
         const uint32_t zero = l[0];
@@ -607,10 +640,10 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb)
     const bool stretchFirstPass = stretch && !_cachedStretchValid;
     // CLAHE and raking both operate on gray, so the colormap is deferred
     // until after those passes. The sampling LUT in that case is gray-only.
-    const bool postGrayDomain = _compositeSettings.postClaheEnabled || rakingEnabled;
-    const bool deferColormap = postGrayDomain && !_baseColormapId.empty();
-    const std::string& sampleColormapId = deferColormap
-        ? std::string() : _baseColormapId;
+    const bool postGrayDomain = ctx.compositeSettings.postClaheEnabled || rakingEnabled;
+    const bool deferColormap = postGrayDomain && !ctx.baseColormapId.empty();
+    const std::string sampleColormapId = deferColormap
+        ? std::string() : ctx.baseColormapId;
     if (stretchFirstPass) {
         // Identity gray LUT so we can extract the raw sample after sampling.
         for (int i = 0; i < 256; i++) {
@@ -618,8 +651,8 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb)
             lut[i] = 0xFF000000u | (v << 16) | (v << 8) | v;
         }
     } else {
-        float wlo = stretch ? float(_cachedStretchLo) : _windowLow;
-        float whi = stretch ? float(_cachedStretchHi) : _windowHigh;
+        float wlo = stretch ? float(_cachedStretchLo) : ctx.windowLow;
+        float whi = stretch ? float(_cachedStretchHi) : ctx.windowHigh;
         // Reuse previous LUT if the inputs haven't changed.
         if (_cachedWindowLow == wlo && _cachedWindowHigh == whi
             && _cachedColormapId == sampleColormapId
@@ -637,48 +670,48 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb)
     }
 
     vc::SampleParams sp;
-    const int numLevels = static_cast<int>(_volume->numScales());
+    const int numLevels = static_cast<int>(ctx.volume->numScales());
     // Always render at the user-requested level. The sampler's per-pixel
     // adaptive fallback handles regions that aren't ready yet by dropping
     // those pixels to whichever coarser level is resident — no whole-frame
     // resolution cycling, and cached fine chunks are used immediately.
-    sp.level = _camera.dsScaleIdx;
+    sp.level = ctx.camera.dsScaleIdx;
     // During live interaction (pan drag, zoom wheel) bump the pyramid
     // level one step coarser. Each step halves the voxels read per
     // sample, which cuts the ray-march cost ~2-4x for a still-coherent
     // preview frame. The interaction-idle timer triggers a full-res
     // render ~180 ms after motion stops.
-    if (_interactive) {
+    if (ctx.interactive) {
         sp.level = std::min(sp.level + 1, std::max(0, numLevels - 1));
     }
-    sp.method = _samplingMethod;
+    sp.method = ctx.samplingMethod;
 
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
         cv::Vec3f vx = plane->basisX();
         cv::Vec3f vy = plane->basisY();
         cv::Vec3f n = plane->normal(cv::Vec3f(0, 0, 0));
 
-        float halfW = static_cast<float>(fbW) * 0.5f / _camera.scale;
-        float halfH = static_cast<float>(fbH) * 0.5f / _camera.scale;
+        float halfW = static_cast<float>(fbW) * 0.5f / ctx.camera.scale;
+        float halfH = static_cast<float>(fbH) * 0.5f / ctx.camera.scale;
 
-        cv::Vec3f origin = vx * (_camera.surfacePtr[0] - halfW)
-                         + vy * (_camera.surfacePtr[1] - halfH)
-                         + plane->origin() + n * _camera.zOff;
-        cv::Vec3f vx_step = vx / _camera.scale;
-        cv::Vec3f vy_step = vy / _camera.scale;
+        cv::Vec3f origin = vx * (ctx.camera.surfacePtr[0] - halfW)
+                         + vy * (ctx.camera.surfacePtr[1] - halfH)
+                         + plane->origin() + n * ctx.camera.zOff;
+        cv::Vec3f vx_step = vx / ctx.camera.scale;
+        cv::Vec3f vy_step = vy / ctx.camera.scale;
 
         int numLayers = 1, zStart = 0;
         float zStep = 1.0f;
         const cv::Vec3f* pNormal = nullptr;
         std::string method;
-        if (_compositeSettings.planeEnabled) {
-            const int front = _compositeSettings.planeLayersFront;
-            const int behind = _compositeSettings.planeLayersBehind;
+        if (ctx.compositeSettings.planeEnabled) {
+            const int front = ctx.compositeSettings.planeLayersFront;
+            const int behind = ctx.compositeSettings.planeLayersBehind;
             numLayers = front + behind + 1;
             zStart = -behind;
-            zStep = _compositeSettings.reverseDirection ? -1.0f : 1.0f;
+            zStep = ctx.compositeSettings.reverseDirection ? -1.0f : 1.0f;
             pNormal = &n;
-            method = _compositeSettings.params.method;
+            method = ctx.compositeSettings.params.method;
         } else {
             pNormal = &n; // ignored for numLayers=1
         }
@@ -686,9 +719,9 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb)
         // Composite averages ~11 layers — the averaging is itself a low-pass,
         // so per-layer Nearest matches Trilinear visually at ~8x the speed.
         vc::Sampling sampleMethod = (numLayers > 1) ? vc::Sampling::Nearest
-                                                    : _samplingMethod;
+                                                    : ctx.samplingMethod;
         sampleAdaptiveARGB32(
-            fbBits, fbStride, _volume->tieredCache(),
+            fbBits, fbStride, ctx.volume->tieredCache(),
             sp.level, numLevels,
             nullptr, &origin, &vx_step, &vy_step,
             nullptr, pNormal,
@@ -706,10 +739,14 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb)
         // zoom expose curvature drift on a non-planar surface. Instead build
         // the base (unoffset) coords here and apply zOff as a single rigid
         // world-space translation in _zOffWorldDir below.
-        cv::Vec3f offset(_camera.surfacePtr[0] * _camera.scale - float(fbW) * 0.5f,
-                         _camera.surfacePtr[1] * _camera.scale - float(fbH) * 0.5f,
+        cv::Vec3f offset(ctx.camera.surfacePtr[0] * ctx.camera.scale - float(fbW) * 0.5f,
+                         ctx.camera.surfacePtr[1] * ctx.camera.scale - float(fbH) * 0.5f,
                          0.0f);
-        const bool wantComposite = _compositeSettings.enabled;
+        const bool wantComposite = ctx.compositeSettings.enabled;
+        // Use the snapshot of _zOffWorldDir taken on the main thread.
+        // Updates discovered here are posted back to main via
+        // invokeMethod (see below) so the write never crosses threads.
+        cv::Vec3f zOffWorldDir = ctx.zOffWorldDir;
         // Always request normals so shift+scroll can sample the view-center
         // normal without a separate gen pass.
         const bool cacheHit =
@@ -717,23 +754,23 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb)
             && _genCacheSurfKey == surf.get()
             && _genCacheFbW == fbW
             && _genCacheFbH == fbH
-            && _genCacheScale == _camera.scale
+            && _genCacheScale == ctx.camera.scale
             && _genCacheOffset == offset
             && _genCacheWantComposite == wantComposite
-            && _genCacheZOff == _camera.zOff
-            && _genCacheZOffDir == _zOffWorldDir
+            && _genCacheZOff == ctx.camera.zOff
+            && _genCacheZOffDir == zOffWorldDir
             && !_genCoords.empty();
         if (!cacheHit) {
             surf->gen(&_genCoords, &_genNormals,
                       cv::Size(fbW, fbH), cv::Vec3f(0, 0, 0),
-                      _camera.scale, offset);
+                      ctx.camera.scale, offset);
             // Lazy-capture the translation direction when zOff was set by a
             // path that didn't populate _zOffWorldDir (adjustSurfaceOffset
             // via Ctrl+./Ctrl+, shortcuts, or any other non-Shift-scroll
             // source). Without this, those offsets would be silent no-ops
             // until the user first Shift-scrolled.
-            if (_camera.zOff != 0.0f &&
-                _zOffWorldDir[0] == 0.0f && _zOffWorldDir[1] == 0.0f && _zOffWorldDir[2] == 0.0f &&
+            if (ctx.camera.zOff != 0.0f &&
+                zOffWorldDir[0] == 0.0f && zOffWorldDir[1] == 0.0f && zOffWorldDir[2] == 0.0f &&
                 !_genNormals.empty()) {
                 const int cy = _genNormals.rows / 2;
                 const int cx = _genNormals.cols / 2;
@@ -741,17 +778,30 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb)
                 if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2])) {
                     const float len = static_cast<float>(cv::norm(n));
                     if (len > 1e-6f) {
-                        _zOffWorldDir = n / len;
+                        zOffWorldDir = n / len;
+                        // Publish the discovered direction back to main so
+                        // subsequent renders (and onZoom's own capture
+                        // branch) see it. Guarded "still-zero" check on
+                        // main avoids stomping a user-driven update that
+                        // raced with this worker.
+                        cv::Vec3f dir = zOffWorldDir;
+                        QMetaObject::invokeMethod(this, [this, dir]() {
+                            if (_zOffWorldDir[0] == 0.0f
+                             && _zOffWorldDir[1] == 0.0f
+                             && _zOffWorldDir[2] == 0.0f) {
+                                _zOffWorldDir = dir;
+                            }
+                        }, Qt::QueuedConnection);
                     }
                 }
             }
             // Apply z-offset as a rigid world-space translation using the
             // cached direction. On cache hits _genCoords is already shifted
             // — avoid double-applying by only running this on cache miss.
-            if (_camera.zOff != 0.0f &&
-                (_zOffWorldDir[0] != 0.0f || _zOffWorldDir[1] != 0.0f || _zOffWorldDir[2] != 0.0f) &&
+            if (ctx.camera.zOff != 0.0f &&
+                (zOffWorldDir[0] != 0.0f || zOffWorldDir[1] != 0.0f || zOffWorldDir[2] != 0.0f) &&
                 !_genCoords.empty()) {
-                const cv::Vec3f tr = _zOffWorldDir * _camera.zOff;
+                const cv::Vec3f tr = zOffWorldDir * ctx.camera.zOff;
                 const int rows = _genCoords.rows;
                 const int cols = _genCoords.cols;
                 for (int y = 0; y < rows; ++y) {
@@ -767,11 +817,11 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb)
             _genCacheSurfKey = surf.get();
             _genCacheFbW = fbW;
             _genCacheFbH = fbH;
-            _genCacheScale = _camera.scale;
+            _genCacheScale = ctx.camera.scale;
             _genCacheOffset = offset;
             _genCacheWantComposite = wantComposite;
-            _genCacheZOff = _camera.zOff;
-            _genCacheZOffDir = _zOffWorldDir;
+            _genCacheZOff = ctx.camera.zOff;
+            _genCacheZOffDir = zOffWorldDir;
             _genCacheDirty = false;
         }
         cv::Mat_<cv::Vec3f>& coords = _genCoords;
@@ -783,18 +833,18 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb)
             const cv::Mat_<cv::Vec3f>* pNormals = nullptr;
             std::string method;
             if (wantComposite && !normals.empty()) {
-                const int front = _compositeSettings.layersFront;
-                const int behind = _compositeSettings.layersBehind;
+                const int front = ctx.compositeSettings.layersFront;
+                const int behind = ctx.compositeSettings.layersBehind;
                 numLayers = front + behind + 1;
                 zStart = -behind;
-                zStep = _compositeSettings.reverseDirection ? -1.0f : 1.0f;
+                zStep = ctx.compositeSettings.reverseDirection ? -1.0f : 1.0f;
                 pNormals = &normals;
-                method = _compositeSettings.params.method;
+                method = ctx.compositeSettings.params.method;
             }
             vc::Sampling sampleMethod = (numLayers > 1) ? vc::Sampling::Nearest
-                                                        : _samplingMethod;
+                                                        : ctx.samplingMethod;
             sampleAdaptiveARGB32(
-                fbBits, fbStride, _volume->tieredCache(),
+                fbBits, fbStride, ctx.volume->tieredCache(),
                 sp.level, numLevels,
                 &coords, nullptr, nullptr, nullptr,
                 pNormals, nullptr,
@@ -850,10 +900,10 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb)
             std::array<uint32_t, 256> stretchedLut;
             if (hi > lo) {
                 vc::buildWindowLevelColormapLut(stretchedLut,
-                    float(lo), float(hi), _baseColormapId);
+                    float(lo), float(hi), ctx.baseColormapId);
             } else {
                 vc::buildWindowLevelColormapLut(stretchedLut,
-                    _windowLow, _windowHigh, _baseColormapId);
+                    ctx.windowLow, ctx.windowHigh, ctx.baseColormapId);
             }
             applyIsoCutoff(stretchedLut, isoCutoff);
             for (int y = 0; y < fbH; y++) {
@@ -866,7 +916,7 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb)
             _cachedLut = stretchedLut;
             _cachedWindowLow = float(lo);
             _cachedWindowHigh = float(hi);
-            _cachedColormapId = _baseColormapId;
+            _cachedColormapId = ctx.baseColormapId;
             _cachedIsoCutoff = isoCutoff;
         }
         if (hi > lo) {
@@ -887,9 +937,9 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb)
             uint8_t* dst = gray.ptr<uint8_t>(y);
             for (int x = 0; x < fbW; x++) dst[x] = uint8_t(row[x] & 0xFFu);
         }
-        if (_compositeSettings.postClaheEnabled) {
-            const int tile = std::max(1, _compositeSettings.postClaheTileSize);
-            const double clip = std::max(0.01, double(_compositeSettings.postClaheClipLimit));
+        if (ctx.compositeSettings.postClaheEnabled) {
+            const int tile = std::max(1, ctx.compositeSettings.postClaheTileSize);
+            const double clip = std::max(0.01, double(ctx.compositeSettings.postClaheClipLimit));
             // Cache the CLAHE instance: it allocates internal histogram
             // buffers on construction. Rebuild only when the parameters
             // actually change.
@@ -953,9 +1003,9 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb)
             // Cache the built LUT: the identity-window LUT depends only on
             // _baseColormapId, so we rebuild only when the colormap actually
             // changes instead of once per frame.
-            if (!_deferredCmapValid || _deferredCmapId != _baseColormapId) {
-                vc::buildWindowLevelColormapLut(_deferredCmapLut, 0.0f, 255.0f, _baseColormapId);
-                _deferredCmapId = _baseColormapId;
+            if (!_deferredCmapValid || _deferredCmapId != ctx.baseColormapId) {
+                vc::buildWindowLevelColormapLut(_deferredCmapLut, 0.0f, 255.0f, ctx.baseColormapId);
+                _deferredCmapId = ctx.baseColormapId;
                 _deferredCmapValid = true;
             }
             const auto& cmapLut = _deferredCmapLut;

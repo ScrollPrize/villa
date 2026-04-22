@@ -273,7 +273,32 @@ private:
     // event can keep reading _framebuffer. When the worker finishes it
     // posts finishRenderOnMainThread() via QueuedConnection — that slot
     // swaps the buffers and performs the main-thread-only scene updates.
-    void renderIntoFramebuffer(QImage& fb);
+    //
+    // RenderContext is the immutable snapshot of viewer state that the
+    // worker reads. The body of renderIntoFramebuffer() must NEVER touch
+    // `_camera` / `_compositeSettings` / `_windowLow` / etc. directly —
+    // those are mutated on the main thread by input handlers and
+    // settings setters; reading them on a worker thread without a lock
+    // is a data race. Everything the worker needs from mutable state is
+    // copied into RenderContext in submitRender() before dispatch.
+    struct RenderContext {
+        AdaptiveCamera camera;
+        CompositeRenderSettings compositeSettings;
+        vc::Sampling samplingMethod;
+        bool interactive = false;
+        float windowLow = 0.0f;
+        float windowHigh = 255.0f;
+        std::string baseColormapId;
+        bool highlightDownscaled = false;
+        cv::Vec3f zOffWorldDir{0.0f, 0.0f, 0.0f};
+        // Strong references so the worker can't race against object
+        // teardown: _surfWeak / _volume could otherwise be reset on main
+        // mid-render. shared_ptr captures here keep them alive for the
+        // duration of the render.
+        std::shared_ptr<Surface> surf;
+        std::shared_ptr<Volume> volume;
+    };
+    void renderIntoFramebuffer(QImage& fb, const RenderContext& ctx);
     Q_INVOKABLE void finishRenderOnMainThread();
 
     // Framebuffer coordinate conversions

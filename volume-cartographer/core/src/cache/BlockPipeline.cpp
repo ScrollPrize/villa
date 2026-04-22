@@ -573,10 +573,20 @@ BlockPipeline::BlockPipeline(
         // Stage compressed bytes for decodePool_ so the loader worker can
         // immediately serve the next I/O request while CPU decode proceeds
         // in parallel. Decode concurrency is bounded by decodePool_ size.
+        // Replacing an existing entry must decrement its size from the
+        // atomic first — otherwise repeated loader re-queues of the same
+        // key leak the counter upward and eventually stall every loader
+        // worker on the backpressure CV with a map that's actually empty.
         const size_t compressedSize = compressed.size();
         {
             std::lock_guard stage(decodeStagingMutex_);
-            decodeStaging_[key] = std::move(compressed);
+            auto [it, inserted] = decodeStaging_.try_emplace(
+                key, std::vector<uint8_t>{});
+            if (!inserted) {
+                decodeStagingBytesAtomic_.fetch_sub(
+                    it->second.size(), std::memory_order_relaxed);
+            }
+            it->second = std::move(compressed);
         }
         decodeStagingBytesAtomic_.fetch_add(compressedSize,
                                             std::memory_order_relaxed);
