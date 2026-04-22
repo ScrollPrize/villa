@@ -476,6 +476,37 @@ def run_preprocess(
 # OME-Zarr helpers
 # ---------------------------------------------------------------------------
 
+_input_meta_cache: dict[str, tuple[tuple[int, ...], str]] = {}
+
+
+def _get_input_meta(zarr_path: str) -> tuple[tuple[int, ...], str]:
+	"""Read chunk sizes and dimension_separator from a zarr array's .zarray."""
+	if zarr_path in _input_meta_cache:
+		return _input_meta_cache[zarr_path]
+	import json as _json
+	zarray_file = os.path.join(zarr_path, ".zarray")
+	with open(zarray_file) as f:
+		meta = _json.load(f)
+	chunks = tuple(meta["chunks"])
+	sep = meta.get("dimension_separator", ".")
+	_input_meta_cache[zarr_path] = (chunks, sep)
+	return chunks, sep
+
+
+def _input_has_chunks(zarr_path: str, z0: int, z1: int, y0: int, y1: int,
+					  x0: int, x1: int) -> bool:
+	"""Check if any chunk files exist in the zarr array for the given region."""
+	chunks, sep = _get_input_meta(zarr_path)
+	cz, cy, cx = chunks[0], chunks[min(1, len(chunks)-1)], chunks[min(2, len(chunks)-1)]
+	for iz in range(max(0, z0 // cz), (z1 + cz - 1) // cz):
+		for iy in range(max(0, y0 // cy), (y1 + cy - 1) // cy):
+			for ix in range(max(0, x0 // cx), (x1 + cx - 1) // cx):
+				path = _zarr_chunk_path(zarr_path, sep, iz, iy, ix)
+				if os.path.isfile(path):
+					return True
+	return False
+
+
 def _invalidate_pyramid_chunks(omezarr_path: str, data_level: int, n_levels: int,
 							   iz: int, iy: int, ix: int) -> None:
 	"""Delete coarser pyramid chunks that depend on data chunk (iz, iy, ix)."""
@@ -1105,6 +1136,10 @@ def _compute_pred_dt_slab(
 			for cx0 in range(pred_x0, pred_x1, edt_chunk):
 				cx1 = min(pred_x1, cx0 + edt_chunk)
 				if _out_chunk_exists(cz0, cy0, cx0):
+					skipped += 1
+					continue
+				# Skip if pred zarr has no input data in this region
+				if not _input_has_chunks(pred_path, cz0, cz1, cy0, cy1, cx0, cx1):
 					skipped += 1
 					continue
 				work.append((cz0, cz1, cy0, cy1, cx0, cx1))
@@ -2339,9 +2374,22 @@ def run_preprocess_3d(
 	out_end_f = b_f + cos_wz   # fine accumulator index where output ends
 	out_end_c = b_c + other_wz
 
+	# Input zarr path for chunk existence checks (resolve level path)
+	_input_zarr_dir = str(Path(str(input_path).rstrip("/")).resolve())
+
 	def _is_tile_done(tz, ty, tx):
-		"""Check if all output chunks this tile contributes to already exist."""
+		"""Check if all output chunks exist OR no input chunks in tile region."""
 		ts = tile_size
+		# Check if input has any data in this tile's region
+		# Tile reads from input at [tz + z0 - border, tz + z0 + ts - border]
+		in_z0 = max(0, tz + z0 - pad0)
+		in_z1 = min(sh[0], tz + z0 - pad0 + ts)
+		in_y0 = max(0, ty + y0 - pad0)
+		in_y1 = min(sh[1], ty + y0 - pad0 + ts)
+		in_x0 = max(0, tx + x0 - pad0)
+		in_x1 = min(sh[2], tx + x0 - pad0 + ts)
+		if not _input_has_chunks(_input_zarr_dir, in_z0, in_z1, in_y0, in_y1, in_x0, in_x1):
+			return True  # no input data → skip tile
 		# Fine (cos) output range in OME-Zarr coords
 		fz0 = max(cos_oz0, tz // sd_fine - b_f + cos_oz0)
 		fz1 = min(cos_oz1, (tz + ts) // sd_fine - b_f + cos_oz0)
@@ -2413,6 +2461,14 @@ def run_preprocess_3d(
 								cy = cos_oy0 + dy
 								cx = cos_ox0 + dx
 								if _omezarr_chunk_exists(cos_omezarr_path, cos_level, cz, cy, cx, oc):
+									n_skip_cos += 1
+									continue
+								# Skip if input has no data in this output chunk's region
+								src_z0 = cz * cos_sd; src_z1 = (cz + oc) * cos_sd
+								src_y0 = cy * cos_sd; src_y1 = (cy + oc) * cos_sd
+								src_x0 = cx * cos_sd; src_x1 = (cx + oc) * cos_sd
+								if not _input_has_chunks(_input_zarr_dir,
+									src_z0, src_z1, src_y0, src_y1, src_x0, src_x1):
 									n_skip_cos += 1
 									continue
 								# Compute slab lazily on first needed chunk
@@ -2519,6 +2575,14 @@ def run_preprocess_3d(
 								cx = other_ox0 + dx
 								# Check all 3 channels (gm, nx, ny) — if gm exists, assume all do
 								if _omezarr_chunk_exists(gm_omezarr_path, other_level, cz, cy, cx, oc):
+									n_skip_c += 1
+									continue
+								# Skip if input has no data in this output chunk's region
+								src_z0c = cz * other_sd; src_z1c = (cz + oc) * other_sd
+								src_y0c = cy * other_sd; src_y1c = (cy + oc) * other_sd
+								src_x0c = cx * other_sd; src_x1c = (cx + oc) * other_sd
+								if not _input_has_chunks(_input_zarr_dir,
+									src_z0c, src_z1c, src_y0c, src_y1c, src_x0c, src_x1c):
 									n_skip_c += 1
 									continue
 								if slab is None:
