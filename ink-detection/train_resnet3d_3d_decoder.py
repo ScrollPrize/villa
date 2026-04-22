@@ -55,6 +55,7 @@ from scipy import ndimage
 from models.resnetall import generate_model
 
 from data import *
+from train_resnet3d_lib.script_utils import build_tile_cache_dir
 class CFG:
     # ============== comp exp name =============
     comp_name = 'vesuvius'
@@ -196,6 +197,15 @@ cfg_init(CFG)
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+TRAIN_FRAGMENT_IDS = (
+    'l5_0_crop', 'l2_0_crop', 'w030_202601301912', 'w029_202601261946', 'w028_20260115221',
+    '500p2a', '658', '-1', 'l_2', 'l_3', 'l_4', 'l_6', 'w00',
+    'auto_grown_20260220174252405', 'auto_grown_20260220144552896', '46527_2um_try2',
+    '20250910185200', 'Man5outer', 'auto_grown_20250918234353791',
+    'auto_grown_20250919055754487_inp_hr', 'auto_grown_20250919061352722_inp_hr',
+    'w00_sean_240226_front', 'auto_grown_20251124-w020', 'auto_grown_20260226121302716_abf',
+)
+
 def read_image_mask(fragment_id,start_idx=15,end_idx=45):
 
     images = []
@@ -250,11 +260,90 @@ def read_image_mask(fragment_id,start_idx=15,end_idx=45):
     assert images.shape[0]==mask.shape[0]
     return images, mask,fragment_mask
 
+
+def get_training_segment_kwargs(fragment_id):
+    kwargs = dict(
+        segment_id=fragment_id,
+        layer_range=(1, 63),
+        reverse_layers=False,
+        base_path='2um_dataset',
+        tile_size=CFG.tile_size,
+    )
+
+    if fragment_id == 'frag4':
+        kwargs.update(layer_range=(22, 46), base_path='train_scrolls', xyz_scale=2)
+    elif 'Frag' in fragment_id or fragment_id in [
+        '20241108120732', '20241108111522', '20241108115232', '20241113090990',
+        '20241113080880', '20241113070770', 'z_dbg_gen_00668_inp_hr',
+    ]:
+        kwargs.update(layer_range=(24, 40), base_path='train_scrolls', xyz_scale=3.9007078344930277)
+    elif '08312025_l2_0' in fragment_id:
+        kwargs.update(layer_range=(8, 24), base_path='0139_traces', xyz_scale=3.9007078344930277)
+    elif fragment_id in [
+        'l2_0_crop', 'l5_0_crop', 'auto_grown_20251124_w025-sm-sb', 'auto_grown_20251201_w027-sm',
+        'w030_202601301912', 'w028_20260115221', 'w025_2025083102_crop', 'w012_2025010815',
+        'w017_2025010815', 'w016_2025010815', 'w029_202601261946',
+    ]:
+        kwargs.update(base_path='2um_dataset/0139_2um')
+    elif fragment_id in ['auto_grown_20251218010446110-w0', 'ortho2']:
+        kwargs.update(layer_range=(32, 94), base_path='PherMANBp_2um')
+    elif fragment_id in ['20240618142020', '20240618142022_flat']:
+        kwargs.update(base_path='s3_2um')
+    elif fragment_id in ['auto_grown_20260220174252405', 'auto_grown_20260220144552896', 'w00']:
+        kwargs.update(base_path='2um_dataset/841_2um')
+    elif fragment_id in ['46527_2um_try2']:
+        kwargs.update(reverse_layers=True, base_path='2um_dataset/814_2um')
+    elif fragment_id in ['500p2a', '658']:
+        kwargs.update(reverse_layers=True)
+    elif fragment_id in ['20250910185200']:
+        kwargs.update(layer_range=(33, 95))
+    elif fragment_id in [
+        'auto_grown_20250918234353791',
+        'auto_grown_20250919055754487_inp_hr',
+        'auto_grown_20250919061352722_inp_hr',
+    ]:
+        kwargs.update(base_path='2um_dataset/9b_2um')
+    elif fragment_id in ['w00_sean_240226_front']:
+        kwargs.update(reverse_layers=True, base_path='2um_dataset/manb_2um')
+    elif fragment_id in ['auto_grown_20251124-w020']:
+        kwargs.update(reverse_layers=True, base_path='2um_dataset/1451_2um')
+    elif fragment_id in ['auto_grown_20260226121302716_abf']:
+        kwargs.update(reverse_layers=True, base_path='2um_dataset/814_2um')
+    elif fragment_id in ['auto_grown_20250926162450723']:
+        kwargs.update(base_path='841')
+    elif fragment_id in ['l2_0']:
+        kwargs.update(base_path='2um_dataset/0139_2um')
+    elif fragment_id in ['l_2', 'l_3', 'l_4', 'l_6', 'l_1', 'l_7']:
+        kwargs.update(base_path='2um_dataset/s4_2um')
+    elif fragment_id in ['-1', '-2']:
+        kwargs.update(base_path='2um_dataset')
+    elif fragment_id == 'Man5outer':
+        kwargs.update(reverse_layers=True, base_path='Man5')
+    elif fragment_id in ['2um_44kev_0.22m', '2um_43kev_0.22m', '2um_62kev_0.22m', '2um_77kev_0.35m']:
+        kwargs.update(layer_range=(2, 64), reverse_layers=True, base_path='front_multi_energy')
+
+    return kwargs
+
+
+def get_training_tile_cache_context():
+    return {
+        'cache_format_version': 1,
+        'valid_id': CFG.valid_id,
+        'size': CFG.size,
+        'tile_size': CFG.tile_size,
+        'stride': CFG.stride,
+        'in_chans': CFG.in_chans,
+        'fragments': [get_training_segment_kwargs(fragment_id) for fragment_id in TRAIN_FRAGMENT_IDS],
+    }
+
+
+def _cache_file_has_aligned_size(path, item_bytes):
+    return os.path.exists(path) and os.path.getsize(path) > 0 and os.path.getsize(path) % item_bytes == 0
+
 def get_train_valid_dataset():
     valid_xyxys = []
     # Stream tiles to disk to avoid OOM with many segments
-    _cache = '/tmp/vesuvius_tile_cache'
-    os.makedirs(_cache, exist_ok=True)
+    _cache = build_tile_cache_dir('/tmp/vesuvius_tile_cache', get_training_tile_cache_context())
 
     _tile_shape = (CFG.size, CFG.size, CFG.in_chans)
     _mask_shape = (CFG.size, CFG.size, 1)
@@ -263,215 +352,38 @@ def get_train_valid_dataset():
 
     # Reuse existing cache if files are present and non-empty
     _tr_img_path = f'{_cache}/train_img.bin'
+    _tr_msk_path = f'{_cache}/train_mask.bin'
     _va_img_path = f'{_cache}/valid_img.bin'
+    _va_msk_path = f'{_cache}/valid_mask.bin'
     _xyxys_path = f'{_cache}/valid_xyxys.npy'
-    if (os.path.exists(_tr_img_path) and os.path.getsize(_tr_img_path) > 0 and
-        os.path.exists(_va_img_path) and os.path.getsize(_va_img_path) > 0 and
+    if (_cache_file_has_aligned_size(_tr_img_path, _tile_bytes) and
+        _cache_file_has_aligned_size(_tr_msk_path, _mask_bytes) and
+        _cache_file_has_aligned_size(_va_img_path, _tile_bytes) and
+        _cache_file_has_aligned_size(_va_msk_path, _mask_bytes) and
         os.path.exists(_xyxys_path)):
         _n_train = os.path.getsize(_tr_img_path) // _tile_bytes
         _n_valid = os.path.getsize(_va_img_path) // _tile_bytes
-        valid_xyxys = np.load(_xyxys_path).tolist()
-        print(f'Reusing tile cache: {_n_train} train, {_n_valid} valid tiles', flush=True)
-        train_images = np.memmap(_tr_img_path, dtype=np.uint8, mode='r', shape=(_n_train, *_tile_shape))
-        train_masks = np.memmap(f'{_cache}/train_mask.bin', dtype=np.float32, mode='r', shape=(_n_train, *_mask_shape))
-        valid_images = np.memmap(_va_img_path, dtype=np.uint8, mode='r', shape=(_n_valid, *_tile_shape))
-        valid_masks = np.memmap(f'{_cache}/valid_mask.bin', dtype=np.float32, mode='r', shape=(_n_valid, *_mask_shape))
-        return train_images, train_masks, valid_images, valid_masks, valid_xyxys
+        valid_xyxys = np.load(_xyxys_path, allow_pickle=False).tolist()
+        if (_n_train == os.path.getsize(_tr_msk_path) // _mask_bytes and
+            _n_valid == os.path.getsize(_va_msk_path) // _mask_bytes and
+            len(valid_xyxys) == _n_valid):
+            print(f'Reusing tile cache {_cache}: {_n_train} train, {_n_valid} valid tiles', flush=True)
+            train_images = np.memmap(_tr_img_path, dtype=np.uint8, mode='r', shape=(_n_train, *_tile_shape))
+            train_masks = np.memmap(_tr_msk_path, dtype=np.float32, mode='r', shape=(_n_train, *_mask_shape))
+            valid_images = np.memmap(_va_img_path, dtype=np.uint8, mode='r', shape=(_n_valid, *_tile_shape))
+            valid_masks = np.memmap(_va_msk_path, dtype=np.float32, mode='r', shape=(_n_valid, *_mask_shape))
+            return train_images, train_masks, valid_images, valid_masks, valid_xyxys
+        print(f'Ignoring incomplete tile cache at {_cache}', flush=True)
 
     _tr_img_f = open(_tr_img_path, 'wb')
-    _tr_msk_f = open(f'{_cache}/train_mask.bin', 'wb')
+    _tr_msk_f = open(_tr_msk_path, 'wb')
     _va_img_f = open(_va_img_path, 'wb')
-    _va_msk_f = open(f'{_cache}/valid_mask.bin', 'wb')
+    _va_msk_f = open(_va_msk_path, 'wb')
     _n_train = 0
     _n_valid = 0
-    for fragment_id in ['l5_0_crop','l2_0_crop','w030_202601301912','w029_202601261946','w028_20260115221','500p2a','658','-1','l_2','l_3','l_4','l_6','w00','auto_grown_20260220174252405','auto_grown_20260220144552896','46527_2um_try2','20250910185200','Man5outer','auto_grown_20250918234353791','auto_grown_20250919055754487_inp_hr','auto_grown_20250919061352722_inp_hr','w00_sean_240226_front','auto_grown_20251124-w020','auto_grown_20260226121302716_abf']:
+    for fragment_id in TRAIN_FRAGMENT_IDS:
         print('reading ',fragment_id)
-        if fragment_id=='frag4':
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(22,46),
-                    reverse_layers=False,
-                    base_path='train_scrolls',
-                    tile_size=CFG.tile_size,
-                    xyz_scale=2,
-                           )
-        elif 'Frag' in fragment_id or fragment_id in ['20241108120732','20241108111522','20241108115232','20241113090990','20241113080880','20241113070770','z_dbg_gen_00668_inp_hr']:
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(24,40),
-                    reverse_layers=False,
-                    base_path='train_scrolls',
-                    tile_size=CFG.tile_size,
-                    xyz_scale=3.9007078344930277,
-                           )
-        elif '08312025_l2_0' in fragment_id:
-            segment=Segment(
-                        segment_id=fragment_id,
-                            layer_range=(8,24),
-                            reverse_layers=False,
-                            base_path='0139_traces',
-                            tile_size=CFG.tile_size,
-                            xyz_scale=3.9007078344930277,
-                                   )
-        elif fragment_id in ['l2_0_crop','l5_0_crop','auto_grown_20251124_w025-sm-sb','auto_grown_20251201_w027-sm','w030_202601301912','w028_20260115221','w025_2025083102_crop','w012_2025010815','w017_2025010815','w025_2025083102_crop','w016_2025010815','w029_202601261946'] :
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(1,63),
-                    reverse_layers=False,
-                    base_path='2um_dataset/0139_2um',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=.25,
-                           )
-        elif fragment_id in ['auto_grown_20251218010446110-w0','ortho2'] :
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(32,94),
-                    reverse_layers=False,
-                    base_path='PherMANBp_2um',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=.25,
-                           )
-        elif fragment_id in ['20240618142020','20240618142022_flat'] :
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(1,63),
-                    reverse_layers=False,
-                    base_path='s3_2um',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=.25,
-                           )
-        elif fragment_id in ['auto_grown_20260220174252405','auto_grown_20260220144552896','w00'] :
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(1,63),
-                    reverse_layers=False,
-                    base_path='2um_dataset/841_2um',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=.25,
-                           )
-        elif fragment_id in ['46527_2um_try2'] :
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(1,63),
-                    reverse_layers=True,
-                    base_path='2um_dataset/814_2um',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=.25,
-                           )
-        elif fragment_id in ['500p2a','658'] :
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(1,63),
-                    reverse_layers=True,
-                    base_path='2um_dataset',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=.25,
-                           )
-        elif fragment_id in ['20250910185200'] :
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(33,95),
-                    reverse_layers=False,
-                    base_path='2um_dataset',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=.258,
-                           )
-        elif fragment_id in ['auto_grown_20250918234353791','auto_grown_20250919055754487_inp_hr','auto_grown_20250919061352722_inp_hr'] :
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(1,63),
-                    reverse_layers=False,
-                    base_path='2um_dataset/9b_2um',
-                    tile_size=CFG.tile_size,
-                           )
-        elif fragment_id in ['w00_sean_240226_front'] :
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(1,63),
-                    reverse_layers=True,
-                    base_path='2um_dataset/manb_2um',
-                    tile_size=CFG.tile_size,
-                           )
-        elif fragment_id in ['auto_grown_20251124-w020'] :
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(1,63),
-                    reverse_layers=True,
-                    base_path='2um_dataset/1451_2um',
-                    tile_size=CFG.tile_size,
-                           )
-        elif fragment_id in ['auto_grown_20260226121302716_abf'] :
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(1,63),
-                    reverse_layers=True,
-                    base_path='2um_dataset/814_2um',
-                    tile_size=CFG.tile_size,
-                           )
-        elif fragment_id in ['auto_grown_20250926162450723'] :
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(1,63),
-                    reverse_layers=False,
-                    base_path='841',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=.258,
-                           )
-        elif fragment_id in ['l2_0'] :
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(1,63),
-                    reverse_layers=False,
-                    base_path='2um_dataset/0139_2um',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=.258,
-                           )
-
-        elif fragment_id in ['l_2','l_3','l_4','l_6','l_1','l_7'] :
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(1,63),
-                    reverse_layers=False,
-                    base_path='2um_dataset/s4_2um',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=.258,
-                           )
-        elif fragment_id in ['-1','-2'] :
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(1,63),
-                    reverse_layers=False,
-                    base_path='2um_dataset',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=.25,
-                           )
-        elif fragment_id == 'Man5outer':
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(1,63),
-                    reverse_layers=True,
-                    base_path='Man5',
-                    tile_size=CFG.tile_size,
-                           )
-        elif fragment_id in ['2um_44kev_0.22m','2um_43kev_0.22m','2um_62kev_0.22m','2um_77kev_0.35m']:
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(2,64),
-                    reverse_layers=True,
-                    base_path='front_multi_energy',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=1.46,
-                           )
-        else:
-
-            segment=Segment(
-                segment_id=fragment_id,
-                    layer_range=(1,63),
-                    reverse_layers=False,
-                    base_path='2um_dataset',
-                    tile_size=CFG.tile_size,
-                    # xyz_scale=.258,
-                           )
+        segment = Segment(**get_training_segment_kwargs(fragment_id))
         image, mask, fragment_mask = segment.get_data()
         print(image.shape, mask.shape, fragment_mask.shape, image.max())
 
@@ -515,13 +427,13 @@ def get_train_valid_dataset():
 
     # Memory-map tile files — workers share pages via OS virtual memory, no CoW duplication
     if _n_train > 0:
-        train_images = np.memmap(f'{_cache}/train_img.bin', dtype=np.uint8, mode='r', shape=(_n_train, *_tile_shape))
-        train_masks = np.memmap(f'{_cache}/train_mask.bin', dtype=np.float32, mode='r', shape=(_n_train, *_mask_shape))
+        train_images = np.memmap(_tr_img_path, dtype=np.uint8, mode='r', shape=(_n_train, *_tile_shape))
+        train_masks = np.memmap(_tr_msk_path, dtype=np.float32, mode='r', shape=(_n_train, *_mask_shape))
     else:
         train_images, train_masks = [], []
     if _n_valid > 0:
-        valid_images = np.memmap(f'{_cache}/valid_img.bin', dtype=np.uint8, mode='r', shape=(_n_valid, *_tile_shape))
-        valid_masks = np.memmap(f'{_cache}/valid_mask.bin', dtype=np.float32, mode='r', shape=(_n_valid, *_mask_shape))
+        valid_images = np.memmap(_va_img_path, dtype=np.uint8, mode='r', shape=(_n_valid, *_tile_shape))
+        valid_masks = np.memmap(_va_msk_path, dtype=np.float32, mode='r', shape=(_n_valid, *_mask_shape))
     else:
         valid_images, valid_masks = [], []
     print(f'Total: {_n_train} train, {_n_valid} valid tiles (disk-backed memmap)', flush=True)

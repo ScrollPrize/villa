@@ -52,6 +52,7 @@ from profiling import (
     dir_size_bytes,
     scoped_timer,
 )
+from runtime_contracts import normalize_model_type, validate_image_role_for_step
 
 # WebKnossos imports
 try:
@@ -84,7 +85,7 @@ class Inputs:
     surface_volume_zarr: str = ""  # Path to pre-created surface volume zarr
     chunk_size: int = 1024  # Chunk size for zarr array creation (SURFACE_VOLUME_CHUNK_SIZE)
     use_zarr_compression: bool = False  # Enable/disable zarr compression
-    model_type: str = "timesformer"  # "timesformer" or "resnet3d-50"
+    model_type: str = "timesformer"  # "timesformer", "resnet3d-50", or "resnet3d-152-3d-decoder"
     tile_size: int = 64  # Tile size for sliding window inference (size will be set to same value)
     stride: int = 16  # Stride for sliding window
     batch_size: int = 256  # Batch size for inference
@@ -121,11 +122,7 @@ def parse_env() -> Inputs:
         use_zarr_compression = os.getenv("USE_ZARR_COMPRESSION", "false").lower() == "true"
 
         # Model type parameter
-        model_type = os.getenv("MODEL_TYPE", "timesformer").strip().lower()
-
-        # Validate model_type
-        if model_type not in ("timesformer", "resnet3d-50"):
-            raise ValueError(f"MODEL_TYPE must be 'timesformer' or 'resnet3d-50', got '{model_type}'")
+        model_type = normalize_model_type(os.getenv("MODEL_TYPE", "timesformer"))
 
         # Inference configuration parameters
         tile_size = int(os.getenv("TILE_SIZE", "64"))
@@ -169,6 +166,7 @@ def parse_env() -> Inputs:
         # Validate step parameter
         if step not in ("prepare", "inference", "reduce", "aggregate-profiling"):
             raise ValueError(f"STEP must be 'prepare', 'inference', 'reduce', or 'aggregate-profiling', got '{step}'")
+        validate_image_role_for_step(step, os.getenv("IMAGE_ROLE", ""))
 
         # Validate NUM_PARTS upfront
         if num_parts < 1:
@@ -719,6 +717,9 @@ def run_inference_step(inputs: Inputs, profiler: Optional[WorkflowProfiler] = No
     elif inputs.model_type == "resnet3d-50":
         from model_resnet3d import load_model
         logger.info(f"Using ResNet3D-50 model")
+    elif inputs.model_type == "resnet3d-152-3d-decoder":
+        from model_resnet3d_3d_decoder import load_model
+        logger.info("Using ResNet3D-152 3D decoder model")
     else:
         raise ValueError(f"Unknown model_type: {inputs.model_type}")
 

@@ -39,6 +39,7 @@ from torch.utils.data import DataLoader, Dataset
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from models.resnetall import generate_model
+from train_resnet3d_lib.script_utils import resolve_fragment_base_path
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 class CFG:
@@ -77,76 +78,35 @@ class CFG:
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+DEFAULT_INFERENCE_BASE_PATHS = (
+    '1451_2um',
+    's4_2um',
+    'PherMANBp_2um',
+    '841_2um',
+    '814_2um',
+    'Man5',
+)
+
 
 def get_img_splits(fragment_id, reverse_layers=False, base_path=None):
     """Load a segment and tile it for inference."""
     images = []
     xyxys = []
 
-    if base_path is not None:
-        segment = Segment(
-            segment_id=fragment_id,
-            layer_range=(1, 63),
-            reverse_layers=reverse_layers,
-            base_path=base_path,
-            tile_size=CFG.tile_size,
+    if base_path is None:
+        base_path = resolve_fragment_base_path(
+            fragment_id,
+            DEFAULT_INFERENCE_BASE_PATHS,
+            fallback_root='2um_dataset',
         )
-    elif fragment_id in os.listdir('1451_2um'):
-        segment = Segment(
-            segment_id=fragment_id,
-            layer_range=(1, 63),
-            reverse_layers=reverse_layers,
-            base_path='1451_2um',
-            tile_size=CFG.tile_size,
-        )
-    elif fragment_id in os.listdir('s4_2um'):
-        segment = Segment(
-            segment_id=fragment_id,
-            layer_range=(1, 63),
-            reverse_layers=reverse_layers,
-            base_path='s4_2um',
-            tile_size=CFG.tile_size,
-        )
-    elif fragment_id in os.listdir('PherMANBp_2um'):
-        segment = Segment(
-            segment_id=fragment_id,
-            layer_range=(1, 63),
-            reverse_layers=reverse_layers,
-            base_path='PherMANBp_2um',
-            tile_size=CFG.tile_size,
-        )
-    elif fragment_id in os.listdir('841_2um'):
-        segment = Segment(
-            segment_id=fragment_id,
-            layer_range=(1, 63),
-            reverse_layers=reverse_layers,
-            base_path='841_2um',
-            tile_size=CFG.tile_size,
-        )
-    elif fragment_id in os.listdir('814_2um'):
-        segment = Segment(
-            segment_id=fragment_id,
-            layer_range=(1, 63),
-            reverse_layers=reverse_layers,
-            base_path='814_2um',
-            tile_size=CFG.tile_size,
-        )
-    elif fragment_id in os.listdir('Man5'):
-        segment = Segment(
-            segment_id=fragment_id,
-            layer_range=(1, 63),
-            reverse_layers=reverse_layers,
-            base_path='Man5',
-            tile_size=CFG.tile_size,
-        )
-    else:
-        segment = Segment(
-            segment_id=fragment_id,
-            layer_range=(1, 63),
-            reverse_layers=reverse_layers,
-            base_path='2um_dataset',
-            tile_size=CFG.tile_size,
-        )
+
+    segment = Segment(
+        segment_id=fragment_id,
+        layer_range=(1, 63),
+        reverse_layers=reverse_layers,
+        base_path=base_path,
+        tile_size=CFG.tile_size,
+    )
 
     image, _, fragment_mask = segment.get_data()
     del segment  # free Segment internals before potential memmap copy
