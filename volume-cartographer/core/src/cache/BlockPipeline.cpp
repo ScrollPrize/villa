@@ -156,8 +156,35 @@ const std::vector<std::byte>* BlockPipeline::shardBytesFor(
     // Miss — do the disk read outside the cache lock so concurrent hits
     // on other shards aren't blocked behind our I/O.
     statShardMisses_.fetch_add(1, std::memory_order_relaxed);
+    // Gate concurrent whole-shard reads. Each call returns a ~256 MiB
+    // buffer; without the gate, 16×hw loader workers all missing at
+    // once hold tens of GiB of in-flight shard bytes. RAII guard
+    // decrements on every return path.
+    {
+        std::unique_lock lk(inflightShardMutex_);
+        inflightShardCv_.wait(lk, [this] {
+            return shuttingDown_.load(std::memory_order_acquire)
+                || inflightShardReads_ < config_.maxConcurrentShardReads;
+        });
+        if (shuttingDown_.load(std::memory_order_acquire)) return nullptr;
+        ++inflightShardReads_;
+    }
+    struct InflightGuard {
+        BlockPipeline* self;
+        size_t bytes = 0;
+        ~InflightGuard() {
+            self->inflightShardBytes_.fetch_sub(bytes, std::memory_order_relaxed);
+            {
+                std::lock_guard lk(self->inflightShardMutex_);
+                --self->inflightShardReads_;
+            }
+            self->inflightShardCv_.notify_one();
+        }
+    } guard{this};
     auto raw = dz.read_whole_shard(chunkIndices(key));
     if (!raw || raw->empty()) return nullptr;
+    guard.bytes = raw->size();
+    inflightShardBytes_.fetch_add(guard.bytes, std::memory_order_relaxed);
     auto bytes = std::make_shared<std::vector<std::byte>>(std::move(*raw));
 
     std::lock_guard lk(bucket.mutex);
@@ -256,11 +283,14 @@ BlockPipeline::BlockPipeline(
     }())
     , loaderPool_([] {
         unsigned hw = std::thread::hardware_concurrency();
-        // 16× hw: loader is almost entirely pread() io_wait. Observed
-        // disk utilisation was ~1% at 4× — we're leaving most of the
-        // device's queue depth on the table. Each worker's stack is
-        // virtual-only until touched, so going wide is cheap.
-        return hw ? 16 * static_cast<int>(hw) : 128;
+        // 4× hw: was 16× to max out disk queue depth, but read_whole_shard
+        // returns ~256 MiB per call on sharded volumes, so 192 parallel
+        // loader workers could hold tens of GiB of in-flight shard bytes
+        // and push the process into swap on 32 GiB machines. With
+        // maxConcurrentShardReads bounding the big allocations, the extra
+        // worker count is wasted threads — 4× is enough to keep the disk
+        // queue full past the backpressure gate.
+        return hw ? 4 * static_cast<int>(hw) : 32;
     }())
     , decodePool_([] {
         unsigned hw = std::thread::hardware_concurrency();
@@ -339,6 +369,19 @@ BlockPipeline::BlockPipeline(
             return {};
         }
 
+        // Backpressure: wait until encodeStaging_ has room before paying
+        // the network + decode cost. Gating here (vs. after assemble)
+        // means a stalled encoder pool doesn't hold 16 MiB buffers per
+        // blocked downloader worker.
+        {
+            std::unique_lock lk(encodeStagingMutex_);
+            encodeStagingCv_.wait(lk, [this] {
+                return shuttingDown_.load(std::memory_order_acquire)
+                    || encodeStaging_.size() < config_.maxEncodeStagingChunks;
+            });
+            if (shuttingDown_.load(std::memory_order_acquire)) return {};
+        }
+
         // Pull source chunks over the network and assemble a canonical
         // 128³ buffer. Source decode happens here too because the
         // re-chunking needs the voxels; it's a small fraction of the
@@ -402,6 +445,7 @@ BlockPipeline::BlockPipeline(
             decoded = std::move(it->second);
             encodeStaging_.erase(it);
         }
+        encodeStagingCv_.notify_one();
         if (!decoded) return {};
 
         const auto& encoded = encodeCanonicalChunk(*decoded, config_);
@@ -703,6 +747,11 @@ skipPassthrough:
 }
 
 BlockPipeline::~BlockPipeline() {
+    // Release any downloader workers blocked on the backpressure CV so
+    // pool.stop() can actually join them.
+    shuttingDown_.store(true, std::memory_order_release);
+    encodeStagingCv_.notify_all();
+    inflightShardCv_.notify_all();
     // Cancel any in-flight curl requests so workers don't sit inside
     // libcurl waiting for S3 timeouts during shutdown.
     utils::HttpClient::abortAll();
@@ -1164,6 +1213,21 @@ auto BlockPipeline::stats() const -> Stats {
     s.loadPending = loaderPool_.pendingCount();
     s.decodePending = decodePool_.pendingCount();
     s.ioPending = s.downloadPending + s.encodePending + s.loadPending + s.decodePending;
+    {
+        std::lock_guard lk(encodeStagingMutex_);
+        s.encodeStagingChunks = encodeStaging_.size();
+    }
+    {
+        std::lock_guard lk(decodeStagingMutex_);
+        size_t total = 0;
+        for (const auto& [_, v] : decodeStaging_) total += v.size();
+        s.decodeStagingBytes = total;
+    }
+    {
+        std::lock_guard lk(inflightShardMutex_);
+        s.inflightShardReads = inflightShardReads_;
+    }
+    s.inflightShardBytes = inflightShardBytes_.load(std::memory_order_relaxed);
     s.shardHits = statShardHits_.load(std::memory_order_relaxed);
     s.shardMisses = statShardMisses_.load(std::memory_order_relaxed);
     // Global byte count is an atomic so we don't need the per-bucket locks
