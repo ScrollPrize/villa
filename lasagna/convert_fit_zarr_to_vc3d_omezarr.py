@@ -547,9 +547,9 @@ def run_from_manifest(
 		base_shape = vol.base_shape_zyx
 	if base_shape is None:
 		# Derive from finest-resolution zarr × scaledown
-		min_sd = min(g.scaledown for g in vol.groups.values())
+		min_sd = min(g.sd_fac for g in vol.groups.values())
 		for g in vol.groups.values():
-			if g.scaledown == min_sd:
+			if g.sd_fac == min_sd:
 				zarr_path = str(vol.path.parent / g.zarr_path)
 				a = zarr.open(zarr_path, mode="r")
 				sh = tuple(int(v) for v in a.shape)
@@ -557,7 +557,7 @@ def run_from_manifest(
 					sh = sh[1:]
 				base_shape = (sh[0] * min_sd, sh[1] * min_sd, sh[2] * min_sd)
 				print(f"{TAG} derived base_shape={base_shape} from {g.zarr_path} "
-					  f"(shape={sh}, scaledown={min_sd})", flush=True)
+					  f"(shape={sh}, sd_fac={min_sd})", flush=True)
 				break
 	if base_shape is None:
 		raise ValueError("Cannot determine base_shape: pass --base-shape or set base_shape_zyx in manifest")
@@ -585,7 +585,7 @@ def run_from_manifest(
 		# Build per-channel preprocess_params so run() can read scaledown + crop
 		a = zarr.open(zarr_path, mode="r")
 		params = dict(getattr(a, "attrs", {}).get("preprocess_params", {}))
-		params.setdefault("scaledown", group.scaledown)
+		params.setdefault("scaledown", group.sd_fac)
 		if vol.crops:
 			# Use the first crop for legacy converter compat
 			params.setdefault("crop_xyzwhd", list(vol.crops[0]))
@@ -602,7 +602,7 @@ def run_from_manifest(
 				pass  # read-only zarr, run() will use defaults
 
 		print(f"{TAG} converting {ch_name} (group={[k for k,v in vol.groups.items() if v is group][0]}, "
-			  f"ch_idx={ch_idx}, scaledown={group.scaledown})", flush=True)
+			  f"ch_idx={ch_idx}, sd_fac={group.sd_fac})", flush=True)
 
 		run(
 			input_path=zarr_path,

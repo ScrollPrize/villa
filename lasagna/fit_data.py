@@ -407,15 +407,21 @@ def get_preprocessed_params(path: str) -> dict:
 	vol = LasagnaVolume.load(path)
 	s2b = vol.source_to_base
 	# Use finest-resolution group to determine volume extent
-	min_sd = min(g.scaledown for g in vol.groups.values())
+	min_sd = min(g.sd_fac for g in vol.groups.values())
 	# Find a group at finest resolution, open its zarr to get spatial dims
 	for g in vol.groups.values():
-		if g.scaledown == min_sd:
+		if g.sd_fac == min_sd:
 			zarr_path = str(vol.path.parent / g.zarr_path)
 			zsrc = zarr.open(zarr_path, mode="r")
 			if not isinstance(zsrc, zarr.Array):
 				raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
-			C, Z, Y, X = (int(v) for v in zsrc.shape)
+			shape = tuple(int(v) for v in zsrc.shape)
+			if len(shape) == 3:
+				Z, Y, X = shape
+			elif len(shape) == 4:
+				_, Z, Y, X = shape
+			else:
+				raise ValueError(f"expected 3D or 4D zarr at {zarr_path}, got shape={shape}")
 			# Extent in source coords, then scale to base (VC3D) coords
 			volume_extent_fullres = (
 				int(X * min_sd * s2b),
@@ -473,7 +479,7 @@ def load_3d(
 			raise ValueError(f"expected 3D or 4D zarr at {zarr_path}, got shape={shape}")
 
 		# Full base-to-zarr factor: crop is in base coords
-		ds_i = int(round(group.scaledown * s2b))
+		ds_i = int(round(group.sd_fac * s2b))
 		if is_3d:
 			Z_all, Y_all, X_all = shape
 		else:
@@ -492,7 +498,7 @@ def load_3d(
 			x1v, y1v, z1v = X_all, Y_all, Z_all
 
 		print(f"[fit_data] read {name} from {group.zarr_path} ch_idx={ch_idx} "
-			  f"ds_base={ds_i} (sd={group.scaledown}*s2b={s2b}) shape={shape} "
+			  f"ds_base={ds_i} (sd_fac={group.sd_fac}*s2b={s2b}) shape={shape} "
 			  f"z=[{z0v}:{z1v}] y=[{y0v}:{y1v}] x=[{x0v}:{x1v}]", flush=True)
 
 		if is_3d:
@@ -513,20 +519,20 @@ def load_3d(
 	# spacing = channel_scaledown * source_to_base  (base voxels per zarr voxel)
 	# Primary spacing always from grad_mag (always loaded, matches size())
 	gm_group, _ = vol.channel_group("grad_mag")
-	primary_sd = float(gm_group.scaledown) * s2b
+	primary_sd = float(gm_group.sd_fac) * s2b
 	primary_spacing = (primary_sd, primary_sd, primary_sd)
 
 	channel_spacing: dict[str, tuple[float, float, float]] = {}
 	for name in ["cos", "grad_mag", "nx", "ny"] + (["pred_dt"] if pred_dt_t is not None else []):
 		g, _ = vol.channel_group(name)
-		sd = float(g.scaledown) * s2b
+		sd = float(g.sd_fac) * s2b
 		channel_spacing[name] = (sd, sd, sd)
 
 	# Origin in base (VC3D) coords
 	if crop is not None:
 		x0, y0, z0 = (int(v) for v in crop[:3])
 		# Align to finest resolution grid (in base coords)
-		finest_sd = min(g.scaledown for g in vol.groups.values())
+		finest_sd = min(g.sd_fac for g in vol.groups.values())
 		base_step = finest_sd * s2b
 		origin_fullres = (
 			float(int(x0 / base_step) * base_step),

@@ -670,8 +670,8 @@ python lasagna/preprocess_cos_omezarr.py predict3d \
 | `--input` | required | Input zarr array (3D ZYX) |
 | `--output` | required | Output `.lasagna.json` path |
 | `--unet-checkpoint` | required | 3D UNet checkpoint (.pt) |
-| `--cos-scaledown` | 2 | Downsample factor for cos channel (half scale) |
-| `--scaledown` | 4 | Downsample factor for other channels (quarter scale) |
+| `--cos-scaledown` | 2 | Downsample power for cos channel (OME-Zarr level, actual factor = 2^value) |
+| `--scaledown` | 4 | Downsample power for other channels (OME-Zarr level, actual factor = 2^value) |
 | `--source-to-base` | 1.0 | Source volume to VC3D base coordinate factor |
 | `--tile-size` | 256 | Inference tile size |
 | `--overlap` | 64 | Tile overlap in voxels |
@@ -695,18 +695,28 @@ Output is a JSON manifest describing channel groups, each stored in a separate z
   "grad_mag_encode_scale": 1000.0,
   "groups": {
     "cos": {
-      "zarr": "cos.zarr",
-      "scaledown": 2,
+      "zarr": "cos.ome.zarr/3",
+      "scaledown": 3,
       "channels": ["cos"]
     },
-    "prediction": {
-      "zarr": "prediction.zarr",
+    "grad_mag": {
+      "zarr": "grad_mag.ome.zarr/4",
       "scaledown": 4,
-      "channels": ["grad_mag", "nx", "ny"]
+      "channels": ["grad_mag"]
+    },
+    "nx": {
+      "zarr": "nx.ome.zarr/4",
+      "scaledown": 4,
+      "channels": ["nx"]
+    },
+    "ny": {
+      "zarr": "ny.ome.zarr/4",
+      "scaledown": 4,
+      "channels": ["ny"]
     },
     "pred_dt": {
-      "zarr": "pred_dt.zarr",
-      "scaledown": 4,
+      "zarr": "pred_dt.ome.zarr/3",
+      "scaledown": 3,
       "channels": ["pred_dt"]
     }
   }
@@ -714,9 +724,9 @@ Output is a JSON manifest describing channel groups, each stored in a separate z
 ```
 
 - **`source_to_base`**: Factor from source volume voxels to base (VC3D) voxels. Default 1.0 (source = base). Set to 4 if source is 4x coarser than the VC3D coordinate system.
-- **`scaledown`** per group: Downsample factor relative to the source volume.
-- **`channels`**: Ordered list — position = channel index in the CZYX zarr.
-- Zarr paths are relative to the JSON file's directory.
+- **`scaledown`** per group: OME-Zarr pyramid level (power of 2). The actual scale factor is `2^scaledown`. E.g. `scaledown: 4` → level 4 → 16x downsampled from base. Use `ChannelGroup.sd_fac` in code to get the actual factor.
+- **`channels`**: Ordered list — position = channel index in the CZYX zarr (for 3D zarrs, only one channel per group).
+- Zarr paths are relative to the JSON file's directory and include the OME-Zarr level suffix.
 - Updating a single group (e.g., adding pred_dt) leaves other groups untouched.
 
 

@@ -680,7 +680,7 @@ python lasagna/preprocess_cos_omezarr.py predict3d \
 | `--tile-size` | Cube tile size for tiled inference (default 256). Must be compatible with the model architecture. |
 | `--overlap` | Overlap between adjacent tiles in voxels (default 64). |
 | `--border` | Hard-discard border at tile edges before linear blending (default 16). |
-| `--scaledown` | Output downsample factor (default 4). The output zarr voxels represent `scaledown` fullres voxels in each dimension. |
+| `--scaledown` | Output downsample power (default 4). OME-Zarr pyramid level; actual factor = 2^scaledown. |
 | `--crop-xyzwhd` | Process only a sub-region: `x y z w h d` in fullres input coordinates. |
 | `--pred-dt` | Path to a surface prediction zarr. Adds a `pred_dt` distance-to-surface channel to the output. |
 | `--device` | Compute device (default: `cuda` if available, otherwise `cpu`). |
@@ -694,7 +694,7 @@ The output zarr has shape `(C, Z, Y, X)` with dtype uint8, where C is 4
 full scaled volume dimensions; data is written at the crop offset (unprocessed
 regions are zero-filled).
 
-Metadata is stored in `preprocess_params` with keys: `scaledown`,
+Metadata is stored in `preprocess_params` with keys: `scaledown` (OME-Zarr level, power of 2),
 `grad_mag_encode_scale` (1000), `channels`, `crop_xyzwhd`, `source`
 ("predict3d"). This is directly consumed by `fit_data.load_3d()`.
 

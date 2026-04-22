@@ -62,9 +62,10 @@ The 3D pipeline: tiled inference with 3D linear blending → sigmoid → avg_poo
 ### Coordinate Spaces
 
 - **Fullres**: raw voxel coordinates from the original volume
-- **Model pixel space**: fullres / scaledown (e.g. scaledown=4 → 1 model pixel = 4 fullres voxels)
-- **z_step_vx**: z-stride between slices in **model pixels**, NOT fullres. Fullres z-stride = z_step_vx * scaledown
-- **3D model**: uniform scaledown for ALL axes. 1 zarr voxel = scaledown fullres voxels in x, y, z. z_step/z_step_eff are 2D-model-only concepts.
+- **Model pixel space**: fullres / sd_fac (e.g. scaledown=4 → sd_fac=2^4=16 → 1 model pixel = 16 fullres voxels)
+- **scaledown**: always an OME-Zarr pyramid level (power of 2). Actual factor = `2^scaledown` = `ChannelGroup.sd_fac`. This applies everywhere: CLI flags, `.lasagna.json`, zarr metadata.
+- **z_step_vx**: z-stride between slices in **model pixels**, NOT fullres. Fullres z-stride = z_step_vx * sd_fac
+- **3D model**: uniform sd_fac for ALL axes. 1 zarr voxel = sd_fac fullres voxels in x, y, z. z_step/z_step_eff are 2D-model-only concepts.
 
 ### Correction Points (`opt_loss_corr.py`)
 
