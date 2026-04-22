@@ -658,64 +658,94 @@ def _release_memmap_pages(arr: np.ndarray, z0: int, z1: int) -> None:
 		pass  # best effort — non-critical
 
 
-def _edt_read_worker(args):
-	"""Multiprocessing worker: read chunk from zarr with overlap, binarize.
-
-	Each worker opens its own zarr handle (zarr3 safe).
-	Returns (chunk_index, binary_bool_array).
-	"""
-	idx, pred_path, cz0, cz1, cy0, cy1, cx0, cx1, overlap, pZ, pY, pX = args
+def _edt_reader_proc(pred_path, work_list, overlap, pZ, pY, pX,
+					  shm_in_names, shm_shapes, free_q, ready_q, work_q, stop_evt):
+	"""Reader process: grab chunk indices from work_q, free slots from free_q,
+	read zarr into shared memory, signal ready_q.  Module-level for pickling."""
+	import multiprocessing.shared_memory as _shm2
 	pred = zarr.open(str(pred_path), mode="r")
-	rz0 = max(0, cz0 - overlap)
-	rz1 = min(pZ, cz1 + overlap)
-	ry0 = max(0, cy0 - overlap)
-	ry1 = min(pY, cy1 + overlap)
-	rx0 = max(0, cx0 - overlap)
-	rx1 = min(pX, cx1 + overlap)
-	raw = np.asarray(pred[rz0:rz1, ry0:ry1, rx0:rx1])
-	return idx, (raw > 0)
+	while not stop_evt.is_set():
+		try:
+			chunk_idx = work_q.get(timeout=0.1)
+		except Exception:
+			if work_q.empty():
+				break
+			continue
+		slot = free_q.get()
+
+		cz0, cz1, cy0, cy1, cx0, cx1 = work_list[chunk_idx]
+		rz0 = max(0, cz0 - overlap)
+		rz1 = min(pZ, cz1 + overlap)
+		ry0 = max(0, cy0 - overlap)
+		ry1 = min(pY, cy1 + overlap)
+		rx0 = max(0, cx0 - overlap)
+		rx1 = min(pX, cx1 + overlap)
+
+		raw = np.asarray(pred[rz0:rz1, ry0:ry1, rx0:rx1])
+		binary = (raw > 0).astype(np.uint8)
+		del raw
+
+		sm = _shm2.SharedMemory(name=shm_in_names[slot])
+		buf = np.ndarray(shm_shapes[slot], dtype=np.uint8, buffer=sm.buf)
+		ashp = binary.shape
+		buf[:ashp[0], :ashp[1], :ashp[2]] = binary
+		sm.close()
+
+		ready_q.put((slot, chunk_idx, ashp))
 
 
-def _edt_write_worker(args):
-	"""Multiprocessing worker: downsample encoded uint8 and write to zarr.
-
-	Each worker opens its own zarr handle (zarr3 safe).
-	"""
-	(idx, dt_u8, out_path, out_level,
-	 cz0, cz1, cy0, cy1, cx0, cx1,
-	 overlap, pZ, pY, pX,
-	 pred_z0, pred_y0, pred_x0,
-	 out_z0, out_y0, out_x0,
-	 scaledown) = args
-
-	rz0 = max(0, cz0 - overlap)
-	ry0 = max(0, cy0 - overlap)
-	rx0 = max(0, cx0 - overlap)
-	sz, sy, sx = cz1 - cz0, cy1 - cy0, cx1 - cx0
-	center = dt_u8[cz0 - rz0:cz0 - rz0 + sz,
-				   cy0 - ry0:cy0 - ry0 + sy,
-				   cx0 - rx0:cx0 - rx0 + sx]
-
+def _edt_writer_proc(out_path, out_level, work_list, overlap, pZ, pY, pX,
+					  pred_z0, pred_y0, pred_x0, out_z0, out_y0, out_x0,
+					  scaledown, shm_out_names, shm_out_shapes,
+					  write_q, free_q, stop_evt):
+	"""Writer process: grab results from write_q, downsample + write zarr from
+	shared memory, release slot to free_q.  Module-level for pickling."""
+	import multiprocessing.shared_memory as _shm2
 	out_arr = zarr.open(str(out_path), mode="r+")[str(out_level)]
-	out_shape = tuple(int(v) for v in out_arr.shape)
+	out_vol_shape = tuple(int(v) for v in out_arr.shape)
 
-	for zl in range(0, sz, scaledown):
-		slc = center[zl]
-		if scaledown > 1:
-			oh = max(1, slc.shape[0] // scaledown)
-			ow = max(1, slc.shape[1] // scaledown)
-			slc = cv2.resize(slc, (ow, oh), interpolation=cv2.INTER_AREA)
-		ozi = out_z0 + (cz0 - pred_z0 + zl) // scaledown
-		oyi = out_y0 + (cy0 - pred_y0) // scaledown
-		oxi = out_x0 + (cx0 - pred_x0) // scaledown
-		oy_end = min(out_shape[1], oyi + slc.shape[0])
-		ox_end = min(out_shape[2], oxi + slc.shape[1])
-		wy = oy_end - oyi
-		wx = ox_end - oxi
-		if ozi < out_shape[0] and wy > 0 and wx > 0:
-			out_arr[ozi, oyi:oy_end, oxi:ox_end] = slc[:wy, :wx]
+	while not stop_evt.is_set():
+		try:
+			item = write_q.get(timeout=0.1)
+		except Exception:
+			continue
+		if item is None:
+			break
+		slot, chunk_idx, ashp = item
 
-	return idx
+		cz0, cz1, cy0, cy1, cx0, cx1 = work_list[chunk_idx]
+		rz0 = max(0, cz0 - overlap)
+		ry0 = max(0, cy0 - overlap)
+		rx0 = max(0, cx0 - overlap)
+
+		sm = _shm2.SharedMemory(name=shm_out_names[slot])
+		buf = np.ndarray(shm_out_shapes[slot], dtype=np.uint8, buffer=sm.buf)
+		dt_u8 = buf[:ashp[0], :ashp[1], :ashp[2]].copy()
+		sm.close()
+
+		sz, sy, sx = cz1 - cz0, cy1 - cy0, cx1 - cx0
+		center = dt_u8[cz0 - rz0:cz0 - rz0 + sz,
+					   cy0 - ry0:cy0 - ry0 + sy,
+					   cx0 - rx0:cx0 - rx0 + sx]
+		for zl in range(0, sz, scaledown):
+			slc = center[zl]
+			if scaledown > 1:
+				oh = max(1, slc.shape[0] // scaledown)
+				ow = max(1, slc.shape[1] // scaledown)
+				slc = cv2.resize(slc, (ow, oh), interpolation=cv2.INTER_AREA)
+			ozi = out_z0 + (cz0 - pred_z0 + zl) // scaledown
+			oyi = out_y0 + (cy0 - pred_y0) // scaledown
+			oxi = out_x0 + (cx0 - pred_x0) // scaledown
+			oy_end = min(out_vol_shape[1], oyi + slc.shape[0])
+			ox_end = min(out_vol_shape[2], oxi + slc.shape[1])
+			wy = oy_end - oyi
+			wx = ox_end - oxi
+			if ozi < out_vol_shape[0] and wy > 0 and wx > 0:
+				out_arr[ozi, oyi:oy_end, oxi:ox_end] = slc[:wy, :wx]
+
+		free_q.put(slot)
+
+
 
 
 def _compute_pred_dt_slab(
@@ -816,69 +846,105 @@ def _compute_pred_dt_slab(
 	print(f"[pred_dt] {n_chunks} chunks to process, {n_workers} workers, edt_chunk={edt_chunk}",
 		  flush=True)
 
-	# --- Pipelined: parallel READ → streamed GPU (H2D|EDT|D2H) → parallel WRITE ---
-	# Three CUDA streams overlap transfers with compute:
-	#   stream_h2d: host→device transfer of next chunk
-	#   stream_compute: EDT + encode on current chunk
-	#   stream_d2h: device→host transfer of previous result
-	# Reader/writer processes run in parallel for I/O.
+	# --- Shared-memory ring buffer pipeline ---
+	# No array pickling through IPC — only slot indices through queues.
+	# Readers write into shared memory, GPU reads from it, writers read from it.
+	import multiprocessing.shared_memory as _shm
+	from multiprocessing import Process, Queue, Event
 
-	read_args = []
-	for idx, (cz0, cz1, cy0, cy1, cx0, cx1) in enumerate(work):
-		read_args.append((idx, pred_path, cz0, cz1, cy0, cy1, cx0, cx1, overlap, pZ, pY, pX))
+	N_SLOTS = 8  # ring buffer depth
+	padded_side = edt_chunk + 2 * overlap  # max buffer dim per axis
+	buf_shape = (padded_side, padded_side, padded_side)
+	buf_bytes = int(np.prod(buf_shape))  # uint8
 
-	pending: dict[int, np.ndarray] = {}
-	next_gpu_idx = 0
-	write_pool = _mp.Pool(processes=n_workers)
-	write_futures = []
-	done_count = [0]
+	# Allocate shared memory slots (input bool + output uint8)
+	shm_in: list[_shm.SharedMemory] = []
+	shm_out: list[_shm.SharedMemory] = []
+	shm_in_names: list[str] = []
+	shm_out_names: list[str] = []
+	for i in range(N_SLOTS):
+		si = _shm.SharedMemory(create=True, size=buf_bytes)
+		so = _shm.SharedMemory(create=True, size=buf_bytes)
+		shm_in.append(si)
+		shm_out.append(so)
+		shm_in_names.append(si.name)
+		shm_out_names.append(so.name)
 
-	stream_h2d = cp.cuda.Stream(non_blocking=True)
-	stream_compute = cp.cuda.Stream(non_blocking=True)
-	stream_d2h = cp.cuda.Stream(non_blocking=True)
+	shm_shapes = [buf_shape] * N_SLOTS
+	shm_out_shapes = [buf_shape] * N_SLOTS
 
-	# Pipeline state: staged GPU buffers
-	staged_gpu = None       # (idx, m_gpu) ready for compute after H2D done
-	computing = None        # (idx, dt_enc_gpu) being computed
-	transferring = None     # (idx, dt_enc_gpu, pinned_buf) being D2H transferred
+	# Queues: free slots, read-ready, write-ready
+	free_q: Queue = Queue()
+	ready_q: Queue = Queue()
+	write_q: Queue = Queue()
+	stop_evt = Event()
 
-	def _gpu_encode(m_gpu):
-		"""EDT + signed encode on current compute stream. Returns uint8 GPU array."""
+	# Seed free queue with (slot, chunk_idx) pairs
+	for chunk_idx in range(n_chunks):
+		# Assign to slots round-robin; readers will block on free_q when full
+		pass
+	# Actually: seed with empty slots, then feed chunk indices separately
+	work_q: Queue = Queue()  # chunk indices to process
+	for ci in range(n_chunks):
+		work_q.put(ci)
+	for s in range(N_SLOTS):
+		free_q.put(s)
+
+	# Launch reader and writer processes
+	n_readers = min(n_workers, n_chunks)
+	n_writers = min(n_workers, n_chunks)
+	readers = []
+	for _ in range(n_readers):
+		p = Process(target=_edt_reader_proc,
+					args=(pred_path, work, overlap, pZ, pY, pX,
+						  shm_in_names, shm_shapes, free_q, ready_q, work_q, stop_evt))
+		p.daemon = True
+		p.start()
+		readers.append(p)
+
+	writers = []
+	for _ in range(n_writers):
+		p = Process(target=_edt_writer_proc,
+					args=(output_omezarr_path, output_level_key, work, overlap, pZ, pY, pX,
+						  pred_z0, pred_y0, pred_x0, out_z0, out_y0, out_x0,
+						  scaledown, shm_out_names, shm_out_shapes,
+						  write_q, free_q, stop_evt))
+		p.daemon = True
+		p.start()
+		writers.append(p)
+
+	# Main process: GPU loop — pull from ready_q, run EDT, push to write_q
+	gpu_done = 0
+	while gpu_done < n_chunks:
+		slot, chunk_idx, ashp = ready_q.get()
+
+		# Map shared memory → GPU
+		sm = _shm.SharedMemory(name=shm_in_names[slot])
+		buf = np.ndarray(shm_shapes[slot], dtype=np.uint8, buffer=sm.buf)
+		binary_np = buf[:ashp[0], :ashp[1], :ashp[2]]
+
+		# GPU EDT + encode
+		m_gpu = cp.asarray(binary_np)
+		sm.close()
 		outer_dt = cnd.distance_transform_edt(~m_gpu)
 		inner_dt = cnd.distance_transform_edt(m_gpu)
 		outer_enc = (128 - cp.clip(cp.round(outer_dt), 1, _MAX_DT)).astype(cp.uint8)
 		inner_enc = (127 + cp.clip(cp.round(inner_dt), 1, _MAX_DT)).astype(cp.uint8)
-		result = cp.where(m_gpu, inner_enc, outer_enc)
-		del outer_dt, inner_dt, outer_enc, inner_enc
-		return result
+		dt_enc = cp.where(m_gpu, inner_enc, outer_enc)
+		dt_u8_np = cp.asnumpy(dt_enc)
+		del m_gpu, outer_dt, inner_dt, outer_enc, inner_enc, dt_enc
 
-	def _dispatch_write(idx, dt_u8_np):
-		"""Send result to write worker pool."""
-		cz0, cz1, cy0, cy1, cx0, cx1 = work[idx]
-		wa = (idx, dt_u8_np, output_omezarr_path, output_level_key,
-			  cz0, cz1, cy0, cy1, cx0, cx1,
-			  overlap, pZ, pY, pX,
-			  pred_z0, pred_y0, pred_x0,
-			  out_z0, out_y0, out_x0, scaledown)
-		write_futures.append(write_pool.apply_async(_edt_write_worker, (wa,)))
+		# Write result to shared output buffer
+		sm_out = _shm.SharedMemory(name=shm_out_names[slot])
+		obuf = np.ndarray(shm_out_shapes[slot], dtype=np.uint8, buffer=sm_out.buf)
+		obuf[:ashp[0], :ashp[1], :ashp[2]] = dt_u8_np
+		sm_out.close()
 
-	def _collect_writes():
-		nonlocal write_futures
-		new = []
-		for wf in write_futures:
-			if wf.ready():
-				wf.get()
-				done_count[0] += 1
-				if progress is not None:
-					progress["edt_done"] = progress.get("edt_done", 0) + 1
-			else:
-				new.append(wf)
-		write_futures = new
+		write_q.put((slot, chunk_idx, ashp))
+		gpu_done += 1
 
-	def _print_progress():
-		gpu_done = next_gpu_idx
-		if gpu_done == 0:
-			return
+		if progress is not None:
+			progress["edt_done"] = progress.get("edt_done", 0) + 1
 		elapsed = max(1e-6, time.time() - t0)
 		eta = elapsed / gpu_done * (n_chunks - gpu_done)
 		overall = ""
@@ -891,90 +957,29 @@ def _compute_pred_dt_slab(
 				overall_eta = oe / overall_frac * (1.0 - overall_frac)
 				overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
 		print(f"\r[pred_dt] gpu {gpu_done}/{n_chunks} "
-			  f"written {done_count[0]}/{n_chunks} "
 			  f"({100.0 * gpu_done / n_chunks:.0f}%) "
 			  f"eta {int(eta // 60):02d}:{int(eta % 60):02d}"
 			  f"{overall}  ",
 			  end="", flush=True)
 
-	with _mp.Pool(processes=n_workers) as read_pool:
-		read_iter = read_pool.imap_unordered(_edt_read_worker, read_args)
+	# Signal writers to stop
+	for _ in writers:
+		write_q.put(None)
+	stop_evt.set()
+	for p in readers:
+		p.join(timeout=5)
+	for p in writers:
+		p.join(timeout=10)
 
-		for idx, binary in read_iter:
-			pending[idx] = binary
-
-			while next_gpu_idx in pending:
-				cur_binary = pending.pop(next_gpu_idx)
-				cur_idx = next_gpu_idx
-				next_gpu_idx += 1
-
-				# Stage 1: H2D transfer (async) — wait for previous H2D first
-				stream_h2d.synchronize()
-				with stream_h2d:
-					new_m_gpu = cp.asarray(cur_binary)
-
-				# Stage 2: if we have a staged buffer, start compute (async)
-				if staged_gpu is not None:
-					prev_idx, prev_m_gpu = staged_gpu
-					# Wait for previous compute to finish before reusing stream
-					stream_compute.synchronize()
-					with stream_compute:
-						# Wait for that buffer's H2D to be done
-						stream_compute.wait_event(stream_h2d.record())
-						prev_result = _gpu_encode(prev_m_gpu)
-						del prev_m_gpu
-
-					# Stage 3: if we have a computing result, start D2H (async)
-					if computing is not None:
-						comp_idx, comp_result = computing
-						stream_d2h.synchronize()
-						with stream_d2h:
-							stream_d2h.wait_event(stream_compute.record())
-							dt_u8 = cp.asnumpy(comp_result)
-						# D2H is synchronous for asnumpy — result is ready
-						del comp_result
-						_dispatch_write(comp_idx, dt_u8)
-						_collect_writes()
-						_print_progress()
-
-					computing = (prev_idx, prev_result)
-
-				staged_gpu = (cur_idx, new_m_gpu)
-
-		# Drain pipeline: process staged buffer
-		if staged_gpu is not None:
-			s_idx, s_m_gpu = staged_gpu
-			stream_h2d.synchronize()
-			with stream_compute:
-				s_result = _gpu_encode(s_m_gpu)
-				del s_m_gpu
-			if computing is not None:
-				comp_idx, comp_result = computing
-				stream_compute.synchronize()
-				dt_u8 = cp.asnumpy(comp_result)
-				del comp_result
-				_dispatch_write(comp_idx, dt_u8)
-			computing = (s_idx, s_result)
-
-		# Drain: transfer last computed result
-		if computing is not None:
-			comp_idx, comp_result = computing
-			stream_compute.synchronize()
-			dt_u8 = cp.asnumpy(comp_result)
-			del comp_result
-			_dispatch_write(comp_idx, dt_u8)
-
-	# Wait for all writes
-	for wf in write_futures:
-		wf.get()
-		done_count[0] += 1
-		if progress is not None:
-			progress["edt_done"] = progress.get("edt_done", 0) + 1
-	write_pool.close()
-	write_pool.join()
+	# Cleanup shared memory
+	for si in shm_in:
+		si.close()
+		si.unlink()
+	for so in shm_out:
+		so.close()
+		so.unlink()
 
 	cp.get_default_memory_pool().free_all_blocks()
-	_print_progress()
 	print(f"\r[pred_dt] {n_chunks} chunks in {time.time() - t0:.1f}s" + " " * 30,
 		  flush=True)
 

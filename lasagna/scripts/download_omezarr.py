@@ -780,6 +780,9 @@ def download(
     if region:
         argv += ["--region", region]
     argv += ["--workers", str(workers)]
+    # Clear cached S3 client so each download() call gets a fresh session
+    # (avoids mixing anon/authenticated credentials between volumes)
+    _thread_local.s3_client_cache = None
     return main(argv)
 
 
