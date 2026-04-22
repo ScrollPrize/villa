@@ -174,8 +174,9 @@ def _process_slab_worker(args_tuple):
 
 def _downsample_chunk_worker(args_tuple):
 	"""Multiprocessing worker: read one chunk-aligned region from level N,
-	downsample 2x, write to level N+1. Lock-free: each worker writes to
-	a unique chunk region at the target level."""
+	downsample 2x, write to level N+1.  Atomic: writes to a temp dir
+	then os.replace() each chunk file into the real output."""
+	import json, shutil
 	(out_path_str, src_level, dst_level,
 	 z0, z1, y0, y1, x0, x1) = args_tuple
 
@@ -186,9 +187,40 @@ def _downsample_chunk_worker(args_tuple):
 	if down.size == 0:
 		return
 	dz0, dy0, dx0 = z0 // 2, y0 // 2, x0 // 2
-	g[str(dst_level)][dz0:dz0 + down.shape[0],
-					  dy0:dy0 + down.shape[1],
-					  dx0:dx0 + down.shape[2]] = down
+
+	# Read chunk size and dimension separator from .zarray
+	dst_level_path = os.path.join(out_path_str, str(dst_level))
+	zarray_path = os.path.join(dst_level_path, ".zarray")
+	with open(zarray_path) as f:
+		meta = json.load(f)
+	chunk_size = meta["chunks"][0]
+	sep = meta.get("dimension_separator", ".")
+
+	# Write to temp level dir
+	tmp_path = dst_level_path + f".tmp.{os.getpid()}"
+	os.makedirs(tmp_path, exist_ok=True)
+	tmp_zarray = os.path.join(tmp_path, ".zarray")
+	if not os.path.isfile(tmp_zarray):
+		shutil.copy2(zarray_path, tmp_zarray)
+	tmp_arr = zarr.open(tmp_path, mode="r+")
+	tmp_arr[dz0:dz0 + down.shape[0],
+			dy0:dy0 + down.shape[1],
+			dx0:dx0 + down.shape[2]] = down
+
+	# Rename each chunk file atomically
+	for cz in range(dz0, dz0 + down.shape[0], chunk_size):
+		for cy in range(dy0, dy0 + down.shape[1], chunk_size):
+			for cx in range(dx0, dx0 + down.shape[2], chunk_size):
+				iz, iy, ix = cz // chunk_size, cy // chunk_size, cx // chunk_size
+				if sep == "/":
+					rel = os.path.join(str(iz), str(iy), str(ix))
+				else:
+					rel = f"{iz}{sep}{iy}{sep}{ix}"
+				src_file = os.path.join(tmp_path, rel)
+				dst_file = os.path.join(dst_level_path, rel)
+				if os.path.isfile(src_file):
+					os.makedirs(os.path.dirname(dst_file), exist_ok=True)
+					os.replace(src_file, dst_file)
 
 
 def _upsample_chunk_worker(args_tuple):
