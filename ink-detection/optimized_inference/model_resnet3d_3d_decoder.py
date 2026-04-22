@@ -173,12 +173,25 @@ class ResNet3DDecoderWrapper:
 
 
 def _extract_state_dict(checkpoint):
-    if isinstance(checkpoint, dict):
-        state_dict = checkpoint.get("state_dict")
+    if not isinstance(checkpoint, dict):
+        raise RuntimeError("Checkpoint does not contain a usable state_dict")
+
+    for key in ("state_dict", "model_state_dict"):
+        state_dict = checkpoint.get(key)
         if isinstance(state_dict, dict):
-            return state_dict
-        if all(isinstance(key, str) for key in checkpoint.keys()):
-            return checkpoint
+            if state_dict and all(
+                isinstance(name, str) and isinstance(value, torch.Tensor)
+                for name, value in state_dict.items()
+            ):
+                return state_dict
+            raise RuntimeError(f"Checkpoint field '{key}' is not a valid tensor state_dict")
+
+    if checkpoint and all(
+        isinstance(name, str) and isinstance(value, torch.Tensor)
+        for name, value in checkpoint.items()
+    ):
+        return checkpoint
+
     raise RuntimeError("Checkpoint does not contain a usable state_dict")
 
 

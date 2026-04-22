@@ -18,7 +18,6 @@ import pandas as pd
 
 import gc
 import tempfile
-from data import *
 import pytorch_lightning as pl
 import numpy as np
 import scipy.stats as st
@@ -40,6 +39,7 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 from models.resnetall import generate_model
 from train_resnet3d_lib.script_utils import resolve_fragment_base_path
+from train_resnet3d_lib.legacy_segment_adapter import load_inference_segment
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 
 class CFG:
@@ -100,16 +100,14 @@ def get_img_splits(fragment_id, reverse_layers=False, base_path=None):
             fallback_root='2um_dataset',
         )
 
-    segment = Segment(
+    image, fragment_mask = load_inference_segment(
         segment_id=fragment_id,
+        dataset_root=base_path,
         layer_range=(1, 63),
         reverse_layers=reverse_layers,
-        base_path=base_path,
-        tile_size=CFG.tile_size,
+        in_chans=CFG.in_chans,
+        layer_read_workers=CFG.num_workers,
     )
-
-    image, _, fragment_mask = segment.get_data()
-    del segment  # free Segment internals before potential memmap copy
 
     # For large segments, back image with a disk memmap to avoid bloating Python's heap
     image_gb = image.nbytes / 1e9

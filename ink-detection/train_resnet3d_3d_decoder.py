@@ -54,8 +54,8 @@ from warmup_scheduler import GradualWarmupScheduler
 from scipy import ndimage
 from models.resnetall import generate_model
 
-from data import *
 from train_resnet3d_lib.script_utils import build_tile_cache_dir
+from train_resnet3d_lib.legacy_segment_adapter import load_training_segment
 class CFG:
     # ============== comp exp name =============
     comp_name = 'vesuvius'
@@ -383,8 +383,15 @@ def get_train_valid_dataset():
     _n_valid = 0
     for fragment_id in TRAIN_FRAGMENT_IDS:
         print('reading ',fragment_id)
-        segment = Segment(**get_training_segment_kwargs(fragment_id))
-        image, mask, fragment_mask = segment.get_data()
+        segment_kwargs = get_training_segment_kwargs(fragment_id)
+        image, mask, fragment_mask = load_training_segment(
+            segment_id=segment_kwargs["segment_id"],
+            dataset_root=segment_kwargs["base_path"],
+            layer_range=segment_kwargs["layer_range"],
+            reverse_layers=segment_kwargs.get("reverse_layers", False),
+            in_chans=CFG.in_chans,
+            layer_read_workers=getattr(CFG, "layer_read_workers", None),
+        )
         print(image.shape, mask.shape, fragment_mask.shape, image.max())
 
         # Extract valid tiles (deduplicated by position)
@@ -418,7 +425,7 @@ def get_train_valid_dataset():
                                     _n_valid += 1
                                     windows_dict[(y1, y2, x1, x2)] = '1'
         print(f'  {fragment_id}: n_train={_n_train}, n_valid={_n_valid}', flush=True)
-        del segment, image, mask, fragment_mask
+        del image, mask, fragment_mask
         gc.collect()
 
     _tr_img_f.close(); _tr_msk_f.close()
