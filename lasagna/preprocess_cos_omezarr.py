@@ -476,10 +476,32 @@ def run_preprocess(
 # OME-Zarr helpers
 # ---------------------------------------------------------------------------
 
+def _omezarr_dim_sep(omezarr_path: str, level: int) -> str:
+	"""Read dimension_separator from .zarray metadata. Defaults to '.'."""
+	import json as _json
+	zarray_path = os.path.join(omezarr_path, str(level), ".zarray")
+	try:
+		with open(zarray_path) as f:
+			return _json.load(f).get("dimension_separator", ".")
+	except Exception:
+		return "."
+
+
+_dim_sep_cache: dict[tuple[str, int], str] = {}
+
+
 def _omezarr_chunk_exists(omezarr_path: str, level: int, z: int, y: int, x: int, chunk_size: int) -> bool:
-	"""Check if an OME-Zarr chunk file exists on disk (zarr v2, dim_sep='/')."""
+	"""Check if an OME-Zarr chunk file exists on disk."""
+	key = (omezarr_path, level)
+	if key not in _dim_sep_cache:
+		_dim_sep_cache[key] = _omezarr_dim_sep(omezarr_path, level)
+	sep = _dim_sep_cache[key]
 	iz, iy, ix = z // chunk_size, y // chunk_size, x // chunk_size
-	return os.path.isfile(os.path.join(omezarr_path, str(level), str(iz), str(iy), str(ix)))
+	if sep == "/":
+		chunk_path = os.path.join(omezarr_path, str(level), str(iz), str(iy), str(ix))
+	else:
+		chunk_path = os.path.join(omezarr_path, str(level), f"{iz}{sep}{iy}{sep}{ix}")
+	return os.path.isfile(chunk_path)
 
 
 def _omezarr_level_shape(
@@ -515,6 +537,7 @@ def _create_omezarr(
 			str(lv), shape=sh,
 			chunks=(min(sh[0], chunk), min(sh[1], chunk), min(sh[2], chunk)),
 			dtype=np.uint8, fill_value=0, overwrite=True,
+			dimension_separator="/",
 		)
 		datasets.append({
 			"path": str(lv),
@@ -549,10 +572,28 @@ def _open_or_create_omezarr(
 			expected = _omezarr_level_shape(base_shape_zyx, first_level)
 			arr = g[str(first_level)]
 			if tuple(int(v) for v in arr.shape) == expected:
+				# Verify zarr format
+				import json as _json
+				zarray_path = os.path.join(path, str(first_level), ".zarray")
+				if os.path.isfile(zarray_path):
+					with open(zarray_path) as f:
+						meta = _json.load(f)
+					zfmt = meta.get("zarr_format", None)
+					if zfmt != 2:
+						raise ValueError(
+							f"{path} level {first_level} has zarr_format={zfmt}, expected 2. "
+							"Delete and re-create the output."
+						)
+				print(f"[predict3d] reusing existing {os.path.basename(path)} "
+					  f"(level {first_level} shape={expected})", flush=True)
 				return g
-		except (KeyError, Exception):
+		except (KeyError, ValueError):
+			raise
+		except Exception:
 			pass
 		print(f"[predict3d] {path} shape mismatch, recreating", flush=True)
+	print(f"[predict3d] creating new {os.path.basename(path)} "
+		  f"(levels {first_level}-{n_levels-1})", flush=True)
 	return _create_omezarr(path, base_shape_zyx, first_level, n_levels, chunk, channel_name)
 
 
@@ -787,13 +828,16 @@ def _edt_writer_proc(out_path, out_level, work_list, overlap, pZ, pY, pX,
 	out_arr = ts.open(spec, read=True, write=True, open=True, context=ctx).result()
 	out_vol_shape = tuple(out_arr.shape)
 
+	_n = 0; _t_wq = 0.0; _t_shm = 0.0; _t_ds = 0.0; _t_wr = 0.0
 	while not stop_evt.is_set():
+		_tw0 = time.monotonic()
 		try:
 			item = write_q.get(timeout=0.1)
 		except Exception:
 			continue
 		if item is None:
 			break
+		_tw1 = time.monotonic()
 		slot, chunk_idx, ashp = item
 
 		cz0, cz1, cy0, cy1, cx0, cx1 = work_list[chunk_idx]
@@ -805,28 +849,50 @@ def _edt_writer_proc(out_path, out_level, work_list, overlap, pZ, pY, pX,
 		buf = np.ndarray(shm_out_shapes[slot], dtype=np.uint8, buffer=sm.buf)
 		dt_u8 = buf[:ashp[0], :ashp[1], :ashp[2]].copy()
 		sm.close()
+		_tw2 = time.monotonic()
 
+		# Downsample all z-slices, assemble into a single 3D output block
 		sz, sy, sx = cz1 - cz0, cy1 - cy0, cx1 - cx0
 		center = dt_u8[cz0 - rz0:cz0 - rz0 + sz,
 					   cy0 - ry0:cy0 - ry0 + sy,
 					   cx0 - rx0:cx0 - rx0 + sx]
+		oyi_base = out_y0 + (cy0 - pred_y0) // scaledown
+		oxi_base = out_x0 + (cx0 - pred_x0) // scaledown
+		out_slices = []
 		for zl in range(0, sz, scaledown):
 			slc = center[zl]
 			if scaledown > 1:
 				oh = max(1, slc.shape[0] // scaledown)
 				ow = max(1, slc.shape[1] // scaledown)
 				slc = cv2.resize(slc, (ow, oh), interpolation=cv2.INTER_AREA)
-			ozi = out_z0 + (cz0 - pred_z0 + zl) // scaledown
-			oyi = out_y0 + (cy0 - pred_y0) // scaledown
-			oxi = out_x0 + (cx0 - pred_x0) // scaledown
-			oy_end = min(out_vol_shape[1], oyi + slc.shape[0])
-			ox_end = min(out_vol_shape[2], oxi + slc.shape[1])
-			wy = oy_end - oyi
-			wx = ox_end - oxi
-			if ozi < out_vol_shape[0] and wy > 0 and wx > 0:
-				out_arr[ozi, oyi:oy_end, oxi:ox_end].write(slc[:wy, :wx]).result()
+			out_slices.append(slc)
+		_tw3 = time.monotonic()
+
+		# Write as one 3D block instead of per-slice
+		if out_slices:
+			block = np.stack(out_slices, axis=0)
+			ozi_start = out_z0 + (cz0 - pred_z0) // scaledown
+			oy_end = min(out_vol_shape[1], oyi_base + block.shape[1])
+			ox_end = min(out_vol_shape[2], oxi_base + block.shape[2])
+			wy = oy_end - oyi_base
+			wx = ox_end - oxi_base
+			oz_end = min(out_vol_shape[0], ozi_start + block.shape[0])
+			wz = oz_end - ozi_start
+			if wz > 0 and wy > 0 and wx > 0:
+				out_arr[ozi_start:oz_end, oyi_base:oy_end, oxi_base:ox_end].write(
+					block[:wz, :wy, :wx]).result()
+		_tw4 = time.monotonic()
 
 		free_q.put(slot)
+
+		_n += 1
+		_t_wq += _tw1 - _tw0; _t_shm += _tw2 - _tw1
+		_t_ds += _tw3 - _tw2; _t_wr += _tw4 - _tw3
+		if _n % 20 == 0:
+			print(f"  [writer pid={os.getpid()}] n={_n} "
+				  f"wq={1000*_t_wq/_n:.0f} shm={1000*_t_shm/_n:.0f} "
+				  f"ds={1000*_t_ds/_n:.0f} write={1000*_t_wr/_n:.0f}ms/chunk",
+				  flush=True)
 
 
 
@@ -890,17 +956,13 @@ def _compute_pred_dt_slab(
 	aligned_y1 = min(pY, ((pred_y1 + out_chunk_in_pred - 1) // out_chunk_in_pred) * out_chunk_in_pred)
 	aligned_x1 = min(pX, ((pred_x1 + out_chunk_in_pred - 1) // out_chunk_in_pred) * out_chunk_in_pred)
 
-	# Helper: check if an output chunk file already exists (zarr v2, dim_sep="/")
 	def _out_chunk_exists(cz0, cy0, cx0):
 		"""Check if the output zarr chunk for this pred-src region exists."""
 		ozi = out_z0 + (cz0 - pred_z0) // scaledown
 		oyi = out_y0 + (cy0 - pred_y0) // scaledown
 		oxi = out_x0 + (cx0 - pred_x0) // scaledown
-		iz = ozi // ome_chunk
-		iy = oyi // ome_chunk
-		ix = oxi // ome_chunk
-		chunk_path = os.path.join(output_omezarr_path, output_level_key, str(iz), str(iy), str(ix))
-		return os.path.isfile(chunk_path)
+		return _omezarr_chunk_exists(output_omezarr_path, int(output_level_key),
+									 ozi, oyi, oxi, ome_chunk)
 
 	# Build work list, skipping chunks whose output already exists
 	work: list[tuple[int, int, int, int, int, int]] = []
