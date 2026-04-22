@@ -2260,6 +2260,14 @@ def run_preprocess_3d(
 	z0 = max(0, z0); y0 = max(0, y0); x0 = max(0, x0)
 	nz = z1 - z0; ny = y1 - y0; nx_dim = x1 - x0
 
+	# Recompute output start offsets from expanded crop
+	cos_oz0 = _ds_index(z0, cos_sd)
+	cos_oy0 = _ds_index(y0, cos_sd)
+	cos_ox0 = _ds_index(x0, cos_sd)
+	other_oz0 = _ds_index(z0, other_sd)
+	other_oy0 = _ds_index(y0, other_sd)
+	other_ox0 = _ds_index(x0, other_sd)
+
 	# Recompute output region sizes with expanded crop
 	cos_wz = cos_oz1 - cos_oz0
 	cos_wy = cos_oy1 - cos_oy0
