@@ -7,6 +7,7 @@ their channels, scaledowns, and coordinate system metadata.
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -15,8 +16,13 @@ from pathlib import Path
 class ChannelGroup:
 	"""One zarr array containing one or more channels at a common resolution."""
 	zarr_path: str          # relative to the .lasagna.json file
-	scaledown: int          # downsample factor relative to source volume
+	scaledown: int          # OME-Zarr pyramid level; actual factor = 2**scaledown
 	channels: list[str]     # ordered; index = position in CZYX zarr
+
+	@property
+	def sd_fac(self) -> int:
+		"""Actual scale factor = 2**scaledown."""
+		return 1 << self.scaledown
 
 	def to_dict(self) -> dict:
 		return {

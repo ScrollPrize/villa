@@ -428,6 +428,9 @@ protected:
     Rect3D _bbox = {{-1,-1,-1},{-1,-1,-1}};
     std::set<std::string> _overlappingIds;
     std::optional<std::filesystem::file_time_type> _maskTimestamp;
+    // Column ranges of disconnected surface components (from meta.json "components").
+    // Each pair is [col_start, col_end). Empty = single contiguous surface.
+    std::vector<std::pair<int,int>> _components;
 
 private:
     // Write surface data to directory without modifying state. skipChannel can be used to exclude a channel.

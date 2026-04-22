@@ -465,11 +465,12 @@ void CAdaptiveVolumeViewer::submitRender()
 
     vc::SampleParams sp;
     const int numLevels = static_cast<int>(_volume->numScales());
+    if (numLevels <= 0) return;  // broken/empty volume — nothing to render
     // Always render at the user-requested level. The sampler's per-pixel
     // adaptive fallback handles regions that aren't ready yet by dropping
     // those pixels to whichever coarser level is resident — no whole-frame
     // resolution cycling, and cached fine chunks are used immediately.
-    sp.level = _camera.dsScaleIdx;
+    sp.level = std::clamp(_camera.dsScaleIdx, 0, numLevels - 1);
     sp.method = _samplingMethod;
 
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {

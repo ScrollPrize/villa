@@ -2706,16 +2706,16 @@ def run_preprocess_3d(
 
 	# --- Update manifest ---
 	vol.update_group("cos", ChannelGroup(
-		zarr_path=f"{prefix}cos.ome.zarr/{cos_level}", scaledown=cos_sd, channels=["cos"]))
+		zarr_path=f"{prefix}cos.ome.zarr/{cos_level}", scaledown=cos_level, channels=["cos"]))
 	vol.update_group("grad_mag", ChannelGroup(
-		zarr_path=f"{prefix}grad_mag.ome.zarr/{other_level}", scaledown=other_sd, channels=["grad_mag"]))
+		zarr_path=f"{prefix}grad_mag.ome.zarr/{other_level}", scaledown=other_level, channels=["grad_mag"]))
 	vol.update_group("nx", ChannelGroup(
-		zarr_path=f"{prefix}nx.ome.zarr/{other_level}", scaledown=other_sd, channels=["nx"]))
+		zarr_path=f"{prefix}nx.ome.zarr/{other_level}", scaledown=other_level, channels=["nx"]))
 	vol.update_group("ny", ChannelGroup(
-		zarr_path=f"{prefix}ny.ome.zarr/{other_level}", scaledown=other_sd, channels=["ny"]))
+		zarr_path=f"{prefix}ny.ome.zarr/{other_level}", scaledown=other_level, channels=["ny"]))
 	if pred_dt_path:
 		vol.update_group("pred_dt", ChannelGroup(
-			zarr_path=f"{prefix}pred_dt.ome.zarr/{cos_level}", scaledown=cos_sd, channels=["pred_dt"]))
+			zarr_path=f"{prefix}pred_dt.ome.zarr/{cos_level}", scaledown=cos_level, channels=["pred_dt"]))
 
 	# --- Resume training ---
 	if _gpu_ctx is not None:

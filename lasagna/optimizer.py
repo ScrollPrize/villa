@@ -275,7 +275,7 @@ def optimize(
 	terms = {
 		"step": {"loss": opt_loss_step.step_loss},
 		"smooth": {"loss": opt_loss_smooth.smooth_loss},
-		"winding_density": {"loss": opt_loss_winding_density.winding_density_loss},
+		"winding_density": {"loss": opt_loss_winding_density.winding_density_loss, "min_depth": 2},
 		"normal": {"loss": opt_loss_dir.normal_loss},
 		"data": {"loss": opt_loss_data.data_loss},
 		"data_plain": {"loss": opt_loss_data.data_plain_loss},
@@ -387,16 +387,20 @@ def optimize(
 
 		# Station-keeping: set seed point anchor (once, on first stage that uses it)
 		if (_need_term("station_n", opt_cfg.eff) > 0 or _need_term("station_t", opt_cfg.eff) > 0) and seed_xyz is not None:
-			dev = data.cos.device
+			dev = data.grad_mag.device
 			seed_t = torch.tensor(list(seed_xyz), device=dev, dtype=torch.float32)
 			opt_loss_station.set_seed(seed_t, data)
 
 		# Initial evaluation
 		def _eval_terms(res_, eff_):
 			"""Evaluate all loss terms, handling both single and multi-loss returns."""
-			total = torch.zeros((), device=data.cos.device, dtype=data.cos.dtype)
+			total = torch.zeros((), device=data.grad_mag.device, dtype=data.grad_mag.dtype)
 			tv: dict[str, float] = {}
+			D = res_.xyz_lr.shape[0]
 			for name, t in terms.items():
+				min_d = t.get("min_depth", 1)
+				if D < min_d:
+					continue
 				sub_names = t.get("sub")
 				if sub_names:
 					# Multi-loss: check if any sub-term has weight

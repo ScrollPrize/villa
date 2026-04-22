@@ -167,6 +167,13 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_)
     if (meta.contains("bbox"))
         _bbox = rect_from_json(meta["bbox"]);
 
+    if (meta.contains("components") && meta["components"].is_array()) {
+        for (const auto& c : meta["components"]) {
+            if (c.is_array() && c.size() >= 2)
+                _components.emplace_back(c[0].get_int(), c[1].get_int());
+        }
+    }
+
     _maskTimestamp = readMaskTimestamp(path);
     _needsLoad = true;  // Points will be loaded lazily
 }
@@ -179,6 +186,13 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_, const utils::Json &
 
     if (json.contains("bbox"))
         _bbox = rect_from_json(json["bbox"]);
+
+    if (json.contains("components") && json["components"].is_array()) {
+        for (const auto& c : json["components"]) {
+            if (c.is_array() && c.size() >= 2)
+                _components.emplace_back(c[0].get_int(), c[1].get_int());
+        }
+    }
 
     _maskTimestamp = readMaskTimestamp(path);
     _needsLoad = true;  // Points will be loaded lazily
@@ -582,19 +596,62 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     // Trigger the cache build + set _validMaskAllValid before deciding
     // whether we need the validity warp below.
     cv::Mat valid_src = validMask();
-    const bool skipValidity = _validMaskAllValid;
 
-    // --- warp coords with seam-safe border (replicate) -------------------
+    // --- warp coords and validity ----------------------------------------
     cv::Mat_<cv::Vec3f> coords_big;
-    cv::warpAffine(*_points, coords_big, A, size + cv::Size(8, 8),
-                cv::INTER_LINEAR, cv::BORDER_REPLICATE);
-
-    // --- warp validity with constant 0 (no replicate leakage) -----------
-    // Skip entirely when the source mask is all-valid: the cropped region
-    // can only contain 255s (the 4px halo that would hold 0s is discarded).
     cv::Mat valid_big;
-    if (!skipValidity) {
-        cv::warpAffine(valid_src, valid_big, A, size + cv::Size(8, 8),
+    const cv::Size outSize = size + cv::Size(8, 8);
+    const cv::Scalar nanScalar(std::numeric_limits<float>::quiet_NaN(),
+                               std::numeric_limits<float>::quiet_NaN(),
+                               std::numeric_limits<float>::quiet_NaN());
+
+    if (_components.size() > 1) {
+        // Multi-component surface: warp each component separately with
+        // BORDER_CONSTANT(NaN) so no interpolation across component boundaries.
+        coords_big.create(outSize);
+        coords_big.setTo(nanScalar);
+        valid_big = cv::Mat::zeros(outSize, CV_8UC1);
+
+        const int rows = _points->rows;
+        for (const auto& [c0, c1] : _components) {
+            const int cw = c1 - c0;
+            if (cw <= 0 || c0 < 0 || c1 > _points->cols) continue;
+
+            cv::Mat_<cv::Vec3f> compPts = (*_points)(cv::Rect(c0, 0, cw, rows));
+            cv::Mat compValid = valid_src(cv::Rect(c0, 0, cw, rows));
+
+            // Adjust affine: source x is offset by c0
+            cv::Mat Ac = A.clone();
+            // A maps source (x,y) -> dest (x,y). Shift source origin by -c0
+            // so the component's local coords start at 0.
+            // new_dest = A * [src_x; src_y; 1]
+            // For component: src_local = src_global - c0
+            // dest = A * [src_local + c0; src_y; 1] = A * [src_local; src_y; 1] + A * [c0; 0; 0]
+            // So we use the original A but applied to a source that's already cropped,
+            // meaning we need: dest = A * [src_local + c0; src_y; 1]
+            // Which equals the original mapping restricted to columns [c0, c1).
+            // Easiest: build a remap for just this component.
+            // Actually simpler: warp the full _points but with a mask.
+            // Simplest correct approach: shift A's x translation by -c0 * A[0][0]
+            Ac.at<double>(0, 2) -= c0 * Ac.at<double>(0, 0);
+
+            cv::Mat_<cv::Vec3f> compCoords;
+            cv::warpAffine(compPts, compCoords, Ac, outSize,
+                        cv::INTER_LINEAR, cv::BORDER_CONSTANT, nanScalar);
+
+            cv::Mat compValidBig;
+            cv::warpAffine(compValid, compValidBig, Ac, outSize,
+                        cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
+
+            // Composite: overwrite where this component is valid
+            compCoords.copyTo(coords_big, compValidBig);
+            cv::bitwise_or(valid_big, compValidBig, valid_big);
+        }
+    } else {
+        // Single component or no metadata: original behavior
+        cv::warpAffine(*_points, coords_big, A, outSize,
+                    cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+        cv::warpAffine(valid_src, valid_big, A, outSize,
                     cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
     }
 
@@ -655,7 +712,7 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     const cv::Vec3f qnan(std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN());
-    if (!skipValidity) {
+    {
         cv::Mat valid = valid_big(inner);
         const bool doNormals = need_normals;
         for (int j = 0; j < h; ++j) {

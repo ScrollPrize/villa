@@ -21,7 +21,7 @@ class CorrPoints3D:
 
 @dataclass(frozen=True)
 class FitData3D:
-	cos: torch.Tensor              # (1, 1, Z, Y, X) uint8 on GPU
+	cos: torch.Tensor | None       # (1, 1, Z, Y, X) uint8 on GPU, or None if skipped
 	grad_mag: torch.Tensor         # (1, 1, Z, Y, X) uint8 on GPU
 	nx: torch.Tensor               # (1, 1, Z, Y, X) uint8 on GPU — hemisphere-encoded normal x
 	ny: torch.Tensor               # (1, 1, Z, Y, X) uint8 on GPU — hemisphere-encoded normal y
@@ -39,10 +39,8 @@ class FitData3D:
 
 	@property
 	def size(self) -> tuple[int, int, int]:
-		"""(Z, Y, X) spatial dimensions."""
-		if self.cos.ndim != 5:
-			raise ValueError("FitData3D.cos must be (1,1,Z,Y,X)")
-		_, _, z, y, x = self.cos.shape
+		"""(Z, Y, X) spatial dimensions from grad_mag (always loaded)."""
+		_, _, z, y, x = self.grad_mag.shape
 		return int(z), int(y), int(x)
 
 	def _spacing_for(self, channel: str) -> tuple[float, float, float]:
@@ -247,6 +245,7 @@ def load_3d_for_model(
 	blur_sigma: float = 0.0,
 	erode_valid_mask: int = 0,
 	cuda_gridsample: bool = True,
+	skip_channels: set[str] | None = None,
 ) -> FitData3D:
 	"""Load 3D data auto-cropped around model mesh bbox. Optionally blurs."""
 	with torch.no_grad():
@@ -260,7 +259,8 @@ def load_3d_for_model(
 	crop = auto_crop_for_mesh(mesh_bbox, prep["volume_extent_fullres"])
 	print(f"[fit_data] auto-crop: x={crop[0]} y={crop[1]} z={crop[2]} "
 		  f"w={crop[3]} h={crop[4]} d={crop[5]}", flush=True)
-	data = load_3d(path=path, device=device, crop=crop, cuda_gridsample=cuda_gridsample)
+	data = load_3d(path=path, device=device, crop=crop, cuda_gridsample=cuda_gridsample,
+				  skip_channels=skip_channels)
 	if blur_sigma > 0:
 		blur_3d(data, sigma=blur_sigma)
 		print(f"[fit_data] blurred data sigma={blur_sigma}", flush=True)
@@ -407,15 +407,21 @@ def get_preprocessed_params(path: str) -> dict:
 	vol = LasagnaVolume.load(path)
 	s2b = vol.source_to_base
 	# Use finest-resolution group to determine volume extent
-	min_sd = min(g.scaledown for g in vol.groups.values())
+	min_sd = min(g.sd_fac for g in vol.groups.values())
 	# Find a group at finest resolution, open its zarr to get spatial dims
 	for g in vol.groups.values():
-		if g.scaledown == min_sd:
+		if g.sd_fac == min_sd:
 			zarr_path = str(vol.path.parent / g.zarr_path)
 			zsrc = zarr.open(zarr_path, mode="r")
 			if not isinstance(zsrc, zarr.Array):
 				raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
-			C, Z, Y, X = (int(v) for v in zsrc.shape)
+			shape = tuple(int(v) for v in zsrc.shape)
+			if len(shape) == 3:
+				Z, Y, X = shape
+			elif len(shape) == 4:
+				_, Z, Y, X = shape
+			else:
+				raise ValueError(f"expected 3D or 4D zarr at {zarr_path}, got shape={shape}")
 			# Extent in source coords, then scale to base (VC3D) coords
 			volume_extent_fullres = (
 				int(X * min_sd * s2b),
@@ -436,10 +442,12 @@ def load_3d(
 	device: torch.device,
 	crop: tuple[int, int, int, int, int, int] | None = None,
 	cuda_gridsample: bool = True,
+	skip_channels: set[str] | None = None,
 ) -> FitData3D:
 	"""Load 3D sub-volume from .lasagna.json manifest.
 
-	crop: (x0, y0, z0, w, h, d) in source-volume voxel coords, or None for full volume.
+	crop: (x0, y0, z0, w, h, d) in base-coord voxels, or None for full volume.
+	skip_channels: channel names to skip (set to None instead of loading).
 	"""
 	vol = LasagnaVolume.load(path)
 	# Effective decode scale: encode_scale / factor
@@ -471,7 +479,7 @@ def load_3d(
 			raise ValueError(f"expected 3D or 4D zarr at {zarr_path}, got shape={shape}")
 
 		# Full base-to-zarr factor: crop is in base coords
-		ds_i = int(round(group.scaledown * s2b))
+		ds_i = int(round(group.sd_fac * s2b))
 		if is_3d:
 			Z_all, Y_all, X_all = shape
 		else:
@@ -490,7 +498,7 @@ def load_3d(
 			x1v, y1v, z1v = X_all, Y_all, Z_all
 
 		print(f"[fit_data] read {name} from {group.zarr_path} ch_idx={ch_idx} "
-			  f"ds_base={ds_i} (sd={group.scaledown}*s2b={s2b}) shape={shape} "
+			  f"ds_base={ds_i} (sd_fac={group.sd_fac}*s2b={s2b}) shape={shape} "
 			  f"z=[{z0v}:{z1v}] y=[{y0v}:{y1v}] x=[{x0v}:{x1v}]", flush=True)
 
 		if is_3d:
@@ -500,29 +508,31 @@ def load_3d(
 		t = torch.from_numpy(a).to(device=device, dtype=torch.uint8)
 		return t.unsqueeze(0).unsqueeze(0)  # (1, 1, Z, Y, X)
 
-	cos_t = _read_channel("cos")
+	_skip = skip_channels or set()
+	cos_t = None if "cos" in _skip else _read_channel("cos")
 	mag_t = _read_channel("grad_mag")
 	nx_t = _read_channel("nx")
 	ny_t = _read_channel("ny")
-	pred_dt_t = _read_channel("pred_dt") if "pred_dt" in all_ch else None
+	pred_dt_t = None if ("pred_dt" in _skip or "pred_dt" not in all_ch) else _read_channel("pred_dt")
 
 	# Build per-channel spacing in base (VC3D) coordinates.
 	# spacing = channel_scaledown * source_to_base  (base voxels per zarr voxel)
-	cos_group, _ = vol.channel_group("cos")
-	primary_sd = float(cos_group.scaledown) * s2b
+	# Primary spacing always from grad_mag (always loaded, matches size())
+	gm_group, _ = vol.channel_group("grad_mag")
+	primary_sd = float(gm_group.sd_fac) * s2b
 	primary_spacing = (primary_sd, primary_sd, primary_sd)
 
 	channel_spacing: dict[str, tuple[float, float, float]] = {}
 	for name in ["cos", "grad_mag", "nx", "ny"] + (["pred_dt"] if pred_dt_t is not None else []):
 		g, _ = vol.channel_group(name)
-		sd = float(g.scaledown) * s2b
+		sd = float(g.sd_fac) * s2b
 		channel_spacing[name] = (sd, sd, sd)
 
 	# Origin in base (VC3D) coords
 	if crop is not None:
 		x0, y0, z0 = (int(v) for v in crop[:3])
 		# Align to finest resolution grid (in base coords)
-		finest_sd = min(g.scaledown for g in vol.groups.values())
+		finest_sd = min(g.sd_fac for g in vol.groups.values())
 		base_step = finest_sd * s2b
 		origin_fullres = (
 			float(int(x0 / base_step) * base_step),
