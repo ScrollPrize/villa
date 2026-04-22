@@ -852,7 +852,7 @@ def _compute_pred_dt_slab(
 	import multiprocessing.shared_memory as _shm
 	from multiprocessing import Process, Queue, Event
 
-	N_SLOTS = 8  # ring buffer depth
+	N_SLOTS = 32  # ring buffer depth — enough to keep GPU fed
 	padded_side = edt_chunk + 2 * overlap  # max buffer dim per axis
 	buf_shape = (padded_side, padded_side, padded_side)
 	buf_bytes = int(np.prod(buf_shape))  # uint8
@@ -913,38 +913,80 @@ def _compute_pred_dt_slab(
 		p.start()
 		writers.append(p)
 
-	# Main process: GPU loop — pull from ready_q, run EDT, push to write_q
+	# Main process: pipelined GPU loop with 3 CUDA streams.
+	# stream_h2d uploads chunk N+1 while stream_compute runs EDT on chunk N
+	# and stream_d2h downloads chunk N-1's result.  All three overlap.
 	gpu_done = 0
+	_t_loop_sum = 0.0
+
+
+	BATCH = 8  # process this many chunks per GPU round-trip
+	stream_h2d = cp.cuda.Stream(non_blocking=True)
+	stream_d2h = cp.cuda.Stream(non_blocking=True)
+	_t_wait_sum = 0.0; _t_h2d_sum = 0.0; _t_edt_sum = 0.0; _t_d2h_sum = 0.0
+
 	while gpu_done < n_chunks:
-		slot, chunk_idx, ashp = ready_q.get()
+		# Collect a batch of ready chunks (up to BATCH, at least 1)
+		_tw0 = time.monotonic()
+		batch_items = []
+		batch_items.append(ready_q.get())  # block for at least one
+		while len(batch_items) < BATCH and not ready_q.empty():
+			try:
+				batch_items.append(ready_q.get_nowait())
+			except Exception:
+				break
+		_tw1 = time.monotonic()
+		B = len(batch_items)
 
-		# Map shared memory → GPU
-		sm = _shm.SharedMemory(name=shm_in_names[slot])
-		buf = np.ndarray(shm_shapes[slot], dtype=np.uint8, buffer=sm.buf)
-		binary_np = buf[:ashp[0], :ashp[1], :ashp[2]]
+		# Batch H2D: async upload all chunks to GPU
+		gpu_binaries = []
+		with stream_h2d:
+			for slot, chunk_idx, ashp in batch_items:
+				sm = _shm.SharedMemory(name=shm_in_names[slot])
+				buf = np.ndarray(shm_shapes[slot], dtype=np.uint8, buffer=sm.buf)
+				gpu_binaries.append(cp.asarray(buf[:ashp[0], :ashp[1], :ashp[2]]))
+				sm.close()
+		h2d_evt = stream_h2d.record()
+		_th2d = time.monotonic()
 
-		# GPU EDT + encode
-		m_gpu = cp.asarray(binary_np)
-		sm.close()
-		outer_dt = cnd.distance_transform_edt(~m_gpu)
-		inner_dt = cnd.distance_transform_edt(m_gpu)
-		outer_enc = (128 - cp.clip(cp.round(outer_dt), 1, _MAX_DT)).astype(cp.uint8)
-		inner_enc = (127 + cp.clip(cp.round(inner_dt), 1, _MAX_DT)).astype(cp.uint8)
-		dt_enc = cp.where(m_gpu, inner_enc, outer_enc)
-		dt_u8_np = cp.asnumpy(dt_enc)
-		del m_gpu, outer_dt, inner_dt, outer_enc, inner_enc, dt_enc
+		# Batch EDT + encode on GPU (wait for H2D, then sequential per chunk)
+		gpu_results = []
+		cp.cuda.get_current_stream().wait_event(h2d_evt)
+		for m_gpu in gpu_binaries:
+			outer_dt = cnd.distance_transform_edt(~m_gpu)
+			inner_dt = cnd.distance_transform_edt(m_gpu)
+			outer_enc = (128 - cp.clip(cp.round(outer_dt), 1, _MAX_DT)).astype(cp.uint8)
+			inner_enc = (127 + cp.clip(cp.round(inner_dt), 1, _MAX_DT)).astype(cp.uint8)
+			gpu_results.append(cp.where(m_gpu, inner_enc, outer_enc))
+			del m_gpu, outer_dt, inner_dt, outer_enc, inner_enc
+		del gpu_binaries
+		compute_evt = cp.cuda.get_current_stream().record()
+		_tedt = time.monotonic()
 
-		# Write result to shared output buffer
-		sm_out = _shm.SharedMemory(name=shm_out_names[slot])
-		obuf = np.ndarray(shm_out_shapes[slot], dtype=np.uint8, buffer=sm_out.buf)
-		obuf[:ashp[0], :ashp[1], :ashp[2]] = dt_u8_np
-		sm_out.close()
+		# Batch D2H: async download all results to shared memory
+		with stream_d2h:
+			stream_d2h.wait_event(compute_evt)
+			for i, (slot, chunk_idx, ashp) in enumerate(batch_items):
+				sm_out = _shm.SharedMemory(name=shm_out_names[slot])
+				obuf = np.ndarray(shm_out_shapes[slot], dtype=np.uint8, buffer=sm_out.buf)
+				gpu_results[i].get(out=obuf[:ashp[0], :ashp[1], :ashp[2]])
+				sm_out.close()
+		stream_d2h.synchronize()
+		for i, (slot, chunk_idx, ashp) in enumerate(batch_items):
+			write_q.put((slot, chunk_idx, ashp))
+			gpu_done += 1
+		del gpu_results
+		_td2h = time.monotonic()
 
-		write_q.put((slot, chunk_idx, ashp))
-		gpu_done += 1
+		_t_wait_sum += _tw1 - _tw0
+		_t_h2d_sum += _th2d - _tw1
+		_t_edt_sum += _tedt - _th2d
+		_t_d2h_sum += _td2h - _tedt
 
 		if progress is not None:
 			progress["edt_done"] = progress.get("edt_done", 0) + 1
+		if gpu_done == 0:
+			continue
 		elapsed = max(1e-6, time.time() - t0)
 		eta = elapsed / gpu_done * (n_chunks - gpu_done)
 		overall = ""
@@ -958,7 +1000,12 @@ def _compute_pred_dt_slab(
 				overall = f" | overall eta {int(overall_eta // 60):02d}:{int(overall_eta % 60):02d}"
 		print(f"\r[pred_dt] gpu {gpu_done}/{n_chunks} "
 			  f"({100.0 * gpu_done / n_chunks:.0f}%) "
-			  f"eta {int(eta // 60):02d}:{int(eta % 60):02d}"
+			  f"eta {int(eta // 60):02d}:{int(eta % 60):02d} "
+			  f"wait={1000*_t_wait_sum/gpu_done:.0f} "
+			  f"h2d={1000*_t_h2d_sum/gpu_done:.0f} "
+			  f"edt={1000*_t_edt_sum/gpu_done:.0f} "
+			  f"d2h={1000*_t_d2h_sum/gpu_done:.0f}ms/chunk "
+			  f"batch={B}"
 			  f"{overall}  ",
 			  end="", flush=True)
 
