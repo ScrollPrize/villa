@@ -105,7 +105,7 @@ std::vector<std::byte> c3d_encode(std::span<const std::byte> raw,
 
 std::vector<std::byte> c3d_decode(std::span<const std::byte> compressed,
                                   std::size_t out_size,
-                                  const C3dCodecParams& /*params*/)
+                                  const C3dCodecParams& params)
 {
     if (out_size != kC3dChunkBytes) {
         throw std::runtime_error(
@@ -130,13 +130,15 @@ std::vector<std::byte> c3d_decode(std::span<const std::byte> compressed,
     // lod_end==0 fast path, c3d.c:3778 otherwise, including the §T9
     // truncated-entropy case where zero-fill happens in the coefficient
     // buffer before the final output loop converts it to u8).
+    c3d_decoder* d = thread_decoder();
+    c3d_decoder_set_denoise(d, !params.skip_denoise);
     std::vector<std::byte> out(out_size);
     uint8_t* out_ptr = reinterpret_cast<uint8_t*>(out.data());
     if (is_aligned(out_ptr)) {
-        c3d_decoder_chunk_decode(thread_decoder(), in, in_len, out_ptr);
+        c3d_decoder_chunk_decode(d, in, in_len, out_ptr);
     } else {
         AlignedBuf staging(out_size);
-        c3d_decoder_chunk_decode(thread_decoder(), in, in_len, staging.p);
+        c3d_decoder_chunk_decode(d, in, in_len, staging.p);
         std::memcpy(out.data(), staging.p, out_size);
     }
     return out;

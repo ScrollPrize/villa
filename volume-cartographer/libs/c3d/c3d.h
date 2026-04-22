@@ -177,6 +177,13 @@ void   c3d_decoder_chunk_decode(c3d_decoder *, const uint8_t *in, size_t in_len,
 void   c3d_decoder_chunk_decode_lod(c3d_decoder *, const uint8_t *in, size_t in_len,
                                     uint8_t lod, uint8_t *out);
 
+/* Toggle the post-decode denoise blur for this decoder instance.  Persists
+ * across decodes until the next call.  Default: enabled.  Callers that
+ * prioritise throughput over the ~0.03 dB PSNR denoise buys at r≈50 (GUI
+ * tile rendering, bulk recompress) can disable it once per decoder and
+ * skip the blur on every subsequent decode. */
+void   c3d_decoder_set_denoise(c3d_decoder *, bool enabled);
+
 /* Multi-chunk batched encode. */
 void c3d_encoder_chunks_encode(c3d_encoder *e,
                                const uint8_t *const *inputs,
