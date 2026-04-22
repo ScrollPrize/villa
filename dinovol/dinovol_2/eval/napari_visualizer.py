@@ -18,6 +18,7 @@ from dinovol_2.dataset.ssl_zarr_dataset import open_zarr_handle
 from dinovol_2.model.model import DinoVitStudentTeacher, _upgrade_weight_norm_state_dict_keys
 
 DEFAULT_NORMALIZATION_SCHEME = "robust"
+PCA_CHUNK_SIZE = 16_384
 
 
 @dataclass
@@ -44,6 +45,23 @@ class EmbeddingCache:
     normalized_patch_embeddings: np.ndarray
     source_bbox: tuple[int, int, int, int, int, int]
     bbox_layer_name: str | None
+
+
+@dataclass
+class FrozenPcaBasis:
+    checkpoint_path: Path
+    normalization_scheme: str
+    embedding_channels: int
+    requested_components: int
+    actual_components: int
+    mean_embedding: np.ndarray
+    components: np.ndarray
+    component_minima: np.ndarray
+    component_maxima: np.ndarray
+    source_image_layer_name: str
+    source_bbox: tuple[int, int, int, int, int, int]
+    mask_method: str
+    mask_dilation_radius: int
 
 
 @dataclass(frozen=True)
@@ -800,57 +818,191 @@ def foreground_mask_to_patch_mask(
     return reshaped.any(axis=(1, 3, 5))
 
 
-def project_patch_embeddings_to_pca_rgb(
+def _flatten_patch_mask(
+    patch_mask: np.ndarray | None,
+    *,
+    patch_grid_shape: tuple[int, int, int],
+) -> np.ndarray | None:
+    if patch_mask is None:
+        return None
+
+    mask = np.asarray(patch_mask, dtype=bool)
+    if mask.shape != patch_grid_shape:
+        raise ValueError(f"patch_mask shape {mask.shape} must match {patch_grid_shape}")
+    flat_mask = mask.reshape(-1)
+    if not flat_mask.any():
+        raise ValueError("patch_mask excludes all patch embeddings")
+    return flat_mask
+
+
+def compute_patch_embedding_pca_basis(
     normalized_patch_embeddings: np.ndarray,
     *,
+    n_components: int = 3,
     patch_mask: np.ndarray | None = None,
+    chunk_size: int = PCA_CHUNK_SIZE,
+) -> tuple[np.ndarray, np.ndarray]:
+    embeddings = np.asarray(normalized_patch_embeddings, dtype=np.float32)
+    if embeddings.ndim != 4:
+        raise ValueError(
+            "normalized_patch_embeddings must have shape `(patch_z, patch_y, patch_x, channels)`"
+        )
+    n_components = int(n_components)
+    if n_components <= 0:
+        raise ValueError(f"n_components must be positive, got {n_components}")
+    chunk_size = int(chunk_size)
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+    flat_embeddings = embeddings.reshape(-1, embeddings.shape[-1])
+    flat_mask = _flatten_patch_mask(patch_mask, patch_grid_shape=embeddings.shape[:3])
+    selected_count = flat_embeddings.shape[0] if flat_mask is None else int(flat_mask.sum())
+    component_count = min(n_components, flat_embeddings.shape[1], max(selected_count - 1, 1))
+
+    mean_embedding = np.zeros(flat_embeddings.shape[1], dtype=np.float64)
+    for start in range(0, flat_embeddings.shape[0], chunk_size):
+        stop = min(start + chunk_size, flat_embeddings.shape[0])
+        chunk = flat_embeddings[start:stop]
+        if flat_mask is not None:
+            mask_chunk = flat_mask[start:stop]
+            if not mask_chunk.any():
+                continue
+            chunk = chunk[mask_chunk]
+        mean_embedding += chunk.sum(axis=0, dtype=np.float64)
+    mean_embedding /= float(selected_count)
+
+    covariance = np.zeros((flat_embeddings.shape[1], flat_embeddings.shape[1]), dtype=np.float64)
+    has_variance = False
+    for start in range(0, flat_embeddings.shape[0], chunk_size):
+        stop = min(start + chunk_size, flat_embeddings.shape[0])
+        chunk = flat_embeddings[start:stop]
+        if flat_mask is not None:
+            mask_chunk = flat_mask[start:stop]
+            if not mask_chunk.any():
+                continue
+            chunk = chunk[mask_chunk]
+        centered_chunk = chunk.astype(np.float64, copy=False) - mean_embedding
+        covariance += centered_chunk.T @ centered_chunk
+        if not has_variance and np.any(centered_chunk):
+            has_variance = True
+
+    components = np.zeros((flat_embeddings.shape[1], component_count), dtype=np.float32)
+    if has_variance:
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        order = np.argsort(eigenvalues)[::-1][:component_count]
+        components = eigenvectors[:, order].astype(np.float32, copy=False)
+    return mean_embedding.astype(np.float32, copy=False), components
+
+
+def compute_projected_patch_component_ranges(
+    normalized_patch_embeddings: np.ndarray,
+    *,
+    mean_embedding: np.ndarray,
+    components: np.ndarray,
+    patch_mask: np.ndarray | None = None,
+    chunk_size: int = PCA_CHUNK_SIZE,
+) -> tuple[np.ndarray, np.ndarray]:
+    embeddings = np.asarray(normalized_patch_embeddings, dtype=np.float32)
+    if embeddings.ndim != 4:
+        raise ValueError(
+            "normalized_patch_embeddings must have shape `(patch_z, patch_y, patch_x, channels)`"
+        )
+    chunk_size = int(chunk_size)
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
+
+    flat_embeddings = embeddings.reshape(-1, embeddings.shape[-1])
+    flat_mask = _flatten_patch_mask(patch_mask, patch_grid_shape=embeddings.shape[:3])
+    mean_embedding = np.asarray(mean_embedding, dtype=np.float32)
+    components = np.asarray(components, dtype=np.float32)
+    component_count = int(components.shape[1])
+    minima = np.full(component_count, np.inf, dtype=np.float32)
+    maxima = np.full(component_count, -np.inf, dtype=np.float32)
+
+    for start in range(0, flat_embeddings.shape[0], chunk_size):
+        stop = min(start + chunk_size, flat_embeddings.shape[0])
+        chunk = flat_embeddings[start:stop]
+        mask_chunk = None if flat_mask is None else flat_mask[start:stop]
+        if mask_chunk is not None and not mask_chunk.any():
+            continue
+
+        projected_chunk = (chunk - mean_embedding) @ components
+        active_chunk = projected_chunk if mask_chunk is None else projected_chunk[mask_chunk]
+        minima = np.minimum(minima, active_chunk.min(axis=0))
+        maxima = np.maximum(maxima, active_chunk.max(axis=0))
+
+    return minima, maxima
+
+
+def project_patch_embeddings_to_pca(
+    normalized_patch_embeddings: np.ndarray,
+    *,
+    mean_embedding: np.ndarray,
+    components: np.ndarray,
+    component_minima: np.ndarray | None = None,
+    component_maxima: np.ndarray | None = None,
+    chunk_size: int = PCA_CHUNK_SIZE,
 ) -> np.ndarray:
     embeddings = np.asarray(normalized_patch_embeddings, dtype=np.float32)
     if embeddings.ndim != 4:
         raise ValueError(
             "normalized_patch_embeddings must have shape `(patch_z, patch_y, patch_x, channels)`"
         )
+    chunk_size = int(chunk_size)
+    if chunk_size <= 0:
+        raise ValueError(f"chunk_size must be positive, got {chunk_size}")
 
-    flat_embeddings = embeddings.reshape(-1, embeddings.shape[-1]).astype(np.float64, copy=False)
-    if patch_mask is None:
-        flat_mask = np.ones(flat_embeddings.shape[0], dtype=bool)
+    flat_embeddings = embeddings.reshape(-1, embeddings.shape[-1])
+    mean_embedding = np.asarray(mean_embedding, dtype=np.float32)
+    if mean_embedding.shape != (flat_embeddings.shape[1],):
+        raise ValueError(
+            f"mean_embedding shape {mean_embedding.shape} must match embedding channels {(flat_embeddings.shape[1],)}"
+        )
+
+    components = np.asarray(components, dtype=np.float32)
+    if components.ndim != 2 or components.shape[0] != flat_embeddings.shape[1]:
+        raise ValueError(
+            "components must have shape `(embedding_channels, component_count)` "
+            f"with embedding_channels={flat_embeddings.shape[1]}, got {components.shape}"
+        )
+    component_count = int(components.shape[1])
+
+    output_flat = np.zeros((flat_embeddings.shape[0], component_count), dtype=np.float32)
+    if component_count == 0:
+        return output_flat.reshape(*embeddings.shape[:3], 0)
+
+    if component_minima is None or component_maxima is None:
+        minima, maxima = compute_projected_patch_component_ranges(
+            embeddings,
+            mean_embedding=mean_embedding,
+            components=components,
+            chunk_size=chunk_size,
+        )
     else:
-        mask = np.asarray(patch_mask, dtype=bool)
-        if mask.shape != embeddings.shape[:3]:
-            raise ValueError(f"patch_mask shape {mask.shape} must match {embeddings.shape[:3]}")
-        flat_mask = mask.reshape(-1)
-        if not flat_mask.any():
-            raise ValueError("patch_mask excludes all patch embeddings")
+        minima = np.asarray(component_minima, dtype=np.float32)
+        maxima = np.asarray(component_maxima, dtype=np.float32)
+        if minima.shape != (component_count,) or maxima.shape != (component_count,):
+            raise ValueError(
+                f"component_minima and component_maxima must each have shape {(component_count,)}, "
+                f"got {minima.shape} and {maxima.shape}"
+            )
 
-    selected_embeddings = flat_embeddings[flat_mask]
-    mean_embedding = selected_embeddings.mean(axis=0, keepdims=True)
-    centered_selected = selected_embeddings - mean_embedding
-    centered_all = flat_embeddings - mean_embedding
+    valid_range = maxima > minima
+    for start in range(0, flat_embeddings.shape[0], chunk_size):
+        stop = min(start + chunk_size, flat_embeddings.shape[0])
+        chunk = flat_embeddings[start:stop]
 
-    component_count = min(3, centered_all.shape[1], max(centered_selected.shape[0] - 1, 1))
-    projected = np.zeros((flat_embeddings.shape[0], 3), dtype=np.float32)
+        projected_chunk = (chunk - mean_embedding) @ components
+        if np.any(valid_range):
+            projected_chunk[:, valid_range] = (projected_chunk[:, valid_range] - minima[valid_range]) / (
+                maxima[valid_range] - minima[valid_range]
+            )
+        if np.any(~valid_range):
+            projected_chunk[:, ~valid_range] = 0.0
+        np.clip(projected_chunk, 0.0, 1.0, out=projected_chunk)
+        output_flat[start:stop] = projected_chunk
 
-    if component_count > 0 and np.any(centered_selected):
-        covariance = centered_selected.T @ centered_selected
-        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
-        order = np.argsort(eigenvalues)[::-1][:component_count]
-        components = eigenvectors[:, order]
-        projected[:, :component_count] = (centered_all @ components).astype(np.float32, copy=False)
-
-    rgb = projected.reshape(*embeddings.shape[:3], 3)
-    active_values = rgb.reshape(-1, 3)[flat_mask]
-    for channel_index in range(3):
-        channel_values = active_values[:, channel_index]
-        minimum = float(channel_values.min())
-        maximum = float(channel_values.max())
-        if maximum > minimum:
-            rgb[..., channel_index] = (rgb[..., channel_index] - minimum) / (maximum - minimum)
-        else:
-            rgb[..., channel_index] = 0.0
-
-    if patch_mask is not None:
-        rgb[~patch_mask] = 0.0
-    return np.clip(rgb, 0.0, 1.0).astype(np.float32, copy=False)
+    return output_flat.reshape(*embeddings.shape[:3], component_count)
 
 
 try:
@@ -882,7 +1034,9 @@ if _QT_AVAILABLE:
             self.viewer = viewer
             self.loaded_backbone: LoadedBackbone | None = None
             self.embedding_cache: EmbeddingCache | None = None
+            self.frozen_pca_basis: FrozenPcaBasis | None = None
             self.ome_zarr_spec: OmeZarrSpec | None = None
+            self._zarr_root = None
 
             self.setWindowTitle("DINO Cosine Similarity")
             self.zarr_path_edit = QLineEdit()
@@ -899,6 +1053,11 @@ if _QT_AVAILABLE:
             self.mask_dilation_spinbox = QSpinBox()
             self.mask_dilation_spinbox.setRange(0, 1024)
             self.mask_dilation_spinbox.setValue(0)
+            self.pca_components_spinbox = QSpinBox()
+            self.pca_components_spinbox.setRange(1, 1024)
+            self.pca_components_spinbox.setValue(3)
+            self.use_frozen_pca_checkbox = QCheckBox()
+            self.use_frozen_pca_checkbox.setChecked(False)
             self.status_label = QLabel(
                 "Select a checkpoint, then open an OME-Zarr or choose an existing image layer."
             )
@@ -923,6 +1082,8 @@ if _QT_AVAILABLE:
 
             pca_button = QPushButton("Show Feature PCA")
             pca_button.clicked.connect(self._show_feature_pca)
+            freeze_pca_button = QPushButton("Freeze PCA Basis")
+            freeze_pca_button.clicked.connect(self._freeze_current_pca_basis)
 
             selected_button = QPushButton("Similarity For Selected Points")
             selected_button.clicked.connect(self._create_layers_for_selected_points)
@@ -952,10 +1113,13 @@ if _QT_AVAILABLE:
             form_layout.addRow("Points Layer", self.points_layer_combo)
             form_layout.addRow("Otsu Foreground Mask", self.otsu_mask_checkbox)
             form_layout.addRow("Mask Dilation", self.mask_dilation_spinbox)
+            form_layout.addRow("PCA Components", self.pca_components_spinbox)
+            form_layout.addRow("Use Frozen PCA", self.use_frozen_pca_checkbox)
 
             button_layout = QHBoxLayout()
             button_layout.addWidget(refresh_button)
             button_layout.addWidget(cache_button)
+            button_layout.addWidget(freeze_pca_button)
             button_layout.addWidget(pca_button)
             button_layout.addWidget(selected_button)
             button_layout.addWidget(all_button)
@@ -976,7 +1140,7 @@ if _QT_AVAILABLE:
             layout.addWidget(scroll_area)
             self.setLayout(layout)
 
-            self.normalization_combo.currentTextChanged.connect(self._invalidate_cache)
+            self.normalization_combo.currentTextChanged.connect(self._invalidate_cache_and_pca_basis)
             self.image_layer_combo.currentTextChanged.connect(self._invalidate_cache)
             self.zarr_scale_combo.currentIndexChanged.connect(self._invalidate_cache)
 
@@ -987,6 +1151,14 @@ if _QT_AVAILABLE:
 
         def _invalidate_cache(self, *_args: Any) -> None:
             self.embedding_cache = None
+
+        def _invalidate_pca_basis(self) -> None:
+            self.frozen_pca_basis = None
+            self.use_frozen_pca_checkbox.setChecked(False)
+
+        def _invalidate_cache_and_pca_basis(self, *_args: Any) -> None:
+            self._invalidate_cache()
+            self._invalidate_pca_basis()
 
         def _browse_zarr_directory(self) -> None:
             directory = QFileDialog.getExistingDirectory(
@@ -1010,7 +1182,7 @@ if _QT_AVAILABLE:
                 return
             self.checkpoint_path_edit.setText(filename)
             self.loaded_backbone = None
-            self._invalidate_cache()
+            self._invalidate_cache_and_pca_basis()
             self._set_status("Checkpoint updated.")
 
         def _load_zarr_scales(self) -> None:
@@ -1045,50 +1217,105 @@ if _QT_AVAILABLE:
                 scale_index = 0
             return self.ome_zarr_spec.scales[scale_index]
 
-        def _open_zarr(self) -> None:
+        def _is_ome_zarr_layer(self, image_layer: Any) -> bool:
+            metadata = getattr(image_layer, "metadata", {}) or {}
+            return (
+                self.ome_zarr_spec is not None
+                and self._zarr_root is not None
+                and metadata.get("ome_zarr_multiscale", False)
+                and metadata.get("ome_zarr_path") == self.ome_zarr_spec.path
+            )
+
+        def _read_zarr_crop(self, spatial_crop: SpatialCrop) -> np.ndarray:
+            if self._zarr_root is None or self.ome_zarr_spec is None:
+                raise RuntimeError("no OME-Zarr is currently open")
             selected_scale = self._selected_zarr_scale()
+            zarr_array = self._zarr_root[selected_scale.path]
+            z0, y0, x0, z1, y1, x1 = spatial_crop.bounds
+            spatial_slices = {"z": slice(z0, z1), "y": slice(y0, y1), "x": slice(x0, x1)}
+            slices = tuple(
+                spatial_slices.get(axis_name, slice(None))
+                for axis_name in selected_scale.axes
+            )
+            cropped = np.asarray(zarr_array[slices])
+            return _reorder_ome_zarr_array(cropped, axes=selected_scale.axes)
+
+        def _crop_layer_transforms(
+            self,
+            image_layer: Any,
+            crop_start_zyx: tuple[int, int, int],
+        ) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+            if self._is_ome_zarr_layer(image_layer):
+                selected_scale = self._selected_zarr_scale()
+                spatial_scale = selected_scale.spatial_scale
+                spatial_translate = tuple(
+                    float(t + s * sc)
+                    for t, s, sc in zip(
+                        selected_scale.spatial_translate, crop_start_zyx, selected_scale.spatial_scale,
+                    )
+                )
+                return spatial_scale, spatial_translate
+            spatial_scale = tuple(float(v) for v in np.asarray(image_layer.scale, dtype=np.float64)[-3:])
+            spatial_translate = cropped_spatial_translate(image_layer, crop_start_zyx=crop_start_zyx)
+            return spatial_scale, spatial_translate
+
+        def _open_zarr(self) -> None:
+            import dask.array as da
+
             if self.ome_zarr_spec is None:
-                raise RuntimeError("OME-Zarr metadata was not loaded")
+                self._load_zarr_scales()
+            if self.ome_zarr_spec is None or not self.ome_zarr_spec.scales:
+                raise ValueError("load an OME-Zarr before opening")
 
             self._set_status(
                 f"Opening {Path(self.ome_zarr_spec.path.rstrip('/')).name or self.ome_zarr_spec.path} "
-                f"scale {selected_scale.index}..."
+                f"as multiscale lazy array..."
             )
-            image_data = load_ome_zarr_array(self.ome_zarr_spec.path, selected_scale)
-            layer_scale, layer_translate = ome_zarr_layer_transform(selected_scale)
+
+            path_str = _normalize_path_string(self.ome_zarr_spec.path)
+            root = zarr.open_group(path_str, mode="r")
+            self._zarr_root = root
+
+            multiscale_data = []
+            for scale in self.ome_zarr_spec.scales:
+                zarr_array = root[scale.path]
+                dask_array = da.from_zarr(zarr_array)
+                channel_axis = scale.channel_axis
+                target_axes = ("c", "z", "y", "x") if channel_axis is not None else ("z", "y", "x")
+                permutation = tuple(scale.axes.index(name) for name in target_axes)
+                if permutation != tuple(range(len(target_axes))):
+                    dask_array = da.transpose(dask_array, axes=permutation)
+                multiscale_data.append(dask_array)
+
+            base_scale = self.ome_zarr_spec.scales[0]
+            layer_scale, layer_translate = ome_zarr_layer_transform(base_scale)
             layer_basename = Path(self.ome_zarr_spec.path.rstrip("/")).name or self.ome_zarr_spec.path.rstrip("/").split("/")[-1]
-            layer_name = f"{layer_basename}_s{selected_scale.index}"
+            layer_name = layer_basename
             bbox_layer_name = f"{layer_name}_bbox"
             metadata = {
                 "ome_zarr_path": self.ome_zarr_spec.path,
-                "ome_zarr_scale_index": int(selected_scale.index),
-                "ome_zarr_scale_path": selected_scale.path,
-                "ome_zarr_axes": list(selected_scale.axes),
+                "ome_zarr_multiscale": True,
                 "bbox_layer_name": bbox_layer_name,
             }
 
             if layer_name in self.viewer.layers:
-                image_layer = self.viewer.layers[layer_name]
-                image_layer.data = image_data
-                image_layer.scale = layer_scale
-                image_layer.translate = layer_translate
-                image_layer.metadata = metadata
-            else:
-                image_layer = self.viewer.add_image(
-                    image_data,
-                    name=layer_name,
-                    scale=layer_scale,
-                    translate=layer_translate,
-                    metadata=metadata,
-                )
+                self.viewer.layers.remove(layer_name)
+            image_layer = self.viewer.add_image(
+                multiscale_data,
+                multiscale=True,
+                name=layer_name,
+                scale=layer_scale,
+                translate=layer_translate,
+                metadata=metadata,
+            )
 
             bbox_layer = self._ensure_bbox_layer_for_image(image_layer)
             self._invalidate_cache()
             self.refresh_layer_choices()
             self._restore_combo_text(self.image_layer_combo, image_layer.name)
             self._set_status(
-                f"Opened {layer_name}. Draw a rectangle in {bbox_layer.name}; embeddings use that YX bbox "
-                f"across the full Z span of scale {selected_scale.index}."
+                f"Opened {layer_name} with {len(self.ome_zarr_spec.scales)} scale level(s). "
+                f"Draw a rectangle in {bbox_layer.name}; select scale for embedding resolution."
             )
 
         def refresh_layer_choices(self) -> None:
@@ -1193,8 +1420,10 @@ if _QT_AVAILABLE:
                 bbox_layer.metadata = bbox_metadata
                 return bbox_layer
 
+            data = image_layer.data
+            ndim = data[0].ndim if isinstance(data, (list, tuple)) else np.asarray(data).ndim
             return self.viewer.add_shapes(
-                ndim=np.asarray(image_layer.data).ndim,
+                ndim=ndim,
                 name=bbox_layer_name,
                 scale=image_scale,
                 translate=image_translate,
@@ -1227,10 +1456,16 @@ if _QT_AVAILABLE:
             image_layer: Any,
             loaded_backbone: LoadedBackbone,
         ) -> SpatialCrop:
-            source_shape = infer_image_spatial_shape(
-                np.asarray(image_layer.data),
-                input_channels=loaded_backbone.input_channels,
-            )
+            is_ome_zarr = self._is_ome_zarr_layer(image_layer)
+            if is_ome_zarr:
+                selected_scale = self._selected_zarr_scale()
+                source_shape = selected_scale.spatial_shape
+            else:
+                source_shape = infer_image_spatial_shape(
+                    np.asarray(image_layer.data),
+                    input_channels=loaded_backbone.input_channels,
+                )
+
             bbox_layer = self._bbox_layer_for_image(image_layer)
             if bbox_layer is None:
                 return SpatialCrop((0, 0, 0), source_shape, None)
@@ -1241,11 +1476,17 @@ if _QT_AVAILABLE:
                 [bbox_layer.data_to_world(vertex) for vertex in rectangle_vertices],
                 dtype=np.float64,
             )
-            image_vertices = np.asarray(
-                [image_layer.world_to_data(vertex) for vertex in world_vertices],
-                dtype=np.float64,
-            )
-            spatial_vertices = image_vertices[:, -3:]
+
+            if is_ome_zarr:
+                scale_arr = np.asarray(selected_scale.spatial_scale, dtype=np.float64)
+                translate_arr = np.asarray(selected_scale.spatial_translate, dtype=np.float64)
+                spatial_vertices = (world_vertices[:, -3:] - translate_arr) / scale_arr
+            else:
+                image_vertices = np.asarray(
+                    [image_layer.world_to_data(vertex) for vertex in world_vertices],
+                    dtype=np.float64,
+                )
+                spatial_vertices = image_vertices[:, -3:]
 
             y0 = max(0, int(np.floor(np.min(spatial_vertices[:, 1]))))
             x0 = max(0, int(np.floor(np.min(spatial_vertices[:, 2]))))
@@ -1266,11 +1507,14 @@ if _QT_AVAILABLE:
             spatial_crop = self._spatial_crop_for_image(image_layer=image_layer, loaded_backbone=loaded_backbone)
             self._set_status(f"Computing patch embeddings for {image_layer.name} within bbox {spatial_crop.bounds}...")
 
-            cropped_volume = crop_image_to_spatial_bbox(
-                np.asarray(image_layer.data),
-                spatial_crop.bounds,
-                input_channels=loaded_backbone.input_channels,
-            )
+            if self._is_ome_zarr_layer(image_layer):
+                cropped_volume = self._read_zarr_crop(spatial_crop)
+            else:
+                cropped_volume = crop_image_to_spatial_bbox(
+                    np.asarray(image_layer.data),
+                    spatial_crop.bounds,
+                    input_channels=loaded_backbone.input_channels,
+                )
             patch_embeddings, source_shape, padded_shape = compute_patch_embedding_grid(
                 cropped_volume,
                 loaded_backbone,
@@ -1310,6 +1554,11 @@ if _QT_AVAILABLE:
         def _point_image_coordinates(self, image_layer: Any, points_layer: Any, point_index: int) -> np.ndarray:
             point = np.asarray(points_layer.data[point_index], dtype=np.float64)
             world = np.asarray(points_layer.data_to_world(point), dtype=np.float64)
+            if self._is_ome_zarr_layer(image_layer):
+                selected_scale = self._selected_zarr_scale()
+                scale_arr = np.asarray(selected_scale.spatial_scale, dtype=np.float64)
+                translate_arr = np.asarray(selected_scale.spatial_translate, dtype=np.float64)
+                return (world[-3:] - translate_arr) / scale_arr
             image_coords = np.asarray(image_layer.world_to_data(world), dtype=np.float64)
             return image_coords[-3:]
 
@@ -1330,10 +1579,8 @@ if _QT_AVAILABLE:
             spatial_bbox: tuple[int, int, int, int, int, int],
             metadata: dict[str, Any],
         ) -> None:
-            spatial_scale = tuple(float(v) for v in np.asarray(image_layer.scale, dtype=np.float64)[-3:])
-            spatial_translate = cropped_spatial_translate(
-                image_layer,
-                crop_start_zyx=tuple(int(v) for v in spatial_bbox[:3]),
+            spatial_scale, spatial_translate = self._crop_layer_transforms(
+                image_layer, crop_start_zyx=tuple(int(v) for v in spatial_bbox[:3]),
             )
             if layer_name in self.viewer.layers:
                 layer = self.viewer.layers[layer_name]
@@ -1365,10 +1612,8 @@ if _QT_AVAILABLE:
             spatial_bbox: tuple[int, int, int, int, int, int],
             metadata: dict[str, Any],
         ) -> None:
-            spatial_scale = tuple(float(v) for v in np.asarray(image_layer.scale, dtype=np.float64)[-3:])
-            spatial_translate = cropped_spatial_translate(
-                image_layer,
-                crop_start_zyx=tuple(int(v) for v in spatial_bbox[:3]),
+            spatial_scale, spatial_translate = self._crop_layer_transforms(
+                image_layer, crop_start_zyx=tuple(int(v) for v in spatial_bbox[:3]),
             )
             if layer_name in self.viewer.layers:
                 layer = self.viewer.layers[layer_name]
@@ -1391,6 +1636,12 @@ if _QT_AVAILABLE:
                 rgb=True,
             )
 
+        def _remove_stale_pca_layers(self, *, base_layer_name: str, keep_layer_names: set[str]) -> None:
+            for layer in list(self.viewer.layers):
+                if layer.name == base_layer_name or layer.name.startswith(f"{base_layer_name}_c"):
+                    if layer.name not in keep_layer_names:
+                        self.viewer.layers.remove(layer)
+
         def _foreground_mask_for_pca(
             self,
             *,
@@ -1402,11 +1653,18 @@ if _QT_AVAILABLE:
                 return None, None
 
             dilation_radius = int(self.mask_dilation_spinbox.value())
-            cropped_image = crop_image_to_spatial_bbox(
-                np.asarray(image_layer.data),
-                embedding_cache.source_bbox,
-                input_channels=loaded_backbone.input_channels,
-            )
+            if self._is_ome_zarr_layer(image_layer):
+                crop = SpatialCrop(
+                    start_zyx=tuple(int(v) for v in embedding_cache.source_bbox[:3]),
+                    stop_zyx=tuple(int(v) for v in embedding_cache.source_bbox[3:]),
+                )
+                cropped_image = self._read_zarr_crop(crop)
+            else:
+                cropped_image = crop_image_to_spatial_bbox(
+                    np.asarray(image_layer.data),
+                    embedding_cache.source_bbox,
+                    input_channels=loaded_backbone.input_channels,
+                )
             foreground_mask = compute_otsu_foreground_mask(
                 cropped_image,
                 input_channels=loaded_backbone.input_channels,
@@ -1418,6 +1676,111 @@ if _QT_AVAILABLE:
                 padded_shape=embedding_cache.padded_shape,
             )
             return foreground_mask, patch_mask
+
+        def _compute_pca_basis_for_current_crop(
+            self,
+            *,
+            loaded_backbone: LoadedBackbone,
+            embedding_cache: EmbeddingCache,
+            image_layer: Any,
+            requested_components: int,
+        ) -> tuple[FrozenPcaBasis, np.ndarray | None]:
+            foreground_mask, patch_mask = self._foreground_mask_for_pca(
+                image_layer=image_layer,
+                loaded_backbone=loaded_backbone,
+                embedding_cache=embedding_cache,
+            )
+            mean_embedding, pca_components = compute_patch_embedding_pca_basis(
+                embedding_cache.normalized_patch_embeddings,
+                n_components=requested_components,
+                patch_mask=patch_mask,
+            )
+            component_minima, component_maxima = compute_projected_patch_component_ranges(
+                embedding_cache.normalized_patch_embeddings,
+                mean_embedding=mean_embedding,
+                components=pca_components,
+                patch_mask=patch_mask,
+            )
+            basis = FrozenPcaBasis(
+                checkpoint_path=embedding_cache.checkpoint_path,
+                normalization_scheme=loaded_backbone.normalization_scheme,
+                embedding_channels=int(embedding_cache.normalized_patch_embeddings.shape[-1]),
+                requested_components=int(requested_components),
+                actual_components=int(pca_components.shape[1]),
+                mean_embedding=mean_embedding,
+                components=pca_components,
+                component_minima=component_minima,
+                component_maxima=component_maxima,
+                source_image_layer_name=image_layer.name,
+                source_bbox=embedding_cache.source_bbox,
+                mask_method="otsu" if foreground_mask is not None else "none",
+                mask_dilation_radius=int(self.mask_dilation_spinbox.value()) if foreground_mask is not None else 0,
+            )
+            return basis, foreground_mask
+
+        def _freeze_current_pca_basis(self) -> None:
+            loaded_backbone, embedding_cache = self._ensure_embedding_cache()
+            image_layer = self._selected_image_layer()
+            requested_components = int(self.pca_components_spinbox.value())
+            self._set_status(
+                f"Freezing PCA basis from {image_layer.name} within bbox {embedding_cache.source_bbox} "
+                f"using {requested_components} component(s)..."
+            )
+            basis, _ = self._compute_pca_basis_for_current_crop(
+                loaded_backbone=loaded_backbone,
+                embedding_cache=embedding_cache,
+                image_layer=image_layer,
+                requested_components=requested_components,
+            )
+            self.frozen_pca_basis = basis
+            self.use_frozen_pca_checkbox.setChecked(True)
+            mask_suffix = (
+                f" with Otsu mask (dilation={basis.mask_dilation_radius})"
+                if basis.mask_method == "otsu"
+                else ""
+            )
+            self._set_status(
+                f"Frozen PCA basis from {basis.source_image_layer_name} within bbox {basis.source_bbox} "
+                f"using components 0:{basis.actual_components}{mask_suffix}."
+            )
+
+        def _resolve_pca_basis(
+            self,
+            *,
+            loaded_backbone: LoadedBackbone,
+            embedding_cache: EmbeddingCache,
+            image_layer: Any,
+            requested_components: int,
+        ) -> tuple[FrozenPcaBasis, np.ndarray | None, str]:
+            if self.use_frozen_pca_checkbox.isChecked():
+                if self.frozen_pca_basis is None:
+                    raise ValueError("no frozen PCA basis is available; click 'Freeze PCA Basis' first")
+                basis = self.frozen_pca_basis
+                if basis.checkpoint_path != embedding_cache.checkpoint_path:
+                    raise ValueError("frozen PCA basis checkpoint does not match the current checkpoint")
+                if basis.normalization_scheme != loaded_backbone.normalization_scheme:
+                    raise ValueError("frozen PCA basis normalization does not match the current normalization setting")
+                if basis.embedding_channels != int(embedding_cache.normalized_patch_embeddings.shape[-1]):
+                    raise ValueError("frozen PCA basis embedding dimensionality does not match the current embeddings")
+                if basis.actual_components < requested_components:
+                    raise ValueError(
+                        f"frozen PCA basis only has {basis.actual_components} component(s); "
+                        "increase 'PCA Components' and freeze again on the reference crop"
+                    )
+                foreground_mask, _ = self._foreground_mask_for_pca(
+                    image_layer=image_layer,
+                    loaded_backbone=loaded_backbone,
+                    embedding_cache=embedding_cache,
+                )
+                return basis, foreground_mask, "frozen"
+
+            basis, foreground_mask = self._compute_pca_basis_for_current_crop(
+                loaded_backbone=loaded_backbone,
+                embedding_cache=embedding_cache,
+                image_layer=image_layer,
+                requested_components=requested_components,
+            )
+            return basis, foreground_mask, "local"
 
         def _create_similarity_layers(self, point_indices: list[int]) -> None:
             _, embedding_cache = self._ensure_embedding_cache()
@@ -1480,39 +1843,74 @@ if _QT_AVAILABLE:
         def _show_feature_pca(self) -> None:
             loaded_backbone, embedding_cache = self._ensure_embedding_cache()
             image_layer = self._selected_image_layer()
-            self._set_status(f"Computing PCA visualization for {image_layer.name} within bbox...")
+            requested_components = int(self.pca_components_spinbox.value())
+            basis_label = "frozen" if self.use_frozen_pca_checkbox.isChecked() else "local"
+            self._set_status(
+                f"Computing PCA visualization for {image_layer.name} within bbox "
+                f"using {requested_components} component(s) with {basis_label} basis..."
+            )
 
-            foreground_mask, patch_mask = self._foreground_mask_for_pca(
-                image_layer=image_layer,
+            basis, foreground_mask, basis_mode = self._resolve_pca_basis(
                 loaded_backbone=loaded_backbone,
                 embedding_cache=embedding_cache,
-            )
-            pca_patch_grid = project_patch_embeddings_to_pca_rgb(
-                embedding_cache.normalized_patch_embeddings,
-                patch_mask=patch_mask,
-            )
-            pca_volume = upsample_patch_grid_to_volume(
-                pca_patch_grid,
-                patch_size=embedding_cache.patch_size,
-                output_shape=embedding_cache.source_shape,
-            )
-            if foreground_mask is not None:
-                pca_volume[~foreground_mask] = 0.0
-
-            layer_name = f"feature_pca_{image_layer.name}"
-            metadata = {
-                "checkpoint_path": str(embedding_cache.checkpoint_path),
-                "mask_method": "otsu" if foreground_mask is not None else "none",
-                "mask_dilation_radius": int(self.mask_dilation_spinbox.value()) if foreground_mask is not None else 0,
-                "source_bbox_zyxzyx": list(embedding_cache.source_bbox),
-                "bbox_layer_name": embedding_cache.bbox_layer_name,
-            }
-            self._replace_or_add_pca_layer(
-                layer_name=layer_name,
-                pca_volume=pca_volume,
                 image_layer=image_layer,
-                spatial_bbox=embedding_cache.source_bbox,
-                metadata=metadata,
+                requested_components=requested_components,
+            )
+            actual_components = min(int(basis.actual_components), requested_components)
+            base_layer_name = f"feature_pca_{image_layer.name}"
+            created_layer_names: set[str] = set()
+            created_count = 0
+            for component_start in range(0, actual_components, 3):
+                component_stop = min(component_start + 3, actual_components)
+                pca_patch_grid = project_patch_embeddings_to_pca(
+                    embedding_cache.normalized_patch_embeddings,
+                    mean_embedding=basis.mean_embedding,
+                    components=basis.components[:, component_start:component_stop],
+                    component_minima=basis.component_minima[component_start:component_stop],
+                    component_maxima=basis.component_maxima[component_start:component_stop],
+                )
+                pca_chunk = np.zeros((*pca_patch_grid.shape[:3], 3), dtype=np.float32)
+                pca_chunk[..., : component_stop - component_start] = pca_patch_grid
+                pca_volume = upsample_patch_grid_to_volume(
+                    pca_chunk,
+                    patch_size=embedding_cache.patch_size,
+                    output_shape=embedding_cache.source_shape,
+                )
+                if foreground_mask is not None:
+                    pca_volume[~foreground_mask] = 0.0
+
+                layer_name = f"{base_layer_name}_c{component_start:03d}_{component_stop - 1:03d}"
+                created_layer_names.add(layer_name)
+                metadata = {
+                    "checkpoint_path": str(embedding_cache.checkpoint_path),
+                    "mask_method": "otsu" if foreground_mask is not None else "none",
+                    "mask_dilation_radius": (
+                        int(self.mask_dilation_spinbox.value()) if foreground_mask is not None else 0
+                    ),
+                    "source_bbox_zyxzyx": list(embedding_cache.source_bbox),
+                    "bbox_layer_name": embedding_cache.bbox_layer_name,
+                    "pca_basis_mode": basis_mode,
+                    "pca_requested_components": requested_components,
+                    "pca_actual_components": actual_components,
+                    "pca_component_start": component_start,
+                    "pca_component_stop": component_stop,
+                    "pca_basis_source_image_layer": basis.source_image_layer_name,
+                    "pca_basis_source_bbox_zyxzyx": list(basis.source_bbox),
+                    "pca_basis_source_mask_method": basis.mask_method,
+                    "pca_basis_source_mask_dilation_radius": basis.mask_dilation_radius,
+                }
+                self._replace_or_add_pca_layer(
+                    layer_name=layer_name,
+                    pca_volume=pca_volume,
+                    image_layer=image_layer,
+                    spatial_bbox=embedding_cache.source_bbox,
+                    metadata=metadata,
+                )
+                created_count += 1
+
+            self._remove_stale_pca_layers(
+                base_layer_name=base_layer_name,
+                keep_layer_names=created_layer_names,
             )
 
             mask_suffix = (
@@ -1520,9 +1918,15 @@ if _QT_AVAILABLE:
                 if foreground_mask is not None
                 else ""
             )
+            basis_suffix = (
+                f" using frozen basis from {basis.source_image_layer_name} {basis.source_bbox}"
+                if basis_mode == "frozen"
+                else ""
+            )
             self._set_status(
-                f"Created PCA feature layer for {image_layer.name} within bbox {embedding_cache.source_bbox}"
-                f"{mask_suffix}."
+                f"Created {created_count} PCA feature layer(s) for {image_layer.name} within bbox "
+                f"{embedding_cache.source_bbox} from components 0:{actual_components}{mask_suffix}"
+                f"{basis_suffix}."
             )
 
         def _create_layers_for_selected_points(self) -> None:
