@@ -6,7 +6,7 @@
 		"station_n": 0.0,
 		"station_t": 0.0001,
 		"winding_density": 1.0,
-		"ext_offset": 1.0,
+		"ext_offset": 0.1,
 		"data": 0.0,
 		"data_plain": 0.0,
 		"pred_dt": 0.001,
@@ -16,7 +16,7 @@
 	"stages": [
 		{
 			"name": "init",
-			"steps": 0,
+			"steps": 500,
 			"min_scaledown": 3,
 			"lr": [100.0, 10.0, 1.0, 0.1, 0.01, 0.001],
 			"params": ["mesh_ms"],
@@ -26,7 +26,7 @@
 		},
 		{
 			"name": "opt",
-			"steps": 0,
+			"steps": 1000,
 			"min_scaledown": 0,
 			"lr": [100.0, 10.0, 1.0, 0.1, 0.01, 0.001],
 			"params": ["mesh_ms"],
@@ -36,7 +36,7 @@
 		},
 		{
 			"name": "snap",
-			"steps": 0,
+			"steps": 1000,
 			"min_scaledown": 0,
 			"lr": [100.0, 10.0, 1.0, 0.1, 0.01, 0.001],
 			"params": ["mesh_ms"],

@@ -1,8 +1,7 @@
 """Station-keeping loss: anchor the mesh to the seed point.
 
-Intersects a ray (seed + t * GT_normal) with all winding surfaces using
-ray-quad intersection. Everything except the final L2 is non-differentiable
-— gradients come purely from the proxy-point construction.
+Tracks the ray-surface intersection position incrementally (one quad per
+winding, analytic solve) instead of brute-forcing all quads every step.
 
 Two loss components:
   - Normal-offset: central winding's offset from seed along the GT normal
@@ -20,15 +19,20 @@ import model as fit_model
 # Module state — set once via set_seed(), persists across stages.
 _seed: torch.Tensor | None = None   # (3,) base coords
 _n_gt: torch.Tensor | None = None   # (3,) GT unit normal at seed
+_h_frac: list[float] = []           # tracked h position per winding
+_w_frac: list[float] = []           # tracked w position per winding
 
 
-def set_seed(seed_xyz: torch.Tensor, data: "fit_data.FitData3D") -> None:
+def set_seed(seed_xyz: torch.Tensor, data: "fit_data.FitData3D",
+             *, Hm: int, Wm: int, D: int = 1) -> None:
     """Set the seed point and sample the GT normal from the data volume.
 
     seed_xyz: (3,) tensor in base (VC3D) coords.
     data: loaded FitData3D for grid_sample.
+    Hm, Wm: model grid dimensions (for initializing tracked position).
+    D: number of windings.
     """
-    global _seed, _n_gt
+    global _seed, _n_gt, _h_frac, _w_frac
     _seed = seed_xyz.detach().clone()
 
     # Sample GT normal at seed point
@@ -41,151 +45,107 @@ def set_seed(seed_xyz: torch.Tensor, data: "fit_data.FitData3D") -> None:
     _n_gt = torch.tensor([nx, ny, nz], device=seed_xyz.device, dtype=torch.float32)
     norm = _n_gt.norm().clamp(min=1e-8)
     _n_gt = _n_gt / norm
+
+    # Initialize tracked position at grid center for each winding
+    _h_frac = [(Hm - 1) / 2.0] * D
+    _w_frac = [(Wm - 1) / 2.0] * D
+
     print(f"[station] seed=({seed_xyz[0]:.0f},{seed_xyz[1]:.0f},{seed_xyz[2]:.0f}) "
-          f"n_gt=({_n_gt[0]:.3f},{_n_gt[1]:.3f},{_n_gt[2]:.3f})", flush=True)
+          f"n_gt=({_n_gt[0]:.3f},{_n_gt[1]:.3f},{_n_gt[2]:.3f}) "
+          f"grid={Hm}x{Wm} D={D}", flush=True)
 
 
 def reset() -> None:
-    global _seed, _n_gt
+    global _seed, _n_gt, _h_frac, _w_frac
     _seed = None
     _n_gt = None
+    _h_frac = []
+    _w_frac = []
 
 
 # ---------------------------------------------------------------------------
-# Ray-quad intersection (bilinear patch, iterative Newton)
+# Analytic ray-quad intersection (single quad, scalar)
 # ---------------------------------------------------------------------------
 
-def _ray_quad_intersect(
-    origin: torch.Tensor,     # (3,)
-    direction: torch.Tensor,  # (3,)
-    p00: torch.Tensor,        # (N, 3)
-    p10: torch.Tensor,        # (N, 3)
-    p01: torch.Tensor,        # (N, 3)
-    p11: torch.Tensor,        # (N, 3)
-    n_iters: int = 8,
-    eps: float = 1e-7,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Vectorized ray vs bilinear quad intersection.
+def _intersect_single_quad(
+    O: torch.Tensor,    # (3,) ray origin
+    n: torch.Tensor,    # (3,) ray direction
+    P00: torch.Tensor,  # (3,)
+    P10: torch.Tensor,  # (3,)
+    P01: torch.Tensor,  # (3,)
+    P11: torch.Tensor,  # (3,)
+    frac_h: float,      # expected u (for root selection)
+    frac_w: float,      # expected v (for root selection)
+    eps: float = 1e-12,
+) -> tuple[float, float, torch.Tensor]:
+    """Analytic ray vs bilinear quad intersection.
 
-    Bilinear patch: P(u,v) = (1-u)(1-v)*p00 + u*(1-v)*p10 + (1-u)*v*p01 + u*v*p11
-    Ray: R(t) = origin + t*direction
-    Solve P(u,v) = R(t) via Newton iteration.
-
-    Returns (t, u, v, hit) all shape (N,). hit is bool mask.
+    Same solver as _intersect_ext_surfaces in model.py.
+    Returns (u, v, conn_pt).
     """
-    N = p00.shape[0]
-    dev = p00.device
+    a = P10 - P00
+    b = P01 - P00
+    c = P11 - P10 - P01 + P00
+    g = P00 - O
 
-    # Initial guess: u=0.5, v=0.5, t from centroid
-    u = torch.full((N,), 0.5, device=dev)
-    v = torch.full((N,), 0.5, device=dev)
-    centroid = 0.25 * (p00 + p10 + p01 + p11)
-    t = ((centroid - origin.unsqueeze(0)) * direction.unsqueeze(0)).sum(-1) / \
-        (direction * direction).sum().clamp(min=eps)
+    def cross2(vec: torch.Tensor, i: int, j: int) -> torch.Tensor:
+        return vec[i] * n[j] - vec[j] * n[i]
 
-    for _ in range(n_iters):
-        # P(u,v)
-        P = ((1 - u) * (1 - v)).unsqueeze(-1) * p00 + \
-            (u * (1 - v)).unsqueeze(-1) * p10 + \
-            ((1 - u) * v).unsqueeze(-1) * p01 + \
-            (u * v).unsqueeze(-1) * p11  # (N, 3)
+    Ap = [cross2(a, 0, 1), cross2(a, 0, 2), cross2(a, 1, 2)]
+    Bp = [cross2(b, 0, 1), cross2(b, 0, 2), cross2(b, 1, 2)]
+    Cp = [cross2(c, 0, 1), cross2(c, 0, 2), cross2(c, 1, 2)]
+    Gp = [cross2(g, 0, 1), cross2(g, 0, 2), cross2(g, 1, 2)]
 
-        # Residual: P(u,v) - R(t)
-        R = origin.unsqueeze(0) + t.unsqueeze(-1) * direction.unsqueeze(0)
-        residual = P - R  # (N, 3)
+    qpairs = [(0, 1), (0, 2), (1, 2)]
+    alphas, betas_q, gammas = [], [], []
+    for p, q in qpairs:
+        alphas.append(Ap[p] * Cp[q] - Ap[q] * Cp[p])
+        betas_q.append(Ap[p] * Bp[q] - Ap[q] * Bp[p] + Gp[p] * Cp[q] - Gp[q] * Cp[p])
+        gammas.append(Gp[p] * Bp[q] - Gp[q] * Bp[p])
 
-        # Jacobian columns: dP/du, dP/dv, -direction
-        dPdu = (-(1 - v)).unsqueeze(-1) * p00 + ((1 - v)).unsqueeze(-1) * p10 + \
-               (-v).unsqueeze(-1) * p01 + v.unsqueeze(-1) * p11  # (N, 3)
-        dPdv = (-(1 - u)).unsqueeze(-1) * p00 + (-u).unsqueeze(-1) * p10 + \
-               ((1 - u)).unsqueeze(-1) * p01 + u.unsqueeze(-1) * p11  # (N, 3)
-        neg_d = -direction.unsqueeze(0).expand(N, 3)  # (N, 3)
+    # Pick best-conditioned plane pair
+    abs_a = [aa.abs().item() for aa in alphas]
+    best_idx = max(range(3), key=lambda i: abs_a[i])
+    alpha = alphas[best_idx]
+    beta = betas_q[best_idx]
+    gamma = gammas[best_idx]
 
-        # Solve 3x3 system [dPdu | dPdv | neg_d] * [du, dv, dt]^T = -residual
-        # Using Cramer's rule vectorized
-        J0, J1, J2 = dPdu, dPdv, neg_d
-        rhs = -residual
+    # Quadratic for u
+    alpha_f = alpha.item()
+    beta_f = beta.item()
+    gamma_f = gamma.item()
 
-        # Cross products for Cramer
-        c01 = torch.linalg.cross(J0, J1)  # (N, 3)
-        det = (c01 * J2).sum(-1)  # (N,)
-        safe_det = torch.where(det.abs() > eps, det, torch.ones_like(det))
+    if abs(alpha_f) < eps:
+        # Linear
+        if abs(beta_f) < eps:
+            u_val = frac_h
+        else:
+            u_val = -gamma_f / beta_f
+    else:
+        disc = beta_f * beta_f - 4.0 * alpha_f * gamma_f
+        if disc < 0:
+            disc = 0.0
+        sqrt_disc = disc ** 0.5
+        u1 = (-beta_f + sqrt_disc) / (2.0 * alpha_f)
+        u2 = (-beta_f - sqrt_disc) / (2.0 * alpha_f)
+        u_val = u1 if abs(u1 - frac_h) <= abs(u2 - frac_h) else u2
 
-        c_rhs_1 = torch.linalg.cross(rhs, J1)
-        du = (c_rhs_1 * J2).sum(-1) / safe_det
-        c0_rhs = torch.linalg.cross(J0, rhs)
-        dv = (c0_rhs * J2).sum(-1) / safe_det
-        dt = (c01 * rhs).sum(-1) / safe_det
+    # Back-substitute for v: pick best-conditioned denominator
+    denom_v = [Bp[k].item() + u_val * Cp[k].item() for k in range(3)]
+    numer_v = [-(Gp[k].item() + u_val * Ap[k].item()) for k in range(3)]
+    abs_dv = [abs(d) for d in denom_v]
+    best_v = max(range(3), key=lambda i: abs_dv[i])
+    if abs_dv[best_v] < eps:
+        v_val = frac_w
+    else:
+        v_val = numer_v[best_v] / denom_v[best_v]
 
-        # Mask degenerate
-        good = det.abs() > eps
-        u = u + torch.where(good, du, torch.zeros_like(du))
-        v = v + torch.where(good, dv, torch.zeros_like(dv))
-        t = t + torch.where(good, dt, torch.zeros_like(dt))
+    # Intersection point
+    u_t = torch.tensor(u_val, device=O.device, dtype=O.dtype)
+    v_t = torch.tensor(v_val, device=O.device, dtype=O.dtype)
+    conn_pt = P00 + u_t * a + v_t * b + (u_t * v_t) * c
 
-    # Check convergence: u,v in [0,1] and residual small
-    P_final = ((1 - u) * (1 - v)).unsqueeze(-1) * p00 + \
-              (u * (1 - v)).unsqueeze(-1) * p10 + \
-              ((1 - u) * v).unsqueeze(-1) * p01 + \
-              (u * v).unsqueeze(-1) * p11
-    R_final = origin.unsqueeze(0) + t.unsqueeze(-1) * direction.unsqueeze(0)
-    res_norm = (P_final - R_final).norm(dim=-1)
-
-    hit = (u >= -eps) & (u <= 1.0 + eps) & (v >= -eps) & (v <= 1.0 + eps) & (res_norm < 1.0)
-
-    return t, u, v, hit
-
-
-def _intersect_winding(
-    seed: torch.Tensor,     # (3,)
-    n_gt: torch.Tensor,     # (3,)
-    surf: torch.Tensor,     # (H, W, 3) — detached
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, bool]:
-    """Intersect ray with one winding surface using quad patches.
-
-    All computation is non-differentiable.
-    Returns (p_int, h_frac, w_frac, quad_normal, did_hit).
-    quad_normal is the geometric normal of the hit quad (for orienting per-vertex normals).
-    """
-    H, W, _ = surf.shape
-    # Build quad corners — all (H-1)*(W-1) quads in parallel
-    p00 = surf[:-1, :-1].reshape(-1, 3)
-    p10 = surf[1:, :-1].reshape(-1, 3)
-    p01 = surf[:-1, 1:].reshape(-1, 3)
-    p11 = surf[1:, 1:].reshape(-1, 3)
-
-    t, u, v, hit = _ray_quad_intersect(seed, n_gt, p00, p10, p01, p11)
-
-    if not hit.any():
-        dev = surf.device
-        z3 = torch.zeros(3, device=dev)
-        return (z3, torch.tensor(0.0, device=dev),
-                torch.tensor(0.0, device=dev), z3, False)
-
-    # Grid indices for each quad
-    rows = torch.arange(H - 1, device=surf.device).unsqueeze(1).expand(H - 1, W - 1).reshape(-1).float()
-    cols = torch.arange(W - 1, device=surf.device).unsqueeze(0).expand(H - 1, W - 1).reshape(-1).float()
-
-    # Fractional grid position: quad (r,c) with parameters (u,v)
-    h_frac = rows + u
-    w_frac = cols + v
-
-    # Pick the hit with smallest |t|
-    t_masked = torch.where(hit, t.abs(), torch.full_like(t, float("inf")))
-    best = t_masked.argmin()
-
-    # Intersection point on the bilinear patch
-    ub, vb = u[best], v[best]
-    p_int = ((1 - ub) * (1 - vb)) * p00[best] + (ub * (1 - vb)) * p10[best] + \
-            ((1 - ub) * vb) * p01[best] + (ub * vb) * p11[best]
-
-    # Quad geometric normal from diagonals cross product
-    diag1 = p11[best] - p00[best]
-    diag2 = p01[best] - p10[best]
-    quad_normal = torch.linalg.cross(diag1, diag2)
-    quad_normal = quad_normal / quad_normal.norm().clamp(min=1e-8)
-
-    return p_int, h_frac[best], w_frac[best], quad_normal, True
+    return u_val, v_val, conn_pt
 
 
 # ---------------------------------------------------------------------------
@@ -201,10 +161,9 @@ def _huber(x: torch.Tensor, delta: float = 1.0) -> torch.Tensor:
 def station_loss(
     *, res: fit_model.FitResult3D,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-    """Station-keeping loss anchored to seed point.
+    """Station-keeping loss anchored to seed point."""
+    global _h_frac, _w_frac
 
-    Everything except the final L2(xyz_lr, proxy) is computed without gradients.
-    """
     dev = res.xyz_lr.device
     D, Hm, Wm, _ = res.xyz_lr.shape
     zero = torch.zeros((), device=dev)
@@ -222,31 +181,50 @@ def station_loss(
     d_center = (D - 1) // 2
     xyz_det = res.xyz_lr.detach()
 
-    # --- Intersect all windings (non-differentiable) ---
-    with torch.no_grad():
-        intersections: list[tuple[int, torch.Tensor, float, float, torch.Tensor]] = []
-        for d in range(D):
-            p_int, h_frac, w_frac, quad_n, did_hit = _intersect_winding(seed, n_gt, xyz_det[d])
-            if did_hit:
-                intersections.append((d, p_int, h_frac.item(), w_frac.item(), quad_n))
+    # Ensure tracked state matches current D
+    while len(_h_frac) < D:
+        _h_frac.append((Hm - 1) / 2.0)
+        _w_frac.append((Wm - 1) / 2.0)
 
-    if not intersections:
-        station_loss._miss_count = getattr(station_loss, "_miss_count", 0) + 1
-        if station_loss._miss_count <= 1 or station_loss._miss_count % 100 == 0:
-            print(f"[station] WARNING: ray missed all windings (x{station_loss._miss_count})", flush=True)
-        return {
-            "station_n": (zero, dummy, (ones,)),
-            "station_t": (zero, dummy, (ones,)),
-        }
+    h_mid = (Hm - 1) / 2.0
+    w_mid = (Wm - 1) / 2.0
+
+    # --- Tracked intersection per winding (non-differentiable) ---
+    intersections: list[tuple[int, torch.Tensor, float, float]] = []
+    with torch.no_grad():
+        for d in range(D):
+            hf = _h_frac[d]
+            wf = _w_frac[d]
+
+            # Clamp to valid quad range
+            row = max(0, min(int(hf), Hm - 2))
+            col = max(0, min(int(wf), Wm - 2))
+            frac_h = hf - row
+            frac_w = wf - col
+
+            surf = xyz_det[d]  # (Hm, Wm, 3)
+            P00 = surf[row, col]
+            P10 = surf[row + 1, col]
+            P01 = surf[row, col + 1]
+            P11 = surf[row + 1, col + 1]
+
+            u_val, v_val, conn_pt = _intersect_single_quad(
+                seed, n_gt, P00, P10, P01, P11, frac_h, frac_w)
+
+            # Update tracked position and clamp to surface
+            new_hf = row + u_val
+            new_wf = col + v_val
+            _h_frac[d] = max(0.0, min(float(Hm - 1), new_hf))
+            _w_frac[d] = max(0.0, min(float(Wm - 1), new_wf))
+
+            intersections.append((d, conn_pt, _h_frac[d], _w_frac[d]))
 
     # --- Normal-offset loss (from central winding, applied jointly) ---
-    # Proxy: shift every vertex by -offset along the seed's GT normal (n_gt).
-    # Single direction for all vertices — no per-vertex orientation needed.
     loss_normal = zero
     with torch.no_grad():
-        center_hit = [x for x in intersections if x[0] == d_center]
-        if center_hit:
-            _, p_int_c, _, _, _ = center_hit[0]
+        center_hits = [x for x in intersections if x[0] == d_center]
+        if center_hits:
+            _, p_int_c, _, _ = center_hits[0]
             offset = ((p_int_c - seed) * n_gt).sum()  # signed scalar
             target_n = xyz_det - offset * n_gt  # broadcast (D, Hm, Wm, 3)
         else:
@@ -256,14 +234,10 @@ def station_loss(
         loss_normal = _huber(res.xyz_lr - target_n).mean()
 
     # --- XY-centering loss (per-winding, independent) ---
-    # Each winding's intersection gives a grid position. Shift all vertices
-    # so the intersection moves toward the grid center.
-    h_mid = (Hm - 1) / 2.0
-    w_mid = (Wm - 1) / 2.0
     loss_xy = zero
     n_xy_hits = 0
 
-    for d, _, h_frac_val, w_frac_val, _ in intersections:
+    for d, _, h_frac_val, w_frac_val in intersections:
         with torch.no_grad():
             dh = h_frac_val - h_mid
             dw = w_frac_val - w_mid

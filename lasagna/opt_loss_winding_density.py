@@ -178,6 +178,27 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 		sv = sv.reshape(D, Hm, Wm, strip_samples).amin(dim=-1).unsqueeze(1)
 		mask = ext_mask * sv
 
+		# DEBUG: log first evaluation
+		if not hasattr(ext_offset_loss, "_dbg_done"):
+			ext_offset_loss._dbg_done = True
+			n_valid = int(mask.sum().item())
+			n_total = int(ext_mask.numel() // ext_mask.shape[1])  # D*Hm*Wm
+			sl_valid = strip_len[ext_mask.squeeze(1) > 0.5]
+			int_valid = integral[ext_mask.squeeze(1) > 0.5]
+			sign_valid = ext_sign[ext_mask.squeeze(1) > 0.5]
+			print(f"[ext_offset] DEBUG: offset={offset} strip_samples={strip_samples} "
+			      f"valid={n_valid}/{n_total}", flush=True)
+			if sl_valid.numel() > 0:
+				print(f"[ext_offset] DEBUG: strip_len: mean={sl_valid.mean():.2f} "
+				      f"min={sl_valid.min():.2f} max={sl_valid.max():.2f}", flush=True)
+				print(f"[ext_offset] DEBUG: integral: mean={int_valid.mean():.4f} "
+				      f"min={int_valid.min():.4f} max={int_valid.max():.4f}", flush=True)
+				print(f"[ext_offset] DEBUG: sign: +1={int((sign_valid > 0).sum())} "
+				      f"-1={int((sign_valid < 0).sum())} 0={int((sign_valid == 0).sum())}", flush=True)
+				err_valid = int_valid - offset
+				print(f"[ext_offset] DEBUG: err: mean={err_valid.mean():.4f} "
+				      f"min={err_valid.min():.4f} max={err_valid.max():.4f}", flush=True)
+
 		wsum = float(mask.sum().detach().cpu())
 		if wsum > 0.0:
 			total_loss = total_loss + (lm * mask).sum() / wsum

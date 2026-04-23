@@ -306,16 +306,6 @@ def optimize(
 			if hasattr(model, "straight_enabled") and model.straight_enabled:
 				model.bake_straight_into_mesh()
 
-		# If min_scaledown > 0, reconstruct pyramid and zero fine levels
-		if "mesh_ms" in opt_cfg.params and opt_cfg.min_scaledown > 0:
-			k0 = opt_cfg.min_scaledown
-			with torch.no_grad():
-				flat = model._integrate_pyramid_3d(model.mesh_ms, pyramid_d=model.pyramid_d)
-				model.mesh_ms = model._construct_pyramid_from_flat_3d(
-					flat, len(model.mesh_ms), pyramid_d=model.pyramid_d)
-				for pi in range(min(k0, len(model.mesh_ms))):
-					model.mesh_ms[pi].zero_()
-
 		all_params = model.opt_params()
 		param_groups: list[dict] = []
 		for name in opt_cfg.params:
@@ -394,7 +384,7 @@ def optimize(
 		if (_need_term("station_n", opt_cfg.eff) > 0 or _need_term("station_t", opt_cfg.eff) > 0) and seed_xyz is not None:
 			dev = data.grad_mag.device
 			seed_t = torch.tensor(list(seed_xyz), device=dev, dtype=torch.float32)
-			opt_loss_station.set_seed(seed_t, data)
+			opt_loss_station.set_seed(seed_t, data, Hm=model.mesh_h, Wm=model.mesh_w, D=model.depth)
 
 		# Initial evaluation
 		def _eval_terms(res_, eff_):
