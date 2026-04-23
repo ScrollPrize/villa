@@ -576,8 +576,13 @@ class Inferer():
                   f"{expected_attr_name} length ({self.num_total_patches}). Using {expected_attr_name} list length.")
 
         if self.num_total_patches == 0:
-            raise RuntimeError(
-                f"Dataset for part {self.part_id}/{self.num_parts} is empty (based on calculated coordinates in '{expected_attr_name}'). Check input data and partitioning.")
+            print(
+                f"Part {self.part_id}/{self.num_parts} has no patch positions; "
+                "empty output stores will still be written so downstream blending can enumerate parts uniformly."
+            )
+            self.num_active_patches = 0
+            self.dataloader = None
+            return self.dataset, self.dataloader
 
         # Let the dataset decide whether to expose a filtered view (e.g. a Subset
         # over non-empty patches when the input zarr's chunk occupancy has been
@@ -648,8 +653,8 @@ class Inferer():
     def _create_output_stores(self):
         if self.num_classes is None or self.patch_size is None or self.num_total_patches is None:
             raise RuntimeError("Cannot create output stores: model/patch info missing.")
-        if not self.patch_start_coords_list:
-            raise RuntimeError("Cannot create output stores: patch coordinates not available.")
+        # An empty patch list is valid: we still write zarrs with shape[0]=0 so
+        # blending can enumerate logits_part_*.zarr files uniformly across parts.
 
         compressor = self._get_zarr_compressor()
         output_shape = (self.num_total_patches, self.num_classes, *self.patch_size)
@@ -675,7 +680,8 @@ class Inferer():
         
         self.coords_store_path = os.path.join(self.output_dir, f"coordinates_part_{self.part_id}.zarr")
         coord_shape = (self.num_total_patches, len(self.patch_size))
-        coord_chunks = (min(self.num_total_patches, 4096), len(self.patch_size))
+        # zarr rejects chunks with a zero dimension even when shape[0] is 0, so floor at 1.
+        coord_chunks = (max(1, min(self.num_total_patches, 4096)), len(self.patch_size))
         
         print(f"Creating coordinates store at: {self.coords_store_path}")
         
@@ -725,8 +731,11 @@ class Inferer():
         except Exception as e:
             print(f"Warning: Failed to write custom attributes: {e}")
 
-        coords_np = np.array(self.patch_start_coords_list, dtype=np.int32)
-        coords_store[:] = coords_np
+        if self.patch_start_coords_list:
+            coords_np = np.array(self.patch_start_coords_list, dtype=np.int32)
+            coords_store[:] = coords_np
+        else:
+            coords_np = np.zeros((0, len(self.patch_size)), dtype=np.int32)
 
         # Compute and store bounding box for efficient blending filtering
         if len(coords_np) > 0:
@@ -874,14 +883,14 @@ class Inferer():
         if self.verbose: print("Creating dataset and dataloader...")
         self._create_dataset_and_loader()
 
-        if self.num_total_patches > 0:
-            if self.verbose: print("Creating output stores...")
-            self._create_output_stores()
+        if self.verbose: print("Creating output stores...")
+        self._create_output_stores()
 
+        if self.num_total_patches > 0:
             if self.verbose: print("Starting inference and writing logits...")
             self._process_batches()
         else:
-            print(f"Skipping processing for part {self.part_id} as no patches were found.")
+            print(f"Part {self.part_id} has no patches; wrote empty output stores and skipped inference.")
 
         if self.verbose: print("Inference complete.")
 
