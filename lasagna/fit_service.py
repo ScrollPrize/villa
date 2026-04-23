@@ -389,11 +389,20 @@ def _run_optimization(body: dict[str, Any]) -> None:
                 _job.set_error("cancelled")
                 return
 
-            # Export to tifxyz — skip if windowed mode already exported
-            _has_tifxyz = any(p.name.endswith(".tifxyz") and p.is_dir()
-                              for p in Path(output_dir).iterdir()) if Path(output_dir).is_dir() else False
-            if _has_tifxyz:
-                print("[fit-service] windowed mode: skipping fit2tifxyz (per-window export done)", flush=True)
+            # Export to tifxyz — skip if windowed mode already exported.
+            # Windowed mode exports .tifxyz dirs into the parent of
+            # model_output (= tmp_dir). Move them to output_dir.
+            _window_tifxyz = [p for p in Path(tmp_dir).iterdir()
+                              if p.name.endswith(".tifxyz") and p.is_dir()]
+            if _window_tifxyz:
+                import shutil as _shutil
+                for p in sorted(_window_tifxyz, key=lambda x: x.name):
+                    dst = Path(output_dir) / p.name
+                    if dst.exists():
+                        _shutil.rmtree(dst)
+                    _shutil.move(str(p), str(dst))
+                print(f"[fit-service] windowed mode: moved {len(_window_tifxyz)} "
+                      f"window tifxyz to {output_dir}", flush=True)
             else:
                 _job.set_running("exporting", 0, 0, 0.0)
                 import fit2tifxyz
