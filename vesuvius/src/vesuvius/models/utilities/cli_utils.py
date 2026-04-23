@@ -9,8 +9,19 @@ def update_config_from_args(mgr, args):
             mgr.dataset_config = {}
         mgr.dataset_config["data_path"] = str(mgr.data_path)
 
+        dataset_type = str(mgr.dataset_config.get("dataset_type", "zarr")).strip().lower()
         volumes_cfg = mgr.dataset_config.get("volumes")
-        if volumes_cfg:
+        if dataset_type == "cross_frame":
+            # URLs live in the config; --input is just the cache dir. Skip the
+            # local-filesystem data-format detection entirely.
+            mgr.data_format = "zarr"
+            mgr.dataset_config["data_format"] = mgr.data_format
+            if args.format and args.format.lower() != "zarr":
+                print(
+                    "Ignoring --format because dataset_type=cross_frame "
+                    "(data is read from the configured URLs)."
+                )
+        elif volumes_cfg:
             mgr.data_format = "explicit"
             mgr.dataset_config["data_format"] = mgr.data_format
             if args.format and args.format.lower() not in {"explicit", "mixed"}:
