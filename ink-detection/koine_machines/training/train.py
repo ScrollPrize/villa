@@ -23,6 +23,7 @@ from vesuvius.models.training.optimizers import (
 )
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from koine_machines.models.make_model import make_model
+from koine_machines.data.dino_guided_labels import DinoGuidedLabelGenerator
 from koine_machines.data.ink_dataset import InkDataset
 from koine_machines.models.load_checkpoint import load_training_checkpoint_from_config, restore_training_state
 from koine_machines.evaluation.metrics.balanced_accuracy import BalancedAccuracy
@@ -127,6 +128,17 @@ def _apply_cucim_label_dilation(batch, label_dilation_distance, supervision_dila
         supervision_mask = ((inklabels > 0) | (supervision_mask > 0)).to(dtype=supervision_mask.dtype)
     batch['inklabels'] = inklabels
     batch['supervision_mask'] = supervision_mask
+
+
+def _apply_dynamic_label_substitution(batch, generator):
+    """Replace batch['inklabels'] with DINO-guided pseudo-labels.
+
+    Labels are computed from batch['image'] (already augmented by the dataset
+    workers). supervision_mask is intentionally left untouched so the loss is
+    still gated by the wrap region from the on-disk supervision masks.
+    """
+    new_labels = generator.generate(batch['image'])
+    batch['inklabels'] = new_labels.to(dtype=batch['inklabels'].dtype)
 
 
 def _distributed_mean_scalar(accelerator, value):
@@ -411,6 +423,19 @@ def train(config_path):
     model, optimizer, train_dl, val_dl = accelerator.prepare(
             model, optimizer, train_dl, val_dl,
         )
+    dynamic_label_cfg = config.get('dynamic_label') or {}
+    dynamic_label_generator = None
+    if dynamic_label_cfg.get('enabled'):
+        dynamic_label_generator = DinoGuidedLabelGenerator(
+            device=accelerator.device,
+            unet_ckpt=dynamic_label_cfg['unet_ckpt'],
+            dino_ckpt=dynamic_label_cfg['dino_ckpt'],
+            ref_embedding=dynamic_label_cfg['ref_embedding'],
+            dino_stride=dynamic_label_cfg.get('dino_stride', 64),
+            dino_minibatch=dynamic_label_cfg.get('dino_minibatch', 8),
+            dino_blend_sigma=dynamic_label_cfg.get('dino_blend_sigma', 4.0),
+            threshold=dynamic_label_cfg.get('threshold', 0.5),
+        )
     # NOTE: we intentionally do NOT prepare lr_scheduler with Accelerate.
     # AcceleratedScheduler calls scheduler.step() num_processes times per
     # optimizer step (when split_batches=False), which makes the LR schedule
@@ -542,6 +567,8 @@ def train(config_path):
         except StopIteration:
             train_iterator = iter(train_dl)
             batch = next(train_iterator)
+        if dynamic_label_generator is not None:
+            _apply_dynamic_label_substitution(batch, dynamic_label_generator)
         if full_3d_label_dilation > 0.0 or full_3d_supervision_dilation > 0.0:
             _apply_cucim_label_dilation(batch, full_3d_label_dilation, full_3d_supervision_dilation)
 
