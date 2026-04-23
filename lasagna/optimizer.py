@@ -459,7 +459,7 @@ def optimize(
 					stage_name=stage.name,
 				)
 
-			if step == 0 or step1 == max_steps or (step1 % 100) == 0:
+			if step == 0 or step1 == max_steps or (step1 % 10) == 0:
 				param_vals: dict[str, float] = {}
 				for k, vs in all_params.items():
 					if len(vs) == 1 and vs[0].numel() == 1:

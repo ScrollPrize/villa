@@ -160,8 +160,11 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 		end = _up_pts(ext_pts)             # (D, He, We, 3) — detached
 		sign_hr = F.interpolate(ext_sign.unsqueeze(1).float(), size=(He, We),
 								mode='nearest').squeeze(1)  # (D, He, We)
-		mask_hr = F.interpolate(ext_mask.float(), size=(He, We),
-								mode='nearest')  # (D, 1, He, We)
+		# Bilinear-upsample mask: HR vertices that had ANY invalid LR neighbor
+		# in their interpolation footprint get mask < 1.0. Threshold at 1.0 to
+		# exclude them (their ext_pts are polluted by bilinear bleed).
+		mask_hr = (F.interpolate(ext_mask.float(), size=(He, We),
+								 mode='bilinear', align_corners=True) >= 1.0).float()
 
 		# Build strips at HR resolution
 		t = torch.linspace(0.0, 1.0, strip_samples, device=device, dtype=dtype)
@@ -176,10 +179,9 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 		signed_len = strip_len * sign_hr
 		integral = mag.mean(dim=-1) * signed_len
 
-		# Huber loss on (integral - target)
+		# L2 loss on (integral - target)
 		err = integral - offset
-		lm = torch.where(err.abs() <= 1.0, 0.5 * err * err, err.abs() - 0.5)
-		lm = lm.unsqueeze(1)  # (D, 1, He, We)
+		lm = (err * err).unsqueeze(1)  # (D, 1, He, We)
 
 		# Validity: mask AND all strip samples have grad_mag > 0
 		sv = (sampled.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=dtype)
@@ -192,6 +194,22 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 			total_wsum += wsum
 		all_lm.append(lm)
 		all_mask.append(mask)
+
+		# DEBUG: periodic logging
+		if not hasattr(ext_offset_loss, "_step"):
+			ext_offset_loss._step = 0
+		ext_offset_loss._step += 1
+		if ext_offset_loss._step <= 2 or ext_offset_loss._step % 100 == 0:
+			with torch.no_grad():
+				m = mask.squeeze(1) > 0.5
+				if m.any():
+					print(f"[ext_offset] step={ext_offset_loss._step} "
+						  f"n={int(m.sum())} "
+						  f"integral={integral[m].mean():.4f}({integral[m].std():.4f}) "
+						  f"strip_len={strip_len[m].mean():.1f}({strip_len[m].std():.1f}) "
+						  f"mag={mag.mean(dim=-1)[m].mean():.4f} "
+						  f"sign:+{int((sign_hr[m]>0).sum())}/-{int((sign_hr[m]<0).sum())} "
+						  f"err={err[m].mean():.4f}({err[m].std():.4f})", flush=True)
 
 	n_ext = len(res.ext_conn)
 	if n_ext > 1:

@@ -13,14 +13,15 @@
 		"data_plain": 0.0,
 		"pred_dt": 0.001,
 		"corr": 0.1,
-		"bend": 100.0
+		"bend": 100.0,
+		"ext_offset": 0.0
 	},
 	"stages": [
 		{
 			"name": "init",
 			"steps": 500,
 			"min_scaledown": 3,
-			"lr": [100.0, 10.0, 1.0, 0.1, 0.01, 0.001],
+			"lr": [10.0, 1.0, 0.1, 0.01, 0.001],
 			"params": ["mesh_ms"],
 			"w_fac": {
 				"pred_dt": 0.0
@@ -30,7 +31,7 @@
 			"name": "opt",
 			"steps": 1000,
 			"min_scaledown": 0,
-			"lr": [100.0, 10.0, 1.0, 0.1, 0.01, 0.001],
+			"lr": [10.0, 1.0, 0.1, 0.01, 0.001],
 			"params": ["mesh_ms"],
 			"w_fac": {
 				"pred_dt": 0.0
@@ -38,9 +39,9 @@
 		},
 		{
 			"name": "snap",
-			"steps": 1000,
+			"steps": 0,
 			"min_scaledown": 0,
-			"lr": [100.0, 10.0, 1.0, 0.1, 0.01, 0.001],
+			"lr": [10.0, 1.0, 0.1, 0.01, 0.001],
 			"params": ["mesh_ms"],
 			"w_fac": {
 				"pred_dt": 0.0
