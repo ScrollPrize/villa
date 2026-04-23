@@ -362,6 +362,7 @@ class VCDataset(Dataset):
             chunks=array_chunks,
             shape=array_shape,
             verbose=self.verbose,
+            anon=self.anon,
         )
         if occupancy is None:
             return None
