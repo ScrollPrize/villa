@@ -116,19 +116,21 @@ void BlockCache::containsBatch(const std::vector<BlockKey>& keys,
     }
 }
 
-void BlockCache::put(const BlockKey& key, const uint8_t* src) noexcept
+void BlockCache::put(const BlockKey& key, const uint8_t* src, uint64_t gen) noexcept
 {
     std::unique_lock lock(mutex_);
-    putLocked(key, src);
+    putLocked(key, src, gen);
 }
 
 void BlockCache::BatchPut::put(const BlockKey& key, const uint8_t* src) noexcept
 {
-    cache_.putLocked(key, src);
+    cache_.putLocked(key, src, gen_);
 }
 
-void BlockCache::putLocked(const BlockKey& key, const uint8_t* src) noexcept
+void BlockCache::putLocked(const BlockKey& key, const uint8_t* src, uint64_t gen) noexcept
 {
+    // Reject stale inserts from a previous volume's pipeline.
+    if (gen != generation_) return;
     // Degenerate config (cache size rounded below one block) — bail
     // instead of dividing by zero in the slot-assignment arithmetic.
     if (nSlots_ == 0) return;
@@ -233,9 +235,16 @@ size_t BlockCache::size() const noexcept
     return occupiedCount_;
 }
 
+uint64_t BlockCache::generation() const noexcept
+{
+    std::shared_lock lock(mutex_);
+    return generation_;
+}
+
 void BlockCache::clear()
 {
     std::unique_lock lock(mutex_);
+    ++generation_;
     map_.clear();
     std::fill(slotKey_.begin(), slotKey_.end(), kEmptyKey);
     std::fill(occupiedBits_.begin(), occupiedBits_.end(), 0);

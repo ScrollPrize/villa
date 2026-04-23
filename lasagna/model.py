@@ -648,22 +648,18 @@ class Model3D(nn.Module):
 				self._ext_conn_offsets[i].nan_to_num_(0.0)
 
 	@staticmethod
-	def from_tifxyz(path: str, *, device: torch.device, mesh_step: int = 100,
-					winding_step: int = 25, subsample_mesh: int = 4,
-					subsample_winding: int = 4) -> "Model3D":
-		"""Create a depth=1 model initialized from a tifxyz directory.
+	def from_tifxyz_crop(xyz: torch.Tensor, valid: torch.Tensor, *,
+						 device: torch.device, mesh_step: int = 100,
+						 winding_step: int = 25, subsample_mesh: int = 4,
+						 subsample_winding: int = 4) -> "Model3D":
+		"""Create a depth=1 model from pre-cropped tifxyz tensors.
 
-		Invalid vertices (VC3D sentinel -1,-1,-1) are inpainted via
-		masked scale-space pyramid reconstruction.
+		xyz: (H, W, 3) float32 — invalid vertices should already be zeroed.
+		valid: (H, W) bool — True for valid vertices.
+
+		Invalid vertices are inpainted via masked scale-space pyramid reconstruction.
 		"""
-		from tifxyz_io import load_tifxyz
-		xyz, valid, meta = load_tifxyz(path, device=device)
 		H, W, _ = xyz.shape
-		# Derive mesh_step from meta scale if available
-		scale = meta.get("scale")
-		if scale is not None and isinstance(scale, list) and len(scale) >= 1 and float(scale[0]) > 0:
-			mesh_step = max(1, int(round(1.0 / float(scale[0]))))
-		# Enough scales to reach ~1×1 for full inpainting
 		import math
 		n_scales = max(5, int(math.ceil(math.log2(max(H, W)))) + 1)
 		mdl = Model3D(
@@ -674,12 +670,33 @@ class Model3D(nn.Module):
 			arc_angle0=-0.5, arc_angle1=0.5,
 			init_mode="arc", pyramid_d=False,
 		)
-		flat_mesh = xyz.permute(2, 0, 1).unsqueeze(1)  # (3, 1, H, W)
+		flat_mesh = xyz.to(device=device).permute(2, 0, 1).unsqueeze(1)  # (3, 1, H, W)
+		valid_dev = valid.to(device=device)
 		mdl.arc_enabled = False
 		mdl.straight_enabled = False
 		mdl.mesh_ms = Model3D._construct_pyramid_from_flat_3d_masked(
-			flat_mesh, valid, n_scales=n_scales, pyramid_d=mdl.pyramid_d)
+			flat_mesh, valid_dev, n_scales=n_scales, pyramid_d=mdl.pyramid_d)
 		return mdl
+
+	@staticmethod
+	def from_tifxyz(path: str, *, device: torch.device, mesh_step: int = 100,
+					winding_step: int = 25, subsample_mesh: int = 4,
+					subsample_winding: int = 4) -> "Model3D":
+		"""Create a depth=1 model initialized from a tifxyz directory.
+
+		Invalid vertices (VC3D sentinel -1,-1,-1) are inpainted via
+		masked scale-space pyramid reconstruction.
+		"""
+		from tifxyz_io import load_tifxyz
+		xyz, valid, meta = load_tifxyz(path, device=device)
+		# Derive mesh_step from meta scale if available
+		scale = meta.get("scale")
+		if scale is not None and isinstance(scale, list) and len(scale) >= 1 and float(scale[0]) > 0:
+			mesh_step = max(1, int(round(1.0 / float(scale[0]))))
+		return Model3D.from_tifxyz_crop(
+			xyz, valid, device=device, mesh_step=mesh_step,
+			winding_step=winding_step, subsample_mesh=subsample_mesh,
+			subsample_winding=subsample_winding)
 
 	def _intersect_ext_surfaces(self, xyz_lr: torch.Tensor, normals: torch.Tensor, data: fit_data.FitData3D
 							   ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]] | None:

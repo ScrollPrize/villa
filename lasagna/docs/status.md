@@ -49,14 +49,20 @@ Integrated output channel layout (uint8):
 
 | Component | File | What it does |
 |-----------|------|--------------|
-| Model | `model.py` | `Model3D` — arc parameterisation, 5-level 3D residual pyramid, amp/bias modulation, HR bilinear upsample, `bake_arc_into_mesh()` |
-| Data pipeline | `fit_data.py` | `FitData3D` — loads preprocessed OME-Zarr (cos, grad_mag, dir0/dir1 per axis, valid, pred_dt); `grid_sample_fullres` for arbitrary 3D sampling |
+| Model | `model.py` | `Model3D` — arc parameterisation, 5-level 3D residual pyramid, amp/bias modulation, HR bilinear upsample, `bake_arc_into_mesh()`, tifxyz init with masked inpainting, external surface intersection |
+| Data pipeline | `fit_data.py` | `FitData3D` — loads preprocessed OME-Zarr (cos, grad_mag, dir0/dir1 per axis, valid, pred_dt); `grid_sample_fullres` for arbitrary 3D sampling with optional gradients |
 | Direction loss | `opt_loss_dir.py` | Quad-face normals projected onto each axis plane, MSE against double-angle dir channels, weighted by surface-normal alignment |
 | Step loss | `opt_loss_step.py` | Euclidean distance between adjacent height rows vs target `mesh_step` |
+| Smooth loss | `opt_loss_smooth.py` | Smoothness regularization, normalized by `mesh_step²` |
+| Bend loss | `opt_loss_bend.py` | Bend angle constraint — penalizes when angle between adjacent edges exceeds 60° from flat |
+| Pred DT loss | `opt_loss_pred_dt.py` | Two-regime clamped L1 loss on distance-to-surface channel (outside + inner weighting) |
+| Winding density | `opt_loss_winding_density.py` | Winding spacing via grad_mag strip integration (Huber loss), plus `ext_offset` loss for external surface offset optimization |
 | Optimizer | `optimizer.py` | Stage list from JSON config; per-stage parameter groups, per-scale learning rates, automatic arc baking when arc params leave the optimised set |
 | Export | `fit2tifxyz.py` | Writes per-winding x/y/z tiffs + `meta.json` with bbox, scale, uuid |
 | HTTP service | `fit_service.py` | REST API for VC3D integration — start/stop jobs, stream progress, download results tar.gz, mDNS discovery |
+| Tifxyz I/O | `tifxyz_io.py` | Loads tifxyz directories → `(xyz, valid, meta)` tensors with `-1,-1,-1` invalid detection |
 | CLI / config | `cli_*.py`, `cli_json.py` | Argument parsing, JSON config merge, multi-stage config loading |
+| Windowed opt | `fit.py` | Windowed tifxyz optimization — tiles large surfaces into overlapping windows, optimizes each independently, exports per-window tifxyz |
 
 ## Not yet implemented
 
@@ -65,10 +71,6 @@ Items described in the spec (`lasagna/lasagna_3d.md`) or the 2D model (`lasagna/
 | Feature | Notes |
 |---------|-------|
 | `gradmag` loss | Sheet-density period-sum loss (exists in 2D, not yet in 3D) |
-| `data` loss | Cosine MSE with amplitude/bias modulation (exists in 2D) |
-| `data_plain` loss | Unmodulated cosine loss (exists in 2D) |
-| `pred_dt` loss | Distance-transform supervision (exists in 2D) |
-| Connection point computation | `conn_offset_ms` pyramid is allocated but connection vectors between windings in the ±D direction are not computed or used in any loss |
 | Mesh growing | Spec describes grow operations in 6 directions (±D, ±H, ±W); not implemented |
 | Mask scheduling | EMA / velocity-based mask expansion described in `lasagna/docs/mask_schedule.md`; not implemented |
 

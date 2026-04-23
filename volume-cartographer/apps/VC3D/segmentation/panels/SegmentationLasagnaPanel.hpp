@@ -53,6 +53,8 @@ public:
     [[nodiscard]] QString seedPointText() const;
     [[nodiscard]] QString newModelOutputName() const;
     [[nodiscard]] double offsetValue() const;
+    [[nodiscard]] int windowSize() const;
+    [[nodiscard]] int windowOverlap() const;
 
     // Setters
     void setLasagnaDataInputPath(const QString& path);
@@ -128,6 +130,8 @@ private:
     QComboBox* _offsetConfigCombo{nullptr};
     QToolButton* _offsetConfigBrowse{nullptr};
     QDoubleSpinBox* _offsetValueSpin{nullptr};
+    QSpinBox* _windowSizeSpin{nullptr};
+    QSpinBox* _windowOverlapSpin{nullptr};
 
     // Action buttons
     QPushButton* _newModelBtn{nullptr};

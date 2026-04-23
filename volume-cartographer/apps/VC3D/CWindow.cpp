@@ -3044,16 +3044,24 @@ void CWindow::CreateWidgets(void)
                       << " windings=" << nmN << std::endl;
         }
 
-        // --- Offset mode: inject windings=1 and offset_value into config ---
+        // --- Offset mode: inject windings=1, offset_value, and window params ---
         if (isOffsetMode && !segPath.empty()) {
             double offsetVal = _segmentationWidget->offsetValue();
+            int windowSize = _segmentationWidget->windowSize();
+            int windowOverlap = _segmentationWidget->windowOverlap();
 
             QJsonObject args = config[QStringLiteral("args")].toObject();
             args[QStringLiteral("windings")] = 1;
+            if (windowSize > 0) {
+                args[QStringLiteral("window-size")] = windowSize;
+                args[QStringLiteral("window-overlap")] = windowOverlap;
+            }
             config[QStringLiteral("args")] = args;
             config[QStringLiteral("offset_value")] = offsetVal;
 
-            std::cerr << "[lasagna] offset mode: offset=" << offsetVal << std::endl;
+            std::cerr << "[lasagna] offset mode: offset=" << offsetVal
+                      << " window_size=" << windowSize
+                      << " window_overlap=" << windowOverlap << std::endl;
         }
 
         // Inject loaded point collections as corr_points

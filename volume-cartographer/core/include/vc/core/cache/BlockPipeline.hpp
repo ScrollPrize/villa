@@ -217,6 +217,7 @@ private:
                                 std::shared_ptr<std::vector<std::byte>> bytes);
 
     BlockCache& blockCache_;
+    uint64_t cacheGen_;  // captured at construction from blockCache_.generation()
 
     // Assemble a canonical 128^3 chunk from one or more source chunks at
     // `canonKey.level`, rechunking as needed. Null if the canonical region
