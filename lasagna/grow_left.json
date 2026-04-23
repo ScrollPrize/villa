@@ -28,12 +28,12 @@
 			"global_opt": {
 				"steps": 0,
 				"lr": 0.01,
-				"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"]
+				"params": ["mesh_ms", "amp", "bias"]
 			},
 			"local_opt": {
 				"steps": 1000,
 				"lr": 0.01,
-				"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"]
+				"params": ["mesh_ms", "amp", "bias"]
 			}
 		}
 	]

@@ -19,6 +19,20 @@ import opt_loss_dir
 import optimizer
 
 
+def _grid_center(mdl: "model.Model3D") -> torch.Tensor:
+	"""Bilinear center of the model grid — matches (Hm-1)/2, (Wm-1)/2 in station loss."""
+	xyz = mdl._grid_xyz()  # (D, Hm, Wm, 3)
+	Hm, Wm = xyz.shape[1], xyz.shape[2]
+	h_mid, w_mid = (Hm - 1) / 2.0, (Wm - 1) / 2.0
+	h0, w0 = int(h_mid), int(w_mid)
+	h1, w1 = min(h0 + 1, Hm - 1), min(w0 + 1, Wm - 1)
+	fh, fw = h_mid - h0, w_mid - w0
+	return ((1 - fh) * (1 - fw) * xyz[0, h0, w0]
+	      + fh * (1 - fw) * xyz[0, h1, w0]
+	      + (1 - fh) * fw * xyz[0, h0, w1]
+	      + fh * fw * xyz[0, h1, w1])
+
+
 def _arc_params_from_seed(
 	seed: tuple[int, int, int],
 	model_w: int,
@@ -366,6 +380,12 @@ def main(argv: list[str] | None = None) -> int:
 			opt_loss_corr.set_snap_mode(opt_cfg.corr_snap)
 			opt_loss_dir.set_mask_zero_normals(opt_cfg.normal_mask_zero)
 
+			# Seed from center of model grid (matches h_mid/w_mid in station loss)
+			center_pt = _grid_center(mdl)
+			win_seed = (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
+			print(f"[fit] window seed: ({win_seed[0]:.0f}, {win_seed[1]:.0f}, {win_seed[2]:.0f})",
+				  flush=True)
+
 			optimizer.optimize(
 				model=mdl,
 				data=data,
@@ -375,6 +395,7 @@ def main(argv: list[str] | None = None) -> int:
 				progress_fn=_make_progress(),
 				load_data_fn=_load_data_win,
 				volume_extent_fullres=volume_extent_fullres,
+				seed_xyz=win_seed,
 			)
 
 			# Export this window's tifxyz
@@ -596,6 +617,12 @@ def main(argv: list[str] | None = None) -> int:
 
 	# Run optimization
 	seed_xyz = tuple(float(v) for v in data_cfg.seed) if data_cfg.seed is not None else None
+	# tifxyz init: always use model grid center as seed (overrides CLI seed)
+	if tifxyz_init:
+		center_pt = _grid_center(mdl)
+		seed_xyz = (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
+		print(f"[fit] tifxyz seed: ({seed_xyz[0]:.0f}, {seed_xyz[1]:.0f}, {seed_xyz[2]:.0f})",
+			  flush=True)
 	optimizer.optimize(
 		model=mdl,
 		data=data,

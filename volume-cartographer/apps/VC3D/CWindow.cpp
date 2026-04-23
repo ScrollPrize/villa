@@ -2921,11 +2921,10 @@ void CWindow::CreateWidgets(void)
         }
 
         // --- Compute next version name ---
+        const std::string tifxyzSuffix = ".tifxyz";
+        std::string rootName = "new_model";  // Default fallback
         QString outputName;
         {
-            std::string rootName = "new_model";  // Default fallback
-            const std::string tifxyzSuffix = ".tifxyz";
-
             if (isNewModel) {
                 // New model: use the output name field, fall back to "new_model"
                 QString nmName = _segmentationWidget->newModelOutputName();
@@ -2942,6 +2941,7 @@ void CWindow::CreateWidgets(void)
                     baseName = baseName.substr(0, baseName.size() - tifxyzSuffix.size());
                 }
                 rootName = baseName;
+                // Strip _vNNN version suffix
                 if (rootName.size() > 5) {
                     auto pos = rootName.rfind("_v");
                     if (pos != std::string::npos && pos + 2 < rootName.size()) {
@@ -2954,6 +2954,12 @@ void CWindow::CreateWidgets(void)
                         }
                         if (allDigits) rootName = rootName.substr(0, pos);
                     }
+                }
+                // Strip _offN_wN window suffix
+                {
+                    auto pos = rootName.find("_off");
+                    if (pos != std::string::npos)
+                        rootName = rootName.substr(0, pos);
                 }
             }
 
@@ -3059,9 +3065,34 @@ void CWindow::CreateWidgets(void)
             config[QStringLiteral("args")] = args;
             config[QStringLiteral("offset_value")] = offsetVal;
 
+            // Windowed offset: override outputName with collision-free base
+            if (windowSize > 0 && !outputDir.isEmpty()) {
+                int offIdx = 1;
+                std::error_code ec2;
+                for (bool collision = true; collision; ++offIdx) {
+                    collision = false;
+                    std::string offPrefix = rootName + "_off" + std::to_string(offIdx) + "_w";
+                    for (auto& entry : std::filesystem::directory_iterator(
+                             outputDir.toStdString(), ec2)) {
+                        auto name = entry.path().filename().string();
+                        if (name.size() > offPrefix.size() + tifxyzSuffix.size() &&
+                            name.compare(0, offPrefix.size(), offPrefix) == 0 &&
+                            name.compare(name.size() - tifxyzSuffix.size(),
+                                         tifxyzSuffix.size(), tifxyzSuffix) == 0) {
+                            collision = true;
+                            break;
+                        }
+                    }
+                }
+                // offIdx is one past the collision-free value
+                outputName = QString::fromStdString(
+                    rootName + "_off" + std::to_string(offIdx - 1));
+            }
+
             std::cerr << "[lasagna] offset mode: offset=" << offsetVal
                       << " window_size=" << windowSize
-                      << " window_overlap=" << windowOverlap << std::endl;
+                      << " window_overlap=" << windowOverlap
+                      << " outputName=" << outputName.toStdString() << std::endl;
         }
 
         // Inject loaded point collections as corr_points

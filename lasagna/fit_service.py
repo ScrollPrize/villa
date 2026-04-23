@@ -396,8 +396,12 @@ def _run_optimization(body: dict[str, Any]) -> None:
                               if p.name.endswith(".tifxyz") and p.is_dir()]
             if _window_tifxyz:
                 import shutil as _shutil
-                for p in sorted(_window_tifxyz, key=lambda x: x.name):
-                    dst = Path(output_dir) / p.name
+                _win_base = body.get("output_name", "")
+                if _win_base.endswith(".tifxyz"):
+                    _win_base = _win_base[:-len(".tifxyz")]
+                for i, p in enumerate(sorted(_window_tifxyz, key=lambda x: x.name)):
+                    dst_name = f"{_win_base}_w{i}.tifxyz" if _win_base else p.name
+                    dst = Path(output_dir) / dst_name
                     if dst.exists():
                         _shutil.rmtree(dst)
                     _shutil.move(str(p), str(dst))

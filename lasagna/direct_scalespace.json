@@ -27,7 +27,7 @@
 			"name": "mesh",
 			"steps": 3000,
 			"lr": 0.1,
-			"params": ["mesh_ms", "conn_offset_ms"],
+			"params": ["mesh_ms"],
 			"min_scaledown": 0,
 			"w_fac": {
 			}

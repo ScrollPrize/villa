@@ -97,7 +97,7 @@ def _parse_opt_settings(
 	if not isinstance(params, list):
 		params = []
 	params = [str(p) for p in params]
-	valid = {"mesh_ms", "conn_offset_ms", "amp", "bias",
+	valid = {"mesh_ms", "amp", "bias",
 			 "arc_cx", "arc_cy", "arc_radius", "arc_angle0", "arc_angle1",
 			 "straight_cx", "straight_cy", "straight_angle", "straight_half_w"}
 	bad_params = sorted(set(params) - valid)

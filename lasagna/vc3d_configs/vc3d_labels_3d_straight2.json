@@ -26,7 +26,7 @@
 			"name": "normals",
 			"steps": 1000,
 			"lr": [1.0, 0.1, 0.01, 0.001],
-			"params": ["mesh_ms", "conn_offset_ms"],
+			"params": ["mesh_ms"],
 			"w_fac": {
 				"winding_vol": 0.0,
 				"pred_dt": 0.0
@@ -36,7 +36,7 @@
 			"name": "winding1",
 			"steps": 1000,
 			"lr": [1.0, 0.1, 0.01, 0.001],
-			"params": ["mesh_ms", "conn_offset_ms"],
+			"params": ["mesh_ms"],
 			"w_fac": {
               "winding_vol": 1.0,
               "pred_dt": 0.0,

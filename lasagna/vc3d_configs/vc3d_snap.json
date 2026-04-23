@@ -18,7 +18,7 @@
 			"steps": 1000,
 			"min_scaledown": 0,
 			"lr": [100.0, 10.0, 1.0, 0.1, 0.01, 0.001],
-			"params": ["mesh_ms","conn_offset_ms"]
+			"params": ["mesh_ms"]
 		}
 	]
 }

@@ -25,7 +25,7 @@
 			"name": "global",
 			"steps": 1000,
 			"lr": [0.1, 0.01, 0.001],
-			"params": ["mesh_ms", "conn_offset_ms"],
+			"params": ["mesh_ms"],
 			"min_scaledown": 0,
 			"w_fac": {
 				"data": 0.0,

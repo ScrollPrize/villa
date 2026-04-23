@@ -31,7 +31,7 @@
 			"global_opt": {
 				"steps": 1000,
 				"lr": [0.1, 0.01, 0.001],
-				"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
+				"params": ["mesh_ms", "amp", "bias"],
 				"min_scaledown": 0,
 				"w_fac": {
 					"corr_winding": 0.0
@@ -46,7 +46,7 @@
 			"global_opt": {
 				"steps": 5000,
 				"lr": [0.01, 0.001, 0.0001],
-				"params": ["mesh_ms", "conn_offset_ms", "amp", "bias"],
+				"params": ["mesh_ms", "amp", "bias"],
 				"min_scaledown": 0,
 				"w_fac": {
 				}

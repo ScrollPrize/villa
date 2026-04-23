@@ -18,7 +18,7 @@
 			"name": "sd4",
 			"steps": 2000,
 			"lr": 1.0,
-			"params": ["mesh_ms", "conn_offset_ms"],
+			"params": ["mesh_ms"],
 			"min_scaledown": 4,
 			"w_fac": {
 			}
@@ -27,7 +27,7 @@
 			"name": "others",
 			"steps": 2000,
 			"lr": 1.0,
-			"params": ["mesh_ms", "conn_offset_ms"],
+			"params": ["mesh_ms"],
 			"min_scaledown": 4,
 			"w_fac": {
 				"dir_conn": 10.0,
@@ -38,7 +38,7 @@
 			"name": "sd3",
 			"steps": 2000,
 			"lr": 0.1,
-			"params": ["mesh_ms", "conn_offset_ms"],
+			"params": ["mesh_ms"],
 			"min_scaledown": 3,
 			"w_fac": {
 				"dir_conn": 10.0,
@@ -49,7 +49,7 @@
 			"name": "sd2",
 			"steps": 5000,
 			"lr": 0.1,
-			"params": ["mesh_ms", "conn_offset_ms"],
+			"params": ["mesh_ms"],
 			"min_scaledown": 2,
 			"w_fac": {
 				"dir_conn": 10.0,
@@ -60,7 +60,7 @@
 			"name": "sd1",
 			"steps": 5000,
 			"lr": 0.1,
-			"params": ["mesh_ms", "conn_offset_ms"],
+			"params": ["mesh_ms"],
 			"min_scaledown": 1,
 			"w_fac": {
 				"dir_conn": 10.0,
@@ -71,7 +71,7 @@
 			"name": "sd0",
 			"steps": 5000,
 			"lr": 0.01,
-			"params": ["mesh_ms", "conn_offset_ms"],
+			"params": ["mesh_ms"],
 			"min_scaledown": 0,
 			"w_fac": {
 				"dir_conn": 10000.0,
