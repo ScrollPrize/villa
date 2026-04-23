@@ -38,6 +38,8 @@ class FitResult3D:
 	mask_conn: torch.Tensor     # (D, 1, Hm, Wm, 3) — validity per connection point
 	sign_conn: torch.Tensor     # (D, 1, Hm, Wm, 2) — ray param sign [prev, next]
 	params: ModelParams3D
+	ext_conn: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]] | None = None
+	# Per external surface: (ext_pts (D,Hm,Wm,3), ext_mask (D,1,Hm,Wm), ext_sign (D,Hm,Wm), offset)
 
 
 class Model3D(nn.Module):
@@ -112,6 +114,13 @@ class Model3D(nn.Module):
 		# Not gradient-optimized; updated by update_conn_offsets() after each step.
 		self.register_buffer("conn_offsets", torch.zeros(4, self.depth, self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
 
+		# External reference surfaces: frozen meshes for offset optimization
+		self._ext_surfaces: list[torch.Tensor] = []          # each (H_ext, W_ext, 3)
+		self._ext_valid: list[torch.Tensor] = []             # each (H_ext, W_ext) bool
+		self._ext_conn_offsets: list[torch.Tensor] = []      # each (2, D, Hm, Wm) — [h_off, w_off]
+		self._ext_conn_params: list[dict] = []                # cached intersection params per ext surface
+		self._ext_offsets: list[float] = []                   # target integral offset per ext surface
+
 		# Amplitude and bias for data matching (deferred but needed for FitResult3D)
 		amp_init = torch.full((self.depth, 1, self.mesh_h, self.mesh_w), 1.0, device=device, dtype=torch.float32)
 		bias_init = torch.full((self.depth, 1, self.mesh_h, self.mesh_w), 0.5, device=device, dtype=torch.float32)
@@ -175,6 +184,70 @@ class Model3D(nn.Module):
 		for i in range(len(targets) - 2, -1, -1):
 			up = Model3D._upsample_crop(recon, *targets[i].shape[1:], pyramid_d=pyramid_d)
 			residuals[i] = targets[i] - up
+			recon = up + residuals[i]
+		return nn.ParameterList([nn.Parameter(r) for r in residuals])
+
+	@staticmethod
+	def _construct_pyramid_from_flat_3d_masked(
+		flat: torch.Tensor, valid: torch.Tensor, n_scales: int, *, pyramid_d: bool,
+	) -> nn.ParameterList:
+		"""Build residual pyramid with validity-aware downsampling.
+
+		flat: (C, D, H, W), valid: (H, W) bool.
+		Invalid regions get residual=0 so integration naturally inpaints them
+		from coarser (valid) structure.
+		"""
+		C = flat.shape[0]
+		D = int(flat.shape[1])
+		# Compute enough scales to reach 1×1
+		shapes: list[tuple[int, int, int]] = [(D, int(flat.shape[2]), int(flat.shape[3]))]
+		for _ in range(1, n_scales):
+			d, h, w = shapes[-1]
+			if pyramid_d:
+				shapes.append((max(1, (d + 1) // 2), max(1, (h + 1) // 2), max(1, (w + 1) // 2)))
+			else:
+				shapes.append((d, max(1, (h + 1) // 2), max(1, (w + 1) // 2)))
+
+		# Build validity mask pyramid: (1, D, H, W) float
+		valid_4d = valid.float().unsqueeze(0).unsqueeze(0).expand(1, D, -1, -1)  # (1, D, H, W)
+
+		# Masked downsampling: weighted average excluding invalid
+		targets: list[torch.Tensor] = [flat]
+		valids: list[torch.Tensor] = [valid_4d]
+		for (d_t, h_t, w_t) in shapes[1:]:
+			prev_data = targets[-1] * valids[-1]  # zero out invalid before pooling
+			prev_valid = valids[-1]
+			if pyramid_d:
+				data_down = F.interpolate(
+					(prev_data).unsqueeze(0), size=(d_t, h_t, w_t),
+					mode='trilinear', align_corners=True).squeeze(0)
+				valid_down = F.interpolate(
+					prev_valid.unsqueeze(0), size=(d_t, h_t, w_t),
+					mode='trilinear', align_corners=True).squeeze(0)
+			else:
+				# (C, D, H, W) → treat D as batch: (C*D, 1, H, W) for 2D interpolate
+				CD = C * D
+				data_down = F.interpolate(
+					prev_data.reshape(CD, 1, prev_data.shape[2], prev_data.shape[3]),
+					size=(h_t, w_t), mode='bilinear', align_corners=True
+				).reshape(C, D, h_t, w_t)
+				valid_down = F.interpolate(
+					prev_valid.reshape(D, 1, prev_valid.shape[2], prev_valid.shape[3]),
+					size=(h_t, w_t), mode='bilinear', align_corners=True
+				).reshape(1, D, h_t, w_t)
+			# Normalize by valid weight
+			target = data_down / valid_down.clamp(min=1e-6)
+			valid_mask = (valid_down > 0.01).float()
+			targets.append(target)
+			valids.append(valid_mask)
+
+		# Build residuals: masked so invalid regions contribute zero
+		residuals: list[torch.Tensor | None] = [None] * len(targets)
+		recon = targets[-1]
+		residuals[-1] = targets[-1]
+		for i in range(len(targets) - 2, -1, -1):
+			up = Model3D._upsample_crop(recon, *targets[i].shape[1:], pyramid_d=pyramid_d)
+			residuals[i] = (targets[i] - up) * valids[i]
 			recon = up + residuals[i]
 		return nn.ParameterList([nn.Parameter(r) for r in residuals])
 
@@ -532,6 +605,205 @@ class Model3D(nn.Module):
 			# garbage indices from NaN.long() in the next forward pass.
 			self.conn_offsets.nan_to_num_(0.0)
 
+	# --- External surface support ---
+
+	def add_external_surface(self, xyz: torch.Tensor, valid: torch.Tensor | None = None,
+						   offset: float = 1.0) -> int:
+		"""Register a frozen external reference surface.
+
+		xyz: (H_ext, W_ext, 3) float32 mesh positions in fullres coords.
+		valid: (H_ext, W_ext) bool — validity mask. None = all valid.
+		offset: target grad_mag integral from model surface to this external surface.
+		Returns the index of the added surface.
+		"""
+		dev = self.conn_offsets.device
+		idx = len(self._ext_surfaces)
+		self._ext_surfaces.append(xyz.detach().to(device=dev))
+		if valid is None:
+			valid = torch.ones(xyz.shape[0], xyz.shape[1], dtype=torch.bool, device=dev)
+		self._ext_valid.append(valid.to(device=dev))
+		self._ext_conn_offsets.append(
+			torch.zeros(2, self.depth, self.mesh_h, self.mesh_w,
+						device=dev, dtype=torch.float32))
+		self._ext_conn_params.append({})
+		self._ext_offsets.append(float(offset))
+		return idx
+
+	def update_ext_conn_offsets(self) -> None:
+		"""Update conn_offsets for all external surfaces from cached intersection params."""
+		D = self.depth
+		Hm = self.mesh_h
+		Wm = self.mesh_w
+		device = self.conn_offsets.device
+		h_idx = torch.arange(Hm, device=device, dtype=torch.float32).view(1, Hm, 1).expand(D, Hm, Wm)
+		w_idx = torch.arange(Wm, device=device, dtype=torch.float32).view(1, 1, Wm).expand(D, Hm, Wm)
+
+		with torch.no_grad():
+			for i, params in enumerate(self._ext_conn_params):
+				if "u" not in params:
+					continue
+				u, v, row, col = params["u"], params["v"], params["row"], params["col"]
+				self._ext_conn_offsets[i][0] = row.float() + u - h_idx
+				self._ext_conn_offsets[i][1] = col.float() + v - w_idx
+				self._ext_conn_offsets[i].nan_to_num_(0.0)
+
+	@staticmethod
+	def from_tifxyz_crop(xyz: torch.Tensor, valid: torch.Tensor, *,
+						 device: torch.device, mesh_step: int = 100,
+						 winding_step: int = 25, subsample_mesh: int = 4,
+						 subsample_winding: int = 4) -> "Model3D":
+		"""Create a depth=1 model from pre-cropped tifxyz tensors.
+
+		xyz: (H, W, 3) float32 — invalid vertices should already be zeroed.
+		valid: (H, W) bool — True for valid vertices.
+
+		Invalid vertices are inpainted via masked scale-space pyramid reconstruction.
+		"""
+		H, W, _ = xyz.shape
+		import math
+		n_scales = max(5, int(math.ceil(math.log2(max(H, W)))) + 1)
+		mdl = Model3D(
+			device=device, depth=1, mesh_h=H, mesh_w=W,
+			mesh_step=mesh_step, winding_step=winding_step,
+			subsample_mesh=subsample_mesh, subsample_winding=subsample_winding,
+			arc_cx=0.0, arc_cy=0.0, arc_radius=1000.0,
+			arc_angle0=-0.5, arc_angle1=0.5,
+			init_mode="arc", pyramid_d=False,
+		)
+		flat_mesh = xyz.to(device=device).permute(2, 0, 1).unsqueeze(1)  # (3, 1, H, W)
+		valid_dev = valid.to(device=device)
+		mdl.arc_enabled = False
+		mdl.straight_enabled = False
+		mdl.mesh_ms = Model3D._construct_pyramid_from_flat_3d_masked(
+			flat_mesh, valid_dev, n_scales=n_scales, pyramid_d=mdl.pyramid_d)
+		return mdl
+
+	@staticmethod
+	def from_tifxyz(path: str, *, device: torch.device, mesh_step: int = 100,
+					winding_step: int = 25, subsample_mesh: int = 4,
+					subsample_winding: int = 4) -> "Model3D":
+		"""Create a depth=1 model initialized from a tifxyz directory.
+
+		Invalid vertices (VC3D sentinel -1,-1,-1) are inpainted via
+		masked scale-space pyramid reconstruction.
+		"""
+		from tifxyz_io import load_tifxyz
+		xyz, valid, meta = load_tifxyz(path, device=device)
+		# Derive mesh_step from meta scale if available
+		scale = meta.get("scale")
+		if scale is not None and isinstance(scale, list) and len(scale) >= 1 and float(scale[0]) > 0:
+			mesh_step = max(1, int(round(1.0 / float(scale[0]))))
+		return Model3D.from_tifxyz_crop(
+			xyz, valid, device=device, mesh_step=mesh_step,
+			winding_step=winding_step, subsample_mesh=subsample_mesh,
+			subsample_winding=subsample_winding)
+
+	def _intersect_ext_surfaces(self, xyz_lr: torch.Tensor, normals: torch.Tensor, data: fit_data.FitData3D
+							   ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]] | None:
+		"""Intersect model vertices with all external surfaces.
+
+		Returns list of (ext_pts, ext_mask, ext_sign, offset) per external surface,
+		or None if no external surfaces registered.
+		"""
+		if not self._ext_surfaces:
+			return None
+		D, Hm, Wm, _ = xyz_lr.shape
+		device = xyz_lr.device
+		eps = 1e-12
+		results = []
+
+		for ei, ext_xyz in enumerate(self._ext_surfaces):
+			H_ext, W_ext, _ = ext_xyz.shape
+			offset = self._ext_offsets[ei]
+			ext_off = self._ext_conn_offsets[ei]  # (2, D, Hm, Wm)
+			h_off = ext_off[0]
+			w_off = ext_off[1]
+
+			# For each model vertex (d, h, w), find target quad on external surface
+			# Initial target: center of external surface + offset
+			h_idx = torch.arange(Hm, device=device, dtype=torch.float32).view(1, Hm, 1).expand(D, Hm, Wm)
+			w_idx = torch.arange(Wm, device=device, dtype=torch.float32).view(1, 1, Wm).expand(D, Hm, Wm)
+
+			target_h = (h_idx * (H_ext - 1) / max(1, Hm - 1) + h_off).clamp(0, H_ext - 1)
+			target_w = (w_idx * (W_ext - 1) / max(1, Wm - 1) + w_off).clamp(0, W_ext - 1)
+			row = target_h.floor().clamp(0, H_ext - 2).long()
+			col = target_w.floor().clamp(0, W_ext - 2).long()
+			frac_h = target_h - row.float()
+			frac_w = target_w - col.float()
+
+			# Gather quad corners from external surface (no batch dim)
+			P00 = ext_xyz[row, col]          # (D, Hm, Wm, 3)
+			P10 = ext_xyz[row + 1, col]
+			P01 = ext_xyz[row, col + 1]
+			P11 = ext_xyz[row + 1, col + 1]
+
+			O = xyz_lr
+			n = normals
+			a = P10 - P00
+			b = P01 - P00
+			c = P11 - P10 - P01 + P00
+			g = P00 - O
+
+			def cross2(vec: torch.Tensor, i: int, j: int) -> torch.Tensor:
+				return vec[..., i] * n[..., j] - vec[..., j] * n[..., i]
+
+			Ap = [cross2(a, 0, 1), cross2(a, 0, 2), cross2(a, 1, 2)]
+			Bp = [cross2(b, 0, 1), cross2(b, 0, 2), cross2(b, 1, 2)]
+			Cp = [cross2(c, 0, 1), cross2(c, 0, 2), cross2(c, 1, 2)]
+			Gp = [cross2(g, 0, 1), cross2(g, 0, 2), cross2(g, 1, 2)]
+
+			qpairs = [(0, 1), (0, 2), (1, 2)]
+			alphas, betas_q, gammas = [], [], []
+			for p, q in qpairs:
+				alphas.append(Ap[p] * Cp[q] - Ap[q] * Cp[p])
+				betas_q.append(Ap[p] * Bp[q] - Ap[q] * Bp[p] + Gp[p] * Cp[q] - Gp[q] * Cp[p])
+				gammas.append(Gp[p] * Bp[q] - Gp[q] * Bp[p])
+
+			abs_a = [aa.abs() for aa in alphas]
+			sel_q0 = (abs_a[0] >= abs_a[1]) & (abs_a[0] >= abs_a[2])
+			sel_q1 = (~sel_q0) & (abs_a[1] >= abs_a[2])
+			alpha = torch.where(sel_q0, alphas[0], torch.where(sel_q1, alphas[1], alphas[2]))
+			beta = torch.where(sel_q0, betas_q[0], torch.where(sel_q1, betas_q[1], betas_q[2]))
+			gamma = torch.where(sel_q0, gammas[0], torch.where(sel_q1, gammas[1], gammas[2]))
+
+			disc = (beta * beta - 4.0 * alpha * gamma).clamp(min=0.0)
+			sqrt_disc = torch.sqrt(disc + eps)
+			is_linear = alpha.abs() < eps
+			u1 = (-beta + sqrt_disc) / (2.0 * alpha + eps * is_linear.float())
+			u2 = (-beta - sqrt_disc) / (2.0 * alpha + eps * is_linear.float())
+			u_lin = -gamma / (beta + eps * (beta.abs() < eps).float())
+			u1 = torch.where(is_linear, u_lin, u1)
+			u2 = torch.where(is_linear, u_lin, u2)
+			u = torch.where((u1 - frac_h).abs() <= (u2 - frac_h).abs(), u1, u2)
+
+			denom_v = [Bp[k] + u * Cp[k] for k in range(3)]
+			numer_v = [-(Gp[k] + u * Ap[k]) for k in range(3)]
+			abs_dv = [d.abs() for d in denom_v]
+			sel_v0 = (abs_dv[0] >= abs_dv[1]) & (abs_dv[0] >= abs_dv[2])
+			sel_v1 = (~sel_v0) & (abs_dv[1] >= abs_dv[2])
+			dv = torch.where(sel_v0, denom_v[0], torch.where(sel_v1, denom_v[1], denom_v[2]))
+			nv = torch.where(sel_v0, numer_v[0], torch.where(sel_v1, numer_v[1], numer_v[2]))
+			v = nv / (dv + eps * (dv.abs() < eps).float())
+
+			conn_pt = P00 + u.unsqueeze(-1) * a + v.unsqueeze(-1) * b + (u * v).unsqueeze(-1) * c
+			s_sign = ((conn_pt - O) * n).sum(dim=-1).sign()
+			s_sign = torch.where(s_sign == 0, torch.ones_like(s_sign), s_sign)
+
+			in_bounds = (target_h >= 0) & (target_h <= H_ext - 1) & (target_w >= 0) & (target_w <= W_ext - 1)
+			uv_ok = (u >= 0) & (u <= 1) & (v >= 0) & (v <= 1)
+			gm_valid = (data.grid_sample_fullres(conn_pt.detach()).grad_mag.squeeze(0).squeeze(0) > 0.0)
+			# Check all 4 quad corners are valid in the external surface
+			ext_v = self._ext_valid[ei]  # (H_ext, W_ext)
+			quad_valid = ext_v[row, col] & ext_v[row + 1, col] & ext_v[row, col + 1] & ext_v[row + 1, col + 1]
+			valid = (in_bounds & uv_ok & gm_valid & quad_valid).to(dtype=xyz_lr.dtype).unsqueeze(1)  # (D, 1, Hm, Wm)
+
+			# Cache intersection params for conn_offset update
+			self._ext_conn_params[ei] = {"u": u, "v": v, "row": row, "col": col}
+
+			results.append((conn_pt.detach(), valid, s_sign, offset))
+
+		return results
+
 	def forward(self, data: fit_data.FitData3D) -> FitResult3D:
 		xyz_lr = self._grid_xyz()  # (D, Hm, Wm, 3)
 		xyz_hr = self._grid_xyz_hr(xyz_lr)  # (D, He, We, 3)
@@ -566,6 +838,9 @@ class Model3D(nn.Module):
 		mask_hr = (data.grid_sample_fullres(xyz_hr.detach()).grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
 		mask_lr = (data.grid_sample_fullres(xyz_lr.detach()).grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
 
+		# External surface intersections
+		ext_conn = self._intersect_ext_surfaces(xyz_lr, normals, data)
+
 		return FitResult3D(
 			xyz_lr=xyz_lr,
 			xyz_hr=xyz_hr,
@@ -582,6 +857,7 @@ class Model3D(nn.Module):
 			mask_conn=mask_conn,
 			sign_conn=sign_conn,
 			params=self.params,
+			ext_conn=ext_conn,
 		)
 
 	def opt_params(self) -> dict[str, list[nn.Parameter]]:

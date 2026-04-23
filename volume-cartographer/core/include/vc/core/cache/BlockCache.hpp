@@ -96,35 +96,46 @@ public:
                        std::vector<uint8_t>& out) const;
 
     // Insert, copying kBlockBytes from `src`. Evicts NRU entries if full.
-    void put(const BlockKey& key, const uint8_t* src) noexcept;
+    // `gen` is the cache generation the caller was issued; if it no longer
+    // matches (volume was switched, cache cleared), the put is a no-op.
+    void put(const BlockKey& key, const uint8_t* src, uint64_t gen) noexcept;
 
     // Scoped batch-put: take the unique_lock once, call put() many times,
     // release on destruction. Eliminates 512 lock/unlock pairs per 128³
     // chunk insert in the sampler hot path.
     class BatchPut {
     public:
-        explicit BatchPut(BlockCache& cache) noexcept
-            : cache_(cache), lock_(cache.mutex_) {}
+        explicit BatchPut(BlockCache& cache, uint64_t gen) noexcept
+            : cache_(cache), gen_(gen), lock_(cache.mutex_) {}
         BatchPut(const BatchPut&) = delete;
         BatchPut& operator=(const BatchPut&) = delete;
         void put(const BlockKey& key, const uint8_t* src) noexcept;
     private:
         BlockCache& cache_;
+        uint64_t gen_;
         std::unique_lock<std::shared_mutex> lock_;
     };
 
     [[nodiscard]] size_t capacity() const noexcept { return nSlots_; }
     [[nodiscard]] size_t size() const noexcept;
 
+    // Returns the current generation. Callers capture this at construction
+    // and pass it to put()/BatchPut so stale inserts are rejected.
+    [[nodiscard]] uint64_t generation() const noexcept;
+
+    // Clear all entries and bump the generation counter. Subsequent puts
+    // with an older generation are silently rejected.
     void clear();
 
 private:
     // Body of put()/BatchPut::put — assumes unique_lock on mutex_ is held.
-    void putLocked(const BlockKey& key, const uint8_t* src) noexcept;
+    // Rejects the insert if gen != generation_.
+    void putLocked(const BlockKey& key, const uint8_t* src, uint64_t gen) noexcept;
     [[nodiscard]] size_t reclaimSlotLocked();
 
     Config config_;
     size_t nSlots_ = 0;
+    uint64_t generation_ = 0;  // bumped on clear(); guarded by mutex_
 
     // Contiguous mmap'd arena of Block objects. Virtual region is sized at
     // startup; a background thread pre-faults pages in 1 GB increments via

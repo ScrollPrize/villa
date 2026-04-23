@@ -250,8 +250,12 @@ BlockPipeline::BlockPipeline(
 
     // Clear the shared block cache so stale blocks from the previous volume
     // don't appear in the new one. Physical pages are released via
-    // MADV_DONTNEED; the virtual mapping stays alive.
+    // MADV_DONTNEED; the virtual mapping stays alive. clear() bumps the
+    // generation counter; we capture it so our puts are accepted while
+    // straggler puts from the old pipeline (with the old generation) are
+    // silently rejected.
     blockCache_.clear();
+    cacheGen_ = blockCache_.generation();
 
     // Scan the on-disk cache once at startup so the stats bar reports
     // actual usage instead of "0 GB / 0 shards" until we write something.
@@ -931,7 +935,7 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
     uint8_t tmp[kBlockBytes];
     // One unique_lock covers all 512 inserts for a 128³ canonical chunk
     // instead of 512 separate lock/unlock pairs.
-    BlockCache::BatchPut batch(blockCache_);
+    BlockCache::BatchPut batch(blockCache_, cacheGen_);
     for (int bi = 0; bi < bzN; ++bi) {
         for (int bj = 0; bj < byN; ++bj) {
             for (int bk = 0; bk < bxN; ++bk) {

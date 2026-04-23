@@ -152,9 +152,9 @@ def main(argv: list[str] | None = None) -> int:
 	_, D, Hm, Wm = (int(v) for v in mesh.shape)
 	mesh_np = mesh.detach().cpu().numpy()  # (3, D, Hm, Wm)
 
-	mesh_step = 16
+	mesh_step = 100
 	if model_params is not None:
-		mesh_step = int(model_params.get("mesh_step", 16))
+		mesh_step = int(model_params.get("mesh_step", 100))
 	xy_step_fullres = float(mesh_step)
 	meta_scale = 1.0 / xy_step_fullres
 

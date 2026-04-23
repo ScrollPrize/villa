@@ -15,6 +15,7 @@ class QLineEdit;
 class QProgressBar;
 class QPushButton;
 class QSettings;
+class QDoubleSpinBox;
 class QSpinBox;
 class QStackedWidget;
 class QToolButton;
@@ -38,7 +39,7 @@ public:
                                             QWidget* parent = nullptr);
 
     /** 0 = Re-optimize, 1 = New Model, 2 = Expand */
-    enum LasagnaMode { ReOptimize = 0, NewModel = 1, Expand = 2 };
+    enum LasagnaMode { ReOptimize = 0, NewModel = 1, Expand = 2, Offset = 3 };
 
     // Getters
     [[nodiscard]] QString lasagnaDataInputPath() const { return _lasagnaDataInputPath; }
@@ -51,6 +52,9 @@ public:
     [[nodiscard]] int newModelWindings() const;
     [[nodiscard]] QString seedPointText() const;
     [[nodiscard]] QString newModelOutputName() const;
+    [[nodiscard]] double offsetValue() const;
+    [[nodiscard]] int windowSize() const;
+    [[nodiscard]] int windowOverlap() const;
 
     // Setters
     void setLasagnaDataInputPath(const QString& path);
@@ -84,6 +88,7 @@ private:
     CollapsibleSettingsGroup* _newModelGroup{nullptr};
     CollapsibleSettingsGroup* _reoptGroup{nullptr};
     CollapsibleSettingsGroup* _expandGroup{nullptr};
+    CollapsibleSettingsGroup* _offsetGroup{nullptr};
 
     // Connection mode
     QComboBox* _connectionCombo{nullptr};
@@ -122,11 +127,17 @@ private:
     QToolButton* _reoptConfigBrowse{nullptr};
     QComboBox* _expandConfigCombo{nullptr};
     QToolButton* _expandConfigBrowse{nullptr};
+    QComboBox* _offsetConfigCombo{nullptr};
+    QToolButton* _offsetConfigBrowse{nullptr};
+    QDoubleSpinBox* _offsetValueSpin{nullptr};
+    QSpinBox* _windowSizeSpin{nullptr};
+    QSpinBox* _windowOverlapSpin{nullptr};
 
     // Action buttons
     QPushButton* _newModelBtn{nullptr};
     QPushButton* _reoptBtn{nullptr};
     QPushButton* _expandBtn{nullptr};
+    QPushButton* _offsetBtn{nullptr};
     QPushButton* _stopBtn{nullptr};
     QPushButton* _stopServiceBtn{nullptr};
 
@@ -137,8 +148,9 @@ private:
     QString _newModelConfigFilePath;
     QString _reoptConfigFilePath;
     QString _expandConfigFilePath;
+    QString _offsetConfigFilePath;
 
-    int _lasagnaMode{0};         // 0=re-optimize, 1=new model, 2=expand
+    int _lasagnaMode{0};         // 0=re-optimize, 1=new model, 2=expand, 3=offset
     int _connectionMode{0};  // 0=internal, 1=external
     QString _externalHost{"127.0.0.1"};
     int _externalPort{9999};

@@ -301,6 +301,62 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     panelLayout->addWidget(_expandBtn);
 
     // =======================================================================
+    // Offset settings + action button
+    // =======================================================================
+    {
+        auto* sep = new QFrame(this);
+        sep->setFrameShape(QFrame::HLine);
+        sep->setFrameShadow(QFrame::Sunken);
+        panelLayout->addWidget(sep);
+    }
+
+    _offsetGroup = new CollapsibleSettingsGroup(tr("Offset Settings"), this);
+    auto* offsetContent = _offsetGroup->contentWidget();
+
+    _offsetGroup->addRow(tr("Config:"), [&](QHBoxLayout* row) {
+        _offsetConfigCombo = new QComboBox(offsetContent);
+        _offsetConfigCombo->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Fixed);
+        _offsetConfigBrowse = new QToolButton(offsetContent);
+        _offsetConfigBrowse->setText(QStringLiteral("..."));
+        _offsetConfigBrowse->setToolTip(tr("Browse for a JSON config file"));
+        row->addWidget(_offsetConfigCombo, 1);
+        row->addWidget(_offsetConfigBrowse);
+    }, tr("JSON config file for offset optimization."));
+
+    _offsetGroup->addRow(tr("Offset:"), [&](QHBoxLayout* row) {
+        _offsetValueSpin = new QDoubleSpinBox(offsetContent);
+        _offsetValueSpin->setRange(-5.0, 5.0);
+        _offsetValueSpin->setSingleStep(1.0);
+        _offsetValueSpin->setDecimals(2);
+        _offsetValueSpin->setValue(1.0);
+        _offsetValueSpin->setToolTip(tr("Target grad_mag integral offset (-1, 0, +1 typical)"));
+        row->addWidget(_offsetValueSpin);
+    }, tr("Offset in winding-integral space. 0=reoptimize in place, ±1=adjacent winding."));
+
+    _offsetGroup->addRow(tr("Window:"), [&](QHBoxLayout* row) {
+        _windowSizeSpin = new QSpinBox(offsetContent);
+        _windowSizeSpin->setRange(0, 100000);
+        _windowSizeSpin->setSingleStep(1000);
+        _windowSizeSpin->setValue(0);
+        _windowSizeSpin->setToolTip(tr("Window size in fullres voxels (0 = no windowing)"));
+        row->addWidget(_windowSizeSpin);
+    }, tr("Split large surfaces into windows for memory efficiency. 0 = process whole surface."));
+
+    _offsetGroup->addRow(tr("Overlap:"), [&](QHBoxLayout* row) {
+        _windowOverlapSpin = new QSpinBox(offsetContent);
+        _windowOverlapSpin->setRange(0, 50000);
+        _windowOverlapSpin->setSingleStep(100);
+        _windowOverlapSpin->setValue(500);
+        _windowOverlapSpin->setToolTip(tr("Overlap between windows in fullres voxels"));
+        row->addWidget(_windowOverlapSpin);
+    }, tr("Overlap ensures smooth transitions at window boundaries."));
+
+    panelLayout->addWidget(_offsetGroup);
+
+    _offsetBtn = new QPushButton(tr("Offset"), this);
+    panelLayout->addWidget(_offsetBtn);
+
+    // =======================================================================
     // Shared bottom area — stop buttons, progress
     // =======================================================================
     auto* btnRow = new QHBoxLayout();
@@ -511,6 +567,39 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         }
     });
 
+    // -- Offset config combo --
+    connect(_offsetConfigCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [this](int index) {
+        if (_restoringSettings || index < 0) return;
+        QString path = _offsetConfigCombo->currentData().toString();
+        if (!path.isEmpty()) {
+            _offsetConfigFilePath = path;
+            writeSetting(QStringLiteral("lasagna_offset_config_file_path"), _offsetConfigFilePath);
+        }
+    });
+    connect(_offsetConfigBrowse, &QToolButton::clicked, this, [this]() {
+        QString initial = _offsetConfigFilePath.isEmpty()
+            ? QDir::homePath() : QFileInfo(_offsetConfigFilePath).absolutePath();
+        QString path = QFileDialog::getOpenFileName(
+            this, tr("Select optimizer config JSON file"), initial,
+            tr("JSON files (*.json);;All files (*)"));
+        if (!path.isEmpty()) {
+            _offsetConfigFilePath = path;
+            writeSetting(QStringLiteral("lasagna_offset_config_file_path"), _offsetConfigFilePath);
+            QFileInfo fi(path);
+            populateConfigCombo(_offsetConfigCombo, fi.absolutePath(), fi.fileName(), _offsetConfigFilePath);
+        }
+    });
+    connect(_offsetValueSpin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        writeSetting(QStringLiteral("lasagna_offset_value"), v);
+    });
+    connect(_windowSizeSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
+        writeSetting(QStringLiteral("lasagna_window_size"), v);
+    });
+    connect(_windowOverlapSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int v) {
+        writeSetting(QStringLiteral("lasagna_window_overlap"), v);
+    });
+
     // -- Expand direction persistence --
     for (int i = 0; i < kExpandDirCount; ++i) {
         connect(_expandDirChecks[i], &QCheckBox::toggled, this, [this, i](bool checked) {
@@ -537,6 +626,10 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         _lasagnaMode = 2;
         triggerOptimization();
     });
+    connect(_offsetBtn, &QPushButton::clicked, this, [this]() {
+        _lasagnaMode = 3;
+        triggerOptimization();
+    });
 
     // -- Stop buttons --
     connect(_stopBtn, &QPushButton::clicked, this, [this]() {
@@ -555,6 +648,9 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
     });
     connect(_reoptGroup, &CollapsibleSettingsGroup::toggled, this, [this](bool expanded) {
         writeSetting(QStringLiteral("group_lasagna_reopt_expanded"), expanded);
+    });
+    connect(_offsetGroup, &CollapsibleSettingsGroup::toggled, this, [this](bool expanded) {
+        writeSetting(QStringLiteral("group_lasagna_offset_expanded"), expanded);
     });
     connect(_expandGroup, &CollapsibleSettingsGroup::toggled, this, [this](bool expanded) {
         writeSetting(QStringLiteral("group_lasagna_expand_expanded"), expanded);
@@ -713,6 +809,7 @@ void SegmentationLasagnaPanel::triggerOptimization()
 {
     const QString& configPath = (_lasagnaMode == 1) ? _newModelConfigFilePath
                               : (_lasagnaMode == 2) ? _expandConfigFilePath
+                              : (_lasagnaMode == 3) ? _offsetConfigFilePath
                               : _reoptConfigFilePath;
 
     if (configPath.isEmpty()) {
@@ -838,6 +935,24 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
 
     // Expand settings
     _expandConfigFilePath = settings.value(QStringLiteral("lasagna_expand_config_file_path"), QString()).toString();
+
+    // Offset settings
+    _offsetConfigFilePath = settings.value(QStringLiteral("lasagna_offset_config_file_path"), QString()).toString();
+    if (_offsetValueSpin) {
+        const QSignalBlocker b(_offsetValueSpin);
+        _offsetValueSpin->setValue(
+            settings.value(QStringLiteral("lasagna_offset_value"), 1.0).toDouble());
+    }
+    if (_windowSizeSpin) {
+        const QSignalBlocker b(_windowSizeSpin);
+        _windowSizeSpin->setValue(
+            settings.value(QStringLiteral("lasagna_window_size"), 0).toInt());
+    }
+    if (_windowOverlapSpin) {
+        const QSignalBlocker b(_windowOverlapSpin);
+        _windowOverlapSpin->setValue(
+            settings.value(QStringLiteral("lasagna_window_overlap"), 500).toInt());
+    }
     for (int i = 0; i < kExpandDirCount; ++i) {
         if (_expandDirChecks[i]) {
             const QSignalBlocker b(_expandDirChecks[i]);
@@ -880,6 +995,15 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
             _expandConfigCombo->addItem(fi.fileName(), _expandConfigFilePath);
         }
     }
+    if (!_offsetConfigFilePath.isEmpty()) {
+        QFileInfo fi(_offsetConfigFilePath);
+        if (fi.exists()) {
+            populateConfigCombo(_offsetConfigCombo, fi.absolutePath(), fi.fileName(), _offsetConfigFilePath);
+        } else if (_offsetConfigCombo) {
+            _offsetConfigCombo->clear();
+            _offsetConfigCombo->addItem(fi.fileName(), _offsetConfigFilePath);
+        }
+    }
 
     // Expand states
     if (_connectionGroup) {
@@ -897,6 +1021,10 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
     if (_expandGroup) {
         _expandGroup->setExpanded(
             settings.value(QStringLiteral("group_lasagna_expand_expanded"), false).toBool());
+    }
+    if (_offsetGroup) {
+        _offsetGroup->setExpanded(
+            settings.value(QStringLiteral("group_lasagna_offset_expanded"), false).toBool());
     }
 
     _restoringSettings = false;
@@ -994,6 +1122,7 @@ QString SegmentationLasagnaPanel::lasagnaConfigText() const
 {
     const QString& path = (_lasagnaMode == 1) ? _newModelConfigFilePath
                         : (_lasagnaMode == 2) ? _expandConfigFilePath
+                        : (_lasagnaMode == 3) ? _offsetConfigFilePath
                         : _reoptConfigFilePath;
     if (path.isEmpty()) return {};
     QFile f(path);
@@ -1045,7 +1174,9 @@ utils::Json SegmentationLasagnaPanel::lasagnaConfigJson() const
         utils::Json parsed = utils::Json::parse(
             std::string_view(utf8.constData(), utf8.size()));
         if (parsed.is_object()) return parsed;
-    } catch (...) {}
+    } catch (const std::exception& e) {
+        std::cerr << "[lasagna] ERROR: invalid config JSON: " << e.what() << std::endl;
+    }
 
     return utils::Json{};
 }
@@ -1077,6 +1208,21 @@ QString SegmentationLasagnaPanel::seedPointText() const
 QString SegmentationLasagnaPanel::newModelOutputName() const
 {
     return _outputNameEdit ? _outputNameEdit->text().trimmed() : QString();
+}
+
+double SegmentationLasagnaPanel::offsetValue() const
+{
+    return _offsetValueSpin ? _offsetValueSpin->value() : 1.0;
+}
+
+int SegmentationLasagnaPanel::windowSize() const
+{
+    return _windowSizeSpin ? _windowSizeSpin->value() : 0;
+}
+
+int SegmentationLasagnaPanel::windowOverlap() const
+{
+    return _windowOverlapSpin ? _windowOverlapSpin->value() : 500;
 }
 
 void SegmentationLasagnaPanel::setSeedFromFocus(int x, int y, int z)

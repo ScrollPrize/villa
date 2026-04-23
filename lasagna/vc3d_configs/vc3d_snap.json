@@ -1,7 +1,4 @@
 {
-	"args": {
-		"mesh-step": 50.0
-	},
 	"base": {
 		"normal": 1.0,
 		"step": 10.0,
@@ -11,20 +8,13 @@
 		"winding_density": 1.0,
 		"data": 0.0,
 		"data_plain": 0.0,
-		"pred_dt": 0.0,
+		"pred_dt": 0.001,
 		"corr": 0.1,
 		"bend": 100.0
 	},
 	"stages": [
 		{
-			"name": "reopt",
-			"steps": 500,
-			"min_scaledown": 3,
-			"lr": [100.0, 10.0, 1.0, 0.1, 0.01, 0.001],
-			"params": ["mesh_ms","conn_offset_ms"]
-		},
-		{
-			"name": "reopt",
+			"name": "snap",
 			"steps": 1000,
 			"min_scaledown": 0,
 			"lr": [100.0, 10.0, 1.0, 0.1, 0.01, 0.001],

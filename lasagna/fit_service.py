@@ -309,6 +309,23 @@ def _run_optimization(body: dict[str, Any]) -> None:
 
         # Build argv for fit.py from the config dict.
         cfg = dict(config)
+
+        # Decode tifxyz data if present (offset mode — files sent as base64)
+        tifxyz_data = body.get("tifxyz_data")
+        if isinstance(tifxyz_data, dict):
+            tifxyz_dir = str(Path(tmp_dir) / "tifxyz_input")
+            Path(tifxyz_dir).mkdir(parents=True, exist_ok=True)
+            for fname, b64 in tifxyz_data.items():
+                (Path(tifxyz_dir) / fname).write_bytes(base64.b64decode(b64))
+            print(f"[fit-service] decoded tifxyz ({len(tifxyz_data)} files) to {tifxyz_dir}", flush=True)
+            # Set up tifxyz-init and external_surfaces pointing to local copy
+            args_section_pre = cfg.get("args", {})
+            if isinstance(args_section_pre, dict):
+                args_section_pre["tifxyz-init"] = tifxyz_dir
+            cfg["args"] = args_section_pre
+            offset_val = float(cfg.pop("offset_value", 1.0))
+            cfg["external_surfaces"] = [{"path": tifxyz_dir, "offset": offset_val}]
+
         args_section = dict(cfg.get("args", {}))
         args_section["input"] = str(data_input)
         if model_input:
@@ -372,21 +389,26 @@ def _run_optimization(body: dict[str, Any]) -> None:
                 _job.set_error("cancelled")
                 return
 
-            # Export to tifxyz
-            _job.set_running("exporting", 0, 0, 0.0)
-            import fit2tifxyz
-            export_argv = ["--input", str(model_output), "--output", str(output_dir)]
-            if body.get("single_segment"):
-                export_argv.append("--single-segment")
-            if body.get("copy_model"):
-                export_argv.append("--copy-model")
-            output_name = body.get("output_name")
-            if output_name:
-                export_argv.extend(["--output-name", str(output_name)])
-            voxel_size_um = config.get("voxel_size_um")
-            if voxel_size_um is not None:
-                export_argv.extend(["--voxel-size-um", str(float(voxel_size_um))])
-            fit2tifxyz.main(export_argv)
+            # Export to tifxyz — skip if windowed mode already exported
+            _has_tifxyz = any(p.name.endswith(".tifxyz") and p.is_dir()
+                              for p in Path(output_dir).iterdir()) if Path(output_dir).is_dir() else False
+            if _has_tifxyz:
+                print("[fit-service] windowed mode: skipping fit2tifxyz (per-window export done)", flush=True)
+            else:
+                _job.set_running("exporting", 0, 0, 0.0)
+                import fit2tifxyz
+                export_argv = ["--input", str(model_output), "--output", str(output_dir)]
+                if body.get("single_segment"):
+                    export_argv.append("--single-segment")
+                if body.get("copy_model"):
+                    export_argv.append("--copy-model")
+                output_name = body.get("output_name")
+                if output_name:
+                    export_argv.extend(["--output-name", str(output_name)])
+                voxel_size_um = config.get("voxel_size_um")
+                if voxel_size_um is not None:
+                    export_argv.extend(["--voxel-size-um", str(float(voxel_size_um))])
+                fit2tifxyz.main(export_argv)
 
         # Clean up intermediate files (but keep results_tmp for download)
         import shutil

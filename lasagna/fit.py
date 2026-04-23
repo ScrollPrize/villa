@@ -146,9 +146,44 @@ def _build_parser() -> argparse.ArgumentParser:
 	cli_model.add_args(p)
 	cli_opt.add_args(p)
 	p.add_argument("--out-dir", default=None, help="Output directory for snapshots and debug")
+	p.add_argument("--tifxyz-init", default=None, help="Initialize model from tifxyz directory instead of model.pt or new model")
+	p.add_argument("--window-size", type=int, default=None,
+		help="Window size in fullres voxels for windowed tifxyz optimization (0 or omit = no windowing)")
+	p.add_argument("--window-overlap", type=int, default=0,
+		help="Overlap between windows in fullres voxels")
 	p.add_argument("--progress", action="store_true", default=False,
 		help="Print machine-readable PROGRESS lines to stdout")
 	return p
+
+
+def _compute_window_grid(
+	H: int, W: int, mesh_step: int, window_size: int, overlap: int,
+) -> list[tuple[int, int, int, int]]:
+	"""Compute window tiles over a (H, W) vertex grid.
+
+	window_size and overlap are in fullres voxels.
+	Returns list of (h0, h1, w0, w1) in vertex indices.
+	"""
+	if overlap >= window_size:
+		raise ValueError(f"overlap ({overlap}) must be less than window_size ({window_size})")
+	win_verts = window_size // mesh_step + 1
+	overlap_verts = overlap // mesh_step
+	stride = max(1, win_verts - overlap_verts)
+	windows = []
+	h = 0
+	while h < H:
+		h1 = min(h + win_verts, H)
+		w = 0
+		while w < W:
+			w1 = min(w + win_verts, W)
+			windows.append((h, h1, w, w1))
+			if w1 == W:
+				break
+			w += stride
+		if h1 == H:
+			break
+		h += stride
+	return windows
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -212,8 +247,186 @@ def main(argv: list[str] | None = None) -> int:
 		model_cfg = dataclasses.replace(model_cfg, depth=auto_depth, mesh_h=auto_mesh_h, mesh_w=auto_mesh_w)
 		print(f"[fit] model size: depth={auto_depth} mesh_h={auto_mesh_h} mesh_w={auto_mesh_w}", flush=True)
 
+	# --- Windowed tifxyz mode ---
+	tifxyz_init = getattr(args, "tifxyz_init", None)
+	window_size = getattr(args, "window_size", None) or 0
+	window_overlap = getattr(args, "window_overlap", 0)
+
+	if tifxyz_init and window_size > 0:
+		from tifxyz_io import load_tifxyz
+		import fit2tifxyz as _f2t
+		import json as _json
+
+		# Load full tifxyz to CPU (save GPU mem)
+		full_xyz, full_valid, full_meta = load_tifxyz(tifxyz_init, device="cpu")
+		H_full, W_full, _ = full_xyz.shape
+		mesh_step = model_cfg.mesh_step
+		scale = full_meta.get("scale")
+		if scale is not None and isinstance(scale, list) and len(scale) >= 1 and float(scale[0]) > 0:
+			mesh_step = max(1, int(round(1.0 / float(scale[0]))))
+
+		# Get offset from external_surfaces config
+		ext_surfaces_cfg = cfg.pop("external_surfaces", None)
+		offset_val = 1.0
+		if isinstance(ext_surfaces_cfg, list) and ext_surfaces_cfg:
+			offset_val = float(ext_surfaces_cfg[0].get("offset", 1.0))
+		ext_margin = max(4, int(2 * abs(offset_val) / mesh_step) + 2)
+
+		# Parse stages and channel skipping (shared across windows)
+		cfg.pop("corr_points", None)
+		cfg.pop("args", None)
+		cfg.pop("voxel_size_um", None)
+		cfg.pop("external_surfaces", None)
+		cfg.pop("tifxyz_data", None)
+		cfg.pop("offset_value", None)
+		stages = optimizer.load_stages_cfg(cfg)
+		_skip_channels: set[str] = set()
+		_any_data = any(s.global_opt.eff.get("data", 0) > 0 or s.global_opt.eff.get("data_plain", 0) > 0
+						for s in stages)
+		_any_pred_dt = any(s.global_opt.eff.get("pred_dt", 0) > 0 for s in stages)
+		if not _any_data:
+			_skip_channels.add("cos")
+		if not _any_pred_dt:
+			_skip_channels.add("pred_dt")
+
+		windows = _compute_window_grid(H_full, W_full, mesh_step, window_size, window_overlap)
+		n_windows = len(windows)
+		overlap_verts = window_overlap // mesh_step
+		print(f"[fit] windowed mode: {n_windows} windows, window_size={window_size} "
+			  f"overlap={window_overlap} mesh_step={mesh_step} grid={H_full}x{W_full}",
+			  flush=True)
+
+		# Output directory for window tifxyz exports
+		output_dir = model_cfg.model_output
+		if output_dir is not None:
+			output_dir = str(Path(output_dir).parent)
+		elif _out_dir is not None:
+			output_dir = _out_dir
+		else:
+			raise ValueError("windowed mode requires --model-output or --out-dir")
+		Path(output_dir).mkdir(parents=True, exist_ok=True)
+
+		voxel_size_um = fit_config.get("voxel_size_um")
+
+		for wi, (h0, h1, w0, w1) in enumerate(windows):
+			print(f"\n[fit] === window {wi+1}/{n_windows}: rows [{h0}:{h1}], cols [{w0}:{w1}] "
+				  f"({h1-h0}x{w1-w0} verts) ===", flush=True)
+
+			# Crop tifxyz to window
+			crop_xyz = full_xyz[h0:h1, w0:w1].to(device)
+			crop_valid = full_valid[h0:h1, w0:w1].to(device)
+
+			# Create model from crop
+			mdl = model.Model3D.from_tifxyz_crop(
+				crop_xyz, crop_valid, device=device, mesh_step=mesh_step,
+				winding_step=model_cfg.winding_step,
+				subsample_mesh=model_cfg.subsample_mesh,
+				subsample_winding=model_cfg.subsample_winding,
+			)
+
+			# Crop external surface with margin for ray intersection at boundaries
+			eh0 = max(0, h0 - ext_margin)
+			eh1 = min(H_full, h1 + ext_margin)
+			ew0 = max(0, w0 - ext_margin)
+			ew1 = min(W_full, w1 + ext_margin)
+			ext_xyz = full_xyz[eh0:eh1, ew0:ew1].to(device)
+			ext_valid = full_valid[eh0:eh1, ew0:ew1].to(device)
+			mdl.add_external_surface(ext_xyz, valid=ext_valid, offset=offset_val)
+
+			# Load data auto-cropped for this window's spatial extent
+			def _load_data_win() -> fit_data.FitData3D:
+				d = fit_data.load_3d_for_model(
+					path=str(data_cfg.input), device=device, model=mdl,
+					cuda_gridsample=data_cfg.cuda_gridsample,
+					erode_valid_mask=data_cfg.erode_valid_mask,
+					skip_channels=_skip_channels,
+				)
+				Z, Y, X = d.size
+				volume_extent = (
+					d.origin_fullres[0], d.origin_fullres[1], d.origin_fullres[2],
+					d.origin_fullres[0] + (X - 1) * d.spacing[0],
+					d.origin_fullres[1] + (Y - 1) * d.spacing[1],
+					d.origin_fullres[2] + (Z - 1) * d.spacing[2],
+				)
+				mdl.params = dataclasses.replace(mdl.params, volume_extent=volume_extent)
+				return d
+			data = _load_data_win()
+
+			# Progress wrapper: prefix window index, scale overall progress
+			def _make_progress(wi_=wi, n_=n_windows):
+				def _progress_win(*, step: int, total: int, loss: float, **kw: object) -> None:
+					if progress_enabled:
+						inner = float(kw.get("overall_progress", 0.0))
+						overall = (wi_ + inner) / n_
+						stage_name = kw.get("stage_name", "")
+						print(f"PROGRESS {step} {total} {loss:.6f} win={wi_+1}/{n_} "
+							  f"overall={overall:.3f} {stage_name}", flush=True)
+				return _progress_win
+
+			opt_loss_corr.set_snap_mode(opt_cfg.corr_snap)
+			opt_loss_dir.set_mask_zero_normals(opt_cfg.normal_mask_zero)
+
+			optimizer.optimize(
+				model=mdl,
+				data=data,
+				stages=stages,
+				snapshot_interval=0,
+				snapshot_fn=lambda **kw: None,
+				progress_fn=_make_progress(),
+				load_data_fn=_load_data_win,
+				volume_extent_fullres=volume_extent_fullres,
+			)
+
+			# Export this window's tifxyz
+			mesh = mdl.mesh_coarse()  # (3, 1, Hm, Wm)
+			mesh_np = mesh.detach().cpu().numpy()
+			Hm, Wm = mesh_np.shape[2], mesh_np.shape[3]
+			x_out = mesh_np[0, 0]  # (Hm, Wm)
+			y_out = mesh_np[1, 0]
+			z_out = mesh_np[2, 0]
+			meta_scale = 1.0 / float(mesh_step)
+
+			win_name = f"window_{wi:04d}.tifxyz"
+			win_dir = Path(output_dir) / win_name
+			area = _f2t._get_area(x_out, y_out, z_out, float(mesh_step),
+								  float(voxel_size_um) if voxel_size_um else None)
+			_f2t._write_tifxyz(
+				out_dir=win_dir, x=x_out, y=y_out, z=z_out,
+				scale=meta_scale, area=area,
+			)
+			# Add window metadata to meta.json
+			meta_path = win_dir / "meta.json"
+			meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+			meta["window_index"] = wi
+			meta["window_origin_verts"] = [h0, w0]
+			meta["window_size_verts"] = [h1 - h0, w1 - w0]
+			meta["source_grid_size_verts"] = [H_full, W_full]
+			meta["overlap_verts"] = overlap_verts
+			meta_path.write_text(_json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+
+			_f2t._print_area(area)
+			print(f"[fit] exported {win_name}", flush=True)
+
+			# Free GPU memory before next window
+			del mdl, data, crop_xyz, crop_valid, ext_xyz, ext_valid, mesh, mesh_np
+			if device.type == "cuda":
+				torch.cuda.empty_cache()
+
+		print(f"\n[fit] windowed mode complete: {n_windows} windows exported to {output_dir}",
+			  flush=True)
+		return 0
+
 	# --- Construct / load model (before data, so we can compute bbox) ---
-	if is_new_model:
+	if tifxyz_init:
+		mdl = model.Model3D.from_tifxyz(
+			tifxyz_init, device=device,
+			mesh_step=model_cfg.mesh_step,
+			winding_step=model_cfg.winding_step,
+			subsample_mesh=model_cfg.subsample_mesh,
+			subsample_winding=model_cfg.subsample_winding,
+		)
+		print(f"[fit] initialized from tifxyz: {tifxyz_init}", flush=True)
+	elif is_new_model:
 		mdl = model.Model3D(
 			device=device,
 			depth=model_cfg.depth,
@@ -246,6 +459,18 @@ def main(argv: list[str] | None = None) -> int:
 	print(f"Model3D: depth={mdl.depth} mesh_h={mdl.mesh_h} mesh_w={mdl.mesh_w} "
 		  f"arc_enabled={mdl.arc_enabled}")
 
+	# Load external reference surfaces
+	ext_surfaces_cfg = cfg.pop("external_surfaces", None)
+	if isinstance(ext_surfaces_cfg, list) and ext_surfaces_cfg:
+		from tifxyz_io import load_tifxyz
+		for es in ext_surfaces_cfg:
+			es_path = str(es["path"])
+			es_offset = float(es.get("offset", 1.0))
+			xyz_ext, valid_ext, meta_ext = load_tifxyz(es_path, device=device)
+			idx = mdl.add_external_surface(xyz_ext, valid=valid_ext, offset=es_offset)
+			print(f"[fit] external surface {idx}: path={es_path} offset={es_offset} "
+				  f"shape={tuple(xyz_ext.shape)} valid={int(valid_ext.sum())}/{valid_ext.numel()}", flush=True)
+
 	# Parse correction points from config (injected by VC3D)
 	corr_points_obj = cfg.pop("corr_points", None)
 	corr_points_3d: fit_data.CorrPoints3D | None = None
@@ -254,6 +479,12 @@ def main(argv: list[str] | None = None) -> int:
 	else:
 		print(f"[fit] corr_points: not found in config (type={type(corr_points_obj).__name__})", flush=True)
 
+	# Strip non-stage keys before parsing stages
+	cfg.pop("args", None)
+	cfg.pop("voxel_size_um", None)
+	cfg.pop("external_surfaces", None)
+	cfg.pop("tifxyz_data", None)
+	cfg.pop("offset_value", None)
 	# Parse stages (before data loading so we know which channels to skip)
 	stages = optimizer.load_stages_cfg(cfg)
 
