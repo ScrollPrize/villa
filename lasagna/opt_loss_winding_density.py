@@ -138,9 +138,16 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 		return z, (z.unsqueeze(0),), (z.unsqueeze(0),)
 
 	D, Hm, Wm, _ = res.xyz_lr.shape
+	He = int(res.xyz_hr.shape[1])
+	We = int(res.xyz_hr.shape[2])
 	device = res.xyz_lr.device
 	dtype = res.xyz_lr.dtype
 	strip_samples = max(2, int(res.params.subsample_mesh) + 1)
+
+	def _up_pts(pts: torch.Tensor) -> torch.Tensor:
+		"""(D, Hm, Wm, 3) → (D, He, We, 3) bilinear."""
+		return F.interpolate(pts.permute(0, 3, 1, 2), size=(He, We),
+							 mode='bilinear', align_corners=True).permute(0, 2, 3, 1)
 
 	total_loss = torch.zeros((), device=device, dtype=dtype)
 	total_wsum = 0.0
@@ -148,56 +155,36 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 	all_mask = []
 
 	for ext_pts, ext_mask, ext_sign, offset in res.ext_conn:
-		# ext_pts: (D, Hm, Wm, 3) — intersection points on external surface
-		# ext_mask: (D, 1, Hm, Wm) — validity
-		# ext_sign: (D, Hm, Wm) — ray direction sign
-		# offset: target grad_mag integral
+		# Upsample everything to HR for denser, more stable sampling
+		start = _up_pts(res.xyz_lr)        # (D, He, We, 3) — has gradients
+		end = _up_pts(ext_pts)             # (D, He, We, 3) — detached
+		sign_hr = F.interpolate(ext_sign.unsqueeze(1).float(), size=(He, We),
+								mode='nearest').squeeze(1)  # (D, He, We)
+		mask_hr = F.interpolate(ext_mask.float(), size=(He, We),
+								mode='nearest')  # (D, 1, He, We)
 
-		# Build strip from model vertex to external intersection point
+		# Build strips at HR resolution
 		t = torch.linspace(0.0, 1.0, strip_samples, device=device, dtype=dtype)
-		start = res.xyz_lr                    # (D, Hm, Wm, 3)
-		end = ext_pts                         # (D, Hm, Wm, 3)
 		diff = end - start
 		strip = start.unsqueeze(-2) + t.view(1, 1, 1, -1, 1) * diff.unsqueeze(-2)
 
-		strip_flat = strip.reshape(D, Hm, Wm * strip_samples, 3)
+		strip_flat = strip.reshape(D, He, We * strip_samples, 3)
 		sampled = res.data.grid_sample_fullres(strip_flat)
-		mag = sampled.grad_mag.squeeze(0).squeeze(0).reshape(D, Hm, Wm, strip_samples)
+		mag = sampled.grad_mag.squeeze(0).squeeze(0).reshape(D, He, We, strip_samples)
 
 		strip_len = torch.sqrt((diff * diff).sum(dim=-1) + 1e-12)
-		signed_len = strip_len * ext_sign
+		signed_len = strip_len * sign_hr
 		integral = mag.mean(dim=-1) * signed_len
 
 		# Huber loss on (integral - target)
 		err = integral - offset
 		lm = torch.where(err.abs() <= 1.0, 0.5 * err * err, err.abs() - 0.5)
-		lm = lm.unsqueeze(1)  # (D, 1, Hm, Wm)
+		lm = lm.unsqueeze(1)  # (D, 1, He, We)
 
-		# Validity: ext_mask AND all strip samples have grad_mag > 0
+		# Validity: mask AND all strip samples have grad_mag > 0
 		sv = (sampled.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=dtype)
-		sv = sv.reshape(D, Hm, Wm, strip_samples).amin(dim=-1).unsqueeze(1)
-		mask = ext_mask * sv
-
-		# DEBUG: log first evaluation
-		if not hasattr(ext_offset_loss, "_dbg_done"):
-			ext_offset_loss._dbg_done = True
-			n_valid = int(mask.sum().item())
-			n_total = int(ext_mask.numel() // ext_mask.shape[1])  # D*Hm*Wm
-			sl_valid = strip_len[ext_mask.squeeze(1) > 0.5]
-			int_valid = integral[ext_mask.squeeze(1) > 0.5]
-			sign_valid = ext_sign[ext_mask.squeeze(1) > 0.5]
-			print(f"[ext_offset] DEBUG: offset={offset} strip_samples={strip_samples} "
-			      f"valid={n_valid}/{n_total}", flush=True)
-			if sl_valid.numel() > 0:
-				print(f"[ext_offset] DEBUG: strip_len: mean={sl_valid.mean():.2f} "
-				      f"min={sl_valid.min():.2f} max={sl_valid.max():.2f}", flush=True)
-				print(f"[ext_offset] DEBUG: integral: mean={int_valid.mean():.4f} "
-				      f"min={int_valid.min():.4f} max={int_valid.max():.4f}", flush=True)
-				print(f"[ext_offset] DEBUG: sign: +1={int((sign_valid > 0).sum())} "
-				      f"-1={int((sign_valid < 0).sum())} 0={int((sign_valid == 0).sum())}", flush=True)
-				err_valid = int_valid - offset
-				print(f"[ext_offset] DEBUG: err: mean={err_valid.mean():.4f} "
-				      f"min={err_valid.min():.4f} max={err_valid.max():.4f}", flush=True)
+		sv = sv.reshape(D, He, We, strip_samples).amin(dim=-1).unsqueeze(1)
+		mask = mask_hr * sv
 
 		wsum = float(mask.sum().detach().cpu())
 		if wsum > 0.0:
