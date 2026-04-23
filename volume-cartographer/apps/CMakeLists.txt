@@ -96,6 +96,24 @@ target_link_libraries(vc_diffuse_winding
 add_executable(vc_render_bench src/vc_render_bench.cpp)
 target_link_libraries(vc_render_bench vc_core)
 
+add_executable(vc_io_bench src/vc_io_bench.cpp)
+target_link_libraries(vc_io_bench vc_core)
+
+add_executable(vc_blockcache_bench src/vc_blockcache_bench.cpp)
+target_link_libraries(vc_blockcache_bench vc_core)
+
+add_executable(vc_transpose_bench src/vc_transpose_bench.cpp)
+target_link_libraries(vc_transpose_bench vc_core)
+
+add_executable(vc_coord_bench src/vc_coord_bench.cpp)
+target_link_libraries(vc_coord_bench vc_core)
+
+add_executable(vc_tifxyz_bench src/vc_tifxyz_bench.cpp)
+target_link_libraries(vc_tifxyz_bench vc_core)
+
+add_executable(vc_coord_regression src/vc_coord_regression.cpp)
+target_link_libraries(vc_coord_regression vc_core)
+
 add_executable(vc_create_segment_mask src/vc_create_segment_mask.cpp)
 target_link_libraries(vc_create_segment_mask vc_core Boost::program_options)
 
@@ -162,17 +180,14 @@ target_link_libraries(vc_tifxyz vc_core Boost::program_options opencv_core)
 add_executable(vc_zarr_to_tiff src/vc_zarr_to_tiff.cpp)
 target_link_libraries(vc_zarr_to_tiff vc_core Boost::program_options TIFF::TIFF)
 
+add_executable(vc_zarr_raw_frames src/vc_zarr_raw_frames.cpp)
+target_link_libraries(vc_zarr_raw_frames vc_core)
+
 add_executable(vc_zarr_recompress src/vc_zarr_recompress.cpp)
 target_link_libraries(vc_zarr_recompress vc_core blosc_static)
 
 add_executable(vc_zarr_prefetch src/vc_zarr_prefetch.cpp)
 target_link_libraries(vc_zarr_prefetch vc_core Boost::program_options)
-
-add_executable(vc_zarr_verify src/vc_zarr_verify.cpp)
-target_link_libraries(vc_zarr_verify vc_core)
-
-add_executable(vc_encode_test src/vc_encode_test.cpp)
-target_link_libraries(vc_encode_test utils_video_codec)
 
 
 # Precompiled headers for CLI apps (reuse vc_core's PCH)

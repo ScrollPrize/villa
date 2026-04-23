@@ -147,9 +147,17 @@ void Volume::zarrOpen()
             const int expectedHeight = ceilDivPow2(baseHeight, levelInt);
             const int expectedWidth = ceilDivPow2(baseWidth, levelInt);
 
-            if (static_cast<int>(shape[0]) != expectedSlices ||
-                static_cast<int>(shape[1]) != expectedHeight ||
-                static_cast<int>(shape[2]) != expectedWidth) {
+            // Canonical format pads each level's shape to a multiple of the
+            // inner chunk size (128³), independently per level. Accept any
+            // zarr_shape that exceeds expected by less than one chunk —
+            // anything larger indicates real corruption.
+            constexpr int kMaxPerLevelPad = 128;
+            auto padOK = [](long long actual, long long expected) {
+                return actual >= expected && actual - expected < kMaxPerLevelPad;
+            };
+            if (!padOK(shape[0], expectedSlices) ||
+                !padOK(shape[1], expectedHeight) ||
+                !padOK(shape[2], expectedWidth)) {
                 throw std::runtime_error(
                     "zarr level " + std::to_string(levelInt) + " shape [z,y,x]=("
                     + std::to_string(shape[0]) + ", " + std::to_string(shape[1]) + ", " + std::to_string(shape[2])
@@ -187,9 +195,15 @@ void Volume::zarrOpen()
             const int expectedHeight = ceilDivPow2(_height, static_cast<int>(level));
             const int expectedWidth = ceilDivPow2(_width, static_cast<int>(level));
 
-            if (static_cast<int>(shape[0]) != expectedSlices ||
-                static_cast<int>(shape[1]) != expectedHeight ||
-                static_cast<int>(shape[2]) != expectedWidth) {
+            // Same tolerance as the auto-generated path: canonical caches pad
+            // each level independently to the next 128-boundary.
+            constexpr int kMaxPerLevelPad = 128;
+            auto padOK = [](long long actual, long long expected) {
+                return actual >= expected && actual - expected < kMaxPerLevelPad;
+            };
+            if (!padOK(shape[0], expectedSlices) ||
+                !padOK(shape[1], expectedHeight) ||
+                !padOK(shape[2], expectedWidth)) {
                 throw std::runtime_error(
                     "zarr level " + std::to_string(level) + " shape [z,y,x]=("
                     + std::to_string(shape[0]) + ", " + std::to_string(shape[1]) + ", " + std::to_string(shape[2])
@@ -282,7 +296,7 @@ size_t Volume::numScales() const noexcept {
 std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
 {
     if (zarrDs_.empty()) return nullptr;
-    std::vector<std::shared_ptr<utils::ZarrArray>> diskLevels;
+    std::vector<std::unique_ptr<utils::ZarrArray>> diskLevels;
 
     // Build level metadata from our zarr datasets
     std::vector<vc::cache::FileSystemSource::LevelMeta> levels;
@@ -307,6 +321,7 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
 
     // Create chunk source: HTTP for remote volumes, filesystem for local
     std::unique_ptr<vc::cache::VolumeSource> source;
+
     if (isRemote_) {
         auto httpSource = std::make_unique<vc::cache::HttpSource>(
             remoteUrl_, remoteDelimiter_, std::move(levels), remoteAuth_);
@@ -316,38 +331,71 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
         source = std::move(httpSource);
 
         // v3 sharded disk cache: path_/0/, path_/1/, ...
-        // 128³ chunks, 1024³ shards, padded to chunk boundaries.
-        // Open if zarr.json exists, create if not.
+        // c3d canonical layout: 4096³ shards with 256³ inner C3DC chunks.
+        // Open per-level zarr.json if it exists, create if not.
         {
-            int nLevels = source->numLevels();
+            const int nLevels = source->numLevels();
             diskLevels.resize(nLevels);
-            auto pad = [](int v, int chunk) -> size_t {
-                return static_cast<size_t>((v + chunk - 1) / chunk * chunk);
+
+            auto pad256 = [](int v) -> size_t {
+                return static_cast<size_t>((v + 255) / 256 * 256);
             };
+
+            auto createLevel = [&](const std::filesystem::path& lvlPath, int lvl) {
+                auto shape = source->levelShape(lvl);
+                utils::ZarrMetadata meta;
+                meta.version = utils::ZarrVersion::v3;
+                meta.node_type = "array";
+                meta.shape = {pad256(shape[0]), pad256(shape[1]), pad256(shape[2])};
+                meta.chunks = {4096, 4096, 4096};
+                meta.dtype = utils::ZarrDtype::uint8;
+                meta.fill_value = 0;
+                meta.chunk_key_encoding = "default";
+                utils::ShardConfig sc;
+                sc.sub_chunks = {256, 256, 256};
+                utils::ZarrCodecConfig cc;
+                cc.name = "c3d";
+                sc.sub_codecs.push_back(cc);
+                meta.shard_config = std::move(sc);
+                return std::make_unique<utils::ZarrArray>(
+                    utils::ZarrArray::create(lvlPath, std::move(meta)));
+            };
+
             for (int lvl = 0; lvl < nLevels; lvl++) {
                 auto lvlPath = path_ / std::to_string(lvl);
                 if (std::filesystem::exists(lvlPath / "zarr.json")) {
-                    diskLevels[lvl] = std::make_shared<utils::ZarrArray>(
+                    auto opened = std::make_unique<utils::ZarrArray>(
                         utils::ZarrArray::open(lvlPath));
+                    if (utils::is_canonical_c3d(opened->metadata())) {
+                        diskLevels[lvl] = std::move(opened);
+                    } else {
+                        // Legacy h265 (or any non-c3d) level from before the
+                        // codec switch. The decoder in BlockPipeline now only
+                        // accepts C3DC, so leaving stale entries in place
+                        // would silently mark chunks as "on disk" without
+                        // ever producing data. Nuke the level dir and create
+                        // a fresh c3d one; the remote source will repopulate.
+                        opened.reset();
+                        fprintf(stderr,
+                            "[Volume] level %d cache at %s is non-c3d — "
+                            "wiping and recreating as c3d\n",
+                            lvl, lvlPath.c_str());
+                        std::error_code ec;
+                        std::filesystem::remove_all(lvlPath, ec);
+                        if (ec) {
+                            throw std::runtime_error(
+                                "failed to remove stale non-c3d cache at "
+                                + lvlPath.string() + ": " + ec.message());
+                        }
+                        diskLevels[lvl] = createLevel(lvlPath, lvl);
+                    }
                 } else {
-                    auto shape = source->levelShape(lvl);
-                    utils::ZarrMetadata meta;
-                    meta.version = utils::ZarrVersion::v3;
-                    meta.node_type = "array";
-                    meta.shape = {pad(shape[0], 128), pad(shape[1], 128), pad(shape[2], 128)};
-                    meta.chunks = {1024, 1024, 1024};
-                    meta.dtype = utils::ZarrDtype::uint8;
-                    meta.fill_value = 0;
-                    meta.chunk_key_encoding = "default";
-                    utils::ShardConfig sc;
-                    sc.sub_chunks = {128, 128, 128};
-                    meta.shard_config = std::move(sc);
-                    diskLevels[lvl] = std::make_shared<utils::ZarrArray>(
-                        utils::ZarrArray::create(lvlPath, std::move(meta)));
+                    diskLevels[lvl] = createLevel(lvlPath, lvl);
                 }
             }
-            fprintf(stderr, "[Volume] Cold cache: %d levels at %s\n",
-                    nLevels, path_.c_str());
+            fprintf(stderr,
+                "[Volume] Cold cache: %d levels at %s (codec: c3d)\n",
+                nLevels, path_.c_str());
         }
     } else {
         source = std::make_unique<vc::cache::FileSystemSource>(
@@ -370,13 +418,13 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
     vc::cache::BlockPipeline::Config config;
     config.volumeId = id();
     config.bytes = cacheBudgetHot_;
-    config.encodeParams = encodeParams_;
+    config.c3dEncodeParams = encodeParams_;
 
-    // Canonical-passthrough detection. Remote sources whose shard layout
-    // matches our local cache (zarr v3, sharded, 128^3 inner H.265 chunks,
-    // 1024^3 shards) get whole-shard byte-passthrough — one HTTP request +
-    // one disk write per source shard instead of decoding and re-encoding
-    // 512 inner chunks. We probe level 0 zarr.json directly because the
+    // Canonical-passthrough detection. Remote sources matching our local
+    // c3d disk cache (4096³ shards with 256³ inner C3DC chunks) get
+    // whole-shard byte-passthrough — one HTTP request + one disk write
+    // per source shard instead of decoding and re-encoding every inner
+    // chunk. We probe level 0 zarr.json directly because the
     // remoteShardConfig from NewFromUrl isn't always populated.
     if (isRemote_) {
         try {
@@ -386,15 +434,15 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
             auto json = vc::cache::httpGetString(base + "0/zarr.json", remoteAuth_);
             if (!json.empty()) {
                 auto meta = utils::detail::parse_zarr_json(json);
-                if (utils::is_canonical_vc3d(meta)
+                if (utils::is_canonical_c3d(meta)
                     && meta.chunks.size() >= 3
-                    && meta.chunks[0] == 1024
-                    && meta.chunks[1] == 1024
-                    && meta.chunks[2] == 1024) {
-                    config.canonicalSourceShard = {1024, 1024, 1024};
+                    && meta.chunks[0] == 4096
+                    && meta.chunks[1] == 4096
+                    && meta.chunks[2] == 4096) {
+                    config.canonicalSourceShard = {4096, 4096, 4096};
                     fprintf(stderr,
-                        "[Volume] canonical-passthrough enabled (source "
-                        "shards 1024x1024x1024 match local)\n");
+                        "[Volume] canonical-passthrough enabled "
+                        "(c3d source shards 4096^3 match local)\n");
                 }
             }
         } catch (const std::exception& e) {
@@ -449,7 +497,7 @@ void Volume::setIOThreads(int count)
     ioThreads_ = count;
 }
 
-void Volume::setEncodeParams(const utils::VideoCodecParams& params)
+void Volume::setEncodeParams(const utils::C3dCodecParams& params)
 {
     if (tieredCache_) {
         fprintf(stderr, "[Volume] WARNING: setEncodeParams() called after cache "
@@ -566,23 +614,6 @@ int Volume::samplePlaneBestEffort(cv::Mat_<uint8_t>& out,
     if (!out.empty())
         applyOptionalPostProcess(out, params);
     return lvl;
-}
-
-int Volume::samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
-                                         const cv::Vec3f& origin,
-                                         const cv::Vec3f& vx_step,
-                                         const cv::Vec3f& vy_step,
-                                         int width, int height,
-                                         const vc::SampleParams& params,
-                                         const uint32_t lut[256])
-{
-    const int nScales = static_cast<int>(numScales());
-    const int desired = std::clamp(params.level, 0, std::max(0, nScales - 1));
-    samplePlaneAdaptiveARGB32(outBuf, outStride, tieredCache(),
-                              desired, nScales,
-                              origin, vx_step, vy_step,
-                              width, height, lut, params.method);
-    return desired;
 }
 
 int Volume::samplePlaneCompositeBestEffortARGB32(

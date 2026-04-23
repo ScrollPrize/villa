@@ -7,6 +7,7 @@
 #include <functional>
 #include <mutex>
 #include <condition_variable>
+#include <string>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -31,6 +32,12 @@ public:
 
     explicit IOPool(int numThreads = 4);
     ~IOPool();
+
+    // Short label used to name worker threads via pthread_setname_np so
+    // perf / top / htop can tell pools apart. Linux TASK_COMM_LEN is 16
+    // (incl. NUL); actual thread name will be "<label>N" where N is the
+    // worker index, so keep label ≤ 13 chars.
+    void setThreadLabel(std::string label) { threadLabel_ = std::move(label); }
 
     void start();
 
@@ -83,7 +90,16 @@ private:
 
     bool shutdown_ = false;
 
+    // Count of workers currently blocked on cv_.wait inside popNext. Lets
+    // enqueue/updateInteractive skip futex_wake syscalls when every worker
+    // is already running — they'll pick up new items via their own popNext
+    // loop. Without this, every panning-viewport frame wakes all workers
+    // even though they're still processing the previous batch, generating
+    // ~Nthreads useless context switches per frame.
+    int idleCount_ = 0;
+
     int numThreads_;
+    std::string threadLabel_;
     std::vector<std::jthread> workers_;
 };
 

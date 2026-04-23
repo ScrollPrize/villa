@@ -154,6 +154,12 @@ namespace viewer {
     // Recent remote volume URLs
     constexpr auto REMOTE_RECENT_URLS = "viewer/remote_recent_urls";
 
+    // Last-used remote segments URL and the remote zarr URL it was attached
+    // to. Auto-open uses these so reopening the same zarr auto-re-attaches
+    // the same segments directory instead of showing the prompt.
+    constexpr auto LAST_REMOTE_SEGMENTS_URL = "viewer/last_remote_segments_url";
+    constexpr auto LAST_REMOTE_SEGMENTS_FOR_ZARR = "viewer/last_remote_segments_for_zarr";
+
     // Audio/UX
     constexpr auto PLAY_SOUND_AFTER_SEG_RUN = "viewer/play_sound_after_seg_run";
     constexpr auto USERNAME = "viewer/username";
@@ -199,6 +205,17 @@ namespace perf {
     constexpr int DOWNSCALE_OVERRIDE_DEFAULT = 0;
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
+
+    // LOD synthesis method.  Selects how c3d chunks are decoded when a
+    // downscaled view is requested.  Value is one of:
+    //   "codec_synthesis"   — call c3d_chunk_decode_lod; codec-native filter.
+    //   "full_decode_box"   — full decode + box-average pool.
+    //   "full_decode_min"   — full decode + min pool.
+    //   "full_decode_max"   — full decode + max pool.
+    // Has no effect until the sampler calls into the LOD-synthesis path
+    // (no-op on the current multi-level zarr pyramid).
+    constexpr auto LOD_METHOD = "perf/lod_method";
+    constexpr auto LOD_METHOD_DEFAULT = "codec_synthesis";
 
     // IO thread count is not configurable — it tracks
     // std::thread::hardware_concurrency() at runtime.

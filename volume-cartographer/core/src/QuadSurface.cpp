@@ -121,6 +121,117 @@ cv::Mat_<cv::Vec3f> resamplePointsLinearPreservingInvalids(
 
 } // namespace
 
+// Axis-aligned src-sample warps used by QuadSurface::gen().  The original
+// code built an affine via cv::getAffineTransform(srcf, dstf) and called
+// cv::warpAffine, but the srcf/dstf construction only encodes a scale +
+// translate (no rotation / shear), so the dst→src mapping is:
+//     src_x = ox + dx * sx
+//     src_y = oy + dy * sy
+// Writing it inline buys two things the OpenCV path doesn't:
+//   1. Zero per-call heap allocation.  cv::warpAffine internally allocates
+//      coord lookup maps (heaptrack caught ~27 MiB × 92 calls per session
+//      of churn on the render path).  These helpers only touch the pooled
+//      dst buffer the caller passes in.
+//   2. Straight-line hot loops that the compiler auto-vectorises on ARM
+//      NEON — OpenCV's CV_32FC3 bilinear path is scalar on aarch64.
+// Parallelised with OpenMP on the outer row loop, matching the rest of
+// the file's existing style.
+namespace {
+
+void warpBilinearReplicateVec3f(const cv::Mat_<cv::Vec3f>& src,
+                                cv::Mat_<cv::Vec3f>& dst,
+                                double ox, double oy,
+                                double sx, double sy)
+{
+    const int sc = src.cols, sr = src.rows;
+    if (sc <= 0 || sr <= 0) return;
+    const int dw = dst.cols, dh = dst.rows;
+    const float sxmax = float(sc - 1);
+    const float symax = float(sr - 1);
+    const float fox = float(ox);
+    const float foy = float(oy);
+    const float fsx = float(sx);
+    const float fsy = float(sy);
+    #pragma omp parallel for schedule(dynamic, 8)
+    for (int dy = 0; dy < dh; ++dy) {
+        float fy = foy + float(dy) * fsy;
+        fy = fy < 0.0f ? 0.0f : (fy > symax ? symax : fy);
+        int y0 = int(fy);                  // floor since fy >= 0
+        int y1 = y0 + 1; if (y1 > sr - 1) y1 = sr - 1;
+        const float wy = fy - float(y0);
+        const cv::Vec3f* row0 = src[y0];
+        const cv::Vec3f* row1 = src[y1];
+        cv::Vec3f* orow = dst[dy];
+        for (int dx = 0; dx < dw; ++dx) {
+            float fx = fox + float(dx) * fsx;
+            fx = fx < 0.0f ? 0.0f : (fx > sxmax ? sxmax : fx);
+            int x0 = int(fx);
+            int x1 = x0 + 1; if (x1 > sc - 1) x1 = sc - 1;
+            const float wx = fx - float(x0);
+            const cv::Vec3f& p00 = row0[x0]; const cv::Vec3f& p01 = row0[x1];
+            const cv::Vec3f& p10 = row1[x0]; const cv::Vec3f& p11 = row1[x1];
+            const float iwx = 1.0f - wx;
+            const float iwy = 1.0f - wy;
+            orow[dx] = (p00 * iwx + p01 * wx) * iwy
+                     + (p10 * iwx + p11 * wx) * wy;
+        }
+    }
+}
+
+void warpNearestConstU8(const cv::Mat_<uint8_t>& src,
+                        cv::Mat_<uint8_t>& dst,
+                        double ox, double oy,
+                        double sx, double sy,
+                        uint8_t border)
+{
+    const int sc = src.cols, sr = src.rows;
+    const int dw = dst.cols, dh = dst.rows;
+    const float fox = float(ox), foy = float(oy);
+    const float fsx = float(sx), fsy = float(sy);
+    #pragma omp parallel for schedule(dynamic, 8)
+    for (int dy = 0; dy < dh; ++dy) {
+        const int sy_i = int(std::lround(foy + float(dy) * fsy));
+        uint8_t* orow = dst[dy];
+        if (sy_i < 0 || sy_i >= sr) {
+            std::memset(orow, border, size_t(dw));
+            continue;
+        }
+        const uint8_t* srow = src[sy_i];
+        for (int dx = 0; dx < dw; ++dx) {
+            const int sx_i = int(std::lround(fox + float(dx) * fsx));
+            orow[dx] = (sx_i < 0 || sx_i >= sc) ? border : srow[sx_i];
+        }
+    }
+}
+
+void warpNearestConstVec3f(const cv::Mat_<cv::Vec3f>& src,
+                           cv::Mat_<cv::Vec3f>& dst,
+                           double ox, double oy,
+                           double sx, double sy,
+                           const cv::Vec3f& border)
+{
+    const int sc = src.cols, sr = src.rows;
+    const int dw = dst.cols, dh = dst.rows;
+    const float fox = float(ox), foy = float(oy);
+    const float fsx = float(sx), fsy = float(sy);
+    #pragma omp parallel for schedule(dynamic, 8)
+    for (int dy = 0; dy < dh; ++dy) {
+        const int sy_i = int(std::lround(foy + float(dy) * fsy));
+        cv::Vec3f* orow = dst[dy];
+        if (sy_i < 0 || sy_i >= sr) {
+            for (int dx = 0; dx < dw; ++dx) orow[dx] = border;
+            continue;
+        }
+        const cv::Vec3f* srow = src[sy_i];
+        for (int dx = 0; dx < dw; ++dx) {
+            const int sx_i = int(std::lround(fox + float(dx) * fsx));
+            orow[dx] = (sx_i < 0 || sx_i >= sc) ? border : srow[sx_i];
+        }
+    }
+}
+
+} // namespace
+
 //NOTE we have 3 coordiante systems. Nominal (voxel volume) coordinates, internal relative (ptr) coords (where _center is at 0/0) and internal absolute (_points) coordinates where the upper left corner is at 0/0.
 static cv::Vec3f internal_loc(const cv::Vec3f &nominal, const cv::Vec3f &internal, const cv::Vec2f &scale)
 {
@@ -514,7 +625,7 @@ void QuadSurface::writeValidMask(const cv::Mat& img)
     cv::Mat_<uint8_t> mask = validMask();
 
     if (img.empty()) {
-        writeTiff(maskPath, mask);
+        writeTiff(maskPath, mask, -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
     } else {
         std::vector<cv::Mat> layers = {mask, img};
         cv::imwritemulti(maskPath.string(), layers);
@@ -560,46 +671,41 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     coords->create(size + cv::Size(8, 8));
 
     // --- build mapping  ---------------------------------
+    // Axis-aligned scale+translate; see the bespoke warp helpers above.
     const double sx = static_cast<double>(_scale[0]) / static_cast<double>(scale);
     const double sy = static_cast<double>(_scale[1]) / static_cast<double>(scale);
     const double ox = static_cast<double>(ul[0]) - 4.0 * sx;
     const double oy = static_cast<double>(ul[1]) - 4.0 * sy;
 
-    std::array<cv::Point2f,3> srcf = {
-        cv::Point2f(static_cast<float>(ox),                       static_cast<float>(oy)),
-        cv::Point2f(static_cast<float>(ox + (w + 8) * sx),        static_cast<float>(oy)),
-        cv::Point2f(static_cast<float>(ox),                       static_cast<float>(oy + (h + 8) * sy))
-    };
-    std::array<cv::Point2f,3> dstf = {
-        cv::Point2f(0.f, 0.f),
-        cv::Point2f(static_cast<float>(w + 8), 0.f),
-        cv::Point2f(0.f, static_cast<float>(h + 8))
-    };
-
-    cv::Mat A = cv::getAffineTransform(srcf.data(), dstf.data());
-
     // --- build a source validity mask (255 if point is valid) -------------
     // Trigger the cache build + set _validMaskAllValid before deciding
     // whether we need the validity warp below.
-    cv::Mat valid_src = validMask();
+    cv::Mat_<uint8_t> valid_src = validMask();
     const bool skipValidity = _validMaskAllValid;
 
     // --- warp coords with seam-safe border (replicate) -------------------
-    cv::Mat_<cv::Vec3f> coords_big;
-    cv::warpAffine(*_points, coords_big, A, size + cv::Size(8, 8),
-                cv::INTER_LINEAR, cv::BORDER_REPLICATE);
+    // Reuse the surface-member scratch: dst.create() no-ops when size +
+    // type match, so after steady state this costs zero allocations. A
+    // reference (not copy) is taken so downstream ops see the same
+    // buffer; the cropped view returned to the caller holds its own
+    // refcount, so if the next gen() call needs a different size,
+    // OpenCV allocates a new buffer and leaves the old one alive for
+    // outstanding views.
+    cv::Mat_<cv::Vec3f>& coords_big = _genCoordsScratch;
+    coords_big.create(h + 8, w + 8);
+    warpBilinearReplicateVec3f(*_points, coords_big, ox, oy, sx, sy);
 
     // --- warp validity with constant 0 (no replicate leakage) -----------
     // Skip entirely when the source mask is all-valid: the cropped region
     // can only contain 255s (the 4px halo that would hold 0s is discarded).
-    cv::Mat valid_big;
+    cv::Mat_<uint8_t>& valid_big = _genValidScratch;
     if (!skipValidity) {
-        cv::warpAffine(valid_src, valid_big, A, size + cv::Size(8, 8),
-                    cv::INTER_NEAREST, cv::BORDER_CONSTANT, cv::Scalar(0));
+        valid_big.create(h + 8, w + 8);
+        warpNearestConstU8(valid_src, valid_big, ox, oy, sx, sy, 0);
     }
 
     // --- normals: warp cached source-grid normals -------------------
-    cv::Mat_<cv::Vec3f> normals_big;
+    cv::Mat_<cv::Vec3f>& normals_big = _genNormalsScratch;
     if (need_normals) {
         // Build source-grid normal cache once per surface. Subsequent gen()
         // calls (panning, zooming) reuse it. Cleared by unloadCaches() when
@@ -632,11 +738,12 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
                 }
             }
         }
-        const cv::Scalar qnScalar(std::numeric_limits<float>::quiet_NaN(),
-                                  std::numeric_limits<float>::quiet_NaN(),
-                                  std::numeric_limits<float>::quiet_NaN());
-        cv::warpAffine(_normalCache, normals_big, A, size + cv::Size(8, 8),
-                       cv::INTER_NEAREST, cv::BORDER_CONSTANT, qnScalar);
+        const cv::Vec3f qnVec(std::numeric_limits<float>::quiet_NaN(),
+                              std::numeric_limits<float>::quiet_NaN(),
+                              std::numeric_limits<float>::quiet_NaN());
+        normals_big.create(h + 8, w + 8);
+        warpNearestConstVec3f(_normalCache, normals_big,
+                              ox, oy, sx, sy, qnVec);
     }
 
     // --- crop away the 4px halo ----------------------------------------
@@ -712,6 +819,12 @@ static inline cv::Vec2f mul(const cv::Vec2f &a, const cv::Vec2f &b)
     return{a[0]*b[0],a[1]*b[1]};
 }
 
+// Gauss-Newton was tried here (2026-04) with full regression coverage
+// (vc_coord_regression against synthetic + three real tifxyz segments).
+// Result: neutral on performance, no reliable accuracy gain. The 8-neighbour
+// halving below is well-tuned for scroll-surface topology (folds, twists,
+// noise) where Newton's linear-regime assumption doesn't hold. See
+// vc_coord_regression for the harness if you want to try again.
 template <typename E>
 static float search_min_loc(const cv::Mat_<E> &points, cv::Vec2f &loc, cv::Vec3f &out, cv::Vec3f tgt, cv::Vec2f init_step, float min_step_x)
 {
@@ -1029,9 +1142,9 @@ void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const s
     cv::split((*_points), xyz);
 
     // Write x/y/z as 32-bit float tiled TIFF with LZW
-    writeTiff(dir / "x.tif", xyz[0]);
-    writeTiff(dir / "y.tif", xyz[1]);
-    writeTiff(dir / "z.tif", xyz[2]);
+    writeTiff(dir / "x.tif", xyz[0], -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
+    writeTiff(dir / "y.tif", xyz[1], -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
+    writeTiff(dir / "z.tif", xyz[2], -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
 
     // OpenCV compression params for fallback
     std::vector<int> compression_params = { cv::IMWRITE_TIFF_COMPRESSION, 5 };
@@ -1046,7 +1159,7 @@ void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const s
                 (mat.type() == CV_8UC1 || mat.type() == CV_16UC1 || mat.type() == CV_32FC1))
             {
                 try {
-                    writeTiff(dir / (name + ".tif"), mat);
+                    writeTiff(dir / (name + ".tif"), mat, -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
                     wrote = true;
                 } catch (...) {
                     wrote = false; // Fall back to OpenCV

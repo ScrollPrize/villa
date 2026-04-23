@@ -2,6 +2,7 @@
 // in exactly ONE translation unit; the linker picks up the override symbols.
 #if defined(VC_HAVE_MIMALLOC)
 #include <mimalloc-new-delete.h>
+#include <mimalloc.h>
 #endif
 
 #include <qapplication.h>
@@ -70,6 +71,20 @@ auto main(int argc, char* argv[]) -> int
     // mimalloc isn't overriding malloc.
     ::mallopt(M_MMAP_THRESHOLD, 128 * 1024);
     ::mallopt(M_TRIM_THRESHOLD, 128 * 1024);
+#endif
+
+#if defined(VC_HAVE_MIMALLOC)
+    // Return freed pages to the OS immediately rather than holding them in
+    // mimalloc's page cache. Matters for VC3D's allocation pattern: big
+    // transient buffers (decoded chunks, render scratch, shard reads) are
+    // freed quickly but the default delay keeps their pages committed,
+    // inflating RSS during bulk-download workloads on RAM-constrained
+    // machines. purge_decommits=1 actually decommits (not just reset);
+    // purge_delay=0 skips the decommit-queue timeout; arena_eager_commit=0
+    // avoids pre-committing arenas that never see writes.
+    mi_option_set(mi_option_purge_decommits, 1);
+    mi_option_set(mi_option_purge_delay, 0);
+    mi_option_set(mi_option_arena_eager_commit, 0);
 #endif
 
 #ifndef _WIN32

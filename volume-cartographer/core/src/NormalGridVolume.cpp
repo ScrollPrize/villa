@@ -29,7 +29,11 @@
          mutable std::shared_mutex mutex;
          mutable std::unordered_map<cv::Vec2i, CacheEntry> grid_cache;
          mutable uint64_t generation_counter = 0;
-         size_t max_cache_size = 4096;
+         // Cap at 512 entries. Each cached GridStore holds up to 2 MiB of
+         // decoded seglists (GridStore.cpp:813) plus metadata, so 512 ≈
+         // ~1 GiB ceiling on this cache alone. The prior 4096 could have
+         // reached 8 GiB if every slot held a fully-populated store.
+         size_t max_cache_size = 512;
          size_t eviction_sample_size = 10;
         
          mutable std::atomic<uint64_t> cache_hits{0};
