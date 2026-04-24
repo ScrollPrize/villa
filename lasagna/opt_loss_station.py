@@ -152,12 +152,6 @@ def _intersect_single_quad(
 # Loss
 # ---------------------------------------------------------------------------
 
-def _huber(x: torch.Tensor, delta: float = 1.0) -> torch.Tensor:
-    """Element-wise Huber loss: L2 for |x|<=delta, L1 for |x|>delta."""
-    abs_x = x.abs()
-    return torch.where(abs_x <= delta, 0.5 * x * x, delta * (abs_x - 0.5 * delta))
-
-
 def station_loss(
     *, res: fit_model.FitResult3D,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
@@ -231,7 +225,7 @@ def station_loss(
             target_n = None
 
     if target_n is not None:
-        loss_normal = _huber(res.xyz_lr - target_n).mean()
+        loss_normal = (res.xyz_lr - target_n).square().mean()
 
     # --- XY-centering loss (per-winding, independent) ---
     loss_xy = zero
@@ -241,13 +235,17 @@ def station_loss(
         with torch.no_grad():
             dh = h_frac_val - h_mid
             dw = w_frac_val - w_mid
-            # Tangent directions from mesh finite differences
-            raw_th = (xyz_det[d, 1:, :, :] - xyz_det[d, :-1, :, :]).mean(dim=(0, 1))  # (3,)
-            raw_tw = (xyz_det[d, :, 1:, :] - xyz_det[d, :, :-1, :]).mean(dim=(0, 1))  # (3,)
-            shift_vec = dh * raw_th + dw * raw_tw  # (3,)
-            target_xy_d = xyz_det[d] + shift_vec  # (Hm, Wm, 3)
+            # Per-vertex tangent directions from finite differences
+            surf = xyz_det[d]  # (Hm, Wm, 3)
+            th = torch.zeros_like(surf)
+            th[:-1] = surf[1:] - surf[:-1]
+            th[-1] = th[-2]
+            tw = torch.zeros_like(surf)
+            tw[:, :-1] = surf[:, 1:] - surf[:, :-1]
+            tw[:, -1] = tw[:, -2]
+            target_xy_d = surf + dh * th + dw * tw  # (Hm, Wm, 3)
 
-        loss_xy = loss_xy + _huber(res.xyz_lr[d] - target_xy_d).mean()
+        loss_xy = loss_xy + (res.xyz_lr[d] - target_xy_d).square().mean()
         n_xy_hits += 1
 
     if n_xy_hits > 0:
