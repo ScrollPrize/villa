@@ -193,12 +193,13 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 			# Winding error
 			winding_err = signed_windings - offset  # (D, He, We)
 
-			# 4 proxies: model quad corner + ext_N * winding_err (shared N, shared error)
+			# 4 proxies: model quad corner - ext_N * winding_err (shared N, shared error)
+			# Negate: if winding_err>0 model is too far in +N, proxy pulls it back
 			we = winding_err.unsqueeze(-1)  # (D, He, We, 1)
-			proxy00 = M00_det + ext_N * we
-			proxy10 = M10_det + ext_N * we
-			proxy01 = M01_det + ext_N * we
-			proxy11 = M11_det + ext_N * we
+			proxy00 = M00_det - ext_N * we
+			proxy10 = M10_det - ext_N * we
+			proxy01 = M01_det - ext_N * we
+			proxy11 = M11_det - ext_N * we
 
 		# 4 weighted L2 losses (M_i has gradients, proxy_i detached)
 		w00 = ((1 - u_frac) * (1 - v_frac)).unsqueeze(1)  # (D, 1, He, We)
