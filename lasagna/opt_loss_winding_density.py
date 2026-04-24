@@ -131,9 +131,11 @@ def winding_density_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, t
 
 
 def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""External offset loss: grad_mag integral from model surface to external reference should equal target offset.
+	"""External offset loss via proxy target at LR using ext surface normals.
 
-	Gradients flow through res.xyz_lr → strip endpoints → grid_sample → integral.
+	For each model vertex, computes the grad_mag integral to the ext surface
+	(detached), then places a proxy target at (offset / mean_grad_mag) along
+	the ext surface normal (constant — can't create feedback loops).
 	"""
 	if res.ext_conn is None or not res.ext_conn:
 		device = res.xyz_lr.device
@@ -141,51 +143,43 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 		return z, (z.unsqueeze(0),), (z.unsqueeze(0),)
 
 	D, Hm, Wm, _ = res.xyz_lr.shape
-	He = int(res.xyz_hr.shape[1])
-	We = int(res.xyz_hr.shape[2])
 	device = res.xyz_lr.device
 	dtype = res.xyz_lr.dtype
 	strip_samples = max(2, int(res.params.subsample_mesh) + 1)
 
-	def _up_pts(pts: torch.Tensor) -> torch.Tensor:
-		"""(D, Hm, Wm, 3) → (D, He, We, 3) bilinear."""
-		return F.interpolate(pts.permute(0, 3, 1, 2), size=(He, We),
-							 mode='bilinear', align_corners=True).permute(0, 2, 3, 1)
+	xyz_det = res.xyz_lr.detach()
 
 	total_loss = torch.zeros((), device=device, dtype=dtype)
 	total_wsum = 0.0
 	all_lm = []
 	all_mask = []
 
-	for ext_pts, ext_mask, ext_sign, offset in res.ext_conn:
-		start = _up_pts(res.xyz_lr)        # (D, He, We, 3) — has gradients
-		end = _up_pts(ext_pts)             # (D, He, We, 3) — detached
-		sign_hr = F.interpolate(ext_sign.unsqueeze(1).float(), size=(He, We),
-								mode='nearest').squeeze(1)  # (D, He, We)
-		mask_hr = (F.interpolate(ext_mask.float(), size=(He, We),
-								 mode='bilinear', align_corners=True) >= 1.0).float()
+	for ext_pts, ext_mask, ext_sign, offset, ext_normal in res.ext_conn:
+		with torch.no_grad():
+			# Grad_mag integral along strip (LR, detached)
+			diff = ext_pts - xyz_det
+			t = torch.linspace(0.0, 1.0, strip_samples, device=device, dtype=dtype)
+			strip = xyz_det.unsqueeze(-2) + t.view(1, 1, 1, -1, 1) * diff.unsqueeze(-2)
+			strip_flat = strip.reshape(D, Hm, Wm * strip_samples, 3)
+			sampled = res.data.grid_sample_fullres(strip_flat)
+			mag = sampled.grad_mag.squeeze(0).squeeze(0).reshape(D, Hm, Wm, strip_samples)
 
-		# Build strips at HR resolution
-		t = torch.linspace(0.0, 1.0, strip_samples, device=device, dtype=dtype)
-		diff = end - start
-		strip = start.unsqueeze(-2) + t.view(1, 1, 1, -1, 1) * diff.unsqueeze(-2)
+			mean_mag = mag.mean(dim=-1).clamp(min=1e-4)
 
-		strip_flat = strip.reshape(D, He, We * strip_samples, 3)
-		sampled = res.data.grid_sample_fullres(strip_flat)
-		mag = sampled.grad_mag.squeeze(0).squeeze(0).reshape(D, He, We, strip_samples)
+			# Strip validity: mask AND all strip samples have grad_mag > 0
+			sv = (sampled.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=dtype)
+			sv = sv.reshape(D, Hm, Wm, strip_samples).amin(dim=-1)
+			mask = (ext_mask.squeeze(1) * sv).unsqueeze(1)  # (D, 1, Hm, Wm)
 
-		strip_len = torch.sqrt((diff * diff).sum(dim=-1) + 1e-12)
-		signed_len = strip_len * sign_hr
-		integral = mag.mean(dim=-1) * signed_len
+			# Orient ext normal toward model (constant direction)
+			orient = ((xyz_det - ext_pts) * ext_normal).sum(dim=-1, keepdim=True).sign()
+			oriented_n = ext_normal * orient
 
-		# L2 loss on (integral - target)
-		err = integral - offset
-		lm = (err * err).unsqueeze(1)  # (D, 1, He, We)
+			# Proxy: ext surface + target offset distance along ext normal
+			target = ext_pts + (offset / mean_mag).unsqueeze(-1) * oriented_n
 
-		# Validity: mask AND all strip samples have grad_mag > 0
-		sv = (sampled.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=dtype)
-		sv = sv.reshape(D, He, We, strip_samples).amin(dim=-1).unsqueeze(1)
-		mask = mask_hr * sv
+		# L2 loss: push mesh toward proxy target
+		lm = (res.xyz_lr - target).square().sum(dim=-1).unsqueeze(1)  # (D, 1, Hm, Wm)
 
 		wsum = float(mask.sum().detach().cpu())
 		if wsum > 0.0:

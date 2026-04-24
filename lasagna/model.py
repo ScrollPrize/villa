@@ -38,8 +38,8 @@ class FitResult3D:
 	mask_conn: torch.Tensor     # (D, 1, Hm, Wm, 3) — validity per connection point
 	sign_conn: torch.Tensor     # (D, 1, Hm, Wm, 2) — ray param sign [prev, next]
 	params: ModelParams3D
-	ext_conn: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]] | None = None
-	# Per external surface: (ext_pts (D,Hm,Wm,3), ext_mask (D,1,Hm,Wm), ext_sign (D,Hm,Wm), offset)
+	ext_conn: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, torch.Tensor]] | None = None
+	# Per ext surface: (ext_pts (D,Hm,Wm,3), ext_mask (D,1,Hm,Wm), ext_sign (D,Hm,Wm), offset, ext_normal (D,Hm,Wm,3))
 
 
 class Model3D(nn.Module):
@@ -119,6 +119,7 @@ class Model3D(nn.Module):
 		self._ext_valid: list[torch.Tensor] = []             # each (H_ext, W_ext) bool
 		self._ext_conn_offsets: list[torch.Tensor] = []      # each (2, D, Hm, Wm) — [h_off, w_off]
 		self._ext_conn_params: list[dict] = []                # cached intersection params per ext surface
+		self._ext_normals: list[torch.Tensor] = []            # each (H_ext, W_ext, 3) precomputed unit normals
 		self._ext_offsets: list[float] = []                   # target integral offset per ext surface
 
 		# Amplitude and bias for data matching (deferred but needed for FitResult3D)
@@ -607,6 +608,39 @@ class Model3D(nn.Module):
 
 	# --- External surface support ---
 
+	@staticmethod
+	def _compute_ext_normals(xyz: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
+		"""Compute unit normals for an external surface using central differences.
+
+		Uses one-sided differences at boundaries and next to invalid vertices.
+		xyz: (H, W, 3), valid: (H, W) bool → (H, W, 3) unit normals (zero at invalid).
+		"""
+		H, W, _ = xyz.shape
+		# h-tangent: fwd + bwd where both neighbors valid → central diff
+		fwd_h = torch.zeros_like(xyz)
+		fwd_h[:-1] = xyz[1:] - xyz[:-1]
+		bwd_h = torch.zeros_like(xyz)
+		bwd_h[1:] = xyz[1:] - xyz[:-1]
+		next_h_v = torch.zeros(H, W, device=xyz.device, dtype=torch.bool)
+		next_h_v[:-1] = valid[1:]
+		prev_h_v = torch.zeros(H, W, device=xyz.device, dtype=torch.bool)
+		prev_h_v[1:] = valid[:-1]
+		dh = fwd_h * next_h_v.unsqueeze(-1) + bwd_h * prev_h_v.unsqueeze(-1)
+		# w-tangent
+		fwd_w = torch.zeros_like(xyz)
+		fwd_w[:, :-1] = xyz[:, 1:] - xyz[:, :-1]
+		bwd_w = torch.zeros_like(xyz)
+		bwd_w[:, 1:] = xyz[:, 1:] - xyz[:, :-1]
+		next_w_v = torch.zeros(H, W, device=xyz.device, dtype=torch.bool)
+		next_w_v[:, :-1] = valid[:, 1:]
+		prev_w_v = torch.zeros(H, W, device=xyz.device, dtype=torch.bool)
+		prev_w_v[:, 1:] = valid[:, :-1]
+		dw = fwd_w * next_w_v.unsqueeze(-1) + bwd_w * prev_w_v.unsqueeze(-1)
+		n = torch.cross(dh, dw, dim=-1)
+		n = n / (n.norm(dim=-1, keepdim=True) + 1e-8)
+		n[~valid] = 0.0
+		return n
+
 	def add_external_surface(self, xyz: torch.Tensor, valid: torch.Tensor | None = None,
 						   offset: float = 1.0) -> int:
 		"""Register a frozen external reference surface.
@@ -621,7 +655,9 @@ class Model3D(nn.Module):
 		self._ext_surfaces.append(xyz.detach().to(device=dev))
 		if valid is None:
 			valid = torch.ones(xyz.shape[0], xyz.shape[1], dtype=torch.bool, device=dev)
-		self._ext_valid.append(valid.to(device=dev))
+		valid_dev = valid.to(device=dev)
+		self._ext_valid.append(valid_dev)
+		self._ext_normals.append(Model3D._compute_ext_normals(xyz.detach().to(device=dev), valid_dev))
 		self._ext_conn_offsets.append(
 			torch.zeros(2, self.depth, self.mesh_h, self.mesh_w,
 						device=dev, dtype=torch.float32))
@@ -706,11 +742,14 @@ class Model3D(nn.Module):
 			winding_step=winding_step, subsample_mesh=subsample_mesh,
 			subsample_winding=subsample_winding)
 
-	def _intersect_ext_surfaces(self, xyz_lr: torch.Tensor, normals: torch.Tensor, data: fit_data.FitData3D
-							   ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, float]] | None:
+	def _intersect_ext_surfaces(self, xyz_lr: torch.Tensor, data: fit_data.FitData3D
+							   ) -> list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, torch.Tensor]] | None:
 		"""Intersect model vertices with all external surfaces.
 
-		Returns list of (ext_pts, ext_mask, ext_sign, offset) per external surface,
+		Uses precomputed ext surface normals as ray direction (constant, independent
+		of model mesh deformation).
+
+		Returns list of (ext_pts, ext_mask, ext_sign, offset, ext_normal) per surface,
 		or None if no external surfaces registered.
 		"""
 		if not self._ext_surfaces:
@@ -727,8 +766,6 @@ class Model3D(nn.Module):
 			h_off = ext_off[0]
 			w_off = ext_off[1]
 
-			# For each model vertex (d, h, w), find target quad on external surface
-			# Initial target: center of external surface + offset
 			h_idx = torch.arange(Hm, device=device, dtype=torch.float32).view(1, Hm, 1).expand(D, Hm, Wm)
 			w_idx = torch.arange(Wm, device=device, dtype=torch.float32).view(1, 1, Wm).expand(D, Hm, Wm)
 
@@ -739,14 +776,23 @@ class Model3D(nn.Module):
 			frac_h = target_h - row.float()
 			frac_w = target_w - col.float()
 
-			# Gather quad corners from external surface (no batch dim)
 			P00 = ext_xyz[row, col]          # (D, Hm, Wm, 3)
 			P10 = ext_xyz[row + 1, col]
 			P01 = ext_xyz[row, col + 1]
 			P11 = ext_xyz[row + 1, col + 1]
 
+			# Bilinear-interpolated ext surface normal as ray direction
+			ext_norms = self._ext_normals[ei]  # (H_ext, W_ext, 3)
+			n00 = ext_norms[row, col]
+			n10 = ext_norms[row + 1, col]
+			n01 = ext_norms[row, col + 1]
+			n11 = ext_norms[row + 1, col + 1]
+			fh = frac_h.unsqueeze(-1)
+			fw = frac_w.unsqueeze(-1)
+			n = (1 - fh) * (1 - fw) * n00 + fh * (1 - fw) * n10 + (1 - fh) * fw * n01 + fh * fw * n11
+			n = n / (n.norm(dim=-1, keepdim=True) + 1e-8)
+
 			O = xyz_lr
-			n = normals
 			a = P10 - P00
 			b = P01 - P00
 			c = P11 - P10 - P01 + P00
@@ -808,7 +854,7 @@ class Model3D(nn.Module):
 			# Cache intersection params for conn_offset update
 			self._ext_conn_params[ei] = {"u": u, "v": v, "row": row, "col": col}
 
-			results.append((conn_pt.detach(), valid, s_sign, offset))
+			results.append((conn_pt.detach(), valid, s_sign, offset, n.detach()))
 
 		return results
 
@@ -847,7 +893,7 @@ class Model3D(nn.Module):
 		mask_lr = (data.grid_sample_fullres(xyz_lr.detach()).grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
 
 		# External surface intersections
-		ext_conn = self._intersect_ext_surfaces(xyz_lr, normals, data)
+		ext_conn = self._intersect_ext_surfaces(xyz_lr, data)
 
 		return FitResult3D(
 			xyz_lr=xyz_lr,
