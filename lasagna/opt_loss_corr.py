@@ -1131,12 +1131,14 @@ def _wind_brute_force_init(
 
 	# --- Avg pair anchors from target winding ---
 	target_finite = torch.isfinite(target)
-	avg_lo_d = target.floor().clamp(0, max(D - 2, 0)).long()
+	# Replace NaN with 0 before floor/long to avoid garbage integers
+	target_safe = torch.where(target_finite, target, torch.zeros_like(target))
+	avg_lo_d = target_safe.floor().clamp(0, max(D - 2, 0)).long()
 	avg_hi_d = (avg_lo_d + 1).clamp(max=D - 1)
 
 	# Find quads on avg layers
 	if target_finite.any():
-		# avg_low — always valid if target is finite and layer in range
+		# avg_low — valid if target is finite and layer in range
 		al_h, al_w, _, _ = _wind_nearest_quad_on_layer(P, xyz_det, avg_lo_d, Qh, Qw)
 		anchors_d[:, 2] = avg_lo_d
 		anchors_h[:, 2] = al_h
@@ -1238,7 +1240,8 @@ def _wind_update_anchors(
 	# Update avg pair layers if target changed
 	D = xyz_det.shape[0]
 	target_finite = torch.isfinite(target)
-	new_avg_lo_d = target.floor().clamp(0, max(D - 2, 0)).long()
+	target_safe = torch.where(target_finite, target, torch.zeros_like(target))
+	new_avg_lo_d = target_safe.floor().clamp(0, max(D - 2, 0)).long()
 	new_avg_hi_d = (new_avg_lo_d + 1).clamp(max=D - 1)
 
 	# Re-init avg anchors where layer changed
