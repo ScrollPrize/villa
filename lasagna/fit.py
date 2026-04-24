@@ -667,6 +667,12 @@ def main(argv: list[str] | None = None) -> int:
 		seed_xyz = (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
 		print(f"[fit] tifxyz seed: ({seed_xyz[0]:.0f}, {seed_xyz[1]:.0f}, {seed_xyz[2]:.0f})",
 			  flush=True)
+	# Re-optimize from checkpoint: derive seed from model grid center
+	if seed_xyz is None and not is_new_model:
+		center_pt = _grid_center(mdl)
+		seed_xyz = (float(center_pt[0]), float(center_pt[1]), float(center_pt[2]))
+		print(f"[fit] checkpoint seed (grid center): ({seed_xyz[0]:.0f}, {seed_xyz[1]:.0f}, {seed_xyz[2]:.0f})",
+			  flush=True)
 	optimizer.optimize(
 		model=mdl,
 		data=data,
