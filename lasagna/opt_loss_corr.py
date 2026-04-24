@@ -822,17 +822,24 @@ def _build_snap_results(
 
 def _wind_nearest_quad_on_layer(
 	P: torch.Tensor,           # (K, 3)
+	n: torch.Tensor,           # (K, 3) — ray direction (surface normal)
 	xyz_det: torch.Tensor,     # (D, Hm, Wm, 3)
 	d_layer: torch.Tensor,     # (K,) int — target depth layer per point
 	Qh: int, Qw: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-	"""For each point, find nearest quad on its assigned layer.
+	"""For each point, find nearest quad via ray-bilinear intersection.
+
+	Shoots ray from P along n, intersects all quads on the assigned layer,
+	picks the quad whose intersection point is closest to P.
 
 	Returns: (h_idx, w_idx, u, v) each (K,).
+	u, v are UNCLAMPED — caller checks [0,1] for validity.
 	"""
 	K = P.shape[0]
 	dev = P.device
 	dt = P.dtype
+	Hm = Qh + 1
+	Wm = Qw + 1
 	NQ = Qh * Qw
 
 	best_h = torch.zeros(K, dtype=torch.long, device=dev)
@@ -843,6 +850,9 @@ def _wind_nearest_quad_on_layer(
 
 	h_q = torch.arange(Qh, device=dev).unsqueeze(1).expand(Qh, Qw).reshape(NQ)
 	w_q = torch.arange(Qw, device=dev).unsqueeze(0).expand(Qh, Qw).reshape(NQ)
+	# Fractional hints at quad center
+	frac_h = torch.full((NQ,), 0.5, device=dev, dtype=dt)
+	frac_w = torch.full((NQ,), 0.5, device=dev, dtype=dt)
 
 	unique_d = torch.unique(d_layer)
 	for d_val in unique_d.tolist():
@@ -852,19 +862,42 @@ def _wind_nearest_quad_on_layer(
 		pmask = (d_layer == d)
 		if not pmask.any():
 			continue
-		P_sub = P[pmask]
+		P_sub = P[pmask]       # (Ks, 3)
+		n_sub = n[pmask]       # (Ks, 3)
+		Ks = P_sub.shape[0]
 
-		v00 = xyz_det[d, :-1, :-1].reshape(NQ, 3).unsqueeze(0)
-		v10 = xyz_det[d, 1:, :-1].reshape(NQ, 3).unsqueeze(0)
-		v01 = xyz_det[d, :-1, 1:].reshape(NQ, 3).unsqueeze(0)
-		v11 = xyz_det[d, 1:, 1:].reshape(NQ, 3).unsqueeze(0)
+		v00 = xyz_det[d, :-1, :-1].reshape(NQ, 3)
+		v10 = xyz_det[d, 1:, :-1].reshape(NQ, 3)
+		v01 = xyz_det[d, :-1, 1:].reshape(NQ, 3)
+		v11 = xyz_det[d, 1:, 1:].reshape(NQ, 3)
 
-		P_exp = P_sub.unsqueeze(1)
-		u_all, v_all = _bilinear_project(P_exp, v00, v10, v01, v11)
-		Q = _bilinear_interp(v00, v10, v01, v11, u_all, v_all)
-		dist_sq = (P_exp - Q).square().sum(-1)
+		# Ray-bilinear intersect: (Ks, NQ) — broadcast P/n over quads
+		u_all, v_all = fit_model.Model3D._ray_bilinear_intersect(
+			P_sub.unsqueeze(1).expand(Ks, NQ, 3),
+			n_sub.unsqueeze(1).expand(Ks, NQ, 3),
+			v00.unsqueeze(0).expand(Ks, NQ, 3),
+			v10.unsqueeze(0).expand(Ks, NQ, 3),
+			v01.unsqueeze(0).expand(Ks, NQ, 3),
+			v11.unsqueeze(0).expand(Ks, NQ, 3),
+			frac_h.unsqueeze(0).expand(Ks, NQ),
+			frac_w.unsqueeze(0).expand(Ks, NQ),
+		)  # u_all, v_all: (Ks, NQ) unclamped
 
-		min_dist, min_qi = dist_sq.min(dim=1)
+		# Compute intersection point and distance
+		uc = u_all.unsqueeze(-1)
+		vc = v_all.unsqueeze(-1)
+		Q = ((1 - uc) * (1 - vc) * v00.unsqueeze(0) +
+			 uc * (1 - vc) * v10.unsqueeze(0) +
+			 (1 - uc) * vc * v01.unsqueeze(0) +
+			 uc * vc * v11.unsqueeze(0))
+		dist_sq = (P_sub.unsqueeze(1) - Q).square().sum(-1)  # (Ks, NQ)
+
+		# Prefer in-bounds intersections; fall back to closest if none in-bounds
+		in_bounds = (u_all >= 0) & (u_all <= 1) & (v_all >= 0) & (v_all <= 1)
+		# Penalize out-of-bounds quads so in-bounds are preferred
+		dist_sq_penalized = torch.where(in_bounds, dist_sq, dist_sq + 1e12)
+		min_dist, min_qi = dist_sq_penalized.min(dim=1)
+
 		pidx = pmask.nonzero(as_tuple=True)[0]
 		better = min_dist < best_dist[pidx]
 		if better.any():
@@ -997,18 +1030,30 @@ def _wind_brute_force_init(
 
 	h_q = torch.arange(Qh, device=dev).unsqueeze(1).expand(Qh, Qw).reshape(NQ)
 	w_q = torch.arange(Qw, device=dev).unsqueeze(0).expand(Qh, Qw).reshape(NQ)
-	P_exp = P.unsqueeze(1)  # (K, 1, 3)
+	frac_half_h = torch.full((K, NQ), 0.5, device=dev, dtype=dt)
+	frac_half_w = torch.full((K, NQ), 0.5, device=dev, dtype=dt)
+	P_exp = P.unsqueeze(1).expand(K, NQ, 3)
+	n_exp = gt_n.unsqueeze(1).expand(K, NQ, 3)
 
 	for d in range(D):
-		v00 = xyz_det[d, :-1, :-1].reshape(NQ, 3).unsqueeze(0)
-		v10 = xyz_det[d, 1:, :-1].reshape(NQ, 3).unsqueeze(0)
-		v01 = xyz_det[d, :-1, 1:].reshape(NQ, 3).unsqueeze(0)
-		v11 = xyz_det[d, 1:, 1:].reshape(NQ, 3).unsqueeze(0)
+		v00 = xyz_det[d, :-1, :-1].reshape(NQ, 3).unsqueeze(0).expand(K, NQ, 3)
+		v10 = xyz_det[d, 1:, :-1].reshape(NQ, 3).unsqueeze(0).expand(K, NQ, 3)
+		v01 = xyz_det[d, :-1, 1:].reshape(NQ, 3).unsqueeze(0).expand(K, NQ, 3)
+		v11 = xyz_det[d, 1:, 1:].reshape(NQ, 3).unsqueeze(0).expand(K, NQ, 3)
 
-		u_all, v_all = _bilinear_project(P_exp, v00, v10, v01, v11)
-		Q = _bilinear_interp(v00, v10, v01, v11, u_all, v_all)
+		# Ray-bilinear intersection: unclamped (u, v)
+		u_all, v_all = fit_model.Model3D._ray_bilinear_intersect(
+			P_exp, n_exp, v00, v10, v01, v11, frac_half_h, frac_half_w)
+		uc = u_all.unsqueeze(-1)
+		vc = v_all.unsqueeze(-1)
+		Q = ((1 - uc) * (1 - vc) * v00 + uc * (1 - vc) * v10 +
+			 (1 - uc) * vc * v01 + uc * vc * v11)
 		dist_sq = (P_exp - Q).square().sum(-1)  # (K, NQ)
-		best_qi = dist_sq.argmin(dim=1)          # (K,)
+
+		# Prefer in-bounds intersections
+		in_bounds = (u_all >= 0) & (u_all <= 1) & (v_all >= 0) & (v_all <= 1)
+		dist_sq_pen = torch.where(in_bounds, dist_sq, dist_sq + 1e12)
+		best_qi = dist_sq_pen.argmin(dim=1)  # (K,)
 
 		kidx = torch.arange(K, device=dev)
 		nearest_h[:, d] = h_q[best_qi]
@@ -1050,21 +1095,31 @@ def _wind_brute_force_init(
 	kidx = torch.arange(K, device=dev)
 
 	# Bracketed points: closest_low = bracket_lo, closest_up = bracket_lo + 1
-	anchors_d[bracket_valid, 0] = bracket_lo[bracket_valid]
-	anchors_d[bracket_valid, 1] = bracket_lo[bracket_valid] + 1
-	anchors_h[bracket_valid, 0] = nearest_h[kidx[bracket_valid], bracket_lo[bracket_valid]]
-	anchors_w[bracket_valid, 0] = nearest_w[kidx[bracket_valid], bracket_lo[bracket_valid]]
-	anchors_h[bracket_valid, 1] = nearest_h[kidx[bracket_valid], bracket_lo[bracket_valid] + 1]
-	anchors_w[bracket_valid, 1] = nearest_w[kidx[bracket_valid], bracket_lo[bracket_valid] + 1]
-	anchors_valid[bracket_valid, 0] = True
-	anchors_valid[bracket_valid, 1] = True
+	bv = bracket_valid
+	bk_lo = bracket_lo[bv]
+	bk_hi = bk_lo + 1
+	bk_idx = kidx[bv]
+	anchors_d[bv, 0] = bk_lo
+	anchors_d[bv, 1] = bk_hi
+	anchors_h[bv, 0] = nearest_h[bk_idx, bk_lo]
+	anchors_w[bv, 0] = nearest_w[bk_idx, bk_lo]
+	anchors_h[bv, 1] = nearest_h[bk_idx, bk_hi]
+	anchors_w[bv, 1] = nearest_w[bk_idx, bk_hi]
+	# Valid only if point projects within the quad (u,v in [0,1])
+	u_lo = nearest_u[bk_idx, bk_lo]; v_lo = nearest_v[bk_idx, bk_lo]
+	u_hi = nearest_u[bk_idx, bk_hi]; v_hi = nearest_v[bk_idx, bk_hi]
+	anchors_valid[bv, 0] = (u_lo >= 0) & (u_lo <= 1) & (v_lo >= 0) & (v_lo <= 1)
+	anchors_valid[bv, 1] = (u_hi >= 0) & (u_hi <= 1) & (v_hi >= 0) & (v_hi <= 1)
 
 	# Single-sided: only closest_low anchor (index 0)
 	single = ~bracket_valid
-	anchors_d[single, 0] = nearest_layer[single]
-	anchors_h[single, 0] = nearest_h[kidx[single], nearest_layer[single]]
-	anchors_w[single, 0] = nearest_w[kidx[single], nearest_layer[single]]
-	anchors_valid[single, 0] = True
+	s_idx = kidx[single]
+	s_layer = nearest_layer[single]
+	anchors_d[single, 0] = s_layer
+	anchors_h[single, 0] = nearest_h[s_idx, s_layer]
+	anchors_w[single, 0] = nearest_w[s_idx, s_layer]
+	u_s = nearest_u[s_idx, s_layer]; v_s = nearest_v[s_idx, s_layer]
+	anchors_valid[single, 0] = (u_s >= 0) & (u_s <= 1) & (v_s >= 0) & (v_s <= 1)
 	# closest_up invalid for single-sided (already False)
 
 	# --- Winding observation ---
@@ -1144,21 +1199,23 @@ def _wind_brute_force_init(
 	avg_lo_d = target_safe.floor().clamp(0, max(D - 2, 0)).long()
 	avg_hi_d = (avg_lo_d + 1).clamp(max=D - 1)
 
-	# Find quads on avg layers
+	# Find quads on avg layers — only valid if point projects within quad (u,v in [0,1])
 	if target_finite.any():
-		# avg_low — valid if target is finite and layer in range
-		al_h, al_w, _, _ = _wind_nearest_quad_on_layer(P, xyz_det, avg_lo_d, Qh, Qw)
+		# avg_low
+		al_h, al_w, al_u, al_v = _wind_nearest_quad_on_layer(P, gt_n, xyz_det, avg_lo_d, Qh, Qw)
+		al_in_quad = (al_u >= 0) & (al_u <= 1) & (al_v >= 0) & (al_v <= 1)
 		anchors_d[:, 2] = avg_lo_d
 		anchors_h[:, 2] = al_h
 		anchors_w[:, 2] = al_w
-		anchors_valid[:, 2] = target_finite & (avg_lo_d >= 0) & (avg_lo_d < D)
+		anchors_valid[:, 2] = target_finite & (avg_lo_d >= 0) & (avg_lo_d < D) & al_in_quad
 
 		# avg_up — only valid if it's a different layer from avg_lo (requires D >= 2)
-		ah_h, ah_w, _, _ = _wind_nearest_quad_on_layer(P, xyz_det, avg_hi_d, Qh, Qw)
+		ah_h, ah_w, ah_u, ah_v = _wind_nearest_quad_on_layer(P, gt_n, xyz_det, avg_hi_d, Qh, Qw)
+		ah_in_quad = (ah_u >= 0) & (ah_u <= 1) & (ah_v >= 0) & (ah_v <= 1)
 		anchors_d[:, 3] = avg_hi_d
 		anchors_h[:, 3] = ah_h
 		anchors_w[:, 3] = ah_w
-		anchors_valid[:, 3] = target_finite & (avg_hi_d > avg_lo_d)
+		anchors_valid[:, 3] = target_finite & (avg_hi_d > avg_lo_d) & ah_in_quad
 
 	return anchors_d, anchors_h, anchors_w, anchors_valid, target, winding_obs
 
@@ -1174,51 +1231,67 @@ def _wind_update_anchors(
 	target: torch.Tensor,         # (K,) float
 	Qh: int, Qw: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-	"""Local anchor update for all correspondences.
+	"""Two-pass ray-bilinear anchor update (same pattern as ext_offset).
+
+	Pass 1: ray intersect on current quad → unclamped (u, v)
+	Pass 2: shift quad idx based on pass-1, re-intersect → final (u, v)
+	Mark invalid if final u,v outside [0,1].
 
 	Returns: (anchors_h, anchors_w, anchors_valid) — mutated in-place but also returned.
 	"""
 	K = P.shape[0]
 	D = xyz_det.shape[0]
-	dev = P.device
-	dt = P.dtype
+	Hm = Qh + 1
+	Wm = Qw + 1
 
+	def _gather_quad(d, h, w):
+		return (xyz_det[d, h, w],
+				xyz_det[d, (h + 1).clamp(max=Qh), w],
+				xyz_det[d, h, (w + 1).clamp(max=Qw)],
+				xyz_det[d, (h + 1).clamp(max=Qh), (w + 1).clamp(max=Qw)])
+
+	# --- Two-pass update for all 4 anchor types ---
 	for ci in range(4):
 		valid = anchors_valid[:, ci]
 		if not valid.any():
 			continue
 		vi = valid.nonzero(as_tuple=True)[0]
 		d_ci = anchors_d[vi, ci]
-		h_old = anchors_h[vi, ci]
-		w_old = anchors_w[vi, ci]
+		row = anchors_h[vi, ci]
+		col = anchors_w[vi, ci]
+		P_vi = P[vi]
+		n_vi = gt_n[vi]
 
-		# Unclamped bilinear project on current quad
-		v00 = xyz_det[d_ci, h_old, w_old]
-		v10 = xyz_det[d_ci, (h_old + 1).clamp(max=Qh), w_old]
-		v01 = xyz_det[d_ci, h_old, (w_old + 1).clamp(max=Qw)]
-		v11 = xyz_det[d_ci, (h_old + 1).clamp(max=Qh), (w_old + 1).clamp(max=Qw)]
+		# Pass 1: intersect on current quad
+		M00, M10, M01, M11 = _gather_quad(d_ci, row, col)
+		frac_h = torch.full_like(row, 0.5, dtype=P.dtype)
+		frac_w = torch.full_like(col, 0.5, dtype=P.dtype)
+		u1, v1 = fit_model.Model3D._ray_bilinear_intersect(
+			P_vi, n_vi, M00, M10, M01, M11, frac_h, frac_w)
 
-		e1 = v10 - v00
-		e2 = v01 - v00
-		g = P[vi] - v00
-		e1e1 = (e1 * e1).sum(-1)
-		e1e2 = (e1 * e2).sum(-1)
-		e2e2 = (e2 * e2).sum(-1)
-		ge1 = (g * e1).sum(-1)
-		ge2 = (g * e2).sum(-1)
-		det = e1e1 * e2e2 - e1e2 * e1e2
-		det_safe = det + (det.abs() < 1e-20).float() * 1e-20
-		u_raw = (ge1 * e2e2 - ge2 * e1e2) / det_safe
-		v_raw = (ge2 * e1e1 - ge1 * e1e2) / det_safe
+		# Shift quad idx based on pass-1, clamp to valid range
+		new_h = (row.float() + u1).clamp(0, Hm - 2)
+		new_w = (col.float() + v1).clamp(0, Wm - 2)
+		new_row = new_h.floor().clamp(0, Hm - 2).long()
+		new_col = new_w.floor().clamp(0, Wm - 2).long()
+		new_frac_h = new_h - new_row.float()
+		new_frac_w = new_w - new_col.float()
 
-		# Integer shift + clamp
-		h_new = (h_old + u_raw.floor().to(torch.long)).clamp(0, Qh - 1)
-		w_new = (w_old + v_raw.floor().to(torch.long)).clamp(0, Qw - 1)
+		# Pass 2: re-intersect on shifted quad
+		M00, M10, M01, M11 = _gather_quad(d_ci, new_row, new_col)
+		u2, v2 = fit_model.Model3D._ray_bilinear_intersect(
+			P_vi, n_vi, M00, M10, M01, M11, new_frac_h, new_frac_w)
 
-		anchors_h[vi, ci] = h_new
-		anchors_w[vi, ci] = w_new
+		# Final position and validity
+		final_h = (new_row.float() + u2).nan_to_num_(0.0).clamp(0, Hm - 2)
+		final_w = (new_col.float() + v2).nan_to_num_(0.0).clamp(0, Wm - 2)
+		anchors_h[vi, ci] = final_h.floor().long()
+		anchors_w[vi, ci] = final_w.floor().long()
+		# Mark invalid if final u,v outside [0,1]
+		in_bounds = (u2 >= 0) & (u2 <= 1) & (v2 >= 0) & (v2 <= 1)
+		anchors_valid[vi, ci] = in_bounds
 
-	# Re-check bracket for closest pair (indices 0, 1)
+	# --- Re-check bracket for closest pair (indices 0, 1) ---
 	has_bracket = anchors_valid[:, 0] & anchors_valid[:, 1]
 	if has_bracket.any():
 		bi = has_bracket.nonzero(as_tuple=True)[0]
@@ -1226,59 +1299,34 @@ def _wind_update_anchors(
 			d_ci = anchors_d[bi, ci]
 			h_ci = anchors_h[bi, ci]
 			w_ci = anchors_w[bi, ci]
-			v00 = xyz_det[d_ci, h_ci, w_ci]
-			v10 = xyz_det[d_ci, (h_ci + 1).clamp(max=Qh), w_ci]
-			v01 = xyz_det[d_ci, h_ci, (w_ci + 1).clamp(max=Qw)]
-			v11 = xyz_det[d_ci, (h_ci + 1).clamp(max=Qh), (w_ci + 1).clamp(max=Qw)]
-			u_c, v_c = _bilinear_project(P[bi], v00, v10, v01, v11)
-			Q_c = _bilinear_interp(v00, v10, v01, v11, u_c, v_c)
+			M00, M10, M01, M11 = _gather_quad(d_ci, h_ci, w_ci)
+			fh = torch.full_like(h_ci, 0.5, dtype=P.dtype)
+			fw = torch.full_like(w_ci, 0.5, dtype=P.dtype)
+			u_c, v_c = fit_model.Model3D._ray_bilinear_intersect(
+				P[bi], gt_n[bi], M00, M10, M01, M11, fh, fw)
+			Q_c = _bilinear_interp(M00, M10, M01, M11,
+								   u_c.clamp(0, 1), v_c.clamp(0, 1))
 			sd = ((P[bi] - Q_c) * gt_n[bi]).sum(dim=-1)
 			if ci == 0:
 				sd_lo = sd
 			else:
 				sd_hi = sd
-		# Check if bracket is still valid (signs differ)
 		bracket_lost = (sd_lo * sd_hi) >= 0
 		if bracket_lost.any():
-			# Mark lost brackets invalid — will be re-found next brute-force
 			lost = bi[bracket_lost]
 			anchors_valid[lost, 0] = False
 			anchors_valid[lost, 1] = False
 
-	# Update avg pair layers if target changed
-	D = xyz_det.shape[0]
+	# --- Update avg pair depth layers if target changed ---
 	target_finite = torch.isfinite(target)
 	target_safe = torch.where(target_finite, target, torch.zeros_like(target))
 	new_avg_lo_d = target_safe.floor().clamp(0, max(D - 2, 0)).long()
 	new_avg_hi_d = (new_avg_lo_d + 1).clamp(max=D - 1)
-
-	# Re-init avg anchors where layer changed
-	lo_changed = target_finite & (new_avg_lo_d != anchors_d[:, 2])
-	hi_changed = target_finite & (new_avg_hi_d != anchors_d[:, 3])
-
-	if lo_changed.any():
-		lci = lo_changed.nonzero(as_tuple=True)[0]
-		al_h, al_w, _, _ = _wind_nearest_quad_on_layer(
-			P[lci], xyz_det, new_avg_lo_d[lci], Qh, Qw)
-		anchors_d[lci, 2] = new_avg_lo_d[lci]
-		anchors_h[lci, 2] = al_h
-		anchors_w[lci, 2] = al_w
-		anchors_valid[lci, 2] = True
-
-	if hi_changed.any():
-		hci = hi_changed.nonzero(as_tuple=True)[0]
-		ah_h, ah_w, _, _ = _wind_nearest_quad_on_layer(
-			P[hci], xyz_det, new_avg_hi_d[hci], Qh, Qw)
-		anchors_d[hci, 3] = new_avg_hi_d[hci]
-		anchors_h[hci, 3] = ah_h
-		anchors_w[hci, 3] = ah_w
-		anchors_valid[hci, 3] = (new_avg_hi_d[hci] > new_avg_lo_d[hci])
-
-	# Ensure avg layer values are current even if not changed
 	anchors_d[:, 2] = new_avg_lo_d
 	anchors_d[:, 3] = new_avg_hi_d
+	# Invalidate avg anchors where target is not finite or layer out of range
 	anchors_valid[:, 2] = anchors_valid[:, 2] & target_finite & (new_avg_lo_d >= 0) & (new_avg_lo_d < D)
-	anchors_valid[:, 3] = anchors_valid[:, 3] & target_finite & (new_avg_hi_d >= 0) & (new_avg_hi_d < D)
+	anchors_valid[:, 3] = anchors_valid[:, 3] & target_finite & (new_avg_hi_d > new_avg_lo_d)
 
 	return anchors_h, anchors_w, anchors_valid
 
@@ -1509,11 +1557,13 @@ def _corr_winding_loss(
 		print(f"[corr-wind] loss={float(total_loss.detach().item()):.6f}, "
 			  f"valid={n_valid}/{K}, rms_proxy={rms:.4f}")
 
-	# Build results
+	# Build results — point is valid only if it has at least one valid avg anchor
+	has_avg_anchor = _wind_anchors_valid[:, 2] | _wind_anchors_valid[:, 3]
+	point_valid = target_finite & has_avg_anchor
 	_last_results = _build_winding_results(
 		winding_obs=_wind_obs_per_point, target=target,
 		err=all_err, pt_ids=pt_ids, col=col, pts=pts, winda=winda,
-		valid=target_finite,
+		valid=point_valid,
 	)
 	if _dbg_call_count == 1:
 		print_detail("INIT")
