@@ -503,7 +503,7 @@ def optimize(
 	has_corr_pts = data.corr_points is not None and data.corr_points.points_xyz_winda.shape[0] > 0
 	corr_weights = [(_need_term("corr", s.global_opt.eff), s.name) for s in stages if s.global_opt.steps > 0]
 	print(f"[optimizer] corr_points={has_corr_pts}"
-		  f" snap_mode={opt_loss_corr._snap_mode}"
+		  f" corr_mode={opt_loss_corr._corr_mode}"
 		  f" corr_weights={corr_weights}", flush=True)
 	if has_corr_pts:
 		cp = data.corr_points

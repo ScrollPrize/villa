@@ -4,11 +4,12 @@ import math
 
 import torch
 
+import fit_data
 import model as fit_model
 
 _dbg_call_count = 0
 _last_results: dict | None = None
-_snap_mode: bool = True
+_corr_mode: str = "winding"
 
 # Snap-mode anchor state (persists across calls)
 _snap_anchors_h: torch.Tensor | None = None
@@ -18,17 +19,34 @@ _snap_anchors_v: torch.Tensor | None = None
 _snap_anchors_dir: torch.Tensor | None = None  # 0=prev, 1=next
 _snap_initialized: bool = False
 
+# Winding-mode anchor state (persists across calls)
+# Correspondence indices: 0=closest_low, 1=closest_up, 2=avg_low, 3=avg_up
+_wind_anchors_d: torch.Tensor | None = None      # (K, 4) int — depth layer
+_wind_anchors_h: torch.Tensor | None = None      # (K, 4) int — quad row
+_wind_anchors_w: torch.Tensor | None = None      # (K, 4) int — quad col
+_wind_anchors_valid: torch.Tensor | None = None   # (K, 4) bool — per-anchor validity
+_wind_initialized: bool = False
+_wind_target_per_point: torch.Tensor | None = None  # (K,) float — cached target winding
+
+
+def set_corr_mode(mode: str) -> None:
+	global _corr_mode
+	assert mode in ("legacy", "snap", "winding"), f"Unknown corr mode: {mode}"
+	_corr_mode = mode
+
 
 def set_snap_mode(enabled: bool) -> None:
-	global _snap_mode
-	_snap_mode = enabled
+	"""Backward compat: 0=legacy, 1=snap."""
+	set_corr_mode("snap" if enabled else "legacy")
 
 
 def corr_loss(
 	*, res: fit_model.FitResult3D,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Dispatch to snap or legacy corr loss."""
-	if _snap_mode:
+	"""Dispatch to winding, snap, or legacy corr loss."""
+	if _corr_mode == "winding":
+		return _corr_winding_loss(res=res)
+	if _corr_mode == "snap":
 		return _corr_snap_loss(res=res)
 	return _corr_legacy_loss(res=res)
 
@@ -725,4 +743,721 @@ def _build_snap_results(
 			"valid": bool(valid[i]),
 		}
 		result["points"][str(pid)] = entry
+	return result
+
+
+# ---------------------------------------------------------------------------
+# Winding-observation corr loss
+# ---------------------------------------------------------------------------
+
+def _wind_nearest_quad_on_layer(
+	P: torch.Tensor,           # (K, 3)
+	xyz_det: torch.Tensor,     # (D, Hm, Wm, 3)
+	d_layer: torch.Tensor,     # (K,) int — target depth layer per point
+	Qh: int, Qw: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+	"""For each point, find nearest quad on its assigned layer.
+
+	Returns: (h_idx, w_idx, u, v) each (K,).
+	"""
+	K = P.shape[0]
+	dev = P.device
+	dt = P.dtype
+	NQ = Qh * Qw
+
+	best_h = torch.zeros(K, dtype=torch.long, device=dev)
+	best_w = torch.zeros(K, dtype=torch.long, device=dev)
+	best_u = torch.zeros(K, dtype=dt, device=dev)
+	best_v = torch.zeros(K, dtype=dt, device=dev)
+	best_dist = torch.full((K,), float("inf"), dtype=dt, device=dev)
+
+	h_q = torch.arange(Qh, device=dev).unsqueeze(1).expand(Qh, Qw).reshape(NQ)
+	w_q = torch.arange(Qw, device=dev).unsqueeze(0).expand(Qh, Qw).reshape(NQ)
+
+	unique_d = torch.unique(d_layer)
+	for d_val in unique_d.tolist():
+		d = int(d_val)
+		if d < 0 or d >= xyz_det.shape[0]:
+			continue
+		pmask = (d_layer == d)
+		if not pmask.any():
+			continue
+		P_sub = P[pmask]
+
+		v00 = xyz_det[d, :-1, :-1].reshape(NQ, 3).unsqueeze(0)
+		v10 = xyz_det[d, 1:, :-1].reshape(NQ, 3).unsqueeze(0)
+		v01 = xyz_det[d, :-1, 1:].reshape(NQ, 3).unsqueeze(0)
+		v11 = xyz_det[d, 1:, 1:].reshape(NQ, 3).unsqueeze(0)
+
+		P_exp = P_sub.unsqueeze(1)
+		u_all, v_all = _bilinear_project(P_exp, v00, v10, v01, v11)
+		Q = _bilinear_interp(v00, v10, v01, v11, u_all, v_all)
+		dist_sq = (P_exp - Q).square().sum(-1)
+
+		min_dist, min_qi = dist_sq.min(dim=1)
+		pidx = pmask.nonzero(as_tuple=True)[0]
+		better = min_dist < best_dist[pidx]
+		if better.any():
+			bi = better.nonzero(as_tuple=True)[0]
+			gi = pidx[bi]
+			qi = min_qi[bi]
+			best_h[gi] = h_q[qi]
+			best_w[gi] = w_q[qi]
+			best_u[gi] = u_all[bi, qi]
+			best_v[gi] = v_all[bi, qi]
+			best_dist[gi] = min_dist[bi]
+
+	return best_h, best_w, best_u, best_v
+
+
+def _wind_strip_integral(
+	P: torch.Tensor,              # (K, 3)
+	Q: torch.Tensor,              # (K, 3)
+	gt_n: torch.Tensor,           # (K, 3)
+	data: fit_data.FitData3D,
+	strip_samples: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+	"""Signed winding integral from P to Q.
+
+	Returns:
+		signed_winding: (K,)  sign(dot(Q-P, gt_n)) * strip_len * mean_mag
+		unsigned_winding: (K,)  strip_len * mean_mag
+		strip_valid: (K,) bool  all samples have grad_mag > 0
+	"""
+	K = P.shape[0]
+	dev = P.device
+	dt = P.dtype
+	diff = Q - P
+	t = torch.linspace(0.0, 1.0, strip_samples, device=dev, dtype=dt)
+	strip = P.unsqueeze(1) + t.view(1, -1, 1) * diff.unsqueeze(1)  # (K, S, 3)
+
+	strip_flat = strip.reshape(1, 1, K * strip_samples, 3)
+	sampled = data.grid_sample_fullres(strip_flat)
+	mag_raw = sampled.grad_mag  # (1, 1, 1, 1, K*S)
+	mag = mag_raw.reshape(K, strip_samples)
+
+	mean_mag = mag.mean(dim=-1).clamp(min=1e-4)
+	strip_len = diff.square().sum(dim=-1).sqrt().clamp(min=1e-8)
+
+	signed_normal_disp = (diff * gt_n).sum(dim=-1)
+	int_sign = torch.sign(signed_normal_disp)
+
+	unsigned_winding = strip_len * mean_mag
+	signed_winding = int_sign * unsigned_winding
+	strip_valid = (mag > 0).all(dim=-1)
+
+	return signed_winding, unsigned_winding, strip_valid
+
+
+def _wind_collection_average(
+	winding_obs: torch.Tensor,    # (K,)
+	winda: torch.Tensor,          # (K,)
+	col: torch.Tensor,            # (K,) int
+	obs_valid: torch.Tensor,      # (K,) bool — which points have reliable winding
+) -> torch.Tensor:
+	"""Collection-coupled target winding per point. Returns (K,) float, NaN for invalid."""
+	K = winding_obs.shape[0]
+	dev = winding_obs.device
+	dt = winding_obs.dtype
+	target = torch.full((K,), float("nan"), device=dev, dtype=dt)
+
+	uc = torch.unique(col)
+	for cid in uc.tolist():
+		m = (col == int(cid)) & obs_valid
+		if not m.any():
+			continue
+		obs_m = winding_obs[m]
+		wa_m = winda[m]
+		# Positive coupling: target = avg(obs - winda) + winda
+		avg_pos = (obs_m - wa_m).mean()
+		err_pos = obs_m - (avg_pos + wa_m)
+		mse_pos = (err_pos * err_pos).mean()
+		# Negative coupling: target = avg(obs + winda) - winda
+		avg_neg = (obs_m + wa_m).mean()
+		err_neg = obs_m - (avg_neg - wa_m)
+		mse_neg = (err_neg * err_neg).mean()
+
+		use_neg = bool((mse_neg < mse_pos).item())
+		if use_neg:
+			target[m] = avg_neg - wa_m
+		else:
+			target[m] = avg_pos + wa_m
+
+		# Set target for all points in collection (including those excluded from avg)
+		m_all = (col == int(cid)) & ~obs_valid
+		if m_all.any():
+			if use_neg:
+				target[m_all] = avg_neg - winda[m_all]
+			else:
+				target[m_all] = avg_pos + winda[m_all]
+
+	return target
+
+
+def _wind_brute_force_init(
+	P: torch.Tensor,              # (K, 3)
+	gt_n: torch.Tensor,           # (K, 3)
+	winda: torch.Tensor,          # (K,)
+	col: torch.Tensor,            # (K,) int
+	xyz_det: torch.Tensor,        # (D, Hm, Wm, 3)
+	data: fit_data.FitData3D,
+	strip_samples: int,
+	Qh: int, Qw: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+	"""Brute-force init: bracket search, winding observation, collection avg, avg pair.
+
+	Returns: (anchors_d, anchors_h, anchors_w, anchors_valid, target_per_point)
+		anchors_d/h/w: (K, 4) int
+		anchors_valid: (K, 4) bool
+		target_per_point: (K,) float (NaN for fully invalid)
+	"""
+	K = P.shape[0]
+	D = xyz_det.shape[0]
+	dev = P.device
+	dt = P.dtype
+	NQ = Qh * Qw
+
+	# --- Per-layer nearest quad + signed distance ---
+	nearest_h = torch.zeros(K, D, dtype=torch.long, device=dev)
+	nearest_w = torch.zeros(K, D, dtype=torch.long, device=dev)
+	nearest_u = torch.zeros(K, D, dtype=dt, device=dev)
+	nearest_v = torch.zeros(K, D, dtype=dt, device=dev)
+	signed_dist = torch.zeros(K, D, dtype=dt, device=dev)
+
+	h_q = torch.arange(Qh, device=dev).unsqueeze(1).expand(Qh, Qw).reshape(NQ)
+	w_q = torch.arange(Qw, device=dev).unsqueeze(0).expand(Qh, Qw).reshape(NQ)
+	P_exp = P.unsqueeze(1)  # (K, 1, 3)
+
+	for d in range(D):
+		v00 = xyz_det[d, :-1, :-1].reshape(NQ, 3).unsqueeze(0)
+		v10 = xyz_det[d, 1:, :-1].reshape(NQ, 3).unsqueeze(0)
+		v01 = xyz_det[d, :-1, 1:].reshape(NQ, 3).unsqueeze(0)
+		v11 = xyz_det[d, 1:, 1:].reshape(NQ, 3).unsqueeze(0)
+
+		u_all, v_all = _bilinear_project(P_exp, v00, v10, v01, v11)
+		Q = _bilinear_interp(v00, v10, v01, v11, u_all, v_all)
+		dist_sq = (P_exp - Q).square().sum(-1)  # (K, NQ)
+		best_qi = dist_sq.argmin(dim=1)          # (K,)
+
+		kidx = torch.arange(K, device=dev)
+		nearest_h[:, d] = h_q[best_qi]
+		nearest_w[:, d] = w_q[best_qi]
+		nearest_u[:, d] = u_all[kidx, best_qi]
+		nearest_v[:, d] = v_all[kidx, best_qi]
+
+		# Signed distance along GT normal
+		Q_best = Q[kidx, best_qi]  # (K, 3)
+		signed_dist[:, d] = ((P - Q_best) * gt_n).sum(dim=-1)
+
+	# --- Find bracket (two layers where signed_dist flips sign) ---
+	bracket_lo = torch.zeros(K, dtype=torch.long, device=dev)
+	bracket_valid = torch.zeros(K, dtype=torch.bool, device=dev)
+	bracket_score = torch.full((K,), float("inf"), dtype=dt, device=dev)
+
+	for d in range(D - 1):
+		sd_lo = signed_dist[:, d]
+		sd_hi = signed_dist[:, d + 1]
+		between = (sd_lo * sd_hi) < 0
+		score = sd_lo.abs() + sd_hi.abs()
+		better = between & (score < bracket_score)
+		bracket_lo[better] = d
+		bracket_valid[better] = True
+		bracket_score[better] = score[better]
+
+	# --- Single-sided: nearest layer for non-bracketed points ---
+	# Find the layer with smallest |signed_dist|
+	abs_sd = signed_dist.abs()
+	nearest_layer = abs_sd.argmin(dim=1)  # (K,)
+
+	# --- Allocate anchor tensors ---
+	anchors_d = torch.zeros(K, 4, dtype=torch.long, device=dev)
+	anchors_h = torch.zeros(K, 4, dtype=torch.long, device=dev)
+	anchors_w = torch.zeros(K, 4, dtype=torch.long, device=dev)
+	anchors_valid = torch.zeros(K, 4, dtype=torch.bool, device=dev)
+
+	# Fill closest pair
+	kidx = torch.arange(K, device=dev)
+
+	# Bracketed points: closest_low = bracket_lo, closest_up = bracket_lo + 1
+	anchors_d[bracket_valid, 0] = bracket_lo[bracket_valid]
+	anchors_d[bracket_valid, 1] = bracket_lo[bracket_valid] + 1
+	anchors_h[bracket_valid, 0] = nearest_h[kidx[bracket_valid], bracket_lo[bracket_valid]]
+	anchors_w[bracket_valid, 0] = nearest_w[kidx[bracket_valid], bracket_lo[bracket_valid]]
+	anchors_h[bracket_valid, 1] = nearest_h[kidx[bracket_valid], bracket_lo[bracket_valid] + 1]
+	anchors_w[bracket_valid, 1] = nearest_w[kidx[bracket_valid], bracket_lo[bracket_valid] + 1]
+	anchors_valid[bracket_valid, 0] = True
+	anchors_valid[bracket_valid, 1] = True
+
+	# Single-sided: only closest_low anchor (index 0)
+	single = ~bracket_valid
+	anchors_d[single, 0] = nearest_layer[single]
+	anchors_h[single, 0] = nearest_h[kidx[single], nearest_layer[single]]
+	anchors_w[single, 0] = nearest_w[kidx[single], nearest_layer[single]]
+	anchors_valid[single, 0] = True
+	# closest_up invalid for single-sided (already False)
+
+	# --- Winding observation ---
+	winding_obs = torch.full((K,), float("nan"), dtype=dt, device=dev)
+	obs_valid = torch.zeros(K, dtype=torch.bool, device=dev)
+
+	# Bracketed: winding = d_low + integral_low / (integral_low + integral_up)
+	if bracket_valid.any():
+		bk = bracket_valid
+		d_lo = anchors_d[bk, 0]
+		h_lo = anchors_h[bk, 0]
+		w_lo = anchors_w[bk, 0]
+		u_lo = nearest_u[kidx[bk], d_lo]
+		v_lo = nearest_v[kidx[bk], d_lo]
+		v00_lo = xyz_det[d_lo, h_lo, w_lo]
+		v10_lo = xyz_det[d_lo, h_lo + 1, w_lo]
+		v01_lo = xyz_det[d_lo, h_lo, w_lo + 1]
+		v11_lo = xyz_det[d_lo, h_lo + 1, w_lo + 1]
+		Q_lo = _bilinear_interp(v00_lo, v10_lo, v01_lo, v11_lo, u_lo, v_lo)
+
+		d_hi = anchors_d[bk, 1]
+		h_hi = anchors_h[bk, 1]
+		w_hi = anchors_w[bk, 1]
+		u_hi = nearest_u[kidx[bk], d_hi]
+		v_hi = nearest_v[kidx[bk], d_hi]
+		v00_hi = xyz_det[d_hi, h_hi, w_hi]
+		v10_hi = xyz_det[d_hi, h_hi + 1, w_hi]
+		v01_hi = xyz_det[d_hi, h_hi, w_hi + 1]
+		v11_hi = xyz_det[d_hi, h_hi + 1, w_hi + 1]
+		Q_hi = _bilinear_interp(v00_hi, v10_hi, v01_hi, v11_hi, u_hi, v_hi)
+
+		P_bk = P[bk]
+		gt_n_bk = gt_n[bk]
+		_, uint_lo, sv_lo = _wind_strip_integral(Q_lo, P_bk, gt_n_bk, data, strip_samples)
+		_, uint_hi, sv_hi = _wind_strip_integral(P_bk, Q_hi, gt_n_bk, data, strip_samples)
+		frac = uint_lo / (uint_lo + uint_hi + 1e-8)
+		winding_obs[bk] = d_lo.to(dt) + frac
+		obs_valid[bk] = sv_lo & sv_hi
+
+	# Single-sided: winding = d_nearest +/- integral (valid only if integral < 1.0)
+	if single.any():
+		d_s = anchors_d[single, 0]
+		h_s = anchors_h[single, 0]
+		w_s = anchors_w[single, 0]
+		u_s = nearest_u[kidx[single], d_s]
+		v_s = nearest_v[kidx[single], d_s]
+		v00_s = xyz_det[d_s, h_s, w_s]
+		v10_s = xyz_det[d_s, h_s + 1, w_s]
+		v01_s = xyz_det[d_s, h_s, w_s + 1]
+		v11_s = xyz_det[d_s, h_s + 1, w_s + 1]
+		Q_s = _bilinear_interp(v00_s, v10_s, v01_s, v11_s, u_s, v_s)
+
+		P_s = P[single]
+		gt_n_s = gt_n[single]
+		sw, uw, sv = _wind_strip_integral(P_s, Q_s, gt_n_s, data, strip_samples)
+		# Sign: if Q is below P (sw < 0), surface is below → winding = d + integral
+		# If Q is above P (sw > 0), surface is above → winding = d - integral
+		above = sw > 0  # surface is above P
+		w_est = torch.where(above, d_s.to(dt) - uw, d_s.to(dt) + uw)
+		valid_single = sv & (uw < 1.0)
+		winding_obs[single] = w_est
+		obs_valid[single] = valid_single
+
+	# --- Collection averaging ---
+	target = _wind_collection_average(winding_obs, winda, col, obs_valid)
+
+	# --- Avg pair anchors from target winding ---
+	target_finite = torch.isfinite(target)
+	avg_lo_d = target.floor().clamp(0, D - 2).long()
+	avg_hi_d = (avg_lo_d + 1).clamp(max=D - 1)
+
+	# Find quads on avg layers
+	if target_finite.any():
+		# avg_low
+		al_h, al_w, _, _ = _wind_nearest_quad_on_layer(P, xyz_det, avg_lo_d, Qh, Qw)
+		anchors_d[:, 2] = avg_lo_d
+		anchors_h[:, 2] = al_h
+		anchors_w[:, 2] = al_w
+		anchors_valid[:, 2] = target_finite & (avg_lo_d >= 0) & (avg_lo_d < D)
+
+		# avg_up
+		ah_h, ah_w, _, _ = _wind_nearest_quad_on_layer(P, xyz_det, avg_hi_d, Qh, Qw)
+		anchors_d[:, 3] = avg_hi_d
+		anchors_h[:, 3] = ah_h
+		anchors_w[:, 3] = ah_w
+		anchors_valid[:, 3] = target_finite & (avg_hi_d >= 0) & (avg_hi_d < D)
+
+	return anchors_d, anchors_h, anchors_w, anchors_valid, target
+
+
+def _wind_update_anchors(
+	P: torch.Tensor,              # (K, 3)
+	gt_n: torch.Tensor,           # (K, 3)
+	xyz_det: torch.Tensor,        # (D, Hm, Wm, 3)
+	anchors_d: torch.Tensor,      # (K, 4) int
+	anchors_h: torch.Tensor,      # (K, 4) int
+	anchors_w: torch.Tensor,      # (K, 4) int
+	anchors_valid: torch.Tensor,  # (K, 4) bool
+	target: torch.Tensor,         # (K,) float
+	Qh: int, Qw: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+	"""Local anchor update for all correspondences.
+
+	Returns: (anchors_h, anchors_w, anchors_valid) — mutated in-place but also returned.
+	"""
+	K = P.shape[0]
+	D = xyz_det.shape[0]
+	dev = P.device
+	dt = P.dtype
+
+	for ci in range(4):
+		valid = anchors_valid[:, ci]
+		if not valid.any():
+			continue
+		vi = valid.nonzero(as_tuple=True)[0]
+		d_ci = anchors_d[vi, ci]
+		h_old = anchors_h[vi, ci]
+		w_old = anchors_w[vi, ci]
+
+		# Unclamped bilinear project on current quad
+		v00 = xyz_det[d_ci, h_old, w_old]
+		v10 = xyz_det[d_ci, (h_old + 1).clamp(max=Qh), w_old]
+		v01 = xyz_det[d_ci, h_old, (w_old + 1).clamp(max=Qw)]
+		v11 = xyz_det[d_ci, (h_old + 1).clamp(max=Qh), (w_old + 1).clamp(max=Qw)]
+
+		e1 = v10 - v00
+		e2 = v01 - v00
+		g = P[vi] - v00
+		e1e1 = (e1 * e1).sum(-1)
+		e1e2 = (e1 * e2).sum(-1)
+		e2e2 = (e2 * e2).sum(-1)
+		ge1 = (g * e1).sum(-1)
+		ge2 = (g * e2).sum(-1)
+		det = e1e1 * e2e2 - e1e2 * e1e2
+		det_safe = det + (det.abs() < 1e-20).float() * 1e-20
+		u_raw = (ge1 * e2e2 - ge2 * e1e2) / det_safe
+		v_raw = (ge2 * e1e1 - ge1 * e1e2) / det_safe
+
+		# Integer shift + clamp
+		h_new = (h_old + u_raw.floor().to(torch.long)).clamp(0, Qh - 1)
+		w_new = (w_old + v_raw.floor().to(torch.long)).clamp(0, Qw - 1)
+
+		anchors_h[vi, ci] = h_new
+		anchors_w[vi, ci] = w_new
+
+	# Re-check bracket for closest pair (indices 0, 1)
+	has_bracket = anchors_valid[:, 0] & anchors_valid[:, 1]
+	if has_bracket.any():
+		bi = has_bracket.nonzero(as_tuple=True)[0]
+		for ci in [0, 1]:
+			d_ci = anchors_d[bi, ci]
+			h_ci = anchors_h[bi, ci]
+			w_ci = anchors_w[bi, ci]
+			v00 = xyz_det[d_ci, h_ci, w_ci]
+			v10 = xyz_det[d_ci, (h_ci + 1).clamp(max=Qh), w_ci]
+			v01 = xyz_det[d_ci, h_ci, (w_ci + 1).clamp(max=Qw)]
+			v11 = xyz_det[d_ci, (h_ci + 1).clamp(max=Qh), (w_ci + 1).clamp(max=Qw)]
+			u_c, v_c = _bilinear_project(P[bi], v00, v10, v01, v11)
+			Q_c = _bilinear_interp(v00, v10, v01, v11, u_c, v_c)
+			sd = ((P[bi] - Q_c) * gt_n[bi]).sum(dim=-1)
+			if ci == 0:
+				sd_lo = sd
+			else:
+				sd_hi = sd
+		# Check if bracket is still valid (signs differ)
+		bracket_lost = (sd_lo * sd_hi) >= 0
+		if bracket_lost.any():
+			# Mark lost brackets invalid — will be re-found next brute-force
+			lost = bi[bracket_lost]
+			anchors_valid[lost, 0] = False
+			anchors_valid[lost, 1] = False
+
+	# Update avg pair layers if target changed
+	target_finite = torch.isfinite(target)
+	new_avg_lo_d = target.floor().clamp(0, D - 2).long()
+	new_avg_hi_d = (new_avg_lo_d + 1).clamp(max=D - 1)
+
+	# Re-init avg anchors where layer changed
+	lo_changed = target_finite & (new_avg_lo_d != anchors_d[:, 2])
+	hi_changed = target_finite & (new_avg_hi_d != anchors_d[:, 3])
+
+	if lo_changed.any():
+		lci = lo_changed.nonzero(as_tuple=True)[0]
+		al_h, al_w, _, _ = _wind_nearest_quad_on_layer(
+			P[lci], xyz_det, new_avg_lo_d[lci], Qh, Qw)
+		anchors_d[lci, 2] = new_avg_lo_d[lci]
+		anchors_h[lci, 2] = al_h
+		anchors_w[lci, 2] = al_w
+		anchors_valid[lci, 2] = True
+
+	if hi_changed.any():
+		hci = hi_changed.nonzero(as_tuple=True)[0]
+		ah_h, ah_w, _, _ = _wind_nearest_quad_on_layer(
+			P[hci], xyz_det, new_avg_hi_d[hci], Qh, Qw)
+		anchors_d[hci, 3] = new_avg_hi_d[hci]
+		anchors_h[hci, 3] = ah_h
+		anchors_w[hci, 3] = ah_w
+		anchors_valid[hci, 3] = True
+
+	# Ensure avg layer values are current even if not changed
+	anchors_d[:, 2] = new_avg_lo_d
+	anchors_d[:, 3] = new_avg_hi_d
+	anchors_valid[:, 2] = anchors_valid[:, 2] & target_finite & (new_avg_lo_d >= 0) & (new_avg_lo_d < D)
+	anchors_valid[:, 3] = anchors_valid[:, 3] & target_finite & (new_avg_hi_d >= 0) & (new_avg_hi_d < D)
+
+	return anchors_h, anchors_w, anchors_valid
+
+
+def _corr_winding_loss(
+	*, res: fit_model.FitResult3D,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	"""Winding-observation corr loss with proxy correction."""
+	global _dbg_call_count, _last_results
+	global _wind_anchors_d, _wind_anchors_h, _wind_anchors_w
+	global _wind_anchors_valid, _wind_initialized, _wind_target_per_point
+
+	_dbg_call_count += 1
+	dbg = (_dbg_call_count <= 2)
+
+	dev = res.xyz_lr.device
+	dt = res.xyz_lr.dtype
+
+	pts_c = res.data.corr_points
+	if pts_c is None or pts_c.points_xyz_winda.shape[0] == 0:
+		if _dbg_call_count <= 2:
+			print("[corr-wind] no correction points")
+		z = torch.zeros((), device=dev, dtype=dt)
+		return z, (torch.zeros((1,), device=dev, dtype=dt),), (torch.zeros((1,), device=dev, dtype=dt),)
+
+	pts = pts_c.points_xyz_winda.to(device=dev, dtype=dt)
+	col = pts_c.collection_idx.to(device=dev, dtype=torch.int64)
+	pt_ids = pts_c.point_ids.to(device=dev, dtype=torch.int64)
+	K = int(pts.shape[0])
+	P = pts[:, :3]
+	winda = pts[:, 3]
+
+	xyz_lr = res.xyz_lr
+	D, Hm, Wm, _ = xyz_lr.shape
+	Qh, Qw = Hm - 1, Wm - 1
+	if Qh <= 0 or Qw <= 0 or D < 2:
+		z = torch.zeros((), device=dev, dtype=dt)
+		return z, (torch.zeros((1,), device=dev, dtype=dt),), (torch.zeros((1,), device=dev, dtype=dt),)
+
+	xyz_det = xyz_lr.detach()
+	strip_samples = max(2, int(res.params.subsample_mesh) + 1)
+
+	# Sample GT normals at corr point positions
+	gt_n_sampled = res.data.grid_sample_fullres(P.reshape(1, 1, K, 3))
+	gt_n = gt_n_sampled.normal_3d  # (1, 1, K, 3) after squeeze in property
+	gt_n = gt_n.reshape(K, 3)
+	gt_n = gt_n / (gt_n.norm(dim=-1, keepdim=True) + 1e-8)
+
+	# --- Initialize or update anchors ---
+	if not _wind_initialized or _wind_anchors_d is None or _wind_anchors_d.shape[0] != K:
+		if dbg:
+			print(f"[corr-wind] brute-force init: K={K} points, mesh=({D},{Hm},{Wm})")
+		with torch.no_grad():
+			(
+				_wind_anchors_d, _wind_anchors_h, _wind_anchors_w,
+				_wind_anchors_valid, _wind_target_per_point,
+			) = _wind_brute_force_init(
+				P, gt_n, winda, col, xyz_det, res.data, strip_samples, Qh, Qw)
+		_wind_initialized = True
+	else:
+		# Phase A: Winding observation (closest pair, detached)
+		with torch.no_grad():
+			winding_obs = torch.full((K,), float("nan"), dtype=dt, device=dev)
+			obs_valid = torch.zeros(K, dtype=torch.bool, device=dev)
+			kidx = torch.arange(K, device=dev)
+
+			# Bracketed points
+			has_bracket = _wind_anchors_valid[:, 0] & _wind_anchors_valid[:, 1]
+			if has_bracket.any():
+				bk = has_bracket
+				bki = bk.nonzero(as_tuple=True)[0]
+				Q_pair = []
+				for ci in [0, 1]:
+					d_ci = _wind_anchors_d[bki, ci]
+					h_ci = _wind_anchors_h[bki, ci]
+					w_ci = _wind_anchors_w[bki, ci]
+					v00 = xyz_det[d_ci, h_ci, w_ci]
+					v10 = xyz_det[d_ci, (h_ci + 1).clamp(max=Qh), w_ci]
+					v01 = xyz_det[d_ci, h_ci, (w_ci + 1).clamp(max=Qw)]
+					v11 = xyz_det[d_ci, (h_ci + 1).clamp(max=Qh), (w_ci + 1).clamp(max=Qw)]
+					u_c, v_c = _bilinear_project(P[bki], v00, v10, v01, v11)
+					Q_pair.append(_bilinear_interp(v00, v10, v01, v11, u_c, v_c))
+
+				Q_lo, Q_hi = Q_pair
+				P_bk = P[bki]
+				gt_n_bk = gt_n[bki]
+				_, uint_lo, sv_lo = _wind_strip_integral(Q_lo, P_bk, gt_n_bk, res.data, strip_samples)
+				_, uint_hi, sv_hi = _wind_strip_integral(P_bk, Q_hi, gt_n_bk, res.data, strip_samples)
+				frac = uint_lo / (uint_lo + uint_hi + 1e-8)
+				d_lo = _wind_anchors_d[bki, 0].to(dt)
+				winding_obs[bki] = d_lo + frac
+				obs_valid[bki] = sv_lo & sv_hi
+
+			# Single-sided points
+			single = _wind_anchors_valid[:, 0] & ~_wind_anchors_valid[:, 1]
+			if single.any():
+				si = single.nonzero(as_tuple=True)[0]
+				d_s = _wind_anchors_d[si, 0]
+				h_s = _wind_anchors_h[si, 0]
+				w_s = _wind_anchors_w[si, 0]
+				v00 = xyz_det[d_s, h_s, w_s]
+				v10 = xyz_det[d_s, (h_s + 1).clamp(max=Qh), w_s]
+				v01 = xyz_det[d_s, h_s, (w_s + 1).clamp(max=Qw)]
+				v11 = xyz_det[d_s, (h_s + 1).clamp(max=Qh), (w_s + 1).clamp(max=Qw)]
+				u_c, v_c = _bilinear_project(P[si], v00, v10, v01, v11)
+				Q_s = _bilinear_interp(v00, v10, v01, v11, u_c, v_c)
+				sw, uw, sv = _wind_strip_integral(P[si], Q_s, gt_n[si], res.data, strip_samples)
+				above = sw > 0
+				w_est = torch.where(above, d_s.to(dt) - uw, d_s.to(dt) + uw)
+				winding_obs[si] = w_est
+				obs_valid[si] = sv & (uw < 1.0)
+
+			# Phase B: Collection averaging
+			_wind_target_per_point = _wind_collection_average(
+				winding_obs, winda, col, obs_valid)
+
+			# Phase C: Update anchors
+			_wind_anchors_h, _wind_anchors_w, _wind_anchors_valid = _wind_update_anchors(
+				P, gt_n, xyz_det,
+				_wind_anchors_d, _wind_anchors_h, _wind_anchors_w,
+				_wind_anchors_valid, _wind_target_per_point,
+				Qh, Qw)
+
+	# === Phase D: Proxy correction loss (avg pair, WITH gradients) ===
+	target = _wind_target_per_point
+	target_finite = torch.isfinite(target)
+	if not target_finite.any():
+		if dbg:
+			print("[corr-wind] no valid targets")
+		z = torch.zeros((), device=dev, dtype=dt)
+		return z, (torch.zeros((1,), device=dev, dtype=dt),), (torch.zeros((1,), device=dev, dtype=dt),)
+
+	frac = (target - _wind_anchors_d[:, 2].to(dt)).clamp(0.0, 1.0)
+
+	total_loss = torch.zeros((), device=dev, dtype=dt)
+	total_wsum = 0.0
+	n_surfaces = 0
+	all_err = torch.zeros(K, device=dev, dtype=dt)
+
+	for ci, tgt_fn in [(2, lambda f: -f), (3, lambda f: 1.0 - f)]:
+		valid = _wind_anchors_valid[:, ci] & target_finite
+		if not valid.any():
+			continue
+		vi = valid.nonzero(as_tuple=True)[0]
+		d_ci = _wind_anchors_d[vi, ci]
+		h_ci = _wind_anchors_h[vi, ci]
+		w_ci = _wind_anchors_w[vi, ci]
+
+		# Gather 4 model quad corners WITH gradients
+		M00 = xyz_lr[d_ci, h_ci, w_ci]
+		M10 = xyz_lr[d_ci, h_ci + 1, w_ci]
+		M01 = xyz_lr[d_ci, h_ci, w_ci + 1]
+		M11 = xyz_lr[d_ci, h_ci + 1, w_ci + 1]
+
+		with torch.no_grad():
+			M00_det = M00.detach()
+			M10_det = M10.detach()
+			M01_det = M01.detach()
+			M11_det = M11.detach()
+
+			# Project P onto quad (detached u,v for weights)
+			u_ci, v_ci = _bilinear_project(P[vi], M00_det, M10_det, M01_det, M11_det)
+
+			# Bilinear model point (detached)
+			uf = u_ci.unsqueeze(-1)
+			vf = v_ci.unsqueeze(-1)
+			Q = (1 - uf) * (1 - vf) * M00_det + uf * (1 - vf) * M10_det + \
+				(1 - uf) * vf * M01_det + uf * vf * M11_det
+
+			# Strip from P to Q: signed winding
+			sw, _, sv = _wind_strip_integral(P[vi], Q, gt_n[vi], res.data, strip_samples)
+
+			# Target offset
+			tgt = tgt_fn(frac[vi])
+			err = sw - tgt
+
+			# Store error for results
+			all_err[vi] = err
+
+			# Proxies: shift each corner by gt_n * err
+			we = err.unsqueeze(-1)
+			gt_n_vi = gt_n[vi]
+			proxy00 = M00_det - gt_n_vi * we
+			proxy10 = M10_det - gt_n_vi * we
+			proxy01 = M01_det - gt_n_vi * we
+			proxy11 = M11_det - gt_n_vi * we
+
+		# Bilinear weights
+		w00 = (1 - u_ci) * (1 - v_ci)
+		w10 = u_ci * (1 - v_ci)
+		w01 = (1 - u_ci) * v_ci
+		w11 = u_ci * v_ci
+
+		# L2 loss (gradients flow through M00..M11)
+		lm00 = (M00 - proxy00).square().sum(dim=-1)
+		lm10 = (M10 - proxy10).square().sum(dim=-1)
+		lm01 = (M01 - proxy01).square().sum(dim=-1)
+		lm11 = (M11 - proxy11).square().sum(dim=-1)
+
+		lm = w00 * lm00 + w10 * lm10 + w01 * lm01 + w11 * lm11
+
+		# Mask by strip validity
+		mask_ci = sv.to(dt)
+		wsum = float(mask_ci.sum().detach().cpu())
+		if wsum > 0:
+			total_loss = total_loss + (lm * mask_ci).sum() / wsum
+			total_wsum += wsum
+		n_surfaces += 1
+
+	if n_surfaces > 1:
+		total_loss = total_loss / n_surfaces
+
+	if dbg:
+		n_valid = int(target_finite.sum().item())
+		rms = float(total_loss.detach().sqrt().item()) if total_wsum > 0 else float("nan")
+		print(f"[corr-wind] loss={float(total_loss.detach().item()):.6f}, "
+			  f"valid={n_valid}/{K}, rms_proxy={rms:.4f}")
+
+	# Build results
+	_last_results = _build_winding_results(
+		winding_obs=_wind_target_per_point, target=target,
+		err=all_err, pt_ids=pt_ids, col=col, pts=pts, winda=winda,
+		valid=target_finite,
+	)
+
+	err_sq = all_err * all_err
+	mask_out = target_finite.to(dt)
+	return total_loss, (err_sq,), (mask_out,)
+
+
+def _build_winding_results(
+	*, winding_obs: torch.Tensor, target: torch.Tensor,
+	err: torch.Tensor, pt_ids: torch.Tensor, col: torch.Tensor,
+	pts: torch.Tensor, winda: torch.Tensor, valid: torch.Tensor,
+) -> dict:
+	"""Build JSON-serializable dict of per-point winding results."""
+	result: dict = {"points": {}, "collection_avgs": {}}
+	K = int(pts.shape[0])
+	for i in range(K):
+		pid = int(pt_ids[i].item())
+		cid = int(col[i].item())
+		w_obs = float(winding_obs[i].item()) if math.isfinite(float(winding_obs[i].item())) else None
+		w_tgt = float(target[i].item()) if math.isfinite(float(target[i].item())) else None
+		e = float(err[i].item()) if bool(valid[i]) and math.isfinite(float(err[i].item())) else None
+		entry: dict = {
+			"collection_id": cid,
+			"p": [round(float(pts[i, j].item()), 2) for j in range(3)],
+			"winding_obs": round(w_obs, 6) if w_obs is not None else None,
+			"winding_target": round(w_tgt, 6) if w_tgt is not None else None,
+			"winding_err": round(e, 6) if e is not None else None,
+			"valid": bool(valid[i]),
+		}
+		result["points"][str(pid)] = entry
+	# Per-collection averages
+	uc = torch.unique(col)
+	for cid_t in uc.tolist():
+		cid_int = int(cid_t)
+		mask = (col == cid_int) & valid
+		if mask.any():
+			v = float(target[mask].mean().item())
+			if math.isfinite(v):
+				result["collection_avgs"][str(cid_int)] = round(v, 6)
 	return result
