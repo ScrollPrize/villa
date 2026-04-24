@@ -519,14 +519,16 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
             slice(x_start, x_end)
         )
 
-        normalized = np.zeros_like(chunk_logits)
-        np.divide(chunk_logits, chunk_weights[np.newaxis, :, :, :] + epsilon,
-                  out=normalized, where=chunk_weights[np.newaxis, :, :, :] > 0)
+        # Divide in place: voxels with weight==0 had no contributions so
+        # chunk_logits is already 0 there, and `where=...` leaves them untouched.
+        weights_b = chunk_weights[np.newaxis, :, :, :]
+        np.divide(chunk_logits, weights_b + epsilon,
+                  out=chunk_logits, where=weights_b > 0)
 
         finalize_config = _worker_state.get('finalize_config')
         if finalize_config is not None:
             from vesuvius.models.run.finalize_outputs import apply_finalization
-            result, is_empty = apply_finalization(normalized, num_classes, finalize_config)
+            result, is_empty = apply_finalization(chunk_logits, num_classes, finalize_config)
             if not is_empty:
                 # Finalized output may have different channel count than blended logits;
                 # write using slices that match the finalized shape.
@@ -538,7 +540,7 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
                 )
                 output_store[finalized_slice] = result
         else:
-            output_store[output_slice] = normalized.astype(np.float16)
+            output_store[output_slice] = chunk_logits.astype(np.float16)
 
     return {
         'chunk': chunk_info,
