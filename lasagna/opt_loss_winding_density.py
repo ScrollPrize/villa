@@ -189,20 +189,8 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 			# Winding error: how many windings off from target
 			err = signed_integral - offset  # positive = too far on +n side
 
-			# Sample GT normal at model vertex, align with ext surface normal
-			gt_sampled = res.data.grid_sample_fullres(xyz_det)
-			gt_nx = gt_sampled.nx.squeeze(0).permute(1, 0, 2, 3).squeeze(1)  # (D, Hm, Wm)
-			gt_ny = gt_sampled.ny.squeeze(0).permute(1, 0, 2, 3).squeeze(1)
-			gt_nz = torch.sqrt((1.0 - gt_nx * gt_nx - gt_ny * gt_ny).clamp(min=0.0))
-			gt_n = torch.stack([gt_nx, gt_ny, gt_nz], dim=-1)  # (D, Hm, Wm, 3)
-			gt_n = gt_n / (gt_n.norm(dim=-1, keepdim=True) + 1e-8)
-			# Flip to align with ext surface normal
-			flip = (gt_n * ext_n).sum(dim=-1, keepdim=True).sign()
-			flip = torch.where(flip == 0, torch.ones_like(flip), flip)
-			gt_n = gt_n * flip
-
-			# Proxy: model vertex shifted by winding error along GT normal
-			target = xyz_det - err.unsqueeze(-1) * gt_n
+			# Proxy: model vertex shifted by winding error along ext surface normal
+			target = xyz_det - err.unsqueeze(-1) * ext_n
 
 		# L2 loss
 		lm = (res.xyz_lr - target).square().sum(dim=-1).unsqueeze(1)  # (D, 1, Hm, Wm)
