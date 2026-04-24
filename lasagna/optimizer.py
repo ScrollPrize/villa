@@ -517,6 +517,7 @@ def optimize(
 			data = _run_opt(si=si, label=f"stage{si}", stage=stage, opt_cfg=stage.global_opt, data=data)
 
 	if any(_need_term("corr", stage.global_opt.eff) > 0 for stage in stages if stage.global_opt.steps > 0):
+		opt_loss_corr.print_detail("END")
 		opt_loss_corr.print_summary()
 	elif has_corr_pts:
 		print("[optimizer] corr points present but corr weight=0, no corr loss computed", flush=True)

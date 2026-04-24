@@ -328,6 +328,75 @@ def print_summary():
 	print(f"[corr] final: valid={n_valid}/{len(pts)}, rms_err={rms:.4f}")
 
 
+def print_detail(label: str = "") -> None:
+	"""Print per-point corr detail: position, winding obs/target, anchors, validity."""
+	tag = f"[corr-detail] {label}" if label else "[corr-detail]"
+	if _last_results is None:
+		print(f"{tag} no results yet")
+		return
+
+	pts = _last_results.get("points", {})
+	col_avgs = _last_results.get("collection_avgs", {})
+	if not pts:
+		print(f"{tag} no points")
+		return
+
+	print(f"{tag} {len(pts)} points, mode={_corr_mode}")
+
+	# Collection averages
+	for cid, avg in sorted(col_avgs.items(), key=lambda x: int(x[0])):
+		print(f"  collection {cid}: avg_winding={avg}")
+
+	# Per-point table
+	print(f"  {'pid':>6s}  {'col':>4s}  {'pos':>26s}  {'w_obs':>8s}  {'w_tgt':>8s}  {'w_err':>8s}  {'valid':>5s}", end="")
+	# Anchor columns (winding mode only)
+	has_anchors = _wind_anchors_d is not None and _corr_mode == "winding"
+	if has_anchors:
+		print(f"  {'cl_lo':>8s}  {'cl_up':>8s}  {'av_lo':>8s}  {'av_up':>8s}", end="")
+	print()
+
+	# Sort by point ID for stable output
+	sorted_pts = sorted(pts.items(), key=lambda x: int(x[0]))
+	# Build pid -> anchor-row mapping.  _build_winding_results iterates range(K)
+	# using pt_ids[i] as dict key, so insertion order == tensor row order.
+	pid_to_idx: dict[int, int] = {}
+	if has_anchors:
+		for idx, pid in enumerate(pts.keys()):
+			pid_to_idx[int(pid)] = idx
+
+	for pid, p in sorted_pts:
+		pos = p.get("p", [0, 0, 0])
+		pos_s = f"({pos[0]:8.1f},{pos[1]:8.1f},{pos[2]:8.1f})"
+		w_obs = p.get("winding_obs")
+		w_tgt = p.get("winding_target")
+		w_err = p.get("winding_err")
+		valid = p.get("valid", False)
+		print(f"  {pid:>6s}  {p.get('collection_id', '?'):>4}  {pos_s}  "
+			  f"{_fmt(w_obs):>8s}  {_fmt(w_tgt):>8s}  {_fmt(w_err):>8s}  "
+			  f"{'  yes' if valid else '   no':>5s}", end="")
+		if has_anchors:
+			idx = pid_to_idx.get(int(pid))
+			if idx is not None and idx < _wind_anchors_d.shape[0]:
+				for ci in range(4):
+					v = bool(_wind_anchors_valid[idx, ci])
+					if v:
+						d = int(_wind_anchors_d[idx, ci])
+						h = int(_wind_anchors_h[idx, ci])
+						w = int(_wind_anchors_w[idx, ci])
+						print(f"  {d:2d},{h:3d},{w:3d}", end="")
+					else:
+						print(f"  {'---':>8s}", end="")
+			else:
+				print(f"  {'?':>8s}" * 4, end="")
+		print()
+
+
+def _fmt(v) -> str:
+	if v is None:
+		return "---"
+	return f"{v:.4f}"
+
+
 def _build_results(
 	*, obs: torch.Tensor, avg: torch.Tensor, err: torch.Tensor,
 	pt_ids: torch.Tensor, col: torch.Tensor, pts: torch.Tensor,
@@ -1062,24 +1131,24 @@ def _wind_brute_force_init(
 
 	# --- Avg pair anchors from target winding ---
 	target_finite = torch.isfinite(target)
-	avg_lo_d = target.floor().clamp(0, D - 2).long()
+	avg_lo_d = target.floor().clamp(0, max(D - 2, 0)).long()
 	avg_hi_d = (avg_lo_d + 1).clamp(max=D - 1)
 
 	# Find quads on avg layers
 	if target_finite.any():
-		# avg_low
+		# avg_low — always valid if target is finite and layer in range
 		al_h, al_w, _, _ = _wind_nearest_quad_on_layer(P, xyz_det, avg_lo_d, Qh, Qw)
 		anchors_d[:, 2] = avg_lo_d
 		anchors_h[:, 2] = al_h
 		anchors_w[:, 2] = al_w
 		anchors_valid[:, 2] = target_finite & (avg_lo_d >= 0) & (avg_lo_d < D)
 
-		# avg_up
+		# avg_up — only valid if it's a different layer from avg_lo (requires D >= 2)
 		ah_h, ah_w, _, _ = _wind_nearest_quad_on_layer(P, xyz_det, avg_hi_d, Qh, Qw)
 		anchors_d[:, 3] = avg_hi_d
 		anchors_h[:, 3] = ah_h
 		anchors_w[:, 3] = ah_w
-		anchors_valid[:, 3] = target_finite & (avg_hi_d >= 0) & (avg_hi_d < D)
+		anchors_valid[:, 3] = target_finite & (avg_hi_d > avg_lo_d)
 
 	return anchors_d, anchors_h, anchors_w, anchors_valid, target
 
@@ -1167,8 +1236,9 @@ def _wind_update_anchors(
 			anchors_valid[lost, 1] = False
 
 	# Update avg pair layers if target changed
+	D = xyz_det.shape[0]
 	target_finite = torch.isfinite(target)
-	new_avg_lo_d = target.floor().clamp(0, D - 2).long()
+	new_avg_lo_d = target.floor().clamp(0, max(D - 2, 0)).long()
 	new_avg_hi_d = (new_avg_lo_d + 1).clamp(max=D - 1)
 
 	# Re-init avg anchors where layer changed
@@ -1191,7 +1261,7 @@ def _wind_update_anchors(
 		anchors_d[hci, 3] = new_avg_hi_d[hci]
 		anchors_h[hci, 3] = ah_h
 		anchors_w[hci, 3] = ah_w
-		anchors_valid[hci, 3] = True
+		anchors_valid[hci, 3] = (new_avg_hi_d[hci] > new_avg_lo_d[hci])
 
 	# Ensure avg layer values are current even if not changed
 	anchors_d[:, 2] = new_avg_lo_d
@@ -1233,7 +1303,9 @@ def _corr_winding_loss(
 	xyz_lr = res.xyz_lr
 	D, Hm, Wm, _ = xyz_lr.shape
 	Qh, Qw = Hm - 1, Wm - 1
-	if Qh <= 0 or Qw <= 0 or D < 2:
+	if Qh <= 0 or Qw <= 0 or D < 1:
+		if _dbg_call_count <= 2:
+			print(f"[corr-wind] mesh too small D={D} Hm={Hm} Wm={Wm}")
 		z = torch.zeros((), device=dev, dtype=dt)
 		return z, (torch.zeros((1,), device=dev, dtype=dt),), (torch.zeros((1,), device=dev, dtype=dt),)
 
@@ -1422,6 +1494,8 @@ def _corr_winding_loss(
 		err=all_err, pt_ids=pt_ids, col=col, pts=pts, winda=winda,
 		valid=target_finite,
 	)
+	if _dbg_call_count == 1:
+		print_detail("INIT")
 
 	err_sq = all_err * all_err
 	mask_out = target_finite.to(dt)
