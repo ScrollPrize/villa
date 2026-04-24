@@ -131,24 +131,22 @@ def winding_density_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, t
 
 
 def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""External offset loss via quad-corner proxy targets at LR.
+	"""External offset loss via per-ext-corner proxy targets.
 
-	For each model vertex, computes the signed winding error (integral - target),
-	then builds 4 proxy targets at the model position shifted by winding_error
-	along each ext surface quad corner's normal (constant, from ext mesh).
-	Per-corner L2 losses are weighted by bilinear (u, v) fractions.
+	For each ext surface corner, finds the model quad it projects onto,
+	computes the signed winding error (strip integral - target offset),
+	then builds 4 proxy targets at each model quad corner shifted by
+	ext_N * winding_error.  Per-corner L2 losses are weighted by bilinear
+	(u, v) fractions from the ray-quad intersection.
 	"""
 	if res.ext_conn is None or not res.ext_conn:
 		device = res.xyz_lr.device
 		z = torch.zeros((), device=device)
 		return z, (z.unsqueeze(0),), (z.unsqueeze(0),)
 
-	D, Hm, Wm, _ = res.xyz_lr.shape
 	device = res.xyz_lr.device
 	dtype = res.xyz_lr.dtype
 	strip_samples = max(2, int(res.params.subsample_mesh) + 1)
-
-	xyz_det = res.xyz_lr.detach()
 
 	total_loss = torch.zeros((), device=device, dtype=dtype)
 	total_wsum = 0.0
@@ -156,44 +154,64 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 	all_mask = []
 
 	for (ext_mask, offset,
-		 P00, P10, P01, P11,
-		 N00, N10, N01, N11,
+		 M00, M10, M01, M11,
+		 ext_P, ext_N,
 		 u_frac, v_frac) in res.ext_conn:
+		# M00..M11: model quad corners (D, H_ext, W_ext, 3) WITH gradients
+		# ext_P, ext_N: ext corner position/normal (D, H_ext, W_ext, 3) detached
+		D, He, We, _ = M00.shape
+
 		with torch.no_grad():
-			# Bilinear ext surface point (for strip integral)
-			uf = u_frac.unsqueeze(-1)
+			M00_det = M00.detach()
+			M10_det = M10.detach()
+			M01_det = M01.detach()
+			M11_det = M11.detach()
+
+			# Bilinear model point (detached) for strip sampling
+			uf = u_frac.unsqueeze(-1)  # (D, He, We, 1)
 			vf = v_frac.unsqueeze(-1)
-			ext_pt = (1-uf)*(1-vf)*P00 + uf*(1-vf)*P10 + (1-uf)*vf*P01 + uf*vf*P11
+			M_bilin = (1-uf)*(1-vf)*M00_det + uf*(1-vf)*M10_det + (1-uf)*vf*M01_det + uf*vf*M11_det
 
-			# Grad_mag along strip from model to ext surface point
-			diff = ext_pt - xyz_det
+			# Strip: ext_P → M_bilin, sample grad_mag
+			diff = M_bilin - ext_P  # (D, He, We, 3)
 			t = torch.linspace(0.0, 1.0, strip_samples, device=device, dtype=dtype)
-			strip = xyz_det.unsqueeze(-2) + t.view(1, 1, 1, -1, 1) * diff.unsqueeze(-2)
-			strip_flat = strip.reshape(D, Hm, Wm * strip_samples, 3)
+			strip = ext_P.unsqueeze(-2) + t.view(1, 1, 1, -1, 1) * diff.unsqueeze(-2)  # (D, He, We, S, 3)
+			strip_flat = strip.reshape(D, He, We * strip_samples, 3)
 			sampled = res.data.grid_sample_fullres(strip_flat)
-			mag = sampled.grad_mag.squeeze(0).squeeze(0).reshape(D, Hm, Wm, strip_samples)
-			mean_mag = mag.mean(dim=-1).clamp(min=1e-4)
+			mag = sampled.grad_mag.squeeze(0).squeeze(0).reshape(D, He, We, strip_samples)
+			mean_mag = mag.mean(dim=-1).clamp(min=1e-4)  # (D, He, We)
 
-			# Strip validity
+			# Strip validity: all sample points must have grad_mag > 0
 			sv = (sampled.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=dtype)
-			sv = sv.reshape(D, Hm, Wm, strip_samples).amin(dim=-1)
-			mask = (ext_mask.squeeze(1) * sv).unsqueeze(1)  # (D, 1, Hm, Wm)
+			sv = sv.reshape(D, He, We, strip_samples).amin(dim=-1)
+			mask = (ext_mask.squeeze(1) * sv).unsqueeze(1)  # (D, 1, He, We)
 
-			# Signed winding integral: positive on +normal side, negative on -normal side
-			strip_len = torch.sqrt((diff * diff).sum(dim=-1) + 1e-12)
-			ext_n = (1-uf)*(1-vf)*N00 + uf*(1-vf)*N10 + (1-uf)*vf*N01 + uf*vf*N11
-			side = ((xyz_det - ext_pt) * ext_n).sum(dim=-1).sign()
-			side = torch.where(side == 0, torch.ones_like(side), side)
-			signed_integral = mean_mag * strip_len * side
+			# Signed winding distance: (M_bilin - ext_P) · ext_N * mean_mag
+			signed_normal_disp = ((M_bilin - ext_P) * ext_N).sum(dim=-1)  # voxels
+			signed_windings = signed_normal_disp * mean_mag  # windings
 
-			# Winding error: how many windings off from target
-			err = signed_integral - offset  # positive = too far on +n side
+			# Winding error
+			winding_err = signed_windings - offset  # (D, He, We)
 
-			# Proxy: model vertex shifted by winding error along ext surface normal
-			target = xyz_det - err.unsqueeze(-1) * ext_n
+			# 4 proxies: model quad corner + ext_N * winding_err (shared N, shared error)
+			we = winding_err.unsqueeze(-1)  # (D, He, We, 1)
+			proxy00 = M00_det + ext_N * we
+			proxy10 = M10_det + ext_N * we
+			proxy01 = M01_det + ext_N * we
+			proxy11 = M11_det + ext_N * we
 
-		# L2 loss
-		lm = (res.xyz_lr - target).square().sum(dim=-1).unsqueeze(1)  # (D, 1, Hm, Wm)
+		# 4 weighted L2 losses (M_i has gradients, proxy_i detached)
+		w00 = ((1 - u_frac) * (1 - v_frac)).unsqueeze(1)  # (D, 1, He, We)
+		w10 = (u_frac * (1 - v_frac)).unsqueeze(1)
+		w01 = ((1 - u_frac) * v_frac).unsqueeze(1)
+		w11 = (u_frac * v_frac).unsqueeze(1)
+
+		lm00 = (M00 - proxy00).square().sum(dim=-1).unsqueeze(1)  # (D, 1, He, We)
+		lm10 = (M10 - proxy10).square().sum(dim=-1).unsqueeze(1)
+		lm01 = (M01 - proxy01).square().sum(dim=-1).unsqueeze(1)
+		lm11 = (M11 - proxy11).square().sum(dim=-1).unsqueeze(1)
+
+		lm = w00 * lm00 + w10 * lm10 + w01 * lm01 + w11 * lm11  # (D, 1, He, We)
 
 		wsum = float(mask.sum().detach().cpu())
 		if wsum > 0.0:

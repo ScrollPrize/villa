@@ -11,7 +11,7 @@
 		"pred_dt": 0.001,
 		"corr": 0.1,
 		"bend": 100.0,
-		"ext_offset": 0.01
+		"ext_offset": 0.0001
 	},
 	"stages": [
 		{
