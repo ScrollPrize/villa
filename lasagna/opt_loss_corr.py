@@ -27,6 +27,7 @@ _wind_anchors_w: torch.Tensor | None = None      # (K, 4) int — quad col
 _wind_anchors_valid: torch.Tensor | None = None   # (K, 4) bool — per-anchor validity
 _wind_initialized: bool = False
 _wind_target_per_point: torch.Tensor | None = None  # (K,) float — cached target winding
+_wind_obs_per_point: torch.Tensor | None = None      # (K,) float — last raw winding observation
 
 
 def set_corr_mode(mode: str) -> None:
@@ -973,7 +974,7 @@ def _wind_brute_force_init(
 	data: fit_data.FitData3D,
 	strip_samples: int,
 	Qh: int, Qw: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
 	"""Brute-force init: bracket search, winding observation, collection avg, avg pair.
 
 	Returns: (anchors_d, anchors_h, anchors_w, anchors_valid, target_per_point)
@@ -1159,7 +1160,7 @@ def _wind_brute_force_init(
 		anchors_w[:, 3] = ah_w
 		anchors_valid[:, 3] = target_finite & (avg_hi_d > avg_lo_d)
 
-	return anchors_d, anchors_h, anchors_w, anchors_valid, target
+	return anchors_d, anchors_h, anchors_w, anchors_valid, target, winding_obs
 
 
 def _wind_update_anchors(
@@ -1289,6 +1290,7 @@ def _corr_winding_loss(
 	global _dbg_call_count, _last_results
 	global _wind_anchors_d, _wind_anchors_h, _wind_anchors_w
 	global _wind_anchors_valid, _wind_initialized, _wind_target_per_point
+	global _wind_obs_per_point
 
 	_dbg_call_count += 1
 	dbg = (_dbg_call_count <= 2)
@@ -1335,7 +1337,7 @@ def _corr_winding_loss(
 		with torch.no_grad():
 			(
 				_wind_anchors_d, _wind_anchors_h, _wind_anchors_w,
-				_wind_anchors_valid, _wind_target_per_point,
+				_wind_anchors_valid, _wind_target_per_point, _wind_obs_per_point,
 			) = _wind_brute_force_init(
 				P, gt_n, winda, col, xyz_det, res.normals, res.data, strip_samples, Qh, Qw)
 		_wind_initialized = True
@@ -1401,6 +1403,7 @@ def _corr_winding_loss(
 				obs_valid[si] = sv & (uw < 1.0)
 
 			# Phase B: Collection averaging
+			_wind_obs_per_point = winding_obs.clone()
 			_wind_target_per_point = _wind_collection_average(
 				winding_obs, winda, col, obs_valid)
 
@@ -1508,7 +1511,7 @@ def _corr_winding_loss(
 
 	# Build results
 	_last_results = _build_winding_results(
-		winding_obs=_wind_target_per_point, target=target,
+		winding_obs=_wind_obs_per_point, target=target,
 		err=all_err, pt_ids=pt_ids, col=col, pts=pts, winda=winda,
 		valid=target_finite,
 	)
