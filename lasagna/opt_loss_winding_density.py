@@ -189,13 +189,26 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 			# Winding error: how many windings off from target
 			err = signed_integral - offset  # positive = too far on +n side
 
-			# Proxy per corner: model shifted by winding error along ext normal.
-			# err already signed via signed_integral — no extra side multiply.
+			# Sample GT normal at intersection point, align with ext surface normal
+			gt_sampled = res.data.grid_sample_fullres(ext_pt)
+			gt_nx = gt_sampled.nx.squeeze(0).permute(1, 0, 2, 3)  # (D, 1, Hm, Wm) → need (D, Hm, Wm)
+			gt_ny = gt_sampled.ny.squeeze(0).permute(1, 0, 2, 3)
+			gt_nx = gt_nx.squeeze(1)  # (D, Hm, Wm)
+			gt_ny = gt_ny.squeeze(1)
+			gt_nz = torch.sqrt((1.0 - gt_nx * gt_nx - gt_ny * gt_ny).clamp(min=0.0))
+			gt_n = torch.stack([gt_nx, gt_ny, gt_nz], dim=-1)  # (D, Hm, Wm, 3)
+			gt_n = gt_n / (gt_n.norm(dim=-1, keepdim=True) + 1e-8)
+			# Flip GT normal to align with ext surface normal
+			flip = (gt_n * ext_n).sum(dim=-1, keepdim=True).sign()
+			flip = torch.where(flip == 0, torch.ones_like(flip), flip)
+			gt_n = gt_n * flip
+
+			# Proxy per corner: model shifted by winding error along GT normal
 			e = err.unsqueeze(-1)  # (D, Hm, Wm, 1)
-			proxy00 = xyz_det - e * N00
-			proxy10 = xyz_det - e * N10
-			proxy01 = xyz_det - e * N01
-			proxy11 = xyz_det - e * N11
+			proxy00 = P00 - e * gt_n
+			proxy10 = P10 - e * gt_n
+			proxy01 = P01 - e * gt_n
+			proxy11 = P11 - e * gt_n
 
 			# Bilinear weights from intersection position within quad
 			w00 = ((1 - u_frac) * (1 - v_frac)).unsqueeze(-1)  # (D, Hm, Wm, 1)
