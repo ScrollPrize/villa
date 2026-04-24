@@ -187,11 +187,16 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 			sv = sv.reshape(D, He, We, strip_samples).amin(dim=-1)
 			mask = (ext_mask.squeeze(1) * sv).unsqueeze(1)  # (D, 1, He, We)
 
-			# Signed winding distance: (M_bilin - ext_P) · ext_N * mean_mag
-			signed_normal_disp = ((M_bilin - ext_P) * ext_N).sum(dim=-1)  # voxels
-			signed_windings = signed_normal_disp * mean_mag  # windings
+			# Sign: which side of ext surface (+1 or -1), from normal projection
+			signed_normal_disp = ((M_bilin - ext_P) * ext_N).sum(dim=-1)
+			int_sign = torch.sign(signed_normal_disp)
 
-			# Winding error
+			# Magnitude: unsigned winding count from strip integral
+			strip_len = diff.square().sum(dim=-1).sqrt().clamp(min=1e-8)
+			unsigned_windings = strip_len * mean_mag
+
+			# Signed windings: sign from intersection, magnitude from integral
+			signed_windings = int_sign * unsigned_windings
 			winding_err = signed_windings - offset  # (D, He, We)
 
 			# 4 proxies: model quad corner - ext_N * winding_err (shared N, shared error)
