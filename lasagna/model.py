@@ -38,10 +38,11 @@ class FitResult3D:
 	mask_conn: torch.Tensor     # (D, 1, Hm, Wm, 3) — validity per connection point
 	sign_conn: torch.Tensor     # (D, 1, Hm, Wm, 2) — ray param sign [prev, next]
 	params: ModelParams3D
+	gt_normal_lr: torch.Tensor | None = None  # (D, Hm, Wm, 3) GT unit normals at LR mesh positions
 	ext_conn: list | None = None
-	# Per ext surface: (mask, offset, M00, M10, M01, M11, ext_P, ext_N, u, v)
-	# M00..M11 = model quad corners (with gradients), ext_P/ext_N = ext corner pos/normal (detached)
-	# Shapes: (D, H_ext, W_ext, ...) — indexed per ext surface corner
+	# Per ext surface: (mask, offset, M00..M11, ext_P, ext_N, u, v, nM00..nM11)
+	# M00..M11 = model quad corners (with gradients), nM00..nM11 = GT normals at corners (detached)
+	# ext_P/ext_N = ext corner pos/normal (detached). Shapes: (D, H_ext, W_ext, ...)
 
 
 class Model3D(nn.Module):
@@ -756,17 +757,18 @@ class Model3D(nn.Module):
 			winding_step=winding_step, subsample_mesh=subsample_mesh,
 			subsample_winding=subsample_winding)
 
-	def _intersect_ext_surfaces(self, xyz_lr: torch.Tensor, data: fit_data.FitData3D
-							   ) -> list | None:
+	def _intersect_ext_surfaces(self, xyz_lr: torch.Tensor, data: fit_data.FitData3D,
+							   gt_normal_lr: torch.Tensor | None = None) -> list | None:
 		"""Intersect ext surface corners with model quads.
 
 		For each ext surface corner, use stored per-corner offset to find the
 		corresponding model quad, then ray-bilinear-patch intersect to get precise
 		(u, v) within that model quad.
 
-		Returns list of (mask, offset, M00, M10, M01, M11, ext_P, ext_N, u, v)
+		Returns list of (mask, offset, M00..M11, ext_P, ext_N, u, v, nM00..nM11)
 		per surface, with shapes (D, H_ext, W_ext, ...).
-		M00..M11 have gradients (indexed from xyz_lr). ext_P, ext_N are detached.
+		M00..M11 have gradients (indexed from xyz_lr). nM00..nM11 are GT normals
+		at the corresponding model quad corners (detached). ext_P, ext_N are detached.
 		"""
 		if not self._ext_surfaces:
 			return None
@@ -790,8 +792,8 @@ class Model3D(nn.Module):
 			model_h = r_idx + h_off  # (D, H_ext, W_ext) — unclamped
 			model_w = c_idx + w_off
 
-			# In-bounds mask (before clamping)
-			in_bounds = (model_h >= 0) & (model_h <= Hm - 1) & (model_w >= 0) & (model_w <= Wm - 1)
+			# In-bounds mask (before clamping) — strict: need valid quad at (row, row+1)
+			in_bounds = (model_h >= 0) & (model_h < Hm - 1) & (model_w >= 0) & (model_w < Wm - 1)
 
 			# Clamp for safe indexing (clamped entries will be masked out)
 			model_h_c = model_h.clamp(0, Hm - 1)
@@ -808,6 +810,16 @@ class Model3D(nn.Module):
 			M10 = xyz_lr[d_idx, row + 1, col]
 			M01 = xyz_lr[d_idx, row, col + 1]
 			M11 = xyz_lr[d_idx, row + 1, col + 1]
+
+			# Gather GT normals at model quad corners (detached)
+			if gt_normal_lr is not None:
+				nM00 = gt_normal_lr[d_idx, row, col]          # (D, H_ext, W_ext, 3)
+				nM10 = gt_normal_lr[d_idx, row + 1, col]
+				nM01 = gt_normal_lr[d_idx, row, col + 1]
+				nM11 = gt_normal_lr[d_idx, row + 1, col + 1]
+			else:
+				z = torch.zeros(D, H_ext, W_ext, 3, device=device, dtype=xyz_lr.dtype)
+				nM00 = nM10 = nM01 = nM11 = z
 
 			# Ext corner position and normal (detached, frozen)
 			ext_norms = self._ext_normals[ei]  # (H_ext, W_ext, 3)
@@ -879,6 +891,7 @@ class Model3D(nn.Module):
 				M00, M10, M01, M11,
 				ext_P.detach(), ext_N.detach(),
 				u.detach(), v.detach(),
+				nM00.detach(), nM10.detach(), nM01.detach(), nM11.detach(),
 			))
 
 		return results
@@ -913,12 +926,14 @@ class Model3D(nn.Module):
 			amp_lr = self.amp.clamp(0.1, 1.0)
 			bias_lr = self.bias.clamp(0.0, 0.45)
 
-		# Masking via grad_mag > 0
+		# Masking via grad_mag > 0 + GT normals at LR positions
+		data_lr = data.grid_sample_fullres(xyz_lr.detach())
 		mask_hr = (data.grid_sample_fullres(xyz_hr.detach()).grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
-		mask_lr = (data.grid_sample_fullres(xyz_lr.detach()).grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
+		mask_lr = (data_lr.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
+		gt_normal_lr = data_lr.normal_3d  # (D, Hm, Wm, 3) or None
 
 		# External surface intersections
-		ext_conn = self._intersect_ext_surfaces(xyz_lr, data)
+		ext_conn = self._intersect_ext_surfaces(xyz_lr, data, gt_normal_lr=gt_normal_lr)
 
 		return FitResult3D(
 			xyz_lr=xyz_lr,
@@ -936,6 +951,7 @@ class Model3D(nn.Module):
 			mask_conn=mask_conn,
 			sign_conn=sign_conn,
 			params=self.params,
+			gt_normal_lr=gt_normal_lr,
 			ext_conn=ext_conn,
 		)
 

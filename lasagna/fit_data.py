@@ -43,6 +43,17 @@ class FitData3D:
 		_, _, z, y, x = self.grad_mag.shape
 		return int(z), int(y), int(x)
 
+	@property
+	def normal_3d(self) -> torch.Tensor | None:
+		"""(D, H, W, 3) unit normals from hemisphere-encoded (nx, ny). nz >= 0."""
+		if self.nx is None:
+			return None
+		nx = self.nx.squeeze(0).squeeze(0)  # (D, H, W)
+		ny = self.ny.squeeze(0).squeeze(0)
+		nz = torch.sqrt(torch.clamp(1.0 - nx * nx - ny * ny, min=1e-8))
+		n = torch.stack([nx, ny, nz], dim=-1)  # (D, H, W, 3)
+		return n / (n.norm(dim=-1, keepdim=True) + 1e-8)
+
 	def _spacing_for(self, channel: str) -> tuple[float, float, float]:
 		"""Return spacing for a specific channel."""
 		if self.channel_spacing and channel in self.channel_spacing:
