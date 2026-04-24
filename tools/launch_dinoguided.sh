@@ -23,6 +23,9 @@ cd "$WORKTREE"
 
 nohup env \
     CUDA_VISIBLE_DEVICES=4,5,6,7 \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    OPENBLAS_NUM_THREADS=1 \
     PYTHONPATH="$WORKTREE/vesuvius/src:$WORKTREE/ink-detection" \
     "$VENV/bin/torchrun" \
         --nproc_per_node=4 --standalone --master_port=29517 \
