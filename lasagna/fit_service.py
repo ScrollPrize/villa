@@ -405,6 +405,13 @@ def _run_optimization(body: dict[str, Any]) -> None:
                     if dst.exists():
                         _shutil.rmtree(dst)
                     _shutil.move(str(p), str(dst))
+                    # Update UUID in meta.json to match the new directory name
+                    _meta_path = dst / "meta.json"
+                    if _meta_path.exists():
+                        import json as _json
+                        _meta = _json.loads(_meta_path.read_text(encoding="utf-8"))
+                        _meta["uuid"] = dst_name
+                        _meta_path.write_text(_json.dumps(_meta, indent=2) + "\n", encoding="utf-8")
                 print(f"[fit-service] windowed mode: moved {len(_window_tifxyz)} "
                       f"window tifxyz to {output_dir}", flush=True)
             else:

@@ -4,7 +4,7 @@
 		"step": 10.0,
 		"smooth": 0.0001,
 		"station_n": 0.0,
-		"station_t": 0.001,
+		"station_t": 0.01,
 		"winding_density": 1.0,
 		"data": 0.0,
 		"data_plain": 0.0,
