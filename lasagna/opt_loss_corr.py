@@ -969,6 +969,7 @@ def _wind_brute_force_init(
 	winda: torch.Tensor,          # (K,)
 	col: torch.Tensor,            # (K,) int
 	xyz_det: torch.Tensor,        # (D, Hm, Wm, 3)
+	normals: torch.Tensor,        # (D, Hm, Wm, 3) — model surface normals
 	data: fit_data.FitData3D,
 	strip_samples: int,
 	Qh: int, Qw: int,
@@ -1117,11 +1118,17 @@ def _wind_brute_force_init(
 
 		P_s = P[single]
 		gt_n_s = gt_n[single]
-		sw, uw, sv = _wind_strip_integral(P_s, Q_s, gt_n_s, data, strip_samples)
-		# Sign: if Q is below P (sw < 0), surface is below → winding = d + integral
-		# If Q is above P (sw > 0), surface is above → winding = d - integral
-		above = sw > 0  # surface is above P
-		w_est = torch.where(above, d_s.to(dt) - uw, d_s.to(dt) + uw)
+		_, uw, sv = _wind_strip_integral(P_s, Q_s, gt_n_s, data, strip_samples)
+		# Use model surface normal at Q to determine sign consistently
+		n00 = normals[d_s, h_s, w_s]
+		n10 = normals[d_s, (h_s + 1).clamp(max=Qh), w_s]
+		n01 = normals[d_s, h_s, (w_s + 1).clamp(max=Qw)]
+		n11 = normals[d_s, (h_s + 1).clamp(max=Qh), (w_s + 1).clamp(max=Qw)]
+		surf_n = _bilinear_interp(n00, n10, n01, n11, u_s, v_s)
+		surf_n = surf_n / (surf_n.norm(dim=-1, keepdim=True) + 1e-8)
+		# dot(P - Q, surf_n) > 0 → P is above surface (in normal direction)
+		above = ((P_s - Q_s) * surf_n).sum(dim=-1) > 0
+		w_est = torch.where(above, d_s.to(dt) + uw, d_s.to(dt) - uw)
 		valid_single = sv & (uw < 1.0)
 		winding_obs[single] = w_est
 		obs_valid[single] = valid_single
@@ -1330,7 +1337,7 @@ def _corr_winding_loss(
 				_wind_anchors_d, _wind_anchors_h, _wind_anchors_w,
 				_wind_anchors_valid, _wind_target_per_point,
 			) = _wind_brute_force_init(
-				P, gt_n, winda, col, xyz_det, res.data, strip_samples, Qh, Qw)
+				P, gt_n, winda, col, xyz_det, res.normals, res.data, strip_samples, Qh, Qw)
 		_wind_initialized = True
 	else:
 		# Phase A: Winding observation (closest pair, detached)
@@ -1379,9 +1386,17 @@ def _corr_winding_loss(
 				v11 = xyz_det[d_s, (h_s + 1).clamp(max=Qh), (w_s + 1).clamp(max=Qw)]
 				u_c, v_c = _bilinear_project(P[si], v00, v10, v01, v11)
 				Q_s = _bilinear_interp(v00, v10, v01, v11, u_c, v_c)
-				sw, uw, sv = _wind_strip_integral(P[si], Q_s, gt_n[si], res.data, strip_samples)
-				above = sw > 0
-				w_est = torch.where(above, d_s.to(dt) - uw, d_s.to(dt) + uw)
+				_, uw, sv = _wind_strip_integral(P[si], Q_s, gt_n[si], res.data, strip_samples)
+				# Use model surface normal at Q for consistent sign
+				mesh_normals = res.normals
+				n00 = mesh_normals[d_s, h_s, w_s]
+				n10 = mesh_normals[d_s, (h_s + 1).clamp(max=Qh), w_s]
+				n01 = mesh_normals[d_s, h_s, (w_s + 1).clamp(max=Qw)]
+				n11 = mesh_normals[d_s, (h_s + 1).clamp(max=Qh), (w_s + 1).clamp(max=Qw)]
+				surf_n = _bilinear_interp(n00, n10, n01, n11, u_c, v_c)
+				surf_n = surf_n / (surf_n.norm(dim=-1, keepdim=True) + 1e-8)
+				above = ((P[si] - Q_s) * surf_n).sum(dim=-1) > 0
+				w_est = torch.where(above, d_s.to(dt) + uw, d_s.to(dt) - uw)
 				winding_obs[si] = w_est
 				obs_valid[si] = sv & (uw < 1.0)
 
