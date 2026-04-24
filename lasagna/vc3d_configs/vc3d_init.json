@@ -36,16 +36,6 @@
 			"w_fac": {
 				"pred_dt": 0.0
 			}
-		},
-		{
-			"name": "snap",
-			"steps": 0,
-			"min_scaledown": 0,
-			"lr": [10.0, 1.0, 0.1, 0.01, 0.001],
-			"params": ["mesh_ms"],
-			"w_fac": {
-				"pred_dt": 0.0
-			}
 		}
 	]
 }

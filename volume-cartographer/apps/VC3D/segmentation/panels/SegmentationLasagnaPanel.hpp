@@ -2,11 +2,7 @@
 
 #include <QWidget>
 
-#include <array>
-
 #include "utils/Json.hpp"
-
-class QCheckBox;
 
 class CollapsibleSettingsGroup;
 class QComboBox;
@@ -38,8 +34,7 @@ public:
     explicit SegmentationLasagnaPanel(const QString& settingsGroup,
                                             QWidget* parent = nullptr);
 
-    /** 0 = Re-optimize, 1 = New Model, 2 = Expand */
-    enum LasagnaMode { ReOptimize = 0, NewModel = 1, Expand = 2, Offset = 3 };
+    enum LasagnaMode { ReOptimize = 0, NewModel = 1, Offset = 3 };
 
     // Getters
     [[nodiscard]] QString lasagnaDataInputPath() const { return _lasagnaDataInputPath; }
@@ -76,7 +71,6 @@ private:
     void populateConfigCombo(QComboBox* combo, const QString& dir,
                              const QString& selectName, QString& outPath,
                              bool growOnly = false);
-    static bool jsonHasGrowStage(const QString& filePath);
     void onConnectionModeChanged(int index);
     void refreshDiscoveredServices();
     void onDiscoveredServiceSelected(int index);
@@ -87,7 +81,6 @@ private:
     CollapsibleSettingsGroup* _connectionGroup{nullptr};
     CollapsibleSettingsGroup* _newModelGroup{nullptr};
     CollapsibleSettingsGroup* _reoptGroup{nullptr};
-    CollapsibleSettingsGroup* _expandGroup{nullptr};
     CollapsibleSettingsGroup* _offsetGroup{nullptr};
 
     // Connection mode
@@ -115,18 +108,11 @@ private:
     QPushButton* _seedFromFocusBtn{nullptr};
     QLineEdit* _outputNameEdit{nullptr};
 
-    // Expand settings — 6 direction checkboxes: W+, W-, +V, -V, +Z, -Z
-    static constexpr int kExpandDirCount = 6;
-    std::array<QCheckBox*, kExpandDirCount> _expandDirChecks{};
-    QSpinBox* _expandGenSpin{nullptr};
-
     // Config combos (one per section)
     QComboBox* _newModelConfigCombo{nullptr};
     QToolButton* _newModelConfigBrowse{nullptr};
     QComboBox* _reoptConfigCombo{nullptr};
     QToolButton* _reoptConfigBrowse{nullptr};
-    QComboBox* _expandConfigCombo{nullptr};
-    QToolButton* _expandConfigBrowse{nullptr};
     QComboBox* _offsetConfigCombo{nullptr};
     QToolButton* _offsetConfigBrowse{nullptr};
     QDoubleSpinBox* _offsetValueSpin{nullptr};
@@ -136,7 +122,6 @@ private:
     // Action buttons
     QPushButton* _newModelBtn{nullptr};
     QPushButton* _reoptBtn{nullptr};
-    QPushButton* _expandBtn{nullptr};
     QPushButton* _offsetBtn{nullptr};
     QPushButton* _stopBtn{nullptr};
     QPushButton* _stopServiceBtn{nullptr};
@@ -147,7 +132,6 @@ private:
     QString _lasagnaDataInputPath;
     QString _newModelConfigFilePath;
     QString _reoptConfigFilePath;
-    QString _expandConfigFilePath;
     QString _offsetConfigFilePath;
 
     int _lasagnaMode{0};         // 0=re-optimize, 1=new model, 2=expand, 3=offset
