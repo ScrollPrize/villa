@@ -133,10 +133,10 @@ def winding_density_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, t
 def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	"""External offset loss via quad-corner proxy targets at LR.
 
-	For each model vertex, builds proxy points at the 4 corners of the
-	intersected ext surface quad, offset along each corner's fixed normal
-	by (offset / mean_grad_mag).  Bilinearly interpolates using (u, v).
-	No sign computation — offset sign determines the side.
+	For each model vertex, computes the signed winding error (integral - target),
+	then builds 4 proxy targets at the model position shifted by winding_error
+	along each ext surface quad corner's normal (constant, from ext mesh).
+	Per-corner L2 losses are weighted by bilinear (u, v) fractions.
 	"""
 	if res.ext_conn is None or not res.ext_conn:
 		device = res.xyz_lr.device
@@ -179,19 +179,36 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 			sv = sv.reshape(D, Hm, Wm, strip_samples).amin(dim=-1)
 			mask = (ext_mask.squeeze(1) * sv).unsqueeze(1)  # (D, 1, Hm, Wm)
 
-			# Proxy at each quad corner: corner + (offset / mean_mag) * corner_normal
-			d = (offset / mean_mag).unsqueeze(-1)  # (D, Hm, Wm, 1)
-			proxy00 = P00 + d * N00
-			proxy10 = P10 + d * N10
-			proxy01 = P01 + d * N01
-			proxy11 = P11 + d * N11
+			# Signed winding integral: positive on +normal side, negative on -normal side
+			strip_len = torch.sqrt((diff * diff).sum(dim=-1) + 1e-12)
+			ext_n = (1-uf)*(1-vf)*N00 + uf*(1-vf)*N10 + (1-uf)*vf*N01 + uf*vf*N11
+			side = ((xyz_det - ext_pt) * ext_n).sum(dim=-1).sign()
+			side = torch.where(side == 0, torch.ones_like(side), side)
+			signed_integral = mean_mag * strip_len * side
 
-			# Bilinear interpolation of proxy points
-			target = ((1-uf)*(1-vf)*proxy00 + uf*(1-vf)*proxy10
-					 + (1-uf)*vf*proxy01 + uf*vf*proxy11)
+			# Winding error: how many windings off from target
+			err = signed_integral - offset  # positive = too far on +n side
 
-		# L2 loss
-		lm = (res.xyz_lr - target).square().sum(dim=-1).unsqueeze(1)  # (D, 1, Hm, Wm)
+			# Proxy per corner: model shifted by winding error along ext normal.
+			# err already signed via signed_integral — no extra side multiply.
+			e = err.unsqueeze(-1)  # (D, Hm, Wm, 1)
+			proxy00 = xyz_det - e * N00
+			proxy10 = xyz_det - e * N10
+			proxy01 = xyz_det - e * N01
+			proxy11 = xyz_det - e * N11
+
+			# Bilinear weights from intersection position within quad
+			w00 = ((1 - u_frac) * (1 - v_frac)).unsqueeze(-1)  # (D, Hm, Wm, 1)
+			w10 = (u_frac * (1 - v_frac)).unsqueeze(-1)
+			w01 = ((1 - u_frac) * v_frac).unsqueeze(-1)
+			w11 = (u_frac * v_frac).unsqueeze(-1)
+
+		# Weighted sum of per-corner L2 losses
+		d00 = (res.xyz_lr - proxy00).square().sum(dim=-1, keepdim=True)
+		d10 = (res.xyz_lr - proxy10).square().sum(dim=-1, keepdim=True)
+		d01 = (res.xyz_lr - proxy01).square().sum(dim=-1, keepdim=True)
+		d11 = (res.xyz_lr - proxy11).square().sum(dim=-1, keepdim=True)
+		lm = (w00 * d00 + w10 * d10 + w01 * d01 + w11 * d11).permute(0, 3, 1, 2)  # (D, 1, Hm, Wm)
 
 		wsum = float(mask.sum().detach().cpu())
 		if wsum > 0.0:
