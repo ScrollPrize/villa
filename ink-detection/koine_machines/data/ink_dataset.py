@@ -21,6 +21,7 @@ from koine_machines.common.common import (
     save_flat_patch_cache,
 )
 from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
+from vesuvius.models.augmentation.transforms.utils.compose import ComposeTransforms
 from vesuvius.image_proc.intensity.normalization import normalize_robust
 import vesuvius.tifxyz as tifxyz
 from koine_machines.data.patch import Patch
@@ -42,6 +43,37 @@ from koine_machines.data.segment import Segment
 
 
 _FULL_3D_SINGLE_WRAP_MODE = "full_3d_single_wrap"
+
+
+_GEOMETRIC_TRANSFORM_KEYWORDS = (
+    'Rot90', 'Mirror', 'Spatial', 'Affine', 'Elastic', 'CropPad', 'Resize',
+)
+
+
+def _is_geometric_transform(t) -> bool:
+    """True iff the transform only changes spatial layout (no intensity change).
+
+    Walks RandomTransform / OneOfTransform wrappers. A OneOf is geometric only
+    if every branch is geometric — mixed groups fall to the photometric side
+    so the label-generation image stays free of any intensity perturbation.
+    """
+    name = type(t).__name__
+    if any(k in name for k in _GEOMETRIC_TRANSFORM_KEYWORDS):
+        return True
+    inner = getattr(t, 'transform', None)
+    if inner is not None:
+        return _is_geometric_transform(inner)
+    list_of = getattr(t, 'list_of_transforms', None)
+    if list_of:
+        return all(_is_geometric_transform(s) for s in list_of)
+    return False
+
+
+def _split_augmentations_by_geometry(compose: ComposeTransforms):
+    geo, photo = [], []
+    for t in compose.transforms:
+        (geo if _is_geometric_transform(t) else photo).append(t)
+    return ComposeTransforms(geo), ComposeTransforms(photo)
 _FULL_3D_LIKE_MODES = {"full_3d", _FULL_3D_SINGLE_WRAP_MODE}
 _NATIVE_3D_MODES = {"normal_pooled_3d", *_FULL_3D_LIKE_MODES}
 _REMOTE_VOLUME_PREFIXES = ("s3://", "http://", "https://")
@@ -1341,6 +1373,21 @@ class InkDataset(Dataset):
         else:
             self.augmentations = None
 
+        # When the trainer feeds the augmented image through DINO+UNet to make
+        # pseudo-labels, photometric augs perturb DINO features. Split the
+        # pipeline so we can snapshot a photometrically-clean (but geometrically
+        # transformed) image as `image_for_label`.
+        self._emit_image_for_label = bool(
+            (config.get('dynamic_label') or {}).get('enabled', False)
+        ) and self.do_augmentations and self.augmentations is not None
+        if self._emit_image_for_label:
+            self._geometric_augmentations, self._photometric_augmentations = (
+                _split_augmentations_by_geometry(self.augmentations)
+            )
+        else:
+            self._geometric_augmentations = None
+            self._photometric_augmentations = None
+
         if patches is None:
             segments = list(self._gather_segments())
             self.segments = segments
@@ -1967,6 +2014,17 @@ class InkDataset(Dataset):
 
             if resample_idx is None:
                 image_crop = image_crop.astype(np.float32, copy=False)
+
+                # Capture an input mask BEFORE normalization, in raw-image units
+                # (e.g. uint8 0-255). Used by the dynamic-label generator to
+                # zero out UNet predictions over background voxels.
+                image_mask_for_label_np = None
+                if self._emit_image_for_label:
+                    mask_threshold = float(
+                        (self.config.get('dynamic_label') or {}).get('input_mask_threshold', 50.0)
+                    )
+                    image_mask_for_label_np = (image_crop > mask_threshold).astype(np.float32)
+
                 if image_valid_slices is not None:
                     image_crop[image_valid_slices] = _normalize_image_crop(
                         image_crop[image_valid_slices],
@@ -2007,6 +2065,9 @@ class InkDataset(Dataset):
                 if use_surface_mask and surface_mask is not None:
                     data['surface_mask'] = torch.from_numpy(surface_mask).float().unsqueeze(0)
 
+                if image_mask_for_label_np is not None:
+                    data['image_mask_for_label'] = torch.from_numpy(image_mask_for_label_np).float().unsqueeze(0)
+
                 if self.do_augmentations and self.augmentations is not None:
                     if self.mode == "normal_pooled_3d":
                         augmentation_data, flat_valid_mask = _pack_normal_pooled_augmentation_data(data)
@@ -2017,9 +2078,22 @@ class InkDataset(Dataset):
                         if _is_full_3d_like_mode(self.mode) and 'surface_mask' in data:
                             augmentation_data = dict(data)
                             augmentation_data['regression_keys'] = ['surface_mask']
-                        result = self.augmentations(**augmentation_data)
+                        if self._emit_image_for_label:
+                            after_geo = self._geometric_augmentations(**augmentation_data)
+                            image_for_label = after_geo['image'].clone()
+                            mask_for_label = after_geo.pop('image_mask_for_label', None)
+                            result = self._photometric_augmentations(**after_geo)
+                            result['image_for_label'] = image_for_label
+                            if mask_for_label is not None:
+                                # Re-binarize after geometric augs in case any
+                                # interpolation produced fractional values.
+                                result['image_mask_for_label'] = (mask_for_label > 0.5).float()
+                        else:
+                            result = self.augmentations(**augmentation_data)
                 else:
                     result = data
+                    if image_mask_for_label_np is not None:
+                        result['image_mask_for_label'] = (data['image_mask_for_label'] > 0.5).float()
 
             if resample_idx is not None:
                 warnings.warn(

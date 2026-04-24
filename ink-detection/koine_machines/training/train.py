@@ -133,11 +133,16 @@ def _apply_cucim_label_dilation(batch, label_dilation_distance, supervision_dila
 def _apply_dynamic_label_substitution(batch, generator):
     """Replace batch['inklabels'] with DINO-guided pseudo-labels.
 
-    Labels are computed from batch['image'] (already augmented by the dataset
-    workers). supervision_mask is intentionally left untouched so the loss is
-    still gated by the wrap region from the on-disk supervision masks.
+    Labels are computed from batch['image_for_label'] when available (the
+    photometrically-clean but geometrically-augmented image emitted by
+    InkDataset), falling back to batch['image']. When batch['image_mask_for_label']
+    is present, it is forwarded to the generator and multiplied into UNet
+    predictions to suppress background voxels. supervision_mask is left
+    untouched so the loss is still gated by the wrap region.
     """
-    new_labels = generator.generate(batch['image'])
+    image_for_label = batch.get('image_for_label', batch['image'])
+    mask_for_label = batch.get('image_mask_for_label', None)
+    new_labels = generator.generate(image_for_label, mask_b1zyx=mask_for_label)
     batch['inklabels'] = new_labels.to(dtype=batch['inklabels'].dtype)
 
 
@@ -567,8 +572,27 @@ def train(config_path):
         except StopIteration:
             train_iterator = iter(train_dl)
             batch = next(train_iterator)
+        dynamic_label_debug_payload = None
         if dynamic_label_generator is not None:
-            _apply_dynamic_label_substitution(batch, dynamic_label_generator)
+            step_will_validate = (step == start_step) or (step % val_every == 0 and step > 0)
+            label_input = batch.get('image_for_label', batch['image'])
+            label_mask = batch.get('image_mask_for_label', None)
+            if step_will_validate and accelerator.is_main_process:
+                original_inklabels = batch['inklabels'].detach().clone()
+                new_labels, debug = dynamic_label_generator.generate_with_debug(
+                    label_input, mask_b1zyx=label_mask
+                )
+                batch['inklabels'] = new_labels.to(dtype=batch['inklabels'].dtype)
+                dynamic_label_debug_payload = (
+                    batch['image'].detach(),
+                    label_input.detach(),
+                    original_inklabels,
+                    debug,
+                )
+            else:
+                _apply_dynamic_label_substitution(batch, dynamic_label_generator)
+            batch.pop('image_for_label', None)
+            batch.pop('image_mask_for_label', None)
         if full_3d_label_dilation > 0.0 or full_3d_supervision_dilation > 0.0:
             _apply_cucim_label_dilation(batch, full_3d_label_dilation, full_3d_supervision_dilation)
 
@@ -651,7 +675,7 @@ def train(config_path):
             if wandb.run is not None:
                 wandb.log(log_dict, step=step)
 
-        if step % val_every == 0 and step > 0:
+        if step == start_step or (step % val_every == 0 and step > 0):
             train_preview = PreviewAccumulator(
                 accelerator=accelerator,
                 get_model_input=get_model_input,
@@ -840,6 +864,27 @@ def train(config_path):
                         'val/tn': float(validation_counts.tn.item()),
                     }
                 )
+                if dynamic_label_debug_payload is not None and wandb.run is not None:
+                    from koine_machines.data.dino_guided_labels import (
+                        make_dynamic_label_debug_figure,
+                    )
+                    import matplotlib.pyplot as _plt
+                    _img_aug, _img_clean, _orig, _debug = dynamic_label_debug_payload
+                    _extra = {}
+                    if 'unet_prob_pre_mask' in _debug and 'input_mask' in _debug:
+                        _extra['unet_prob_pre_mask'] = _debug['unet_prob_pre_mask'][0, 0].float().cpu().numpy()
+                        _extra['input_mask'] = _debug['input_mask'][0, 0].float().cpu().numpy()
+                    _fig = make_dynamic_label_debug_figure(
+                        image=_img_clean[0, 0].float().cpu().numpy(),
+                        original_label=_orig[0, 0].float().cpu().numpy(),
+                        unet_prob=_debug['unet_prob'][0, 0].float().cpu().numpy(),
+                        sim_map=_debug['sim_map'][0, 0].float().cpu().numpy(),
+                        union=_debug['union'][0, 0].float().cpu().numpy(),
+                        binarized=_debug['binarized'][0, 0].float().cpu().numpy(),
+                        **_extra,
+                    )
+                    log_dict['dynamic_label/debug'] = wandb.Image(_fig)
+                    _plt.close(_fig)
                 if wandb.run is not None:
                     wandb.log(log_dict, step=step)
 

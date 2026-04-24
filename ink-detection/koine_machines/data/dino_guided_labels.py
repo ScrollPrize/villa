@@ -143,11 +143,32 @@ class DinoGuidedLabelGenerator:
         self._weight = _gaussian_window_3d(_TOKENS_PER_WINDOW_AXIS, dino_blend_sigma).to(self.device)
 
     @torch.inference_mode()
-    def generate(self, image_b1zyx: torch.Tensor) -> torch.Tensor:
-        """image_b1zyx: [B, 1, 256, 256, 256] (any float dtype, on self.device).
+    def generate(
+        self,
+        image_b1zyx: torch.Tensor,
+        mask_b1zyx: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        binarized, _ = self._generate_internal(image_b1zyx, mask_b1zyx, return_debug=False)
+        return binarized
 
-        Returns float tensor [B, 1, 256, 256, 256] with values in {0, 1}.
+    @torch.inference_mode()
+    def generate_with_debug(
+        self,
+        image_b1zyx: torch.Tensor,
+        mask_b1zyx: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, dict]:
+        """Like `generate` but also returns a dict with intermediates:
+        {'unet_prob_pre_mask', 'input_mask', 'unet_prob', 'sim_map', 'union', 'binarized'}
+        all shaped [B, 1, 256, 256, 256] (input_mask omitted when no mask passed).
         """
+        return self._generate_internal(image_b1zyx, mask_b1zyx, return_debug=True)
+
+    def _generate_internal(
+        self,
+        image_b1zyx: torch.Tensor,
+        mask_b1zyx: torch.Tensor | None,
+        return_debug: bool,
+    ):
         if image_b1zyx.shape[-3:] != (_CHUNK_SIZE,) * 3:
             raise ValueError(
                 f"expected chunk size {_CHUNK_SIZE}^3, got {tuple(image_b1zyx.shape)}"
@@ -158,11 +179,30 @@ class DinoGuidedLabelGenerator:
         logits = unet_out["ink"] if isinstance(unet_out, dict) else unet_out
         if isinstance(logits, (list, tuple)):
             logits = logits[0]
-        unet_prob = torch.sigmoid(logits.float())          # [B, 1, 256, 256, 256]
+        unet_prob_pre_mask = torch.sigmoid(logits.float())   # [B, 1, 256, 256, 256]
+
+        if mask_b1zyx is not None:
+            mask = mask_b1zyx.to(device=self.device, dtype=unet_prob_pre_mask.dtype, non_blocking=True)
+            unet_prob = unet_prob_pre_mask * mask
+        else:
+            mask = None
+            unet_prob = unet_prob_pre_mask
 
         sim_full = self._dino_sim_map(img)                  # [B, 1, 256, 256, 256] in [0, 1]
-        product = unet_prob * sim_full
-        return (product > self.threshold).float()
+        union = unet_prob * sim_full
+        binarized = (union > self.threshold).float()
+        if not return_debug:
+            return binarized, None
+        debug = {
+            'unet_prob_pre_mask': unet_prob_pre_mask,
+            'unet_prob': unet_prob,
+            'sim_map': sim_full,
+            'union': union,
+            'binarized': binarized,
+        }
+        if mask is not None:
+            debug['input_mask'] = mask
+        return binarized, debug
 
     @torch.inference_mode()
     def _dino_sim_map(self, image_b1zyx: torch.Tensor) -> torch.Tensor:
@@ -216,4 +256,62 @@ class DinoGuidedLabelGenerator:
             mode="trilinear",
             align_corners=False,
         )                                                                     # [B, 1, 256, 256, 256]
-        return ((sim_full + 1.0) / 2.0).clamp(0.0, 1.0)
+        # Per-sample min-max normalize so the sim map always spans [0, 1],
+        # giving the union/threshold step full dynamic range regardless of how
+        # tightly the raw cosine sim clusters for this chunk.
+        mins = sim_full.amin(dim=(1, 2, 3, 4), keepdim=True)
+        maxs = sim_full.amax(dim=(1, 2, 3, 4), keepdim=True)
+        return (sim_full - mins) / (maxs - mins).clamp_min(1e-6)
+
+
+def make_dynamic_label_debug_figure(
+    *,
+    image: np.ndarray,
+    original_label: np.ndarray,
+    unet_prob: np.ndarray,
+    sim_map: np.ndarray,
+    union: np.ndarray,
+    binarized: np.ndarray,
+    unet_prob_pre_mask: np.ndarray | None = None,
+    input_mask: np.ndarray | None = None,
+    z_index: int | None = None,
+):
+    """Build a debug figure at the middle z-slice of a 3D chunk.
+
+    Layout: 2x3 by default; 2x4 when both `unet_prob_pre_mask` and `input_mask`
+    are supplied. All inputs are 3D float arrays with shape [Z, Y, X]. Returns
+    a matplotlib Figure suitable for `wandb.Image(fig)`.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    z = image.shape[0] // 2 if z_index is None else int(z_index)
+    has_mask_panels = unet_prob_pre_mask is not None and input_mask is not None
+    panels = [
+        ("Image",            image[z],          "gray",    None),
+        ("Original Label",   original_label[z], "gray",    (0.0, 1.0)),
+    ]
+    if has_mask_panels:
+        panels.extend([
+            ("Input Mask",       input_mask[z],         "gray",  (0.0, 1.0)),
+            ("UNet pre-mask",    unet_prob_pre_mask[z], "magma", (0.0, 1.0)),
+        ])
+    panels.extend([
+        ("UNet sigmoid",     unet_prob[z],      "magma",   (0.0, 1.0)),
+        ("Cosine sim",       sim_map[z],        "viridis", (0.0, 1.0)),
+        ("Union",            union[z],          "magma",   (0.0, 1.0)),
+        ("Binarized",        binarized[z],      "gray",    (0.0, 1.0)),
+    ])
+    ncols = 4 if has_mask_panels else 3
+    fig, axes = plt.subplots(2, ncols, figsize=(4 * ncols, 8))
+    for ax, (title, arr, cmap, vlim) in zip(axes.flat, panels):
+        if vlim is None:
+            ax.imshow(arr, cmap=cmap)
+        else:
+            ax.imshow(arr, cmap=cmap, vmin=vlim[0], vmax=vlim[1])
+        ax.set_title(title)
+        ax.axis("off")
+    fig.suptitle(f"dynamic label debug — z={z}", fontsize=10)
+    fig.tight_layout()
+    return fig
