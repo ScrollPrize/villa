@@ -11,14 +11,14 @@
 		"pred_dt": 0.001,
 		"corr": 0.1,
 		"bend": 100.0,
-		"ext_offset": 1.0
+		"ext_offset": 0.01
 	},
 	"stages": [
 		{
 			"name": "init",
-			"steps": 500,
+			"steps": 1000,
 			"min_scaledown": 3,
-			"lr": [1.0, 0.1, 0.01, 0.001, 0.0001],
+			"lr": [10.0, 1.0, 0.1, 0.01, 0.001],
 			"params": ["mesh_ms"],
 			"w_fac": {
 				"pred_dt": 0.0
@@ -26,9 +26,9 @@
 		},
 		{
 			"name": "opt",
-			"steps": 1000,
+			"steps": 2000,
 			"min_scaledown": 0,
-			"lr": [1.0, 0.1, 0.01, 0.001, 0.0001],
+			"lr": [10.0, 1.0, 0.1, 0.01, 0.001],
 			"params": ["mesh_ms"],
 			"w_fac": {
 				"pred_dt": 0.0

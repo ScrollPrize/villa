@@ -130,14 +130,19 @@ def winding_density_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, t
 	return loss, (lm,), (mask,)
 
 
+EXT_OFFSET_USE_GT_NORMALS = True
+
+
 def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	"""External offset loss via per-ext-corner proxy targets.
 
 	For each ext surface corner, finds the model quad it projects onto,
 	computes the signed winding error (strip integral - target offset),
 	then builds 4 proxy targets at each model quad corner shifted by
-	ext_N * winding_error.  Per-corner L2 losses are weighted by bilinear
+	proxy_n * winding_error.  Per-corner L2 losses are weighted by bilinear
 	(u, v) fractions from the ray-quad intersection.
+
+	Ext_conn data is upsampled for better coverage between sparse corners.
 	"""
 	if res.ext_conn is None or not res.ext_conn:
 		device = res.xyz_lr.device
@@ -147,20 +152,71 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 	device = res.xyz_lr.device
 	dtype = res.xyz_lr.dtype
 	strip_samples = max(2, int(res.params.subsample_mesh) + 1)
+	upsample = max(1, int(res.params.subsample_mesh))
+
+	def _up_hw(t: torch.Tensor) -> torch.Tensor:
+		"""Upsample (D, H, W, C) → (D, H*up, W*up, C) bilinear."""
+		if upsample <= 1:
+			return t
+		return F.interpolate(t.permute(0, 3, 1, 2), scale_factor=upsample,
+							 mode='bilinear', align_corners=True).permute(0, 2, 3, 1)
+
+	def _up_scalar(t: torch.Tensor) -> torch.Tensor:
+		"""Upsample (D, H, W) → (D, H*up, W*up) bilinear."""
+		if upsample <= 1:
+			return t
+		return F.interpolate(t.unsqueeze(1), scale_factor=upsample,
+							 mode='bilinear', align_corners=True).squeeze(1)
+
+	def _up_mask(t: torch.Tensor) -> torch.Tensor:
+		"""Upsample (D, 1, H, W) → (D, 1, H*up, W*up). Bilinear + threshold
+		so only points where all contributing corners are valid pass."""
+		if upsample <= 1:
+			return t
+		up = F.interpolate(t, scale_factor=upsample, mode='bilinear', align_corners=True)
+		return (up >= 1.0).to(dtype=t.dtype)
 
 	total_loss = torch.zeros((), device=device, dtype=dtype)
 	total_wsum = 0.0
 	all_lm = []
 	all_mask = []
 
-	for (ext_mask, offset,
-		 M00, M10, M01, M11,
-		 ext_P, ext_N,
-		 u_frac, v_frac,
-		 _nM00, _nM10, _nM01, _nM11) in res.ext_conn:
-		# M00..M11: model quad corners (D, H_ext, W_ext, 3) WITH gradients
-		# ext_P, ext_N: ext corner position/normal (D, H_ext, W_ext, 3) detached
-		D, He, We, _ = M00.shape
+	Hm = int(res.xyz_lr.shape[1])
+	Wm = int(res.xyz_lr.shape[2])
+
+	for (ext_mask, offset, ext_P, ext_N, full_h, full_w) in res.ext_conn:
+
+		# Upsample ext surface data + model grid positions
+		ext_mask_up = _up_mask(ext_mask)
+		ext_P_up = _up_hw(ext_P)
+		ext_N_up = _up_hw(ext_N)
+		ext_N_up = ext_N_up / (ext_N_up.norm(dim=-1, keepdim=True) + 1e-8)
+		full_h_up = _up_scalar(full_h)
+		full_w_up = _up_scalar(full_w)
+
+		# Derive per-upsampled-point model quad from interpolated grid position
+		D = full_h_up.shape[0]
+		He = full_h_up.shape[1]
+		We = full_h_up.shape[2]
+
+		# In-bounds: upsampled point must map to valid model quad
+		in_bounds = (full_h_up >= 0) & (full_h_up < Hm - 1) & (full_w_up >= 0) & (full_w_up < Wm - 1)
+		ext_mask_up = ext_mask_up * in_bounds.unsqueeze(1).to(dtype=dtype)
+
+		# Clamp for safe indexing (out-of-bounds already masked)
+		fh_c = full_h_up.clamp(0, Hm - 1)
+		fw_c = full_w_up.clamp(0, Wm - 1)
+		row = fh_c.floor().clamp(0, Hm - 2).long()
+		col = fw_c.floor().clamp(0, Wm - 2).long()
+		u_frac = fh_c - row.float()
+		v_frac = fw_c - col.float()
+
+		# Gather model quad corners from xyz_lr (WITH gradients)
+		d_idx = torch.arange(D, device=device).view(D, 1, 1).expand(D, He, We)
+		M00 = res.xyz_lr[d_idx, row, col]
+		M10 = res.xyz_lr[d_idx, row + 1, col]
+		M01 = res.xyz_lr[d_idx, row, col + 1]
+		M11 = res.xyz_lr[d_idx, row + 1, col + 1]
 
 		with torch.no_grad():
 			M00_det = M00.detach()
@@ -169,26 +225,26 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 			M11_det = M11.detach()
 
 			# Bilinear model point (detached) for strip sampling
-			uf = u_frac.unsqueeze(-1)  # (D, He, We, 1)
+			uf = u_frac.unsqueeze(-1)
 			vf = v_frac.unsqueeze(-1)
 			M_bilin = (1-uf)*(1-vf)*M00_det + uf*(1-vf)*M10_det + (1-uf)*vf*M01_det + uf*vf*M11_det
 
 			# Strip: ext_P → M_bilin, sample grad_mag
-			diff = M_bilin - ext_P  # (D, He, We, 3)
+			diff = M_bilin - ext_P_up
 			t = torch.linspace(0.0, 1.0, strip_samples, device=device, dtype=dtype)
-			strip = ext_P.unsqueeze(-2) + t.view(1, 1, 1, -1, 1) * diff.unsqueeze(-2)  # (D, He, We, S, 3)
+			strip = ext_P_up.unsqueeze(-2) + t.view(1, 1, 1, -1, 1) * diff.unsqueeze(-2)
 			strip_flat = strip.reshape(D, He, We * strip_samples, 3)
 			sampled = res.data.grid_sample_fullres(strip_flat)
 			mag = sampled.grad_mag.squeeze(0).squeeze(0).reshape(D, He, We, strip_samples)
-			mean_mag = mag.mean(dim=-1).clamp(min=1e-4)  # (D, He, We)
+			mean_mag = mag.mean(dim=-1).clamp(min=1e-4)
 
 			# Strip validity: all sample points must have grad_mag > 0
 			sv = (sampled.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=dtype)
 			sv = sv.reshape(D, He, We, strip_samples).amin(dim=-1)
-			mask = (ext_mask.squeeze(1) * sv).unsqueeze(1)  # (D, 1, He, We)
+			mask = (ext_mask_up.squeeze(1) * sv).unsqueeze(1)
 
-			# Sign: which side of ext surface (+1 or -1), from normal projection
-			signed_normal_disp = ((M_bilin - ext_P) * ext_N).sum(dim=-1)
+			# Sign: which side of ext surface (+1 or -1)
+			signed_normal_disp = ((M_bilin - ext_P_up) * ext_N_up).sum(dim=-1)
 			int_sign = torch.sign(signed_normal_disp)
 
 			# Magnitude: unsigned winding count from strip integral
@@ -197,27 +253,35 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 
 			# Signed windings: sign from intersection, magnitude from integral
 			signed_windings = int_sign * unsigned_windings
-			winding_err = signed_windings - offset  # (D, He, We)
+			winding_err = signed_windings - offset
 
-			# 4 proxies: model quad corner - ext_N * winding_err (shared N, shared error)
-			we = winding_err.unsqueeze(-1)  # (D, He, We, 1)
-			proxy00 = M00_det - ext_N * we
-			proxy10 = M10_det - ext_N * we
-			proxy01 = M01_det - ext_N * we
-			proxy11 = M11_det - ext_N * we
+			# Proxy normal: GT sampled at upsampled ext positions, or ext_N
+			if EXT_OFFSET_USE_GT_NORMALS:
+				gt_n = res.data.grid_sample_fullres(ext_P_up).normal_3d
+				dot = (gt_n * ext_N_up).sum(dim=-1, keepdim=True)
+				proxy_n = torch.where(dot >= 0, gt_n, -gt_n)
+			else:
+				proxy_n = ext_N_up
 
-		# 4 weighted L2 losses (M_i has gradients, proxy_i detached)
-		w00 = ((1 - u_frac) * (1 - v_frac)).unsqueeze(1)  # (D, 1, He, We)
+			# 4 proxies: model quad corner - proxy_n * winding_err
+			we = winding_err.unsqueeze(-1)
+			proxy00 = M00_det - proxy_n * we
+			proxy10 = M10_det - proxy_n * we
+			proxy01 = M01_det - proxy_n * we
+			proxy11 = M11_det - proxy_n * we
+
+		# 4 weighted L2 losses (M_i gathered from xyz_lr, has gradients)
+		w00 = ((1 - u_frac) * (1 - v_frac)).unsqueeze(1)
 		w10 = (u_frac * (1 - v_frac)).unsqueeze(1)
 		w01 = ((1 - u_frac) * v_frac).unsqueeze(1)
 		w11 = (u_frac * v_frac).unsqueeze(1)
 
-		lm00 = (M00 - proxy00).square().sum(dim=-1).unsqueeze(1)  # (D, 1, He, We)
+		lm00 = (M00 - proxy00).square().sum(dim=-1).unsqueeze(1)
 		lm10 = (M10 - proxy10).square().sum(dim=-1).unsqueeze(1)
 		lm01 = (M01 - proxy01).square().sum(dim=-1).unsqueeze(1)
 		lm11 = (M11 - proxy11).square().sum(dim=-1).unsqueeze(1)
 
-		lm = w00 * lm00 + w10 * lm10 + w01 * lm01 + w11 * lm11  # (D, 1, He, We)
+		lm = w00 * lm00 + w10 * lm10 + w01 * lm01 + w11 * lm11
 
 		wsum = float(mask.sum().detach().cpu())
 		if wsum > 0.0:

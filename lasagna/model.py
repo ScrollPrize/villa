@@ -40,9 +40,9 @@ class FitResult3D:
 	params: ModelParams3D
 	gt_normal_lr: torch.Tensor | None = None  # (D, Hm, Wm, 3) GT unit normals at LR mesh positions
 	ext_conn: list | None = None
-	# Per ext surface: (mask, offset, M00..M11, ext_P, ext_N, u, v, nM00..nM11)
-	# M00..M11 = model quad corners (with gradients), nM00..nM11 = GT normals at corners (detached)
-	# ext_P/ext_N = ext corner pos/normal (detached). Shapes: (D, H_ext, W_ext, ...)
+	# Per ext surface: (mask, offset, ext_P, ext_N, full_h, full_w)
+	# ext_P/ext_N = ext corner pos/normal (detached), full_h/full_w = model grid position (row+u, col+v)
+	# Shapes: (D, H_ext, W_ext, ...). Model quad corners are re-gathered from xyz_lr in the loss.
 
 
 class Model3D(nn.Module):
@@ -644,6 +644,70 @@ class Model3D(nn.Module):
 		n[~valid] = 0.0
 		return n
 
+	@staticmethod
+	def _ray_bilinear_intersect(O: torch.Tensor, n: torch.Tensor,
+								M00: torch.Tensor, M10: torch.Tensor,
+								M01: torch.Tensor, M11: torch.Tensor,
+								frac_h: torch.Tensor, frac_w: torch.Tensor,
+								) -> tuple[torch.Tensor, torch.Tensor]:
+		"""Ray-bilinear-patch intersection.
+
+		Shoots ray from O along direction n, intersects with bilinear patch
+		defined by corners M00, M10, M01, M11.  frac_h/frac_w are used to
+		disambiguate the two quadratic roots (pick closer to expected).
+
+		Returns (u, v) — unclamped intersection parameters.
+		All inputs: (..., 3) for points/directions, (...) for frac_h/frac_w.
+		"""
+		eps = 1e-12
+		a = M10 - M00
+		b = M01 - M00
+		c = M11 - M10 - M01 + M00
+		g = M00 - O
+
+		def cross2(vec: torch.Tensor, i: int, j: int) -> torch.Tensor:
+			return vec[..., i] * n[..., j] - vec[..., j] * n[..., i]
+
+		Ap = [cross2(a, 0, 1), cross2(a, 0, 2), cross2(a, 1, 2)]
+		Bp = [cross2(b, 0, 1), cross2(b, 0, 2), cross2(b, 1, 2)]
+		Cp = [cross2(c, 0, 1), cross2(c, 0, 2), cross2(c, 1, 2)]
+		Gp = [cross2(g, 0, 1), cross2(g, 0, 2), cross2(g, 1, 2)]
+
+		qpairs = [(0, 1), (0, 2), (1, 2)]
+		alphas, betas_q, gammas = [], [], []
+		for p, q in qpairs:
+			alphas.append(Ap[p] * Cp[q] - Ap[q] * Cp[p])
+			betas_q.append(Ap[p] * Bp[q] - Ap[q] * Bp[p] + Gp[p] * Cp[q] - Gp[q] * Cp[p])
+			gammas.append(Gp[p] * Bp[q] - Gp[q] * Bp[p])
+
+		abs_a = [aa.abs() for aa in alphas]
+		sel_q0 = (abs_a[0] >= abs_a[1]) & (abs_a[0] >= abs_a[2])
+		sel_q1 = (~sel_q0) & (abs_a[1] >= abs_a[2])
+		alpha = torch.where(sel_q0, alphas[0], torch.where(sel_q1, alphas[1], alphas[2]))
+		beta = torch.where(sel_q0, betas_q[0], torch.where(sel_q1, betas_q[1], betas_q[2]))
+		gamma = torch.where(sel_q0, gammas[0], torch.where(sel_q1, gammas[1], gammas[2]))
+
+		disc = (beta * beta - 4.0 * alpha * gamma).clamp(min=0.0)
+		sqrt_disc = torch.sqrt(disc + eps)
+		is_linear = alpha.abs() < eps
+		u1 = (-beta + sqrt_disc) / (2.0 * alpha + eps * is_linear.float())
+		u2 = (-beta - sqrt_disc) / (2.0 * alpha + eps * is_linear.float())
+		u_lin = -gamma / (beta + eps * (beta.abs() < eps).float())
+		u1 = torch.where(is_linear, u_lin, u1)
+		u2 = torch.where(is_linear, u_lin, u2)
+		u = torch.where((u1 - frac_h).abs() <= (u2 - frac_h).abs(), u1, u2)
+
+		denom_v = [Bp[k] + u * Cp[k] for k in range(3)]
+		numer_v = [-(Gp[k] + u * Ap[k]) for k in range(3)]
+		abs_dv = [d.abs() for d in denom_v]
+		sel_v0 = (abs_dv[0] >= abs_dv[1]) & (abs_dv[0] >= abs_dv[2])
+		sel_v1 = (~sel_v0) & (abs_dv[1] >= abs_dv[2])
+		dv = torch.where(sel_v0, denom_v[0], torch.where(sel_v1, denom_v[1], denom_v[2]))
+		nv = torch.where(sel_v0, numer_v[0], torch.where(sel_v1, numer_v[1], numer_v[2]))
+		v = nv / (dv + eps * (dv.abs() < eps).float())
+
+		return u, v
+
 	def add_external_surface(self, xyz: torch.Tensor, valid: torch.Tensor | None = None,
 						   offset: float = 1.0) -> int:
 		"""Register a frozen external reference surface.
@@ -670,31 +734,76 @@ class Model3D(nn.Module):
 		return idx
 
 	def update_ext_conn_offsets(self) -> None:
-		"""Update per-ext-corner offsets from cached intersection params.
+		"""Two-pass intersection update using current (post-step) model params.
 
-		After each optimization step, refine the ext→model grid mapping so that
-		intersection tracking follows model deformation.  Offsets are clamped so
-		the mapped model position stays within [0, Hm-1] / [0, Wm-1], allowing
-		off-surface points to be pulled back toward the model boundary.
+		Pass 1: intersect with current quad → raw (u, v), unclamped.
+		Pass 2: shift quad idx based on pass-1 result (clamped), re-intersect
+		        with new quad → final (u, v), unclamped.
+		Store offset from updated quad. The forward pass masks by uv ∈ [0,1].
 		"""
+		if not self._ext_surfaces:
+			return
 		Hm = self.mesh_h
 		Wm = self.mesh_w
+		D = self.depth
+		xyz_lr = self._grid_xyz().detach()  # current post-step positions
+		device = xyz_lr.device
 
 		with torch.no_grad():
-			for i, params in enumerate(self._ext_conn_params):
-				if "u" not in params:
-					continue
-				u, v, row, col = params["u"], params["v"], params["row"], params["col"]
-				H_ext, W_ext = self._ext_surfaces[i].shape[0], self._ext_surfaces[i].shape[1]
-				D = self._ext_conn_offsets[i].shape[1]
-				device = self._ext_conn_offsets[i].device
+			for i, ext_xyz in enumerate(self._ext_surfaces):
+				H_ext, W_ext, _ = ext_xyz.shape
+				ext_off = self._ext_conn_offsets[i]
+				h_off, w_off = ext_off[0], ext_off[1]
+				ext_norms = self._ext_normals[i]
+
 				r_idx = torch.arange(H_ext, device=device, dtype=torch.float32).view(1, H_ext, 1).expand(D, H_ext, W_ext)
 				c_idx = torch.arange(W_ext, device=device, dtype=torch.float32).view(1, 1, W_ext).expand(D, H_ext, W_ext)
-				new_h_off = row.float() + u - r_idx
-				new_w_off = col.float() + v - c_idx
-				# Clamp so model_h = r + h_off stays in [0, Hm-1]
-				new_h_off = (r_idx + new_h_off).clamp(0, Hm - 1) - r_idx
-				new_w_off = (c_idx + new_w_off).clamp(0, Wm - 1) - c_idx
+				d_idx = torch.arange(D, device=device).view(D, 1, 1).expand(D, H_ext, W_ext)
+				ext_P = ext_xyz.unsqueeze(0).expand(D, -1, -1, -1)
+				ext_N = ext_norms.unsqueeze(0).expand(D, -1, -1, -1)
+
+				# Current model grid position from stored offset
+				model_h = r_idx + h_off
+				model_w = c_idx + w_off
+				row = model_h.floor().clamp(0, Hm - 2).long()
+				col = model_w.floor().clamp(0, Wm - 2).long()
+				frac_h = (model_h - row.float()).clamp(0, 1)
+				frac_w = (model_w - col.float()).clamp(0, 1)
+
+				# Gather model quad at current idx
+				M00 = xyz_lr[d_idx, row, col]
+				M10 = xyz_lr[d_idx, (row + 1).clamp(max=Hm - 1), col]
+				M01 = xyz_lr[d_idx, row, (col + 1).clamp(max=Wm - 1)]
+				M11 = xyz_lr[d_idx, (row + 1).clamp(max=Hm - 1), (col + 1).clamp(max=Wm - 1)]
+
+				# PASS 1: intersect → raw (u, v), unclamped
+				u1, v1 = Model3D._ray_bilinear_intersect(
+					ext_P, ext_N, M00, M10, M01, M11, frac_h, frac_w)
+
+				# Update idx: shift quad based on pass-1 result, clamp to valid range
+				new_model_h = (row.float() + u1).clamp(0, Hm - 2)
+				new_model_w = (col.float() + v1).clamp(0, Wm - 2)
+				new_row = new_model_h.floor().clamp(0, Hm - 2).long()
+				new_col = new_model_w.floor().clamp(0, Wm - 2).long()
+				new_frac_h = new_model_h - new_row.float()
+				new_frac_w = new_model_w - new_col.float()
+
+				# Gather model quad at updated idx
+				M00 = xyz_lr[d_idx, new_row, new_col]
+				M10 = xyz_lr[d_idx, (new_row + 1).clamp(max=Hm - 1), new_col]
+				M01 = xyz_lr[d_idx, new_row, (new_col + 1).clamp(max=Wm - 1)]
+				M11 = xyz_lr[d_idx, (new_row + 1).clamp(max=Hm - 1), (new_col + 1).clamp(max=Wm - 1)]
+
+				# PASS 2: re-intersect → final (u, v), unclamped
+				u2, v2 = Model3D._ray_bilinear_intersect(
+					ext_P, ext_N, M00, M10, M01, M11, new_frac_h, new_frac_w)
+
+				# Store offset from updated position
+				new_h_off = new_row.float() + u2 - r_idx
+				new_w_off = new_col.float() + v2 - c_idx
+				# Clamp so model_h stays in valid quad range [0, Hm-2]
+				new_h_off = (r_idx + new_h_off).clamp(0, Hm - 2) - r_idx
+				new_w_off = (c_idx + new_w_off).clamp(0, Wm - 2) - c_idx
 				self._ext_conn_offsets[i][0] = new_h_off.nan_to_num_(0.0)
 				self._ext_conn_offsets[i][1] = new_w_off.nan_to_num_(0.0)
 
@@ -757,24 +866,23 @@ class Model3D(nn.Module):
 			winding_step=winding_step, subsample_mesh=subsample_mesh,
 			subsample_winding=subsample_winding)
 
-	def _intersect_ext_surfaces(self, xyz_lr: torch.Tensor, data: fit_data.FitData3D,
-							   gt_normal_lr: torch.Tensor | None = None) -> list | None:
+	def _intersect_ext_surfaces(self, xyz_lr: torch.Tensor, data: fit_data.FitData3D
+							   ) -> list | None:
 		"""Intersect ext surface corners with model quads.
 
 		For each ext surface corner, use stored per-corner offset to find the
 		corresponding model quad, then ray-bilinear-patch intersect to get precise
 		(u, v) within that model quad.
 
-		Returns list of (mask, offset, M00..M11, ext_P, ext_N, u, v, nM00..nM11)
-		per surface, with shapes (D, H_ext, W_ext, ...).
-		M00..M11 have gradients (indexed from xyz_lr). nM00..nM11 are GT normals
-		at the corresponding model quad corners (detached). ext_P, ext_N are detached.
+		Returns list of (mask, offset, ext_P, ext_N, full_h, full_w) per surface,
+		with shapes (D, H_ext, W_ext, ...).
+		full_h/full_w = row + u, col + v — continuous model grid position.
+		Model quad corners are re-gathered from xyz_lr in the loss function.
 		"""
 		if not self._ext_surfaces:
 			return None
 		D, Hm, Wm, _ = xyz_lr.shape
 		device = xyz_lr.device
-		eps = 1e-12
 		results = []
 
 		for ei, ext_xyz in enumerate(self._ext_surfaces):
@@ -798,100 +906,44 @@ class Model3D(nn.Module):
 			# Clamp for safe indexing (clamped entries will be masked out)
 			model_h_c = model_h.clamp(0, Hm - 1)
 			model_w_c = model_w.clamp(0, Wm - 1)
-			row = model_h_c.floor().clamp(0, Hm - 2).long()  # (D, H_ext, W_ext)
+			row = model_h_c.floor().clamp(0, Hm - 2).long()
 			col = model_w_c.floor().clamp(0, Wm - 2).long()
 			frac_h = model_h_c - row.float()
 			frac_w = model_w_c - col.float()
 
-			# Gather model quad corners (WITH gradients)
-			# xyz_lr: (D, Hm, Wm, 3) — need to gather at (d, row, col) etc.
+			# Gather model quad corners (detached for intersection only)
 			d_idx = torch.arange(D, device=device).view(D, 1, 1).expand(D, H_ext, W_ext)
-			M00 = xyz_lr[d_idx, row, col]          # (D, H_ext, W_ext, 3)
-			M10 = xyz_lr[d_idx, row + 1, col]
-			M01 = xyz_lr[d_idx, row, col + 1]
-			M11 = xyz_lr[d_idx, row + 1, col + 1]
-
-			# Gather GT normals at model quad corners (detached)
-			if gt_normal_lr is not None:
-				nM00 = gt_normal_lr[d_idx, row, col]          # (D, H_ext, W_ext, 3)
-				nM10 = gt_normal_lr[d_idx, row + 1, col]
-				nM01 = gt_normal_lr[d_idx, row, col + 1]
-				nM11 = gt_normal_lr[d_idx, row + 1, col + 1]
-			else:
-				z = torch.zeros(D, H_ext, W_ext, 3, device=device, dtype=xyz_lr.dtype)
-				nM00 = nM10 = nM01 = nM11 = z
+			M00 = xyz_lr[d_idx, row, col].detach()
+			M10 = xyz_lr[d_idx, row + 1, col].detach()
+			M01 = xyz_lr[d_idx, row, col + 1].detach()
+			M11 = xyz_lr[d_idx, row + 1, col + 1].detach()
 
 			# Ext corner position and normal (detached, frozen)
 			ext_norms = self._ext_normals[ei]  # (H_ext, W_ext, 3)
 			ext_P = ext_xyz.unsqueeze(0).expand(D, -1, -1, -1)  # (D, H_ext, W_ext, 3)
 			ext_N = ext_norms.unsqueeze(0).expand(D, -1, -1, -1)
 
-			# Ray-bilinear-patch intersection: ray from ext_P along ext_N,
-			# intersect with model quad (M00..M11) → precise (u, v).
-			# Same math as before but reversed: O=ext_P, n=ext_N, patch=M00..M11.
-			O = ext_P
-			n = ext_N
-			a = M10.detach() - M00.detach()
-			b = M01.detach() - M00.detach()
-			c = M11.detach() - M10.detach() - M01.detach() + M00.detach()
-			g = M00.detach() - O
+			# Ray-bilinear-patch intersection → (u, v) unclamped
+			u, v = Model3D._ray_bilinear_intersect(
+				ext_P, ext_N, M00, M10, M01, M11, frac_h, frac_w)
 
-			def cross2(vec: torch.Tensor, i: int, j: int) -> torch.Tensor:
-				return vec[..., i] * n[..., j] - vec[..., j] * n[..., i]
-
-			Ap = [cross2(a, 0, 1), cross2(a, 0, 2), cross2(a, 1, 2)]
-			Bp = [cross2(b, 0, 1), cross2(b, 0, 2), cross2(b, 1, 2)]
-			Cp = [cross2(c, 0, 1), cross2(c, 0, 2), cross2(c, 1, 2)]
-			Gp = [cross2(g, 0, 1), cross2(g, 0, 2), cross2(g, 1, 2)]
-
-			qpairs = [(0, 1), (0, 2), (1, 2)]
-			alphas, betas_q, gammas = [], [], []
-			for p, q in qpairs:
-				alphas.append(Ap[p] * Cp[q] - Ap[q] * Cp[p])
-				betas_q.append(Ap[p] * Bp[q] - Ap[q] * Bp[p] + Gp[p] * Cp[q] - Gp[q] * Cp[p])
-				gammas.append(Gp[p] * Bp[q] - Gp[q] * Bp[p])
-
-			abs_a = [aa.abs() for aa in alphas]
-			sel_q0 = (abs_a[0] >= abs_a[1]) & (abs_a[0] >= abs_a[2])
-			sel_q1 = (~sel_q0) & (abs_a[1] >= abs_a[2])
-			alpha = torch.where(sel_q0, alphas[0], torch.where(sel_q1, alphas[1], alphas[2]))
-			beta = torch.where(sel_q0, betas_q[0], torch.where(sel_q1, betas_q[1], betas_q[2]))
-			gamma = torch.where(sel_q0, gammas[0], torch.where(sel_q1, gammas[1], gammas[2]))
-
-			disc = (beta * beta - 4.0 * alpha * gamma).clamp(min=0.0)
-			sqrt_disc = torch.sqrt(disc + eps)
-			is_linear = alpha.abs() < eps
-			u1 = (-beta + sqrt_disc) / (2.0 * alpha + eps * is_linear.float())
-			u2 = (-beta - sqrt_disc) / (2.0 * alpha + eps * is_linear.float())
-			u_lin = -gamma / (beta + eps * (beta.abs() < eps).float())
-			u1 = torch.where(is_linear, u_lin, u1)
-			u2 = torch.where(is_linear, u_lin, u2)
-			u = torch.where((u1 - frac_h).abs() <= (u2 - frac_h).abs(), u1, u2)
-
-			denom_v = [Bp[k] + u * Cp[k] for k in range(3)]
-			numer_v = [-(Gp[k] + u * Ap[k]) for k in range(3)]
-			abs_dv = [d.abs() for d in denom_v]
-			sel_v0 = (abs_dv[0] >= abs_dv[1]) & (abs_dv[0] >= abs_dv[2])
-			sel_v1 = (~sel_v0) & (abs_dv[1] >= abs_dv[2])
-			dv = torch.where(sel_v0, denom_v[0], torch.where(sel_v1, denom_v[1], denom_v[2]))
-			nv = torch.where(sel_v0, numer_v[0], torch.where(sel_v1, numer_v[1], numer_v[2]))
-			v = nv / (dv + eps * (dv.abs() < eps).float())
+			# Full model grid position: row + u, col + v
+			full_h = row.float() + u  # (D, H_ext, W_ext)
+			full_w = col.float() + v
 
 			# Validity: ext corner valid, model quad in bounds, intersection in [0,1]²
 			uv_ok = (u >= 0) & (u <= 1) & (v >= 0) & (v <= 1)
 			ext_v = self._ext_valid[ei]  # (H_ext, W_ext)
-			ext_corner_valid = ext_v.unsqueeze(0).expand(D, -1, -1)  # (D, H_ext, W_ext)
-			valid = (in_bounds & uv_ok & ext_corner_valid).to(dtype=xyz_lr.dtype).unsqueeze(1)  # (D, 1, H_ext, W_ext)
+			ext_corner_valid = ext_v.unsqueeze(0).expand(D, -1, -1)
+			valid = (in_bounds & uv_ok & ext_corner_valid).to(dtype=xyz_lr.dtype).unsqueeze(1)
 
 			# Cache intersection params for conn_offset update
 			self._ext_conn_params[ei] = {"u": u, "v": v, "row": row, "col": col}
 
 			results.append((
 				valid, offset,
-				M00, M10, M01, M11,
 				ext_P.detach(), ext_N.detach(),
-				u.detach(), v.detach(),
-				nM00.detach(), nM10.detach(), nM01.detach(), nM11.detach(),
+				full_h.detach(), full_w.detach(),
 			))
 
 		return results
@@ -933,7 +985,7 @@ class Model3D(nn.Module):
 		gt_normal_lr = data_lr.normal_3d  # (D, Hm, Wm, 3) or None
 
 		# External surface intersections
-		ext_conn = self._intersect_ext_surfaces(xyz_lr, data, gt_normal_lr=gt_normal_lr)
+		ext_conn = self._intersect_ext_surfaces(xyz_lr, data)
 
 		return FitResult3D(
 			xyz_lr=xyz_lr,
