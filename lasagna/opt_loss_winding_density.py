@@ -130,7 +130,7 @@ def winding_density_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, t
 	return loss, (lm,), (mask,)
 
 
-EXT_OFFSET_USE_GT_NORMALS = True
+EXT_OFFSET_USE_GT_NORMALS = False
 
 
 def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
