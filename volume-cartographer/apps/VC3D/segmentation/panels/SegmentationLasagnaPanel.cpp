@@ -286,7 +286,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         _windowSizeSpin = new QSpinBox(offsetContent);
         _windowSizeSpin->setRange(0, 100000);
         _windowSizeSpin->setSingleStep(1000);
-        _windowSizeSpin->setValue(0);
+        _windowSizeSpin->setValue(5000);
         _windowSizeSpin->setToolTip(tr("Window size in fullres voxels (0 = no windowing)"));
         row->addWidget(_windowSizeSpin);
     }, tr("Split large surfaces into windows for memory efficiency. 0 = process whole surface."));
@@ -834,7 +834,7 @@ void SegmentationLasagnaPanel::restoreSettings(QSettings& settings)
     if (_windowSizeSpin) {
         const QSignalBlocker b(_windowSizeSpin);
         _windowSizeSpin->setValue(
-            settings.value(QStringLiteral("lasagna_window_size"), 0).toInt());
+            settings.value(QStringLiteral("lasagna_window_size"), 5000).toInt());
     }
     if (_windowOverlapSpin) {
         const QSignalBlocker b(_windowOverlapSpin);
@@ -1025,7 +1025,7 @@ double SegmentationLasagnaPanel::offsetValue() const
 
 int SegmentationLasagnaPanel::windowSize() const
 {
-    return _windowSizeSpin ? _windowSizeSpin->value() : 0;
+    return _windowSizeSpin ? _windowSizeSpin->value() : 5000;
 }
 
 int SegmentationLasagnaPanel::windowOverlap() const

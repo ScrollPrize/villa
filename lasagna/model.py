@@ -769,8 +769,8 @@ class Model3D(nn.Module):
 			h_idx = torch.arange(Hm, device=device, dtype=torch.float32).view(1, Hm, 1).expand(D, Hm, Wm)
 			w_idx = torch.arange(Wm, device=device, dtype=torch.float32).view(1, 1, Wm).expand(D, Hm, Wm)
 
-			target_h = (h_idx * (H_ext - 1) / max(1, Hm - 1) + h_off).clamp(0, H_ext - 1)
-			target_w = (w_idx * (W_ext - 1) / max(1, Wm - 1) + w_off).clamp(0, W_ext - 1)
+			target_h = (h_idx + h_off).clamp(0, H_ext - 1)
+			target_w = (w_idx + w_off).clamp(0, W_ext - 1)
 			row = target_h.floor().clamp(0, H_ext - 2).long()
 			col = target_w.floor().clamp(0, W_ext - 2).long()
 			frac_h = target_h - row.float()

@@ -337,7 +337,9 @@ def main(argv: list[str] | None = None) -> int:
 			ew1 = min(W_full, w1 + ext_margin)
 			ext_xyz = full_xyz[eh0:eh1, ew0:ew1].to(device)
 			ext_valid = full_valid[eh0:eh1, ew0:ew1].to(device)
-			mdl.add_external_surface(ext_xyz, valid=ext_valid, offset=offset_val)
+			ext_idx = mdl.add_external_surface(ext_xyz, valid=ext_valid, offset=offset_val)
+			mdl._ext_conn_offsets[ext_idx][0] = float(h0 - eh0)
+			mdl._ext_conn_offsets[ext_idx][1] = float(w0 - ew0)
 
 			# Adaptive data loader for this window
 			def _full_load_win(skip_channels: set[str]) -> fit_data.FitData3D:
