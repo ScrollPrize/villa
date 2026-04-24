@@ -2318,6 +2318,8 @@ def run_preprocess_3d(
 			source_to_base=source_to_base,
 			base_shape_zyx=base_shape_zyx,
 		)
+	# grad_mag is predicted per downscaled voxel; factor converts to fullres
+	vol.grad_mag_factor = 1.0 / effective_other_sd
 	# Record this crop in base coordinates (appends if new, deduplicates)
 	if crop_xyzwhd is not None:
 		vol.add_crop(tuple(int(v) for v in crop_xyzwhd))
