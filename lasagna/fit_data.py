@@ -252,6 +252,54 @@ def erode_grad_mag(data: FitData3D, radius: int) -> None:
 	del invalid_u8
 
 
+def load_single_channel(
+	*, path: str, device: torch.device, channel: str,
+	crop: tuple[int, int, int, int, int, int] | None = None,
+) -> tuple[torch.Tensor, tuple[float, float, float]]:
+	"""Load one channel from a .lasagna.json volume.
+
+	Returns (tensor (1,1,Z,Y,X) uint8, spacing (sx,sy,sz) in base coords).
+	"""
+	vol = LasagnaVolume.load(path)
+	s2b = vol.source_to_base
+	if channel not in vol.all_channels():
+		raise ValueError(f"channel '{channel}' not in volume (available: {vol.all_channels()})")
+	group, ch_idx = vol.channel_group(channel)
+	zarr_path = str(vol.path.parent / group.zarr_path)
+	zsrc = zarr.open(zarr_path, mode="r")
+	if not isinstance(zsrc, zarr.Array):
+		raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
+	shape = tuple(int(v) for v in zsrc.shape)
+	is_3d = len(shape) == 3
+	if not is_3d and len(shape) != 4:
+		raise ValueError(f"expected 3D or 4D zarr at {zarr_path}, got shape={shape}")
+	ds_i = int(round(group.sd_fac * s2b))
+	if is_3d:
+		Z_all, Y_all, X_all = shape
+	else:
+		_, Z_all, Y_all, X_all = shape
+	if crop is not None:
+		x0, y0, z0, cw, ch_, cd = (int(v) for v in crop)
+		x0v = max(0, x0 // ds_i)
+		y0v = max(0, y0 // ds_i)
+		z0v = max(0, z0 // ds_i)
+		x1v = min(X_all, (x0 + cw + ds_i - 1) // ds_i)
+		y1v = min(Y_all, (y0 + ch_ + ds_i - 1) // ds_i)
+		z1v = min(Z_all, (z0 + cd + ds_i - 1) // ds_i)
+	else:
+		x0v, y0v, z0v = 0, 0, 0
+		x1v, y1v, z1v = X_all, Y_all, Z_all
+	print(f"[fit_data] load_single_channel {channel} from {group.zarr_path} "
+		  f"ds_base={ds_i} z=[{z0v}:{z1v}] y=[{y0v}:{y1v}] x=[{x0v}:{x1v}]", flush=True)
+	if is_3d:
+		a = np.asarray(zsrc[z0v:z1v, y0v:y1v, x0v:x1v])
+	else:
+		a = np.asarray(zsrc[ch_idx, z0v:z1v, y0v:y1v, x0v:x1v])
+	t = torch.from_numpy(a).to(device=device, dtype=torch.uint8)
+	sd = float(group.sd_fac) * s2b
+	return t.unsqueeze(0).unsqueeze(0), (sd, sd, sd)
+
+
 def load_3d_for_model(
 	*, path: str, device: torch.device, model: object,
 	blur_sigma: float = 0.0,

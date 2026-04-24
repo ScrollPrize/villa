@@ -294,14 +294,6 @@ def main(argv: list[str] | None = None) -> int:
 		cfg.pop("tifxyz_data", None)
 		cfg.pop("offset_value", None)
 		stages = optimizer.load_stages_cfg(cfg)
-		_skip_channels: set[str] = set()
-		_any_data = any(s.global_opt.eff.get("data", 0) > 0 or s.global_opt.eff.get("data_plain", 0) > 0
-						for s in stages)
-		_any_pred_dt = any(s.global_opt.eff.get("pred_dt", 0) > 0 for s in stages)
-		if not _any_data:
-			_skip_channels.add("cos")
-		if not _any_pred_dt:
-			_skip_channels.add("pred_dt")
 
 		windows = _compute_window_grid(H_full, W_full, mesh_step, window_size, window_overlap)
 		n_windows = len(windows)
@@ -347,13 +339,13 @@ def main(argv: list[str] | None = None) -> int:
 			ext_valid = full_valid[eh0:eh1, ew0:ew1].to(device)
 			mdl.add_external_surface(ext_xyz, valid=ext_valid, offset=offset_val)
 
-			# Load data auto-cropped for this window's spatial extent
-			def _load_data_win() -> fit_data.FitData3D:
+			# Adaptive data loader for this window
+			def _full_load_win(skip_channels: set[str]) -> fit_data.FitData3D:
 				d = fit_data.load_3d_for_model(
 					path=str(data_cfg.input), device=device, model=mdl,
 					cuda_gridsample=data_cfg.cuda_gridsample,
 					erode_valid_mask=data_cfg.erode_valid_mask,
-					skip_channels=_skip_channels,
+					skip_channels=skip_channels,
 				)
 				Z, Y, X = d.size
 				volume_extent = (
@@ -364,7 +356,36 @@ def main(argv: list[str] | None = None) -> int:
 				)
 				mdl.params = dataclasses.replace(mdl.params, volume_extent=volume_extent)
 				return d
-			data = _load_data_win()
+
+			def _ensure_data_win(data: fit_data.FitData3D | None, needed_channels: set[str]) -> fit_data.FitData3D:
+				skip = {"cos", "pred_dt"} - needed_channels
+				if data is None or optimizer.check_data_bounds(
+						mdl, data, volume_extent_fullres=volume_extent_fullres):
+					if data is not None:
+						print(f"[fit] window mesh near data border, reloading", flush=True)
+					return _full_load_win(skip_channels=skip)
+				missing: list[str] = []
+				if "pred_dt" in needed_channels and data.pred_dt is None:
+					missing.append("pred_dt")
+				if "cos" in needed_channels and data.cos is None:
+					missing.append("cos")
+				if not missing:
+					return data
+				Z, Y, X = data.size
+				sx, sy, sz = data.spacing
+				crop = (int(data.origin_fullres[0]), int(data.origin_fullres[1]),
+						int(data.origin_fullres[2]),
+						int(round(X * sx)), int(round(Y * sy)), int(round(Z * sz)))
+				for ch in missing:
+					t, sp = fit_data.load_single_channel(
+						path=str(data_cfg.input), device=device, channel=ch, crop=crop)
+					cs = dict(data.channel_spacing) if data.channel_spacing else {}
+					cs[ch] = sp
+					data = dataclasses.replace(data, **{ch: t}, channel_spacing=cs)
+				print(f"[fit] loaded missing channels {missing}", flush=True)
+				return data
+
+			data = _ensure_data_win(None, set())
 
 			# Progress wrapper: prefix window index, scale overall progress
 			def _make_progress(wi_=wi, n_=n_windows):
@@ -393,8 +414,7 @@ def main(argv: list[str] | None = None) -> int:
 				snapshot_interval=0,
 				snapshot_fn=lambda **kw: None,
 				progress_fn=_make_progress(),
-				load_data_fn=_load_data_win,
-				volume_extent_fullres=volume_extent_fullres,
+				ensure_data_fn=_ensure_data_win,
 				seed_xyz=win_seed,
 			)
 
@@ -506,27 +526,15 @@ def main(argv: list[str] | None = None) -> int:
 	cfg.pop("external_surfaces", None)
 	cfg.pop("tifxyz_data", None)
 	cfg.pop("offset_value", None)
-	# Parse stages (before data loading so we know which channels to skip)
 	stages = optimizer.load_stages_cfg(cfg)
 
-	_skip_channels: set[str] = set()
-	_any_data = any(s.global_opt.eff.get("data", 0) > 0 or s.global_opt.eff.get("data_plain", 0) > 0
-					for s in stages)
-	_any_pred_dt = any(s.global_opt.eff.get("pred_dt", 0) > 0 for s in stages)
-	if not _any_data:
-		_skip_channels.add("cos")
-	if not _any_pred_dt:
-		_skip_channels.add("pred_dt")
-	if _skip_channels:
-		print(f"[fit] skipping channels: {sorted(_skip_channels)}", flush=True)
-
-	# --- Data loading (with auto-crop, blur, and reload support) ---
-	def _load_data() -> fit_data.FitData3D:
+	# --- Adaptive data loader: handles bounds + missing channels ---
+	def _full_load(skip_channels: set[str]) -> fit_data.FitData3D:
 		d = fit_data.load_3d_for_model(
 			path=str(data_cfg.input), device=device, model=mdl,
 			cuda_gridsample=data_cfg.cuda_gridsample,
 			erode_valid_mask=data_cfg.erode_valid_mask,
-			skip_channels=_skip_channels,
+			skip_channels=skip_channels,
 		)
 		Z, Y, X = d.size
 		volume_extent = (
@@ -552,7 +560,38 @@ def main(argv: list[str] | None = None) -> int:
 						winding_min=wv_min, winding_max=wv_max)
 		return d
 
-	data = _load_data()
+	def _ensure_data(data: fit_data.FitData3D | None, needed_channels: set[str]) -> fit_data.FitData3D:
+		skip = {"cos", "pred_dt"} - needed_channels
+		# Full reload if no data yet or mesh near data border
+		if data is None or optimizer.check_data_bounds(
+				mdl, data, volume_extent_fullres=volume_extent_fullres):
+			if data is not None:
+				print(f"[fit] mesh near data border, reloading", flush=True)
+			return _full_load(skip_channels=skip)
+		# Check for missing channels
+		missing: list[str] = []
+		if "pred_dt" in needed_channels and data.pred_dt is None:
+			missing.append("pred_dt")
+		if "cos" in needed_channels and data.cos is None:
+			missing.append("cos")
+		if not missing:
+			return data
+		# Load only the missing channels into existing data
+		Z, Y, X = data.size
+		sx, sy, sz = data.spacing
+		crop = (int(data.origin_fullres[0]), int(data.origin_fullres[1]),
+				int(data.origin_fullres[2]),
+				int(round(X * sx)), int(round(Y * sy)), int(round(Z * sz)))
+		for ch in missing:
+			t, sp = fit_data.load_single_channel(
+				path=str(data_cfg.input), device=device, channel=ch, crop=crop)
+			cs = dict(data.channel_spacing) if data.channel_spacing else {}
+			cs[ch] = sp
+			data = dataclasses.replace(data, **{ch: t}, channel_spacing=cs)
+		print(f"[fit] loaded missing channels {missing}", flush=True)
+		return data
+
+	data = _ensure_data(None, set())
 
 	# Print loaded data summary
 	Z, Y, X = data.size
@@ -630,8 +669,7 @@ def main(argv: list[str] | None = None) -> int:
 		snapshot_interval=opt_cfg.snapshot_interval,
 		snapshot_fn=_snapshot,
 		progress_fn=_progress,
-		load_data_fn=_load_data,
-		volume_extent_fullres=volume_extent_fullres,
+		ensure_data_fn=_ensure_data,
 		seed_xyz=seed_xyz,
 	)
 

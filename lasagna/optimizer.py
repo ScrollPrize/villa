@@ -270,8 +270,7 @@ def optimize(
 	snapshot_interval: int,
 	snapshot_fn,
 	progress_fn=None,
-	load_data_fn=None,
-	volume_extent_fullres: tuple[int, int, int] | None = None,
+	ensure_data_fn=None,
 	seed_xyz: tuple[float, float, float] | None = None,
 ) -> fit_data.FitData3D:
 
@@ -380,6 +379,15 @@ def optimize(
 				row += f"  {pv[k]:10.4f}"
 			print(row)
 
+		# Ensure data covers mesh and has all channels needed by this stage
+		_needed_channels: set[str] = set()
+		if _need_term("pred_dt", opt_cfg.eff) > 0:
+			_needed_channels.add("pred_dt")
+		if _need_term("data", opt_cfg.eff) > 0 or _need_term("data_plain", opt_cfg.eff) > 0:
+			_needed_channels.add("cos")
+		if ensure_data_fn is not None:
+			data = ensure_data_fn(data, _needed_channels)
+
 		# Station-keeping: set seed point anchor (once, on first stage that uses it)
 		if (_need_term("station_n", opt_cfg.eff) > 0 or _need_term("station_t", opt_cfg.eff) > 0) and seed_xyz is not None:
 			dev = data.grad_mag.device
@@ -474,9 +482,8 @@ def optimize(
 				_t_steps_acc = 0
 				_t_wall_start = _t_wall_now
 
-			if load_data_fn is not None and (step1 % 100) == 0 and check_data_bounds(model, data, volume_extent_fullres=volume_extent_fullres):
-				print(f"[optimizer] mesh near data border at step {step1}, reloading data", flush=True)
-				data = load_data_fn()
+			if ensure_data_fn is not None and (step1 % 100) == 0:
+				data = ensure_data_fn(data, _needed_channels)
 
 			if snap_int > 0 and (step1 % snap_int) == 0:
 				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()), data=data, res=res)

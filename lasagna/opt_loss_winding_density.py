@@ -131,7 +131,10 @@ def winding_density_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, t
 
 
 def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""External offset loss: grad_mag integral from model surface to external reference should equal target offset."""
+	"""External offset loss: grad_mag integral from model surface to external reference should equal target offset.
+
+	Gradients flow through res.xyz_lr → strip endpoints → grid_sample → integral.
+	"""
 	if res.ext_conn is None or not res.ext_conn:
 		device = res.xyz_lr.device
 		z = torch.zeros((), device=device)
@@ -155,14 +158,10 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 	all_mask = []
 
 	for ext_pts, ext_mask, ext_sign, offset in res.ext_conn:
-		# Upsample everything to HR for denser, more stable sampling
 		start = _up_pts(res.xyz_lr)        # (D, He, We, 3) — has gradients
 		end = _up_pts(ext_pts)             # (D, He, We, 3) — detached
 		sign_hr = F.interpolate(ext_sign.unsqueeze(1).float(), size=(He, We),
 								mode='nearest').squeeze(1)  # (D, He, We)
-		# Bilinear-upsample mask: HR vertices that had ANY invalid LR neighbor
-		# in their interpolation footprint get mask < 1.0. Threshold at 1.0 to
-		# exclude them (their ext_pts are polluted by bilinear bleed).
 		mask_hr = (F.interpolate(ext_mask.float(), size=(He, We),
 								 mode='bilinear', align_corners=True) >= 1.0).float()
 
@@ -195,27 +194,10 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 		all_lm.append(lm)
 		all_mask.append(mask)
 
-		# DEBUG: periodic logging
-		if not hasattr(ext_offset_loss, "_step"):
-			ext_offset_loss._step = 0
-		ext_offset_loss._step += 1
-		if ext_offset_loss._step <= 2 or ext_offset_loss._step % 100 == 0:
-			with torch.no_grad():
-				m = mask.squeeze(1) > 0.5
-				if m.any():
-					print(f"[ext_offset] step={ext_offset_loss._step} "
-						  f"n={int(m.sum())} "
-						  f"integral={integral[m].mean():.4f}({integral[m].std():.4f}) "
-						  f"strip_len={strip_len[m].mean():.1f}({strip_len[m].std():.1f}) "
-						  f"mag={mag.mean(dim=-1)[m].mean():.4f} "
-						  f"sign:+{int((sign_hr[m]>0).sum())}/-{int((sign_hr[m]<0).sum())} "
-						  f"err={err[m].mean():.4f}({err[m].std():.4f})", flush=True)
-
 	n_ext = len(res.ext_conn)
 	if n_ext > 1:
 		total_loss = total_loss / n_ext
 
-	# Average lm/mask for visualization
 	lm_avg = sum(all_lm) / n_ext
 	mask_avg = sum(all_mask).clamp(max=1.0) / n_ext
 	return total_loss, (lm_avg,), (mask_avg,)
