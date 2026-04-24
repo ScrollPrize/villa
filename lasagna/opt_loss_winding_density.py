@@ -131,11 +131,12 @@ def winding_density_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, t
 
 
 def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""External offset loss via proxy target at LR using ext surface normals.
+	"""External offset loss via quad-corner proxy targets at LR.
 
-	For each model vertex, computes the grad_mag integral to the ext surface
-	(detached), then places a proxy target at (offset / mean_grad_mag) along
-	the ext surface normal (constant — can't create feedback loops).
+	For each model vertex, builds proxy points at the 4 corners of the
+	intersected ext surface quad, offset along each corner's fixed normal
+	by (offset / mean_grad_mag).  Bilinearly interpolates using (u, v).
+	No sign computation — offset sign determines the side.
 	"""
 	if res.ext_conn is None or not res.ext_conn:
 		device = res.xyz_lr.device
@@ -154,31 +155,42 @@ def ext_offset_loss(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, tuple[
 	all_lm = []
 	all_mask = []
 
-	for ext_pts, ext_mask, ext_sign, offset, ext_normal in res.ext_conn:
+	for (ext_mask, offset,
+		 P00, P10, P01, P11,
+		 N00, N10, N01, N11,
+		 u_frac, v_frac) in res.ext_conn:
 		with torch.no_grad():
-			# Grad_mag integral along strip (LR, detached)
-			diff = ext_pts - xyz_det
+			# Bilinear ext surface point (for strip integral)
+			uf = u_frac.unsqueeze(-1)
+			vf = v_frac.unsqueeze(-1)
+			ext_pt = (1-uf)*(1-vf)*P00 + uf*(1-vf)*P10 + (1-uf)*vf*P01 + uf*vf*P11
+
+			# Grad_mag along strip from model to ext surface point
+			diff = ext_pt - xyz_det
 			t = torch.linspace(0.0, 1.0, strip_samples, device=device, dtype=dtype)
 			strip = xyz_det.unsqueeze(-2) + t.view(1, 1, 1, -1, 1) * diff.unsqueeze(-2)
 			strip_flat = strip.reshape(D, Hm, Wm * strip_samples, 3)
 			sampled = res.data.grid_sample_fullres(strip_flat)
 			mag = sampled.grad_mag.squeeze(0).squeeze(0).reshape(D, Hm, Wm, strip_samples)
-
 			mean_mag = mag.mean(dim=-1).clamp(min=1e-4)
 
-			# Strip validity: mask AND all strip samples have grad_mag > 0
+			# Strip validity
 			sv = (sampled.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=dtype)
 			sv = sv.reshape(D, Hm, Wm, strip_samples).amin(dim=-1)
 			mask = (ext_mask.squeeze(1) * sv).unsqueeze(1)  # (D, 1, Hm, Wm)
 
-			# Orient ext normal toward model (constant direction)
-			orient = ((xyz_det - ext_pts) * ext_normal).sum(dim=-1, keepdim=True).sign()
-			oriented_n = ext_normal * orient
+			# Proxy at each quad corner: corner + (offset / mean_mag) * corner_normal
+			d = (offset / mean_mag).unsqueeze(-1)  # (D, Hm, Wm, 1)
+			proxy00 = P00 + d * N00
+			proxy10 = P10 + d * N10
+			proxy01 = P01 + d * N01
+			proxy11 = P11 + d * N11
 
-			# Proxy: ext surface + target offset distance along ext normal
-			target = ext_pts + (offset / mean_mag).unsqueeze(-1) * oriented_n
+			# Bilinear interpolation of proxy points
+			target = ((1-uf)*(1-vf)*proxy00 + uf*(1-vf)*proxy10
+					 + (1-uf)*vf*proxy01 + uf*vf*proxy11)
 
-		# L2 loss: push mesh toward proxy target
+		# L2 loss
 		lm = (res.xyz_lr - target).square().sum(dim=-1).unsqueeze(1)  # (D, 1, Hm, Wm)
 
 		wsum = float(mask.sum().detach().cpu())

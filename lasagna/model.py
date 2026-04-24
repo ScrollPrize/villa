@@ -38,8 +38,8 @@ class FitResult3D:
 	mask_conn: torch.Tensor     # (D, 1, Hm, Wm, 3) — validity per connection point
 	sign_conn: torch.Tensor     # (D, 1, Hm, Wm, 2) — ray param sign [prev, next]
 	params: ModelParams3D
-	ext_conn: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor, float, torch.Tensor]] | None = None
-	# Per ext surface: (ext_pts (D,Hm,Wm,3), ext_mask (D,1,Hm,Wm), ext_sign (D,Hm,Wm), offset, ext_normal (D,Hm,Wm,3))
+	ext_conn: list | None = None
+	# Per ext surface: (mask, offset, P00..P11, N00..N11, u_frac, v_frac) — quad corners + normals + bilinear fracs
 
 
 class Model3D(nn.Module):
@@ -840,13 +840,10 @@ class Model3D(nn.Module):
 			v = nv / (dv + eps * (dv.abs() < eps).float())
 
 			conn_pt = P00 + u.unsqueeze(-1) * a + v.unsqueeze(-1) * b + (u * v).unsqueeze(-1) * c
-			s_sign = ((conn_pt - O) * n).sum(dim=-1).sign()
-			s_sign = torch.where(s_sign == 0, torch.ones_like(s_sign), s_sign)
 
 			in_bounds = (target_h >= 0) & (target_h <= H_ext - 1) & (target_w >= 0) & (target_w <= W_ext - 1)
 			uv_ok = (u >= 0) & (u <= 1) & (v >= 0) & (v <= 1)
 			gm_valid = (data.grid_sample_fullres(conn_pt.detach()).grad_mag.squeeze(0).squeeze(0) > 0.0)
-			# Check all 4 quad corners are valid in the external surface
 			ext_v = self._ext_valid[ei]  # (H_ext, W_ext)
 			quad_valid = ext_v[row, col] & ext_v[row + 1, col] & ext_v[row, col + 1] & ext_v[row + 1, col + 1]
 			valid = (in_bounds & uv_ok & gm_valid & quad_valid).to(dtype=xyz_lr.dtype).unsqueeze(1)  # (D, 1, Hm, Wm)
@@ -854,7 +851,12 @@ class Model3D(nn.Module):
 			# Cache intersection params for conn_offset update
 			self._ext_conn_params[ei] = {"u": u, "v": v, "row": row, "col": col}
 
-			results.append((conn_pt.detach(), valid, s_sign, offset, n.detach()))
+			results.append((
+				valid, offset,
+				P00.detach(), P10.detach(), P01.detach(), P11.detach(),
+				n00.detach(), n10.detach(), n01.detach(), n11.detach(),
+				u.detach(), v.detach(),
+			))
 
 		return results
 
