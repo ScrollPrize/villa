@@ -566,12 +566,13 @@ def calculate_chunks(volume_shape, output_chunks=None, z_range=None):
                 y_end = min(y_start + y_chunk, Y)
                 x_end = min(x_start + x_chunk, X)
 
-                # Apply Z-range filtering if specified
+                # Apply Z-range filtering if specified. z_range is chunk-aligned
+                # (see merge_inference_outputs), so each chunk's z_start uniquely
+                # identifies its owning partition.
                 if z_range is not None:
                     range_z_start, range_z_end = z_range
-                    # Only include chunks whose end is inside the range
-                    if not (range_z_start < z_end and range_z_end >= z_end):
-                        continue  # Skip chunks outside the Z-range
+                    if not (range_z_start <= z_start < range_z_end):
+                        continue
 
                 chunks.append({
                     'z_start': z_start, 'z_end': z_end,
@@ -777,13 +778,23 @@ def merge_inference_outputs(
     gaussian_map = generate_gaussian_map(patch_size, sigma_scale=sigma_scale)
 
     # --- 5. Calculate Z-range for this part ---
+    # Partition by chunk index (not by Z coordinate) so boundaries always fall
+    # on chunk boundaries. Otherwise the `(range_z_start, range_z_end]` filter
+    # on z_end drifts against the chunk grid and the clamped partial last chunk
+    # can land in the same partition as the preceding full chunk — doubling the
+    # last partition's work and leaving part 0 empty.
     z_range = None
     if num_parts > 1:
-        total_z = original_volume_shape[0]  # Z dimension
-        z_start = (global_part_id * total_z) // num_parts
-        z_end = ((global_part_id + 1) * total_z) // num_parts
+        total_z = original_volume_shape[0]
+        z_chunk = output_chunks[1]
+        total_z_chunks = (total_z + z_chunk - 1) // z_chunk
+        start_chunk = (global_part_id * total_z_chunks) // num_parts
+        end_chunk = ((global_part_id + 1) * total_z_chunks) // num_parts
+        z_start = start_chunk * z_chunk
+        z_end = min(end_chunk * z_chunk, total_z)
         z_range = (z_start, z_end)
-        print(f"Part {global_part_id} processing Z-range: {z_start} to {z_end} (out of {total_z})")
+        print(f"Part {global_part_id} processing Z-range: {z_start} to {z_end} "
+              f"(chunks {start_chunk}..{end_chunk} of {total_z_chunks}, total_z={total_z})")
 
     # --- 6. Calculate Processing Chunks ---
     chunks = calculate_chunks(
