@@ -661,7 +661,6 @@ class Model3D(nn.Module):
 		"""
 		H, W, _ = xyz.shape
 		import math
-		n_scales = max(5, int(math.ceil(math.log2(max(H, W)))) + 1)
 		mdl = Model3D(
 			device=device, depth=1, mesh_h=H, mesh_w=W,
 			mesh_step=mesh_step, winding_step=winding_step,
@@ -674,8 +673,17 @@ class Model3D(nn.Module):
 		valid_dev = valid.to(device=device)
 		mdl.arc_enabled = False
 		mdl.straight_enabled = False
-		mdl.mesh_ms = Model3D._construct_pyramid_from_flat_3d_masked(
-			flat_mesh, valid_dev, n_scales=n_scales, pyramid_d=mdl.pyramid_d)
+		# Inpaint invalid vertices via masked pyramid, then rebuild with
+		# the standard (non-masked) constructor so the pyramid has the same
+		# number of scales and residual distribution as checkpoint-loaded models.
+		n_inpaint = max(5, int(math.ceil(math.log2(max(H, W)))) + 1)
+		inpaint_ms = Model3D._construct_pyramid_from_flat_3d_masked(
+			flat_mesh, valid_dev, n_scales=n_inpaint, pyramid_d=mdl.pyramid_d)
+		with torch.no_grad():
+			flat_inpainted = Model3D._integrate_pyramid_3d(inpaint_ms, pyramid_d=mdl.pyramid_d)
+		n_scales = len(mdl.mesh_ms)  # standard scale count from constructor
+		mdl.mesh_ms = Model3D._construct_pyramid_from_flat_3d(
+			flat_inpainted, n_scales, pyramid_d=mdl.pyramid_d)
 		return mdl
 
 	@staticmethod
