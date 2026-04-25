@@ -248,8 +248,6 @@ void CorrectionsState::setGrowthInProgress(bool running)
 
 void CorrectionsState::clearAll(bool editingEnabled)
 {
-    setAnnotateMode(false, false, editingEnabled);
-
     if (_collection) {
         for (uint64_t id : _pendingCollectionIds) {
             if (_managedCollectionIds.count(id) > 0) {
