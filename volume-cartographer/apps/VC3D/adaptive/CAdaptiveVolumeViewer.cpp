@@ -1199,7 +1199,7 @@ cv::Vec3f CAdaptiveVolumeViewer::sceneToVolume(const QPointF& scenePoint) const
     auto surf = _surfWeak.lock();
     if (!surf) return {0, 0, 0};
     cv::Vec2f sp = sceneToSurface(scenePoint);
-    cv::Vec3f surfLoc = {sp[0], sp[1], 0};
+    cv::Vec3f surfLoc = {sp[0], sp[1], _camera.zOff};
     cv::Vec3f ptr(0, 0, 0);
     return surf->coord(ptr, surfLoc);
 }
@@ -1635,7 +1635,7 @@ bool CAdaptiveVolumeViewer::sceneToVolumePN(cv::Vec3f& p, cv::Vec3f& n,
         return false;
     }
     cv::Vec2f sp = sceneToSurface(scenePos);
-    cv::Vec3f surfLoc = {sp[0], sp[1], 0};
+    cv::Vec3f surfLoc = {sp[0], sp[1], _camera.zOff};
     cv::Vec3f ptr(0, 0, 0);
     n = surf->normal(ptr, surfLoc);
     p = surf->coord(ptr, surfLoc);
