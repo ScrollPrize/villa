@@ -3185,13 +3185,7 @@ void CWindow::CreateWidgets(void)
         if (_surfacePanel) {
             _surfacePanel->loadSurfacesIncremental();
         }
-        // Reload corr_points_results for the active surface
-        if (_point_collection_widget) {
-            auto surf = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
-            if (surf && !surf->path.empty()) {
-                _point_collection_widget->loadCorrPointsResults(surf->path / "corr_points_results.json");
-            }
-        }
+        // corr_points_results will be loaded when the new segment is activated
     });
 
     // Create Drawing widget
@@ -5143,6 +5137,17 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
         if (_segmentationModule) {
             _segmentationModule->onActiveSegmentChanged(surf.get());
         }
+
+        // Load corr_points_results for the new segment
+        if (_point_collection_widget) {
+            auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf);
+            if (quadSurf && !quadSurf->path.empty()) {
+                _point_collection_widget->loadCorrPointsResults(
+                    quadSurf->path / "corr_points_results.json");
+            } else {
+                _point_collection_widget->clearCorrPointsResults();
+            }
+        }
     }
 
     if (surf) {
@@ -5173,6 +5178,17 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSu
 
     if (newSurfId != previousSurfId && _segmentationModule) {
         _segmentationModule->onActiveSegmentChanged(surf.get());
+
+        // Load corr_points_results for the new segment
+        if (_point_collection_widget) {
+            auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf);
+            if (quadSurf && !quadSurf->path.empty()) {
+                _point_collection_widget->loadCorrPointsResults(
+                    quadSurf->path / "corr_points_results.json");
+            } else {
+                _point_collection_widget->clearCorrPointsResults();
+            }
+        }
 
         const bool wantsEditing = _segmentationWidget && _segmentationWidget->isEditingEnabled();
         if (wantsEditing) {

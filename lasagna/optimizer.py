@@ -152,6 +152,9 @@ lambda_global: dict[str, float] = {
 	"data_plain": 0.0,
 	"pred_dt": 0.0,
 	"corr": 0.0,
+	"corr_snap": 0.0,
+	"corr_legacy": 0.0,
+	"corr_signed": 0.0,
 	"winding_vol": 0.0,
 	"station_n": 0.0,
 	"station_t": 0.0,
@@ -282,7 +285,10 @@ def optimize(
 		"data": {"loss": opt_loss_data.data_loss},
 		"data_plain": {"loss": opt_loss_data.data_plain_loss},
 		"pred_dt": {"loss": opt_loss_pred_dt.pred_dt_loss},
-		"corr": {"loss": opt_loss_corr.corr_loss},
+		"corr": {"loss": opt_loss_corr.corr_winding_loss},
+		"corr_snap": {"loss": opt_loss_corr.corr_snap_loss},
+		"corr_legacy": {"loss": opt_loss_corr.corr_legacy_loss},
+		"corr_signed": {"loss": opt_loss_corr.corr_signed_loss},
 		"winding_vol": {"loss": opt_loss_winding_volume.winding_volume_loss},
 		"station": {"loss": opt_loss_station.station_loss, "sub": ["station_n", "station_t"]},
 		"bend": {"loss": opt_loss_bend.bend_loss},
@@ -500,26 +506,27 @@ def optimize(
 	_num_stages = len(stages)
 
 	# Debug: show corr status
+	_corr_terms = ("corr", "corr_snap", "corr_legacy", "corr_signed")
 	has_corr_pts = data.corr_points is not None and data.corr_points.points_xyz_winda.shape[0] > 0
-	corr_weights = [(_need_term("corr", s.global_opt.eff), s.name) for s in stages if s.global_opt.steps > 0]
-	print(f"[optimizer] corr_points={has_corr_pts}"
-		  f" corr_mode={opt_loss_corr._corr_mode}"
-		  f" corr_weights={corr_weights}", flush=True)
+	corr_weights = {t: [(_need_term(t, s.global_opt.eff), s.name) for s in stages if s.global_opt.steps > 0]
+					for t in _corr_terms}
+	active_corr = {t: ws for t, ws in corr_weights.items() if any(w > 0 for w, _ in ws)}
+	print(f"[optimizer] corr_points={has_corr_pts} active_corr_terms={list(active_corr.keys())}", flush=True)
 	if has_corr_pts:
 		cp = data.corr_points
 		n = cp.points_xyz_winda.shape[0]
 		print(f"[optimizer] {n} corr points", flush=True)
-		if all(w == 0.0 for w, _ in corr_weights):
-			print(f"[optimizer] WARNING: corr points loaded but corr weight is 0 in all stages!", flush=True)
+		if not active_corr:
+			print(f"[optimizer] WARNING: corr points loaded but no corr weight > 0 in any stage!", flush=True)
 
 	for si, stage in enumerate(stages):
 		if stage.global_opt.steps > 0:
 			data = _run_opt(si=si, label=f"stage{si}", stage=stage, opt_cfg=stage.global_opt, data=data)
 
-	if any(_need_term("corr", stage.global_opt.eff) > 0 for stage in stages if stage.global_opt.steps > 0):
+	if active_corr:
 		opt_loss_corr.print_detail("END")
 		opt_loss_corr.print_summary()
 	elif has_corr_pts:
-		print("[optimizer] corr points present but corr weight=0, no corr loss computed", flush=True)
+		print("[optimizer] corr points present but no corr weight > 0, no corr loss computed", flush=True)
 
 	return data

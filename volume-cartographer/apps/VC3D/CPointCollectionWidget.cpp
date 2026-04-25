@@ -261,12 +261,14 @@ void CPointCollectionWidget::refreshTree()
             pt_err_item->setFlags(pt_err_item->flags() & ~Qt::ItemIsEditable);
 
             auto res_it = _corr_point_results.find(point.id);
-            if (res_it != _corr_point_results.end() && corrResultPositionMatches(res_it->second, point.p)) {
-                if (std::isfinite(res_it->second.winding_obs)) {
-                    pt_winding_item->setText(QString::number(res_it->second.winding_obs, 'f', 3));
-                }
-                if (std::isfinite(res_it->second.winding_err)) {
-                    pt_err_item->setText(QString::number(res_it->second.winding_err, 'f', 3));
+            if (res_it != _corr_point_results.end()) {
+                if (corrResultPositionMatches(res_it->second, point.p)) {
+                    if (std::isfinite(res_it->second.winding_obs)) {
+                        pt_winding_item->setText(QString::number(res_it->second.winding_obs, 'f', 3));
+                    }
+                    if (std::isfinite(res_it->second.winding_err)) {
+                        pt_err_item->setText(QString::number(res_it->second.winding_err, 'f', 3));
+                    }
                 }
             }
 
@@ -782,7 +784,7 @@ void CPointCollectionWidget::loadCorrPointsResults(const std::filesystem::path& 
         utils::Json j = utils::Json::parse_file(jsonPath);
 
         if (j.contains("points") && j["points"].is_object()) {
-            const auto& points = j["points"];
+            auto points = j["points"];  // copy — ref into Json::at() cache gets evicted by nested calls
             for (auto it = points.begin(); it != points.end(); ++it) {
                 const std::string key = it.key();
                 const auto& val = *it;
@@ -805,7 +807,7 @@ void CPointCollectionWidget::loadCorrPointsResults(const std::filesystem::path& 
         }
 
         if (j.contains("collection_avgs") && j["collection_avgs"].is_object()) {
-            const auto& avgs = j["collection_avgs"];
+            auto avgs = j["collection_avgs"];  // copy — ref into Json::at() cache gets evicted by nested calls
             for (auto it = avgs.begin(); it != avgs.end(); ++it) {
                 const std::string key = it.key();
                 const auto& val = *it;
@@ -816,8 +818,10 @@ void CPointCollectionWidget::loadCorrPointsResults(const std::filesystem::path& 
                 }
             }
         }
+    } catch (const std::exception& e) {
+        qWarning() << "Failed to parse corr_points_results:" << e.what();
     } catch (...) {
-        // Silently ignore parse errors
+        qWarning() << "Failed to parse corr_points_results (unknown error)";
     }
 
     refreshTree();

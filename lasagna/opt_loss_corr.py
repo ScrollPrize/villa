@@ -9,7 +9,6 @@ import model as fit_model
 
 _dbg_call_count = 0
 _last_results: dict | None = None
-_corr_mode: str = "winding"
 
 # Snap-mode anchor state (persists across calls)
 _snap_anchors_h: torch.Tensor | None = None
@@ -18,6 +17,12 @@ _snap_anchors_u: torch.Tensor | None = None
 _snap_anchors_v: torch.Tensor | None = None
 _snap_anchors_dir: torch.Tensor | None = None  # 0=prev, 1=next
 _snap_initialized: bool = False
+
+# Corr-snap-to-surface anchor state (persists across calls)
+_csnap_anchors_h: torch.Tensor | None = None    # (K,) int — quad row
+_csnap_anchors_w: torch.Tensor | None = None    # (K,) int — quad col
+_csnap_anchors_valid: torch.Tensor | None = None # (K,) bool — per-anchor validity
+_csnap_initialized: bool = False
 
 # Winding-mode anchor state (persists across calls)
 # Correspondence indices: 0=closest_low, 1=closest_up, 2=avg_low, 3=avg_up
@@ -30,26 +35,28 @@ _wind_target_per_point: torch.Tensor | None = None  # (K,) float — cached targ
 _wind_obs_per_point: torch.Tensor | None = None      # (K,) float — last raw winding observation
 
 
-def set_corr_mode(mode: str) -> None:
-	global _corr_mode
-	assert mode in ("legacy", "snap", "winding"), f"Unknown corr mode: {mode}"
-	_corr_mode = mode
-
-
-def set_snap_mode(enabled: bool) -> None:
-	"""Backward compat: 0=legacy, 1=snap."""
-	set_corr_mode("snap" if enabled else "legacy")
-
-
-def corr_loss(
+def corr_winding_loss(
 	*, res: fit_model.FitResult3D,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Dispatch to winding, snap, or legacy corr loss."""
-	if _corr_mode == "winding":
-		return _corr_winding_loss(res=res)
-	if _corr_mode == "snap":
-		return _corr_snap_loss(res=res)
+	return _corr_winding_loss(res=res)
+
+
+def corr_snap_loss(
+	*, res: fit_model.FitResult3D,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	return _corr_snap_to_surface_loss(res=res)
+
+
+def corr_legacy_loss(
+	*, res: fit_model.FitResult3D,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	return _corr_legacy_loss(res=res)
+
+
+def corr_signed_loss(
+	*, res: fit_model.FitResult3D,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	return _corr_snap_loss(res=res)
 
 
 def _corr_legacy_loss(
@@ -342,7 +349,7 @@ def print_detail(label: str = "") -> None:
 		print(f"{tag} no points")
 		return
 
-	print(f"{tag} {len(pts)} points, mode={_corr_mode}")
+	print(f"{tag} {len(pts)} points")
 
 	# Collection averages
 	for cid, avg in sorted(col_avgs.items(), key=lambda x: int(x[0])):
@@ -351,7 +358,7 @@ def print_detail(label: str = "") -> None:
 	# Per-point table
 	print(f"  {'pid':>6s}  {'col':>4s}  {'pos':>26s}  {'w_obs':>8s}  {'w_tgt':>8s}  {'w_err':>8s}  {'valid':>5s}", end="")
 	# Anchor columns (winding mode only)
-	has_anchors = _wind_anchors_d is not None and _corr_mode == "winding"
+	has_anchors = _wind_anchors_d is not None
 	if has_anchors:
 		print(f"  {'cl_lo':>8s}  {'cl_up':>8s}  {'av_lo':>8s}  {'av_up':>8s}", end="")
 	print()
@@ -1605,4 +1612,230 @@ def _build_winding_results(
 			v = float(target[mask].mean().item())
 			if math.isfinite(v):
 				result["collection_avgs"][str(cid_int)] = round(v, 6)
+	return result
+
+
+# ---------------------------------------------------------------------------
+# Corr snap-to-surface loss (D=1 only, single anchor per point)
+# ---------------------------------------------------------------------------
+
+def _corr_snap_to_surface_loss(
+	*, res: fit_model.FitResult3D,
+) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
+	"""Snap-to-surface corr loss: push single winding toward each corr point.
+
+	D=1 only. One ray-bilinear anchor per point on layer 0. Proxy correction
+	pushes the surface toward P, scaled by the grad_mag strip integral between
+	the surface and P (so far-away points with weak signal contribute less).
+	"""
+	global _dbg_call_count, _last_results
+	global _csnap_anchors_h, _csnap_anchors_w, _csnap_anchors_valid, _csnap_initialized
+
+	_dbg_call_count += 1
+	dbg = (_dbg_call_count <= 2)
+
+	dev = res.xyz_lr.device
+	dt = res.xyz_lr.dtype
+	zero = torch.zeros((), device=dev, dtype=dt)
+	dummy_ret = (zero, (torch.zeros((1,), device=dev, dtype=dt),),
+				 (torch.zeros((1,), device=dev, dtype=dt),))
+
+	pts_c = res.data.corr_points
+	if pts_c is None or pts_c.points_xyz_winda.shape[0] == 0:
+		if dbg:
+			print("[corr-snap2s] no correction points")
+		return dummy_ret
+
+	pts = pts_c.points_xyz_winda.to(device=dev, dtype=dt)
+	col = pts_c.collection_idx.to(device=dev, dtype=torch.int64)
+	pt_ids = pts_c.point_ids.to(device=dev, dtype=torch.int64)
+	K = int(pts.shape[0])
+	P = pts[:, :3]
+
+	xyz_lr = res.xyz_lr
+	D, Hm, Wm, _ = xyz_lr.shape
+	Qh, Qw = Hm - 1, Wm - 1
+
+	if D != 1:
+		print(f"[corr-snap2s] ERROR: corr_snap requires D=1, got D={D}")
+		return dummy_ret
+	if Qh <= 0 or Qw <= 0:
+		return dummy_ret
+
+	xyz_det = xyz_lr.detach()
+	strip_samples = max(2, int(res.params.subsample_mesh) + 1)
+
+	# GT normal at corr point positions (for strip integral sign + proxy direction)
+	gt_n_sampled = res.data.grid_sample_fullres(P.reshape(1, 1, K, 3))
+	gt_n = gt_n_sampled.normal_3d.reshape(K, 3)
+	gt_n = gt_n / (gt_n.norm(dim=-1, keepdim=True) + 1e-8)
+
+	# --- Initialize or update anchors ---
+	d_layer = torch.zeros(K, dtype=torch.long, device=dev)  # always layer 0
+
+	if not _csnap_initialized or _csnap_anchors_h is None or _csnap_anchors_h.shape[0] != K:
+		if dbg:
+			print(f"[corr-snap2s] brute-force init: K={K} points, mesh=(1,{Hm},{Wm})")
+		with torch.no_grad():
+			ah, aw, au, av = _wind_nearest_quad_on_layer(P, gt_n, xyz_det, d_layer, Qh, Qw)
+			in_bounds = (au >= 0) & (au <= 1) & (av >= 0) & (av <= 1)
+			_csnap_anchors_h = ah
+			_csnap_anchors_w = aw
+			_csnap_anchors_valid = in_bounds
+		_csnap_initialized = True
+	else:
+		# Two-pass ray-bilinear update (same as winding anchor update)
+		with torch.no_grad():
+			def _gather_quad_cs(d, h, w):
+				return (xyz_det[d, h, w],
+						xyz_det[d, (h + 1).clamp(max=Qh), w],
+						xyz_det[d, h, (w + 1).clamp(max=Qw)],
+						xyz_det[d, (h + 1).clamp(max=Qh), (w + 1).clamp(max=Qw)])
+
+			row = _csnap_anchors_h
+			col_a = _csnap_anchors_w
+
+			# Pass 1: intersect on current quad
+			M00, M10, M01, M11 = _gather_quad_cs(d_layer, row, col_a)
+			frac_h = torch.full_like(row, 0.5, dtype=dt)
+			frac_w = torch.full_like(col_a, 0.5, dtype=dt)
+			u1, v1 = fit_model.Model3D._ray_bilinear_intersect(
+				P, gt_n, M00, M10, M01, M11, frac_h, frac_w)
+
+			# Shift quad idx
+			new_h = (row.float() + u1).clamp(0, Hm - 2)
+			new_w = (col_a.float() + v1).clamp(0, Wm - 2)
+			new_row = new_h.floor().clamp(0, Hm - 2).long()
+			new_col = new_w.floor().clamp(0, Wm - 2).long()
+			new_frac_h = new_h - new_row.float()
+			new_frac_w = new_w - new_col.float()
+
+			# Pass 2: re-intersect on shifted quad
+			M00, M10, M01, M11 = _gather_quad_cs(d_layer, new_row, new_col)
+			u2, v2 = fit_model.Model3D._ray_bilinear_intersect(
+				P, gt_n, M00, M10, M01, M11, new_frac_h, new_frac_w)
+
+			final_h = (new_row.float() + u2).nan_to_num_(0.0).clamp(0, Hm - 2)
+			final_w = (new_col.float() + v2).nan_to_num_(0.0).clamp(0, Wm - 2)
+			_csnap_anchors_h = final_h.floor().long()
+			_csnap_anchors_w = final_w.floor().long()
+			_csnap_anchors_valid = (u2 >= 0) & (u2 <= 1) & (v2 >= 0) & (v2 <= 1)
+
+	# --- Proxy correction loss ---
+	valid = _csnap_anchors_valid
+	if not valid.any():
+		if dbg:
+			print("[corr-snap2s] no valid anchors")
+		_last_results = _build_csnap_results(
+			pt_ids=pt_ids, col_idx=col, pts=pts, valid=valid,
+			signed_dist=torch.zeros(K, device=dev, dtype=dt))
+		return dummy_ret
+
+	vi = valid.nonzero(as_tuple=True)[0]
+	h_vi = _csnap_anchors_h[vi]
+	w_vi = _csnap_anchors_w[vi]
+	d_vi = torch.zeros_like(h_vi)  # layer 0
+
+	# Gather model quad corners WITH gradients
+	M00 = xyz_lr[d_vi, h_vi, w_vi]
+	M10 = xyz_lr[d_vi, h_vi + 1, w_vi]
+	M01 = xyz_lr[d_vi, h_vi, w_vi + 1]
+	M11 = xyz_lr[d_vi, h_vi + 1, w_vi + 1]
+
+	with torch.no_grad():
+		M00_det = M00.detach()
+		M10_det = M10.detach()
+		M01_det = M01.detach()
+		M11_det = M11.detach()
+
+		# Project P onto quad (detached u,v for bilinear weights)
+		u_ci, v_ci = _bilinear_project(P[vi], M00_det, M10_det, M01_det, M11_det)
+
+		# Bilinear model point (detached)
+		uf = u_ci.unsqueeze(-1)
+		vf = v_ci.unsqueeze(-1)
+		Q = (1 - uf) * (1 - vf) * M00_det + uf * (1 - vf) * M10_det + \
+			(1 - uf) * vf * M01_det + uf * vf * M11_det
+
+		# Strip integral from P to Q
+		sw, uw, sv = _wind_strip_integral(P[vi], Q, gt_n[vi], res.data, strip_samples)
+
+		# Error: signed winding from surface to point should be 0
+		# (we want surface AT the point, so target offset is 0)
+		err = sw
+
+		# Store signed distance for results
+		all_signed_dist = torch.zeros(K, device=dev, dtype=dt)
+		all_signed_dist[vi] = err.detach()
+
+		# Proxies: shift each corner by gt_n * err
+		we = err.unsqueeze(-1)
+		gt_n_vi = gt_n[vi]
+		proxy00 = M00_det - gt_n_vi * we
+		proxy10 = M10_det - gt_n_vi * we
+		proxy01 = M01_det - gt_n_vi * we
+		proxy11 = M11_det - gt_n_vi * we
+
+	# Bilinear weights
+	w00 = (1 - u_ci) * (1 - v_ci)
+	w10 = u_ci * (1 - v_ci)
+	w01 = (1 - u_ci) * v_ci
+	w11 = u_ci * v_ci
+
+	# L2 loss (gradients flow through M00..M11), scaled by grad_mag integral
+	lm00 = (M00 - proxy00).square().sum(dim=-1)
+	lm10 = (M10 - proxy10).square().sum(dim=-1)
+	lm01 = (M01 - proxy01).square().sum(dim=-1)
+	lm11 = (M11 - proxy11).square().sum(dim=-1)
+	lm = w00 * lm00 + w10 * lm10 + w01 * lm01 + w11 * lm11
+
+	# Scale by strip integral (so weak-signal far-away points contribute less)
+	weight = uw.clamp(max=1.0)
+	lm_weighted = lm * weight
+
+	# Mask by strip validity
+	mask_ci = sv.to(dt)
+	wsum = float(mask_ci.sum().detach().cpu())
+	if wsum > 0:
+		loss = (lm_weighted * mask_ci).sum() / wsum
+	else:
+		loss = zero
+
+	if dbg:
+		rms = float(loss.detach().sqrt().item()) if wsum > 0 else float("nan")
+		n_valid = int(valid.sum().item())
+		print(f"[corr-snap2s] loss={float(loss.detach().item()):.6f}, "
+			  f"valid={n_valid}/{K}, rms_proxy={rms:.4f}")
+
+	_last_results = _build_csnap_results(
+		pt_ids=pt_ids, col_idx=col, pts=pts, valid=valid,
+		signed_dist=all_signed_dist)
+	if _dbg_call_count == 1:
+		print_detail("INIT")
+
+	err_sq_all = all_signed_dist * all_signed_dist
+	mask_out = valid.to(dt)
+	return loss, (err_sq_all,), (mask_out,)
+
+
+def _build_csnap_results(
+	*, pt_ids: torch.Tensor, col_idx: torch.Tensor, pts: torch.Tensor,
+	valid: torch.Tensor, signed_dist: torch.Tensor,
+) -> dict:
+	"""Build JSON-serializable dict of per-point corr_snap results."""
+	result: dict = {"points": {}, "collection_avgs": {}}
+	K = int(pts.shape[0])
+	for i in range(K):
+		pid = int(pt_ids[i].item())
+		cid = int(col_idx[i].item())
+		sd = float(signed_dist[i].item()) if bool(valid[i]) else None
+		entry: dict = {
+			"collection_id": cid,
+			"p": [round(float(pts[i, j].item()), 2) for j in range(3)],
+			"winding_obs": 0.0 if bool(valid[i]) else None,
+			"winding_target": 0.0 if bool(valid[i]) else None,
+			"winding_err": round(sd, 6) if sd is not None and math.isfinite(sd) else None,
+			"valid": bool(valid[i]),
+		}
+		result["points"][str(pid)] = entry
 	return result

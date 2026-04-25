@@ -403,7 +403,6 @@ def main(argv: list[str] | None = None) -> int:
 							  f"overall={overall:.3f} {stage_name}", flush=True)
 				return _progress_win
 
-			opt_loss_corr.set_corr_mode(opt_cfg.corr_mode)
 			opt_loss_dir.set_mask_zero_normals(opt_cfg.normal_mask_zero)
 
 			# Seed from center of model grid (matches h_mid/w_mid in station loss)
@@ -655,8 +654,6 @@ def main(argv: list[str] | None = None) -> int:
 		if progress_enabled:
 			print(f"PROGRESS {step} {total} {loss:.6f}", flush=True)
 
-	# Configure corr snap mode
-	opt_loss_corr.set_corr_mode(opt_cfg.corr_mode)
 	opt_loss_dir.set_mask_zero_normals(opt_cfg.normal_mask_zero)
 
 	# Run optimization
