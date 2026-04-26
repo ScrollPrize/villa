@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <stdexcept>
 #include <thread>
 #include <utils/http_fetch.hpp>
 
@@ -407,6 +408,8 @@ BlockPipeline::BlockPipeline(
                 std::lock_guard lock(negativeMutex_);
                 negativeCache_.insert(key);
                 if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
+            } else if (isHttp && HttpSource::lastFetchHadTransientError()) {
+                throw std::runtime_error("transient HTTP chunk fetch failure");
             }
             return {};
         }
@@ -547,6 +550,8 @@ BlockPipeline::BlockPipeline(
                     bloomAdd(key);
                     std::lock_guard lock(negativeMutex_);
                     negativeCache_.insert(key);
+                } else if (isHttp && HttpSource::lastFetchHadTransientError()) {
+                    throw std::runtime_error("transient HTTP chunk fetch failure");
                 }
                 return {};
             }
@@ -715,6 +720,8 @@ BlockPipeline::BlockPipeline(
                         std::lock_guard lock(negativeMutex_);
                         negativeCache_.insert(key);
                         if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
+                    } else if (HttpSource::lastFetchHadTransientError()) {
+                        throw std::runtime_error("transient HTTP chunk fetch failure");
                     }
                     return {};
                 }
@@ -1003,14 +1010,25 @@ ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey) {
     out->elementSize = 1;
     out->bytes.assign(size_t(C) * C * C, 0);
     bool anyData = false;
+    bool sawTransientFetchFailure = false;
+    const bool isHttp = dynamic_cast<HttpSource*>(source_.get()) != nullptr;
 
     for (int siz = sz0; siz < sz1; ++siz)
     for (int siy = sy0; siy < sy1; ++siy)
     for (int six = sx0; six < sx1; ++six) {
         ChunkKey srcKey{canonKey.level, siz, siy, six};
         std::vector<uint8_t> compressed;
-        try { compressed = source_->fetch(srcKey); } catch (...) { continue; }
-        if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) continue;
+        try {
+            compressed = source_->fetch(srcKey);
+        } catch (...) {
+            if (isHttp) sawTransientFetchFailure = true;
+            continue;
+        }
+        if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) {
+            if (isHttp && HttpSource::lastFetchHadTransientError())
+                sawTransientFetchFailure = true;
+            continue;
+        }
         auto data = decompress_(compressed, srcKey);
         if (!data) continue;
         anyData = true;
@@ -1038,6 +1056,8 @@ ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey) {
         }
     }
 
+    if (sawTransientFetchFailure)
+        throw std::runtime_error("transient HTTP chunk fetch failure");
     if (!anyData) return nullptr;
     return out;
 }

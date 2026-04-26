@@ -3158,8 +3158,8 @@ void CWindow::CreateWidgets(void)
     tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDrawing);
 
-    // Make Drawing dock the active tab by default
-    ui.dockWidgetDrawing->raise();
+    // Make Segmentation dock the active tab by default
+    ui.dockWidgetSegmentation->raise();
 
     // Build Viewer Controls dock from the existing view-related panels.
     auto* viewerControlsLayout = qobject_cast<QVBoxLayout*>(ui.dockWidgetViewerControlsContents->layout());

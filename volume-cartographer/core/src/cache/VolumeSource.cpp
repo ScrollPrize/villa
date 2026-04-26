@@ -212,11 +212,17 @@ int HttpSource::totalChunksPerShard() const noexcept
 
 namespace {
 thread_local bool tl_last_was_absent = false;
+thread_local bool tl_last_had_transient_error = false;
 }
 
 bool HttpSource::lastFetchWasAbsent() noexcept
 {
     return tl_last_was_absent;
+}
+
+bool HttpSource::lastFetchHadTransientError() noexcept
+{
+    return tl_last_had_transient_error;
 }
 
 std::vector<uint8_t> HttpSource::httpGet(const std::string& url)
@@ -227,11 +233,13 @@ std::vector<uint8_t> HttpSource::httpGet(const std::string& url)
     // also flips it on after seeing a missing/zero-placeholder index entry
     // inside a successfully-downloaded shard.
     tl_last_was_absent = (resp.status_code == 404);
+    tl_last_had_transient_error = false;
     if (!resp.ok()) {
         // 404 is an expected "chunk doesn't exist" response — stay quiet.
         // Anything else (403/401/5xx) almost always means auth or network
         // trouble; log loudly so it doesn't look like an empty volume.
         if (resp.status_code != 404) {
+            tl_last_had_transient_error = true;
             transientError_.store(true, std::memory_order_relaxed);
             static std::atomic<int> errCount{0};
             int n = errCount.fetch_add(1);
@@ -268,8 +276,10 @@ std::vector<uint8_t> HttpSource::httpGetRange(const std::string& url,
     if (length == 0) return {};
     auto resp = client_->get_range(url, offset, length);
     tl_last_was_absent = (resp.status_code == 404);
+    tl_last_had_transient_error = false;
     if (!resp.ok()) {
         if (resp.status_code != 404) {
+            tl_last_had_transient_error = true;
             transientError_.store(true, std::memory_order_relaxed);
             static std::atomic<int> errCount{0};
             int n = errCount.fetch_add(1);
@@ -310,6 +320,7 @@ std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
     const int inner = innerChunkIndex(key);
     if (inner < 0 || inner >= nChunks) {
         tl_last_was_absent = false;
+        tl_last_had_transient_error = false;
         return {};
     }
 
@@ -328,7 +339,11 @@ std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
     if (!shardIndex) {
         const std::size_t indexBytes = std::size_t(nChunks) * 16;
         auto raw = httpGetRange(url, 0, indexBytes);
-        if (raw.size() != indexBytes) return {};
+        if (raw.size() != indexBytes) {
+            if (!tl_last_was_absent)
+                tl_last_had_transient_error = true;
+            return {};
+        }
 
         std::span<const std::byte> span(
             reinterpret_cast<const std::byte*>(raw.data()), raw.size());
@@ -367,10 +382,12 @@ std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
     if (entry.is_missing()
         || (entry.offset == (~uint64_t(0) - 1) && entry.nbytes == 0)) {
         tl_last_was_absent = true;
+        tl_last_had_transient_error = false;
         return {};
     }
     if (entry.nbytes == 0) {
         tl_last_was_absent = false;
+        tl_last_had_transient_error = false;
         return {};
     }
 
