@@ -16,15 +16,21 @@ CHUNK_STATS_ENABLED = True
 _CHUNK_SIZE = 32
 
 
-def _dilate6(t: torch.Tensor) -> torch.Tensor:
-    """6-connected dilation of a 3D bool tensor."""
+def _dilate26(t: torch.Tensor) -> torch.Tensor:
+    """26-connected dilation of a 3D bool tensor (full 3x3x3 neighborhood)."""
     d = t.clone()
-    d[1:] |= t[:-1]
-    d[:-1] |= t[1:]
-    d[:, 1:] |= t[:, :-1]
-    d[:, :-1] |= t[:, 1:]
-    d[:, :, 1:] |= t[:, :, :-1]
-    d[:, :, :-1] |= t[:, :, 1:]
+    for dz in (-1, 0, 1):
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                if dz == 0 and dy == 0 and dx == 0:
+                    continue
+                sz = slice(max(0, dz), t.shape[0] + min(0, dz))
+                sy = slice(max(0, dy), t.shape[1] + min(0, dy))
+                sx = slice(max(0, dx), t.shape[2] + min(0, dx))
+                tz = slice(max(0, -dz), t.shape[0] + min(0, -dz))
+                ty = slice(max(0, -dy), t.shape[1] + min(0, -dy))
+                tx = slice(max(0, -dx), t.shape[2] + min(0, -dx))
+                d[sz, sy, sx] |= t[tz, ty, tx]
     return d
 
 
@@ -38,7 +44,7 @@ class ChunkStats:
         self._grp_prev: dict[tuple[int, int, int], torch.Tensor] = {}
         self._grp_prev_dil: dict[tuple[int, int, int], torch.Tensor] = {}
         # accumulators: cur, new, dil, miss
-        self._grp_acc: dict[tuple[int, int, int], list[int]] = {}  # [cur, new, dil, miss]
+        self._grp_acc: dict[tuple[int, int, int], list[int]] = {}
         self._iter_count: int = 0
         self._hdr_printed: bool = False
 
@@ -89,60 +95,75 @@ class ChunkStats:
     def end_iteration(self) -> None:
         self._iter_count += 1
         grp_cur = self._union_current()
+        # Compute per-iteration stats
+        self._grp_snap: dict[tuple[int, int, int], list[int]] = {}
         for key, cur in grp_cur.items():
             prev = self._grp_prev[key]
             prev_dil = self._grp_prev_dil[key]
-            cur_dil = _dilate6(cur)
-            n_cur = int(cur.sum())
-            n_new = int((cur & ~prev).sum())
-            n_dil = int(cur_dil.sum())
-            n_miss = int((cur & ~prev_dil).sum())
+            cur_dil = _dilate26(cur)
+            self._grp_snap[key] = [
+                int(cur.sum()),
+                int((cur & ~prev).sum()),
+                int(cur_dil.sum()),
+                int((cur & ~prev_dil).sum()),
+            ]
             acc = self._grp_acc[key]
-            acc[0] += n_cur
-            acc[1] += n_new
-            acc[2] += n_dil
-            acc[3] += n_miss
+            for i in range(4):
+                acc[i] += self._grp_snap[key][i]
             self._grp_prev[key] = cur
             self._grp_prev_dil[key] = cur_dil
-        if self._iter_count <= 100 or self._iter_count % 100 == 0:
-            self._print_line()
+        if self._iter_count <= 100:
+            self._print_line(avg=False)
+        elif self._iter_count % 100 == 0:
+            self._print_line(avg=True)
         if self._iter_count % 100 == 0:
             for acc in self._grp_acc.values():
                 acc[:] = [0, 0, 0, 0]
 
-    def _print_line(self) -> None:
-        n = self._iter_count if self._iter_count <= 100 else 100
+    def _print_line(self, *, avg: bool) -> None:
         grp_keys = sorted(self._grp_acc.keys())
         if not grp_keys:
             return
         mib_per_chunk = _CHUNK_SIZE ** 3 / 1024 ** 2
+        _N = 4
+        _cols = ("cur", "new", "dil", "miss")
         if not self._hdr_printed:
             h1 = f"{'[chunk]  it':14s}"
             h2 = f"{'':14s}"
+            col_hdr = "".join(f"{c:>7s}" for c in _cols)
             for key in grp_keys:
                 nch = self._grp_nch[key]
                 cZ, cY, cX = key
                 label = f"{cZ}\u00d7{cY}\u00d7{cX} ({nch}ch)"
-                w = 28
+                w = 7 * _N
                 h1 += f"  {label:^{w}s}"
-                h2 += f"  {'cur':>7s}{'new':>7s}{'dil':>7s}{'miss':>7s}"
-            h1 += f"  {'total chunks':^28s}  {'total MiB':^28s}"
-            h2 += f"  {'cur':>7s}{'new':>7s}{'dil':>7s}{'miss':>7s}"
-            h2 += f"  {'cur':>7s}{'new':>7s}{'dil':>7s}{'miss':>7s}"
+                h2 += f"  {col_hdr}"
+            h1 += f"  {'total chunks':^{7*_N}s}  {'total MiB':^{7*_N}s}"
+            h2 += f"  {col_hdr}  {col_hdr}"
             print(h1)
             print(h2)
             self._hdr_printed = True
         row = f"[chunk] {self._iter_count:>5d} "
-        tot = [0.0, 0.0, 0.0, 0.0]
-        for key in grp_keys:
-            acc = self._grp_acc[key]
-            vals = [acc[i] / n for i in range(4)]
-            row += f"  {vals[0]:7.0f}{vals[1]:7.0f}{vals[2]:7.0f}{vals[3]:7.0f}"
-            for i in range(4):
-                tot[i] += vals[i]
-        row += f"  {tot[0]:7.0f}{tot[1]:7.0f}{tot[2]:7.0f}{tot[3]:7.0f}"
-        m = [v * mib_per_chunk for v in tot]
-        row += f"  {m[0]:7.1f}{m[1]:7.1f}{m[2]:7.1f}{m[3]:7.1f}"
+        tot = [0.0] * _N
+        if avg:
+            n = 100
+            for key in grp_keys:
+                vals = [self._grp_acc[key][i] / n for i in range(_N)]
+                row += "  " + "".join(f"{v:7.3f}" for v in vals)
+                for i in range(_N):
+                    tot[i] += vals[i]
+            row += "  " + "".join(f"{v:7.3f}" for v in tot)
+            m = [v * mib_per_chunk for v in tot]
+            row += "  " + "".join(f"{v:7.3f}" for v in m)
+        else:
+            for key in grp_keys:
+                vals = self._grp_snap[key]
+                row += "  " + "".join(f"{v:7d}" for v in vals)
+                for i in range(_N):
+                    tot[i] += vals[i]
+            row += "  " + "".join(f"{v:7.0f}" for v in tot)
+            m = [v * mib_per_chunk for v in tot]
+            row += "  " + "".join(f"{v:7.3f}" for v in m)
         print(row)
 
 
