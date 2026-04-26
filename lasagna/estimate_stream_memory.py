@@ -69,28 +69,49 @@ def _chunked_surface_bytes(diam: int, height: int, channel_ds: dict[str, int]) -
     return total
 
 
-def _stream_bytes(N: int, sm: int, sw: int, N_ext: int) -> int:
-    """Compute streamed memory for N LR vertices."""
+def _stream_bytes(N: int, sm: int, sw: int, N_ext: int,
+                  lr_winding: bool = False) -> int:
+    """Compute streamed memory for N LR vertices.
+
+    lr_winding=True: winding density integral at LR step (not HR),
+    grad_mag sampled with full 3×3 Jacobian (10 bytes) on CPU.
+    """
     hr = sm * sw
     S = sm + 1
-    bytes_diff = 4    # value + 3 partials
-    bytes_nodiff = 1  # value only
+    bytes_diff = 4     # value + 3 partials (d/dx, d/dy, d/dz)
+    bytes_nodiff = 1   # value only
+    bytes_jac = 10     # value + 3×3 Jacobian
 
-    calls = [
-        (hr,            5, True),   # fwd: data_s
-        (hr,            1, False),  # fwd: mask_hr
-        (1,             1, False),  # fwd: mask_lr
-        (3,             1, False),  # fwd: conn masks
-        (N_ext,         1, False),  # fwd: ext intersect
-        (hr,            1, True),   # data loss
-        (1,             3, False),  # normal (nx, ny, gm)
-        (1,             1, True),   # pred_dt
-        (2 * hr * S,    1, False),  # winding_density
-        (N_ext * S,     1, False),  # ext_offset
-    ]
+    if lr_winding:
+        # winding_density: LR step, S strip samples, grad_mag with full Jacobian
+        # ext_offset: LR step (already LR), S strip samples, grad_mag with full Jacobian
+        calls = [
+            (hr,            5, bytes_diff),    # fwd: data_s
+            (hr,            1, bytes_nodiff),  # fwd: mask_hr
+            (1,             1, bytes_nodiff),  # fwd: mask_lr
+            (3,             1, bytes_nodiff),  # fwd: conn masks
+            (N_ext,         1, bytes_nodiff),  # fwd: ext intersect
+            (hr,            1, bytes_diff),    # data loss
+            (1,             3, bytes_nodiff),  # normal (nx, ny, gm)
+            (1,             1, bytes_diff),    # pred_dt
+            (2 * S,         1, bytes_jac),     # winding_density: LR × S, full Jacobian
+            (N_ext * S,     1, bytes_jac),     # ext_offset: LR × S, full Jacobian
+        ]
+    else:
+        calls = [
+            (hr,            5, bytes_diff),    # fwd: data_s
+            (hr,            1, bytes_nodiff),  # fwd: mask_hr
+            (1,             1, bytes_nodiff),  # fwd: mask_lr
+            (3,             1, bytes_nodiff),  # fwd: conn masks
+            (N_ext,         1, bytes_nodiff),  # fwd: ext intersect
+            (hr,            1, bytes_diff),    # data loss
+            (1,             3, bytes_nodiff),  # normal (nx, ny, gm)
+            (1,             1, bytes_diff),    # pred_dt
+            (2 * hr * S,    1, bytes_nodiff),  # winding_density
+            (N_ext * S,     1, bytes_nodiff),  # ext_offset
+        ]
     total = 0
-    for factor, n_ch, diff in calls:
-        bpc = bytes_diff if diff else bytes_nodiff
+    for factor, n_ch, bpc in calls:
         total += factor * N * n_ch * bpc
     return total
 
@@ -247,9 +268,9 @@ def main(argv: list[str] | None = None) -> int:
     N_a = side * side
 
     load_a = _vol_bytes(vol_X, vol_Y, vol_Z, channel_ds)
-    # Full scroll: filled cylinder (all windings), diameter = scroll_xy
     chunked_a = _chunked_filled_bytes(vol_X, vol_Z, channel_ds)
     stream_a = _stream_bytes(N_a, sm, sw, N_ext)
+    stream_a_lr = _stream_bytes(N_a, sm, sw, N_ext, lr_winding=True)
 
     print(f"\n{'='*60}")
     print(f"A) Full scroll")
@@ -261,6 +282,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Dense bbox load:      {_fmt(load_a):>12s}")
     print(f"  Chunked (filled cyl): {_fmt(chunked_a):>12s}")
     print(f"  Streamed:             {_fmt(stream_a):>12s}")
+    print(f"  Streamed LR-wind:     {_fmt(stream_a_lr):>12s}")
 
     # ==============================================================
     # B) Crop cylinder: mesh = outer surface, load = bbox + margin
@@ -292,9 +314,9 @@ def main(argv: list[str] | None = None) -> int:
     crop_d = min(crop_d, vol_Z)
 
     load_b = _vol_bytes(crop_w, crop_h, crop_d, channel_ds)
-    # Crop cylinder: only the surface shell touches chunks
     chunked_b = _chunked_surface_bytes(cyl_diam, cyl_z, channel_ds)
     stream_b = _stream_bytes(N_b, sm, sw, N_ext)
+    stream_b_lr = _stream_bytes(N_b, sm, sw, N_ext, lr_winding=True)
 
     cyl_diam_mm = cyl_diam * voxel_um / 1000.0
     cyl_z_mm = cyl_z * voxel_um / 1000.0
@@ -315,33 +337,46 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  Dense bbox load:      {_fmt(load_b):>12s}")
     print(f"  Chunked (surface):    {_fmt(chunked_b):>12s}")
     print(f"  Streamed:             {_fmt(stream_b):>12s}")
+    print(f"  Streamed LR-wind:     {_fmt(stream_b_lr):>12s}")
 
     # ==============================================================
     # Summary
     # ==============================================================
-    print(f"\n{'='*60}")
-    print(f"Summary")
-    print(f"{'='*60}")
-    print(f"                    {'Dense':>12s}  {'Chunked':>12s}  {'Streamed':>12s}")
-    print(f"  A) Full scroll    {_fmt(load_a):>12s}  {_fmt(chunked_a):>12s}  {_fmt(stream_a):>12s}")
-    print(f"  B) Crop cylinder  {_fmt(load_b):>12s}  {_fmt(chunked_b):>12s}  {_fmt(stream_b):>12s}")
-    print()
-    print(f"  Ratios (dense / X):")
-    print(f"    A) chunked: {load_a / max(1, chunked_a):>6.0f}×"
-          f"   streamed: {load_a / max(1, stream_a):>6.0f}×")
-    print(f"    B) chunked: {load_b / max(1, chunked_b):>6.0f}×"
-          f"   streamed: {load_b / max(1, stream_b):>6.0f}×")
-
-    # Per-cm² cost (mesh area → memory)
+    # Per-cm² cost
     area_a_cm2 = args.mesh_area_sqm * 1e4
     area_b_cm2 = (math.pi * cyl_diam * cyl_z) * (voxel_um * 1e-4) ** 2
-    print(f"\n  Per cm² of mesh surface:")
-    print(f"    A) {area_a_cm2:,.0f} cm²:  "
-          f"chunked {_fmt(chunked_a / area_a_cm2)}/cm²  "
-          f"streamed {_fmt(stream_a / area_a_cm2)}/cm²")
-    print(f"    B) {area_b_cm2:,.1f} cm²:  "
-          f"chunked {_fmt(chunked_b / area_b_cm2)}/cm²  "
-          f"streamed {_fmt(stream_b / area_b_cm2)}/cm²")
+
+    def _ratio(a: float, b: float) -> str:
+        r = a / max(1, b)
+        if r >= 100:
+            return f"{r:,.0f}×"
+        return f"{r:.1f}×"
+
+    col = f"{'Str LR-wind':>12s}"
+    print(f"\n{'='*72}")
+    print(f"Summary")
+    print(f"{'='*72}")
+    print(f"  {'':18s}  {'Dense':>12s}  {'Chunked':>12s}  {'Streamed':>12s}  {col}")
+    print(f"  {'─'*70}")
+
+    # Total memory
+    print(f"  A) Full scroll  {_fmt(load_a):>12s}  {_fmt(chunked_a):>12s}  {_fmt(stream_a):>12s}  {_fmt(stream_a_lr):>12s}")
+    print(f"  B) Crop cyl     {_fmt(load_b):>12s}  {_fmt(chunked_b):>12s}  {_fmt(stream_b):>12s}  {_fmt(stream_b_lr):>12s}")
+    print()
+
+    # Savings vs dense
+    print(f"  Savings vs dense")
+    print(f"  A) Full scroll  {'1×':>12s}  {_ratio(load_a, chunked_a):>12s}  {_ratio(load_a, stream_a):>12s}  {_ratio(load_a, stream_a_lr):>12s}")
+    print(f"  B) Crop cyl     {'1×':>12s}  {_ratio(load_b, chunked_b):>12s}  {_ratio(load_b, stream_b):>12s}  {_ratio(load_b, stream_b_lr):>12s}")
+    print()
+
+    # Per cm²
+    def _pcm2(b: float, a: float) -> str:
+        return _fmt(b / a) + "/cm²"
+
+    print(f"  Per cm² of mesh")
+    print(f"  A) {area_a_cm2:>7,.0f} cm²  {_pcm2(load_a, area_a_cm2):>12s}  {_pcm2(chunked_a, area_a_cm2):>12s}  {_pcm2(stream_a, area_a_cm2):>12s}  {_pcm2(stream_a_lr, area_a_cm2):>12s}")
+    print(f"  B) {area_b_cm2:>7,.1f} cm²  {_pcm2(load_b, area_b_cm2):>12s}  {_pcm2(chunked_b, area_b_cm2):>12s}  {_pcm2(stream_b, area_b_cm2):>12s}  {_pcm2(stream_b_lr, area_b_cm2):>12s}")
 
     return 0
 
