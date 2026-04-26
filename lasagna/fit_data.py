@@ -11,6 +11,105 @@ import zarr
 
 from lasagna_volume import LasagnaVolume
 
+# --- Chunk sampling statistics ---
+CHUNK_STATS_ENABLED = True
+_CHUNK_SIZE = 32
+
+
+class ChunkStats:
+    """Track which 32-voxel chunks are sampled per optimizer iteration."""
+
+    def __init__(self) -> None:
+        self._current: dict[str, torch.Tensor] = {}   # channel -> bool (cZ, cY, cX)
+        self._previous: dict[str, torch.Tensor] = {}
+        self._acc_total: dict[str, int] = {}
+        self._acc_delta: dict[str, int] = {}
+        self._iter_count: int = 0
+
+    def _ensure_channel(self, channel: str, vol_shape_zyx: tuple[int, int, int],
+                        device: torch.device) -> None:
+        if channel in self._current:
+            return
+        cz = (vol_shape_zyx[0] + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+        cy = (vol_shape_zyx[1] + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+        cx = (vol_shape_zyx[2] + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+        self._current[channel] = torch.zeros(cz, cy, cx, dtype=torch.bool, device=device)
+        self._previous[channel] = torch.zeros(cz, cy, cx, dtype=torch.bool, device=device)
+        self._acc_total[channel] = 0
+        self._acc_delta[channel] = 0
+
+    def begin_iteration(self) -> None:
+        for t in self._current.values():
+            t.zero_()
+
+    def record(self, channel: str, xyz_local: torch.Tensor,
+               vol_shape_zyx: tuple[int, int, int], device: torch.device) -> None:
+        """Record sampled positions. xyz_local: (..., 3) as (x, y, z) in channel voxels."""
+        self._ensure_channel(channel, vol_shape_zyx, device)
+        ct = self._current[channel]
+        cZ, cY, cX = ct.shape
+        with torch.no_grad():
+            flat = xyz_local.reshape(-1, 3)
+            ci_x = (flat[:, 0] / _CHUNK_SIZE).long().clamp(0, cX - 1)
+            ci_y = (flat[:, 1] / _CHUNK_SIZE).long().clamp(0, cY - 1)
+            ci_z = (flat[:, 2] / _CHUNK_SIZE).long().clamp(0, cZ - 1)
+            ct[ci_z, ci_y, ci_x] = True
+
+    def end_iteration(self) -> None:
+        self._iter_count += 1
+        for ch in self._current:
+            total = int(self._current[ch].sum())
+            delta = int((self._current[ch] & ~self._previous[ch]).sum())
+            self._acc_total[ch] = self._acc_total.get(ch, 0) + total
+            self._acc_delta[ch] = self._acc_delta.get(ch, 0) + delta
+            self._previous[ch].copy_(self._current[ch])
+        if self._iter_count % 100 == 0:
+            self._print_stats()
+
+    def _print_stats(self) -> None:
+        n = min(self._iter_count, 100)
+        print(f"\n[chunk_stats] avg over last {n} iterations (iter {self._iter_count}):")
+        total_all = 0.0
+        delta_all = 0.0
+        for ch in sorted(self._current.keys()):
+            avg_total = self._acc_total[ch] / n
+            avg_delta = self._acc_delta[ch] / n
+            cZ, cY, cX = self._current[ch].shape
+            grid_total = cZ * cY * cX
+            print(f"  {ch:>10s}: {avg_total:8.1f} chunks/it ({avg_delta:6.1f} new)  "
+                  f"grid={cZ}\u00d7{cY}\u00d7{cX} ({grid_total:,} total)")
+            total_all += avg_total
+            delta_all += avg_delta
+        chunk_bytes = _CHUNK_SIZE ** 3
+        print(f"  {'TOTAL':>10s}: {total_all:8.1f} chunks/it ({delta_all:6.1f} new)  "
+              f"= {total_all * chunk_bytes / 1024**2:.1f} MiB/it "
+              f"({delta_all * chunk_bytes / 1024**2:.1f} MiB new)")
+        for ch in self._acc_total:
+            self._acc_total[ch] = 0
+            self._acc_delta[ch] = 0
+
+
+_chunk_stats = ChunkStats()
+
+
+def _record_chunks(data: "FitData3D", xyz_fullres: torch.Tensor) -> None:
+    """Record which 32-voxel chunks are touched by this sampling call."""
+    dev = xyz_fullres.device
+    origin = torch.tensor(data.origin_fullres, dtype=torch.float32, device=dev)
+    channels = [
+        ("cos", data.cos), ("grad_mag", data.grad_mag),
+        ("nx", data.nx), ("ny", data.ny), ("pred_dt", data.pred_dt),
+    ]
+    with torch.no_grad():
+        for ch_name, ch_tensor in channels:
+            if ch_tensor is None:
+                continue
+            sp = data._spacing_for(ch_name)
+            spacing = torch.tensor(sp, dtype=torch.float32, device=dev)
+            local_xyz = (xyz_fullres - origin) / spacing
+            vol_shape = data._size_of(ch_tensor)
+            _chunk_stats.record(ch_name, local_xyz, vol_shape, dev)
+
 
 @dataclass(frozen=True)
 class CorrPoints3D:
@@ -74,6 +173,8 @@ class FitData3D:
 		Uses custom CUDA uint8 kernel when cuda_gridsample=True, else PyTorch F.grid_sample.
 		diff=True: use differentiable CUDA kernel (gradients flow through xyz).
 		"""
+		if CHUNK_STATS_ENABLED:
+			_record_chunks(self, xyz_fullres)
 		if self.cuda_gridsample:
 			return self._grid_sample_cuda(xyz_fullres, diff=diff)
 		return self._grid_sample_torch(xyz_fullres)

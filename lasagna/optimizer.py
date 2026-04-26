@@ -457,8 +457,12 @@ def optimize(
 		loss = loss0
 
 		for step in range(max_steps):
+			if fit_data.CHUNK_STATS_ENABLED:
+				fit_data._chunk_stats.begin_iteration()
 			res = model(data)
 			loss, term_vals = _eval_terms(res, opt_cfg.eff)
+			if fit_data.CHUNK_STATS_ENABLED:
+				fit_data._chunk_stats.end_iteration()
 
 			opt.zero_grad(set_to_none=True)
 			loss.backward()
