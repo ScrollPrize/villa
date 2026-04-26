@@ -89,6 +89,12 @@ public:
     void clearMemory();
     void clearAll();
 
+    // Explicitly stop all worker pools and release caches. After this call
+    // the pipeline is inert — the destructor becomes a no-op. Use in
+    // volume-switch paths to ensure the old pipeline's abortAll() doesn't
+    // poison a new pipeline that's already running.
+    void shutdown();
+
     [[nodiscard]] int numLevels() const noexcept;
     [[nodiscard]] std::array<int, 3> chunkShape(int level) const noexcept;
     [[nodiscard]] std::array<int, 3> levelShape(int level) const noexcept;
@@ -262,6 +268,9 @@ private:
     mutable std::mutex writtenShardsMutex_;
     std::unordered_set<ShardKey, ShardKeyHash> writtenShards_;
     mutable std::atomic<uint64_t> statMisses_{0};
+
+    // Set by shutdown() so the destructor can skip redundant teardown.
+    bool isShutdown_ = false;
 
     // Seeded from a startup scan of the on-disk cache so stats show real
     // usage immediately; session-scoped writes accumulate on top.

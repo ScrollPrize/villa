@@ -225,7 +225,7 @@ std::vector<uint8_t> HttpSource::httpGet(const std::string& url)
         // 404 is an expected "chunk doesn't exist" response — stay quiet.
         // Anything else (403/401/5xx) almost always means auth or network
         // trouble; log loudly so it doesn't look like an empty volume.
-        if (resp.status_code != 404) {
+        if (resp.status_code != 404 && resp.status_code != 0) {
             transientError_.store(true, std::memory_order_relaxed);
             static std::atomic<int> errCount{0};
             int n = errCount.fetch_add(1);

@@ -672,7 +672,9 @@ skipPassthrough:
     decodePool_.start();
 }
 
-BlockPipeline::~BlockPipeline() {
+void BlockPipeline::shutdown() {
+    if (isShutdown_) return;
+    isShutdown_ = true;
     // Cancel any in-flight curl requests so workers don't sit inside
     // libcurl waiting for S3 timeouts during shutdown.
     utils::HttpClient::abortAll();
@@ -688,6 +690,9 @@ BlockPipeline::~BlockPipeline() {
     encodePool_.stop();
     loaderPool_.stop();
     decodePool_.stop();
+    // All workers have joined — safe to clear the process-global abort
+    // flag so a new pipeline can use curl without seeing a stale abort.
+    utils::HttpClient::resetAbort();
     // Release cached data before member destructors run, so any shared_ptrs
     // held by thread-locals or callbacks don't keep shard/block data alive.
     clearMemory();
@@ -697,6 +702,10 @@ BlockPipeline::~BlockPipeline() {
         std::fprintf(stderr, "[Cache] session summary: coldHits=%lu iceFetches=%lu (%.0f%% from disk)\n",
                      cold, ice, (cold + ice) > 0 ? 100.0 * cold / (cold + ice) : 0.0);
     }
+}
+
+BlockPipeline::~BlockPipeline() {
+    shutdown();
 }
 
 void BlockPipeline::bloomAdd(const ChunkKey& key) noexcept {

@@ -48,11 +48,16 @@ std::string CState::currentVolumeId() const { return _currentVolumeId; }
 
 void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
-    // Stop old volume's pipeline IO and clear all caches to avoid stale tiles
+    // Fully stop the old pipeline's workers before creating a new one.
+    // shutdown() calls abortAll() to interrupt in-flight curl, joins all
+    // threads, then resetAbort() so the new pipeline's workers start clean.
+    // Without this, the old pipeline's destructor (deferred by viewer
+    // shared_ptrs) would call abortAll() AFTER the new pipeline starts,
+    // poisoning all new curl requests.
     if (_currentVolume) {
         auto* oldPipeline = _currentVolume->tieredCache();
         if (oldPipeline) {
-            oldPipeline->clearMemory();
+            oldPipeline->shutdown();
         }
     }
     if (_blockCache) {
