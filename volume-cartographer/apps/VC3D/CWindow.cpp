@@ -2552,6 +2552,7 @@ bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, 
     }
 
     _state->setPOI("focus", focus);
+    recenterSegmentationViewerNear(position);
 
     // Get surface for orientation - look up by ID
     Surface* orientationSource = _state->surfaceRaw(focus->surfaceId);
@@ -2579,6 +2580,39 @@ void CWindow::recenterPlaneViewersOn(const cv::Vec3f& position)
             viewer->centerOnVolumePoint(position, true);
         }
     });
+}
+
+void CWindow::recenterSegmentationViewerNear(const cv::Vec3f& position)
+{
+    static constexpr float kMaxDistanceVoxels = 100.0f;
+
+    if (!_viewerManager) {
+        return;
+    }
+
+    auto* viewer = segmentationViewer();
+    if (!viewer) {
+        return;
+    }
+
+    auto activeSurface = _segmentationModule ? _segmentationModule->activeBaseSurfaceShared() : nullptr;
+    if (!activeSurface) {
+        activeSurface = std::dynamic_pointer_cast<QuadSurface>(_state ? _state->surface("segmentation") : nullptr);
+    }
+    if (!activeSurface) {
+        return;
+    }
+
+    auto* patchIndex = _viewerManager->surfacePatchIndex();
+    if (!patchIndex || !patchIndex->containsSurface(activeSurface)) {
+        return;
+    }
+
+    auto hit = patchIndex->locate(position, kMaxDistanceVoxels, activeSurface);
+    if (hit && hit->distance <= kMaxDistanceVoxels) {
+        const cv::Vec3f loc = activeSurface->loc(hit->ptr);
+        viewer->centerOnSurfacePoint({loc[0], loc[1]}, true);
+    }
 }
 
 bool CWindow::recenterViewersOnCurrentFocus()

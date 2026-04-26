@@ -72,6 +72,7 @@ public:
     void invalidateVis() {}
     void invalidateIntersect(const std::string& = "") override;
     void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false);
+    void centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender = false);
 
     // --- Accessors ---
     std::string surfName() const override { return _surfName; }

@@ -145,6 +145,7 @@ private:
     bool centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId);
     bool centerFocusOnCursor();
     void recenterPlaneViewersOn(const cv::Vec3f& position);
+    void recenterSegmentationViewerNear(const cv::Vec3f& position);
     bool recenterViewersOnCurrentFocus();
     void setSegmentationCursorMirroring(bool enabled);
     bool segmentationCursorMirroringEnabled() const { return _mirrorCursorToSegmentation; }

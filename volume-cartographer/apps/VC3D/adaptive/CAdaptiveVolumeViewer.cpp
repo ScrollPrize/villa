@@ -1165,6 +1165,25 @@ void CAdaptiveVolumeViewer::centerOnVolumePoint(const cv::Vec3f& point, bool for
     emit overlaysUpdated();
 }
 
+void CAdaptiveVolumeViewer::centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender)
+{
+    if (!std::isfinite(point[0]) || !std::isfinite(point[1])) {
+        return;
+    }
+
+    _camera.surfacePtr[0] = point[0];
+    _camera.surfacePtr[1] = point[1];
+    _cachedStretchValid = false;
+    syncCameraTransform();
+
+    if (forceRender) {
+        renderVisible(true);
+    } else {
+        scheduleRender();
+    }
+    emit overlaysUpdated();
+}
+
 // ============================================================================
 // Navigation
 // ============================================================================
