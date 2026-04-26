@@ -70,6 +70,25 @@ static std::string surface_name(const QuadSurface* surf)
     return surf->id;
 }
 
+static bool looks_like_resume_surface(const QuadSurface* surf, const nlohmann::json& params)
+{
+    if (params.value("resume_growth", false) || params.value("resume", false)) {
+        return true;
+    }
+    if (!surf || surf->meta.is_null() || !surf->meta.is_object()) {
+        return false;
+    }
+
+    const nlohmann::json meta = json_from_utils(surf->meta);
+    if (meta.contains("vc_grow_seg_from_segments_params")) {
+        return true;
+    }
+    if (meta.value("source", std::string{}) == "vc_grow_seg_from_segments") {
+        return true;
+    }
+    return false;
+}
+
 using SurfaceOverlaps = std::unordered_map<QuadSurface*, std::set<QuadSurface*>>;
 using Umbilicus = vc::core::util::Umbilicus;
 
@@ -389,6 +408,44 @@ static void copy(const SurfTrackerData &src, SurfTrackerData &tgt, const cv::Rec
 
     // tgt.seed_loc = src.seed_loc;
     // tgt.seed_coord = src.seed_coord;
+}
+
+static void add_surface_if_close(QuadSurface* surf,
+                                 const cv::Vec2i& p,
+                                 const cv::Vec3d& coord,
+                                 SurfTrackerData& data,
+                                 SurfacePatchIndex* surface_patch_index)
+{
+    if (!surf || data.has(surf, p)) {
+        return;
+    }
+
+    auto ptr = surf->pointer();
+    const cv::Vec3f coord_f{
+        static_cast<float>(coord[0]),
+        static_cast<float>(coord[1]),
+        static_cast<float>(coord[2])
+    };
+
+    if (surface_patch_index && !surface_patch_index->empty()) {
+        SurfacePatchIndex::SurfacePtr target_surface(surf, [](QuadSurface*) {});
+        auto hit = surface_patch_index->locate(coord_f, same_surface_th, target_surface);
+        if (!hit) {
+            return;
+        }
+        ptr = hit->ptr;
+    } else {
+        if (surf->pointTo(ptr, coord_f, same_surface_th, 10) > same_surface_th) {
+            return;
+        }
+    }
+
+    const cv::Vec3f loc = surf->loc_raw(ptr);
+    if (SurfTrackerData::lookup_int_loc(surf, {loc[1], loc[0]})[0] == -1) {
+        return;
+    }
+    data.surfs(p).insert(surf);
+    data.loc(surf, p) = {loc[1], loc[0]};
 }
 
 static int add_surftrack_distloss(QuadSurface *sm, const cv::Vec2i &p, const cv::Vec2i &off, SurfTrackerData &data,
@@ -1387,6 +1444,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
     }
 
     cv::Mat_<cv::Vec3f> seed_points = seed->rawPoints();
+    const bool resume_growth = looks_like_resume_surface(seed, params);
+    const int grid_step = std::max(1, static_cast<int>(std::lround(step)));
 
     int stop_gen = 100000;
     int closing_r = 20; //FIXME dont forget to reset!
@@ -1397,6 +1456,16 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
     int sliding_w = static_cast<int>(1000/src_step/step*2 * sliding_w_scale);
     int w = 2000/src_step/step*2+10+2*closing_r;
     int h = 15000/src_step/step*2+10+2*closing_r;
+    cv::Point resume_origin(closing_r + 5, closing_r + 5);
+    if (resume_growth) {
+        const int resume_cols = (seed_points.cols + grid_step - 1) / grid_step + 1;
+        const int resume_rows = (seed_points.rows + grid_step - 1) / grid_step + 1;
+        w = std::max(w, resume_origin.x + resume_cols + closing_r + 10);
+        h = std::max(h, resume_origin.y + resume_rows + closing_r + 10);
+        std::cout << "resume_growth: true, source grid " << seed_points.size()
+                  << " low-res " << cv::Size(resume_cols, resume_rows)
+                  << " origin " << resume_origin << std::endl;
+    }
     cv::Size size = {w,h};
     cv::Rect bounds(0,0,w-1,h-1);
     cv::Rect save_bounds_inv(closing_r+5,closing_r+5,h-closing_r-10,w-closing_r-10);
@@ -1422,49 +1491,163 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
 
     SurfTrackerData data;
 
-    cv::Vec2i seed_loc = {seed_points.rows/2, seed_points.cols/2};
-
-    int tries = 0;
-    while (seed_points(seed_loc)[0] == -1 || (enforce_z_range && (seed_points(seed_loc)[2] < z_min || seed_points(seed_loc)[2] > z_max))) {
-        seed_loc = {rand() % seed_points.rows, rand() % seed_points.cols };
-        std::cout << "try loc " << seed_loc << std::endl;
-        if (++tries > 10000)
-            break;
-    }
-
-    data.loc(seed,{y0,x0}) = {
-        static_cast<double>(seed_loc[0]),
-        static_cast<double>(seed_loc[1])
-    };
-    data.surfs({y0,x0}).insert(seed);
-    points(y0,x0) = data.lookup_int(seed,{y0,x0});
-
-
-    data.seed_coord = points(y0,x0);
-    data.seed_loc = cv::Point2i(y0,x0);
-
-    std::cout << "seed coord " << data.seed_coord << " at " << data.seed_loc << std::endl;
-    if (enforce_z_range && (data.seed_coord[2] < z_min || data.seed_coord[2] > z_max))
-        std::cout << "warning: seed z " << data.seed_coord[2] << " is outside z_range; growth will be restricted to [" << z_min << ", " << z_max << "]" << std::endl;
-
-    state(y0,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
-    generations(y0,x0) = 1;
-    fringe.insert(cv::Vec2i(y0,x0));
-
-    //insert initial surfs per location
-    for(const auto& p : fringe) {
-        data.surfs(p).insert(seed);
-        cv::Vec3f coord = points(p);
-        std::cout << "testing " << p << " from cands: " << surface_overlaps(&overlaps, seed).size() << coord << std::endl;
-        for(auto s : surface_overlaps(&overlaps, seed)) {
-            auto ptr = s->pointer();
-            if (s->pointTo(ptr, coord, same_surface_th, 1000, surface_patch_index_ptr) <= same_surface_th) {
-                cv::Vec3f loc = s->loc_raw(ptr);
-                data.surfs(p).insert(s);
-                data.loc(s, p) = {loc[1], loc[0]};
+    bool initialized_from_resume = false;
+    if (resume_growth) {
+        cv::Mat resume_generations = seed->channel("generations");
+        cv::Mat_<uint16_t> resume_generations_u16;
+        if (!resume_generations.empty()) {
+            if (resume_generations.type() == CV_16UC1) {
+                resume_generations_u16 = resume_generations;
+            } else {
+                resume_generations.convertTo(resume_generations_u16, CV_16U);
             }
         }
-        std::cout << "fringe point " << p << " surfcount " << data.surfs(p).size() << " init " << data.loc(seed, p) << data.lookup_int(seed, p) << std::endl;
+
+        cv::Rect resume_used;
+        bool have_resume_used = false;
+        cv::Vec2i first_valid(-1, -1);
+        int resumed_count = 0;
+
+        for (int ry = 0; ry < seed_points.rows - 1; ry += grid_step) {
+            for (int rx = 0; rx < seed_points.cols - 1; rx += grid_step) {
+                const cv::Vec2d seed_loc_d{static_cast<double>(ry), static_cast<double>(rx)};
+                if (!loc_valid(seed_points, seed_loc_d)) {
+                    continue;
+                }
+                cv::Vec2i p(resume_origin.y + ry / grid_step,
+                            resume_origin.x + rx / grid_step);
+                if (p[0] < 0 || p[0] >= state.rows || p[1] < 0 || p[1] >= state.cols) {
+                    continue;
+                }
+
+                data.loc(seed, p) = {static_cast<double>(ry), static_cast<double>(rx)};
+                data.surfs(p).insert(seed);
+                points(p) = data.lookup_int(seed, p);
+                state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
+                if (!resume_generations_u16.empty() &&
+                    ry < resume_generations_u16.rows &&
+                    rx < resume_generations_u16.cols) {
+                    generations(p) = std::max<uint16_t>(resume_generations_u16(ry, rx), 1);
+                } else {
+                    generations(p) = 1;
+                }
+
+                cv::Rect cell(p[1], p[0], 1, 1);
+                resume_used = have_resume_used ? (resume_used | cell) : cell;
+                have_resume_used = true;
+                if (first_valid[0] == -1) {
+                    first_valid = p;
+                }
+                resumed_count++;
+            }
+        }
+
+        if (have_resume_used) {
+            used_area = resume_used;
+            used_area_hr = scaled_rect_trunc(used_area, step);
+            data.seed_loc = first_valid;
+            data.seed_coord = points(first_valid);
+            initialized_from_resume = true;
+
+            std::set<QuadSurface*> resume_candidates = surface_overlaps(&overlaps, seed);
+            if (surface_patch_index_ptr || resume_candidates.empty()) {
+                for (const auto& [_, sm] : surfs) {
+                    if (sm && sm != seed) {
+                        resume_candidates.insert(sm);
+                    }
+                }
+            }
+
+            int fringe_count = 0;
+            int discovered_overlap_count = 0;
+            for (int j = std::max(0, used_area.y - 1); j <= std::min(used_area.br().y + 1, state.rows - 1); ++j) {
+                for (int i = std::max(0, used_area.x - 1); i <= std::min(used_area.br().x + 1, state.cols - 1); ++i) {
+                    const cv::Vec2i p(j, i);
+                    if ((state(p) & STATE_LOC_VALID) == 0) {
+                        continue;
+                    }
+                    bool has_invalid_neighbor = false;
+                    for (const auto& n : neighs) {
+                        const cv::Vec2i pn = p + n;
+                        if (pn[0] < 0 || pn[0] >= state.rows || pn[1] < 0 || pn[1] >= state.cols ||
+                            (state(pn) & STATE_LOC_VALID) == 0) {
+                            has_invalid_neighbor = true;
+                            break;
+                        }
+                    }
+                    if (!has_invalid_neighbor) {
+                        continue;
+                    }
+
+                    fringe.insert(p);
+                    fringe_count++;
+                    const std::size_t before = overlaps[seed].size();
+                    for (auto* s : resume_candidates) {
+                        add_surface_if_close(s, p, points(p), data, surface_patch_index_ptr);
+                        if (data.has(s, p)) {
+                            overlaps[seed].insert(s);
+                            overlaps[s].insert(seed);
+                        }
+                    }
+                    discovered_overlap_count += static_cast<int>(overlaps[seed].size() - before);
+                }
+            }
+
+            std::cout << "resume_growth initialized " << resumed_count
+                      << " low-res points, fringe " << fringe_count
+                      << ", overlaps " << surface_overlaps(&overlaps, seed).size()
+                      << " (discovered " << discovered_overlap_count << ")"
+                      << " used_area " << used_area << std::endl;
+        } else {
+            std::cout << "resume_growth requested but no valid resume samples were found; falling back to center seed" << std::endl;
+        }
+    }
+
+    if (!initialized_from_resume) {
+        cv::Vec2i seed_loc = {seed_points.rows/2, seed_points.cols/2};
+
+        int tries = 0;
+        while (seed_points(seed_loc)[0] == -1 || (enforce_z_range && (seed_points(seed_loc)[2] < z_min || seed_points(seed_loc)[2] > z_max))) {
+            seed_loc = {rand() % seed_points.rows, rand() % seed_points.cols };
+            std::cout << "try loc " << seed_loc << std::endl;
+            if (++tries > 10000)
+                break;
+        }
+
+        data.loc(seed,{y0,x0}) = {
+            static_cast<double>(seed_loc[0]),
+            static_cast<double>(seed_loc[1])
+        };
+        data.surfs({y0,x0}).insert(seed);
+        points(y0,x0) = data.lookup_int(seed,{y0,x0});
+
+
+        data.seed_coord = points(y0,x0);
+        data.seed_loc = cv::Point2i(y0,x0);
+
+        std::cout << "seed coord " << data.seed_coord << " at " << data.seed_loc << std::endl;
+        if (enforce_z_range && (data.seed_coord[2] < z_min || data.seed_coord[2] > z_max))
+            std::cout << "warning: seed z " << data.seed_coord[2] << " is outside z_range; growth will be restricted to [" << z_min << ", " << z_max << "]" << std::endl;
+
+        state(y0,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
+        generations(y0,x0) = 1;
+        fringe.insert(cv::Vec2i(y0,x0));
+
+        //insert initial surfs per location
+        for(const auto& p : fringe) {
+            data.surfs(p).insert(seed);
+            cv::Vec3f coord = points(p);
+            std::cout << "testing " << p << " from cands: " << surface_overlaps(&overlaps, seed).size() << coord << std::endl;
+            for(auto s : surface_overlaps(&overlaps, seed)) {
+                auto ptr = s->pointer();
+                if (s->pointTo(ptr, coord, same_surface_th, 1000, surface_patch_index_ptr) <= same_surface_th) {
+                    cv::Vec3f loc = s->loc_raw(ptr);
+                    data.surfs(p).insert(s);
+                    data.loc(s, p) = {loc[1], loc[0]};
+                }
+            }
+            std::cout << "fringe point " << p << " surfcount " << data.surfs(p).size() << " init " << data.loc(seed, p) << data.lookup_int(seed, p) << std::endl;
+        }
     }
 
     std::cout << "starting from " << x0 << " " << y0 << std::endl;
@@ -1486,7 +1669,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
     for(int i=0;i<omp_get_max_threads();i++)
         data_ths[i] = data;
 
-    bool flip_x_done = !flip_x;
+    bool flip_x_done = !flip_x || initialized_from_resume;
+    if (flip_x && initialized_from_resume) {
+        std::cout << "flip_x skipped for resumed growth" << std::endl;
+    }
     bool flip_x_wait_logged = false;
 
     auto has_horizontal_extent_to_flip = [&]() {
@@ -1580,9 +1766,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
     };
 
     bool at_right_border = false;
+    std::optional<std::filesystem::path> current_snapshot_path;
     for(int generation=0;generation<stop_gen;generation++) {
         std::unordered_set<cv::Vec2i,vec2i_hash> cands;
-        if (generation == 0) {
+        if (generation == 0 && !initialized_from_resume) {
             cands.insert(cv::Vec2i(y0-1,x0));
         }
         else
@@ -1965,8 +2152,20 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
                 dbg_surf->meta["area_vx2"] = static_cast<double>(area_est_vx2);
                 dbg_surf->meta["area_cm2"] = static_cast<double>(area_est_cm2);
                 dbg_surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
-                std::string uuid = std::string(Z_DBG_GEN_PREFIX)+"current";
-                dbg_surf->save(tgt_dir / uuid, uuid, true);
+                const std::filesystem::path legacy_current_path = tgt_dir / (std::string(Z_DBG_GEN_PREFIX)+"current");
+                std::string uuid = std::string(Z_DBG_GEN_PREFIX) + get_surface_time_str();
+                const std::filesystem::path snapshot_path = tgt_dir / uuid;
+                dbg_surf->save(snapshot_path.string(), uuid, true);
+
+                std::error_code cleanup_ec;
+                if (legacy_current_path != snapshot_path) {
+                    std::filesystem::remove_all(legacy_current_path, cleanup_ec);
+                }
+                cleanup_ec.clear();
+                if (current_snapshot_path && *current_snapshot_path != snapshot_path) {
+                    std::filesystem::remove_all(*current_snapshot_path, cleanup_ec);
+                }
+                current_snapshot_path = snapshot_path;
                 delete dbg_surf;
             }
         }
