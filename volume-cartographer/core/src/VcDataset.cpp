@@ -515,6 +515,12 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
 
     switch (impl_->compressor_.id) {
         case CompressorId::None:
+            if (compressed.size() < outBytes) {
+                throw std::runtime_error(
+                    "uncompressed zarr chunk is shorter than expected (" +
+                    std::to_string(compressed.size()) + " < " +
+                    std::to_string(outBytes) + " bytes)");
+            }
             std::memcpy(output, compressed.data(), outBytes);
             break;
 
