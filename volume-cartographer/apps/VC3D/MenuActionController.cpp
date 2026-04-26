@@ -872,6 +872,7 @@ void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
             if (_window->_state->vpkg()->hasVolume(volume->id())) {
                 continue;
             }
+            _window->runStartupPrefetchForVolume(volume);
             if (_window->_state->vpkg()->addVolume(volume)) {
                 attachedCount++;
             } else {

@@ -1219,6 +1219,58 @@ size_t BlockPipeline::countAvailable(const std::vector<ChunkKey>& keys) const {
     return n;
 }
 
+std::vector<ChunkKey> BlockPipeline::chunksMissingFromCache(
+    const std::vector<ChunkKey>& keys) const
+{
+    std::vector<ChunkKey> missing;
+    if (!source_) return keys;
+
+    constexpr int kMaxL = 16;
+    std::array<int, kMaxL> bpcZ{}, bpcY{}, bpcX{};
+    std::array<bool, kMaxL> shapeCached{};
+
+    auto ensureShapeCached = [&](int level) {
+        if (level < 0 || level >= kMaxL || shapeCached[level]) return;
+        auto csk = chunkShape(level);
+        if (csk[0] > 0) {
+            bpcZ[level] = csk[0] / kBlockSize;
+            bpcY[level] = csk[1] / kBlockSize;
+            bpcX[level] = csk[2] / kBlockSize;
+        }
+        shapeCached[level] = true;
+    };
+
+    for (const auto& key : keys) {
+        if (isNegativeCached(key) || isEmptyChunk(key)) continue;
+
+        bool resident = false;
+        if (key.level >= 0 && key.level < kMaxL) {
+            ensureShapeCached(key.level);
+            const int z = bpcZ[key.level], y = bpcY[key.level], x = bpcX[key.level];
+            if (z > 0 && y > 0 && x > 0) {
+                const BlockKey first{key.level, key.iz * z, key.iy * y, key.ix * x};
+                const BlockKey last{key.level, key.iz * z + z - 1,
+                                               key.iy * y + y - 1,
+                                               key.ix * x + x - 1};
+                resident = blockCache_.contains(first) && blockCache_.contains(last);
+            }
+        }
+        if (resident) continue;
+
+        auto* dz = (key.level >= 0 && key.level < int(diskLevels_.size()))
+            ? diskLevels_[key.level].get()
+            : nullptr;
+        const bool diskPresent = dz
+            && dz->is_sharded()
+            && dz->inner_chunk_exists(chunkIndices(key));
+        if (diskPresent) continue;
+
+        missing.push_back(key);
+    }
+
+    return missing;
+}
+
 BlockPipeline::ChunkReadyCallbackId
 BlockPipeline::addChunkReadyListener(ChunkReadyCallback cb) {
     std::lock_guard lock(callbackMutex_);

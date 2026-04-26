@@ -150,6 +150,12 @@ auto main(int argc, char* argv[]) -> int
         QString::number(CHUNK_CACHE_SIZE_GB));
     parser.addOption(cacheSizeOption);
 
+    QCommandLineOption prefetchLevelOption(
+        "prefetch-level",
+        "For remote Zarr volumes, block on startup/open and prefetch the given pyramid level into the local cache (use 5 for the coarse level).",
+        "level");
+    parser.addOption(prefetchLevelOption);
+
     parser.process(app);
 
     if (parser.isSet(skipShapeCheckOption)) {
@@ -183,7 +189,18 @@ auto main(int argc, char* argv[]) -> int
         cacheSizeGB = static_cast<size_t>(parsed);
     }
 
-    CWindow aWin(cacheSizeGB);
+    int startupPrefetchLevel = -1;
+    if (parser.isSet(prefetchLevelOption)) {
+        bool ok = false;
+        const int parsed = parser.value(prefetchLevelOption).toInt(&ok);
+        if (!ok || parsed < 0) {
+            std::cerr << "Error: Invalid prefetch level. Must be a non-negative integer." << std::endl;
+            return 1;
+        }
+        startupPrefetchLevel = parsed;
+    }
+
+    CWindow aWin(cacheSizeGB, startupPrefetchLevel);
     aWin.show();
     return QApplication::exec();
 }
