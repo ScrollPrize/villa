@@ -728,7 +728,8 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
             numLayers, zStart, zStep,
             fbW, fbH, method, lut.data(), sampleMethod,
             &lightP,  // sampler uses lightP for volumetric and lighting paths
-            lvlOutPtr, lvlOutStride);
+            lvlOutPtr, lvlOutStride,
+            false, !ctx.interactive);
     } else {
         // surf->gen treats offset as the TOP-LEFT of the rendered region in
         // scaled surface units, but camera.surfacePtr is the CENTRE of the
@@ -843,6 +844,10 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
             }
             vc::Sampling sampleMethod = (numLayers > 1) ? vc::Sampling::Nearest
                                                         : ctx.samplingMethod;
+            const bool skipPrefetch =
+                cacheHit
+                && _genCachePrefetchLevel == sp.level
+                && _genCachePrefetchNumLevels == numLevels;
             sampleAdaptiveARGB32(
                 fbBits, fbStride, ctx.volume->tieredCache(),
                 sp.level, numLevels,
@@ -853,10 +858,15 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
                 &lightP,  // sampler uses lightP for volumetric and lighting paths
                 lvlOutPtr, lvlOutStride,
                 // Coords cached → prior frame already did the chunk
-                // enumeration + fetchInteractive for this exact geometry.
+                // enumeration + fetchInteractive for this exact geometry
+                // at this exact pyramid level.
                 // The per-sample adaptive-fallback path still handles any
                 // block not yet resident, so correctness is preserved.
-                cacheHit);
+                skipPrefetch, !ctx.interactive);
+            if (!skipPrefetch) {
+                _genCachePrefetchLevel = sp.level;
+                _genCachePrefetchNumLevels = numLevels;
+            }
         }
     }
 

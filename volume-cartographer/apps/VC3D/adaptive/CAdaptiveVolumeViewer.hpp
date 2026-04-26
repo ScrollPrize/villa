@@ -454,6 +454,8 @@ private:
     bool _genCacheDirty = true;
     float _genCacheZOff = 0.0f;
     cv::Vec3f _genCacheZOffDir{0.0f, 0.0f, 0.0f};
+    int _genCachePrefetchLevel = -1;
+    int _genCachePrefetchNumLevels = -1;
 
 public:
     // Re-reads perf/interaction settings from disk into cached members.
