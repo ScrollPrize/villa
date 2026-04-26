@@ -22,9 +22,12 @@ class ChunkStats:
     def __init__(self) -> None:
         self._current: dict[str, torch.Tensor] = {}   # channel -> bool (cZ, cY, cX)
         self._previous: dict[str, torch.Tensor] = {}
-        self._acc_total: dict[str, int] = {}
-        self._acc_delta: dict[str, int] = {}
+        # per-group accumulators (keyed by (cZ, cY, cX) grid shape)
+        self._grp_acc_total: dict[tuple[int, int, int], int] = {}
+        self._grp_acc_delta: dict[tuple[int, int, int], int] = {}
+        self._grp_nch: dict[tuple[int, int, int], int] = {}  # channels per group
         self._iter_count: int = 0
+        self._hdr_printed: bool = False
 
     def _ensure_channel(self, channel: str, vol_shape_zyx: tuple[int, int, int],
                         device: torch.device) -> None:
@@ -35,8 +38,12 @@ class ChunkStats:
         cx = (vol_shape_zyx[2] + _CHUNK_SIZE - 1) // _CHUNK_SIZE
         self._current[channel] = torch.zeros(cz, cy, cx, dtype=torch.bool, device=device)
         self._previous[channel] = torch.zeros(cz, cy, cx, dtype=torch.bool, device=device)
-        self._acc_total[channel] = 0
-        self._acc_delta[channel] = 0
+        key = (cz, cy, cx)
+        if key not in self._grp_acc_total:
+            self._grp_acc_total[key] = 0
+            self._grp_acc_delta[key] = 0
+            self._grp_nch[key] = 0
+        self._grp_nch[key] += 1
 
     def begin_iteration(self) -> None:
         for t in self._current.values():
@@ -55,38 +62,75 @@ class ChunkStats:
             ci_z = (flat[:, 2] / _CHUNK_SIZE).long().clamp(0, cZ - 1)
             ct[ci_z, ci_y, ci_x] = True
 
+    def _group_stats(self) -> dict[tuple[int, int, int], tuple[int, int, int]]:
+        """Per grid-shape: (total_chunks, delta_chunks, n_channels)."""
+        # Union channels that share the same grid shape
+        grp_cur: dict[tuple[int, int, int], torch.Tensor] = {}
+        grp_prev: dict[tuple[int, int, int], torch.Tensor] = {}
+        for ch, ct in self._current.items():
+            key = tuple(ct.shape)
+            if key not in grp_cur:
+                grp_cur[key] = ct.clone()
+                grp_prev[key] = self._previous[ch].clone()
+            else:
+                grp_cur[key] |= ct
+                grp_prev[key] |= self._previous[ch]
+        out = {}
+        for key in grp_cur:
+            total = int(grp_cur[key].sum())
+            delta = int((grp_cur[key] & ~grp_prev[key]).sum())
+            out[key] = (total, delta, self._grp_nch[key])
+        return out
+
     def end_iteration(self) -> None:
         self._iter_count += 1
+        grp = self._group_stats()
+        for key, (total, delta, _nch) in grp.items():
+            self._grp_acc_total[key] = self._grp_acc_total.get(key, 0) + total
+            self._grp_acc_delta[key] = self._grp_acc_delta.get(key, 0) + delta
+        # Copy current -> previous
         for ch in self._current:
-            total = int(self._current[ch].sum())
-            delta = int((self._current[ch] & ~self._previous[ch]).sum())
-            self._acc_total[ch] = self._acc_total.get(ch, 0) + total
-            self._acc_delta[ch] = self._acc_delta.get(ch, 0) + delta
             self._previous[ch].copy_(self._current[ch])
+        if self._iter_count <= 100 or self._iter_count % 100 == 0:
+            self._print_line()
         if self._iter_count % 100 == 0:
-            self._print_stats()
+            self._reset_acc()
 
-    def _print_stats(self) -> None:
-        n = min(self._iter_count, 100)
-        print(f"\n[chunk_stats] avg over last {n} iterations (iter {self._iter_count}):")
+    def _print_line(self) -> None:
+        n = self._iter_count if self._iter_count <= 100 else min(self._iter_count, 100)
+        # Build sorted group keys
+        grp_keys = sorted(self._grp_acc_total.keys())
+        if not grp_keys:
+            return
+        chunk_bytes = _CHUNK_SIZE ** 3
+        if not self._hdr_printed:
+            parts = ["[chunk] it"]
+            for key in grp_keys:
+                nch = self._grp_nch[key]
+                cZ, cY, cX = key
+                label = f"{cZ}\u00d7{cY}\u00d7{cX}({nch}ch)"
+                parts.append(f"{label:>20s} new")
+            parts.append("   total_MiB  new_MiB")
+            print("  ".join(parts))
+            self._hdr_printed = True
+        parts = [f"[chunk] {self._iter_count:>4d}"]
         total_all = 0.0
         delta_all = 0.0
-        for ch in sorted(self._current.keys()):
-            avg_total = self._acc_total[ch] / n
-            avg_delta = self._acc_delta[ch] / n
-            cZ, cY, cX = self._current[ch].shape
-            grid_total = cZ * cY * cX
-            print(f"  {ch:>10s}: {avg_total:8.1f} chunks/it ({avg_delta:6.1f} new)  "
-                  f"grid={cZ}\u00d7{cY}\u00d7{cX} ({grid_total:,} total)")
-            total_all += avg_total
-            delta_all += avg_delta
-        chunk_bytes = _CHUNK_SIZE ** 3
-        print(f"  {'TOTAL':>10s}: {total_all:8.1f} chunks/it ({delta_all:6.1f} new)  "
-              f"= {total_all * chunk_bytes / 1024**2:.1f} MiB/it "
-              f"({delta_all * chunk_bytes / 1024**2:.1f} MiB new)")
-        for ch in self._acc_total:
-            self._acc_total[ch] = 0
-            self._acc_delta[ch] = 0
+        for key in grp_keys:
+            avg_t = self._grp_acc_total[key] / n
+            avg_d = self._grp_acc_delta[key] / n
+            parts.append(f"{avg_t:8.0f} {avg_d:8.0f}")
+            total_all += avg_t
+            delta_all += avg_d
+        mib_total = total_all * chunk_bytes / 1024 ** 2
+        mib_delta = delta_all * chunk_bytes / 1024 ** 2
+        parts.append(f"{mib_total:10.1f} {mib_delta:8.1f}")
+        print("  ".join(parts))
+
+    def _reset_acc(self) -> None:
+        for key in self._grp_acc_total:
+            self._grp_acc_total[key] = 0
+            self._grp_acc_delta[key] = 0
 
 
 _chunk_stats = ChunkStats()
