@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -146,5 +147,6 @@ private:
                              PatchFilter&& patchFilter = NoPatchFilter{}) const;
 
     struct Impl;
+    mutable std::shared_mutex mutex_;
     std::unique_ptr<Impl> impl_;
 };

@@ -12,6 +12,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <thread>
@@ -712,8 +713,24 @@ SurfacePatchIndex::SurfacePatchIndex()
 {}
 
 SurfacePatchIndex::~SurfacePatchIndex() = default;
-SurfacePatchIndex::SurfacePatchIndex(SurfacePatchIndex&&) noexcept = default;
-SurfacePatchIndex& SurfacePatchIndex::operator=(SurfacePatchIndex&&) noexcept = default;
+SurfacePatchIndex::SurfacePatchIndex(SurfacePatchIndex&& other) noexcept
+{
+    std::unique_lock<std::shared_mutex> lock(other.mutex_);
+    impl_ = std::move(other.impl_);
+}
+
+SurfacePatchIndex& SurfacePatchIndex::operator=(SurfacePatchIndex&& other) noexcept
+{
+    if (this == &other) {
+        return *this;
+    }
+
+    std::unique_lock<std::shared_mutex> selfLock(mutex_, std::defer_lock);
+    std::unique_lock<std::shared_mutex> otherLock(other.mutex_, std::defer_lock);
+    std::lock(selfLock, otherLock);
+    impl_ = std::move(other.impl_);
+    return *this;
+}
 
 std::string SurfacePatchIndex::cacheKeyForSurfaces(const std::vector<SurfacePtr>& surfaces,
                                                    int samplingStride,
@@ -770,6 +787,7 @@ std::string SurfacePatchIndex::cacheKeyForSurfaces(const std::vector<SurfacePtr>
 bool SurfacePatchIndex::saveCache(const std::filesystem::path& cachePath,
                                   const std::string& cacheKey) const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     if (!impl_) {
         return false;
     }
@@ -889,6 +907,7 @@ bool SurfacePatchIndex::loadCache(const std::filesystem::path& cachePath,
                                   const std::vector<SurfacePtr>& surfaces,
                                   const std::string& expectedKey)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     std::ifstream in(cachePath, std::ios::binary);
     if (!in) {
         return false;
@@ -1099,6 +1118,7 @@ SurfacePatchIndex::Impl::collectEntriesForSurface(const SurfacePtr& surface,
 
 void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float bboxPadding)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_) {
         impl_ = std::make_unique<Impl>();
     }
@@ -1190,6 +1210,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
 
 void SurfacePatchIndex::clear()
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (impl_) {
         impl_->tree.reset();
         impl_->patchCount = 0;
@@ -1202,27 +1223,32 @@ void SurfacePatchIndex::clear()
 
 bool SurfacePatchIndex::empty() const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     return !impl_ || !impl_->tree || impl_->patchCount == 0;
 }
 
 size_t SurfacePatchIndex::patchCount() const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     return impl_ ? impl_->patchCount : 0;
 }
 
 size_t SurfacePatchIndex::surfaceCount() const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     return impl_ ? impl_->surfaceRecords.size() : 0;
 }
 
 bool SurfacePatchIndex::containsSurface(const SurfacePtr& surface) const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     return impl_ && surface && impl_->surfaceRecords.find(surface.get()) != impl_->surfaceRecords.end();
 }
 
 std::optional<SurfacePatchIndex::LookupResult>
 SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const SurfacePtr& targetSurface) const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !impl_->tree || tolerance <= 0.0f || !isFinitePoint(worldPoint)) {
         return std::nullopt;
     }
@@ -1362,6 +1388,7 @@ void SurfacePatchIndex::forEachTriangleImpl(
     Visitor&& visitor,
     PatchFilter&& patchFilter) const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !impl_->tree) {
         return;
     }
@@ -1732,6 +1759,7 @@ SurfacePatchIndex::clipTriangleToPlane(const TriangleCandidate& tri,
 
 bool SurfacePatchIndex::updateSurface(const SurfacePtr& surface)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !surface) {
         return false;
     }
@@ -1760,6 +1788,7 @@ bool SurfacePatchIndex::updateSurfaceRegion(const SurfacePtr& surface,
                                             int colStart,
                                             int colEnd)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !surface) {
         return false;
     }
@@ -1805,6 +1834,7 @@ bool SurfacePatchIndex::updateSurfaceRegion(const SurfacePtr& surface,
 
 bool SurfacePatchIndex::removeSurface(const SurfacePtr& surface)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !surface) {
         return false;
     }
@@ -1813,6 +1843,7 @@ bool SurfacePatchIndex::removeSurface(const SurfacePtr& surface)
 
 bool SurfacePatchIndex::setSamplingStride(int stride)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     stride = std::max(1, stride);
     if (!impl_) {
         impl_ = std::make_unique<Impl>();
@@ -1830,6 +1861,7 @@ bool SurfacePatchIndex::setSamplingStride(int stride)
 
 int SurfacePatchIndex::samplingStride() const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     if (!impl_) {
         return 1;
     }
@@ -1838,6 +1870,7 @@ int SurfacePatchIndex::samplingStride() const
 
 void SurfacePatchIndex::setReadOnly(bool readOnly)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_) {
         impl_ = std::make_unique<Impl>();
     }
@@ -1852,6 +1885,7 @@ void SurfacePatchIndex::setReadOnly(bool readOnly)
 
 bool SurfacePatchIndex::readOnly() const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     return impl_ && impl_->readOnly;
 }
 
@@ -2175,7 +2209,7 @@ void SurfacePatchIndex::Impl::removeCells(const SurfacePtr& surface,
 
 void SurfacePatchIndex::queueCellUpdateForVertex(const SurfacePtr& surface, int vertexRow, int vertexCol)
 {
-    if (!impl_ || !surface) {
+    if (!surface) {
         return;
     }
 
@@ -2204,6 +2238,7 @@ void SurfacePatchIndex::queueCellRangeUpdate(const SurfacePtr& surface,
                                            int colStart,
                                            int colEnd)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !surface) {
         return;
     }
@@ -2244,6 +2279,7 @@ void SurfacePatchIndex::queueCellRangeUpdate(const SurfacePtr& surface,
 
 bool SurfacePatchIndex::flushPendingUpdates(const SurfacePtr& surface)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_) {
         return false;
     }
@@ -2338,6 +2374,7 @@ bool SurfacePatchIndex::Impl::flushPendingSurface(const SurfacePtr& surface, Sur
 
 bool SurfacePatchIndex::hasPendingUpdates(const SurfacePtr& surface) const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     if (!impl_) {
         return false;
     }
@@ -2362,6 +2399,7 @@ bool SurfacePatchIndex::hasPendingUpdates(const SurfacePtr& surface) const
 
 void SurfacePatchIndex::incrementGeneration(const SurfacePtr& surface)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !surface) {
         return;
     }
@@ -2370,6 +2408,7 @@ void SurfacePatchIndex::incrementGeneration(const SurfacePtr& surface)
 
 uint64_t SurfacePatchIndex::generation(const SurfacePtr& surface) const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !surface) {
         return 0;
     }
@@ -2379,6 +2418,7 @@ uint64_t SurfacePatchIndex::generation(const SurfacePtr& surface) const
 
 void SurfacePatchIndex::setGeneration(const SurfacePtr& surface, uint64_t gen)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !surface) {
         return;
     }
