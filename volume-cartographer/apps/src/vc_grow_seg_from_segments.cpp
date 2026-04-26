@@ -3,6 +3,7 @@
 
 #include "vc/core/types/VcDataset.hpp"
 
+#include <boost/program_options.hpp>
 #include <opencv2/core.hpp>
 
 #include "vc/core/util/Slicing.hpp"
@@ -22,6 +23,7 @@ using shape = std::vector<size_t>;
 
 
 using Json = utils::Json;
+namespace po = boost::program_options;
 
 static void add_target_context(utils::Json& meta, const std::filesystem::path& volume_path)
 {
@@ -79,16 +81,56 @@ static void add_internal_volume_shape(utils::Json& params, const std::vector<siz
 
 int main(int argc, char *argv[])
 {
-    if (argc != 6) {
-        std::cout << "usage: " << argv[0] << " <zarr-volume> <src-dir> <tgt-dir> <json-params> <src-segment>" << std::endl;
-        return EXIT_SUCCESS;
+    std::filesystem::path vol_path, src_dir, tgt_dir, params_path, src_path;
+
+    bool use_old_args = argc == 6 && argv[1][0] != '-' && argv[2][0] != '-' &&
+        argv[3][0] != '-' && argv[4][0] != '-' && argv[5][0] != '-';
+
+    if (use_old_args) {
+        vol_path = argv[1];
+        src_dir = argv[2];
+        tgt_dir = argv[3];
+        params_path = argv[4];
+        src_path = argv[5];
+    } else {
+        po::options_description desc("Allowed options");
+        desc.add_options()
+            ("help,h", "produce help message")
+            ("volume,v", po::value<std::string>()->required(), "OME-Zarr volume path")
+            ("src-dir,s", po::value<std::string>()->required(), "Directory containing source segments")
+            ("target-dir,t", po::value<std::string>()->required(), "Target directory for output traces")
+            ("params,p", po::value<std::string>()->required(), "JSON parameters file")
+            ("src-segment", po::value<std::string>()->required(), "Source segment path to grow from");
+
+        po::variables_map vm;
+        try {
+            po::store(po::parse_command_line(argc, argv, desc), vm);
+
+            if (vm.count("help")) {
+                std::cout << desc << std::endl;
+                return EXIT_SUCCESS;
+            }
+
+            po::notify(vm);
+        } catch (const po::error& e) {
+            std::cerr << "ERROR: " << e.what() << std::endl << std::endl;
+            std::cerr << "usage: " << argv[0]
+                      << " --volume <zarr-volume>"
+                      << " --src-dir <src-dir>"
+                      << " --target-dir <tgt-dir>"
+                      << " --params <json-params>"
+                      << " --src-segment <src-segment>" << std::endl << std::endl;
+            std::cerr << desc << std::endl;
+            return EXIT_FAILURE;
+        }
+
+        vol_path = vm["volume"].as<std::string>();
+        src_dir = vm["src-dir"].as<std::string>();
+        tgt_dir = vm["target-dir"].as<std::string>();
+        params_path = vm["params"].as<std::string>();
+        src_path = vm["src-segment"].as<std::string>();
     }
 
-    std::filesystem::path vol_path = argv[1];
-    std::filesystem::path src_dir = argv[2];
-    std::filesystem::path tgt_dir = argv[3];
-    std::filesystem::path params_path = argv[4];
-    std::filesystem::path src_path = argv[5];
     while (src_path.filename().empty())
         src_path = src_path.parent_path();
 
