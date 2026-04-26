@@ -16,16 +16,29 @@ CHUNK_STATS_ENABLED = True
 _CHUNK_SIZE = 32
 
 
+def _dilate6(t: torch.Tensor) -> torch.Tensor:
+    """6-connected dilation of a 3D bool tensor."""
+    d = t.clone()
+    d[1:] |= t[:-1]
+    d[:-1] |= t[1:]
+    d[:, 1:] |= t[:, :-1]
+    d[:, :-1] |= t[:, 1:]
+    d[:, :, 1:] |= t[:, :, :-1]
+    d[:, :, :-1] |= t[:, :, 1:]
+    return d
+
+
 class ChunkStats:
     """Track which 32-voxel chunks are sampled per optimizer iteration."""
 
     def __init__(self) -> None:
         self._current: dict[str, torch.Tensor] = {}   # channel -> bool (cZ, cY, cX)
-        self._previous: dict[str, torch.Tensor] = {}
-        # per-group accumulators (keyed by (cZ, cY, cX) grid shape)
-        self._grp_acc_total: dict[tuple[int, int, int], int] = {}
-        self._grp_acc_delta: dict[tuple[int, int, int], int] = {}
-        self._grp_nch: dict[tuple[int, int, int], int] = {}  # channels per group
+        self._grp_nch: dict[tuple[int, int, int], int] = {}
+        # per-group previous state
+        self._grp_prev: dict[tuple[int, int, int], torch.Tensor] = {}
+        self._grp_prev_dil: dict[tuple[int, int, int], torch.Tensor] = {}
+        # accumulators: cur, new, dil, miss
+        self._grp_acc: dict[tuple[int, int, int], list[int]] = {}  # [cur, new, dil, miss]
         self._iter_count: int = 0
         self._hdr_printed: bool = False
 
@@ -37,11 +50,11 @@ class ChunkStats:
         cy = (vol_shape_zyx[1] + _CHUNK_SIZE - 1) // _CHUNK_SIZE
         cx = (vol_shape_zyx[2] + _CHUNK_SIZE - 1) // _CHUNK_SIZE
         self._current[channel] = torch.zeros(cz, cy, cx, dtype=torch.bool, device=device)
-        self._previous[channel] = torch.zeros(cz, cy, cx, dtype=torch.bool, device=device)
         key = (cz, cy, cx)
-        if key not in self._grp_acc_total:
-            self._grp_acc_total[key] = 0
-            self._grp_acc_delta[key] = 0
+        if key not in self._grp_acc:
+            self._grp_prev[key] = torch.zeros(cz, cy, cx, dtype=torch.bool, device=device)
+            self._grp_prev_dil[key] = torch.zeros(cz, cy, cx, dtype=torch.bool, device=device)
+            self._grp_acc[key] = [0, 0, 0, 0]
             self._grp_nch[key] = 0
         self._grp_nch[key] += 1
 
@@ -62,75 +75,75 @@ class ChunkStats:
             ci_z = (flat[:, 2] / _CHUNK_SIZE).long().clamp(0, cZ - 1)
             ct[ci_z, ci_y, ci_x] = True
 
-    def _group_stats(self) -> dict[tuple[int, int, int], tuple[int, int, int]]:
-        """Per grid-shape: (total_chunks, delta_chunks, n_channels)."""
-        # Union channels that share the same grid shape
-        grp_cur: dict[tuple[int, int, int], torch.Tensor] = {}
-        grp_prev: dict[tuple[int, int, int], torch.Tensor] = {}
+    def _union_current(self) -> dict[tuple[int, int, int], torch.Tensor]:
+        """Union per-channel current tensors into per-group."""
+        grp: dict[tuple[int, int, int], torch.Tensor] = {}
         for ch, ct in self._current.items():
             key = tuple(ct.shape)
-            if key not in grp_cur:
-                grp_cur[key] = ct.clone()
-                grp_prev[key] = self._previous[ch].clone()
+            if key not in grp:
+                grp[key] = ct.clone()
             else:
-                grp_cur[key] |= ct
-                grp_prev[key] |= self._previous[ch]
-        out = {}
-        for key in grp_cur:
-            total = int(grp_cur[key].sum())
-            delta = int((grp_cur[key] & ~grp_prev[key]).sum())
-            out[key] = (total, delta, self._grp_nch[key])
-        return out
+                grp[key] |= ct
+        return grp
 
     def end_iteration(self) -> None:
         self._iter_count += 1
-        grp = self._group_stats()
-        for key, (total, delta, _nch) in grp.items():
-            self._grp_acc_total[key] = self._grp_acc_total.get(key, 0) + total
-            self._grp_acc_delta[key] = self._grp_acc_delta.get(key, 0) + delta
-        # Copy current -> previous
-        for ch in self._current:
-            self._previous[ch].copy_(self._current[ch])
+        grp_cur = self._union_current()
+        for key, cur in grp_cur.items():
+            prev = self._grp_prev[key]
+            prev_dil = self._grp_prev_dil[key]
+            cur_dil = _dilate6(cur)
+            n_cur = int(cur.sum())
+            n_new = int((cur & ~prev).sum())
+            n_dil = int(cur_dil.sum())
+            n_miss = int((cur & ~prev_dil).sum())
+            acc = self._grp_acc[key]
+            acc[0] += n_cur
+            acc[1] += n_new
+            acc[2] += n_dil
+            acc[3] += n_miss
+            self._grp_prev[key] = cur
+            self._grp_prev_dil[key] = cur_dil
         if self._iter_count <= 100 or self._iter_count % 100 == 0:
             self._print_line()
         if self._iter_count % 100 == 0:
-            self._reset_acc()
+            for acc in self._grp_acc.values():
+                acc[:] = [0, 0, 0, 0]
 
     def _print_line(self) -> None:
-        n = self._iter_count if self._iter_count <= 100 else min(self._iter_count, 100)
-        # Build sorted group keys
-        grp_keys = sorted(self._grp_acc_total.keys())
+        n = self._iter_count if self._iter_count <= 100 else 100
+        grp_keys = sorted(self._grp_acc.keys())
         if not grp_keys:
             return
-        chunk_bytes = _CHUNK_SIZE ** 3
+        mib_per_chunk = _CHUNK_SIZE ** 3 / 1024 ** 2
         if not self._hdr_printed:
-            parts = ["[chunk] it"]
+            h1 = f"{'[chunk]  it':14s}"
+            h2 = f"{'':14s}"
             for key in grp_keys:
                 nch = self._grp_nch[key]
                 cZ, cY, cX = key
-                label = f"{cZ}\u00d7{cY}\u00d7{cX}({nch}ch)"
-                parts.append(f"{label:>20s} new")
-            parts.append("   total_MiB  new_MiB")
-            print("  ".join(parts))
+                label = f"{cZ}\u00d7{cY}\u00d7{cX} ({nch}ch)"
+                w = 28
+                h1 += f"  {label:^{w}s}"
+                h2 += f"  {'cur':>7s}{'new':>7s}{'dil':>7s}{'miss':>7s}"
+            h1 += f"  {'total chunks':^28s}  {'total MiB':^28s}"
+            h2 += f"  {'cur':>7s}{'new':>7s}{'dil':>7s}{'miss':>7s}"
+            h2 += f"  {'cur':>7s}{'new':>7s}{'dil':>7s}{'miss':>7s}"
+            print(h1)
+            print(h2)
             self._hdr_printed = True
-        parts = [f"[chunk] {self._iter_count:>4d}"]
-        total_all = 0.0
-        delta_all = 0.0
+        row = f"[chunk] {self._iter_count:>5d} "
+        tot = [0.0, 0.0, 0.0, 0.0]
         for key in grp_keys:
-            avg_t = self._grp_acc_total[key] / n
-            avg_d = self._grp_acc_delta[key] / n
-            parts.append(f"{avg_t:8.0f} {avg_d:8.0f}")
-            total_all += avg_t
-            delta_all += avg_d
-        mib_total = total_all * chunk_bytes / 1024 ** 2
-        mib_delta = delta_all * chunk_bytes / 1024 ** 2
-        parts.append(f"{mib_total:10.1f} {mib_delta:8.1f}")
-        print("  ".join(parts))
-
-    def _reset_acc(self) -> None:
-        for key in self._grp_acc_total:
-            self._grp_acc_total[key] = 0
-            self._grp_acc_delta[key] = 0
+            acc = self._grp_acc[key]
+            vals = [acc[i] / n for i in range(4)]
+            row += f"  {vals[0]:7.0f}{vals[1]:7.0f}{vals[2]:7.0f}{vals[3]:7.0f}"
+            for i in range(4):
+                tot[i] += vals[i]
+        row += f"  {tot[0]:7.0f}{tot[1]:7.0f}{tot[2]:7.0f}{tot[3]:7.0f}"
+        m = [v * mib_per_chunk for v in tot]
+        row += f"  {m[0]:7.1f}{m[1]:7.1f}{m[2]:7.1f}{m[3]:7.1f}"
+        print(row)
 
 
 _chunk_stats = ChunkStats()
