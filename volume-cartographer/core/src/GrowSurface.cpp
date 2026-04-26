@@ -951,7 +951,10 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     std::cout << "optimizer: optimizing surface " << state.size() << " " << used_area <<  " " << static_bounds << std::endl;
 
     cv::Mat_<cv::Vec3d> points_new = points.clone();
-    QuadSurface sm(points, {1,1});
+    // QuadSurface destruction can release storage shared with optimizer helper
+    // surfaces on this path. Keep these remap-only helpers alive past the
+    // optimizer cleanup.
+    QuadSurface* sm = new QuadSurface(points, {1,1});
 
     std::shared_mutex mutex;
 
@@ -982,8 +985,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     for(int j=used_area.y;j<used_area.br().y;j++)
         for(int i=used_area.x;i<used_area.br().x;i++)
             if (state(j,i) & STATE_LOC_VALID) {
-                data_new.surfs({j,i}).insert(&sm);
-                data_new.loc(&sm, {j,i}) = {j,i};
+                data_new.surfs({j,i}).insert(sm);
+                data_new.loc(sm, {j,i}) = {static_cast<double>(j), static_cast<double>(i)};
             }
 
     cv::Mat_<uint8_t> new_state = state.clone();
@@ -1008,14 +1011,14 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                     new_state(j, i) = STATE_COORD_VALID;
                     points_new(j,i) = {-3,-2,-4};
                     //TODO add local area solve
-                    double err = local_solve(&sm, {j,i}, data_new, new_state, points_new, step, src_step, LOSS_3D_INDIRECT | SURF_LOSS);
+                    double err = local_solve(sm, {j,i}, data_new, new_state, points_new, step, src_step, LOSS_3D_INDIRECT | SURF_LOSS);
                     if (points_new(j,i)[0] == -3) {
                         //FIXME actually check for solver failure?
                         new_state(j, i) = 0;
                         points_new(j,i) = {-1,-1,-1};
                     }
                     else
-                        res_count += surftrack_add_global(&sm, {j,i}, data_new, problem_inpaint, new_state, points_new, step*src_step, LOSS_3D_INDIRECT | OPTIMIZE_ALL);
+                        res_count += surftrack_add_global(sm, {j,i}, data_new, problem_inpaint, new_state, points_new, step*src_step, LOSS_3D_INDIRECT | OPTIMIZE_ALL);
                 }
     }
 
@@ -1031,7 +1034,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     cv::Mat_<cv::Vec3d> points_inpainted = points_new.clone();
 
     //TODO we could directly use higher res here?
-    QuadSurface sm_inp(points_inpainted, {1,1});
+    QuadSurface* sm_inp = new QuadSurface(points_inpainted, {1,1});
 
     SurfTrackerData data_inp;
     data_inp._data = data_new._data;
@@ -1039,8 +1042,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     for(int j=used_area.y;j<used_area.br().y;j++)
         for(int i=used_area.x;i<used_area.br().x;i++)
             if (new_state(j,i) & STATE_LOC_VALID) {
-                data_inp.surfs({j,i}).insert(&sm_inp);
-                data_inp.loc(&sm_inp, {j,i}) = {j,i};
+                data_inp.surfs({j,i}).insert(sm_inp);
+                data_inp.loc(sm_inp, {j,i}) = {static_cast<double>(j), static_cast<double>(i)};
             }
 
     ceres::Problem problem;
@@ -1050,10 +1053,10 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     int fix_points = 0;
     for(int j=used_area.y;j<used_area.br().y;j++)
         for(int i=used_area.x;i<used_area.br().x;i++) {
-            res_count += surftrack_add_global(&sm_inp, {j,i}, data_inp, problem, new_state, points_new, step*src_step, LOSS_3D_INDIRECT | SURF_LOSS | OPTIMIZE_ALL);
+            res_count += surftrack_add_global(sm_inp, {j,i}, data_inp, problem, new_state, points_new, step*src_step, LOSS_3D_INDIRECT | SURF_LOSS | OPTIMIZE_ALL);
             fix_points++;
-            if (problem.HasParameterBlock(&data_inp.loc(&sm_inp, {j,i})[0]))
-                problem.AddResidualBlock(LinChkDistLoss::Create(data_inp.loc(&sm_inp, {j,i}), 1.0), nullptr, &data_inp.loc(&sm_inp, {j,i})[0]);
+            if (problem.HasParameterBlock(&data_inp.loc(sm_inp, {j,i})[0]))
+                problem.AddResidualBlock(LinChkDistLoss::Create(data_inp.loc(sm_inp, {j,i}), 1.0), nullptr, &data_inp.loc(sm_inp, {j,i})[0]);
         }
 
     std::cout << "optimizer: num fix points " << fix_points << std::endl;
@@ -1065,8 +1068,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     for(int j=used_area.y;j<used_area.br().y;j++)
         for(int i=used_area.x;i<used_area.br().x;i++) {
             fix_points_z++;
-            if (problem.HasParameterBlock(&data_inp.loc(&sm_inp, {j,i})[0]))
-                problem.AddResidualBlock(ZLocationLoss<cv::Vec3d>::Create(points_new, data_inp.seed_coord[2] - (j-data.seed_loc[0])*step*src_step, z_loc_loss_w), new ceres::HuberLoss(1.0), &data_inp.loc(&sm_inp, {j,i})[0]);
+            if (problem.HasParameterBlock(&data_inp.loc(sm_inp, {j,i})[0]))
+                problem.AddResidualBlock(ZLocationLoss<cv::Vec3d>::Create(points_new, data_inp.seed_coord[2] - (j-data.seed_loc[0])*step*src_step, z_loc_loss_w), new ceres::HuberLoss(1.0), &data_inp.loc(sm_inp, {j,i})[0]);
         }
 
     std::cout << "optimizer: optimizing " << res_count << " residuals, seed " << seed << std::endl;
@@ -1074,8 +1077,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     for(int j=used_area.y;j<used_area.br().y;j++)
         for(int i=used_area.x;i<used_area.br().x;i++)
             if (static_bounds.contains(cv::Point(i,j))) {
-                if (problem.HasParameterBlock(&data_inp.loc(&sm_inp, {j,i})[0]))
-                    problem.SetParameterBlockConstant(&data_inp.loc(&sm_inp, {j,i})[0]);
+                if (problem.HasParameterBlock(&data_inp.loc(sm_inp, {j,i})[0]))
+                    problem.SetParameterBlockConstant(&data_inp.loc(sm_inp, {j,i})[0]);
                 if (problem.HasParameterBlock(&points_new(j, i)[0]))
                     problem.SetParameterBlockConstant(&points_new(j, i)[0]);
             }
@@ -1117,7 +1120,7 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                 mutex.unlock();
             }
             else if (new_state(j,i) & STATE_VALID) {
-                cv::Vec2d l = data_inp.loc(&sm_inp ,{j,i});
+                cv::Vec2d l = data_inp.loc(sm_inp ,{j,i});
                 int y = l[0];
                 int x = l[1];
                 l *= step;
@@ -1228,7 +1231,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
 
                         for(int y=j-2;y<=j+2;y++)
                             for(int x=i-2;x<=i+2;x++)
-                                fringe_next(y,x) = 1;
+                                if (y >= 0 && y < fringe_next.rows && x >= 0 && x < fringe_next.cols)
+                                    fringe_next(y,x) = 1;
                     }
                 }
         std::cout << "optimizer: added " << added << std::endl;
