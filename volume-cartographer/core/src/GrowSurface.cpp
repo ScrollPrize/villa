@@ -850,6 +850,35 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat
     return points_hr;
 }
 
+static cv::Mat_<uint16_t> surftrack_generations_hr(const cv::Mat_<uint8_t>& state, const cv::Mat_<uint16_t>& generations,
+                                                   const cv::Rect& used_area, float step)
+{
+    cv::Mat_<uint16_t> generations_hr(state.rows * step, state.cols * step, static_cast<uint16_t>(0));
+    for(int j=used_area.y;j<used_area.br().y-1;j++)
+        for(int i=used_area.x;i<used_area.br().x-1;i++) {
+            if (state(j,i) & (STATE_LOC_VALID|STATE_COORD_VALID)
+                && state(j,i+1) & (STATE_LOC_VALID|STATE_COORD_VALID)
+                && state(j+1,i) & (STATE_LOC_VALID|STATE_COORD_VALID)
+                && state(j+1,i+1) & (STATE_LOC_VALID|STATE_COORD_VALID))
+            {
+                uint16_t cell_generation = std::max(
+                    std::max(generations(j,i), generations(j,i+1)),
+                    std::max(generations(j+1,i), generations(j+1,i+1)));
+                if (cell_generation == 0) {
+                    continue;
+                }
+                for(int sy=0;sy<=step;sy++)
+                    for(int sx=0;sx<=step;sx++) {
+                        const int y = j * step + sy;
+                        const int x = i * step + sx;
+                        generations_hr(y,x) = std::max(generations_hr(y,x), cell_generation);
+                    }
+            }
+        }
+
+    return generations_hr;
+}
+
 
 
 
@@ -1384,6 +1413,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
     std::unordered_set<cv::Vec2i,vec2i_hash> fringe;
 
     cv::Mat_<uint8_t> state(size,0);
+    cv::Mat_<uint16_t> generations(size, static_cast<uint16_t>(0));
     cv::Mat_<uint16_t> inliers_sum_dbg(size,0);
     cv::Mat_<cv::Vec3d> points(size,{-1,-1,-1});
 
@@ -1418,6 +1448,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
         std::cout << "warning: seed z " << data.seed_coord[2] << " is outside z_range; growth will be restricted to [" << z_min << ", " << z_max << "]" << std::endl;
 
     state(y0,x0) = STATE_LOC_VALID | STATE_COORD_VALID;
+    generations(y0,x0) = 1;
     fringe.insert(cv::Vec2i(y0,x0));
 
     //insert initial surfs per location
@@ -1499,9 +1530,11 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
         }
 
         cv::Mat_<uint8_t> state_orig = state.clone();
+        cv::Mat_<uint16_t> generations_orig = generations.clone();
         cv::Mat_<cv::Vec3d> points_orig = points.clone();
         cv::Mat_<uint16_t> inliers_sum_dbg_orig = inliers_sum_dbg.clone();
         state.setTo(0);
+        generations.setTo(0);
         points.setTo(cv::Vec3d(-1,-1,-1));
         inliers_sum_dbg.setTo(0);
 
@@ -1518,6 +1551,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
                         continue;
                     }
                     state(ny, nx) = state_orig(j, i);
+                    generations(ny, nx) = generations_orig(j, i);
                     points(ny, nx) = points_orig(j, i);
                     inliers_sum_dbg(ny, nx) = inliers_sum_dbg_orig(j, i);
                     cv::Rect cell(nx, ny, 1, 1);
@@ -1773,6 +1807,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
                     throw std::runtime_error("oops best_cord[0]");
                 if (violates_single_wrap(p, best_coord)) {
                     state(p) = 0;
+                    generations(p) = 0;
                     points(p) = {-1,-1,-1};
                     continue;
                 }
@@ -1780,6 +1815,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
                 data_th.surfs(p).insert(best_surf);
                 data_th.loc(best_surf, p) = best_loc;
                 state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
+                generations(p) = static_cast<uint16_t>(std::min(generation + 1, static_cast<int>(std::numeric_limits<uint16_t>::max())));
                 points(p) = best_coord;
                 inliers_sum_dbg(p) = best_inliers;
 
@@ -1858,10 +1894,12 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
             else if (best_inliers == -1) {
                 //just try again some other time
                 state(p) = 0;
+                generations(p) = 0;
                 points(p) = {-1,-1,-1};
             }
             else {
                 state(p) = 0;
+                generations(p) = 0;
                 points(p) = {-1,-1,-1};
 #pragma omp critical
                 best_inliers_gen = std::max(best_inliers_gen, best_inliers);
@@ -1916,7 +1954,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
         if (generation % 50 == 0 || update_mapping /*|| generation < 10*/) {
             {
                 cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step);
+                cv::Mat_<uint16_t> generations_hr = surftrack_generations_hr(state, generations, used_area, step);
                 auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
+                dbg_surf->setChannel("generations", generations_hr(used_area_hr));
                 dbg_surf->meta = utils::Json::object();
                 dbg_surf->meta["vc_grow_seg_from_segments_params"] = json_to_utils(params);
 
@@ -1964,7 +2004,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
 
             if (debug_images) {
                 cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step);
+                cv::Mat_<uint16_t> generations_hr = surftrack_generations_hr(state, generations, used_area, step);
                 auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
+                dbg_surf->setChannel("generations", generations_hr(used_area_hr));
                 dbg_surf->meta = utils::Json::object();
                 dbg_surf->meta["vc_grow_seg_from_segments_params"] = json_to_utils(params);
 
@@ -2006,6 +2048,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
             state = cv::Mat_<uint8_t>(size, 0);
             old_state.copyTo(state(cv::Rect(0,0,old_state.cols,h)));
 
+            cv::Mat_<uint16_t> old_generations = generations;
+            generations = cv::Mat_<uint16_t>(size, static_cast<uint16_t>(0));
+            old_generations.copyTo(generations(cv::Rect(0,0,old_generations.cols,h)));
+
             cv::Mat_<uint16_t> old_inliers_sum_dbg = inliers_sum_dbg;
             inliers_sum_dbg = cv::Mat_<uint16_t>(size, 0);
             old_inliers_sum_dbg.copyTo(inliers_sum_dbg(cv::Rect(0,0,old_inliers_sum_dbg.cols,h)));
@@ -2039,8 +2085,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
     std::cout << "area est: " << area_est_vx2 << " vx^2 (" << area_est_cm2 << " cm^2)" << std::endl;
 
     cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step);
+    cv::Mat_<uint16_t> generations_hr = surftrack_generations_hr(state, generations, used_area, step);
 
     auto surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
+    surf->setChannel("generations", generations_hr(used_area_hr));
 
     surf->meta = utils::Json::object();
     surf->meta["area_vx2"] = static_cast<double>(area_est_vx2);
