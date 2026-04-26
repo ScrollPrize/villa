@@ -3,6 +3,7 @@
 #include <QWidget>
 #include <QPointF>
 #include <QImage>
+#include <QTransform>
 
 #include <array>
 #include <atomic>
@@ -312,6 +313,19 @@ private:
     void zoomStepsAt(int steps, const QPointF& scenePos);
 
     bool isAxisAlignedView() const;
+
+    struct CameraSceneSnapshot {
+        float camSurfX = 0.0f;
+        float camSurfY = 0.0f;
+        float camScale = 1.0f;
+        float vpCx = 0.0f;
+        float vpCy = 0.0f;
+        QTransform sceneToView;
+        QTransform viewToScene;
+        bool valid = false;
+    };
+    CameraSceneSnapshot cameraSceneSnapshot() const;
+    void warpIntersectionItemsFrom(const CameraSceneSnapshot& oldCam);
 
     // --- Qt widgets ---
     CVolumeViewerView* _view = nullptr;

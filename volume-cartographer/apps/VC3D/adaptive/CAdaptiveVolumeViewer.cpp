@@ -1169,8 +1169,73 @@ void CAdaptiveVolumeViewer::centerOnVolumePoint(const cv::Vec3f& point, bool for
 // Navigation
 // ============================================================================
 
+CAdaptiveVolumeViewer::CameraSceneSnapshot CAdaptiveVolumeViewer::cameraSceneSnapshot() const
+{
+    CameraSceneSnapshot snap;
+    if (!_view || _framebuffer.isNull() || _camera.scale <= 0.0f) {
+        return snap;
+    }
+
+    snap.camSurfX = _camera.surfacePtr[0];
+    snap.camSurfY = _camera.surfacePtr[1];
+    snap.camScale = _camera.scale;
+    snap.vpCx = static_cast<float>(_framebuffer.width()) * 0.5f;
+    snap.vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
+    snap.sceneToView = _view->transform();
+    snap.viewToScene = snap.sceneToView.inverted();
+    snap.valid = true;
+    return snap;
+}
+
+void CAdaptiveVolumeViewer::warpIntersectionItemsFrom(const CameraSceneSnapshot& oldCam)
+{
+    if (!oldCam.valid || _intersectionItems.empty()) {
+        return;
+    }
+
+    const CameraSceneSnapshot newCam = cameraSceneSnapshot();
+    if (!newCam.valid || oldCam.camScale <= 0.0f) {
+        return;
+    }
+
+    const float scaleRatio = newCam.camScale / oldCam.camScale;
+    auto mapScenePoint = [&](const QPointF& scenePoint) {
+        const QPointF oldVp = oldCam.sceneToView.map(scenePoint);
+        const qreal newVx =
+            oldVp.x() * scaleRatio +
+            (oldCam.camSurfX - newCam.camSurfX) * newCam.camScale +
+            newCam.vpCx - oldCam.vpCx * scaleRatio;
+        const qreal newVy =
+            oldVp.y() * scaleRatio +
+            (oldCam.camSurfY - newCam.camSurfY) * newCam.camScale +
+            newCam.vpCy - oldCam.vpCy * scaleRatio;
+        return newCam.viewToScene.map(QPointF(newVx, newVy));
+    };
+
+    const QPointF p0 = mapScenePoint(QPointF(0.0, 0.0));
+    const QPointF p1 = mapScenePoint(QPointF(1.0, 0.0));
+    const QPointF p2 = mapScenePoint(QPointF(0.0, 1.0));
+    QTransform sceneWarp(
+        p1.x() - p0.x(), p1.y() - p0.y(),
+        p2.x() - p0.x(), p2.y() - p0.y(),
+        p0.x(), p0.y());
+
+    for (auto* item : _intersectionItems) {
+        auto* pathItem = qgraphicsitem_cast<QGraphicsPathItem*>(item);
+        if (!pathItem) {
+            continue;
+        }
+        pathItem->setPath(sceneWarp.map(pathItem->path()));
+        pathItem->setTransform(QTransform());
+    }
+    if (_view) {
+        _view->viewport()->update();
+    }
+}
+
 void CAdaptiveVolumeViewer::panByF(float dx, float dy)
 {
+    const CameraSceneSnapshot oldCam = cameraSceneSnapshot();
     const float invScale = _panSensitivity / _camera.scale;
     _camera.surfacePtr[0] -= dx * invScale;
     _camera.surfacePtr[1] -= dy * invScale;
@@ -1181,6 +1246,7 @@ void CAdaptiveVolumeViewer::panByF(float dx, float dy)
     }
 
     _cachedStretchValid = false;
+    warpIntersectionItemsFrom(oldCam);
     beginInteraction();
     scheduleRender();
     emit overlaysUpdated();
@@ -1189,6 +1255,8 @@ void CAdaptiveVolumeViewer::panByF(float dx, float dy)
 void CAdaptiveVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 {
     if (steps == 0) return;
+
+    const CameraSceneSnapshot oldCam = cameraSceneSnapshot();
 
     float factor = std::pow(1.05f, static_cast<float>(steps) * _zoomSensitivity);
     float newScale = std::clamp(_camera.scale * factor,
@@ -1233,6 +1301,7 @@ void CAdaptiveVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     _scene->setSceneRect(0, 0, w, h);
 
     _cachedStretchValid = false;
+    warpIntersectionItemsFrom(oldCam);
     // Zoom can fire as fast as the keyboard repeats. scheduleRender()
     // coalesces bursts into the 60 fps render timer so we don't render
     // dozens of intermediate frames the user never sees.
@@ -1702,7 +1771,6 @@ void CAdaptiveVolumeViewer::renderIntersectionsNow()
         _lastIntersectFp = {};
         return;
     }
-    invalidateIntersect();
     _lastIntersectFp = fp;
 
     // Snapshot camera state for the worker's plane-to-scene projections.
@@ -1853,6 +1921,9 @@ void CAdaptiveVolumeViewer::renderIntersectionsNow()
                     }
                     _planeWorkerBusy.store(false,
                                            std::memory_order_release);
+                    if (_intersectionsDirty && _renderTimer && !_renderTimer->isActive()) {
+                        _renderTimer->start();
+                    }
                 },
                 Qt::QueuedConnection);
             _backgroundWorkers.fetch_sub(1, std::memory_order_release);
@@ -1958,8 +2029,6 @@ void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<S
     if (_lastIntersectFp == fp && !_intersectionItems.empty()) {
         return;
     }
-    invalidateIntersect();
-    _lastIntersectFp = fp;
 
     // Everything past this point is pure computation over `activeSeg`,
     // `planes`, `patchIndex`, and a snapshot of the camera transform. We
@@ -1971,11 +2040,14 @@ void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<S
     if (_flattenedWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
         // A previous compute is still running. _intersectionsDirty will
         // stay true; _renderTimer will re-enter here once the worker
-        // finishes and resets the flag.
+        // finishes and resets the flag. Leave the existing items visible:
+        // clearing them here creates a blank overlay if the in-flight
+        // worker is invalidated by this newer camera state.
         _intersectionsDirty = true;
         _lastIntersectFp = {};
         return;
     }
+    _lastIntersectFp = fp;
 
     Rect3D allBounds{cv::Vec3f(0, 0, 0), cv::Vec3f(1, 1, 1)};
     if (_volume) {
@@ -2086,6 +2158,9 @@ void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<S
                     }
                     _flattenedWorkerBusy.store(false,
                                                std::memory_order_release);
+                    if (_intersectionsDirty && _renderTimer && !_renderTimer->isActive()) {
+                        _renderTimer->start();
+                    }
                 },
                 Qt::QueuedConnection);
             _backgroundWorkers.fetch_sub(1, std::memory_order_release);
