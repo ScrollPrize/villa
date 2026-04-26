@@ -152,7 +152,7 @@ auto main(int argc, char* argv[]) -> int
 
     QCommandLineOption prefetchLevelOption(
         "prefetch-level",
-        "For remote Zarr volumes, block on startup/open and prefetch the given pyramid level into the local cache (use 5 for the coarse level).",
+        "For remote Zarr volumes, block on startup/open and prefetch the given pyramid level plus all coarser levels into the local cache.",
         "level");
     parser.addOption(prefetchLevelOption);
 

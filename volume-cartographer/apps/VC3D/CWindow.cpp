@@ -2247,7 +2247,15 @@ void CWindow::runStartupPrefetchForVolume(const std::shared_ptr<Volume>& volume)
     }
 
     volume->setCacheBudget(_cacheSizeBytes);
-    prefetchRemoteLevelWithDialog(this, volume, _startupPrefetchLevel);
+    const int numLevels = static_cast<int>(volume->numScales());
+    if (_startupPrefetchLevel >= numLevels) {
+        prefetchRemoteLevelWithDialog(this, volume, _startupPrefetchLevel);
+        return;
+    }
+
+    for (int level = _startupPrefetchLevel; level < numLevels; ++level) {
+        prefetchRemoteLevelWithDialog(this, volume, level);
+    }
 }
 
 bool CWindow::attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
