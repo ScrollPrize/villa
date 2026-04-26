@@ -150,6 +150,11 @@ static bool crosses_single_wrap_seam(const Umbilicus& umbilicus,
     return delta > 180.0;
 }
 
+static bool same_single_wrap_z(const cv::Vec3d& a, const cv::Vec3d& b)
+{
+    return static_cast<int>(std::lround(a[2])) == static_cast<int>(std::lround(b[2]));
+}
+
 } // namespace
 
 int static dbg_counter = 0;
@@ -1362,6 +1367,12 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
         std::cout << "  single wrap: true, seam direction: -x, umbilicus_path: "
                   << params["umbilicus_path"].get<std::string>() << std::endl;
     }
+    const int single_wrap_gap_search = std::max(0, params.value("single_wrap_gap_search", 0));
+    if (single_wrap_umbilicus) {
+        std::cout << "  single_wrap_gap_search: "
+                  << (single_wrap_gap_search == 0 ? std::string("used-area") : std::to_string(single_wrap_gap_search))
+                  << std::endl;
+    }
 
     std::cout << "total surface count: " << surfs_v.size() << std::endl;
 
@@ -1695,16 +1706,44 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
             return false;
         }
 
+        auto valid_existing_point = [&](const cv::Vec2i& pn) {
+            return pn[0] >= 0 && pn[0] < points.rows &&
+                   pn[1] >= 0 && pn[1] < points.cols &&
+                   (state(pn) & STATE_LOC_VALID) != 0 &&
+                   points(pn)[0] != -1;
+        };
+
+        auto crosses_existing_point = [&](const cv::Vec2i& pn) {
+            return valid_existing_point(pn) &&
+                   crosses_single_wrap_seam(*single_wrap_umbilicus, points(pn), coord);
+        };
+
         for (const auto& n : neighs) {
             const cv::Vec2i pn = p + n;
-            if (pn[0] < 0 || pn[0] >= points.rows || pn[1] < 0 || pn[1] >= points.cols) {
-                continue;
-            }
-            if ((state(pn) & STATE_LOC_VALID) == 0 || points(pn)[0] == -1) {
-                continue;
-            }
-            if (crosses_single_wrap_seam(*single_wrap_umbilicus, points(pn), coord)) {
+            if (crosses_existing_point(pn)) {
                 return true;
+            }
+        }
+
+        const int max_gap = single_wrap_gap_search > 0
+            ? single_wrap_gap_search
+            : std::max(points.rows, points.cols);
+        const cv::Rect scan_area = (used_area | cv::Rect(p[1], p[0], 1, 1)) &
+                                   cv::Rect(0, 0, points.cols, points.rows);
+        for (const auto& n : neighs) {
+            cv::Vec2i pn = p + n;
+            for (int gap = 1; gap <= max_gap; ++gap, pn += n) {
+                if (!scan_area.contains(cv::Point(pn[1], pn[0]))) {
+                    break;
+                }
+                if (!valid_existing_point(pn)) {
+                    continue;
+                }
+                if (same_single_wrap_z(points(pn), coord) &&
+                    crosses_single_wrap_seam(*single_wrap_umbilicus, points(pn), coord)) {
+                    return true;
+                }
+                break;
             }
         }
 
