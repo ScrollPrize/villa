@@ -1357,6 +1357,7 @@ void CAdaptiveVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMo
             focus->p = newPos;
             if (length > 0.0) focus->n = normal;
             focus->surfaceId = _surfName;
+            focus->suppressViewerRecenter = true;
             _state->setPOI("focus", focus);
         } else {
             // Direct z-offset — rigid translation along the surface normal at

@@ -21,6 +21,7 @@ struct POI
     cv::Vec3f p = {0,0,0};
     std::string surfaceId;  // ID of the source surface (for lookup, not ownership)
     cv::Vec3f n = {0,0,0};
+    bool suppressViewerRecenter = false;
 };
 
 class CState : public QObject

@@ -5503,10 +5503,12 @@ void CWindow::onFocusPOIChanged(std::string name, POI* poi)
 
         _axisAlignedSliceController->applyOrientation();
 
-        const cv::Vec3f focusPosition = poi->p;
-        QTimer::singleShot(0, this, [this, focusPosition]() {
-            recenterPlaneViewersOn(focusPosition);
-        });
+        if (!poi->suppressViewerRecenter) {
+            const cv::Vec3f focusPosition = poi->p;
+            QTimer::singleShot(0, this, [this, focusPosition]() {
+                recenterPlaneViewersOn(focusPosition);
+            });
+        }
     }
 }
 
