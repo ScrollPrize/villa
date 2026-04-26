@@ -295,6 +295,8 @@ def optimize(
 		"ext_offset": {"loss": opt_loss_winding_density.ext_offset_loss},
 	}
 
+	_corr_start_printed = [False]
+
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, data: fit_data.FitData3D) -> fit_data.FitData3D:
 		print(f"[optimizer] {label}: params={opt_cfg.params} steps={opt_cfg.steps} "
 			  f"lr={opt_cfg.lr} min_scaledown={opt_cfg.min_scaledown}", flush=True)
@@ -443,6 +445,10 @@ def optimize(
 			term_vals0 = {k: round(v, 4) for k, v in term_vals0.items()}
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
 			_print_status(step_label=f"{label} 0/{opt_cfg.steps}", loss_val=loss0.item(), tv=term_vals0, pv=param_vals0)
+			# Print corr detail after initial eval (first stage only)
+			if not _corr_start_printed[0] and any(t in term_vals0 for t in ("corr", "corr_snap", "corr_legacy", "corr_signed")):
+				opt_loss_corr.print_detail("START")
+				_corr_start_printed[0] = True
 		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data, res=res0)
 
 		max_steps = opt_cfg.steps

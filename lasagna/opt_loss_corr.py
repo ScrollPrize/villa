@@ -304,7 +304,7 @@ def _corr_legacy_loss(
 
 	# --- Step 7: loss ---
 	err_sq = torch.where(point_valid, err * err, torch.zeros_like(err))
-	loss = err_sq[point_valid].mean()
+	loss = err_sq[point_valid].sum()
 
 	if dbg:
 		print(f"[corr] loss={loss.item():.6f}, valid={point_valid.sum().item()}/{K}, "
@@ -780,7 +780,7 @@ def _corr_snap_loss(
 
 	err = torch.where(anchor_valid, signed_dist, torch.zeros_like(signed_dist))
 	err_sq = err * err
-	loss = err_sq[anchor_valid].mean()
+	loss = err_sq[anchor_valid].sum()
 
 	if dbg:
 		rms = loss.item() ** 0.5
@@ -1551,12 +1551,9 @@ def _corr_winding_loss(
 		mask_ci = sv.to(dt)
 		wsum = float(mask_ci.sum().detach().cpu())
 		if wsum > 0:
-			total_loss = total_loss + (lm * mask_ci).sum() / wsum
+			total_loss = total_loss + (lm * mask_ci).sum()
 			total_wsum += wsum
 		n_surfaces += 1
-
-	if n_surfaces > 1:
-		total_loss = total_loss / n_surfaces
 
 	if dbg:
 		n_valid = int(target_finite.sum().item())
@@ -1683,43 +1680,44 @@ def _corr_snap_to_surface_loss(
 			_csnap_anchors_w = aw
 			_csnap_anchors_valid = in_bounds
 		_csnap_initialized = True
-	else:
-		# Two-pass ray-bilinear update (same as winding anchor update)
-		with torch.no_grad():
-			def _gather_quad_cs(d, h, w):
-				return (xyz_det[d, h, w],
-						xyz_det[d, (h + 1).clamp(max=Qh), w],
-						xyz_det[d, h, (w + 1).clamp(max=Qw)],
-						xyz_det[d, (h + 1).clamp(max=Qh), (w + 1).clamp(max=Qw)])
+		# Fall through to the update step below for distance validation
 
-			row = _csnap_anchors_h
-			col_a = _csnap_anchors_w
+	# Two-pass ray-bilinear update + distance validation (runs every step, including after init)
+	with torch.no_grad():
+		def _gather_quad_cs(d, h, w):
+			return (xyz_det[d, h, w],
+					xyz_det[d, (h + 1).clamp(max=Qh), w],
+					xyz_det[d, h, (w + 1).clamp(max=Qw)],
+					xyz_det[d, (h + 1).clamp(max=Qh), (w + 1).clamp(max=Qw)])
 
-			# Pass 1: intersect on current quad
-			M00, M10, M01, M11 = _gather_quad_cs(d_layer, row, col_a)
-			frac_h = torch.full_like(row, 0.5, dtype=dt)
-			frac_w = torch.full_like(col_a, 0.5, dtype=dt)
-			u1, v1 = fit_model.Model3D._ray_bilinear_intersect(
-				P, gt_n, M00, M10, M01, M11, frac_h, frac_w)
+		row = _csnap_anchors_h
+		col_a = _csnap_anchors_w
 
-			# Shift quad idx
-			new_h = (row.float() + u1).clamp(0, Hm - 2)
-			new_w = (col_a.float() + v1).clamp(0, Wm - 2)
-			new_row = new_h.floor().clamp(0, Hm - 2).long()
-			new_col = new_w.floor().clamp(0, Wm - 2).long()
-			new_frac_h = new_h - new_row.float()
-			new_frac_w = new_w - new_col.float()
+		# Pass 1: intersect on current quad
+		M00, M10, M01, M11 = _gather_quad_cs(d_layer, row, col_a)
+		frac_h = torch.full_like(row, 0.5, dtype=dt)
+		frac_w = torch.full_like(col_a, 0.5, dtype=dt)
+		u1, v1 = fit_model.Model3D._ray_bilinear_intersect(
+			P, gt_n, M00, M10, M01, M11, frac_h, frac_w)
 
-			# Pass 2: re-intersect on shifted quad
-			M00, M10, M01, M11 = _gather_quad_cs(d_layer, new_row, new_col)
-			u2, v2 = fit_model.Model3D._ray_bilinear_intersect(
-				P, gt_n, M00, M10, M01, M11, new_frac_h, new_frac_w)
+		# Shift quad idx
+		new_h = (row.float() + u1).clamp(0, Hm - 2)
+		new_w = (col_a.float() + v1).clamp(0, Wm - 2)
+		new_row = new_h.floor().clamp(0, Hm - 2).long()
+		new_col = new_w.floor().clamp(0, Wm - 2).long()
+		new_frac_h = new_h - new_row.float()
+		new_frac_w = new_w - new_col.float()
 
-			final_h = (new_row.float() + u2).nan_to_num_(0.0).clamp(0, Hm - 2)
-			final_w = (new_col.float() + v2).nan_to_num_(0.0).clamp(0, Wm - 2)
-			_csnap_anchors_h = final_h.floor().long()
-			_csnap_anchors_w = final_w.floor().long()
-			_csnap_anchors_valid = (u2 >= 0) & (u2 <= 1) & (v2 >= 0) & (v2 <= 1)
+		# Pass 2: re-intersect on shifted quad
+		M00, M10, M01, M11 = _gather_quad_cs(d_layer, new_row, new_col)
+		u2, v2 = fit_model.Model3D._ray_bilinear_intersect(
+			P, gt_n, M00, M10, M01, M11, new_frac_h, new_frac_w)
+
+		final_h = (new_row.float() + u2).nan_to_num_(0.0).clamp(0, Hm - 2)
+		final_w = (new_col.float() + v2).nan_to_num_(0.0).clamp(0, Wm - 2)
+		_csnap_anchors_h = final_h.floor().long()
+		_csnap_anchors_w = final_w.floor().long()
+		_csnap_anchors_valid = (u2 >= 0) & (u2 <= 1) & (v2 >= 0) & (v2 <= 1)
 
 	# --- Proxy correction loss ---
 	valid = _csnap_anchors_valid
@@ -1764,6 +1762,13 @@ def _corr_snap_to_surface_loss(
 		# (we want surface AT the point, so target offset is 0)
 		err = sw
 
+		# Invalidate points too far from the surface (> 2 windings)
+		too_far = uw > 2.0
+		if too_far.any():
+			# Update validity — mark as invalid in anchor state
+			vi_too_far = vi[too_far]
+			_csnap_anchors_valid[vi_too_far] = False
+
 		# Store signed distance for results
 		all_signed_dist = torch.zeros(K, device=dev, dtype=dt)
 		all_signed_dist[vi] = err.detach()
@@ -1782,27 +1787,19 @@ def _corr_snap_to_surface_loss(
 	w01 = (1 - u_ci) * v_ci
 	w11 = u_ci * v_ci
 
-	# L2 loss (gradients flow through M00..M11), scaled by grad_mag integral
+	# L2 loss (gradients flow through M00..M11), masked by distance threshold
 	lm00 = (M00 - proxy00).square().sum(dim=-1)
 	lm10 = (M10 - proxy10).square().sum(dim=-1)
 	lm01 = (M01 - proxy01).square().sum(dim=-1)
 	lm11 = (M11 - proxy11).square().sum(dim=-1)
 	lm = w00 * lm00 + w10 * lm10 + w01 * lm01 + w11 * lm11
+	lm_mask = (~too_far).to(dt)
+	loss = (lm * lm_mask).sum()
 
-	# Scale by strip integral (so weak-signal far-away points contribute less)
-	weight = uw.clamp(max=1.0)
-	lm_weighted = lm * weight
-
-	# Mask by strip validity
-	mask_ci = sv.to(dt)
-	wsum = float(mask_ci.sum().detach().cpu())
-	if wsum > 0:
-		loss = (lm_weighted * mask_ci).sum() / wsum
-	else:
-		loss = zero
-
+	# Re-read valid after too_far update
+	valid = _csnap_anchors_valid
 	if dbg:
-		rms = float(loss.detach().sqrt().item()) if wsum > 0 else float("nan")
+		rms = float(loss.detach().sqrt().item()) if loss.item() > 0 else float("nan")
 		n_valid = int(valid.sum().item())
 		print(f"[corr-snap2s] loss={float(loss.detach().item()):.6f}, "
 			  f"valid={n_valid}/{K}, rms_proxy={rms:.4f}")
