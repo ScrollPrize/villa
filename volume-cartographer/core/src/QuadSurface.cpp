@@ -1148,25 +1148,25 @@ void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const s
     std::vector<cv::Mat> xyz;
     cv::split((*_points), xyz);
 
-    // Write x/y/z as 32-bit float tiled TIFF with LZW
-    writeTiff(dir / "x.tif", xyz[0], -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
-    writeTiff(dir / "y.tif", xyz[1], -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
-    writeTiff(dir / "z.tif", xyz[2], -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
+    // QuadSurface tifxyz files are written as untiled, uncompressed TIFFs.
+    writeTiff(dir / "x.tif", xyz[0], -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi_);
+    writeTiff(dir / "y.tif", xyz[1], -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi_);
+    writeTiff(dir / "z.tif", xyz[2], -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi_);
 
     // OpenCV compression params for fallback
-    std::vector<int> compression_params = { cv::IMWRITE_TIFF_COMPRESSION, 5 };
+    std::vector<int> compression_params = { cv::IMWRITE_TIFF_COMPRESSION, COMPRESSION_NONE };
 
     // Save additional channels
     for (auto const& [name, mat] : _channels) {
         if (!mat.empty() && (skipChannel.empty() || name != skipChannel)) {
             bool wrote = false;
 
-            // Try tiled TIFF for single-channel ancillary data (8U/16U/32F)
+            // Try untiled, uncompressed TIFF for single-channel ancillary data (8U/16U/32F)
             if (mat.channels() == 1 &&
                 (mat.type() == CV_8UC1 || mat.type() == CV_16UC1 || mat.type() == CV_32FC1))
             {
                 try {
-                    writeTiff(dir / (name + ".tif"), mat, -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
+                    writeTiff(dir / (name + ".tif"), mat, -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi_);
                     wrote = true;
                 } catch (...) {
                     wrote = false; // Fall back to OpenCV
