@@ -978,46 +978,13 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
 
     // Try accelerated search using spatial indices
     if (surfaceIndex && !surfaceIndex->empty()) {
-        // Use R-tree to find candidate triangles near target
-        const float searchRadius = std::max(th * 4.0f, 100.0f);
-        Rect3D bounds;
-        bounds.low = tgt - cv::Vec3f(searchRadius, searchRadius, searchRadius);
-        bounds.high = tgt + cv::Vec3f(searchRadius, searchRadius, searchRadius);
-
-        std::vector<std::pair<int, int>> candidateCells;
-        surfaceIndex->forEachTriangle(bounds, SurfacePatchIndex::SurfacePtr{nullptr}, [&](const SurfacePatchIndex::TriangleCandidate& tri) {
-            // Filter to only triangles from this surface
-            if (tri.surface.get() == this) {
-                candidateCells.emplace_back(tri.j, tri.i);
-            }
-        });
-
-        // Search from each candidate cell
-        for (const auto& [row, col] : candidateCells) {
-            if (col < 1 || col >= _points->cols - 1 || row < 1 || row >= _points->rows - 1) {
-                continue;
-            }
-            if ((*_points)(row, col)[0] == -1) {
-                continue;
-            }
-
-            loc = {static_cast<float>(col), static_cast<float>(row)};
-            dist = search_min_loc(*_points, loc, _out, tgt, step_small, _scale[0]*0.1);
-
-            if (dist < th && dist >= 0) {
-                ptr = cv::Vec3f(loc[0], loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
-                return dist;
-            } else if (dist >= 0 && dist < min_dist) {
-                min_loc = loc;
-                min_dist = dist;
-            }
+        SurfacePatchIndex::SurfacePtr targetSurface(this, [](QuadSurface*) {});
+        if (auto hit = surfaceIndex->locate(tgt, th, targetSurface)) {
+            ptr = hit->ptr;
+            return hit->distance;
         }
 
-        // If we found something decent with R-tree, return it
-        if (min_dist < th * 2.0f) {
-            ptr = cv::Vec3f(min_loc[0], min_loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
-            return min_dist;
-        }
+        return std::nextafter(th, std::numeric_limits<float>::infinity());
     }
 
     // Try point index for a better starting hint
