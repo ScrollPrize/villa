@@ -806,7 +806,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     cv::Rect static_bounds, float step, float src_step, const cv::Vec2i &seed, int closing_r, bool keep_inpainted = false,
     const std::filesystem::path& tgt_dir = std::filesystem::path(),
     SurfacePatchIndex* surface_patch_index = nullptr,
-    const SurfaceOverlaps* overlaps = nullptr)
+    const SurfaceOverlaps* overlaps = nullptr,
+    bool debug_images = false)
 {
     std::cout << "optimizer: optimizing surface " << state.size() << " " << used_area <<  " " << static_bounds << std::endl;
 
@@ -945,12 +946,12 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     std::cout << summary.FullReport() << std::endl;
     std::cout << "optimizer: rms " << sqrt(summary.final_cost/summary.num_residual_blocks) << " count " << summary.num_residual_blocks << std::endl;
 
-    {
+    if (debug_images) {
         cv::Mat_<cv::Vec3d> points_hr_inp = surftrack_genpoints_hr(data, new_state, points_inpainted, used_area, step, src_step, true);
         try {
             auto dbg_surf = new QuadSurface(points_hr_inp(used_area_hr), {1/src_step,1/src_step});
-            std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str()+"_inp_hr";
-            dbg_surf->save(tgt_dir / uuid, uuid);
+            std::string uuid = std::string(Z_DBG_GEN_PREFIX)+"inp_hr";
+            dbg_surf->save(tgt_dir / uuid, uuid, true);
             delete dbg_surf;
         } catch (cv::Exception&) {
             // We did not find a valid region of interest to expand to
@@ -1117,12 +1118,12 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     data.seed_loc = seed;
     data.seed_coord = points(seed);
 
-    {
+    if (debug_images) {
         cv::Mat_<cv::Vec3d> points_hr_inp = surftrack_genpoints_hr(data, state, points, used_area, step, src_step, true);
         try {
             auto dbg_surf = new QuadSurface(points_hr_inp(used_area_hr), {1/src_step,1/src_step});
-            std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str()+"_opt_inp_hr";
-            dbg_surf->save(tgt_dir / uuid, uuid);
+            std::string uuid = std::string(Z_DBG_GEN_PREFIX)+"opt_inp_hr";
+            dbg_surf->save(tgt_dir / uuid, uuid, true);
             delete dbg_surf;
         } catch (cv::Exception&) {
             // We did not find a valid region of interest to expand to
@@ -1149,6 +1150,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
     float step = params.value("step", 10);
     int max_width = params.value("max_width", 80000);
     const bool use_patch_cache = params.value("use_patch_cache", false);
+    const bool debug_images = params.value("debug_images", false);
     std::filesystem::path surface_patch_cache_dir = tgt_dir / ".surface_patch_index_cache";
     if (params.contains("surface_patch_cache_dir") && params["surface_patch_cache_dir"].is_string()) {
         surface_patch_cache_dir = params["surface_patch_cache_dir"].get<std::string>();
@@ -1838,8 +1840,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
                 dbg_surf->meta["area_vx2"] = static_cast<double>(area_est_vx2);
                 dbg_surf->meta["area_cm2"] = static_cast<double>(area_est_cm2);
                 dbg_surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
-                std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str();
-                dbg_surf->save(tgt_dir / uuid, uuid);
+                std::string uuid = std::string(Z_DBG_GEN_PREFIX)+"current";
+                dbg_surf->save(tgt_dir / uuid, uuid, true);
                 delete dbg_surf;
             }
         }
@@ -1854,7 +1856,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
 
             cv::Rect active = active_bounds & used_area;
             optimize_surface_mapping(opt_data, opt_state, opt_points, active, static_bounds, step, src_step,
-                                     {y0,x0}, closing_r, true, tgt_dir, surface_patch_index_ptr, &overlaps);
+                                     {y0,x0}, closing_r, true, tgt_dir, surface_patch_index_ptr, &overlaps, debug_images);
             if (active.area() > 0) {
                 copy(opt_data, data, active);
                 opt_points(active).copyTo(points(active));
@@ -1875,19 +1877,19 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
                     if (state(j,i) & STATE_LOC_VALID)
                         fringe.insert(cv::Vec2i(j,i));
 
-            {
+            if (debug_images) {
                 cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step);
                 auto dbg_surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
                 dbg_surf->meta = utils::Json::object();
                 dbg_surf->meta["vc_grow_seg_from_segments_params"] = json_to_utils(params);
 
-                std::string uuid = Z_DBG_GEN_PREFIX+get_surface_time_str()+"_opt";
+                std::string uuid = std::string(Z_DBG_GEN_PREFIX)+"opt";
                 float const area_est_vx2 = loc_valid_count*src_step*src_step*step*step;
                 float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
                 dbg_surf->meta["area_vx2"] = static_cast<double>(area_est_vx2);
                 dbg_surf->meta["area_cm2"] = static_cast<double>(area_est_cm2);
                 dbg_surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
-                dbg_surf->save(tgt_dir / uuid, uuid);
+                dbg_surf->save(tgt_dir / uuid, uuid, true);
                 delete dbg_surf;
             }
         }
