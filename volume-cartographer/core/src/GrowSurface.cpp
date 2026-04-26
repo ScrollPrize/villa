@@ -9,6 +9,7 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/core/util/Umbilicus.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
 #include "vc/core/util/DateTime.hpp"
@@ -22,8 +23,10 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -68,6 +71,7 @@ static std::string surface_name(const QuadSurface* surf)
 }
 
 using SurfaceOverlaps = std::unordered_map<QuadSurface*, std::set<QuadSurface*>>;
+using Umbilicus = vc::core::util::Umbilicus;
 
 static const std::set<QuadSurface*>& surface_overlaps(const SurfaceOverlaps* overlaps, QuadSurface* surf)
 {
@@ -76,6 +80,55 @@ static const std::set<QuadSurface*>& surface_overlaps(const SurfaceOverlaps* ove
         return empty;
     auto it = overlaps->find(surf);
     return it == overlaps->end() ? empty : it->second;
+}
+
+static cv::Vec3i volume_shape_from_params(const nlohmann::json& params)
+{
+    if (!params.contains("_volume_shape") || !params["_volume_shape"].is_array() || params["_volume_shape"].size() != 3) {
+        throw std::runtime_error("\"single wrap\" requires internal _volume_shape [z, y, x]; command callers should derive it from the volume path");
+    }
+
+    return {
+        params["_volume_shape"][0].get<int>(),
+        params["_volume_shape"][1].get<int>(),
+        params["_volume_shape"][2].get<int>()
+    };
+}
+
+static std::optional<Umbilicus> single_wrap_umbilicus_from_params(const nlohmann::json& params)
+{
+    if (!params.value("single wrap", false)) {
+        return std::nullopt;
+    }
+    if (!params.contains("umbilicus_path") || !params["umbilicus_path"].is_string()) {
+        throw std::runtime_error("\"single wrap\" requires an umbilicus_path parameter");
+    }
+
+    Umbilicus umbilicus = Umbilicus::FromFile(params["umbilicus_path"].get<std::string>(),
+                                              volume_shape_from_params(params));
+    umbilicus.set_seam(Umbilicus::SeamDirection::NegativeX);
+    return umbilicus;
+}
+
+static bool crosses_single_wrap_seam(const Umbilicus& umbilicus,
+                                     const cv::Vec3d& a,
+                                     const cv::Vec3d& b)
+{
+    const int za = static_cast<int>(std::lround(a[2]));
+    const int zb = static_cast<int>(std::lround(b[2]));
+    if (za != zb) {
+        return false;
+    }
+
+    const cv::Vec3f af{static_cast<float>(a[0]), static_cast<float>(a[1]), static_cast<float>(a[2])};
+    const cv::Vec3f bf{static_cast<float>(b[0]), static_cast<float>(b[1]), static_cast<float>(b[2])};
+    const double theta_a = umbilicus.theta(af);
+    const double theta_b = umbilicus.theta(bf);
+    double delta = std::abs(theta_a - theta_b);
+    if (delta > 360.0) {
+        delta = std::fmod(delta, 360.0);
+    }
+    return delta > 180.0;
 }
 
 } // namespace
@@ -1214,6 +1267,12 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
     if (enforce_z_range)
         std::cout << "  z_range: [" << z_min << ", " << z_max << "]" << std::endl;
 
+    std::optional<Umbilicus> single_wrap_umbilicus = single_wrap_umbilicus_from_params(params);
+    if (single_wrap_umbilicus) {
+        std::cout << "  single wrap: true, seam direction: -x, umbilicus_path: "
+                  << params["umbilicus_path"].get<std::string>() << std::endl;
+    }
+
     std::cout << "total surface count: " << surfs_v.size() << std::endl;
 
     std::set<QuadSurface *> approved_sm;
@@ -1407,6 +1466,27 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
                 }
             }
         }
+        return false;
+    };
+
+    auto violates_single_wrap = [&](const cv::Vec2i& p, const cv::Vec3d& coord) {
+        if (!single_wrap_umbilicus) {
+            return false;
+        }
+
+        for (const auto& n : neighs) {
+            const cv::Vec2i pn = p + n;
+            if (pn[0] < 0 || pn[0] >= points.rows || pn[1] < 0 || pn[1] >= points.cols) {
+                continue;
+            }
+            if ((state(pn) & STATE_LOC_VALID) == 0 || points(pn)[0] == -1) {
+                continue;
+            }
+            if (crosses_single_wrap_seam(*single_wrap_umbilicus, points(pn), coord)) {
+                return true;
+            }
+        }
+
         return false;
     };
 
@@ -1691,6 +1771,11 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed, const std::vect
             if (best_inliers >= curr_best_inl_th || best_ref_seed) {
                 if (best_coord[0] == -1)
                     throw std::runtime_error("oops best_cord[0]");
+                if (violates_single_wrap(p, best_coord)) {
+                    state(p) = 0;
+                    points(p) = {-1,-1,-1};
+                    continue;
+                }
 
                 data_th.surfs(p).insert(best_surf);
                 data_th.loc(best_surf, p) = best_loc;

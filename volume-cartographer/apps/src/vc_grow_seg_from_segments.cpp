@@ -10,6 +10,8 @@
 
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
+#include <vector>
 
 #include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/StreamOperators.hpp"
@@ -59,6 +61,19 @@ static void add_target_context(utils::Json& meta, const std::filesystem::path& v
     }
 }
 
+static void add_internal_volume_shape(utils::Json& params, const std::vector<size_t>& shape)
+{
+    if (shape.size() != 3) {
+        throw std::runtime_error("Expected zarr dataset shape [z, y, x]");
+    }
+
+    auto volume_shape = utils::Json::array();
+    volume_shape.push_back(static_cast<int>(shape[0]));
+    volume_shape.push_back(static_cast<int>(shape[1]));
+    volume_shape.push_back(static_cast<int>(shape[2]));
+    params["_volume_shape"] = std::move(volume_shape);
+}
+
 
 
 
@@ -91,6 +106,7 @@ int main(int argc, char *argv[])
 
     std::cout << "zarr dataset size for scale group 0 " << ds->shape() << std::endl;
     std::cout << "chunk shape shape " << ds->defaultChunkShape() << std::endl;
+    add_internal_volume_shape(params, ds->shape());
 
     float voxelsize = Json::parse_file(vol_path/"meta.json")["voxelsize"].get_float();
 
