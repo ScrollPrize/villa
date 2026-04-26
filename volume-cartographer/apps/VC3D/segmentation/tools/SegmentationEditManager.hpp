@@ -110,7 +110,8 @@ public:
     std::optional<std::pair<int, int>> worldToGridIndex(const cv::Vec3f& worldPos,
                                                         float* outDistance = nullptr,
                                                         GridSearchResolution detail =
-                                                            GridSearchResolution::High) const;
+                                                            GridSearchResolution::High,
+                                                        bool warnOnFailure = true) const;
     std::optional<cv::Vec3f> vertexWorldPosition(int row, int col) const;
 
     bool beginActiveDrag(const std::pair<int, int>& gridIndex);

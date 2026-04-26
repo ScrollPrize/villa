@@ -22,6 +22,7 @@
 #include <QLoggingCategory>
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <iostream>
 #include <optional>
 #include <unordered_set>
@@ -523,10 +524,17 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     // Build task captures shared_ptrs - surfaces stay alive throughout async operation
     const int stride = _surfacePatchSamplingStride;
     auto future = QtConcurrent::run([quadSurfaces, stride]() -> std::shared_ptr<SurfacePatchIndex> {
-        auto index = std::make_shared<SurfacePatchIndex>();
-        index->setSamplingStride(stride);
-        index->rebuild(quadSurfaces);
-        return index;
+        try {
+            auto index = std::make_shared<SurfacePatchIndex>();
+            index->setSamplingStride(stride);
+            index->rebuild(quadSurfaces);
+            return index;
+        } catch (const std::exception& e) {
+            qCWarning(lcViewerManager) << "SurfacePatchIndex async rebuild failed:" << e.what();
+        } catch (...) {
+            qCWarning(lcViewerManager) << "SurfacePatchIndex async rebuild failed with an unknown exception";
+        }
+        return nullptr;
     });
     _surfacePatchIndexWatcher->setFuture(future);
 }
@@ -601,7 +609,7 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
     }
 
     const std::string surfId = quad->id;
-    const bool alreadyIndexed = _indexedSurfaceIds.count(surfId) != 0;
+    const bool alreadyIndexed = _surfacePatchIndex.containsSurface(quad);
 
     // Check if async rebuild is in progress
     const bool asyncRebuildInProgress = _surfacePatchIndexWatcher &&
@@ -621,6 +629,23 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
 
     if (isEditUpdate && alreadyIndexed) {
         return true;
+    }
+
+    if (isEditUpdate && !_surfacePatchIndex.empty()) {
+        if (_surfacePatchIndex.updateSurface(quad)) {
+            _indexedSurfaceIds.insert(surfId);
+            if (asyncRebuildInProgress) {
+                _surfacesQueuedDuringRebuildIds.push_back(surfId);
+            }
+            qCInfo(lcViewerManager) << "Inserted active edit surface into SurfacePatchIndex"
+                                    << surfId.c_str();
+            return true;
+        }
+        _indexedSurfaceIds.erase(surfId);
+        _surfacePatchIndexNeedsRebuild = true;
+        qCInfo(lcViewerManager) << "Failed to insert active edit surface into SurfacePatchIndex"
+                                << surfId.c_str() << "- marking index for rebuild";
+        return false;
     }
 
     if (asyncRebuildInProgress) {

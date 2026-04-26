@@ -16,6 +16,7 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <unordered_set>
@@ -1411,6 +1412,7 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
             [currentPtsCopy = std::move(currentPtsCopy),
              overlayDataVec = std::move(overlayDataVec),
              threshold]() -> QImage {
+                try {
                 const int rows = currentPtsCopy.rows;
                 const int cols = currentPtsCopy.cols;
 
@@ -1494,6 +1496,12 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
                 }
 
                 return overlapImage;
+                } catch (const std::exception& e) {
+                    qWarning() << "Segmentation overlap worker failed:" << e.what();
+                } catch (...) {
+                    qWarning() << "Segmentation overlap worker failed with an unknown exception";
+                }
+                return {};
             });
 
         _overlapWatcher->setFuture(future);

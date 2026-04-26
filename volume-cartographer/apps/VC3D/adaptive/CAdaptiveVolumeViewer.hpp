@@ -229,7 +229,6 @@ public slots:
 
     void onZoom(int steps, QPointF scenePoint, Qt::KeyboardModifiers modifiers);
     void onResized();
-    void onCursorMove(QPointF scenePos);
     void onPanStart(Qt::MouseButton, Qt::KeyboardModifiers);
     void onPanRelease(Qt::MouseButton, Qt::KeyboardModifiers);
     void onVolumeClicked(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
@@ -251,11 +250,11 @@ signals:
                            Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void sendZSliceChanged(int z_value);
     void sendMousePressVolume(cv::Vec3f vol_loc, cv::Vec3f normal,
-                              Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+                              Qt::MouseButton button, Qt::KeyboardModifiers modifiers, QPointF scenePos);
     void sendMouseMoveVolume(cv::Vec3f vol_loc, Qt::MouseButtons buttons,
-                             Qt::KeyboardModifiers modifiers);
+                             Qt::KeyboardModifiers modifiers, QPointF scenePos);
     void sendMouseReleaseVolume(cv::Vec3f vol_loc, Qt::MouseButton button,
-                                Qt::KeyboardModifiers modifiers);
+                                Qt::KeyboardModifiers modifiers, QPointF scenePos);
     void sendCollectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
     void pointClicked(uint64_t pointId);

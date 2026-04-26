@@ -282,15 +282,18 @@ private:
                           const cv::Vec3f& worldPos,
                           const cv::Vec3f& surfaceNormal,
                           Qt::MouseButton button,
-                          Qt::KeyboardModifiers modifiers);
+                          Qt::KeyboardModifiers modifiers,
+                          const QPointF& scenePos);
     void handleMouseMove(CTiledVolumeViewer* viewer,
                          const cv::Vec3f& worldPos,
                          Qt::MouseButtons buttons,
-                         Qt::KeyboardModifiers modifiers);
+                         Qt::KeyboardModifiers modifiers,
+                         const QPointF& scenePos);
     void handleMouseRelease(CTiledVolumeViewer* viewer,
                             const cv::Vec3f& worldPos,
                             Qt::MouseButton button,
-                            Qt::KeyboardModifiers modifiers);
+                            Qt::KeyboardModifiers modifiers,
+                            const QPointF& scenePos);
     void handleWheel(CTiledVolumeViewer* viewer,
                      int deltaSteps,
                      const QPointF& scenePos,
@@ -314,10 +317,11 @@ private:
     void finishDrag();
     void cancelDrag();
 
-    void updateHover(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos);
+    void updateHover(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos, const QPointF& scenePos);
     [[nodiscard]] bool isNearRotationHandle(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos) const;
     SegmentationEditManager::GridSearchResolution hoverLookupDetail(const cv::Vec3f& worldPos);
     void resetHoverLookupDetail();
+    bool recoverHoverPointerFromCursor();
     void recordPointerSample(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos);
 
     bool startPushPull(int direction, std::optional<bool> alphaOverride = std::nullopt);

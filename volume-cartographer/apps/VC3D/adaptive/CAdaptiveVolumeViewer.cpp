@@ -63,6 +63,7 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
         fmt.setSwapInterval(0);  // disable vsync — we already coalesce at 16 ms
         auto* gl = new QOpenGLWidget(_view);
         gl->setFormat(fmt);
+        gl->setMouseTracking(true);
         _view->setViewport(gl);
     }
     fGraphicsView = _view;
@@ -83,7 +84,6 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
     connect(_view, &CVolumeViewerView::sendVolumeClicked, this, &CAdaptiveVolumeViewer::onVolumeClicked);
     connect(_view, &CVolumeViewerView::sendZoom, this, &CAdaptiveVolumeViewer::onZoom);
     connect(_view, &CVolumeViewerView::sendResized, this, &CAdaptiveVolumeViewer::onResized);
-    connect(_view, &CVolumeViewerView::sendCursorMove, this, &CAdaptiveVolumeViewer::onCursorMove);
     connect(_view, &CVolumeViewerView::sendPanRelease, this, &CAdaptiveVolumeViewer::onPanRelease);
     connect(_view, &CVolumeViewerView::sendPanStart, this, &CAdaptiveVolumeViewer::onPanStart);
     connect(_view, &CVolumeViewerView::sendMousePress, this, &CAdaptiveVolumeViewer::onMousePress);
@@ -1413,19 +1413,6 @@ void CAdaptiveVolumeViewer::onResized()
     emit overlaysUpdated();
 }
 
-void CAdaptiveVolumeViewer::onCursorMove(QPointF scenePos)
-{
-    _lastScenePos = scenePos;
-    if (_isPanning) {
-        float dx = static_cast<float>(scenePos.x() - _lastPanSceneF.x());
-        float dy = static_cast<float>(scenePos.y() - _lastPanSceneF.y());
-        _lastPanSceneF = scenePos;
-        if (std::abs(dx) > 0.001f || std::abs(dy) > 0.001f) {
-            panByF(dx, dy);
-        }
-    }
-}
-
 void CAdaptiveVolumeViewer::onPanStart(Qt::MouseButton, Qt::KeyboardModifiers)
 {
     _isPanning = true;
@@ -1454,21 +1441,32 @@ void CAdaptiveVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton butto
 {
     cv::Vec3f p = sceneToVolume(scenePos);
     cv::Vec3f n(0, 0, 1);
-    emit sendMousePressVolume(p, n, button, modifiers);
+    emit sendMousePressVolume(p, n, button, modifiers, scenePos);
 }
 
 void CAdaptiveVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons buttons,
                                          Qt::KeyboardModifiers modifiers)
 {
+    _lastScenePos = scenePos;
+    if (_isPanning) {
+        const float dx = static_cast<float>(scenePos.x() - _lastPanSceneF.x());
+        const float dy = static_cast<float>(scenePos.y() - _lastPanSceneF.y());
+        _lastPanSceneF = scenePos;
+        if (std::abs(dx) > 0.001f || std::abs(dy) > 0.001f) {
+            panByF(dx, dy);
+        }
+        return;
+    }
+
     cv::Vec3f p = sceneToVolume(scenePos);
-    emit sendMouseMoveVolume(p, buttons, modifiers);
+    emit sendMouseMoveVolume(p, buttons, modifiers, scenePos);
 }
 
 void CAdaptiveVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton button,
                                             Qt::KeyboardModifiers modifiers)
 {
     cv::Vec3f p = sceneToVolume(scenePos);
-    emit sendMouseReleaseVolume(p, button, modifiers);
+    emit sendMouseReleaseVolume(p, button, modifiers, scenePos);
 }
 
 void CAdaptiveVolumeViewer::onKeyPress(int key, Qt::KeyboardModifiers)
@@ -1637,8 +1635,16 @@ float activeSegmentationIntersectionWidth(float baseWidth)
 }
 }
 
-void CAdaptiveVolumeViewer::invalidateIntersect(const std::string&)
+void CAdaptiveVolumeViewer::invalidateIntersect(const std::string& name)
 {
+    if (!name.empty()) {
+        // A named target changed in place. Keep the previous overlay visible
+        // until renderIntersectionsNow() has computed replacement paths;
+        // clearing here creates a visible flash during continuous edits.
+        _lastIntersectFp = {};
+        return;
+    }
+
     for (auto* item : _intersectionItems) {
         if (item && item->scene()) _scene->removeItem(item);
         delete item;
@@ -2223,6 +2229,9 @@ void CAdaptiveVolumeViewer::setOverlayGroup(const std::string& key,
 {
     clearOverlayGroup(key);
     _overlayGroups[key] = items;
+    if (_view && _view->viewport()) {
+        _view->viewport()->update();
+    }
 }
 
 void CAdaptiveVolumeViewer::clearOverlayGroup(const std::string& key)
@@ -2234,6 +2243,9 @@ void CAdaptiveVolumeViewer::clearOverlayGroup(const std::string& key)
         delete item;
     }
     _overlayGroups.erase(it);
+    if (_view && _view->viewport()) {
+        _view->viewport()->update();
+    }
 }
 
 void CAdaptiveVolumeViewer::clearAllOverlayGroups()

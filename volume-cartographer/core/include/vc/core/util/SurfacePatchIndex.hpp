@@ -54,6 +54,7 @@ public:
     bool empty() const;
     size_t patchCount() const;
     size_t surfaceCount() const;
+    bool containsSurface(const SurfacePtr& surface) const;
 
     std::optional<LookupResult> locate(const cv::Vec3f& worldPoint,
                                        float tolerance,

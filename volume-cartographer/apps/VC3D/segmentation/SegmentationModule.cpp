@@ -15,7 +15,9 @@
 
 #include "vc/ui/VCCollection.hpp"
 
+#include <QApplication>
 #include <QDebug>
+#include <QCursor>
 #include <QLoggingCategory>
 #include <QPointer>
 #include <QString>
@@ -264,30 +266,47 @@ void SegmentationModule::setHoverPreviewEnabled(bool enabled)
 bool SegmentationModule::ensureHoverTarget()
 {
     if (!_editManager || !_editManager->hasSession()) {
+        qCWarning(lcSegModule) << "Cannot resolve segmentation hover target: no active editing session.";
         return false;
     }
-    if (_hoverPreviewEnabled && _hover.valid) {
-        if (!_hoverPointer.valid || _hover.viewer == _hoverPointer.viewer) {
-            return true;
-        }
+
+    // Push/pull calls this from a timer while the cursor can move between
+    // mouse-move events delivered to the segmentation module. Refresh from the
+    // viewer cursor first so the resolved grid target follows the mouse even
+    // when hover preview is disabled.
+    recoverHoverPointerFromCursor();
+
+    if (_hover.valid && _hoverPointer.valid && _hover.viewer != _hoverPointer.viewer) {
         _hover.clear();
     }
+
     if (!_hoverPointer.valid) {
+        qCWarning(lcSegModule) << "Cannot resolve segmentation hover target: no cursor sample for a segmentation viewer.";
         return false;
     }
     CTiledVolumeViewer* viewer = _hoverPointer.viewer.data();
     if (!viewer) {
+        _hoverPointer.valid = false;
+        qCWarning(lcSegModule) << "Cannot resolve segmentation hover target: cursor sample viewer no longer exists.";
+        return false;
+    }
+    if (!isSegmentationViewer(viewer)) {
+        qCWarning(lcSegModule) << "Cannot resolve segmentation hover target: viewer is not a segmentation viewer:"
+                               << QString::fromStdString(viewer->surfName());
         _hoverPointer.valid = false;
         return false;
     }
     auto gridIndex = _editManager->worldToGridIndex(_hoverPointer.world);
     if (!gridIndex) {
         _hover.clear();
+        qCWarning(lcSegModule) << "Cannot resolve segmentation hover target: surface patch index lookup failed.";
         return false;
     }
     auto world = _editManager->vertexWorldPosition(gridIndex->first, gridIndex->second);
     if (!world) {
         _hover.clear();
+        qCWarning(lcSegModule) << "Cannot resolve segmentation hover target: resolved grid vertex is invalid"
+                               << "row" << gridIndex->first << "col" << gridIndex->second;
         return false;
     }
     _hover.set(gridIndex->first, gridIndex->second, *world, viewer);
@@ -410,20 +429,23 @@ void SegmentationModule::bindViewerSignals(CTiledVolumeViewer* viewer)
             this, [this, viewer](const cv::Vec3f& worldPos,
                                  const cv::Vec3f& normal,
                                  Qt::MouseButton button,
-                                 Qt::KeyboardModifiers modifiers) {
-                handleMousePress(viewer, worldPos, normal, button, modifiers);
+                                 Qt::KeyboardModifiers modifiers,
+                                 const QPointF& scenePos) {
+                handleMousePress(viewer, worldPos, normal, button, modifiers, scenePos);
             });
     connect(viewer, &CTiledVolumeViewer::sendMouseMoveVolume,
             this, [this, viewer](const cv::Vec3f& worldPos,
                                  Qt::MouseButtons buttons,
-                                 Qt::KeyboardModifiers modifiers) {
-                handleMouseMove(viewer, worldPos, buttons, modifiers);
+                                 Qt::KeyboardModifiers modifiers,
+                                 const QPointF& scenePos) {
+                handleMouseMove(viewer, worldPos, buttons, modifiers, scenePos);
             });
     connect(viewer, &CTiledVolumeViewer::sendMouseReleaseVolume,
             this, [this, viewer](const cv::Vec3f& worldPos,
                                  Qt::MouseButton button,
-                                 Qt::KeyboardModifiers modifiers) {
-                handleMouseRelease(viewer, worldPos, button, modifiers);
+                                 Qt::KeyboardModifiers modifiers,
+                                 const QPointF& scenePos) {
+                handleMouseRelease(viewer, worldPos, button, modifiers, scenePos);
             });
     connect(viewer, &CTiledVolumeViewer::sendSegmentationRadiusWheel,
             this, [this, viewer](int steps, const QPointF& scenePoint, const cv::Vec3f& worldPos) {
@@ -1635,6 +1657,59 @@ void SegmentationModule::resetHoverLookupDetail()
     _hoverLookup.lastWorld = cv::Vec3f(0.0f, 0.0f, 0.0f);
 }
 
+bool SegmentationModule::recoverHoverPointerFromCursor()
+{
+    const QPoint globalCursor = QCursor::pos();
+
+    CTiledVolumeViewer* targetViewer = nullptr;
+    if (QWidget* widget = QApplication::widgetAt(globalCursor)) {
+        for (QWidget* current = widget; current && !targetViewer; current = current->parentWidget()) {
+            for (auto* viewer : std::as_const(_attachedViewers)) {
+                if (!viewer || !isSegmentationViewer(viewer)) {
+                    continue;
+                }
+                if (current == viewer) {
+                    targetViewer = viewer;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!targetViewer) {
+        for (auto* viewer : std::as_const(_attachedViewers)) {
+            if (!viewer || !isSegmentationViewer(viewer)) {
+                continue;
+            }
+            auto* graphicsView = viewer->fGraphicsView;
+            if (!graphicsView || !graphicsView->viewport()) {
+                continue;
+            }
+            const QPoint viewportCursor = graphicsView->viewport()->mapFromGlobal(globalCursor);
+            if (graphicsView->viewport()->rect().contains(viewportCursor)) {
+                targetViewer = viewer;
+                break;
+            }
+        }
+    }
+
+    if (targetViewer) {
+        auto* graphicsView = targetViewer->fGraphicsView;
+        if (!graphicsView || !graphicsView->viewport()) {
+            return false;
+        }
+        const QPoint viewportCursor = graphicsView->viewport()->mapFromGlobal(globalCursor);
+        if (!graphicsView->viewport()->rect().contains(viewportCursor)) {
+            return false;
+        }
+        const QPointF scenePos = graphicsView->mapToScene(viewportCursor);
+        recordPointerSample(targetViewer, targetViewer->sceneToVolume(scenePos));
+        return _hoverPointer.valid;
+    }
+
+    return false;
+}
+
 void SegmentationModule::recordPointerSample(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos)
 {
     if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
@@ -1660,48 +1735,73 @@ void SegmentationModule::recordPointerSample(CTiledVolumeViewer* viewer, const c
     _hoverPointer.world = worldPos;
 }
 
-void SegmentationModule::updateHover(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos)
+void SegmentationModule::updateHover(CTiledVolumeViewer* viewer,
+                                     const cv::Vec3f& worldPos,
+                                     const QPointF& scenePos)
 {
+    CTiledVolumeViewer* targetViewer = viewer;
+    cv::Vec3f targetWorld = worldPos;
     bool hoverChanged = false;
 
-    if (!_hoverPreviewEnabled) {
-        resetHoverLookupDetail();
+    const auto clearHover = [&]() {
         if (_hover.valid) {
             _hover.clear();
             hoverChanged = true;
         }
+    };
+
+    const auto setHover = [&](int row, int col, const cv::Vec3f& world) {
+        const bool rowChanged = !_hover.valid || _hover.row != row;
+        const bool colChanged = !_hover.valid || _hover.col != col;
+        const bool worldChanged = !_hover.valid || cv::norm(_hover.world - world) >= 1e-4f;
+        const bool viewerChanged = !_hover.valid || _hover.viewer != targetViewer;
+        if (rowChanged || colChanged || worldChanged || viewerChanged) {
+            _hover.set(row, col, world, targetViewer);
+            hoverChanged = true;
+        }
+    };
+
+    if (!_editingEnabled || !_hoverPreviewEnabled) {
+        resetHoverLookupDetail();
+        clearHover();
     } else if (!_editManager || !_editManager->hasSession()) {
         resetHoverLookupDetail();
-        if (_hover.valid) {
-            _hover.clear();
-            hoverChanged = true;
-        }
+        clearHover();
     } else {
-        const auto detail = hoverLookupDetail(worldPos);
-        if (detail != SegmentationEditManager::GridSearchResolution::High) {
-            if (_hover.valid) {
-                _hover.clear();
-                hoverChanged = true;
+        if (!targetViewer || !isSegmentationViewer(targetViewer)) {
+            clearHover();
+        } else if (targetViewer->surfName() == "segmentation") {
+            const cv::Mat_<cv::Vec3f>& points = _editManager->previewPoints();
+            if (points.empty()) {
+                clearHover();
+            } else {
+                const cv::Vec2f surfaceCoords = targetViewer->sceneToSurfaceCoords(scenePos);
+                const int col = std::clamp(static_cast<int>(std::round(surfaceCoords[0])), 0, points.cols - 1);
+                const int row = std::clamp(static_cast<int>(std::round(surfaceCoords[1])), 0, points.rows - 1);
+                if (auto world = _editManager->vertexWorldPosition(row, col)) {
+                    setHover(row, col, *world);
+                } else {
+                    clearHover();
+                }
             }
         } else {
-            auto gridIndex = _editManager->worldToGridIndex(worldPos, nullptr, detail);
-            if (!gridIndex) {
-                if (_hover.valid) {
-                    _hover.clear();
-                    hoverChanged = true;
+            float surfaceDistance = 0.0f;
+            if (auto gridIndex = _editManager->worldToGridIndex(targetWorld,
+                                                                &surfaceDistance,
+                                                                SegmentationEditManager::GridSearchResolution::High,
+                                                                false)) {
+                const float maxHoverDistance = std::max(gridStepWorld(), 1.0f) * 100.0f;
+                if (surfaceDistance <= maxHoverDistance) {
+                    if (auto world = _editManager->vertexWorldPosition(gridIndex->first, gridIndex->second)) {
+                        setHover(gridIndex->first, gridIndex->second, *world);
+                    } else {
+                        clearHover();
+                    }
+                } else {
+                    clearHover();
                 }
-            } else if (auto world = _editManager->vertexWorldPosition(gridIndex->first, gridIndex->second)) {
-                const bool rowChanged = !_hover.valid || _hover.row != gridIndex->first;
-                const bool colChanged = !_hover.valid || _hover.col != gridIndex->second;
-                const bool worldChanged = !_hover.valid || cv::norm(_hover.world - *world) >= 1e-4f;
-                const bool viewerChanged = !_hover.valid || _hover.viewer != viewer;
-                if (rowChanged || colChanged || worldChanged || viewerChanged) {
-                    _hover.set(gridIndex->first, gridIndex->second, *world, viewer);
-                    hoverChanged = true;
-                }
-            } else if (_hover.valid) {
-                _hover.clear();
-                hoverChanged = true;
+            } else {
+                clearHover();
             }
         }
     }

@@ -275,7 +275,8 @@ void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
                                           const cv::Vec3f& worldPos,
                                           const cv::Vec3f& /*surfaceNormal*/,
                                           Qt::MouseButton button,
-                                          Qt::KeyboardModifiers modifiers)
+                                          Qt::KeyboardModifiers modifiers,
+                                          const QPointF& scenePos)
 {
     const bool isLeftButton = (button == Qt::LeftButton);
 
@@ -297,7 +298,6 @@ void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
                 _approvalTool->startStrokeFromPlane(worldPos, planeNormal, worldRadius);
             } else {
                 // Flattened view - convert scene coordinates to surface coordinates
-                const QPointF scenePos = viewer->lastScenePosition();
                 const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
                 _approvalTool->startStroke(worldPos, QPointF(surfCoords[0], surfCoords[1]));
             }
@@ -408,7 +408,8 @@ void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
 void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
                                          const cv::Vec3f& worldPos,
                                          Qt::MouseButtons buttons,
-                                         Qt::KeyboardModifiers modifiers)
+                                         Qt::KeyboardModifiers modifiers,
+                                         const QPointF& scenePos)
 {
     Q_UNUSED(modifiers);
 
@@ -429,7 +430,6 @@ void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
                     _approvalTool->extendStrokeFromPlane(worldPos, planeNormal, worldRadius, false);
                 } else {
                     // Convert scene coordinates to surface coordinates for grid mapping
-                    const QPointF scenePos = viewer->lastScenePosition();
                     const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
                     _approvalTool->extendStroke(worldPos, QPointF(surfCoords[0], surfCoords[1]), false);
                 }
@@ -460,7 +460,6 @@ void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
             shouldUpdate = delta.dot(delta) >= minMoveThreshold * minMoveThreshold;
         }
         if (shouldUpdate) {
-            const QPointF scenePos = viewer->lastScenePosition();
             const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
 
             // Get plane normal if this is a plane viewer (XY/XZ/YZ)
@@ -505,14 +504,15 @@ void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
 
     if (!buttons.testFlag(Qt::LeftButton)) {
         recordPointerSample(viewer, worldPos);
-        updateHover(viewer, worldPos);
+        updateHover(viewer, worldPos, scenePos);
     }
 }
 
 void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
                                             const cv::Vec3f& worldPos,
                                             Qt::MouseButton button,
-                                            Qt::KeyboardModifiers /*modifiers*/)
+                                            Qt::KeyboardModifiers /*modifiers*/,
+                                            const QPointF& scenePos)
 {
     // Handle approval mask mode
     const bool approvalStrokeActive = _approvalTool && _approvalTool->strokeActive();
@@ -531,7 +531,6 @@ void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
                 _approvalTool->finishStrokeFromPlane();
             } else {
                 // Convert scene coordinates to surface coordinates for grid mapping
-                const QPointF scenePos = viewer->lastScenePosition();
                 const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
                 _approvalTool->extendStroke(worldPos, QPointF(surfCoords[0], surfCoords[1]), true);
                 _approvalTool->finishStroke();
@@ -569,7 +568,7 @@ void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
 
 void SegmentationModule::handleWheel(CTiledVolumeViewer* viewer,
                                      int deltaSteps,
-                                     const QPointF& /*scenePos*/,
+                                     const QPointF& scenePos,
                                      const cv::Vec3f& worldPos)
 {
     if (!_editingEnabled) {
@@ -600,7 +599,7 @@ void SegmentationModule::handleWheel(CTiledVolumeViewer* viewer,
     }
 
     recordPointerSample(viewer, worldPos);
-    updateHover(viewer, worldPos);
+    updateHover(viewer, worldPos, scenePos);
     const float updatedRadius = falloffRadius(targetTool);
     QString label;
     switch (targetTool) {

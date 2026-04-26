@@ -5,13 +5,16 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
+#include <QLoggingCategory>
+
 #include "utils/Json.hpp"
 #include <algorithm>
 #include <cmath>
-#include <limits>
 #include <utility>
 #include <unordered_map>
 #include <unordered_set>
+
+Q_LOGGING_CATEGORY(lcSegEditManager, "vc.segmentation.editmanager")
 
 namespace
 {
@@ -314,37 +317,16 @@ bool SegmentationEditManager::applyExternalSurfaceUpdate(const cv::Rect& vertexR
     return true;
 }
 
-namespace
-{
-struct StridedSearchProfile
-{
-    int stride{1};
-    int maxRadius{0};
-    int radiusStep{1};
-    float breakMultiplier{1.5f};
-};
-}
-
 std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(const cv::Vec3f& worldPos,
                                                                               float* outDistance,
-                                                                              GridSearchResolution detail) const
+                                                                              GridSearchResolution detail,
+                                                                              bool warnOnFailure) const
 {
+    (void)detail;
+
     if (!_baseSurface) {
         return std::nullopt;
     }
-
-    cv::Vec3f ptr;
-    if (_pointerSeedValid) {
-        ptr = _pointerSeed;
-    } else {
-        ptr = cv::Vec3f(0, 0, 0);
-        _pointerSeed = ptr;
-        _pointerSeedValid = true;
-    }
-    auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-    const float distance = _baseSurface->pointTo(ptr, worldPos, std::numeric_limits<float>::max(), 400, patchIndex);
-    _pointerSeed = ptr;
-    cv::Vec3f raw = _baseSurface->loc_raw(ptr);
 
     const cv::Mat_<cv::Vec3f>* points = _previewPoints;
     if (!points) {
@@ -360,133 +342,44 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
         return std::nullopt;
     }
 
-    int approxCol = static_cast<int>(std::round(raw[0]));
-    int approxRow = static_cast<int>(std::round(raw[1]));
-
-    approxRow = std::clamp(approxRow, 0, rows - 1);
-    approxCol = std::clamp(approxCol, 0, cols - 1);
-
-    auto accumulateCandidate = [&](int r, int c, float& bestDistSq, int& bestRow, int& bestCol) {
-        const cv::Vec3f& candidate = (*points)(r, c);
-        if (isInvalidPoint(candidate)) {
-            return;
-        }
-        const cv::Vec3f diff = candidate - worldPos;
-        const float distSq = diff.dot(diff);
-        if (distSq < bestDistSq) {
-            bestDistSq = distSq;
-            bestRow = r;
-            bestCol = c;
-        }
-    };
-
     const float stepNorm = stepNormalization();
-    const float stepNormSq = stepNorm * stepNorm;
-
-    float bestDistSq = std::numeric_limits<float>::max();
-    int bestRow = -1;
-    int bestCol = -1;
-
-    const auto runDenseSearch = [&]() {
-        constexpr int kInitialRadius = 12;
-        for (int radius = 0; radius <= kInitialRadius; ++radius) {
-            const int rowStart = std::max(0, approxRow - radius);
-            const int rowEnd = std::min(rows - 1, approxRow + radius);
-            const int colStart = std::max(0, approxCol - radius);
-            const int colEnd = std::min(cols - 1, approxCol + radius);
-
-            for (int r = rowStart; r <= rowEnd; ++r) {
-                for (int c = colStart; c <= colEnd; ++c) {
-                    accumulateCandidate(r, c, bestDistSq, bestRow, bestCol);
-                }
-            }
-
-            if (bestRow != -1) {
-                const float breakThreshold = (radius == 0)
-                                                 ? stepNorm
-                                                 : stepNorm * 1.5f * static_cast<float>(radius);
-                if (bestDistSq <= breakThreshold * breakThreshold) {
-                    break;
-                }
-            }
-        }
-
-        if (bestRow == -1 || bestDistSq > stepNormSq * 25.0f) {
-            for (int r = 0; r < rows; ++r) {
-                for (int c = 0; c < cols; ++c) {
-                    accumulateCandidate(r, c, bestDistSq, bestRow, bestCol);
-                }
-            }
-        }
-    };
-
-    const auto runStridedSearch = [&](const StridedSearchProfile& profile) {
-        if (profile.stride <= 0 || profile.radiusStep <= 0 || profile.maxRadius < 0) {
-            return;
-        }
-
-        for (int radius = 0; radius <= profile.maxRadius; radius += profile.radiusStep) {
-            const int rowStart = approxRow - radius;
-            const int rowEnd = approxRow + radius;
-            const int colStart = approxCol - radius;
-            const int colEnd = approxCol + radius;
-
-            for (int r = rowStart; r <= rowEnd; r += profile.stride) {
-                if (r < 0 || r >= rows) {
-                    continue;
-                }
-                for (int c = colStart; c <= colEnd; c += profile.stride) {
-                    if (c < 0 || c >= cols) {
-                        continue;
-                    }
-                    accumulateCandidate(r, c, bestDistSq, bestRow, bestCol);
-                }
-            }
-
-            if (bestRow != -1) {
-                const float breakRadius = (radius == 0)
-                                              ? stepNorm
-                                              : stepNorm * profile.breakMultiplier * static_cast<float>(radius);
-                if (bestDistSq <= breakRadius * breakRadius) {
-                    break;
-                }
-            }
-        }
-    };
-
-    switch (detail) {
-    case GridSearchResolution::Low: {
-        runStridedSearch(StridedSearchProfile{4, 16, 4, 2.5f});
-        if (bestRow == -1) {
-            runStridedSearch(StridedSearchProfile{2, 12, 2, 1.75f});
-        }
-        break;
-    }
-    case GridSearchResolution::Medium: {
-        runStridedSearch(StridedSearchProfile{2, 12, 2, 1.75f});
-        if (bestRow == -1) {
-            runDenseSearch();
-        }
-        break;
-    }
-    case GridSearchResolution::High:
-        runDenseSearch();
-        break;
-    }
-
-    if (bestRow == -1) {
-        if (outDistance) {
-            *outDistance = distance;
+    const float locateTolerance = std::max(stepNorm * 64.0f, 512.0f);
+    auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+    if (!patchIndex || patchIndex->empty()) {
+        if (warnOnFailure) {
+            qCWarning(lcSegEditManager) << "Cannot resolve segmentation grid location: surface patch index is unavailable.";
         }
         return std::nullopt;
     }
 
-    const float bestDist = std::sqrt(bestDistSq);
-    if (outDistance) {
-        *outDistance = bestDist;
+    auto hit = patchIndex->locate(worldPos, locateTolerance, _baseSurface);
+    if (!hit) {
+        if (warnOnFailure) {
+            qCWarning(lcSegEditManager) << "Cannot resolve segmentation grid location: surface patch index missed active surface"
+                                        << "within tolerance" << locateTolerance;
+        }
+        return std::nullopt;
     }
 
-    return std::make_pair(bestRow, bestCol);
+    _pointerSeed = hit->ptr;
+    _pointerSeedValid = true;
+
+    const cv::Vec2f grid = _baseSurface->ptrToGrid(hit->ptr);
+    const int col = std::clamp(static_cast<int>(std::round(grid[0])), 0, cols - 1);
+    const int row = std::clamp(static_cast<int>(std::round(grid[1])), 0, rows - 1);
+    if (isInvalidPoint((*points)(row, col))) {
+        if (warnOnFailure) {
+            qCWarning(lcSegEditManager) << "Cannot resolve segmentation grid location: surface patch index hit invalid vertex"
+                                        << "row" << row << "col" << col;
+        }
+        return std::nullopt;
+    }
+
+    if (outDistance) {
+        *outDistance = hit->distance;
+    }
+
+    return std::make_pair(row, col);
 }
 
 std::optional<cv::Vec3f> SegmentationEditManager::vertexWorldPosition(int row, int col) const

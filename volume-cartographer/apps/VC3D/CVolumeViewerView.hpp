@@ -30,7 +30,6 @@ signals:
     void sendVolumeClicked(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void sendPanRelease(Qt::MouseButton, Qt::KeyboardModifiers);
     void sendPanStart(Qt::MouseButton, Qt::KeyboardModifiers);
-    void sendCursorMove(QPointF);
     void sendMousePress(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void sendMouseMove(QPointF, Qt::MouseButtons, Qt::KeyboardModifiers);
     void sendMouseRelease(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);

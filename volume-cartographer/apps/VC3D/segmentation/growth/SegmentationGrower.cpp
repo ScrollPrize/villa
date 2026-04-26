@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cmath>
 #include <ctime>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
@@ -1610,7 +1611,21 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
                 : tr("Running dense displacement (overwrite current segment)..."),
             kStatusMedium);
 
-        auto future = QtConcurrent::run(runDenseDisplacementGrowth, denseJob);
+        auto future = QtConcurrent::run([denseJob]() {
+            try {
+                return runDenseDisplacementGrowth(denseJob);
+            } catch (const std::exception& e) {
+                qCWarning(lcSegGrowth) << "Dense displacement worker failed:" << e.what();
+                TracerGrowthResult result;
+                result.error = QStringLiteral("Dense displacement failed: %1").arg(e.what());
+                return result;
+            } catch (...) {
+                qCWarning(lcSegGrowth) << "Dense displacement worker failed with an unknown exception";
+                TracerGrowthResult result;
+                result.error = QStringLiteral("Dense displacement failed with an unknown exception");
+                return result;
+            }
+        });
         _watcher = std::make_unique<QFutureWatcher<TracerGrowthResult>>(this);
         connect(_watcher.get(), &QFutureWatcher<TracerGrowthResult>::finished,
                 this, &SegmentationGrower::onFutureFinished);
@@ -1763,7 +1778,21 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
 
     _activeRequest = std::move(pending);
 
-    auto future = QtConcurrent::run(runTracerGrowth, request, ctx);
+    auto future = QtConcurrent::run([request, ctx]() {
+        try {
+            return runTracerGrowth(request, ctx);
+        } catch (const std::exception& e) {
+            qCWarning(lcSegGrowth) << "Tracer growth worker failed:" << e.what();
+            TracerGrowthResult result;
+            result.error = QStringLiteral("Tracer growth failed: %1").arg(e.what());
+            return result;
+        } catch (...) {
+            qCWarning(lcSegGrowth) << "Tracer growth worker failed with an unknown exception";
+            TracerGrowthResult result;
+            result.error = QStringLiteral("Tracer growth failed with an unknown exception");
+            return result;
+        }
+    });
     _watcher = std::make_unique<QFutureWatcher<TracerGrowthResult>>(this);
     connect(_watcher.get(), &QFutureWatcher<TracerGrowthResult>::finished,
             this, &SegmentationGrower::onFutureFinished);
@@ -1952,7 +1981,21 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
 
     showStatus(tr("Running displacement copy (creating front/back segments)..."), kStatusMedium);
 
-    auto future = QtConcurrent::run(runCopyDisplacementGrowth, copyJob);
+    auto future = QtConcurrent::run([copyJob]() {
+        try {
+            return runCopyDisplacementGrowth(copyJob);
+        } catch (const std::exception& e) {
+            qCWarning(lcSegGrowth) << "Copy displacement worker failed:" << e.what();
+            TracerGrowthResult result;
+            result.error = QStringLiteral("Copy displacement failed: %1").arg(e.what());
+            return result;
+        } catch (...) {
+            qCWarning(lcSegGrowth) << "Copy displacement worker failed with an unknown exception";
+            TracerGrowthResult result;
+            result.error = QStringLiteral("Copy displacement failed with an unknown exception");
+            return result;
+        }
+    });
     _watcher = std::make_unique<QFutureWatcher<TracerGrowthResult>>(this);
     connect(_watcher.get(), &QFutureWatcher<TracerGrowthResult>::finished,
             this, &SegmentationGrower::onFutureFinished);

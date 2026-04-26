@@ -35,6 +35,22 @@ inline float clamp01(float v) {
     return std::max(0.0f, std::min(1.0f, v));
 }
 
+inline bool isFinitePoint(const cv::Vec3f& p) noexcept
+{
+    return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+}
+
+inline bool isValidSurfacePoint(const cv::Vec3f& p) noexcept
+{
+    return p[0] != -1.0f && isFinitePoint(p);
+}
+
+inline bool isValidBounds(const cv::Vec3f& low, const cv::Vec3f& high) noexcept
+{
+    return isFinitePoint(low) && isFinitePoint(high)
+        && low[0] <= high[0] && low[1] <= high[1] && low[2] <= high[2];
+}
+
 TriangleHit closestPointOnTriangle(const cv::Vec3f& p,
                                    const cv::Vec3f& a,
                                    const cv::Vec3f& b,
@@ -198,6 +214,7 @@ struct SurfacePatchIndex::Impl {
     };
 
     static uint16_t qEnc(float v) noexcept {
+        if (!std::isfinite(v)) return 0;
         float t = (v - kQLow) * (65535.0f / kQRange);
         if (t < 0.0f) return 0;
         if (t > 65535.0f) return 65535;
@@ -724,10 +741,15 @@ size_t SurfacePatchIndex::surfaceCount() const
     return impl_ ? impl_->surfaceRecords.size() : 0;
 }
 
+bool SurfacePatchIndex::containsSurface(const SurfacePtr& surface) const
+{
+    return impl_ && surface && impl_->surfaceRecords.find(surface.get()) != impl_->surfaceRecords.end();
+}
+
 std::optional<SurfacePatchIndex::LookupResult>
 SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const SurfacePtr& targetSurface) const
 {
-    if (!impl_ || !impl_->tree || tolerance <= 0.0f) {
+    if (!impl_ || !impl_->tree || tolerance <= 0.0f || !isFinitePoint(worldPoint)) {
         return std::nullopt;
     }
 
@@ -784,9 +806,17 @@ SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const Su
         found = true;
     };
 
-    impl_->tree->query(
-        bgi::intersects(query),
-        boost::make_function_output_iterator(processEntry));
+    try {
+        impl_->tree->query(
+            bgi::intersects(query),
+            boost::make_function_output_iterator(processEntry));
+    } catch (const std::exception& e) {
+        std::cerr << "[SurfacePatchIndex] locate query failed: " << e.what() << std::endl;
+        return std::nullopt;
+    } catch (...) {
+        std::cerr << "[SurfacePatchIndex] locate query failed: unknown exception" << std::endl;
+        return std::nullopt;
+    }
 
     if (!found) {
         return std::nullopt;
@@ -864,6 +894,9 @@ void SurfacePatchIndex::forEachTriangleImpl(
 
     Impl::Point3 min_pt(bounds.low[0], bounds.low[1], bounds.low[2]);
     Impl::Point3 max_pt(bounds.high[0], bounds.high[1], bounds.high[2]);
+    if (!isValidBounds(bounds.low, bounds.high)) {
+        return;
+    }
     Impl::Box3 query(min_pt, max_pt);
 
     // Cache surface metadata to avoid redundant lookups across patches
@@ -992,8 +1025,14 @@ void SurfacePatchIndex::forEachTriangleImpl(
         }
     };
 
-    impl_->tree->query(bgi::intersects(query),
-                       boost::make_function_output_iterator(emitFromPatch));
+    try {
+        impl_->tree->query(bgi::intersects(query),
+                           boost::make_function_output_iterator(emitFromPatch));
+    } catch (const std::exception& e) {
+        std::cerr << "[SurfacePatchIndex] triangle query failed: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "[SurfacePatchIndex] triangle query failed: unknown exception" << std::endl;
+    }
 }
 
 bool SurfacePatchIndex::Impl::removeSurfaceEntries(const SurfacePtr& surface)
@@ -1445,7 +1484,8 @@ bool SurfacePatchIndex::Impl::loadPatchCorners(const PatchRecord& rec,
     const cv::Vec3f& p01 = (*points)(row + effectiveRowStride, col);
     const cv::Vec3f& p11 = (*points)(row + effectiveRowStride, col + effectiveColStride);
 
-    if (p00[0] == -1.0f || p10[0] == -1.0f || p01[0] == -1.0f || p11[0] == -1.0f) {
+    if (!isValidSurfacePoint(p00) || !isValidSurfacePoint(p10)
+        || !isValidSurfacePoint(p01) || !isValidSurfacePoint(p11)) {
         return false;
     }
 
@@ -1477,7 +1517,8 @@ bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
     const cv::Vec3f& p10 = points(row, col + effectiveColStride);
     const cv::Vec3f& p01 = points(row + effectiveRowStride, col);
     const cv::Vec3f& p11 = points(row + effectiveRowStride, col + effectiveColStride);
-    if (p00[0] == -1.0f || p10[0] == -1.0f || p01[0] == -1.0f || p11[0] == -1.0f) {
+    if (!isValidSurfacePoint(p00) || !isValidSurfacePoint(p10)
+        || !isValidSurfacePoint(p01) || !isValidSurfacePoint(p11)) {
         return false;
     }
 
@@ -1497,7 +1538,7 @@ bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
     cv::Vec3f low{p00};
     cv::Vec3f high{p00};
     auto extend = [&](const cv::Vec3f& p) {
-        if (p[0] == -1.0f) return;
+        if (!isValidSurfacePoint(p)) return;
         low[0] = std::min(low[0], p[0]);
         low[1] = std::min(low[1], p[1]);
         low[2] = std::min(low[2], p[2]);
@@ -1510,6 +1551,9 @@ bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
         for (int dc = 0; dc <= effectiveColStride; ++dc) {
             extend(rowPtr[dc]);
         }
+    }
+    if (!isValidBounds(low, high)) {
+        return false;
     }
 
     outEntry.patch = buildEntryFromBbox(rec, low, high, bboxPadding);
@@ -1905,6 +1949,9 @@ SurfacePatchIndex::computePlaneIntersections(
         viewBbox,
         plane.coord(cv::Vec3f(0, 0, 0),
                     {static_cast<float>(roi.br().x), static_cast<float>(roi.br().y), 0.0f}));
+    if (!isValidBounds(viewBbox.low, viewBbox.high)) {
+        return result;
+    }
 
     // Pad the bbox by 25% of the max extent (minimum 64 units)
     const cv::Vec3f extent = viewBbox.high - viewBbox.low;
