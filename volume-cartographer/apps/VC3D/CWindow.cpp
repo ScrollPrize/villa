@@ -907,7 +907,9 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
 #elif defined(__GLIBC__)
         ::malloc_trim(0);
 #endif
-        vc3d::ramstats::dumpOnce(_viewerManager.get(), _state);
+        if (DebugLoggingEnabled()) {
+            vc3d::ramstats::dumpOnce(_viewerManager.get(), _state);
+        }
     });
     trimTimer->start();
 

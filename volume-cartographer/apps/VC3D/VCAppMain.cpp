@@ -14,6 +14,7 @@
 #include <QSettings>
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/Logging.hpp"
 
 #include <opencv2/core.hpp>
 #include <iostream>
@@ -156,7 +157,17 @@ auto main(int argc, char* argv[]) -> int
         "level");
     parser.addOption(prefetchLevelOption);
 
+    QCommandLineOption debugOption(
+        "debug",
+        "Enable verbose diagnostic logging while loading and trimming surfaces.");
+    parser.addOption(debugOption);
+
     parser.process(app);
+
+    if (parser.isSet(debugOption)) {
+        SetDebugLoggingEnabled(true);
+        SetLogLevel("debug");
+    }
 
     if (parser.isSet(skipShapeCheckOption)) {
         Volume::skipShapeCheck = true;

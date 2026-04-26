@@ -2,11 +2,14 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cmath>
+#include <future>
 #include <iostream>
 #include <limits>
 #include <optional>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <unordered_map>
@@ -18,12 +21,15 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/Logging.hpp"
 
 
 namespace bg = boost::geometry;
 namespace bgi = boost::geometry::index;
 
 namespace {
+
+using SurfacePtr = SurfacePatchIndex::SurfacePtr;
 
 struct TriangleHit {
     cv::Vec3f closest{0, 0, 0};
@@ -49,6 +55,70 @@ inline bool isValidBounds(const cv::Vec3f& low, const cv::Vec3f& high) noexcept
 {
     return isFinitePoint(low) && isFinitePoint(high)
         && low[0] <= high[0] && low[1] <= high[1] && low[2] <= high[2];
+}
+
+std::vector<SurfacePtr> loadSurfacesInBatches(const std::vector<SurfacePtr>& surfaces)
+{
+    constexpr size_t kBatchSize = 1000;
+    constexpr size_t kMaxWorkers = 8;
+
+    std::vector<SurfacePtr> loaded;
+    loaded.reserve(surfaces.size());
+
+    for (size_t batchStart = 0; batchStart < surfaces.size(); batchStart += kBatchSize) {
+        const size_t batchEnd = std::min(batchStart + kBatchSize, surfaces.size());
+        const size_t batchSize = batchEnd - batchStart;
+        std::vector<SurfacePtr> batchLoaded(batchSize);
+
+        const unsigned hw = std::thread::hardware_concurrency();
+        const size_t workerCount = std::max<size_t>(
+            1, std::min<size_t>({batchSize, kMaxWorkers, hw == 0 ? 4 : hw}));
+        std::atomic_size_t next{0};
+        std::vector<std::future<void>> workers;
+        workers.reserve(workerCount);
+
+        for (size_t worker = 0; worker < workerCount; ++worker) {
+            workers.emplace_back(std::async(std::launch::async, [&]() {
+                while (true) {
+                    const size_t localIndex = next.fetch_add(1, std::memory_order_relaxed);
+                    if (localIndex >= batchSize) {
+                        break;
+                    }
+
+                    const auto& s = surfaces[batchStart + localIndex];
+                    if (!s) {
+                        continue;
+                    }
+                    if (!s->isLoaded()) {
+                        if (DebugLoggingEnabled()) {
+                            std::cout << "[SurfacePatchIndex] Loading surface: " << s->id << std::endl;
+                        }
+                        s->rawPointsPtr();  // triggers ensureLoaded()
+                    }
+                    if (s->isLoaded()) {
+                        batchLoaded[localIndex] = s;
+                        if (DebugLoggingEnabled()) {
+                            std::cout << "[SurfacePatchIndex] Indexed surface: " << s->id << std::endl;
+                        }
+                    } else if (DebugLoggingEnabled()) {
+                        std::cout << "[SurfacePatchIndex] Failed to load surface: " << s->id << std::endl;
+                    }
+                }
+            }));
+        }
+
+        for (auto& worker : workers) {
+            worker.get();
+        }
+
+        for (auto& surface : batchLoaded) {
+            if (surface) {
+                loaded.push_back(std::move(surface));
+            }
+        }
+    }
+
+    return loaded;
 }
 
 TriangleHit closestPointOnTriangle(const cv::Vec3f& p,
@@ -134,8 +204,6 @@ TriangleHit closestPointOnTriangle(const cv::Vec3f& p,
     hit.distSq = d[0]*d[0] + d[1]*d[1] + d[2]*d[2];
     return hit;
 }
-
-using SurfacePtr = SurfacePatchIndex::SurfacePtr;
 
 struct CellKey {
     SurfacePtr surface;
@@ -620,25 +688,11 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
 
     // Eagerly load any surfaces whose TIFF data hasn't been loaded yet.
     // This is safe because rebuild() typically runs on a background thread.
-    std::vector<SurfacePtr> loaded;
-    loaded.reserve(surfaces.size());
-    for (const auto& s : surfaces) {
-        if (!s) {
-            continue;
-        }
-        if (!s->isLoaded()) {
-            std::cout << "[SurfacePatchIndex] Loading surface: " << s->id << std::endl;
-            s->rawPointsPtr();  // triggers ensureLoaded()
-        }
-        if (s->isLoaded()) {
-            loaded.push_back(s);
-            std::cout << "[SurfacePatchIndex] Indexed surface: " << s->id << std::endl;
-        } else {
-            std::cout << "[SurfacePatchIndex] Failed to load surface: " << s->id << std::endl;
-        }
-    }
+    std::vector<SurfacePtr> loaded = loadSurfacesInBatches(surfaces);
     const size_t surfaceCount = loaded.size();
-    std::cout << "[SurfacePatchIndex] rebuild: " << surfaceCount << " of " << surfaces.size() << " surfaces loaded" << std::endl;
+    if (DebugLoggingEnabled()) {
+        std::cout << "[SurfacePatchIndex] rebuild: " << surfaceCount << " of " << surfaces.size() << " surfaces loaded" << std::endl;
+    }
     if (surfaceCount == 0) {
         impl_->tree.reset();
         impl_->samplingStride = std::max(1, impl_->samplingStride);

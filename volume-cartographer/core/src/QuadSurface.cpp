@@ -2,6 +2,7 @@
 
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/LoadJson.hpp"
+#include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PointIndex.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
@@ -310,8 +311,10 @@ void QuadSurface::ensureLoaded()
         return;
     }
 
-    std::fprintf(stderr, "[SURF] load %s (from %s)\n",
-                 id.c_str(), path.string().c_str());
+    if (DebugLoggingEnabled()) {
+        std::fprintf(stderr, "[SURF] load %s (from %s)\n",
+                     id.c_str(), path.string().c_str());
+    }
     auto loaded = load_quad_from_tifxyz(path.string());
     if (!loaded) {
         throw std::runtime_error("Failed to load surface from: " + path.string());
@@ -529,11 +532,13 @@ bool QuadSurface::trimToValidBbox()
     _validMaskCache = cv::Mat_<uint8_t>();
     _validMaskAllValid = false;
     _normalCache = cv::Mat_<cv::Vec3f>();
-    std::fprintf(stderr,
-        "[SURF] trim %s %dx%d -> %dx%d  saved %zu MB (%.1f%%)\n",
-        id.c_str(), cols, rows, bbW, bbH,
-        (origBytes - trimBytes) / (1024 * 1024),
-        pctSaved * 100.0);
+    if (DebugLoggingEnabled()) {
+        std::fprintf(stderr,
+            "[SURF] trim %s %dx%d -> %dx%d  saved %zu MB (%.1f%%)\n",
+            id.c_str(), cols, rows, bbW, bbH,
+            (origBytes - trimBytes) / (1024 * 1024),
+            pctSaved * 100.0);
+    }
     return true;
 }
 
@@ -553,7 +558,9 @@ void QuadSurface::unloadPoints()
     _validMaskAllValid = false;
     _normalCache = cv::Mat_<cv::Vec3f>();
     _needsLoad = true;
-    std::fprintf(stderr, "[SURF] unload %s (%zu MB freed)\n", id.c_str(), mb);
+    if (DebugLoggingEnabled()) {
+        std::fprintf(stderr, "[SURF] unload %s (%zu MB freed)\n", id.c_str(), mb);
+    }
 }
 
 void QuadSurface::unloadCaches()
