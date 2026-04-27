@@ -48,38 +48,31 @@ std::string CState::currentVolumeId() const { return _currentVolumeId; }
 
 void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
-    // Fully stop the old pipeline's workers before creating a new one.
-    // shutdown() calls abortAll() to interrupt in-flight curl, joins all
-    // threads, then resetAbort() so the new pipeline's workers start clean.
-    // Without this, the old pipeline's destructor (deferred by viewer
-    // shared_ptrs) would call abortAll() AFTER the new pipeline starts,
-    // poisoning all new curl requests.
+    fprintf(stderr, "[CState] setCurrentVolume: begin (old=%p new=%p)\n",
+            (void*)_currentVolume.get(), (void*)vol.get());
+
+    // Shut down old pipeline workers and destroy the pipeline eagerly so
+    // we don't have two 10 GB mmaps alive simultaneously. shutdown() makes
+    // the destructor's abortAll() a no-op, and resetTieredCache() frees
+    // the BlockCache mmap before the new pipeline allocates its own.
     if (_currentVolume) {
         auto* oldPipeline = _currentVolume->tieredCache();
         if (oldPipeline) {
+            fprintf(stderr, "[CState] shutting down old pipeline %p\n", (void*)oldPipeline);
             oldPipeline->shutdown();
         }
-        // Do NOT resetTieredCache on the outgoing volume here — the
-        // viewer's OnVolumeChanged still holds a reference and will call
-        // tieredCache() to unregister its listener.  If the dead pipeline
-        // is null, that call recreates a zombie pipeline with a stale
-        // cache generation, causing permanent black screen on re-select.
-        // Instead we leave the dead pipeline in place (shutdown prevents
-        // further work) and reset the INCOMING volume below.
-    }
-    if (_blockCache) {
-        _blockCache->clear();
-    }
-    _currentVolume = std::move(vol);
-    // Destroy any stale/zombie pipeline on the incoming volume so
-    // the next tieredCache() call creates a fresh one with the current
-    // BlockCache generation.
-    if (_currentVolume) {
+        fprintf(stderr, "[CState] resetting old pipeline\n");
         _currentVolume->resetTieredCache();
     }
+
+    fprintf(stderr, "[CState] replacing _currentVolume\n");
+    _currentVolume = std::move(vol);
     applyCacheBudget(_currentVolume);
     resolveCurrentVolumeId();
+
+    fprintf(stderr, "[CState] emitting volumeChanged\n");
     emit volumeChanged(_currentVolume, _currentVolumeId);
+    fprintf(stderr, "[CState] setCurrentVolume: done\n");
 }
 
 std::string CState::segmentationGrowthVolumeId() const { return _segmentationGrowthVolumeId; }
@@ -122,18 +115,6 @@ void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
 {
     if (vol && _cacheSizeBytes > 0) {
         vol->setCacheBudget(_cacheSizeBytes);
-
-        // Create the shared BlockCache on first use. It persists across
-        // volume switches — only the BlockPipeline is recreated, avoiding
-        // the expensive 10 GB mmap + prefault on every switch.
-        if (!_blockCache) {
-            vc::cache::BlockCache::Config bcfg;
-            bcfg.bytes = _cacheSizeBytes;
-            for (auto& f : bcfg.levelFloor) f = 4096;
-            const_cast<CState*>(this)->_blockCache =
-                std::make_unique<vc::cache::BlockCache>(bcfg);
-        }
-        vol->setBlockCache(_blockCache.get());
     }
 }
 

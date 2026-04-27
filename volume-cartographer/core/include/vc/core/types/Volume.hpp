@@ -93,9 +93,6 @@ public:
     // Set cache budget (must be called before first tieredCache() access).
     void setCacheBudget(size_t hotBytes);
 
-    // Set a shared BlockCache that persists across volume switches.
-    // Must be called before first tieredCache() access.
-    void setBlockCache(vc::cache::BlockCache* bc);
 
     // Inject a local zarr array for the cold cache tier.
     // Must be called before first tieredCache() access.
@@ -173,8 +170,8 @@ protected:
     // Cache ownership
     mutable std::unique_ptr<vc::cache::BlockPipeline> tieredCache_;
     mutable std::mutex cacheMutex_;
+    mutable bool pipelineReset_ = false;  // set by resetTieredCache(); prevents zombie re-creation
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
-    vc::cache::BlockCache* sharedBlockCache_ = nullptr;
     int ioThreads_ = 0;  // 0 = use default
     utils::C3dCodecParams encodeParams_ = {};
 

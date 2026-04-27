@@ -257,7 +257,6 @@ static bool bytesAreCanonical(const std::vector<uint8_t>& bytes) {
 
 BlockPipeline::BlockPipeline(
     Config config,
-    BlockCache& blockCache,
     std::unique_ptr<VolumeSource> source,
     DecompressFn decompress,
     std::vector<std::unique_ptr<utils::ZarrArray>> diskLevels)
@@ -265,16 +264,6 @@ BlockPipeline::BlockPipeline(
     , diskLevels_(std::move(diskLevels))
     , source_(std::move(source))
     , decompress_(std::move(decompress))
-    // Thread sizing. Loader is pure I/O wait (disk read or shard-cache
-    // memcpy) — oversubscribe heavily so it can keep the disk queue full
-    // even when many threads are blocked on io_wait. The CPU-bound pools
-    // (encode, decode) stay near hw so concurrent decode never runs more
-    // threads than cores. CLI tools (e.g. vc_zarr_prefetch) can still
-    // override the downloader count via setIOThreads().
-    //   downloader: HTTP fetch + re-chunk (I/O bound, keep-alive pool)
-    //   encode    : h265 encode → disk (CPU, cold-miss only)
-    //   loader    : shard-cache memcpy or disk read → staged bytes (I/O)
-    //   decode    : h265 decode + block insert (pure CPU, caps work rate)
     , downloaderPool_([&] {
         if (config_.ioThreads > 0) return config_.ioThreads;
         unsigned hw = std::thread::hardware_concurrency();
@@ -286,31 +275,24 @@ BlockPipeline::BlockPipeline(
     }())
     , loaderPool_([] {
         unsigned hw = std::thread::hardware_concurrency();
-        // 4× hw: was 16× to max out disk queue depth, but read_whole_shard
-        // returns ~256 MiB per call on sharded volumes, so 192 parallel
-        // loader workers could hold tens of GiB of in-flight shard bytes
-        // and push the process into swap on 32 GiB machines. With
-        // maxConcurrentShardReads bounding the big allocations, the extra
-        // worker count is wasted threads — 4× is enough to keep the disk
-        // queue full past the backpressure gate.
         return hw ? 4 * static_cast<int>(hw) : 32;
     }())
     , decodePool_([] {
         unsigned hw = std::thread::hardware_concurrency();
         return hw ? static_cast<int>(hw) : 8;
     }())
-    , blockCache_(blockCache)
+    , blockCache_([&] {
+        BlockCache::Config bcfg;
+        bcfg.bytes = config_.bytes;
+        for (auto& f : bcfg.levelFloor) f = 4096;
+        return bcfg;
+    }())
 {
-    // Clear any stale process-wide HTTP abort flag from a previous
-    // BlockPipeline's destructor. Without this, a volume swap during the
-    // same session would leave the flag set and every subsequent curl
-    // request would return CURLE_ABORTED_BY_CALLBACK → silent failure.
-    utils::HttpClient::resetAbort();
+    fprintf(stderr, "[BlockPipeline] constructor %p: bytes=%zu\n", (void*)this, config_.bytes);
 
-    // Clear the shared block cache so stale blocks from the previous volume
-    // don't appear in the new one. Physical pages are released via
-    // MADV_DONTNEED; the virtual mapping stays alive.
-    blockCache_.clear();
+    // Clear any stale process-wide HTTP abort flag from a previous
+    // BlockPipeline's destructor.
+    utils::HttpClient::resetAbort();
 
     // Scan the on-disk cache once at startup so the stats bar reports
     // actual usage instead of "0 GB / 0 shards" until we write something.
@@ -785,8 +767,11 @@ skipPassthrough:
 void BlockPipeline::shutdown() {
     // Atomic exchange: if already shutting down (destructor or prior shutdown()
     // call), skip. This makes shutdown() + ~BlockPipeline() idempotent.
-    if (shuttingDown_.exchange(true, std::memory_order_acq_rel))
+    if (shuttingDown_.exchange(true, std::memory_order_acq_rel)) {
+        fprintf(stderr, "[BlockPipeline] shutdown %p: already shut down\n", (void*)this);
         return;
+    }
+    fprintf(stderr, "[BlockPipeline] shutdown %p: stopping pools...\n", (void*)this);
     // Release any downloader workers blocked on the backpressure CV so
     // pool.stop() can actually join them.
     encodeStagingCv_.notify_all();
@@ -810,9 +795,7 @@ void BlockPipeline::shutdown() {
     // All workers have joined — safe to clear the process-global abort
     // flag so a new pipeline can use curl without seeing a stale abort.
     utils::HttpClient::resetAbort();
-    // Release cached data before member destructors run, so any shared_ptrs
-    // held by thread-locals or callbacks don't keep shard/block data alive.
-    clearMemory();
+    fprintf(stderr, "[BlockPipeline] shutdown %p: pools stopped, abort cleared\n", (void*)this);
     auto cold = statColdHits_.load();
     auto ice = statIceFetches_.load();
     if (cold > 0 || ice > 0) {
@@ -822,7 +805,9 @@ void BlockPipeline::shutdown() {
 }
 
 BlockPipeline::~BlockPipeline() {
+    fprintf(stderr, "[BlockPipeline] destructor %p\n", (void*)this);
     shutdown();
+    fprintf(stderr, "[BlockPipeline] destructor %p: done\n", (void*)this);
 }
 
 void BlockPipeline::bloomAdd(const ChunkKey& key) noexcept {
@@ -847,6 +832,10 @@ void BlockPipeline::bloomClear() noexcept {
 }
 
 void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targetLevel) {
+    static int fetchDbgCount = 0;
+    if (fetchDbgCount++ < 5 || fetchDbgCount % 100 == 0)
+        fprintf(stderr, "[BlockPipeline] fetchInteractive %p: %zu keys, targetLevel=%d\n",
+                (void*)this, keys.size(), targetLevel);
     if (keys.empty()) return;
     // Dedup: the renderer calls this every frame, and viewport-idle frames
     // pass the same keys + targetLevel as the previous call. When the
@@ -1349,17 +1338,8 @@ std::unique_ptr<BlockPipeline> openFilesystemPipeline(
     BlockPipeline::Config cfg;
     cfg.bytes = maxBytes;
 
-    // CLI tools typically don't pass a shared cache — create a local one.
-    static thread_local std::unique_ptr<BlockCache> localCache;
-    if (!sharedCache) {
-        BlockCache::Config bcfg;
-        bcfg.bytes = maxBytes;
-        for (auto& f : bcfg.levelFloor) f = 4096;
-        localCache = std::make_unique<BlockCache>(bcfg);
-        sharedCache = localCache.get();
-    }
     return std::make_unique<BlockPipeline>(
-        std::move(cfg), *sharedCache, std::move(source), std::move(decompress));
+        std::move(cfg), std::move(source), std::move(decompress));
 }
 
 }  // namespace vc::cache

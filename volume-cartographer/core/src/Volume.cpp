@@ -298,10 +298,19 @@ vc::VcDataset *Volume::zarrDataset(int level) const {
     if (level < 0 || zarrDs_.empty())
         return nullptr;
 
-    if (static_cast<size_t>(level) >= zarrDs_.size())
-        return nullptr;
+    if (static_cast<size_t>(level) < zarrDs_.size()) {
+        auto* ds = zarrDs_[static_cast<size_t>(level)].get();
+        if (ds) return ds;
+    }
 
-    return zarrDs_[static_cast<size_t>(level)].get();
+    // Requested level is missing (padded gap). When called with
+    // default level=0, callers just want "any dataset" as a validity
+    // check — return the first non-null entry.
+    if (level == 0) {
+        for (auto& d : zarrDs_)
+            if (d) return d.get();
+    }
+    return nullptr;
 }
 
 size_t Volume::numScales() const noexcept {
@@ -479,21 +488,8 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
         fprintf(stderr, "[Volume] IO threads: %d\n", config.ioThreads);
     }
 
-    // Use the shared BlockCache if one was provided; otherwise create a
-    // local one (CLI tools, tests, etc.).
-    static thread_local std::unique_ptr<vc::cache::BlockCache> localBlockCache;
-    vc::cache::BlockCache* bc = sharedBlockCache_;
-    if (!bc) {
-        vc::cache::BlockCache::Config bcfg;
-        bcfg.bytes = cacheBudgetHot_;
-        for (auto& f : bcfg.levelFloor) f = 4096;
-        localBlockCache = std::make_unique<vc::cache::BlockCache>(bcfg);
-        bc = localBlockCache.get();
-    }
-
     auto pipeline = std::make_unique<vc::cache::BlockPipeline>(
         std::move(config),
-        *bc,
         std::move(source),
         std::move(decompress),
         std::move(diskLevels));
@@ -507,9 +503,13 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
 void Volume::ensureTieredCache() const
 {
     std::lock_guard<std::mutex> lock(cacheMutex_);
-    if (!tieredCache_) {
+    if (!tieredCache_ && !pipelineReset_) {
+        fprintf(stderr, "[Volume] %p ensureTieredCache: creating pipeline (budget=%zu)\n",
+                (void*)this, cacheBudgetHot_);
         auto* self = const_cast<Volume*>(this);
         tieredCache_ = self->createTieredCache();
+        fprintf(stderr, "[Volume] %p ensureTieredCache: pipeline=%p created\n",
+                (void*)this, (void*)tieredCache_.get());
     }
 }
 
@@ -521,8 +521,12 @@ vc::cache::BlockPipeline* Volume::tieredCache()
 
 void Volume::resetTieredCache()
 {
+    fprintf(stderr, "[Volume] %p resetTieredCache: destroying pipeline=%p\n",
+            (void*)this, (void*)tieredCache_.get());
     std::lock_guard<std::mutex> lock(cacheMutex_);
     tieredCache_.reset();
+    pipelineReset_ = true;  // prevent zombie re-creation
+    fprintf(stderr, "[Volume] %p resetTieredCache: done\n", (void*)this);
 }
 
 void Volume::setCacheBudget(size_t hotBytes)
@@ -530,10 +534,6 @@ void Volume::setCacheBudget(size_t hotBytes)
     cacheBudgetHot_ = hotBytes;
 }
 
-void Volume::setBlockCache(vc::cache::BlockCache* bc)
-{
-    sharedBlockCache_ = bc;
-}
 
 void Volume::setIOThreads(int count)
 {

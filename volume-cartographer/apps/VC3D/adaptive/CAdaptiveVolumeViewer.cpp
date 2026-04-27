@@ -199,6 +199,10 @@ Surface* CAdaptiveVolumeViewer::currentSurface() const
 
 void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
 {
+    fprintf(stderr, "[Viewer:%s] OnVolumeChanged: old=%p new=%p _surfWeak=%p axisAligned=%d\n",
+            _surfName.c_str(), (void*)_volume.get(), (void*)vol.get(),
+            (void*)_surfWeak.lock().get(), isAxisAlignedView() ? 1 : 0);
+
     if (_chunkCbId != 0 && _volume && _volume->tieredCache()) {
         _volume->tieredCache()->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
@@ -250,6 +254,9 @@ void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
         _defaultSurface = std::make_shared<PlaneSurface>(center, normal);
         _surfWeak = _defaultSurface;
     }
+
+    fprintf(stderr, "[Viewer:%s] OnVolumeChanged: after surface setup: _surfWeak=%p _volume=%p\n",
+            _surfName.c_str(), (void*)_surfWeak.lock().get(), (void*)_volume.get());
 
     if (_volume) {
         int nScales = static_cast<int>(_volume->numScales());
@@ -495,6 +502,18 @@ void CAdaptiveVolumeViewer::submitRender()
     // these safely — the shared_ptr from weak_ptr::lock() and the volume
     // pointers need main-thread-stable reads.
     auto surf = _surfWeak.lock();
+    {
+        // Reset counter on each volume change so we always see the first
+        // few submitRender calls after a switch.
+        static int srDbg = 0;
+        static void* lastVol = nullptr;
+        if ((void*)_volume.get() != lastVol) { srDbg = 0; lastVol = (void*)_volume.get(); }
+        if (srDbg++ < 5)
+            fprintf(stderr, "[Viewer:%s] submitRender #%d: surf=%p vol=%p zarrDs(0)=%p numScales=%zu\n",
+                    _surfName.c_str(), srDbg, (void*)surf.get(), (void*)_volume.get(),
+                    _volume ? (void*)_volume->zarrDataset(0) : nullptr,
+                    _volume ? _volume->numScales() : 0);
+    }
     if (!surf || !_volume || !_volume->zarrDataset()) return;
     const int fbW = _framebuffer.width();
     const int fbH = _framebuffer.height();
