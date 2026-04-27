@@ -12,12 +12,14 @@
 #include "vc/core/types/SampleParams.hpp"
 #include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/cache/ChunkKey.hpp"
+#include "vc/core/cache/TickCoordinator.hpp"
 #include <cstring>
 #include <unordered_set>
 
 #include <opencv2/imgproc.hpp>
 
 #include <QSettings>
+#include <QThreadPool>
 #include <QTimer>
 #include <QVBoxLayout>
 #include <QLabel>
@@ -28,6 +30,8 @@
 #include <QPainterPath>
 #include <QPen>
 #include <QWindowStateChangeEvent>
+#include <QOpenGLWidget>
+#include <QSurfaceFormat>
 #include <QApplication>
 #include <QPointer>
 
@@ -47,6 +51,20 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
     , _viewerManager(manager)
 {
     _view = new CVolumeViewerView(this);
+    // GPU-backed paint device for the scene: all painter ops (QImage blit,
+    // overlay items, intersections) go through an OpenGL surface instead
+    // of Qt's CPU raster engine. The QImage framebuffer we populate in
+    // drawBackground becomes a GL texture upload + textured quad, and
+    // QGraphicsView compositing runs on the GPU rasterizer. Drops the
+    // CPU blit cost (was ~5% of frame per the perf map) and frees main-
+    // thread cycles for the sampling kernel.
+    {
+        QSurfaceFormat fmt;
+        fmt.setSwapInterval(0);  // disable vsync — we already coalesce at 16 ms
+        auto* gl = new QOpenGLWidget(_view);
+        gl->setFormat(fmt);
+        _view->setViewport(gl);
+    }
     fGraphicsView = _view;
     _view->setHorizontalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
     _view->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
@@ -88,6 +106,25 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
             submitRender();
             updateStatusLabel();
         }
+        if (_intersectionsDirty) {
+            _intersectionsDirty = false;
+            renderIntersectionsNow();
+        }
+    });
+
+    // When the user stops actively panning / zooming, kick a full-res
+    // re-render to replace the progressive-level frame with a crisp one.
+    // 180 ms chosen to be comfortably past the typical debounce of wheel
+    // events + tail of a pan drag, so we don't flip to full-res in the
+    // middle of continued motion.
+    _interactionIdleTimer = new QTimer(this);
+    _interactionIdleTimer->setSingleShot(true);
+    _interactionIdleTimer->setInterval(180);
+    connect(_interactionIdleTimer, &QTimer::timeout, this, [this]() {
+        if (_interactive) {
+            _interactive = false;
+            scheduleRender();
+        }
     });
 
 
@@ -119,9 +156,20 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
 
 CAdaptiveVolumeViewer::~CAdaptiveVolumeViewer()
 {
+    // Wait for any async workers (render, intersection compute) that hold
+    // `this`. Dropping to member destruction while one is in flight causes
+    // SIGSEGV on exit — observed on Qt app shutdown after a warm-cache
+    // session. Simple spin is fine; the common case is counter==0 on entry.
+    while (_backgroundWorkers.load(std::memory_order_acquire) > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
     if (_chunkCbId != 0 && _volume && _volume->tieredCache()) {
         _volume->tieredCache()->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
+    }
+    if (_tickViewportSlot >= 0) {
+        vc::cache::TickCoordinator::releaseViewportSlotGlobal(_tickViewportSlot);
+        _tickViewportSlot = -1;
     }
 }
 
@@ -172,13 +220,18 @@ void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
         std::weak_ptr<Volume> volumeWeak = _volume;
         _chunkCbId = cache->addChunkReadyListener(
             [guard, volumeWeak](const vc::cache::ChunkKey&) {
+                // The pipeline's chunkArrivedFlag_ is edge-triggered via
+                // atomic exchange — this callback only fires when the flag
+                // flips false→true. Deferring the clear to submitRender (on
+                // the 16ms render timer) ensures every subsequent arrival in
+                // the same tick window finds the flag already set and takes
+                // the exchange=true/return-early branch — no listener fire,
+                // no cross-thread event post. One wake per 16ms tick max,
+                // instead of one per chunk burst.
                 QMetaObject::invokeMethod(qApp, [guard, volumeWeak]() {
                     if (!guard) return;
                     auto vol = volumeWeak.lock();
                     if (!vol || guard->_volume != vol) return;
-                    if (auto* c = vol->tieredCache()) {
-                        c->clearChunkArrivedFlag();
-                    }
                     guard->scheduleRender();
                 }, Qt::QueuedConnection);
             });
@@ -201,7 +254,7 @@ void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     if (_volume) {
         int nScales = static_cast<int>(_volume->numScales());
         std::vector<float> sfs(nScales);
-        for (int i = 0; i < nScales; i++) sfs[i] = _volume->levelScaleFactor(i);
+        for (int i = 0; i < nScales; i++) sfs[i] = static_cast<float>(size_t{1} << i);
         _camera.recalcPyramidLevel(nScales, sfs.data());
         double vs = _volume->voxelSize() / static_cast<double>(_camera.dsScale);
         _view->setVoxelSize(vs, vs);
@@ -361,8 +414,33 @@ void CAdaptiveVolumeViewer::scheduleRender()
 {
     syncCameraTransform();
     _renderPending = true;
-    if (!_renderTimer->isActive())
+    if (!_renderTimer->isActive()) {
+        // 16 ms (~60 fps) for crisp idle frames; 33 ms (~30 fps) while the
+        // user is actively panning/zooming. At progressive +1 pyramid the
+        // preview is already blurrier than a settled frame, so 30 fps
+        // matches what the eye perceives during motion and halves the
+        // render work the kernel has to do under load.
+        _renderTimer->setInterval(_interactive ? 33 : 16);
         _renderTimer->start();
+    }
+}
+
+// Toggle to re-enable progressive rendering during pan/zoom. The motion-
+// time resolution drop felt visually jarring in practice, so it's off by
+// default — but the plumbing (submitRender level bump, idle-timer catch-
+// up, 30 fps interactive coalesce) stays in place so it can be switched
+// back on with a single recompile.
+static constexpr bool kProgressiveRenderingEnabled = false;
+
+void CAdaptiveVolumeViewer::beginInteraction()
+{
+    // Called from any event path that represents live user motion (pan
+    // drag, zoom wheel). Marks _interactive so the next submitRender
+    // picks the progressive pyramid level, and arms the idle timer so a
+    // full-res render fires once motion stops.
+    if (!kProgressiveRenderingEnabled) return;
+    _interactive = true;
+    _interactionIdleTimer->start();
 }
 
 void CAdaptiveVolumeViewer::syncCameraTransform()
@@ -385,45 +463,175 @@ void CAdaptiveVolumeViewer::reloadPerfSettings()
     _highlightDownscaled = s.value("viewer_controls/highlight_downscaled", false).toBool();
 }
 
+void CAdaptiveVolumeViewer::recordRenderDuration(double seconds)
+{
+    if (seconds <= 0.0) return;
+    _renderDurationsSec[_renderDurationHead] = seconds;
+    _renderDurationHead = (_renderDurationHead + 1) % kFpsRingSize;
+    if (_renderDurationCount < kFpsRingSize) ++_renderDurationCount;
+}
+
+float CAdaptiveVolumeViewer::measuredFps() const
+{
+    if (_renderDurationCount == 0) return 0.0f;
+    double sum = 0.0;
+    for (int i = 0; i < _renderDurationCount; ++i) sum += _renderDurationsSec[i];
+    const double avg = sum / double(_renderDurationCount);
+    if (avg <= 1e-6) return 0.0f;
+    return float(1.0 / avg);
+}
+
 void CAdaptiveVolumeViewer::submitRender()
 {
-    const CompositeParams& lightP = _compositeSettings.params;
-    const bool rakingEnabled = _compositeSettings.postRakingEnabled;
-    const float rakingAz = _compositeSettings.postRakingAzimuth;
-    const float rakingEl = _compositeSettings.postRakingElevation;
-    const float rakingStrength = std::clamp(_compositeSettings.postRakingStrength, 0.0f, 1.0f);
-    const float rakingDepth = std::max(0.01f, _compositeSettings.postRakingDepthScale);
+    // Re-arm the chunk-arrival edge detector for the next tick window.
+    // Any chunk that decodes during this render will set the flag again and
+    // fire exactly one post-event to trigger the next render. See the
+    // addChunkReadyListener callback above for why the clear lives here.
+    if (_volume) {
+        if (auto* c = _volume->tieredCache()) c->clearChunkArrivedFlag();
+    }
+
+    // Quick main-thread checks before dispatch. The worker can't check
+    // these safely — the shared_ptr from weak_ptr::lock() and the volume
+    // pointers need main-thread-stable reads.
+    auto surf = _surfWeak.lock();
+    if (!surf || !_volume || !_volume->zarrDataset()) return;
+    const int fbW = _framebuffer.width();
+    const int fbH = _framebuffer.height();
+    if (fbW <= 0 || fbH <= 0) return;
+
+    // Serialise: if a worker is already rendering, just note that another
+    // frame is pending. finishRenderOnMainThread() will reschedule once
+    // the in-flight worker commits. Must precede any _framebufferWork
+    // mutation — reassigning the QImage while the worker is writing to it
+    // would corrupt both the new and in-flight frames.
+    if (_renderWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
+        _renderPendingAfterWorker = true;
+        return;
+    }
+
+    // Now that we own the busy gate, it's safe to resize the work buffer
+    // — no worker is touching it. create() / assignment only happen on
+    // size/format change.
+    if (_framebufferWork.isNull() || _framebufferWork.width() != fbW
+        || _framebufferWork.height() != fbH
+        || _framebufferWork.format() != _framebuffer.format()) {
+        _framebufferWork = QImage(fbW, fbH, _framebuffer.format());
+    }
+    _renderT0 = std::chrono::steady_clock::now();
+
+    // Snapshot everything the worker will read that main-thread setters
+    // can write. Done under the busy gate so settings setters queue
+    // behind us on the event loop — the snapshot always reflects a
+    // self-consistent frame of state rather than a torn mid-setter view.
+    // Tick coordinator slot is also allocated here on main (avoids a
+    // teardown race with the destructor) before we publish inside the
+    // worker.
+    if (_tickViewportSlot < 0) {
+        _tickViewportSlot = vc::cache::TickCoordinator::acquireViewportSlotGlobal();
+    }
+    RenderContext ctx;
+    ctx.camera = _camera;
+    ctx.compositeSettings = _compositeSettings;
+    ctx.samplingMethod = _samplingMethod;
+    ctx.interactive = _interactive;
+    ctx.windowLow = _windowLow;
+    ctx.windowHigh = _windowHigh;
+    ctx.baseColormapId = _baseColormapId;
+    ctx.highlightDownscaled = _highlightDownscaled;
+    ctx.zOffWorldDir = _zOffWorldDir;
+    ctx.surf = std::move(surf);
+    ctx.volume = _volume;
+
+    // Dispatch the whole render body to QThreadPool. The main thread
+    // returns immediately — Qt input events are no longer stalled behind
+    // the tile sample loop, the CLAHE pass, or the stretch scan.
+    _backgroundWorkers.fetch_add(1, std::memory_order_acq_rel);
+    QThreadPool::globalInstance()->start([this, ctx = std::move(ctx)]() {
+        try {
+            renderIntoFramebuffer(_framebufferWork, ctx);
+        } catch (...) {
+            // Swallow render errors here; finishRenderOnMainThread still
+            // fires so the busy flag gets cleared and we don't deadlock
+            // the render timer.
+        }
+        QMetaObject::invokeMethod(this,
+            "finishRenderOnMainThread", Qt::QueuedConnection);
+        // Decrement last — the destructor spins on this reaching 0, so
+        // all `this` access (including the invokeMethod post above) must
+        // happen before we signal "worker done".
+        _backgroundWorkers.fetch_sub(1, std::memory_order_release);
+    });
+}
+
+void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
+                                                   const RenderContext& ctx)
+{
+    // All reads of mutable viewer state go through `ctx` — `_camera`,
+    // `_compositeSettings`, `_windowLow`, `_baseColormapId`,
+    // `_highlightDownscaled`, `_samplingMethod`, `_interactive`,
+    // `_zOffWorldDir`, `_surfWeak`, `_volume` are all mutated by main-
+    // thread handlers and must not be touched from this worker thread.
+    // Per-render scratch caches (_genCoords, _cachedLut, _claheCache,
+    // etc.) are only touched here and are serialised by the
+    // _renderWorkerBusy gate so they remain safe without the snapshot.
+    const CompositeParams& lightP = ctx.compositeSettings.params;
+    const bool rakingEnabled = ctx.compositeSettings.postRakingEnabled;
+    const float rakingAz = ctx.compositeSettings.postRakingAzimuth;
+    const float rakingEl = ctx.compositeSettings.postRakingElevation;
+    const float rakingStrength = std::clamp(ctx.compositeSettings.postRakingStrength, 0.0f, 1.0f);
+    const float rakingDepth = std::max(0.01f, ctx.compositeSettings.postRakingDepthScale);
 
     // Debug overlay: paint a per-pixel gradient based on fallback-level depth.
     // Cached in reloadPerfSettings() instead of re-read from disk each frame.
-    const bool highlightDownscaled = _highlightDownscaled;
+    const bool highlightDownscaled = ctx.highlightDownscaled;
 
-    auto surf = _surfWeak.lock();
-    if (!surf || !_volume || !_volume->zarrDataset()) return;
+    const auto& surf = ctx.surf;
+    if (!surf || !ctx.volume || !ctx.volume->zarrDataset()) return;
 
-    int fbW = _framebuffer.width();
-    int fbH = _framebuffer.height();
+    // fb size was validated on main thread before dispatch.
+    const int fbW = fb.width();
+    const int fbH = fb.height();
     if (fbW <= 0 || fbH <= 0) return;
 
-    // Always populate the level buffer — the debug overlay is optional, but
-    // we need the per-pixel fallback depth to enqueue the missing high-res
-    // chunks below regardless of whether the overlay is shown.
-    if (_levelBuffer.rows != fbH || _levelBuffer.cols != fbW) {
-        _levelBuffer.create(fbH, fbW);
+    // Publish viewport snapshot for the tick coordinator. Used by
+    // prefetch coalescing (so the tick drain knows which pipelines/levels
+    // are in use) and future slice scoping. Slot allocation itself moved
+    // to submitRender (main thread) so the destructor's release doesn't
+    // race with a lazy-allocation here.
+    if (_tickViewportSlot >= 0) {
+        vc::cache::ViewportSnapshot vs;
+        vs.active = true;
+        vs.level = ctx.camera.dsScaleIdx;
+        vs.pipeline = ctx.volume->tieredCache();
+        vc::cache::TickCoordinator::publishViewportGlobal(_tickViewportSlot, vs);
     }
-    _levelBuffer.setTo(0);
-    uint8_t* lvlOutPtr = _levelBuffer.ptr<uint8_t>(0);
-    const int lvlOutStride = int(_levelBuffer.step1());
 
-    auto* fbBits = reinterpret_cast<uint32_t*>(_framebuffer.bits());
-    int fbStride = _framebuffer.bytesPerLine() / 4;
+    // Level buffer is only consumed by the downscale-highlight debug
+    // overlay below; when the overlay is off, pass a null pointer to the
+    // kernel so it skips per-pixel level writes entirely, and skip the
+    // full-framebuffer setTo(0) memset here. At 1080p that memset is
+    // ~8 MB/frame of unnecessary bandwidth.
+    uint8_t* lvlOutPtr = nullptr;
+    int lvlOutStride = 0;
+    if (highlightDownscaled) {
+        if (_levelBuffer.rows != fbH || _levelBuffer.cols != fbW) {
+            _levelBuffer.create(fbH, fbW);
+        }
+        _levelBuffer.setTo(0);
+        lvlOutPtr = _levelBuffer.ptr<uint8_t>(0);
+        lvlOutStride = int(_levelBuffer.step1());
+    }
+
+    auto* fbBits = reinterpret_cast<uint32_t*>(fb.bits());
+    int fbStride = fb.bytesPerLine() / 4;
 
     // Build the render LUT. For stretch mode we use last frame's min/max
     // so the render is a single pass; we refresh the cached range by
     // scanning the framebuffer after. A camera change invalidates the
     // cache and forces a 2-pass on the first frame after motion.
-    const bool stretch = _compositeSettings.postStretchValues;
-    const uint8_t isoCutoff = _compositeSettings.params.isoCutoff;
+    const bool stretch = ctx.compositeSettings.postStretchValues;
+    const uint8_t isoCutoff = ctx.compositeSettings.params.isoCutoff;
     auto applyIsoCutoff = [&](std::array<uint32_t, 256>& l, uint8_t cutoff) {
         if (cutoff == 0) return;
         const uint32_t zero = l[0];
@@ -434,10 +642,10 @@ void CAdaptiveVolumeViewer::submitRender()
     const bool stretchFirstPass = stretch && !_cachedStretchValid;
     // CLAHE and raking both operate on gray, so the colormap is deferred
     // until after those passes. The sampling LUT in that case is gray-only.
-    const bool postGrayDomain = _compositeSettings.postClaheEnabled || rakingEnabled;
-    const bool deferColormap = postGrayDomain && !_baseColormapId.empty();
-    const std::string& sampleColormapId = deferColormap
-        ? std::string() : _baseColormapId;
+    const bool postGrayDomain = ctx.compositeSettings.postClaheEnabled || rakingEnabled;
+    const bool deferColormap = postGrayDomain && !ctx.baseColormapId.empty();
+    const std::string sampleColormapId = deferColormap
+        ? std::string() : ctx.baseColormapId;
     if (stretchFirstPass) {
         // Identity gray LUT so we can extract the raw sample after sampling.
         for (int i = 0; i < 256; i++) {
@@ -445,8 +653,8 @@ void CAdaptiveVolumeViewer::submitRender()
             lut[i] = 0xFF000000u | (v << 16) | (v << 8) | v;
         }
     } else {
-        float wlo = stretch ? float(_cachedStretchLo) : _windowLow;
-        float whi = stretch ? float(_cachedStretchHi) : _windowHigh;
+        float wlo = stretch ? float(_cachedStretchLo) : ctx.windowLow;
+        float whi = stretch ? float(_cachedStretchHi) : ctx.windowHigh;
         // Reuse previous LUT if the inputs haven't changed.
         if (_cachedWindowLow == wlo && _cachedWindowHigh == whi
             && _cachedColormapId == sampleColormapId
@@ -464,41 +672,48 @@ void CAdaptiveVolumeViewer::submitRender()
     }
 
     vc::SampleParams sp;
-    const int numLevels = static_cast<int>(_volume->numScales());
-    if (numLevels <= 0) return;  // broken/empty volume — nothing to render
+    const int numLevels = static_cast<int>(ctx.volume->numScales());
     // Always render at the user-requested level. The sampler's per-pixel
     // adaptive fallback handles regions that aren't ready yet by dropping
     // those pixels to whichever coarser level is resident — no whole-frame
     // resolution cycling, and cached fine chunks are used immediately.
-    sp.level = std::clamp(_camera.dsScaleIdx, 0, numLevels - 1);
-    sp.method = _samplingMethod;
+    sp.level = ctx.camera.dsScaleIdx;
+    // During live interaction (pan drag, zoom wheel) bump the pyramid
+    // level one step coarser. Each step halves the voxels read per
+    // sample, which cuts the ray-march cost ~2-4x for a still-coherent
+    // preview frame. The interaction-idle timer triggers a full-res
+    // render ~180 ms after motion stops.
+    if (ctx.interactive) {
+        sp.level = std::min(sp.level + 1, std::max(0, numLevels - 1));
+    }
+    sp.method = ctx.samplingMethod;
 
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
         cv::Vec3f vx = plane->basisX();
         cv::Vec3f vy = plane->basisY();
         cv::Vec3f n = plane->normal(cv::Vec3f(0, 0, 0));
 
-        float halfW = static_cast<float>(fbW) * 0.5f / _camera.scale;
-        float halfH = static_cast<float>(fbH) * 0.5f / _camera.scale;
+        float halfW = static_cast<float>(fbW) * 0.5f / ctx.camera.scale;
+        float halfH = static_cast<float>(fbH) * 0.5f / ctx.camera.scale;
 
-        cv::Vec3f origin = vx * (_camera.surfacePtr[0] - halfW)
-                         + vy * (_camera.surfacePtr[1] - halfH)
-                         + plane->origin() + n * _camera.zOff;
-        cv::Vec3f vx_step = vx / _camera.scale;
-        cv::Vec3f vy_step = vy / _camera.scale;
+        cv::Vec3f origin = vx * (ctx.camera.surfacePtr[0] - halfW)
+                         + vy * (ctx.camera.surfacePtr[1] - halfH)
+                         + plane->origin() + n * ctx.camera.zOff;
+        cv::Vec3f vx_step = vx / ctx.camera.scale;
+        cv::Vec3f vy_step = vy / ctx.camera.scale;
 
         int numLayers = 1, zStart = 0;
         float zStep = 1.0f;
         const cv::Vec3f* pNormal = nullptr;
         std::string method;
-        if (_compositeSettings.planeEnabled) {
-            const int front = _compositeSettings.planeLayersFront;
-            const int behind = _compositeSettings.planeLayersBehind;
+        if (ctx.compositeSettings.planeEnabled) {
+            const int front = ctx.compositeSettings.planeLayersFront;
+            const int behind = ctx.compositeSettings.planeLayersBehind;
             numLayers = front + behind + 1;
             zStart = -behind;
-            zStep = _compositeSettings.reverseDirection ? -1.0f : 1.0f;
+            zStep = ctx.compositeSettings.reverseDirection ? -1.0f : 1.0f;
             pNormal = &n;
-            method = _compositeSettings.params.method;
+            method = ctx.compositeSettings.params.method;
         } else {
             pNormal = &n; // ignored for numLayers=1
         }
@@ -506,9 +721,9 @@ void CAdaptiveVolumeViewer::submitRender()
         // Composite averages ~11 layers — the averaging is itself a low-pass,
         // so per-layer Nearest matches Trilinear visually at ~8x the speed.
         vc::Sampling sampleMethod = (numLayers > 1) ? vc::Sampling::Nearest
-                                                    : _samplingMethod;
+                                                    : ctx.samplingMethod;
         sampleAdaptiveARGB32(
-            fbBits, fbStride, _volume->tieredCache(),
+            fbBits, fbStride, ctx.volume->tieredCache(),
             sp.level, numLevels,
             nullptr, &origin, &vx_step, &vy_step,
             nullptr, pNormal,
@@ -526,10 +741,14 @@ void CAdaptiveVolumeViewer::submitRender()
         // zoom expose curvature drift on a non-planar surface. Instead build
         // the base (unoffset) coords here and apply zOff as a single rigid
         // world-space translation in _zOffWorldDir below.
-        cv::Vec3f offset(_camera.surfacePtr[0] * _camera.scale - float(fbW) * 0.5f,
-                         _camera.surfacePtr[1] * _camera.scale - float(fbH) * 0.5f,
+        cv::Vec3f offset(ctx.camera.surfacePtr[0] * ctx.camera.scale - float(fbW) * 0.5f,
+                         ctx.camera.surfacePtr[1] * ctx.camera.scale - float(fbH) * 0.5f,
                          0.0f);
-        const bool wantComposite = _compositeSettings.enabled;
+        const bool wantComposite = ctx.compositeSettings.enabled;
+        // Use the snapshot of _zOffWorldDir taken on the main thread.
+        // Updates discovered here are posted back to main via
+        // invokeMethod (see below) so the write never crosses threads.
+        cv::Vec3f zOffWorldDir = ctx.zOffWorldDir;
         // Always request normals so shift+scroll can sample the view-center
         // normal without a separate gen pass.
         const bool cacheHit =
@@ -537,23 +756,23 @@ void CAdaptiveVolumeViewer::submitRender()
             && _genCacheSurfKey == surf.get()
             && _genCacheFbW == fbW
             && _genCacheFbH == fbH
-            && _genCacheScale == _camera.scale
+            && _genCacheScale == ctx.camera.scale
             && _genCacheOffset == offset
             && _genCacheWantComposite == wantComposite
-            && _genCacheZOff == _camera.zOff
-            && _genCacheZOffDir == _zOffWorldDir
+            && _genCacheZOff == ctx.camera.zOff
+            && _genCacheZOffDir == zOffWorldDir
             && !_genCoords.empty();
         if (!cacheHit) {
             surf->gen(&_genCoords, &_genNormals,
                       cv::Size(fbW, fbH), cv::Vec3f(0, 0, 0),
-                      _camera.scale, offset);
+                      ctx.camera.scale, offset);
             // Lazy-capture the translation direction when zOff was set by a
             // path that didn't populate _zOffWorldDir (adjustSurfaceOffset
             // via Ctrl+./Ctrl+, shortcuts, or any other non-Shift-scroll
             // source). Without this, those offsets would be silent no-ops
             // until the user first Shift-scrolled.
-            if (_camera.zOff != 0.0f &&
-                _zOffWorldDir[0] == 0.0f && _zOffWorldDir[1] == 0.0f && _zOffWorldDir[2] == 0.0f &&
+            if (ctx.camera.zOff != 0.0f &&
+                zOffWorldDir[0] == 0.0f && zOffWorldDir[1] == 0.0f && zOffWorldDir[2] == 0.0f &&
                 !_genNormals.empty()) {
                 const int cy = _genNormals.rows / 2;
                 const int cx = _genNormals.cols / 2;
@@ -561,17 +780,30 @@ void CAdaptiveVolumeViewer::submitRender()
                 if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2])) {
                     const float len = static_cast<float>(cv::norm(n));
                     if (len > 1e-6f) {
-                        _zOffWorldDir = n / len;
+                        zOffWorldDir = n / len;
+                        // Publish the discovered direction back to main so
+                        // subsequent renders (and onZoom's own capture
+                        // branch) see it. Guarded "still-zero" check on
+                        // main avoids stomping a user-driven update that
+                        // raced with this worker.
+                        cv::Vec3f dir = zOffWorldDir;
+                        QMetaObject::invokeMethod(this, [this, dir]() {
+                            if (_zOffWorldDir[0] == 0.0f
+                             && _zOffWorldDir[1] == 0.0f
+                             && _zOffWorldDir[2] == 0.0f) {
+                                _zOffWorldDir = dir;
+                            }
+                        }, Qt::QueuedConnection);
                     }
                 }
             }
             // Apply z-offset as a rigid world-space translation using the
             // cached direction. On cache hits _genCoords is already shifted
             // — avoid double-applying by only running this on cache miss.
-            if (_camera.zOff != 0.0f &&
-                (_zOffWorldDir[0] != 0.0f || _zOffWorldDir[1] != 0.0f || _zOffWorldDir[2] != 0.0f) &&
+            if (ctx.camera.zOff != 0.0f &&
+                (zOffWorldDir[0] != 0.0f || zOffWorldDir[1] != 0.0f || zOffWorldDir[2] != 0.0f) &&
                 !_genCoords.empty()) {
-                const cv::Vec3f tr = _zOffWorldDir * _camera.zOff;
+                const cv::Vec3f tr = zOffWorldDir * ctx.camera.zOff;
                 const int rows = _genCoords.rows;
                 const int cols = _genCoords.cols;
                 for (int y = 0; y < rows; ++y) {
@@ -587,11 +819,11 @@ void CAdaptiveVolumeViewer::submitRender()
             _genCacheSurfKey = surf.get();
             _genCacheFbW = fbW;
             _genCacheFbH = fbH;
-            _genCacheScale = _camera.scale;
+            _genCacheScale = ctx.camera.scale;
             _genCacheOffset = offset;
             _genCacheWantComposite = wantComposite;
-            _genCacheZOff = _camera.zOff;
-            _genCacheZOffDir = _zOffWorldDir;
+            _genCacheZOff = ctx.camera.zOff;
+            _genCacheZOffDir = zOffWorldDir;
             _genCacheDirty = false;
         }
         cv::Mat_<cv::Vec3f>& coords = _genCoords;
@@ -603,25 +835,30 @@ void CAdaptiveVolumeViewer::submitRender()
             const cv::Mat_<cv::Vec3f>* pNormals = nullptr;
             std::string method;
             if (wantComposite && !normals.empty()) {
-                const int front = _compositeSettings.layersFront;
-                const int behind = _compositeSettings.layersBehind;
+                const int front = ctx.compositeSettings.layersFront;
+                const int behind = ctx.compositeSettings.layersBehind;
                 numLayers = front + behind + 1;
                 zStart = -behind;
-                zStep = _compositeSettings.reverseDirection ? -1.0f : 1.0f;
+                zStep = ctx.compositeSettings.reverseDirection ? -1.0f : 1.0f;
                 pNormals = &normals;
-                method = _compositeSettings.params.method;
+                method = ctx.compositeSettings.params.method;
             }
             vc::Sampling sampleMethod = (numLayers > 1) ? vc::Sampling::Nearest
-                                                        : _samplingMethod;
+                                                        : ctx.samplingMethod;
             sampleAdaptiveARGB32(
-                fbBits, fbStride, _volume->tieredCache(),
+                fbBits, fbStride, ctx.volume->tieredCache(),
                 sp.level, numLevels,
                 &coords, nullptr, nullptr, nullptr,
                 pNormals, nullptr,
                 numLayers, zStart, zStep,
                 fbW, fbH, method, lut.data(), sampleMethod,
-            &lightP,  // sampler uses lightP for volumetric and lighting paths
-            lvlOutPtr, lvlOutStride);
+                &lightP,  // sampler uses lightP for volumetric and lighting paths
+                lvlOutPtr, lvlOutStride,
+                // Coords cached → prior frame already did the chunk
+                // enumeration + fetchInteractive for this exact geometry.
+                // The per-sample adaptive-fallback path still handles any
+                // block not yet resident, so correctness is preserved.
+                cacheHit);
         }
     }
 
@@ -665,10 +902,10 @@ void CAdaptiveVolumeViewer::submitRender()
             std::array<uint32_t, 256> stretchedLut;
             if (hi > lo) {
                 vc::buildWindowLevelColormapLut(stretchedLut,
-                    float(lo), float(hi), _baseColormapId);
+                    float(lo), float(hi), ctx.baseColormapId);
             } else {
                 vc::buildWindowLevelColormapLut(stretchedLut,
-                    _windowLow, _windowHigh, _baseColormapId);
+                    ctx.windowLow, ctx.windowHigh, ctx.baseColormapId);
             }
             applyIsoCutoff(stretchedLut, isoCutoff);
             for (int y = 0; y < fbH; y++) {
@@ -681,7 +918,7 @@ void CAdaptiveVolumeViewer::submitRender()
             _cachedLut = stretchedLut;
             _cachedWindowLow = float(lo);
             _cachedWindowHigh = float(hi);
-            _cachedColormapId = _baseColormapId;
+            _cachedColormapId = ctx.baseColormapId;
             _cachedIsoCutoff = isoCutoff;
         }
         if (hi > lo) {
@@ -702,9 +939,9 @@ void CAdaptiveVolumeViewer::submitRender()
             uint8_t* dst = gray.ptr<uint8_t>(y);
             for (int x = 0; x < fbW; x++) dst[x] = uint8_t(row[x] & 0xFFu);
         }
-        if (_compositeSettings.postClaheEnabled) {
-            const int tile = std::max(1, _compositeSettings.postClaheTileSize);
-            const double clip = std::max(0.01, double(_compositeSettings.postClaheClipLimit));
+        if (ctx.compositeSettings.postClaheEnabled) {
+            const int tile = std::max(1, ctx.compositeSettings.postClaheTileSize);
+            const double clip = std::max(0.01, double(ctx.compositeSettings.postClaheClipLimit));
             // Cache the CLAHE instance: it allocates internal histogram
             // buffers on construction. Rebuild only when the parameters
             // actually change.
@@ -768,9 +1005,9 @@ void CAdaptiveVolumeViewer::submitRender()
             // Cache the built LUT: the identity-window LUT depends only on
             // _baseColormapId, so we rebuild only when the colormap actually
             // changes instead of once per frame.
-            if (!_deferredCmapValid || _deferredCmapId != _baseColormapId) {
-                vc::buildWindowLevelColormapLut(_deferredCmapLut, 0.0f, 255.0f, _baseColormapId);
-                _deferredCmapId = _baseColormapId;
+            if (!_deferredCmapValid || _deferredCmapId != ctx.baseColormapId) {
+                vc::buildWindowLevelColormapLut(_deferredCmapLut, 0.0f, 255.0f, ctx.baseColormapId);
+                _deferredCmapId = ctx.baseColormapId;
                 _deferredCmapValid = true;
             }
             const auto& cmapLut = _deferredCmapLut;
@@ -830,17 +1067,47 @@ void CAdaptiveVolumeViewer::submitRender()
         }
     }
 
-    // Update camera tracking for coordinate conversions
-    syncCameraTransform();
+}
 
+void CAdaptiveVolumeViewer::finishRenderOnMainThread()
+{
+    // Guard against a mid-render resize: onResized() may have
+    // reallocated _framebuffer to a new viewport size while the worker
+    // was still writing to the work buffer at the old size. Swapping
+    // unconditionally would clobber the correctly-sized _framebuffer
+    // with a stale-sized image and leave the view drawing from the
+    // wrong size every frame after. Drop the stale render on the floor
+    // instead and re-schedule.
+    const bool sizesMatch = (_framebuffer.size() == _framebufferWork.size());
+    if (sizesMatch) {
+        std::swap(_framebuffer, _framebufferWork);
+    }
+
+    // Main-thread-only tail. syncCameraTransform writes Qt view state,
+    // updateFocusMarker / renderIntersections / overlaysUpdated all touch
+    // the scene graph, viewport()->update schedules a paint event.
+    syncCameraTransform();
     updateFocusMarker();
     renderIntersections();
     emit overlaysUpdated();
-    // update() schedules a deferred repaint via the event loop; repaint()
-    // blocks the UI thread synchronously until paintEvent returns, which
-    // stalls every frame during pans/zooms.
     _view->viewport()->update();
+
+    const auto renderDt = std::chrono::steady_clock::now() - _renderT0;
+    recordRenderDuration(std::chrono::duration<double>(renderDt).count());
     updateStatusLabel();
+
+    _renderWorkerBusy.store(false, std::memory_order_release);
+    // Re-schedule if a pending frame was queued OR if we discarded a
+    // stale-sized frame above — either way we owe the view a current
+    // render.
+    if (_renderPendingAfterWorker || !sizesMatch) {
+        _renderPendingAfterWorker = false;
+        // Queue the next frame on the render timer instead of calling
+        // submitRender recursively — keeps the dispatch on the Qt event
+        // loop and lets any batched setters that fired while the worker
+        // ran settle into state before we read it.
+        scheduleRender();
+    }
 }
 
 void CAdaptiveVolumeViewer::renderVisible(bool force)
@@ -916,6 +1183,7 @@ void CAdaptiveVolumeViewer::panByF(float dx, float dy)
     }
 
     _cachedStretchValid = false;
+    beginInteraction();
     scheduleRender();
     emit overlaysUpdated();
 }
@@ -949,7 +1217,7 @@ void CAdaptiveVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
         float oldDs = _camera.dsScale;
         int ns = static_cast<int>(_volume->numScales());
         std::vector<float> sfs(ns);
-        for (int i = 0; i < ns; i++) sfs[i] = _volume->levelScaleFactor(i);
+        for (int i = 0; i < ns; i++) sfs[i] = static_cast<float>(size_t{1} << i);
         _camera.recalcPyramidLevel(ns, sfs.data());
         if (std::abs(_camera.dsScale - oldDs) > 1e-6f) {
             double vs = _volume->voxelSize() / static_cast<double>(_camera.dsScale);
@@ -973,6 +1241,7 @@ void CAdaptiveVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     // Zoom can fire as fast as the keyboard repeats. scheduleRender()
     // coalesces bursts into the 60 fps render timer so we don't render
     // dozens of intermediate frames the user never sees.
+    beginInteraction();
     scheduleRender();
     emit overlaysUpdated();
 }
@@ -1048,6 +1317,7 @@ void CAdaptiveVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMo
                 }
             }
             _camera.zOff = std::clamp(_camera.zOff + dz, -maxZ, maxZ);
+            beginInteraction();
             scheduleRender();
             updateStatusLabel();
         }
@@ -1313,6 +1583,19 @@ void CAdaptiveVolumeViewer::invalidateIntersect(const std::string&)
 
 void CAdaptiveVolumeViewer::renderIntersections()
 {
+    // Coalesce rapid-fire UI setters (opacity / thickness / surface-
+    // change / slider drags) into one rtree + triangle-clip pass per
+    // render tick. The _renderTimer callback drains this flag at the
+    // same 16 ms boundary it kicks submitRender() on, so we reuse the
+    // existing tick instead of running a second timer.
+    _intersectionsDirty = true;
+    if (_renderTimer && !_renderTimer->isActive()) {
+        _renderTimer->start();
+    }
+}
+
+void CAdaptiveVolumeViewer::renderIntersectionsNow()
+{
     auto surf = _surfWeak.lock();
     if (!surf || !_state || !_viewerManager || !_scene || !_view) {
         invalidateIntersect();
@@ -1414,50 +1697,59 @@ void CAdaptiveVolumeViewer::renderIntersections()
     if (_lastIntersectFp == fp && !_intersectionItems.empty()) {
         return;
     }
+
+    // Serialise: one plane-intersection worker at a time. If another is
+    // still running, remember dirty and let the next render tick restart
+    // us. Don't clear the scene items here — leave the old overlay
+    // visible rather than blanking while we recompute.
+    if (_planeWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
+        _intersectionsDirty = true;
+        _lastIntersectFp = {};
+        return;
+    }
     invalidateIntersect();
     _lastIntersectFp = fp;
 
-    auto intersections = patchIndex->computePlaneIntersections(*plane, planeRoi, targets);
-    if (intersections.empty()) { /* kept cleared by invalidate above */ return; }
-
-    // Group path segments by draw style for batched drawing. Active
-    // segmentation gets its own z so it always renders above other
-    // intersection overlays.
-    std::unordered_map<IntersectionStyle, QPainterPath, IntersectionStyleHash> groupedPaths;
-    std::unordered_map<IntersectionStyle, QColor, IntersectionStyleHash> groupedColors;
-    // Bitwise finite check: matches repo convention (see feedback_ffast_math).
-    // Finite iff exponent bits are not all 1s.
-    auto isFiniteScalar = [](double v) {
-        uint64_t bits;
-        std::memcpy(&bits, &v, sizeof(bits));
-        return (bits & 0x7FF0000000000000ULL) != 0x7FF0000000000000ULL;
+    // Snapshot camera state for the worker's plane-to-scene projections.
+    struct PlaneCamSnapshot {
+        float camSurfX, camSurfY, camScale;
+        float vpCx, vpCy;
+        QTransform viewToScene;
     };
-    auto isFinitePoint = [&](const QPointF& p) {
-        return isFiniteScalar(p.x()) && isFiniteScalar(p.y());
-    };
-    // volumeToScene() locks _surfWeak and dynamic_casts on every call. We
-    // already have `plane` cached from the top of this function, so inline
-    // the projection once per segment endpoint here.
-    auto planeToScene = [&](const cv::Vec3f& volPoint) {
-        cv::Vec3f proj = plane->project(volPoint, 1.0, 1.0);
-        return surfaceToScene(proj[0], proj[1]);
+    PlaneCamSnapshot cam{
+        _camSurfX, _camSurfY, _camScale,
+        static_cast<float>(_framebuffer.width()) * 0.5f,
+        static_cast<float>(_framebuffer.height()) * 0.5f,
+        _view ? _view->transform().inverted() : QTransform(),
     };
 
-    for (const auto& [target, segments] : intersections) {
-        if (!target || segments.empty()) continue;
-
-        QColor baseColor;
-        int zValue = kIntersectionZ;
+    // Pre-resolve per-target styling on the main thread — it reads
+    // _surfaceColorAssignments / _nextColorIndex and touches the palette
+    // LUT, all of which we want to keep single-threaded. The worker's
+    // output is a flat list of styled segments; the scene rebuild then
+    // groups them by style into QPainterPaths.
+    struct TargetStyle {
+        QColor color;
+        int z;
+        float penWidth;
+    };
+    std::unordered_map<const void*, TargetStyle> targetStyles;
+    targetStyles.reserve(targets.size());
+    for (const auto& target : targets) {
+        if (!target) continue;
+        TargetStyle ts;
+        ts.z = kIntersectionZ;
         float opacity = _intersectionOpacity;
-        float penWidth = _intersectionThickness;
+        ts.penWidth = _intersectionThickness;
+        QColor baseColor;
         if (target == activeSeg) {
             baseColor = activeSegmentationColorForView(_surfName);
-            zValue = kActiveIntersectionZ;
+            ts.z = kActiveIntersectionZ;
             opacity *= kActiveIntersectionOpacityScale;
-            penWidth = activeSegmentationIntersectionWidth(penWidth);
+            ts.penWidth = activeSegmentationIntersectionWidth(ts.penWidth);
         } else if (_highlightedSurfaceIds.count(target->id)) {
             baseColor = QColor(0, 220, 255);
-            zValue = kHighlightedIntersectionZ;
+            ts.z = kHighlightedIntersectionZ;
         } else {
             const auto& id = target->id;
             auto it = _surfaceColorAssignments.find(id);
@@ -1473,41 +1765,103 @@ void CAdaptiveVolumeViewer::renderIntersections()
             baseColor = QColor::fromRgba(kIntersectionPalette[idx % kIntersectionPalette.size()]);
         }
         baseColor.setAlphaF(std::clamp(opacity, 0.0f, 1.0f));
-        if (baseColor.alpha() <= 0) continue;
+        ts.color = baseColor;
+        targetStyles.emplace(target.get(), ts);
+    }
 
-        for (const auto& seg : segments) {
-            QPointF a = planeToScene(seg.world[0]);
-            QPointF b = planeToScene(seg.world[1]);
-            if (!isFinitePoint(a) || !isFinitePoint(b)) continue;
-            const IntersectionStyle style{
-                baseColor.rgba(),
-                zValue,
-                int(std::lround(std::max(0.0f, penWidth) * 1000.0f)),
+    // Capture the plane by shared_ptr (reuse via _state is fine — shared
+    // ownership keeps it alive across the worker). patchIndex is owned by
+    // ViewerManager (app-lifetime).
+    auto planeSp = std::dynamic_pointer_cast<PlaneSurface>(
+        _state->surface(_surfName));
+    if (!planeSp) {
+        _planeWorkerBusy.store(false, std::memory_order_release);
+        return;
+    }
+
+    _backgroundWorkers.fetch_add(1, std::memory_order_acq_rel);
+    QThreadPool::globalInstance()->start(
+        [this, fp, planeSp, planeRoi, targets = std::move(targets),
+         targetStyles = std::move(targetStyles), cam, patchIndex]() mutable {
+            auto isFiniteScalar = [](double v) {
+                uint64_t bits;
+                std::memcpy(&bits, &v, sizeof(bits));
+                return (bits & 0x7FF0000000000000ULL) != 0x7FF0000000000000ULL;
             };
-            QPainterPath& path = groupedPaths[style];
-            path.moveTo(a);
-            path.lineTo(b);
-            groupedColors[style] = baseColor;
-        }
-    }
+            auto surfToScene = [&](float sx, float sy) -> QPointF {
+                const qreal vx = (sx - cam.camSurfX) * cam.camScale + cam.vpCx;
+                const qreal vy = (sy - cam.camSurfY) * cam.camScale + cam.vpCy;
+                return cam.viewToScene.map(QPointF(vx, vy));
+            };
+            auto planeToScene = [&](const cv::Vec3f& volPoint) {
+                cv::Vec3f proj = planeSp->project(volPoint, 1.0, 1.0);
+                return surfToScene(proj[0], proj[1]);
+            };
 
-    _intersectionItems.reserve(groupedPaths.size());
-    for (const auto& [style, path] : groupedPaths) {
-        if (path.isEmpty()) continue;
-        auto* item = new QGraphicsPathItem(path);
-        QPen pen(groupedColors[style]);
-        pen.setWidthF(static_cast<qreal>(style.widthQ) / 1000.0);
-        pen.setCapStyle(Qt::RoundCap);
-        pen.setJoinStyle(Qt::RoundJoin);
-        pen.setCosmetic(true);
-        item->setPen(pen);
-        item->setBrush(Qt::NoBrush);
-        item->setZValue(style.z);
-        _scene->addItem(item);
-        _intersectionItems.push_back(item);
-    }
+            // Heavy compute: rtree walk + per-patch triangle clip.
+            auto intersections = patchIndex->computePlaneIntersections(
+                *planeSp, planeRoi, targets);
 
-    _view->viewport()->update();
+            // Group by draw style — same output shape the main-thread apply
+            // step needs for batched QGraphicsPathItem creation.
+            std::unordered_map<IntersectionStyle, QPainterPath,
+                               IntersectionStyleHash> groupedPaths;
+            std::unordered_map<IntersectionStyle, QColor,
+                               IntersectionStyleHash> groupedColors;
+            for (const auto& [target, segments] : intersections) {
+                if (!target || segments.empty()) continue;
+                auto it = targetStyles.find(target.get());
+                if (it == targetStyles.end()) continue;
+                const auto& ts = it->second;
+                if (ts.color.alpha() <= 0) continue;
+                for (const auto& seg : segments) {
+                    QPointF a = planeToScene(seg.world[0]);
+                    QPointF b = planeToScene(seg.world[1]);
+                    if (!isFiniteScalar(a.x()) || !isFiniteScalar(a.y())
+                     || !isFiniteScalar(b.x()) || !isFiniteScalar(b.y()))
+                        continue;
+                    const IntersectionStyle style{
+                        ts.color.rgba(),
+                        ts.z,
+                        int(std::lround(std::max(0.0f, ts.penWidth) * 1000.0f)),
+                    };
+                    groupedPaths[style].moveTo(a);
+                    groupedPaths[style].lineTo(b);
+                    groupedColors[style] = ts.color;
+                }
+            }
+
+            // Post-back builds QGraphicsPathItems on the main thread.
+            QMetaObject::invokeMethod(this,
+                [this, fp,
+                 groupedPaths = std::move(groupedPaths),
+                 groupedColors = std::move(groupedColors)]() mutable {
+                    if (_lastIntersectFp == fp) {
+                        invalidateIntersect();
+                        _intersectionItems.reserve(groupedPaths.size());
+                        for (const auto& [style, path] : groupedPaths) {
+                            if (path.isEmpty()) continue;
+                            auto* item = new QGraphicsPathItem(path);
+                            QPen pen(groupedColors[style]);
+                            pen.setWidthF(
+                                static_cast<qreal>(style.widthQ) / 1000.0);
+                            pen.setCapStyle(Qt::RoundCap);
+                            pen.setJoinStyle(Qt::RoundJoin);
+                            pen.setCosmetic(true);
+                            item->setPen(pen);
+                            item->setBrush(Qt::NoBrush);
+                            item->setZValue(style.z);
+                            _scene->addItem(item);
+                            _intersectionItems.push_back(item);
+                        }
+                        if (_view) _view->viewport()->update();
+                    }
+                    _planeWorkerBusy.store(false,
+                                           std::memory_order_release);
+                },
+                Qt::QueuedConnection);
+            _backgroundWorkers.fetch_sub(1, std::memory_order_release);
+        });
 }
 
 void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Surface>& surf)
@@ -1551,18 +1905,83 @@ void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<S
         return;
     }
 
-    // Flattened view has no single plane — skip the plane-based fingerprint
-    // cache and just rebuild each call. Clipping one segment against three
-    // planes over the visible viewport is cheap.
+    // Fingerprint covers the only things the triangle clip depends on:
+    // the 3 plane poses, the active segmentation identity + generation,
+    // opacity, thickness. Patch count is folded in so a segment edit
+    // that adds/removes patches still triggers a rebuild. When nothing
+    // material changed, the rtree + triangle-clip pass is skipped —
+    // that's the expensive work profiled at ~5% of main-thread CPU.
+    IntersectFingerprint fp;
+    auto mix = [](std::size_t s, std::size_t v) {
+        return s ^ (v + 0x9e3779b9u + (s << 6) + (s >> 2));
+    };
+    auto hashVec = [&](std::size_t s, const cv::Vec3f& v) {
+        for (int i = 0; i < 3; ++i)
+            s = mix(s, std::hash<int>{}(int(std::lround(v[i] * 1000.0f))));
+        return s;
+    };
+    std::size_t planesHash = 0;
+    for (const auto& e : planes) {
+        planesHash = hashVec(planesHash, e.plane->origin());
+        planesHash = hashVec(planesHash, e.plane->normal({}, {}));
+        planesHash = hashVec(planesHash, e.plane->basisX());
+        planesHash = hashVec(planesHash, e.plane->basisY());
+        planesHash = mix(planesHash,
+            std::hash<uint32_t>{}(uint32_t(e.color.rgba())));
+    }
+    fp.flattenedPlanesHash = planesHash;
+    fp.opacityQ = int(std::lround(_intersectionOpacity * 1000.0f));
+    fp.thicknessQ = int(std::lround(_intersectionThickness * 1000.0f));
+    fp.patchCount = patchIndex->patchCount();
+    fp.surfaceCount = patchIndex->surfaceCount();
+    fp.activeSegHash = std::hash<const void*>{}(activeSeg.get());
+    fp.targetGenerationHash = std::hash<uint64_t>{}(
+        patchIndex->generation(activeSeg));
+    // Fold the camera state into the fingerprint so pan/zoom invalidates
+    // the cache — surfaceToScene() below consumes all of this.
+    std::size_t cameraHash = 0;
+    auto hashInt = [&](std::size_t s, int v) {
+        return mix(s, std::hash<int>{}(v));
+    };
+    cameraHash = hashInt(cameraHash, int(std::lround(_camSurfX * 1000.0f)));
+    cameraHash = hashInt(cameraHash, int(std::lround(_camSurfY * 1000.0f)));
+    cameraHash = hashInt(cameraHash, int(std::lround(_camScale * 1000.0f)));
+    cameraHash = hashInt(cameraHash, _framebuffer.width());
+    cameraHash = hashInt(cameraHash, _framebuffer.height());
+    if (_view) {
+        const QTransform t = _view->transform();
+        auto q = [](qreal v) { return int(std::lround(v * 1000.0)); };
+        cameraHash = hashInt(cameraHash, q(t.m11()));
+        cameraHash = hashInt(cameraHash, q(t.m12()));
+        cameraHash = hashInt(cameraHash, q(t.m21()));
+        cameraHash = hashInt(cameraHash, q(t.m22()));
+        cameraHash = hashInt(cameraHash, q(t.dx()));
+        cameraHash = hashInt(cameraHash, q(t.dy()));
+    }
+    fp.cameraHash = cameraHash;
+    fp.valid = true;
+    if (_lastIntersectFp == fp && !_intersectionItems.empty()) {
+        return;
+    }
     invalidateIntersect();
-    _lastIntersectFp = {};
+    _lastIntersectFp = fp;
 
-    // Iterate every triangle of the active segment: a triangle's UV may sit
-    // anywhere on the flattened patch, so restricting by a viewport-derived
-    // 3D bbox would miss lines that belong on-screen but whose 3D vertices
-    // live elsewhere. One segment's triangle count is bounded enough for
-    // this to be cheap. Size the bbox to the volume so R-tree quantization
-    // (16-bit per axis over ~101000 units) can't drop valid cells.
+    // Everything past this point is pure computation over `activeSeg`,
+    // `planes`, `patchIndex`, and a snapshot of the camera transform. We
+    // dispatch it to QThreadPool so the rtree walk + per-triangle plane
+    // clip don't block input processing — on the heavy workload
+    // (~1.97M patches) this pass was measurable stalls on the main
+    // thread. The result is posted back via invokeMethod(Queued) and
+    // applied to the scene on the main thread.
+    if (_flattenedWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
+        // A previous compute is still running. _intersectionsDirty will
+        // stay true; _renderTimer will re-enter here once the worker
+        // finishes and resets the flag.
+        _intersectionsDirty = true;
+        _lastIntersectFp = {};
+        return;
+    }
+
     Rect3D allBounds{cv::Vec3f(0, 0, 0), cv::Vec3f(1, 1, 1)};
     if (_volume) {
         auto [w, h, d] = _volume->shape();
@@ -1571,58 +1990,111 @@ void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<S
                           static_cast<float>(d)};
     }
 
-    auto isFiniteScalar = [](double v) {
-        uint64_t bits;
-        std::memcpy(&bits, &v, sizeof(bits));
-        return (bits & 0x7FF0000000000000ULL) != 0x7FF0000000000000ULL;
-    };
-    auto isFinitePoint = [&](const QPointF& p) {
-        return isFiniteScalar(p.x()) && isFiniteScalar(p.y());
-    };
-
     const float clipTol = std::max(_intersectionThickness, 1e-4f);
-    std::vector<QPainterPath> paths(planes.size());
 
-    patchIndex->forEachTriangle(allBounds, activeSeg,
-        [&](const SurfacePatchIndex::TriangleCandidate& tri) {
-            for (size_t idx = 0; idx < planes.size(); ++idx) {
-                auto seg = SurfacePatchIndex::clipTriangleToPlane(
-                    tri, *planes[idx].plane, clipTol);
-                if (!seg) continue;
-                cv::Vec3f a = activeSeg->loc(seg->surfaceParams[0]);
-                cv::Vec3f b = activeSeg->loc(seg->surfaceParams[1]);
-                QPointF pa = surfaceToScene(a[0], a[1]);
-                QPointF pb = surfaceToScene(b[0], b[1]);
-                if (!isFinitePoint(pa) || !isFinitePoint(pb)) continue;
-                paths[idx].moveTo(pa);
-                paths[idx].lineTo(pb);
-            }
-        });
+    // Snapshot camera state so the worker can call a pure surfaceToScene
+    // equivalent without touching Qt objects. _view->transform() /
+    // _framebuffer / _camSurfX/Y/Scale are all read here on the main
+    // thread.
+    struct CamSnapshot {
+        float camSurfX, camSurfY, camScale;
+        float vpCx, vpCy;
+        QTransform viewToScene;
+    };
+    CamSnapshot cam{
+        _camSurfX, _camSurfY, _camScale,
+        static_cast<float>(_framebuffer.width()) * 0.5f,
+        static_cast<float>(_framebuffer.height()) * 0.5f,
+        _view ? _view->transform().inverted() : QTransform(),
+    };
 
     const float penWidth = std::max(_intersectionThickness,
                                     kActiveIntersectionMinWidthDelta);
     const float opacity = std::clamp(
         _intersectionOpacity * kActiveIntersectionOpacityScale, 0.0f, 1.0f);
 
-    _intersectionItems.reserve(planes.size());
-    for (size_t idx = 0; idx < planes.size(); ++idx) {
-        if (paths[idx].isEmpty()) continue;
-        QColor color = planes[idx].color;
-        color.setAlphaF(opacity);
-        auto* item = new QGraphicsPathItem(paths[idx]);
-        QPen pen(color);
-        pen.setWidthF(static_cast<qreal>(penWidth));
-        pen.setCapStyle(Qt::RoundCap);
-        pen.setJoinStyle(Qt::RoundJoin);
-        pen.setCosmetic(true);
-        item->setPen(pen);
-        item->setBrush(Qt::NoBrush);
-        item->setZValue(kActiveIntersectionZ);
-        _scene->addItem(item);
-        _intersectionItems.push_back(item);
+    std::vector<QColor> colors;
+    colors.reserve(planes.size());
+    std::vector<std::shared_ptr<PlaneSurface>> planeSurfs;
+    planeSurfs.reserve(planes.size());
+    for (const auto& e : planes) {
+        colors.push_back(e.color);
+        planeSurfs.push_back(e.plane);
     }
 
-    _view->viewport()->update();
+    _backgroundWorkers.fetch_add(1, std::memory_order_acq_rel);
+    QThreadPool::globalInstance()->start(
+        [this, fp, allBounds, clipTol, cam,
+         activeSeg, patchIndex, planeSurfs = std::move(planeSurfs),
+         colors = std::move(colors), penWidth, opacity]() mutable {
+            auto isFiniteScalar = [](double v) {
+                uint64_t bits;
+                std::memcpy(&bits, &v, sizeof(bits));
+                return (bits & 0x7FF0000000000000ULL) != 0x7FF0000000000000ULL;
+            };
+            auto surfToScene = [&](float sx, float sy) -> QPointF {
+                const qreal vx = (sx - cam.camSurfX) * cam.camScale + cam.vpCx;
+                const qreal vy = (sy - cam.camSurfY) * cam.camScale + cam.vpCy;
+                // QGraphicsView::mapToScene(QPoint) == viewportTransform-inverse
+                // applied to the point. inverted() was captured on the main
+                // thread; apply it here without touching QGraphicsView.
+                return cam.viewToScene.map(QPointF(vx, vy));
+            };
+
+            std::vector<QPainterPath> paths(planeSurfs.size());
+            patchIndex->forEachTriangle(allBounds, activeSeg,
+                [&](const SurfacePatchIndex::TriangleCandidate& tri) {
+                    for (size_t idx = 0; idx < planeSurfs.size(); ++idx) {
+                        auto seg = SurfacePatchIndex::clipTriangleToPlane(
+                            tri, *planeSurfs[idx], clipTol);
+                        if (!seg) continue;
+                        cv::Vec3f a = activeSeg->loc(seg->surfaceParams[0]);
+                        cv::Vec3f b = activeSeg->loc(seg->surfaceParams[1]);
+                        QPointF pa = surfToScene(a[0], a[1]);
+                        QPointF pb = surfToScene(b[0], b[1]);
+                        if (!isFiniteScalar(pa.x()) || !isFiniteScalar(pa.y())
+                         || !isFiniteScalar(pb.x()) || !isFiniteScalar(pb.y()))
+                            continue;
+                        paths[idx].moveTo(pa);
+                        paths[idx].lineTo(pb);
+                    }
+                });
+
+            // Post back to main thread. Queued connection — if `this` is
+            // destroyed before the event fires, Qt drops it silently.
+            QMetaObject::invokeMethod(this,
+                [this, fp, paths = std::move(paths),
+                 colors = std::move(colors), penWidth, opacity]() mutable {
+                    // Bail if fingerprint changed while we were computing.
+                    // _renderTimer will notice _intersectionsDirty and
+                    // reschedule.
+                    if (_lastIntersectFp == fp) {
+                        invalidateIntersect();
+                        _intersectionItems.reserve(colors.size());
+                        for (size_t idx = 0; idx < paths.size(); ++idx) {
+                            if (paths[idx].isEmpty()) continue;
+                            QColor c = colors[idx];
+                            c.setAlphaF(opacity);
+                            auto* item = new QGraphicsPathItem(paths[idx]);
+                            QPen pen(c);
+                            pen.setWidthF(static_cast<qreal>(penWidth));
+                            pen.setCapStyle(Qt::RoundCap);
+                            pen.setJoinStyle(Qt::RoundJoin);
+                            pen.setCosmetic(true);
+                            item->setPen(pen);
+                            item->setBrush(Qt::NoBrush);
+                            item->setZValue(kActiveIntersectionZ);
+                            _scene->addItem(item);
+                            _intersectionItems.push_back(item);
+                        }
+                        if (_view) _view->viewport()->update();
+                    }
+                    _flattenedWorkerBusy.store(false,
+                                               std::memory_order_release);
+                },
+                Qt::QueuedConnection);
+            _backgroundWorkers.fetch_sub(1, std::memory_order_release);
+        });
 }
 
 bool CAdaptiveVolumeViewer::sceneToVolumePN(cv::Vec3f& p, cv::Vec3f& n,
@@ -1663,8 +2135,11 @@ void CAdaptiveVolumeViewer::resetSurfaceOffsets()
 
 void CAdaptiveVolumeViewer::setVolumeWindow(float low, float high)
 {
-    _windowLow = std::clamp(low, 0.0f, 65535.0f);
-    _windowHigh = std::clamp(high, 0.0f, 65535.0f);
+    const float lo = std::clamp(low, 0.0f, 65535.0f);
+    const float hi = std::clamp(high, 0.0f, 65535.0f);
+    if (lo == _windowLow && hi == _windowHigh) return;
+    _windowLow = lo;
+    _windowHigh = hi;
     if (_volume) scheduleRender();
 }
 
@@ -1717,10 +2192,31 @@ void CAdaptiveVolumeViewer::updateStatusLabel()
     if (now - _lastStatusUpdate < std::chrono::milliseconds(100)) return;
     _lastStatusUpdate = now;
 
+    // Z display: for plane viewers, shift+scroll moves the 'focus' POI
+    // rather than writing _camera.zOff, so we show the plane's signed
+    // offset along its own normal from the world origin. For the
+    // segmentation (flattened) view, shift+scroll writes _camera.zOff
+    // directly, so show that.
+    float zDisplay = _camera.zOff;
+    if (auto surf = _surfWeak.lock()) {
+        if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
+            const cv::Vec3f n = plane->normal(cv::Vec3f(0, 0, 0), {});
+            const double len = cv::norm(n);
+            if (len > 1e-6) {
+                const cv::Vec3f nHat = n * static_cast<float>(1.0 / len);
+                zDisplay = plane->origin().dot(nHat);
+            }
+        }
+    }
     QString status = QString("%1x 1:%2 z=%3")
         .arg(static_cast<double>(_camera.scale), 0, 'f', 2)
         .arg(1 << _camera.dsScaleIdx)
-        .arg(static_cast<double>(_camera.zOff), 0, 'f', 1);
+        .arg(static_cast<double>(zDisplay), 0, 'f', 1);
+
+    const float fps = measuredFps();
+    if (fps > 0.0f) {
+        status += QString(" | %1 fps").arg(static_cast<double>(fps), 0, 'f', 1);
+    }
 
     if (_volume->tieredCache()) {
         auto s = _volume->tieredCache()->stats();
@@ -1782,7 +2278,7 @@ void CAdaptiveVolumeViewer::fitSurfaceInView()
     if (_volume) {
         int ns = static_cast<int>(_volume->numScales());
         std::vector<float> sfs(ns);
-        for (int i = 0; i < ns; i++) sfs[i] = _volume->levelScaleFactor(i);
+        for (int i = 0; i < ns; i++) sfs[i] = static_cast<float>(size_t{1} << i);
         _camera.recalcPyramidLevel(ns, sfs.data());
     }
     scheduleRender();

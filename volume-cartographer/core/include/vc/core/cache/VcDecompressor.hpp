@@ -19,10 +19,6 @@ namespace vc::cache {
 // into a ChunkData containing the voxel values. Handles uint8 and uint16
 // datasets, with optional uint16->uint8 downsampling (divide by 257).
 //
-// If the input has the VC3D video codec magic header, it is decoded with
-// video_decode() instead of the normal zarr decompression path. This
-// allows transparent reading from both original and recompressed formats.
-//
 // datasets: one VcDataset* per pyramid level (index = level).
 // The dataset is used to determine chunk shape, dtype, and decompressor.
 // Pointers must remain valid for the lifetime of the returned function.

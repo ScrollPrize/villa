@@ -1316,6 +1316,29 @@ int main(int argc, char *argv[])
         printMat4x4(affineTransform.matrix, "Final composed affine:");
     }
 
+    // Try to read voxelsize from meta.json to set TIFF DPI.
+    // meta.json stores the level-0 voxel size; renders at --group-idx > 0
+    // come from a 2^group_idx-downsampled pyramid, so each output pixel
+    // covers (voxelsize / ds_scale) µm. Account for that so the DPI tag
+    // matches the actual pixel grid.
+    float tifDpi = 0.f;
+    {
+        auto metaPath = vol_path / "meta.json";
+        if (std::filesystem::exists(metaPath)) {
+            try {
+                auto meta = Json::parse_file(metaPath);
+                if (meta.contains("voxelsize")) {
+                    const double vs = meta["voxelsize"].get_double();
+                    const double vsLevel = ds_scale > 0
+                                               ? vs / double(ds_scale)
+                                               : vs;
+                    tifDpi = voxelSizeToDpi(vsLevel);
+                }
+            } catch (...) {
+            }
+        }
+    }
+
     // --- Open source volume ---
     std::shared_ptr<Volume> remoteVolume;
     std::unique_ptr<vc::VcDataset> ownedDs;
@@ -1609,7 +1632,7 @@ int main(int argc, char *argv[])
                 uint32_t tiffTileW = (uint32_t(outW) + 15u) & ~15u;
                 uint16_t tifComp = quickTif ? COMPRESSION_PACKBITS : COMPRESSION_LZW;
                 for (int z = 0; z < tifSlices; z++)
-                    tifWriters.emplace_back(makePartPath(z), uint32_t(outW), uint32_t(outH), cvType, tiffTileW, tiffTileH, 0.0f, tifComp);
+                    tifWriters.emplace_back(makePartPath(z), uint32_t(outW), uint32_t(outH), cvType, tiffTileW, tiffTileH, 0.0f, tifComp, tifDpi);
             }
         }
 

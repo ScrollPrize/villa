@@ -31,13 +31,16 @@ COPY inference.py /app
 COPY profiling.py /app
 COPY model_timesformer.py /app
 COPY model_resnet3d.py /app
+COPY model_resnet3d_3d_decoder.py /app
 COPY k8s.py /app
+COPY runtime_contracts.py /app
 COPY vendored_cache_store.py /app
 COPY models/ /app/models/
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
 ENV CUDA_VISIBLE_DEVICES=0
+ENV IMAGE_ROLE=gpu
 
 ENTRYPOINT ["python", "/app/entrypoint.py"]
 
@@ -62,15 +65,13 @@ RUN uv pip install --system --no-cache -r requirements-cpu-only.txt
 
 COPY entrypoint.py /app
 COPY processing.py /app
-COPY inference.py /app
 COPY profiling.py /app
-COPY model_timesformer.py /app
-COPY model_resnet3d.py /app
 COPY k8s.py /app
+COPY runtime_contracts.py /app
 COPY vendored_cache_store.py /app
-COPY models/ /app/models/
 
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONPATH=/app
+ENV IMAGE_ROLE=cpu
 
 ENTRYPOINT ["python", "/app/entrypoint.py"]

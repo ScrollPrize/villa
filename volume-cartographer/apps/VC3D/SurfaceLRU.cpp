@@ -2,6 +2,40 @@
 
 #include "vc/core/util/QuadSurface.hpp"
 
+#include <QThreadPool>
+
+#include <atomic>
+#include <mutex>
+#include <unordered_set>
+
+namespace {
+
+// Dedupe concurrent async ensureLoaded() dispatches per surface — touch()
+// is called every render tick for the active surface, so an unloaded
+// surface would otherwise have a new QThreadPool task enqueued per frame
+// until the load finishes. Not a correctness issue (ensureLoaded has its
+// own mutex + double-check) but wasteful. The set holds raw pointers
+// keyed by QuadSurface*; entries are removed when the async load
+// returns, regardless of success or throw.
+std::mutex g_asyncLoadMutex;
+std::unordered_set<QuadSurface*> g_asyncLoadInFlight;
+
+void asyncWarmSurface(std::shared_ptr<QuadSurface> surf)
+{
+    if (!surf || surf->isLoaded()) return;
+    {
+        std::lock_guard<std::mutex> lk(g_asyncLoadMutex);
+        if (!g_asyncLoadInFlight.insert(surf.get()).second) return;
+    }
+    QThreadPool::globalInstance()->start([surf = std::move(surf)]() mutable {
+        try { surf->ensureLoaded(); } catch (...) {}
+        std::lock_guard<std::mutex> lk(g_asyncLoadMutex);
+        g_asyncLoadInFlight.erase(surf.get());
+    });
+}
+
+} // namespace
+
 void SurfaceLRU::setMaxResident(std::size_t n)
 {
     _maxResident = n;
@@ -18,13 +52,18 @@ void SurfaceLRU::touch(const std::shared_ptr<QuadSurface>& surf)
     if (it != _index.end()) {
         // Move to front.
         _order.splice(_order.begin(), _order, it->second);
-        return;
+    } else {
+        _order.push_front(surf);
+        _index[raw] = _order.begin();
+        while (_order.size() > _maxResident) {
+            evictOne();
+        }
     }
-    _order.push_front(surf);
-    _index[raw] = _order.begin();
-    while (_order.size() > _maxResident) {
-        evictOne();
-    }
+    // Kick off the TIFF load on a worker if not already loaded. Keeps the
+    // main thread (our caller) free for input processing — otherwise the
+    // first rawPointsPtr() hit after eviction synchronously LZW-decodes
+    // three ~170 MiB TIFFs on the main thread.
+    asyncWarmSurface(surf);
 }
 
 void SurfaceLRU::pin(const std::shared_ptr<QuadSurface>& surf)

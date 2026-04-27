@@ -7,6 +7,9 @@
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
+#if defined(VC_HAVE_MIMALLOC)
+#include <mimalloc.h>
+#endif
 
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "WindowRangeWidget.hpp"
@@ -137,12 +140,21 @@ namespace
 std::string compositeMethodForModeIndex(int index)
 {
     switch (index) {
-        case 0: return "max";
-        case 1: return "mean";
-        case 2: return "min";
-        case 3: return "alpha";
-        case 4: return "beerLambert";
-        case 5: return "volumetric";
+        case 0:  return "max";
+        case 1:  return "mean";
+        case 2:  return "min";
+        case 3:  return "alpha";
+        case 4:  return "beerLambert";
+        case 5:  return "volumetric";
+        case 6:  return "dvr";
+        case 7:  return "firstHitIso";
+        case 8:  return "devFromMean";
+        case 9:  return "emissionDvr";
+        case 10: return "maxAboveIso";
+        case 11: return "gammaWeighted";
+        case 12: return "gradientMag";
+        case 13: return "pbrIso";
+        case 14: return "shadedDvr";
         default: return "mean";
     }
 }
@@ -155,6 +167,15 @@ int compositeModeIndexForMethod(const std::string& method)
     if (method == "alpha") return 3;
     if (method == "beerLambert") return 4;
     if (method == "volumetric") return 5;
+    if (method == "dvr") return 6;
+    if (method == "firstHitIso") return 7;
+    if (method == "devFromMean") return 8;
+    if (method == "emissionDvr") return 9;
+    if (method == "maxAboveIso") return 10;
+    if (method == "gammaWeighted") return 11;
+    if (method == "gradientMag") return 12;
+    if (method == "pbrIso") return 13;
+    if (method == "shadedDvr") return 14;
     return 1;
 }
 
@@ -651,14 +672,16 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _windowStateSaveTimer->setInterval(500);
     connect(_windowStateSaveTimer, &QTimer::timeout, this, &CWindow::saveWindowState);
 
-    // Periodic glibc heap trim: returns sbrk-grown segments back to the OS
-    // once they're no longer in use. Cheap (~µs) when nothing to trim.
-    // Also dumps a RAM stats line for live monitoring. malloc_trim is a
-    // glibc extension — skipped on macOS / non-glibc libc.
+    // Periodic heap trim: under mimalloc, mi_collect asks it to purge
+    // thread / segment caches and return freed pages to the OS. Under
+    // glibc, malloc_trim returns sbrk-grown segments. Also dumps a RAM
+    // stats line for live monitoring.
     auto* trimTimer = new QTimer(this);
     trimTimer->setInterval(1000);
     connect(trimTimer, &QTimer::timeout, this, [this]() {
-#if defined(__GLIBC__)
+#if defined(VC_HAVE_MIMALLOC)
+        mi_collect(false);
+#elif defined(__GLIBC__)
         ::malloc_trim(0);
 #endif
         vc3d::ramstats::dumpOnce(_viewerManager.get(), _state);
@@ -681,6 +704,8 @@ CWindow::CWindow(size_t cacheSizeGB) :
 
     _cacheSizeBytes = cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
     std::cout << "chunk cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
+
+    _tickCoordinator = std::make_unique<vc::cache::TickCoordinator>();
 
     _state = new CState(_cacheSizeBytes, this);
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
@@ -4265,6 +4290,60 @@ void CWindow::CreateWidgets(void)
         }
     });
 
+    // Per-ray layer preprocess (applied to N composite samples before composite method)
+    connect(ui.chkPreNormalizeLayers, &QCheckBox::toggled, this, [this](bool checked) {
+        if (auto* viewer = segmentationViewer()) {
+            auto s = viewer->compositeRenderSettings();
+            s.params.preNormalizeLayers = checked;
+            viewer->setCompositeRenderSettings(s);
+        }
+    });
+    connect(ui.chkPreHistEqLayers, &QCheckBox::toggled, this, [this](bool checked) {
+        if (auto* viewer = segmentationViewer()) {
+            auto s = viewer->compositeRenderSettings();
+            s.params.preHistEqLayers = checked;
+            viewer->setCompositeRenderSettings(s);
+        }
+    });
+
+    // Pre-TF / Post-TF: 4-knot piecewise-linear LUTs. Endpoints (0,0) and
+    // (255,255) are fixed; only the two middle knots are editable.
+    auto applyTfParam = [this](auto&& mutate) {
+        if (auto* viewer = segmentationViewer()) {
+            auto s = viewer->compositeRenderSettings();
+            mutate(s.params);
+            viewer->setCompositeRenderSettings(s);
+        }
+    };
+    connect(ui.chkPreTfEnabled, &QCheckBox::toggled, this, [applyTfParam](bool v) {
+        applyTfParam([v](CompositeParams& p) { p.preTfEnabled = v; });
+    });
+    connect(ui.spinPreTfX1, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.preTfX1 = uint8_t(v); }); });
+    connect(ui.spinPreTfY1, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.preTfY1 = uint8_t(v); }); });
+    connect(ui.spinPreTfX2, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.preTfX2 = uint8_t(v); }); });
+    connect(ui.spinPreTfY2, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.preTfY2 = uint8_t(v); }); });
+    connect(ui.chkPostTfEnabled, &QCheckBox::toggled, this, [applyTfParam](bool v) {
+        applyTfParam([v](CompositeParams& p) { p.postTfEnabled = v; });
+    });
+    connect(ui.spinPostTfX1, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.postTfX1 = uint8_t(v); }); });
+    connect(ui.spinPostTfY1, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.postTfY1 = uint8_t(v); }); });
+    connect(ui.spinPostTfX2, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.postTfX2 = uint8_t(v); }); });
+    connect(ui.spinPostTfY2, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.postTfY2 = uint8_t(v); }); });
+    connect(ui.spinDvrAmbient, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+        [applyTfParam](double v) { applyTfParam([v](CompositeParams& p) { p.dvrAmbient = float(v); }); });
+    connect(ui.spinPbrRoughness, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+        [applyTfParam](double v) { applyTfParam([v](CompositeParams& p) { p.pbrRoughness = float(v); }); });
+    connect(ui.spinPbrMetallic, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+        [applyTfParam](double v) { applyTfParam([v](CompositeParams& p) { p.pbrMetallic = float(v); }); });
+
     // Connect ISO Cutoff slider - applies to all viewers (segmentation, XY, XZ, YZ)
     connect(ui.sliderIsoCutoff, &QSlider::valueChanged, this, [this](int value) {
         ui.lblIsoCutoffValue->setText(QString::number(value));
@@ -4299,53 +4378,109 @@ void CWindow::CreateWidgets(void)
     });
 
     // Helper lambda to update visibility of method-specific parameters
-    auto updateCompositeParamsVisibility = [this](int methodIndex) {
-        // Alpha parameters (row 1, 2 - AlphaMin/Max, AlphaThreshold/Material)
-        bool showAlphaParams = (methodIndex == 3); // Alpha method
-        ui.lblAlphaMin->setVisible(showAlphaParams);
-        ui.spinAlphaMin->setVisible(showAlphaParams);
-        ui.lblAlphaMax->setVisible(showAlphaParams);
-        ui.spinAlphaMax->setVisible(showAlphaParams);
-        ui.lblAlphaThreshold->setVisible(showAlphaParams);
-        ui.spinAlphaThreshold->setVisible(showAlphaParams);
-        ui.lblMaterial->setVisible(showAlphaParams);
-        ui.spinMaterial->setVisible(showAlphaParams);
+    auto updateCompositeParamsVisibility = [this]() {
+        const int methodIndex = ui.cmbCompositeMode->currentIndex();
+        const bool lightingOn = ui.chkLightingEnabled->isChecked();
+        const bool preTfOn = ui.chkPreTfEnabled->isChecked();
+        const bool postTfOn = ui.chkPostTfEnabled->isChecked();
 
-        // Beer-Lambert parameters (row 7, 8 - Extinction/Emission, Ambient)
-        bool showBLParams = (methodIndex == 4); // Beer-Lambert method
-        ui.lblBLExtinction->setVisible(showBLParams);
-        ui.spinBLExtinction->setVisible(showBLParams);
-        ui.lblBLEmission->setVisible(showBLParams);
-        ui.spinBLEmission->setVisible(showBLParams);
-        ui.lblBLAmbient->setVisible(showBLParams);
-        ui.spinBLAmbient->setVisible(showBLParams);
+        // Method-family flags.
+        const bool isAlpha    = (methodIndex == 3);
+        const bool isBL       = (methodIndex == 4);
+        const bool isVolum    = (methodIndex == 5);
+        const bool isDvr      = (methodIndex == 6);
+        const bool isFirstHit = (methodIndex == 7);
+        const bool isPbr      = (methodIndex == 13);
+        const bool isShadedDvr = (methodIndex == 14);
 
-        // Lighting parameters (rows 9-12) - always shown, works with all methods
+        // Alpha knobs: only for the Alpha method.
+        ui.lblAlphaMin->setVisible(isAlpha);
+        ui.spinAlphaMin->setVisible(isAlpha);
+        ui.lblAlphaMax->setVisible(isAlpha);
+        ui.spinAlphaMax->setVisible(isAlpha);
+        ui.lblAlphaThreshold->setVisible(isAlpha);
+        ui.spinAlphaThreshold->setVisible(isAlpha);
+        ui.lblMaterial->setVisible(isAlpha);
+        ui.spinMaterial->setVisible(isAlpha);
+
+        // Beer-Lambert knobs: shared by Beer-Lambert and Volumetric modes.
+        const bool showBL = isBL || isVolum;
+        ui.lblBLExtinction->setVisible(showBL);
+        ui.spinBLExtinction->setVisible(showBL);
+        ui.lblBLEmission->setVisible(showBL);
+        ui.spinBLEmission->setVisible(showBL);
+        ui.lblBLAmbient->setVisible(showBL);
+        ui.spinBLAmbient->setVisible(showBL);
+
+        // Shadow-ray steps: only Volumetric uses the secondary shadow ray.
+        ui.lblShadowSteps->setVisible(isVolum);
+        ui.spinShadowSteps->setVisible(isVolum);
+
+        // DVR ambient: DVR and shaded-DVR methods.
+        const bool showDvrAmbient = isDvr || isShadedDvr;
+        ui.lblDvrAmbient->setVisible(showDvrAmbient);
+        ui.spinDvrAmbient->setVisible(showDvrAmbient);
+
+        // PBR roughness/metallic knobs: only the PBR method.
+        ui.lblPbrRoughness->setVisible(isPbr);
+        ui.spinPbrRoughness->setVisible(isPbr);
+        ui.lblPbrMetallic->setVisible(isPbr);
+        ui.spinPbrMetallic->setVisible(isPbr);
+
+        // Lighting: check always visible (user toggles on/off); the
+        // direction/diffuse/ambient knobs appear only when lighting is
+        // actually on. First-Hit Iso is a shading-heavy method so we
+        // gently enforce its need for lighting by showing the chk always.
         ui.chkLightingEnabled->setVisible(true);
-        ui.lblLightAzimuth->setVisible(true);
-        ui.spinLightAzimuth->setVisible(true);
-        ui.lblLightElevation->setVisible(true);
-        ui.spinLightElevation->setVisible(true);
-        ui.lblLightDiffuse->setVisible(true);
-        ui.spinLightDiffuse->setVisible(true);
-        ui.lblLightAmbient->setVisible(true);
-        ui.spinLightAmbient->setVisible(true);
-        ui.chkUseVolumeGradients->setVisible(true);
+        ui.lblLightAzimuth->setVisible(lightingOn);
+        ui.spinLightAzimuth->setVisible(lightingOn);
+        ui.lblLightElevation->setVisible(lightingOn);
+        ui.spinLightElevation->setVisible(lightingOn);
+        ui.lblLightDiffuse->setVisible(lightingOn);
+        ui.spinLightDiffuse->setVisible(lightingOn);
+        ui.lblLightAmbient->setVisible(lightingOn);
+        ui.spinLightAmbient->setVisible(lightingOn);
+        ui.chkUseVolumeGradients->setVisible(lightingOn);
 
-        // No methods currently use scale or param sliders
+        // Pre/Post TF knots: spinboxes + knot-2 labels appear only when
+        // the corresponding enable checkbox is ticked.
+        ui.spinPreTfX1->setVisible(preTfOn);
+        ui.spinPreTfY1->setVisible(preTfOn);
+        ui.spinPreTfX2->setVisible(preTfOn);
+        ui.spinPreTfY2->setVisible(preTfOn);
+        ui.lblPreTfKnot2->setVisible(preTfOn);
+        ui.spinPostTfX1->setVisible(postTfOn);
+        ui.spinPostTfY1->setVisible(postTfOn);
+        ui.spinPostTfX2->setVisible(postTfOn);
+        ui.spinPostTfY2->setVisible(postTfOn);
+        ui.lblPostTfKnot2->setVisible(postTfOn);
+
+        // No methods currently use scale or param sliders.
         ui.lblMethodScale->setVisible(false);
         ui.sliderMethodScale->setVisible(false);
         ui.lblMethodScaleValue->setVisible(false);
         ui.lblMethodParam->setVisible(false);
         ui.sliderMethodParam->setVisible(false);
         ui.lblMethodParamValue->setVisible(false);
+
+        (void)isFirstHit;  // reserved for future First-Hit-specific knobs
+        (void)isShadedDvr; (void)isPbr; // already consumed above
     };
 
-    // Update the cmbCompositeMode connection to also update visibility
-    connect(ui.cmbCompositeMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, updateCompositeParamsVisibility);
+    // Re-run visibility logic whenever any of the inputs that gate widgets
+    // change — composite method, or any of the three enable checkboxes
+    // that each control a sub-group of knobs.
+    connect(ui.cmbCompositeMode, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [updateCompositeParamsVisibility](int) { updateCompositeParamsVisibility(); });
+    connect(ui.chkLightingEnabled, &QCheckBox::toggled,
+            this, [updateCompositeParamsVisibility](bool) { updateCompositeParamsVisibility(); });
+    connect(ui.chkPreTfEnabled, &QCheckBox::toggled,
+            this, [updateCompositeParamsVisibility](bool) { updateCompositeParamsVisibility(); });
+    connect(ui.chkPostTfEnabled, &QCheckBox::toggled,
+            this, [updateCompositeParamsVisibility](bool) { updateCompositeParamsVisibility(); });
 
-    // Initialize visibility based on current selection
-    updateCompositeParamsVisibility(ui.cmbCompositeMode->currentIndex());
+    // Initialize visibility from current UI state.
+    updateCompositeParamsVisibility();
 
     // Connect Plane Composite controls (separate enable for XY/XZ/YZ, shared layer counts)
     connect(ui.chkPlaneCompositeXY, &QCheckBox::toggled, this, [this](bool checked) {

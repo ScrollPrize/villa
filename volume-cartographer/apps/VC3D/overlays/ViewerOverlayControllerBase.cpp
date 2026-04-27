@@ -238,13 +238,37 @@ void ViewerOverlayControllerBase::attachViewer(VolumeViewerBase* viewer)
 
     ViewerEntry entry;
     entry.viewer = viewer;
+    // Per-viewer 16ms debounce timer. Each overlaysUpdated signal sets the
+    // dirty flag and restarts the timer; when the timer fires we rebuild
+    // at most once per tick regardless of signal frequency.
+    entry.rebuildTimer = new QTimer(this);
+    entry.rebuildTimer->setSingleShot(true);
+    entry.rebuildTimer->setInterval(16);
+    QObject::connect(entry.rebuildTimer, &QTimer::timeout, this, [this, viewer]() {
+        auto it = std::find_if(_viewers.begin(), _viewers.end(),
+            [viewer](const ViewerEntry& e) { return e.viewer == viewer; });
+        if (it == _viewers.end() || !it->rebuildDirty) return;
+        it->rebuildDirty = false;
+        rebuildOverlay(viewer);
+    });
     entry.overlaysUpdatedConn = viewer->connectOverlaysUpdated(
-        this, [this, viewer]() { rebuildOverlay(viewer); });
+        this, [this, viewer]() { scheduleRebuild(viewer); });
     entry.destroyedConn = QObject::connect(viewer->asQObject(), &QObject::destroyed,
                                            this, [this, viewer]() { detachViewer(viewer); });
 
     _viewers.push_back(entry);
-    rebuildOverlay(viewer);
+    rebuildOverlay(viewer);  // first rebuild is synchronous, no point debouncing it
+}
+
+void ViewerOverlayControllerBase::scheduleRebuild(VolumeViewerBase* viewer)
+{
+    auto it = std::find_if(_viewers.begin(), _viewers.end(),
+        [viewer](const ViewerEntry& entry) { return entry.viewer == viewer; });
+    if (it == _viewers.end()) return;
+    it->rebuildDirty = true;
+    if (it->rebuildTimer && !it->rebuildTimer->isActive()) {
+        it->rebuildTimer->start();
+    }
 }
 
 void ViewerOverlayControllerBase::detachViewer(VolumeViewerBase* viewer)
@@ -256,6 +280,11 @@ void ViewerOverlayControllerBase::detachViewer(VolumeViewerBase* viewer)
     for (auto iter = it; iter != _viewers.end(); ++iter) {
         QObject::disconnect(iter->overlaysUpdatedConn);
         QObject::disconnect(iter->destroyedConn);
+        if (iter->rebuildTimer) {
+            iter->rebuildTimer->stop();
+            iter->rebuildTimer->deleteLater();
+            iter->rebuildTimer = nullptr;
+        }
         if (iter->viewer) {
             iter->viewer->clearOverlayGroup(_overlayGroupKey);
         }
@@ -789,6 +818,11 @@ void ViewerOverlayControllerBase::detachAllViewers()
     for (auto& entry : _viewers) {
         QObject::disconnect(entry.overlaysUpdatedConn);
         QObject::disconnect(entry.destroyedConn);
+        if (entry.rebuildTimer) {
+            entry.rebuildTimer->stop();
+            entry.rebuildTimer->deleteLater();
+            entry.rebuildTimer = nullptr;
+        }
         if (entry.viewer) {
             entry.viewer->clearOverlayGroup(_overlayGroupKey);
         }

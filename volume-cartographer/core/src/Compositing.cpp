@@ -96,6 +96,40 @@ float compositeLayerStack(
             return CompositeMethod::alpha(stack, params);
         case utils::CompositingMethod::beer_lambert:
             return CompositeMethod::beerLambert(stack, params);
+        case utils::CompositingMethod::dvr:
+            return utils::composite_dvr(
+                std::span<const float>(stack.values.data(), stack.validCount),
+                params.dvrAmbient);
+        case utils::CompositingMethod::first_hit_iso:
+            return utils::composite_first_hit_iso(
+                std::span<const float>(stack.values.data(), stack.validCount),
+                float(params.isoCutoff));
+        case utils::CompositingMethod::dev_from_mean:
+            return utils::composite_dev_from_mean(
+                std::span<const float>(stack.values.data(), stack.validCount),
+                float(params.isoCutoff));
+        case utils::CompositingMethod::emission_dvr:
+            return utils::composite_emission_dvr(
+                std::span<const float>(stack.values.data(), stack.validCount));
+        case utils::CompositingMethod::max_above_iso:
+            return utils::composite_max_above_iso(
+                std::span<const float>(stack.values.data(), stack.validCount),
+                float(params.isoCutoff));
+        case utils::CompositingMethod::gamma_weighted:
+            return utils::composite_gamma_weighted(
+                std::span<const float>(stack.values.data(), stack.validCount),
+                float(params.isoCutoff));
+        case utils::CompositingMethod::gradient_mag:
+            return utils::composite_gradient_mag(
+                std::span<const float>(stack.values.data(), stack.validCount));
+        case utils::CompositingMethod::pbr_iso:
+            return utils::composite_first_hit_iso(
+                std::span<const float>(stack.values.data(), stack.validCount),
+                float(params.isoCutoff));
+        case utils::CompositingMethod::shaded_dvr:
+            return utils::composite_dvr(
+                std::span<const float>(stack.values.data(), stack.validCount),
+                params.dvrAmbient);
     }
 
     return CompositeMethod::mean(stack);
@@ -104,6 +138,37 @@ float compositeLayerStack(
 bool methodRequiresLayerStorage(const std::string& method) noexcept
 {
     return utils::method_requires_storage(utils::parse_compositing_method(method));
+}
+
+void buildTfLut256(bool enabled,
+                   uint8_t x1, uint8_t y1,
+                   uint8_t x2, uint8_t y2,
+                   uint8_t lut[256]) noexcept
+{
+    if (!enabled) {
+        for (int i = 0; i < 256; ++i) lut[i] = uint8_t(i);
+        return;
+    }
+    // Sort the two middle knots by x so the PL function is monotone in x.
+    if (x1 > x2) { std::swap(x1, x2); std::swap(y1, y2); }
+    // Four segments: [0,x1] → [0,y1], [x1,x2] → [y1,y2], [x2,255] → [y2,255].
+    // Each segment is a linear interpolation; degenerate runs collapse to a
+    // step by short-circuiting the denominator.
+    auto lerp = [](float x, float x0, float x1, float y0, float y1) {
+        const float d = x1 - x0;
+        if (d <= 0.f) return y0;
+        const float t = (x - x0) / d;
+        return y0 + t * (y1 - y0);
+    };
+    for (int i = 0; i < 256; ++i) {
+        float y;
+        if (i <= int(x1))      y = lerp(float(i), 0.f,      float(x1), 0.f,      float(y1));
+        else if (i <= int(x2)) y = lerp(float(i), float(x1), float(x2), float(y1), float(y2));
+        else                   y = lerp(float(i), float(x2), 255.f,     float(y2), 255.f);
+        if (y < 0.f) y = 0.f;
+        if (y > 255.f) y = 255.f;
+        lut[i] = uint8_t(y + 0.5f);
+    }
 }
 
 float computeLightingFactor(const cv::Vec3f& normal, const CompositeParams& params) noexcept

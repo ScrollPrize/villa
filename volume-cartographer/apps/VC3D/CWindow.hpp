@@ -35,6 +35,7 @@
 #include "segmentation/SegmentationWidget.hpp"
 #include "segmentation/growth/SegmentationGrowth.hpp"
 #include "SeedingWidget.hpp"
+#include "vc/core/cache/TickCoordinator.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -224,6 +225,12 @@ private:
     bool can_change_volume_();
 
     size_t _cacheSizeBytes = 0;
+
+    // Declared early so that the publisher thread joins (via ~jthread) after
+    // all viewers and caches below have been destroyed. Readers hold raw
+    // const pointers into FrameState buffers owned here; the coordinator
+    // must outlive every possible reader.
+    std::unique_ptr<vc::cache::TickCoordinator> _tickCoordinator;
 
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;

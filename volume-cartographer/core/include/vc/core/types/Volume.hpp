@@ -15,7 +15,7 @@
 #include "vc/core/types/SampleParams.hpp"
 #include "vc/core/cache/HttpMetadataFetcher.hpp"  // HttpAuth
 #include "vc/core/util/NetworkFilesystem.hpp"
-#include "utils/video_codec.hpp"
+#include "utils/c3d_codec.hpp"
 
 // Forward declarations
 namespace vc { class VcDataset; }
@@ -76,11 +76,6 @@ public:
     [[nodiscard]] vc::VcDataset *zarrDataset(int level = 0) const;
     [[nodiscard]] size_t numScales() const noexcept;
 
-    // Actual OME-Zarr scale factor for a given vector index (from .zattrs
-    // multiscales coordinateTransformations).  Returns 1.0 for level 0 in
-    // standard volumes, or e.g. 4.0 if the finest available scale is "2".
-    [[nodiscard]] float levelScaleFactor(int vectorIndex) const noexcept;
-
     // Create a BlockPipeline backed by this volume's zarr data.
     [[nodiscard]] std::unique_ptr<vc::cache::BlockPipeline> createTieredCache() const;
 
@@ -108,10 +103,11 @@ public:
     // Must be called before first tieredCache() access.
     void setIOThreads(int count);
 
-    // Override the H.265 encode params used when re-encoding non-canonical
-    // source chunks into the canonical disk cache. depth/height/width are
-    // ignored (filled per chunk). Must be called before first tieredCache().
-    void setEncodeParams(const utils::VideoCodecParams& params);
+    // Override the c3d encode params (target_ratio) used when re-encoding
+    // non-canonical source chunks into the canonical disk cache.
+    // depth/height/width are filled per-chunk. Must be called before
+    // first tieredCache().
+    void setEncodeParams(const utils::C3dCodecParams& params);
 
     // --- Sampling API ---
 
@@ -146,17 +142,6 @@ public:
                               int width, int height,
                               const vc::SampleParams& params);
 
-    // Fused plane sampling + LUT: samples and writes ARGB32 directly,
-    // eliminating the intermediate cv::Mat and applyPostProcess pass.
-    // outBuf must have room for width*height pixels (outStride in uint32_t units).
-    int samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
-                                    const cv::Vec3f& origin,
-                                    const cv::Vec3f& vx_step,
-                                    const cv::Vec3f& vy_step,
-                                    int width, int height,
-                                    const vc::SampleParams& params,
-                                    const uint32_t lut[256]);
-
     // Fused plane composite: nearest-neighbor per layer + composite + LUT → ARGB32.
     // No coord matrix. For PlaneSurface composite rendering.
     int samplePlaneCompositeBestEffortARGB32(
@@ -183,7 +168,6 @@ protected:
     int _slices{0};
 
     std::vector<std::unique_ptr<vc::VcDataset>> zarrDs_;
-    std::vector<float> zarrScaleFactors_;  // per vector-index scale factor from .zattrs
     void zarrOpen();
 
     // Cache ownership
@@ -192,7 +176,7 @@ protected:
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
     vc::cache::BlockCache* sharedBlockCache_ = nullptr;
     int ioThreads_ = 0;  // 0 = use default
-    utils::VideoCodecParams encodeParams_ = {.qp = 36};
+    utils::C3dCodecParams encodeParams_ = {};
 
     void ensureTieredCache() const;
 

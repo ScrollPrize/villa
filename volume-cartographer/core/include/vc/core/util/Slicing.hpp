@@ -81,31 +81,6 @@ void samplePlane(cv::Mat_<uint8_t>& out, vc::cache::BlockPipeline* cache, int le
                  const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
                  int width, int height, vc::Sampling method);
 
-// Adaptive plane sampling: per-pixel level fallback. For each pixel, tries the
-// desired level first; if that chunk isn't in hot cache, falls back to coarser
-// levels. This means half the image can be full-res while the rest is still loading.
-// Returns the coarsest level actually used (for prefetch decisions).
-int samplePlaneAdaptiveARGB32(uint32_t* outBuf, int outStride,
-                               vc::cache::BlockPipeline* cache,
-                               int desiredLevel, int numLevels,
-                               const cv::Vec3f& origin,
-                               const cv::Vec3f& vx_step,
-                               const cv::Vec3f& vy_step,
-                               int width, int height,
-                               const uint32_t lut[256],
-                               vc::Sampling method = vc::Sampling::Nearest);
-
-// Adaptive coords sampling: per-pixel level fallback for QuadSurface.
-// Same as samplePlaneAdaptiveARGB32 but takes pre-computed coords matrix.
-// Non-blocking: missing chunks skipped (rendered as lut[0]).
-void sampleCoordsAdaptiveARGB32(
-    uint32_t* outBuf, int outStride,
-    vc::cache::BlockPipeline* cache,
-    int desiredLevel, int numLevels,
-    const cv::Mat_<cv::Vec3f>& coords,
-    const uint32_t lut[256],
-    vc::Sampling method = vc::Sampling::Nearest);
-
 // Unified composite-capable adaptive sampler with per-pixel level fallback.
 // One entry point for plane/coords and composite/non-composite rendering:
 //   - Plane mode: pass coords=nullptr and origin/vx_step/vy_step/planeNormal.
@@ -135,7 +110,15 @@ void sampleAdaptiveARGB32(
     // tagged with the *coarsest* pyramid-level offset used while sampling
     // (0 = desired level, 1..N = fallback depth). Stride is in bytes.
     uint8_t* levelOut = nullptr,
-    int levelStride = 0);
+    int levelStride = 0,
+    // When true, skip the per-frame chunk enumeration + sort + fetchInteractive
+    // that the kernel normally runs before dispatching tiles. Intended for
+    // callers that can prove the coords haven't changed since the last
+    // render (e.g. QuadSurface gen cache hit) — the prior frame already
+    // queued the needed blocks, so rerunning the enumeration is pure
+    // overhead. No correctness impact on block residency: the per-sample
+    // adaptive fallback still handles any block not yet loaded.
+    bool skipPrefetch = false);
 
 // Fused plane composite: inline coords + nearest-neighbor per layer + composite + LUT → ARGB32.
 // No coord matrix allocation. For PlaneSurface composite rendering.

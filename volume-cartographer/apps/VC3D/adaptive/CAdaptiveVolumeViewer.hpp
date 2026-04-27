@@ -5,6 +5,7 @@
 #include <QImage>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <memory>
 #include <map>
@@ -42,7 +43,7 @@ class PlaneSurface;
 #define CTiledVolumeViewer CAdaptiveVolumeViewer
 
 // Adaptive per-pixel volume viewer. Renders a PlaneSurface via
-// samplePlaneAdaptiveARGB32 directly to a viewport-sized framebuffer,
+// sampleAdaptiveARGB32 directly to a viewport-sized framebuffer,
 // with composite post-process (CLAHE, raking light), intersections,
 // and overlays.
 class CAdaptiveVolumeViewer : public QWidget, public VolumeViewerBase
@@ -62,6 +63,11 @@ public:
     // --- Rendering ---
     void renderVisible(bool force = false);
     void renderIntersections() override;
+    // Synchronous body of renderIntersections(). The public override just
+    // schedules a coalesced debounce so rapid-fire UI setters (opacity /
+    // thickness / surface-change / intersect-target slider) don't each
+    // pay the full rtree + triangle-clip cost on the main thread.
+    void renderIntersectionsNow();
     void invalidateVis() {}
     void invalidateIntersect(const std::string& = "") override;
     void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false);
@@ -81,7 +87,15 @@ public:
     VCCollection* pointCollection() const override { return _pointCollection; }
 
     // --- Settings passthrough ---
+    // Equality guards: Qt UI routinely fires value-changed signals even
+    // when the user's action rounds to the same stored value (e.g. a
+    // drag-release that reports the current spinbox value). Without the
+    // guard we'd queue a real render for every no-op signal — the 16 ms
+    // coalesce timer still fires, but it triggers a full frame for zero
+    // visible change. Skipping identical settings keeps the pipeline
+    // idle when nothing actually changed.
     void setCompositeRenderSettings(const CompositeRenderSettings& s) {
+        if (_compositeSettings == s) return;
         _compositeSettings = s;
         scheduleRender();
     }
@@ -92,7 +106,11 @@ public:
     void setVolumeWindow(float low, float high);
     float volumeWindowLow() const { return _windowLow; }
     float volumeWindowHigh() const { return _windowHigh; }
-    void setBaseColormap(const std::string& id) { _baseColormapId = id; scheduleRender(); }
+    void setBaseColormap(const std::string& id) {
+        if (_baseColormapId == id) return;
+        _baseColormapId = id;
+        scheduleRender();
+    }
     void setStretchValues(bool) { scheduleRender(); }
 
     // --- Display stubs ---
@@ -248,6 +266,41 @@ private:
     void scheduleRender();
     void syncCameraTransform();
 
+    // Async render pipeline. submitRender() is called on the main thread
+    // (Qt render timer). It snapshots what the worker needs, dispatches
+    // renderIntoFramebuffer() to QThreadPool, and returns immediately.
+    // The worker writes into _framebufferWork (double-buffer) so the paint
+    // event can keep reading _framebuffer. When the worker finishes it
+    // posts finishRenderOnMainThread() via QueuedConnection — that slot
+    // swaps the buffers and performs the main-thread-only scene updates.
+    //
+    // RenderContext is the immutable snapshot of viewer state that the
+    // worker reads. The body of renderIntoFramebuffer() must NEVER touch
+    // `_camera` / `_compositeSettings` / `_windowLow` / etc. directly —
+    // those are mutated on the main thread by input handlers and
+    // settings setters; reading them on a worker thread without a lock
+    // is a data race. Everything the worker needs from mutable state is
+    // copied into RenderContext in submitRender() before dispatch.
+    struct RenderContext {
+        AdaptiveCamera camera;
+        CompositeRenderSettings compositeSettings;
+        vc::Sampling samplingMethod;
+        bool interactive = false;
+        float windowLow = 0.0f;
+        float windowHigh = 255.0f;
+        std::string baseColormapId;
+        bool highlightDownscaled = false;
+        cv::Vec3f zOffWorldDir{0.0f, 0.0f, 0.0f};
+        // Strong references so the worker can't race against object
+        // teardown: _surfWeak / _volume could otherwise be reset on main
+        // mid-render. shared_ptr captures here keep them alive for the
+        // duration of the render.
+        std::shared_ptr<Surface> surf;
+        std::shared_ptr<Volume> volume;
+    };
+    void renderIntoFramebuffer(QImage& fb, const RenderContext& ctx);
+    Q_INVOKABLE void finishRenderOnMainThread();
+
     // Framebuffer coordinate conversions
     QPointF surfaceToScene(float surfX, float surfY) const;
     cv::Vec2f sceneToSurface(const QPointF& scenePos) const;
@@ -267,8 +320,34 @@ private:
     QTimer* _renderTimer = nullptr;
     bool _renderPending = false;
 
+    // Progressive rendering: during live interaction (pan drag, zoom wheel
+    // events) we render at +1 pyramid level for faster frames. When the
+    // user stops interacting, an idle timer fires and we kick a full-res
+    // render to catch up. This trades a slightly-softer image during
+    // motion for materially lower frame time, which in turn makes pans/
+    // zooms feel smoother without touching the sample kernel.
+    QTimer* _interactionIdleTimer = nullptr;
+    bool _interactive = false;
+    // Increment on every interactive event; submitRender captures the
+    // value before dispatching. If it changes while a render is in flight
+    // we know the user acted again and we should keep rendering.
+    void beginInteraction();
+
     // --- Framebuffer ---
+    // _framebuffer — last committed frame, read by the view's paint path
+    // (CVolumeViewerView::drawBackground holds a pointer to it).
+    // _framebufferWork — scratch that the async worker writes into.
+    // finishRenderOnMainThread() does std::swap on the two QImages (main
+    // thread only, so no paint/swap race) to commit the new frame.
     QImage _framebuffer;
+    QImage _framebufferWork;
+    // Serialises render dispatch. Only one worker runs at a time; if
+    // submitRender fires while busy, the next render is queued via
+    // _renderPendingAfterWorker so we don't lose a frame's worth of
+    // state change (slider drag, camera pan).
+    std::atomic<bool> _renderWorkerBusy{false};
+    bool _renderPendingAfterWorker = false;
+    std::chrono::steady_clock::time_point _renderT0{};
     // Per-pixel pyramid-level tag (0 = desired, 1..5 = fallback depth).
     // Allocated lazily when "highlight downscaled chunks" is enabled.
     cv::Mat_<uint8_t> _levelBuffer;
@@ -319,6 +398,21 @@ private:
     int _normalMaxArrows = 32;
     QString _lastStatusText;
     std::chrono::steady_clock::time_point _lastStatusUpdate{};
+    // FPS tracking — ring buffer of recent submitRender() timestamps.
+    // Status label reads the newest minus the oldest to get an averaged
+    // fps number; single-frame interval is too noisy to display.
+    // FPS ring stores per-frame render DURATIONS (seconds), not render
+    // timestamps. The reported value is 1 / mean(duration) — i.e., the
+    // theoretical framerate we would sustain at our measured render
+    // cost. Decouples the readout from user-input pacing so an idle
+    // viewer doesn't read 0 FPS and a held-button pan doesn't read the
+    // timer interval as "60 fps".
+    static constexpr int kFpsRingSize = 32;
+    std::array<double, kFpsRingSize> _renderDurationsSec{};
+    int _renderDurationHead = 0;
+    int _renderDurationCount = 0;
+    void recordRenderDuration(double seconds);
+    float measuredFps() const;
     std::chrono::steady_clock::time_point _lastStretchScan{};
     cv::Ptr<cv::CLAHE> _claheCache;
     int _claheCacheTile = -1;
@@ -396,13 +490,55 @@ private:
         size_t targetGenerationHash = 0;
         size_t activeSegHash = 0;
         size_t highlightedSurfaceHash = 0;
+        // Hash of the three seg xy/xz/yz plane poses for the flattened-
+        // view path. 0 on the plane-view path (which uses the
+        // plane{Origin,Normal,BasisX,BasisY}Q fields instead).
+        size_t flattenedPlanesHash = 0;
+        // Hash of everything surfaceToScene() consumes: _camSurfX/Y/Scale,
+        // framebuffer size, and the QGraphicsView affine. The flattened-
+        // view path emits scene coords directly from surface coords via
+        // surfaceToScene(), so a pan/zoom with no other fingerprint field
+        // changing must still force a rebuild — otherwise cached overlay
+        // items stay at stale scene positions. Plane view path gets it
+        // implicitly via roi{X,Y,W,H} (derived from _view->mapToScene)
+        // so cameraHash stays 0 there.
+        size_t cameraHash = 0;
         bool valid = false;
         bool operator==(const IntersectFingerprint&) const = default;
     };
     IntersectFingerprint _lastIntersectFp;
+    // Coalescing flag. renderIntersections() (public, called from UI
+    // setters) just sets this and reuses the existing _renderTimer
+    // tick; the actual rtree + triangle-clip work runs once per tick
+    // inside renderIntersectionsNow().
+    bool _intersectionsDirty = false;
+
+    // Flattened-intersection worker state. The heavy rtree walk + triangle
+    // clip used to run on the main thread, blocking input processing on
+    // surfaces with millions of patches. We now dispatch it to a thread
+    // pool task; while a worker is in flight we skip scheduling another.
+    // Cooked paths are handed back via a queued QMetaObject::invokeMethod
+    // lambda and applied to the scene on the main thread.
+    std::atomic<bool> _flattenedWorkerBusy{false};
+    // Same for the plane-view intersection path (computePlaneIntersections
+    // + grouping). Async pattern is identical — worker computes the raw
+    // intersection segments, main thread builds QGraphicsPathItems.
+    std::atomic<bool> _planeWorkerBusy{false};
+    // Counts all background tasks that hold `this` (render worker,
+    // intersection workers). The destructor spins on this reaching zero
+    // before letting members go — otherwise a QThreadPool task still
+    // running inside renderIntoFramebuffer() or an intersection compute
+    // will dereference freed memory on app exit (observed as SIGSEGV
+    // at shutdown after a warm-cache session).
+    std::atomic<int> _backgroundWorkers{0};
 
     // --- Chunk-ready listener ---
     vc::cache::BlockPipeline::ChunkReadyCallbackId _chunkCbId = 0;
     bool _hadValidDataBounds = false;
     bool _dirtyWhileMinimized = false;
+
+    // TickCoordinator viewport slot. Acquired lazily on first publish and
+    // released in the destructor. -1 means "no slot" (either coordinator
+    // missing, or allocation table was full at ctor time).
+    int _tickViewportSlot = -1;
 };
