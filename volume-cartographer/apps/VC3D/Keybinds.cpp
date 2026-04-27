@@ -253,6 +253,14 @@ const KeyPressDef SegmentationUndo{
     Qt::ControlModifier,
     true
 };
+const KeyPressDef ManualAddToggle{
+    "manual_add_toggle",
+    kSectionSegEditing,
+    "Toggle Manual Add mode",
+    Qt::Key_E,
+    Qt::ShiftModifier,
+    true
+};
 const KeyPressDef LineDrawHold{
     "line_draw_hold",
     kSectionSegEditing,
@@ -389,6 +397,14 @@ const KeyPressDef GrowthStepAll{
     Qt::NoModifier,
     true
 };
+const KeyPressDef GrowthFill{
+    "growth_fill",
+    kSectionSegGrowth,
+    "Fill growth without expanding the Patch Tracer grid",
+    Qt::Key_5,
+    Qt::ShiftModifier,
+    true
+};
 
 const KeyPressDef DeletePoint{
     "delete_point",
@@ -494,6 +510,7 @@ QString buildKeybindsHelpText()
         { kSectionSegments, shortcuts::CyclePrevSegment.description, HelpKeyType::Shortcut, &shortcuts::CyclePrevSegment, nullptr, nullptr },
 
         { kSectionSegEditing, keypress::SegmentationUndo.description, HelpKeyType::KeyPress, nullptr, &keypress::SegmentationUndo, nullptr },
+        { kSectionSegEditing, keypress::ManualAddToggle.description, HelpKeyType::KeyPress, nullptr, &keypress::ManualAddToggle, nullptr },
         { kSectionSegEditing, keypress::LineDrawHold.description, HelpKeyType::KeyPress, nullptr, &keypress::LineDrawHold, nullptr },
         { kSectionSegEditing, keypress::ToggleAnnotation.description, HelpKeyType::KeyPress, nullptr, &keypress::ToggleAnnotation, nullptr },
         { kSectionSegEditing, "Add correction point", HelpKeyType::Literal, nullptr, nullptr, "  Click" },
@@ -513,6 +530,7 @@ QString buildKeybindsHelpText()
         { kSectionSegGrowth, keypress::GrowthRight.description, HelpKeyType::KeyPress, nullptr, &keypress::GrowthRight, nullptr },
         { kSectionSegGrowth, keypress::GrowthAll.description, HelpKeyType::KeyPress, nullptr, &keypress::GrowthAll, nullptr },
         { kSectionSegGrowth, keypress::GrowthStepAll.description, HelpKeyType::KeyPress, nullptr, &keypress::GrowthStepAll, nullptr },
+        { kSectionSegGrowth, keypress::GrowthFill.description, HelpKeyType::KeyPress, nullptr, &keypress::GrowthFill, nullptr },
 
         { kSectionPushPull, keypress::PushPullIn.description, HelpKeyType::KeyPress, nullptr, &keypress::PushPullIn, nullptr },
         { kSectionPushPull, keypress::PushPullOut.description, HelpKeyType::KeyPress, nullptr, &keypress::PushPullOut, nullptr },

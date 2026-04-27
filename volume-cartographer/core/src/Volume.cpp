@@ -30,6 +30,26 @@
 static const std::filesystem::path METADATA_FILE = "meta.json";
 static const std::filesystem::path METADATA_FILE_ALT = "metadata.json";
 
+namespace
+{
+
+bool isRemoteAuthError(const std::exception& e)
+{
+    const std::string msg = e.what();
+    return msg.find("AWS credentials") != std::string::npos ||
+           msg.find("Access denied") != std::string::npos ||
+           msg.find("ExpiredToken") != std::string::npos ||
+           msg.find("InvalidToken") != std::string::npos ||
+           msg.find("TokenRefreshRequired") != std::string::npos ||
+           msg.find("InvalidAccessKeyId") != std::string::npos ||
+           msg.find("SignatureDoesNotMatch") != std::string::npos ||
+           msg.find("HTTP 400") != std::string::npos ||
+           msg.find("HTTP 401") != std::string::npos ||
+           msg.find("HTTP 403") != std::string::npos;
+}
+
+} // namespace
+
 Volume::Volume(std::filesystem::path path) : path_(std::move(path))
 {
     loadMetadata();
@@ -267,8 +287,21 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
         root = fs::path(std::getenv("HOME") ? std::getenv("HOME") : "/tmp") / ".VC3D" / "remote_cache";
     }
 
-    // Fetch remote metadata (downloads .zarray files, synthesizes meta.json)
-    auto info = vc::cache::fetchRemoteZarrMetadata(resolved.httpsUrl, root, auth);
+    // Fetch remote metadata (downloads .zarray files, synthesizes meta.json).
+    // If stale AWS credentials are present, public buckets may reject the
+    // signed request even though the same object is readable anonymously.
+    vc::cache::RemoteZarrInfo info;
+    try {
+        info = vc::cache::fetchRemoteZarrMetadata(resolved.httpsUrl, root, auth);
+    } catch (const std::exception& e) {
+        if (!resolved.useAwsSigv4 || auth.empty() || !isRemoteAuthError(e)) {
+            throw;
+        }
+
+        vc::cache::HttpAuth anonymousAuth;
+        info = vc::cache::fetchRemoteZarrMetadata(resolved.httpsUrl, root, anonymousAuth);
+        auth = std::move(anonymousAuth);
+    }
 
     // Temporarily skip shape validation (staging dir has no chunk data)
     struct SkipShapeGuard {
@@ -743,5 +776,4 @@ const Volume::DataBounds& Volume::dataBounds() const
     });
     return dataBounds_;
 }
-
 

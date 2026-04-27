@@ -59,6 +59,7 @@ extern const KeyPressDef ApprovalPaintToggle;
 extern const KeyPressDef UnapprovalPaintToggle;
 extern const KeyPressDef ApprovalUndo;
 extern const KeyPressDef SegmentationUndo;
+extern const KeyPressDef ManualAddToggle;
 extern const KeyPressDef LineDrawHold;
 extern const KeyPressDef GrowSegmentation;
 extern const KeyPressDef CancelOperation;
@@ -76,6 +77,7 @@ extern const KeyPressDef GrowthDown;
 extern const KeyPressDef GrowthRight;
 extern const KeyPressDef GrowthAll;
 extern const KeyPressDef GrowthStepAll;
+extern const KeyPressDef GrowthFill;
 
 extern const KeyPressDef DeletePoint;
 } // namespace keypress

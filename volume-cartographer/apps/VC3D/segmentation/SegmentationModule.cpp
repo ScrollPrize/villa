@@ -8,6 +8,7 @@
 #include "tools/SegmentationLineTool.hpp"
 #include "tools/SegmentationPushPullTool.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
+#include "tools/SurfaceMaskBrushTool.hpp"
 #include "tools/CellReoptimizationTool.hpp"
 #include "growth/SegmentationCorrections.hpp"
 #include "ViewerManager.hpp"
@@ -15,24 +16,30 @@
 
 #include "vc/ui/VCCollection.hpp"
 
+#include <QApplication>
 #include <QDebug>
+#include <QCursor>
 #include <QLoggingCategory>
+#include <QPointF>
 #include <QPointer>
 #include <QString>
 #include <QTimer>
 #include <QtConcurrent/QtConcurrent>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <optional>
 #include <limits>
 #include <exception>
+#include <set>
 #include <utility>
 #include <vector>
 
 #include "utils/Json.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/PlaneSurface.hpp"
 
 
 Q_LOGGING_CATEGORY(lcSegModule, "vc.segmentation.module")
@@ -56,6 +63,37 @@ void ensureSurfaceMetaObject(QuadSurface* surface)
         return;
     }
     surface->meta = utils::Json::object();
+}
+
+std::optional<std::pair<int, int>> segmentationSceneToGrid(CTiledVolumeViewer* viewer,
+                                                           const QPointF& scenePos,
+                                                           int rows,
+                                                           int cols)
+{
+    if (!viewer || rows <= 0 || cols <= 0) {
+        return std::nullopt;
+    }
+
+    const cv::Vec2f surfaceCoords = viewer->sceneToSurfaceCoords(scenePos);
+    int col = 0;
+    int row = 0;
+    if (auto* quad = dynamic_cast<QuadSurface*>(viewer->currentSurface())) {
+        const cv::Vec2f surfScale = quad->scale();
+        const cv::Vec3f center = quad->center();
+        if (std::abs(surfScale[0]) < 1e-6f || std::abs(surfScale[1]) < 1e-6f) {
+            return std::nullopt;
+        }
+        col = static_cast<int>(std::lround((surfaceCoords[0] + center[0]) * surfScale[0]));
+        row = static_cast<int>(std::lround((surfaceCoords[1] + center[1]) * surfScale[1]));
+    } else {
+        col = static_cast<int>(std::lround(surfaceCoords[0]));
+        row = static_cast<int>(std::lround(surfaceCoords[1]));
+    }
+
+    if (row < 0 || row >= rows || col < 0 || col >= cols) {
+        return std::nullopt;
+    }
+    return std::make_pair(row, col);
 }
 }
 
@@ -134,6 +172,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _autoApprovalRadius = _widget->autoApprovalRadius();
         _autoApprovalThreshold = _widget->autoApprovalThreshold();
         _autoApprovalMaxDistance = _widget->autoApprovalMaxDistance();
+        _drawMaskEnabled = _widget->drawMaskEnabled();
     }
 
     if (_overlay) {
@@ -150,6 +189,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     _pushPullTool->setAlphaConfig(initialAlphaConfig);
 
     _approvalTool = std::make_unique<ApprovalMaskBrushTool>(*this, _editManager, _widget);
+    _surfaceMaskTool = std::make_unique<SurfaceMaskBrushTool>(*this);
 
     _cellReoptTool = std::make_unique<CellReoptimizationTool>(*this, _editManager, _overlay, _pointCollection, this);
     connect(_cellReoptTool.get(), &CellReoptimizationTool::statusMessage,
@@ -165,6 +205,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
             });
 
     _corrections = std::make_unique<segmentation::CorrectionsState>(*this, _widget, _pointCollection);
+    _manualAddTool = std::make_unique<ManualAddTool>();
 
     useFalloff(FalloffTool::Drag);
 
@@ -264,30 +305,47 @@ void SegmentationModule::setHoverPreviewEnabled(bool enabled)
 bool SegmentationModule::ensureHoverTarget()
 {
     if (!_editManager || !_editManager->hasSession()) {
+        qCWarning(lcSegModule) << "Cannot resolve segmentation hover target: no active editing session.";
         return false;
     }
-    if (_hoverPreviewEnabled && _hover.valid) {
-        if (!_hoverPointer.valid || _hover.viewer == _hoverPointer.viewer) {
-            return true;
-        }
+
+    // Push/pull calls this from a timer while the cursor can move between
+    // mouse-move events delivered to the segmentation module. Refresh from the
+    // viewer cursor first so the resolved grid target follows the mouse even
+    // when hover preview is disabled.
+    recoverHoverPointerFromCursor();
+
+    if (_hover.valid && _hoverPointer.valid && _hover.viewer != _hoverPointer.viewer) {
         _hover.clear();
     }
+
     if (!_hoverPointer.valid) {
+        qCWarning(lcSegModule) << "Cannot resolve segmentation hover target: no cursor sample for a segmentation viewer.";
         return false;
     }
     CTiledVolumeViewer* viewer = _hoverPointer.viewer.data();
     if (!viewer) {
+        _hoverPointer.valid = false;
+        qCWarning(lcSegModule) << "Cannot resolve segmentation hover target: cursor sample viewer no longer exists.";
+        return false;
+    }
+    if (!isSegmentationViewer(viewer)) {
+        qCWarning(lcSegModule) << "Cannot resolve segmentation hover target: viewer is not a segmentation viewer:"
+                               << QString::fromStdString(viewer->surfName());
         _hoverPointer.valid = false;
         return false;
     }
     auto gridIndex = _editManager->worldToGridIndex(_hoverPointer.world);
     if (!gridIndex) {
         _hover.clear();
+        qCWarning(lcSegModule) << "Cannot resolve segmentation hover target: surface patch index lookup failed.";
         return false;
     }
     auto world = _editManager->vertexWorldPosition(gridIndex->first, gridIndex->second);
     if (!world) {
         _hover.clear();
+        qCWarning(lcSegModule) << "Cannot resolve segmentation hover target: resolved grid vertex is invalid"
+                               << "row" << gridIndex->first << "col" << gridIndex->second;
         return false;
     }
     _hover.set(gridIndex->first, gridIndex->second, *world, viewer);
@@ -302,6 +360,8 @@ void SegmentationModule::bindWidgetSignals()
 
     connect(_widget, &SegmentationWidget::editingModeChanged,
             this, &SegmentationModule::setEditingEnabled);
+    connect(_widget, &SegmentationWidget::drawMaskChanged,
+            this, &SegmentationModule::setDrawMaskEnabled);
     connect(_widget, &SegmentationWidget::dragRadiusChanged,
             this, &SegmentationModule::setDragRadius);
     connect(_widget, &SegmentationWidget::dragSigmaChanged,
@@ -398,6 +458,19 @@ void SegmentationModule::bindWidgetSignals()
                                           SegmentationGrowthDirection::All,
                                           0, false);
             });
+    connect(_widget, &SegmentationWidget::manualAddConfigChanged, this, [this]() {
+        if (_manualAddTool && _widget) {
+            _manualAddTool->setConfig(_widget->manualAddConfig());
+        }
+    });
+    connect(_widget, &SegmentationWidget::manualAddClearPendingRequested,
+            this, &SegmentationModule::clearManualAddPending);
+    connect(_widget, &SegmentationWidget::manualAddRecomputeRequested,
+            this, &SegmentationModule::recomputeManualAdd);
+    connect(_widget, &SegmentationWidget::manualAddApplyExitRequested,
+            this, [this]() { finishManualAdd(true); });
+    connect(_widget, &SegmentationWidget::manualAddCancelRequested,
+            this, [this]() { finishManualAdd(false); });
 }
 
 void SegmentationModule::bindViewerSignals(CTiledVolumeViewer* viewer)
@@ -410,20 +483,23 @@ void SegmentationModule::bindViewerSignals(CTiledVolumeViewer* viewer)
             this, [this, viewer](const cv::Vec3f& worldPos,
                                  const cv::Vec3f& normal,
                                  Qt::MouseButton button,
-                                 Qt::KeyboardModifiers modifiers) {
-                handleMousePress(viewer, worldPos, normal, button, modifiers);
+                                 Qt::KeyboardModifiers modifiers,
+                                 const QPointF& scenePos) {
+                handleMousePress(viewer, worldPos, normal, button, modifiers, scenePos);
             });
     connect(viewer, &CTiledVolumeViewer::sendMouseMoveVolume,
             this, [this, viewer](const cv::Vec3f& worldPos,
                                  Qt::MouseButtons buttons,
-                                 Qt::KeyboardModifiers modifiers) {
-                handleMouseMove(viewer, worldPos, buttons, modifiers);
+                                 Qt::KeyboardModifiers modifiers,
+                                 const QPointF& scenePos) {
+                handleMouseMove(viewer, worldPos, buttons, modifiers, scenePos);
             });
     connect(viewer, &CTiledVolumeViewer::sendMouseReleaseVolume,
             this, [this, viewer](const cv::Vec3f& worldPos,
                                  Qt::MouseButton button,
-                                 Qt::KeyboardModifiers modifiers) {
-                handleMouseRelease(viewer, worldPos, button, modifiers);
+                                 Qt::KeyboardModifiers modifiers,
+                                 const QPointF& scenePos) {
+                handleMouseRelease(viewer, worldPos, button, modifiers, scenePos);
             });
     connect(viewer, &CTiledVolumeViewer::sendSegmentationRadiusWheel,
             this, [this, viewer](int steps, const QPointF& scenePoint, const cv::Vec3f& worldPos) {
@@ -468,6 +544,7 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     }
     updateViewerCursors();
     if (!enabled) {
+        resetManualAddState(true);
         stopAllPushPull();
         setCorrectionsAnnotateMode(false, false);
         clearLineDragStroke();
@@ -521,6 +598,8 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
 {
     qCInfo(lcSegModule) << "Active segment changed";
 
+    resetManualAddState(true);
+
     // Flush any pending approval mask saves and clear images BEFORE turning off editing
     // loadApprovalMaskImage(nullptr) does both:
     // 1. Saves pending changes to _approvalSaveSurface (the previous segment)
@@ -528,6 +607,10 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
     // This prevents the old mask from being incorrectly saved to the new segment
     if (_overlay) {
         _overlay->loadApprovalMaskImage(nullptr);
+    }
+    if (_surfaceMaskTool) {
+        _surfaceMaskTool->setSurface(newSurface);
+        _surfaceMaskTool->setActive(_drawMaskEnabled);
     }
 
     // Turn off any approval mask editing when switching segments
@@ -726,6 +809,39 @@ void SegmentationModule::setEditUnapprovedMask(bool enabled)
         if (wasEditing) {
             saveApprovalMaskToDisk();
         }
+    }
+
+    refreshOverlay();
+}
+
+void SegmentationModule::setDrawMaskEnabled(bool enabled)
+{
+    if (_drawMaskEnabled == enabled) {
+        return;
+    }
+
+    _drawMaskEnabled = enabled;
+    _shiftDrawMaskActive = false;
+
+    if (_surfaceMaskTool) {
+        _surfaceMaskTool->setActive(_drawMaskEnabled);
+
+        QuadSurface* surface = nullptr;
+        std::shared_ptr<Surface> surfaceHolder;
+        if (_state) {
+            surfaceHolder = _state->surface("segmentation");
+            surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
+        }
+        if (!surface && _editManager && _editManager->hasSession()) {
+            surface = _editManager->baseSurface().get();
+        }
+        _surfaceMaskTool->setSurface(surface);
+    }
+
+    if (enabled) {
+        clearLineDragStroke();
+        stopAllPushPull();
+        cancelDrag();
     }
 
     refreshOverlay();
@@ -1010,8 +1126,13 @@ void SegmentationModule::setGrowthInProgress(bool running)
         setCorrectionsAnnotateMode(false, false);
         clearLineDragStroke();
         _lineDrawKeyActive = false;
+        resetHoverLookupDetail();
+    } else if (_editingEnabled && _hoverPreviewEnabled && !_hover.valid) {
+        recoverHoverPointerFromCursor();
+        ensureHoverTarget();
     }
     updateCorrectionsWidget();
+    refreshOverlay();
     emit growthInProgressChanged(_growthInProgress);
 }
 
@@ -1146,17 +1267,22 @@ void SegmentationModule::refreshOverlay()
         const auto& linePts = _lineTool->overlayPoints();
         maskPoints.insert(maskPoints.end(), linePts.begin(), linePts.end());
     }
+    if (_surfaceMaskTool) {
+        state.surfaceMaskPoints = _surfaceMaskTool->overlaySurfacePoints();
+    }
 
     const bool hasLineStroke = _lineTool && !_lineTool->overlayPoints().empty();
     const bool lineStrokeActive = _lineTool && _lineTool->strokeActive();
+    const bool surfaceMaskActive = _surfaceMaskTool && _surfaceMaskTool->active();
+    const bool surfaceMaskStrokeActive = _surfaceMaskTool && _surfaceMaskTool->strokeActive();
     const bool pushPullActive = _pushPullTool && _pushPullTool->isActive();
 
     state.maskPoints = std::move(maskPoints);
-    state.maskVisible = !state.maskPoints.empty();
+    state.maskVisible = !state.maskPoints.empty() || !state.surfaceMaskPoints.empty();
     state.hasLineStroke = hasLineStroke;
     state.lineStrokeActive = lineStrokeActive;
-    state.brushActive = false;
-    state.brushStrokeActive = false;
+    state.brushActive = surfaceMaskActive;
+    state.brushStrokeActive = surfaceMaskStrokeActive;
     state.pushPullActive = pushPullActive;
 
     FalloffTool overlayTool = _activeFalloff;
@@ -1167,6 +1293,76 @@ void SegmentationModule::refreshOverlay()
     }
 
     state.displayRadiusSteps = falloffRadius(overlayTool);
+    if (surfaceMaskActive || surfaceMaskStrokeActive) {
+        state.displayRadiusSteps = _approvalMaskBrushRadius;
+    }
+
+    if (_manualAddMode && _manualAddTool) {
+        state.manualAddActive = true;
+        state.manualAddTintOpacity = _manualAddTool->config().tintOpacity;
+        state.manualAddRevision = _manualAddTool->revision();
+        const auto& preview = _manualAddTool->previewPoints();
+        auto convertLine = [&](const ManualAddTool::GridPolyline& source) {
+            SegmentationOverlayController::State::ManualAddLine line;
+            line.committed = source.committed;
+            line.surfacePoints.reserve(source.vertices.size());
+            line.worldPoints.reserve(source.vertices.size());
+            for (const auto& p : source.vertices) {
+                const int row = p.y;
+                const int col = p.x;
+                line.surfacePoints.push_back(QPointF(col, row));
+                if (row >= 0 && row < preview.rows && col >= 0 && col < preview.cols &&
+                    !ManualAddTool::isInvalidPoint(preview(row, col))) {
+                    line.worldPoints.push_back(preview(row, col));
+                }
+            }
+            return line;
+        };
+        for (const auto& line : _manualAddTool->hoverPolylines()) {
+            state.manualAddHoverLines.push_back(convertLine(line));
+        }
+        for (const auto& line : _manualAddTool->committedPolylines()) {
+            state.manualAddCommittedLines.push_back(convertLine(line));
+        }
+        if (auto hover = _manualAddTool->hoverVertex()) {
+            state.manualAddHoverVertex = QPointF(hover->col, hover->row);
+            state.manualAddHoverCrossFill =
+                _manualAddTool->config().linePreviewMode == ManualAddTool::LinePreviewMode::CrossFill;
+        }
+        for (const auto& key : _manualAddTool->fillVertices()) {
+            if (key.row >= 0 && key.row < preview.rows && key.col >= 0 && key.col < preview.cols &&
+                !ManualAddTool::isInvalidPoint(preview(key.row, key.col))) {
+                state.manualAddPreviewVertices.push_back(preview(key.row, key.col));
+            }
+        }
+        std::set<std::pair<int, int>> previewCells;
+        for (const auto& key : _manualAddTool->fillVertices()) {
+            for (int row = key.row - 1; row <= key.row; ++row) {
+                for (int col = key.col - 1; col <= key.col; ++col) {
+                    if (row >= 0 && row + 1 < preview.rows && col >= 0 && col + 1 < preview.cols) {
+                        previewCells.insert({row, col});
+                    }
+                }
+            }
+        }
+        state.manualAddPreviewQuads.reserve(previewCells.size());
+        for (const auto& [row, col] : previewCells) {
+            const std::array<cv::Vec3f, 4> quad{
+                preview(row, col),
+                preview(row, col + 1),
+                preview(row + 1, col + 1),
+                preview(row + 1, col)
+            };
+            if (std::all_of(quad.begin(), quad.end(), [](const cv::Vec3f& point) {
+                    return !ManualAddTool::isInvalidPoint(point);
+                })) {
+                state.manualAddPreviewQuads.push_back(quad);
+            }
+        }
+        for (const auto& constraint : _manualAddTool->userPlaneConstraints()) {
+            state.manualAddPlaneConstraints.push_back(constraint.world);
+        }
+    }
 
     _overlay->applyState(state);
 }
@@ -1419,6 +1615,15 @@ void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod met
                                                     int steps,
                                                     bool inpaintOnly)
 {
+    if (method == SegmentationGrowthMethod::ManualAdd) {
+        emit statusMessageRequested(tr("Manual Add is interactive; use Shift+E and the Manual Add panel."), kStatusMedium);
+        return;
+    }
+    if (_manualAddMode) {
+        emit statusMessageRequested(tr("Apply or cancel Manual Add before running growth."), kStatusMedium);
+        return;
+    }
+
     const bool allowZeroSteps = inpaintOnly || method == SegmentationGrowthMethod::Corrections;
     int sanitizedSteps = allowZeroSteps ? std::max(0, steps) : std::max(1, steps);
     const bool usingCorrections = !inpaintOnly &&
@@ -1452,6 +1657,294 @@ void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod met
     }
     markNextEditsFromGrowth();
     emit growSurfaceRequested(method, direction, sanitizedSteps, inpaintOnly);
+}
+
+bool SegmentationModule::beginManualAdd()
+{
+    if (_manualAddMode) {
+        return true;
+    }
+    if (!_widget || !_editManager) {
+        return false;
+    }
+    if (!_editingEnabled) {
+        setEditingEnabled(true);
+        _widget->setEditingEnabled(true);
+    }
+    if (!_editManager->hasSession()) {
+        emit statusMessageRequested(tr("Open a segmentation editing session before Manual Add."), kStatusMedium);
+        return false;
+    }
+    if (_editManager->hasPendingChanges()) {
+        emit statusMessageRequested(tr("Apply or cancel pending edits before Manual Add."), kStatusMedium);
+        return false;
+    }
+    if (_saveInProgress || _pendingAutosave) {
+        emit statusMessageRequested(tr("Wait for the current save before Manual Add."), kStatusMedium);
+        return false;
+    }
+
+    stopAllPushPull();
+    clearLineDragStroke();
+    cancelDrag();
+    cancelCorrectionDrag();
+    setCorrectionsAnnotateMode(false, false);
+    setEditApprovedMask(false);
+    setEditUnapprovedMask(false);
+    setCellReoptimizationMode(false);
+
+    _previousGrowthMethodBeforeManualAdd = _widget->growthMethod();
+    _widget->setGrowthMethod(SegmentationGrowthMethod::ManualAdd);
+    if (!_manualAddTool) {
+        _manualAddTool = std::make_unique<ManualAddTool>();
+    }
+    if (!_manualAddTool->begin(_editManager->previewPoints(), _widget->manualAddConfig())) {
+        emit statusMessageRequested(tr("Manual Add could not read the active surface."), kStatusMedium);
+        return false;
+    }
+    _manualAddMode = true;
+    _widget->setManualAddActive(true);
+    refreshOverlay();
+    emit statusMessageRequested(tr("Manual Add enabled."), kStatusShort);
+    return true;
+}
+
+bool SegmentationModule::finishManualAdd(bool apply)
+{
+    if (!_manualAddMode || !_manualAddTool) {
+        return false;
+    }
+
+    if (apply) {
+        if (_editManager) {
+            std::optional<cv::Rect> bounds;
+            if (!_editManager->setPreviewPointsOnly(_manualAddTool->previewPoints(),
+                                                    _manualAddTool->changedVertices(),
+                                                    true,
+                                                    &bounds)) {
+                emit statusMessageRequested(tr("Manual Add final preview update failed."), kStatusMedium);
+                return false;
+            }
+            if (_state && _editManager->previewSurface()) {
+                _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+            }
+            emitPendingChanges();
+            refreshOverlay();
+        }
+        if (_editManager && _editManager->hasPendingChanges()) {
+            applyEdits();
+        }
+        emit statusMessageRequested(tr("Manual Add applied and saved."), kStatusMedium);
+    } else {
+        if (_editManager) {
+            _editManager->restorePreviewSnapshot(_manualAddTool->entrySnapshotPoints());
+            if (_state && _editManager->previewSurface()) {
+                _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+            }
+        }
+        if (_widget) {
+            _widget->setGrowthMethod(_previousGrowthMethodBeforeManualAdd);
+        }
+        emitPendingChanges();
+        emit statusMessageRequested(tr("Manual Add canceled."), kStatusShort);
+    }
+
+    _manualAddMode = false;
+    _manualAddTool->clear();
+    if (_widget) {
+        _widget->setManualAddActive(false);
+    }
+    refreshOverlay();
+    return true;
+}
+
+void SegmentationModule::resetManualAddState(bool restorePreview)
+{
+    if (_manualAddMode && _manualAddTool && restorePreview && _editManager) {
+        _editManager->restorePreviewSnapshot(_manualAddTool->entrySnapshotPoints());
+        if (_state && _editManager->previewSurface()) {
+            _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+        }
+        emitPendingChanges();
+    }
+
+    if (_manualAddTool) {
+        _manualAddTool->clear();
+    }
+
+    const bool wasManualAddMode = _manualAddMode;
+    _manualAddMode = false;
+
+    if (_widget) {
+        _widget->setManualAddActive(false);
+        if (_widget->growthMethod() == SegmentationGrowthMethod::ManualAdd) {
+            const auto fallback = _previousGrowthMethodBeforeManualAdd == SegmentationGrowthMethod::ManualAdd
+                ? SegmentationGrowthMethod::Tracer
+                : _previousGrowthMethodBeforeManualAdd;
+            _widget->setGrowthMethod(fallback);
+        }
+    }
+
+    if (wasManualAddMode) {
+        refreshOverlay();
+    }
+}
+
+bool SegmentationModule::recomputeManualAdd()
+{
+    if (!_manualAddMode || !_manualAddTool || !_editManager) {
+        return false;
+    }
+    std::string status;
+    if (!_manualAddTool->recompute(&status)) {
+        emit statusMessageRequested(QString::fromStdString(status), kStatusMedium);
+        return false;
+    }
+    std::optional<cv::Rect> bounds;
+    if (!_editManager->setPreviewPointsOnly(_manualAddTool->previewPoints(),
+                                            _manualAddTool->changedVertices(),
+                                            true,
+                                            &bounds)) {
+        emit statusMessageRequested(tr("Manual Add preview update failed."), kStatusMedium);
+        return false;
+    }
+    if (_state && _editManager->previewSurface()) {
+        _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+    }
+    emitPendingChanges();
+    refreshOverlay();
+    emit statusMessageRequested(QString::fromStdString(status), kStatusShort);
+    return true;
+}
+
+bool SegmentationModule::clearManualAddPending()
+{
+    if (!_manualAddMode || !_manualAddTool || !_editManager) {
+        return false;
+    }
+    if (!_manualAddTool->clearPending(_widget ? _widget->manualAddConfig() : ManualAddTool::Config{})) {
+        return false;
+    }
+    _editManager->restorePreviewSnapshot(_manualAddTool->entrySnapshotPoints());
+    if (_state && _editManager->previewSurface()) {
+        _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+    }
+    emitPendingChanges();
+    refreshOverlay();
+    emit statusMessageRequested(_manualAddTool->initialFillCommitted()
+                                    ? tr("Manual Add pending geometry cleared. Press Shift+E to save, then enable Manual Add again for another fill.")
+                                    : tr("Manual Add pending geometry cleared."),
+                                kStatusShort);
+    return true;
+}
+
+bool SegmentationModule::undoManualAddPlaneConstraint()
+{
+    if (!_manualAddMode || !_manualAddTool || !_editManager) {
+        return false;
+    }
+
+    std::string status;
+    if (!_manualAddTool->removeLastPlaneConstraint(&status)) {
+        emit statusMessageRequested(QString::fromStdString(status), kStatusShort);
+        return false;
+    }
+
+    std::optional<cv::Rect> bounds;
+    if (!_editManager->setPreviewPointsOnly(_manualAddTool->previewPoints(),
+                                            _manualAddTool->changedVertices(),
+                                            true,
+                                            &bounds)) {
+        emit statusMessageRequested(tr("Manual Add preview update failed."), kStatusMedium);
+        return false;
+    }
+    if (_state && _editManager->previewSurface()) {
+        _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+    }
+    emitPendingChanges();
+    refreshOverlay();
+    emit statusMessageRequested(QString::fromStdString(status), kStatusShort);
+    return true;
+}
+
+bool SegmentationModule::handleManualAddMousePress(CTiledVolumeViewer* viewer,
+                                                   const cv::Vec3f& worldPos,
+                                                   Qt::MouseButton button,
+                                                   Qt::KeyboardModifiers modifiers,
+                                                   const QPointF& scenePos)
+{
+    if (!_manualAddMode || !_manualAddTool || !viewer) {
+        return false;
+    }
+    if (viewer->surfName() == "segmentation" && button == Qt::LeftButton && modifiers == Qt::NoModifier) {
+        std::string status;
+        if (!_manualAddTool->commitHover(&status)) {
+            emit statusMessageRequested(QString::fromStdString(status), kStatusMedium);
+            return true;
+        }
+        return recomputeManualAdd();
+    }
+
+    auto* planeSurf = dynamic_cast<PlaneSurface*>(viewer->currentSurface());
+    if (planeSurf && modifiers.testFlag(Qt::ShiftModifier) &&
+        (button == Qt::LeftButton || button == Qt::RightButton)) {
+        if (button == Qt::RightButton) {
+            std::string status;
+            _manualAddTool->removePlaneConstraintNear(worldPos, _manualAddTool->config().planeConstraintRadius, &status);
+            emit statusMessageRequested(QString::fromStdString(status), kStatusShort);
+            return recomputeManualAdd();
+        }
+
+        const auto& preview = _manualAddTool->previewPoints();
+        const cv::Vec2f clickPlane = viewer->sceneToSurfaceCoords(scenePos);
+        const double radiusSq = _manualAddTool->config().planeConstraintRadius *
+                                _manualAddTool->config().planeConstraintRadius;
+        double bestDistSq = radiusSq;
+        std::optional<SegmentationEditManager::GridKey> best;
+        for (const auto& key : _manualAddTool->fillVertices()) {
+            if (key.row < 0 || key.row >= preview.rows || key.col < 0 || key.col >= preview.cols) {
+                continue;
+            }
+            const cv::Vec3f projected = planeSurf->project(preview(key.row, key.col), 1.0f, 1.0f);
+            const double dx = static_cast<double>(projected[0]) - clickPlane[0];
+            const double dy = static_cast<double>(projected[1]) - clickPlane[1];
+            const double distSq = dx * dx + dy * dy;
+            if (distSq <= bestDistSq) {
+                bestDistSq = distSq;
+                best = key;
+            }
+        }
+        std::string status;
+        if (!best || !_manualAddTool->addOrReplacePlaneConstraint(best->row, best->col, worldPos, &status)) {
+            emit statusMessageRequested(QString::fromStdString(status), kStatusMedium);
+            return true;
+        }
+        return recomputeManualAdd();
+    }
+    Q_UNUSED(scenePos);
+    return true;
+}
+
+bool SegmentationModule::handleManualAddMouseMove(CTiledVolumeViewer* viewer,
+                                                  Qt::MouseButtons buttons,
+                                                  const QPointF& scenePos)
+{
+    if (!_manualAddMode || !_manualAddTool || !viewer || buttons != Qt::NoButton) {
+        return false;
+    }
+    if (viewer->surfName() != "segmentation") {
+        return true;
+    }
+    const auto grid = segmentationSceneToGrid(viewer,
+                                              scenePos,
+                                              _manualAddTool->entrySnapshotPoints().rows,
+                                              _manualAddTool->entrySnapshotPoints().cols);
+    const bool changed = grid ? _manualAddTool->updateHover(grid->first, grid->second)
+                              : _manualAddTool->updateHover(-1, -1);
+    if (changed) {
+        refreshOverlay();
+    }
+    return true;
 }
 
 void SegmentationModule::clearLineDragStroke()
@@ -1649,6 +2142,59 @@ void SegmentationModule::resetHoverLookupDetail()
     _hoverLookup.lastWorld = cv::Vec3f(0.0f, 0.0f, 0.0f);
 }
 
+bool SegmentationModule::recoverHoverPointerFromCursor()
+{
+    const QPoint globalCursor = QCursor::pos();
+
+    CTiledVolumeViewer* targetViewer = nullptr;
+    if (QWidget* widget = QApplication::widgetAt(globalCursor)) {
+        for (QWidget* current = widget; current && !targetViewer; current = current->parentWidget()) {
+            for (auto* viewer : std::as_const(_attachedViewers)) {
+                if (!viewer || !isSegmentationViewer(viewer)) {
+                    continue;
+                }
+                if (current == viewer) {
+                    targetViewer = viewer;
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!targetViewer) {
+        for (auto* viewer : std::as_const(_attachedViewers)) {
+            if (!viewer || !isSegmentationViewer(viewer)) {
+                continue;
+            }
+            auto* graphicsView = viewer->fGraphicsView;
+            if (!graphicsView || !graphicsView->viewport()) {
+                continue;
+            }
+            const QPoint viewportCursor = graphicsView->viewport()->mapFromGlobal(globalCursor);
+            if (graphicsView->viewport()->rect().contains(viewportCursor)) {
+                targetViewer = viewer;
+                break;
+            }
+        }
+    }
+
+    if (targetViewer) {
+        auto* graphicsView = targetViewer->fGraphicsView;
+        if (!graphicsView || !graphicsView->viewport()) {
+            return false;
+        }
+        const QPoint viewportCursor = graphicsView->viewport()->mapFromGlobal(globalCursor);
+        if (!graphicsView->viewport()->rect().contains(viewportCursor)) {
+            return false;
+        }
+        const QPointF scenePos = graphicsView->mapToScene(viewportCursor);
+        recordPointerSample(targetViewer, targetViewer->sceneToVolume(scenePos));
+        return _hoverPointer.valid;
+    }
+
+    return false;
+}
+
 void SegmentationModule::recordPointerSample(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos)
 {
     if (!_editingEnabled || !_editManager || !_editManager->hasSession()) {
@@ -1674,48 +2220,77 @@ void SegmentationModule::recordPointerSample(CTiledVolumeViewer* viewer, const c
     _hoverPointer.world = worldPos;
 }
 
-void SegmentationModule::updateHover(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos)
+void SegmentationModule::updateHover(CTiledVolumeViewer* viewer,
+                                     const cv::Vec3f& worldPos,
+                                     const QPointF& scenePos)
 {
+    CTiledVolumeViewer* targetViewer = viewer;
+    cv::Vec3f targetWorld = worldPos;
     bool hoverChanged = false;
 
-    if (!_hoverPreviewEnabled) {
-        resetHoverLookupDetail();
+    const auto clearHover = [&]() {
         if (_hover.valid) {
             _hover.clear();
             hoverChanged = true;
         }
+    };
+
+    const auto setHover = [&](int row, int col, const cv::Vec3f& world) {
+        const bool rowChanged = !_hover.valid || _hover.row != row;
+        const bool colChanged = !_hover.valid || _hover.col != col;
+        const bool worldChanged = !_hover.valid || cv::norm(_hover.world - world) >= 1e-4f;
+        const bool viewerChanged = !_hover.valid || _hover.viewer != targetViewer;
+        if (rowChanged || colChanged || worldChanged || viewerChanged) {
+            _hover.set(row, col, world, targetViewer);
+            hoverChanged = true;
+        }
+    };
+
+    if (_growthInProgress) {
+        resetHoverLookupDetail();
+    } else if (!_editingEnabled || !_hoverPreviewEnabled) {
+        resetHoverLookupDetail();
+        clearHover();
     } else if (!_editManager || !_editManager->hasSession()) {
         resetHoverLookupDetail();
-        if (_hover.valid) {
-            _hover.clear();
-            hoverChanged = true;
-        }
+        clearHover();
     } else {
-        const auto detail = hoverLookupDetail(worldPos);
-        if (detail != SegmentationEditManager::GridSearchResolution::High) {
-            if (_hover.valid) {
-                _hover.clear();
-                hoverChanged = true;
+        if (!targetViewer || !isSegmentationViewer(targetViewer)) {
+            clearHover();
+        } else if (targetViewer->surfName() == "segmentation") {
+            const cv::Mat_<cv::Vec3f>& points = _editManager->previewPoints();
+            if (points.empty()) {
+                clearHover();
+            } else {
+                const auto grid = segmentationSceneToGrid(targetViewer, scenePos, points.rows, points.cols);
+                if (grid) {
+                    if (auto world = _editManager->vertexWorldPosition(grid->first, grid->second)) {
+                        setHover(grid->first, grid->second, *world);
+                    } else {
+                        clearHover();
+                    }
+                } else {
+                    clearHover();
+                }
             }
         } else {
-            auto gridIndex = _editManager->worldToGridIndex(worldPos, nullptr, detail);
-            if (!gridIndex) {
-                if (_hover.valid) {
-                    _hover.clear();
-                    hoverChanged = true;
+            float surfaceDistance = 0.0f;
+            if (auto gridIndex = _editManager->worldToGridIndex(targetWorld,
+                                                                &surfaceDistance,
+                                                                SegmentationEditManager::GridSearchResolution::High,
+                                                                false)) {
+                const float maxHoverDistance = std::max(gridStepWorld(), 1.0f) * 100.0f;
+                if (surfaceDistance <= maxHoverDistance) {
+                    if (auto world = _editManager->vertexWorldPosition(gridIndex->first, gridIndex->second)) {
+                        setHover(gridIndex->first, gridIndex->second, *world);
+                    } else {
+                        clearHover();
+                    }
+                } else {
+                    clearHover();
                 }
-            } else if (auto world = _editManager->vertexWorldPosition(gridIndex->first, gridIndex->second)) {
-                const bool rowChanged = !_hover.valid || _hover.row != gridIndex->first;
-                const bool colChanged = !_hover.valid || _hover.col != gridIndex->second;
-                const bool worldChanged = !_hover.valid || cv::norm(_hover.world - *world) >= 1e-4f;
-                const bool viewerChanged = !_hover.valid || _hover.viewer != viewer;
-                if (rowChanged || colChanged || worldChanged || viewerChanged) {
-                    _hover.set(gridIndex->first, gridIndex->second, *world, viewer);
-                    hoverChanged = true;
-                }
-            } else if (_hover.valid) {
-                _hover.clear();
-                hoverChanged = true;
+            } else {
+                clearHover();
             }
         }
     }

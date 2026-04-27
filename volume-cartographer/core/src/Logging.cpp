@@ -7,6 +7,11 @@
 #include <iomanip>
 #include <sstream>
 #include <vector>
+#include <atomic>
+
+namespace {
+std::atomic_bool g_debugLoggingEnabled{false};
+}
 
 // Internal implementation class
 class LoggerImpl {
@@ -127,4 +132,12 @@ void SetLogLevel(const std::string& s) {
     }
 
     Logger()->set_level(level);
+}
+
+void SetDebugLoggingEnabled(bool enabled) {
+    g_debugLoggingEnabled.store(enabled, std::memory_order_relaxed);
+}
+
+bool DebugLoggingEnabled() {
+    return g_debugLoggingEnabled.load(std::memory_order_relaxed);
 }

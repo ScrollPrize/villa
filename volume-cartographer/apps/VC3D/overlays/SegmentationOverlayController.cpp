@@ -16,8 +16,10 @@
 #include <algorithm>
 #include <cmath>
 #include <chrono>
+#include <exception>
 #include <filesystem>
 #include <limits>
+#include <tuple>
 #include <unordered_set>
 
 #include <opencv2/imgcodecs.hpp>
@@ -46,9 +48,25 @@ constexpr qreal kApprovalMaskZ = 50.0;  // Below mask path (60) but above most o
 constexpr qreal kSurfaceOverlapZ = 45.0;  // Below approval mask
 constexpr qreal kMarkerZ = 95.0;
 constexpr qreal kRadiusCircleZ = 80.0;
+constexpr float kManualAddPlaneDistanceTolerance = 10.0f;
+constexpr qreal kManualAddIntersectionZ = 121.0;
+constexpr float kManualAddIntersectionOpacityScale = 1.2f;
+constexpr float kManualAddIntersectionWidthScale = 1.3f;
+constexpr float kManualAddIntersectionMinWidthDelta = 0.75f;
 
 // Full opacity for mask pixels - the slider controls overall opacity via QGraphicsPixmapItem::setOpacity
 constexpr int kApprovalMaskAlpha = 255;
+
+QColor manualAddIntersectionColor()
+{
+    return QColor(0, 220, 255);
+}
+
+qreal manualAddIntersectionWidth(qreal baseWidth)
+{
+    return std::max(baseWidth * kManualAddIntersectionWidthScale,
+                    baseWidth + kManualAddIntersectionMinWidthDelta);
+}
 }
 
 bool SegmentationOverlayController::State::operator==(const State& rhs) const
@@ -119,6 +137,7 @@ bool SegmentationOverlayController::State::operator==(const State& rhs) const
     return optionalEqual(activeMarker, rhs.activeMarker) &&
            vectorEqual(neighbours, rhs.neighbours) &&
            maskEqual(maskPoints, rhs.maskPoints) &&
+           surfaceMaskPoints == rhs.surfaceMaskPoints &&
            maskVisible == rhs.maskVisible &&
            brushActive == rhs.brushActive &&
            brushStrokeActive == rhs.brushStrokeActive &&
@@ -142,7 +161,9 @@ bool SegmentationOverlayController::State::operator==(const State& rhs) const
            approvalBrushColor == rhs.approvalBrushColor &&
            surface == rhs.surface &&
            approvalHoverSurfacePos == rhs.approvalHoverSurfacePos &&
-           vec3fOptEqual(approvalHoverPlaneNormal, rhs.approvalHoverPlaneNormal);
+           vec3fOptEqual(approvalHoverPlaneNormal, rhs.approvalHoverPlaneNormal) &&
+           manualAddActive == rhs.manualAddActive &&
+           manualAddRevision == rhs.manualAddRevision;
 }
 
 SegmentationOverlayController::SegmentationOverlayController(CState* state, QObject* parent)
@@ -678,6 +699,213 @@ void SegmentationOverlayController::collectPrimitives(VolumeViewerBase* viewer,
 
     const State& state = *_currentState;
 
+    if (state.manualAddActive) {
+        const bool flattened = viewer->surfName() == "segmentation";
+        auto* tiledViewer = dynamic_cast<CTiledVolumeViewer*>(viewer);
+        auto* quadSurface = flattened ? dynamic_cast<QuadSurface*>(viewer->currentSurface()) : nullptr;
+        auto gridToScene = [&](const QPointF& grid) -> QPointF {
+            if (!tiledViewer || !quadSurface) {
+                return {};
+            }
+            const cv::Vec2f surfScale = quadSurface->scale();
+            const cv::Vec3f center = quadSurface->center();
+            if (std::abs(surfScale[0]) < 1e-6f || std::abs(surfScale[1]) < 1e-6f) {
+                return {};
+            }
+            const float surfX = static_cast<float>(grid.x()) / surfScale[0] - center[0];
+            const float surfY = static_cast<float>(grid.y()) / surfScale[1] - center[1];
+            return tiledViewer->surfaceCoordsToScene(surfX, surfY);
+        };
+        auto drawLine = [&](const State::ManualAddLine& line) {
+            std::vector<QPointF> points;
+            if (flattened) {
+                points.reserve(line.surfacePoints.size());
+                for (const QPointF& grid : line.surfacePoints) {
+                    const QPointF scene = gridToScene(grid);
+                    if (std::isfinite(scene.x()) && std::isfinite(scene.y())) {
+                        points.push_back(scene);
+                    }
+                }
+            } else if (auto* plane = dynamic_cast<PlaneSurface*>(viewer->currentSurface())) {
+                Q_UNUSED(plane);
+                return;
+            } else {
+                points = volumeToScene(viewer, line.worldPoints);
+            }
+            if (points.size() < 2) {
+                return;
+            }
+            ViewerOverlayControllerBase::OverlayStyle style;
+            style.penColor = line.committed ? QColor(0, 220, 255, 240) : QColor(255, 220, 0, 230);
+            style.penWidth = 3.0;
+            style.z = 110.0;
+            builder.addLineStrip(points, false, style);
+        };
+        for (const auto& line : state.manualAddCommittedLines) {
+            drawLine(line);
+        }
+        for (const auto& line : state.manualAddHoverLines) {
+            drawLine(line);
+        }
+        if (flattened && state.manualAddHoverVertex) {
+            const QPointF scene = gridToScene(*state.manualAddHoverVertex);
+            if (std::isfinite(scene.x()) && std::isfinite(scene.y())) {
+                ViewerOverlayControllerBase::OverlayStyle hoverStyle;
+                hoverStyle.penColor = QColor(255, 255, 255, 250);
+                hoverStyle.brushColor = state.manualAddHoverCrossFill ? Qt::transparent : QColor(255, 220, 0, 220);
+                hoverStyle.penWidth = 2.0;
+                hoverStyle.z = 112.0;
+                builder.addCircle(scene, state.manualAddHoverCrossFill ? 8.0 : 5.0, !state.manualAddHoverCrossFill, hoverStyle);
+            }
+        }
+        if (!flattened) {
+            auto* plane = dynamic_cast<PlaneSurface*>(viewer->currentSurface());
+            if (plane) {
+                ViewerOverlayControllerBase::OverlayStyle previewStyle;
+                previewStyle.penColor = manualAddIntersectionColor();
+                previewStyle.penColor.setAlphaF(std::clamp(viewer->intersectionOpacity() *
+                                                           kManualAddIntersectionOpacityScale,
+                                                           0.0f,
+                                                           1.0f));
+                previewStyle.penWidth = manualAddIntersectionWidth(viewer->intersectionThickness());
+                previewStyle.z = kManualAddIntersectionZ;
+
+                auto addUnique = [](std::vector<cv::Vec3f>& points, const cv::Vec3f& candidate) {
+                    for (const cv::Vec3f& point : points) {
+                        if (cv::norm(point - candidate) < 1e-3f) {
+                            return;
+                        }
+                    }
+                    points.push_back(candidate);
+                };
+
+                constexpr int kEdges[4][2] = {{0, 1}, {1, 2}, {2, 3}, {3, 0}};
+                constexpr float kPlaneEpsilon = 1e-3f;
+                std::vector<std::pair<cv::Vec3f, cv::Vec3f>> segments;
+                for (const auto& quad : state.manualAddPreviewQuads) {
+                    std::vector<cv::Vec3f> intersections;
+                    for (const auto& edge : kEdges) {
+                        const cv::Vec3f& a = quad[edge[0]];
+                        const cv::Vec3f& b = quad[edge[1]];
+                        const float da = plane->scalarp(a);
+                        const float db = plane->scalarp(b);
+                        const bool aOnPlane = std::abs(da) <= kPlaneEpsilon;
+                        const bool bOnPlane = std::abs(db) <= kPlaneEpsilon;
+                        if (aOnPlane) {
+                            addUnique(intersections, a);
+                        }
+                        if (bOnPlane) {
+                            addUnique(intersections, b);
+                        }
+                        if (aOnPlane || bOnPlane || da * db > 0.0f) {
+                            continue;
+                        }
+                        const float t = da / (da - db);
+                        addUnique(intersections, a + (b - a) * t);
+                    }
+                    if (intersections.size() == 2) {
+                        segments.push_back({intersections[0], intersections[1]});
+                    } else if (intersections.size() > 2) {
+                        std::pair<int, int> farthest{0, 1};
+                        float farthestDist = 0.0f;
+                        for (int i = 0; i < static_cast<int>(intersections.size()); ++i) {
+                            for (int j = i + 1; j < static_cast<int>(intersections.size()); ++j) {
+                                const float dist = cv::norm(intersections[i] - intersections[j]);
+                                if (dist > farthestDist) {
+                                    farthestDist = dist;
+                                    farthest = {i, j};
+                                }
+                            }
+                        }
+                        segments.push_back({intersections[farthest.first], intersections[farthest.second]});
+                    }
+                }
+
+                std::vector<std::vector<cv::Vec3f>> polylines;
+                constexpr float kMergeEpsilon = 1e-2f;
+                auto samePoint = [](const cv::Vec3f& a, const cv::Vec3f& b) {
+                    return cv::norm(a - b) < kMergeEpsilon;
+                };
+                for (const auto& segment : segments) {
+                    if (cv::norm(segment.first - segment.second) < kMergeEpsilon) {
+                        continue;
+                    }
+                    bool merged = false;
+                    for (auto& line : polylines) {
+                        if (samePoint(line.back(), segment.first)) {
+                            line.push_back(segment.second);
+                            merged = true;
+                            break;
+                        }
+                        if (samePoint(line.back(), segment.second)) {
+                            line.push_back(segment.first);
+                            merged = true;
+                            break;
+                        }
+                        if (samePoint(line.front(), segment.second)) {
+                            line.insert(line.begin(), segment.first);
+                            merged = true;
+                            break;
+                        }
+                        if (samePoint(line.front(), segment.first)) {
+                            line.insert(line.begin(), segment.second);
+                            merged = true;
+                            break;
+                        }
+                    }
+                    if (!merged) {
+                        polylines.push_back({segment.first, segment.second});
+                    }
+                }
+                for (bool changed = true; changed;) {
+                    changed = false;
+                    for (std::size_t i = 0; i < polylines.size() && !changed; ++i) {
+                        for (std::size_t j = i + 1; j < polylines.size(); ++j) {
+                            if (samePoint(polylines[i].back(), polylines[j].front())) {
+                                polylines[i].insert(polylines[i].end(), polylines[j].begin() + 1, polylines[j].end());
+                            } else if (samePoint(polylines[i].back(), polylines[j].back())) {
+                                polylines[i].insert(polylines[i].end(), polylines[j].rbegin() + 1, polylines[j].rend());
+                            } else if (samePoint(polylines[i].front(), polylines[j].back())) {
+                                polylines[i].insert(polylines[i].begin(), polylines[j].begin(), polylines[j].end() - 1);
+                            } else if (samePoint(polylines[i].front(), polylines[j].front())) {
+                                polylines[i].insert(polylines[i].begin(), polylines[j].rbegin(), polylines[j].rend() - 1);
+                            } else {
+                                continue;
+                            }
+                            polylines.erase(polylines.begin() + static_cast<std::ptrdiff_t>(j));
+                            changed = true;
+                            break;
+                        }
+                    }
+                }
+
+                auto lineLength = [](const std::vector<cv::Vec3f>& line) {
+                    float length = 0.0f;
+                    for (std::size_t i = 1; i < line.size(); ++i) {
+                        length += cv::norm(line[i] - line[i - 1]);
+                    }
+                    return length;
+                };
+                auto bestLine = std::max_element(polylines.begin(), polylines.end(), [&](const auto& lhs, const auto& rhs) {
+                    return lineLength(lhs) < lineLength(rhs);
+                });
+                if (bestLine != polylines.end() && bestLine->size() >= 2) {
+                    builder.addLineStrip(volumeToScene(viewer, *bestLine), false, previewStyle);
+                }
+            }
+            ViewerOverlayControllerBase::OverlayStyle constraintStyle;
+            constraintStyle.penColor = QColor(255, 255, 120, 255);
+            constraintStyle.brushColor = QColor(255, 255, 120, 220);
+            constraintStyle.penWidth = 1.0;
+            constraintStyle.z = 111.0;
+            for (const cv::Vec3f& constraint : state.manualAddPlaneConstraints) {
+                if (!plane || plane->pointDist(constraint) <= kManualAddPlaneDistanceTolerance) {
+                    builder.addCircle(viewer->volumeToScene(constraint), 5.0, true, constraintStyle);
+                }
+            }
+        }
+    }
+
     // Render approval mask overlays regardless of editing enabled
     // (but painting requires editing to be enabled - handled in SegmentationModule)
     if (state.approvalMaskMode && state.surface) {
@@ -720,6 +948,46 @@ void SegmentationOverlayController::collectPrimitives(VolumeViewerBase* viewer,
 
     if (shouldShowMask(state)) {
         builder.addPath(buildMaskPrimitive(state));
+    }
+
+    if (!state.surfaceMaskPoints.empty() && viewer->surfName() == "segmentation") {
+        auto* tiledViewer = dynamic_cast<CTiledVolumeViewer*>(viewer);
+        if (tiledViewer) {
+            std::vector<QPointF> scenePoints;
+            scenePoints.reserve(state.surfaceMaskPoints.size());
+            for (const QPointF& surfacePoint : state.surfaceMaskPoints) {
+                const QPointF scene = tiledViewer->surfaceCoordsToScene(static_cast<float>(surfacePoint.x()),
+                                                                        static_cast<float>(surfacePoint.y()));
+                if (std::isfinite(scene.x()) && std::isfinite(scene.y())) {
+                    scenePoints.push_back(scene);
+                }
+            }
+
+            if (!scenePoints.empty()) {
+                ViewerOverlayControllerBase::OverlayStyle style;
+                style.penColor = QColor(255, 80, 40, 230);
+                style.brushColor = QColor(255, 80, 40, 70);
+                style.penWidth = 2.0;
+                style.penStyle = Qt::DashLine;
+                style.dashPattern = {4.0, 4.0};
+                style.z = kMaskZ + 5.0;
+
+                const QPointF center = scenePoints.back();
+                const QPointF edge = tiledViewer->surfaceCoordsToScene(
+                    static_cast<float>(state.surfaceMaskPoints.back().x() + state.displayRadiusSteps),
+                    static_cast<float>(state.surfaceMaskPoints.back().y()));
+                const qreal radiusPixels = std::hypot(edge.x() - center.x(), edge.y() - center.y());
+                if (radiusPixels > 1.0) {
+                    builder.addCircle(center, radiusPixels, false, style);
+                }
+
+                if (scenePoints.size() >= 2) {
+                    style.penWidth = std::max<qreal>(2.0, radiusPixels * 0.35);
+                    style.penStyle = Qt::SolidLine;
+                    builder.addLineStrip(scenePoints, false, style);
+                }
+            }
+        }
     }
 
     buildVertexMarkers(state, viewer, builder);
@@ -1411,6 +1679,7 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
             [currentPtsCopy = std::move(currentPtsCopy),
              overlayDataVec = std::move(overlayDataVec),
              threshold]() -> QImage {
+                try {
                 const int rows = currentPtsCopy.rows;
                 const int cols = currentPtsCopy.cols;
 
@@ -1494,6 +1763,12 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
                 }
 
                 return overlapImage;
+                } catch (const std::exception& e) {
+                    qWarning() << "Segmentation overlap worker failed:" << e.what();
+                } catch (...) {
+                    qWarning() << "Segmentation overlap worker failed with an unknown exception";
+                }
+                return {};
             });
 
         _overlapWatcher->setFuture(future);

@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -16,12 +17,15 @@
 #include "vc/ui/VCCollection.hpp"
 
 class QuadSurface;
+class SurfacePatchIndex;
 class Volume;
 
 enum class SegmentationGrowthMethod {
     Tracer = 0,
     Corrections = 1,
     Extrapolation = 2,
+    PatchTracer = 3,
+    ManualAdd = 4,
 };
 
 inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
@@ -33,6 +37,10 @@ inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
         return QStringLiteral("Corrections");
     case SegmentationGrowthMethod::Extrapolation:
         return QStringLiteral("Extrapolation");
+    case SegmentationGrowthMethod::PatchTracer:
+        return QStringLiteral("Patch Tracer");
+    case SegmentationGrowthMethod::ManualAdd:
+        return QStringLiteral("Manual Add");
     }
     return QStringLiteral("Unknown");
 }
@@ -45,6 +53,12 @@ inline SegmentationGrowthMethod segmentationGrowthMethodFromInt(int value)
     if (value == static_cast<int>(SegmentationGrowthMethod::Extrapolation)) {
         return SegmentationGrowthMethod::Extrapolation;
     }
+    if (value == static_cast<int>(SegmentationGrowthMethod::PatchTracer)) {
+        return SegmentationGrowthMethod::PatchTracer;
+    }
+    if (value == static_cast<int>(SegmentationGrowthMethod::ManualAdd)) {
+        return SegmentationGrowthMethod::ManualAdd;
+    }
     return SegmentationGrowthMethod::Tracer;
 }
 
@@ -54,6 +68,7 @@ enum class SegmentationGrowthDirection {
     Down,
     Left,
     Right,
+    Fill,
 };
 
 inline QString segmentationGrowthDirectionToString(SegmentationGrowthDirection direction)
@@ -69,6 +84,8 @@ inline QString segmentationGrowthDirectionToString(SegmentationGrowthDirection d
         return QStringLiteral("Left");
     case SegmentationGrowthDirection::Right:
         return QStringLiteral("Right");
+    case SegmentationGrowthDirection::Fill:
+        return QStringLiteral("Fill");
     }
     return QStringLiteral("All");
 }
@@ -84,6 +101,8 @@ inline SegmentationGrowthDirection segmentationGrowthDirectionFromInt(int value)
         return SegmentationGrowthDirection::Left;
     case static_cast<int>(SegmentationGrowthDirection::Right):
         return SegmentationGrowthDirection::Right;
+    case static_cast<int>(SegmentationGrowthDirection::Fill):
+        return SegmentationGrowthDirection::Fill;
     default:
         return SegmentationGrowthDirection::All;
     }
@@ -206,6 +225,8 @@ struct TracerGrowthContext {
     // For corrections annotation saving
     std::vector<std::string> volumeIds;
     std::string growthVolumeId;
+    SurfacePatchIndex* surfacePatchIndex{nullptr};
+    std::vector<std::shared_ptr<QuadSurface>> patchSurfaces;
 };
 
 struct TracerGrowthResult {
@@ -213,10 +234,15 @@ struct TracerGrowthResult {
     QString error;
     QString statusMessage;
     std::vector<std::filesystem::path> temporarySurfacePaths;
+    QString patchTracerCacheSourcePath;
+    std::vector<std::shared_ptr<QuadSurface>> patchTracerCachedSurfaces;
+    std::shared_ptr<SurfacePatchIndex> patchTracerCachedIndex;
 };
 
 TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                    const TracerGrowthContext& context);
+TracerGrowthResult runPatchTracerGrowth(const SegmentationGrowthRequest& request,
+                                        const TracerGrowthContext& context);
 
 void updateSegmentationSurfaceMetadata(QuadSurface* surface,
                                        double voxelSize);

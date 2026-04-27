@@ -2,11 +2,20 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <cmath>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <future>
+#include <iomanip>
 #include <iostream>
 #include <limits>
+#include <mutex>
 #include <optional>
+#include <sstream>
+#include <thread>
 #include <utility>
 #include <vector>
 #include <unordered_map>
@@ -18,12 +27,15 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/Logging.hpp"
 
 
 namespace bg = boost::geometry;
 namespace bgi = boost::geometry::index;
 
 namespace {
+
+using SurfacePtr = SurfacePatchIndex::SurfacePtr;
 
 struct TriangleHit {
     cv::Vec3f closest{0, 0, 0};
@@ -33,6 +45,202 @@ struct TriangleHit {
 
 inline float clamp01(float v) {
     return std::max(0.0f, std::min(1.0f, v));
+}
+
+static constexpr char kCacheMagic[8] = {'V', 'C', 'S', 'P', 'I', 'D', 'X', '2'};
+static constexpr std::uint32_t kCacheVersion = 1;
+
+std::string normalized_surface_path(const QuadSurface* surface)
+{
+    if (!surface) {
+        return {};
+    }
+    std::filesystem::path p = surface->path;
+    if (p.empty()) {
+        return {};
+    }
+    std::error_code ec;
+    p = std::filesystem::absolute(p, ec);
+    if (ec) {
+        p = surface->path;
+    }
+    return p.lexically_normal().generic_string();
+}
+
+std::uint64_t fnv1a_update(std::uint64_t h, const void* data, std::size_t size)
+{
+    const auto* bytes = static_cast<const std::uint8_t*>(data);
+    for (std::size_t i = 0; i < size; ++i) {
+        h ^= bytes[i];
+        h *= 1099511628211ULL;
+    }
+    return h;
+}
+
+std::uint64_t fnv1a_update_string(std::uint64_t h, const std::string& value)
+{
+    const std::uint64_t len = value.size();
+    h = fnv1a_update(h, &len, sizeof(len));
+    return fnv1a_update(h, value.data(), value.size());
+}
+
+void hash_path_identity(std::uint64_t& h, const std::filesystem::path& path)
+{
+    const std::string pathString = path.lexically_normal().generic_string();
+    h = fnv1a_update_string(h, pathString);
+
+    std::error_code ec;
+    const bool exists = std::filesystem::exists(path, ec);
+    h = fnv1a_update(h, &exists, sizeof(exists));
+    if (!exists || ec) {
+        return;
+    }
+
+    const bool regular = std::filesystem::is_regular_file(path, ec);
+    h = fnv1a_update(h, &regular, sizeof(regular));
+    if (regular && !ec) {
+        const auto size = std::filesystem::file_size(path, ec);
+        if (!ec) {
+            h = fnv1a_update(h, &size, sizeof(size));
+        }
+    }
+
+    const auto mtime = std::filesystem::last_write_time(path, ec);
+    if (!ec) {
+        const auto ticks = mtime.time_since_epoch().count();
+        h = fnv1a_update(h, &ticks, sizeof(ticks));
+    }
+}
+
+template <typename T>
+bool write_pod(std::ostream& os, const T& value)
+{
+    os.write(reinterpret_cast<const char*>(&value), sizeof(T));
+    return static_cast<bool>(os);
+}
+
+template <typename T>
+bool read_pod(std::istream& is, T& value)
+{
+    is.read(reinterpret_cast<char*>(&value), sizeof(T));
+    return static_cast<bool>(is);
+}
+
+bool write_string(std::ostream& os, const std::string& value)
+{
+    const std::uint64_t size = value.size();
+    return write_pod(os, size) &&
+           (size == 0 || static_cast<bool>(os.write(value.data(), static_cast<std::streamsize>(size))));
+}
+
+bool read_string(std::istream& is, std::string& value)
+{
+    std::uint64_t size = 0;
+    if (!read_pod(is, size) || size > (1ULL << 32)) {
+        return false;
+    }
+    value.assign(static_cast<std::size_t>(size), '\0');
+    return size == 0 ||
+           static_cast<bool>(is.read(value.data(), static_cast<std::streamsize>(size)));
+}
+
+inline bool isFinitePoint(const cv::Vec3f& p) noexcept
+{
+    return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+}
+
+inline bool isValidSurfacePoint(const cv::Vec3f& p) noexcept
+{
+    return p[0] != -1.0f && isFinitePoint(p);
+}
+
+inline bool isValidBounds(const cv::Vec3f& low, const cv::Vec3f& high) noexcept
+{
+    return isFinitePoint(low) && isFinitePoint(high)
+        && low[0] <= high[0] && low[1] <= high[1] && low[2] <= high[2];
+}
+
+std::vector<SurfacePtr> loadSurfacesInBatches(const std::vector<SurfacePtr>& surfaces)
+{
+    constexpr size_t kBatchSize = 5000;
+    constexpr size_t kMaxWorkers = 8;
+
+    std::vector<SurfacePtr> loaded;
+    loaded.reserve(surfaces.size());
+
+    for (size_t batchStart = 0; batchStart < surfaces.size(); batchStart += kBatchSize) {
+        const size_t batchEnd = std::min(batchStart + kBatchSize, surfaces.size());
+        const size_t batchSize = batchEnd - batchStart;
+        const auto batchTimeStart = std::chrono::steady_clock::now();
+        std::cout << "[SurfacePatchIndex] loading surfaces "
+                  << batchStart << "-" << (batchEnd == 0 ? 0 : batchEnd - 1)
+                  << " / " << surfaces.size() << std::endl;
+        std::vector<SurfacePtr> batchLoaded(batchSize);
+
+        const unsigned hw = std::thread::hardware_concurrency();
+        const size_t workerCount = std::max<size_t>(
+            1, std::min<size_t>({batchSize, kMaxWorkers, hw == 0 ? 4 : hw}));
+        std::atomic_size_t next{0};
+        std::vector<std::future<void>> workers;
+        workers.reserve(workerCount);
+
+        for (size_t worker = 0; worker < workerCount; ++worker) {
+            workers.emplace_back(std::async(std::launch::async, [&]() {
+                while (true) {
+                    const size_t localIndex = next.fetch_add(1, std::memory_order_relaxed);
+                    if (localIndex >= batchSize) {
+                        break;
+                    }
+
+                    const auto& s = surfaces[batchStart + localIndex];
+                    if (!s) {
+                        continue;
+                    }
+                    if (!s->isLoaded()) {
+                        if (DebugLoggingEnabled()) {
+                            std::cout << "[SurfacePatchIndex] Loading surface: " << s->id << std::endl;
+                        }
+                        // Remote stubs whose TIFFs haven't finished downloading
+                        // yet throw "Failed to open TIFF" out of ensureLoaded().
+                        // Catch here — propagating to worker.get() would re-throw
+                        // out of a std::async future and abort the rebuild.
+                        try {
+                            s->rawPointsPtr();
+                        } catch (const std::exception& e) {
+                            std::cout << "[SurfacePatchIndex] Skipping surface "
+                                      << s->id << ": " << e.what() << std::endl;
+                        }
+                    }
+                    if (s->isLoaded()) {
+                        batchLoaded[localIndex] = s;
+                        if (DebugLoggingEnabled()) {
+                            std::cout << "[SurfacePatchIndex] Indexed surface: " << s->id << std::endl;
+                        }
+                    } else if (DebugLoggingEnabled()) {
+                        std::cout << "[SurfacePatchIndex] Failed to load surface: " << s->id << std::endl;
+                    }
+                }
+            }));
+        }
+
+        for (auto& worker : workers) {
+            worker.get();
+        }
+
+        for (auto& surface : batchLoaded) {
+            if (surface) {
+                loaded.push_back(std::move(surface));
+            }
+        }
+        const double seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - batchTimeStart).count();
+        std::cout << "[SurfacePatchIndex] loaded batch "
+                  << batchEnd << "/" << surfaces.size()
+                  << " cumulative_loaded=" << loaded.size()
+                  << " seconds=" << seconds << std::endl;
+    }
+
+    return loaded;
 }
 
 TriangleHit closestPointOnTriangle(const cv::Vec3f& p,
@@ -119,8 +327,6 @@ TriangleHit closestPointOnTriangle(const cv::Vec3f& p,
     return hit;
 }
 
-using SurfacePtr = SurfacePatchIndex::SurfacePtr;
-
 struct CellKey {
     SurfacePtr surface;
     std::uint64_t packed = 0;
@@ -198,6 +404,7 @@ struct SurfacePatchIndex::Impl {
     };
 
     static uint16_t qEnc(float v) noexcept {
+        if (!std::isfinite(v)) return 0;
         float t = (v - kQLow) * (65535.0f / kQRange);
         if (t < 0.0f) return 0;
         if (t > 65535.0f) return 65535;
@@ -397,6 +604,7 @@ struct SurfacePatchIndex::Impl {
     // stride-1 triangulation. Always a multiple of samplingStride.
     int samplingStride = 1;
     int tileStride = kMinTileStride;
+    bool readOnly = false;
 
     static int computeTileStride(int triStride) noexcept {
         const int s = std::max(1, triStride);
@@ -524,8 +732,343 @@ SurfacePatchIndex::SurfacePatchIndex()
 {}
 
 SurfacePatchIndex::~SurfacePatchIndex() = default;
-SurfacePatchIndex::SurfacePatchIndex(SurfacePatchIndex&&) noexcept = default;
-SurfacePatchIndex& SurfacePatchIndex::operator=(SurfacePatchIndex&&) noexcept = default;
+SurfacePatchIndex::SurfacePatchIndex(SurfacePatchIndex&& other) noexcept
+{
+    std::unique_lock<std::shared_mutex> lock(other.mutex_);
+    impl_ = std::move(other.impl_);
+}
+
+SurfacePatchIndex& SurfacePatchIndex::operator=(SurfacePatchIndex&& other) noexcept
+{
+    if (this == &other) {
+        return *this;
+    }
+
+    std::unique_lock<std::shared_mutex> selfLock(mutex_, std::defer_lock);
+    std::unique_lock<std::shared_mutex> otherLock(other.mutex_, std::defer_lock);
+    std::lock(selfLock, otherLock);
+    impl_ = std::move(other.impl_);
+    return *this;
+}
+
+std::string SurfacePatchIndex::cacheKeyForSurfaces(const std::vector<SurfacePtr>& surfaces,
+                                                   int samplingStride,
+                                                   float bboxPadding)
+{
+    struct SurfaceIdentity {
+        std::string path;
+        std::string id;
+    };
+
+    std::vector<SurfaceIdentity> identities;
+    identities.reserve(surfaces.size());
+    for (const auto& surface : surfaces) {
+        if (!surface) {
+            continue;
+        }
+        identities.push_back({normalized_surface_path(surface.get()), surface->id});
+    }
+    std::sort(identities.begin(), identities.end(),
+              [](const SurfaceIdentity& a, const SurfaceIdentity& b) {
+                  if (a.path != b.path) {
+                      return a.path < b.path;
+                  }
+                  return a.id < b.id;
+              });
+
+    std::uint64_t h = 1469598103934665603ULL;
+    h = fnv1a_update(h, kCacheMagic, sizeof(kCacheMagic));
+    h = fnv1a_update(h, &kCacheVersion, sizeof(kCacheVersion));
+    samplingStride = std::max(1, samplingStride);
+    h = fnv1a_update(h, &samplingStride, sizeof(samplingStride));
+    h = fnv1a_update(h, &bboxPadding, sizeof(bboxPadding));
+    const std::uint64_t surfaceCount = identities.size();
+    h = fnv1a_update(h, &surfaceCount, sizeof(surfaceCount));
+
+    for (const auto& identity : identities) {
+        h = fnv1a_update_string(h, identity.id);
+        h = fnv1a_update_string(h, identity.path);
+        if (!identity.path.empty()) {
+            const std::filesystem::path base(identity.path);
+            hash_path_identity(h, base / "meta.json");
+            hash_path_identity(h, base / "x.tif");
+            hash_path_identity(h, base / "y.tif");
+            hash_path_identity(h, base / "z.tif");
+            hash_path_identity(h, base / "overlapping.json");
+        }
+    }
+
+    std::ostringstream os;
+    os << std::hex << std::setfill('0') << std::setw(16) << h;
+    return os.str();
+}
+
+bool SurfacePatchIndex::saveCache(const std::filesystem::path& cachePath,
+                                  const std::string& cacheKey) const
+{
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (!impl_) {
+        return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::create_directories(cachePath.parent_path(), ec);
+    if (ec) {
+        std::cerr << "[SurfacePatchIndex] cache save: failed to create "
+                  << cachePath.parent_path() << ": " << ec.message() << std::endl;
+        return false;
+    }
+
+    const std::filesystem::path tmpPath = cachePath.string() + ".tmp";
+    std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
+    if (!out) {
+        std::cerr << "[SurfacePatchIndex] cache save: failed to open " << tmpPath << std::endl;
+        return false;
+    }
+
+    std::vector<QuadSurface*> surfaces;
+    surfaces.reserve(impl_->surfaceRecords.size());
+    for (const auto& it : impl_->surfaceRecords) {
+        if (it.first) {
+            surfaces.push_back(it.first);
+        }
+    }
+    std::sort(surfaces.begin(), surfaces.end(), [](QuadSurface* a, QuadSurface* b) {
+        const std::string ap = normalized_surface_path(a);
+        const std::string bp = normalized_surface_path(b);
+        if (ap != bp) {
+            return ap < bp;
+        }
+        return a->id < b->id;
+    });
+
+    std::unordered_map<QuadSurface*, std::uint32_t> surfaceIndex;
+    surfaceIndex.reserve(surfaces.size());
+    for (std::uint32_t i = 0; i < surfaces.size(); ++i) {
+        surfaceIndex[surfaces[i]] = i;
+    }
+
+    std::vector<Impl::Entry> entries;
+    if (impl_->tree) {
+        entries.reserve(impl_->patchCount);
+        for (const auto& entry : *impl_->tree) {
+            if (surfaceIndex.find(entry.second.surface) != surfaceIndex.end()) {
+                entries.push_back(entry);
+            }
+        }
+    }
+
+    out.write(kCacheMagic, sizeof(kCacheMagic));
+    if (!write_pod(out, kCacheVersion) ||
+        !write_string(out, cacheKey) ||
+        !write_pod(out, impl_->samplingStride) ||
+        !write_pod(out, impl_->bboxPadding)) {
+        return false;
+    }
+
+    const std::uint64_t surfaceCount = surfaces.size();
+    if (!write_pod(out, surfaceCount)) {
+        return false;
+    }
+    for (QuadSurface* surface : surfaces) {
+        const auto recIt = impl_->surfaceRecords.find(surface);
+        if (recIt == impl_->surfaceRecords.end()) {
+            return false;
+        }
+        const Impl::SurfaceCellMask& mask = recIt->second.mask;
+        const std::int32_t rows = mask.rows;
+        const std::int32_t cols = mask.cols;
+        if (!write_string(out, surface->id) ||
+            !write_string(out, normalized_surface_path(surface)) ||
+            !write_pod(out, rows) ||
+            !write_pod(out, cols)) {
+            return false;
+        }
+    }
+
+    const std::uint64_t entryCount = entries.size();
+    if (!write_pod(out, entryCount)) {
+        return false;
+    }
+    for (const auto& entry : entries) {
+        const auto idxIt = surfaceIndex.find(entry.second.surface);
+        if (idxIt == surfaceIndex.end()) {
+            return false;
+        }
+        const std::uint32_t idx = idxIt->second;
+        const std::int32_t i = entry.second.i;
+        const std::int32_t j = entry.second.j;
+        const Impl::QBox qbox = Impl::boxQuantize(entry.first);
+        if (!write_pod(out, idx) ||
+            !write_pod(out, i) ||
+            !write_pod(out, j) ||
+            !write_pod(out, qbox)) {
+            return false;
+        }
+    }
+
+    out.close();
+    if (!out) {
+        return false;
+    }
+    std::filesystem::remove(cachePath, ec);
+    ec.clear();
+    std::filesystem::rename(tmpPath, cachePath, ec);
+    if (ec) {
+        std::cerr << "[SurfacePatchIndex] cache save: failed to publish "
+                  << cachePath << ": " << ec.message() << std::endl;
+        return false;
+    }
+    return true;
+}
+
+bool SurfacePatchIndex::loadCache(const std::filesystem::path& cachePath,
+                                  const std::vector<SurfacePtr>& surfaces,
+                                  const std::string& expectedKey)
+{
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    std::ifstream in(cachePath, std::ios::binary);
+    if (!in) {
+        return false;
+    }
+
+    char magic[sizeof(kCacheMagic)]{};
+    in.read(magic, sizeof(magic));
+    if (!in || std::memcmp(magic, kCacheMagic, sizeof(kCacheMagic)) != 0) {
+        return false;
+    }
+
+    std::uint32_t version = 0;
+    std::string storedKey;
+    int storedStride = 1;
+    float storedPadding = 0.0f;
+    if (!read_pod(in, version) ||
+        version != kCacheVersion ||
+        !read_string(in, storedKey) ||
+        storedKey != expectedKey ||
+        !read_pod(in, storedStride) ||
+        !read_pod(in, storedPadding)) {
+        return false;
+    }
+
+    std::unordered_map<std::string, SurfacePtr> byPath;
+    std::unordered_map<std::string, SurfacePtr> byId;
+    byPath.reserve(surfaces.size());
+    byId.reserve(surfaces.size());
+    for (const auto& surface : surfaces) {
+        if (!surface) {
+            continue;
+        }
+        const std::string path = normalized_surface_path(surface.get());
+        if (!path.empty()) {
+            byPath.emplace(path, surface);
+        }
+        byId.emplace(surface->id, surface);
+    }
+
+    std::uint64_t surfaceCount64 = 0;
+    if (!read_pod(in, surfaceCount64) ||
+        surfaceCount64 > static_cast<std::uint64_t>(std::numeric_limits<std::uint32_t>::max())) {
+        return false;
+    }
+
+    struct CachedSurface {
+        SurfacePtr surface;
+        std::int32_t rows = 0;
+        std::int32_t cols = 0;
+    };
+    std::vector<CachedSurface> cachedSurfaces;
+    cachedSurfaces.reserve(static_cast<std::size_t>(surfaceCount64));
+
+    for (std::uint64_t idx = 0; idx < surfaceCount64; ++idx) {
+        std::string id;
+        std::string path;
+        std::int32_t rows = 0;
+        std::int32_t cols = 0;
+        if (!read_string(in, id) ||
+            !read_string(in, path) ||
+            !read_pod(in, rows) ||
+            !read_pod(in, cols) ||
+            rows < 0 ||
+            cols < 0) {
+            return false;
+        }
+
+        SurfacePtr surface;
+        auto pathIt = byPath.find(path);
+        if (pathIt != byPath.end()) {
+            surface = pathIt->second;
+        } else {
+            auto idIt = byId.find(id);
+            if (idIt != byId.end()) {
+                surface = idIt->second;
+            }
+        }
+        if (!surface) {
+            return false;
+        }
+        cachedSurfaces.push_back({surface, rows, cols});
+    }
+
+    std::uint64_t entryCount64 = 0;
+    if (!read_pod(in, entryCount64) ||
+        entryCount64 > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        return false;
+    }
+
+    auto newImpl = std::make_unique<Impl>();
+    newImpl->bboxPadding = storedPadding;
+    newImpl->samplingStride = std::max(1, storedStride);
+    newImpl->tileStride = Impl::computeTileStride(newImpl->samplingStride);
+    newImpl->readOnly = impl_ ? impl_->readOnly : false;
+
+    for (const auto& cached : cachedSurfaces) {
+        Impl::SurfaceRecord rec;
+        rec.surface = cached.surface;
+        rec.mask.ensureSize(cached.rows, cached.cols);
+        newImpl->surfaceRecords[cached.surface.get()] = std::move(rec);
+    }
+
+    std::vector<Impl::Entry> entries;
+    entries.reserve(static_cast<std::size_t>(entryCount64));
+    for (std::uint64_t entryIdx = 0; entryIdx < entryCount64; ++entryIdx) {
+        std::uint32_t surfaceIdx = 0;
+        std::int32_t i = 0;
+        std::int32_t j = 0;
+        Impl::QBox qbox{};
+        if (!read_pod(in, surfaceIdx) ||
+            !read_pod(in, i) ||
+            !read_pod(in, j) ||
+            !read_pod(in, qbox) ||
+            surfaceIdx >= cachedSurfaces.size()) {
+            return false;
+        }
+
+        const SurfacePtr& surface = cachedSurfaces[surfaceIdx].surface;
+        auto recIt = newImpl->surfaceRecords.find(surface.get());
+        if (recIt == newImpl->surfaceRecords.end() ||
+            !recIt->second.mask.validIndex(j, i)) {
+            return false;
+        }
+
+        Impl::PatchRecord rec;
+        rec.surface = surface.get();
+        rec.i = i;
+        rec.j = j;
+        entries.emplace_back(Impl::boxDequantize(qbox), rec);
+
+        Impl::SurfaceCellMask& mask = recIt->second.mask;
+        mask.setActive(j, i, true);
+        mask.cachedBoxes[mask.index(j, i)] = qbox;
+    }
+
+    newImpl->patchCount = entries.size();
+    if (!entries.empty()) {
+        newImpl->tree = std::make_unique<Impl::PatchTree>(entries.begin(), entries.end());
+    }
+    impl_ = std::move(newImpl);
+    return true;
+}
 
 SurfacePatchIndex::Impl::SurfaceRecord* SurfacePatchIndex::Impl::getRecord(QuadSurface* raw)
 {
@@ -594,6 +1137,7 @@ SurfacePatchIndex::Impl::collectEntriesForSurface(const SurfacePtr& surface,
 
 void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float bboxPadding)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_) {
         impl_ = std::make_unique<Impl>();
     }
@@ -603,35 +1147,11 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
 
     // Eagerly load any surfaces whose TIFF data hasn't been loaded yet.
     // This is safe because rebuild() typically runs on a background thread.
-    std::vector<SurfacePtr> loaded;
-    loaded.reserve(surfaces.size());
-    for (const auto& s : surfaces) {
-        if (!s) {
-            continue;
-        }
-        if (!s->isLoaded()) {
-            std::cout << "[SurfacePatchIndex] Loading surface: " << s->id << std::endl;
-            try {
-                s->rawPointsPtr();  // triggers ensureLoaded()
-            } catch (const std::exception& e) {
-                // Remote segments whose TIFFs haven't finished downloading
-                // yet, or transient I/O errors. Skip this surface — the
-                // async download flow re-schedules a rebuild once the data
-                // lands. Previously this re-threw out of a QtConcurrent
-                // lambda and hit QUnhandledException → terminate().
-                std::cout << "[SurfacePatchIndex] Skipping surface " << s->id
-                          << ": " << e.what() << std::endl;
-            }
-        }
-        if (s->isLoaded()) {
-            loaded.push_back(s);
-            std::cout << "[SurfacePatchIndex] Indexed surface: " << s->id << std::endl;
-        } else {
-            std::cout << "[SurfacePatchIndex] Failed to load surface: " << s->id << std::endl;
-        }
-    }
+    std::vector<SurfacePtr> loaded = loadSurfacesInBatches(surfaces);
     const size_t surfaceCount = loaded.size();
-    std::cout << "[SurfacePatchIndex] rebuild: " << surfaceCount << " of " << surfaces.size() << " surfaces loaded" << std::endl;
+    if (DebugLoggingEnabled()) {
+        std::cout << "[SurfacePatchIndex] rebuild: " << surfaceCount << " of " << surfaces.size() << " surfaces loaded" << std::endl;
+    }
     if (surfaceCount == 0) {
         impl_->tree.reset();
         impl_->samplingStride = std::max(1, impl_->samplingStride);
@@ -645,6 +1165,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     const float padding = bboxPadding;
 
     // Pre-create all masks (sequential, enables thread-safe parallel access)
+    std::cout << "[SurfacePatchIndex] creating masks for " << surfaceCount << " surfaces" << std::endl;
     for (const SurfacePtr& surface : loaded) {
         impl_->ensureMask(surface);
     }
@@ -652,6 +1173,8 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     // Per-surface results for parallel collection
     using CellResult = std::vector<std::pair<CellKey, Impl::CellEntry>>;
     std::vector<CellResult> perSurfaceCells(surfaceCount);
+    std::atomic_size_t indexedSurfaces{0};
+    const auto collectStart = std::chrono::steady_clock::now();
 
     // Parallel phase: collect entries and update masks for each surface
     #pragma omp parallel for schedule(dynamic, 1)
@@ -676,9 +1199,21 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
                 }
             }
         }
+        const size_t done = indexedSurfaces.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (done == surfaceCount || done % 1000 == 0) {
+            #pragma omp critical(surface_patch_index_progress)
+            {
+                const double seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - collectStart).count();
+                std::cout << "[SurfacePatchIndex] indexed surfaces "
+                          << done << "/" << surfaceCount
+                          << " seconds=" << seconds << std::endl;
+            }
+        }
     }
 
     // Merge entries from all surfaces
+    std::cout << "[SurfacePatchIndex] merging entries" << std::endl;
     size_t totalEntries = 0;
     for (const auto& cells : perSurfaceCells) {
         for (const auto& cell : cells) {
@@ -703,12 +1238,16 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     if (entries.empty()) {
         impl_->tree.reset();
     } else {
+        std::cout << "[SurfacePatchIndex] building R-tree with " << entries.size() << " entries" << std::endl;
         impl_->tree = std::make_unique<Impl::PatchTree>(entries.begin(), entries.end());
     }
+    std::cout << "[SurfacePatchIndex] rebuild complete: surfaces=" << surfaceCount
+              << " patches=" << impl_->patchCount << std::endl;
 }
 
 void SurfacePatchIndex::clear()
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (impl_) {
         impl_->tree.reset();
         impl_->patchCount = 0;
@@ -721,23 +1260,33 @@ void SurfacePatchIndex::clear()
 
 bool SurfacePatchIndex::empty() const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     return !impl_ || !impl_->tree || impl_->patchCount == 0;
 }
 
 size_t SurfacePatchIndex::patchCount() const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     return impl_ ? impl_->patchCount : 0;
 }
 
 size_t SurfacePatchIndex::surfaceCount() const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     return impl_ ? impl_->surfaceRecords.size() : 0;
+}
+
+bool SurfacePatchIndex::containsSurface(const SurfacePtr& surface) const
+{
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return impl_ && surface && impl_->surfaceRecords.find(surface.get()) != impl_->surfaceRecords.end();
 }
 
 std::optional<SurfacePatchIndex::LookupResult>
 SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const SurfacePtr& targetSurface) const
 {
-    if (!impl_ || !impl_->tree || tolerance <= 0.0f) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (!impl_ || !impl_->tree || tolerance <= 0.0f || !isFinitePoint(worldPoint)) {
         return std::nullopt;
     }
 
@@ -794,9 +1343,17 @@ SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const Su
         found = true;
     };
 
-    impl_->tree->query(
-        bgi::intersects(query),
-        boost::make_function_output_iterator(processEntry));
+    try {
+        impl_->tree->query(
+            bgi::intersects(query),
+            boost::make_function_output_iterator(processEntry));
+    } catch (const std::exception& e) {
+        std::cerr << "[SurfacePatchIndex] locate query failed: " << e.what() << std::endl;
+        return std::nullopt;
+    } catch (...) {
+        std::cerr << "[SurfacePatchIndex] locate query failed: unknown exception" << std::endl;
+        return std::nullopt;
+    }
 
     if (!found) {
         return std::nullopt;
@@ -868,12 +1425,16 @@ void SurfacePatchIndex::forEachTriangleImpl(
     Visitor&& visitor,
     PatchFilter&& patchFilter) const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !impl_->tree) {
         return;
     }
 
     Impl::Point3 min_pt(bounds.low[0], bounds.low[1], bounds.low[2]);
     Impl::Point3 max_pt(bounds.high[0], bounds.high[1], bounds.high[2]);
+    if (!isValidBounds(bounds.low, bounds.high)) {
+        return;
+    }
     Impl::Box3 query(min_pt, max_pt);
 
     // Cache surface metadata to avoid redundant lookups across patches
@@ -1002,8 +1563,14 @@ void SurfacePatchIndex::forEachTriangleImpl(
         }
     };
 
-    impl_->tree->query(bgi::intersects(query),
-                       boost::make_function_output_iterator(emitFromPatch));
+    try {
+        impl_->tree->query(bgi::intersects(query),
+                           boost::make_function_output_iterator(emitFromPatch));
+    } catch (const std::exception& e) {
+        std::cerr << "[SurfacePatchIndex] triangle query failed: " << e.what() << std::endl;
+    } catch (...) {
+        std::cerr << "[SurfacePatchIndex] triangle query failed: unknown exception" << std::endl;
+    }
 }
 
 bool SurfacePatchIndex::Impl::removeSurfaceEntries(const SurfacePtr& surface)
@@ -1229,6 +1796,7 @@ SurfacePatchIndex::clipTriangleToPlane(const TriangleCandidate& tri,
 
 bool SurfacePatchIndex::updateSurface(const SurfacePtr& surface)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !surface) {
         return false;
     }
@@ -1257,6 +1825,7 @@ bool SurfacePatchIndex::updateSurfaceRegion(const SurfacePtr& surface,
                                             int colStart,
                                             int colEnd)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !surface) {
         return false;
     }
@@ -1302,6 +1871,7 @@ bool SurfacePatchIndex::updateSurfaceRegion(const SurfacePtr& surface,
 
 bool SurfacePatchIndex::removeSurface(const SurfacePtr& surface)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !surface) {
         return false;
     }
@@ -1310,6 +1880,7 @@ bool SurfacePatchIndex::removeSurface(const SurfacePtr& surface)
 
 bool SurfacePatchIndex::setSamplingStride(int stride)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     stride = std::max(1, stride);
     if (!impl_) {
         impl_ = std::make_unique<Impl>();
@@ -1327,10 +1898,32 @@ bool SurfacePatchIndex::setSamplingStride(int stride)
 
 int SurfacePatchIndex::samplingStride() const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     if (!impl_) {
         return 1;
     }
     return impl_->samplingStride;  // Invariant: always >= 1 (enforced by setter)
+}
+
+void SurfacePatchIndex::setReadOnly(bool readOnly)
+{
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (!impl_) {
+        impl_ = std::make_unique<Impl>();
+    }
+    if (impl_->readOnly == readOnly) {
+        return;
+    }
+    impl_->readOnly = readOnly;
+    impl_->tree.reset();
+    impl_->surfaceRecords.clear();
+    impl_->patchCount = 0;
+}
+
+bool SurfacePatchIndex::readOnly() const
+{
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return impl_ && impl_->readOnly;
 }
 
 std::optional<SurfacePatchIndex::Impl::Entry>
@@ -1455,7 +2048,8 @@ bool SurfacePatchIndex::Impl::loadPatchCorners(const PatchRecord& rec,
     const cv::Vec3f& p01 = (*points)(row + effectiveRowStride, col);
     const cv::Vec3f& p11 = (*points)(row + effectiveRowStride, col + effectiveColStride);
 
-    if (p00[0] == -1.0f || p10[0] == -1.0f || p01[0] == -1.0f || p11[0] == -1.0f) {
+    if (!isValidSurfacePoint(p00) || !isValidSurfacePoint(p10)
+        || !isValidSurfacePoint(p01) || !isValidSurfacePoint(p11)) {
         return false;
     }
 
@@ -1487,7 +2081,8 @@ bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
     const cv::Vec3f& p10 = points(row, col + effectiveColStride);
     const cv::Vec3f& p01 = points(row + effectiveRowStride, col);
     const cv::Vec3f& p11 = points(row + effectiveRowStride, col + effectiveColStride);
-    if (p00[0] == -1.0f || p10[0] == -1.0f || p01[0] == -1.0f || p11[0] == -1.0f) {
+    if (!isValidSurfacePoint(p00) || !isValidSurfacePoint(p10)
+        || !isValidSurfacePoint(p01) || !isValidSurfacePoint(p11)) {
         return false;
     }
 
@@ -1507,7 +2102,7 @@ bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
     cv::Vec3f low{p00};
     cv::Vec3f high{p00};
     auto extend = [&](const cv::Vec3f& p) {
-        if (p[0] == -1.0f) return;
+        if (!isValidSurfacePoint(p)) return;
         low[0] = std::min(low[0], p[0]);
         low[1] = std::min(low[1], p[1]);
         low[2] = std::min(low[2], p[2]);
@@ -1520,6 +2115,9 @@ bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
         for (int dc = 0; dc <= effectiveColStride; ++dc) {
             extend(rowPtr[dc]);
         }
+    }
+    if (!isValidBounds(low, high)) {
+        return false;
     }
 
     outEntry.patch = buildEntryFromBbox(rec, low, high, bboxPadding);
@@ -1648,7 +2246,7 @@ void SurfacePatchIndex::Impl::removeCells(const SurfacePtr& surface,
 
 void SurfacePatchIndex::queueCellUpdateForVertex(const SurfacePtr& surface, int vertexRow, int vertexCol)
 {
-    if (!impl_ || !surface) {
+    if (!surface) {
         return;
     }
 
@@ -1677,6 +2275,7 @@ void SurfacePatchIndex::queueCellRangeUpdate(const SurfacePtr& surface,
                                            int colStart,
                                            int colEnd)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !surface) {
         return;
     }
@@ -1717,6 +2316,7 @@ void SurfacePatchIndex::queueCellRangeUpdate(const SurfacePtr& surface,
 
 bool SurfacePatchIndex::flushPendingUpdates(const SurfacePtr& surface)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_) {
         return false;
     }
@@ -1811,6 +2411,7 @@ bool SurfacePatchIndex::Impl::flushPendingSurface(const SurfacePtr& surface, Sur
 
 bool SurfacePatchIndex::hasPendingUpdates(const SurfacePtr& surface) const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     if (!impl_) {
         return false;
     }
@@ -1835,6 +2436,7 @@ bool SurfacePatchIndex::hasPendingUpdates(const SurfacePtr& surface) const
 
 void SurfacePatchIndex::incrementGeneration(const SurfacePtr& surface)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !surface) {
         return;
     }
@@ -1843,6 +2445,7 @@ void SurfacePatchIndex::incrementGeneration(const SurfacePtr& surface)
 
 uint64_t SurfacePatchIndex::generation(const SurfacePtr& surface) const
 {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !surface) {
         return 0;
     }
@@ -1852,6 +2455,7 @@ uint64_t SurfacePatchIndex::generation(const SurfacePtr& surface) const
 
 void SurfacePatchIndex::setGeneration(const SurfacePtr& surface, uint64_t gen)
 {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !surface) {
         return;
     }
@@ -1915,6 +2519,9 @@ SurfacePatchIndex::computePlaneIntersections(
         viewBbox,
         plane.coord(cv::Vec3f(0, 0, 0),
                     {static_cast<float>(roi.br().x), static_cast<float>(roi.br().y), 0.0f}));
+    if (!isValidBounds(viewBbox.low, viewBbox.high)) {
+        return result;
+    }
 
     // Pad the bbox by 25% of the max extent (minimum 64 units)
     const cv::Vec3f extent = viewBbox.high - viewBbox.low;

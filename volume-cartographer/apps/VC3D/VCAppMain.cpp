@@ -14,6 +14,7 @@
 #include <QSettings>
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/Logging.hpp"
 
 #include <opencv2/core.hpp>
 #include <iostream>
@@ -150,7 +151,23 @@ auto main(int argc, char* argv[]) -> int
         QString::number(CHUNK_CACHE_SIZE_GB));
     parser.addOption(cacheSizeOption);
 
+    QCommandLineOption prefetchLevelOption(
+        "prefetch-level",
+        "For remote Zarr volumes, block on startup/open and prefetch the given pyramid level plus all coarser levels into the local cache.",
+        "level");
+    parser.addOption(prefetchLevelOption);
+
+    QCommandLineOption debugOption(
+        "debug",
+        "Enable verbose diagnostic logging while loading and trimming surfaces.");
+    parser.addOption(debugOption);
+
     parser.process(app);
+
+    if (parser.isSet(debugOption)) {
+        SetDebugLoggingEnabled(true);
+        SetLogLevel("debug");
+    }
 
     if (parser.isSet(skipShapeCheckOption)) {
         Volume::skipShapeCheck = true;
@@ -183,7 +200,18 @@ auto main(int argc, char* argv[]) -> int
         cacheSizeGB = static_cast<size_t>(parsed);
     }
 
-    CWindow aWin(cacheSizeGB);
+    int startupPrefetchLevel = -1;
+    if (parser.isSet(prefetchLevelOption)) {
+        bool ok = false;
+        const int parsed = parser.value(prefetchLevelOption).toInt(&ok);
+        if (!ok || parsed < 0) {
+            std::cerr << "Error: Invalid prefetch level. Must be a non-negative integer." << std::endl;
+            return 1;
+        }
+        startupPrefetchLevel = parsed;
+    }
+
+    CWindow aWin(cacheSizeGB, startupPrefetchLevel);
     aWin.show();
     return QApplication::exec();
 }

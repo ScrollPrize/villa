@@ -2,7 +2,10 @@
 
 #include <QWidget>
 #include <QPointF>
+#include <QRectF>
+#include <QColor>
 #include <QImage>
+#include <QTransform>
 
 #include <array>
 #include <atomic>
@@ -71,6 +74,7 @@ public:
     void invalidateVis() {}
     void invalidateIntersect(const std::string& = "") override;
     void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false);
+    void centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender = false);
 
     // --- Accessors ---
     std::string surfName() const override { return _surfName; }
@@ -154,9 +158,9 @@ public:
     void clearOverlayGroup(const std::string& key) override;
     void clearAllOverlayGroups() override;
 
-    // --- BBox stubs ---
-    auto selections() const -> std::vector<std::pair<QRectF, QColor>> override { return {}; }
-    std::optional<QRectF> activeBBoxSceneRect() const override { return std::nullopt; }
+    // --- BBox ---
+    auto selections() const -> std::vector<std::pair<QRectF, QColor>> override;
+    std::optional<QRectF> activeBBoxSceneRect() const override;
 
     // --- Intersection ---
     float intersectionOpacity() const override { return _intersectionOpacity; }
@@ -186,6 +190,7 @@ public:
     QPointF volumeToScene(const cv::Vec3f& vol_point) override;
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const override;
     cv::Vec2f sceneToSurfaceCoords(const QPointF& scenePos) const;
+    QPointF surfaceCoordsToScene(float surfX, float surfY) const { return surfaceToScene(surfX, surfY); }
     bool sceneToVolumePN(cv::Vec3f& p, cv::Vec3f& n, const QPointF& scenePos) const;
     QPointF lastScenePosition() const { return _lastScenePos; }
 
@@ -193,11 +198,11 @@ public:
     void adjustSurfaceOffset(float dn);
     void resetSurfaceOffsets();
 
-    // --- BBox tool stubs ---
-    void setBBoxMode(bool) {}
-    bool isBBoxMode() const { return false; }
-    QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF&) { return nullptr; }
-    void clearSelections() {}
+    // --- BBox tool ---
+    void setBBoxMode(bool enabled);
+    bool isBBoxMode() const { return _bboxMode; }
+    QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF& sceneRect);
+    void clearSelections();
 
     // --- Compat accessors ---
     CVolumeViewerView* fGraphicsView = nullptr;  // alias for _view, set in constructor
@@ -216,6 +221,7 @@ public:
 
     void updateStatusLabel();
     void fitSurfaceInView();
+    void requestRender();
     bool isWindowMinimized() const;
     bool eventFilter(QObject* watched, QEvent* event) override;
 
@@ -228,7 +234,6 @@ public slots:
 
     void onZoom(int steps, QPointF scenePoint, Qt::KeyboardModifiers modifiers);
     void onResized();
-    void onCursorMove(QPointF scenePos);
     void onPanStart(Qt::MouseButton, Qt::KeyboardModifiers);
     void onPanRelease(Qt::MouseButton, Qt::KeyboardModifiers);
     void onVolumeClicked(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
@@ -250,11 +255,11 @@ signals:
                            Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void sendZSliceChanged(int z_value);
     void sendMousePressVolume(cv::Vec3f vol_loc, cv::Vec3f normal,
-                              Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+                              Qt::MouseButton button, Qt::KeyboardModifiers modifiers, QPointF scenePos);
     void sendMouseMoveVolume(cv::Vec3f vol_loc, Qt::MouseButtons buttons,
-                             Qt::KeyboardModifiers modifiers);
+                             Qt::KeyboardModifiers modifiers, QPointF scenePos);
     void sendMouseReleaseVolume(cv::Vec3f vol_loc, Qt::MouseButton button,
-                                Qt::KeyboardModifiers modifiers);
+                                Qt::KeyboardModifiers modifiers, QPointF scenePos);
     void sendCollectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
     void pointClicked(uint64_t pointId);
@@ -304,6 +309,7 @@ private:
     // Framebuffer coordinate conversions
     QPointF surfaceToScene(float surfX, float surfY) const;
     cv::Vec2f sceneToSurface(const QPointF& scenePos) const;
+    QRectF surfaceRectToSceneRect(const QRectF& surfRect) const;
     void updateFocusMarker(POI* poi = nullptr);
 
     void renderFlattenedIntersections(const std::shared_ptr<Surface>& surf);
@@ -312,6 +318,19 @@ private:
     void zoomStepsAt(int steps, const QPointF& scenePos);
 
     bool isAxisAlignedView() const;
+
+    struct CameraSceneSnapshot {
+        float camSurfX = 0.0f;
+        float camSurfY = 0.0f;
+        float camScale = 1.0f;
+        float vpCx = 0.0f;
+        float vpCy = 0.0f;
+        QTransform sceneToView;
+        QTransform viewToScene;
+        bool valid = false;
+    };
+    CameraSceneSnapshot cameraSceneSnapshot() const;
+    void warpIntersectionItemsFrom(const CameraSceneSnapshot& oldCam);
 
     // --- Qt widgets ---
     CVolumeViewerView* _view = nullptr;
@@ -440,6 +459,8 @@ private:
     bool _genCacheDirty = true;
     float _genCacheZOff = 0.0f;
     cv::Vec3f _genCacheZOffDir{0.0f, 0.0f, 0.0f};
+    int _genCachePrefetchLevel = -1;
+    int _genCachePrefetchNumLevels = -1;
 
 public:
     // Re-reads perf/interaction settings from disk into cached members.
@@ -462,6 +483,16 @@ private:
     // --- Overlay groups (stored for VolumeViewerBase interface) ---
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
     QGraphicsItem* _focusMarker = nullptr;
+
+    // --- BBox tool state ---
+    bool _bboxMode = false;
+    QPointF _bboxStart;
+    std::optional<QRectF> _activeBBoxSurfRect;
+    struct Selection {
+        QRectF surfRect;
+        QColor color;
+    };
+    std::vector<Selection> _selections;
 
     // --- Intersection overlay ---
     std::set<std::string> _intersectTgts;

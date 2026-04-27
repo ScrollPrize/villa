@@ -68,6 +68,8 @@ set(srcs
     segmentation/panels/SegmentationNeuralTracerPanel.hpp
     segmentation/panels/SegmentationDirectionFieldPanel.cpp
     segmentation/panels/SegmentationDirectionFieldPanel.hpp
+    segmentation/panels/SegmentationManualAddPanel.cpp
+    segmentation/panels/SegmentationManualAddPanel.hpp
     segmentation/growth/SegmentationGrowth.cpp
     segmentation/growth/ExtrapolationGrowth.cpp
     segmentation/growth/ExtrapolationGrowth.hpp
@@ -77,8 +79,14 @@ set(srcs
     segmentation/tools/SegmentationEditManager.hpp
     segmentation/tools/ApprovalMaskBrushTool.cpp
     segmentation/tools/ApprovalMaskBrushTool.hpp
+    segmentation/tools/SurfaceMaskBrushTool.cpp
+    segmentation/tools/SurfaceMaskBrushTool.hpp
     segmentation/tools/CellReoptimizationTool.cpp
     segmentation/tools/CellReoptimizationTool.hpp
+    segmentation/tools/ManualAddTool.cpp
+    segmentation/tools/ManualAddTool.hpp
+    segmentation/tools/ThinPlateSpline3d.cpp
+    segmentation/tools/ThinPlateSpline3d.hpp
     segmentation/tools/SegmentationLineTool.cpp
     segmentation/tools/SegmentationLineTool.hpp
     segmentation/tools/SegmentationPushPullTool.cpp
@@ -184,6 +192,7 @@ target_link_libraries(VC3D
     vc_ui
     vc_tracer
     vc_flattening
+    Ceres::ceres
     Qt6::Core
     Qt6::Concurrent
     Qt6::Gui

@@ -112,6 +112,13 @@ public:
     // Only insert into negativeCache_ when this is true.
     [[nodiscard]] static bool lastFetchWasAbsent() noexcept;
 
+    // Per-thread "this fetch failed for a retryable/non-absence reason"
+    // signal, set by the most recent fetch on this thread. True for HTTP
+    // auth/network/server/range failures, false for success and confirmed
+    // source absence. Callers should not mark work done or negative-cache
+    // when this is true.
+    [[nodiscard]] static bool lastFetchHadTransientError() noexcept;
+
 private:
     std::string chunkUrl(const ChunkKey& key) const;
     std::string shardUrl(const ChunkKey& key) const;

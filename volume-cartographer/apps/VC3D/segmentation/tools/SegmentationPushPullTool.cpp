@@ -19,6 +19,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <limits>
 #include <optional>
 #include <numeric>
@@ -450,6 +451,7 @@ void SegmentationPushPullTool::setAlphaConfig(const AlphaPushPullConfig& config)
 bool SegmentationPushPullTool::start(int direction, std::optional<bool> alphaOverride)
 {
     if (direction == 0) {
+        qCWarning(lcSegPushPull) << "Push/pull start ignored: direction is zero.";
         return false;
     }
 
@@ -463,13 +465,16 @@ bool SegmentationPushPullTool::start(int direction, std::optional<bool> alphaOve
     }
 
     if (!_module.ensureHoverTarget()) {
+        qCWarning(lcSegPushPull) << "Push/pull start failed: no hover target.";
         return false;
     }
     const auto hover = _module.hoverInfo();
     if (!hover.valid || !hover.viewer || !_module.isSegmentationViewer(hover.viewer)) {
+        qCWarning(lcSegPushPull) << "Push/pull start failed: hover target is invalid or not a segmentation viewer.";
         return false;
     }
     if (!_editManager || !_editManager->hasSession()) {
+        qCWarning(lcSegPushPull) << "Push/pull start failed: no active editing session.";
         return false;
     }
 
@@ -815,6 +820,7 @@ void SegmentationPushPullTool::launchAlphaCompute()
     auto future = QtConcurrent::run(
         [volume, datasetIndex, scale, direction, config, perVertex,
          centerWorld, centerNormal, sampleInputs]() -> AlphaResult {
+        try {
 
         AlphaResult result;
 
@@ -897,6 +903,12 @@ void SegmentationPushPullTool::launchAlphaCompute()
         }
 
         return result;
+        } catch (const std::exception& e) {
+            qCWarning(lcSegPushPull) << "Alpha push/pull worker failed:" << e.what();
+        } catch (...) {
+            qCWarning(lcSegPushPull) << "Alpha push/pull worker failed with an unknown exception";
+        }
+        return AlphaResult{};
     });
 
     _alphaWatcher.setFuture(future);

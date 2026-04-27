@@ -152,6 +152,12 @@ public:
     // (first block in block cache) or known-empty.
     [[nodiscard]] size_t countAvailable(const std::vector<ChunkKey>& keys) const;
 
+    // Return chunks that are not resident, not known-empty, and not already
+    // present in the canonical disk cache. Used by explicit cache prefetch so
+    // already-downloaded chunks are not fetched again.
+    [[nodiscard]] std::vector<ChunkKey> chunksMissingFromCache(
+        const std::vector<ChunkKey>& keys) const;
+
     // --- Notifications ---
     using ChunkReadyCallback = std::function<void(const ChunkKey&)>;
     using ChunkReadyCallbackId = uint64_t;

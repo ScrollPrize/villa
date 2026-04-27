@@ -75,6 +75,9 @@ void CVolumeViewerView::drawForeground(QPainter* p, const QRectF& sceneRect)
 CVolumeViewerView::CVolumeViewerView(QWidget* parent) : QGraphicsView(parent)
 {
     setMouseTracking(true);
+    if (viewport()) {
+        viewport()->setMouseTracking(true);
+    }
 };
 
 void CVolumeViewerView::drawBackground(QPainter* painter, const QRectF& /*rect*/)
@@ -137,6 +140,15 @@ void CVolumeViewerView::mouseReleaseEvent(QMouseEvent *event)
     }
     else if (event->button() == Qt::RightButton)
     {
+        if (_right_button_mouse_forwarded) {
+            QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
+            QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
+            sendMouseRelease(scene_loc, event->button(), event->modifiers());
+            _right_button_mouse_forwarded = false;
+            event->accept();
+            return;
+        }
+
         setCursor(Qt::ArrowCursor);
         event->accept();
         if (_regular_pan) {
@@ -213,6 +225,15 @@ void CVolumeViewerView::mousePressEvent(QMouseEvent *event)
     }
     else if (event->button() == Qt::RightButton)
     {
+        if (event->modifiers().testFlag(Qt::ShiftModifier)) {
+            QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
+            QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
+            _right_button_mouse_forwarded = true;
+            sendMousePress(scene_loc, event->button(), event->modifiers());
+            event->accept();
+            return;
+        }
+
         _regular_pan = true;
         _last_pan_position = QPoint(event->position().x(), event->position().y());
         sendPanStart(event->button(), event->modifiers());
@@ -260,7 +281,7 @@ void CVolumeViewerView::mouseMoveEvent(QMouseEvent *event)
         event->accept();
 
         // Tiled viewers disable scrollbars and perform panning in their
-        // sendCursorMove handler, so they still need pan-motion updates here.
+        // mouse-move handler, so they still need pan-motion updates here.
         if (!_scrollPanDisabled) {
             return;
         }
@@ -268,12 +289,6 @@ void CVolumeViewerView::mouseMoveEvent(QMouseEvent *event)
 
     QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
     QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
-
-    sendCursorMove(scene_loc);
-
-    if (_regular_pan) {
-        return;
-    }
 
     // Forward mouse move events even without a pressed button so tools that
     // rely on hover state (e.g. segmentation editing) receive continuous

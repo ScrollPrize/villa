@@ -13,6 +13,7 @@
 #include "CState.hpp"
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/types/Volume.hpp"
+#include "vc/core/util/Logging.hpp"
 
 #include <QMdiArea>
 #include <QThread>
@@ -22,6 +23,7 @@
 #include <QLoggingCategory>
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <iostream>
 #include <optional>
 #include <unordered_set>
@@ -31,6 +33,8 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 Q_LOGGING_CATEGORY(lcViewerManager, "vc.viewer.manager")
+
+#define VC3D_DEBUG_QCINFO(category) if (!DebugLoggingEnabled()) {} else qCInfo(category)
 
 
 ViewerManager::ViewerManager(CState* state,
@@ -393,20 +397,20 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
     if (_surfacePatchIndexNeedsRebuild || _surfacePatchIndex->empty()) {
         _surfacePatchIndexNeedsRebuild = true;
         _indexedSurfaceIds.erase(surfId);
-        qCInfo(lcViewerManager) << "Deferred surface index refresh for" << surfId.c_str()
+        VC3D_DEBUG_QCINFO(lcViewerManager) << "Deferred surface index refresh for" << surfId.c_str()
                                 << "(global rebuild pending)";
         return;
     }
 
     if (_surfacePatchIndex->updateSurface(surface)) {
         _indexedSurfaceIds.insert(surfId);
-        qCInfo(lcViewerManager) << "Rebuilt SurfacePatchIndex entries for surface" << surfId.c_str();
+        VC3D_DEBUG_QCINFO(lcViewerManager) << "Rebuilt SurfacePatchIndex entries for surface" << surfId.c_str();
         return;
     }
 
     _surfacePatchIndexNeedsRebuild = true;
     _indexedSurfaceIds.erase(surfId);
-    qCInfo(lcViewerManager) << "Failed to rebuild SurfacePatchIndex for surface" << surfId.c_str()
+    VC3D_DEBUG_QCINFO(lcViewerManager) << "Failed to rebuild SurfacePatchIndex for surface" << surfId.c_str()
                             << "- marking index for rebuild";
 }
 
@@ -418,7 +422,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
 
     // Empty rect means no changes
     if (changedRegion.empty()) {
-        qCInfo(lcViewerManager) << "Skipped SurfacePatchIndex update (no changes)";
+        VC3D_DEBUG_QCINFO(lcViewerManager) << "Skipped SurfacePatchIndex update (no changes)";
         return;
     }
 
@@ -426,7 +430,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
     if (_surfacePatchIndexNeedsRebuild || _surfacePatchIndex->empty()) {
         _surfacePatchIndexNeedsRebuild = true;
         _indexedSurfaceIds.erase(surfId);
-        qCInfo(lcViewerManager) << "Deferred surface index refresh for" << surfId.c_str()
+        VC3D_DEBUG_QCINFO(lcViewerManager) << "Deferred surface index refresh for" << surfId.c_str()
                                 << "(global rebuild pending)";
         return;
     }
@@ -439,7 +443,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
 
     if (_surfacePatchIndex->updateSurfaceRegion(surface, rowStart, rowEnd, colStart, colEnd)) {
         _indexedSurfaceIds.insert(surfId);
-        qCInfo(lcViewerManager) << "Updated SurfacePatchIndex region for" << surfId.c_str()
+        VC3D_DEBUG_QCINFO(lcViewerManager) << "Updated SurfacePatchIndex region for" << surfId.c_str()
                                 << "rows" << rowStart << "-" << rowEnd
                                 << "cols" << colStart << "-" << colEnd;
         return;
@@ -538,10 +542,11 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
             // swallowed inside rebuild(); anything reaching here is a
             // structural error. Fail the rebuild gracefully so the result
             // path's null-check kicks in instead of terminate-on-unhandled.
-            std::cout << "[SurfacePatchIndex] rebuild failed: " << e.what()
-                      << std::endl;
-            return {};
+            qCWarning(lcViewerManager) << "SurfacePatchIndex async rebuild failed:" << e.what();
+        } catch (...) {
+            qCWarning(lcViewerManager) << "SurfacePatchIndex async rebuild failed with an unknown exception";
         }
+        return std::shared_ptr<SurfacePatchIndex>{};
     });
     _surfacePatchIndexWatcher->setFuture(future);
 }
@@ -585,7 +590,7 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     _surfacesQueuedForRemovalDuringRebuild.clear();
     _surfacesQueuedDuringRebuildIds.clear();
 
-    qCInfo(lcViewerManager) << "Asynchronously rebuilt SurfacePatchIndex for"
+    VC3D_DEBUG_QCINFO(lcViewerManager) << "Asynchronously rebuilt SurfacePatchIndex for"
                             << _indexedSurfaceIds.size() << "surfaces"
                             << "at stride" << _surfacePatchSamplingStride;
     forEachViewer([](CTiledVolumeViewer* v) { v->renderIntersections(); });
@@ -596,7 +601,7 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
         _targetRefinedStride > 0 && _surfacePatchSamplingStride > _targetRefinedStride;
     if (refineRequested || queuesDirty) {
         if (refineRequested) {
-            qCInfo(lcViewerManager) << "Starting progressive refinement from stride"
+            VC3D_DEBUG_QCINFO(lcViewerManager) << "Starting progressive refinement from stride"
                                     << _surfacePatchSamplingStride << "to" << _targetRefinedStride;
             const int targetStride = _targetRefinedStride;
             _targetRefinedStride = 0;  // Clear target to prevent infinite loop
@@ -616,7 +621,7 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
     }
 
     const std::string surfId = quad->id;
-    const bool alreadyIndexed = _indexedSurfaceIds.count(surfId) != 0;
+    const bool alreadyIndexed = _surfacePatchIndex->containsSurface(quad);
 
     // Check if async rebuild is in progress
     const bool asyncRebuildInProgress = _surfacePatchIndexWatcher &&
@@ -636,6 +641,23 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
 
     if (isEditUpdate && alreadyIndexed) {
         return true;
+    }
+
+    if (isEditUpdate && !_surfacePatchIndex->empty()) {
+        if (_surfacePatchIndex->updateSurface(quad)) {
+            _indexedSurfaceIds.insert(surfId);
+            if (asyncRebuildInProgress) {
+                _surfacesQueuedDuringRebuildIds.push_back(surfId);
+            }
+            VC3D_DEBUG_QCINFO(lcViewerManager) << "Inserted active edit surface into SurfacePatchIndex"
+                                    << surfId.c_str();
+            return true;
+        }
+        _indexedSurfaceIds.erase(surfId);
+        _surfacePatchIndexNeedsRebuild = true;
+        VC3D_DEBUG_QCINFO(lcViewerManager) << "Failed to insert active edit surface into SurfacePatchIndex"
+                                << surfId.c_str() << "- marking index for rebuild";
+        return false;
     }
 
     if (asyncRebuildInProgress) {
