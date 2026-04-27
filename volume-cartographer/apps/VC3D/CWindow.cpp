@@ -1487,25 +1487,41 @@ void CWindow::configureViewerConnections(CTiledVolumeViewer* viewer)
     }
 
     const std::string& surfName = viewer->surfName();
-    if ((surfName == "seg xz" || surfName == "seg yz") && !viewer->property("vc_axisaligned_bound").toBool()) {
+    if ((surfName == "xy plane" || surfName == "seg xz" || surfName == "seg yz") &&
+        !viewer->property("vc_axisaligned_bound").toBool()) {
         if (viewer->fGraphicsView) {
-            viewer->fGraphicsView->setMiddleButtonPanEnabled(!_axisAlignedSliceController->isEnabled());
+            if (surfName == "seg xz" || surfName == "seg yz") {
+                viewer->fGraphicsView->setMiddleButtonPanEnabled(!_axisAlignedSliceController->isEnabled());
+            }
+            if (!viewer->fGraphicsView->property("vc_tilt_handle_bound").toBool()) {
+                connect(viewer->fGraphicsView, &CVolumeViewerView::sendTiltHandleChanged,
+                        this, [this, viewer](QPointF tilt) {
+                            _axisAlignedSliceController->onTiltHandleChanged(viewer, tilt);
+                        });
+                connect(viewer->fGraphicsView, &CVolumeViewerView::sendTiltHandleReset,
+                        this, [this]() {
+                            _axisAlignedSliceController->onTiltHandleReset();
+                        });
+                viewer->fGraphicsView->setProperty("vc_tilt_handle_bound", true);
+            }
         }
 
-        connect(viewer, &CTiledVolumeViewer::sendMousePressVolume,
-                this, [this, viewer](cv::Vec3f volLoc, cv::Vec3f /*normal*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
-                    _axisAlignedSliceController->onMousePress(viewer, volLoc, button, modifiers);
-                });
+        if (surfName == "seg xz" || surfName == "seg yz") {
+            connect(viewer, &CTiledVolumeViewer::sendMousePressVolume,
+                    this, [this, viewer](cv::Vec3f volLoc, cv::Vec3f /*normal*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
+                        _axisAlignedSliceController->onMousePress(viewer, volLoc, button, modifiers);
+                    });
 
-        connect(viewer, &CTiledVolumeViewer::sendMouseMoveVolume,
-                this, [this, viewer](cv::Vec3f volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers) {
-                    _axisAlignedSliceController->onMouseMove(viewer, volLoc, buttons, modifiers);
-                });
+            connect(viewer, &CTiledVolumeViewer::sendMouseMoveVolume,
+                    this, [this, viewer](cv::Vec3f volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers) {
+                        _axisAlignedSliceController->onMouseMove(viewer, volLoc, buttons, modifiers);
+                    });
 
-        connect(viewer, &CTiledVolumeViewer::sendMouseReleaseVolume,
-                this, [this, viewer](cv::Vec3f /*volLoc*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
-                    _axisAlignedSliceController->onMouseRelease(viewer, button, modifiers);
-                });
+            connect(viewer, &CTiledVolumeViewer::sendMouseReleaseVolume,
+                    this, [this, viewer](cv::Vec3f /*volLoc*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
+                        _axisAlignedSliceController->onMouseRelease(viewer, button, modifiers);
+                    });
+        }
 
         viewer->setProperty("vc_axisaligned_bound", true);
     }
