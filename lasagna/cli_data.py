@@ -83,10 +83,7 @@ def from_args(args: argparse.Namespace) -> DataConfig:
 
 
 def load_fit_data(cfg: DataConfig) -> fit_data.FitData3D:
-	return fit_data.load_3d(
+	return fit_data.load_3d_streaming(
 		path=cfg.input,
 		device=torch.device(cfg.device),
-		downscale=cfg.downscale,
-		crop=cfg.crop,
-		cuda_gridsample=cfg.cuda_gridsample,
 	)

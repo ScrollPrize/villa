@@ -398,14 +398,14 @@ def optimize(
 
 		# Station-keeping: set seed point anchor (once, on first stage that uses it)
 		if (_need_term("station_n", opt_cfg.eff) > 0 or _need_term("station_t", opt_cfg.eff) > 0) and seed_xyz is not None:
-			dev = data.grad_mag.device
+			dev = next(model.parameters()).device
 			seed_t = torch.tensor(list(seed_xyz), device=dev, dtype=torch.float32)
 			opt_loss_station.set_seed(seed_t, data, Hm=model.mesh_h, Wm=model.mesh_w, D=model.depth)
 
 		# Initial evaluation
 		def _eval_terms(res_, eff_):
 			"""Evaluate all loss terms, handling both single and multi-loss returns."""
-			total = torch.zeros((), device=data.grad_mag.device, dtype=data.grad_mag.dtype)
+			total = torch.zeros((), device=next(model.parameters()).device, dtype=torch.float32)
 			tv: dict[str, float] = {}
 			D = res_.xyz_lr.shape[0]
 			for name, t in terms.items():
@@ -435,6 +435,17 @@ def optimize(
 					total = total + w * lv
 			return total, tv
 
+		# Initial prefetch for streaming mode
+		if data.sparse_caches:
+			with torch.no_grad():
+				_xyz_lr_pf = model._grid_xyz()
+				_xyz_hr_pf = model._grid_xyz_hr(_xyz_lr_pf)
+			for _cache in data.sparse_caches.values():
+				_sp = data._spacing_for(_cache.channels[0])
+				_cache.prefetch(_xyz_hr_pf, data.origin_fullres, _sp)
+			for _cache in data.sparse_caches.values():
+				_cache.sync()
+
 		with torch.no_grad():
 			res0 = model(data)
 			loss0, term_vals0 = _eval_terms(res0, opt_cfg.eff)
@@ -457,6 +468,11 @@ def optimize(
 		loss = loss0
 
 		for step in range(max_steps):
+			# Sync: wait for chunks loaded by last prefetch
+			if data.sparse_caches:
+				for _cache in data.sparse_caches.values():
+					_cache.sync()
+
 			if fit_data.CHUNK_STATS_ENABLED:
 				fit_data._chunk_stats.begin_iteration()
 			res = model(data)
@@ -469,6 +485,15 @@ def optimize(
 			opt.step()
 			model.update_conn_offsets()
 			model.update_ext_conn_offsets()
+
+			# Prefetch: predict next iteration's chunks from updated mesh
+			if data.sparse_caches:
+				with torch.no_grad():
+					_xyz_lr_pf = model._grid_xyz()
+					_xyz_hr_pf = model._grid_xyz_hr(_xyz_lr_pf)
+				for _cache in data.sparse_caches.values():
+					_sp = data._spacing_for(_cache.channels[0])
+					_cache.prefetch(_xyz_hr_pf, data.origin_fullres, _sp)
 			_t_steps_acc += 1
 			_done_steps[0] += 1
 

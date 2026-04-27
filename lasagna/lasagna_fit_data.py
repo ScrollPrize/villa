@@ -661,8 +661,7 @@ def fit_data_to_model(
 
 	# --- Load data for spatial metadata ---
 	print(f"[fit_data] loading spatial metadata from {input_path}", flush=True)
-	data = fit_data.load_3d_for_model(path=input_path, device=dev, model=mdl,
-									  cuda_gridsample=dev.type == "cuda")
+	data = fit_data.load_3d_streaming(path=input_path, device=dev)
 	Z, Y, X = data.size
 	origin = data.origin_fullres
 	spacing = data.spacing
@@ -681,6 +680,13 @@ def fit_data_to_model(
 	print("[fit_data] running model forward pass", flush=True)
 	with torch.no_grad():
 		xyz_lr = mdl._grid_xyz()  # (D, Hm, Wm, 3)
+		# Prefetch chunks for streaming mode
+		if data.sparse_caches:
+			for _cache in data.sparse_caches.values():
+				_sp = data._spacing_for(_cache.channels[0])
+				_cache.prefetch(xyz_lr, data.origin_fullres, _sp)
+			for _cache in data.sparse_caches.values():
+				_cache.sync()
 		mask_lr = (data.grid_sample_fullres(xyz_lr).grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=torch.float32).unsqueeze(1)
 		# (D, 1, Hm, Wm)
 
@@ -803,29 +809,30 @@ def fit_data_to_model(
 			mode='nearest').squeeze(1)
 
 		# Strip validity: all midpoint samples must be inside volume (grad_mag > 0)
-		gm_vol = data.grad_mag.float()  # (1, 1, Z, Y, X)
-		for direction_grid, direction_name in [(strip_grid_prev, 'prev'), (strip_grid_next, 'next')]:
-			sv = F.grid_sample(gm_vol, direction_grid, mode='nearest',
-							   padding_mode='zeros', align_corners=True)
-			sv = sv.squeeze(0).squeeze(0).reshape(D, Hm, Wm, strip_samples)
-			sv = (sv > 0).all(dim=-1).float()
-			if direction_name == 'prev':
-				conn_mask_prev = conn_mask_prev * sv
-			else:
-				conn_mask_next = conn_mask_next * sv
+		if data.grad_mag is not None:
+			gm_vol = data.grad_mag.float()  # (1, 1, Z, Y, X)
+			for direction_grid, direction_name in [(strip_grid_prev, 'prev'), (strip_grid_next, 'next')]:
+				sv = F.grid_sample(gm_vol, direction_grid, mode='nearest',
+								   padding_mode='zeros', align_corners=True)
+				sv = sv.squeeze(0).squeeze(0).reshape(D, Hm, Wm, strip_samples)
+				sv = (sv > 0).all(dim=-1).float()
+				if direction_name == 'prev':
+					conn_mask_prev = conn_mask_prev * sv
+				else:
+					conn_mask_next = conn_mask_next * sv
 
-		for direction_grid, direction_name, H, W in [
-			(strip_grid_prev_d, 'prev', Hd, Wd),
-			(strip_grid_next_d, 'next', Hd, Wd),
-		]:
-			sv = F.grid_sample(gm_vol, direction_grid, mode='nearest',
-							   padding_mode='zeros', align_corners=True)
-			sv = sv.squeeze(0).squeeze(0).reshape(D, H, W, strip_samples)
-			sv = (sv > 0).all(dim=-1).float()
-			if direction_name == 'prev':
-				conn_mask_prev_d = conn_mask_prev_d * sv
-			else:
-				conn_mask_next_d = conn_mask_next_d * sv
+			for direction_grid, direction_name, H, W in [
+				(strip_grid_prev_d, 'prev', Hd, Wd),
+				(strip_grid_next_d, 'next', Hd, Wd),
+			]:
+				sv = F.grid_sample(gm_vol, direction_grid, mode='nearest',
+								   padding_mode='zeros', align_corners=True)
+				sv = sv.squeeze(0).squeeze(0).reshape(D, H, W, strip_samples)
+				sv = (sv > 0).all(dim=-1).float()
+				if direction_name == 'prev':
+					conn_mask_prev_d = conn_mask_prev_d * sv
+				else:
+					conn_mask_next_d = conn_mask_next_d * sv
 
 		# Initial density: uniform 1/avg_strip_length (so initial integral ≈ 1.0)
 		all_lens = torch.cat([strip_len_prev[conn_mask_prev > 0.5],
