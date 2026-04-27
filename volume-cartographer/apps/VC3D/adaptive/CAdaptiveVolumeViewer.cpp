@@ -502,18 +502,6 @@ void CAdaptiveVolumeViewer::submitRender()
     // these safely — the shared_ptr from weak_ptr::lock() and the volume
     // pointers need main-thread-stable reads.
     auto surf = _surfWeak.lock();
-    {
-        // Reset counter on each volume change so we always see the first
-        // few submitRender calls after a switch.
-        static int srDbg = 0;
-        static void* lastVol = nullptr;
-        if ((void*)_volume.get() != lastVol) { srDbg = 0; lastVol = (void*)_volume.get(); }
-        if (srDbg++ < 5)
-            fprintf(stderr, "[Viewer:%s] submitRender #%d: surf=%p vol=%p zarrDs(0)=%p numScales=%zu\n",
-                    _surfName.c_str(), srDbg, (void*)surf.get(), (void*)_volume.get(),
-                    _volume ? (void*)_volume->zarrDataset(0) : nullptr,
-                    _volume ? _volume->numScales() : 0);
-    }
     if (!surf || !_volume || !_volume->zarrDataset()) return;
     const int fbW = _framebuffer.width();
     const int fbH = _framebuffer.height();
@@ -569,10 +557,12 @@ void CAdaptiveVolumeViewer::submitRender()
     QThreadPool::globalInstance()->start([this, ctx = std::move(ctx)]() {
         try {
             renderIntoFramebuffer(_framebufferWork, ctx);
+        } catch (const std::exception& ex) {
+            fprintf(stderr, "[Viewer:%s] RENDER EXCEPTION: %s\n",
+                    _surfName.c_str(), ex.what());
         } catch (...) {
-            // Swallow render errors here; finishRenderOnMainThread still
-            // fires so the busy flag gets cleared and we don't deadlock
-            // the render timer.
+            fprintf(stderr, "[Viewer:%s] RENDER EXCEPTION (unknown)\n",
+                    _surfName.c_str());
         }
         QMetaObject::invokeMethod(this,
             "finishRenderOnMainThread", Qt::QueuedConnection);
@@ -1090,13 +1080,6 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
 
 void CAdaptiveVolumeViewer::finishRenderOnMainThread()
 {
-    // Guard against a mid-render resize: onResized() may have
-    // reallocated _framebuffer to a new viewport size while the worker
-    // was still writing to the work buffer at the old size. Swapping
-    // unconditionally would clobber the correctly-sized _framebuffer
-    // with a stale-sized image and leave the view drawing from the
-    // wrong size every frame after. Drop the stale render on the floor
-    // instead and re-schedule.
     const bool sizesMatch = (_framebuffer.size() == _framebufferWork.size());
     if (sizesMatch) {
         std::swap(_framebuffer, _framebufferWork);

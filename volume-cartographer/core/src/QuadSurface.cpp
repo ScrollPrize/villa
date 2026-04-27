@@ -745,13 +745,13 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     // Trigger the cache build + set _validMaskAllValid before deciding
     // whether we need the validity warp below.
     cv::Mat_<uint8_t> valid_src = validMask();
-    const bool skipValidity = _validMaskAllValid;
+    bool skipValidity = _validMaskAllValid;
 
     // --- warp coords and validity ----------------------------------------
     cv::Mat_<cv::Vec3f>& coords_big = _genCoordsScratch;
     cv::Mat_<uint8_t>& valid_big = _genValidScratch;
 
-    if (_components.size() > 1) {
+    if (!_components.empty()) {
         // Multi-component surface: warp each component separately with
         // constant NaN border so no interpolation across component boundaries.
         const cv::Vec3f nanV(std::numeric_limits<float>::quiet_NaN(),
@@ -791,13 +791,15 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
             }
         }
     } else {
-        // Single component: main's replicate path with scratch reuse
+        // Single component: replicate coords, constant-0 validity.
+        // Always warp validity even when all source points are valid —
+        // the 4px halo around the crop region needs 0s so the
+        // invalidation pass below sets them to NaN (black edges).
         coords_big.create(h + 8, w + 8);
         warpBilinearReplicateVec3f(*_points, coords_big, ox, oy, sx, sy);
-        if (!skipValidity) {
-            valid_big.create(h + 8, w + 8);
-            warpNearestConstU8(valid_src, valid_big, ox, oy, sx, sy, 0);
-        }
+        valid_big.create(h + 8, w + 8);
+        warpNearestConstU8(valid_src, valid_big, ox, oy, sx, sy, 0);
+        skipValidity = false;  // force invalidation pass below
     }
 
     // --- normals: warp cached source-grid normals -------------------
@@ -858,7 +860,7 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     const cv::Vec3f qnan(std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN(),
                         std::numeric_limits<float>::quiet_NaN());
-    {
+    if (!skipValidity) {
         cv::Mat valid = valid_big(inner);
         const bool doNormals = need_normals;
         for (int j = 0; j < h; ++j) {
