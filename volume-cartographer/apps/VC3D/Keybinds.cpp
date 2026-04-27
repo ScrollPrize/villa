@@ -389,6 +389,14 @@ const KeyPressDef GrowthStepAll{
     Qt::NoModifier,
     true
 };
+const KeyPressDef GrowthFill{
+    "growth_fill",
+    kSectionSegGrowth,
+    "Fill growth without expanding the Patch Tracer grid",
+    Qt::Key_5,
+    Qt::ShiftModifier,
+    true
+};
 
 const KeyPressDef DeletePoint{
     "delete_point",
@@ -513,6 +521,7 @@ QString buildKeybindsHelpText()
         { kSectionSegGrowth, keypress::GrowthRight.description, HelpKeyType::KeyPress, nullptr, &keypress::GrowthRight, nullptr },
         { kSectionSegGrowth, keypress::GrowthAll.description, HelpKeyType::KeyPress, nullptr, &keypress::GrowthAll, nullptr },
         { kSectionSegGrowth, keypress::GrowthStepAll.description, HelpKeyType::KeyPress, nullptr, &keypress::GrowthStepAll, nullptr },
+        { kSectionSegGrowth, keypress::GrowthFill.description, HelpKeyType::KeyPress, nullptr, &keypress::GrowthFill, nullptr },
 
         { kSectionPushPull, keypress::PushPullIn.description, HelpKeyType::KeyPress, nullptr, &keypress::PushPullIn, nullptr },
         { kSectionPushPull, keypress::PushPullOut.description, HelpKeyType::KeyPress, nullptr, &keypress::PushPullOut, nullptr },

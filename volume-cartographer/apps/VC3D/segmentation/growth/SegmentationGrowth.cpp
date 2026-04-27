@@ -5,11 +5,13 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <set>
 #include <system_error>
 
 #include "utils/Json.hpp"
 #include <opencv2/core.hpp>
+#include <omp.h>
 #include <QLoggingCategory>
 #include <QString>
 
@@ -28,7 +30,29 @@
 Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth)
 
 namespace
-{void createRotatingBackup(QuadSurface* surface, int maxBackups = 10)
+{
+class ScopedOmpThreadLimit
+{
+public:
+    explicit ScopedOmpThreadLimit(int threadCount)
+        : _previousThreadCount(std::max(1, omp_get_max_threads()))
+    {
+        omp_set_num_threads(std::max(1, threadCount));
+    }
+
+    ~ScopedOmpThreadLimit()
+    {
+        omp_set_num_threads(_previousThreadCount);
+    }
+
+    ScopedOmpThreadLimit(const ScopedOmpThreadLimit&) = delete;
+    ScopedOmpThreadLimit& operator=(const ScopedOmpThreadLimit&) = delete;
+
+private:
+    int _previousThreadCount{1};
+};
+
+void createRotatingBackup(QuadSurface* surface, int maxBackups = 10)
 {
     if (!surface) {
         return;
@@ -138,6 +162,8 @@ QString directionToString(SegmentationGrowthDirection direction)
         return QStringLiteral("left");
     case SegmentationGrowthDirection::Right:
         return QStringLiteral("right");
+    case SegmentationGrowthDirection::Fill:
+        return QStringLiteral("fill");
     case SegmentationGrowthDirection::All:
     default:
         return QStringLiteral("all");
@@ -279,7 +305,11 @@ utils::Json buildTracerParams(const SegmentationGrowthRequest& request)
     params["grow_mode"] = directionToString(request.direction).toStdString();
     params["grow_steps"] = std::max(0, request.steps);
 
-    if (request.direction == SegmentationGrowthDirection::Left || request.direction == SegmentationGrowthDirection::Right) {
+    if (request.direction == SegmentationGrowthDirection::Fill) {
+        params["grow_extra_rows"] = 0;
+        params["grow_extra_cols"] = 0;
+        params["disable_grid_expansion"] = true;
+    } else if (request.direction == SegmentationGrowthDirection::Left || request.direction == SegmentationGrowthDirection::Right) {
         params["grow_extra_cols"] = std::max(0, request.steps);
         params["grow_extra_rows"] = 0;
     } else if (request.direction == SegmentationGrowthDirection::Up || request.direction == SegmentationGrowthDirection::Down) {
@@ -311,6 +341,7 @@ utils::Json buildTracerParams(const SegmentationGrowthRequest& request)
             allowRight = true;
             break;
         case SegmentationGrowthDirection::All:
+        case SegmentationGrowthDirection::Fill:
         default:
             allowUp = allowDown = allowLeft = allowRight = true;
             break;
@@ -493,6 +524,13 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         }
         qCInfo(lcSegGrowth) << "  params:" << QString::fromStdString(params.dump());
         createRotatingBackup(context.resumeSurface);
+
+        std::optional<ScopedOmpThreadLimit> regularTracerOmpLimit;
+        if (request.method == SegmentationGrowthMethod::Tracer) {
+            regularTracerOmpLimit.emplace(1);
+            qCInfo(lcSegGrowth) << "  regular tracer OpenMP threads forced to 1";
+        }
+
         QuadSurface* surface = tracer(dataset,
                                       1.0f,
                                       context.volume->tieredCache(),

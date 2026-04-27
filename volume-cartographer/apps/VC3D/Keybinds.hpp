@@ -76,6 +76,7 @@ extern const KeyPressDef GrowthDown;
 extern const KeyPressDef GrowthRight;
 extern const KeyPressDef GrowthAll;
 extern const KeyPressDef GrowthStepAll;
+extern const KeyPressDef GrowthFill;
 
 extern const KeyPressDef DeletePoint;
 } // namespace keypress

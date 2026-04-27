@@ -198,6 +198,28 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         return true;
     }
 
+    const bool growthFillShortcut =
+        event->modifiers() == vc3d::keybinds::keypress::GrowthFill.modifiers &&
+        (event->key() == vc3d::keybinds::keypress::GrowthFill.key ||
+         event->key() == Qt::Key_Percent);
+    if (growthFillShortcut &&
+        !event->isAutoRepeat()) {
+        if (!_widget || !_widget->growthKeybindsEnabled()) {
+            return false;
+        }
+
+        const SegmentationGrowthMethod method = _widget->growthMethod();
+        if (method != SegmentationGrowthMethod::PatchTracer) {
+            return false;
+        }
+
+        _pendingShortcutDirections = std::vector<SegmentationGrowthDirection>{SegmentationGrowthDirection::All};
+        const int steps = std::max(1, _widget->growthSteps());
+        handleGrowSurfaceRequested(method, SegmentationGrowthDirection::Fill, steps, false);
+        event->accept();
+        return true;
+    }
+
     if (event->modifiers() == Qt::NoModifier && !event->isAutoRepeat()) {
         if (!_widget || !_widget->growthKeybindsEnabled()) {
             return false;
