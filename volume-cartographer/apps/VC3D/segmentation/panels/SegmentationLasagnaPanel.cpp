@@ -382,6 +382,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             _datasetCombo->setEnabled(false);
             if (_newModelBtn) _newModelBtn->setEnabled(false);
             if (_reoptBtn) _reoptBtn->setEnabled(false);
+            if (_offsetBtn) _offsetBtn->setEnabled(false);
             return;
         }
         int restoreIdx = 0;
@@ -398,6 +399,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         _dataInputStack->setCurrentIndex(1);
         if (_newModelBtn) _newModelBtn->setEnabled(true);
         if (_reoptBtn) _reoptBtn->setEnabled(true);
+        if (_offsetBtn) _offsetBtn->setEnabled(true);
     });
 
     connect(_dataInputEdit, &QLineEdit::textChanged, this, [this](const QString& text) {
@@ -587,9 +589,11 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             if (_datasetCombo) { _datasetCombo->clear(); _datasetCombo->setEnabled(false); }
             if (_newModelBtn) _newModelBtn->setEnabled(false);
             if (_reoptBtn) _reoptBtn->setEnabled(false);
+            if (_offsetBtn) _offsetBtn->setEnabled(false);
         } else {
             if (_newModelBtn) _newModelBtn->setEnabled(true);
             if (_reoptBtn) _reoptBtn->setEnabled(true);
+            if (_offsetBtn) _offsetBtn->setEnabled(true);
             }
     });
     connect(&mgr, &LasagnaServiceManager::serviceError, this, [this](const QString& err) {
@@ -603,12 +607,14 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
             if (_datasetCombo) _datasetCombo->setEnabled(false);
             if (_newModelBtn) _newModelBtn->setEnabled(false);
             if (_reoptBtn) _reoptBtn->setEnabled(false);
+            if (_offsetBtn) _offsetBtn->setEnabled(false);
         }
     });
     connect(&mgr, &LasagnaServiceManager::optimizationStarted, this, [this]() {
         if (_stopBtn) _stopBtn->setEnabled(true);
         if (_newModelBtn) _newModelBtn->setEnabled(false);
         if (_reoptBtn) _reoptBtn->setEnabled(false);
+        if (_offsetBtn) _offsetBtn->setEnabled(false);
 
         if (_progressLabel) {
             _progressLabel->setText(tr("Optimization started..."));
@@ -643,6 +649,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         if (_stopBtn) _stopBtn->setEnabled(false);
         if (_newModelBtn) _newModelBtn->setEnabled(true);
         if (_reoptBtn) _reoptBtn->setEnabled(true);
+        if (_offsetBtn) _offsetBtn->setEnabled(true);
         if (_progressBar) _progressBar->setVisible(false);
         if (_progressLabel) {
             _progressLabel->setText(tr("Optimization finished. Output: %1").arg(outputDir));
@@ -656,6 +663,7 @@ SegmentationLasagnaPanel::SegmentationLasagnaPanel(
         if (_stopBtn) _stopBtn->setEnabled(false);
         if (_newModelBtn) _newModelBtn->setEnabled(true);
         if (_reoptBtn) _reoptBtn->setEnabled(true);
+        if (_offsetBtn) _offsetBtn->setEnabled(true);
         if (_progressBar) _progressBar->setVisible(false);
         if (_progressLabel) {
             _progressLabel->setText(tr("Optimization error: %1").arg(err));
@@ -900,6 +908,7 @@ void SegmentationLasagnaPanel::syncUiState(bool /*editingEnabled*/, bool optimiz
 
     if (_newModelBtn) _newModelBtn->setEnabled(!optimizing);
     if (_reoptBtn) _reoptBtn->setEnabled(!optimizing);
+    if (_offsetBtn) _offsetBtn->setEnabled(!optimizing);
     if (_stopBtn) _stopBtn->setEnabled(optimizing);
 }
 
@@ -1073,11 +1082,13 @@ void SegmentationLasagnaPanel::updateConnectionWidgets()
         _datasetCombo->setEnabled(hasDatasets);
         if (_newModelBtn) _newModelBtn->setEnabled(hasDatasets);
         if (_reoptBtn) _reoptBtn->setEnabled(hasDatasets);
+        if (_offsetBtn) _offsetBtn->setEnabled(hasDatasets);
     } else {
         // Internal mode: re-enable controls
         if (_datasetCombo) _datasetCombo->setEnabled(true);
         if (_newModelBtn) _newModelBtn->setEnabled(true);
         if (_reoptBtn) _reoptBtn->setEnabled(true);
+        if (_offsetBtn) _offsetBtn->setEnabled(true);
     }
 
     if (external && !_restoringSettings && !_externalHost.isEmpty() && _externalPort > 0) {
