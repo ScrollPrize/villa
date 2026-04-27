@@ -23,6 +23,11 @@ def _pool_w3(*, lm: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, tor
 
 def _sample_cos_diff(res: fit_model.FitResult3D) -> torch.Tensor:
 	"""Differentiably sample cos channel at xyz_hr. Returns (D, 1, He, We)."""
+	if res.data.sparse_caches:
+		# Sparse streaming mode: go through unified grid_sample_fullres path
+		sampled = res.data.grid_sample_fullres(res.xyz_hr, diff=True)
+		return sampled.cos.squeeze(0).permute(1, 0, 2, 3)  # (D, 1, He, We)
+	# Dense mode: direct kernel call (cos channel only, more efficient)
 	dev = res.xyz_hr.device
 	offset = torch.tensor(res.data.origin_fullres, dtype=torch.float32, device=dev)
 	inv_scale = torch.tensor([1.0 / s for s in res.data.spacing], dtype=torch.float32, device=dev)

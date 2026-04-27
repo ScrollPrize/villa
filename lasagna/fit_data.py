@@ -200,9 +200,9 @@ class CorrPoints3D:
 @dataclass(frozen=True)
 class FitData3D:
 	cos: torch.Tensor | None       # (1, 1, Z, Y, X) uint8 on GPU, or None if skipped
-	grad_mag: torch.Tensor         # (1, 1, Z, Y, X) uint8 on GPU
-	nx: torch.Tensor               # (1, 1, Z, Y, X) uint8 on GPU — hemisphere-encoded normal x
-	ny: torch.Tensor               # (1, 1, Z, Y, X) uint8 on GPU — hemisphere-encoded normal y
+	grad_mag: torch.Tensor | None  # (1, 1, Z, Y, X) uint8 on GPU, or None in streaming mode
+	nx: torch.Tensor | None        # (1, 1, Z, Y, X) uint8 on GPU — hemisphere-encoded normal x
+	ny: torch.Tensor | None        # (1, 1, Z, Y, X) uint8 on GPU — hemisphere-encoded normal y
 	pred_dt: torch.Tensor | None
 	corr_points: CorrPoints3D | None
 	winding_volume: torch.Tensor | None  # (1, 1, Z, Y, X) float32 on GPU
@@ -214,12 +214,18 @@ class FitData3D:
 	winding_max: float | None = None     # max valid winding value (from zarr metadata)
 	grad_mag_scale: float = 255.0                # encoding scale for grad_mag channel
 	cuda_gridsample: bool = True                  # use custom CUDA uint8 kernel vs PyTorch F.grid_sample
+	sparse_caches: dict | None = None            # group_name -> SparseChunkGroupCache (streaming mode)
+	_vol_size: tuple[int, int, int] | None = None  # fallback size when grad_mag is None
 
 	@property
 	def size(self) -> tuple[int, int, int]:
-		"""(Z, Y, X) spatial dimensions from grad_mag (always loaded)."""
-		_, _, z, y, x = self.grad_mag.shape
-		return int(z), int(y), int(x)
+		"""(Z, Y, X) spatial dimensions."""
+		if self.grad_mag is not None:
+			_, _, z, y, x = self.grad_mag.shape
+			return int(z), int(y), int(x)
+		if self._vol_size is not None:
+			return self._vol_size
+		raise ValueError("no size available: grad_mag is None and _vol_size not set")
 
 	@property
 	def normal_3d(self) -> torch.Tensor | None:
@@ -254,6 +260,8 @@ class FitData3D:
 		"""
 		if CHUNK_STATS_ENABLED:
 			_record_chunks(self, xyz_fullres)
+		if self.sparse_caches:
+			return self._grid_sample_sparse(xyz_fullres, diff=diff)
 		if self.cuda_gridsample:
 			return self._grid_sample_cuda(xyz_fullres, diff=diff)
 		return self._grid_sample_torch(xyz_fullres)
@@ -297,6 +305,58 @@ class FitData3D:
 			nx=_gs(self.nx, lambda t: (t - 128.0) / 127.0, "nx"),
 			ny=_gs(self.ny, lambda t: (t - 128.0) / 127.0, "ny"),
 			pred_dt=_gs(self.pred_dt, lambda t: t, "pred_dt"),
+			corr_points=self.corr_points,
+			winding_volume=self.winding_volume,
+			origin_fullres=self.origin_fullres,
+			spacing=self.spacing,
+			channel_spacing=self.channel_spacing,
+			source_to_base=self.source_to_base,
+			winding_min=self.winding_min,
+			winding_max=self.winding_max,
+			grad_mag_scale=self.grad_mag_scale,
+			cuda_gridsample=self.cuda_gridsample,
+		)
+
+	def _grid_sample_sparse(self, xyz_fullres: torch.Tensor, *, diff: bool = False) -> "FitData3D":
+		"""Sample from sparse chunk caches."""
+		from sparse_cache import SparseChunkGroupCache
+
+		dev = xyz_fullres.device
+		offset = torch.tensor(self.origin_fullres, dtype=torch.float32, device=dev)
+
+		# Collect raw samples from each cache group
+		raw: dict[str, torch.Tensor] = {}  # channel_name -> (1, D, H, W)
+		for group_name, cache in self.sparse_caches.items():
+			sp = self._spacing_for(cache.channels[0])
+			inv_scale = torch.tensor([1.0 / s for s in sp], dtype=torch.float32, device=dev)
+			# (C, D, H, W) raw interpolated values
+			sampled = cache.grid_sample(xyz_fullres, offset, inv_scale, diff=diff)
+			if not diff:
+				sampled = sampled.float()
+			for i, ch_name in enumerate(cache.channels):
+				raw[ch_name] = sampled[i:i+1].unsqueeze(0)  # (1, 1, D, H, W)
+
+		# Decode per-channel (same as _grid_sample_cuda)
+		cos_t = raw.get("cos")
+		if cos_t is not None:
+			cos_t = cos_t / 255.0
+		gm_t = raw.get("grad_mag")
+		if gm_t is not None:
+			gm_t = gm_t / self.grad_mag_scale
+		nx_t = raw.get("nx")
+		if nx_t is not None:
+			nx_t = (nx_t - 128.0) / 127.0
+		ny_t = raw.get("ny")
+		if ny_t is not None:
+			ny_t = (ny_t - 128.0) / 127.0
+		pred_dt_t = raw.get("pred_dt")
+
+		return FitData3D(
+			cos=cos_t,
+			grad_mag=gm_t,
+			nx=nx_t,
+			ny=ny_t,
+			pred_dt=pred_dt_t,
 			corr_points=self.corr_points,
 			winding_volume=self.winding_volume,
 			origin_fullres=self.origin_fullres,
@@ -810,4 +870,107 @@ def load_3d(
 		source_to_base=vol.source_to_base,
 		grad_mag_scale=gmag_enc,
 		cuda_gridsample=cuda_gridsample,
+	)
+
+
+def load_3d_streaming(
+	*,
+	path: str,
+	device: torch.device,
+	skip_channels: set[str] | None = None,
+) -> FitData3D:
+	"""Load .lasagna.json as sparse streaming cache — no upfront data load.
+
+	Chunks are loaded on demand via prefetch/sync. The returned FitData3D has
+	dense channel tensors set to None and sparse_caches populated instead.
+	"""
+	from sparse_cache import SparseChunkGroupCache
+
+	vol = LasagnaVolume.load(path)
+	gmag_enc = vol.grad_mag_encode_scale / vol.grad_mag_factor
+	s2b = vol.source_to_base
+	_skip = skip_channels or set()
+
+	# Build sparse caches per group
+	sparse_caches: dict[str, SparseChunkGroupCache] = {}
+	channel_spacing: dict[str, tuple[float, float, float]] = {}
+
+	# Track finest scaledown for origin alignment
+	finest_sd = min(g.sd_fac for g in vol.groups.values())
+	# Track primary spacing (from grad_mag group)
+	primary_spacing: tuple[float, float, float] | None = None
+	# Track vol size for the size property (use finest resolution)
+	vol_size: tuple[int, int, int] | None = None
+
+	for group_name, group in vol.groups.items():
+		# Filter out skipped channels
+		channels = [ch for ch in group.channels if ch not in _skip]
+		if not channels:
+			continue
+
+		zarr_path = str(vol.path.parent / group.zarr_path)
+		zsrc = zarr.open(zarr_path, mode="r")
+		if not isinstance(zsrc, zarr.Array):
+			raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
+		shape = tuple(int(v) for v in zsrc.shape)
+		is_3d = len(shape) == 3
+		if is_3d:
+			Z, Y, X = shape
+		elif len(shape) == 4:
+			_, Z, Y, X = shape
+		else:
+			raise ValueError(f"expected 3D or 4D zarr at {zarr_path}, got shape={shape}")
+
+		# Build channel index mapping
+		channel_indices: dict[str, int] = {}
+		for ch in channels:
+			ch_idx = group.channels.index(ch)
+			channel_indices[ch] = ch_idx
+
+		cache = SparseChunkGroupCache(
+			channels=channels,
+			zarr_path=zarr_path,
+			vol_shape_zyx=(Z, Y, X),
+			channel_indices=channel_indices,
+			is_3d_zarr=is_3d,
+			device=device,
+		)
+		sparse_caches[group_name] = cache
+
+		# Per-channel spacing
+		sd = float(group.sd_fac) * s2b
+		for ch in channels:
+			channel_spacing[ch] = (sd, sd, sd)
+
+		# Primary spacing + vol size from grad_mag (matches old size property)
+		if "grad_mag" in channels:
+			primary_spacing = (sd, sd, sd)
+			vol_size = (Z, Y, X)
+
+	if primary_spacing is None:
+		raise ValueError("grad_mag channel not found in any group")
+
+	# Origin at (0, 0, 0) for streaming — no crop
+	origin_fullres = (0.0, 0.0, 0.0)
+
+	print(f"[fit_data] load_3d_streaming: origin={origin_fullres} "
+		  f"primary_spacing={primary_spacing} source_to_base={s2b} "
+		  f"groups={list(sparse_caches.keys())}", flush=True)
+
+	return FitData3D(
+		cos=None,
+		grad_mag=None,
+		nx=None,
+		ny=None,
+		pred_dt=None,
+		corr_points=None,
+		winding_volume=None,
+		origin_fullres=origin_fullres,
+		spacing=primary_spacing,
+		channel_spacing=channel_spacing,
+		source_to_base=vol.source_to_base,
+		grad_mag_scale=gmag_enc,
+		cuda_gridsample=True,
+		sparse_caches=sparse_caches,
+		_vol_size=vol_size,
 	)

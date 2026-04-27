@@ -348,50 +348,26 @@ def main(argv: list[str] | None = None) -> int:
 			mdl._ext_conn_offsets[ext_idx][0] = float(eh0 - h0)
 			mdl._ext_conn_offsets[ext_idx][1] = float(ew0 - w0)
 
-			# Adaptive data loader for this window
-			def _full_load_win(skip_channels: set[str]) -> fit_data.FitData3D:
-				d = fit_data.load_3d_for_model(
-					path=str(data_cfg.input), device=device, model=mdl,
-					cuda_gridsample=data_cfg.cuda_gridsample,
-					erode_valid_mask=data_cfg.erode_valid_mask,
-					skip_channels=skip_channels,
+			# Streaming data loader for this window
+			def _load_streaming_win() -> fit_data.FitData3D:
+				d = fit_data.load_3d_streaming(
+					path=str(data_cfg.input),
+					device=device,
 				)
 				Z, Y, X = d.size
+				sx, sy, sz = d.spacing
 				volume_extent = (
 					d.origin_fullres[0], d.origin_fullres[1], d.origin_fullres[2],
-					d.origin_fullres[0] + (X - 1) * d.spacing[0],
-					d.origin_fullres[1] + (Y - 1) * d.spacing[1],
-					d.origin_fullres[2] + (Z - 1) * d.spacing[2],
+					d.origin_fullres[0] + (X - 1) * sx,
+					d.origin_fullres[1] + (Y - 1) * sy,
+					d.origin_fullres[2] + (Z - 1) * sz,
 				)
 				mdl.params = dataclasses.replace(mdl.params, volume_extent=volume_extent)
 				return d
 
 			def _ensure_data_win(data: fit_data.FitData3D | None, needed_channels: set[str]) -> fit_data.FitData3D:
-				skip = {"cos", "pred_dt"} - needed_channels
-				if data is None or optimizer.check_data_bounds(
-						mdl, data, volume_extent_fullres=volume_extent_fullres):
-					if data is not None:
-						print(f"[fit] window mesh near data border, reloading", flush=True)
-					return _full_load_win(skip_channels=skip)
-				missing: list[str] = []
-				if "pred_dt" in needed_channels and data.pred_dt is None:
-					missing.append("pred_dt")
-				if "cos" in needed_channels and data.cos is None:
-					missing.append("cos")
-				if not missing:
-					return data
-				Z, Y, X = data.size
-				sx, sy, sz = data.spacing
-				crop = (int(data.origin_fullres[0]), int(data.origin_fullres[1]),
-						int(data.origin_fullres[2]),
-						int(round(X * sx)), int(round(Y * sy)), int(round(Z * sz)))
-				for ch in missing:
-					t, sp = fit_data.load_single_channel(
-						path=str(data_cfg.input), device=device, channel=ch, crop=crop)
-					cs = dict(data.channel_spacing) if data.channel_spacing else {}
-					cs[ch] = sp
-					data = dataclasses.replace(data, **{ch: t}, channel_spacing=cs)
-				print(f"[fit] loaded missing channels {missing}", flush=True)
+				if data is None:
+					return _load_streaming_win()
 				return data
 
 			data = _ensure_data_win(None, set())
@@ -536,82 +512,59 @@ def main(argv: list[str] | None = None) -> int:
 	cfg.pop("offset_value", None)
 	stages = optimizer.load_stages_cfg(cfg)
 
-	# --- Adaptive data loader: handles bounds + missing channels ---
-	def _full_load(skip_channels: set[str]) -> fit_data.FitData3D:
-		d = fit_data.load_3d_for_model(
-			path=str(data_cfg.input), device=device, model=mdl,
-			cuda_gridsample=data_cfg.cuda_gridsample,
-			erode_valid_mask=data_cfg.erode_valid_mask,
-			skip_channels=skip_channels,
+	# --- Streaming data loader ---
+	def _load_streaming() -> fit_data.FitData3D:
+		d = fit_data.load_3d_streaming(
+			path=str(data_cfg.input),
+			device=device,
 		)
 		Z, Y, X = d.size
+		# Volume extent covers the full zarr volume
+		sx, sy, sz = d.spacing
 		volume_extent = (
 			d.origin_fullres[0],
 			d.origin_fullres[1],
 			d.origin_fullres[2],
-			d.origin_fullres[0] + (X - 1) * d.spacing[0],
-			d.origin_fullres[1] + (Y - 1) * d.spacing[1],
-			d.origin_fullres[2] + (Z - 1) * d.spacing[2],
+			d.origin_fullres[0] + (X - 1) * sx,
+			d.origin_fullres[1] + (Y - 1) * sy,
+			d.origin_fullres[2] + (Z - 1) * sz,
 		)
 		mdl.params = dataclasses.replace(mdl.params, volume_extent=volume_extent)
 		if corr_points_3d is not None:
 			d = dataclasses.replace(d, corr_points=corr_points_3d)
 		if data_cfg.winding_volume is not None:
-			ox, oy, oz = d.origin_fullres
-			sx, sy, sz = d.spacing
-			wv_crop = (int(ox), int(oy), int(oz),
-					   int(X * sx), int(Y * sy), int(Z * sz))
 			wv_t, wv_min, wv_max = fit_data.load_winding_volume(
 				path=data_cfg.winding_volume, device=device,
-				crop=wv_crop, downscale=scaledown)
+				crop=None, downscale=scaledown)
 			d = dataclasses.replace(d, winding_volume=wv_t,
 						winding_min=wv_min, winding_max=wv_max)
 		return d
 
 	def _ensure_data(data: fit_data.FitData3D | None, needed_channels: set[str]) -> fit_data.FitData3D:
-		skip = {"cos", "pred_dt"} - needed_channels
-		# Full reload if no data yet or mesh near data border
-		if data is None or optimizer.check_data_bounds(
-				mdl, data, volume_extent_fullres=volume_extent_fullres):
-			if data is not None:
-				print(f"[fit] mesh near data border, reloading", flush=True)
-			return _full_load(skip_channels=skip)
-		# Check for missing channels
-		missing: list[str] = []
-		if "pred_dt" in needed_channels and data.pred_dt is None:
-			missing.append("pred_dt")
-		if "cos" in needed_channels and data.cos is None:
-			missing.append("cos")
-		if not missing:
-			return data
-		# Load only the missing channels into existing data
-		Z, Y, X = data.size
-		sx, sy, sz = data.spacing
-		crop = (int(data.origin_fullres[0]), int(data.origin_fullres[1]),
-				int(data.origin_fullres[2]),
-				int(round(X * sx)), int(round(Y * sy)), int(round(Z * sz)))
-		for ch in missing:
-			t, sp = fit_data.load_single_channel(
-				path=str(data_cfg.input), device=device, channel=ch, crop=crop)
-			cs = dict(data.channel_spacing) if data.channel_spacing else {}
-			cs[ch] = sp
-			data = dataclasses.replace(data, **{ch: t}, channel_spacing=cs)
-		print(f"[fit] loaded missing channels {missing}", flush=True)
+		if data is None:
+			return _load_streaming()
+		# Streaming covers full volume — no border checks or channel loading needed
 		return data
 
 	data = _ensure_data(None, set())
 
 	# Print loaded data summary
 	Z, Y, X = data.size
-	_data_bytes = sum(t.nbytes for t in [data.cos, data.grad_mag, data.nx, data.ny] if t is not None)
-	if data.pred_dt is not None:
-		_data_bytes += data.pred_dt.nbytes
-	if data.winding_volume is not None:
-		_data_bytes += data.winding_volume.nbytes
-	print(f"[fit] data: size=({Z},{Y},{X}) origin={data.origin_fullres} spacing={data.spacing} "
-		  f"pred_dt={data.pred_dt is not None} winding_volume={data.winding_volume is not None} "
-		  f"corr_points={data.corr_points is not None} "
-		  f"mem={_data_bytes / 2**30:.2f} GiB", flush=True)
+	if data.sparse_caches:
+		_cache_table_bytes = sum(c.chunk_table.nbytes for c in data.sparse_caches.values())
+		print(f"[fit] data (streaming): vol_size=({Z},{Y},{X}) origin={data.origin_fullres} "
+			  f"spacing={data.spacing} groups={list(data.sparse_caches.keys())} "
+			  f"table_mem={_cache_table_bytes / 2**20:.1f} MiB", flush=True)
+	else:
+		_data_bytes = sum(t.nbytes for t in [data.cos, data.grad_mag, data.nx, data.ny] if t is not None)
+		if data.pred_dt is not None:
+			_data_bytes += data.pred_dt.nbytes
+		if data.winding_volume is not None:
+			_data_bytes += data.winding_volume.nbytes
+		print(f"[fit] data: size=({Z},{Y},{X}) origin={data.origin_fullres} spacing={data.spacing} "
+			  f"pred_dt={data.pred_dt is not None} winding_volume={data.winding_volume is not None} "
+			  f"corr_points={data.corr_points is not None} "
+			  f"mem={_data_bytes / 2**30:.2f} GiB", flush=True)
 
 	# Print initial mesh stats
 	with torch.no_grad():
