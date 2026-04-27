@@ -162,7 +162,7 @@ inline bool isValidBounds(const cv::Vec3f& low, const cv::Vec3f& high) noexcept
 
 std::vector<SurfacePtr> loadSurfacesInBatches(const std::vector<SurfacePtr>& surfaces)
 {
-    constexpr size_t kBatchSize = 1000;
+    constexpr size_t kBatchSize = 5000;
     constexpr size_t kMaxWorkers = 8;
 
     std::vector<SurfacePtr> loaded;
@@ -171,6 +171,10 @@ std::vector<SurfacePtr> loadSurfacesInBatches(const std::vector<SurfacePtr>& sur
     for (size_t batchStart = 0; batchStart < surfaces.size(); batchStart += kBatchSize) {
         const size_t batchEnd = std::min(batchStart + kBatchSize, surfaces.size());
         const size_t batchSize = batchEnd - batchStart;
+        const auto batchTimeStart = std::chrono::steady_clock::now();
+        std::cout << "[SurfacePatchIndex] loading surfaces "
+                  << batchStart << "-" << (batchEnd == 0 ? 0 : batchEnd - 1)
+                  << " / " << surfaces.size() << std::endl;
         std::vector<SurfacePtr> batchLoaded(batchSize);
 
         const unsigned hw = std::thread::hardware_concurrency();
@@ -219,6 +223,12 @@ std::vector<SurfacePtr> loadSurfacesInBatches(const std::vector<SurfacePtr>& sur
                 loaded.push_back(std::move(surface));
             }
         }
+        const double seconds = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - batchTimeStart).count();
+        std::cout << "[SurfacePatchIndex] loaded batch "
+                  << batchEnd << "/" << surfaces.size()
+                  << " cumulative_loaded=" << loaded.size()
+                  << " seconds=" << seconds << std::endl;
     }
 
     return loaded;
@@ -1146,6 +1156,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     const float padding = bboxPadding;
 
     // Pre-create all masks (sequential, enables thread-safe parallel access)
+    std::cout << "[SurfacePatchIndex] creating masks for " << surfaceCount << " surfaces" << std::endl;
     for (const SurfacePtr& surface : loaded) {
         impl_->ensureMask(surface);
     }
@@ -1153,6 +1164,8 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     // Per-surface results for parallel collection
     using CellResult = std::vector<std::pair<CellKey, Impl::CellEntry>>;
     std::vector<CellResult> perSurfaceCells(surfaceCount);
+    std::atomic_size_t indexedSurfaces{0};
+    const auto collectStart = std::chrono::steady_clock::now();
 
     // Parallel phase: collect entries and update masks for each surface
     #pragma omp parallel for schedule(dynamic, 1)
@@ -1177,9 +1190,21 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
                 }
             }
         }
+        const size_t done = indexedSurfaces.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (done == surfaceCount || done % 1000 == 0) {
+            #pragma omp critical(surface_patch_index_progress)
+            {
+                const double seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - collectStart).count();
+                std::cout << "[SurfacePatchIndex] indexed surfaces "
+                          << done << "/" << surfaceCount
+                          << " seconds=" << seconds << std::endl;
+            }
+        }
     }
 
     // Merge entries from all surfaces
+    std::cout << "[SurfacePatchIndex] merging entries" << std::endl;
     size_t totalEntries = 0;
     for (const auto& cells : perSurfaceCells) {
         for (const auto& cell : cells) {
@@ -1204,8 +1229,11 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     if (entries.empty()) {
         impl_->tree.reset();
     } else {
+        std::cout << "[SurfacePatchIndex] building R-tree with " << entries.size() << " entries" << std::endl;
         impl_->tree = std::make_unique<Impl::PatchTree>(entries.begin(), entries.end());
     }
+    std::cout << "[SurfacePatchIndex] rebuild complete: surfaces=" << surfaceCount
+              << " patches=" << impl_->patchCount << std::endl;
 }
 
 void SurfacePatchIndex::clear()

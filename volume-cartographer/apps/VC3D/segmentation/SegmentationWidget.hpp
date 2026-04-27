@@ -65,6 +65,8 @@ public:
     [[nodiscard]] bool showHoverMarker() const;
     [[nodiscard]] bool growthKeybindsEnabled() const;
     [[nodiscard]] QString normal3dZarrPath() const;
+    [[nodiscard]] QString patchTracerSourcePath() const;
+    [[nodiscard]] utils::Json patchTracerParamsJson() const;
     // Neural tracer getters — delegated to panel
     [[nodiscard]] bool neuralTracerEnabled() const;
     [[nodiscard]] QString neuralCheckpointPath() const;

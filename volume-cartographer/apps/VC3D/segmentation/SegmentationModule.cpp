@@ -1032,6 +1032,8 @@ void SegmentationModule::setGrowthInProgress(bool running)
         setCorrectionsAnnotateMode(false, false);
         clearLineDragStroke();
         _lineDrawKeyActive = false;
+        resetHoverLookupDetail();
+        _hover.clear();
     }
     updateCorrectionsWidget();
     emit growthInProgressChanged(_growthInProgress);
@@ -1761,7 +1763,10 @@ void SegmentationModule::updateHover(CTiledVolumeViewer* viewer,
         }
     };
 
-    if (!_editingEnabled || !_hoverPreviewEnabled) {
+    if (_growthInProgress) {
+        resetHoverLookupDetail();
+        clearHover();
+    } else if (!_editingEnabled || !_hoverPreviewEnabled) {
         resetHoverLookupDetail();
         clearHover();
     } else if (!_editManager || !_editManager->hasSession()) {

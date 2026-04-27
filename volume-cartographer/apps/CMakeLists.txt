@@ -147,6 +147,10 @@ target_include_directories(vc_gen_normalgrids PRIVATE diffusion)
 add_executable(vc_ngrids src/vc_ngrids.cpp)
 target_link_libraries(vc_ngrids vc_core Boost::program_options opencv_core Ceres::ceres OpenMP::OpenMP_CXX)
 
+# Generate normal3d Zarr directly from tifxyz patches
+add_executable(vc_patch_normals3d src/vc_patch_normals3d.cpp)
+target_link_libraries(vc_patch_normals3d vc_core Boost::program_options opencv_core OpenMP::OpenMP_CXX)
+
 add_executable(vc_tifxyz2rgb src/vc_tifxyz2rgb.cpp)
 target_link_libraries(vc_tifxyz2rgb
     vc_core
@@ -220,6 +224,7 @@ if(VC_USE_PCH)
         vc_transform_geom
         vc_gen_normalgrids
         vc_ngrids
+        vc_patch_normals3d
         vc_tifxyz2rgb
         vc_rgb2tifxyz
         vc_telea_inpaint

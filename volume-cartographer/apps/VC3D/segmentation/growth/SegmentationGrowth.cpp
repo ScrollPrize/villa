@@ -5,6 +5,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <set>
 #include <system_error>
 
 #include "utils/Json.hpp"
@@ -352,7 +353,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         result.error = QStringLiteral("Segmentation surface lacks a generations channel");
         return result;
     }
-
     ensureNormalsInward(context.resumeSurface, context.volume);
 
     vc::VcDataset* dataset = context.volume->zarrDataset(0);
@@ -515,6 +515,75 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         result.statusMessage = QStringLiteral("Tracer growth completed");
     } catch (const std::exception& ex) {
         result.error = QStringLiteral("Tracer growth failed: %1").arg(ex.what());
+    }
+
+    return result;
+}
+
+TracerGrowthResult runPatchTracerGrowth(const SegmentationGrowthRequest& request,
+                                        const TracerGrowthContext& context)
+{
+    TracerGrowthResult result;
+
+    if (!context.resumeSurface) {
+        result.error = QStringLiteral("Missing segmentation surface for Patch Tracer growth");
+        return result;
+    }
+
+    if (!ensureGenerationsChannel(context.resumeSurface)) {
+        result.error = QStringLiteral("Segmentation surface lacks a generations channel");
+        return result;
+    }
+
+    utils::Json params = buildTracerParams(request);
+    params["resume_growth"] = true;
+    params["steps"] = std::max(0, request.steps);
+    params["use_patch_cache"] = false;
+    if (!context.cacheRoot.isEmpty()) {
+        params["cache_root"] = context.cacheRoot.toStdString();
+    }
+
+    std::filesystem::path targetDir;
+    if (!context.resumeSurface->path.empty()) {
+        targetDir = context.resumeSurface->path.parent_path();
+    }
+    if (targetDir.empty() && !context.cacheRoot.isEmpty()) {
+        targetDir = std::filesystem::path(context.cacheRoot.toStdString());
+    }
+    if (targetDir.empty()) {
+        targetDir = std::filesystem::temp_directory_path();
+    }
+    params["tgt_dir"] = targetDir.string();
+
+    std::vector<QuadSurface*> surfaces;
+    surfaces.reserve(context.patchSurfaces.size() + 1);
+    std::set<QuadSurface*> seen;
+    auto appendSurface = [&](QuadSurface* surface) {
+        if (surface && seen.insert(surface).second) {
+            surfaces.push_back(surface);
+        }
+    };
+    for (const auto& surface : context.patchSurfaces) {
+        appendSurface(surface.get());
+    }
+    appendSurface(context.resumeSurface);
+
+    try {
+        qCInfo(lcSegGrowth) << "Calling grow_surf_from_surfs() for Patch Tracer";
+        qCInfo(lcSegGrowth) << "  surface count:" << static_cast<int>(surfaces.size());
+        qCInfo(lcSegGrowth) << "  external patch index:" << (context.surfacePatchIndex != nullptr);
+        qCInfo(lcSegGrowth) << "  params:" << QString::fromStdString(params.dump());
+        createRotatingBackup(context.resumeSurface);
+        result.surface = grow_surf_from_surfs(context.resumeSurface,
+                                              surfaces,
+                                              params,
+                                              static_cast<float>(context.voxelSize),
+                                              context.surfacePatchIndex);
+        result.statusMessage = QStringLiteral("Patch Tracer growth completed");
+    } catch (const std::exception& ex) {
+        result.error = QStringLiteral("Patch Tracer growth failed: %1").arg(ex.what());
+    } catch (...) {
+        result.error = QStringLiteral("Patch Tracer growth failed with an unknown exception");
     }
 
     return result;

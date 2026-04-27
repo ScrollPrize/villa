@@ -2,6 +2,8 @@
 
 #include "SegmentationGrowth.hpp"
 
+#include "vc/core/util/SurfacePatchIndex.hpp"
+
 #include <QFutureWatcher>
 #include <QObject>
 #include <QPointer>
@@ -111,4 +113,7 @@ private:
     bool _running{false};
     std::unique_ptr<QFutureWatcher<TracerGrowthResult>> _watcher;
     std::optional<ActiveRequest> _activeRequest;
+    QString _patchTracerCachedSourcePath;
+    std::vector<std::shared_ptr<QuadSurface>> _patchTracerCachedSurfaces;
+    std::shared_ptr<SurfacePatchIndex> _patchTracerCachedIndex;
 };

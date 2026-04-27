@@ -4,6 +4,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <optional>
 #include <string>
 #include <utility>
@@ -16,12 +17,14 @@
 #include "vc/ui/VCCollection.hpp"
 
 class QuadSurface;
+class SurfacePatchIndex;
 class Volume;
 
 enum class SegmentationGrowthMethod {
     Tracer = 0,
     Corrections = 1,
     Extrapolation = 2,
+    PatchTracer = 3,
 };
 
 inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
@@ -33,6 +36,8 @@ inline QString segmentationGrowthMethodToString(SegmentationGrowthMethod method)
         return QStringLiteral("Corrections");
     case SegmentationGrowthMethod::Extrapolation:
         return QStringLiteral("Extrapolation");
+    case SegmentationGrowthMethod::PatchTracer:
+        return QStringLiteral("Patch Tracer");
     }
     return QStringLiteral("Unknown");
 }
@@ -44,6 +49,9 @@ inline SegmentationGrowthMethod segmentationGrowthMethodFromInt(int value)
     }
     if (value == static_cast<int>(SegmentationGrowthMethod::Extrapolation)) {
         return SegmentationGrowthMethod::Extrapolation;
+    }
+    if (value == static_cast<int>(SegmentationGrowthMethod::PatchTracer)) {
+        return SegmentationGrowthMethod::PatchTracer;
     }
     return SegmentationGrowthMethod::Tracer;
 }
@@ -207,6 +215,8 @@ struct TracerGrowthContext {
     std::filesystem::path volpkgRoot;
     std::vector<std::string> volumeIds;
     std::string growthVolumeId;
+    SurfacePatchIndex* surfacePatchIndex{nullptr};
+    std::vector<std::shared_ptr<QuadSurface>> patchSurfaces;
 };
 
 struct TracerGrowthResult {
@@ -214,10 +224,15 @@ struct TracerGrowthResult {
     QString error;
     QString statusMessage;
     std::vector<std::filesystem::path> temporarySurfacePaths;
+    QString patchTracerCacheSourcePath;
+    std::vector<std::shared_ptr<QuadSurface>> patchTracerCachedSurfaces;
+    std::shared_ptr<SurfacePatchIndex> patchTracerCachedIndex;
 };
 
 TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                    const TracerGrowthContext& context);
+TracerGrowthResult runPatchTracerGrowth(const SegmentationGrowthRequest& request,
+                                        const TracerGrowthContext& context);
 
 void updateSegmentationSurfaceMetadata(QuadSurface* surface,
                                        double voxelSize);

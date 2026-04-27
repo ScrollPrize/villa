@@ -347,6 +347,8 @@ int SegmentationWidget::skeletonChunkSize() const { return _growthPanel->skeleto
 int SegmentationWidget::skeletonSearchRadius() const { return _growthPanel->skeletonSearchRadius(); }
 bool SegmentationWidget::growthKeybindsEnabled() const { return _growthPanel->growthKeybindsEnabled(); }
 QString SegmentationWidget::normal3dZarrPath() const { return _growthPanel->normal3dZarrPath(); }
+QString SegmentationWidget::patchTracerSourcePath() const { return _growthPanel->patchTracerSourcePath(); }
+utils::Json SegmentationWidget::patchTracerParamsJson() const { return _growthPanel->patchTracerParamsJson(); }
 std::vector<SegmentationGrowthDirection> SegmentationWidget::allowedGrowthDirections() const { return _growthPanel->allowedGrowthDirections(); }
 std::optional<std::pair<int, int>> SegmentationWidget::correctionsZRange() const { return _growthPanel->correctionsZRange(); }
 
