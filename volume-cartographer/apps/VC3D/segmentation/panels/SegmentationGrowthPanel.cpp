@@ -83,10 +83,12 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
     _comboGrowthMethod->addItem(tr("Tracer"), static_cast<int>(SegmentationGrowthMethod::Tracer));
     _comboGrowthMethod->addItem(tr("Patch Tracer"), static_cast<int>(SegmentationGrowthMethod::PatchTracer));
     _comboGrowthMethod->addItem(tr("Extrapolation"), static_cast<int>(SegmentationGrowthMethod::Extrapolation));
+    _comboGrowthMethod->addItem(tr("Manual Add"), static_cast<int>(SegmentationGrowthMethod::ManualAdd));
     _comboGrowthMethod->setToolTip(tr("Select the growth algorithm:\n"
                                       "- Tracer: Neural-guided growth using volume data\n"
                                       "- Patch Tracer: Patch-index based growth from loaded surfaces\n"
-                                      "- Extrapolation: Simple polynomial extrapolation from boundary points"));
+                                      "- Extrapolation: Simple polynomial extrapolation from boundary points\n"
+                                      "- Manual Add: Interactive invalid-region bridging"));
     methodRow->addWidget(methodLabel);
     methodRow->addWidget(_comboGrowthMethod);
     methodRow->addStretch(1);
@@ -763,6 +765,15 @@ void SegmentationGrowthPanel::setGrowthInProgress(bool running)
     updateGrowthUiState();
 }
 
+void SegmentationGrowthPanel::setManualAddUiActive(bool active)
+{
+    if (_manualAddUiActive == active) {
+        return;
+    }
+    _manualAddUiActive = active;
+    updateGrowthUiState();
+}
+
 void SegmentationGrowthPanel::setNormalGridAvailable(bool available)
 {
     _normalGridAvailable = available;
@@ -983,7 +994,73 @@ int SegmentationGrowthPanel::normalizeGrowthDirectionMask(int mask)
 
 void SegmentationGrowthPanel::updateGrowthUiState()
 {
-    const bool enableGrowth = _editingEnabled && !_growthInProgress;
+    const bool manual = _manualAddUiActive || _growthMethod == SegmentationGrowthMethod::ManualAdd;
+    const bool enableGrowth = _editingEnabled && !_growthInProgress && !manual;
+    if (_spinGrowthSteps) {
+        _spinGrowthSteps->setVisible(!manual);
+    }
+    if (_btnGrow) {
+        _btnGrow->setVisible(!manual);
+    }
+    if (_btnInpaint) {
+        _btnInpaint->setVisible(!manual);
+    }
+    if (_chkGrowthDirUp) {
+        _chkGrowthDirUp->setVisible(!manual);
+    }
+    if (_chkGrowthDirDown) {
+        _chkGrowthDirDown->setVisible(!manual);
+    }
+    if (_chkGrowthDirLeft) {
+        _chkGrowthDirLeft->setVisible(!manual);
+    }
+    if (_chkGrowthDirRight) {
+        _chkGrowthDirRight->setVisible(!manual);
+    }
+    if (_chkGrowthKeybindsEnabled) {
+        _chkGrowthKeybindsEnabled->setVisible(!manual);
+    }
+    if (_chkCorrectionsUseZRange) {
+        _chkCorrectionsUseZRange->setVisible(!manual);
+    }
+    if (_spinCorrectionsZMin) {
+        _spinCorrectionsZMin->setVisible(!manual);
+    }
+    if (_spinCorrectionsZMax) {
+        _spinCorrectionsZMax->setVisible(!manual);
+    }
+    if (_comboVolumes) {
+        if (auto* parent = _comboVolumes->parentWidget()) {
+            parent->setVisible(!manual);
+        }
+    }
+    if (_lblNormalGrid) {
+        _lblNormalGrid->setVisible(!manual);
+    }
+    if (_editNormalGridPath) {
+        _editNormalGridPath->setVisible(!manual && _normalGridAvailable && !_normalGridPath.isEmpty());
+    }
+    if (_lblNormal3d) {
+        _lblNormal3d->setVisible(!manual);
+    }
+    const int normal3dCount = _normal3dCandidates.size();
+    const bool showNormal3dCombo = normal3dCount > 1;
+    const bool showNormal3dPath = normal3dCount == 1;
+    if (_comboNormal3d) {
+        _comboNormal3d->setVisible(!manual && showNormal3dCombo);
+    }
+    if (_editNormal3dPath) {
+        _editNormal3dPath->setVisible(!manual && showNormal3dPath);
+    }
+    if (_patchTracerSourceContainer) {
+        _patchTracerSourceContainer->setVisible(!manual && _growthMethod == SegmentationGrowthMethod::PatchTracer);
+    }
+    if (_patchTracerUmbilicusContainer) {
+        _patchTracerUmbilicusContainer->setVisible(!manual && _growthMethod == SegmentationGrowthMethod::PatchTracer);
+    }
+    if (_groupPatchTracerParams) {
+        _groupPatchTracerParams->setVisible(!manual && _growthMethod == SegmentationGrowthMethod::PatchTracer);
+    }
     if (_spinGrowthSteps) {
         _spinGrowthSteps->setEnabled(enableGrowth);
     }
@@ -1233,6 +1310,9 @@ void SegmentationGrowthPanel::triggerGrowthRequest(SegmentationGrowthDirection d
                                                     bool inpaintOnly)
 {
     if (!_editingEnabled || _growthInProgress) {
+        return;
+    }
+    if (_growthMethod == SegmentationGrowthMethod::ManualAdd) {
         return;
     }
 

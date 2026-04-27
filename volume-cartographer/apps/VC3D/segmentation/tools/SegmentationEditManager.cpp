@@ -194,6 +194,102 @@ bool SegmentationEditManager::setPreviewPoints(const cv::Mat_<cv::Vec3f>& points
     return true;
 }
 
+bool SegmentationEditManager::setPreviewPointsOnly(const cv::Mat_<cv::Vec3f>& points,
+                                                   const std::vector<GridKey>& editedVertices,
+                                                   bool markAsPendingEdit,
+                                                   std::optional<cv::Rect>* outDiffBounds)
+{
+    if (outDiffBounds) {
+        outDiffBounds->reset();
+    }
+    if (!_previewPoints || !_originalPoints) {
+        return false;
+    }
+    if (points.rows != _previewPoints->rows || points.cols != _previewPoints->cols ||
+        points.rows != _originalPoints->rows || points.cols != _originalPoints->cols) {
+        return false;
+    }
+
+    points.copyTo(*_previewPoints);
+    _editedVertices.clear();
+    _recentTouched.clear();
+    _recentTouched.reserve(editedVertices.size());
+
+    bool diffFound = false;
+    int minRow = points.rows;
+    int maxRow = -1;
+    int minCol = points.cols;
+    int maxCol = -1;
+
+    for (const auto& key : editedVertices) {
+        if (key.row < 0 || key.row >= points.rows || key.col < 0 || key.col >= points.cols) {
+            continue;
+        }
+        const cv::Vec3f& original = (*_originalPoints)(key.row, key.col);
+        const cv::Vec3f& current = points(key.row, key.col);
+        if (original[0] == current[0] && original[1] == current[1] && original[2] == current[2]) {
+            continue;
+        }
+
+        if (!diffFound) {
+            diffFound = true;
+            minRow = maxRow = key.row;
+            minCol = maxCol = key.col;
+        } else {
+            minRow = std::min(minRow, key.row);
+            maxRow = std::max(maxRow, key.row);
+            minCol = std::min(minCol, key.col);
+            maxCol = std::max(maxCol, key.col);
+        }
+
+        _recentTouched.push_back(key);
+        _editedVertices[key] = VertexEdit{key.row, key.col, original, current, _pendingGrowthMarking};
+
+        if (_viewerManager && _baseSurface) {
+            if (auto* index = _viewerManager->surfacePatchIndex()) {
+                index->queueCellUpdateForVertex(_baseSurface, key.row, key.col);
+            }
+        }
+    }
+
+    if (_baseSurface) {
+        _baseSurface->invalidateCache();
+    }
+    _hasPendingEdits = markAsPendingEdit && !_editedVertices.empty();
+    if (_pendingGrowthMarking && !_editedVertices.empty()) {
+        _pendingGrowthMarking = false;
+    }
+
+    if (outDiffBounds && diffFound) {
+        *outDiffBounds = cv::Rect(minCol, minRow, maxCol - minCol + 1, maxRow - minRow + 1);
+    }
+    return true;
+}
+
+bool SegmentationEditManager::restorePreviewSnapshot(const cv::Mat_<cv::Vec3f>& points)
+{
+    if (!_previewPoints || !_originalPoints) {
+        return false;
+    }
+    if (points.rows != _previewPoints->rows || points.cols != _previewPoints->cols ||
+        points.rows != _originalPoints->rows || points.cols != _originalPoints->cols) {
+        return false;
+    }
+
+    points.copyTo(*_previewPoints);
+    points.copyTo(*_originalPoints);
+    _editedVertices.clear();
+    _recentTouched.clear();
+    clearActiveDrag();
+    _hasPendingEdits = false;
+    _pendingGrowthMarking = false;
+    resetPointerSeed();
+    if (_baseSurface) {
+        _baseSurface->invalidateCache();
+    }
+    return true;
+}
+
 void SegmentationEditManager::resetPreview()
 {
     rebuildPreviewFromOriginal();

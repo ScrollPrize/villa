@@ -28,6 +28,57 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         return false;
     }
 
+    if (event->key() == vc3d::keybinds::keypress::ManualAddToggle.key &&
+        event->modifiers() == vc3d::keybinds::keypress::ManualAddToggle.modifiers &&
+        (!vc3d::keybinds::keypress::ManualAddToggle.requireNoAutoRepeat || !event->isAutoRepeat())) {
+        if (_manualAddMode) {
+            finishManualAdd(true);
+        } else {
+            beginManualAdd();
+        }
+        event->accept();
+        return true;
+    }
+
+    if (_manualAddMode) {
+        const bool manualAddLineModeCycle =
+            !event->isAutoRepeat() &&
+            event->key() == Qt::Key_Q &&
+            event->modifiers() == Qt::ShiftModifier;
+        if (manualAddLineModeCycle && _widget && _manualAddTool) {
+            const ManualAddTool::LinePreviewMode mode = _widget->cycleManualAddLinePreviewMode();
+            _manualAddTool->setConfig(_widget->manualAddConfig());
+            if (auto hover = _manualAddTool->hoverVertex()) {
+                _manualAddTool->updateHover(hover->row, hover->col);
+            }
+            refreshOverlay();
+            QString label;
+            switch (mode) {
+            case ManualAddTool::LinePreviewMode::VerticalOnly:
+                label = tr("Vertical only");
+                break;
+            case ManualAddTool::LinePreviewMode::HorizontalOnly:
+                label = tr("Horizontal only");
+                break;
+            case ManualAddTool::LinePreviewMode::Cross:
+                label = tr("Cross");
+                break;
+            case ManualAddTool::LinePreviewMode::CrossFill:
+                label = tr("Cross-fill");
+                break;
+            }
+            emit statusMessageRequested(tr("Manual Add yellow line: %1").arg(label), kStatusShort);
+            event->accept();
+            return true;
+        }
+        if (event->key() == vc3d::keybinds::keypress::CancelOperation.key) {
+            finishManualAdd(false);
+            event->accept();
+            return true;
+        }
+        return false;
+    }
+
     // B: Toggle edit approved mask (only if show approval mask is enabled)
     if (event->key() == vc3d::keybinds::keypress::ApprovalPaintToggle.key &&
         !event->isAutoRepeat() &&
@@ -302,6 +353,10 @@ void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
 {
     const bool isLeftButton = (button == Qt::LeftButton);
 
+    if (_manualAddMode && handleManualAddMousePress(viewer, worldPos, button, modifiers, scenePos)) {
+        return;
+    }
+
     // Handle approval mask editing mode - works independently of surface editing
     if (isEditingApprovalMask() && isLeftButton) {
         if (modifiers.testFlag(Qt::ControlModifier) || modifiers.testFlag(Qt::AltModifier)) {
@@ -435,6 +490,10 @@ void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
 {
     Q_UNUSED(modifiers);
 
+    if (_manualAddMode && handleManualAddMouseMove(viewer, buttons, scenePos)) {
+        return;
+    }
+
     // Handle approval mask mode
     const bool approvalStrokeActive = _approvalTool && _approvalTool->strokeActive();
     if (approvalStrokeActive) {
@@ -536,6 +595,14 @@ void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
                                             Qt::KeyboardModifiers /*modifiers*/,
                                             const QPointF& scenePos)
 {
+    if (_manualAddMode) {
+        Q_UNUSED(viewer);
+        Q_UNUSED(worldPos);
+        Q_UNUSED(button);
+        Q_UNUSED(scenePos);
+        return;
+    }
+
     // Handle approval mask mode
     const bool approvalStrokeActive = _approvalTool && _approvalTool->strokeActive();
     if (approvalStrokeActive && button == Qt::LeftButton) {

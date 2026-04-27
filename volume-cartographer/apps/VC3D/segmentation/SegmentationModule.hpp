@@ -22,6 +22,7 @@
 
 #include "../adaptive/CAdaptiveVolumeViewer.hpp"
 #include "tools/SegmentationEditManager.hpp"
+#include "tools/ManualAddTool.hpp"
 #include "growth/SegmentationGrowth.hpp"
 #include "SegmentationPushPullConfig.hpp"
 #include "SegmentationUndoHistory.hpp"
@@ -176,6 +177,8 @@ public:
 
     void setRotationHandleHitTester(std::function<bool(CTiledVolumeViewer*, const cv::Vec3f&)> tester);
 
+    [[nodiscard]] bool manualAddMode() const { return _manualAddMode; }
+
 signals:
     void editingEnabledChanged(bool enabled);
     void statusMessageRequested(const QString& text, int timeoutMs);
@@ -276,6 +279,18 @@ private:
                                     SegmentationGrowthDirection direction,
                                     int steps,
                                     bool inpaintOnly);
+    bool beginManualAdd();
+    bool finishManualAdd(bool apply);
+    bool recomputeManualAdd();
+    bool clearManualAddPending();
+    bool handleManualAddMousePress(CTiledVolumeViewer* viewer,
+                                   const cv::Vec3f& worldPos,
+                                   Qt::MouseButton button,
+                                   Qt::KeyboardModifiers modifiers,
+                                   const QPointF& scenePos);
+    bool handleManualAddMouseMove(CTiledVolumeViewer* viewer,
+                                  Qt::MouseButtons buttons,
+                                  const QPointF& scenePos);
     void clearLineDragStroke();
 
     void handleMousePress(CTiledVolumeViewer* viewer,
@@ -374,6 +389,9 @@ private:
     std::unique_ptr<SegmentationPushPullTool> _pushPullTool;
     std::unique_ptr<ApprovalMaskBrushTool> _approvalTool;
     std::unique_ptr<CellReoptimizationTool> _cellReoptTool;
+    std::unique_ptr<ManualAddTool> _manualAddTool;
+    bool _manualAddMode{false};
+    SegmentationGrowthMethod _previousGrowthMethodBeforeManualAdd{SegmentationGrowthMethod::Tracer};
 
     bool _showApprovalMask{false};
     bool _cellReoptMode{false};

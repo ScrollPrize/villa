@@ -253,6 +253,14 @@ const KeyPressDef SegmentationUndo{
     Qt::ControlModifier,
     true
 };
+const KeyPressDef ManualAddToggle{
+    "manual_add_toggle",
+    kSectionSegEditing,
+    "Toggle Manual Add mode",
+    Qt::Key_E,
+    Qt::ShiftModifier,
+    true
+};
 const KeyPressDef LineDrawHold{
     "line_draw_hold",
     kSectionSegEditing,
@@ -502,6 +510,7 @@ QString buildKeybindsHelpText()
         { kSectionSegments, shortcuts::CyclePrevSegment.description, HelpKeyType::Shortcut, &shortcuts::CyclePrevSegment, nullptr, nullptr },
 
         { kSectionSegEditing, keypress::SegmentationUndo.description, HelpKeyType::KeyPress, nullptr, &keypress::SegmentationUndo, nullptr },
+        { kSectionSegEditing, keypress::ManualAddToggle.description, HelpKeyType::KeyPress, nullptr, &keypress::ManualAddToggle, nullptr },
         { kSectionSegEditing, keypress::LineDrawHold.description, HelpKeyType::KeyPress, nullptr, &keypress::LineDrawHold, nullptr },
         { kSectionSegEditing, keypress::ToggleAnnotation.description, HelpKeyType::KeyPress, nullptr, &keypress::ToggleAnnotation, nullptr },
         { kSectionSegEditing, "Add correction point", HelpKeyType::Literal, nullptr, nullptr, "  Click" },

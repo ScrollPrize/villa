@@ -11,6 +11,7 @@
 #include "panels/SegmentationNeuralTracerPanel.hpp"
 #include "panels/SegmentationDirectionFieldPanel.hpp"
 #include "panels/SegmentationLasagnaPanel.hpp"
+#include "panels/SegmentationManualAddPanel.hpp"
 #include "VCSettings.hpp"
 
 #include <QSettings>
@@ -40,6 +41,9 @@ void SegmentationWidget::buildUi()
 
     _growthPanel = new SegmentationGrowthPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_growthPanel);
+
+    _manualAddPanel = new SegmentationManualAddPanel(QStringLiteral("segmentation_edit"), this);
+    layout->addWidget(_manualAddPanel);
 
     _editingPanel = new SegmentationEditingPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_editingPanel);
@@ -156,6 +160,17 @@ void SegmentationWidget::buildUi()
     connect(_growthPanel, &SegmentationGrowthPanel::correctionsZRangeChanged,
             this, &SegmentationWidget::correctionsZRangeChanged);
 
+    connect(_manualAddPanel, &SegmentationManualAddPanel::configChanged,
+            this, &SegmentationWidget::manualAddConfigChanged);
+    connect(_manualAddPanel, &SegmentationManualAddPanel::clearPendingRequested,
+            this, &SegmentationWidget::manualAddClearPendingRequested);
+    connect(_manualAddPanel, &SegmentationManualAddPanel::recomputeRequested,
+            this, &SegmentationWidget::manualAddRecomputeRequested);
+    connect(_manualAddPanel, &SegmentationManualAddPanel::applyExitRequested,
+            this, &SegmentationWidget::manualAddApplyExitRequested);
+    connect(_manualAddPanel, &SegmentationManualAddPanel::cancelRequested,
+            this, &SegmentationWidget::manualAddCancelRequested);
+
     // Forward corrections panel signals
     connect(_correctionsPanel, &SegmentationCorrectionsPanel::correctionsCreateRequested,
             this, &SegmentationWidget::correctionsCreateRequested);
@@ -195,7 +210,19 @@ void SegmentationWidget::syncUiState()
         }
     }
 
+    const bool manualAddSelected = _growthPanel->growthMethod() == SegmentationGrowthMethod::ManualAdd;
+    _growthPanel->setManualAddUiActive(manualAddSelected);
+    _manualAddPanel->setVisible(manualAddSelected);
+    _manualAddPanel->syncUiState(_editingEnabled, _manualAddActive);
+
     _growthPanel->syncUiState(_editingEnabled, _growthInProgress);
+    _editingPanel->setVisible(!manualAddSelected);
+    _approvalMaskPanel->setVisible(!manualAddSelected);
+    _cellReoptPanel->setVisible(!manualAddSelected);
+    _directionFieldPanel->setVisible(!manualAddSelected);
+    _neuralTracerPanel->setVisible(!manualAddSelected);
+    _correctionsPanel->setVisible(!manualAddSelected);
+    _customParamsPanel->setVisible(!manualAddSelected);
     _editingPanel->syncUiState(_editingEnabled, _growthInProgress);
     _customParamsPanel->syncUiState(_editingEnabled);
     _directionFieldPanel->syncUiState(_editingEnabled);
@@ -216,6 +243,7 @@ void SegmentationWidget::restoreSettings()
 
     _editingPanel->restoreSettings(settings);
     _growthPanel->restoreSettings(settings);
+    _manualAddPanel->restoreSettings(settings);
     _directionFieldPanel->restoreSettings(settings);
     _correctionsPanel->restoreSettings(settings);
     _customParamsPanel->restoreSettings(settings);
@@ -349,10 +377,23 @@ bool SegmentationWidget::growthKeybindsEnabled() const { return _growthPanel->gr
 QString SegmentationWidget::normal3dZarrPath() const { return _growthPanel->normal3dZarrPath(); }
 QString SegmentationWidget::patchTracerSourcePath() const { return _growthPanel->patchTracerSourcePath(); }
 utils::Json SegmentationWidget::patchTracerParamsJson() const { return _growthPanel->patchTracerParamsJson(); }
+ManualAddTool::Config SegmentationWidget::manualAddConfig() const { return _manualAddPanel->config(); }
+ManualAddTool::LinePreviewMode SegmentationWidget::cycleManualAddLinePreviewMode()
+{
+    return _manualAddPanel->cycleLinePreviewMode();
+}
 std::vector<SegmentationGrowthDirection> SegmentationWidget::allowedGrowthDirections() const { return _growthPanel->allowedGrowthDirections(); }
 std::optional<std::pair<int, int>> SegmentationWidget::correctionsZRange() const { return _growthPanel->correctionsZRange(); }
 
 void SegmentationWidget::setGrowthMethod(SegmentationGrowthMethod method) { _growthPanel->setGrowthMethod(method); }
+void SegmentationWidget::setManualAddActive(bool active)
+{
+    if (_manualAddActive == active) {
+        return;
+    }
+    _manualAddActive = active;
+    syncUiState();
+}
 void SegmentationWidget::setGrowthSteps(int steps, bool persist) { _growthPanel->setGrowthSteps(steps, persist); }
 void SegmentationWidget::setGrowthInProgress(bool running)
 {

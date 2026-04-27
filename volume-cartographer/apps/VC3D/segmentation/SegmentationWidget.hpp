@@ -14,6 +14,7 @@
 #include "utils/Json.hpp"
 
 #include "growth/SegmentationGrowth.hpp"
+#include "tools/ManualAddTool.hpp"
 
 class SegmentationHeaderRow;
 class SegmentationEditingPanel;
@@ -25,6 +26,7 @@ class SegmentationCellReoptPanel;
 class SegmentationNeuralTracerPanel;
 class SegmentationDirectionFieldPanel;
 class SegmentationLasagnaPanel;
+class SegmentationManualAddPanel;
 
 class SegmentationWidget : public QWidget
 {
@@ -67,6 +69,7 @@ public:
     [[nodiscard]] QString normal3dZarrPath() const;
     [[nodiscard]] QString patchTracerSourcePath() const;
     [[nodiscard]] utils::Json patchTracerParamsJson() const;
+    [[nodiscard]] ManualAddTool::Config manualAddConfig() const;
     // Neural tracer getters — delegated to panel
     [[nodiscard]] bool neuralTracerEnabled() const;
     [[nodiscard]] QString neuralCheckpointPath() const;
@@ -99,6 +102,8 @@ public:
     void setGrowthInProgress(bool running);
     void setShowHoverMarker(bool enabled);
     void setEraseBrushActive(bool active);
+    void setManualAddActive(bool active);
+    ManualAddTool::LinePreviewMode cycleManualAddLinePreviewMode();
 
     void setNormalGridAvailable(bool available);
     void setNormalGridPathHint(const QString& hint);
@@ -256,6 +261,11 @@ signals:
     void cellReoptMinSpacingChanged(float spacing);
     void cellReoptPerimeterOffsetChanged(float offset);
     void cellReoptGrowthRequested(uint64_t collectionId);
+    void manualAddConfigChanged();
+    void manualAddClearPendingRequested();
+    void manualAddRecomputeRequested();
+    void manualAddApplyExitRequested();
+    void manualAddCancelRequested();
 
 private:
     void buildUi();
@@ -279,5 +289,7 @@ private:
     SegmentationNeuralTracerPanel* _neuralTracerPanel{nullptr};
     SegmentationDirectionFieldPanel* _directionFieldPanel{nullptr};
     SegmentationLasagnaPanel* _lasagnaPanel{nullptr};
+    SegmentationManualAddPanel* _manualAddPanel{nullptr};
+    bool _manualAddActive{false};
 
 };

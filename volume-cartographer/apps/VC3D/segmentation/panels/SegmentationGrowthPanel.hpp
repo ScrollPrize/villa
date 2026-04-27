@@ -55,6 +55,7 @@ public:
     void setGrowthMethod(SegmentationGrowthMethod method);
     void setGrowthSteps(int steps, bool persist = true);
     void setGrowthInProgress(bool running);
+    void setManualAddUiActive(bool active);
     void setNormalGridAvailable(bool available);
     void setNormalGridPathHint(const QString& hint);
     void setNormalGridPath(const QString& path);
@@ -214,6 +215,7 @@ private:
 
     bool _editingEnabled{false};
     bool _growthInProgress{false};
+    bool _manualAddUiActive{false};
     bool _restoringSettings{false};
     const QString _settingsGroup;
 };

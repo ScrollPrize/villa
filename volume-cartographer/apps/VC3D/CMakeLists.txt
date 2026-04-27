@@ -66,6 +66,8 @@ set(srcs
     segmentation/panels/SegmentationNeuralTracerPanel.hpp
     segmentation/panels/SegmentationDirectionFieldPanel.cpp
     segmentation/panels/SegmentationDirectionFieldPanel.hpp
+    segmentation/panels/SegmentationManualAddPanel.cpp
+    segmentation/panels/SegmentationManualAddPanel.hpp
     segmentation/growth/SegmentationGrowth.cpp
     segmentation/growth/ExtrapolationGrowth.cpp
     segmentation/growth/ExtrapolationGrowth.hpp
@@ -77,6 +79,10 @@ set(srcs
     segmentation/tools/ApprovalMaskBrushTool.hpp
     segmentation/tools/CellReoptimizationTool.cpp
     segmentation/tools/CellReoptimizationTool.hpp
+    segmentation/tools/ManualAddTool.cpp
+    segmentation/tools/ManualAddTool.hpp
+    segmentation/tools/ThinPlateSpline3d.cpp
+    segmentation/tools/ThinPlateSpline3d.hpp
     segmentation/tools/SegmentationLineTool.cpp
     segmentation/tools/SegmentationLineTool.hpp
     segmentation/tools/SegmentationPushPullTool.cpp

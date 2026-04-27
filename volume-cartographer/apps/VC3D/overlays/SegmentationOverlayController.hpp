@@ -6,6 +6,7 @@
 #include <QFutureWatcher>
 #include <QImage>
 #include <chrono>
+#include <array>
 #include <deque>
 #include <map>
 #include <optional>
@@ -37,6 +38,13 @@ public:
 
     struct State
     {
+        struct ManualAddLine
+        {
+            std::vector<cv::Vec3f> worldPoints;
+            std::vector<QPointF> surfacePoints;
+            bool committed{false};
+        };
+
         enum class FalloffMode
         {
             Drag,
@@ -80,6 +88,17 @@ public:
         std::optional<cv::Vec3f> approvalHoverWorld;  // Current hover position for brush circle
         std::optional<QPointF> approvalHoverSurfacePos; // Surface position (for dirty checking)
         std::optional<cv::Vec3f> approvalHoverPlaneNormal;  // Plane normal when hovering in XY/XZ/YZ viewers
+
+        bool manualAddActive{false};
+        std::vector<ManualAddLine> manualAddHoverLines;
+        std::vector<ManualAddLine> manualAddCommittedLines;
+        std::optional<QPointF> manualAddHoverVertex;
+        bool manualAddHoverCrossFill{false};
+        std::vector<cv::Vec3f> manualAddPreviewVertices;
+        std::vector<std::array<cv::Vec3f, 4>> manualAddPreviewQuads;
+        std::vector<cv::Vec3f> manualAddPlaneConstraints;
+        float manualAddTintOpacity{0.45f};
+        uint64_t manualAddRevision{0};
 
         bool operator==(const State& rhs) const;
         bool operator!=(const State& rhs) const { return !(*this == rhs); }

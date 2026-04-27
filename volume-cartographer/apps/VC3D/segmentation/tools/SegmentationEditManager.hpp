@@ -102,6 +102,11 @@ public:
     bool setPreviewPoints(const cv::Mat_<cv::Vec3f>& points,
                           bool markAsPendingEdit,
                           std::optional<cv::Rect>* outDiffBounds = nullptr);
+    bool setPreviewPointsOnly(const cv::Mat_<cv::Vec3f>& points,
+                              const std::vector<GridKey>& editedVertices,
+                              bool markAsPendingEdit,
+                              std::optional<cv::Rect>* outDiffBounds = nullptr);
+    bool restorePreviewSnapshot(const cv::Mat_<cv::Vec3f>& points);
 
     void resetPreview();
     void applyPreview();
