@@ -57,6 +57,7 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
             oldPipeline->shutdown();
             oldPipeline->clearMemory();
         }
+        _currentVolume->resetTieredCache();
     }
     if (_blockCache) {
         _blockCache->clear();
