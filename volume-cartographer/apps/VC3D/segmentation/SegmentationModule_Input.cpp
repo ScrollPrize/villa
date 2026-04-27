@@ -277,7 +277,8 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
         }
 
         const SegmentationGrowthMethod method = _widget->growthMethod();
-        if (method != SegmentationGrowthMethod::PatchTracer) {
+        if (method != SegmentationGrowthMethod::Tracer &&
+            method != SegmentationGrowthMethod::PatchTracer) {
             return false;
         }
 

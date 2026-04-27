@@ -253,8 +253,8 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
     growthLayout->addLayout(dirRow);
 
     auto* keybindsRow = new QHBoxLayout();
-    _chkGrowthKeybindsEnabled = new QCheckBox(tr("Enable growth keybinds (1-6)"), _groupGrowth);
-    _chkGrowthKeybindsEnabled->setToolTip(tr("When enabled, keys 1-6 trigger growth in different directions."));
+    _chkGrowthKeybindsEnabled = new QCheckBox(tr("Enable growth keybinds (1-6, Shift+5)"), _groupGrowth);
+    _chkGrowthKeybindsEnabled->setToolTip(tr("When enabled, keys 1-6 trigger growth in different directions and Shift+5 triggers fill growth."));
     keybindsRow->addWidget(_chkGrowthKeybindsEnabled);
     keybindsRow->addStretch(1);
     growthLayout->addLayout(keybindsRow);

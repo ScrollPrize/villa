@@ -1595,6 +1595,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     int grid_limit_w = std::numeric_limits<int>::max();
     int grid_limit_h = std::numeric_limits<int>::max();
     cv::Point resume_origin(grid_margin, grid_margin);
+    cv::Rect resume_grid_bounds;
     if (resume_growth) {
         const int resume_cols = (seed_points.cols + grid_step - 1) / grid_step + 1;
         const int resume_rows = (seed_points.rows + grid_step - 1) / grid_step + 1;
@@ -1607,6 +1608,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         grid_limit_h = grid_margin + extra_up + resume_rows + extra_down + grid_margin;
         w = std::max(1, grid_limit_w);
         h = std::max(1, grid_limit_h);
+        resume_grid_bounds = cv::Rect(resume_origin.x, resume_origin.y, resume_cols, resume_rows);
         std::cout << "resume_growth: true, source grid " << seed_points.size()
                   << " low-res " << cv::Size(resume_cols, resume_rows)
                   << " origin " << resume_origin
@@ -1621,6 +1623,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     cv::Rect save_bounds_inv(closing_r+5,closing_r+5,h-closing_r-10,w-closing_r-10);
     cv::Rect active_bounds(closing_r+5,closing_r+5,w-closing_r-10,h-closing_r-10);
     cv::Rect static_bounds(0,0,0,h);
+    const bool constrain_to_resume_grid =
+        disable_grid_expansion && resume_growth && resume_grid_bounds.area() > 0;
 
     int x0 = w/2;
     int y0 = h/2;
@@ -2141,6 +2145,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
                 for(const auto& n : neighs) {
                     cv::Vec2i pn = p+n;
+                    if (constrain_to_resume_grid &&
+                        !resume_grid_bounds.contains(cv::Point(pn[1], pn[0]))) {
+                        continue;
+                    }
                     if (save_bounds_inv.contains(cv::Point(pn))
                         && (state(pn) & STATE_PROCESSING) == 0
                         && (state(pn) & STATE_LOC_VALID) == 0)

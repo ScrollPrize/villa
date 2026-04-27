@@ -400,7 +400,7 @@ const KeyPressDef GrowthStepAll{
 const KeyPressDef GrowthFill{
     "growth_fill",
     kSectionSegGrowth,
-    "Fill growth without expanding the Patch Tracer grid",
+    "Fill growth without expanding the grid",
     Qt::Key_5,
     Qt::ShiftModifier,
     true
