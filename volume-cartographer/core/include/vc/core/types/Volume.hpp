@@ -88,7 +88,12 @@ public:
 
     // Lazily create and return the tiered chunk cache for this volume.
     // Thread-safe: creates on first call, returns same cache thereafter.
+    // After resetTieredCache(), the next call re-creates the pipeline.
     [[nodiscard]] vc::cache::BlockPipeline* tieredCache();
+
+    // Destroy the current pipeline so the next tieredCache() call creates
+    // a fresh one.  Call after shutdown() on a volume that may be re-used.
+    void resetTieredCache();
 
     // Set cache budget (must be called before first tieredCache() access).
     void setCacheBudget(size_t hotBytes);
@@ -183,7 +188,7 @@ protected:
 
     // Cache ownership
     mutable std::unique_ptr<vc::cache::BlockPipeline> tieredCache_;
-    mutable std::once_flag cacheOnce_;
+    mutable std::mutex cacheMutex_;
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
     vc::cache::BlockCache* sharedBlockCache_ = nullptr;
     int ioThreads_ = 0;  // 0 = use default

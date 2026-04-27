@@ -59,11 +59,24 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
         if (oldPipeline) {
             oldPipeline->shutdown();
         }
+        // Do NOT resetTieredCache on the outgoing volume here — the
+        // viewer's OnVolumeChanged still holds a reference and will call
+        // tieredCache() to unregister its listener.  If the dead pipeline
+        // is null, that call recreates a zombie pipeline with a stale
+        // cache generation, causing permanent black screen on re-select.
+        // Instead we leave the dead pipeline in place (shutdown prevents
+        // further work) and reset the INCOMING volume below.
     }
     if (_blockCache) {
         _blockCache->clear();
     }
     _currentVolume = std::move(vol);
+    // Destroy any stale/zombie pipeline on the incoming volume so
+    // the next tieredCache() call creates a fresh one with the current
+    // BlockCache generation.
+    if (_currentVolume) {
+        _currentVolume->resetTieredCache();
+    }
     applyCacheBudget(_currentVolume);
     resolveCurrentVolumeId();
     emit volumeChanged(_currentVolume, _currentVolumeId);

@@ -458,16 +458,23 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
 
 void Volume::ensureTieredCache() const
 {
-    std::call_once(cacheOnce_, [this]() {
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    if (!tieredCache_) {
         auto* self = const_cast<Volume*>(this);
         tieredCache_ = self->createTieredCache();
-    });
+    }
 }
 
 vc::cache::BlockPipeline* Volume::tieredCache()
 {
     ensureTieredCache();
     return tieredCache_.get();
+}
+
+void Volume::resetTieredCache()
+{
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    tieredCache_.reset();
 }
 
 void Volume::setCacheBudget(size_t hotBytes)
