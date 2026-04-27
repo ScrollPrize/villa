@@ -489,14 +489,14 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
         fprintf(stderr, "[Volume] IO threads: %d\n", config.ioThreads);
     }
 
-    static thread_local std::unique_ptr<vc::cache::BlockCache> localBlockCache;
+    std::unique_ptr<vc::cache::BlockCache> ownedCache;
     vc::cache::BlockCache* bc = sharedBlockCache_;
     if (!bc) {
         vc::cache::BlockCache::Config bcfg;
         bcfg.bytes = cacheBudgetHot_;
         for (auto& f : bcfg.levelFloor) f = 4096;
-        localBlockCache = std::make_unique<vc::cache::BlockCache>(bcfg);
-        bc = localBlockCache.get();
+        ownedCache = std::make_unique<vc::cache::BlockCache>(bcfg);
+        bc = ownedCache.get();
     }
 
     auto pipeline = std::make_unique<vc::cache::BlockPipeline>(
@@ -505,6 +505,7 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
         std::move(source),
         std::move(decompress),
         std::move(diskLevels));
+    pipeline->ownBlockCache(std::move(ownedCache));
     return pipeline;
 }
 

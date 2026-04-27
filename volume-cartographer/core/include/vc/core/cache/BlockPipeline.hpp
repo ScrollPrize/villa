@@ -100,6 +100,10 @@ public:
     BlockPipeline(const BlockPipeline&) = delete;
     BlockPipeline& operator=(const BlockPipeline&) = delete;
 
+    // Transfer ownership of a fallback BlockCache into this pipeline.
+    // Must be called immediately after construction, before any work.
+    void ownBlockCache(std::unique_ptr<BlockCache> cache) { ownedBlockCache_ = std::move(cache); }
+
     // --- Block-level access ---
     // Returns a shared_ptr to the 16^3 block, or null if not in RAM.
     // Evicted blocks stay alive while any caller still holds a shared_ptr.
@@ -295,6 +299,7 @@ private:
                                 const ShardKey& sk,
                                 std::shared_ptr<utils::ShardBytes> bytes);
 
+    std::unique_ptr<BlockCache> ownedBlockCache_;  // per-pipeline fallback when no shared cache
     BlockCache& blockCache_;
 
     // Assemble a canonical 128^3 chunk from one or more source chunks at

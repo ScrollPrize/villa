@@ -1339,16 +1339,18 @@ std::unique_ptr<BlockPipeline> openFilesystemPipeline(
     BlockPipeline::Config cfg;
     cfg.bytes = maxBytes;
 
-    static thread_local std::unique_ptr<BlockCache> localCache;
+    std::unique_ptr<BlockCache> ownedCache;
     if (!sharedCache) {
         BlockCache::Config bcfg;
         bcfg.bytes = maxBytes;
         for (auto& f : bcfg.levelFloor) f = 4096;
-        localCache = std::make_unique<BlockCache>(bcfg);
-        sharedCache = localCache.get();
+        ownedCache = std::make_unique<BlockCache>(bcfg);
+        sharedCache = ownedCache.get();
     }
-    return std::make_unique<BlockPipeline>(
+    auto pipeline = std::make_unique<BlockPipeline>(
         std::move(cfg), *sharedCache, std::move(source), std::move(decompress));
+    pipeline->ownBlockCache(std::move(ownedCache));
+    return pipeline;
 }
 
 }  // namespace vc::cache
