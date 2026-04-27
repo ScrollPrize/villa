@@ -652,7 +652,12 @@ std::shared_ptr<QuadSurface> VolumePkg::loadSurface(const std::string& id)
         Logger()->error("Cannot load surface - segmentation {} not found", id);
         return nullptr;
     }
-    return segIt->second->loadSurface();
+    try {
+        return segIt->second->loadSurface();
+    } catch (const std::exception& e) {
+        Logger()->warn("loadSurface({}) failed: {}", id, e.what());
+        return nullptr;
+    }
 }
 
 std::shared_ptr<QuadSurface> VolumePkg::getSurface(const std::string& id)

@@ -823,11 +823,15 @@ CWindow::CWindow(size_t cacheSizeGB) :
             });
     _viewerManager->setVolumeOverlay(_volumeOverlay.get());
 
+    // Menu controller must exist before CreateWidgets() because the volpkg
+    // dock connects its signals to slots on _menuController during widget
+    // setup. Without this ordering Qt skips those connects with "invalid
+    // nullptr parameter" warnings and the dock context menu does nothing.
+    _menuController = std::make_unique<MenuActionController>(this);
+
     // create UI widgets
     CreateWidgets();
 
-    // create menus/actions controller
-    _menuController = std::make_unique<MenuActionController>(this);
     _menuController->populateMenus(menuBar());
 
     if (isDarkMode()) {
@@ -2627,7 +2631,17 @@ void CWindow::CreateWidgets(void)
                 auto surf = _state->vpkg()->getSurface(segmentId.toStdString());
                 auto* quad = dynamic_cast<QuadSurface*>(surf.get());
                 if (!quad) return;
-                quad->ensureLoaded();
+                try {
+                    quad->ensureLoaded();
+                } catch (const std::exception& e) {
+                    if (statusBar()) {
+                        statusBar()->showMessage(
+                            tr("Cannot focus '%1': %2")
+                                .arg(segmentId, QString::fromStdString(e.what())),
+                            5000);
+                    }
+                    return;
+                }
                 cv::Vec3f c = quad->center();
                 POI* poi = _state->poi("focus");
                 if (!poi) poi = new POI;

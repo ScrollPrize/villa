@@ -96,9 +96,29 @@ SurfacePanelController::SurfacePanelController(const UiRefs& ui,
                 this, [this](QTreeWidgetItem* item, int /*column*/) {
             if (!item) return;
             const QString segId = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
-            if (!segId.isEmpty()) {
-                emit focusSurfaceRequested(segId);
+            if (segId.isEmpty()) return;
+            const std::string id = segId.toStdString();
+            // Stub: queue the focus to fire after the download completes
+            // and trigger the download via the same path as a normal click.
+            // Without this the focus handler would synchronously call
+            // ensureLoaded() and throw because the TIFFs aren't on disk yet.
+            if (_remoteStubSegments.count(id)) {
+                _pendingFocusAfterDownload.insert(id);
+                if (!_remoteDownloading.count(id)) {
+                    _remoteDownloading.insert(id);
+                    item->setText(SURFACE_ID_COLUMN,
+                        segId + QStringLiteral(" [downloading...]"));
+                    item->setForeground(SURFACE_ID_COLUMN,
+                        QBrush(QColor(0, 120, 215)));
+                    emit remoteSegmentDownloadRequested(segId);
+                }
+                return;
             }
+            if (_remoteDownloading.count(id)) {
+                _pendingFocusAfterDownload.insert(id);
+                return;
+            }
+            emit focusSurfaceRequested(segId);
         });
     }
 }
@@ -319,6 +339,7 @@ void SurfacePanelController::replaceStubWithSurface(
     if (!surface) {
         // Download failed - revert to stub state so user can retry
         _remoteStubSegments.insert(segmentId);
+        _pendingFocusAfterDownload.erase(segmentId);
         if (_ui.treeWidget) {
             const QString idQStr = QString::fromStdString(segmentId);
             QTreeWidgetItemIterator it(_ui.treeWidget);
@@ -377,6 +398,12 @@ void SurfacePanelController::replaceStubWithSurface(
         _state->setSurface("segmentation", surface, false, false);
         _state->setActiveSurface(segmentId, std::dynamic_pointer_cast<QuadSurface>(surface));
         _state->emitSurfacesChanged();
+    }
+
+    // If the user double-clicked this segment while it was still a stub,
+    // fire the focus request now that the data is actually loaded.
+    if (_pendingFocusAfterDownload.erase(segmentId)) {
+        emit focusSurfaceRequested(QString::fromStdString(segmentId));
     }
 }
 

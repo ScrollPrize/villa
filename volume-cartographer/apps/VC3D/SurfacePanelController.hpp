@@ -214,4 +214,8 @@ private:
     std::unordered_set<std::string> _remoteStubSegments;
     // Segment IDs currently being downloaded (avoid duplicate downloads).
     std::unordered_set<std::string> _remoteDownloading;
+    // Segment IDs the user double-clicked while still a stub. After the
+    // download finishes (replaceStubWithSurface) we emit focusSurfaceRequested
+    // so the focus action follows through instead of racing the download.
+    std::unordered_set<std::string> _pendingFocusAfterDownload;
 };

@@ -1559,7 +1559,15 @@ void SegmentationCommandHandler::onFetchRemoteChunks(const std::string& segmentI
                              tr("Could not find surface '%1'.").arg(QString::fromStdString(segmentId)));
         return;
     }
-    surface->ensureLoaded();
+    try {
+        surface->ensureLoaded();
+    } catch (const std::exception& e) {
+        QMessageBox::warning(_parentWidget, tr("Error"),
+            tr("Could not load surface '%1':\n%2")
+                .arg(QString::fromStdString(segmentId),
+                     QString::fromStdString(e.what())));
+        return;
+    }
 
     auto* cache = volume->tieredCache();
     if (!cache) {
