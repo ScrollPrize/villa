@@ -362,7 +362,7 @@ def print_detail(label: str = "") -> None:
 	# Anchor columns (winding mode only)
 	has_anchors = _wind_anchors_d is not None
 	if has_anchors:
-		print(f"  {'cl_lo':>8s}  {'cl_up':>8s}  {'av_lo':>8s}  {'av_up':>8s}", end="")
+		print(f"  {'cl_lo':>8s}  {'cl_up':>8s}  {'tg_lo':>8s}  {'tg_up':>8s}", end="")
 	print()
 
 	# Sort by point ID for stable output
@@ -1538,6 +1538,10 @@ def _corr_winding_loss(
 	n_surfaces = 0
 	all_err = torch.zeros(K, device=dev, dtype=dt)
 
+	# Per-surface frac weight: tgt_lo (ci=2) gets 1-frac, tgt_hi (ci=3) gets frac.
+	# Integer targets naturally zero out the second surface.
+	frac_weight = {2: (1.0 - frac), 3: frac}
+
 	for ci, tgt_fn in [(2, lambda f: -f), (3, lambda f: 1.0 - f)]:
 		valid = _wind_anchors_valid[:, ci] & target_finite
 		if not valid.any():
@@ -1575,8 +1579,9 @@ def _corr_winding_loss(
 			tgt = tgt_fn(frac[vi])
 			err = sw - tgt
 
-			# Store error for results
-			all_err[vi] = err
+			# Store error for results (weighted by frac proximity)
+			fw = frac_weight[ci][vi]
+			all_err[vi] += err * fw
 
 			# Proxies: shift each corner by gt_n * err
 			we = err.unsqueeze(-1)
@@ -1600,8 +1605,8 @@ def _corr_winding_loss(
 
 		lm = w00 * lm00 + w10 * lm10 + w01 * lm01 + w11 * lm11
 
-		# Mask by strip validity
-		mask_ci = sv.to(dt)
+		# Mask by strip validity, weighted by frac proximity to target
+		mask_ci = sv.to(dt) * frac_weight[ci][vi]
 		wsum = float(mask_ci.sum().detach().cpu())
 		if wsum > 0:
 			total_loss = total_loss + (lm * mask_ci).sum()
@@ -1614,9 +1619,9 @@ def _corr_winding_loss(
 		print(f"[corr-wind] loss={float(total_loss.detach().item()):.6f}, "
 			  f"valid={n_valid}/{K}, rms_proxy={rms:.4f}")
 
-	# Build results — point is valid only if it has at least one valid avg anchor
-	has_avg_anchor = _wind_anchors_valid[:, 2] | _wind_anchors_valid[:, 3]
-	point_valid = target_finite & has_avg_anchor
+	# Build results — point is valid only if it has at least one valid tgt anchor
+	has_tgt_anchor = _wind_anchors_valid[:, 2] | _wind_anchors_valid[:, 3]
+	point_valid = target_finite & has_tgt_anchor
 	_last_results = _build_winding_results(
 		winding_obs=_wind_obs_per_point, target=target,
 		err=all_err, pt_ids=pt_ids, col=col, pts=pts, winda=winda,
