@@ -442,6 +442,9 @@ protected:
     Rect3D _bbox = {{-1,-1,-1},{-1,-1,-1}};
     std::set<std::string> _overlappingIds;
     std::optional<std::filesystem::file_time_type> _maskTimestamp;
+    // Column ranges of disconnected surface components (from meta.json "components").
+    // Each pair is [col_start, col_end). Empty = single contiguous surface.
+    std::vector<std::pair<int,int>> _components;
     float dpi_ = 0.f;
 
 private:
@@ -457,6 +460,10 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path, int 
 
 float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3d> &points, const cv::Vec3f &tgt, float th, int max_iters, float scale);
 float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &tgt, float th, int max_iters, float scale);
+
+// Look up winding depth index from the "d" channel at grid (row, col).
+// Returns NAN if surface is null, "d" channel is missing, or coords are out of bounds.
+float lookupDepthIndex(QuadSurface* surface, int row, int col);
 
 std::unique_ptr<QuadSurface> surface_diff(QuadSurface* a, QuadSurface* b, float tolerance = 2.0);
 std::unique_ptr<QuadSurface> surface_union(QuadSurface* a, QuadSurface* b, float tolerance = 2.0);

@@ -647,7 +647,7 @@ void MenuActionController::attachRemoteZarr()
 
 bool MenuActionController::tryResolveRemoteAuth(const QString& url,
                                                 vc::cache::HttpAuth* authOut,
-                                                bool /*allowPrompt*/,
+                                                bool allowPrompt,
                                                 QString* errorMessage) const
 {
     if (!authOut) {
@@ -680,13 +680,63 @@ bool MenuActionController::tryResolveRemoteAuth(const QString& url,
         return true;
     }
 
-    // Public S3 buckets can be read anonymously. Do not block the first
-    // request on credential entry just because the URL is S3-shaped; if the
-    // server returns an auth error, the caller's existing retry path prompts.
-    if (errorMessage) {
-        errorMessage->clear();
+    if (!allowPrompt) {
+        // No credentials available and can't prompt — proceed with anonymous
+        // access (unsigned HTTPS). Works for public S3 buckets.
+        *authOut = {};  // anonymous — no SigV4
+        return true;
     }
 
+    bool credOk = false;
+    QString accessKey = QInputDialog::getText(
+        _window,
+        QObject::tr("AWS Credentials"),
+        QObject::tr("AWS_ACCESS_KEY_ID (leave empty for anonymous/public access):"),
+        QLineEdit::Normal, QString(), &credOk);
+    if (!credOk) {
+        if (errorMessage) {
+            *errorMessage = QObject::tr("AWS credential entry canceled.");
+        }
+        return false;
+    }
+
+    // Empty access key → anonymous access (public buckets)
+    if (accessKey.trimmed().isEmpty()) {
+        *authOut = {};  // anonymous — no SigV4
+        return true;
+    }
+
+    QString secretKey = QInputDialog::getText(
+        _window,
+        QObject::tr("AWS Credentials"),
+        QObject::tr("AWS_SECRET_ACCESS_KEY:"),
+        QLineEdit::Password, QString(), &credOk);
+    if (!credOk || secretKey.trimmed().isEmpty()) {
+        if (errorMessage) {
+            *errorMessage = QObject::tr("AWS credential entry canceled.");
+        }
+        return false;
+    }
+
+    QString sessionToken = QInputDialog::getText(
+        _window,
+        QObject::tr("AWS Credentials"),
+        QObject::tr("AWS_SESSION_TOKEN (optional, leave blank if not using STS):"),
+        QLineEdit::Normal, QString(), &credOk);
+    if (!credOk) {
+        if (errorMessage) {
+            *errorMessage = QObject::tr("AWS credential entry canceled.");
+        }
+        return false;
+    }
+
+    authOut->access_key = accessKey.trimmed().toStdString();
+    authOut->secret_key = secretKey.trimmed().toStdString();
+    authOut->session_token = sessionToken.trimmed().toStdString();
+
+    settings.setValue(vc3d::settings::aws::ACCESS_KEY, accessKey.trimmed());
+    settings.setValue(vc3d::settings::aws::SECRET_KEY, secretKey.trimmed());
+    settings.setValue(vc3d::settings::aws::SESSION_TOKEN, sessionToken.trimmed());
     return true;
 }
 

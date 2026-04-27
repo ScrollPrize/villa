@@ -218,13 +218,36 @@
            </widget>
           </item>
           <item row="5" column="0">
+           <widget class="QLabel" name="labelZoomSensitivity">
+            <property name="text">
+             <string>Zoom sensitivity</string>
+            </property>
+           </widget>
+          </item>
+          <item row="5" column="1">
+           <widget class="QDoubleSpinBox" name="spinZoomSensitivity">
+            <property name="minimum">
+             <double>0.100000000000000</double>
+            </property>
+            <property name="maximum">
+             <double>10.000000000000000</double>
+            </property>
+            <property name="singleStep">
+             <double>0.100000000000000</double>
+            </property>
+            <property name="value">
+             <double>1.000000000000000</double>
+            </property>
+           </widget>
+          </item>
+          <item row="6" column="0">
            <widget class="QLabel" name="label_7">
             <property name="text">
              <string>Opacity of &quot;Display&quot; mode segments</string>
             </property>
            </widget>
           </item>
-          <item row="5" column="1">
+          <item row="6" column="1">
            <widget class="QSpinBox" name="spinDisplayOpacity">
             <property name="suffix">
              <string>%</string>
@@ -240,7 +263,7 @@
             </property>
            </widget>
           </item>
-          <item row="5" column="2">
+          <item row="6" column="2">
            <widget class="QPushButton" name="btnHelpDisplayOpacity">
             <property name="enabled">
              <bool>true</bool>
@@ -265,7 +288,7 @@
             </property>
            </widget>
           </item>
-          <item row="6" column="0" colspan="2">
+          <item row="7" column="0" colspan="2">
            <widget class="QCheckBox" name="chkPlaySoundAfterSegRun">
             <property name="text">
              <string>Play sound when segmentation run finished</string>
@@ -275,21 +298,21 @@
             </property>
            </widget>
           </item>
-          <item row="7" column="0">
+          <item row="8" column="0">
            <widget class="QLabel" name="label_8">
             <property name="text">
              <string>Username (for tagging)</string>
             </property>
            </widget>
           </item>
-          <item row="7" column="1">
+          <item row="8" column="1">
            <widget class="QLineEdit" name="edtUsername">
             <property name="placeholderText">
              <string>Enter your username</string>
             </property>
            </widget>
           </item>
-          <item row="8" column="0" colspan="2">
+          <item row="9" column="0" colspan="2">
            <widget class="QCheckBox" name="chkResetViewOnSurfaceChange">
             <property name="text">
              <string>Reset view when switching between surfaces</string>

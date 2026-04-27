@@ -231,6 +231,56 @@ void warpNearestConstVec3f(const cv::Mat_<cv::Vec3f>& src,
     }
 }
 
+void warpBilinearConstVec3f(const cv::Mat_<cv::Vec3f>& src,
+                            cv::Mat_<cv::Vec3f>& dst,
+                            double ox, double oy,
+                            double sx, double sy,
+                            const cv::Vec3f& border)
+{
+    const int sc = src.cols, sr = src.rows;
+    if (sc <= 0 || sr <= 0) {
+        dst.setTo(border);
+        return;
+    }
+    const int dw = dst.cols, dh = dst.rows;
+    const float sxmax = float(sc - 1);
+    const float symax = float(sr - 1);
+    const float fox = float(ox);
+    const float foy = float(oy);
+    const float fsx = float(sx);
+    const float fsy = float(sy);
+    #pragma omp parallel for schedule(dynamic, 8)
+    for (int dy = 0; dy < dh; ++dy) {
+        float fy = foy + float(dy) * fsy;
+        cv::Vec3f* orow = dst[dy];
+        if (fy < 0.0f || fy > symax) {
+            for (int dx = 0; dx < dw; ++dx) orow[dx] = border;
+            continue;
+        }
+        int y0 = int(fy);
+        int y1 = y0 + 1; if (y1 > sr - 1) y1 = sr - 1;
+        const float wy = fy - float(y0);
+        const cv::Vec3f* row0 = src[y0];
+        const cv::Vec3f* row1 = src[y1];
+        for (int dx = 0; dx < dw; ++dx) {
+            float fx = fox + float(dx) * fsx;
+            if (fx < 0.0f || fx > sxmax) {
+                orow[dx] = border;
+                continue;
+            }
+            int x0 = int(fx);
+            int x1 = x0 + 1; if (x1 > sc - 1) x1 = sc - 1;
+            const float wx = fx - float(x0);
+            const cv::Vec3f& p00 = row0[x0]; const cv::Vec3f& p01 = row0[x1];
+            const cv::Vec3f& p10 = row1[x0]; const cv::Vec3f& p11 = row1[x1];
+            const float iwx = 1.0f - wx;
+            const float iwy = 1.0f - wy;
+            orow[dx] = (p00 * iwx + p01 * wx) * iwy
+                     + (p10 * iwx + p11 * wx) * wy;
+        }
+    }
+}
+
 } // namespace
 
 //NOTE we have 3 coordiante systems. Nominal (voxel volume) coordinates, internal relative (ptr) coords (where _center is at 0/0) and internal absolute (_points) coordinates where the upper left corner is at 0/0.
@@ -279,6 +329,13 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_)
     if (meta.contains("bbox"))
         _bbox = rect_from_json(meta["bbox"]);
 
+    if (meta.contains("components") && meta["components"].is_array()) {
+        for (const auto& c : meta["components"]) {
+            if (c.is_array() && c.size() >= 2)
+                _components.emplace_back(c[0].get_int(), c[1].get_int());
+        }
+    }
+
     _maskTimestamp = readMaskTimestamp(path);
     _needsLoad = true;  // Points will be loaded lazily
 }
@@ -291,6 +348,13 @@ QuadSurface::QuadSurface(const std::filesystem::path &path_, const utils::Json &
 
     if (json.contains("bbox"))
         _bbox = rect_from_json(json["bbox"]);
+
+    if (json.contains("components") && json["components"].is_array()) {
+        for (const auto& c : json["components"]) {
+            if (c.is_array() && c.size() >= 2)
+                _components.emplace_back(c[0].get_int(), c[1].get_int());
+        }
+    }
 
     _maskTimestamp = readMaskTimestamp(path);
     _needsLoad = true;  // Points will be loaded lazily
@@ -688,27 +752,61 @@ void QuadSurface::gen(cv::Mat_<cv::Vec3f>* coords,
     // Trigger the cache build + set _validMaskAllValid before deciding
     // whether we need the validity warp below.
     cv::Mat_<uint8_t> valid_src = validMask();
-    const bool skipValidity = _validMaskAllValid;
+    bool skipValidity = _validMaskAllValid;
 
-    // --- warp coords with seam-safe border (replicate) -------------------
-    // Reuse the surface-member scratch: dst.create() no-ops when size +
-    // type match, so after steady state this costs zero allocations. A
-    // reference (not copy) is taken so downstream ops see the same
-    // buffer; the cropped view returned to the caller holds its own
-    // refcount, so if the next gen() call needs a different size,
-    // OpenCV allocates a new buffer and leaves the old one alive for
-    // outstanding views.
+    // --- warp coords and validity ----------------------------------------
     cv::Mat_<cv::Vec3f>& coords_big = _genCoordsScratch;
-    coords_big.create(h + 8, w + 8);
-    warpBilinearReplicateVec3f(*_points, coords_big, ox, oy, sx, sy);
-
-    // --- warp validity with constant 0 (no replicate leakage) -----------
-    // Skip entirely when the source mask is all-valid: the cropped region
-    // can only contain 255s (the 4px halo that would hold 0s is discarded).
     cv::Mat_<uint8_t>& valid_big = _genValidScratch;
-    if (!skipValidity) {
+
+    if (!_components.empty()) {
+        // Multi-component surface: warp each component separately with
+        // constant NaN border so no interpolation across component boundaries.
+        const cv::Vec3f nanV(std::numeric_limits<float>::quiet_NaN(),
+                             std::numeric_limits<float>::quiet_NaN(),
+                             std::numeric_limits<float>::quiet_NaN());
+        coords_big.create(h + 8, w + 8);
+        coords_big.setTo(nanV);
+        valid_big.create(h + 8, w + 8);
+        valid_big.setTo(0);
+
+        const int rows = _points->rows;
+        cv::Mat_<cv::Vec3f> compCoords;
+        cv::Mat_<uint8_t> compValidBig;
+        for (const auto& [c0, c1] : _components) {
+            const int cw = c1 - c0;
+            if (cw <= 0 || c0 < 0 || c1 > _points->cols) continue;
+
+            cv::Mat_<cv::Vec3f> compPts = (*_points)(cv::Rect(c0, 0, cw, rows));
+            compCoords.create(h + 8, w + 8);
+            warpBilinearConstVec3f(compPts, compCoords, ox - c0, oy, sx, sy, nanV);
+
+            if (!skipValidity) {
+                cv::Mat_<uint8_t> compValid = valid_src(cv::Rect(c0, 0, cw, rows));
+                compValidBig.create(h + 8, w + 8);
+                warpNearestConstU8(compValid, compValidBig, ox - c0, oy, sx, sy, 0);
+                compCoords.copyTo(coords_big, compValidBig);
+                cv::bitwise_or(valid_big, compValidBig, valid_big);
+            } else {
+                // All-valid source: composite non-NaN pixels directly
+                for (int r = 0; r < coords_big.rows; r++) {
+                    const cv::Vec3f* s = compCoords[r];
+                    cv::Vec3f* d = coords_big[r];
+                    for (int ci = 0; ci < coords_big.cols; ci++) {
+                        if (std::isfinite(s[ci][0])) d[ci] = s[ci];
+                    }
+                }
+            }
+        }
+    } else {
+        // Single component: replicate coords, constant-0 validity.
+        // Always warp validity even when all source points are valid —
+        // the 4px halo around the crop region needs 0s so the
+        // invalidation pass below sets them to NaN (black edges).
+        coords_big.create(h + 8, w + 8);
+        warpBilinearReplicateVec3f(*_points, coords_big, ox, oy, sx, sy);
         valid_big.create(h + 8, w + 8);
         warpNearestConstU8(valid_src, valid_big, ox, oy, sx, sy, 0);
+        skipValidity = false;  // force invalidation pass below
     }
 
     // --- normals: warp cached source-grid normals -------------------
@@ -949,6 +1047,27 @@ float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3d> &points, const cv::Vec3f
 float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &tgt, float th, int max_iters, float scale)
 {
     return pointTo_(loc, points, tgt, th, max_iters, scale);
+}
+
+float lookupDepthIndex(QuadSurface* surface, int row, int col)
+{
+    if (!surface) {
+        return NAN;
+    }
+    cv::Mat dChannel = surface->channel("d");
+    if (dChannel.empty()) {
+        return NAN;
+    }
+    if (row < 0 || row >= dChannel.rows || col < 0 || col >= dChannel.cols) {
+        return NAN;
+    }
+    if (dChannel.type() == CV_32F) {
+        return dChannel.at<float>(row, col);
+    }
+    if (dChannel.type() == CV_64F) {
+        return static_cast<float>(dChannel.at<double>(row, col));
+    }
+    return NAN;
 }
 
 //search the surface point that is closest to the target coord

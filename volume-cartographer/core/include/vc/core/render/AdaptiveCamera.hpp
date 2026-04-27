@@ -35,7 +35,9 @@ struct AdaptiveCamera {
 
     // Recalculate pyramid level from current scale.
     // numScales = volume->numScales()
-    void recalcPyramidLevel(int numScales) noexcept;
+    // scaleFactors: optional per-level OME-Zarr scale factors (e.g. [8,16,32,...]).
+    //   When non-null, dsScale = 1/scaleFactors[dsScaleIdx] instead of 1/2^idx.
+    void recalcPyramidLevel(int numScales, const float* scaleFactors = nullptr) noexcept;
 
     // Snap scale to the nearest predefined zoom stop
     static float roundScale(float s) noexcept;

@@ -95,7 +95,7 @@ void to_json(Json& j, const VCCollection::Collection& c) {
 void from_json(const Json& j, VCCollection::Collection& c) {
     c.name = j.at("name").get_string();
 
-    const Json& points_obj = j.at("points");
+    Json points_obj = j.at("points");  // copy — ref into at() cache gets evicted by nested at() calls
     if (points_obj.is_object()) {
         for (auto it = points_obj.begin(); it != points_obj.end(); ++it) {
             uint64_t id = std::stoull(it.key());
@@ -380,7 +380,7 @@ bool VCCollection::loadFromJSON(const std::string& filename)
             throw std::runtime_error("JSON file has incorrect version or is missing version info.");
         }
 
-        const Json& collections_obj = j.at("collections");
+        Json collections_obj = j.at("collections");  // copy — ref into at() cache gets evicted by nested at() calls
         if (!collections_obj.is_object()) {
             return false;
         }
@@ -546,7 +546,7 @@ bool VCCollection::loadFromSegmentPath(const std::filesystem::path& segmentPath)
             return false;
         }
 
-        const Json& collections_obj = j.at("collections");
+        Json collections_obj = j.at("collections");  // copy — ref into at() cache gets evicted by nested at() calls
         if (!collections_obj.is_object()) {
             return false;
         }

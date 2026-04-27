@@ -1470,3 +1470,148 @@ int ABFFlattenDialog::downsampleFactor() const
 {
     return spDownsample_ ? spDownsample_->value() : 1;
 }
+
+// ================= VisLasagnaObjDialog =================
+// static session members
+bool VisLasagnaObjDialog::s_haveSession = false;
+bool VisLasagnaObjDialog::s_xy = true;
+bool VisLasagnaObjDialog::s_xz = false;
+bool VisLasagnaObjDialog::s_yz = false;
+bool VisLasagnaObjDialog::s_cos = true;
+bool VisLasagnaObjDialog::s_gradMag = true;
+bool VisLasagnaObjDialog::s_lStep = true;
+bool VisLasagnaObjDialog::s_lSmooth = true;
+bool VisLasagnaObjDialog::s_lWinding = true;
+bool VisLasagnaObjDialog::s_lNormal = true;
+bool VisLasagnaObjDialog::s_mesh = true;
+bool VisLasagnaObjDialog::s_conn = true;
+
+VisLasagnaObjDialog::VisLasagnaObjDialog(QWidget* parent, const QString& outputDir)
+    : QDialog(parent)
+{
+    setWindowTitle("Lasagna Vis as OBJ");
+    auto main = new QVBoxLayout(this);
+
+    // Output directory
+    auto form = new QFormLayout();
+    QWidget* outPick = pathPicker(this, edtOutput_, "Select output directory", true);
+    edtOutput_->setText(outputDir);
+    form->addRow("Output dir:", outPick);
+    main->addLayout(form);
+
+    // Slice planes
+    auto sliceGroup = new QGroupBox("Slice Planes", this);
+    auto sliceLayout = new QHBoxLayout(sliceGroup);
+    chkXY_ = new QCheckBox("XY", this); chkXY_->setChecked(true);
+    chkXZ_ = new QCheckBox("XZ", this);
+    chkYZ_ = new QCheckBox("YZ", this);
+    sliceLayout->addWidget(chkXY_);
+    sliceLayout->addWidget(chkXZ_);
+    sliceLayout->addWidget(chkYZ_);
+    main->addWidget(sliceGroup);
+
+    // Channels
+    auto chanGroup = new QGroupBox("Channels", this);
+    auto chanLayout = new QHBoxLayout(chanGroup);
+    chkCos_ = new QCheckBox("cos", this); chkCos_->setChecked(true);
+    chkGradMag_ = new QCheckBox("grad_mag", this); chkGradMag_->setChecked(true);
+    chanLayout->addWidget(chkCos_);
+    chanLayout->addWidget(chkGradMag_);
+    main->addWidget(chanGroup);
+
+    // Losses
+    auto lossGroup = new QGroupBox("Loss Maps", this);
+    auto lossLayout = new QVBoxLayout(lossGroup);
+    chkLossStep_ = new QCheckBox("step", this); chkLossStep_->setChecked(true);
+    chkLossSmooth_ = new QCheckBox("smooth", this); chkLossSmooth_->setChecked(true);
+    chkLossWinding_ = new QCheckBox("winding_density", this); chkLossWinding_->setChecked(true);
+    chkLossNormal_ = new QCheckBox("normal", this); chkLossNormal_->setChecked(true);
+    lossLayout->addWidget(chkLossStep_);
+    lossLayout->addWidget(chkLossSmooth_);
+    lossLayout->addWidget(chkLossWinding_);
+    lossLayout->addWidget(chkLossNormal_);
+    main->addWidget(lossGroup);
+
+    // Geometry
+    auto geoGroup = new QGroupBox("Geometry", this);
+    auto geoLayout = new QHBoxLayout(geoGroup);
+    chkMesh_ = new QCheckBox("Mesh", this); chkMesh_->setChecked(true);
+    chkConn_ = new QCheckBox("Connections", this); chkConn_->setChecked(true);
+    geoLayout->addWidget(chkMesh_);
+    geoLayout->addWidget(chkConn_);
+    main->addWidget(geoGroup);
+
+    // Buttons
+    auto btns = new QDialogButtonBox(QDialogButtonBox::Ok | QDialogButtonBox::Cancel, this);
+    connect(btns, &QDialogButtonBox::accepted, this, &QDialog::accept);
+    connect(btns, &QDialogButtonBox::rejected, this, &QDialog::reject);
+    connect(btns, &QDialogButtonBox::accepted, this, [this]() { updateSessionFromUI(); });
+    main->addWidget(btns);
+
+    ensureDialogWidthForEdits(this, QList<QLineEdit*>{ edtOutput_ });
+
+    // Apply session defaults
+    applySessionDefaults();
+}
+
+QString VisLasagnaObjDialog::outputDir() const { return edtOutput_->text(); }
+
+QStringList VisLasagnaObjDialog::slices() const {
+    QStringList r;
+    if (chkXY_->isChecked()) r << QStringLiteral("xy");
+    if (chkXZ_->isChecked()) r << QStringLiteral("xz");
+    if (chkYZ_->isChecked()) r << QStringLiteral("yz");
+    return r;
+}
+
+QStringList VisLasagnaObjDialog::channels() const {
+    QStringList r;
+    if (chkCos_->isChecked()) r << QStringLiteral("cos");
+    if (chkGradMag_->isChecked()) r << QStringLiteral("grad_mag");
+    return r;
+}
+
+QStringList VisLasagnaObjDialog::losses() const {
+    QStringList r;
+    if (chkLossStep_->isChecked()) r << QStringLiteral("step");
+    if (chkLossSmooth_->isChecked()) r << QStringLiteral("smooth");
+    if (chkLossWinding_->isChecked()) r << QStringLiteral("winding_density");
+    if (chkLossNormal_->isChecked()) r << QStringLiteral("normal");
+    return r;
+}
+
+bool VisLasagnaObjDialog::includeMesh() const { return chkMesh_->isChecked(); }
+bool VisLasagnaObjDialog::includeConnections() const { return chkConn_->isChecked(); }
+
+void VisLasagnaObjDialog::applySessionDefaults()
+{
+    if (!s_haveSession) return;
+    // Don't restore s_outputDir — always use the segment-derived path from constructor
+    chkXY_->setChecked(s_xy);
+    chkXZ_->setChecked(s_xz);
+    chkYZ_->setChecked(s_yz);
+    chkCos_->setChecked(s_cos);
+    chkGradMag_->setChecked(s_gradMag);
+    chkLossStep_->setChecked(s_lStep);
+    chkLossSmooth_->setChecked(s_lSmooth);
+    chkLossWinding_->setChecked(s_lWinding);
+    chkLossNormal_->setChecked(s_lNormal);
+    chkMesh_->setChecked(s_mesh);
+    chkConn_->setChecked(s_conn);
+}
+
+void VisLasagnaObjDialog::updateSessionFromUI()
+{
+    s_haveSession = true;
+    s_xy = chkXY_->isChecked();
+    s_xz = chkXZ_->isChecked();
+    s_yz = chkYZ_->isChecked();
+    s_cos = chkCos_->isChecked();
+    s_gradMag = chkGradMag_->isChecked();
+    s_lStep = chkLossStep_->isChecked();
+    s_lSmooth = chkLossSmooth_->isChecked();
+    s_lWinding = chkLossWinding_->isChecked();
+    s_lNormal = chkLossNormal_->isChecked();
+    s_mesh = chkMesh_->isChecked();
+    s_conn = chkConn_->isChecked();
+}

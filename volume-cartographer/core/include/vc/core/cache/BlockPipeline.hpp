@@ -90,6 +90,7 @@ public:
 
     BlockPipeline(
         Config config,
+        BlockCache& blockCache,
         std::unique_ptr<VolumeSource> source,
         DecompressFn decompress,
         std::vector<std::unique_ptr<utils::ZarrArray>> diskLevels = {});
@@ -98,6 +99,10 @@ public:
 
     BlockPipeline(const BlockPipeline&) = delete;
     BlockPipeline& operator=(const BlockPipeline&) = delete;
+
+    // Transfer ownership of a fallback BlockCache into this pipeline.
+    // Must be called immediately after construction, before any work.
+    void ownBlockCache(std::unique_ptr<BlockCache> cache) { ownedBlockCache_ = std::move(cache); }
 
     // --- Block-level access ---
     // Returns a shared_ptr to the 16^3 block, or null if not in RAM.
@@ -115,9 +120,19 @@ public:
     void clearMemory();
     void clearAll();
 
+    // Explicitly stop all worker pools and release caches. After this call
+    // the pipeline is inert — the destructor becomes a no-op. Use in
+    // volume-switch paths to ensure the old pipeline's abortAll() doesn't
+    // poison a new pipeline that's already running.
+    void shutdown();
+
     [[nodiscard]] int numLevels() const noexcept;
     [[nodiscard]] std::array<int, 3> chunkShape(int level) const noexcept;
     [[nodiscard]] std::array<int, 3> levelShape(int level) const noexcept;
+
+    // OME-Zarr scale factor for a vector index (e.g. 4.0 for directory "2").
+    // Falls back to 2^vectorIndex if not set.
+    [[nodiscard]] float levelScaleFactor(int vectorIndex) const noexcept;
 
     // --- Logical data bounds ---
     struct DataBoundsL0 {
@@ -290,7 +305,8 @@ private:
                                 const ShardKey& sk,
                                 std::shared_ptr<utils::ShardBytes> bytes);
 
-    BlockCache blockCache_;
+    std::unique_ptr<BlockCache> ownedBlockCache_;  // per-pipeline fallback when no shared cache
+    BlockCache& blockCache_;
 
     // Assemble a canonical 128^3 chunk from one or more source chunks at
     // `canonKey.level`, rechunking as needed. Null if the canonical region
@@ -427,6 +443,7 @@ private:
 // Convenience: open a single-level BlockPipeline against a local zarr dataset
 // (no disk tier; filesystem serves as ice). Used by CLI tools, tracer, etc.
 std::unique_ptr<BlockPipeline> openFilesystemPipeline(
-    VcDataset* ds, size_t maxBytes, const std::filesystem::path& datasetPath);
+    VcDataset* ds, size_t maxBytes, const std::filesystem::path& datasetPath,
+    BlockCache* sharedCache = nullptr);
 
 }  // namespace vc::cache

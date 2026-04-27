@@ -2,6 +2,7 @@ import os
 import cv2
 import zarr
 import json
+import warnings
 import glob
 import torch
 import random
@@ -1027,16 +1028,12 @@ def load_datasets(config, shard_idx=None, total_shards=None):
     for dataset in config['datasets']:
         volume_path = dataset['volume_path']
         if config.get("use_volume_store_cache", False):
-            # TODO: how does this interact with multiple dataloader workers? cache is created before fork, hence presumably not shared?
-            if "://" in volume_path or "::" in volume_path:
-                store = zarr.storage.FSStore(volume_path, mode='r')
-            else:
-                store = zarr.storage.DirectoryStore(volume_path)
-            cache_gb = float(config.get("cache_max_gb", config.get("volume_cache_gb", 12)))
-            store = zarr.storage.LRUStoreCache(store, max_size=int(cache_gb * 1024**3))
-            ome_zarr = zarr.open_group(store, mode='r')
-        else:
-            ome_zarr = zarr.open(volume_path, mode='r')
+            warnings.warn(
+                "use_volume_store_cache is no longer supported with zarr 3 "
+                "(LRUStoreCache was removed). Ignoring the option.",
+                stacklevel=2,
+            )
+        ome_zarr = zarr.open(volume_path, mode='r')
 
         volume_scale = dataset['volume_scale']
         volume = ome_zarr[str(volume_scale)]

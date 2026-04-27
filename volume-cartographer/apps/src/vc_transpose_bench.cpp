@@ -55,7 +55,7 @@ void insertChunkAsBlocks(BlockCache& cache, int level, int baseBz, int baseBy, i
     // pattern the baseline insertChunkAsBlocks uses, so this bench
     // measures the baseline variant apples-to-apples.
     uint8_t tmp[kBlockBytes];
-    BlockCache::BatchPut batch(cache);
+    BlockCache::BatchPut batch(cache, cache.generation());
     for (int bi = 0; bi < bzN; ++bi) {
       for (int bj = 0; bj < byN; ++bj) {
         for (int bk = 0; bk < bxN; ++bk) {
