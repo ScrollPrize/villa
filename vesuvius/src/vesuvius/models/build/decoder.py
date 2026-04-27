@@ -32,7 +32,10 @@ class PixelShuffle3d(nn.Module):
 
     def __init__(self, in_channels, out_channels, stride, bias=True):
         super().__init__()
-        r = int(stride[0])  # assume isotropic stride
+        if not all(int(s) == int(stride[0]) for s in stride):
+            raise ValueError(
+                f"PixelShuffle3d requires isotropic stride, got {list(stride)}")
+        r = int(stride[0])
         self.r = r
         self.conv = nn.Conv3d(in_channels, out_channels * r * r * r, kernel_size=1, bias=bias)
 
