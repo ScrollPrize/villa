@@ -1565,11 +1565,16 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             grow_down = grow_right = grow_up = grow_left = true;
         }
     }
-    std::vector<cv::Vec2i> neighs;
-    if (grow_down) neighs.push_back({1,0});
-    if (grow_right) neighs.push_back({0,1});
-    if (grow_up) neighs.push_back({-1,0});
-    if (grow_left) neighs.push_back({0,-1});
+    const std::vector<cv::Vec2i> neighs = {
+        { 1,  0},
+        { 1,  1},
+        { 0,  1},
+        {-1,  1},
+        {-1,  0},
+        {-1, -1},
+        { 0, -1},
+        { 1, -1},
+    };
     std::cout << "growth directions:"
               << " down=" << grow_down
               << " right=" << grow_right
