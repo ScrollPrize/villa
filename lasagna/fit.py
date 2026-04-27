@@ -103,6 +103,7 @@ def _parse_corr_points(obj: dict, device: torch.device) -> fit_data.CorrPoints3D
 	rows: list[list[float]] = []
 	cids: list[int] = []
 	pids: list[int] = []
+	abs_flags: list[bool] = []
 	for _cid, col in cols.items():
 		if not isinstance(col, dict):
 			print(f"[fit] _parse_corr_points: col {_cid} is not a dict", flush=True)
@@ -110,11 +111,7 @@ def _parse_corr_points(obj: dict, device: torch.device) -> fit_data.CorrPoints3D
 		md = col.get("metadata", {})
 		if not isinstance(md, dict):
 			md = {}
-		if bool(md.get("winding_is_absolute", True)):
-			n_pts = len(col.get("points", {})) if isinstance(col.get("points"), dict) else 0
-			print(f"[fit] _parse_corr_points: skipping collection {_cid} "
-				  f"(winding_is_absolute={md.get('winding_is_absolute')}, {n_pts} points)", flush=True)
-			continue
+		is_abs = bool(md.get("winding_is_absolute", True))
 		pts = col.get("points", {})
 		if not isinstance(pts, dict):
 			continue
@@ -122,6 +119,7 @@ def _parse_corr_points(obj: dict, device: torch.device) -> fit_data.CorrPoints3D
 			cid_i = int(_cid)
 		except Exception:
 			cid_i = -1
+		n_pts = 0
 		for _pid, pd in pts.items():
 			if not isinstance(pd, dict):
 				continue
@@ -139,16 +137,22 @@ def _parse_corr_points(obj: dict, device: torch.device) -> fit_data.CorrPoints3D
 			rows.append([float(pv[0]), float(pv[1]), float(pv[2]), float(wa)])
 			cids.append(cid_i)
 			pids.append(pid_i)
+			abs_flags.append(is_abs)
+			n_pts += 1
+		print(f"[fit] _parse_corr_points: col {_cid}: {n_pts} points, "
+			  f"absolute={is_abs}", flush=True)
 	if not rows:
 		print(f"[fit] _parse_corr_points: no valid points found after parsing", flush=True)
 		return None
 	pts_t = torch.tensor(rows, dtype=torch.float32, device=device)
 	col_t = torch.tensor(cids, dtype=torch.int64, device=device)
 	pid_t = torch.tensor(pids, dtype=torch.int64, device=device)
+	abs_t = torch.tensor(abs_flags, dtype=torch.bool, device=device)
+	n_abs = int(abs_t.sum().item())
 	print(f"[fit] loaded {pts_t.shape[0]} corr_points from config "
-		  f"({len(set(cids))} collections)")
+		  f"({len(set(cids))} collections, {n_abs} absolute, {len(rows) - n_abs} relative)")
 	return fit_data.CorrPoints3D(points_xyz_winda=pts_t, collection_idx=col_t,
-								 point_ids=pid_t)
+								 point_ids=pid_t, is_absolute=abs_t)
 
 
 def _build_parser() -> argparse.ArgumentParser:

@@ -33,6 +33,8 @@ _wind_anchors_valid: torch.Tensor | None = None   # (K, 4) bool — per-anchor v
 _wind_initialized: bool = False
 _wind_target_per_point: torch.Tensor | None = None  # (K,) float — cached target winding
 _wind_obs_per_point: torch.Tensor | None = None      # (K,) float — last raw winding observation
+_wind_reinit_counter: int = 0
+_wind_prev_any_valid: torch.Tensor | None = None     # (K,) bool — per-point "had valid anchor last step"
 
 
 def corr_winding_loss(
@@ -356,7 +358,7 @@ def print_detail(label: str = "") -> None:
 		print(f"  collection {cid}: avg_winding={avg}")
 
 	# Per-point table
-	print(f"  {'pid':>6s}  {'col':>4s}  {'pos':>26s}  {'w_obs':>8s}  {'w_tgt':>8s}  {'w_err':>8s}  {'valid':>5s}", end="")
+	print(f"  {'pid':>6s}  {'col':>4s}  {'pos':>26s}  {'w_obs':>8s}  {'w_tgt':>8s}  {'w_err':>8s}  {'valid':>5s}  {'abs':>3s}", end="")
 	# Anchor columns (winding mode only)
 	has_anchors = _wind_anchors_d is not None
 	if has_anchors:
@@ -379,9 +381,10 @@ def print_detail(label: str = "") -> None:
 		w_tgt = p.get("winding_target")
 		w_err = p.get("winding_err")
 		valid = p.get("valid", False)
+		is_abs = p.get("absolute", False)
 		print(f"  {pid:>6s}  {p.get('collection_id', '?'):>4}  {pos_s}  "
 			  f"{_fmt(w_obs):>8s}  {_fmt(w_tgt):>8s}  {_fmt(w_err):>8s}  "
-			  f"{'  yes' if valid else '   no':>5s}", end="")
+			  f"{'  yes' if valid else '   no':>5s}  {'  Y' if is_abs else '  N':>3s}", end="")
 		if has_anchors:
 			idx = pid_to_idx.get(int(pid))
 			if idx is not None and idx < _wind_anchors_d.shape[0]:
@@ -964,16 +967,25 @@ def _wind_collection_average(
 	winda: torch.Tensor,          # (K,)
 	col: torch.Tensor,            # (K,) int
 	obs_valid: torch.Tensor,      # (K,) bool — which points have reliable winding
+	is_absolute: torch.Tensor,    # (K,) bool — absolute points bypass averaging
 ) -> torch.Tensor:
-	"""Collection-coupled target winding per point. Returns (K,) float, NaN for invalid."""
+	"""Collection-coupled target winding per point. Returns (K,) float, NaN for invalid.
+
+	Absolute points: target = winda directly (no averaging).
+	Relative points: observe, subtract winda, average within collection, add winda back.
+	"""
 	K = winding_obs.shape[0]
 	dev = winding_obs.device
 	dt = winding_obs.dtype
 	target = torch.full((K,), float("nan"), device=dev, dtype=dt)
 
+	# Absolute points: target is the specified winding directly
+	target[is_absolute] = winda[is_absolute]
+
+	# Relative points: collection-coupled +/- winda averaging
 	uc = torch.unique(col)
 	for cid in uc.tolist():
-		m = (col == int(cid)) & obs_valid
+		m = (col == int(cid)) & obs_valid & ~is_absolute
 		if not m.any():
 			continue
 		obs_m = winding_obs[m]
@@ -993,8 +1005,8 @@ def _wind_collection_average(
 		else:
 			target[m] = avg_pos + wa_m
 
-		# Set target for all points in collection (including those excluded from avg)
-		m_all = (col == int(cid)) & ~obs_valid
+		# Set target for relative points in collection excluded from avg
+		m_all = (col == int(cid)) & ~obs_valid & ~is_absolute
 		if m_all.any():
 			if use_neg:
 				target[m_all] = avg_neg - winda[m_all]
@@ -1009,6 +1021,7 @@ def _wind_brute_force_init(
 	gt_n: torch.Tensor,           # (K, 3)
 	winda: torch.Tensor,          # (K,)
 	col: torch.Tensor,            # (K,) int
+	is_absolute: torch.Tensor,    # (K,) bool
 	xyz_det: torch.Tensor,        # (D, Hm, Wm, 3)
 	normals: torch.Tensor,        # (D, Hm, Wm, 3) — model surface normals
 	data: fit_data.FitData3D,
@@ -1197,7 +1210,7 @@ def _wind_brute_force_init(
 		obs_valid[single] = valid_single
 
 	# --- Collection averaging ---
-	target = _wind_collection_average(winding_obs, winda, col, obs_valid)
+	target = _wind_collection_average(winding_obs, winda, col, obs_valid, is_absolute)
 
 	# --- Avg pair anchors from target winding ---
 	target_finite = torch.isfinite(target)
@@ -1345,7 +1358,7 @@ def _corr_winding_loss(
 	global _dbg_call_count, _last_results
 	global _wind_anchors_d, _wind_anchors_h, _wind_anchors_w
 	global _wind_anchors_valid, _wind_initialized, _wind_target_per_point
-	global _wind_obs_per_point
+	global _wind_obs_per_point, _wind_reinit_counter, _wind_prev_any_valid
 
 	_dbg_call_count += 1
 	dbg = (_dbg_call_count <= 2)
@@ -1363,6 +1376,7 @@ def _corr_winding_loss(
 	pts = pts_c.points_xyz_winda.to(device=dev, dtype=dt)
 	col = pts_c.collection_idx.to(device=dev, dtype=torch.int64)
 	pt_ids = pts_c.point_ids.to(device=dev, dtype=torch.int64)
+	is_absolute = pts_c.is_absolute.to(device=dev)
 	K = int(pts.shape[0])
 	P = pts[:, :3]
 	winda = pts[:, 3]
@@ -1394,8 +1408,10 @@ def _corr_winding_loss(
 				_wind_anchors_d, _wind_anchors_h, _wind_anchors_w,
 				_wind_anchors_valid, _wind_target_per_point, _wind_obs_per_point,
 			) = _wind_brute_force_init(
-				P, gt_n, winda, col, xyz_det, res.normals, res.data, strip_samples, Qh, Qw)
+				P, gt_n, winda, col, is_absolute, xyz_det, res.normals, res.data, strip_samples, Qh, Qw)
 		_wind_initialized = True
+		_wind_reinit_counter = 0
+		_wind_prev_any_valid = None
 	else:
 		# Phase A: Winding observation (closest pair, detached)
 		with torch.no_grad():
@@ -1460,7 +1476,7 @@ def _corr_winding_loss(
 			# Phase B: Collection averaging
 			_wind_obs_per_point = winding_obs.clone()
 			_wind_target_per_point = _wind_collection_average(
-				winding_obs, winda, col, obs_valid)
+				winding_obs, winda, col, obs_valid, is_absolute)
 
 			# Phase C: Update anchors
 			_wind_anchors_h, _wind_anchors_w, _wind_anchors_valid = _wind_update_anchors(
@@ -1468,6 +1484,43 @@ def _corr_winding_loss(
 				_wind_anchors_d, _wind_anchors_h, _wind_anchors_w,
 				_wind_anchors_valid, _wind_target_per_point,
 				Qh, Qw)
+
+			# Phase C.5: Re-init points that lost all valid anchors
+			any_valid = _wind_anchors_valid.any(dim=1)  # (K,)
+			just_lost = (_wind_prev_any_valid & ~any_valid) if _wind_prev_any_valid is not None else ~any_valid
+			persistent_lost = ~any_valid & ~just_lost
+			_wind_reinit_counter += 1
+			needs_reinit = just_lost | (persistent_lost & (_wind_reinit_counter % 100 == 0))
+			_wind_prev_any_valid = any_valid.clone()
+
+			if needs_reinit.any():
+				ri = needs_reinit.nonzero(as_tuple=True)[0]
+				n_ri = int(ri.shape[0])
+				# Save old brackets before re-init
+				old_d0 = _wind_anchors_d[ri, 0].tolist()
+				old_d1 = _wind_anchors_d[ri, 1].tolist()
+				old_v0 = _wind_anchors_valid[ri, 0].tolist()
+				old_v1 = _wind_anchors_valid[ri, 1].tolist()
+				(rd, rh, rw, rv, rt, ro) = _wind_brute_force_init(
+					P[ri], gt_n[ri], winda[ri], col[ri], is_absolute[ri],
+					xyz_det, res.normals, res.data, strip_samples, Qh, Qw)
+				_wind_anchors_d[ri] = rd
+				_wind_anchors_h[ri] = rh
+				_wind_anchors_w[ri] = rw
+				_wind_anchors_valid[ri] = rv
+				_wind_target_per_point[ri] = rt
+				_wind_obs_per_point[ri] = ro
+				# Log old → new brackets
+				new_d0 = rd[:, 0].tolist()
+				new_d1 = rd[:, 1].tolist()
+				new_v0 = rv[:, 0].tolist()
+				new_v1 = rv[:, 1].tolist()
+				print(f"[corr-wind] re-init {n_ri} points (just_lost={int(just_lost.sum())}, "
+					  f"persistent={int(persistent_lost.sum())}, step={_wind_reinit_counter})")
+				for j in range(n_ri):
+					old_b = f"{old_d0[j]}-{old_d1[j]}" if old_v0[j] and old_v1[j] else "---"
+					new_b = f"{new_d0[j]}-{new_d1[j]}" if new_v0[j] and new_v1[j] else "---"
+					print(f"  pt {int(ri[j])}: bracket {old_b} -> {new_b}")
 
 	# === Phase D: Proxy correction loss (avg pair, WITH gradients) ===
 	target = _wind_target_per_point
@@ -1567,7 +1620,7 @@ def _corr_winding_loss(
 	_last_results = _build_winding_results(
 		winding_obs=_wind_obs_per_point, target=target,
 		err=all_err, pt_ids=pt_ids, col=col, pts=pts, winda=winda,
-		valid=point_valid,
+		valid=point_valid, is_absolute=is_absolute,
 	)
 	if _dbg_call_count == 1:
 		print_detail("INIT")
@@ -1581,6 +1634,7 @@ def _build_winding_results(
 	*, winding_obs: torch.Tensor, target: torch.Tensor,
 	err: torch.Tensor, pt_ids: torch.Tensor, col: torch.Tensor,
 	pts: torch.Tensor, winda: torch.Tensor, valid: torch.Tensor,
+	is_absolute: torch.Tensor,
 ) -> dict:
 	"""Build JSON-serializable dict of per-point winding results."""
 	result: dict = {"points": {}, "collection_avgs": {}}
@@ -1598,6 +1652,7 @@ def _build_winding_results(
 			"winding_target": round(w_tgt, 6) if w_tgt is not None else None,
 			"winding_err": round(e, 6) if e is not None else None,
 			"valid": bool(valid[i]),
+			"absolute": bool(is_absolute[i]),
 		}
 		result["points"][str(pid)] = entry
 	# Per-collection averages
@@ -1643,9 +1698,16 @@ def _corr_snap_to_surface_loss(
 			print("[corr-snap2s] no correction points")
 		return dummy_ret
 
-	pts = pts_c.points_xyz_winda.to(device=dev, dtype=dt)
-	col = pts_c.collection_idx.to(device=dev, dtype=torch.int64)
-	pt_ids = pts_c.point_ids.to(device=dev, dtype=torch.int64)
+	# Filter to absolute-only points
+	abs_mask = pts_c.is_absolute.to(device=dev)
+	if not abs_mask.any():
+		if dbg:
+			print("[corr-snap2s] no absolute points")
+		return dummy_ret
+
+	pts = pts_c.points_xyz_winda[abs_mask].to(device=dev, dtype=dt)
+	col = pts_c.collection_idx[abs_mask].to(device=dev, dtype=torch.int64)
+	pt_ids = pts_c.point_ids[abs_mask].to(device=dev, dtype=torch.int64)
 	K = int(pts.shape[0])
 	P = pts[:, :3]
 
@@ -1654,7 +1716,8 @@ def _corr_snap_to_surface_loss(
 	Qh, Qw = Hm - 1, Wm - 1
 
 	if D != 1:
-		print(f"[corr-snap2s] ERROR: corr_snap requires D=1, got D={D}")
+		if dbg:
+			print(f"[corr-snap2s] D={D} != 1, corr_snap only for single-winding models")
 		return dummy_ret
 	if Qh <= 0 or Qw <= 0:
 		return dummy_ret

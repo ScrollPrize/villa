@@ -12,7 +12,7 @@ import zarr
 from lasagna_volume import LasagnaVolume
 
 # --- Chunk sampling statistics ---
-CHUNK_STATS_ENABLED = True
+CHUNK_STATS_ENABLED = False
 _CHUNK_SIZE = 32
 
 
@@ -194,6 +194,7 @@ class CorrPoints3D:
 	points_xyz_winda: torch.Tensor  # (K, 4) — x, y, z, winda in fullres (winda = depth index from d.tif)
 	collection_idx: torch.Tensor    # (K,) — integer collection ID per point
 	point_ids: torch.Tensor         # (K,) — integer point ID per point
+	is_absolute: torch.Tensor       # (K,) bool — True if winding is absolute (not relative/averaged)
 
 
 @dataclass(frozen=True)
