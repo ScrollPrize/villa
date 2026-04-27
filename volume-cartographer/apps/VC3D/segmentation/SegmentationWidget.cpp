@@ -434,9 +434,12 @@ QString SegmentationWidget::lasagnaConfigText() const { return _lasagnaPanel->la
 int SegmentationWidget::lasagnaMode() const { return static_cast<int>(_lasagnaPanel->lasagnaMode()); }
 int SegmentationWidget::newModelWidth() const { return _lasagnaPanel->newModelWidth(); }
 int SegmentationWidget::newModelHeight() const { return _lasagnaPanel->newModelHeight(); }
-int SegmentationWidget::newModelDepth() const { return _lasagnaPanel->newModelDepth(); }
+int SegmentationWidget::newModelWindings() const { return _lasagnaPanel->newModelWindings(); }
 QString SegmentationWidget::seedPointText() const { return _lasagnaPanel->seedPointText(); }
 QString SegmentationWidget::newModelOutputName() const { return _lasagnaPanel->newModelOutputName(); }
+double SegmentationWidget::offsetValue() const { return _lasagnaPanel->offsetValue(); }
+int SegmentationWidget::windowSize() const { return _lasagnaPanel->windowSize(); }
+int SegmentationWidget::windowOverlap() const { return _lasagnaPanel->windowOverlap(); }
 
 void SegmentationWidget::setLasagnaDataInputPath(const QString& path) { _lasagnaPanel->setLasagnaDataInputPath(path); }
 void SegmentationWidget::setSeedFromFocus(int x, int y, int z) { _lasagnaPanel->setSeedFromFocus(x, y, z); }

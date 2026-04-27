@@ -135,8 +135,14 @@ bool VolumePkg::isValidVolumeDirectory(const std::filesystem::path& dirpath) con
         return false;
     }
 
-    if (!std::filesystem::exists(dirpath / "meta.json") &&
-        !std::filesystem::exists(dirpath / "metadata.json")) {
+    // Accept meta.json, metadata.json, or zarr group markers (.zgroup/.zattrs).
+    // Volume::Volume() auto-generates metadata from zarr shapes when no
+    // meta.json exists, so we just need evidence this is a zarr volume.
+    bool hasMetadata = std::filesystem::exists(dirpath / "meta.json") ||
+                       std::filesystem::exists(dirpath / "metadata.json") ||
+                       std::filesystem::exists(dirpath / ".zgroup") ||
+                       std::filesystem::exists(dirpath / ".zattrs");
+    if (!hasMetadata) {
         return false;
     }
 

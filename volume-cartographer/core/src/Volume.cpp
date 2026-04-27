@@ -7,7 +7,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
-#include <thread>
+#include <unordered_map>
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -16,6 +16,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/cache/BlockCache.hpp"
 #include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/cache/VolumeSource.hpp"
 #include "vc/core/cache/VcDecompressor.hpp"
@@ -111,9 +112,34 @@ void Volume::zarrOpen()
     if (!metadata_.contains("format") || metadata_["format"].get_string() != "zarr")
         return;
 
-    zarrDs_ = vc::openZarrLevels(path_);
+    {
+        auto compactDs = vc::openZarrLevels(path_);
+
+        // Reindex so zarrDs_[i] corresponds to actual scale level i.
+        // openZarrLevels() returns a compact vector; directory names give the
+        // true level number. Power-of-2 scaling is assumed but not every level
+        // needs to be present (e.g. only levels 1,2,3 or 0,2).
+        int maxLevel = 0;
+        for (auto& ds : compactDs) {
+            try {
+                int lvl = std::stoi(ds->path().filename().string());
+                maxLevel = std::max(maxLevel, lvl);
+            } catch (...) {
+                fprintf(stderr, "[Volume] skipping non-numeric zarr level '%s'\n",
+                        ds->path().filename().string().c_str());
+            }
+        }
+        zarrDs_.resize(maxLevel + 1);
+        for (auto& ds : compactDs) {
+            try {
+                int lvl = std::stoi(ds->path().filename().string());
+                zarrDs_[lvl] = std::move(ds);
+            } catch (...) {}
+        }
+    }
 
     for (size_t i = 0; i < zarrDs_.size(); i++) {
+        if (!zarrDs_[i]) continue;  // missing level
         auto dtype = zarrDs_[i]->getDtype();
         if (dtype != vc::VcDtype::uint8 && dtype != vc::VcDtype::uint16)
             throw std::runtime_error("only uint8 & uint16 is currently supported for zarr datasets, incompatible type found in " + path_.string());
@@ -147,10 +173,6 @@ void Volume::zarrOpen()
             const int expectedHeight = ceilDivPow2(baseHeight, levelInt);
             const int expectedWidth = ceilDivPow2(baseWidth, levelInt);
 
-            // Canonical format pads each level's shape to a multiple of the
-            // inner chunk size (128³), independently per level. Accept any
-            // zarr_shape that exceeds expected by less than one chunk —
-            // anything larger indicates real corruption.
             constexpr int kMaxPerLevelPad = 128;
             auto padOK = [](long long actual, long long expected) {
                 return actual >= expected && actual - expected < kMaxPerLevelPad;
@@ -165,10 +187,6 @@ void Volume::zarrOpen()
                     + ", height=" + std::to_string(baseHeight) + ", width=" + std::to_string(baseWidth)
                     + ") in " + path_.string());
             }
-        }
-
-        if (!hasReference) {
-            throw std::runtime_error("no physical zarr dataset directories found in " + path_.string());
         }
 
         _slices = baseSlices;
@@ -195,8 +213,6 @@ void Volume::zarrOpen()
             const int expectedHeight = ceilDivPow2(_height, static_cast<int>(level));
             const int expectedWidth = ceilDivPow2(_width, static_cast<int>(level));
 
-            // Same tolerance as the auto-generated path: canonical caches pad
-            // each level independently to the next 128-boundary.
             constexpr int kMaxPerLevelPad = 128;
             auto padOK = [](long long actual, long long expected) {
                 return actual >= expected && actual - expected < kMaxPerLevelPad;
@@ -212,10 +228,8 @@ void Volume::zarrOpen()
                     + ") in " + path_.string());
             }
         }
-
-        if (!hasAnyPhysicalScale) {
+        if (!hasAnyPhysicalScale)
             throw std::runtime_error("no physical zarr dataset directories found in " + path_.string());
-        }
     }
 }
 
@@ -238,6 +252,11 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
         auth = vc::cache::loadAwsCredentials();
         if (auth.region.empty())
             auth.region = resolved.awsRegion;
+        // SigV4 is implicitly enabled when access_key is non-empty.
+        // If credentials are missing, clear them so the request proceeds
+        // unsigned (anonymous access for public buckets).
+        if (auth.access_key.empty() || auth.secret_key.empty())
+            auth = {};  // anonymous — no SigV4
     } else if (resolved.useAwsSigv4 && auth.region.empty()) {
         auth.region = resolved.awsRegion;
     }
@@ -283,10 +302,19 @@ vc::VcDataset *Volume::zarrDataset(int level) const {
     if (level < 0 || zarrDs_.empty())
         return nullptr;
 
-    if (static_cast<size_t>(level) >= zarrDs_.size())
-        return nullptr;
+    if (static_cast<size_t>(level) < zarrDs_.size()) {
+        auto* ds = zarrDs_[static_cast<size_t>(level)].get();
+        if (ds) return ds;
+    }
 
-    return zarrDs_[static_cast<size_t>(level)].get();
+    // Requested level is missing (padded gap). When called with
+    // default level=0, callers just want "any dataset" as a validity
+    // check — return the first non-null entry.
+    if (level == 0) {
+        for (auto& d : zarrDs_)
+            if (d) return d.get();
+    }
+    return nullptr;
 }
 
 size_t Volume::numScales() const noexcept {
@@ -298,13 +326,17 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
     if (zarrDs_.empty()) return nullptr;
     std::vector<std::unique_ptr<utils::ZarrArray>> diskLevels;
 
-    // Build level metadata from our zarr datasets
-    std::vector<vc::cache::FileSystemSource::LevelMeta> levels;
-    levels.reserve(zarrDs_.size());
-    for (auto& ds : zarrDs_) {
+    // Build level metadata from our zarr datasets. The vector is padded so
+    // index = actual scale level; missing levels have default (zero) shapes.
+    std::vector<vc::cache::FileSystemSource::LevelMeta> levels(zarrDs_.size());
+    std::string delimiter;
+    for (size_t i = 0; i < zarrDs_.size(); ++i) {
+        if (!zarrDs_[i]) continue;  // missing level — leave default {0,0,0}
+        auto& ds = zarrDs_[i];
+        auto& lm = levels[i];
         const auto& shape = ds->shape();
         const auto& chunks = ds->defaultChunkShape();
-        vc::cache::FileSystemSource::LevelMeta lm;
+        lm.dirName = ds->path().filename().string();
         lm.shape = {
             static_cast<int>(shape[0]),
             static_cast<int>(shape[1]),
@@ -313,11 +345,9 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
             static_cast<int>(chunks[0]),
             static_cast<int>(chunks[1]),
             static_cast<int>(chunks[2])};
-        levels.push_back(lm);
+        if (delimiter.empty())
+            delimiter = ds->delimiter();
     }
-
-    // Get delimiter from VcDataset
-    std::string delimiter = zarrDs_[0]->delimiter();
 
     // Create chunk source: HTTP for remote volumes, filesystem for local
     std::unique_ptr<vc::cache::VolumeSource> source;
@@ -462,11 +492,24 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
         fprintf(stderr, "[Volume] IO threads: %d\n", config.ioThreads);
     }
 
-    return std::make_unique<vc::cache::BlockPipeline>(
+    std::unique_ptr<vc::cache::BlockCache> ownedCache;
+    vc::cache::BlockCache* bc = sharedBlockCache_;
+    if (!bc) {
+        vc::cache::BlockCache::Config bcfg;
+        bcfg.bytes = cacheBudgetHot_;
+        for (auto& f : bcfg.levelFloor) f = 4096;
+        ownedCache = std::make_unique<vc::cache::BlockCache>(bcfg);
+        bc = ownedCache.get();
+    }
+
+    auto pipeline = std::make_unique<vc::cache::BlockPipeline>(
         std::move(config),
+        *bc,
         std::move(source),
         std::move(decompress),
         std::move(diskLevels));
+    pipeline->ownBlockCache(std::move(ownedCache));
+    return pipeline;
 }
 
 // ============================================================================
@@ -475,10 +518,15 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
 
 void Volume::ensureTieredCache() const
 {
-    std::call_once(cacheOnce_, [this]() {
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    if (!tieredCache_) {
+        fprintf(stderr, "[Volume] %p ensureTieredCache: creating pipeline (budget=%zu)\n",
+                (void*)this, cacheBudgetHot_);
         auto* self = const_cast<Volume*>(this);
         tieredCache_ = self->createTieredCache();
-    });
+        fprintf(stderr, "[Volume] %p ensureTieredCache: pipeline=%p created\n",
+                (void*)this, (void*)tieredCache_.get());
+    }
 }
 
 vc::cache::BlockPipeline* Volume::tieredCache()
@@ -487,10 +535,25 @@ vc::cache::BlockPipeline* Volume::tieredCache()
     return tieredCache_.get();
 }
 
+void Volume::resetTieredCache()
+{
+    fprintf(stderr, "[Volume] %p resetTieredCache: destroying pipeline=%p\n",
+            (void*)this, (void*)tieredCache_.get());
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    tieredCache_.reset();
+    fprintf(stderr, "[Volume] %p resetTieredCache: done\n", (void*)this);
+}
+
 void Volume::setCacheBudget(size_t hotBytes)
 {
     cacheBudgetHot_ = hotBytes;
 }
+
+void Volume::setBlockCache(vc::cache::BlockCache* bc)
+{
+    sharedBlockCache_ = bc;
+}
+
 
 void Volume::setIOThreads(int count)
 {

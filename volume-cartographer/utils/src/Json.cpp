@@ -125,7 +125,7 @@ Json& Json::operator[](const std::string& key) {
     auto& child = cache.back();
     child.impl_ = std::make_unique<Impl>(&(impl_->j()[key]), false);
     // Trim cache if it grows too large (shouldn't happen in practice)
-    while (cache.size() > 64) cache.pop_front();
+    while (cache.size() > 4096) cache.pop_front();
     return child;
 }
 
@@ -136,7 +136,7 @@ const Json& Json::operator[](const std::string& key) const {
     // const_cast is safe: the const version only exposes const& of the child
     child.impl_ = std::make_unique<Impl>(
         const_cast<njson*>(&(impl_->j().at(key))), false);
-    while (cache.size() > 64) cache.pop_front();
+    while (cache.size() > 4096) cache.pop_front();
     return child;
 }
 
@@ -145,7 +145,7 @@ Json& Json::at(const std::string& key) {
     cache.emplace_back();
     auto& child = cache.back();
     child.impl_ = std::make_unique<Impl>(&(impl_->j().at(key)), false);
-    while (cache.size() > 64) cache.pop_front();
+    while (cache.size() > 4096) cache.pop_front();
     return child;
 }
 
@@ -155,7 +155,7 @@ const Json& Json::at(const std::string& key) const {
     auto& child = cache.back();
     child.impl_ = std::make_unique<Impl>(
         const_cast<njson*>(&(impl_->j().at(key))), false);
-    while (cache.size() > 64) cache.pop_front();
+    while (cache.size() > 4096) cache.pop_front();
     return child;
 }
 
@@ -165,7 +165,7 @@ Json& Json::operator[](size_t index) {
     cache.emplace_back();
     auto& child = cache.back();
     child.impl_ = std::make_unique<Impl>(&(impl_->j()[index]), false);
-    while (cache.size() > 64) cache.pop_front();
+    while (cache.size() > 4096) cache.pop_front();
     return child;
 }
 
@@ -175,7 +175,7 @@ const Json& Json::operator[](size_t index) const {
     auto& child = cache.back();
     child.impl_ = std::make_unique<Impl>(
         const_cast<njson*>(&(impl_->j().at(index))), false);
-    while (cache.size() > 64) cache.pop_front();
+    while (cache.size() > 4096) cache.pop_front();
     return child;
 }
 
@@ -184,7 +184,7 @@ Json& Json::at(size_t index) {
     cache.emplace_back();
     auto& child = cache.back();
     child.impl_ = std::make_unique<Impl>(&(impl_->j().at(index)), false);
-    while (cache.size() > 64) cache.pop_front();
+    while (cache.size() > 4096) cache.pop_front();
     return child;
 }
 
@@ -194,7 +194,7 @@ const Json& Json::at(size_t index) const {
     auto& child = cache.back();
     child.impl_ = std::make_unique<Impl>(
         const_cast<njson*>(&(impl_->j().at(index))), false);
-    while (cache.size() > 64) cache.pop_front();
+    while (cache.size() > 4096) cache.pop_front();
     return child;
 }
 

@@ -1,7 +1,7 @@
 #include "vc/core/render/AdaptiveCamera.hpp"
 #include <algorithm>
 
-void AdaptiveCamera::recalcPyramidLevel(int numScales) noexcept
+void AdaptiveCamera::recalcPyramidLevel(int numScales, const float* scaleFactors) noexcept
 {
     if (numScales <= 0) {
         dsScaleIdx = 0;
@@ -9,19 +9,27 @@ void AdaptiveCamera::recalcPyramidLevel(int numScales) noexcept
         return;
     }
 
-    const float minScale = std::pow(2.0f, -static_cast<float>(numScales));
-
-    if (scale < minScale) {
-        dsScaleIdx = numScales - 1;
+    if (scaleFactors) {
+        // Pick the finest level whose scale factor <= 1/scale (i.e. the level
+        // that can provide at least one data voxel per screen pixel).
+        // scale=0.125 → need sf<=8 → pick level with sf=8.
+        // scale=0.03  → need sf<=33 → pick level with sf=32.
+        float needed = 1.0f / std::max(scale, 1e-6f);
+        dsScaleIdx = 0;
+        for (int i = 0; i < numScales; i++) {
+            if (scaleFactors[i] <= needed + 0.001f)
+                dsScaleIdx = i;
+            else
+                break;
+        }
     } else {
-        // Interpolate DOWN: always use the finer (higher-res) pyramid level.
-        // ceil(-log2(scale)) gives the coarser level; subtract 1 for finer.
-        // e.g. scale 0.75 → ceil(0.415) = 1, minus 1 = 0 → native
-        // e.g. scale 0.3  → ceil(1.737) = 2, minus 1 = 1 → 2x downsample
-        // e.g. scale 2.0  → ceil(-1.0)  = -1, minus 1 = -2 → clamped to 0
-        // Epsilon prevents float rounding near exact powers of 2.
-        float rawLevel = -std::log2(std::max(scale, 1e-6f));
-        dsScaleIdx = std::max(0, static_cast<int>(std::ceil(rawLevel - 0.001f)) - 1);
+        const float minScale = std::pow(2.0f, -static_cast<float>(numScales));
+        if (scale < minScale) {
+            dsScaleIdx = numScales - 1;
+        } else {
+            float rawLevel = -std::log2(std::max(scale, 1e-6f));
+            dsScaleIdx = std::max(0, static_cast<int>(std::ceil(rawLevel - 0.001f)) - 1);
+        }
     }
 
     dsScaleIdx = std::clamp(dsScaleIdx, 0, numScales - 1);
@@ -31,17 +39,19 @@ void AdaptiveCamera::recalcPyramidLevel(int numScales) noexcept
         dsScaleIdx = std::min(dsScaleIdx, numScales - 1);
     }
 
-    // Integer dsScaleIdx up to the pyramid depth. 24 entries covers any
-    // realistic volume (2^24 = 16M × native voxel).
-    static constexpr float kInvPow2[24] = {
-        1.0f,        1.0f/2,      1.0f/4,       1.0f/8,
-        1.0f/16,     1.0f/32,     1.0f/64,      1.0f/128,
-        1.0f/256,    1.0f/512,    1.0f/1024,    1.0f/2048,
-        1.0f/4096,   1.0f/8192,   1.0f/16384,   1.0f/32768,
-        1.0f/65536,  1.0f/131072, 1.0f/262144,  1.0f/524288,
-        1.0f/1048576,1.0f/2097152,1.0f/4194304, 1.0f/8388608,
-    };
-    dsScale = kInvPow2[std::clamp(dsScaleIdx, 0, 23)];
+    if (scaleFactors && dsScaleIdx >= 0 && dsScaleIdx < numScales) {
+        dsScale = 1.0f / scaleFactors[dsScaleIdx];
+    } else {
+        static constexpr float kInvPow2[24] = {
+            1.0f,        1.0f/2,      1.0f/4,       1.0f/8,
+            1.0f/16,     1.0f/32,     1.0f/64,      1.0f/128,
+            1.0f/256,    1.0f/512,    1.0f/1024,    1.0f/2048,
+            1.0f/4096,   1.0f/8192,   1.0f/16384,   1.0f/32768,
+            1.0f/65536,  1.0f/131072, 1.0f/262144,  1.0f/524288,
+            1.0f/1048576,1.0f/2097152,1.0f/4194304, 1.0f/8388608,
+        };
+        dsScale = kInvPow2[std::clamp(dsScaleIdx, 0, 23)];
+    }
 }
 
 // Predefined zoom stops where TILE_PX/scale is a "nice" number, eliminating

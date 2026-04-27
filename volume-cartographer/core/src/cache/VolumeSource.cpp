@@ -77,6 +77,7 @@ void FileSystemSource::discoverLevels()
         try {
             auto meta = utils::ZarrArray::open(levelPath).metadata();
             LevelMeta lm{};
+            lm.dirName = std::to_string(lvl);
             // Finest granularity: inner chunks for sharded v3, chunks otherwise.
             const auto& cs = meta.shard_config ? meta.shard_config->sub_chunks
                                                : meta.chunks;
@@ -111,7 +112,10 @@ void FileSystemSource::discoverLevels()
 
 std::filesystem::path FileSystemSource::chunkPath(const ChunkKey& key) const
 {
-    return root_ / std::to_string(key.level) / chunkFilename(key, delimiter_);
+    const auto& dir = (key.level >= 0 && key.level < int(levels_.size()) && !levels_[key.level].dirName.empty())
+        ? levels_[key.level].dirName
+        : std::to_string(key.level);
+    return root_ / dir / chunkFilename(key, delimiter_);
 }
 
 std::vector<uint8_t> FileSystemSource::fetch(const ChunkKey& key)
@@ -164,11 +168,14 @@ void HttpSource::setShardConfig(const ShardConfig& config)
 
 std::string HttpSource::chunkUrl(const ChunkKey& key) const
 {
+    const auto& dir = (key.level >= 0 && key.level < int(levels_.size()) && !levels_[key.level].dirName.empty())
+        ? levels_[key.level].dirName
+        : std::to_string(key.level);
     std::string url;
     url.reserve(baseUrl_.size() + 32);
     url += baseUrl_;
     url += '/';
-    url += std::to_string(key.level);
+    url += dir;
     url += '/';
     url += std::to_string(key.iz);
     url += delimiter_;
@@ -183,11 +190,14 @@ std::string HttpSource::shardUrl(const ChunkKey& key) const
     int sz = key.iz / chunksPerShard_[0];
     int sy = key.iy / chunksPerShard_[1];
     int sx = key.ix / chunksPerShard_[2];
+    const auto& dir = (key.level >= 0 && key.level < int(levels_.size()) && !levels_[key.level].dirName.empty())
+        ? levels_[key.level].dirName
+        : std::to_string(key.level);
     std::string url;
     url.reserve(baseUrl_.size() + 32);
     url += baseUrl_;
     url += '/';
-    url += std::to_string(key.level);
+    url += dir;
     url += "/c/";
     url += std::to_string(sz);
     url += '/';
@@ -231,7 +241,7 @@ std::vector<uint8_t> HttpSource::httpGet(const std::string& url)
         // 404 is an expected "chunk doesn't exist" response — stay quiet.
         // Anything else (403/401/5xx) almost always means auth or network
         // trouble; log loudly so it doesn't look like an empty volume.
-        if (resp.status_code != 404) {
+        if (resp.status_code != 404 && resp.status_code != 0) {
             transientError_.store(true, std::memory_order_relaxed);
             static std::atomic<int> errCount{0};
             int n = errCount.fetch_add(1);

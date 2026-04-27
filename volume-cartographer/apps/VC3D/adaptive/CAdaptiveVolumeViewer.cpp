@@ -199,6 +199,10 @@ Surface* CAdaptiveVolumeViewer::currentSurface() const
 
 void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
 {
+    fprintf(stderr, "[Viewer:%s] OnVolumeChanged: old=%p new=%p _surfWeak=%p axisAligned=%d\n",
+            _surfName.c_str(), (void*)_volume.get(), (void*)vol.get(),
+            (void*)_surfWeak.lock().get(), isAxisAlignedView() ? 1 : 0);
+
     if (_chunkCbId != 0 && _volume && _volume->tieredCache()) {
         _volume->tieredCache()->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
@@ -251,9 +255,14 @@ void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
         _surfWeak = _defaultSurface;
     }
 
+    fprintf(stderr, "[Viewer:%s] OnVolumeChanged: after surface setup: _surfWeak=%p _volume=%p\n",
+            _surfName.c_str(), (void*)_surfWeak.lock().get(), (void*)_volume.get());
+
     if (_volume) {
         int nScales = static_cast<int>(_volume->numScales());
-        _camera.recalcPyramidLevel(nScales);
+        std::vector<float> sfs(nScales);
+        for (int i = 0; i < nScales; i++) sfs[i] = static_cast<float>(size_t{1} << i);
+        _camera.recalcPyramidLevel(nScales, sfs.data());
         double vs = _volume->voxelSize() / static_cast<double>(_camera.dsScale);
         _view->setVoxelSize(vs, vs);
     }
@@ -548,10 +557,12 @@ void CAdaptiveVolumeViewer::submitRender()
     QThreadPool::globalInstance()->start([this, ctx = std::move(ctx)]() {
         try {
             renderIntoFramebuffer(_framebufferWork, ctx);
+        } catch (const std::exception& ex) {
+            fprintf(stderr, "[Viewer:%s] RENDER EXCEPTION: %s\n",
+                    _surfName.c_str(), ex.what());
         } catch (...) {
-            // Swallow render errors here; finishRenderOnMainThread still
-            // fires so the busy flag gets cleared and we don't deadlock
-            // the render timer.
+            fprintf(stderr, "[Viewer:%s] RENDER EXCEPTION (unknown)\n",
+                    _surfName.c_str());
         }
         QMetaObject::invokeMethod(this,
             "finishRenderOnMainThread", Qt::QueuedConnection);
@@ -1069,13 +1080,6 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
 
 void CAdaptiveVolumeViewer::finishRenderOnMainThread()
 {
-    // Guard against a mid-render resize: onResized() may have
-    // reallocated _framebuffer to a new viewport size while the worker
-    // was still writing to the work buffer at the old size. Swapping
-    // unconditionally would clobber the correctly-sized _framebuffer
-    // with a stale-sized image and leave the view drawing from the
-    // wrong size every frame after. Drop the stale render on the floor
-    // instead and re-schedule.
     const bool sizesMatch = (_framebuffer.size() == _framebufferWork.size());
     if (sizesMatch) {
         std::swap(_framebuffer, _framebufferWork);
@@ -1213,7 +1217,10 @@ void CAdaptiveVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 
     if (_volume) {
         float oldDs = _camera.dsScale;
-        _camera.recalcPyramidLevel(static_cast<int>(_volume->numScales()));
+        int ns = static_cast<int>(_volume->numScales());
+        std::vector<float> sfs(ns);
+        for (int i = 0; i < ns; i++) sfs[i] = static_cast<float>(size_t{1} << i);
+        _camera.recalcPyramidLevel(ns, sfs.data());
         if (std::abs(_camera.dsScale - oldDs) > 1e-6f) {
             double vs = _volume->voxelSize() / static_cast<double>(_camera.dsScale);
             _view->setVoxelSize(vs, vs);
@@ -1464,7 +1471,7 @@ cv::Vec3f CAdaptiveVolumeViewer::sceneToVolume(const QPointF& scenePoint) const
     auto surf = _surfWeak.lock();
     if (!surf) return {0, 0, 0};
     cv::Vec2f sp = sceneToSurface(scenePoint);
-    cv::Vec3f surfLoc = {sp[0], sp[1], 0};
+    cv::Vec3f surfLoc = {sp[0], sp[1], _camera.zOff};
     cv::Vec3f ptr(0, 0, 0);
     return surf->coord(ptr, surfLoc);
 }
@@ -2102,7 +2109,7 @@ bool CAdaptiveVolumeViewer::sceneToVolumePN(cv::Vec3f& p, cv::Vec3f& n,
         return false;
     }
     cv::Vec2f sp = sceneToSurface(scenePos);
-    cv::Vec3f surfLoc = {sp[0], sp[1], 0};
+    cv::Vec3f surfLoc = {sp[0], sp[1], _camera.zOff};
     cv::Vec3f ptr(0, 0, 0);
     n = surf->normal(ptr, surfLoc);
     p = surf->coord(ptr, surfLoc);
@@ -2270,8 +2277,12 @@ void CAdaptiveVolumeViewer::fitSurfaceInView()
 {
     _camera.surfacePtr = cv::Vec3f(0, 0, 0);
     _camera.scale = 0.5f;
-    if (_volume)
-        _camera.recalcPyramidLevel(static_cast<int>(_volume->numScales()));
+    if (_volume) {
+        int ns = static_cast<int>(_volume->numScales());
+        std::vector<float> sfs(ns);
+        for (int i = 0; i < ns; i++) sfs[i] = static_cast<float>(size_t{1} << i);
+        _camera.recalcPyramidLevel(ns, sfs.data());
+    }
     scheduleRender();
 }
 

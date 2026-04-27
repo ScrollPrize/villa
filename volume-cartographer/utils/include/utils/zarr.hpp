@@ -703,16 +703,28 @@ inline std::vector<std::byte> read_file_bytes(const std::filesystem::path& p) {
 }
 
 inline void write_file(const std::filesystem::path& p, std::string_view data) {
-    std::ofstream f(p, std::ios::binary | std::ios::trunc);
-    if (!f) throw std::runtime_error("zarr: cannot write file: " + p.string());
-    f.write(data.data(), static_cast<std::streamsize>(data.size()));
+    auto tmp = p;
+    tmp += ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) throw std::runtime_error("zarr: cannot write file: " + p.string());
+        f.write(data.data(), static_cast<std::streamsize>(data.size()));
+    }
+    std::filesystem::rename(tmp, p);
 }
 
 inline void write_file_bytes(const std::filesystem::path& p, std::span<const std::byte> data) {
-    std::ofstream f(p, std::ios::binary | std::ios::trunc);
-    if (!f) throw std::runtime_error("zarr: cannot write file: " + p.string());
-    f.write(reinterpret_cast<const char*>(data.data()),
-            static_cast<std::streamsize>(data.size()));
+    // Atomic write: write to .tmp, then rename. Prevents corrupt files
+    // if the process is interrupted (e.g. curl abort during shutdown).
+    auto tmp = p;
+    tmp += ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) throw std::runtime_error("zarr: cannot write file: " + tmp.string());
+        f.write(reinterpret_cast<const char*>(data.data()),
+                static_cast<std::streamsize>(data.size()));
+    }
+    std::filesystem::rename(tmp, p);
 }
 
 // ----- Endian helpers -----

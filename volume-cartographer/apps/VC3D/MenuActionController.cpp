@@ -681,23 +681,29 @@ bool MenuActionController::tryResolveRemoteAuth(const QString& url,
     }
 
     if (!allowPrompt) {
-        if (errorMessage) {
-            *errorMessage = QObject::tr("Missing AWS credentials for %1").arg(url);
-        }
-        return false;
+        // No credentials available and can't prompt — proceed with anonymous
+        // access (unsigned HTTPS). Works for public S3 buckets.
+        *authOut = {};  // anonymous — no SigV4
+        return true;
     }
 
     bool credOk = false;
     QString accessKey = QInputDialog::getText(
         _window,
         QObject::tr("AWS Credentials"),
-        QObject::tr("AWS_ACCESS_KEY_ID:"),
+        QObject::tr("AWS_ACCESS_KEY_ID (leave empty for anonymous/public access):"),
         QLineEdit::Normal, QString(), &credOk);
-    if (!credOk || accessKey.trimmed().isEmpty()) {
+    if (!credOk) {
         if (errorMessage) {
             *errorMessage = QObject::tr("AWS credential entry canceled.");
         }
         return false;
+    }
+
+    // Empty access key → anonymous access (public buckets)
+    if (accessKey.trimmed().isEmpty()) {
+        *authOut = {};  // anonymous — no SigV4
+        return true;
     }
 
     QString secretKey = QInputDialog::getText(

@@ -1,0 +1,2049 @@
+"""TifxyzLasagnaDataset — PyTorch Dataset for lasagna 3D UNet training from tifxyz surfaces.
+
+Produces training patches where:
+- CT volume crops are read from zarr (CPU)
+- Surface masks and direction channels are voxelized from tifxyz grids (CPU)
+- EDT, chain ordering, cos/grad_mag/validity derivation happens on GPU in the train step
+
+Uses helpers from vesuvius neural tracing for patch finding, surface extraction,
+and voxelization.
+"""
+from __future__ import annotations
+
+import warnings
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch.utils.data import Dataset
+
+import vesuvius.tifxyz as tifxyz
+from vesuvius.neural_tracing.datasets.patch_finding import find_world_chunk_patches
+from vesuvius.neural_tracing.datasets.common import (
+    ChunkPatch,
+    OfflineCacheMiss,
+    open_zarr,
+    open_zarr_group,
+    _compute_wrap_order_stats,
+    _extract_wrap_ids,
+    _parse_z_range,
+    _read_volume_crop,
+    _read_volume_crop_from_patch,
+    _segment_overlaps_z_range,
+    _trim_to_world_bbox,
+    _triplet_wraps_compatible,
+    _upsample_world_triplet,
+    voxelize_surface_grid_masked,
+)
+
+try:
+    from numba import njit
+except Exception:
+    njit = None
+
+
+TAG = "[tifxyz_lasagna_dataset]"
+
+
+# ---------------------------------------------------------------------------
+# Cross-volume affine transform helpers
+# ---------------------------------------------------------------------------
+
+def _parse_transform(dataset: dict) -> np.ndarray | None:
+    """Parse inline 3×4 affine from dataset config, optionally inverting.
+
+    Returns (3, 4) float64 ndarray in XYZ order (matching transform.json
+    convention), or None if no transform is specified.
+    """
+    raw = dataset.get("transform")
+    if raw is None:
+        return None
+    m = np.array(raw, dtype=np.float64)
+    if m.shape != (3, 4):
+        raise ValueError(f"transform must be (3,4), got {m.shape}")
+    if dataset.get("transform_invert", False):
+        m4 = np.eye(4, dtype=np.float64)
+        m4[:3, :] = m
+        m4 = np.linalg.inv(m4)
+        m = m4[:3, :]
+    return m
+
+
+def _build_cache_to_volume_zyx(
+    transform_xyz: np.ndarray,
+    cache_scale: int,
+    volume_scale: int,
+) -> np.ndarray:
+    """Build a combined 3×4 affine: cache-scale ZYX → volume reading-level ZYX.
+
+    Steps (in XYZ):
+      1. scale up by 2^cache_scale  (cache coords → source level-0)
+      2. apply transform_xyz        (source level-0 → target level-0)
+      3. scale down by 2^volume_scale (target level-0 → reading level)
+
+    Then convert from XYZ to ZYX convention for internal use.
+    """
+    up = float(2 ** cache_scale)
+    down = 1.0 / float(2 ** volume_scale)
+
+    # Compose in 4×4 XYZ space
+    m4 = np.eye(4, dtype=np.float64)
+    m4[:3, :] = transform_xyz
+    # Pre-multiply by scale-up (acts on input): multiply columns 0-2 by up
+    m4[:3, :3] *= up
+    m4[:3, 3] *= 1.0  # translation is already at level-0
+    # Post-multiply by scale-down (acts on output): multiply rows 0-2 by down
+    m4[:3, :] *= down
+
+    # Convert XYZ→ZYX: swap rows 0↔2, swap columns 0↔2
+    # Row swap: output is (z, y, x) instead of (x, y, z)
+    m4_zyx = m4.copy()
+    m4_zyx[0, :], m4_zyx[2, :] = m4[2, :].copy(), m4[0, :].copy()
+    # Column swap: input is (z, y, x) instead of (x, y, z)
+    m4_zyx[:, 0], m4_zyx[:, 2] = m4_zyx[:, 2].copy(), m4_zyx[:, 0].copy()
+
+    return m4_zyx[:3, :].astype(np.float64)
+
+
+def _apply_affine_zyx(affine_3x4: np.ndarray, zyx: np.ndarray) -> np.ndarray:
+    """Apply a 3×4 affine (ZYX convention) to an array of ZYX points.
+
+    Parameters
+    ----------
+    affine_3x4 : (3, 4) array
+    zyx : (..., 3) array
+
+    Returns
+    -------
+    (..., 3) array — transformed points
+    """
+    shape = zyx.shape
+    pts = zyx.reshape(-1, 3).astype(np.float64)
+    ones = np.ones((pts.shape[0], 1), dtype=np.float64)
+    homo = np.hstack([pts, ones])  # (N, 4)
+    out = (affine_3x4 @ homo.T).T  # (N, 3)
+    return out.astype(np.float32).reshape(shape)
+
+
+# ---------------------------------------------------------------------------
+# Multi-channel trilinear splatting
+# ---------------------------------------------------------------------------
+
+if njit is not None:
+    @njit(cache=True)
+    def _splat_multichannel_trilinear_numba(
+        points, values, size_z, size_y, size_x, n_channels,
+    ):
+        """Splat (N, n_channels) values at (N, 3) ZYX positions into a volume.
+
+        Returns (n_channels, size_z, size_y, size_x) float32, weight-
+        normalized so each voxel holds the trilinear-weighted mean of
+        the contributing point values.
+        """
+        vox = np.zeros((n_channels, size_z, size_y, size_x), dtype=np.float32)
+        weights = np.zeros((size_z, size_y, size_x), dtype=np.float32)
+        n_points = points.shape[0]
+        for i in range(n_points):
+            pz = points[i, 0]
+            py = points[i, 1]
+            px = points[i, 2]
+            if not (np.isfinite(pz) and np.isfinite(py) and np.isfinite(px)):
+                continue
+
+            z0 = int(np.floor(pz))
+            y0 = int(np.floor(py))
+            x0 = int(np.floor(px))
+            dz = pz - z0
+            dy = py - y0
+            dx = px - x0
+
+            for oz in range(2):
+                zi = z0 + oz
+                if zi < 0 or zi >= size_z:
+                    continue
+                wz = (1.0 - dz) if oz == 0 else dz
+                if wz <= 0.0:
+                    continue
+                for oy in range(2):
+                    yi = y0 + oy
+                    if yi < 0 or yi >= size_y:
+                        continue
+                    wy = (1.0 - dy) if oy == 0 else dy
+                    if wy <= 0.0:
+                        continue
+                    for ox in range(2):
+                        xi = x0 + ox
+                        if xi < 0 or xi >= size_x:
+                            continue
+                        wx = (1.0 - dx) if ox == 0 else dx
+                        if wx <= 0.0:
+                            continue
+                        w = wz * wy * wx
+                        weights[zi, yi, xi] += w
+                        for c in range(n_channels):
+                            vox[c, zi, yi, xi] += w * values[i, c]
+
+        # Normalize by accumulated weight
+        for zi in range(size_z):
+            for yi in range(size_y):
+                for xi in range(size_x):
+                    if weights[zi, yi, xi] > 0:
+                        for c in range(n_channels):
+                            vox[c, zi, yi, xi] /= weights[zi, yi, xi]
+        return vox
+else:
+    _splat_multichannel_trilinear_numba = None
+
+
+def _splat_multichannel(points_zyx, values, crop_size):
+    """Splat multi-channel values at 3D positions into a volume.
+
+    Linear weighted average of contributions per voxel. The sign-
+    ambiguity of raw normals is handled by the caller splatting
+    second-moment tensor components ``n·nᵀ`` instead of raw normals —
+    ``nnᵀ = (−n)(−n)ᵀ`` so linear averaging is already sign-
+    invariant and there's no cancellation.
+
+    Args:
+        points_zyx: (N, 3) float32 — local ZYX positions
+        values: (N, C) float32 — channel values per point
+        crop_size: (Z, Y, X) int tuple
+
+    Returns:
+        (C, Z, Y, X) float32 — splatted volume
+        (Z, Y, X) float32 — weight accumulator (>0 where splatted)
+    """
+    crop_size = tuple(int(v) for v in crop_size)
+    N = points_zyx.shape[0]
+    C = values.shape[1]
+
+    if N == 0:
+        return (
+            np.zeros((C,) + crop_size, dtype=np.float32),
+            np.zeros(crop_size, dtype=np.float32),
+        )
+
+    # Filter non-finite points
+    finite = np.isfinite(points_zyx).all(axis=1) & np.isfinite(values).all(axis=1)
+    points_zyx = np.ascontiguousarray(points_zyx[finite], dtype=np.float32)
+    values = np.ascontiguousarray(values[finite], dtype=np.float32)
+
+    if points_zyx.shape[0] == 0:
+        return (
+            np.zeros((C,) + crop_size, dtype=np.float32),
+            np.zeros(crop_size, dtype=np.float32),
+        )
+
+    if _splat_multichannel_trilinear_numba is not None:
+        vox = _splat_multichannel_trilinear_numba(
+            points_zyx, values,
+            crop_size[0], crop_size[1], crop_size[2], C,
+        )
+        # Recompute weight for the mask (any non-zero channel)
+        weight = np.zeros(crop_size, dtype=np.float32)
+        weight[np.any(np.abs(vox) > 0, axis=0)] = 1.0
+        return vox, weight
+
+    # Fallback: numpy (slower but functional)
+    vox = np.zeros((C,) + crop_size, dtype=np.float32)
+    weights = np.zeros(crop_size, dtype=np.float32)
+    base = np.floor(points_zyx).astype(np.int64)
+    frac = points_zyx - base.astype(np.float32)
+
+    for oz in (0, 1):
+        z_idx = base[:, 0] + oz
+        wz = (1.0 - frac[:, 0]) if oz == 0 else frac[:, 0]
+        for oy in (0, 1):
+            y_idx = base[:, 1] + oy
+            wy = (1.0 - frac[:, 1]) if oy == 0 else frac[:, 1]
+            for ox in (0, 1):
+                x_idx = base[:, 2] + ox
+                wx = (1.0 - frac[:, 2]) if ox == 0 else frac[:, 2]
+                w = wz * wy * wx
+                valid = (
+                    (w > 0)
+                    & (z_idx >= 0) & (z_idx < crop_size[0])
+                    & (y_idx >= 0) & (y_idx < crop_size[1])
+                    & (x_idx >= 0) & (x_idx < crop_size[2])
+                )
+                if np.any(valid):
+                    zi = z_idx[valid]
+                    yi = y_idx[valid]
+                    xi = x_idx[valid]
+                    wv = w[valid].astype(np.float32)
+                    np.add.at(weights, (zi, yi, xi), wv)
+                    for c in range(C):
+                        np.add.at(vox[c], (zi, yi, xi), wv * values[valid, c])
+
+    # Normalize
+    nonzero = weights > 0
+    for c in range(C):
+        vox[c][nonzero] /= weights[nonzero]
+    return vox, (weights > 0).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Direction channel encoding (numpy, for CPU splatting)
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Surface normal estimation from grid
+# ---------------------------------------------------------------------------
+
+def _estimate_grid_normals(zyx_grid):
+    """Estimate surface normals from a (H, W, 3) ZYX grid via cross product of tangent vectors."""
+    tangent_r = np.zeros_like(zyx_grid)
+    tangent_r[:-1] = zyx_grid[1:] - zyx_grid[:-1]
+    tangent_r[-1] = tangent_r[-2]
+    tangent_c = np.zeros_like(zyx_grid)
+    tangent_c[:, :-1] = zyx_grid[:, 1:] - zyx_grid[:, :-1]
+    tangent_c[:, -1] = tangent_c[:, -2]
+    normals = np.cross(tangent_r, tangent_c)
+    norm = np.linalg.norm(normals, axis=-1, keepdims=True) + 1e-6
+    return normals / norm
+
+
+def _tensor_moments_from_normals_zyx(normals_zyx: np.ndarray) -> np.ndarray:
+    """Convert ``(N, 3)`` raw ZYX normals to ``(N, 6)`` second-moment
+    tensor components ``(nx², ny², nz², nx·ny, nx·nz, ny·nz)``.
+
+    This is the sign-invariant representation of an unsigned
+    direction: ``n·nᵀ`` and ``(−n)·(−n)ᵀ`` are identical, so
+    linear averaging of these 6 components is the correct operation
+    for splat accumulation and for chain-adjacent blending.
+    Encoding via :func:`tifxyz_labels.encode_from_tensor` then
+    produces the same 6-channel direction targets as encoding each
+    normal individually — without ever needing a mean-direction
+    vector that could land on a slerp encoding singularity.
+    """
+    normals_zyx = np.asarray(normals_zyx, dtype=np.float32)
+    nz = normals_zyx[..., 0]
+    ny = normals_zyx[..., 1]
+    nx = normals_zyx[..., 2]
+    return np.stack(
+        [nx * nx, ny * ny, nz * nz, nx * ny, nx * nz, ny * nz],
+        axis=-1,
+    ).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
+# Chain building (ports dataset_rowcol_cond._build_triplet_neighbor_lookup)
+# ---------------------------------------------------------------------------
+
+def build_patch_chains(patch, max_wraps: int) -> dict:
+    """Group a patch's wraps into ordered chains.
+
+    For each wrap in patch.wraps[:max_wraps], computes a 2D median position,
+    sorts wraps along the dominant-spread axis, and links each wrap to its
+    nearest compatible neighbor on each side. "Compatible" is same segment
+    or consecutive ``w<N>`` filename winding ids (per neural_tracing's
+    ``_triplet_wraps_compatible``). Chains are formed by walking reciprocal
+    next-links.
+
+    Returns ``{wrap_idx: {"chain": int, "pos": int, "has_prev": bool,
+    "has_next": bool, "label": str}}``.
+    """
+    wraps = patch.wraps[:max_wraps]
+    wrap_stats = []
+    for wrap_idx, wrap in enumerate(wraps):
+        s = _compute_wrap_order_stats(wrap)
+        if s is None:
+            continue
+        seg = wrap.get("segment")
+        seg_path = getattr(seg, "path", None)
+        from pathlib import Path as _P
+        seg_name = _P(seg_path).name if seg_path is not None else ""
+        wrap_ids = _extract_wrap_ids(seg_name)
+        if not wrap_ids:
+            wrap_ids = _extract_wrap_ids(getattr(seg, "uuid", ""))
+        wrap_stats.append({
+            "wrap_idx": wrap_idx,
+            "segment_idx": int(wrap["segment_idx"]),
+            "wrap_ids": wrap_ids,
+            "x_median": s["x_median"],
+            "y_median": s["y_median"],
+        })
+
+    result: dict = {}
+    if not wrap_stats:
+        return result
+
+    if len(wrap_stats) == 1:
+        wi = wrap_stats[0]["wrap_idx"]
+        result[wi] = {
+            "chain": 0, "pos": 0,
+            "has_prev": False, "has_next": False,
+            "label": "a0",
+        }
+        return result
+
+    xs = np.array([s["x_median"] for s in wrap_stats], dtype=np.float32)
+    ys = np.array([s["y_median"] for s in wrap_stats], dtype=np.float32)
+    order_axis = "x" if (xs.max() - xs.min()) >= (ys.max() - ys.min()) else "y"
+    if order_axis == "x":
+        ordered = sorted(wrap_stats, key=lambda s: (s["x_median"], s["wrap_idx"]))
+    else:
+        ordered = sorted(wrap_stats, key=lambda s: (s["y_median"], s["wrap_idx"]))
+
+    prev_of: dict = {}
+    next_of: dict = {}
+    for pos, target in enumerate(ordered):
+        for lp in range(pos - 1, -1, -1):
+            if _triplet_wraps_compatible(target, ordered[lp]):
+                prev_of[target["wrap_idx"]] = ordered[lp]["wrap_idx"]
+                break
+        for rp in range(pos + 1, len(ordered)):
+            if _triplet_wraps_compatible(target, ordered[rp]):
+                next_of[target["wrap_idx"]] = ordered[rp]["wrap_idx"]
+                break
+
+    chains: list = []
+    visited: set = set()
+    for s in ordered:
+        wi = s["wrap_idx"]
+        if wi in visited:
+            continue
+        p = prev_of.get(wi)
+        if p is not None and next_of.get(p) == wi:
+            continue
+        chain = []
+        cur = wi
+        while cur is not None and cur not in visited:
+            chain.append(cur)
+            visited.add(cur)
+            nxt = next_of.get(cur)
+            if nxt is not None and prev_of.get(nxt) == cur:
+                cur = nxt
+            else:
+                cur = None
+        chains.append(chain)
+    for s in ordered:
+        wi = s["wrap_idx"]
+        if wi in visited:
+            continue
+        chains.append([wi])
+        visited.add(wi)
+
+    for ci, chain in enumerate(chains):
+        letter = chr(ord("a") + ci) if ci < 26 else f"z{ci - 25}"
+        for pos, wi in enumerate(chain):
+            result[wi] = {
+                "chain": ci,
+                "pos": pos,
+                "has_prev": pos > 0,
+                "has_next": pos < len(chain) - 1,
+                "label": f"{letter}{pos}",
+            }
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Patch finding (world-chunk method)
+# ---------------------------------------------------------------------------
+
+def _find_patches_world_chunks(config, patch_size_zyx):
+    """Find training patches using the world-chunk tiling method.
+
+    Follows the pattern from dataset_rowcol_cond.py, using find_world_chunk_patches
+    from the neural tracing pipeline.
+    """
+    # Defaults from dataset_defaults.py:50-62
+    overlap_fraction = float(config.get("overlap_fraction", 0.0))
+    min_span_ratio = float(config.get("min_span_ratio", 1.0))
+    edge_touch_frac = float(config.get("edge_touch_frac", 0.1))
+    edge_touch_min_count_base = int(config.get("edge_touch_min_count", 10))
+    edge_touch_pad = int(config.get("edge_touch_pad", 0))
+    min_points_per_wrap_base = int(config.get("min_points_per_wrap", 100))
+    scale_normalize = bool(config.get("scale_normalize_patch_counts", True))
+    ref_scale = int(config.get("patch_count_reference_scale", 0))
+    bbox_pad_2d = int(config.get("bbox_pad_2d", 0))
+    require_all_valid = bool(config.get("require_all_valid_in_bbox", True))
+    skip_invalid = bool(config.get("skip_chunk_if_any_invalid", False))
+    inner_bbox_fraction = float(config.get("inner_bbox_fraction", 0.7))
+    force_recompute = bool(config.get("force_recompute_patches", False))
+    chunk_pad = float(config.get("chunk_pad", 0.0))
+    verbose = bool(config.get("verbose", False))
+
+    target_size = tuple(int(v) for v in patch_size_zyx)
+
+    patches = []
+    volume_groups = {}  # {dataset_idx: zarr.Group} for multi-scale CT reads
+    for dataset_idx, dataset in enumerate(config["datasets"]):
+        volume_path = dataset.get("volume_path")
+        if volume_path is None:
+            continue
+
+        # Derive a short human-readable dataset name for logging/vis.
+        _ds_name = ""
+        _seg_p = dataset.get("segments_path")
+        if _seg_p:
+            _ds_name = Path(_seg_p).parent.name
+        if not _ds_name and volume_path:
+            _ds_name = Path(str(volume_path).rstrip("/")).name
+        if not _ds_name:
+            _ds_name = f"dataset{dataset_idx}"
+
+        volume_scale = int(dataset["volume_scale"])
+        cache_scale = int(dataset.get("cache_scale", volume_scale))
+        segments_path = dataset.get("segments_path")
+        if not segments_path:
+            continue
+
+        # Cross-volume affine transform (optional).
+        _transform_xyz = _parse_transform(dataset)
+        _cache_to_vol = None
+        if _transform_xyz is not None:
+            _cache_to_vol = _build_cache_to_volume_zyx(
+                _transform_xyz, cache_scale, volume_scale,
+            )
+            print(
+                f"{TAG} dataset_idx={dataset_idx} cross-volume transform: "
+                f"cache_scale={cache_scale} volume_scale={volume_scale}",
+                flush=True,
+            )
+
+        # Open zarr volume (handles local, S3, HTTPS with caching)
+        volume_auth_json = dataset.get(
+            "volume_auth_json", config.get("volume_auth_json")
+        )
+        volume = open_zarr(
+            volume_path, scale=volume_scale,
+            auth_json_path=volume_auth_json, config=config,
+        )
+
+        # For scale augmentation or refinement mode: open the zarr Group
+        # so we can access alternate pyramid levels per-sample.
+        _vol_group = None
+        _need_group = (
+            float(config.get("scale_aug_prob", 0.0)) > 0
+            or bool(config.get("refine_mode", False))
+            or int(config.get("scale_offset", 0)) != 0
+        )
+        if _need_group:
+            try:
+                _vol_group = open_zarr_group(
+                    volume_path,
+                    auth_json_path=volume_auth_json, config=config,
+                )
+                volume_groups[dataset_idx] = _vol_group
+            except Exception as e:
+                warnings.warn(
+                    f"Could not open zarr group for scale aug/refine "
+                    f"(dataset_idx={dataset_idx}): {e}; "
+                    f"multi-level access disabled for this dataset."
+                )
+
+        # Load and retarget segments.  Use cache_scale for retargeting so
+        # that the patch cache is shared with entries that use the same
+        # segments_path at the same cache_scale.  z_range is in cache_scale
+        # coordinates (same convention as original datasets).
+        retarget_factor = 2 ** cache_scale
+        z_range = _parse_z_range(dataset.get("z_range"))
+        dataset_segments = list(tifxyz.load_folder(segments_path))
+        scaled_segments = []
+        dropped_by_z_range = 0
+        for seg in dataset_segments:
+            seg_scaled = seg.retarget(retarget_factor)
+            if not _segment_overlaps_z_range(seg_scaled, z_range):
+                dropped_by_z_range += 1
+                continue
+            seg_scaled.volume = volume
+            scaled_segments.append(seg_scaled)
+
+        if not scaled_segments:
+            warnings.warn(
+                f"No segments remain after z_range filtering for dataset_idx={dataset_idx} "
+                f"(segments_path={segments_path}, z_range={z_range}); skipping."
+            )
+            continue
+
+        # Scale-normalize patch counts (dataset_rowcol_cond.py:297-309)
+        if scale_normalize:
+            count_scale = float(2 ** (cache_scale - ref_scale))
+            count_scale_sq = count_scale * count_scale
+        else:
+            count_scale_sq = 1.0
+
+        min_points_per_wrap = max(
+            1, int(round(min_points_per_wrap_base * count_scale_sq))
+        )
+        edge_touch_min_count = max(
+            1, int(round(edge_touch_min_count_base * count_scale_sq))
+        )
+
+        # Find world-chunk patches
+        cache_dir = Path(segments_path) / ".patch_cache"
+        chunk_results = find_world_chunk_patches(
+            segments=scaled_segments,
+            target_size=target_size,
+            overlap_fraction=overlap_fraction,
+            min_span_ratio=min_span_ratio,
+            edge_touch_frac=edge_touch_frac,
+            edge_touch_min_count=edge_touch_min_count,
+            edge_touch_pad=edge_touch_pad,
+            min_points_per_wrap=min_points_per_wrap,
+            bbox_pad_2d=bbox_pad_2d,
+            require_all_valid_in_bbox=require_all_valid,
+            skip_chunk_if_any_invalid=skip_invalid,
+            inner_bbox_fraction=inner_bbox_fraction,
+            cache_dir=cache_dir,
+            force_recompute=force_recompute,
+            verbose=verbose,
+            chunk_pad=chunk_pad,
+        )
+
+        # Convert chunk dicts to ChunkPatch objects (dataset_rowcol_cond.py:332-349)
+        for _local_i, chunk in enumerate(chunk_results):
+            wraps_in_chunk = []
+            for w in chunk["wraps"]:
+                seg_idx = w["segment_idx"]
+                wraps_in_chunk.append({
+                    "segment": scaled_segments[seg_idx],
+                    "bbox_2d": tuple(w["bbox_2d"]),
+                    "wrap_id": w["wrap_id"],
+                    "segment_idx": seg_idx,
+                })
+
+            patches.append(ChunkPatch(
+                chunk_id=tuple(chunk["chunk_id"]),
+                volume=volume,
+                scale=volume_scale,
+                world_bbox=tuple(chunk["bbox_3d"]),
+                wraps=wraps_in_chunk,
+                segments=scaled_segments,
+                dataset_idx=dataset_idx,
+                dataset_name=_ds_name,
+                dataset_local_idx=_local_i,
+                volume_group=_vol_group,
+                cache_to_volume=_cache_to_vol,
+            ))
+
+    return patches, volume_groups
+
+
+# ---------------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------------
+
+class TifxyzLasagnaDataset(Dataset):
+    """Dataset that derives lasagna training channels from tifxyz surfaces.
+
+    Each __getitem__ returns:
+        - vol_crop: (1, Z, Y, X) float32 — CT crop in [0, 1] (uint8/255)
+        - surface_masks: (N, Z, Y, X) float32 — per-surface binary voxelization
+        - raw_normals: (3, Z, Y, X) float32 — splatted raw ZYX normals. The
+          double-angle direction encoding is derived downstream, in
+          `tifxyz_labels.derive_cos_gradmag_validity`, AFTER chain-adjacent
+          slerp-blending — so this raw representation is the single source
+          of truth.
+        - normals_valid: (1, Z, Y, X) float32 — where normals were splatted
+        - num_surfaces: int
+        - padding_mask: (1, Z, Y, X) float32 — where CT data exists
+
+    GPU label derivation (EDT, chain, cos/grad_mag, direction encoding)
+    happens in the train step via tifxyz_labels.compute_patch_labels().
+    """
+
+    def __init__(
+        self,
+        config: dict,
+        apply_augmentation: bool = True,
+        include_geometry: bool = False,
+        include_patch_ref: bool = False,
+        refine_mode: bool = False,
+        scale_offset: int = 0,
+    ):
+        # Normalize patch_size to 3-element ZYX array (CT read size).
+        patch_size_zyx = np.asarray(config["patch_size"], dtype=np.int32).reshape(-1)
+        if patch_size_zyx.size == 1:
+            patch_size_zyx = np.repeat(patch_size_zyx, 3)
+        self.patch_size_zyx = patch_size_zyx
+
+        # Label patch size (GT region). Defaults to patch_size for
+        # backward compat. When smaller than patch_size, the GT region
+        # is placed at a (train-time) random offset inside the larger
+        # CT crop so the model sees varying context around varying
+        # supervision positions. Patch tiling still uses label size so
+        # wrap-caching / dataset layout are unchanged.
+        label_cfg = config.get("label_patch_size", patch_size_zyx)
+        label_patch_size_zyx = np.asarray(label_cfg, dtype=np.int32).reshape(-1)
+        if label_patch_size_zyx.size == 1:
+            label_patch_size_zyx = np.repeat(label_patch_size_zyx, 3)
+        if np.any(label_patch_size_zyx > patch_size_zyx):
+            raise ValueError(
+                f"label_patch_size {label_patch_size_zyx.tolist()} must be "
+                f"<= patch_size {patch_size_zyx.tolist()} per-dim"
+            )
+        self.label_patch_size_zyx = label_patch_size_zyx
+        self.apply_augmentation = bool(apply_augmentation)
+        self.random_paste_offset = bool(
+            config.get("random_paste_offset",
+                        np.any(label_patch_size_zyx < patch_size_zyx))
+        )
+
+        self.max_surfaces_per_patch = int(config.get("max_surfaces_per_patch", 8))
+        self.scale_aug_prob = float(config.get("scale_aug_prob", 0.0))
+        self.scale_aug_factor = int(config.get("scale_aug_factor", 2))
+        # Per-instance flag: when True, every sample uses scale aug.
+        # The train loop creates two dataset instances (one with this
+        # True, one False) and picks per-batch.
+        self.scale_aug_active = False
+        # Emits per-surface raw geometry (``surface_geometry``) in the
+        # __getitem__ output when True. Used by lasagna3d dataset vis to
+        # draw normal arrows and per-wrap labels from the exact tensors
+        # training consumes. Keep False for training (no visible work cost
+        # beyond allocating a tiny list of views).
+        self.include_geometry = bool(include_geometry)
+        # When True, attach the raw ChunkPatch object to each sample so
+        # downstream code (e.g. lasagna3d dataset vis) can re-read fresh
+        # CT crops at different sizes for inference.
+        self.include_patch_ref = bool(include_patch_ref)
+        # Multi-scale refinement mode: also voxelize surfaces at 2×
+        # resolution for a random subregion, returned as _fine keys.
+        self.refine_mode = bool(refine_mode)
+        # Scale offset: -1 (coarser, 2× world), 0 (base), +1 (finer, 0.5× world)
+        self.scale_offset = int(scale_offset)
+        config["scale_offset"] = self.scale_offset
+
+        # Augmentation
+        if apply_augmentation:
+            from vesuvius.models.augmentation.pipelines.training_transforms import create_training_transforms
+            self.augmentations = create_training_transforms(
+                patch_size=tuple(int(v) for v in self.patch_size_zyx),
+                no_spatial=False,
+            )
+        else:
+            self.augmentations = None
+
+        # Find patches using world-chunk method. Tiling + chunk cache
+        # are keyed off the (small) label region, not the CT read size.
+        self.patches, self.volume_groups = _find_patches_world_chunks(
+            config, self.label_patch_size_zyx,
+        )
+
+        print(f"{TAG} loaded {len(self.patches)} patches")
+
+        # Optional offline-mode filter: keep only patches whose volume crops
+        # can be read entirely from the local zarr chunk cache. Used by tests
+        # and dev runs where we want to train against pre-cached data without
+        # any network access. open_zarr() has already configured the store in
+        # offline mode (volume_cache_offline=True), so any cache miss raises
+        # OfflineCacheMiss instead of fetching.
+        if bool(config.get("volume_cache_offline", False)):
+            self.patches = self._filter_to_cached_patches(self.patches)
+            print(f"{TAG} offline filter: {len(self.patches)} patches with full local cache")
+
+    def _filter_to_cached_patches(self, patches):
+        """Return only patches whose volume crops are fully in the local cache."""
+        try:
+            from tqdm import tqdm
+            iterator = tqdm(patches, desc=f"{TAG} offline filter", dynamic_ncols=True)
+        except ImportError:
+            iterator = patches
+
+        crop_size = tuple(int(v) for v in self.patch_size_zyx)
+        label_size = tuple(int(v) for v in self.label_patch_size_zyx)
+        # Envelope covering every possible runtime CT read. Training
+        # uses paste_off ∈ [-L/2, P − L/2] per axis, so ct_min ranges
+        # over [label_min − (P − L/2), label_min + L/2] and the union
+        # of all ct_max ends at label_min + L/2 + P. That's a 2P cube
+        # starting at label_min − (P − L/2). When P == L, val uses
+        # the centered position — checking the P-sized centered
+        # window is sufficient, keeping filter cost unchanged for
+        # pre-random-offset runs.
+        is_random = any(crop_size[i] > label_size[i] for i in range(3))
+        if is_random:
+            env_size = tuple(2 * crop_size[i] for i in range(3))
+            env_off = np.array(
+                [-(crop_size[i] - label_size[i] // 2) for i in range(3)],
+                dtype=np.int64,
+            )
+        else:
+            env_size = crop_size
+            env_off = np.array(
+                [-((crop_size[i] - label_size[i]) // 2) for i in range(3)],
+                dtype=np.int64,
+            )
+        env_size_arr = np.array(env_size, dtype=np.int64)
+        kept = []
+        dropped = 0
+        for patch in iterator:
+            z0, _, y0, _, x0, _ = patch.world_bbox
+            label_min = np.array([z0, y0, x0], dtype=np.int64)
+            min_corner = label_min + env_off
+            max_corner = min_corner + env_size_arr
+            try:
+                _read_volume_crop_from_patch(
+                    patch, crop_size=env_size,
+                    min_corner=min_corner, max_corner=max_corner,
+                    image_normalization="unit",
+                )
+            except OfflineCacheMiss:
+                dropped += 1
+                continue
+            kept.append(patch)
+        if dropped:
+            print(f"{TAG} offline filter: dropped {dropped} patches missing chunks")
+        return kept
+
+    def __len__(self):
+        return len(self.patches)
+
+    def _extract_and_voxelize_wrap(self, patch, wrap, min_corner, crop_size,
+                                    coord_scale=1):
+        """Extract a wrap surface, voxelize it, and compute direction channels.
+
+        This is the **single source of truth** for turning one wrap into its
+        training signal. Both the training path (``__getitem__``) and the
+        visualization path (``lasagna3d dataset vis``) call this method and
+        build their output from the returned dict — the vis never
+        re-implements the upsample/trim/voxelize logic.
+
+        Args:
+            coord_scale: coordinate multiplier for multi-resolution
+                voxelization.  When > 1, world coordinates are scaled
+                by this factor before computing local positions, so
+                the output grid has finer resolution.  ``min_corner``
+                must already be in the scaled coordinate system.
+
+        Returns a dict with keys:
+            mask          (Z, Y, X) float32 — binary voxelization
+            points_local  (M, 3) float32   — local ZYX positions for splatting
+            normals_zyx   (M, 3) float32   — raw ZYX normals at those positions.
+                                             The double-angle encoding is
+                                             applied downstream in
+                                             `tifxyz_labels.derive_cos_gradmag_validity`,
+                                             AFTER slerp-blending between
+                                             chain-adjacent wraps, so this
+                                             raw representation is the single
+                                             source of truth.
+        """
+        crop_size_tuple = tuple(int(v) for v in crop_size)
+        empty_pts = np.zeros((0, 3), dtype=np.float32)
+        empty_mask = np.zeros(crop_size_tuple, dtype=np.float32)
+
+        def _empty(mask=empty_mask):
+            return {
+                "mask": mask,
+                "points_local": empty_pts,
+                "normals_zyx": empty_pts.copy(),
+                "ctrl_pos_stored": np.zeros((0, 0, 3), dtype=np.float32),
+                "ctrl_normals_stored": np.zeros((0, 0, 3), dtype=np.float32),
+                "grid_rc_vol": np.zeros((2,) + crop_size_tuple, dtype=np.float32),
+                "grid_rc_weight": np.zeros(crop_size_tuple, dtype=np.float32),
+            }
+
+        seg = wrap["segment"]
+        r_min, r_max, c_min, c_max = wrap["bbox_2d"]
+
+        # Clamp to segment bounds
+        seg_h, seg_w = seg._valid_mask.shape
+        r_min = max(0, r_min)
+        r_max = min(seg_h - 1, r_max)
+        c_min = max(0, c_min)
+        c_max = min(seg_w - 1, c_max)
+        if r_max < r_min or c_max < c_min:
+            return _empty()
+
+        # Read stored-resolution grid
+        seg.use_stored_resolution()
+        scale_y, scale_x = seg._scale
+        x_s, y_s, z_s, valid_s = seg[r_min:r_max + 1, c_min:c_max + 1]
+        if x_s.size == 0:
+            return _empty()
+
+        # Skip wraps with invalid cells in stored grid (upsampling requires all-valid)
+        if valid_s is not None and not valid_s.all():
+            return _empty()
+
+        # Upsample to full resolution
+        try:
+            x_full, y_full, z_full = _upsample_world_triplet(
+                x_s, y_s, z_s, scale_y, scale_x,
+            )
+        except ValueError:
+            return _empty()
+
+        # Trim to world bbox
+        trimmed = _trim_to_world_bbox(x_full, y_full, z_full, patch.world_bbox)
+        if trimmed is None:
+            return _empty()
+        x_full, y_full, z_full = trimmed
+
+        # Build (H, W, 3) ZYX grid in world coordinates.
+        # If a cross-volume transform is present, map from cache-scale
+        # coords to the target volume's reading-level coords.
+        zyx_world = np.stack(
+            [z_full, y_full, x_full], axis=-1,
+        ).astype(np.float32)
+        if patch.cache_to_volume is not None:
+            zyx_world = _apply_affine_zyx(patch.cache_to_volume, zyx_world)
+
+        # Convert to local coordinates.  When coord_scale != 1, scale
+        # world coords to the target grid (finer if >1, coarser if <1)
+        # before subtracting min_corner (which is already in scaled coords).
+        min_corner_f = min_corner.astype(np.float32)
+        if coord_scale != 1:
+            zyx_local = zyx_world * float(coord_scale) - min_corner_f
+        else:
+            zyx_local = zyx_world - min_corner_f
+
+        # Compute validity mask (finite + within crop bounds)
+        valid = (
+            np.isfinite(zyx_local).all(axis=-1)
+            & (zyx_local[..., 0] >= -0.5)
+            & (zyx_local[..., 0] < crop_size_tuple[0] - 0.5)
+            & (zyx_local[..., 1] >= -0.5)
+            & (zyx_local[..., 1] < crop_size_tuple[1] - 0.5)
+            & (zyx_local[..., 2] >= -0.5)
+            & (zyx_local[..., 2] < crop_size_tuple[2] - 0.5)
+        )
+
+        if not np.any(valid):
+            return _empty()
+
+        # Voxelize using neural tracing's line-drawing rasterizer
+        surface_mask = voxelize_surface_grid_masked(
+            zyx_local, crop_size_tuple, valid,
+        )
+
+        # Compute normals from the grid (full-res)
+        normals_zyx = _estimate_grid_normals(zyx_world)
+
+        # Stored-resolution control points for cage deformation.
+        # The stored-res grid is at ~20vx spacing — each vertex is a
+        # cage control point.  Convert to local coords for the
+        # training-loop cage weight computation.
+        zyx_stored_world = np.stack(
+            [z_s, y_s, x_s], axis=-1,
+        ).astype(np.float32)
+        if patch.cache_to_volume is not None:
+            zyx_stored_world = _apply_affine_zyx(
+                patch.cache_to_volume, zyx_stored_world,
+            )
+        if coord_scale != 1:
+            zyx_stored_local = (
+                zyx_stored_world * float(coord_scale) - min_corner_f
+            )
+        else:
+            zyx_stored_local = zyx_stored_world - min_corner_f
+        normals_stored = _estimate_grid_normals(zyx_stored_world)
+
+        # Build a grid-coordinate volume: for each surface voxel,
+        # what is its (r_stored_frac, c_stored_frac) in the stored-res
+        # quad mesh?  Splat stored-res row/col values at each full-res
+        # vertex position.  This uses valid grid points only.
+        H_full, W_full = zyx_local.shape[:2]
+        H_s, W_s = x_s.shape
+        if H_full > 1 and W_full > 1 and H_s > 0 and W_s > 0:
+            # Full-res index → stored-res fractional coordinate
+            r_stored_map = np.linspace(
+                0, H_s - 1, H_full, dtype=np.float32,
+            )[:, None].repeat(W_full, axis=1)
+            c_stored_map = np.linspace(
+                0, W_s - 1, W_full, dtype=np.float32,
+            )[None, :].repeat(H_full, axis=0)
+            # Splat (r_stored, c_stored) onto the 3D volume at
+            # full-res vertex positions
+            rc_vals = np.stack(
+                [r_stored_map[valid], c_stored_map[valid]], axis=-1,
+            ).astype(np.float32)
+            pts_for_rc = zyx_local[valid].astype(np.float32)
+            if pts_for_rc.shape[0] > 0:
+                grid_rc_vol, grid_rc_weight = _splat_multichannel(
+                    pts_for_rc, rc_vals, crop_size_tuple,
+                )
+            else:
+                grid_rc_vol = np.zeros(
+                    (2,) + crop_size_tuple, dtype=np.float32,
+                )
+                grid_rc_weight = np.zeros(crop_size_tuple, dtype=np.float32)
+        else:
+            grid_rc_vol = np.zeros(
+                (2,) + crop_size_tuple, dtype=np.float32,
+            )
+            grid_rc_weight = np.zeros(crop_size_tuple, dtype=np.float32)
+
+        # Raw normals are the single source of truth for direction
+        # supervision. The 6-channel double-angle encoding is derived
+        # downstream in `tifxyz_labels.derive_cos_gradmag_validity`
+        # *after* slerp-blending the raw normals at chain-adjacent
+        # brackets, so the encoding lives in exactly one place and
+        # the blend is done in the correct (angle) space.
+        valid_for_dir = valid & np.isfinite(normals_zyx).all(axis=-1)
+        if not np.any(valid_for_dir):
+            return _empty(surface_mask)
+
+        pts_local = zyx_local[valid_for_dir].astype(np.float32)
+        normals_used = normals_zyx[valid_for_dir].astype(np.float32)
+
+        return {
+            "mask": surface_mask,
+            "points_local": pts_local,
+            "normals_zyx": normals_used,
+            # Cage deformation data
+            "ctrl_pos_stored": zyx_stored_local,     # (H_s, W_s, 3) local coords
+            "ctrl_normals_stored": normals_stored,   # (H_s, W_s, 3) unit normals
+            "grid_rc_vol": grid_rc_vol,              # (2, Z, Y, X) stored-res (r, c) per surface voxel
+            "grid_rc_weight": grid_rc_weight,        # (Z, Y, X) splat weight (>0 where valid)
+        }
+
+    def __getitem__(self, idx):
+        try:
+            return self._getitem_impl(idx)
+        except (PermissionError, OSError, ConnectionError,
+                TimeoutError, OfflineCacheMiss) as e:
+            # Transient zarr/S3 read errors (expired token, network
+            # hiccup, stale credential, missing cache chunk). Return
+            # None → collate_variable_surfaces filters it, and the
+            # train loop's empty-batch path skips the step.
+            patch = self.patches[idx] if idx < len(self.patches) else None
+            seg = ""
+            if patch is not None and patch.wraps:
+                try:
+                    seg = str(patch.wraps[0]["segment"].uuid)
+                except Exception:
+                    seg = "?"
+            print(
+                f"{TAG} read error idx={idx} seg={seg} "
+                f"{type(e).__name__}: {e} — skipping sample",
+                flush=True,
+            )
+            return None
+
+    def _getitem_impl(self, idx):
+        patch = self.patches[idx]
+
+        z0, z1, y0, y1, x0, x1 = patch.world_bbox
+        crop_size = tuple(int(v) for v in self.patch_size_zyx)
+        label_size = tuple(int(v) for v in self.label_patch_size_zyx)
+
+        # --- Scale augmentation decision ---
+        # When active, CT is read from a coarser zarr level (wider FOV,
+        # same tensor shape).  GT is computed at *original* crop_size at
+        # full res — zero extra memory.  The train loop pools GT to
+        # crop_size/f and pastes it at a random offset inside the
+        # crop_size target tensor.
+        f = 1  # effective scale factor (1 = no aug)
+        use_scale_aug = (
+            self.scale_aug_active
+            and self.scale_aug_prob > 0
+            and patch.volume_group is not None
+        )
+        _aug_arr = None
+        if use_scale_aug:
+            aug_level = patch.scale + 1
+            try:
+                _aug_arr = patch.volume_group[str(aug_level)]
+                f = self.scale_aug_factor
+            except (KeyError, IndexError):
+                use_scale_aug = False
+                f = 1
+
+        # Label region origin in world coords (sized label_patch_size).
+        # When a cross-volume transform is present, world_bbox is in
+        # cache-scale coords.  The transform includes rotation, so we
+        # must transform all 8 bbox corners to find the axis-aligned
+        # bounding box in reading-level space, then center the crop on it.
+        if patch.cache_to_volume is not None:
+            corners_zyx = np.array([
+                [z, y, x]
+                for z in (z0, z1)
+                for y in (y0, y1)
+                for x in (x0, x1)
+            ], dtype=np.float64)
+            corners_vol = _apply_affine_zyx(patch.cache_to_volume, corners_zyx)
+            aabb_min = corners_vol.min(axis=0)
+            aabb_max = corners_vol.max(axis=0)
+            aabb_center = (aabb_min + aabb_max) / 2.0
+            label_min = np.round(
+                aabb_center - np.array(label_size, dtype=np.float64) / 2.0
+            ).astype(np.int64)
+        else:
+            label_min = np.array([z0, y0, x0], dtype=np.int64)
+        # Place the label region inside the (larger) CT crop.
+        # paste_off ∈ [-L/2, P - L/2] allows up to half of the GT to
+        # be cropped off either edge during training; val/eval uses
+        # the centered position. When P == L, randomization collapses
+        # to the centered case.
+        if self.random_paste_offset and np.any(
+            np.asarray(crop_size) > np.asarray(label_size)
+        ):
+            paste_off = np.array(
+                [
+                    int(np.random.randint(
+                        -label_size[i] // 2,
+                        crop_size[i] - label_size[i] // 2 + 1,
+                    ))
+                    for i in range(3)
+                ],
+                dtype=np.int64,
+            )
+        else:
+            paste_off = np.array(
+                [(crop_size[i] - label_size[i]) // 2 for i in range(3)],
+                dtype=np.int64,
+            )
+        # GT read origin in full-res coords.
+        min_corner = label_min - paste_off
+        max_corner = min_corner + np.array(crop_size, dtype=np.int64)
+
+        # --- CT read ---
+        scale_aug_offset = None
+        if use_scale_aug:
+            # CT from the coarser zarr level.  One voxel at level+1 =
+            # f voxels at the base level.  We read crop_size voxels
+            # covering f× the world extent.
+            #
+            # The pooled GT (crop_size/f) will be pasted at a random
+            # offset inside the crop_size output tensor.  We pick that
+            # offset here and shift the CT read so the GT region lands
+            # at that offset within the CT tensor.
+            pooled_size = np.array([c // f for c in crop_size], dtype=np.int64)
+            scale_aug_offset = np.array(
+                [int(np.random.randint(0, crop_size[d] - pooled_size[d] + 1))
+                 for d in range(3)],
+                dtype=np.int64,
+            )
+            # CT world origin: shift so GT lands at scale_aug_offset
+            # (in output-tensor coords) within the CT tensor.
+            ct_world_min = min_corner - scale_aug_offset * f
+            ct_min = ct_world_min // f
+            ct_max = ct_min + np.array(crop_size, dtype=np.int64)
+            vol_crop = _read_volume_crop(
+                _aug_arr, crop_size=crop_size,
+                min_corner=ct_min, max_corner=ct_max,
+                image_normalization="unit",
+            )
+        else:
+            vol_crop = _read_volume_crop_from_patch(
+                patch, crop_size=crop_size,
+                min_corner=min_corner, max_corner=max_corner,
+                image_normalization="unit",
+            )
+
+        # --- Multi-scale offset: override CT + voxelization coords ---
+        # For scale_offset != 0, re-read CT from a different zarr level
+        # and adjust min_corner so voxelization covers the right world
+        # region at P resolution.
+        voxel_coord_scale = 1
+        scale_rand_offset = None  # random offset within the wider/narrower region
+        if self.scale_offset != 0 and patch.volume_group is not None:
+            base_center = min_corner + np.array(crop_size, dtype=np.int64) // 2
+            P = crop_size[0]
+
+            if self.scale_offset == -1:
+                # Coarser: P voxels covering 2× world.
+                # Each coarse voxel = 2 base voxels.
+                target_level = patch.scale + 1
+                # Random offset: where within the 2× region the base crop sits
+                scale_rand_offset = np.array(
+                    [int(np.random.randint(0, max(P // 2, 1))) for _ in range(3)],
+                    dtype=np.int64,
+                )
+                # Coarse region center in base voxels
+                coarse_center_base = base_center  # centered on same patch
+                # Coarse min in coarse voxels (each = 2 base)
+                coarse_min_coarse = (coarse_center_base - P) // 2 + scale_rand_offset // 2
+                ct_min = coarse_min_coarse
+                ct_max = ct_min + P
+                # Voxelization: world coords × 0.5 to convert to coarse voxels
+                voxel_coord_scale = 0.5
+                # min_corner for voxelization = coarse_min in coarse-voxel space
+                min_corner = ct_min.astype(np.int64)
+                crop_size = (P, P, P)
+
+            elif self.scale_offset == 1:
+                # Finer: P voxels covering 0.5× world.
+                target_level = patch.scale - 1
+                if target_level < 0:
+                    target_level = 0
+                # Random offset: where within the base region the fine crop sits
+                half_P = P // 2
+                scale_rand_offset = np.array(
+                    [int(np.random.randint(0, max(half_P, 1) + 1)) for _ in range(3)],
+                    dtype=np.int64,
+                )
+                # Fine region in base voxels: starts at min_corner + scale_rand_offset
+                fine_start_base = min_corner + scale_rand_offset
+                # Fine min in fine voxels (each = 0.5 base)
+                ct_min = (fine_start_base * 2).astype(np.int64)
+                ct_max = ct_min + P
+                voxel_coord_scale = 2
+                min_corner = ct_min.astype(np.int64)
+                crop_size = (P, P, P)
+
+            # Read CT from the target zarr level
+            try:
+                target_arr = patch.volume_group[str(target_level)]
+                vol_crop = _read_volume_crop(
+                    target_arr, crop_size=crop_size,
+                    min_corner=ct_min, max_corner=ct_max,
+                    image_normalization="unit",
+                )
+            except (KeyError, IndexError):
+                # Level not available — return zeros
+                vol_crop = np.zeros(crop_size, dtype=np.float32)
+
+        # Per-patch chain info (wrap_idx → chain/pos/has_prev/has_next/label)
+        chain_info_full = build_patch_chains(patch, self.max_surfaces_per_patch)
+
+        # Per-surface: voxelize mask and collect raw normals for splatting.
+        # Always at crop_size in full-res coords (scale aug only affects
+        # the CT read; GT runs at original resolution).
+        surface_masks = []
+        all_normal_points = []
+        all_normals_zyx = []
+        kept_wrap_indices: list[int] = []
+        surface_geometry: list[dict] = []
+        # Cage deformation: per-surface control points + grid-coord volume
+        cage_ctrl_pos: list[np.ndarray] = []      # (H_s, W_s, 3) per surface
+        cage_ctrl_normals: list[np.ndarray] = []  # (H_s, W_s, 3) per surface
+        cage_grid_rc: list[np.ndarray] = []       # (2, Z, Y, X) per surface
+        cage_grid_rc_w: list[np.ndarray] = []     # (Z, Y, X) per surface
+
+        for wrap_idx, wrap in enumerate(patch.wraps[:self.max_surfaces_per_patch]):
+            wrap_out = self._extract_and_voxelize_wrap(
+                patch, wrap, min_corner, crop_size,
+                coord_scale=voxel_coord_scale,
+            )
+            mask = wrap_out["mask"]
+            if np.any(mask > 0):
+                surface_masks.append(mask)
+                kept_wrap_indices.append(wrap_idx)
+                pts_local = wrap_out["points_local"]
+                if pts_local.shape[0] > 0:
+                    all_normal_points.append(pts_local)
+                    all_normals_zyx.append(wrap_out["normals_zyx"])
+                cage_ctrl_pos.append(wrap_out["ctrl_pos_stored"])
+                cage_ctrl_normals.append(wrap_out["ctrl_normals_stored"])
+                cage_grid_rc.append(wrap_out["grid_rc_vol"])
+                cage_grid_rc_w.append(wrap_out["grid_rc_weight"])
+                if self.include_geometry:
+                    surface_geometry.append({
+                        "wrap_idx": wrap_idx,
+                        "points_local": wrap_out["points_local"],
+                        "normals_zyx": wrap_out["normals_zyx"],
+                    })
+
+        num_surfaces = len(surface_masks)
+
+        # Per-retained-mask chain metadata (aligned with surface_masks ordering).
+        surface_chain_info: list[dict] = []
+        for wi in kept_wrap_indices:
+            seg_idx = int(patch.wraps[wi]["segment_idx"])
+            entry = chain_info_full.get(wi)
+            if entry is None:
+                surface_chain_info.append({
+                    "wrap_idx": wi,
+                    "segment_idx": seg_idx,
+                    "chain": -1, "pos": 0,
+                    "has_prev": False, "has_next": False,
+                    "label": "?",
+                })
+            else:
+                surface_chain_info.append({
+                    "wrap_idx": wi,
+                    "segment_idx": seg_idx,
+                    "chain": int(entry["chain"]),
+                    "pos": int(entry["pos"]),
+                    "has_prev": bool(entry["has_prev"]),
+                    "has_next": bool(entry["has_next"]),
+                    "label": str(entry.get("label", f"?{int(entry['pos'])}")),
+                })
+
+        # Stack surface masks: (N, Z, Y, X)
+        if num_surfaces > 0:
+            surface_masks_arr = np.stack(surface_masks, axis=0)
+        else:
+            surface_masks_arr = np.zeros((0,) + crop_size, dtype=np.float32)
+
+        # Splat 6-component SECOND-MOMENT TENSOR from all surfaces
+        # combined: (6, Z, Y, X). The tensor representation
+        # N = n·nᵀ (unique components nx², ny², nz², nx·ny, nx·nz,
+        # ny·nz) is sign-invariant — opposite-signed cross-product
+        # normals at adjacent grid points produce the SAME tensor,
+        # so trilinear averaging in this space can't cancel or
+        # produce wrong directions. Downstream
+        # derive_cos_gradmag_validity linearly blends this tensor
+        # at the chain-adjacent bracket and calls encode_from_tensor
+        # once to produce the final 6-channel targets[2:8] —
+        # entirely avoiding the slerp encoding-singularity spike
+        # that linear interpolation through a "mean direction"
+        # hits at configurations where the geodesic midpoint
+        # crosses an encoding pole.
+        if all_normal_points:
+            pts = np.concatenate(all_normal_points, axis=0)
+            raw_nrm = np.concatenate(all_normals_zyx, axis=0)  # (N, 3)
+            tensor_vals = _tensor_moments_from_normals_zyx(raw_nrm)  # (N, 6)
+            tensor_moments_vol, normals_valid_vol = _splat_multichannel(
+                pts, tensor_vals, crop_size,
+            )
+        else:
+            tensor_moments_vol = np.zeros((6,) + crop_size, dtype=np.float32)
+            normals_valid_vol = np.zeros(crop_size, dtype=np.float32)
+
+        # Padding mask: where CT data actually exists (non-zero after crop)
+        padding_mask = np.ones(crop_size, dtype=np.float32)
+
+        # --- Fine-resolution voxelization for multi-scale refinement ---
+        # Re-voxelize at 2× resolution for a random P/2 subregion.
+        fine_offset = None
+        surface_masks_fine_arr = None
+        tensor_moments_fine_vol = None
+        normals_valid_fine_vol = None
+        if self.refine_mode and num_surfaces > 0 and self.scale_offset == 0:
+            P = crop_size[0]  # cubic
+            half_P = P // 2
+            # Random offset: fine subregion start within the base P region
+            fine_offset = np.array(
+                [int(np.random.randint(0, half_P + 1)) for _ in range(3)],
+                dtype=np.int64,
+            )
+            fine_crop = (P, P, P)  # P fine voxels = P/2 base voxels
+            fine_min = (min_corner + fine_offset).astype(np.float32) * 2.0
+
+            fine_masks = []
+            fine_normal_pts = []
+            fine_normals_zyx = []
+            fine_cage_ctrl_pos = []
+            fine_cage_ctrl_normals = []
+            fine_cage_grid_rc = []
+            fine_cage_grid_rc_w = []
+            for wi_local, wi_global in enumerate(kept_wrap_indices):
+                wrap = patch.wraps[wi_global]
+                w_out = self._extract_and_voxelize_wrap(
+                    patch, wrap, fine_min, fine_crop, coord_scale=2,
+                )
+                fine_masks.append(w_out["mask"])
+                if w_out["points_local"].shape[0] > 0:
+                    fine_normal_pts.append(w_out["points_local"])
+                    fine_normals_zyx.append(w_out["normals_zyx"])
+                fine_cage_ctrl_pos.append(w_out["ctrl_pos_stored"])
+                fine_cage_ctrl_normals.append(w_out["ctrl_normals_stored"])
+                fine_cage_grid_rc.append(w_out["grid_rc_vol"])
+                fine_cage_grid_rc_w.append(w_out["grid_rc_weight"])
+
+            surface_masks_fine_arr = np.stack(fine_masks, axis=0)
+
+            if fine_normal_pts:
+                pts_f = np.concatenate(fine_normal_pts, axis=0)
+                nrm_f = np.concatenate(fine_normals_zyx, axis=0)
+                tvals_f = _tensor_moments_from_normals_zyx(nrm_f)
+                tensor_moments_fine_vol, normals_valid_fine_vol = (
+                    _splat_multichannel(pts_f, tvals_f, fine_crop)
+                )
+            else:
+                tensor_moments_fine_vol = np.zeros(
+                    (6,) + fine_crop, dtype=np.float32,
+                )
+                normals_valid_fine_vol = np.zeros(
+                    fine_crop, dtype=np.float32,
+                )
+
+        # --- Coarse-resolution data for multi-scale refinement ---
+        # Re-voxelize at 0.5× resolution covering 2× world extent.
+        coarse_offset = None
+        surface_masks_m1_arr = None
+        tensor_moments_m1_vol = None
+        normals_valid_m1_vol = None
+        image_m1_crop = None
+        image_p1_crop = None
+        cage_ctrl_pos_m1: list = []
+        cage_ctrl_normals_m1: list = []
+        cage_grid_rc_m1: list = []
+        cage_grid_rc_w_m1: list = []
+        if self.refine_mode and num_surfaces > 0 and self.scale_offset == 0:
+            P = crop_size[0]
+            _vol_group = getattr(patch, "volume_group", None)
+
+            # --- Coarse scale (-1): P voxels covering 2× world ---
+            target_level_m1 = patch.scale + 1
+            arr_m1 = None
+            if _vol_group is not None:
+                try:
+                    arr_m1 = _vol_group[str(target_level_m1)]
+                except (KeyError, IndexError):
+                    # Log once per dataset to help diagnose missing levels
+                    _miss_key = f"_warned_m1_{patch.dataset_idx}"
+                    if not getattr(self, _miss_key, False):
+                        avail = sorted(k for k in _vol_group.keys()
+                                       if not k.startswith("."))
+                        print(f"[tifxyz_dataset] coarse level {target_level_m1} "
+                              f"not in zarr group (base={patch.scale}, "
+                              f"available={avail}, ds={patch.dataset_name})",
+                              flush=True)
+                        setattr(self, _miss_key, True)
+
+            if arr_m1 is not None:
+                coarse_offset = np.array(
+                    [int(np.random.randint(0, max(P // 2, 1)))
+                     for _ in range(3)],
+                    dtype=np.int64,
+                )
+                base_center = min_corner + P // 2
+                coarse_min = (
+                    (base_center - P) // 2 + coarse_offset // 2
+                ).astype(np.int64)
+                coarse_max = coarse_min + P
+                coarse_crop = (P, P, P)
+
+                # Read coarse CT
+                image_m1_crop = _read_volume_crop(
+                    arr_m1, crop_size=coarse_crop,
+                    min_corner=coarse_min, max_corner=coarse_max,
+                    image_normalization="unit",
+                )
+
+                # Voxelize surfaces at coarse scale
+                m1_masks = []
+                m1_normal_pts = []
+                m1_normals_zyx = []
+                for wi_global in kept_wrap_indices:
+                    wrap = patch.wraps[wi_global]
+                    w_out = self._extract_and_voxelize_wrap(
+                        patch, wrap, coarse_min, coarse_crop,
+                        coord_scale=0.5,
+                    )
+                    m1_masks.append(w_out["mask"])
+                    if w_out["points_local"].shape[0] > 0:
+                        m1_normal_pts.append(w_out["points_local"])
+                        m1_normals_zyx.append(w_out["normals_zyx"])
+                    cage_ctrl_pos_m1.append(w_out["ctrl_pos_stored"])
+                    cage_ctrl_normals_m1.append(w_out["ctrl_normals_stored"])
+                    cage_grid_rc_m1.append(w_out["grid_rc_vol"])
+                    cage_grid_rc_w_m1.append(w_out["grid_rc_weight"])
+
+                surface_masks_m1_arr = np.stack(m1_masks, axis=0)
+
+                if m1_normal_pts:
+                    pts_m1 = np.concatenate(m1_normal_pts, axis=0)
+                    nrm_m1 = np.concatenate(m1_normals_zyx, axis=0)
+                    tvals_m1 = _tensor_moments_from_normals_zyx(nrm_m1)
+                    tensor_moments_m1_vol, normals_valid_m1_vol = (
+                        _splat_multichannel(pts_m1, tvals_m1, coarse_crop)
+                    )
+                else:
+                    tensor_moments_m1_vol = np.zeros(
+                        (6,) + coarse_crop, dtype=np.float32,
+                    )
+                    normals_valid_m1_vol = np.zeros(
+                        coarse_crop, dtype=np.float32,
+                    )
+
+            # --- Fine CT (+1): read from zarr level-1 ---
+            if fine_offset is not None and _vol_group is not None:
+                target_level_p1 = patch.scale - 1
+                if target_level_p1 >= 0:
+                    try:
+                        arr_p1 = _vol_group[str(target_level_p1)]
+                        fine_ct_min = (
+                            (min_corner + fine_offset) * 2
+                        ).astype(np.int64)
+                        fine_ct_max = fine_ct_min + P
+                        image_p1_crop = _read_volume_crop(
+                            arr_p1, crop_size=(P, P, P),
+                            min_corner=fine_ct_min, max_corner=fine_ct_max,
+                            image_normalization="unit",
+                        )
+                    except (KeyError, IndexError):
+                        pass
+
+        # Convert to tensors
+        vol_crop_t = torch.as_tensor(
+            np.asarray(vol_crop, dtype=np.float32)
+        ).unsqueeze(0)  # (1, Z, Y, X)
+
+        surface_masks_t = torch.as_tensor(surface_masks_arr, dtype=torch.float32)
+        tensor_moments_t = torch.as_tensor(tensor_moments_vol, dtype=torch.float32)
+        normals_valid_t = torch.as_tensor(normals_valid_vol, dtype=torch.float32).unsqueeze(0)
+        padding_mask_t = torch.as_tensor(padding_mask, dtype=torch.float32).unsqueeze(0)
+
+        # World center and min in base-level voxels for multi-scale CT reads.
+        bbox = patch.world_bbox  # (z_min, z_max, y_min, y_max, x_min, x_max)
+        world_center = np.array([
+            (bbox[0] + bbox[1]) / 2.0,
+            (bbox[2] + bbox[3]) / 2.0,
+            (bbox[4] + bbox[5]) / 2.0,
+        ], dtype=np.float64)
+
+        sample = {
+            "image": vol_crop_t,                        # (1, Z, Y, X)
+            "surface_masks": surface_masks_t,           # (N, Z, Y, X)
+            "tensor_moments": tensor_moments_t,         # (6, Z, Y, X) — nx², ny², nz², nx·ny, nx·nz, ny·nz
+            "normals_valid": normals_valid_t,           # (1, Z, Y, X)
+            "num_surfaces": num_surfaces,
+            "padding_mask": padding_mask_t,             # (1, Z, Y, X)
+            "surface_chain_info": surface_chain_info,   # list[dict], len == N
+            "patch_info": {
+                "segment_uuid": str(patch.wraps[0]["segment"].uuid) if patch.wraps else "",
+                "world_bbox": patch.world_bbox,
+                "world_center": world_center,           # (3,) float64 — base-level voxels
+                "world_min": min_corner,                # (3,) int64 — CT read origin
+                "scale": patch.scale,                   # zarr level
+                "idx": patch.dataset_local_idx,
+                "global_idx": idx,
+                "dataset_idx": patch.dataset_idx,
+                "dataset_name": patch.dataset_name,
+                "scale_aug_factor": f,
+                "scale_aug_offset": scale_aug_offset,   # (3,) int64 or None
+                "fine_offset": fine_offset,             # (3,) int64 or None
+                "scale_offset": self.scale_offset,     # -1, 0, or +1
+                "scale_rand_offset": scale_rand_offset,  # (3,) int64 or None
+            },
+        }
+        # Cage deformation: per-surface control point grids + coordinate maps
+        if cage_ctrl_pos:
+            sample["cage_ctrl_pos"] = [
+                torch.as_tensor(cp, dtype=torch.float32) for cp in cage_ctrl_pos
+            ]
+            sample["cage_ctrl_normals"] = [
+                torch.as_tensor(cn, dtype=torch.float32) for cn in cage_ctrl_normals
+            ]
+            sample["cage_grid_rc"] = [
+                torch.as_tensor(rc, dtype=torch.float32) for rc in cage_grid_rc
+            ]
+            sample["cage_grid_rc_w"] = [
+                torch.as_tensor(w, dtype=torch.float32) for w in cage_grid_rc_w
+            ]
+        if self.refine_mode and surface_masks_fine_arr is not None:
+            sample["surface_masks_fine"] = torch.as_tensor(
+                surface_masks_fine_arr, dtype=torch.float32,
+            )
+            sample["tensor_moments_fine"] = torch.as_tensor(
+                tensor_moments_fine_vol, dtype=torch.float32,
+            )
+            sample["normals_valid_fine"] = torch.as_tensor(
+                normals_valid_fine_vol, dtype=torch.float32,
+            ).unsqueeze(0)
+            sample["cage_ctrl_pos_fine"] = [
+                torch.as_tensor(cp, dtype=torch.float32)
+                for cp in fine_cage_ctrl_pos
+            ]
+            sample["cage_ctrl_normals_fine"] = [
+                torch.as_tensor(cn, dtype=torch.float32)
+                for cn in fine_cage_ctrl_normals
+            ]
+            sample["cage_grid_rc_fine"] = [
+                torch.as_tensor(rc, dtype=torch.float32)
+                for rc in fine_cage_grid_rc
+            ]
+            sample["cage_grid_rc_w_fine"] = [
+                torch.as_tensor(w, dtype=torch.float32)
+                for w in fine_cage_grid_rc_w
+            ]
+        if self.refine_mode and image_p1_crop is not None:
+            sample["image_p1"] = torch.as_tensor(
+                np.asarray(image_p1_crop, dtype=np.float32),
+            ).unsqueeze(0)
+        if self.refine_mode and surface_masks_m1_arr is not None:
+            sample["image_m1"] = torch.as_tensor(
+                np.asarray(image_m1_crop, dtype=np.float32),
+            ).unsqueeze(0)
+            sample["surface_masks_m1"] = torch.as_tensor(
+                surface_masks_m1_arr, dtype=torch.float32,
+            )
+            sample["tensor_moments_m1"] = torch.as_tensor(
+                tensor_moments_m1_vol, dtype=torch.float32,
+            )
+            sample["normals_valid_m1"] = torch.as_tensor(
+                normals_valid_m1_vol, dtype=torch.float32,
+            ).unsqueeze(0)
+            sample["cage_ctrl_pos_m1"] = [
+                torch.as_tensor(cp, dtype=torch.float32)
+                for cp in cage_ctrl_pos_m1
+            ]
+            sample["cage_ctrl_normals_m1"] = [
+                torch.as_tensor(cn, dtype=torch.float32)
+                for cn in cage_ctrl_normals_m1
+            ]
+            sample["cage_grid_rc_m1"] = [
+                torch.as_tensor(rc, dtype=torch.float32)
+                for rc in cage_grid_rc_m1
+            ]
+            sample["cage_grid_rc_w_m1"] = [
+                torch.as_tensor(w, dtype=torch.float32)
+                for w in cage_grid_rc_w_m1
+            ]
+            sample["patch_info"]["coarse_offset"] = coarse_offset
+        if self.include_geometry:
+            sample["surface_geometry"] = surface_geometry
+        if self.include_patch_ref:
+            sample["_patch"] = patch
+        return sample
+
+
+def collate_variable_surfaces(batch):
+    """Custom collate_fn that handles variable numbers of surfaces per patch.
+
+    Stacks fixed-size tensors normally, keeps surface_masks as a list.
+    """
+    # Filter samples that raised in __getitem__ (transient zarr/S3
+    # read errors etc.). An empty result signals the train loop to
+    # skip the step.
+    batch = [b for b in batch if b is not None]
+    if not batch:
+        return None
+    images = torch.stack([b["image"] for b in batch])
+    tensor_moments = torch.stack([b["tensor_moments"] for b in batch])
+    normals_valid = torch.stack([b["normals_valid"] for b in batch])
+    padding_masks = torch.stack([b["padding_mask"] for b in batch])
+    num_surfaces = [b["num_surfaces"] for b in batch]
+    surface_masks = [b["surface_masks"] for b in batch]
+    surface_chain_info = [b["surface_chain_info"] for b in batch]
+    patch_infos = [b["patch_info"] for b in batch]
+
+    out = {
+        "image": images,                        # (B, 1, Z, Y, X)
+        "surface_masks": surface_masks,         # list of (Ni, Z, Y, X) tensors
+        "tensor_moments": tensor_moments,       # (B, 6, Z, Y, X)
+        "normals_valid": normals_valid,         # (B, 1, Z, Y, X)
+        "num_surfaces": num_surfaces,           # list of ints
+        "padding_mask": padding_masks,          # (B, 1, Z, Y, X)
+        "surface_chain_info": surface_chain_info,  # list of list[dict]
+        "patch_info": patch_infos,
+    }
+    if all("cage_ctrl_pos" in b for b in batch):
+        out["cage_ctrl_pos"] = [b["cage_ctrl_pos"] for b in batch]
+        out["cage_ctrl_normals"] = [b["cage_ctrl_normals"] for b in batch]
+        out["cage_grid_rc"] = [b["cage_grid_rc"] for b in batch]
+        out["cage_grid_rc_w"] = [b["cage_grid_rc_w"] for b in batch]
+    if all("surface_masks_fine" in b for b in batch):
+        out["surface_masks_fine"] = [b["surface_masks_fine"] for b in batch]
+        out["tensor_moments_fine"] = torch.stack(
+            [b["tensor_moments_fine"] for b in batch],
+        )
+        out["normals_valid_fine"] = torch.stack(
+            [b["normals_valid_fine"] for b in batch],
+        )
+    if all("cage_ctrl_pos_fine" in b for b in batch):
+        out["cage_ctrl_pos_fine"] = [b["cage_ctrl_pos_fine"] for b in batch]
+        out["cage_ctrl_normals_fine"] = [b["cage_ctrl_normals_fine"] for b in batch]
+        out["cage_grid_rc_fine"] = [b["cage_grid_rc_fine"] for b in batch]
+        out["cage_grid_rc_w_fine"] = [b["cage_grid_rc_w_fine"] for b in batch]
+    # Coarse scale (-1) data — only if ALL samples have it
+    if all("image_m1" in b for b in batch):
+        out["image_m1"] = torch.stack([b["image_m1"] for b in batch])
+    if all("surface_masks_m1" in b for b in batch):
+        out["surface_masks_m1"] = [b["surface_masks_m1"] for b in batch]
+        out["tensor_moments_m1"] = torch.stack(
+            [b["tensor_moments_m1"] for b in batch],
+        )
+        out["normals_valid_m1"] = torch.stack(
+            [b["normals_valid_m1"] for b in batch],
+        )
+    if all("cage_ctrl_pos_m1" in b for b in batch):
+        out["cage_ctrl_pos_m1"] = [b["cage_ctrl_pos_m1"] for b in batch]
+        out["cage_ctrl_normals_m1"] = [b["cage_ctrl_normals_m1"] for b in batch]
+        out["cage_grid_rc_m1"] = [b["cage_grid_rc_m1"] for b in batch]
+        out["cage_grid_rc_w_m1"] = [b["cage_grid_rc_w_m1"] for b in batch]
+    # Fine CT image — only if ALL samples have it
+    if all("image_p1" in b for b in batch):
+        out["image_p1"] = torch.stack([b["image_p1"] for b in batch])
+    if "surface_geometry" in batch[0]:
+        out["surface_geometry"] = [b["surface_geometry"] for b in batch]
+    if "_patch" in batch[0]:
+        out["_patch"] = [b["_patch"] for b in batch]
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Geometry-level spatial augmentation
+# ---------------------------------------------------------------------------
+
+def _transform_geometry(geom_list, flip_z, flip_y, flip_x, k, size_zyx):
+    """Flip/rot transform for a single sample's surface_geometry list.
+
+    Applies per-axis coordinate flips + k*90° rotation around Z,
+    with the matching sign flip / XY rotation on the raw normals.
+    The result still holds valid ``points_local`` / ``normals_zyx``
+    in the patch-local ZYX frame, so downstream re-splatting via
+    ``_splat_multichannel`` produces a correct raw-normal volume
+    for the new frame.
+    """
+    Zs, Ys, Xs = int(size_zyx[0]), int(size_zyx[1]), int(size_zyx[2])
+    out = []
+    for g in geom_list:
+        pts = np.asarray(
+            g.get("points_local", np.zeros((0, 3), np.float32))
+        ).astype(np.float32).copy()
+        nrm = np.asarray(
+            g.get("normals_zyx", np.zeros((0, 3), np.float32))
+        ).astype(np.float32).copy()
+        if pts.shape[0]:
+            if flip_z:
+                pts[:, 0] = (Zs - 1) - pts[:, 0]
+                nrm[:, 0] *= -1.0
+            if flip_y:
+                pts[:, 1] = (Ys - 1) - pts[:, 1]
+                nrm[:, 1] *= -1.0
+            if flip_x:
+                pts[:, 2] = (Xs - 1) - pts[:, 2]
+                nrm[:, 2] *= -1.0
+            # torch.rot90(k=+1, dims=(Y, X)) sends old (y, x) to
+            # new ((N-1) - old_x, old_y). Vectors rotate the same
+            # way: old +y -> new +x, old +x -> new -y.
+            for _ in range(k % 4):
+                y_new = (Ys - 1) - pts[:, 2].copy()
+                x_new = pts[:, 1].copy()
+                pts[:, 1] = y_new
+                pts[:, 2] = x_new
+                ny_new = -nrm[:, 2].copy()
+                nx_new = nrm[:, 1].copy()
+                nrm[:, 1] = ny_new
+                nrm[:, 2] = nx_new
+        out.append({**g, "points_local": pts, "normals_zyx": nrm})
+    return out
+
+
+def augment_batch_inplace(batch: dict) -> dict:
+    """Apply a single shared random flip+rot90 transform to every
+    patch-local field in a collated batch, then re-splat the
+    ``tensor_moments`` and ``normals_valid`` volumes from the
+    augmented surface_geometry.
+
+    Raw normals are transformed coherently with the points by
+    ``_transform_geometry`` (sign-flipping per axis, rotating in the
+    XY plane), so re-splatting them is the correct thing to do in
+    any flip/rot frame. We splat the 6-component second-moment
+    tensor (``nx², ny², nz², nx·ny, nx·nz, ny·nz``) rather than the
+    raw normals so that averaging is sign-invariant by construction.
+
+    Intended to be called by the training loop before
+    ``compute_batch_targets``. Val should not call this.
+    """
+    flip_z = bool(torch.rand(1).item() < 0.5)
+    flip_y = bool(torch.rand(1).item() < 0.5)
+    flip_x = bool(torch.rand(1).item() < 0.5)
+    k = int(torch.randint(0, 4, (1,)).item())
+    batch["_aug"] = (flip_z, flip_y, flip_x, k)
+    if not (flip_z or flip_y or flip_x or k):
+        return batch
+
+    def _flip_rot(t, dims):
+        dz, dy, dx = dims
+        if flip_z:
+            t = torch.flip(t, [dz])
+        if flip_y:
+            t = torch.flip(t, [dy])
+        if flip_x:
+            t = torch.flip(t, [dx])
+        if k:
+            t = torch.rot90(t, k, dims=(dy, dx))
+        return t
+
+    batch["image"] = _flip_rot(batch["image"], (2, 3, 4))
+    batch["padding_mask"] = _flip_rot(batch["padding_mask"], (2, 3, 4))
+    batch["surface_masks"] = [
+        _flip_rot(m, (1, 2, 3)) for m in batch["surface_masks"]
+    ]
+
+    B = batch["image"].shape[0]
+    Z, Y, X = batch["image"].shape[2:]
+
+    if "surface_geometry" not in batch:
+        # No geometry — best we can do is a spatial flip/rot of the
+        # already-splatted tensor volume. Tensor components are
+        # sign-invariant, so per-axis flips only require permuting
+        # the off-diagonal components that involve a flipped axis.
+        # k=rot90 in the XY plane permutes nx² ↔ ny² and signs on
+        # off-diagonals involving X/Y. We derive it from the
+        # raw-normal transform: old (nz, ny, nx) → new
+        # (nz, -nx, ny), so:
+        #   new_nx² = ny²
+        #   new_ny² = nx²
+        #   new_nz² = nz²
+        #   new (nx·ny) = (ny)·(-nx) = -(nx·ny)
+        #   new (nx·nz) = (ny)·(nz)   =  (ny·nz)
+        #   new (ny·nz) = (-nx)·(nz)  = -(nx·nz)
+        tm = _flip_rot(batch["tensor_moments"], (2, 3, 4))
+        # Axis flips: diagonals (nx², ny², nz²) unchanged. Off-
+        # diagonals pick up a sign iff they involve exactly one
+        # flipped axis (sign flips an odd number of times).
+        sgn_xy = 1.0
+        sgn_xz = 1.0
+        sgn_yz = 1.0
+        if flip_x:
+            sgn_xy = -sgn_xy
+            sgn_xz = -sgn_xz
+        if flip_y:
+            sgn_xy = -sgn_xy
+            sgn_yz = -sgn_yz
+        if flip_z:
+            sgn_xz = -sgn_xz
+            sgn_yz = -sgn_yz
+        tm[:, 3] = tm[:, 3] * sgn_xy
+        tm[:, 4] = tm[:, 4] * sgn_xz
+        tm[:, 5] = tm[:, 5] * sgn_yz
+        # rot90 around Z, k times.
+        for _ in range(k % 4):
+            nx2_old = tm[:, 0].clone()
+            ny2_old = tm[:, 1].clone()
+            nxny_old = tm[:, 3].clone()
+            nxnz_old = tm[:, 4].clone()
+            nynz_old = tm[:, 5].clone()
+            tm[:, 0] = ny2_old               # new nx² = old ny²
+            tm[:, 1] = nx2_old               # new ny² = old nx²
+            tm[:, 3] = -nxny_old             # new nx·ny = -(old nx·ny)
+            tm[:, 4] = nynz_old              # new nx·nz = old ny·nz
+            tm[:, 5] = -nxnz_old             # new ny·nz = -(old nx·nz)
+        batch["tensor_moments"] = tm
+        batch["normals_valid"] = _flip_rot(
+            batch["normals_valid"], (2, 3, 4),
+        )
+        return batch
+
+    new_tensor = torch.zeros_like(batch["tensor_moments"])
+    new_normals_valid = torch.zeros_like(batch["normals_valid"])
+
+    for b in range(B):
+        geom = _transform_geometry(
+            batch["surface_geometry"][b],
+            flip_z, flip_y, flip_x, k, (Z, Y, X),
+        )
+        batch["surface_geometry"][b] = geom
+
+        if not geom:
+            continue
+        pts_list = [g["points_local"] for g in geom if g["points_local"].shape[0]]
+        nrm_list = [g["normals_zyx"] for g in geom if g["normals_zyx"].shape[0]]
+        if not pts_list:
+            continue
+        all_pts = np.concatenate(pts_list, axis=0)
+        all_nrm = np.concatenate(nrm_list, axis=0)  # (N, 3) raw normals
+        tensor_vals = _tensor_moments_from_normals_zyx(all_nrm)  # (N, 6)
+        tensor_vol, nv = _splat_multichannel(
+            all_pts, tensor_vals, (int(Z), int(Y), int(X)),
+        )
+        new_tensor[b] = torch.as_tensor(
+            tensor_vol, dtype=new_tensor.dtype,
+        )
+        new_normals_valid[b, 0] = torch.as_tensor(
+            nv, dtype=new_normals_valid.dtype,
+        )
+
+    batch["tensor_moments"] = new_tensor
+    batch["normals_valid"] = new_normals_valid
+
+    # --- Augment cage deformation data ---
+    if "cage_ctrl_pos" in batch and batch["cage_ctrl_pos"] is not None:
+        for b_idx in range(B):
+            if b_idx >= len(batch["cage_ctrl_pos"]):
+                break
+            # ctrl_pos: list of (H_s, W_s, 3) per surface — transform as points
+            # ctrl_normals: list of (H_s, W_s, 3) per surface — transform as normals
+            for s in range(len(batch["cage_ctrl_pos"][b_idx])):
+                cp = batch["cage_ctrl_pos"][b_idx][s].clone()  # (H_s, W_s, 3) ZYX
+                cn = batch["cage_ctrl_normals"][b_idx][s].clone()
+                if cp.numel() == 0:
+                    continue
+                if flip_z:
+                    cp[..., 0] = (Z - 1) - cp[..., 0]
+                    cn[..., 0] *= -1.0
+                if flip_y:
+                    cp[..., 1] = (Y - 1) - cp[..., 1]
+                    cn[..., 1] *= -1.0
+                if flip_x:
+                    cp[..., 2] = (X - 1) - cp[..., 2]
+                    cn[..., 2] *= -1.0
+                for _ in range(k % 4):
+                    y_new = (Y - 1) - cp[..., 2].clone()
+                    x_new = cp[..., 1].clone()
+                    cp[..., 1] = y_new
+                    cp[..., 2] = x_new
+                    ny_new = -cn[..., 2].clone()
+                    nx_new = cn[..., 1].clone()
+                    cn[..., 1] = ny_new
+                    cn[..., 2] = nx_new
+                batch["cage_ctrl_pos"][b_idx][s] = cp
+                batch["cage_ctrl_normals"][b_idx][s] = cn
+
+            # grid_rc: list of (2, Z, Y, X) — spatial flip/rot
+            # grid_rc_w: list of (Z, Y, X) — spatial flip/rot
+            for s in range(len(batch["cage_grid_rc"][b_idx])):
+                batch["cage_grid_rc"][b_idx][s] = _flip_rot(
+                    batch["cage_grid_rc"][b_idx][s], (1, 2, 3),
+                )
+                batch["cage_grid_rc_w"][b_idx][s] = _flip_rot(
+                    batch["cage_grid_rc_w"][b_idx][s], (0, 1, 2),
+                )
+
+    # --- Augment fine-resolution fields ---
+    if "surface_masks_fine" in batch and batch["surface_masks_fine"] is not None:
+        batch["surface_masks_fine"] = [
+            _flip_rot(m, (1, 2, 3)) for m in batch["surface_masks_fine"]
+        ]
+    if "tensor_moments_fine" in batch and batch["tensor_moments_fine"] is not None:
+        # Same spatial + component transform as base tensor_moments
+        tmf = _flip_rot(batch["tensor_moments_fine"], (2, 3, 4))
+        # Re-splat from augmented fine geometry would be ideal, but we
+        # don't have fine geometry stored. Apply the same component
+        # permutation as the no-geometry path.
+        sgn_xy = 1.0
+        sgn_xz = 1.0
+        sgn_yz = 1.0
+        if flip_x:
+            sgn_xy = -sgn_xy
+            sgn_xz = -sgn_xz
+        if flip_y:
+            sgn_xy = -sgn_xy
+            sgn_yz = -sgn_yz
+        if flip_z:
+            sgn_xz = -sgn_xz
+            sgn_yz = -sgn_yz
+        tmf[:, 3] = tmf[:, 3] * sgn_xy
+        tmf[:, 4] = tmf[:, 4] * sgn_xz
+        tmf[:, 5] = tmf[:, 5] * sgn_yz
+        for _ in range(k % 4):
+            nx2_old = tmf[:, 0].clone()
+            ny2_old = tmf[:, 1].clone()
+            nxny_old = tmf[:, 3].clone()
+            nxnz_old = tmf[:, 4].clone()
+            nynz_old = tmf[:, 5].clone()
+            tmf[:, 0] = ny2_old
+            tmf[:, 1] = nx2_old
+            tmf[:, 3] = -nxny_old
+            tmf[:, 4] = nynz_old
+            tmf[:, 5] = -nxnz_old
+        batch["tensor_moments_fine"] = tmf
+    if "normals_valid_fine" in batch and batch["normals_valid_fine"] is not None:
+        batch["normals_valid_fine"] = _flip_rot(
+            batch["normals_valid_fine"], (2, 3, 4),
+        )
+
+    # Fine cage data — same transform as base cage data but at fine resolution
+    if "cage_ctrl_pos_fine" in batch and batch["cage_ctrl_pos_fine"] is not None:
+        # Fine resolution spatial dims (may differ from base Z, Y, X)
+        for b_idx in range(B):
+            if b_idx >= len(batch["cage_ctrl_pos_fine"]):
+                break
+            # Get fine spatial size from grid_rc_fine
+            if batch["cage_grid_rc_fine"][b_idx]:
+                fZ = batch["cage_grid_rc_fine"][b_idx][0].shape[1]
+                fY = batch["cage_grid_rc_fine"][b_idx][0].shape[2]
+                fX = batch["cage_grid_rc_fine"][b_idx][0].shape[3]
+            else:
+                fZ, fY, fX = Z, Y, X
+            for s in range(len(batch["cage_ctrl_pos_fine"][b_idx])):
+                cp = batch["cage_ctrl_pos_fine"][b_idx][s].clone()
+                cn = batch["cage_ctrl_normals_fine"][b_idx][s].clone()
+                if cp.numel() == 0:
+                    continue
+                if flip_z:
+                    cp[..., 0] = (fZ - 1) - cp[..., 0]
+                    cn[..., 0] *= -1.0
+                if flip_y:
+                    cp[..., 1] = (fY - 1) - cp[..., 1]
+                    cn[..., 1] *= -1.0
+                if flip_x:
+                    cp[..., 2] = (fX - 1) - cp[..., 2]
+                    cn[..., 2] *= -1.0
+                for _ in range(k % 4):
+                    y_new = (fY - 1) - cp[..., 2].clone()
+                    x_new = cp[..., 1].clone()
+                    cp[..., 1] = y_new
+                    cp[..., 2] = x_new
+                    ny_new = -cn[..., 2].clone()
+                    nx_new = cn[..., 1].clone()
+                    cn[..., 1] = ny_new
+                    cn[..., 2] = nx_new
+                batch["cage_ctrl_pos_fine"][b_idx][s] = cp
+                batch["cage_ctrl_normals_fine"][b_idx][s] = cn
+
+            for s in range(len(batch["cage_grid_rc_fine"][b_idx])):
+                batch["cage_grid_rc_fine"][b_idx][s] = _flip_rot(
+                    batch["cage_grid_rc_fine"][b_idx][s], (1, 2, 3),
+                )
+                batch["cage_grid_rc_w_fine"][b_idx][s] = _flip_rot(
+                    batch["cage_grid_rc_w_fine"][b_idx][s], (0, 1, 2),
+                )
+
+    # --- Augment coarse-resolution fields (_m1) ---
+    if "image_m1" in batch and batch["image_m1"] is not None:
+        batch["image_m1"] = _flip_rot(batch["image_m1"], (2, 3, 4))
+    if "image_p1" in batch and batch["image_p1"] is not None:
+        batch["image_p1"] = _flip_rot(batch["image_p1"], (2, 3, 4))
+    if "surface_masks_m1" in batch and batch["surface_masks_m1"] is not None:
+        batch["surface_masks_m1"] = [
+            _flip_rot(m, (1, 2, 3)) for m in batch["surface_masks_m1"]
+        ]
+    if "tensor_moments_m1" in batch and batch["tensor_moments_m1"] is not None:
+        tmm = _flip_rot(batch["tensor_moments_m1"], (2, 3, 4))
+        sgn_xy = 1.0
+        sgn_xz = 1.0
+        sgn_yz = 1.0
+        if flip_x:
+            sgn_xy = -sgn_xy
+            sgn_xz = -sgn_xz
+        if flip_y:
+            sgn_xy = -sgn_xy
+            sgn_yz = -sgn_yz
+        if flip_z:
+            sgn_xz = -sgn_xz
+            sgn_yz = -sgn_yz
+        tmm[:, 3] = tmm[:, 3] * sgn_xy
+        tmm[:, 4] = tmm[:, 4] * sgn_xz
+        tmm[:, 5] = tmm[:, 5] * sgn_yz
+        for _ in range(k % 4):
+            nx2_old = tmm[:, 0].clone()
+            ny2_old = tmm[:, 1].clone()
+            nxny_old = tmm[:, 3].clone()
+            nxnz_old = tmm[:, 4].clone()
+            nynz_old = tmm[:, 5].clone()
+            tmm[:, 0] = ny2_old
+            tmm[:, 1] = nx2_old
+            tmm[:, 3] = -nxny_old
+            tmm[:, 4] = nynz_old
+            tmm[:, 5] = -nxnz_old
+        batch["tensor_moments_m1"] = tmm
+    if "normals_valid_m1" in batch and batch["normals_valid_m1"] is not None:
+        batch["normals_valid_m1"] = _flip_rot(
+            batch["normals_valid_m1"], (2, 3, 4),
+        )
+
+    # Coarse cage data — same transform as base but at coarse resolution
+    if "cage_ctrl_pos_m1" in batch and batch["cage_ctrl_pos_m1"] is not None:
+        for b_idx in range(B):
+            if b_idx >= len(batch["cage_ctrl_pos_m1"]):
+                break
+            if batch["cage_grid_rc_m1"][b_idx]:
+                mZ = batch["cage_grid_rc_m1"][b_idx][0].shape[1]
+                mY = batch["cage_grid_rc_m1"][b_idx][0].shape[2]
+                mX = batch["cage_grid_rc_m1"][b_idx][0].shape[3]
+            else:
+                mZ, mY, mX = Z, Y, X
+            for s in range(len(batch["cage_ctrl_pos_m1"][b_idx])):
+                cp = batch["cage_ctrl_pos_m1"][b_idx][s].clone()
+                cn = batch["cage_ctrl_normals_m1"][b_idx][s].clone()
+                if cp.numel() == 0:
+                    continue
+                if flip_z:
+                    cp[..., 0] = (mZ - 1) - cp[..., 0]
+                    cn[..., 0] *= -1.0
+                if flip_y:
+                    cp[..., 1] = (mY - 1) - cp[..., 1]
+                    cn[..., 1] *= -1.0
+                if flip_x:
+                    cp[..., 2] = (mX - 1) - cp[..., 2]
+                    cn[..., 2] *= -1.0
+                for _ in range(k % 4):
+                    y_new = (mY - 1) - cp[..., 2].clone()
+                    x_new = cp[..., 1].clone()
+                    cp[..., 1] = y_new
+                    cp[..., 2] = x_new
+                    ny_new = -cn[..., 2].clone()
+                    nx_new = cn[..., 1].clone()
+                    cn[..., 1] = ny_new
+                    cn[..., 2] = nx_new
+                batch["cage_ctrl_pos_m1"][b_idx][s] = cp
+                batch["cage_ctrl_normals_m1"][b_idx][s] = cn
+
+            for s in range(len(batch["cage_grid_rc_m1"][b_idx])):
+                batch["cage_grid_rc_m1"][b_idx][s] = _flip_rot(
+                    batch["cage_grid_rc_m1"][b_idx][s], (1, 2, 3),
+                )
+                batch["cage_grid_rc_w_m1"][b_idx][s] = _flip_rot(
+                    batch["cage_grid_rc_w_m1"][b_idx][s], (0, 1, 2),
+                )
+
+    return batch

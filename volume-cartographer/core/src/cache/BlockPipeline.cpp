@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -256,6 +257,7 @@ static bool bytesAreCanonical(const std::vector<uint8_t>& bytes) {
 
 BlockPipeline::BlockPipeline(
     Config config,
+    BlockCache& blockCache,
     std::unique_ptr<VolumeSource> source,
     DecompressFn decompress,
     std::vector<std::unique_ptr<utils::ZarrArray>> diskLevels)
@@ -263,16 +265,6 @@ BlockPipeline::BlockPipeline(
     , diskLevels_(std::move(diskLevels))
     , source_(std::move(source))
     , decompress_(std::move(decompress))
-    // Thread sizing. Loader is pure I/O wait (disk read or shard-cache
-    // memcpy) — oversubscribe heavily so it can keep the disk queue full
-    // even when many threads are blocked on io_wait. The CPU-bound pools
-    // (encode, decode) stay near hw so concurrent decode never runs more
-    // threads than cores. CLI tools (e.g. vc_zarr_prefetch) can still
-    // override the downloader count via setIOThreads().
-    //   downloader: HTTP fetch + re-chunk (I/O bound, keep-alive pool)
-    //   encode    : h265 encode → disk (CPU, cold-miss only)
-    //   loader    : shard-cache memcpy or disk read → staged bytes (I/O)
-    //   decode    : h265 decode + block insert (pure CPU, caps work rate)
     , downloaderPool_([&] {
         if (config_.ioThreads > 0) return config_.ioThreads;
         unsigned hw = std::thread::hardware_concurrency();
@@ -284,36 +276,24 @@ BlockPipeline::BlockPipeline(
     }())
     , loaderPool_([] {
         unsigned hw = std::thread::hardware_concurrency();
-        // 4× hw: was 16× to max out disk queue depth, but read_whole_shard
-        // returns ~256 MiB per call on sharded volumes, so 192 parallel
-        // loader workers could hold tens of GiB of in-flight shard bytes
-        // and push the process into swap on 32 GiB machines. With
-        // maxConcurrentShardReads bounding the big allocations, the extra
-        // worker count is wasted threads — 4× is enough to keep the disk
-        // queue full past the backpressure gate.
         return hw ? 4 * static_cast<int>(hw) : 32;
     }())
     , decodePool_([] {
         unsigned hw = std::thread::hardware_concurrency();
         return hw ? static_cast<int>(hw) : 8;
     }())
-    , blockCache_([&] {
-        // Reserve a small residency floor per pyramid level so a coarse
-        // fallback image is always available even under heavy fine-level
-        // pressure. 4096 blocks = 16 MiB per level = ~32 canonical 128^3
-        // chunks — enough for a viewport-worth at any level. Floors are
-        // clamped inside BlockCache if they'd overwhelm the arena.
-        BlockCache::Config bcfg;
-        bcfg.bytes = config_.bytes;
-        for (auto& f : bcfg.levelFloor) f = 4096;
-        return bcfg;
-      }())
+    , blockCache_(blockCache)
 {
+    fprintf(stderr, "[BlockPipeline] constructor %p: bytes=%zu\n", (void*)this, config_.bytes);
+
     // Clear any stale process-wide HTTP abort flag from a previous
-    // BlockPipeline's destructor. Without this, a volume swap during the
-    // same session would leave the flag set and every subsequent curl
-    // request would return CURLE_ABORTED_BY_CALLBACK → silent failure.
+    // BlockPipeline's destructor.
     utils::HttpClient::resetAbort();
+
+    // Don't clear blockCache_ here — CState::setCurrentVolume already
+    // called clearMemory() + _blockCache->clear() before we got here.
+    // A second clear() would bump the generation and invalidate in-flight
+    // inserts that read the gen between the two clears.
 
     // Scan the on-disk cache once at startup so the stats bar reports
     // actual usage instead of "0 GB / 0 shards" until we write something.
@@ -785,10 +765,16 @@ skipPassthrough:
     decodePool_.start();
 }
 
-BlockPipeline::~BlockPipeline() {
+void BlockPipeline::shutdown() {
+    // Atomic exchange: if already shutting down (destructor or prior shutdown()
+    // call), skip. This makes shutdown() + ~BlockPipeline() idempotent.
+    if (shuttingDown_.exchange(true, std::memory_order_acq_rel)) {
+        fprintf(stderr, "[BlockPipeline] shutdown %p: already shut down\n", (void*)this);
+        return;
+    }
+    fprintf(stderr, "[BlockPipeline] shutdown %p: stopping pools...\n", (void*)this);
     // Release any downloader workers blocked on the backpressure CV so
     // pool.stop() can actually join them.
-    shuttingDown_.store(true, std::memory_order_release);
     encodeStagingCv_.notify_all();
     decodeStagingCv_.notify_all();
     inflightShardCv_.notify_all();
@@ -807,12 +793,22 @@ BlockPipeline::~BlockPipeline() {
     encodePool_.stop();
     loaderPool_.stop();
     decodePool_.stop();
+    // All workers have joined — safe to clear the process-global abort
+    // flag so a new pipeline can use curl without seeing a stale abort.
+    utils::HttpClient::resetAbort();
+    fprintf(stderr, "[BlockPipeline] shutdown %p: pools stopped, abort cleared\n", (void*)this);
     auto cold = statColdHits_.load();
     auto ice = statIceFetches_.load();
     if (cold > 0 || ice > 0) {
         std::fprintf(stderr, "[Cache] session summary: coldHits=%lu iceFetches=%lu (%.0f%% from disk)\n",
                      cold, ice, (cold + ice) > 0 ? 100.0 * cold / (cold + ice) : 0.0);
     }
+}
+
+BlockPipeline::~BlockPipeline() {
+    fprintf(stderr, "[BlockPipeline] destructor %p\n", (void*)this);
+    shutdown();
+    fprintf(stderr, "[BlockPipeline] destructor %p: done\n", (void*)this);
 }
 
 void BlockPipeline::bloomAdd(const ChunkKey& key) noexcept {
@@ -837,6 +833,10 @@ void BlockPipeline::bloomClear() noexcept {
 }
 
 void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targetLevel) {
+    static int fetchDbgCount = 0;
+    if (fetchDbgCount++ < 5 || fetchDbgCount % 100 == 0)
+        fprintf(stderr, "[BlockPipeline] fetchInteractive %p: %zu keys, targetLevel=%d\n",
+                (void*)this, keys.size(), targetLevel);
     if (keys.empty()) return;
     // Dedup: the renderer calls this every frame, and viewport-idle frames
     // pass the same keys + targetLevel as the previous call. When the
@@ -1086,7 +1086,7 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
     // instead of 512 separate lock/unlock pairs. acquire() returns the
     // arena slot directly so we write the 16³ block straight into its
     // final destination — no tmp buffer, no double copy.
-    BlockCache::BatchPut batch(blockCache_);
+    BlockCache::BatchPut batch(blockCache_, blockCache_.generation());
     for (int bi = 0; bi < bzN; ++bi) {
         for (int bj = 0; bj < byN; ++bj) {
             for (int bk = 0; bk < bxN; ++bk) {
@@ -1167,7 +1167,36 @@ std::array<int, 3> BlockPipeline::chunkShape(int level) const noexcept {
 }
 
 std::array<int, 3> BlockPipeline::levelShape(int level) const noexcept {
-    return source_ ? source_->levelShape(level) : std::array<int, 3>{0, 0, 0};
+    if (!source_) return {0, 0, 0};
+    auto shape = source_->levelShape(level);
+    // If this level doesn't physically exist (shape is zero), synthesize
+    // the expected shape from a level that does exist using scale factors.
+    // This allows bounds checks and coordinate transforms to work correctly
+    // for missing fine scales (e.g., scales 0-1 absent, only 2+ present).
+    if (shape[0] == 0 || shape[1] == 0 || shape[2] == 0) {
+        float sf = levelScaleFactor(level);
+        int nLevels = source_->numLevels();
+        for (int i = 0; i < nLevels; i++) {
+            auto refShape = source_->levelShape(i);
+            if (refShape[0] > 0 && refShape[1] > 0 && refShape[2] > 0) {
+                float refSf = levelScaleFactor(i);
+                float ratio = refSf / sf;  // e.g. 4.0/1.0 = 4 if ref is coarser
+                shape = {
+                    static_cast<int>(std::ceil(refShape[0] * ratio)),
+                    static_cast<int>(std::ceil(refShape[1] * ratio)),
+                    static_cast<int>(std::ceil(refShape[2] * ratio))
+                };
+                break;
+            }
+        }
+    }
+    return shape;
+}
+
+float BlockPipeline::levelScaleFactor(int vectorIndex) const noexcept {
+    // Power-of-2 scaling: level 0 → 1, level 1 → 2, level 2 → 4, etc.
+    // With padded level vectors (index = actual scale), this is always correct.
+    return static_cast<float>(size_t{1} << vectorIndex);
 }
 
 void BlockPipeline::setDataBounds(int minX, int maxX, int minY, int maxY, int minZ, int maxZ) {
@@ -1296,7 +1325,8 @@ auto BlockPipeline::stats() const -> Stats {
 }
 
 std::unique_ptr<BlockPipeline> openFilesystemPipeline(
-    VcDataset* ds, size_t maxBytes, const std::filesystem::path& datasetPath)
+    VcDataset* ds, size_t maxBytes, const std::filesystem::path& datasetPath,
+    BlockCache* sharedCache)
 {
     FileSystemSource::LevelMeta lm;
     const auto& shape = ds->shape();
@@ -1308,8 +1338,19 @@ std::unique_ptr<BlockPipeline> openFilesystemPipeline(
     auto decompress = makeVcDecompressor(ds);
     BlockPipeline::Config cfg;
     cfg.bytes = maxBytes;
-    return std::make_unique<BlockPipeline>(
-        std::move(cfg), std::move(source), std::move(decompress));
+
+    std::unique_ptr<BlockCache> ownedCache;
+    if (!sharedCache) {
+        BlockCache::Config bcfg;
+        bcfg.bytes = maxBytes;
+        for (auto& f : bcfg.levelFloor) f = 4096;
+        ownedCache = std::make_unique<BlockCache>(bcfg);
+        sharedCache = ownedCache.get();
+    }
+    auto pipeline = std::make_unique<BlockPipeline>(
+        std::move(cfg), *sharedCache, std::move(source), std::move(decompress));
+    pipeline->ownBlockCache(std::move(ownedCache));
+    return pipeline;
 }
 
 }  // namespace vc::cache
