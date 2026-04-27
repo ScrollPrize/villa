@@ -4001,18 +4001,65 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
         if (stop_gen && generation >= stop_gen)
             break;
 
-        // For every point in the fringe (where we might expand the patch outwards), add to cands all
-        // new 2D points we might add to the patch (and later find the corresponding 3D point for)
-        for(const auto& p : fringe)
-        {
-            for(const auto& n : neighs)
-                if (bounds.contains(cv::Point(p+n))
-                    && (trace_params.state(p+n) & STATE_PROCESSING) == 0
-                    && (trace_params.state(p+n) & STATE_LOC_VALID) == 0) {
-                    trace_params.state(p+n) |= STATE_PROCESSING;
-                    cands.push_back(p+n);
+        auto is_loc_valid = [&](const cv::Vec2i& p) {
+            return bounds.contains(cv::Point(p[1], p[0])) &&
+                   (trace_params.state(p) & STATE_LOC_VALID) != 0;
+        };
+
+        auto is_inside_used_area = [&](const cv::Vec2i& p) {
+            return used_area.contains(cv::Point(p[1], p[0]));
+        };
+
+        auto append_candidate = [&](const cv::Vec2i& p) {
+            if (!bounds.contains(cv::Point(p[1], p[0])) ||
+                (trace_params.state(p) & STATE_PROCESSING) != 0 ||
+                (trace_params.state(p) & STATE_LOC_VALID) != 0) {
+                return;
+            }
+
+            trace_params.state(p) |= STATE_PROCESSING;
+            cands.push_back(p);
+        };
+
+        bool used_area_fully_valid = true;
+        for (int j = used_area.y; j < used_area.br().y && used_area_fully_valid; ++j) {
+            for (int i = used_area.x; i < used_area.br().x; ++i) {
+                if ((trace_params.state(j, i) & STATE_LOC_VALID) == 0) {
+                    used_area_fully_valid = false;
+                    break;
                 }
+            }
         }
+
+        if (!used_area_fully_valid) {
+            // Irregular resumed patches should fill holes within the existing grid before
+            // growing the bounding rectangle. For right growth, this means every valid
+            // point with an invalid point immediately to its right contributes that
+            // invalid point as a candidate; the other directions follow the same rule.
+            for (int j = used_area.y; j < used_area.br().y; ++j) {
+                for (int i = used_area.x; i < used_area.br().x; ++i) {
+                    const cv::Vec2i p{j, i};
+                    if (!is_loc_valid(p)) {
+                        continue;
+                    }
+
+                    for (const auto& n : neighs) {
+                        const cv::Vec2i candidate = p + n;
+                        if (is_inside_used_area(candidate)) {
+                            append_candidate(candidate);
+                        }
+                    }
+                }
+            }
+        } else {
+            // For a rectangular patch, keep the existing fast frontier behavior.
+            for (const auto& p : fringe) {
+                for (const auto& n : neighs) {
+                    append_candidate(p + n);
+                }
+            }
+        }
+
         std::cout << "gen " << generation << " processing " << cands.size() << " fringe cands (total done " << succ << " fringe: " << fringe.size() << ")" << std::endl;
         fringe.resize(0);
 

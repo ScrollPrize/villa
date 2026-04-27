@@ -1808,6 +1808,32 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     int curr_best_inl_th = inlier_base_threshold;
     int last_succ_parametrization = 0;
 
+    auto count_loc_valid_in_rect = [](const cv::Mat_<uint8_t>& state_, const cv::Rect& area) {
+        const cv::Rect safe = area & cv::Rect(0, 0, state_.cols, state_.rows);
+        int count = 0;
+        for (int y = safe.y; y < safe.br().y; ++y)
+            for (int x = safe.x; x < safe.br().x; ++x)
+                if (state_(y, x) & STATE_LOC_VALID)
+                    ++count;
+        return count;
+    };
+
+    int best_loc_valid_count = count_loc_valid_in_rect(state, used_area);
+    cv::Mat_<cv::Vec3d> best_points = points.clone();
+    cv::Mat_<uint8_t> best_state = state.clone();
+    cv::Mat_<uint16_t> best_generations = generations.clone();
+    SurfTrackerData best_data = data;
+    cv::Rect best_used_area = used_area;
+
+    auto save_best_surface = [&](int count) {
+        best_loc_valid_count = count;
+        best_points = points.clone();
+        best_state = state.clone();
+        best_generations = generations.clone();
+        best_data = data;
+        best_used_area = used_area;
+    };
+
     std::vector<SurfTrackerData> data_ths(omp_get_max_threads());
     std::vector<std::vector<cv::Vec2i>> added_points_threads(omp_get_max_threads());
     for(int i=0;i<omp_get_max_threads();i++)
@@ -2436,6 +2462,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             for(int i=used_area.x;i<used_area.br().x-1;i++)
                 if (state(j,i) & STATE_LOC_VALID)
                     loc_valid_count++;
+        if (loc_valid_count > best_loc_valid_count) {
+            save_best_surface(loc_valid_count);
+        }
 
         bool update_mapping = (succ >= 1000 && (loc_valid_count-last_succ_parametrization) >= std::max(100.0, 0.3*last_succ_parametrization));
         if (fringe.empty() && final_opts) {
@@ -2488,11 +2517,27 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
             cv::Rect active = active_bounds & used_area;
             if (active.area() > 0) {
+                auto count_loc_valid_in = [](const cv::Mat_<uint8_t>& state_, const cv::Rect& area) {
+                    int count = 0;
+                    for (int y = area.y; y < area.br().y; ++y)
+                        for (int x = area.x; x < area.br().x; ++x)
+                            if (state_(y, x) & STATE_LOC_VALID)
+                                ++count;
+                    return count;
+                };
+                const int valid_before_opt = count_loc_valid_in(state, active);
+
                 optimize_surface_mapping(opt_data, opt_state, opt_points, active, static_bounds, step, src_step,
                                          opt_data.seed_loc, closing_r, true, tgt_dir, surface_patch_index_ptr, &overlaps, debug_images);
-                copy(opt_data, data, active);
-                opt_points(active).copyTo(points(active));
-                opt_state(active).copyTo(state(active));
+                const int valid_after_opt = count_loc_valid_in(opt_state, active);
+                if (valid_before_opt > 0 && valid_after_opt * 2 < valid_before_opt) {
+                    std::cout << "optimizer: rejecting mapping; valid points collapsed "
+                              << valid_before_opt << " -> " << valid_after_opt << std::endl;
+                } else {
+                    copy(opt_data, data, active);
+                    opt_points(active).copyTo(points(active));
+                    opt_state(active).copyTo(state(active));
+                }
 
                 for(int i=0;i<omp_get_max_threads();i++) {
                     data_ths[i] = data;
@@ -2610,11 +2655,11 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 if (add_before > 0) {
                     return std::pair<int, int>(
                         std::max(inner_start, used_start - add_before - overlap),
-                        std::min(inner_end, used_end + overlap));
+                        std::min(inner_end, used_start + overlap));
                 }
                 if (add_after > 0) {
                     return std::pair<int, int>(
-                        std::max(inner_start, used_start - overlap),
+                        std::max(inner_start, used_end - overlap),
                         std::min(inner_end, used_end + add_after + overlap));
                 }
                 return std::pair<int, int>(inner_start, inner_end);
@@ -2666,6 +2711,21 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
     approved_log.close();
 
+    const int final_loc_valid_count = count_loc_valid_in_rect(state, used_area);
+    if (best_loc_valid_count > final_loc_valid_count) {
+        std::cout << "using best growth snapshot; final valid count shrank "
+                  << final_loc_valid_count << " -> " << best_loc_valid_count << std::endl;
+        points = best_points.clone();
+        state = best_state.clone();
+        generations = best_generations.clone();
+        data = best_data;
+        used_area = best_used_area;
+        used_area_hr = scaled_rect_trunc(used_area, step);
+        loc_valid_count = best_loc_valid_count;
+    } else {
+        loc_valid_count = final_loc_valid_count;
+    }
+
     float const area_est_vx2 = loc_valid_count*src_step*src_step*step*step;
     float const area_est_cm2 = area_est_vx2 * voxelsize * voxelsize / 1e8;
     std::cout << "area est: " << area_est_vx2 << " vx^2 (" << area_est_cm2 << " cm^2)" << std::endl;
@@ -2673,17 +2733,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, used_area, step, src_step);
     cv::Mat_<uint16_t> generations_hr = surftrack_generations_hr(state, generations, used_area, step);
 
-    cv::Rect output_area_hr = valid_points_bounds(points_hr);
-    if (output_area_hr.area() <= 0) {
-        output_area_hr = used_area_hr;
-    }
-    output_area_hr = output_area_hr & cv::Rect(0, 0, points_hr.cols, points_hr.rows);
-
-    cv::Mat_<cv::Vec3d> surface_points = points_hr(output_area_hr).clone();
-    cv::Mat_<uint16_t> surface_generations = generations_hr(output_area_hr).clone();
-
-    auto surf = new QuadSurface(surface_points, {1/src_step,1/src_step});
-    surf->setChannel("generations", surface_generations);
+    auto surf = new QuadSurface(points_hr(used_area_hr), {1/src_step,1/src_step});
+    surf->setChannel("generations", generations_hr(used_area_hr));
 
     surf->meta = utils::Json::object();
     surf->meta["area_vx2"] = static_cast<double>(area_est_vx2);
