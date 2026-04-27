@@ -515,8 +515,10 @@ def _invalidate_pyramid_chunks(omezarr_path: str, data_level: int, n_levels: int
 		iz, iy, ix = iz // 2, iy // 2, ix // 2
 		level_path = os.path.join(omezarr_path, str(lv))
 		path = _zarr_chunk_path(level_path, sep, iz, iy, ix)
-		if os.path.isfile(path):
+		try:
 			os.unlink(path)
+		except FileNotFoundError:
+			pass
 
 
 def _zarr_chunk_path(level_path: str, sep: str, iz: int, iy: int, ix: int) -> str:
@@ -2111,25 +2113,55 @@ def _resolve_base_shape(
 		f = 2 ** scale
 		return (sh[0] * f, sh[1] * f, sh[2] * f)
 
-	# Auto-detect: find the finest available level in the input's zarr group
-	# and scale up to base (level 0) resolution.
+	# Auto-detect: find the zarr group root and read actual level 0 shape.
 	try:
+		import json as _json
 		inp = Path(str(input_path).rstrip("/"))
-		# Walk up to find the zarr root (directory containing .zgroup or .zattrs)
 		group_path = inp.parent if inp.name.isdigit() else inp
+
+		# Try 1: read level 0 .zarray directly (most accurate)
+		level0_zarray = group_path / "0" / ".zarray"
+		if level0_zarray.is_file():
+			with open(level0_zarray) as f:
+				meta = _json.load(f)
+			sh = tuple(int(v) for v in meta["shape"])
+			if len(sh) == 3:
+				print(f"[predict3d] base shape from level 0 .zarray: {sh}", flush=True)
+				return sh
+
+		# Try 2: read from .zattrs multiscales metadata
+		zattrs_path = group_path / ".zattrs"
+		if zattrs_path.is_file():
+			with open(zattrs_path) as f:
+				zattrs = _json.load(f)
+			ms = zattrs.get("multiscales", [])
+			if ms:
+				datasets = ms[0].get("datasets", [])
+				for ds in datasets:
+					if ds.get("path") == "0":
+						# Level 0 exists in metadata — try reading its .zarray
+						break
+				# Get level 0 shape from the group if accessible
+				grp = zarr.open_group(str(group_path), mode="r")
+				if "0" in [str(k) for k in grp.keys()]:
+					arr = grp["0"]
+					sh = tuple(int(v) for v in arr.shape)
+					if len(sh) == 3:
+						print(f"[predict3d] base shape from level 0 array: {sh}", flush=True)
+						return sh
+
+		# Try 3: fall back to finest available level × 2^level (approximate!)
 		grp = zarr.open_group(str(group_path), mode="r")
-		# Find the finest (lowest-numbered) level
 		level_keys = sorted(int(k) for k in grp.keys() if k.isdigit())
 		if level_keys:
 			finest_lv = level_keys[0]
 			arr = grp[str(finest_lv)]
 			sh = tuple(int(v) for v in arr.shape)
 			if len(sh) == 3:
-				# Scale up: level N shape × 2^N ≈ base shape
 				f = 2 ** finest_lv
 				base = (sh[0] * f, sh[1] * f, sh[2] * f)
-				print(f"[predict3d] auto-detected base shape: level {finest_lv} "
-					  f"shape={sh} × {f} → base={base}", flush=True)
+				print(f"[predict3d] WARNING: base shape estimated from level {finest_lv} "
+					  f"shape={sh} × {f} → {base} (may be off by a few voxels)", flush=True)
 				return base
 	except Exception:
 		pass
@@ -2340,6 +2372,20 @@ def run_preprocess_3d(
 		pred_per_cos = max(1, effective_cos_sd // pred_sd)
 		print(f"[predict3d] pred-dt={pred_dt_path} shape={_pred_shape} "
 			  f"pred_sd={pred_sd} pred_per_cos={pred_per_cos}", flush=True)
+		# Validate base_shape is consistent with pred zarr
+		for dim, bs, ps in zip("ZYX", base_shape_zyx, _pred_shape):
+			expected = _omezarr_level_shape(base_shape_zyx, round(_math.log2(pred_sd)) if pred_sd > 1 else 0)
+			break  # just need the tuple
+		pred_level = round(_math.log2(pred_sd)) if pred_sd > 1 else 0
+		expected_pred_shape = _omezarr_level_shape(base_shape_zyx, pred_level)
+		for dim, exp, actual in zip("ZYX", expected_pred_shape, _pred_shape):
+			if abs(exp - actual) > 1:
+				raise ValueError(
+					f"base_shape {base_shape_zyx} implies pred level {pred_level} shape "
+					f"{expected_pred_shape}, but actual pred shape is {_pred_shape}. "
+					f"Dimension {dim}: expected {exp}, got {actual}. "
+					f"Check --base-ref or ensure the input zarr group has level 0."
+				)
 
 	# --- Create OME-Zarr outputs ---
 	cos_omezarr_path = os.path.join(out_dir, f"{prefix}cos.ome.zarr")
