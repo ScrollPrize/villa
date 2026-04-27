@@ -105,6 +105,7 @@ private:
     VCCollection* _pointCollection;
 
     size_t _cacheSizeBytes;
+    std::unique_ptr<vc::cache::BlockCache> _blockCache;
 
     // Surface/POI data (formerly in CSurfaceCollection)
     std::unordered_map<std::string, std::shared_ptr<Surface>> _surfs;

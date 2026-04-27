@@ -223,26 +223,27 @@ void BlockCache::containsBatch(const std::vector<BlockKey>& keys,
     }
 }
 
-void BlockCache::put(const BlockKey& key, const uint8_t* src) noexcept
+void BlockCache::put(const BlockKey& key, const uint8_t* src, uint64_t gen) noexcept
 {
     std::unique_lock lock(arenaMutex_);
-    putLocked(key, src);
+    putLocked(key, src, gen);
 }
 
 void BlockCache::BatchPut::put(const BlockKey& key, const uint8_t* src) noexcept
 {
-    cache_.putLocked(key, src);
+    cache_.putLocked(key, src, gen_);
 }
 
 uint8_t* BlockCache::BatchPut::acquire(const BlockKey& key) noexcept
 {
-    size_t slot = cache_.acquireSlotLocked(key);
+    size_t slot = cache_.acquireSlotLocked(key, gen_);
     if (slot == SIZE_MAX) return nullptr;
     return cache_.arena_[slot].data;
 }
 
-size_t BlockCache::acquireSlotLocked(const BlockKey& key) noexcept
+size_t BlockCache::acquireSlotLocked(const BlockKey& key, uint64_t gen) noexcept
 {
+    if (gen != generation_) return SIZE_MAX;
     // Degenerate config (cache size rounded below one block) — bail
     // instead of dividing by zero in the slot-assignment arithmetic.
     if (nSlots_ == 0) return SIZE_MAX;
@@ -365,9 +366,9 @@ size_t BlockCache::acquireSlotLocked(const BlockKey& key) noexcept
     return slot;
 }
 
-void BlockCache::putLocked(const BlockKey& key, const uint8_t* src) noexcept
+void BlockCache::putLocked(const BlockKey& key, const uint8_t* src, uint64_t gen) noexcept
 {
-    const size_t slot = acquireSlotLocked(key);
+    const size_t slot = acquireSlotLocked(key, gen);
     if (slot == SIZE_MAX) return;
     std::memcpy(arena_[slot].data, src, kBlockBytes);
 }
@@ -448,9 +449,15 @@ size_t BlockCache::size() const noexcept
     return occupiedCount_;
 }
 
+uint64_t BlockCache::generation() const noexcept
+{
+    return generation_;
+}
+
 void BlockCache::clear()
 {
     std::unique_lock lock(arenaMutex_);
+    ++generation_;
     for (auto& s : shards_) {
         for (size_t i = 0; i < kShardMapSize; ++i)
             s.table[i].store(kEntryEmpty, std::memory_order_relaxed);

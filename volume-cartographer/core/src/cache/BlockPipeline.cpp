@@ -257,6 +257,7 @@ static bool bytesAreCanonical(const std::vector<uint8_t>& bytes) {
 
 BlockPipeline::BlockPipeline(
     Config config,
+    BlockCache& blockCache,
     std::unique_ptr<VolumeSource> source,
     DecompressFn decompress,
     std::vector<std::unique_ptr<utils::ZarrArray>> diskLevels)
@@ -281,18 +282,18 @@ BlockPipeline::BlockPipeline(
         unsigned hw = std::thread::hardware_concurrency();
         return hw ? static_cast<int>(hw) : 8;
     }())
-    , blockCache_([&] {
-        BlockCache::Config bcfg;
-        bcfg.bytes = config_.bytes;
-        for (auto& f : bcfg.levelFloor) f = 4096;
-        return bcfg;
-    }())
+    , blockCache_(blockCache)
 {
     fprintf(stderr, "[BlockPipeline] constructor %p: bytes=%zu\n", (void*)this, config_.bytes);
 
     // Clear any stale process-wide HTTP abort flag from a previous
     // BlockPipeline's destructor.
     utils::HttpClient::resetAbort();
+
+    // Don't clear blockCache_ here — CState::setCurrentVolume already
+    // called clearMemory() + _blockCache->clear() before we got here.
+    // A second clear() would bump the generation and invalidate in-flight
+    // inserts that read the gen between the two clears.
 
     // Scan the on-disk cache once at startup so the stats bar reports
     // actual usage instead of "0 GB / 0 shards" until we write something.
@@ -1085,7 +1086,7 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
     // instead of 512 separate lock/unlock pairs. acquire() returns the
     // arena slot directly so we write the 16³ block straight into its
     // final destination — no tmp buffer, no double copy.
-    BlockCache::BatchPut batch(blockCache_);
+    BlockCache::BatchPut batch(blockCache_, blockCache_.generation());
     for (int bi = 0; bi < bzN; ++bi) {
         for (int bj = 0; bj < byN; ++bj) {
             for (int bk = 0; bk < bxN; ++bk) {
@@ -1338,8 +1339,16 @@ std::unique_ptr<BlockPipeline> openFilesystemPipeline(
     BlockPipeline::Config cfg;
     cfg.bytes = maxBytes;
 
+    static thread_local std::unique_ptr<BlockCache> localCache;
+    if (!sharedCache) {
+        BlockCache::Config bcfg;
+        bcfg.bytes = maxBytes;
+        for (auto& f : bcfg.levelFloor) f = 4096;
+        localCache = std::make_unique<BlockCache>(bcfg);
+        sharedCache = localCache.get();
+    }
     return std::make_unique<BlockPipeline>(
-        std::move(cfg), std::move(source), std::move(decompress));
+        std::move(cfg), *sharedCache, std::move(source), std::move(decompress));
 }
 
 }  // namespace vc::cache

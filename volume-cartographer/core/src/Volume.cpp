@@ -16,6 +16,7 @@
 #include <opencv2/imgcodecs.hpp>
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Slicing.hpp"
+#include "vc/core/cache/BlockCache.hpp"
 #include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/cache/VolumeSource.hpp"
 #include "vc/core/cache/VcDecompressor.hpp"
@@ -488,8 +489,19 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
         fprintf(stderr, "[Volume] IO threads: %d\n", config.ioThreads);
     }
 
+    static thread_local std::unique_ptr<vc::cache::BlockCache> localBlockCache;
+    vc::cache::BlockCache* bc = sharedBlockCache_;
+    if (!bc) {
+        vc::cache::BlockCache::Config bcfg;
+        bcfg.bytes = cacheBudgetHot_;
+        for (auto& f : bcfg.levelFloor) f = 4096;
+        localBlockCache = std::make_unique<vc::cache::BlockCache>(bcfg);
+        bc = localBlockCache.get();
+    }
+
     auto pipeline = std::make_unique<vc::cache::BlockPipeline>(
         std::move(config),
+        *bc,
         std::move(source),
         std::move(decompress),
         std::move(diskLevels));
@@ -503,7 +515,7 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
 void Volume::ensureTieredCache() const
 {
     std::lock_guard<std::mutex> lock(cacheMutex_);
-    if (!tieredCache_ && !pipelineReset_) {
+    if (!tieredCache_) {
         fprintf(stderr, "[Volume] %p ensureTieredCache: creating pipeline (budget=%zu)\n",
                 (void*)this, cacheBudgetHot_);
         auto* self = const_cast<Volume*>(this);
@@ -525,13 +537,17 @@ void Volume::resetTieredCache()
             (void*)this, (void*)tieredCache_.get());
     std::lock_guard<std::mutex> lock(cacheMutex_);
     tieredCache_.reset();
-    pipelineReset_ = true;  // prevent zombie re-creation
     fprintf(stderr, "[Volume] %p resetTieredCache: done\n", (void*)this);
 }
 
 void Volume::setCacheBudget(size_t hotBytes)
 {
     cacheBudgetHot_ = hotBytes;
+}
+
+void Volume::setBlockCache(vc::cache::BlockCache* bc)
+{
+    sharedBlockCache_ = bc;
 }
 
 

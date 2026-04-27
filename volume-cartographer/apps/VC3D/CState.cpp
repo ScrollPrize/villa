@@ -50,26 +50,19 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
     fprintf(stderr, "[CState] setCurrentVolume: begin (old=%p new=%p)\n",
             (void*)_currentVolume.get(), (void*)vol.get());
-
-    // Shut down old pipeline workers and destroy the pipeline eagerly so
-    // we don't have two 10 GB mmaps alive simultaneously. shutdown() makes
-    // the destructor's abortAll() a no-op, and resetTieredCache() frees
-    // the BlockCache mmap before the new pipeline allocates its own.
     if (_currentVolume) {
         auto* oldPipeline = _currentVolume->tieredCache();
         if (oldPipeline) {
-            fprintf(stderr, "[CState] shutting down old pipeline %p\n", (void*)oldPipeline);
-            oldPipeline->shutdown();
+            fprintf(stderr, "[CState] clearMemory on old pipeline\n");
+            oldPipeline->clearMemory();
         }
-        fprintf(stderr, "[CState] resetting old pipeline\n");
-        _currentVolume->resetTieredCache();
     }
-
-    fprintf(stderr, "[CState] replacing _currentVolume\n");
+    if (_blockCache) {
+        _blockCache->clear();
+    }
     _currentVolume = std::move(vol);
     applyCacheBudget(_currentVolume);
     resolveCurrentVolumeId();
-
     fprintf(stderr, "[CState] emitting volumeChanged\n");
     emit volumeChanged(_currentVolume, _currentVolumeId);
     fprintf(stderr, "[CState] setCurrentVolume: done\n");
@@ -115,6 +108,14 @@ void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
 {
     if (vol && _cacheSizeBytes > 0) {
         vol->setCacheBudget(_cacheSizeBytes);
+        if (!_blockCache) {
+            vc::cache::BlockCache::Config bcfg;
+            bcfg.bytes = _cacheSizeBytes;
+            for (auto& f : bcfg.levelFloor) f = 4096;
+            const_cast<CState*>(this)->_blockCache =
+                std::make_unique<vc::cache::BlockCache>(bcfg);
+        }
+        vol->setBlockCache(_blockCache.get());
     }
 }
 
