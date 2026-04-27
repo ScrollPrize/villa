@@ -8,6 +8,7 @@
 #include "tools/SegmentationLineTool.hpp"
 #include "tools/SegmentationPushPullTool.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
+#include "tools/SurfaceMaskBrushTool.hpp"
 #include "tools/CellReoptimizationTool.hpp"
 #include "growth/SegmentationCorrections.hpp"
 #include "ViewerManager.hpp"
@@ -171,6 +172,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
         _autoApprovalRadius = _widget->autoApprovalRadius();
         _autoApprovalThreshold = _widget->autoApprovalThreshold();
         _autoApprovalMaxDistance = _widget->autoApprovalMaxDistance();
+        _drawMaskEnabled = _widget->drawMaskEnabled();
     }
 
     if (_overlay) {
@@ -187,6 +189,7 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     _pushPullTool->setAlphaConfig(initialAlphaConfig);
 
     _approvalTool = std::make_unique<ApprovalMaskBrushTool>(*this, _editManager, _widget);
+    _surfaceMaskTool = std::make_unique<SurfaceMaskBrushTool>(*this);
 
     _cellReoptTool = std::make_unique<CellReoptimizationTool>(*this, _editManager, _overlay, _pointCollection, this);
     connect(_cellReoptTool.get(), &CellReoptimizationTool::statusMessage,
@@ -357,6 +360,8 @@ void SegmentationModule::bindWidgetSignals()
 
     connect(_widget, &SegmentationWidget::editingModeChanged,
             this, &SegmentationModule::setEditingEnabled);
+    connect(_widget, &SegmentationWidget::drawMaskChanged,
+            this, &SegmentationModule::setDrawMaskEnabled);
     connect(_widget, &SegmentationWidget::dragRadiusChanged,
             this, &SegmentationModule::setDragRadius);
     connect(_widget, &SegmentationWidget::dragSigmaChanged,
@@ -600,6 +605,10 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
     if (_overlay) {
         _overlay->loadApprovalMaskImage(nullptr);
     }
+    if (_surfaceMaskTool) {
+        _surfaceMaskTool->setSurface(newSurface);
+        _surfaceMaskTool->setActive(_drawMaskEnabled);
+    }
 
     // Turn off any approval mask editing when switching segments
     if (isEditingApprovalMask()) {
@@ -797,6 +806,39 @@ void SegmentationModule::setEditUnapprovedMask(bool enabled)
         if (wasEditing) {
             saveApprovalMaskToDisk();
         }
+    }
+
+    refreshOverlay();
+}
+
+void SegmentationModule::setDrawMaskEnabled(bool enabled)
+{
+    if (_drawMaskEnabled == enabled) {
+        return;
+    }
+
+    _drawMaskEnabled = enabled;
+    _shiftDrawMaskActive = false;
+
+    if (_surfaceMaskTool) {
+        _surfaceMaskTool->setActive(_drawMaskEnabled);
+
+        QuadSurface* surface = nullptr;
+        std::shared_ptr<Surface> surfaceHolder;
+        if (_state) {
+            surfaceHolder = _state->surface("segmentation");
+            surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
+        }
+        if (!surface && _editManager && _editManager->hasSession()) {
+            surface = _editManager->baseSurface().get();
+        }
+        _surfaceMaskTool->setSurface(surface);
+    }
+
+    if (enabled) {
+        clearLineDragStroke();
+        stopAllPushPull();
+        cancelDrag();
     }
 
     refreshOverlay();
@@ -1217,22 +1259,31 @@ void SegmentationModule::refreshOverlay()
     if (_lineTool) {
         maskReserve += _lineTool->overlayPoints().size();
     }
+    if (_surfaceMaskTool) {
+        maskReserve += _surfaceMaskTool->overlayPoints().size();
+    }
     maskPoints.reserve(maskReserve);
     if (_lineTool) {
         const auto& linePts = _lineTool->overlayPoints();
         maskPoints.insert(maskPoints.end(), linePts.begin(), linePts.end());
     }
+    if (_surfaceMaskTool) {
+        const auto& surfaceMaskPts = _surfaceMaskTool->overlayPoints();
+        maskPoints.insert(maskPoints.end(), surfaceMaskPts.begin(), surfaceMaskPts.end());
+    }
 
     const bool hasLineStroke = _lineTool && !_lineTool->overlayPoints().empty();
     const bool lineStrokeActive = _lineTool && _lineTool->strokeActive();
+    const bool surfaceMaskActive = _surfaceMaskTool && _surfaceMaskTool->active();
+    const bool surfaceMaskStrokeActive = _surfaceMaskTool && _surfaceMaskTool->strokeActive();
     const bool pushPullActive = _pushPullTool && _pushPullTool->isActive();
 
     state.maskPoints = std::move(maskPoints);
     state.maskVisible = !state.maskPoints.empty();
     state.hasLineStroke = hasLineStroke;
     state.lineStrokeActive = lineStrokeActive;
-    state.brushActive = false;
-    state.brushStrokeActive = false;
+    state.brushActive = surfaceMaskActive;
+    state.brushStrokeActive = surfaceMaskStrokeActive;
     state.pushPullActive = pushPullActive;
 
     FalloffTool overlayTool = _activeFalloff;
@@ -1243,6 +1294,9 @@ void SegmentationModule::refreshOverlay()
     }
 
     state.displayRadiusSteps = falloffRadius(overlayTool);
+    if (surfaceMaskActive || surfaceMaskStrokeActive) {
+        state.displayRadiusSteps = _approvalMaskBrushRadius;
+    }
 
     if (_manualAddMode && _manualAddTool) {
         state.manualAddActive = true;
@@ -1649,6 +1703,25 @@ bool SegmentationModule::finishManualAdd(bool apply)
     }
 
     if (apply) {
+        if (_editManager) {
+            if (!_manualAddTool->finalizeSpacingRelaxation()) {
+                emit statusMessageRequested(tr("Manual Add finalization failed."), kStatusMedium);
+                return false;
+            }
+            std::optional<cv::Rect> bounds;
+            if (!_editManager->setPreviewPointsOnly(_manualAddTool->previewPoints(),
+                                                    _manualAddTool->changedVertices(),
+                                                    true,
+                                                    &bounds)) {
+                emit statusMessageRequested(tr("Manual Add final preview update failed."), kStatusMedium);
+                return false;
+            }
+            if (_state && _editManager->previewSurface()) {
+                _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+            }
+            emitPendingChanges();
+            refreshOverlay();
+        }
         if (_editManager && _editManager->hasPendingChanges()) {
             applyEdits();
         }
@@ -1721,6 +1794,35 @@ bool SegmentationModule::clearManualAddPending()
                                     ? tr("Manual Add pending geometry cleared. Press Shift+E to save, then enable Manual Add again for another fill.")
                                     : tr("Manual Add pending geometry cleared."),
                                 kStatusShort);
+    return true;
+}
+
+bool SegmentationModule::undoManualAddPlaneConstraint()
+{
+    if (!_manualAddMode || !_manualAddTool || !_editManager) {
+        return false;
+    }
+
+    std::string status;
+    if (!_manualAddTool->removeLastPlaneConstraint(&status)) {
+        emit statusMessageRequested(QString::fromStdString(status), kStatusShort);
+        return false;
+    }
+
+    std::optional<cv::Rect> bounds;
+    if (!_editManager->setPreviewPointsOnly(_manualAddTool->previewPoints(),
+                                            _manualAddTool->changedVertices(),
+                                            true,
+                                            &bounds)) {
+        emit statusMessageRequested(tr("Manual Add preview update failed."), kStatusMedium);
+        return false;
+    }
+    if (_state && _editManager->previewSurface()) {
+        _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+    }
+    emitPendingChanges();
+    refreshOverlay();
+    emit statusMessageRequested(QString::fromStdString(status), kStatusShort);
     return true;
 }
 

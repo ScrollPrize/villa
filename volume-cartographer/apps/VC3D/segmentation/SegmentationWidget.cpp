@@ -74,6 +74,9 @@ void SegmentationWidget::buildUi()
     connect(_headerRow, &SegmentationHeaderRow::editingToggled, this, [this](bool enabled) {
         updateEditingState(enabled, true);
     });
+    connect(_headerRow, &SegmentationHeaderRow::drawMaskToggled, this, [this](bool enabled) {
+        setDrawMaskEnabled(enabled);
+    });
 
     // Forward editing panel signals
     connect(_editingPanel, &SegmentationEditingPanel::dragRadiusChanged,
@@ -202,6 +205,7 @@ void SegmentationWidget::syncUiState()
 {
     if (_headerRow) {
         _headerRow->setEditingChecked(_editingEnabled);
+        _headerRow->setDrawMaskChecked(_drawMaskEnabled);
         if (_editingEnabled) {
             _headerRow->setStatusText(_pending ? tr("Editing enabled – pending changes")
                                                : tr("Editing enabled"));
@@ -216,7 +220,7 @@ void SegmentationWidget::syncUiState()
     _manualAddPanel->syncUiState(_editingEnabled, _manualAddActive);
 
     _growthPanel->syncUiState(_editingEnabled, _growthInProgress);
-    _editingPanel->setVisible(!manualAddSelected);
+    _editingPanel->setVisible(true);
     _approvalMaskPanel->setVisible(!manualAddSelected);
     _cellReoptPanel->setVisible(!manualAddSelected);
     _directionFieldPanel->setVisible(!manualAddSelected);
@@ -357,6 +361,18 @@ void SegmentationWidget::setPendingChanges(bool pending)
 void SegmentationWidget::setEditingEnabled(bool enabled)
 {
     updateEditingState(enabled, false);
+}
+
+void SegmentationWidget::setDrawMaskEnabled(bool enabled)
+{
+    if (_drawMaskEnabled == enabled) {
+        return;
+    }
+    _drawMaskEnabled = enabled;
+    if (_headerRow) {
+        _headerRow->setDrawMaskChecked(enabled);
+    }
+    emit drawMaskChanged(_drawMaskEnabled);
 }
 
 // --- Growth panel delegations ---

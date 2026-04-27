@@ -77,6 +77,8 @@ set(srcs
     segmentation/tools/SegmentationEditManager.hpp
     segmentation/tools/ApprovalMaskBrushTool.cpp
     segmentation/tools/ApprovalMaskBrushTool.hpp
+    segmentation/tools/SurfaceMaskBrushTool.cpp
+    segmentation/tools/SurfaceMaskBrushTool.hpp
     segmentation/tools/CellReoptimizationTool.cpp
     segmentation/tools/CellReoptimizationTool.hpp
     segmentation/tools/ManualAddTool.cpp
@@ -188,6 +190,7 @@ target_link_libraries(VC3D
     vc_ui
     vc_tracer
     vc_flattening
+    Ceres::ceres
     Qt6::Core
     Qt6::Concurrent
     Qt6::Gui

@@ -219,6 +219,7 @@ public:
 
     void updateStatusLabel();
     void fitSurfaceInView();
+    void requestRender();
     bool isWindowMinimized() const;
     bool eventFilter(QObject* watched, QEvent* event) override;
 

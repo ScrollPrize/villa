@@ -49,9 +49,24 @@ constexpr qreal kSurfaceOverlapZ = 45.0;  // Below approval mask
 constexpr qreal kMarkerZ = 95.0;
 constexpr qreal kRadiusCircleZ = 80.0;
 constexpr float kManualAddPlaneDistanceTolerance = 10.0f;
+constexpr qreal kManualAddIntersectionZ = 121.0;
+constexpr float kManualAddIntersectionOpacityScale = 1.2f;
+constexpr float kManualAddIntersectionWidthScale = 1.3f;
+constexpr float kManualAddIntersectionMinWidthDelta = 0.75f;
 
 // Full opacity for mask pixels - the slider controls overall opacity via QGraphicsPixmapItem::setOpacity
 constexpr int kApprovalMaskAlpha = 255;
+
+QColor manualAddIntersectionColor()
+{
+    return QColor(0, 220, 255);
+}
+
+qreal manualAddIntersectionWidth(qreal baseWidth)
+{
+    return std::max(baseWidth * kManualAddIntersectionWidthScale,
+                    baseWidth + kManualAddIntersectionMinWidthDelta);
+}
 }
 
 bool SegmentationOverlayController::State::operator==(const State& rhs) const
@@ -711,21 +726,8 @@ void SegmentationOverlayController::collectPrimitives(VolumeViewerBase* viewer,
                     }
                 }
             } else if (auto* plane = dynamic_cast<PlaneSurface*>(viewer->currentSurface())) {
-                points.reserve(line.worldPoints.size());
-                for (const cv::Vec3f& world : line.worldPoints) {
-                    if (plane->pointDist(world) <= kManualAddPlaneDistanceTolerance) {
-                        points.push_back(viewer->volumeToScene(world));
-                    } else if (points.size() >= 2) {
-                        ViewerOverlayControllerBase::OverlayStyle style;
-                        style.penColor = line.committed ? QColor(0, 220, 255, 240) : QColor(255, 220, 0, 230);
-                        style.penWidth = 3.0;
-                        style.z = 110.0;
-                        builder.addLineStrip(points, false, style);
-                        points.clear();
-                    } else {
-                        points.clear();
-                    }
-                }
+                Q_UNUSED(plane);
+                return;
             } else {
                 points = volumeToScene(viewer, line.worldPoints);
             }
@@ -759,9 +761,13 @@ void SegmentationOverlayController::collectPrimitives(VolumeViewerBase* viewer,
             auto* plane = dynamic_cast<PlaneSurface*>(viewer->currentSurface());
             if (plane) {
                 ViewerOverlayControllerBase::OverlayStyle previewStyle;
-                previewStyle.penColor = QColor(0, 220, 255, 235);
-                previewStyle.penWidth = 2.0;
-                previewStyle.z = 109.0;
+                previewStyle.penColor = manualAddIntersectionColor();
+                previewStyle.penColor.setAlphaF(std::clamp(viewer->intersectionOpacity() *
+                                                           kManualAddIntersectionOpacityScale,
+                                                           0.0f,
+                                                           1.0f));
+                previewStyle.penWidth = manualAddIntersectionWidth(viewer->intersectionThickness());
+                previewStyle.z = kManualAddIntersectionZ;
 
                 auto addUnique = [](std::vector<cv::Vec3f>& points, const cv::Vec3f& candidate) {
                     for (const cv::Vec3f& point : points) {

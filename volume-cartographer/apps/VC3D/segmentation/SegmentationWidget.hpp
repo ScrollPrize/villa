@@ -36,6 +36,7 @@ public:
     explicit SegmentationWidget(QWidget* parent = nullptr);
 
     [[nodiscard]] bool isEditingEnabled() const { return _editingEnabled; }
+    [[nodiscard]] bool drawMaskEnabled() const { return _drawMaskEnabled; }
     [[nodiscard]] float dragRadius() const;
     [[nodiscard]] float dragSigma() const;
     [[nodiscard]] float lineRadius() const;
@@ -87,6 +88,7 @@ public:
 
     void setPendingChanges(bool pending);
     void setEditingEnabled(bool enabled);
+    void setDrawMaskEnabled(bool enabled);
     void setDragRadius(float value);
     void setDragSigma(float value);
     void setLineRadius(float value);
@@ -204,6 +206,7 @@ public:
 
 signals:
     void editingModeChanged(bool enabled);
+    void drawMaskChanged(bool enabled);
     void dragRadiusChanged(float value);
     void dragSigmaChanged(float value);
     void lineRadiusChanged(float value);
@@ -275,6 +278,7 @@ private:
     void updateEditingState(bool enabled, bool notifyListeners);
 
     bool _editingEnabled{false};
+    bool _drawMaskEnabled{false};
     bool _pending{false};
     bool _growthInProgress{false};
     bool _restoringSettings{false};

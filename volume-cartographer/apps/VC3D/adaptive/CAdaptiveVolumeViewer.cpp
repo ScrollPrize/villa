@@ -1694,6 +1694,12 @@ void CAdaptiveVolumeViewer::renderIntersections()
     }
 }
 
+void CAdaptiveVolumeViewer::requestRender()
+{
+    scheduleRender();
+    emit overlaysUpdated();
+}
+
 void CAdaptiveVolumeViewer::renderIntersectionsNow()
 {
     auto surf = _surfWeak.lock();

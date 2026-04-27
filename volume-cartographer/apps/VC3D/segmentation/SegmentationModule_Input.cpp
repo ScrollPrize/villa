@@ -3,6 +3,7 @@
 #include "adaptive/CAdaptiveVolumeViewer.hpp"
 #include "tools/SegmentationBrushTool.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
+#include "tools/SurfaceMaskBrushTool.hpp"
 #include "tools/CellReoptimizationTool.hpp"
 #include "growth/SegmentationCorrections.hpp"
 #include "tools/SegmentationEditManager.hpp"
@@ -13,6 +14,7 @@
 #include "../Keybinds.hpp"
 
 #include "vc/core/util/PlaneSurface.hpp"
+#include "vc/core/util/QuadSurface.hpp"
 
 #include <QKeyEvent>
 #include <QKeySequence>
@@ -41,6 +43,21 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
     }
 
     if (_manualAddMode) {
+        if (!event->isAutoRepeat()) {
+            const bool undoRequested =
+                event->matches(vc3d::keybinds::standard::Undo) ||
+                (event->key() == vc3d::keybinds::keypress::SegmentationUndo.key &&
+                 (event->modifiers() & vc3d::keybinds::keypress::SegmentationUndo.modifiers) ==
+                     vc3d::keybinds::keypress::SegmentationUndo.modifiers);
+            if (undoRequested) {
+                if (undoManualAddPlaneConstraint()) {
+                    event->accept();
+                    return true;
+                }
+                return false;
+            }
+        }
+
         const bool manualAddLineModeCycle =
             !event->isAutoRepeat() &&
             event->key() == Qt::Key_Q &&
@@ -328,6 +345,18 @@ bool SegmentationModule::handleKeyRelease(QKeyEvent* event)
         return true;
     }
 
+    if (event->key() == Qt::Key_Shift && !event->isAutoRepeat() && _shiftDrawMaskActive) {
+        if (_surfaceMaskTool) {
+            if (_surfaceMaskTool->strokeActive()) {
+                _surfaceMaskTool->finishStroke();
+            }
+            _surfaceMaskTool->setActive(_drawMaskEnabled);
+        }
+        _shiftDrawMaskActive = false;
+        event->accept();
+        return true;
+    }
+
     const bool pushPullKey =
         (event->key() == vc3d::keybinds::keypress::PushPullIn.key ||
          event->key() == vc3d::keybinds::keypress::PushPullOut.key);
@@ -352,8 +381,26 @@ void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
                                           const QPointF& scenePos)
 {
     const bool isLeftButton = (button == Qt::LeftButton);
+    const bool isRightButton = (button == Qt::RightButton);
 
     if (_manualAddMode && handleManualAddMousePress(viewer, worldPos, button, modifiers, scenePos)) {
+        return;
+    }
+
+    const bool drawMaskRequested = _drawMaskEnabled ||
+                                   modifiers.testFlag(Qt::ShiftModifier);
+    if (drawMaskRequested && isRightButton && viewer && isSegmentationViewer(viewer) && _surfaceMaskTool) {
+        auto* surface = dynamic_cast<QuadSurface*>(viewer->currentSurface());
+        if (!surface && _editManager && _editManager->hasSession()) {
+            surface = _editManager->baseSurface().get();
+        }
+        if (surface) {
+            _shiftDrawMaskActive = !_drawMaskEnabled && modifiers.testFlag(Qt::ShiftModifier);
+            _surfaceMaskTool->setSurface(surface);
+            _surfaceMaskTool->setActive(true);
+            const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
+            _surfaceMaskTool->startStroke(QPointF(surfCoords[0], surfCoords[1]));
+        }
         return;
     }
 
@@ -488,9 +535,23 @@ void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
                                          Qt::KeyboardModifiers modifiers,
                                          const QPointF& scenePos)
 {
-    Q_UNUSED(modifiers);
-
     if (_manualAddMode && handleManualAddMouseMove(viewer, buttons, scenePos)) {
+        return;
+    }
+
+    const bool maskStrokeActive = _surfaceMaskTool && _surfaceMaskTool->strokeActive();
+    if (maskStrokeActive) {
+        if (buttons.testFlag(Qt::RightButton) &&
+            (_drawMaskEnabled || modifiers.testFlag(Qt::ShiftModifier))) {
+            const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
+            _surfaceMaskTool->extendStroke(QPointF(surfCoords[0], surfCoords[1]), false);
+        } else {
+            _surfaceMaskTool->finishStroke();
+            if (_shiftDrawMaskActive) {
+                _surfaceMaskTool->setActive(_drawMaskEnabled);
+                _shiftDrawMaskActive = false;
+            }
+        }
         return;
     }
 
@@ -600,6 +661,20 @@ void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
         Q_UNUSED(worldPos);
         Q_UNUSED(button);
         Q_UNUSED(scenePos);
+        return;
+    }
+
+    const bool maskStrokeActive = _surfaceMaskTool && _surfaceMaskTool->strokeActive();
+    if (maskStrokeActive && button == Qt::RightButton) {
+        if (_surfaceMaskTool && viewer) {
+            const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
+            _surfaceMaskTool->extendStroke(QPointF(surfCoords[0], surfCoords[1]), true);
+            _surfaceMaskTool->finishStroke();
+            if (_shiftDrawMaskActive) {
+                _surfaceMaskTool->setActive(_drawMaskEnabled);
+                _shiftDrawMaskActive = false;
+            }
+        }
         return;
     }
 

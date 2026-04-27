@@ -54,6 +54,7 @@ class QTimer;
 class SegmentationLineTool;
 class SegmentationPushPullTool;
 class ApprovalMaskBrushTool;
+class SurfaceMaskBrushTool;
 class CellReoptimizationTool;
 
 class SegmentationModule : public QObject
@@ -91,10 +92,12 @@ public:
     void setShowApprovalMask(bool enabled);
     void setEditApprovedMask(bool enabled);
     void setEditUnapprovedMask(bool enabled);
+    void setDrawMaskEnabled(bool enabled);
     void onActiveSegmentChanged(QuadSurface* newSurface);
     [[nodiscard]] bool showApprovalMask() const { return _showApprovalMask; }
     [[nodiscard]] bool editApprovedMask() const { return _editApprovedMask; }
     [[nodiscard]] bool editUnapprovedMask() const { return _editUnapprovedMask; }
+    [[nodiscard]] bool drawMaskEnabled() const { return _drawMaskEnabled; }
     [[nodiscard]] bool autoApprovalEnabled() const { return _autoApprovalEnabled; }
     [[nodiscard]] float autoApprovalRadius() const { return _autoApprovalRadius; }
     [[nodiscard]] float autoApprovalThreshold() const { return _autoApprovalThreshold; }
@@ -196,6 +199,7 @@ private:
     friend class SegmentationLineTool;
     friend class SegmentationPushPullTool;
     friend class ApprovalMaskBrushTool;
+    friend class SurfaceMaskBrushTool;
     friend class SegmentationBrushTool;
     friend class segmentation::CorrectionsState;
 
@@ -283,6 +287,7 @@ private:
     bool finishManualAdd(bool apply);
     bool recomputeManualAdd();
     bool clearManualAddPending();
+    bool undoManualAddPlaneConstraint();
     bool handleManualAddMousePress(CTiledVolumeViewer* viewer,
                                    const cv::Vec3f& worldPos,
                                    Qt::MouseButton button,
@@ -388,6 +393,7 @@ private:
     std::unique_ptr<SegmentationLineTool> _lineTool;
     std::unique_ptr<SegmentationPushPullTool> _pushPullTool;
     std::unique_ptr<ApprovalMaskBrushTool> _approvalTool;
+    std::unique_ptr<SurfaceMaskBrushTool> _surfaceMaskTool;
     std::unique_ptr<CellReoptimizationTool> _cellReoptTool;
     std::unique_ptr<ManualAddTool> _manualAddTool;
     bool _manualAddMode{false};
@@ -399,6 +405,8 @@ private:
     uint64_t _cellReoptCollectionId{0};  // Specific collection for cell reopt (0 = use all)
     bool _editApprovedMask{false};
     bool _editUnapprovedMask{false};
+    bool _drawMaskEnabled{false};
+    bool _shiftDrawMaskActive{false};
     bool _autoApprovalEnabled{true};
     float _autoApprovalRadius{0.5f};
     float _autoApprovalThreshold{0.0f};

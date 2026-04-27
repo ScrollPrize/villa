@@ -140,6 +140,15 @@ void CVolumeViewerView::mouseReleaseEvent(QMouseEvent *event)
     }
     else if (event->button() == Qt::RightButton)
     {
+        if (_right_button_mouse_forwarded) {
+            QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
+            QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
+            sendMouseRelease(scene_loc, event->button(), event->modifiers());
+            _right_button_mouse_forwarded = false;
+            event->accept();
+            return;
+        }
+
         setCursor(Qt::ArrowCursor);
         event->accept();
         if (_regular_pan) {
@@ -216,6 +225,15 @@ void CVolumeViewerView::mousePressEvent(QMouseEvent *event)
     }
     else if (event->button() == Qt::RightButton)
     {
+        if (event->modifiers().testFlag(Qt::ShiftModifier)) {
+            QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
+            QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
+            _right_button_mouse_forwarded = true;
+            sendMousePress(scene_loc, event->button(), event->modifiers());
+            event->accept();
+            return;
+        }
+
         _regular_pan = true;
         _last_pan_position = QPoint(event->position().x(), event->position().y());
         sendPanStart(event->button(), event->modifiers());
