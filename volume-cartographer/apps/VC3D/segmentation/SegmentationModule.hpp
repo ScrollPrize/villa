@@ -285,6 +285,7 @@ private:
                                     bool inpaintOnly);
     bool beginManualAdd();
     bool finishManualAdd(bool apply);
+    void resetManualAddState(bool restorePreview);
     bool recomputeManualAdd();
     bool clearManualAddPending();
     bool undoManualAddPlaneConstraint();

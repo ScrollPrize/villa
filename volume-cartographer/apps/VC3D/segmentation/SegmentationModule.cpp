@@ -544,6 +544,7 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     }
     updateViewerCursors();
     if (!enabled) {
+        resetManualAddState(true);
         stopAllPushPull();
         setCorrectionsAnnotateMode(false, false);
         clearLineDragStroke();
@@ -596,6 +597,8 @@ void SegmentationModule::setShowApprovalMask(bool enabled)
 void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
 {
     qCInfo(lcSegModule) << "Active segment changed";
+
+    resetManualAddState(true);
 
     // Flush any pending approval mask saves and clear images BEFORE turning off editing
     // loadApprovalMaskImage(nullptr) does both:
@@ -1739,6 +1742,38 @@ bool SegmentationModule::finishManualAdd(bool apply)
     }
     refreshOverlay();
     return true;
+}
+
+void SegmentationModule::resetManualAddState(bool restorePreview)
+{
+    if (_manualAddMode && _manualAddTool && restorePreview && _editManager) {
+        _editManager->restorePreviewSnapshot(_manualAddTool->entrySnapshotPoints());
+        if (_state && _editManager->previewSurface()) {
+            _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+        }
+        emitPendingChanges();
+    }
+
+    if (_manualAddTool) {
+        _manualAddTool->clear();
+    }
+
+    const bool wasManualAddMode = _manualAddMode;
+    _manualAddMode = false;
+
+    if (_widget) {
+        _widget->setManualAddActive(false);
+        if (_widget->growthMethod() == SegmentationGrowthMethod::ManualAdd) {
+            const auto fallback = _previousGrowthMethodBeforeManualAdd == SegmentationGrowthMethod::ManualAdd
+                ? SegmentationGrowthMethod::Tracer
+                : _previousGrowthMethodBeforeManualAdd;
+            _widget->setGrowthMethod(fallback);
+        }
+    }
+
+    if (wasManualAddMode) {
+        refreshOverlay();
+    }
 }
 
 bool SegmentationModule::recomputeManualAdd()
