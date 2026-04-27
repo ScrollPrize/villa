@@ -157,10 +157,26 @@ std::string CState::currentVolumeId() const { return _currentVolumeId; }
 
 void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
+    fprintf(stderr, "[CState] setCurrentVolume: begin (old=%p new=%p)\n",
+            (void*)_currentVolume.get(), (void*)vol.get());
+    if (_currentVolume) {
+        auto* oldPipeline = _currentVolume->tieredCache();
+        if (oldPipeline) {
+            fprintf(stderr, "[CState] shutdown + clearMemory on old pipeline\n");
+            oldPipeline->shutdown();
+            oldPipeline->clearMemory();
+        }
+        _currentVolume->resetTieredCache();
+    }
+    if (_blockCache) {
+        _blockCache->clear();
+    }
     _currentVolume = std::move(vol);
     applyCacheBudget(_currentVolume);
     resolveCurrentVolumeId();
+    fprintf(stderr, "[CState] emitting volumeChanged\n");
     emit volumeChanged(_currentVolume, _currentVolumeId);
+    fprintf(stderr, "[CState] setCurrentVolume: done\n");
 }
 
 std::string CState::segmentationGrowthVolumeId() const { return _segmentationGrowthVolumeId; }
@@ -203,9 +219,14 @@ void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
 {
     if (vol && _cacheSizeBytes > 0) {
         vol->setCacheBudget(_cacheSizeBytes);
-        // Leave ioThreads at default (0) so BlockPipeline's interactive
-        // sizing (half hw download/load, quarter hw encode) kicks in.
-        // CLI tools can still force a full-hw count via setIOThreads.
+        if (!_blockCache) {
+            vc::cache::BlockCache::Config bcfg;
+            bcfg.bytes = _cacheSizeBytes;
+            for (auto& f : bcfg.levelFloor) f = 4096;
+            const_cast<CState*>(this)->_blockCache =
+                std::make_unique<vc::cache::BlockCache>(bcfg);
+        }
+        vol->setBlockCache(_blockCache.get());
     }
 }
 

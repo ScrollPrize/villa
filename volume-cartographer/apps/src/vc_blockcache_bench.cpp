@@ -73,7 +73,7 @@ std::vector<BlockKey> populate(BlockCache& cache, size_t nKeys) {
     for (size_t i = 0; i < nKeys; ++i) {
         BlockKey k{0, int(i / 1024), int((i / 32) & 31), int(i & 31)};
         keys.push_back(k);
-        cache.put(k, pattern.data());
+        cache.put(k, pattern.data(), cache.generation());
     }
     return keys;
 }
@@ -148,7 +148,7 @@ Phase benchPutBatch(BlockCache& cache, int threads, uint64_t chunkIterPerThread)
                 // thrash on identical keys — models concurrent chunk
                 // insertion from different levels/regions.
                 const int baseBz = tid * 64 + int((c & 0xff) * threads);
-                BlockCache::BatchPut batch(cache);
+                BlockCache::BatchPut batch(cache, cache.generation());
                 for (int bi = 0; bi < 8; ++bi)
                   for (int bj = 0; bj < 8; ++bj)
                     for (int bk = 0; bk < 8; ++bk) {

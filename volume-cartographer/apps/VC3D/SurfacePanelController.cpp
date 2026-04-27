@@ -92,6 +92,14 @@ SurfacePanelController::SurfacePanelController(const UiRefs& ui,
                 this, &SurfacePanelController::handleTreeSelectionChanged);
         connect(_ui.treeWidget, &QWidget::customContextMenuRequested,
                 this, &SurfacePanelController::showContextMenu);
+        connect(_ui.treeWidget, &QTreeWidget::itemDoubleClicked,
+                this, [this](QTreeWidgetItem* item, int /*column*/) {
+            if (!item) return;
+            const QString segId = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
+            if (!segId.isEmpty()) {
+                emit focusSurfaceRequested(segId);
+            }
+        });
     }
 }
 
@@ -889,6 +897,13 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         }
     }
 
+    if (selectedSegmentIds.size() == 1) {
+        QAction* focusAction = contextMenu.addAction(tr("Focus"));
+        connect(focusAction, &QAction::triggered, this, [this, segmentId]() {
+            emit focusSurfaceRequested(segmentId);
+        });
+    }
+
     QAction* copyPathAction = contextMenu.addAction(tr("Copy Segment Path"));
     connect(copyPathAction, &QAction::triggered, this, [this, segmentId]() {
         emit copySegmentPathRequested(segmentId);
@@ -1001,6 +1016,10 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     QAction* convertToObjAction = contextMenu.addAction(tr("Convert to OBJ"));
     connect(convertToObjAction, &QAction::triggered, this, [this, segmentId]() {
         emit convertToObjRequested(segmentId);
+    });
+    QAction* visObjAction = contextMenu.addAction(tr("Lasagna Vis as OBJ"));
+    connect(visObjAction, &QAction::triggered, this, [this, segmentId]() {
+        emit visLasagnaObjRequested(segmentId);
     });
     QAction* cropBoundsAction = contextMenu.addAction(tr("Crop bounds to valid region"));
     connect(cropBoundsAction, &QAction::triggered, this, [this, segmentId]() {

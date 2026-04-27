@@ -97,15 +97,15 @@ public:
                        std::vector<uint8_t>& out) const;
 
     // Insert, copying kBlockBytes from `src`. Evicts NRU entries if full.
-    void put(const BlockKey& key, const uint8_t* src) noexcept;
+    void put(const BlockKey& key, const uint8_t* src, uint64_t gen) noexcept;
 
     // Scoped batch-put: take the unique_lock once, call put() many times,
     // release on destruction. Eliminates 512 lock/unlock pairs per 128³
     // chunk insert in the sampler hot path.
     class BatchPut {
     public:
-        explicit BatchPut(BlockCache& cache) noexcept
-            : cache_(cache), lock_(cache.arenaMutex_) {}
+        explicit BatchPut(BlockCache& cache, uint64_t gen) noexcept
+            : cache_(cache), gen_(gen), lock_(cache.arenaMutex_) {}
         BatchPut(const BatchPut&) = delete;
         BatchPut& operator=(const BatchPut&) = delete;
         void put(const BlockKey& key, const uint8_t* src) noexcept;
@@ -118,6 +118,7 @@ public:
         [[nodiscard]] uint8_t* acquire(const BlockKey& key) noexcept;
     private:
         BlockCache& cache_;
+        uint64_t gen_;
         std::unique_lock<std::shared_mutex> lock_;
     };
 
@@ -137,18 +138,20 @@ public:
         return evictionVersion_.load(std::memory_order_relaxed);
     }
 
+    [[nodiscard]] uint64_t generation() const noexcept;
     void clear();
 
 private:
     // Body of put()/BatchPut::put — assumes unique_lock on arenaMutex_ is held.
-    void putLocked(const BlockKey& key, const uint8_t* src) noexcept;
+    void putLocked(const BlockKey& key, const uint8_t* src, uint64_t gen) noexcept;
     // Reserve a slot (overwrite if key exists, else allocate/reclaim). Returns
     // SIZE_MAX iff nSlots_==0. Updates shard map/slotKey_/occupancy.
-    [[nodiscard]] size_t acquireSlotLocked(const BlockKey& key) noexcept;
+    [[nodiscard]] size_t acquireSlotLocked(const BlockKey& key, uint64_t gen) noexcept;
     [[nodiscard]] size_t reclaimSlotLocked();
 
     Config config_;
     size_t nSlots_ = 0;
+    std::atomic<uint64_t> generation_{0};
 
     // Contiguous mmap'd arena of Block objects. Virtual region is sized at
     // startup; a background thread pre-faults pages in 1 GB increments via

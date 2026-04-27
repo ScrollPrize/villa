@@ -36,6 +36,7 @@ public:
     struct LevelMeta {
         std::array<int, 3> shape;
         std::array<int, 3> chunkShape;
+        std::string dirName;  // actual directory name (e.g. "3" for scale 3)
     };
 
     explicit FileSystemSource(
