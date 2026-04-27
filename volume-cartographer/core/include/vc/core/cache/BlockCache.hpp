@@ -151,7 +151,7 @@ private:
 
     Config config_;
     size_t nSlots_ = 0;
-    uint64_t generation_ = 0;
+    std::atomic<uint64_t> generation_{0};
 
     // Contiguous mmap'd arena of Block objects. Virtual region is sized at
     // startup; a background thread pre-faults pages in 1 GB increments via

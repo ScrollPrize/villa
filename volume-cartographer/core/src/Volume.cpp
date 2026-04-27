@@ -124,7 +124,10 @@ void Volume::zarrOpen()
             try {
                 int lvl = std::stoi(ds->path().filename().string());
                 maxLevel = std::max(maxLevel, lvl);
-            } catch (...) {}
+            } catch (...) {
+                fprintf(stderr, "[Volume] skipping non-numeric zarr level '%s'\n",
+                        ds->path().filename().string().c_str());
+            }
         }
         zarrDs_.resize(maxLevel + 1);
         for (auto& ds : compactDs) {

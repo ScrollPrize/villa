@@ -451,13 +451,13 @@ size_t BlockCache::size() const noexcept
 
 uint64_t BlockCache::generation() const noexcept
 {
-    return generation_;
+    return generation_.load(std::memory_order_relaxed);
 }
 
 void BlockCache::clear()
 {
     std::unique_lock lock(arenaMutex_);
-    ++generation_;
+    generation_.fetch_add(1, std::memory_order_relaxed);
     for (auto& s : shards_) {
         for (size_t i = 0; i < kShardMapSize; ++i)
             s.table[i].store(kEntryEmpty, std::memory_order_relaxed);
