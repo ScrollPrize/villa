@@ -435,15 +435,25 @@ def optimize(
 					total = total + w * lv
 			return total, tv
 
-		# Initial prefetch for streaming mode
+		# Streaming mode: filter caches to only those needed by this stage
+		# grad_mag/nx/ny are always needed; cos and pred_dt are conditional
+		_active_caches = []
 		if data.sparse_caches:
+			_always_needed = {"grad_mag", "nx", "ny"}
+			_stage_channels = _always_needed | _needed_channels
+			for _cache in data.sparse_caches.values():
+				if _stage_channels & set(_cache.channels):
+					_active_caches.append(_cache)
+
+		# Initial prefetch for streaming mode
+		if _active_caches:
 			with torch.no_grad():
 				_xyz_lr_pf = model._grid_xyz()
 				_xyz_hr_pf = model._grid_xyz_hr(_xyz_lr_pf)
-			for _cache in data.sparse_caches.values():
+			for _cache in _active_caches:
 				_sp = data._spacing_for(_cache.channels[0])
 				_cache.prefetch(_xyz_hr_pf, data.origin_fullres, _sp)
-			for _cache in data.sparse_caches.values():
+			for _cache in _active_caches:
 				_cache.sync()
 
 		with torch.no_grad():
@@ -469,8 +479,8 @@ def optimize(
 
 		for step in range(max_steps):
 			# Sync: wait for chunks loaded by last prefetch
-			if data.sparse_caches:
-				for _cache in data.sparse_caches.values():
+			if _active_caches:
+				for _cache in _active_caches:
 					_cache.sync()
 
 			if fit_data.CHUNK_STATS_ENABLED:
@@ -487,13 +497,15 @@ def optimize(
 			model.update_ext_conn_offsets()
 
 			# Prefetch: predict next iteration's chunks from updated mesh
-			if data.sparse_caches:
+			if _active_caches:
 				with torch.no_grad():
 					_xyz_lr_pf = model._grid_xyz()
 					_xyz_hr_pf = model._grid_xyz_hr(_xyz_lr_pf)
-				for _cache in data.sparse_caches.values():
+				for _cache in _active_caches:
 					_sp = data._spacing_for(_cache.channels[0])
 					_cache.prefetch(_xyz_hr_pf, data.origin_fullres, _sp)
+				for _cache in _active_caches:
+					_cache.end_iteration()
 			_t_steps_acc += 1
 			_done_steps[0] += 1
 

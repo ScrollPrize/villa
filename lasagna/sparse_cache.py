@@ -1,6 +1,7 @@
 """Sparse GPU chunk cache for streaming zarr volumes."""
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor, Future
 from typing import TYPE_CHECKING
 
@@ -82,7 +83,12 @@ class SparseChunkGroupCache:
         self._pending: list[Future] = []
         self._transfer_stream = torch.cuda.Stream(device=device)
 
-        cZ, cY, cX = self.chunk_grid
+        # Stats: accumulated over 100-iteration windows
+        self._iter_count: int = 0
+        self._acc_new_chunks: int = 0
+        self._acc_fetch_ms: float = 0.0
+        self._last_sync_new: int = 0  # chunks from most recent sync
+
         table_mib = cZ * cY * cX * 8 / 1024**2
         print(f"[sparse_cache] {','.join(channels)}: chunk_grid={cZ}x{cY}x{cX} "
               f"vol={Z}x{Y}x{X} table={table_mib:.1f}MiB", flush=True)
@@ -118,7 +124,6 @@ class SparseChunkGroupCache:
 
         coords = missing.nonzero().cpu()  # (N, 3) — (cz, cy, cx)
         n_missing = coords.shape[0]
-        print(f"[sparse_cache] {','.join(self.channels)}: prefetch {n_missing} chunks", flush=True)
 
         # Submit reads to thread pool
         for i in range(n_missing):
@@ -171,8 +176,10 @@ class SparseChunkGroupCache:
     def sync(self) -> None:
         """Wait for pending chunk loads, batch-transfer to GPU, update chunk_table."""
         if not self._pending:
+            self._last_sync_new = 0
             return
 
+        t0 = time.perf_counter()
         results = [f.result() for f in self._pending]
         self._pending.clear()
 
@@ -202,6 +209,27 @@ class SparseChunkGroupCache:
         for i, (cz, cy, cx) in enumerate(coords_list):
             ptr = base_ptr + i * chunk_bytes
             self.chunk_table[cz, cy, cx] = ptr
+
+        dt_ms = (time.perf_counter() - t0) * 1000.0
+        self._last_sync_new = n
+        self._acc_new_chunks += n
+        self._acc_fetch_ms += dt_ms
+
+    def end_iteration(self) -> None:
+        """Call once per optimizer iteration to accumulate stats and print every 100."""
+        self._iter_count += 1
+        if self._iter_count % 100 == 0:
+            n = self._acc_new_chunks
+            ms = self._acc_fetch_ms
+            ms_per_it = ms / 100.0
+            ms_per_chunk = ms / n if n > 0 else 0.0
+            total = self.loaded_chunks()
+            total_mib = self.loaded_mib()
+            print(f"[sparse_cache] {','.join(self.channels)}: "
+                  f"+{n} chunks in 100it ({ms_per_it:.1f}ms/it, {ms_per_chunk:.1f}ms/chunk) "
+                  f"total={total} ({total_mib:.1f}MiB)", flush=True)
+            self._acc_new_chunks = 0
+            self._acc_fetch_ms = 0.0
 
     def grid_sample(self, xyz_fullres: torch.Tensor, origin: torch.Tensor,
                     inv_scale: torch.Tensor, *, diff: bool = False) -> torch.Tensor:
