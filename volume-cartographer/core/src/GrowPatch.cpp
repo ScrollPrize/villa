@@ -3361,6 +3361,11 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
         start_gen = (rewind_gen == -1) ? static_cast<int>(max_val) : rewind_gen;
         generation = start_gen;
 
+        const bool preserve_all_resume_points = rewind_gen == -1;
+        const uint16_t fallback_resume_gen = static_cast<uint16_t>(std::max(1, start_gen));
+        int imported_zero_generation_points = 0;
+        int skipped_rewind_points = 0;
+
         int min_gen = std::numeric_limits<int>::max();
         x0 = -1;
         y0 = -1;
@@ -3369,18 +3374,43 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
                 int target_y = resume_pad_y + j;
                 int target_x = resume_pad_x + i;
                 uint16_t gen = resume_generations.at<uint16_t>(j, i);
-                if (gen > 0 && gen <= start_gen && resume_points(j,i)[0] != -1) {
-                    trace_params.dpoints(target_y, target_x) = resume_points(j, i);
-                    generations(target_y, target_x) = gen;
-                    succ++;
-                    trace_params.state(target_y, target_x) = STATE_LOC_VALID | STATE_COORD_VALID;
-                    if (gen < min_gen) {
-                        min_gen = gen;
-                        x0 = target_x;
-                        y0 = target_y;
+                if (resume_points(j,i)[0] == -1) {
+                    continue;
+                }
+
+                if (gen == 0) {
+                    if (!preserve_all_resume_points) {
+                        continue;
                     }
+                    gen = fallback_resume_gen;
+                    ++imported_zero_generation_points;
+                } else if (gen > start_gen) {
+                    if (!preserve_all_resume_points) {
+                        ++skipped_rewind_points;
+                        continue;
+                    }
+                    gen = fallback_resume_gen;
+                }
+
+                trace_params.dpoints(target_y, target_x) = resume_points(j, i);
+                generations(target_y, target_x) = gen;
+                succ++;
+                trace_params.state(target_y, target_x) = STATE_LOC_VALID | STATE_COORD_VALID;
+                if (gen < min_gen) {
+                    min_gen = gen;
+                    x0 = target_x;
+                    y0 = target_y;
                 }
             }
+        }
+
+        if (imported_zero_generation_points > 0) {
+            std::cout << "Resume import preserved " << imported_zero_generation_points
+                      << " valid points with zero generation metadata." << std::endl;
+        }
+        if (skipped_rewind_points > 0) {
+            std::cout << "Resume import skipped " << skipped_rewind_points
+                      << " points newer than rewind generation " << start_gen << "." << std::endl;
         }
 
         trace_data.point_correction = PointCorrection(corrections);

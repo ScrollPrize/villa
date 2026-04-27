@@ -429,11 +429,9 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
     }
 
     params["generations"] = targetGenerations;
-    int rewindGen = -1;
-    if (startGen > 1) {
-        rewindGen = startGen - 1;
+    if (!params.contains("rewind_gen")) {
+        params["rewind_gen"] = -1;
     }
-    params["rewind_gen"] = rewindGen;
     params["cache_root"] = context.cacheRoot.toStdString();
     if (!context.normalGridPath.isEmpty()) {
         params["normal_grid_path"] = context.normalGridPath.toStdString();
