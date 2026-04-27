@@ -83,7 +83,12 @@ static TraceResult tracePath(
         tracedPoints->clear();
     }
 
+    const uint64_t maxSteps = static_cast<uint64_t>(distTransform.cols + distTransform.rows);
+
     while (true) {
+        if (result.steps >= maxSteps) {
+            break;
+        }
         if (currentPoint != seedPoint) {
             auto* visitedRow = visited.ptr<uint8_t>(currentPoint.y);
             if (outputImage != nullptr) {
@@ -294,3 +299,4 @@ void customThinningTraceOnly(const cv::Mat& inputImage,
 {
     customThinningImpl(inputImage, nullptr, &traces, stats);
 }
+

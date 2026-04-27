@@ -380,8 +380,7 @@ std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
 
 std::vector<uint8_t> HttpSource::fetch(const ChunkKey& key)
 {
-    if (sharded_)
-        return fetchFromShard(key);
+    if (sharded_) return fetchFromShard(key);
     return httpGet(chunkUrl(key));
 }
 

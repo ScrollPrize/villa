@@ -43,6 +43,7 @@
 #include <QInputDialog>
 #include <QThread>
 #include <QtConcurrent/QtConcurrent>
+#include <QThreadPool>
 #include <QComboBox>
 #include <QFutureWatcher>
 #include <QRegularExpression>
@@ -95,7 +96,7 @@
 #include "SettingsDialog.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "CPointCollectionWidget.hpp"
-#include "ProjectDockWidget.hpp"
+#include "VolpkgDockWidget.hpp"
 #include "SurfaceTreeWidget.hpp"
 #include "SeedingWidget.hpp"
 #include "DrawingWidget.hpp"
@@ -548,6 +549,17 @@ std::shared_ptr<QuadSurface> cloneSurfaceForTransform(const std::shared_ptr<Quad
     return clone;
 }
 
+QThreadPool* segmentDownloadPool()
+{
+    static QThreadPool* pool = [] {
+        auto* p = new QThreadPool(QCoreApplication::instance());
+        p->setMaxThreadCount(1);
+        p->setObjectName(QStringLiteral("SegmentDownloadPool"));
+        return p;
+    }();
+    return pool;
+}
+
 void primeRemoteLevel5WithDialog(CWindow* window, const std::shared_ptr<Volume>& volume)
 {
     if (!window || !volume) return;
@@ -714,7 +726,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     // project / volpkg they're working in at a glance.
     const QString baseWindowTitle = windowTitle();
     connect(_state, &CState::projectChanged, this,
-        [this, baseWindowTitle](std::shared_ptr<vc::Project> project) {
+        [this, baseWindowTitle](std::shared_ptr<vc::Volpkg> project) {
             if (!project) {
                 setWindowTitle(baseWindowTitle);
                 return;
@@ -731,6 +743,11 @@ CWindow::CWindow(size_t cacheSizeGB) :
             }
             setWindowTitle(QStringLiteral("%1 [%2%3]")
                                .arg(baseWindowTitle, name, suffix));
+        });
+
+    connect(_state, &CState::vpkgChanged, this,
+        [this](std::shared_ptr<VolumePkg>) {
+            updateNormalGridAvailability();
         });
 
     _fileWatcher = std::make_unique<FileWatcherService>(_state, this);
@@ -965,14 +982,20 @@ CWindow::CWindow(size_t cacheSizeGB) :
 
         QTimer::singleShot(0, this, [this, files, remoteUrls]() {
             if (!_menuController) return;
-            // Prefer the autosaved current project from the previous session;
-            // fall back to recent volpkg / remote when it's absent or fails.
             if (_menuController->tryRestoreAutosavedProject()) return;
             if (!files.empty() && !files.at(0).isEmpty()) {
                 _menuController->openVolpkgAt(files[0]);
-            } else if (!remoteUrls.empty() && !remoteUrls.at(0).isEmpty()) {
-                _menuController->openRemoteUrl(remoteUrls[0], false);
+                return;
             }
+            if (!remoteUrls.empty() && !remoteUrls.at(0).isEmpty()) {
+                _menuController->openRemoteUrl(remoteUrls[0], false);
+                return;
+            }
+            _menuController->loadEmptyVolumePackage();
+        });
+    } else {
+        QTimer::singleShot(0, this, [this]() {
+            if (_menuController) _menuController->loadEmptyVolumePackage();
         });
     }
 
@@ -2107,18 +2130,19 @@ void CWindow::downloadRemoteSegmentOnDemand(const QString& segmentId)
     std::string cachePath;
     vc::cache::HttpAuth auth;
     vc::RemoteSegmentSource segSource;
-    if (_state && _state->hasRemoteSegmentInfo(segId)) {
+    if (!_state || !_state->hasRemoteSegmentInfo(segId)) {
+        if (statusBar()) {
+            statusBar()->showMessage(
+                tr("No remote source info for segment %1").arg(segmentId), 5000);
+        }
+        return;
+    }
+    {
         const auto info = _state->remoteSegmentInfo(segId);
         dlBase = info.baseUrl;
         cachePath = info.cachePath;
         auth = info.auth;
         segSource = info.source;
-    } else {
-        dlBase = (_remoteScroll.segSource == vc::RemoteSegmentSource::Direct)
-            ? _remoteScroll.segmentsBaseUrl : _remoteScroll.baseUrl;
-        cachePath = _remoteScroll.cachePath;
-        auth = _remoteScroll.auth;
-        segSource = _remoteScroll.segSource;
     }
 
     if (statusBar()) {
@@ -2127,18 +2151,11 @@ void CWindow::downloadRemoteSegmentOnDemand(const QString& segmentId)
     }
 
     auto* watcher = new QFutureWatcher<std::shared_ptr<QuadSurface>>(this);
-    // Capture the current session URL so the completion handler can detect
-    // a stale result if the user closed/switched volumes during download.
-    const std::string expectedBaseUrl = _remoteScroll.baseUrl;
+    auto vpkgAtDispatch = _state ? _state->vpkg() : nullptr;
     connect(watcher, &QFutureWatcher<std::shared_ptr<QuadSurface>>::finished, this,
-        [this, watcher, segId, expectedBaseUrl]() {
+        [this, watcher, segId, vpkgAtDispatch]() {
             watcher->deleteLater();
-            // If the remote scroll session changed, silently discard the
-            // result — applying a segment from a previous dataset to the
-            // current CState would corrupt surface state.
-            if (_remoteScroll.baseUrl != expectedBaseUrl) {
-                return;
-            }
+            if (!_state || _state->vpkg() != vpkgAtDispatch) return;
             std::shared_ptr<QuadSurface> surf;
             try {
                 surf = watcher->result();
@@ -2167,18 +2184,12 @@ void CWindow::downloadRemoteSegmentOnDemand(const QString& segmentId)
             }
         });
 
-    const std::string baseUrl = _remoteScroll.baseUrl;
-
     auto future = QtConcurrent::run(
-        [dlBase, baseUrl, segId, cachePath, auth, segSource]() -> std::shared_ptr<QuadSurface> {
-            // Cache-root layout MUST match MenuActionController::promptAndLoadRemoteSegments
-            // so previously-preloaded segments are reused on demand instead
-            // of re-downloaded into a second location.
-            //   Direct sources: flat → cachePath/paths/<segId>
-            //   Segments/Paths (full volpkg): nested → cachePath/<volpkgName>/{paths|segments}/<segId>
+        segmentDownloadPool(),
+        [dlBase, segId, cachePath, auth, segSource]() -> std::shared_ptr<QuadSurface> {
             std::filesystem::path segmentRoot = cachePath;
             if (segSource != vc::RemoteSegmentSource::Direct) {
-                std::string volpkgName = baseUrl;
+                std::string volpkgName = dlBase;
                 while (!volpkgName.empty() && volpkgName.back() == '/') volpkgName.pop_back();
                 auto slash = volpkgName.rfind('/');
                 if (slash != std::string::npos) volpkgName = volpkgName.substr(slash + 1);
@@ -2250,6 +2261,7 @@ void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
     }
 
     refreshTransformsPanelState();
+    UpdateView();
 }
 
 void CWindow::updateNormalGridAvailability()
@@ -2903,25 +2915,25 @@ void CWindow::CreateWidgets(void)
     {
         auto* dock = new QDockWidget(tr("Project"), this);
         dock->setObjectName(QStringLiteral("projectDock"));
-        auto* inner = new ProjectDockWidget(dock);
+        auto* inner = new VolpkgDockWidget(dock);
         dock->setWidget(inner);
         addDockWidget(Qt::LeftDockWidgetArea, dock);
         _projectDock = inner;
 
         connect(_state, &CState::projectChanged, _projectDock,
-                &ProjectDockWidget::setProject);
+                &VolpkgDockWidget::setProject);
 
-        connect(_projectDock, &ProjectDockWidget::reloadSourceRequested,
+        connect(_projectDock, &VolpkgDockWidget::reloadSourceRequested,
                 _menuController.get(), &MenuActionController::reloadSourceById);
-        connect(_projectDock, &ProjectDockWidget::removeSourceRequested,
+        connect(_projectDock, &VolpkgDockWidget::removeSourceRequested,
                 _menuController.get(), &MenuActionController::removeSourceById);
-        connect(_projectDock, &ProjectDockWidget::renameSourceRequested,
+        connect(_projectDock, &VolpkgDockWidget::renameSourceRequested,
                 _menuController.get(), &MenuActionController::renameSourceById);
-        connect(_projectDock, &ProjectDockWidget::toggleEnabledRequested,
+        connect(_projectDock, &VolpkgDockWidget::toggleEnabledRequested,
                 _menuController.get(), &MenuActionController::setSourceEnabled);
-        connect(_projectDock, &ProjectDockWidget::editTagsRequested,
+        connect(_projectDock, &VolpkgDockWidget::editTagsRequested,
                 _menuController.get(), &MenuActionController::editSourceTags);
-        connect(_projectDock, &ProjectDockWidget::openSourceLocationRequested,
+        connect(_projectDock, &VolpkgDockWidget::openSourceLocationRequested,
                 _menuController.get(), &MenuActionController::revealSourceLocation);
     }
 
@@ -4478,9 +4490,7 @@ void CWindow::setWidgetsEnabled(bool state)
 
 auto CWindow::InitializeVolumePkg(const std::string& nVpkgPath) -> bool
 {
-    _state->setVpkg(nullptr);
-    _state->setProject(nullptr);
-    updateNormalGridAvailability();
+    _state->setPackage(nullptr, nullptr);
     if (_segmentationModule && _segmentationModule->editingEnabled()) {
         _segmentationModule->setEditingEnabled(false);
     }
@@ -4492,45 +4502,41 @@ auto CWindow::InitializeVolumePkg(const std::string& nVpkgPath) -> bool
         _segmentationWidget->setVolumePackagePath(QString());
     }
 
+    std::shared_ptr<VolumePkg> pkg;
     try {
-        _state->setVpkg(VolumePkg::New(nVpkgPath));
+        pkg = VolumePkg::New(nVpkgPath);
     } catch (const std::exception& e) {
         Logger()->error("Failed to initialize volpkg: {}", e.what());
     }
-
-    if (_state->vpkg() == nullptr) {
+    if (!pkg) {
         Logger()->error("Cannot open .volpkg: {}", nVpkgPath);
-        QMessageBox::warning(
-            this, "Error",
+        QMessageBox::warning(this, "Error",
             "Volume package failed to load. Package might be corrupt. Check the console log for a detailed error message.");
         return false;
     }
 
-    // Build a Project view of this volpkg and publish it alongside the
-    // VolumePkg. Callers can migrate to the Project-based API incrementally.
+    std::shared_ptr<vc::Volpkg> proj;
     try {
-        auto proj = std::make_shared<vc::Project>(
-            vc::Project::from_volpkg(nVpkgPath));
-        _state->setProject(std::move(proj));
+        proj = std::make_shared<vc::Volpkg>(vc::Volpkg::from_volpkg(nVpkgPath));
     } catch (const std::exception& e) {
         Logger()->warn("Could not build Project view of volpkg '{}': {}",
                        nVpkgPath, e.what());
     }
+
+    _state->setPackage(std::move(pkg), std::move(proj));
     return true;
 }
 
-// Update the widgets
 void CWindow::UpdateView(void)
 {
     if (!_state->hasVpkg() && _state->currentVolume() == nullptr) {
-        setWidgetsEnabled(false);  // Disable Widgets for User
+        setWidgetsEnabled(false);
         ui.lblVpkgName->setText("[ No Volume Package Loaded ]");
         return;
     }
 
-    setWidgetsEnabled(true);  // Enable Widgets for User
+    setWidgetsEnabled(true);
 
-    // show volume package name
     UpdateVolpkgLabel(0);
 
     volSelect->setEnabled(can_change_volume_());
@@ -4648,8 +4654,7 @@ void CWindow::OpenVolume(const QString& path)
             "The selected file is not of the correct type: \".volpkg\"");
         Logger()->error(
             "Selected file is not .volpkg: {}", aVpkgPath.toStdString());
-        _state->setVpkg(nullptr);  // Is needed for User Experience, clears screen.
-        updateNormalGridAvailability();
+        _state->setPackage(nullptr, nullptr);
         return;
     }
 
@@ -4686,8 +4691,7 @@ void CWindow::OpenVolume(const QString& path)
                          std::to_string(VOLPKG_MIN_VERSION) + "+.";
         Logger()->error(msg);
         QMessageBox::warning(this, tr("ERROR"), QString(msg.c_str()));
-        _state->setVpkg(nullptr);
-        updateNormalGridAvailability();
+        _state->setPackage(nullptr, nullptr);
         return;
     }
 
@@ -4853,10 +4857,8 @@ void CWindow::CloseVolume(void)
         }
     }
 
-    // CState::closeAll emits volumeClosing, clears surfaces, vpkg, volume, points
     _state->closeAll();
 
-    updateNormalGridAvailability();
     if (_segmentationWidget) {
         _segmentationWidget->setAvailableVolumes({}, QString());
         _segmentationWidget->setVolumePackagePath(QString());
@@ -4868,9 +4870,6 @@ void CWindow::CloseVolume(void)
         _surfacePanel->resetTagUi();
     }
 
-    _remoteScroll.active = false;
-
-    // Update UI
     UpdateView();
     if (treeWidgetSurfaces) {
         treeWidgetSurfaces->clear();
@@ -4886,11 +4885,10 @@ void CWindow::CloseVolume(void)
 // Handle open request
 auto CWindow::can_change_volume_() -> bool
 {
-    if (_state->hasVpkg() && _state->vpkg()->numberOfVolumes() > 1) {
+    if (_state->hasVpkg() && _state->vpkg()->numberOfVolumes() > 0) {
         return true;
     }
-    // Also allow switching when volSelect has multiple remote volumes
-    if (volSelect && volSelect->count() > 1) {
+    if (volSelect && volSelect->count() > 0) {
         return true;
     }
     return false;

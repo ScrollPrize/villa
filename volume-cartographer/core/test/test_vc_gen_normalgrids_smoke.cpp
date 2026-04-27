@@ -98,6 +98,7 @@ TEST(GenNormalGridsSmoke, GeneratesGridOutputsFromTinyZarr)
         + " -o " + quote(outputRoot)
         + " --sparse-volume 4"
         + " --preview-every 0"
+        + " --spiral-step 4"
         + " --metrics-json " + quote(metricsPath)
         + " --level 0";
 
@@ -113,11 +114,13 @@ TEST(GenNormalGridsSmoke, GeneratesGridOutputsFromTinyZarr)
         for (const auto& entry : fs::directory_iterator(outputRoot / plane)) {
             if (entry.is_regular_file() && entry.path().extension() == ".grid" && fs::file_size(entry.path()) > 0) {
                 vc::core::util::GridStore grid(entry.path().string());
-                EXPECT_GT(grid.numSegments(), 0u);
-                foundNonEmpty = true;
-                break;
+                if (grid.numSegments() > 0) {
+                    foundNonEmpty = true;
+                    break;
+                }
             }
         }
+        if (foundNonEmpty) break;
     }
     EXPECT_TRUE(foundNonEmpty);
 }

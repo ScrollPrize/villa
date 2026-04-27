@@ -457,7 +457,7 @@ std::string generateTimestampString()
 
 // Save correction annotation data
 void saveCorrectionsAnnotation(
-    const std::filesystem::path& volpkgRoot,
+    const std::filesystem::path& correctionsRoot,
     const std::string& segmentId,
     const QuadSurface* beforeCrop,
     const QuadSurface* afterCrop,
@@ -472,7 +472,7 @@ void saveCorrectionsAnnotation(
 
     // Create timestamped folder
     std::string timestamp = generateTimestampString();
-    std::filesystem::path correctionsDir = volpkgRoot / "corrections" / timestamp;
+    std::filesystem::path correctionsDir = correctionsRoot / timestamp;
 
     std::error_code ec;
     std::filesystem::create_directories(correctionsDir, ec);
@@ -1696,7 +1696,6 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
 
     // Populate fields for corrections annotation saving
     if (volumeContext.package) {
-        ctx.volpkgRoot = std::filesystem::path(volumeContext.package->getVolpkgDirectory());
         ctx.volumeIds = volumeContext.package->volumeIDs();
     }
     ctx.growthVolumeId = growthVolumeId;
@@ -2163,14 +2162,14 @@ void SegmentationGrower::onFutureFinished()
             return;
         }
 
-        const std::filesystem::path volpkgRoot(request.volumeContext.package->getVolpkgDirectory());
-        const std::string segmentationDir = request.volumeContext.package->getSegmentationDirectory();
-        const std::filesystem::path segmentsDir = volpkgRoot / segmentationDir;
+        const std::filesystem::path segmentsDir = _context.state
+            ? _context.state->outputSegmentsPath()
+            : std::filesystem::path(request.volumeContext.package->getVolpkgDirectory())
+                  / request.volumeContext.package->getSegmentationDirectory();
         std::error_code mkdirEc;
         std::filesystem::create_directories(segmentsDir, mkdirEc);
         if (mkdirEc) {
-            showStatus(tr("Failed to create %1 directory for displacement copy: %2")
-                           .arg(QString::fromStdString(segmentationDir))
+            showStatus(tr("Failed to create output directory for displacement copy: %1")
                            .arg(QString::fromStdString(mkdirEc.message())),
                        kStatusLong);
             cleanupDisplacementTemporarySurfaces();
@@ -2253,14 +2252,14 @@ void SegmentationGrower::onFutureFinished()
             return;
         }
 
-        const std::filesystem::path volpkgRoot(request.volumeContext.package->getVolpkgDirectory());
-        const std::string segmentationDir = request.volumeContext.package->getSegmentationDirectory();
-        const std::filesystem::path segmentsDir = volpkgRoot / segmentationDir;
+        const std::filesystem::path segmentsDir = _context.state
+            ? _context.state->outputSegmentsPath()
+            : std::filesystem::path(request.volumeContext.package->getVolpkgDirectory())
+                  / request.volumeContext.package->getSegmentationDirectory();
         std::error_code mkdirEc;
         std::filesystem::create_directories(segmentsDir, mkdirEc);
         if (mkdirEc) {
-            showStatus(tr("Failed to create %1 directory for new segment: %2")
-                           .arg(QString::fromStdString(segmentationDir))
+            showStatus(tr("Failed to create output directory for new segment: %1")
                            .arg(QString::fromStdString(mkdirEc.message())),
                        kStatusLong);
             cleanupDisplacementTemporarySurfaces();
@@ -2589,17 +2588,21 @@ void SegmentationGrower::onFutureFinished()
         auto afterCrop = cropSurfaceToGridRegion(primarySurface ? primarySurface : request.segmentationSurface.get(),
                                                   request.correctionsBounds->gridRegion);
         if (afterCrop) {
-            // Get volpkg root from the package
-            std::filesystem::path volpkgRoot;
+            std::filesystem::path correctionsRoot;
             std::vector<std::string> volumeIds;
+            if (_context.state) {
+                correctionsRoot = _context.state->supportFilePath("corrections");
+            } else if (request.volumeContext.package) {
+                correctionsRoot = std::filesystem::path(
+                    request.volumeContext.package->getVolpkgDirectory()) / "corrections";
+            }
             if (request.volumeContext.package) {
-                volpkgRoot = std::filesystem::path(request.volumeContext.package->getVolpkgDirectory());
                 volumeIds = request.volumeContext.package->volumeIDs();
             }
 
-            if (!volpkgRoot.empty()) {
+            if (!correctionsRoot.empty()) {
                 saveCorrectionsAnnotation(
-                    volpkgRoot,
+                    correctionsRoot,
                     request.segmentationSurface ? request.segmentationSurface->id : "",
                     request.beforeCrop.get(),
                     afterCrop.get(),

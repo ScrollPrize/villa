@@ -11,6 +11,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "utils/Json.hpp"
 #include "vc/core/types/VcDataset.hpp"
 
 namespace {
@@ -115,10 +116,14 @@ void createNormalsInput(
     dsx->writeRegion({0, 0, 0}, shape_vec, x.data());
     dsy->writeRegion({0, 0, 0}, shape_vec, y.data());
     dsz->writeRegion({0, 0, 0}, shape_vec, z.data());
-    vc::writeZarrAttributes(root, {
-        {"grid_origin_xyz", {0, 0, 0}},
-        {"sample_step", 1},
-    });
+    utils::Json origin = utils::Json::array();
+    origin.push_back(static_cast<int64_t>(0));
+    origin.push_back(static_cast<int64_t>(0));
+    origin.push_back(static_cast<int64_t>(0));
+    utils::Json attrs = utils::Json::object();
+    attrs["grid_origin_xyz"] = origin;
+    attrs["sample_step"] = 1;
+    vc::writeZarrAttributes(root, attrs);
 }
 
 void createChunkedNormalsInput(const fs::path& root)

@@ -10,6 +10,7 @@
 #include <fstream>
 #include <atomic>
 #include <chrono>
+#include <future>
 #include <mutex>
 #include <unordered_map>
 #include <arpa/inet.h>
@@ -18,6 +19,7 @@
 
 
 #include "vc/core/types/VcDataset.hpp"
+#include "vc/core/types/Volume.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/cache/BlockPipeline.hpp"
 #include <vc/core/util/GridStore.hpp>
@@ -293,7 +295,7 @@ int main(int argc, char* argv[]) {
             "Options");
         generate_desc.add_options()
             ("help,h", "Print this help message")
-            ("input,i", po::value<std::string>()->required(), "Input Zarr volume path")
+            ("input,i", po::value<std::string>()->required(), "Input Zarr volume path (local dir, s3://, or https://)")
             ("output,o", po::value<std::string>()->required(), "Output directory path")
             ("level", po::value<int>()->default_value(0), "Input OME-Zarr level to read")
             ("spiral-step", po::value<double>()->default_value(20.0), "Spiral step for resampling paths")
@@ -302,7 +304,9 @@ int main(int argc, char* argv[]) {
             ("chunk-budget-mib", po::value<size_t>()->default_value(512), "Maximum chunk batch budget in MiB")
             ("preview-every", po::value<int>()->default_value(100), "Write preview image every N written slices, 0 disables")
             ("verify-grid-save", po::bool_switch()->default_value(false), "Verify GridStore files by reloading after save")
-            ("metrics-json", po::value<std::string>(), "Write structured metrics json");
+            ("metrics-json", po::value<std::string>(), "Write structured metrics json")
+            ("cache-dir", po::value<std::string>(), "Local cache dir for remote volumes (default: ~/.VC3D/remote_cache)")
+            ("crop", po::value<std::vector<int>>()->multitoken(), "Crop bounding box: x0 y0 z0 x1 y1 z1 (half-open, XYZ in level-space voxels)");
 
         std::vector<std::string> opts = po::collect_unrecognized(parsed.options, po::include_positional);
         if (explicit_command && !opts.empty()) {
@@ -478,14 +482,64 @@ void run_generate(const po::variables_map& vm) {
     const std::optional<fs::path> metrics_json_path = vm.count("metrics-json")
         ? std::optional<fs::path>(fs::path(vm["metrics-json"].as<std::string>()))
         : std::nullopt;
+    auto is_remote_url = [](const std::string& p) {
+        return p.starts_with("s3://") || p.starts_with("s3+")
+            || p.starts_with("http://") || p.starts_with("https://");
+    };
+    const bool is_remote = is_remote_url(input_path);
 
-    std::cout << "Input Zarr path: " << input_path << std::endl;
+    std::cout << "Input Zarr path: " << input_path << (is_remote ? " (remote)" : "") << std::endl;
     std::cout << "Input level: " << input_level << std::endl;
     std::cout << "Output directory: " << output_path << std::endl;
 
-    const fs::path input_dataset_path = fs::path(input_path) / std::to_string(input_level);
-    auto ds = std::make_unique<vc::VcDataset>(input_dataset_path);
-    const auto shape = ds->shape();
+    std::shared_ptr<Volume> vol;
+    if (is_remote) {
+        fs::path cache_dir;
+        if (vm.count("cache-dir")) {
+            cache_dir = fs::path(vm["cache-dir"].as<std::string>());
+        }
+        vol = Volume::NewFromUrl(input_path, cache_dir);
+    } else {
+        vol = Volume::New(fs::path(input_path));
+    }
+    auto* ds = vol->zarrDataset(input_level);
+    if (!ds) {
+        throw std::runtime_error("Volume has no dataset at level " + std::to_string(input_level));
+    }
+    const auto full_shape = ds->shape();
+
+    std::array<size_t, 3> crop_origin_zyx = {0, 0, 0};
+    std::vector<size_t> shape = full_shape;
+    if (vm.count("crop")) {
+        const auto cv = vm["crop"].as<std::vector<int>>();
+        if (cv.size() != 6) {
+            throw std::runtime_error("--crop expects 6 integers: x0 y0 z0 x1 y1 z1");
+        }
+        const int x0 = cv[0], y0 = cv[1], z0 = cv[2];
+        const int x1 = cv[3], y1 = cv[4], z1 = cv[5];
+        if (x1 <= x0 || y1 <= y0 || z1 <= z0) {
+            throw std::runtime_error("--crop invalid: max must be > min in all dimensions");
+        }
+        if (static_cast<size_t>(z1) > full_shape[0]
+            || static_cast<size_t>(y1) > full_shape[1]
+            || static_cast<size_t>(x1) > full_shape[2]) {
+            throw std::runtime_error("--crop exceeds level shape");
+        }
+        crop_origin_zyx = {
+            static_cast<size_t>(z0),
+            static_cast<size_t>(y0),
+            static_cast<size_t>(x0),
+        };
+        shape = {
+            static_cast<size_t>(z1 - z0),
+            static_cast<size_t>(y1 - y0),
+            static_cast<size_t>(x1 - x0),
+        };
+        std::cout << "Crop (XYZ): [" << x0 << "," << y0 << "," << z0 << ") -> ["
+                  << x1 << "," << y1 << "," << z1 << ")"
+                  << "  effective shape ZYX=" << shape[0] << "x" << shape[1] << "x" << shape[2]
+                  << std::endl;
+    }
 
     fs::path output_fs_path(output_path);
     fs::create_directories(output_fs_path / "xy");
@@ -524,7 +578,8 @@ void run_generate(const po::variables_map& vm) {
         256ull * 1024ull * 1024ull,
         std::max<size_t>(64ull * 1024ull * 1024ull, max_estimated_batch_bytes / 2));
 
-    auto cache = vc::cache::openFilesystemPipeline(ds.get(), cache_budget_bytes, ds->path());
+    vol->setCacheBudget(cache_budget_bytes);
+    auto* cache = vol->tieredCache();
 
     RunMetrics run_metrics;
     run_metrics.inputPath = input_path;
@@ -601,7 +656,83 @@ void run_generate(const po::variables_map& vm) {
         const size_t chunk_count_y = (shape[1] + source_chunk_shape[1] - 1) / source_chunk_shape[1];
         const size_t chunk_count_x = (shape[2] + source_chunk_shape[2] - 1) / source_chunk_shape[2];
 
-        for (const auto& source_chunk_plan : sampled_chunk_plans) {
+        auto compute_slab_params = [&](size_t sourceChunkIndex)
+            -> std::pair<std::array<size_t, 3>, cv::Vec3i> {
+            std::array<size_t, 3> s_shape;
+            cv::Vec3i s_offset;
+            switch (dir) {
+            case SliceDirection::XY:
+                s_shape = {source_chunk_shape[0], shape[1], shape[2]};
+                s_offset = {
+                    static_cast<int>(sourceChunkIndex * source_chunk_shape[0]),
+                    0, 0,
+                };
+                break;
+            case SliceDirection::XZ:
+                s_shape = {shape[0], source_chunk_shape[1], shape[2]};
+                s_offset = {
+                    0,
+                    static_cast<int>(sourceChunkIndex * source_chunk_shape[1]),
+                    0,
+                };
+                break;
+            case SliceDirection::YZ:
+                s_shape = {shape[0], shape[1], source_chunk_shape[2]};
+                s_offset = {
+                    0, 0,
+                    static_cast<int>(sourceChunkIndex * source_chunk_shape[2]),
+                };
+                break;
+            }
+            for (int axis = 0; axis < 3; ++axis) {
+                const size_t end = static_cast<size_t>(s_offset[axis]) + s_shape[axis];
+                if (end > shape[axis]) {
+                    s_shape[axis] = shape[axis] - static_cast<size_t>(s_offset[axis]);
+                }
+            }
+            for (int axis = 0; axis < 3; ++axis) {
+                s_offset[axis] += static_cast<int>(crop_origin_zyx[axis]);
+            }
+            return {s_shape, s_offset};
+        };
+
+        struct ReadSlab {
+            Array3D<uint8_t> data;
+            double read_seconds = 0.0;
+        };
+
+        auto read_slab_sync = [&](size_t sourceChunkIndex) -> ReadSlab {
+            auto [s_shape, s_offset] = compute_slab_params(sourceChunkIndex);
+            ReadSlab rs;
+            rs.data = Array3D<uint8_t>(s_shape);
+            const auto read_start = std::chrono::steady_clock::now();
+            readArea3D(rs.data, s_offset, cache, 0);
+            rs.read_seconds = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - read_start).count();
+            return rs;
+        };
+
+        std::future<ReadSlab> next_slab_future;
+        ReadSlab current_slab;
+
+        for (size_t plan_idx = 0; plan_idx < sampled_chunk_plans.size(); ++plan_idx) {
+            const auto& source_chunk_plan = sampled_chunk_plans[plan_idx];
+
+            if (plan_idx == 0) {
+                current_slab = read_slab_sync(source_chunk_plan.sourceChunkIndex);
+            } else {
+                current_slab = next_slab_future.get();
+            }
+            dir_metrics.timingTotals["read_chunk"] += current_slab.read_seconds;
+            dir_metrics.timingCounts["read_chunk"] += 1;
+
+            if (plan_idx + 1 < sampled_chunk_plans.size()) {
+                const size_t next_idx =
+                    sampled_chunk_plans[plan_idx + 1].sourceChunkIndex;
+                next_slab_future = std::async(std::launch::async,
+                    read_slab_sync, next_idx);
+            }
+
             for (size_t batch_start = 0;
                  batch_start < source_chunk_plan.sampledSlices.size();
                  batch_start += chunk_size_tgt) {
@@ -644,52 +775,9 @@ void run_generate(const po::variables_map& vm) {
                 }
 
                 if (!assembled_slices.empty()) {
-                    std::array<size_t, 3> slab_shape;
-                    cv::Vec3i slab_offset;
-                    switch (dir) {
-                    case SliceDirection::XY:
-                        slab_shape = {source_chunk_shape[0], shape[1], shape[2]};
-                        slab_offset = {
-                            static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[0]),
-                            0,
-                            0,
-                        };
-                        break;
-                    case SliceDirection::XZ:
-                        slab_shape = {shape[0], source_chunk_shape[1], shape[2]};
-                        slab_offset = {
-                            0,
-                            static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[1]),
-                            0,
-                        };
-                        break;
-                    case SliceDirection::YZ:
-                        slab_shape = {shape[0], shape[1], source_chunk_shape[2]};
-                        slab_offset = {
-                            0,
-                            0,
-                            static_cast<int>(source_chunk_plan.sourceChunkIndex * source_chunk_shape[2]),
-                        };
-                        break;
-                    }
-                    // Clip slab to actual volume extents so we do not read past the end.
-                    for (int axis = 0; axis < 3; ++axis) {
-                        const size_t end = static_cast<size_t>(slab_offset[axis]) + slab_shape[axis];
-                        if (end > shape[axis]) {
-                            slab_shape[axis] = shape[axis] - static_cast<size_t>(slab_offset[axis]);
-                        }
-                    }
-
-                    const auto read_start = std::chrono::steady_clock::now();
-                    Array3D<uint8_t> chunk_data(slab_shape);
-                    readArea3D(chunk_data, slab_offset, cache.get(), 0);
-                    dir_metrics.timingTotals["read_chunk"] += std::chrono::duration<double>(
-                        std::chrono::steady_clock::now() - read_start).count();
-                    dir_metrics.timingCounts["read_chunk"] += 1;
-
                     for (auto& assembled : assembled_slices) {
                         const bool any_nonzero = vc::core::util::extractBinarySliceFromChunk(
-                            chunk_data,
+                            current_slab.data,
                             to_normal_grid_direction(dir),
                             assembled.localSliceIndex,
                             assembled.binarySlice);

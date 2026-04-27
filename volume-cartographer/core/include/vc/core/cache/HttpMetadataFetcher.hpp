@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -30,6 +31,7 @@ struct RemoteZarrInfo {
     std::string delimiter = ".";
     int numLevels = 0;
     ShardConfig shardConfig;
+    std::vector<std::array<int, 3>> sourceChunkShapes;
 };
 
 // Result of S3 ListObjectsV2 with delimiter.

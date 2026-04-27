@@ -11,7 +11,6 @@
 #include <opencv2/core.hpp>
 
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
-#include "vc/core/types/Project.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/RemoteScroll.hpp"
@@ -35,16 +34,18 @@ public:
     explicit CState(size_t cacheSizeBytes, QObject* parent = nullptr);
     ~CState();
 
-    // --- VolumePkg ---
     std::shared_ptr<VolumePkg> vpkg() const;
-    void setVpkg(std::shared_ptr<VolumePkg> pkg);
     QString vpkgPath() const;
     bool hasVpkg() const;
 
-    // --- Project (flexible JSON-backed descriptor; shadows vpkg for now) ---
-    std::shared_ptr<vc::Project> project() const;
-    void setProject(std::shared_ptr<vc::Project> proj);
+    std::shared_ptr<vc::Volpkg> project() const;
     bool hasProject() const;
+
+    // Atomic volpkg+project swap. Use for opens/closes/restarts.
+    void setPackage(std::shared_ptr<VolumePkg> pkg,
+                    std::shared_ptr<vc::Volpkg> proj);
+    // Project mutation (data_sources appended/removed) without swapping vpkg.
+    void setProject(std::shared_ptr<vc::Volpkg> proj);
 
     // Path lookups that prefer the active Project, falling back to vpkg.
     // Empty return means "not resolvable" — callers must check.
@@ -116,7 +117,7 @@ public:
 
 signals:
     void vpkgChanged(std::shared_ptr<VolumePkg> vpkg);
-    void projectChanged(std::shared_ptr<vc::Project> project);
+    void projectChanged(std::shared_ptr<vc::Volpkg> project);
     void volumeChanged(std::shared_ptr<Volume> volume, const std::string& volumeId);
     void surfacesLoaded();
     void volumeClosing();
@@ -131,7 +132,7 @@ private:
     void resolveCurrentVolumeId();
 
     std::shared_ptr<VolumePkg> _vpkg;
-    std::shared_ptr<vc::Project> _project;
+    std::shared_ptr<vc::Volpkg> _project;
     std::unordered_map<std::string, RemoteSegmentInfo> _remoteSegmentInfo;
     std::shared_ptr<Volume> _currentVolume;
     std::string _currentVolumeId;

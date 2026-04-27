@@ -943,8 +943,10 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         });
 
         // Reload from Backup submenu
-        std::filesystem::path backupsDir =
-            std::filesystem::path(_volumePkg->getVolpkgDirectory()) / "backups" / segmentId.toStdString();
+        std::filesystem::path backupsDir = _state
+            ? _state->supportFilePath("backups") / segmentId.toStdString()
+            : std::filesystem::path(_volumePkg->getVolpkgDirectory())
+                  / "backups" / segmentId.toStdString();
         if (std::filesystem::exists(backupsDir) && std::filesystem::is_directory(backupsDir)) {
             std::vector<int> availableBackups;
             for (const auto& entry : std::filesystem::directory_iterator(backupsDir)) {

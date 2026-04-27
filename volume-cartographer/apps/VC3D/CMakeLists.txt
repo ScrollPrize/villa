@@ -45,8 +45,8 @@ set(srcs
     SeedingWidget.hpp
     DrawingWidget.cpp
     DrawingWidget.hpp
-    ProjectDockWidget.cpp
-    ProjectDockWidget.hpp
+    VolpkgDockWidget.cpp
+    VolpkgDockWidget.hpp
     segmentation/SegmentationCommon.hpp
     segmentation/SegmentationWidget.cpp
     segmentation/SegmentationWidget.hpp
@@ -111,8 +111,8 @@ set(srcs
     SurfacePanelController.hpp
     MenuActionController.cpp
     MenuActionController.hpp
-    S3BrowserDialog.cpp
-    S3BrowserDialog.hpp
+    UnifiedBrowserDialog.cpp
+    UnifiedBrowserDialog.hpp
     segmentation/SegmentationModule.cpp
     segmentation/SegmentationModule.hpp
     segmentation/growth/SegmentationCorrections.cpp

@@ -374,6 +374,22 @@ void CAdaptiveVolumeViewer::onVolumeClosing()
     _chunkCbId = 0;
     onSurfaceChanged(_surfName, nullptr);
     _volume.reset();
+    _surfWeak.reset();
+    _defaultSurface.reset();
+
+    // Wipe the last-rendered frame so the previous volume's slice doesn't
+    // linger after the package is closed. submitRender() bails out without
+    // a volume, so we have to clear the framebuffer ourselves and force a
+    // repaint of the viewport.
+    if (!_framebuffer.isNull()) {
+        _framebuffer.fill(QColor(64, 64, 64));
+    }
+    if (_scene) {
+        _scene->clear();
+    }
+    if (_view && _view->viewport()) {
+        _view->viewport()->update();
+    }
 }
 
 void CAdaptiveVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
@@ -1604,7 +1620,7 @@ void CAdaptiveVolumeViewer::renderIntersectionsNow()
         return;
     }
 
-    auto* patchIndex = _viewerManager->surfacePatchIndex();
+    auto patchIndex = _viewerManager->surfacePatchIndexShared();
     if (!patchIndex || patchIndex->empty()) {
         invalidateIntersect();
         _lastIntersectFp = {};
@@ -1778,6 +1794,7 @@ void CAdaptiveVolumeViewer::renderIntersectionsNow()
     QThreadPool::globalInstance()->start(
         [this, fp, planeSp, planeRoi, targets = std::move(targets),
          targetStyles = std::move(targetStyles), cam, patchIndex]() mutable {
+          try {
             auto isFiniteScalar = [](double v) {
                 uint64_t bits;
                 std::memcpy(&bits, &v, sizeof(bits));
@@ -1855,7 +1872,12 @@ void CAdaptiveVolumeViewer::renderIntersectionsNow()
                                            std::memory_order_release);
                 },
                 Qt::QueuedConnection);
-            _backgroundWorkers.fetch_sub(1, std::memory_order_release);
+          } catch (...) {
+              QMetaObject::invokeMethod(this, [this]() {
+                  _planeWorkerBusy.store(false, std::memory_order_release);
+              }, Qt::QueuedConnection);
+          }
+          _backgroundWorkers.fetch_sub(1, std::memory_order_release);
         });
 }
 
@@ -1870,7 +1892,7 @@ void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<S
         return;
     }
 
-    auto* patchIndex = _viewerManager->surfacePatchIndex();
+    auto patchIndex = _viewerManager->surfacePatchIndexShared();
     if (!patchIndex || patchIndex->empty()) {
         invalidateIntersect();
         _lastIntersectFp = {};
@@ -2022,6 +2044,7 @@ void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<S
         [this, fp, allBounds, clipTol, cam,
          activeSeg, patchIndex, planeSurfs = std::move(planeSurfs),
          colors = std::move(colors), penWidth, opacity]() mutable {
+          try {
             auto isFiniteScalar = [](double v) {
                 uint64_t bits;
                 std::memcpy(&bits, &v, sizeof(bits));
@@ -2088,7 +2111,12 @@ void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<S
                                                std::memory_order_release);
                 },
                 Qt::QueuedConnection);
-            _backgroundWorkers.fetch_sub(1, std::memory_order_release);
+          } catch (...) {
+              QMetaObject::invokeMethod(this, [this]() {
+                  _flattenedWorkerBusy.store(false, std::memory_order_release);
+              }, Qt::QueuedConnection);
+          }
+          _backgroundWorkers.fetch_sub(1, std::memory_order_release);
         });
 }
 

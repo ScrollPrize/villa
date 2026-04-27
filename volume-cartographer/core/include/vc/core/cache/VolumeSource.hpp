@@ -19,7 +19,6 @@ namespace utils::detail { struct ShardIndex; }
 
 namespace vc::cache {
 
-// Abstract interface for fetching raw compressed chunk bytes from a data source.
 class VolumeSource {
 public:
     virtual ~VolumeSource() = default;
@@ -27,6 +26,8 @@ public:
     [[nodiscard]] virtual int numLevels() const noexcept = 0;
     [[nodiscard]] virtual std::array<int, 3> chunkShape(int level) const noexcept = 0;
     [[nodiscard]] virtual std::array<int, 3> levelShape(int level) const noexcept = 0;
+    [[nodiscard]] virtual bool isSharded() const noexcept { return false; }
+    [[nodiscard]] virtual bool lastFetchConfirmsAbsent() const noexcept { return true; }
 };
 
 // Reads compressed chunks from a local zarr v2 directory.
@@ -84,7 +85,11 @@ public:
 
     // Download an entire shard as raw bytes (for bulk prefetch to disk).
     [[nodiscard]] std::vector<uint8_t> fetchWholeShard(int level, int sz, int sy, int sx);
-    [[nodiscard]] bool isSharded() const noexcept { return sharded_; }
+    [[nodiscard]] bool isSharded() const noexcept override { return sharded_; }
+    [[nodiscard]] bool lastFetchConfirmsAbsent() const noexcept override
+    {
+        return lastFetchWasAbsent();
+    }
     [[nodiscard]] std::array<int, 3> shardsPerAxis(int level) const noexcept;
     [[nodiscard]] std::array<int, 3> chunksPerShard() const noexcept { return chunksPerShard_; }
     [[nodiscard]] std::array<int, 3> shardShape() const noexcept { return shardShape_; }

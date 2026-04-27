@@ -1,4 +1,4 @@
-#include "ProjectDockWidget.hpp"
+#include "VolpkgDockWidget.hpp"
 
 #include <QAction>
 #include <QCheckBox>
@@ -12,7 +12,7 @@
 #include <QUrl>
 #include <QVBoxLayout>
 
-#include "vc/core/types/Project.hpp"
+#include "vc/core/types/VolumePkg.hpp"
 
 namespace {
 constexpr int kColName = 0;
@@ -51,7 +51,7 @@ QString stateDisplay(const vc::DataSource& ds)
 }
 } // namespace
 
-ProjectDockWidget::ProjectDockWidget(QWidget* parent)
+VolpkgDockWidget::VolpkgDockWidget(QWidget* parent)
     : QWidget(parent)
 {
     auto* vbox = new QVBoxLayout(this);
@@ -61,13 +61,13 @@ ProjectDockWidget::ProjectDockWidget(QWidget* parent)
     _filterEdit = new QLineEdit(this);
     _filterEdit->setPlaceholderText(tr("Filter by name, type, tag, location..."));
     connect(_filterEdit, &QLineEdit::textChanged,
-            this, &ProjectDockWidget::applyFilter);
+            this, &VolpkgDockWidget::applyFilter);
     topRow->addWidget(_filterEdit, 1);
 
     _groupedCheck = new QCheckBox(tr("Grouped"), this);
     _groupedCheck->setChecked(true);
     connect(_groupedCheck, &QCheckBox::toggled,
-            this, &ProjectDockWidget::toggleGroupedView);
+            this, &VolpkgDockWidget::toggleGroupedView);
     topRow->addWidget(_groupedCheck);
 
     vbox->addLayout(topRow);
@@ -82,25 +82,25 @@ ProjectDockWidget::ProjectDockWidget(QWidget* parent)
     _tree->header()->setSectionResizeMode(kColName, QHeaderView::Interactive);
     _tree->header()->setSectionResizeMode(kColWhere, QHeaderView::Stretch);
     connect(_tree, &QTreeWidget::customContextMenuRequested,
-            this, &ProjectDockWidget::handleContextMenu);
+            this, &VolpkgDockWidget::handleContextMenu);
     vbox->addWidget(_tree, 1);
 }
 
-ProjectDockWidget::~ProjectDockWidget() = default;
+VolpkgDockWidget::~VolpkgDockWidget() = default;
 
-void ProjectDockWidget::setProject(std::shared_ptr<vc::Project> project)
+void VolpkgDockWidget::setProject(std::shared_ptr<vc::Volpkg> project)
 {
     _project = std::move(project);
     rebuildTree();
 }
 
-void ProjectDockWidget::toggleGroupedView(bool grouped)
+void VolpkgDockWidget::toggleGroupedView(bool grouped)
 {
     _grouped = grouped;
     rebuildTree();
 }
 
-void ProjectDockWidget::rebuildTree()
+void VolpkgDockWidget::rebuildTree()
 {
     if (!_tree) return;
     _tree->clear();
@@ -183,7 +183,7 @@ void ProjectDockWidget::rebuildTree()
     applyFilter();
 }
 
-void ProjectDockWidget::applyFilter()
+void VolpkgDockWidget::applyFilter()
 {
     if (!_tree) return;
     const QString filter = _filterEdit ? _filterEdit->text().trimmed() : QString();
@@ -212,7 +212,7 @@ void ProjectDockWidget::applyFilter()
     }
 }
 
-QString ProjectDockWidget::selectedSourceId() const
+QString VolpkgDockWidget::selectedSourceId() const
 {
     if (!_tree) return {};
     auto items = _tree->selectedItems();
@@ -220,7 +220,7 @@ QString ProjectDockWidget::selectedSourceId() const
     return items.first()->data(kColName, Qt::UserRole).toString();
 }
 
-void ProjectDockWidget::handleContextMenu(const QPoint& pos)
+void VolpkgDockWidget::handleContextMenu(const QPoint& pos)
 {
     if (!_tree) return;
     auto* item = _tree->itemAt(pos);

@@ -15,7 +15,7 @@ class CWindow;
 class Volume;
 
 namespace vc {
-class Project;
+class Volpkg;
 struct DataSource;
 }
 
@@ -26,7 +26,6 @@ class MenuActionController : public QObject
 public:
     static constexpr int kMaxRecentVolpkg = 10;
     static constexpr int kMaxRecentRemote = 10;
-    static constexpr int kMaxRecentProject = 10;
 
     explicit MenuActionController(CWindow* window);
 
@@ -35,10 +34,11 @@ public:
     void removeRecentVolpkgEntry(const QString& path);
     void refreshRecentMenu();
     void openVolpkgAt(const QString& path);
-    // Try to restore ~/.VC3D/current_project.json from the previous session.
-    // Returns true if a project was applied.
+    // Unified dispatcher: routes any path/URL to the right open handler.
+    // Extension-sniffs .volpkg.json / .volpkg / scroll URLs / local zarr dirs.
+    void openFile(const QString& pathOrUrl);
     bool tryRestoreAutosavedProject();
-    void loadAttachedRemoteVolumesForCurrentPackage();
+    void loadEmptyVolumePackage();
     void triggerTeleaInpaint();
     void openRemoteUrl(const QString& url, bool isRetry = false);
 
@@ -46,9 +46,10 @@ public:
     // load synchronously and return the count of items loaded. Remote sources
     // dispatch to a background thread and return 0 — the apply-and-refresh
     // step happens on the main thread when the worker completes.
-    int loadSource(const vc::Project& proj, const vc::DataSource& ds);
+    int loadSource(const vc::Volpkg& proj, const vc::DataSource& ds);
+    int attachDataSource(vc::DataSource ds);
     // Remove anything contributed by a DataSource from the active VolumePkg.
-    void unloadSource(const vc::Project& proj, const vc::DataSource& ds);
+    void unloadSource(const vc::Volpkg& proj, const vc::DataSource& ds);
 
     // Id-addressed variants, for use from the Project dock widget where
     // the user has already picked a specific source. Public so Qt::connect
@@ -60,26 +61,24 @@ public:
     void editSourceTags(const QString& sourceId);
     void revealSourceLocation(const QString& sourceId);
 
+    // Auth resolver exposed for the unified browser dialog. Returns false if
+    // auth resolution failed (and writes a message into err); on success,
+    // stores credentials in *out.
+    bool resolveAuthForBrowser(const QString& url,
+                               vc::cache::HttpAuth* out,
+                               QString* err);
+
 private slots:
+    void newVolpkg();
     void openVolpkg();
     void openRecentVolpkg();
-    void openLocalZarr();
-    void openRemoteVolume();
-    void browseS3();
-    void attachRemoteZarr();
-    void attachRemoteSegments();
     void openRecentRemoteVolume();
+    void saveVolpkgAs();
+    void attachVolume();
+    void attachSegments();
+    void attachOther();
+    void attachFromVolpkg();
     void showSettingsDialog();
-    // Project / Data menu actions (new JSON-backed project system).
-    void openProject();
-    void openRecentProject();
-    void saveProjectAs();
-    void dataAddFileDir();
-    void dataAddRemote();
-    void dataAddFromProject();
-    void dataRemoveSource();
-    void dataRenameSource();
-    void dataReloadSource();
     void showAboutDialog();
     void showKeybindings();
     void resetSegmentationViews();
@@ -105,11 +104,6 @@ private:
     void refreshRecentRemoteMenu();
     void ensureRecentRemoteActions();
 
-    QStringList loadRecentProjects() const;
-    void saveRecentProjects(const QStringList& paths);
-    void updateRecentProjectList(const QString& path);
-    void refreshRecentProjectMenu();
-    void ensureRecentProjectActions();
     void attachRemoteZarrUrl(const QString& url, bool persistEntry = true);
     void openRemoteZarr(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
     void openRemoteScroll(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
@@ -128,11 +122,9 @@ private:
                               bool allowPrompt,
                               QString* errorMessage = nullptr) const;
     // Helpers used by loadSource for the local and remote branches.
-    int loadSourceLocal(const vc::Project& proj, const vc::DataSource& ds);
-    void loadSourceRemoteAsync(const vc::Project& proj, const vc::DataSource& ds);
+    int loadSourceLocal(const vc::Volpkg& proj, const vc::DataSource& ds);
+    void loadSourceRemoteAsync(const vc::Volpkg& proj, const vc::DataSource& ds);
     QString remoteCacheDirectory() const;
-    QString remoteVolumeRegistryPath() const;
-    void persistAttachedRemoteVolume(const QString& url, const std::shared_ptr<Volume>& volume);
 
     CWindow* _window{nullptr};
 
@@ -144,19 +136,16 @@ private:
     QMenu* _helpMenu{nullptr};
     QMenu* _recentMenu{nullptr};
     QMenu* _recentRemoteMenu{nullptr};
-    QMenu* _projectMenu{nullptr};
-    QMenu* _recentProjectMenu{nullptr};
-    QMenu* _dataMenu{nullptr};
 
+    QAction* _newVolpkgAct{nullptr};
     QAction* _openAct{nullptr};
-    QAction* _openLocalZarrAct{nullptr};
-    QAction* _openRemoteAct{nullptr};
-    QAction* _attachRemoteZarrAct{nullptr};
-    QAction* _attachRemoteSegmentsAct{nullptr};
-    QAction* _browseS3Act{nullptr};
+    QAction* _saveAsAct{nullptr};
+    QAction* _attachVolumeAct{nullptr};
+    QAction* _attachSegmentsAct{nullptr};
+    QAction* _attachOtherAct{nullptr};
+    QAction* _attachFromVolpkgAct{nullptr};
     std::array<QAction*, kMaxRecentVolpkg> _recentActs{};
     std::array<QAction*, kMaxRecentRemote> _recentRemoteActs{};
-    std::array<QAction*, kMaxRecentProject> _recentProjectActs{};
     QAction* _settingsAct{nullptr};
     QAction* _exitAct{nullptr};
     QAction* _keybindsAct{nullptr};
@@ -170,14 +159,6 @@ private:
     QAction* _selectionClearAct{nullptr};
     QAction* _teleaAct{nullptr};
     QAction* _importObjAct{nullptr};
-    QAction* _projectOpenAct{nullptr};
-    QAction* _projectSaveAsAct{nullptr};
-    QAction* _dataAddFileDirAct{nullptr};
-    QAction* _dataAddRemoteAct{nullptr};
-    QAction* _dataAddFromProjectAct{nullptr};
-    QAction* _dataRemoveSourceAct{nullptr};
-    QAction* _dataRenameSourceAct{nullptr};
-    QAction* _dataReloadSourceAct{nullptr};
     int _remoteOpenAuthRetries{0};
     int _remoteScrollAuthRetries{0};
 

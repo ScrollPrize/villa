@@ -373,6 +373,7 @@ public:
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L);
+            curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
             if (config_.follow_redirects) {
                 curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
                 curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
@@ -598,6 +599,10 @@ private:
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L);
+
+            // HTTP/2 over TLS: S3 supports it; multiplexing many GETs over one
+            // connection cuts per-request handshake/slow-start overhead.
+            curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
 
             // Redirects
             if (config_.follow_redirects) {

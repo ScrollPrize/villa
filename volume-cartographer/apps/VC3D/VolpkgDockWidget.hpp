@@ -9,24 +9,24 @@ class QTreeWidgetItem;
 class QCheckBox;
 class QPoint;
 
-namespace vc { class Project; }
+namespace vc { class Volpkg; }
 
 // Dedicated "Project" panel that shows every DataSource in the active
 // Project with type / location / tags / state columns. Lets the user
 // reload, remove, rename, enable/disable, and edit tags per source via a
 // right-click context menu, without needing to walk through the Data
 // menu each time.
-class ProjectDockWidget : public QWidget
+class VolpkgDockWidget : public QWidget
 {
     Q_OBJECT
 
 public:
-    explicit ProjectDockWidget(QWidget* parent = nullptr);
-    ~ProjectDockWidget() override;
+    explicit VolpkgDockWidget(QWidget* parent = nullptr);
+    ~VolpkgDockWidget() override;
 
 public slots:
     // Rebuild the tree from the given project (null → clear).
-    void setProject(std::shared_ptr<vc::Project> project);
+    void setProject(std::shared_ptr<vc::Volpkg> project);
 
 signals:
     void reloadSourceRequested(const QString& sourceId);
@@ -45,7 +45,7 @@ private:
     void rebuildTree();
     QString selectedSourceId() const;
 
-    std::shared_ptr<vc::Project> _project;
+    std::shared_ptr<vc::Volpkg> _project;
 
     QLineEdit* _filterEdit{nullptr};
     QCheckBox* _groupedCheck{nullptr};

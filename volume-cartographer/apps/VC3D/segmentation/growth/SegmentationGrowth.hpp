@@ -204,7 +204,6 @@ struct TracerGrowthContext {
     QString normalGridPath;
     QString normal3dZarrPath;
     // For corrections annotation saving
-    std::filesystem::path volpkgRoot;
     std::vector<std::string> volumeIds;
     std::string growthVolumeId;
 };

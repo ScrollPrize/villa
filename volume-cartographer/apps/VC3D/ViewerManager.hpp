@@ -106,6 +106,7 @@ public:
     float intersectionThickness() const { return _intersectionThickness; }
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
     SurfacePatchIndex* surfacePatchIndex();
+    std::shared_ptr<SurfacePatchIndex> surfacePatchIndexShared();
     void refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface);
     void refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface, const cv::Rect& changedRegion);
 
@@ -167,7 +168,7 @@ private:
     int _intersectionMaxSurfaces{0};  // 0 = unlimited
 
     VolumeOverlayController* _volumeOverlay{nullptr};
-    SurfacePatchIndex _surfacePatchIndex;
+    std::shared_ptr<SurfacePatchIndex> _surfacePatchIndex{std::make_shared<SurfacePatchIndex>()};
     bool _surfacePatchIndexNeedsRebuild{true};
     // Use string IDs for surface tracking to avoid dangling pointers in async operations
     std::unordered_set<std::string> _indexedSurfaceIds;

@@ -390,19 +390,25 @@ BlockPipeline::BlockPipeline(
             if (shuttingDown_.load(std::memory_order_acquire)) return {};
         }
 
-        // Pull source chunks over the network and assemble a canonical
-        // 128³ buffer. Source decode happens here too because the
-        // re-chunking needs the voxels; it's a small fraction of the
-        // overall work compared to x265 encode, which is now off-thread.
-        auto decoded = assembleCanonicalChunk(key);
+        AssembleOutcome outcome = AssembleOutcome::TransientFailure;
+        auto decoded = assembleCanonicalChunk(key, &outcome);
+        {
+            static std::atomic<uint64_t> okCnt{0}, absentCnt{0}, transientCnt{0}, emptyCnt{0};
+            if (!decoded) {
+                if (outcome == AssembleOutcome::Absent) absentCnt.fetch_add(1);
+                else transientCnt.fetch_add(1);
+            } else if (decoded->isEmpty) emptyCnt.fetch_add(1);
+            else okCnt.fetch_add(1);
+            auto total = okCnt.load() + absentCnt.load() + transientCnt.load() + emptyCnt.load();
+            if ((total & 0xFF) == 1) {
+                std::fprintf(stderr,
+                    "[assembleStats] ok=%lu absent=%lu transient=%lu empty=%lu\n",
+                    (unsigned long)okCnt.load(), (unsigned long)absentCnt.load(),
+                    (unsigned long)transientCnt.load(), (unsigned long)emptyCnt.load());
+            }
+        }
         if (!decoded) {
-            // Negative-cache *only* when the source confirms the chunk is
-            // genuinely absent — a real S3 404, or a sharded v3 missing/
-            // zero-placeholder index entry. Transient errors / curl
-            // failures / auth issues must not poison the cache.
-            const bool isHttp = dynamic_cast<HttpSource*>(source_.get()) != nullptr;
-            const bool absent = !isHttp || HttpSource::lastFetchWasAbsent();
-            if (absent) {
+            if (outcome == AssembleOutcome::Absent) {
                 bloomAdd(key);
                 std::lock_guard lock(negativeMutex_);
                 negativeCache_.insert(key);
@@ -539,11 +545,7 @@ BlockPipeline::BlockPipeline(
             // Local source, no disk tier: treat the source files as disk.
             try { compressed = source_->fetch(key); } catch (...) { return {}; }
             if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) {
-                // Same rule as the downloader: only poison the negative
-                // cache when the source confirms genuine absence.
-                const bool isHttp = dynamic_cast<HttpSource*>(source_.get()) != nullptr;
-                const bool absent = !isHttp || HttpSource::lastFetchWasAbsent();
-                if (absent) {
+                if (source_->lastFetchConfirmsAbsent()) {
                     bloomAdd(key);
                     std::lock_guard lock(negativeMutex_);
                     negativeCache_.insert(key);
@@ -701,16 +703,11 @@ BlockPipeline::BlockPipeline(
                     return {};
                 }
 
-                // Pull the canonical h265 bytes from source.
-                // HttpSource::fetch caches the whole source shard
-                // internally, so concurrent siblings hit the cache.
                 std::vector<uint8_t> bytes;
                 try { bytes = source_->fetch(key); }
                 catch (...) { return {}; }
                 if (bytes.empty()) {
-                    // Negative-cache only on confirmed source-side absence
-                    // (real 404 or sharded-v3 missing/zero placeholder).
-                    if (HttpSource::lastFetchWasAbsent()) {
+                    if (source_->lastFetchConfirmsAbsent()) {
                         bloomAdd(key);
                         std::lock_guard lock(negativeMutex_);
                         negativeCache_.insert(key);
@@ -719,19 +716,7 @@ BlockPipeline::BlockPipeline(
                     return {};
                 }
 
-                // Sanity: bytes must carry the C3DC magic. If not, the
-                // source advertised canonical structure but serves blosc
-                // or raw — we can't use it. Mark the chunk negative so
-                // we stop re-fetching it every render; otherwise every
-                // fetchInteractive would re-queue it forever.
                 if (!bytesAreCanonical(bytes)) {
-                    // Always log: these are source-level corruption events,
-                    // not transient noise. Rate-limiting to 5 previously hid
-                    // systemic codec-mismatch issues from users.
-                    std::fprintf(stderr,
-                        "[BlockPipeline] passthrough: chunk lvl=%d "
-                        "(%d,%d,%d) lacks C3DC magic — marking absent\n",
-                        key.level, key.iz, key.iy, key.ix);
                     bloomAdd(key);
                     {
                         std::lock_guard lock(negativeMutex_);
@@ -922,26 +907,30 @@ void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targ
     std::vector<ChunkKey> loaderKeys, downloaderKeys;
     loaderKeys.reserve(keys.size());
     downloaderKeys.reserve(keys.size());
+    int skippedNeg = 0, skippedEmpty = 0, skippedResident = 0;
     for (size_t i = 0; i < keys.size(); ++i) {
         const auto& key = keys[i];
-        if (isNegativeCached(key)) continue;
-        if (isEmptyChunk(key)) continue;
-        // Both first and last block of the chunk must be resident to
-        // consider the chunk fully cached. See comment above probeKeys.
+        if (isNegativeCached(key)) { skippedNeg++; continue; }
+        if (isEmptyChunk(key)) { skippedEmpty++; continue; }
         if (probeKeys[i * 2].level >= 0
-            && resident[i * 2] && resident[i * 2 + 1]) continue;
+            && resident[i * 2] && resident[i * 2 + 1]) { skippedResident++; continue; }
 
         auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
         const bool diskPresent = dz
             && dz->is_sharded()
             && dz->inner_chunk_exists(chunkIndices(key));
         if (diskPresent || !dz) {
-            // Present on canonical disk, OR no canonical disk tier at all
-            // (local filesystem source — the "disk" is the source files).
             loaderKeys.push_back(key);
         } else {
             downloaderKeys.push_back(key);
         }
+    }
+    static std::atomic<uint64_t> callCount{0};
+    if ((callCount.fetch_add(1) & 0xF) == 0) {
+        std::fprintf(stderr,
+            "[fetchInteractive] %zu keys: neg=%d empty=%d resident=%d -> loader=%zu dl=%zu\n",
+            keys.size(), skippedNeg, skippedEmpty, skippedResident,
+            loaderKeys.size(), downloaderKeys.size());
     }
     if (!loaderKeys.empty())
         loaderPool_.updateInteractive(loaderKeys, targetLevel);
@@ -986,7 +975,10 @@ BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
 // Rechunk source chunks into a canonical 128^3 chunk. Returns a decoded
 // ChunkData for the canonical chunk, or null if the canonical region is
 // entirely absent from the source.
-ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey) {
+ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey,
+                                                   AssembleOutcome* outcome) {
+    auto setOutcome = [&](AssembleOutcome v) { if (outcome) *outcome = v; };
+    setOutcome(AssembleOutcome::TransientFailure);
     if (!source_ || !decompress_) return nullptr;
     const int C = kCanonicalChunkSide;
     auto scs = source_->chunkShape(canonKey.level);
@@ -1003,16 +995,41 @@ ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey) {
     out->elementSize = 1;
     out->bytes.assign(size_t(C) * C * C, 0);
     bool anyData = false;
+    bool anyTransient = false;
 
+    bool anyZeroFill = false;
+    bool anyDecompressFail = false;
     for (int siz = sz0; siz < sz1; ++siz)
     for (int siy = sy0; siy < sy1; ++siy)
     for (int six = sx0; six < sx1; ++six) {
         ChunkKey srcKey{canonKey.level, siz, siy, six};
         std::vector<uint8_t> compressed;
-        try { compressed = source_->fetch(srcKey); } catch (...) { continue; }
-        if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) continue;
+        try { compressed = source_->fetch(srcKey); }
+        catch (...) { anyTransient = true; continue; }
+        if (compressed.empty()) {
+            if (source_->lastFetchConfirmsAbsent()) anyZeroFill = true;
+            else anyTransient = true;
+            continue;
+        }
+        if (isAllZero(compressed.data(), compressed.size())) {
+            anyZeroFill = true;
+            continue;
+        }
         auto data = decompress_(compressed, srcKey);
-        if (!data) continue;
+        if (!data) {
+            anyDecompressFail = true;
+            static std::atomic<int> warnCount{0};
+            int n = warnCount.fetch_add(1);
+            if (n < 5) {
+                std::fprintf(stderr,
+                    "[assembleCanonical] decompress_ returned null for L%d src %d/%d/%d "
+                    "(%zu compressed bytes); canonical L%d %d/%d/%d\n",
+                    srcKey.level, siz, siy, six, compressed.size(),
+                    canonKey.level, canonKey.iz, canonKey.iy, canonKey.ix);
+            }
+            anyTransient = true;
+            continue;
+        }
         anyData = true;
 
         int svz = siz * scs[0], svy = siy * scs[1], svx = six * scs[2];
@@ -1038,7 +1055,12 @@ ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey) {
         }
     }
 
-    if (!anyData) return nullptr;
+    if (!anyData) {
+        setOutcome(anyTransient ? AssembleOutcome::TransientFailure
+                                : AssembleOutcome::Absent);
+        return nullptr;
+    }
+    setOutcome(AssembleOutcome::Ok);
     return out;
 }
 
@@ -1286,8 +1308,7 @@ auto BlockPipeline::stats() const -> Stats {
         std::lock_guard lk(writtenShardsMutex_);
         s.diskShards = initialDiskShards_ + writtenShards_.size();
     }
-    if (auto* http = dynamic_cast<HttpSource*>(source_.get()))
-        s.sharded = http->isSharded();
+    s.sharded = source_ && source_->isSharded();
     if (!s.sharded) {
         for (const auto& dz : diskLevels_)
             if (dz && dz->is_sharded()) { s.sharded = true; break; }

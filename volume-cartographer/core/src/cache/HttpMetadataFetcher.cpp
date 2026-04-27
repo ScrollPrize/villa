@@ -412,12 +412,33 @@ static std::optional<RemoteZarrInfo> tryLoadCachedMetadata(
         std::fprintf(log, "[REMOTE] Using cached metadata from %s (%d levels)\n",
                      stagingDir.c_str(), numLevels);
 
+    std::vector<std::array<int, 3>> sourceChunkShapes;
+    sourceChunkShapes.reserve(numLevels);
+    for (int lvl = 0; lvl < numLevels; ++lvl) {
+        auto body = readFile(stagingDir / std::to_string(lvl) / ".zarray");
+        std::array<int, 3> cs{0, 0, 0};
+        if (!body.empty()) {
+            try {
+                auto j = utils::Json::parse(body);
+                if (j.contains("chunks") && j["chunks"].is_array() && j["chunks"].size() >= 3) {
+                    cs = {
+                        int(j["chunks"][0].get_int()),
+                        int(j["chunks"][1].get_int()),
+                        int(j["chunks"][2].get_int()),
+                    };
+                }
+            } catch (...) {}
+        }
+        sourceChunkShapes.push_back(cs);
+    }
+
     return RemoteZarrInfo{
         .url = baseUrl,
         .stagingDir = stagingDir,
         .delimiter = delimiter,
         .numLevels = numLevels,
-        .shardConfig = shardConfig
+        .shardConfig = shardConfig,
+        .sourceChunkShapes = std::move(sourceChunkShapes),
     };
 }
 
@@ -466,6 +487,7 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
     utils::Json level0Meta;
     ShardConfig shardConfig;
     bool isV3 = false;
+    std::vector<std::array<int, 3>> sourceChunkShapes;
 
     constexpr int kBatchSize = 8;
     constexpr int kMaxLevels = 20;
@@ -515,15 +537,26 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
             std::fprintf(log, "[REMOTE] Level %d: fetched .zarray (%zu bytes)\n",
                          lvl, zarray.size());
 
-        if (lvl == 0) {
-            try {
-                level0Meta = utils::Json::parse(zarray);
-                if (level0Meta.contains("dimension_separator"))
-                    delimiter = level0Meta["dimension_separator"].get_string();
-            } catch (const std::exception& e) {
-                if (auto* log = cacheDebugLog())
-                    std::fprintf(log, "[REMOTE] Warning: failed to parse level 0 .zarray: %s\n", e.what());
+        try {
+            auto meta = utils::Json::parse(zarray);
+            if (lvl == 0) {
+                level0Meta = meta;
+                if (meta.contains("dimension_separator"))
+                    delimiter = meta["dimension_separator"].get_string();
             }
+            if (meta.contains("chunks") && meta["chunks"].is_array() && meta["chunks"].size() >= 3) {
+                sourceChunkShapes.push_back({
+                    int(meta["chunks"][0].get_int()),
+                    int(meta["chunks"][1].get_int()),
+                    int(meta["chunks"][2].get_int()),
+                });
+            } else {
+                sourceChunkShapes.push_back({0, 0, 0});
+            }
+        } catch (const std::exception& e) {
+            if (auto* log = cacheDebugLog())
+                std::fprintf(log, "[REMOTE] Warning: failed to parse level %d .zarray: %s\n", lvl, e.what());
+            sourceChunkShapes.push_back({0, 0, 0});
         }
         return true;
     });
@@ -559,6 +592,20 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
             auto levelDir = stagingDir / std::to_string(lvl);
             writeFile(levelDir / ".zarray", synthesized);
             isV3 = true;
+
+            if (meta.shard_config && meta.shard_config->sub_chunks.size() >= 3) {
+                sourceChunkShapes.push_back({
+                    int(meta.shard_config->sub_chunks[0]),
+                    int(meta.shard_config->sub_chunks[1]),
+                    int(meta.shard_config->sub_chunks[2]),
+                });
+            } else if (meta.chunks.size() >= 3) {
+                sourceChunkShapes.push_back({
+                    int(meta.chunks[0]), int(meta.chunks[1]), int(meta.chunks[2]),
+                });
+            } else {
+                sourceChunkShapes.push_back({0, 0, 0});
+            }
 
             if (auto* log = cacheDebugLog())
                 std::fprintf(log, "[REMOTE] Level %d: fetched zarr.json (v3), synthesized .zarray (%zu bytes)\n",
@@ -621,7 +668,8 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
         .stagingDir = stagingDir,
         .delimiter = delimiter,
         .numLevels = numLevels,
-        .shardConfig = shardConfig
+        .shardConfig = shardConfig,
+        .sourceChunkShapes = std::move(sourceChunkShapes),
     };
 }
 

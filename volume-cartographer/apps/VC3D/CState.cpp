@@ -26,32 +26,33 @@ CState::~CState() = default;
 
 std::shared_ptr<VolumePkg> CState::vpkg() const { return _vpkg; }
 
-void CState::setVpkg(std::shared_ptr<VolumePkg> pkg)
-{
-    _vpkg = std::move(pkg);
-    _remoteSegmentInfo.clear();
-    emit vpkgChanged(_vpkg);
-}
-
 QString CState::vpkgPath() const
 {
-    if (_vpkg) {
-        return QString::fromStdString(_vpkg->getVolpkgDirectory());
-    }
+    if (_vpkg) return QString::fromStdString(_vpkg->getVolpkgDirectory());
     return {};
 }
 
 bool CState::hasVpkg() const { return _vpkg != nullptr; }
 
-std::shared_ptr<vc::Project> CState::project() const { return _project; }
+std::shared_ptr<vc::Volpkg> CState::project() const { return _project; }
 
-void CState::setProject(std::shared_ptr<vc::Project> proj)
+bool CState::hasProject() const { return _project != nullptr; }
+
+void CState::setPackage(std::shared_ptr<VolumePkg> pkg,
+                        std::shared_ptr<vc::Volpkg> proj)
+{
+    _vpkg = std::move(pkg);
+    _project = std::move(proj);
+    _remoteSegmentInfo.clear();
+    emit projectChanged(_project);
+    emit vpkgChanged(_vpkg);
+}
+
+void CState::setProject(std::shared_ptr<vc::Volpkg> proj)
 {
     _project = std::move(proj);
     emit projectChanged(_project);
 }
-
-bool CState::hasProject() const { return _project != nullptr; }
 
 std::filesystem::path CState::segmentsPath(const std::string& idOrName) const
 {
@@ -246,12 +247,18 @@ void CState::closeAll()
     }
 
     _vpkg = nullptr;
+    _project = nullptr;
+    _remoteSegmentInfo.clear();
     _currentVolume = nullptr;
     _currentVolumeId.clear();
     _segmentationGrowthVolumeId.clear();
 
     _pois.clear();
     _pointCollection->clearAll();
+
+    emit projectChanged(_project);
+    emit vpkgChanged(_vpkg);
+    emit volumeChanged(_currentVolume, _currentVolumeId);
 }
 
 // --- Surface methods (from CSurfaceCollection) ---

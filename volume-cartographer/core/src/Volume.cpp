@@ -266,6 +266,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     vol->remoteDelimiter_ = info.delimiter;
     vol->remoteAuth_ = auth;
     vol->remoteShardConfig_ = info.shardConfig;
+    vol->remoteSourceChunkShapes_ = info.sourceChunkShapes;
 
     return vol;
 }
@@ -298,21 +299,27 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
     if (zarrDs_.empty()) return nullptr;
     std::vector<std::unique_ptr<utils::ZarrArray>> diskLevels;
 
-    // Build level metadata from our zarr datasets
     std::vector<vc::cache::FileSystemSource::LevelMeta> levels;
     levels.reserve(zarrDs_.size());
-    for (auto& ds : zarrDs_) {
+    for (size_t i = 0; i < zarrDs_.size(); ++i) {
+        auto& ds = zarrDs_[i];
         const auto& shape = ds->shape();
-        const auto& chunks = ds->defaultChunkShape();
         vc::cache::FileSystemSource::LevelMeta lm;
         lm.shape = {
             static_cast<int>(shape[0]),
             static_cast<int>(shape[1]),
             static_cast<int>(shape[2])};
-        lm.chunkShape = {
-            static_cast<int>(chunks[0]),
-            static_cast<int>(chunks[1]),
-            static_cast<int>(chunks[2])};
+        if (isRemote_
+            && i < remoteSourceChunkShapes_.size()
+            && remoteSourceChunkShapes_[i][0] > 0) {
+            lm.chunkShape = remoteSourceChunkShapes_[i];
+        } else {
+            const auto& chunks = ds->defaultChunkShape();
+            lm.chunkShape = {
+                static_cast<int>(chunks[0]),
+                static_cast<int>(chunks[1]),
+                static_cast<int>(chunks[2])};
+        }
         levels.push_back(lm);
     }
 
@@ -457,7 +464,7 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
         } else if (mountInfo_.parallelCount > 0) {
             config.ioThreads = mountInfo_.parallelCount;
         } else {
-            config.ioThreads = 8;  // HTTP/2 multiplexing: fewer connections, many streams each
+            config.ioThreads = 24;
         }
         fprintf(stderr, "[Volume] IO threads: %d\n", config.ioThreads);
     }

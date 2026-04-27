@@ -611,7 +611,17 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
         }
         if (!s->isLoaded()) {
             std::cout << "[SurfacePatchIndex] Loading surface: " << s->id << std::endl;
-            s->rawPointsPtr();  // triggers ensureLoaded()
+            try {
+                s->rawPointsPtr();  // triggers ensureLoaded()
+            } catch (const std::exception& e) {
+                // Remote segments whose TIFFs haven't finished downloading
+                // yet, or transient I/O errors. Skip this surface — the
+                // async download flow re-schedules a rebuild once the data
+                // lands. Previously this re-threw out of a QtConcurrent
+                // lambda and hit QUnhandledException → terminate().
+                std::cout << "[SurfacePatchIndex] Skipping surface " << s->id
+                          << ": " << e.what() << std::endl;
+            }
         }
         if (s->isLoaded()) {
             loaded.push_back(s);

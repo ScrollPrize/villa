@@ -8,7 +8,7 @@
 
 #include "utils/Json.hpp"
 
-#include "vc/core/types/Project.hpp"
+#include "vc/core/types/VolumePkg.hpp"
 
 namespace {
 
@@ -31,9 +31,9 @@ private:
     fs::path path_;
 };
 
-vc::Project build_sample()
+vc::Volpkg build_sample()
 {
-    vc::Project p;
+    vc::Volpkg p;
     p.name = "sample";
     p.version = 7;
     p.description = "mix-and-match test";
@@ -74,7 +74,7 @@ TEST(Project, RoundTripJson)
 {
     const auto orig = build_sample();
     auto j = orig.to_json();
-    auto copy = vc::Project::from_json(j);
+    auto copy = vc::Volpkg::from_json(j);
 
     EXPECT_EQ(copy.name, orig.name);
     EXPECT_EQ(copy.version, orig.version);
@@ -100,7 +100,7 @@ TEST(Project, SaveLoadFile)
     const auto orig = build_sample();
 
     orig.save_to_file(dst);
-    auto loaded = vc::Project::load_from_file(dst);
+    auto loaded = vc::Volpkg::load_from_file(dst);
 
     EXPECT_EQ(loaded.name, orig.name);
     EXPECT_EQ(loaded.version, orig.version);
@@ -132,7 +132,7 @@ TEST(Project, FromVolpkgMirrorsDirs)
     fs::create_directory(tmp.path() / "paths");
     fs::create_directory(tmp.path() / "traces");
 
-    auto p = vc::Project::from_volpkg(tmp.path());
+    auto p = vc::Volpkg::from_volpkg(tmp.path());
 
     EXPECT_EQ(p.name, "test_scroll");
     EXPECT_EQ(p.version, 6);

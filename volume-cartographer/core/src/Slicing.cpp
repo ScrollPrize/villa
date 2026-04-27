@@ -637,10 +637,12 @@ template<typename T>
 void readArea3DImpl(Array3D<T>& out, const cv::Vec3i& offset,
                     BlockPipeline* cache, int level) {
     int d = int(out.shape()[0]), h = int(out.shape()[1]), w = int(out.shape()[2]);
-    // Prefetch
+    // offset is ZYX-ordered to match Array3D shape and all callers
+    // (GrowPatch's clamped_origin_zyx, ExtrapolationGrowth's clampedOriginZYX,
+    // vc_gen_normalgrids' slab_offset, etc.). prefetchRegion takes XYZ.
     prefetchRegion(*cache, level,
-                   float(offset[0]), float(offset[1]), float(offset[2]),
-                   float(offset[0] + w - 1), float(offset[1] + h - 1), float(offset[2] + d - 1));
+                   float(offset[2]), float(offset[1]), float(offset[0]),
+                   float(offset[2] + w - 1), float(offset[1] + h - 1), float(offset[0] + d - 1));
 
     #pragma omp parallel
     {
@@ -648,10 +650,10 @@ void readArea3DImpl(Array3D<T>& out, const cv::Vec3i& offset,
         #pragma omp for schedule(dynamic, 4) collapse(2)
         for (int z = 0; z < d; z++) {
             for (int y = 0; y < h; y++) {
-                int iz = offset[2] + z;
+                int iz = offset[0] + z;
                 int iy = offset[1] + y;
                 for (int x = 0; x < w; x++) {
-                    int ix = offset[0] + x;
+                    int ix = offset[2] + x;
                     out(z, y, x) = s.sampleInt(iz, iy, ix);
                 }
             }
