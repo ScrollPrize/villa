@@ -32,6 +32,8 @@ private:
     [[nodiscard]] std::optional<std::pair<int, int>> surfaceToGridIndex(const QPointF& surfacePos) const;
     void ensureMask();
     void paintAt(int row, int col);
+    void queueVertex(int row, int col);
+    void fillEnclosedStrokeArea();
     void persistMask();
     void applyPendingCells();
     void invalidateViewers();
@@ -44,5 +46,6 @@ private:
     std::optional<std::pair<int, int>> _lastGrid;
     std::unordered_set<uint64_t> _paintedCells;
     std::vector<std::pair<int, int>> _pendingCells;
+    std::vector<std::pair<int, int>> _strokeGridPoints;
     std::vector<QPointF> _overlaySurfacePoints;
 };

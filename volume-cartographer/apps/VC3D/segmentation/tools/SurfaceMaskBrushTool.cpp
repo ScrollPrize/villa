@@ -23,6 +23,121 @@ uint64_t cellKey(int row, int col)
     return (static_cast<uint64_t>(static_cast<uint32_t>(row)) << 32) |
            static_cast<uint32_t>(col);
 }
+
+struct GridPointF {
+    float row;
+    float col;
+};
+
+GridPointF toPoint(const std::pair<int, int>& p)
+{
+    return {static_cast<float>(p.first), static_cast<float>(p.second)};
+}
+
+float cross(const GridPointF& a, const GridPointF& b, const GridPointF& c)
+{
+    return (b.col - a.col) * (c.row - a.row) -
+           (b.row - a.row) * (c.col - a.col);
+}
+
+bool pointInRect(const GridPointF& p, float rowMin, float rowMax, float colMin, float colMax)
+{
+    return p.row >= rowMin && p.row <= rowMax &&
+           p.col >= colMin && p.col <= colMax;
+}
+
+bool pointInPolygon(const GridPointF& point, const std::vector<std::pair<int, int>>& polygon)
+{
+    bool inside = false;
+    for (std::size_t i = 0, j = polygon.size() - 1; i < polygon.size(); j = i++) {
+        const GridPointF a = toPoint(polygon[i]);
+        const GridPointF b = toPoint(polygon[j]);
+        const bool crosses = ((a.row > point.row) != (b.row > point.row)) &&
+                             (point.col < (b.col - a.col) * (point.row - a.row) /
+                                              (b.row - a.row) + a.col);
+        if (crosses) {
+            inside = !inside;
+        }
+    }
+    return inside;
+}
+
+bool segmentsIntersect(GridPointF a, GridPointF b, GridPointF c, GridPointF d)
+{
+    constexpr float eps = 1.0e-5f;
+    const float c1 = cross(a, b, c);
+    const float c2 = cross(a, b, d);
+    const float c3 = cross(c, d, a);
+    const float c4 = cross(c, d, b);
+
+    auto onSegment = [](const GridPointF& p, const GridPointF& q, const GridPointF& r) {
+        constexpr float eps = 1.0e-5f;
+        return std::abs(cross(p, q, r)) <= eps &&
+               q.row >= std::min(p.row, r.row) - eps &&
+               q.row <= std::max(p.row, r.row) + eps &&
+               q.col >= std::min(p.col, r.col) - eps &&
+               q.col <= std::max(p.col, r.col) + eps;
+    };
+
+    if (((c1 > eps && c2 < -eps) || (c1 < -eps && c2 > eps)) &&
+        ((c3 > eps && c4 < -eps) || (c3 < -eps && c4 > eps))) {
+        return true;
+    }
+
+    return onSegment(a, c, b) ||
+           onSegment(a, d, b) ||
+           onSegment(c, a, d) ||
+           onSegment(c, b, d);
+}
+
+bool polygonIntersectsCell(const std::vector<std::pair<int, int>>& polygon, int row, int col)
+{
+    const float rowMin = static_cast<float>(row);
+    const float rowMax = static_cast<float>(row + 1);
+    const float colMin = static_cast<float>(col);
+    const float colMax = static_cast<float>(col + 1);
+
+    const GridPointF center{rowMin + 0.5f, colMin + 0.5f};
+    if (pointInPolygon(center, polygon)) {
+        return true;
+    }
+
+    const GridPointF corners[] = {
+        {rowMin, colMin},
+        {rowMin, colMax},
+        {rowMax, colMax},
+        {rowMax, colMin}
+    };
+    for (const GridPointF& corner : corners) {
+        if (pointInPolygon(corner, polygon)) {
+            return true;
+        }
+    }
+
+    for (const auto& p : polygon) {
+        if (pointInRect(toPoint(p), rowMin, rowMax, colMin, colMax)) {
+            return true;
+        }
+    }
+
+    const std::pair<GridPointF, GridPointF> edges[] = {
+        {corners[0], corners[1]},
+        {corners[1], corners[2]},
+        {corners[2], corners[3]},
+        {corners[3], corners[0]}
+    };
+    for (std::size_t i = 0, j = polygon.size() - 1; i < polygon.size(); j = i++) {
+        const GridPointF a = toPoint(polygon[j]);
+        const GridPointF b = toPoint(polygon[i]);
+        for (const auto& edge : edges) {
+            if (segmentsIntersect(a, b, edge.first, edge.second)) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
 }
 
 SurfaceMaskBrushTool::SurfaceMaskBrushTool(SegmentationModule& module)
@@ -40,6 +155,7 @@ void SurfaceMaskBrushTool::setSurface(QuadSurface* surface)
     _lastGrid.reset();
     _paintedCells.clear();
     _pendingCells.clear();
+    _strokeGridPoints.clear();
     _overlaySurfacePoints.clear();
 }
 
@@ -69,6 +185,7 @@ void SurfaceMaskBrushTool::startStroke(const QPointF& surfacePos)
     _strokeActive = true;
     _paintedCells.clear();
     _pendingCells.clear();
+    _strokeGridPoints.clear();
     _overlaySurfacePoints.clear();
     _lastGrid = grid;
     paintAt(grid->first, grid->second);
@@ -137,10 +254,12 @@ void SurfaceMaskBrushTool::finishStroke()
 
     _strokeActive = false;
     _lastGrid.reset();
+    fillEnclosedStrokeArea();
     applyPendingCells();
     persistMask();
     _paintedCells.clear();
     _pendingCells.clear();
+    _strokeGridPoints.clear();
     _overlaySurfacePoints.clear();
     invalidateViewers();
 }
@@ -151,6 +270,7 @@ void SurfaceMaskBrushTool::cancelStroke()
     _lastGrid.reset();
     _paintedCells.clear();
     _pendingCells.clear();
+    _strokeGridPoints.clear();
     _overlaySurfacePoints.clear();
     if (_surface) {
         _mask = _surface->validMask();
@@ -224,29 +344,113 @@ void SurfaceMaskBrushTool::paintAt(int centerRow, int centerCol)
     const float avgScale = 0.5f * (std::abs(scale[0]) + std::abs(scale[1]));
     const int radius = static_cast<int>(std::ceil(std::max(1.0f, _module.approvalMaskBrushRadius() *
                                                                  (avgScale > 1e-4f ? avgScale : 1.0f))));
-    const int radiusSq = radius * radius;
+    const float radiusSq = static_cast<float>(radius * radius);
     const cv::Vec3f center = _surface->center();
     _overlaySurfacePoints.emplace_back(static_cast<float>(centerCol) / scale[0] - center[0],
                                        static_cast<float>(centerRow) / scale[1] - center[1]);
+    if (_strokeGridPoints.empty() ||
+        _strokeGridPoints.back().first != centerRow ||
+        _strokeGridPoints.back().second != centerCol) {
+        _strokeGridPoints.emplace_back(centerRow, centerCol);
+    }
 
-    for (int dr = -radius; dr <= radius; ++dr) {
-        for (int dc = -radius; dc <= radius; ++dc) {
-            if (dr * dr + dc * dc > radiusSq) {
+    if (_mask.rows < 2 || _mask.cols < 2) {
+        for (int dr = -radius; dr <= radius; ++dr) {
+            for (int dc = -radius; dc <= radius; ++dc) {
+                if (static_cast<float>(dr * dr + dc * dc) > radiusSq) {
+                    continue;
+                }
+                queueVertex(centerRow + dr, centerCol + dc);
+            }
+        }
+        return;
+    }
+
+    const int rowStart = std::max(0, centerRow - radius - 1);
+    const int rowEnd = std::min(_mask.rows - 2, centerRow + radius);
+    const int colStart = std::max(0, centerCol - radius - 1);
+    const int colEnd = std::min(_mask.cols - 2, centerCol + radius);
+
+    for (int cellRow = rowStart; cellRow <= rowEnd; ++cellRow) {
+        const float nearestRow = std::clamp(static_cast<float>(centerRow),
+                                            static_cast<float>(cellRow),
+                                            static_cast<float>(cellRow + 1));
+        const float dr = nearestRow - static_cast<float>(centerRow);
+        for (int cellCol = colStart; cellCol <= colEnd; ++cellCol) {
+            const float nearestCol = std::clamp(static_cast<float>(centerCol),
+                                                static_cast<float>(cellCol),
+                                                static_cast<float>(cellCol + 1));
+            const float dc = nearestCol - static_cast<float>(centerCol);
+            if (dr * dr + dc * dc > radiusSq + 1.0e-4f) {
                 continue;
             }
 
-            const int row = centerRow + dr;
-            const int col = centerCol + dc;
-            if (row < 0 || row >= _mask.rows || col < 0 || col >= _mask.cols) {
+            queueVertex(cellRow, cellCol);
+            queueVertex(cellRow + 1, cellCol);
+            queueVertex(cellRow, cellCol + 1);
+            queueVertex(cellRow + 1, cellCol + 1);
+        }
+    }
+}
+
+void SurfaceMaskBrushTool::queueVertex(int row, int col)
+{
+    if (row < 0 || row >= _mask.rows || col < 0 || col >= _mask.cols) {
+        return;
+    }
+
+    const uint64_t key = cellKey(row, col);
+    if (!_paintedCells.insert(key).second) {
+        return;
+    }
+
+    _pendingCells.emplace_back(row, col);
+}
+
+void SurfaceMaskBrushTool::fillEnclosedStrokeArea()
+{
+    if (_strokeGridPoints.size() < 3 || _mask.rows < 2 || _mask.cols < 2) {
+        return;
+    }
+
+    std::vector<std::pair<int, int>> polygon;
+    polygon.reserve(_strokeGridPoints.size());
+    for (const auto& p : _strokeGridPoints) {
+        if (!polygon.empty() && polygon.back() == p) {
+            continue;
+        }
+        polygon.push_back(p);
+    }
+    if (polygon.size() < 3) {
+        return;
+    }
+
+    int minRow = polygon.front().first;
+    int maxRow = polygon.front().first;
+    int minCol = polygon.front().second;
+    int maxCol = polygon.front().second;
+    for (const auto& p : polygon) {
+        minRow = std::min(minRow, p.first);
+        maxRow = std::max(maxRow, p.first);
+        minCol = std::min(minCol, p.second);
+        maxCol = std::max(maxCol, p.second);
+    }
+
+    const int rowStart = std::max(0, minRow - 1);
+    const int rowEnd = std::min(_mask.rows - 2, maxRow);
+    const int colStart = std::max(0, minCol - 1);
+    const int colEnd = std::min(_mask.cols - 2, maxCol);
+
+    for (int cellRow = rowStart; cellRow <= rowEnd; ++cellRow) {
+        for (int cellCol = colStart; cellCol <= colEnd; ++cellCol) {
+            if (!polygonIntersectsCell(polygon, cellRow, cellCol)) {
                 continue;
             }
 
-            const uint64_t key = cellKey(row, col);
-            if (!_paintedCells.insert(key).second) {
-                continue;
-            }
-
-            _pendingCells.emplace_back(row, col);
+            queueVertex(cellRow, cellCol);
+            queueVertex(cellRow + 1, cellCol);
+            queueVertex(cellRow, cellCol + 1);
+            queueVertex(cellRow + 1, cellCol + 1);
         }
     }
 }
@@ -309,6 +513,9 @@ void SurfaceMaskBrushTool::invalidateViewers()
             if (viewer) {
                 viewer->invalidateIntersect();
                 viewer->renderIntersections();
+                if (viewer->surfName() == "segmentation") {
+                    viewer->renderVisible(true);
+                }
                 viewer->requestRender();
             }
         });

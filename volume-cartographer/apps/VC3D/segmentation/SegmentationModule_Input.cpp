@@ -670,7 +670,9 @@ void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
             const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
             _surfaceMaskTool->extendStroke(QPointF(surfCoords[0], surfCoords[1]), true);
             if (_shiftDrawMaskActive) {
-                _surfaceMaskTool->pauseStroke();
+                _surfaceMaskTool->finishStroke();
+                _surfaceMaskTool->setActive(_drawMaskEnabled);
+                _shiftDrawMaskActive = false;
             } else {
                 _surfaceMaskTool->finishStroke();
             }
