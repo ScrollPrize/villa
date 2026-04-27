@@ -177,9 +177,6 @@ target_link_libraries(vc_thinning vc_core opencv_ximgproc)
 add_executable(vc_tifxyz src/vc_tifxyz.cpp)
 target_link_libraries(vc_tifxyz vc_core Boost::program_options opencv_core)
 
-add_executable(vc_project_tifxyz src/vc_project_tifxyz.cpp)
-target_link_libraries(vc_project_tifxyz vc_core Boost::program_options opencv_core OpenMP::OpenMP_CXX)
-
 add_executable(vc_zarr_to_tiff src/vc_zarr_to_tiff.cpp)
 target_link_libraries(vc_zarr_to_tiff vc_core Boost::program_options TIFF::TIFF)
 
@@ -229,7 +226,6 @@ if(VC_USE_PCH)
         vc_telea_inpaint
         vc_thinning
         vc_tifxyz
-        vc_project_tifxyz
         vc_zarr_to_tiff
     )
         target_precompile_headers(${_app} REUSE_FROM vc_core)
