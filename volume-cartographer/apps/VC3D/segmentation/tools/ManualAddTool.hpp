@@ -27,7 +27,8 @@ public:
         int sampleCap{512};
         int previewThrottleMs{50};
         float tintOpacity{0.45f};
-        double planeConstraintRadius{8.0};
+        double planeConstraintRadius{30.0};
+        double planeConstraintReplacementRadius{16.0};
         LinePreviewMode linePreviewMode{LinePreviewMode::Cross};
         bool includeTouchedValidBorder{true};
         bool allowBoundarySmoothing{false};
@@ -51,6 +52,7 @@ public:
 
     bool begin(const cv::Mat_<cv::Vec3f>& points, Config config);
     void clear();
+    bool clearPending(Config config);
 
     [[nodiscard]] bool active() const { return !_entrySnapshotPoints.empty(); }
     [[nodiscard]] const cv::Mat_<cv::Vec3f>& entrySnapshotPoints() const { return _entrySnapshotPoints; }
@@ -61,6 +63,7 @@ public:
     [[nodiscard]] const std::vector<SegmentationEditManager::GridKey>& fillVertices() const { return _fillVertices; }
     [[nodiscard]] const std::vector<SegmentationEditManager::GridKey>& changedVertices() const { return _changedVertices; }
     [[nodiscard]] const std::vector<Constraint3d>& userPlaneConstraints() const { return _userPlaneConstraints; }
+    [[nodiscard]] bool initialFillCommitted() const { return _initialFillCommitted; }
     [[nodiscard]] uint64_t revision() const { return _revision; }
 
     bool updateHover(int row, int col);
@@ -97,5 +100,6 @@ private:
     std::vector<GridKey> _borderSampleVertices;
     std::vector<GridKey> _changedVertices;
     std::vector<Constraint3d> _userPlaneConstraints;
+    bool _initialFillCommitted{false};
     uint64_t _revision{0};
 };

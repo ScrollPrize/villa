@@ -48,6 +48,7 @@ constexpr qreal kApprovalMaskZ = 50.0;  // Below mask path (60) but above most o
 constexpr qreal kSurfaceOverlapZ = 45.0;  // Below approval mask
 constexpr qreal kMarkerZ = 95.0;
 constexpr qreal kRadiusCircleZ = 80.0;
+constexpr float kManualAddPlaneDistanceTolerance = 10.0f;
 
 // Full opacity for mask pixels - the slider controls overall opacity via QGraphicsPixmapItem::setOpacity
 constexpr int kApprovalMaskAlpha = 255;
@@ -709,6 +710,22 @@ void SegmentationOverlayController::collectPrimitives(VolumeViewerBase* viewer,
                         points.push_back(scene);
                     }
                 }
+            } else if (auto* plane = dynamic_cast<PlaneSurface*>(viewer->currentSurface())) {
+                points.reserve(line.worldPoints.size());
+                for (const cv::Vec3f& world : line.worldPoints) {
+                    if (plane->pointDist(world) <= kManualAddPlaneDistanceTolerance) {
+                        points.push_back(viewer->volumeToScene(world));
+                    } else if (points.size() >= 2) {
+                        ViewerOverlayControllerBase::OverlayStyle style;
+                        style.penColor = line.committed ? QColor(0, 220, 255, 240) : QColor(255, 220, 0, 230);
+                        style.penWidth = 3.0;
+                        style.z = 110.0;
+                        builder.addLineStrip(points, false, style);
+                        points.clear();
+                    } else {
+                        points.clear();
+                    }
+                }
             } else {
                 points = volumeToScene(viewer, line.worldPoints);
             }
@@ -739,7 +756,8 @@ void SegmentationOverlayController::collectPrimitives(VolumeViewerBase* viewer,
             }
         }
         if (!flattened) {
-            if (auto* plane = dynamic_cast<PlaneSurface*>(viewer->currentSurface())) {
+            auto* plane = dynamic_cast<PlaneSurface*>(viewer->currentSurface());
+            if (plane) {
                 ViewerOverlayControllerBase::OverlayStyle previewStyle;
                 previewStyle.penColor = QColor(0, 220, 255, 235);
                 previewStyle.penWidth = 2.0;
@@ -873,8 +891,10 @@ void SegmentationOverlayController::collectPrimitives(VolumeViewerBase* viewer,
             constraintStyle.brushColor = QColor(255, 255, 120, 220);
             constraintStyle.penWidth = 1.0;
             constraintStyle.z = 111.0;
-            for (const QPointF& pt : volumeToScene(viewer, state.manualAddPlaneConstraints)) {
-                builder.addCircle(pt, 5.0, true, constraintStyle);
+            for (const cv::Vec3f& constraint : state.manualAddPlaneConstraints) {
+                if (!plane || plane->pointDist(constraint) <= kManualAddPlaneDistanceTolerance) {
+                    builder.addCircle(viewer->volumeToScene(constraint), 5.0, true, constraintStyle);
+                }
             }
         }
     }

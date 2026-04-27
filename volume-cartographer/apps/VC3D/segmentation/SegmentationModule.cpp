@@ -1708,14 +1708,19 @@ bool SegmentationModule::clearManualAddPending()
     if (!_manualAddMode || !_manualAddTool || !_editManager) {
         return false;
     }
-    _manualAddTool->begin(_manualAddTool->entrySnapshotPoints(), _widget ? _widget->manualAddConfig() : ManualAddTool::Config{});
+    if (!_manualAddTool->clearPending(_widget ? _widget->manualAddConfig() : ManualAddTool::Config{})) {
+        return false;
+    }
     _editManager->restorePreviewSnapshot(_manualAddTool->entrySnapshotPoints());
     if (_state && _editManager->previewSurface()) {
         _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
     }
     emitPendingChanges();
     refreshOverlay();
-    emit statusMessageRequested(tr("Manual Add pending geometry cleared."), kStatusShort);
+    emit statusMessageRequested(_manualAddTool->initialFillCommitted()
+                                    ? tr("Manual Add pending geometry cleared. Press Shift+E to save, then enable Manual Add again for another fill.")
+                                    : tr("Manual Add pending geometry cleared."),
+                                kStatusShort);
     return true;
 }
 

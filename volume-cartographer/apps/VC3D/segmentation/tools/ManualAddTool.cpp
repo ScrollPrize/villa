@@ -45,6 +45,7 @@ ManualAddTool::Config ManualAddTool::sanitize(Config config)
     config.previewThrottleMs = std::clamp(config.previewThrottleMs, 0, 500);
     config.tintOpacity = std::clamp(config.tintOpacity, 0.0f, 1.0f);
     config.planeConstraintRadius = std::clamp(config.planeConstraintRadius, 0.5, 100.0);
+    config.planeConstraintReplacementRadius = std::clamp(config.planeConstraintReplacementRadius, 0.0, 100.0);
     const int mode = std::clamp(static_cast<int>(config.linePreviewMode),
                                 static_cast<int>(LinePreviewMode::VerticalOnly),
                                 static_cast<int>(LinePreviewMode::CrossFill));
@@ -67,6 +68,7 @@ bool ManualAddTool::begin(const cv::Mat_<cv::Vec3f>& points, Config config)
     _borderSampleVertices.clear();
     _changedVertices.clear();
     _userPlaneConstraints.clear();
+    _initialFillCommitted = false;
     touchRevision();
     return true;
 }
@@ -82,7 +84,26 @@ void ManualAddTool::clear()
     _borderSampleVertices.clear();
     _changedVertices.clear();
     _userPlaneConstraints.clear();
+    _initialFillCommitted = false;
     touchRevision();
+}
+
+bool ManualAddTool::clearPending(Config config)
+{
+    if (_entrySnapshotPoints.empty()) {
+        return false;
+    }
+    _config = sanitize(config);
+    _previewPoints = _entrySnapshotPoints.clone();
+    _hoverPolylines.clear();
+    _hoverVertex.reset();
+    _committedPolylines.clear();
+    _fillVertices.clear();
+    _borderSampleVertices.clear();
+    _changedVertices.clear();
+    _userPlaneConstraints.clear();
+    touchRevision();
+    return true;
 }
 
 bool ManualAddTool::isInvalidPoint(const cv::Vec3f& value)
@@ -137,6 +158,16 @@ std::optional<ManualAddTool::GridPolyline> ManualAddTool::discoverAxisLine(int r
 
 bool ManualAddTool::updateHover(int row, int col)
 {
+    if (_initialFillCommitted) {
+        if (!_hoverPolylines.empty() || _hoverVertex.has_value()) {
+            _hoverPolylines.clear();
+            _hoverVertex.reset();
+            touchRevision();
+            return true;
+        }
+        return false;
+    }
+
     if (!inBounds(row, col) || !isInvalid(row, col)) {
         if (!_hoverPolylines.empty() || _hoverVertex.has_value()) {
             _hoverPolylines.clear();
@@ -181,12 +212,26 @@ bool ManualAddTool::updateHover(int row, int col)
 
 bool ManualAddTool::commitHover(std::string* status)
 {
+    if (_initialFillCommitted) {
+        if (status) {
+            *status = "Manual Add initial fill has already been used. Press Shift+E to save, then enable Manual Add again.";
+        }
+        return false;
+    }
     if (_hoverPolylines.empty()) {
         if (status) {
             *status = "No Manual Add bridge is available at the cursor.";
         }
         return false;
     }
+    const auto previousCommittedPolylines = _committedPolylines;
+    const auto previousHoverPolylines = _hoverPolylines;
+    const auto previousHoverVertex = _hoverVertex;
+    const auto previousPreview = _previewPoints.clone();
+    const auto previousFillVertices = _fillVertices;
+    const auto previousBorderSampleVertices = _borderSampleVertices;
+    const auto previousChangedVertices = _changedVertices;
+
     for (auto line : _hoverPolylines) {
         line.committed = true;
         line.floodFillComponent = _config.linePreviewMode == LinePreviewMode::CrossFill;
@@ -195,7 +240,21 @@ bool ManualAddTool::commitHover(std::string* status)
     _hoverPolylines.clear();
     _hoverVertex.reset();
     touchRevision();
-    return recompute(status);
+    if (recompute(status)) {
+        _initialFillCommitted = true;
+        touchRevision();
+        return true;
+    }
+
+    _committedPolylines = previousCommittedPolylines;
+    _hoverPolylines = previousHoverPolylines;
+    _hoverVertex = previousHoverVertex;
+    _previewPoints = previousPreview;
+    _fillVertices = previousFillVertices;
+    _borderSampleVertices = previousBorderSampleVertices;
+    _changedVertices = previousChangedVertices;
+    touchRevision();
+    return false;
 }
 
 void ManualAddTool::extractFillAndBorder()
@@ -515,15 +574,14 @@ bool ManualAddTool::addOrReplacePlaneConstraint(int row, int col, const cv::Vec3
     const auto previousBorderSampleVertices = _borderSampleVertices;
     const auto previousChangedVertices = _changedVertices;
 
-    auto it = std::find_if(_userPlaneConstraints.begin(), _userPlaneConstraints.end(), [&](const Constraint3d& c) {
-        return c.row == row && c.col == col;
-    });
     Constraint3d constraint{row, col, world, Constraint3d::Source::PlaneUser};
-    if (it == _userPlaneConstraints.end()) {
-        _userPlaneConstraints.push_back(constraint);
-    } else {
-        *it = constraint;
-    }
+    const double replacementRadiusSq = _config.planeConstraintReplacementRadius * _config.planeConstraintReplacementRadius;
+    _userPlaneConstraints.erase(std::remove_if(_userPlaneConstraints.begin(), _userPlaneConstraints.end(), [&](const Constraint3d& c) {
+                                    const cv::Vec3f delta = c.world - world;
+                                    return c.row == row && c.col == col || delta.dot(delta) <= replacementRadiusSq;
+                                }),
+                                _userPlaneConstraints.end());
+    _userPlaneConstraints.push_back(constraint);
     if (recompute(status)) {
         return true;
     }

@@ -65,8 +65,14 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
     _spinPlaneConstraintRadius = new QDoubleSpinBox(group);
     _spinPlaneConstraintRadius->setRange(0.5, 100.0);
     _spinPlaneConstraintRadius->setSingleStep(0.5);
-    _spinPlaneConstraintRadius->setValue(8.0);
+    _spinPlaneConstraintRadius->setValue(30.0);
     form->addRow(tr("Plane constraint radius"), _spinPlaneConstraintRadius);
+
+    _spinPlaneConstraintReplacementRadius = new QDoubleSpinBox(group);
+    _spinPlaneConstraintReplacementRadius->setRange(0.0, 100.0);
+    _spinPlaneConstraintReplacementRadius->setSingleStep(0.5);
+    _spinPlaneConstraintReplacementRadius->setValue(16.0);
+    form->addRow(tr("Constraint replace radius"), _spinPlaneConstraintReplacementRadius);
 
     _comboLinePreviewMode = new QComboBox(group);
     _comboLinePreviewMode->addItem(tr("Cross"), static_cast<int>(ManualAddTool::LinePreviewMode::Cross));
@@ -108,6 +114,7 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
     }
     connect(_spinRegularization, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, persist);
     connect(_spinPlaneConstraintRadius, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, persist);
+    connect(_spinPlaneConstraintReplacementRadius, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, persist);
     connect(_comboLinePreviewMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, persist);
     connect(_chkIncludeTouchedValidBorder, &QCheckBox::toggled, this, persist);
     connect(_chkAllowBoundarySmoothing, &QCheckBox::toggled, this, persist);
@@ -127,6 +134,7 @@ ManualAddTool::Config SegmentationManualAddPanel::config() const
     cfg.previewThrottleMs = _spinPreviewThrottle->value();
     cfg.tintOpacity = static_cast<float>(_spinTintOpacity->value()) / 100.0f;
     cfg.planeConstraintRadius = _spinPlaneConstraintRadius->value();
+    cfg.planeConstraintReplacementRadius = _spinPlaneConstraintReplacementRadius->value();
     cfg.linePreviewMode = static_cast<ManualAddTool::LinePreviewMode>(_comboLinePreviewMode->currentData().toInt());
     cfg.includeTouchedValidBorder = _chkIncludeTouchedValidBorder->isChecked();
     cfg.allowBoundarySmoothing = _chkAllowBoundarySmoothing->isChecked();
@@ -153,7 +161,8 @@ void SegmentationManualAddPanel::restoreSettings(QSettings& settings)
     setSpin(_spinSampleCap, settings.value(QStringLiteral("manual_add_sample_cap"), 512).toInt());
     setSpin(_spinPreviewThrottle, settings.value(QStringLiteral("manual_add_preview_throttle_ms"), 50).toInt());
     setSpin(_spinTintOpacity, settings.value(QStringLiteral("manual_add_tint_opacity_percent"), 45).toInt());
-    setSpin(_spinPlaneConstraintRadius, settings.value(QStringLiteral("manual_add_plane_constraint_radius"), 8.0).toDouble());
+    setSpin(_spinPlaneConstraintRadius, settings.value(QStringLiteral("manual_add_plane_constraint_radius"), 30.0).toDouble());
+    setSpin(_spinPlaneConstraintReplacementRadius, settings.value(QStringLiteral("manual_add_plane_constraint_replacement_radius"), 16.0).toDouble());
     {
         const QSignalBlocker blocker(_comboLinePreviewMode);
         const int mode = settings.value(QStringLiteral("manual_add_line_preview_mode"),
@@ -209,6 +218,7 @@ void SegmentationManualAddPanel::persistFromUi()
     writeSetting(QStringLiteral("manual_add_preview_throttle_ms"), _spinPreviewThrottle->value());
     writeSetting(QStringLiteral("manual_add_tint_opacity_percent"), _spinTintOpacity->value());
     writeSetting(QStringLiteral("manual_add_plane_constraint_radius"), _spinPlaneConstraintRadius->value());
+    writeSetting(QStringLiteral("manual_add_plane_constraint_replacement_radius"), _spinPlaneConstraintReplacementRadius->value());
     writeSetting(QStringLiteral("manual_add_line_preview_mode"), _comboLinePreviewMode->currentData().toInt());
     writeSetting(QStringLiteral("manual_add_include_touched_valid_border"), _chkIncludeTouchedValidBorder->isChecked());
     writeSetting(QStringLiteral("manual_add_allow_boundary_smoothing"), _chkAllowBoundarySmoothing->isChecked());
