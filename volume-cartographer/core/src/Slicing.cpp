@@ -1334,7 +1334,8 @@ void sampleSingleLayerAdaptiveImpl(
 
     if (promoteFallbackChunks) {
         auto repairKeys = fallbackRepair.merged();
-        if (!repairKeys.empty()) cache.fetchInteractive(repairKeys, desiredLevel);
+        if (!repairKeys.empty()) cache.fetchInteractive(repairKeys, desiredLevel,
+                                                        true);
     }
 }
 
@@ -2461,7 +2462,8 @@ void sampleCompositeAdaptiveImpl(
 
     if (promoteFallbackChunks) {
         auto repairKeys = fallbackRepair.merged();
-        if (!repairKeys.empty()) cache.fetchInteractive(repairKeys, desiredLevel);
+        if (!repairKeys.empty()) cache.fetchInteractive(repairKeys, desiredLevel,
+                                                        true);
     }
 }
 

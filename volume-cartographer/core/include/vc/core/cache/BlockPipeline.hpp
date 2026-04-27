@@ -114,7 +114,8 @@ public:
     // into 16^3 blocks and inserted into the block cache. targetLevel is
     // the pyramid level the viewer is currently displaying at; shards at
     // that level get the highest IO priority.
-    void fetchInteractive(const std::vector<ChunkKey>& keys, int targetLevel = 0);
+    void fetchInteractive(const std::vector<ChunkKey>& keys, int targetLevel = 0,
+                          bool bypassDedup = false);
 
     // --- Cache management ---
     void clearMemory();

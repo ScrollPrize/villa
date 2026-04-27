@@ -839,7 +839,8 @@ void BlockPipeline::bloomClear() noexcept {
     for (auto& w : negativeBloom_) w.store(0, std::memory_order_relaxed);
 }
 
-void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targetLevel) {
+void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targetLevel,
+                                     bool bypassDedup) {
     static int fetchDbgCount = 0;
     if (fetchDbgCount++ < 5 || fetchDbgCount % 100 == 0)
         fprintf(stderr, "[BlockPipeline] fetchInteractive %p: %zu keys, targetLevel=%d\n",
@@ -851,7 +852,7 @@ void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targ
     // downstream would change — the expensive containsBatch, emptyChunks
     // snapshot, classification, and (most importantly) IOPool queue
     // rebuilds would reproduce their previous outputs. Skip.
-    {
+    if (!bypassDedup) {
         // Commutative hash so order-insensitive dedup works across
         // render paths that enumerate chunks in different orders.
         uint64_t h = uint64_t(uint32_t(targetLevel)) * 0x9E3779B97F4A7C15ULL;
