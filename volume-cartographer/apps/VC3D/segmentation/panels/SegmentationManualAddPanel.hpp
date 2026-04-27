@@ -45,8 +45,6 @@ private:
     QSpinBox* _spinTintOpacity{nullptr};
     QDoubleSpinBox* _spinPlaneConstraintRadius{nullptr};
     QDoubleSpinBox* _spinPlaneConstraintReplacementRadius{nullptr};
-    QCheckBox* _chkSpacingRelaxationEnabled{nullptr};
-    QSpinBox* _spinSpacingRelaxationHalo{nullptr};
     QComboBox* _comboLinePreviewMode{nullptr};
     QCheckBox* _chkIncludeTouchedValidBorder{nullptr};
     QCheckBox* _chkAllowBoundarySmoothing{nullptr};

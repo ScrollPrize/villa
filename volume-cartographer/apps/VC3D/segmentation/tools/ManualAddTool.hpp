@@ -29,13 +29,6 @@ public:
         float tintOpacity{0.45f};
         double planeConstraintRadius{30.0};
         double planeConstraintReplacementRadius{16.0};
-        bool spacingRelaxationEnabled{false};
-        int spacingRelaxationHalo{2};
-        int spacingRelaxationMaxVertices{900};
-        int spacingRelaxationIterations{25};
-        double spacingRelaxationDistanceWeight{0.35};
-        double spacingRelaxationAnchorWeight{0.08};
-        double spacingRelaxationHaloAnchorWeight{0.35};
         LinePreviewMode linePreviewMode{LinePreviewMode::Cross};
         bool includeTouchedValidBorder{true};
         bool allowBoundarySmoothing{false};
@@ -79,7 +72,6 @@ public:
     bool removePlaneConstraintNear(const cv::Vec3f& world, double radius, std::string* status = nullptr);
     bool removeLastPlaneConstraint(std::string* status = nullptr);
     bool recompute(std::string* status = nullptr);
-    bool finalizeSpacingRelaxation(std::string* status = nullptr);
 
     void setConfig(Config config) { _config = sanitize(config); }
     [[nodiscard]] Config config() const { return _config; }
@@ -97,7 +89,6 @@ private:
     void extractFillAndBorder();
     std::vector<Constraint3d> buildFitSamples() const;
     std::vector<Constraint3d> downsampleSamples(std::vector<Constraint3d> samples) const;
-    void relaxSpacing();
     void touchRevision() { ++_revision; }
 
     Config _config;

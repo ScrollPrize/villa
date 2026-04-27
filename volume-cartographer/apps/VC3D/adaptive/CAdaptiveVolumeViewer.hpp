@@ -2,6 +2,8 @@
 
 #include <QWidget>
 #include <QPointF>
+#include <QRectF>
+#include <QColor>
 #include <QImage>
 #include <QTransform>
 
@@ -156,9 +158,9 @@ public:
     void clearOverlayGroup(const std::string& key) override;
     void clearAllOverlayGroups() override;
 
-    // --- BBox stubs ---
-    auto selections() const -> std::vector<std::pair<QRectF, QColor>> override { return {}; }
-    std::optional<QRectF> activeBBoxSceneRect() const override { return std::nullopt; }
+    // --- BBox ---
+    auto selections() const -> std::vector<std::pair<QRectF, QColor>> override;
+    std::optional<QRectF> activeBBoxSceneRect() const override;
 
     // --- Intersection ---
     float intersectionOpacity() const override { return _intersectionOpacity; }
@@ -196,11 +198,11 @@ public:
     void adjustSurfaceOffset(float dn);
     void resetSurfaceOffsets();
 
-    // --- BBox tool stubs ---
-    void setBBoxMode(bool) {}
-    bool isBBoxMode() const { return false; }
-    QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF&) { return nullptr; }
-    void clearSelections() {}
+    // --- BBox tool ---
+    void setBBoxMode(bool enabled);
+    bool isBBoxMode() const { return _bboxMode; }
+    QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF& sceneRect);
+    void clearSelections();
 
     // --- Compat accessors ---
     CVolumeViewerView* fGraphicsView = nullptr;  // alias for _view, set in constructor
@@ -307,6 +309,7 @@ private:
     // Framebuffer coordinate conversions
     QPointF surfaceToScene(float surfX, float surfY) const;
     cv::Vec2f sceneToSurface(const QPointF& scenePos) const;
+    QRectF surfaceRectToSceneRect(const QRectF& surfRect) const;
     void updateFocusMarker(POI* poi = nullptr);
 
     void renderFlattenedIntersections(const std::shared_ptr<Surface>& surf);
@@ -480,6 +483,16 @@ private:
     // --- Overlay groups (stored for VolumeViewerBase interface) ---
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
     QGraphicsItem* _focusMarker = nullptr;
+
+    // --- BBox tool state ---
+    bool _bboxMode = false;
+    QPointF _bboxStart;
+    std::optional<QRectF> _activeBBoxSurfRect;
+    struct Selection {
+        QRectF surfRect;
+        QColor color;
+    };
+    std::vector<Selection> _selections;
 
     // --- Intersection overlay ---
     std::set<std::string> _intersectTgts;

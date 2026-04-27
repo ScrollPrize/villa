@@ -19,10 +19,12 @@ public:
     void setActive(bool active);
     [[nodiscard]] bool active() const { return _active; }
     [[nodiscard]] bool strokeActive() const { return _strokeActive; }
-    [[nodiscard]] const std::vector<cv::Vec3f>& overlayPoints() const { return _overlayPoints; }
+    [[nodiscard]] bool hasPendingStroke() const { return !_pendingCells.empty(); }
+    [[nodiscard]] const std::vector<QPointF>& overlaySurfacePoints() const { return _overlaySurfacePoints; }
 
     void startStroke(const QPointF& surfacePos);
     void extendStroke(const QPointF& surfacePos, bool forceSample);
+    void pauseStroke();
     void finishStroke();
     void cancelStroke();
 
@@ -30,8 +32,8 @@ private:
     [[nodiscard]] std::optional<std::pair<int, int>> surfaceToGridIndex(const QPointF& surfacePos) const;
     void ensureMask();
     void paintAt(int row, int col);
-    void addOverlayPoint(int row, int col);
     void persistMask();
+    void applyPendingCells();
     void invalidateViewers();
 
     SegmentationModule& _module;
@@ -41,5 +43,6 @@ private:
     bool _strokeActive{false};
     std::optional<std::pair<int, int>> _lastGrid;
     std::unordered_set<uint64_t> _paintedCells;
-    std::vector<cv::Vec3f> _overlayPoints;
+    std::vector<std::pair<int, int>> _pendingCells;
+    std::vector<QPointF> _overlaySurfacePoints;
 };

@@ -2,12 +2,8 @@
 
 #include "ThinPlateSpline3d.hpp"
 
-#include <ceres/ceres.h>
-
 #include <algorithm>
-#include <array>
 #include <cmath>
-#include <iostream>
 #include <map>
 #include <queue>
 #include <set>
@@ -38,73 +34,6 @@ ManualAddTool::GridPolyline makeLine(int row0, int col0, int row1, int col1)
 
 int rowOf(const cv::Point2i& p) { return p.y; }
 int colOf(const cv::Point2i& p) { return p.x; }
-
-struct DistanceResidual
-{
-    DistanceResidual(double target, double weight)
-        : target(target)
-        , weight(weight)
-    {
-    }
-
-    template <typename T>
-    bool operator()(const T* const a, const T* const b, T* residual) const
-    {
-        const T dx = a[0] - b[0];
-        const T dy = a[1] - b[1];
-        const T dz = a[2] - b[2];
-        residual[0] = T(weight) * (ceres::sqrt(dx * dx + dy * dy + dz * dz + T(1e-12)) - T(target));
-        return true;
-    }
-
-    double target;
-    double weight;
-};
-
-struct DistanceToFixedResidual
-{
-    DistanceToFixedResidual(cv::Vec3d fixed, double target, double weight)
-        : fixed(fixed)
-        , target(target)
-        , weight(weight)
-    {
-    }
-
-    template <typename T>
-    bool operator()(const T* const a, T* residual) const
-    {
-        const T dx = a[0] - T(fixed[0]);
-        const T dy = a[1] - T(fixed[1]);
-        const T dz = a[2] - T(fixed[2]);
-        residual[0] = T(weight) * (ceres::sqrt(dx * dx + dy * dy + dz * dz + T(1e-12)) - T(target));
-        return true;
-    }
-
-    cv::Vec3d fixed;
-    double target;
-    double weight;
-};
-
-struct AnchorResidual
-{
-    AnchorResidual(cv::Vec3d target, double weight)
-        : target(target)
-        , weight(weight)
-    {
-    }
-
-    template <typename T>
-    bool operator()(const T* const p, T* residual) const
-    {
-        residual[0] = T(weight) * (p[0] - T(target[0]));
-        residual[1] = T(weight) * (p[1] - T(target[1]));
-        residual[2] = T(weight) * (p[2] - T(target[2]));
-        return true;
-    }
-
-    cv::Vec3d target;
-    double weight;
-};
 }
 
 ManualAddTool::Config ManualAddTool::sanitize(Config config)
@@ -117,12 +46,6 @@ ManualAddTool::Config ManualAddTool::sanitize(Config config)
     config.tintOpacity = std::clamp(config.tintOpacity, 0.0f, 1.0f);
     config.planeConstraintRadius = std::clamp(config.planeConstraintRadius, 0.5, 100.0);
     config.planeConstraintReplacementRadius = std::clamp(config.planeConstraintReplacementRadius, 0.0, 100.0);
-    config.spacingRelaxationHalo = std::clamp(config.spacingRelaxationHalo, 0, 8);
-    config.spacingRelaxationMaxVertices = std::clamp(config.spacingRelaxationMaxVertices, 16, 10000);
-    config.spacingRelaxationIterations = std::clamp(config.spacingRelaxationIterations, 1, 100);
-    config.spacingRelaxationDistanceWeight = std::clamp(config.spacingRelaxationDistanceWeight, 0.0, 10.0);
-    config.spacingRelaxationAnchorWeight = std::clamp(config.spacingRelaxationAnchorWeight, 0.0, 10.0);
-    config.spacingRelaxationHaloAnchorWeight = std::clamp(config.spacingRelaxationHaloAnchorWeight, 0.0, 10.0);
     const int mode = std::clamp(static_cast<int>(config.linePreviewMode),
                                 static_cast<int>(LinePreviewMode::VerticalOnly),
                                 static_cast<int>(LinePreviewMode::CrossFill));
@@ -573,227 +496,6 @@ std::vector<ManualAddTool::Constraint3d> ManualAddTool::downsampleSamples(std::v
     return result;
 }
 
-void ManualAddTool::relaxSpacing()
-{
-    if (!_config.spacingRelaxationEnabled ||
-        _config.spacingRelaxationDistanceWeight <= 0.0 ||
-        _previewPoints.empty() ||
-        _fillVertices.empty()) {
-        if (!_fillVertices.empty()) {
-            std::cout << "Manual Add spacing relaxation skipped: disabled or no distance weight" << std::endl;
-        }
-        return;
-    }
-
-    const int rows = _previewPoints.rows;
-    const int cols = _previewPoints.cols;
-    std::set<std::pair<int, int>> fill;
-    for (const auto& key : _fillVertices) {
-        fill.insert({key.row, key.col});
-    }
-    std::set<std::pair<int, int>> userConstrained;
-    for (const auto& constraint : _userPlaneConstraints) {
-        userConstrained.insert({constraint.row, constraint.col});
-    }
-
-    std::set<std::pair<int, int>> variableKeys;
-    const int halo = _config.spacingRelaxationHalo;
-    for (const auto& key : _fillVertices) {
-        for (int dr = -halo; dr <= halo; ++dr) {
-            for (int dc = -halo; dc <= halo; ++dc) {
-                const int row = key.row + dr;
-                const int col = key.col + dc;
-                if (row < 0 || row >= rows || col < 0 || col >= cols) {
-                    continue;
-                }
-                if (!fill.count({row, col}) && !isValid(row, col)) {
-                    continue;
-                }
-                if (!isInvalidPoint(_previewPoints(row, col))) {
-                    variableKeys.insert({row, col});
-                }
-            }
-        }
-    }
-    if (variableKeys.empty()) {
-        std::cout << "Manual Add spacing relaxation skipped: no valid vertices in fill/halo" << std::endl;
-        return;
-    }
-    if (static_cast<int>(variableKeys.size()) > _config.spacingRelaxationMaxVertices) {
-        std::cout << "Manual Add spacing relaxation skipped: " << variableKeys.size()
-                  << " vertices exceeds cap " << _config.spacingRelaxationMaxVertices << std::endl;
-        return;
-    }
-
-    constexpr int kEdges[4][2] = {{0, 1}, {1, 0}, {1, 1}, {1, -1}};
-    double fallbackTarget[4] = {0.0, 0.0, 0.0, 0.0};
-    for (int edgeIndex = 0; edgeIndex < 4; ++edgeIndex) {
-        std::vector<double> lengths;
-        const int dr = kEdges[edgeIndex][0];
-        const int dc = kEdges[edgeIndex][1];
-        for (const auto& [row, col] : variableKeys) {
-            const int nr = row + dr;
-            const int nc = col + dc;
-            if (nr < 0 || nr >= rows || nc < 0 || nc >= cols ||
-                !isValid(row, col) || !isValid(nr, nc)) {
-                continue;
-            }
-            lengths.push_back(cv::norm(_entrySnapshotPoints(row, col) - _entrySnapshotPoints(nr, nc)));
-        }
-        if (!lengths.empty()) {
-            const auto mid = lengths.begin() + static_cast<std::ptrdiff_t>(lengths.size() / 2);
-            std::nth_element(lengths.begin(), mid, lengths.end());
-            fallbackTarget[edgeIndex] = std::max(1e-6, *mid);
-        }
-    }
-    if (fallbackTarget[0] <= 0.0 && fallbackTarget[1] <= 0.0) {
-        std::cout << "Manual Add spacing relaxation skipped: could not infer target edge length" << std::endl;
-        return;
-    }
-    if (fallbackTarget[0] <= 0.0) {
-        fallbackTarget[0] = fallbackTarget[1];
-    }
-    if (fallbackTarget[1] <= 0.0) {
-        fallbackTarget[1] = fallbackTarget[0];
-    }
-    const double diagonalFallback = std::sqrt(fallbackTarget[0] * fallbackTarget[0] +
-                                             fallbackTarget[1] * fallbackTarget[1]);
-    if (fallbackTarget[2] <= 0.0) {
-        fallbackTarget[2] = diagonalFallback;
-    }
-    if (fallbackTarget[3] <= 0.0) {
-        fallbackTarget[3] = diagonalFallback;
-    }
-
-    struct Variable
-    {
-        int row;
-        int col;
-        cv::Vec3d initial;
-        std::array<double, 3> value;
-        bool fill;
-        bool userConstrained;
-    };
-
-    std::vector<Variable> variables;
-    variables.reserve(variableKeys.size());
-    std::map<std::pair<int, int>, int> indexByKey;
-    for (const auto& [row, col] : variableKeys) {
-        const cv::Vec3f p = _previewPoints(row, col);
-        const cv::Vec3d initial(p[0], p[1], p[2]);
-        indexByKey[{row, col}] = static_cast<int>(variables.size());
-        variables.push_back(Variable{row, col,
-                                     initial,
-                                     {initial[0], initial[1], initial[2]},
-                                     fill.count({row, col}) != 0,
-                                     userConstrained.count({row, col}) != 0});
-    }
-
-    auto targetForEdge = [&](int row, int col, int nr, int nc, int edgeIndex) {
-        if (isValid(row, col) && isValid(nr, nc)) {
-            return std::max(1e-6, static_cast<double>(cv::norm(_entrySnapshotPoints(row, col) - _entrySnapshotPoints(nr, nc))));
-        }
-        return fallbackTarget[edgeIndex];
-    };
-
-    ceres::Problem problem;
-    int distanceResiduals = 0;
-    for (auto& variable : variables) {
-        const double anchorWeight = variable.fill
-                                        ? _config.spacingRelaxationAnchorWeight
-                                        : _config.spacingRelaxationHaloAnchorWeight;
-        if (anchorWeight > 0.0) {
-            problem.AddResidualBlock(
-                new ceres::AutoDiffCostFunction<AnchorResidual, 3, 3>(
-                    new AnchorResidual(variable.initial, anchorWeight)),
-                nullptr,
-                variable.value.data());
-        }
-        if (variable.userConstrained) {
-            problem.SetParameterBlockConstant(variable.value.data());
-        }
-    }
-
-    for (int i = 0; i < static_cast<int>(variables.size()); ++i) {
-        const auto& variable = variables[i];
-        for (int edgeIndex = 0; edgeIndex < 4; ++edgeIndex) {
-            const int nr = variable.row + kEdges[edgeIndex][0];
-            const int nc = variable.col + kEdges[edgeIndex][1];
-            if (nr < 0 || nr >= rows || nc < 0 || nc >= cols) {
-                continue;
-            }
-            const double target = targetForEdge(variable.row, variable.col, nr, nc, edgeIndex);
-            if (target <= 0.0) {
-                continue;
-            }
-            const auto otherIt = indexByKey.find({nr, nc});
-            if (otherIt != indexByKey.end()) {
-                problem.AddResidualBlock(
-                    new ceres::AutoDiffCostFunction<DistanceResidual, 1, 3, 3>(
-                        new DistanceResidual(target, _config.spacingRelaxationDistanceWeight)),
-                    nullptr,
-                    variables[i].value.data(),
-                    variables[otherIt->second].value.data());
-                ++distanceResiduals;
-            } else if (isValid(nr, nc)) {
-                const cv::Vec3f p = _entrySnapshotPoints(nr, nc);
-                problem.AddResidualBlock(
-                    new ceres::AutoDiffCostFunction<DistanceToFixedResidual, 1, 3>(
-                        new DistanceToFixedResidual(cv::Vec3d(p[0], p[1], p[2]), target,
-                                                    _config.spacingRelaxationDistanceWeight)),
-                    nullptr,
-                    variables[i].value.data());
-                ++distanceResiduals;
-            }
-        }
-    }
-    std::cout << "Manual Add spacing relaxation: solving " << variables.size()
-              << " vertices, halo " << halo
-              << ", " << distanceResiduals
-              << " distance residuals, max " << _config.spacingRelaxationIterations
-              << " iterations" << std::endl;
-
-    ceres::Solver::Options options;
-    options.max_num_iterations = _config.spacingRelaxationIterations;
-    options.linear_solver_type = ceres::DENSE_QR;
-    options.logging_type = ceres::SILENT;
-    options.minimizer_progress_to_stdout = false;
-
-    ceres::Solver::Summary summary;
-    ceres::Solve(options, &problem, &summary);
-    if (!summary.IsSolutionUsable()) {
-        std::cout << "Manual Add spacing relaxation failed: "
-                  << summary.BriefReport() << std::endl;
-        return;
-    }
-    std::cout << "Manual Add spacing relaxation finished: "
-              << summary.iterations.size() << " iterations, cost "
-              << summary.initial_cost << " -> " << summary.final_cost << std::endl;
-
-    std::set<std::pair<int, int>> changed;
-    for (const auto& key : _changedVertices) {
-        changed.insert({key.row, key.col});
-    }
-    for (const auto& variable : variables) {
-        const cv::Vec3f relaxed(static_cast<float>(variable.value[0]),
-                                static_cast<float>(variable.value[1]),
-                                static_cast<float>(variable.value[2]));
-        if (!std::isfinite(relaxed[0]) || !std::isfinite(relaxed[1]) || !std::isfinite(relaxed[2])) {
-            continue;
-        }
-        _previewPoints(variable.row, variable.col) = relaxed;
-        const cv::Vec3f original = _entrySnapshotPoints(variable.row, variable.col);
-        if (variable.fill || cv::norm(relaxed - original) > 1e-5f) {
-            changed.insert({variable.row, variable.col});
-        }
-    }
-    _changedVertices.clear();
-    _changedVertices.reserve(changed.size());
-    for (const auto& [row, col] : changed) {
-        _changedVertices.push_back(GridKey{row, col});
-    }
-}
-
 bool ManualAddTool::recompute(std::string* status)
 {
     if (_entrySnapshotPoints.empty()) {
@@ -851,19 +553,6 @@ bool ManualAddTool::recompute(std::string* status)
 
     if (status) {
         *status = "Manual Add preview updated.";
-    }
-    touchRevision();
-    return true;
-}
-
-bool ManualAddTool::finalizeSpacingRelaxation(std::string* status)
-{
-    if (_entrySnapshotPoints.empty()) {
-        return false;
-    }
-    relaxSpacing();
-    if (status) {
-        *status = "Manual Add finalized.";
     }
     touchRevision();
     return true;

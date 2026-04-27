@@ -1259,17 +1259,13 @@ void SegmentationModule::refreshOverlay()
     if (_lineTool) {
         maskReserve += _lineTool->overlayPoints().size();
     }
-    if (_surfaceMaskTool) {
-        maskReserve += _surfaceMaskTool->overlayPoints().size();
-    }
     maskPoints.reserve(maskReserve);
     if (_lineTool) {
         const auto& linePts = _lineTool->overlayPoints();
         maskPoints.insert(maskPoints.end(), linePts.begin(), linePts.end());
     }
     if (_surfaceMaskTool) {
-        const auto& surfaceMaskPts = _surfaceMaskTool->overlayPoints();
-        maskPoints.insert(maskPoints.end(), surfaceMaskPts.begin(), surfaceMaskPts.end());
+        state.surfaceMaskPoints = _surfaceMaskTool->overlaySurfacePoints();
     }
 
     const bool hasLineStroke = _lineTool && !_lineTool->overlayPoints().empty();
@@ -1279,7 +1275,7 @@ void SegmentationModule::refreshOverlay()
     const bool pushPullActive = _pushPullTool && _pushPullTool->isActive();
 
     state.maskPoints = std::move(maskPoints);
-    state.maskVisible = !state.maskPoints.empty();
+    state.maskVisible = !state.maskPoints.empty() || !state.surfaceMaskPoints.empty();
     state.hasLineStroke = hasLineStroke;
     state.lineStrokeActive = lineStrokeActive;
     state.brushActive = surfaceMaskActive;
@@ -1704,10 +1700,6 @@ bool SegmentationModule::finishManualAdd(bool apply)
 
     if (apply) {
         if (_editManager) {
-            if (!_manualAddTool->finalizeSpacingRelaxation()) {
-                emit statusMessageRequested(tr("Manual Add finalization failed."), kStatusMedium);
-                return false;
-            }
             std::optional<cv::Rect> bounds;
             if (!_editManager->setPreviewPointsOnly(_manualAddTool->previewPoints(),
                                                     _manualAddTool->changedVertices(),

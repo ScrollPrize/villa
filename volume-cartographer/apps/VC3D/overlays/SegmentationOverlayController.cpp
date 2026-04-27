@@ -137,6 +137,7 @@ bool SegmentationOverlayController::State::operator==(const State& rhs) const
     return optionalEqual(activeMarker, rhs.activeMarker) &&
            vectorEqual(neighbours, rhs.neighbours) &&
            maskEqual(maskPoints, rhs.maskPoints) &&
+           surfaceMaskPoints == rhs.surfaceMaskPoints &&
            maskVisible == rhs.maskVisible &&
            brushActive == rhs.brushActive &&
            brushStrokeActive == rhs.brushStrokeActive &&
@@ -947,6 +948,46 @@ void SegmentationOverlayController::collectPrimitives(VolumeViewerBase* viewer,
 
     if (shouldShowMask(state)) {
         builder.addPath(buildMaskPrimitive(state));
+    }
+
+    if (!state.surfaceMaskPoints.empty() && viewer->surfName() == "segmentation") {
+        auto* tiledViewer = dynamic_cast<CTiledVolumeViewer*>(viewer);
+        if (tiledViewer) {
+            std::vector<QPointF> scenePoints;
+            scenePoints.reserve(state.surfaceMaskPoints.size());
+            for (const QPointF& surfacePoint : state.surfaceMaskPoints) {
+                const QPointF scene = tiledViewer->surfaceCoordsToScene(static_cast<float>(surfacePoint.x()),
+                                                                        static_cast<float>(surfacePoint.y()));
+                if (std::isfinite(scene.x()) && std::isfinite(scene.y())) {
+                    scenePoints.push_back(scene);
+                }
+            }
+
+            if (!scenePoints.empty()) {
+                ViewerOverlayControllerBase::OverlayStyle style;
+                style.penColor = QColor(255, 80, 40, 230);
+                style.brushColor = QColor(255, 80, 40, 70);
+                style.penWidth = 2.0;
+                style.penStyle = Qt::DashLine;
+                style.dashPattern = {4.0, 4.0};
+                style.z = kMaskZ + 5.0;
+
+                const QPointF center = scenePoints.back();
+                const QPointF edge = tiledViewer->surfaceCoordsToScene(
+                    static_cast<float>(state.surfaceMaskPoints.back().x() + state.displayRadiusSteps),
+                    static_cast<float>(state.surfaceMaskPoints.back().y()));
+                const qreal radiusPixels = std::hypot(edge.x() - center.x(), edge.y() - center.y());
+                if (radiusPixels > 1.0) {
+                    builder.addCircle(center, radiusPixels, false, style);
+                }
+
+                if (scenePoints.size() >= 2) {
+                    style.penWidth = std::max<qreal>(2.0, radiusPixels * 0.35);
+                    style.penStyle = Qt::SolidLine;
+                    builder.addLineStrip(scenePoints, false, style);
+                }
+            }
+        }
     }
 
     buildVertexMarkers(state, viewer, builder);

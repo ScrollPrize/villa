@@ -74,11 +74,6 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
     _spinPlaneConstraintReplacementRadius->setValue(16.0);
     form->addRow(tr("Constraint replace radius"), _spinPlaneConstraintReplacementRadius);
 
-    _spinSpacingRelaxationHalo = new QSpinBox(group);
-    _spinSpacingRelaxationHalo->setRange(0, 8);
-    _spinSpacingRelaxationHalo->setValue(2);
-    form->addRow(tr("Spacing relax halo"), _spinSpacingRelaxationHalo);
-
     _comboLinePreviewMode = new QComboBox(group);
     _comboLinePreviewMode->addItem(tr("Cross"), static_cast<int>(ManualAddTool::LinePreviewMode::Cross));
     _comboLinePreviewMode->addItem(tr("Cross-fill"), static_cast<int>(ManualAddTool::LinePreviewMode::CrossFill));
@@ -95,10 +90,6 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
     _chkAllowBoundarySmoothing = new QCheckBox(tr("Allow boundary smoothing"), group);
     _chkAllowBoundarySmoothing->setChecked(false);
     layout->addWidget(_chkAllowBoundarySmoothing);
-
-    _chkSpacingRelaxationEnabled = new QCheckBox(tr("Relax 3D spacing after fit"), group);
-    _chkSpacingRelaxationEnabled->setChecked(false);
-    layout->addWidget(_chkSpacingRelaxationEnabled);
 
     auto* buttons = new QHBoxLayout();
     _btnClearPending = new QPushButton(tr("Clear Pending"), group);
@@ -118,7 +109,7 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
         persistFromUi();
         emit configChanged();
     };
-    for (auto* spin : {_spinMaxPreviewSpan, _spinBoundaryBand, _spinSampleCap, _spinPreviewThrottle, _spinTintOpacity, _spinSpacingRelaxationHalo}) {
+    for (auto* spin : {_spinMaxPreviewSpan, _spinBoundaryBand, _spinSampleCap, _spinPreviewThrottle, _spinTintOpacity}) {
         connect(spin, QOverload<int>::of(&QSpinBox::valueChanged), this, persist);
     }
     connect(_spinRegularization, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, persist);
@@ -127,7 +118,6 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
     connect(_comboLinePreviewMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, persist);
     connect(_chkIncludeTouchedValidBorder, &QCheckBox::toggled, this, persist);
     connect(_chkAllowBoundarySmoothing, &QCheckBox::toggled, this, persist);
-    connect(_chkSpacingRelaxationEnabled, &QCheckBox::toggled, this, persist);
     connect(_btnClearPending, &QPushButton::clicked, this, &SegmentationManualAddPanel::clearPendingRequested);
     connect(_btnRecompute, &QPushButton::clicked, this, &SegmentationManualAddPanel::recomputeRequested);
     connect(_btnApplyExit, &QPushButton::clicked, this, &SegmentationManualAddPanel::applyExitRequested);
@@ -145,8 +135,6 @@ ManualAddTool::Config SegmentationManualAddPanel::config() const
     cfg.tintOpacity = static_cast<float>(_spinTintOpacity->value()) / 100.0f;
     cfg.planeConstraintRadius = _spinPlaneConstraintRadius->value();
     cfg.planeConstraintReplacementRadius = _spinPlaneConstraintReplacementRadius->value();
-    cfg.spacingRelaxationEnabled = _chkSpacingRelaxationEnabled->isChecked();
-    cfg.spacingRelaxationHalo = _spinSpacingRelaxationHalo->value();
     cfg.linePreviewMode = static_cast<ManualAddTool::LinePreviewMode>(_comboLinePreviewMode->currentData().toInt());
     cfg.includeTouchedValidBorder = _chkIncludeTouchedValidBorder->isChecked();
     cfg.allowBoundarySmoothing = _chkAllowBoundarySmoothing->isChecked();
@@ -175,7 +163,6 @@ void SegmentationManualAddPanel::restoreSettings(QSettings& settings)
     setSpin(_spinTintOpacity, settings.value(QStringLiteral("manual_add_tint_opacity_percent"), 45).toInt());
     setSpin(_spinPlaneConstraintRadius, settings.value(QStringLiteral("manual_add_plane_constraint_radius"), 30.0).toDouble());
     setSpin(_spinPlaneConstraintReplacementRadius, settings.value(QStringLiteral("manual_add_plane_constraint_replacement_radius"), 16.0).toDouble());
-    setSpin(_spinSpacingRelaxationHalo, settings.value(QStringLiteral("manual_add_spacing_relaxation_halo"), 2).toInt());
     {
         const QSignalBlocker blocker(_comboLinePreviewMode);
         const int mode = settings.value(QStringLiteral("manual_add_line_preview_mode"),
@@ -190,10 +177,6 @@ void SegmentationManualAddPanel::restoreSettings(QSettings& settings)
     {
         const QSignalBlocker blocker(_chkAllowBoundarySmoothing);
         _chkAllowBoundarySmoothing->setChecked(settings.value(QStringLiteral("manual_add_allow_boundary_smoothing"), false).toBool());
-    }
-    {
-        const QSignalBlocker blocker(_chkSpacingRelaxationEnabled);
-        _chkSpacingRelaxationEnabled->setChecked(settings.value(QStringLiteral("manual_add_spacing_relaxation_enabled"), false).toBool());
     }
     _restoringSettings = false;
 }
@@ -236,8 +219,6 @@ void SegmentationManualAddPanel::persistFromUi()
     writeSetting(QStringLiteral("manual_add_tint_opacity_percent"), _spinTintOpacity->value());
     writeSetting(QStringLiteral("manual_add_plane_constraint_radius"), _spinPlaneConstraintRadius->value());
     writeSetting(QStringLiteral("manual_add_plane_constraint_replacement_radius"), _spinPlaneConstraintReplacementRadius->value());
-    writeSetting(QStringLiteral("manual_add_spacing_relaxation_enabled"), _chkSpacingRelaxationEnabled->isChecked());
-    writeSetting(QStringLiteral("manual_add_spacing_relaxation_halo"), _spinSpacingRelaxationHalo->value());
     writeSetting(QStringLiteral("manual_add_line_preview_mode"), _comboLinePreviewMode->currentData().toInt());
     writeSetting(QStringLiteral("manual_add_include_touched_valid_border"), _chkIncludeTouchedValidBorder->isChecked());
     writeSetting(QStringLiteral("manual_add_allow_boundary_smoothing"), _chkAllowBoundarySmoothing->isChecked());

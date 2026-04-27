@@ -347,7 +347,7 @@ bool SegmentationModule::handleKeyRelease(QKeyEvent* event)
 
     if (event->key() == Qt::Key_Shift && !event->isAutoRepeat() && _shiftDrawMaskActive) {
         if (_surfaceMaskTool) {
-            if (_surfaceMaskTool->strokeActive()) {
+            if (_surfaceMaskTool->strokeActive() || _surfaceMaskTool->hasPendingStroke()) {
                 _surfaceMaskTool->finishStroke();
             }
             _surfaceMaskTool->setActive(_drawMaskEnabled);
@@ -669,10 +669,10 @@ void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
         if (_surfaceMaskTool && viewer) {
             const cv::Vec2f surfCoords = viewer->sceneToSurfaceCoords(scenePos);
             _surfaceMaskTool->extendStroke(QPointF(surfCoords[0], surfCoords[1]), true);
-            _surfaceMaskTool->finishStroke();
             if (_shiftDrawMaskActive) {
-                _surfaceMaskTool->setActive(_drawMaskEnabled);
-                _shiftDrawMaskActive = false;
+                _surfaceMaskTool->pauseStroke();
+            } else {
+                _surfaceMaskTool->finishStroke();
             }
         }
         return;

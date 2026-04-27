@@ -10,7 +10,6 @@
 #include <cmath>
 #include <exception>
 #include <filesystem>
-#include <limits>
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Tiff.hpp"
@@ -40,7 +39,8 @@ void SurfaceMaskBrushTool::setSurface(QuadSurface* surface)
     _mask.release();
     _lastGrid.reset();
     _paintedCells.clear();
-    _overlayPoints.clear();
+    _pendingCells.clear();
+    _overlaySurfacePoints.clear();
 }
 
 void SurfaceMaskBrushTool::setActive(bool active)
@@ -49,7 +49,7 @@ void SurfaceMaskBrushTool::setActive(bool active)
         return;
     }
     _active = active;
-    if (!_active && _strokeActive) {
+    if (!_active && (_strokeActive || hasPendingStroke())) {
         finishStroke();
     }
 }
@@ -68,7 +68,8 @@ void SurfaceMaskBrushTool::startStroke(const QPointF& surfacePos)
     ensureMask();
     _strokeActive = true;
     _paintedCells.clear();
-    _overlayPoints.clear();
+    _pendingCells.clear();
+    _overlaySurfacePoints.clear();
     _lastGrid = grid;
     paintAt(grid->first, grid->second);
     invalidateViewers();
@@ -117,7 +118,7 @@ void SurfaceMaskBrushTool::extendStroke(const QPointF& surfacePos, bool forceSam
     invalidateViewers();
 }
 
-void SurfaceMaskBrushTool::finishStroke()
+void SurfaceMaskBrushTool::pauseStroke()
 {
     if (!_strokeActive) {
         return;
@@ -125,9 +126,22 @@ void SurfaceMaskBrushTool::finishStroke()
 
     _strokeActive = false;
     _lastGrid.reset();
+    invalidateViewers();
+}
+
+void SurfaceMaskBrushTool::finishStroke()
+{
+    if (!_strokeActive && _pendingCells.empty()) {
+        return;
+    }
+
+    _strokeActive = false;
+    _lastGrid.reset();
+    applyPendingCells();
     persistMask();
     _paintedCells.clear();
-    _overlayPoints.clear();
+    _pendingCells.clear();
+    _overlaySurfacePoints.clear();
     invalidateViewers();
 }
 
@@ -136,7 +150,8 @@ void SurfaceMaskBrushTool::cancelStroke()
     _strokeActive = false;
     _lastGrid.reset();
     _paintedCells.clear();
-    _overlayPoints.clear();
+    _pendingCells.clear();
+    _overlaySurfacePoints.clear();
     if (_surface) {
         _mask = _surface->validMask();
     } else {
@@ -203,13 +218,16 @@ void SurfaceMaskBrushTool::paintAt(int centerRow, int centerCol)
     }
 
     const cv::Vec2f scale = _surface->scale();
+    if (std::abs(scale[0]) < 1e-6f || std::abs(scale[1]) < 1e-6f) {
+        return;
+    }
     const float avgScale = 0.5f * (std::abs(scale[0]) + std::abs(scale[1]));
     const int radius = static_cast<int>(std::ceil(std::max(1.0f, _module.approvalMaskBrushRadius() *
                                                                  (avgScale > 1e-4f ? avgScale : 1.0f))));
     const int radiusSq = radius * radius;
-    const cv::Vec3f invalid(-1.0f, -1.0f, -1.0f);
-
-    addOverlayPoint(centerRow, centerCol);
+    const cv::Vec3f center = _surface->center();
+    _overlaySurfacePoints.emplace_back(static_cast<float>(centerCol) / scale[0] - center[0],
+                                       static_cast<float>(centerRow) / scale[1] - center[1]);
 
     for (int dr = -radius; dr <= radius; ++dr) {
         for (int dc = -radius; dc <= radius; ++dc) {
@@ -228,32 +246,8 @@ void SurfaceMaskBrushTool::paintAt(int centerRow, int centerCol)
                 continue;
             }
 
-            _mask(row, col) = 0;
-            (*points)(row, col) = invalid;
+            _pendingCells.emplace_back(row, col);
         }
-    }
-}
-
-void SurfaceMaskBrushTool::addOverlayPoint(int row, int col)
-{
-    if (!_surface) {
-        return;
-    }
-
-    const auto* points = _surface->rawPointsPtr();
-    if (!points || row < 0 || row >= points->rows || col < 0 || col >= points->cols) {
-        return;
-    }
-
-    const cv::Vec3f point = (*points)(row, col);
-    const bool valid = std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]) &&
-                       point[0] >= 0.0f && point[1] >= 0.0f && point[2] >= 0.0f;
-    if (!valid) {
-        return;
-    }
-
-    if (_overlayPoints.empty() || cv::norm(_overlayPoints.back() - point) > std::numeric_limits<float>::epsilon()) {
-        _overlayPoints.push_back(point);
     }
 }
 
@@ -284,6 +278,27 @@ void SurfaceMaskBrushTool::persistMask()
         Q_EMIT _module.statusMessageRequested(
             QCoreApplication::translate("SurfaceMaskBrushTool", "Failed to save mask.tif."),
             kStatusLong);
+    }
+}
+
+void SurfaceMaskBrushTool::applyPendingCells()
+{
+    if (!_surface || _mask.empty()) {
+        return;
+    }
+
+    auto* points = _surface->rawPointsPtr();
+    if (!points || points->empty()) {
+        return;
+    }
+
+    const cv::Vec3f invalid(-1.0f, -1.0f, -1.0f);
+    for (const auto& [row, col] : _pendingCells) {
+        if (row < 0 || row >= _mask.rows || col < 0 || col >= _mask.cols) {
+            continue;
+        }
+        _mask(row, col) = 0;
+        (*points)(row, col) = invalid;
     }
 }
 

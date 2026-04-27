@@ -55,6 +55,7 @@ public:
         std::optional<VertexMarker> activeMarker;
         std::vector<VertexMarker> neighbours;
         std::vector<cv::Vec3f> maskPoints;
+        std::vector<QPointF> surfaceMaskPoints;
         bool maskVisible{false};
         bool brushActive{false};
         bool brushStrokeActive{false};
