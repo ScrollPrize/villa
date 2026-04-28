@@ -46,6 +46,7 @@ public:
     void setMdiArea(QMdiArea* mdiArea) { _mdiArea = mdiArea; }
     void setAnnotationViewer(CTiledVolumeViewer* viewer) { _annotationViewer = viewer; }
     void setReferenceViewer(CTiledVolumeViewer* viewer) { _referenceViewer = viewer; }
+    CTiledVolumeViewer* referenceViewer() const { return _referenceViewer; }
     int fiberStep() const { return _fiberStep; }
 
 signals:

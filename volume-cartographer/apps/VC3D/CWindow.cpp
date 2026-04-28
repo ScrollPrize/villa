@@ -6655,6 +6655,18 @@ void CWindow::onFiberAnnotationViewerRequested(const std::string& surfaceName, c
         auto* subWindow = qobject_cast<QMdiSubWindow*>(viewer->parentWidget());
         if (subWindow) {
             subWindow->show();
+
+            // Tile fiber annotation (right half) and reference (left half) side by side
+            auto* refViewer = _fiberController->referenceViewer();
+            if (refViewer) {
+                auto* refSub = qobject_cast<QMdiSubWindow*>(refViewer->parentWidget());
+                if (refSub) {
+                    QRect area = mdiArea->contentsRect();
+                    int halfW = area.width() / 2;
+                    refSub->setGeometry(area.x(), area.y(), halfW, area.height());
+                    subWindow->setGeometry(area.x() + halfW, area.y(), area.width() - halfW, area.height());
+                }
+            }
         }
     }
 }

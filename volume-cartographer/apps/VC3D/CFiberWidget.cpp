@@ -39,7 +39,7 @@ void CFiberWidget::setupUi()
     stepLayout->addWidget(new QLabel("Step:"));
     _stepGroup = new QButtonGroup(this);
     _stepGroup->setExclusive(true);
-    for (int step : {5, 10, 25, 50, 100}) {
+    for (int step : {1, 5, 10, 25, 50, 100}) {
         auto* btn = new QPushButton(QString::number(step), mainWidget);
         btn->setCheckable(true);
         btn->setMinimumWidth(30);

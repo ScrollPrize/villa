@@ -8,8 +8,6 @@
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <cmath>
-#include <algorithm>
-#include <iostream>
 
 FiberAnnotationController::FiberAnnotationController(CState* state,
                                                      VCCollection* collection,
@@ -150,36 +148,45 @@ void FiberAnnotationController::advanceToNextPrediction()
         return predictFromThreeOrMore();
     }();
 
-    // 1. Get old annotation plane's basisY (the "up" the user was seeing)
+    // 1. Get old annotation plane
     auto oldPlane = std::dynamic_pointer_cast<PlaneSurface>(_cstate->surface(kFiberAnnotationSurface));
     cv::Vec3f oldVy = oldPlane ? oldPlane->basisY() : cv::Vec3f(0, 1, 0);
+
+    // Clamp normal rotation to 5°/voxel relative to previous slice normal
+    if (oldPlane) {
+        cv::Vec3f oldNormal = oldPlane->normal({});
+        float cosA = std::clamp(oldNormal.dot(nextDir), -1.0f, 1.0f);
+        float angle = std::acos(cosA);
+        float maxAngle = static_cast<float>(_fiberStep) * 5.0f * static_cast<float>(M_PI / 180.0);
+        if (angle > maxAngle) {
+            cv::Vec3f axis = oldNormal.cross(nextDir);
+            float axisLen = static_cast<float>(cv::norm(axis));
+            if (axisLen > 1e-6f) {
+                axis /= axisLen;
+                // Rodrigues: rotate oldNormal towards nextDir by maxAngle
+                // axis ⊥ oldNormal so the (axis·v)(1-cos) term is zero
+                nextDir = oldNormal * std::cos(maxAngle)
+                        + axis.cross(oldNormal) * std::sin(maxAngle);
+            }
+        }
+        // Recompute position along clamped direction so prediction doesn't wander
+        nextPos = _recentPoints.back().position + nextDir * static_cast<float>(_fiberStep);
+    }
 
     // 2. Copy old annotation plane as reference (must be a separate object —
     //    reusing the same pointer causes surfaceWillBeDeleted to nuke the
     //    reference when the annotation surface is overwritten).
     if (oldPlane) {
-        auto refPlane = std::make_shared<PlaneSurface>(oldPlane->origin(), oldPlane->normal({}));
-        refPlane->setInPlaneRotation(oldPlane->inPlaneRotation());
+        auto refPlane = std::make_shared<PlaneSurface>();
+        refPlane->setFromNormalAndUp(oldPlane->origin(), oldPlane->normal({}), oldPlane->basisY());
         _cstate->setSurface(kFiberReferenceSurface, refPlane);
     }
 
-    // 3. Create new annotation plane (gets default basis from vxy_from_normal)
-    auto newPlane = std::make_shared<PlaneSurface>(nextPos, nextDir);
-
-    // 4. Project old basisY onto new plane to get target "up"
-    float dot = oldVy.dot(nextDir);
-    cv::Vec3f projUp = oldVy - dot * nextDir;
-    float projLen = static_cast<float>(cv::norm(projUp));
-    if (projLen > 1e-6f) {
-        projUp /= projLen;
-
-        // 5. Signed angle from new default basisY to projected old basisY
-        cv::Vec3f defaultVy = newPlane->basisY();
-        cv::Vec3f cross = defaultVy.cross(projUp);
-        float sinA = cross.dot(nextDir);
-        float cosA = defaultVy.dot(projUp);
-        newPlane->setInPlaneRotation(std::atan2(sinA, cosA));
-    }
+    // 3. Create new annotation plane with stable rotation.
+    //    Uses oldVy as up hint — setFromNormalAndUp computes the basis directly
+    //    (bypasses vxy_from_normal, no discontinuous sign flips).
+    auto newPlane = std::make_shared<PlaneSurface>();
+    newPlane->setFromNormalAndUp(nextPos, nextDir, oldVy);
 
     // 6. Register and center viewers
     _cstate->setSurface(kFiberAnnotationSurface, newPlane);
@@ -220,31 +227,34 @@ std::pair<cv::Vec3f, cv::Vec3f> FiberAnnotationController::predictFromThreeOrMor
     const cv::Vec3f& p1 = _recentPoints[n - 2].position;
     const cv::Vec3f& p2 = _recentPoints[n - 1].position;
 
-    // Quadratic fit: P(t) = a*t^2 + b*t + c where t=0->p0, t=1->p1, t=2->p2
-    cv::Vec3f a = 0.5f * (p2 - 2.0f * p1 + p0);
-    cv::Vec3f b = (p1 - p0) - a;
-    // c = p0
+    // Rotation-based extrapolation: mirror v1 through v2
+    cv::Vec3f d1 = p1 - p0;
+    cv::Vec3f d2 = p2 - p1;
+    float len1 = static_cast<float>(cv::norm(d1));
+    float len2 = static_cast<float>(cv::norm(d2));
 
-    // Predict at t=3
-    float t = 3.0f;
-    cv::Vec3f predicted_raw = a * t * t + b * t + p0;
-
-    // Direction = P'(t) = 2*a*t + b
-    cv::Vec3f dir_raw = 2.0f * a * t + b;
-    float dirLen = static_cast<float>(cv::norm(dir_raw));
-    cv::Vec3f dir = dirLen > 1e-6f ? dir_raw / dirLen : cv::Vec3f(0, 0, 1);
-
-    // Normalize distance from last point to fiberStep
-    cv::Vec3f fromLast = predicted_raw - p2;
-    float fromLastLen = static_cast<float>(cv::norm(fromLast));
-    cv::Vec3f predicted;
-    if (fromLastLen > 1e-6f) {
-        predicted = p2 + (fromLast / fromLastLen) * static_cast<float>(_fiberStep);
-    } else {
-        predicted = p2 + dir * static_cast<float>(_fiberStep);
+    if (len1 < 1e-6f || len2 < 1e-6f) {
+        // Degenerate — fall back to linear
+        cv::Vec3f dir = len2 > 1e-6f ? d2 / len2 : cv::Vec3f(0, 0, 1);
+        return {p2 + dir * static_cast<float>(_fiberStep), dir};
     }
 
-    return {predicted, dir};
+    cv::Vec3f v1 = d1 / len1;
+    cv::Vec3f v2 = d2 / len2;
+
+    // v3 = 2*(v1·v2)*v2 - v1: same angular change from v1→v2 applied past v2.
+    // Clamp: if v1·v2 < 0 (angle > 90°), fall back to linear to prevent reversal.
+    float cosAngle = v1.dot(v2);
+    cv::Vec3f v3;
+    if (cosAngle < 0.0f) {
+        v3 = v2;
+    } else {
+        v3 = 2.0f * cosAngle * v2 - v1;
+    }
+    float v3Len = static_cast<float>(cv::norm(v3));
+    cv::Vec3f dir = v3Len > 1e-6f ? v3 / v3Len : v2;
+
+    return {p2 + dir * static_cast<float>(_fiberStep), dir};
 }
 
 void FiberAnnotationController::closeAnnotationViewer()

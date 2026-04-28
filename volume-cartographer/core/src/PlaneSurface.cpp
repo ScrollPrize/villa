@@ -145,6 +145,39 @@ float PlaneSurface::pointDist(cv::Vec3f wp)
     return std::abs(scalarp);
 }
 
+void PlaneSurface::setFromNormalAndUp(cv::Vec3f origin, cv::Vec3f normal, cv::Vec3f upHint)
+{
+    _origin = origin;
+    cv::normalize(normal, _normal);
+    _inPlaneRotation = 0.0f;
+
+    // Project upHint onto the plane perpendicular to normal, use as vy.
+    // Then derive vx = vy × normal (right-handed: normal = vx × vy).
+    cv::Vec3f vy = upHint - upHint.dot(_normal) * _normal;
+    float vyLen = static_cast<float>(cv::norm(vy));
+    if (vyLen < 1e-6f) {
+        // upHint parallel to normal — pick fallback
+        cv::Vec3f fallback = (std::abs(_normal[1]) < 0.9f) ? cv::Vec3f(0,1,0) : cv::Vec3f(1,0,0);
+        vy = fallback - fallback.dot(_normal) * _normal;
+        vyLen = static_cast<float>(cv::norm(vy));
+    }
+    vy /= vyLen;
+    cv::Vec3f vx = vy.cross(_normal);
+    cv::normalize(vx, vx, 1, 0, cv::NORM_L2);
+
+    _vx = vx;
+    _vy = vy;
+
+    // Recompute _M, _T (same as update())
+    std::vector<cv::Vec3f> src = {_origin, _origin+_normal, _origin+_vx, _origin+_vy};
+    std::vector<cv::Vec3f> tgt = {{0,0,0}, {0,0,1}, {1,0,0}, {0,1,0}};
+    cv::Mat transf;
+    cv::Mat inliers;
+    cv::estimateAffine3D(src, tgt, transf, inliers, 0.1, 0.99);
+    _M = transf({0,0,3,3});
+    _T = transf({3,0,1,3});
+}
+
 void PlaneSurface::setInPlaneRotation(float radians)
 {
     _inPlaneRotation = radians;
