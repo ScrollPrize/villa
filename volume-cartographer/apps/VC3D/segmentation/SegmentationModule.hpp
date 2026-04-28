@@ -181,6 +181,8 @@ public:
     void setRotationHandleHitTester(std::function<bool(CTiledVolumeViewer*, const cv::Vec3f&)> tester);
 
     [[nodiscard]] bool manualAddMode() const { return _manualAddMode; }
+    [[nodiscard]] cv::Mat takePendingManualAddTracerMask();
+    bool applyManualAddTracerPreview(QuadSurface* surface);
 
 signals:
     void editingEnabledChanged(bool enabled);
@@ -398,6 +400,7 @@ private:
     std::unique_ptr<CellReoptimizationTool> _cellReoptTool;
     std::unique_ptr<ManualAddTool> _manualAddTool;
     bool _manualAddMode{false};
+    cv::Mat _pendingManualAddTracerMask;
     SegmentationGrowthMethod _previousGrowthMethodBeforeManualAdd{SegmentationGrowthMethod::Tracer};
 
     bool _showApprovalMask{false};

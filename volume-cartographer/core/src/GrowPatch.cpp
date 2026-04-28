@@ -521,6 +521,7 @@ struct TraceData {
     bool cell_reopt_mode = false;
     cv::Mat_<uchar> boundary_mask;
     cv::Mat_<uchar> interior_mask;
+    cv::Mat_<uchar> allowed_growth_mask;
     const cv::Mat_<cv::Vec3d>* reopt_anchors = nullptr;
     const cv::Mat_<cv::Vec3d>* reopt_normals = nullptr;
     double reopt_tangent_weight = 10.0;
@@ -2745,7 +2746,7 @@ struct thresholdedDistance
 };
 
 
-QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *cache, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections)
+QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *cache, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections, const cv::Mat* allowed_growth_mask)
 {
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
     int pre_neural_gens = 0, neural_batch_size = 1;
@@ -3355,6 +3356,29 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
         resume_pad_y = (h - resume_points.rows) / 2;
 
         used_area = cv::Rect(resume_pad_x, resume_pad_y, resume_points.cols, resume_points.rows);
+
+        if (allowed_growth_mask && !allowed_growth_mask->empty()) {
+            if (allowed_growth_mask->rows != resume_points.rows || allowed_growth_mask->cols != resume_points.cols) {
+                throw std::runtime_error("allowed growth mask size does not match resume surface size.");
+            }
+            trace_data.allowed_growth_mask = cv::Mat_<uchar>(trace_params.state.size(), static_cast<uchar>(0));
+            cv::Mat normalized_mask;
+            if (allowed_growth_mask->type() == CV_8UC1) {
+                normalized_mask = *allowed_growth_mask;
+            } else {
+                allowed_growth_mask->convertTo(normalized_mask, CV_8U);
+            }
+            for (int r = 0; r < normalized_mask.rows; ++r) {
+                for (int c = 0; c < normalized_mask.cols; ++c) {
+                    if (normalized_mask.at<uchar>(r, c) != 0) {
+                        trace_data.allowed_growth_mask(resume_pad_y + r, resume_pad_x + c) = 1;
+                    }
+                }
+            }
+            std::cout << "Allowed growth mask cells: "
+                      << cv::countNonZero(trace_data.allowed_growth_mask)
+                      << std::endl;
+        }
  
         double min_val, max_val;
         cv::minMaxLoc(resume_generations, &min_val, &max_val);
@@ -4044,6 +4068,11 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
             if (!bounds.contains(cv::Point(p[1], p[0])) ||
                 (trace_params.state(p) & STATE_PROCESSING) != 0 ||
                 (trace_params.state(p) & STATE_LOC_VALID) != 0) {
+                return;
+            }
+            if (!trace_data.allowed_growth_mask.empty() &&
+                (!point_in_bounds(trace_data.allowed_growth_mask, p) ||
+                 trace_data.allowed_growth_mask(p) == 0)) {
                 return;
             }
 

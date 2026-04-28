@@ -19,6 +19,12 @@ public:
         CrossFill = 3,
     };
 
+    enum class InterpolationMode
+    {
+        ThinPlateSpline = 0,
+        TracerRestrictedToFill = 1,
+    };
+
     struct Config
     {
         int maxPreviewSpan{256};
@@ -30,6 +36,7 @@ public:
         double planeConstraintRadius{30.0};
         double planeConstraintReplacementRadius{16.0};
         LinePreviewMode linePreviewMode{LinePreviewMode::Cross};
+        InterpolationMode interpolationMode{InterpolationMode::ThinPlateSpline};
         bool includeTouchedValidBorder{true};
         bool allowBoundarySmoothing{false};
     };
