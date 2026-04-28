@@ -139,6 +139,15 @@ def _write_cache_blob(url: str, blob: bytes) -> bool:
     """Write bytes to a cache URL. Returns True on success."""
     try:
         fs, fs_path = _url_to_fs(url)
+        parent = os.path.dirname(fs_path.rstrip("/"))
+        if parent:
+            try:
+                fs.makedirs(parent, exist_ok=True)
+            except TypeError:
+                try:
+                    fs.makedirs(parent)
+                except FileExistsError:
+                    pass
         with fs.open(fs_path, "wb") as f:
             f.write(blob)
         return True
@@ -377,6 +386,11 @@ def build_chunk_occupancy(
                 f"  Chunk occupancy cache HIT ({source}): "
                 f"{occ}/{total} ({100.0 * occ / total:.1f}%) chunks occupied for {array_url}"
             )
+            override = _override_cache_url()
+            if override and source and not source.startswith("override:"):
+                # A workflow override is an explicit shared cache location for
+                # downstream workers. Materialize sidecar/local hits there too.
+                _save_cached(array_url, sig, cached)
             return cached
         print(f"  Chunk occupancy cache MISS for {array_url} (will build and cache)")
     elif use_cache:
