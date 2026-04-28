@@ -184,6 +184,7 @@ private slots:
     void onNewFiberRequested();
     void onFiberCrosshairModeChanged(bool active);
     void onFiberAnnotationViewerRequested(const std::string& surfaceName, const QString& title);
+    void onFiberReferenceViewerRequested(const std::string& surfaceName, const QString& title);
     void onFiberAnnotationFinished(uint64_t fiberId);
     void refreshVolumeSelectionUi(const QString& preferredVolumeId = QString());
     void onPreviewTransformToggled(bool enabled);

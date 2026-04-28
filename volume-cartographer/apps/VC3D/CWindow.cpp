@@ -3599,10 +3599,14 @@ void CWindow::CreateWidgets(void)
 
     connect(_fiberWidget, &CFiberWidget::newFiberRequested,
             this, &CWindow::onNewFiberRequested);
+    connect(_fiberWidget, &CFiberWidget::stepChanged,
+            _fiberController.get(), &FiberAnnotationController::onStepChanged);
     connect(_fiberController.get(), &FiberAnnotationController::crosshairModeChanged,
             this, &CWindow::onFiberCrosshairModeChanged);
     connect(_fiberController.get(), &FiberAnnotationController::requestAnnotationViewer,
             this, &CWindow::onFiberAnnotationViewerRequested);
+    connect(_fiberController.get(), &FiberAnnotationController::requestReferenceViewer,
+            this, &CWindow::onFiberReferenceViewerRequested);
     connect(_fiberController.get(), &FiberAnnotationController::annotationFinished,
             this, &CWindow::onFiberAnnotationFinished);
 
@@ -6638,6 +6642,32 @@ void CWindow::onFiberAnnotationViewerRequested(const std::string& surfaceName, c
         _fiberController->setAnnotationViewer(viewer);
         connect(viewer, &CTiledVolumeViewer::sendVolumeClicked,
                 _fiberController.get(), &FiberAnnotationController::onAnnotationViewerClicked);
+
+        // Set the current volume on the new viewer (volumeChanged already fired)
+        if (_state->currentVolume()) {
+            viewer->OnVolumeChanged(_state->currentVolume());
+        }
+
+        // Show the MDI subwindow (addSubWindow creates it hidden)
+        auto* subWindow = qobject_cast<QMdiSubWindow*>(viewer->parentWidget());
+        if (subWindow) {
+            subWindow->show();
+        }
+    }
+}
+
+void CWindow::onFiberReferenceViewerRequested(const std::string& surfaceName, const QString& title)
+{
+    auto* viewer = newConnectedViewer(surfaceName, title, mdiArea);
+    if (viewer && _fiberController) {
+        _fiberController->setReferenceViewer(viewer);
+        if (_state->currentVolume()) {
+            viewer->OnVolumeChanged(_state->currentVolume());
+        }
+        auto* subWindow = qobject_cast<QMdiSubWindow*>(viewer->parentWidget());
+        if (subWindow) {
+            subWindow->show();
+        }
     }
 }
 
