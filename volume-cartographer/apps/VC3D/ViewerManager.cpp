@@ -73,6 +73,13 @@ ViewerManager::ViewerManager(CState* state,
             this,
             &ViewerManager::handleSurfacePatchIndexPrimeFinished);
 
+    _surfacePatchIndexTaskWatcher =
+        new QFutureWatcher<SurfacePatchIndexTaskResult>(this);
+    connect(_surfacePatchIndexTaskWatcher,
+            &QFutureWatcher<SurfacePatchIndexTaskResult>::finished,
+            this,
+            &ViewerManager::handleSurfacePatchIndexTaskFinished);
+
     if (_state) {
         connect(_state,
                 &CState::surfaceChanged,
@@ -505,8 +512,7 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     _surfacePatchIndexNeedsRebuild = false;
 
     // Clear any surfaces queued from a previous rebuild cycle
-    _surfacesQueuedDuringRebuildIds.clear();
-    _surfacesQueuedForRemovalDuringRebuild.clear();
+    _surfacesQueuedDuringRebuild.clear();
 
     // Build task captures shared_ptrs - surfaces stay alive throughout async operation
     const int stride = _surfacePatchSamplingStride;
@@ -555,27 +561,124 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
     _indexedSurfaceIds.insert(_pendingSurfacePatchIndexSurfaceIds.begin(),
                               _pendingSurfacePatchIndexSurfaceIds.end());
 
-    // If surfaces were added or removed during the async rebuild, re-prime
-    // instead of doing incremental remove/update on the main thread. The
-    // rebuild runs on a worker thread; per-surface rtree mutations here
-    // were a measurable main-thread stall (~14% of profile) on segments
-    // with large coords grids.
-    const bool queuesDirty = !_surfacesQueuedForRemovalDuringRebuild.empty()
-                          || !_surfacesQueuedDuringRebuildIds.empty();
-    _surfacesQueuedForRemovalDuringRebuild.clear();
-    _surfacesQueuedDuringRebuildIds.clear();
+    auto queuedDuringRebuild = std::move(_surfacesQueuedDuringRebuild);
+    _surfacesQueuedDuringRebuild.clear();
 
     VC3D_DEBUG_QCINFO(lcViewerManager) << "Asynchronously rebuilt SurfacePatchIndex for"
                             << _indexedSurfaceIds.size() << "surfaces"
                             << "at stride" << _surfacePatchSamplingStride;
-    forEachViewer([](CTiledVolumeViewer* v) { v->renderIntersections(); });
 
-    if (queuesDirty) {
-        _pendingSurfacePatchIndexSurfaceIds.clear();
-        primeSurfacePatchIndicesAsync();
+    _pendingSurfacePatchIndexSurfaceIds.clear();
+
+    // Surfaces added/removed while the full async rebuild was running do not
+    // require another full rebuild. Apply just those deltas on the worker.
+    if (queuedDuringRebuild.empty()) {
+        forEachViewer([](CTiledVolumeViewer* v) { v->renderIntersections(); });
     } else {
-        _pendingSurfacePatchIndexSurfaceIds.clear();
+        forEachViewer([](CTiledVolumeViewer* v) { v->invalidateIntersect(); });
+        for (auto& task : queuedDuringRebuild) {
+            queueSurfacePatchIndexTask(std::move(task));
+        }
     }
+}
+
+void ViewerManager::queueSurfacePatchIndexTask(SurfacePatchIndexTask task)
+{
+    if (!task.surface) {
+        return;
+    }
+
+    const QuadSurface* raw = task.surface.get();
+    if (task.type == SurfacePatchIndexTaskType::Remove) {
+        _indexedSurfaceIds.erase(task.id);
+        _pendingSurfacePatchIndexTasks.erase(
+            std::remove_if(_pendingSurfacePatchIndexTasks.begin(),
+                           _pendingSurfacePatchIndexTasks.end(),
+                           [raw](const SurfacePatchIndexTask& pending) {
+                               return pending.surface.get() == raw;
+                           }),
+            _pendingSurfacePatchIndexTasks.end());
+    } else {
+        for (auto& pending : _pendingSurfacePatchIndexTasks) {
+            if (pending.type == SurfacePatchIndexTaskType::Update &&
+                pending.surface.get() == raw) {
+                pending = std::move(task);
+                startNextSurfacePatchIndexTask();
+                return;
+            }
+        }
+    }
+
+    _pendingSurfacePatchIndexTasks.push_back(std::move(task));
+    startNextSurfacePatchIndexTask();
+}
+
+void ViewerManager::startNextSurfacePatchIndexTask()
+{
+    if (!_surfacePatchIndexTaskWatcher ||
+        _surfacePatchIndexTaskWatcher->isRunning() ||
+        _pendingSurfacePatchIndexTasks.empty()) {
+        return;
+    }
+
+    SurfacePatchIndexTask task = std::move(_pendingSurfacePatchIndexTasks.front());
+    _pendingSurfacePatchIndexTasks.erase(_pendingSurfacePatchIndexTasks.begin());
+
+    auto* index = &_surfacePatchIndex;
+    auto future = QtConcurrent::run([index, task = std::move(task)]() mutable -> SurfacePatchIndexTaskResult {
+        SurfacePatchIndexTaskResult result;
+        result.type = task.type;
+        result.id = std::move(task.id);
+        result.surface = std::move(task.surface);
+
+        try {
+            if (result.type == SurfacePatchIndexTaskType::Update) {
+                result.success = index->updateSurface(result.surface);
+            } else {
+                result.success = index->removeSurface(result.surface);
+            }
+        } catch (const std::exception& e) {
+            qCWarning(lcViewerManager) << "SurfacePatchIndex single-surface task failed:" << e.what();
+        } catch (...) {
+            qCWarning(lcViewerManager) << "SurfacePatchIndex single-surface task failed with an unknown exception";
+        }
+
+        return result;
+    });
+    _surfacePatchIndexTaskWatcher->setFuture(future);
+}
+
+void ViewerManager::handleSurfacePatchIndexTaskFinished()
+{
+    if (!_surfacePatchIndexTaskWatcher) {
+        return;
+    }
+
+    const auto result = _surfacePatchIndexTaskWatcher->future().result();
+    if (result.success) {
+        if (result.type == SurfacePatchIndexTaskType::Update) {
+            _indexedSurfaceIds.insert(result.id);
+            VC3D_DEBUG_QCINFO(lcViewerManager) << "Updated SurfacePatchIndex for surface"
+                                               << result.id.c_str();
+            forEachViewer([](CTiledVolumeViewer* v) { v->renderIntersections(); });
+        } else {
+            _indexedSurfaceIds.erase(result.id);
+            VC3D_DEBUG_QCINFO(lcViewerManager) << "Removed surface from SurfacePatchIndex"
+                                               << result.id.c_str();
+            forEachViewer([](CTiledVolumeViewer* v) {
+                v->invalidateIntersect();
+                v->renderIntersections();
+            });
+        }
+    } else if (result.type == SurfacePatchIndexTaskType::Update) {
+        _indexedSurfaceIds.erase(result.id);
+        _surfacePatchIndexNeedsRebuild = true;
+        VC3D_DEBUG_QCINFO(lcViewerManager) << "Failed to update SurfacePatchIndex for surface"
+                                           << result.id.c_str()
+                                           << "- marking index for rebuild";
+    }
+
+    startNextSurfacePatchIndexTask();
 }
 
 bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::SurfacePtr& quad, bool isEditUpdate)
@@ -603,6 +706,15 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
         return flushed || isEditUpdate;
     }
 
+    // Non-edit surfaceChanged signals are also used for UI alias/selection
+    // updates, especially the "segmentation" alias. If the surface is already
+    // present in the index and no cell updates are pending, there is no rtree
+    // work to do.
+    if (!isEditUpdate && alreadyIndexed) {
+        _indexedSurfaceIds.insert(surfId);
+        return true;
+    }
+
     if (isEditUpdate && alreadyIndexed) {
         return true;
     }
@@ -611,7 +723,8 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
         if (_surfacePatchIndex.updateSurface(quad)) {
             _indexedSurfaceIds.insert(surfId);
             if (asyncRebuildInProgress) {
-                _surfacesQueuedDuringRebuildIds.push_back(surfId);
+                _surfacesQueuedDuringRebuild.push_back(
+                    {SurfacePatchIndexTaskType::Update, surfId, quad});
             }
             VC3D_DEBUG_QCINFO(lcViewerManager) << "Inserted active edit surface into SurfacePatchIndex"
                                     << surfId.c_str();
@@ -625,22 +738,20 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
     }
 
     if (asyncRebuildInProgress) {
-        // An async rebuild is already running; tell it to re-prime when it
-        // finishes so this surface's changes land without blocking main.
-        _surfacesQueuedDuringRebuildIds.push_back(surfId);
+        // An async rebuild is already running. Apply this surface as a
+        // single-surface delta after the rebuilt index is swapped in.
+        _surfacesQueuedDuringRebuild.push_back(
+            {SurfacePatchIndexTaskType::Update, surfId, quad});
         return true;
     }
 
-    // No async work in flight. Previously we ran updateSurface /
-    // flushPendingUpdates / insertCells synchronously on the main thread —
-    // a full rtree insert pass for a large segment costs ~3% of a frame
-    // and shows up as a visible GUI stall when many surfaces load in
-    // quick succession. Defer to the async primer instead: mark dirty and
-    // kick off a worker-thread rebuild. Main stays responsive; the new
-    // surface's entries become visible one rebuild cycle later.
-    _indexedSurfaceIds.erase(surfId);  // will be re-populated by async primer
+    if (!_surfacePatchIndex.empty()) {
+        queueSurfacePatchIndexTask(
+            {SurfacePatchIndexTaskType::Update, surfId, quad});
+        return true;
+    }
+
     _surfacePatchIndexNeedsRebuild = true;
-    primeSurfacePatchIndicesAsync();
     return true;
 }
 
@@ -698,7 +809,13 @@ void ViewerManager::handleSurfaceWillBeDeleted(std::string name, std::shared_ptr
             vec.erase(std::remove(vec.begin(), vec.end(), name), vec.end());
         };
         removeFromVector(_pendingSurfacePatchIndexSurfaceIds);
-        removeFromVector(_surfacesQueuedDuringRebuildIds);
+        _surfacesQueuedDuringRebuild.erase(
+            std::remove_if(_surfacesQueuedDuringRebuild.begin(),
+                           _surfacesQueuedDuringRebuild.end(),
+                           [&name](const SurfacePatchIndexTask& task) {
+                               return task.id == name;
+                           }),
+            _surfacesQueuedDuringRebuild.end());
 
         // If an async rebuild is in progress, queue for removal from the new
         // index when it completes. Store the shared_ptr so the surface stays
@@ -706,24 +823,24 @@ void ViewerManager::handleSurfaceWillBeDeleted(std::string name, std::shared_ptr
         bool asyncRebuildInProgress = _surfacePatchIndexWatcher &&
                                        _surfacePatchIndexWatcher->isRunning();
         if (asyncRebuildInProgress) {
-            _surfacesQueuedForRemovalDuringRebuild.emplace_back(name, surf);
-        }
-
-        if (wasIndexed) {
-            // Remove from the current R-tree index
-            _surfacePatchIndex.removeSurface(quad);
+            _surfacesQueuedDuringRebuild.push_back(
+                {SurfacePatchIndexTaskType::Remove, name, quad});
+        } else if (wasIndexed) {
+            queueSurfacePatchIndexTask(
+                {SurfacePatchIndexTaskType::Remove, name, quad});
         } else {
             std::fprintf(stderr,
                 "[ViewerManager::handleSurfaceWillBeDeleted] name=%s skipping "
                 "removeSurface (never indexed)\n", name.c_str());
         }
 
-        // Invalidate intersection lines on all viewers so stale lines from the
-        // deleted surface don't persist on screen.
-        forEachViewer([](CTiledVolumeViewer* v) {
-            v->invalidateIntersect();
-            v->renderIntersections();
-        });
+        if (asyncRebuildInProgress || wasIndexed) {
+            // Hide stale lines immediately; the async removal will update the
+            // R-tree before intersections are rendered again.
+            forEachViewer([](CTiledVolumeViewer* v) {
+                v->invalidateIntersect();
+            });
+        }
     }
 }
 

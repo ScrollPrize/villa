@@ -1714,32 +1714,19 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     int sliding_w = static_cast<int>(1000/src_step/step*2 * sliding_w_scale);
     int w = 2000/src_step/step*2+10+2*closing_r;
     int h = 15000/src_step/step*2+10+2*closing_r;
-    bool grow_down = true;
+    const bool has_growth_directions = params.contains("growth_directions") && params["growth_directions"].is_array();
+    bool grow_down = false;
     bool grow_right = true;
-    bool grow_up = true;
-    bool grow_left = true;
+    bool grow_up = false;
+    bool grow_left = false;
     const bool disable_grid_expansion = params.value("disable_grid_expansion", params.value("fill_growth", false));
-    if (params.contains("growth_directions") && params["growth_directions"].is_array()) {
-        grow_down = grow_right = grow_up = grow_left = false;
-        for (const auto& dir : params["growth_directions"]) {
-            if (!dir.is_string()) {
-                continue;
-            }
-            const std::string value = dir.get<std::string>();
-            if (value == "all") {
-                grow_down = grow_right = grow_up = grow_left = true;
-                break;
-            }
-            if (value == "down") grow_down = true;
-            else if (value == "right") grow_right = true;
-            else if (value == "up") grow_up = true;
-            else if (value == "left") grow_left = true;
-        }
-        if (!grow_down && !grow_right && !grow_up && !grow_left) {
-            grow_down = grow_right = grow_up = grow_left = true;
-        }
-    }
-    const std::vector<cv::Vec2i> neighs = {
+    const std::vector<cv::Vec2i> legacy_4_neighs = {
+        { 1,  0},
+        { 0,  1},
+        {-1,  0},
+        { 0, -1},
+    };
+    const std::vector<cv::Vec2i> all_8_neighs = {
         { 1,  0},
         { 1,  1},
         { 0,  1},
@@ -1749,11 +1736,63 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         { 0, -1},
         { 1, -1},
     };
+    auto append_unique_neigh = [](std::vector<cv::Vec2i>& neighs, const cv::Vec2i& value) {
+        for (const auto& existing : neighs) {
+            if (existing == value) {
+                return;
+            }
+        }
+        neighs.push_back(value);
+    };
+
+    int requested_neighbor_count = params.value("growth_neighbor_count", 4);
+    if (requested_neighbor_count != 4 && requested_neighbor_count != 8) {
+        std::cerr << "warning: growth_neighbor_count must be 4 or 8; defaulting to 4" << std::endl;
+        requested_neighbor_count = 4;
+    }
+    std::vector<cv::Vec2i> neighs = requested_neighbor_count == 8 ? all_8_neighs : legacy_4_neighs;
+
+    if (has_growth_directions) {
+        grow_down = grow_right = grow_up = grow_left = false;
+        neighs.clear();
+        for (const auto& dir : params["growth_directions"]) {
+            if (!dir.is_string()) {
+                continue;
+            }
+            const std::string value = dir.get<std::string>();
+            if (value == "all") {
+                grow_down = grow_right = grow_up = grow_left = true;
+                neighs = all_8_neighs;
+                break;
+            }
+            if (value == "down") {
+                grow_down = true;
+                append_unique_neigh(neighs, {1, 0});
+            }
+            else if (value == "right") {
+                grow_right = true;
+                append_unique_neigh(neighs, {0, 1});
+            }
+            else if (value == "up") {
+                grow_up = true;
+                append_unique_neigh(neighs, {-1, 0});
+            }
+            else if (value == "left") {
+                grow_left = true;
+                append_unique_neigh(neighs, {0, -1});
+            }
+        }
+        if (!grow_down && !grow_right && !grow_up && !grow_left) {
+            grow_down = grow_right = grow_up = grow_left = true;
+            neighs = all_8_neighs;
+        }
+    }
     std::cout << "growth directions:"
               << " down=" << grow_down
               << " right=" << grow_right
               << " up=" << grow_up
               << " left=" << grow_left
+              << " neighbor_count=" << neighs.size()
               << " expand_grid=" << !disable_grid_expansion
               << " steps=" << stop_gen << std::endl;
 

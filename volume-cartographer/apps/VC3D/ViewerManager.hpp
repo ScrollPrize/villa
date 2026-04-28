@@ -125,12 +125,33 @@ signals:
 
 private slots:
     void handleSurfacePatchIndexPrimeFinished();
+    void handleSurfacePatchIndexTaskFinished();
     void handleSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
     void handleSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
 
 private:
+    enum class SurfacePatchIndexTaskType {
+        Update,
+        Remove,
+    };
+
+    struct SurfacePatchIndexTask {
+        SurfacePatchIndexTaskType type{SurfacePatchIndexTaskType::Update};
+        std::string id;
+        SurfacePatchIndex::SurfacePtr surface;
+    };
+
+    struct SurfacePatchIndexTaskResult {
+        SurfacePatchIndexTaskType type{SurfacePatchIndexTaskType::Update};
+        std::string id;
+        SurfacePatchIndex::SurfacePtr surface;
+        bool success{false};
+    };
+
     void registerOverlay(ViewerOverlayControllerBase* overlay);
     bool updateSurfacePatchIndexForSurface(const SurfacePatchIndex::SurfacePtr& quad, bool isEditUpdate);
+    void queueSurfacePatchIndexTask(SurfacePatchIndexTask task);
+    void startNextSurfacePatchIndexTask();
 
     CState* _state;
     VCCollection* _points;
@@ -170,9 +191,10 @@ private:
     // Use string IDs for surface tracking to avoid dangling pointers in async operations
     std::unordered_set<std::string> _indexedSurfaceIds;
     std::vector<std::string> _pendingSurfacePatchIndexSurfaceIds;
-    std::vector<std::string> _surfacesQueuedDuringRebuildIds;
-    std::vector<std::pair<std::string, std::shared_ptr<Surface>>> _surfacesQueuedForRemovalDuringRebuild;
+    std::vector<SurfacePatchIndexTask> _pendingSurfacePatchIndexTasks;
+    std::vector<SurfacePatchIndexTask> _surfacesQueuedDuringRebuild;
     QFutureWatcher<std::shared_ptr<SurfacePatchIndex>>* _surfacePatchIndexWatcher{nullptr};
+    QFutureWatcher<SurfacePatchIndexTaskResult>* _surfacePatchIndexTaskWatcher{nullptr};
 
     // Surfaces currently pinned in the LRU as "highlighted/visible".
     // We track them so we can unpin the right set when highlights change.
