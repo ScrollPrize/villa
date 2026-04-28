@@ -191,6 +191,13 @@ namespace perf {
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
 
+    // When true the disk cache stores c3d-compressed sharded zarr (smaller,
+    // lossy).  When false it stores raw uncompressed voxels at the source
+    // volume's native chunk size (larger, lossless).  Both modes use
+    // independent directories so they can coexist.  Requires restart.
+    constexpr auto DISK_CACHE_COMPRESSED = "perf/disk_cache_compressed";
+    constexpr bool DISK_CACHE_COMPRESSED_DEFAULT = true;
+
     // LOD synthesis method.  Selects how c3d chunks are decoded when a
     // downscaled view is requested.  Value is one of:
     //   "codec_synthesis"   — call c3d_chunk_decode_lod; codec-native filter.

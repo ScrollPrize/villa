@@ -78,6 +78,12 @@ public:
         // hundreds of MiB here. 256 MiB ≈ a few thousand chunks max.
         size_t maxDecodeStagingBytes = 256ULL << 20;
 
+        // When false, the disk cache stores raw uncompressed voxels at
+        // source chunk size.  The encoder writes raw bytes (no c3d),
+        // the decoder wraps them directly, and assembleCanonicalChunk is
+        // skipped in favour of direct fetch+decompress.
+        bool compressed = true;
+
         // When non-zero, declares the source is byte-identical to our local
         // canonical c3d disk format: zarr v3, 4096³ shards with 256³ inner
         // C3DC chunks. The downloader then bypasses the encoder entirely —
@@ -313,8 +319,16 @@ private:
     // is entirely absent from the source.
     [[nodiscard]] ChunkDataPtr assembleCanonicalChunk(const ChunkKey& canonKey);
 
+    // Fetch and decompress a single source chunk (uncompressed mode).
+    [[nodiscard]] ChunkDataPtr fetchAndDecompressSourceChunk(const ChunkKey& key);
+
     // Split a decoded chunk into 16^3 blocks and insert into blockCache_.
     void insertChunkAsBlocks(const ChunkKey& key, const ChunkData& chunk);
+
+    // Blocks-per-chunk for each level (used by blockAt empty-chunk reverse map).
+    // Computed once after diskLevels_ and config_ are set.
+    static constexpr int kMaxLevels = 16;
+    std::array<std::array<int,3>, kMaxLevels> blocksPerChunk_{};
 
     // All-zero canonical chunks: record their key instead of materialising
     // 512 identical zero blocks in the arena. blockAt() returns a pointer

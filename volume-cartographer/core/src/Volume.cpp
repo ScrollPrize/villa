@@ -393,18 +393,28 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
         }
         source = std::move(httpSource);
 
-        // v3 sharded disk cache: path_/0/, path_/1/, ...
-        // c3d canonical layout: 4096³ shards with 256³ inner C3DC chunks.
-        // Open per-level zarr.json if it exists, create if not.
+        // Disk cache setup. Two modes controlled by diskCacheCompressed_:
+        //
+        // Compressed (default): v3 sharded zarr with c3d codec at path_/0/ etc.
+        //   4096³ shards, 256³ inner C3DC chunks.
+        //
+        // Uncompressed: flat (non-sharded) v3 zarr at <volumeId>_uncompressed/0/ etc.
+        //   Source chunk shape, raw bytes, no codec.
         {
             const int nLevels = source->numLevels();
             diskLevels.resize(nLevels);
+
+            // Uncompressed root is a sibling directory to the staging dir.
+            const std::filesystem::path diskRoot = diskCacheCompressed_
+                ? path_
+                : path_.parent_path() / (path_.filename().string() + "_uncompressed");
 
             auto pad256 = [](int v) -> size_t {
                 return static_cast<size_t>((v + 255) / 256 * 256);
             };
 
-            auto createLevel = [&](const std::filesystem::path& lvlPath, int lvl) {
+            // c3d-compressed sharded level
+            auto createCompressedLevel = [&](const std::filesystem::path& lvlPath, int lvl) {
                 auto shape = source->levelShape(lvl);
                 utils::ZarrMetadata meta;
                 meta.version = utils::ZarrVersion::v3;
@@ -424,41 +434,66 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
                     utils::ZarrArray::create(lvlPath, std::move(meta)));
             };
 
+            // Raw uncompressed level — flat zarr at source chunk size
+            auto createUncompressedLevel = [&](const std::filesystem::path& lvlPath, int lvl) {
+                auto shape = source->levelShape(lvl);
+                auto scs = source->chunkShape(lvl);
+                auto padTo = [](int v, int align) -> size_t {
+                    return static_cast<size_t>((v + align - 1) / align * align);
+                };
+                utils::ZarrMetadata meta;
+                meta.version = utils::ZarrVersion::v3;
+                meta.node_type = "array";
+                meta.shape = {padTo(shape[0], scs[0]),
+                              padTo(shape[1], scs[1]),
+                              padTo(shape[2], scs[2])};
+                meta.chunks = {size_t(scs[0]), size_t(scs[1]), size_t(scs[2])};
+                meta.dtype = utils::ZarrDtype::uint8;
+                meta.fill_value = 0;
+                meta.chunk_key_encoding = "default";
+                // No shard_config, no codecs → raw flat files
+                return std::make_unique<utils::ZarrArray>(
+                    utils::ZarrArray::create(lvlPath, std::move(meta)));
+            };
+
             for (int lvl = 0; lvl < nLevels; lvl++) {
-                auto lvlPath = path_ / std::to_string(lvl);
+                auto lvlPath = diskRoot / std::to_string(lvl);
                 if (std::filesystem::exists(lvlPath / "zarr.json")) {
                     auto opened = std::make_unique<utils::ZarrArray>(
                         utils::ZarrArray::open(lvlPath));
-                    if (utils::is_canonical_c3d(opened->metadata())) {
-                        diskLevels[lvl] = std::move(opened);
-                    } else {
-                        // Legacy h265 (or any non-c3d) level from before the
-                        // codec switch. The decoder in BlockPipeline now only
-                        // accepts C3DC, so leaving stale entries in place
-                        // would silently mark chunks as "on disk" without
-                        // ever producing data. Nuke the level dir and create
-                        // a fresh c3d one; the remote source will repopulate.
-                        opened.reset();
-                        fprintf(stderr,
-                            "[Volume] level %d cache at %s is non-c3d — "
-                            "wiping and recreating as c3d\n",
-                            lvl, lvlPath.c_str());
-                        std::error_code ec;
-                        std::filesystem::remove_all(lvlPath, ec);
-                        if (ec) {
-                            throw std::runtime_error(
-                                "failed to remove stale non-c3d cache at "
-                                + lvlPath.string() + ": " + ec.message());
+                    if (diskCacheCompressed_) {
+                        if (utils::is_canonical_c3d(opened->metadata())) {
+                            diskLevels[lvl] = std::move(opened);
+                        } else {
+                            // Legacy non-c3d level — wipe and recreate.
+                            opened.reset();
+                            fprintf(stderr,
+                                "[Volume] level %d cache at %s is non-c3d — "
+                                "wiping and recreating as c3d\n",
+                                lvl, lvlPath.c_str());
+                            std::error_code ec;
+                            std::filesystem::remove_all(lvlPath, ec);
+                            if (ec) {
+                                throw std::runtime_error(
+                                    "failed to remove stale non-c3d cache at "
+                                    + lvlPath.string() + ": " + ec.message());
+                            }
+                            diskLevels[lvl] = createCompressedLevel(lvlPath, lvl);
                         }
-                        diskLevels[lvl] = createLevel(lvlPath, lvl);
+                    } else {
+                        // Uncompressed mode: accept any existing non-sharded zarr
+                        diskLevels[lvl] = std::move(opened);
                     }
                 } else {
-                    diskLevels[lvl] = createLevel(lvlPath, lvl);
+                    diskLevels[lvl] = diskCacheCompressed_
+                        ? createCompressedLevel(lvlPath, lvl)
+                        : createUncompressedLevel(lvlPath, lvl);
                 }
             }
             fprintf(stderr,
-                "[Volume] Cold cache: %d levels at %s (codec: c3d)\n",
-                nLevels, path_.c_str());
+                "[Volume] Cold cache: %d levels at %s (codec: %s)\n",
+                nLevels, diskRoot.c_str(),
+                diskCacheCompressed_ ? "c3d" : "uncompressed");
         }
     } else {
         source = std::make_unique<vc::cache::FileSystemSource>(
@@ -482,14 +517,16 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
     config.volumeId = id();
     config.bytes = cacheBudgetHot_;
     config.c3dEncodeParams = encodeParams_;
+    config.compressed = diskCacheCompressed_;
 
     // Canonical-passthrough detection. Remote sources matching our local
     // c3d disk cache (4096³ shards with 256³ inner C3DC chunks) get
     // whole-shard byte-passthrough — one HTTP request + one disk write
     // per source shard instead of decoding and re-encoding every inner
-    // chunk. We probe level 0 zarr.json directly because the
+    // chunk. Passthrough only applies to compressed mode (c3d on both
+    // ends). We probe level 0 zarr.json directly because the
     // remoteShardConfig from NewFromUrl isn't always populated.
-    if (isRemote_) {
+    if (isRemote_ && diskCacheCompressed_) {
         try {
             auto resolved = vc::resolveRemoteUrl(remoteUrl_);
             const std::string base = resolved.httpsUrl
@@ -601,6 +638,16 @@ void Volume::setEncodeParams(const utils::C3dCodecParams& params)
         return;
     }
     encodeParams_ = params;
+}
+
+void Volume::setDiskCacheCompressed(bool compressed)
+{
+    if (tieredCache_) {
+        fprintf(stderr, "[Volume] WARNING: setDiskCacheCompressed() called after "
+                        "cache already created — ignoring\n");
+        return;
+    }
+    diskCacheCompressed_ = compressed;
 }
 
 // ============================================================================

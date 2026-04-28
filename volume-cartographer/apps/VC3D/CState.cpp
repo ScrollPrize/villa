@@ -110,6 +110,16 @@ void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
 {
     if (vol && _cacheSizeBytes > 0) {
         vol->setCacheBudget(_cacheSizeBytes);
+
+        // Apply disk-cache compression setting
+        {
+            using namespace vc3d::settings;
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            vol->setDiskCacheCompressed(
+                settings.value(perf::DISK_CACHE_COMPRESSED,
+                               perf::DISK_CACHE_COMPRESSED_DEFAULT).toBool());
+        }
+
         if (!_blockCache) {
             vc::cache::BlockCache::Config bcfg;
             bcfg.bytes = _cacheSizeBytes;

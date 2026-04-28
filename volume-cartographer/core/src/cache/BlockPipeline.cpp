@@ -25,14 +25,14 @@ static std::array<size_t, 3> chunkIndices(const ChunkKey& key) {
 
 static std::optional<std::vector<std::byte>> zarrReadChunk(
     utils::ZarrArray& zarr, const ChunkKey& key) {
-    return zarr.read_inner_chunk_from_shard(chunkIndices(key));
+    return zarr.read_chunk(chunkIndices(key));
 }
 
 static void zarrWriteChunk(
     utils::ZarrArray& zarr, const ChunkKey& key,
     const uint8_t* data, size_t size) {
     std::span<const std::byte> bytes(reinterpret_cast<const std::byte*>(data), size);
-    zarr.write_inner_chunk_to_shard(chunkIndices(key), bytes);
+    zarr.write_chunk(chunkIndices(key), bytes);
 }
 
 static bool isAllZero(const uint8_t* data, size_t size) noexcept {
@@ -366,7 +366,9 @@ BlockPipeline::BlockPipeline(
             if (shuttingDown_.load(std::memory_order_acquire)) return {};
         }
 
-        auto decoded = assembleCanonicalChunk(key);
+        auto decoded = config_.compressed
+            ? assembleCanonicalChunk(key)
+            : fetchAndDecompressSourceChunk(key);
         if (!decoded) {
             const bool isHttp = dynamic_cast<HttpSource*>(source_.get()) != nullptr;
             const bool absent = !isHttp || HttpSource::lastFetchWasAbsent();
@@ -420,11 +422,20 @@ BlockPipeline::BlockPipeline(
         encodeStagingCv_.notify_one();
         if (!decoded) return {};
 
-        const auto& encoded = encodeCanonicalChunk(*decoded, config_);
-        zarrWriteChunk(*dz, key,
-            reinterpret_cast<const uint8_t*>(encoded.data()), encoded.size());
+        size_t writeBytes;
+        if (config_.compressed) {
+            const auto& encoded = encodeCanonicalChunk(*decoded, config_);
+            zarrWriteChunk(*dz, key,
+                reinterpret_cast<const uint8_t*>(encoded.data()), encoded.size());
+            writeBytes = encoded.size();
+        } else {
+            // Raw mode: write decoded voxels directly
+            zarrWriteChunk(*dz, key, decoded->rawData(),
+                           decoded->bytes.size());
+            writeBytes = decoded->bytes.size();
+        }
         statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
-        statDiskBytes_.fetch_add(encoded.size(), std::memory_order_relaxed);
+        statDiskBytes_.fetch_add(writeBytes, std::memory_order_relaxed);
         if (dz->is_sharded()) {
             const ShardKey sk = canonicalShardKey(key);
             {
@@ -591,7 +602,17 @@ BlockPipeline::BlockPipeline(
 
         ChunkDataPtr decoded;
         auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
-        if (dz) {
+        if (!config_.compressed && dz) {
+            // Raw mode: bytes are already decoded voxels
+            auto scs = source_ ? source_->chunkShape(key.level)
+                               : std::array<int,3>{0,0,0};
+            decoded = acquireChunkData();
+            decoded->shape = {scs[0], scs[1], scs[2]};
+            decoded->elementSize = 1;
+            decoded->bytes.resize(compressed.size());
+            std::memcpy(decoded->bytes.data(), compressed.data(),
+                        compressed.size());
+        } else if (dz) {
             decoded = decodeCanonicalChunk(compressed);
         } else if (decompress_) {
             decoded = decompress_(compressed, key);
@@ -744,6 +765,16 @@ BlockPipeline::BlockPipeline(
             });
     }
 skipPassthrough:
+
+    // Precompute blocks-per-chunk for each level (used by blockAt).
+    for (int lvl = 0; lvl < kMaxLevels; ++lvl) {
+        auto cs = chunkShape(lvl);
+        if (cs[0] > 0 && cs[1] > 0 && cs[2] > 0) {
+            blocksPerChunk_[lvl] = {cs[0] / kBlockSize,
+                                    cs[1] / kBlockSize,
+                                    cs[2] / kBlockSize};
+        }
+    }
 
     downloaderPool_.start();
     encodePool_.start();
@@ -918,9 +949,10 @@ void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targ
             && resident[i * 2] && resident[i * 2 + 1]) continue;
 
         auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
-        const bool diskPresent = dz
-            && dz->is_sharded()
-            && dz->inner_chunk_exists(chunkIndices(key));
+        const bool diskPresent = dz && (
+            dz->is_sharded()
+                ? dz->inner_chunk_exists(chunkIndices(key))
+                : dz->chunk_exists(chunkIndices(key)));
         if (diskPresent || !dz) {
             // Present on canonical disk, OR no canonical disk tier at all
             // (local filesystem source — the "disk" is the source files).
@@ -949,8 +981,13 @@ BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
     // canonical-chunk index and query via the lock-free hash set. No
     // rwlock on the miss path — every blockAt miss used to hit
     // pthread_rwlock_rdlock here.
-    const int cps = kCanonicalChunkSide / kBlockSize;
-    const ChunkKey chunkKey{key.level, key.bz / cps, key.by / cps, key.bx / cps};
+    const auto& bpc = (key.level >= 0 && key.level < kMaxLevels)
+        ? blocksPerChunk_[key.level]
+        : blocksPerChunk_[0];
+    const int bpcZ = bpc[0] > 0 ? bpc[0] : (kCanonicalChunkSide / kBlockSize);
+    const int bpcY = bpc[1] > 0 ? bpc[1] : (kCanonicalChunkSide / kBlockSize);
+    const int bpcX = bpc[2] > 0 ? bpc[2] : (kCanonicalChunkSide / kBlockSize);
+    const ChunkKey chunkKey{key.level, key.bz / bpcZ, key.by / bpcY, key.bx / bpcX};
     if (isEmptyChunk(chunkKey)) {
         // One canonical zero block shared by every caller asking for
         // a block inside any empty chunk — no arena consumption.
@@ -1039,6 +1076,17 @@ ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey) {
         throw std::runtime_error("transient HTTP chunk fetch failure");
     if (!anyData) return nullptr;
     return out;
+}
+
+ChunkDataPtr BlockPipeline::fetchAndDecompressSourceChunk(const ChunkKey& key) {
+    if (!source_ || !decompress_) return nullptr;
+    std::vector<uint8_t> compressed;
+    try { compressed = source_->fetch(key); }
+    catch (...) { return nullptr; }
+    if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) {
+        return nullptr;
+    }
+    return decompress_(compressed, key);
 }
 
 
@@ -1158,9 +1206,13 @@ std::array<int, 3> BlockPipeline::chunkShape(int level) const noexcept {
     // chunk size may differ (e.g., 128³ h265 source re-canonicalized as
     // 256³ c3d); returning the source shape would make Slicing.cpp's
     // chunk-key enumeration compute the wrong grid.
+    // In uncompressed mode, source chunk size is used directly (no rechunking).
     if (level >= 0 && level < int(diskLevels_.size()) && diskLevels_[level]) {
-        const int C = kCanonicalChunkSide;
-        return {C, C, C};
+        if (config_.compressed) {
+            const int C = kCanonicalChunkSide;
+            return {C, C, C};
+        }
+        return source_->chunkShape(level);
     }
     return source_->chunkShape(level);
 }

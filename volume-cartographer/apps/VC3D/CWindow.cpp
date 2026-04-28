@@ -2252,6 +2252,13 @@ void CWindow::runStartupPrefetchForVolume(const std::shared_ptr<Volume>& volume)
     }
 
     volume->setCacheBudget(_cacheSizeBytes);
+    {
+        using namespace vc3d::settings;
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        volume->setDiskCacheCompressed(
+            settings.value(perf::DISK_CACHE_COMPRESSED,
+                           perf::DISK_CACHE_COMPRESSED_DEFAULT).toBool());
+    }
     const int numLevels = static_cast<int>(volume->numScales());
     if (_startupPrefetchLevel >= numLevels) {
         prefetchRemoteLevelWithDialog(this, volume, _startupPrefetchLevel);
