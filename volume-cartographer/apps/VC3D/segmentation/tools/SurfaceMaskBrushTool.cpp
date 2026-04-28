@@ -255,7 +255,8 @@ void SurfaceMaskBrushTool::finishStroke()
     _strokeActive = false;
     _lastGrid.reset();
     fillEnclosedStrokeArea();
-    applyPendingCells();
+    const cv::Rect changedRegion = applyPendingCells();
+    refreshSurfacePatchIndex(changedRegion);
     persistMask();
     _paintedCells.clear();
     _pendingCells.clear();
@@ -485,16 +486,21 @@ void SurfaceMaskBrushTool::persistMask()
     }
 }
 
-void SurfaceMaskBrushTool::applyPendingCells()
+cv::Rect SurfaceMaskBrushTool::applyPendingCells()
 {
     if (!_surface || _mask.empty()) {
-        return;
+        return {};
     }
 
     auto* points = _surface->rawPointsPtr();
     if (!points || points->empty()) {
-        return;
+        return {};
     }
+
+    int minRow = points->rows;
+    int maxRow = -1;
+    int minCol = points->cols;
+    int maxCol = -1;
 
     const cv::Vec3f invalid(-1.0f, -1.0f, -1.0f);
     for (const auto& [row, col] : _pendingCells) {
@@ -503,7 +509,42 @@ void SurfaceMaskBrushTool::applyPendingCells()
         }
         _mask(row, col) = 0;
         (*points)(row, col) = invalid;
+        minRow = std::min(minRow, row);
+        maxRow = std::max(maxRow, row);
+        minCol = std::min(minCol, col);
+        maxCol = std::max(maxCol, col);
     }
+
+    if (maxRow < minRow || maxCol < minCol || points->rows < 2 || points->cols < 2) {
+        return {};
+    }
+
+    const int cellRowCount = points->rows - 1;
+    const int cellColCount = points->cols - 1;
+    const int rowStart = std::max(0, minRow - 1);
+    const int rowEnd = std::min(cellRowCount, maxRow + 1);
+    const int colStart = std::max(0, minCol - 1);
+    const int colEnd = std::min(cellColCount, maxCol + 1);
+    if (rowStart >= rowEnd || colStart >= colEnd) {
+        return {};
+    }
+
+    return cv::Rect(colStart, rowStart, colEnd - colStart, rowEnd - rowStart);
+}
+
+void SurfaceMaskBrushTool::refreshSurfacePatchIndex(const cv::Rect& changedRegion)
+{
+    if (!_surface || changedRegion.empty()) {
+        return;
+    }
+
+    auto* manager = _module.viewerManager();
+    if (!manager) {
+        return;
+    }
+
+    SurfacePatchIndex::SurfacePtr surface(_surface, [](QuadSurface*) {});
+    manager->refreshSurfacePatchIndex(surface, changedRegion);
 }
 
 void SurfaceMaskBrushTool::invalidateViewers()

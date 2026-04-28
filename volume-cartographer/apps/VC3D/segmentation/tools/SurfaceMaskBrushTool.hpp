@@ -35,7 +35,8 @@ private:
     void queueVertex(int row, int col);
     void fillEnclosedStrokeArea();
     void persistMask();
-    void applyPendingCells();
+    [[nodiscard]] cv::Rect applyPendingCells();
+    void refreshSurfacePatchIndex(const cv::Rect& changedRegion);
     void invalidateViewers();
 
     SegmentationModule& _module;
