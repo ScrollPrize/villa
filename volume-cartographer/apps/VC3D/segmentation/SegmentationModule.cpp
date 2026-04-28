@@ -302,6 +302,8 @@ void SegmentationModule::bindWidgetSignals()
 
     connect(_widget, &SegmentationWidget::editingModeChanged,
             this, &SegmentationModule::setEditingEnabled);
+    connect(_widget, &SegmentationWidget::annotateToggled,
+            this, &SegmentationModule::setAnnotateMode);
     connect(_widget, &SegmentationWidget::dragRadiusChanged,
             this, &SegmentationModule::setDragRadius);
     connect(_widget, &SegmentationWidget::dragSigmaChanged,
@@ -346,8 +348,6 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::onCorrectionsCreateRequested);
     connect(_widget, &SegmentationWidget::correctionsCollectionSelected,
             this, &SegmentationModule::onCorrectionsCollectionSelected);
-    connect(_widget, &SegmentationWidget::correctionsAnnotateToggled,
-            this, &SegmentationModule::onCorrectionsAnnotateToggled);
     connect(_widget, &SegmentationWidget::correctionsZRangeChanged,
             this, &SegmentationModule::onCorrectionsZRangeChanged);
     connect(_widget, &SegmentationWidget::showApprovalMaskChanged,
@@ -456,6 +456,15 @@ void SegmentationModule::setIgnoreSegSurfaceChange(bool ignore)
     _ignoreSegSurfaceChange = ignore;
 }
 
+void SegmentationModule::setAnnotateMode(bool enabled)
+{
+    if (_annotateMode == enabled) {
+        return;
+    }
+    _annotateMode = enabled;
+    emit annotateModeChanged(enabled);
+}
+
 void SegmentationModule::setEditingEnabled(bool enabled)
 {
     if (_editingEnabled == enabled) {
@@ -469,7 +478,6 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     updateViewerCursors();
     if (!enabled) {
         stopAllPushPull();
-        setCorrectionsAnnotateMode(false, false);
         clearLineDragStroke();
         _lineDrawKeyActive = false;
         clearUndoStack();
@@ -872,7 +880,7 @@ void SegmentationModule::setCellReoptimizationMode(bool enabled)
 
     // Disable conflicting modes when enabling cell reopt
     if (enabled) {
-        setCorrectionsAnnotateMode(false, false);
+        setAnnotateMode(false);
         setEditApprovedMask(false);
         setEditUnapprovedMask(false);
     }
@@ -1007,7 +1015,7 @@ void SegmentationModule::setGrowthInProgress(bool running)
     if (running) {
         // Clear the cell reopt collection ID now that payload has been built
         _cellReoptCollectionId = 0;
-        setCorrectionsAnnotateMode(false, false);
+        setAnnotateMode(false);
         clearLineDragStroke();
         _lineDrawKeyActive = false;
     }
@@ -1200,17 +1208,6 @@ void SegmentationModule::updateCellReoptCollections()
     _widget->setCellReoptCollections(entries);
 }
 
-void SegmentationModule::setCorrectionsAnnotateMode(bool enabled, bool userInitiated)
-{
-    if (!_corrections) {
-        return;
-    }
-
-    const bool wasActive = _corrections->annotateMode();
-    const bool isActive = _corrections->setAnnotateMode(enabled, userInitiated, _editingEnabled);
-    if (isActive && !wasActive) {
-    }
-}
 
 void SegmentationModule::setActiveCorrectionCollection(uint64_t collectionId, bool userInitiated)
 {
@@ -1227,6 +1224,11 @@ uint64_t SegmentationModule::createCorrectionCollection(bool announce)
 void SegmentationModule::handleCorrectionPointAdded(const cv::Vec3f& worldPos)
 {
     if (!_corrections) return;
+
+    // Auto-create collection on first annotation
+    if (!_corrections->hasActiveCollection()) {
+        createCorrectionCollection(false);
+    }
 
     // Look up winding depth index from d.tif channel → store in winding_annotation
     float wind_a = NAN;
@@ -1363,23 +1365,12 @@ void SegmentationModule::onCorrectionsCreateRequested()
         return;
     }
 
-    const bool wasActive = _corrections->annotateMode();
-    const uint64_t created = _corrections->createCollection(true);
-    if (created != 0) {
-        const bool nowActive = _corrections->setAnnotateMode(true, false, _editingEnabled);
-        if (nowActive && !wasActive) {
-            }
-    }
+    _corrections->createCollection(true);
 }
 
 void SegmentationModule::onCorrectionsCollectionSelected(uint64_t id)
 {
     setActiveCorrectionCollection(id, true);
-}
-
-void SegmentationModule::onCorrectionsAnnotateToggled(bool enabled)
-{
-    setCorrectionsAnnotateMode(enabled, true);
 }
 
 void SegmentationModule::onCorrectionsZRangeChanged(bool enabled, int zMin, int zMax)
@@ -1392,7 +1383,7 @@ void SegmentationModule::onCorrectionsZRangeChanged(bool enabled, int zMin, int 
 void SegmentationModule::clearPendingCorrections()
 {
     if (_corrections) {
-        _corrections->clearAll(_editingEnabled);
+        _corrections->clearAll();
     }
 }
 

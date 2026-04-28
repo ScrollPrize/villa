@@ -18,6 +18,7 @@
 #include <QMessageBox>
 #include <QLabel>
 #include <QMenu>
+#include <QSignalBlocker>
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 
@@ -63,6 +64,12 @@ void CPointCollectionWidget::setupUi()
 {
     QWidget *main_widget = new QWidget(this);
     QVBoxLayout *layout = new QVBoxLayout(main_widget);
+
+    _chkAnnotate = new QCheckBox("Annotate", main_widget);
+    _chkAnnotate->setChecked(true);
+    _chkAnnotate->setToolTip("Toggle annotation mode for placing correction points on surfaces.");
+    layout->addWidget(_chkAnnotate);
+    connect(_chkAnnotate, &QCheckBox::toggled, this, &CPointCollectionWidget::annotateToggled);
 
     _tree_view = new QTreeView(main_widget);
     _model = new QStandardItemModel(this);
@@ -832,6 +839,14 @@ void CPointCollectionWidget::clearCorrPointsResults()
     _corr_point_results.clear();
     _corr_collection_avgs.clear();
     refreshTree();
+}
+
+void CPointCollectionWidget::setAnnotateChecked(bool checked)
+{
+    if (_chkAnnotate) {
+        const QSignalBlocker blocker(_chkAnnotate);
+        _chkAnnotate->setChecked(checked);
+    }
 }
 
 CPointCollectionWidget::~CPointCollectionWidget() {

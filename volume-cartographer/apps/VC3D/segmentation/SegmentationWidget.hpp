@@ -110,7 +110,6 @@ public:
     void setActiveVolume(const QString& volumeId);
 
     void setCorrectionsEnabled(bool enabled);
-    void setCorrectionsAnnotateChecked(bool enabled);
     void setCorrectionCollections(const QVector<QPair<uint64_t, QString>>& collections,
                                    std::optional<uint64_t> activeId);
     void setGrowthSteps(int steps, bool persist = true);
@@ -198,7 +197,10 @@ public:
     void setLasagnaDataInputPath(const QString& path);
     void setSeedFromFocus(int x, int y, int z);
 
+    void setAnnotateChecked(bool checked);
+
 signals:
+    void annotateToggled(bool enabled);
     void editingModeChanged(bool enabled);
     void dragRadiusChanged(float value);
     void dragSigmaChanged(float value);
@@ -222,7 +224,6 @@ signals:
     void volumeSelectionChanged(const QString& volumeId);
     void correctionsCreateRequested();
     void correctionsCollectionSelected(uint64_t collectionId);
-    void correctionsAnnotateToggled(bool enabled);
     void correctionsZRangeChanged(bool enabled, int zMin, int zMax);
     void hoverMarkerToggled(bool enabled);
     void showApprovalMaskChanged(bool enabled);

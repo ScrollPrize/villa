@@ -71,7 +71,9 @@ public:
     ~SegmentationModule();
 
     [[nodiscard]] bool editingEnabled() const { return _editingEnabled; }
+    [[nodiscard]] bool annotateMode() const { return _annotateMode; }
     void setEditingEnabled(bool enabled);
+    void setAnnotateMode(bool enabled);
     void setIgnoreSegSurfaceChange(bool ignore);
     [[nodiscard]] bool ignoreSegSurfaceChange() const { return _ignoreSegSurfaceChange; }
     void setDragRadius(float radiusSteps);
@@ -178,6 +180,7 @@ public:
 
 signals:
     void editingEnabledChanged(bool enabled);
+    void annotateModeChanged(bool enabled);
     void statusMessageRequested(const QString& text, int timeoutMs);
     void pendingChangesChanged(bool pending);
     void stopToolsRequested();
@@ -256,7 +259,6 @@ private:
     void refreshOverlay();
     void updateCorrectionsWidget();
     void updateCellReoptCollections();
-    void setCorrectionsAnnotateMode(bool enabled, bool userInitiated);
     void setActiveCorrectionCollection(uint64_t collectionId, bool userInitiated);
     uint64_t createCorrectionCollection(bool announce);
     void handleCorrectionPointAdded(const cv::Vec3f& worldPos);
@@ -269,7 +271,6 @@ private:
     void pruneMissingCorrections();
     void onCorrectionsCreateRequested();
     void onCorrectionsCollectionSelected(uint64_t id);
-    void onCorrectionsAnnotateToggled(bool enabled);
     void onCorrectionsZRangeChanged(bool enabled, int zMin, int zMax);
 
     void handleGrowSurfaceRequested(SegmentationGrowthMethod method,
@@ -338,6 +339,7 @@ private:
     CState* _state{nullptr};
     VCCollection* _pointCollection{nullptr};
 
+    bool _annotateMode{true};
     bool _editingEnabled{false};
     float _dragRadiusSteps{5.0f};
     float _dragSigmaSteps{2.0f};

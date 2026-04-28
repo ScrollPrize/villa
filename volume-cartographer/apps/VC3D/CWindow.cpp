@@ -2760,6 +2760,14 @@ void CWindow::CreateWidgets(void)
         _viewerManager->setSegmentationOverlay(_segmentationOverlay.get());
     }
 
+    // Wire annotate mode: dock widget <-> module <-> header row (via SegmentationWidget)
+    connect(_point_collection_widget, &CPointCollectionWidget::annotateToggled,
+            _segmentationModule.get(), &SegmentationModule::setAnnotateMode);
+    connect(_segmentationModule.get(), &SegmentationModule::annotateModeChanged,
+            _point_collection_widget, &CPointCollectionWidget::setAnnotateChecked);
+    connect(_segmentationModule.get(), &SegmentationModule::annotateModeChanged,
+            _segmentationWidget, &SegmentationWidget::setAnnotateChecked);
+
     connect(_segmentationModule.get(), &SegmentationModule::editingEnabledChanged,
             this, &CWindow::onSegmentationEditingModeChanged);
     connect(_segmentationModule.get(), &SegmentationModule::statusMessageRequested,

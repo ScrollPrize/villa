@@ -183,17 +183,7 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
 
     if (event->key() == vc3d::keybinds::keypress::ToggleAnnotation.key &&
         event->modifiers() == vc3d::keybinds::keypress::ToggleAnnotation.modifiers) {
-        if (!_editingEnabled) {
-            setEditingEnabled(true);
-            if (_widget) {
-                _widget->setEditingEnabled(true);
-            }
-            setCorrectionsAnnotateMode(true, true);
-        } else {
-            // Toggle correction point annotation mode
-            bool currentMode = _corrections && _corrections->annotateMode();
-            setCorrectionsAnnotateMode(!currentMode, true);
-        }
+        setAnnotateMode(!_annotateMode);
         event->accept();
         return true;
     }
@@ -305,16 +295,8 @@ void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
         return;
     }
 
-    // Surface editing requires _editingEnabled
-    if (!_editingEnabled) {
-        return;
-    }
-
-    if (isLeftButton && isNearRotationHandle(viewer, worldPos)) {
-        return;
-    }
-
-    if (_corrections && _corrections->annotateMode()) {
+    // Annotation mode works independently of surface editing
+    if (_annotateMode) {
         if (!isLeftButton) {
             return;
         }
@@ -335,6 +317,15 @@ void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
         // Default: add correction point at clicked position
         handleCorrectionPointAdded(worldPos);
         updateCorrectionsWidget();
+        return;
+    }
+
+    // Surface editing requires _editingEnabled
+    if (!_editingEnabled) {
+        return;
+    }
+
+    if (isLeftButton && isNearRotationHandle(viewer, worldPos)) {
         return;
     }
 
@@ -499,7 +490,7 @@ void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
         return;
     }
 
-    if (_corrections && _corrections->annotateMode()) {
+    if (_annotateMode) {
         return;
     }
 
@@ -557,7 +548,7 @@ void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
     }
 
     if (!_drag.active || button != Qt::LeftButton) {
-        if (_corrections && _corrections->annotateMode() && button == Qt::LeftButton) {
+        if (_annotateMode && button == Qt::LeftButton) {
             return;
         }
         return;

@@ -862,6 +862,7 @@ def _corr_winding_loss(
 	total_wsum = 0.0
 	n_surfaces = 0
 	all_err = torch.zeros(K, device=dev, dtype=dt)
+	all_too_far = torch.zeros(K, dtype=torch.bool, device=dev)
 
 	# Per-surface frac weight: tgt_lo (ci=2) gets 1-frac, tgt_hi (ci=3) gets frac.
 	# Integer targets naturally zero out the second surface.
@@ -909,6 +910,7 @@ def _corr_winding_loss(
 			# Bracketed points skip this — large uw there is just density variation.
 			is_bracketed = _wind_anchors_valid[vi, 0] & _wind_anchors_valid[vi, 1]
 			too_far = ~is_bracketed & (uw > 2.0)
+			all_too_far[vi] |= too_far
 
 			# Store error for results (weighted by frac proximity)
 			fw = frac_weight[ci][vi]
@@ -950,9 +952,9 @@ def _corr_winding_loss(
 		print(f"[corr-wind] loss={float(total_loss.detach().item()):.6f}, "
 			  f"valid={n_valid}/{K}, rms_proxy={rms:.4f}")
 
-	# Build results — point is valid only if it has at least one valid tgt anchor
+	# Build results — point is valid only if it has a valid tgt anchor and is not too far
 	has_tgt_anchor = _wind_anchors_valid[:, 2] | _wind_anchors_valid[:, 3]
-	point_valid = target_finite & has_tgt_anchor
+	point_valid = target_finite & has_tgt_anchor & ~all_too_far
 	_last_results = _build_winding_results(
 		winding_obs=_wind_obs_per_point, target=target,
 		err=all_err, pt_ids=pt_ids, col=col, pts=pts, winda=winda,

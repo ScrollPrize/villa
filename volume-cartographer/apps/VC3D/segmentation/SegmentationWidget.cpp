@@ -70,6 +70,8 @@ void SegmentationWidget::buildUi()
     connect(_headerRow, &SegmentationHeaderRow::editingToggled, this, [this](bool enabled) {
         updateEditingState(enabled, true);
     });
+    connect(_headerRow, &SegmentationHeaderRow::annotateToggled,
+            this, &SegmentationWidget::annotateToggled);
 
     // Forward editing panel signals
     connect(_editingPanel, &SegmentationEditingPanel::dragRadiusChanged,
@@ -161,8 +163,6 @@ void SegmentationWidget::buildUi()
             this, &SegmentationWidget::correctionsCreateRequested);
     connect(_correctionsPanel, &SegmentationCorrectionsPanel::correctionsCollectionSelected,
             this, &SegmentationWidget::correctionsCollectionSelected);
-    connect(_correctionsPanel, &SegmentationCorrectionsPanel::correctionsAnnotateToggled,
-            this, &SegmentationWidget::correctionsAnnotateToggled);
 
     // Forward neural tracer panel signals
     connect(_neuralTracerPanel, &SegmentationNeuralTracerPanel::neuralTracerEnabledChanged,
@@ -331,6 +331,13 @@ void SegmentationWidget::setEditingEnabled(bool enabled)
     updateEditingState(enabled, false);
 }
 
+void SegmentationWidget::setAnnotateChecked(bool checked)
+{
+    if (_headerRow) {
+        _headerRow->setAnnotateChecked(checked);
+    }
+}
+
 // --- Growth panel delegations ---
 
 SegmentationGrowthMethod SegmentationWidget::growthMethod() const { return _growthPanel->growthMethod(); }
@@ -371,7 +378,6 @@ void SegmentationWidget::setActiveVolume(const QString& volumeId) { _growthPanel
 // --- Corrections delegations ---
 
 void SegmentationWidget::setCorrectionsEnabled(bool enabled) { _correctionsPanel->setCorrectionsEnabled(enabled); }
-void SegmentationWidget::setCorrectionsAnnotateChecked(bool enabled) { _correctionsPanel->setCorrectionsAnnotateChecked(enabled); }
 
 void SegmentationWidget::setCorrectionCollections(const QVector<QPair<uint64_t, QString>>& collections,
                                                   std::optional<uint64_t> activeId)

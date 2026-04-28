@@ -39,7 +39,10 @@ public:
     void loadCorrPointsResults(const std::filesystem::path& jsonPath);
     void clearCorrPointsResults();
 
+    void setAnnotateChecked(bool checked);
+
 signals:
+    void annotateToggled(bool enabled);
     void collectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
     void pointDoubleClicked(uint64_t pointId);
@@ -85,6 +88,8 @@ private slots:
     VCCollection *_point_collection = nullptr;
     uint64_t _selected_collection_id = 0;
     uint64_t _selected_point_id = 0;
+
+    QCheckBox *_chkAnnotate{nullptr};
 
     QTreeView *_tree_view;
     QStandardItemModel *_model;
