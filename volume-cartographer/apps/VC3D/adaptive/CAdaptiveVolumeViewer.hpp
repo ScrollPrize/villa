@@ -2,11 +2,16 @@
 
 #include <QWidget>
 #include <QPointF>
+#include <QRectF>
+#include <QColor>
 #include <QImage>
+#include <QTransform>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <memory>
 #include <map>
 #include <set>
@@ -71,6 +76,7 @@ public:
     void invalidateVis() {}
     void invalidateIntersect(const std::string& = "") override;
     void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false);
+    void centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender = false);
 
     // --- Accessors ---
     std::string surfName() const override { return _surfName; }
@@ -124,12 +130,12 @@ public:
     void setNormalArrowLengthScale(float scale) { _normalArrowLengthScale = scale; emit overlaysUpdated(); }
     void setNormalMaxArrows(int maxArrows) { _normalMaxArrows = maxArrows; emit overlaysUpdated(); }
 
-    // --- Overlay volume stubs ---
-    void setOverlayVolume(std::shared_ptr<Volume>) {}
-    void setOverlayOpacity(float) {}
-    void setOverlayColormap(const std::string&) {}
-    void setOverlayThreshold(float) {}
-    void setOverlayWindow(float, float) {}
+    // --- Overlay volume ---
+    void setOverlayVolume(std::shared_ptr<Volume> volume);
+    void setOverlayOpacity(float opacity);
+    void setOverlayColormap(const std::string& colormapId);
+    void setOverlayThreshold(float threshold);
+    void setOverlayWindow(float low, float high);
 
     // --- Segmentation stubs ---
     void setSegmentationEditActive(bool) {}
@@ -154,9 +160,9 @@ public:
     void clearOverlayGroup(const std::string& key) override;
     void clearAllOverlayGroups() override;
 
-    // --- BBox stubs ---
-    auto selections() const -> std::vector<std::pair<QRectF, QColor>> override { return {}; }
-    std::optional<QRectF> activeBBoxSceneRect() const override { return std::nullopt; }
+    // --- BBox ---
+    auto selections() const -> std::vector<std::pair<QRectF, QColor>> override;
+    std::optional<QRectF> activeBBoxSceneRect() const override;
 
     // --- Intersection ---
     float intersectionOpacity() const override { return _intersectionOpacity; }
@@ -171,21 +177,32 @@ public:
     }
     void setSurfacePatchSamplingStride(int s) { _surfacePatchSamplingStride = s; }
 
-    // --- Surface overlay stubs ---
-    bool surfaceOverlayEnabled() const override { return false; }
-    const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override {
-        static std::map<std::string, cv::Vec3b> empty;
-        return empty;
+    // --- Surface overlays ---
+    bool surfaceOverlayEnabled() const override { return _surfaceOverlayEnabled; }
+    const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override { return _surfaceOverlays; }
+    float surfaceOverlapThreshold() const override { return _surfaceOverlapThreshold; }
+    void setSurfaceOverlayEnabled(bool enabled) {
+        if (_surfaceOverlayEnabled == enabled) return;
+        _surfaceOverlayEnabled = enabled;
+        emit overlaysUpdated();
     }
-    float surfaceOverlapThreshold() const override { return 5.0f; }
-    void setSurfaceOverlayEnabled(bool) {}
-    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>&) {}
-    void setSurfaceOverlapThreshold(float) {}
+    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) {
+        if (_surfaceOverlays == overlays) return;
+        _surfaceOverlays = overlays;
+        if (_surfaceOverlayEnabled) emit overlaysUpdated();
+    }
+    void setSurfaceOverlapThreshold(float threshold) {
+        const float clamped = std::max(0.0f, threshold);
+        if (std::abs(_surfaceOverlapThreshold - clamped) < 1e-6f) return;
+        _surfaceOverlapThreshold = clamped;
+        if (_surfaceOverlayEnabled) emit overlaysUpdated();
+    }
 
     // --- Coordinate transforms ---
     QPointF volumeToScene(const cv::Vec3f& vol_point) override;
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const override;
     cv::Vec2f sceneToSurfaceCoords(const QPointF& scenePos) const;
+    QPointF surfaceCoordsToScene(float surfX, float surfY) const { return surfaceToScene(surfX, surfY); }
     bool sceneToVolumePN(cv::Vec3f& p, cv::Vec3f& n, const QPointF& scenePos) const;
     QPointF lastScenePosition() const { return _lastScenePos; }
 
@@ -193,11 +210,11 @@ public:
     void adjustSurfaceOffset(float dn);
     void resetSurfaceOffsets();
 
-    // --- BBox tool stubs ---
-    void setBBoxMode(bool) {}
-    bool isBBoxMode() const { return false; }
-    QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF&) { return nullptr; }
-    void clearSelections() {}
+    // --- BBox tool ---
+    void setBBoxMode(bool enabled);
+    bool isBBoxMode() const { return _bboxMode; }
+    QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF& sceneRect);
+    void clearSelections();
 
     // --- Compat accessors ---
     CVolumeViewerView* fGraphicsView = nullptr;  // alias for _view, set in constructor
@@ -216,6 +233,7 @@ public:
 
     void updateStatusLabel();
     void fitSurfaceInView();
+    void requestRender();
     bool isWindowMinimized() const;
     bool eventFilter(QObject* watched, QEvent* event) override;
 
@@ -228,7 +246,6 @@ public slots:
 
     void onZoom(int steps, QPointF scenePoint, Qt::KeyboardModifiers modifiers);
     void onResized();
-    void onCursorMove(QPointF scenePos);
     void onPanStart(Qt::MouseButton, Qt::KeyboardModifiers);
     void onPanRelease(Qt::MouseButton, Qt::KeyboardModifiers);
     void onVolumeClicked(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
@@ -250,11 +267,11 @@ signals:
                            Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void sendZSliceChanged(int z_value);
     void sendMousePressVolume(cv::Vec3f vol_loc, cv::Vec3f normal,
-                              Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+                              Qt::MouseButton button, Qt::KeyboardModifiers modifiers, QPointF scenePos);
     void sendMouseMoveVolume(cv::Vec3f vol_loc, Qt::MouseButtons buttons,
-                             Qt::KeyboardModifiers modifiers);
+                             Qt::KeyboardModifiers modifiers, QPointF scenePos);
     void sendMouseReleaseVolume(cv::Vec3f vol_loc, Qt::MouseButton button,
-                                Qt::KeyboardModifiers modifiers);
+                                Qt::KeyboardModifiers modifiers, QPointF scenePos);
     void sendCollectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
     void pointClicked(uint64_t pointId);
@@ -297,6 +314,11 @@ private:
         // duration of the render.
         std::shared_ptr<Surface> surf;
         std::shared_ptr<Volume> volume;
+        std::shared_ptr<Volume> overlayVolume;
+        float overlayOpacity = 0.0f;
+        std::string overlayColormapId;
+        float overlayWindowLow = 0.0f;
+        float overlayWindowHigh = 255.0f;
     };
     void renderIntoFramebuffer(QImage& fb, const RenderContext& ctx);
     Q_INVOKABLE void finishRenderOnMainThread();
@@ -304,6 +326,7 @@ private:
     // Framebuffer coordinate conversions
     QPointF surfaceToScene(float surfX, float surfY) const;
     cv::Vec2f sceneToSurface(const QPointF& scenePos) const;
+    QRectF surfaceRectToSceneRect(const QRectF& surfRect) const;
     void updateFocusMarker(POI* poi = nullptr);
 
     void renderFlattenedIntersections(const std::shared_ptr<Surface>& surf);
@@ -312,6 +335,19 @@ private:
     void zoomStepsAt(int steps, const QPointF& scenePos);
 
     bool isAxisAlignedView() const;
+
+    struct CameraSceneSnapshot {
+        float camSurfX = 0.0f;
+        float camSurfY = 0.0f;
+        float camScale = 1.0f;
+        float vpCx = 0.0f;
+        float vpCy = 0.0f;
+        QTransform sceneToView;
+        QTransform viewToScene;
+        bool valid = false;
+    };
+    CameraSceneSnapshot cameraSceneSnapshot() const;
+    void warpIntersectionItemsFrom(const CameraSceneSnapshot& oldCam);
 
     // --- Qt widgets ---
     CVolumeViewerView* _view = nullptr;
@@ -341,6 +377,7 @@ private:
     // thread only, so no paint/swap race) to commit the new frame.
     QImage _framebuffer;
     QImage _framebufferWork;
+    QImage _overlayFramebuffer;
     // Serialises render dispatch. Only one worker runs at a time; if
     // submitRender fires while busy, the next render is queued via
     // _renderPendingAfterWorker so we don't lose a frame's worth of
@@ -367,6 +404,14 @@ private:
     float _windowLow = 0.0f;
     float _windowHigh = 255.0f;
     std::string _baseColormapId;
+    std::shared_ptr<Volume> _overlayVolume;
+    float _overlayOpacity{0.5f};
+    std::string _overlayColormapId;
+    float _overlayWindowLow{0.0f};
+    float _overlayWindowHigh{255.0f};
+    bool _surfaceOverlayEnabled{false};
+    std::map<std::string, cv::Vec3b> _surfaceOverlays;
+    float _surfaceOverlapThreshold{5.0f};
     // Flattened-view z-scroll translation direction (unit vector in world
     // space). Captured at each shift+scroll from the surface normal under
     // the view center so the translation is rigid — plain zoom never
@@ -440,6 +485,8 @@ private:
     bool _genCacheDirty = true;
     float _genCacheZOff = 0.0f;
     cv::Vec3f _genCacheZOffDir{0.0f, 0.0f, 0.0f};
+    int _genCachePrefetchLevel = -1;
+    int _genCachePrefetchNumLevels = -1;
 
 public:
     // Re-reads perf/interaction settings from disk into cached members.
@@ -462,6 +509,16 @@ private:
     // --- Overlay groups (stored for VolumeViewerBase interface) ---
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
     QGraphicsItem* _focusMarker = nullptr;
+
+    // --- BBox tool state ---
+    bool _bboxMode = false;
+    QPointF _bboxStart;
+    std::optional<QRectF> _activeBBoxSurfRect;
+    struct Selection {
+        QRectF surfRect;
+        QColor color;
+    };
+    std::vector<Selection> _selections;
 
     // --- Intersection overlay ---
     std::set<std::string> _intersectTgts;
@@ -534,6 +591,7 @@ private:
 
     // --- Chunk-ready listener ---
     vc::cache::BlockPipeline::ChunkReadyCallbackId _chunkCbId = 0;
+    vc::cache::BlockPipeline::ChunkReadyCallbackId _overlayChunkCbId = 0;
     bool _hadValidDataBounds = false;
     bool _dirtyWhileMinimized = false;
 

@@ -22,6 +22,7 @@
 
 #include "../adaptive/CAdaptiveVolumeViewer.hpp"
 #include "tools/SegmentationEditManager.hpp"
+#include "tools/ManualAddTool.hpp"
 #include "growth/SegmentationGrowth.hpp"
 #include "SegmentationPushPullConfig.hpp"
 #include "SegmentationUndoHistory.hpp"
@@ -53,6 +54,7 @@ class QTimer;
 class SegmentationLineTool;
 class SegmentationPushPullTool;
 class ApprovalMaskBrushTool;
+class SurfaceMaskBrushTool;
 class CellReoptimizationTool;
 
 class SegmentationModule : public QObject
@@ -90,10 +92,12 @@ public:
     void setShowApprovalMask(bool enabled);
     void setEditApprovedMask(bool enabled);
     void setEditUnapprovedMask(bool enabled);
+    void setDrawMaskEnabled(bool enabled);
     void onActiveSegmentChanged(QuadSurface* newSurface);
     [[nodiscard]] bool showApprovalMask() const { return _showApprovalMask; }
     [[nodiscard]] bool editApprovedMask() const { return _editApprovedMask; }
     [[nodiscard]] bool editUnapprovedMask() const { return _editUnapprovedMask; }
+    [[nodiscard]] bool drawMaskEnabled() const { return _drawMaskEnabled; }
     [[nodiscard]] bool autoApprovalEnabled() const { return _autoApprovalEnabled; }
     [[nodiscard]] float autoApprovalRadius() const { return _autoApprovalRadius; }
     [[nodiscard]] float autoApprovalThreshold() const { return _autoApprovalThreshold; }
@@ -176,6 +180,8 @@ public:
 
     void setRotationHandleHitTester(std::function<bool(CTiledVolumeViewer*, const cv::Vec3f&)> tester);
 
+    [[nodiscard]] bool manualAddMode() const { return _manualAddMode; }
+
 signals:
     void editingEnabledChanged(bool enabled);
     void statusMessageRequested(const QString& text, int timeoutMs);
@@ -193,6 +199,7 @@ private:
     friend class SegmentationLineTool;
     friend class SegmentationPushPullTool;
     friend class ApprovalMaskBrushTool;
+    friend class SurfaceMaskBrushTool;
     friend class SegmentationBrushTool;
     friend class segmentation::CorrectionsState;
 
@@ -276,21 +283,38 @@ private:
                                     SegmentationGrowthDirection direction,
                                     int steps,
                                     bool inpaintOnly);
+    bool beginManualAdd();
+    bool finishManualAdd(bool apply);
+    void resetManualAddState(bool restorePreview);
+    bool recomputeManualAdd();
+    bool clearManualAddPending();
+    bool undoManualAddPlaneConstraint();
+    bool handleManualAddMousePress(CTiledVolumeViewer* viewer,
+                                   const cv::Vec3f& worldPos,
+                                   Qt::MouseButton button,
+                                   Qt::KeyboardModifiers modifiers,
+                                   const QPointF& scenePos);
+    bool handleManualAddMouseMove(CTiledVolumeViewer* viewer,
+                                  Qt::MouseButtons buttons,
+                                  const QPointF& scenePos);
     void clearLineDragStroke();
 
     void handleMousePress(CTiledVolumeViewer* viewer,
                           const cv::Vec3f& worldPos,
                           const cv::Vec3f& surfaceNormal,
                           Qt::MouseButton button,
-                          Qt::KeyboardModifiers modifiers);
+                          Qt::KeyboardModifiers modifiers,
+                          const QPointF& scenePos);
     void handleMouseMove(CTiledVolumeViewer* viewer,
                          const cv::Vec3f& worldPos,
                          Qt::MouseButtons buttons,
-                         Qt::KeyboardModifiers modifiers);
+                         Qt::KeyboardModifiers modifiers,
+                         const QPointF& scenePos);
     void handleMouseRelease(CTiledVolumeViewer* viewer,
                             const cv::Vec3f& worldPos,
                             Qt::MouseButton button,
-                            Qt::KeyboardModifiers modifiers);
+                            Qt::KeyboardModifiers modifiers,
+                            const QPointF& scenePos);
     void handleWheel(CTiledVolumeViewer* viewer,
                      int deltaSteps,
                      const QPointF& scenePos,
@@ -314,10 +338,11 @@ private:
     void finishDrag();
     void cancelDrag();
 
-    void updateHover(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos);
+    void updateHover(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos, const QPointF& scenePos);
     [[nodiscard]] bool isNearRotationHandle(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos) const;
     SegmentationEditManager::GridSearchResolution hoverLookupDetail(const cv::Vec3f& worldPos);
     void resetHoverLookupDetail();
+    bool recoverHoverPointerFromCursor();
     void recordPointerSample(CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos);
 
     bool startPushPull(int direction, std::optional<bool> alphaOverride = std::nullopt);
@@ -369,7 +394,11 @@ private:
     std::unique_ptr<SegmentationLineTool> _lineTool;
     std::unique_ptr<SegmentationPushPullTool> _pushPullTool;
     std::unique_ptr<ApprovalMaskBrushTool> _approvalTool;
+    std::unique_ptr<SurfaceMaskBrushTool> _surfaceMaskTool;
     std::unique_ptr<CellReoptimizationTool> _cellReoptTool;
+    std::unique_ptr<ManualAddTool> _manualAddTool;
+    bool _manualAddMode{false};
+    SegmentationGrowthMethod _previousGrowthMethodBeforeManualAdd{SegmentationGrowthMethod::Tracer};
 
     bool _showApprovalMask{false};
     bool _cellReoptMode{false};
@@ -377,6 +406,8 @@ private:
     uint64_t _cellReoptCollectionId{0};  // Specific collection for cell reopt (0 = use all)
     bool _editApprovedMask{false};
     bool _editUnapprovedMask{false};
+    bool _drawMaskEnabled{false};
+    bool _shiftDrawMaskActive{false};
     bool _autoApprovalEnabled{true};
     float _autoApprovalRadius{0.5f};
     float _autoApprovalThreshold{0.0f};

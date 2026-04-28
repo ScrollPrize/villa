@@ -5,10 +5,13 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <optional>
+#include <set>
 #include <system_error>
 
 #include "utils/Json.hpp"
 #include <opencv2/core.hpp>
+#include <omp.h>
 #include <QLoggingCategory>
 #include <QString>
 
@@ -27,7 +30,29 @@
 Q_DECLARE_LOGGING_CATEGORY(lcSegGrowth)
 
 namespace
-{void createRotatingBackup(QuadSurface* surface, int maxBackups = 10)
+{
+class ScopedOmpThreadLimit
+{
+public:
+    explicit ScopedOmpThreadLimit(int threadCount)
+        : _previousThreadCount(std::max(1, omp_get_max_threads()))
+    {
+        omp_set_num_threads(std::max(1, threadCount));
+    }
+
+    ~ScopedOmpThreadLimit()
+    {
+        omp_set_num_threads(_previousThreadCount);
+    }
+
+    ScopedOmpThreadLimit(const ScopedOmpThreadLimit&) = delete;
+    ScopedOmpThreadLimit& operator=(const ScopedOmpThreadLimit&) = delete;
+
+private:
+    int _previousThreadCount{1};
+};
+
+void createRotatingBackup(QuadSurface* surface, int maxBackups = 10)
 {
     if (!surface) {
         return;
@@ -137,6 +162,8 @@ QString directionToString(SegmentationGrowthDirection direction)
         return QStringLiteral("left");
     case SegmentationGrowthDirection::Right:
         return QStringLiteral("right");
+    case SegmentationGrowthDirection::Fill:
+        return QStringLiteral("fill");
     case SegmentationGrowthDirection::All:
     default:
         return QStringLiteral("all");
@@ -277,16 +304,22 @@ utils::Json buildTracerParams(const SegmentationGrowthRequest& request)
     params["rewind_gen"] = -1;
     params["grow_mode"] = directionToString(request.direction).toStdString();
     params["grow_steps"] = std::max(0, request.steps);
+    params["grow_extra_rows"] = 0;
+    params["grow_extra_cols"] = 0;
 
-    if (request.direction == SegmentationGrowthDirection::Left || request.direction == SegmentationGrowthDirection::Right) {
-        params["grow_extra_cols"] = std::max(0, request.steps);
-        params["grow_extra_rows"] = 0;
+    if (request.direction == SegmentationGrowthDirection::Fill) {
+        params["grow_max_extra_rows"] = 0;
+        params["grow_max_extra_cols"] = 0;
+        params["disable_grid_expansion"] = true;
+    } else if (request.direction == SegmentationGrowthDirection::Left || request.direction == SegmentationGrowthDirection::Right) {
+        params["grow_max_extra_cols"] = std::max(0, request.steps);
+        params["grow_max_extra_rows"] = 0;
     } else if (request.direction == SegmentationGrowthDirection::Up || request.direction == SegmentationGrowthDirection::Down) {
-        params["grow_extra_rows"] = std::max(0, request.steps);
-        params["grow_extra_cols"] = 0;
+        params["grow_max_extra_rows"] = std::max(0, request.steps);
+        params["grow_max_extra_cols"] = 0;
     } else {
-        params["grow_extra_rows"] = std::max(0, request.steps);
-        params["grow_extra_cols"] = std::max(0, request.steps);
+        params["grow_max_extra_rows"] = std::max(0, request.steps);
+        params["grow_max_extra_cols"] = std::max(0, request.steps);
     }
 
     params["inpaint"] = request.inpaintOnly;
@@ -310,6 +343,7 @@ utils::Json buildTracerParams(const SegmentationGrowthRequest& request)
             allowRight = true;
             break;
         case SegmentationGrowthDirection::All:
+        case SegmentationGrowthDirection::Fill:
         default:
             allowUp = allowDown = allowLeft = allowRight = true;
             break;
@@ -352,7 +386,6 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         result.error = QStringLiteral("Segmentation surface lacks a generations channel");
         return result;
     }
-
     ensureNormalsInward(context.resumeSurface, context.volume);
 
     vc::VcDataset* dataset = context.volume->zarrDataset(0);
@@ -429,11 +462,9 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
     }
 
     params["generations"] = targetGenerations;
-    int rewindGen = -1;
-    if (startGen > 1) {
-        rewindGen = startGen - 1;
+    if (!params.contains("rewind_gen")) {
+        params["rewind_gen"] = -1;
     }
-    params["rewind_gen"] = rewindGen;
     params["cache_root"] = context.cacheRoot.toStdString();
     if (!context.normalGridPath.isEmpty()) {
         params["normal_grid_path"] = context.normalGridPath.toStdString();
@@ -495,6 +526,13 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         }
         qCInfo(lcSegGrowth) << "  params:" << QString::fromStdString(params.dump());
         createRotatingBackup(context.resumeSurface);
+
+        std::optional<ScopedOmpThreadLimit> regularTracerOmpLimit;
+        if (request.method == SegmentationGrowthMethod::Tracer) {
+            regularTracerOmpLimit.emplace(1);
+            qCInfo(lcSegGrowth) << "  regular tracer OpenMP threads forced to 1";
+        }
+
         QuadSurface* surface = tracer(dataset,
                                       1.0f,
                                       context.volume->tieredCache(),
@@ -515,6 +553,75 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
         result.statusMessage = QStringLiteral("Tracer growth completed");
     } catch (const std::exception& ex) {
         result.error = QStringLiteral("Tracer growth failed: %1").arg(ex.what());
+    }
+
+    return result;
+}
+
+TracerGrowthResult runPatchTracerGrowth(const SegmentationGrowthRequest& request,
+                                        const TracerGrowthContext& context)
+{
+    TracerGrowthResult result;
+
+    if (!context.resumeSurface) {
+        result.error = QStringLiteral("Missing segmentation surface for Patch Tracer growth");
+        return result;
+    }
+
+    if (!ensureGenerationsChannel(context.resumeSurface)) {
+        result.error = QStringLiteral("Segmentation surface lacks a generations channel");
+        return result;
+    }
+
+    utils::Json params = buildTracerParams(request);
+    params["resume_growth"] = true;
+    params["steps"] = std::max(0, request.steps);
+    params["use_patch_cache"] = false;
+    if (!context.cacheRoot.isEmpty()) {
+        params["cache_root"] = context.cacheRoot.toStdString();
+    }
+
+    std::filesystem::path targetDir;
+    if (!context.resumeSurface->path.empty()) {
+        targetDir = context.resumeSurface->path.parent_path();
+    }
+    if (targetDir.empty() && !context.cacheRoot.isEmpty()) {
+        targetDir = std::filesystem::path(context.cacheRoot.toStdString());
+    }
+    if (targetDir.empty()) {
+        targetDir = std::filesystem::temp_directory_path();
+    }
+    params["tgt_dir"] = targetDir.string();
+
+    std::vector<QuadSurface*> surfaces;
+    surfaces.reserve(context.patchSurfaces.size() + 1);
+    std::set<QuadSurface*> seen;
+    auto appendSurface = [&](QuadSurface* surface) {
+        if (surface && seen.insert(surface).second) {
+            surfaces.push_back(surface);
+        }
+    };
+    for (const auto& surface : context.patchSurfaces) {
+        appendSurface(surface.get());
+    }
+    appendSurface(context.resumeSurface);
+
+    try {
+        qCInfo(lcSegGrowth) << "Calling grow_surf_from_surfs() for Patch Tracer";
+        qCInfo(lcSegGrowth) << "  surface count:" << static_cast<int>(surfaces.size());
+        qCInfo(lcSegGrowth) << "  external patch index:" << (context.surfacePatchIndex != nullptr);
+        qCInfo(lcSegGrowth) << "  params:" << QString::fromStdString(params.dump());
+        createRotatingBackup(context.resumeSurface);
+        result.surface = grow_surf_from_surfs(context.resumeSurface,
+                                              surfaces,
+                                              params,
+                                              static_cast<float>(context.voxelSize),
+                                              context.surfacePatchIndex);
+        result.statusMessage = QStringLiteral("Patch Tracer growth completed");
+    } catch (const std::exception& ex) {
+        result.error = QStringLiteral("Patch Tracer growth failed: %1").arg(ex.what());
+    } catch (...) {
+        result.error = QStringLiteral("Patch Tracer growth failed with an unknown exception");
     }
 
     return result;

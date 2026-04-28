@@ -2,6 +2,8 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <unordered_map>
 
 #include <boost/geometry.hpp>
@@ -10,6 +12,15 @@
 
 namespace bg = boost::geometry;
 namespace bgi = boost::geometry::index;
+
+namespace {
+
+bool isFinitePoint(const cv::Vec3f& p) noexcept
+{
+    return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
+}
+
+}
 
 struct PointIndex::Impl {
     using Point3 = bg::model::point<float, 3, bg::cs::cartesian>;
@@ -60,6 +71,10 @@ size_t PointIndex::size() const
 
 void PointIndex::insert(uint64_t id, uint64_t collectionId, const cv::Vec3f& position)
 {
+    if (!isFinitePoint(position)) {
+        return;
+    }
+
     auto it = impl_->pointData.find(id);
     if (it != impl_->pointData.end()) {
         // Already exists - update instead
@@ -84,6 +99,9 @@ void PointIndex::bulkInsert(const std::vector<std::tuple<uint64_t, uint64_t, cv:
     entries.reserve(points.size());
 
     for (const auto& [id, collectionId, position] : points) {
+        if (!isFinitePoint(position)) {
+            continue;
+        }
         impl_->pointData[id] = {position, collectionId};
         entries.emplace_back(Impl::toBoost(position), id);
     }
@@ -104,6 +122,9 @@ void PointIndex::buildFromMat(const cv::Mat_<cv::Vec3f>& points, uint64_t collec
     entries.reserve(static_cast<size_t>(points.rows) * points.cols);
 
     for (auto [j, i, p] : ValidPointRange<const cv::Vec3f>(&points)) {
+        if (!isFinitePoint(p)) {
+            continue;
+        }
         uint64_t id = static_cast<uint64_t>(j) * points.cols + i;
         impl_->pointData[id] = {p, collectionId};
         entries.emplace_back(Impl::toBoost(p), id);
@@ -127,6 +148,10 @@ void PointIndex::remove(uint64_t id)
 
 bool PointIndex::update(uint64_t id, const cv::Vec3f& newPosition)
 {
+    if (!isFinitePoint(newPosition)) {
+        return false;
+    }
+
     auto it = impl_->pointData.find(id);
     if (it == impl_->pointData.end()) {
         return false;
@@ -144,7 +169,7 @@ std::vector<PointIndex::QueryResult> PointIndex::queryRadius(
 {
     std::vector<QueryResult> results;
 
-    if (radius <= 0.0f || impl_->tree.empty()) {
+    if (radius <= 0.0f || !std::isfinite(radius) || !isFinitePoint(center) || impl_->tree.empty()) {
         return results;
     }
 
@@ -180,7 +205,7 @@ std::optional<PointIndex::QueryResult> PointIndex::nearest(
     const cv::Vec3f& position,
     float maxDistance) const
 {
-    if (impl_->tree.empty()) {
+    if (impl_->tree.empty() || !isFinitePoint(position) || !std::isfinite(maxDistance)) {
         return std::nullopt;
     }
 
@@ -216,7 +241,7 @@ std::vector<PointIndex::QueryResult> PointIndex::kNearest(
 {
     std::vector<QueryResult> results;
 
-    if (k == 0 || impl_->tree.empty()) {
+    if (k == 0 || impl_->tree.empty() || !isFinitePoint(position) || !std::isfinite(maxDistance)) {
         return results;
     }
 
@@ -251,7 +276,7 @@ std::optional<PointIndex::QueryResult> PointIndex::nearestInCollection(
     uint64_t collectionId,
     float maxDistance) const
 {
-    if (impl_->tree.empty()) {
+    if (impl_->tree.empty() || !isFinitePoint(position) || !std::isfinite(maxDistance)) {
         return std::nullopt;
     }
 

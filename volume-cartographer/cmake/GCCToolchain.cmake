@@ -11,6 +11,14 @@ set(VC_SIZE_LINKER_FLAGS "")
 
 message(STATUS "GCC: auto LTO + gc-sections")
 
+# Keep default GCC builds quiet from diagnostics that are noisy in our normal
+# dependency/header mix or existing legacy code paths.
+add_compile_options(
+    -Wno-psabi
+    -Wno-ignored-attributes
+    -Wno-narrowing
+)
+
 # ---- Developer warnings ------------------------------------------------------
 if(VC_DEVELOPER_WARNINGS)
     add_compile_options(

@@ -3361,6 +3361,11 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
         start_gen = (rewind_gen == -1) ? static_cast<int>(max_val) : rewind_gen;
         generation = start_gen;
 
+        const bool preserve_all_resume_points = rewind_gen == -1;
+        const uint16_t fallback_resume_gen = static_cast<uint16_t>(std::max(1, start_gen));
+        int imported_zero_generation_points = 0;
+        int skipped_rewind_points = 0;
+
         int min_gen = std::numeric_limits<int>::max();
         x0 = -1;
         y0 = -1;
@@ -3369,18 +3374,43 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
                 int target_y = resume_pad_y + j;
                 int target_x = resume_pad_x + i;
                 uint16_t gen = resume_generations.at<uint16_t>(j, i);
-                if (gen > 0 && gen <= start_gen && resume_points(j,i)[0] != -1) {
-                    trace_params.dpoints(target_y, target_x) = resume_points(j, i);
-                    generations(target_y, target_x) = gen;
-                    succ++;
-                    trace_params.state(target_y, target_x) = STATE_LOC_VALID | STATE_COORD_VALID;
-                    if (gen < min_gen) {
-                        min_gen = gen;
-                        x0 = target_x;
-                        y0 = target_y;
+                if (resume_points(j,i)[0] == -1) {
+                    continue;
+                }
+
+                if (gen == 0) {
+                    if (!preserve_all_resume_points) {
+                        continue;
                     }
+                    gen = fallback_resume_gen;
+                    ++imported_zero_generation_points;
+                } else if (gen > start_gen) {
+                    if (!preserve_all_resume_points) {
+                        ++skipped_rewind_points;
+                        continue;
+                    }
+                    gen = fallback_resume_gen;
+                }
+
+                trace_params.dpoints(target_y, target_x) = resume_points(j, i);
+                generations(target_y, target_x) = gen;
+                succ++;
+                trace_params.state(target_y, target_x) = STATE_LOC_VALID | STATE_COORD_VALID;
+                if (gen < min_gen) {
+                    min_gen = gen;
+                    x0 = target_x;
+                    y0 = target_y;
                 }
             }
+        }
+
+        if (imported_zero_generation_points > 0) {
+            std::cout << "Resume import preserved " << imported_zero_generation_points
+                      << " valid points with zero generation metadata." << std::endl;
+        }
+        if (skipped_rewind_points > 0) {
+            std::cout << "Resume import skipped " << skipped_rewind_points
+                      << " points newer than rewind generation " << start_gen << "." << std::endl;
         }
 
         trace_data.point_correction = PointCorrection(corrections);
@@ -4001,18 +4031,65 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
         if (stop_gen && generation >= stop_gen)
             break;
 
-        // For every point in the fringe (where we might expand the patch outwards), add to cands all
-        // new 2D points we might add to the patch (and later find the corresponding 3D point for)
-        for(const auto& p : fringe)
-        {
-            for(const auto& n : neighs)
-                if (bounds.contains(cv::Point(p+n))
-                    && (trace_params.state(p+n) & STATE_PROCESSING) == 0
-                    && (trace_params.state(p+n) & STATE_LOC_VALID) == 0) {
-                    trace_params.state(p+n) |= STATE_PROCESSING;
-                    cands.push_back(p+n);
+        auto is_loc_valid = [&](const cv::Vec2i& p) {
+            return bounds.contains(cv::Point(p[1], p[0])) &&
+                   (trace_params.state(p) & STATE_LOC_VALID) != 0;
+        };
+
+        auto is_inside_used_area = [&](const cv::Vec2i& p) {
+            return used_area.contains(cv::Point(p[1], p[0]));
+        };
+
+        auto append_candidate = [&](const cv::Vec2i& p) {
+            if (!bounds.contains(cv::Point(p[1], p[0])) ||
+                (trace_params.state(p) & STATE_PROCESSING) != 0 ||
+                (trace_params.state(p) & STATE_LOC_VALID) != 0) {
+                return;
+            }
+
+            trace_params.state(p) |= STATE_PROCESSING;
+            cands.push_back(p);
+        };
+
+        bool used_area_fully_valid = true;
+        for (int j = used_area.y; j < used_area.br().y && used_area_fully_valid; ++j) {
+            for (int i = used_area.x; i < used_area.br().x; ++i) {
+                if ((trace_params.state(j, i) & STATE_LOC_VALID) == 0) {
+                    used_area_fully_valid = false;
+                    break;
                 }
+            }
         }
+
+        if (!used_area_fully_valid) {
+            // Irregular resumed patches should fill holes within the existing grid before
+            // growing the bounding rectangle. For right growth, this means every valid
+            // point with an invalid point immediately to its right contributes that
+            // invalid point as a candidate; the other directions follow the same rule.
+            for (int j = used_area.y; j < used_area.br().y; ++j) {
+                for (int i = used_area.x; i < used_area.br().x; ++i) {
+                    const cv::Vec2i p{j, i};
+                    if (!is_loc_valid(p)) {
+                        continue;
+                    }
+
+                    for (const auto& n : neighs) {
+                        const cv::Vec2i candidate = p + n;
+                        if (is_inside_used_area(candidate)) {
+                            append_candidate(candidate);
+                        }
+                    }
+                }
+            }
+        } else {
+            // For a rectangular patch, keep the existing fast frontier behavior.
+            for (const auto& p : fringe) {
+                for (const auto& n : neighs) {
+                    append_candidate(p + n);
+                }
+            }
+        }
+
         std::cout << "gen " << generation << " processing " << cands.size() << " fringe cands (total done " << succ << " fringe: " << fringe.size() << ")" << std::endl;
         fringe.resize(0);
 
