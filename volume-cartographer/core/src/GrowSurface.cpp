@@ -1065,7 +1065,6 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat
 {
     cv::Mat_<cv::Vec3f> points_hr(state.rows*step, state.cols*step, {0,0,0});
     cv::Mat_<int> counts_hr(state.rows*step, state.cols*step, 0);
-#pragma omp parallel for //FIXME data access is just not threading friendly ...
     for(int j=used_area.y;j<used_area.br().y-1;j++)
         for(int i=used_area.x;i<used_area.br().x-1;i++) {
             if (state(j,i) & (STATE_LOC_VALID|STATE_COORD_VALID)
