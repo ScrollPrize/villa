@@ -2760,21 +2760,10 @@ void CWindow::CreateWidgets(void)
         _viewerManager->setSegmentationOverlay(_segmentationOverlay.get());
     }
 
-    // Wire annotate mode: dock widget <-> module <-> header row (via SegmentationWidget)
-    connect(_point_collection_widget, &CPointCollectionWidget::annotateToggled,
-            _segmentationModule.get(), &SegmentationModule::setAnnotateMode);
-    connect(_segmentationModule.get(), &SegmentationModule::annotateModeChanged,
-            _point_collection_widget, &CPointCollectionWidget::setAnnotateChecked);
+    // Wire annotate mode: module -> header row (via SegmentationWidget)
+    // NOTE: connections involving _point_collection_widget are below, after it is created.
     connect(_segmentationModule.get(), &SegmentationModule::annotateModeChanged,
             _segmentationWidget, &SegmentationWidget::setAnnotateChecked);
-
-    // Wire annotation point/collection selection: module -> dock widget, dock widget -> module
-    connect(_segmentationModule.get(), &SegmentationModule::annotationPointSelected,
-            _point_collection_widget, &CPointCollectionWidget::selectPoint);
-    connect(_segmentationModule.get(), &SegmentationModule::annotationCollectionSelected,
-            _point_collection_widget, &CPointCollectionWidget::selectCollection);
-    connect(_point_collection_widget, &CPointCollectionWidget::collectionSelected,
-            _segmentationModule.get(), &SegmentationModule::setSelectedAnnotationCollection);
     connect(_segmentationModule.get(), &SegmentationModule::annotationPointFocused,
             this, &CWindow::onPointDoubleClicked);
 
@@ -3271,6 +3260,19 @@ void CWindow::CreateWidgets(void)
     connect(_point_collection_widget, &CPointCollectionWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
     connect(_point_collection_widget, &CPointCollectionWidget::convertPointToAnchorRequested, this, &CWindow::onConvertPointToAnchor);
     connect(_point_collection_widget, &CPointCollectionWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
+
+    // Wire annotate mode & annotation selection: dock widget <-> segmentation module
+    // (must be after _point_collection_widget creation)
+    connect(_point_collection_widget, &CPointCollectionWidget::annotateToggled,
+            _segmentationModule.get(), &SegmentationModule::setAnnotateMode);
+    connect(_segmentationModule.get(), &SegmentationModule::annotateModeChanged,
+            _point_collection_widget, &CPointCollectionWidget::setAnnotateChecked);
+    connect(_segmentationModule.get(), &SegmentationModule::annotationPointSelected,
+            _point_collection_widget, &CPointCollectionWidget::selectPoint);
+    connect(_segmentationModule.get(), &SegmentationModule::annotationCollectionSelected,
+            _point_collection_widget, &CPointCollectionWidget::selectCollection);
+    connect(_point_collection_widget, &CPointCollectionWidget::collectionSelected,
+            _segmentationModule.get(), &SegmentationModule::setSelectedAnnotationCollection);
 
     // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, and Drawing together
     tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);

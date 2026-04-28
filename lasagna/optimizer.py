@@ -564,6 +564,11 @@ def optimize(
 		if stage.global_opt.steps > 0:
 			data = _run_opt(si=si, label=f"stage{si}", stage=stage, opt_cfg=stage.global_opt, data=data)
 
+	# Print sparse cache summary
+	if data.sparse_caches:
+		for _cache in data.sparse_caches.values():
+			_cache.print_summary()
+
 	if active_corr:
 		opt_loss_corr.print_detail("END")
 		opt_loss_corr.print_summary()
