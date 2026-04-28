@@ -46,10 +46,7 @@ static bool isAllZero(const uint8_t* data, size_t size) noexcept {
 
 static bool diskShardMarksChunkEmpty(utils::ZarrArray& dz, const ChunkKey& key) {
     if (!dz.is_sharded()) return false;
-    // Only honor our own verified-absent sentinel. Ignore zarr-spec empty
-    // markers — they could have been written by a prior buggy session and
-    // are no longer trusted as proof of absence.
-    return dz.inner_chunk_is_verified_absent(chunkIndices(key));
+    return dz.inner_chunk_is_empty(chunkIndices(key));
 }
 
 BlockPipeline::FetchVerdict BlockPipeline::classifyFetch(
@@ -59,11 +56,14 @@ BlockPipeline::FetchVerdict BlockPipeline::classifyFetch(
     bool sourceHadTransientError,
     bool authProven)
 {
-    if (fetchThrew) return FetchVerdict::RetryLater;
-    if (sourceHadTransientError) return FetchVerdict::RetryLater;
-    if (!bytes.empty()) return FetchVerdict::HasData;
-    if (sourceConfirmsAbsent && authProven) return FetchVerdict::DefinitivelyAbsent;
-    return FetchVerdict::RetryLater;
+    if (fetchThrew) return FetchVerdict::Transient;
+    if (sourceHadTransientError) return FetchVerdict::Transient;
+    if (!bytes.empty()) {
+        if (isAllZero(bytes.data(), bytes.size())) return FetchVerdict::EmptyConfirmed;
+        return FetchVerdict::HasData;
+    }
+    if (sourceConfirmsAbsent && authProven) return FetchVerdict::EmptyConfirmed;
+    return FetchVerdict::Transient;
 }
 
 void BlockPipeline::markChunkAbsent(const ChunkKey& key, utils::ZarrArray* dz)
@@ -74,7 +74,7 @@ void BlockPipeline::markChunkAbsent(const ChunkKey& key, utils::ZarrArray* dz)
         negativeCache_.insert(key);
     }
     if (dz && dz->is_sharded()) {
-        dz->mark_inner_chunk_verified_absent(chunkIndices(key));
+        dz->mark_inner_chunk_empty(chunkIndices(key));
     }
 }
 
@@ -543,11 +543,11 @@ BlockPipeline::BlockPipeline(
                 source_->lastFetchConfirmsAbsent(),
                 vc::cache::HttpSource::lastFetchHadTransientError(),
                 config_.authProven);
-            if (verdict == FetchVerdict::DefinitivelyAbsent) {
+            if (verdict == FetchVerdict::EmptyConfirmed) {
                 markChunkAbsent(key, dz);
                 return {};
             }
-            if (verdict == FetchVerdict::RetryLater) return {};
+            if (verdict == FetchVerdict::Transient) return {};
             statColdHits_.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -706,11 +706,11 @@ BlockPipeline::BlockPipeline(
                     source_->lastFetchConfirmsAbsent(),
                     vc::cache::HttpSource::lastFetchHadTransientError(),
                     config_.authProven);
-                if (verdict == FetchVerdict::DefinitivelyAbsent) {
+                if (verdict == FetchVerdict::EmptyConfirmed) {
                     markChunkAbsent(key, dz);
                     return {};
                 }
-                if (verdict == FetchVerdict::RetryLater) return {};
+                if (verdict == FetchVerdict::Transient) return {};
 
                 if (!bytesAreCanonical(bytes)) return {};
 
@@ -1020,8 +1020,8 @@ ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey,
             source_->lastFetchConfirmsAbsent(),
             vc::cache::HttpSource::lastFetchHadTransientError(),
             config_.authProven);
-        if (verdict == FetchVerdict::RetryLater) { anyTransient = true; continue; }
-        if (verdict == FetchVerdict::DefinitivelyAbsent) { anyZeroFill = true; continue; }
+        if (verdict == FetchVerdict::Transient) { anyTransient = true; continue; }
+        if (verdict == FetchVerdict::EmptyConfirmed) { anyZeroFill = true; continue; }
         auto data = decompress_(compressed, srcKey);
         if (!data) {
             anyDecompressFail = true;
