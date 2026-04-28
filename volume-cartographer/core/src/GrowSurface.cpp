@@ -198,10 +198,9 @@ static float sliding_w_scale = 1.0f;       // Scale factor for sliding window
 static float z_loc_loss_w = 0.1f;          // Weight for Z location loss constraints
 static float dist_loss_2d_w = 1.0f;        // Weight for 2D distance constraints
 static float dist_loss_3d_w = 2.0f;        // Weight for 3D distance constraints
-static int nonlocal_dist_check_radius = 6; // Grid radius for candidate spacing guard
-static float nonlocal_dist_max_rel_err = 1.0f; // Reject if medium-range distance differs by more than this fraction
-static int dist_loss_3d_long_radius = 2;    // Extra 3D distance residual radius
-static float dist_loss_3d_long_w_scale = 0.5f; // Weight multiplier for extra residuals
+static int sdir_3d_radius = 2;             // Symmetric-Dirichlet metric radius, in grid strides
+static float sdir_3d_w = 0.5f;             // Weight for local 3D metric preservation
+static float sdir_3d_candidate_max = 4.0f; // Reject candidates with a worse local metric residual
 static float straight_min_count = 1.0f;    // Minimum number of straight constraints
 static int inlier_base_threshold = 20;     // Starting threshold for inliers
 
@@ -552,25 +551,50 @@ static int add_surftrack_distloss_3D(cv::Mat_<cv::Vec3d> &points, const cv::Vec2
     return 1;
 }
 
-static int add_surftrack_long_distlosses_3D(cv::Mat_<cv::Vec3d> &points, const cv::Vec2i &p, ceres::Problem &problem,
-    const cv::Mat_<uint8_t> &state, float unit, int flags = 0)
+static int add_surftrack_sdirloss_3D(cv::Mat_<cv::Vec3d> &points, const cv::Vec2i &p, int stride,
+    ceres::Problem &problem, const cv::Mat_<uint8_t> &state, float unit)
 {
-    if (dist_loss_3d_long_radius < 2 || dist_loss_3d_long_w_scale <= 0.0f)
+    if (sdir_3d_w <= 0.0f || stride < 1)
+        return 0;
+
+    const cv::Vec2i pu = p + cv::Vec2i(0, stride);
+    const cv::Vec2i pv = p + cv::Vec2i(stride, 0);
+    if (p[0] < 0 || p[0] >= state.rows || p[1] < 0 || p[1] >= state.cols)
+        return 0;
+    if (pu[0] < 0 || pu[0] >= state.rows || pu[1] < 0 || pu[1] >= state.cols)
+        return 0;
+    if (pv[0] < 0 || pv[0] >= state.rows || pv[1] < 0 || pv[1] >= state.cols)
+        return 0;
+    if ((state(p) & (STATE_COORD_VALID | STATE_LOC_VALID)) == 0)
+        return 0;
+    if ((state(pu) & (STATE_COORD_VALID | STATE_LOC_VALID)) == 0)
+        return 0;
+    if ((state(pv) & (STATE_COORD_VALID | STATE_LOC_VALID)) == 0)
+        return 0;
+    if (points(p)[0] == -1 || points(pu)[0] == -1 || points(pv)[0] == -1)
+        return 0;
+
+    problem.AddResidualBlock(
+        SymmetricDirichletLoss::Create(unit * stride, sdir_3d_w, 1e-8, 1e-2),
+        new ceres::CauchyLoss(1.0),
+        &points(p)[0],
+        &points(pu)[0],
+        &points(pv)[0]);
+
+    return 1;
+}
+
+static int add_surftrack_sdirlosses_3D(cv::Mat_<cv::Vec3d> &points, const cv::Vec2i &p, ceres::Problem &problem,
+    const cv::Mat_<uint8_t> &state, float unit)
+{
+    if (sdir_3d_radius < 1 || sdir_3d_w <= 0.0f)
         return 0;
 
     int count = 0;
-    const float weight = dist_loss_3d_w * dist_loss_3d_long_w_scale;
-    for (int dy = -dist_loss_3d_long_radius; dy <= dist_loss_3d_long_radius; ++dy) {
-        for (int dx = -dist_loss_3d_long_radius; dx <= dist_loss_3d_long_radius; ++dx) {
-            const int cheb = std::max(std::abs(dy), std::abs(dx));
-            if (cheb < 2 || cheb > dist_loss_3d_long_radius)
-                continue;
-            const cv::Vec2i off{dy, dx};
-            const cv::Vec2i q = p + off;
-            if (q[0] < 0 || q[0] >= state.rows || q[1] < 0 || q[1] >= state.cols)
-                continue;
-            count += add_surftrack_distloss_3D(points, p, off, problem, state, unit, flags, nullptr, weight);
-        }
+    for (int stride = 1; stride <= sdir_3d_radius; ++stride) {
+        count += add_surftrack_sdirloss_3D(points, p, stride, problem, state, unit);
+        count += add_surftrack_sdirloss_3D(points, p - cv::Vec2i(0, stride), stride, problem, state, unit);
+        count += add_surftrack_sdirloss_3D(points, p - cv::Vec2i(stride, 0), stride, problem, state, unit);
     }
 
     return count;
@@ -591,37 +615,33 @@ static int cond_surftrack_distloss_3D(int type, QuadSurface *sm, cv::Mat_<cv::Ve
     return count;
 }
 
-static int cond_surftrack_long_distlosses_3D(QuadSurface *sm, cv::Mat_<cv::Vec3d> &points, const cv::Vec2i &p,
-    SurfTrackerData &data, ceres::Problem &problem, const cv::Mat_<uint8_t> &state, float unit, int flags = 0)
+static int cond_surftrack_sdirloss_3D(int type, QuadSurface *sm, cv::Mat_<cv::Vec3d> &points, const cv::Vec2i &p, int stride,
+    SurfTrackerData &data, ceres::Problem &problem, const cv::Mat_<uint8_t> &state, float unit)
 {
-    if (dist_loss_3d_long_radius < 2 || dist_loss_3d_long_w_scale <= 0.0f)
+    resId_t id(type, sm, p);
+    if (data.hasResId(id))
+        return 0;
+
+    const int count = add_surftrack_sdirloss_3D(points, p, stride, problem, state, unit);
+    if (count) {
+        data.resId(id) = nullptr;
+    }
+
+    return count;
+}
+
+static int cond_surftrack_sdirlosses_3D(QuadSurface *sm, cv::Mat_<cv::Vec3d> &points, const cv::Vec2i &p,
+    SurfTrackerData &data, ceres::Problem &problem, const cv::Mat_<uint8_t> &state, float unit)
+{
+    if (sdir_3d_radius < 1 || sdir_3d_w <= 0.0f)
         return 0;
 
     int count = 0;
     int type = 20;
-    const float weight = dist_loss_3d_w * dist_loss_3d_long_w_scale;
-    for (int dy = -dist_loss_3d_long_radius; dy <= dist_loss_3d_long_radius; ++dy) {
-        for (int dx = -dist_loss_3d_long_radius; dx <= dist_loss_3d_long_radius; ++dx, ++type) {
-            const int cheb = std::max(std::abs(dy), std::abs(dx));
-            if (cheb < 2 || cheb > dist_loss_3d_long_radius)
-                continue;
-
-            const cv::Vec2i off{dy, dx};
-            const cv::Vec2i q = p + off;
-            if (q[0] < 0 || q[0] >= state.rows || q[1] < 0 || q[1] >= state.cols)
-                continue;
-
-            resId_t id(type, sm, p, p + off);
-            if (data.hasResId(id))
-                continue;
-
-            ceres::ResidualBlockId res;
-            const int added = add_surftrack_distloss_3D(points, p, off, problem, state, unit, flags, &res, weight);
-            if (added) {
-                data.resId(id) = res;
-                count += added;
-            }
-        }
+    for (int stride = 1; stride <= sdir_3d_radius; ++stride) {
+        count += cond_surftrack_sdirloss_3D(type++, sm, points, p, stride, data, problem, state, unit);
+        count += cond_surftrack_sdirloss_3D(type++, sm, points, p - cv::Vec2i(0, stride), stride, data, problem, state, unit);
+        count += cond_surftrack_sdirloss_3D(type++, sm, points, p - cv::Vec2i(stride, 0), stride, data, problem, state, unit);
     }
 
     return count;
@@ -765,7 +785,7 @@ static int surftrack_add_local(QuadSurface *sm, const cv::Vec2i& p, SurfTrackerD
         count += add_surftrack_distloss_3D(points, p, {1,-1}, problem, state, step*src_step, flags);
         count += add_surftrack_distloss_3D(points, p, {-1,1}, problem, state, step*src_step, flags);
         count += add_surftrack_distloss_3D(points, p, {-1,-1}, problem, state, step*src_step, flags);
-        count += add_surftrack_long_distlosses_3D(points, p, problem, state, step*src_step, flags);
+        count += add_surftrack_sdirlosses_3D(points, p, problem, state, step*src_step);
 
         //horizontal
         count_straight += add_surftrack_straightloss_3D(p, {0,-2},{0,-1},{0,0}, points, problem, state);
@@ -837,7 +857,7 @@ static int surftrack_add_global(QuadSurface *sm, const cv::Vec2i& p, SurfTracker
         count += cond_surftrack_distloss_3D(2, sm, points, p, {1,-1}, data, problem, state, step, flags);
         count += cond_surftrack_distloss_3D(3, sm, points, p, {-1,1}, data, problem, state, step, flags);
         count += cond_surftrack_distloss_3D(3, sm, points, p, {-1,-1}, data, problem, state, step, flags);
-        count += cond_surftrack_long_distlosses_3D(sm, points, p, data, problem, state, step, flags);
+        count += cond_surftrack_sdirlosses_3D(sm, points, p, data, problem, state, step);
 
         //horizontal
         count += cond_surftrack_straightloss_3D(4, sm, p, {0,-2},{0,-1},{0,0}, points, data, problem, state, flags);
@@ -917,42 +937,77 @@ static double local_cost_destructive(QuadSurface *sm, const cv::Vec2i& p, SurfTr
 }
 
 
-static bool nonlocal_distance_consistent(const cv::Vec2i& p, const cv::Vec3d& coord,
+static bool candidate_coord_at(const cv::Vec2i& candidate_p, const cv::Vec3d& candidate_coord,
+    const cv::Vec2i& p, const cv::Mat_<uint8_t>& state, const cv::Mat_<cv::Vec3d>& points, cv::Vec3d& out)
+{
+    if (p[0] < 0 || p[0] >= state.rows || p[1] < 0 || p[1] >= state.cols)
+        return false;
+    if (p == candidate_p) {
+        out = candidate_coord;
+        return out[0] != -1;
+    }
+    if ((state(p) & (STATE_LOC_VALID | STATE_COORD_VALID)) == 0)
+        return false;
+    if (points(p)[0] == -1)
+        return false;
+
+    out = points(p);
+    return true;
+}
+
+static bool candidate_sdir_residual(const cv::Vec2i& candidate_p, const cv::Vec3d& candidate_coord,
+    const cv::Vec2i& origin, int stride, const cv::Mat_<uint8_t>& state, const cv::Mat_<cv::Vec3d>& points,
+    float unit, double& residual)
+{
+    cv::Vec3d p;
+    cv::Vec3d pu;
+    cv::Vec3d pv;
+    if (!candidate_coord_at(candidate_p, candidate_coord, origin, state, points, p))
+        return false;
+    if (!candidate_coord_at(candidate_p, candidate_coord, origin + cv::Vec2i(0, stride), state, points, pu))
+        return false;
+    if (!candidate_coord_at(candidate_p, candidate_coord, origin + cv::Vec2i(stride, 0), state, points, pv))
+        return false;
+
+    const double scaled_unit = static_cast<double>(unit) * static_cast<double>(stride);
+    if (scaled_unit <= 0.0)
+        return false;
+
+    const cv::Vec3d eu = (pu - p) / scaled_unit;
+    const cv::Vec3d ev = (pv - p) / scaled_unit;
+
+    const double a = eu.dot(eu);
+    const double c = ev.dot(ev);
+    const double b = eu.dot(ev);
+    const double trG = a + c;
+    const double detG = a * c - b * b;
+    const double det_safe = detG + 1e-8 + 1e-2 * trG;
+    if (det_safe <= 0.0)
+        return false;
+
+    const double energy = trG + trG / det_safe;
+    residual = std::abs(energy - 4.0);
+    return true;
+}
+
+static bool local_metric_consistent(const cv::Vec2i& p, const cv::Vec3d& coord,
     const cv::Mat_<uint8_t>& state, const cv::Mat_<cv::Vec3d>& points, float step, float src_step)
 {
-    if (nonlocal_dist_check_radius < 2 || nonlocal_dist_max_rel_err <= 0.0f)
+    if (sdir_3d_radius < 1 || sdir_3d_candidate_max <= 0.0f)
         return true;
 
-    const int y0 = std::max(0, p[0] - nonlocal_dist_check_radius);
-    const int y1 = std::min(state.rows - 1, p[0] + nonlocal_dist_check_radius);
-    const int x0 = std::max(0, p[1] - nonlocal_dist_check_radius);
-    const int x1 = std::min(state.cols - 1, p[1] + nonlocal_dist_check_radius);
-
-    for (int y = y0; y <= y1; ++y) {
-        for (int x = x0; x <= x1; ++x) {
-            if (y == p[0] && x == p[1])
+    const float unit = step * src_step;
+    for (int stride = 1; stride <= sdir_3d_radius; ++stride) {
+        const cv::Vec2i origins[] = {
+            p,
+            p - cv::Vec2i(0, stride),
+            p - cv::Vec2i(stride, 0)
+        };
+        for (const cv::Vec2i& origin : origins) {
+            double residual = 0.0;
+            if (!candidate_sdir_residual(p, coord, origin, stride, state, points, unit, residual))
                 continue;
-            if ((state(y, x) & (STATE_LOC_VALID | STATE_COORD_VALID)) == 0)
-                continue;
-            if (points(y, x)[0] == -1)
-                continue;
-
-            const double dy = static_cast<double>(y - p[0]);
-            const double dx = static_cast<double>(x - p[1]);
-            const double grid_dist = std::sqrt(dy * dy + dx * dx);
-            if (grid_dist < 2.0 || grid_dist > static_cast<double>(nonlocal_dist_check_radius))
-                continue;
-
-            const double target = static_cast<double>(step) * static_cast<double>(src_step) * grid_dist;
-            if (target <= 0.0)
-                continue;
-
-            const double actual = cv::norm(coord - points(y, x));
-            if (actual <= 0.0)
-                return false;
-
-            const double rel_err = actual > target ? actual / target - 1.0 : target / actual - 1.0;
-            if (rel_err > nonlocal_dist_max_rel_err)
+            if (residual > static_cast<double>(sdir_3d_candidate_max))
                 return false;
         }
     }
@@ -1478,10 +1533,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     z_loc_loss_w = params.value("z_loc_loss_w", 0.1f);                  // Weight for Z location loss constraints
     dist_loss_2d_w = params.value("dist_loss_2d_w", 1.0f);              // Weight for 2D distance constraints
     dist_loss_3d_w = params.value("dist_loss_3d_w", 2.0f);              // Weight for 3D distance constraints
-    nonlocal_dist_check_radius = params.value("nonlocal_dist_check_radius", 6);
-    nonlocal_dist_max_rel_err = params.value("nonlocal_dist_max_rel_err", 1.0f);
-    dist_loss_3d_long_radius = params.value("dist_loss_3d_long_radius", 2);
-    dist_loss_3d_long_w_scale = params.value("dist_loss_3d_long_w_scale", 0.5f);
+    sdir_3d_radius = params.value("sdir_3d_radius", 2);
+    sdir_3d_w = params.value("sdir_3d_w", 0.5f);
+    sdir_3d_candidate_max = params.value("sdir_3d_candidate_max", 4.0f);
     straight_min_count = params.value("straight_min_count", 1.0f);      // Minimum number of straight constraints
     inlier_base_threshold = params.value("inlier_base_threshold", 20);  // Starting threshold for inliers
 
@@ -1523,10 +1577,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::cout << "  z_loc_loss_w: " << z_loc_loss_w << std::endl;
     std::cout << "  dist_loss_2d_w: " << dist_loss_2d_w << std::endl;
     std::cout << "  dist_loss_3d_w: " << dist_loss_3d_w << std::endl;
-    std::cout << "  nonlocal_dist_check_radius: " << nonlocal_dist_check_radius << std::endl;
-    std::cout << "  nonlocal_dist_max_rel_err: " << nonlocal_dist_max_rel_err << std::endl;
-    std::cout << "  dist_loss_3d_long_radius: " << dist_loss_3d_long_radius << std::endl;
-    std::cout << "  dist_loss_3d_long_w_scale: " << dist_loss_3d_long_w_scale << std::endl;
+    std::cout << "  sdir_3d_radius: " << sdir_3d_radius << std::endl;
+    std::cout << "  sdir_3d_w: " << sdir_3d_w << std::endl;
+    std::cout << "  sdir_3d_candidate_max: " << sdir_3d_candidate_max << std::endl;
     std::cout << "  use_patch_cache: "
               << (use_patch_cache ? "true" : "false") << std::endl;
     if (external_surface_patch_index) {
@@ -2386,7 +2439,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
                 state(p) = 0;
 
-                if (!nonlocal_distance_consistent(p, coord, state, points, step, src_step)) {
+                if (!local_metric_consistent(p, coord, state, points, step, src_step)) {
                     data_th.erase(ref_surf, p);
                     continue;
                 }
@@ -2464,7 +2517,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                     // Final guard: reject best candidate outside z-range
                     best_inliers = -1;
                     best_ref_seed = false;
-                } else if (!nonlocal_distance_consistent(p, best_coord, state, points, step, src_step)) {
+                } else if (!local_metric_consistent(p, best_coord, state, points, step, src_step)) {
                     best_inliers = -1;
                     best_ref_seed = false;
                 } else {
