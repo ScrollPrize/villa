@@ -32,6 +32,12 @@ __global__ void sparse_grid_sample_3d_u8_kernel(
     float py = (grid[grid_base + 1 * grid_stride_c] - offset[1]) * inv_scale[1];
     float pz = (grid[grid_base + 2 * grid_stride_c] - offset[2]) * inv_scale[2];
 
+    // NaN/Inf guard: non-finite coords → output 0
+    if (!isfinite(px) || !isfinite(py) || !isfinite(pz)) {
+        for (int c = 0; c < C; c++) out[(long long)c * N + n] = 0;
+        return;
+    }
+
     // Chunk coord
     int ci_x = (int)floorf(px / 32.0f);
     int ci_y = (int)floorf(py / 32.0f);
