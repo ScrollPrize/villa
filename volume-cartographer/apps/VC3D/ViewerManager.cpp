@@ -56,8 +56,12 @@ ViewerManager::ViewerManager(CState* state,
     const float minHigh = std::min(_volumeWindowLow + 1.0f, 255.0f);
     _volumeWindowHigh = std::clamp(storedBaseHigh, minHigh, 255.0f);
 
-    const int storedSampling = settings.value(viewer::INTERSECTION_SAMPLING_STRIDE, viewer::INTERSECTION_SAMPLING_STRIDE_DEFAULT).toInt();
-    _surfacePatchSamplingStride = std::max(1, storedSampling);
+    const bool strideUserSet = settings.value(viewer::INTERSECTION_SAMPLING_STRIDE_USER_SET, false).toBool();
+    const int storedSampling = settings.value(viewer::INTERSECTION_SAMPLING_STRIDE,
+                                              viewer::INTERSECTION_SAMPLING_STRIDE_DEFAULT).toInt();
+    _surfacePatchSamplingStride = std::max(1, strideUserSet
+                                                  ? storedSampling
+                                                  : viewer::INTERSECTION_SAMPLING_STRIDE_DEFAULT);
     const float storedThickness = settings.value(viewer::INTERSECTION_THICKNESS, viewer::INTERSECTION_THICKNESS_DEFAULT).toFloat();
     _intersectionThickness = std::max(0.0f, storedThickness);
     _intersectionMaxSurfaces = std::max(0, settings.value(viewer::INTERSECTION_MAX_SURFACES, viewer::INTERSECTION_MAX_SURFACES_DEFAULT).toInt());
@@ -338,16 +342,16 @@ void ViewerManager::setVolumeWindow(float low, float high)
 void ViewerManager::setSurfacePatchSamplingStride(int stride, bool userInitiated)
 {
     stride = std::max(1, stride);
-    if (userInitiated) {
-        _surfacePatchStrideUserSet = true;
-    }
     if (_surfacePatchSamplingStride == stride) {
         return;
     }
     _surfacePatchSamplingStride = stride;
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue(vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE, _surfacePatchSamplingStride);
+    if (userInitiated) {
+        settings.setValue(vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE, _surfacePatchSamplingStride);
+        settings.setValue(vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE_USER_SET, true);
+    }
 
     if (_surfacePatchIndex.setSamplingStride(_surfacePatchSamplingStride)) {
         _surfacePatchIndexNeedsRebuild = true;
@@ -377,6 +381,14 @@ void ViewerManager::setIntersectionMaxSurfaces(int limit)
 SurfacePatchIndex* ViewerManager::surfacePatchIndex()
 {
     rebuildSurfacePatchIndexIfNeeded();
+    if (_surfacePatchIndex.empty()) {
+        return nullptr;
+    }
+    return &_surfacePatchIndex;
+}
+
+SurfacePatchIndex* ViewerManager::surfacePatchIndexIfReady()
+{
     if (_surfacePatchIndex.empty()) {
         return nullptr;
     }
@@ -485,35 +497,7 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
         _surfacePatchIndex.clear();
         _indexedSurfaceIds.clear();
         _surfacePatchIndexNeedsRebuild = false;
-        _surfacePatchStrideTiered = false;
-        _targetRefinedStride = 0;
         return;
-    }
-
-    // Apply tiered default stride only on the first prime per surface set.
-    // Subsequent primes (refinement step, edits) preserve the current stride
-    // and the (possibly already-consumed) refinement target. Without this
-    // gate the refinement loop ping-pongs between defaultStride and 1
-    // forever and the index is constantly torn down.
-    const size_t surfaceCount = quadSurfaces.size();
-    if (!_surfacePatchStrideUserSet && !_surfacePatchStrideTiered) {
-        // Coarse stride first for fast initial display, then refine all
-        // the way down to stride 1 in one async step.
-        int defaultStride;
-        if (surfaceCount > 2500) {
-            defaultStride = 32;
-        } else if (surfaceCount >= 500) {
-            defaultStride = 16;
-        } else if (surfaceCount >= 100) {
-            defaultStride = 8;
-        } else if (surfaceCount >= 30) {
-            defaultStride = 4;
-        } else {
-            defaultStride = 2;
-        }
-        _targetRefinedStride = 1;
-        _surfacePatchStrideTiered = true;
-        setSurfacePatchSamplingStride(defaultStride, false);
     }
 
     // Clear rebuild flag since we're about to do an async build
@@ -586,18 +570,7 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
                             << "at stride" << _surfacePatchSamplingStride;
     forEachViewer([](CTiledVolumeViewer* v) { v->renderIntersections(); });
 
-    // Check if progressive refinement is needed. Queued changes also fall
-    // through this path by re-priming at the (possibly same) current stride.
-    const bool refineRequested =
-        _targetRefinedStride > 0 && _surfacePatchSamplingStride > _targetRefinedStride;
-    if (refineRequested || queuesDirty) {
-        if (refineRequested) {
-            VC3D_DEBUG_QCINFO(lcViewerManager) << "Starting progressive refinement from stride"
-                                    << _surfacePatchSamplingStride << "to" << _targetRefinedStride;
-            const int targetStride = _targetRefinedStride;
-            _targetRefinedStride = 0;  // Clear target to prevent infinite loop
-            setSurfacePatchSamplingStride(targetStride, false);
-        }
+    if (queuesDirty) {
         _pendingSurfacePatchIndexSurfaceIds.clear();
         primeSurfacePatchIndicesAsync();
     } else {

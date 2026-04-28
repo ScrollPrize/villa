@@ -20,6 +20,7 @@
 #include <utility>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <fcntl.h>
 #include <sys/mman.h>
@@ -1596,8 +1597,12 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     const int stride = impl_->tileStride;
     const float padding = bboxPadding;
 
+    const bool debugLogging = DebugLoggingEnabled();
+
     // Pre-create all masks (sequential, enables thread-safe parallel access)
-    std::cout << "[SurfacePatchIndex] creating masks for " << surfaceCount << " surfaces" << std::endl;
+    if (debugLogging) {
+        std::cout << "[SurfacePatchIndex] creating masks for " << surfaceCount << " surfaces" << std::endl;
+    }
     for (const auto& item : mappedSurfaces) {
         Impl::SurfaceRecord& rec = impl_->surfaceRecords[item.surface.get()];
         rec.surface = item.surface;
@@ -1624,7 +1629,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
         }
 
         const size_t done = indexedSurfaces.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (done == surfaceCount || done % 1000 == 0) {
+        if (debugLogging && (done == surfaceCount || done % 1000 == 0)) {
             #pragma omp critical(surface_patch_index_progress)
             {
                 const double seconds = std::chrono::duration<double>(
@@ -1637,7 +1642,9 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     }
 
     // Merge entries from all surfaces
-    std::cout << "[SurfacePatchIndex] merging entries" << std::endl;
+    if (debugLogging) {
+        std::cout << "[SurfacePatchIndex] merging entries" << std::endl;
+    }
     size_t totalEntries = 0;
     for (const auto& entriesForSurface : perSurfaceEntries) {
         totalEntries += entriesForSurface.size();
@@ -1658,11 +1665,15 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     if (entries.empty()) {
         impl_->tree.reset();
     } else {
-        std::cout << "[SurfacePatchIndex] building R-tree with " << entries.size() << " entries" << std::endl;
+        if (debugLogging) {
+            std::cout << "[SurfacePatchIndex] building R-tree with " << entries.size() << " entries" << std::endl;
+        }
         impl_->tree = std::make_unique<Impl::PatchTree>(entries.begin(), entries.end());
     }
-    std::cout << "[SurfacePatchIndex] rebuild complete: surfaces=" << surfaceCount
-              << " patches=" << impl_->patchCount << std::endl;
+    if (debugLogging) {
+        std::cout << "[SurfacePatchIndex] rebuild complete: surfaces=" << surfaceCount
+                  << " patches=" << impl_->patchCount << std::endl;
+    }
 }
 
 void SurfacePatchIndex::clear()
@@ -1921,24 +1932,29 @@ void SurfacePatchIndex::forEachTriangleImpl(
         SurfacePtr ownedPtr;  // Shared ownership for TriangleCandidate
     };
     std::unordered_map<QuadSurface*, SurfaceCache> surfaceCacheMap;
-    surfaceCacheMap.reserve(filterSurfaces ? filterSurfaces->size() : 4);
+    surfaceCacheMap.reserve(std::min<std::size_t>(
+        filterSurfaces ? filterSurfaces->size() : 4, 4096));
+
+    std::unordered_set<QuadSurface*> filterSurfaceRaw;
+    if (filterSurfaces) {
+        filterSurfaceRaw.reserve(filterSurfaces->size());
+        for (const auto& surface : *filterSurfaces) {
+            if (surface) {
+                filterSurfaceRaw.insert(surface.get());
+            }
+        }
+        if (filterSurfaceRaw.empty()) {
+            return;
+        }
+    }
 
     auto emitFromPatch = [&](const Impl::Entry& entry) {
         const Impl::PatchRecord& rec = entry.second;
         if (targetSurface && rec.surface != targetSurface.get()) {
             return;
         }
-        if (filterSurfaces) {
-            bool found = false;
-            for (const auto& s : *filterSurfaces) {
-                if (s.get() == rec.surface) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                return;
-            }
+        if (filterSurfaces && filterSurfaceRaw.find(rec.surface) == filterSurfaceRaw.end()) {
+            return;
         }
         // Optional caller-supplied bbox-level reject (e.g. plane-vs-bbox).
         // Runs before the expensive loadPatchCorners call. With the default
@@ -3065,12 +3081,16 @@ SurfacePatchIndex::computePlaneIntersections(
     viewBbox.low -= cv::Vec3f(padding, padding, padding);
     viewBbox.high += cv::Vec3f(padding, padding, padding);
 
-    // Pre-create per-target buckets so the visitor lookup is a single
-    // pointer-keyed find (no allocation, no rehash) per triangle.
-    std::unordered_map<const QuadSurface*, std::vector<TriangleSegment>*> buckets;
-    buckets.reserve(targets.size());
+    // Map raw target pointers back to their shared_ptrs. Do not pre-create
+    // result vectors for every visible surface: large VC3D sessions can have
+    // 100k+ targets, while a single viewport/plane usually intersects only a
+    // small fraction of them.
+    std::unordered_map<const QuadSurface*, SurfacePtr> targetByRaw;
+    targetByRaw.reserve(targets.size());
     for (const auto& t : targets) {
-        if (t) buckets.emplace(t.get(), &result[t]);
+        if (t) {
+            targetByRaw.emplace(t.get(), t);
+        }
     }
 
     // Patch-level reject: skip patches whose bbox lies entirely on one
@@ -3115,17 +3135,11 @@ SurfacePatchIndex::computePlaneIntersections(
         [&](const TriangleCandidate& tri) {
             auto seg = clipTriangleToPlane(tri, plane, clipTolerance);
             if (!seg) return;
-            auto it = buckets.find(tri.surface.get());
-            if (it == buckets.end()) return;
-            it->second->push_back(std::move(*seg));
+            auto it = targetByRaw.find(tri.surface.get());
+            if (it == targetByRaw.end()) return;
+            result[it->second].push_back(std::move(*seg));
         },
         bboxStraddlesPlane);
-
-    // Drop empty entries that were pre-created but never received a segment.
-    for (auto it = result.begin(); it != result.end(); ) {
-        if (it->second.empty()) it = result.erase(it);
-        else ++it;
-    }
 
     return result;
 }

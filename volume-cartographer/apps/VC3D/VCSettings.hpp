@@ -112,12 +112,13 @@ namespace viewer {
     constexpr auto INTERSECTION_OPACITY = "viewer/intersection_opacity";
     constexpr auto INTERSECTION_THICKNESS = "viewer/intersection_thickness";
     constexpr auto INTERSECTION_SAMPLING_STRIDE = "viewer/intersection_sampling_stride";
+    constexpr auto INTERSECTION_SAMPLING_STRIDE_USER_SET = "viewer/intersection_sampling_stride_user_set";
 
     constexpr auto INTERSECTION_MAX_SURFACES = "viewer/intersection_max_surfaces";
 
     constexpr int INTERSECTION_OPACITY_DEFAULT = 100;
     constexpr float INTERSECTION_THICKNESS_DEFAULT = 0.0f;
-    constexpr int INTERSECTION_SAMPLING_STRIDE_DEFAULT = 2;
+    constexpr int INTERSECTION_SAMPLING_STRIDE_DEFAULT = 1;
     constexpr int INTERSECTION_MAX_SURFACES_DEFAULT = 0;  // 0 = unlimited
 
     // Axis Overlays
