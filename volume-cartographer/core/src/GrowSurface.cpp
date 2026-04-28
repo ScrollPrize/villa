@@ -1063,8 +1063,13 @@ static double local_solve(QuadSurface *sm, const cv::Vec2i &p, SurfTrackerData &
 static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat_<uint8_t> &state, cv::Mat_<cv::Vec3d> &points, const cv::Rect &used_area,
     float step, float step_src, bool inpaint = false)
 {
-    cv::Mat_<cv::Vec3f> points_hr(state.rows*step, state.cols*step, {0,0,0});
-    cv::Mat_<int> counts_hr(state.rows*step, state.cols*step, 0);
+    const int hr_rows = static_cast<int>(state.rows * step);
+    const int hr_cols = static_cast<int>(state.cols * step);
+    cv::Mat_<cv::Vec3f> points_hr(hr_rows, hr_cols, {0,0,0});
+    cv::Mat_<int> counts_hr(hr_rows, hr_cols, 0);
+    cv::Mat_<uint8_t> rejected_hr(hr_rows, hr_cols, static_cast<uint8_t>(0));
+    const double sample_outlier_dist = std::max<double>(step_src * 3.0, step * step_src);
+    const double sample_outlier_dist_sq = sample_outlier_dist * sample_outlier_dist;
     for(int j=used_area.y;j<used_area.br().y-1;j++)
         for(int i=used_area.x;i<used_area.br().x-1;i++) {
             if (state(j,i) & (STATE_LOC_VALID|STATE_COORD_VALID)
@@ -1072,6 +1077,10 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat
                 && state(j+1,i) & (STATE_LOC_VALID|STATE_COORD_VALID)
                 && state(j+1,i+1) & (STATE_LOC_VALID|STATE_COORD_VALID))
             {
+            const cv::Vec3d& c00 = points(j,i);
+            const cv::Vec3d& c01 = points(j,i+1);
+            const cv::Vec3d& c10 = points(j+1,i);
+            const cv::Vec3d& c11 = points(j+1,i+1);
             for(auto &sm : data.surfsC({j,i})) {
                 if (data.valid_int(sm,{j,i})
                     && data.valid_int(sm,{j,i+1})
@@ -1091,18 +1100,39 @@ static cv::Mat_<cv::Vec3d> surftrack_genpoints_hr(SurfTrackerData &data, cv::Mat
                             cv::Vec2f l1 = (1-fx)*l10 + fx*l11;
                             cv::Vec2f l = (1-fy)*l0 + fy*l1;
                             if (loc_valid(sm->rawPoints(), l)) {
-                                points_hr(j*step+sy,i*step+sx) += SurfTrackerData::lookup_int_loc(sm,l);
-                                counts_hr(j*step+sy,i*step+sx) += 1;
+                                cv::Vec3d c0 = (1-fx)*c00 + fx*c01;
+                                cv::Vec3d c1 = (1-fx)*c10 + fx*c11;
+                                cv::Vec3d expected = (1-fy)*c0 + fy*c1;
+                                cv::Vec3d sample = SurfTrackerData::lookup_int_loc(sm,l);
+                                const cv::Vec3d delta = sample - expected;
+                                const int y = j*step+sy;
+                                const int x = i*step+sx;
+                                if (delta.dot(delta) <= sample_outlier_dist_sq) {
+                                    points_hr(y,x) += sample;
+                                    counts_hr(y,x) += 1;
+                                }
+                                else {
+                                    rejected_hr(y,x) = 1;
+                                }
                             }
                         }
                 }
             }
+            for(int sy=0;sy<=step;sy++)
+                for(int sx=0;sx<=step;sx++) {
+                    const int y = j*step+sy;
+                    const int x = i*step+sx;
+                    if (!counts_hr(y,x) && rejected_hr(y,x)) {
+                        float fx = sx/step;
+                        float fy = sy/step;
+                        cv::Vec3d c0 = (1-fx)*c00 + fx*c01;
+                        cv::Vec3d c1 = (1-fx)*c10 + fx*c11;
+                        cv::Vec3d c = (1-fy)*c0 + fy*c1;
+                        points_hr(y,x) = c;
+                        counts_hr(y,x) = 1;
+                    }
+                }
             if (!counts_hr(j*step+1,i*step+1) && inpaint) {
-                const cv::Vec3d& c00 = points(j,i);
-                const cv::Vec3d& c01 = points(j,i+1);
-                const cv::Vec3d& c10 = points(j+1,i);
-                const cv::Vec3d& c11 = points(j+1,i+1);
-
                 for(int sy=0;sy<=step;sy++)
                     for(int sx=0;sx<=step;sx++) {
                         if (!counts_hr(j*step+sy,i*step+sx)) {
@@ -1518,6 +1548,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     float src_step = params.value("src_step", 20);
     float step = params.value("step", 10);
     int max_width = params.value("max_width", 80000);
+    int max_height = std::max(1, params.value("max_height", 50000));
     const bool use_patch_cache = params.value("use_patch_cache", false);
     const bool debug_images = params.value("debug_images", false);
     std::filesystem::path surface_patch_cache_dir = tgt_dir / ".surface_patch_index_cache";
@@ -1578,6 +1609,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::cout << "  z_loc_loss_w: " << z_loc_loss_w << std::endl;
     std::cout << "  dist_loss_2d_w: " << dist_loss_2d_w << std::endl;
     std::cout << "  dist_loss_3d_w: " << dist_loss_3d_w << std::endl;
+    std::cout << "  max_width: " << max_width << std::endl;
+    std::cout << "  max_height: " << max_height << std::endl;
     std::cout << "  sdir_3d_radius: " << sdir_3d_radius << std::endl;
     std::cout << "  sdir_3d_w: " << sdir_3d_w << std::endl;
     std::cout << "  sdir_3d_global_w: " << sdir_3d_global_w << std::endl;
@@ -1713,7 +1746,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     //1k ~ 1cm, scaled by sliding_w_scale parameter
     int sliding_w = static_cast<int>(1000/src_step/step*2 * sliding_w_scale);
     int w = 2000/src_step/step*2+10+2*closing_r;
-    int h = 15000/src_step/step*2+10+2*closing_r;
+    int h = max_height/src_step/step*2+10+2*closing_r;
     const bool has_growth_directions = params.contains("growth_directions") && params["growth_directions"].is_array();
     bool grow_down = false;
     bool grow_right = true;
@@ -2884,8 +2917,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
         //continue expansion
         const int max_grid_extent = std::max(1, static_cast<int>(max_width / step));
+        const int max_grid_height = std::max(1, static_cast<int>(max_height / step));
         const int max_grid_w = std::min(max_grid_extent, grid_limit_w);
-        const int max_grid_h = std::min(max_grid_extent, grid_limit_h);
+        const int max_grid_h = std::min(max_grid_height, grid_limit_h);
         const auto remaining_extra = [](int max_extra, int expanded) {
             if (max_extra == std::numeric_limits<int>::max()) {
                 return std::numeric_limits<int>::max();

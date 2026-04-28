@@ -639,9 +639,16 @@ void SegmentationModule::onActiveSegmentChanged(QuadSurface* newSurface)
     // Check if new surface has an approval mask
     bool hasApprovalMask = false;
     if (newSurface) {
-        cv::Mat approvalChannel = newSurface->channel("approval", SURF_CHANNEL_NORESIZE);
-        hasApprovalMask = !approvalChannel.empty();
-        qCInfo(lcSegModule) << "  New surface has approval mask:" << hasApprovalMask;
+        try {
+            cv::Mat approvalChannel = newSurface->channel("approval", SURF_CHANNEL_NORESIZE);
+            hasApprovalMask = !approvalChannel.empty();
+            qCInfo(lcSegModule) << "  New surface has approval mask:" << hasApprovalMask;
+        } catch (const std::exception& e) {
+            qCWarning(lcSegModule)
+                << "  Could not inspect approval mask for active segment:"
+                << e.what();
+            newSurface = nullptr;
+        }
     }
 
     if (_showApprovalMask) {
