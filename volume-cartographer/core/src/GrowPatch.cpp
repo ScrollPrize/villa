@@ -3361,6 +3361,9 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
             if (allowed_growth_mask->rows != resume_points.rows || allowed_growth_mask->cols != resume_points.cols) {
                 throw std::runtime_error("allowed growth mask size does not match resume surface size.");
             }
+            if (allowed_growth_mask->channels() != 1) {
+                throw std::runtime_error("allowed growth mask must be single-channel.");
+            }
             trace_data.allowed_growth_mask = cv::Mat_<uchar>(trace_params.state.size(), static_cast<uchar>(0));
             cv::Mat normalized_mask;
             if (allowed_growth_mask->type() == CV_8UC1) {
@@ -3368,16 +3371,10 @@ QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *ca
             } else {
                 allowed_growth_mask->convertTo(normalized_mask, CV_8U);
             }
-            for (int r = 0; r < normalized_mask.rows; ++r) {
-                for (int c = 0; c < normalized_mask.cols; ++c) {
-                    if (normalized_mask.at<uchar>(r, c) != 0) {
-                        trace_data.allowed_growth_mask(resume_pad_y + r, resume_pad_x + c) = 1;
-                    }
-                }
-            }
-            std::cout << "Allowed growth mask cells: "
-                      << cv::countNonZero(trace_data.allowed_growth_mask)
-                      << std::endl;
+
+            cv::Mat nonzero_mask;
+            cv::compare(normalized_mask, 0, nonzero_mask, cv::CMP_NE);
+            trace_data.allowed_growth_mask(used_area).setTo(1, nonzero_mask);
         }
  
         double min_val, max_val;
