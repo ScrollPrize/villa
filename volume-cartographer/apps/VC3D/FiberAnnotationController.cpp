@@ -325,9 +325,9 @@ void FiberAnnotationController::onAnimTick()
         return;
     }
 
-    // Triangle wave: 0→1→0 over kDurationMs
+    // Triangle wave: 1→0→1 over kDurationMs (start at current, go to ref, back)
     float frac = static_cast<float>(elapsed) / static_cast<float>(kDurationMs);
-    float t = 1.0f - std::abs(2.0f * frac - 1.0f);
+    float t = std::abs(2.0f * frac - 1.0f);
 
     // Interpolate
     cv::Vec3f pos = _animRefPos * (1.0f - t) + _animAnnotPos * t;
