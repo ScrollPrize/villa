@@ -127,6 +127,7 @@ private:
     QString remoteCacheDirectory() const;
 
     CWindow* _window{nullptr};
+    bool _inAutosaveRestore{false};
 
     QMenu* _fileMenu{nullptr};
     QMenu* _editMenu{nullptr};

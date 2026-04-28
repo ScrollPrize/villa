@@ -26,6 +26,7 @@
 #include "vc/core/types/Segmentation.hpp"
 
 #include <QAction>
+#include <QScopeGuard>
 #include <QApplication>
 #include <QClipboard>
 #include <QFutureWatcher>
@@ -536,9 +537,9 @@ bool MenuActionController::tryRestoreAutosavedProject()
 
     _window->_state->setPackage(VolumePkg::New(proj), proj);
 
-    // Kick off any remote sources so populated cache metadata can arrive
-    // asynchronously (dedup-safe for local sources already ingested by
-    // VolumePkg::New above).
+    _inAutosaveRestore = true;
+    auto restoreGuard = qScopeGuard([this]{ _inAutosaveRestore = false; });
+
     auto loadAllOfType = [&](vc::DataSourceType type) {
         for (const auto* ds : proj->sources_of_type(type)) {
             if (ds) loadSource(*proj, *ds);
@@ -964,14 +965,13 @@ void MenuActionController::loadSourceRemoteAsync(const vc::Volpkg& proj,
     // Cooperative cancellation: worker checks this between segments.
     auto cancelled = std::make_shared<std::atomic<bool>>(false);
 
-    // Temporary status-bar cancel button, cleaned up when the future
-    // completes (see the finished handler below). Skip widget construction
-    // if the main window isn't shown yet — happens during autosave restore
-    // where the status bar's layout isn't activated yet and addPermanentWidget
-    // crashes inside QPixmapIconEngine.
+    // Skip the cancel/status widgets during autosave restore — touching the
+    // status bar's layout from inside the restore queue crashes Qt's layout
+    // machinery (SIGBUS through a stale vtable). The user sees a status
+    // message anyway via the parent flow.
     QPushButton* cancelBtn = nullptr;
     QLabel* statusLbl = nullptr;
-    if (_window && _window->isVisible() && _window->statusBar()) {
+    if (_window && !_inAutosaveRestore && _window->statusBar()) {
         statusLbl = new QLabel(
             tr("Loading remote %1...").arg(QString::fromStdString(url)),
             _window->statusBar());
