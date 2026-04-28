@@ -306,6 +306,7 @@ void CVolumeViewerView::keyPressEvent(QKeyEvent *event)
     }
 
     QGraphicsView::keyPressEvent(event);
+    event->ignore();  // let unhandled keys propagate to CWindow
 }
 
 void CVolumeViewerView::keyReleaseEvent(QKeyEvent *event)
