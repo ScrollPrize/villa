@@ -103,6 +103,35 @@ def _checkpoint_normalization_scheme(checkpoint_data):
     return image_normalization
 
 
+def _select_evenly_spaced_middle_indices(candidate_indices, limit):
+    """Select a deterministic, small representative subset of patch indices."""
+    candidates = list(candidate_indices)
+    if limit >= len(candidates):
+        return candidates
+    if limit == 1:
+        return [candidates[len(candidates) // 2]]
+
+    positions = np.linspace(0, len(candidates) - 1, num=limit)
+    selected_offsets = []
+    seen = set()
+    for pos in positions:
+        offset = int(round(float(pos)))
+        offset = min(max(offset, 0), len(candidates) - 1)
+        if offset not in seen:
+            selected_offsets.append(offset)
+            seen.add(offset)
+
+    offset = 0
+    while len(selected_offsets) < limit and offset < len(candidates):
+        if offset not in seen:
+            selected_offsets.append(offset)
+            seen.add(offset)
+        offset += 1
+
+    selected_offsets.sort()
+    return [candidates[offset] for offset in selected_offsets]
+
+
 class _InferenceDeepSupervisionWrapper(torch.nn.Module):
     """Collapse multi-scale train-time outputs to highest-resolution inference outputs."""
 
@@ -210,6 +239,7 @@ class Inferer():
                  model_type: str = 'auto',
                  input_anon: bool = False,
                  model_cache_dir: str = DEFAULT_MODEL_CACHE_DIR,
+                 max_patches: int = None,
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -244,6 +274,7 @@ class Inferer():
         self.model_type = model_type
         self.input_anon = input_anon
         self.model_cache_dir = model_cache_dir
+        self.max_patches = max_patches
         self.model_patch_size = None
         self.num_classes = None
 
@@ -271,6 +302,8 @@ class Inferer():
             raise ValueError(f"Invalid overlap value {self.overlap}. Must be between 0 and 1.")
         if self.tta_type not in ['mirroring', 'rotation']:
              raise ValueError(f"Invalid tta_type '{self.tta_type}'. Must be 'mirroring' or 'rotation'.")
+        if self.max_patches is not None and self.max_patches < 1:
+            raise ValueError(f"max_patches must be >= 1 when provided, got {self.max_patches}.")
         # Defer patch size validation until after model loading if not explicitly provided
 
         # --- Output Setup ---
@@ -593,6 +626,37 @@ class Inferer():
         
         return model_info
 
+    def _limit_dataset_patches(self):
+        if self.max_patches is None:
+            return
+
+        positions = getattr(self.dataset, 'all_positions', None)
+        if not positions or len(positions) <= self.max_patches:
+            return
+
+        candidate_indices = range(len(positions))
+        non_empty_mask = getattr(self.dataset, 'non_empty_mask', None)
+        if non_empty_mask is not None and len(non_empty_mask) == len(positions):
+            non_empty_indices = np.flatnonzero(non_empty_mask)
+            if len(non_empty_indices) > 0:
+                candidate_indices = non_empty_indices.tolist()
+
+        selected_indices = _select_evenly_spaced_middle_indices(
+            candidate_indices,
+            min(self.max_patches, len(candidate_indices)),
+        )
+
+        self.dataset.all_positions = [positions[index] for index in selected_indices]
+        if non_empty_mask is not None and len(non_empty_mask) == len(positions):
+            self.dataset.non_empty_mask = np.asarray(non_empty_mask)[selected_indices]
+
+        if self.verbose:
+            print(
+                f"Limited part {self.part_id}/{self.num_parts} from {len(positions)} "
+                f"to {len(self.dataset.all_positions)} patch positions "
+                f"(max_patches={self.max_patches})"
+            )
+
     def _create_dataset_and_loader(self):
         # Use step_size instead of overlap (step_size is [0-1] representing stride as fraction of patch size)
         # step_size of 0.5 means 50% overlap
@@ -647,6 +711,8 @@ class Inferer():
         if not hasattr(self.dataset, expected_attr_name) or getattr(self.dataset, expected_attr_name) is None:
             raise AttributeError(f"The VCDataset instance must calculate and provide an "
                                  f"'{expected_attr_name}' attribute (list of coordinate tuples).")
+
+        self._limit_dataset_patches()
 
         self.patch_start_coords_list = getattr(self.dataset, expected_attr_name)
         self.num_total_patches = len(self.patch_start_coords_list)
@@ -1047,6 +1113,9 @@ def main():
                       help=f'Local directory used to cache models downloaded from S3. '
                            f'Only applies when --model_path is an s3:// URL. '
                            f'Default: {DEFAULT_MODEL_CACHE_DIR}')
+    parser.add_argument('--max_patches', type=int, default=None,
+                      help='Optional cap on patch positions processed by this part. '
+                           'Intended for smoke tests; production inference leaves this unset.')
     
     args = parser.parse_args()
     
@@ -1104,6 +1173,7 @@ def main():
         model_type=args.model_type,
         input_anon=args.input_anon,
         model_cache_dir=args.model_cache_dir,
+        max_patches=args.max_patches,
     )
 
     try:

@@ -17,6 +17,7 @@ from vesuvius.models.run.inference import (
     Inferer,
     _checkpoint_normalization_scheme,
     _normalize_train_py_model_config,
+    _select_evenly_spaced_middle_indices,
     _select_train_py_state_dict,
 )
 from vesuvius.models.run.finalize_outputs import FinalizeConfig, apply_finalization
@@ -105,6 +106,44 @@ def test_legacy_checkpoint_raw_weights_when_ema_validation_disabled() -> None:
 
     assert source == "model"
     torch.testing.assert_close(state_dict["weight"], torch.tensor([1.0]))
+
+
+def test_select_evenly_spaced_middle_indices_prefers_middle_for_one_patch() -> None:
+    assert _select_evenly_spaced_middle_indices([10, 20, 30, 40, 50], 1) == [30]
+
+
+def test_max_patches_prefers_non_empty_candidates() -> None:
+    inferer = Inferer.__new__(Inferer)
+    inferer.max_patches = 2
+    inferer.verbose = False
+    inferer.part_id = 0
+    inferer.num_parts = 1
+    inferer.dataset = SimpleNamespace(
+        all_positions=[(idx, 0, 0) for idx in range(6)],
+        non_empty_mask=np.array([False, True, False, True, True, False]),
+    )
+
+    inferer._limit_dataset_patches()
+
+    assert inferer.dataset.all_positions == [(1, 0, 0), (4, 0, 0)]
+    np.testing.assert_array_equal(inferer.dataset.non_empty_mask, np.array([True, True]))
+
+
+def test_max_patches_keeps_empty_fallback_when_no_non_empty_candidates() -> None:
+    inferer = Inferer.__new__(Inferer)
+    inferer.max_patches = 1
+    inferer.verbose = False
+    inferer.part_id = 0
+    inferer.num_parts = 1
+    inferer.dataset = SimpleNamespace(
+        all_positions=[(idx, 0, 0) for idx in range(5)],
+        non_empty_mask=np.array([False, False, False, False, False]),
+    )
+
+    inferer._limit_dataset_patches()
+
+    assert inferer.dataset.all_positions == [(2, 0, 0)]
+    np.testing.assert_array_equal(inferer.dataset.non_empty_mask, np.array([False]))
 
 
 def test_load_train_py_model_supports_legacy_checkpoint_with_ema(tmp_path: Path) -> None:
@@ -244,6 +283,8 @@ def test_main_accepts_input_anon(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
             "--output_dir",
             str(tmp_path / "out"),
             "--input_anon",
+            "--max_patches",
+            "1",
             "--device",
             "cpu",
         ],
@@ -251,6 +292,7 @@ def test_main_accepts_input_anon(monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 
     assert inference.main() == 0
     assert captured["input_anon"] is True
+    assert captured["max_patches"] == 1
 
 
 def test_finalization_handles_single_channel_multitask_probabilities() -> None:
