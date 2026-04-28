@@ -394,6 +394,48 @@ void appendChunksForRegion(BlockPipeline& cache, int level,
                 out.push_back({level, iz, iy, ix});
 }
 
+struct VoxelBounds {
+    float minX = std::numeric_limits<float>::max();
+    float minY = std::numeric_limits<float>::max();
+    float minZ = std::numeric_limits<float>::max();
+    float maxX = std::numeric_limits<float>::lowest();
+    float maxY = std::numeric_limits<float>::lowest();
+    float maxZ = std::numeric_limits<float>::lowest();
+
+    void include(const cv::Vec3f& p) {
+        minX = std::min(minX, p[0]);
+        minY = std::min(minY, p[1]);
+        minZ = std::min(minZ, p[2]);
+        maxX = std::max(maxX, p[0]);
+        maxY = std::max(maxY, p[1]);
+        maxZ = std::max(maxZ, p[2]);
+    }
+};
+
+VoxelBounds planeViewportBounds(const cv::Vec3f& origin,
+                                const cv::Vec3f& vxStep,
+                                const cv::Vec3f& vyStep,
+                                int w, int h,
+                                const cv::Vec3f& normal,
+                                float zMin, float zMax) {
+    VoxelBounds b;
+    const float xMax = float(std::max(0, w - 1));
+    const float yMax = float(std::max(0, h - 1));
+    const cv::Vec3f corners[4] = {
+        origin,
+        origin + vxStep * xMax,
+        origin + vyStep * yMax,
+        origin + vxStep * xMax + vyStep * yMax,
+    };
+    for (const cv::Vec3f& corner : corners) {
+        b.include(corner + normal * zMin);
+        if (zMax != zMin) {
+            b.include(corner + normal * zMax);
+        }
+    }
+    return b;
+}
+
 // Surface-aware chunk enumeration. Bbox enumeration is correct for planes
 // (the plane really does span its bbox) but disastrous for curved surfaces:
 // a flattened scroll surface might span a 4000x4000x500 voxel bbox while
@@ -1165,17 +1207,16 @@ void sampleSingleLayerAdaptiveImpl(
             TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel);
         }
     } else {
-        cv::Vec3f p0 = *origin + (*planeNormal) * zOffConst;
-        cv::Vec3f p1 = *origin + (*vx_step)*float(w-1) + (*vy_step)*float(h-1) + (*planeNormal)*zOffConst;
-        float minVx=std::min(p0[0],p1[0]), maxVx=std::max(p0[0],p1[0]);
-        float minVy=std::min(p0[1],p1[1]), maxVy=std::max(p0[1],p1[1]);
-        float minVz=std::min(p0[2],p1[2]), maxVz=std::max(p0[2],p1[2]);
+        const VoxelBounds b = planeViewportBounds(
+            *origin, *vx_step, *vy_step, w, h, *planeNormal,
+            zOffConst, zOffConst);
         thread_local std::vector<vc::cache::ChunkKey> keys;
         keys.clear();
         for (int lvl=desiredLevel; lvl<numLevels; lvl++) {
             float s = levelScale(lvl);
             appendChunksForRegion(cache, lvl,
-                minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s, keys);
+                b.minX*s, b.minY*s, b.minZ*s,
+                b.maxX*s, b.maxY*s, b.maxZ*s, keys);
         }
         viewCenterL0 = *origin
             + (*vx_step) * (float(w) * 0.5f)
@@ -1402,17 +1443,16 @@ void sampleCompositeAdaptiveImpl(
             TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel);
         }
     } else {
-        cv::Vec3f p0 = *origin + (*planeNormal) * zMin;
-        cv::Vec3f p1 = *origin + (*vx_step)*float(w-1) + (*vy_step)*float(h-1) + (*planeNormal)*zMax;
-        float minVx=std::min(p0[0],p1[0]), maxVx=std::max(p0[0],p1[0]);
-        float minVy=std::min(p0[1],p1[1]), maxVy=std::max(p0[1],p1[1]);
-        float minVz=std::min(p0[2],p1[2]), maxVz=std::max(p0[2],p1[2]);
+        const VoxelBounds b = planeViewportBounds(
+            *origin, *vx_step, *vy_step, w, h, *planeNormal,
+            zMin, zMax);
         thread_local std::vector<vc::cache::ChunkKey> keys;
         keys.clear();
         for (int lvl=desiredLevel; lvl<numLevels; lvl++) {
             float s = levelScale(lvl);
             appendChunksForRegion(cache, lvl,
-                minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s, keys);
+                b.minX*s, b.minY*s, b.minZ*s,
+                b.maxX*s, b.maxY*s, b.maxZ*s, keys);
         }
         viewCenterL0 = *origin
             + (*vx_step) * (float(w) * 0.5f)
