@@ -344,7 +344,7 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
         segYZShared->setOrigin(origin);
 
         cv::Vec3f ptr(0, 0, 0);
-        auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+        auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndexIfReady() : nullptr;
         segment->pointTo(ptr, origin, 1.0f, 1000, patchIndex);
 
         cv::Vec3f xDir = segment->coord(ptr, {1, 0, 0});

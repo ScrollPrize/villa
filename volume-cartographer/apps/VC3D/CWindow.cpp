@@ -4303,8 +4303,12 @@ void CWindow::CreateWidgets(void)
             comboIntersectionSampling->addItem(tr(opt.label), opt.stride);
         }
 
-        const int savedStride = settings.value(vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE,
-                                              vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE_DEFAULT).toInt();
+        const bool strideUserSet = settings.value(vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE_USER_SET,
+                                                  false).toBool();
+        const int savedStride = strideUserSet
+            ? settings.value(vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE,
+                             vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE_DEFAULT).toInt()
+            : vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE_DEFAULT;
         int selectedIndex = comboIntersectionSampling->findData(savedStride);
         if (selectedIndex < 0) {
             selectedIndex = comboIntersectionSampling->findData(1);
@@ -4324,7 +4328,7 @@ void CWindow::CreateWidgets(void)
                     _viewerManager->setSurfacePatchSamplingStride(stride);
                 });
 
-        // Update combobox when stride changes programmatically (e.g., tiered defaults)
+        // Update combobox when stride changes programmatically.
         if (_viewerManager) {
             connect(_viewerManager.get(),
                     &ViewerManager::samplingStrideChanged,
@@ -5546,9 +5550,18 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
             _segmentationWidget->setEditingEnabled(false);
         }
 
-        // Handle approval mask when switching segments
         if (_segmentationModule) {
-            _segmentationModule->onActiveSegmentChanged(surf.get());
+            try {
+                _segmentationModule->onActiveSegmentChanged(surf.get());
+            } catch (const std::exception& e) {
+                qWarning() << "Failed to activate surface"
+                           << surfaceId
+                           << "while it may still be writing:"
+                           << e.what();
+                _state->clearActiveSurface();
+                _state->setSurface("segmentation", nullptr, false, false);
+                surf.reset();
+            }
         }
 
         // Load corr_points_results for the new segment
@@ -5563,9 +5576,19 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
         }
     }
 
-    if (surf) {
-        _axisAlignedSliceController->applyOrientation(surf.get());
-    } else {
+    try {
+        if (surf) {
+            _axisAlignedSliceController->applyOrientation(surf.get());
+        } else {
+            _axisAlignedSliceController->applyOrientation();
+        }
+    } catch (const std::exception& e) {
+        qWarning() << "Failed to apply surface orientation for"
+                   << surfaceId
+                   << "while it may still be writing:"
+                   << e.what();
+        _state->clearActiveSurface();
+        _state->setSurface("segmentation", nullptr, false, false);
         _axisAlignedSliceController->applyOrientation();
     }
 
@@ -5590,7 +5613,17 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSu
     auto surf = _state->activeSurface().lock();
 
     if (newSurfId != previousSurfId && _segmentationModule) {
-        _segmentationModule->onActiveSegmentChanged(surf.get());
+        try {
+            _segmentationModule->onActiveSegmentChanged(surf.get());
+        } catch (const std::exception& e) {
+            qWarning() << "Failed to activate surface"
+                       << surfaceId
+                       << "while it may still be writing:"
+                       << e.what();
+            _state->clearActiveSurface();
+            _state->setSurface("segmentation", nullptr, false, false);
+            surf.reset();
+        }
 
         // Load corr_points_results for the new segment
         if (_point_collection_widget) {
@@ -5627,9 +5660,19 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSu
         }
     }
 
-    if (surf) {
-        _axisAlignedSliceController->applyOrientation(surf.get());
-    } else {
+    try {
+        if (surf) {
+            _axisAlignedSliceController->applyOrientation(surf.get());
+        } else {
+            _axisAlignedSliceController->applyOrientation();
+        }
+    } catch (const std::exception& e) {
+        qWarning() << "Failed to apply surface orientation for"
+                   << surfaceId
+                   << "while it may still be writing:"
+                   << e.what();
+        _state->clearActiveSurface();
+        _state->setSurface("segmentation", nullptr, false, false);
         _axisAlignedSliceController->applyOrientation();
     }
 
@@ -5824,7 +5867,7 @@ void CWindow::onSegmentationDirChanged(int index)
         // Set the new directory in the VolumePkg
         _state->vpkg()->setSegmentationDirectory(newDir);
 
-        // Reset stride user override so tiered defaults apply to new directory
+        // Reset stride user override for the new directory.
         if (_viewerManager) {
             _viewerManager->resetStrideUserOverride();
         }

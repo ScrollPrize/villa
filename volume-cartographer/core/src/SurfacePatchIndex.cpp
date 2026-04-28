@@ -11,6 +11,7 @@
 #include <future>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -19,10 +20,17 @@
 #include <utility>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
+
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <boost/geometry.hpp>
 #include <boost/geometry/index/rtree.hpp>
 #include <boost/iterator/function_output_iterator.hpp>
+#include <tiffio.h>
 
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -154,18 +162,238 @@ inline bool isValidSurfacePoint(const cv::Vec3f& p) noexcept
     return p[0] != -1.0f && isFinitePoint(p);
 }
 
+inline bool isValidMappedSurfacePoint(const cv::Vec3f& p) noexcept
+{
+    return p[2] > 0.0f && isFinitePoint(p);
+}
+
 inline bool isValidBounds(const cv::Vec3f& low, const cv::Vec3f& high) noexcept
 {
     return isFinitePoint(low) && isFinitePoint(high)
         && low[0] <= high[0] && low[1] <= high[1] && low[2] <= high[2];
 }
 
-std::vector<SurfacePtr> loadSurfacesInBatches(const std::vector<SurfacePtr>& surfaces)
+class FileMapping {
+public:
+    FileMapping() = default;
+    FileMapping(const FileMapping&) = delete;
+    FileMapping& operator=(const FileMapping&) = delete;
+    FileMapping(FileMapping&& other) noexcept { moveFrom(other); }
+    FileMapping& operator=(FileMapping&& other) noexcept
+    {
+        if (this != &other) {
+            close();
+            moveFrom(other);
+        }
+        return *this;
+    }
+    ~FileMapping() { close(); }
+
+    void open(const std::filesystem::path& path)
+    {
+        close();
+        fd_ = ::open(path.c_str(), O_RDONLY);
+        if (fd_ < 0) {
+            throw std::runtime_error("mmap open failed: " + path.string());
+        }
+        struct stat st {};
+        if (::fstat(fd_, &st) != 0 || st.st_size <= 0) {
+            close();
+            throw std::runtime_error("mmap stat failed: " + path.string());
+        }
+        size_ = static_cast<std::size_t>(st.st_size);
+        data_ = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
+        if (data_ == MAP_FAILED) {
+            data_ = nullptr;
+            close();
+            throw std::runtime_error("mmap failed: " + path.string());
+        }
+        // The mapping owns the pages; the descriptor is only needed for mmap().
+        ::close(fd_);
+        fd_ = -1;
+    }
+
+    const std::uint8_t* bytes(std::uint64_t offset, std::uint64_t size) const
+    {
+        if (!data_ || offset > size_ || size > size_ - offset) {
+            throw std::runtime_error("mmap TIFF strip points outside file");
+        }
+        return static_cast<const std::uint8_t*>(data_) + offset;
+    }
+
+private:
+    void close()
+    {
+        if (data_) {
+            ::munmap(data_, size_);
+            data_ = nullptr;
+        }
+        if (fd_ >= 0) {
+            ::close(fd_);
+            fd_ = -1;
+        }
+        size_ = 0;
+    }
+
+    void moveFrom(FileMapping& other) noexcept
+    {
+        fd_ = other.fd_;
+        data_ = other.data_;
+        size_ = other.size_;
+        other.fd_ = -1;
+        other.data_ = nullptr;
+        other.size_ = 0;
+    }
+
+    int fd_ = -1;
+    void* data_ = nullptr;
+    std::size_t size_ = 0;
+};
+
+class MappedTifBand {
+public:
+    void open(const std::filesystem::path& path)
+    {
+        TIFF* tif = TIFFOpen(path.string().c_str(), "r");
+        if (!tif) {
+            throw std::runtime_error("failed to open TIFF for mmap: " + path.string());
+        }
+
+        uint32_t w = 0;
+        uint32_t h = 0;
+        uint16_t spp = 1;
+        uint16_t bps = 0;
+        uint16_t fmt = SAMPLEFORMAT_UINT;
+        uint16_t compression = COMPRESSION_NONE;
+        uint32_t rowsPerStrip = 0;
+        if (!TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &w) ||
+            !TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &h)) {
+            TIFFClose(tif);
+            throw std::runtime_error("mmap TIFF missing dimensions: " + path.string());
+        }
+        TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &spp);
+        TIFFGetFieldDefaulted(tif, TIFFTAG_BITSPERSAMPLE, &bps);
+        TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLEFORMAT, &fmt);
+        TIFFGetFieldDefaulted(tif, TIFFTAG_COMPRESSION, &compression);
+        TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &rowsPerStrip);
+
+        const tstrip_t stripCount = TIFFNumberOfStrips(tif);
+        if (TIFFIsTiled(tif) || TIFFIsByteSwapped(tif) || spp != 1 ||
+            bps != 32 || fmt != SAMPLEFORMAT_IEEEFP ||
+            compression != COMPRESSION_NONE || stripCount <= 0 ||
+            rowsPerStrip == 0) {
+            std::ostringstream oss;
+            oss << "TIFF is not mmap-compatible: " << path.string()
+                << " tiled=" << TIFFIsTiled(tif)
+                << " byte_swapped=" << TIFFIsByteSwapped(tif)
+                << " spp=" << spp
+                << " bps=" << bps
+                << " sample_format=" << fmt
+                << " compression=" << compression
+                << " strips=" << stripCount
+                << " rows_per_strip=" << rowsPerStrip
+                << " height=" << h;
+            TIFFClose(tif);
+            throw std::runtime_error(oss.str());
+        }
+
+        uint64_t* offsets = nullptr;
+        uint64_t* byteCounts = nullptr;
+        if (!TIFFGetField(tif, TIFFTAG_STRIPOFFSETS, &offsets) ||
+            !TIFFGetField(tif, TIFFTAG_STRIPBYTECOUNTS, &byteCounts) ||
+            !offsets || !byteCounts) {
+            TIFFClose(tif);
+            throw std::runtime_error("mmap TIFF missing strip offsets: " + path.string());
+        }
+
+        std::vector<std::uint64_t> stripOffsets(static_cast<std::size_t>(stripCount));
+        std::vector<std::uint64_t> stripByteCounts(static_cast<std::size_t>(stripCount));
+        for (tstrip_t strip = 0; strip < stripCount; ++strip) {
+            const uint32_t firstRow = strip * rowsPerStrip;
+            const uint32_t rowsInStrip = firstRow >= h ? 0 : std::min(rowsPerStrip, h - firstRow);
+            const std::uint64_t expectedBytes =
+                static_cast<std::uint64_t>(w) * rowsInStrip * sizeof(float);
+            if (rowsInStrip == 0 || byteCounts[strip] < expectedBytes) {
+                TIFFClose(tif);
+                throw std::runtime_error("mmap TIFF strip is smaller than expected: " + path.string());
+            }
+            stripOffsets[strip] = offsets[strip];
+            stripByteCounts[strip] = byteCounts[strip];
+        }
+        TIFFClose(tif);
+
+        mapping_.open(path);
+        width_ = static_cast<int>(w);
+        height_ = static_cast<int>(h);
+        rowsPerStrip_ = static_cast<int>(rowsPerStrip);
+        stripOffsets_ = std::move(stripOffsets);
+        stripByteCounts_ = std::move(stripByteCounts);
+    }
+
+    int width() const { return width_; }
+    int height() const { return height_; }
+    float at(int row, int col) const
+    {
+        const int strip = row / rowsPerStrip_;
+        const int rowInStrip = row - strip * rowsPerStrip_;
+        const std::uint64_t offset =
+            stripOffsets_[static_cast<std::size_t>(strip)] +
+            (static_cast<std::uint64_t>(rowInStrip) * width_ + col) * sizeof(float);
+        return *reinterpret_cast<const float*>(mapping_.bytes(offset, sizeof(float)));
+    }
+
+private:
+    FileMapping mapping_;
+    std::vector<std::uint64_t> stripOffsets_;
+    std::vector<std::uint64_t> stripByteCounts_;
+    int width_ = 0;
+    int height_ = 0;
+    int rowsPerStrip_ = 0;
+};
+
+class MappedTifxyzSurface {
+public:
+    explicit MappedTifxyzSurface(const std::filesystem::path& dir)
+    {
+        x_.open(dir / "x.tif");
+        y_.open(dir / "y.tif");
+        z_.open(dir / "z.tif");
+        if (x_.width() != y_.width() || x_.width() != z_.width() ||
+            x_.height() != y_.height() || x_.height() != z_.height()) {
+            throw std::runtime_error("mmap tifxyz band size mismatch: " + dir.string());
+        }
+    }
+
+    int rows() const { return x_.height(); }
+    int cols() const { return x_.width(); }
+    cv::Vec3f at(int row, int col) const
+    {
+        return cv::Vec3f(x_.at(row, col), y_.at(row, col), z_.at(row, col));
+    }
+
+private:
+    MappedTifBand x_;
+    MappedTifBand y_;
+    MappedTifBand z_;
+};
+
+struct LoadedSurface {
+    SurfacePtr surface;
+    bool wasLoaded = false;
+    bool loadedForIndex = false;
+};
+
+struct MappedSurfaceForIndex {
+    SurfacePtr surface;
+    std::shared_ptr<MappedTifxyzSurface> mapped;
+};
+
+std::vector<LoadedSurface> loadSurfacesInBatches(const std::vector<SurfacePtr>& surfaces)
 {
     constexpr size_t kBatchSize = 5000;
     constexpr size_t kMaxWorkers = 8;
 
-    std::vector<SurfacePtr> loaded;
+    std::vector<LoadedSurface> loaded;
     loaded.reserve(surfaces.size());
 
     for (size_t batchStart = 0; batchStart < surfaces.size(); batchStart += kBatchSize) {
@@ -175,7 +403,7 @@ std::vector<SurfacePtr> loadSurfacesInBatches(const std::vector<SurfacePtr>& sur
         std::cout << "[SurfacePatchIndex] loading surfaces "
                   << batchStart << "-" << (batchEnd == 0 ? 0 : batchEnd - 1)
                   << " / " << surfaces.size() << std::endl;
-        std::vector<SurfacePtr> batchLoaded(batchSize);
+        std::vector<LoadedSurface> batchLoaded(batchSize);
 
         const unsigned hw = std::thread::hardware_concurrency();
         const size_t workerCount = std::max<size_t>(
@@ -196,14 +424,15 @@ std::vector<SurfacePtr> loadSurfacesInBatches(const std::vector<SurfacePtr>& sur
                     if (!s) {
                         continue;
                     }
-                    if (!s->isLoaded()) {
+                    const bool wasLoaded = s->isLoaded();
+                    if (!wasLoaded) {
                         if (DebugLoggingEnabled()) {
                             std::cout << "[SurfacePatchIndex] Loading surface: " << s->id << std::endl;
                         }
                         s->rawPointsPtr();  // triggers ensureLoaded()
                     }
                     if (s->isLoaded()) {
-                        batchLoaded[localIndex] = s;
+                        batchLoaded[localIndex] = LoadedSurface{s, wasLoaded, !wasLoaded};
                         if (DebugLoggingEnabled()) {
                             std::cout << "[SurfacePatchIndex] Indexed surface: " << s->id << std::endl;
                         }
@@ -218,9 +447,9 @@ std::vector<SurfacePtr> loadSurfacesInBatches(const std::vector<SurfacePtr>& sur
             worker.get();
         }
 
-        for (auto& surface : batchLoaded) {
-            if (surface) {
-                loaded.push_back(std::move(surface));
+        for (auto& item : batchLoaded) {
+            if (item.surface) {
+                loaded.push_back(std::move(item));
             }
         }
         const double seconds = std::chrono::duration<double>(
@@ -363,6 +592,7 @@ struct SurfacePatchIndex::Impl {
         // Raw pointer: the SurfaceRecord in surfaceRecords owns the
         // shared_ptr and outlives every PatchRecord that references it.
         QuadSurface* surface = nullptr;
+        const MappedTifxyzSurface* mapped = nullptr;
         int i = 0;
         int j = 0;
         // NOTE: stride is not stored — it is always equal to
@@ -370,6 +600,7 @@ struct SurfacePatchIndex::Impl {
 
         bool operator==(const PatchRecord& other) const noexcept {
             return surface == other.surface &&
+                   mapped == other.mapped &&
                    i == other.i &&
                    j == other.j;
         }
@@ -431,20 +662,26 @@ struct SurfacePatchIndex::Impl {
     struct SurfaceCellMask {
         int rows = 0;
         int cols = 0;
+        int tileStride = 1;
+        int tileRows = 0;
+        int tileCols = 0;
         int activeCount = 0;
         std::vector<uint8_t> states;
-        // Dense vector of each cell's quantized R-tree Box3 (keyed by flat cell
-        // index). Dense because after the on-load trim, >95% of cells are
-        // active, making the map overhead (~52B/entry) far more costly than
-        // the empty-slot cost of a dense array (12B/cell).
+        // Dense vector of each tile anchor's quantized R-tree Box3. Entries
+        // are keyed by compact tile slot, while public/internal callers still
+        // pass native grid cell anchors (row,col). PatchRecord keeps native
+        // anchors so query/update behavior does not change.
         // Validity is determined by states[] bits, not by a sentinel QBox.
         std::vector<QBox> cachedBoxes;
-        std::unordered_set<std::size_t> pendingCells;  // Cells needing R-tree update
+        std::unordered_set<std::size_t> pendingCells;  // Tile slots needing R-tree update
 
         void clear()
         {
             rows = 0;
             cols = 0;
+            tileStride = 1;
+            tileRows = 0;
+            tileCols = 0;
             activeCount = 0;
             states.clear();
             cachedBoxes.clear();
@@ -452,22 +689,31 @@ struct SurfacePatchIndex::Impl {
             pendingCells.clear();
         }
 
-        void ensureSize(int rowCount, int colCount)
+        void ensureSize(int rowCount, int colCount, int stride)
         {
             rowCount = std::max(rowCount, 0);
             colCount = std::max(colCount, 0);
-            const std::size_t required = static_cast<std::size_t>(rowCount) * colCount;
+            stride = std::max(1, stride);
             if (rowCount <= 0 || colCount <= 0) {
                 clear();
                 return;
             }
+            const int requiredTileRows = (rowCount + stride - 1) / stride;
+            const int requiredTileCols = (colCount + stride - 1) / stride;
+            const std::size_t required =
+                static_cast<std::size_t>(requiredTileRows) * requiredTileCols;
             const std::size_t requiredBytes = (required + 7u) / 8u;
-            if (rows == rowCount && cols == colCount && states.size() == requiredBytes
+            if (rows == rowCount && cols == colCount && tileStride == stride
+                && tileRows == requiredTileRows && tileCols == requiredTileCols
+                && states.size() == requiredBytes
                 && cachedBoxes.size() == required) {
                 return;
             }
             rows = rowCount;
             cols = colCount;
+            tileStride = stride;
+            tileRows = requiredTileRows;
+            tileCols = requiredTileCols;
             activeCount = 0;
             states.assign(requiredBytes, 0);
             cachedBoxes.assign(required, QBox{});
@@ -479,28 +725,46 @@ struct SurfacePatchIndex::Impl {
             return row >= 0 && row < rows && col >= 0 && col < cols;
         }
 
-        std::size_t index(int row, int col) const
+        std::optional<std::size_t> tileIndex(int row, int col) const
         {
-            return static_cast<std::size_t>(row) * cols + col;
+            if (!validIndex(row, col) || tileStride <= 0 || tileRows <= 0 || tileCols <= 0) {
+                return std::nullopt;
+            }
+            if ((row % tileStride) != 0 || (col % tileStride) != 0) {
+                return std::nullopt;
+            }
+            const int tileRow = row / tileStride;
+            const int tileCol = col / tileStride;
+            if (tileRow < 0 || tileRow >= tileRows || tileCol < 0 || tileCol >= tileCols) {
+                return std::nullopt;
+            }
+            return static_cast<std::size_t>(tileRow) * tileCols + tileCol;
+        }
+
+        std::pair<int, int> nativeAnchor(std::size_t tileIdx) const
+        {
+            const int tileRow = static_cast<int>(tileIdx / tileCols);
+            const int tileCol = static_cast<int>(tileIdx % tileCols);
+            return {tileRow * tileStride, tileCol * tileStride};
         }
 
         bool isActive(int row, int col) const
         {
-            if (!validIndex(row, col)) {
+            const auto idx = tileIndex(row, col);
+            if (!idx) {
                 return false;
             }
-            const std::size_t idx = index(row, col);
-            return (states[idx >> 3] >> (idx & 7u)) & 1u;
+            return (states[*idx >> 3] >> (*idx & 7u)) & 1u;
         }
 
         void setActive(int row, int col, bool active)
         {
-            if (!validIndex(row, col)) {
+            const auto idx = tileIndex(row, col);
+            if (!idx) {
                 return;
             }
-            const std::size_t idx = index(row, col);
-            const std::size_t byte = idx >> 3;
-            const uint8_t bit = static_cast<uint8_t>(1u << (idx & 7u));
+            const std::size_t byte = *idx >> 3;
+            const uint8_t bit = static_cast<uint8_t>(1u << (*idx & 7u));
             const bool prev = (states[byte] & bit) != 0;
             if (prev == active) {
                 return;
@@ -516,18 +780,20 @@ struct SurfacePatchIndex::Impl {
 
         std::optional<Box3> bboxAt(int row, int col) const
         {
-            if (!validIndex(row, col) || !isActive(row, col)) {
+            const auto idx = tileIndex(row, col);
+            if (!idx || !isActive(row, col)) {
                 return std::nullopt;
             }
-            return boxDequantize(cachedBoxes[index(row, col)]);
+            return boxDequantize(cachedBoxes[*idx]);
         }
 
         void storeBox(int row, int col, const Box3& box)
         {
-            if (!validIndex(row, col)) {
+            const auto idx = tileIndex(row, col);
+            if (!idx) {
                 return;
             }
-            cachedBoxes[index(row, col)] = boxQuantize(box);
+            cachedBoxes[*idx] = boxQuantize(box);
         }
 
         void eraseBox(int row, int col)
@@ -545,26 +811,29 @@ struct SurfacePatchIndex::Impl {
         // Pending update tracking methods
         void queueUpdate(int row, int col)
         {
-            if (!validIndex(row, col)) {
+            const auto idx = tileIndex(row, col);
+            if (!idx) {
                 return;
             }
-            pendingCells.insert(index(row, col));
+            pendingCells.insert(*idx);
         }
 
         void clearPending(int row, int col)
         {
-            if (!validIndex(row, col)) {
+            const auto idx = tileIndex(row, col);
+            if (!idx) {
                 return;
             }
-            pendingCells.erase(index(row, col));
+            pendingCells.erase(*idx);
         }
 
         bool isPending(int row, int col) const
         {
-            if (!validIndex(row, col)) {
+            const auto idx = tileIndex(row, col);
+            if (!idx) {
                 return false;
             }
-            return pendingCells.count(index(row, col)) > 0;
+            return pendingCells.count(*idx) > 0;
         }
 
         bool hasPending() const
@@ -581,6 +850,7 @@ struct SurfacePatchIndex::Impl {
     // Surface record holding the shared_ptr and associated mask
     struct SurfaceRecord {
         SurfacePtr surface;  // Keeps the surface alive
+        std::shared_ptr<MappedTifxyzSurface> mapped;
         SurfaceCellMask mask;
     };
 
@@ -629,6 +899,30 @@ struct SurfacePatchIndex::Impl {
                              int rowEnd,
                              int colStart,
                              int colEnd);
+    static std::vector<Entry> collectEntriesForRebuild(QuadSurface* surface,
+                                                       const cv::Mat_<cv::Vec3f>& points,
+                                                       SurfaceCellMask& mask,
+                                                       float bboxPadding,
+                                                       int samplingStride);
+    static std::vector<Entry> collectMappedEntriesForRebuild(QuadSurface* surface,
+                                                             const MappedTifxyzSurface& points,
+                                                             SurfaceCellMask& mask,
+                                                             float bboxPadding,
+                                                             int samplingStride);
+    static bool buildEntryForCell(QuadSurface* surface,
+                                  const cv::Mat_<cv::Vec3f>& points,
+                                  int col,
+                                  int row,
+                                  int stride,
+                                  float bboxPadding,
+                                  Entry& outEntry);
+    static bool buildMappedEntryForCell(QuadSurface* surface,
+                                        const MappedTifxyzSurface& points,
+                                        int col,
+                                        int row,
+                                        int stride,
+                                        float bboxPadding,
+                                        Entry& outEntry);
     static bool buildCellEntry(const SurfacePtr& surface,
                                const cv::Mat_<cv::Vec3f>& points,
                                int col,
@@ -680,7 +974,7 @@ struct SurfacePatchIndex::Impl {
 
         for (int subJ = 0; subJ < tileStride; subJ += triStride) {
             for (int subI = 0; subI < tileStride; subI += triStride) {
-                const PatchRecord subRec{rec.surface, rec.i + subI, rec.j + subJ};
+                const PatchRecord subRec{rec.surface, rec.mapped, rec.i + subI, rec.j + subJ};
                 std::array<cv::Vec3f, 4> corners;
                 if (!loadPatchCorners(subRec, triStride, corners)) {
                     continue;
@@ -1016,7 +1310,7 @@ bool SurfacePatchIndex::loadCache(const std::filesystem::path& cachePath,
     for (const auto& cached : cachedSurfaces) {
         Impl::SurfaceRecord rec;
         rec.surface = cached.surface;
-        rec.mask.ensureSize(cached.rows, cached.cols);
+        rec.mask.ensureSize(cached.rows, cached.cols, newImpl->tileStride);
         newImpl->surfaceRecords[cached.surface.get()] = std::move(rec);
     }
 
@@ -1044,13 +1338,18 @@ bool SurfacePatchIndex::loadCache(const std::filesystem::path& cachePath,
 
         Impl::PatchRecord rec;
         rec.surface = surface.get();
+        rec.mapped = recIt->second.mapped.get();
         rec.i = i;
         rec.j = j;
         entries.emplace_back(Impl::boxDequantize(qbox), rec);
 
         Impl::SurfaceCellMask& mask = recIt->second.mask;
         mask.setActive(j, i, true);
-        mask.cachedBoxes[mask.index(j, i)] = qbox;
+        if (auto tileIdx = mask.tileIndex(j, i)) {
+            mask.cachedBoxes[*tileIdx] = qbox;
+        } else {
+            return false;
+        }
     }
 
     newImpl->patchCount = entries.size();
@@ -1126,6 +1425,139 @@ SurfacePatchIndex::Impl::collectEntriesForSurface(const SurfacePtr& surface,
     return result;
 }
 
+std::vector<SurfacePatchIndex::Impl::Entry>
+SurfacePatchIndex::Impl::collectEntriesForRebuild(QuadSurface* surface,
+                                                  const cv::Mat_<cv::Vec3f>& points,
+                                                  SurfaceCellMask& mask,
+                                                  float bboxPadding,
+                                                  int samplingStride)
+{
+    std::vector<Entry> entries;
+    if (!surface || points.empty()) {
+        return entries;
+    }
+
+    const int cellRowCount = points.rows - 1;
+    const int cellColCount = points.cols - 1;
+    if (cellRowCount <= 0 || cellColCount <= 0) {
+        return entries;
+    }
+
+    samplingStride = std::max(1, samplingStride);
+    const size_t estimatedCells =
+        static_cast<size_t>((cellRowCount + samplingStride - 1) / samplingStride) *
+        static_cast<size_t>((cellColCount + samplingStride - 1) / samplingStride);
+    entries.reserve(estimatedCells);
+
+    for (int row = 0; row < cellRowCount; row += samplingStride) {
+        for (int col = 0; col < cellColCount; col += samplingStride) {
+            Entry entry;
+            if (!buildEntryForCell(surface, points, col, row, samplingStride, bboxPadding, entry)) {
+                continue;
+            }
+            mask.setActive(row, col, true);
+            mask.storeBox(row, col, entry.first);
+            entries.push_back(std::move(entry));
+        }
+    }
+
+    return entries;
+}
+
+bool SurfacePatchIndex::Impl::buildMappedEntryForCell(QuadSurface* surface,
+                                                      const MappedTifxyzSurface& points,
+                                                      int col,
+                                                      int row,
+                                                      int stride,
+                                                      float bboxPadding,
+                                                      Entry& outEntry)
+{
+    if (!surface) {
+        return false;
+    }
+
+    const int maxColStride = points.cols() - 1 - col;
+    const int maxRowStride = points.rows() - 1 - row;
+    const int effectiveColStride = std::min(stride, maxColStride);
+    const int effectiveRowStride = std::min(stride, maxRowStride);
+    if (effectiveColStride <= 0 || effectiveRowStride <= 0) {
+        return false;
+    }
+
+    const cv::Vec3f p00 = points.at(row, col);
+    const cv::Vec3f p10 = points.at(row, col + effectiveColStride);
+    const cv::Vec3f p01 = points.at(row + effectiveRowStride, col);
+    const cv::Vec3f p11 = points.at(row + effectiveRowStride, col + effectiveColStride);
+    if (!isValidMappedSurfacePoint(p00) || !isValidMappedSurfacePoint(p10)
+        || !isValidMappedSurfacePoint(p01) || !isValidMappedSurfacePoint(p11)) {
+        return false;
+    }
+
+    PatchRecord rec;
+    rec.surface = surface;
+    rec.mapped = &points;
+    rec.i = col;
+    rec.j = row;
+
+    cv::Vec3f low{p00};
+    cv::Vec3f high{p00};
+    auto extend = [&](const cv::Vec3f& p) {
+        if (!isValidMappedSurfacePoint(p)) return;
+        low[0] = std::min(low[0], p[0]);
+        low[1] = std::min(low[1], p[1]);
+        low[2] = std::min(low[2], p[2]);
+        high[0] = std::max(high[0], p[0]);
+        high[1] = std::max(high[1], p[1]);
+        high[2] = std::max(high[2], p[2]);
+    };
+    for (int dr = 0; dr <= effectiveRowStride; ++dr) {
+        for (int dc = 0; dc <= effectiveColStride; ++dc) {
+            extend(points.at(row + dr, col + dc));
+        }
+    }
+    if (!isValidBounds(low, high)) {
+        return false;
+    }
+
+    outEntry = buildEntryFromBbox(rec, low, high, bboxPadding);
+    return true;
+}
+
+std::vector<SurfacePatchIndex::Impl::Entry>
+SurfacePatchIndex::Impl::collectMappedEntriesForRebuild(QuadSurface* surface,
+                                                        const MappedTifxyzSurface& points,
+                                                        SurfaceCellMask& mask,
+                                                        float bboxPadding,
+                                                        int samplingStride)
+{
+    std::vector<Entry> entries;
+    if (!surface || points.rows() < 2 || points.cols() < 2) {
+        return entries;
+    }
+
+    const int cellRowCount = points.rows() - 1;
+    const int cellColCount = points.cols() - 1;
+    samplingStride = std::max(1, samplingStride);
+    const size_t estimatedCells =
+        static_cast<size_t>((cellRowCount + samplingStride - 1) / samplingStride) *
+        static_cast<size_t>((cellColCount + samplingStride - 1) / samplingStride);
+    entries.reserve(estimatedCells);
+
+    for (int row = 0; row < cellRowCount; row += samplingStride) {
+        for (int col = 0; col < cellColCount; col += samplingStride) {
+            Entry entry;
+            if (!buildMappedEntryForCell(surface, points, col, row, samplingStride, bboxPadding, entry)) {
+                continue;
+            }
+            mask.setActive(row, col, true);
+            mask.storeBox(row, col, entry.first);
+            entries.push_back(std::move(entry));
+        }
+    }
+
+    return entries;
+}
+
 void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float bboxPadding)
 {
     std::unique_lock<std::shared_mutex> lock(mutex_);
@@ -1136,12 +1568,22 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     impl_->surfaceRecords.clear();
     impl_->patchCount = 0;
 
-    // Eagerly load any surfaces whose TIFF data hasn't been loaded yet.
-    // This is safe because rebuild() typically runs on a background thread.
-    std::vector<SurfacePtr> loaded = loadSurfacesInBatches(surfaces);
-    const size_t surfaceCount = loaded.size();
+    std::vector<MappedSurfaceForIndex> mappedSurfaces;
+    mappedSurfaces.reserve(surfaces.size());
+    for (const auto& surface : surfaces) {
+        if (!surface) {
+            continue;
+        }
+        if (surface->path.empty()) {
+            throw std::runtime_error("SurfacePatchIndex mmap rebuild requires disk-backed tifxyz surfaces: " + surface->id);
+        }
+        auto mapped = std::make_shared<MappedTifxyzSurface>(surface->path);
+        mappedSurfaces.push_back(MappedSurfaceForIndex{surface, std::move(mapped)});
+    }
+
+    const size_t surfaceCount = mappedSurfaces.size();
     if (DebugLoggingEnabled()) {
-        std::cout << "[SurfacePatchIndex] rebuild: " << surfaceCount << " of " << surfaces.size() << " surfaces loaded" << std::endl;
+        std::cout << "[SurfacePatchIndex] rebuild: " << surfaceCount << " of " << surfaces.size() << " surfaces mmap-opened" << std::endl;
     }
     if (surfaceCount == 0) {
         impl_->tree.reset();
@@ -1155,43 +1597,39 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     const int stride = impl_->tileStride;
     const float padding = bboxPadding;
 
+    const bool debugLogging = DebugLoggingEnabled();
+
     // Pre-create all masks (sequential, enables thread-safe parallel access)
-    std::cout << "[SurfacePatchIndex] creating masks for " << surfaceCount << " surfaces" << std::endl;
-    for (const SurfacePtr& surface : loaded) {
-        impl_->ensureMask(surface);
+    if (debugLogging) {
+        std::cout << "[SurfacePatchIndex] creating masks for " << surfaceCount << " surfaces" << std::endl;
+    }
+    for (const auto& item : mappedSurfaces) {
+        Impl::SurfaceRecord& rec = impl_->surfaceRecords[item.surface.get()];
+        rec.surface = item.surface;
+        rec.mapped = item.mapped;
+        rec.mask.ensureSize(std::max(0, item.mapped->rows() - 1),
+                            std::max(0, item.mapped->cols() - 1),
+                            stride);
     }
 
-    // Per-surface results for parallel collection
-    using CellResult = std::vector<std::pair<CellKey, Impl::CellEntry>>;
-    std::vector<CellResult> perSurfaceCells(surfaceCount);
+    // Per-surface entries for parallel collection. Rebuild does not need
+    // CellKey/CellEntry wrappers; masks are updated immediately per surface.
+    std::vector<std::vector<Impl::Entry>> perSurfaceEntries(surfaceCount);
     std::atomic_size_t indexedSurfaces{0};
     const auto collectStart = std::chrono::steady_clock::now();
 
     // Parallel phase: collect entries and update masks for each surface
     #pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < surfaceCount; ++i) {
-        perSurfaceCells[i] = Impl::collectEntriesForSurface(
-            loaded[i],
-            padding,
-            stride,
-            0,
-            std::numeric_limits<int>::max(),
-            0,
-            std::numeric_limits<int>::max());
-
-        // Update mask for this surface (each surface has its own mask, no contention)
-        auto* rec = impl_->getRecord(loaded[i].get());
-        if (rec) {
-            for (auto& cell : perSurfaceCells[i]) {
-                rec->mask.setActive(cell.first.rowIndex(), cell.first.colIndex(), cell.second.hasPatch);
-                if (cell.second.hasPatch) {
-                    rec->mask.storeBox(cell.first.rowIndex(), cell.first.colIndex(),
-                                       cell.second.patch.first);
-                }
-            }
+        const SurfacePtr& surface = mappedSurfaces[i].surface;
+        auto* rec = impl_->getRecord(surface.get());
+        if (rec && mappedSurfaces[i].mapped) {
+            perSurfaceEntries[i] = Impl::collectMappedEntriesForRebuild(
+                surface.get(), *mappedSurfaces[i].mapped, rec->mask, padding, stride);
         }
+
         const size_t done = indexedSurfaces.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (done == surfaceCount || done % 1000 == 0) {
+        if (debugLogging && (done == surfaceCount || done % 1000 == 0)) {
             #pragma omp critical(surface_patch_index_progress)
             {
                 const double seconds = std::chrono::duration<double>(
@@ -1204,36 +1642,38 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     }
 
     // Merge entries from all surfaces
-    std::cout << "[SurfacePatchIndex] merging entries" << std::endl;
+    if (debugLogging) {
+        std::cout << "[SurfacePatchIndex] merging entries" << std::endl;
+    }
     size_t totalEntries = 0;
-    for (const auto& cells : perSurfaceCells) {
-        for (const auto& cell : cells) {
-            if (cell.second.hasPatch) {
-                ++totalEntries;
-            }
-        }
+    for (const auto& entriesForSurface : perSurfaceEntries) {
+        totalEntries += entriesForSurface.size();
     }
 
     std::vector<Impl::Entry> entries;
     entries.reserve(totalEntries);
 
-    for (auto& cells : perSurfaceCells) {
-        for (auto& cell : cells) {
-            if (cell.second.hasPatch) {
-                entries.push_back(std::move(cell.second.patch));
-            }
-        }
+    for (auto& entriesForSurface : perSurfaceEntries) {
+        entries.insert(entries.end(),
+                       std::make_move_iterator(entriesForSurface.begin()),
+                       std::make_move_iterator(entriesForSurface.end()));
+        entriesForSurface.clear();
+        entriesForSurface.shrink_to_fit();
     }
 
     impl_->patchCount = entries.size();
     if (entries.empty()) {
         impl_->tree.reset();
     } else {
-        std::cout << "[SurfacePatchIndex] building R-tree with " << entries.size() << " entries" << std::endl;
+        if (debugLogging) {
+            std::cout << "[SurfacePatchIndex] building R-tree with " << entries.size() << " entries" << std::endl;
+        }
         impl_->tree = std::make_unique<Impl::PatchTree>(entries.begin(), entries.end());
     }
-    std::cout << "[SurfacePatchIndex] rebuild complete: surfaces=" << surfaceCount
-              << " patches=" << impl_->patchCount << std::endl;
+    if (debugLogging) {
+        std::cout << "[SurfacePatchIndex] rebuild complete: surfaces=" << surfaceCount
+                  << " patches=" << impl_->patchCount << std::endl;
+    }
 }
 
 void SurfacePatchIndex::clear()
@@ -1492,24 +1932,29 @@ void SurfacePatchIndex::forEachTriangleImpl(
         SurfacePtr ownedPtr;  // Shared ownership for TriangleCandidate
     };
     std::unordered_map<QuadSurface*, SurfaceCache> surfaceCacheMap;
-    surfaceCacheMap.reserve(filterSurfaces ? filterSurfaces->size() : 4);
+    surfaceCacheMap.reserve(std::min<std::size_t>(
+        filterSurfaces ? filterSurfaces->size() : 4, 4096));
+
+    std::unordered_set<QuadSurface*> filterSurfaceRaw;
+    if (filterSurfaces) {
+        filterSurfaceRaw.reserve(filterSurfaces->size());
+        for (const auto& surface : *filterSurfaces) {
+            if (surface) {
+                filterSurfaceRaw.insert(surface.get());
+            }
+        }
+        if (filterSurfaceRaw.empty()) {
+            return;
+        }
+    }
 
     auto emitFromPatch = [&](const Impl::Entry& entry) {
         const Impl::PatchRecord& rec = entry.second;
         if (targetSurface && rec.surface != targetSurface.get()) {
             return;
         }
-        if (filterSurfaces) {
-            bool found = false;
-            for (const auto& s : *filterSurfaces) {
-                if (s.get() == rec.surface) {
-                    found = true;
-                    break;
-                }
-            }
-            if (!found) {
-                return;
-            }
+        if (filterSurfaces && filterSurfaceRaw.find(rec.surface) == filterSurfaceRaw.end()) {
+            return;
         }
         // Optional caller-supplied bbox-level reject (e.g. plane-vs-bbox).
         // Runs before the expensive loadPatchCorners call. With the default
@@ -1535,9 +1980,16 @@ void SurfacePatchIndex::forEachTriangleImpl(
             }
             const cv::Vec3f center = rec.surface->center();
             const cv::Vec2f scale = rec.surface->scale();
-            const cv::Mat_<cv::Vec3f>* points = rec.surface->rawPointsPtr();
-            const int rows = points ? points->rows : 0;
-            const int cols = points ? points->cols : 0;
+            int rows = 0;
+            int cols = 0;
+            if (rec.mapped) {
+                rows = rec.mapped->rows();
+                cols = rec.mapped->cols();
+            } else {
+                const cv::Mat_<cv::Vec3f>* points = rec.surface->rawPointsPtr();
+                rows = points ? points->rows : 0;
+                cols = points ? points->cols : 0;
+            }
             cacheIt = surfaceCacheMap.emplace(rec.surface,
                 SurfaceCache{center[0] * scale[0], center[1] * scale[1],
                              rows, cols, srIt->second.surface}).first;
@@ -1551,7 +2003,7 @@ void SurfacePatchIndex::forEachTriangleImpl(
 
         for (int subJ = rec.j; subJ < subRowLimit; subJ += triStride) {
             for (int subI = rec.i; subI < subColLimit; subI += triStride) {
-                const Impl::PatchRecord subRec{rec.surface, subI, subJ};
+                const Impl::PatchRecord subRec{rec.surface, rec.mapped, subI, subJ};
                 std::array<cv::Vec3f, 4> corners;
                 if (!Impl::loadPatchCorners(subRec, triStride, corners)) {
                     continue;
@@ -1634,16 +2086,16 @@ bool SurfacePatchIndex::Impl::removeSurfaceEntries(const SurfacePtr& surface)
 
     SurfaceCellMask& mask = it->second.mask;
 
-    // Walk active cells via states bitset, use dense cachedBoxes for each.
+    // Walk active tile slots via states bitset, use compact cachedBoxes for each.
     if (tree && mask.activeCount > 0 && !mask.cachedBoxes.empty()) {
-        for (int row = 0; row < mask.rows; ++row) {
-            for (int col = 0; col < mask.cols; ++col) {
-                if (!mask.isActive(row, col)) continue;
-                const QBox& qb = mask.cachedBoxes[mask.index(row, col)];
-                PatchRecord rec{surface.get(), col, row};
-                if (tree->remove(Entry(boxDequantize(qb), rec)) && patchCount > 0) {
-                    --patchCount;
-                }
+        for (std::size_t tileIdx = 0; tileIdx < mask.cachedBoxes.size(); ++tileIdx) {
+            const auto [row, col] = mask.nativeAnchor(tileIdx);
+            if (!mask.isActive(row, col)) continue;
+            const QBox& qb = mask.cachedBoxes[tileIdx];
+            const auto mapped = it->second.mapped.get();
+            PatchRecord rec{surface.get(), mapped, col, row};
+            if (tree->remove(Entry(boxDequantize(qb), rec)) && patchCount > 0) {
+                --patchCount;
             }
         }
     }
@@ -1666,14 +2118,17 @@ void SurfacePatchIndex::Impl::removeSurfaceEntriesFromTree(const SurfacePtr& sur
     }
 
     if (tree) {
-        for (int row = 0; row < mask.rows; ++row) {
-            for (int col = 0; col < mask.cols; ++col) {
-                if (!mask.isActive(row, col)) continue;
-                const QBox& qb = mask.cachedBoxes[mask.index(row, col)];
-                PatchRecord rec{surface.get(), col, row};
-                if (tree->remove(Entry(boxDequantize(qb), rec)) && patchCount > 0) {
-                    --patchCount;
-                }
+        const MappedTifxyzSurface* mapped = nullptr;
+        if (auto it = surfaceRecords.find(surface.get()); it != surfaceRecords.end()) {
+            mapped = it->second.mapped.get();
+        }
+        for (std::size_t tileIdx = 0; tileIdx < mask.cachedBoxes.size(); ++tileIdx) {
+            const auto [row, col] = mask.nativeAnchor(tileIdx);
+            if (!mask.isActive(row, col)) continue;
+            const QBox& qb = mask.cachedBoxes[tileIdx];
+            PatchRecord rec{surface.get(), mapped, col, row};
+            if (tree->remove(Entry(boxDequantize(qb), rec)) && patchCount > 0) {
+                --patchCount;
             }
         }
     }
@@ -1981,6 +2436,9 @@ SurfacePatchIndex::Impl::makePatchEntry(const CellKey& key) const
 
     PatchRecord rec;
     rec.surface = key.surface.get();
+    if (auto it = surfaceRecords.find(key.surface.get()); it != surfaceRecords.end()) {
+        rec.mapped = it->second.mapped.get();
+    }
     rec.i = key.colIndex();
     rec.j = key.rowIndex();
 
@@ -2049,14 +2507,14 @@ SurfacePatchIndex::Impl::ensureMask(const SurfacePtr& surface)
             // This prevents orphaned entries when surface grows/shrinks
             removeSurfaceEntriesFromTree(surface, mask);
         }
-        mask.ensureSize(rowCount, colCount);
+        mask.ensureSize(rowCount, colCount, tileStride);
         return mask;
     }
 
     // New surface - create fresh record
     SurfaceRecord& rec = surfaceRecords[surface.get()];
     rec.surface = surface;  // Keep the surface alive
-    rec.mask.ensureSize(rowCount, colCount);
+    rec.mask.ensureSize(rowCount, colCount, tileStride);
     return rec.mask;
 }
 
@@ -2067,12 +2525,14 @@ bool SurfacePatchIndex::Impl::loadPatchCorners(const PatchRecord& rec,
     if (!rec.surface) {
         return false;
     }
-    const cv::Mat_<cv::Vec3f>* points = rec.surface->rawPointsPtr();
-    if (!points) {
-        return false;
-    }
-    const int rows = points->rows;
-    const int cols = points->cols;
+    const int rows = rec.mapped ? rec.mapped->rows() : [&]() {
+        const cv::Mat_<cv::Vec3f>* points = rec.surface->rawPointsPtr();
+        return points ? points->rows : 0;
+    }();
+    const int cols = rec.mapped ? rec.mapped->cols() : [&]() {
+        const cv::Mat_<cv::Vec3f>* points = rec.surface->rawPointsPtr();
+        return points ? points->cols : 0;
+    }();
     if (rows < 2 || cols < 2) {
         return false;
     }
@@ -2089,13 +2549,28 @@ bool SurfacePatchIndex::Impl::loadPatchCorners(const PatchRecord& rec,
         return false;
     }
 
-    const cv::Vec3f& p00 = (*points)(row, col);
-    const cv::Vec3f& p10 = (*points)(row, col + effectiveColStride);
-    const cv::Vec3f& p01 = (*points)(row + effectiveRowStride, col);
-    const cv::Vec3f& p11 = (*points)(row + effectiveRowStride, col + effectiveColStride);
+    cv::Vec3f p00;
+    cv::Vec3f p10;
+    cv::Vec3f p01;
+    cv::Vec3f p11;
+    if (rec.mapped) {
+        p00 = rec.mapped->at(row, col);
+        p10 = rec.mapped->at(row, col + effectiveColStride);
+        p01 = rec.mapped->at(row + effectiveRowStride, col);
+        p11 = rec.mapped->at(row + effectiveRowStride, col + effectiveColStride);
+    } else {
+        const cv::Mat_<cv::Vec3f>* points = rec.surface->rawPointsPtr();
+        if (!points) {
+            return false;
+        }
+        p00 = (*points)(row, col);
+        p10 = (*points)(row, col + effectiveColStride);
+        p01 = (*points)(row + effectiveRowStride, col);
+        p11 = (*points)(row + effectiveRowStride, col + effectiveColStride);
+    }
 
-    if (!isValidSurfacePoint(p00) || !isValidSurfacePoint(p10)
-        || !isValidSurfacePoint(p01) || !isValidSurfacePoint(p11)) {
+    const auto valid = rec.mapped ? isValidMappedSurfacePoint : isValidSurfacePoint;
+    if (!valid(p00) || !valid(p10) || !valid(p01) || !valid(p11)) {
         return false;
     }
 
@@ -2103,14 +2578,18 @@ bool SurfacePatchIndex::Impl::loadPatchCorners(const PatchRecord& rec,
     return true;
 }
 
-bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
-                                             const cv::Mat_<cv::Vec3f>& points,
-                                             int col,
-                                             int row,
-                                             int stride,
-                                             float bboxPadding,
-                                             CellEntry& outEntry)
+bool SurfacePatchIndex::Impl::buildEntryForCell(QuadSurface* surface,
+                                                const cv::Mat_<cv::Vec3f>& points,
+                                                int col,
+                                                int row,
+                                                int stride,
+                                                float bboxPadding,
+                                                Entry& outEntry)
 {
+    if (!surface) {
+        return false;
+    }
+
     // Clamp stride to not exceed bounds
     const int maxColStride = points.cols - 1 - col;
     const int maxRowStride = points.rows - 1 - row;
@@ -2133,7 +2612,8 @@ bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
     }
 
     PatchRecord rec;
-    rec.surface = surface.get();
+    rec.surface = surface;
+    rec.mapped = nullptr;
     rec.i = col;
     rec.j = row;
 
@@ -2166,9 +2646,26 @@ bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
         return false;
     }
 
-    outEntry.patch = buildEntryFromBbox(rec, low, high, bboxPadding);
-    outEntry.hasPatch = true;
+    outEntry = buildEntryFromBbox(rec, low, high, bboxPadding);
 
+    return true;
+}
+
+bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
+                                             const cv::Mat_<cv::Vec3f>& points,
+                                             int col,
+                                             int row,
+                                             int stride,
+                                             float bboxPadding,
+                                             CellEntry& outEntry)
+{
+    Entry entry;
+    if (!buildEntryForCell(surface.get(), points, col, row, stride, bboxPadding, entry)) {
+        return false;
+    }
+
+    outEntry.patch = std::move(entry);
+    outEntry.hasPatch = true;
     return true;
 }
 
@@ -2185,7 +2682,11 @@ void SurfacePatchIndex::Impl::removeCellEntry(SurfaceCellMask& mask,
     bool removed = false;
     if (tree) {
         if (auto cachedBox = mask.bboxAt(row, col)) {
-            PatchRecord rec{surface.get(), col, row};
+            const MappedTifxyzSurface* mapped = nullptr;
+            if (auto it = surfaceRecords.find(surface.get()); it != surfaceRecords.end()) {
+                mapped = it->second.mapped.get();
+            }
+            PatchRecord rec{surface.get(), mapped, col, row};
             removed = tree->remove(Entry(*cachedBox, rec));
         } else {
             if (auto entry = makePatchEntry(CellKey(surface, row, col))) {
@@ -2416,13 +2917,16 @@ bool SurfacePatchIndex::Impl::flushPendingSurface(const SurfacePtr& surface, Sur
     const int stride = tileStride;
 
     for (std::size_t idx : mask.pendingCells) {
-        const int row = static_cast<int>(idx / mask.cols);
-        const int col = static_cast<int>(idx % mask.cols);
+        const auto [row, col] = mask.nativeAnchor(idx);
 
         // Remove old entry if it exists
         if (mask.isActive(row, col)) {
             if (auto cachedBox = mask.bboxAt(row, col)) {
-                PatchRecord rec{surface.get(), col, row};
+                const MappedTifxyzSurface* mapped = nullptr;
+                if (auto it = surfaceRecords.find(surface.get()); it != surfaceRecords.end()) {
+                    mapped = it->second.mapped.get();
+                }
+                PatchRecord rec{surface.get(), mapped, col, row};
                 toRemove.emplace_back(*cachedBox, rec);
             }
             mask.setActive(row, col, false);
@@ -2577,12 +3081,16 @@ SurfacePatchIndex::computePlaneIntersections(
     viewBbox.low -= cv::Vec3f(padding, padding, padding);
     viewBbox.high += cv::Vec3f(padding, padding, padding);
 
-    // Pre-create per-target buckets so the visitor lookup is a single
-    // pointer-keyed find (no allocation, no rehash) per triangle.
-    std::unordered_map<const QuadSurface*, std::vector<TriangleSegment>*> buckets;
-    buckets.reserve(targets.size());
+    // Map raw target pointers back to their shared_ptrs. Do not pre-create
+    // result vectors for every visible surface: large VC3D sessions can have
+    // 100k+ targets, while a single viewport/plane usually intersects only a
+    // small fraction of them.
+    std::unordered_map<const QuadSurface*, SurfacePtr> targetByRaw;
+    targetByRaw.reserve(targets.size());
     for (const auto& t : targets) {
-        if (t) buckets.emplace(t.get(), &result[t]);
+        if (t) {
+            targetByRaw.emplace(t.get(), t);
+        }
     }
 
     // Patch-level reject: skip patches whose bbox lies entirely on one
@@ -2627,17 +3135,11 @@ SurfacePatchIndex::computePlaneIntersections(
         [&](const TriangleCandidate& tri) {
             auto seg = clipTriangleToPlane(tri, plane, clipTolerance);
             if (!seg) return;
-            auto it = buckets.find(tri.surface.get());
-            if (it == buckets.end()) return;
-            it->second->push_back(std::move(*seg));
+            auto it = targetByRaw.find(tri.surface.get());
+            if (it == targetByRaw.end()) return;
+            result[it->second].push_back(std::move(*seg));
         },
         bboxStraddlesPlane);
-
-    // Drop empty entries that were pre-created but never received a segment.
-    for (auto it = result.begin(); it != result.end(); ) {
-        if (it->second.empty()) it = result.erase(it);
-        else ++it;
-    }
 
     return result;
 }
