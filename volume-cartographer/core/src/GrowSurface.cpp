@@ -1750,6 +1750,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         std::cerr << "warning: growth_neighbor_count must be 4 or 8; defaulting to 4" << std::endl;
         requested_neighbor_count = 4;
     }
+    const int max_no_growth_expansions = params.value("max_no_growth_expansions", 5);
     std::vector<cv::Vec2i> neighs = requested_neighbor_count == 8 ? all_8_neighs : legacy_4_neighs;
 
     if (has_growth_directions) {
@@ -1793,6 +1794,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
               << " up=" << grow_up
               << " left=" << grow_left
               << " neighbor_count=" << neighs.size()
+              << " max_no_growth_expansions=" << max_no_growth_expansions
               << " expand_grid=" << !disable_grid_expansion
               << " steps=" << stop_gen << std::endl;
 
@@ -2107,6 +2109,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     cv::Rect best_used_area = used_area;
     int best_expanded_left = expanded_left;
     int best_expanded_up = expanded_up;
+    int last_expansion_loc_valid_count = best_loc_valid_count;
+    int no_growth_expansions = 0;
 
     auto save_best_surface = [&](int count) {
         best_loc_valid_count = count;
@@ -2898,6 +2902,18 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         const bool can_expand_down = !disable_grid_expansion && grow_down && remaining_down > 0 && h < max_grid_h;
         if (fringe.empty() && (can_expand_left || can_expand_right || can_expand_up || can_expand_down))
         {
+            if (loc_valid_count <= last_expansion_loc_valid_count) {
+                no_growth_expansions++;
+            } else {
+                no_growth_expansions = 0;
+            }
+            last_expansion_loc_valid_count = loc_valid_count;
+            if (max_no_growth_expansions > 0 && no_growth_expansions >= max_no_growth_expansions) {
+                std::cout << "stopping growth after " << no_growth_expansions
+                          << " expansions with no valid-count increase"
+                          << " (valid=" << loc_valid_count << ")" << std::endl;
+                break;
+            }
             at_right_border = false;
             int width_capacity = max_grid_w - w;
             int height_capacity = max_grid_h - h;
