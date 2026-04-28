@@ -58,8 +58,8 @@ bool isMmapCompatible(const TiffInfo& info)
            info.bits == 32 &&
            info.sampleFormat == SAMPLEFORMAT_IEEEFP &&
            info.compression == COMPRESSION_NONE &&
-           info.strips == 1 &&
-           info.rowsPerStrip >= info.height;
+           info.strips > 0 &&
+           info.rowsPerStrip > 0;
 }
 
 float sampleToFloat(const uint8_t* p, uint16_t sampleFormat, uint16_t bits)
@@ -278,7 +278,9 @@ int main(int argc, char** argv)
     }
 
     std::vector<fs::path> surfaces;
-    if (recursive) {
+    if (isTifxyzDir(root)) {
+        surfaces.push_back(root);
+    } else if (recursive) {
         for (const auto& entry : fs::recursive_directory_iterator(root)) {
             if (entry.is_directory() && isTifxyzDir(entry.path())) {
                 surfaces.push_back(entry.path());
