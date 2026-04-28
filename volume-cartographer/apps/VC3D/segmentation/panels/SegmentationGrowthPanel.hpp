@@ -153,6 +153,7 @@ private:
     QDoubleSpinBox* _spinPatchDistLoss3dWeight{nullptr};
     QSpinBox* _spinPatchSdir3dRadius{nullptr};
     QDoubleSpinBox* _spinPatchSdir3dWeight{nullptr};
+    QDoubleSpinBox* _spinPatchSdir3dGlobalWeight{nullptr};
     QDoubleSpinBox* _spinPatchSdir3dCandidateMax{nullptr};
     QDoubleSpinBox* _spinPatchStraightMinCount{nullptr};
     QSpinBox* _spinPatchInlierBaseThreshold{nullptr};
@@ -208,6 +209,7 @@ private:
     double _patchDistLoss3dWeight{2.0};
     int _patchSdir3dRadius{2};
     double _patchSdir3dWeight{0.5};
+    double _patchSdir3dGlobalWeight{0.25};
     double _patchSdir3dCandidateMax{4.0};
     double _patchStraightMinCount{1.0};
     int _patchInlierBaseThreshold{20};

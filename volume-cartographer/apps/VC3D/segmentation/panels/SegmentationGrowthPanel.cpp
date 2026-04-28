@@ -391,7 +391,7 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
         auto* rowLayout = new QHBoxLayout(row);
         rowLayout->setContentsMargins(0, 0, 0, 0);
         rowLayout->setSpacing(4);
-        rowLayout->addWidget(spin);
+        rowLayout->addWidget(spin, 1);
 
         auto* reset = new QToolButton(row);
         reset->setAutoRaise(true);
@@ -442,6 +442,7 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
     _spinPatchDistLoss3dWeight = addDoubleParam(tr("Dist loss 3D"), 0.0, 100.0, 0.1, _patchDistLoss3dWeight, 2.0);
     _spinPatchSdir3dRadius = addIntParam(tr("SDIR radius 3D"), 0, 8, 1, _patchSdir3dRadius, 2);
     _spinPatchSdir3dWeight = addDoubleParam(tr("SDIR weight 3D"), 0.0, 100.0, 0.1, _patchSdir3dWeight, 0.5);
+    _spinPatchSdir3dGlobalWeight = addDoubleParam(tr("SDIR global weight 3D"), 0.0, 100.0, 0.1, _patchSdir3dGlobalWeight, 0.25);
     _spinPatchSdir3dCandidateMax = addDoubleParam(tr("SDIR candidate max"), 0.0, 1000.0, 0.1, _patchSdir3dCandidateMax, 4.0);
     _spinPatchStraightMinCount = addDoubleParam(tr("Straight min count"), 0.0, 16.0, 0.5, _patchStraightMinCount, 1.0);
     _spinPatchInlierBaseThreshold = addIntParam(tr("Inlier base threshold"), 0, 10000, 1, _patchInlierBaseThreshold, 20);
@@ -949,6 +950,7 @@ utils::Json SegmentationGrowthPanel::patchTracerParamsJson() const
     params["dist_loss_3d_w"] = _patchDistLoss3dWeight;
     params["sdir_3d_radius"] = _patchSdir3dRadius;
     params["sdir_3d_w"] = _patchSdir3dWeight;
+    params["sdir_3d_global_w"] = _patchSdir3dGlobalWeight;
     params["sdir_3d_candidate_max"] = _patchSdir3dCandidateMax;
     params["straight_min_count"] = _patchStraightMinCount;
     params["inlier_base_threshold"] = _patchInlierBaseThreshold;
@@ -1254,6 +1256,7 @@ void SegmentationGrowthPanel::resetPatchTracerParams(bool persist)
     _patchDistLoss3dWeight = 2.0;
     _patchSdir3dRadius = 2;
     _patchSdir3dWeight = 0.5;
+    _patchSdir3dGlobalWeight = 0.25;
     _patchSdir3dCandidateMax = 4.0;
     _patchStraightMinCount = 1.0;
     _patchInlierBaseThreshold = 20;
@@ -1288,6 +1291,7 @@ void SegmentationGrowthPanel::syncPatchTracerParamsUi()
     setSpin(_spinPatchDistLoss3dWeight, _patchDistLoss3dWeight);
     setSpin(_spinPatchSdir3dRadius, _patchSdir3dRadius);
     setSpin(_spinPatchSdir3dWeight, _patchSdir3dWeight);
+    setSpin(_spinPatchSdir3dGlobalWeight, _patchSdir3dGlobalWeight);
     setSpin(_spinPatchSdir3dCandidateMax, _patchSdir3dCandidateMax);
     setSpin(_spinPatchStraightMinCount, _patchStraightMinCount);
     setSpin(_spinPatchInlierBaseThreshold, _patchInlierBaseThreshold);
@@ -1326,6 +1330,7 @@ void SegmentationGrowthPanel::persistPatchTracerParams()
     if (_spinPatchDistLoss3dWeight) _patchDistLoss3dWeight = _spinPatchDistLoss3dWeight->value();
     if (_spinPatchSdir3dRadius) _patchSdir3dRadius = _spinPatchSdir3dRadius->value();
     if (_spinPatchSdir3dWeight) _patchSdir3dWeight = _spinPatchSdir3dWeight->value();
+    if (_spinPatchSdir3dGlobalWeight) _patchSdir3dGlobalWeight = _spinPatchSdir3dGlobalWeight->value();
     if (_spinPatchSdir3dCandidateMax) _patchSdir3dCandidateMax = _spinPatchSdir3dCandidateMax->value();
     if (_spinPatchStraightMinCount) _patchStraightMinCount = _spinPatchStraightMinCount->value();
     if (_spinPatchInlierBaseThreshold) _patchInlierBaseThreshold = _spinPatchInlierBaseThreshold->value();
@@ -1352,6 +1357,7 @@ void SegmentationGrowthPanel::persistPatchTracerParams()
     writeSetting(QStringLiteral("patch_dist_loss_3d_w"), _patchDistLoss3dWeight);
     writeSetting(QStringLiteral("patch_sdir_3d_radius"), _patchSdir3dRadius);
     writeSetting(QStringLiteral("patch_sdir_3d_w"), _patchSdir3dWeight);
+    writeSetting(QStringLiteral("patch_sdir_3d_global_w"), _patchSdir3dGlobalWeight);
     writeSetting(QStringLiteral("patch_sdir_3d_candidate_max"), _patchSdir3dCandidateMax);
     writeSetting(QStringLiteral("patch_straight_min_count"), _patchStraightMinCount);
     writeSetting(QStringLiteral("patch_inlier_base_threshold"), _patchInlierBaseThreshold);
@@ -1461,6 +1467,7 @@ void SegmentationGrowthPanel::restoreSettings(QSettings& settings)
     _patchDistLoss3dWeight = std::clamp(settings.value(QStringLiteral("patch_dist_loss_3d_w"), _patchDistLoss3dWeight).toDouble(), 0.0, 100.0);
     _patchSdir3dRadius = std::clamp(settings.value(QStringLiteral("patch_sdir_3d_radius"), _patchSdir3dRadius).toInt(), 0, 8);
     _patchSdir3dWeight = std::clamp(settings.value(QStringLiteral("patch_sdir_3d_w"), _patchSdir3dWeight).toDouble(), 0.0, 100.0);
+    _patchSdir3dGlobalWeight = std::clamp(settings.value(QStringLiteral("patch_sdir_3d_global_w"), _patchSdir3dGlobalWeight).toDouble(), 0.0, 100.0);
     _patchSdir3dCandidateMax = std::clamp(settings.value(QStringLiteral("patch_sdir_3d_candidate_max"), _patchSdir3dCandidateMax).toDouble(), 0.0, 1000.0);
     _patchStraightMinCount = std::clamp(settings.value(QStringLiteral("patch_straight_min_count"), _patchStraightMinCount).toDouble(), 0.0, 16.0);
     _patchInlierBaseThreshold = std::clamp(settings.value(QStringLiteral("patch_inlier_base_threshold"), _patchInlierBaseThreshold).toInt(), 0, 10000);

@@ -200,6 +200,7 @@ static float dist_loss_2d_w = 1.0f;        // Weight for 2D distance constraints
 static float dist_loss_3d_w = 2.0f;        // Weight for 3D distance constraints
 static int sdir_3d_radius = 2;             // Symmetric-Dirichlet metric radius, in grid strides
 static float sdir_3d_w = 0.5f;             // Weight for local 3D metric preservation
+static float sdir_3d_global_w = 0.25f;     // Weight for 3D metric preservation during global optimization
 static float sdir_3d_candidate_max = 4.0f; // Reject candidates with a worse local metric residual
 static float straight_min_count = 1.0f;    // Minimum number of straight constraints
 static int inlier_base_threshold = 20;     // Starting threshold for inliers
@@ -552,9 +553,9 @@ static int add_surftrack_distloss_3D(cv::Mat_<cv::Vec3d> &points, const cv::Vec2
 }
 
 static int add_surftrack_sdirloss_3D(cv::Mat_<cv::Vec3d> &points, const cv::Vec2i &p, int stride,
-    ceres::Problem &problem, const cv::Mat_<uint8_t> &state, float unit)
+    ceres::Problem &problem, const cv::Mat_<uint8_t> &state, float unit, float weight = sdir_3d_w)
 {
-    if (sdir_3d_w <= 0.0f || stride < 1)
+    if (weight <= 0.0f || stride < 1)
         return 0;
 
     const cv::Vec2i pu = p + cv::Vec2i(0, stride);
@@ -575,7 +576,7 @@ static int add_surftrack_sdirloss_3D(cv::Mat_<cv::Vec3d> &points, const cv::Vec2
         return 0;
 
     problem.AddResidualBlock(
-        SymmetricDirichletLoss::Create(unit * stride, sdir_3d_w, 1e-8, 1e-2),
+        SymmetricDirichletLoss::Create(unit * stride, weight, 1e-8, 1e-2),
         new ceres::CauchyLoss(1.0),
         &points(p)[0],
         &points(pu)[0],
@@ -622,7 +623,7 @@ static int cond_surftrack_sdirloss_3D(int type, QuadSurface *sm, cv::Mat_<cv::Ve
     if (data.hasResId(id))
         return 0;
 
-    const int count = add_surftrack_sdirloss_3D(points, p, stride, problem, state, unit);
+    const int count = add_surftrack_sdirloss_3D(points, p, stride, problem, state, unit, sdir_3d_global_w);
     if (count) {
         data.resId(id) = nullptr;
     }
@@ -633,7 +634,7 @@ static int cond_surftrack_sdirloss_3D(int type, QuadSurface *sm, cv::Mat_<cv::Ve
 static int cond_surftrack_sdirlosses_3D(QuadSurface *sm, cv::Mat_<cv::Vec3d> &points, const cv::Vec2i &p,
     SurfTrackerData &data, ceres::Problem &problem, const cv::Mat_<uint8_t> &state, float unit)
 {
-    if (sdir_3d_radius < 1 || sdir_3d_w <= 0.0f)
+    if (sdir_3d_radius < 1 || sdir_3d_global_w <= 0.0f)
         return 0;
 
     int count = 0;
@@ -1535,6 +1536,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     dist_loss_3d_w = params.value("dist_loss_3d_w", 2.0f);              // Weight for 3D distance constraints
     sdir_3d_radius = params.value("sdir_3d_radius", 2);
     sdir_3d_w = params.value("sdir_3d_w", 0.5f);
+    sdir_3d_global_w = params.value("sdir_3d_global_w", 0.5f * sdir_3d_w);
     sdir_3d_candidate_max = params.value("sdir_3d_candidate_max", 4.0f);
     straight_min_count = params.value("straight_min_count", 1.0f);      // Minimum number of straight constraints
     inlier_base_threshold = params.value("inlier_base_threshold", 20);  // Starting threshold for inliers
@@ -1579,6 +1581,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::cout << "  dist_loss_3d_w: " << dist_loss_3d_w << std::endl;
     std::cout << "  sdir_3d_radius: " << sdir_3d_radius << std::endl;
     std::cout << "  sdir_3d_w: " << sdir_3d_w << std::endl;
+    std::cout << "  sdir_3d_global_w: " << sdir_3d_global_w << std::endl;
     std::cout << "  sdir_3d_candidate_max: " << sdir_3d_candidate_max << std::endl;
     std::cout << "  use_patch_cache: "
               << (use_patch_cache ? "true" : "false") << std::endl;
