@@ -106,6 +106,7 @@ private slots:
     QPushButton *_fill_winding_plus_button;
     QPushButton *_fill_winding_minus_button;
     QPushButton *_fill_winding_equals_button;
+    QDoubleSpinBox *_fill_constant_spinbox;
     QLabel *_anchor_status_label;
     QPushButton *_clear_anchor_button;
 

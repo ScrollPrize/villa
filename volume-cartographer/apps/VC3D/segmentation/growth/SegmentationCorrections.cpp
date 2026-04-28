@@ -130,7 +130,16 @@ void CorrectionsState::handlePointAdded(const cv::Vec3f& worldPos, float wind_a)
     }
 
     ColPoint pt = _collection->addPoint(it->second.name, worldPos);
-    if (!std::isnan(wind_a)) {
+
+    // Priority: auto-fill mode > d.tif lookup
+    auto mode = _collection->getAutoFillMode(_activeCollectionId);
+    if (mode != VCCollection::WindingFillMode::None) {
+        float autoVal = _collection->computeAutoFillValue(_activeCollectionId);
+        if (!std::isnan(autoVal)) {
+            pt.winding_annotation = autoVal;
+            _collection->updatePoint(pt);
+        }
+    } else if (!std::isnan(wind_a)) {
         pt.winding_annotation = wind_a;
         _collection->updatePoint(pt);
     }

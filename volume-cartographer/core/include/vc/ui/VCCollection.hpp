@@ -34,6 +34,7 @@ class VCCollection : public QObject
 
 public:
     enum class WindingFillMode {
+        None,
         Incremental,
         Decremental,
         Constant
@@ -47,6 +48,8 @@ public:
         CollectionMetadata metadata;
         cv::Vec3f color;
         std::optional<cv::Vec2f> anchor2d;  // 2D grid anchor for drag-and-drop corrections
+        WindingFillMode autoFillMode = WindingFillMode::None;
+        float autoFillConstant = 0.0f;
     };
 
     explicit VCCollection(QObject* parent = nullptr);
@@ -71,7 +74,11 @@ public:
     std::optional<ColPoint> getPoint(uint64_t pointId) const;
     std::vector<ColPoint> getPoints(const std::string& collectionName) const;
     std::string generateNewCollectionName(const std::string& prefix = "col") const;
-    void autoFillWindingNumbers(uint64_t collectionId, WindingFillMode mode);
+    void autoFillWindingNumbers(uint64_t collectionId, WindingFillMode mode, float constantValue = 0.0f);
+    void setAutoFillMode(uint64_t collectionId, WindingFillMode mode, float constantValue = 0.0f);
+    WindingFillMode getAutoFillMode(uint64_t collectionId) const;
+    float getAutoFillConstant(uint64_t collectionId) const;
+    float computeAutoFillValue(uint64_t collectionId) const;
 
    bool saveToJSON(const std::string& filename) const;
    bool loadFromJSON(const std::string& filename);

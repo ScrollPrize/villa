@@ -1439,9 +1439,43 @@ void SegmentationModule::handleCorrectionPointAdded(const cv::Vec3f& worldPos, u
 
     // Look up winding depth index from d.tif channel → store in winding_annotation
     float wind_a = NAN;
-    auto* surface = activeBaseSurface();
-    if (surface && _editManager) {
-        auto gridIdx = _editManager->worldToGridIndex(worldPos);
+    QuadSurface* surface = activeBaseSurface();
+    std::shared_ptr<Surface> surfaceHolder;
+
+    // Fallback: get surface from state if no editing session
+    if (!surface && _state) {
+        surfaceHolder = _state->surface("segmentation");
+        surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
+    }
+
+    if (surface) {
+        // Try edit manager first (has preview points if editing)
+        std::optional<std::pair<int, int>> gridIdx;
+        if (_editManager && _editManager->hasSession()) {
+            gridIdx = _editManager->worldToGridIndex(worldPos);
+        }
+
+        // Fallback: use patch index directly
+        if (!gridIdx) {
+            auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+            auto surfQ = surfaceHolder
+                ? std::dynamic_pointer_cast<QuadSurface>(surfaceHolder)
+                : activeBaseSurfaceShared();
+            if (patchIndex && !patchIndex->empty() && surfQ) {
+                const auto* pts = surface->rawPointsPtr();
+                if (pts && pts->rows > 0 && pts->cols > 0) {
+                    float tol = std::max(surface->scale()[0] * 64.0f, 512.0f);
+                    auto hit = patchIndex->locate(worldPos, tol, surfQ);
+                    if (hit) {
+                        cv::Vec2f grid = surface->ptrToGrid(hit->ptr);
+                        int col = std::clamp(static_cast<int>(std::round(grid[0])), 0, pts->cols - 1);
+                        int row = std::clamp(static_cast<int>(std::round(grid[1])), 0, pts->rows - 1);
+                        gridIdx = {row, col};
+                    }
+                }
+            }
+        }
+
         if (gridIdx) {
             wind_a = lookupDepthIndex(surface, gridIdx->first, gridIdx->second);
         }

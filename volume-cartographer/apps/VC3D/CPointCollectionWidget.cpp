@@ -116,9 +116,19 @@ void CPointCollectionWidget::setupUi()
     _fill_winding_plus_button = new QPushButton("Fill +");
     _fill_winding_minus_button = new QPushButton("Fill -");
     _fill_winding_equals_button = new QPushButton("Fill =");
+    _fill_winding_plus_button->setCheckable(true);
+    _fill_winding_minus_button->setCheckable(true);
+    _fill_winding_equals_button->setCheckable(true);
+    _fill_constant_spinbox = new QDoubleSpinBox();
+    _fill_constant_spinbox->setRange(-1000, 1000);
+    _fill_constant_spinbox->setDecimals(1);
+    _fill_constant_spinbox->setSingleStep(1.0);
+    _fill_constant_spinbox->setValue(0.0);
+    _fill_constant_spinbox->setMaximumWidth(80);
     fill_layout->addWidget(_fill_winding_plus_button);
     fill_layout->addWidget(_fill_winding_minus_button);
     fill_layout->addWidget(_fill_winding_equals_button);
+    fill_layout->addWidget(_fill_constant_spinbox);
     collection_layout->addLayout(fill_layout);
 
     // Anchor status for drag-and-drop corrections
@@ -140,6 +150,10 @@ void CPointCollectionWidget::setupUi()
     connect(_fill_winding_plus_button, &QPushButton::clicked, this, &CPointCollectionWidget::onFillWindingPlusClicked);
     connect(_fill_winding_minus_button, &QPushButton::clicked, this, &CPointCollectionWidget::onFillWindingMinusClicked);
     connect(_fill_winding_equals_button, &QPushButton::clicked, this, &CPointCollectionWidget::onFillWindingEqualsClicked);
+    connect(_fill_constant_spinbox, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
+        if (_selected_collection_id != 0 && _fill_winding_equals_button->isChecked())
+            _point_collection->setAutoFillMode(_selected_collection_id, VCCollection::WindingFillMode::Constant, static_cast<float>(v));
+    });
 
     // Point Metadata
     _point_metadata_group = new QGroupBox("Point Metadata");
@@ -539,6 +553,15 @@ void CPointCollectionWidget::updateMetadataWidgets()
                 _anchor_status_label->setText("Anchor: none");
                 _clear_anchor_button->setEnabled(false);
             }
+
+            // Restore auto-fill button states
+            auto fillMode = collection.autoFillMode;
+            _fill_winding_plus_button->setChecked(fillMode == VCCollection::WindingFillMode::Incremental);
+            _fill_winding_minus_button->setChecked(fillMode == VCCollection::WindingFillMode::Decremental);
+            _fill_winding_equals_button->setChecked(fillMode == VCCollection::WindingFillMode::Constant);
+            _fill_constant_spinbox->blockSignals(true);
+            _fill_constant_spinbox->setValue(collection.autoFillConstant);
+            _fill_constant_spinbox->blockSignals(false);
         }
     } else {
         _collection_name_edit->clear();
@@ -546,6 +569,10 @@ void CPointCollectionWidget::updateMetadataWidgets()
         _color_button->setAutoFillBackground(false);
         _anchor_status_label->setText("Anchor: none");
         _clear_anchor_button->setEnabled(false);
+        _fill_winding_plus_button->setChecked(false);
+        _fill_winding_minus_button->setChecked(false);
+        _fill_winding_equals_button->setChecked(false);
+        _fill_constant_spinbox->setValue(0.0);
     }
 
     if (point_selected) {
@@ -652,23 +679,49 @@ void CPointCollectionWidget::onWindingEnabledChanged(Qt::CheckState state)
 
 void CPointCollectionWidget::onFillWindingPlusClicked()
 {
-    if (_selected_collection_id != 0) {
-        _point_collection->autoFillWindingNumbers(_selected_collection_id, VCCollection::WindingFillMode::Incremental);
+    if (_selected_collection_id == 0) return;
+
+    if (_fill_winding_plus_button->isChecked()) {
+        _fill_winding_minus_button->setChecked(false);
+        _fill_winding_equals_button->setChecked(false);
+        _point_collection->setAutoFillMode(_selected_collection_id, VCCollection::WindingFillMode::Incremental);
+    } else {
+        _point_collection->setAutoFillMode(_selected_collection_id, VCCollection::WindingFillMode::None);
     }
+
+    _point_collection->autoFillWindingNumbers(_selected_collection_id, VCCollection::WindingFillMode::Incremental);
 }
 
 void CPointCollectionWidget::onFillWindingMinusClicked()
 {
-    if (_selected_collection_id != 0) {
-        _point_collection->autoFillWindingNumbers(_selected_collection_id, VCCollection::WindingFillMode::Decremental);
+    if (_selected_collection_id == 0) return;
+
+    if (_fill_winding_minus_button->isChecked()) {
+        _fill_winding_plus_button->setChecked(false);
+        _fill_winding_equals_button->setChecked(false);
+        _point_collection->setAutoFillMode(_selected_collection_id, VCCollection::WindingFillMode::Decremental);
+    } else {
+        _point_collection->setAutoFillMode(_selected_collection_id, VCCollection::WindingFillMode::None);
     }
+
+    _point_collection->autoFillWindingNumbers(_selected_collection_id, VCCollection::WindingFillMode::Decremental);
 }
 
 void CPointCollectionWidget::onFillWindingEqualsClicked()
 {
-    if (_selected_collection_id != 0) {
-        _point_collection->autoFillWindingNumbers(_selected_collection_id, VCCollection::WindingFillMode::Constant);
+    if (_selected_collection_id == 0) return;
+
+    float constVal = static_cast<float>(_fill_constant_spinbox->value());
+
+    if (_fill_winding_equals_button->isChecked()) {
+        _fill_winding_plus_button->setChecked(false);
+        _fill_winding_minus_button->setChecked(false);
+        _point_collection->setAutoFillMode(_selected_collection_id, VCCollection::WindingFillMode::Constant, constVal);
+    } else {
+        _point_collection->setAutoFillMode(_selected_collection_id, VCCollection::WindingFillMode::None);
     }
+
+    _point_collection->autoFillWindingNumbers(_selected_collection_id, VCCollection::WindingFillMode::Constant, constVal);
 }
  
 void CPointCollectionWidget::onSaveClicked()
