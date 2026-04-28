@@ -1573,11 +1573,17 @@ def _corr_winding_loss(
 				(1 - uf) * vf * M01_det + uf * vf * M11_det
 
 			# Strip from P to Q: signed winding
-			sw, _, sv = _wind_strip_integral(P[vi], Q, gt_n[vi], res.data, strip_samples)
+			sw, uw, sv = _wind_strip_integral(P[vi], Q, gt_n[vi], res.data, strip_samples)
 
 			# Target offset
 			tgt = tgt_fn(frac[vi])
 			err = sw - tgt
+
+			# Single-sided distance cutoff: reject points > 2 windings from surface
+			# when not bracketed (above top layer or below bottom layer).
+			# Bracketed points skip this — large uw there is just density variation.
+			is_bracketed = _wind_anchors_valid[vi, 0] & _wind_anchors_valid[vi, 1]
+			too_far = ~is_bracketed & (uw > 2.0)
 
 			# Store error for results (weighted by frac proximity)
 			fw = frac_weight[ci][vi]
@@ -1605,8 +1611,8 @@ def _corr_winding_loss(
 
 		lm = w00 * lm00 + w10 * lm10 + w01 * lm01 + w11 * lm11
 
-		# Mask by strip validity, weighted by frac proximity to target
-		mask_ci = sv.to(dt) * frac_weight[ci][vi]
+		# Mask by strip validity + distance cutoff, weighted by frac proximity to target
+		mask_ci = sv.to(dt) * (~too_far).to(dt) * frac_weight[ci][vi]
 		wsum = float(mask_ci.sum().detach().cpu())
 		if wsum > 0:
 			total_loss = total_loss + (lm * mask_ci).sum()
