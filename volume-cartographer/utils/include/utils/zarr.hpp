@@ -1388,10 +1388,8 @@ public:
         f.read(reinterpret_cast<char*>(&nbytes), 8);
         if (!f) return false;
         // Not present: (0xFF..FF, 0xFF..FF). Empty/zero: (0xFF..FE, 0).
-        // Verified-absent (our marker): (0xFF..FD, 0).
         if (offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0)) return false;
         if (offset == (~std::uint64_t(0) - 1) && nbytes == 0) return false;
-        if (offset == (~std::uint64_t(0) - 2) && nbytes == 0) return false;
         return true;
     }
 
