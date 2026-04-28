@@ -77,13 +77,11 @@ set_source_files_properties(src/Slicing.cpp PROPERTIES
 
 # Precompiled headers for faster builds
 if(VC_USE_PCH)
-# Downstream targets (vc_ui, vc_tracer, VC3D) link Qt6 and REUSE_FROM vc_core.
-# Qt6::Core may inject interface compile options (e.g. -mno-direct-extern-access
-# on GCC); the PCH must be compiled with the same flags or GCC ignores it.
-get_target_property(_qt_compile_opts Qt6::Core INTERFACE_COMPILE_OPTIONS)
-if(_qt_compile_opts)
-    target_compile_options(vc_core PRIVATE ${_qt_compile_opts})
-endif()
+# Downstream targets (vc_ui, vc_tracer, VC3D) REUSE_FROM vc_core and link Qt6.
+# Qt6 injects compile flags via generator expressions (e.g. -mno-direct-extern-access
+# on GCC). The PCH must be compiled with the same flags or GCC ignores it.
+# Linking Qt6::Core PRIVATE makes CMake evaluate the genexps for the PCH build.
+target_link_libraries(vc_core PRIVATE Qt6::Core)
 target_precompile_headers(vc_core PRIVATE
     # STL - containers
     <array>
