@@ -840,12 +840,13 @@ def _corr_winding_loss(
 				new_d1 = rd[:, 1].tolist()
 				new_v0 = rv[:, 0].tolist()
 				new_v1 = rv[:, 1].tolist()
-				print(f"[corr-wind] re-init {n_ri} points (just_lost={int(just_lost.sum())}, "
-					  f"persistent={int(persistent_lost.sum())}, step={_wind_reinit_counter})")
-				for j in range(n_ri):
-					old_b = f"{old_d0[j]}-{old_d1[j]}" if old_v0[j] and old_v1[j] else "---"
-					new_b = f"{new_d0[j]}-{new_d1[j]}" if new_v0[j] and new_v1[j] else "---"
-					print(f"  pt {int(ri[j])}: bracket {old_b} -> {new_b}")
+				if dbg:
+					print(f"[corr-wind] re-init {n_ri} points (just_lost={int(just_lost.sum())}, "
+						  f"persistent={int(persistent_lost.sum())}, step={_wind_reinit_counter})")
+					for j in range(n_ri):
+						old_b = f"{old_d0[j]}-{old_d1[j]}" if old_v0[j] and old_v1[j] else "---"
+						new_b = f"{new_d0[j]}-{new_d1[j]}" if new_v0[j] and new_v1[j] else "---"
+						print(f"  pt {int(ri[j])}: bracket {old_b} -> {new_b}")
 
 	# === Phase D: Proxy correction loss (avg pair, WITH gradients) ===
 	target = _wind_target_per_point
