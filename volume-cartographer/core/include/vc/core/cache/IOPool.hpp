@@ -60,6 +60,9 @@ public:
     void cancelPending();
 
     [[nodiscard]] size_t pendingCount() const noexcept;
+    [[nodiscard]] uint64_t stateVersion() const noexcept {
+        return stateVersion_.load(std::memory_order_relaxed);
+    }
 
     void stop();
 
@@ -97,6 +100,12 @@ private:
     // even though they're still processing the previous batch, generating
     // ~Nthreads useless context switches per frame.
     int idleCount_ = 0;
+
+    // Monotonic state counter for callers that deduplicate submissions.
+    // Bumped whenever queued/in-flight/done state changes, including
+    // transient-failure erases. This lets an identical viewport request
+    // re-run triage after the pool made progress or dropped work.
+    std::atomic<uint64_t> stateVersion_{0};
 
     int numThreads_;
     std::string threadLabel_;

@@ -53,6 +53,7 @@ void IOPool::start()
                         // it, instead of permanently marking it Done.
                         std::lock_guard lock(mutex_);
                         shards_.erase(shard);
+                        stateVersion_.fetch_add(1, std::memory_order_relaxed);
                         continue;
                     }
                 }
@@ -65,6 +66,7 @@ void IOPool::start()
                     std::lock_guard lock(mutex_);
                     if (fetchOk) shards_[shard] = ShardState::Done;
                     else         shards_.erase(shard);
+                    stateVersion_.fetch_add(1, std::memory_order_relaxed);
                 }
 
                 if (onComplete_ && !result.empty()) {
@@ -107,6 +109,7 @@ void IOPool::submit(const std::vector<ChunkKey>& keys)
                     queues_[sk.level].push_back(sk);
                     queueTotal_++;
                     ++addedCount;
+                    stateVersion_.fetch_add(1, std::memory_order_relaxed);
                 }
                 continue;
             }
@@ -115,6 +118,7 @@ void IOPool::submit(const std::vector<ChunkKey>& keys)
             queues_[sk.level].push_back(sk);
             queueTotal_++;
             ++addedCount;
+            stateVersion_.fetch_add(1, std::memory_order_relaxed);
         }
         idleSnapshot = idleCount_;
     }
@@ -192,6 +196,7 @@ void IOPool::updateInteractive(const std::vector<ChunkKey>& keys, int targetLeve
                 shards_[sk] = ShardState::Queued;
             }
             front[sk.level].push_back(sk);
+            stateVersion_.fetch_add(1, std::memory_order_relaxed);
         }
 
         queueTotal_ = 0;
@@ -272,6 +277,7 @@ ShardKey IOPool::popNext()
         queueTotal_--;
         served_[bestLevel]++;
         shards_[sk] = ShardState::InFlight;
+        stateVersion_.fetch_add(1, std::memory_order_relaxed);
         return sk;
     }
     // Unreachable: queueTotal_ > 0 implies some queue is non-empty.
@@ -290,6 +296,7 @@ void IOPool::cancelPending()
         q.clear();
     }
     queueTotal_ = 0;
+    stateVersion_.fetch_add(1, std::memory_order_relaxed);
 }
 
 size_t IOPool::pendingCount() const noexcept
