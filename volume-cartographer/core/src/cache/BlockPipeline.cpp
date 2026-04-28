@@ -46,9 +46,6 @@ static bool isAllZero(const uint8_t* data, size_t size) noexcept {
 
 static bool diskShardMarksChunkEmpty(utils::ZarrArray& dz, const ChunkKey& key) {
     if (!dz.is_sharded()) return false;
-    // Only honor our own verified-absent sentinel. Ignore zarr-spec empty
-    // markers — they could have been written by a prior buggy session and
-    // are no longer trusted as proof of absence.
     return dz.inner_chunk_is_verified_absent(chunkIndices(key));
 }
 
