@@ -1227,9 +1227,14 @@ uint64_t SegmentationModule::createCorrectionCollection(bool announce)
     return _corrections ? _corrections->createCollection(announce) : 0;
 }
 
-void SegmentationModule::handleCorrectionPointAdded(const cv::Vec3f& worldPos)
+void SegmentationModule::handleCorrectionPointAdded(const cv::Vec3f& worldPos, uint64_t collectionId)
 {
     if (!_corrections) return;
+
+    // If a specific collection is requested, switch to it
+    if (collectionId != 0) {
+        _corrections->setActiveCollection(collectionId, false);
+    }
 
     // Auto-create collection on first annotation
     if (!_corrections->hasActiveCollection()) {

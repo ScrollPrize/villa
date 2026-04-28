@@ -297,7 +297,7 @@ private:
     void updateCellReoptCollections();
     void setActiveCorrectionCollection(uint64_t collectionId, bool userInitiated);
     uint64_t createCorrectionCollection(bool announce);
-    void handleCorrectionPointAdded(const cv::Vec3f& worldPos);
+    void handleCorrectionPointAdded(const cv::Vec3f& worldPos, uint64_t collectionId = 0);
     void handleCorrectionPointRemove(const cv::Vec3f& worldPos);
     void beginCorrectionDrag(int row, int col, CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos);
     void updateCorrectionDrag(const cv::Vec3f& worldPos);

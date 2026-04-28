@@ -308,18 +308,7 @@ void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
         }
         // Shift+click: add new point to selected collection
         if (modifiers.testFlag(Qt::ShiftModifier)) {
-            // If a collection is selected, add to it directly
-            if (_selectedAnnotationCollectionId != 0 && _pointCollection) {
-                const auto& collections = _pointCollection->getAllCollections();
-                auto it = collections.find(_selectedAnnotationCollectionId);
-                if (it != collections.end()) {
-                    // Temporarily set the corrections active collection
-                    if (_corrections) {
-                        _corrections->setActiveCollection(_selectedAnnotationCollectionId, false);
-                    }
-                }
-            }
-            handleCorrectionPointAdded(worldPos);
+            handleCorrectionPointAdded(worldPos, _selectedAnnotationCollectionId);
             updateCorrectionsWidget();
             return;
         }
