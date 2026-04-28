@@ -86,6 +86,7 @@ public:
         // match this for byte-passthrough to be valid; every inner chunk is
         // magic-checked for "C3DC".
         std::array<int, 3> canonicalSourceShard = {0, 0, 0};
+        bool authProven = false;
     };
 
     BlockPipeline(
@@ -395,6 +396,14 @@ private:
     void bloomClear() noexcept;
     mutable std::mutex negativeMutex_;
     std::unordered_set<ChunkKey, ChunkKeyHash> negativeCache_;
+
+    enum class FetchVerdict { HasData, EmptyConfirmed, Transient };
+    static FetchVerdict classifyFetch(const std::vector<uint8_t>& bytes,
+                                       bool fetchThrew,
+                                       bool sourceConfirmsAbsent,
+                                       bool sourceHadTransientError,
+                                       bool authProven);
+    void markChunkAbsent(const ChunkKey& key, utils::ZarrArray* dz);
 
     mutable std::mutex callbackMutex_;
     std::vector<std::pair<ChunkReadyCallbackId, ChunkReadyCallback>> chunkReadyListeners_;

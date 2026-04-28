@@ -496,28 +496,44 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
     // per source shard instead of decoding and re-encoding every inner
     // chunk. We probe level 0 zarr.json directly because the
     // remoteShardConfig from NewFromUrl isn't always populated.
+    config.authProven = !isRemote_;
     if (isRemote_) {
         try {
             auto resolved = vc::resolveRemoteUrl(remoteUrl_);
             const std::string base = resolved.httpsUrl
                 + (resolved.httpsUrl.back() == '/' ? "" : "/");
-            auto json = vc::cache::httpGetString(base + "0/zarr.json", remoteAuth_);
+            std::string json;
+            for (const std::string& probe :
+                 {std::string("0/zarr.json"), std::string("zarr.json"),
+                  std::string("0/.zarray"), std::string(".zattrs")}) {
+                json = vc::cache::httpGetString(base + probe, remoteAuth_);
+                if (!json.empty()) break;
+            }
             if (!json.empty()) {
-                auto meta = utils::detail::parse_zarr_json(json);
-                if (utils::is_canonical_c3d(meta)
-                    && meta.chunks.size() >= 3
-                    && meta.chunks[0] == 4096
-                    && meta.chunks[1] == 4096
-                    && meta.chunks[2] == 4096) {
-                    config.canonicalSourceShard = {4096, 4096, 4096};
-                    fprintf(stderr,
-                        "[Volume] canonical-passthrough enabled "
-                        "(c3d source shards 4096^3 match local)\n");
-                }
+                config.authProven = true;
+                fprintf(stderr,
+                    "[Volume] auth proven for %s\n", base.c_str());
+                try {
+                    auto meta = utils::detail::parse_zarr_json(json);
+                    if (utils::is_canonical_c3d(meta)
+                        && meta.chunks.size() >= 3
+                        && meta.chunks[0] == 4096
+                        && meta.chunks[1] == 4096
+                        && meta.chunks[2] == 4096) {
+                        config.canonicalSourceShard = {4096, 4096, 4096};
+                        fprintf(stderr,
+                            "[Volume] canonical-passthrough enabled "
+                            "(c3d source shards 4096^3 match local)\n");
+                    }
+                } catch (...) { /* non-c3d source — that's fine */ }
+            } else {
+                fprintf(stderr,
+                    "[Volume] auth probe failed for %s — disabling negative caching\n",
+                    base.c_str());
             }
         } catch (const std::exception& e) {
             fprintf(stderr,
-                "[Volume] canonical-passthrough detection failed: %s\n",
+                "[Volume] auth probe failed: %s — disabling negative caching\n",
                 e.what());
         }
     }

@@ -44,16 +44,38 @@ static bool isAllZero(const uint8_t* data, size_t size) noexcept {
     return true;
 }
 
-// Two zarr sharded-index sentinel states we care about:
-//   (0xFF..F, 0xFF..F) — "missing" : the default fill for a freshly-created
-//       shard file. Semantically "dunno, not yet fetched" — we should retry.
-//   (0xFF..E, 0)        — "empty"   : we positively confirmed the chunk is
-//       absent/zero remotely. Skip re-fetching.
-// inner_chunk_is_empty() specifically tests for the (0xFF..E, 0) sentinel,
-// so it only returns true for the "confirmed empty" state.
 static bool diskShardMarksChunkEmpty(utils::ZarrArray& dz, const ChunkKey& key) {
     if (!dz.is_sharded()) return false;
     return dz.inner_chunk_is_empty(chunkIndices(key));
+}
+
+BlockPipeline::FetchVerdict BlockPipeline::classifyFetch(
+    const std::vector<uint8_t>& bytes,
+    bool fetchThrew,
+    bool sourceConfirmsAbsent,
+    bool sourceHadTransientError,
+    bool authProven)
+{
+    if (fetchThrew) return FetchVerdict::Transient;
+    if (sourceHadTransientError) return FetchVerdict::Transient;
+    if (!bytes.empty()) {
+        if (isAllZero(bytes.data(), bytes.size())) return FetchVerdict::EmptyConfirmed;
+        return FetchVerdict::HasData;
+    }
+    if (sourceConfirmsAbsent && authProven) return FetchVerdict::EmptyConfirmed;
+    return FetchVerdict::Transient;
+}
+
+void BlockPipeline::markChunkAbsent(const ChunkKey& key, utils::ZarrArray* dz)
+{
+    bloomAdd(key);
+    {
+        std::lock_guard lock(negativeMutex_);
+        negativeCache_.insert(key);
+    }
+    if (dz && dz->is_sharded()) {
+        dz->mark_inner_chunk_empty(chunkIndices(key));
+    }
 }
 
 ShardKey BlockPipeline::canonicalShardKey(const ChunkKey& key) const noexcept
@@ -352,9 +374,7 @@ BlockPipeline::BlockPipeline(
         if (!dz || !source_) return {};
 
         if (diskShardMarksChunkEmpty(*dz, key)) {
-            bloomAdd(key);
-            std::lock_guard lock(negativeMutex_);
-            negativeCache_.insert(key);
+            markChunkAbsent(key, dz);
             return {};
         }
 
@@ -390,10 +410,7 @@ BlockPipeline::BlockPipeline(
         }
         if (!decoded) {
             if (outcome == AssembleOutcome::Absent) {
-                bloomAdd(key);
-                std::lock_guard lock(negativeMutex_);
-                negativeCache_.insert(key);
-                if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
+                markChunkAbsent(key, dz);
             }
             return {};
         }
@@ -493,13 +510,9 @@ BlockPipeline::BlockPipeline(
 
         if (dz) {
             if (diskShardMarksChunkEmpty(*dz, key)) {
-                bloomAdd(key);
-                std::lock_guard lock(negativeMutex_);
-                negativeCache_.insert(key);
+                markChunkAbsent(key, dz);
                 return {};
             }
-            // Route through the shard cache. Subsequent inner chunks from
-            // the same shard served from RAM with no syscalls.
             std::optional<std::vector<std::byte>> innerBytes;
             if (dz->is_sharded() && config_.shardCacheBytes > 0) {
                 auto shardBytes = shardBytesFor(key, *dz);
@@ -523,16 +536,18 @@ BlockPipeline::BlockPipeline(
                     reinterpret_cast<const uint8_t*>(innerBytes->data() + innerBytes->size()));
             }
         } else if (source_) {
-            // Local source, no disk tier: treat the source files as disk.
-            try { compressed = source_->fetch(key); } catch (...) { return {}; }
-            if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) {
-                if (source_->lastFetchConfirmsAbsent()) {
-                    bloomAdd(key);
-                    std::lock_guard lock(negativeMutex_);
-                    negativeCache_.insert(key);
-                }
+            bool threw = false;
+            try { compressed = source_->fetch(key); } catch (...) { threw = true; }
+            const auto verdict = classifyFetch(
+                compressed, threw,
+                source_->lastFetchConfirmsAbsent(),
+                vc::cache::HttpSource::lastFetchHadTransientError(),
+                config_.authProven);
+            if (verdict == FetchVerdict::EmptyConfirmed) {
+                markChunkAbsent(key, dz);
                 return {};
             }
+            if (verdict == FetchVerdict::Transient) return {};
             statColdHits_.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -678,36 +693,26 @@ BlockPipeline::BlockPipeline(
                     ? diskLevels_[key.level].get() : nullptr;
                 if (!dz || !source_) return {};
                 if (diskShardMarksChunkEmpty(*dz, key)) {
-                    bloomAdd(key);
-                    std::lock_guard lock(negativeMutex_);
-                    negativeCache_.insert(key);
+                    markChunkAbsent(key, dz);
                     return {};
                 }
 
                 std::vector<uint8_t> bytes;
+                bool threw = false;
                 try { bytes = source_->fetch(key); }
-                catch (...) { return {}; }
-                if (bytes.empty()) {
-                    if (source_->lastFetchConfirmsAbsent()) {
-                        bloomAdd(key);
-                        std::lock_guard lock(negativeMutex_);
-                        negativeCache_.insert(key);
-                        if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
-                    } else if (HttpSource::lastFetchHadTransientError()) {
-                        throw std::runtime_error("transient HTTP chunk fetch failure");
-                    }
+                catch (...) { threw = true; }
+                const auto verdict = classifyFetch(
+                    bytes, threw,
+                    source_->lastFetchConfirmsAbsent(),
+                    vc::cache::HttpSource::lastFetchHadTransientError(),
+                    config_.authProven);
+                if (verdict == FetchVerdict::EmptyConfirmed) {
+                    markChunkAbsent(key, dz);
                     return {};
                 }
+                if (verdict == FetchVerdict::Transient) return {};
 
-                if (!bytesAreCanonical(bytes)) {
-                    bloomAdd(key);
-                    {
-                        std::lock_guard lock(negativeMutex_);
-                        negativeCache_.insert(key);
-                    }
-                    if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
-                    return {};
-                }
+                if (!bytesAreCanonical(bytes)) return {};
 
                 statIceFetches_.fetch_add(1, std::memory_order_relaxed);
                 zarrWriteChunk(*dz, key, bytes.data(), bytes.size());
@@ -1007,17 +1012,16 @@ ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey,
     for (int six = sx0; six < sx1; ++six) {
         ChunkKey srcKey{canonKey.level, siz, siy, six};
         std::vector<uint8_t> compressed;
+        bool threw = false;
         try { compressed = source_->fetch(srcKey); }
-        catch (...) { anyTransient = true; continue; }
-        if (compressed.empty()) {
-            if (source_->lastFetchConfirmsAbsent()) anyZeroFill = true;
-            else anyTransient = true;
-            continue;
-        }
-        if (isAllZero(compressed.data(), compressed.size())) {
-            anyZeroFill = true;
-            continue;
-        }
+        catch (...) { threw = true; }
+        const auto verdict = classifyFetch(
+            compressed, threw,
+            source_->lastFetchConfirmsAbsent(),
+            vc::cache::HttpSource::lastFetchHadTransientError(),
+            config_.authProven);
+        if (verdict == FetchVerdict::Transient) { anyTransient = true; continue; }
+        if (verdict == FetchVerdict::EmptyConfirmed) { anyZeroFill = true; continue; }
         auto data = decompress_(compressed, srcKey);
         if (!data) {
             anyDecompressFail = true;
