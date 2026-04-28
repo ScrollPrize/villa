@@ -11,6 +11,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -178,6 +179,17 @@ public:
 
     void setRotationHandleHitTester(std::function<bool(CTiledVolumeViewer*, const cv::Vec3f&)> tester);
 
+    struct NearestPointResult {
+        uint64_t pointId{0};
+        uint64_t collectionId{0};
+        float distance{std::numeric_limits<float>::max()};
+    };
+
+    NearestPointResult findNearestPoint(const cv::Vec3f& worldPos, float maxDist = 20.0f);
+
+public slots:
+    void setSelectedAnnotationCollection(uint64_t collectionId);
+
 signals:
     void editingEnabledChanged(bool enabled);
     void annotateModeChanged(bool enabled);
@@ -191,6 +203,8 @@ signals:
                               bool inpaintOnly);
     void growthInProgressChanged(bool running);
     void approvalMaskSaved(const std::string& segmentId);
+    void annotationPointSelected(uint64_t pointId);
+    void annotationCollectionSelected(uint64_t collectionId);
 
 private:
     friend class SegmentationLineTool;
@@ -252,6 +266,27 @@ private:
         }
     };
 
+    struct PointMoveDragState
+    {
+        bool active{false};
+        uint64_t pointId{0};
+        uint64_t collectionId{0};
+        cv::Vec3f startWorld{0.0f, 0.0f, 0.0f};
+        cv::Vec3f currentWorld{0.0f, 0.0f, 0.0f};
+        QPointer<CTiledVolumeViewer> viewer;
+        bool moved{false};
+
+        void reset() {
+            active = false;
+            pointId = 0;
+            collectionId = 0;
+            startWorld = {0.0f, 0.0f, 0.0f};
+            currentWorld = {0.0f, 0.0f, 0.0f};
+            viewer = nullptr;
+            moved = false;
+        }
+    };
+
     void bindWidgetSignals();
     void bindViewerSignals(CTiledVolumeViewer* viewer);
 
@@ -267,6 +302,10 @@ private:
     void updateCorrectionDrag(const cv::Vec3f& worldPos);
     void finishCorrectionDrag();
     void cancelCorrectionDrag();
+
+    void beginPointMoveDrag(uint64_t pointId, uint64_t collectionId, CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos);
+    void updatePointMoveDrag(const cv::Vec3f& worldPos);
+    void finishPointMoveDrag();
 
     void pruneMissingCorrections();
     void onCorrectionsCreateRequested();
@@ -361,6 +400,8 @@ private:
     DragState _drag;
     HoverState _hover;
     CorrectionDragState _correctionDrag;
+    PointMoveDragState _pointMoveDrag;
+    uint64_t _selectedAnnotationCollectionId{0};
     QSet<CTiledVolumeViewer*> _attachedViewers;
 
     std::function<bool(CTiledVolumeViewer*, const cv::Vec3f&)> _rotationHandleHitTester;

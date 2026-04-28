@@ -2768,6 +2768,14 @@ void CWindow::CreateWidgets(void)
     connect(_segmentationModule.get(), &SegmentationModule::annotateModeChanged,
             _segmentationWidget, &SegmentationWidget::setAnnotateChecked);
 
+    // Wire annotation point/collection selection: module -> dock widget, dock widget -> module
+    connect(_segmentationModule.get(), &SegmentationModule::annotationPointSelected,
+            _point_collection_widget, &CPointCollectionWidget::selectPoint);
+    connect(_segmentationModule.get(), &SegmentationModule::annotationCollectionSelected,
+            _point_collection_widget, &CPointCollectionWidget::selectCollection);
+    connect(_point_collection_widget, &CPointCollectionWidget::collectionSelected,
+            _segmentationModule.get(), &SegmentationModule::setSelectedAnnotationCollection);
+
     connect(_segmentationModule.get(), &SegmentationModule::editingEnabledChanged,
             this, &CWindow::onSegmentationEditingModeChanged);
     connect(_segmentationModule.get(), &SegmentationModule::statusMessageRequested,

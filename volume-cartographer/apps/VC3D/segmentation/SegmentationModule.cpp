@@ -1359,6 +1359,91 @@ void SegmentationModule::cancelCorrectionDrag()
     }
 }
 
+SegmentationModule::NearestPointResult SegmentationModule::findNearestPoint(const cv::Vec3f& worldPos, float maxDist)
+{
+    NearestPointResult result;
+    if (!_pointCollection) {
+        return result;
+    }
+
+    const auto& collections = _pointCollection->getAllCollections();
+    for (const auto& [colId, col] : collections) {
+        for (const auto& [ptId, pt] : col.points) {
+            const float dist = static_cast<float>(cv::norm(pt.p - worldPos));
+            if (dist < result.distance && dist <= maxDist) {
+                result.pointId = ptId;
+                result.collectionId = colId;
+                result.distance = dist;
+            }
+        }
+    }
+    return result;
+}
+
+void SegmentationModule::setSelectedAnnotationCollection(uint64_t collectionId)
+{
+    _selectedAnnotationCollectionId = collectionId;
+}
+
+void SegmentationModule::beginPointMoveDrag(uint64_t pointId, uint64_t collectionId,
+                                            CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos)
+{
+    _pointMoveDrag.active = true;
+    _pointMoveDrag.pointId = pointId;
+    _pointMoveDrag.collectionId = collectionId;
+    _pointMoveDrag.startWorld = worldPos;
+    _pointMoveDrag.currentWorld = worldPos;
+    _pointMoveDrag.viewer = viewer;
+    _pointMoveDrag.moved = false;
+}
+
+void SegmentationModule::updatePointMoveDrag(const cv::Vec3f& worldPos)
+{
+    if (!_pointMoveDrag.active) {
+        return;
+    }
+
+    const cv::Vec3f delta = worldPos - _pointMoveDrag.startWorld;
+    const float distance = cv::norm(delta);
+    if (distance > 1.0f) {
+        _pointMoveDrag.moved = true;
+    }
+    _pointMoveDrag.currentWorld = worldPos;
+}
+
+void SegmentationModule::finishPointMoveDrag()
+{
+    if (!_pointMoveDrag.active) {
+        return;
+    }
+
+    const bool didMove = _pointMoveDrag.moved;
+    const uint64_t pointId = _pointMoveDrag.pointId;
+    const uint64_t collectionId = _pointMoveDrag.collectionId;
+    const cv::Vec3f targetWorld = _pointMoveDrag.currentWorld;
+
+    _pointMoveDrag.reset();
+
+    if (didMove) {
+        // Update point position
+        if (_pointCollection) {
+            auto ptOpt = _pointCollection->getPoint(pointId);
+            if (ptOpt) {
+                ColPoint updated = *ptOpt;
+                updated.p = targetWorld;
+                _pointCollection->updatePoint(updated);
+                qCInfo(lcSegModule) << "Moved point" << pointId << "to"
+                                    << targetWorld[0] << targetWorld[1] << targetWorld[2];
+            }
+        }
+        updateCorrectionsWidget();
+    } else {
+        // Click without drag: select the point
+        emit annotationPointSelected(pointId);
+        emit annotationCollectionSelected(collectionId);
+    }
+}
+
 void SegmentationModule::onCorrectionsCreateRequested()
 {
     if (!_corrections) {

@@ -300,23 +300,39 @@ void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
         if (!isLeftButton) {
             return;
         }
+        // Ctrl+click: remove nearest point (unchanged)
         if (modifiers.testFlag(Qt::ControlModifier)) {
             handleCorrectionPointRemove(worldPos);
             updateCorrectionsWidget();
             return;
         }
-        // Shift+click+drag: start correction drag with anchor2d
-        // Click without Shift: add correction point directly (old behavior)
-        if (modifiers.testFlag(Qt::ShiftModifier) && _editManager) {
-            auto gridIndex = _editManager->worldToGridIndex(worldPos);
-            if (gridIndex) {
-                beginCorrectionDrag(gridIndex->first, gridIndex->second, viewer, worldPos);
-                return;
+        // Shift+click: add new point to selected collection
+        if (modifiers.testFlag(Qt::ShiftModifier)) {
+            // If a collection is selected, add to it directly
+            if (_selectedAnnotationCollectionId != 0 && _pointCollection) {
+                const auto& collections = _pointCollection->getAllCollections();
+                auto it = collections.find(_selectedAnnotationCollectionId);
+                if (it != collections.end()) {
+                    // Temporarily set the corrections active collection
+                    if (_corrections) {
+                        _corrections->setActiveCollection(_selectedAnnotationCollectionId, false);
+                    }
+                }
             }
+            handleCorrectionPointAdded(worldPos);
+            updateCorrectionsWidget();
+            return;
         }
-        // Default: add correction point at clicked position
-        handleCorrectionPointAdded(worldPos);
-        updateCorrectionsWidget();
+        // Plain click: find nearest point for select or drag-to-move
+        auto nearest = findNearestPoint(worldPos);
+        if (nearest.pointId != 0) {
+            // Start point move drag (select happens on release if no movement)
+            beginPointMoveDrag(nearest.pointId, nearest.collectionId, viewer, worldPos);
+            return;
+        }
+        // Click on empty space: deselect
+        emit annotationPointSelected(0);
+        emit annotationCollectionSelected(0);
         return;
     }
 
@@ -480,6 +496,11 @@ void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
         return;
     }
 
+    if (_pointMoveDrag.active) {
+        updatePointMoveDrag(worldPos);
+        return;
+    }
+
     if (_drag.active) {
         updateDrag(worldPos);
         return;
@@ -538,6 +559,12 @@ void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
             _lineTool->extendStroke(worldPos, true);
             _lineTool->finishStroke(_lineDrawKeyActive);
         }
+        return;
+    }
+
+    if (_pointMoveDrag.active && button == Qt::LeftButton) {
+        updatePointMoveDrag(worldPos);
+        finishPointMoveDrag();
         return;
     }
 

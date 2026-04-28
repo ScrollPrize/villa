@@ -198,7 +198,7 @@ void CPointCollectionWidget::refreshTree()
         }
 
         _model->clear();
-        _model->setHorizontalHeaderLabels({"Name", "Points", "Winding", "Error"});
+        _model->setHorizontalHeaderLabels({"Name", "Points", "Winding", "Error", "Position"});
         _model->blockSignals(false);
     }
 
@@ -240,7 +240,10 @@ void CPointCollectionWidget::refreshTree()
         QStandardItem *col_err_item = new QStandardItem();
         col_err_item->setFlags(col_err_item->flags() & ~Qt::ItemIsEditable);
 
-        _model->appendRow({name_item, count_item, col_winding_item, col_err_item});
+        QStandardItem *col_pos_item = new QStandardItem();
+        col_pos_item->setFlags(col_pos_item->flags() & ~Qt::ItemIsEditable);
+
+        _model->appendRow({name_item, count_item, col_winding_item, col_err_item, col_pos_item});
 
         // Get points and sort them by ID
         std::vector<ColPoint> sorted_points;
@@ -259,13 +262,16 @@ void CPointCollectionWidget::refreshTree()
             id_item->setData(QVariant::fromValue(point.id));
             id_item->setFlags(id_item->flags() & ~Qt::ItemIsEditable);
 
-            QStandardItem *pos_item = new QStandardItem(QString("{%1, %2, %3}").arg(point.p[0]).arg(point.p[1]).arg(point.p[2]));
-            pos_item->setFlags(pos_item->flags() & ~Qt::ItemIsEditable);
+            QStandardItem *empty_item = new QStandardItem();
+            empty_item->setFlags(empty_item->flags() & ~Qt::ItemIsEditable);
 
             QStandardItem *pt_winding_item = new QStandardItem();
             pt_winding_item->setFlags(pt_winding_item->flags() & ~Qt::ItemIsEditable);
             QStandardItem *pt_err_item = new QStandardItem();
             pt_err_item->setFlags(pt_err_item->flags() & ~Qt::ItemIsEditable);
+
+            QStandardItem *pos_item = new QStandardItem(QString("{%1, %2, %3}").arg(point.p[0]).arg(point.p[1]).arg(point.p[2]));
+            pos_item->setFlags(pos_item->flags() & ~Qt::ItemIsEditable);
 
             auto res_it = _corr_point_results.find(point.id);
             if (res_it != _corr_point_results.end()) {
@@ -279,7 +285,7 @@ void CPointCollectionWidget::refreshTree()
                 }
             }
 
-            name_item->appendRow({id_item, pos_item, pt_winding_item, pt_err_item});
+            name_item->appendRow({id_item, empty_item, pt_winding_item, pt_err_item, pos_item});
         }
     }
 
@@ -317,7 +323,10 @@ void CPointCollectionWidget::onCollectionsAdded(const std::vector<uint64_t>& col
         QStandardItem *col_err_item = new QStandardItem();
         col_err_item->setFlags(col_err_item->flags() & ~Qt::ItemIsEditable);
 
-        _model->appendRow({name_item, count_item, col_winding_item, col_err_item});
+        QStandardItem *col_pos_item = new QStandardItem();
+        col_pos_item->setFlags(col_pos_item->flags() & ~Qt::ItemIsEditable);
+
+        _model->appendRow({name_item, count_item, col_winding_item, col_err_item, col_pos_item});
 
         for(const auto& point_pair : collection.points) {
             onPointAdded(point_pair.second);
@@ -350,7 +359,7 @@ void CPointCollectionWidget::onCollectionRemoved(uint64_t collectionId)
             _model->blockSignals(true);
             _model->removeRows(0, _model->rowCount());
             _model->clear();
-            _model->setHorizontalHeaderLabels({"Name", "Points", "Winding", "Error"});
+            _model->setHorizontalHeaderLabels({"Name", "Points", "Winding", "Error", "Position"});
             _model->blockSignals(false);
         }
         return;
@@ -370,13 +379,16 @@ void CPointCollectionWidget::onPointAdded(const ColPoint& point)
         id_item->setData(QVariant::fromValue(point.id));
         id_item->setFlags(id_item->flags() & ~Qt::ItemIsEditable);
 
-        QStandardItem *pos_item = new QStandardItem(QString("{%1, %2, %3}").arg(point.p[0]).arg(point.p[1]).arg(point.p[2]));
-        pos_item->setFlags(pos_item->flags() & ~Qt::ItemIsEditable);
+        QStandardItem *empty_item = new QStandardItem();
+        empty_item->setFlags(empty_item->flags() & ~Qt::ItemIsEditable);
 
         QStandardItem *pt_winding_item = new QStandardItem();
         pt_winding_item->setFlags(pt_winding_item->flags() & ~Qt::ItemIsEditable);
         QStandardItem *pt_err_item = new QStandardItem();
         pt_err_item->setFlags(pt_err_item->flags() & ~Qt::ItemIsEditable);
+
+        QStandardItem *pos_item = new QStandardItem(QString("{%1, %2, %3}").arg(point.p[0]).arg(point.p[1]).arg(point.p[2]));
+        pos_item->setFlags(pos_item->flags() & ~Qt::ItemIsEditable);
 
         auto res_it = _corr_point_results.find(point.id);
         if (res_it != _corr_point_results.end() && corrResultPositionMatches(res_it->second, point.p)) {
@@ -388,7 +400,7 @@ void CPointCollectionWidget::onPointAdded(const ColPoint& point)
             }
         }
 
-        collection_item->appendRow({id_item, pos_item, pt_winding_item, pt_err_item});
+        collection_item->appendRow({id_item, empty_item, pt_winding_item, pt_err_item, pos_item});
 
         // Update count
         QStandardItem* count_item = _model->item(collection_item->row(), 1);
@@ -408,8 +420,8 @@ void CPointCollectionWidget::onPointChanged(const ColPoint& point)
             QStandardItem *point_item = collection_item->child(j, 0);
             if (!point_item || point_item->data().toULongLong() != point.id) continue;
 
-            // Update position text (column 1)
-            QStandardItem *pos_item = collection_item->child(j, 1);
+            // Update position text (column 4)
+            QStandardItem *pos_item = collection_item->child(j, 4);
             if (pos_item) {
                 pos_item->setText(QString("{%1, %2, %3}").arg(point.p[0]).arg(point.p[1]).arg(point.p[2]));
             }
@@ -691,6 +703,10 @@ void CPointCollectionWidget::onLoadClicked()
  
 void CPointCollectionWidget::selectCollection(uint64_t collectionId)
 {
+    if (collectionId == 0) {
+        _tree_view->selectionModel()->clearSelection();
+        return;
+    }
     QStandardItem* item = findCollectionItem(collectionId);
     if (item) {
         _tree_view->selectionModel()->clearSelection();
