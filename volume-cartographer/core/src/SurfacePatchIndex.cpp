@@ -200,10 +200,6 @@ std::vector<SurfacePtr> loadSurfacesInBatches(const std::vector<SurfacePtr>& sur
                         if (DebugLoggingEnabled()) {
                             std::cout << "[SurfacePatchIndex] Loading surface: " << s->id << std::endl;
                         }
-                        // Remote stubs whose TIFFs haven't finished downloading
-                        // yet throw "Failed to open TIFF" out of ensureLoaded().
-                        // Catch here — propagating to worker.get() would re-throw
-                        // out of a std::async future and abort the rebuild.
                         try {
                             s->rawPointsPtr();
                         } catch (const std::exception& e) {
