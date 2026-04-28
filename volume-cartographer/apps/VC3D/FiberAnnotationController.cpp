@@ -59,18 +59,6 @@ bool FiberAnnotationController::handleVolumeClick(const cv::Vec3f& vol_loc,
 
     // Store initial normal and first point
     _initialNormal = normal;
-
-    // Initialize stable up: pick a vector perpendicular to the fiber direction.
-    // The fiber direction is along the clicked slice's normal, so pick a world
-    // axis that's not parallel to it.
-    cv::Vec3f dir = normal;
-    float dirLen = static_cast<float>(cv::norm(dir));
-    if (dirLen > 1e-6f) dir /= dirLen;
-    cv::Vec3f candidate = (std::abs(dir[1]) < 0.9f) ? cv::Vec3f(0,1,0) : cv::Vec3f(1,0,0);
-    _stableUp = candidate - candidate.dot(dir) * dir;
-    float upLen = static_cast<float>(cv::norm(_stableUp));
-    if (upLen > 1e-6f) _stableUp /= upLen;
-
     addFiberPoint(vol_loc);
 
     // Transition to annotation state
@@ -162,14 +150,43 @@ void FiberAnnotationController::advanceToNextPrediction()
         return predictFromThreeOrMore();
     }();
 
-    updateSlicePlane(nextPos, nextDir);
+    // 1. Get old annotation plane's basisY (the "up" the user was seeing)
+    auto oldPlane = std::dynamic_pointer_cast<PlaneSurface>(_cstate->surface(kFiberAnnotationSurface));
+    cv::Vec3f oldVy = oldPlane ? oldPlane->basisY() : cv::Vec3f(0, 1, 0);
 
-    // Update reference plane: same orientation as annotation, centered on last point
-    if (!_recentPoints.empty()) {
-        cv::Vec3f refPos = _recentPoints.back().position;
-        updateReferencePlane(refPos, nextDir);
-        centerViewers(nextPos, refPos);
+    // 2. Copy old annotation plane as reference (must be a separate object —
+    //    reusing the same pointer causes surfaceWillBeDeleted to nuke the
+    //    reference when the annotation surface is overwritten).
+    if (oldPlane) {
+        auto refPlane = std::make_shared<PlaneSurface>(oldPlane->origin(), oldPlane->normal({}));
+        refPlane->setInPlaneRotation(oldPlane->inPlaneRotation());
+        _cstate->setSurface(kFiberReferenceSurface, refPlane);
     }
+
+    // 3. Create new annotation plane (gets default basis from vxy_from_normal)
+    auto newPlane = std::make_shared<PlaneSurface>(nextPos, nextDir);
+
+    // 4. Project old basisY onto new plane to get target "up"
+    float dot = oldVy.dot(nextDir);
+    cv::Vec3f projUp = oldVy - dot * nextDir;
+    float projLen = static_cast<float>(cv::norm(projUp));
+    if (projLen > 1e-6f) {
+        projUp /= projLen;
+
+        // 5. Signed angle from new default basisY to projected old basisY
+        cv::Vec3f defaultVy = newPlane->basisY();
+        cv::Vec3f cross = defaultVy.cross(projUp);
+        float sinA = cross.dot(nextDir);
+        float cosA = defaultVy.dot(projUp);
+        newPlane->setInPlaneRotation(std::atan2(sinA, cosA));
+    }
+
+    // 6. Register and center viewers
+    _cstate->setSurface(kFiberAnnotationSurface, newPlane);
+    if (_annotationViewer)
+        _annotationViewer->centerOnVolumePoint(nextPos);
+    if (_referenceViewer && !_recentPoints.empty())
+        _referenceViewer->centerOnVolumePoint(_recentPoints.back().position);
 }
 
 std::pair<cv::Vec3f, cv::Vec3f> FiberAnnotationController::predictFromOnePoint() const
@@ -230,77 +247,6 @@ std::pair<cv::Vec3f, cv::Vec3f> FiberAnnotationController::predictFromThreeOrMor
     return {predicted, dir};
 }
 
-void FiberAnnotationController::updateSlicePlane(const cv::Vec3f& center,
-                                                  const cv::Vec3f& direction)
-{
-    if (!_annotationPlane) {
-        _annotationPlane = std::make_shared<PlaneSurface>();
-    }
-
-    // Project _stableUp onto the plane orthogonal to the new direction
-    // to maintain a consistent "up" across steps and prevent rotation jumps.
-    float dot = _stableUp.dot(direction);
-    cv::Vec3f upProj = _stableUp - dot * direction;
-    float upLen = static_cast<float>(cv::norm(upProj));
-    if (upLen > 1e-6f) {
-        upProj /= upLen;
-        _stableUp = upProj;
-    } else {
-        // _stableUp is (anti-)parallel to direction — pick a new one
-        cv::Vec3f fallback = (std::abs(direction[1]) < 0.9f)
-                             ? cv::Vec3f(0, 1, 0) : cv::Vec3f(1, 0, 0);
-        upProj = fallback - fallback.dot(direction) * direction;
-        cv::normalize(upProj, upProj);
-        _stableUp = upProj;
-    }
-
-    // Reset rotation before setting normal so update() computes the true
-    // default basis vectors (otherwise the old rotation contaminates them).
-    _annotationPlane->setInPlaneRotation(0);
-    _annotationPlane->setOrigin(center);
-    _annotationPlane->setNormal(direction);
-
-    // Signed angle from default basisY to _stableUp around the normal.
-    // Uses cross product to get correct sign regardless of basis handedness.
-    cv::Vec3f defaultVy = _annotationPlane->basisY();
-    cv::Vec3f cross = defaultVy.cross(_stableUp);
-    float sinA = cross.dot(direction);  // project onto normal for signed sin
-    float cosA = defaultVy.dot(_stableUp);
-    float angle = std::atan2(sinA, cosA);
-
-    _annotationPlane->setInPlaneRotation(angle);
-    _cstate->setSurface(kFiberAnnotationSurface, _annotationPlane);
-}
-
-void FiberAnnotationController::updateReferencePlane(const cv::Vec3f& center,
-                                                      const cv::Vec3f& direction)
-{
-    if (!_referencePlane) {
-        _referencePlane = std::make_shared<PlaneSurface>();
-    }
-    _referencePlane->setInPlaneRotation(0);
-    _referencePlane->setOrigin(center);
-    _referencePlane->setNormal(direction);
-
-    cv::Vec3f defaultVy = _referencePlane->basisY();
-    cv::Vec3f cross = defaultVy.cross(_stableUp);
-    float sinA = cross.dot(direction);
-    float cosA = defaultVy.dot(_stableUp);
-    float angle = std::atan2(sinA, cosA);
-    _referencePlane->setInPlaneRotation(angle);
-
-    _cstate->setSurface(kFiberReferenceSurface, _referencePlane);
-}
-
-void FiberAnnotationController::centerViewers(const cv::Vec3f& annotationCenter,
-                                               const cv::Vec3f& referenceCenter)
-{
-    if (_annotationViewer)
-        _annotationViewer->centerOnVolumePoint(annotationCenter);
-    if (_referenceViewer)
-        _referenceViewer->centerOnVolumePoint(referenceCenter);
-}
-
 void FiberAnnotationController::closeAnnotationViewer()
 {
     if (_annotationViewer) {
@@ -319,6 +265,4 @@ void FiberAnnotationController::closeAnnotationViewer()
     }
     _cstate->setSurface(kFiberAnnotationSurface, nullptr);
     _cstate->setSurface(kFiberReferenceSurface, nullptr);
-    _annotationPlane.reset();
-    _referencePlane.reset();
 }

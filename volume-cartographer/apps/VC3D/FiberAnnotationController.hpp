@@ -37,13 +37,10 @@ public:
 
     void beginNewFiber();
 
-    // Called by CWindow::onVolumeClicked for first-point pick.
-    // Returns true if this controller consumed the click.
     bool handleVolumeClick(const cv::Vec3f& vol_loc, const cv::Vec3f& normal,
                            Surface* surf, Qt::MouseButton button,
                            Qt::KeyboardModifiers modifiers);
 
-    // Called when Escape is pressed. Returns true if consumed.
     bool handleEscape();
 
     void setMdiArea(QMdiArea* mdiArea) { _mdiArea = mdiArea; }
@@ -77,15 +74,11 @@ private:
     std::pair<cv::Vec3f, cv::Vec3f> predictFromTwoPoints() const;
     std::pair<cv::Vec3f, cv::Vec3f> predictFromThreeOrMore() const;
 
-    void updateSlicePlane(const cv::Vec3f& center, const cv::Vec3f& direction);
-
     CState* _cstate;
     VCCollection* _collection;
     QMdiArea* _mdiArea = nullptr;
     CTiledVolumeViewer* _annotationViewer = nullptr;
     CTiledVolumeViewer* _referenceViewer = nullptr;
-    std::shared_ptr<PlaneSurface> _annotationPlane;
-    std::shared_ptr<PlaneSurface> _referencePlane;
 
     State _state = State::Idle;
     uint64_t _currentFiberId = 0;
@@ -94,10 +87,6 @@ private:
     int _fiberStep = 50;
 
     std::vector<FiberPoint> _recentPoints;
-    cv::Vec3f _stableUp = {0, 1, 0};  // maintained across steps to prevent in-plane rotation jumps
-
-    void updateReferencePlane(const cv::Vec3f& center, const cv::Vec3f& direction);
-    void centerViewers(const cv::Vec3f& annotationCenter, const cv::Vec3f& referenceCenter);
 
     static constexpr const char* kFiberAnnotationSurface = "fiber_annotation_plane";
     static constexpr const char* kFiberReferenceSurface = "fiber_reference_plane";

@@ -6643,12 +6643,15 @@ void CWindow::onFiberAnnotationViewerRequested(const std::string& surfaceName, c
         connect(viewer, &CTiledVolumeViewer::sendVolumeClicked,
                 _fiberController.get(), &FiberAnnotationController::onAnnotationViewerClicked);
 
-        // Set the current volume on the new viewer (volumeChanged already fired)
+        // Isolate fiber viewer from segmentation module and global focus POI
+        disconnect(_state, &CState::poiChanged, viewer, &CTiledVolumeViewer::onPOIChanged);
+        if (_segmentationModule)
+            disconnect(viewer, nullptr, _segmentationModule.get(), nullptr);
+
         if (_state->currentVolume()) {
             viewer->OnVolumeChanged(_state->currentVolume());
         }
 
-        // Show the MDI subwindow (addSubWindow creates it hidden)
         auto* subWindow = qobject_cast<QMdiSubWindow*>(viewer->parentWidget());
         if (subWindow) {
             subWindow->show();
@@ -6661,6 +6664,12 @@ void CWindow::onFiberReferenceViewerRequested(const std::string& surfaceName, co
     auto* viewer = newConnectedViewer(surfaceName, title, mdiArea);
     if (viewer && _fiberController) {
         _fiberController->setReferenceViewer(viewer);
+
+        // Isolate fiber viewer from segmentation module and global focus POI
+        disconnect(_state, &CState::poiChanged, viewer, &CTiledVolumeViewer::onPOIChanged);
+        if (_segmentationModule)
+            disconnect(viewer, nullptr, _segmentationModule.get(), nullptr);
+
         if (_state->currentVolume()) {
             viewer->OnVolumeChanged(_state->currentVolume());
         }
