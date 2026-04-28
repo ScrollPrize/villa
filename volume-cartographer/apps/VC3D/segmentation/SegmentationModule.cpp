@@ -1659,6 +1659,71 @@ void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod met
     emit growSurfaceRequested(method, direction, sanitizedSteps, inpaintOnly);
 }
 
+cv::Mat SegmentationModule::takePendingManualAddTracerMask()
+{
+    cv::Mat mask = _pendingManualAddTracerMask;
+    _pendingManualAddTracerMask.release();
+    return mask;
+}
+
+bool SegmentationModule::applyManualAddTracerPreview(QuadSurface* surface)
+{
+    if (!_manualAddMode || !_manualAddTool || !_editManager || !surface) {
+        return false;
+    }
+
+    const auto& snapshot = _manualAddTool->entrySnapshotPoints();
+    const auto& fill = _manualAddTool->fillVertices();
+    const auto* tracedPoints = surface->rawPointsPtr();
+    if (snapshot.empty() || fill.empty() || !tracedPoints || tracedPoints->empty()) {
+        return false;
+    }
+
+    int offsetCol = 0;
+    int offsetRow = 0;
+    if (!surface->meta.is_null() && surface->meta.is_object() && surface->meta.contains("grid_offset")) {
+        const auto& offset = surface->meta["grid_offset"];
+        if (offset.is_array() && offset.size() >= 2 && offset[0].is_number() && offset[1].is_number()) {
+            offsetCol = offset[0].get_int();
+            offsetRow = offset[1].get_int();
+        }
+    }
+
+    cv::Mat_<cv::Vec3f> preview = snapshot.clone();
+    std::vector<SegmentationEditManager::GridKey> changed;
+    changed.reserve(fill.size());
+    for (const auto& key : fill) {
+        const int srcRow = key.row + offsetRow;
+        const int srcCol = key.col + offsetCol;
+        if (key.row < 0 || key.row >= preview.rows || key.col < 0 || key.col >= preview.cols ||
+            srcRow < 0 || srcRow >= tracedPoints->rows || srcCol < 0 || srcCol >= tracedPoints->cols) {
+            continue;
+        }
+
+        const cv::Vec3f& point = (*tracedPoints)(srcRow, srcCol);
+        if (ManualAddTool::isInvalidPoint(point)) {
+            continue;
+        }
+        preview(key.row, key.col) = point;
+        changed.push_back(key);
+    }
+
+    if (changed.empty()) {
+        return false;
+    }
+
+    std::optional<cv::Rect> bounds;
+    if (!_editManager->setPreviewPointsOnly(preview, changed, true, &bounds)) {
+        return false;
+    }
+    if (_state && _editManager->previewSurface()) {
+        _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+    }
+    emitPendingChanges();
+    refreshOverlay();
+    return true;
+}
+
 bool SegmentationModule::beginManualAdd()
 {
     if (_manualAddMode) {
@@ -1719,7 +1784,12 @@ bool SegmentationModule::finishManualAdd(bool apply)
     }
 
     if (apply) {
-        if (_editManager) {
+        if (_manualAddTool->config().interpolationMode == ManualAddTool::InterpolationMode::TracerRestrictedToFill) {
+            if (!_editManager || !_editManager->hasPendingChanges()) {
+                emit statusMessageRequested(tr("Manual Add tracer preview is not ready yet."), kStatusMedium);
+                return false;
+            }
+        } else if (_editManager) {
             std::optional<cv::Rect> bounds;
             if (!_editManager->setPreviewPointsOnly(_manualAddTool->previewPoints(),
                                                     _manualAddTool->changedVertices(),
@@ -1764,6 +1834,8 @@ bool SegmentationModule::finishManualAdd(bool apply)
 
 void SegmentationModule::resetManualAddState(bool restorePreview)
 {
+    _pendingManualAddTracerMask.release();
+
     if (_manualAddMode && _manualAddTool && restorePreview && _editManager) {
         _editManager->restorePreviewSnapshot(_manualAddTool->entrySnapshotPoints());
         if (_state && _editManager->previewSurface()) {
@@ -1804,6 +1876,38 @@ bool SegmentationModule::recomputeManualAdd()
         emit statusMessageRequested(QString::fromStdString(status), kStatusMedium);
         return false;
     }
+
+    if (_manualAddTool->config().interpolationMode == ManualAddTool::InterpolationMode::TracerRestrictedToFill) {
+        if (_growthInProgress) {
+            emit statusMessageRequested(tr("Surface growth already in progress"), kStatusMedium);
+            return false;
+        }
+
+        const auto& snapshot = _manualAddTool->entrySnapshotPoints();
+        const auto& fill = _manualAddTool->fillVertices();
+        if (snapshot.empty() || fill.empty()) {
+            emit statusMessageRequested(tr("Manual Add tracer fill is empty."), kStatusMedium);
+            return false;
+        }
+
+        cv::Mat_<uint8_t> mask(snapshot.rows, snapshot.cols, static_cast<uint8_t>(0));
+        for (const auto& key : fill) {
+            if (key.row >= 0 && key.row < mask.rows && key.col >= 0 && key.col < mask.cols) {
+                mask(key.row, key.col) = 255;
+            }
+        }
+        _pendingManualAddTracerMask = mask;
+
+        emit statusMessageRequested(tr("Running Manual Add tracer inside filled area..."), kStatusMedium);
+        markNextEditsFromGrowth();
+        emit growSurfaceRequested(SegmentationGrowthMethod::Tracer,
+                                  SegmentationGrowthDirection::Fill,
+                                  std::max(1, static_cast<int>(fill.size())),
+                                  false);
+        refreshOverlay();
+        return true;
+    }
+
     std::optional<cv::Rect> bounds;
     if (!_editManager->setPreviewPointsOnly(_manualAddTool->previewPoints(),
                                             _manualAddTool->changedVertices(),

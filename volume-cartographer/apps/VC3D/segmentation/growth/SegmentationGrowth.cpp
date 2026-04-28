@@ -545,7 +545,8 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
                                       context.resumeSurface,
                                       std::filesystem::path(),
                                       utils::Json{},
-                                      correctionCollection);
+                                      correctionCollection,
+                                      context.allowedGrowthMask.empty() ? nullptr : &context.allowedGrowthMask);
 
         // Note: approval and mask channels are preserved inside the tracer
 

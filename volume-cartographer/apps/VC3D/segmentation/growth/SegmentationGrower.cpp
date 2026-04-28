@@ -1720,6 +1720,14 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     request.direction = effectiveDirection;
     request.steps = sanitizedSteps;
     request.inpaintOnly = inpaintOnly;
+    if (method == SegmentationGrowthMethod::Tracer && _context.module) {
+        request.allowedGrowthMask = _context.module->takePendingManualAddTracerMask();
+        if (!request.allowedGrowthMask.empty()) {
+            qCInfo(lcSegGrowth) << "Manual Add tracer growth mask cells"
+                                << cv::countNonZero(request.allowedGrowthMask);
+            request.manualAddPreview = _context.module->manualAddMode();
+        }
+    }
 
     if (inpaintOnly) {
         // Consume any pending overrides; inpainting ignores directional constraints.
@@ -1770,9 +1778,11 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         qCInfo(lcSegGrowth) << "Cell reoptimization mode enabled for tracer params.";
     }
 
+    const bool manualAddTracerMask = !request.allowedGrowthMask.empty();
     const bool neuralTracerEnabled = _context.widget->neuralTracerEnabled();
     const bool denseMode = neuralTracerEnabled &&
-        _context.widget->neuralModelType() == NeuralTracerModelType::DenseDisplacement;
+        _context.widget->neuralModelType() == NeuralTracerModelType::DenseDisplacement &&
+        !manualAddTracerMask;
 
     if (denseMode) {
         const QString denseCheckpointPath = _context.widget->denseCheckpointPath().trimmed();
@@ -1990,6 +2000,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     ctx.voxelSize = growthVolume->voxelSize();
     ctx.normalGridPath = volumeContext.normalGridPath;
     ctx.normal3dZarrPath = volumeContext.normal3dZarrPath;
+    ctx.allowedGrowthMask = request.allowedGrowthMask;
 
     // Populate fields for corrections annotation saving
     if (volumeContext.package) {
@@ -2043,6 +2054,7 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
     pending.usingCorrections = usingCorrections;
     pending.inpaintOnly = inpaintOnly;
     pending.correctionsAffectedBounds = correctionAffectedBounds;
+    pending.manualAddPreview = request.manualAddPreview;
 
     // Compute corrections bounds and snapshot "before" surface for annotation saving
     if (usingCorrections) {
@@ -2572,6 +2584,17 @@ void SegmentationGrower::onFutureFinished()
                                                  : std::filesystem::path());
         showStatus(tr("Tracer growth did not return a surface."), kStatusMedium);
         finalize(false);
+        return;
+    }
+
+    if (request.manualAddPreview) {
+        const bool ok = _context.module && _context.module->applyManualAddTracerPreview(result.surface);
+        delete result.surface;
+        showStatus(ok
+                       ? tr("Manual Add tracer preview updated.")
+                       : tr("Manual Add tracer preview update failed."),
+                   ok ? kStatusShort : kStatusLong);
+        finalize(ok);
         return;
     }
 
