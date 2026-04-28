@@ -431,20 +431,26 @@ struct SurfacePatchIndex::Impl {
     struct SurfaceCellMask {
         int rows = 0;
         int cols = 0;
+        int tileStride = 1;
+        int tileRows = 0;
+        int tileCols = 0;
         int activeCount = 0;
         std::vector<uint8_t> states;
-        // Dense vector of each cell's quantized R-tree Box3 (keyed by flat cell
-        // index). Dense because after the on-load trim, >95% of cells are
-        // active, making the map overhead (~52B/entry) far more costly than
-        // the empty-slot cost of a dense array (12B/cell).
+        // Dense vector of each tile anchor's quantized R-tree Box3. Entries
+        // are keyed by compact tile slot, while public/internal callers still
+        // pass native grid cell anchors (row,col). PatchRecord keeps native
+        // anchors so query/update behavior does not change.
         // Validity is determined by states[] bits, not by a sentinel QBox.
         std::vector<QBox> cachedBoxes;
-        std::unordered_set<std::size_t> pendingCells;  // Cells needing R-tree update
+        std::unordered_set<std::size_t> pendingCells;  // Tile slots needing R-tree update
 
         void clear()
         {
             rows = 0;
             cols = 0;
+            tileStride = 1;
+            tileRows = 0;
+            tileCols = 0;
             activeCount = 0;
             states.clear();
             cachedBoxes.clear();
@@ -452,22 +458,31 @@ struct SurfacePatchIndex::Impl {
             pendingCells.clear();
         }
 
-        void ensureSize(int rowCount, int colCount)
+        void ensureSize(int rowCount, int colCount, int stride)
         {
             rowCount = std::max(rowCount, 0);
             colCount = std::max(colCount, 0);
-            const std::size_t required = static_cast<std::size_t>(rowCount) * colCount;
+            stride = std::max(1, stride);
             if (rowCount <= 0 || colCount <= 0) {
                 clear();
                 return;
             }
+            const int requiredTileRows = (rowCount + stride - 1) / stride;
+            const int requiredTileCols = (colCount + stride - 1) / stride;
+            const std::size_t required =
+                static_cast<std::size_t>(requiredTileRows) * requiredTileCols;
             const std::size_t requiredBytes = (required + 7u) / 8u;
-            if (rows == rowCount && cols == colCount && states.size() == requiredBytes
+            if (rows == rowCount && cols == colCount && tileStride == stride
+                && tileRows == requiredTileRows && tileCols == requiredTileCols
+                && states.size() == requiredBytes
                 && cachedBoxes.size() == required) {
                 return;
             }
             rows = rowCount;
             cols = colCount;
+            tileStride = stride;
+            tileRows = requiredTileRows;
+            tileCols = requiredTileCols;
             activeCount = 0;
             states.assign(requiredBytes, 0);
             cachedBoxes.assign(required, QBox{});
@@ -479,28 +494,46 @@ struct SurfacePatchIndex::Impl {
             return row >= 0 && row < rows && col >= 0 && col < cols;
         }
 
-        std::size_t index(int row, int col) const
+        std::optional<std::size_t> tileIndex(int row, int col) const
         {
-            return static_cast<std::size_t>(row) * cols + col;
+            if (!validIndex(row, col) || tileStride <= 0 || tileRows <= 0 || tileCols <= 0) {
+                return std::nullopt;
+            }
+            if ((row % tileStride) != 0 || (col % tileStride) != 0) {
+                return std::nullopt;
+            }
+            const int tileRow = row / tileStride;
+            const int tileCol = col / tileStride;
+            if (tileRow < 0 || tileRow >= tileRows || tileCol < 0 || tileCol >= tileCols) {
+                return std::nullopt;
+            }
+            return static_cast<std::size_t>(tileRow) * tileCols + tileCol;
+        }
+
+        std::pair<int, int> nativeAnchor(std::size_t tileIdx) const
+        {
+            const int tileRow = static_cast<int>(tileIdx / tileCols);
+            const int tileCol = static_cast<int>(tileIdx % tileCols);
+            return {tileRow * tileStride, tileCol * tileStride};
         }
 
         bool isActive(int row, int col) const
         {
-            if (!validIndex(row, col)) {
+            const auto idx = tileIndex(row, col);
+            if (!idx) {
                 return false;
             }
-            const std::size_t idx = index(row, col);
-            return (states[idx >> 3] >> (idx & 7u)) & 1u;
+            return (states[*idx >> 3] >> (*idx & 7u)) & 1u;
         }
 
         void setActive(int row, int col, bool active)
         {
-            if (!validIndex(row, col)) {
+            const auto idx = tileIndex(row, col);
+            if (!idx) {
                 return;
             }
-            const std::size_t idx = index(row, col);
-            const std::size_t byte = idx >> 3;
-            const uint8_t bit = static_cast<uint8_t>(1u << (idx & 7u));
+            const std::size_t byte = *idx >> 3;
+            const uint8_t bit = static_cast<uint8_t>(1u << (*idx & 7u));
             const bool prev = (states[byte] & bit) != 0;
             if (prev == active) {
                 return;
@@ -516,18 +549,20 @@ struct SurfacePatchIndex::Impl {
 
         std::optional<Box3> bboxAt(int row, int col) const
         {
-            if (!validIndex(row, col) || !isActive(row, col)) {
+            const auto idx = tileIndex(row, col);
+            if (!idx || !isActive(row, col)) {
                 return std::nullopt;
             }
-            return boxDequantize(cachedBoxes[index(row, col)]);
+            return boxDequantize(cachedBoxes[*idx]);
         }
 
         void storeBox(int row, int col, const Box3& box)
         {
-            if (!validIndex(row, col)) {
+            const auto idx = tileIndex(row, col);
+            if (!idx) {
                 return;
             }
-            cachedBoxes[index(row, col)] = boxQuantize(box);
+            cachedBoxes[*idx] = boxQuantize(box);
         }
 
         void eraseBox(int row, int col)
@@ -545,26 +580,29 @@ struct SurfacePatchIndex::Impl {
         // Pending update tracking methods
         void queueUpdate(int row, int col)
         {
-            if (!validIndex(row, col)) {
+            const auto idx = tileIndex(row, col);
+            if (!idx) {
                 return;
             }
-            pendingCells.insert(index(row, col));
+            pendingCells.insert(*idx);
         }
 
         void clearPending(int row, int col)
         {
-            if (!validIndex(row, col)) {
+            const auto idx = tileIndex(row, col);
+            if (!idx) {
                 return;
             }
-            pendingCells.erase(index(row, col));
+            pendingCells.erase(*idx);
         }
 
         bool isPending(int row, int col) const
         {
-            if (!validIndex(row, col)) {
+            const auto idx = tileIndex(row, col);
+            if (!idx) {
                 return false;
             }
-            return pendingCells.count(index(row, col)) > 0;
+            return pendingCells.count(*idx) > 0;
         }
 
         bool hasPending() const
@@ -1016,7 +1054,7 @@ bool SurfacePatchIndex::loadCache(const std::filesystem::path& cachePath,
     for (const auto& cached : cachedSurfaces) {
         Impl::SurfaceRecord rec;
         rec.surface = cached.surface;
-        rec.mask.ensureSize(cached.rows, cached.cols);
+        rec.mask.ensureSize(cached.rows, cached.cols, newImpl->tileStride);
         newImpl->surfaceRecords[cached.surface.get()] = std::move(rec);
     }
 
@@ -1050,7 +1088,11 @@ bool SurfacePatchIndex::loadCache(const std::filesystem::path& cachePath,
 
         Impl::SurfaceCellMask& mask = recIt->second.mask;
         mask.setActive(j, i, true);
-        mask.cachedBoxes[mask.index(j, i)] = qbox;
+        if (auto tileIdx = mask.tileIndex(j, i)) {
+            mask.cachedBoxes[*tileIdx] = qbox;
+        } else {
+            return false;
+        }
     }
 
     newImpl->patchCount = entries.size();
@@ -1634,16 +1676,15 @@ bool SurfacePatchIndex::Impl::removeSurfaceEntries(const SurfacePtr& surface)
 
     SurfaceCellMask& mask = it->second.mask;
 
-    // Walk active cells via states bitset, use dense cachedBoxes for each.
+    // Walk active tile slots via states bitset, use compact cachedBoxes for each.
     if (tree && mask.activeCount > 0 && !mask.cachedBoxes.empty()) {
-        for (int row = 0; row < mask.rows; ++row) {
-            for (int col = 0; col < mask.cols; ++col) {
-                if (!mask.isActive(row, col)) continue;
-                const QBox& qb = mask.cachedBoxes[mask.index(row, col)];
-                PatchRecord rec{surface.get(), col, row};
-                if (tree->remove(Entry(boxDequantize(qb), rec)) && patchCount > 0) {
-                    --patchCount;
-                }
+        for (std::size_t tileIdx = 0; tileIdx < mask.cachedBoxes.size(); ++tileIdx) {
+            const auto [row, col] = mask.nativeAnchor(tileIdx);
+            if (!mask.isActive(row, col)) continue;
+            const QBox& qb = mask.cachedBoxes[tileIdx];
+            PatchRecord rec{surface.get(), col, row};
+            if (tree->remove(Entry(boxDequantize(qb), rec)) && patchCount > 0) {
+                --patchCount;
             }
         }
     }
@@ -1666,14 +1707,13 @@ void SurfacePatchIndex::Impl::removeSurfaceEntriesFromTree(const SurfacePtr& sur
     }
 
     if (tree) {
-        for (int row = 0; row < mask.rows; ++row) {
-            for (int col = 0; col < mask.cols; ++col) {
-                if (!mask.isActive(row, col)) continue;
-                const QBox& qb = mask.cachedBoxes[mask.index(row, col)];
-                PatchRecord rec{surface.get(), col, row};
-                if (tree->remove(Entry(boxDequantize(qb), rec)) && patchCount > 0) {
-                    --patchCount;
-                }
+        for (std::size_t tileIdx = 0; tileIdx < mask.cachedBoxes.size(); ++tileIdx) {
+            const auto [row, col] = mask.nativeAnchor(tileIdx);
+            if (!mask.isActive(row, col)) continue;
+            const QBox& qb = mask.cachedBoxes[tileIdx];
+            PatchRecord rec{surface.get(), col, row};
+            if (tree->remove(Entry(boxDequantize(qb), rec)) && patchCount > 0) {
+                --patchCount;
             }
         }
     }
@@ -2049,14 +2089,14 @@ SurfacePatchIndex::Impl::ensureMask(const SurfacePtr& surface)
             // This prevents orphaned entries when surface grows/shrinks
             removeSurfaceEntriesFromTree(surface, mask);
         }
-        mask.ensureSize(rowCount, colCount);
+        mask.ensureSize(rowCount, colCount, tileStride);
         return mask;
     }
 
     // New surface - create fresh record
     SurfaceRecord& rec = surfaceRecords[surface.get()];
     rec.surface = surface;  // Keep the surface alive
-    rec.mask.ensureSize(rowCount, colCount);
+    rec.mask.ensureSize(rowCount, colCount, tileStride);
     return rec.mask;
 }
 
@@ -2416,8 +2456,7 @@ bool SurfacePatchIndex::Impl::flushPendingSurface(const SurfacePtr& surface, Sur
     const int stride = tileStride;
 
     for (std::size_t idx : mask.pendingCells) {
-        const int row = static_cast<int>(idx / mask.cols);
-        const int col = static_cast<int>(idx % mask.cols);
+        const auto [row, col] = mask.nativeAnchor(idx);
 
         // Remove old entry if it exists
         if (mask.isActive(row, col)) {
