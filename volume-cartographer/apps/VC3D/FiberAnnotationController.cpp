@@ -7,6 +7,9 @@
 
 #include <QMdiArea>
 #include <QMdiSubWindow>
+#include <QElapsedTimer>
+#include <QKeyEvent>
+#include <QTimer>
 #include <cmath>
 
 FiberAnnotationController::FiberAnnotationController(CState* state,
@@ -268,8 +271,82 @@ std::pair<cv::Vec3f, cv::Vec3f> FiberAnnotationController::predictFromThreeOrMor
     return {p2 + dir * static_cast<float>(_fiberStep), dir};
 }
 
+bool FiberAnnotationController::handleKeyPress(QKeyEvent* event)
+{
+    if (event->key() != Qt::Key_J) return false;
+    if (_state != State::Annotating) return false;
+    if (_animating) return false;
+
+    // Snapshot ref (index 0) and annotation (index 5) endpoints
+    auto refSurf = std::dynamic_pointer_cast<PlaneSurface>(
+        _cstate->surface(fiberSurfaceName(0)));
+    auto annotSurf = std::dynamic_pointer_cast<PlaneSurface>(
+        _cstate->surface(fiberSurfaceName(kNumViews - 1)));
+    if (!refSurf || !annotSurf) return false;
+
+    _animRefPos = refSurf->origin();
+    _animRefNormal = refSurf->normal({});
+    _animRefVy = refSurf->basisY();
+    _animAnnotPos = annotSurf->origin();
+    _animAnnotNormal = annotSurf->normal({});
+    _animAnnotVy = annotSurf->basisY();
+
+    _animating = true;
+    if (!_animClock) _animClock = new QElapsedTimer();
+    _animClock->start();
+
+    onAnimTick();
+    event->accept();
+    return true;
+}
+
+void FiberAnnotationController::onAnimTick()
+{
+    if (!_animating || !_animClock) return;
+
+    qint64 elapsed = _animClock->elapsed();
+    constexpr qint64 kDurationMs = 1000;
+
+    auto* viewer = _fiberViewers[kNumViews - 1];
+    if (!viewer) { _animating = false; return; }
+
+    if (elapsed >= kDurationMs) {
+        // Done — restore annotation viewer to its own surface
+        _animating = false;
+        viewer->setSurface(fiberSurfaceName(kNumViews - 1));
+        return;
+    }
+
+    // Triangle wave: 0→1→0 over kDurationMs
+    float frac = static_cast<float>(elapsed) / static_cast<float>(kDurationMs);
+    float t = 1.0f - std::abs(2.0f * frac - 1.0f);
+
+    // Interpolate
+    cv::Vec3f pos = _animRefPos * (1.0f - t) + _animAnnotPos * t;
+
+    cv::Vec3f n = _animRefNormal * (1.0f - t) + _animAnnotNormal * t;
+    float nLen = static_cast<float>(cv::norm(n));
+    if (nLen > 1e-6f) n /= nLen;
+
+    cv::Vec3f up = _animRefVy * (1.0f - t) + _animAnnotVy * t;
+    float upLen = static_cast<float>(cv::norm(up));
+    if (upLen > 1e-6f) up /= upLen;
+
+    auto plane = std::make_shared<PlaneSurface>();
+    plane->setFromNormalAndUp(pos, n, up);
+    _cstate->setSurface(fiberSurfaceName(kNumViews - 1), plane);
+    viewer->centerOnVolumePoint(pos);
+
+    // Schedule next frame on next event loop tick
+    QTimer::singleShot(0, this, &FiberAnnotationController::onAnimTick);
+}
+
 void FiberAnnotationController::closeAnnotationViewer()
 {
+    _animating = false;
+    delete _animClock;
+    _animClock = nullptr;
+
     for (int i = 0; i < kNumViews; ++i) {
         if (_fiberViewers[i]) {
             auto* subWindow = qobject_cast<QMdiSubWindow*>(_fiberViewers[i]->parentWidget());

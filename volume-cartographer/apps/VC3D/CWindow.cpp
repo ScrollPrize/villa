@@ -5051,6 +5051,10 @@ void CWindow::keyPressEvent(QKeyEvent* event)
         return;
     }
 
+    // Fiber animation (P key)
+    if (_fiberController && _fiberController->handleKeyPress(event))
+        return;
+
     if (event->key() == vc3d::keybinds::keypress::ToggleVolumeOverlay.key &&
         event->modifiers() == vc3d::keybinds::keypress::ToggleVolumeOverlay.modifiers) {
         toggleVolumeOverlayVisibility();

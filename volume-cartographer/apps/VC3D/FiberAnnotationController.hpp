@@ -14,6 +14,8 @@ class CAdaptiveVolumeViewer;
 #endif
 class QMdiArea;
 class QMdiSubWindow;
+class QElapsedTimer;
+class QKeyEvent;
 class PlaneSurface;
 class Surface;
 
@@ -44,6 +46,7 @@ public:
                            Qt::KeyboardModifiers modifiers);
 
     bool handleEscape();
+    bool handleKeyPress(QKeyEvent* event);
 
     void setMdiArea(QMdiArea* mdiArea) { _mdiArea = mdiArea; }
     void setFiberViewer(int index, CTiledVolumeViewer* viewer);
@@ -62,6 +65,9 @@ public slots:
                                    Surface* surf, Qt::MouseButton button,
                                    Qt::KeyboardModifiers modifiers);
     void onStepChanged(int step);
+
+private slots:
+    void onAnimTick();
 
 private:
     struct FiberPoint {
@@ -89,4 +95,10 @@ private:
     int _fiberStep = 50;
 
     std::vector<FiberPoint> _recentPoints;
+
+    // Animation state
+    bool _animating = false;
+    QElapsedTimer* _animClock = nullptr;
+    cv::Vec3f _animRefPos, _animRefNormal, _animRefVy;
+    cv::Vec3f _animAnnotPos, _animAnnotNormal, _animAnnotVy;
 };
