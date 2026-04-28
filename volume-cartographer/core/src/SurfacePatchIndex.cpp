@@ -197,14 +197,19 @@ public:
         }
         struct stat st {};
         if (::fstat(fd_, &st) != 0 || st.st_size <= 0) {
+            close();
             throw std::runtime_error("mmap stat failed: " + path.string());
         }
         size_ = static_cast<std::size_t>(st.st_size);
         data_ = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd_, 0);
         if (data_ == MAP_FAILED) {
             data_ = nullptr;
+            close();
             throw std::runtime_error("mmap failed: " + path.string());
         }
+        // The mapping owns the pages; the descriptor is only needed for mmap().
+        ::close(fd_);
+        fd_ = -1;
     }
 
     const std::uint8_t* bytes(std::uint64_t offset, std::uint64_t size) const
@@ -271,12 +276,24 @@ public:
         TIFFGetFieldDefaulted(tif, TIFFTAG_COMPRESSION, &compression);
         TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &rowsPerStrip);
 
+        const tstrip_t stripCount = TIFFNumberOfStrips(tif);
         if (TIFFIsTiled(tif) || TIFFIsByteSwapped(tif) || spp != 1 ||
             bps != 32 || fmt != SAMPLEFORMAT_IEEEFP ||
-            compression != COMPRESSION_NONE || TIFFNumberOfStrips(tif) != 1 ||
-            rowsPerStrip < h) {
+            compression != COMPRESSION_NONE || stripCount <= 0 ||
+            rowsPerStrip == 0) {
+            std::ostringstream oss;
+            oss << "TIFF is not mmap-compatible: " << path.string()
+                << " tiled=" << TIFFIsTiled(tif)
+                << " byte_swapped=" << TIFFIsByteSwapped(tif)
+                << " spp=" << spp
+                << " bps=" << bps
+                << " sample_format=" << fmt
+                << " compression=" << compression
+                << " strips=" << stripCount
+                << " rows_per_strip=" << rowsPerStrip
+                << " height=" << h;
             TIFFClose(tif);
-            throw std::runtime_error("TIFF is not mmap-compatible: " + path.string());
+            throw std::runtime_error(oss.str());
         }
 
         uint64_t* offsets = nullptr;
@@ -288,29 +305,49 @@ public:
             throw std::runtime_error("mmap TIFF missing strip offsets: " + path.string());
         }
 
-        const std::uint64_t expectedBytes = static_cast<std::uint64_t>(w) * h * sizeof(float);
-        if (byteCounts[0] < expectedBytes) {
-            TIFFClose(tif);
-            throw std::runtime_error("mmap TIFF strip is smaller than expected: " + path.string());
+        std::vector<std::uint64_t> stripOffsets(static_cast<std::size_t>(stripCount));
+        std::vector<std::uint64_t> stripByteCounts(static_cast<std::size_t>(stripCount));
+        for (tstrip_t strip = 0; strip < stripCount; ++strip) {
+            const uint32_t firstRow = strip * rowsPerStrip;
+            const uint32_t rowsInStrip = firstRow >= h ? 0 : std::min(rowsPerStrip, h - firstRow);
+            const std::uint64_t expectedBytes =
+                static_cast<std::uint64_t>(w) * rowsInStrip * sizeof(float);
+            if (rowsInStrip == 0 || byteCounts[strip] < expectedBytes) {
+                TIFFClose(tif);
+                throw std::runtime_error("mmap TIFF strip is smaller than expected: " + path.string());
+            }
+            stripOffsets[strip] = offsets[strip];
+            stripByteCounts[strip] = byteCounts[strip];
         }
-        const std::uint64_t stripOffset = offsets[0];
         TIFFClose(tif);
 
         mapping_.open(path);
         width_ = static_cast<int>(w);
         height_ = static_cast<int>(h);
-        data_ = reinterpret_cast<const float*>(mapping_.bytes(stripOffset, expectedBytes));
+        rowsPerStrip_ = static_cast<int>(rowsPerStrip);
+        stripOffsets_ = std::move(stripOffsets);
+        stripByteCounts_ = std::move(stripByteCounts);
     }
 
     int width() const { return width_; }
     int height() const { return height_; }
-    float at(int row, int col) const { return data_[static_cast<std::size_t>(row) * width_ + col]; }
+    float at(int row, int col) const
+    {
+        const int strip = row / rowsPerStrip_;
+        const int rowInStrip = row - strip * rowsPerStrip_;
+        const std::uint64_t offset =
+            stripOffsets_[static_cast<std::size_t>(strip)] +
+            (static_cast<std::uint64_t>(rowInStrip) * width_ + col) * sizeof(float);
+        return *reinterpret_cast<const float*>(mapping_.bytes(offset, sizeof(float)));
+    }
 
 private:
     FileMapping mapping_;
-    const float* data_ = nullptr;
+    std::vector<std::uint64_t> stripOffsets_;
+    std::vector<std::uint64_t> stripByteCounts_;
     int width_ = 0;
     int height_ = 0;
+    int rowsPerStrip_ = 0;
 };
 
 class MappedTifxyzSurface {

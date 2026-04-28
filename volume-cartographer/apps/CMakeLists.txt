@@ -114,6 +114,9 @@ target_link_libraries(vc_tifxyz_bench vc_core)
 add_executable(vc_tifxyz_mmap_prepare src/vc_tifxyz_mmap_prepare.cpp)
 target_link_libraries(vc_tifxyz_mmap_prepare TIFF::TIFF)
 
+add_executable(vc_surface_patch_index_bench src/vc_surface_patch_index_bench.cpp)
+target_link_libraries(vc_surface_patch_index_bench vc_core)
+
 add_executable(vc_coord_regression src/vc_coord_regression.cpp)
 target_link_libraries(vc_coord_regression vc_core)
 
@@ -224,6 +227,7 @@ if(VC_USE_PCH)
         vc_diffuse_winding
         vc_render_bench
         vc_tifxyz_mmap_prepare
+        vc_surface_patch_index_bench
         vc_create_segment_mask
         vc_surface_diff
         vc_visualize
