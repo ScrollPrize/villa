@@ -20,6 +20,13 @@
 #include <unordered_map>
 #include <variant>
 
+#if !defined(_WIN32)
+#  include <fcntl.h>
+#  include <sys/mman.h>
+#  include <sys/stat.h>
+#  include <unistd.h>
+#endif
+
 #if __has_include("compression.hpp")
 #  include "compression.hpp"
 #  define UTILS_HAS_COMPRESSION 1
@@ -457,19 +464,18 @@ struct ZarrMetadata {
     }
 };
 
-/// Structural check: zarr v3, sharded, with 128^3 inner chunks. A true return
-/// here means the layout matches our canonical disk-cache format, but does NOT
-/// guarantee the inner bytes are VC3D/H.265 — only a runtime magic check on a
-/// fetched inner chunk can confirm that.
-[[nodiscard]] inline bool is_canonical_vc3d(const ZarrMetadata& m) noexcept {
+/// Structural check: zarr v3, sharded, with 256^3 inner chunks (c3d codec
+/// atom). This only checks shape; the inner bytes still need a C3DC
+/// magic-check before decode.
+[[nodiscard]] inline bool is_canonical_c3d(const ZarrMetadata& m) noexcept {
     if (m.version != ZarrVersion::v3) return false;
     if (!m.shard_config) return false;
     const auto& sc = *m.shard_config;
     if (sc.sub_chunks.size() < 3) return false;
-    if (sc.sub_chunks[0] != 128 || sc.sub_chunks[1] != 128 || sc.sub_chunks[2] != 128)
+    if (sc.sub_chunks[0] != 256 || sc.sub_chunks[1] != 256 || sc.sub_chunks[2] != 256)
         return false;
     if (m.chunks.size() < 3) return false;
-    for (int d = 0; d < 3; ++d) if (m.chunks[d] % 128 != 0) return false;
+    for (int d = 0; d < 3; ++d) if (m.chunks[d] % 256 != 0) return false;
     if (m.dtype != ZarrDtype::uint8) return false;
     return true;
 }
@@ -697,16 +703,28 @@ inline std::vector<std::byte> read_file_bytes(const std::filesystem::path& p) {
 }
 
 inline void write_file(const std::filesystem::path& p, std::string_view data) {
-    std::ofstream f(p, std::ios::binary | std::ios::trunc);
-    if (!f) throw std::runtime_error("zarr: cannot write file: " + p.string());
-    f.write(data.data(), static_cast<std::streamsize>(data.size()));
+    auto tmp = p;
+    tmp += ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) throw std::runtime_error("zarr: cannot write file: " + p.string());
+        f.write(data.data(), static_cast<std::streamsize>(data.size()));
+    }
+    std::filesystem::rename(tmp, p);
 }
 
 inline void write_file_bytes(const std::filesystem::path& p, std::span<const std::byte> data) {
-    std::ofstream f(p, std::ios::binary | std::ios::trunc);
-    if (!f) throw std::runtime_error("zarr: cannot write file: " + p.string());
-    f.write(reinterpret_cast<const char*>(data.data()),
-            static_cast<std::streamsize>(data.size()));
+    // Atomic write: write to .tmp, then rename. Prevents corrupt files
+    // if the process is interrupted (e.g. curl abort during shutdown).
+    auto tmp = p;
+    tmp += ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
+        if (!f) throw std::runtime_error("zarr: cannot write file: " + tmp.string());
+        f.write(reinterpret_cast<const char*>(data.data()),
+                static_cast<std::streamsize>(data.size()));
+    }
+    std::filesystem::rename(tmp, p);
 }
 
 // ----- Endian helpers -----
@@ -901,6 +919,66 @@ inline ZarrVersion detect_version(const std::filesystem::path& path) {
 
 } // namespace detail
 
+// Owns a block of bytes that was either mmap'd read-only from a file
+// (preferred on POSIX for shard files — kernel handles residency) or
+// heap-allocated (fallback). Non-copyable, movable. Static factories
+// make the ownership discriminator explicit at the call site.
+class ShardBytes final {
+public:
+    ShardBytes() = default;
+    ~ShardBytes() { release(); }
+    ShardBytes(const ShardBytes&) = delete;
+    ShardBytes& operator=(const ShardBytes&) = delete;
+    ShardBytes(ShardBytes&& o) noexcept { take(std::move(o)); }
+    ShardBytes& operator=(ShardBytes&& o) noexcept {
+        if (this != &o) { release(); take(std::move(o)); }
+        return *this;
+    }
+
+    static ShardBytes from_mmap(void* ptr, std::size_t n) noexcept {
+        ShardBytes b;
+        b.mapped_ = ptr;
+        b.size_ = n;
+        return b;
+    }
+    static ShardBytes from_vector(std::vector<std::byte> v) noexcept {
+        ShardBytes b;
+        b.size_ = v.size();
+        b.vec_ = std::move(v);
+        return b;
+    }
+
+    const std::byte* data() const noexcept {
+        return mapped_ ? static_cast<const std::byte*>(mapped_) : vec_.data();
+    }
+    std::size_t size() const noexcept { return size_; }
+    bool empty() const noexcept { return size_ == 0; }
+    std::span<const std::byte> span() const noexcept { return {data(), size_}; }
+    // True when the backing is an mmap rather than heap (diagnostic).
+    bool is_mmap() const noexcept { return mapped_ != nullptr; }
+
+private:
+    void release() noexcept {
+#if !defined(_WIN32)
+        if (mapped_) {
+            ::munmap(mapped_, size_);
+        }
+#endif
+        mapped_ = nullptr;
+        vec_.clear();
+        vec_.shrink_to_fit();
+        size_ = 0;
+    }
+    void take(ShardBytes&& o) noexcept {
+        mapped_ = o.mapped_; o.mapped_ = nullptr;
+        vec_ = std::move(o.vec_);
+        size_ = o.size_; o.size_ = 0;
+    }
+    void* mapped_ = nullptr;      // mmap region if non-null
+    std::vector<std::byte> vec_;  // otherwise heap-owned
+    std::size_t size_ = 0;
+};
+
 // ---------------------------------------------------------------------------
 // ZarrArray
 // ---------------------------------------------------------------------------
@@ -950,13 +1028,21 @@ public:
             auto it = registry.find(meta.compressor_id);
             if (it != registry.end()) codec = it->second;
         } else if (version == ZarrVersion::v3) {
-            // Look for bytes-to-bytes codecs in the pipeline.
-            for (const auto& cc : meta.codecs) {
-                if (cc.name != "bytes" && cc.name != "transpose" && cc.name != "sharding_indexed") {
-                    auto it = registry.find(cc.name);
-                    if (it != registry.end()) { codec = it->second; break; }
+            // Look for bytes-to-bytes codecs in the pipeline.  For sharded
+            // arrays the outer pipeline only has sharding_indexed; the real
+            // per-inner-chunk compressor lives in shard_config->sub_codecs.
+            auto scan = [&](const std::vector<ZarrCodecConfig>& cs) {
+                for (const auto& cc : cs) {
+                    if (cc.name != "bytes" && cc.name != "transpose"
+                        && cc.name != "sharding_indexed") {
+                        auto it = registry.find(cc.name);
+                        if (it != registry.end()) { codec = it->second; return true; }
+                    }
                 }
-            }
+                return false;
+            };
+            if (meta.shard_config) scan(meta.shard_config->sub_codecs);
+            if (!codec.decompress) scan(meta.codecs);
         }
 
         return ZarrArray(path, std::move(meta), std::move(codec), std::move(registry));
@@ -1039,8 +1125,14 @@ public:
 
     [[nodiscard]] std::optional<std::vector<std::byte>>
     read_chunk(std::span<const std::size_t> chunk_indices) const {
-        if (is_sharded())
-            return read_inner_chunk_from_shard(chunk_indices);
+        if (is_sharded()) {
+            auto raw = read_inner_chunk_from_shard(chunk_indices);
+            if (!raw) return std::nullopt;
+            if (codec_.decompress && needs_decompression()) {
+                return codec_.decompress(*raw, meta_.sub_chunk_byte_size());
+            }
+            return raw;
+        }
 
         auto raw = read_chunk_raw(chunk_indices);
         if (!raw) return std::nullopt;
@@ -1126,6 +1218,12 @@ public:
         return extract_inner_chunk(*shard_data, inner_indices);
     }
 
+    // 4k-align chunk payloads inside shards so decoders can mmap the shard
+    // and hand direct pointers to the codec without buffering.  Index entries
+    // use the aligned offset; padding bytes between chunks are ignored by
+    // the reader (spec allows arbitrary gaps).
+    static constexpr std::uint64_t kShardChunkAlign = 4096;
+
     /// Write a complete shard given a set of inner chunk data.
     /// `inner_chunks` is indexed by linear inner chunk index (C-order).
     /// Missing inner chunks should be std::nullopt.
@@ -1140,7 +1238,7 @@ public:
         if (inner_chunks.size() != n_inner)
             throw std::runtime_error("zarr: wrong number of inner chunks for shard");
 
-        // Build shard data: [index][chunk0][chunk1]...
+        // Build shard data: [index][chunk0 padded to 4k][chunk1 padded to 4k]...
         std::vector<std::byte> shard_data;
         detail::ShardIndex index;
         index.entries.resize(n_inner);
@@ -1148,6 +1246,13 @@ public:
         // Index always at start — reserve space for it.
         const std::size_t index_size = n_inner * 16;
         shard_data.resize(index_size);
+
+        auto pad_to_align = [&]() {
+            auto n = shard_data.size();
+            auto aligned = (n + kShardChunkAlign - 1) & ~(kShardChunkAlign - 1);
+            if (aligned > n) shard_data.resize(aligned, std::byte{0});
+        };
+        pad_to_align();   // ensures first chunk lands on 4k boundary
 
         for (std::size_t i = 0; i < n_inner; ++i) {
             if (!inner_chunks[i]) {
@@ -1168,6 +1273,7 @@ public:
             index.entries[i].offset = shard_data.size();
             index.entries[i].nbytes  = write_data.size();
             shard_data.insert(shard_data.end(), write_data.begin(), write_data.end());
+            pad_to_align();
         }
 
         // Write index at start.
@@ -1231,9 +1337,16 @@ public:
         std::fstream f(p, std::ios::binary | std::ios::in | std::ios::out);
         if (!f) return;
 
-        // 1. Seek to EOF, append chunk data
+        // 1. Seek to EOF, round up to next 4k boundary, append chunk data.
+        //    Padding bytes (if any) are left uninitialised — ext4 zero-fills
+        //    them on sparse extension, and readers never look at them.
         f.seekp(0, std::ios::end);
-        auto chunk_offset = static_cast<std::uint64_t>(f.tellp());
+        auto eof_offset = static_cast<std::uint64_t>(f.tellp());
+        auto chunk_offset = (eof_offset + kShardChunkAlign - 1)
+                          & ~(kShardChunkAlign - 1);
+        if (chunk_offset != eof_offset) {
+            f.seekp(static_cast<std::streamoff>(chunk_offset));
+        }
         f.write(reinterpret_cast<const char*>(data.data()),
                 static_cast<std::streamsize>(data.size()));
 
@@ -1416,10 +1529,15 @@ private:
         if (meta_.version == ZarrVersion::v2)
             return !meta_.compressor_id.empty();
         // v3: check for bytes-to-bytes codecs in pipeline.
-        for (const auto& cc : meta_.codecs)
-            if (cc.name != "bytes" && cc.name != "transpose" && cc.name != "sharding_indexed")
-                return true;
-        return false;
+        auto has_bb = [](const std::vector<ZarrCodecConfig>& cs) {
+            for (const auto& cc : cs)
+                if (cc.name != "bytes" && cc.name != "transpose"
+                    && cc.name != "sharding_indexed")
+                    return true;
+            return false;
+        };
+        if (meta_.shard_config && has_bb(meta_.shard_config->sub_codecs)) return true;
+        return has_bb(meta_.codecs);
     }
 
     [[nodiscard]] bool needs_decompression() const noexcept {
@@ -1537,7 +1655,13 @@ public:
     /// extract_inner_chunk() to pull out individual inner chunks — useful
     /// when a caller maintains an external shard-level cache and wants to
     /// serve many inner chunks from a single disk read.
-    [[nodiscard]] std::optional<std::vector<std::byte>>
+    ///
+    /// On POSIX the returned bytes are backed by a read-only mmap so the
+    /// kernel's page cache owns residency — under memory pressure unused
+    /// pages drop without touching our allocator. Inner chunks written
+    /// later invalidate the view (caller must drop/refresh); shard_mutex
+    /// serialises reads vs. write_inner_chunk_to_shard.
+    [[nodiscard]] std::optional<ShardBytes>
     read_whole_shard(std::span<const std::size_t> chunk_indices) const {
         if (!is_sharded()) return std::nullopt;
         const auto ndim = meta_.ndim();
@@ -1549,6 +1673,26 @@ public:
         auto key = chunk_key(shard_idx);
         auto p = root_ / key;
         std::lock_guard lock(shard_mutex_for(p));
+#if !defined(_WIN32)
+        int fd = ::open(p.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd < 0) return std::nullopt;
+        struct stat st;
+        if (::fstat(fd, &st) < 0 || st.st_size <= 0) {
+            ::close(fd);
+            return std::nullopt;
+        }
+        const std::size_t sz = static_cast<std::size_t>(st.st_size);
+        void* ptr = ::mmap(nullptr, sz, PROT_READ, MAP_PRIVATE, fd, 0);
+        // The mapping survives the fd close — no fd leak from a long-lived
+        // shard-cache entry.
+        ::close(fd);
+        if (ptr == MAP_FAILED) return std::nullopt;
+        // MADV_RANDOM: we parse the trailing index then hop to a specific
+        // inner-chunk offset. Sequential readahead would prefetch pages we
+        // never touch.
+        ::madvise(ptr, sz, MADV_RANDOM);
+        return ShardBytes::from_mmap(ptr, sz);
+#else
         std::ifstream f(p, std::ios::binary | std::ios::ate);
         if (!f) return std::nullopt;
         auto size = static_cast<std::streamsize>(f.tellg());
@@ -1557,7 +1701,8 @@ public:
         f.seekg(0);
         f.read(reinterpret_cast<char*>(data.data()), size);
         if (!f) return std::nullopt;
-        return data;
+        return ShardBytes::from_vector(std::move(data));
+#endif
     }
 
     /// Extract a single inner chunk from shard data.

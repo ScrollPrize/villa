@@ -1,4 +1,5 @@
 #include "vc/core/cache/VolumeSource.hpp"
+#include "vc/core/cache/BlockCache.hpp"
 #include "vc/core/cache/CacheDebugLog.hpp"
 #include "vc/core/cache/CacheUtils.hpp"
 
@@ -76,6 +77,7 @@ void FileSystemSource::discoverLevels()
         try {
             auto meta = utils::ZarrArray::open(levelPath).metadata();
             LevelMeta lm{};
+            lm.dirName = std::to_string(lvl);
             // Finest granularity: inner chunks for sharded v3, chunks otherwise.
             const auto& cs = meta.shard_config ? meta.shard_config->sub_chunks
                                                : meta.chunks;
@@ -83,6 +85,21 @@ void FileSystemSource::discoverLevels()
                 lm.shape = {int(meta.shape[0]), int(meta.shape[1]), int(meta.shape[2])};
             if (cs.size() >= 3)
                 lm.chunkShape = {int(cs[0]), int(cs[1]), int(cs[2])};
+            // 16³ blocks are the fixed storage unit; chunks must tile cleanly.
+            // Arbitrary multiples of 16 on each axis are fine (128³, 64³,
+            // 192³, non-cubic 32x128x128, etc.) — just not 100, 50, 96 etc.
+            for (int d = 0; d < 3; ++d) {
+                if (lm.chunkShape[d] <= 0 || lm.chunkShape[d] % kBlockSize != 0) {
+                    throw std::runtime_error(
+                        "zarr level " + std::to_string(lvl) + " at " +
+                        levelPath.string() + " has chunk shape " +
+                        std::to_string(lm.chunkShape[0]) + "x" +
+                        std::to_string(lm.chunkShape[1]) + "x" +
+                        std::to_string(lm.chunkShape[2]) +
+                        "; each axis must be a positive multiple of " +
+                        std::to_string(kBlockSize));
+                }
+            }
             levels_.push_back(lm);
         } catch (const std::exception& e) {
             if (auto* log = cacheDebugLog())
@@ -95,7 +112,10 @@ void FileSystemSource::discoverLevels()
 
 std::filesystem::path FileSystemSource::chunkPath(const ChunkKey& key) const
 {
-    return root_ / std::to_string(key.level) / chunkFilename(key, delimiter_);
+    const auto& dir = (key.level >= 0 && key.level < int(levels_.size()) && !levels_[key.level].dirName.empty())
+        ? levels_[key.level].dirName
+        : std::to_string(key.level);
+    return root_ / dir / chunkFilename(key, delimiter_);
 }
 
 std::vector<uint8_t> FileSystemSource::fetch(const ChunkKey& key)
@@ -148,11 +168,14 @@ void HttpSource::setShardConfig(const ShardConfig& config)
 
 std::string HttpSource::chunkUrl(const ChunkKey& key) const
 {
+    const auto& dir = (key.level >= 0 && key.level < int(levels_.size()) && !levels_[key.level].dirName.empty())
+        ? levels_[key.level].dirName
+        : std::to_string(key.level);
     std::string url;
     url.reserve(baseUrl_.size() + 32);
     url += baseUrl_;
     url += '/';
-    url += std::to_string(key.level);
+    url += dir;
     url += '/';
     url += std::to_string(key.iz);
     url += delimiter_;
@@ -167,11 +190,14 @@ std::string HttpSource::shardUrl(const ChunkKey& key) const
     int sz = key.iz / chunksPerShard_[0];
     int sy = key.iy / chunksPerShard_[1];
     int sx = key.ix / chunksPerShard_[2];
+    const auto& dir = (key.level >= 0 && key.level < int(levels_.size()) && !levels_[key.level].dirName.empty())
+        ? levels_[key.level].dirName
+        : std::to_string(key.level);
     std::string url;
     url.reserve(baseUrl_.size() + 32);
     url += baseUrl_;
     url += '/';
-    url += std::to_string(key.level);
+    url += dir;
     url += "/c/";
     url += std::to_string(sz);
     url += '/';
@@ -215,7 +241,7 @@ std::vector<uint8_t> HttpSource::httpGet(const std::string& url)
         // 404 is an expected "chunk doesn't exist" response — stay quiet.
         // Anything else (403/401/5xx) almost always means auth or network
         // trouble; log loudly so it doesn't look like an empty volume.
-        if (resp.status_code != 404) {
+        if (resp.status_code != 404 && resp.status_code != 0) {
             transientError_.store(true, std::memory_order_relaxed);
             static std::atomic<int> errCount{0};
             int n = errCount.fetch_add(1);
@@ -245,65 +271,51 @@ std::vector<uint8_t> HttpSource::httpGet(const std::string& url)
     return result;
 }
 
+std::vector<uint8_t> HttpSource::httpGetRange(const std::string& url,
+                                              std::size_t offset,
+                                              std::size_t length)
+{
+    if (length == 0) return {};
+    auto resp = client_->get_range(url, offset, length);
+    tl_last_was_absent = (resp.status_code == 404);
+    if (!resp.ok()) {
+        if (resp.status_code != 404) {
+            transientError_.store(true, std::memory_order_relaxed);
+            static std::atomic<int> errCount{0};
+            int n = errCount.fetch_add(1);
+            if (n < 5) {
+                std::fprintf(stderr,
+                             "[HTTP] GET_RANGE %s [%zu..%zu) -> status=%ld\n",
+                             url.c_str(), offset, offset + length,
+                             long(resp.status_code));
+            }
+        }
+        return {};
+    }
+    transientError_.store(false, std::memory_order_relaxed);
+
+    // Servers are allowed to ignore Range and return 200 with the full
+    // resource (RFC 7233 §3.1). Detect that by body size > requested
+    // length and slice out [offset, offset+length) ourselves so the
+    // caller always sees the bytes it asked for.
+    const auto& body = resp.body;
+    std::vector<uint8_t> result;
+    if (body.size() > length && body.size() >= offset + length) {
+        result.resize(length);
+        std::memcpy(result.data(), body.data() + offset, length);
+    } else {
+        result.resize(body.size());
+        if (!body.empty())
+            std::memcpy(result.data(), body.data(), result.size());
+    }
+    return result;
+}
+
 std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
 {
     std::string url = shardUrl(key);
-
-    std::shared_ptr<std::vector<uint8_t>> shardData;
-    std::shared_ptr<utils::detail::ShardIndex> shardIndex;
-    {
-        std::lock_guard<std::mutex> lock(shardCacheMutex_);
-        if (auto it = shardCacheMap_.find(url); it != shardCacheMap_.end()) {
-            // LRU touch: move the hit to the front of the list.
-            shardCacheLru_.splice(shardCacheLru_.begin(), shardCacheLru_, it->second);
-            shardData = it->second->entry.bytes;
-            shardIndex = it->second->entry.index;
-        }
-    }
-
-    if (!shardData) {
-        auto raw = httpGet(url);
-        if (raw.empty()) return {};
-        shardData = std::make_shared<std::vector<uint8_t>>(std::move(raw));
-
-        constexpr size_t kShardCacheBudget = 256ull << 20;
-        std::lock_guard<std::mutex> lock(shardCacheMutex_);
-
-        // If another thread raced ahead and inserted the same url, reuse
-        // its entry (keep our download but let it fall out of scope).
-        if (auto it = shardCacheMap_.find(url); it != shardCacheMap_.end()) {
-            shardCacheLru_.splice(shardCacheLru_.begin(), shardCacheLru_, it->second);
-            shardData = it->second->entry.bytes;
-            shardIndex = it->second->entry.index;
-        } else {
-            shardCacheLru_.push_front({url, {shardData, {}}});
-            shardCacheMap_[url] = shardCacheLru_.begin();
-            shardCacheBytes_ += shardData->size();
-
-            // LRU eviction: drop oldest entries until we're under budget.
-            // Keep at least one entry so the just-inserted item survives
-            // even if it alone exceeds the budget.
-            while (shardCacheBytes_ > kShardCacheBudget
-                   && shardCacheLru_.size() > 1) {
-                auto& victim = shardCacheLru_.back();
-                shardCacheBytes_ -= victim.entry.bytes
-                    ? victim.entry.bytes->size() : 0;
-                shardCacheMap_.erase(victim.url);
-                shardCacheLru_.pop_back();
-            }
-
-            if (auto* log = cacheDebugLog())
-                std::fprintf(log, "[SHARD] Cached %s (%zu bytes, %d entries, cache=%zu, bytes=%zu)\n",
-                             url.c_str(), shardData->size(), totalChunksPerShard(),
-                             shardCacheMap_.size(), shardCacheBytes_);
-        }
-    }
-
     const int nChunks = totalChunksPerShard();
-    if (shardData->size() < size_t(nChunks) * 16) {
-        tl_last_was_absent = false;
-        return {};
-    }
+    if (nChunks <= 0) return {};
 
     const int inner = innerChunkIndex(key);
     if (inner < 0 || inner >= nChunks) {
@@ -311,22 +323,55 @@ std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
         return {};
     }
 
-    // Cache the parsed index alongside the bytes. Without this we were
-    // re-parsing ~16 KB (512 * 16 B) on every single inner-chunk fetch
-    // against the same shard.
+    // Phase 1: fetch + cache the parsed shard index.  The index lives at the
+    // head of the shard (zarr-v3 index_location=start) so one Range GET of
+    // nChunks*16 bytes gives us full chunk addressability.
+    std::shared_ptr<utils::detail::ShardIndex> shardIndex;
+    {
+        std::lock_guard<std::mutex> lock(shardCacheMutex_);
+        if (auto it = shardCacheMap_.find(url); it != shardCacheMap_.end()) {
+            shardCacheLru_.splice(shardCacheLru_.begin(), shardCacheLru_, it->second);
+            shardIndex = it->second->entry.index;
+        }
+    }
+
     if (!shardIndex) {
-        std::span<const std::byte> shardBytes(
-            reinterpret_cast<const std::byte*>(shardData->data()), shardData->size());
+        const std::size_t indexBytes = std::size_t(nChunks) * 16;
+        auto raw = httpGetRange(url, 0, indexBytes);
+        if (raw.size() != indexBytes) return {};
+
+        std::span<const std::byte> span(
+            reinterpret_cast<const std::byte*>(raw.data()), raw.size());
         auto parsed = std::make_shared<utils::detail::ShardIndex>(
-            utils::detail::ShardIndex::deserialize(shardBytes, size_t(nChunks)));
+            utils::detail::ShardIndex::deserialize(span, size_t(nChunks)));
+
+        constexpr size_t kShardIndexBudget = 64ull << 20;   // ~64 MiB of indices
         std::lock_guard<std::mutex> lock(shardCacheMutex_);
         if (auto it = shardCacheMap_.find(url); it != shardCacheMap_.end()) {
             if (!it->second->entry.index) it->second->entry.index = parsed;
             shardIndex = it->second->entry.index;
+            shardCacheLru_.splice(shardCacheLru_.begin(), shardCacheLru_, it->second);
         } else {
-            shardIndex = std::move(parsed);
+            shardCacheLru_.push_front({url, {/*bytes=*/{}, parsed}});
+            shardCacheMap_[url] = shardCacheLru_.begin();
+            shardCacheBytes_ += indexBytes;
+            shardIndex = parsed;
+
+            while (shardCacheBytes_ > kShardIndexBudget
+                   && shardCacheLru_.size() > 1) {
+                auto& victim = shardCacheLru_.back();
+                shardCacheBytes_ -= std::size_t(nChunks) * 16;
+                shardCacheMap_.erase(victim.url);
+                shardCacheLru_.pop_back();
+            }
+
+            if (auto* log = cacheDebugLog())
+                std::fprintf(log, "[SHARD] Cached index %s (%zu entries, cache=%zu)\n",
+                             url.c_str(), std::size_t(nChunks),
+                             shardCacheMap_.size());
         }
     }
+
     const auto& entry = shardIndex->entries[inner];
 
     if (entry.is_missing()
@@ -334,13 +379,13 @@ std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
         tl_last_was_absent = true;
         return {};
     }
-    if (entry.offset + entry.nbytes > shardData->size()) {
+    if (entry.nbytes == 0) {
         tl_last_was_absent = false;
         return {};
     }
 
-    return {shardData->data() + entry.offset,
-            shardData->data() + entry.offset + entry.nbytes};
+    // Phase 2: Range GET just the chunk's bytes.
+    return httpGetRange(url, entry.offset, entry.nbytes);
 }
 
 std::vector<uint8_t> HttpSource::fetch(const ChunkKey& key)

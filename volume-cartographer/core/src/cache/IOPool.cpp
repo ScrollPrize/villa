@@ -3,6 +3,10 @@
 #include <algorithm>
 #include <unordered_set>
 
+#if defined(__linux__) || defined(__APPLE__)
+#include <pthread.h>
+#endif
+
 namespace vc::cache {
 
 IOPool::IOPool(int numThreads)
@@ -14,7 +18,19 @@ void IOPool::start()
 {
     workers_.reserve(numThreads_);
     for (int i = 0; i < numThreads_; i++) {
-        workers_.emplace_back([this](std::stop_token stop) {
+        workers_.emplace_back([this, i](std::stop_token stop) {
+            if (!threadLabel_.empty()) {
+#if defined(__linux__)
+                // TASK_COMM_LEN = 16 incl. NUL. Truncate if needed.
+                char name[16];
+                std::snprintf(name, sizeof(name), "%s%d", threadLabel_.c_str(), i);
+                ::pthread_setname_np(::pthread_self(), name);
+#elif defined(__APPLE__)
+                char name[32];
+                std::snprintf(name, sizeof(name), "%s%d", threadLabel_.c_str(), i);
+                ::pthread_setname_np(name);
+#endif
+            }
             for (;;) {
                 ShardKey shard;
                 try {
@@ -72,6 +88,7 @@ void IOPool::submit(const std::vector<ChunkKey>& keys)
     if (keys.empty()) return;
 
     int addedCount = 0;
+    int idleSnapshot = 0;
     {
         std::lock_guard lock(mutex_);
         if (shutdown_) return;
@@ -99,11 +116,13 @@ void IOPool::submit(const std::vector<ChunkKey>& keys)
             queueTotal_++;
             ++addedCount;
         }
+        idleSnapshot = idleCount_;
     }
-    // Wake exactly as many workers as we added items, capped at pool size.
-    // When we'd wake everyone anyway, one notify_all is a single futex op
-    // instead of N sequential notify_one futex_wake syscalls.
-    const int toWake = std::min(addedCount, numThreads_);
+    // Wake only workers actually asleep — busy workers will pick up new
+    // items on their next popNext iteration, so notifying them is a
+    // wasted futex_wake syscall.
+    const int toWake = std::min({addedCount, idleSnapshot, numThreads_});
+    if (toWake <= 0) return;
     if (toWake >= numThreads_) {
         cv_.notify_all();
     } else {
@@ -183,8 +202,13 @@ void IOPool::updateInteractive(const std::vector<ChunkKey>& keys, int targetLeve
             q.insert(q.end(), backlog[lvl].begin(), backlog[lvl].end());
             queueTotal_ += q.size();
         }
-        totalToWake = std::min<size_t>(queueTotal_, size_t(numThreads_));
+        // Clamp wake count by the number of workers actually asleep —
+        // see submit() for the reasoning.
+        totalToWake = std::min<size_t>({queueTotal_,
+                                        size_t(idleCount_),
+                                        size_t(numThreads_)});
     }
+    if (totalToWake == 0) return;
     if (totalToWake >= size_t(numThreads_)) {
         cv_.notify_all();
     } else {
@@ -195,9 +219,15 @@ void IOPool::updateInteractive(const std::vector<ChunkKey>& keys, int targetLeve
 ShardKey IOPool::popNext()
 {
     std::unique_lock lock(mutex_);
-    cv_.wait(lock, [this] {
-        return queueTotal_ > 0 || shutdown_;
-    });
+    if (queueTotal_ == 0 && !shutdown_) {
+        // Advertise idleness before blocking so producers can gate their
+        // notifies on "someone is actually waiting".
+        ++idleCount_;
+        cv_.wait(lock, [this] {
+            return queueTotal_ > 0 || shutdown_;
+        });
+        --idleCount_;
+    }
     if (shutdown_ && queueTotal_ == 0)
         throw std::runtime_error("IOPool shutdown");
 

@@ -35,6 +35,7 @@
 #include "segmentation/SegmentationWidget.hpp"
 #include "segmentation/growth/SegmentationGrowth.hpp"
 #include "SeedingWidget.hpp"
+#include "vc/core/cache/TickCoordinator.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -82,6 +83,7 @@ public slots:
     void onLocChanged(void);
     void onManualPlaneChanged(void);
     void onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
+    void onVisLasagnaObj(const std::string& segmentId);
     void onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                    SegmentationGrowthDirection direction,
                                    int steps,
@@ -223,6 +225,12 @@ private:
     bool can_change_volume_();
 
     size_t _cacheSizeBytes = 0;
+
+    // Declared early so that the publisher thread joins (via ~jthread) after
+    // all viewers and caches below have been destroyed. Readers hold raw
+    // const pointers into FrameState buffers owned here; the coordinator
+    // must outlive every possible reader.
+    std::unique_ptr<vc::cache::TickCoordinator> _tickCoordinator;
 
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;

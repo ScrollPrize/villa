@@ -81,6 +81,10 @@ void dumpOnce(ViewerManager* viewerManager, CState* state)
 #endif
 
     std::size_t blockBytes = 0;
+    std::size_t encStageChunks = 0;
+    std::size_t decStageBytes = 0;
+    std::size_t dlPending = 0, encPending = 0, ldPending = 0, decPending = 0;
+    std::size_t inflightShardReads = 0, inflightShardBytes = 0;
     std::size_t patchCount = 0;
     std::size_t surfaceCount = 0;
     if (viewerManager) {
@@ -88,6 +92,14 @@ void dumpOnce(ViewerManager* viewerManager, CState* state)
             if (auto* bp = vol->tieredCache()) {
                 const auto stats = bp->stats();
                 blockBytes = stats.blocks * 4096;
+                encStageChunks = stats.encodeStagingChunks;
+                decStageBytes = stats.decodeStagingBytes;
+                dlPending = stats.downloadPending;
+                encPending = stats.encodePending;
+                ldPending = stats.loadPending;
+                decPending = stats.decodePending;
+                inflightShardReads = stats.inflightShardReads;
+                inflightShardBytes = stats.inflightShardBytes;
             }
         }
         if (auto* spi = viewerManager->surfacePatchIndex()) {
@@ -97,35 +109,62 @@ void dumpOnce(ViewerManager* viewerManager, CState* state)
     }
 
     const std::size_t surfaceBytes = estimateLoadedSurfaceBytes(state);
+    // 16 MiB per staged canonical chunk (256³ u8).
+    const std::size_t encStageMB = (encStageChunks * 16ULL * 1024 * 1024) / (1024 * 1024);
 
 #if defined(VC_HAVE_MIMALLOC)
-    // std::fprintf(stderr,
-    //     "[RAM] rss=%ldMB hwm=%ldMB swap=%ldMB"
-    //     " | blocks=%zuMB | spi=%zu_patches/%zu_surfs | surface_points=%zuMB\n",
-    //     ps.vmRssKB / 1024,
-    //     ps.vmHwmKB / 1024,
-    //     ps.vmSwapKB / 1024,
-    //     blockBytes / (1024*1024),
-    //     patchCount,
-    //     surfaceCount,
-    //     surfaceBytes / (1024*1024));
+    size_t mi_elapsed = 0, mi_user = 0, mi_sys = 0, mi_rss = 0, mi_peak_rss = 0;
+    size_t mi_commit = 0, mi_peak_commit = 0, mi_faults = 0;
+    mi_process_info(&mi_elapsed, &mi_user, &mi_sys, &mi_rss, &mi_peak_rss,
+                    &mi_commit, &mi_peak_commit, &mi_faults);
+    // mi_process_info underflows to huge uint64 values after mimalloc has
+    // begun teardown on shutdown. Anything bigger than 1 PiB is the bug.
+    constexpr size_t kMiSane = size_t(1) << 50;
+    if (mi_commit      > kMiSane) mi_commit      = 0;
+    if (mi_peak_commit > kMiSane) mi_peak_commit = 0;
+    if (mi_rss         > kMiSane) mi_rss         = 0;
+    if (mi_peak_rss    > kMiSane) mi_peak_rss    = 0;
+    std::fprintf(stderr,
+        "[RAM] rss=%ldMB hwm=%ldMB swap=%ldMB"
+        " | mi_commit=%zuMB mi_peak_commit=%zuMB mi_peak_rss=%zuMB"
+        " | blocks=%zuMB enc_stage=%zuc/%zuMB dec_stage=%zuKB"
+        " | pend dl=%zu enc=%zu ld=%zu dec=%zu"
+        " | shard_inflight=%zur/%zuMB"
+        " | spi=%zup/%zus surfs=%zuMB\n",
+        ps.vmRssKB / 1024,
+        ps.vmHwmKB / 1024,
+        ps.vmSwapKB / 1024,
+        mi_commit / (1024*1024),
+        mi_peak_commit / (1024*1024),
+        mi_peak_rss / (1024*1024),
+        blockBytes / (1024*1024),
+        encStageChunks, encStageMB,
+        decStageBytes / 1024,
+        dlPending, encPending, ldPending, decPending,
+        inflightShardReads, inflightShardBytes / (1024*1024),
+        patchCount, surfaceCount,
+        surfaceBytes / (1024*1024));
 #else
-    // std::fprintf(stderr,
-    //     "[RAM] rss=%ldMB hwm=%ldMB swap=%ldMB | malloc:in_use=%zuMB free=%zuMB mmap=%zuMB"
-    //     " | blocks=%zuMB | spi=%zu_patches/%zu_surfs | surface_points=%zuMB\n",
-    //     ps.vmRssKB / 1024,
-    //     ps.vmHwmKB / 1024,
-    //     ps.vmSwapKB / 1024,
-    //     std::size_t(mi.uordblks) / (1024*1024),
-    //     std::size_t(mi.fordblks) / (1024*1024),
-    //     std::size_t(mi.hblkhd) / (1024*1024),
-    //     blockBytes / (1024*1024),
-    //     patchCount,
-    //     surfaceCount,
-    //     surfaceBytes / (1024*1024));
+    std::fprintf(stderr,
+        "[RAM] rss=%ldMB hwm=%ldMB swap=%ldMB | malloc:in_use=%zuMB free=%zuMB mmap=%zuMB"
+        " | blocks=%zuMB enc_stage=%zuc/%zuMB dec_stage=%zuKB"
+        " | pend dl=%zu enc=%zu ld=%zu dec=%zu"
+        " | shard_inflight=%zur/%zuMB"
+        " | spi=%zup/%zus surfs=%zuMB\n",
+        ps.vmRssKB / 1024,
+        ps.vmHwmKB / 1024,
+        ps.vmSwapKB / 1024,
+        std::size_t(mi.uordblks) / (1024*1024),
+        std::size_t(mi.fordblks) / (1024*1024),
+        std::size_t(mi.hblkhd) / (1024*1024),
+        blockBytes / (1024*1024),
+        encStageChunks, encStageMB,
+        decStageBytes / 1024,
+        dlPending, encPending, ldPending, decPending,
+        inflightShardReads, inflightShardBytes / (1024*1024),
+        patchCount, surfaceCount,
+        surfaceBytes / (1024*1024));
 #endif
-    (void)ps; (void)mi; (void)blockBytes; (void)patchCount;
-    (void)surfaceCount; (void)surfaceBytes;
 }
 
 }  // namespace vc3d::ramstats

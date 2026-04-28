@@ -71,6 +71,7 @@ class Volume:
         - 'instance_zscore': Z-score normalization computed per slice/volume instance.
         - 'global_zscore': Z-score normalization using pre-computed global mean/std.
         - 'instance_minmax': Min-max scaling to [0, 1] computed per slice/volume instance.
+        - 'percentile_minmax': Per-instance p1/p99 clipping and scaling to [0, 1].
     global_mean : Optional[float]
         Global mean value (required for 'global_zscore').
     global_std : Optional[float]
@@ -135,7 +136,7 @@ class Volume:
         format : str, default = 'zarr'
             Data format (currently only 'zarr').
         normalization_scheme : str, default = 'none'
-            Normalization method ('none', 'instance_zscore', 'global_zscore', 'instance_minmax').
+            Normalization method ('none', 'instance_zscore', 'global_zscore', 'instance_minmax', 'percentile_minmax').
         global_mean : Optional[float], default = None
             Global mean for 'global_zscore'. Must be provided if scheme is 'global_zscore'.
         global_std : Optional[float], default = None
@@ -172,7 +173,7 @@ class Volume:
         self.inklabel = None  # Initialize inklabel
 
         # --- Input Validation ---
-        valid_schemes = ['none', 'instance_zscore', 'global_zscore', 'instance_minmax', 'ct']
+        valid_schemes = ['none', 'instance_zscore', 'global_zscore', 'instance_minmax', 'percentile_minmax', 'ct']
         if self.normalization_scheme not in valid_schemes:
             raise ValueError(
                 f"Invalid normalization_scheme: '{self.normalization_scheme}'. Must be one of {valid_schemes}")
@@ -874,6 +875,17 @@ class Volume:
                 data_slice[c] = (data_slice[c] - min_val) / denominator
             if self.verbose: print(f"  Applied instance Min-Max scaling to [0, 1].")
 
+        elif self.normalization_scheme == 'percentile_minmax':
+            for c in range(data_slice.shape[0]):
+                lower, upper = np.percentile(data_slice[c], (1.0, 99.0))
+                denominator = float(upper - lower)
+                if denominator <= 1e-8:
+                    data_slice[c] = 0.0
+                else:
+                    clipped = np.clip(data_slice[c], lower, upper)
+                    data_slice[c] = (clipped - lower) / denominator
+            if self.verbose: print(f"  Applied percentile Min-Max scaling to [0, 1].")
+
         elif self.normalization_scheme == 'ct':
             # nnU-Net CT normalization: clip to percentiles then z-score with global mean/std
             lb = float(self.intensity_props['percentile_00_5'])
@@ -905,7 +917,7 @@ class Volume:
 
                 if np.issubdtype(target_dtype, np.integer):
                     # Handle conversion to integer types
-                    if self.normalization_scheme in ['instance_minmax']:  # Data is in [0, 1] range
+                    if self.normalization_scheme in ['instance_minmax', 'percentile_minmax']:  # Data is in [0, 1] range
                         max_target_val = get_max_value(target_dtype)
                         # Scale to target range, clip just in case due to float precision
                         data_slice = np.clip(data_slice * max_target_val, 0, max_target_val)

@@ -376,6 +376,16 @@ public:
     // because gen() can be called from concurrent OMP threads.
     mutable std::atomic<bool> _validMaskAllValid{false};
     mutable cv::Mat_<cv::Vec3f> _normalCache;
+    // gen() scratch buffers reused across render ticks. At 1920×1080 each
+    // coords/normals Mat is ~170 MiB of cv::Vec3f; submitRender fires every
+    // 16-33 ms so fresh allocations burn GB/sec through the allocator and
+    // page-fault every frame. cv::warpAffine writes these as dst: OpenCV's
+    // Mat::create reuses the buffer when size+type match the existing alloc,
+    // so these stay at one buffer per surface after steady state is reached.
+    // mutable because gen() is const.
+    mutable cv::Mat_<cv::Vec3f> _genCoordsScratch;
+    mutable cv::Mat_<cv::Vec3f> _genNormalsScratch;
+    mutable cv::Mat_<uint8_t> _genValidScratch;
     cv::Vec2f _scale;
 
     void setChannel(const std::string& name, const cv::Mat& channel);
@@ -420,6 +430,10 @@ public:
     void refreshMaskTimestamp();
     static std::optional<std::filesystem::file_time_type> readMaskTimestamp(const std::filesystem::path& dir);
 
+    // DPI for TIFF output (0 = don't set). Set via setDpi() or voxelSizeToDpi().
+    float dpi() const { return dpi_; }
+    void setDpi(float d) { dpi_ = d; }
+
 protected:
     std::unordered_map<std::string, cv::Mat> _channels;
     std::unique_ptr<cv::Mat_<cv::Vec3f>> _points;
@@ -428,6 +442,10 @@ protected:
     Rect3D _bbox = {{-1,-1,-1},{-1,-1,-1}};
     std::set<std::string> _overlappingIds;
     std::optional<std::filesystem::file_time_type> _maskTimestamp;
+    // Column ranges of disconnected surface components (from meta.json "components").
+    // Each pair is [col_start, col_end). Empty = single contiguous surface.
+    std::vector<std::pair<int,int>> _components;
+    float dpi_ = 0.f;
 
 private:
     // Write surface data to directory without modifying state. skipChannel can be used to exclude a channel.
@@ -442,6 +460,10 @@ std::unique_ptr<QuadSurface> load_quad_from_tifxyz(const std::string &path, int 
 
 float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3d> &points, const cv::Vec3f &tgt, float th, int max_iters, float scale);
 float pointTo(cv::Vec2f &loc, const cv::Mat_<cv::Vec3f> &points, const cv::Vec3f &tgt, float th, int max_iters, float scale);
+
+// Look up winding depth index from the "d" channel at grid (row, col).
+// Returns NAN if surface is null, "d" channel is missing, or coords are out of bounds.
+float lookupDepthIndex(QuadSurface* surface, int row, int col);
 
 std::unique_ptr<QuadSurface> surface_diff(QuadSurface* a, QuadSurface* b, float tolerance = 2.0);
 std::unique_ptr<QuadSurface> surface_union(QuadSurface* a, QuadSurface* b, float tolerance = 2.0);

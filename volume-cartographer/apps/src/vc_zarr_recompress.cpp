@@ -1,12 +1,12 @@
-// vc_zarr_recompress: Recompress zarr v2 volumes to zarr v3 with H265 + sharding.
+// vc_zarr_recompress: Recompress zarr v2 volumes to zarr v3 with c3d sharding.
 //
 // Reads zarr v2 chunks (blosc/zstd/raw) from S3 or local filesystem,
-// recompresses with H265 into zarr v3 shards (1024³ shards, 128³ inner chunks),
+// recompresses with c3d into zarr v3 shards (4096³ shards, 256³ inner chunks),
 // writes zarr v3 output to S3 or local filesystem.
 //
-// Each 128³ inner chunk is H265-encoded individually (VC3D header + H265
-// bitstream). Shards have a fixed 8192-byte index at the start (512 entries,
-// 16 bytes each: u64 offset + u64 size, little-endian).
+// Each 256³ inner chunk is c3d-encoded individually (C3DC header + c3d
+// bitstream). Shards have a fixed-size index at the start (16 bytes per
+// entry: u64 offset + u64 size, little-endian).
 //
 // Shard index encoding:
 //   (0xFFFFFFFFFFFFFFFF, 0xFFFFFFFFFFFFFFFF) = missing chunk (not present)
@@ -16,7 +16,7 @@
 // Work is partitioned by output shard — each thread gets exclusive shards,
 // so no two threads ever read/write the same input chunks or output shards.
 //
-// All 6 pyramid levels (0-5) are processed in a single invocation.
+// All pyramid levels (0-5) are processed in a single invocation.
 //
 // Usage:
 //   vc_zarr_recompress <input> <output> [options]
@@ -27,26 +27,16 @@
 //   s3+us-east-1://bucket/...     (S3 with explicit region)
 //
 // Options:
-//   --qp N          H265 quantization parameter (0-51) [default: 36]
-//   --verify        Verify roundtrip (decode after encode)
-//   --jobs N        Outer worker threads (shards in flight) [default: 8]
-//   --inner-jobs K  Inner worker threads per shard (chunks in flight)
-//                   [default: hardware_concurrency]
-//   --bit-shift N   Right-shift input by N bits pre-encode (0..7, default 0).
-//                   Ultra-compression at the expense of signal quality; decode
-//                   left-shifts by N to restore range. Use only when aggressive
-//                   compression is needed (e.g. streaming 4-bit previews).
-//   --log FILE      Log completed shards to this file [default: none]
-//   --stats-pct N   Sample N% of encoded chunks and compute lossy-codec
-//                   quality metrics (MAE, RMSE, PSNR, percentiles).
-//                   Default 0 (disabled).  1-5 is cheap and representative.
-//   --air-clamp T   Physics-derived dark clamp: any voxel v <= T is snapped
-//                   to v = T before encoding.  Removes the air/void noise
-//                   band (reconstruction noise sitting around the air u8
-//                   value has no segmentation-relevant information) and
-//                   lets h265 compress those regions as near-constant.
-//                   Typical T for 78 keV BM18 scans: ~54 (air ~39 + 15
-//                   noise margin).  Default 0 (disabled).
+//   --target-ratio R  c3d target compression ratio [default: 50]
+//                     (50 ≈ 40 dB PSNR on scroll CT)
+//   --verify          Verify roundtrip (decode after encode)
+//   --jobs N          Outer worker threads (shards in flight) [default: 8]
+//   --inner-jobs K    Inner worker threads per shard (chunks in flight)
+//                     [default: hardware_concurrency]
+//   --log FILE        Log completed shards to this file [default: none]
+//   --stats-pct N     Sample N% of encoded chunks and compute lossy-codec
+//                     quality metrics (MAE, RMSE, PSNR, percentiles).
+//                     Default 0 (disabled). 1-5 is cheap and representative.
 
 #include <cstdio>
 #include <cstdlib>
@@ -73,17 +63,19 @@
 #include "utils/Json.hpp"
 #include <blosc.h>
 
-#include "utils/video_codec.hpp"
+#include "utils/c3d_codec.hpp"
 #include "utils/http_fetch.hpp"
 #include "utils/zarr.hpp"
 
 namespace fs = std::filesystem;
 using Json = utils::Json;
 
-static constexpr size_t SHARD_DIM = 1024;  // shard shape per axis
-static constexpr size_t CHUNK_DIM = 128;   // inner chunk shape per axis
-static constexpr size_t CHUNKS_PER_SHARD = SHARD_DIM / CHUNK_DIM;  // 8
-static constexpr size_t INNER_CHUNKS = CHUNKS_PER_SHARD * CHUNKS_PER_SHARD * CHUNKS_PER_SHARD;  // 512
+// c3d canonical geometry: 4096³ shards with 256³ inner chunks.
+static constexpr size_t SHARD_DIM = 4096;
+static constexpr size_t CHUNK_DIM = 256;
+static constexpr size_t CHUNKS_PER_SHARD = SHARD_DIM / CHUNK_DIM;                 // 16
+static constexpr size_t INNER_CHUNKS = CHUNKS_PER_SHARD * CHUNKS_PER_SHARD
+                                     * CHUNKS_PER_SHARD;                          // 4096
 static constexpr size_t CHUNK_VOXELS = CHUNK_DIM * CHUNK_DIM * CHUNK_DIM;
 
 // ============================================================================
@@ -381,7 +373,8 @@ static std::vector<std::byte> decompress_blosc(const std::vector<std::byte>& com
 // Zarr v3 metadata generation
 // ============================================================================
 
-static std::string make_zarr_v3_metadata(const std::vector<size_t>& shape, int qp) {
+static std::string make_zarr_v3_metadata(const std::vector<size_t>& shape,
+                                         float target_ratio) {
     utils::ZarrMetadata meta;
     meta.version = utils::ZarrVersion::v3;
     meta.shape = shape;
@@ -391,16 +384,15 @@ static std::string make_zarr_v3_metadata(const std::vector<size_t>& shape, int q
     meta.chunk_key_encoding = "default";  // "/" separator
     meta.node_type = "array";
 
-    // Sharding config: 1024³ shards with 128³ inner chunks, index at start
+    // Sharding config: SHARD_DIM³ shards with CHUNK_DIM³ inner chunks.
     utils::ShardConfig sc;
     sc.sub_chunks = {CHUNK_DIM, CHUNK_DIM, CHUNK_DIM};
 
-    // Sub-chunk codec: h265 (VC3D video codec)
-    utils::ZarrCodecConfig h265_codec;
-    h265_codec.name = "h265";
-    h265_codec.configuration = std::make_shared<utils::JsonValue>(utils::JsonValue{{"qp", Json(qp)}});
-    sc.sub_codecs.push_back(h265_codec);
-
+    utils::ZarrCodecConfig codec_cfg;
+    codec_cfg.name = "c3d";
+    codec_cfg.configuration = std::make_shared<utils::JsonValue>(
+        utils::JsonValue{{"target_ratio", Json((double)target_ratio)}});
+    sc.sub_codecs.push_back(codec_cfg);
     meta.shard_config = sc;
 
     return utils::detail::serialize_zarr_json(meta);
@@ -671,7 +663,7 @@ int main(int argc, char** argv) {
                   << "Input/output: local path or s3://bucket/path\n"
                   << "\n"
                   << "Options:\n"
-                  << "  --qp N           H265 quantization (0-51, lower=better) [36]\n"
+                  << "  --target-ratio R  c3d target compression ratio (>1.0). [50]\n"
                   << "  --verify         Verify roundtrip after encoding\n"
                   << "  --jobs N         Outer workers (shards in flight) [8]\n"
                   << "  --inner-jobs K   Inner workers per shard (chunks in flight)\n"
@@ -679,8 +671,6 @@ int main(int argc, char** argv) {
                   << "  --log FILE       Log completed shards to file\n"
                   << "  --stats-pct N    Sample N%% of chunks for quality metrics\n"
                   << "                   (MAE, RMSE, PSNR, percentiles).  [0 = off]\n"
-                  << "  --air-clamp T    Clamp voxels v<=T to T pre-encode. [0 = off]\n"
-                  << "  --bit-shift N    Right-shift input by N bits (0..7). [0 = off]\n"
                   << "  --levels CSV     Process only listed levels (e.g. 4,5). [default: all]\n"
                   << "  --rank N         VM index in fanout (0..world-1). [default: 0]\n"
                   << "  --world N        Total VM count for horizontal scaling. [default: 1]\n"
@@ -689,7 +679,7 @@ int main(int argc, char** argv) {
                   << "                          Skips occupancy and resume lists. Coordinator\n"
                   << "                          handles both. Use for per-shard process fanout.\n"
                   << "  --shard-file PATH       File of 'L/sz/sy/sx' lines — batch many shards\n"
-                  << "                          in one process (amortize x265 init + TCP reuse).\n"
+                  << "                          in one process (amortize encoder init + TCP reuse).\n"
                   << "  --encode-jobs N  Encode pool threads per worker [default: 2*cores]\n"
                   << "  --occupancy-file PATH  Binary bitmap of input chunk existence\n"
                   << "                          (nz*ny*nx bits). Skips S3 LIST entirely.\n"
@@ -701,7 +691,6 @@ int main(int argc, char** argv) {
 
     std::string input_path = argv[1];
     std::string output_path = argv[2];
-    int qp = 36;
     bool verify = false;
     // Outer workers process shards in parallel. Since the per-shard work is
     // now mostly parallel internally (see --inner-jobs), a modest outer count
@@ -713,8 +702,6 @@ int main(int argc, char** argv) {
     int inner_jobs = std::max(1, (int)std::thread::hardware_concurrency());
     std::string log_path;
     int stats_pct = 0;
-    int air_clamp = 0;         // legacy high-clamp (snap v<=T to T). 0=off.
-    int shift_n = 0;           // right-shift input by N (ultra-compression, off by default)
     std::string levels_arg;    // empty = all discovered; else CSV of levels
     int rank = 0;              // this VM's index in the fanout (0..world-1)
     int world = 1;             // total VM count for horizontal scaling
@@ -722,17 +709,15 @@ int main(int argc, char** argv) {
     std::string shard_file;    // file of "L/sz/sy/sx" lines — batch in one process
     int encode_jobs = 0;       // 0 = 2*hw_concurrency (default)
     std::string occupancy_file; // external occupancy bitmap (coordinator-built)
+    float target_ratio = 50.0f; // c3d target compression ratio (>1.0)
 
     for (int i = 3; i < argc; i++) {
         std::string arg = argv[i];
-        if (arg == "--qp" && i + 1 < argc) qp = std::atoi(argv[++i]);
-        else if (arg == "--verify") verify = true;
+        if (arg == "--verify") verify = true;
         else if (arg == "--jobs" && i + 1 < argc) jobs = std::atoi(argv[++i]);
         else if (arg == "--inner-jobs" && i + 1 < argc) inner_jobs = std::atoi(argv[++i]);
         else if (arg == "--log" && i + 1 < argc) log_path = argv[++i];
         else if (arg == "--stats-pct" && i + 1 < argc) stats_pct = std::atoi(argv[++i]);
-        else if (arg == "--air-clamp" && i + 1 < argc) air_clamp = std::atoi(argv[++i]);
-        else if (arg == "--bit-shift" && i + 1 < argc) shift_n = std::atoi(argv[++i]);
         else if (arg == "--levels" && i + 1 < argc) levels_arg = argv[++i];
         else if (arg == "--rank" && i + 1 < argc) rank = std::atoi(argv[++i]);
         else if (arg == "--world" && i + 1 < argc) world = std::atoi(argv[++i]);
@@ -740,13 +725,29 @@ int main(int argc, char** argv) {
         else if (arg == "--shard-file" && i + 1 < argc) shard_file = argv[++i];
         else if (arg == "--encode-jobs" && i + 1 < argc) encode_jobs = std::atoi(argv[++i]);
         else if (arg == "--occupancy-file" && i + 1 < argc) occupancy_file = argv[++i];
+        else if (arg == "--target-ratio" && i + 1 < argc) target_ratio = (float)std::atof(argv[++i]);
+        else if (arg == "--codec" || arg == "--qp" || arg == "--air-clamp" || arg == "--bit-shift") {
+            // Legacy h265 flags: removed in the c3d-only switch. Fail fast
+            // so orchestration scripts that still pass them don't silently
+            // inherit --target-ratio defaults and produce mis-encoded data.
+            fprintf(stderr,
+                "Error: flag %s was removed along with the H.265 codec path.\n"
+                "       The recompress tool is c3d-only now; use --target-ratio "
+                "instead of --qp, and drop --codec / --air-clamp / --bit-shift.\n",
+                arg.c_str());
+            return 1;
+        }
+        else {
+            fprintf(stderr, "Error: unknown argument %s\n", arg.c_str());
+            return 1;
+        }
+    }
+    if (!(target_ratio > 1.0f)) {
+        fprintf(stderr, "--target-ratio must be > 1.0, got %g\n", (double)target_ratio);
+        return 1;
     }
     if (stats_pct < 0) stats_pct = 0;
     if (stats_pct > 100) stats_pct = 100;
-    if (air_clamp < 0) air_clamp = 0;
-    if (air_clamp > 255) air_clamp = 255;
-    if (shift_n < 0) shift_n = 0;
-    if (shift_n > 7) shift_n = 7;
     // In --one-shard mode, force the level filter to the shard's level.
     if (!one_shard_arg.empty()) {
         int ol = -1;
@@ -807,10 +808,9 @@ int main(int argc, char** argv) {
 
     printf("Input:  %s\n", input_path.c_str());
     printf("Output: %s\n", output_path.c_str());
-    printf("H265 QP: %d, shard: %zu³, chunk: %zu³\n", qp, SHARD_DIM, CHUNK_DIM);
+    printf("Codec: c3d (target-ratio %.2f), shard: %zu³, chunk: %zu³\n",
+           (double)target_ratio, SHARD_DIM, CHUNK_DIM);
     printf("Outer jobs: %d  |  Inner jobs/shard: %d\n", jobs, inner_jobs);
-    if (air_clamp > 0) printf("Air clamp: v <= %d -> %d\n", air_clamp, air_clamp);
-    if (shift_n > 0) printf("Bit-shift: %d (ultra-compression mode)\n", shift_n);
     if (world > 1) printf("Fanout: rank %d / world %d (sz %% %d == %d)\n",
                            rank, world, world, rank);
     printf("\n");
@@ -913,7 +913,7 @@ int main(int argc, char** argv) {
         // coordinator writes it once before fanning out workers).
         if (one_shard_arg.empty() && shard_file.empty()) {
             output->write_string(std::to_string(l) + "/zarr.json",
-                                  make_zarr_v3_metadata(shape, qp));
+                                  make_zarr_v3_metadata(shape, target_ratio));
         }
 
         // Reuse cached .zarray from discovery phase (saves a GET per worker).
@@ -951,6 +951,21 @@ int main(int argc, char** argv) {
         for (auto d : src_chunks) src_chunk_voxels *= d;
         size_t src_raw_bytes = is_u16 ? src_chunk_voxels * 2 : src_chunk_voxels;
 
+        // Source chunks must tile the output chunk evenly.  Output chunks
+        // larger than source (common: 128³ source → 256³ c3d output) are
+        // assembled by the downloader; sources larger than output are not
+        // supported by this tool.
+        for (int d = 0; d < 3; ++d) {
+            if (src_chunks[d] == 0 || CHUNK_DIM % src_chunks[d] != 0
+                || src_chunks[d] > CHUNK_DIM) {
+                fprintf(stderr,
+                    "level %d: incompatible source chunk shape [%zu,%zu,%zu] "
+                    "for output chunk dim %zu (must divide evenly and be <= output)\n",
+                    l, src_chunks[0], src_chunks[1], src_chunks[2], CHUNK_DIM);
+                return 1;
+            }
+        }
+
         // Shard grid dimensions
         size_t shard_nz = (shape[0] + SHARD_DIM - 1) / SHARD_DIM;
         size_t shard_ny = (shape[1] + SHARD_DIM - 1) / SHARD_DIM;
@@ -962,11 +977,15 @@ int main(int argc, char** argv) {
         // per shard.  Skipped in --one-shard mode: the coordinator already
         // filtered to this shard and the inner download loop falls back to
         // per-chunk GETs with 404 being cheap (~50 ms each, 128 parallel).
-        std::vector<size_t> chunk128 = {CHUNK_DIM, CHUNK_DIM, CHUNK_DIM};
+        // Occupancy mask is indexed by SOURCE chunk grid (that's what the
+        // S3 listing returns).  When source chunk size == output chunk
+        // size these two grids coincide; when src is smaller (e.g. 128³
+        // source → 256³ c3d output), one output chunk is "present" if
+        // any of its covering source chunks exists — checked below.
         std::vector<bool> occ_mask;
-        size_t occ_nz = (shape[0] + CHUNK_DIM - 1) / CHUNK_DIM;
-        size_t occ_ny = (shape[1] + CHUNK_DIM - 1) / CHUNK_DIM;
-        size_t occ_nx = (shape[2] + CHUNK_DIM - 1) / CHUNK_DIM;
+        size_t occ_nz = (shape[0] + src_chunks[0] - 1) / src_chunks[0];
+        size_t occ_ny = (shape[1] + src_chunks[1] - 1) / src_chunks[1];
+        size_t occ_nx = (shape[2] + src_chunks[2] - 1) / src_chunks[2];
         if (!occupancy_file.empty()) {
             // Substitute the level number if path contains {L}
             std::string p = occupancy_file;
@@ -974,7 +993,7 @@ int main(int argc, char** argv) {
             if (pos != std::string::npos) p.replace(pos, 3, std::to_string(l));
             occ_mask = load_occupancy_file(p, occ_nz, occ_ny, occ_nx);
         } else if (one_shard_arg.empty() && shard_file.empty()) {
-            occ_mask = build_occupancy_from_listing(*input, l, shape, chunk128, 64);
+            occ_mask = build_occupancy_from_listing(*input, l, shape, src_chunks, 64);
         }
 
         printf("  Source: chunks [%zu,%zu,%zu], compressor: %s, sep: '%s', dtype: %s\n",
@@ -1043,7 +1062,7 @@ int main(int argc, char** argv) {
             fflush(stdout);
         }
 
-        static constexpr size_t INDEX_BYTES = INNER_CHUNKS * 16;  // 8192
+        const size_t INDEX_BYTES = INNER_CHUNKS * 16;
 
         std::atomic<size_t> total_raw{0}, total_compressed{0};
         std::atomic<int> processed_shards{0}, processed_chunks{0};
@@ -1141,7 +1160,15 @@ int main(int argc, char** argv) {
         struct DownloadTask {
             std::shared_ptr<ShardState> shard;
             size_t job_idx;
-            std::string src_key;
+            // Base source-chunk coords that anchor this output chunk, plus
+            // the per-axis ratio (CHUNK_DIM / src_chunk_dim) of source
+            // chunks along each axis.  When ratio is {1,1,1} the worker
+            // reads exactly one source chunk (original 1:1 path); when it
+            // is {2,2,2} (typical: 128³ source → 256³ c3d output) the
+            // worker fetches 8 source chunks and assembles them into the
+            // output-chunk voxel grid.
+            size_t src_base_z, src_base_y, src_base_x;
+            size_t rz, ry, rx;
         };
 
         struct EncodeTask {
@@ -1159,6 +1186,11 @@ int main(int argc, char** argv) {
         std::mutex enc_mtx;
         std::condition_variable enc_cv;
         bool enc_done = false;
+        // Bound enc_q so downloaders can't race ahead of the encode pool and
+        // pile up CHUNK_VOXELS-sized raw buffers (16 MiB each at 256³).
+        // Cap = 4 × encode workers keeps each encoder fed through normal
+        // pop/encode cycles while capping peak raw RAM at ~ENC_Q_CAP*16 MiB.
+        const size_t ENC_Q_CAP = std::max(8, encode_jobs * 4);
 
         // In-flight shard limiter: bounds how many ShardStates are live in
         // RAM at once (each holds up to 512 compressed chunk buffers ~ 30-40
@@ -1257,42 +1289,84 @@ int main(int argc, char** argv) {
                     }
                 };
 
-                std::vector<std::byte> raw;
-                try {
-                    auto data = t_input->read(task.src_key);
-                    if (utils::is_video_compressed(
-                            std::span<const std::byte>(data))) {
-                        total_raw.fetch_add(CHUNK_VOXELS);
-                        total_compressed.fetch_add(data.size());
-                        processed_chunks.fetch_add(1);
-                        finalize_slot(RESULT_PASSTHROUGH, std::move(data));
-                        continue;
+                // Fast 1:1 passthrough when the source is already stored
+                // in our output codec and the output chunk size matches
+                // (ratio {1,1,1}). Matching input magic to the configured
+                // output codec avoids misinterpreting h265 bytes as c3d
+                // (or vice versa) as raw voxels downstream.
+                if (task.rz == 1 && task.ry == 1 && task.rx == 1) {
+                    std::string src_key = level_prefix +
+                        std::to_string(task.src_base_z) + dim_sep +
+                        std::to_string(task.src_base_y) + dim_sep +
+                        std::to_string(task.src_base_x);
+                    try {
+                        auto data = t_input->read(src_key);
+                        if (utils::is_c3d_compressed(
+                                std::span<const std::byte>(data))) {
+                            total_raw.fetch_add(CHUNK_VOXELS);
+                            total_compressed.fetch_add(data.size());
+                            processed_chunks.fetch_add(1);
+                            finalize_slot(RESULT_PASSTHROUGH, std::move(data));
+                            continue;
+                        }
+                    } catch (...) {
+                        // fall through to the assemble path, which tolerates
+                        // missing source chunks via zero-fill.
                     }
-                    if (!compressor_id.empty()) {
-                        raw = decompress_blosc(data, src_raw_bytes);
-                    } else {
-                        raw = std::move(data);
-                    }
-                } catch (...) {
-                    finalize_slot(RESULT_NONE, {});
-                    continue;
                 }
 
-                if (is_u16) {
-                    size_t n = raw.size() / 2;
-                    auto* src = reinterpret_cast<const uint16_t*>(raw.data());
-                    for (size_t i = 0; i < n; i++) {
-                        raw[i] = static_cast<std::byte>(
-                            static_cast<uint8_t>(src[i] / 257));
+                // Assemble the output chunk by reading each covering source
+                // chunk and copying it into the right sub-region of a
+                // CHUNK_VOXELS buffer.  Missing source chunks (404 / throw
+                // on read) are left as the pre-zeroed default.
+                std::vector<std::byte> raw(CHUNK_VOXELS, std::byte{0});
+                const size_t sx = src_chunks[2];
+                const size_t sy = src_chunks[1];
+                const size_t sz = src_chunks[0];
+                for (size_t dz = 0; dz < task.rz; ++dz)
+                for (size_t dy = 0; dy < task.ry; ++dy)
+                for (size_t dx = 0; dx < task.rx; ++dx) {
+                    std::string src_key = level_prefix +
+                        std::to_string(task.src_base_z + dz) + dim_sep +
+                        std::to_string(task.src_base_y + dy) + dim_sep +
+                        std::to_string(task.src_base_x + dx);
+                    std::vector<std::byte> src_raw;
+                    try {
+                        auto data = t_input->read(src_key);
+                        if (!compressor_id.empty()) {
+                            src_raw = decompress_blosc(data, src_raw_bytes);
+                        } else {
+                            src_raw = std::move(data);
+                        }
+                    } catch (...) {
+                        continue;   // missing source chunk → zero sub-block
                     }
-                    raw.resize(n);
-                }
-                if (raw.size() < CHUNK_VOXELS) {
-                    std::vector<std::byte> padded(CHUNK_VOXELS, std::byte{0});
-                    std::memcpy(padded.data(), raw.data(), raw.size());
-                    raw = std::move(padded);
-                } else if (raw.size() > CHUNK_VOXELS) {
-                    raw.resize(CHUNK_VOXELS);
+
+                    if (is_u16) {
+                        size_t n = src_raw.size() / 2;
+                        auto* s16 = reinterpret_cast<const uint16_t*>(src_raw.data());
+                        for (size_t i = 0; i < n; ++i) {
+                            src_raw[i] = static_cast<std::byte>(
+                                static_cast<uint8_t>(s16[i] / 257));
+                        }
+                        src_raw.resize(n);
+                    }
+                    // Copy src_raw (sz × sy × sx) into raw at sub-offset
+                    // (dz*sz, dy*sy, dx*sx).  A row is sx bytes contiguous
+                    // in both src and dst; outer strides differ (dst row
+                    // stride is CHUNK_DIM, dst z-stride is CHUNK_DIM²).
+                    const size_t have_z = std::min(sz, src_raw.size() / (sy * sx));
+                    for (size_t z = 0; z < have_z; ++z) {
+                        for (size_t y = 0; y < sy; ++y) {
+                            const std::byte* src_row =
+                                src_raw.data() + (z * sy + y) * sx;
+                            std::byte* dst_row = raw.data()
+                                + ((dz * sz + z) * CHUNK_DIM
+                                   + (dy * sy + y)) * CHUNK_DIM
+                                + dx * sx;
+                            std::memcpy(dst_row, src_row, sx);
+                        }
+                    }
                 }
 
                 // Air-clamp is applied inside the codec (and the threshold is
@@ -1305,13 +1379,18 @@ int main(int argc, char** argv) {
                     continue;
                 }
 
-                std::lock_guard elk(enc_mtx);
-                enc_q.push_back({task.shard, task.job_idx, std::move(raw)});
+                {
+                    std::unique_lock elk(enc_mtx);
+                    enc_cv.wait(elk, [&]{
+                        return enc_q.size() < ENC_Q_CAP || enc_done;
+                    });
+                    enc_q.push_back({task.shard, task.job_idx, std::move(raw)});
+                }
                 enc_cv.notify_one();
             }
         };
 
-        // Encode worker: pop raw buffer, h265-encode, store, decrement
+        // Encode worker: pop raw buffer, c3d-encode, store, decrement
         // shard remaining; finalize on last chunk.
         auto enc_fn = [&]() {
             for (;;) {
@@ -1323,25 +1402,38 @@ int main(int argc, char** argv) {
                     task = std::move(enc_q.front());
                     enc_q.pop_front();
                 }
+                // Wake any downloader blocked on queue-full.
+                enc_cv.notify_one();
 
                 total_raw.fetch_add(CHUNK_VOXELS);
 
-                utils::VideoCodecParams params;
-                params.qp = qp;
-                params.depth = CHUNK_DIM;
-                params.height = CHUNK_DIM;
-                params.width = CHUNK_DIM;
-                params.air_clamp = air_clamp;
-                params.shift_n = shift_n;
+                std::vector<std::byte> compressed;
+                auto decode_cb = [&](std::vector<std::byte>& enc) {
+                    utils::C3dCodecParams p;
+                    p.target_ratio = target_ratio;
+                    p.depth = (int)CHUNK_DIM;
+                    p.height = (int)CHUNK_DIM;
+                    p.width = (int)CHUNK_DIM;
+                    return utils::c3d_decode(std::span<const std::byte>(enc),
+                                             CHUNK_VOXELS, p);
+                };
 
-                auto compressed = utils::video_encode(
-                    std::span<const std::byte>(task.raw), params);
+                {
+                    utils::C3dCodecParams p;
+                    p.target_ratio = target_ratio;
+                    p.depth = (int)CHUNK_DIM;
+                    p.height = (int)CHUNK_DIM;
+                    p.width = (int)CHUNK_DIM;
+                    compressed = utils::c3d_encode(
+                        std::span<const std::byte>(task.raw), p);
+                }
                 total_compressed.fetch_add(compressed.size());
 
                 if (verify) {
-                    auto decoded = utils::video_decode(
-                        std::span<const std::byte>(compressed),
-                        CHUNK_VOXELS, params);
+                    auto decoded = decode_cb(compressed);
+                    // c3d is lossy; --verify's strict memcmp will almost
+                    // always fail. Kept for parity with the legacy flag;
+                    // --stats-pct is the meaningful quality check.
                     if (decoded.size() != task.raw.size() ||
                         std::memcmp(decoded.data(), task.raw.data(),
                                     task.raw.size()) != 0) {
@@ -1357,9 +1449,7 @@ int main(int argc, char** argv) {
                     thread_local std::mt19937 rng{std::random_device{}()};
                     thread_local std::uniform_int_distribution<int> roll(1, 100);
                     if (roll(rng) <= stats_pct) {
-                        auto decoded = utils::video_decode(
-                            std::span<const std::byte>(compressed),
-                            CHUNK_VOXELS, params);
+                        auto decoded = decode_cb(compressed);
                         size_t n = std::min(decoded.size(), task.raw.size());
                         std::array<uint64_t, 256> local_hist{};
                         for (size_t i = 0; i < n; i++) {
@@ -1483,26 +1573,58 @@ int main(int argc, char** argv) {
                         size_t inner_idx = iz * CHUNKS_PER_SHARD * CHUNKS_PER_SHARD
                                          + iy * CHUNKS_PER_SHARD + ix;
                         if (cz >= out_nz || cy >= out_ny || cx >= out_nx) continue;
+                        size_t rz = CHUNK_DIM / src_chunks[0];
+                        size_t ry = CHUNK_DIM / src_chunks[1];
+                        size_t rx = CHUNK_DIM / src_chunks[2];
+                        size_t src_base_z = cz * rz;
+                        size_t src_base_y = cy * ry;
+                        size_t src_base_x = cx * rx;
+                        // Occupancy mask is indexed by source chunk grid;
+                        // output chunk is "present" if any covering source
+                        // chunk exists in the mask.
                         if (!occ_mask.empty()) {
-                            size_t flat = cz * out_ny * out_nx + cy * out_nx + cx;
-                            if (!occ_mask[flat]) {
+                            bool any = false;
+                            for (size_t dz = 0; dz < rz && !any; ++dz)
+                            for (size_t dy = 0; dy < ry && !any; ++dy)
+                            for (size_t dx = 0; dx < rx && !any; ++dx) {
+                                size_t sz0 = src_base_z + dz;
+                                size_t sy0 = src_base_y + dy;
+                                size_t sx0 = src_base_x + dx;
+                                if (sz0 >= occ_nz || sy0 >= occ_ny || sx0 >= occ_nx)
+                                    continue;
+                                if (occ_mask[sz0 * occ_ny * occ_nx
+                                             + sy0 * occ_nx + sx0])
+                                    any = true;
+                            }
+                            if (!any) {
                                 skipped_chunks.fetch_add(1);
                                 continue;
                             }
                         }
-                        std::string src_key = level_prefix +
-                            std::to_string(cz) + dim_sep +
-                            std::to_string(cy) + dim_sep +
-                            std::to_string(cx);
-                        if (!existing_input.empty()
-                            && !existing_input.count(src_key)) {
-                            continue;
+                        // existing_input is built from a listing of source
+                        // keys; when source chunks are smaller than output
+                        // chunks an output chunk exists if any covering
+                        // source chunk exists.
+                        if (!existing_input.empty()) {
+                            bool any = false;
+                            for (size_t dz = 0; dz < rz && !any; ++dz)
+                            for (size_t dy = 0; dy < ry && !any; ++dy)
+                            for (size_t dx = 0; dx < rx && !any; ++dx) {
+                                std::string sk = level_prefix +
+                                    std::to_string(src_base_z + dz) + dim_sep +
+                                    std::to_string(src_base_y + dy) + dim_sep +
+                                    std::to_string(src_base_x + dx);
+                                if (existing_input.count(sk)) any = true;
+                            }
+                            if (!any) continue;
                         }
                         size_t job_idx = shard->result_kind.size();
                         shard->result_kind.push_back(RESULT_NONE);
                         shard->result_data.emplace_back();
                         shard->result_inner_idx.push_back(inner_idx);
-                        tasks.push_back({shard, job_idx, std::move(src_key)});
+                        tasks.push_back({shard, job_idx,
+                                         src_base_z, src_base_y, src_base_x,
+                                         rz, ry, rx});
                     }
                 }
             }

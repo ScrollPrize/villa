@@ -15,12 +15,12 @@
 #include "vc/core/types/SampleParams.hpp"
 #include "vc/core/cache/HttpMetadataFetcher.hpp"  // HttpAuth
 #include "vc/core/util/NetworkFilesystem.hpp"
-#include "utils/video_codec.hpp"
+#include "utils/c3d_codec.hpp"
 
 // Forward declarations
 namespace vc { class VcDataset; }
 
-namespace vc::cache { class BlockPipeline; }
+namespace vc::cache { class BlockPipeline; class BlockCache; }
 namespace utils { class ZarrArray; }
 
 struct CompositeParams;
@@ -83,10 +83,17 @@ public:
 
     // Lazily create and return the tiered chunk cache for this volume.
     // Thread-safe: creates on first call, returns same cache thereafter.
+    // After resetTieredCache(), the next call re-creates the pipeline.
     [[nodiscard]] vc::cache::BlockPipeline* tieredCache();
+
+    // Destroy the current pipeline so the next tieredCache() call creates
+    // a fresh one.  Call after shutdown() on a volume that may be re-used.
+    void resetTieredCache();
 
     // Set cache budget (must be called before first tieredCache() access).
     void setCacheBudget(size_t hotBytes);
+    void setBlockCache(vc::cache::BlockCache* bc);
+
 
     // Inject a local zarr array for the cold cache tier.
     // Must be called before first tieredCache() access.
@@ -94,10 +101,11 @@ public:
     // Must be called before first tieredCache() access.
     void setIOThreads(int count);
 
-    // Override the H.265 encode params used when re-encoding non-canonical
-    // source chunks into the canonical disk cache. depth/height/width are
-    // ignored (filled per chunk). Must be called before first tieredCache().
-    void setEncodeParams(const utils::VideoCodecParams& params);
+    // Override the c3d encode params (target_ratio) used when re-encoding
+    // non-canonical source chunks into the canonical disk cache.
+    // depth/height/width are filled per-chunk. Must be called before
+    // first tieredCache().
+    void setEncodeParams(const utils::C3dCodecParams& params);
 
     // --- Sampling API ---
 
@@ -132,17 +140,6 @@ public:
                               int width, int height,
                               const vc::SampleParams& params);
 
-    // Fused plane sampling + LUT: samples and writes ARGB32 directly,
-    // eliminating the intermediate cv::Mat and applyPostProcess pass.
-    // outBuf must have room for width*height pixels (outStride in uint32_t units).
-    int samplePlaneBestEffortARGB32(uint32_t* outBuf, int outStride,
-                                    const cv::Vec3f& origin,
-                                    const cv::Vec3f& vx_step,
-                                    const cv::Vec3f& vy_step,
-                                    int width, int height,
-                                    const vc::SampleParams& params,
-                                    const uint32_t lut[256]);
-
     // Fused plane composite: nearest-neighbor per layer + composite + LUT → ARGB32.
     // No coord matrix. For PlaneSurface composite rendering.
     int samplePlaneCompositeBestEffortARGB32(
@@ -173,10 +170,11 @@ protected:
 
     // Cache ownership
     mutable std::unique_ptr<vc::cache::BlockPipeline> tieredCache_;
-    mutable std::once_flag cacheOnce_;
+    mutable std::mutex cacheMutex_;
+    vc::cache::BlockCache* sharedBlockCache_ = nullptr;
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default
     int ioThreads_ = 0;  // 0 = use default
-    utils::VideoCodecParams encodeParams_ = {.qp = 36};
+    utils::C3dCodecParams encodeParams_ = {};
 
     void ensureTieredCache() const;
 

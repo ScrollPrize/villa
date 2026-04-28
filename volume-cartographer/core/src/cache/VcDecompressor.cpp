@@ -5,9 +5,6 @@
 #include <stdexcept>
 #include <vector>
 
-#if __has_include("utils/video_codec.hpp")
-#include "utils/video_codec.hpp"
-#endif
 
 namespace vc::cache {
 
@@ -27,7 +24,7 @@ static bool isChunkEmpty(const uint8_t* data, size_t n)
 
 static ChunkDataPtr acquireChunkData(size_t bytesNeeded)
 {
-    auto result = std::make_shared<ChunkData>();
+    auto result = vc::cache::acquireChunkData();
     result->resizeBytes(bytesNeeded);
     return result;
 }
@@ -49,43 +46,6 @@ DecompressFn makeVcDecompressor(const std::vector<vc::VcDataset*>& datasets)
         // Determine required buffer size upfront to reuse pooled buffers
         const auto dtype = ds.getDtype();
         size_t bufferBytes = (dtype == vc::VcDtype::uint16) ? chunkSize * 2 : chunkSize;
-
-#ifdef UTILS_HAS_VIDEO_CODEC
-        // Check for VC3D video codec magic header
-        if (utils::is_video_compressed(
-                std::span<const std::byte>(
-                    reinterpret_cast<const std::byte*>(compressed.data()),
-                    compressed.size()))) {
-            auto dims = utils::video_header_dims(
-                std::span<const std::byte>(
-                    reinterpret_cast<const std::byte*>(compressed.data()),
-                    compressed.size()));
-
-            utils::VideoCodecParams vp;
-            vp.depth = dims[0];
-            vp.height = dims[1];
-            vp.width = dims[2];
-
-            auto decoded = utils::video_decode(
-                std::span<const std::byte>(
-                    reinterpret_cast<const std::byte*>(compressed.data()),
-                    compressed.size()),
-                size_t(dims[0]) * dims[1] * dims[2], vp);
-
-            int cz = static_cast<int>(chunkShape[0]);
-            int cy = static_cast<int>(chunkShape[1]);
-            int cx = static_cast<int>(chunkShape[2]);
-            size_t copySize = std::min(decoded.size(), chunkSize);
-
-            auto result = acquireChunkData(chunkSize);
-            result->shape = {cz, cy, cx};
-            result->elementSize = 1;
-
-            std::memcpy(result->rawData(), decoded.data(), copySize);
-            result->isEmpty = isChunkEmpty(result->rawData(), chunkSize);
-            return result;
-        }
-#endif
 
         int cz = static_cast<int>(chunkShape[0]);
         int cy = static_cast<int>(chunkShape[1]);

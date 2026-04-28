@@ -132,6 +132,7 @@ signals:
     void growSegmentRequested(const QString& segmentId);
     void addOverlapRequested(const QString& segmentId);
     void convertToObjRequested(const QString& segmentId);
+    void visLasagnaObjRequested(const QString& segmentId);
     void cropBoundsRequested(const QString& segmentId);
     void slimFlattenRequested(const QString& segmentId);
     void abfFlattenRequested(const QString& segmentId);
@@ -155,6 +156,7 @@ signals:
     void flipURequested(const QString& segmentId);
     void flipVRequested(const QString& segmentId);
     void rotateSurfaceRequested(const QString& segmentId);
+    void focusSurfaceRequested(const QString& segmentId);
     void surfaceActivatedPreserveEditing(const QString& id, QuadSurface* surface);
 
 

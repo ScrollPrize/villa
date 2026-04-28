@@ -7,6 +7,9 @@
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
+#if defined(VC_HAVE_MIMALLOC)
+#include <mimalloc.h>
+#endif
 
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "WindowRangeWidget.hpp"
@@ -67,7 +70,6 @@
 #include <QListView>
 #include <QFont>
 #include <QPainter>
-#include <chrono>
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -106,6 +108,8 @@
 #include "AxisAlignedSliceController.hpp"
 #include "SurfaceAreaCalculator.hpp"
 #include "SegmentationCommandHandler.hpp"
+#include "LasagnaServiceManager.hpp"
+#include "segmentation/panels/SegmentationLasagnaPanel.hpp"
 #include "vc/core/Version.hpp"
 
 #include "vc/core/util/Logging.hpp"
@@ -136,12 +140,21 @@ namespace
 std::string compositeMethodForModeIndex(int index)
 {
     switch (index) {
-        case 0: return "max";
-        case 1: return "mean";
-        case 2: return "min";
-        case 3: return "alpha";
-        case 4: return "beerLambert";
-        case 5: return "volumetric";
+        case 0:  return "max";
+        case 1:  return "mean";
+        case 2:  return "min";
+        case 3:  return "alpha";
+        case 4:  return "beerLambert";
+        case 5:  return "volumetric";
+        case 6:  return "dvr";
+        case 7:  return "firstHitIso";
+        case 8:  return "devFromMean";
+        case 9:  return "emissionDvr";
+        case 10: return "maxAboveIso";
+        case 11: return "gammaWeighted";
+        case 12: return "gradientMag";
+        case 13: return "pbrIso";
+        case 14: return "shadedDvr";
         default: return "mean";
     }
 }
@@ -154,6 +167,15 @@ int compositeModeIndexForMethod(const std::string& method)
     if (method == "alpha") return 3;
     if (method == "beerLambert") return 4;
     if (method == "volumetric") return 5;
+    if (method == "dvr") return 6;
+    if (method == "firstHitIso") return 7;
+    if (method == "devFromMean") return 8;
+    if (method == "emissionDvr") return 9;
+    if (method == "maxAboveIso") return 10;
+    if (method == "gammaWeighted") return 11;
+    if (method == "gradientMag") return 12;
+    if (method == "pbrIso") return 13;
+    if (method == "shadedDvr") return 14;
     return 1;
 }
 
@@ -650,14 +672,16 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _windowStateSaveTimer->setInterval(500);
     connect(_windowStateSaveTimer, &QTimer::timeout, this, &CWindow::saveWindowState);
 
-    // Periodic glibc heap trim: returns sbrk-grown segments back to the OS
-    // once they're no longer in use. Cheap (~µs) when nothing to trim.
-    // Also dumps a RAM stats line for live monitoring. malloc_trim is a
-    // glibc extension — skipped on macOS / non-glibc libc.
+    // Periodic heap trim: under mimalloc, mi_collect asks it to purge
+    // thread / segment caches and return freed pages to the OS. Under
+    // glibc, malloc_trim returns sbrk-grown segments. Also dumps a RAM
+    // stats line for live monitoring.
     auto* trimTimer = new QTimer(this);
     trimTimer->setInterval(1000);
     connect(trimTimer, &QTimer::timeout, this, [this]() {
-#if defined(__GLIBC__)
+#if defined(VC_HAVE_MIMALLOC)
+        mi_collect(false);
+#elif defined(__GLIBC__)
         ::malloc_trim(0);
 #endif
         vc3d::ramstats::dumpOnce(_viewerManager.get(), _state);
@@ -680,6 +704,8 @@ CWindow::CWindow(size_t cacheSizeGB) :
 
     _cacheSizeBytes = cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
     std::cout << "chunk cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
+
+    _tickCoordinator = std::make_unique<vc::cache::TickCoordinator>();
 
     _state = new CState(_cacheSizeBytes, this);
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
@@ -874,6 +900,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     }
     // Ensure right-side tabified docks have a usable minimum size
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
+                               _lasagnaDock,
                                ui.dockWidgetDistanceTransform,
                                ui.dockWidgetDrawing }) {
         if (dock) {
@@ -889,6 +916,7 @@ CWindow::CWindow(size_t cacheSizeGB) :
     }
 
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
+                               _lasagnaDock,
                                ui.dockWidgetDistanceTransform,
                                ui.dockWidgetDrawing,
                                ui.dockWidgetVolumes,
@@ -2527,6 +2555,10 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onConvertToObj(segmentId.toStdString());
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::visLasagnaObjRequested,
+            this, [this](const QString& segmentId) {
+                onVisLasagnaObj(segmentId.toStdString());
+            });
     connect(_surfacePanel.get(), &SurfacePanelController::cropBoundsRequested,
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onCropSurfaceToValidRegion(segmentId.toStdString());
@@ -2542,6 +2574,20 @@ void CWindow::CreateWidgets(void)
     connect(_surfacePanel.get(), &SurfacePanelController::rotateSurfaceRequested,
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onRotateSurface(segmentId.toStdString());
+            });
+    connect(_surfacePanel.get(), &SurfacePanelController::focusSurfaceRequested,
+            this, [this](const QString& segmentId) {
+                if (!_state || !_state->vpkg()) return;
+                auto surf = _state->vpkg()->getSurface(segmentId.toStdString());
+                auto* quad = dynamic_cast<QuadSurface*>(surf.get());
+                if (!quad) return;
+                quad->ensureLoaded();
+                cv::Vec3f c = quad->center();
+                POI* poi = _state->poi("focus");
+                if (!poi) poi = new POI;
+                poi->p = c;
+                poi->n = {0, 0, 0};
+                _state->setPOI("focus", poi);
             });
     connect(_surfacePanel.get(), &SurfacePanelController::alphaCompRefineRequested,
             this, [this](const QString& segmentId) {
@@ -2673,6 +2719,15 @@ void CWindow::CreateWidgets(void)
     _segmentationWidget->setNormalGridPathHint(initialHint);
     attachScrollAreaToDock(ui.dockWidgetSegmentation, _segmentationWidget, QStringLiteral("dockWidgetSegmentationContent"));
 
+    // Create Lasagna dock from the panel already constructed by SegmentationWidget
+    {
+        auto* panel = _segmentationWidget->lasagnaPanel();
+        panel->setVisible(true);
+        _lasagnaDock = new QDockWidget(tr("Lasagna Model"), this);
+        _lasagnaDock->setObjectName(QStringLiteral("dockWidgetLasagna"));
+        attachScrollAreaToDock(_lasagnaDock, panel, QStringLiteral("dockWidgetLasagnaContent"));
+        addDockWidget(Qt::RightDockWidgetArea, _lasagnaDock);
+    }
 
     _segmentationEdit = std::make_unique<SegmentationEditManager>(this);
     _segmentationEdit->setViewerManager(_viewerManager.get());
@@ -2809,6 +2864,355 @@ void CWindow::CreateWidgets(void)
         }
     });
 
+    // -- Lasagna connections --
+    connect(_segmentationWidget, &SegmentationWidget::seedFromFocusRequested, this, [this]() {
+        POI* focus = _state ? _state->poi("focus") : nullptr;
+        if (focus)
+            _segmentationWidget->setSeedFromFocus(
+                static_cast<int>(focus->p[0]),
+                static_cast<int>(focus->p[1]),
+                static_cast<int>(focus->p[2]));
+    });
+
+    connect(_segmentationWidget, &SegmentationWidget::lasagnaOptimizeRequested, this, [this]() {
+        auto& mgr = LasagnaServiceManager::instance();
+        const bool isNewModel = (_segmentationWidget->lasagnaMode() == 1);
+
+        // Ensure service is running (external or internal)
+        if (mgr.isExternal()) {
+            if (!mgr.isRunning()) {
+                auto msg = tr("External service not connected. Select a service or check host/port.");
+                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                statusBar()->showMessage(msg, 5000);
+                return;
+            }
+        } else {
+            if (!mgr.ensureServiceRunning()) {
+                auto msg = tr("Failed to start lasagna service: %1").arg(mgr.lastError());
+                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                statusBar()->showMessage(msg, 5000);
+                return;
+            }
+        }
+
+        // Get the active segment path
+        std::filesystem::path segPath;
+        auto activeSurface = std::dynamic_pointer_cast<QuadSurface>(
+            _state->surface("segmentation"));
+        if (activeSurface && !activeSurface->path.empty()) {
+            segPath = activeSurface->path;
+        }
+
+        bool isOffsetMode = (_segmentationWidget->lasagnaMode() == SegmentationLasagnaPanel::LasagnaMode::Offset);
+
+        // Model path — required for re-optimize/expand, not for new/offset
+        QString modelPath;
+        if (!isNewModel && !isOffsetMode) {
+            if (!segPath.empty()) {
+                auto modelFile = segPath / "model.pt";
+                if (std::filesystem::exists(modelFile)) {
+                    try {
+                        modelPath = QString::fromStdString(
+                            std::filesystem::canonical(modelFile).string());
+                    } catch (const std::filesystem::filesystem_error&) {}
+                }
+            }
+            if (modelPath.isEmpty()) {
+                auto msg = tr("No model.pt found in segment directory. Cannot run lasagna.");
+                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                statusBar()->showMessage(msg, 5000);
+                return;
+            }
+        }
+
+        // Data input path (zarr)
+        QString dataInput = _segmentationWidget->lasagnaDataInputPath();
+        if (dataInput.isEmpty()) {
+            auto msg = tr("No data input path set. Set the zarr path in the Lasagna Model panel.");
+            std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+            statusBar()->showMessage(msg, 5000);
+            return;
+        }
+
+        // Output dir: for re-optimize use the segment's parent directory;
+        // for new model use the volpkg's segmentation directory
+        QString outputDir;
+        if (!segPath.empty()) {
+            outputDir = QString::fromStdString(segPath.parent_path().string());
+        } else if (_state->vpkg()) {
+            auto vpkgRoot = std::filesystem::path(_state->vpkg()->getVolpkgDirectory());
+            auto segDir = vpkgRoot / _state->vpkg()->getSegmentationDirectory();
+            outputDir = QString::fromStdString(segDir.string());
+        }
+
+        // --- Compute next version name ---
+        const std::string tifxyzSuffix = ".tifxyz";
+        std::string rootName = "new_model";  // Default fallback
+        QString outputName;
+        {
+            if (isNewModel) {
+                // New model: use the output name field, fall back to "new_model"
+                QString nmName = _segmentationWidget->newModelOutputName();
+                if (!nmName.isEmpty()) {
+                    rootName = nmName.toStdString();
+                }
+            } else if (!segPath.empty()) {
+                // Re-optimize: derive from existing segment name
+                auto segName = segPath.filename().string();
+                std::string baseName = segName;
+                if (baseName.size() > tifxyzSuffix.size() &&
+                    baseName.compare(baseName.size() - tifxyzSuffix.size(),
+                                     tifxyzSuffix.size(), tifxyzSuffix) == 0) {
+                    baseName = baseName.substr(0, baseName.size() - tifxyzSuffix.size());
+                }
+                rootName = baseName;
+                // Strip _vNNN version suffix
+                if (rootName.size() > 5) {
+                    auto pos = rootName.rfind("_v");
+                    if (pos != std::string::npos && pos + 2 < rootName.size()) {
+                        bool allDigits = true;
+                        for (size_t i = pos + 2; i < rootName.size(); ++i) {
+                            if (!std::isdigit(static_cast<unsigned char>(rootName[i]))) {
+                                allDigits = false;
+                                break;
+                            }
+                        }
+                        if (allDigits) rootName = rootName.substr(0, pos);
+                    }
+                }
+                // Strip _offN_wN window suffix
+                {
+                    auto pos = rootName.find("_off");
+                    if (pos != std::string::npos)
+                        rootName = rootName.substr(0, pos);
+                }
+            }
+
+            // Scan for highest existing version in the output directory
+            int maxVersion = 0;
+            if (!outputDir.isEmpty()) {
+                std::error_code ec;
+                for (auto& entry : std::filesystem::directory_iterator(
+                         outputDir.toStdString(), ec)) {
+                    auto name = entry.path().filename().string();
+                    std::string prefix = rootName + "_v";
+                    if (name.size() > prefix.size() + tifxyzSuffix.size() &&
+                        name.compare(0, prefix.size(), prefix) == 0 &&
+                        name.compare(name.size() - tifxyzSuffix.size(),
+                                     tifxyzSuffix.size(), tifxyzSuffix) == 0) {
+                        auto numStr = name.substr(prefix.size(),
+                            name.size() - prefix.size() - tifxyzSuffix.size());
+                        bool allDigits = true;
+                        for (auto c : numStr) {
+                            if (!std::isdigit(static_cast<unsigned char>(c)))
+                                allDigits = false;
+                        }
+                        if (allDigits && !numStr.empty()) {
+                            int v = std::stoi(numStr);
+                            if (v > maxVersion) maxVersion = v;
+                        }
+                    }
+                }
+            }
+            char numBuf[16];
+            std::snprintf(numBuf, sizeof(numBuf), "_v%03d", maxVersion + 1);
+            outputName = QString::fromStdString(rootName + numBuf + ".tifxyz");
+        }
+
+        // Parse config JSON from the editor
+        QJsonObject config;
+        QString configText = _segmentationWidget->lasagnaConfigText().trimmed();
+        if (!configText.isEmpty()) {
+            QJsonDocument doc = QJsonDocument::fromJson(configText.toUtf8());
+            if (doc.isObject()) {
+                config = doc.object();
+            }
+        }
+
+        // --- New Model: inject crop, init_size_frac, z_size, grow into config ---
+        if (isNewModel) {
+            int nmW = _segmentationWidget->newModelWidth();
+            int nmH = _segmentationWidget->newModelHeight();
+            int nmN = _segmentationWidget->newModelWindings();
+
+            // Get bbox center: use seed point if specified, otherwise focus
+            int cx, cy, cz;
+            QString seedText = _segmentationWidget->seedPointText();
+            bool seedOk = false;
+            if (!seedText.isEmpty()) {
+                QStringList parts = seedText.split(',');
+                if (parts.size() == 3) {
+                    bool ok0, ok1, ok2;
+                    cx = parts[0].trimmed().toInt(&ok0);
+                    cy = parts[1].trimmed().toInt(&ok1);
+                    cz = parts[2].trimmed().toInt(&ok2);
+                    seedOk = ok0 && ok1 && ok2;
+                }
+            }
+            if (!seedOk) {
+                POI* focus = _state ? _state->poi("focus") : nullptr;
+                if (!focus) {
+                    auto msg = tr("No focus position or seed point set. Place the cursor or enter a seed.");
+                    std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                    statusBar()->showMessage(msg, 5000);
+                    return;
+                }
+                cx = static_cast<int>(focus->p[0]);
+                cy = static_cast<int>(focus->p[1]);
+                cz = static_cast<int>(focus->p[2]);
+            }
+
+            // Build/override the "args" section with seed, model-w, model-h, windings
+            QJsonObject args = config[QStringLiteral("args")].toObject();
+            args[QStringLiteral("seed")] = QJsonArray{cx, cy, cz};
+            args[QStringLiteral("model-w")] = nmW;
+            args[QStringLiteral("model-h")] = nmH;
+            args[QStringLiteral("windings")] = nmN;
+            config[QStringLiteral("args")] = args;
+
+            std::cerr << "[lasagna] new model: seed=(" << cx << "," << cy
+                      << "," << cz << ") w=" << nmW << " h=" << nmH
+                      << " windings=" << nmN << std::endl;
+        }
+
+        // --- Offset mode: inject windings=1, offset_value, and window params ---
+        if (isOffsetMode && !segPath.empty()) {
+            double offsetVal = _segmentationWidget->offsetValue();
+            int windowSize = _segmentationWidget->windowSize();
+            int windowOverlap = _segmentationWidget->windowOverlap();
+
+            QJsonObject args = config[QStringLiteral("args")].toObject();
+            args[QStringLiteral("windings")] = 1;
+            if (windowSize > 0) {
+                args[QStringLiteral("window-size")] = windowSize;
+                args[QStringLiteral("window-overlap")] = windowOverlap;
+            }
+            config[QStringLiteral("args")] = args;
+            config[QStringLiteral("offset_value")] = offsetVal;
+
+            // Windowed offset: override outputName with collision-free base
+            if (windowSize > 0 && !outputDir.isEmpty()) {
+                int offIdx = 1;
+                std::error_code ec2;
+                for (bool collision = true; collision; ++offIdx) {
+                    collision = false;
+                    std::string offPrefix = rootName + "_off" + std::to_string(offIdx) + "_w";
+                    for (auto& entry : std::filesystem::directory_iterator(
+                             outputDir.toStdString(), ec2)) {
+                        auto name = entry.path().filename().string();
+                        if (name.size() > offPrefix.size() + tifxyzSuffix.size() &&
+                            name.compare(0, offPrefix.size(), offPrefix) == 0 &&
+                            name.compare(name.size() - tifxyzSuffix.size(),
+                                         tifxyzSuffix.size(), tifxyzSuffix) == 0) {
+                            collision = true;
+                            break;
+                        }
+                    }
+                }
+                // offIdx is one past the collision-free value
+                outputName = QString::fromStdString(
+                    rootName + "_off" + std::to_string(offIdx - 1));
+            }
+
+            std::cerr << "[lasagna] offset mode: offset=" << offsetVal
+                      << " window_size=" << windowSize
+                      << " window_overlap=" << windowOverlap
+                      << " outputName=" << outputName.toStdString() << std::endl;
+        }
+
+        // Inject loaded point collections as corr_points
+        if (_state->pointCollection()) {
+            const auto& cols = _state->pointCollection()->getAllCollections();
+            if (!cols.empty()) {
+                utils::Json corr_json;
+                utils::Json cols_json = utils::Json::object();
+                for (const auto& [cid, col] : cols) {
+                    utils::Json col_json;
+                    to_json(col_json, col);
+                    cols_json[std::to_string(cid)] = col_json;
+                }
+                corr_json["collections"] = cols_json;
+                QJsonDocument corrDoc = QJsonDocument::fromJson(
+                    QByteArray::fromStdString(corr_json.dump()));
+                if (corrDoc.isObject()) {
+                    config[QStringLiteral("corr_points")] = corrDoc.object();
+                    std::cerr << "[lasagna] injected " << cols.size()
+                              << " point collection(s) as corr_points" << std::endl;
+                }
+            }
+        }
+
+        // Inject voxel_size_um from the current volume
+        if (_state->currentVolume()) {
+            try {
+                double vs = _state->currentVolume()->voxelSize();
+                if (std::isfinite(vs) && vs > 0.0) {
+                    config[QStringLiteral("voxel_size_um")] = vs;
+                }
+            } catch (...) {}
+        }
+
+        // Build optimization request
+        QJsonObject request;
+        request[QStringLiteral("data_input")] = dataInput;
+        request[QStringLiteral("single_segment")] = true;
+        request[QStringLiteral("copy_model")] = true;
+        if (!outputName.isEmpty()) {
+            request[QStringLiteral("output_name")] = outputName;
+        }
+        request[QStringLiteral("config")] = config;
+
+        if (isOffsetMode && !segPath.empty()) {
+            // Offset mode: send tifxyz files as base64
+            QJsonObject tifxyzData;
+            for (const auto* fname : {"x.tif", "y.tif", "z.tif", "meta.json"}) {
+                auto filePath = segPath / fname;
+                if (!std::filesystem::exists(filePath)) continue;
+                QFile f(QString::fromStdString(filePath.string()));
+                if (f.open(QIODevice::ReadOnly)) {
+                    tifxyzData[QString::fromLatin1(fname)] =
+                        QString::fromLatin1(f.readAll().toBase64());
+                }
+            }
+            request[QStringLiteral("tifxyz_data")] = tifxyzData;
+        } else if (!isNewModel) {
+            // Re-optimize / Expand: send model.pt as base64 data
+            QFile modelFile(modelPath);
+            if (!modelFile.open(QIODevice::ReadOnly)) {
+                auto msg = tr("Cannot read model file: %1").arg(modelPath);
+                std::cerr << "[lasagna] " << msg.toStdString() << std::endl;
+                statusBar()->showMessage(msg, 5000);
+                return;
+            }
+            QByteArray modelBytes = modelFile.readAll();
+            modelFile.close();
+            request[QStringLiteral("model_data")] =
+                QString::fromLatin1(modelBytes.toBase64());
+        }
+
+        mgr.startOptimization(request, outputDir);
+        statusBar()->showMessage(
+            tr("Lasagna optimization started (%1). Output: %2")
+                .arg(isNewModel ? tr("new model") : tr("re-optimize"))
+                .arg(outputName), 3000);
+    });
+
+    connect(_segmentationWidget, &SegmentationWidget::lasagnaStopRequested, this, [this]() {
+        LasagnaServiceManager::instance().stopOptimization();
+        statusBar()->showMessage(tr("Lasagna optimization stop requested."), 3000);
+    });
+
+    // Auto-reload segments when fit optimization finishes
+    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::optimizationFinished,
+            this, [this](const QString& outputDir) {
+        statusBar()->showMessage(
+            tr("Lasagna optimization finished. Reloading segments from %1").arg(outputDir), 5000);
+        if (_surfacePanel) {
+            _surfacePanel->loadSurfacesIncremental();
+        }
+        // corr_points_results will be loaded when the new segment is activated
+    });
+
     // Create Drawing widget
     _drawingWidget = new DrawingWidget();
     _drawingWidget->setState(_state);
@@ -2850,7 +3254,8 @@ void CWindow::CreateWidgets(void)
     connect(_point_collection_widget, &CPointCollectionWidget::convertPointToAnchorRequested, this, &CWindow::onConvertPointToAnchor);
     connect(_point_collection_widget, &CPointCollectionWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
 
-    // Tab the docks - keep Segmentation, Seeding, Point Collections, and Drawing together
+    // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, and Drawing together
+    tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
     tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDrawing);
@@ -3885,6 +4290,60 @@ void CWindow::CreateWidgets(void)
         }
     });
 
+    // Per-ray layer preprocess (applied to N composite samples before composite method)
+    connect(ui.chkPreNormalizeLayers, &QCheckBox::toggled, this, [this](bool checked) {
+        if (auto* viewer = segmentationViewer()) {
+            auto s = viewer->compositeRenderSettings();
+            s.params.preNormalizeLayers = checked;
+            viewer->setCompositeRenderSettings(s);
+        }
+    });
+    connect(ui.chkPreHistEqLayers, &QCheckBox::toggled, this, [this](bool checked) {
+        if (auto* viewer = segmentationViewer()) {
+            auto s = viewer->compositeRenderSettings();
+            s.params.preHistEqLayers = checked;
+            viewer->setCompositeRenderSettings(s);
+        }
+    });
+
+    // Pre-TF / Post-TF: 4-knot piecewise-linear LUTs. Endpoints (0,0) and
+    // (255,255) are fixed; only the two middle knots are editable.
+    auto applyTfParam = [this](auto&& mutate) {
+        if (auto* viewer = segmentationViewer()) {
+            auto s = viewer->compositeRenderSettings();
+            mutate(s.params);
+            viewer->setCompositeRenderSettings(s);
+        }
+    };
+    connect(ui.chkPreTfEnabled, &QCheckBox::toggled, this, [applyTfParam](bool v) {
+        applyTfParam([v](CompositeParams& p) { p.preTfEnabled = v; });
+    });
+    connect(ui.spinPreTfX1, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.preTfX1 = uint8_t(v); }); });
+    connect(ui.spinPreTfY1, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.preTfY1 = uint8_t(v); }); });
+    connect(ui.spinPreTfX2, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.preTfX2 = uint8_t(v); }); });
+    connect(ui.spinPreTfY2, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.preTfY2 = uint8_t(v); }); });
+    connect(ui.chkPostTfEnabled, &QCheckBox::toggled, this, [applyTfParam](bool v) {
+        applyTfParam([v](CompositeParams& p) { p.postTfEnabled = v; });
+    });
+    connect(ui.spinPostTfX1, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.postTfX1 = uint8_t(v); }); });
+    connect(ui.spinPostTfY1, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.postTfY1 = uint8_t(v); }); });
+    connect(ui.spinPostTfX2, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.postTfX2 = uint8_t(v); }); });
+    connect(ui.spinPostTfY2, QOverload<int>::of(&QSpinBox::valueChanged), this,
+        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.postTfY2 = uint8_t(v); }); });
+    connect(ui.spinDvrAmbient, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+        [applyTfParam](double v) { applyTfParam([v](CompositeParams& p) { p.dvrAmbient = float(v); }); });
+    connect(ui.spinPbrRoughness, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+        [applyTfParam](double v) { applyTfParam([v](CompositeParams& p) { p.pbrRoughness = float(v); }); });
+    connect(ui.spinPbrMetallic, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
+        [applyTfParam](double v) { applyTfParam([v](CompositeParams& p) { p.pbrMetallic = float(v); }); });
+
     // Connect ISO Cutoff slider - applies to all viewers (segmentation, XY, XZ, YZ)
     connect(ui.sliderIsoCutoff, &QSlider::valueChanged, this, [this](int value) {
         ui.lblIsoCutoffValue->setText(QString::number(value));
@@ -3919,53 +4378,109 @@ void CWindow::CreateWidgets(void)
     });
 
     // Helper lambda to update visibility of method-specific parameters
-    auto updateCompositeParamsVisibility = [this](int methodIndex) {
-        // Alpha parameters (row 1, 2 - AlphaMin/Max, AlphaThreshold/Material)
-        bool showAlphaParams = (methodIndex == 3); // Alpha method
-        ui.lblAlphaMin->setVisible(showAlphaParams);
-        ui.spinAlphaMin->setVisible(showAlphaParams);
-        ui.lblAlphaMax->setVisible(showAlphaParams);
-        ui.spinAlphaMax->setVisible(showAlphaParams);
-        ui.lblAlphaThreshold->setVisible(showAlphaParams);
-        ui.spinAlphaThreshold->setVisible(showAlphaParams);
-        ui.lblMaterial->setVisible(showAlphaParams);
-        ui.spinMaterial->setVisible(showAlphaParams);
+    auto updateCompositeParamsVisibility = [this]() {
+        const int methodIndex = ui.cmbCompositeMode->currentIndex();
+        const bool lightingOn = ui.chkLightingEnabled->isChecked();
+        const bool preTfOn = ui.chkPreTfEnabled->isChecked();
+        const bool postTfOn = ui.chkPostTfEnabled->isChecked();
 
-        // Beer-Lambert parameters (row 7, 8 - Extinction/Emission, Ambient)
-        bool showBLParams = (methodIndex == 4); // Beer-Lambert method
-        ui.lblBLExtinction->setVisible(showBLParams);
-        ui.spinBLExtinction->setVisible(showBLParams);
-        ui.lblBLEmission->setVisible(showBLParams);
-        ui.spinBLEmission->setVisible(showBLParams);
-        ui.lblBLAmbient->setVisible(showBLParams);
-        ui.spinBLAmbient->setVisible(showBLParams);
+        // Method-family flags.
+        const bool isAlpha    = (methodIndex == 3);
+        const bool isBL       = (methodIndex == 4);
+        const bool isVolum    = (methodIndex == 5);
+        const bool isDvr      = (methodIndex == 6);
+        const bool isFirstHit = (methodIndex == 7);
+        const bool isPbr      = (methodIndex == 13);
+        const bool isShadedDvr = (methodIndex == 14);
 
-        // Lighting parameters (rows 9-12) - always shown, works with all methods
+        // Alpha knobs: only for the Alpha method.
+        ui.lblAlphaMin->setVisible(isAlpha);
+        ui.spinAlphaMin->setVisible(isAlpha);
+        ui.lblAlphaMax->setVisible(isAlpha);
+        ui.spinAlphaMax->setVisible(isAlpha);
+        ui.lblAlphaThreshold->setVisible(isAlpha);
+        ui.spinAlphaThreshold->setVisible(isAlpha);
+        ui.lblMaterial->setVisible(isAlpha);
+        ui.spinMaterial->setVisible(isAlpha);
+
+        // Beer-Lambert knobs: shared by Beer-Lambert and Volumetric modes.
+        const bool showBL = isBL || isVolum;
+        ui.lblBLExtinction->setVisible(showBL);
+        ui.spinBLExtinction->setVisible(showBL);
+        ui.lblBLEmission->setVisible(showBL);
+        ui.spinBLEmission->setVisible(showBL);
+        ui.lblBLAmbient->setVisible(showBL);
+        ui.spinBLAmbient->setVisible(showBL);
+
+        // Shadow-ray steps: only Volumetric uses the secondary shadow ray.
+        ui.lblShadowSteps->setVisible(isVolum);
+        ui.spinShadowSteps->setVisible(isVolum);
+
+        // DVR ambient: DVR and shaded-DVR methods.
+        const bool showDvrAmbient = isDvr || isShadedDvr;
+        ui.lblDvrAmbient->setVisible(showDvrAmbient);
+        ui.spinDvrAmbient->setVisible(showDvrAmbient);
+
+        // PBR roughness/metallic knobs: only the PBR method.
+        ui.lblPbrRoughness->setVisible(isPbr);
+        ui.spinPbrRoughness->setVisible(isPbr);
+        ui.lblPbrMetallic->setVisible(isPbr);
+        ui.spinPbrMetallic->setVisible(isPbr);
+
+        // Lighting: check always visible (user toggles on/off); the
+        // direction/diffuse/ambient knobs appear only when lighting is
+        // actually on. First-Hit Iso is a shading-heavy method so we
+        // gently enforce its need for lighting by showing the chk always.
         ui.chkLightingEnabled->setVisible(true);
-        ui.lblLightAzimuth->setVisible(true);
-        ui.spinLightAzimuth->setVisible(true);
-        ui.lblLightElevation->setVisible(true);
-        ui.spinLightElevation->setVisible(true);
-        ui.lblLightDiffuse->setVisible(true);
-        ui.spinLightDiffuse->setVisible(true);
-        ui.lblLightAmbient->setVisible(true);
-        ui.spinLightAmbient->setVisible(true);
-        ui.chkUseVolumeGradients->setVisible(true);
+        ui.lblLightAzimuth->setVisible(lightingOn);
+        ui.spinLightAzimuth->setVisible(lightingOn);
+        ui.lblLightElevation->setVisible(lightingOn);
+        ui.spinLightElevation->setVisible(lightingOn);
+        ui.lblLightDiffuse->setVisible(lightingOn);
+        ui.spinLightDiffuse->setVisible(lightingOn);
+        ui.lblLightAmbient->setVisible(lightingOn);
+        ui.spinLightAmbient->setVisible(lightingOn);
+        ui.chkUseVolumeGradients->setVisible(lightingOn);
 
-        // No methods currently use scale or param sliders
+        // Pre/Post TF knots: spinboxes + knot-2 labels appear only when
+        // the corresponding enable checkbox is ticked.
+        ui.spinPreTfX1->setVisible(preTfOn);
+        ui.spinPreTfY1->setVisible(preTfOn);
+        ui.spinPreTfX2->setVisible(preTfOn);
+        ui.spinPreTfY2->setVisible(preTfOn);
+        ui.lblPreTfKnot2->setVisible(preTfOn);
+        ui.spinPostTfX1->setVisible(postTfOn);
+        ui.spinPostTfY1->setVisible(postTfOn);
+        ui.spinPostTfX2->setVisible(postTfOn);
+        ui.spinPostTfY2->setVisible(postTfOn);
+        ui.lblPostTfKnot2->setVisible(postTfOn);
+
+        // No methods currently use scale or param sliders.
         ui.lblMethodScale->setVisible(false);
         ui.sliderMethodScale->setVisible(false);
         ui.lblMethodScaleValue->setVisible(false);
         ui.lblMethodParam->setVisible(false);
         ui.sliderMethodParam->setVisible(false);
         ui.lblMethodParamValue->setVisible(false);
+
+        (void)isFirstHit;  // reserved for future First-Hit-specific knobs
+        (void)isShadedDvr; (void)isPbr; // already consumed above
     };
 
-    // Update the cmbCompositeMode connection to also update visibility
-    connect(ui.cmbCompositeMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, updateCompositeParamsVisibility);
+    // Re-run visibility logic whenever any of the inputs that gate widgets
+    // change — composite method, or any of the three enable checkboxes
+    // that each control a sub-group of knobs.
+    connect(ui.cmbCompositeMode, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, [updateCompositeParamsVisibility](int) { updateCompositeParamsVisibility(); });
+    connect(ui.chkLightingEnabled, &QCheckBox::toggled,
+            this, [updateCompositeParamsVisibility](bool) { updateCompositeParamsVisibility(); });
+    connect(ui.chkPreTfEnabled, &QCheckBox::toggled,
+            this, [updateCompositeParamsVisibility](bool) { updateCompositeParamsVisibility(); });
+    connect(ui.chkPostTfEnabled, &QCheckBox::toggled,
+            this, [updateCompositeParamsVisibility](bool) { updateCompositeParamsVisibility(); });
 
-    // Initialize visibility based on current selection
-    updateCompositeParamsVisibility(ui.cmbCompositeMode->currentIndex());
+    // Initialize visibility from current UI state.
+    updateCompositeParamsVisibility();
 
     // Connect Plane Composite controls (separate enable for XY/XZ/YZ, shared layer counts)
     connect(ui.chkPlaneCompositeXY, &QCheckBox::toggled, this, [this](bool checked) {
@@ -4757,6 +5272,17 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
         if (_segmentationModule) {
             _segmentationModule->onActiveSegmentChanged(surf.get());
         }
+
+        // Load corr_points_results for the new segment
+        if (_point_collection_widget) {
+            auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf);
+            if (quadSurf && !quadSurf->path.empty()) {
+                _point_collection_widget->loadCorrPointsResults(
+                    quadSurf->path / "corr_points_results.json");
+            } else {
+                _point_collection_widget->clearCorrPointsResults();
+            }
+        }
     }
 
     if (surf) {
@@ -4787,6 +5313,17 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSu
 
     if (newSurfId != previousSurfId && _segmentationModule) {
         _segmentationModule->onActiveSegmentChanged(surf.get());
+
+        // Load corr_points_results for the new segment
+        if (_point_collection_widget) {
+            auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf);
+            if (quadSurf && !quadSurf->path.empty()) {
+                _point_collection_widget->loadCorrPointsResults(
+                    quadSurf->path / "corr_points_results.json");
+            } else {
+                _point_collection_widget->clearCorrPointsResults();
+            }
+        }
 
         const bool wantsEditing = _segmentationWidget && _segmentationWidget->isEditingEnabled();
         if (wantsEditing) {
