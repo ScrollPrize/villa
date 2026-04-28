@@ -425,6 +425,12 @@ void SegmentationModule::bindViewerSignals(CTiledVolumeViewer* viewer)
                                  Qt::KeyboardModifiers modifiers) {
                 handleMouseRelease(viewer, worldPos, button, modifiers);
             });
+    connect(viewer, &CTiledVolumeViewer::sendMouseDoubleClickVolume,
+            this, [this, viewer](const cv::Vec3f& worldPos,
+                                 Qt::MouseButton button,
+                                 Qt::KeyboardModifiers modifiers) {
+                handleMouseDoubleClick(viewer, worldPos, button, modifiers);
+            });
     connect(viewer, &CTiledVolumeViewer::sendSegmentationRadiusWheel,
             this, [this, viewer](int steps, const QPointF& scenePoint, const cv::Vec3f& worldPos) {
                 handleWheel(viewer, steps, scenePoint, worldPos);

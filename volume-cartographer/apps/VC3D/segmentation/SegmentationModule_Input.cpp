@@ -585,6 +585,28 @@ void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
     finishDrag();
 }
 
+void SegmentationModule::handleMouseDoubleClick(CTiledVolumeViewer* /*viewer*/,
+                                                 const cv::Vec3f& worldPos,
+                                                 Qt::MouseButton button,
+                                                 Qt::KeyboardModifiers /*modifiers*/)
+{
+    if (!_annotateMode || button != Qt::LeftButton) {
+        return;
+    }
+
+    // Cancel any in-progress point move drag from the first click
+    _pointMoveDrag.reset();
+
+    // Double-click on a point: select + focus
+    auto nearest = findNearestPoint(worldPos);
+    if (nearest.pointId != 0) {
+        _selectedAnnotationCollectionId = nearest.collectionId;
+        emit annotationCollectionSelected(nearest.collectionId);
+        emit annotationPointSelected(nearest.pointId);
+        emit annotationPointFocused(nearest.pointId);
+    }
+}
+
 void SegmentationModule::handleWheel(CTiledVolumeViewer* viewer,
                                      int deltaSteps,
                                      const QPointF& /*scenePos*/,

@@ -89,6 +89,10 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
     connect(_view, &CVolumeViewerView::sendMousePress, this, &CAdaptiveVolumeViewer::onMousePress);
     connect(_view, &CVolumeViewerView::sendMouseMove, this, &CAdaptiveVolumeViewer::onMouseMove);
     connect(_view, &CVolumeViewerView::sendMouseRelease, this, &CAdaptiveVolumeViewer::onMouseRelease);
+    connect(_view, &CVolumeViewerView::sendMouseDoubleClick, this, [this](QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
+        cv::Vec3f p = sceneToVolume(scenePos);
+        emit sendMouseDoubleClickVolume(p, button, modifiers);
+    });
     connect(_view, &CVolumeViewerView::sendKeyPress, this, &CAdaptiveVolumeViewer::onKeyPress);
     connect(_view, &CVolumeViewerView::sendKeyRelease, this, &CAdaptiveVolumeViewer::onKeyRelease);
 

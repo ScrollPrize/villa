@@ -205,6 +205,7 @@ signals:
     void approvalMaskSaved(const std::string& segmentId);
     void annotationPointSelected(uint64_t pointId);
     void annotationCollectionSelected(uint64_t collectionId);
+    void annotationPointFocused(uint64_t pointId);
 
 private:
     friend class SegmentationLineTool;
@@ -323,6 +324,10 @@ private:
                           const cv::Vec3f& surfaceNormal,
                           Qt::MouseButton button,
                           Qt::KeyboardModifiers modifiers);
+    void handleMouseDoubleClick(CTiledVolumeViewer* viewer,
+                                const cv::Vec3f& worldPos,
+                                Qt::MouseButton button,
+                                Qt::KeyboardModifiers modifiers);
     void handleMouseMove(CTiledVolumeViewer* viewer,
                          const cv::Vec3f& worldPos,
                          Qt::MouseButtons buttons,

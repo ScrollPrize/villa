@@ -2775,6 +2775,8 @@ void CWindow::CreateWidgets(void)
             _point_collection_widget, &CPointCollectionWidget::selectCollection);
     connect(_point_collection_widget, &CPointCollectionWidget::collectionSelected,
             _segmentationModule.get(), &SegmentationModule::setSelectedAnnotationCollection);
+    connect(_segmentationModule.get(), &SegmentationModule::annotationPointFocused,
+            this, &CWindow::onPointDoubleClicked);
 
     connect(_segmentationModule.get(), &SegmentationModule::editingEnabledChanged,
             this, &CWindow::onSegmentationEditingModeChanged);
@@ -5690,24 +5692,7 @@ void CWindow::onPointDoubleClicked(uint64_t pointId)
 {
     auto point_opt = _state->pointCollection()->getPoint(pointId);
     if (point_opt) {
-        POI *poi = _state->poi("focus");
-        if (!poi) {
-            poi = new POI;
-        }
-        poi->p = point_opt->p;
-
-        // Find the closest normal on the segmentation surface
-        auto seg_surface = _state->surface("segmentation");
-        if (auto* quad_surface = dynamic_cast<QuadSurface*>(seg_surface.get())) {
-            cv::Vec3f ptr(0, 0, 0);
-            auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-            quad_surface->pointTo(ptr, point_opt->p, 4.0, 100, patchIndex);
-            poi->n = quad_surface->normal(ptr, quad_surface->loc(ptr));
-        } else {
-            poi->n = cv::Vec3f(0, 0, 1); // Default normal if no surface
-        }
-
-        _state->setPOI("focus", poi);
+        centerFocusAt(point_opt->p, cv::Vec3f(0, 0, 0), "");
     }
 }
 

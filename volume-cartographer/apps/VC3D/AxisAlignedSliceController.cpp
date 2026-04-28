@@ -253,17 +253,20 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
             segYZShared = std::make_shared<PlaneSurface>();
         }
 
-        segXZShared->setOrigin(origin);
-        segYZShared->setOrigin(origin);
-
         cv::Vec3f ptr(0, 0, 0);
         auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
         segment->pointTo(ptr, origin, 1.0f, 1000, patchIndex);
 
+        // Use the closest surface point as origin for the slicing planes,
+        // not the raw focus point — ensures normals are true surface tangents
+        cv::Vec3f surfOrigin = segment->coord(ptr, {0, 0, 0});
+        segXZShared->setOrigin(surfOrigin);
+        segYZShared->setOrigin(surfOrigin);
+
         cv::Vec3f xDir = segment->coord(ptr, {1, 0, 0});
         cv::Vec3f yDir = segment->coord(ptr, {0, 1, 0});
-        segXZShared->setNormal(xDir - origin);
-        segYZShared->setNormal(yDir - origin);
+        segXZShared->setNormal(xDir - surfOrigin);
+        segYZShared->setNormal(yDir - surfOrigin);
         segXZShared->setInPlaneRotation(0.0f);
         segYZShared->setInPlaneRotation(0.0f);
 

@@ -728,10 +728,6 @@ QStandardItem* CPointCollectionWidget::findCollectionItem(uint64_t collectionId)
 
 void CPointCollectionWidget::selectPoint(uint64_t pointId)
 {
-    if (_selected_point_id == pointId) {
-        return;
-    }
-
     // Find the item corresponding to the pointId
     for (int i = 0; i < _model->rowCount(); ++i) {
         QStandardItem *collection_item = _model->item(i);

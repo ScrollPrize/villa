@@ -233,6 +233,18 @@ void CVolumeViewerView::mousePressEvent(QMouseEvent *event)
     event->ignore();
 }
 
+void CVolumeViewerView::mouseDoubleClickEvent(QMouseEvent *event)
+{
+    if (event->button() == Qt::LeftButton) {
+        QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
+        QPointF scene_loc = mapToScene({int(global_loc.x()), int(global_loc.y())});
+        emit sendMouseDoubleClick(scene_loc, event->button(), event->modifiers());
+        event->accept();
+        return;
+    }
+    event->ignore();
+}
+
 void CVolumeViewerView::resizeEvent(QResizeEvent *event)
 {
     // Base class first so viewport()->size() reflects the new dimensions.
