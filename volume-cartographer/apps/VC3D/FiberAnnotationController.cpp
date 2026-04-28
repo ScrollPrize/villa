@@ -179,31 +179,32 @@ void FiberAnnotationController::advanceToNextPrediction()
         nextPos = _recentPoints.back().position + nextDir * static_cast<float>(_fiberStep);
     }
 
-    // Reference state (t=0): last clicked point, old plane orientation
-    cv::Vec3f refPos = _recentPoints.back().position;
-    cv::Vec3f refNormal = oldNormal;
-    cv::Vec3f refVy = oldVy;
+    // Ref view (index 0): exact clone of previous annotation view
+    if (oldPlane) {
+        auto refPlane = std::make_shared<PlaneSurface>();
+        refPlane->setFromNormalAndUp(oldPlane->origin(), oldNormal, oldVy);
+        _cstate->setSurface(fiberSurfaceName(0), refPlane);
+    }
 
-    // Annotation state (t=1): predicted position, new orientation
-    cv::Vec3f annotPos = nextPos;
-    cv::Vec3f annotNormal = nextDir;
-    // Compute annotation vy by projecting old vy onto new normal's plane
-    cv::Vec3f annotVy = oldVy - oldVy.dot(annotNormal) * annotNormal;
+    // Annotation state
+    cv::Vec3f annotVy = oldVy - oldVy.dot(nextDir) * nextDir;
     float annotVyLen = static_cast<float>(cv::norm(annotVy));
     if (annotVyLen > 1e-6f) annotVy /= annotVyLen;
     else annotVy = oldVy;
 
-    // Create 6 interpolated planes (t = i/5 for i=0..5)
-    for (int i = 0; i < kNumViews; ++i) {
+    cv::Vec3f refPos = oldPlane ? oldPlane->origin() : _recentPoints.back().position;
+
+    // Interpolated views (index 1..4) and annotation view (index 5)
+    for (int i = 1; i < kNumViews; ++i) {
         float t = static_cast<float>(i) / static_cast<float>(kNumViews - 1);
 
-        cv::Vec3f pos = refPos * (1.0f - t) + annotPos * t;
+        cv::Vec3f pos = refPos * (1.0f - t) + nextPos * t;
 
-        cv::Vec3f n = refNormal * (1.0f - t) + annotNormal * t;
+        cv::Vec3f n = oldNormal * (1.0f - t) + nextDir * t;
         float nLen = static_cast<float>(cv::norm(n));
         if (nLen > 1e-6f) n /= nLen;
 
-        cv::Vec3f up = refVy * (1.0f - t) + annotVy * t;
+        cv::Vec3f up = oldVy * (1.0f - t) + annotVy * t;
         float upLen = static_cast<float>(cv::norm(up));
         if (upLen > 1e-6f) up /= upLen;
 
@@ -291,6 +292,9 @@ bool FiberAnnotationController::handleKeyPress(QKeyEvent* event)
     _animAnnotNormal = annotSurf->normal({});
     _animAnnotVy = annotSurf->basisY();
 
+    // Save the original annotation plane to restore after animation
+    _animSavedAnnotPlane = annotSurf;
+
     _animating = true;
     if (!_animClock) _animClock = new QElapsedTimer();
     _animClock->start();
@@ -311,9 +315,13 @@ void FiberAnnotationController::onAnimTick()
     if (!viewer) { _animating = false; return; }
 
     if (elapsed >= kDurationMs) {
-        // Done — restore annotation viewer to its own surface
+        // Done — restore original annotation plane
         _animating = false;
-        viewer->setSurface(fiberSurfaceName(kNumViews - 1));
+        if (_animSavedAnnotPlane) {
+            _cstate->setSurface(fiberSurfaceName(kNumViews - 1), _animSavedAnnotPlane);
+            viewer->centerOnVolumePoint(_animSavedAnnotPlane->origin());
+            _animSavedAnnotPlane.reset();
+        }
         return;
     }
 

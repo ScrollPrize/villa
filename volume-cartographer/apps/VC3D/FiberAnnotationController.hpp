@@ -99,6 +99,7 @@ private:
     // Animation state
     bool _animating = false;
     QElapsedTimer* _animClock = nullptr;
+    std::shared_ptr<PlaneSurface> _animSavedAnnotPlane;  // restored when animation ends
     cv::Vec3f _animRefPos, _animRefNormal, _animRefVy;
     cv::Vec3f _animAnnotPos, _animAnnotNormal, _animAnnotVy;
 };
