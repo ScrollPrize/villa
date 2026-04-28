@@ -390,12 +390,6 @@ def optimize(
 		if ensure_data_fn is not None:
 			data = ensure_data_fn(data, _needed_channels)
 
-		# Station-keeping: set seed point anchor (once, on first stage that uses it)
-		if (_need_term("station_n", opt_cfg.eff) > 0 or _need_term("station_t", opt_cfg.eff) > 0) and seed_xyz is not None:
-			dev = next(model.parameters()).device
-			seed_t = torch.tensor(list(seed_xyz), device=dev, dtype=torch.float32)
-			opt_loss_station.set_seed(seed_t, data, Hm=model.mesh_h, Wm=model.mesh_w, D=model.depth)
-
 		# Initial evaluation
 		def _eval_terms(res_, eff_):
 			"""Evaluate all loss terms, handling both single and multi-loss returns."""
@@ -447,8 +441,22 @@ def optimize(
 			for _cache in _active_caches:
 				_sp = data._spacing_for(_cache.channels[0])
 				_cache.prefetch(_xyz_hr_pf, data.origin_fullres, _sp)
+			# Also prefetch chunks for corr points (static positions, loaded once)
+			if data.corr_points is not None and data.corr_points.points_xyz_winda.shape[0] > 0:
+				_corr_xyz = data.corr_points.points_xyz_winda[:, :3].to(
+					device=next(model.parameters()).device, dtype=torch.float32)
+				for _cache in _active_caches:
+					_sp = data._spacing_for(_cache.channels[0])
+					_cache.prefetch(_corr_xyz, data.origin_fullres, _sp)
 			for _cache in _active_caches:
 				_cache.sync()
+
+		# Station-keeping: set seed point anchor (once, on first stage that uses it)
+		# Must be AFTER prefetch+sync so grid_sample_fullres can read loaded chunks.
+		if (_need_term("station_n", opt_cfg.eff) > 0 or _need_term("station_t", opt_cfg.eff) > 0) and seed_xyz is not None:
+			dev = next(model.parameters()).device
+			seed_t = torch.tensor(list(seed_xyz), device=dev, dtype=torch.float32)
+			opt_loss_station.set_seed(seed_t, data, Hm=model.mesh_h, Wm=model.mesh_w, D=model.depth)
 
 		with torch.no_grad():
 			res0 = model(data)
