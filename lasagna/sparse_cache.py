@@ -83,10 +83,10 @@ class SparseChunkGroupCache:
         self._pending: list[Future] = []
         self._transfer_stream = torch.cuda.Stream(device=device)
 
-        # Stats: accumulated over 100-iteration windows
+        # Stats: accumulated over entire optimization
         self._iter_count: int = 0
-        self._acc_new_chunks: int = 0
-        self._acc_fetch_ms: float = 0.0
+        self._total_new_chunks: int = 0
+        self._total_fetch_ms: float = 0.0
         self._last_sync_new: int = 0  # chunks from most recent sync
 
         table_mib = cZ * cY * cX * 8 / 1024**2
@@ -212,24 +212,25 @@ class SparseChunkGroupCache:
 
         dt_ms = (time.perf_counter() - t0) * 1000.0
         self._last_sync_new = n
-        self._acc_new_chunks += n
-        self._acc_fetch_ms += dt_ms
+        self._total_new_chunks += n
+        self._total_fetch_ms += dt_ms
 
     def end_iteration(self) -> None:
-        """Call once per optimizer iteration to accumulate stats and print every 100."""
+        """Call once per optimizer iteration to accumulate stats."""
         self._iter_count += 1
-        if self._iter_count % 100 == 0:
-            n = self._acc_new_chunks
-            ms = self._acc_fetch_ms
-            ms_per_it = ms / 100.0
-            ms_per_chunk = ms / n if n > 0 else 0.0
-            total = self.loaded_chunks()
-            total_mib = self.loaded_mib()
-            print(f"[sparse_cache] {','.join(self.channels)}: "
-                  f"+{n} chunks in 100it ({ms_per_it:.1f}ms/it, {ms_per_chunk:.1f}ms/chunk) "
-                  f"total={total} ({total_mib:.1f}MiB)", flush=True)
-            self._acc_new_chunks = 0
-            self._acc_fetch_ms = 0.0
+
+    def print_summary(self) -> None:
+        """Print accumulated cache stats summary. Call after optimization."""
+        n = self._total_new_chunks
+        ms = self._total_fetch_ms
+        its = self._iter_count
+        ms_per_it = ms / its if its > 0 else 0.0
+        ms_per_chunk = ms / n if n > 0 else 0.0
+        total = self.loaded_chunks()
+        total_mib = self.loaded_mib()
+        print(f"[sparse_cache] {','.join(self.channels)}: "
+              f"{n} chunks in {its}it ({ms_per_it:.1f}ms/it, {ms_per_chunk:.1f}ms/chunk) "
+              f"total={total} ({total_mib:.1f}MiB)", flush=True)
 
     def grid_sample(self, xyz_fullres: torch.Tensor, origin: torch.Tensor,
                     inv_scale: torch.Tensor, *, diff: bool = False) -> torch.Tensor:
