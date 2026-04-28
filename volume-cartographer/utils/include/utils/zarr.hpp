@@ -1506,18 +1506,8 @@ public:
         std::fstream f(p, std::ios::binary | std::ios::in | std::ios::out);
         if (!f) return;
 
-        f.seekg(static_cast<std::streamoff>(linear * 16));
-        std::uint64_t cur_offset = 0, cur_nbytes = 0;
-        f.read(reinterpret_cast<char*>(&cur_offset), 8);
-        f.read(reinterpret_cast<char*>(&cur_nbytes), 8);
-        if (!f) return;
-        const bool not_present = (cur_offset == ~std::uint64_t(0)
-                                  && cur_nbytes == ~std::uint64_t(0));
-        if (!not_present) return;
-
         std::uint64_t sentinel_offset = ~std::uint64_t(0) - 2;
         std::uint64_t sentinel_nbytes = 0;
-        f.clear();
         f.seekp(static_cast<std::streamoff>(linear * 16));
         f.write(reinterpret_cast<const char*>(&sentinel_offset), 8);
         f.write(reinterpret_cast<const char*>(&sentinel_nbytes), 8);
