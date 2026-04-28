@@ -156,6 +156,8 @@ private:
     QDoubleSpinBox* _spinPatchSdir3dCandidateMax{nullptr};
     QDoubleSpinBox* _spinPatchStraightMinCount{nullptr};
     QSpinBox* _spinPatchInlierBaseThreshold{nullptr};
+    QSpinBox* _spinPatchConsensusDefaultThreshold{nullptr};
+    QSpinBox* _spinPatchConsensusLimitThreshold{nullptr};
     QCheckBox* _chkPatchFlipX{nullptr};
     QCheckBox* _chkPatchDebugImages{nullptr};
     QCheckBox* _chkPatchSingleWrap{nullptr};
@@ -209,6 +211,8 @@ private:
     double _patchSdir3dCandidateMax{4.0};
     double _patchStraightMinCount{1.0};
     int _patchInlierBaseThreshold{20};
+    int _patchConsensusDefaultThreshold{10};
+    int _patchConsensusLimitThreshold{2};
     bool _patchFlipX{false};
     bool _patchDebugImages{false};
     bool _patchSingleWrap{false};

@@ -20,6 +20,8 @@
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSpinBox>
+#include <QStyle>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QVariant>
 
@@ -384,43 +386,67 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
     auto* patchForm = new QFormLayout();
     patchForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
 
-    auto addIntParam = [&](const QString& label, int min, int max, int step, int value) {
+    auto addResetButton = [&](auto* spin, auto defaultValue) {
+        auto* row = new QWidget(_groupPatchTracerParams);
+        auto* rowLayout = new QHBoxLayout(row);
+        rowLayout->setContentsMargins(0, 0, 0, 0);
+        rowLayout->setSpacing(4);
+        rowLayout->addWidget(spin);
+
+        auto* reset = new QToolButton(row);
+        reset->setAutoRaise(true);
+        reset->setIcon(style()->standardIcon(QStyle::SP_BrowserReload));
+        reset->setToolTip(tr("Reset this parameter to its default."));
+        reset->setFixedSize(22, 22);
+        rowLayout->addWidget(reset);
+
+        connect(reset, &QToolButton::clicked, this, [this, spin, defaultValue]() {
+            spin->setValue(defaultValue);
+            persistPatchTracerParams();
+        });
+
+        return row;
+    };
+
+    auto addIntParam = [&](const QString& label, int min, int max, int step, int value, int defaultValue) {
         auto* spin = new QSpinBox(_groupPatchTracerParams);
         spin->setRange(min, max);
         spin->setSingleStep(step);
         spin->setValue(value);
-        patchForm->addRow(label, spin);
+        patchForm->addRow(label, addResetButton(spin, defaultValue));
         connect(spin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this]() { persistPatchTracerParams(); });
         return spin;
     };
-    auto addDoubleParam = [&](const QString& label, double min, double max, double step, double value) {
+    auto addDoubleParam = [&](const QString& label, double min, double max, double step, double value, double defaultValue) {
         auto* spin = new QDoubleSpinBox(_groupPatchTracerParams);
         spin->setRange(min, max);
         spin->setSingleStep(step);
         spin->setDecimals(4);
         spin->setValue(value);
-        patchForm->addRow(label, spin);
+        patchForm->addRow(label, addResetButton(spin, defaultValue));
         connect(spin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this]() { persistPatchTracerParams(); });
         return spin;
     };
 
-    _spinPatchGlobalStepsPerWindow = addIntParam(tr("Global opt windows"), 0, 100, 1, _patchGlobalStepsPerWindow);
-    _spinPatchSrcStep = addIntParam(tr("Source step"), 1, 1000, 1, _patchSrcStep);
-    _spinPatchStep = addIntParam(tr("Grid step"), 1, 1000, 1, _patchStep);
-    _spinPatchMaxWidth = addIntParam(tr("Max width"), 1, 1000000, 1000, _patchMaxWidth);
-    _spinPatchLocalCostInlierThreshold = addDoubleParam(tr("Local cost inlier"), 0.0, 100.0, 0.01, _patchLocalCostInlierThreshold);
-    _spinPatchSameSurfaceThreshold = addDoubleParam(tr("Same surface threshold"), 0.0, 1000.0, 0.1, _patchSameSurfaceThreshold);
-    _spinPatchStraightWeight = addDoubleParam(tr("Straight weight 2D"), 0.0, 100.0, 0.1, _patchStraightWeight);
-    _spinPatchStraightWeight3d = addDoubleParam(tr("Straight weight 3D"), 0.0, 100.0, 0.1, _patchStraightWeight3d);
-    _spinPatchSlidingWindowScale = addDoubleParam(tr("Sliding window scale"), 0.01, 100.0, 0.1, _patchSlidingWindowScale);
-    _spinPatchZLocationLossWeight = addDoubleParam(tr("Z loc loss weight"), 0.0, 100.0, 0.1, _patchZLocationLossWeight);
-    _spinPatchDistLoss2dWeight = addDoubleParam(tr("Dist loss 2D"), 0.0, 100.0, 0.1, _patchDistLoss2dWeight);
-    _spinPatchDistLoss3dWeight = addDoubleParam(tr("Dist loss 3D"), 0.0, 100.0, 0.1, _patchDistLoss3dWeight);
-    _spinPatchSdir3dRadius = addIntParam(tr("SDIR radius 3D"), 0, 8, 1, _patchSdir3dRadius);
-    _spinPatchSdir3dWeight = addDoubleParam(tr("SDIR weight 3D"), 0.0, 100.0, 0.1, _patchSdir3dWeight);
-    _spinPatchSdir3dCandidateMax = addDoubleParam(tr("SDIR candidate max"), 0.0, 1000.0, 0.1, _patchSdir3dCandidateMax);
-    _spinPatchStraightMinCount = addDoubleParam(tr("Straight min count"), 0.0, 16.0, 0.5, _patchStraightMinCount);
-    _spinPatchInlierBaseThreshold = addIntParam(tr("Inlier base threshold"), 0, 10000, 1, _patchInlierBaseThreshold);
+    _spinPatchGlobalStepsPerWindow = addIntParam(tr("Global opt windows"), 0, 100, 1, _patchGlobalStepsPerWindow, 0);
+    _spinPatchSrcStep = addIntParam(tr("Source step"), 1, 1000, 1, _patchSrcStep, 20);
+    _spinPatchStep = addIntParam(tr("Grid step"), 1, 1000, 1, _patchStep, 10);
+    _spinPatchMaxWidth = addIntParam(tr("Max width"), 1, 1000000, 1000, _patchMaxWidth, 80000);
+    _spinPatchLocalCostInlierThreshold = addDoubleParam(tr("Local cost inlier"), 0.0, 100.0, 0.01, _patchLocalCostInlierThreshold, 0.2);
+    _spinPatchSameSurfaceThreshold = addDoubleParam(tr("Same surface threshold"), 0.0, 1000.0, 0.1, _patchSameSurfaceThreshold, 2.0);
+    _spinPatchStraightWeight = addDoubleParam(tr("Straight weight 2D"), 0.0, 100.0, 0.1, _patchStraightWeight, 0.7);
+    _spinPatchStraightWeight3d = addDoubleParam(tr("Straight weight 3D"), 0.0, 100.0, 0.1, _patchStraightWeight3d, 4.0);
+    _spinPatchSlidingWindowScale = addDoubleParam(tr("Sliding window scale"), 0.01, 100.0, 0.1, _patchSlidingWindowScale, 1.0);
+    _spinPatchZLocationLossWeight = addDoubleParam(tr("Z loc loss weight"), 0.0, 100.0, 0.1, _patchZLocationLossWeight, 0.1);
+    _spinPatchDistLoss2dWeight = addDoubleParam(tr("Dist loss 2D"), 0.0, 100.0, 0.1, _patchDistLoss2dWeight, 1.0);
+    _spinPatchDistLoss3dWeight = addDoubleParam(tr("Dist loss 3D"), 0.0, 100.0, 0.1, _patchDistLoss3dWeight, 2.0);
+    _spinPatchSdir3dRadius = addIntParam(tr("SDIR radius 3D"), 0, 8, 1, _patchSdir3dRadius, 2);
+    _spinPatchSdir3dWeight = addDoubleParam(tr("SDIR weight 3D"), 0.0, 100.0, 0.1, _patchSdir3dWeight, 0.5);
+    _spinPatchSdir3dCandidateMax = addDoubleParam(tr("SDIR candidate max"), 0.0, 1000.0, 0.1, _patchSdir3dCandidateMax, 4.0);
+    _spinPatchStraightMinCount = addDoubleParam(tr("Straight min count"), 0.0, 16.0, 0.5, _patchStraightMinCount, 1.0);
+    _spinPatchInlierBaseThreshold = addIntParam(tr("Inlier base threshold"), 0, 10000, 1, _patchInlierBaseThreshold, 20);
+    _spinPatchConsensusDefaultThreshold = addIntParam(tr("Consensus default th"), 0, 10000, 1, _patchConsensusDefaultThreshold, 10);
+    _spinPatchConsensusLimitThreshold = addIntParam(tr("Consensus limit th"), 0, 10000, 1, _patchConsensusLimitThreshold, 2);
 
     _chkPatchFlipX = new QCheckBox(tr("Flip X"), _groupPatchTracerParams);
     _chkPatchDebugImages = new QCheckBox(tr("Debug images"), _groupPatchTracerParams);
@@ -926,6 +952,8 @@ utils::Json SegmentationGrowthPanel::patchTracerParamsJson() const
     params["sdir_3d_candidate_max"] = _patchSdir3dCandidateMax;
     params["straight_min_count"] = _patchStraightMinCount;
     params["inlier_base_threshold"] = _patchInlierBaseThreshold;
+    params["consensus_default_th"] = _patchConsensusDefaultThreshold;
+    params["consensus_limit_th"] = _patchConsensusLimitThreshold;
     return params;
 }
 
@@ -1229,6 +1257,8 @@ void SegmentationGrowthPanel::resetPatchTracerParams(bool persist)
     _patchSdir3dCandidateMax = 4.0;
     _patchStraightMinCount = 1.0;
     _patchInlierBaseThreshold = 20;
+    _patchConsensusDefaultThreshold = 10;
+    _patchConsensusLimitThreshold = 2;
     syncPatchTracerParamsUi();
     if (persist) {
         persistPatchTracerParams();
@@ -1261,6 +1291,8 @@ void SegmentationGrowthPanel::syncPatchTracerParamsUi()
     setSpin(_spinPatchSdir3dCandidateMax, _patchSdir3dCandidateMax);
     setSpin(_spinPatchStraightMinCount, _patchStraightMinCount);
     setSpin(_spinPatchInlierBaseThreshold, _patchInlierBaseThreshold);
+    setSpin(_spinPatchConsensusDefaultThreshold, _patchConsensusDefaultThreshold);
+    setSpin(_spinPatchConsensusLimitThreshold, _patchConsensusLimitThreshold);
     if (_chkPatchFlipX) {
         const QSignalBlocker blocker(_chkPatchFlipX);
         _chkPatchFlipX->setChecked(_patchFlipX);
@@ -1297,6 +1329,8 @@ void SegmentationGrowthPanel::persistPatchTracerParams()
     if (_spinPatchSdir3dCandidateMax) _patchSdir3dCandidateMax = _spinPatchSdir3dCandidateMax->value();
     if (_spinPatchStraightMinCount) _patchStraightMinCount = _spinPatchStraightMinCount->value();
     if (_spinPatchInlierBaseThreshold) _patchInlierBaseThreshold = _spinPatchInlierBaseThreshold->value();
+    if (_spinPatchConsensusDefaultThreshold) _patchConsensusDefaultThreshold = _spinPatchConsensusDefaultThreshold->value();
+    if (_spinPatchConsensusLimitThreshold) _patchConsensusLimitThreshold = _spinPatchConsensusLimitThreshold->value();
     if (_chkPatchFlipX) _patchFlipX = _chkPatchFlipX->isChecked();
     if (_chkPatchDebugImages) _patchDebugImages = _chkPatchDebugImages->isChecked();
     if (_chkPatchSingleWrap) _patchSingleWrap = _chkPatchSingleWrap->isChecked();
@@ -1321,6 +1355,8 @@ void SegmentationGrowthPanel::persistPatchTracerParams()
     writeSetting(QStringLiteral("patch_sdir_3d_candidate_max"), _patchSdir3dCandidateMax);
     writeSetting(QStringLiteral("patch_straight_min_count"), _patchStraightMinCount);
     writeSetting(QStringLiteral("patch_inlier_base_threshold"), _patchInlierBaseThreshold);
+    writeSetting(QStringLiteral("patch_consensus_default_th"), _patchConsensusDefaultThreshold);
+    writeSetting(QStringLiteral("patch_consensus_limit_th"), _patchConsensusLimitThreshold);
 }
 
 void SegmentationGrowthPanel::triggerGrowthRequest(SegmentationGrowthDirection direction,
@@ -1428,6 +1464,8 @@ void SegmentationGrowthPanel::restoreSettings(QSettings& settings)
     _patchSdir3dCandidateMax = std::clamp(settings.value(QStringLiteral("patch_sdir_3d_candidate_max"), _patchSdir3dCandidateMax).toDouble(), 0.0, 1000.0);
     _patchStraightMinCount = std::clamp(settings.value(QStringLiteral("patch_straight_min_count"), _patchStraightMinCount).toDouble(), 0.0, 16.0);
     _patchInlierBaseThreshold = std::clamp(settings.value(QStringLiteral("patch_inlier_base_threshold"), _patchInlierBaseThreshold).toInt(), 0, 10000);
+    _patchConsensusDefaultThreshold = std::clamp(settings.value(QStringLiteral("patch_consensus_default_th"), _patchConsensusDefaultThreshold).toInt(), 0, 10000);
+    _patchConsensusLimitThreshold = std::clamp(settings.value(QStringLiteral("patch_consensus_limit_th"), _patchConsensusLimitThreshold).toInt(), 0, 10000);
 
     _restoringSettings = false;
 }
