@@ -152,9 +152,6 @@ lambda_global: dict[str, float] = {
 	"data_plain": 0.0,
 	"pred_dt": 0.0,
 	"corr": 0.0,
-	"corr_snap": 0.0,
-	"corr_legacy": 0.0,
-	"corr_signed": 0.0,
 	"winding_vol": 0.0,
 	"station_n": 0.0,
 	"station_t": 0.0,
@@ -286,9 +283,6 @@ def optimize(
 		"data_plain": {"loss": opt_loss_data.data_plain_loss},
 		"pred_dt": {"loss": opt_loss_pred_dt.pred_dt_loss},
 		"corr": {"loss": opt_loss_corr.corr_winding_loss},
-		"corr_snap": {"loss": opt_loss_corr.corr_snap_loss},
-		"corr_legacy": {"loss": opt_loss_corr.corr_legacy_loss},
-		"corr_signed": {"loss": opt_loss_corr.corr_signed_loss},
 		"winding_vol": {"loss": opt_loss_winding_volume.winding_volume_loss},
 		"station": {"loss": opt_loss_station.station_loss, "sub": ["station_n", "station_t"]},
 		"bend": {"loss": opt_loss_bend.bend_loss},
@@ -467,7 +461,7 @@ def optimize(
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
 			_print_status(step_label=f"{label} 0/{opt_cfg.steps}", loss_val=loss0.item(), tv=term_vals0, pv=param_vals0)
 			# Print corr detail after initial eval (first stage only)
-			if not _corr_start_printed[0] and any(t in term_vals0 for t in ("corr", "corr_snap", "corr_legacy", "corr_signed")):
+			if not _corr_start_printed[0] and "corr" in term_vals0:
 				opt_loss_corr.print_detail("START")
 				_corr_start_printed[0] = True
 		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data, res=res0)
@@ -553,7 +547,7 @@ def optimize(
 	_num_stages = len(stages)
 
 	# Debug: show corr status
-	_corr_terms = ("corr", "corr_snap", "corr_legacy", "corr_signed")
+	_corr_terms = ("corr",)
 	has_corr_pts = data.corr_points is not None and data.corr_points.points_xyz_winda.shape[0] > 0
 	corr_weights = {t: [(_need_term(t, s.global_opt.eff), s.name) for s in stages if s.global_opt.steps > 0]
 					for t in _corr_terms}
