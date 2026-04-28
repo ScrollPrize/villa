@@ -965,10 +965,13 @@ void MenuActionController::loadSourceRemoteAsync(const vc::Volpkg& proj,
     auto cancelled = std::make_shared<std::atomic<bool>>(false);
 
     // Temporary status-bar cancel button, cleaned up when the future
-    // completes (see the finished handler below).
+    // completes (see the finished handler below). Skip widget construction
+    // if the main window isn't shown yet — happens during autosave restore
+    // where the status bar's layout isn't activated yet and addPermanentWidget
+    // crashes inside QPixmapIconEngine.
     QPushButton* cancelBtn = nullptr;
     QLabel* statusLbl = nullptr;
-    if (_window && _window->statusBar()) {
+    if (_window && _window->isVisible() && _window->statusBar()) {
         statusLbl = new QLabel(
             tr("Loading remote %1...").arg(QString::fromStdString(url)),
             _window->statusBar());

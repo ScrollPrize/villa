@@ -159,6 +159,10 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
     fprintf(stderr, "[CState] setCurrentVolume: begin (old=%p new=%p)\n",
             (void*)_currentVolume.get(), (void*)vol.get());
+    if (_currentVolume == vol) {
+        fprintf(stderr, "[CState] setCurrentVolume: same volume, no-op\n");
+        return;
+    }
     if (_currentVolume) {
         auto* oldPipeline = _currentVolume->tieredCache();
         if (oldPipeline) {
