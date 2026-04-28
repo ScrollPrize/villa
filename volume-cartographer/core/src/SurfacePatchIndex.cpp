@@ -11,6 +11,7 @@
 #include <future>
 #include <iomanip>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -160,12 +161,18 @@ inline bool isValidBounds(const cv::Vec3f& low, const cv::Vec3f& high) noexcept
         && low[0] <= high[0] && low[1] <= high[1] && low[2] <= high[2];
 }
 
-std::vector<SurfacePtr> loadSurfacesInBatches(const std::vector<SurfacePtr>& surfaces)
+struct LoadedSurface {
+    SurfacePtr surface;
+    bool wasLoaded = false;
+    bool loadedForIndex = false;
+};
+
+std::vector<LoadedSurface> loadSurfacesInBatches(const std::vector<SurfacePtr>& surfaces)
 {
     constexpr size_t kBatchSize = 5000;
     constexpr size_t kMaxWorkers = 8;
 
-    std::vector<SurfacePtr> loaded;
+    std::vector<LoadedSurface> loaded;
     loaded.reserve(surfaces.size());
 
     for (size_t batchStart = 0; batchStart < surfaces.size(); batchStart += kBatchSize) {
@@ -175,7 +182,7 @@ std::vector<SurfacePtr> loadSurfacesInBatches(const std::vector<SurfacePtr>& sur
         std::cout << "[SurfacePatchIndex] loading surfaces "
                   << batchStart << "-" << (batchEnd == 0 ? 0 : batchEnd - 1)
                   << " / " << surfaces.size() << std::endl;
-        std::vector<SurfacePtr> batchLoaded(batchSize);
+        std::vector<LoadedSurface> batchLoaded(batchSize);
 
         const unsigned hw = std::thread::hardware_concurrency();
         const size_t workerCount = std::max<size_t>(
@@ -196,14 +203,15 @@ std::vector<SurfacePtr> loadSurfacesInBatches(const std::vector<SurfacePtr>& sur
                     if (!s) {
                         continue;
                     }
-                    if (!s->isLoaded()) {
+                    const bool wasLoaded = s->isLoaded();
+                    if (!wasLoaded) {
                         if (DebugLoggingEnabled()) {
                             std::cout << "[SurfacePatchIndex] Loading surface: " << s->id << std::endl;
                         }
                         s->rawPointsPtr();  // triggers ensureLoaded()
                     }
                     if (s->isLoaded()) {
-                        batchLoaded[localIndex] = s;
+                        batchLoaded[localIndex] = LoadedSurface{s, wasLoaded, !wasLoaded};
                         if (DebugLoggingEnabled()) {
                             std::cout << "[SurfacePatchIndex] Indexed surface: " << s->id << std::endl;
                         }
@@ -218,9 +226,9 @@ std::vector<SurfacePtr> loadSurfacesInBatches(const std::vector<SurfacePtr>& sur
             worker.get();
         }
 
-        for (auto& surface : batchLoaded) {
-            if (surface) {
-                loaded.push_back(std::move(surface));
+        for (auto& item : batchLoaded) {
+            if (item.surface) {
+                loaded.push_back(std::move(item));
             }
         }
         const double seconds = std::chrono::duration<double>(
@@ -667,6 +675,18 @@ struct SurfacePatchIndex::Impl {
                              int rowEnd,
                              int colStart,
                              int colEnd);
+    static std::vector<Entry> collectEntriesForRebuild(QuadSurface* surface,
+                                                       const cv::Mat_<cv::Vec3f>& points,
+                                                       SurfaceCellMask& mask,
+                                                       float bboxPadding,
+                                                       int samplingStride);
+    static bool buildEntryForCell(QuadSurface* surface,
+                                  const cv::Mat_<cv::Vec3f>& points,
+                                  int col,
+                                  int row,
+                                  int stride,
+                                  float bboxPadding,
+                                  Entry& outEntry);
     static bool buildCellEntry(const SurfacePtr& surface,
                                const cv::Mat_<cv::Vec3f>& points,
                                int col,
@@ -1168,6 +1188,45 @@ SurfacePatchIndex::Impl::collectEntriesForSurface(const SurfacePtr& surface,
     return result;
 }
 
+std::vector<SurfacePatchIndex::Impl::Entry>
+SurfacePatchIndex::Impl::collectEntriesForRebuild(QuadSurface* surface,
+                                                  const cv::Mat_<cv::Vec3f>& points,
+                                                  SurfaceCellMask& mask,
+                                                  float bboxPadding,
+                                                  int samplingStride)
+{
+    std::vector<Entry> entries;
+    if (!surface || points.empty()) {
+        return entries;
+    }
+
+    const int cellRowCount = points.rows - 1;
+    const int cellColCount = points.cols - 1;
+    if (cellRowCount <= 0 || cellColCount <= 0) {
+        return entries;
+    }
+
+    samplingStride = std::max(1, samplingStride);
+    const size_t estimatedCells =
+        static_cast<size_t>((cellRowCount + samplingStride - 1) / samplingStride) *
+        static_cast<size_t>((cellColCount + samplingStride - 1) / samplingStride);
+    entries.reserve(estimatedCells);
+
+    for (int row = 0; row < cellRowCount; row += samplingStride) {
+        for (int col = 0; col < cellColCount; col += samplingStride) {
+            Entry entry;
+            if (!buildEntryForCell(surface, points, col, row, samplingStride, bboxPadding, entry)) {
+                continue;
+            }
+            mask.setActive(row, col, true);
+            mask.storeBox(row, col, entry.first);
+            entries.push_back(std::move(entry));
+        }
+    }
+
+    return entries;
+}
+
 void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float bboxPadding)
 {
     std::unique_lock<std::shared_mutex> lock(mutex_);
@@ -1180,7 +1239,7 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
 
     // Eagerly load any surfaces whose TIFF data hasn't been loaded yet.
     // This is safe because rebuild() typically runs on a background thread.
-    std::vector<SurfacePtr> loaded = loadSurfacesInBatches(surfaces);
+    std::vector<LoadedSurface> loaded = loadSurfacesInBatches(surfaces);
     const size_t surfaceCount = loaded.size();
     if (DebugLoggingEnabled()) {
         std::cout << "[SurfacePatchIndex] rebuild: " << surfaceCount << " of " << surfaces.size() << " surfaces loaded" << std::endl;
@@ -1199,39 +1258,31 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
 
     // Pre-create all masks (sequential, enables thread-safe parallel access)
     std::cout << "[SurfacePatchIndex] creating masks for " << surfaceCount << " surfaces" << std::endl;
-    for (const SurfacePtr& surface : loaded) {
-        impl_->ensureMask(surface);
+    for (const LoadedSurface& item : loaded) {
+        impl_->ensureMask(item.surface);
     }
 
-    // Per-surface results for parallel collection
-    using CellResult = std::vector<std::pair<CellKey, Impl::CellEntry>>;
-    std::vector<CellResult> perSurfaceCells(surfaceCount);
+    // Per-surface entries for parallel collection. Rebuild does not need
+    // CellKey/CellEntry wrappers; masks are updated immediately per surface.
+    std::vector<std::vector<Impl::Entry>> perSurfaceEntries(surfaceCount);
     std::atomic_size_t indexedSurfaces{0};
     const auto collectStart = std::chrono::steady_clock::now();
 
     // Parallel phase: collect entries and update masks for each surface
     #pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < surfaceCount; ++i) {
-        perSurfaceCells[i] = Impl::collectEntriesForSurface(
-            loaded[i],
-            padding,
-            stride,
-            0,
-            std::numeric_limits<int>::max(),
-            0,
-            std::numeric_limits<int>::max());
-
-        // Update mask for this surface (each surface has its own mask, no contention)
-        auto* rec = impl_->getRecord(loaded[i].get());
+        const SurfacePtr& surface = loaded[i].surface;
+        auto* rec = impl_->getRecord(surface.get());
         if (rec) {
-            for (auto& cell : perSurfaceCells[i]) {
-                rec->mask.setActive(cell.first.rowIndex(), cell.first.colIndex(), cell.second.hasPatch);
-                if (cell.second.hasPatch) {
-                    rec->mask.storeBox(cell.first.rowIndex(), cell.first.colIndex(),
-                                       cell.second.patch.first);
-                }
+            if (const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr()) {
+                perSurfaceEntries[i] = Impl::collectEntriesForRebuild(
+                    surface.get(), *points, rec->mask, padding, stride);
             }
         }
+        if (loaded[i].loadedForIndex && surface->canUnload()) {
+            surface->unloadPoints();
+        }
+
         const size_t done = indexedSurfaces.fetch_add(1, std::memory_order_relaxed) + 1;
         if (done == surfaceCount || done % 1000 == 0) {
             #pragma omp critical(surface_patch_index_progress)
@@ -1248,23 +1299,19 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     // Merge entries from all surfaces
     std::cout << "[SurfacePatchIndex] merging entries" << std::endl;
     size_t totalEntries = 0;
-    for (const auto& cells : perSurfaceCells) {
-        for (const auto& cell : cells) {
-            if (cell.second.hasPatch) {
-                ++totalEntries;
-            }
-        }
+    for (const auto& entriesForSurface : perSurfaceEntries) {
+        totalEntries += entriesForSurface.size();
     }
 
     std::vector<Impl::Entry> entries;
     entries.reserve(totalEntries);
 
-    for (auto& cells : perSurfaceCells) {
-        for (auto& cell : cells) {
-            if (cell.second.hasPatch) {
-                entries.push_back(std::move(cell.second.patch));
-            }
-        }
+    for (auto& entriesForSurface : perSurfaceEntries) {
+        entries.insert(entries.end(),
+                       std::make_move_iterator(entriesForSurface.begin()),
+                       std::make_move_iterator(entriesForSurface.end()));
+        entriesForSurface.clear();
+        entriesForSurface.shrink_to_fit();
     }
 
     impl_->patchCount = entries.size();
@@ -2143,14 +2190,18 @@ bool SurfacePatchIndex::Impl::loadPatchCorners(const PatchRecord& rec,
     return true;
 }
 
-bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
-                                             const cv::Mat_<cv::Vec3f>& points,
-                                             int col,
-                                             int row,
-                                             int stride,
-                                             float bboxPadding,
-                                             CellEntry& outEntry)
+bool SurfacePatchIndex::Impl::buildEntryForCell(QuadSurface* surface,
+                                                const cv::Mat_<cv::Vec3f>& points,
+                                                int col,
+                                                int row,
+                                                int stride,
+                                                float bboxPadding,
+                                                Entry& outEntry)
 {
+    if (!surface) {
+        return false;
+    }
+
     // Clamp stride to not exceed bounds
     const int maxColStride = points.cols - 1 - col;
     const int maxRowStride = points.rows - 1 - row;
@@ -2173,7 +2224,7 @@ bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
     }
 
     PatchRecord rec;
-    rec.surface = surface.get();
+    rec.surface = surface;
     rec.i = col;
     rec.j = row;
 
@@ -2206,9 +2257,26 @@ bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
         return false;
     }
 
-    outEntry.patch = buildEntryFromBbox(rec, low, high, bboxPadding);
-    outEntry.hasPatch = true;
+    outEntry = buildEntryFromBbox(rec, low, high, bboxPadding);
 
+    return true;
+}
+
+bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
+                                             const cv::Mat_<cv::Vec3f>& points,
+                                             int col,
+                                             int row,
+                                             int stride,
+                                             float bboxPadding,
+                                             CellEntry& outEntry)
+{
+    Entry entry;
+    if (!buildEntryForCell(surface.get(), points, col, row, stride, bboxPadding, entry)) {
+        return false;
+    }
+
+    outEntry.patch = std::move(entry);
+    outEntry.hasPatch = true;
     return true;
 }
 
