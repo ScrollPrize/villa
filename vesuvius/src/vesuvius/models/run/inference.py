@@ -22,6 +22,84 @@ from vesuvius.models.run.patch_writer import BoundedPatchWriter
 from vesuvius.utils.k8s import get_tqdm_kwargs
 
 
+def _tuple_if_sequence(value):
+    if isinstance(value, (list, tuple)):
+        return tuple(value)
+    return value
+
+
+def _normalize_train_py_model_config(checkpoint_data):
+    """Return a modern model_config for current and legacy train.py checkpoints."""
+    model_config = checkpoint_data.get('model_config')
+    if model_config:
+        return dict(model_config)
+
+    legacy_config = checkpoint_data.get('config')
+    if not isinstance(legacy_config, dict):
+        return {}
+
+    model_config = dict(legacy_config.get('model_config') or {})
+
+    if 'patch_size' in legacy_config:
+        patch_size = _tuple_if_sequence(legacy_config['patch_size'])
+        model_config.setdefault('patch_size', patch_size)
+        model_config.setdefault('train_patch_size', patch_size)
+
+    if 'batch_size' in legacy_config:
+        model_config.setdefault('batch_size', legacy_config['batch_size'])
+        model_config.setdefault('train_batch_size', legacy_config['batch_size'])
+
+    if 'in_channels' in legacy_config:
+        model_config.setdefault('in_channels', legacy_config['in_channels'])
+
+    targets = legacy_config.get('targets')
+    if targets:
+        model_config.setdefault('targets', targets)
+
+    model_name = (
+        legacy_config.get('wandb_run_name')
+        or legacy_config.get('model_name')
+        or legacy_config.get('out_dir')
+    )
+    if model_name:
+        model_config.setdefault('model_name', str(model_name))
+
+    if 'enable_deep_supervision' in legacy_config:
+        model_config.setdefault('enable_deep_supervision', legacy_config['enable_deep_supervision'])
+    else:
+        model_config.setdefault('enable_deep_supervision', False)
+
+    return model_config
+
+
+def _legacy_checkpoint_uses_ema_for_inference(checkpoint_data):
+    legacy_config = checkpoint_data.get('config')
+    if not isinstance(legacy_config, dict):
+        return False
+    ema_config = legacy_config.get('ema')
+    if not isinstance(ema_config, dict):
+        return False
+    return bool(ema_config.get('validate', False)) and isinstance(checkpoint_data.get('ema_model'), dict)
+
+
+def _select_train_py_state_dict(checkpoint_data):
+    if _legacy_checkpoint_uses_ema_for_inference(checkpoint_data):
+        return checkpoint_data['ema_model'], 'ema_model'
+    return checkpoint_data.get('model', checkpoint_data), 'model'
+
+
+def _checkpoint_normalization_scheme(checkpoint_data):
+    if 'normalization_scheme' in checkpoint_data:
+        return checkpoint_data['normalization_scheme']
+    legacy_config = checkpoint_data.get('config')
+    if not isinstance(legacy_config, dict):
+        return None
+    image_normalization = legacy_config.get('image_normalization')
+    if image_normalization == 'percentile_minmax':
+        return 'percentile_minmax'
+    return image_normalization
+
+
 class _InferenceDeepSupervisionWrapper(torch.nn.Module):
     """Collapse multi-scale train-time outputs to highest-resolution inference outputs."""
 
@@ -74,6 +152,7 @@ class Inferer():
                  compression_level: int = 1,
                  hf_token: str = None,
                  model_type: str = 'auto',
+                 input_anon: bool = False,
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -106,6 +185,7 @@ class Inferer():
         self.compression_level = compression_level
         self.hf_token = hf_token
         self.model_type = model_type
+        self.input_anon = input_anon
         self.model_patch_size = None
         self.num_classes = None
 
@@ -326,13 +406,14 @@ class Inferer():
         checkpoint_data = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         
         # Extract model configuration
-        model_config = checkpoint_data.get('model_config', {})
+        model_config = _normalize_train_py_model_config(checkpoint_data)
         if not model_config:
             raise ValueError("No model configuration found in checkpoint")
         
         # Extract normalization info if present
-        if 'normalization_scheme' in checkpoint_data:
-            self.model_normalization_scheme = checkpoint_data['normalization_scheme']
+        checkpoint_normalization = _checkpoint_normalization_scheme(checkpoint_data)
+        if checkpoint_normalization:
+            self.model_normalization_scheme = checkpoint_normalization
             if self.verbose:
                 print(f"Found normalization scheme in checkpoint: {self.model_normalization_scheme}")
         
@@ -365,7 +446,9 @@ class Inferer():
         model = model.to(self.device)
         
         # Load weights
-        model_state_dict = checkpoint_data.get('model', checkpoint_data)
+        model_state_dict, state_dict_source = _select_train_py_state_dict(checkpoint_data)
+        if self.verbose:
+            print(f"Loading weights from checkpoint key: {state_dict_source}")
 
         # Strip wrapper prefixes (DDP 'module.' and torch.compile '_orig_mod.')
         # This ensures checkpoint compatibility regardless of how it was saved
@@ -492,7 +575,8 @@ class Inferer():
             scroll_id=self.scroll_id,
             segment_id=self.segment_id,
             energy=self.energy,
-            resolution=self.resolution
+            resolution=self.resolution,
+            anon=self.input_anon,
         )
 
         expected_attr_name = 'all_positions'
@@ -876,6 +960,8 @@ def main():
     parser.add_argument('--segment_id', type=str, default=None, help='Segment ID to use (if input_format is volume)')
     parser.add_argument('--energy', type=int, default=None, help='Energy level to use (if input_format is volume)')
     parser.add_argument('--resolution', type=float, default=None, help='Resolution to use (if input_format is volume)')
+    parser.add_argument('--input_anon', action='store_true',
+                      help='Use anonymous requests for input S3 reads. Output writes remain authenticated.')
     
     # Add arguments for Hugging Face model loading
     parser.add_argument('--hf_token', type=str, default=None, help='Hugging Face token for accessing private repositories')
@@ -936,7 +1022,8 @@ def main():
         compression_level=args.zarr_compression_level,
         # Pass Hugging Face parameters
         hf_token=args.hf_token,
-        model_type=args.model_type
+        model_type=args.model_type,
+        input_anon=args.input_anon,
     )
 
     try:
