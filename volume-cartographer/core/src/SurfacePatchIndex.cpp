@@ -1407,6 +1407,61 @@ void SurfacePatchIndex::forEachTriangle(const Rect3D& bounds,
     forEachTriangleImpl(bounds, targetSurface, nullptr, visitor);
 }
 
+void SurfacePatchIndex::forEachTriangleIntersectingRay(
+    const Rect3D& bounds,
+    const SurfacePtr& targetSurface,
+    const cv::Vec3f& origin,
+    const cv::Vec3f& dir,
+    float minT,
+    float maxT,
+    const std::function<void(const TriangleCandidate&)>& visitor) const
+{
+    if (!visitor || minT > maxT) {
+        return;
+    }
+
+    auto rayIntersectsBox = [&](const Impl::Box3& box) {
+        float t0 = minT;
+        float t1 = maxT;
+        const float lows[3] = {
+            box.min_corner().get<0>(),
+            box.min_corner().get<1>(),
+            box.min_corner().get<2>()
+        };
+        const float highs[3] = {
+            box.max_corner().get<0>(),
+            box.max_corner().get<1>(),
+            box.max_corner().get<2>()
+        };
+
+        for (int ax = 0; ax < 3; ++ax) {
+            const float d = dir[ax];
+            if (std::abs(d) <= 1e-8f) {
+                if (origin[ax] < lows[ax] || origin[ax] > highs[ax]) {
+                    return false;
+                }
+                continue;
+            }
+
+            const float invD = 1.0f / d;
+            float nearT = (lows[ax] - origin[ax]) * invD;
+            float farT = (highs[ax] - origin[ax]) * invD;
+            if (nearT > farT) {
+                std::swap(nearT, farT);
+            }
+            t0 = std::max(t0, nearT);
+            t1 = std::min(t1, farT);
+            if (t0 > t1) {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    forEachTriangleImpl(bounds, targetSurface, nullptr, visitor, rayIntersectsBox);
+}
+
 void SurfacePatchIndex::forEachTriangle(const Rect3D& bounds,
                                         const std::unordered_set<SurfacePtr>& targetSurfaces,
                                         const std::function<void(const TriangleCandidate&)>& visitor) const

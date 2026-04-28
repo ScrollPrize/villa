@@ -198,6 +198,10 @@ static float sliding_w_scale = 1.0f;       // Scale factor for sliding window
 static float z_loc_loss_w = 0.1f;          // Weight for Z location loss constraints
 static float dist_loss_2d_w = 1.0f;        // Weight for 2D distance constraints
 static float dist_loss_3d_w = 2.0f;        // Weight for 3D distance constraints
+static int sdir_3d_radius = 2;             // Symmetric-Dirichlet metric radius, in grid strides
+static float sdir_3d_w = 0.5f;             // Weight for local 3D metric preservation
+static float sdir_3d_global_w = 0.25f;     // Weight for 3D metric preservation during global optimization
+static float sdir_3d_candidate_max = 4.0f; // Reject candidates with a worse local metric residual
 static float straight_min_count = 1.0f;    // Minimum number of straight constraints
 static int inlier_base_threshold = 20;     // Starting threshold for inliers
 
@@ -548,6 +552,55 @@ static int add_surftrack_distloss_3D(cv::Mat_<cv::Vec3d> &points, const cv::Vec2
     return 1;
 }
 
+static int add_surftrack_sdirloss_3D(cv::Mat_<cv::Vec3d> &points, const cv::Vec2i &p, int stride,
+    ceres::Problem &problem, const cv::Mat_<uint8_t> &state, float unit, float weight = sdir_3d_w)
+{
+    if (weight <= 0.0f || stride < 1)
+        return 0;
+
+    const cv::Vec2i pu = p + cv::Vec2i(0, stride);
+    const cv::Vec2i pv = p + cv::Vec2i(stride, 0);
+    if (p[0] < 0 || p[0] >= state.rows || p[1] < 0 || p[1] >= state.cols)
+        return 0;
+    if (pu[0] < 0 || pu[0] >= state.rows || pu[1] < 0 || pu[1] >= state.cols)
+        return 0;
+    if (pv[0] < 0 || pv[0] >= state.rows || pv[1] < 0 || pv[1] >= state.cols)
+        return 0;
+    if ((state(p) & (STATE_COORD_VALID | STATE_LOC_VALID)) == 0)
+        return 0;
+    if ((state(pu) & (STATE_COORD_VALID | STATE_LOC_VALID)) == 0)
+        return 0;
+    if ((state(pv) & (STATE_COORD_VALID | STATE_LOC_VALID)) == 0)
+        return 0;
+    if (points(p)[0] == -1 || points(pu)[0] == -1 || points(pv)[0] == -1)
+        return 0;
+
+    problem.AddResidualBlock(
+        SymmetricDirichletLoss::Create(unit * stride, weight, 1e-8, 1e-2),
+        new ceres::CauchyLoss(1.0),
+        &points(p)[0],
+        &points(pu)[0],
+        &points(pv)[0]);
+
+    return 1;
+}
+
+static int add_surftrack_sdirlosses_3D(cv::Mat_<cv::Vec3d> &points, const cv::Vec2i &p, ceres::Problem &problem,
+    const cv::Mat_<uint8_t> &state, float unit)
+{
+    if (sdir_3d_radius < 1 || sdir_3d_w <= 0.0f)
+        return 0;
+
+    int count = 0;
+    for (int stride = 1; stride <= sdir_3d_radius; ++stride) {
+        count += add_surftrack_sdirloss_3D(points, p, stride, problem, state, unit);
+        count += add_surftrack_sdirloss_3D(points, p - cv::Vec2i(0, stride), stride, problem, state, unit);
+        count += add_surftrack_sdirloss_3D(points, p - cv::Vec2i(stride, 0), stride, problem, state, unit);
+    }
+
+    return count;
+}
+
 static int cond_surftrack_distloss_3D(int type, QuadSurface *sm, cv::Mat_<cv::Vec3d> &points, const cv::Vec2i &p, const cv::Vec2i &off,
     SurfTrackerData &data, ceres::Problem &problem, const cv::Mat_<uint8_t> &state, float unit, int flags = 0)
 {
@@ -559,6 +612,38 @@ static int cond_surftrack_distloss_3D(int type, QuadSurface *sm, cv::Mat_<cv::Ve
     int count = add_surftrack_distloss_3D(points, p, off, problem, state, unit, flags, &res);
 
     data.resId(id) = res;
+
+    return count;
+}
+
+static int cond_surftrack_sdirloss_3D(int type, QuadSurface *sm, cv::Mat_<cv::Vec3d> &points, const cv::Vec2i &p, int stride,
+    SurfTrackerData &data, ceres::Problem &problem, const cv::Mat_<uint8_t> &state, float unit)
+{
+    resId_t id(type, sm, p);
+    if (data.hasResId(id))
+        return 0;
+
+    const int count = add_surftrack_sdirloss_3D(points, p, stride, problem, state, unit, sdir_3d_global_w);
+    if (count) {
+        data.resId(id) = nullptr;
+    }
+
+    return count;
+}
+
+static int cond_surftrack_sdirlosses_3D(QuadSurface *sm, cv::Mat_<cv::Vec3d> &points, const cv::Vec2i &p,
+    SurfTrackerData &data, ceres::Problem &problem, const cv::Mat_<uint8_t> &state, float unit)
+{
+    if (sdir_3d_radius < 1 || sdir_3d_global_w <= 0.0f)
+        return 0;
+
+    int count = 0;
+    int type = 20;
+    for (int stride = 1; stride <= sdir_3d_radius; ++stride) {
+        count += cond_surftrack_sdirloss_3D(type++, sm, points, p, stride, data, problem, state, unit);
+        count += cond_surftrack_sdirloss_3D(type++, sm, points, p - cv::Vec2i(0, stride), stride, data, problem, state, unit);
+        count += cond_surftrack_sdirloss_3D(type++, sm, points, p - cv::Vec2i(stride, 0), stride, data, problem, state, unit);
+    }
 
     return count;
 }
@@ -701,6 +786,7 @@ static int surftrack_add_local(QuadSurface *sm, const cv::Vec2i& p, SurfTrackerD
         count += add_surftrack_distloss_3D(points, p, {1,-1}, problem, state, step*src_step, flags);
         count += add_surftrack_distloss_3D(points, p, {-1,1}, problem, state, step*src_step, flags);
         count += add_surftrack_distloss_3D(points, p, {-1,-1}, problem, state, step*src_step, flags);
+        count += add_surftrack_sdirlosses_3D(points, p, problem, state, step*src_step);
 
         //horizontal
         count_straight += add_surftrack_straightloss_3D(p, {0,-2},{0,-1},{0,0}, points, problem, state);
@@ -772,6 +858,7 @@ static int surftrack_add_global(QuadSurface *sm, const cv::Vec2i& p, SurfTracker
         count += cond_surftrack_distloss_3D(2, sm, points, p, {1,-1}, data, problem, state, step, flags);
         count += cond_surftrack_distloss_3D(3, sm, points, p, {-1,1}, data, problem, state, step, flags);
         count += cond_surftrack_distloss_3D(3, sm, points, p, {-1,-1}, data, problem, state, step, flags);
+        count += cond_surftrack_sdirlosses_3D(sm, points, p, data, problem, state, step);
 
         //horizontal
         count += cond_surftrack_straightloss_3D(4, sm, p, {0,-2},{0,-1},{0,0}, points, data, problem, state, flags);
@@ -848,6 +935,85 @@ static double local_cost_destructive(QuadSurface *sm, const cv::Vec2i& p, SurfTr
         return 0;
     else
         return sqrt(test_loss/count);
+}
+
+
+static bool candidate_coord_at(const cv::Vec2i& candidate_p, const cv::Vec3d& candidate_coord,
+    const cv::Vec2i& p, const cv::Mat_<uint8_t>& state, const cv::Mat_<cv::Vec3d>& points, cv::Vec3d& out)
+{
+    if (p[0] < 0 || p[0] >= state.rows || p[1] < 0 || p[1] >= state.cols)
+        return false;
+    if (p == candidate_p) {
+        out = candidate_coord;
+        return out[0] != -1;
+    }
+    if ((state(p) & (STATE_LOC_VALID | STATE_COORD_VALID)) == 0)
+        return false;
+    if (points(p)[0] == -1)
+        return false;
+
+    out = points(p);
+    return true;
+}
+
+static bool candidate_sdir_residual(const cv::Vec2i& candidate_p, const cv::Vec3d& candidate_coord,
+    const cv::Vec2i& origin, int stride, const cv::Mat_<uint8_t>& state, const cv::Mat_<cv::Vec3d>& points,
+    float unit, double& residual)
+{
+    cv::Vec3d p;
+    cv::Vec3d pu;
+    cv::Vec3d pv;
+    if (!candidate_coord_at(candidate_p, candidate_coord, origin, state, points, p))
+        return false;
+    if (!candidate_coord_at(candidate_p, candidate_coord, origin + cv::Vec2i(0, stride), state, points, pu))
+        return false;
+    if (!candidate_coord_at(candidate_p, candidate_coord, origin + cv::Vec2i(stride, 0), state, points, pv))
+        return false;
+
+    const double scaled_unit = static_cast<double>(unit) * static_cast<double>(stride);
+    if (scaled_unit <= 0.0)
+        return false;
+
+    const cv::Vec3d eu = (pu - p) / scaled_unit;
+    const cv::Vec3d ev = (pv - p) / scaled_unit;
+
+    const double a = eu.dot(eu);
+    const double c = ev.dot(ev);
+    const double b = eu.dot(ev);
+    const double trG = a + c;
+    const double detG = a * c - b * b;
+    const double det_safe = detG + 1e-8 + 1e-2 * trG;
+    if (det_safe <= 0.0)
+        return false;
+
+    const double energy = trG + trG / det_safe;
+    residual = std::abs(energy - 4.0);
+    return true;
+}
+
+static bool local_metric_consistent(const cv::Vec2i& p, const cv::Vec3d& coord,
+    const cv::Mat_<uint8_t>& state, const cv::Mat_<cv::Vec3d>& points, float step, float src_step)
+{
+    if (sdir_3d_radius < 1 || sdir_3d_candidate_max <= 0.0f)
+        return true;
+
+    const float unit = step * src_step;
+    for (int stride = 1; stride <= sdir_3d_radius; ++stride) {
+        const cv::Vec2i origins[] = {
+            p,
+            p - cv::Vec2i(0, stride),
+            p - cv::Vec2i(stride, 0)
+        };
+        for (const cv::Vec2i& origin : origins) {
+            double residual = 0.0;
+            if (!candidate_sdir_residual(p, coord, origin, stride, state, points, unit, residual))
+                continue;
+            if (residual > static_cast<double>(sdir_3d_candidate_max))
+                return false;
+        }
+    }
+
+    return true;
 }
 
 
@@ -1368,6 +1534,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     z_loc_loss_w = params.value("z_loc_loss_w", 0.1f);                  // Weight for Z location loss constraints
     dist_loss_2d_w = params.value("dist_loss_2d_w", 1.0f);              // Weight for 2D distance constraints
     dist_loss_3d_w = params.value("dist_loss_3d_w", 2.0f);              // Weight for 3D distance constraints
+    sdir_3d_radius = params.value("sdir_3d_radius", 2);
+    sdir_3d_w = params.value("sdir_3d_w", 0.5f);
+    sdir_3d_global_w = params.value("sdir_3d_global_w", 0.5f * sdir_3d_w);
+    sdir_3d_candidate_max = params.value("sdir_3d_candidate_max", 4.0f);
     straight_min_count = params.value("straight_min_count", 1.0f);      // Minimum number of straight constraints
     inlier_base_threshold = params.value("inlier_base_threshold", 20);  // Starting threshold for inliers
 
@@ -1409,6 +1579,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::cout << "  z_loc_loss_w: " << z_loc_loss_w << std::endl;
     std::cout << "  dist_loss_2d_w: " << dist_loss_2d_w << std::endl;
     std::cout << "  dist_loss_3d_w: " << dist_loss_3d_w << std::endl;
+    std::cout << "  sdir_3d_radius: " << sdir_3d_radius << std::endl;
+    std::cout << "  sdir_3d_w: " << sdir_3d_w << std::endl;
+    std::cout << "  sdir_3d_global_w: " << sdir_3d_global_w << std::endl;
+    std::cout << "  sdir_3d_candidate_max: " << sdir_3d_candidate_max << std::endl;
     std::cout << "  use_patch_cache: "
               << (use_patch_cache ? "true" : "false") << std::endl;
     if (external_surface_patch_index) {
@@ -1589,38 +1763,78 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         const int extra = std::max(0, p.value(key, 0));
         return (extra + grid_step - 1) / grid_step;
     };
-    const int grow_extra_rows_lr = requested_extra_lr("grow_extra_rows", params);
-    const int grow_extra_cols_lr = requested_extra_lr("grow_extra_cols", params);
+    const int grow_initial_extra_rows_lr = requested_extra_lr("grow_extra_rows", params);
+    const int grow_initial_extra_cols_lr = requested_extra_lr("grow_extra_cols", params);
+    const int grow_max_extra_rows_lr = std::max(
+        grow_initial_extra_rows_lr,
+        params.contains("grow_max_extra_rows")
+            ? requested_extra_lr("grow_max_extra_rows", params)
+            : grow_initial_extra_rows_lr);
+    const int grow_max_extra_cols_lr = std::max(
+        grow_initial_extra_cols_lr,
+        params.contains("grow_max_extra_cols")
+            ? requested_extra_lr("grow_max_extra_cols", params)
+            : grow_initial_extra_cols_lr);
 
     int grid_limit_w = std::numeric_limits<int>::max();
     int grid_limit_h = std::numeric_limits<int>::max();
     cv::Point resume_origin(grid_margin, grid_margin);
+    cv::Rect resume_grid_bounds;
+    int expanded_left = 0;
+    int expanded_right = 0;
+    int expanded_up = 0;
+    int expanded_down = 0;
+    int max_extra_left = std::numeric_limits<int>::max();
+    int max_extra_right = std::numeric_limits<int>::max();
+    int max_extra_up = std::numeric_limits<int>::max();
+    int max_extra_down = std::numeric_limits<int>::max();
     if (resume_growth) {
         const int resume_cols = (seed_points.cols + grid_step - 1) / grid_step + 1;
         const int resume_rows = (seed_points.rows + grid_step - 1) / grid_step + 1;
-        const int extra_left = grow_left ? grow_extra_cols_lr : 0;
-        const int extra_right = grow_right ? grow_extra_cols_lr : 0;
-        const int extra_up = grow_up ? grow_extra_rows_lr : 0;
-        const int extra_down = grow_down ? grow_extra_rows_lr : 0;
+        const int extra_left = grow_left ? grow_initial_extra_cols_lr : 0;
+        const int extra_right = grow_right ? grow_initial_extra_cols_lr : 0;
+        const int extra_up = grow_up ? grow_initial_extra_rows_lr : 0;
+        const int extra_down = grow_down ? grow_initial_extra_rows_lr : 0;
+        expanded_left = extra_left;
+        expanded_right = extra_right;
+        expanded_up = extra_up;
+        expanded_down = extra_down;
+        max_extra_left = grow_left ? grow_max_extra_cols_lr : 0;
+        max_extra_right = grow_right ? grow_max_extra_cols_lr : 0;
+        max_extra_up = grow_up ? grow_max_extra_rows_lr : 0;
+        max_extra_down = grow_down ? grow_max_extra_rows_lr : 0;
         resume_origin = cv::Point(grid_margin + extra_left, grid_margin + extra_up);
-        grid_limit_w = grid_margin + extra_left + resume_cols + extra_right + grid_margin;
-        grid_limit_h = grid_margin + extra_up + resume_rows + extra_down + grid_margin;
+        grid_limit_w = grid_margin + max_extra_left + resume_cols + max_extra_right + grid_margin;
+        grid_limit_h = grid_margin + max_extra_up + resume_rows + max_extra_down + grid_margin;
         w = std::max(1, grid_limit_w);
         h = std::max(1, grid_limit_h);
+        if (extra_left != max_extra_left || extra_right != max_extra_right) {
+            w = std::max(1, grid_margin + extra_left + resume_cols + extra_right + grid_margin);
+        }
+        if (extra_up != max_extra_up || extra_down != max_extra_down) {
+            h = std::max(1, grid_margin + extra_up + resume_rows + extra_down + grid_margin);
+        }
+        resume_grid_bounds = cv::Rect(resume_origin.x, resume_origin.y, resume_cols, resume_rows);
         std::cout << "resume_growth: true, source grid " << seed_points.size()
                   << " low-res " << cv::Size(resume_cols, resume_rows)
                   << " origin " << resume_origin
                   << " bounds " << cv::Size(w, h)
-                  << " extra_lr left=" << extra_left
+                  << " initial_extra_lr left=" << extra_left
                   << " right=" << extra_right
                   << " up=" << extra_up
-                  << " down=" << extra_down << std::endl;
+                  << " down=" << extra_down
+                  << " max_extra_lr left=" << max_extra_left
+                  << " right=" << max_extra_right
+                  << " up=" << max_extra_up
+                  << " down=" << max_extra_down << std::endl;
     }
     cv::Size size = {w,h};
     cv::Rect bounds(0,0,w-1,h-1);
     cv::Rect save_bounds_inv(closing_r+5,closing_r+5,h-closing_r-10,w-closing_r-10);
     cv::Rect active_bounds(closing_r+5,closing_r+5,w-closing_r-10,h-closing_r-10);
     cv::Rect static_bounds(0,0,0,h);
+    const bool constrain_to_resume_grid =
+        disable_grid_expansion && resume_growth && resume_grid_bounds.area() > 0;
 
     int x0 = w/2;
     int y0 = h/2;
@@ -1853,6 +2067,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     cv::Mat_<uint16_t> best_generations = generations.clone();
     SurfTrackerData best_data = data;
     cv::Rect best_used_area = used_area;
+    int best_expanded_left = expanded_left;
+    int best_expanded_up = expanded_up;
 
     auto save_best_surface = [&](int count) {
         best_loc_valid_count = count;
@@ -1861,6 +2077,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         best_generations = generations.clone();
         best_data = data;
         best_used_area = used_area;
+        best_expanded_left = expanded_left;
+        best_expanded_up = expanded_up;
     };
 
     std::vector<SurfTrackerData> data_ths(omp_get_max_threads());
@@ -2141,6 +2359,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
                 for(const auto& n : neighs) {
                     cv::Vec2i pn = p+n;
+                    if (constrain_to_resume_grid &&
+                        !resume_grid_bounds.contains(cv::Point(pn[1], pn[0]))) {
+                        continue;
+                    }
                     if (save_bounds_inv.contains(cv::Point(pn))
                         && (state(pn) & STATE_PROCESSING) == 0
                         && (state(pn) & STATE_LOC_VALID) == 0)
@@ -2260,6 +2482,11 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
                 state(p) = 0;
 
+                if (!local_metric_consistent(p, coord, state, points, step, src_step)) {
+                    data_th.erase(ref_surf, p);
+                    continue;
+                }
+
                 int inliers_sum = 0;
                 int inliers_count = 0;
 
@@ -2331,6 +2558,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             {
                 if (enforce_z_range && (best_coord[2] < z_min || best_coord[2] > z_max)) {
                     // Final guard: reject best candidate outside z-range
+                    best_inliers = -1;
+                    best_ref_seed = false;
+                } else if (!local_metric_consistent(p, best_coord, state, points, step, src_step)) {
                     best_inliers = -1;
                     best_ref_seed = false;
                 } else {
@@ -2614,17 +2844,31 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         const int max_grid_extent = std::max(1, static_cast<int>(max_width / step));
         const int max_grid_w = std::min(max_grid_extent, grid_limit_w);
         const int max_grid_h = std::min(max_grid_extent, grid_limit_h);
-        const bool can_expand_left = !disable_grid_expansion && grow_left && w < max_grid_w;
-        const bool can_expand_right = !disable_grid_expansion && grow_right && w < max_grid_w;
-        const bool can_expand_up = !disable_grid_expansion && grow_up && h < max_grid_h;
-        const bool can_expand_down = !disable_grid_expansion && grow_down && h < max_grid_h;
+        const auto remaining_extra = [](int max_extra, int expanded) {
+            if (max_extra == std::numeric_limits<int>::max()) {
+                return std::numeric_limits<int>::max();
+            }
+            return std::max(0, max_extra - expanded);
+        };
+        const int remaining_left = remaining_extra(max_extra_left, expanded_left);
+        const int remaining_right = remaining_extra(max_extra_right, expanded_right);
+        const int remaining_up = remaining_extra(max_extra_up, expanded_up);
+        const int remaining_down = remaining_extra(max_extra_down, expanded_down);
+        const bool can_expand_left = !disable_grid_expansion && grow_left && remaining_left > 0 && w < max_grid_w;
+        const bool can_expand_right = !disable_grid_expansion && grow_right && remaining_right > 0 && w < max_grid_w;
+        const bool can_expand_up = !disable_grid_expansion && grow_up && remaining_up > 0 && h < max_grid_h;
+        const bool can_expand_down = !disable_grid_expansion && grow_down && remaining_down > 0 && h < max_grid_h;
         if (fringe.empty() && (can_expand_left || can_expand_right || can_expand_up || can_expand_down))
         {
             at_right_border = false;
-            const int add_left = can_expand_left ? std::min(sliding_w, max_grid_w - w) : 0;
-            const int add_right = can_expand_right ? std::min(sliding_w, max_grid_w - w - add_left) : 0;
-            const int add_up = can_expand_up ? std::min(sliding_w, max_grid_h - h) : 0;
-            const int add_down = can_expand_down ? std::min(sliding_w, max_grid_h - h - add_up) : 0;
+            int width_capacity = max_grid_w - w;
+            int height_capacity = max_grid_h - h;
+            const int add_left = can_expand_left ? std::min({sliding_w, remaining_left, width_capacity}) : 0;
+            width_capacity -= add_left;
+            const int add_right = can_expand_right ? std::min({sliding_w, remaining_right, width_capacity}) : 0;
+            const int add_up = can_expand_up ? std::min({sliding_w, remaining_up, height_capacity}) : 0;
+            height_capacity -= add_up;
+            const int add_down = can_expand_down ? std::min({sliding_w, remaining_down, height_capacity}) : 0;
             const int new_w = w + add_left + add_right;
             const int new_h = h + add_up + add_down;
             if (new_w == w && new_h == h) {
@@ -2639,6 +2883,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             final_opts = global_steps_per_window;
             w = new_w;
             h = new_h;
+            expanded_left += add_left;
+            expanded_right += add_right;
+            expanded_up += add_up;
+            expanded_down += add_down;
             size = {w,h};
             bounds = {0,0,w-1,h-1};
             save_bounds_inv = {closing_r+5,closing_r+5,h-closing_r-10,w-closing_r-10};
@@ -2752,6 +3000,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         data = best_data;
         used_area = best_used_area;
         used_area_hr = scaled_rect_trunc(used_area, step);
+        expanded_left = best_expanded_left;
+        expanded_up = best_expanded_up;
         loc_valid_count = best_loc_valid_count;
     } else {
         loc_valid_count = final_loc_valid_count;
@@ -2771,6 +3021,14 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     surf->meta["area_vx2"] = static_cast<double>(area_est_vx2);
     surf->meta["area_cm2"] = static_cast<double>(area_est_cm2);
     surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
+    if (resume_growth) {
+        const int offset_col = grid_margin + expanded_left - used_area.x;
+        const int offset_row = grid_margin + expanded_up - used_area.y;
+        auto off_arr = utils::Json::array();
+        off_arr.push_back(offset_col);
+        off_arr.push_back(offset_row);
+        surf->meta["grid_offset"] = std::move(off_arr);
+    }
 
     return surf;
 }

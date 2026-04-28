@@ -20,6 +20,7 @@ Q_LOGGING_CATEGORY(lcAxisSlices2, "vc.axis_aligned");
 namespace
 {
 constexpr float kAxisRotationDegreesPerScenePixel = 0.25f;
+constexpr float kMaxTiltDegrees = 45.0f;
 constexpr float kEpsilon = 1e-6f;
 constexpr float kDegToRad = static_cast<float>(CV_PI / 180.0);
 constexpr int kRotationApplyDelayMs = 25;
@@ -33,6 +34,18 @@ cv::Vec3f rotateAroundZ(const cv::Vec3f& v, float radians)
         v[0] * s + v[1] * c,
         v[2]
     };
+}
+
+cv::Vec3f rotateAroundAxis(const cv::Vec3f& v, const cv::Vec3f& axis, float radians)
+{
+    const float axisMagnitude = cv::norm(axis);
+    if (axisMagnitude <= kEpsilon) {
+        return v;
+    }
+    const cv::Vec3f a = axis * (1.0f / axisMagnitude);
+    const float c = std::cos(radians);
+    const float s = std::sin(radians);
+    return v * c + a.cross(v) * s + a * (a.dot(v) * (1.0f - c));
 }
 
 cv::Vec3f projectVectorOntoPlane(const cv::Vec3f& v, const cv::Vec3f& normal)
@@ -83,6 +96,9 @@ void AxisAlignedSliceController::setEnabled(bool enabled, QCheckBox* overlayChec
     if (enabled) {
         _segXZRotationDeg = 0.0f;
         _segYZRotationDeg = 0.0f;
+        _xyTilt = QPointF(0.0, 0.0);
+        _segXZTilt = 0.0;
+        _segYZTilt = 0.0;
     }
     _drags.clear();
     qCDebug(lcAxisSlices2) << "Axis-aligned slices" << (enabled ? "enabled" : "disabled");
@@ -104,6 +120,44 @@ void AxisAlignedSliceController::resetRotations()
     _segXZRotationDeg = 0.0f;
     _segYZRotationDeg = 0.0f;
     applyOrientation();
+}
+
+void AxisAlignedSliceController::resetTilt()
+{
+    _xyTilt = QPointF(0.0, 0.0);
+    _segXZTilt = 0.0;
+    _segYZTilt = 0.0;
+    applyOrientation();
+}
+
+void AxisAlignedSliceController::onTiltHandleChanged(CTiledVolumeViewer* viewer, QPointF tilt)
+{
+    if (!_enabled || !viewer) {
+        return;
+    }
+
+    const std::string surfaceName = viewer->surfName();
+    if (surfaceName == "xy plane") {
+        const double len = std::hypot(tilt.x(), tilt.y());
+        if (len > 1.0) {
+            tilt /= len;
+        }
+        _xyTilt = tilt;
+    } else if (surfaceName == "seg xz") {
+        _segXZTilt = std::clamp(tilt.x(), -1.0, 1.0);
+    } else if (surfaceName == "seg yz") {
+        _segYZTilt = std::clamp(tilt.y(), -1.0, 1.0);
+    } else {
+        return;
+    }
+
+    scheduleOrientationUpdate();
+    updateTiltHandles();
+}
+
+void AxisAlignedSliceController::onTiltHandleReset()
+{
+    resetTilt();
 }
 
 void AxisAlignedSliceController::onMousePress(CTiledVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButton button, Qt::KeyboardModifiers)
@@ -177,10 +231,24 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
     POI* focus = _state->poi("focus");
     cv::Vec3f origin = focus ? focus->p : cv::Vec3f(0, 0, 0);
 
+    auto xyNormalFromTilt = [this]() {
+        const double tiltLen = _enabled ? std::min(1.0, std::hypot(_xyTilt.x(), _xyTilt.y())) : 0.0;
+        if (tiltLen <= kEpsilon) {
+            return cv::Vec3f(0.0f, 0.0f, 1.0f);
+        }
+
+        const float angle = static_cast<float>(tiltLen) * kMaxTiltDegrees * kDegToRad;
+        const cv::Vec3f axis = normalizeOrZero(cv::Vec3f(static_cast<float>(_xyTilt.y()),
+                                                         static_cast<float>(-_xyTilt.x()),
+                                                         0.0f));
+        return normalizeOrZero(rotateAroundAxis({0.0f, 0.0f, 1.0f}, axis, angle));
+    };
+
     // Helper to configure a plane with optional yaw rotation
     const auto configurePlane = [&](const std::string& planeName,
                                     const cv::Vec3f& baseNormal,
-                                    float yawDeg = 0.0f) {
+                                    float yawDeg = 0.0f,
+                                    double tilt = 0.0) {
         auto planeShared = std::dynamic_pointer_cast<PlaneSurface>(_state->surface(planeName));
         if (!planeShared) {
             planeShared = std::make_shared<PlaneSurface>();
@@ -189,30 +257,48 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
         planeShared->setOrigin(origin);
         planeShared->setInPlaneRotation(0.0f);
 
-        // Apply yaw rotation if set
-        cv::Vec3f rotatedNormal;
+        cv::Vec3f rotatedNormal = baseNormal;
         if (std::abs(yawDeg) > 0.001f) {
             const float radians = yawDeg * kDegToRad;
             rotatedNormal = rotateAroundZ(baseNormal, radians);
-        } else {
-            rotatedNormal = baseNormal;
+        }
+
+        if (_enabled && std::abs(tilt) > kEpsilon) {
+            const cv::Vec3f horizontalNormal(rotatedNormal[0], rotatedNormal[1], 0.0f);
+            const cv::Vec3f tiltAxis = normalizeOrZero(horizontalNormal.cross({0.0f, 0.0f, 1.0f}));
+            if (cv::norm(tiltAxis) > kEpsilon) {
+                const float radians = static_cast<float>(tilt) * kMaxTiltDegrees * kDegToRad;
+                rotatedNormal = normalizeOrZero(rotateAroundAxis(rotatedNormal, tiltAxis, radians));
+            }
         }
 
         planeShared->setNormal(rotatedNormal);
 
-        // Adjust in-plane rotation so "up" is aligned with volume Z when possible
-        const cv::Vec3f upAxis(0.0f, 0.0f, 1.0f);
-        const cv::Vec3f projectedUp = projectVectorOntoPlane(upAxis, rotatedNormal);
-        const cv::Vec3f desiredUp = normalizeOrZero(projectedUp);
-
-        if (cv::norm(desiredUp) > kEpsilon) {
-            const cv::Vec3f currentUp = planeShared->basisY();
-            const float delta = signedAngleBetween(currentUp, desiredUp, rotatedNormal);
-            if (std::abs(delta) > kEpsilon) {
-                planeShared->setInPlaneRotation(delta);
+        if (planeName == "xy plane") {
+            const cv::Vec3f projectedRight = projectVectorOntoPlane({1.0f, 0.0f, 0.0f}, rotatedNormal);
+            const cv::Vec3f desiredRight = normalizeOrZero(projectedRight);
+            if (cv::norm(desiredRight) > kEpsilon) {
+                const cv::Vec3f currentRight = planeShared->basisX();
+                const float delta = signedAngleBetween(currentRight, desiredRight, rotatedNormal);
+                if (std::abs(delta) > kEpsilon) {
+                    planeShared->setInPlaneRotation(delta);
+                }
             }
         } else {
-            planeShared->setInPlaneRotation(0.0f);
+            // Adjust in-plane rotation so "up" is aligned with volume Z when possible.
+            const cv::Vec3f upAxis(0.0f, 0.0f, 1.0f);
+            const cv::Vec3f projectedUp = projectVectorOntoPlane(upAxis, rotatedNormal);
+            const cv::Vec3f desiredUp = normalizeOrZero(projectedUp);
+
+            if (cv::norm(desiredUp) > kEpsilon) {
+                const cv::Vec3f currentUp = planeShared->basisY();
+                const float delta = signedAngleBetween(currentUp, desiredUp, rotatedNormal);
+                if (std::abs(delta) > kEpsilon) {
+                    planeShared->setInPlaneRotation(delta);
+                }
+            } else {
+                planeShared->setInPlaneRotation(0.0f);
+            }
         }
 
         _state->setSurface(planeName, planeShared);
@@ -220,15 +306,16 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
     };
 
     // Always update the XY plane
-    auto xyPlane = configurePlane("xy plane", cv::Vec3f(0.0f, 0.0f, 1.0f));
+    auto xyPlane = configurePlane("xy plane", xyNormalFromTilt());
 
     if (_enabled) {
-        auto segXZShared = configurePlane("seg xz", cv::Vec3f(0.0f, 1.0f, 0.0f), _segXZRotationDeg);
-        auto segYZShared = configurePlane("seg yz", cv::Vec3f(1.0f, 0.0f, 0.0f), _segYZRotationDeg);
+        auto segXZShared = configurePlane("seg xz", {0.0f, 1.0f, 0.0f}, _segXZRotationDeg, _segXZTilt);
+        auto segYZShared = configurePlane("seg yz", {1.0f, 0.0f, 0.0f}, _segYZRotationDeg, _segYZTilt);
 
         if (_planeSlicingOverlay) {
             _planeSlicingOverlay->refreshAll();
         }
+        updateTiltHandles();
         return;
     } else {
         QuadSurface* segment = nullptr;
@@ -272,6 +359,7 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
         if (_planeSlicingOverlay) {
             _planeSlicingOverlay->refreshAll();
         }
+        updateTiltHandles();
         return;
     }
 }
@@ -363,5 +451,45 @@ void AxisAlignedSliceController::updateSliceInteraction()
             qCDebug(lcAxisSlices2) << "Middle-button pan set" << QString::fromStdString(name)
                                    << "enabled" << viewer->fGraphicsView->middleButtonPanEnabled();
         }
+    });
+    updateTiltHandles();
+}
+
+void AxisAlignedSliceController::updateTiltHandles()
+{
+    if (!_viewerManager) {
+        return;
+    }
+
+    _viewerManager->forEachViewer([this](CTiledVolumeViewer* viewer) {
+        if (!viewer || !viewer->fGraphicsView) {
+            return;
+        }
+
+        if (!viewer->fGraphicsView->property("vc_tilt_handle_bound").toBool()) {
+            connect(viewer->fGraphicsView, &CVolumeViewerView::sendTiltHandleChanged,
+                    this, [this, viewer](QPointF tilt) {
+                        onTiltHandleChanged(viewer, tilt);
+                    });
+            connect(viewer->fGraphicsView, &CVolumeViewerView::sendTiltHandleReset,
+                    this, [this]() {
+                        onTiltHandleReset();
+                    });
+            viewer->fGraphicsView->setProperty("vc_tilt_handle_bound", true);
+        }
+
+        const std::string& name = viewer->surfName();
+        auto mode = CVolumeViewerView::TiltHandleMode::Hidden;
+        QPointF value = _xyTilt;
+        if (_enabled && name == "xy plane") {
+            mode = CVolumeViewerView::TiltHandleMode::Square;
+        } else if (_enabled && name == "seg xz") {
+            mode = CVolumeViewerView::TiltHandleMode::SemiCircleX;
+            value = QPointF(_segXZTilt, 0.0);
+        } else if (_enabled && name == "seg yz") {
+            mode = CVolumeViewerView::TiltHandleMode::SemiCircleY;
+            value = QPointF(0.0, _segYZTilt);
+        }
+        viewer->fGraphicsView->setTiltHandle(mode, value);
     });
 }

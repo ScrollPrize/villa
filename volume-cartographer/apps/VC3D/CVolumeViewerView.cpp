@@ -6,6 +6,7 @@
 #include <QPainter>
 #include <QScrollBar>
 #include <cmath>
+#include <algorithm>
 
 
 
@@ -70,6 +71,8 @@ void CVolumeViewerView::drawForeground(QPainter* p, const QRectF& sceneRect)
     p->drawLine(M, bottom, static_cast<int>(M + _cachedBarPx), bottom);
     p->drawText(M, bottom - 5, _cachedBarLabel);
     p->restore();
+
+    drawTiltHandle(p);
 }
 
 CVolumeViewerView::CVolumeViewerView(QWidget* parent) : QGraphicsView(parent)
@@ -79,6 +82,105 @@ CVolumeViewerView::CVolumeViewerView(QWidget* parent) : QGraphicsView(parent)
         viewport()->setMouseTracking(true);
     }
 };
+
+void CVolumeViewerView::setTiltHandle(TiltHandleMode mode, QPointF tilt)
+{
+    _tiltHandleMode = mode;
+    _tiltHandleValue = tilt;
+    if (_tiltHandleMode == TiltHandleMode::SemiCircleX) {
+        _tiltHandleValue.setY(0.0);
+    } else if (_tiltHandleMode == TiltHandleMode::SemiCircleY) {
+        _tiltHandleValue.setX(0.0);
+    }
+    update();
+}
+
+QRectF CVolumeViewerView::tiltHandleRect() const
+{
+    constexpr double kSize = 46.0;
+    constexpr double kMargin = 14.0;
+    return QRectF(viewport()->width() - kSize - kMargin,
+                  viewport()->height() - kSize - kMargin,
+                  kSize,
+                  kSize);
+}
+
+bool CVolumeViewerView::pointInTiltHandle(const QPointF& viewportPos) const
+{
+    if (_tiltHandleMode == TiltHandleMode::Hidden) {
+        return false;
+    }
+    return tiltHandleRect().adjusted(-5.0, -5.0, 5.0, 5.0).contains(viewportPos);
+}
+
+QPointF CVolumeViewerView::tiltFromHandlePos(const QPointF& viewportPos) const
+{
+    const QRectF r = tiltHandleRect();
+    const QPointF c = r.center();
+    const double radius = r.width() * 0.38;
+    const double nx = std::clamp((viewportPos.x() - c.x()) / radius, -1.0, 1.0);
+    const double ny = std::clamp((viewportPos.y() - c.y()) / radius, -1.0, 1.0);
+
+    if (_tiltHandleMode == TiltHandleMode::Square) {
+        const double len = std::hypot(nx, ny);
+        if (len > 1.0) {
+            return QPointF(nx / len, ny / len);
+        }
+        return QPointF(nx, ny);
+    }
+
+    if (_tiltHandleMode == TiltHandleMode::SemiCircleX) {
+        return QPointF(nx, 0.0);
+    }
+    if (_tiltHandleMode == TiltHandleMode::SemiCircleY) {
+        return QPointF(0.0, nx);
+    }
+    return QPointF(0.0, 0.0);
+}
+
+void CVolumeViewerView::drawTiltHandle(QPainter* p) const
+{
+    if (_tiltHandleMode == TiltHandleMode::Hidden) {
+        return;
+    }
+
+    p->save();
+    p->resetTransform();
+    p->setRenderHint(QPainter::Antialiasing);
+
+    const QRectF r = tiltHandleRect();
+    const QPointF c = r.center();
+    const double radius = r.width() * 0.38;
+
+    QPen cyan(QColor(0, 220, 255), 1.6, Qt::DashLine);
+    cyan.setCosmetic(true);
+    p->setPen(cyan);
+    p->setBrush(Qt::NoBrush);
+
+    QPointF dot = c;
+    if (_tiltHandleMode == TiltHandleMode::Square) {
+        const QRectF box(c.x() - radius, c.y() - radius, radius * 2.0, radius * 2.0);
+        p->drawRect(box);
+        dot = QPointF(c.x() + _tiltHandleValue.x() * radius,
+                      c.y() + _tiltHandleValue.y() * radius);
+    } else {
+        const QRectF arc(c.x() - radius, c.y() - radius, radius * 2.0, radius * 2.0);
+        p->drawArc(arc, 0, 180 * 16);
+        const double v = _tiltHandleMode == TiltHandleMode::SemiCircleX
+            ? _tiltHandleValue.x()
+            : _tiltHandleValue.y();
+        const double clamped = std::clamp(v, -1.0, 1.0);
+        constexpr double kPi = 3.14159265358979323846;
+        const double theta = (1.0 - clamped) * kPi * 0.5;
+        dot = QPointF(c.x() + std::cos(theta) * radius,
+                      c.y() - std::sin(theta) * radius);
+    }
+
+    p->setPen(QPen(QColor(40, 28, 0), 1.0));
+    p->setBrush(QColor(255, 214, 42));
+    p->drawEllipse(dot, 4.0, 4.0);
+    p->restore();
+}
 
 void CVolumeViewerView::drawBackground(QPainter* painter, const QRectF& /*rect*/)
 {
@@ -118,6 +220,16 @@ void CVolumeViewerView::wheelEvent(QWheelEvent *event)
 
 void CVolumeViewerView::mouseReleaseEvent(QMouseEvent *event)
 {
+    if (_tiltHandleDragging) {
+        if (event->button() == Qt::LeftButton) {
+            emit sendTiltHandleChanged(tiltFromHandlePos(event->position()));
+            _tiltHandleDragging = false;
+            unsetCursor();
+            event->accept();
+            return;
+        }
+    }
+
     if (event->button() == Qt::MiddleButton)
     {
         if (_middleButtonPanEnabled)
@@ -204,6 +316,14 @@ void CVolumeViewerView::keyReleaseEvent(QKeyEvent *event)
 
 void CVolumeViewerView::mousePressEvent(QMouseEvent *event)
 {
+    if (event->button() == Qt::LeftButton && pointInTiltHandle(event->position())) {
+        _tiltHandleDragging = true;
+        setCursor(Qt::CrossCursor);
+        emit sendTiltHandleChanged(tiltFromHandlePos(event->position()));
+        event->accept();
+        return;
+    }
+
     if (event->button() == Qt::MiddleButton)
     {
         if (_middleButtonPanEnabled)
@@ -254,6 +374,17 @@ void CVolumeViewerView::mousePressEvent(QMouseEvent *event)
     event->ignore();
 }
 
+void CVolumeViewerView::mouseDoubleClickEvent(QMouseEvent *event)
+{
+    if (event->button() == Qt::LeftButton && pointInTiltHandle(event->position())) {
+        _tiltHandleDragging = false;
+        emit sendTiltHandleReset();
+        event->accept();
+        return;
+    }
+    QGraphicsView::mouseDoubleClickEvent(event);
+}
+
 void CVolumeViewerView::resizeEvent(QResizeEvent *event)
 {
     // Base class first so viewport()->size() reflects the new dimensions.
@@ -266,6 +397,12 @@ void CVolumeViewerView::resizeEvent(QResizeEvent *event)
 
 void CVolumeViewerView::mouseMoveEvent(QMouseEvent *event)
 {
+    if (_tiltHandleDragging) {
+        emit sendTiltHandleChanged(tiltFromHandlePos(event->position()));
+        event->accept();
+        return;
+    }
+
     if (_regular_pan)
     {
         if (!_scrollPanDisabled) {

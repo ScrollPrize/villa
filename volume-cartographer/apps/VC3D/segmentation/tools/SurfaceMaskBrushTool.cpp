@@ -1,6 +1,7 @@
 #include "SurfaceMaskBrushTool.hpp"
 
 #include "../SegmentationModule.hpp"
+#include "SegmentationEditManager.hpp"
 #include "../../ViewerManager.hpp"
 
 #include <QCoreApplication>
@@ -9,10 +10,8 @@
 #include <algorithm>
 #include <cmath>
 #include <exception>
-#include <filesystem>
 
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Tiff.hpp"
 
 Q_LOGGING_CATEGORY(lcSurfaceMaskBrush, "vc.segmentation.surfacemask")
 
@@ -255,8 +254,12 @@ void SurfaceMaskBrushTool::finishStroke()
     _strokeActive = false;
     _lastGrid.reset();
     fillEnclosedStrokeArea();
-    applyPendingCells();
-    persistMask();
+    const cv::Rect changedRegion = applyPendingCells();
+    if (_module.hasActiveSession() && _module.activeBaseSurface() == _surface && !changedRegion.empty()) {
+        _module._editManager->applyExternalSurfaceUpdate(changedRegion);
+    }
+    refreshSurfacePatchIndex(changedRegion);
+    persistSurface();
     _paintedCells.clear();
     _pendingCells.clear();
     _strokeGridPoints.clear();
@@ -455,7 +458,7 @@ void SurfaceMaskBrushTool::fillEnclosedStrokeArea()
     }
 }
 
-void SurfaceMaskBrushTool::persistMask()
+void SurfaceMaskBrushTool::persistSurface()
 {
     if (!_surface || _mask.empty()) {
         return;
@@ -465,36 +468,45 @@ void SurfaceMaskBrushTool::persistMask()
 
     if (_surface->path.empty()) {
         Q_EMIT _module.statusMessageRequested(
-            QCoreApplication::translate("SurfaceMaskBrushTool", "Cannot save mask: surface has no tifxyz path."),
+            QCoreApplication::translate("SurfaceMaskBrushTool", "Cannot save surface: surface has no tifxyz path."),
             kStatusMedium);
         return;
     }
 
+    if (_module.hasActiveSession()) {
+        _module.emitPendingChanges();
+        _module.markAutosaveNeeded(true);
+        return;
+    }
+
     try {
-        const std::filesystem::path maskPath = _surface->path / "mask.tif";
-        writeTiff(maskPath, _mask, -1, 1024, 1024, -1.0f, COMPRESSION_LZW, _surface->dpi());
-        _surface->refreshMaskTimestamp();
+        _surface->saveOverwrite();
         Q_EMIT _module.statusMessageRequested(
-            QCoreApplication::translate("SurfaceMaskBrushTool", "Saved mask.tif."),
+            QCoreApplication::translate("SurfaceMaskBrushTool", "Saved surface."),
             kStatusShort);
     } catch (const std::exception& e) {
-        qCWarning(lcSurfaceMaskBrush) << "Failed to save mask.tif:" << e.what();
+        qCWarning(lcSurfaceMaskBrush) << "Failed to save surface:" << e.what();
         Q_EMIT _module.statusMessageRequested(
-            QCoreApplication::translate("SurfaceMaskBrushTool", "Failed to save mask.tif."),
+            QCoreApplication::translate("SurfaceMaskBrushTool", "Failed to save surface."),
             kStatusLong);
     }
 }
 
-void SurfaceMaskBrushTool::applyPendingCells()
+cv::Rect SurfaceMaskBrushTool::applyPendingCells()
 {
     if (!_surface || _mask.empty()) {
-        return;
+        return {};
     }
 
     auto* points = _surface->rawPointsPtr();
     if (!points || points->empty()) {
-        return;
+        return {};
     }
+
+    int minRow = points->rows;
+    int maxRow = -1;
+    int minCol = points->cols;
+    int maxCol = -1;
 
     const cv::Vec3f invalid(-1.0f, -1.0f, -1.0f);
     for (const auto& [row, col] : _pendingCells) {
@@ -503,7 +515,42 @@ void SurfaceMaskBrushTool::applyPendingCells()
         }
         _mask(row, col) = 0;
         (*points)(row, col) = invalid;
+        minRow = std::min(minRow, row);
+        maxRow = std::max(maxRow, row);
+        minCol = std::min(minCol, col);
+        maxCol = std::max(maxCol, col);
     }
+
+    if (maxRow < minRow || maxCol < minCol || points->rows < 2 || points->cols < 2) {
+        return {};
+    }
+
+    const int cellRowCount = points->rows - 1;
+    const int cellColCount = points->cols - 1;
+    const int rowStart = std::max(0, minRow - 1);
+    const int rowEnd = std::min(cellRowCount, maxRow + 1);
+    const int colStart = std::max(0, minCol - 1);
+    const int colEnd = std::min(cellColCount, maxCol + 1);
+    if (rowStart >= rowEnd || colStart >= colEnd) {
+        return {};
+    }
+
+    return cv::Rect(colStart, rowStart, colEnd - colStart, rowEnd - rowStart);
+}
+
+void SurfaceMaskBrushTool::refreshSurfacePatchIndex(const cv::Rect& changedRegion)
+{
+    if (!_surface || changedRegion.empty()) {
+        return;
+    }
+
+    auto* manager = _module.viewerManager();
+    if (!manager) {
+        return;
+    }
+
+    SurfacePatchIndex::SurfacePtr surface(_surface, [](QuadSurface*) {});
+    manager->refreshSurfacePatchIndex(surface, changedRegion);
 }
 
 void SurfaceMaskBrushTool::invalidateViewers()

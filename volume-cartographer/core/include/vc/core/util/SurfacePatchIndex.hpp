@@ -83,6 +83,14 @@ public:
                          const SurfacePtr& targetSurface,
                          const std::function<void(const TriangleCandidate&)>& visitor) const;
 
+    void forEachTriangleIntersectingRay(const Rect3D& bounds,
+                                        const SurfacePtr& targetSurface,
+                                        const cv::Vec3f& origin,
+                                        const cv::Vec3f& dir,
+                                        float minT,
+                                        float maxT,
+                                        const std::function<void(const TriangleCandidate&)>& visitor) const;
+
     void forEachTriangle(const Rect3D& bounds,
                          const std::unordered_set<SurfacePtr>& targetSurfaces,
                          const std::function<void(const TriangleCandidate&)>& visitor) const;

@@ -269,6 +269,26 @@ void ManualAddTool::extractFillAndBorder()
     const int cols = _entrySnapshotPoints.cols;
     std::set<std::pair<int, int>> seen;
     std::set<std::pair<int, int>> barriers;
+    cv::Rect validBounds;
+    bool haveValidBounds = false;
+
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            if (!isValid(row, col)) {
+                continue;
+            }
+            const cv::Rect cell(col, row, 1, 1);
+            validBounds = haveValidBounds ? (validBounds | cell) : cell;
+            haveValidBounds = true;
+        }
+    }
+    if (!haveValidBounds) {
+        return;
+    }
+
+    auto fillAllowed = [&](int row, int col) {
+        return validBounds.contains(cv::Point(col, row)) && isInvalid(row, col);
+    };
 
     for (const auto& line : _committedPolylines) {
         for (const auto& p : line.vertices) {
@@ -277,7 +297,7 @@ void ManualAddTool::extractFillAndBorder()
     }
 
     auto addFill = [&](int row, int col) {
-        if (!isInvalid(row, col) || seen.count({row, col}) != 0) {
+        if (!fillAllowed(row, col) || seen.count({row, col}) != 0) {
             return;
         }
         seen.insert({row, col});
@@ -291,7 +311,7 @@ void ManualAddTool::extractFillAndBorder()
 
         auto push = [&](int row, int col) {
             const auto key = std::make_pair(row, col);
-            if (!isInvalid(row, col) || barriers.count(key) != 0 || sideSeen.count(key) != 0) {
+            if (!fillAllowed(row, col) || barriers.count(key) != 0 || sideSeen.count(key) != 0) {
                 return;
             }
             sideSeen.insert(key);
@@ -317,7 +337,7 @@ void ManualAddTool::extractFillAndBorder()
     auto collectComponentFromLine = [&](const GridPolyline& line) {
         std::queue<GridKey> queue;
         auto push = [&](int row, int col) {
-            if (!isInvalid(row, col) || seen.count({row, col}) != 0) {
+            if (!fillAllowed(row, col) || seen.count({row, col}) != 0) {
                 return;
             }
             seen.insert({row, col});

@@ -8,6 +8,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/core/render/Colormaps.hpp"
 #include "vc/core/render/PostProcess.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/types/SampleParams.hpp"
@@ -37,6 +38,7 @@
 #include <QPointer>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 
@@ -167,6 +169,10 @@ CAdaptiveVolumeViewer::~CAdaptiveVolumeViewer()
     if (_chunkCbId != 0 && _volume && _volume->tieredCache()) {
         _volume->tieredCache()->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
+    }
+    if (_overlayChunkCbId != 0 && _overlayVolume && _overlayVolume->tieredCache()) {
+        _overlayVolume->tieredCache()->removeChunkReadyListener(_overlayChunkCbId);
+        _overlayChunkCbId = 0;
     }
     if (_tickViewportSlot >= 0) {
         vc::cache::TickCoordinator::releaseViewportSlotGlobal(_tickViewportSlot);
@@ -382,6 +388,10 @@ void CAdaptiveVolumeViewer::onVolumeClosing()
         _volume->tieredCache()->removeChunkReadyListener(_chunkCbId);
     }
     _chunkCbId = 0;
+    if (_overlayChunkCbId != 0 && _overlayVolume && _overlayVolume->tieredCache()) {
+        _overlayVolume->tieredCache()->removeChunkReadyListener(_overlayChunkCbId);
+    }
+    _overlayChunkCbId = 0;
     onSurfaceChanged(_surfName, nullptr);
     _volume.reset();
     _surfWeak.reset();
@@ -456,6 +466,109 @@ void CAdaptiveVolumeViewer::scheduleRender()
 // back on with a single recompile.
 static constexpr bool kProgressiveRenderingEnabled = false;
 
+namespace {
+
+int chooseAvailableLevel(const std::shared_ptr<Volume>& volume, int desiredLevel)
+{
+    if (!volume || volume->numScales() == 0) {
+        return -1;
+    }
+
+    const int numLevels = static_cast<int>(volume->numScales());
+    desiredLevel = std::clamp(desiredLevel, 0, numLevels - 1);
+
+    int chosen = desiredLevel;
+    while (chosen < numLevels && !volume->zarrDataset(chosen)) {
+        ++chosen;
+    }
+    if (chosen < numLevels) {
+        return chosen;
+    }
+
+    chosen = desiredLevel - 1;
+    while (chosen >= 0 && !volume->zarrDataset(chosen)) {
+        --chosen;
+    }
+    return chosen;
+}
+
+void buildOverlayLut(std::array<uint32_t, 256>& lut,
+                     const std::string& colormapId,
+                     float windowLow,
+                     float windowHigh,
+                     float opacity)
+{
+    const int low = static_cast<int>(std::round(std::clamp(windowLow, 0.0f, 255.0f)));
+    int high = static_cast<int>(std::round(std::clamp(windowHigh, 0.0f, 255.0f)));
+    if (high <= low) {
+        high = std::min(255, low + 1);
+    }
+
+    const auto& spec = vc::resolve(colormapId);
+    cv::Mat_<uint8_t> colorInput(1, 256);
+    const float span = std::max(1.0f, static_cast<float>(high - low));
+    for (int i = 0; i < 256; ++i) {
+        if (spec.kind == vc::OverlayColormapKind::DiscreteLut) {
+            colorInput(0, i) = static_cast<uint8_t>(i);
+        } else {
+            const float scaled = std::clamp((static_cast<float>(i) - static_cast<float>(low)) / span,
+                                            0.0f, 1.0f);
+            colorInput(0, i) = static_cast<uint8_t>(std::round(scaled * 255.0f));
+        }
+    }
+
+    vc::makeColors(colorInput, spec, lut.data(), 256);
+
+    const uint32_t alpha = static_cast<uint32_t>(
+        std::round(std::clamp(opacity, 0.0f, 1.0f) * 255.0f));
+    for (int i = 0; i < 256; ++i) {
+        if (i < low || alpha == 0) {
+            lut[i] &= 0x00FFFFFFu;
+        } else {
+            lut[i] = (lut[i] & 0x00FFFFFFu) | (alpha << 24);
+        }
+    }
+}
+
+void blendOverlayARGB32(uint32_t* baseBits,
+                        int baseStride,
+                        const uint32_t* overlayBits,
+                        int overlayStride,
+                        int width,
+                        int height)
+{
+    for (int y = 0; y < height; ++y) {
+        uint32_t* base = baseBits + size_t(y) * size_t(baseStride);
+        const uint32_t* overlay = overlayBits + size_t(y) * size_t(overlayStride);
+        for (int x = 0; x < width; ++x) {
+            const uint32_t ov = overlay[x];
+            const uint32_t a = ov >> 24;
+            if (a == 0) {
+                continue;
+            }
+            if (a == 255) {
+                base[x] = 0xFF000000u | (ov & 0x00FFFFFFu);
+                continue;
+            }
+
+            const uint32_t src = base[x];
+            const uint32_t ia = 255u - a;
+            const uint32_t sr = (src >> 16) & 0xFFu;
+            const uint32_t sg = (src >> 8) & 0xFFu;
+            const uint32_t sb = src & 0xFFu;
+            const uint32_t or_ = (ov >> 16) & 0xFFu;
+            const uint32_t og = (ov >> 8) & 0xFFu;
+            const uint32_t ob = ov & 0xFFu;
+            const uint32_t r = (sr * ia + or_ * a + 127u) / 255u;
+            const uint32_t g = (sg * ia + og * a + 127u) / 255u;
+            const uint32_t b = (sb * ia + ob * a + 127u) / 255u;
+            base[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
+} // namespace
+
 void CAdaptiveVolumeViewer::beginInteraction()
 {
     // Called from any event path that represents live user motion (pan
@@ -514,6 +627,9 @@ void CAdaptiveVolumeViewer::submitRender()
     if (_volume) {
         if (auto* c = _volume->tieredCache()) c->clearChunkArrivedFlag();
     }
+    if (_overlayVolume) {
+        if (auto* c = _overlayVolume->tieredCache()) c->clearChunkArrivedFlag();
+    }
 
     // Quick main-thread checks before dispatch. The worker can't check
     // these safely — the shared_ptr from weak_ptr::lock() and the volume
@@ -566,6 +682,11 @@ void CAdaptiveVolumeViewer::submitRender()
     ctx.zOffWorldDir = _zOffWorldDir;
     ctx.surf = std::move(surf);
     ctx.volume = _volume;
+    ctx.overlayVolume = _overlayVolume;
+    ctx.overlayOpacity = _overlayOpacity;
+    ctx.overlayColormapId = _overlayColormapId;
+    ctx.overlayWindowLow = _overlayWindowLow;
+    ctx.overlayWindowHigh = _overlayWindowHigh;
 
     // Dispatch the whole render body to QThreadPool. The main thread
     // returns immediately — Qt input events are no longer stalled behind
@@ -651,6 +772,12 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
 
     auto* fbBits = reinterpret_cast<uint32_t*>(fb.bits());
     int fbStride = fb.bytesPerLine() / 4;
+    bool overlayUsePlane = false;
+    cv::Vec3f overlayOrigin(0.0f, 0.0f, 0.0f);
+    cv::Vec3f overlayVxStep(0.0f, 0.0f, 0.0f);
+    cv::Vec3f overlayVyStep(0.0f, 0.0f, 0.0f);
+    cv::Vec3f overlayPlaneNormal(0.0f, 0.0f, 1.0f);
+    const cv::Mat_<cv::Vec3f>* overlayCoords = nullptr;
 
     // Build the render LUT. For stretch mode we use last frame's min/max
     // so the render is a single pass; we refresh the cached range by
@@ -727,6 +854,11 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
                          + plane->origin() + n * ctx.camera.zOff;
         cv::Vec3f vx_step = vx / ctx.camera.scale;
         cv::Vec3f vy_step = vy / ctx.camera.scale;
+        overlayUsePlane = true;
+        overlayOrigin = origin;
+        overlayVxStep = vx_step;
+        overlayVyStep = vy_step;
+        overlayPlaneNormal = n;
 
         int numLayers = 1, zStart = 0;
         float zStep = 1.0f;
@@ -857,6 +989,7 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
         cv::Mat_<cv::Vec3f>& normals = _genNormals;
 
         if (!coords.empty()) {
+            overlayCoords = &coords;
             int numLayers = 1, zStart = 0;
             float zStep = 1.0f;
             const cv::Mat_<cv::Vec3f>* pNormals = nullptr;
@@ -1060,6 +1193,55 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
                     uint32_t v = src[x];
                     row[x] = 0xFF000000u | (v << 16) | (v << 8) | v;
                 }
+            }
+        }
+    }
+
+    if (ctx.overlayVolume && ctx.overlayOpacity > 0.0f) {
+        const int overlayLevel = chooseAvailableLevel(ctx.overlayVolume, ctx.camera.dsScaleIdx);
+        auto* overlayCache = ctx.overlayVolume->tieredCache();
+        if (overlayLevel >= 0 && overlayCache) {
+            if (_overlayFramebuffer.isNull()
+                || _overlayFramebuffer.width() != fbW
+                || _overlayFramebuffer.height() != fbH
+                || _overlayFramebuffer.format() != QImage::Format_ARGB32) {
+                _overlayFramebuffer = QImage(fbW, fbH, QImage::Format_ARGB32);
+            }
+            _overlayFramebuffer.fill(Qt::transparent);
+
+            std::array<uint32_t, 256> overlayLut{};
+            buildOverlayLut(overlayLut,
+                            ctx.overlayColormapId,
+                            ctx.overlayWindowLow,
+                            ctx.overlayWindowHigh,
+                            ctx.overlayOpacity);
+
+            auto* overlayBits = reinterpret_cast<uint32_t*>(_overlayFramebuffer.bits());
+            const int overlayStride = _overlayFramebuffer.bytesPerLine() / 4;
+            const int overlayNumLevels = static_cast<int>(ctx.overlayVolume->numScales());
+
+            if (overlayUsePlane) {
+                sampleAdaptiveARGB32(
+                    overlayBits, overlayStride, overlayCache,
+                    overlayLevel, overlayNumLevels,
+                    nullptr, &overlayOrigin, &overlayVxStep, &overlayVyStep,
+                    nullptr, &overlayPlaneNormal,
+                    1, 0, 1.0f,
+                    fbW, fbH, std::string(), overlayLut.data(), vc::Sampling::Nearest,
+                    nullptr, nullptr, 0,
+                    false, !ctx.interactive);
+                blendOverlayARGB32(fbBits, fbStride, overlayBits, overlayStride, fbW, fbH);
+            } else if (overlayCoords && !overlayCoords->empty()) {
+                sampleAdaptiveARGB32(
+                    overlayBits, overlayStride, overlayCache,
+                    overlayLevel, overlayNumLevels,
+                    overlayCoords, nullptr, nullptr, nullptr,
+                    nullptr, nullptr,
+                    1, 0, 1.0f,
+                    fbW, fbH, std::string(), overlayLut.data(), vc::Sampling::Nearest,
+                    nullptr, nullptr, 0,
+                    false, !ctx.interactive);
+                blendOverlayARGB32(fbBits, fbStride, overlayBits, overlayStride, fbW, fbH);
             }
         }
     }
@@ -2490,6 +2672,87 @@ void CAdaptiveVolumeViewer::setVolumeWindow(float low, float high)
     _windowLow = lo;
     _windowHigh = hi;
     if (_volume) scheduleRender();
+}
+
+void CAdaptiveVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
+{
+    if (_overlayVolume == volume) {
+        return;
+    }
+
+    if (_overlayChunkCbId != 0 && _overlayVolume && _overlayVolume->tieredCache()) {
+        _overlayVolume->tieredCache()->removeChunkReadyListener(_overlayChunkCbId);
+        _overlayChunkCbId = 0;
+    }
+
+    _overlayVolume = std::move(volume);
+
+    if (_overlayVolume && _overlayVolume->numScales() >= 1) {
+        auto* cache = _overlayVolume->tieredCache();
+        QPointer<CAdaptiveVolumeViewer> guard(this);
+        std::weak_ptr<Volume> volumeWeak = _overlayVolume;
+        _overlayChunkCbId = cache->addChunkReadyListener(
+            [guard, volumeWeak](const vc::cache::ChunkKey&) {
+                QMetaObject::invokeMethod(qApp, [guard, volumeWeak]() {
+                    if (!guard) return;
+                    auto vol = volumeWeak.lock();
+                    if (!vol || guard->_overlayVolume != vol) return;
+                    guard->scheduleRender();
+                }, Qt::QueuedConnection);
+            });
+    }
+
+    scheduleRender();
+}
+
+void CAdaptiveVolumeViewer::setOverlayOpacity(float opacity)
+{
+    const float clamped = std::clamp(opacity, 0.0f, 1.0f);
+    if (std::abs(clamped - _overlayOpacity) < 1e-6f) {
+        return;
+    }
+    _overlayOpacity = clamped;
+    if (_overlayVolume) {
+        scheduleRender();
+    }
+}
+
+void CAdaptiveVolumeViewer::setOverlayColormap(const std::string& colormapId)
+{
+    if (_overlayColormapId == colormapId) {
+        return;
+    }
+    _overlayColormapId = colormapId;
+    if (_overlayVolume) {
+        scheduleRender();
+    }
+}
+
+void CAdaptiveVolumeViewer::setOverlayThreshold(float threshold)
+{
+    setOverlayWindow(std::max(threshold, 0.0f), _overlayWindowHigh);
+}
+
+void CAdaptiveVolumeViewer::setOverlayWindow(float low, float high)
+{
+    constexpr float kMaxOverlayValue = 255.0f;
+    const float clampedLow = std::clamp(low, 0.0f, kMaxOverlayValue);
+    float clampedHigh = std::clamp(high, 0.0f, kMaxOverlayValue);
+    if (clampedHigh <= clampedLow) {
+        clampedHigh = std::min(kMaxOverlayValue, clampedLow + 1.0f);
+    }
+
+    const bool unchanged = std::abs(clampedLow - _overlayWindowLow) < 1e-6f &&
+                           std::abs(clampedHigh - _overlayWindowHigh) < 1e-6f;
+    if (unchanged) {
+        return;
+    }
+
+    _overlayWindowLow = clampedLow;
+    _overlayWindowHigh = clampedHigh;
+    if (_overlayVolume) {
+        scheduleRender();
+    }
 }
 
 // ============================================================================

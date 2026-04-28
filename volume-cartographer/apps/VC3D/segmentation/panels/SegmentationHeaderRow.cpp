@@ -20,7 +20,7 @@ SegmentationHeaderRow::SegmentationHeaderRow(QWidget* parent)
     _chkEditing->setToolTip(tr("Start or stop segmentation editing so brush tools can modify surfaces."));
 
     _chkDrawMask = new QCheckBox(tr("Draw mask"), this);
-    _chkDrawMask->setToolTip(tr("Right-drag on the surface view to mark grid cells invalid in mask.tif."));
+    _chkDrawMask->setToolTip(tr("Right-drag on the surface view to mark grid cells invalid in the surface."));
 
     _lblStatus = new QLabel(this);
     _lblStatus->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);

@@ -49,6 +49,7 @@ public:
     [[nodiscard]] float smoothingStrength() const;
     [[nodiscard]] int smoothingIterations() const;
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const;
+    [[nodiscard]] SegmentationGrowthMethod lastNonManualGrowthMethod() const { return _lastNonManualGrowthMethod; }
     [[nodiscard]] int growthSteps() const;
     [[nodiscard]] int extrapolationPointCount() const;
     [[nodiscard]] ExtrapolationType extrapolationType() const;
@@ -279,6 +280,7 @@ private:
     void restoreSettings();
     void writeSetting(const QString& key, const QVariant& value);
     void updateEditingState(bool enabled, bool notifyListeners);
+    void noteGrowthMethod(SegmentationGrowthMethod method);
 
     bool _editingEnabled{false};
     bool _drawMaskEnabled{false};
@@ -298,5 +300,6 @@ private:
     SegmentationLasagnaPanel* _lasagnaPanel{nullptr};
     SegmentationManualAddPanel* _manualAddPanel{nullptr};
     bool _manualAddActive{false};
+    SegmentationGrowthMethod _lastNonManualGrowthMethod{SegmentationGrowthMethod::Tracer};
 
 };

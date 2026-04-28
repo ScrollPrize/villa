@@ -1694,6 +1694,9 @@ bool SegmentationModule::beginManualAdd()
     setCellReoptimizationMode(false);
 
     _previousGrowthMethodBeforeManualAdd = _widget->growthMethod();
+    if (_previousGrowthMethodBeforeManualAdd == SegmentationGrowthMethod::ManualAdd) {
+        _previousGrowthMethodBeforeManualAdd = _widget->lastNonManualGrowthMethod();
+    }
     _widget->setGrowthMethod(SegmentationGrowthMethod::ManualAdd);
     if (!_manualAddTool) {
         _manualAddTool = std::make_unique<ManualAddTool>();
@@ -1742,9 +1745,6 @@ bool SegmentationModule::finishManualAdd(bool apply)
                 _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
             }
         }
-        if (_widget) {
-            _widget->setGrowthMethod(_previousGrowthMethodBeforeManualAdd);
-        }
         emitPendingChanges();
         emit statusMessageRequested(tr("Manual Add canceled."), kStatusShort);
     }
@@ -1753,6 +1753,10 @@ bool SegmentationModule::finishManualAdd(bool apply)
     _manualAddTool->clear();
     if (_widget) {
         _widget->setManualAddActive(false);
+        const auto fallback = _previousGrowthMethodBeforeManualAdd == SegmentationGrowthMethod::ManualAdd
+            ? SegmentationGrowthMethod::Tracer
+            : _previousGrowthMethodBeforeManualAdd;
+        _widget->setGrowthMethod(fallback);
     }
     refreshOverlay();
     return true;

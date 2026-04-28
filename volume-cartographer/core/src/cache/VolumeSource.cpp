@@ -330,7 +330,6 @@ std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
     const int inner = innerChunkIndex(key);
     if (inner < 0 || inner >= nChunks) {
         tl_last_was_absent = false;
-        tl_last_had_transient_error = false;
         return {};
     }
 

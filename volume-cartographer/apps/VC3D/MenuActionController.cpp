@@ -1822,7 +1822,7 @@ bool MenuActionController::resolveAuthForBrowser(const QString& url,
 
 bool MenuActionController::tryResolveRemoteAuth(const QString& url,
                                                 vc::cache::HttpAuth* authOut,
-                                                bool /*allowPrompt*/,
+                                                bool allowPrompt,
                                                 QString* errorMessage) const
 {
     if (!authOut) {
