@@ -3,6 +3,7 @@
 #include "ViewerManager.hpp"
 #include "VCSettings.hpp"
 #include "../CState.hpp"
+
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"

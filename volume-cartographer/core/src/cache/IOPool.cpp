@@ -46,7 +46,7 @@ void IOPool::start()
                     try {
                         result = fetchFunc_(shard);
                         fetchOk = true;
-                    } catch (const std::exception& e) {
+                    } catch (const std::exception&) {
                         // Exception = transient failure (HTTP 5xx, auth,
                         // decode). Drop the shard from the state map
                         // entirely so the next interactive request re-queues

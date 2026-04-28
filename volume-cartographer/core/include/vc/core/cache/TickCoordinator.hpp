@@ -158,7 +158,10 @@ public:
     // immediate fetchInteractive if the coordinator is not running.
     static void enqueuePrefetchGlobal(BlockPipeline* pipeline,
                                       const std::vector<ChunkKey>& keys,
-                                      int targetLevel) noexcept;
+                                      int targetLevel,
+                                      float viewCenterX = 0,
+                                      float viewCenterY = 0,
+                                      float viewCenterZ = 0) noexcept;
 
     [[nodiscard]] std::uint64_t droppedChunkLanded() const noexcept
     {
@@ -221,6 +224,7 @@ private:
         BlockPipeline* pipeline;
         int targetLevel;
         std::vector<ChunkKey> keys;
+        float viewCenterX = 0, viewCenterY = 0, viewCenterZ = 0;
     };
     std::mutex prefetchMutex_;
     std::vector<PendingPrefetch> prefetchQueue_;

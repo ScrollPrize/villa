@@ -1088,7 +1088,8 @@ void sampleSingleLayerAdaptiveImpl(
                                          std::min(numLevels, int(vc::cache::kMaxLevels)),
                                          viewCenterL0);
             }
-            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel);
+            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel,
+                viewCenterL0[0], viewCenterL0[1], viewCenterL0[2]);
         }
     } else {
         cv::Vec3f p0 = *origin + (*planeNormal) * zOffConst;
@@ -1116,7 +1117,8 @@ void sampleSingleLayerAdaptiveImpl(
                                          std::min(numLevels, int(vc::cache::kMaxLevels)),
                                          viewCenterL0);
             }
-            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel);
+            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel,
+                viewCenterL0[0], viewCenterL0[1], viewCenterL0[2]);
         }
     }
     }  // skipPrefetch guard
@@ -1323,7 +1325,8 @@ void sampleCompositeAdaptiveImpl(
                                          std::min(numLevels, int(vc::cache::kMaxLevels)),
                                          viewCenterL0);
             }
-            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel);
+            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel,
+                viewCenterL0[0], viewCenterL0[1], viewCenterL0[2]);
         }
     } else {
         cv::Vec3f p0 = *origin + (*planeNormal) * zMin;
@@ -1351,7 +1354,8 @@ void sampleCompositeAdaptiveImpl(
                                          std::min(numLevels, int(vc::cache::kMaxLevels)),
                                          viewCenterL0);
             }
-            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel);
+            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel,
+                viewCenterL0[0], viewCenterL0[1], viewCenterL0[2]);
         }
     }
     }  // skipPrefetch guard

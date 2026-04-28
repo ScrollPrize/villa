@@ -120,7 +120,10 @@ void TickCoordinator::publishViewportGlobal(int slotIdx,
 
 void TickCoordinator::enqueuePrefetchGlobal(BlockPipeline* pipeline,
                                             const std::vector<ChunkKey>& keys,
-                                            int targetLevel) noexcept
+                                            int targetLevel,
+                                            float viewCenterX,
+                                            float viewCenterY,
+                                            float viewCenterZ) noexcept
 {
     if (!pipeline || keys.empty()) return;
     TickCoordinator* c = g_coordinator.load(std::memory_order_acquire);
@@ -129,7 +132,7 @@ void TickCoordinator::enqueuePrefetchGlobal(BlockPipeline* pipeline,
         pipeline->fetchInteractive(keys, targetLevel);
         return;
     }
-    PendingPrefetch p{pipeline, targetLevel, keys};
+    PendingPrefetch p{pipeline, targetLevel, keys, viewCenterX, viewCenterY, viewCenterZ};
     std::lock_guard lk(c->prefetchMutex_);
     c->prefetchQueue_.push_back(std::move(p));
 }
@@ -294,6 +297,27 @@ void TickCoordinator::runLoop(std::stop_token stop) noexcept
                 merged.erase(std::unique(merged.begin(), merged.end()),
                              merged.end());
                 if (!merged.empty()) {
+                    // Re-sort by distance from viewport center (the dedup
+                    // sort above used ChunkKey order, destroying the
+                    // per-viewer center-distance ordering).
+                    const float cx0 = it->viewCenterX;
+                    const float cy0 = it->viewCenterY;
+                    const float cz0 = it->viewCenterZ;
+                    auto* pl = it->pipeline;
+                    std::sort(merged.begin(), merged.end(),
+                        [&](const ChunkKey& a, const ChunkKey& b) {
+                            auto csA = pl->chunkShape(a.level);
+                            float scA = float(1 << a.level);
+                            float ax = (float(a.ix) + 0.5f) * float(csA[2]) * scA - cx0;
+                            float ay = (float(a.iy) + 0.5f) * float(csA[1]) * scA - cy0;
+                            float az = (float(a.iz) + 0.5f) * float(csA[0]) * scA - cz0;
+                            auto csB = pl->chunkShape(b.level);
+                            float scB = float(1 << b.level);
+                            float bx = (float(b.ix) + 0.5f) * float(csB[2]) * scB - cx0;
+                            float by = (float(b.iy) + 0.5f) * float(csB[1]) * scB - cy0;
+                            float bz = (float(b.iz) + 0.5f) * float(csB[0]) * scB - cz0;
+                            return (ax*ax+ay*ay+az*az) < (bx*bx+by*by+bz*bz);
+                        });
                     it->pipeline->fetchInteractive(merged, it->targetLevel);
                     ++prefetchCallsThisTick;
                 }

@@ -1,7 +1,6 @@
 #include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/cache/TickCoordinator.hpp"
 #include "vc/core/cache/VolumeSource.hpp"
-#include "vc/core/cache/CacheDebugLog.hpp"
 #include "vc/core/cache/VcDecompressor.hpp"
 #include "vc/core/types/VcDataset.hpp"
 
@@ -357,10 +356,6 @@ BlockPipeline::BlockPipeline(
             return {};
         }
 
-        // Backpressure: wait until encodeStaging_ has room before paying
-        // the network + decode cost. Gating here (vs. after assemble)
-        // means a stalled encoder pool doesn't hold 16 MiB buffers per
-        // blocked downloader worker.
         {
             std::unique_lock lk(encodeStagingMutex_);
             encodeStagingCv_.wait(lk, [this] {
@@ -370,16 +365,8 @@ BlockPipeline::BlockPipeline(
             if (shuttingDown_.load(std::memory_order_acquire)) return {};
         }
 
-        // Pull source chunks over the network and assemble a canonical
-        // 128³ buffer. Source decode happens here too because the
-        // re-chunking needs the voxels; it's a small fraction of the
-        // overall work compared to x265 encode, which is now off-thread.
         auto decoded = assembleCanonicalChunk(key);
         if (!decoded) {
-            // Negative-cache *only* when the source confirms the chunk is
-            // genuinely absent — a real S3 404, or a sharded v3 missing/
-            // zero-placeholder index entry. Transient errors / curl
-            // failures / auth issues must not poison the cache.
             const bool isHttp = dynamic_cast<HttpSource*>(source_.get()) != nullptr;
             const bool absent = !isHttp || HttpSource::lastFetchWasAbsent();
             if (absent) {
@@ -392,7 +379,6 @@ BlockPipeline::BlockPipeline(
         }
         statIceFetches_.fetch_add(1, std::memory_order_relaxed);
 
-        // Stage for the encoder.
         {
             std::lock_guard lk(encodeStagingMutex_);
             encodeStaging_[key] = std::move(decoded);
@@ -408,11 +394,6 @@ BlockPipeline::BlockPipeline(
             std::vector<ChunkKey> encodeKeys;
             encodeKeys.reserve(res.size());
             for (auto& [key, _] : res) encodeKeys.push_back(key);
-            // submit appends (O(N) in new keys); updateInteractive would
-            // reshuffle the whole encoder queue (O(Q)) and reset served
-            // counters, neither of which makes sense for inter-stage
-            // handoffs — the viewport priority comes from the renderer's
-            // fetchInteractive call upstream, not from completions.
             encodePool_.submit(encodeKeys);
         });
 
@@ -519,8 +500,6 @@ BlockPipeline::BlockPipeline(
             // Local source, no disk tier: treat the source files as disk.
             try { compressed = source_->fetch(key); } catch (...) { return {}; }
             if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) {
-                // Same rule as the downloader: only poison the negative
-                // cache when the source confirms genuine absence.
                 const bool isHttp = dynamic_cast<HttpSource*>(source_.get()) != nullptr;
                 const bool absent = !isHttp || HttpSource::lastFetchWasAbsent();
                 if (absent) {
