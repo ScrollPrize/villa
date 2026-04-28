@@ -62,6 +62,12 @@ public:
     void stopOptimization();
 
     /**
+     * Export multi-layer OBJ visualization.
+     * Synchronous POST to /export_vis; emits visExportFinished or visExportError.
+     */
+    void exportLasagnaVis(const QJsonObject& config);
+
+    /**
      * Scan ~/.fit_services for running service .json files.
      * Stale entries (dead PIDs) are removed.
      */
@@ -82,6 +88,9 @@ signals:
                               const QString& stageName);
     void optimizationFinished(const QString& outputDir);
     void optimizationError(const QString& message);
+
+    void visExportFinished(const QString& outputDir);
+    void visExportError(const QString& message);
 
     /** Emitted after GET /datasets reply with the list of datasets. */
     void datasetsReceived(const QJsonArray& datasets);
@@ -119,5 +128,6 @@ private:
     QString _lastError;
     bool _serviceReady{false};
     bool _optimizationRunning{false};
-    QString _localOutputDir;  // where to unpack results
+    QString _localOutputDir;  // where to unpack optimization results
+    QString _visOutputDir;    // where to unpack vis export results
 };

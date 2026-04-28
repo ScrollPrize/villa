@@ -30,7 +30,7 @@ public:
     bool setAnnotateMode(bool enabled, bool userInitiated, bool editingEnabled);
     void setActiveCollection(uint64_t collectionId, bool userInitiated);
     uint64_t createCollection(bool announce);
-    void handlePointAdded(const cv::Vec3f& worldPos);
+    void handlePointAdded(const cv::Vec3f& worldPos, float wind_a = NAN);
     void handlePointRemoved(const cv::Vec3f& worldPos);
 
     void onZRangeChanged(bool enabled, int zMin, int zMax);

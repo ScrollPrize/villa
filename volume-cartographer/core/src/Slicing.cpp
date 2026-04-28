@@ -1397,7 +1397,15 @@ void sampleCompositeAdaptiveImpl(
     bool skipPrefetch = false,
     bool promoteFallbackChunks = false)
 {
-    auto levelScale = [](int lvl) { return (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f; };
+    if (numLevels <= 0 || desiredLevel >= numLevels) {
+        // No usable levels (broken/empty volume) — fill black.
+        for (int y = 0; y < h; ++y) {
+            uint32_t* row = outBuf + size_t(y) * size_t(outStride);
+            for (int x = 0; x < w; ++x) row[x] = lut[0];
+        }
+        return;
+    }
+    auto levelScale = [&cache](int lvl) { return 1.0f / cache.levelScaleFactor(lvl); };
     const float zLo = float(zStart) * zStep;
     const float zHi = float(zStart + numLayers - 1) * zStep;
     const float zMin = std::min(zLo, zHi), zMax = std::max(zLo, zHi);
@@ -1478,8 +1486,10 @@ void sampleCompositeAdaptiveImpl(
     const int nSamplersTotal = numLevels - desiredLevel;
     for (int i = 0; i < nSamplersTotal && i < kMaxLevels; i++) {
         int lvl = desiredLevel + i;
-        scales[i] = (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f;
+        scales[i] = 1.0f / cache.levelScaleFactor(lvl);
     }
+
+
 
     // Parse compositeMethod once. Pixel loop previously did string compare
     // per pixel for the LayerStorage path; convert to a small enum up front.

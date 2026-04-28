@@ -647,7 +647,7 @@ void MenuActionController::attachRemoteZarr()
 
 bool MenuActionController::tryResolveRemoteAuth(const QString& url,
                                                 vc::cache::HttpAuth* authOut,
-                                                bool /*allowPrompt*/,
+                                                bool allowPrompt,
                                                 QString* errorMessage) const
 {
     if (!authOut) {
@@ -828,7 +828,6 @@ void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
             if (_window->_state->vpkg()->hasVolume(volume->id())) {
                 continue;
             }
-            _window->runStartupPrefetchForVolume(volume);
             if (_window->_state->vpkg()->addVolume(volume)) {
                 attachedCount++;
             } else {

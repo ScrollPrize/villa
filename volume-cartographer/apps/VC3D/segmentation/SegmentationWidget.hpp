@@ -197,9 +197,12 @@ public:
     [[nodiscard]] int lasagnaMode() const;
     [[nodiscard]] int newModelWidth() const;
     [[nodiscard]] int newModelHeight() const;
-    [[nodiscard]] int newModelDepth() const;
+    [[nodiscard]] int newModelWindings() const;
     [[nodiscard]] QString seedPointText() const;
     [[nodiscard]] QString newModelOutputName() const;
+    [[nodiscard]] double offsetValue() const;
+    [[nodiscard]] int windowSize() const;
+    [[nodiscard]] int windowOverlap() const;
 
     // Lasagna setters
     void setLasagnaDataInputPath(const QString& path);

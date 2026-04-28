@@ -848,26 +848,47 @@ std::vector<std::unique_ptr<VcDataset>> openZarrLevels(
 {
     std::vector<std::string> levelNames;
 
-    for (auto& entry : std::filesystem::directory_iterator(zarrRoot)) {
-        if (!entry.is_directory()) continue;
-        auto p = entry.path();
-        if (std::filesystem::exists(p / ".zarray")) {
-            levelNames.push_back(p.filename().string());
+    // Prefer OME-Zarr .zattrs multiscales metadata for level discovery.
+    auto zattrs = readZarrAttributes(zarrRoot);
+    bool gotFromAttrs = false;
+    if (zattrs.contains("multiscales") && zattrs["multiscales"].is_array()
+        && zattrs["multiscales"].size() > 0) {
+        auto ms0 = zattrs["multiscales"][0];
+        if (ms0.contains("datasets") && ms0["datasets"].is_array()) {
+            for (const auto& ds : ms0["datasets"]) {
+                if (ds.contains("path")) {
+                    std::string p = ds["path"].get_string();
+                    // Verify the array actually exists on disk
+                    if (std::filesystem::exists(zarrRoot / p / ".zarray")) {
+                        levelNames.push_back(std::move(p));
+                    }
+                }
+            }
+            gotFromAttrs = !levelNames.empty();
         }
     }
 
-    // Sort numerically where possible, lexicographically otherwise.
-    // Numeric names sort before non-numeric names.
-    std::sort(levelNames.begin(), levelNames.end(),
-              [](const std::string& a, const std::string& b) {
-                  int ia = 0, ib = 0;
-                  bool aNum = false, bNum = false;
-                  try { ia = std::stoi(a); aNum = true; } catch (...) {}
-                  try { ib = std::stoi(b); bNum = true; } catch (...) {}
-                  if (aNum && bNum) return ia < ib;
-                  if (aNum != bNum) return aNum;  // numeric before non-numeric
-                  return a < b;
-              });
+    // Fallback: scan subdirectories for .zarray (legacy / non-OME zarrs).
+    if (!gotFromAttrs) {
+        for (auto& entry : std::filesystem::directory_iterator(zarrRoot)) {
+            if (!entry.is_directory()) continue;
+            auto p = entry.path();
+            if (std::filesystem::exists(p / ".zarray")) {
+                levelNames.push_back(p.filename().string());
+            }
+        }
+        // Sort numerically where possible, lexicographically otherwise.
+        std::sort(levelNames.begin(), levelNames.end(),
+                  [](const std::string& a, const std::string& b) {
+                      int ia = 0, ib = 0;
+                      bool aNum = false, bNum = false;
+                      try { ia = std::stoi(a); aNum = true; } catch (...) {}
+                      try { ib = std::stoi(b); bNum = true; } catch (...) {}
+                      if (aNum && bNum) return ia < ib;
+                      if (aNum != bNum) return aNum;
+                      return a < b;
+                  });
+    }
 
     std::vector<std::unique_ptr<VcDataset>> result;
     result.reserve(levelNames.size());
