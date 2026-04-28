@@ -1549,7 +1549,8 @@ void CAdaptiveVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMo
 
     if (modifiers & Qt::ShiftModifier) {
         // Z-scroll
-        float dz = static_cast<float>(steps) * _zScrollSensitivity;
+        const int sliceStepSize = _viewerManager ? _viewerManager->sliceStepSize() : 1;
+        float dz = static_cast<float>(steps * sliceStepSize) * _zScrollSensitivity;
 
         PlaneSurface* plane = dynamic_cast<PlaneSurface*>(surf.get());
         if (_surfName != "segmentation" && plane && _state) {
