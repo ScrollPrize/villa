@@ -1,6 +1,7 @@
 #include "SurfaceMaskBrushTool.hpp"
 
 #include "../SegmentationModule.hpp"
+#include "SegmentationEditManager.hpp"
 #include "../../ViewerManager.hpp"
 
 #include <QCoreApplication>
@@ -9,10 +10,8 @@
 #include <algorithm>
 #include <cmath>
 #include <exception>
-#include <filesystem>
 
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Tiff.hpp"
 
 Q_LOGGING_CATEGORY(lcSurfaceMaskBrush, "vc.segmentation.surfacemask")
 
@@ -256,8 +255,11 @@ void SurfaceMaskBrushTool::finishStroke()
     _lastGrid.reset();
     fillEnclosedStrokeArea();
     const cv::Rect changedRegion = applyPendingCells();
+    if (_module.hasActiveSession() && _module.activeBaseSurface() == _surface && !changedRegion.empty()) {
+        _module._editManager->applyExternalSurfaceUpdate(changedRegion);
+    }
     refreshSurfacePatchIndex(changedRegion);
-    persistMask();
+    persistSurface();
     _paintedCells.clear();
     _pendingCells.clear();
     _strokeGridPoints.clear();
@@ -456,7 +458,7 @@ void SurfaceMaskBrushTool::fillEnclosedStrokeArea()
     }
 }
 
-void SurfaceMaskBrushTool::persistMask()
+void SurfaceMaskBrushTool::persistSurface()
 {
     if (!_surface || _mask.empty()) {
         return;
@@ -466,22 +468,26 @@ void SurfaceMaskBrushTool::persistMask()
 
     if (_surface->path.empty()) {
         Q_EMIT _module.statusMessageRequested(
-            QCoreApplication::translate("SurfaceMaskBrushTool", "Cannot save mask: surface has no tifxyz path."),
+            QCoreApplication::translate("SurfaceMaskBrushTool", "Cannot save surface: surface has no tifxyz path."),
             kStatusMedium);
         return;
     }
 
+    if (_module.hasActiveSession()) {
+        _module.emitPendingChanges();
+        _module.markAutosaveNeeded(true);
+        return;
+    }
+
     try {
-        const std::filesystem::path maskPath = _surface->path / "mask.tif";
-        writeTiff(maskPath, _mask, -1, 1024, 1024, -1.0f, COMPRESSION_LZW, _surface->dpi());
-        _surface->refreshMaskTimestamp();
+        _surface->saveOverwrite();
         Q_EMIT _module.statusMessageRequested(
-            QCoreApplication::translate("SurfaceMaskBrushTool", "Saved mask.tif."),
+            QCoreApplication::translate("SurfaceMaskBrushTool", "Saved surface."),
             kStatusShort);
     } catch (const std::exception& e) {
-        qCWarning(lcSurfaceMaskBrush) << "Failed to save mask.tif:" << e.what();
+        qCWarning(lcSurfaceMaskBrush) << "Failed to save surface:" << e.what();
         Q_EMIT _module.statusMessageRequested(
-            QCoreApplication::translate("SurfaceMaskBrushTool", "Failed to save mask.tif."),
+            QCoreApplication::translate("SurfaceMaskBrushTool", "Failed to save surface."),
             kStatusLong);
     }
 }

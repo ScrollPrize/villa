@@ -304,20 +304,22 @@ utils::Json buildTracerParams(const SegmentationGrowthRequest& request)
     params["rewind_gen"] = -1;
     params["grow_mode"] = directionToString(request.direction).toStdString();
     params["grow_steps"] = std::max(0, request.steps);
+    params["grow_extra_rows"] = 0;
+    params["grow_extra_cols"] = 0;
 
     if (request.direction == SegmentationGrowthDirection::Fill) {
-        params["grow_extra_rows"] = 0;
-        params["grow_extra_cols"] = 0;
+        params["grow_max_extra_rows"] = 0;
+        params["grow_max_extra_cols"] = 0;
         params["disable_grid_expansion"] = true;
     } else if (request.direction == SegmentationGrowthDirection::Left || request.direction == SegmentationGrowthDirection::Right) {
-        params["grow_extra_cols"] = std::max(0, request.steps);
-        params["grow_extra_rows"] = 0;
+        params["grow_max_extra_cols"] = std::max(0, request.steps);
+        params["grow_max_extra_rows"] = 0;
     } else if (request.direction == SegmentationGrowthDirection::Up || request.direction == SegmentationGrowthDirection::Down) {
-        params["grow_extra_rows"] = std::max(0, request.steps);
-        params["grow_extra_cols"] = 0;
+        params["grow_max_extra_rows"] = std::max(0, request.steps);
+        params["grow_max_extra_cols"] = 0;
     } else {
-        params["grow_extra_rows"] = std::max(0, request.steps);
-        params["grow_extra_cols"] = std::max(0, request.steps);
+        params["grow_max_extra_rows"] = std::max(0, request.steps);
+        params["grow_max_extra_cols"] = std::max(0, request.steps);
     }
 
     params["inpaint"] = request.inpaintOnly;

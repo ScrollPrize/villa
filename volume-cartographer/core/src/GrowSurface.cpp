@@ -1760,34 +1760,70 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         const int extra = std::max(0, p.value(key, 0));
         return (extra + grid_step - 1) / grid_step;
     };
-    const int grow_extra_rows_lr = requested_extra_lr("grow_extra_rows", params);
-    const int grow_extra_cols_lr = requested_extra_lr("grow_extra_cols", params);
+    const int grow_initial_extra_rows_lr = requested_extra_lr("grow_extra_rows", params);
+    const int grow_initial_extra_cols_lr = requested_extra_lr("grow_extra_cols", params);
+    const int grow_max_extra_rows_lr = std::max(
+        grow_initial_extra_rows_lr,
+        params.contains("grow_max_extra_rows")
+            ? requested_extra_lr("grow_max_extra_rows", params)
+            : grow_initial_extra_rows_lr);
+    const int grow_max_extra_cols_lr = std::max(
+        grow_initial_extra_cols_lr,
+        params.contains("grow_max_extra_cols")
+            ? requested_extra_lr("grow_max_extra_cols", params)
+            : grow_initial_extra_cols_lr);
 
     int grid_limit_w = std::numeric_limits<int>::max();
     int grid_limit_h = std::numeric_limits<int>::max();
     cv::Point resume_origin(grid_margin, grid_margin);
     cv::Rect resume_grid_bounds;
+    int expanded_left = 0;
+    int expanded_right = 0;
+    int expanded_up = 0;
+    int expanded_down = 0;
+    int max_extra_left = std::numeric_limits<int>::max();
+    int max_extra_right = std::numeric_limits<int>::max();
+    int max_extra_up = std::numeric_limits<int>::max();
+    int max_extra_down = std::numeric_limits<int>::max();
     if (resume_growth) {
         const int resume_cols = (seed_points.cols + grid_step - 1) / grid_step + 1;
         const int resume_rows = (seed_points.rows + grid_step - 1) / grid_step + 1;
-        const int extra_left = grow_left ? grow_extra_cols_lr : 0;
-        const int extra_right = grow_right ? grow_extra_cols_lr : 0;
-        const int extra_up = grow_up ? grow_extra_rows_lr : 0;
-        const int extra_down = grow_down ? grow_extra_rows_lr : 0;
+        const int extra_left = grow_left ? grow_initial_extra_cols_lr : 0;
+        const int extra_right = grow_right ? grow_initial_extra_cols_lr : 0;
+        const int extra_up = grow_up ? grow_initial_extra_rows_lr : 0;
+        const int extra_down = grow_down ? grow_initial_extra_rows_lr : 0;
+        expanded_left = extra_left;
+        expanded_right = extra_right;
+        expanded_up = extra_up;
+        expanded_down = extra_down;
+        max_extra_left = grow_left ? grow_max_extra_cols_lr : 0;
+        max_extra_right = grow_right ? grow_max_extra_cols_lr : 0;
+        max_extra_up = grow_up ? grow_max_extra_rows_lr : 0;
+        max_extra_down = grow_down ? grow_max_extra_rows_lr : 0;
         resume_origin = cv::Point(grid_margin + extra_left, grid_margin + extra_up);
-        grid_limit_w = grid_margin + extra_left + resume_cols + extra_right + grid_margin;
-        grid_limit_h = grid_margin + extra_up + resume_rows + extra_down + grid_margin;
+        grid_limit_w = grid_margin + max_extra_left + resume_cols + max_extra_right + grid_margin;
+        grid_limit_h = grid_margin + max_extra_up + resume_rows + max_extra_down + grid_margin;
         w = std::max(1, grid_limit_w);
         h = std::max(1, grid_limit_h);
+        if (extra_left != max_extra_left || extra_right != max_extra_right) {
+            w = std::max(1, grid_margin + extra_left + resume_cols + extra_right + grid_margin);
+        }
+        if (extra_up != max_extra_up || extra_down != max_extra_down) {
+            h = std::max(1, grid_margin + extra_up + resume_rows + extra_down + grid_margin);
+        }
         resume_grid_bounds = cv::Rect(resume_origin.x, resume_origin.y, resume_cols, resume_rows);
         std::cout << "resume_growth: true, source grid " << seed_points.size()
                   << " low-res " << cv::Size(resume_cols, resume_rows)
                   << " origin " << resume_origin
                   << " bounds " << cv::Size(w, h)
-                  << " extra_lr left=" << extra_left
+                  << " initial_extra_lr left=" << extra_left
                   << " right=" << extra_right
                   << " up=" << extra_up
-                  << " down=" << extra_down << std::endl;
+                  << " down=" << extra_down
+                  << " max_extra_lr left=" << max_extra_left
+                  << " right=" << max_extra_right
+                  << " up=" << max_extra_up
+                  << " down=" << max_extra_down << std::endl;
     }
     cv::Size size = {w,h};
     cv::Rect bounds(0,0,w-1,h-1);
@@ -2028,6 +2064,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     cv::Mat_<uint16_t> best_generations = generations.clone();
     SurfTrackerData best_data = data;
     cv::Rect best_used_area = used_area;
+    int best_expanded_left = expanded_left;
+    int best_expanded_up = expanded_up;
 
     auto save_best_surface = [&](int count) {
         best_loc_valid_count = count;
@@ -2036,6 +2074,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         best_generations = generations.clone();
         best_data = data;
         best_used_area = used_area;
+        best_expanded_left = expanded_left;
+        best_expanded_up = expanded_up;
     };
 
     std::vector<SurfTrackerData> data_ths(omp_get_max_threads());
@@ -2801,17 +2841,31 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         const int max_grid_extent = std::max(1, static_cast<int>(max_width / step));
         const int max_grid_w = std::min(max_grid_extent, grid_limit_w);
         const int max_grid_h = std::min(max_grid_extent, grid_limit_h);
-        const bool can_expand_left = !disable_grid_expansion && grow_left && w < max_grid_w;
-        const bool can_expand_right = !disable_grid_expansion && grow_right && w < max_grid_w;
-        const bool can_expand_up = !disable_grid_expansion && grow_up && h < max_grid_h;
-        const bool can_expand_down = !disable_grid_expansion && grow_down && h < max_grid_h;
+        const auto remaining_extra = [](int max_extra, int expanded) {
+            if (max_extra == std::numeric_limits<int>::max()) {
+                return std::numeric_limits<int>::max();
+            }
+            return std::max(0, max_extra - expanded);
+        };
+        const int remaining_left = remaining_extra(max_extra_left, expanded_left);
+        const int remaining_right = remaining_extra(max_extra_right, expanded_right);
+        const int remaining_up = remaining_extra(max_extra_up, expanded_up);
+        const int remaining_down = remaining_extra(max_extra_down, expanded_down);
+        const bool can_expand_left = !disable_grid_expansion && grow_left && remaining_left > 0 && w < max_grid_w;
+        const bool can_expand_right = !disable_grid_expansion && grow_right && remaining_right > 0 && w < max_grid_w;
+        const bool can_expand_up = !disable_grid_expansion && grow_up && remaining_up > 0 && h < max_grid_h;
+        const bool can_expand_down = !disable_grid_expansion && grow_down && remaining_down > 0 && h < max_grid_h;
         if (fringe.empty() && (can_expand_left || can_expand_right || can_expand_up || can_expand_down))
         {
             at_right_border = false;
-            const int add_left = can_expand_left ? std::min(sliding_w, max_grid_w - w) : 0;
-            const int add_right = can_expand_right ? std::min(sliding_w, max_grid_w - w - add_left) : 0;
-            const int add_up = can_expand_up ? std::min(sliding_w, max_grid_h - h) : 0;
-            const int add_down = can_expand_down ? std::min(sliding_w, max_grid_h - h - add_up) : 0;
+            int width_capacity = max_grid_w - w;
+            int height_capacity = max_grid_h - h;
+            const int add_left = can_expand_left ? std::min({sliding_w, remaining_left, width_capacity}) : 0;
+            width_capacity -= add_left;
+            const int add_right = can_expand_right ? std::min({sliding_w, remaining_right, width_capacity}) : 0;
+            const int add_up = can_expand_up ? std::min({sliding_w, remaining_up, height_capacity}) : 0;
+            height_capacity -= add_up;
+            const int add_down = can_expand_down ? std::min({sliding_w, remaining_down, height_capacity}) : 0;
             const int new_w = w + add_left + add_right;
             const int new_h = h + add_up + add_down;
             if (new_w == w && new_h == h) {
@@ -2826,6 +2880,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             final_opts = global_steps_per_window;
             w = new_w;
             h = new_h;
+            expanded_left += add_left;
+            expanded_right += add_right;
+            expanded_up += add_up;
+            expanded_down += add_down;
             size = {w,h};
             bounds = {0,0,w-1,h-1};
             save_bounds_inv = {closing_r+5,closing_r+5,h-closing_r-10,w-closing_r-10};
@@ -2939,6 +2997,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         data = best_data;
         used_area = best_used_area;
         used_area_hr = scaled_rect_trunc(used_area, step);
+        expanded_left = best_expanded_left;
+        expanded_up = best_expanded_up;
         loc_valid_count = best_loc_valid_count;
     } else {
         loc_valid_count = final_loc_valid_count;
@@ -2958,6 +3018,14 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     surf->meta["area_vx2"] = static_cast<double>(area_est_vx2);
     surf->meta["area_cm2"] = static_cast<double>(area_est_cm2);
     surf->meta["used_approved_segments"] = json_to_utils(nlohmann::json(std::vector<std::string>(used_approved_names.begin(), used_approved_names.end())));
+    if (resume_growth) {
+        const int offset_col = grid_margin + expanded_left - used_area.x;
+        const int offset_row = grid_margin + expanded_up - used_area.y;
+        auto off_arr = utils::Json::array();
+        off_arr.push_back(offset_col);
+        off_arr.push_back(offset_row);
+        surf->meta["grid_offset"] = std::move(off_arr);
+    }
 
     return surf;
 }
