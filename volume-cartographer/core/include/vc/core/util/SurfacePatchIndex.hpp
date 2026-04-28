@@ -2,9 +2,12 @@
 
 #include <array>
 #include <cstdint>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <optional>
+#include <shared_mutex>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -50,10 +53,19 @@ public:
     SurfacePatchIndex& operator=(const SurfacePatchIndex&) = delete;
 
     void rebuild(const std::vector<SurfacePtr>& surfaces, float bboxPadding = 0.0f);
+    static std::string cacheKeyForSurfaces(const std::vector<SurfacePtr>& surfaces,
+                                           int samplingStride,
+                                           float bboxPadding);
+    bool loadCache(const std::filesystem::path& cachePath,
+                   const std::vector<SurfacePtr>& surfaces,
+                   const std::string& expectedKey);
+    bool saveCache(const std::filesystem::path& cachePath,
+                   const std::string& cacheKey) const;
     void clear();
     bool empty() const;
     size_t patchCount() const;
     size_t surfaceCount() const;
+    bool containsSurface(const SurfacePtr& surface) const;
 
     std::optional<LookupResult> locate(const cv::Vec3f& worldPoint,
                                        float tolerance,
@@ -70,6 +82,14 @@ public:
     void forEachTriangle(const Rect3D& bounds,
                          const SurfacePtr& targetSurface,
                          const std::function<void(const TriangleCandidate&)>& visitor) const;
+
+    void forEachTriangleIntersectingRay(const Rect3D& bounds,
+                                        const SurfacePtr& targetSurface,
+                                        const cv::Vec3f& origin,
+                                        const cv::Vec3f& dir,
+                                        float minT,
+                                        float maxT,
+                                        const std::function<void(const TriangleCandidate&)>& visitor) const;
 
     void forEachTriangle(const Rect3D& bounds,
                          const std::unordered_set<SurfacePtr>& targetSurfaces,
@@ -99,6 +119,8 @@ public:
     bool removeSurface(const SurfacePtr& surface);
     bool setSamplingStride(int stride);
     int samplingStride() const;
+    void setReadOnly(bool readOnly);
+    bool readOnly() const;
 
     // Pending update tracking for incremental R-tree updates
     // Queue the 4 cells surrounding a vertex for update
@@ -133,5 +155,6 @@ private:
                              PatchFilter&& patchFilter = NoPatchFilter{}) const;
 
     struct Impl;
+    mutable std::shared_mutex mutex_;
     std::unique_ptr<Impl> impl_;
 };

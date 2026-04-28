@@ -519,14 +519,16 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
             slice(x_start, x_end)
         )
 
-        normalized = np.zeros_like(chunk_logits)
-        np.divide(chunk_logits, chunk_weights[np.newaxis, :, :, :] + epsilon,
-                  out=normalized, where=chunk_weights[np.newaxis, :, :, :] > 0)
+        # Divide in place: voxels with weight==0 had no contributions so
+        # chunk_logits is already 0 there, and `where=...` leaves them untouched.
+        weights_b = chunk_weights[np.newaxis, :, :, :]
+        np.divide(chunk_logits, weights_b + epsilon,
+                  out=chunk_logits, where=weights_b > 0)
 
         finalize_config = _worker_state.get('finalize_config')
         if finalize_config is not None:
             from vesuvius.models.run.finalize_outputs import apply_finalization
-            result, is_empty = apply_finalization(normalized, num_classes, finalize_config)
+            result, is_empty = apply_finalization(chunk_logits, num_classes, finalize_config)
             if not is_empty:
                 # Finalized output may have different channel count than blended logits;
                 # write using slices that match the finalized shape.
@@ -538,7 +540,7 @@ def process_chunk(chunk_info, chunk_patches, epsilon=1e-8):
                 )
                 output_store[finalized_slice] = result
         else:
-            output_store[output_slice] = normalized.astype(np.float16)
+            output_store[output_slice] = chunk_logits.astype(np.float16)
 
     return {
         'chunk': chunk_info,
@@ -566,12 +568,13 @@ def calculate_chunks(volume_shape, output_chunks=None, z_range=None):
                 y_end = min(y_start + y_chunk, Y)
                 x_end = min(x_start + x_chunk, X)
 
-                # Apply Z-range filtering if specified
+                # Apply Z-range filtering if specified. z_range is chunk-aligned
+                # (see merge_inference_outputs), so each chunk's z_start uniquely
+                # identifies its owning partition.
                 if z_range is not None:
                     range_z_start, range_z_end = z_range
-                    # Only include chunks whose end is inside the range
-                    if not (range_z_start < z_end and range_z_end >= z_end):
-                        continue  # Skip chunks outside the Z-range
+                    if not (range_z_start <= z_start < range_z_end):
+                        continue
 
                 chunks.append({
                     'z_start': z_start, 'z_end': z_end,
@@ -777,13 +780,23 @@ def merge_inference_outputs(
     gaussian_map = generate_gaussian_map(patch_size, sigma_scale=sigma_scale)
 
     # --- 5. Calculate Z-range for this part ---
+    # Partition by chunk index (not by Z coordinate) so boundaries always fall
+    # on chunk boundaries. Otherwise the `(range_z_start, range_z_end]` filter
+    # on z_end drifts against the chunk grid and the clamped partial last chunk
+    # can land in the same partition as the preceding full chunk — doubling the
+    # last partition's work and leaving part 0 empty.
     z_range = None
     if num_parts > 1:
-        total_z = original_volume_shape[0]  # Z dimension
-        z_start = (global_part_id * total_z) // num_parts
-        z_end = ((global_part_id + 1) * total_z) // num_parts
+        total_z = original_volume_shape[0]
+        z_chunk = output_chunks[1]
+        total_z_chunks = (total_z + z_chunk - 1) // z_chunk
+        start_chunk = (global_part_id * total_z_chunks) // num_parts
+        end_chunk = ((global_part_id + 1) * total_z_chunks) // num_parts
+        z_start = start_chunk * z_chunk
+        z_end = min(end_chunk * z_chunk, total_z)
         z_range = (z_start, z_end)
-        print(f"Part {global_part_id} processing Z-range: {z_start} to {z_end} (out of {total_z})")
+        print(f"Part {global_part_id} processing Z-range: {z_start} to {z_end} "
+              f"(chunks {start_chunk}..{end_chunk} of {total_z_chunks}, total_z={total_z})")
 
     # --- 6. Calculate Processing Chunks ---
     chunks = calculate_chunks(

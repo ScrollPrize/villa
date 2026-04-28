@@ -18,6 +18,7 @@ vc_add_test(test_vc_ngrids_smoke test_vc_ngrids_smoke.cpp)
 vc_add_test(test_volumepkg test_volumepkg.cpp)
 vc_add_test(test_vcdataset test_vcdataset.cpp)
 vc_add_test(test_quad_surface test_quad_surface.cpp)
+vc_add_test(test_surface_patch_index test_surface_patch_index.cpp)
 
 add_dependencies(test_vc_gen_normalgrids_smoke vc_gen_normalgrids)
 target_compile_definitions(test_vc_gen_normalgrids_smoke PRIVATE

@@ -118,7 +118,11 @@ void sampleAdaptiveARGB32(
     // queued the needed blocks, so rerunning the enumeration is pure
     // overhead. No correctness impact on block residency: the per-sample
     // adaptive fallback still handles any block not yet loaded.
-    bool skipPrefetch = false);
+    bool skipPrefetch = false,
+    // When true, pixels that visibly fall back to a coarser level are
+    // aggregated back to desired-level ChunkKeys and submitted immediately as
+    // an interactive repair request. Intended for idle catch-up frames.
+    bool promoteFallbackChunks = false);
 
 // Fused plane composite: inline coords + nearest-neighbor per layer + composite + LUT → ARGB32.
 // No coord matrix allocation. For PlaneSurface composite rendering.
@@ -130,4 +134,3 @@ void samplePlaneCompositeARGB32(
     int width, int height,
     const std::string& compositeMethod,
     const uint32_t lut[256]);
-

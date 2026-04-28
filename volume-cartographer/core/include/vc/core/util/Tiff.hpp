@@ -14,9 +14,10 @@ inline float voxelSizeToDpi(double voxelSizeUm)
     return voxelSizeUm > 0 ? static_cast<float>(25400.0 / voxelSizeUm) : 0.f;
 }
 
-// Write single-channel image (8U, 16U, 32F) as tiled TIFF
+// Write single-channel image (8U, 16U, 32F) as TIFF.
 // cvType: output type (-1 = same as input). If different, values are scaled:
 //         8U↔16U: scale by 257, 8U↔32F: scale by 1/255, 16U↔32F: scale by 1/65535
+// tileW/tileH: tile dimensions. If either is 0, write one untiled strip.
 // compression: libtiff compression constant (e.g. COMPRESSION_LZW, COMPRESSION_PACKBITS)
 // padValue: value for padding partial tiles (default -1.0f, used for float; int types use 0)
 // dpi: resolution in dots per inch (0 = don't set). Use voxelSizeToDpi() to convert from µm.

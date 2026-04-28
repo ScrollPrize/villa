@@ -406,10 +406,15 @@ class SurfaceTracerEvaluation:
 
             cmd = [
                 str(self.bin_dir / "vc_grow_seg_from_segments"),
+                "--volume",
                 self.config["surface_zarr_volume"],
+                "--src-dir",
                 str(self.patches_dir),
+                "--target-dir",
                 str(run_traces_dir),
+                "--params",
                 str(tracer_params_file),
+                "--src-segment",
                 str(source_patch.path),
             ]
 

@@ -2,7 +2,10 @@ import torch
 import numpy as np
 import zarr
 import os
+import fcntl
+import hashlib
 import multiprocessing
+import subprocess
 import threading
 import fsspec
 import numcodecs
@@ -20,6 +23,113 @@ from vesuvius.models.run.external_models.load_resnet import try_load_external_re
 from vesuvius.models.run.tta import infer_with_tta
 from vesuvius.models.run.patch_writer import BoundedPatchWriter
 from vesuvius.utils.k8s import get_tqdm_kwargs
+
+
+def _tuple_if_sequence(value):
+    if isinstance(value, (list, tuple)):
+        return tuple(value)
+    return value
+
+
+def _normalize_train_py_model_config(checkpoint_data):
+    """Return a modern model_config for current and legacy train.py checkpoints."""
+    model_config = checkpoint_data.get('model_config')
+    if model_config:
+        return dict(model_config)
+
+    legacy_config = checkpoint_data.get('config')
+    if not isinstance(legacy_config, dict):
+        return {}
+
+    model_config = dict(legacy_config.get('model_config') or {})
+
+    if 'patch_size' in legacy_config:
+        patch_size = _tuple_if_sequence(legacy_config['patch_size'])
+        model_config.setdefault('patch_size', patch_size)
+        model_config.setdefault('train_patch_size', patch_size)
+
+    if 'batch_size' in legacy_config:
+        model_config.setdefault('batch_size', legacy_config['batch_size'])
+        model_config.setdefault('train_batch_size', legacy_config['batch_size'])
+
+    if 'in_channels' in legacy_config:
+        model_config.setdefault('in_channels', legacy_config['in_channels'])
+
+    targets = legacy_config.get('targets')
+    if targets:
+        model_config.setdefault('targets', targets)
+
+    model_name = (
+        legacy_config.get('wandb_run_name')
+        or legacy_config.get('model_name')
+        or legacy_config.get('out_dir')
+    )
+    if model_name:
+        model_config.setdefault('model_name', str(model_name))
+
+    if 'enable_deep_supervision' in legacy_config:
+        model_config.setdefault('enable_deep_supervision', legacy_config['enable_deep_supervision'])
+    else:
+        model_config.setdefault('enable_deep_supervision', False)
+
+    return model_config
+
+
+def _legacy_checkpoint_uses_ema_for_inference(checkpoint_data):
+    legacy_config = checkpoint_data.get('config')
+    if not isinstance(legacy_config, dict):
+        return False
+    ema_config = legacy_config.get('ema')
+    if not isinstance(ema_config, dict):
+        return False
+    return bool(ema_config.get('validate', False)) and isinstance(checkpoint_data.get('ema_model'), dict)
+
+
+def _select_train_py_state_dict(checkpoint_data):
+    if _legacy_checkpoint_uses_ema_for_inference(checkpoint_data):
+        return checkpoint_data['ema_model'], 'ema_model'
+    return checkpoint_data.get('model', checkpoint_data), 'model'
+
+
+def _checkpoint_normalization_scheme(checkpoint_data):
+    if 'normalization_scheme' in checkpoint_data:
+        return checkpoint_data['normalization_scheme']
+    legacy_config = checkpoint_data.get('config')
+    if not isinstance(legacy_config, dict):
+        return None
+    image_normalization = legacy_config.get('image_normalization')
+    if image_normalization == 'percentile_minmax':
+        return 'percentile_minmax'
+    return image_normalization
+
+
+def _select_evenly_spaced_middle_indices(candidate_indices, limit):
+    """Select a deterministic, small representative subset of patch indices."""
+    candidates = list(candidate_indices)
+    if limit >= len(candidates):
+        return candidates
+    if limit == 1:
+        return [candidates[len(candidates) // 2]]
+
+    positions = np.linspace(0, len(candidates) - 1, num=limit)
+    selected_offsets = []
+    seen = set()
+    for pos in positions:
+        offset = int(round(float(pos)))
+        offset = min(max(offset, 0), len(candidates) - 1)
+        if offset not in seen:
+            selected_offsets.append(offset)
+            seen.add(offset)
+
+    offset = 0
+    while len(selected_offsets) < limit and offset < len(candidates):
+        if offset not in seen:
+            selected_offsets.append(offset)
+            seen.add(offset)
+        offset += 1
+
+    selected_offsets.sort()
+    return [candidates[offset] for offset in selected_offsets]
 
 
 class _InferenceDeepSupervisionWrapper(torch.nn.Module):
@@ -41,6 +151,59 @@ class _InferenceDeepSupervisionWrapper(torch.nn.Module):
 
     def forward(self, *args, **kwargs):
         return self._collapse(self.network(*args, **kwargs))
+
+
+DEFAULT_MODEL_CACHE_DIR = os.environ.get('VESUVIUS_MODEL_CACHE_DIR', '/tmp/vesuvius-models')
+
+
+def _resolve_model_path(model_path: str, cache_dir: str, verbose: bool = False) -> str:
+    """Resolve a model_path, downloading from S3 to a local cache if needed.
+
+    For s3:// URLs, runs `aws s3 sync` into `<cache_dir>/<sha256(url)>/` and
+    returns the local directory path. A `.done` sentinel marks successful
+    completion so re-runs reuse the cache. Concurrent downloads of the same
+    model are serialized with fcntl.flock on a per-model lockfile.
+
+    For non-S3 paths, returns the input unchanged.
+    """
+    if not isinstance(model_path, str) or not model_path.startswith('s3://'):
+        return model_path
+
+    os.makedirs(cache_dir, exist_ok=True)
+    key = hashlib.sha256(model_path.encode('utf-8')).hexdigest()[:16]
+    target = os.path.join(cache_dir, key)
+    done = target + '.done'
+    lock_path = target + '.lock'
+
+    if os.path.exists(done):
+        if verbose:
+            print(f"Model cache hit: {model_path} -> {target}")
+        return target
+
+    with open(lock_path, 'w') as lock_fh:
+        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        # Re-check after acquiring the lock in case another process completed.
+        if os.path.exists(done):
+            if verbose:
+                print(f"Model cache hit after lock: {model_path} -> {target}")
+            return target
+
+        print(f"Downloading model from {model_path} to {target}")
+        os.makedirs(target, exist_ok=True)
+        result = subprocess.run(
+            ['aws', 's3', 'sync', model_path.rstrip('/') + '/', target],
+            check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"aws s3 sync failed for {model_path} (exit {result.returncode})"
+            )
+        # Sentinel written only after a successful sync so partial downloads
+        # never appear cached.
+        open(done, 'w').close()
+        print(f"Model cached at {target}")
+
+    return target
 
 
 class Inferer():
@@ -74,6 +237,9 @@ class Inferer():
                  compression_level: int = 1,
                  hf_token: str = None,
                  model_type: str = 'auto',
+                 input_anon: bool = False,
+                 model_cache_dir: str = DEFAULT_MODEL_CACHE_DIR,
+                 max_patches: int = None,
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -106,6 +272,9 @@ class Inferer():
         self.compression_level = compression_level
         self.hf_token = hf_token
         self.model_type = model_type
+        self.input_anon = input_anon
+        self.model_cache_dir = model_cache_dir
+        self.max_patches = max_patches
         self.model_patch_size = None
         self.num_classes = None
 
@@ -133,6 +302,8 @@ class Inferer():
             raise ValueError(f"Invalid overlap value {self.overlap}. Must be between 0 and 1.")
         if self.tta_type not in ['mirroring', 'rotation']:
              raise ValueError(f"Invalid tta_type '{self.tta_type}'. Must be 'mirroring' or 'rotation'.")
+        if self.max_patches is not None and self.max_patches < 1:
+            raise ValueError(f"max_patches must be >= 1 when provided, got {self.max_patches}.")
         # Defer patch size validation until after model loading if not explicitly provided
 
         # --- Output Setup ---
@@ -162,6 +333,12 @@ class Inferer():
 
 
     def _load_model(self):
+        # Download+cache S3 model paths to a local directory before loading.
+        # hf:// URLs are handled by load_model_for_inference via huggingface_hub.
+        self.model_path = _resolve_model_path(
+            self.model_path, self.model_cache_dir, verbose=self.verbose
+        )
+
         # check if model_path is a Hugging Face model path (starts with "hf://")
         if isinstance(self.model_path, str) and self.model_path.startswith("hf://"):
             hf_model_path = self.model_path.replace("hf://", "")
@@ -326,13 +503,14 @@ class Inferer():
         checkpoint_data = torch.load(checkpoint_path, map_location='cpu', weights_only=False)
         
         # Extract model configuration
-        model_config = checkpoint_data.get('model_config', {})
+        model_config = _normalize_train_py_model_config(checkpoint_data)
         if not model_config:
             raise ValueError("No model configuration found in checkpoint")
         
         # Extract normalization info if present
-        if 'normalization_scheme' in checkpoint_data:
-            self.model_normalization_scheme = checkpoint_data['normalization_scheme']
+        checkpoint_normalization = _checkpoint_normalization_scheme(checkpoint_data)
+        if checkpoint_normalization:
+            self.model_normalization_scheme = checkpoint_normalization
             if self.verbose:
                 print(f"Found normalization scheme in checkpoint: {self.model_normalization_scheme}")
         
@@ -365,7 +543,9 @@ class Inferer():
         model = model.to(self.device)
         
         # Load weights
-        model_state_dict = checkpoint_data.get('model', checkpoint_data)
+        model_state_dict, state_dict_source = _select_train_py_state_dict(checkpoint_data)
+        if self.verbose:
+            print(f"Loading weights from checkpoint key: {state_dict_source}")
 
         # Strip wrapper prefixes (DDP 'module.' and torch.compile '_orig_mod.')
         # This ensures checkpoint compatibility regardless of how it was saved
@@ -446,6 +626,37 @@ class Inferer():
         
         return model_info
 
+    def _limit_dataset_patches(self):
+        if self.max_patches is None:
+            return
+
+        positions = getattr(self.dataset, 'all_positions', None)
+        if not positions or len(positions) <= self.max_patches:
+            return
+
+        candidate_indices = range(len(positions))
+        non_empty_mask = getattr(self.dataset, 'non_empty_mask', None)
+        if non_empty_mask is not None and len(non_empty_mask) == len(positions):
+            non_empty_indices = np.flatnonzero(non_empty_mask)
+            if len(non_empty_indices) > 0:
+                candidate_indices = non_empty_indices.tolist()
+
+        selected_indices = _select_evenly_spaced_middle_indices(
+            candidate_indices,
+            min(self.max_patches, len(candidate_indices)),
+        )
+
+        self.dataset.all_positions = [positions[index] for index in selected_indices]
+        if non_empty_mask is not None and len(non_empty_mask) == len(positions):
+            self.dataset.non_empty_mask = np.asarray(non_empty_mask)[selected_indices]
+
+        if self.verbose:
+            print(
+                f"Limited part {self.part_id}/{self.num_parts} from {len(positions)} "
+                f"to {len(self.dataset.all_positions)} patch positions "
+                f"(max_patches={self.max_patches})"
+            )
+
     def _create_dataset_and_loader(self):
         # Use step_size instead of overlap (step_size is [0-1] representing stride as fraction of patch size)
         # step_size of 0.5 means 50% overlap
@@ -492,13 +703,16 @@ class Inferer():
             scroll_id=self.scroll_id,
             segment_id=self.segment_id,
             energy=self.energy,
-            resolution=self.resolution
+            resolution=self.resolution,
+            anon=self.input_anon,
         )
 
         expected_attr_name = 'all_positions'
         if not hasattr(self.dataset, expected_attr_name) or getattr(self.dataset, expected_attr_name) is None:
             raise AttributeError(f"The VCDataset instance must calculate and provide an "
                                  f"'{expected_attr_name}' attribute (list of coordinate tuples).")
+
+        self._limit_dataset_patches()
 
         self.patch_start_coords_list = getattr(self.dataset, expected_attr_name)
         self.num_total_patches = len(self.patch_start_coords_list)
@@ -509,8 +723,13 @@ class Inferer():
                   f"{expected_attr_name} length ({self.num_total_patches}). Using {expected_attr_name} list length.")
 
         if self.num_total_patches == 0:
-            raise RuntimeError(
-                f"Dataset for part {self.part_id}/{self.num_parts} is empty (based on calculated coordinates in '{expected_attr_name}'). Check input data and partitioning.")
+            print(
+                f"Part {self.part_id}/{self.num_parts} has no patch positions; "
+                "empty output stores will still be written so downstream blending can enumerate parts uniformly."
+            )
+            self.num_active_patches = 0
+            self.dataloader = None
+            return self.dataset, self.dataloader
 
         # Let the dataset decide whether to expose a filtered view (e.g. a Subset
         # over non-empty patches when the input zarr's chunk occupancy has been
@@ -581,8 +800,8 @@ class Inferer():
     def _create_output_stores(self):
         if self.num_classes is None or self.patch_size is None or self.num_total_patches is None:
             raise RuntimeError("Cannot create output stores: model/patch info missing.")
-        if not self.patch_start_coords_list:
-            raise RuntimeError("Cannot create output stores: patch coordinates not available.")
+        # An empty patch list is valid: we still write zarrs with shape[0]=0 so
+        # blending can enumerate logits_part_*.zarr files uniformly across parts.
 
         compressor = self._get_zarr_compressor()
         output_shape = (self.num_total_patches, self.num_classes, *self.patch_size)
@@ -608,7 +827,8 @@ class Inferer():
         
         self.coords_store_path = os.path.join(self.output_dir, f"coordinates_part_{self.part_id}.zarr")
         coord_shape = (self.num_total_patches, len(self.patch_size))
-        coord_chunks = (min(self.num_total_patches, 4096), len(self.patch_size))
+        # zarr rejects chunks with a zero dimension even when shape[0] is 0, so floor at 1.
+        coord_chunks = (max(1, min(self.num_total_patches, 4096)), len(self.patch_size))
         
         print(f"Creating coordinates store at: {self.coords_store_path}")
         
@@ -658,8 +878,11 @@ class Inferer():
         except Exception as e:
             print(f"Warning: Failed to write custom attributes: {e}")
 
-        coords_np = np.array(self.patch_start_coords_list, dtype=np.int32)
-        coords_store[:] = coords_np
+        if self.patch_start_coords_list:
+            coords_np = np.array(self.patch_start_coords_list, dtype=np.int32)
+            coords_store[:] = coords_np
+        else:
+            coords_np = np.zeros((0, len(self.patch_size)), dtype=np.int32)
 
         # Compute and store bounding box for efficient blending filtering
         if len(coords_np) > 0:
@@ -807,14 +1030,14 @@ class Inferer():
         if self.verbose: print("Creating dataset and dataloader...")
         self._create_dataset_and_loader()
 
-        if self.num_total_patches > 0:
-            if self.verbose: print("Creating output stores...")
-            self._create_output_stores()
+        if self.verbose: print("Creating output stores...")
+        self._create_output_stores()
 
+        if self.num_total_patches > 0:
             if self.verbose: print("Starting inference and writing logits...")
             self._process_batches()
         else:
-            print(f"Skipping processing for part {self.part_id} as no patches were found.")
+            print(f"Part {self.part_id} has no patches; wrote empty output stores and skipped inference.")
 
         if self.verbose: print("Inference complete.")
 
@@ -837,6 +1060,10 @@ def main():
     parser.add_argument('--model_path', type=str, required=True,
                       help='Path to nnUNet model folder, train.py .pth, or external model path (when enabled)')
     parser.add_argument('--input_dir', type=str, required=True, help='Path to the input Zarr volume')
+    parser.add_argument('--input_anon', action='store_true',
+                      help='Use anonymous (unsigned) S3 requests for the input volume. '
+                           'Required when reading from a public bucket while AWS credentials '
+                           'are configured for writes to a different bucket.')
     parser.add_argument('--output_dir', type=str, required=True, help='Path to store output predictions')
     parser.add_argument('--input_format', type=str, default='zarr', help='Input format (zarr, volume)')
     parser.add_argument('--tta_type', type=str, default='mirroring', choices=['mirroring', 'rotation'],
@@ -876,12 +1103,19 @@ def main():
     parser.add_argument('--segment_id', type=str, default=None, help='Segment ID to use (if input_format is volume)')
     parser.add_argument('--energy', type=int, default=None, help='Energy level to use (if input_format is volume)')
     parser.add_argument('--resolution', type=float, default=None, help='Resolution to use (if input_format is volume)')
-    
+
     # Add arguments for Hugging Face model loading
     parser.add_argument('--hf_token', type=str, default=None, help='Hugging Face token for accessing private repositories')
     parser.add_argument('--model-type', type=str, default='auto',
                       choices=['auto', 'nnunet', 'train_py', 'resnet'],
                       help='Model loader type. Use "resnet" for external ink_model.py + .pth loading.')
+    parser.add_argument('--model_cache_dir', type=str, default=DEFAULT_MODEL_CACHE_DIR,
+                      help=f'Local directory used to cache models downloaded from S3. '
+                           f'Only applies when --model_path is an s3:// URL. '
+                           f'Default: {DEFAULT_MODEL_CACHE_DIR}')
+    parser.add_argument('--max_patches', type=int, default=None,
+                      help='Optional cap on patch positions processed by this part. '
+                           'Intended for smoke tests; production inference leaves this unset.')
     
     args = parser.parse_args()
     
@@ -936,7 +1170,10 @@ def main():
         compression_level=args.zarr_compression_level,
         # Pass Hugging Face parameters
         hf_token=args.hf_token,
-        model_type=args.model_type
+        model_type=args.model_type,
+        input_anon=args.input_anon,
+        model_cache_dir=args.model_cache_dir,
+        max_patches=args.max_patches,
     )
 
     try:

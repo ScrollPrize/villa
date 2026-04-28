@@ -8,6 +8,9 @@
 #include <QCheckBox>
 #include <QComboBox>
 #include <QDoubleSpinBox>
+#include <QDir>
+#include <QFileDialog>
+#include <QFormLayout>
 #include <QGroupBox>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -17,11 +20,14 @@
 #include <QSettings>
 #include <QSignalBlocker>
 #include <QSpinBox>
+#include <QStyle>
+#include <QToolButton>
 #include <QVBoxLayout>
 #include <QVariant>
 
 #include <algorithm>
 #include <cmath>
+#include <filesystem>
 
 namespace {
 constexpr int kGrowDirUpBit = 1 << 0;
@@ -29,6 +35,8 @@ constexpr int kGrowDirDownBit = 1 << 1;
 constexpr int kGrowDirLeftBit = 1 << 2;
 constexpr int kGrowDirRightBit = 1 << 3;
 constexpr int kGrowDirAllMask = kGrowDirUpBit | kGrowDirDownBit | kGrowDirLeftBit | kGrowDirRightBit;
+constexpr int kDefaultGrowthMaxSteps = 1024;
+constexpr int kPatchTracerMaxSteps = 100000;
 
 bool containsSurfKeyword(const QString& text)
 {
@@ -47,6 +55,13 @@ std::optional<int> trailingNumber(const QString& text)
         return match.captured(1).toInt();
     }
     return std::nullopt;
+}
+
+int growthStepMaximumForMethod(SegmentationGrowthMethod method)
+{
+    return method == SegmentationGrowthMethod::PatchTracer
+        ? kPatchTracerMaxSteps
+        : kDefaultGrowthMaxSteps;
 }
 } // namespace
 
@@ -68,10 +83,14 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
     auto* methodLabel = new QLabel(tr("Method:"), _groupGrowth);
     _comboGrowthMethod = new QComboBox(_groupGrowth);
     _comboGrowthMethod->addItem(tr("Tracer"), static_cast<int>(SegmentationGrowthMethod::Tracer));
+    _comboGrowthMethod->addItem(tr("Patch Tracer"), static_cast<int>(SegmentationGrowthMethod::PatchTracer));
     _comboGrowthMethod->addItem(tr("Extrapolation"), static_cast<int>(SegmentationGrowthMethod::Extrapolation));
+    _comboGrowthMethod->addItem(tr("Manual Add"), static_cast<int>(SegmentationGrowthMethod::ManualAdd));
     _comboGrowthMethod->setToolTip(tr("Select the growth algorithm:\n"
                                       "- Tracer: Neural-guided growth using volume data\n"
-                                      "- Extrapolation: Simple polynomial extrapolation from boundary points"));
+                                      "- Patch Tracer: Patch-index based growth from loaded surfaces\n"
+                                      "- Extrapolation: Simple polynomial extrapolation from boundary points\n"
+                                      "- Manual Add: Interactive invalid-region bridging"));
     methodRow->addWidget(methodLabel);
     methodRow->addWidget(_comboGrowthMethod);
     methodRow->addStretch(1);
@@ -210,7 +229,7 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
     auto* dirRow = new QHBoxLayout();
     auto* stepsLabel = new QLabel(tr("Steps:"), _groupGrowth);
     _spinGrowthSteps = new QSpinBox(_groupGrowth);
-    _spinGrowthSteps->setRange(0, 1024);
+    _spinGrowthSteps->setRange(0, kDefaultGrowthMaxSteps);
     _spinGrowthSteps->setSingleStep(1);
     _spinGrowthSteps->setToolTip(tr("Number of iterations to run when growing the segmentation."));
     dirRow->addWidget(stepsLabel);
@@ -236,8 +255,8 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
     growthLayout->addLayout(dirRow);
 
     auto* keybindsRow = new QHBoxLayout();
-    _chkGrowthKeybindsEnabled = new QCheckBox(tr("Enable growth keybinds (1-6)"), _groupGrowth);
-    _chkGrowthKeybindsEnabled->setToolTip(tr("When enabled, keys 1-6 trigger growth in different directions."));
+    _chkGrowthKeybindsEnabled = new QCheckBox(tr("Enable growth keybinds (1-6, Shift+5)"), _groupGrowth);
+    _chkGrowthKeybindsEnabled->setToolTip(tr("When enabled, keys 1-6 trigger growth in different directions and Shift+5 triggers fill growth."));
     keybindsRow->addWidget(_chkGrowthKeybindsEnabled);
     keybindsRow->addStretch(1);
     growthLayout->addLayout(keybindsRow);
@@ -325,6 +344,131 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
 
         panelLayout->addLayout(normal3dRow);
     }
+
+    {
+        _patchTracerSourceContainer = new QWidget(this);
+        auto* patchTracerRow = new QHBoxLayout();
+        patchTracerRow->setContentsMargins(0, 0, 0, 0);
+        _patchTracerSourceContainer->setLayout(patchTracerRow);
+        _lblPatchTracerSource = new QLabel(tr("Patch Tracer source:"), this);
+        patchTracerRow->addWidget(_lblPatchTracerSource, 0);
+
+        _editPatchTracerSourcePath = new QLineEdit(this);
+        _editPatchTracerSourcePath->setReadOnly(true);
+        patchTracerRow->addWidget(_editPatchTracerSourcePath, 1);
+
+        _btnPatchTracerSourceBrowse = new QPushButton(tr("Browse"), this);
+        _btnPatchTracerSourceBrowse->setToolTip(tr("Select a folder of patch surfaces for Patch Tracer growth."));
+        patchTracerRow->addWidget(_btnPatchTracerSourceBrowse, 0);
+        panelLayout->addWidget(_patchTracerSourceContainer);
+    }
+
+    {
+        _patchTracerUmbilicusContainer = new QWidget(this);
+        auto* umbilicusRow = new QHBoxLayout();
+        umbilicusRow->setContentsMargins(0, 0, 0, 0);
+        _patchTracerUmbilicusContainer->setLayout(umbilicusRow);
+        _lblPatchTracerUmbilicus = new QLabel(tr("Umbilicus:"), this);
+        umbilicusRow->addWidget(_lblPatchTracerUmbilicus, 0);
+
+        _editPatchTracerUmbilicusPath = new QLineEdit(this);
+        _editPatchTracerUmbilicusPath->setReadOnly(true);
+        umbilicusRow->addWidget(_editPatchTracerUmbilicusPath, 1);
+
+        _btnPatchTracerUmbilicusBrowse = new QPushButton(tr("Browse"), this);
+        _btnPatchTracerUmbilicusBrowse->setToolTip(tr("Select an umbilicus JSON file for Patch Tracer single-wrap growth."));
+        umbilicusRow->addWidget(_btnPatchTracerUmbilicusBrowse, 0);
+        panelLayout->addWidget(_patchTracerUmbilicusContainer);
+    }
+
+    _groupPatchTracerParams = new QGroupBox(tr("Patch Tracer"), this);
+    auto* patchParamsLayout = new QVBoxLayout(_groupPatchTracerParams);
+    auto* patchForm = new QFormLayout();
+    patchForm->setFieldGrowthPolicy(QFormLayout::AllNonFixedFieldsGrow);
+
+    auto addResetButton = [&](auto* spin, auto defaultValue) {
+        auto* row = new QWidget(_groupPatchTracerParams);
+        auto* rowLayout = new QHBoxLayout(row);
+        rowLayout->setContentsMargins(0, 0, 0, 0);
+        rowLayout->setSpacing(4);
+        rowLayout->addWidget(spin, 1);
+
+        auto* reset = new QToolButton(row);
+        reset->setAutoRaise(true);
+        reset->setIcon(style()->standardIcon(QStyle::SP_BrowserReload));
+        reset->setToolTip(tr("Reset this parameter to its default."));
+        reset->setFixedSize(22, 22);
+        rowLayout->addWidget(reset);
+
+        connect(reset, &QToolButton::clicked, this, [this, spin, defaultValue]() {
+            spin->setValue(defaultValue);
+            persistPatchTracerParams();
+        });
+
+        return row;
+    };
+
+    auto addIntParam = [&](const QString& label, int min, int max, int step, int value, int defaultValue) {
+        auto* spin = new QSpinBox(_groupPatchTracerParams);
+        spin->setRange(min, max);
+        spin->setSingleStep(step);
+        spin->setValue(value);
+        patchForm->addRow(label, addResetButton(spin, defaultValue));
+        connect(spin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this]() { persistPatchTracerParams(); });
+        return spin;
+    };
+    auto addDoubleParam = [&](const QString& label, double min, double max, double step, double value, double defaultValue) {
+        auto* spin = new QDoubleSpinBox(_groupPatchTracerParams);
+        spin->setRange(min, max);
+        spin->setSingleStep(step);
+        spin->setDecimals(4);
+        spin->setValue(value);
+        patchForm->addRow(label, addResetButton(spin, defaultValue));
+        connect(spin, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this]() { persistPatchTracerParams(); });
+        return spin;
+    };
+
+    _spinPatchGlobalStepsPerWindow = addIntParam(tr("Global opt windows"), 0, 100, 1, _patchGlobalStepsPerWindow, 0);
+    _spinPatchSrcStep = addIntParam(tr("Source step"), 1, 1000, 1, _patchSrcStep, 20);
+    _spinPatchStep = addIntParam(tr("Grid step"), 1, 1000, 1, _patchStep, 10);
+    _spinPatchMaxWidth = addIntParam(tr("Max width"), 1, 1000000, 1000, _patchMaxWidth, 80000);
+    _spinPatchLocalCostInlierThreshold = addDoubleParam(tr("Local cost inlier"), 0.0, 100.0, 0.01, _patchLocalCostInlierThreshold, 0.2);
+    _spinPatchSameSurfaceThreshold = addDoubleParam(tr("Same surface threshold"), 0.0, 1000.0, 0.1, _patchSameSurfaceThreshold, 2.0);
+    _spinPatchStraightWeight = addDoubleParam(tr("Straight weight 2D"), 0.0, 100.0, 0.1, _patchStraightWeight, 0.7);
+    _spinPatchStraightWeight3d = addDoubleParam(tr("Straight weight 3D"), 0.0, 100.0, 0.1, _patchStraightWeight3d, 4.0);
+    _spinPatchSlidingWindowScale = addDoubleParam(tr("Sliding window scale"), 0.01, 100.0, 0.1, _patchSlidingWindowScale, 1.0);
+    _spinPatchZLocationLossWeight = addDoubleParam(tr("Z loc loss weight"), 0.0, 100.0, 0.1, _patchZLocationLossWeight, 0.1);
+    _spinPatchDistLoss2dWeight = addDoubleParam(tr("Dist loss 2D"), 0.0, 100.0, 0.1, _patchDistLoss2dWeight, 1.0);
+    _spinPatchDistLoss3dWeight = addDoubleParam(tr("Dist loss 3D"), 0.0, 100.0, 0.1, _patchDistLoss3dWeight, 2.0);
+    _spinPatchSdir3dRadius = addIntParam(tr("SDIR radius 3D"), 0, 8, 1, _patchSdir3dRadius, 2);
+    _spinPatchSdir3dWeight = addDoubleParam(tr("SDIR weight 3D"), 0.0, 100.0, 0.1, _patchSdir3dWeight, 0.5);
+    _spinPatchSdir3dGlobalWeight = addDoubleParam(tr("SDIR global weight 3D"), 0.0, 100.0, 0.1, _patchSdir3dGlobalWeight, 0.25);
+    _spinPatchSdir3dCandidateMax = addDoubleParam(tr("SDIR candidate max"), 0.0, 1000.0, 0.1, _patchSdir3dCandidateMax, 4.0);
+    _spinPatchStraightMinCount = addDoubleParam(tr("Straight min count"), 0.0, 16.0, 0.5, _patchStraightMinCount, 1.0);
+    _spinPatchInlierBaseThreshold = addIntParam(tr("Inlier base threshold"), 0, 10000, 1, _patchInlierBaseThreshold, 20);
+    _spinPatchConsensusDefaultThreshold = addIntParam(tr("Consensus default th"), 0, 10000, 1, _patchConsensusDefaultThreshold, 10);
+    _spinPatchConsensusLimitThreshold = addIntParam(tr("Consensus limit th"), 0, 10000, 1, _patchConsensusLimitThreshold, 2);
+
+    _chkPatchFlipX = new QCheckBox(tr("Flip X"), _groupPatchTracerParams);
+    _chkPatchDebugImages = new QCheckBox(tr("Debug images"), _groupPatchTracerParams);
+    _chkPatchSingleWrap = new QCheckBox(tr("Single wrap"), _groupPatchTracerParams);
+    connect(_chkPatchFlipX, &QCheckBox::toggled, this, [this]() { persistPatchTracerParams(); });
+    connect(_chkPatchDebugImages, &QCheckBox::toggled, this, [this]() { persistPatchTracerParams(); });
+    connect(_chkPatchSingleWrap, &QCheckBox::toggled, this, [this]() { persistPatchTracerParams(); });
+    patchForm->addRow(QString(), _chkPatchFlipX);
+    patchForm->addRow(QString(), _chkPatchDebugImages);
+    patchForm->addRow(QString(), _chkPatchSingleWrap);
+
+    patchParamsLayout->addLayout(patchForm);
+    auto* patchButtons = new QHBoxLayout();
+    _btnPatchTracerResetDefaults = new QPushButton(tr("Reset to Defaults"), _groupPatchTracerParams);
+    connect(_btnPatchTracerResetDefaults, &QPushButton::clicked, this, [this]() {
+        resetPatchTracerParams(true);
+    });
+    patchButtons->addWidget(_btnPatchTracerResetDefaults);
+    patchButtons->addStretch(1);
+    patchParamsLayout->addLayout(patchButtons);
+    panelLayout->addWidget(_groupPatchTracerParams);
 
     // --- Signal wiring ---
 
@@ -453,6 +597,42 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
         updateNormal3dUi();
     });
 
+    connect(_btnPatchTracerSourceBrowse, &QPushButton::clicked, this, [this]() {
+        QString initial = _patchTracerSourcePath;
+        if (initial.isEmpty() && !_volumePackagePath.isEmpty()) {
+            initial = QDir(_volumePackagePath).filePath(QStringLiteral("paths"));
+        }
+        const QString dir = QFileDialog::getExistingDirectory(this,
+                                                              tr("Select Patch Tracer source folder"),
+                                                              initial,
+                                                              QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks);
+        if (dir.isEmpty()) {
+            return;
+        }
+        _patchTracerSourcePath = QDir::cleanPath(dir);
+        writeSetting(QStringLiteral("patch_tracer_source_path"), _patchTracerSourcePath);
+        updatePatchTracerSourceUi();
+    });
+
+    connect(_btnPatchTracerUmbilicusBrowse, &QPushButton::clicked, this, [this]() {
+        QString initial = _patchTracerUmbilicusPath;
+        if (initial.isEmpty() && !_volumePackagePath.isEmpty()) {
+            initial = _volumePackagePath;
+        }
+        const QString file = QFileDialog::getOpenFileName(this,
+                                                          tr("Select umbilicus JSON"),
+                                                          initial,
+                                                          tr("JSON Files (*.json);;All Files (*)"));
+        if (file.isEmpty()) {
+            return;
+        }
+        _patchTracerUmbilicusPath = QDir::cleanPath(file);
+        _patchTracerUmbilicusPathUserSet = true;
+        writeSetting(QStringLiteral("patch_tracer_umbilicus_path"), _patchTracerUmbilicusPath);
+        writeSetting(QStringLiteral("patch_tracer_umbilicus_path_user_set"), _patchTracerUmbilicusPathUserSet);
+        updatePatchTracerUmbilicusUi();
+    });
+
     // Z-range connections
     connect(_chkCorrectionsUseZRange, &QCheckBox::toggled, this, [this](bool enabled) {
         _correctionsZRangeEnabled = enabled;
@@ -539,7 +719,13 @@ QString SegmentationGrowthPanel::determineDefaultVolumeId(const QVector<QPair<QS
 void SegmentationGrowthPanel::applyGrowthSteps(int steps, bool persist, bool fromUi)
 {
     const int minimum = (_growthMethod == SegmentationGrowthMethod::Corrections) ? 0 : 1;
-    const int clamped = std::clamp(steps, minimum, 1024);
+    const int maximum = growthStepMaximumForMethod(_growthMethod);
+    const int clamped = std::clamp(steps, minimum, maximum);
+
+    if (_spinGrowthSteps && _spinGrowthSteps->maximum() != maximum) {
+        QSignalBlocker blocker(_spinGrowthSteps);
+        _spinGrowthSteps->setMaximum(maximum);
+    }
 
     if ((!fromUi || clamped != steps) && _spinGrowthSteps) {
         QSignalBlocker blocker(_spinGrowthSteps);
@@ -547,13 +733,21 @@ void SegmentationGrowthPanel::applyGrowthSteps(int steps, bool persist, bool fro
     }
 
     if (clamped > 0) {
-        _tracerGrowthSteps = std::max(1, clamped);
+        if (_growthMethod == SegmentationGrowthMethod::PatchTracer) {
+            _patchTracerGrowthSteps = std::max(1, clamped);
+        } else {
+            _tracerGrowthSteps = std::max(1, std::min(clamped, kDefaultGrowthMaxSteps));
+        }
     }
 
     _growthSteps = clamped;
 
     if (persist) {
-        writeSetting(QStringLiteral("growth_steps"), _growthSteps);
+        if (_growthMethod == SegmentationGrowthMethod::PatchTracer) {
+            writeSetting(QStringLiteral("growth_steps_patch_tracer"), _patchTracerGrowthSteps);
+        } else {
+            writeSetting(QStringLiteral("growth_steps"), _growthSteps);
+        }
         writeSetting(QStringLiteral("growth_steps_tracer"), _tracerGrowthSteps);
     }
 }
@@ -569,15 +763,22 @@ void SegmentationGrowthPanel::setGrowthMethod(SegmentationGrowthMethod method)
         return;
     }
     const int currentSteps = _growthSteps;
-    if (method == SegmentationGrowthMethod::Corrections) {
-        _tracerGrowthSteps = (currentSteps > 0) ? currentSteps : std::max(1, _tracerGrowthSteps);
+    const SegmentationGrowthMethod previousMethod = _growthMethod;
+    if (previousMethod == SegmentationGrowthMethod::PatchTracer) {
+        _patchTracerGrowthSteps = (currentSteps > 0) ? currentSteps : std::max(1, _patchTracerGrowthSteps);
+    } else if (previousMethod != SegmentationGrowthMethod::Corrections) {
+        _tracerGrowthSteps = (currentSteps > 0)
+            ? std::min(currentSteps, kDefaultGrowthMaxSteps)
+            : std::max(1, _tracerGrowthSteps);
     }
     _growthMethod = method;
-    int targetSteps = currentSteps;
+    int targetSteps = std::max(1, _tracerGrowthSteps);
     if (method == SegmentationGrowthMethod::Corrections) {
         targetSteps = 0;
+    } else if (method == SegmentationGrowthMethod::PatchTracer) {
+        targetSteps = std::max(1, _patchTracerGrowthSteps);
     } else {
-        targetSteps = (currentSteps < 1) ? std::max(1, _tracerGrowthSteps) : std::max(1, currentSteps);
+        targetSteps = std::max(1, _tracerGrowthSteps);
     }
     applyGrowthSteps(targetSteps, true, false);
     writeSetting(QStringLiteral("growth_method"), static_cast<int>(_growthMethod));
@@ -591,6 +792,15 @@ void SegmentationGrowthPanel::setGrowthInProgress(bool running)
         return;
     }
     _growthInProgress = running;
+    updateGrowthUiState();
+}
+
+void SegmentationGrowthPanel::setManualAddUiActive(bool active)
+{
+    if (_manualAddUiActive == active) {
+        return;
+    }
+    _manualAddUiActive = active;
     updateGrowthUiState();
 }
 
@@ -628,6 +838,18 @@ void SegmentationGrowthPanel::setNormal3dZarrCandidates(const QStringList& candi
 void SegmentationGrowthPanel::setVolumePackagePath(const QString& path)
 {
     _volumePackagePath = path;
+    if (_patchTracerSourcePath.isEmpty() && !_volumePackagePath.isEmpty()) {
+        _patchTracerSourcePath = QDir(_volumePackagePath).filePath(QStringLiteral("paths"));
+    }
+    if (!_patchTracerUmbilicusPathUserSet && !_volumePackagePath.isEmpty()) {
+        const QString defaultUmbilicus = QDir(_volumePackagePath).filePath(QStringLiteral("umbilicus.json"));
+        std::error_code ec;
+        if (std::filesystem::exists(defaultUmbilicus.toStdString(), ec) && !ec) {
+            _patchTracerUmbilicusPath = defaultUmbilicus;
+        } else {
+            _patchTracerUmbilicusPath.clear();
+        }
+    }
     syncUiState(_editingEnabled, _growthInProgress);
 }
 
@@ -705,6 +927,38 @@ std::optional<std::pair<int, int>> SegmentationGrowthPanel::correctionsZRange() 
     return std::make_pair(_correctionsZMin, _correctionsZMax);
 }
 
+utils::Json SegmentationGrowthPanel::patchTracerParamsJson() const
+{
+    utils::Json params = utils::Json::object();
+    params["global_steps_per_window"] = _patchGlobalStepsPerWindow;
+    params["flip_x"] = _patchFlipX;
+    params["src_step"] = _patchSrcStep;
+    params["step"] = _patchStep;
+    params["max_width"] = _patchMaxWidth;
+    params["debug_images"] = _patchDebugImages;
+    params["single wrap"] = _patchSingleWrap;
+    if (!_patchTracerUmbilicusPath.trimmed().isEmpty()) {
+        params["umbilicus_path"] = _patchTracerUmbilicusPath.toStdString();
+    }
+    params["local_cost_inl_th"] = _patchLocalCostInlierThreshold;
+    params["same_surface_th"] = _patchSameSurfaceThreshold;
+    params["straight_weight"] = _patchStraightWeight;
+    params["straight_weight_3D"] = _patchStraightWeight3d;
+    params["sliding_w_scale"] = _patchSlidingWindowScale;
+    params["z_loc_loss_w"] = _patchZLocationLossWeight;
+    params["dist_loss_2d_w"] = _patchDistLoss2dWeight;
+    params["dist_loss_3d_w"] = _patchDistLoss3dWeight;
+    params["sdir_3d_radius"] = _patchSdir3dRadius;
+    params["sdir_3d_w"] = _patchSdir3dWeight;
+    params["sdir_3d_global_w"] = _patchSdir3dGlobalWeight;
+    params["sdir_3d_candidate_max"] = _patchSdir3dCandidateMax;
+    params["straight_min_count"] = _patchStraightMinCount;
+    params["inlier_base_threshold"] = _patchInlierBaseThreshold;
+    params["consensus_default_th"] = _patchConsensusDefaultThreshold;
+    params["consensus_limit_th"] = _patchConsensusLimitThreshold;
+    return params;
+}
+
 void SegmentationGrowthPanel::setGrowthDirectionMask(int mask)
 {
     mask = normalizeGrowthDirectionMask(mask);
@@ -776,7 +1030,73 @@ int SegmentationGrowthPanel::normalizeGrowthDirectionMask(int mask)
 
 void SegmentationGrowthPanel::updateGrowthUiState()
 {
-    const bool enableGrowth = _editingEnabled && !_growthInProgress;
+    const bool manual = _manualAddUiActive || _growthMethod == SegmentationGrowthMethod::ManualAdd;
+    const bool enableGrowth = _editingEnabled && !_growthInProgress && !manual;
+    if (_spinGrowthSteps) {
+        _spinGrowthSteps->setVisible(!manual);
+    }
+    if (_btnGrow) {
+        _btnGrow->setVisible(!manual);
+    }
+    if (_btnInpaint) {
+        _btnInpaint->setVisible(!manual);
+    }
+    if (_chkGrowthDirUp) {
+        _chkGrowthDirUp->setVisible(!manual);
+    }
+    if (_chkGrowthDirDown) {
+        _chkGrowthDirDown->setVisible(!manual);
+    }
+    if (_chkGrowthDirLeft) {
+        _chkGrowthDirLeft->setVisible(!manual);
+    }
+    if (_chkGrowthDirRight) {
+        _chkGrowthDirRight->setVisible(!manual);
+    }
+    if (_chkGrowthKeybindsEnabled) {
+        _chkGrowthKeybindsEnabled->setVisible(!manual);
+    }
+    if (_chkCorrectionsUseZRange) {
+        _chkCorrectionsUseZRange->setVisible(!manual);
+    }
+    if (_spinCorrectionsZMin) {
+        _spinCorrectionsZMin->setVisible(!manual);
+    }
+    if (_spinCorrectionsZMax) {
+        _spinCorrectionsZMax->setVisible(!manual);
+    }
+    if (_comboVolumes) {
+        if (auto* parent = _comboVolumes->parentWidget()) {
+            parent->setVisible(!manual);
+        }
+    }
+    if (_lblNormalGrid) {
+        _lblNormalGrid->setVisible(!manual);
+    }
+    if (_editNormalGridPath) {
+        _editNormalGridPath->setVisible(!manual && _normalGridAvailable && !_normalGridPath.isEmpty());
+    }
+    if (_lblNormal3d) {
+        _lblNormal3d->setVisible(!manual);
+    }
+    const int normal3dCount = _normal3dCandidates.size();
+    const bool showNormal3dCombo = normal3dCount > 1;
+    const bool showNormal3dPath = normal3dCount == 1;
+    if (_comboNormal3d) {
+        _comboNormal3d->setVisible(!manual && showNormal3dCombo);
+    }
+    if (_editNormal3dPath) {
+        _editNormal3dPath->setVisible(!manual && showNormal3dPath);
+    }
+    if (_patchTracerSourceContainer) {
+        _patchTracerSourceContainer->setVisible(!manual && _growthMethod == SegmentationGrowthMethod::PatchTracer);
+    }
+    if (_patchTracerUmbilicusContainer) {
+        _patchTracerUmbilicusContainer->setVisible(!manual && _growthMethod == SegmentationGrowthMethod::PatchTracer);
+    }
+    if (_groupPatchTracerParams) {
+        _groupPatchTracerParams->setVisible(!manual && _growthMethod == SegmentationGrowthMethod::PatchTracer);
+    }
     if (_spinGrowthSteps) {
         _spinGrowthSteps->setEnabled(enableGrowth);
     }
@@ -809,6 +1129,15 @@ void SegmentationGrowthPanel::updateGrowthUiState()
     }
     if (_spinCorrectionsZMax) {
         _spinCorrectionsZMax->setEnabled(allowZRange && _correctionsZRangeEnabled);
+    }
+    if (_btnPatchTracerSourceBrowse) {
+        _btnPatchTracerSourceBrowse->setEnabled(enableGrowth);
+    }
+    if (_btnPatchTracerUmbilicusBrowse) {
+        _btnPatchTracerUmbilicusBrowse->setEnabled(enableGrowth);
+    }
+    if (_groupPatchTracerParams) {
+        _groupPatchTracerParams->setEnabled(enableGrowth);
     }
 }
 
@@ -882,11 +1211,168 @@ void SegmentationGrowthPanel::updateNormal3dUi()
     }
 }
 
+void SegmentationGrowthPanel::updatePatchTracerSourceUi()
+{
+    if (_patchTracerSourcePath.isEmpty() && !_volumePackagePath.isEmpty()) {
+        _patchTracerSourcePath = QDir(_volumePackagePath).filePath(QStringLiteral("paths"));
+    }
+    if (_editPatchTracerSourcePath) {
+        _editPatchTracerSourcePath->setText(_patchTracerSourcePath);
+        _editPatchTracerSourcePath->setToolTip(_patchTracerSourcePath);
+    }
+}
+
+void SegmentationGrowthPanel::updatePatchTracerUmbilicusUi()
+{
+    if (!_patchTracerUmbilicusPathUserSet && _patchTracerUmbilicusPath.isEmpty() && !_volumePackagePath.isEmpty()) {
+        const QString defaultUmbilicus = QDir(_volumePackagePath).filePath(QStringLiteral("umbilicus.json"));
+        std::error_code ec;
+        if (std::filesystem::exists(defaultUmbilicus.toStdString(), ec) && !ec) {
+            _patchTracerUmbilicusPath = defaultUmbilicus;
+        }
+    }
+    if (_editPatchTracerUmbilicusPath) {
+        _editPatchTracerUmbilicusPath->setText(_patchTracerUmbilicusPath);
+        _editPatchTracerUmbilicusPath->setToolTip(_patchTracerUmbilicusPath);
+    }
+}
+
+void SegmentationGrowthPanel::resetPatchTracerParams(bool persist)
+{
+    _patchGlobalStepsPerWindow = 0;
+    _patchFlipX = false;
+    _patchSrcStep = 20;
+    _patchStep = 10;
+    _patchMaxWidth = 80000;
+    _patchDebugImages = false;
+    _patchSingleWrap = false;
+    _patchLocalCostInlierThreshold = 0.2;
+    _patchSameSurfaceThreshold = 2.0;
+    _patchStraightWeight = 0.7;
+    _patchStraightWeight3d = 4.0;
+    _patchSlidingWindowScale = 1.0;
+    _patchZLocationLossWeight = 0.1;
+    _patchDistLoss2dWeight = 1.0;
+    _patchDistLoss3dWeight = 2.0;
+    _patchSdir3dRadius = 2;
+    _patchSdir3dWeight = 0.5;
+    _patchSdir3dGlobalWeight = 0.25;
+    _patchSdir3dCandidateMax = 4.0;
+    _patchStraightMinCount = 1.0;
+    _patchInlierBaseThreshold = 20;
+    _patchConsensusDefaultThreshold = 10;
+    _patchConsensusLimitThreshold = 2;
+    syncPatchTracerParamsUi();
+    if (persist) {
+        persistPatchTracerParams();
+    }
+}
+
+void SegmentationGrowthPanel::syncPatchTracerParamsUi()
+{
+    auto setSpin = [](auto* spin, auto value) {
+        if (!spin) {
+            return;
+        }
+        const QSignalBlocker blocker(spin);
+        spin->setValue(value);
+    };
+    setSpin(_spinPatchGlobalStepsPerWindow, _patchGlobalStepsPerWindow);
+    setSpin(_spinPatchSrcStep, _patchSrcStep);
+    setSpin(_spinPatchStep, _patchStep);
+    setSpin(_spinPatchMaxWidth, _patchMaxWidth);
+    setSpin(_spinPatchLocalCostInlierThreshold, _patchLocalCostInlierThreshold);
+    setSpin(_spinPatchSameSurfaceThreshold, _patchSameSurfaceThreshold);
+    setSpin(_spinPatchStraightWeight, _patchStraightWeight);
+    setSpin(_spinPatchStraightWeight3d, _patchStraightWeight3d);
+    setSpin(_spinPatchSlidingWindowScale, _patchSlidingWindowScale);
+    setSpin(_spinPatchZLocationLossWeight, _patchZLocationLossWeight);
+    setSpin(_spinPatchDistLoss2dWeight, _patchDistLoss2dWeight);
+    setSpin(_spinPatchDistLoss3dWeight, _patchDistLoss3dWeight);
+    setSpin(_spinPatchSdir3dRadius, _patchSdir3dRadius);
+    setSpin(_spinPatchSdir3dWeight, _patchSdir3dWeight);
+    setSpin(_spinPatchSdir3dGlobalWeight, _patchSdir3dGlobalWeight);
+    setSpin(_spinPatchSdir3dCandidateMax, _patchSdir3dCandidateMax);
+    setSpin(_spinPatchStraightMinCount, _patchStraightMinCount);
+    setSpin(_spinPatchInlierBaseThreshold, _patchInlierBaseThreshold);
+    setSpin(_spinPatchConsensusDefaultThreshold, _patchConsensusDefaultThreshold);
+    setSpin(_spinPatchConsensusLimitThreshold, _patchConsensusLimitThreshold);
+    if (_chkPatchFlipX) {
+        const QSignalBlocker blocker(_chkPatchFlipX);
+        _chkPatchFlipX->setChecked(_patchFlipX);
+    }
+    if (_chkPatchDebugImages) {
+        const QSignalBlocker blocker(_chkPatchDebugImages);
+        _chkPatchDebugImages->setChecked(_patchDebugImages);
+    }
+    if (_chkPatchSingleWrap) {
+        const QSignalBlocker blocker(_chkPatchSingleWrap);
+        _chkPatchSingleWrap->setChecked(_patchSingleWrap);
+    }
+}
+
+void SegmentationGrowthPanel::persistPatchTracerParams()
+{
+    if (_restoringSettings) {
+        return;
+    }
+    if (_spinPatchGlobalStepsPerWindow) _patchGlobalStepsPerWindow = _spinPatchGlobalStepsPerWindow->value();
+    if (_spinPatchSrcStep) _patchSrcStep = _spinPatchSrcStep->value();
+    if (_spinPatchStep) _patchStep = _spinPatchStep->value();
+    if (_spinPatchMaxWidth) _patchMaxWidth = _spinPatchMaxWidth->value();
+    if (_spinPatchLocalCostInlierThreshold) _patchLocalCostInlierThreshold = _spinPatchLocalCostInlierThreshold->value();
+    if (_spinPatchSameSurfaceThreshold) _patchSameSurfaceThreshold = _spinPatchSameSurfaceThreshold->value();
+    if (_spinPatchStraightWeight) _patchStraightWeight = _spinPatchStraightWeight->value();
+    if (_spinPatchStraightWeight3d) _patchStraightWeight3d = _spinPatchStraightWeight3d->value();
+    if (_spinPatchSlidingWindowScale) _patchSlidingWindowScale = _spinPatchSlidingWindowScale->value();
+    if (_spinPatchZLocationLossWeight) _patchZLocationLossWeight = _spinPatchZLocationLossWeight->value();
+    if (_spinPatchDistLoss2dWeight) _patchDistLoss2dWeight = _spinPatchDistLoss2dWeight->value();
+    if (_spinPatchDistLoss3dWeight) _patchDistLoss3dWeight = _spinPatchDistLoss3dWeight->value();
+    if (_spinPatchSdir3dRadius) _patchSdir3dRadius = _spinPatchSdir3dRadius->value();
+    if (_spinPatchSdir3dWeight) _patchSdir3dWeight = _spinPatchSdir3dWeight->value();
+    if (_spinPatchSdir3dGlobalWeight) _patchSdir3dGlobalWeight = _spinPatchSdir3dGlobalWeight->value();
+    if (_spinPatchSdir3dCandidateMax) _patchSdir3dCandidateMax = _spinPatchSdir3dCandidateMax->value();
+    if (_spinPatchStraightMinCount) _patchStraightMinCount = _spinPatchStraightMinCount->value();
+    if (_spinPatchInlierBaseThreshold) _patchInlierBaseThreshold = _spinPatchInlierBaseThreshold->value();
+    if (_spinPatchConsensusDefaultThreshold) _patchConsensusDefaultThreshold = _spinPatchConsensusDefaultThreshold->value();
+    if (_spinPatchConsensusLimitThreshold) _patchConsensusLimitThreshold = _spinPatchConsensusLimitThreshold->value();
+    if (_chkPatchFlipX) _patchFlipX = _chkPatchFlipX->isChecked();
+    if (_chkPatchDebugImages) _patchDebugImages = _chkPatchDebugImages->isChecked();
+    if (_chkPatchSingleWrap) _patchSingleWrap = _chkPatchSingleWrap->isChecked();
+
+    writeSetting(QStringLiteral("patch_global_steps_per_window"), _patchGlobalStepsPerWindow);
+    writeSetting(QStringLiteral("patch_flip_x"), _patchFlipX);
+    writeSetting(QStringLiteral("patch_src_step"), _patchSrcStep);
+    writeSetting(QStringLiteral("patch_step"), _patchStep);
+    writeSetting(QStringLiteral("patch_max_width"), _patchMaxWidth);
+    writeSetting(QStringLiteral("patch_debug_images"), _patchDebugImages);
+    writeSetting(QStringLiteral("patch_single_wrap"), _patchSingleWrap);
+    writeSetting(QStringLiteral("patch_local_cost_inl_th"), _patchLocalCostInlierThreshold);
+    writeSetting(QStringLiteral("patch_same_surface_th"), _patchSameSurfaceThreshold);
+    writeSetting(QStringLiteral("patch_straight_weight"), _patchStraightWeight);
+    writeSetting(QStringLiteral("patch_straight_weight_3D"), _patchStraightWeight3d);
+    writeSetting(QStringLiteral("patch_sliding_w_scale"), _patchSlidingWindowScale);
+    writeSetting(QStringLiteral("patch_z_loc_loss_w"), _patchZLocationLossWeight);
+    writeSetting(QStringLiteral("patch_dist_loss_2d_w"), _patchDistLoss2dWeight);
+    writeSetting(QStringLiteral("patch_dist_loss_3d_w"), _patchDistLoss3dWeight);
+    writeSetting(QStringLiteral("patch_sdir_3d_radius"), _patchSdir3dRadius);
+    writeSetting(QStringLiteral("patch_sdir_3d_w"), _patchSdir3dWeight);
+    writeSetting(QStringLiteral("patch_sdir_3d_global_w"), _patchSdir3dGlobalWeight);
+    writeSetting(QStringLiteral("patch_sdir_3d_candidate_max"), _patchSdir3dCandidateMax);
+    writeSetting(QStringLiteral("patch_straight_min_count"), _patchStraightMinCount);
+    writeSetting(QStringLiteral("patch_inlier_base_threshold"), _patchInlierBaseThreshold);
+    writeSetting(QStringLiteral("patch_consensus_default_th"), _patchConsensusDefaultThreshold);
+    writeSetting(QStringLiteral("patch_consensus_limit_th"), _patchConsensusLimitThreshold);
+}
+
 void SegmentationGrowthPanel::triggerGrowthRequest(SegmentationGrowthDirection direction,
                                                     int steps,
                                                     bool inpaintOnly)
 {
     if (!_editingEnabled || _growthInProgress) {
+        return;
+    }
+    if (_growthMethod == SegmentationGrowthMethod::ManualAdd) {
         return;
     }
 
@@ -896,7 +1382,7 @@ void SegmentationGrowthPanel::triggerGrowthRequest(SegmentationGrowthDirection d
 
     const bool allowZeroSteps = inpaintOnly || method == SegmentationGrowthMethod::Corrections;
     const int minSteps = allowZeroSteps ? 0 : 1;
-    const int clampedSteps = std::clamp(steps, minSteps, 1024);
+    const int clampedSteps = std::clamp(steps, minSteps, growthStepMaximumForMethod(method));
     const int finalSteps = clampedSteps;
 
     qCInfo(lcSegWidget) << "Grow request" << segmentationGrowthMethodToString(method)
@@ -937,8 +1423,17 @@ void SegmentationGrowthPanel::restoreSettings(QSettings& settings)
                              .value(QStringLiteral("growth_steps_tracer"),
                                     std::max(1, storedGrowthSteps))
                              .toInt();
-    _tracerGrowthSteps = std::clamp(_tracerGrowthSteps, 1, 1024);
-    applyGrowthSteps(storedGrowthSteps, false, false);
+    _tracerGrowthSteps = std::clamp(_tracerGrowthSteps, 1, kDefaultGrowthMaxSteps);
+    _patchTracerGrowthSteps = settings
+                                  .value(QStringLiteral("growth_steps_patch_tracer"),
+                                         _patchTracerGrowthSteps)
+                                  .toInt();
+    _patchTracerGrowthSteps = std::clamp(_patchTracerGrowthSteps, 1, kPatchTracerMaxSteps);
+    applyGrowthSteps(_growthMethod == SegmentationGrowthMethod::PatchTracer
+                         ? _patchTracerGrowthSteps
+                         : storedGrowthSteps,
+                     false,
+                     false);
     _growthDirectionMask = normalizeGrowthDirectionMask(
         settings.value(segmentation::GROWTH_DIRECTION_MASK, kGrowDirAllMask).toInt());
     _growthKeybindsEnabled = settings.value(segmentation::GROWTH_KEYBINDS_ENABLED,
@@ -952,6 +1447,32 @@ void SegmentationGrowthPanel::restoreSettings(QSettings& settings)
     }
 
     _normal3dSelectedPath = settings.value(QStringLiteral("normal3d_selected_path"), QString()).toString();
+    _patchTracerSourcePath = settings.value(QStringLiteral("patch_tracer_source_path"), QString()).toString();
+    _patchTracerUmbilicusPath = settings.value(QStringLiteral("patch_tracer_umbilicus_path"), QString()).toString();
+    _patchTracerUmbilicusPathUserSet = settings.value(QStringLiteral("patch_tracer_umbilicus_path_user_set"), false).toBool();
+    _patchGlobalStepsPerWindow = settings.value(QStringLiteral("patch_global_steps_per_window"), _patchGlobalStepsPerWindow).toInt();
+    _patchFlipX = settings.value(QStringLiteral("patch_flip_x"), _patchFlipX).toBool();
+    _patchSrcStep = std::clamp(settings.value(QStringLiteral("patch_src_step"), _patchSrcStep).toInt(), 1, 1000);
+    _patchStep = std::clamp(settings.value(QStringLiteral("patch_step"), _patchStep).toInt(), 1, 1000);
+    _patchMaxWidth = std::clamp(settings.value(QStringLiteral("patch_max_width"), _patchMaxWidth).toInt(), 1, 1000000);
+    _patchDebugImages = settings.value(QStringLiteral("patch_debug_images"), _patchDebugImages).toBool();
+    _patchSingleWrap = settings.value(QStringLiteral("patch_single_wrap"), _patchSingleWrap).toBool();
+    _patchLocalCostInlierThreshold = std::clamp(settings.value(QStringLiteral("patch_local_cost_inl_th"), _patchLocalCostInlierThreshold).toDouble(), 0.0, 100.0);
+    _patchSameSurfaceThreshold = std::clamp(settings.value(QStringLiteral("patch_same_surface_th"), _patchSameSurfaceThreshold).toDouble(), 0.0, 1000.0);
+    _patchStraightWeight = std::clamp(settings.value(QStringLiteral("patch_straight_weight"), _patchStraightWeight).toDouble(), 0.0, 100.0);
+    _patchStraightWeight3d = std::clamp(settings.value(QStringLiteral("patch_straight_weight_3D"), _patchStraightWeight3d).toDouble(), 0.0, 100.0);
+    _patchSlidingWindowScale = std::clamp(settings.value(QStringLiteral("patch_sliding_w_scale"), _patchSlidingWindowScale).toDouble(), 0.01, 100.0);
+    _patchZLocationLossWeight = std::clamp(settings.value(QStringLiteral("patch_z_loc_loss_w"), _patchZLocationLossWeight).toDouble(), 0.0, 100.0);
+    _patchDistLoss2dWeight = std::clamp(settings.value(QStringLiteral("patch_dist_loss_2d_w"), _patchDistLoss2dWeight).toDouble(), 0.0, 100.0);
+    _patchDistLoss3dWeight = std::clamp(settings.value(QStringLiteral("patch_dist_loss_3d_w"), _patchDistLoss3dWeight).toDouble(), 0.0, 100.0);
+    _patchSdir3dRadius = std::clamp(settings.value(QStringLiteral("patch_sdir_3d_radius"), _patchSdir3dRadius).toInt(), 0, 8);
+    _patchSdir3dWeight = std::clamp(settings.value(QStringLiteral("patch_sdir_3d_w"), _patchSdir3dWeight).toDouble(), 0.0, 100.0);
+    _patchSdir3dGlobalWeight = std::clamp(settings.value(QStringLiteral("patch_sdir_3d_global_w"), _patchSdir3dGlobalWeight).toDouble(), 0.0, 100.0);
+    _patchSdir3dCandidateMax = std::clamp(settings.value(QStringLiteral("patch_sdir_3d_candidate_max"), _patchSdir3dCandidateMax).toDouble(), 0.0, 1000.0);
+    _patchStraightMinCount = std::clamp(settings.value(QStringLiteral("patch_straight_min_count"), _patchStraightMinCount).toDouble(), 0.0, 16.0);
+    _patchInlierBaseThreshold = std::clamp(settings.value(QStringLiteral("patch_inlier_base_threshold"), _patchInlierBaseThreshold).toInt(), 0, 10000);
+    _patchConsensusDefaultThreshold = std::clamp(settings.value(QStringLiteral("patch_consensus_default_th"), _patchConsensusDefaultThreshold).toInt(), 0, 10000);
+    _patchConsensusLimitThreshold = std::clamp(settings.value(QStringLiteral("patch_consensus_limit_th"), _patchConsensusLimitThreshold).toInt(), 0, 10000);
 
     _restoringSettings = false;
 }
@@ -963,6 +1484,7 @@ void SegmentationGrowthPanel::syncUiState(bool editingEnabled, bool growthInProg
 
     if (_spinGrowthSteps) {
         const QSignalBlocker blocker(_spinGrowthSteps);
+        _spinGrowthSteps->setMaximum(growthStepMaximumForMethod(_growthMethod));
         _spinGrowthSteps->setValue(_growthSteps);
     }
 
@@ -976,6 +1498,15 @@ void SegmentationGrowthPanel::syncUiState(bool editingEnabled, bool growthInProg
 
     if (_extrapolationOptionsPanel) {
         _extrapolationOptionsPanel->setVisible(_growthMethod == SegmentationGrowthMethod::Extrapolation);
+    }
+    if (_groupPatchTracerParams) {
+        _groupPatchTracerParams->setVisible(_growthMethod == SegmentationGrowthMethod::PatchTracer);
+    }
+    if (_patchTracerSourceContainer) {
+        _patchTracerSourceContainer->setVisible(_growthMethod == SegmentationGrowthMethod::PatchTracer);
+    }
+    if (_patchTracerUmbilicusContainer) {
+        _patchTracerUmbilicusContainer->setVisible(_growthMethod == SegmentationGrowthMethod::PatchTracer);
     }
 
     if (_spinExtrapolationPoints) {
@@ -1104,6 +1635,9 @@ void SegmentationGrowthPanel::syncUiState(bool editingEnabled, bool growthInProg
     }
 
     updateNormal3dUi();
+    updatePatchTracerSourceUi();
+    updatePatchTracerUmbilicusUi();
+    syncPatchTracerParamsUi();
 
     updateGrowthUiState();
 }

@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -405,11 +406,35 @@ struct VcDataset::Impl {
         return reg;
     }
 
+    static std::string readTextFile(const std::filesystem::path& path) {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) {
+            throw std::runtime_error("failed to read " + path.string());
+        }
+        return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
+    }
+
     void open(const std::filesystem::path& path) {
         fsPath = path;
-        // Auto-detects v2 (.zarray) and v3 (zarr.json).
-        zarrArray_ = std::make_unique<utils::ZarrArray>(
-            utils::ZarrArray::open(path, buildCodecRegistry(/*dtypeSize guess*/1)));
+        // Remote volumes stage source metadata as .zarray files, then store
+        // the local c3d disk cache beside it as zarr.json. openZarrLevels()
+        // only selects directories with .zarray, so prefer that source
+        // metadata here when both files exist; otherwise a reopened remote
+        // cache would rebuild the HTTP source from the local cache metadata.
+        if (std::filesystem::exists(path / ".zarray")) {
+            auto meta = utils::detail::parse_zarray(readTextFile(path / ".zarray"));
+            auto registry = buildCodecRegistry(/*dtypeSize guess*/1);
+            utils::ZarrArray::Codec codec;
+            if (!meta.compressor_id.empty()) {
+                auto it = registry.find(meta.compressor_id);
+                if (it != registry.end()) codec = it->second;
+            }
+            zarrArray_ = std::make_unique<utils::ZarrArray>(
+                utils::ZarrArray::open_with_metadata(path, std::move(meta), std::move(codec)));
+        } else {
+            zarrArray_ = std::make_unique<utils::ZarrArray>(
+                utils::ZarrArray::open(path, buildCodecRegistry(/*dtypeSize guess*/1)));
+        }
         const auto& meta = zarrArray_->metadata();
 
         shape_.assign(meta.shape.begin(), meta.shape.end());
@@ -490,6 +515,12 @@ void VcDataset::decompress(std::span<const uint8_t> compressed,
 
     switch (impl_->compressor_.id) {
         case CompressorId::None:
+            if (compressed.size() < outBytes) {
+                throw std::runtime_error(
+                    "uncompressed zarr chunk is shorter than expected (" +
+                    std::to_string(compressed.size()) + " < " +
+                    std::to_string(outBytes) + " bytes)");
+            }
             std::memcpy(output, compressed.data(), outBytes);
             break;
 

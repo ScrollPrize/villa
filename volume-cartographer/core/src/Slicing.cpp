@@ -23,6 +23,7 @@
 #include <mutex>
 #include <semaphore>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 #include <omp.h>
 
@@ -391,6 +392,48 @@ void appendChunksForRegion(BlockPipeline& cache, int level,
         for (int iy = cMinY; iy <= cMaxY && iy < chunksY; iy++)
             for (int ix = cMinX; ix <= cMaxX && ix < chunksX; ix++)
                 out.push_back({level, iz, iy, ix});
+}
+
+struct VoxelBounds {
+    float minX = std::numeric_limits<float>::max();
+    float minY = std::numeric_limits<float>::max();
+    float minZ = std::numeric_limits<float>::max();
+    float maxX = std::numeric_limits<float>::lowest();
+    float maxY = std::numeric_limits<float>::lowest();
+    float maxZ = std::numeric_limits<float>::lowest();
+
+    void include(const cv::Vec3f& p) {
+        minX = std::min(minX, p[0]);
+        minY = std::min(minY, p[1]);
+        minZ = std::min(minZ, p[2]);
+        maxX = std::max(maxX, p[0]);
+        maxY = std::max(maxY, p[1]);
+        maxZ = std::max(maxZ, p[2]);
+    }
+};
+
+VoxelBounds planeViewportBounds(const cv::Vec3f& origin,
+                                const cv::Vec3f& vxStep,
+                                const cv::Vec3f& vyStep,
+                                int w, int h,
+                                const cv::Vec3f& normal,
+                                float zMin, float zMax) {
+    VoxelBounds b;
+    const float xMax = float(std::max(0, w - 1));
+    const float yMax = float(std::max(0, h - 1));
+    const cv::Vec3f corners[4] = {
+        origin,
+        origin + vxStep * xMax,
+        origin + vyStep * yMax,
+        origin + vxStep * xMax + vyStep * yMax,
+    };
+    for (const cv::Vec3f& corner : corners) {
+        b.include(corner + normal * zMin);
+        if (zMax != zMin) {
+            b.include(corner + normal * zMax);
+        }
+    }
+    return b;
 }
 
 // Surface-aware chunk enumeration. Bbox enumeration is correct for planes
@@ -827,6 +870,78 @@ inline void runRenderThreads(Body&& body) {
     RenderThreadPool::instance().run(std::forward<Body>(body));
 }
 
+struct FallbackRepairCollector {
+    bool enabled = false;
+    int level = 0;
+    std::array<int, 3> chunkShape{};
+    VolumeShape shape{};
+    std::vector<std::vector<ChunkKey>> keysByThread;
+    std::vector<std::unordered_set<ChunkKey, vc::cache::ChunkKeyHash>> seenByThread;
+
+    FallbackRepairCollector(BlockPipeline& cache, int desiredLevel, bool on)
+        : enabled(on), level(desiredLevel)
+    {
+        if (!enabled) return;
+        chunkShape = cache.chunkShape(level);
+        if (chunkShape[0] <= 0 || chunkShape[1] <= 0 || chunkShape[2] <= 0) {
+            enabled = false;
+            return;
+        }
+        shape = VolumeShape(cache, level);
+        const int n = std::max(1, renderThreadCount());
+        keysByThread.resize(n);
+        seenByThread.resize(n);
+        for (auto& seen : seenByThread) seen.reserve(512);
+    }
+
+    VC_FORCE_INLINE void recordVoxel(int tid, int iz, int iy, int ix)
+    {
+        if (!enabled) return;
+        if (unsigned(iz) >= unsigned(shape.sz)
+         || unsigned(iy) >= unsigned(shape.sy)
+         || unsigned(ix) >= unsigned(shape.sx)) {
+            return;
+        }
+        tid = std::clamp(tid, 0, int(keysByThread.size()) - 1);
+        auto& keys = keysByThread[tid];
+        if (keys.size() >= 4096) return;
+        ChunkKey k{level, iz / chunkShape[0], iy / chunkShape[1], ix / chunkShape[2]};
+        if (seenByThread[tid].insert(k).second) keys.push_back(k);
+    }
+
+    template<SampleMode Mode>
+    VC_FORCE_INLINE void recordSample(int tid, float vz, float vy, float vx)
+    {
+        if constexpr (Mode == SampleMode::Nearest) {
+            if (vz < 0.f || vy < 0.f || vx < 0.f) return;
+            recordVoxel(tid, int(vz + 0.5f), int(vy + 0.5f), int(vx + 0.5f));
+        } else {
+            if (!std::isfinite(vz) || !std::isfinite(vy) || !std::isfinite(vx)) return;
+            const int z0 = int(std::floor(vz));
+            const int y0 = int(std::floor(vy));
+            const int x0 = int(std::floor(vx));
+            for (int dz = 0; dz <= 1; ++dz)
+                for (int dy = 0; dy <= 1; ++dy)
+                    for (int dx = 0; dx <= 1; ++dx)
+                        recordVoxel(tid, z0 + dz, y0 + dy, x0 + dx);
+        }
+    }
+
+    std::vector<ChunkKey> merged()
+    {
+        std::vector<ChunkKey> out;
+        if (!enabled) return out;
+        size_t total = 0;
+        for (const auto& keys : keysByThread) total += keys.size();
+        out.reserve(total);
+        for (const auto& keys : keysByThread)
+            out.insert(out.end(), keys.begin(), keys.end());
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    }
+};
+
 // Attempt a non-blocking fetch at level L; returns true and writes LUT pixel
 // if all needed blocks are present. Trilinear path uses 8 corners.
 // Nearest sample with caller-guaranteed in-bounds coords. Caller must have
@@ -1032,7 +1147,8 @@ void sampleSingleLayerAdaptiveImpl(
     const CompositeParams* lightParams,
     uint8_t* levelOut,
     int levelStride,
-    bool skipPrefetch = false)
+    bool skipPrefetch = false,
+    bool promoteFallbackChunks = false)
 {
     auto levelScale = [](int lvl) { return (lvl > 0) ? 1.0f / float(1 << lvl) : 1.0f; };
     const float zOffConst = float(zStart) * zStep;
@@ -1092,17 +1208,16 @@ void sampleSingleLayerAdaptiveImpl(
                 viewCenterL0[0], viewCenterL0[1], viewCenterL0[2]);
         }
     } else {
-        cv::Vec3f p0 = *origin + (*planeNormal) * zOffConst;
-        cv::Vec3f p1 = *origin + (*vx_step)*float(w-1) + (*vy_step)*float(h-1) + (*planeNormal)*zOffConst;
-        float minVx=std::min(p0[0],p1[0]), maxVx=std::max(p0[0],p1[0]);
-        float minVy=std::min(p0[1],p1[1]), maxVy=std::max(p0[1],p1[1]);
-        float minVz=std::min(p0[2],p1[2]), maxVz=std::max(p0[2],p1[2]);
+        const VoxelBounds b = planeViewportBounds(
+            *origin, *vx_step, *vy_step, w, h, *planeNormal,
+            zOffConst, zOffConst);
         thread_local std::vector<vc::cache::ChunkKey> keys;
         keys.clear();
         for (int lvl=desiredLevel; lvl<numLevels; lvl++) {
             float s = levelScale(lvl);
             appendChunksForRegion(cache, lvl,
-                minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s, keys);
+                b.minX*s, b.minY*s, b.minZ*s,
+                b.maxX*s, b.maxY*s, b.maxZ*s, keys);
         }
         viewCenterL0 = *origin
             + (*vx_step) * (float(w) * 0.5f)
@@ -1138,8 +1253,9 @@ void sampleSingleLayerAdaptiveImpl(
     const int nTilesX = (w + kTile - 1) / kTile;
     const int totalTiles = nTilesY * nTilesX;
     std::atomic<int> nextTile{0};
+    FallbackRepairCollector fallbackRepair(cache, desiredLevel, promoteFallbackChunks);
 
-    runRenderThreads([&](int /*tid*/) {
+    runRenderThreads([&](int tid) {
         const int nSamplers = numLevels - desiredLevel;
         std::array<std::optional<BlockSampler<uint8_t>>, kMaxLevels> samplers;
         if (nSamplers > 0) samplers[0].emplace(cache, desiredLevel);
@@ -1214,7 +1330,10 @@ void sampleSingleLayerAdaptiveImpl(
                         const float r = scalesRatio[i];
                         if (trySampleNB<SMode>(sampler(i),
                             swz * r, swy * r, swx * r, v)) {
-                            if (uint8_t(i) > pxLevel) pxLevel = uint8_t(i);
+                            if (uint8_t(i) > pxLevel) {
+                                pxLevel = uint8_t(i);
+                                fallbackRepair.template recordSample<SMode>(tid, swz, swy, swx);
+                            }
                             break;
                         }
                     }
@@ -1255,6 +1374,11 @@ void sampleSingleLayerAdaptiveImpl(
         }
         }  // while tiles
     });
+
+    if (promoteFallbackChunks) {
+        auto repairKeys = fallbackRepair.merged();
+        if (!repairKeys.empty()) cache.fetchInteractive(repairKeys, desiredLevel);
+    }
 }
 
 template<SampleMode SMode, AccumMode2 AMode>
@@ -1272,7 +1396,8 @@ void sampleCompositeAdaptiveImpl(
     const CompositeParams* lightParams,
     uint8_t* levelOut,
     int levelStride,
-    bool skipPrefetch = false)
+    bool skipPrefetch = false,
+    bool promoteFallbackChunks = false)
 {
     if (numLevels <= 0 || desiredLevel >= numLevels) {
         // No usable levels (broken/empty volume) — fill black.
@@ -1329,17 +1454,16 @@ void sampleCompositeAdaptiveImpl(
                 viewCenterL0[0], viewCenterL0[1], viewCenterL0[2]);
         }
     } else {
-        cv::Vec3f p0 = *origin + (*planeNormal) * zMin;
-        cv::Vec3f p1 = *origin + (*vx_step)*float(w-1) + (*vy_step)*float(h-1) + (*planeNormal)*zMax;
-        float minVx=std::min(p0[0],p1[0]), maxVx=std::max(p0[0],p1[0]);
-        float minVy=std::min(p0[1],p1[1]), maxVy=std::max(p0[1],p1[1]);
-        float minVz=std::min(p0[2],p1[2]), maxVz=std::max(p0[2],p1[2]);
+        const VoxelBounds b = planeViewportBounds(
+            *origin, *vx_step, *vy_step, w, h, *planeNormal,
+            zMin, zMax);
         thread_local std::vector<vc::cache::ChunkKey> keys;
         keys.clear();
         for (int lvl=desiredLevel; lvl<numLevels; lvl++) {
             float s = levelScale(lvl);
             appendChunksForRegion(cache, lvl,
-                minVx*s, minVy*s, minVz*s, maxVx*s, maxVy*s, maxVz*s, keys);
+                b.minX*s, b.minY*s, b.minZ*s,
+                b.maxX*s, b.maxY*s, b.maxZ*s, keys);
         }
         viewCenterL0 = *origin
             + (*vx_step) * (float(w) * 0.5f)
@@ -1456,8 +1580,9 @@ void sampleCompositeAdaptiveImpl(
     const int nTilesX = (w + kTile - 1) / kTile;
     const int totalTiles = nTilesY * nTilesX;
     std::atomic<int> nextTile{0};
+    FallbackRepairCollector fallbackRepair(cache, desiredLevel, promoteFallbackChunks);
 
-    runRenderThreads([&](int /*tid*/) {
+    runRenderThreads([&](int tid) {
         // Lazy per-level samplers: construct the level-0 sampler eagerly
         // (always used) and leave higher levels unconstructed until the
         // adaptive fallback actually needs them. Each sampler carries a
@@ -1582,7 +1707,11 @@ void sampleCompositeAdaptiveImpl(
                                 float scl = scales[i];
                                 if (trySampleNB<SMode>(sampler(i),
                                     wzV * scl, wyV * scl, wxV * scl, v)) {
-                                    if (uint8_t(i) > pxLevel) pxLevel = uint8_t(i);
+                                    if (uint8_t(i) > pxLevel) {
+                                        pxLevel = uint8_t(i);
+                                        fallbackRepair.template recordSample<SMode>(
+                                            tid, svz, svy, svx);
+                                    }
                                     break;
                                 }
                             }
@@ -1738,7 +1867,11 @@ void sampleCompositeAdaptiveImpl(
                                     const float r = scalesRatio[i];
                                     if (trySampleNB<SMode>(sampler(i),
                                             swz * r, swy * r, swx * r, fv)) {
-                                        if (uint8_t(i) > pxLevel) pxLevel = uint8_t(i);
+                                        if (uint8_t(i) > pxLevel) {
+                                            pxLevel = uint8_t(i);
+                                            fallbackRepair.template recordSample<SMode>(
+                                                tid, swz, swy, swx);
+                                        }
                                         break;
                                     }
                                 }
@@ -1789,7 +1922,11 @@ void sampleCompositeAdaptiveImpl(
                                     const float r = scalesRatio[i];
                                     if (trySampleNB<SMode>(sampler(i),
                                             swz * r, swy * r, swx * r, fv)) {
-                                        if (uint8_t(i) > pxLevel) pxLevel = uint8_t(i);
+                                        if (uint8_t(i) > pxLevel) {
+                                            pxLevel = uint8_t(i);
+                                            fallbackRepair.template recordSample<SMode>(
+                                                tid, swz, swy, swx);
+                                        }
                                         break;
                                     }
                                 }
@@ -1809,7 +1946,11 @@ void sampleCompositeAdaptiveImpl(
                             const float r = scalesRatio[i];
                             if (trySampleNB<SMode>(sampler(i),
                                 swz * r, swy * r, swx * r, v)) {
-                                if (uint8_t(i) > pxLevel) pxLevel = uint8_t(i);
+                                if (uint8_t(i) > pxLevel) {
+                                    pxLevel = uint8_t(i);
+                                    fallbackRepair.template recordSample<SMode>(
+                                        tid, swz, swy, swx);
+                                }
                                 break;
                             }
                         }
@@ -2361,6 +2502,11 @@ void sampleCompositeAdaptiveImpl(
         }
         }  // while tiles
     });
+
+    if (promoteFallbackChunks) {
+        auto repairKeys = fallbackRepair.merged();
+        if (!repairKeys.empty()) cache.fetchInteractive(repairKeys, desiredLevel);
+    }
 }
 
 
@@ -2379,7 +2525,8 @@ void dispatchCompositeAdaptive(
     const CompositeParams* lightParams,
     uint8_t* levelOut,
     int levelStride,
-    bool skipPrefetch)
+    bool skipPrefetch,
+    bool promoteFallbackChunks)
 {
     AccumMode2 mode = accumModeFor(method);
     // Per-ray layer preprocess (normalize / hist-eq over N composite samples)
@@ -2410,7 +2557,8 @@ void dispatchCompositeAdaptive(
         sampleSingleLayerAdaptiveImpl<SMode>(
             outBuf, outStride, cache, desiredLevel, numLevels,
             coords, origin, vx_step, vy_step, normals, planeNormal,
-            zStart, zStep, w, h, lut, lightParams, levelOut, levelStride, skipPrefetch);
+            zStart, zStep, w, h, lut, lightParams, levelOut, levelStride,
+            skipPrefetch, promoteFallbackChunks);
         return;
     }
     switch (mode) {
@@ -2418,27 +2566,32 @@ void dispatchCompositeAdaptive(
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::Max>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride, skipPrefetch); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride,
+                skipPrefetch, promoteFallbackChunks); break;
         case AccumMode2::Min:
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::Min>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride, skipPrefetch); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride,
+                skipPrefetch, promoteFallbackChunks); break;
         case AccumMode2::LayerStorage:
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::LayerStorage>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride, skipPrefetch); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride,
+                skipPrefetch, promoteFallbackChunks); break;
         case AccumMode2::Volumetric:
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::Volumetric>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride, skipPrefetch); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride,
+                skipPrefetch, promoteFallbackChunks); break;
         default:
             sampleCompositeAdaptiveImpl<SMode, AccumMode2::Mean>(
                 outBuf, outStride, cache, desiredLevel, numLevels,
                 coords, origin, vx_step, vy_step, normals, planeNormal,
-                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride, skipPrefetch); break;
+                numLayers, zStart, zStep, w, h, method, lut, lightParams, levelOut, levelStride,
+                skipPrefetch, promoteFallbackChunks); break;
     }
 }
 
@@ -2460,7 +2613,8 @@ void sampleAdaptiveARGB32(
     const CompositeParams* lightParams,
     uint8_t* levelOut,
     int levelStride,
-    bool skipPrefetch)
+    bool skipPrefetch,
+    bool promoteFallbackChunks)
 {
     if (numLayers <= 0) numLayers = 1;
     // Composite rendering forces Nearest: averaging N layers already
@@ -2472,12 +2626,14 @@ void sampleAdaptiveARGB32(
         dispatchCompositeAdaptive<SampleMode::Nearest>(
             outBuf, outStride, *cache, desiredLevel, numLevels,
             coords, origin, vx_step, vy_step, normals, planeNormal,
-            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams, levelOut, levelStride, skipPrefetch);
+            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams,
+            levelOut, levelStride, skipPrefetch, promoteFallbackChunks);
     } else {
         dispatchCompositeAdaptive<SampleMode::Trilinear>(
             outBuf, outStride, *cache, desiredLevel, numLevels,
             coords, origin, vx_step, vy_step, normals, planeNormal,
-            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams, levelOut, levelStride, skipPrefetch);
+            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams,
+            levelOut, levelStride, skipPrefetch, promoteFallbackChunks);
     }
 }
 

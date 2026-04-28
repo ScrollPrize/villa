@@ -14,6 +14,7 @@
 #include "utils/Json.hpp"
 
 #include "growth/SegmentationGrowth.hpp"
+#include "tools/ManualAddTool.hpp"
 
 class SegmentationHeaderRow;
 class SegmentationEditingPanel;
@@ -25,6 +26,7 @@ class SegmentationCellReoptPanel;
 class SegmentationNeuralTracerPanel;
 class SegmentationDirectionFieldPanel;
 class SegmentationLasagnaPanel;
+class SegmentationManualAddPanel;
 
 class SegmentationWidget : public QWidget
 {
@@ -34,6 +36,7 @@ public:
     explicit SegmentationWidget(QWidget* parent = nullptr);
 
     [[nodiscard]] bool isEditingEnabled() const { return _editingEnabled; }
+    [[nodiscard]] bool drawMaskEnabled() const { return _drawMaskEnabled; }
     [[nodiscard]] float dragRadius() const;
     [[nodiscard]] float dragSigma() const;
     [[nodiscard]] float lineRadius() const;
@@ -46,6 +49,7 @@ public:
     [[nodiscard]] float smoothingStrength() const;
     [[nodiscard]] int smoothingIterations() const;
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const;
+    [[nodiscard]] SegmentationGrowthMethod lastNonManualGrowthMethod() const { return _lastNonManualGrowthMethod; }
     [[nodiscard]] int growthSteps() const;
     [[nodiscard]] int extrapolationPointCount() const;
     [[nodiscard]] ExtrapolationType extrapolationType() const;
@@ -65,6 +69,9 @@ public:
     [[nodiscard]] bool showHoverMarker() const;
     [[nodiscard]] bool growthKeybindsEnabled() const;
     [[nodiscard]] QString normal3dZarrPath() const;
+    [[nodiscard]] QString patchTracerSourcePath() const;
+    [[nodiscard]] utils::Json patchTracerParamsJson() const;
+    [[nodiscard]] ManualAddTool::Config manualAddConfig() const;
     // Neural tracer getters — delegated to panel
     [[nodiscard]] bool neuralTracerEnabled() const;
     [[nodiscard]] QString neuralCheckpointPath() const;
@@ -82,6 +89,7 @@ public:
 
     void setPendingChanges(bool pending);
     void setEditingEnabled(bool enabled);
+    void setDrawMaskEnabled(bool enabled);
     void setDragRadius(float value);
     void setDragSigma(float value);
     void setLineRadius(float value);
@@ -97,6 +105,8 @@ public:
     void setGrowthInProgress(bool running);
     void setShowHoverMarker(bool enabled);
     void setEraseBrushActive(bool active);
+    void setManualAddActive(bool active);
+    ManualAddTool::LinePreviewMode cycleManualAddLinePreviewMode();
 
     void setNormalGridAvailable(bool available);
     void setNormalGridPathHint(const QString& hint);
@@ -202,6 +212,7 @@ public:
 signals:
     void annotateToggled(bool enabled);
     void editingModeChanged(bool enabled);
+    void drawMaskChanged(bool enabled);
     void dragRadiusChanged(float value);
     void dragSigmaChanged(float value);
     void lineRadiusChanged(float value);
@@ -258,6 +269,11 @@ signals:
     void cellReoptMinSpacingChanged(float spacing);
     void cellReoptPerimeterOffsetChanged(float offset);
     void cellReoptGrowthRequested(uint64_t collectionId);
+    void manualAddConfigChanged();
+    void manualAddClearPendingRequested();
+    void manualAddRecomputeRequested();
+    void manualAddApplyExitRequested();
+    void manualAddCancelRequested();
 
 private:
     void buildUi();
@@ -265,8 +281,10 @@ private:
     void restoreSettings();
     void writeSetting(const QString& key, const QVariant& value);
     void updateEditingState(bool enabled, bool notifyListeners);
+    void noteGrowthMethod(SegmentationGrowthMethod method);
 
     bool _editingEnabled{false};
+    bool _drawMaskEnabled{false};
     bool _pending{false};
     bool _growthInProgress{false};
     bool _restoringSettings{false};
@@ -281,5 +299,8 @@ private:
     SegmentationNeuralTracerPanel* _neuralTracerPanel{nullptr};
     SegmentationDirectionFieldPanel* _directionFieldPanel{nullptr};
     SegmentationLasagnaPanel* _lasagnaPanel{nullptr};
+    SegmentationManualAddPanel* _manualAddPanel{nullptr};
+    bool _manualAddActive{false};
+    SegmentationGrowthMethod _lastNonManualGrowthMethod{SegmentationGrowthMethod::Tracer};
 
 };

@@ -28,9 +28,11 @@
 #include <chrono>
 #include <cmath>
 #include <ctime>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <utility>
 #include <cstdint>
 #include <cctype>
@@ -750,6 +752,144 @@ QString createDenseSnapshotPath(const QString& preferredDir)
     return dir.filePath(QStringLiteral("vc_dense_input_%1").arg(suffix));
 }
 
+QString defaultPatchTracerSourcePath(const std::shared_ptr<VolumePkg>& pkg)
+{
+    if (!pkg) {
+        return QString();
+    }
+    return QDir(QString::fromStdString(pkg->getVolpkgDirectory())).filePath(QStringLiteral("paths"));
+}
+
+std::filesystem::path normalizedExistingPath(const QString& path)
+{
+    if (path.trimmed().isEmpty()) {
+        return {};
+    }
+    std::error_code ec;
+    const std::filesystem::path raw(path.toStdString());
+    auto normalized = std::filesystem::weakly_canonical(raw, ec);
+    return ec ? raw.lexically_normal() : normalized;
+}
+
+bool sameFilesystemPath(const QString& a, const QString& b)
+{
+    return normalizedExistingPath(a) == normalizedExistingPath(b);
+}
+
+std::vector<std::shared_ptr<QuadSurface>> loadPatchTracerSurfacesFromFolder(const QString& sourcePath,
+                                                                            QuadSurface* seedSurface)
+{
+    std::vector<std::shared_ptr<QuadSurface>> surfaces;
+    const std::filesystem::path root(sourcePath.toStdString());
+    std::error_code ec;
+    if (!std::filesystem::exists(root, ec) || !std::filesystem::is_directory(root, ec)) {
+        throw std::runtime_error("Patch Tracer source folder does not exist: " + root.string());
+    }
+
+    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+        if (ec) {
+            break;
+        }
+        if (!entry.is_directory(ec)) {
+            continue;
+        }
+        const std::filesystem::path path = entry.path();
+        if (seedSurface && !seedSurface->path.empty() &&
+            normalizedExistingPath(QString::fromStdString(path.string())) ==
+                normalizedExistingPath(QString::fromStdString(seedSurface->path.string()))) {
+            continue;
+        }
+        try {
+            auto loaded = load_quad_from_tifxyz(path.string());
+            if (loaded) {
+                surfaces.emplace_back(std::shared_ptr<QuadSurface>(loaded.release()));
+            }
+        } catch (const std::exception& ex) {
+            qCInfo(lcSegGrowth) << "Skipping Patch Tracer surface"
+                                << QString::fromStdString(path.string())
+                                << ex.what();
+        }
+    }
+
+    if (surfaces.empty()) {
+        throw std::runtime_error("Patch Tracer source folder contains no loadable surfaces: " + root.string());
+    }
+    return surfaces;
+}
+
+std::shared_ptr<SurfacePatchIndex> buildPatchTracerIndex(const std::vector<std::shared_ptr<QuadSurface>>& surfaces,
+                                                         QuadSurface* seedSurface)
+{
+    std::vector<SurfacePatchIndex::SurfacePtr> patchSurfaces;
+    patchSurfaces.reserve(surfaces.size() + 1);
+    std::set<QuadSurface*> seen;
+    auto append = [&](const std::shared_ptr<QuadSurface>& surface) {
+        if (surface && seen.insert(surface.get()).second) {
+            patchSurfaces.emplace_back(surface);
+        }
+    };
+    for (const auto& surface : surfaces) {
+        append(surface);
+    }
+    if (seedSurface && seen.insert(seedSurface).second) {
+        patchSurfaces.emplace_back(SurfacePatchIndex::SurfacePtr(seedSurface, [](QuadSurface*) {}));
+    }
+
+    auto index = std::make_shared<SurfacePatchIndex>();
+    index->rebuild(patchSurfaces, 0.0f);
+    return index;
+}
+
+bool uiPatchIndexMatchesSourceFolder(CState* state,
+                                     SurfacePatchIndex* index,
+                                     const QString& sourcePath,
+                                     std::vector<std::shared_ptr<QuadSurface>>& matchingSurfaces)
+{
+    matchingSurfaces.clear();
+    if (!state || !index || sourcePath.trimmed().isEmpty()) {
+        return false;
+    }
+
+    std::map<std::filesystem::path, std::shared_ptr<QuadSurface>> loadedByPath;
+    for (const auto& surface : state->surfaces()) {
+        auto quad = std::dynamic_pointer_cast<QuadSurface>(surface);
+        if (!quad || quad->path.empty()) {
+            continue;
+        }
+        loadedByPath[normalizedExistingPath(QString::fromStdString(quad->path.string()))] = std::move(quad);
+    }
+
+    const std::filesystem::path root(sourcePath.toStdString());
+    std::error_code ec;
+    if (!std::filesystem::exists(root, ec) || !std::filesystem::is_directory(root, ec)) {
+        return false;
+    }
+
+    int candidateCount = 0;
+    for (const auto& entry : std::filesystem::directory_iterator(root, ec)) {
+        if (ec) {
+            return false;
+        }
+        if (!entry.is_directory(ec)) {
+            continue;
+        }
+        candidateCount++;
+        const auto key = normalizedExistingPath(QString::fromStdString(entry.path().string()));
+        auto it = loadedByPath.find(key);
+        if (it == loadedByPath.end() || !it->second || !index->containsSurface(it->second)) {
+            matchingSurfaces.clear();
+            return false;
+        }
+        matchingSurfaces.push_back(it->second);
+    }
+
+    if (candidateCount == 0) {
+        matchingSurfaces.clear();
+        return false;
+    }
+    return true;
+}
+
 utils::Json sendSocketJsonRequest(const QString& socketPath, const utils::Json& request)
 {
     const std::string socketStd = socketPath.toStdString();
@@ -1377,6 +1517,149 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
         return true;
     }
 
+    if (method == SegmentationGrowthMethod::PatchTracer) {
+        if (_context.module->growthInProgress()) {
+            showStatus(tr("Surface growth already in progress"), kStatusMedium);
+            return false;
+        }
+        if (!_context.widget->customParamsValid()) {
+            const QString errorText = _context.widget->customParamsError();
+            const QString message = errorText.isEmpty()
+                ? tr("Custom params JSON is invalid. Fix the contents and try again.")
+                : tr("Custom params JSON is invalid: %1").arg(errorText);
+            showStatus(message, kStatusLong);
+            return false;
+        }
+
+        const int sanitizedSteps = std::max(1, steps);
+        const SegmentationGrowthDirection effectiveDirection = inpaintOnly
+            ? SegmentationGrowthDirection::All
+            : direction;
+
+        SegmentationGrowthRequest request;
+        request.method = method;
+        request.direction = effectiveDirection;
+        request.steps = sanitizedSteps;
+        request.inpaintOnly = false;
+
+        if (auto overrideDirs = _context.module->takeShortcutDirectionOverride()) {
+            request.allowedDirections = std::move(*overrideDirs);
+        }
+        if (request.allowedDirections.empty()) {
+            request.allowedDirections = _context.widget->allowedGrowthDirections();
+        }
+        if (request.allowedDirections.empty()) {
+            request.allowedDirections = {
+                SegmentationGrowthDirection::Up,
+                SegmentationGrowthDirection::Down,
+                SegmentationGrowthDirection::Left,
+                SegmentationGrowthDirection::Right
+            };
+        }
+
+        request.customParams = _context.widget->patchTracerParamsJson();
+        auto customParams = _context.widget->customParamsJson();
+        if (!customParams.is_null()) {
+            if (request.customParams.is_null()) {
+                request.customParams = utils::Json::object();
+            }
+            for (auto it = customParams.begin(); it != customParams.end(); ++it) {
+                request.customParams[it.key()] = *it;
+            }
+        }
+
+        const QString defaultSource = defaultPatchTracerSourcePath(volumeContext.package);
+        QString sourcePath = _context.widget->patchTracerSourcePath().trimmed();
+        if (sourcePath.isEmpty()) {
+            sourcePath = defaultSource;
+        }
+        sourcePath = QDir::cleanPath(sourcePath);
+        SurfacePatchIndex* uiPatchIndex = _context.viewerManager ? _context.viewerManager->surfacePatchIndex() : nullptr;
+        std::vector<std::shared_ptr<QuadSurface>> uiMatchedSurfaces;
+        const bool useUiPatchIndex = uiPatchIndexMatchesSourceFolder(_context.state,
+                                                                     uiPatchIndex,
+                                                                     sourcePath,
+                                                                     uiMatchedSurfaces);
+
+        TracerGrowthContext ctx;
+        ctx.resumeSurface = segmentationSurface.get();
+        ctx.cacheRoot = cacheRootForVolumePkg(volumeContext.package);
+        ctx.voxelSize = volumeContext.activeVolume ? volumeContext.activeVolume->voxelSize() : 1.0;
+        if (volumeContext.package) {
+            ctx.volpkgRoot = std::filesystem::path(volumeContext.package->getVolpkgDirectory());
+            ctx.volumeIds = volumeContext.package->volumeIDs();
+        }
+
+        if (useUiPatchIndex) {
+            ctx.surfacePatchIndex = uiPatchIndex;
+            ctx.patchSurfaces = std::move(uiMatchedSurfaces);
+        } else if (_patchTracerCachedIndex &&
+                   sameFilesystemPath(sourcePath, _patchTracerCachedSourcePath)) {
+            ctx.surfacePatchIndex = _patchTracerCachedIndex.get();
+            ctx.patchSurfaces = _patchTracerCachedSurfaces;
+        }
+
+        qCInfo(lcSegGrowth) << "Patch Tracer requested"
+                            << "source" << sourcePath
+                            << "useUiPatchIndex" << useUiPatchIndex
+                            << "steps" << sanitizedSteps;
+
+        _running = true;
+        _context.module->setGrowthInProgress(true);
+
+        ActiveRequest pending;
+        pending.volumeContext = volumeContext;
+        pending.growthVolume = volumeContext.activeVolume;
+        pending.growthVolumeId = volumeContext.activeVolumeId;
+        pending.segmentationSurface = segmentationSurface;
+        pending.growthVoxelSize = ctx.voxelSize;
+        pending.usingCorrections = false;
+        pending.inpaintOnly = false;
+        _activeRequest = std::move(pending);
+
+        showStatus(useUiPatchIndex
+                       ? tr("Running Patch Tracer growth...")
+                       : (ctx.surfacePatchIndex
+                              ? tr("Running Patch Tracer growth with cached folder index...")
+                              : tr("Building Patch Tracer index and running growth...")),
+                   kStatusMedium);
+
+        auto future = QtConcurrent::run([request, ctx, sourcePath]() mutable {
+            try {
+                std::shared_ptr<SurfacePatchIndex> builtIndex;
+                std::vector<std::shared_ptr<QuadSurface>> builtSurfaces;
+                if (!ctx.surfacePatchIndex) {
+                    builtSurfaces = loadPatchTracerSurfacesFromFolder(sourcePath, ctx.resumeSurface);
+                    builtIndex = buildPatchTracerIndex(builtSurfaces, ctx.resumeSurface);
+                    ctx.surfacePatchIndex = builtIndex.get();
+                    ctx.patchSurfaces = builtSurfaces;
+                }
+                TracerGrowthResult result = runPatchTracerGrowth(request, ctx);
+                if (builtIndex) {
+                    result.patchTracerCacheSourcePath = sourcePath;
+                    result.patchTracerCachedSurfaces = std::move(builtSurfaces);
+                    result.patchTracerCachedIndex = std::move(builtIndex);
+                }
+                return result;
+            } catch (const std::exception& e) {
+                qCWarning(lcSegGrowth) << "Patch Tracer worker failed:" << e.what();
+                TracerGrowthResult result;
+                result.error = QStringLiteral("Patch Tracer failed: %1").arg(e.what());
+                return result;
+            } catch (...) {
+                qCWarning(lcSegGrowth) << "Patch Tracer worker failed with an unknown exception";
+                TracerGrowthResult result;
+                result.error = QStringLiteral("Patch Tracer failed with an unknown exception");
+                return result;
+            }
+        });
+        _watcher = std::make_unique<QFutureWatcher<TracerGrowthResult>>(this);
+        connect(_watcher.get(), &QFutureWatcher<TracerGrowthResult>::finished,
+                this, &SegmentationGrower::onFutureFinished);
+        _watcher->setFuture(future);
+        return true;
+    }
+
     std::shared_ptr<Volume> growthVolume;
     std::string growthVolumeId = volumeContext.requestedVolumeId;
 
@@ -1610,7 +1893,21 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
                 : tr("Running dense displacement (overwrite current segment)..."),
             kStatusMedium);
 
-        auto future = QtConcurrent::run(runDenseDisplacementGrowth, denseJob);
+        auto future = QtConcurrent::run([denseJob]() {
+            try {
+                return runDenseDisplacementGrowth(denseJob);
+            } catch (const std::exception& e) {
+                qCWarning(lcSegGrowth) << "Dense displacement worker failed:" << e.what();
+                TracerGrowthResult result;
+                result.error = QStringLiteral("Dense displacement failed: %1").arg(e.what());
+                return result;
+            } catch (...) {
+                qCWarning(lcSegGrowth) << "Dense displacement worker failed with an unknown exception";
+                TracerGrowthResult result;
+                result.error = QStringLiteral("Dense displacement failed with an unknown exception");
+                return result;
+            }
+        });
         _watcher = std::make_unique<QFutureWatcher<TracerGrowthResult>>(this);
         connect(_watcher.get(), &QFutureWatcher<TracerGrowthResult>::finished,
                 this, &SegmentationGrower::onFutureFinished);
@@ -1763,7 +2060,21 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
 
     _activeRequest = std::move(pending);
 
-    auto future = QtConcurrent::run(runTracerGrowth, request, ctx);
+    auto future = QtConcurrent::run([request, ctx]() {
+        try {
+            return runTracerGrowth(request, ctx);
+        } catch (const std::exception& e) {
+            qCWarning(lcSegGrowth) << "Tracer growth worker failed:" << e.what();
+            TracerGrowthResult result;
+            result.error = QStringLiteral("Tracer growth failed: %1").arg(e.what());
+            return result;
+        } catch (...) {
+            qCWarning(lcSegGrowth) << "Tracer growth worker failed with an unknown exception";
+            TracerGrowthResult result;
+            result.error = QStringLiteral("Tracer growth failed with an unknown exception");
+            return result;
+        }
+    });
     _watcher = std::make_unique<QFutureWatcher<TracerGrowthResult>>(this);
     connect(_watcher.get(), &QFutureWatcher<TracerGrowthResult>::finished,
             this, &SegmentationGrower::onFutureFinished);
@@ -1952,7 +2263,21 @@ bool SegmentationGrower::startCopyWithNt(const VolumeContext& volumeContext)
 
     showStatus(tr("Running displacement copy (creating front/back segments)..."), kStatusMedium);
 
-    auto future = QtConcurrent::run(runCopyDisplacementGrowth, copyJob);
+    auto future = QtConcurrent::run([copyJob]() {
+        try {
+            return runCopyDisplacementGrowth(copyJob);
+        } catch (const std::exception& e) {
+            qCWarning(lcSegGrowth) << "Copy displacement worker failed:" << e.what();
+            TracerGrowthResult result;
+            result.error = QStringLiteral("Copy displacement failed: %1").arg(e.what());
+            return result;
+        } catch (...) {
+            qCWarning(lcSegGrowth) << "Copy displacement worker failed with an unknown exception";
+            TracerGrowthResult result;
+            result.error = QStringLiteral("Copy displacement failed with an unknown exception");
+            return result;
+        }
+    });
     _watcher = std::make_unique<QFutureWatcher<TracerGrowthResult>>(this);
     connect(_watcher.get(), &QFutureWatcher<TracerGrowthResult>::finished,
             this, &SegmentationGrower::onFutureFinished);
@@ -2071,6 +2396,12 @@ void SegmentationGrower::onFutureFinished()
 
     ActiveRequest request = std::move(*_activeRequest);
     _activeRequest.reset();
+
+    if (result.patchTracerCachedIndex && !result.patchTracerCacheSourcePath.isEmpty()) {
+        _patchTracerCachedSourcePath = result.patchTracerCacheSourcePath;
+        _patchTracerCachedSurfaces = result.patchTracerCachedSurfaces;
+        _patchTracerCachedIndex = result.patchTracerCachedIndex;
+    }
 
     auto cleanupDisplacementTemporarySurfaces = [&](const std::filesystem::path& preservePath = std::filesystem::path()) {
         if (!request.denseDisplacement && !request.copyDisplacement) {

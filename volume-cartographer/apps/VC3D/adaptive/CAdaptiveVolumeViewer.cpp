@@ -7,7 +7,9 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
+#include "vc/core/render/Colormaps.hpp"
 #include "vc/core/render/PostProcess.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/types/SampleParams.hpp"
@@ -37,6 +39,7 @@
 #include <QPointer>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <limits>
 
@@ -64,6 +67,7 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
         fmt.setSwapInterval(0);  // disable vsync — we already coalesce at 16 ms
         auto* gl = new QOpenGLWidget(_view);
         gl->setFormat(fmt);
+        gl->setMouseTracking(true);
         _view->setViewport(gl);
     }
     fGraphicsView = _view;
@@ -84,7 +88,6 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
     connect(_view, &CVolumeViewerView::sendVolumeClicked, this, &CAdaptiveVolumeViewer::onVolumeClicked);
     connect(_view, &CVolumeViewerView::sendZoom, this, &CAdaptiveVolumeViewer::onZoom);
     connect(_view, &CVolumeViewerView::sendResized, this, &CAdaptiveVolumeViewer::onResized);
-    connect(_view, &CVolumeViewerView::sendCursorMove, this, &CAdaptiveVolumeViewer::onCursorMove);
     connect(_view, &CVolumeViewerView::sendPanRelease, this, &CAdaptiveVolumeViewer::onPanRelease);
     connect(_view, &CVolumeViewerView::sendPanStart, this, &CAdaptiveVolumeViewer::onPanStart);
     connect(_view, &CVolumeViewerView::sendMousePress, this, &CAdaptiveVolumeViewer::onMousePress);
@@ -171,6 +174,10 @@ CAdaptiveVolumeViewer::~CAdaptiveVolumeViewer()
     if (_chunkCbId != 0 && _volume && _volume->tieredCache()) {
         _volume->tieredCache()->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
+    }
+    if (_overlayChunkCbId != 0 && _overlayVolume && _overlayVolume->tieredCache()) {
+        _overlayVolume->tieredCache()->removeChunkReadyListener(_overlayChunkCbId);
+        _overlayChunkCbId = 0;
     }
     if (_tickViewportSlot >= 0) {
         vc::cache::TickCoordinator::releaseViewportSlotGlobal(_tickViewportSlot);
@@ -386,6 +393,10 @@ void CAdaptiveVolumeViewer::onVolumeClosing()
         _volume->tieredCache()->removeChunkReadyListener(_chunkCbId);
     }
     _chunkCbId = 0;
+    if (_overlayChunkCbId != 0 && _overlayVolume && _overlayVolume->tieredCache()) {
+        _overlayVolume->tieredCache()->removeChunkReadyListener(_overlayChunkCbId);
+    }
+    _overlayChunkCbId = 0;
     onSurfaceChanged(_surfName, nullptr);
     _volume.reset();
 }
@@ -443,6 +454,109 @@ void CAdaptiveVolumeViewer::scheduleRender()
 // up, 30 fps interactive coalesce) stays in place so it can be switched
 // back on with a single recompile.
 static constexpr bool kProgressiveRenderingEnabled = false;
+
+namespace {
+
+int chooseAvailableLevel(const std::shared_ptr<Volume>& volume, int desiredLevel)
+{
+    if (!volume || volume->numScales() == 0) {
+        return -1;
+    }
+
+    const int numLevels = static_cast<int>(volume->numScales());
+    desiredLevel = std::clamp(desiredLevel, 0, numLevels - 1);
+
+    int chosen = desiredLevel;
+    while (chosen < numLevels && !volume->zarrDataset(chosen)) {
+        ++chosen;
+    }
+    if (chosen < numLevels) {
+        return chosen;
+    }
+
+    chosen = desiredLevel - 1;
+    while (chosen >= 0 && !volume->zarrDataset(chosen)) {
+        --chosen;
+    }
+    return chosen;
+}
+
+void buildOverlayLut(std::array<uint32_t, 256>& lut,
+                     const std::string& colormapId,
+                     float windowLow,
+                     float windowHigh,
+                     float opacity)
+{
+    const int low = static_cast<int>(std::round(std::clamp(windowLow, 0.0f, 255.0f)));
+    int high = static_cast<int>(std::round(std::clamp(windowHigh, 0.0f, 255.0f)));
+    if (high <= low) {
+        high = std::min(255, low + 1);
+    }
+
+    const auto& spec = vc::resolve(colormapId);
+    cv::Mat_<uint8_t> colorInput(1, 256);
+    const float span = std::max(1.0f, static_cast<float>(high - low));
+    for (int i = 0; i < 256; ++i) {
+        if (spec.kind == vc::OverlayColormapKind::DiscreteLut) {
+            colorInput(0, i) = static_cast<uint8_t>(i);
+        } else {
+            const float scaled = std::clamp((static_cast<float>(i) - static_cast<float>(low)) / span,
+                                            0.0f, 1.0f);
+            colorInput(0, i) = static_cast<uint8_t>(std::round(scaled * 255.0f));
+        }
+    }
+
+    vc::makeColors(colorInput, spec, lut.data(), 256);
+
+    const uint32_t alpha = static_cast<uint32_t>(
+        std::round(std::clamp(opacity, 0.0f, 1.0f) * 255.0f));
+    for (int i = 0; i < 256; ++i) {
+        if (i < low || alpha == 0) {
+            lut[i] &= 0x00FFFFFFu;
+        } else {
+            lut[i] = (lut[i] & 0x00FFFFFFu) | (alpha << 24);
+        }
+    }
+}
+
+void blendOverlayARGB32(uint32_t* baseBits,
+                        int baseStride,
+                        const uint32_t* overlayBits,
+                        int overlayStride,
+                        int width,
+                        int height)
+{
+    for (int y = 0; y < height; ++y) {
+        uint32_t* base = baseBits + size_t(y) * size_t(baseStride);
+        const uint32_t* overlay = overlayBits + size_t(y) * size_t(overlayStride);
+        for (int x = 0; x < width; ++x) {
+            const uint32_t ov = overlay[x];
+            const uint32_t a = ov >> 24;
+            if (a == 0) {
+                continue;
+            }
+            if (a == 255) {
+                base[x] = 0xFF000000u | (ov & 0x00FFFFFFu);
+                continue;
+            }
+
+            const uint32_t src = base[x];
+            const uint32_t ia = 255u - a;
+            const uint32_t sr = (src >> 16) & 0xFFu;
+            const uint32_t sg = (src >> 8) & 0xFFu;
+            const uint32_t sb = src & 0xFFu;
+            const uint32_t or_ = (ov >> 16) & 0xFFu;
+            const uint32_t og = (ov >> 8) & 0xFFu;
+            const uint32_t ob = ov & 0xFFu;
+            const uint32_t r = (sr * ia + or_ * a + 127u) / 255u;
+            const uint32_t g = (sg * ia + og * a + 127u) / 255u;
+            const uint32_t b = (sb * ia + ob * a + 127u) / 255u;
+            base[x] = 0xFF000000u | (r << 16) | (g << 8) | b;
+        }
+    }
+}
+
+} // namespace
 
 void CAdaptiveVolumeViewer::beginInteraction()
 {
@@ -502,6 +616,9 @@ void CAdaptiveVolumeViewer::submitRender()
     if (_volume) {
         if (auto* c = _volume->tieredCache()) c->clearChunkArrivedFlag();
     }
+    if (_overlayVolume) {
+        if (auto* c = _overlayVolume->tieredCache()) c->clearChunkArrivedFlag();
+    }
 
     // Quick main-thread checks before dispatch. The worker can't check
     // these safely — the shared_ptr from weak_ptr::lock() and the volume
@@ -554,6 +671,11 @@ void CAdaptiveVolumeViewer::submitRender()
     ctx.zOffWorldDir = _zOffWorldDir;
     ctx.surf = std::move(surf);
     ctx.volume = _volume;
+    ctx.overlayVolume = _overlayVolume;
+    ctx.overlayOpacity = _overlayOpacity;
+    ctx.overlayColormapId = _overlayColormapId;
+    ctx.overlayWindowLow = _overlayWindowLow;
+    ctx.overlayWindowHigh = _overlayWindowHigh;
 
     // Dispatch the whole render body to QThreadPool. The main thread
     // returns immediately — Qt input events are no longer stalled behind
@@ -639,6 +761,12 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
 
     auto* fbBits = reinterpret_cast<uint32_t*>(fb.bits());
     int fbStride = fb.bytesPerLine() / 4;
+    bool overlayUsePlane = false;
+    cv::Vec3f overlayOrigin(0.0f, 0.0f, 0.0f);
+    cv::Vec3f overlayVxStep(0.0f, 0.0f, 0.0f);
+    cv::Vec3f overlayVyStep(0.0f, 0.0f, 0.0f);
+    cv::Vec3f overlayPlaneNormal(0.0f, 0.0f, 1.0f);
+    const cv::Mat_<cv::Vec3f>* overlayCoords = nullptr;
 
     // Build the render LUT. For stretch mode we use last frame's min/max
     // so the render is a single pass; we refresh the cached range by
@@ -715,6 +843,11 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
                          + plane->origin() + n * ctx.camera.zOff;
         cv::Vec3f vx_step = vx / ctx.camera.scale;
         cv::Vec3f vy_step = vy / ctx.camera.scale;
+        overlayUsePlane = true;
+        overlayOrigin = origin;
+        overlayVxStep = vx_step;
+        overlayVyStep = vy_step;
+        overlayPlaneNormal = n;
 
         int numLayers = 1, zStart = 0;
         float zStep = 1.0f;
@@ -744,7 +877,8 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
             numLayers, zStart, zStep,
             fbW, fbH, method, lut.data(), sampleMethod,
             &lightP,  // sampler uses lightP for volumetric and lighting paths
-            lvlOutPtr, lvlOutStride);
+            lvlOutPtr, lvlOutStride,
+            false, !ctx.interactive);
     } else {
         // surf->gen treats offset as the TOP-LEFT of the rendered region in
         // scaled surface units, but camera.surfacePtr is the CENTRE of the
@@ -844,6 +978,7 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
         cv::Mat_<cv::Vec3f>& normals = _genNormals;
 
         if (!coords.empty()) {
+            overlayCoords = &coords;
             int numLayers = 1, zStart = 0;
             float zStep = 1.0f;
             const cv::Mat_<cv::Vec3f>* pNormals = nullptr;
@@ -859,6 +994,10 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
             }
             vc::Sampling sampleMethod = (numLayers > 1) ? vc::Sampling::Nearest
                                                         : ctx.samplingMethod;
+            const bool skipPrefetch =
+                cacheHit
+                && _genCachePrefetchLevel == sp.level
+                && _genCachePrefetchNumLevels == numLevels;
             sampleAdaptiveARGB32(
                 fbBits, fbStride, ctx.volume->tieredCache(),
                 sp.level, numLevels,
@@ -869,10 +1008,15 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
                 &lightP,  // sampler uses lightP for volumetric and lighting paths
                 lvlOutPtr, lvlOutStride,
                 // Coords cached → prior frame already did the chunk
-                // enumeration + fetchInteractive for this exact geometry.
+                // enumeration + fetchInteractive for this exact geometry
+                // at this exact pyramid level.
                 // The per-sample adaptive-fallback path still handles any
                 // block not yet resident, so correctness is preserved.
-                cacheHit);
+                skipPrefetch, !ctx.interactive);
+            if (!skipPrefetch) {
+                _genCachePrefetchLevel = sp.level;
+                _genCachePrefetchNumLevels = numLevels;
+            }
         }
     }
 
@@ -1042,6 +1186,55 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
         }
     }
 
+    if (ctx.overlayVolume && ctx.overlayOpacity > 0.0f) {
+        const int overlayLevel = chooseAvailableLevel(ctx.overlayVolume, ctx.camera.dsScaleIdx);
+        auto* overlayCache = ctx.overlayVolume->tieredCache();
+        if (overlayLevel >= 0 && overlayCache) {
+            if (_overlayFramebuffer.isNull()
+                || _overlayFramebuffer.width() != fbW
+                || _overlayFramebuffer.height() != fbH
+                || _overlayFramebuffer.format() != QImage::Format_ARGB32) {
+                _overlayFramebuffer = QImage(fbW, fbH, QImage::Format_ARGB32);
+            }
+            _overlayFramebuffer.fill(Qt::transparent);
+
+            std::array<uint32_t, 256> overlayLut{};
+            buildOverlayLut(overlayLut,
+                            ctx.overlayColormapId,
+                            ctx.overlayWindowLow,
+                            ctx.overlayWindowHigh,
+                            ctx.overlayOpacity);
+
+            auto* overlayBits = reinterpret_cast<uint32_t*>(_overlayFramebuffer.bits());
+            const int overlayStride = _overlayFramebuffer.bytesPerLine() / 4;
+            const int overlayNumLevels = static_cast<int>(ctx.overlayVolume->numScales());
+
+            if (overlayUsePlane) {
+                sampleAdaptiveARGB32(
+                    overlayBits, overlayStride, overlayCache,
+                    overlayLevel, overlayNumLevels,
+                    nullptr, &overlayOrigin, &overlayVxStep, &overlayVyStep,
+                    nullptr, &overlayPlaneNormal,
+                    1, 0, 1.0f,
+                    fbW, fbH, std::string(), overlayLut.data(), vc::Sampling::Nearest,
+                    nullptr, nullptr, 0,
+                    false, !ctx.interactive);
+                blendOverlayARGB32(fbBits, fbStride, overlayBits, overlayStride, fbW, fbH);
+            } else if (overlayCoords && !overlayCoords->empty()) {
+                sampleAdaptiveARGB32(
+                    overlayBits, overlayStride, overlayCache,
+                    overlayLevel, overlayNumLevels,
+                    overlayCoords, nullptr, nullptr, nullptr,
+                    nullptr, nullptr,
+                    1, 0, 1.0f,
+                    fbW, fbH, std::string(), overlayLut.data(), vc::Sampling::Nearest,
+                    nullptr, nullptr, 0,
+                    false, !ctx.interactive);
+                blendOverlayARGB32(fbBits, fbStride, overlayBits, overlayStride, fbW, fbH);
+            }
+        }
+    }
+
     if (highlightDownscaled && lvlOutPtr
         && _levelBuffer.rows == fbH && _levelBuffer.cols == fbW) {
         // Fallback-depth gradient: green (1 level coarser) → red (5+ coarser).
@@ -1174,12 +1367,96 @@ void CAdaptiveVolumeViewer::centerOnVolumePoint(const cv::Vec3f& point, bool for
     emit overlaysUpdated();
 }
 
+void CAdaptiveVolumeViewer::centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender)
+{
+    if (!std::isfinite(point[0]) || !std::isfinite(point[1])) {
+        return;
+    }
+
+    _camera.surfacePtr[0] = point[0];
+    _camera.surfacePtr[1] = point[1];
+    _cachedStretchValid = false;
+    syncCameraTransform();
+
+    if (forceRender) {
+        renderVisible(true);
+    } else {
+        scheduleRender();
+    }
+    emit overlaysUpdated();
+}
+
 // ============================================================================
 // Navigation
 // ============================================================================
 
+CAdaptiveVolumeViewer::CameraSceneSnapshot CAdaptiveVolumeViewer::cameraSceneSnapshot() const
+{
+    CameraSceneSnapshot snap;
+    if (!_view || _framebuffer.isNull() || _camera.scale <= 0.0f) {
+        return snap;
+    }
+
+    snap.camSurfX = _camera.surfacePtr[0];
+    snap.camSurfY = _camera.surfacePtr[1];
+    snap.camScale = _camera.scale;
+    snap.vpCx = static_cast<float>(_framebuffer.width()) * 0.5f;
+    snap.vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
+    snap.sceneToView = _view->transform();
+    snap.viewToScene = snap.sceneToView.inverted();
+    snap.valid = true;
+    return snap;
+}
+
+void CAdaptiveVolumeViewer::warpIntersectionItemsFrom(const CameraSceneSnapshot& oldCam)
+{
+    if (!oldCam.valid || _intersectionItems.empty()) {
+        return;
+    }
+
+    const CameraSceneSnapshot newCam = cameraSceneSnapshot();
+    if (!newCam.valid || oldCam.camScale <= 0.0f) {
+        return;
+    }
+
+    const float scaleRatio = newCam.camScale / oldCam.camScale;
+    auto mapScenePoint = [&](const QPointF& scenePoint) {
+        const QPointF oldVp = oldCam.sceneToView.map(scenePoint);
+        const qreal newVx =
+            oldVp.x() * scaleRatio +
+            (oldCam.camSurfX - newCam.camSurfX) * newCam.camScale +
+            newCam.vpCx - oldCam.vpCx * scaleRatio;
+        const qreal newVy =
+            oldVp.y() * scaleRatio +
+            (oldCam.camSurfY - newCam.camSurfY) * newCam.camScale +
+            newCam.vpCy - oldCam.vpCy * scaleRatio;
+        return newCam.viewToScene.map(QPointF(newVx, newVy));
+    };
+
+    const QPointF p0 = mapScenePoint(QPointF(0.0, 0.0));
+    const QPointF p1 = mapScenePoint(QPointF(1.0, 0.0));
+    const QPointF p2 = mapScenePoint(QPointF(0.0, 1.0));
+    QTransform sceneWarp(
+        p1.x() - p0.x(), p1.y() - p0.y(),
+        p2.x() - p0.x(), p2.y() - p0.y(),
+        p0.x(), p0.y());
+
+    for (auto* item : _intersectionItems) {
+        auto* pathItem = qgraphicsitem_cast<QGraphicsPathItem*>(item);
+        if (!pathItem) {
+            continue;
+        }
+        pathItem->setPath(sceneWarp.map(pathItem->path()));
+        pathItem->setTransform(QTransform());
+    }
+    if (_view) {
+        _view->viewport()->update();
+    }
+}
+
 void CAdaptiveVolumeViewer::panByF(float dx, float dy)
 {
+    const CameraSceneSnapshot oldCam = cameraSceneSnapshot();
     const float invScale = _panSensitivity / _camera.scale;
     _camera.surfacePtr[0] -= dx * invScale;
     _camera.surfacePtr[1] -= dy * invScale;
@@ -1190,6 +1467,7 @@ void CAdaptiveVolumeViewer::panByF(float dx, float dy)
     }
 
     _cachedStretchValid = false;
+    warpIntersectionItemsFrom(oldCam);
     beginInteraction();
     scheduleRender();
     emit overlaysUpdated();
@@ -1198,6 +1476,8 @@ void CAdaptiveVolumeViewer::panByF(float dx, float dy)
 void CAdaptiveVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
 {
     if (steps == 0) return;
+
+    const CameraSceneSnapshot oldCam = cameraSceneSnapshot();
 
     float factor = std::pow(1.05f, static_cast<float>(steps) * _zoomSensitivity);
     float newScale = std::clamp(_camera.scale * factor,
@@ -1245,6 +1525,7 @@ void CAdaptiveVolumeViewer::zoomStepsAt(int steps, const QPointF& scenePos)
     _scene->setSceneRect(0, 0, w, h);
 
     _cachedStretchValid = false;
+    warpIntersectionItemsFrom(oldCam);
     // Zoom can fire as fast as the keyboard repeats. scheduleRender()
     // coalesces bursts into the 60 fps render timer so we don't render
     // dozens of intermediate frames the user never sees.
@@ -1300,6 +1581,7 @@ void CAdaptiveVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMo
             focus->p = newPos;
             if (length > 0.0) focus->n = normal;
             focus->surfaceId = _surfName;
+            focus->suppressViewerRecenter = true;
             _state->setPOI("focus", focus);
         } else {
             // Direct z-offset — rigid translation along the surface normal at
@@ -1355,19 +1637,6 @@ void CAdaptiveVolumeViewer::onResized()
     emit overlaysUpdated();
 }
 
-void CAdaptiveVolumeViewer::onCursorMove(QPointF scenePos)
-{
-    _lastScenePos = scenePos;
-    if (_isPanning) {
-        float dx = static_cast<float>(scenePos.x() - _lastPanSceneF.x());
-        float dy = static_cast<float>(scenePos.y() - _lastPanSceneF.y());
-        _lastPanSceneF = scenePos;
-        if (std::abs(dx) > 0.001f || std::abs(dy) > 0.001f) {
-            panByF(dx, dy);
-        }
-    }
-}
-
 void CAdaptiveVolumeViewer::onPanStart(Qt::MouseButton, Qt::KeyboardModifiers)
 {
     _isPanning = true;
@@ -1394,23 +1663,226 @@ void CAdaptiveVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton bu
 void CAdaptiveVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button,
                                           Qt::KeyboardModifiers modifiers)
 {
+    if (_bboxMode && _surfName == "segmentation") {
+        if (button == Qt::LeftButton) {
+            const cv::Vec2f sp = sceneToSurface(scenePos);
+            _bboxStart = QPointF(sp[0], sp[1]);
+            _activeBBoxSurfRect = QRectF(_bboxStart, _bboxStart).normalized();
+            emit overlaysUpdated();
+        }
+        return;
+    }
+
     cv::Vec3f p = sceneToVolume(scenePos);
     cv::Vec3f n(0, 0, 1);
-    emit sendMousePressVolume(p, n, button, modifiers);
+    emit sendMousePressVolume(p, n, button, modifiers, scenePos);
 }
 
 void CAdaptiveVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons buttons,
                                          Qt::KeyboardModifiers modifiers)
 {
+    _lastScenePos = scenePos;
+    if (_bboxMode && _surfName == "segmentation") {
+        if (_activeBBoxSurfRect && (buttons & Qt::LeftButton)) {
+            const cv::Vec2f sp = sceneToSurface(scenePos);
+            const QPointF cur(sp[0], sp[1]);
+            _activeBBoxSurfRect = QRectF(_bboxStart, cur).normalized();
+            emit overlaysUpdated();
+        }
+        return;
+    }
+
+    if (_isPanning) {
+        const float dx = static_cast<float>(scenePos.x() - _lastPanSceneF.x());
+        const float dy = static_cast<float>(scenePos.y() - _lastPanSceneF.y());
+        _lastPanSceneF = scenePos;
+        if (std::abs(dx) > 0.001f || std::abs(dy) > 0.001f) {
+            panByF(dx, dy);
+        }
+        return;
+    }
+
     cv::Vec3f p = sceneToVolume(scenePos);
-    emit sendMouseMoveVolume(p, buttons, modifiers);
+    emit sendMouseMoveVolume(p, buttons, modifiers, scenePos);
 }
 
 void CAdaptiveVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton button,
                                             Qt::KeyboardModifiers modifiers)
 {
+    if (_bboxMode && _surfName == "segmentation") {
+        if (button == Qt::LeftButton && _activeBBoxSurfRect) {
+            const cv::Vec2f sp = sceneToSurface(scenePos);
+            const QPointF cur(sp[0], sp[1]);
+            const QRectF surfRect = QRectF(_bboxStart, cur).normalized();
+            const int idx = static_cast<int>(_selections.size());
+            const QColor color = QColor::fromHsv((idx * 53) % 360, 200, 255);
+            _selections.push_back({surfRect, color});
+            _activeBBoxSurfRect.reset();
+            emit overlaysUpdated();
+        }
+        return;
+    }
+
     cv::Vec3f p = sceneToVolume(scenePos);
-    emit sendMouseReleaseVolume(p, button, modifiers);
+    emit sendMouseReleaseVolume(p, button, modifiers, scenePos);
+}
+
+void CAdaptiveVolumeViewer::setBBoxMode(bool enabled)
+{
+    _bboxMode = enabled;
+    if (!enabled && _activeBBoxSurfRect) {
+        _activeBBoxSurfRect.reset();
+        emit overlaysUpdated();
+    }
+}
+
+QuadSurface* CAdaptiveVolumeViewer::makeBBoxFilteredSurfaceFromSceneRect(const QRectF& sceneRect)
+{
+    if (_surfName != "segmentation") {
+        return nullptr;
+    }
+
+    auto surf = _surfWeak.lock();
+    auto* quad = dynamic_cast<QuadSurface*>(surf.get());
+    if (!quad) {
+        return nullptr;
+    }
+
+    const cv::Mat_<cv::Vec3f> src = quad->rawPoints();
+    const int h = src.rows;
+    const int w = src.cols;
+    if (h <= 0 || w <= 0) {
+        return nullptr;
+    }
+
+    const cv::Vec2f sp0 = sceneToSurface(sceneRect.topLeft());
+    const cv::Vec2f sp1 = sceneToSurface(sceneRect.bottomRight());
+    QRectF surfRect(QPointF(sp0[0], sp0[1]), QPointF(sp1[0], sp1[1]));
+    surfRect = surfRect.normalized();
+
+    const double cx = w * 0.5;
+    const double cy = h * 0.5;
+    const cv::Vec2f scale = quad->scale();
+    if (scale[0] == 0.0f || scale[1] == 0.0f) {
+        return nullptr;
+    }
+
+    const int i0 = std::max(0, static_cast<int>(std::floor(cx + surfRect.left() * scale[0])));
+    const int i1 = std::min(w - 1, static_cast<int>(std::ceil(cx + surfRect.right() * scale[0])));
+    const int j0 = std::max(0, static_cast<int>(std::floor(cy + surfRect.top() * scale[1])));
+    const int j1 = std::min(h - 1, static_cast<int>(std::ceil(cy + surfRect.bottom() * scale[1])));
+    if (i0 > i1 || j0 > j1) {
+        return nullptr;
+    }
+
+    cv::Mat_<cv::Vec3f> cropped(j1 - j0 + 1, i1 - i0 + 1, cv::Vec3f(-1.0f, -1.0f, -1.0f));
+    for (int j = j0; j <= j1; ++j) {
+        for (int i = i0; i <= i1; ++i) {
+            const cv::Vec3f& p = src(j, i);
+            if (p[0] == -1.0f && p[1] == -1.0f && p[2] == -1.0f) {
+                continue;
+            }
+            const double u = (i - cx) / scale[0];
+            const double v = (j - cy) / scale[1];
+            if (u >= surfRect.left() && u <= surfRect.right() &&
+                v >= surfRect.top() && v <= surfRect.bottom()) {
+                cropped(j - j0, i - i0) = p;
+            }
+        }
+    }
+
+    cv::Mat_<cv::Vec3f> cleaned = clean_surface_outliers(cropped);
+
+    auto countValidInCol = [&](int c) {
+        int count = 0;
+        for (int r = 0; r < cleaned.rows; ++r) {
+            if (cleaned(r, c)[0] != -1.0f) {
+                ++count;
+            }
+        }
+        return count;
+    };
+    auto countValidInRow = [&](int r) {
+        int count = 0;
+        for (int c = 0; c < cleaned.cols; ++c) {
+            if (cleaned(r, c)[0] != -1.0f) {
+                ++count;
+            }
+        }
+        return count;
+    };
+
+    const int minValidCol = std::max(1, std::min(3, cleaned.rows));
+    const int minValidRow = std::max(1, std::min(3, cleaned.cols));
+    int left = 0;
+    int right = cleaned.cols - 1;
+    int top = 0;
+    int bottom = cleaned.rows - 1;
+    while (left <= right && countValidInCol(left) < minValidCol) {
+        ++left;
+    }
+    while (right >= left && countValidInCol(right) < minValidCol) {
+        --right;
+    }
+    while (top <= bottom && countValidInRow(top) < minValidRow) {
+        ++top;
+    }
+    while (bottom >= top && countValidInRow(bottom) < minValidRow) {
+        --bottom;
+    }
+
+    if (left > right || top > bottom) {
+        left = cleaned.cols;
+        right = -1;
+        top = cleaned.rows;
+        bottom = -1;
+        for (int j = 0; j < cleaned.rows; ++j) {
+            for (int i = 0; i < cleaned.cols; ++i) {
+                if (cleaned(j, i)[0] != -1.0f) {
+                    left = std::min(left, i);
+                    right = std::max(right, i);
+                    top = std::min(top, j);
+                    bottom = std::max(bottom, j);
+                }
+            }
+        }
+        if (right < 0 || bottom < 0) {
+            return nullptr;
+        }
+    }
+
+    cv::Mat_<cv::Vec3f> finalPts(bottom - top + 1, right - left + 1, cv::Vec3f(-1.0f, -1.0f, -1.0f));
+    for (int j = top; j <= bottom; ++j) {
+        for (int i = left; i <= right; ++i) {
+            finalPts(j - top, i - left) = cleaned(j, i);
+        }
+    }
+
+    return new QuadSurface(finalPts, quad->scale());
+}
+
+auto CAdaptiveVolumeViewer::selections() const -> std::vector<std::pair<QRectF, QColor>>
+{
+    std::vector<std::pair<QRectF, QColor>> out;
+    out.reserve(_selections.size());
+    for (const auto& selection : _selections) {
+        out.emplace_back(surfaceRectToSceneRect(selection.surfRect), selection.color);
+    }
+    return out;
+}
+
+std::optional<QRectF> CAdaptiveVolumeViewer::activeBBoxSceneRect() const
+{
+    if (!_activeBBoxSurfRect) {
+        return std::nullopt;
+    }
+    return surfaceRectToSceneRect(*_activeBBoxSurfRect);
+}
+
+void CAdaptiveVolumeViewer::clearSelections()
+{
+    _selections.clear();
+    emit overlaysUpdated();
 }
 
 void CAdaptiveVolumeViewer::onKeyPress(int key, Qt::KeyboardModifiers)
@@ -1438,6 +1910,15 @@ QPointF CAdaptiveVolumeViewer::surfaceToScene(float surfX, float surfY) const
     const qreal vx = (surfX - _camSurfX) * _camScale + vpCx;
     const qreal vy = (surfY - _camSurfY) * _camScale + vpCy;
     return _view->mapToScene(QPointF(vx, vy).toPoint());
+}
+
+QRectF CAdaptiveVolumeViewer::surfaceRectToSceneRect(const QRectF& surfRect) const
+{
+    const QPointF p0 = surfaceToScene(static_cast<float>(surfRect.left()),
+                                      static_cast<float>(surfRect.top()));
+    const QPointF p1 = surfaceToScene(static_cast<float>(surfRect.right()),
+                                      static_cast<float>(surfRect.bottom()));
+    return QRectF(p0, p1).normalized();
 }
 
 cv::Vec2f CAdaptiveVolumeViewer::sceneToSurface(const QPointF& scenePos) const
@@ -1579,8 +2060,16 @@ float activeSegmentationIntersectionWidth(float baseWidth)
 }
 }
 
-void CAdaptiveVolumeViewer::invalidateIntersect(const std::string&)
+void CAdaptiveVolumeViewer::invalidateIntersect(const std::string& name)
 {
+    if (!name.empty()) {
+        // A named target changed in place. Keep the previous overlay visible
+        // until renderIntersectionsNow() has computed replacement paths;
+        // clearing here creates a visible flash during continuous edits.
+        _lastIntersectFp = {};
+        return;
+    }
+
     for (auto* item : _intersectionItems) {
         if (item && item->scene()) _scene->removeItem(item);
         delete item;
@@ -1599,6 +2088,12 @@ void CAdaptiveVolumeViewer::renderIntersections()
     if (_renderTimer && !_renderTimer->isActive()) {
         _renderTimer->start();
     }
+}
+
+void CAdaptiveVolumeViewer::requestRender()
+{
+    scheduleRender();
+    emit overlaysUpdated();
 }
 
 void CAdaptiveVolumeViewer::renderIntersectionsNow()
@@ -1714,7 +2209,6 @@ void CAdaptiveVolumeViewer::renderIntersectionsNow()
         _lastIntersectFp = {};
         return;
     }
-    invalidateIntersect();
     _lastIntersectFp = fp;
 
     // Snapshot camera state for the worker's plane-to-scene projections.
@@ -1865,6 +2359,9 @@ void CAdaptiveVolumeViewer::renderIntersectionsNow()
                     }
                     _planeWorkerBusy.store(false,
                                            std::memory_order_release);
+                    if (_intersectionsDirty && _renderTimer && !_renderTimer->isActive()) {
+                        _renderTimer->start();
+                    }
                 },
                 Qt::QueuedConnection);
             _backgroundWorkers.fetch_sub(1, std::memory_order_release);
@@ -1970,8 +2467,6 @@ void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<S
     if (_lastIntersectFp == fp && !_intersectionItems.empty()) {
         return;
     }
-    invalidateIntersect();
-    _lastIntersectFp = fp;
 
     // Everything past this point is pure computation over `activeSeg`,
     // `planes`, `patchIndex`, and a snapshot of the camera transform. We
@@ -1983,11 +2478,14 @@ void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<S
     if (_flattenedWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
         // A previous compute is still running. _intersectionsDirty will
         // stay true; _renderTimer will re-enter here once the worker
-        // finishes and resets the flag.
+        // finishes and resets the flag. Leave the existing items visible:
+        // clearing them here creates a blank overlay if the in-flight
+        // worker is invalidated by this newer camera state.
         _intersectionsDirty = true;
         _lastIntersectFp = {};
         return;
     }
+    _lastIntersectFp = fp;
 
     Rect3D allBounds{cv::Vec3f(0, 0, 0), cv::Vec3f(1, 1, 1)};
     if (_volume) {
@@ -2098,6 +2596,9 @@ void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<S
                     }
                     _flattenedWorkerBusy.store(false,
                                                std::memory_order_release);
+                    if (_intersectionsDirty && _renderTimer && !_renderTimer->isActive()) {
+                        _renderTimer->start();
+                    }
                 },
                 Qt::QueuedConnection);
             _backgroundWorkers.fetch_sub(1, std::memory_order_release);
@@ -2150,6 +2651,87 @@ void CAdaptiveVolumeViewer::setVolumeWindow(float low, float high)
     if (_volume) scheduleRender();
 }
 
+void CAdaptiveVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
+{
+    if (_overlayVolume == volume) {
+        return;
+    }
+
+    if (_overlayChunkCbId != 0 && _overlayVolume && _overlayVolume->tieredCache()) {
+        _overlayVolume->tieredCache()->removeChunkReadyListener(_overlayChunkCbId);
+        _overlayChunkCbId = 0;
+    }
+
+    _overlayVolume = std::move(volume);
+
+    if (_overlayVolume && _overlayVolume->numScales() >= 1) {
+        auto* cache = _overlayVolume->tieredCache();
+        QPointer<CAdaptiveVolumeViewer> guard(this);
+        std::weak_ptr<Volume> volumeWeak = _overlayVolume;
+        _overlayChunkCbId = cache->addChunkReadyListener(
+            [guard, volumeWeak](const vc::cache::ChunkKey&) {
+                QMetaObject::invokeMethod(qApp, [guard, volumeWeak]() {
+                    if (!guard) return;
+                    auto vol = volumeWeak.lock();
+                    if (!vol || guard->_overlayVolume != vol) return;
+                    guard->scheduleRender();
+                }, Qt::QueuedConnection);
+            });
+    }
+
+    scheduleRender();
+}
+
+void CAdaptiveVolumeViewer::setOverlayOpacity(float opacity)
+{
+    const float clamped = std::clamp(opacity, 0.0f, 1.0f);
+    if (std::abs(clamped - _overlayOpacity) < 1e-6f) {
+        return;
+    }
+    _overlayOpacity = clamped;
+    if (_overlayVolume) {
+        scheduleRender();
+    }
+}
+
+void CAdaptiveVolumeViewer::setOverlayColormap(const std::string& colormapId)
+{
+    if (_overlayColormapId == colormapId) {
+        return;
+    }
+    _overlayColormapId = colormapId;
+    if (_overlayVolume) {
+        scheduleRender();
+    }
+}
+
+void CAdaptiveVolumeViewer::setOverlayThreshold(float threshold)
+{
+    setOverlayWindow(std::max(threshold, 0.0f), _overlayWindowHigh);
+}
+
+void CAdaptiveVolumeViewer::setOverlayWindow(float low, float high)
+{
+    constexpr float kMaxOverlayValue = 255.0f;
+    const float clampedLow = std::clamp(low, 0.0f, kMaxOverlayValue);
+    float clampedHigh = std::clamp(high, 0.0f, kMaxOverlayValue);
+    if (clampedHigh <= clampedLow) {
+        clampedHigh = std::min(kMaxOverlayValue, clampedLow + 1.0f);
+    }
+
+    const bool unchanged = std::abs(clampedLow - _overlayWindowLow) < 1e-6f &&
+                           std::abs(clampedHigh - _overlayWindowHigh) < 1e-6f;
+    if (unchanged) {
+        return;
+    }
+
+    _overlayWindowLow = clampedLow;
+    _overlayWindowHigh = clampedHigh;
+    if (_overlayVolume) {
+        scheduleRender();
+    }
+}
+
 // ============================================================================
 // Overlay group management (for VolumeViewerBase)
 // ============================================================================
@@ -2159,6 +2741,9 @@ void CAdaptiveVolumeViewer::setOverlayGroup(const std::string& key,
 {
     clearOverlayGroup(key);
     _overlayGroups[key] = items;
+    if (_view && _view->viewport()) {
+        _view->viewport()->update();
+    }
 }
 
 void CAdaptiveVolumeViewer::clearOverlayGroup(const std::string& key)
@@ -2170,6 +2755,9 @@ void CAdaptiveVolumeViewer::clearOverlayGroup(const std::string& key)
         delete item;
     }
     _overlayGroups.erase(it);
+    if (_view && _view->viewport()) {
+        _view->viewport()->update();
+    }
 }
 
 void CAdaptiveVolumeViewer::clearAllOverlayGroups()

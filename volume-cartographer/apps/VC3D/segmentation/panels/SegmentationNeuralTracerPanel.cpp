@@ -590,7 +590,7 @@ void SegmentationNeuralTracerPanel::restoreSettings(QSettings& settings)
 
     _restoringSettings = true;
 
-    _neuralTracerEnabled = settings.value(QStringLiteral("neural_tracer_enabled"), false).toBool();
+    _neuralTracerEnabled = false;
     _neuralCheckpointPath = settings.value(QStringLiteral("neural_checkpoint_path"), QString()).toString();
     _neuralPythonPath = settings.value(QStringLiteral("neural_python_path"), QString()).toString();
     _neuralVolumeScale = settings.value(QStringLiteral("neural_volume_scale"), 0).toInt();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <QGraphicsView>
+#include <QPointF>
 
 class CVolumeViewerView : public QGraphicsView
 {
@@ -23,6 +24,13 @@ public:
     void setMiddleButtonPanEnabled(bool enabled) { _middleButtonPanEnabled = enabled; }
     bool middleButtonPanEnabled() const { return _middleButtonPanEnabled; }
     void setScrollPanDisabled(bool disabled) { _scrollPanDisabled = disabled; }
+    enum class TiltHandleMode {
+        Hidden,
+        Square,
+        SemiCircleX,
+        SemiCircleY,
+    };
+    void setTiltHandle(TiltHandleMode mode, QPointF tilt);
 
 signals:
     void sendResized();
@@ -31,18 +39,21 @@ signals:
     void sendVolumeClicked(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void sendPanRelease(Qt::MouseButton, Qt::KeyboardModifiers);
     void sendPanStart(Qt::MouseButton, Qt::KeyboardModifiers);
-    void sendCursorMove(QPointF);
     void sendMousePress(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void sendMouseDoubleClick(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void sendMouseMove(QPointF, Qt::MouseButtons, Qt::KeyboardModifiers);
     void sendMouseRelease(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void sendKeyPress(int key, Qt::KeyboardModifiers modifiers);
     void sendKeyRelease(int key, Qt::KeyboardModifiers modifiers);
+    void sendTiltHandleChanged(QPointF tilt);
+    void sendTiltHandleReset();
     
 protected:
     bool _regular_pan = false;
     QPoint _last_pan_position;
     bool _left_button_pressed = false;
+    bool _right_button_mouse_forwarded = false;
+    bool _tiltHandleDragging = false;
     /// Draw our scalebar on every repaint
     void drawForeground(QPainter* painter, const QRectF& sceneRect) override;
     /// Paint framebuffer directly, bypassing QGraphicsPixmapItem
@@ -56,6 +67,10 @@ private:
  private:
     /// Round “ideal” length to 1,2 or 5 × 10^n
     double chooseNiceLength(double nominal) const;
+    QRectF tiltHandleRect() const;
+    bool pointInTiltHandle(const QPointF& viewportPos) const;
+    QPointF tiltFromHandlePos(const QPointF& viewportPos) const;
+    void drawTiltHandle(QPainter* painter) const;
 
     // µm per scene-unit (pixel)
     double m_vx = 32.0, m_vy = 32.0;
@@ -73,4 +88,7 @@ private:
     mutable int _cachedVpW = 0;
     mutable int _cachedVpH = 0;
     mutable double _cachedVx = 0;
+
+    TiltHandleMode _tiltHandleMode = TiltHandleMode::Hidden;
+    QPointF _tiltHandleValue{0.0, 0.0};
 };

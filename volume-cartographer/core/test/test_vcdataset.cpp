@@ -8,6 +8,7 @@
 #include <filesystem>
 #include <fstream>
 #include <numeric>
+#include <stdexcept>
 #include <vector>
 
 #include "utils/Json.hpp"
@@ -122,6 +123,29 @@ TEST(VcDataset, CreateZarrDatasetWritesConfiguredFillValue)
     const auto zarray = readJson(tempDir.path() / "0" / ".zarray");
     ASSERT_TRUE(zarray.contains("fill_value"));
     EXPECT_EQ(zarray["fill_value"].get_int(), 128);
+}
+
+TEST(VcDataset, UncompressedDecompressRejectsShortInput)
+{
+    ScopedTempDir tempDir;
+    const std::vector<size_t> shape = {8, 8, 8};
+    const std::vector<size_t> chunks = {8, 8, 8};
+
+    auto ds = vc::createZarrDataset(
+        tempDir.path(), "0", shape, chunks, vc::VcDtype::uint8, "none");
+    ASSERT_TRUE(ds != nullptr);
+
+    vc::VcDataset reopened(tempDir.path() / "0");
+    std::vector<uint8_t> shortBytes(shape[0] * shape[1] * shape[2] / 2, 1);
+    std::vector<uint8_t> output(shape[0] * shape[1] * shape[2], 0);
+
+    bool threw = false;
+    try {
+        reopened.decompress(shortBytes, output.data(), output.size());
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    EXPECT_TRUE(threw);
 }
 
 TEST(VcDataset, WriteZarrRegionU8ByChunkPreservesSubregionAndFillPadding)

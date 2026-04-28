@@ -13,6 +13,7 @@
 #include <filesystem>
 #include <fstream>
 #include <set>
+#include <stdexcept>
 #include <thread>
 #include <utils/http_fetch.hpp>
 
@@ -374,6 +375,8 @@ BlockPipeline::BlockPipeline(
                 std::lock_guard lock(negativeMutex_);
                 negativeCache_.insert(key);
                 if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
+            } else if (isHttp && HttpSource::lastFetchHadTransientError()) {
+                throw std::runtime_error("transient HTTP chunk fetch failure");
             }
             return {};
         }
@@ -506,6 +509,8 @@ BlockPipeline::BlockPipeline(
                     bloomAdd(key);
                     std::lock_guard lock(negativeMutex_);
                     negativeCache_.insert(key);
+                } else if (isHttp && HttpSource::lastFetchHadTransientError()) {
+                    throw std::runtime_error("transient HTTP chunk fetch failure");
                 }
                 return {};
             }
@@ -674,6 +679,8 @@ BlockPipeline::BlockPipeline(
                         std::lock_guard lock(negativeMutex_);
                         negativeCache_.insert(key);
                         if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
+                    } else if (HttpSource::lastFetchHadTransientError()) {
+                        throw std::runtime_error("transient HTTP chunk fetch failure");
                     }
                     return {};
                 }
@@ -982,14 +989,25 @@ ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey) {
     out->elementSize = 1;
     out->bytes.assign(size_t(C) * C * C, 0);
     bool anyData = false;
+    bool sawTransientFetchFailure = false;
+    const bool isHttp = dynamic_cast<HttpSource*>(source_.get()) != nullptr;
 
     for (int siz = sz0; siz < sz1; ++siz)
     for (int siy = sy0; siy < sy1; ++siy)
     for (int six = sx0; six < sx1; ++six) {
         ChunkKey srcKey{canonKey.level, siz, siy, six};
         std::vector<uint8_t> compressed;
-        try { compressed = source_->fetch(srcKey); } catch (...) { continue; }
-        if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) continue;
+        try {
+            compressed = source_->fetch(srcKey);
+        } catch (...) {
+            if (isHttp) sawTransientFetchFailure = true;
+            continue;
+        }
+        if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) {
+            if (isHttp && HttpSource::lastFetchHadTransientError())
+                sawTransientFetchFailure = true;
+            continue;
+        }
         auto data = decompress_(compressed, srcKey);
         if (!data) continue;
         anyData = true;
@@ -1017,6 +1035,8 @@ ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey) {
         }
     }
 
+    if (sawTransientFetchFailure)
+        throw std::runtime_error("transient HTTP chunk fetch failure");
     if (!anyData) return nullptr;
     return out;
 }
@@ -1225,6 +1245,58 @@ size_t BlockPipeline::countAvailable(const std::vector<ChunkKey>& keys) const {
         if (blockCache_.contains(first) && blockCache_.contains(last)) n++;
     }
     return n;
+}
+
+std::vector<ChunkKey> BlockPipeline::chunksMissingFromCache(
+    const std::vector<ChunkKey>& keys) const
+{
+    std::vector<ChunkKey> missing;
+    if (!source_) return keys;
+
+    constexpr int kMaxL = 16;
+    std::array<int, kMaxL> bpcZ{}, bpcY{}, bpcX{};
+    std::array<bool, kMaxL> shapeCached{};
+
+    auto ensureShapeCached = [&](int level) {
+        if (level < 0 || level >= kMaxL || shapeCached[level]) return;
+        auto csk = chunkShape(level);
+        if (csk[0] > 0) {
+            bpcZ[level] = csk[0] / kBlockSize;
+            bpcY[level] = csk[1] / kBlockSize;
+            bpcX[level] = csk[2] / kBlockSize;
+        }
+        shapeCached[level] = true;
+    };
+
+    for (const auto& key : keys) {
+        if (isNegativeCached(key) || isEmptyChunk(key)) continue;
+
+        bool resident = false;
+        if (key.level >= 0 && key.level < kMaxL) {
+            ensureShapeCached(key.level);
+            const int z = bpcZ[key.level], y = bpcY[key.level], x = bpcX[key.level];
+            if (z > 0 && y > 0 && x > 0) {
+                const BlockKey first{key.level, key.iz * z, key.iy * y, key.ix * x};
+                const BlockKey last{key.level, key.iz * z + z - 1,
+                                               key.iy * y + y - 1,
+                                               key.ix * x + x - 1};
+                resident = blockCache_.contains(first) && blockCache_.contains(last);
+            }
+        }
+        if (resident) continue;
+
+        auto* dz = (key.level >= 0 && key.level < int(diskLevels_.size()))
+            ? diskLevels_[key.level].get()
+            : nullptr;
+        const bool diskPresent = dz
+            && dz->is_sharded()
+            && dz->inner_chunk_exists(chunkIndices(key));
+        if (diskPresent) continue;
+
+        missing.push_back(key);
+    }
+
+    return missing;
 }
 
 BlockPipeline::ChunkReadyCallbackId

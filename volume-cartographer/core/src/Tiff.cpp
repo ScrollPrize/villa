@@ -109,13 +109,33 @@ void writeTiff(const std::filesystem::path& outPath, const cv::Mat& img, int cvT
     if (compression == COMPRESSION_LZW || compression == COMPRESSION_DEFLATE ||
         compression == COMPRESSION_ADOBE_DEFLATE)
         TIFFSetField(tf, TIFFTAG_PREDICTOR,   PREDICTOR_HORIZONTAL);
-    TIFFSetField(tf, TIFFTAG_TILEWIDTH,       tileW);
-    TIFFSetField(tf, TIFFTAG_TILELENGTH,      tileH);
     if (dpi > 0.f) {
         TIFFSetField(tf, TIFFTAG_RESOLUTIONUNIT, RESUNIT_INCH);
         TIFFSetField(tf, TIFFTAG_XRESOLUTION, dpi);
         TIFFSetField(tf, TIFFTAG_YRESOLUTION, dpi);
     }
+
+    if (tileW == 0 || tileH == 0) {
+        TIFFSetField(tf, TIFFTAG_ROWSPERSTRIP, H);
+        for (uint32_t y = 0; y < H; ++y) {
+            const uint8_t* row = outImg.ptr<uint8_t>(static_cast<int>(y));
+            if (TIFFWriteScanline(tf, const_cast<uint8_t*>(row), y, 0) < 0) {
+                TIFFClose(tf);
+                throw std::runtime_error("TIFFWriteScanline failed at row " +
+                                        std::to_string(y) + " in " + outPath.string());
+            }
+        }
+
+        if (!TIFFWriteDirectory(tf)) {
+            TIFFClose(tf);
+            throw std::runtime_error("TIFFWriteDirectory failed for " + outPath.string());
+        }
+        TIFFClose(tf);
+        return;
+    }
+
+    TIFFSetField(tf, TIFFTAG_TILEWIDTH,       tileW);
+    TIFFSetField(tf, TIFFTAG_TILELENGTH,      tileH);
 
     const size_t tileBytes = static_cast<size_t>(tileW) * tileH * params.elemSize;
     std::vector<uint8_t> tileBuf(tileBytes);

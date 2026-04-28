@@ -102,6 +102,11 @@ public:
     bool setPreviewPoints(const cv::Mat_<cv::Vec3f>& points,
                           bool markAsPendingEdit,
                           std::optional<cv::Rect>* outDiffBounds = nullptr);
+    bool setPreviewPointsOnly(const cv::Mat_<cv::Vec3f>& points,
+                              const std::vector<GridKey>& editedVertices,
+                              bool markAsPendingEdit,
+                              std::optional<cv::Rect>* outDiffBounds = nullptr);
+    bool restorePreviewSnapshot(const cv::Mat_<cv::Vec3f>& points);
 
     void resetPreview();
     void applyPreview();
@@ -110,7 +115,8 @@ public:
     std::optional<std::pair<int, int>> worldToGridIndex(const cv::Vec3f& worldPos,
                                                         float* outDistance = nullptr,
                                                         GridSearchResolution detail =
-                                                            GridSearchResolution::High) const;
+                                                            GridSearchResolution::High,
+                                                        bool warnOnFailure = true) const;
     std::optional<cv::Vec3f> vertexWorldPosition(int row, int col) const;
 
     bool beginActiveDrag(const std::pair<int, int>& gridIndex);

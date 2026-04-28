@@ -35,11 +35,14 @@ public:
     void setEnabled(bool enabled, QCheckBox* overlayCheckbox = nullptr, QSpinBox* overlayOpacitySpin = nullptr);
 
     void resetRotations();
+    void resetTilt();
 
     // Mouse event handlers for rotation dragging
     void onMousePress(CTiledVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
     void onMouseMove(CTiledVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers);
     void onMouseRelease(CTiledVolumeViewer* viewer, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+    void onTiltHandleChanged(CTiledVolumeViewer* viewer, QPointF tilt);
+    void onTiltHandleReset();
 
     // Apply slice plane orientations based on current state
     void applyOrientation(Surface* sourceOverride = nullptr);
@@ -65,6 +68,9 @@ private:
     bool _enabled{false};
     float _segXZRotationDeg{0.0f};
     float _segYZRotationDeg{0.0f};
+    QPointF _xyTilt{0.0, 0.0};
+    double _segXZTilt{0.0};
+    double _segYZTilt{0.0};
 
     struct DragState {
         bool active = false;
@@ -77,4 +83,5 @@ private:
     bool _orientationDirty{false};
 
     void processOrientationUpdate();
+    void updateTiltHandles();
 };

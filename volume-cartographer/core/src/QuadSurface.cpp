@@ -2,6 +2,7 @@
 
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/LoadJson.hpp"
+#include "vc/core/util/Logging.hpp"
 #include "vc/core/util/PointIndex.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
@@ -374,8 +375,10 @@ void QuadSurface::ensureLoaded()
         return;
     }
 
-    std::fprintf(stderr, "[SURF] load %s (from %s)\n",
-                 id.c_str(), path.string().c_str());
+    if (DebugLoggingEnabled()) {
+        std::fprintf(stderr, "[SURF] load %s (from %s)\n",
+                     id.c_str(), path.string().c_str());
+    }
     auto loaded = load_quad_from_tifxyz(path.string());
     if (!loaded) {
         throw std::runtime_error("Failed to load surface from: " + path.string());
@@ -593,11 +596,13 @@ bool QuadSurface::trimToValidBbox()
     _validMaskCache = cv::Mat_<uint8_t>();
     _validMaskAllValid = false;
     _normalCache = cv::Mat_<cv::Vec3f>();
-    std::fprintf(stderr,
-        "[SURF] trim %s %dx%d -> %dx%d  saved %zu MB (%.1f%%)\n",
-        id.c_str(), cols, rows, bbW, bbH,
-        (origBytes - trimBytes) / (1024 * 1024),
-        pctSaved * 100.0);
+    if (DebugLoggingEnabled()) {
+        std::fprintf(stderr,
+            "[SURF] trim %s %dx%d -> %dx%d  saved %zu MB (%.1f%%)\n",
+            id.c_str(), cols, rows, bbW, bbH,
+            (origBytes - trimBytes) / (1024 * 1024),
+            pctSaved * 100.0);
+    }
     return true;
 }
 
@@ -617,7 +622,9 @@ void QuadSurface::unloadPoints()
     _validMaskAllValid = false;
     _normalCache = cv::Mat_<cv::Vec3f>();
     _needsLoad = true;
-    std::fprintf(stderr, "[SURF] unload %s (%zu MB freed)\n", id.c_str(), mb);
+    if (DebugLoggingEnabled()) {
+        std::fprintf(stderr, "[SURF] unload %s (%zu MB freed)\n", id.c_str(), mb);
+    }
 }
 
 void QuadSurface::unloadCaches()
@@ -1090,46 +1097,13 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
 
     // Try accelerated search using spatial indices
     if (surfaceIndex && !surfaceIndex->empty()) {
-        // Use R-tree to find candidate triangles near target
-        const float searchRadius = std::max(th * 4.0f, 100.0f);
-        Rect3D bounds;
-        bounds.low = tgt - cv::Vec3f(searchRadius, searchRadius, searchRadius);
-        bounds.high = tgt + cv::Vec3f(searchRadius, searchRadius, searchRadius);
-
-        std::vector<std::pair<int, int>> candidateCells;
-        surfaceIndex->forEachTriangle(bounds, SurfacePatchIndex::SurfacePtr{nullptr}, [&](const SurfacePatchIndex::TriangleCandidate& tri) {
-            // Filter to only triangles from this surface
-            if (tri.surface.get() == this) {
-                candidateCells.emplace_back(tri.j, tri.i);
-            }
-        });
-
-        // Search from each candidate cell
-        for (const auto& [row, col] : candidateCells) {
-            if (col < 1 || col >= _points->cols - 1 || row < 1 || row >= _points->rows - 1) {
-                continue;
-            }
-            if ((*_points)(row, col)[0] == -1) {
-                continue;
-            }
-
-            loc = {static_cast<float>(col), static_cast<float>(row)};
-            dist = search_min_loc(*_points, loc, _out, tgt, step_small, _scale[0]*0.1);
-
-            if (dist < th && dist >= 0) {
-                ptr = cv::Vec3f(loc[0], loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
-                return dist;
-            } else if (dist >= 0 && dist < min_dist) {
-                min_loc = loc;
-                min_dist = dist;
-            }
+        SurfacePatchIndex::SurfacePtr targetSurface(this, [](QuadSurface*) {});
+        if (auto hit = surfaceIndex->locate(tgt, th, targetSurface)) {
+            ptr = hit->ptr;
+            return hit->distance;
         }
 
-        // If we found something decent with R-tree, return it
-        if (min_dist < th * 2.0f) {
-            ptr = cv::Vec3f(min_loc[0], min_loc[1], 0) - cv::Vec3f(_center[0]*_scale[0], _center[1]*_scale[1], 0);
-            return min_dist;
-        }
+        return std::nextafter(th, std::numeric_limits<float>::infinity());
     }
 
     // Try point index for a better starting hint
@@ -1260,25 +1234,25 @@ void QuadSurface::writeDataToDirectory(const std::filesystem::path& dir, const s
     std::vector<cv::Mat> xyz;
     cv::split((*_points), xyz);
 
-    // Write x/y/z as 32-bit float tiled TIFF with LZW
-    writeTiff(dir / "x.tif", xyz[0], -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
-    writeTiff(dir / "y.tif", xyz[1], -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
-    writeTiff(dir / "z.tif", xyz[2], -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
+    // QuadSurface tifxyz files are written as untiled, uncompressed TIFFs.
+    writeTiff(dir / "x.tif", xyz[0], -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi_);
+    writeTiff(dir / "y.tif", xyz[1], -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi_);
+    writeTiff(dir / "z.tif", xyz[2], -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi_);
 
     // OpenCV compression params for fallback
-    std::vector<int> compression_params = { cv::IMWRITE_TIFF_COMPRESSION, 5 };
+    std::vector<int> compression_params = { cv::IMWRITE_TIFF_COMPRESSION, COMPRESSION_NONE };
 
     // Save additional channels
     for (auto const& [name, mat] : _channels) {
         if (!mat.empty() && (skipChannel.empty() || name != skipChannel)) {
             bool wrote = false;
 
-            // Try tiled TIFF for single-channel ancillary data (8U/16U/32F)
+            // Try untiled, uncompressed TIFF for single-channel ancillary data (8U/16U/32F)
             if (mat.channels() == 1 &&
                 (mat.type() == CV_8UC1 || mat.type() == CV_16UC1 || mat.type() == CV_32FC1))
             {
                 try {
-                    writeTiff(dir / (name + ".tif"), mat, -1, 1024, 1024, -1.0f, COMPRESSION_LZW, dpi_);
+                    writeTiff(dir / (name + ".tif"), mat, -1, 0, 0, -1.0f, COMPRESSION_NONE, dpi_);
                     wrote = true;
                 } catch (...) {
                     wrote = false; // Fall back to OpenCV
