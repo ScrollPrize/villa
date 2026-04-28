@@ -7,9 +7,11 @@
 #include <QImage>
 #include <QTransform>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <memory>
 #include <map>
 #include <set>
@@ -128,12 +130,12 @@ public:
     void setNormalArrowLengthScale(float scale) { _normalArrowLengthScale = scale; emit overlaysUpdated(); }
     void setNormalMaxArrows(int maxArrows) { _normalMaxArrows = maxArrows; emit overlaysUpdated(); }
 
-    // --- Overlay volume stubs ---
-    void setOverlayVolume(std::shared_ptr<Volume>) {}
-    void setOverlayOpacity(float) {}
-    void setOverlayColormap(const std::string&) {}
-    void setOverlayThreshold(float) {}
-    void setOverlayWindow(float, float) {}
+    // --- Overlay volume ---
+    void setOverlayVolume(std::shared_ptr<Volume> volume);
+    void setOverlayOpacity(float opacity);
+    void setOverlayColormap(const std::string& colormapId);
+    void setOverlayThreshold(float threshold);
+    void setOverlayWindow(float low, float high);
 
     // --- Segmentation stubs ---
     void setSegmentationEditActive(bool) {}
@@ -175,16 +177,26 @@ public:
     }
     void setSurfacePatchSamplingStride(int s) { _surfacePatchSamplingStride = s; }
 
-    // --- Surface overlay stubs ---
-    bool surfaceOverlayEnabled() const override { return false; }
-    const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override {
-        static std::map<std::string, cv::Vec3b> empty;
-        return empty;
+    // --- Surface overlays ---
+    bool surfaceOverlayEnabled() const override { return _surfaceOverlayEnabled; }
+    const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override { return _surfaceOverlays; }
+    float surfaceOverlapThreshold() const override { return _surfaceOverlapThreshold; }
+    void setSurfaceOverlayEnabled(bool enabled) {
+        if (_surfaceOverlayEnabled == enabled) return;
+        _surfaceOverlayEnabled = enabled;
+        emit overlaysUpdated();
     }
-    float surfaceOverlapThreshold() const override { return 5.0f; }
-    void setSurfaceOverlayEnabled(bool) {}
-    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>&) {}
-    void setSurfaceOverlapThreshold(float) {}
+    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) {
+        if (_surfaceOverlays == overlays) return;
+        _surfaceOverlays = overlays;
+        if (_surfaceOverlayEnabled) emit overlaysUpdated();
+    }
+    void setSurfaceOverlapThreshold(float threshold) {
+        const float clamped = std::max(0.0f, threshold);
+        if (std::abs(_surfaceOverlapThreshold - clamped) < 1e-6f) return;
+        _surfaceOverlapThreshold = clamped;
+        if (_surfaceOverlayEnabled) emit overlaysUpdated();
+    }
 
     // --- Coordinate transforms ---
     QPointF volumeToScene(const cv::Vec3f& vol_point) override;
@@ -302,6 +314,11 @@ private:
         // duration of the render.
         std::shared_ptr<Surface> surf;
         std::shared_ptr<Volume> volume;
+        std::shared_ptr<Volume> overlayVolume;
+        float overlayOpacity = 0.0f;
+        std::string overlayColormapId;
+        float overlayWindowLow = 0.0f;
+        float overlayWindowHigh = 255.0f;
     };
     void renderIntoFramebuffer(QImage& fb, const RenderContext& ctx);
     Q_INVOKABLE void finishRenderOnMainThread();
@@ -360,6 +377,7 @@ private:
     // thread only, so no paint/swap race) to commit the new frame.
     QImage _framebuffer;
     QImage _framebufferWork;
+    QImage _overlayFramebuffer;
     // Serialises render dispatch. Only one worker runs at a time; if
     // submitRender fires while busy, the next render is queued via
     // _renderPendingAfterWorker so we don't lose a frame's worth of
@@ -386,6 +404,14 @@ private:
     float _windowLow = 0.0f;
     float _windowHigh = 255.0f;
     std::string _baseColormapId;
+    std::shared_ptr<Volume> _overlayVolume;
+    float _overlayOpacity{0.5f};
+    std::string _overlayColormapId;
+    float _overlayWindowLow{0.0f};
+    float _overlayWindowHigh{255.0f};
+    bool _surfaceOverlayEnabled{false};
+    std::map<std::string, cv::Vec3b> _surfaceOverlays;
+    float _surfaceOverlapThreshold{5.0f};
     // Flattened-view z-scroll translation direction (unit vector in world
     // space). Captured at each shift+scroll from the surface normal under
     // the view center so the translation is rigid — plain zoom never
@@ -565,6 +591,7 @@ private:
 
     // --- Chunk-ready listener ---
     vc::cache::BlockPipeline::ChunkReadyCallbackId _chunkCbId = 0;
+    vc::cache::BlockPipeline::ChunkReadyCallbackId _overlayChunkCbId = 0;
     bool _hadValidDataBounds = false;
     bool _dirtyWhileMinimized = false;
 
