@@ -29,6 +29,7 @@
 #include <QMdiSubWindow>
 #include <QApplication>
 #include <QGuiApplication>
+#include <QWindow>
 #include <QScreen>
 #include <QStyleHints>
 #include <QDesktopServices>
@@ -1155,6 +1156,32 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     ensureDockWidgetFeatures(_point_collection_widget);
     connect(_point_collection_widget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
     connect(_point_collection_widget, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
+
+    // Wayland workaround: dock drags trigger grabMouse() which fails,
+    // leaving Qt's internal state stuck so all mouse events stop.
+    // Synthesize a mouse release to clear the stuck button state.
+    if (QGuiApplication::platformName() == QLatin1String("wayland")) {
+        auto fixGrab = [this](){
+            // Defer to after Qt finishes its internal dock drag processing.
+            QTimer::singleShot(100, this, [](){
+                if (auto* g = QWidget::mouseGrabber())
+                    g->releaseMouse();
+                for (auto* w : QGuiApplication::topLevelWindows())
+                    w->setMouseGrabEnabled(false);
+            });
+        };
+        for (QDockWidget* dock : { ui.dockWidgetSegmentation,
+                                   _lasagnaDock,
+                                   ui.dockWidgetDistanceTransform,
+                                   ui.dockWidgetDrawing,
+                                   ui.dockWidgetVolumes,
+                                   ui.dockWidgetViewerControls,
+                                   static_cast<QDockWidget*>(_point_collection_widget) }) {
+            if (!dock) continue;
+            connect(dock, &QDockWidget::topLevelChanged, this, fixGrab);
+            connect(dock, &QDockWidget::dockLocationChanged, this, fixGrab);
+        }
+    }
 
     const QSize minWindowSize(960, 640);
     setMinimumSize(minWindowSize);
