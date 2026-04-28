@@ -397,7 +397,16 @@ private:
     mutable std::mutex negativeMutex_;
     std::unordered_set<ChunkKey, ChunkKeyHash> negativeCache_;
 
-    enum class FetchVerdict { HasData, EmptyConfirmed, Transient };
+    // Four explicit verdicts. Only `DefinitivelyAbsent` ever causes
+    // negative caching — and that requires real verification: HTTP 404 (or
+    // sharded shard-index missing/zero sentinel from a successfully-
+    // fetched index) AND a session-wide proof that auth was good. Anything
+    // else either has data or is uncertain and must be retried.
+    enum class FetchVerdict {
+        HasData,
+        DefinitivelyAbsent,
+        RetryLater,
+    };
     static FetchVerdict classifyFetch(const std::vector<uint8_t>& bytes,
                                        bool fetchThrew,
                                        bool sourceConfirmsAbsent,
