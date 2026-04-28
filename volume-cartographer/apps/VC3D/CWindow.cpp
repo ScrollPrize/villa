@@ -3603,10 +3603,8 @@ void CWindow::CreateWidgets(void)
             _fiberController.get(), &FiberAnnotationController::onStepChanged);
     connect(_fiberController.get(), &FiberAnnotationController::crosshairModeChanged,
             this, &CWindow::onFiberCrosshairModeChanged);
-    connect(_fiberController.get(), &FiberAnnotationController::requestAnnotationViewer,
-            this, &CWindow::onFiberAnnotationViewerRequested);
-    connect(_fiberController.get(), &FiberAnnotationController::requestReferenceViewer,
-            this, &CWindow::onFiberReferenceViewerRequested);
+    connect(_fiberController.get(), &FiberAnnotationController::requestFiberViewers,
+            this, &CWindow::onFiberViewersRequested);
     connect(_fiberController.get(), &FiberAnnotationController::annotationFinished,
             this, &CWindow::onFiberAnnotationFinished);
 
@@ -6635,60 +6633,61 @@ void CWindow::onFiberCrosshairModeChanged(bool active)
     });
 }
 
-void CWindow::onFiberAnnotationViewerRequested(const std::string& surfaceName, const QString& title)
+void CWindow::onFiberViewersRequested()
 {
-    auto* viewer = newConnectedViewer(surfaceName, title, mdiArea);
-    if (viewer && _fiberController) {
-        _fiberController->setAnnotationViewer(viewer);
-        connect(viewer, &CTiledVolumeViewer::sendVolumeClicked,
-                _fiberController.get(), &FiberAnnotationController::onAnnotationViewerClicked);
+    if (!_fiberController) return;
 
-        // Isolate fiber viewer from segmentation module and global focus POI
+    constexpr int N = FiberAnnotationController::kNumViews;
+
+    // U-layout grid positions: down left column, across bottom, up right column
+    //   index:  0(ref)  5(annot)
+    //           1       4
+    //           2       3
+    struct GridPos { int row; int col; };
+    constexpr GridPos grid[N] = {{0,0}, {1,0}, {2,0}, {2,1}, {1,1}, {0,1}};
+
+    QMdiSubWindow* subWindows[N] = {};
+
+    for (int i = 0; i < N; ++i) {
+        QString title = (i == 0) ? tr("Fiber Ref") :
+                        (i == N-1) ? tr("Fiber Annotate") :
+                        tr("Fiber %1/%2").arg(i).arg(N-1);
+
+        auto* viewer = newConnectedViewer(
+            FiberAnnotationController::fiberSurfaceName(i), title, mdiArea);
+        if (!viewer) continue;
+
+        _fiberController->setFiberViewer(i, viewer);
+
+        // Isolate from segmentation module and global focus POI
         disconnect(_state, &CState::poiChanged, viewer, &CTiledVolumeViewer::onPOIChanged);
         if (_segmentationModule)
             disconnect(viewer, nullptr, _segmentationModule.get(), nullptr);
 
-        if (_state->currentVolume()) {
+        // Only the last view (annotation) handles clicks
+        if (i == N - 1) {
+            connect(viewer, &CTiledVolumeViewer::sendVolumeClicked,
+                    _fiberController.get(), &FiberAnnotationController::onAnnotationViewerClicked);
+        }
+
+        if (_state->currentVolume())
             viewer->OnVolumeChanged(_state->currentVolume());
-        }
 
-        auto* subWindow = qobject_cast<QMdiSubWindow*>(viewer->parentWidget());
-        if (subWindow) {
-            subWindow->show();
-
-            // Tile fiber annotation (right half) and reference (left half) side by side
-            auto* refViewer = _fiberController->referenceViewer();
-            if (refViewer) {
-                auto* refSub = qobject_cast<QMdiSubWindow*>(refViewer->parentWidget());
-                if (refSub) {
-                    QRect area = mdiArea->contentsRect();
-                    int halfW = area.width() / 2;
-                    refSub->setGeometry(area.x(), area.y(), halfW, area.height());
-                    subWindow->setGeometry(area.x() + halfW, area.y(), area.width() - halfW, area.height());
-                }
-            }
-        }
+        subWindows[i] = qobject_cast<QMdiSubWindow*>(viewer->parentWidget());
+        if (subWindows[i])
+            subWindows[i]->show();
     }
-}
 
-void CWindow::onFiberReferenceViewerRequested(const std::string& surfaceName, const QString& title)
-{
-    auto* viewer = newConnectedViewer(surfaceName, title, mdiArea);
-    if (viewer && _fiberController) {
-        _fiberController->setReferenceViewer(viewer);
+    // Layout: 2 columns × 3 rows U-grid
+    QRect area = mdiArea->contentsRect();
+    int colW = area.width() / 2;
+    int rowH = area.height() / 3;
 
-        // Isolate fiber viewer from segmentation module and global focus POI
-        disconnect(_state, &CState::poiChanged, viewer, &CTiledVolumeViewer::onPOIChanged);
-        if (_segmentationModule)
-            disconnect(viewer, nullptr, _segmentationModule.get(), nullptr);
-
-        if (_state->currentVolume()) {
-            viewer->OnVolumeChanged(_state->currentVolume());
-        }
-        auto* subWindow = qobject_cast<QMdiSubWindow*>(viewer->parentWidget());
-        if (subWindow) {
-            subWindow->show();
-        }
+    for (int i = 0; i < N; ++i) {
+        if (!subWindows[i]) continue;
+        int x = area.x() + grid[i].col * colW;
+        int y = area.y() + grid[i].row * rowH;
+        subWindows[i]->setGeometry(x, y, colW, rowH);
     }
 }
 

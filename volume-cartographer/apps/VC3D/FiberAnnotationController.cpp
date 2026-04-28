@@ -21,6 +21,22 @@ FiberAnnotationController::~FiberAnnotationController()
     closeAnnotationViewer();
 }
 
+std::string FiberAnnotationController::fiberSurfaceName(int index)
+{
+    return "fiber_slice_" + std::to_string(index);
+}
+
+void FiberAnnotationController::setFiberViewer(int index, CTiledVolumeViewer* viewer)
+{
+    if (index >= 0 && index < kNumViews)
+        _fiberViewers[index] = viewer;
+}
+
+CTiledVolumeViewer* FiberAnnotationController::fiberViewer(int index) const
+{
+    return (index >= 0 && index < kNumViews) ? _fiberViewers[index] : nullptr;
+}
+
 void FiberAnnotationController::beginNewFiber()
 {
     closeAnnotationViewer();
@@ -42,32 +58,24 @@ bool FiberAnnotationController::handleVolumeClick(const cv::Vec3f& vol_loc,
     if (button != Qt::LeftButton)
         return false;
 
-    // Create the fiber collection
     _fiberCollectionName = _collection->generateNewCollectionName("fiber");
     uint64_t colId = _collection->addCollection(_fiberCollectionName);
     _currentFiberId = colId;
 
-    // Set fiber tag
     _collection->setCollectionTag(colId, "fiber", "true");
 
-    // Set winding metadata: not absolute
     CollectionMetadata meta;
     meta.absolute_winding_number = false;
     _collection->setCollectionMetadata(colId, meta);
 
-    // Store initial normal and first point
     _initialNormal = normal;
     addFiberPoint(vol_loc);
 
-    // Transition to annotation state
     _state = State::Annotating;
     emit crosshairModeChanged(false);
 
-    // Open annotation viewer at predicted next position
     advanceToNextPrediction();
-    emit requestReferenceViewer(kFiberReferenceSurface, tr("Fiber Ref"));
-    emit requestAnnotationViewer(kFiberAnnotationSurface,
-                                 QString("Fiber: %1").arg(QString::fromStdString(_fiberCollectionName)));
+    emit requestFiberViewers();
 
     return true;
 }
@@ -109,12 +117,10 @@ void FiberAnnotationController::addFiberPoint(const cv::Vec3f& position)
 {
     ColPoint pt = _collection->addPoint(_fiberCollectionName, position);
 
-    // Set winding to 0
     ColPoint updated = pt;
     updated.winding_annotation = 0.0f;
     _collection->updatePoint(updated);
 
-    // Compute arrival direction
     FiberPoint fp;
     fp.position = position;
     if (!_recentPoints.empty()) {
@@ -126,7 +132,6 @@ void FiberAnnotationController::addFiberPoint(const cv::Vec3f& position)
     }
 
     _recentPoints.push_back(fp);
-    // Keep only last 3
     while (_recentPoints.size() > 3) {
         _recentPoints.erase(_recentPoints.begin());
     }
@@ -148,13 +153,14 @@ void FiberAnnotationController::advanceToNextPrediction()
         return predictFromThreeOrMore();
     }();
 
-    // 1. Get old annotation plane
-    auto oldPlane = std::dynamic_pointer_cast<PlaneSurface>(_cstate->surface(kFiberAnnotationSurface));
+    // Get old annotation plane (index 5) for basisY and normal
+    auto oldPlane = std::dynamic_pointer_cast<PlaneSurface>(
+        _cstate->surface(fiberSurfaceName(kNumViews - 1)));
     cv::Vec3f oldVy = oldPlane ? oldPlane->basisY() : cv::Vec3f(0, 1, 0);
+    cv::Vec3f oldNormal = oldPlane ? oldPlane->normal({}) : _initialNormal;
 
-    // Clamp normal rotation to 5°/voxel relative to previous slice normal
+    // Clamp normal rotation to 5°/voxel
     if (oldPlane) {
-        cv::Vec3f oldNormal = oldPlane->normal({});
         float cosA = std::clamp(oldNormal.dot(nextDir), -1.0f, 1.0f);
         float angle = std::acos(cosA);
         float maxAngle = static_cast<float>(_fiberStep) * 5.0f * static_cast<float>(M_PI / 180.0);
@@ -163,37 +169,48 @@ void FiberAnnotationController::advanceToNextPrediction()
             float axisLen = static_cast<float>(cv::norm(axis));
             if (axisLen > 1e-6f) {
                 axis /= axisLen;
-                // Rodrigues: rotate oldNormal towards nextDir by maxAngle
-                // axis ⊥ oldNormal so the (axis·v)(1-cos) term is zero
                 nextDir = oldNormal * std::cos(maxAngle)
                         + axis.cross(oldNormal) * std::sin(maxAngle);
             }
         }
-        // Recompute position along clamped direction so prediction doesn't wander
         nextPos = _recentPoints.back().position + nextDir * static_cast<float>(_fiberStep);
     }
 
-    // 2. Copy old annotation plane as reference (must be a separate object —
-    //    reusing the same pointer causes surfaceWillBeDeleted to nuke the
-    //    reference when the annotation surface is overwritten).
-    if (oldPlane) {
-        auto refPlane = std::make_shared<PlaneSurface>();
-        refPlane->setFromNormalAndUp(oldPlane->origin(), oldPlane->normal({}), oldPlane->basisY());
-        _cstate->setSurface(kFiberReferenceSurface, refPlane);
+    // Reference state (t=0): last clicked point, old plane orientation
+    cv::Vec3f refPos = _recentPoints.back().position;
+    cv::Vec3f refNormal = oldNormal;
+    cv::Vec3f refVy = oldVy;
+
+    // Annotation state (t=1): predicted position, new orientation
+    cv::Vec3f annotPos = nextPos;
+    cv::Vec3f annotNormal = nextDir;
+    // Compute annotation vy by projecting old vy onto new normal's plane
+    cv::Vec3f annotVy = oldVy - oldVy.dot(annotNormal) * annotNormal;
+    float annotVyLen = static_cast<float>(cv::norm(annotVy));
+    if (annotVyLen > 1e-6f) annotVy /= annotVyLen;
+    else annotVy = oldVy;
+
+    // Create 6 interpolated planes (t = i/5 for i=0..5)
+    for (int i = 0; i < kNumViews; ++i) {
+        float t = static_cast<float>(i) / static_cast<float>(kNumViews - 1);
+
+        cv::Vec3f pos = refPos * (1.0f - t) + annotPos * t;
+
+        cv::Vec3f n = refNormal * (1.0f - t) + annotNormal * t;
+        float nLen = static_cast<float>(cv::norm(n));
+        if (nLen > 1e-6f) n /= nLen;
+
+        cv::Vec3f up = refVy * (1.0f - t) + annotVy * t;
+        float upLen = static_cast<float>(cv::norm(up));
+        if (upLen > 1e-6f) up /= upLen;
+
+        auto plane = std::make_shared<PlaneSurface>();
+        plane->setFromNormalAndUp(pos, n, up);
+        _cstate->setSurface(fiberSurfaceName(i), plane);
+
+        if (_fiberViewers[i])
+            _fiberViewers[i]->centerOnVolumePoint(pos);
     }
-
-    // 3. Create new annotation plane with stable rotation.
-    //    Uses oldVy as up hint — setFromNormalAndUp computes the basis directly
-    //    (bypasses vxy_from_normal, no discontinuous sign flips).
-    auto newPlane = std::make_shared<PlaneSurface>();
-    newPlane->setFromNormalAndUp(nextPos, nextDir, oldVy);
-
-    // 6. Register and center viewers
-    _cstate->setSurface(kFiberAnnotationSurface, newPlane);
-    if (_annotationViewer)
-        _annotationViewer->centerOnVolumePoint(nextPos);
-    if (_referenceViewer && !_recentPoints.empty())
-        _referenceViewer->centerOnVolumePoint(_recentPoints.back().position);
 }
 
 std::pair<cv::Vec3f, cv::Vec3f> FiberAnnotationController::predictFromOnePoint() const
@@ -204,8 +221,7 @@ std::pair<cv::Vec3f, cv::Vec3f> FiberAnnotationController::predictFromOnePoint()
     if (len > 1e-6f) dir /= len;
     else dir = cv::Vec3f(0, 0, 1);
 
-    cv::Vec3f predicted = p0 + dir * static_cast<float>(_fiberStep);
-    return {predicted, dir};
+    return {p0 + dir * static_cast<float>(_fiberStep), dir};
 }
 
 std::pair<cv::Vec3f, cv::Vec3f> FiberAnnotationController::predictFromTwoPoints() const
@@ -216,8 +232,7 @@ std::pair<cv::Vec3f, cv::Vec3f> FiberAnnotationController::predictFromTwoPoints(
     float len = static_cast<float>(cv::norm(diff));
     cv::Vec3f dir = len > 1e-6f ? diff / len : cv::Vec3f(0, 0, 1);
 
-    cv::Vec3f predicted = p1 + dir * static_cast<float>(_fiberStep);
-    return {predicted, dir};
+    return {p1 + dir * static_cast<float>(_fiberStep), dir};
 }
 
 std::pair<cv::Vec3f, cv::Vec3f> FiberAnnotationController::predictFromThreeOrMore() const
@@ -227,14 +242,12 @@ std::pair<cv::Vec3f, cv::Vec3f> FiberAnnotationController::predictFromThreeOrMor
     const cv::Vec3f& p1 = _recentPoints[n - 2].position;
     const cv::Vec3f& p2 = _recentPoints[n - 1].position;
 
-    // Rotation-based extrapolation: mirror v1 through v2
     cv::Vec3f d1 = p1 - p0;
     cv::Vec3f d2 = p2 - p1;
     float len1 = static_cast<float>(cv::norm(d1));
     float len2 = static_cast<float>(cv::norm(d2));
 
     if (len1 < 1e-6f || len2 < 1e-6f) {
-        // Degenerate — fall back to linear
         cv::Vec3f dir = len2 > 1e-6f ? d2 / len2 : cv::Vec3f(0, 0, 1);
         return {p2 + dir * static_cast<float>(_fiberStep), dir};
     }
@@ -242,8 +255,6 @@ std::pair<cv::Vec3f, cv::Vec3f> FiberAnnotationController::predictFromThreeOrMor
     cv::Vec3f v1 = d1 / len1;
     cv::Vec3f v2 = d2 / len2;
 
-    // v3 = 2*(v1·v2)*v2 - v1: same angular change from v1→v2 applied past v2.
-    // Clamp: if v1·v2 < 0 (angle > 90°), fall back to linear to prevent reversal.
     float cosAngle = v1.dot(v2);
     cv::Vec3f v3;
     if (cosAngle < 0.0f) {
@@ -259,20 +270,14 @@ std::pair<cv::Vec3f, cv::Vec3f> FiberAnnotationController::predictFromThreeOrMor
 
 void FiberAnnotationController::closeAnnotationViewer()
 {
-    if (_annotationViewer) {
-        auto* subWindow = qobject_cast<QMdiSubWindow*>(_annotationViewer->parentWidget());
-        if (subWindow) {
-            subWindow->close();
+    for (int i = 0; i < kNumViews; ++i) {
+        if (_fiberViewers[i]) {
+            auto* subWindow = qobject_cast<QMdiSubWindow*>(_fiberViewers[i]->parentWidget());
+            if (subWindow) {
+                subWindow->close();
+            }
+            _fiberViewers[i] = nullptr;
         }
-        _annotationViewer = nullptr;
+        _cstate->setSurface(fiberSurfaceName(i), nullptr);
     }
-    if (_referenceViewer) {
-        auto* subWindow = qobject_cast<QMdiSubWindow*>(_referenceViewer->parentWidget());
-        if (subWindow) {
-            subWindow->close();
-        }
-        _referenceViewer = nullptr;
-    }
-    _cstate->setSurface(kFiberAnnotationSurface, nullptr);
-    _cstate->setSurface(kFiberReferenceSurface, nullptr);
 }

@@ -22,6 +22,8 @@ class FiberAnnotationController : public QObject
     Q_OBJECT
 
 public:
+    static constexpr int kNumViews = 6;
+
     enum class State {
         Idle,
         WaitingForFirstClick,
@@ -44,16 +46,16 @@ public:
     bool handleEscape();
 
     void setMdiArea(QMdiArea* mdiArea) { _mdiArea = mdiArea; }
-    void setAnnotationViewer(CTiledVolumeViewer* viewer) { _annotationViewer = viewer; }
-    void setReferenceViewer(CTiledVolumeViewer* viewer) { _referenceViewer = viewer; }
-    CTiledVolumeViewer* referenceViewer() const { return _referenceViewer; }
+    void setFiberViewer(int index, CTiledVolumeViewer* viewer);
+    CTiledVolumeViewer* fiberViewer(int index) const;
     int fiberStep() const { return _fiberStep; }
+
+    static std::string fiberSurfaceName(int index);
 
 signals:
     void crosshairModeChanged(bool active);
     void annotationFinished(uint64_t fiberId);
-    void requestAnnotationViewer(const std::string& surfaceName, const QString& title);
-    void requestReferenceViewer(const std::string& surfaceName, const QString& title);
+    void requestFiberViewers();
 
 public slots:
     void onAnnotationViewerClicked(cv::Vec3f vol_loc, cv::Vec3f normal,
@@ -78,8 +80,7 @@ private:
     CState* _cstate;
     VCCollection* _collection;
     QMdiArea* _mdiArea = nullptr;
-    CTiledVolumeViewer* _annotationViewer = nullptr;
-    CTiledVolumeViewer* _referenceViewer = nullptr;
+    CTiledVolumeViewer* _fiberViewers[kNumViews] = {};
 
     State _state = State::Idle;
     uint64_t _currentFiberId = 0;
@@ -88,7 +89,4 @@ private:
     int _fiberStep = 50;
 
     std::vector<FiberPoint> _recentPoints;
-
-    static constexpr const char* kFiberAnnotationSurface = "fiber_annotation_plane";
-    static constexpr const char* kFiberReferenceSurface = "fiber_reference_plane";
 };
