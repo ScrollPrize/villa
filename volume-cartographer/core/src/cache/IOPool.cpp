@@ -196,7 +196,6 @@ void IOPool::updateInteractive(const std::vector<ChunkKey>& keys, int targetLeve
                 shards_[sk] = ShardState::Queued;
             }
             front[sk.level].push_back(sk);
-            stateVersion_.fetch_add(1, std::memory_order_relaxed);
         }
 
         queueTotal_ = 0;

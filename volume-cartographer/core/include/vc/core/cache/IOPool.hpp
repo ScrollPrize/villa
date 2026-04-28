@@ -102,9 +102,10 @@ private:
     int idleCount_ = 0;
 
     // Monotonic state counter for callers that deduplicate submissions.
-    // Bumped whenever queued/in-flight/done state changes, including
-    // transient-failure erases. This lets an identical viewport request
-    // re-run triage after the pool made progress or dropped work.
+    // Bumped when workers make progress, inter-stage submits add work, or
+    // pending work is dropped. Viewport queue reprioritization intentionally
+    // does not bump it, so identical idle frames can keep deduplicating while
+    // workers drain the existing queue.
     std::atomic<uint64_t> stateVersion_{0};
 
     int numThreads_;

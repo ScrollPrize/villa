@@ -418,7 +418,7 @@ private:
     mutable std::mutex fetchInteractiveDedupMutex_;
     uint64_t lastFetchInteractiveHash_ = 0;
     uint64_t lastFetchInteractiveEviction_ = 0;
-    uint64_t lastFetchInteractiveIoVersion_ = 0;
+    std::array<uint64_t, 4> lastFetchInteractiveIoVersions_{};
     int lastFetchInteractiveTargetLevel_ = -1;
     bool haveLastFetchInteractive_ = false;
 

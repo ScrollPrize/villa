@@ -865,22 +865,23 @@ void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targ
         ChunkKeyHash kh;
         for (const auto& k : keys) h ^= kh(k);
         const uint64_t evictionNow = blockCache_.evictionVersion();
-        const uint64_t ioVersionNow =
-            downloaderPool_.stateVersion()
-            ^ (loaderPool_.stateVersion() << 1)
-            ^ (encodePool_.stateVersion() << 2)
-            ^ (decodePool_.stateVersion() << 3);
+        const std::array<uint64_t, 4> ioVersionsNow{
+            downloaderPool_.stateVersion(),
+            loaderPool_.stateVersion(),
+            encodePool_.stateVersion(),
+            decodePool_.stateVersion()
+        };
         std::lock_guard lk(fetchInteractiveDedupMutex_);
         if (haveLastFetchInteractive_
             && lastFetchInteractiveHash_ == h
             && lastFetchInteractiveEviction_ == evictionNow
-            && lastFetchInteractiveIoVersion_ == ioVersionNow
+            && lastFetchInteractiveIoVersions_ == ioVersionsNow
             && lastFetchInteractiveTargetLevel_ == targetLevel) {
             return;
         }
         lastFetchInteractiveHash_ = h;
         lastFetchInteractiveEviction_ = evictionNow;
-        lastFetchInteractiveIoVersion_ = ioVersionNow;
+        lastFetchInteractiveIoVersions_ = ioVersionsNow;
         lastFetchInteractiveTargetLevel_ = targetLevel;
         haveLastFetchInteractive_ = true;
     }
