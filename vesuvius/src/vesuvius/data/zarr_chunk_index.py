@@ -8,6 +8,13 @@ empty regions of a sparse input volume without ever reading the underlying data.
 
 Also provides a disk cache keyed by the array's `.zarray` ETag (S3) or mtime
 (local), so repeat runs pay no listing cost after the first.
+
+Cache lookup order (read): explicit override URL (env var
+``VESUVIUS_CHUNK_OCCUPANCY_URL``) → sidecar next to the input array →
+per-host local fallback. Cache save order (write): override URL if set,
+otherwise sidecar, otherwise local. The override URL is always accessed
+with the caller's default (authenticated) credentials — it is intended to
+live on a writable working prefix, even when the input array is anonymous.
 """
 
 from __future__ import annotations
@@ -28,8 +35,20 @@ from vesuvius.utils.k8s import get_tqdm_kwargs
 
 
 SIDECAR_NAME = ".chunk_occupancy.npz"
+ENV_OVERRIDE_URL = "VESUVIUS_CHUNK_OCCUPANCY_URL"
 
 _LIST_MAX_WORKERS = int(os.environ.get("VESUVIUS_CHUNK_INDEX_WORKERS", "32"))
+
+
+def _override_cache_url() -> Optional[str]:
+    url = os.environ.get(ENV_OVERRIDE_URL, "").strip()
+    return url or None
+
+
+def _url_to_fs(url: str, *, anon: bool = False):
+    """Resolve (fs, fs_path) for ``url``. Apply ``anon`` only to S3 URLs."""
+    storage_options = {"anon": True} if anon and url.startswith("s3://") else {}
+    return fsspec.core.url_to_fs(url, **storage_options)
 
 
 def _local_cache_dir() -> Path:
@@ -47,25 +66,32 @@ def _sidecar_url(array_url: str) -> str:
     return array_url.rstrip("/") + "/" + SIDECAR_NAME
 
 
-def _zarray_signature(array_url: str) -> Optional[str]:
+def _zarray_signature(array_url: str, *, anon: bool = False) -> Optional[str]:
     """Return a short stable signature for the array's .zarray (ETag on S3, mtime+size locally)."""
     zarray_url = array_url.rstrip("/") + "/.zarray"
     try:
-        if array_url.startswith("s3://"):
-            fs = fsspec.filesystem("s3", anon=False)
-            info = fs.info(zarray_url.replace("s3://", ""))
-            etag = info.get("ETag") or info.get("etag")
-            if etag:
-                return str(etag).strip('"')
-            return f"size={info.get('size')}"
-        else:
-            st = os.stat(zarray_url)
-            return f"{int(st.st_mtime_ns)}-{st.st_size}"
+        fs, fs_path = _url_to_fs(zarray_url, anon=anon)
+        info = fs.info(fs_path)
+        etag = info.get("ETag") or info.get("etag")
+        if etag:
+            return str(etag).strip('"')
+        mtime = info.get("mtime")
+        size = info.get("size")
+        if mtime is not None and size is not None:
+            # Local-style signature when ETag is unavailable.
+            try:
+                mtime_ns = int(mtime.timestamp() * 1_000_000_000) if hasattr(mtime, "timestamp") else int(mtime)
+            except Exception:
+                mtime_ns = 0
+            return f"{mtime_ns}-{size}"
+        if size is not None:
+            return f"size={size}"
+        return None
     except Exception:
         return None
 
 
-def _serialize_bitmap(bitmap: np.ndarray, sig: str) -> bytes:
+def serialize_bitmap(bitmap: np.ndarray, sig: str) -> bytes:
     """Encode the occupancy bitmap + signature into a single .npz byte blob."""
     import io
 
@@ -74,7 +100,7 @@ def _serialize_bitmap(bitmap: np.ndarray, sig: str) -> bytes:
     return buf.getvalue()
 
 
-def _deserialize_bitmap(blob: bytes, expected_sig: str, expected_grid: Tuple[int, ...]) -> Optional[np.ndarray]:
+def deserialize_bitmap(blob: bytes, expected_sig: str, expected_grid: Tuple[int, ...]) -> Optional[np.ndarray]:
     import io
 
     try:
@@ -91,36 +117,70 @@ def _deserialize_bitmap(blob: bytes, expected_sig: str, expected_grid: Tuple[int
     return bitmap.astype(bool, copy=False)
 
 
+# Backwards-compatible aliases for internal callers.
+_serialize_bitmap = serialize_bitmap
+_deserialize_bitmap = deserialize_bitmap
+
+
+def _read_cache_blob(url: str) -> Optional[bytes]:
+    """Read raw bytes from a cache URL, or None on miss. Never uses anon."""
+    try:
+        fs, fs_path = _url_to_fs(url)
+        if not fs.exists(fs_path):
+            return None
+        with fs.open(fs_path, "rb") as f:
+            return f.read()
+    except Exception as e:
+        warnings.warn(f"Failed to read chunk occupancy cache at {url}: {e}")
+        return None
+
+
+def _write_cache_blob(url: str, blob: bytes) -> bool:
+    """Write bytes to a cache URL. Returns True on success."""
+    try:
+        fs, fs_path = _url_to_fs(url)
+        parent = os.path.dirname(fs_path.rstrip("/"))
+        if parent:
+            try:
+                fs.makedirs(parent, exist_ok=True)
+            except TypeError:
+                try:
+                    fs.makedirs(parent)
+                except FileExistsError:
+                    pass
+        with fs.open(fs_path, "wb") as f:
+            f.write(blob)
+        return True
+    except Exception as e:
+        warnings.warn(f"Failed to write chunk occupancy cache at {url}: {e}")
+        return False
+
+
 def _load_cached(
     array_url: str, sig: str, expected_grid: Tuple[int, ...]
 ) -> Tuple[Optional[np.ndarray], Optional[str]]:
-    """Try sidecar next to the array first (shared across partitions), then local cache.
+    """Try override URL, then sidecar next to the array, then per-host local cache.
 
     Returns (bitmap, source) where `source` is one of:
-      - "sidecar:<url>"  sidecar file next to the zarr array
-      - "local:<path>"   per-host local fallback cache
-      - None             no cache hit (bitmap is also None)
+      - "override:<url>"  explicit ``VESUVIUS_CHUNK_OCCUPANCY_URL`` cache
+      - "sidecar:<url>"   sidecar file next to the zarr array
+      - "local:<path>"    per-host local fallback cache
+      - None              no cache hit (bitmap is also None)
     """
+    override = _override_cache_url()
+    if override:
+        blob = _read_cache_blob(override)
+        if blob is not None:
+            bitmap = _deserialize_bitmap(blob, sig, expected_grid)
+            if bitmap is not None:
+                return bitmap, f"override:{override}"
+
     sidecar = _sidecar_url(array_url)
-    try:
-        if array_url.startswith("s3://"):
-            fs = fsspec.filesystem("s3", anon=False)
-            key = sidecar.replace("s3://", "")
-            if fs.exists(key):
-                with fs.open(key, "rb") as f:
-                    blob = f.read()
-                bitmap = _deserialize_bitmap(blob, sig, expected_grid)
-                if bitmap is not None:
-                    return bitmap, f"sidecar:{sidecar}"
-        else:
-            if os.path.exists(sidecar):
-                with open(sidecar, "rb") as f:
-                    blob = f.read()
-                bitmap = _deserialize_bitmap(blob, sig, expected_grid)
-                if bitmap is not None:
-                    return bitmap, f"sidecar:{sidecar}"
-    except Exception as e:
-        warnings.warn(f"Failed to load sidecar chunk occupancy from {sidecar}: {e}")
+    blob = _read_cache_blob(sidecar)
+    if blob is not None:
+        bitmap = _deserialize_bitmap(blob, sig, expected_grid)
+        if bitmap is not None:
+            return bitmap, f"sidecar:{sidecar}"
 
     local = _local_cache_path(array_url)
     if local.exists():
@@ -136,24 +196,28 @@ def _load_cached(
 
 
 def _save_cached(array_url: str, sig: str, bitmap: np.ndarray) -> None:
-    """Write sidecar next to the array (so all partitions share it); on failure, fall back to local cache."""
+    """Write override URL first, then sidecar, then per-host local fallback."""
     blob = _serialize_bitmap(bitmap, sig)
+
+    override = _override_cache_url()
+    if override:
+        if _write_cache_blob(override, blob):
+            print(f"  Chunk occupancy cache SAVED to override: {override}")
+            return
+
     sidecar = _sidecar_url(array_url)
     try:
+        fs, fs_path = _url_to_fs(sidecar)
         if array_url.startswith("s3://"):
-            fs = fsspec.filesystem("s3", anon=False)
-            key = sidecar.replace("s3://", "")
-            with fs.open(key, "wb") as f:
+            with fs.open(fs_path, "wb") as f:
                 f.write(blob)
-            print(f"  Chunk occupancy cache SAVED to sidecar: {sidecar}")
-            return
         else:
-            tmp = sidecar + ".tmp"
+            tmp = fs_path + ".tmp"
             with open(tmp, "wb") as f:
                 f.write(blob)
-            os.replace(tmp, sidecar)
-            print(f"  Chunk occupancy cache SAVED to sidecar: {sidecar}")
-            return
+            os.replace(tmp, fs_path)
+        print(f"  Chunk occupancy cache SAVED to sidecar: {sidecar}")
+        return
     except Exception as e:
         warnings.warn(
             f"Could not write chunk occupancy sidecar to {sidecar}: {e}. "
@@ -171,7 +235,7 @@ def _save_cached(array_url: str, sig: str, bitmap: np.ndarray) -> None:
         warnings.warn(f"Failed to save local chunk occupancy cache to {local}: {e}")
 
 
-def _read_zarray(array_url: str) -> Optional[dict]:
+def _read_zarray(array_url: str, *, anon: bool = False) -> Optional[dict]:
     """Fetch and parse `.zarray` for the given array URL.
 
     Returns the parsed JSON dict, or None on any failure (caller falls back
@@ -179,25 +243,21 @@ def _read_zarray(array_url: str) -> Optional[dict]:
     """
     zarray_url = array_url.rstrip("/") + "/.zarray"
     try:
-        if array_url.startswith("s3://"):
-            fs = fsspec.filesystem("s3", anon=False)
-            with fs.open(zarray_url.replace("s3://", ""), "rb") as f:
-                return json.loads(f.read())
-        else:
-            with open(zarray_url, "rb") as f:
-                return json.loads(f.read())
+        fs, fs_path = _url_to_fs(zarray_url, anon=anon)
+        with fs.open(fs_path, "rb") as f:
+            return json.loads(f.read())
     except Exception as e:
         warnings.warn(f"Failed to read {zarray_url}: {e}")
         return None
 
 
-def _list_chunks_s3(array_url: str, sub_prefix: str) -> List[str]:
+def _list_chunks_s3(array_url: str, sub_prefix: str, *, anon: bool = False) -> List[str]:
     """List chunk keys under an S3 zarr v2 array at `sub_prefix`.
 
     Returns keys relative to the array prefix (e.g. `"0/12/3/7"` for a
     `/`-separated 4D array, or `"0.12.3.7"` for a `.`-separated one).
     """
-    fs = fsspec.filesystem("s3", anon=False)
+    fs = fsspec.filesystem("s3", anon=anon)
     bucket_and_prefix = array_url.replace("s3://", "").rstrip("/")
     bucket, _, prefix = bucket_and_prefix.partition("/")
     if prefix and not prefix.endswith("/"):
@@ -273,6 +333,7 @@ def build_chunk_occupancy(
     *,
     verbose: bool = False,
     use_cache: bool = True,
+    anon: bool = False,
 ) -> Optional[np.ndarray]:
     """
     Build a boolean bitmap over the spatial chunk grid of a zarr v2 array.
@@ -284,6 +345,9 @@ def build_chunk_occupancy(
         shape:  Per-axis array shape.
         verbose: Log progress/counts.
         use_cache: Honour (and populate) the on-disk cache.
+        anon: Use unsigned S3 requests when reading the input array. The
+            override cache URL (``VESUVIUS_CHUNK_OCCUPANCY_URL``) is always
+            accessed with default credentials and never inherits this flag.
 
     Returns:
         A boolean numpy array over the *spatial* chunk grid (leading channel
@@ -312,7 +376,7 @@ def build_chunk_occupancy(
         warnings.warn(f"Degenerate chunk grid for {array_url}: {grid_dims}")
         return None
 
-    sig = _zarray_signature(array_url) if use_cache else None
+    sig = _zarray_signature(array_url, anon=anon) if use_cache else None
     if sig is not None:
         cached, source = _load_cached(array_url, sig, grid_dims)
         if cached is not None:
@@ -322,6 +386,11 @@ def build_chunk_occupancy(
                 f"  Chunk occupancy cache HIT ({source}): "
                 f"{occ}/{total} ({100.0 * occ / total:.1f}%) chunks occupied for {array_url}"
             )
+            override = _override_cache_url()
+            if override and source and not source.startswith("override:"):
+                # A workflow override is an explicit shared cache location for
+                # downstream workers. Materialize sidecar/local hits there too.
+                _save_cached(array_url, sig, cached)
             return cached
         print(f"  Chunk occupancy cache MISS for {array_url} (will build and cache)")
     elif use_cache:
@@ -332,7 +401,7 @@ def build_chunk_occupancy(
     else:
         print(f"  Chunk occupancy cache disabled for {array_url}")
 
-    zarray = _read_zarray(array_url)
+    zarray = _read_zarray(array_url, anon=anon)
     if zarray is None:
         return None
     sep = zarray.get("dimension_separator", ".")
@@ -391,7 +460,7 @@ def build_chunk_occupancy(
     try:
         if array_url.startswith("s3://"):
             with ThreadPoolExecutor(max_workers=min(_LIST_MAX_WORKERS, max(1, len(sub_prefixes)))) as ex:
-                futures = [ex.submit(_list_chunks_s3, array_url, sp) for sp in sub_prefixes]
+                futures = [ex.submit(_list_chunks_s3, array_url, sp, anon=anon) for sp in sub_prefixes]
                 for fut in as_completed(futures):
                     _consume(fut.result())
                     pbar.update(1)

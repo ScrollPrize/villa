@@ -43,6 +43,7 @@ class VCDataset(Dataset):
             # return_as_tensor: bool = True, # Forcing True below
             domain: Optional[str] = None,
             skip_empty_patches: bool = True,  # Whether to skip empty (homogeneous) patches
+            anon: bool = False,  # Use anonymous (unsigned) requests for S3 input paths
             ):
         """
         Dataset for nnUNet inference using the Volume class for data access and preprocessing.
@@ -73,6 +74,7 @@ class VCDataset(Dataset):
             return_as_type: Target NumPy dtype string for Volume output *before* tensor conversion
                              (e.g., 'np.float16', 'np.float32'). Default is 'np.float32'.
             domain: Data source domain for Volume ('dl.ash2txt', 'local'). Auto-detected if None.
+            anon: Use anonymous requests for input S3 reads.
         """
         self.input_path = input_path
         self.input_format = input_format # Keep for informational purposes
@@ -84,6 +86,7 @@ class VCDataset(Dataset):
         self.mode = mode
         self.return_as_tensor = True # Dataset __getitem__ always returns tensors
         self.skip_empty_patches = skip_empty_patches
+        self.anon = anon
         self.empty_patches_skipped = 0  # Counter for skipped patches
         self.non_empty_mask = None  # Per-patch bool mask; populated below for infer mode with zarr input
 
@@ -163,6 +166,7 @@ class VCDataset(Dataset):
                 print(f"  Return As Tensor: {self.return_as_tensor}") # Use internal dataset flag
                 print(f"  Input Channels: {num_input_channels}")
                 print(f"  Targets: {targets}")
+                print(f"  Anonymous S3 Input: {anon}")
                 print("---------------------------\n")
 
             # Validate Zarr path if provided - skip validation for remote paths
@@ -199,7 +203,8 @@ class VCDataset(Dataset):
                 return_as_tensor=self.return_as_tensor, # Ensure Volume returns tensors directly
                 verbose=verbose,
                 domain=domain,
-                path=use_path
+                path=use_path,
+                anon=self.anon,
             )
 
             # Get shape and dtype from the primary resolution level (0)
@@ -359,6 +364,7 @@ class VCDataset(Dataset):
             chunks=array_chunks,
             shape=array_shape,
             verbose=self.verbose,
+            anon=self.anon,
         )
         if occupancy is None:
             return None

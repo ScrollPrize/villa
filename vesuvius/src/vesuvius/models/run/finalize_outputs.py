@@ -60,8 +60,6 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
     else:
         logit_cutoff = None
 
-    single_channel_binary = mode == "binary" and (not is_multi_task or not target_info) and num_classes == 1
-
     if mode == "binary":
         if is_multi_task and target_info:
             target_results = []
@@ -69,7 +67,13 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
                 start_ch = info['start_channel']
                 end_ch = info['end_channel']
                 target_logits = logits_np[start_ch:end_ch]
-                if logit_cutoff is not None:
+                if target_logits.shape[0] == 1:
+                    logits = target_logits[0].astype(np.float32)
+                    if logit_cutoff is not None:
+                        target_results.append((logits > logit_cutoff).astype(np.float32))
+                    else:
+                        target_results.append(1.0 / (1.0 + np.exp(-np.clip(logits, -20, 20))))
+                elif logit_cutoff is not None:
                     binary_mask = (target_logits[1] - target_logits[0] > logit_cutoff).astype(np.float32)
                     target_results.append(binary_mask)
                 else:
@@ -107,7 +111,7 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
 
     output_np = output_data
 
-    if single_channel_binary:
+    if mode == "binary":
         output_np = np.clip(output_np * 255.0, 0, 255).astype(np.uint8)
     else:
         # Scale to uint8 range [0, 255]
