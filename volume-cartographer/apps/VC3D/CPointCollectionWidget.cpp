@@ -701,11 +701,10 @@ void CPointCollectionWidget::onFillWindingPlusClicked()
         _fill_winding_minus_button->setChecked(false);
         _fill_winding_equals_button->setChecked(false);
         _point_collection->setAutoFillMode(_selected_collection_id, VCCollection::WindingFillMode::Incremental);
+        _point_collection->autoFillWindingNumbers(_selected_collection_id, VCCollection::WindingFillMode::Incremental);
     } else {
         _point_collection->setAutoFillMode(_selected_collection_id, VCCollection::WindingFillMode::None);
     }
-
-    _point_collection->autoFillWindingNumbers(_selected_collection_id, VCCollection::WindingFillMode::Incremental);
 }
 
 void CPointCollectionWidget::onFillWindingMinusClicked()
@@ -716,11 +715,10 @@ void CPointCollectionWidget::onFillWindingMinusClicked()
         _fill_winding_plus_button->setChecked(false);
         _fill_winding_equals_button->setChecked(false);
         _point_collection->setAutoFillMode(_selected_collection_id, VCCollection::WindingFillMode::Decremental);
+        _point_collection->autoFillWindingNumbers(_selected_collection_id, VCCollection::WindingFillMode::Decremental);
     } else {
         _point_collection->setAutoFillMode(_selected_collection_id, VCCollection::WindingFillMode::None);
     }
-
-    _point_collection->autoFillWindingNumbers(_selected_collection_id, VCCollection::WindingFillMode::Decremental);
 }
 
 void CPointCollectionWidget::onFillWindingEqualsClicked()
@@ -733,11 +731,10 @@ void CPointCollectionWidget::onFillWindingEqualsClicked()
         _fill_winding_plus_button->setChecked(false);
         _fill_winding_minus_button->setChecked(false);
         _point_collection->setAutoFillMode(_selected_collection_id, VCCollection::WindingFillMode::Constant, constVal);
+        _point_collection->autoFillWindingNumbers(_selected_collection_id, VCCollection::WindingFillMode::Constant, constVal);
     } else {
         _point_collection->setAutoFillMode(_selected_collection_id, VCCollection::WindingFillMode::None);
     }
-
-    _point_collection->autoFillWindingNumbers(_selected_collection_id, VCCollection::WindingFillMode::Constant, constVal);
 }
  
 void CPointCollectionWidget::onSaveClicked()
@@ -941,4 +938,3 @@ CPointCollectionWidget::~CPointCollectionWidget() {
         _model->clear();
     }
 }
-
