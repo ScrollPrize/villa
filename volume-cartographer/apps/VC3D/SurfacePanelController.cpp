@@ -1866,48 +1866,39 @@ void SurfacePanelController::applyFiltersInternal()
                 }
             }
 
-            std::vector<VolumeViewerBase*> viewers;
-            if (auto* segmentationViewer = _segmentationViewerProvider ? _segmentationViewerProvider() : nullptr) {
-                viewers.push_back(segmentationViewer);
-            }
-            if (_viewerManager) {
-                _viewerManager->forEachViewer([&viewers](CTiledVolumeViewer* viewer) {
-                    if (viewer && std::find(viewers.begin(), viewers.end(), viewer) == viewers.end()) {
-                        viewers.push_back(viewer);
+            VolumeViewerBase* focusCircleViewer = _segmentationViewerProvider ? _segmentationViewerProvider() : nullptr;
+            if (!focusCircleViewer && _viewerManager) {
+                _viewerManager->forEachViewer([&focusCircleViewer](CTiledVolumeViewer* viewer) {
+                    if (!focusCircleViewer && viewer) {
+                        focusCircleViewer = viewer;
                     }
                 });
             }
 
-            for (VolumeViewerBase* viewer : viewers) {
-                if (!viewer) {
-                    continue;
+            if (focusCircleViewer) {
+                const QPointF sceneCenter = focusCircleViewer->volumeToScene(poi->p);
+                if (finitePoint(sceneCenter)) {
+                    const Rect3D bounds = focusCircleWorldBounds(focusCircleViewer, sceneCenter);
+                    SurfacePatchIndex::TriangleQuery query;
+                    query.bounds = bounds;
+                    patchIndex->forEachTriangle(query,
+                        [&](const SurfacePatchIndex::TriangleCandidate& tri) {
+                            if (!tri.surface || focusPointSurfaces.count(tri.surface.get()) != 0) {
+                                return;
+                            }
+
+                            const QPointF a = focusCircleViewer->volumeToScene(tri.world[0]);
+                            const QPointF b = focusCircleViewer->volumeToScene(tri.world[1]);
+                            const QPointF c = focusCircleViewer->volumeToScene(tri.world[2]);
+                            if (!finitePoint(a) || !finitePoint(b) || !finitePoint(c)) {
+                                return;
+                            }
+
+                            if (triangleIntersectsCircle2D(sceneCenter, kFocusMarkerSceneRadius, a, b, c)) {
+                                focusPointSurfaces.insert(tri.surface.get());
+                            }
+                        });
                 }
-
-                const QPointF sceneCenter = viewer->volumeToScene(poi->p);
-                if (!finitePoint(sceneCenter)) {
-                    continue;
-                }
-
-                const Rect3D bounds = focusCircleWorldBounds(viewer, sceneCenter);
-                SurfacePatchIndex::TriangleQuery query;
-                query.bounds = bounds;
-                patchIndex->forEachTriangle(query,
-                    [&](const SurfacePatchIndex::TriangleCandidate& tri) {
-                        if (!tri.surface || focusPointSurfaces.count(tri.surface.get()) != 0) {
-                            return;
-                        }
-
-                        const QPointF a = viewer->volumeToScene(tri.world[0]);
-                        const QPointF b = viewer->volumeToScene(tri.world[1]);
-                        const QPointF c = viewer->volumeToScene(tri.world[2]);
-                        if (!finitePoint(a) || !finitePoint(b) || !finitePoint(c)) {
-                            return;
-                        }
-
-                        if (triangleIntersectsCircle2D(sceneCenter, kFocusMarkerSceneRadius, a, b, c)) {
-                            focusPointSurfaces.insert(tri.surface.get());
-                        }
-                    });
             }
         }
     }
