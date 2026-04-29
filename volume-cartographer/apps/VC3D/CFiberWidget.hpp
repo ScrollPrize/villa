@@ -22,12 +22,14 @@ signals:
     void newFiberRequested();
     void fiberSelected(uint64_t fiberId);
     void stepChanged(int step);
+    void invertDirectionRequested();
 
 public slots:
     void selectFiber(uint64_t fiberId);
 
 private slots:
     void onNewFiberClicked();
+    void onInvertDirClicked();
     void onStepButtonClicked(int id);
     void onSelectionChanged();
 
@@ -50,5 +52,6 @@ private:
     QListView* _listView;
     QStandardItemModel* _model;
     QPushButton* _newFiberButton;
+    QPushButton* _invertDirButton;
     QButtonGroup* _stepGroup;
 };
