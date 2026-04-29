@@ -127,6 +127,8 @@ void print_usage(const char* argv0)
 {
     std::cout << "usage: " << argv0
               << " --target <target-dir> --source <source-tifxyz-or-source-dir> [options]\n"
+              << "       " << argv0
+              << " <target-dir> <source-tifxyz-or-source-dir> [options]\n"
               << "   Builds a stride-1 surface patch index for target-dir and adds\n"
               << "   overlapping.json metadata for overlaps found from the source.\n"
               << "   source may be one tifxyz segment directory or a directory of segments.\n"
@@ -156,6 +158,7 @@ size_t parse_positive_size(const std::string& name, const std::string& value)
 Config parse_args(int argc, char* argv[])
 {
     Config cfg;
+    std::vector<std::string> positional;
 
     auto require_value = [&](int& i, const std::string& option) -> std::string {
         if (i + 1 >= argc) {
@@ -178,8 +181,26 @@ Config parse_args(int argc, char* argv[])
             cfg.requestedWorkers = parse_positive_size("workers", require_value(i, arg));
         } else if (arg == "--point-stride") {
             cfg.pointStride = parse_positive_size("point-stride", require_value(i, arg));
-        } else {
+        } else if (!arg.empty() && arg[0] == '-') {
             throw std::runtime_error("Unknown argument: " + arg);
+        } else {
+            positional.push_back(arg);
+        }
+    }
+
+    if (positional.size() > 2) {
+        throw std::runtime_error("Expected at most two positional arguments: <target-dir> <source-tifxyz-or-source-dir>");
+    }
+    if (!positional.empty()) {
+        size_t next = 0;
+        if (cfg.targetRoot.empty() && next < positional.size()) {
+            cfg.targetRoot = positional[next++];
+        }
+        if (cfg.sourceRoot.empty() && next < positional.size()) {
+            cfg.sourceRoot = positional[next++];
+        }
+        if (next != positional.size()) {
+            throw std::runtime_error("Positional arguments conflict with --target/--source");
         }
     }
 
