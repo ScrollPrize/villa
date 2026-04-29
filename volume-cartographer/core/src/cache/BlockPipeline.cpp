@@ -837,12 +837,6 @@ void BlockPipeline::shutdown() {
     // All workers have joined — safe to clear the process-global abort
     // flag so a new pipeline can use curl without seeing a stale abort.
     utils::HttpClient::resetAbort();
-    auto cold = statColdHits_.load();
-    auto ice = statIceFetches_.load();
-    if (cold > 0 || ice > 0) {
-        std::fprintf(stderr, "[Cache] session summary: coldHits=%lu iceFetches=%lu (%.0f%% from disk)\n",
-                     cold, ice, (cold + ice) > 0 ? 100.0 * cold / (cold + ice) : 0.0);
-    }
 }
 
 BlockPipeline::~BlockPipeline() {
