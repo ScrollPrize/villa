@@ -95,7 +95,7 @@ def print_detail(label: str = "") -> None:
 		print(f"  collection {cid}: avg_winding={avg}")
 
 	# Per-point table
-	print(f"  {'pid':>6s}  {'col':>4s}  {'pos':>26s}  {'w_obs':>8s}  {'w_tgt':>8s}  {'w_err':>8s}  {'valid':>5s}  {'abs':>3s}", end="")
+	print(f"  {'pid':>6s}  {'col':>4s}  {'pos':>26s}  {'w_obs':>8s}  {'w_tgt':>8s}  {'w_err':>8s}  {'n_dot':>7s}  {'p_n':>23s}  {'tgt_n':>23s}  {'valid':>5s}  {'abs':>3s}", end="")
 	# Anchor columns (winding mode only)
 	has_anchors = _wind_anchors_d is not None
 	if has_anchors:
@@ -117,10 +117,14 @@ def print_detail(label: str = "") -> None:
 		w_obs = p.get("winding_obs")
 		w_tgt = p.get("winding_target")
 		w_err = p.get("winding_err")
+		n_dot = p.get("normal_alignment")
+		point_normal = p.get("point_normal")
+		target_normal = p.get("target_normal")
 		valid = p.get("valid", False)
 		is_abs = p.get("absolute", False)
 		print(f"  {pid:>6s}  {p.get('collection_id', '?'):>4}  {pos_s}  "
-			  f"{_fmt(w_obs):>8s}  {_fmt(w_tgt):>8s}  {_fmt(w_err):>8s}  "
+			  f"{_fmt(w_obs):>8s}  {_fmt(w_tgt):>8s}  {_fmt(w_err):>8s}  {_fmt(n_dot):>7s}  "
+			  f"{_fmt_vec(point_normal):>23s}  {_fmt_vec(target_normal):>23s}  "
 			  f"{'  yes' if valid else '   no':>5s}  {'  Y' if is_abs else '  N':>3s}", end="")
 		if has_anchors:
 			idx = pid_to_idx.get(int(pid))
@@ -143,6 +147,12 @@ def _fmt(v) -> str:
 	if v is None:
 		return "---"
 	return f"{v:.4f}"
+
+
+def _fmt_vec(v) -> str:
+	if v is None:
+		return "---"
+	return "(" + ",".join(f"{float(x):.3f}" for x in v) + ")"
 
 
 def _bilinear_project(P: torch.Tensor, v00: torch.Tensor, v10: torch.Tensor,
@@ -1008,6 +1018,11 @@ def _corr_winding_loss(
 
 	all_err = torch.zeros(K, device=dev, dtype=dt)
 	all_too_far = torch.zeros(K, dtype=torch.bool, device=dev)
+	target_obs_sum = torch.zeros(K, device=dev, dtype=dt)
+	target_obs_wsum = torch.zeros(K, device=dev, dtype=dt)
+	normal_align_sum = torch.zeros(K, device=dev, dtype=dt)
+	normal_align_wsum = torch.zeros(K, device=dev, dtype=dt)
+	target_normal_sum = torch.zeros(K, 3, device=dev, dtype=dt)
 
 	# Shared scalar height map and weight accumulator across both ci=2 and ci=3 splats.
 	# H_map carries signed-delta contributions; W_map carries Gaussian × soft-mask weights.
@@ -1041,9 +1056,16 @@ def _corr_winding_loss(
 			layer_d = d_ci.to(dt)
 			tgt = layer_d - target[vi]
 			err = sw - tgt
+			gt_n_q_sampled = res.data.grid_sample_fullres(Q_det.reshape(1, 1, int(Q_det.shape[0]), 3))
+			gt_n_q = gt_n_q_sampled.normal_3d.reshape(int(Q_det.shape[0]), 3)
+			gt_n_q = gt_n_q / (gt_n_q.norm(dim=-1, keepdim=True) + 1e-8)
+			normal_align = (gt_n_q * gt_n[vi]).sum(dim=-1).clamp(-1.0, 1.0)
+			normal_sign = torch.where(normal_align >= 0.0, torch.ones_like(normal_align), -torch.ones_like(normal_align))
 
-			# Single-sided cutoff: kept universal.  Far-out one-sided anchors are
-			# invalidated, not silently clamped onto the boundary surface.
+			# Keep the closest-pair bracket as a trust gate for applying force.
+			# Target-pair measurements are useful for reporting, but if the point
+			# is not bracketed by the current stack and the strip is far away, the
+			# target anchor can produce large, unstable pulls.
 			is_bracketed = _wind_anchors_valid[vi, 0] & _wind_anchors_valid[vi, 1]
 			too_far = ~is_bracketed & (uw > 2.0)
 			all_too_far[vi] |= too_far
@@ -1051,14 +1073,18 @@ def _corr_winding_loss(
 			# Track per-point error for reporting (blend-weighted across the two anchors)
 			fw_ci = frac_weight[ci][vi]
 			all_err[vi] += err * fw_ci
+			measure_ok = sv & ib
+			fw_measure = fw_ci * measure_ok.to(dt)
+			target_obs_sum[vi] += (target[vi] - err) * fw_measure
+			target_obs_wsum[vi] += fw_measure
+			normal_align_sum[vi] += normal_align * fw_measure
+			normal_align_wsum[vi] += fw_measure
+			target_normal_sum[vi] += gt_n_q * fw_measure.unsqueeze(-1)
 
-			# Scalar per-point displacement along gt_n. The old proxy was
-			# `M_det − gt_n_p · err`, i.e. move corners by `−err` along gt_n_p; here we
-			# splat the same scalar `−err` and apply along the per-vertex gt_n_v at the
-			# active vertex. The mesh normal at the intersection plays no role here —
-			# `sw` responds to corner moves purely via `(Q−P)·gt_n_p`, so no sign flip is
-			# needed when the local mesh winding is inside-out relative to gt_n_p.
-			signed_delta = -err
+			# Scalar per-point displacement along the sampled target normals.  The error
+			# is measured in the correction-point normal frame, so flip it when the target
+			# intersection normal points the other way.
+			signed_delta = -err * normal_sign
 			# Fold ray-in-bounds into the soft mask so out-of-quad ray hits don't splat.
 			mask_p = sv.to(dt) * (~too_far).to(dt) * fw_ci * ib.to(dt)
 
@@ -1112,10 +1138,30 @@ def _corr_winding_loss(
 	# Build results — point is valid only if it has a valid tgt anchor and is not too far
 	has_tgt_anchor = _wind_anchors_valid[:, 2] | _wind_anchors_valid[:, 3]
 	point_valid = target_finite & has_tgt_anchor & ~all_too_far
+	target_obs = torch.where(
+		target_obs_wsum > 1e-8,
+		target_obs_sum / target_obs_wsum.clamp_min(1e-8),
+		torch.full_like(target_obs_sum, float("nan")))
+	normal_alignment = torch.where(
+		normal_align_wsum > 1e-8,
+		normal_align_sum / normal_align_wsum.clamp_min(1e-8),
+		torch.full_like(normal_align_sum, float("nan")))
+	target_normal = target_normal_sum / normal_align_wsum.clamp_min(1e-8).unsqueeze(-1)
+	target_normal = target_normal / target_normal.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+	target_normal = torch.where(
+		(normal_align_wsum > 1e-8).unsqueeze(-1),
+		target_normal,
+		torch.full_like(target_normal, float("nan")))
+	report_obs = torch.where(
+		is_absolute & torch.isfinite(target_obs),
+		target_obs,
+		_wind_obs_per_point)
 	_last_results = _build_winding_results(
-		winding_obs=_wind_obs_per_point, target=target,
+		winding_obs=report_obs, target=target,
 		err=all_err, pt_ids=pt_ids, col=col, pts=pts, winda=winda,
 		valid=point_valid, is_absolute=is_absolute,
+		point_normal=gt_n, target_normal=target_normal,
+		normal_alignment=normal_alignment,
 	)
 	if _dbg_call_count == 1:
 		print_detail("INIT")
@@ -1129,23 +1175,40 @@ def _build_winding_results(
 	*, winding_obs: torch.Tensor, target: torch.Tensor,
 	err: torch.Tensor, pt_ids: torch.Tensor, col: torch.Tensor,
 	pts: torch.Tensor, winda: torch.Tensor, valid: torch.Tensor,
-	is_absolute: torch.Tensor,
+	is_absolute: torch.Tensor, point_normal: torch.Tensor,
+	target_normal: torch.Tensor, normal_alignment: torch.Tensor,
 ) -> dict:
 	"""Build JSON-serializable dict of per-point winding results."""
 	result: dict = {"points": {}, "collection_avgs": {}}
 	K = int(pts.shape[0])
+
+	def _finite_float(t: torch.Tensor) -> float | None:
+		v = float(t.item())
+		return v if math.isfinite(v) else None
+
+	def _finite_vec(t: torch.Tensor) -> list[float] | None:
+		vals = [float(t[j].item()) for j in range(int(t.shape[0]))]
+		if not all(math.isfinite(v) for v in vals):
+			return None
+		return [round(v, 6) for v in vals]
+
 	for i in range(K):
 		pid = int(pt_ids[i].item())
 		cid = int(col[i].item())
-		w_obs = float(winding_obs[i].item()) if math.isfinite(float(winding_obs[i].item())) else None
-		w_tgt = float(target[i].item()) if math.isfinite(float(target[i].item())) else None
-		e = float(err[i].item()) if bool(valid[i]) and math.isfinite(float(err[i].item())) else None
+		w_obs = _finite_float(winding_obs[i])
+		w_tgt = _finite_float(target[i])
+		e_raw = _finite_float(err[i])
+		e = e_raw if bool(valid[i]) else None
+		n_dot = _finite_float(normal_alignment[i])
 		entry: dict = {
 			"collection_id": cid,
 			"p": [round(float(pts[i, j].item()), 2) for j in range(3)],
 			"winding_obs": round(w_obs, 6) if w_obs is not None else None,
 			"winding_target": round(w_tgt, 6) if w_tgt is not None else None,
 			"winding_err": round(e, 6) if e is not None else None,
+			"normal_alignment": round(n_dot, 6) if n_dot is not None else None,
+			"point_normal": _finite_vec(point_normal[i]),
+			"target_normal": _finite_vec(target_normal[i]),
 			"valid": bool(valid[i]),
 			"absolute": bool(is_absolute[i]),
 		}
