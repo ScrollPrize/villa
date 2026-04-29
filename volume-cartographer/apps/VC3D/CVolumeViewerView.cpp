@@ -1,6 +1,7 @@
 #include "CVolumeViewerView.hpp"
 
 #include <QGraphicsView>
+#include <QGraphicsProxyWidget>
 #include <QMouseEvent>
 #include <QKeyEvent>
 #include <QPainter>
@@ -113,6 +114,18 @@ bool CVolumeViewerView::pointInTiltHandle(const QPointF& viewportPos) const
     return tiltHandleRect().adjusted(-5.0, -5.0, 5.0, 5.0).contains(viewportPos);
 }
 
+bool CVolumeViewerView::pointInSceneWidget(const QPointF& viewportPos) const
+{
+    QGraphicsItem* item = itemAt(viewportPos.toPoint());
+    while (item) {
+        if (qgraphicsitem_cast<QGraphicsProxyWidget*>(item)) {
+            return true;
+        }
+        item = item->parentItem();
+    }
+    return false;
+}
+
 QPointF CVolumeViewerView::tiltFromHandlePos(const QPointF& viewportPos) const
 {
     const QRectF r = tiltHandleRect();
@@ -198,6 +211,11 @@ void CVolumeViewerView::scrollContentsBy(int dx, int dy)
 
 void CVolumeViewerView::wheelEvent(QWheelEvent *event)
 {
+    if (pointInSceneWidget(event->position())) {
+        QGraphicsView::wheelEvent(event);
+        return;
+    }
+
     // Accumulate fractional degrees so high-resolution trackpads and mice
     // with fine scroll steps don't lose precision to integer truncation.
     // Standard mice send 120 units (= 15 degrees) per notch.
@@ -220,6 +238,15 @@ void CVolumeViewerView::wheelEvent(QWheelEvent *event)
 
 void CVolumeViewerView::mouseReleaseEvent(QMouseEvent *event)
 {
+    if (_sceneWidgetMouseCapture) {
+        QGraphicsView::mouseReleaseEvent(event);
+        if (event->buttons() == Qt::NoButton) {
+            _sceneWidgetMouseCapture = false;
+        }
+        event->accept();
+        return;
+    }
+
     if (_tiltHandleDragging) {
         if (event->button() == Qt::LeftButton) {
             emit sendTiltHandleChanged(tiltFromHandlePos(event->position()));
@@ -316,6 +343,13 @@ void CVolumeViewerView::keyReleaseEvent(QKeyEvent *event)
 
 void CVolumeViewerView::mousePressEvent(QMouseEvent *event)
 {
+    if (pointInSceneWidget(event->position())) {
+        _sceneWidgetMouseCapture = true;
+        QGraphicsView::mousePressEvent(event);
+        event->accept();
+        return;
+    }
+
     if (event->button() == Qt::LeftButton && pointInTiltHandle(event->position())) {
         _tiltHandleDragging = true;
         setCursor(Qt::CrossCursor);
@@ -397,6 +431,12 @@ void CVolumeViewerView::resizeEvent(QResizeEvent *event)
 
 void CVolumeViewerView::mouseMoveEvent(QMouseEvent *event)
 {
+    if (_sceneWidgetMouseCapture) {
+        QGraphicsView::mouseMoveEvent(event);
+        event->accept();
+        return;
+    }
+
     if (_tiltHandleDragging) {
         emit sendTiltHandleChanged(tiltFromHandlePos(event->position()));
         event->accept();

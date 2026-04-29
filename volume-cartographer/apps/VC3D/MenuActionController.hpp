@@ -54,6 +54,7 @@ private slots:
     void clearSelection();
     void runTeleaInpaint();
     void importObjAsPatch();
+    void beginRotateSurfaceTransform();
     void exitApplication();
 
 private:
@@ -94,6 +95,7 @@ private:
     QMenu* _editMenu{nullptr};
     QMenu* _viewMenu{nullptr};
     QMenu* _actionsMenu{nullptr};
+    QMenu* _transformsMenu{nullptr};
     QMenu* _selectionMenu{nullptr};
     QMenu* _helpMenu{nullptr};
     QMenu* _recentMenu{nullptr};
@@ -120,6 +122,7 @@ private:
     QAction* _selectionClearAct{nullptr};
     QAction* _teleaAct{nullptr};
     QAction* _importObjAct{nullptr};
+    QAction* _rotateSurfaceAct{nullptr};
     int _remoteOpenAuthRetries{0};
     int _remoteScrollAuthRetries{0};
 

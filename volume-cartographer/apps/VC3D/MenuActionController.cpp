@@ -199,6 +199,9 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _importObjAct = new QAction(QObject::tr("Import OBJ as Patch..."), this);
     connect(_importObjAct, &QAction::triggered, this, &MenuActionController::importObjAsPatch);
 
+    _rotateSurfaceAct = new QAction(QObject::tr("Rotate"), this);
+    connect(_rotateSurfaceAct, &QAction::triggered, this, &MenuActionController::beginRotateSurfaceTransform);
+
     // Build menus
     _fileMenu = new QMenu(QObject::tr("&File"), qWindow);
     _fileMenu->addAction(_openAct);
@@ -249,6 +252,10 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
 
     _actionsMenu = new QMenu(QObject::tr("&Actions"), qWindow);
     _actionsMenu->addAction(_drawBBoxAct);
+    _actionsMenu->addSeparator();
+    _transformsMenu = new QMenu(QObject::tr("&Transforms"), _actionsMenu);
+    _transformsMenu->addAction(_rotateSurfaceAct);
+    _actionsMenu->addMenu(_transformsMenu);
     _actionsMenu->addSeparator();
     _actionsMenu->addAction(_teleaAct);
 
@@ -2243,4 +2250,29 @@ void MenuActionController::importObjAsPatch()
     }
 
     QMessageBox::information(_window, QObject::tr("Import Results"), message);
+}
+
+void MenuActionController::beginRotateSurfaceTransform()
+{
+    if (!_window || !_window->_transformOverlay) {
+        return;
+    }
+
+    auto activeSurface = _window->_state ? _window->_state->activeSurface().lock() : nullptr;
+    if (!activeSurface) {
+        activeSurface = _window->_state
+            ? std::dynamic_pointer_cast<QuadSurface>(_window->_state->surface("segmentation"))
+            : nullptr;
+    }
+    if (!activeSurface) {
+        QMessageBox::information(_window,
+                                 QObject::tr("Rotate Surface"),
+                                 QObject::tr("Select a segmentation surface before rotating."));
+        return;
+    }
+
+    _window->_transformOverlay->beginRotate();
+    if (_window->statusBar()) {
+        _window->statusBar()->showMessage(QObject::tr("Surface rotation active"), 3000);
+    }
 }

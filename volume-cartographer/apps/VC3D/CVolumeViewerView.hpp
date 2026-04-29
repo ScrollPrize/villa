@@ -70,11 +70,13 @@ private:
     bool pointInTiltHandle(const QPointF& viewportPos) const;
     QPointF tiltFromHandlePos(const QPointF& viewportPos) const;
     void drawTiltHandle(QPainter* painter) const;
+    bool pointInSceneWidget(const QPointF& viewportPos) const;
 
     // µm per scene-unit (pixel)
     double m_vx = 32.0, m_vy = 32.0;
     bool _middleButtonPanEnabled = true;
     bool _scrollPanDisabled = false;
+    bool _sceneWidgetMouseCapture = false;
     int _wheelAccum = 0;  // fractional wheel delta accumulator
 
     // Scalebar cache — avoid recomputing font/text every frame
