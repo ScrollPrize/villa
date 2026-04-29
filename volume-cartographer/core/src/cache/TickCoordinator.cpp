@@ -209,7 +209,7 @@ void TickCoordinator::runLoop(std::stop_token stop) noexcept
                             (std::uint64_t(std::uint32_t(by)) << 21) |
                              std::uint64_t(std::uint32_t(bx));
                         sliceMaster_.push_back(SliceEntry{
-                            packed, ce.pipeline, b});
+                            packed, ce.key.level, ce.pipeline, b});
                     }
                 }
             }
@@ -318,17 +318,17 @@ void TickCoordinator::runLoop(std::stop_token stop) noexcept
             next->emptyChunkKeys = emptyChunkMaster_;
         }
         // Rebuild published slice from master. Copy, then sort by packed
-        // key so readers can binary_search. Dedup isn't strictly required
-        // (stale entries for a given key are fine — the reader verifies
-        // the pipeline pointer and a stale Block* either still points to
-        // valid arena memory or to a repurposed slot, which fails the
-        // key check inside the per-sampler slot cache).
+        // key so readers can binary_search. Dedup isn't strictly required;
+        // readers verify pipeline and level because packed block coordinates
+        // overlap across volumes and pyramid levels.
         if (chunksThisTick > 0 || next->slice.size() != sliceMaster_.size()) {
             next->slice = sliceMaster_;
             std::sort(next->slice.begin(), next->slice.end(),
                       [](const SliceEntry& a, const SliceEntry& b) {
                           if (a.packedKey != b.packedKey)
                               return a.packedKey < b.packedKey;
+                          if (a.level != b.level)
+                              return a.level < b.level;
                           return a.pipeline < b.pipeline;
                       });
         }
