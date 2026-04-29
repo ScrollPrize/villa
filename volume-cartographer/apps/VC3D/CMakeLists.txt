@@ -143,6 +143,10 @@ set(srcs
     ConsoleOutputWidget.cpp
     ConsoleOutputWidget.hpp
     CPointCollectionWidget.cpp
+    CFiberWidget.cpp
+    CFiberWidget.hpp
+    FiberAnnotationController.cpp
+    FiberAnnotationController.hpp
     elements/COutlinedTextItem.hpp
     elements/COutlinedTextItem.cpp
     adaptive/CAdaptiveVolumeViewer.cpp

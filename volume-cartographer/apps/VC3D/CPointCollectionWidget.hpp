@@ -109,6 +109,7 @@ private slots:
     QDoubleSpinBox *_fill_constant_spinbox;
     QLabel *_anchor_status_label;
     QPushButton *_clear_anchor_button;
+    QLabel *_tags_label;
 
     QGroupBox *_point_metadata_group;
     QCheckBox *_winding_enabled_checkbox;

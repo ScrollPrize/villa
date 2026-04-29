@@ -143,6 +143,10 @@ void CPointCollectionWidget::setupUi()
     collection_layout->addLayout(anchor_layout);
     connect(_clear_anchor_button, &QPushButton::clicked, this, &CPointCollectionWidget::onClearAnchorClicked);
 
+    _tags_label = new QLabel("Tags: (none)");
+    _tags_label->setWordWrap(true);
+    collection_layout->addWidget(_tags_label);
+
     layout->addWidget(_collection_metadata_group);
  
     CONNECT_CHECK_STATE(_absolute_winding_checkbox, this, onAbsoluteWindingChanged);
@@ -544,6 +548,17 @@ void CPointCollectionWidget::updateMetadataWidgets()
             _color_button->setPalette(pal);
             _color_button->update();
 
+            // Update tags display
+            if (collection.tags.empty()) {
+                _tags_label->setText("Tags: (none)");
+            } else {
+                QStringList parts;
+                for (const auto& [k, v] : collection.tags) {
+                    parts.append(QString::fromStdString(k) + "=" + QString::fromStdString(v));
+                }
+                _tags_label->setText("Tags: " + parts.join(", "));
+            }
+
             // Update anchor status
             if (collection.anchor2d.has_value()) {
                 cv::Vec2f anchor = collection.anchor2d.value();
@@ -573,6 +588,7 @@ void CPointCollectionWidget::updateMetadataWidgets()
         _fill_winding_minus_button->setChecked(false);
         _fill_winding_equals_button->setChecked(false);
         _fill_constant_spinbox->setValue(0.0);
+        _tags_label->setText("Tags: (none)");
     }
 
     if (point_selected) {

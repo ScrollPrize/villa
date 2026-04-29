@@ -90,9 +90,18 @@ void to_json(Json& j, const VCCollection::Collection& c) {
     if (c.anchor2d.has_value()) {
         j["anchor2d"] = vec2f_to_json(c.anchor2d.value());
     }
+
     if (c.autoFillMode != VCCollection::WindingFillMode::None) {
         j["autoFillMode"] = Json(static_cast<int>(c.autoFillMode));
         j["autoFillConstant"] = Json((double)c.autoFillConstant);
+    }
+
+    if (!c.tags.empty()) {
+        Json tags_obj = Json::object();
+        for (const auto& [key, val] : c.tags) {
+            tags_obj[key] = Json(val);
+        }
+        j["tags"] = std::move(tags_obj);
     }
 }
 
@@ -118,6 +127,7 @@ void from_json(const Json& j, VCCollection::Collection& c) {
     } else {
         c.anchor2d = std::nullopt;
     }
+
     if (j.contains("autoFillMode") && j.at("autoFillMode").is_number()) {
         int modeInt = j.at("autoFillMode").get_int();
         if (modeInt >= 0 && modeInt <= 3) {
@@ -126,6 +136,15 @@ void from_json(const Json& j, VCCollection::Collection& c) {
     }
     if (j.contains("autoFillConstant") && j.at("autoFillConstant").is_number()) {
         c.autoFillConstant = j.at("autoFillConstant").get_float();
+    }
+
+    if (j.contains("tags") && j.at("tags").is_object()) {
+        Json tags_obj = j.at("tags");
+        for (auto it = tags_obj.begin(); it != tags_obj.end(); ++it) {
+            if ((*it).is_string()) {
+                c.tags[it.key()] = (*it).get_string();
+            }
+        }
     }
 }
  
@@ -270,6 +289,32 @@ std::optional<cv::Vec2f> VCCollection::getCollectionAnchor2d(uint64_t collection
 {
     if (_collections.count(collectionId)) {
         return _collections.at(collectionId).anchor2d;
+    }
+    return std::nullopt;
+}
+
+void VCCollection::setCollectionTag(uint64_t collectionId, const std::string& key, const std::string& value)
+{
+    if (_collections.count(collectionId)) {
+        _collections.at(collectionId).tags[key] = value;
+        emit collectionChanged(collectionId);
+    }
+}
+
+void VCCollection::removeCollectionTag(uint64_t collectionId, const std::string& key)
+{
+    if (_collections.count(collectionId)) {
+        _collections.at(collectionId).tags.erase(key);
+        emit collectionChanged(collectionId);
+    }
+}
+
+std::optional<std::string> VCCollection::getCollectionTag(uint64_t collectionId, const std::string& key) const
+{
+    if (_collections.count(collectionId)) {
+        const auto& tags = _collections.at(collectionId).tags;
+        auto it = tags.find(key);
+        if (it != tags.end()) return it->second;
     }
     return std::nullopt;
 }

@@ -98,6 +98,8 @@
 #include "SettingsDialog.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "CPointCollectionWidget.hpp"
+#include "CFiberWidget.hpp"
+#include "FiberAnnotationController.hpp"
 #include "SurfaceTreeWidget.hpp"
 #include "SeedingWidget.hpp"
 #include "DrawingWidget.hpp"
@@ -3586,10 +3588,35 @@ void CWindow::CreateWidgets(void)
     connect(_point_collection_widget, &CPointCollectionWidget::collectionSelected,
             _segmentationModule.get(), &SegmentationModule::setSelectedAnnotationCollection);
 
-    // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, and Drawing together
+    // Create fiber annotation controller and dock
+    _fiberController = std::make_unique<FiberAnnotationController>(
+        _state, _state->pointCollection(), this);
+    _fiberController->setMdiArea(mdiArea);
+
+    _fiberWidget = new CFiberWidget(_state->pointCollection(), this);
+    _fiberWidget->setObjectName("fiberDock");
+    addDockWidget(Qt::RightDockWidgetArea, _fiberWidget);
+
+    connect(_fiberWidget, &CFiberWidget::newFiberRequested,
+            this, &CWindow::onNewFiberRequested);
+    connect(_fiberWidget, &CFiberWidget::stepChanged,
+            _fiberController.get(), &FiberAnnotationController::onStepChanged);
+    connect(_fiberController.get(), &FiberAnnotationController::crosshairModeChanged,
+            this, &CWindow::onFiberCrosshairModeChanged);
+    connect(_fiberController.get(), &FiberAnnotationController::requestFiberViewers,
+            this, &CWindow::onFiberViewersRequested);
+    connect(_fiberController.get(), &FiberAnnotationController::annotationFinished,
+            this, &CWindow::onFiberAnnotationFinished);
+
+    ensureDockWidgetFeatures(_fiberWidget);
+    connect(_fiberWidget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(_fiberWidget, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
+
+    // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, Fibers, and Drawing together
     tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
     tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
+    tabifyDockWidget(ui.dockWidgetSegmentation, _fiberWidget);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDrawing);
 
     // Make Segmentation dock the active tab by default
@@ -5018,6 +5045,16 @@ void CWindow::CreateWidgets(void)
 // Create actions
 void CWindow::keyPressEvent(QKeyEvent* event)
 {
+    // Let fiber controller handle Escape first
+    if (event->key() == Qt::Key_Escape && _fiberController && _fiberController->handleEscape()) {
+        event->accept();
+        return;
+    }
+
+    // Fiber animation (P key)
+    if (_fiberController && _fiberController->handleKeyPress(event))
+        return;
+
     if (event->key() == vc3d::keybinds::keypress::ToggleVolumeOverlay.key &&
         event->modifiers() == vc3d::keybinds::keypress::ToggleVolumeOverlay.modifiers) {
         toggleVolumeOverlayVisibility();
@@ -5545,6 +5582,10 @@ void CWindow::onLocChanged(void)
 
 void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers)
 {
+    // Let fiber annotation controller consume the click if in WaitingForFirstClick mode
+    if (_fiberController && _fiberController->handleVolumeClick(vol_loc, normal, surf, buttons, modifiers))
+        return;
+
     if (modifiers & Qt::ShiftModifier) {
         return;
     }
@@ -6575,4 +6616,88 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
     }
 
     statusBar()->showMessage(tr("Focused & aligned view to %1 points").arg(pts.size()), 3000);
+}
+
+// ---- Fiber annotation slots -------------------------------------------------
+
+void CWindow::onNewFiberRequested()
+{
+    if (_fiberController) {
+        _fiberController->beginNewFiber();
+    }
+}
+
+void CWindow::onFiberCrosshairModeChanged(bool active)
+{
+    if (!_viewerManager) return;
+    _viewerManager->forEachViewer([active](CTiledVolumeViewer* v) {
+        if (v->graphicsView()) {
+            v->graphicsView()->setCursor(active ? Qt::CrossCursor : Qt::ArrowCursor);
+        }
+    });
+}
+
+void CWindow::onFiberViewersRequested()
+{
+    if (!_fiberController) return;
+
+    constexpr int N = FiberAnnotationController::kNumViews;
+
+    // U-layout grid positions: down left column, across bottom, up right column
+    //   index:  0(ref)  5(annot)
+    //           1       4
+    //           2       3
+    struct GridPos { int row; int col; };
+    constexpr GridPos grid[N] = {{0,0}, {1,0}, {2,0}, {2,1}, {1,1}, {0,1}};
+
+    QMdiSubWindow* subWindows[N] = {};
+
+    for (int i = 0; i < N; ++i) {
+        QString title = (i == 0) ? tr("Fiber Ref") :
+                        (i == N-1) ? tr("Fiber Annotate") :
+                        tr("Fiber %1/%2").arg(i).arg(N-1);
+
+        auto* viewer = newConnectedViewer(
+            FiberAnnotationController::fiberSurfaceName(i), title, mdiArea);
+        if (!viewer) continue;
+
+        _fiberController->setFiberViewer(i, viewer);
+
+        // Isolate from segmentation module and global focus POI
+        disconnect(_state, &CState::poiChanged, viewer, &CTiledVolumeViewer::onPOIChanged);
+        if (_segmentationModule)
+            disconnect(viewer, nullptr, _segmentationModule.get(), nullptr);
+
+        // Only the last view (annotation) handles clicks
+        if (i == N - 1) {
+            connect(viewer, &CTiledVolumeViewer::sendVolumeClicked,
+                    _fiberController.get(), &FiberAnnotationController::onAnnotationViewerClicked);
+        }
+
+        if (_state->currentVolume())
+            viewer->OnVolumeChanged(_state->currentVolume());
+
+        subWindows[i] = qobject_cast<QMdiSubWindow*>(viewer->parentWidget());
+        if (subWindows[i])
+            subWindows[i]->show();
+    }
+
+    // Layout: 2 columns × 3 rows U-grid
+    QRect area = mdiArea->contentsRect();
+    int colW = area.width() / 2;
+    int rowH = area.height() / 3;
+
+    for (int i = 0; i < N; ++i) {
+        if (!subWindows[i]) continue;
+        int x = area.x() + grid[i].col * colW;
+        int y = area.y() + grid[i].row * rowH;
+        subWindows[i]->setGeometry(x, y, colW, rowH);
+    }
+}
+
+void CWindow::onFiberAnnotationFinished(uint64_t fiberId)
+{
+    if (_fiberWidget) {
+        _fiberWidget->selectFiber(fiberId);
+    }
 }
