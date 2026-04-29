@@ -700,7 +700,8 @@ public:
     }
 
 private:
-    // Write (or update) meta.json in 'dir' so that it contains:
+    // Write (or update) meta.json in 'dir' so that it contains tifxyz identity
+    // fields plus:
     //   "scale": [sx, sy]
     // Returns true on success; leaves other JSON keys intact if meta.json exists.
     static bool overwriteMetaScale_(const QString& dir, double sx, double sy) {
@@ -719,6 +720,19 @@ private:
 
         QJsonArray scaleArr; scaleArr.append(sx); scaleArr.append(sy);
         root.insert(QStringLiteral("scale"), scaleArr);
+        if (!root.contains(QStringLiteral("type"))) {
+            root.insert(QStringLiteral("type"), QStringLiteral("seg"));
+        }
+        if (!root.contains(QStringLiteral("uuid"))) {
+            QString uuid = QFileInfo(dir).fileName();
+            if (uuid.isEmpty()) {
+                uuid = QDir(dir).dirName();
+            }
+            root.insert(QStringLiteral("uuid"), uuid);
+        }
+        if (!root.contains(QStringLiteral("format"))) {
+            root.insert(QStringLiteral("format"), QStringLiteral("tifxyz"));
+        }
 
         QFile out(metaPath);
         if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
