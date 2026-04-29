@@ -24,7 +24,7 @@ class FiberAnnotationController : public QObject
     Q_OBJECT
 
 public:
-    static constexpr int kNumViews = 6;
+    static constexpr int kNumViews = 2;  // 0 = ref, 1 = annotation
 
     enum class State {
         Idle,
@@ -65,6 +65,7 @@ public slots:
                                    Surface* surf, Qt::MouseButton button,
                                    Qt::KeyboardModifiers modifiers);
     void onStepChanged(int step);
+    void invertDirection();
 
 private slots:
     void onAnimTick();
@@ -76,9 +77,12 @@ private:
     };
 
     void addFiberPoint(const cv::Vec3f& position);
-    void advanceToNextPrediction();
+    void rebuildRecentPointsFromChain();
+    void commitClickAndAdvance();
+    void updatePrediction();
     void closeAnnotationViewer();
 
+    cv::Vec3f predictDirection() const;
     std::pair<cv::Vec3f, cv::Vec3f> predictFromOnePoint() const;
     std::pair<cv::Vec3f, cv::Vec3f> predictFromTwoPoints() const;
     std::pair<cv::Vec3f, cv::Vec3f> predictFromThreeOrMore() const;
@@ -93,6 +97,13 @@ private:
     std::string _fiberCollectionName;
     cv::Vec3f _initialNormal = {0, 0, 1};
     int _fiberStep = 50;
+    bool _invertMode = false;
+
+    // Anchor pose (the "ref" view); set on click, preserved across step changes
+    bool _hasAnchor = false;
+    cv::Vec3f _anchorPos = {0, 0, 0};
+    cv::Vec3f _anchorNormal = {0, 0, 1};
+    cv::Vec3f _anchorVy = {0, 1, 0};
 
     std::vector<FiberPoint> _recentPoints;
 
