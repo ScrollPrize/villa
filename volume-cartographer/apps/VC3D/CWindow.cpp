@@ -3601,6 +3601,8 @@ void CWindow::CreateWidgets(void)
             this, &CWindow::onNewFiberRequested);
     connect(_fiberWidget, &CFiberWidget::stepChanged,
             _fiberController.get(), &FiberAnnotationController::onStepChanged);
+    connect(_fiberWidget, &CFiberWidget::invertDirectionRequested,
+            _fiberController.get(), &FiberAnnotationController::invertDirection);
     connect(_fiberController.get(), &FiberAnnotationController::crosshairModeChanged,
             this, &CWindow::onFiberCrosshairModeChanged);
     connect(_fiberController.get(), &FiberAnnotationController::requestFiberViewers,
@@ -6637,19 +6639,10 @@ void CWindow::onFiberViewersRequested()
 
     constexpr int N = FiberAnnotationController::kNumViews;
 
-    // U-layout grid positions: down left column, across bottom, up right column
-    //   index:  0(ref)  5(annot)
-    //           1       4
-    //           2       3
-    struct GridPos { int row; int col; };
-    constexpr GridPos grid[N] = {{0,0}, {1,0}, {2,0}, {2,1}, {1,1}, {0,1}};
-
     QMdiSubWindow* subWindows[N] = {};
 
     for (int i = 0; i < N; ++i) {
-        QString title = (i == 0) ? tr("Fiber Ref") :
-                        (i == N-1) ? tr("Fiber Annotate") :
-                        tr("Fiber %1/%2").arg(i).arg(N-1);
+        QString title = (i == 0) ? tr("Fiber Ref") : tr("Fiber Annotate");
 
         auto* viewer = newConnectedViewer(
             FiberAnnotationController::fiberSurfaceName(i), title, mdiArea);
@@ -6676,15 +6669,15 @@ void CWindow::onFiberViewersRequested()
             subWindows[i]->show();
     }
 
-    // Layout: 2 columns × 3 rows U-grid
+    // Layout: 2 columns × 1 row — ref on the left, annotate on the right.
     QRect area = mdiArea->contentsRect();
     int colW = area.width() / 2;
-    int rowH = area.height() / 3;
+    int rowH = area.height();
 
     for (int i = 0; i < N; ++i) {
         if (!subWindows[i]) continue;
-        int x = area.x() + grid[i].col * colW;
-        int y = area.y() + grid[i].row * rowH;
+        int x = area.x() + i * colW;
+        int y = area.y();
         subWindows[i]->setGeometry(x, y, colW, rowH);
     }
 }

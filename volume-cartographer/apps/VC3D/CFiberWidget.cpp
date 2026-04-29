@@ -56,7 +56,12 @@ void CFiberWidget::setupUi()
     _newFiberButton->setToolTip("Create a new fiber and start annotation (crosshair pick mode)");
     layout->addWidget(_newFiberButton);
 
+    _invertDirButton = new QPushButton(tr("Invert Direction"), mainWidget);
+    _invertDirButton->setToolTip("Jump to the other end of the fiber chain and continue annotating in the opposite direction");
+    layout->addWidget(_invertDirButton);
+
     connect(_newFiberButton, &QPushButton::clicked, this, &CFiberWidget::onNewFiberClicked);
+    connect(_invertDirButton, &QPushButton::clicked, this, &CFiberWidget::onInvertDirClicked);
 
     layout->addStretch();
     setWidget(mainWidget);
@@ -130,6 +135,11 @@ void CFiberWidget::selectFiber(uint64_t fiberId)
 void CFiberWidget::onNewFiberClicked()
 {
     emit newFiberRequested();
+}
+
+void CFiberWidget::onInvertDirClicked()
+{
+    emit invertDirectionRequested();
 }
 
 void CFiberWidget::onStepButtonClicked(int id)
