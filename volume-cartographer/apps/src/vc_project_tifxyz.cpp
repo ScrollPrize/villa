@@ -265,38 +265,6 @@ std::optional<float> ray_triangle_t(const cv::Vec3f& origin,
     return hit->t;
 }
 
-bool ray_intersects_patch_bounds(const SurfacePatchIndex::PatchBounds& bounds,
-                                 const cv::Vec3f& origin,
-                                 const cv::Vec3f& dir,
-                                 float minT,
-                                 float maxT)
-{
-    float t0 = minT;
-    float t1 = maxT;
-    for (int ax = 0; ax < 3; ++ax) {
-        const float d = dir[ax];
-        if (std::abs(d) <= 1e-8f) {
-            if (origin[ax] < bounds.low[ax] || origin[ax] > bounds.high[ax]) {
-                return false;
-            }
-            continue;
-        }
-
-        const float invD = 1.0f / d;
-        float nearT = (bounds.low[ax] - origin[ax]) * invD;
-        float farT = (bounds.high[ax] - origin[ax]) * invD;
-        if (nearT > farT) {
-            std::swap(nearT, farT);
-        }
-        t0 = std::max(t0, nearT);
-        t1 = std::min(t1, farT);
-        if (t0 > t1) {
-            return false;
-        }
-    }
-    return true;
-}
-
 cv::Vec3f interpolate_surface_param(const SurfacePatchIndex::TriangleCandidate& tri,
                                     const cv::Vec3f& bary)
 {
@@ -685,18 +653,13 @@ void repair_shifted_ray_outliers(const Config& cfg,
                 const cv::Vec3f origin = *predicted - dir * cfg.repairBacktrack;
                 const float maxT = cfg.repairBacktrack + cfg.repairForward;
                 const cv::Vec3f end = origin + dir * maxT;
-                Rect3D bounds;
-                for (int ax = 0; ax < 3; ++ax) {
-                    bounds.low[ax] = std::min(origin[ax], end[ax]) - cfg.bboxPadding;
-                    bounds.high[ax] = std::max(origin[ax], end[ax]) + cfg.bboxPadding;
-                }
 
                 std::vector<RayHit> hits;
-                SurfacePatchIndex::TriangleQuery query;
-                query.bounds = bounds;
-                query.patchFilter = [&](const SurfacePatchIndex::PatchBounds& patchBounds) {
-                    return ray_intersects_patch_bounds(patchBounds, origin, dir, 0.0f, maxT);
-                };
+                SurfacePatchIndex::RayQuery query;
+                query.src = origin;
+                query.end = end;
+                query.minT = 0.0f;
+                query.bboxPadding = cfg.bboxPadding;
                 index.forEachTriangle(
                     query,
                     [&](const SurfacePatchIndex::TriangleCandidate& tri) {
@@ -958,20 +921,14 @@ cv::Mat_<cv::Vec3f> snap_points_to_patch_rays(const cv::Mat_<cv::Vec3f>& points,
             }
 
             const cv::Vec3f end = origin + dir * maxDistance;
-            Rect3D bounds;
-            for (int ax = 0; ax < 3; ++ax) {
-                bounds.low[ax] = std::min(origin[ax], end[ax]) - cfg.bboxPadding;
-                bounds.high[ax] = std::max(origin[ax], end[ax]) + cfg.bboxPadding;
-            }
 
             float bestT = std::numeric_limits<float>::max();
             cv::Vec3f bestPoint = kInvalid;
-            SurfacePatchIndex::TriangleQuery query;
-            query.bounds = bounds;
-            query.patchFilter = [&](const SurfacePatchIndex::PatchBounds& patchBounds) {
-                return ray_intersects_patch_bounds(patchBounds, origin, dir,
-                                                   cfg.snapMinDistance, maxDistance);
-            };
+            SurfacePatchIndex::RayQuery query;
+            query.src = origin;
+            query.end = end;
+            query.minT = cfg.snapMinDistance;
+            query.bboxPadding = cfg.bboxPadding;
             index.forEachTriangle(
                 query,
                 [&](const SurfacePatchIndex::TriangleCandidate& tri) {
@@ -1318,19 +1275,13 @@ int main(int argc, char** argv)
             const cv::Vec3f origin = srcPoints(sr, sc);
             const cv::Vec3f dir = rayDirs(sr, sc);
             const cv::Vec3f end = origin + dir * cfg.maxDistance;
-            Rect3D bounds;
-            for (int ax = 0; ax < 3; ++ax) {
-                bounds.low[ax] = std::min(origin[ax], end[ax]) - cfg.bboxPadding;
-                bounds.high[ax] = std::max(origin[ax], end[ax]) + cfg.bboxPadding;
-            }
 
             std::vector<RayHit> hits;
-            SurfacePatchIndex::TriangleQuery query;
-            query.bounds = bounds;
-            query.patchFilter = [&](const SurfacePatchIndex::PatchBounds& patchBounds) {
-                return ray_intersects_patch_bounds(patchBounds, origin, dir,
-                                                   cfg.minDistance, cfg.maxDistance);
-            };
+            SurfacePatchIndex::RayQuery query;
+            query.src = origin;
+            query.end = end;
+            query.minT = cfg.minDistance;
+            query.bboxPadding = cfg.bboxPadding;
             index.forEachTriangle(
                 query,
                 [&](const SurfacePatchIndex::TriangleCandidate& tri) {
@@ -1358,19 +1309,13 @@ int main(int argc, char** argv)
             if (!hits.empty()) {
                 const float firstPatchT = hits.front().t;
                 const cv::Vec3f selfEnd = origin + dir * firstPatchT;
-                Rect3D selfBounds;
-                for (int ax = 0; ax < 3; ++ax) {
-                    selfBounds.low[ax] = std::min(origin[ax], selfEnd[ax]) - cfg.bboxPadding;
-                    selfBounds.high[ax] = std::max(origin[ax], selfEnd[ax]) + cfg.bboxPadding;
-                }
                 bool selfHitFirst = false;
-                SurfacePatchIndex::TriangleQuery selfQuery;
-                selfQuery.bounds = selfBounds;
+                SurfacePatchIndex::RayQuery selfQuery;
+                selfQuery.src = origin;
+                selfQuery.end = selfEnd;
+                selfQuery.minT = cfg.minDistance;
+                selfQuery.bboxPadding = cfg.bboxPadding;
                 selfQuery.targetSurface = src;
-                selfQuery.patchFilter = [&](const SurfacePatchIndex::PatchBounds& patchBounds) {
-                    return ray_intersects_patch_bounds(patchBounds, origin, dir,
-                                                       cfg.minDistance, firstPatchT);
-                };
                 sourceIndex.forEachTriangle(
                     selfQuery,
                     [&](const SurfacePatchIndex::TriangleCandidate& tri) {

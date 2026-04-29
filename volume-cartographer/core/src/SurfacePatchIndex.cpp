@@ -1978,6 +1978,63 @@ void SurfacePatchIndex::forEachTriangle(
                         patchFilter);
 }
 
+void SurfacePatchIndex::forEachTriangle(
+    const RayQuery& query,
+    const std::function<void(const TriangleCandidate&)>& visitor) const
+{
+    if (!visitor || !isFinitePoint(query.src) || !isFinitePoint(query.end) ||
+        !std::isfinite(query.minT) || !std::isfinite(query.bboxPadding)) {
+        return;
+    }
+
+    const cv::Vec3f ray = query.end - query.src;
+    const float maxT = cv::norm(ray);
+    if (!std::isfinite(maxT) || maxT <= 1e-6f || query.minT > maxT) {
+        return;
+    }
+
+    const cv::Vec3f dir = ray * (1.0f / maxT);
+    Rect3D bounds;
+    for (int ax = 0; ax < 3; ++ax) {
+        bounds.low[ax] = std::min(query.src[ax], query.end[ax]) - query.bboxPadding;
+        bounds.high[ax] = std::max(query.src[ax], query.end[ax]) + query.bboxPadding;
+    }
+
+    TriangleQuery triangleQuery;
+    triangleQuery.bounds = bounds;
+    triangleQuery.targetSurface = query.targetSurface;
+    triangleQuery.targetSurfaces = query.targetSurfaces;
+    triangleQuery.patchFilter = [src = query.src, dir, minT = query.minT, maxT](
+        const PatchBounds& patchBounds) {
+        float t0 = minT;
+        float t1 = maxT;
+        for (int ax = 0; ax < 3; ++ax) {
+            const float d = dir[ax];
+            if (std::abs(d) <= 1e-8f) {
+                if (src[ax] < patchBounds.low[ax] || src[ax] > patchBounds.high[ax]) {
+                    return false;
+                }
+                continue;
+            }
+
+            const float invD = 1.0f / d;
+            float nearT = (patchBounds.low[ax] - src[ax]) * invD;
+            float farT = (patchBounds.high[ax] - src[ax]) * invD;
+            if (nearT > farT) {
+                std::swap(nearT, farT);
+            }
+            t0 = std::max(t0, nearT);
+            t1 = std::min(t1, farT);
+            if (t0 > t1) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    forEachTriangle(triangleQuery, visitor);
+}
+
 template <typename Visitor, typename PatchFilter>
 void SurfacePatchIndex::forEachTriangleImpl(
     const Rect3D& bounds,

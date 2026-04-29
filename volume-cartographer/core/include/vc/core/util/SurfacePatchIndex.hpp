@@ -56,6 +56,15 @@ public:
         std::function<bool(const PatchBounds&)> patchFilter;
     };
 
+    struct RayQuery {
+        cv::Vec3f src = {0, 0, 0};
+        cv::Vec3f end = {0, 0, 0};
+        float minT = 0.0f;
+        float bboxPadding = 0.0f;
+        SurfacePtr targetSurface;
+        const std::unordered_set<SurfacePtr>* targetSurfaces = nullptr;
+    };
+
     SurfacePatchIndex();
     ~SurfacePatchIndex();
 
@@ -93,6 +102,8 @@ public:
                            const SurfacePtr& targetSurface = nullptr) const;
 
     void forEachTriangle(const TriangleQuery& query,
+                         const std::function<void(const TriangleCandidate&)>& visitor) const;
+    void forEachTriangle(const RayQuery& query,
                          const std::function<void(const TriangleCandidate&)>& visitor) const;
 
     static std::optional<TriangleSegment> clipTriangleToPlane(const TriangleCandidate& tri,
