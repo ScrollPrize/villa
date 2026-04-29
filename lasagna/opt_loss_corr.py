@@ -628,29 +628,34 @@ def _wind_brute_force_init(
 	target = _wind_collection_average(winding_obs, winda, col, obs_valid, is_absolute)
 
 	# --- Avg pair anchors from target winding ---
+	# Honor the actual target value: no clamping, no rounding.  Three regimes:
+	#   inside  (0 <= target <= D-1): two anchors at floor(target), floor(target)+1
+	#   below   (target < 0):         one-sided, anchor on layer 0
+	#   above   (target > D-1):       one-sided, anchor on layer D-1
 	target_finite = torch.isfinite(target)
-	# Replace NaN with 0 before floor/long to avoid garbage integers
 	target_safe = torch.where(target_finite, target, torch.zeros_like(target))
-	avg_lo_d = target_safe.floor().clamp(0, max(D - 2, 0)).long()
-	avg_hi_d = (avg_lo_d + 1).clamp(max=D - 1)
+	inside = target_finite & (target_safe >= 0.0) & (target_safe <= float(D - 1))
+	below = target_finite & (target_safe < 0.0)
+	above = target_finite & (target_safe > float(D - 1))
 
-	# Find quads on avg layers — only valid if point projects within quad (u,v in [0,1])
+	floor_t = target_safe.floor().long()
+	layer_lo = torch.where(below, torch.zeros_like(floor_t), floor_t)
+	layer_hi = torch.where(above, torch.full_like(floor_t, D - 1), floor_t + 1)
+
 	if target_finite.any():
-		# avg_low
-		al_h, al_w, al_u, al_v = _wind_nearest_quad_on_layer(P, gt_n, xyz_det, avg_lo_d, Qh, Qw)
+		al_h, al_w, al_u, al_v = _wind_nearest_quad_on_layer(P, gt_n, xyz_det, layer_lo, Qh, Qw)
 		al_in_quad = (al_u >= 0) & (al_u <= 1) & (al_v >= 0) & (al_v <= 1)
-		anchors_d[:, 2] = avg_lo_d
+		anchors_d[:, 2] = layer_lo
 		anchors_h[:, 2] = al_h
 		anchors_w[:, 2] = al_w
-		anchors_valid[:, 2] = target_finite & (avg_lo_d >= 0) & (avg_lo_d < D) & al_in_quad
+		anchors_valid[:, 2] = (inside | below) & al_in_quad & (layer_lo >= 0) & (layer_lo < D)
 
-		# avg_up — only valid if it's a different layer from avg_lo (requires D >= 2)
-		ah_h, ah_w, ah_u, ah_v = _wind_nearest_quad_on_layer(P, gt_n, xyz_det, avg_hi_d, Qh, Qw)
+		ah_h, ah_w, ah_u, ah_v = _wind_nearest_quad_on_layer(P, gt_n, xyz_det, layer_hi, Qh, Qw)
 		ah_in_quad = (ah_u >= 0) & (ah_u <= 1) & (ah_v >= 0) & (ah_v <= 1)
-		anchors_d[:, 3] = avg_hi_d
+		anchors_d[:, 3] = layer_hi
 		anchors_h[:, 3] = ah_h
 		anchors_w[:, 3] = ah_w
-		anchors_valid[:, 3] = target_finite & (avg_hi_d > avg_lo_d) & ah_in_quad
+		anchors_valid[:, 3] = (inside | above) & ah_in_quad & (layer_hi >= 0) & (layer_hi < D)
 
 	return anchors_d, anchors_h, anchors_w, anchors_valid, target, winding_obs
 
@@ -752,16 +757,22 @@ def _wind_update_anchors(
 			anchors_valid[lost, 0] = False
 			anchors_valid[lost, 1] = False
 
-	# --- Update avg pair depth layers if target changed ---
+	# --- Update avg pair depth layers if target changed (regime-aware, no clamp) ---
 	target_finite = torch.isfinite(target)
 	target_safe = torch.where(target_finite, target, torch.zeros_like(target))
-	new_avg_lo_d = target_safe.floor().clamp(0, max(D - 2, 0)).long()
-	new_avg_hi_d = (new_avg_lo_d + 1).clamp(max=D - 1)
-	anchors_d[:, 2] = new_avg_lo_d
-	anchors_d[:, 3] = new_avg_hi_d
-	# Invalidate avg anchors where target is not finite or layer out of range
-	anchors_valid[:, 2] = anchors_valid[:, 2] & target_finite & (new_avg_lo_d >= 0) & (new_avg_lo_d < D)
-	anchors_valid[:, 3] = anchors_valid[:, 3] & target_finite & (new_avg_hi_d > new_avg_lo_d)
+	inside = target_finite & (target_safe >= 0.0) & (target_safe <= float(D - 1))
+	below = target_finite & (target_safe < 0.0)
+	above = target_finite & (target_safe > float(D - 1))
+
+	floor_t = target_safe.floor().long()
+	new_layer_lo = torch.where(below, torch.zeros_like(floor_t), floor_t)
+	new_layer_hi = torch.where(above, torch.full_like(floor_t, D - 1), floor_t + 1)
+	anchors_d[:, 2] = new_layer_lo
+	anchors_d[:, 3] = new_layer_hi
+	# ci=2 active for inside | below; ci=3 active for inside | above.  Layer-range gate
+	# also invalidates the inactive slot whose layer index can fall outside [0, D).
+	anchors_valid[:, 2] = anchors_valid[:, 2] & (inside | below) & (new_layer_lo >= 0) & (new_layer_lo < D)
+	anchors_valid[:, 3] = anchors_valid[:, 3] & (inside | above) & (new_layer_hi >= 0) & (new_layer_hi < D)
 
 	return anchors_h, anchors_w, anchors_valid
 
@@ -951,14 +962,23 @@ def _corr_winding_loss(
 		z = torch.zeros((), device=dev, dtype=dt)
 		return z, (torch.zeros((1,), device=dev, dtype=dt),), (torch.zeros((1,), device=dev, dtype=dt),)
 
-	frac = (target - _wind_anchors_d[:, 2].to(dt)).clamp(0.0, 1.0)
+	# Regime classification — must match _wind_brute_force_init / _wind_update_anchors.
+	target_safe = torch.where(target_finite, target, torch.zeros_like(target))
+	inside_t = target_finite & (target_safe >= 0.0) & (target_safe <= float(D - 1))
+
+	# Per-anchor blend weight:
+	#   inside-mesh: smooth lerp between layer_lo and layer_hi (frac ∈ [0,1] by construction)
+	#   one-sided  : full weight 1 on the single active anchor.
+	frac_lo = target_safe - _wind_anchors_d[:, 2].to(dt)              # = target - layer_lo
+	frac_hi = target_safe - (_wind_anchors_d[:, 3].to(dt) - 1.0)      # = target - (layer_hi - 1)
+	ones_t = torch.ones_like(target_safe)
+	frac_weight = {
+		2: torch.where(inside_t, 1.0 - frac_lo, ones_t),
+		3: torch.where(inside_t, frac_hi,        ones_t),
+	}
 
 	all_err = torch.zeros(K, device=dev, dtype=dt)
 	all_too_far = torch.zeros(K, dtype=torch.bool, device=dev)
-
-	# Per-surface frac weight: tgt_lo (ci=2) gets 1-frac, tgt_hi (ci=3) gets frac.
-	# Integer targets naturally zero out the second surface.
-	frac_weight = {2: (1.0 - frac), 3: frac}
 
 	# Shared scalar height map and weight accumulator across both ci=2 and ci=3 splats.
 	# H_map carries signed-delta contributions; W_map carries Gaussian × soft-mask weights.
@@ -967,7 +987,7 @@ def _corr_winding_loss(
 
 	# Per-corr-point detached pipeline for each ci, then splat into the shared height map.
 	with torch.no_grad():
-		for ci, tgt_fn in [(2, lambda f: -f), (3, lambda f: 1.0 - f)]:
+		for ci in [2, 3]:
 			valid = _wind_anchors_valid[:, ci] & target_finite
 			if not valid.any():
 				continue
@@ -985,17 +1005,21 @@ def _corr_winding_loss(
 			u_ci, v_ci, ib = _ray_quad_intersect(P[vi], gt_n[vi], M00_det, M10_det, M01_det, M11_det)
 			Q_det = _bilinear_interp(M00_det, M10_det, M01_det, M11_det, u_ci, v_ci)
 
-			# Strip integral → signed winding and validity
+			# Strip integral → signed winding and validity.  tgt = layer_d − target lets the
+			# same formula serve inside-mesh (frac ∈ [0,1]) AND one-sided (signed offset to
+			# the boundary layer); no clamps.
 			sw, uw, sv = _wind_strip_integral(P[vi], Q_det, gt_n[vi], res.data, strip_samples)
-			tgt = tgt_fn(frac[vi])
+			layer_d = d_ci.to(dt)
+			tgt = layer_d - target[vi]
 			err = sw - tgt
 
-			# Single-sided cutoff (same logic as before)
+			# Single-sided cutoff: kept universal.  Far-out one-sided anchors are
+			# invalidated, not silently clamped onto the boundary surface.
 			is_bracketed = _wind_anchors_valid[vi, 0] & _wind_anchors_valid[vi, 1]
 			too_far = ~is_bracketed & (uw > 2.0)
 			all_too_far[vi] |= too_far
 
-			# Track per-point error for reporting (frac-weighted, same as before)
+			# Track per-point error for reporting (blend-weighted across the two anchors)
 			fw_ci = frac_weight[ci][vi]
 			all_err[vi] += err * fw_ci
 
