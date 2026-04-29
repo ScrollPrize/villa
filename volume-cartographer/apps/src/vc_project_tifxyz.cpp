@@ -1304,7 +1304,7 @@ int main(int argc, char** argv)
                     SurfacePatchIndex::PointQuery query;
                     query.worldPoint = hit.point;
                     query.tolerance = cfg.sameWrapTolerance;
-                    query.targetSurface = src;
+                    query.surfaces.only = src;
                     return sourceIndex.locate(query).has_value();
                 }), hits.end());
                 sameWrapDiscarded.fetch_add(before - hits.size(), std::memory_order_relaxed);
@@ -1319,7 +1319,7 @@ int main(int argc, char** argv)
                 selfQuery.end = selfEnd;
                 selfQuery.minT = cfg.minDistance;
                 selfQuery.bboxPadding = cfg.bboxPadding;
-                selfQuery.targetSurface = src;
+                selfQuery.surfaces.only = src;
                 sourceIndex.forEachTriangle(
                     selfQuery,
                     [&](const SurfacePatchIndex::TriangleCandidate& tri) {

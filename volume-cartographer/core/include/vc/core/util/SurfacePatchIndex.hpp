@@ -49,19 +49,22 @@ public:
         cv::Vec3f high = {0, 0, 0};
     };
 
+    struct SurfaceFilter {
+        SurfacePtr only;
+        const std::unordered_set<SurfacePtr>* include = nullptr;
+        const std::unordered_set<SurfacePtr>* exclude = nullptr;
+    };
+
     struct TriangleQuery {
         Rect3D bounds;
-        SurfacePtr targetSurface;
-        const std::unordered_set<SurfacePtr>* targetSurfaces = nullptr;
+        SurfaceFilter surfaces;
         std::function<bool(const PatchBounds&)> patchFilter;
     };
 
     struct PointQuery {
         cv::Vec3f worldPoint = {0, 0, 0};
         float tolerance = 0.0f;
-        SurfacePtr targetSurface;
-        const std::unordered_set<SurfacePtr>* targetSurfaces = nullptr;
-        const std::unordered_set<const QuadSurface*>* excludedSurfaces = nullptr;
+        SurfaceFilter surfaces;
     };
 
     struct RayQuery {
@@ -69,8 +72,7 @@ public:
         cv::Vec3f end = {0, 0, 0};
         float minT = 0.0f;
         float bboxPadding = 0.0f;
-        SurfacePtr targetSurface;
-        const std::unordered_set<SurfacePtr>* targetSurfaces = nullptr;
+        SurfaceFilter surfaces;
     };
 
     SurfacePatchIndex();
@@ -99,8 +101,7 @@ public:
 
     std::optional<LookupResult> locate(const PointQuery& query) const;
     std::vector<LookupResult> locateAll(const PointQuery& query) const;
-    void locateSurfaceHits(const PointQuery& query,
-                           std::vector<const QuadSurface*>& outSurfaces) const;
+    std::vector<SurfacePtr> locateSurfaces(const PointQuery& query) const;
 
     void forEachTriangle(const TriangleQuery& query,
                          const std::function<void(const TriangleCandidate&)>& visitor) const;
@@ -154,8 +155,7 @@ private:
 
     template <typename Visitor, typename PatchFilter = NoPatchFilter>
     void forEachTriangleImpl(const Rect3D& bounds,
-                             const SurfacePtr& targetSurface,
-                             const std::unordered_set<SurfacePtr>* filterSurfaces,
+                             const SurfaceFilter& surfaces,
                              Visitor&& visitor,
                              PatchFilter&& patchFilter = NoPatchFilter{}) const;
 

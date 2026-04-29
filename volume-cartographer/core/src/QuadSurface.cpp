@@ -1101,7 +1101,7 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
         SurfacePatchIndex::PointQuery query;
         query.worldPoint = tgt;
         query.tolerance = th;
-        query.targetSurface = targetSurface;
+        query.surfaces.only = targetSurface;
         if (auto hit = surfaceIndex->locate(query)) {
             ptr = hit->ptr;
             return hit->distance;

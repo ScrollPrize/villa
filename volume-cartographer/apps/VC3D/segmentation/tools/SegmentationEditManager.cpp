@@ -451,7 +451,7 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
     SurfacePatchIndex::PointQuery query;
     query.worldPoint = worldPos;
     query.tolerance = locateTolerance;
-    query.targetSurface = _baseSurface;
+    query.surfaces.only = _baseSurface;
     auto hit = patchIndex->locate(query);
     if (!hit) {
         if (warnOnFailure) {

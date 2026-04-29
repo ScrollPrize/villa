@@ -173,6 +173,55 @@ inline bool isValidBounds(const cv::Vec3f& low, const cv::Vec3f& high) noexcept
         && low[0] <= high[0] && low[1] <= high[1] && low[2] <= high[2];
 }
 
+struct RawSurfaceFilter {
+    QuadSurface* only = nullptr;
+    bool hasInclude = false;
+    bool rejectAllIncludes = false;
+    std::unordered_set<QuadSurface*> include;
+    std::unordered_set<QuadSurface*> exclude;
+
+    bool accepts(QuadSurface* surface) const
+    {
+        if (!surface || (only && surface != only)) {
+            return false;
+        }
+        if (hasInclude) {
+            if (rejectAllIncludes || include.find(surface) == include.end()) {
+                return false;
+            }
+        }
+        return exclude.find(surface) == exclude.end();
+    }
+};
+
+RawSurfaceFilter makeRawSurfaceFilter(const SurfacePatchIndex::SurfaceFilter& filter)
+{
+    RawSurfaceFilter raw;
+    raw.only = filter.only ? filter.only.get() : nullptr;
+
+    if (filter.include) {
+        raw.hasInclude = true;
+        raw.include.reserve(filter.include->size());
+        for (const auto& surface : *filter.include) {
+            if (surface) {
+                raw.include.insert(surface.get());
+            }
+        }
+        raw.rejectAllIncludes = raw.include.empty();
+    }
+
+    if (filter.exclude) {
+        raw.exclude.reserve(filter.exclude->size());
+        for (const auto& surface : *filter.exclude) {
+            if (surface) {
+                raw.exclude.insert(surface.get());
+            }
+        }
+    }
+
+    return raw;
+}
+
 class FileMapping {
 public:
     FileMapping() = default;
@@ -1079,7 +1128,6 @@ std::string SurfacePatchIndex::cacheKeyForSurfaces(const std::vector<SurfacePtr>
             hash_path_identity(h, base / "x.tif");
             hash_path_identity(h, base / "y.tif");
             hash_path_identity(h, base / "z.tif");
-            hash_path_identity(h, base / "overlapping.json");
         }
     }
 
@@ -1732,18 +1780,9 @@ SurfacePatchIndex::locate(const PointQuery& pointQuery) const
     Impl::Box3 query(min_pt, max_pt);
 
     const float toleranceSq = tol * tol;
-    QuadSurface* const targetRaw = pointQuery.targetSurface ? pointQuery.targetSurface.get() : nullptr;
-    std::unordered_set<QuadSurface*> filterSurfaceRaw;
-    if (pointQuery.targetSurfaces) {
-        filterSurfaceRaw.reserve(pointQuery.targetSurfaces->size());
-        for (const auto& surface : *pointQuery.targetSurfaces) {
-            if (surface) {
-                filterSurfaceRaw.insert(surface.get());
-            }
-        }
-        if (filterSurfaceRaw.empty()) {
-            return std::nullopt;
-        }
+    const RawSurfaceFilter surfaceFilter = makeRawSurfaceFilter(pointQuery.surfaces);
+    if (surfaceFilter.rejectAllIncludes) {
+        return std::nullopt;
     }
     SurfacePatchIndex::LookupResult best;
     QuadSurface* bestSurfaceRaw = nullptr;
@@ -1767,9 +1806,7 @@ SurfacePatchIndex::locate(const PointQuery& pointQuery) const
 
     auto processEntry = [&](const Impl::Entry& entry) {
         const Impl::PatchRecord& rec = entry.second;
-        if ((targetRaw && rec.surface != targetRaw) ||
-            (pointQuery.targetSurfaces && filterSurfaceRaw.find(rec.surface) == filterSurfaceRaw.end()) ||
-            (pointQuery.excludedSurfaces && pointQuery.excludedSurfaces->count(rec.surface))) {
+        if (!surfaceFilter.accepts(rec.surface)) {
             return;
         }
 
@@ -1837,18 +1874,9 @@ SurfacePatchIndex::locateAll(const PointQuery& pointQuery) const
     Impl::Box3 query(min_pt, max_pt);
 
     const float toleranceSq = tol * tol;
-    QuadSurface* const targetRaw = pointQuery.targetSurface ? pointQuery.targetSurface.get() : nullptr;
-    std::unordered_set<QuadSurface*> filterSurfaceRaw;
-    if (pointQuery.targetSurfaces) {
-        filterSurfaceRaw.reserve(pointQuery.targetSurfaces->size());
-        for (const auto& surface : *pointQuery.targetSurfaces) {
-            if (surface) {
-                filterSurfaceRaw.insert(surface.get());
-            }
-        }
-        if (filterSurfaceRaw.empty()) {
-            return {};
-        }
+    const RawSurfaceFilter surfaceFilter = makeRawSurfaceFilter(pointQuery.surfaces);
+    if (surfaceFilter.rejectAllIncludes) {
+        return {};
     }
 
     struct SurfaceInfo {
@@ -1876,9 +1904,7 @@ SurfacePatchIndex::locateAll(const PointQuery& pointQuery) const
 
     auto processEntry = [&](const Impl::Entry& entry) {
         const Impl::PatchRecord& rec = entry.second;
-        if ((targetRaw && rec.surface != targetRaw) ||
-            (pointQuery.targetSurfaces && filterSurfaceRaw.find(rec.surface) == filterSurfaceRaw.end()) ||
-            (pointQuery.excludedSurfaces && pointQuery.excludedSurfaces->count(rec.surface))) {
+        if (!surfaceFilter.accepts(rec.surface)) {
             return;
         }
 
@@ -1930,16 +1956,13 @@ SurfacePatchIndex::locateAll(const PointQuery& pointQuery) const
     return results;
 }
 
-void SurfacePatchIndex::locateSurfaceHits(
-    const PointQuery& pointQuery,
-    std::vector<const QuadSurface*>& outSurfaces) const
+std::vector<SurfacePatchIndex::SurfacePtr>
+SurfacePatchIndex::locateSurfaces(const PointQuery& pointQuery) const
 {
-    outSurfaces.clear();
-
     std::shared_lock<std::shared_mutex> lock(mutex_);
     if (!impl_ || !impl_->tree || pointQuery.tolerance <= 0.0f ||
         !isFinitePoint(pointQuery.worldPoint)) {
-        return;
+        return {};
     }
 
     const float tol = std::max(pointQuery.tolerance, 0.0f);
@@ -1951,31 +1974,19 @@ void SurfacePatchIndex::locateSurfaceHits(
                         pointQuery.worldPoint[2] + tol);
     Impl::Box3 query(min_pt, max_pt);
     const float toleranceSq = tol * tol;
-    QuadSurface* const targetRaw = pointQuery.targetSurface ? pointQuery.targetSurface.get() : nullptr;
-    std::unordered_set<QuadSurface*> filterSurfaceRaw;
-    if (pointQuery.targetSurfaces) {
-        filterSurfaceRaw.reserve(pointQuery.targetSurfaces->size());
-        for (const auto& surface : *pointQuery.targetSurfaces) {
-            if (surface) {
-                filterSurfaceRaw.insert(surface.get());
-            }
-        }
-        if (filterSurfaceRaw.empty()) {
-            return;
-        }
+    const RawSurfaceFilter surfaceFilter = makeRawSurfaceFilter(pointQuery.surfaces);
+    if (surfaceFilter.rejectAllIncludes) {
+        return {};
     }
 
-    auto alreadyOutput = [&](const QuadSurface* surface) {
-        return std::any_of(outSurfaces.begin(), outSurfaces.end(),
-                           [&](const QuadSurface* existing) { return existing == surface; });
-    };
+    std::vector<SurfacePtr> surfaces;
+    surfaces.reserve(8);
+    std::unordered_set<QuadSurface*> emitted;
+    emitted.reserve(8);
 
     auto processEntry = [&](const Impl::Entry& entry) {
         const Impl::PatchRecord& rec = entry.second;
-        if ((targetRaw && rec.surface != targetRaw) ||
-            (pointQuery.targetSurfaces && filterSurfaceRaw.find(rec.surface) == filterSurfaceRaw.end()) ||
-            (pointQuery.excludedSurfaces && pointQuery.excludedSurfaces->count(rec.surface)) ||
-            alreadyOutput(rec.surface)) {
+        if (!surfaceFilter.accepts(rec.surface) || emitted.find(rec.surface) != emitted.end()) {
             return;
         }
 
@@ -1985,7 +1996,12 @@ void SurfacePatchIndex::locateSurfaceHits(
             return;
         }
 
-        outSurfaces.push_back(rec.surface);
+        auto srIt = impl_->surfaceRecords.find(rec.surface);
+        if (srIt == impl_->surfaceRecords.end()) {
+            return;
+        }
+        emitted.insert(rec.surface);
+        surfaces.push_back(srIt->second.surface);
     };
 
     try {
@@ -1993,14 +2009,16 @@ void SurfacePatchIndex::locateSurfaceHits(
             bgi::intersects(query),
             boost::make_function_output_iterator(processEntry));
     } catch (const std::exception& e) {
-        std::cerr << "[SurfacePatchIndex] locateSurfaceHits query failed: "
+        std::cerr << "[SurfacePatchIndex] locateSurfaces query failed: "
                   << e.what() << std::endl;
-        outSurfaces.clear();
+        return {};
     } catch (...) {
-        std::cerr << "[SurfacePatchIndex] locateSurfaceHits query failed: unknown exception"
+        std::cerr << "[SurfacePatchIndex] locateSurfaces query failed: unknown exception"
                   << std::endl;
-        outSurfaces.clear();
+        return {};
     }
+
+    return surfaces;
 }
 
 void SurfacePatchIndex::forEachTriangle(
@@ -2027,8 +2045,7 @@ void SurfacePatchIndex::forEachTriangle(
     };
 
     forEachTriangleImpl(query.bounds,
-                        query.targetSurface,
-                        query.targetSurfaces,
+                        query.surfaces,
                         visitor,
                         patchFilter);
 }
@@ -2057,8 +2074,7 @@ void SurfacePatchIndex::forEachTriangle(
 
     TriangleQuery triangleQuery;
     triangleQuery.bounds = bounds;
-    triangleQuery.targetSurface = query.targetSurface;
-    triangleQuery.targetSurfaces = query.targetSurfaces;
+    triangleQuery.surfaces = query.surfaces;
     triangleQuery.patchFilter = [src = query.src, dir, minT = query.minT, maxT](
         const PatchBounds& patchBounds) {
         float t0 = minT;
@@ -2093,8 +2109,7 @@ void SurfacePatchIndex::forEachTriangle(
 template <typename Visitor, typename PatchFilter>
 void SurfacePatchIndex::forEachTriangleImpl(
     const Rect3D& bounds,
-    const SurfacePtr& targetSurface,
-    const std::unordered_set<SurfacePtr>* filterSurfaces,
+    const SurfaceFilter& surfaces,
     Visitor&& visitor,
     PatchFilter&& patchFilter) const
 {
@@ -2120,27 +2135,16 @@ void SurfacePatchIndex::forEachTriangleImpl(
     };
     std::unordered_map<QuadSurface*, SurfaceCache> surfaceCacheMap;
     surfaceCacheMap.reserve(std::min<std::size_t>(
-        filterSurfaces ? filterSurfaces->size() : 4, 4096));
+        surfaces.include ? surfaces.include->size() : 4, 4096));
 
-    std::unordered_set<QuadSurface*> filterSurfaceRaw;
-    if (filterSurfaces) {
-        filterSurfaceRaw.reserve(filterSurfaces->size());
-        for (const auto& surface : *filterSurfaces) {
-            if (surface) {
-                filterSurfaceRaw.insert(surface.get());
-            }
-        }
-        if (filterSurfaceRaw.empty()) {
-            return;
-        }
+    const RawSurfaceFilter surfaceFilter = makeRawSurfaceFilter(surfaces);
+    if (surfaceFilter.rejectAllIncludes) {
+        return;
     }
 
     auto emitFromPatch = [&](const Impl::Entry& entry) {
         const Impl::PatchRecord& rec = entry.second;
-        if (targetSurface && rec.surface != targetSurface.get()) {
-            return;
-        }
-        if (filterSurfaces && filterSurfaceRaw.find(rec.surface) == filterSurfaceRaw.end()) {
+        if (!surfaceFilter.accepts(rec.surface)) {
             return;
         }
         // Optional caller-supplied bbox-level reject (e.g. plane-vs-bbox).
@@ -3273,7 +3277,9 @@ SurfacePatchIndex::computePlaneIntersections(
     // against the plane right there and append the resulting segment to
     // the per-surface bucket. Skips the intermediate TriangleCandidate
     // vector and the bySurface grouping pass entirely.
-    forEachTriangleImpl(viewBbox, nullptr, &targets,
+    SurfaceFilter surfaceFilter;
+    surfaceFilter.include = &targets;
+    forEachTriangleImpl(viewBbox, surfaceFilter,
         [&](const TriangleCandidate& tri) {
             auto seg = clipTriangleToPlane(tri, plane, clipTolerance);
             if (!seg) return;

@@ -2658,7 +2658,7 @@ void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<S
             std::vector<QPainterPath> paths(planeSurfs.size());
             SurfacePatchIndex::TriangleQuery query;
             query.bounds = allBounds;
-            query.targetSurface = activeSeg;
+            query.surfaces.only = activeSeg;
             patchIndex->forEachTriangle(query,
                 [&](const SurfacePatchIndex::TriangleCandidate& tri) {
                     for (size_t idx = 0; idx < planeSurfs.size(); ++idx) {

@@ -2614,7 +2614,7 @@ void CWindow::recenterSegmentationViewerNear(const cv::Vec3f& position)
     SurfacePatchIndex::PointQuery query;
     query.worldPoint = position;
     query.tolerance = kMaxDistanceVoxels;
-    query.targetSurface = activeSurface;
+    query.surfaces.only = activeSurface;
     auto hit = patchIndex->locate(query);
     if (hit && hit->distance <= kMaxDistanceVoxels) {
         const cv::Vec3f loc = activeSurface->loc(hit->ptr);

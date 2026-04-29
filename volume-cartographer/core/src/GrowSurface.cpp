@@ -31,6 +31,7 @@
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -106,17 +107,7 @@ static bool looks_like_resume_surface(const QuadSurface* surf, const nlohmann::j
     return false;
 }
 
-using SurfaceOverlaps = std::unordered_map<QuadSurface*, std::set<QuadSurface*>>;
 using Umbilicus = vc::core::util::Umbilicus;
-
-static const std::set<QuadSurface*>& surface_overlaps(const SurfaceOverlaps* overlaps, QuadSurface* surf)
-{
-    static const std::set<QuadSurface*> empty;
-    if (!overlaps)
-        return empty;
-    auto it = overlaps->find(surf);
-    return it == overlaps->end() ? empty : it->second;
-}
 
 static cv::Vec3i volume_shape_from_params(const nlohmann::json& params)
 {
@@ -479,46 +470,65 @@ static void copy(const SurfTrackerData &src, SurfTrackerData &tgt, const cv::Rec
     // tgt.seed_coord = src.seed_coord;
 }
 
-static void add_surface_if_close(QuadSurface* surf,
-                                 const cv::Vec2i& p,
-                                 const cv::Vec3d& coord,
-                                 SurfTrackerData& data,
-                                 SurfacePatchIndex* surface_patch_index)
+static std::set<QuadSurface*> surface_patch_candidates(SurfacePatchIndex* surface_patch_index,
+                                                       const cv::Vec3d& coord,
+                                                       QuadSurface* exclude = nullptr)
 {
-    if (!surf || data.has(surf, p)) {
-        return;
+    std::set<QuadSurface*> candidates;
+    if (!surface_patch_index || surface_patch_index->empty() || coord[0] == -1) {
+        return candidates;
     }
 
-    auto ptr = surf->pointer();
-    const cv::Vec3f coord_f{
+    SurfacePatchIndex::PointQuery query;
+    query.worldPoint = {
         static_cast<float>(coord[0]),
         static_cast<float>(coord[1]),
         static_cast<float>(coord[2])
     };
+    query.tolerance = same_surface_th;
 
-    if (surface_patch_index && !surface_patch_index->empty()) {
-        SurfacePatchIndex::SurfacePtr target_surface(surf, [](QuadSurface*) {});
-        SurfacePatchIndex::PointQuery query;
-        query.worldPoint = coord_f;
-        query.tolerance = same_surface_th;
-        query.targetSurface = target_surface;
-        auto hit = surface_patch_index->locate(query);
-        if (!hit) {
-            return;
-        }
-        ptr = hit->ptr;
-    } else {
-        if (surf->pointTo(ptr, coord_f, same_surface_th, 10) > same_surface_th) {
-            return;
+    for (const auto& surface : surface_patch_index->locateSurfaces(query)) {
+        QuadSurface* raw = surface.get();
+        if (raw && raw != exclude) {
+            candidates.insert(raw);
         }
     }
+    return candidates;
+}
 
-    const cv::Vec3f loc = surf->loc_raw(ptr);
-    if (SurfTrackerData::lookup_int_loc(surf, {loc[1], loc[0]})[0] == -1) {
-        return;
+static int add_surface_patch_candidates(const cv::Vec2i& p,
+                                        const cv::Vec3d& coord,
+                                        SurfTrackerData& data,
+                                        SurfacePatchIndex* surface_patch_index,
+                                        QuadSurface* exclude = nullptr)
+{
+    if (!surface_patch_index || surface_patch_index->empty() || coord[0] == -1) {
+        return 0;
     }
-    data.surfs(p).insert(surf);
-    data.loc(surf, p) = {loc[1], loc[0]};
+
+    SurfacePatchIndex::PointQuery query;
+    query.worldPoint = {
+        static_cast<float>(coord[0]),
+        static_cast<float>(coord[1]),
+        static_cast<float>(coord[2])
+    };
+    query.tolerance = same_surface_th;
+
+    int added = 0;
+    for (const auto& hit : surface_patch_index->locateAll(query)) {
+        QuadSurface* surf = hit.surface.get();
+        if (!surf || surf == exclude || data.has(surf, p)) {
+            continue;
+        }
+        const cv::Vec3f loc = surf->loc_raw(hit.ptr);
+        if (SurfTrackerData::lookup_int_loc(surf, {loc[1], loc[0]})[0] == -1) {
+            continue;
+        }
+        data.surfs(p).insert(surf);
+        data.loc(surf, p) = {loc[1], loc[0]};
+        ++added;
+    }
+    return added;
 }
 
 static int add_surftrack_distloss(QuadSurface *sm, const cv::Vec2i &p, const cv::Vec2i &off, SurfTrackerData &data,
@@ -1391,7 +1401,6 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     cv::Rect static_bounds, float step, float src_step, const cv::Vec2i &seed, int closing_r, bool keep_inpainted = false,
     const std::filesystem::path& tgt_dir = std::filesystem::path(),
     SurfacePatchIndex* surface_patch_index = nullptr,
-    const SurfaceOverlaps* overlaps = nullptr,
     bool debug_images = false)
 {
     std::cout << "optimizer: optimizing surface " << state.size() << " " << used_area <<  " " << static_bounds << std::endl;
@@ -1639,10 +1648,9 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                 if (!static_bounds.contains(cv::Point(i,j)) && state_out(j,i) & STATE_LOC_VALID && (fringe(j, i) || fringe_next(j, i))) {
                     mutex.lock_shared();
                     std::set<QuadSurface *> surf_cands = data_out.surfs({j,i});
-                    for(auto s : data_out.surfs({j,i}))
-                        surf_cands.insert(surface_overlaps(overlaps, s).begin(),
-                                          surface_overlaps(overlaps, s).end());
                     mutex.unlock();
+                    auto patch_cands = surface_patch_candidates(surface_patch_index, points_out(j, i));
+                    surf_cands.insert(patch_cands.begin(), patch_cands.end());
 
                     for(auto test_surf : surf_cands) {
                         mutex.lock_shared();
@@ -1738,7 +1746,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::filesystem::path tgt_dir = params["tgt_dir"].get<std::string>();
 
     std::unordered_map<std::string,QuadSurface *> surfs;
-    SurfaceOverlaps overlaps;
     float src_step = params.value("src_step", 20);
     float step = params.value("step", 10);
     int max_width = params.value("max_width", 80000);
@@ -1879,18 +1886,12 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     for(auto sm : approved_sm)
         std::cout << "approved: " << surface_name(sm) << std::endl;
 
-    for(auto &sm : surfs_v)
-        for(const auto& name : sm->overlappingIds())
-            if (surfs.contains(name))
-                overlaps[sm].insert(surfs[name]);
-
     std::cout << "total surface count (after defective filter): " << surfs.size() << std::endl;
-    std::cout << "seed " << seed << " name " << surface_name(seed) << " seed overlapping: "
-              << surface_overlaps(&overlaps, seed).size() << "/" << seed->overlappingIds().size() << std::endl;
+    std::cout << "seed " << seed << " name " << surface_name(seed) << std::endl;
 
     SurfacePatchIndex surface_patch_index;
     SurfacePatchIndex* surface_patch_index_ptr = external_surface_patch_index;
-    if (use_patch_cache && !surface_patch_index_ptr) {
+    if (!surface_patch_index_ptr) {
         std::vector<SurfacePatchIndex::SurfacePtr> patch_surfaces;
         std::set<QuadSurface*> indexed_surfaces;
         patch_surfaces.reserve(surfs.size() + 1);
@@ -1912,30 +1913,34 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         std::string cache_key;
         cache_key = SurfacePatchIndex::cacheKeyForSurfaces(
             patch_surfaces, surface_patch_index.samplingStride(), 0.0f);
-        cache_path = surface_patch_cache_dir / ("surface_patch_index_" + cache_key + ".bin");
-        const auto cache_load_start = std::chrono::steady_clock::now();
-        cache_hit = surface_patch_index.loadCache(cache_path, patch_surfaces, cache_key);
-        const double cache_load_elapsed = std::chrono::duration<double>(
-            std::chrono::steady_clock::now() - cache_load_start).count();
-        std::cout << "SurfacePatchIndex cache "
-                  << (cache_hit ? "hit" : "miss")
-                  << " key=" << cache_key
-                  << " time=" << cache_load_elapsed << "s"
-                  << " path=" << cache_path << std::endl;
+        if (use_patch_cache) {
+            cache_path = surface_patch_cache_dir / ("surface_patch_index_" + cache_key + ".bin");
+            const auto cache_load_start = std::chrono::steady_clock::now();
+            cache_hit = surface_patch_index.loadCache(cache_path, patch_surfaces, cache_key);
+            const double cache_load_elapsed = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - cache_load_start).count();
+            std::cout << "SurfacePatchIndex cache "
+                      << (cache_hit ? "hit" : "miss")
+                      << " key=" << cache_key
+                      << " time=" << cache_load_elapsed << "s"
+                      << " path=" << cache_path << std::endl;
+        }
         if (!cache_hit) {
             const auto rebuild_start = std::chrono::steady_clock::now();
             surface_patch_index.rebuild(patch_surfaces, 0.0f);
             const double rebuild_elapsed = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - rebuild_start).count();
             std::cout << "SurfacePatchIndex rebuild time=" << rebuild_elapsed << "s" << std::endl;
-            const auto cache_save_start = std::chrono::steady_clock::now();
-            const bool saved = surface_patch_index.saveCache(cache_path, cache_key);
-            const double cache_save_elapsed = std::chrono::duration<double>(
-                std::chrono::steady_clock::now() - cache_save_start).count();
-            std::cout << "SurfacePatchIndex cache save "
-                      << (saved ? "ok" : "failed")
-                      << " time=" << cache_save_elapsed << "s"
-                      << " path=" << cache_path << std::endl;
+            if (use_patch_cache) {
+                const auto cache_save_start = std::chrono::steady_clock::now();
+                const bool saved = surface_patch_index.saveCache(cache_path, cache_key);
+                const double cache_save_elapsed = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - cache_save_start).count();
+                std::cout << "SurfacePatchIndex cache save "
+                          << (saved ? "ok" : "failed")
+                          << " time=" << cache_save_elapsed << "s"
+                          << " path=" << cache_path << std::endl;
+            }
         }
         surface_patch_index_ptr = &surface_patch_index;
         std::cout << "SurfacePatchIndex built for " << patch_surfaces.size()
@@ -2194,17 +2199,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             data.seed_coord = points(first_valid);
             initialized_from_resume = true;
 
-            std::set<QuadSurface*> resume_candidates = surface_overlaps(&overlaps, seed);
-            if (surface_patch_index_ptr || resume_candidates.empty()) {
-                for (const auto& [_, sm] : surfs) {
-                    if (sm && sm != seed) {
-                        resume_candidates.insert(sm);
-                    }
-                }
-            }
-
             int fringe_count = 0;
-            int discovered_overlap_count = 0;
+            int discovered_patch_ref_count = 0;
             for (int j = std::max(0, used_area.y - 1); j <= std::min(used_area.br().y + 1, state.rows - 1); ++j) {
                 for (int i = std::max(0, used_area.x - 1); i <= std::min(used_area.br().x + 1, state.cols - 1); ++i) {
                     const cv::Vec2i p(j, i);
@@ -2226,47 +2222,34 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
                     fringe.insert(p);
                     fringe_count++;
-                    const std::size_t before = overlaps[seed].size();
-                    for (auto* s : resume_candidates) {
-                        add_surface_if_close(s, p, points(p), data, surface_patch_index_ptr);
-                        if (data.has(s, p)) {
-                            overlaps[seed].insert(s);
-                            overlaps[s].insert(seed);
-                        }
-                    }
-                    discovered_overlap_count += static_cast<int>(overlaps[seed].size() - before);
+                    discovered_patch_ref_count += add_surface_patch_candidates(
+                        p, points(p), data, surface_patch_index_ptr, seed);
                 }
             }
 
-            int seeded_overlap_locations = 0;
-            int seeded_overlap_refs = 0;
-            if (!surface_overlaps(&overlaps, seed).empty()) {
-                for (int j = std::max(0, used_area.y); j <= std::min(used_area.br().y, state.rows - 1); ++j) {
-                    for (int i = std::max(0, used_area.x); i <= std::min(used_area.br().x, state.cols - 1); ++i) {
-                        const cv::Vec2i p(j, i);
-                        if ((state(p) & STATE_LOC_VALID) == 0) {
-                            continue;
-                        }
+            int seeded_patch_ref_locations = 0;
+            int seeded_patch_refs = 0;
+            for (int j = std::max(0, used_area.y); j <= std::min(used_area.br().y, state.rows - 1); ++j) {
+                for (int i = std::max(0, used_area.x); i <= std::min(used_area.br().x, state.cols - 1); ++i) {
+                    const cv::Vec2i p(j, i);
+                    if ((state(p) & STATE_LOC_VALID) == 0) {
+                        continue;
+                    }
 
-                        const std::size_t before = data.surfs(p).size();
-                        for (auto* s : surface_overlaps(&overlaps, seed)) {
-                            add_surface_if_close(s, p, points(p), data, surface_patch_index_ptr);
-                        }
-                        const std::size_t added = data.surfs(p).size() - before;
-                        if (added > 0) {
-                            seeded_overlap_locations++;
-                            seeded_overlap_refs += static_cast<int>(added);
-                        }
+                    const int added = add_surface_patch_candidates(
+                        p, points(p), data, surface_patch_index_ptr, seed);
+                    if (added > 0) {
+                        seeded_patch_ref_locations++;
+                        seeded_patch_refs += added;
                     }
                 }
             }
 
             std::cout << "resume_growth initialized " << resumed_count
                       << " low-res points, fringe " << fringe_count
-                      << ", overlaps " << surface_overlaps(&overlaps, seed).size()
-                      << " (discovered " << discovered_overlap_count << ")"
-                      << ", seeded overlap refs " << seeded_overlap_refs
-                      << " at " << seeded_overlap_locations << " points"
+                      << ", patch-index refs discovered " << discovered_patch_ref_count
+                      << ", seeded patch-index refs " << seeded_patch_refs
+                      << " at " << seeded_patch_ref_locations << " points"
                       << " used_area " << used_area << std::endl;
         } else {
             std::cout << "resume_growth requested but no valid resume samples were found; falling back to center seed" << std::endl;
@@ -2306,16 +2289,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         //insert initial surfs per location
         for(const auto& p : fringe) {
             data.surfs(p).insert(seed);
-            cv::Vec3f coord = points(p);
-            std::cout << "testing " << p << " from cands: " << surface_overlaps(&overlaps, seed).size() << coord << std::endl;
-            for(auto s : surface_overlaps(&overlaps, seed)) {
-                auto ptr = s->pointer();
-                if (s->pointTo(ptr, coord, same_surface_th, 1000, surface_patch_index_ptr) <= same_surface_th) {
-                    cv::Vec3f loc = s->loc_raw(ptr);
-                    data.surfs(p).insert(s);
-                    data.loc(s, p) = {loc[1], loc[0]};
-                }
-            }
+            cv::Vec3d coord = points(p);
+            int added = add_surface_patch_candidates(p, coord, data, surface_patch_index_ptr, seed);
+            std::cout << "testing " << p << " from patch-index cands: " << added << coord << std::endl;
             std::cout << "fringe point " << p << " surfcount " << data.surfs(p).size() << " init " << data.loc(seed, p) << data.lookup_int(seed, p) << std::endl;
         }
     }
@@ -2895,10 +2871,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 std::set<QuadSurface *> more_local_surfs;
 
                 for(auto test_surf : local_surfs) {
-                    for(auto s : surface_overlaps(&overlaps, test_surf))
-                        if (!local_surfs.contains(s) && s != best_surf)
-                            more_local_surfs.insert(s);
-
                     if (test_surf == best_surf)
                         continue;
 
@@ -2918,6 +2890,11 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                             data_th.erase(test_surf, p);
                     }
                 }
+
+                auto patch_cands = surface_patch_candidates(surface_patch_index_ptr, best_coord, best_surf);
+                for (auto* s : patch_cands)
+                    if (!local_surfs.contains(s))
+                        more_local_surfs.insert(s);
 
                 ceres::Solver::Summary summary;
 
@@ -3079,7 +3056,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 const int valid_before_opt = count_loc_valid_in(state, active);
 
                 optimize_surface_mapping(opt_data, opt_state, opt_points, active, static_bounds, step, src_step,
-                                         opt_data.seed_loc, closing_r, true, tgt_dir, surface_patch_index_ptr, &overlaps, debug_images);
+                                         opt_data.seed_loc, closing_r, true, tgt_dir, surface_patch_index_ptr, debug_images);
                 const int valid_after_opt = count_loc_valid_in(opt_state, active);
                 if (valid_before_opt > 0 && valid_after_opt * 2 < valid_before_opt) {
                     std::cout << "optimizer: rejecting mapping; valid points collapsed "

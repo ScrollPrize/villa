@@ -16,13 +16,13 @@ A spatial index for efficiently querying triangulated surface patches (QuadSurfa
 
 ```cpp
 struct LookupResult {
-    QuadSurface* surface = nullptr;  // The surface containing the point
+    SurfacePatchIndex::SurfacePtr surface;  // The surface containing the point
     cv::Vec3f ptr = {0, 0, 0};       // Surface-local pointer coordinates
     float distance = -1.0f;          // Distance from query point to surface
 };
 
 struct TriangleCandidate {
-    QuadSurface* surface = nullptr;
+    SurfacePatchIndex::SurfacePtr surface;
     int i = 0;                       // Grid row index
     int j = 0;                       // Grid column index
     int triangleIndex = 0;           // 0 = (p00,p10,p01), 1 = (p10,p11,p01)
@@ -31,9 +31,21 @@ struct TriangleCandidate {
 };
 
 struct TriangleSegment {
-    QuadSurface* surface = nullptr;
+    SurfacePatchIndex::SurfacePtr surface;
     std::array<cv::Vec3f, 2> world{};        // 3D world coordinates of segment endpoints
     std::array<cv::Vec3f, 2> surfaceParams{}; // Surface pointer coordinates
+};
+```
+
+### Surface Filtering
+
+Point, triangle, and ray queries all use the same optional filter:
+
+```cpp
+struct SurfaceFilter {
+    SurfacePtr only;                                  // Search one surface
+    const std::unordered_set<SurfacePtr>* include;    // Search this set
+    const std::unordered_set<SurfacePtr>* exclude;    // Skip this set
 };
 ```
 
@@ -47,7 +59,7 @@ struct TriangleSegment {
 
 ```cpp
 SurfacePatchIndex index;
-std::vector<QuadSurface*> surfaces = { surf1, surf2, surf3 };
+std::vector<SurfacePatchIndex::SurfacePtr> surfaces = { surf1, surf2, surf3 };
 index.rebuild(surfaces, 2.0f);  // 2 voxel padding on bounding boxes
 ```
 
@@ -55,19 +67,26 @@ index.rebuild(surfaces, 2.0f);  // 2 voxel padding on bounding boxes
 
 | Method | Description |
 |--------|-------------|
-| `locate(worldPoint, tolerance, targetSurface)` | Find the closest surface point to a 3D coordinate |
+| `locate(query)` | Find the closest surface point to a 3D coordinate |
+| `locateAll(query)` | Find the closest hit per matching surface |
+| `locateSurfaces(query)` | Find matching surfaces without returning pointer coordinates |
 
 **Parameters:**
-- `worldPoint`: The 3D coordinate to locate
-- `tolerance`: Maximum distance to consider a valid match
-- `targetSurface`: Optional; if non-null, only search this specific surface
+- `query.worldPoint`: The 3D coordinate to locate
+- `query.tolerance`: Maximum distance to consider a valid match
+- `query.surfaces`: Optional surface filter
 
 **Returns:** `std::optional<LookupResult>` - empty if no surface found within tolerance
 
 ```cpp
-auto result = index.locate(cv::Vec3f{100, 200, 50}, 5.0f);
+SurfacePatchIndex::PointQuery query;
+query.worldPoint = {100, 200, 50};
+query.tolerance = 5.0f;
+query.surfaces.only = surf1;
+
+auto result = index.locate(query);
 if (result) {
-    QuadSurface* surf = result->surface;
+    auto surf = result->surface;
     cv::Vec3f ptr = result->ptr;  // Use with surf->coord(ptr) to get exact position
     float dist = result->distance;
 }
@@ -79,23 +98,16 @@ Query all triangles within a 3D bounding box:
 
 | Method | Description |
 |--------|-------------|
-| `queryTriangles(bounds, targetSurface, outCandidates)` | Find triangles in bounds, optionally filtered to one surface |
-| `queryTriangles(bounds, targetSurfaces, outCandidates)` | Find triangles in bounds, filtered to a set of surfaces |
-| `forEachTriangle(bounds, targetSurface, visitor)` | Iterate over triangles with a callback |
-| `forEachTriangle(bounds, targetSurfaces, visitor)` | Iterate over triangles with a callback (set filter) |
+| `forEachTriangle(TriangleQuery, visitor)` | Iterate over triangles in bounds with an optional surface filter |
+| `forEachTriangle(RayQuery, visitor)` | Iterate over triangles whose patch boxes intersect a ray segment |
 
 ```cpp
 Rect3D bounds = {{50, 50, 50}, {150, 150, 150}};
-std::vector<SurfacePatchIndex::TriangleCandidate> triangles;
 
-// Get all triangles in the region
-index.queryTriangles(bounds, nullptr, triangles);
-
-// Get triangles from a specific surface only
-index.queryTriangles(bounds, mySurface, triangles);
-
-// Use a visitor pattern
-index.forEachTriangle(bounds, nullptr, [](const auto& tri) {
+SurfacePatchIndex::TriangleQuery query;
+query.bounds = bounds;
+query.surfaces.only = surf1;
+index.forEachTriangle(query, [](const auto& tri) {
     // Process each triangle
     cv::Vec3f v0 = tri.world[0];
     cv::Vec3f v1 = tri.world[1];
@@ -172,8 +184,6 @@ The index maintains a generation counter per surface that increments each time p
 | Method | Description |
 |--------|-------------|
 | `generation(surface)` | Get the current generation counter for a surface |
-| `incrementGeneration(surface)` | Manually increment the generation |
-| `setGeneration(surface, gen)` | Set the generation to a specific value |
 
 ```cpp
 // Track generations to detect updates
@@ -303,4 +313,3 @@ auto nearby = index.queryRadius(query, 25.0f);
 ## Implementation Notes
 
 Both indexes use **Boost.Geometry R-trees**
-

@@ -356,14 +356,12 @@ int main(int argc, char *argv[])
                         result.sourceKey = canonical_key(source.path);
                         result.sourceId = source.id;
 
-                        std::unordered_set<const QuadSurface*> excludedTargetSurfaces;
+                        std::unordered_set<SurfacePatchIndex::SurfacePtr> excludedTargetSurfaces;
                         excludedTargetSurfaces.reserve(32);
                         if (const auto selfIt = targetByPath.find(result.sourceKey);
                             selfIt != targetByPath.end()) {
-                            excludedTargetSurfaces.insert(selfIt->second.get());
+                            excludedTargetSurfaces.insert(selfIt->second);
                         }
-                        std::vector<const QuadSurface*> pointHits;
-                        pointHits.reserve(16);
                         size_t progressPointBatch = 0;
                         size_t validPointIndex = 0;
                         for (const auto& pointRef : source.validPoints()) {
@@ -382,14 +380,13 @@ int main(int argc, char *argv[])
                             SurfacePatchIndex::PointQuery query;
                             query.worldPoint = pointRef.point;
                             query.tolerance = kOverlapTolerance;
-                            query.excludedSurfaces = &excludedTargetSurfaces;
-                            index.locateSurfaceHits(query, pointHits);
-                            for (const QuadSurface* hitSurface : pointHits) {
+                            query.surfaces.exclude = &excludedTargetSurfaces;
+                            for (const auto& hitSurface : index.locateSurfaces(query)) {
                                 if (!hitSurface) {
                                     continue;
                                 }
 
-                                const auto targetIt = targetInfoBySurface.find(hitSurface);
+                                const auto targetIt = targetInfoBySurface.find(hitSurface.get());
                                 if (targetIt == targetInfoBySurface.end()) {
                                     continue;
                                 }
