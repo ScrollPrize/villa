@@ -1738,11 +1738,13 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                                               SurfacePatchIndex* external_surface_patch_index = nullptr)
 {
     bool flip_x = params.value("flip_x", 0);
+    bool bidirectional = params.value("bidirectional", false);
     int global_steps_per_window = params.value("global_steps_per_window", 0);
 
 
     std::cout << "global_steps_per_window: " << global_steps_per_window << std::endl;
     std::cout << "flip_x: " << flip_x << std::endl;
+    std::cout << "bidirectional: " << bidirectional << std::endl;
     std::filesystem::path tgt_dir = params["tgt_dir"].get<std::string>();
 
     std::unordered_map<std::string,QuadSurface *> surfs;
@@ -1966,7 +1968,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     bool grow_down = false;
     bool grow_right = true;
     bool grow_up = false;
-    bool grow_left = flip_x && !has_growth_directions;
+    bool grow_left = bidirectional && !has_growth_directions;
     const bool disable_grid_expansion = params.value("disable_grid_expansion", params.value("fill_growth", false));
     const std::vector<cv::Vec2i> legacy_4_neighs = {
         { 1,  0},
@@ -2034,6 +2036,12 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         if (!grow_down && !grow_right && !grow_up && !grow_left) {
             grow_down = grow_right = grow_up = grow_left = true;
             neighs = all_8_neighs;
+        }
+    }
+    if (flip_x) {
+        std::swap(grow_left, grow_right);
+        for (auto& neigh : neighs) {
+            neigh[1] = -neigh[1];
         }
     }
     std::cout << "growth directions:"
