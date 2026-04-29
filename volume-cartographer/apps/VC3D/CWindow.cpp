@@ -261,25 +261,15 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
         return QString();
     }
 
-    std::filesystem::path rootPath(pkg->getVolpkgDirectory());
-    if (rootPath.empty()) {
-        qCInfo(lcSegGrowth) << "Normal grid lookup skipped (volume package path empty)";
+    auto paths = pkg->normalGridPaths();
+    if (paths.empty()) {
+        qCInfo(lcSegGrowth) << "Normal grid lookup: no normal_grids entries in project";
         return QString();
     }
-
-    const std::filesystem::path candidate = rootPath / "normal_grids";
-    const QString candidateStr = QString::fromStdString(candidate.string());
-    if (checkedPath) {
-        *checkedPath = candidateStr;
-    }
-
-    if (std::filesystem::exists(candidate) && std::filesystem::is_directory(candidate)) {
-        qCInfo(lcSegGrowth) << "Normal grid lookup at" << candidateStr << ": found";
-        return candidateStr;
-    }
-
-    qCInfo(lcSegGrowth) << "Normal grid lookup at" << candidateStr << ": missing";
-    return QString();
+    const QString candidateStr = QString::fromStdString(paths.front().string());
+    if (checkedPath) *checkedPath = candidateStr;
+    qCInfo(lcSegGrowth) << "Normal grid resolved to" << candidateStr;
+    return candidateStr;
 }
 
 QStringList normal3dZarrCandidatesForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
@@ -294,41 +284,15 @@ QStringList normal3dZarrCandidatesForVolumePkg(const std::shared_ptr<VolumePkg>&
         }
         return {};
     }
-    std::filesystem::path rootPath(pkg->getVolpkgDirectory());
-    if (rootPath.empty()) {
-        if (hint) {
-            *hint = QObject::tr("Normal3D lookup skipped (volume package path empty)");
-        }
-        return {};
-    }
-    const std::filesystem::path base = rootPath / "normal3d";
-    const QString baseStr = QString::fromStdString(base.string());
-    if (hint) {
-        *hint = QObject::tr("Checked: %1").arg(baseStr);
-    }
-    std::error_code ec;
-    if (!std::filesystem::exists(base, ec) || !std::filesystem::is_directory(base, ec)) {
-        return {};
-    }
-
+    auto paths = pkg->normal3dZarrPaths();
     QStringList candidates;
-    for (const auto& entry : std::filesystem::directory_iterator(base, ec)) {
-        if (ec) {
-            break;
-        }
-        if (!entry.is_directory(ec) || ec) {
-            continue;
-        }
-        const std::filesystem::path p = entry.path();
-        // Heuristic: treat as zarr if it contains x/0, y/0, z/0.
-        if (std::filesystem::is_directory(p / "x" / "0") &&
-            std::filesystem::is_directory(p / "y" / "0") &&
-            std::filesystem::is_directory(p / "z" / "0")) {
-            candidates.push_back(QString::fromStdString(p.string()));
-        }
-    }
-
+    for (const auto& p : paths) candidates.push_back(QString::fromStdString(p.string()));
     candidates.sort();
+    if (hint) {
+        *hint = candidates.isEmpty()
+            ? QObject::tr("No volumes tagged 'normal3d' in project")
+            : QObject::tr("%1 normal3d zarr(s) tagged").arg(candidates.size());
+    }
     return candidates;
 }
 
@@ -936,6 +900,19 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     _state = new CState(_cacheSizeBytes, this);
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
+    connect(_state, &CState::vpkgChanged, this,
+            [this](std::shared_ptr<VolumePkg> pkg) {
+                if (!pkg) return;
+                pkg->setSegmentsChangedCallback(
+                    [self = QPointer<CWindow>(this)]() {
+                        QMetaObject::invokeMethod(self.data(), [self]() {
+                            auto* w = self.data();
+                            if (!w || !w->_surfacePanel || !w->_state || !w->_state->vpkg()) return;
+                            w->_surfacePanel->setVolumePkg(w->_state->vpkg());
+                            w->_surfacePanel->refreshSurfaceList();
+                        }, Qt::QueuedConnection);
+                    });
+            });
 
     _fileWatcher = std::make_unique<FileWatcherService>(_state, this);
     connect(_fileWatcher.get(), &FileWatcherService::statusMessage,
@@ -1163,30 +1140,12 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
                std::max(height(), minWindowSize.height()));
     }
 
-    // If enabled, auto open the last used volume (local or remote, deferred so window shows first)
-    if (settings.value(vc3d::settings::volpkg::AUTO_OPEN, vc3d::settings::volpkg::AUTO_OPEN_DEFAULT).toInt() != 0) {
-
-        QStringList files = settings.value(vc3d::settings::volpkg::RECENT).toStringList();
-        QStringList remoteUrls = settings.value(vc3d::settings::viewer::REMOTE_RECENT_URLS).toStringList();
-
-        if (!files.empty() && !files.at(0).isEmpty()) {
-            // Local volpkg available — open it
-            QString path = files[0];
-            QTimer::singleShot(0, this, [this, path]() {
-                if (_menuController) {
-                    _menuController->openVolpkgAt(path);
-                }
-            });
-        } else if (!remoteUrls.empty() && !remoteUrls.at(0).isEmpty()) {
-            // No local volpkg but have a recent remote URL — open it
-            QString url = remoteUrls[0];
-            QTimer::singleShot(0, this, [this, url]() {
-                if (_menuController) {
-                    _menuController->openRemoteUrl(url, false);
-                }
-            });
-        }
-    }
+    QTimer::singleShot(0, this, [this]() {
+        std::shared_ptr<VolumePkg> pkg = VolumePkg::loadAutosave();
+        if (!pkg) pkg = VolumePkg::newEmpty();
+        _state->setVpkg(pkg);
+        refreshCurrentVolumePackageUi(QString(), true);
+    });
 
     // Create application-wide keyboard shortcuts
     fDrawingModeShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::DrawingMode), this);
@@ -2328,89 +2287,41 @@ void CWindow::setRemoteStubs(
 void CWindow::downloadRemoteSegmentOnDemand(const QString& segmentId)
 {
     const std::string segId = segmentId.toStdString();
-    const std::string dlBase = (_remoteScroll.segSource == vc::RemoteSegmentSource::Direct)
-        ? _remoteScroll.segmentsBaseUrl : _remoteScroll.baseUrl;
-    const std::string cachePath = _remoteScroll.cachePath;
-    const auto auth = _remoteScroll.auth;
-    const auto segSource = _remoteScroll.segSource;
+    if (!_state || !_state->vpkg()) return;
+    auto vpkg = _state->vpkg();
 
     if (statusBar()) {
-        statusBar()->showMessage(
-            tr("Downloading segment %1...").arg(segmentId));
+        statusBar()->showMessage(tr("Downloading segment %1...").arg(segmentId));
     }
 
     auto* watcher = new QFutureWatcher<std::shared_ptr<QuadSurface>>(this);
-    // Capture the current session URL so the completion handler can detect
-    // a stale result if the user closed/switched volumes during download.
-    const std::string expectedBaseUrl = _remoteScroll.baseUrl;
     connect(watcher, &QFutureWatcher<std::shared_ptr<QuadSurface>>::finished, this,
-        [this, watcher, segId, expectedBaseUrl]() {
+        [this, watcher, segId]() {
             watcher->deleteLater();
-            // If the remote scroll session changed, silently discard the
-            // result — applying a segment from a previous dataset to the
-            // current CState would corrupt surface state.
-            if (_remoteScroll.baseUrl != expectedBaseUrl) {
-                return;
-            }
             std::shared_ptr<QuadSurface> surf;
-            try {
-                surf = watcher->result();
-            } catch (const std::exception& e) {
-                std::fprintf(stderr, "[RemoteScroll] Download failed for %s: %s\n",
-                    segId.c_str(), e.what());
+            try { surf = watcher->result(); }
+            catch (const std::exception& e) {
+                std::fprintf(stderr, "[Remote] Download failed for %s: %s\n", segId.c_str(), e.what());
             }
-
             if (surf) {
                 if (statusBar()) {
                     statusBar()->showMessage(
                         tr("Downloaded segment %1").arg(QString::fromStdString(segId)), 3000);
                 }
-                if (_surfacePanel) {
-                    _surfacePanel->replaceStubWithSurface(segId, surf);
-                }
+                if (_surfacePanel) _surfacePanel->replaceStubWithSurface(segId, surf);
             } else {
                 if (statusBar()) {
                     statusBar()->showMessage(
                         tr("Failed to download segment %1").arg(QString::fromStdString(segId)), 5000);
                 }
-                // Reset the stub state so user can retry
-                if (_surfacePanel) {
-                    _surfacePanel->replaceStubWithSurface(segId, nullptr);
-                }
+                if (_surfacePanel) _surfacePanel->replaceStubWithSurface(segId, nullptr);
             }
         });
 
-    const std::string baseUrl = _remoteScroll.baseUrl;
-
-    auto future = QtConcurrent::run(
-        [dlBase, baseUrl, segId, cachePath, auth, segSource]() -> std::shared_ptr<QuadSurface> {
-            // Cache-root layout MUST match MenuActionController::promptAndLoadRemoteSegments
-            // so previously-preloaded segments are reused on demand instead
-            // of re-downloaded into a second location.
-            //   Direct sources: flat → cachePath/paths/<segId>
-            //   Segments/Paths (full volpkg): nested → cachePath/<volpkgName>/{paths|segments}/<segId>
-            std::filesystem::path segmentRoot = cachePath;
-            if (segSource != vc::RemoteSegmentSource::Direct) {
-                std::string volpkgName = baseUrl;
-                while (!volpkgName.empty() && volpkgName.back() == '/') volpkgName.pop_back();
-                auto slash = volpkgName.rfind('/');
-                if (slash != std::string::npos) volpkgName = volpkgName.substr(slash + 1);
-                segmentRoot = std::filesystem::path(cachePath) / volpkgName;
-            }
-
-            auto localDir = vc::downloadRemoteSegment(
-                dlBase, segId, segmentRoot, auth, segSource);
-
-            if (!std::filesystem::exists(localDir / "meta.json")) {
-                return nullptr;
-            }
-
-            auto seg = Segmentation::New(localDir);
-            if (seg && seg->canLoadSurface()) {
-                return seg->loadSurface();
-            }
-            return nullptr;
-        });
+    auto future = QtConcurrent::run([vpkg, segId]() -> std::shared_ptr<QuadSurface> {
+        if (!vpkg->ensureRemoteSegmentDownloaded(segId)) return nullptr;
+        return vpkg->loadSurface(segId);
+    });
     watcher->setFuture(future);
 }
 
@@ -2860,12 +2771,24 @@ void CWindow::CreateWidgets(void)
                 auto* quad = dynamic_cast<QuadSurface*>(surf.get());
                 if (!quad) return;
                 quad->ensureLoaded();
-                cv::Vec3f c = quad->center();
-                POI* poi = _state->poi("focus");
-                if (!poi) poi = new POI;
-                poi->p = c;
-                poi->n = {0, 0, 0};
-                _state->setPOI("focus", poi);
+                const cv::Vec3f worldCenter = quad->coord({0, 0, 0}, {0, 0, 0});
+                if (!std::isfinite(worldCenter[0]) || worldCenter[0] < 0.0f) return;
+                cv::Vec3f normal = quad->normal({0, 0, 0}, {0, 0, 0});
+                if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) || !std::isfinite(normal[2])) {
+                    normal = cv::Vec3f(0, 0, 1);
+                }
+                if (auto vol = _state->currentVolume()) {
+                    auto [w, h, d] = vol->shape();
+                    cv::Vec3f clamped = worldCenter;
+                    clamped[0] = std::clamp(clamped[0], 0.0f, static_cast<float>(w - 1));
+                    clamped[1] = std::clamp(clamped[1], 0.0f, static_cast<float>(h - 1));
+                    clamped[2] = std::clamp(clamped[2], 0.0f, static_cast<float>(d - 1));
+                    POI* poi = new POI;
+                    poi->p = clamped;
+                    poi->n = normal;
+                    poi->surfaceId = segmentId.toStdString();
+                    _state->setPOI("focus", poi);
+                }
             });
     connect(_surfacePanel.get(), &SurfacePanelController::alphaCompRefineRequested,
             this, [this](const QString& segmentId) {
@@ -5062,6 +4985,9 @@ void CWindow::closeEvent(QCloseEvent* event)
     if (_viewerManager) {
         _viewerManager->beginShutdown();
     }
+    if (_state && _state->vpkg()) {
+        try { _state->vpkg()->saveAutosave(); } catch (...) {}
+    }
     saveWindowState();
     event->accept();
 }
@@ -5094,16 +5020,17 @@ auto CWindow::InitializeVolumePkg(const std::string& nVpkgPath) -> bool
     }
 
     try {
-        _state->setVpkg(VolumePkg::New(nVpkgPath));
+        _state->setVpkg(VolumePkg::load(nVpkgPath));
     } catch (const std::exception& e) {
         Logger()->error("Failed to initialize volpkg: {}", e.what());
     }
 
     if (_state->vpkg() == nullptr) {
-        Logger()->error("Cannot open .volpkg: {}", nVpkgPath);
+        Logger()->error("Cannot open project: {}", nVpkgPath);
         QMessageBox::warning(
             this, "Error",
-            "Volume package failed to load. Package might be corrupt. Check the console log for a detailed error message.");
+            "Project failed to load. Falling back to a new blank project.");
+        _state->setVpkg(VolumePkg::newEmpty());
         return false;
     }
     return true;
@@ -5219,32 +5146,17 @@ void CWindow::OpenVolume(const QString& path)
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
     if (aVpkgPath.isEmpty()) {
-        aVpkgPath = QFileDialog::getExistingDirectory(
-            this, tr("Open Directory"), settings.value(vc3d::settings::volpkg::DEFAULT_PATH).toString(),
-            QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks | QFileDialog::ReadOnly | QFileDialog::DontUseNativeDialog);
-        // Dialog box cancelled
-        if (aVpkgPath.length() == 0) {
-            Logger()->info("Open .volpkg canceled");
+        aVpkgPath = QFileDialog::getOpenFileName(
+            this, tr("Open Project"), settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
+            tr("Project (*.volpkg.json);;All files (*.*)"),
+            nullptr, QFileDialog::DontResolveSymlinks | QFileDialog::ReadOnly | QFileDialog::DontUseNativeDialog);
+        if (aVpkgPath.isEmpty()) {
+            Logger()->info("Open project canceled");
             return;
         }
     }
 
-    // Checks the folder path for .volpkg extension
-    auto const extension = aVpkgPath.toStdString().substr(
-        aVpkgPath.toStdString().length() - 7, aVpkgPath.toStdString().length());
-    if (extension != ".volpkg") {
-        QMessageBox::warning(
-            this, tr("ERROR"),
-            "The selected file is not of the correct type: \".volpkg\"");
-        Logger()->error(
-            "Selected file is not .volpkg: {}", aVpkgPath.toStdString());
-        _state->setVpkg(nullptr);  // Is needed for User Experience, clears screen.
-        updateNormalGridAvailability();
-        return;
-    }
-
-    // Open volume package
-    if (!InitializeVolumePkg(aVpkgPath.toStdString() + "/")) {
+    if (!InitializeVolumePkg(aVpkgPath.toStdString())) {
         return;
     }
 
@@ -5573,6 +5485,38 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
             } else {
                 _point_collection_widget->clearCorrPointsResults();
             }
+        }
+    }
+
+    if (_axisAlignedSliceController) {
+        _axisAlignedSliceController->resetAll();
+    }
+
+    if (auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf)) {
+        try {
+            quadSurf->ensureLoaded();
+            const cv::Vec3f worldCenter = quadSurf->coord({0, 0, 0}, {0, 0, 0});
+            const bool centerValid = std::isfinite(worldCenter[0])
+                && std::isfinite(worldCenter[1])
+                && std::isfinite(worldCenter[2])
+                && worldCenter[0] >= 0.0f;
+            if (centerValid) {
+                if (auto vol = _state->currentVolume()) {
+                    auto [w, h, d] = vol->shape();
+                    cv::Vec3f clamped = worldCenter;
+                    clamped[0] = std::clamp(clamped[0], 0.0f, static_cast<float>(w - 1));
+                    clamped[1] = std::clamp(clamped[1], 0.0f, static_cast<float>(h - 1));
+                    clamped[2] = std::clamp(clamped[2], 0.0f, static_cast<float>(d - 1));
+                    POI* poi = new POI;
+                    poi->p = clamped;
+                    poi->n = cv::Vec3f(0, 0, 0);
+                    poi->surfaceId = newSurfId;
+                    _state->setPOI("focus", poi);
+                }
+            }
+        } catch (const std::exception& e) {
+            qWarning() << "Could not compute world center for"
+                       << surfaceId << ":" << e.what();
         }
     }
 

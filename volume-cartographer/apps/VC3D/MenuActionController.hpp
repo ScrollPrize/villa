@@ -29,19 +29,19 @@ public:
     void removeRecentVolpkgEntry(const QString& path);
     void refreshRecentMenu();
     void openVolpkgAt(const QString& path);
-    void loadAttachedRemoteVolumesForCurrentPackage();
     void triggerTeleaInpaint();
-    void openRemoteUrl(const QString& url, bool isRetry = false);
 
 private slots:
+    void newProject();
+    void saveProjectAs();
+    void attachVolume();
+    void attachSegments();
+    void attachNormalGrid();
+    void detachEntry();
+    void setOutputSegments();
+    void convertLegacyVolpkg();
     void openVolpkg();
     void openRecentVolpkg();
-    void openLocalZarr();
-    void openRemoteVolume();
-    void browseS3();
-    void attachRemoteZarr();
-    void attachRemoteSegments();
-    void openRecentRemoteVolume();
     void showSettingsDialog();
     void showAboutDialog();
     void showKeybindings();
@@ -59,34 +59,23 @@ private slots:
 private:
     QStringList loadRecentPaths() const;
     void saveRecentPaths(const QStringList& paths);
-    void rebuildRecentMenu();
     void ensureRecentActions();
 
-    QStringList loadRecentRemoteUrls() const;
-    void saveRecentRemoteUrls(const QStringList& urls);
-    void updateRecentRemoteList(const QString& url);
-    void refreshRecentRemoteMenu();
-    void ensureRecentRemoteActions();
-    void attachRemoteZarrUrl(const QString& url, bool persistEntry = true);
-    void openRemoteZarr(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
-    void openRemoteScroll(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
-    void promptAndLoadRemoteSegments(const vc::cache::HttpAuth& auth, const std::string& cachePath);
-    // Non-prompting variant: attaches the supplied segments URL and triggers
-    // the same discovery + surface-caching pipeline as the prompting path.
-    // On success, persists (segUrl, zarrUrl) in QSettings so auto-open of
-    // the same remote zarr can skip the prompt next time. Pass the current
-    // remote volume's URL as zarrUrl; empty disables persistence.
-    void loadRemoteSegmentsWithUrl(const QString& segUrl,
-                                   const vc::cache::HttpAuth& auth,
-                                   const std::string& cachePath,
-                                   const QString& zarrUrl);
     bool tryResolveRemoteAuth(const QString& url,
                               vc::cache::HttpAuth* authOut,
                               bool allowPrompt,
                               QString* errorMessage = nullptr) const;
+    // Runs vc_volpkg_convert against `inputLocation` (legacy folder or remote URL),
+    // prompts the user for an output .volpkg.json, and returns the written path
+    // via `convertedOut` on success.
+    bool runLegacyVolpkgConvert(const QString& inputLocation, QString* convertedOut);
     QString remoteCacheDirectory() const;
-    QString remoteVolumeRegistryPath() const;
-    void persistAttachedRemoteVolume(const QString& url, const std::shared_ptr<Volume>& volume);
+    QString promptLocation(const QString& title,
+                           const QString& hint,
+                           const QString& defaultDir,
+                           const QStringList& localFilters,
+                           bool acceptFiles,
+                           bool acceptDirs);
 
     CWindow* _window{nullptr};
 
@@ -97,16 +86,17 @@ private:
     QMenu* _selectionMenu{nullptr};
     QMenu* _helpMenu{nullptr};
     QMenu* _recentMenu{nullptr};
-    QMenu* _recentRemoteMenu{nullptr};
 
+    QAction* _newProjectAct{nullptr};
+    QAction* _saveProjectAsAct{nullptr};
+    QAction* _attachVolumeAct{nullptr};
+    QAction* _attachSegmentsAct{nullptr};
+    QAction* _attachNormalGridAct{nullptr};
+    QAction* _detachEntryAct{nullptr};
+    QAction* _setOutputSegmentsAct{nullptr};
+    QAction* _convertLegacyAct{nullptr};
     QAction* _openAct{nullptr};
-    QAction* _openLocalZarrAct{nullptr};
-    QAction* _openRemoteAct{nullptr};
-    QAction* _attachRemoteZarrAct{nullptr};
-    QAction* _attachRemoteSegmentsAct{nullptr};
-    QAction* _browseS3Act{nullptr};
     std::array<QAction*, kMaxRecentVolpkg> _recentActs{};
-    std::array<QAction*, kMaxRecentRemote> _recentRemoteActs{};
     QAction* _settingsAct{nullptr};
     QAction* _exitAct{nullptr};
     QAction* _keybindsAct{nullptr};
@@ -120,8 +110,6 @@ private:
     QAction* _selectionClearAct{nullptr};
     QAction* _teleaAct{nullptr};
     QAction* _importObjAct{nullptr};
-    int _remoteOpenAuthRetries{0};
-    int _remoteScrollAuthRetries{0};
 
     QPointer<QDialog> _keybindsDialog;
 };

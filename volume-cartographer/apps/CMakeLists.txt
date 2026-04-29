@@ -129,6 +129,9 @@ target_link_libraries(vc_surface_diff vc_core Boost::program_options)
 add_executable(vc_visualize src/vc_visualize.cpp)
 target_link_libraries(vc_visualize vc_core Boost::program_options)
 
+add_executable(vc_volpkg_convert src/vc_volpkg_convert.cpp)
+target_link_libraries(vc_volpkg_convert vc_core)
+
 
 add_executable(vc_ced2d src/vc_ced2d.cpp)
 target_link_libraries(vc_ced2d

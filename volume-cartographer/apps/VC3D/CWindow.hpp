@@ -45,7 +45,7 @@
 #define MAX_RECENT_VOLPKG 10
 
 // Volpkg version required by this app
-static constexpr int VOLPKG_MIN_VERSION = 6;
+static constexpr int VOLPKG_MIN_VERSION = 1;
 static constexpr int VOLPKG_SLICE_MIN_INDEX = 0;
 
 
