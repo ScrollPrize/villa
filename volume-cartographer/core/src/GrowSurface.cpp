@@ -1553,6 +1553,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     const int flatten_prune_min_valid = params.value("flatten_prune_min_valid", 64);
     const int flatten_prune_abf_iterations = params.value("flatten_prune_abf_iterations", 5);
     const bool flatten_prune_exploded_only = params.value("flatten_prune_exploded_only", true);
+    const bool flatten_prune_connected_components = params.value("flatten_prune_connected_components", true);
     std::vector<int> flatten_prune_scales = {1};
     if (params.contains("flatten_prune_scales") && params["flatten_prune_scales"].is_array()) {
         flatten_prune_scales.clear();
@@ -1633,6 +1634,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         std::cout << "  flatten_prune_abf_iterations: " << flatten_prune_abf_iterations << std::endl;
         std::cout << "  flatten_prune_exploded_only: "
                   << (flatten_prune_exploded_only ? "true" : "false") << std::endl;
+        std::cout << "  flatten_prune_connected_components: "
+                  << (flatten_prune_connected_components ? "true" : "false") << std::endl;
         std::cout << "  flatten_prune_scales:";
         for (int scale : flatten_prune_scales) {
             std::cout << " " << scale;
@@ -2499,10 +2502,14 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         cv::Mat_<uint8_t> visited(active.height, active.width, uint8_t{0});
         std::vector<std::vector<cv::Vec2i>> components;
         const std::vector<cv::Vec2i> component_neighs = {
-            { 1,  0},
-            { 0,  1},
             {-1,  0},
+            {-1,  1},
+            { 0,  1},
+            { 1,  1},
+            { 1,  0},
+            { 1, -1},
             { 0, -1},
+            {-1, -1},
         };
 
         for (int y = active.y; y < active.br().y; ++y) {
@@ -2747,7 +2754,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         }
 
         if (!to_prune.empty()) {
-            const int disconnected_pruned = prune_to_largest_2d_component();
+            const int disconnected_pruned = flatten_prune_connected_components ? prune_to_largest_2d_component() : 0;
             recompute_used_area_from_state();
             rebuild_frontier_from_state();
 
@@ -2889,24 +2896,18 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             return 0;
         }
 
-        auto map_uv_to_grid = [&](const cv::Vec2f& uv) -> cv::Vec2i {
+        auto map_uv_to_grid_cont = [&](const cv::Vec2f& uv) -> cv::Vec2d {
             const double ux = static_cast<double>(uv[0]) - uv_mean[0];
             const double uy = static_cast<double>(uv[1]) - uv_mean[1];
             const double gx = fit_a * ux - fit_b * uy + grid_mean[0];
             const double gy = fit_b * ux + fit_a * uy + grid_mean[1];
-            const int mapped_x = std::clamp(static_cast<int>(std::lround(gx)), 0, points.cols - 1);
-            const int mapped_y = std::clamp(static_cast<int>(std::lround(gy)), 0, points.rows - 1);
-            return {mapped_y, mapped_x};
+            return {gy, gx};
         };
 
-        struct RegridMove {
-            cv::Vec2i from;
-            cv::Vec2i to;
-            int priority = 0;
-        };
-        std::vector<RegridMove> moves;
-        moves.reserve(static_cast<std::size_t>(usable_uv_count));
-        std::unordered_set<cv::Vec2i, vec2i_hash> occupied;
+        double min_grid_x = std::numeric_limits<double>::infinity();
+        double min_grid_y = std::numeric_limits<double>::infinity();
+        double max_grid_x = -std::numeric_limits<double>::infinity();
+        double max_grid_y = -std::numeric_limits<double>::infinity();
         auto in_active = [&](const cv::Vec2i& p) {
             return active.contains(cv::Point(p[1], p[0]));
         };
@@ -2916,133 +2917,308 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             points(data.seed_loc)[0] != -1;
         for (int y = 0; y < active.height; ++y) {
             for (int x = 0; x < active.width; ++x) {
-                const cv::Vec2i from(active.y + y, active.x + x);
-                if ((state(from) & STATE_LOC_VALID) == 0 || points(from)[0] == -1) {
+                const int src_y = active.y + y;
+                const int src_x = active.x + x;
+                if ((state(src_y, src_x) & STATE_LOC_VALID) == 0 || points(src_y, src_x)[0] == -1) {
                     continue;
                 }
                 const cv::Vec2f& uv = diagnostics.uv(y, x);
                 if (uv[0] == -1.f || !std::isfinite(uv[0]) || !std::isfinite(uv[1])) {
                     continue;
                 }
-                const cv::Vec2i to = map_uv_to_grid(uv);
-                if (!active.contains(cv::Point(to[1], to[0]))) {
-                    continue;
-                }
-                if (flatten_regrid_max_displacement > 0 &&
-                    (std::abs(to[0] - from[0]) > flatten_regrid_max_displacement ||
-                     std::abs(to[1] - from[1]) > flatten_regrid_max_displacement)) {
-                    continue;
-                }
-                int priority = static_cast<int>(inliers_sum_dbg(from));
-                if (from == data.seed_loc) {
-                    priority = std::numeric_limits<int>::max();
-                }
-                moves.push_back({from, to, priority});
+                const cv::Vec2d mapped = map_uv_to_grid_cont(uv);
+                min_grid_y = std::min(min_grid_y, mapped[0]);
+                min_grid_x = std::min(min_grid_x, mapped[1]);
+                max_grid_y = std::max(max_grid_y, mapped[0]);
+                max_grid_x = std::max(max_grid_x, mapped[1]);
+            }
+        }
+        if (!std::isfinite(min_grid_x) || !std::isfinite(min_grid_y) ||
+            !std::isfinite(max_grid_x) || !std::isfinite(max_grid_y)) {
+            return 0;
+        }
+
+        constexpr int regrid_padding = 2;
+        const int lattice_w = std::max(2, static_cast<int>(std::ceil(max_grid_x - min_grid_x)) + 1 + 2 * regrid_padding);
+        const int lattice_h = std::max(2, static_cast<int>(std::ceil(max_grid_y - min_grid_y)) + 1 + 2 * regrid_padding);
+        const int max_grid_extent = std::max(1, static_cast<int>(max_width / step));
+        const int max_grid_height = std::max(1, static_cast<int>(max_height / step));
+        const int max_grid_w = std::min(max_grid_extent, grid_limit_w);
+        const int max_grid_h = std::min(max_grid_height, grid_limit_h);
+        if (lattice_w > max_grid_w || lattice_h > max_grid_h) {
+            std::cout << "flatten regrid: rejecting raster grid " << lattice_w << "x" << lattice_h
+                      << " above limit " << max_grid_w << "x" << max_grid_h << std::endl;
+            return 0;
+        }
+
+        cv::Vec2i seed_local(-1, -1);
+        if (seed_in_active) {
+            const cv::Vec2f& seed_uv = diagnostics.uv(data.seed_loc[0] - active.y, data.seed_loc[1] - active.x);
+            if (seed_uv[0] != -1.f && std::isfinite(seed_uv[0]) && std::isfinite(seed_uv[1])) {
+                const cv::Vec2d mapped = map_uv_to_grid_cont(seed_uv);
+                seed_local = {
+                    static_cast<int>(std::lround(mapped[0] - min_grid_y)) + regrid_padding,
+                    static_cast<int>(std::lround(mapped[1] - min_grid_x)) + regrid_padding
+                };
+            }
+            if (seed_local[0] < 0) {
+                std::cout << "flatten regrid: rejecting raster grid; seed has no valid UV" << std::endl;
+                return 0;
             }
         }
 
-        std::sort(moves.begin(), moves.end(), [](const RegridMove& a, const RegridMove& b) {
-            if (a.priority != b.priority) {
-                return a.priority > b.priority;
-            }
-            if (a.from[0] != b.from[0]) {
-                return a.from[0] < b.from[0];
-            }
-            return a.from[1] < b.from[1];
-        });
+        cv::Point lattice_origin(
+            static_cast<int>(std::lround(grid_mean[0] - lattice_w * 0.5)),
+            static_cast<int>(std::lround(grid_mean[1] - lattice_h * 0.5)));
+        if (seed_in_active && seed_local[0] >= 0) {
+            lattice_origin.x = data.seed_loc[1] - seed_local[1];
+            lattice_origin.y = data.seed_loc[0] - seed_local[0];
+        }
 
-        std::vector<RegridMove> kept_moves;
-        kept_moves.reserve(moves.size());
-        bool seed_kept = !seed_in_active;
-        for (const RegridMove& move : moves) {
-            if (!occupied.insert(move.to).second) {
-                continue;
+        int add_left = std::max(0, -lattice_origin.x);
+        int add_up = std::max(0, -lattice_origin.y);
+        int add_right = std::max(0, lattice_origin.x + lattice_w - points.cols);
+        int add_down = std::max(0, lattice_origin.y + lattice_h - points.rows);
+        if (disable_grid_expansion && (add_left > 0 || add_up > 0 || add_right > 0 || add_down > 0)) {
+            std::cout << "flatten regrid: rejecting raster grid; expansion disabled" << std::endl;
+            return 0;
+        }
+        if (points.cols + add_left + add_right > max_grid_w || points.rows + add_up + add_down > max_grid_h) {
+            std::cout << "flatten regrid: rejecting raster grid; expanded size "
+                      << (points.cols + add_left + add_right) << "x" << (points.rows + add_up + add_down)
+                      << " above limit " << max_grid_w << "x" << max_grid_h << std::endl;
+            return 0;
+        }
+        lattice_origin.x += add_left;
+        lattice_origin.y += add_up;
+
+        SurfTrackerData old_data = data;
+        const cv::Mat_<uint8_t> old_state = state.clone();
+        const cv::Mat_<uint16_t> old_generations = generations.clone();
+        const cv::Mat_<cv::Vec3d> old_points = points.clone();
+        const cv::Mat_<uint16_t> old_inliers = inliers_sum_dbg.clone();
+
+        const cv::Size new_size(points.cols + add_left + add_right, points.rows + add_up + add_down);
+        cv::Mat_<uint8_t> next_state(new_size, uint8_t{0});
+        cv::Mat_<uint16_t> next_generations(new_size, static_cast<uint16_t>(0));
+        cv::Mat_<cv::Vec3d> next_points(new_size, cv::Vec3d(-1, -1, -1));
+        cv::Mat_<uint16_t> next_inliers(new_size, static_cast<uint16_t>(0));
+        SurfTrackerData next_data;
+        next_data.seed_loc = {-1, -1};
+        next_data.seed_coord = old_data.seed_coord;
+
+        auto has_valid_uv = [](const cv::Vec2f& uv) {
+            return uv[0] != -1.f && std::isfinite(uv[0]) && std::isfinite(uv[1]);
+        };
+        auto has_valid_src = [&](const cv::Vec2i& p) {
+            return p[0] >= 0 && p[0] < old_points.rows &&
+                   p[1] >= 0 && p[1] < old_points.cols &&
+                   (old_state(p) & STATE_LOC_VALID) != 0 &&
+                   old_points(p)[0] != -1;
+        };
+        auto to_lattice = [&](const cv::Vec2f& uv) {
+            const cv::Vec2d mapped = map_uv_to_grid_cont(uv);
+            return cv::Vec2f(
+                static_cast<float>(mapped[1] - min_grid_x + regrid_padding + lattice_origin.x),
+                static_cast<float>(mapped[0] - min_grid_y + regrid_padding + lattice_origin.y));
+        };
+        auto barycentric = [](const cv::Vec2f& p, const cv::Vec2f& a, const cv::Vec2f& b, const cv::Vec2f& c,
+                              cv::Vec3d& out) {
+            const cv::Vec2f v0 = b - a;
+            const cv::Vec2f v1 = c - a;
+            const cv::Vec2f v2 = p - a;
+            const double d00 = v0.dot(v0);
+            const double d01 = v0.dot(v1);
+            const double d11 = v1.dot(v1);
+            const double d20 = v2.dot(v0);
+            const double d21 = v2.dot(v1);
+            const double denom = d00 * d11 - d01 * d01;
+            if (!std::isfinite(denom) || std::abs(denom) < 1e-20) {
+                return false;
             }
-            kept_moves.push_back(move);
-            seed_kept = seed_kept || move.from == data.seed_loc;
+            const double v = (d11 * d20 - d01 * d21) / denom;
+            const double w = (d00 * d21 - d01 * d20) / denom;
+            const double u = 1.0 - v - w;
+            constexpr double eps = -1e-5;
+            if (u < eps || v < eps || w < eps) {
+                return false;
+            }
+            out = {u, v, w};
+            return true;
+        };
+        auto clear_next_data_at = [&](const cv::Vec2i& p) {
+            next_data._surfs.erase(p);
+            auto it = next_data._data.begin();
+            while (it != next_data._data.end()) {
+                if (it->first.second == p) {
+                    it = next_data._data.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        };
+        auto raster_triangle = [&](const cv::Vec2i& p0, const cv::Vec2i& p1, const cv::Vec2i& p2,
+                                   const cv::Vec2f& uv0, const cv::Vec2f& uv1, const cv::Vec2f& uv2) {
+            if (!has_valid_src(p0) || !has_valid_src(p1) || !has_valid_src(p2) ||
+                !has_valid_uv(uv0) || !has_valid_uv(uv1) || !has_valid_uv(uv2)) {
+                return;
+            }
+            const cv::Vec2f g0 = to_lattice(uv0);
+            const cv::Vec2f g1 = to_lattice(uv1);
+            const cv::Vec2f g2 = to_lattice(uv2);
+            const int min_x = std::max(0, static_cast<int>(std::floor(std::min({g0[0], g1[0], g2[0]}))) - 1);
+            const int max_x = std::min(next_points.cols - 1, static_cast<int>(std::ceil(std::max({g0[0], g1[0], g2[0]}))) + 1);
+            const int min_y = std::max(0, static_cast<int>(std::floor(std::min({g0[1], g1[1], g2[1]}))) - 1);
+            const int max_y = std::min(next_points.rows - 1, static_cast<int>(std::ceil(std::max({g0[1], g1[1], g2[1]}))) + 1);
+            for (int y = min_y; y <= max_y; ++y) {
+                for (int x = min_x; x <= max_x; ++x) {
+                    cv::Vec3d bary;
+                    if (!barycentric(cv::Vec2f(static_cast<float>(x), static_cast<float>(y)), g0, g1, g2, bary)) {
+                        continue;
+                    }
+                    const cv::Vec2i dst(y, x);
+                    const int priority = static_cast<int>(std::lround(
+                        bary[0] * old_inliers(p0) + bary[1] * old_inliers(p1) + bary[2] * old_inliers(p2)));
+                    if ((next_state(dst) & STATE_LOC_VALID) != 0 && priority <= next_inliers(dst)) {
+                        continue;
+                    }
+
+                    std::set<QuadSurface*> dst_surfs;
+                    for (QuadSurface* surf : old_data.surfsC(p0)) {
+                        if (!old_data.surfsC(p1).contains(surf) || !old_data.surfsC(p2).contains(surf) ||
+                            !old_data.has(surf, p0) || !old_data.has(surf, p1) || !old_data.has(surf, p2)) {
+                            continue;
+                        }
+                        dst_surfs.insert(surf);
+                    }
+                    if (dst_surfs.empty()) {
+                        continue;
+                    }
+
+                    clear_next_data_at(dst);
+                    next_state(dst) = STATE_LOC_VALID | STATE_COORD_VALID;
+                    next_generations(dst) = static_cast<uint16_t>(std::clamp<int>(
+                        static_cast<int>(std::lround(bary[0] * old_generations(p0) +
+                                                     bary[1] * old_generations(p1) +
+                                                     bary[2] * old_generations(p2))),
+                        0,
+                        std::numeric_limits<uint16_t>::max()));
+                    next_points(dst) = bary[0] * old_points(p0) + bary[1] * old_points(p1) + bary[2] * old_points(p2);
+                    next_inliers(dst) = static_cast<uint16_t>(std::clamp(priority, 0, static_cast<int>(std::numeric_limits<uint16_t>::max())));
+                    next_data.surfs(dst) = dst_surfs;
+                    for (QuadSurface* surf : dst_surfs) {
+                        next_data.loc(surf, dst) =
+                            bary[0] * old_data._data[{surf, p0}] +
+                            bary[1] * old_data._data[{surf, p1}] +
+                            bary[2] * old_data._data[{surf, p2}];
+                    }
+                }
+            }
+        };
+
+        for (int y = 0; y < active.height - 1; ++y) {
+            for (int x = 0; x < active.width - 1; ++x) {
+                const cv::Vec2i p00(active.y + y, active.x + x);
+                const cv::Vec2i p01(active.y + y, active.x + x + 1);
+                const cv::Vec2i p10(active.y + y + 1, active.x + x);
+                const cv::Vec2i p11(active.y + y + 1, active.x + x + 1);
+                const cv::Vec2f& uv00 = diagnostics.uv(y, x);
+                const cv::Vec2f& uv01 = diagnostics.uv(y, x + 1);
+                const cv::Vec2f& uv10 = diagnostics.uv(y + 1, x);
+                const cv::Vec2f& uv11 = diagnostics.uv(y + 1, x + 1);
+                raster_triangle(p10, p00, p01, uv10, uv00, uv01);
+                raster_triangle(p10, p01, p11, uv10, uv01, uv11);
+            }
         }
-        if (kept_moves.empty()) {
+
+        int rasterized_count = 0;
+        cv::Rect next_used_area;
+        bool have_next_used_area = false;
+        for (int y = 0; y < next_state.rows; ++y) {
+            for (int x = 0; x < next_state.cols; ++x) {
+                if ((next_state(y, x) & STATE_LOC_VALID) == 0 || next_points(y, x)[0] == -1) {
+                    continue;
+                }
+                rasterized_count++;
+                const cv::Rect cell(x, y, 1, 1);
+                next_used_area = have_next_used_area ? (next_used_area | cell) : cell;
+                have_next_used_area = true;
+            }
+        }
+        if (!have_next_used_area || rasterized_count < flatten_regrid_min_valid) {
             return 0;
         }
-        if (!seed_kept) {
-            std::cout << "flatten regrid: rejecting remap; seed would be removed" << std::endl;
-            return 0;
-        }
-        const double keep_ratio = static_cast<double>(kept_moves.size()) / static_cast<double>(valid_count);
+        const double keep_ratio = static_cast<double>(std::min(rasterized_count, valid_count)) / static_cast<double>(valid_count);
         if (keep_ratio < static_cast<double>(flatten_regrid_min_keep_ratio)) {
-            std::cout << "flatten regrid: rejecting remap; kept ratio "
+            std::cout << "flatten regrid: rejecting raster grid; rasterized ratio "
                       << keep_ratio << " below " << flatten_regrid_min_keep_ratio << std::endl;
             return 0;
         }
 
-        SurfTrackerData old_data = data;
-        cv::Mat_<uint8_t> old_state = state.clone();
-        cv::Mat_<uint16_t> old_generations = generations.clone();
-        cv::Mat_<cv::Vec3d> old_points = points.clone();
-        cv::Mat_<uint16_t> old_inliers = inliers_sum_dbg.clone();
-
-        for (int y = active.y; y < active.br().y; ++y) {
-            for (int x = active.x; x < active.br().x; ++x) {
-                const cv::Vec2i p(y, x);
-                state(p) = 0;
-                generations(p) = 0;
-                points(p) = {-1, -1, -1};
-                inliers_sum_dbg(p) = 0;
-            }
-        }
-
-        auto data_it = data._data.begin();
-        while (data_it != data._data.end()) {
-            if (in_active(data_it->first.second)) {
-                data_it = data._data.erase(data_it);
-            } else {
-                ++data_it;
-            }
-        }
-        auto surfs_it = data._surfs.begin();
-        while (surfs_it != data._surfs.end()) {
-            if (in_active(surfs_it->first)) {
-                surfs_it = data._surfs.erase(surfs_it);
-            } else {
-                ++surfs_it;
-            }
-        }
-        data._res_blocks.clear();
-
-        int moved_seed = 0;
-        for (const RegridMove& move : kept_moves) {
-            state(move.to) = old_state(move.from);
-            generations(move.to) = old_generations(move.from);
-            points(move.to) = old_points(move.from);
-            inliers_sum_dbg(move.to) = old_inliers(move.from);
-
-            data.surfs(move.to) = old_data.surfsC(move.from);
-            for (QuadSurface* surf : data.surfs(move.to)) {
-                if (old_data.has(surf, move.from)) {
-                    data.loc(surf, move.to) = old_data._data[{surf, move.from}];
+        if (seed_in_active) {
+            cv::Vec2i mapped_seed(lattice_origin.y + seed_local[0], lattice_origin.x + seed_local[1]);
+            cv::Vec2i best_seed(-1, -1);
+            int best_seed_dist = std::numeric_limits<int>::max();
+            for (int y = next_used_area.y; y < next_used_area.br().y; ++y) {
+                for (int x = next_used_area.x; x < next_used_area.br().x; ++x) {
+                    const cv::Vec2i p(y, x);
+                    if ((next_state(p) & STATE_LOC_VALID) == 0 || next_points(p)[0] == -1) {
+                        continue;
+                    }
+                    const int dy = y - mapped_seed[0];
+                    const int dx = x - mapped_seed[1];
+                    const int dist = dy * dy + dx * dx;
+                    if (dist < best_seed_dist) {
+                        best_seed_dist = dist;
+                        best_seed = p;
+                    }
                 }
             }
-            if (move.from == old_data.seed_loc) {
-                data.seed_loc = move.to;
-                moved_seed++;
+            if (best_seed[0] < 0) {
+                std::cout << "flatten regrid: rejecting raster grid; seed would be removed" << std::endl;
+                return 0;
             }
+            next_data.seed_loc = best_seed;
+            next_data.seed_coord = next_points(best_seed);
+        } else {
+            next_data.seed_loc = old_data.seed_loc + cv::Vec2i(add_up, add_left);
+            next_data.seed_coord = old_data.seed_coord;
         }
-        data.seed_coord = old_data.seed_coord;
 
-        recompute_used_area_from_state();
+        points = std::move(next_points);
+        state = std::move(next_state);
+        generations = std::move(next_generations);
+        inliers_sum_dbg = std::move(next_inliers);
+        data = std::move(next_data);
+        w = points.cols;
+        h = points.rows;
+        size = {w, h};
+        bounds = {0, 0, w - 1, h - 1};
+        save_bounds_inv = {closing_r + 5, closing_r + 5, h - closing_r - 10, w - closing_r - 10};
+        active_bounds = {closing_r + 5, closing_r + 5, w - closing_r - 10, h - closing_r - 10};
+        static_bounds = cv::Rect(0, 0, 0, h);
+        if (add_left > 0 || add_up > 0) {
+            expanded_left += add_left;
+            expanded_up += add_up;
+            x0 += add_left;
+            y0 += add_up;
+        }
+        used_area = next_used_area;
+        used_area_hr = scaled_rect_trunc(used_area, step);
         fringe.clear();
-        for (const RegridMove& move : kept_moves) {
-            if ((state(move.to) & STATE_LOC_VALID) == 0) {
-                continue;
-            }
-            for (const auto& n : neighs) {
-                const cv::Vec2i pn = move.to + n;
-                if (pn[0] < 0 || pn[0] >= state.rows || pn[1] < 0 || pn[1] >= state.cols) {
+        for (int y = used_area.y; y < used_area.br().y; ++y) {
+            for (int x = used_area.x; x < used_area.br().x; ++x) {
+                const cv::Vec2i p(y, x);
+                if ((state(p) & STATE_LOC_VALID) == 0) {
                     continue;
                 }
-                if ((state(pn) & STATE_LOC_VALID) == 0) {
-                    fringe.insert(move.to);
-                    break;
+                for (const auto& n : neighs) {
+                    const cv::Vec2i pn = p + n;
+                    if (pn[0] < 0 || pn[0] >= state.rows || pn[1] < 0 || pn[1] >= state.cols ||
+                        (state(pn) & STATE_LOC_VALID) == 0) {
+                        fringe.insert(p);
+                        break;
+                    }
                 }
             }
         }
@@ -3052,15 +3228,15 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             added_points_threads[i].clear();
         }
 
-        std::cout << "flatten regrid: moved " << kept_moves.size()
-                  << " / " << moves.size()
-                  << " vertices after generation " << generation;
-        if (moved_seed > 0) {
+        std::cout << "flatten regrid: rasterized " << rasterized_count
+                  << " points into " << lattice_w << "x" << lattice_h
+                  << " lattice after generation " << generation;
+        if (seed_in_active) {
             std::cout << " (seed moved to " << data.seed_loc << ")";
         }
         std::cout << std::endl;
 
-        return static_cast<int>(kept_moves.size());
+        return rasterized_count;
     };
 
     bool at_right_border = false;
