@@ -223,6 +223,35 @@ int HttpSource::totalChunksPerShard() const noexcept
 namespace {
 thread_local bool tl_last_was_absent = false;
 thread_local bool tl_last_had_transient_error = false;
+
+std::string httpBodyPreview(const utils::HttpResponse& resp)
+{
+    if (resp.body.empty()) return "no body";
+
+    const bool contentTypeText =
+        resp.content_type.find("text/") != std::string::npos ||
+        resp.content_type.find("json") != std::string::npos ||
+        resp.content_type.find("xml") != std::string::npos;
+    if (!contentTypeText) {
+        return std::to_string(resp.body.size()) + " body bytes";
+    }
+
+    std::string out;
+    const size_t limit = std::min(resp.body.size(), size_t(200));
+    out.reserve(limit);
+    for (size_t i = 0; i < limit; ++i) {
+        const unsigned char c = static_cast<unsigned char>(resp.body[i]);
+        if (c == '\n' || c == '\r' || c == '\t') {
+            out.push_back(' ');
+        } else if (c >= 32 && c < 127) {
+            out.push_back(static_cast<char>(c));
+        } else {
+            return std::to_string(resp.body.size()) + " non-text body bytes";
+        }
+    }
+    if (resp.body.size() > limit) out += "...";
+    return out;
+}
 }
 
 bool HttpSource::lastFetchWasAbsent() noexcept
@@ -248,7 +277,7 @@ std::vector<uint8_t> HttpSource::httpGet(const std::string& url)
         // 404 is an expected "chunk doesn't exist" response — stay quiet.
         // Anything else (403/401/5xx) almost always means auth or network
         // trouble; log loudly so it doesn't look like an empty volume.
-        if (resp.status_code != 404) {
+        if (resp.status_code != 404 && !utils::HttpClient::isAborted()) {
             tl_last_had_transient_error = true;
             transientError_.store(true, std::memory_order_relaxed);
             static std::atomic<int> errCount{0};
@@ -257,11 +286,7 @@ std::vector<uint8_t> HttpSource::httpGet(const std::string& url)
                 std::fprintf(stderr, "[HTTP] GET %s -> status=%ld (%s)\n",
                              url.c_str(),
                              long(resp.status_code),
-                             resp.body.empty()
-                                 ? "(no body)"
-                                 : std::string(
-                                     reinterpret_cast<const char*>(resp.body.data()),
-                                     std::min(resp.body.size(), size_t(200))).c_str());
+                             httpBodyPreview(resp).c_str());
             }
         }
         return {};
@@ -288,7 +313,7 @@ std::vector<uint8_t> HttpSource::httpGetRange(const std::string& url,
     tl_last_was_absent = (resp.status_code == 404);
     tl_last_had_transient_error = false;
     if (!resp.ok()) {
-        if (resp.status_code != 404) {
+        if (resp.status_code != 404 && !utils::HttpClient::isAborted()) {
             tl_last_had_transient_error = true;
             transientError_.store(true, std::memory_order_relaxed);
             static std::atomic<int> errCount{0};

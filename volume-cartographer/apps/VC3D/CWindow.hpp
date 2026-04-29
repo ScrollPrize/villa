@@ -19,6 +19,7 @@
 #include <map>
 
 #include "CPointCollectionWidget.hpp"
+#include "CFiberWidget.hpp"
 #include "CState.hpp"
 #include "adaptive/CAdaptiveVolumeViewer.hpp"
 #include "DrawingWidget.hpp"
@@ -51,6 +52,7 @@ static constexpr int VOLPKG_SLICE_MIN_INDEX = 0;
 
 //forward declaration to avoid circular inclusion as CommandLineToolRunner needs CWindow.hpp
 class CommandLineToolRunner;
+class FiberAnnotationController;
 class SegmentationModule;
 class SurfacePanelController;
 class MenuActionController;
@@ -179,6 +181,10 @@ private slots:
     void onSliceStepSizeChanged(int newSize);
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
     void onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId);
+    void onNewFiberRequested();
+    void onFiberCrosshairModeChanged(bool active);
+    void onFiberViewersRequested();
+    void onFiberAnnotationFinished(uint64_t fiberId);
     void refreshVolumeSelectionUi(const QString& preferredVolumeId = QString());
     void onPreviewTransformToggled(bool enabled);
     void onSaveTransformedRequested();
@@ -196,6 +202,8 @@ private:
     QDockWidget* _lasagnaDock{nullptr};
     DrawingWidget* _drawingWidget;
     CPointCollectionWidget* _point_collection_widget;
+    CFiberWidget* _fiberWidget{nullptr};
+    std::unique_ptr<FiberAnnotationController> _fiberController;
 
     SurfaceTreeWidget *treeWidgetSurfaces;
     QPushButton *btnReloadSurfaces;

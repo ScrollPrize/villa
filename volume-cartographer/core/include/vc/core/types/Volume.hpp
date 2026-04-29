@@ -107,6 +107,11 @@ public:
     // first tieredCache().
     void setEncodeParams(const utils::C3dCodecParams& params);
 
+    // When false, the disk cache stores source chunk bytes unchanged at the
+    // source volume's native chunk size instead of c3d-compressed shards.
+    // Must be called before first tieredCache() access.
+    void setDiskCacheCompressed(bool compressed);
+
     // --- Sampling API ---
 
     // Single-slice blocking sample (uint8)
@@ -191,6 +196,9 @@ protected:
 
     // Filesystem mount info (detected once at construction)
     vc::NetworkMountInfo mountInfo_;
+
+    // Disk cache mode (true = c3d compressed shards, false = raw voxels)
+    bool diskCacheCompressed_ = true;
 
     // Remote volume state
     bool isRemote_ = false;

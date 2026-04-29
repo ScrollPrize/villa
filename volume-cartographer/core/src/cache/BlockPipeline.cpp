@@ -1,7 +1,6 @@
 #include "vc/core/cache/BlockPipeline.hpp"
 #include "vc/core/cache/TickCoordinator.hpp"
 #include "vc/core/cache/VolumeSource.hpp"
-#include "vc/core/cache/CacheDebugLog.hpp"
 #include "vc/core/cache/VcDecompressor.hpp"
 #include "vc/core/types/VcDataset.hpp"
 
@@ -26,14 +25,21 @@ static std::array<size_t, 3> chunkIndices(const ChunkKey& key) {
 
 static std::optional<std::vector<std::byte>> zarrReadChunk(
     utils::ZarrArray& zarr, const ChunkKey& key) {
-    return zarr.read_inner_chunk_from_shard(chunkIndices(key));
+    if (zarr.is_sharded()) {
+        return zarr.read_inner_chunk_from_shard(chunkIndices(key));
+    }
+    return zarr.read_chunk(chunkIndices(key));
 }
 
 static void zarrWriteChunk(
     utils::ZarrArray& zarr, const ChunkKey& key,
     const uint8_t* data, size_t size) {
     std::span<const std::byte> bytes(reinterpret_cast<const std::byte*>(data), size);
-    zarr.write_inner_chunk_to_shard(chunkIndices(key), bytes);
+    if (zarr.is_sharded()) {
+        zarr.write_inner_chunk_to_shard(chunkIndices(key), bytes);
+        return;
+    }
+    zarr.write_chunk(chunkIndices(key), bytes);
 }
 
 static bool isAllZero(const uint8_t* data, size_t size) noexcept {
@@ -285,8 +291,6 @@ BlockPipeline::BlockPipeline(
     }())
     , blockCache_(blockCache)
 {
-    fprintf(stderr, "[BlockPipeline] constructor %p: bytes=%zu\n", (void*)this, config_.bytes);
-
     // Clear any stale process-wide HTTP abort flag from a previous
     // BlockPipeline's destructor.
     utils::HttpClient::resetAbort();
@@ -339,11 +343,10 @@ BlockPipeline::BlockPipeline(
     encodePool_.setShardMapper(shardMapper);
     loaderPool_.setShardMapper(shardMapper);
 
-    // Downloader: network fetch + source-codec decode + re-chunk into a
-    // canonical 128³ ChunkData. Stages the decoded buffer and hands the
-    // key to the encoder. Does NOT touch disk, h265, or the block cache —
-    // so one thread can return to fetching the next chunk as quickly as
-    // possible.
+    // Downloader: network fetch.  Compressed-cache mode source-decodes and
+    // re-chunks into canonical ChunkData before staging; unchanged-cache mode
+    // stages the fetched source bytes directly.  Does NOT touch disk, c3d, or
+    // the block cache.
     downloaderPool_.setFetchFunc([this](const ShardKey& shard) -> IOPool::FetchResult {
         ChunkKey key{shard.level, shard.sz, shard.sy, shard.sx};
         if (isNegativeCached(key)) return {};
@@ -361,29 +364,28 @@ BlockPipeline::BlockPipeline(
             return {};
         }
 
-        // Backpressure: wait until encodeStaging_ has room before paying
-        // the network + decode cost. Gating here (vs. after assemble)
-        // means a stalled encoder pool doesn't hold 16 MiB buffers per
-        // blocked downloader worker.
         {
             std::unique_lock lk(encodeStagingMutex_);
             encodeStagingCv_.wait(lk, [this] {
                 return shuttingDown_.load(std::memory_order_acquire)
-                    || encodeStaging_.size() < config_.maxEncodeStagingChunks;
+                    || encodeStaging_.size() + encodeByteStaging_.size()
+                         < config_.maxEncodeStagingChunks;
             });
             if (shuttingDown_.load(std::memory_order_acquire)) return {};
         }
 
-        // Pull source chunks over the network and assemble a canonical
-        // 128³ buffer. Source decode happens here too because the
-        // re-chunking needs the voxels; it's a small fraction of the
-        // overall work compared to x265 encode, which is now off-thread.
-        auto decoded = assembleCanonicalChunk(key);
-        if (!decoded) {
-            // Negative-cache *only* when the source confirms the chunk is
-            // genuinely absent — a real S3 404, or a sharded v3 missing/
-            // zero-placeholder index entry. Transient errors / curl
-            // failures / auth issues must not poison the cache.
+        ChunkDataPtr decoded;
+        std::vector<uint8_t> sourceBytes;
+        if (config_.compressed) {
+            decoded = assembleCanonicalChunk(key);
+        } else {
+            try { sourceBytes = source_->fetch(key); } catch (...) {}
+        }
+
+        const bool fetched = config_.compressed
+            ? static_cast<bool>(decoded)
+            : (!sourceBytes.empty() && !isAllZero(sourceBytes.data(), sourceBytes.size()));
+        if (!fetched) {
             const bool isHttp = dynamic_cast<HttpSource*>(source_.get()) != nullptr;
             const bool absent = !isHttp || HttpSource::lastFetchWasAbsent();
             if (absent) {
@@ -401,10 +403,13 @@ BlockPipeline::BlockPipeline(
         }
         statIceFetches_.fetch_add(1, std::memory_order_relaxed);
 
-        // Stage for the encoder.
         {
             std::lock_guard lk(encodeStagingMutex_);
-            encodeStaging_[key] = std::move(decoded);
+            if (config_.compressed) {
+                encodeStaging_[key] = std::move(decoded);
+            } else {
+                encodeByteStaging_[key] = std::move(sourceBytes);
+            }
         }
         IOPool::FetchResult result;
         result.emplace_back(key, std::vector<uint8_t>{});
@@ -417,39 +422,51 @@ BlockPipeline::BlockPipeline(
             std::vector<ChunkKey> encodeKeys;
             encodeKeys.reserve(res.size());
             for (auto& [key, _] : res) encodeKeys.push_back(key);
-            // submit appends (O(N) in new keys); updateInteractive would
-            // reshuffle the whole encoder queue (O(Q)) and reset served
-            // counters, neither of which makes sense for inter-stage
-            // handoffs — the viewport priority comes from the renderer's
-            // fetchInteractive call upstream, not from completions.
             encodePool_.submit(encodeKeys);
         });
 
-    // Encoder: take staged ChunkData → h265 encode → disk write → forward
-    // the key to the loader. Pure CPU work plus a small disk write;
-    // oversubscribing this pool just thrashes cores, so it runs at 1×
-    // hardware_concurrency.
+    // Encoder: compressed-cache mode takes staged ChunkData → c3d encode →
+    // disk write.  Unchanged-cache mode writes staged source bytes directly.
+    // Then forward the key to the loader.
     encodePool_.setFetchFunc([this](const ShardKey& shard) -> IOPool::FetchResult {
         ChunkKey key{shard.level, shard.sz, shard.sy, shard.sx};
         auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
         if (!dz) return {};
 
-        ChunkDataPtr decoded;
-        {
-            std::lock_guard lk(encodeStagingMutex_);
-            auto it = encodeStaging_.find(key);
-            if (it == encodeStaging_.end()) return {};
-            decoded = std::move(it->second);
-            encodeStaging_.erase(it);
-        }
-        encodeStagingCv_.notify_one();
-        if (!decoded) return {};
+        size_t writeBytes;
+        if (config_.compressed) {
+            ChunkDataPtr decoded;
+            {
+                std::lock_guard lk(encodeStagingMutex_);
+                auto it = encodeStaging_.find(key);
+                if (it == encodeStaging_.end()) return {};
+                decoded = std::move(it->second);
+                encodeStaging_.erase(it);
+            }
+            encodeStagingCv_.notify_one();
+            if (!decoded) return {};
 
-        const auto& encoded = encodeCanonicalChunk(*decoded, config_);
-        zarrWriteChunk(*dz, key,
-            reinterpret_cast<const uint8_t*>(encoded.data()), encoded.size());
+            const auto& encoded = encodeCanonicalChunk(*decoded, config_);
+            zarrWriteChunk(*dz, key,
+                reinterpret_cast<const uint8_t*>(encoded.data()), encoded.size());
+            writeBytes = encoded.size();
+        } else {
+            std::vector<uint8_t> sourceBytes;
+            {
+                std::lock_guard lk(encodeStagingMutex_);
+                auto it = encodeByteStaging_.find(key);
+                if (it == encodeByteStaging_.end()) return {};
+                sourceBytes = std::move(it->second);
+                encodeByteStaging_.erase(it);
+            }
+            encodeStagingCv_.notify_one();
+            if (sourceBytes.empty()) return {};
+
+            zarrWriteChunk(*dz, key, sourceBytes.data(), sourceBytes.size());
+            writeBytes = sourceBytes.size();
+        }
         statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
-        statDiskBytes_.fetch_add(encoded.size(), std::memory_order_relaxed);
+        statDiskBytes_.fetch_add(writeBytes, std::memory_order_relaxed);
         if (dz->is_sharded()) {
             const ShardKey sk = canonicalShardKey(key);
             {
@@ -531,8 +548,6 @@ BlockPipeline::BlockPipeline(
             // Local source, no disk tier: treat the source files as disk.
             try { compressed = source_->fetch(key); } catch (...) { return {}; }
             if (compressed.empty() || isAllZero(compressed.data(), compressed.size())) {
-                // Same rule as the downloader: only poison the negative
-                // cache when the source confirms genuine absence.
                 const bool isHttp = dynamic_cast<HttpSource*>(source_.get()) != nullptr;
                 const bool absent = !isHttp || HttpSource::lastFetchWasAbsent();
                 if (absent) {
@@ -624,7 +639,11 @@ BlockPipeline::BlockPipeline(
 
         ChunkDataPtr decoded;
         auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
-        if (dz) {
+        if (!config_.compressed && dz) {
+            // Unchanged-cache mode: disk bytes are exactly what the source
+            // delivered, so apply the normal source decompressor now.
+            if (decompress_) decoded = decompress_(compressed, key);
+        } else if (dz) {
             decoded = decodeCanonicalChunk(compressed);
         } else if (decompress_) {
             decoded = decompress_(compressed, key);
@@ -773,6 +792,16 @@ BlockPipeline::BlockPipeline(
     }
 skipPassthrough:
 
+    // Precompute blocks-per-chunk for each level (used by blockAt).
+    for (int lvl = 0; lvl < kMaxLevels; ++lvl) {
+        auto cs = chunkShape(lvl);
+        if (cs[0] > 0 && cs[1] > 0 && cs[2] > 0) {
+            blocksPerChunk_[lvl] = {cs[0] / kBlockSize,
+                                    cs[1] / kBlockSize,
+                                    cs[2] / kBlockSize};
+        }
+    }
+
     downloaderPool_.start();
     encodePool_.start();
     loaderPool_.start();
@@ -783,10 +812,8 @@ void BlockPipeline::shutdown() {
     // Atomic exchange: if already shutting down (destructor or prior shutdown()
     // call), skip. This makes shutdown() + ~BlockPipeline() idempotent.
     if (shuttingDown_.exchange(true, std::memory_order_acq_rel)) {
-        fprintf(stderr, "[BlockPipeline] shutdown %p: already shut down\n", (void*)this);
         return;
     }
-    fprintf(stderr, "[BlockPipeline] shutdown %p: stopping pools...\n", (void*)this);
     // Release any downloader workers blocked on the backpressure CV so
     // pool.stop() can actually join them.
     encodeStagingCv_.notify_all();
@@ -810,19 +837,10 @@ void BlockPipeline::shutdown() {
     // All workers have joined — safe to clear the process-global abort
     // flag so a new pipeline can use curl without seeing a stale abort.
     utils::HttpClient::resetAbort();
-    fprintf(stderr, "[BlockPipeline] shutdown %p: pools stopped, abort cleared\n", (void*)this);
-    auto cold = statColdHits_.load();
-    auto ice = statIceFetches_.load();
-    if (cold > 0 || ice > 0) {
-        std::fprintf(stderr, "[Cache] session summary: coldHits=%lu iceFetches=%lu (%.0f%% from disk)\n",
-                     cold, ice, (cold + ice) > 0 ? 100.0 * cold / (cold + ice) : 0.0);
-    }
 }
 
 BlockPipeline::~BlockPipeline() {
-    fprintf(stderr, "[BlockPipeline] destructor %p\n", (void*)this);
     shutdown();
-    fprintf(stderr, "[BlockPipeline] destructor %p: done\n", (void*)this);
 }
 
 void BlockPipeline::bloomAdd(const ChunkKey& key) noexcept {
@@ -847,10 +865,6 @@ void BlockPipeline::bloomClear() noexcept {
 }
 
 void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targetLevel) {
-    static int fetchDbgCount = 0;
-    if (fetchDbgCount++ < 5 || fetchDbgCount % 100 == 0)
-        fprintf(stderr, "[BlockPipeline] fetchInteractive %p: %zu keys, targetLevel=%d\n",
-                (void*)this, keys.size(), targetLevel);
     if (keys.empty()) return;
     // Dedup: the renderer calls this every frame, and viewport-idle frames
     // pass the same keys + targetLevel as the previous call. When the
@@ -954,9 +968,10 @@ void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targ
             && resident[i * 2] && resident[i * 2 + 1]) continue;
 
         auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
-        const bool diskPresent = dz
-            && dz->is_sharded()
-            && dz->inner_chunk_exists(chunkIndices(key));
+        const bool diskPresent = dz && (
+            dz->is_sharded()
+                ? dz->inner_chunk_exists(chunkIndices(key))
+                : dz->chunk_exists(chunkIndices(key)));
         if (diskPresent || !dz) {
             // Present on canonical disk, OR no canonical disk tier at all
             // (local filesystem source — the "disk" is the source files).
@@ -985,8 +1000,13 @@ BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
     // canonical-chunk index and query via the lock-free hash set. No
     // rwlock on the miss path — every blockAt miss used to hit
     // pthread_rwlock_rdlock here.
-    const int cps = kCanonicalChunkSide / kBlockSize;
-    const ChunkKey chunkKey{key.level, key.bz / cps, key.by / cps, key.bx / cps};
+    const auto& bpc = (key.level >= 0 && key.level < kMaxLevels)
+        ? blocksPerChunk_[key.level]
+        : blocksPerChunk_[0];
+    const int bpcZ = bpc[0] > 0 ? bpc[0] : (kCanonicalChunkSide / kBlockSize);
+    const int bpcY = bpc[1] > 0 ? bpc[1] : (kCanonicalChunkSide / kBlockSize);
+    const int bpcX = bpc[2] > 0 ? bpc[2] : (kCanonicalChunkSide / kBlockSize);
+    const ChunkKey chunkKey{key.level, key.bz / bpcZ, key.by / bpcY, key.bx / bpcX};
     if (isEmptyChunk(chunkKey)) {
         // One canonical zero block shared by every caller asking for
         // a block inside any empty chunk — no arena consumption.
@@ -1076,7 +1096,6 @@ ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey) {
     if (!anyData) return nullptr;
     return out;
 }
-
 
 void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
                                         const ChunkData& chunk) {
@@ -1182,6 +1201,7 @@ void BlockPipeline::clearAll() {
     {
         std::lock_guard lk(encodeStagingMutex_);
         encodeStaging_.clear();
+        encodeByteStaging_.clear();
     }
     {
         std::lock_guard lk(decodeStagingMutex_);
@@ -1213,9 +1233,13 @@ std::array<int, 3> BlockPipeline::chunkShape(int level) const noexcept {
     // chunk size may differ (e.g., 128³ h265 source re-canonicalized as
     // 256³ c3d); returning the source shape would make Slicing.cpp's
     // chunk-key enumeration compute the wrong grid.
+    // In unchanged-cache mode, source chunk size is used directly (no rechunking).
     if (level >= 0 && level < int(diskLevels_.size()) && diskLevels_[level]) {
-        const int C = kCanonicalChunkSide;
-        return {C, C, C};
+        if (config_.compressed) {
+            const int C = kCanonicalChunkSide;
+            return {C, C, C};
+        }
+        return source_->chunkShape(level);
     }
     return source_->chunkShape(level);
 }
@@ -1343,9 +1367,10 @@ std::vector<ChunkKey> BlockPipeline::chunksMissingFromCache(
         auto* dz = (key.level >= 0 && key.level < int(diskLevels_.size()))
             ? diskLevels_[key.level].get()
             : nullptr;
-        const bool diskPresent = dz
-            && dz->is_sharded()
-            && dz->inner_chunk_exists(chunkIndices(key));
+        const bool diskPresent = dz && (
+            dz->is_sharded()
+                ? dz->inner_chunk_exists(chunkIndices(key))
+                : dz->chunk_exists(chunkIndices(key)));
         if (diskPresent) continue;
 
         missing.push_back(key);
@@ -1390,7 +1415,7 @@ auto BlockPipeline::stats() const -> Stats {
     s.ioPending = s.downloadPending + s.encodePending + s.loadPending + s.decodePending;
     {
         std::lock_guard lk(encodeStagingMutex_);
-        s.encodeStagingChunks = encodeStaging_.size();
+        s.encodeStagingChunks = encodeStaging_.size() + encodeByteStaging_.size();
     }
     s.decodeStagingBytes = decodeStagingBytesAtomic_.load(
         std::memory_order_relaxed);

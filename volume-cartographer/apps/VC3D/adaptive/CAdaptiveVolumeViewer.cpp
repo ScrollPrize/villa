@@ -3,6 +3,7 @@
 #include "ViewerManager.hpp"
 #include "VCSettings.hpp"
 #include "../CState.hpp"
+
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -92,6 +93,10 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
     connect(_view, &CVolumeViewerView::sendMousePress, this, &CAdaptiveVolumeViewer::onMousePress);
     connect(_view, &CVolumeViewerView::sendMouseMove, this, &CAdaptiveVolumeViewer::onMouseMove);
     connect(_view, &CVolumeViewerView::sendMouseRelease, this, &CAdaptiveVolumeViewer::onMouseRelease);
+    connect(_view, &CVolumeViewerView::sendMouseDoubleClick, this, [this](QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
+        cv::Vec3f p = sceneToVolume(scenePos);
+        emit sendMouseDoubleClickVolume(p, button, modifiers);
+    });
     connect(_view, &CVolumeViewerView::sendKeyPress, this, &CAdaptiveVolumeViewer::onKeyPress);
     connect(_view, &CVolumeViewerView::sendKeyRelease, this, &CAdaptiveVolumeViewer::onKeyRelease);
 
@@ -224,10 +229,6 @@ Surface* CAdaptiveVolumeViewer::currentSurface() const
 
 void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
 {
-    fprintf(stderr, "[Viewer:%s] OnVolumeChanged: old=%p new=%p _surfWeak=%p axisAligned=%d\n",
-            _surfName.c_str(), (void*)_volume.get(), (void*)vol.get(),
-            (void*)_surfWeak.lock().get(), isAxisAlignedView() ? 1 : 0);
-
     if (_chunkCbId != 0 && _volume && _volume->tieredCache()) {
         _volume->tieredCache()->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
@@ -279,9 +280,6 @@ void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
         _defaultSurface = std::make_shared<PlaneSurface>(center, normal);
         _surfWeak = _defaultSurface;
     }
-
-    fprintf(stderr, "[Viewer:%s] OnVolumeChanged: after surface setup: _surfWeak=%p _volume=%p\n",
-            _surfName.c_str(), (void*)_surfWeak.lock().get(), (void*)_volume.get());
 
     if (_volume) {
         int nScales = static_cast<int>(_volume->numScales());

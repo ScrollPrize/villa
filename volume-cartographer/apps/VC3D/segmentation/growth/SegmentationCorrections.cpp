@@ -53,39 +53,6 @@ void CorrectionsState::setCollection(VCCollection* collection)
     refreshWidget();
 }
 
-bool CorrectionsState::setAnnotateMode(bool enabled, bool userInitiated, bool editingEnabled)
-{
-    if (!_collection || _growthInProgress || !editingEnabled) {
-        enabled = false;
-    }
-
-    if (enabled && _activeCollectionId == 0) {
-        if (createCollection(false) == 0) {
-            enabled = false;
-        }
-    }
-
-    if (_annotateMode == enabled) {
-        refreshWidget();
-        return _annotateMode;
-    }
-
-    _annotateMode = enabled;
-
-    if (_widget) {
-        _widget->setCorrectionsAnnotateChecked(enabled);
-    }
-
-    if (userInitiated) {
-        const QString message = enabled ? QObject::tr("Correction annotation enabled")
-                                        : QObject::tr("Correction annotation disabled");
-        emitStatus(message, kStatusShort);
-    }
-
-    refreshWidget();
-    return _annotateMode;
-}
-
 void CorrectionsState::setActiveCollection(uint64_t collectionId, bool userInitiated)
 {
     if (!_collection) {
@@ -94,7 +61,6 @@ void CorrectionsState::setActiveCollection(uint64_t collectionId, bool userIniti
 
     if (collectionId == 0) {
         _activeCollectionId = 0;
-        setAnnotateMode(false, false, _module.editingEnabled());
         refreshWidget();
         return;
     }
@@ -164,7 +130,16 @@ void CorrectionsState::handlePointAdded(const cv::Vec3f& worldPos, float wind_a)
     }
 
     ColPoint pt = _collection->addPoint(it->second.name, worldPos);
-    if (!std::isnan(wind_a)) {
+
+    // Priority: auto-fill mode > d.tif lookup
+    auto mode = _collection->getAutoFillMode(_activeCollectionId);
+    if (mode != VCCollection::WindingFillMode::None) {
+        float autoVal = _collection->computeAutoFillValue(_activeCollectionId);
+        if (!std::isnan(autoVal)) {
+            pt.winding_annotation = autoVal;
+            _collection->updatePoint(pt);
+        }
+    } else if (!std::isnan(wind_a)) {
         pt.winding_annotation = wind_a;
         _collection->updatePoint(pt);
     }
@@ -240,13 +215,10 @@ void CorrectionsState::setGrowthInProgress(bool running)
     if (_widget) {
         _widget->setCorrectionsEnabled(!_growthInProgress && _collection != nullptr);
     }
-    if (_growthInProgress) {
-        setAnnotateMode(false, false, _module.editingEnabled());
-    }
     refreshWidget();
 }
 
-void CorrectionsState::clearAll(bool editingEnabled)
+void CorrectionsState::clearAll()
 {
     if (_collection) {
         for (uint64_t id : _pendingCollectionIds) {
@@ -302,7 +274,6 @@ void CorrectionsState::refreshWidget()
 
     _widget->setCorrectionCollections(entries, active);
     _widget->setCorrectionsEnabled(correctionsAvailable);
-    _widget->setCorrectionsAnnotateChecked(_annotateMode && correctionsAvailable);
 }
 
 void CorrectionsState::pruneMissing()
@@ -448,7 +419,6 @@ void CorrectionsState::onCollectionRemoved(uint64_t id)
         _pendingCollectionIds.clear();
         _managedCollectionIds.clear();
         _activeCollectionId = 0;
-        setAnnotateMode(false, false, _module.editingEnabled());
         refreshWidget();
         return;
     }
@@ -462,7 +432,6 @@ void CorrectionsState::onCollectionRemoved(uint64_t id)
 
     if (_activeCollectionId == id) {
         _activeCollectionId = 0;
-        setAnnotateMode(false, false, _module.editingEnabled());
     }
 
     refreshWidget();

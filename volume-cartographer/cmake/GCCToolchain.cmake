@@ -9,7 +9,7 @@ set(VC_STRIP_FLAGS "-s")
 set(VC_SIZE_FLAGS "")
 set(VC_SIZE_LINKER_FLAGS "")
 
-message(STATUS "GCC: auto LTO + gc-sections")
+message(STATUS "GCC toolchain loaded")
 
 # Keep default GCC builds quiet from diagnostics that are noisy in our normal
 # dependency/header mix or existing legacy code paths.

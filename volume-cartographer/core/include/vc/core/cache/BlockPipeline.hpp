@@ -78,6 +78,12 @@ public:
         // hundreds of MiB here. 256 MiB ≈ a few thousand chunks max.
         size_t maxDecodeStagingBytes = 256ULL << 20;
 
+        // When false, the disk cache stores the source bytes unchanged at
+        // source chunk size.  The encoder writes fetched bytes directly
+        // (no c3d and no local recompression), and the decoder applies the
+        // normal source decompressor after reading from cache.
+        bool compressed = true;
+
         // When non-zero, declares the source is byte-identical to our local
         // canonical c3d disk format: zarr v3, 4096³ shards with 256³ inner
         // C3DC chunks. The downloader then bypasses the encoder entirely —
@@ -178,7 +184,7 @@ public:
         size_t encodePending = 0;          // staged ChunkData → h265 disk queue
         size_t loadPending = 0;            // disk → staged bytes queue
         size_t decodePending = 0;          // staged bytes → decoded + block cache
-        size_t encodeStagingChunks = 0;    // chunks sitting in encodeStaging_ (16 MiB ea)
+        size_t encodeStagingChunks = 0;    // chunks sitting in encoder staging
         size_t decodeStagingBytes = 0;     // bytes sitting in decodeStaging_ (compressed)
         size_t inflightShardReads = 0;     // read_whole_shard calls currently in progress
         size_t inflightShardBytes = 0;     // bytes held by in-progress shard reads
@@ -203,10 +209,11 @@ private:
     DecompressFn decompress_;
     // Four fully independent pools — each specialised for one stage so no
     // stage can starve another.
-    //   downloaderPool_ : s3 fetch + source decode + re-chunk → staged
-    //     ChunkData. Network-bound. Never touches disk or block cache.
-    //   encodePool_     : take staged ChunkData → h265 encode → disk.
-    //     CPU-bound. Never touches the network or block cache.
+    //   downloaderPool_ : s3 fetch; compressed mode decodes/rechunks into
+    //     staged ChunkData, unchanged mode stages source bytes. Network-bound.
+    //     Never touches disk or block cache.
+    //   encodePool_     : compressed mode h265/c3d-encodes staged ChunkData;
+    //     unchanged mode writes staged source bytes directly to disk.
     //   loaderPool_     : disk read (or shard-cache memcpy) → staged
     //     compressed bytes. I/O-bound. Never decodes.
     //   decodePool_     : take staged compressed bytes → h265 decode →
@@ -219,12 +226,14 @@ private:
     IOPool encodePool_;
     IOPool loaderPool_;
     IOPool decodePool_;
-    // Hand-off buffer between downloader and encoder. Download inserts
-    // (key → decoded ChunkData) after assembling, encoder takes it out.
+    // Hand-off buffers between downloader and encoder. Download inserts
+    // either decoded ChunkData (compressed cache) or unchanged source bytes
+    // (unchanged cache), encoder takes them out.
     // CV gates the downloader when encodeStaging_ is at capacity so a
     // fast network can't run RAM to swap while encode drains to disk.
     mutable std::mutex encodeStagingMutex_;
     std::unordered_map<ChunkKey, ChunkDataPtr, ChunkKeyHash> encodeStaging_;
+    std::unordered_map<ChunkKey, std::vector<uint8_t>, ChunkKeyHash> encodeByteStaging_;
     std::condition_variable encodeStagingCv_;
     std::atomic<bool> shuttingDown_{false};
 
@@ -315,6 +324,11 @@ private:
 
     // Split a decoded chunk into 16^3 blocks and insert into blockCache_.
     void insertChunkAsBlocks(const ChunkKey& key, const ChunkData& chunk);
+
+    // Blocks-per-chunk for each level (used by blockAt empty-chunk reverse map).
+    // Computed once after diskLevels_ and config_ are set.
+    static constexpr int kMaxLevels = 16;
+    std::array<std::array<int,3>, kMaxLevels> blocksPerChunk_{};
 
     // Wake viewer/listeners when a chunk's visible state changes, including
     // decoded data, all-zero chunks, and confirmed-absent chunks. The

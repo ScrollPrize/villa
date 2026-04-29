@@ -90,6 +90,19 @@ void to_json(Json& j, const VCCollection::Collection& c) {
     if (c.anchor2d.has_value()) {
         j["anchor2d"] = vec2f_to_json(c.anchor2d.value());
     }
+
+    if (c.autoFillMode != VCCollection::WindingFillMode::None) {
+        j["autoFillMode"] = Json(static_cast<int>(c.autoFillMode));
+        j["autoFillConstant"] = Json((double)c.autoFillConstant);
+    }
+
+    if (!c.tags.empty()) {
+        Json tags_obj = Json::object();
+        for (const auto& [key, val] : c.tags) {
+            tags_obj[key] = Json(val);
+        }
+        j["tags"] = std::move(tags_obj);
+    }
 }
 
 void from_json(const Json& j, VCCollection::Collection& c) {
@@ -113,6 +126,25 @@ void from_json(const Json& j, VCCollection::Collection& c) {
         c.anchor2d = vec2f_from_json(j.at("anchor2d"));
     } else {
         c.anchor2d = std::nullopt;
+    }
+
+    if (j.contains("autoFillMode") && j.at("autoFillMode").is_number()) {
+        int modeInt = j.at("autoFillMode").get_int();
+        if (modeInt >= 0 && modeInt <= 3) {
+            c.autoFillMode = static_cast<VCCollection::WindingFillMode>(modeInt);
+        }
+    }
+    if (j.contains("autoFillConstant") && j.at("autoFillConstant").is_number()) {
+        c.autoFillConstant = j.at("autoFillConstant").get_float();
+    }
+
+    if (j.contains("tags") && j.at("tags").is_object()) {
+        Json tags_obj = j.at("tags");
+        for (auto it = tags_obj.begin(); it != tags_obj.end(); ++it) {
+            if ((*it).is_string()) {
+                c.tags[it.key()] = (*it).get_string();
+            }
+        }
     }
 }
  
@@ -261,6 +293,32 @@ std::optional<cv::Vec2f> VCCollection::getCollectionAnchor2d(uint64_t collection
     return std::nullopt;
 }
 
+void VCCollection::setCollectionTag(uint64_t collectionId, const std::string& key, const std::string& value)
+{
+    if (_collections.count(collectionId)) {
+        _collections.at(collectionId).tags[key] = value;
+        emit collectionChanged(collectionId);
+    }
+}
+
+void VCCollection::removeCollectionTag(uint64_t collectionId, const std::string& key)
+{
+    if (_collections.count(collectionId)) {
+        _collections.at(collectionId).tags.erase(key);
+        emit collectionChanged(collectionId);
+    }
+}
+
+std::optional<std::string> VCCollection::getCollectionTag(uint64_t collectionId, const std::string& key) const
+{
+    if (_collections.count(collectionId)) {
+        const auto& tags = _collections.at(collectionId).tags;
+        auto it = tags.find(key);
+        if (it != tags.end()) return it->second;
+    }
+    return std::nullopt;
+}
+
 std::optional<ColPoint> VCCollection::getPoint(uint64_t pointId) const
 {
     if (_points.count(pointId)) {
@@ -300,11 +358,11 @@ std::string VCCollection::generateNewCollectionName(const std::string& prefix) c
     return new_name;
 }
 
-void VCCollection::autoFillWindingNumbers(uint64_t collectionId, WindingFillMode mode)
+void VCCollection::autoFillWindingNumbers(uint64_t collectionId, WindingFillMode mode, float constantValue)
 {
     if (_collections.count(collectionId)) {
         auto& collection = _collections.at(collectionId);
-        
+
         std::vector<ColPoint*> points_to_sort;
         for(auto& pair : collection.points) {
             points_to_sort.push_back(&pair.second);
@@ -324,6 +382,8 @@ void VCCollection::autoFillWindingNumbers(uint64_t collectionId, WindingFillMode
 
         for(ColPoint* point : points_to_sort) {
             switch (mode) {
+                case WindingFillMode::None:
+                    break;
                 case WindingFillMode::Incremental:
                     point->winding_annotation = winding_counter;
                     winding_counter += 1.0f;
@@ -333,12 +393,79 @@ void VCCollection::autoFillWindingNumbers(uint64_t collectionId, WindingFillMode
                     winding_counter -= 1.0f;
                     break;
                 case WindingFillMode::Constant:
-                    point->winding_annotation = 0.0f;
+                    point->winding_annotation = constantValue;
                     break;
             }
             updatePoint(*point);
         }
     }
+}
+
+void VCCollection::setAutoFillMode(uint64_t collectionId, WindingFillMode mode, float constantValue)
+{
+    if (_collections.count(collectionId)) {
+        _collections.at(collectionId).autoFillMode = mode;
+        _collections.at(collectionId).autoFillConstant = constantValue;
+        emit collectionChanged(collectionId);
+    }
+}
+
+VCCollection::WindingFillMode VCCollection::getAutoFillMode(uint64_t collectionId) const
+{
+    if (_collections.count(collectionId)) {
+        return _collections.at(collectionId).autoFillMode;
+    }
+    return WindingFillMode::None;
+}
+
+float VCCollection::getAutoFillConstant(uint64_t collectionId) const
+{
+    if (_collections.count(collectionId)) {
+        return _collections.at(collectionId).autoFillConstant;
+    }
+    return 0.0f;
+}
+
+float VCCollection::computeAutoFillValue(uint64_t collectionId) const
+{
+    if (!_collections.count(collectionId)) {
+        return NAN;
+    }
+    const auto& col = _collections.at(collectionId);
+
+    switch (col.autoFillMode) {
+        case WindingFillMode::None:
+            return NAN;
+        case WindingFillMode::Constant:
+            return col.autoFillConstant;
+        case WindingFillMode::Incremental: {
+            float maxVal = 0.0f;
+            bool found = false;
+            for (const auto& [pid, pt] : col.points) {
+                if (!std::isnan(pt.winding_annotation)) {
+                    if (!found || pt.winding_annotation > maxVal) {
+                        maxVal = pt.winding_annotation;
+                        found = true;
+                    }
+                }
+            }
+            return found ? maxVal + 1.0f : 1.0f;
+        }
+        case WindingFillMode::Decremental: {
+            float minVal = 0.0f;
+            bool found = false;
+            for (const auto& [pid, pt] : col.points) {
+                if (!std::isnan(pt.winding_annotation)) {
+                    if (!found || pt.winding_annotation < minVal) {
+                        minVal = pt.winding_annotation;
+                        found = true;
+                    }
+                }
+            }
+            return found ? minVal - 1.0f : -1.0f;
+        }
+    }
+    return NAN;
 }
  
 bool VCCollection::saveToJSON(const std::string& filename) const

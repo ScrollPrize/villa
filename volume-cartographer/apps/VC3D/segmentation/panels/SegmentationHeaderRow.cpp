@@ -12,6 +12,10 @@ SegmentationHeaderRow::SegmentationHeaderRow(QWidget* parent)
     auto* layout = new QHBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
 
+    _chkAnnotate = new QCheckBox(tr("Annotate"), this);
+    _chkAnnotate->setChecked(true);
+    _chkAnnotate->setToolTip(tr("Toggle annotation mode for placing correction points on surfaces."));
+
     auto* checkLayout = new QVBoxLayout();
     checkLayout->setContentsMargins(0, 0, 0, 0);
     checkLayout->setSpacing(2);
@@ -25,12 +29,14 @@ SegmentationHeaderRow::SegmentationHeaderRow(QWidget* parent)
     _lblStatus = new QLabel(this);
     _lblStatus->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
 
+    checkLayout->addWidget(_chkAnnotate);
     checkLayout->addWidget(_chkEditing);
     checkLayout->addWidget(_chkDrawMask);
     layout->addLayout(checkLayout);
     layout->addSpacing(8);
     layout->addWidget(_lblStatus, 1);
 
+    connect(_chkAnnotate, &QCheckBox::toggled, this, &SegmentationHeaderRow::annotateToggled);
     connect(_chkEditing, &QCheckBox::toggled, this, &SegmentationHeaderRow::editingToggled);
     connect(_chkDrawMask, &QCheckBox::toggled, this, &SegmentationHeaderRow::drawMaskToggled);
 }
@@ -47,6 +53,20 @@ void SegmentationHeaderRow::setEditingChecked(bool checked)
 bool SegmentationHeaderRow::isEditingChecked() const
 {
     return _chkEditing && _chkEditing->isChecked();
+}
+
+void SegmentationHeaderRow::setAnnotateChecked(bool checked)
+{
+    if (!_chkAnnotate) {
+        return;
+    }
+    const QSignalBlocker blocker(_chkAnnotate);
+    _chkAnnotate->setChecked(checked);
+}
+
+bool SegmentationHeaderRow::isAnnotateChecked() const
+{
+    return _chkAnnotate && _chkAnnotate->isChecked();
 }
 
 void SegmentationHeaderRow::setDrawMaskChecked(bool checked)

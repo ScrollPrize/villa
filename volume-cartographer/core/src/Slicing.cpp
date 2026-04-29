@@ -1204,7 +1204,8 @@ void sampleSingleLayerAdaptiveImpl(
                                          std::min(numLevels, int(vc::cache::kMaxLevels)),
                                          viewCenterL0);
             }
-            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel);
+            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel,
+                viewCenterL0[0], viewCenterL0[1], viewCenterL0[2]);
         }
     } else {
         const VoxelBounds b = planeViewportBounds(
@@ -1231,7 +1232,8 @@ void sampleSingleLayerAdaptiveImpl(
                                          std::min(numLevels, int(vc::cache::kMaxLevels)),
                                          viewCenterL0);
             }
-            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel);
+            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel,
+                viewCenterL0[0], viewCenterL0[1], viewCenterL0[2]);
         }
     }
     }  // skipPrefetch guard
@@ -1448,7 +1450,8 @@ void sampleCompositeAdaptiveImpl(
                                          std::min(numLevels, int(vc::cache::kMaxLevels)),
                                          viewCenterL0);
             }
-            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel);
+            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel,
+                viewCenterL0[0], viewCenterL0[1], viewCenterL0[2]);
         }
     } else {
         const VoxelBounds b = planeViewportBounds(
@@ -1475,7 +1478,8 @@ void sampleCompositeAdaptiveImpl(
                                          std::min(numLevels, int(vc::cache::kMaxLevels)),
                                          viewCenterL0);
             }
-            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel);
+            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel,
+                viewCenterL0[0], viewCenterL0[1], viewCenterL0[2]);
         }
     }
     }  // skipPrefetch guard

@@ -27,7 +27,6 @@ public:
     void setWidget(SegmentationWidget* widget);
     void setCollection(VCCollection* collection);
 
-    bool setAnnotateMode(bool enabled, bool userInitiated, bool editingEnabled);
     void setActiveCollection(uint64_t collectionId, bool userInitiated);
     uint64_t createCollection(bool announce);
     void handlePointAdded(const cv::Vec3f& worldPos, float wind_a = NAN);
@@ -36,13 +35,13 @@ public:
     void onZRangeChanged(bool enabled, int zMin, int zMax);
 
     void setGrowthInProgress(bool running);
-    void clearAll(bool editingEnabled);
+    void clearAll();
     void refreshWidget();
     void pruneMissing();
 
-    [[nodiscard]] bool annotateMode() const { return _annotateMode; }
     [[nodiscard]] bool growthInProgress() const { return _growthInProgress; }
     [[nodiscard]] uint64_t activeCollection() const { return _activeCollectionId; }
+    [[nodiscard]] bool hasActiveCollection() const { return _activeCollectionId != 0; }
     [[nodiscard]] std::optional<std::pair<int, int>> zRange() const;
     [[nodiscard]] SegmentationCorrectionsPayload buildPayload(bool onlyActiveCollection = false) const;
     [[nodiscard]] SegmentationCorrectionsPayload buildPayloadForCollection(uint64_t collectionId) const;
@@ -58,7 +57,6 @@ private:
     SegmentationWidget* _widget{nullptr};
     VCCollection* _collection{nullptr};
 
-    bool _annotateMode{false};
     uint64_t _activeCollectionId{0};
     std::vector<uint64_t> _pendingCollectionIds;
     std::unordered_set<uint64_t> _managedCollectionIds;

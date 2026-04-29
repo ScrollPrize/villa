@@ -39,10 +39,6 @@ SegmentationCorrectionsPanel::SegmentationCorrectionsPanel(const QString& settin
     _btnCorrectionsNew->setToolTip(tr("Create a new, empty correction set for this segmentation."));
     correctionsLayout->addWidget(_btnCorrectionsNew);
 
-    _chkCorrectionsAnnotate = new QCheckBox(tr("Annotate corrections"), _groupCorrections);
-    _chkCorrectionsAnnotate->setToolTip(tr("Toggle annotation overlay while reviewing corrections."));
-    correctionsLayout->addWidget(_chkCorrectionsAnnotate);
-
     _groupCorrections->setLayout(correctionsLayout);
     panelLayout->addWidget(_groupCorrections);
 
@@ -59,10 +55,6 @@ SegmentationCorrectionsPanel::SegmentationCorrectionsPanel(const QString& settin
 
     connect(_btnCorrectionsNew, &QPushButton::clicked, this, [this]() {
         emit correctionsCreateRequested();
-    });
-
-    connect(_chkCorrectionsAnnotate, &QCheckBox::toggled, this, [this](bool enabled) {
-        emit correctionsAnnotateToggled(enabled);
     });
 }
 
@@ -81,22 +73,6 @@ void SegmentationCorrectionsPanel::setCorrectionsEnabled(bool enabled)
     }
     _correctionsEnabled = enabled;
     writeSetting(QStringLiteral("corrections_enabled"), _correctionsEnabled);
-    if (!enabled) {
-        _correctionsAnnotateChecked = false;
-        if (_chkCorrectionsAnnotate) {
-            const QSignalBlocker blocker(_chkCorrectionsAnnotate);
-            _chkCorrectionsAnnotate->setChecked(false);
-        }
-    }
-}
-
-void SegmentationCorrectionsPanel::setCorrectionsAnnotateChecked(bool enabled)
-{
-    _correctionsAnnotateChecked = enabled;
-    if (_chkCorrectionsAnnotate) {
-        const QSignalBlocker blocker(_chkCorrectionsAnnotate);
-        _chkCorrectionsAnnotate->setChecked(enabled);
-    }
 }
 
 void SegmentationCorrectionsPanel::setCorrectionCollections(
@@ -144,10 +120,5 @@ void SegmentationCorrectionsPanel::syncUiState(bool editingEnabled, bool growthI
     }
     if (_btnCorrectionsNew) {
         _btnCorrectionsNew->setEnabled(editingEnabled && !growthInProgress);
-    }
-    if (_chkCorrectionsAnnotate) {
-        _chkCorrectionsAnnotate->setEnabled(allowCorrections);
-        const QSignalBlocker blocker(_chkCorrectionsAnnotate);
-        _chkCorrectionsAnnotate->setChecked(_correctionsAnnotateChecked);
     }
 }

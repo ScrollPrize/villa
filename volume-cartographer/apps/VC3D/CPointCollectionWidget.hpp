@@ -39,7 +39,10 @@ public:
     void loadCorrPointsResults(const std::filesystem::path& jsonPath);
     void clearCorrPointsResults();
 
+    void setAnnotateChecked(bool checked);
+
 signals:
+    void annotateToggled(bool enabled);
     void collectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
     void pointDoubleClicked(uint64_t pointId);
@@ -86,6 +89,8 @@ private slots:
     uint64_t _selected_collection_id = 0;
     uint64_t _selected_point_id = 0;
 
+    QCheckBox *_chkAnnotate{nullptr};
+
     QTreeView *_tree_view;
     QStandardItemModel *_model;
  
@@ -101,8 +106,10 @@ private slots:
     QPushButton *_fill_winding_plus_button;
     QPushButton *_fill_winding_minus_button;
     QPushButton *_fill_winding_equals_button;
+    QDoubleSpinBox *_fill_constant_spinbox;
     QLabel *_anchor_status_label;
     QPushButton *_clear_anchor_button;
+    QLabel *_tags_label;
 
     QGroupBox *_point_metadata_group;
     QCheckBox *_winding_enabled_checkbox;

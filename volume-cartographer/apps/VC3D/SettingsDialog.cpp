@@ -70,8 +70,11 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     if (auto* lbl = findChild<QLabel*>("labelIOThreads")) lbl->hide();
     if (spinIOThreads) spinIOThreads->hide();
 
-    // Hide removed recompression UI — the disk cache now always uses c3d.
-    chkVideoRecompress->hide();
+    // Disk-cache compression toggle (repurposed from old recompression UI)
+    chkVideoRecompress->setChecked(
+        settings.value(perf::DISK_CACHE_COMPRESSED, perf::DISK_CACHE_COMPRESSED_DEFAULT).toBool());
+
+    // Codec-type and quality-preset combos are unused — keep hidden.
     cmbVideoQualityPreset->hide();
     cmbVideoCodecType->hide();
     if (auto* label = findChild<QLabel*>("labelVideoQualityPreset"))
@@ -135,6 +138,7 @@ void SettingsDialog::accept()
     // Cache settings
     settings.setValue(perf::RAM_CACHE_SIZE_GB, spinRamCacheSizeGB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text());
+    settings.setValue(perf::DISK_CACHE_COMPRESSED, chkVideoRecompress->isChecked());
 
     // IO_THREADS setting removed — see CState::applyCacheBudget.
 

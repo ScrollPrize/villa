@@ -48,12 +48,9 @@ std::string CState::currentVolumeId() const { return _currentVolumeId; }
 
 void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
-    fprintf(stderr, "[CState] setCurrentVolume: begin (old=%p new=%p)\n",
-            (void*)_currentVolume.get(), (void*)vol.get());
     if (_currentVolume) {
         auto* oldPipeline = _currentVolume->tieredCache();
         if (oldPipeline) {
-            fprintf(stderr, "[CState] shutdown + clearMemory on old pipeline\n");
             oldPipeline->shutdown();
             oldPipeline->clearMemory();
         }
@@ -65,9 +62,7 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
     _currentVolume = std::move(vol);
     applyCacheBudget(_currentVolume);
     resolveCurrentVolumeId();
-    fprintf(stderr, "[CState] emitting volumeChanged\n");
     emit volumeChanged(_currentVolume, _currentVolumeId);
-    fprintf(stderr, "[CState] setCurrentVolume: done\n");
 }
 
 std::string CState::segmentationGrowthVolumeId() const { return _segmentationGrowthVolumeId; }
@@ -110,6 +105,16 @@ void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
 {
     if (vol && _cacheSizeBytes > 0) {
         vol->setCacheBudget(_cacheSizeBytes);
+
+        // Apply disk-cache compression setting
+        {
+            using namespace vc3d::settings;
+            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+            vol->setDiskCacheCompressed(
+                settings.value(perf::DISK_CACHE_COMPRESSED,
+                               perf::DISK_CACHE_COMPRESSED_DEFAULT).toBool());
+        }
+
         if (!_blockCache) {
             vc::cache::BlockCache::Config bcfg;
             bcfg.bytes = _cacheSizeBytes;

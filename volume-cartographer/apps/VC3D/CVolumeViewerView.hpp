@@ -11,13 +11,13 @@ public:
     CVolumeViewerView(QWidget* parent = 0);
     void mouseReleaseEvent(QMouseEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
+    void mouseDoubleClickEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
     void scrollContentsBy(int dx, int dy) override;
     void keyPressEvent(QKeyEvent *event) override;
     void keyReleaseEvent(QKeyEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
-    void mouseDoubleClickEvent(QMouseEvent *event) override;
     /// Set physical voxel size (units per scene-unit, e.g. µm/pixel).
     /// Call this after you load your Zarr spacing metadata.
     void setVoxelSize(double sx, double sy) { m_vx = sx; m_vy = sy; update(); }
@@ -40,6 +40,7 @@ signals:
     void sendPanRelease(Qt::MouseButton, Qt::KeyboardModifiers);
     void sendPanStart(Qt::MouseButton, Qt::KeyboardModifiers);
     void sendMousePress(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
+    void sendMouseDoubleClick(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void sendMouseMove(QPointF, Qt::MouseButtons, Qt::KeyboardModifiers);
     void sendMouseRelease(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void sendKeyPress(int key, Qt::KeyboardModifiers modifiers);
