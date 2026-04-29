@@ -1798,6 +1798,98 @@ SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const Su
     return best;
 }
 
+std::vector<SurfacePatchIndex::LookupResult>
+SurfacePatchIndex::locateAll(const cv::Vec3f& worldPoint, float tolerance, const SurfacePtr& targetSurface) const
+{
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (!impl_ || !impl_->tree || tolerance <= 0.0f || !isFinitePoint(worldPoint)) {
+        return {};
+    }
+
+    const float tol = std::max(tolerance, 0.0f);
+    Impl::Point3 min_pt(worldPoint[0] - tol, worldPoint[1] - tol, worldPoint[2] - tol);
+    Impl::Point3 max_pt(worldPoint[0] + tol, worldPoint[1] + tol, worldPoint[2] + tol);
+    Impl::Box3 query(min_pt, max_pt);
+
+    const float toleranceSq = tol * tol;
+
+    struct SurfaceInfo {
+        cv::Vec3f center;
+        cv::Vec2f scale;
+    };
+    std::unordered_map<QuadSurface*, SurfaceInfo> surfaceInfoCache;
+    surfaceInfoCache.reserve(4);
+    auto ensureSurfaceInfo = [&](QuadSurface* surface) -> const SurfaceInfo& {
+        auto it = surfaceInfoCache.find(surface);
+        if (it != surfaceInfoCache.end()) {
+            return it->second;
+        }
+        SurfaceInfo info{surface->center(), surface->scale()};
+        auto [insertIt, _] = surfaceInfoCache.emplace(surface, info);
+        return insertIt->second;
+    };
+
+    struct SurfaceHit {
+        LookupResult result;
+        float distSq = std::numeric_limits<float>::infinity();
+    };
+    std::unordered_map<QuadSurface*, SurfaceHit> hits;
+    hits.reserve(8);
+
+    auto processEntry = [&](const Impl::Entry& entry) {
+        const Impl::PatchRecord& rec = entry.second;
+        if (targetSurface && rec.surface != targetSurface.get()) {
+            return;
+        }
+
+        Impl::PatchHit hit = Impl::evaluatePatch(rec, impl_->tileStride,
+                                                  impl_->samplingStride, worldPoint);
+        if (!hit.valid || hit.distSq > toleranceSq) {
+            return;
+        }
+
+        auto& best = hits[rec.surface];
+        if (hit.distSq > best.distSq) {
+            return;
+        }
+
+        const SurfaceInfo& info = ensureSurfaceInfo(rec.surface);
+        const float absX = static_cast<float>(rec.i) + hit.u;
+        const float absY = static_cast<float>(rec.j) + hit.v;
+        best.result.ptr = {
+            absX - info.center[0] * info.scale[0],
+            absY - info.center[1] * info.scale[1],
+            0.0f
+        };
+        best.distSq = hit.distSq;
+    };
+
+    try {
+        impl_->tree->query(
+            bgi::intersects(query),
+            boost::make_function_output_iterator(processEntry));
+    } catch (const std::exception& e) {
+        std::cerr << "[SurfacePatchIndex] locateAll query failed: " << e.what() << std::endl;
+        return {};
+    } catch (...) {
+        std::cerr << "[SurfacePatchIndex] locateAll query failed: unknown exception" << std::endl;
+        return {};
+    }
+
+    std::vector<LookupResult> results;
+    results.reserve(hits.size());
+    for (auto& [surfaceRaw, hit] : hits) {
+        auto srIt = impl_->surfaceRecords.find(surfaceRaw);
+        if (srIt == impl_->surfaceRecords.end()) {
+            continue;
+        }
+        hit.result.surface = srIt->second.surface;
+        hit.result.distance = std::sqrt(hit.distSq);
+        results.push_back(std::move(hit.result));
+    }
+    return results;
+}
+
 void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
                                        const SurfacePtr& targetSurface,
                                        std::vector<TriangleCandidate>& outCandidates) const

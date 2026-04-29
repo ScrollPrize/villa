@@ -384,6 +384,7 @@ private:
     // _renderPendingAfterWorker so we don't lose a frame's worth of
     // state change (slider drag, camera pan).
     std::atomic<bool> _renderWorkerBusy{false};
+    std::atomic<bool> _renderWorkerFailed{false};
     bool _renderPendingAfterWorker = false;
     std::chrono::steady_clock::time_point _renderT0{};
     // Per-pixel pyramid-level tag (0 = desired, 1..5 = fallback depth).

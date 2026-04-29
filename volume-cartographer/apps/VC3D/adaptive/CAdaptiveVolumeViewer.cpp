@@ -54,14 +54,14 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
     , _viewerManager(manager)
 {
     _view = new CVolumeViewerView(this);
-    // GPU-backed paint device for the scene: all painter ops (QImage blit,
-    // overlay items, intersections) go through an OpenGL surface instead
-    // of Qt's CPU raster engine. The QImage framebuffer we populate in
-    // drawBackground becomes a GL texture upload + textured quad, and
-    // QGraphicsView compositing runs on the GPU rasterizer. Drops the
-    // CPU blit cost (was ~5% of frame per the perf map) and frees main-
-    // thread cycles for the sampling kernel.
-    {
+    bool glViewportRequested = false;
+    const int useGlViewport =
+        qEnvironmentVariableIntValue("VC3D_USE_OPENGL_VIEWPORT", &glViewportRequested);
+    if (glViewportRequested && useGlViewport != 0) {
+        // GPU-backed paint device for the scene: all painter ops (QImage blit,
+        // overlay items, intersections) go through an OpenGL surface instead
+        // of Qt's CPU raster engine. This remains opt-in because some
+        // NVIDIA/GLX/Qt combinations crash while flushing widget paints.
         QSurfaceFormat fmt;
         fmt.setSwapInterval(0);  // disable vsync — we already coalesce at 16 ms
         auto* gl = new QOpenGLWidget(_view);
@@ -468,26 +468,50 @@ void CAdaptiveVolumeViewer::handleSurfaceAccessException(const QString& context,
             context.toUtf8().constData(),
             message.toUtf8().constData());
 
-    _renderPending = false;
-    _intersectionsDirty = false;
-    _renderPendingAfterWorker = false;
-    _genCacheDirty = true;
-    invalidateIntersect();
+    try {
+        _renderPending = false;
+        _intersectionsDirty = false;
+        _renderPendingAfterWorker = false;
+        _genCacheDirty = true;
+        _surfWeak.reset();
 
-    if (_scene) {
-        _scene->clear();
-        _overlayGroups.clear();
-        _intersectionItems.clear();
-        _focusMarker = nullptr;
-    }
+        if (_state) {
+            std::string failedSurfaceName = _surfName;
+            if (failedSurfaceName == "segmentation") {
+                failedSurfaceName = _state->activeSurfaceId();
+                _state->setSurface("segmentation", nullptr, true, false);
+            }
+            if (!failedSurfaceName.empty()) {
+                _state->setSurface(failedSurfaceName, nullptr, true, false);
+                if (auto pkg = _state->vpkg()) {
+                    pkg->unloadSurface(failedSurfaceName);
+                }
+            }
+        }
 
-    if (_lbl) {
-        const QString status = tr("Surface load failed: %1. Click Reload Surfaces after fixing or removing the bad surface.")
-                                   .arg(message);
-        _lastStatusText = status;
-        _lbl->setText(status);
-        _lbl->adjustSize();
-        _lbl->show();
+        invalidateIntersect();
+
+        if (_scene) {
+            _scene->clear();
+            _overlayGroups.clear();
+            _intersectionItems.clear();
+            _focusMarker = nullptr;
+        }
+
+        if (_lbl) {
+            const QString status = tr("Surface load failed: %1. Click Reload Surfaces after fixing or removing the bad surface.")
+                                       .arg(message);
+            _lastStatusText = status;
+            _lbl->setText(status);
+            _lbl->adjustSize();
+            _lbl->show();
+        }
+    } catch (const std::exception& ex) {
+        fprintf(stderr, "[Viewer:%s] Surface failure cleanup failed: %s\n",
+                _surfName.c_str(), ex.what());
+    } catch (...) {
+        fprintf(stderr, "[Viewer:%s] Surface failure cleanup failed: unknown error\n",
+                _surfName.c_str());
     }
 }
 
@@ -727,11 +751,13 @@ void CAdaptiveVolumeViewer::submitRender()
     // Dispatch the whole render body to QThreadPool. The main thread
     // returns immediately — Qt input events are no longer stalled behind
     // the tile sample loop, the CLAHE pass, or the stretch scan.
+    _renderWorkerFailed.store(false, std::memory_order_release);
     _backgroundWorkers.fetch_add(1, std::memory_order_acq_rel);
     QThreadPool::globalInstance()->start([this, ctx = std::move(ctx)]() {
         try {
             renderIntoFramebuffer(_framebufferWork, ctx);
         } catch (const std::exception& ex) {
+            _renderWorkerFailed.store(true, std::memory_order_release);
             fprintf(stderr, "[Viewer:%s] RENDER EXCEPTION: %s\n",
                     _surfName.c_str(), ex.what());
             const QString message = QString::fromUtf8(ex.what());
@@ -740,6 +766,7 @@ void CAdaptiveVolumeViewer::submitRender()
                                       Q_ARG(QString, tr("render")),
                                       Q_ARG(QString, message));
         } catch (...) {
+            _renderWorkerFailed.store(true, std::memory_order_release);
             fprintf(stderr, "[Viewer:%s] RENDER EXCEPTION (unknown)\n",
                     _surfName.c_str());
             QMetaObject::invokeMethod(this, "handleSurfaceAccessException",
@@ -1334,25 +1361,36 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
 
 void CAdaptiveVolumeViewer::finishRenderOnMainThread()
 {
+    if (_renderWorkerFailed.exchange(false, std::memory_order_acq_rel)) {
+        _renderWorkerBusy.store(false, std::memory_order_release);
+        return;
+    }
+
     const bool sizesMatch = (_framebuffer.size() == _framebufferWork.size());
     if (sizesMatch) {
         std::swap(_framebuffer, _framebufferWork);
     }
 
-    // Main-thread-only tail. syncCameraTransform writes Qt view state,
-    // updateFocusMarker / renderIntersections / overlaysUpdated all touch
-    // the scene graph, viewport()->update schedules a paint event.
-    syncCameraTransform();
-    updateFocusMarker();
-    if (!_navigationInteractionActive) {
-        renderIntersections();
-    }
-    emit overlaysUpdated();
-    _view->viewport()->update();
+    try {
+        // Main-thread-only tail. syncCameraTransform writes Qt view state,
+        // updateFocusMarker / renderIntersections / overlaysUpdated all touch
+        // the scene graph, viewport()->update schedules a paint event.
+        syncCameraTransform();
+        updateFocusMarker();
+        if (!_navigationInteractionActive) {
+            renderIntersections();
+        }
+        emit overlaysUpdated();
+        _view->viewport()->update();
 
-    const auto renderDt = std::chrono::steady_clock::now() - _renderT0;
-    recordRenderDuration(std::chrono::duration<double>(renderDt).count());
-    updateStatusLabel();
+        const auto renderDt = std::chrono::steady_clock::now() - _renderT0;
+        recordRenderDuration(std::chrono::duration<double>(renderDt).count());
+        updateStatusLabel();
+    } catch (const std::exception& ex) {
+        handleSurfaceAccessException(tr("render finish"), QString::fromUtf8(ex.what()));
+    } catch (...) {
+        handleSurfaceAccessException(tr("render finish"), tr("unknown error"));
+    }
 
     _renderWorkerBusy.store(false, std::memory_order_release);
     // Re-schedule if a pending frame was queued OR if we discarded a
