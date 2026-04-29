@@ -262,7 +262,10 @@ private:
                 bool found_match = false;
                 int matched_idx = -1;
 
-                auto result = patchIndex.locate(point, tolerance);
+                SurfacePatchIndex::PointQuery query;
+                query.worldPoint = point;
+                query.tolerance = tolerance;
+                auto result = patchIndex.locate(query);
                 if (result.has_value()) {
                     // Find matching surface index
                     for (size_t idx = 0; idx < surfaces.size(); idx++) {

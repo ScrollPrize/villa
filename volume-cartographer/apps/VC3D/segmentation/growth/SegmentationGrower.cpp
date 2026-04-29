@@ -210,7 +210,10 @@ std::optional<std::pair<int, int>> locateGridIndexWithPatchIndex(QuadSurface* su
         }
         const float tolerance = std::max(8.0f, scale * 8.0f);
         // Query without surface filter, then verify result matches our surface
-        if (auto hit = patchIndex->locate(worldPos, tolerance)) {
+        SurfacePatchIndex::PointQuery query;
+        query.worldPoint = worldPos;
+        query.tolerance = tolerance;
+        if (auto hit = patchIndex->locate(query)) {
             if (hit->surface.get() == surface) {
                 const int col = std::clamp(static_cast<int>(std::round(hit->ptr[0])),
                                            0,

@@ -1301,7 +1301,11 @@ int main(int argc, char** argv)
             if (!hits.empty() && cfg.sameWrapTolerance > 0.0f) {
                 const std::size_t before = hits.size();
                 hits.erase(std::remove_if(hits.begin(), hits.end(), [&](const RayHit& hit) {
-                    return sourceIndex.locate(hit.point, cfg.sameWrapTolerance, src).has_value();
+                    SurfacePatchIndex::PointQuery query;
+                    query.worldPoint = hit.point;
+                    query.tolerance = cfg.sameWrapTolerance;
+                    query.targetSurface = src;
+                    return sourceIndex.locate(query).has_value();
                 }), hits.end());
                 sameWrapDiscarded.fetch_add(before - hits.size(), std::memory_order_relaxed);
             }

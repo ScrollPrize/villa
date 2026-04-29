@@ -1098,7 +1098,11 @@ float QuadSurface::pointTo(cv::Vec3f &ptr, const cv::Vec3f &tgt, float th, int m
     // Try accelerated search using spatial indices
     if (surfaceIndex && !surfaceIndex->empty()) {
         SurfacePatchIndex::SurfacePtr targetSurface(this, [](QuadSurface*) {});
-        if (auto hit = surfaceIndex->locate(tgt, th, targetSurface)) {
+        SurfacePatchIndex::PointQuery query;
+        query.worldPoint = tgt;
+        query.tolerance = th;
+        query.targetSurface = targetSurface;
+        if (auto hit = surfaceIndex->locate(query)) {
             ptr = hit->ptr;
             return hit->distance;
         }

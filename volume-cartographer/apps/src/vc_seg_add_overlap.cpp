@@ -379,10 +379,11 @@ int main(int argc, char *argv[])
                                 progressPointBatch = 0;
                             }
 
-                            index.locateSurfaceHits(pointRef.point,
-                                                    kOverlapTolerance,
-                                                    excludedTargetSurfaces,
-                                                    pointHits);
+                            SurfacePatchIndex::PointQuery query;
+                            query.worldPoint = pointRef.point;
+                            query.tolerance = kOverlapTolerance;
+                            query.excludedSurfaces = &excludedTargetSurfaces;
+                            index.locateSurfaceHits(query, pointHits);
                             for (const QuadSurface* hitSurface : pointHits) {
                                 if (!hitSurface) {
                                     continue;

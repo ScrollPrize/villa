@@ -498,7 +498,11 @@ static void add_surface_if_close(QuadSurface* surf,
 
     if (surface_patch_index && !surface_patch_index->empty()) {
         SurfacePatchIndex::SurfacePtr target_surface(surf, [](QuadSurface*) {});
-        auto hit = surface_patch_index->locate(coord_f, same_surface_th, target_surface);
+        SurfacePatchIndex::PointQuery query;
+        query.worldPoint = coord_f;
+        query.tolerance = same_surface_th;
+        query.targetSurface = target_surface;
+        auto hit = surface_patch_index->locate(query);
         if (!hit) {
             return;
         }

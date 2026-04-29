@@ -1714,19 +1714,37 @@ bool SurfacePatchIndex::containsSurface(const SurfacePtr& surface) const
 }
 
 std::optional<SurfacePatchIndex::LookupResult>
-SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const SurfacePtr& targetSurface) const
+SurfacePatchIndex::locate(const PointQuery& pointQuery) const
 {
     std::shared_lock<std::shared_mutex> lock(mutex_);
-    if (!impl_ || !impl_->tree || tolerance <= 0.0f || !isFinitePoint(worldPoint)) {
+    if (!impl_ || !impl_->tree || pointQuery.tolerance <= 0.0f ||
+        !isFinitePoint(pointQuery.worldPoint)) {
         return std::nullopt;
     }
 
-    const float tol = std::max(tolerance, 0.0f);
-    Impl::Point3 min_pt(worldPoint[0] - tol, worldPoint[1] - tol, worldPoint[2] - tol);
-    Impl::Point3 max_pt(worldPoint[0] + tol, worldPoint[1] + tol, worldPoint[2] + tol);
+    const float tol = std::max(pointQuery.tolerance, 0.0f);
+    Impl::Point3 min_pt(pointQuery.worldPoint[0] - tol,
+                        pointQuery.worldPoint[1] - tol,
+                        pointQuery.worldPoint[2] - tol);
+    Impl::Point3 max_pt(pointQuery.worldPoint[0] + tol,
+                        pointQuery.worldPoint[1] + tol,
+                        pointQuery.worldPoint[2] + tol);
     Impl::Box3 query(min_pt, max_pt);
 
     const float toleranceSq = tol * tol;
+    QuadSurface* const targetRaw = pointQuery.targetSurface ? pointQuery.targetSurface.get() : nullptr;
+    std::unordered_set<QuadSurface*> filterSurfaceRaw;
+    if (pointQuery.targetSurfaces) {
+        filterSurfaceRaw.reserve(pointQuery.targetSurfaces->size());
+        for (const auto& surface : *pointQuery.targetSurfaces) {
+            if (surface) {
+                filterSurfaceRaw.insert(surface.get());
+            }
+        }
+        if (filterSurfaceRaw.empty()) {
+            return std::nullopt;
+        }
+    }
     SurfacePatchIndex::LookupResult best;
     QuadSurface* bestSurfaceRaw = nullptr;
     float bestDistSq = toleranceSq;
@@ -1749,12 +1767,14 @@ SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const Su
 
     auto processEntry = [&](const Impl::Entry& entry) {
         const Impl::PatchRecord& rec = entry.second;
-        if (targetSurface && rec.surface != targetSurface.get()) {
+        if ((targetRaw && rec.surface != targetRaw) ||
+            (pointQuery.targetSurfaces && filterSurfaceRaw.find(rec.surface) == filterSurfaceRaw.end()) ||
+            (pointQuery.excludedSurfaces && pointQuery.excludedSurfaces->count(rec.surface))) {
             return;
         }
 
         Impl::PatchHit hit = Impl::evaluatePatch(rec, impl_->tileStride,
-                                                  impl_->samplingStride, worldPoint);
+                                                  impl_->samplingStride, pointQuery.worldPoint);
         if (!hit.valid || hit.distSq > bestDistSq) {
             return;
         }
@@ -1799,19 +1819,37 @@ SurfacePatchIndex::locate(const cv::Vec3f& worldPoint, float tolerance, const Su
 }
 
 std::vector<SurfacePatchIndex::LookupResult>
-SurfacePatchIndex::locateAll(const cv::Vec3f& worldPoint, float tolerance, const SurfacePtr& targetSurface) const
+SurfacePatchIndex::locateAll(const PointQuery& pointQuery) const
 {
     std::shared_lock<std::shared_mutex> lock(mutex_);
-    if (!impl_ || !impl_->tree || tolerance <= 0.0f || !isFinitePoint(worldPoint)) {
+    if (!impl_ || !impl_->tree || pointQuery.tolerance <= 0.0f ||
+        !isFinitePoint(pointQuery.worldPoint)) {
         return {};
     }
 
-    const float tol = std::max(tolerance, 0.0f);
-    Impl::Point3 min_pt(worldPoint[0] - tol, worldPoint[1] - tol, worldPoint[2] - tol);
-    Impl::Point3 max_pt(worldPoint[0] + tol, worldPoint[1] + tol, worldPoint[2] + tol);
+    const float tol = std::max(pointQuery.tolerance, 0.0f);
+    Impl::Point3 min_pt(pointQuery.worldPoint[0] - tol,
+                        pointQuery.worldPoint[1] - tol,
+                        pointQuery.worldPoint[2] - tol);
+    Impl::Point3 max_pt(pointQuery.worldPoint[0] + tol,
+                        pointQuery.worldPoint[1] + tol,
+                        pointQuery.worldPoint[2] + tol);
     Impl::Box3 query(min_pt, max_pt);
 
     const float toleranceSq = tol * tol;
+    QuadSurface* const targetRaw = pointQuery.targetSurface ? pointQuery.targetSurface.get() : nullptr;
+    std::unordered_set<QuadSurface*> filterSurfaceRaw;
+    if (pointQuery.targetSurfaces) {
+        filterSurfaceRaw.reserve(pointQuery.targetSurfaces->size());
+        for (const auto& surface : *pointQuery.targetSurfaces) {
+            if (surface) {
+                filterSurfaceRaw.insert(surface.get());
+            }
+        }
+        if (filterSurfaceRaw.empty()) {
+            return {};
+        }
+    }
 
     struct SurfaceInfo {
         cv::Vec3f center;
@@ -1838,12 +1876,14 @@ SurfacePatchIndex::locateAll(const cv::Vec3f& worldPoint, float tolerance, const
 
     auto processEntry = [&](const Impl::Entry& entry) {
         const Impl::PatchRecord& rec = entry.second;
-        if (targetSurface && rec.surface != targetSurface.get()) {
+        if ((targetRaw && rec.surface != targetRaw) ||
+            (pointQuery.targetSurfaces && filterSurfaceRaw.find(rec.surface) == filterSurfaceRaw.end()) ||
+            (pointQuery.excludedSurfaces && pointQuery.excludedSurfaces->count(rec.surface))) {
             return;
         }
 
         Impl::PatchHit hit = Impl::evaluatePatch(rec, impl_->tileStride,
-                                                  impl_->samplingStride, worldPoint);
+                                                  impl_->samplingStride, pointQuery.worldPoint);
         if (!hit.valid || hit.distSq > toleranceSq) {
             return;
         }
@@ -1891,25 +1931,39 @@ SurfacePatchIndex::locateAll(const cv::Vec3f& worldPoint, float tolerance, const
 }
 
 void SurfacePatchIndex::locateSurfaceHits(
-    const cv::Vec3f& worldPoint,
-    float tolerance,
-    const std::unordered_set<const QuadSurface*>& excludedSurfaces,
-    std::vector<const QuadSurface*>& outSurfaces,
-    const SurfacePtr& targetSurface) const
+    const PointQuery& pointQuery,
+    std::vector<const QuadSurface*>& outSurfaces) const
 {
     outSurfaces.clear();
 
     std::shared_lock<std::shared_mutex> lock(mutex_);
-    if (!impl_ || !impl_->tree || tolerance <= 0.0f || !isFinitePoint(worldPoint)) {
+    if (!impl_ || !impl_->tree || pointQuery.tolerance <= 0.0f ||
+        !isFinitePoint(pointQuery.worldPoint)) {
         return;
     }
 
-    const float tol = std::max(tolerance, 0.0f);
-    Impl::Point3 min_pt(worldPoint[0] - tol, worldPoint[1] - tol, worldPoint[2] - tol);
-    Impl::Point3 max_pt(worldPoint[0] + tol, worldPoint[1] + tol, worldPoint[2] + tol);
+    const float tol = std::max(pointQuery.tolerance, 0.0f);
+    Impl::Point3 min_pt(pointQuery.worldPoint[0] - tol,
+                        pointQuery.worldPoint[1] - tol,
+                        pointQuery.worldPoint[2] - tol);
+    Impl::Point3 max_pt(pointQuery.worldPoint[0] + tol,
+                        pointQuery.worldPoint[1] + tol,
+                        pointQuery.worldPoint[2] + tol);
     Impl::Box3 query(min_pt, max_pt);
     const float toleranceSq = tol * tol;
-    QuadSurface* const targetRaw = targetSurface ? targetSurface.get() : nullptr;
+    QuadSurface* const targetRaw = pointQuery.targetSurface ? pointQuery.targetSurface.get() : nullptr;
+    std::unordered_set<QuadSurface*> filterSurfaceRaw;
+    if (pointQuery.targetSurfaces) {
+        filterSurfaceRaw.reserve(pointQuery.targetSurfaces->size());
+        for (const auto& surface : *pointQuery.targetSurfaces) {
+            if (surface) {
+                filterSurfaceRaw.insert(surface.get());
+            }
+        }
+        if (filterSurfaceRaw.empty()) {
+            return;
+        }
+    }
 
     auto alreadyOutput = [&](const QuadSurface* surface) {
         return std::any_of(outSurfaces.begin(), outSurfaces.end(),
@@ -1919,13 +1973,14 @@ void SurfacePatchIndex::locateSurfaceHits(
     auto processEntry = [&](const Impl::Entry& entry) {
         const Impl::PatchRecord& rec = entry.second;
         if ((targetRaw && rec.surface != targetRaw) ||
-            excludedSurfaces.count(rec.surface) ||
+            (pointQuery.targetSurfaces && filterSurfaceRaw.find(rec.surface) == filterSurfaceRaw.end()) ||
+            (pointQuery.excludedSurfaces && pointQuery.excludedSurfaces->count(rec.surface)) ||
             alreadyOutput(rec.surface)) {
             return;
         }
 
         Impl::PatchHit hit = Impl::evaluatePatch(rec, impl_->tileStride,
-                                                  impl_->samplingStride, worldPoint);
+                                                  impl_->samplingStride, pointQuery.worldPoint);
         if (!hit.valid || hit.distSq > toleranceSq) {
             return;
         }

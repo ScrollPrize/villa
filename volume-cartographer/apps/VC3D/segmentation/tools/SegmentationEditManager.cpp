@@ -448,7 +448,11 @@ std::optional<std::pair<int, int>> SegmentationEditManager::worldToGridIndex(con
         return std::nullopt;
     }
 
-    auto hit = patchIndex->locate(worldPos, locateTolerance, _baseSurface);
+    SurfacePatchIndex::PointQuery query;
+    query.worldPoint = worldPos;
+    query.tolerance = locateTolerance;
+    query.targetSurface = _baseSurface;
+    auto hit = patchIndex->locate(query);
     if (!hit) {
         if (warnOnFailure) {
             qCWarning(lcSegEditManager) << "Cannot resolve segmentation grid location: surface patch index missed active surface"

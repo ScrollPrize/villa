@@ -1857,7 +1857,10 @@ void SurfacePanelController::applyFiltersInternal()
     std::unordered_set<QuadSurface*> focusPointSurfaces;
     if (focusPointFilter) {
         if (auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr) {
-            for (const auto& hit : patchIndex->locateAll(poi->p, kFocusPointHitTolerance)) {
+            SurfacePatchIndex::PointQuery query;
+            query.worldPoint = poi->p;
+            query.tolerance = kFocusPointHitTolerance;
+            for (const auto& hit : patchIndex->locateAll(query)) {
                 if (hit.surface) {
                     focusPointSurfaces.insert(hit.surface.get());
                 }

@@ -1889,7 +1889,10 @@ static int gen_normal_loss(ceres::Problem &problem, const cv::Vec2i &p, TracePar
             const cv::Vec3f center_f(static_cast<float>(center_d[0]),
                                      static_cast<float>(center_d[1]),
                                      static_cast<float>(center_d[2]));
-            auto hit = trace_data.patch_normals->index->locate(center_f, trace_data.patch_normals->tolerance);
+            SurfacePatchIndex::PointQuery query;
+            query.worldPoint = center_f;
+            query.tolerance = trace_data.patch_normals->tolerance;
+            auto hit = trace_data.patch_normals->index->locate(query);
             if (hit && hit->surface) {
                 cv::Vec3f normal_f = hit->surface->normal(hit->ptr);
                 const float norm = cv::norm(normal_f);

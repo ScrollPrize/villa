@@ -56,6 +56,14 @@ public:
         std::function<bool(const PatchBounds&)> patchFilter;
     };
 
+    struct PointQuery {
+        cv::Vec3f worldPoint = {0, 0, 0};
+        float tolerance = 0.0f;
+        SurfacePtr targetSurface;
+        const std::unordered_set<SurfacePtr>* targetSurfaces = nullptr;
+        const std::unordered_set<const QuadSurface*>* excludedSurfaces = nullptr;
+    };
+
     struct RayQuery {
         cv::Vec3f src = {0, 0, 0};
         cv::Vec3f end = {0, 0, 0};
@@ -89,17 +97,10 @@ public:
     size_t surfaceCount() const;
     bool containsSurface(const SurfacePtr& surface) const;
 
-    std::optional<LookupResult> locate(const cv::Vec3f& worldPoint,
-                                       float tolerance,
-                                       const SurfacePtr& targetSurface = nullptr) const;
-    std::vector<LookupResult> locateAll(const cv::Vec3f& worldPoint,
-                                        float tolerance,
-                                        const SurfacePtr& targetSurface = nullptr) const;
-    void locateSurfaceHits(const cv::Vec3f& worldPoint,
-                           float tolerance,
-                           const std::unordered_set<const QuadSurface*>& excludedSurfaces,
-                           std::vector<const QuadSurface*>& outSurfaces,
-                           const SurfacePtr& targetSurface = nullptr) const;
+    std::optional<LookupResult> locate(const PointQuery& query) const;
+    std::vector<LookupResult> locateAll(const PointQuery& query) const;
+    void locateSurfaceHits(const PointQuery& query,
+                           std::vector<const QuadSurface*>& outSurfaces) const;
 
     void forEachTriangle(const TriangleQuery& query,
                          const std::function<void(const TriangleCandidate&)>& visitor) const;
