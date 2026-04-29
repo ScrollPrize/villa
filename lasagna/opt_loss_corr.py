@@ -690,6 +690,27 @@ def _wind_update_anchors(
 				xyz_det[d, h, (w + 1).clamp(max=Qw)],
 				xyz_det[d, (h + 1).clamp(max=Qh), (w + 1).clamp(max=Qw)])
 
+	# --- Avg-pair (ci=2, ci=3): non-sticky validity.  Recompute layers from the current
+	# target and reset eligibility BEFORE the refine loop so points process their refine
+	# whenever the regime allows, not only when they happened to be valid last iteration.
+	target_finite = torch.isfinite(target)
+	target_safe = torch.where(target_finite, target, torch.zeros_like(target))
+	inside = target_finite & (target_safe >= 0.0) & (target_safe <= float(D - 1))
+	below = target_finite & (target_safe < 0.0)
+	above = target_finite & (target_safe > float(D - 1))
+
+	floor_t = target_safe.floor().long()
+	new_layer_lo = torch.where(below, torch.zeros_like(floor_t), floor_t)
+	new_layer_hi = torch.where(above, torch.full_like(floor_t, D - 1), floor_t + 1)
+	anchors_d[:, 2] = new_layer_lo
+	anchors_d[:, 3] = new_layer_hi
+
+	# Reset avg-pair validity to regime-eligible.  The refine loop below will then re-evaluate
+	# in_bounds and write the final True/False — so previously-invalid points get a fresh shot
+	# instead of staying stuck.  Closest-pair (ci=0, ci=1) keeps its sticky semantics.
+	anchors_valid[:, 2] = (inside | below) & (new_layer_lo >= 0) & (new_layer_lo < D)
+	anchors_valid[:, 3] = (inside | above) & (new_layer_hi >= 0) & (new_layer_hi < D)
+
 	# --- Two-pass update for all 4 anchor types ---
 	for ci in range(4):
 		valid = anchors_valid[:, ci]
@@ -757,22 +778,7 @@ def _wind_update_anchors(
 			anchors_valid[lost, 0] = False
 			anchors_valid[lost, 1] = False
 
-	# --- Update avg pair depth layers if target changed (regime-aware, no clamp) ---
-	target_finite = torch.isfinite(target)
-	target_safe = torch.where(target_finite, target, torch.zeros_like(target))
-	inside = target_finite & (target_safe >= 0.0) & (target_safe <= float(D - 1))
-	below = target_finite & (target_safe < 0.0)
-	above = target_finite & (target_safe > float(D - 1))
-
-	floor_t = target_safe.floor().long()
-	new_layer_lo = torch.where(below, torch.zeros_like(floor_t), floor_t)
-	new_layer_hi = torch.where(above, torch.full_like(floor_t, D - 1), floor_t + 1)
-	anchors_d[:, 2] = new_layer_lo
-	anchors_d[:, 3] = new_layer_hi
-	# ci=2 active for inside | below; ci=3 active for inside | above.  Layer-range gate
-	# also invalidates the inactive slot whose layer index can fall outside [0, D).
-	anchors_valid[:, 2] = anchors_valid[:, 2] & (inside | below) & (new_layer_lo >= 0) & (new_layer_lo < D)
-	anchors_valid[:, 3] = anchors_valid[:, 3] & (inside | above) & (new_layer_hi >= 0) & (new_layer_hi < D)
+	# Avg-pair layer assignment + eligibility was already done before the refine loop.
 
 	return anchors_h, anchors_w, anchors_valid
 
