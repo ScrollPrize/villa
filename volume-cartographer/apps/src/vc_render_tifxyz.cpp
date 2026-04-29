@@ -1163,6 +1163,10 @@ int main(int argc, char *argv[])
     std::filesystem::path seg_path = parsed["segmentation"].as<std::string>();
 
     float tgt_scale = parsed["scale"].as<float>();
+    if (!std::isfinite(tgt_scale) || tgt_scale <= 0) {
+        logPrintf(stderr, "Error: --scale must be positive\n");
+        return EXIT_FAILURE;
+    }
     int group_idx = parsed["group-idx"].as<int>();
     int num_slices = parsed["num-slices"].as<int>();
     double slice_step = parsed["slice-step"].as<float>();
@@ -1281,7 +1285,7 @@ int main(int argc, char *argv[])
                     const double vsLevel = ds_scale > 0
                                                ? vs / double(ds_scale)
                                                : vs;
-                    tifDpi = voxelSizeToDpi(vsLevel);
+                    tifDpi = voxelSizeToDpi(vsLevel / double(tgt_scale));
                 }
             } catch (...) {
             }
@@ -1363,6 +1367,13 @@ int main(int argc, char *argv[])
     } else {
         logPrintf(stdout, "Voxel size: 1.0 (no metadata found; override with --voxel-size)\n");
     }
+    const double source_group_voxel_size = ds_scale > 0
+        ? base_voxel_size / double(ds_scale)
+        : base_voxel_size;
+    const double output_yx_voxel_size = source_group_voxel_size / double(tgt_scale);
+    const double output_z_voxel_size = base_voxel_size * slice_step;
+    logPrintf(stdout, "Output voxel size: z=%g, yx=%g %s\n",
+              output_z_voxel_size, output_yx_voxel_size, voxel_unit.c_str());
 
     int rotQuadGlobal = -1;
     if (std::abs(rotate_angle) > 1e-6) {
@@ -1514,7 +1525,7 @@ int main(int argc, char *argv[])
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
-                               base_voxel_size, voxel_unit);
+                               output_z_voxel_size, output_yx_voxel_size, voxel_unit);
                 return true;
             } else if (numParts > 1) {
                 if (!std::filesystem::exists(std::filesystem::path(zarrOutputArg) / "0" / ".zarray")) {
@@ -1714,7 +1725,7 @@ int main(int argc, char *argv[])
                 if (rotQuad >= 0 && (rotQuad % 2) == 1) std::swap(attrXY.width, attrXY.height);
                 writeZarrAttrs(outFilePath, vol_path, group_idx, baseZ, slice_step, accum_step,
                                accum_type_str, accumOffsets.size(), attrXY, baseZ, CH, CW,
-                               base_voxel_size, voxel_unit);
+                               output_z_voxel_size, output_yx_voxel_size, voxel_unit);
             }
         }
         return true;

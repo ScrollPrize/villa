@@ -340,7 +340,7 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
                     size_t baseZ, double sliceStep, double accumStep,
                     const std::string& accumTypeStr, size_t accumSamples,
                     const cv::Size& canvasSize, size_t CZ, size_t CH, size_t CW,
-                    double baseVoxelSize, const std::string& voxelUnit)
+                    double zVoxelSize, double yxVoxelSize, const std::string& voxelUnit)
 {
     Json attrs;
     attrs["source_zarr"] = volPath.string();
@@ -376,8 +376,8 @@ void writeZarrAttrs(const std::filesystem::path& outDir,
     ms["axes"] = std::move(axes);
     ms["datasets"] = Json::array();
     for (int l = 0; l <= 5; l++) {
-        const double sYX = baseVoxelSize * std::pow(2.0, l);
-        const double sZ = baseVoxelSize;
+        const double sYX = yxVoxelSize * std::pow(2.0, l);
+        const double sZ = zVoxelSize;
         Json scale_arr = Json::array();
         scale_arr.push_back(sZ); scale_arr.push_back(sYX); scale_arr.push_back(sYX);
         Json trans_arr = Json::array();
