@@ -398,16 +398,17 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
         // Compressed (default): v3 sharded zarr with c3d codec at path_/0/ etc.
         //   4096³ shards, 256³ inner C3DC chunks.
         //
-        // Uncompressed: flat (non-sharded) v3 zarr at <volumeId>_uncompressed/0/ etc.
-        //   Source chunk shape, raw bytes, no codec.
+        // Unchanged: flat (non-sharded) v3 zarr at
+        // <volumeId>_unchanged/0/ etc. Chunks store the exact source
+        // bytes returned by VolumeSource::fetch(), with no local codec.
         {
             const int nLevels = source->numLevels();
             diskLevels.resize(nLevels);
 
-            // Uncompressed root is a sibling directory to the staging dir.
+            // Unchanged root is a sibling directory to the staging dir.
             const std::filesystem::path diskRoot = diskCacheCompressed_
                 ? path_
-                : path_.parent_path() / (path_.filename().string() + "_uncompressed");
+                : path_.parent_path() / (path_.filename().string() + "_unchanged");
 
             auto pad256 = [](int v) -> size_t {
                 return static_cast<size_t>((v + 255) / 256 * 256);
@@ -434,8 +435,8 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
                     utils::ZarrArray::create(lvlPath, std::move(meta)));
             };
 
-            // Raw uncompressed level — flat zarr at source chunk size
-            auto createUncompressedLevel = [&](const std::filesystem::path& lvlPath, int lvl) {
+            // Unchanged level — flat zarr at source chunk size.
+            auto createUnchangedLevel = [&](const std::filesystem::path& lvlPath, int lvl) {
                 auto shape = source->levelShape(lvl);
                 auto scs = source->chunkShape(lvl);
                 auto padTo = [](int v, int align) -> size_t {
@@ -451,7 +452,8 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
                 meta.dtype = utils::ZarrDtype::uint8;
                 meta.fill_value = 0;
                 meta.chunk_key_encoding = "default";
-                // No shard_config, no codecs → raw flat files
+                // No shard_config, no local codecs. Payload bytes remain in
+                // the source's encoding and are decoded when loaded.
                 return std::make_unique<utils::ZarrArray>(
                     utils::ZarrArray::create(lvlPath, std::move(meta)));
             };
@@ -481,19 +483,19 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
                             diskLevels[lvl] = createCompressedLevel(lvlPath, lvl);
                         }
                     } else {
-                        // Uncompressed mode: accept any existing non-sharded zarr
+                        // Unchanged mode: accept any existing non-sharded zarr.
                         diskLevels[lvl] = std::move(opened);
                     }
                 } else {
                     diskLevels[lvl] = diskCacheCompressed_
                         ? createCompressedLevel(lvlPath, lvl)
-                        : createUncompressedLevel(lvlPath, lvl);
+                        : createUnchangedLevel(lvlPath, lvl);
                 }
             }
             fprintf(stderr,
                 "[Volume] Cold cache: %d levels at %s (codec: %s)\n",
                 nLevels, diskRoot.c_str(),
-                diskCacheCompressed_ ? "c3d" : "uncompressed");
+                diskCacheCompressed_ ? "c3d" : "unchanged");
         }
     } else {
         source = std::make_unique<vc::cache::FileSystemSource>(

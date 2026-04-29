@@ -193,7 +193,7 @@ namespace perf {
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
 
     // When true the disk cache stores c3d-compressed sharded zarr (smaller,
-    // lossy).  When false it stores raw uncompressed voxels at the source
+    // lossy).  When false it stores source chunk bytes unchanged at the
     // volume's native chunk size (larger, lossless).  Both modes use
     // independent directories so they can coexist.  Requires restart.
     constexpr auto DISK_CACHE_COMPRESSED = "perf/disk_cache_compressed";

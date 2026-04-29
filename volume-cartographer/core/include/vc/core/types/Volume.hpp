@@ -107,7 +107,7 @@ public:
     // first tieredCache().
     void setEncodeParams(const utils::C3dCodecParams& params);
 
-    // When false, the disk cache stores raw uncompressed voxels at the
+    // When false, the disk cache stores source chunk bytes unchanged at the
     // source volume's native chunk size instead of c3d-compressed shards.
     // Must be called before first tieredCache() access.
     void setDiskCacheCompressed(bool compressed);
