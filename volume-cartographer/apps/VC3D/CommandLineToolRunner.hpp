@@ -101,6 +101,7 @@ private:
     QStringList buildArguments(Tool tool);
     QString toolName(Tool tool) const;
     QString getOutputPath() const;
+    void clearTemporaryJsonParams();
 
     CWindow* _mainWindow;
     ProgressUtil* _progressUtil;
@@ -119,6 +120,7 @@ private:
     QString _tifxyzPath;
     QString _objPath;
     QString _jsonParams;
+    QString _temporaryJsonParams;
     QString _resumeSurfacePath;
     QString _resumeOpt;
     

@@ -9,9 +9,11 @@
 #include <QTextStream>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QJsonParseError>
 #include <QMessageBox>
 #include <QClipboard>
 #include <QApplication>
+#include <QTemporaryFile>
 
 
 
@@ -57,6 +59,15 @@ QString formatCommand(const QString& program, const QStringList& args, int ompTh
 
 } // namespace
 
+void CommandLineToolRunner::clearTemporaryJsonParams()
+{
+    if (_temporaryJsonParams.isEmpty()) {
+        return;
+    }
+    QFile::remove(_temporaryJsonParams);
+    _temporaryJsonParams.clear();
+}
+
 CommandLineToolRunner::CommandLineToolRunner(QStatusBar* statusBar, CWindow* mainWindow, QObject* parent)
     : QObject(parent)
     , _mainWindow(mainWindow)
@@ -86,6 +97,7 @@ CommandLineToolRunner::CommandLineToolRunner(QStatusBar* statusBar, CWindow* mai
 
 CommandLineToolRunner::~CommandLineToolRunner()
 {
+    clearTemporaryJsonParams();
     if (_process) {
         if (_process->state() != QProcess::NotRunning) {
             _process->terminate();
@@ -136,6 +148,7 @@ void CommandLineToolRunner::setGrowParams(QString volumePath, QString tgtDir, QS
     setVolumePath(volumePath);
     _tgtDir = tgtDir;
     _jsonParams = jsonParams;
+    clearTemporaryJsonParams();
     _seed_x = seed_x;
     _seed_y = seed_y;
     _seed_z = seed_z;
@@ -147,7 +160,11 @@ void CommandLineToolRunner::setGrowParams(QString volumePath, QString tgtDir, QS
         QByteArray jsonData = file.readAll();
         file.close();
 
-        QJsonDocument doc = QJsonDocument::fromJson(jsonData);
+        QJsonParseError parseError;
+        QJsonDocument doc = QJsonDocument::fromJson(jsonData, &parseError);
+        if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
+            return;
+        }
         QJsonObject jsonObj = doc.object();
 
         if (useExpandMode) {
@@ -161,15 +178,20 @@ void CommandLineToolRunner::setGrowParams(QString volumePath, QString tgtDir, QS
         doc.setObject(jsonObj);
         jsonData = doc.toJson();
 
-        if (file.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
-            file.write(jsonData);
-            file.close();
+        QTemporaryFile tempFile(QDir::temp().filePath(QStringLiteral("vc_grow_params_XXXXXX.json")));
+        tempFile.setAutoRemove(false);
+        if (tempFile.open()) {
+            tempFile.write(jsonData);
+            tempFile.close();
+            _temporaryJsonParams = tempFile.fileName();
+            _jsonParams = _temporaryJsonParams;
         }
     }
 }
 
 void CommandLineToolRunner::setTraceParams(QString volumePath, QString srcDir, QString tgtDir, QString jsonParams, QString srcSegment)
 {
+    clearTemporaryJsonParams();
     setVolumePath(volumePath);
     _srcDir = srcDir;
     _tgtDir = tgtDir;
@@ -534,6 +556,7 @@ void CommandLineToolRunner::onProcessFinished(int exitCode, QProcess::ExitStatus
         delete _logFile;
         _logFile = nullptr;
     }
+    clearTemporaryJsonParams();
 
     _explicitVolumePath = false;
 
@@ -596,6 +619,7 @@ void CommandLineToolRunner::onProcessError(QProcess::ProcessError error)
         delete _logFile;
         _logFile = nullptr;
     }
+    clearTemporaryJsonParams();
 
     if (_progressUtil) _progressUtil->stopAnimation(tr("Process failed"));
 
@@ -781,6 +805,7 @@ void CommandLineToolRunner::setObjRefineParams(const QString& volumePath,
                                                const QString& dstSurface,
                                                const QString& jsonParams)
 {
+    clearTemporaryJsonParams();
     setVolumePath(volumePath);
     _segmentPath = srcSurface;
     _refineDst = dstSurface;
@@ -793,6 +818,7 @@ void CommandLineToolRunner::setNeighborCopyParams(const QString& volumePath,
                                                   const QString& outputDir,
                                                   const QString& resumeOpt)
 {
+    clearTemporaryJsonParams();
     setVolumePath(volumePath);
     _jsonParams = paramsJson;
     _resumeSurfacePath = resumeSurface;
