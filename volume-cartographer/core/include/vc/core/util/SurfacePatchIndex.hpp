@@ -31,9 +31,9 @@ public:
 
     struct TriangleCandidate {
         SurfacePtr surface;
-        int i = 0;
-        int j = 0;
-        int triangleIndex = 0; // 0 = (p00,p10,p01), 1 = (p10,p11,p01)
+        int i = 0; // Grid column index (x)
+        int j = 0; // Grid row index (y)
+        int triangleIndex = 0; // 0 = (p00,p10,p01), 1 = (p10,p11,p01), pXY = (column,row)
         std::array<cv::Vec3f, 3> world{};
         std::array<cv::Vec3f, 3> surfaceParams{}; // ptr-space coordinates for vertices
     };

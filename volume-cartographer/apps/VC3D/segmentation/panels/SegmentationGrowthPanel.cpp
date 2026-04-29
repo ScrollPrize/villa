@@ -448,22 +448,70 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
         return description + QStringLiteral("\n") + example;
     };
 
-    _spinPatchGlobalStepsPerWindow = addIntParam(tr("Global opt windows"), 0, 100, 1, _patchGlobalStepsPerWindow, 0);
-    _spinPatchSrcStep = addIntParam(tr("Source step"), 1, 1000, 1, _patchSrcStep, 20);
-    _spinPatchStep = addIntParam(tr("Grid step"), 1, 1000, 1, _patchStep, 10);
-    _spinPatchMaxWidth = addIntParam(tr("Max width"), 1, 1000000, 1000, _patchMaxWidth, 80000);
-    _spinPatchLocalCostInlierThreshold = addDoubleParam(tr("Local cost inlier"), 0.0, 100.0, 0.01, _patchLocalCostInlierThreshold, 0.2);
-    _spinPatchSameSurfaceThreshold = addDoubleParam(tr("Same surface threshold"), 0.0, 1000.0, 0.1, _patchSameSurfaceThreshold, 2.0);
-    _spinPatchStraightWeight = addDoubleParam(tr("Straight weight 2D"), 0.0, 100.0, 0.1, _patchStraightWeight, 0.7);
-    _spinPatchStraightWeight3d = addDoubleParam(tr("Straight weight 3D"), 0.0, 100.0, 0.1, _patchStraightWeight3d, 4.0);
-    _spinPatchSlidingWindowScale = addDoubleParam(tr("Sliding window scale"), 0.01, 100.0, 0.1, _patchSlidingWindowScale, 1.0);
-    _spinPatchZLocationLossWeight = addDoubleParam(tr("Z loc loss weight"), 0.0, 100.0, 0.1, _patchZLocationLossWeight, 0.1);
-    _spinPatchDistLoss2dWeight = addDoubleParam(tr("Dist loss 2D"), 0.0, 100.0, 0.1, _patchDistLoss2dWeight, 1.0);
-    _spinPatchDistLoss3dWeight = addDoubleParam(tr("Dist loss 3D"), 0.0, 100.0, 0.1, _patchDistLoss3dWeight, 2.0);
-    _spinPatchSdir3dRadius = addIntParam(tr("SDIR radius 3D"), 0, 8, 1, _patchSdir3dRadius, 2);
-    _spinPatchSdir3dWeight = addDoubleParam(tr("SDIR weight 3D"), 0.0, 100.0, 0.1, _patchSdir3dWeight, 0.5);
-    _spinPatchSdir3dGlobalWeight = addDoubleParam(tr("SDIR global weight 3D"), 0.0, 100.0, 0.1, _patchSdir3dGlobalWeight, 0.25);
-    _spinPatchSdir3dCandidateMax = addDoubleParam(tr("SDIR candidate max"), 0.0, 1000.0, 0.1, _patchSdir3dCandidateMax, 4.0);
+    _spinPatchGlobalStepsPerWindow = addIntParam(
+        tr("Global opt windows"), 0, 100, 1, _patchGlobalStepsPerWindow, 0,
+        patchHelp(tr("Runs this many global/window optimization passes after each growth window is saved."),
+                  tr("Set to 0 to skip these extra passes; increase to smooth the grown surface more often at higher cost.")));
+    _spinPatchSrcStep = addIntParam(
+        tr("Source step"), 1, 1000, 1, _patchSrcStep, 20,
+        patchHelp(tr("Voxel spacing represented by one source-surface sample used by the tracer."),
+                  tr("Together with Grid step, this sets the target 3D distance between neighboring traced points.")));
+    _spinPatchStep = addIntParam(
+        tr("Grid step"), 1, 1000, 1, _patchStep, 10,
+        patchHelp(tr("Tracing-grid stride used when growing from the seed surface."),
+                  tr("Larger values grow a coarser surface faster; smaller values add denser grid points.")));
+    _spinPatchMaxWidth = addIntParam(
+        tr("Max width"), 1, 1000000, 1000, _patchMaxWidth, 80000,
+        patchHelp(tr("Maximum allowed traced-surface extent in voxel units before growth is stopped."),
+                  tr("Increase for wider sheets; decrease to cap runaway growth sooner.")));
+    _spinPatchLocalCostInlierThreshold = addDoubleParam(
+        tr("Local cost inlier"), 0.0, 100.0, 0.01, _patchLocalCostInlierThreshold, 0.2,
+        patchHelp(tr("Accepts a surface as an inlier when its local optimization residual is below this value."),
+                  tr("Increase to accept noisier matches; decrease to require tighter local consistency.")));
+    _spinPatchSameSurfaceThreshold = addDoubleParam(
+        tr("Same surface threshold"), 0.0, 1000.0, 0.1, _patchSameSurfaceThreshold, 2.0,
+        patchHelp(tr("Maximum world-space distance used when locating candidate patch surfaces near a point."),
+                  tr("Increase to consider farther nearby surfaces; decrease to avoid accidental cross-surface matches.")));
+    _spinPatchStraightWeight = addDoubleParam(
+        tr("Straight weight 2D"), 0.0, 100.0, 0.1, _patchStraightWeight, 0.7,
+        patchHelp(tr("Weights 2D straight-line constraints in source-surface parameter space."),
+                  tr("Increase to keep parameter rows and columns straighter; decrease to allow more local bending.")));
+    _spinPatchStraightWeight3d = addDoubleParam(
+        tr("Straight weight 3D"), 0.0, 100.0, 0.1, _patchStraightWeight3d, 4.0,
+        patchHelp(tr("Weights 3D straight-line constraints between neighboring traced points."),
+                  tr("Increase to keep the grown surface smoother in volume space; decrease to follow sharper geometry.")));
+    _spinPatchSlidingWindowScale = addDoubleParam(
+        tr("Sliding window scale"), 0.01, 100.0, 0.1, _patchSlidingWindowScale, 1.0,
+        patchHelp(tr("Scales the active sliding window size used during growth and local remapping."),
+                  tr("Increase to optimize larger neighborhoods; decrease to use smaller, cheaper windows.")));
+    _spinPatchZLocationLossWeight = addDoubleParam(
+        tr("Z loc loss weight"), 0.0, 100.0, 0.1, _patchZLocationLossWeight, 0.1,
+        patchHelp(tr("Weights the constraint that keeps new points near the expected Z position from the seed trend."),
+                  tr("Increase to resist Z drift; decrease when the sheet legitimately bends away from the seed Z trend.")));
+    _spinPatchDistLoss2dWeight = addDoubleParam(
+        tr("Dist loss 2D"), 0.0, 100.0, 0.1, _patchDistLoss2dWeight, 1.0,
+        patchHelp(tr("Weights neighbor-distance preservation in 2D source-surface parameter coordinates."),
+                  tr("Increase to keep parameter spacing more uniform; decrease to let parameter locations adapt more freely.")));
+    _spinPatchDistLoss3dWeight = addDoubleParam(
+        tr("Dist loss 3D"), 0.0, 100.0, 0.1, _patchDistLoss3dWeight, 2.0,
+        patchHelp(tr("Weights neighbor-distance preservation in 3D volume coordinates."),
+                  tr("Increase to keep 3D point spacing closer to the grid spacing; decrease to allow more stretch or compression.")));
+    _spinPatchSdir3dRadius = addIntParam(
+        tr("SDIR radius 3D"), 0, 8, 1, _patchSdir3dRadius, 2,
+        patchHelp(tr("Checks 3D symmetric-Dirichlet metric distortion across this many grid strides."),
+                  tr("Increase to catch broader 3D distortion; set to 0 to disable 3D metric preservation checks.")));
+    _spinPatchSdir3dWeight = addDoubleParam(
+        tr("SDIR weight 3D"), 0.0, 100.0, 0.1, _patchSdir3dWeight, 0.5,
+        patchHelp(tr("Weights local 3D metric-preservation constraints during per-point solves."),
+                  tr("Increase to resist local stretching or folding; decrease to let candidates follow patch evidence more freely.")));
+    _spinPatchSdir3dGlobalWeight = addDoubleParam(
+        tr("SDIR global weight 3D"), 0.0, 100.0, 0.1, _patchSdir3dGlobalWeight, 0.25,
+        patchHelp(tr("Weights 3D metric-preservation constraints during global/window optimization."),
+                  tr("Increase to smooth larger 3D distortions during global passes; decrease to reduce this regularization.")));
+    _spinPatchSdir3dCandidateMax = addDoubleParam(
+        tr("SDIR candidate max"), 0.0, 1000.0, 0.1, _patchSdir3dCandidateMax, 4.0,
+        patchHelp(tr("Rejects candidates whose local 3D metric residual is above this threshold."),
+                  tr("Increase to allow more distorted 3D candidates; decrease to reject stretched or folded candidates sooner.")));
     _spinPatchParamSdir2dRadius = addIntParam(
         tr("Param SDIR radius 2D"), 0, 8, 1, _patchParamSdir2dRadius, 2,
         patchHelp(tr("Checks 2D source-surface parameter distortion across this many grid strides."),
@@ -496,14 +544,35 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
         tr("Param non-neighbor radius"), 0, 64, 1, _patchParamNonneighborRadius, 4,
         patchHelp(tr("Searches this many grid cells around a candidate for non-neighbor parameter-space crowding."),
                   tr("Increase to catch farther crowding at higher cost; decrease or set near 1 to make the check local or effectively off.")));
-    _spinPatchStraightMinCount = addDoubleParam(tr("Straight min count"), 0.0, 16.0, 0.5, _patchStraightMinCount, 1.0);
-    _spinPatchInlierBaseThreshold = addIntParam(tr("Inlier base threshold"), 0, 10000, 1, _patchInlierBaseThreshold, 20);
-    _spinPatchConsensusDefaultThreshold = addIntParam(tr("Consensus default th"), 0, 10000, 1, _patchConsensusDefaultThreshold, 10);
-    _spinPatchConsensusLimitThreshold = addIntParam(tr("Consensus limit th"), 0, 10000, 1, _patchConsensusLimitThreshold, 2);
+    _spinPatchStraightMinCount = addDoubleParam(
+        tr("Straight min count"), 0.0, 16.0, 0.5, _patchStraightMinCount, 1.0,
+        patchHelp(tr("Minimum number of straightness constraints required for a non-seed candidate to count as an inlier."),
+                  tr("Increase to require more local support; decrease to accept candidates with fewer straightness checks.")));
+    _spinPatchInlierBaseThreshold = addIntParam(
+        tr("Inlier base threshold"), 0, 10000, 1, _patchInlierBaseThreshold, 20,
+        patchHelp(tr("Starting consensus score a candidate must reach before it is accepted for growth."),
+                  tr("Increase for stricter growth; decrease to continue through weakly supported areas.")));
+    _spinPatchConsensusDefaultThreshold = addIntParam(
+        tr("Consensus default th"), 0, 10000, 1, _patchConsensusDefaultThreshold, 10,
+        patchHelp(tr("Lower bound used when the adaptive consensus threshold relaxes after growth stalls."),
+                  tr("Increase to keep stalled growth strict; decrease to let the tracer retry with fewer inliers.")));
+    _spinPatchConsensusLimitThreshold = addIntParam(
+        tr("Consensus limit th"), 0, 10000, 1, _patchConsensusLimitThreshold, 2,
+        patchHelp(tr("Lowest relaxed consensus threshold used after the tracer is no longer at the right growth border."),
+                  tr("Increase to avoid very weak late candidates; decrease to permit more aggressive recovery after stalls.")));
 
     _chkPatchFlipX = new QCheckBox(tr("Flip X"), _groupPatchTracerParams);
+    _chkPatchFlipX->setToolTip(
+        patchHelp(tr("Mirrors the traced grid across the seed X center after initial growth and swaps left/right growth directions."),
+                  tr("Use for symmetric opposite-side growth; leave off for normal one-sided growth.")));
     _chkPatchDebugImages = new QCheckBox(tr("Debug images"), _groupPatchTracerParams);
+    _chkPatchDebugImages->setToolTip(
+        patchHelp(tr("Writes intermediate debug surfaces/images during patch tracing and optimization."),
+                  tr("Enable only when diagnosing growth behavior; it adds disk output and runtime overhead.")));
     _chkPatchSingleWrap = new QCheckBox(tr("Single wrap"), _groupPatchTracerParams);
+    _chkPatchSingleWrap->setToolTip(
+        patchHelp(tr("Uses the selected umbilicus to prevent growth across the single-wrap seam."),
+                  tr("Requires an umbilicus path and constrains seam crossings using angular/radial checks.")));
     connect(_chkPatchFlipX, &QCheckBox::toggled, this, [this]() { persistPatchTracerParams(); });
     connect(_chkPatchDebugImages, &QCheckBox::toggled, this, [this]() { persistPatchTracerParams(); });
     connect(_chkPatchSingleWrap, &QCheckBox::toggled, this, [this]() { persistPatchTracerParams(); });

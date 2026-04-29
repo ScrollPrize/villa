@@ -23,9 +23,9 @@ struct LookupResult {
 
 struct TriangleCandidate {
     SurfacePatchIndex::SurfacePtr surface;
-    int i = 0;                       // Grid row index
-    int j = 0;                       // Grid column index
-    int triangleIndex = 0;           // 0 = (p00,p10,p01), 1 = (p10,p11,p01)
+    int i = 0;                       // Grid column index (x)
+    int j = 0;                       // Grid row index (y)
+    int triangleIndex = 0;           // 0 = (p00,p10,p01), 1 = (p10,p11,p01), pXY = (column,row)
     std::array<cv::Vec3f, 3> world{};         // 3D world coordinates of vertices
     std::array<cv::Vec3f, 3> surfaceParams{}; // Surface pointer coordinates for vertices
 };
@@ -39,7 +39,7 @@ struct TriangleSegment {
 
 ### Surface Filtering
 
-Point, triangle, and ray queries all use the same optional filter:
+Point, triangle, and ray queries use small query structs. All of them include the same optional surface filter:
 
 ```cpp
 struct SurfaceFilter {
@@ -47,20 +47,72 @@ struct SurfaceFilter {
     const std::unordered_set<SurfacePtr>* include;    // Search this set
     const std::unordered_set<SurfacePtr>* exclude;    // Skip this set
 };
+
+struct PointQuery {
+    cv::Vec3f worldPoint = {0, 0, 0};
+    float tolerance = 0.0f;
+    SurfaceFilter surfaces;
+};
+
+struct PatchBounds {
+    cv::Vec3f low = {0, 0, 0};
+    cv::Vec3f high = {0, 0, 0};
+};
+
+struct TriangleQuery {
+    Rect3D bounds;
+    SurfaceFilter surfaces;
+    std::function<bool(const PatchBounds&)> patchFilter; // Optional bbox-level reject
+};
+
+struct RayQuery {
+    cv::Vec3f src = {0, 0, 0};
+    cv::Vec3f end = {0, 0, 0};
+    float minT = 0.0f;
+    float bboxPadding = 0.0f;
+    SurfaceFilter surfaces;
+};
 ```
 
 ### Building the Index
 
 | Method | Description |
 |--------|-------------|
-| `rebuild(surfaces, bboxPadding)` | Build the index from a vector of `QuadSurface*`. Optional padding expands bounding boxes. |
+| `rebuild(surfaces, bboxPadding)` | Build the index from a vector of `SurfacePtr` disk-backed tifxyz `QuadSurface` objects. Optional padding expands bounding boxes. |
 | `clear()` | Remove all surfaces from the index |
 | `empty()` | Returns `true` if the index contains no surfaces |
+| `patchCount()` | Returns the number of indexed patch boxes |
+| `surfaceCount()` | Returns the number of indexed surfaces |
+| `containsSurface(surface)` | Returns whether a surface is currently indexed |
 
 ```cpp
 SurfacePatchIndex index;
 std::vector<SurfacePatchIndex::SurfacePtr> surfaces = { surf1, surf2, surf3 };
 index.rebuild(surfaces, 2.0f);  // 2 voxel padding on bounding boxes
+```
+
+### Cache Files
+
+Indexes can be saved and reloaded when the source surfaces, sampling stride, and padding match a cache key.
+
+| Method | Description |
+|--------|-------------|
+| `cacheKeyForSurfaces(surfaces, samplingStride, bboxPadding)` | Build the expected cache key for a surface set and index settings |
+| `loadCache(cachePath, surfaces, expectedKey)` | Load a previously saved index; returns `false` if the file/key/surface set is incompatible |
+| `saveCache(cachePath, cacheKey)` | Save the current index to disk |
+
+```cpp
+const int stride = 1;
+const float padding = 2.0f;
+SurfacePatchIndex index;
+index.setSamplingStride(stride);
+
+const std::string key =
+    SurfacePatchIndex::cacheKeyForSurfaces(surfaces, stride, padding);
+if (!index.loadCache(cachePath, surfaces, key)) {
+    index.rebuild(surfaces, padding);
+    index.saveCache(cachePath, key);
+}
 ```
 
 ### Point Location
@@ -94,7 +146,7 @@ if (result) {
 
 ### Triangle Queries
 
-Query all triangles within a 3D bounding box:
+Query all triangles within a 3D bounding box, or all triangles whose patch boxes intersect a ray segment:
 
 | Method | Description |
 |--------|-------------|
@@ -115,6 +167,18 @@ index.forEachTriangle(query, [](const auto& tri) {
 });
 ```
 
+```cpp
+SurfacePatchIndex::RayQuery ray;
+ray.src = {0, 0, 0};
+ray.end = {100, 0, 0};
+ray.minT = 1.0f;
+ray.bboxPadding = 2.0f;
+
+index.forEachTriangle(ray, [](const auto& tri) {
+    // Perform exact ray/triangle testing if needed
+});
+```
+
 ### Triangle Clipping
 
 Clip a triangle against a plane, returning the line segment where they intersect:
@@ -127,6 +191,8 @@ static std::optional<TriangleSegment> clipTriangleToPlane(
 ```
 
 Returns the segment where the triangle crosses the plane, or empty if no intersection.
+
+`computePlaneIntersections(plane, planeRoi, targets, clipTolerance)` clips all target surfaces against a plane ROI and returns the intersection segments grouped by surface.
 
 ### Incremental Updates
 
@@ -155,8 +221,8 @@ For interactive editing workflows, the index supports queuing cell updates and f
 |--------|-------------|
 | `queueCellUpdateForVertex(surface, row, col)` | Queue the 4 cells sharing a vertex for update |
 | `queueCellRangeUpdate(surface, rowStart, rowEnd, colStart, colEnd)` | Queue a range of cells for update |
-| `flushPendingUpdates(surface)` | Apply all pending cell updates to the R-tree |
-| `hasPendingUpdates(surface)` | Check if a surface has pending cell updates |
+| `flushPendingUpdates(surface)` | Apply pending cell updates for one surface, or all surfaces when omitted |
+| `hasPendingUpdates(surface)` | Check whether one surface, or any surface when omitted, has pending cell updates |
 
 **Typical workflow:**
 
@@ -202,8 +268,9 @@ if (index.generation(surface) != lastKnownGen) {
 |--------|-------------|
 | `setSamplingStride(stride)` | Set the grid sampling stride (default 1) |
 | `samplingStride()` | Get the current sampling stride |
+| `setReadOnly(readOnly)` | Switch read-only mode and clear the current index state |
 
-Higher stride values trade accuracy for performance by sampling fewer triangles.
+Higher stride values emit fewer triangles during triangle iteration. Internally, the R-tree stores coarser patch boxes and sub-iterates them at `samplingStride`.
 
 ---
 
