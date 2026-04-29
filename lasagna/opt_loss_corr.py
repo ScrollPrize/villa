@@ -148,6 +148,32 @@ def _bilinear_project(P: torch.Tensor, v00: torch.Tensor, v10: torch.Tensor,
 	return u, v
 
 
+def _ray_quad_intersect(P: torch.Tensor, gt_n_p: torch.Tensor,
+						v00: torch.Tensor, v10: torch.Tensor,
+						v01: torch.Tensor, v11: torch.Tensor
+						) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+	"""Ray from P along gt_n_p → bilinear-quad intersection.
+
+	Uniform GT-normal projection used by both the obs (avg-feeding) and the Phase D
+	splat — see plan. Returns (u_clamped, v_clamped, in_bounds), all (Kp,):
+
+	  - u, v clamped to [0, 1] so Q always stays on the quad and the strip integral
+	    can't blow up if the ray glances the quad.
+	  - in_bounds tells the caller whether the *unclamped* hit was inside the quad,
+	    so they can fold "ray missed the quad" into their validity mask (and exclude
+	    the point from the avg / from the splat).
+	"""
+	Kp = P.shape[0]
+	dev = P.device
+	dt = P.dtype
+	fh = torch.full((Kp,), 0.5, device=dev, dtype=dt)
+	fw = torch.full((Kp,), 0.5, device=dev, dtype=dt)
+	u, v = fit_model.Model3D._ray_bilinear_intersect(
+		P, gt_n_p, v00, v10, v01, v11, fh, fw)
+	in_bounds = (u >= 0.0) & (u <= 1.0) & (v >= 0.0) & (v <= 1.0)
+	return u.clamp(0.0, 1.0), v.clamp(0.0, 1.0), in_bounds
+
+
 def _bilinear_interp(v00: torch.Tensor, v10: torch.Tensor,
 					 v01: torch.Tensor, v11: torch.Tensor,
 					 u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -814,6 +840,7 @@ def _corr_winding_loss(
 				bk = has_bracket
 				bki = bk.nonzero(as_tuple=True)[0]
 				Q_pair = []
+				ib_pair = [None, None]
 				for ci in [0, 1]:
 					d_ci = _wind_anchors_d[bki, ci]
 					h_ci = _wind_anchors_h[bki, ci]
@@ -822,8 +849,9 @@ def _corr_winding_loss(
 					v10 = xyz_det[d_ci, (h_ci + 1).clamp(max=Qh), w_ci]
 					v01 = xyz_det[d_ci, h_ci, (w_ci + 1).clamp(max=Qw)]
 					v11 = xyz_det[d_ci, (h_ci + 1).clamp(max=Qh), (w_ci + 1).clamp(max=Qw)]
-					u_c, v_c = _bilinear_project(P[bki], v00, v10, v01, v11)
+					u_c, v_c, ib_c = _ray_quad_intersect(P[bki], gt_n[bki], v00, v10, v01, v11)
 					Q_pair.append(_bilinear_interp(v00, v10, v01, v11, u_c, v_c))
+					ib_pair[ci] = ib_c
 
 				Q_lo, Q_hi = Q_pair
 				P_bk = P[bki]
@@ -833,7 +861,8 @@ def _corr_winding_loss(
 				frac = uint_lo / (uint_lo + uint_hi + 1e-8)
 				d_lo = _wind_anchors_d[bki, 0].to(dt)
 				winding_obs[bki] = d_lo + frac
-				obs_valid[bki] = sv_lo & sv_hi
+				# Bracketed obs only valid if both ray hits land in-quad on each layer.
+				obs_valid[bki] = sv_lo & sv_hi & ib_pair[0] & ib_pair[1]
 
 			# Single-sided points
 			single = _wind_anchors_valid[:, 0] & ~_wind_anchors_valid[:, 1]
@@ -846,7 +875,7 @@ def _corr_winding_loss(
 				v10 = xyz_det[d_s, (h_s + 1).clamp(max=Qh), w_s]
 				v01 = xyz_det[d_s, h_s, (w_s + 1).clamp(max=Qw)]
 				v11 = xyz_det[d_s, (h_s + 1).clamp(max=Qh), (w_s + 1).clamp(max=Qw)]
-				u_c, v_c = _bilinear_project(P[si], v00, v10, v01, v11)
+				u_c, v_c, ib = _ray_quad_intersect(P[si], gt_n[si], v00, v10, v01, v11)
 				Q_s = _bilinear_interp(v00, v10, v01, v11, u_c, v_c)
 				_, uw, sv = _wind_strip_integral(P[si], Q_s, gt_n[si], res.data, strip_samples)
 				# Use model surface normal at Q for consistent sign
@@ -860,7 +889,8 @@ def _corr_winding_loss(
 				above = ((P[si] - Q_s) * surf_n).sum(dim=-1) > 0
 				w_est = torch.where(above, d_s.to(dt) + uw, d_s.to(dt) - uw)
 				winding_obs[si] = w_est
-				obs_valid[si] = sv & (uw < 1.0)
+				# Single-sided obs invalid if ray missed the quad (in_bounds=False).
+				obs_valid[si] = sv & (uw < 1.0) & ib
 
 			# Phase B: Collection averaging
 			_wind_obs_per_point = winding_obs.clone()
@@ -946,12 +976,13 @@ def _corr_winding_loss(
 			h_ci = _wind_anchors_h[vi, ci]
 			w_ci = _wind_anchors_w[vi, ci]
 
-			# Detached quad corners and projection
+			# Detached quad corners and ray-along-gt_n projection (same intersection
+			# method as obs / brute_force_init — see plan).
 			M00_det = xyz_det[d_ci, h_ci, w_ci]
 			M10_det = xyz_det[d_ci, h_ci + 1, w_ci]
 			M01_det = xyz_det[d_ci, h_ci, w_ci + 1]
 			M11_det = xyz_det[d_ci, h_ci + 1, w_ci + 1]
-			u_ci, v_ci = _bilinear_project(P[vi], M00_det, M10_det, M01_det, M11_det)
+			u_ci, v_ci, ib = _ray_quad_intersect(P[vi], gt_n[vi], M00_det, M10_det, M01_det, M11_det)
 			Q_det = _bilinear_interp(M00_det, M10_det, M01_det, M11_det, u_ci, v_ci)
 
 			# Strip integral → signed winding and validity
@@ -975,7 +1006,8 @@ def _corr_winding_loss(
 			# `sw` responds to corner moves purely via `(Q−P)·gt_n_p`, so no sign flip is
 			# needed when the local mesh winding is inside-out relative to gt_n_p.
 			signed_delta = -err
-			mask_p = sv.to(dt) * (~too_far).to(dt) * fw_ci
+			# Fold ray-in-bounds into the soft mask so out-of-quad ray hits don't splat.
+			mask_p = sv.to(dt) * (~too_far).to(dt) * fw_ci * ib.to(dt)
 
 			# Continuous mesh-space position of the corr point on the avg-pair quad.
 			h_cont = h_ci.to(dt) + u_ci
