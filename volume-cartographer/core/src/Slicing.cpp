@@ -221,8 +221,8 @@ struct BlockSampler {
             // Plain-memory binary search saves the atomic-heavy
             // BlockCache::get / isEmptyChunk probes for the first access
             // of hot data. The slice may contain multiple entries for a
-            // given packedKey (one per pipeline); scan the run looking
-            // for a pipeline match.
+            // given packedKey; scan the run looking for matching pipeline
+            // and pyramid level.
             if (!frame->slice.empty()) {
                 auto it = std::lower_bound(
                     frame->slice.begin(), frame->slice.end(), key,
@@ -230,7 +230,7 @@ struct BlockSampler {
                         return e.packedKey < k;
                     });
                 while (it != frame->slice.end() && it->packedKey == key) {
-                    if (it->pipeline == &cache && it->block) {
+                    if (it->pipeline == &cache && it->level == level && it->block) {
                         slotBlocks[idx] = const_cast<BlockPtr>(it->block);
                         slot.data = reinterpret_cast<const T*>(it->block->data);
                         slot.key  = key;
