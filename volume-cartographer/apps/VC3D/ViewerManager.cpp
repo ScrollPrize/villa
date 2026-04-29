@@ -360,7 +360,7 @@ void ViewerManager::setSurfacePatchSamplingStride(int stride, bool userInitiated
         settings.setValue(vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE_USER_SET, true);
     }
 
-    if (_surfacePatchIndex.setSamplingStride(_surfacePatchSamplingStride)) {
+    if (_surfacePatchIndex->setSamplingStride(_surfacePatchSamplingStride)) {
         _surfacePatchIndexNeedsRebuild = true;
         _indexedSurfaceIds.clear();
         // Index was cleared — remove stale intersection lines immediately.
@@ -388,18 +388,23 @@ void ViewerManager::setIntersectionMaxSurfaces(int limit)
 SurfacePatchIndex* ViewerManager::surfacePatchIndex()
 {
     rebuildSurfacePatchIndexIfNeeded();
-    if (_surfacePatchIndex.empty()) {
-        return nullptr;
-    }
-    return &_surfacePatchIndex;
+    if (_surfacePatchIndex->empty()) return nullptr;
+    return _surfacePatchIndex.get();
+}
+
+std::shared_ptr<SurfacePatchIndex> ViewerManager::surfacePatchIndexShared()
+{
+    rebuildSurfacePatchIndexIfNeeded();
+    if (_surfacePatchIndex->empty()) return nullptr;
+    return _surfacePatchIndex;
 }
 
 SurfacePatchIndex* ViewerManager::surfacePatchIndexIfReady()
 {
-    if (_surfacePatchIndex.empty()) {
+    if (_surfacePatchIndex->empty()) {
         return nullptr;
     }
-    return &_surfacePatchIndex;
+    return _surfacePatchIndex.get();
 }
 
 void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface)
@@ -408,7 +413,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
         return;
     }
     const std::string surfId = surface->id;
-    if (_surfacePatchIndexNeedsRebuild || _surfacePatchIndex.empty()) {
+    if (_surfacePatchIndexNeedsRebuild || _surfacePatchIndex->empty()) {
         _surfacePatchIndexNeedsRebuild = true;
         _indexedSurfaceIds.erase(surfId);
         VC3D_DEBUG_QCINFO(lcViewerManager) << "Deferred surface index refresh for" << surfId.c_str()
@@ -416,7 +421,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
         return;
     }
 
-    if (_surfacePatchIndex.updateSurface(surface)) {
+    if (_surfacePatchIndex->updateSurface(surface)) {
         _indexedSurfaceIds.insert(surfId);
         VC3D_DEBUG_QCINFO(lcViewerManager) << "Rebuilt SurfacePatchIndex entries for surface" << surfId.c_str();
         return;
@@ -441,7 +446,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
     }
 
     const std::string surfId = surface->id;
-    if (_surfacePatchIndexNeedsRebuild || _surfacePatchIndex.empty()) {
+    if (_surfacePatchIndexNeedsRebuild || _surfacePatchIndex->empty()) {
         _surfacePatchIndexNeedsRebuild = true;
         _indexedSurfaceIds.erase(surfId);
         VC3D_DEBUG_QCINFO(lcViewerManager) << "Deferred surface index refresh for" << surfId.c_str()
@@ -455,7 +460,7 @@ void ViewerManager::refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr
     const int colStart = changedRegion.x;
     const int colEnd = changedRegion.x + changedRegion.width;
 
-    if (_surfacePatchIndex.updateSurfaceRegion(surface, rowStart, rowEnd, colStart, colEnd)) {
+    if (_surfacePatchIndex->updateSurfaceRegion(surface, rowStart, rowEnd, colStart, colEnd)) {
         _indexedSurfaceIds.insert(surfId);
         VC3D_DEBUG_QCINFO(lcViewerManager) << "Updated SurfacePatchIndex region for" << surfId.c_str()
                                 << "rows" << rowStart << "-" << rowEnd
@@ -501,7 +506,7 @@ void ViewerManager::primeSurfacePatchIndicesAsync()
     }
     _pendingSurfacePatchIndexSurfaceIds = surfaceIds;
     if (quadSurfaces.empty()) {
-        _surfacePatchIndex.clear();
+        _surfacePatchIndex->clear();
         _indexedSurfaceIds.clear();
         _surfacePatchIndexNeedsRebuild = false;
         return;
@@ -555,7 +560,7 @@ void ViewerManager::handleSurfacePatchIndexPrimeFinished()
         _pendingSurfacePatchIndexSurfaceIds.clear();
         return;
     }
-    _surfacePatchIndex = std::move(*result);
+    _surfacePatchIndex = std::move(result);
     _surfacePatchIndexNeedsRebuild = false;
     _indexedSurfaceIds.clear();
     _indexedSurfaceIds.insert(_pendingSurfacePatchIndexSurfaceIds.begin(),
@@ -624,7 +629,7 @@ void ViewerManager::startNextSurfacePatchIndexTask()
     SurfacePatchIndexTask task = std::move(_pendingSurfacePatchIndexTasks.front());
     _pendingSurfacePatchIndexTasks.erase(_pendingSurfacePatchIndexTasks.begin());
 
-    auto* index = &_surfacePatchIndex;
+    auto index = _surfacePatchIndex;
     auto future = QtConcurrent::run([index, task = std::move(task)]() mutable -> SurfacePatchIndexTaskResult {
         SurfacePatchIndexTaskResult result;
         result.type = task.type;
@@ -688,7 +693,7 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
     }
 
     const std::string surfId = quad->id;
-    const bool alreadyIndexed = _surfacePatchIndex.containsSurface(quad);
+    const bool alreadyIndexed = _surfacePatchIndex->containsSurface(quad);
 
     // Check if async rebuild is in progress
     const bool asyncRebuildInProgress = _surfacePatchIndexWatcher &&
@@ -697,8 +702,8 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
     // Editing tools queue the exact touched cells as vertices move. Flush those
     // cells into the current index immediately so plane intersections update
     // without turning every brush/push-pull tick into a global async rebuild.
-    if (_surfacePatchIndex.hasPendingUpdates(quad)) {
-        const bool flushed = _surfacePatchIndex.flushPendingUpdates(quad);
+    if (_surfacePatchIndex->hasPendingUpdates(quad)) {
+        const bool flushed = _surfacePatchIndex->flushPendingUpdates(quad);
         if (flushed) {
             _indexedSurfaceIds.insert(surfId);
         }
@@ -719,8 +724,8 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
         return true;
     }
 
-    if (isEditUpdate && !_surfacePatchIndex.empty()) {
-        if (_surfacePatchIndex.updateSurface(quad)) {
+    if (isEditUpdate && !_surfacePatchIndex->empty()) {
+        if (_surfacePatchIndex->updateSurface(quad)) {
             _indexedSurfaceIds.insert(surfId);
             if (asyncRebuildInProgress) {
                 _surfacesQueuedDuringRebuild.push_back(
@@ -745,7 +750,7 @@ bool ViewerManager::updateSurfacePatchIndexForSurface(const SurfacePatchIndex::S
         return true;
     }
 
-    if (!_surfacePatchIndex.empty()) {
+    if (!_surfacePatchIndex->empty()) {
         queueSurfacePatchIndexTask(
             {SurfacePatchIndexTaskType::Update, surfId, quad});
         return true;

@@ -226,7 +226,6 @@ struct TracerGrowthContext {
     QString normal3dZarrPath;
     cv::Mat allowedGrowthMask;
     // For corrections annotation saving
-    std::filesystem::path volpkgRoot;
     std::vector<std::string> volumeIds;
     std::string growthVolumeId;
     SurfacePatchIndex* surfacePatchIndex{nullptr};

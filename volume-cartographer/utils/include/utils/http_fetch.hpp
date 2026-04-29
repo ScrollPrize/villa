@@ -30,6 +30,33 @@
 namespace utils {
 
 // ---------------------------------------------------------------------------
+// Per-thread cancellation token. The xferinfo callback in HttpClient checks
+// this pointer; if it resolves to a flag that is set, the in-flight curl
+// transfer returns CURLE_ABORTED_BY_CALLBACK on the next progress tick
+// (sub-millisecond on an active socket).
+//
+// Typical usage from an async worker:
+//   auto cancel = std::make_shared<std::atomic<bool>>(false);
+//   utils::CancelScope scope(cancel.get());
+//   // ... HTTP calls on this thread now observe the flag ...
+//
+// Thread-local so concurrent workers on different pool threads don't fight
+// over a single setting; RAII-scoped so nesting/restoration is automatic.
+// ---------------------------------------------------------------------------
+inline thread_local std::atomic<bool>* tl_cancel_token = nullptr;
+
+class CancelScope {
+public:
+    explicit CancelScope(std::atomic<bool>* token) noexcept
+        : prev_(tl_cancel_token) { tl_cancel_token = token; }
+    ~CancelScope() { tl_cancel_token = prev_; }
+    CancelScope(const CancelScope&) = delete;
+    CancelScope& operator=(const CancelScope&) = delete;
+private:
+    std::atomic<bool>* prev_;
+};
+
+// ---------------------------------------------------------------------------
 // RAII curl handle wrapper (detail)
 // ---------------------------------------------------------------------------
 namespace detail {
@@ -242,6 +269,20 @@ public:
         return abort_flag().load(std::memory_order_acquire);
     }
 
+    // True if either the process-global abort or the current thread's
+    // CancelScope token is set. Used by the retry loop so a per-request
+    // cancellation terminates promptly instead of spinning through retries.
+    [[nodiscard]] static bool shouldAbort() noexcept
+    {
+        if (abort_flag().load(std::memory_order_acquire)) return true;
+        if (tl_cancel_token
+            && tl_cancel_token->load(std::memory_order_acquire))
+        {
+            return true;
+        }
+        return false;
+    }
+
 private:
     static std::atomic<bool>& abort_flag() noexcept
     {
@@ -258,7 +299,16 @@ private:
         // is free (plain load); relaxed would have worked there but is
         // not formally guaranteed to see the abort bit in bounded time
         // on weakly-ordered archs.
-        return abort_flag().load(std::memory_order_acquire) ? 1 : 0;
+        if (abort_flag().load(std::memory_order_acquire)) return 1;
+        // Per-thread token — set by a CancelScope enclosing the worker
+        // call tree. Lets an individual async job abort just its own
+        // transfers without affecting other concurrent downloads.
+        if (tl_cancel_token
+            && tl_cancel_token->load(std::memory_order_acquire))
+        {
+            return 1;
+        }
+        return 0;
     }
 
 public:
@@ -304,7 +354,7 @@ public:
 
         HttpResponse resp;
         for (std::size_t attempt = 0; attempt <= config_.max_retries; ++attempt) {
-            if (isAborted()) { std::fclose(f); return resp; }
+            if (shouldAbort()) { std::fclose(f); return resp; }
             resp = HttpResponse{};
             std::fseek(f, 0, SEEK_SET);
             auto* curl = thread_handle();
@@ -323,6 +373,7 @@ public:
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L);
+            curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
             if (config_.follow_redirects) {
                 curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
                 curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
@@ -529,7 +580,7 @@ private:
         HttpResponse resp;
 
         for (std::size_t attempt = 0; attempt <= config_.max_retries; ++attempt) {
-            if (isAborted()) return resp;
+            if (shouldAbort()) return resp;
             resp = HttpResponse{};
             auto* curl = thread_handle();
             curl_easy_reset(curl);
@@ -548,6 +599,10 @@ private:
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, 30L);
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 30L);
+
+            // HTTP/2 over TLS: S3 supports it; multiplexing many GETs over one
+            // connection cuts per-request handshake/slow-start overhead.
+            curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, (long)CURL_HTTP_VERSION_2TLS);
 
             // Redirects
             if (config_.follow_redirects) {
@@ -642,7 +697,7 @@ private:
             }
 
             // Retry on network / transient curl errors
-            if (attempt < config_.max_retries && !isAborted()) {
+            if (attempt < config_.max_retries && !shouldAbort()) {
                 thread_local std::mt19937 rng{std::random_device{}()};
                 std::uniform_int_distribution<unsigned> jitter(0, 100);
                 std::this_thread::sleep_for(

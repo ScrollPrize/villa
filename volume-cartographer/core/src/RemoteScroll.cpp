@@ -63,6 +63,91 @@ RemoteScrollInfo discoverRemoteScroll(const std::string& httpsUrl, const cache::
     return info;
 }
 
+namespace {
+
+std::filesystem::path remoteSegmentLocalDir(
+    const std::filesystem::path& cacheDir,
+    const std::string& segmentId,
+    RemoteSegmentSource source)
+{
+    const char* subdir = (source == RemoteSegmentSource::Segments) ? "segments" : "paths";
+    return cacheDir / subdir / segmentId;
+}
+
+std::string remoteSegmentBaseUrl(
+    const std::string& baseUrl,
+    const std::string& segmentId,
+    RemoteSegmentSource source)
+{
+    if (source == RemoteSegmentSource::Direct) return baseUrl + "/" + segmentId + "/";
+    if (source == RemoteSegmentSource::Paths)  return baseUrl + "/paths/" + segmentId + "/";
+    return baseUrl + "/segments/" + segmentId + "/mesh/tifxyz/";
+}
+
+void patchSegmentMeta(const std::filesystem::path& metaPath, const std::string& segmentId)
+{
+    if (!std::filesystem::exists(metaPath)) return;
+    try {
+        auto meta = utils::Json::parse_file(metaPath);
+        bool patched = false;
+        if (!meta.contains("type"))   { meta["type"]   = "seg";     patched = true; }
+        if (!meta.contains("uuid"))   { meta["uuid"]   = segmentId; patched = true; }
+        if (!meta.contains("format")) { meta["format"] = "tifxyz";  patched = true; }
+        if (patched) {
+            std::ofstream ofs(metaPath);
+            ofs << meta.dump(2);
+        }
+    } catch (const std::exception& e) {
+        Logger()->warn("[RemoteScroll] Failed to patch meta.json: {}", e.what());
+    }
+}
+
+std::filesystem::path downloadRemoteSegmentFiles(
+    const std::string& baseUrl,
+    const std::string& segmentId,
+    const std::filesystem::path& cacheDir,
+    const cache::HttpAuth& auth,
+    RemoteSegmentSource source,
+    const std::vector<std::string>& files)
+{
+    namespace fs = std::filesystem;
+    auto localDir = remoteSegmentLocalDir(cacheDir, segmentId, source);
+    fs::create_directories(localDir);
+
+    bool allExist = true;
+    for (const auto& f : files) {
+        if (!fs::exists(localDir / f)) { allExist = false; break; }
+    }
+    if (allExist) return localDir;
+
+    auto failMarker = localDir / ".download_failed";
+    if (fs::exists(failMarker)) return localDir;
+
+    const std::string remoteBase = remoteSegmentBaseUrl(baseUrl, segmentId, source);
+    for (const auto& f : files) {
+        auto localPath = localDir / f;
+        if (fs::exists(localPath)) continue;
+        const std::string url = remoteBase + f;
+        Logger()->info("[RemoteScroll]   Downloading {} -> {}", url, localPath.string());
+        if (!cache::httpDownloadFile(url, localPath, auth)) {
+            Logger()->error("[RemoteScroll]   FAILED to download {}", f);
+        }
+    }
+
+    auto metaPath = localDir / "meta.json";
+    if (!fs::exists(metaPath)) {
+        Logger()->warn("[RemoteScroll] Segment {} download failed, marking to skip", segmentId);
+        std::ofstream marker(failMarker);
+        marker << "Download failed at "
+               << std::chrono::system_clock::now().time_since_epoch().count() << "\n";
+        return localDir;
+    }
+    patchSegmentMeta(metaPath, segmentId);
+    return localDir;
+}
+
+} // namespace
+
 std::filesystem::path downloadRemoteSegment(
     const std::string& baseUrl,
     const std::string& segmentId,
@@ -70,110 +155,9 @@ std::filesystem::path downloadRemoteSegment(
     const cache::HttpAuth& auth,
     RemoteSegmentSource source)
 {
-    namespace fs = std::filesystem;
-
-    // Local destination: cacheDir/{paths|segments}/<segId>/
-    const char* subdir = (source == RemoteSegmentSource::Segments) ? "segments" : "paths";
-    auto localDir = cacheDir / subdir / segmentId;
-    fs::create_directories(localDir);
-
-    // Files to download from the remote tifxyz directory
-    const std::vector<std::string> files = {"meta.json", "x.tif", "y.tif", "z.tif"};
-
-    // Check if all files already exist
-    bool allExist = true;
-    for (const auto& f : files) {
-        if (!fs::exists(localDir / f)) {
-            allExist = false;
-            break;
-        }
-    }
-
-    if (allExist) {
-        Logger()->info("[RemoteScroll] Segment {} already cached at {}",
-                     segmentId, localDir.string());
-        return localDir;
-    }
-
-    // Check for a previous download failure marker — skip retrying
-    auto failMarker = localDir / ".download_failed";
-    if (fs::exists(failMarker)) {
-        Logger()->debug("[RemoteScroll] Segment {} previously failed, skipping",
-                       segmentId);
-        return localDir;
-    }
-
-    // Build remote base URL depending on source format
-    std::string remoteBase;
-    if (source == RemoteSegmentSource::Direct) {
-        // External URL: baseUrl is already the parent of segment dirs
-        remoteBase = baseUrl + "/" + segmentId + "/";
-    } else if (source == RemoteSegmentSource::Paths) {
-        // Full volpkg: paths/<segId>/<file>
-        remoteBase = baseUrl + "/paths/" + segmentId + "/";
-    } else {
-        // Lite format: segments/<segId>/mesh/tifxyz/<file>
-        remoteBase = baseUrl + "/segments/" + segmentId + "/mesh/tifxyz/";
-    }
-
-    for (const auto& f : files) {
-        auto localPath = localDir / f;
-        if (fs::exists(localPath)) {
-            Logger()->debug("[RemoteScroll]   {} already exists, skipping", f);
-            continue;
-        }
-
-        std::string url = remoteBase + f;
-        Logger()->info("[RemoteScroll]   Downloading {} -> {}",
-                     url, localPath.string());
-
-        if (!cache::httpDownloadFile(url, localPath, auth)) {
-            Logger()->error("[RemoteScroll]   FAILED to download {}", f);
-            // Continue with other files — partial downloads are handled by the
-            // caller checking if meta.json exists
-        }
-    }
-
-    // If meta.json doesn't exist after download attempts, mark as failed
-    auto metaPath = localDir / "meta.json";
-    if (!fs::exists(metaPath)) {
-        Logger()->warn("[RemoteScroll] Segment {} download failed, marking to skip future attempts",
-                      segmentId);
-        std::ofstream marker(failMarker);
-        marker << "Download failed at " << std::chrono::system_clock::now().time_since_epoch().count() << "\n";
-        return localDir;
-    }
-
-    // Patch meta.json if required fields are missing (safety net for lite format)
-    if (fs::exists(metaPath)) {
-        try {
-            auto meta = utils::Json::parse_file(metaPath);
-
-            bool patched = false;
-            if (!meta.contains("type")) {
-                meta["type"] = "seg";
-                patched = true;
-            }
-            if (!meta.contains("uuid")) {
-                meta["uuid"] = segmentId;
-                patched = true;
-            }
-            if (!meta.contains("format")) {
-                meta["format"] = "tifxyz";
-                patched = true;
-            }
-
-            if (patched) {
-                Logger()->info("[RemoteScroll]   Patched meta.json for segment {}", segmentId);
-                std::ofstream ofs(metaPath);
-                ofs << meta.dump(2);
-            }
-        } catch (const std::exception& e) {
-            Logger()->warn("[RemoteScroll]   Failed to patch meta.json: {}", e.what());
-        }
-    }
-
-    return localDir;
+    return downloadRemoteSegmentFiles(
+        baseUrl, segmentId, cacheDir, auth, source,
+        {"meta.json", "x.tif", "y.tif", "z.tif"});
 }
 
 std::filesystem::path downloadRemoteSegmentMetadataOnly(
@@ -183,64 +167,8 @@ std::filesystem::path downloadRemoteSegmentMetadataOnly(
     const cache::HttpAuth& auth,
     RemoteSegmentSource source)
 {
-    namespace fs = std::filesystem;
-
-    const char* subdir = (source == RemoteSegmentSource::Segments) ? "segments" : "paths";
-    auto localDir = cacheDir / subdir / segmentId;
-    fs::create_directories(localDir);
-
-    auto metaPath = localDir / "meta.json";
-    if (fs::exists(metaPath)) {
-        Logger()->debug("[RemoteScroll] meta.json already cached for segment {}", segmentId);
-        return localDir;
-    }
-
-    // Skip if previously failed
-    auto failMarker = localDir / ".download_failed";
-    if (fs::exists(failMarker)) {
-        Logger()->debug("[RemoteScroll] Segment {} previously failed, skipping", segmentId);
-        return localDir;
-    }
-
-    // Build remote URL for meta.json
-    std::string remoteBase;
-    if (source == RemoteSegmentSource::Direct) {
-        remoteBase = baseUrl + "/" + segmentId + "/";
-    } else if (source == RemoteSegmentSource::Paths) {
-        remoteBase = baseUrl + "/paths/" + segmentId + "/";
-    } else {
-        remoteBase = baseUrl + "/segments/" + segmentId + "/mesh/tifxyz/";
-    }
-
-    std::string url = remoteBase + "meta.json";
-    Logger()->info("[RemoteScroll] Downloading metadata {} -> {}", url, metaPath.string());
-
-    if (!cache::httpDownloadFile(url, metaPath, auth)) {
-        Logger()->error("[RemoteScroll] Failed to download meta.json for segment {}", segmentId);
-        return localDir;
-    }
-
-    // Patch meta.json if required fields are missing
-    if (fs::exists(metaPath)) {
-        try {
-            auto meta = utils::Json::parse_file(metaPath);
-
-            bool patched = false;
-            if (!meta.contains("type")) { meta["type"] = "seg"; patched = true; }
-            if (!meta.contains("uuid")) { meta["uuid"] = segmentId; patched = true; }
-            if (!meta.contains("format")) { meta["format"] = "tifxyz"; patched = true; }
-
-            if (patched) {
-                Logger()->info("[RemoteScroll] Patched meta.json for segment {}", segmentId);
-                std::ofstream ofs(metaPath);
-                ofs << meta.dump(2);
-            }
-        } catch (const std::exception& e) {
-            Logger()->warn("[RemoteScroll] Failed to patch meta.json: {}", e.what());
-        }
-    }
-
-    return localDir;
+    return downloadRemoteSegmentFiles(
+        baseUrl, segmentId, cacheDir, auth, source, {"meta.json"});
 }
 
 bool isRemoteSegmentFullyCached(

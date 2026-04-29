@@ -318,6 +318,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     vol->remoteDelimiter_ = info.delimiter;
     vol->remoteAuth_ = auth;
     vol->remoteShardConfig_ = info.shardConfig;
+    vol->remoteSourceChunkShapes_ = info.sourceChunkShapes;
 
     return vol;
 }
@@ -359,25 +360,29 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
     if (zarrDs_.empty()) return nullptr;
     std::vector<std::unique_ptr<utils::ZarrArray>> diskLevels;
 
-    // Build level metadata from our zarr datasets. The vector is padded so
-    // index = actual scale level; missing levels have default (zero) shapes.
     std::vector<vc::cache::FileSystemSource::LevelMeta> levels(zarrDs_.size());
     std::string delimiter;
     for (size_t i = 0; i < zarrDs_.size(); ++i) {
-        if (!zarrDs_[i]) continue;  // missing level — leave default {0,0,0}
+        if (!zarrDs_[i]) continue;
         auto& ds = zarrDs_[i];
         auto& lm = levels[i];
         const auto& shape = ds->shape();
-        const auto& chunks = ds->defaultChunkShape();
         lm.dirName = ds->path().filename().string();
         lm.shape = {
             static_cast<int>(shape[0]),
             static_cast<int>(shape[1]),
             static_cast<int>(shape[2])};
-        lm.chunkShape = {
-            static_cast<int>(chunks[0]),
-            static_cast<int>(chunks[1]),
-            static_cast<int>(chunks[2])};
+        if (isRemote_
+            && i < remoteSourceChunkShapes_.size()
+            && remoteSourceChunkShapes_[i][0] > 0) {
+            lm.chunkShape = remoteSourceChunkShapes_[i];
+        } else {
+            const auto& chunks = ds->defaultChunkShape();
+            lm.chunkShape = {
+                static_cast<int>(chunks[0]),
+                static_cast<int>(chunks[1]),
+                static_cast<int>(chunks[2])};
+        }
         if (delimiter.empty())
             delimiter = ds->delimiter();
     }
@@ -520,7 +525,7 @@ std::unique_ptr<vc::cache::BlockPipeline> Volume::createTieredCache() const
         } else if (mountInfo_.parallelCount > 0) {
             config.ioThreads = mountInfo_.parallelCount;
         } else {
-            config.ioThreads = 8;  // HTTP/2 multiplexing: fewer connections, many streams each
+            config.ioThreads = 24;
         }
         fprintf(stderr, "[Volume] IO threads: %d\n", config.ioThreads);
     }

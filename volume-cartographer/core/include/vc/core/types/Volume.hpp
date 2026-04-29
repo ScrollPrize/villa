@@ -198,4 +198,5 @@ protected:
     std::string remoteDelimiter_ = ".";
     vc::cache::HttpAuth remoteAuth_;
     vc::cache::ShardConfig remoteShardConfig_;
+    std::vector<std::array<int, 3>> remoteSourceChunkShapes_;
 };

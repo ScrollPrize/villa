@@ -100,6 +100,9 @@ public:
     void replaceStubWithSurface(const std::string& segmentId, std::shared_ptr<Surface> surface);
     // Check if a segment is a remote stub (not yet downloaded).
     bool isRemoteStub(const std::string& segmentId) const;
+    // Mark an already-in-VolumePkg segment as a remote stub so clicking it
+    // triggers on-demand download instead of immediate surface load.
+    void markAsRemoteStub(const std::string& segmentId);
     void updateTreeItemIcon(SurfaceTreeWidgetItem* item);
     void refreshSurfaceMetrics(const std::string& surfaceId);
 

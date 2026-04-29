@@ -64,6 +64,7 @@ class QStandardItemModel;
 class FileWatcherService;
 class AxisAlignedSliceController;
 class SegmentationCommandHandler;
+class VolpkgDockWidget;
 
 class CWindow : public QMainWindow
 {
@@ -262,18 +263,8 @@ private:
     bool _normalGridAvailable{false};
     QString _normalGridPath;
 
-    // Remote scroll state for on-demand segment downloading
-    struct RemoteScrollState {
-        std::string baseUrl;
-        std::string segmentsBaseUrl;
-        std::string cachePath;
-        vc::cache::HttpAuth auth;
-        vc::RemoteSegmentSource segSource = vc::RemoteSegmentSource::Segments;
-        bool active = false;
-    };
-    RemoteScrollState _remoteScroll;
-
     std::unique_ptr<FileWatcherService> _fileWatcher;
+    VolpkgDockWidget* _projectDock{nullptr};
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
     bool _maskRenderInProgress{false};
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;

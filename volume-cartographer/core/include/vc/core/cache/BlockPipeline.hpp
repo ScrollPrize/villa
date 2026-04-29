@@ -308,10 +308,11 @@ private:
     std::unique_ptr<BlockCache> ownedBlockCache_;  // per-pipeline fallback when no shared cache
     BlockCache& blockCache_;
 
-    // Assemble a canonical 128^3 chunk from one or more source chunks at
-    // `canonKey.level`, rechunking as needed. Null if the canonical region
-    // is entirely absent from the source.
-    [[nodiscard]] ChunkDataPtr assembleCanonicalChunk(const ChunkKey& canonKey);
+    enum class AssembleOutcome { Ok, Absent, TransientFailure };
+
+    [[nodiscard]] ChunkDataPtr assembleCanonicalChunk(
+        const ChunkKey& canonKey,
+        AssembleOutcome* outcome = nullptr);
 
     // Split a decoded chunk into 16^3 blocks and insert into blockCache_.
     void insertChunkAsBlocks(const ChunkKey& key, const ChunkData& chunk);

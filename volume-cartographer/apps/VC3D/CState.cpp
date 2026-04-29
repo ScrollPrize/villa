@@ -26,21 +26,130 @@ CState::~CState() = default;
 
 std::shared_ptr<VolumePkg> CState::vpkg() const { return _vpkg; }
 
-void CState::setVpkg(std::shared_ptr<VolumePkg> pkg)
-{
-    _vpkg = std::move(pkg);
-    emit vpkgChanged(_vpkg);
-}
-
 QString CState::vpkgPath() const
 {
-    if (_vpkg) {
-        return QString::fromStdString(_vpkg->getVolpkgDirectory());
-    }
+    if (_vpkg) return QString::fromStdString(_vpkg->getVolpkgDirectory());
     return {};
 }
 
 bool CState::hasVpkg() const { return _vpkg != nullptr; }
+
+std::shared_ptr<vc::Volpkg> CState::project() const { return _project; }
+
+bool CState::hasProject() const { return _project != nullptr; }
+
+void CState::setPackage(std::shared_ptr<VolumePkg> pkg,
+                        std::shared_ptr<vc::Volpkg> proj)
+{
+    _vpkg = std::move(pkg);
+    _project = std::move(proj);
+    _remoteSegmentInfo.clear();
+    emit projectChanged(_project);
+    emit vpkgChanged(_vpkg);
+}
+
+void CState::setProject(std::shared_ptr<vc::Volpkg> proj)
+{
+    _project = std::move(proj);
+    emit projectChanged(_project);
+}
+
+std::filesystem::path CState::segmentsPath(const std::string& idOrName) const
+{
+    if (_project) {
+        try { return _project->resolve_segments_dir(idOrName); }
+        catch (const std::exception&) { /* fall through to vpkg */ }
+    }
+    if (_vpkg) {
+        return std::filesystem::path(_vpkg->getVolpkgDirectory()) / idOrName;
+    }
+    return {};
+}
+
+std::filesystem::path CState::activeSegmentsPath() const
+{
+    if (_project) {
+        try { return _project->resolve_active_segments_dir(); }
+        catch (const std::exception&) { /* fall through */ }
+    }
+    if (_vpkg) {
+        return std::filesystem::path(_vpkg->getVolpkgDirectory())
+            / _vpkg->getSegmentationDirectory();
+    }
+    return {};
+}
+
+std::filesystem::path CState::outputSegmentsPath() const
+{
+    if (_project) {
+        try { return _project->resolve_output_segments_dir(); }
+        catch (const std::exception&) { /* fall through */ }
+    }
+    return activeSegmentsPath();
+}
+
+std::filesystem::path CState::volumesPath() const
+{
+    if (_project) {
+        try { return _project->resolve_volumes_dir(); }
+        catch (const std::exception&) { /* fall through */ }
+    }
+    if (_vpkg) {
+        return std::filesystem::path(_vpkg->getVolpkgDirectory()) / "volumes";
+    }
+    return {};
+}
+
+void CState::registerRemoteSegment(const std::string& segId, RemoteSegmentInfo info)
+{
+    _remoteSegmentInfo[segId] = std::move(info);
+}
+
+void CState::clearRemoteSegmentRegistry()
+{
+    _remoteSegmentInfo.clear();
+}
+
+bool CState::hasRemoteSegmentInfo(const std::string& segId) const
+{
+    return _remoteSegmentInfo.count(segId) > 0;
+}
+
+CState::RemoteSegmentInfo CState::remoteSegmentInfo(const std::string& segId) const
+{
+    auto it = _remoteSegmentInfo.find(segId);
+    if (it == _remoteSegmentInfo.end()) return {};
+    return it->second;
+}
+
+std::filesystem::path CState::supportFilePath(const std::string& filename) const
+{
+    if (_project) {
+        try { return _project->support_file_path(filename); }
+        catch (const std::exception&) { /* fall through */ }
+    }
+    if (_vpkg) {
+        return std::filesystem::path(_vpkg->getVolpkgDirectory()) / filename;
+    }
+    return {};
+}
+
+std::vector<std::filesystem::path> CState::allSegmentsPaths() const
+{
+    if (_project) {
+        auto v = _project->all_segments_dirs();
+        if (!v.empty()) return v;
+    }
+    std::vector<std::filesystem::path> out;
+    if (_vpkg) {
+        const std::filesystem::path root(_vpkg->getVolpkgDirectory());
+        for (const auto& name : _vpkg->getAvailableSegmentationDirectories()) {
+            auto p = root / name;
+            if (std::filesystem::exists(p)) out.push_back(std::move(p));
+        }
+    }
+    return out;
+}
 
 std::shared_ptr<Volume> CState::currentVolume() const { return _currentVolume; }
 
@@ -159,12 +268,18 @@ void CState::closeAll()
     }
 
     _vpkg = nullptr;
+    _project = nullptr;
+    _remoteSegmentInfo.clear();
     _currentVolume = nullptr;
     _currentVolumeId.clear();
     _segmentationGrowthVolumeId.clear();
 
     _pois.clear();
     _pointCollection->clearAll();
+
+    emit projectChanged(_project);
+    emit vpkgChanged(_vpkg);
+    emit volumeChanged(_currentVolume, _currentVolumeId);
 }
 
 // --- Surface methods (from CSurfaceCollection) ---

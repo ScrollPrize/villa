@@ -293,6 +293,23 @@ void SurfacePanelController::loadRemoteStubs(
     emit surfacesLoaded();
 }
 
+void SurfacePanelController::markAsRemoteStub(const std::string& segmentId)
+{
+    _remoteStubSegments.insert(segmentId);
+    if (!_ui.treeWidget) return;
+    const QString idQStr = QString::fromStdString(segmentId);
+    QTreeWidgetItemIterator it(_ui.treeWidget);
+    while (*it) {
+        if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() == idQStr) {
+            (*it)->setText(SURFACE_ID_COLUMN,
+                idQStr + QStringLiteral(" [remote]"));
+            (*it)->setForeground(SURFACE_ID_COLUMN, QBrush(Qt::gray));
+            break;
+        }
+        ++it;
+    }
+}
+
 void SurfacePanelController::replaceStubWithSurface(
     const std::string& segmentId,
     std::shared_ptr<Surface> surface)
@@ -941,8 +958,10 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         });
 
         // Reload from Backup submenu
-        std::filesystem::path backupsDir =
-            std::filesystem::path(_volumePkg->getVolpkgDirectory()) / "backups" / segmentId.toStdString();
+        std::filesystem::path backupsDir = _state
+            ? _state->supportFilePath("backups") / segmentId.toStdString()
+            : std::filesystem::path(_volumePkg->getVolpkgDirectory())
+                  / "backups" / segmentId.toStdString();
         if (std::filesystem::exists(backupsDir) && std::filesystem::is_directory(backupsDir)) {
             std::vector<int> availableBackups;
             for (const auto& entry : std::filesystem::directory_iterator(backupsDir)) {

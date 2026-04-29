@@ -14,6 +14,11 @@ class QMenuBar;
 class CWindow;
 class Volume;
 
+namespace vc {
+class Volpkg;
+struct DataSource;
+}
+
 class MenuActionController : public QObject
 {
     Q_OBJECT
@@ -29,19 +34,50 @@ public:
     void removeRecentVolpkgEntry(const QString& path);
     void refreshRecentMenu();
     void openVolpkgAt(const QString& path);
-    void loadAttachedRemoteVolumesForCurrentPackage();
+    // Unified dispatcher: routes any path/URL to the right open handler.
+    // Extension-sniffs .volpkg.json / .volpkg / scroll URLs / local zarr dirs.
+    void openFile(const QString& pathOrUrl);
+    bool tryRestoreAutosavedProject();
+    void loadEmptyVolumePackage();
     void triggerTeleaInpaint();
     void openRemoteUrl(const QString& url, bool isRetry = false);
 
+    // Realize a Project DataSource into the active VolumePkg. Local sources
+    // load synchronously and return the count of items loaded. Remote sources
+    // dispatch to a background thread and return 0 — the apply-and-refresh
+    // step happens on the main thread when the worker completes.
+    int loadSource(const vc::Volpkg& proj, const vc::DataSource& ds);
+    int attachDataSource(vc::DataSource ds);
+    // Remove anything contributed by a DataSource from the active VolumePkg.
+    void unloadSource(const vc::Volpkg& proj, const vc::DataSource& ds);
+
+    // Id-addressed variants, for use from the Project dock widget where
+    // the user has already picked a specific source. Public so Qt::connect
+    // from CWindow / the dock can bind to them.
+    void reloadSourceById(const QString& sourceId);
+    void removeSourceById(const QString& sourceId);
+    void renameSourceById(const QString& sourceId);
+    void setSourceEnabled(const QString& sourceId, bool enabled);
+    void editSourceTags(const QString& sourceId);
+    void revealSourceLocation(const QString& sourceId);
+
+    // Auth resolver exposed for the unified browser dialog. Returns false if
+    // auth resolution failed (and writes a message into err); on success,
+    // stores credentials in *out.
+    bool resolveAuthForBrowser(const QString& url,
+                               vc::cache::HttpAuth* out,
+                               QString* err);
+
 private slots:
+    void newVolpkg();
     void openVolpkg();
     void openRecentVolpkg();
-    void openLocalZarr();
-    void openRemoteVolume();
-    void browseS3();
-    void attachRemoteZarr();
-    void attachRemoteSegments();
     void openRecentRemoteVolume();
+    void saveVolpkgAs();
+    void attachVolume();
+    void attachSegments();
+    void attachOther();
+    void attachFromVolpkg();
     void showSettingsDialog();
     void showAboutDialog();
     void showKeybindings();
@@ -67,6 +103,7 @@ private:
     void updateRecentRemoteList(const QString& url);
     void refreshRecentRemoteMenu();
     void ensureRecentRemoteActions();
+
     void attachRemoteZarrUrl(const QString& url, bool persistEntry = true);
     void openRemoteZarr(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
     void openRemoteScroll(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
@@ -84,9 +121,10 @@ private:
                               vc::cache::HttpAuth* authOut,
                               bool allowPrompt,
                               QString* errorMessage = nullptr) const;
+    // Helpers used by loadSource for the local and remote branches.
+    int loadSourceLocal(const vc::Volpkg& proj, const vc::DataSource& ds);
+    void loadSourceRemoteAsync(const vc::Volpkg& proj, const vc::DataSource& ds);
     QString remoteCacheDirectory() const;
-    QString remoteVolumeRegistryPath() const;
-    void persistAttachedRemoteVolume(const QString& url, const std::shared_ptr<Volume>& volume);
 
     CWindow* _window{nullptr};
 
@@ -99,12 +137,13 @@ private:
     QMenu* _recentMenu{nullptr};
     QMenu* _recentRemoteMenu{nullptr};
 
+    QAction* _newVolpkgAct{nullptr};
     QAction* _openAct{nullptr};
-    QAction* _openLocalZarrAct{nullptr};
-    QAction* _openRemoteAct{nullptr};
-    QAction* _attachRemoteZarrAct{nullptr};
-    QAction* _attachRemoteSegmentsAct{nullptr};
-    QAction* _browseS3Act{nullptr};
+    QAction* _saveAsAct{nullptr};
+    QAction* _attachVolumeAct{nullptr};
+    QAction* _attachSegmentsAct{nullptr};
+    QAction* _attachOtherAct{nullptr};
+    QAction* _attachFromVolpkgAct{nullptr};
     std::array<QAction*, kMaxRecentVolpkg> _recentActs{};
     std::array<QAction*, kMaxRecentRemote> _recentRemoteActs{};
     QAction* _settingsAct{nullptr};
