@@ -558,7 +558,12 @@ static ChunkResult compute_chunk(
 
     const auto query_t0 = std::chrono::steady_clock::now();
     std::vector<SurfacePatchIndex::TriangleCandidate> triangles;
-    index.queryTriangles(bounds, nullptr, triangles);
+    triangles.reserve(2048);
+    SurfacePatchIndex::TriangleQuery query;
+    query.bounds = bounds;
+    index.forEachTriangle(query, [&](const SurfacePatchIndex::TriangleCandidate& tri) {
+        triangles.push_back(tri);
+    });
     result.querySeconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - query_t0).count();
     result.queriedTriangles = triangles.size();
 

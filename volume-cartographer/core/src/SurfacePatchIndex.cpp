@@ -1890,109 +1890,92 @@ SurfacePatchIndex::locateAll(const cv::Vec3f& worldPoint, float tolerance, const
     return results;
 }
 
-void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
-                                       const SurfacePtr& targetSurface,
-                                       std::vector<TriangleCandidate>& outCandidates) const
+void SurfacePatchIndex::locateSurfaceHits(
+    const cv::Vec3f& worldPoint,
+    float tolerance,
+    const std::unordered_set<const QuadSurface*>& excludedSurfaces,
+    std::vector<const QuadSurface*>& outSurfaces,
+    const SurfacePtr& targetSurface) const
 {
-    outCandidates.clear();
-    // Rough upper bound: keep whatever capacity the vector already had.
-    // A typical viewport has a few thousand triangle candidates; a small
-    // reserve avoids 3-4 reallocations during the push_back loop.
-    if (outCandidates.capacity() < 2048) {
-        outCandidates.reserve(2048);
-    }
-    forEachTriangleImpl(bounds, targetSurface, nullptr, [&](const TriangleCandidate& candidate) {
-        outCandidates.push_back(candidate);
-    });
-}
+    outSurfaces.clear();
 
-void SurfacePatchIndex::queryTriangles(const Rect3D& bounds,
-                                       const std::unordered_set<SurfacePtr>& targetSurfaces,
-                                       std::vector<TriangleCandidate>& outCandidates) const
-{
-    outCandidates.clear();
-    if (targetSurfaces.empty()) {
-        return;
-    }
-    if (outCandidates.capacity() < 2048) {
-        outCandidates.reserve(2048);
-    }
-    forEachTriangleImpl(bounds, nullptr, &targetSurfaces, [&](const TriangleCandidate& candidate) {
-        outCandidates.push_back(candidate);
-    });
-}
-
-void SurfacePatchIndex::forEachTriangle(const Rect3D& bounds,
-                                        const SurfacePtr& targetSurface,
-                                        const std::function<void(const TriangleCandidate&)>& visitor) const
-{
-    if (!visitor) return;
-    forEachTriangleImpl(bounds, targetSurface, nullptr, visitor);
-}
-
-void SurfacePatchIndex::forEachTriangleIntersectingRay(
-    const Rect3D& bounds,
-    const SurfacePtr& targetSurface,
-    const cv::Vec3f& origin,
-    const cv::Vec3f& dir,
-    float minT,
-    float maxT,
-    const std::function<void(const TriangleCandidate&)>& visitor) const
-{
-    if (!visitor || minT > maxT) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (!impl_ || !impl_->tree || tolerance <= 0.0f || !isFinitePoint(worldPoint)) {
         return;
     }
 
-    auto rayIntersectsBox = [&](const Impl::Box3& box) {
-        float t0 = minT;
-        float t1 = maxT;
-        const float lows[3] = {
-            box.min_corner().get<0>(),
-            box.min_corner().get<1>(),
-            box.min_corner().get<2>()
-        };
-        const float highs[3] = {
-            box.max_corner().get<0>(),
-            box.max_corner().get<1>(),
-            box.max_corner().get<2>()
-        };
+    const float tol = std::max(tolerance, 0.0f);
+    Impl::Point3 min_pt(worldPoint[0] - tol, worldPoint[1] - tol, worldPoint[2] - tol);
+    Impl::Point3 max_pt(worldPoint[0] + tol, worldPoint[1] + tol, worldPoint[2] + tol);
+    Impl::Box3 query(min_pt, max_pt);
+    const float toleranceSq = tol * tol;
+    QuadSurface* const targetRaw = targetSurface ? targetSurface.get() : nullptr;
 
-        for (int ax = 0; ax < 3; ++ax) {
-            const float d = dir[ax];
-            if (std::abs(d) <= 1e-8f) {
-                if (origin[ax] < lows[ax] || origin[ax] > highs[ax]) {
-                    return false;
-                }
-                continue;
-            }
-
-            const float invD = 1.0f / d;
-            float nearT = (lows[ax] - origin[ax]) * invD;
-            float farT = (highs[ax] - origin[ax]) * invD;
-            if (nearT > farT) {
-                std::swap(nearT, farT);
-            }
-            t0 = std::max(t0, nearT);
-            t1 = std::min(t1, farT);
-            if (t0 > t1) {
-                return false;
-            }
-        }
-
-        return true;
+    auto alreadyOutput = [&](const QuadSurface* surface) {
+        return std::any_of(outSurfaces.begin(), outSurfaces.end(),
+                           [&](const QuadSurface* existing) { return existing == surface; });
     };
 
-    forEachTriangleImpl(bounds, targetSurface, nullptr, visitor, rayIntersectsBox);
+    auto processEntry = [&](const Impl::Entry& entry) {
+        const Impl::PatchRecord& rec = entry.second;
+        if ((targetRaw && rec.surface != targetRaw) ||
+            excludedSurfaces.count(rec.surface) ||
+            alreadyOutput(rec.surface)) {
+            return;
+        }
+
+        Impl::PatchHit hit = Impl::evaluatePatch(rec, impl_->tileStride,
+                                                  impl_->samplingStride, worldPoint);
+        if (!hit.valid || hit.distSq > toleranceSq) {
+            return;
+        }
+
+        outSurfaces.push_back(rec.surface);
+    };
+
+    try {
+        impl_->tree->query(
+            bgi::intersects(query),
+            boost::make_function_output_iterator(processEntry));
+    } catch (const std::exception& e) {
+        std::cerr << "[SurfacePatchIndex] locateSurfaceHits query failed: "
+                  << e.what() << std::endl;
+        outSurfaces.clear();
+    } catch (...) {
+        std::cerr << "[SurfacePatchIndex] locateSurfaceHits query failed: unknown exception"
+                  << std::endl;
+        outSurfaces.clear();
+    }
 }
 
-void SurfacePatchIndex::forEachTriangle(const Rect3D& bounds,
-                                        const std::unordered_set<SurfacePtr>& targetSurfaces,
-                                        const std::function<void(const TriangleCandidate&)>& visitor) const
+void SurfacePatchIndex::forEachTriangle(
+    const TriangleQuery& query,
+    const std::function<void(const TriangleCandidate&)>& visitor) const
 {
-    if (!visitor || targetSurfaces.empty()) {
+    if (!visitor) {
         return;
     }
-    forEachTriangleImpl(bounds, nullptr, &targetSurfaces, visitor);
+
+    auto patchFilter = [&](const Impl::Box3& box) {
+        if (!query.patchFilter) {
+            return true;
+        }
+        const PatchBounds bounds{
+            cv::Vec3f(box.min_corner().get<0>(),
+                      box.min_corner().get<1>(),
+                      box.min_corner().get<2>()),
+            cv::Vec3f(box.max_corner().get<0>(),
+                      box.max_corner().get<1>(),
+                      box.max_corner().get<2>())
+        };
+        return query.patchFilter(bounds);
+    };
+
+    forEachTriangleImpl(query.bounds,
+                        query.targetSurface,
+                        query.targetSurfaces,
+                        visitor,
+                        patchFilter);
 }
 
 template <typename Visitor, typename PatchFilter>
@@ -2511,12 +2494,6 @@ void SurfacePatchIndex::setReadOnly(bool readOnly)
     impl_->tree.reset();
     impl_->surfaceRecords.clear();
     impl_->patchCount = 0;
-}
-
-bool SurfacePatchIndex::readOnly() const
-{
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    return impl_ && impl_->readOnly;
 }
 
 std::optional<SurfacePatchIndex::Impl::Entry>
@@ -3076,15 +3053,6 @@ bool SurfacePatchIndex::hasPendingUpdates(const SurfacePtr& surface) const
 // Generation tracking for undo/redo detection
 // ============================================================================
 
-void SurfacePatchIndex::incrementGeneration(const SurfacePtr& surface)
-{
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    if (!impl_ || !surface) {
-        return;
-    }
-    ++impl_->surfaceGenerations[surface.get()];
-}
-
 uint64_t SurfacePatchIndex::generation(const SurfacePtr& surface) const
 {
     std::shared_lock<std::shared_mutex> lock(mutex_);
@@ -3093,36 +3061,6 @@ uint64_t SurfacePatchIndex::generation(const SurfacePtr& surface) const
     }
     auto it = impl_->surfaceGenerations.find(surface.get());
     return it != impl_->surfaceGenerations.end() ? it->second : 0;
-}
-
-void SurfacePatchIndex::setGeneration(const SurfacePtr& surface, uint64_t gen)
-{
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    if (!impl_ || !surface) {
-        return;
-    }
-    impl_->surfaceGenerations[surface.get()] = gen;
-}
-
-bool SurfacePatchIndex::segmentsEqual(const std::vector<TriangleSegment>& a,
-                                      const std::vector<TriangleSegment>& b,
-                                      float epsilon)
-{
-    if (a.size() != b.size()) {
-        return false;
-    }
-    for (size_t i = 0; i < a.size(); ++i) {
-        for (int j = 0; j < 2; ++j) {
-            const auto& wa = a[i].world[j];
-            const auto& wb = b[i].world[j];
-            if (std::abs(wa[0] - wb[0]) > epsilon ||
-                std::abs(wa[1] - wb[1]) > epsilon ||
-                std::abs(wa[2] - wb[2]) > epsilon) {
-                return false;
-            }
-        }
-    }
-    return true;
 }
 
 std::unordered_map<SurfacePatchIndex::SurfacePtr, std::vector<SurfacePatchIndex::TriangleSegment>>

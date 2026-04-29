@@ -1078,7 +1078,8 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
             vc::Sampling sampleMethod = (numLayers > 1) ? vc::Sampling::Nearest
                                                         : ctx.samplingMethod;
             const bool skipPrefetch =
-                cacheHit
+                ctx.interactive
+                && cacheHit
                 && _genCachePrefetchLevel == sp.level
                 && _genCachePrefetchNumLevels == numLevels;
             sampleAdaptiveARGB32(
@@ -1090,11 +1091,11 @@ void CAdaptiveVolumeViewer::renderIntoFramebuffer(QImage& fb,
                 fbW, fbH, method, lut.data(), sampleMethod,
                 &lightP,  // sampler uses lightP for volumetric and lighting paths
                 lvlOutPtr, lvlOutStride,
-                // Coords cached → prior frame already did the chunk
-                // enumeration + fetchInteractive for this exact geometry
-                // at this exact pyramid level.
-                // The per-sample adaptive-fallback path still handles any
-                // block not yet resident, so correctness is preserved.
+                // Coords cached during live motion → prior preview frame
+                // already seeded the same chunk set. Once idle, keep
+                // prefetching: if adaptive fallback showed a coarse chunk,
+                // the fine chunk may still need to be loaded from the
+                // on-disk tier even though the surface coords are unchanged.
                 skipPrefetch, !ctx.interactive);
             if (!skipPrefetch) {
                 _genCachePrefetchLevel = sp.level;
@@ -2655,7 +2656,10 @@ void CAdaptiveVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<S
             };
 
             std::vector<QPainterPath> paths(planeSurfs.size());
-            patchIndex->forEachTriangle(allBounds, activeSeg,
+            SurfacePatchIndex::TriangleQuery query;
+            query.bounds = allBounds;
+            query.targetSurface = activeSeg;
+            patchIndex->forEachTriangle(query,
                 [&](const SurfacePatchIndex::TriangleCandidate& tri) {
                     for (size_t idx = 0; idx < planeSurfs.size(); ++idx) {
                         auto seg = SurfacePatchIndex::clipTriangleToPlane(

@@ -3,6 +3,7 @@
 #include "SurfaceTreeWidget.hpp"
 #include "ViewerManager.hpp"
 #include "CState.hpp"
+#include "VolumeViewerBase.hpp"
 #include "adaptive/CAdaptiveVolumeViewer.hpp"
 #include "elements/DropdownChecklistButton.hpp"
 #include "VCSettings.hpp"
@@ -38,6 +39,7 @@
 
 #include <iostream>
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <optional>
 #include <unordered_set>
@@ -45,6 +47,9 @@
 #include <filesystem>
 
 namespace {
+
+constexpr double kFocusMarkerSceneRadius = 10.0;
+constexpr float kFocusPointHitTolerance = 2.0f;
 
 void sync_tag(utils::Json& dict, bool checked, const std::string& name, const std::string& username = {})
 {
@@ -65,6 +70,87 @@ void sync_tag(utils::Json& dict, bool checked, const std::string& name, const st
             dict["date_last_modified"] = get_surface_time_str();
         }
     }
+}
+
+double pointSegmentDistanceSq(const QPointF& p, const QPointF& a, const QPointF& b)
+{
+    const double abx = b.x() - a.x();
+    const double aby = b.y() - a.y();
+    const double lenSq = abx * abx + aby * aby;
+    if (lenSq <= 0.0) {
+        const double dx = p.x() - a.x();
+        const double dy = p.y() - a.y();
+        return dx * dx + dy * dy;
+    }
+
+    const double t = std::clamp(((p.x() - a.x()) * abx + (p.y() - a.y()) * aby) / lenSq, 0.0, 1.0);
+    const QPointF closest(a.x() + t * abx, a.y() + t * aby);
+    const double dx = p.x() - closest.x();
+    const double dy = p.y() - closest.y();
+    return dx * dx + dy * dy;
+}
+
+bool pointInTriangle2D(const QPointF& p, const QPointF& a, const QPointF& b, const QPointF& c)
+{
+    auto sign = [](const QPointF& p1, const QPointF& p2, const QPointF& p3) {
+        return (p1.x() - p3.x()) * (p2.y() - p3.y()) -
+               (p2.x() - p3.x()) * (p1.y() - p3.y());
+    };
+
+    const double d1 = sign(p, a, b);
+    const double d2 = sign(p, b, c);
+    const double d3 = sign(p, c, a);
+    const bool hasNeg = (d1 < 0.0) || (d2 < 0.0) || (d3 < 0.0);
+    const bool hasPos = (d1 > 0.0) || (d2 > 0.0) || (d3 > 0.0);
+    return !(hasNeg && hasPos);
+}
+
+bool triangleIntersectsCircle2D(const QPointF& center,
+                                double radius,
+                                const QPointF& a,
+                                const QPointF& b,
+                                const QPointF& c)
+{
+    const double radiusSq = radius * radius;
+    auto within = [&](const QPointF& p) {
+        const double dx = p.x() - center.x();
+        const double dy = p.y() - center.y();
+        return dx * dx + dy * dy <= radiusSq;
+    };
+
+    return within(a) || within(b) || within(c) ||
+           pointInTriangle2D(center, a, b, c) ||
+           pointSegmentDistanceSq(center, a, b) <= radiusSq ||
+           pointSegmentDistanceSq(center, b, c) <= radiusSq ||
+           pointSegmentDistanceSq(center, c, a) <= radiusSq;
+}
+
+bool finitePoint(const QPointF& p)
+{
+    return std::isfinite(p.x()) && std::isfinite(p.y());
+}
+
+Rect3D focusCircleWorldBounds(VolumeViewerBase* viewer, const QPointF& sceneCenter)
+{
+    Rect3D bounds;
+    bounds.low = viewer->sceneToVolume(sceneCenter);
+    bounds.high = bounds.low;
+
+    const QPointF samples[] = {
+        sceneCenter + QPointF(kFocusMarkerSceneRadius, 0.0),
+        sceneCenter + QPointF(-kFocusMarkerSceneRadius, 0.0),
+        sceneCenter + QPointF(0.0, kFocusMarkerSceneRadius),
+        sceneCenter + QPointF(0.0, -kFocusMarkerSceneRadius),
+    };
+
+    for (const QPointF& sample : samples) {
+        bounds = expand_rect(bounds, viewer->sceneToVolume(sample));
+    }
+
+    const cv::Vec3f padding(kFocusPointHitTolerance, kFocusPointHitTolerance, kFocusPointHitTolerance);
+    bounds.low -= padding;
+    bounds.high += padding;
+    return bounds;
 }
 
 } // namespace
@@ -1771,10 +1857,54 @@ void SurfacePanelController::applyFiltersInternal()
     std::unordered_set<QuadSurface*> focusPointSurfaces;
     if (focusPointFilter) {
         if (auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr) {
-            for (const auto& hit : patchIndex->locateAll(poi->p, 2.0f)) {
+            for (const auto& hit : patchIndex->locateAll(poi->p, kFocusPointHitTolerance)) {
                 if (hit.surface) {
                     focusPointSurfaces.insert(hit.surface.get());
                 }
+            }
+
+            std::vector<VolumeViewerBase*> viewers;
+            if (auto* segmentationViewer = _segmentationViewerProvider ? _segmentationViewerProvider() : nullptr) {
+                viewers.push_back(segmentationViewer);
+            }
+            if (_viewerManager) {
+                _viewerManager->forEachViewer([&viewers](CTiledVolumeViewer* viewer) {
+                    if (viewer && std::find(viewers.begin(), viewers.end(), viewer) == viewers.end()) {
+                        viewers.push_back(viewer);
+                    }
+                });
+            }
+
+            for (VolumeViewerBase* viewer : viewers) {
+                if (!viewer) {
+                    continue;
+                }
+
+                const QPointF sceneCenter = viewer->volumeToScene(poi->p);
+                if (!finitePoint(sceneCenter)) {
+                    continue;
+                }
+
+                const Rect3D bounds = focusCircleWorldBounds(viewer, sceneCenter);
+                SurfacePatchIndex::TriangleQuery query;
+                query.bounds = bounds;
+                patchIndex->forEachTriangle(query,
+                    [&](const SurfacePatchIndex::TriangleCandidate& tri) {
+                        if (!tri.surface || focusPointSurfaces.count(tri.surface.get()) != 0) {
+                            return;
+                        }
+
+                        const QPointF a = viewer->volumeToScene(tri.world[0]);
+                        const QPointF b = viewer->volumeToScene(tri.world[1]);
+                        const QPointF c = viewer->volumeToScene(tri.world[2]);
+                        if (!finitePoint(a) || !finitePoint(b) || !finitePoint(c)) {
+                            return;
+                        }
+
+                        if (triangleIntersectsCircle2D(sceneCenter, kFocusMarkerSceneRadius, a, b, c)) {
+                            focusPointSurfaces.insert(tri.surface.get());
+                        }
+                    });
             }
         }
     }

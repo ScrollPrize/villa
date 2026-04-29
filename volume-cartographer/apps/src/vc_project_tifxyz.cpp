@@ -265,6 +265,38 @@ std::optional<float> ray_triangle_t(const cv::Vec3f& origin,
     return hit->t;
 }
 
+bool ray_intersects_patch_bounds(const SurfacePatchIndex::PatchBounds& bounds,
+                                 const cv::Vec3f& origin,
+                                 const cv::Vec3f& dir,
+                                 float minT,
+                                 float maxT)
+{
+    float t0 = minT;
+    float t1 = maxT;
+    for (int ax = 0; ax < 3; ++ax) {
+        const float d = dir[ax];
+        if (std::abs(d) <= 1e-8f) {
+            if (origin[ax] < bounds.low[ax] || origin[ax] > bounds.high[ax]) {
+                return false;
+            }
+            continue;
+        }
+
+        const float invD = 1.0f / d;
+        float nearT = (bounds.low[ax] - origin[ax]) * invD;
+        float farT = (bounds.high[ax] - origin[ax]) * invD;
+        if (nearT > farT) {
+            std::swap(nearT, farT);
+        }
+        t0 = std::max(t0, nearT);
+        t1 = std::min(t1, farT);
+        if (t0 > t1) {
+            return false;
+        }
+    }
+    return true;
+}
+
 cv::Vec3f interpolate_surface_param(const SurfacePatchIndex::TriangleCandidate& tri,
                                     const cv::Vec3f& bary)
 {
@@ -660,8 +692,13 @@ void repair_shifted_ray_outliers(const Config& cfg,
                 }
 
                 std::vector<RayHit> hits;
-                index.forEachTriangleIntersectingRay(
-                    bounds, nullptr, origin, dir, 0.0f, maxT,
+                SurfacePatchIndex::TriangleQuery query;
+                query.bounds = bounds;
+                query.patchFilter = [&](const SurfacePatchIndex::PatchBounds& patchBounds) {
+                    return ray_intersects_patch_bounds(patchBounds, origin, dir, 0.0f, maxT);
+                };
+                index.forEachTriangle(
+                    query,
                     [&](const SurfacePatchIndex::TriangleCandidate& tri) {
                         auto intersection = ray_triangle_intersection(origin, dir, tri.world, 0.0f, maxT);
                         if (!intersection) {
@@ -929,8 +966,14 @@ cv::Mat_<cv::Vec3f> snap_points_to_patch_rays(const cv::Mat_<cv::Vec3f>& points,
 
             float bestT = std::numeric_limits<float>::max();
             cv::Vec3f bestPoint = kInvalid;
-            index.forEachTriangleIntersectingRay(
-                bounds, nullptr, origin, dir, cfg.snapMinDistance, maxDistance,
+            SurfacePatchIndex::TriangleQuery query;
+            query.bounds = bounds;
+            query.patchFilter = [&](const SurfacePatchIndex::PatchBounds& patchBounds) {
+                return ray_intersects_patch_bounds(patchBounds, origin, dir,
+                                                   cfg.snapMinDistance, maxDistance);
+            };
+            index.forEachTriangle(
+                query,
                 [&](const SurfacePatchIndex::TriangleCandidate& tri) {
                     auto t = ray_triangle_t(origin, dir, tri.world, cfg.snapMinDistance, maxDistance);
                     if (t && *t < bestT) {
@@ -1282,8 +1325,14 @@ int main(int argc, char** argv)
             }
 
             std::vector<RayHit> hits;
-            index.forEachTriangleIntersectingRay(
-                bounds, nullptr, origin, dir, cfg.minDistance, cfg.maxDistance,
+            SurfacePatchIndex::TriangleQuery query;
+            query.bounds = bounds;
+            query.patchFilter = [&](const SurfacePatchIndex::PatchBounds& patchBounds) {
+                return ray_intersects_patch_bounds(patchBounds, origin, dir,
+                                                   cfg.minDistance, cfg.maxDistance);
+            };
+            index.forEachTriangle(
+                query,
                 [&](const SurfacePatchIndex::TriangleCandidate& tri) {
                     auto intersection = ray_triangle_intersection(origin, dir, tri.world,
                                                                   cfg.minDistance, cfg.maxDistance);
@@ -1315,8 +1364,15 @@ int main(int argc, char** argv)
                     selfBounds.high[ax] = std::max(origin[ax], selfEnd[ax]) + cfg.bboxPadding;
                 }
                 bool selfHitFirst = false;
-                sourceIndex.forEachTriangleIntersectingRay(
-                    selfBounds, src, origin, dir, cfg.minDistance, firstPatchT,
+                SurfacePatchIndex::TriangleQuery selfQuery;
+                selfQuery.bounds = selfBounds;
+                selfQuery.targetSurface = src;
+                selfQuery.patchFilter = [&](const SurfacePatchIndex::PatchBounds& patchBounds) {
+                    return ray_intersects_patch_bounds(patchBounds, origin, dir,
+                                                       cfg.minDistance, firstPatchT);
+                };
+                sourceIndex.forEachTriangle(
+                    selfQuery,
                     [&](const SurfacePatchIndex::TriangleCandidate& tri) {
                         if (selfHitFirst || is_local_source_triangle(tri, sr, sc, cfg.indexStride, cfg.selfHitIgnoreRadius)) {
                             return;

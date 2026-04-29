@@ -14,9 +14,10 @@
 
 #include <opencv2/core.hpp>
 
+#include "vc/core/util/QuadSurface.hpp"
+
 class QuadSurface;
 class PlaneSurface;
-struct Rect3D;
 
 class SurfacePatchIndex {
 public:
@@ -41,6 +42,18 @@ public:
         SurfacePtr surface;
         std::array<cv::Vec3f, 2> world{};
         std::array<cv::Vec3f, 2> surfaceParams{};
+    };
+
+    struct PatchBounds {
+        cv::Vec3f low = {0, 0, 0};
+        cv::Vec3f high = {0, 0, 0};
+    };
+
+    struct TriangleQuery {
+        Rect3D bounds;
+        SurfacePtr targetSurface;
+        const std::unordered_set<SurfacePtr>* targetSurfaces = nullptr;
+        std::function<bool(const PatchBounds&)> patchFilter;
     };
 
     SurfacePatchIndex();
@@ -73,38 +86,18 @@ public:
     std::vector<LookupResult> locateAll(const cv::Vec3f& worldPoint,
                                         float tolerance,
                                         const SurfacePtr& targetSurface = nullptr) const;
+    void locateSurfaceHits(const cv::Vec3f& worldPoint,
+                           float tolerance,
+                           const std::unordered_set<const QuadSurface*>& excludedSurfaces,
+                           std::vector<const QuadSurface*>& outSurfaces,
+                           const SurfacePtr& targetSurface = nullptr) const;
 
-    void queryTriangles(const Rect3D& bounds,
-                        const SurfacePtr& targetSurface,
-                        std::vector<TriangleCandidate>& outCandidates) const;
-
-    void queryTriangles(const Rect3D& bounds,
-                        const std::unordered_set<SurfacePtr>& targetSurfaces,
-                        std::vector<TriangleCandidate>& outCandidates) const;
-
-    void forEachTriangle(const Rect3D& bounds,
-                         const SurfacePtr& targetSurface,
-                         const std::function<void(const TriangleCandidate&)>& visitor) const;
-
-    void forEachTriangleIntersectingRay(const Rect3D& bounds,
-                                        const SurfacePtr& targetSurface,
-                                        const cv::Vec3f& origin,
-                                        const cv::Vec3f& dir,
-                                        float minT,
-                                        float maxT,
-                                        const std::function<void(const TriangleCandidate&)>& visitor) const;
-
-    void forEachTriangle(const Rect3D& bounds,
-                         const std::unordered_set<SurfacePtr>& targetSurfaces,
+    void forEachTriangle(const TriangleQuery& query,
                          const std::function<void(const TriangleCandidate&)>& visitor) const;
 
     static std::optional<TriangleSegment> clipTriangleToPlane(const TriangleCandidate& tri,
                                                               const PlaneSurface& plane,
                                                               float epsilon = 1e-4f);
-
-    static bool segmentsEqual(const std::vector<TriangleSegment>& a,
-                              const std::vector<TriangleSegment>& b,
-                              float epsilon = 1e-4f);
 
     std::unordered_map<SurfacePtr, std::vector<TriangleSegment>>
     computePlaneIntersections(
@@ -123,7 +116,6 @@ public:
     bool setSamplingStride(int stride);
     int samplingStride() const;
     void setReadOnly(bool readOnly);
-    bool readOnly() const;
 
     // Pending update tracking for incremental R-tree updates
     // Queue the 4 cells surrounding a vertex for update
@@ -140,9 +132,7 @@ public:
     bool hasPendingUpdates(const SurfacePtr& surface = nullptr) const;
 
     // Generation tracking for undo/redo detection
-    void incrementGeneration(const SurfacePtr& surface);
     uint64_t generation(const SurfacePtr& surface) const;
-    void setGeneration(const SurfacePtr& surface, uint64_t gen);
 
 private:
     struct NoPatchFilter {
