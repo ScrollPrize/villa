@@ -5988,16 +5988,10 @@ void CWindow::onManualLocationChanged()
     // Update the line edit with clamped values
     lblLocFocus->setText(QString("%1, %2, %3").arg(x).arg(y).arg(z));
 
-    // Update the focus POI
-    POI* poi = _state->poi("focus");
-    if (!poi) {
-        poi = new POI;
-    }
-
-    poi->p = cv::Vec3f(x, y, z);
-    poi->n = cv::Vec3f(0, 0, 1); // Default normal for XY plane
-
-    _state->setPOI("focus", poi);
+    // Route through centerFocusAt so slice planes reorient (canonical fallback
+    // when no segment is loaded, segment-tangent otherwise) — same behaviour
+    // as ctrl-click in a viewer.
+    centerFocusAt(cv::Vec3f(x, y, z), cv::Vec3f(0, 0, 1), std::string());
 
     if (_surfacePanel) {
         _surfacePanel->refreshFiltersOnly();

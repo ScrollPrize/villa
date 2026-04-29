@@ -308,28 +308,22 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
     // Always update the XY plane
     auto xyPlane = configurePlane("xy plane", xyNormalFromTilt());
 
-    if (_enabled) {
-        auto segXZShared = configurePlane("seg xz", {0.0f, 1.0f, 0.0f}, _segXZRotationDeg, _segXZTilt);
-        auto segYZShared = configurePlane("seg yz", {1.0f, 0.0f, 0.0f}, _segYZRotationDeg, _segYZTilt);
-
-        if (_planeSlicingOverlay) {
-            _planeSlicingOverlay->refreshAll();
-        }
-        updateTiltHandles();
-        return;
+    // Resolve segment so we can decide whether to fall back to canonical axes.
+    QuadSurface* segment = nullptr;
+    std::shared_ptr<Surface> segmentHolder;  // Keep surface alive during this scope
+    if (sourceOverride) {
+        segment = dynamic_cast<QuadSurface*>(sourceOverride);
     } else {
-        QuadSurface* segment = nullptr;
-        std::shared_ptr<Surface> segmentHolder;  // Keep surface alive during this scope
-        if (sourceOverride) {
-            segment = dynamic_cast<QuadSurface*>(sourceOverride);
-        } else {
-            segmentHolder = _state->surface("segmentation");
-            segment = dynamic_cast<QuadSurface*>(segmentHolder.get());
-        }
-        if (!segment) {
-            return;
-        }
+        segmentHolder = _state->surface("segmentation");
+        segment = dynamic_cast<QuadSurface*>(segmentHolder.get());
+    }
 
+    const bool useCanonical = _enabled || !segment;
+
+    if (useCanonical) {
+        configurePlane("seg xz", {0.0f, 1.0f, 0.0f}, _segXZRotationDeg, _segXZTilt);
+        configurePlane("seg yz", {1.0f, 0.0f, 0.0f}, _segYZRotationDeg, _segYZTilt);
+    } else {
         auto segXZShared = std::dynamic_pointer_cast<PlaneSurface>(_state->surface("seg xz"));
         auto segYZShared = std::dynamic_pointer_cast<PlaneSurface>(_state->surface("seg yz"));
 
@@ -359,12 +353,12 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
 
         _state->setSurface("seg xz", segXZShared);
         _state->setSurface("seg yz", segYZShared);
-        if (_planeSlicingOverlay) {
-            _planeSlicingOverlay->refreshAll();
-        }
-        updateTiltHandles();
-        return;
     }
+
+    if (_planeSlicingOverlay) {
+        _planeSlicingOverlay->refreshAll();
+    }
+    updateTiltHandles();
 }
 
 float AxisAlignedSliceController::normalizeDegrees(float degrees)
