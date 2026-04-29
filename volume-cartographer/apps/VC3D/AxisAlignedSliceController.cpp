@@ -335,7 +335,7 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
         }
 
         cv::Vec3f ptr(0, 0, 0);
-        auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+        auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndexIfReady() : nullptr;
         segment->pointTo(ptr, origin, 1.0f, 1000, patchIndex);
 
         // Use the closest surface point as origin for the slicing planes,

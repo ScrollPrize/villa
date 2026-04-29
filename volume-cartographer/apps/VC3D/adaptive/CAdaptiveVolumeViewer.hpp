@@ -284,6 +284,7 @@ private:
     void submitRender();
     void scheduleRender();
     void syncCameraTransform();
+    Q_INVOKABLE void handleSurfaceAccessException(const QString& context, const QString& message);
 
     // Async render pipeline. submitRender() is called on the main thread
     // (Qt render timer). It snapshots what the worker needs, dispatches
@@ -366,9 +367,9 @@ private:
     // zooms feel smoother without touching the sample kernel.
     QTimer* _interactionIdleTimer = nullptr;
     bool _interactive = false;
-    // Increment on every interactive event; submitRender captures the
-    // value before dispatching. If it changes while a render is in flight
-    // we know the user acted again and we should keep rendering.
+    // True while panning/zooming, even when progressive rendering is off.
+    // Used to defer intersection recompute while warped paths track motion.
+    bool _navigationInteractionActive = false;
     void beginInteraction();
 
     // --- Framebuffer ---

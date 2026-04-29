@@ -90,7 +90,7 @@ public:
     void setIntersectionMaxSurfaces(int limit);
     int intersectionMaxSurfaces() const { return _intersectionMaxSurfaces; }
     void primeSurfacePatchIndicesAsync();
-    void resetStrideUserOverride() { _surfacePatchStrideUserSet = false; _surfacePatchStrideTiered = false; }
+    void resetStrideUserOverride() {}
 
     bool resetDefaultFor(CTiledVolumeViewer* viewer) const;
     void setResetDefaultFor(CTiledVolumeViewer* viewer, bool value);
@@ -106,6 +106,7 @@ public:
     float intersectionThickness() const { return _intersectionThickness; }
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids);
     SurfacePatchIndex* surfacePatchIndex();
+    SurfacePatchIndex* surfacePatchIndexIfReady();
     void refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface);
     void refreshSurfacePatchIndex(const SurfacePatchIndex::SurfacePtr& surface, const cv::Rect& changedRegion);
 
@@ -124,12 +125,33 @@ signals:
 
 private slots:
     void handleSurfacePatchIndexPrimeFinished();
+    void handleSurfacePatchIndexTaskFinished();
     void handleSurfaceChanged(std::string name, std::shared_ptr<Surface> surf, bool isEditUpdate = false);
     void handleSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
 
 private:
+    enum class SurfacePatchIndexTaskType {
+        Update,
+        Remove,
+    };
+
+    struct SurfacePatchIndexTask {
+        SurfacePatchIndexTaskType type{SurfacePatchIndexTaskType::Update};
+        std::string id;
+        SurfacePatchIndex::SurfacePtr surface;
+    };
+
+    struct SurfacePatchIndexTaskResult {
+        SurfacePatchIndexTaskType type{SurfacePatchIndexTaskType::Update};
+        std::string id;
+        SurfacePatchIndex::SurfacePtr surface;
+        bool success{false};
+    };
+
     void registerOverlay(ViewerOverlayControllerBase* overlay);
     bool updateSurfacePatchIndexForSurface(const SurfacePatchIndex::SurfacePtr& quad, bool isEditUpdate);
+    void queueSurfacePatchIndexTask(SurfacePatchIndexTask task);
+    void startNextSurfacePatchIndexTask();
 
     CState* _state;
     VCCollection* _points;
@@ -160,9 +182,6 @@ private:
     bool _mirrorCursorToSegmentation{false};
     int _sliceStepSize{1};
     int _surfacePatchSamplingStride{1};
-    bool _surfacePatchStrideUserSet{false};
-    bool _surfacePatchStrideTiered{false};  // tier code ran for current surface set
-    int _targetRefinedStride{0};  // 0 = no refinement pending
     std::atomic<bool> _shuttingDown{false};
     int _intersectionMaxSurfaces{0};  // 0 = unlimited
 
@@ -172,9 +191,10 @@ private:
     // Use string IDs for surface tracking to avoid dangling pointers in async operations
     std::unordered_set<std::string> _indexedSurfaceIds;
     std::vector<std::string> _pendingSurfacePatchIndexSurfaceIds;
-    std::vector<std::string> _surfacesQueuedDuringRebuildIds;
-    std::vector<std::pair<std::string, std::shared_ptr<Surface>>> _surfacesQueuedForRemovalDuringRebuild;
+    std::vector<SurfacePatchIndexTask> _pendingSurfacePatchIndexTasks;
+    std::vector<SurfacePatchIndexTask> _surfacesQueuedDuringRebuild;
     QFutureWatcher<std::shared_ptr<SurfacePatchIndex>>* _surfacePatchIndexWatcher{nullptr};
+    QFutureWatcher<SurfacePatchIndexTaskResult>* _surfacePatchIndexTaskWatcher{nullptr};
 
     // Surfaces currently pinned in the LRU as "highlighted/visible".
     // We track them so we can unpin the right set when highlights change.

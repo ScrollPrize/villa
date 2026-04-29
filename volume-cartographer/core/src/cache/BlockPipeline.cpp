@@ -352,8 +352,11 @@ BlockPipeline::BlockPipeline(
 
         if (diskShardMarksChunkEmpty(*dz, key)) {
             bloomAdd(key);
-            std::lock_guard lock(negativeMutex_);
-            negativeCache_.insert(key);
+            {
+                std::lock_guard lock(negativeMutex_);
+                negativeCache_.insert(key);
+            }
+            notifyChunkReady(key);
             return {};
         }
 
@@ -374,9 +377,12 @@ BlockPipeline::BlockPipeline(
             const bool absent = !isHttp || HttpSource::lastFetchWasAbsent();
             if (absent) {
                 bloomAdd(key);
-                std::lock_guard lock(negativeMutex_);
-                negativeCache_.insert(key);
+                {
+                    std::lock_guard lock(negativeMutex_);
+                    negativeCache_.insert(key);
+                }
                 if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
+                notifyChunkReady(key);
             } else if (isHttp && HttpSource::lastFetchHadTransientError()) {
                 throw std::runtime_error("transient HTTP chunk fetch failure");
             }
@@ -482,8 +488,11 @@ BlockPipeline::BlockPipeline(
         if (dz) {
             if (diskShardMarksChunkEmpty(*dz, key)) {
                 bloomAdd(key);
-                std::lock_guard lock(negativeMutex_);
-                negativeCache_.insert(key);
+                {
+                    std::lock_guard lock(negativeMutex_);
+                    negativeCache_.insert(key);
+                }
+                notifyChunkReady(key);
                 return {};
             }
             // Route through the shard cache. Subsequent inner chunks from
@@ -518,8 +527,11 @@ BlockPipeline::BlockPipeline(
                 const bool absent = !isHttp || HttpSource::lastFetchWasAbsent();
                 if (absent) {
                     bloomAdd(key);
-                    std::lock_guard lock(negativeMutex_);
-                    negativeCache_.insert(key);
+                    {
+                        std::lock_guard lock(negativeMutex_);
+                        negativeCache_.insert(key);
+                    }
+                    notifyChunkReady(key);
                 } else if (isHttp && HttpSource::lastFetchHadTransientError()) {
                     throw std::runtime_error("transient HTTP chunk fetch failure");
                 }
@@ -620,19 +632,7 @@ BlockPipeline::BlockPipeline(
         if (!decoded) return {};
 
         insertChunkAsBlocks(key, *decoded);
-        if (!chunkArrivedFlag_.exchange(true, std::memory_order_acq_rel)) {
-            // Snapshot callbacks under lock and release before firing so
-            // a slow listener can't serialize the decode hot path or
-            // deadlock with add/remove calls that need the same mutex.
-            std::vector<ChunkReadyCallback> snapshot;
-            {
-                std::lock_guard cbLock(callbackMutex_);
-                snapshot.reserve(chunkReadyListeners_.size());
-                for (const auto& [id, cb] : chunkReadyListeners_)
-                    snapshot.push_back(cb);
-            }
-            for (const auto& cb : snapshot) cb(key);
-        }
+        notifyChunkReady(key);
         return {};
     });
 
@@ -681,8 +681,11 @@ BlockPipeline::BlockPipeline(
                 if (!dz || !source_) return {};
                 if (diskShardMarksChunkEmpty(*dz, key)) {
                     bloomAdd(key);
-                    std::lock_guard lock(negativeMutex_);
-                    negativeCache_.insert(key);
+                    {
+                        std::lock_guard lock(negativeMutex_);
+                        negativeCache_.insert(key);
+                    }
+                    notifyChunkReady(key);
                     return {};
                 }
 
@@ -697,9 +700,12 @@ BlockPipeline::BlockPipeline(
                     // (real 404 or sharded-v3 missing/zero placeholder).
                     if (HttpSource::lastFetchWasAbsent()) {
                         bloomAdd(key);
-                        std::lock_guard lock(negativeMutex_);
-                        negativeCache_.insert(key);
+                        {
+                            std::lock_guard lock(negativeMutex_);
+                            negativeCache_.insert(key);
+                        }
                         if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
+                        notifyChunkReady(key);
                     } else if (HttpSource::lastFetchHadTransientError()) {
                         throw std::runtime_error("transient HTTP chunk fetch failure");
                     }
@@ -725,6 +731,7 @@ BlockPipeline::BlockPipeline(
                         negativeCache_.insert(key);
                     }
                     if (dz->is_sharded()) dz->mark_inner_chunk_empty(chunkIndices(key));
+                    notifyChunkReady(key);
                     return {};
                 }
 
@@ -857,10 +864,10 @@ void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targ
     if (keys.empty()) return;
     // Dedup: the renderer calls this every frame, and viewport-idle frames
     // pass the same keys + targetLevel as the previous call. When the
-    // BlockCache hasn't evicted anything since the last submit, nothing
-    // downstream would change — the expensive containsBatch, emptyChunks
-    // snapshot, classification, and (most importantly) IOPool queue
-    // rebuilds would reproduce their previous outputs. Skip.
+    // BlockCache and I/O pools have not changed since the last submit,
+    // nothing downstream would change — the expensive containsBatch,
+    // emptyChunks snapshot, classification, and (most importantly)
+    // IOPool queue rebuilds would reproduce their previous outputs. Skip.
     {
         // Commutative hash so order-insensitive dedup works across
         // render paths that enumerate chunks in different orders.
@@ -868,15 +875,23 @@ void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targ
         ChunkKeyHash kh;
         for (const auto& k : keys) h ^= kh(k);
         const uint64_t evictionNow = blockCache_.evictionVersion();
+        const std::array<uint64_t, 4> ioVersionsNow{
+            downloaderPool_.stateVersion(),
+            loaderPool_.stateVersion(),
+            encodePool_.stateVersion(),
+            decodePool_.stateVersion()
+        };
         std::lock_guard lk(fetchInteractiveDedupMutex_);
         if (haveLastFetchInteractive_
             && lastFetchInteractiveHash_ == h
             && lastFetchInteractiveEviction_ == evictionNow
+            && lastFetchInteractiveIoVersions_ == ioVersionsNow
             && lastFetchInteractiveTargetLevel_ == targetLevel) {
             return;
         }
         lastFetchInteractiveHash_ = h;
         lastFetchInteractiveEviction_ = evictionNow;
+        lastFetchInteractiveIoVersions_ = ioVersionsNow;
         lastFetchInteractiveTargetLevel_ = targetLevel;
         haveLastFetchInteractive_ = true;
     }
@@ -1152,6 +1167,25 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
         }
     }
     TickCoordinator::notifyChunkLanded(this, key);
+}
+
+void BlockPipeline::notifyChunkReady(const ChunkKey& key) {
+    if (chunkArrivedFlag_.exchange(true, std::memory_order_acq_rel)) {
+        return;
+    }
+
+    // Snapshot callbacks under lock and release before firing so a slow
+    // listener can't serialize the decode/fetch hot path or deadlock with
+    // add/remove calls that need the same mutex.
+    std::vector<ChunkReadyCallback> snapshot;
+    {
+        std::lock_guard cbLock(callbackMutex_);
+        snapshot.reserve(chunkReadyListeners_.size());
+        for (const auto& [id, cb] : chunkReadyListeners_) {
+            snapshot.push_back(cb);
+        }
+    }
+    for (const auto& cb : snapshot) cb(key);
 }
 
 

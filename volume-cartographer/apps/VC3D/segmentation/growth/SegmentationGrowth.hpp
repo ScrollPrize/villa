@@ -208,6 +208,8 @@ struct SegmentationGrowthRequest {
     std::optional<std::pair<int, int>> correctionsZRange;
     std::vector<SegmentationDirectionFieldConfig> directionFields;
     utils::Json customParams;
+    cv::Mat allowedGrowthMask;
+    bool manualAddPreview{false};
     bool inpaintOnly{false};
     // Extrapolation parameters
     int extrapolationPointCount{7};
@@ -222,6 +224,7 @@ struct TracerGrowthContext {
     double voxelSize{1.0};
     QString normalGridPath;
     QString normal3dZarrPath;
+    cv::Mat allowedGrowthMask;
     // For corrections annotation saving
     std::filesystem::path volpkgRoot;
     std::vector<std::string> volumeIds;

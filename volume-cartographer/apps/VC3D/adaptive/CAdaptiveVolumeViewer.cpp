@@ -111,17 +111,30 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
     connect(_renderTimer, &QTimer::timeout, this, [this]() {
         if (_renderPending) {
             _renderPending = false;
-            submitRender();
-            updateStatusLabel();
+            try {
+                submitRender();
+                updateStatusLabel();
+            } catch (const std::exception& ex) {
+                handleSurfaceAccessException(tr("render"), QString::fromUtf8(ex.what()));
+            } catch (...) {
+                handleSurfaceAccessException(tr("render"), tr("unknown error"));
+            }
         }
         if (_intersectionsDirty) {
             _intersectionsDirty = false;
-            renderIntersectionsNow();
+            try {
+                renderIntersectionsNow();
+            } catch (const std::exception& ex) {
+                handleSurfaceAccessException(tr("intersection render"), QString::fromUtf8(ex.what()));
+            } catch (...) {
+                handleSurfaceAccessException(tr("intersection render"), tr("unknown error"));
+            }
         }
     });
 
     // When the user stops actively panning / zooming, kick a full-res
-    // re-render to replace the progressive-level frame with a crisp one.
+    // re-render to replace the progressive-level frame with a crisp one,
+    // and rebuild intersections for the final ROI after live-motion warping.
     // 180 ms chosen to be comfortably past the typical debounce of wheel
     // events + tail of a pan drag, so we don't flip to full-res in the
     // middle of continued motion.
@@ -129,9 +142,14 @@ CAdaptiveVolumeViewer::CAdaptiveVolumeViewer(CState* state,
     _interactionIdleTimer->setSingleShot(true);
     _interactionIdleTimer->setInterval(180);
     connect(_interactionIdleTimer, &QTimer::timeout, this, [this]() {
+        const bool wasNavigating = _navigationInteractionActive;
+        _navigationInteractionActive = false;
         if (_interactive) {
             _interactive = false;
             scheduleRender();
+        }
+        if (wasNavigating) {
+            renderIntersections();
         }
     });
 
@@ -448,6 +466,36 @@ void CAdaptiveVolumeViewer::scheduleRender()
     }
 }
 
+void CAdaptiveVolumeViewer::handleSurfaceAccessException(const QString& context, const QString& message)
+{
+    fprintf(stderr, "[Viewer:%s] Surface %s failed: %s\n",
+            _surfName.c_str(),
+            context.toUtf8().constData(),
+            message.toUtf8().constData());
+
+    _renderPending = false;
+    _intersectionsDirty = false;
+    _renderPendingAfterWorker = false;
+    _genCacheDirty = true;
+    invalidateIntersect();
+
+    if (_scene) {
+        _scene->clear();
+        _overlayGroups.clear();
+        _intersectionItems.clear();
+        _focusMarker = nullptr;
+    }
+
+    if (_lbl) {
+        const QString status = tr("Surface load failed: %1. Click Reload Surfaces after fixing or removing the bad surface.")
+                                   .arg(message);
+        _lastStatusText = status;
+        _lbl->setText(status);
+        _lbl->adjustSize();
+        _lbl->show();
+    }
+}
+
 // Toggle to re-enable progressive rendering during pan/zoom. The motion-
 // time resolution drop felt visually jarring in practice, so it's off by
 // default — but the plumbing (submitRender level bump, idle-timer catch-
@@ -561,12 +609,16 @@ void blendOverlayARGB32(uint32_t* baseBits,
 void CAdaptiveVolumeViewer::beginInteraction()
 {
     // Called from any event path that represents live user motion (pan
-    // drag, zoom wheel). Marks _interactive so the next submitRender
-    // picks the progressive pyramid level, and arms the idle timer so a
-    // full-res render fires once motion stops.
-    if (!kProgressiveRenderingEnabled) return;
-    _interactive = true;
-    _interactionIdleTimer->start();
+    // drag, zoom wheel). Existing intersection items are warped during
+    // motion; the expensive rtree + triangle-clip pass is delayed until
+    // the user settles so we don't rebuild it for every intermediate ROI.
+    _navigationInteractionActive = true;
+    if (_interactionIdleTimer) {
+        _interactionIdleTimer->start();
+    }
+    if (kProgressiveRenderingEnabled) {
+        _interactive = true;
+    }
 }
 
 void CAdaptiveVolumeViewer::syncCameraTransform()
@@ -687,9 +739,18 @@ void CAdaptiveVolumeViewer::submitRender()
         } catch (const std::exception& ex) {
             fprintf(stderr, "[Viewer:%s] RENDER EXCEPTION: %s\n",
                     _surfName.c_str(), ex.what());
+            const QString message = QString::fromUtf8(ex.what());
+            QMetaObject::invokeMethod(this, "handleSurfaceAccessException",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(QString, tr("render")),
+                                      Q_ARG(QString, message));
         } catch (...) {
             fprintf(stderr, "[Viewer:%s] RENDER EXCEPTION (unknown)\n",
                     _surfName.c_str());
+            QMetaObject::invokeMethod(this, "handleSurfaceAccessException",
+                                      Qt::QueuedConnection,
+                                      Q_ARG(QString, tr("render")),
+                                      Q_ARG(QString, tr("unknown error")));
         }
         QMetaObject::invokeMethod(this,
             "finishRenderOnMainThread", Qt::QueuedConnection);
@@ -1288,7 +1349,9 @@ void CAdaptiveVolumeViewer::finishRenderOnMainThread()
     // the scene graph, viewport()->update schedules a paint event.
     syncCameraTransform();
     updateFocusMarker();
-    renderIntersections();
+    if (!_navigationInteractionActive) {
+        renderIntersections();
+    }
     emit overlaysUpdated();
     _view->viewport()->update();
 
@@ -1554,7 +1617,8 @@ void CAdaptiveVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardMo
 
     if (modifiers & Qt::ShiftModifier) {
         // Z-scroll
-        float dz = static_cast<float>(steps) * _zScrollSensitivity;
+        const int sliceStepSize = _viewerManager ? _viewerManager->sliceStepSize() : 1;
+        float dz = static_cast<float>(steps * sliceStepSize) * _zScrollSensitivity;
 
         PlaneSurface* plane = dynamic_cast<PlaneSurface*>(surf.get());
         if (_surfName != "segmentation" && plane && _state) {
@@ -1645,8 +1709,19 @@ void CAdaptiveVolumeViewer::onPanStart(Qt::MouseButton, Qt::KeyboardModifiers)
 
 void CAdaptiveVolumeViewer::onPanRelease(Qt::MouseButton, Qt::KeyboardModifiers)
 {
+    const bool wasNavigating = _navigationInteractionActive;
     _isPanning = false;
+    _navigationInteractionActive = false;
+    if (_interactionIdleTimer) {
+        _interactionIdleTimer->stop();
+    }
+    if (_interactive) {
+        _interactive = false;
+    }
     scheduleRender();
+    if (wasNavigating) {
+        renderIntersections();
+    }
 }
 
 void CAdaptiveVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton buttons,

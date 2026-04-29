@@ -46,6 +46,7 @@ private:
     QDoubleSpinBox* _spinPlaneConstraintRadius{nullptr};
     QDoubleSpinBox* _spinPlaneConstraintReplacementRadius{nullptr};
     QComboBox* _comboLinePreviewMode{nullptr};
+    QComboBox* _comboInterpolationMode{nullptr};
     QCheckBox* _chkIncludeTouchedValidBorder{nullptr};
     QCheckBox* _chkAllowBoundarySmoothing{nullptr};
     QPushButton* _btnClearPending{nullptr};

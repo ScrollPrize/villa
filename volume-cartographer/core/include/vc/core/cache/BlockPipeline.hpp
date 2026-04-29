@@ -330,6 +330,11 @@ private:
     static constexpr int kMaxLevels = 16;
     std::array<std::array<int,3>, kMaxLevels> blocksPerChunk_{};
 
+    // Wake viewer/listeners when a chunk's visible state changes, including
+    // decoded data, all-zero chunks, and confirmed-absent chunks. The
+    // chunk-arrival flag coalesces bursts to one UI wake per render tick.
+    void notifyChunkReady(const ChunkKey& key);
+
     // All-zero canonical chunks: record their key instead of materialising
     // 512 identical zero blocks in the arena. blockAt() returns a pointer
     // to a single static zero-block when the block's canonical chunk is
@@ -427,6 +432,7 @@ private:
     mutable std::mutex fetchInteractiveDedupMutex_;
     uint64_t lastFetchInteractiveHash_ = 0;
     uint64_t lastFetchInteractiveEviction_ = 0;
+    std::array<uint64_t, 4> lastFetchInteractiveIoVersions_{};
     int lastFetchInteractiveTargetLevel_ = -1;
     bool haveLastFetchInteractive_ = false;
 

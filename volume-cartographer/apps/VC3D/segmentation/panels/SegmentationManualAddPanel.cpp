@@ -81,6 +81,11 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
     _comboLinePreviewMode->addItem(tr("Horizontal only"), static_cast<int>(ManualAddTool::LinePreviewMode::HorizontalOnly));
     form->addRow(tr("Yellow line"), _comboLinePreviewMode);
 
+    _comboInterpolationMode = new QComboBox(group);
+    _comboInterpolationMode->addItem(tr("Thin-plate spline"), static_cast<int>(ManualAddTool::InterpolationMode::ThinPlateSpline));
+    _comboInterpolationMode->addItem(tr("Tracer inside fill"), static_cast<int>(ManualAddTool::InterpolationMode::TracerRestrictedToFill));
+    form->addRow(tr("Fill method"), _comboInterpolationMode);
+
     layout->addLayout(form);
 
     _chkIncludeTouchedValidBorder = new QCheckBox(tr("Include touched valid border in fit"), group);
@@ -116,6 +121,7 @@ SegmentationManualAddPanel::SegmentationManualAddPanel(const QString& settingsGr
     connect(_spinPlaneConstraintRadius, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, persist);
     connect(_spinPlaneConstraintReplacementRadius, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, persist);
     connect(_comboLinePreviewMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, persist);
+    connect(_comboInterpolationMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, persist);
     connect(_chkIncludeTouchedValidBorder, &QCheckBox::toggled, this, persist);
     connect(_chkAllowBoundarySmoothing, &QCheckBox::toggled, this, persist);
     connect(_btnClearPending, &QPushButton::clicked, this, &SegmentationManualAddPanel::clearPendingRequested);
@@ -136,6 +142,7 @@ ManualAddTool::Config SegmentationManualAddPanel::config() const
     cfg.planeConstraintRadius = _spinPlaneConstraintRadius->value();
     cfg.planeConstraintReplacementRadius = _spinPlaneConstraintReplacementRadius->value();
     cfg.linePreviewMode = static_cast<ManualAddTool::LinePreviewMode>(_comboLinePreviewMode->currentData().toInt());
+    cfg.interpolationMode = static_cast<ManualAddTool::InterpolationMode>(_comboInterpolationMode->currentData().toInt());
     cfg.includeTouchedValidBorder = _chkIncludeTouchedValidBorder->isChecked();
     cfg.allowBoundarySmoothing = _chkAllowBoundarySmoothing->isChecked();
     return cfg;
@@ -169,6 +176,13 @@ void SegmentationManualAddPanel::restoreSettings(QSettings& settings)
                                         static_cast<int>(ManualAddTool::LinePreviewMode::Cross)).toInt();
         const int index = std::max(0, _comboLinePreviewMode->findData(mode));
         _comboLinePreviewMode->setCurrentIndex(index);
+    }
+    {
+        const QSignalBlocker blocker(_comboInterpolationMode);
+        const int mode = settings.value(QStringLiteral("manual_add_interpolation_mode"),
+                                        static_cast<int>(ManualAddTool::InterpolationMode::ThinPlateSpline)).toInt();
+        const int index = std::max(0, _comboInterpolationMode->findData(mode));
+        _comboInterpolationMode->setCurrentIndex(index);
     }
     {
         const QSignalBlocker blocker(_chkIncludeTouchedValidBorder);
@@ -220,6 +234,7 @@ void SegmentationManualAddPanel::persistFromUi()
     writeSetting(QStringLiteral("manual_add_plane_constraint_radius"), _spinPlaneConstraintRadius->value());
     writeSetting(QStringLiteral("manual_add_plane_constraint_replacement_radius"), _spinPlaneConstraintReplacementRadius->value());
     writeSetting(QStringLiteral("manual_add_line_preview_mode"), _comboLinePreviewMode->currentData().toInt());
+    writeSetting(QStringLiteral("manual_add_interpolation_mode"), _comboInterpolationMode->currentData().toInt());
     writeSetting(QStringLiteral("manual_add_include_touched_valid_border"), _chkIncludeTouchedValidBorder->isChecked());
     writeSetting(QStringLiteral("manual_add_allow_boundary_smoothing"), _chkAllowBoundarySmoothing->isChecked());
 }

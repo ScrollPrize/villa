@@ -50,6 +50,10 @@ ManualAddTool::Config ManualAddTool::sanitize(Config config)
                                 static_cast<int>(LinePreviewMode::VerticalOnly),
                                 static_cast<int>(LinePreviewMode::CrossFill));
     config.linePreviewMode = static_cast<LinePreviewMode>(mode);
+    const int interpolation = std::clamp(static_cast<int>(config.interpolationMode),
+                                         static_cast<int>(InterpolationMode::ThinPlateSpline),
+                                         static_cast<int>(InterpolationMode::TracerRestrictedToFill));
+    config.interpolationMode = static_cast<InterpolationMode>(interpolation);
     return config;
 }
 
@@ -527,6 +531,16 @@ bool ManualAddTool::recompute(std::string* status)
             *status = "Manual Add line does not touch an invalid component.";
         }
         return false;
+    }
+
+    if (_config.interpolationMode == InterpolationMode::TracerRestrictedToFill) {
+        _previewPoints = _entrySnapshotPoints.clone();
+        _changedVertices.clear();
+        if (status) {
+            *status = "Manual Add tracer fill mask updated.";
+        }
+        touchRevision();
+        return true;
     }
 
     const auto samples = buildFitSamples();

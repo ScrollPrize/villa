@@ -192,6 +192,8 @@ public:
     NearestPointResult findNearestPoint(const cv::Vec3f& worldPos, float maxDist = 20.0f);
 
     [[nodiscard]] bool manualAddMode() const { return _manualAddMode; }
+    [[nodiscard]] cv::Mat takePendingManualAddTracerMask();
+    bool applyManualAddTracerPreview(QuadSurface* surface);
 
 public slots:
     void setSelectedAnnotationCollection(uint64_t collectionId);
@@ -446,6 +448,7 @@ private:
     std::unique_ptr<CellReoptimizationTool> _cellReoptTool;
     std::unique_ptr<ManualAddTool> _manualAddTool;
     bool _manualAddMode{false};
+    cv::Mat _pendingManualAddTracerMask;
     SegmentationGrowthMethod _previousGrowthMethodBeforeManualAdd{SegmentationGrowthMethod::Tracer};
 
     bool _showApprovalMask{false};

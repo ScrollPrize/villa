@@ -96,6 +96,7 @@ private:
         bool denseDisplacement{false};
         bool denseCreateNewSegment{false};
         bool copyDisplacement{false};
+        bool manualAddPreview{false};
         std::optional<cv::Rect> correctionsAffectedBounds;
         // For corrections annotation saving
         std::optional<CorrectionsBounds> correctionsBounds;
