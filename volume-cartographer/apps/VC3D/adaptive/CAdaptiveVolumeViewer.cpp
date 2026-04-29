@@ -423,7 +423,11 @@ void CAdaptiveVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
 
     if (plane) {
         plane->setOrigin(poi->p);
-        if (cv::norm(poi->n) > 0.5)
+        // The focus POI is shared by all plane viewers. Its normal describes
+        // the surface/view that produced the focus update, so applying it to
+        // every PlaneSurface makes Shift+wheel in one plane reorient the
+        // other orthogonal plane views to the same slicing basis.
+        if (poi->surfaceId == _surfName && cv::norm(poi->n) > 0.5)
             plane->setNormal(poi->n);
 
         // Check if data bounds just became valid
