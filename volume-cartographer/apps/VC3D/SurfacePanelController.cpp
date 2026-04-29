@@ -519,9 +519,8 @@ SurfacePanelController::SurfaceChanges SurfacePanelController::detectSurfaceChan
             if (addedIds.find(uiId) != addedIds.end()) {
                 continue;
             }
-            // Only check timestamps for surfaces that are actually loaded in memory.
-            // If not loaded, we'll get fresh data when we eventually load it.
             if (!_volumePkg->isSurfaceLoaded(uiId)) {
+                changes.toReload.push_back(uiId);
                 continue;
             }
             auto surf = _volumePkg->getSurface(uiId);
@@ -1768,6 +1767,17 @@ void SurfacePanelController::applyFiltersInternal()
     POI* poi = _state ? _state->poi("focus") : nullptr;
     int filterCounter = 0;
     const bool currentOnly = isChecked(_filters.currentOnly);
+    const bool focusPointFilter = isChecked(_filters.focusPoints) && poi;
+    std::unordered_set<QuadSurface*> focusPointSurfaces;
+    if (focusPointFilter) {
+        if (auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr) {
+            for (const auto& hit : patchIndex->locateAll(poi->p, 2.0f)) {
+                if (hit.surface) {
+                    focusPointSurfaces.insert(hit.surface.get());
+                }
+            }
+        }
+    }
 
     QTreeWidgetItemIterator it(_ui.treeWidget);
     while (*it) {
@@ -1782,11 +1792,11 @@ void SurfacePanelController::applyFiltersInternal()
             show = show && QString::fromStdString(id).contains(surfaceIdFilterText, Qt::CaseInsensitive);
         }
 
-        if (surf) {
-            if (isChecked(_filters.focusPoints) && poi) {
-                show = show && contains(*surf, poi->p);
-            }
+        if (focusPointFilter) {
+            show = show && surf && focusPointSurfaces.find(surf.get()) != focusPointSurfaces.end();
+        }
 
+        if (surf) {
             if (model) {
                 bool anyChecked = false;
                 bool anyMatches = false;

@@ -120,6 +120,14 @@ auto main(int argc, char* argv[]) -> int
         }
     }
 
+    // VC3D uses traditional QWidget painting for the shell UI. Avoid Qt's
+    // RHI-backed widget flushing path unless the user explicitly opts in;
+    // it can route ordinary exposes through GLX and crash in some NVIDIA
+    // driver/Qt combinations before any project code is on the stack.
+    if (qEnvironmentVariableIsEmpty("QT_WIDGETS_RHI")) {
+        qputenv("QT_WIDGETS_RHI", "0");
+    }
+
     QApplication app(argc, argv);
     QApplication::setOrganizationName("Vesuvius Challenge");
     QApplication::setApplicationName("VC3D");

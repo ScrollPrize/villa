@@ -333,6 +333,66 @@ struct StraightLoss2D {
     }
 };
 
+struct ParamMetricLoss2D {
+    ParamMetricLoss2D(double unit, double w, double min_area_ratio, double area_w,
+                      double eps_abs, double eps_rel)
+      : _unit(unit),
+        _w(w),
+        _min_area_ratio(min_area_ratio),
+        _area_w(area_w),
+        _eps_abs(eps_abs),
+        _eps_rel(eps_rel) {}
+
+    template <typename T>
+    bool operator()(const T* const p,
+                    const T* const pu,
+                    const T* const pv,
+                    T* residual) const
+    {
+        const T inv_unit = T(1.0) / T(_unit);
+        T eu[2] = { (pu[0]-p[0])*inv_unit, (pu[1]-p[1])*inv_unit };
+        T ev[2] = { (pv[0]-p[0])*inv_unit, (pv[1]-p[1])*inv_unit };
+
+        T a = eu[0]*eu[0] + eu[1]*eu[1];
+        T c = ev[0]*ev[0] + ev[1]*ev[1];
+        T b = eu[0]*ev[0] + eu[1]*ev[1];
+        T trG = a + c;
+        T detG = a*c - b*b;
+        T det_safe = detG + T(_eps_abs) + T(_eps_rel) * trG;
+
+        T E = trG + trG / det_safe;
+        residual[0] = T(_w) * (E - T(4.0));
+
+        // loc is stored as [row, col]. A regular cell has negative signed
+        // row/col cross product, so negate it to make the expected area positive.
+        T signed_area = -(eu[0]*ev[1] - eu[1]*ev[0]);
+        T deficit = T(_min_area_ratio) - signed_area;
+        if (val(deficit) > 0.0)
+            residual[1] = T(_area_w) * deficit;
+        else
+            residual[1] = T(0);
+
+        return true;
+    }
+
+    static ceres::CostFunction* Create(double unit, double w = 1.0,
+                                       double min_area_ratio = 0.25,
+                                       double area_w = 2.0,
+                                       double eps_abs = 1e-8,
+                                       double eps_rel = 1e-2)
+    {
+        return new ceres::AutoDiffCostFunction<ParamMetricLoss2D, 2, 2, 2, 2>(
+            new ParamMetricLoss2D(unit, w, min_area_ratio, area_w, eps_abs, eps_rel));
+    }
+
+    double _unit;
+    double _w;
+    double _min_area_ratio;
+    double _area_w;
+    double _eps_abs;
+    double _eps_rel;
+};
+
 template<typename T, typename E, int C>
 void interp_lin_2d(const cv::Mat_<cv::Vec<E,C>> &m, const T &y, const T &x, T *v) {
     int yi = val(y);
