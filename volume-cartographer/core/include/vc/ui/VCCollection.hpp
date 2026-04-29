@@ -25,7 +25,7 @@ struct ColPoint
  
 struct CollectionMetadata
 {
-    bool absolute_winding_number = false;
+    bool absolute_winding_number = true;
 };
  
 class VCCollection : public QObject
