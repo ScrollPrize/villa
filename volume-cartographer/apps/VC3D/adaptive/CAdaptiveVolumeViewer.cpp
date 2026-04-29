@@ -1772,13 +1772,11 @@ void CAdaptiveVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton bu
 void CAdaptiveVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button,
                                           Qt::KeyboardModifiers modifiers)
 {
-    if (_bboxMode && _surfName == "segmentation") {
-        if (button == Qt::LeftButton) {
-            const cv::Vec2f sp = sceneToSurface(scenePos);
-            _bboxStart = QPointF(sp[0], sp[1]);
-            _activeBBoxSurfRect = QRectF(_bboxStart, _bboxStart).normalized();
-            emit overlaysUpdated();
-        }
+    if (_bboxMode && _surfName == "segmentation" && button == Qt::LeftButton) {
+        const cv::Vec2f sp = sceneToSurface(scenePos);
+        _bboxStart = QPointF(sp[0], sp[1]);
+        _activeBBoxSurfRect = QRectF(_bboxStart, _bboxStart).normalized();
+        emit overlaysUpdated();
         return;
     }
 
@@ -1791,13 +1789,12 @@ void CAdaptiveVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons butto
                                          Qt::KeyboardModifiers modifiers)
 {
     _lastScenePos = scenePos;
-    if (_bboxMode && _surfName == "segmentation") {
-        if (_activeBBoxSurfRect && (buttons & Qt::LeftButton)) {
-            const cv::Vec2f sp = sceneToSurface(scenePos);
-            const QPointF cur(sp[0], sp[1]);
-            _activeBBoxSurfRect = QRectF(_bboxStart, cur).normalized();
-            emit overlaysUpdated();
-        }
+    if (_bboxMode && _surfName == "segmentation" && _activeBBoxSurfRect &&
+        (buttons & Qt::LeftButton)) {
+        const cv::Vec2f sp = sceneToSurface(scenePos);
+        const QPointF cur(sp[0], sp[1]);
+        _activeBBoxSurfRect = QRectF(_bboxStart, cur).normalized();
+        emit overlaysUpdated();
         return;
     }
 
@@ -1818,17 +1815,16 @@ void CAdaptiveVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons butto
 void CAdaptiveVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton button,
                                             Qt::KeyboardModifiers modifiers)
 {
-    if (_bboxMode && _surfName == "segmentation") {
-        if (button == Qt::LeftButton && _activeBBoxSurfRect) {
-            const cv::Vec2f sp = sceneToSurface(scenePos);
-            const QPointF cur(sp[0], sp[1]);
-            const QRectF surfRect = QRectF(_bboxStart, cur).normalized();
-            const int idx = static_cast<int>(_selections.size());
-            const QColor color = QColor::fromHsv((idx * 53) % 360, 200, 255);
-            _selections.push_back({surfRect, color});
-            _activeBBoxSurfRect.reset();
-            emit overlaysUpdated();
-        }
+    if (_bboxMode && _surfName == "segmentation" && button == Qt::LeftButton &&
+        _activeBBoxSurfRect) {
+        const cv::Vec2f sp = sceneToSurface(scenePos);
+        const QPointF cur(sp[0], sp[1]);
+        const QRectF surfRect = QRectF(_bboxStart, cur).normalized();
+        const int idx = static_cast<int>(_selections.size());
+        const QColor color = QColor::fromHsv((idx * 53) % 360, 200, 255);
+        _selections.push_back({surfRect, color});
+        _activeBBoxSurfRect.reset();
+        emit overlaysUpdated();
         return;
     }
 
