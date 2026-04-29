@@ -1061,6 +1061,7 @@ def _corr_winding_loss(
 			gt_n_q = gt_n_q / (gt_n_q.norm(dim=-1, keepdim=True) + 1e-8)
 			normal_align = (gt_n_q * gt_n[vi]).sum(dim=-1).clamp(-1.0, 1.0)
 			normal_sign = torch.where(normal_align >= 0.0, torch.ones_like(normal_align), -torch.ones_like(normal_align))
+			normal_weight = normal_align.abs()
 
 			# Keep the closest-pair bracket as a trust gate for applying force.
 			# Target-pair measurements are useful for reporting, but if the point
@@ -1085,8 +1086,9 @@ def _corr_winding_loss(
 			# is measured in the correction-point normal frame, so flip it when the target
 			# intersection normal points the other way.
 			signed_delta = -err * normal_sign
-			# Fold ray-in-bounds into the soft mask so out-of-quad ray hits don't splat.
-			mask_p = sv.to(dt) * (~too_far).to(dt) * fw_ci * ib.to(dt)
+			# Fold ray-in-bounds and normal alignment into the soft mask: perpendicular
+			# normals contribute no correction; aligned/opposite normals contribute fully.
+			mask_p = sv.to(dt) * (~too_far).to(dt) * fw_ci * ib.to(dt) * normal_weight
 
 			# Continuous mesh-space position of the corr point on the avg-pair quad.
 			h_cont = h_ci.to(dt) + u_ci
