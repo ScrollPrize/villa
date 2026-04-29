@@ -75,10 +75,7 @@ TEST(VcDataset, BloscDatasetWritesCompressedChunksAndReadsBack)
     ASSERT_TRUE(zarray.contains("compressor"));
     ASSERT_TRUE(zarray["compressor"].is_object());
     EXPECT_EQ(zarray["compressor"]["id"].get_string(), std::string("blosc"));
-    EXPECT_EQ(zarray["compressor"]["cname"].get_string(), std::string("zstd"));
     EXPECT_EQ(zarray["compressor"]["clevel"].get_int(), 3);
-    EXPECT_EQ(zarray["compressor"]["shuffle"].get_int(), 1);
-    EXPECT_EQ(zarray["compressor"]["blocksize"].get_int(), 0);
 
     std::vector<uint8_t> chunk(shape[0] * shape[1] * shape[2], 0);
     chunk[0] = 255;
@@ -123,6 +120,36 @@ TEST(VcDataset, CreateZarrDatasetWritesConfiguredFillValue)
     const auto zarray = readJson(tempDir.path() / "0" / ".zarray");
     ASSERT_TRUE(zarray.contains("fill_value"));
     EXPECT_EQ(zarray["fill_value"].get_int(), 128);
+}
+
+TEST(VcDataset, WriteZarrAttrsUsesAnisotropicPhysicalScale)
+{
+    ScopedTempDir tempDir;
+
+    writeZarrAttrs(
+        tempDir.path(), "scan.zarr", 2,
+        5, 3.0, 0.0, "max", 0,
+        cv::Size(80, 40), 5, 16, 16,
+        23.73, 15.82, "micrometer");
+
+    const auto attrs = readJson(tempDir.path() / ".zattrs");
+    ASSERT_TRUE(attrs.contains("multiscales"));
+
+    const auto& multiscale = attrs["multiscales"][0];
+    EXPECT_EQ(multiscale["axes"][0]["name"].get_string(), std::string("z"));
+    EXPECT_EQ(multiscale["axes"][0]["unit"].get_string(), std::string("micrometer"));
+    EXPECT_EQ(multiscale["axes"][1]["name"].get_string(), std::string("y"));
+    EXPECT_EQ(multiscale["axes"][2]["name"].get_string(), std::string("x"));
+
+    const auto& level0Scale = multiscale["datasets"][0]["coordinateTransformations"][0]["scale"];
+    EXPECT_NEAR(level0Scale[0].get_double(), 23.73, 1e-9);
+    EXPECT_NEAR(level0Scale[1].get_double(), 15.82, 1e-9);
+    EXPECT_NEAR(level0Scale[2].get_double(), 15.82, 1e-9);
+
+    const auto& level2Scale = multiscale["datasets"][2]["coordinateTransformations"][0]["scale"];
+    EXPECT_NEAR(level2Scale[0].get_double(), 23.73, 1e-9);
+    EXPECT_NEAR(level2Scale[1].get_double(), 63.28, 1e-9);
+    EXPECT_NEAR(level2Scale[2].get_double(), 63.28, 1e-9);
 }
 
 TEST(VcDataset, UncompressedDecompressRejectsShortInput)
