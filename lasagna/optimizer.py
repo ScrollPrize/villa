@@ -297,6 +297,10 @@ def optimize(
 		if opt_cfg.steps <= 0:
 			return data
 
+		# Configure corr Phase D Gaussian-splat σ (default 1.0; 7×7 vertex neighborhood).
+		corr_splat_sigma = float(opt_cfg.args.get("corr_splat_sigma", 1.0)) if opt_cfg.args else 1.0
+		opt_loss_corr.set_splat_sigma(corr_splat_sigma)
+
 		# If arc/straight params not in optimized set, bake into mesh
 		arc_params_set = {"arc_cx", "arc_cy", "arc_radius", "arc_angle0", "arc_angle1"}
 		if not arc_params_set.intersection(opt_cfg.params):

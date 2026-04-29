@@ -22,6 +22,16 @@ _wind_obs_per_point: torch.Tensor | None = None      # (K,) float — last raw w
 _wind_reinit_counter: int = 0
 _wind_prev_any_valid: torch.Tensor | None = None     # (K,) bool — per-point "had valid anchor last step"
 
+# Phase D Gaussian splat config: σ in mesh-vertex units. 1.0 → 7×7 neighborhood (~3-vertex radius).
+# Set per stage via opt_loss_corr.set_splat_sigma(...) from optimizer.py.
+_corr_splat_sigma: float = 1.0
+
+
+def set_splat_sigma(sigma: float) -> None:
+	"""Set the Gaussian σ used by Phase D's height-map splat (units: mesh vertices)."""
+	global _corr_splat_sigma
+	_corr_splat_sigma = float(sigma)
+
 
 def corr_winding_loss(
 	*, res: fit_model.FitResult3D,
@@ -285,6 +295,60 @@ def _wind_strip_integral(
 	strip_valid = (mag > 0).all(dim=-1)
 
 	return signed_winding, unsigned_winding, strip_valid
+
+
+def _height_map_splat(
+	d_p: torch.Tensor,            # (Kp,) int   — layer per point
+	h_floor_p: torch.Tensor,      # (Kp,) int   — quad row
+	w_floor_p: torch.Tensor,      # (Kp,) int   — quad col
+	h_cont_p: torch.Tensor,       # (Kp,) float — continuous mesh-row position
+	w_cont_p: torch.Tensor,       # (Kp,) float — continuous mesh-col position
+	signed_delta_p: torch.Tensor, # (Kp,) float — scalar per-point displacement (sign baked in)
+	mask_p: torch.Tensor,         # (Kp,) float — soft per-point validity weight
+	sigma: float,
+	D: int, Hm: int, Wm: int,
+	H_map: torch.Tensor,          # (D, Hm, Wm) — accumulator (mutated in place)
+	W_map: torch.Tensor,          # (D, Hm, Wm) — accumulator (mutated in place)
+) -> None:
+	"""Splat per-corr-point scalar displacements onto (D, Hm, Wm) accumulators with a Gaussian
+	kernel in mesh-vertex coordinates. R = ceil(3σ) neighborhood; out-of-bounds neighbors
+	get weight 0 (no spillover). All inputs are detached scalars/tensors.
+	"""
+	Kp = d_p.shape[0]
+	if Kp == 0:
+		return
+	dev = d_p.device
+	dt = signed_delta_p.dtype
+
+	R = int(math.ceil(3.0 * sigma))
+	if R < 1:
+		R = 1
+	N_off = 2 * R + 1
+
+	off = torch.arange(-R, R + 1, device=dev, dtype=torch.long)
+	oh_grid, ow_grid = torch.meshgrid(off, off, indexing="ij")           # (N, N)
+	oh_grid = oh_grid.reshape(1, N_off, N_off)                            # (1, N, N)
+	ow_grid = ow_grid.reshape(1, N_off, N_off)
+
+	v_h = h_floor_p.view(Kp, 1, 1) + oh_grid                              # (Kp, N, N)
+	v_w = w_floor_p.view(Kp, 1, 1) + ow_grid
+
+	# Gaussian distance from continuous corr-point position to integer vertex (h_v, w_v).
+	dh = v_h.to(dt) - h_cont_p.view(Kp, 1, 1)
+	dw = v_w.to(dt) - w_cont_p.view(Kp, 1, 1)
+	gauss = torch.exp(-(dh * dh + dw * dw) / (2.0 * float(sigma) * float(sigma)))
+
+	# Out-of-bounds → zero weight (no spillover at mesh edge); clamp index for safe scatter.
+	in_bounds = (v_h >= 0) & (v_h < Hm) & (v_w >= 0) & (v_w < Wm)
+	weight = gauss * in_bounds.to(dt) * mask_p.view(Kp, 1, 1)
+	delta = weight * signed_delta_p.view(Kp, 1, 1)
+
+	v_h_c = v_h.clamp(0, Hm - 1)
+	v_w_c = v_w.clamp(0, Wm - 1)
+	flat_idx = (d_p.view(Kp, 1, 1) * Hm * Wm + v_h_c * Wm + v_w_c).reshape(-1)
+
+	H_map.view(-1).scatter_add_(0, flat_idx, delta.reshape(-1))
+	W_map.view(-1).scatter_add_(0, flat_idx, weight.reshape(-1))
 
 
 def _wind_collection_average(
@@ -848,7 +912,7 @@ def _corr_winding_loss(
 						new_b = f"{new_d0[j]}-{new_d1[j]}" if new_v0[j] and new_v1[j] else "---"
 						print(f"  pt {int(ri[j])}: bracket {old_b} -> {new_b}")
 
-	# === Phase D: Proxy correction loss (avg pair, WITH gradients) ===
+	# === Phase D: Gaussian-splat height-map proxy (avg pair, WITH gradients) ===
 	target = _wind_target_per_point
 	target_finite = torch.isfinite(target)
 	if not target_finite.any():
@@ -859,9 +923,6 @@ def _corr_winding_loss(
 
 	frac = (target - _wind_anchors_d[:, 2].to(dt)).clamp(0.0, 1.0)
 
-	total_loss = torch.zeros((), device=dev, dtype=dt)
-	total_wsum = 0.0
-	n_surfaces = 0
 	all_err = torch.zeros(K, device=dev, dtype=dt)
 	all_too_far = torch.zeros(K, dtype=torch.bool, device=dev)
 
@@ -869,89 +930,99 @@ def _corr_winding_loss(
 	# Integer targets naturally zero out the second surface.
 	frac_weight = {2: (1.0 - frac), 3: frac}
 
-	for ci, tgt_fn in [(2, lambda f: -f), (3, lambda f: 1.0 - f)]:
-		valid = _wind_anchors_valid[:, ci] & target_finite
-		if not valid.any():
-			continue
-		vi = valid.nonzero(as_tuple=True)[0]
-		d_ci = _wind_anchors_d[vi, ci]
-		h_ci = _wind_anchors_h[vi, ci]
-		w_ci = _wind_anchors_w[vi, ci]
+	# Shared scalar height map and weight accumulator across both ci=2 and ci=3 splats.
+	# H_map carries signed-delta contributions; W_map carries Gaussian × soft-mask weights.
+	H_map = torch.zeros(D, Hm, Wm, device=dev, dtype=dt)
+	W_map = torch.zeros(D, Hm, Wm, device=dev, dtype=dt)
 
-		# Gather 4 model quad corners WITH gradients
-		M00 = xyz_lr[d_ci, h_ci, w_ci]
-		M10 = xyz_lr[d_ci, h_ci + 1, w_ci]
-		M01 = xyz_lr[d_ci, h_ci, w_ci + 1]
-		M11 = xyz_lr[d_ci, h_ci + 1, w_ci + 1]
+	# Per-corr-point detached pipeline for each ci, then splat into the shared height map.
+	with torch.no_grad():
+		for ci, tgt_fn in [(2, lambda f: -f), (3, lambda f: 1.0 - f)]:
+			valid = _wind_anchors_valid[:, ci] & target_finite
+			if not valid.any():
+				continue
+			vi = valid.nonzero(as_tuple=True)[0]
+			d_ci = _wind_anchors_d[vi, ci]
+			h_ci = _wind_anchors_h[vi, ci]
+			w_ci = _wind_anchors_w[vi, ci]
 
-		with torch.no_grad():
-			M00_det = M00.detach()
-			M10_det = M10.detach()
-			M01_det = M01.detach()
-			M11_det = M11.detach()
-
-			# Project P onto quad (detached u,v for weights)
+			# Detached quad corners and projection
+			M00_det = xyz_det[d_ci, h_ci, w_ci]
+			M10_det = xyz_det[d_ci, h_ci + 1, w_ci]
+			M01_det = xyz_det[d_ci, h_ci, w_ci + 1]
+			M11_det = xyz_det[d_ci, h_ci + 1, w_ci + 1]
 			u_ci, v_ci = _bilinear_project(P[vi], M00_det, M10_det, M01_det, M11_det)
+			Q_det = _bilinear_interp(M00_det, M10_det, M01_det, M11_det, u_ci, v_ci)
 
-			# Bilinear model point (detached)
-			uf = u_ci.unsqueeze(-1)
-			vf = v_ci.unsqueeze(-1)
-			Q = (1 - uf) * (1 - vf) * M00_det + uf * (1 - vf) * M10_det + \
-				(1 - uf) * vf * M01_det + uf * vf * M11_det
-
-			# Strip from P to Q: signed winding
-			sw, uw, sv = _wind_strip_integral(P[vi], Q, gt_n[vi], res.data, strip_samples)
-
-			# Target offset
+			# Strip integral → signed winding and validity
+			sw, uw, sv = _wind_strip_integral(P[vi], Q_det, gt_n[vi], res.data, strip_samples)
 			tgt = tgt_fn(frac[vi])
 			err = sw - tgt
 
-			# Single-sided distance cutoff: reject points > 2 windings from surface
-			# when not bracketed (above top layer or below bottom layer).
-			# Bracketed points skip this — large uw there is just density variation.
+			# Single-sided cutoff (same logic as before)
 			is_bracketed = _wind_anchors_valid[vi, 0] & _wind_anchors_valid[vi, 1]
 			too_far = ~is_bracketed & (uw > 2.0)
 			all_too_far[vi] |= too_far
 
-			# Store error for results (weighted by frac proximity)
-			fw = frac_weight[ci][vi]
-			all_err[vi] += err * fw
+			# Track per-point error for reporting (frac-weighted, same as before)
+			fw_ci = frac_weight[ci][vi]
+			all_err[vi] += err * fw_ci
 
-			# Proxies: shift each corner by gt_n * err
-			we = err.unsqueeze(-1)
-			gt_n_vi = gt_n[vi]
-			proxy00 = M00_det - gt_n_vi * we
-			proxy10 = M10_det - gt_n_vi * we
-			proxy01 = M01_det - gt_n_vi * we
-			proxy11 = M11_det - gt_n_vi * we
+			# Scalar per-point displacement along gt_n. The old proxy was
+			# `M_det − gt_n_p · err`, i.e. move corners by `−err` along gt_n_p; here we
+			# splat the same scalar `−err` and apply along the per-vertex gt_n_v at the
+			# active vertex. The mesh normal at the intersection plays no role here —
+			# `sw` responds to corner moves purely via `(Q−P)·gt_n_p`, so no sign flip is
+			# needed when the local mesh winding is inside-out relative to gt_n_p.
+			signed_delta = -err
+			mask_p = sv.to(dt) * (~too_far).to(dt) * fw_ci
 
-		# Bilinear weights
-		w00 = (1 - u_ci) * (1 - v_ci)
-		w10 = u_ci * (1 - v_ci)
-		w01 = (1 - u_ci) * v_ci
-		w11 = u_ci * v_ci
+			# Continuous mesh-space position of the corr point on the avg-pair quad.
+			h_cont = h_ci.to(dt) + u_ci
+			w_cont = w_ci.to(dt) + v_ci
 
-		# L2 loss (gradients flow through M00..M11)
-		lm00 = (M00 - proxy00).square().sum(dim=-1)
-		lm10 = (M10 - proxy10).square().sum(dim=-1)
-		lm01 = (M01 - proxy01).square().sum(dim=-1)
-		lm11 = (M11 - proxy11).square().sum(dim=-1)
+			_height_map_splat(
+				d_ci, h_ci, w_ci, h_cont, w_cont,
+				signed_delta, mask_p,
+				_corr_splat_sigma, D, Hm, Wm,
+				H_map, W_map,
+			)
 
-		lm = w00 * lm00 + w10 * lm10 + w01 * lm01 + w11 * lm11
+	# Apply the height map: for each active vertex, target = M_det + gt_n_v · (H/W).
+	# Sample GT normal at the active vertex 3D positions (one extra grid_sample call).
+	active = W_map > 1e-8
+	n_active = int(active.sum().item())
 
-		# Mask by strip validity + distance cutoff, weighted by frac proximity to target
-		mask_ci = sv.to(dt) * (~too_far).to(dt) * frac_weight[ci][vi]
-		wsum = float(mask_ci.sum().detach().cpu())
-		if wsum > 0:
-			total_loss = total_loss + (lm * mask_ci).sum()
-			total_wsum += wsum
-		n_surfaces += 1
+	total_loss = torch.zeros((), device=dev, dtype=dt)
+	total_wsum = 0.0
+	if n_active > 0:
+		# Gather active indices and tensors
+		d_idx, h_idx, w_idx = active.nonzero(as_tuple=True)
+		M_active = xyz_lr[d_idx, h_idx, w_idx]                       # live, (Na, 3)
+		M_det_active = xyz_det[d_idx, h_idx, w_idx]                  # detached, (Na, 3)
+		H_active = H_map[d_idx, h_idx, w_idx]                        # (Na,)
+		W_active = W_map[d_idx, h_idx, w_idx]                        # (Na,)
+
+		# Sample GT normal at each active vertex's 3D position (detached)
+		Na = int(M_active.shape[0])
+		gt_n_v_sampled = res.data.grid_sample_fullres(M_det_active.reshape(1, 1, Na, 3))
+		gt_n_v = gt_n_v_sampled.normal_3d.reshape(Na, 3)
+		gt_n_v = gt_n_v / (gt_n_v.norm(dim=-1, keepdim=True) + 1e-8)
+
+		# target_v = M_det_v + gt_n_v · (H_v / W_v)  (3D)
+		h_per_v = (H_active / W_active.clamp_min(1e-8)).unsqueeze(-1)
+		target_active = M_det_active + gt_n_v * h_per_v
+
+		# loss = Σ W_v · ||M_v - target_v||²  (gradient flows through M_active)
+		diff = M_active - target_active
+		total_loss = total_loss + (W_active * diff.square().sum(dim=-1)).sum()
+		total_wsum = float(W_active.sum().detach().cpu())
 
 	if dbg:
 		n_valid = int(target_finite.sum().item())
 		rms = float(total_loss.detach().sqrt().item()) if total_wsum > 0 else float("nan")
 		print(f"[corr-wind] loss={float(total_loss.detach().item()):.6f}, "
-			  f"valid={n_valid}/{K}, rms_proxy={rms:.4f}")
+			  f"valid={n_valid}/{K}, active_verts={n_active}, rms_proxy={rms:.4f}")
 
 	# Build results — point is valid only if it has a valid tgt anchor and is not too far
 	has_tgt_anchor = _wind_anchors_valid[:, 2] | _wind_anchors_valid[:, 3]
