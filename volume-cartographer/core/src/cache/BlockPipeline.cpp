@@ -20,6 +20,12 @@
 
 namespace vc::cache {
 
+static bool envFlagEnabled(const char* name) noexcept {
+    const char* value = std::getenv(name);
+    if (!value || value[0] == '\0') return false;
+    return !(value[0] == '0' && value[1] == '\0');
+}
+
 static std::array<size_t, 3> chunkIndices(const ChunkKey& key) {
     return {size_t(key.iz), size_t(key.iy), size_t(key.ix)};
 }
@@ -847,6 +853,15 @@ void BlockPipeline::bloomClear() noexcept {
 }
 
 void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targetLevel) {
+    static const bool disableFetchInteractiveDedup =
+        envFlagEnabled("VC_DISABLE_FETCHINTERACTIVE_DEDUP");
+    static bool printedDedupDisabled = false;
+    if (disableFetchInteractiveDedup && !printedDedupDisabled) {
+        printedDedupDisabled = true;
+        std::fprintf(stderr,
+            "[BlockPipeline] VC_DISABLE_FETCHINTERACTIVE_DEDUP=1: "
+            "fetchInteractive dedup disabled\n");
+    }
     static int fetchDbgCount = 0;
     if (fetchDbgCount++ < 5 || fetchDbgCount % 100 == 0)
         fprintf(stderr, "[BlockPipeline] fetchInteractive %p: %zu keys, targetLevel=%d\n",
@@ -858,7 +873,7 @@ void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targ
     // nothing downstream would change — the expensive containsBatch,
     // emptyChunks snapshot, classification, and (most importantly)
     // IOPool queue rebuilds would reproduce their previous outputs. Skip.
-    {
+    if (!disableFetchInteractiveDedup) {
         // Commutative hash so order-insensitive dedup works across
         // render paths that enumerate chunks in different orders.
         uint64_t h = uint64_t(uint32_t(targetLevel)) * 0x9E3779B97F4A7C15ULL;
