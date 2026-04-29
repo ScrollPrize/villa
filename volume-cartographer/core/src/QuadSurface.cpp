@@ -1521,6 +1521,33 @@ void QuadSurface::save_meta()
     if (path.empty())
         throw std::runtime_error("no storage path for QuadSurface");
 
+    if (!meta.is_object()) {
+        throw std::runtime_error("can't save_meta() with non-object metadata!");
+    }
+
+    const std::string uuid = !id.empty() ? id : path.filename().string();
+    if (uuid.empty()) {
+        throw std::runtime_error("QuadSurface::save_meta() requires a non-empty uuid");
+    }
+
+    {
+        auto lo = utils::Json::array();
+        lo.push_back(bbox().low[0]); lo.push_back(bbox().low[1]); lo.push_back(bbox().low[2]);
+        auto hi = utils::Json::array();
+        hi.push_back(bbox().high[0]); hi.push_back(bbox().high[1]); hi.push_back(bbox().high[2]);
+        auto bb = utils::Json::array();
+        bb.push_back(std::move(lo)); bb.push_back(std::move(hi));
+        meta["bbox"] = std::move(bb);
+    }
+    meta["type"] = "seg";
+    meta["uuid"] = uuid;
+    meta["format"] = "tifxyz";
+    {
+        auto sc = utils::Json::array();
+        sc.push_back(_scale[0]); sc.push_back(_scale[1]);
+        meta["scale"] = std::move(sc);
+    }
+
     std::ofstream o(path/"meta.json.tmp");
     o << meta.dump(4) << std::endl;
 
