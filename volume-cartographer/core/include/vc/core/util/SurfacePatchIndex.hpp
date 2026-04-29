@@ -70,6 +70,9 @@ public:
     std::optional<LookupResult> locate(const cv::Vec3f& worldPoint,
                                        float tolerance,
                                        const SurfacePtr& targetSurface = nullptr) const;
+    std::vector<LookupResult> locateAll(const cv::Vec3f& worldPoint,
+                                        float tolerance,
+                                        const SurfacePtr& targetSurface = nullptr) const;
 
     void queryTriangles(const Rect3D& bounds,
                         const SurfacePtr& targetSurface,
