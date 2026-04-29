@@ -41,10 +41,12 @@ struct ChunkLandedEvent {
 };
 
 // One slice entry. `packedKey` is the BlockSampler packKey of (bz,by,bx).
-// Readers verify `pipeline` matches their BlockPipeline&; multi-volume
-// scenes intermix entries in the published vector otherwise.
+// Readers verify both `pipeline` and `level`; adaptive renders can have
+// several pyramid levels resident for one pipeline, and block coordinates
+// overlap across levels.
 struct SliceEntry {
     std::uint64_t        packedKey;
+    int                  level;
     const BlockPipeline* pipeline;
     const Block*         block;
 };
