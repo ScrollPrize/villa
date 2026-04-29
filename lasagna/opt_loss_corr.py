@@ -33,6 +33,26 @@ def set_splat_sigma(sigma: float) -> None:
 	_corr_splat_sigma = float(sigma)
 
 
+def reset_state() -> None:
+	"""Reset persistent corr state between independent optimization jobs."""
+	global _dbg_call_count, _last_results
+	global _wind_anchors_d, _wind_anchors_h, _wind_anchors_w, _wind_anchors_valid
+	global _wind_initialized, _wind_target_per_point, _wind_obs_per_point
+	global _wind_reinit_counter, _wind_prev_any_valid
+
+	_dbg_call_count = 0
+	_last_results = None
+	_wind_anchors_d = None
+	_wind_anchors_h = None
+	_wind_anchors_w = None
+	_wind_anchors_valid = None
+	_wind_initialized = False
+	_wind_target_per_point = None
+	_wind_obs_per_point = None
+	_wind_reinit_counter = 0
+	_wind_prev_any_valid = None
+
+
 def corr_winding_loss(
 	*, res: fit_model.FitResult3D,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
@@ -364,9 +384,12 @@ def _height_map_splat(
 	dw = v_w.to(dt) - w_cont_p.view(Kp, 1, 1)
 	gauss = torch.exp(-(dh * dh + dw * dw) / (2.0 * float(sigma) * float(sigma)))
 
-	# Out-of-bounds → zero weight (no spillover at mesh edge); clamp index for safe scatter.
+	# Out-of-bounds → zero weight (no spillover at mesh edge). Normalize each
+	# per-point splat so sigma changes spread, not total correction strength.
 	in_bounds = (v_h >= 0) & (v_h < Hm) & (v_w >= 0) & (v_w < Wm)
-	weight = gauss * in_bounds.to(dt) * mask_p.view(Kp, 1, 1)
+	base_weight = gauss * in_bounds.to(dt)
+	base_weight = base_weight / base_weight.sum(dim=(1, 2), keepdim=True).clamp_min(1e-8)
+	weight = base_weight * mask_p.view(Kp, 1, 1)
 	delta = weight * signed_delta_p.view(Kp, 1, 1)
 
 	v_h_c = v_h.clamp(0, Hm - 1)

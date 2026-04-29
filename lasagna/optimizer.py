@@ -273,6 +273,7 @@ def optimize(
 	ensure_data_fn=None,
 	seed_xyz: tuple[float, float, float] | None = None,
 ) -> fit_data.FitData3D:
+	opt_loss_corr.reset_state()
 
 	terms = {
 		"step": {"loss": opt_loss_step.step_loss},
@@ -326,7 +327,7 @@ def optimize(
 				for p in group:
 					param_groups.append({"params": [p], "lr": lr_last})
 		if not param_groups:
-			return
+			return data
 		opt = torch.optim.Adam(param_groups)
 
 		# winding_offset_autocrop: compute offset/direction then crop invalid depth layers
