@@ -116,7 +116,7 @@ BlockPtr BlockCache::get(const BlockKey& key) noexcept
     // eviction/reassignment races.
     const uint64_t packed = packBlockKey(key);
     const uint32_t tag = keyTag32(packed);
-    if (tag != 0) {  // tag==0 collides with kL2Empty; skip L2 for that key
+    {
         const size_t setIdx = l2Index(packed, kL2Bits);
         std::atomic<uint64_t>* set = &l2_[setIdx * kL2Ways];
         for (size_t way = 0; way < kL2Ways; ++way) {
@@ -152,8 +152,7 @@ BlockPtr BlockCache::get(const BlockKey& key) noexcept
                 && slotKeyPacked_[slot].load(std::memory_order_acquire) == packed) {
                 setUsed(slot, true);
                 shard.hits.fetch_add(1, std::memory_order_relaxed);
-                if (tag != 0) {
-                    // Populate L2 for next lookup.
+                {
                     const size_t setIdx = l2Index(packed, kL2Bits);
                     std::atomic<uint64_t>* set = &l2_[setIdx * kL2Ways];
                     size_t wayToUse = kL2Ways;
@@ -346,7 +345,7 @@ size_t BlockCache::acquireSlotLocked(const BlockKey& key, uint64_t gen) noexcept
     // lock-free. Same empty-preferred / round-robin-fallback placement as
     // the slow-path populate in get().
     const uint32_t tag = keyTag32(packed);
-    if (tag != 0) {
+    {
         const size_t setIdx = l2Index(packed, kL2Bits);
         std::atomic<uint64_t>* set = &l2_[setIdx * kL2Ways];
         size_t wayToUse = kL2Ways;
@@ -424,7 +423,7 @@ size_t BlockCache::reclaimSlotLocked()
             // both the tag and the slot index so we don't invalidate an
             // unrelated block.
             const uint32_t oldTag = keyTag32(pk);
-            if (oldTag != 0) {
+            {
                 const size_t setIdx = l2Index(pk, kL2Bits);
                 std::atomic<uint64_t>* set = &l2_[setIdx * kL2Ways];
                 for (size_t way = 0; way < kL2Ways; ++way) {
@@ -474,10 +473,6 @@ void BlockCache::clear()
     clockHand_ = 0;
     levelOccupied_.fill(0);
     evictionVersion_.fetch_add(1, std::memory_order_relaxed);
-    // Tell kernel we don't need any of these pages for now.
-    if (arena_ && arenaBytes_) {
-        ::madvise(arena_, arenaBytes_, MADV_DONTNEED);
-    }
 }
 
 }  // namespace vc::cache

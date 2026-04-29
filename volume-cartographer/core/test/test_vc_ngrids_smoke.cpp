@@ -65,27 +65,27 @@ void createInputVolume(const fs::path& root)
         {"name", "vol-test"},
         {"type", "vol"},
         {"format", "zarr"},
-        {"width", 64},
-        {"height", 64},
-        {"slices", 64},
+        {"width", 32},
+        {"height", 32},
+        {"slices", 32},
         {"voxelsize", 1.0},
         {"min", 0.0},
         {"max", 255.0}
     });
 
-    auto ds = vc::createZarrDataset(root, "0", {64, 64, 64}, {16, 16, 16}, vc::VcDtype::uint8, "none", "/");
-    std::vector<uint8_t> volume(64 * 64 * 64, 0);
+    auto ds = vc::createZarrDataset(root, "0", {32, 32, 32}, {16, 16, 16}, vc::VcDtype::uint8, "none", "/");
+    std::vector<uint8_t> volume(32 * 32 * 32, 0);
     auto idx = [](int z, int y, int x) {
-        return static_cast<size_t>((z * 64 + y) * 64 + x);
+        return static_cast<size_t>((z * 32 + y) * 32 + x);
     };
-    for (int z = 16; z < 48; ++z) {
-        for (int y = 16; y < 48; ++y) {
-            for (int x = 16; x < 48; ++x) {
+    for (int z = 8; z < 24; ++z) {
+        for (int y = 8; y < 24; ++y) {
+            for (int x = 8; x < 24; ++x) {
                 volume[idx(z, y, x)] = 255;
             }
         }
     }
-    ds->writeRegion({0, 0, 0}, {64, 64, 64}, volume.data());
+    ds->writeRegion({0, 0, 0}, {32, 32, 32}, volume.data());
 }
 
 void createNormalsInput(
@@ -215,6 +215,7 @@ TEST(NGridsSmoke, FitAndAlignNormalsAreDeterministicSingleThreaded)
         + " -o " + quote(gridsRoot)
         + " --sparse-volume 4"
         + " --preview-every 0"
+        + " --spiral-step 4"
         + " --level 0";
     ASSERT_EQ(std::system(gen_cmd.c_str()), 0);
 

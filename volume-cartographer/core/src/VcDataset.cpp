@@ -309,6 +309,9 @@ static CompressorConfig compressorFromMeta(const utils::ZarrMetadata& meta, int 
         if (meta.compressor_id == "blosc") {
             cfg.id = CompressorId::Blosc;
             cfg.blosc_clevel = meta.compression_level > 0 ? meta.compression_level : 5;
+            if (!meta.blosc_cname.empty()) cfg.blosc_cname = meta.blosc_cname;
+            cfg.blosc_shuffle = meta.blosc_shuffle;
+            cfg.blosc_blocksize = meta.blosc_blocksize;
         } else if (meta.compressor_id == "zstd") {
             cfg.id = CompressorId::Zstd;
             cfg.level = meta.compression_level > 0 ? meta.compression_level : 3;
@@ -781,13 +784,12 @@ bool VcDataset::writeRegion(const std::vector<size_t>& offset,
                 }
             }
 
-            // If partial, read existing chunk first
             if (!fullChunk) {
                 auto existing = impl_->zarrArray_->read_chunk(idxSpan);
                 if (existing && existing->size() >= chunkElems * elemSize) {
                     std::memcpy(chunkBuf.data(), existing->data(), chunkElems * elemSize);
                 } else {
-                    std::memset(chunkBuf.data(), 0, chunkElems * elemSize);
+                    fillTypedElements(chunkBuf.data(), chunkElems, impl_->fillValueBytes_);
                 }
             }
 

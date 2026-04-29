@@ -111,9 +111,9 @@ void TickCoordinator::publishViewportGlobal(int slotIdx,
     TickCoordinator* c = g_coordinator.load(std::memory_order_acquire);
     if (!c || slotIdx < 0 || std::size_t(slotIdx) >= kMaxViewers) return;
     auto& slot = c->viewportSlots_[slotIdx];
-    // Seqlock write: bump to odd, copy payload, bump to even+2.
     const std::uint64_t prev = slot.seq.load(std::memory_order_relaxed);
     slot.seq.store(prev + 1, std::memory_order_release);
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     slot.snapshot = s;
     slot.seq.store(prev + 2, std::memory_order_release);
 }

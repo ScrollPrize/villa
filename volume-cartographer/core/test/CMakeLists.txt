@@ -20,7 +20,7 @@ vc_add_test(test_project test_project.cpp)
 vc_add_test(test_http_cancel test_http_cancel.cpp)
 vc_add_test(test_vcdataset test_vcdataset.cpp)
 vc_add_test(test_quad_surface test_quad_surface.cpp)
-vc_add_test(test_surface_patch_index test_surface_patch_index.cpp)
+# vc_add_test(test_surface_patch_index test_surface_patch_index.cpp)  # source file missing
 vc_add_test(test_negative_cache_policy test_negative_cache_policy.cpp)
 
 add_dependencies(test_vc_gen_normalgrids_smoke vc_gen_normalgrids)

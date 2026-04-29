@@ -410,6 +410,9 @@ struct ZarrMetadata {
     char byte_order = '<';
     std::string compressor_id;           // "blosc", "zlib", "zstd", or "" for raw
     int compression_level = 5;
+    std::string blosc_cname = "zstd";
+    int blosc_shuffle = 1;
+    int blosc_blocksize = 0;
     std::string dimension_separator = ".";
     std::vector<ZarrFilter> filters;     // v2 filters applied before compression
 
@@ -758,14 +761,22 @@ inline std::uint64_t read_le64(const std::byte* src) {
 
 // ----- Shard index -----
 
-/// Shard index entry: offset and nbytes for one inner chunk.
-/// If offset == 0xFFFF...F and nbytes == 0xFFFF...F, the chunk is missing.
+// Sentinels: missing=(~0,~0), real=(off,N), empty=(~0-1,0), verified_absent=(~0-2,0).
 struct ShardIndexEntry {
     std::uint64_t offset = ~std::uint64_t(0);
     std::uint64_t nbytes  = ~std::uint64_t(0);
 
     [[nodiscard]] bool is_missing() const noexcept {
         return offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0);
+    }
+    [[nodiscard]] bool is_empty() const noexcept {
+        return offset == (~std::uint64_t(0) - 1) && nbytes == 0;
+    }
+    [[nodiscard]] bool is_verified_absent() const noexcept {
+        return offset == (~std::uint64_t(0) - 2) && nbytes == 0;
+    }
+    [[nodiscard]] bool has_data() const noexcept {
+        return !is_missing() && !is_empty() && !is_verified_absent();
     }
 };
 
@@ -831,6 +842,13 @@ inline std::string serialize_zarray(const ZarrMetadata& meta) {
     // compressor
     if (meta.compressor_id.empty()) {
         s += "  \"compressor\": null,\n";
+    } else if (meta.compressor_id == "blosc") {
+        s += "  \"compressor\": {\"id\": \"blosc\"";
+        s += ", \"cname\": \"" + meta.blosc_cname + "\"";
+        s += ", \"clevel\": " + std::to_string(meta.compression_level);
+        s += ", \"shuffle\": " + std::to_string(meta.blosc_shuffle);
+        s += ", \"blocksize\": " + std::to_string(meta.blosc_blocksize);
+        s += "},\n";
     } else {
         s += "  \"compressor\": {\"id\": \"" + meta.compressor_id + "\"";
         s += ", \"clevel\": " + std::to_string(meta.compression_level);
@@ -1284,11 +1302,13 @@ public:
         write_chunk_raw(shard_indices, shard_data);
     }
 
-    /// Append a single chunk to its shard file. Index at start (fixed 8KB header).
-    /// Two tiny writes: (1) append chunk data at EOF, (2) update 16-byte index entry.
-    /// Creates shard with empty index if it doesn't exist.
-    void write_inner_chunk_to_shard(std::span<const std::size_t> chunk_indices,
-                                    std::span<const std::byte> data) {
+    /// Append a single chunk to its shard file. Returns true on success;
+    /// false if the chunk could not be written durably (open/write/fsync
+    /// failure, ENOSPC, EIO, etc.). On false, the index entry is left
+    /// untouched so the shard stays internally consistent.
+    [[nodiscard]] bool write_inner_chunk_to_shard(
+        std::span<const std::size_t> chunk_indices,
+        std::span<const std::byte> data) {
         if (!is_sharded())
             throw std::runtime_error("zarr: not a sharded array");
 
@@ -1333,71 +1353,83 @@ public:
                          static_cast<std::streamsize>(index_size));
         }
 
-        // Open for random read/write
+#if defined(_WIN32)
         std::fstream f(p, std::ios::binary | std::ios::in | std::ios::out);
-        if (!f) return;
-
-        // 1. Seek to EOF, round up to next 4k boundary, append chunk data.
-        //    Padding bytes (if any) are left uninitialised — ext4 zero-fills
-        //    them on sparse extension, and readers never look at them.
+        if (!f) return false;
         f.seekp(0, std::ios::end);
         auto eof_offset = static_cast<std::uint64_t>(f.tellp());
         auto chunk_offset = (eof_offset + kShardChunkAlign - 1)
                           & ~(kShardChunkAlign - 1);
-        if (chunk_offset != eof_offset) {
+        if (chunk_offset != eof_offset)
             f.seekp(static_cast<std::streamoff>(chunk_offset));
-        }
         f.write(reinterpret_cast<const char*>(data.data()),
                 static_cast<std::streamsize>(data.size()));
-
-        // 2. Seek to index entry, write 16 bytes (offset + nbytes)
+        if (!f) return false;
         auto nbytes = static_cast<std::uint64_t>(data.size());
+        std::byte ent[16];
+        detail::write_le64(ent,     chunk_offset);
+        detail::write_le64(ent + 8, nbytes);
         f.seekp(static_cast<std::streamoff>(linear * 16));
-        f.write(reinterpret_cast<const char*>(&chunk_offset), 8);
-        f.write(reinterpret_cast<const char*>(&nbytes), 8);
+        f.write(reinterpret_cast<const char*>(ent), 16);
         f.flush();
-    }
+        return f.good();
+#else
+        const int fd = ::open(p.c_str(), O_WRONLY | O_CLOEXEC);
+        if (fd < 0) return false;
+        struct FdGuard {
+            int fd;
+            ~FdGuard() { if (fd >= 0) ::close(fd); }
+        } fdg{fd};
 
-    /// Check if an inner chunk exists. Reads only the 16-byte index entry.
-    [[nodiscard]] bool inner_chunk_exists(std::span<const std::size_t> chunk_indices) const {
-        if (!is_sharded()) return false;
-        const auto ndim = meta_.ndim();
+        const off_t cur_end = ::lseek(fd, 0, SEEK_END);
+        if (cur_end < 0) return false;
+        const std::uint64_t eof_offset = static_cast<std::uint64_t>(cur_end);
+        const std::uint64_t chunk_offset =
+            (eof_offset + kShardChunkAlign - 1) & ~(kShardChunkAlign - 1);
 
-        std::vector<std::size_t> shard_idx(ndim);
-        std::vector<std::size_t> inner_idx(ndim);
-        for (std::size_t d = 0; d < ndim; ++d) {
-            auto ips = meta_.sub_chunks_per_shard(d);
-            shard_idx[d] = chunk_indices[d] / ips;
-            inner_idx[d] = chunk_indices[d] % ips;
+        const char* dp = reinterpret_cast<const char*>(data.data());
+        std::size_t remaining = data.size();
+        std::uint64_t off = chunk_offset;
+        while (remaining > 0) {
+            ssize_t n = ::pwrite(fd, dp, remaining, static_cast<off_t>(off));
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return false;
+            }
+            dp += n;
+            off += static_cast<std::uint64_t>(n);
+            remaining -= static_cast<std::size_t>(n);
         }
 
-        std::size_t linear = 0;
-        std::size_t stride = 1;
-        for (std::size_t d = ndim; d-- > 0;) {
-            linear += inner_idx[d] * stride;
-            stride *= meta_.sub_chunks_per_shard(d);
+        if (::fdatasync(fd) != 0) return false;
+
+        const std::uint64_t nbytes = data.size();
+        std::byte ent[16];
+        detail::write_le64(ent,     chunk_offset);
+        detail::write_le64(ent + 8, nbytes);
+        const off_t idx_off = static_cast<off_t>(linear * 16);
+        std::size_t left = 16;
+        const char* ep = reinterpret_cast<const char*>(ent);
+        off_t io = idx_off;
+        while (left > 0) {
+            ssize_t n = ::pwrite(fd, ep, left, io);
+            if (n < 0) {
+                if (errno == EINTR) continue;
+                return false;
+            }
+            ep += n;
+            io += n;
+            left -= static_cast<std::size_t>(n);
         }
-
-        auto p = root_ / chunk_key(shard_idx);
-        std::ifstream f(p, std::ios::binary);
-        if (!f) return false;
-
-        f.seekg(static_cast<std::streamoff>(linear * 16));
-        std::uint64_t offset = 0, nbytes = 0;
-        f.read(reinterpret_cast<char*>(&offset), 8);
-        f.read(reinterpret_cast<char*>(&nbytes), 8);
-        if (!f) return false;
-        // Not present: (0xFF..FF, 0xFF..FF). Empty/zero: (0xFF..FE, 0).
-        if (offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0)) return false;
-        if (offset == (~std::uint64_t(0) - 1) && nbytes == 0) return false;
+        if (::fdatasync(fd) != 0) return false;
         return true;
+#endif
     }
 
-    /// Check if an inner chunk is marked as known-empty (zero data).
-    [[nodiscard]] bool inner_chunk_is_empty(std::span<const std::size_t> chunk_indices) const {
-        if (!is_sharded()) return false;
+    [[nodiscard]] std::optional<detail::ShardIndexEntry>
+    read_inner_chunk_entry(std::span<const std::size_t> chunk_indices) const {
+        if (!is_sharded()) return std::nullopt;
         const auto ndim = meta_.ndim();
-
         std::vector<std::size_t> shard_idx(ndim);
         std::vector<std::size_t> inner_idx(ndim);
         for (std::size_t d = 0; d < ndim; ++d) {
@@ -1405,28 +1437,51 @@ public:
             shard_idx[d] = chunk_indices[d] / ips;
             inner_idx[d] = chunk_indices[d] % ips;
         }
-
         std::size_t linear = 0;
         std::size_t stride = 1;
         for (std::size_t d = ndim; d-- > 0;) {
             linear += inner_idx[d] * stride;
             stride *= meta_.sub_chunks_per_shard(d);
         }
-
         auto p = root_ / chunk_key(shard_idx);
         std::ifstream f(p, std::ios::binary);
-        if (!f) return false;
-
+        if (!f) return std::nullopt;
         f.seekg(static_cast<std::streamoff>(linear * 16));
-        std::uint64_t offset = 0, nbytes = 0;
-        f.read(reinterpret_cast<char*>(&offset), 8);
-        f.read(reinterpret_cast<char*>(&nbytes), 8);
-        if (!f) return false;
-        return (offset == (~std::uint64_t(0) - 1) && nbytes == 0);
+        detail::ShardIndexEntry e;
+        std::byte buf[16];
+        f.read(reinterpret_cast<char*>(buf), 16);
+        if (!f) return std::nullopt;
+        e.offset = detail::read_le64(buf);
+        e.nbytes = detail::read_le64(buf + 8);
+        return e;
     }
 
-    /// Mark an inner chunk as known-empty (zero data). Writes sentinel to index.
+    [[nodiscard]] bool inner_chunk_exists(std::span<const std::size_t> chunk_indices) const {
+        auto e = read_inner_chunk_entry(chunk_indices);
+        return e && e->has_data();
+    }
+    [[nodiscard]] bool inner_chunk_is_empty(std::span<const std::size_t> chunk_indices) const {
+        auto e = read_inner_chunk_entry(chunk_indices);
+        return e && e->is_empty();
+    }
+    [[nodiscard]] bool inner_chunk_is_verified_absent(
+        std::span<const std::size_t> chunk_indices) const {
+        auto e = read_inner_chunk_entry(chunk_indices);
+        return e && e->is_verified_absent();
+    }
+
     void mark_inner_chunk_empty(std::span<const std::size_t> chunk_indices) {
+        write_inner_chunk_sentinel_if_safe(chunk_indices, ~std::uint64_t(0) - 1, 0);
+    }
+    void mark_inner_chunk_verified_absent(std::span<const std::size_t> chunk_indices) {
+        write_inner_chunk_sentinel_if_safe(chunk_indices, ~std::uint64_t(0) - 2, 0);
+    }
+
+private:
+    void write_inner_chunk_sentinel_if_safe(
+        std::span<const std::size_t> chunk_indices,
+        std::uint64_t sentinel_offset,
+        std::uint64_t sentinel_nbytes) {
         if (!is_sharded())
             throw std::runtime_error("zarr: not a sharded array");
 
@@ -1453,6 +1508,7 @@ public:
         auto p = root_ / key;
         std::filesystem::create_directories(p.parent_path());
 
+        std::lock_guard lock(shard_mutex_for(p));
         if (!std::filesystem::exists(p)) {
             std::ofstream create(p, std::ios::binary);
             std::vector<std::byte> empty_index(index_size);
@@ -1461,18 +1517,28 @@ public:
                          static_cast<std::streamsize>(index_size));
         }
 
-        std::lock_guard lock(shard_mutex_for(p));
         std::fstream f(p, std::ios::binary | std::ios::in | std::ios::out);
         if (!f) return;
 
-        // Write empty sentinel: (0xFF..FE, 0)
-        std::uint64_t sentinel_offset = ~std::uint64_t(0) - 1;
-        std::uint64_t sentinel_nbytes = 0;
+        f.seekg(static_cast<std::streamoff>(linear * 16));
+        std::byte buf[16];
+        f.read(reinterpret_cast<char*>(buf), 16);
+        if (!f) return;
+        detail::ShardIndexEntry cur;
+        cur.offset = detail::read_le64(buf);
+        cur.nbytes = detail::read_le64(buf + 8);
+        if (!cur.is_missing()) return;
+
+        f.clear();
         f.seekp(static_cast<std::streamoff>(linear * 16));
-        f.write(reinterpret_cast<const char*>(&sentinel_offset), 8);
-        f.write(reinterpret_cast<const char*>(&sentinel_nbytes), 8);
+        std::byte out[16];
+        detail::write_le64(out, sentinel_offset);
+        detail::write_le64(out + 8, sentinel_nbytes);
+        f.write(reinterpret_cast<const char*>(out), 16);
         f.flush();
     }
+
+public:
 
     /// Write a shard file whose index marks every inner chunk as empty.
     /// Used to record "this shard is known empty" without a remote round-trip.
@@ -1635,17 +1701,30 @@ public:
 
         // Read 16-byte index entry at position linear*16
         f.seekg(static_cast<std::streamoff>(linear * 16));
-        std::uint64_t offset = 0, nbytes = 0;
-        f.read(reinterpret_cast<char*>(&offset), 8);
-        f.read(reinterpret_cast<char*>(&nbytes), 8);
+        std::byte entry_buf[16];
+        f.read(reinterpret_cast<char*>(entry_buf), 16);
         if (!f) return std::nullopt;
-        if (offset == ~std::uint64_t(0) && nbytes == ~std::uint64_t(0))
+        detail::ShardIndexEntry entry;
+        entry.offset = detail::read_le64(entry_buf);
+        entry.nbytes = detail::read_le64(entry_buf + 8);
+        // No data: missing slot, zarr-spec empty, or VC verified-absent
+        // sentinel. has_data() is the single source of truth.
+        if (!entry.has_data()) return std::nullopt;
+
+        f.seekg(0, std::ios::end);
+        const auto end_pos = f.tellg();
+        if (end_pos < 0) return std::nullopt;
+        const std::uint64_t file_size = static_cast<std::uint64_t>(end_pos);
+        if (entry.offset > file_size
+            || entry.nbytes > file_size - entry.offset) {
             return std::nullopt;
+        }
 
         // Read chunk data
-        f.seekg(static_cast<std::streamoff>(offset));
-        std::vector<std::byte> data(nbytes);
-        f.read(reinterpret_cast<char*>(data.data()), static_cast<std::streamsize>(nbytes));
+        f.seekg(static_cast<std::streamoff>(entry.offset));
+        std::vector<std::byte> data(static_cast<std::size_t>(entry.nbytes));
+        f.read(reinterpret_cast<char*>(data.data()),
+               static_cast<std::streamsize>(entry.nbytes));
         if (!f) return std::nullopt;
         return data;
     }

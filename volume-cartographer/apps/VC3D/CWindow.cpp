@@ -5630,12 +5630,17 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
             _segmentationWidget->setEditingEnabled(false);
         }
 
-        // Handle approval mask when switching segments
+        if (auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf)) {
+            const cv::Vec3f volPos = quadSurf->coord({0, 0, 0});
+            if (volPos[0] >= 0 && volPos[1] >= 0 && volPos[2] >= 0) {
+                centerFocusAt(volPos, quadSurf->normal({0, 0, 0}), newSurfId);
+            }
+        }
+
         if (_segmentationModule) {
             _segmentationModule->onActiveSegmentChanged(surf.get());
         }
 
-        // Load corr_points_results for the new segment
         if (_point_collection_widget) {
             auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf);
             if (quadSurf && !quadSurf->path.empty()) {

@@ -72,6 +72,12 @@ ZarrMetadata parse_zarray(std::string_view json_str) {
                 meta.compressor_id = cid->get_string();
             if (auto* cl = json_find(*p, "clevel"); cl && cl->is_number())
                 meta.compression_level = cl->get_int();
+            if (auto* cn = json_find(*p, "cname"); cn && cn->is_string())
+                meta.blosc_cname = cn->get_string();
+            if (auto* sh = json_find(*p, "shuffle"); sh && sh->is_number())
+                meta.blosc_shuffle = sh->get_int();
+            if (auto* bs = json_find(*p, "blocksize"); bs && bs->is_number())
+                meta.blosc_blocksize = bs->get_int();
         }
     }
 
@@ -729,10 +735,12 @@ ZarrArray::extract_inner_chunk(std::span<const std::byte> shard_data,
         throw std::runtime_error("zarr: inner chunk index out of range");
 
     const auto& entry = index.entries[linear];
-    if (entry.is_missing()) return std::nullopt;
+    if (!entry.has_data()) return std::nullopt;
 
-    if (entry.offset + entry.nbytes > shard_data.size())
+    if (entry.offset > shard_data.size()
+        || entry.nbytes > shard_data.size() - entry.offset) {
         throw std::runtime_error("zarr: inner chunk offset/size exceeds shard data");
+    }
 
     std::vector<std::byte> chunk(
         shard_data.begin() + static_cast<std::ptrdiff_t>(entry.offset),

@@ -138,6 +138,10 @@ public:
         return evictionVersion_.load(std::memory_order_relaxed);
     }
 
+    void bumpEvictionVersion() noexcept {
+        evictionVersion_.fetch_add(1, std::memory_order_relaxed);
+    }
+
     [[nodiscard]] uint64_t generation() const noexcept;
     void clear();
 
@@ -181,61 +185,6 @@ private:
     // single global statBlockHits_.fetch_add on every get() hit cost ~12% of
     // total CPU under 12-thread render — the atomic traffic ping-ponged one
     // cacheline across all cores. Per-shard counters eliminate that.
-    //
-    // FastRwLock: single 64-bit atomic (reader count in low 32, writer bit
-    // in high bit). Each read_lock/unlock is ONE LSE atomic op (LDADDAL /
-    // LDADDL) — ~30-50 cycles uncontended vs. glibc pthread_rwlock which
-    // does several atomic ops per acquire for futex-wakeup bookkeeping.
-    // Under the 12-thread render workload the uncontended cost savings
-    // dominated: pthread_rwlock was ~44% of CPU on heavy composite
-    // frames; this cuts that to just the raw atomic RMW cost.
-    struct alignas(64) FastRwLock {
-        static constexpr uint64_t kWriterBit = 1ull << 32;
-        static constexpr uint64_t kReaderMask = 0xFFFFFFFFull;
-        mutable std::atomic<uint64_t> state{0};
-
-        void lock_shared() const noexcept {
-            uint64_t prev = state.fetch_add(1, std::memory_order_acquire);
-            if (!(prev & kWriterBit)) return;  // uncontended fast path
-            // Writer holds the lock — undo our reader and wait.
-            state.fetch_sub(1, std::memory_order_relaxed);
-            for (;;) {
-                while (state.load(std::memory_order_relaxed) & kWriterBit) {
-#if defined(__aarch64__)
-                    asm volatile("yield" ::: "memory");
-#endif
-                }
-                prev = state.fetch_add(1, std::memory_order_acquire);
-                if (!(prev & kWriterBit)) return;
-                state.fetch_sub(1, std::memory_order_relaxed);
-            }
-        }
-        void unlock_shared() const noexcept {
-            state.fetch_sub(1, std::memory_order_release);
-        }
-        void lock() noexcept {
-            // Set writer bit. Another writer may race; spin until we're
-            // the sole writer. Then wait for existing readers to drain.
-            for (;;) {
-                uint64_t prev = state.fetch_or(kWriterBit, std::memory_order_acquire);
-                if (!(prev & kWriterBit)) break;
-                while (state.load(std::memory_order_relaxed) & kWriterBit) {
-#if defined(__aarch64__)
-                    asm volatile("yield" ::: "memory");
-#endif
-                }
-            }
-            while ((state.load(std::memory_order_acquire) & kReaderMask) != 0) {
-#if defined(__aarch64__)
-                asm volatile("yield" ::: "memory");
-#endif
-            }
-        }
-        void unlock() noexcept {
-            state.fetch_and(~kWriterBit, std::memory_order_release);
-        }
-    };
-
     // Per-shard lock-free open-addressing hash table. Writers are still
     // serialized by arenaMutex_ (single writer globally), so the insert /
     // erase paths just atomic-store entries with release semantics.
@@ -297,10 +246,7 @@ private:
     // lock for map updates.
     mutable std::shared_mutex arenaMutex_;
 
-    // Pack BlockKey into 64 bits: [level:4][bz:20][by:20][bx:20]. Covers
-    // any realistic volume (2^20 blocks × 16 voxels = 16.7M voxels per axis)
-    // and all level ids we use. The all-ones pattern (UINT64_MAX) maps to
-    // kEmptyKey {-1,-1,-1,-1}, so it doubles as the "empty slot" sentinel.
+    static_assert(kMaxLevels <= 8, "level field is 4 bits signed; widen pack/unpack to grow");
     static uint64_t packBlockKey(const BlockKey& k) noexcept {
         return (uint64_t(uint32_t(k.level) & 0xFu)     << 60)
              | (uint64_t(uint32_t(k.bz)    & 0xFFFFFu) << 40)
@@ -327,7 +273,8 @@ private:
     static uint32_t keyTag32(uint64_t packed) noexcept {
         uint64_t h = packed * 0x9E3779B97F4A7C15ULL;
         h ^= h >> 32;
-        return uint32_t(h);
+        uint32_t r = uint32_t(h);
+        return r == 0 ? 1u : r;
     }
     static size_t l2Index(uint64_t packed, size_t bits) noexcept {
         uint64_t h = packed * 0xBF58476D1CE4E5B9ULL;

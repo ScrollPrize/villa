@@ -29,24 +29,16 @@ static std::optional<std::vector<std::byte>> zarrReadChunk(
     return zarr.read_inner_chunk_from_shard(chunkIndices(key));
 }
 
-static void zarrWriteChunk(
+[[nodiscard]] static bool zarrWriteChunk(
     utils::ZarrArray& zarr, const ChunkKey& key,
     const uint8_t* data, size_t size) {
     std::span<const std::byte> bytes(reinterpret_cast<const std::byte*>(data), size);
-    zarr.write_inner_chunk_to_shard(chunkIndices(key), bytes);
+    return zarr.write_inner_chunk_to_shard(chunkIndices(key), bytes);
 }
 
-static bool isAllZero(const uint8_t* data, size_t size) noexcept {
-    const auto* p = reinterpret_cast<const uint64_t*>(data);
-    size_t n8 = size / 8;
-    for (size_t i = 0; i < n8; i++) if (p[i] != 0) return false;
-    for (size_t i = n8 * 8; i < size; i++) if (data[i] != 0) return false;
-    return true;
-}
-
-static bool diskShardMarksChunkEmpty(utils::ZarrArray& dz, const ChunkKey& key) {
+static bool diskShardMarksChunkAbsent(utils::ZarrArray& dz, const ChunkKey& key) {
     if (!dz.is_sharded()) return false;
-    return dz.inner_chunk_is_empty(chunkIndices(key));
+    return dz.inner_chunk_is_verified_absent(chunkIndices(key));
 }
 
 BlockPipeline::FetchVerdict BlockPipeline::classifyFetch(
@@ -58,23 +50,30 @@ BlockPipeline::FetchVerdict BlockPipeline::classifyFetch(
 {
     if (fetchThrew) return FetchVerdict::Transient;
     if (sourceHadTransientError) return FetchVerdict::Transient;
-    if (!bytes.empty()) {
-        if (isAllZero(bytes.data(), bytes.size())) return FetchVerdict::EmptyConfirmed;
-        return FetchVerdict::HasData;
-    }
+    if (!bytes.empty()) return FetchVerdict::HasData;
     if (sourceConfirmsAbsent && authProven) return FetchVerdict::EmptyConfirmed;
     return FetchVerdict::Transient;
 }
 
 void BlockPipeline::markChunkAbsent(const ChunkKey& key, utils::ZarrArray* dz)
 {
+    static std::atomic<uint64_t> markCount{0};
+    uint64_t n = markCount.fetch_add(1);
+    if (n < 50 || (n & 0xFF) == 0) {
+        std::fprintf(stderr,
+            "[markChunkAbsent #%lu] L%d %d/%d/%d (authProven=%d)\n",
+            (unsigned long)n, key.level, key.iz, key.iy, key.ix,
+            int(config_.authProven));
+    }
     bloomAdd(key);
     {
         std::lock_guard lock(negativeMutex_);
         negativeCache_.insert(key);
     }
+    addEmptyChunk(key);
+    blockCache_.bumpEvictionVersion();
     if (dz && dz->is_sharded()) {
-        dz->mark_inner_chunk_empty(chunkIndices(key));
+        dz->mark_inner_chunk_verified_absent(chunkIndices(key));
     }
 }
 
@@ -202,7 +201,7 @@ const utils::ShardBytes* BlockPipeline::shardBytesFor(
                 std::lock_guard lk(self->inflightShardMutex_);
                 --self->inflightShardReads_;
             }
-            self->inflightShardCv_.notify_one();
+            self->inflightShardCv_.notify_all();
         }
     } guard{this};
     auto raw = dz.read_whole_shard(chunkIndices(key));
@@ -373,7 +372,7 @@ BlockPipeline::BlockPipeline(
         auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
         if (!dz || !source_) return {};
 
-        if (diskShardMarksChunkEmpty(*dz, key)) {
+        if (diskShardMarksChunkAbsent(*dz, key)) {
             markChunkAbsent(key, dz);
             return {};
         }
@@ -457,12 +456,17 @@ BlockPipeline::BlockPipeline(
             decoded = std::move(it->second);
             encodeStaging_.erase(it);
         }
-        encodeStagingCv_.notify_one();
+        encodeStagingCv_.notify_all();
         if (!decoded) return {};
 
         const auto& encoded = encodeCanonicalChunk(*decoded, config_);
-        zarrWriteChunk(*dz, key,
-            reinterpret_cast<const uint8_t*>(encoded.data()), encoded.size());
+        if (!zarrWriteChunk(*dz, key,
+            reinterpret_cast<const uint8_t*>(encoded.data()), encoded.size())) {
+            std::fprintf(stderr,
+                "[BlockPipeline] disk write failed for L%d %d/%d/%d (likely ENOSPC)\n",
+                key.level, key.iz, key.iy, key.ix);
+            return {};
+        }
         statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
         statDiskBytes_.fetch_add(encoded.size(), std::memory_order_relaxed);
         if (dz->is_sharded()) {
@@ -509,7 +513,7 @@ BlockPipeline::BlockPipeline(
         std::vector<uint8_t> compressed;
 
         if (dz) {
-            if (diskShardMarksChunkEmpty(*dz, key)) {
+            if (diskShardMarksChunkAbsent(*dz, key)) {
                 markChunkAbsent(key, dz);
                 return {};
             }
@@ -537,17 +541,17 @@ BlockPipeline::BlockPipeline(
             }
         } else if (source_) {
             bool threw = false;
-            try { compressed = source_->fetch(key); } catch (...) { threw = true; }
+            FetchResult fr;
+            try { fr = source_->fetch(key); } catch (...) { threw = true; }
             const auto verdict = classifyFetch(
-                compressed, threw,
-                source_->lastFetchConfirmsAbsent(),
-                vc::cache::HttpSource::lastFetchHadTransientError(),
+                fr.bytes, threw, fr.wasAbsent, fr.transientError,
                 config_.authProven);
             if (verdict == FetchVerdict::EmptyConfirmed) {
                 markChunkAbsent(key, dz);
                 return {};
             }
             if (verdict == FetchVerdict::Transient) return {};
+            compressed = std::move(fr.bytes);
             statColdHits_.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -620,7 +624,7 @@ BlockPipeline::BlockPipeline(
         }
         decodeStagingBytesAtomic_.fetch_sub(compressed.size(),
                                             std::memory_order_relaxed);
-        decodeStagingCv_.notify_one();
+        decodeStagingCv_.notify_all();
         if (compressed.empty()) return {};
 
         ChunkDataPtr decoded;
@@ -692,19 +696,17 @@ BlockPipeline::BlockPipeline(
                 auto* dz = (key.level < int(diskLevels_.size()))
                     ? diskLevels_[key.level].get() : nullptr;
                 if (!dz || !source_) return {};
-                if (diskShardMarksChunkEmpty(*dz, key)) {
+                if (diskShardMarksChunkAbsent(*dz, key)) {
                     markChunkAbsent(key, dz);
                     return {};
                 }
 
-                std::vector<uint8_t> bytes;
                 bool threw = false;
-                try { bytes = source_->fetch(key); }
+                FetchResult fr;
+                try { fr = source_->fetch(key); }
                 catch (...) { threw = true; }
                 const auto verdict = classifyFetch(
-                    bytes, threw,
-                    source_->lastFetchConfirmsAbsent(),
-                    vc::cache::HttpSource::lastFetchHadTransientError(),
+                    fr.bytes, threw, fr.wasAbsent, fr.transientError,
                     config_.authProven);
                 if (verdict == FetchVerdict::EmptyConfirmed) {
                     markChunkAbsent(key, dz);
@@ -712,10 +714,16 @@ BlockPipeline::BlockPipeline(
                 }
                 if (verdict == FetchVerdict::Transient) return {};
 
+                std::vector<uint8_t> bytes = std::move(fr.bytes);
                 if (!bytesAreCanonical(bytes)) return {};
 
                 statIceFetches_.fetch_add(1, std::memory_order_relaxed);
-                zarrWriteChunk(*dz, key, bytes.data(), bytes.size());
+                if (!zarrWriteChunk(*dz, key, bytes.data(), bytes.size())) {
+                    std::fprintf(stderr,
+                        "[BlockPipeline] passthrough disk write failed for L%d %d/%d/%d\n",
+                        key.level, key.iz, key.iy, key.ix);
+                    return {};
+                }
                 statDiskWrites_.fetch_add(1, std::memory_order_relaxed);
                 statDiskBytes_.fetch_add(bytes.size(), std::memory_order_relaxed);
                 if (dz->is_sharded()) {
@@ -804,17 +812,27 @@ BlockPipeline::~BlockPipeline() {
     fprintf(stderr, "[BlockPipeline] destructor %p: done\n", (void*)this);
 }
 
+static inline std::pair<uint64_t, uint64_t> bloomHashes(uint64_t h) noexcept {
+    uint64_t h1 = h;
+    h1 = (h1 ^ (h1 >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    h1 = (h1 ^ (h1 >> 27)) * 0x94D049BB133111EBULL;
+    h1 ^= h1 >> 31;
+    uint64_t h2 = h + 0x9E3779B97F4A7C15ULL;
+    h2 = (h2 ^ (h2 >> 30)) * 0xBF58476D1CE4E5B9ULL;
+    h2 = (h2 ^ (h2 >> 27)) * 0x94D049BB133111EBULL;
+    h2 ^= h2 >> 31;
+    return {h1, h2};
+}
+
 void BlockPipeline::bloomAdd(const ChunkKey& key) noexcept {
-    auto h = ChunkKeyHash{}(key);
-    uint64_t h1 = h, h2 = h * 0x9E3779B97F4A7C15ULL;
+    auto [h1, h2] = bloomHashes(ChunkKeyHash{}(key));
     size_t i1 = h1 % kBloomBits, i2 = h2 % kBloomBits;
     negativeBloom_[i1 / 64].fetch_or(1ULL << (i1 % 64), std::memory_order_relaxed);
     negativeBloom_[i2 / 64].fetch_or(1ULL << (i2 % 64), std::memory_order_relaxed);
 }
 
 bool BlockPipeline::bloomMayContain(const ChunkKey& key) const noexcept {
-    auto h = ChunkKeyHash{}(key);
-    uint64_t h1 = h, h2 = h * 0x9E3779B97F4A7C15ULL;
+    auto [h1, h2] = bloomHashes(ChunkKeyHash{}(key));
     size_t i1 = h1 % kBloomBits, i2 = h2 % kBloomBits;
     auto b1 = negativeBloom_[i1 / 64].load(std::memory_order_relaxed) & (1ULL << (i1 % 64));
     auto b2 = negativeBloom_[i2 / 64].load(std::memory_order_relaxed) & (1ULL << (i2 % 64));
@@ -990,6 +1008,14 @@ ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey,
     if (!source_ || !decompress_) return nullptr;
     const int C = kCanonicalChunkSide;
     auto scs = source_->chunkShape(canonKey.level);
+    static std::atomic<uint64_t> dbgN{0};
+    uint64_t dn = dbgN.fetch_add(1);
+    if (dn < 3) {
+        std::fprintf(stderr,
+            "[assembleCanonical] L%d canon=(%d,%d,%d) C=%d srcChunkShape=(%d,%d,%d)\n",
+            canonKey.level, canonKey.iz, canonKey.iy, canonKey.ix,
+            C, scs[0], scs[1], scs[2]);
+    }
     if (scs[0] <= 0 || scs[1] <= 0 || scs[2] <= 0) return nullptr;
 
     int cz0 = canonKey.iz * C, cy0 = canonKey.iy * C, cx0 = canonKey.ix * C;
@@ -1011,17 +1037,16 @@ ChunkDataPtr BlockPipeline::assembleCanonicalChunk(const ChunkKey& canonKey,
     for (int siy = sy0; siy < sy1; ++siy)
     for (int six = sx0; six < sx1; ++six) {
         ChunkKey srcKey{canonKey.level, siz, siy, six};
-        std::vector<uint8_t> compressed;
         bool threw = false;
-        try { compressed = source_->fetch(srcKey); }
+        FetchResult fr;
+        try { fr = source_->fetch(srcKey); }
         catch (...) { threw = true; }
         const auto verdict = classifyFetch(
-            compressed, threw,
-            source_->lastFetchConfirmsAbsent(),
-            vc::cache::HttpSource::lastFetchHadTransientError(),
+            fr.bytes, threw, fr.wasAbsent, fr.transientError,
             config_.authProven);
         if (verdict == FetchVerdict::Transient) { anyTransient = true; continue; }
         if (verdict == FetchVerdict::EmptyConfirmed) { anyZeroFill = true; continue; }
+        std::vector<uint8_t> compressed = std::move(fr.bytes);
         auto data = decompress_(compressed, srcKey);
         if (!data) {
             anyDecompressFail = true;
@@ -1161,7 +1186,16 @@ void BlockPipeline::clearAll() {
     {
         std::lock_guard lk(decodeStagingMutex_);
         decodeStaging_.clear();
+        decodeStagingBytesAtomic_.store(0, std::memory_order_relaxed);
     }
+    {
+        std::lock_guard lk(inflightShardMutex_);
+        inflightShardReads_ = 0;
+    }
+    inflightShardBytes_.store(0, std::memory_order_relaxed);
+    encodeStagingCv_.notify_all();
+    decodeStagingCv_.notify_all();
+    inflightShardCv_.notify_all();
     for (auto& bucket : shardCacheBuckets_) {
         std::lock_guard lk(bucket.mutex);
         bucket.lru.clear();
@@ -1172,6 +1206,14 @@ void BlockPipeline::clearAll() {
     blockCache_.clear();
     clearEmptyChunks();
     bloomClear();
+    statColdHits_.store(0, std::memory_order_relaxed);
+    statIceFetches_.store(0, std::memory_order_relaxed);
+    statMisses_.store(0, std::memory_order_relaxed);
+    statEmptyHits_.store(0, std::memory_order_relaxed);
+    statDiskWrites_.store(0, std::memory_order_relaxed);
+    statDiskBytes_.store(0, std::memory_order_relaxed);
+    statShardHits_.store(0, std::memory_order_relaxed);
+    statShardMisses_.store(0, std::memory_order_relaxed);
     std::lock_guard lock(negativeMutex_);
     negativeCache_.clear();
 }
@@ -1389,7 +1431,6 @@ auto BlockPipeline::stats() const -> Stats {
         std::lock_guard lock(negativeMutex_);
         s.negativeCount = negativeCache_.size();
     }
-    s.totalSubmitted = statTotalSubmitted_.load(std::memory_order_relaxed);
     s.diskBytes = initialDiskBytes_
                 + statDiskBytes_.load(std::memory_order_relaxed);
     {

@@ -210,32 +210,18 @@ private:
         }
     };
 
-    // -- read helpers (batched stat updates to reduce atomic contention) ----
     void recordMiss() const noexcept
     {
-        thread_local int missCount = 0;
-        if (++missCount >= 256) {
-            misses_.fetch_add(256, std::memory_order_relaxed);
-            missCount = 0;
-        }
+        misses_.fetch_add(1, std::memory_order_relaxed);
     }
 
     void recordHit(const Entry& entry) const noexcept
     {
         if (config_.promote_on_read) {
-            thread_local uint64_t localGen = 0;
-            if (++localGen >= 64) {
-                entry.generation.store(generation_.fetch_add(localGen, std::memory_order_relaxed), std::memory_order_relaxed);
-                localGen = 0;
-            } else {
-                entry.generation.store(generation_.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            }
+            entry.generation.store(generation_.load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
         }
-        thread_local int hitCount = 0;
-        if (++hitCount >= 256) {
-            hits_.fetch_add(256, std::memory_order_relaxed);
-            hitCount = 0;
-        }
+        hits_.fetch_add(1, std::memory_order_relaxed);
     }
 
     // -- size computation ---------------------------------------------------

@@ -230,6 +230,12 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
 
     POI* focus = _state->poi("focus");
     cv::Vec3f origin = focus ? focus->p : cv::Vec3f(0, 0, 0);
+    if (!focus) {
+        if (auto vol = _state->currentVolume()) {
+            auto [w, h, d] = vol->shape();
+            origin = cv::Vec3f((w - 1) * 0.5f, (h - 1) * 0.5f, (d - 1) * 0.5f);
+        }
+    }
 
     auto xyNormalFromTilt = [this]() {
         const double tiltLen = _enabled ? std::min(1.0, std::hypot(_xyTilt.x(), _xyTilt.y())) : 0.0;

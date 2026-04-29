@@ -53,25 +53,15 @@ TEST_CASE("composite_alpha fully transparent") {
 }
 
 TEST_CASE("composite_alpha basic") {
-    // Single layer with value 127.5 (half of 255) mapped linearly from [0,1]
-    // The function normalizes by dividing by 255*range, so use 255-scale values.
     std::vector<float> layers = {127.5f};
-    float result = composite_alpha(layers, 0.0f, 1.0f);
-    // normalized = 127.5 / (255*1) - 0 = 0.5
-    // alpha = 0.5, value_acc = (1-0)*0.5 * 0.5 = 0.25
-    // result = 0.25 * 255 = 63.75
-    CHECK_NEAR(result, 63.75f, 1e-3);
+    float result = composite_alpha(layers, 0.0f, 255.0f);
+    CHECK_NEAR(result * 255.0f, 63.75f, 1e-3);
 }
 
 TEST_CASE("composite_alpha opaque layer") {
-    // Layer with value 255 at alpha_max -> fully opaque
     std::vector<float> layers = {255.0f, 127.5f};
-    float result = composite_alpha(layers, 0.0f, 1.0f);
-    // First layer: normalized = 255/(255*1) = 1.0, opacity=1, weight=1*1=1
-    //   value_acc = 1*1 = 1, alpha = 1
-    // Second layer: alpha >= cutoff (1.0), break
-    // result = 1.0 * 255 = 255
-    CHECK_NEAR(result, 255.0f, 1e-3);
+    float result = composite_alpha(layers, 0.0f, 255.0f);
+    CHECK_NEAR(result * 255.0f, 255.0f, 1e-3);
 }
 
 // ---- composite_beer_lambert ------------------------------------------------

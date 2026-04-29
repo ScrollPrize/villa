@@ -149,6 +149,13 @@ public:
 
     [[nodiscard]] bool isNegativeCached(const ChunkKey& key) const;
 
+    enum class FetchVerdict { HasData, EmptyConfirmed, Transient };
+    static FetchVerdict classifyFetch(const std::vector<uint8_t>& bytes,
+                                       bool fetchThrew,
+                                       bool sourceConfirmsAbsent,
+                                       bool sourceHadTransientError,
+                                       bool authProven);
+
     // Counts how many of the given chunks are either already decoded
     // (first block in block cache) or known-empty.
     [[nodiscard]] size_t countAvailable(const std::vector<ChunkKey>& keys) const;
@@ -191,7 +198,6 @@ public:
         size_t negativeCount = 0;
         size_t diskBytes = 0;
         size_t diskShards = 0;
-        uint64_t totalSubmitted = 0;
         bool sharded = false;
     };
 
@@ -397,12 +403,6 @@ private:
     mutable std::mutex negativeMutex_;
     std::unordered_set<ChunkKey, ChunkKeyHash> negativeCache_;
 
-    enum class FetchVerdict { HasData, EmptyConfirmed, Transient };
-    static FetchVerdict classifyFetch(const std::vector<uint8_t>& bytes,
-                                       bool fetchThrew,
-                                       bool sourceConfirmsAbsent,
-                                       bool sourceHadTransientError,
-                                       bool authProven);
     void markChunkAbsent(const ChunkKey& key, utils::ZarrArray* dz);
 
     mutable std::mutex callbackMutex_;
@@ -436,7 +436,6 @@ private:
     std::atomic<uint64_t> statColdHits_{0};
     std::atomic<uint64_t> statIceFetches_{0};
     std::atomic<uint64_t> statDiskWrites_{0};
-    std::atomic<uint64_t> statTotalSubmitted_{0};
     // Cumulative bytes written to the canonical disk cache this session.
     std::atomic<uint64_t> statDiskBytes_{0};
     // Distinct shard files touched this session.

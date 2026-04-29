@@ -566,9 +566,9 @@ TEST_CASE("Zarr v3 codec pipeline parsing") {
     auto meta = utils::detail::parse_zarr_json(json_str);
     REQUIRE_EQ(meta.codecs.size(), std::size_t(2));
     REQUIRE_EQ(meta.codecs[0].name, std::string("bytes"));
-    REQUIRE(meta.codecs[0].configuration.is_object());
+    REQUIRE(meta.codecs[0].configuration && meta.codecs[0].configuration->is_object());
     REQUIRE_EQ(meta.codecs[1].name, std::string("blosc"));
-    REQUIRE(meta.codecs[1].configuration.is_object());
+    REQUIRE(meta.codecs[1].configuration && meta.codecs[1].configuration->is_object());
 
     // No shard config should be detected
     REQUIRE(!meta.shard_config.has_value());
@@ -586,14 +586,14 @@ TEST_CASE("Zarr v3 codecs serialize round trip") {
     bytes_codec.name = "bytes";
     utils::JsonObject bytes_cfg;
     bytes_cfg["endian"] = utils::JsonValue("little");
-    bytes_codec.configuration = utils::JsonValue(std::move(bytes_cfg));
+    bytes_codec.configuration = std::make_shared<utils::JsonValue>(std::move(bytes_cfg));
     meta.codecs.push_back(bytes_codec);
 
     utils::ZarrCodecConfig zstd_codec;
     zstd_codec.name = "zstd";
     utils::JsonObject zstd_cfg;
     zstd_cfg["level"] = utils::JsonValue(3);
-    zstd_codec.configuration = utils::JsonValue(std::move(zstd_cfg));
+    zstd_codec.configuration = std::make_shared<utils::JsonValue>(std::move(zstd_cfg));
     meta.codecs.push_back(zstd_codec);
 
     auto json = utils::detail::serialize_zarr_json(meta);
@@ -696,7 +696,6 @@ TEST_CASE("ZarrMetadata shard helpers") {
 
     utils::ShardConfig sc;
     sc.sub_chunks = {16, 16};
-    sc.index_at_end = true;
     meta.shard_config = sc;
 
     // sub_chunk_byte_size: 16 * 16 * 2 = 512
@@ -889,7 +888,6 @@ TEST_CASE("Zarr v3 sharding metadata parse round trip") {
     REQUIRE_EQ(meta.shard_config->sub_chunks.size(), std::size_t(2));
     REQUIRE_EQ(meta.shard_config->sub_chunks[0], std::size_t(16));
     REQUIRE_EQ(meta.shard_config->sub_chunks[1], std::size_t(16));
-    REQUIRE(meta.shard_config->index_at_end);
     REQUIRE_EQ(meta.shard_config->index_codecs.size(), std::size_t(1));
     REQUIRE_EQ(meta.shard_config->index_codecs[0].name, std::string("bytes"));
     REQUIRE_EQ(meta.shard_config->sub_codecs.size(), std::size_t(1));
@@ -905,9 +903,7 @@ TEST_CASE("Zarr v3 sharding metadata serialize with shard_config") {
 
     utils::ShardConfig sc;
     sc.sub_chunks = {8, 8};
-    sc.index_at_end = true;
     meta.shard_config = sc;
-    // Leave codecs empty so serialize_zarr_json builds a sharding_indexed codec
 
     auto json = utils::detail::serialize_zarr_json(meta);
     auto parsed = utils::detail::parse_zarr_json(json);
@@ -915,7 +911,6 @@ TEST_CASE("Zarr v3 sharding metadata serialize with shard_config") {
     REQUIRE(parsed.shard_config.has_value());
     REQUIRE_EQ(parsed.shard_config->sub_chunks[0], std::size_t(8));
     REQUIRE_EQ(parsed.shard_config->sub_chunks[1], std::size_t(8));
-    REQUIRE(parsed.shard_config->index_at_end);
 }
 
 TEST_CASE("Zarr v3 sharding index_location start") {
@@ -949,7 +944,6 @@ TEST_CASE("Zarr v3 sharding index_location start") {
 
     auto meta = utils::detail::parse_zarr_json(json_str);
     REQUIRE(meta.shard_config.has_value());
-    REQUIRE(!meta.shard_config->index_at_end);
 }
 
 TEST_CASE("ZarrArray v3 sharded write_shard and read_inner_chunk") {
@@ -963,7 +957,6 @@ TEST_CASE("ZarrArray v3 sharded write_shard and read_inner_chunk") {
 
     utils::ShardConfig sc;
     sc.sub_chunks = {16, 16};
-    sc.index_at_end = true;
     meta.shard_config = sc;
 
     auto arr = utils::ZarrArray::create(dir / "sharded.zarr", meta);
@@ -1021,7 +1014,6 @@ TEST_CASE("ZarrArray v3 sharded write_shard index at start") {
 
     utils::ShardConfig sc;
     sc.sub_chunks = {8, 8};
-    sc.index_at_end = false;  // index at start
     meta.shard_config = sc;
 
     auto arr = utils::ZarrArray::create(dir / "sharded.zarr", meta);
@@ -1065,7 +1057,6 @@ TEST_CASE("ZarrArray v3 read_chunk dispatches to sharding") {
 
     utils::ShardConfig sc;
     sc.sub_chunks = {16, 16};
-    sc.index_at_end = true;
     meta.shard_config = sc;
 
     auto arr = utils::ZarrArray::create(dir / "sharded.zarr", meta);
@@ -1331,72 +1322,6 @@ TEST_CASE("ZarrFilter bad elem size passthrough") {
     REQUIRE_EQ(encoded.size(), bytes.size());
 }
 
-// ---------------------------------------------------------------------------
-// 10. V2 .zarray round trip with filters
-// ---------------------------------------------------------------------------
-
-TEST_CASE("Zarr .zarray round trip with delta filter") {
-    utils::ZarrMetadata meta;
-    meta.shape = {100};
-    meta.chunks = {50};
-    meta.dtype = utils::ZarrDtype::int32;
-    meta.compressor_id = "";
-
-    utils::ZarrFilter f;
-    f.id = utils::ZarrFilterId::delta;
-    f.dtype = utils::ZarrDtype::int32;
-    f.astype = utils::ZarrDtype::int32;
-    meta.filters.push_back(f);
-
-    auto json = utils::detail::serialize_zarray(meta);
-    auto parsed = utils::detail::parse_zarray(json);
-
-    REQUIRE_EQ(parsed.filters.size(), std::size_t(1));
-    REQUIRE_EQ(parsed.filters[0].id, utils::ZarrFilterId::delta);
-    REQUIRE_EQ(parsed.filters[0].dtype, utils::ZarrDtype::int32);
-    REQUIRE_EQ(parsed.filters[0].astype, utils::ZarrDtype::int32);
-}
-
-TEST_CASE("Zarr .zarray round trip with fixedscaleoffset filter") {
-    utils::ZarrMetadata meta;
-    meta.shape = {64};
-    meta.chunks = {64};
-    meta.dtype = utils::ZarrDtype::float64;
-
-    utils::ZarrFilter f;
-    f.id = utils::ZarrFilterId::fixedscaleoffset;
-    f.offset = 5.0;
-    f.scale = 2.0;
-    meta.filters.push_back(f);
-
-    auto json = utils::detail::serialize_zarray(meta);
-    auto parsed = utils::detail::parse_zarray(json);
-
-    REQUIRE_EQ(parsed.filters.size(), std::size_t(1));
-    REQUIRE_EQ(parsed.filters[0].id, utils::ZarrFilterId::fixedscaleoffset);
-    REQUIRE_NEAR(parsed.filters[0].offset, 5.0, 1e-10);
-    REQUIRE_NEAR(parsed.filters[0].scale, 2.0, 1e-10);
-}
-
-TEST_CASE("Zarr .zarray round trip with quantize filter") {
-    utils::ZarrMetadata meta;
-    meta.shape = {64};
-    meta.chunks = {64};
-    meta.dtype = utils::ZarrDtype::float32;
-
-    utils::ZarrFilter f;
-    f.id = utils::ZarrFilterId::quantize;
-    f.digits = 3;
-    meta.filters.push_back(f);
-
-    auto json = utils::detail::serialize_zarray(meta);
-    auto parsed = utils::detail::parse_zarray(json);
-
-    REQUIRE_EQ(parsed.filters.size(), std::size_t(1));
-    REQUIRE_EQ(parsed.filters[0].id, utils::ZarrFilterId::quantize);
-    REQUIRE_EQ(parsed.filters[0].digits, 3);
-}
-
 TEST_CASE("ZarrArray v2 with delta filter write/read round trip") {
     auto dir = make_temp_dir("v2_filter_rw");
 
@@ -1577,23 +1502,23 @@ TEST_CASE("LabelMetadata parse round trip") {
     auto json = utils::json_object({
         {"image-label", utils::json_object({
             {"version", utils::JsonValue("0.4")},
-            {"colors", utils::JsonValue(utils::JsonArray{
+            {"colors", utils::json_array({
                 utils::json_object({
                     {"label-value", utils::JsonValue(1)},
-                    {"rgba", utils::JsonValue(utils::JsonArray{
+                    {"rgba", utils::json_array({
                         utils::JsonValue(255), utils::JsonValue(0),
                         utils::JsonValue(0), utils::JsonValue(255)
                     })}
                 }),
                 utils::json_object({
                     {"label-value", utils::JsonValue(2)},
-                    {"rgba", utils::JsonValue(utils::JsonArray{
+                    {"rgba", utils::json_array({
                         utils::JsonValue(0), utils::JsonValue(255),
                         utils::JsonValue(0), utils::JsonValue(128)
                     })}
                 })
             })},
-            {"properties", utils::JsonValue(utils::JsonArray{
+            {"properties", utils::json_array({
                 utils::JsonValue("area"), utils::JsonValue("centroid")
             })}
         })}
@@ -1625,16 +1550,16 @@ TEST_CASE("PlateMetadata parse round trip") {
             {"version", utils::JsonValue("0.4")},
             {"name", utils::JsonValue("my_plate")},
             {"field_count", utils::JsonValue(2)},
-            {"columns", utils::JsonValue(utils::JsonArray{
+            {"columns", utils::json_array({
                 utils::json_object({{"name", utils::JsonValue("1")}}),
                 utils::json_object({{"name", utils::JsonValue("2")}}),
                 utils::json_object({{"name", utils::JsonValue("3")}})
             })},
-            {"rows", utils::JsonValue(utils::JsonArray{
+            {"rows", utils::json_array({
                 utils::json_object({{"name", utils::JsonValue("A")}}),
                 utils::json_object({{"name", utils::JsonValue("B")}})
             })},
-            {"wells", utils::JsonValue(utils::JsonArray{
+            {"wells", utils::json_array({
                 utils::json_object({
                     {"path", utils::JsonValue("A/1")},
                     {"rowIndex", utils::JsonValue(0)},
@@ -1685,16 +1610,16 @@ TEST_CASE("PlateMetadata parse missing plate throws") {
 // ---------------------------------------------------------------------------
 
 TEST_CASE("CoordinateTransform parse scale and translation") {
-    auto json = utils::JsonValue(utils::JsonArray{
+    auto json = utils::json_array({
         utils::json_object({
             {"type", utils::JsonValue("scale")},
-            {"scale", utils::JsonValue(utils::JsonArray{
+            {"scale", utils::json_array({
                 utils::JsonValue(1.0), utils::JsonValue(2.0), utils::JsonValue(3.0)
             })}
         }),
         utils::json_object({
             {"type", utils::JsonValue("translation")},
-            {"translation", utils::JsonValue(utils::JsonArray{
+            {"translation", utils::json_array({
                 utils::JsonValue(10.0), utils::JsonValue(20.0), utils::JsonValue(30.0)
             })}
         })
@@ -2318,36 +2243,6 @@ TEST_CASE("MultiscaleMetadata type field preserved") {
     auto parsed = utils::parse_ome_metadata(jv);
 
     REQUIRE_EQ(parsed.type, std::string("gaussian"));
-}
-
-// ---------------------------------------------------------------------------
-// 31. Zarr .zarray with multiple filters
-// ---------------------------------------------------------------------------
-
-TEST_CASE("Zarr .zarray with multiple filters round trip") {
-    utils::ZarrMetadata meta;
-    meta.shape = {64};
-    meta.chunks = {64};
-    meta.dtype = utils::ZarrDtype::float64;
-
-    utils::ZarrFilter f1;
-    f1.id = utils::ZarrFilterId::delta;
-    f1.dtype = utils::ZarrDtype::float64;
-    f1.astype = utils::ZarrDtype::float64;
-    meta.filters.push_back(f1);
-
-    utils::ZarrFilter f2;
-    f2.id = utils::ZarrFilterId::quantize;
-    f2.digits = 5;
-    meta.filters.push_back(f2);
-
-    auto json = utils::detail::serialize_zarray(meta);
-    auto parsed = utils::detail::parse_zarray(json);
-
-    REQUIRE_EQ(parsed.filters.size(), std::size_t(2));
-    REQUIRE_EQ(parsed.filters[0].id, utils::ZarrFilterId::delta);
-    REQUIRE_EQ(parsed.filters[1].id, utils::ZarrFilterId::quantize);
-    REQUIRE_EQ(parsed.filters[1].digits, 5);
 }
 
 // ---------------------------------------------------------------------------

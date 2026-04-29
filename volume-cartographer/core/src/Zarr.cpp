@@ -76,7 +76,7 @@ void writeZarrRegionU8ByChunk(vc::VcDataset* dsOut,
     if (dsOut->getDtype() != vc::VcDtype::uint8) {
         throw std::runtime_error("writeZarrRegionU8ByChunk only supports uint8 datasets");
     }
-    if ((regionShape[0] > 0 || regionShape[1] > 0 || regionShape[2] > 0) && !data) {
+    if (regionShape[0] > 0 && regionShape[1] > 0 && regionShape[2] > 0 && !data) {
         throw std::runtime_error("writeZarrRegionU8ByChunk requires input data");
     }
 

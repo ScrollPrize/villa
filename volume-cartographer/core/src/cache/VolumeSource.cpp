@@ -118,10 +118,16 @@ std::filesystem::path FileSystemSource::chunkPath(const ChunkKey& key) const
     return root_ / dir / chunkFilename(key, delimiter_);
 }
 
-std::vector<uint8_t> FileSystemSource::fetch(const ChunkKey& key)
+FetchResult FileSystemSource::fetch(const ChunkKey& key)
 {
+    FetchResult out;
     auto result = readFileToVector(chunkPath(key));
-    return result ? std::move(*result) : std::vector<uint8_t>{};
+    if (result) {
+        out.bytes = std::move(*result);
+    } else {
+        out.wasAbsent = true;
+    }
+    return out;
 }
 
 int FileSystemSource::numLevels() const noexcept { return levelsNumLevels(levels_); }
@@ -220,36 +226,17 @@ int HttpSource::totalChunksPerShard() const noexcept
     return chunksPerShard_[0] * chunksPerShard_[1] * chunksPerShard_[2];
 }
 
-namespace {
-thread_local bool tl_last_was_absent = false;
-thread_local bool tl_last_had_transient_error = false;
-}
-
-bool HttpSource::lastFetchWasAbsent() noexcept
+FetchResult HttpSource::httpGet(const std::string& url)
 {
-    return tl_last_was_absent;
-}
-
-bool HttpSource::lastFetchHadTransientError() noexcept
-{
-    return tl_last_had_transient_error;
-}
-
-std::vector<uint8_t> HttpSource::httpGet(const std::string& url)
-{
+    FetchResult out;
     auto resp = client_->get(url);
-    // Per-thread "this object is genuinely absent" signal: true on real
-    // 404, false on success or any transient/auth error. fetchFromShard
-    // also flips it on after seeing a missing/zero-placeholder index entry
-    // inside a successfully-downloaded shard.
-    tl_last_was_absent = (resp.status_code == 404);
-    tl_last_had_transient_error = false;
+    out.wasAbsent = (resp.status_code == 404);
+    if (resp.status_code == 404) {
+        std::fprintf(stderr, "[HTTP 404] GET %s\n", url.c_str());
+    }
     if (!resp.ok()) {
-        // 404 is an expected "chunk doesn't exist" response — stay quiet.
-        // Anything else (403/401/5xx) almost always means auth or network
-        // trouble; log loudly so it doesn't look like an empty volume.
         if (resp.status_code != 404) {
-            tl_last_had_transient_error = true;
+            out.transientError = true;
             transientError_.store(true, std::memory_order_relaxed);
             static std::atomic<int> errCount{0};
             int n = errCount.fetch_add(1);
@@ -264,32 +251,31 @@ std::vector<uint8_t> HttpSource::httpGet(const std::string& url)
                                      std::min(resp.body.size(), size_t(200))).c_str());
             }
         }
-        return {};
+        return out;
     }
 
-    // Clear the sticky "transient trouble" flag on any successful response
-    // (including 200 with empty body). Otherwise one bad 5xx early in a
-    // session would make the flag latch forever and callers would keep
-    // suppressing negative-cache writes.
     transientError_.store(false, std::memory_order_relaxed);
-
-    std::vector<uint8_t> result(resp.body.size());
-    if (!result.empty())
-        std::memcpy(result.data(), resp.body.data(), result.size());
-    return result;
+    out.bytes.resize(resp.body.size());
+    if (!out.bytes.empty())
+        std::memcpy(out.bytes.data(), resp.body.data(), out.bytes.size());
+    return out;
 }
 
-std::vector<uint8_t> HttpSource::httpGetRange(const std::string& url,
-                                              std::size_t offset,
-                                              std::size_t length)
+FetchResult HttpSource::httpGetRange(const std::string& url,
+                                     std::size_t offset,
+                                     std::size_t length)
 {
-    if (length == 0) return {};
+    FetchResult out;
+    if (length == 0) return out;
     auto resp = client_->get_range(url, offset, length);
-    tl_last_was_absent = (resp.status_code == 404);
-    tl_last_had_transient_error = false;
+    out.wasAbsent = (resp.status_code == 404);
+    if (resp.status_code == 404) {
+        std::fprintf(stderr, "[HTTP 404] GET_RANGE %s [%zu..%zu)\n",
+            url.c_str(), offset, offset + length);
+    }
     if (!resp.ok()) {
         if (resp.status_code != 404) {
-            tl_last_had_transient_error = true;
+            out.transientError = true;
             transientError_.store(true, std::memory_order_relaxed);
             static std::atomic<int> errCount{0};
             int n = errCount.fetch_add(1);
@@ -300,42 +286,32 @@ std::vector<uint8_t> HttpSource::httpGetRange(const std::string& url,
                              long(resp.status_code));
             }
         }
-        return {};
+        return out;
     }
     transientError_.store(false, std::memory_order_relaxed);
 
-    // Servers are allowed to ignore Range and return 200 with the full
-    // resource (RFC 7233 §3.1). Detect that by body size > requested
-    // length and slice out [offset, offset+length) ourselves so the
-    // caller always sees the bytes it asked for.
     const auto& body = resp.body;
-    std::vector<uint8_t> result;
     if (body.size() > length && body.size() >= offset + length) {
-        result.resize(length);
-        std::memcpy(result.data(), body.data() + offset, length);
+        out.bytes.resize(length);
+        std::memcpy(out.bytes.data(), body.data() + offset, length);
     } else {
-        result.resize(body.size());
+        out.bytes.resize(body.size());
         if (!body.empty())
-            std::memcpy(result.data(), body.data(), result.size());
+            std::memcpy(out.bytes.data(), body.data(), out.bytes.size());
     }
-    return result;
+    return out;
 }
 
-std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
+FetchResult HttpSource::fetchFromShard(const ChunkKey& key)
 {
+    FetchResult out;
     std::string url = shardUrl(key);
     const int nChunks = totalChunksPerShard();
-    if (nChunks <= 0) return {};
+    if (nChunks <= 0) return out;
 
     const int inner = innerChunkIndex(key);
-    if (inner < 0 || inner >= nChunks) {
-        tl_last_was_absent = false;
-        return {};
-    }
+    if (inner < 0 || inner >= nChunks) return out;
 
-    // Phase 1: fetch + cache the parsed shard index.  The index lives at the
-    // head of the shard (zarr-v3 index_location=start) so one Range GET of
-    // nChunks*16 bytes gives us full chunk addressability.
     std::shared_ptr<utils::detail::ShardIndex> shardIndex;
     {
         std::lock_guard<std::mutex> lock(shardCacheMutex_);
@@ -348,25 +324,25 @@ std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
     if (!shardIndex) {
         const std::size_t indexBytes = std::size_t(nChunks) * 16;
         auto raw = httpGetRange(url, 0, indexBytes);
-        if (raw.size() != indexBytes) {
-            if (!tl_last_was_absent)
-                tl_last_had_transient_error = true;
-            return {};
+        if (raw.bytes.size() != indexBytes) {
+            out.wasAbsent = raw.wasAbsent;
+            out.transientError = raw.transientError || (!raw.wasAbsent);
+            return out;
         }
 
         std::span<const std::byte> span(
-            reinterpret_cast<const std::byte*>(raw.data()), raw.size());
+            reinterpret_cast<const std::byte*>(raw.bytes.data()), raw.bytes.size());
         auto parsed = std::make_shared<utils::detail::ShardIndex>(
             utils::detail::ShardIndex::deserialize(span, size_t(nChunks)));
 
-        constexpr size_t kShardIndexBudget = 64ull << 20;   // ~64 MiB of indices
+        constexpr size_t kShardIndexBudget = 64ull << 20;
         std::lock_guard<std::mutex> lock(shardCacheMutex_);
         if (auto it = shardCacheMap_.find(url); it != shardCacheMap_.end()) {
             if (!it->second->entry.index) it->second->entry.index = parsed;
             shardIndex = it->second->entry.index;
             shardCacheLru_.splice(shardCacheLru_.begin(), shardCacheLru_, it->second);
         } else {
-            shardCacheLru_.push_front({url, {/*bytes=*/{}, parsed}});
+            shardCacheLru_.push_front({url, {{}, parsed}});
             shardCacheMap_[url] = shardCacheLru_.begin();
             shardCacheBytes_ += indexBytes;
             shardIndex = parsed;
@@ -388,23 +364,22 @@ std::vector<uint8_t> HttpSource::fetchFromShard(const ChunkKey& key)
 
     const auto& entry = shardIndex->entries[inner];
 
-    if (entry.is_missing()
-        || (entry.offset == (~uint64_t(0) - 1) && entry.nbytes == 0)) {
-        tl_last_was_absent = true;
-        tl_last_had_transient_error = false;
-        return {};
+    if (entry.is_missing() || entry.is_empty() || entry.is_verified_absent()) {
+        const char* why = entry.is_missing() ? "missing"
+                        : entry.is_empty() ? "zarr-empty"
+                        : "verified-absent";
+        std::fprintf(stderr,
+            "[fetchFromShard ABSENT] %s inner=%d -> %s\n",
+            url.c_str(), inner, why);
+        out.wasAbsent = true;
+        return out;
     }
-    if (entry.nbytes == 0) {
-        tl_last_was_absent = false;
-        tl_last_had_transient_error = false;
-        return {};
-    }
+    if (entry.nbytes == 0) return out;
 
-    // Phase 2: Range GET just the chunk's bytes.
     return httpGetRange(url, entry.offset, entry.nbytes);
 }
 
-std::vector<uint8_t> HttpSource::fetch(const ChunkKey& key)
+FetchResult HttpSource::fetch(const ChunkKey& key)
 {
     if (sharded_) return fetchFromShard(key);
     return httpGet(chunkUrl(key));
@@ -423,7 +398,7 @@ std::vector<uint8_t> HttpSource::fetchWholeShard(int level, int sz, int sy, int 
     url += std::to_string(sy);
     url += '/';
     url += std::to_string(sx);
-    return httpGet(url);
+    return std::move(httpGet(url).bytes);
 }
 
 std::array<int, 3> HttpSource::shardsPerAxis(int level) const noexcept

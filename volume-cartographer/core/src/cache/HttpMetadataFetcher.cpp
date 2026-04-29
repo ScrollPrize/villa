@@ -68,11 +68,6 @@ std::string httpGetString(const std::string& url, const HttpAuth& auth)
             throw std::runtime_error(errMsg + ". Check your AWS credentials.");
         }
 
-        if (resp.status_code >= 500) {
-            throw std::runtime_error(
-                "HTTP server error " + std::to_string(resp.status_code) + " fetching " + url);
-        }
-
         return {};
     }
 

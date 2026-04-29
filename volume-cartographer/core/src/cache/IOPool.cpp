@@ -1,6 +1,7 @@
 #include "vc/core/cache/IOPool.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <unordered_set>
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -70,7 +71,10 @@ void IOPool::start()
                 if (onComplete_ && !result.empty()) {
                     try {
                         onComplete_(std::move(result));
-                    } catch (const std::exception&) {}
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr,
+                            "[IOPool] completion callback threw: %s\n", e.what());
+                    }
                 }
             }
         });
@@ -295,7 +299,11 @@ void IOPool::cancelPending()
 size_t IOPool::pendingCount() const noexcept
 {
     std::lock_guard lock(mutex_);
-    return queueTotal_;
+    size_t inflight = 0;
+    for (const auto& [_, st] : shards_) {
+        if (st == ShardState::InFlight) ++inflight;
+    }
+    return queueTotal_ + inflight;
 }
 
 void IOPool::stop()
