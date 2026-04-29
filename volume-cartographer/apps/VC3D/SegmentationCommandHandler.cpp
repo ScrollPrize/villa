@@ -65,6 +65,7 @@
 #include "vc/core/cache/ChunkKey.hpp"
 #include "vc/core/types/VcDataset.hpp"
 #include "ToolDialogs.hpp"
+#include "elements/JsonFileEditorDialog.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "elements/JsonProfilePresets.hpp"
 #include "utils/Json.hpp"
@@ -2521,6 +2522,32 @@ void SegmentationCommandHandler::onGrowSeeds(const std::string& segmentId, bool 
     QString modeDesc = isExpand ? "expand mode" :
                       (isRandomSeed ? "random seed mode" : "seed mode");
     emit statusMessage(tr("Growing segment using %1 in %2").arg(jsonFileName).arg(modeDesc), 5000);
+}
+
+void SegmentationCommandHandler::onEditGrowParams(const QString& jsonFileName)
+{
+    if (!_state || !_state->vpkg()) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("No volume package loaded."));
+        return;
+    }
+
+    if (jsonFileName != QStringLiteral("seed.json") && jsonFileName != QStringLiteral("expand.json")) {
+        QMessageBox::warning(_parentWidget, tr("Error"), tr("Unsupported params file: %1").arg(jsonFileName));
+        return;
+    }
+
+    const QString filePath = QDir(_state->vpkgPath()).filePath(jsonFileName);
+    if (!QFileInfo::exists(filePath)) {
+        QMessageBox::warning(_parentWidget,
+                             tr("Error"),
+                             tr("%1 not found in the volume package.").arg(jsonFileName));
+        return;
+    }
+
+    JsonFileEditorDialog dlg(filePath, tr("Edit %1").arg(jsonFileName), _parentWidget);
+    if (dlg.exec() == QDialog::Accepted) {
+        emit statusMessage(tr("Saved %1").arg(jsonFileName), 5000);
+    }
 }
 
 void SegmentationCommandHandler::handleNeighborCopyToolFinished(bool success)

@@ -18,6 +18,7 @@
 
 #include <opencv2/imgproc.hpp>
 
+#include "elements/JsonFileEditorDialog.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Slicing.hpp"
@@ -194,6 +195,17 @@ void SeedingWidget::setupUI()
     expandSeedsButton->setEnabled(false);
     expandSeedsButton->setToolTip("Run seed expansion using expand.json");
     mainLayout->addWidget(expandSeedsButton);
+
+    auto paramsLayout = new QHBoxLayout();
+    editSeedParamsButton = new QPushButton("Edit seed.json", this);
+    editSeedParamsButton->setEnabled(false);
+    editSeedParamsButton->setToolTip("Edit seed.json in the current volume package");
+    paramsLayout->addWidget(editSeedParamsButton);
+    editExpandParamsButton = new QPushButton("Edit expand.json", this);
+    editExpandParamsButton->setEnabled(false);
+    editExpandParamsButton->setToolTip("Edit expand.json in the current volume package");
+    paramsLayout->addWidget(editExpandParamsButton);
+    mainLayout->addLayout(paramsLayout);
     
     resetPointsButton = new QPushButton("Reset Points", this);
     resetPointsButton->setEnabled(false);
@@ -331,6 +343,8 @@ void SeedingWidget::setupUI()
     connect(clearPeaksButton, &QPushButton::clicked, this, &SeedingWidget::onClearPeaksClicked);
     connect(runSegmentationButton, &QPushButton::clicked, this, &SeedingWidget::onRunSegmentationClicked);
     connect(expandSeedsButton, &QPushButton::clicked, this, &SeedingWidget::onExpandSeedsClicked);
+    connect(editSeedParamsButton, &QPushButton::clicked, this, &SeedingWidget::onEditSeedParamsClicked);
+    connect(editExpandParamsButton, &QPushButton::clicked, this, &SeedingWidget::onEditExpandParamsClicked);
     connect(resetPointsButton, &QPushButton::clicked, this, &SeedingWidget::onResetPointsClicked);
     connect(cancelButton, &QPushButton::clicked, this, &SeedingWidget::onCancelClicked);
     connect(labelWrapsButton, &QPushButton::clicked, [this]() {
@@ -1676,6 +1690,12 @@ void SeedingWidget::updateButtonStates()
     bool hasSegmentations = fVpkg && fVpkg->hasSegmentations();
     expandSeedsButton->setEnabled(currentVolume != nullptr && hasSegmentations);
 
+    const QString vpkgPath = fVpkg ? _state->vpkgPath() : QString();
+    editSeedParamsButton->setEnabled(!vpkgPath.isEmpty() &&
+                                     QFileInfo::exists(QDir(vpkgPath).filePath(QStringLiteral("seed.json"))));
+    editExpandParamsButton->setEnabled(!vpkgPath.isEmpty() &&
+                                       QFileInfo::exists(QDir(vpkgPath).filePath(QStringLiteral("expand.json"))));
+
     // Enable reset if we have any points or paths
     bool hasAnyData = hasAnyPoints || !paths.empty();
     resetPointsButton->setEnabled(hasAnyData);
@@ -1881,6 +1901,37 @@ void SeedingWidget::onExpandSeedsClicked()
     }
 
     progressUtil->stopProgress();
+}
+
+void SeedingWidget::onEditSeedParamsClicked()
+{
+    editGrowParamsFile(QStringLiteral("seed.json"));
+}
+
+void SeedingWidget::onEditExpandParamsClicked()
+{
+    editGrowParamsFile(QStringLiteral("expand.json"));
+}
+
+void SeedingWidget::editGrowParamsFile(const QString& fileName)
+{
+    if (!_state || !_state->vpkg()) {
+        QMessageBox::warning(this, tr("Error"), tr("No volume package loaded."));
+        return;
+    }
+
+    const QString filePath = QDir(_state->vpkgPath()).filePath(fileName);
+    if (!QFileInfo::exists(filePath)) {
+        QMessageBox::warning(this,
+                             tr("Error"),
+                             tr("%1 not found in the volume package.").arg(fileName));
+        return;
+    }
+
+    JsonFileEditorDialog dlg(filePath, tr("Edit %1").arg(fileName), this);
+    if (dlg.exec() == QDialog::Accepted) {
+        emit sendStatusMessageAvailable(tr("Saved %1").arg(fileName), 5000);
+    }
 }
 
 void SeedingWidget::onCancelClicked()

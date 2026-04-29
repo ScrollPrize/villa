@@ -127,6 +127,7 @@ public slots:
     void onRasterizeSegments(const QStringList& segmentIds);
     void onAddIgnoreLabel();
     void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
+    void onEditGrowParams(const QString& jsonFileName);
     void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
     void onResumeLocalGrowPatchRequested(const QString& segmentId);
     void onReloadFromBackup(const QString& segmentId, int backupIndex);

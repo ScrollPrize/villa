@@ -59,6 +59,8 @@ private slots:
     void onClearPeaksClicked();
     void onRunSegmentationClicked();
     void onExpandSeedsClicked();
+    void onEditSeedParamsClicked();
+    void onEditExpandParamsClicked();
     void onResetPointsClicked();
     void onCancelClicked();
     void onNeuralTraceClicked();
@@ -95,6 +97,7 @@ private:
     void updatePointsDisplay();
     void updateInfoLabel();
     void updateButtonStates();
+    void editGrowParamsFile(const QString& fileName);
     
 private:
     
@@ -123,6 +126,8 @@ private:
     QPushButton* clearPeaksButton;
     QPushButton* runSegmentationButton;
     QPushButton* expandSeedsButton;
+    QPushButton* editSeedParamsButton;
+    QPushButton* editExpandParamsButton;
     QPushButton* resetPointsButton;
     QPushButton* cancelButton;
     QPushButton* labelWrapsButton;

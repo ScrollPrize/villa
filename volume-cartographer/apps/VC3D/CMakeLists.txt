@@ -34,6 +34,8 @@ set(srcs
     elements/DropdownChecklistButton.hpp
     elements/JsonProfileEditor.cpp
     elements/JsonProfileEditor.hpp
+    elements/JsonFileEditorDialog.cpp
+    elements/JsonFileEditorDialog.hpp
     elements/VolumeSelector.cpp
     elements/VolumeSelector.hpp
     elements/RangeSlider.cpp

@@ -907,6 +907,15 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     connect(seedWithExpandAction, &QAction::triggered, this, [this, segmentId]() {
         emit growSeedsRequested(segmentId, true, false);
     });
+    seedMenu->addSeparator();
+    QAction* editSeedParamsAction = seedMenu->addAction(tr("Edit seed.json..."));
+    connect(editSeedParamsAction, &QAction::triggered, this, [this]() {
+        emit editGrowParamsRequested(QStringLiteral("seed.json"));
+    });
+    QAction* editExpandParamsAction = seedMenu->addAction(tr("Edit expand.json..."));
+    connect(editExpandParamsAction, &QAction::triggered, this, [this]() {
+        emit editGrowParamsRequested(QStringLiteral("expand.json"));
+    });
 
     QAction* growSegmentAction = contextMenu.addAction(tr("Run Trace"));
     connect(growSegmentAction, &QAction::triggered, this, [this, segmentId]() {
