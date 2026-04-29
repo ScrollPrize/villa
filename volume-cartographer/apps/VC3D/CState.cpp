@@ -48,12 +48,9 @@ std::string CState::currentVolumeId() const { return _currentVolumeId; }
 
 void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
-    fprintf(stderr, "[CState] setCurrentVolume: begin (old=%p new=%p)\n",
-            (void*)_currentVolume.get(), (void*)vol.get());
     if (_currentVolume) {
         auto* oldPipeline = _currentVolume->tieredCache();
         if (oldPipeline) {
-            fprintf(stderr, "[CState] shutdown + clearMemory on old pipeline\n");
             oldPipeline->shutdown();
             oldPipeline->clearMemory();
         }
@@ -65,9 +62,7 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
     _currentVolume = std::move(vol);
     applyCacheBudget(_currentVolume);
     resolveCurrentVolumeId();
-    fprintf(stderr, "[CState] emitting volumeChanged\n");
     emit volumeChanged(_currentVolume, _currentVolumeId);
-    fprintf(stderr, "[CState] setCurrentVolume: done\n");
 }
 
 std::string CState::segmentationGrowthVolumeId() const { return _segmentationGrowthVolumeId; }

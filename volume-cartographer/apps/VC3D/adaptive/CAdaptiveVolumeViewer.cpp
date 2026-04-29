@@ -229,10 +229,6 @@ Surface* CAdaptiveVolumeViewer::currentSurface() const
 
 void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
 {
-    fprintf(stderr, "[Viewer:%s] OnVolumeChanged: old=%p new=%p _surfWeak=%p axisAligned=%d\n",
-            _surfName.c_str(), (void*)_volume.get(), (void*)vol.get(),
-            (void*)_surfWeak.lock().get(), isAxisAlignedView() ? 1 : 0);
-
     if (_chunkCbId != 0 && _volume && _volume->tieredCache()) {
         _volume->tieredCache()->removeChunkReadyListener(_chunkCbId);
         _chunkCbId = 0;
@@ -284,9 +280,6 @@ void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
         _defaultSurface = std::make_shared<PlaneSurface>(center, normal);
         _surfWeak = _defaultSurface;
     }
-
-    fprintf(stderr, "[Viewer:%s] OnVolumeChanged: after surface setup: _surfWeak=%p _volume=%p\n",
-            _surfName.c_str(), (void*)_surfWeak.lock().get(), (void*)_volume.get());
 
     if (_volume) {
         int nScales = static_cast<int>(_volume->numScales());

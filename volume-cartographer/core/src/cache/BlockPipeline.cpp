@@ -284,8 +284,6 @@ BlockPipeline::BlockPipeline(
     }())
     , blockCache_(blockCache)
 {
-    fprintf(stderr, "[BlockPipeline] constructor %p: bytes=%zu\n", (void*)this, config_.bytes);
-
     // Clear any stale process-wide HTTP abort flag from a previous
     // BlockPipeline's destructor.
     utils::HttpClient::resetAbort();
@@ -793,10 +791,8 @@ void BlockPipeline::shutdown() {
     // Atomic exchange: if already shutting down (destructor or prior shutdown()
     // call), skip. This makes shutdown() + ~BlockPipeline() idempotent.
     if (shuttingDown_.exchange(true, std::memory_order_acq_rel)) {
-        fprintf(stderr, "[BlockPipeline] shutdown %p: already shut down\n", (void*)this);
         return;
     }
-    fprintf(stderr, "[BlockPipeline] shutdown %p: stopping pools...\n", (void*)this);
     // Release any downloader workers blocked on the backpressure CV so
     // pool.stop() can actually join them.
     encodeStagingCv_.notify_all();
@@ -820,7 +816,6 @@ void BlockPipeline::shutdown() {
     // All workers have joined — safe to clear the process-global abort
     // flag so a new pipeline can use curl without seeing a stale abort.
     utils::HttpClient::resetAbort();
-    fprintf(stderr, "[BlockPipeline] shutdown %p: pools stopped, abort cleared\n", (void*)this);
     auto cold = statColdHits_.load();
     auto ice = statIceFetches_.load();
     if (cold > 0 || ice > 0) {
@@ -830,9 +825,7 @@ void BlockPipeline::shutdown() {
 }
 
 BlockPipeline::~BlockPipeline() {
-    fprintf(stderr, "[BlockPipeline] destructor %p\n", (void*)this);
     shutdown();
-    fprintf(stderr, "[BlockPipeline] destructor %p: done\n", (void*)this);
 }
 
 void BlockPipeline::bloomAdd(const ChunkKey& key) noexcept {
@@ -857,10 +850,6 @@ void BlockPipeline::bloomClear() noexcept {
 }
 
 void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targetLevel) {
-    static int fetchDbgCount = 0;
-    if (fetchDbgCount++ < 5 || fetchDbgCount % 100 == 0)
-        fprintf(stderr, "[BlockPipeline] fetchInteractive %p: %zu keys, targetLevel=%d\n",
-                (void*)this, keys.size(), targetLevel);
     if (keys.empty()) return;
     // Dedup: the renderer calls this every frame, and viewport-idle frames
     // pass the same keys + targetLevel as the previous call. When the

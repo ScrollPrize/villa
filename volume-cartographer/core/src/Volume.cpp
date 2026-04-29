@@ -590,12 +590,8 @@ void Volume::ensureTieredCache() const
 {
     std::lock_guard<std::mutex> lock(cacheMutex_);
     if (!tieredCache_) {
-        fprintf(stderr, "[Volume] %p ensureTieredCache: creating pipeline (budget=%zu)\n",
-                (void*)this, cacheBudgetHot_);
         auto* self = const_cast<Volume*>(this);
         tieredCache_ = self->createTieredCache();
-        fprintf(stderr, "[Volume] %p ensureTieredCache: pipeline=%p created\n",
-                (void*)this, (void*)tieredCache_.get());
     }
 }
 
@@ -607,11 +603,8 @@ vc::cache::BlockPipeline* Volume::tieredCache()
 
 void Volume::resetTieredCache()
 {
-    fprintf(stderr, "[Volume] %p resetTieredCache: destroying pipeline=%p\n",
-            (void*)this, (void*)tieredCache_.get());
     std::lock_guard<std::mutex> lock(cacheMutex_);
     tieredCache_.reset();
-    fprintf(stderr, "[Volume] %p resetTieredCache: done\n", (void*)this);
 }
 
 void Volume::setCacheBudget(size_t hotBytes)
@@ -816,4 +809,3 @@ const Volume::DataBounds& Volume::dataBounds() const
     });
     return dataBounds_;
 }
-
