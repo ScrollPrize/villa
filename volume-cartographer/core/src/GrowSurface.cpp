@@ -10,6 +10,7 @@
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/core/util/Umbilicus.hpp"
+#include "vc/flattening/ABFFlattening.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
 #include "vc/core/util/DateTime.hpp"
@@ -22,11 +23,13 @@
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <queue>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -191,6 +194,10 @@ static float dist_loss_2d_w = 1.0f;        // Weight for 2D distance constraints
 static float dist_loss_3d_w = 2.0f;        // Weight for 3D distance constraints
 static float straight_min_count = 1.0f;    // Minimum number of straight constraints
 static int inlier_base_threshold = 20;     // Starting threshold for inliers
+static float param_metric_2d_w = 0.0f;     // Weight for 2D local metric constraints
+static float param_metric_2d_area_w = 2.0f;
+static float param_metric_2d_min_area_ratio = 0.25f;
+static float symmetric_dirichlet_3d_w = 0.0f;
 
 static cv::Vec3f at_int_inv(const cv::Mat_<cv::Vec3f> &points, cv::Vec2f p)
 {
@@ -664,6 +671,124 @@ static int cond_surftrack_straightloss_3D(int type, QuadSurface *sm, const cv::V
     return count;
 }
 
+static int add_surftrack_param_metric_2D(QuadSurface *sm, const cv::Vec2i &p, SurfTrackerData &data,
+    ceres::Problem &problem, const cv::Mat_<uint8_t> &state, float unit, int flags = 0)
+{
+    if (param_metric_2d_w <= 0.f) {
+        return 0;
+    }
+
+    auto valid = [&](const cv::Vec2i& q) {
+        return q[0] >= 0 && q[0] < state.rows &&
+               q[1] >= 0 && q[1] < state.cols &&
+               (state(q) & STATE_LOC_VALID) != 0 &&
+               data.has(sm, q);
+    };
+
+    const std::array<cv::Vec2i, 8> metric_offsets{{
+        { 0,  1},
+        { 1,  1},
+        { 1,  0},
+        { 1, -1},
+        { 0, -1},
+        {-1, -1},
+        {-1,  0},
+        {-1,  1},
+    }};
+
+    auto add = [&](const cv::Vec2i& u, const cv::Vec2i& v) {
+        const int area = u[0] * v[1] - u[1] * v[0];
+        if (area == 0) {
+            return 0;
+        }
+        if (!valid(p) || !valid(p + u) || !valid(p + v)) {
+            return 0;
+        }
+
+        problem.AddResidualBlock(
+            ParamMetricLoss2D::Create(unit, u, v,
+                                      param_metric_2d_w,
+                                      param_metric_2d_min_area_ratio,
+                                      param_metric_2d_area_w),
+            nullptr,
+            &data.loc(sm, p)[0],
+            &data.loc(sm, p + u)[0],
+            &data.loc(sm, p + v)[0]);
+
+        if ((flags & OPTIMIZE_ALL) == 0) {
+            problem.SetParameterBlockConstant(&data.loc(sm, p + u)[0]);
+            problem.SetParameterBlockConstant(&data.loc(sm, p + v)[0]);
+        }
+        return 1;
+    };
+
+    int count = 0;
+    for (std::size_t i = 0; i < metric_offsets.size(); ++i) {
+        for (std::size_t j = i + 1; j < metric_offsets.size(); ++j) {
+            count += add(metric_offsets[i], metric_offsets[j]);
+        }
+    }
+    return count;
+}
+
+static int add_surftrack_symmetric_dirichlet_3D(const cv::Vec2i &p,
+    cv::Mat_<cv::Vec3d> &points, ceres::Problem &problem, const cv::Mat_<uint8_t> &state,
+    float unit, int flags = 0)
+{
+    if (symmetric_dirichlet_3d_w <= 0.f) {
+        return 0;
+    }
+
+    const std::array<cv::Vec2i, 8> metric_offsets{{
+        { 0,  1},
+        { 1,  1},
+        { 1,  0},
+        { 1, -1},
+        { 0, -1},
+        {-1, -1},
+        {-1,  0},
+        {-1,  1},
+    }};
+
+    auto valid = [&](const cv::Vec2i& q) {
+        return q[0] >= 0 && q[0] < state.rows &&
+               q[1] >= 0 && q[1] < state.cols &&
+               (state(q) & (STATE_LOC_VALID | STATE_COORD_VALID)) != 0 &&
+               points(q)[0] != -1;
+    };
+
+    auto add = [&](const cv::Vec2i& u, const cv::Vec2i& v) {
+        const int area = u[0] * v[1] - u[1] * v[0];
+        if (area == 0) {
+            return 0;
+        }
+        if (!valid(p) || !valid(p + u) || !valid(p + v)) {
+            return 0;
+        }
+
+        problem.AddResidualBlock(
+            SymmetricDirichletLoss::Create(unit, u, v, symmetric_dirichlet_3d_w),
+            nullptr,
+            &points(p)[0],
+            &points(p + u)[0],
+            &points(p + v)[0]);
+
+        if ((flags & OPTIMIZE_ALL) == 0) {
+            problem.SetParameterBlockConstant(&points(p + u)[0]);
+            problem.SetParameterBlockConstant(&points(p + v)[0]);
+        }
+        return 1;
+    };
+
+    int count = 0;
+    for (std::size_t i = 0; i < metric_offsets.size(); ++i) {
+        for (std::size_t j = i + 1; j < metric_offsets.size(); ++j) {
+            count += add(metric_offsets[i], metric_offsets[j]);
+        }
+    }
+    return count;
+}
+
 static int add_surftrack_surfloss(QuadSurface *sm, const cv::Vec2i& p, SurfTrackerData &data, ceres::Problem &problem, const cv::Mat_<uint8_t> &state,
     cv::Mat_<cv::Vec3d> &points, float step, ceres::ResidualBlockId *res = nullptr, float w = 0.1)
 {
@@ -725,6 +850,8 @@ static int surftrack_add_local(QuadSurface *sm, const cv::Vec2i& p, SurfTrackerD
         count_straight += add_surftrack_straightloss_3D(p, {-2,0},{-1,0},{0,0}, points, problem, state);
         count_straight += add_surftrack_straightloss_3D(p, {-1,0},{0,0},{1,0}, points, problem, state);
         count_straight += add_surftrack_straightloss_3D(p, {0,0},{1,0},{2,0}, points, problem, state);
+
+        count += add_surftrack_symmetric_dirichlet_3D(p, points, problem, state, step*src_step, flags);
     }
     else {
         count += add_surftrack_distloss(sm, p, {0,1}, data, problem, state, step);
@@ -747,6 +874,9 @@ static int surftrack_add_local(QuadSurface *sm, const cv::Vec2i& p, SurfTrackerD
         count_straight += add_surftrack_straightloss(sm, p, {-2,0},{-1,0},{0,0}, data, problem, state);
         count_straight += add_surftrack_straightloss(sm, p, {-1,0},{0,0},{1,0}, data, problem, state);
         count_straight += add_surftrack_straightloss(sm, p, {0,0},{1,0},{2,0}, data, problem, state);
+
+        count += add_surftrack_param_metric_2D(sm, p, data, problem, state, step, flags);
+        count += add_surftrack_symmetric_dirichlet_3D(p, points, problem, state, step*src_step, flags);
     }
 
     if (flags & LOSS_ZLOC)
@@ -1411,8 +1541,45 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     z_loc_loss_w = params.value("z_loc_loss_w", 0.1f);                  // Weight for Z location loss constraints
     dist_loss_2d_w = params.value("dist_loss_2d_w", 1.0f);              // Weight for 2D distance constraints
     dist_loss_3d_w = params.value("dist_loss_3d_w", 2.0f);              // Weight for 3D distance constraints
+    param_metric_2d_w = params.value("param_metric_2d_w", 0.0f);
+    param_metric_2d_area_w = params.value("param_metric_2d_area_w", 2.0f);
+    param_metric_2d_min_area_ratio = params.value("param_metric_2d_min_area_ratio", 0.25f);
+    symmetric_dirichlet_3d_w = params.value("symmetric_dirichlet_3d_w", 0.0f);
     straight_min_count = params.value("straight_min_count", 1.0f);      // Minimum number of straight constraints
     inlier_base_threshold = params.value("inlier_base_threshold", 20);  // Starting threshold for inliers
+    const int flatten_prune_interval = params.value("flatten_prune_interval", 0);
+    const int flatten_prune_max_vertices = std::max(0, params.value("flatten_prune_max_vertices", 16));
+    const float flatten_prune_score_threshold = params.value("flatten_prune_score_threshold", 500.f);
+    const int flatten_prune_min_valid = params.value("flatten_prune_min_valid", 64);
+    const int flatten_prune_abf_iterations = params.value("flatten_prune_abf_iterations", 5);
+    const bool flatten_prune_exploded_only = params.value("flatten_prune_exploded_only", true);
+    std::vector<int> flatten_prune_scales = {1};
+    if (params.contains("flatten_prune_scales") && params["flatten_prune_scales"].is_array()) {
+        flatten_prune_scales.clear();
+        for (const auto& scale_value : params["flatten_prune_scales"]) {
+            if (!scale_value.is_number_integer()) {
+                continue;
+            }
+            const int scale = scale_value.get<int>();
+            if (scale <= 0) {
+                continue;
+            }
+            if (std::find(flatten_prune_scales.begin(), flatten_prune_scales.end(), scale) == flatten_prune_scales.end()) {
+                flatten_prune_scales.push_back(scale);
+            }
+        }
+        if (flatten_prune_scales.empty()) {
+            flatten_prune_scales.push_back(1);
+        }
+    } else if (params.value("flatten_prune_multiscale", false)) {
+        flatten_prune_scales = {1, 2, 4};
+    }
+    std::sort(flatten_prune_scales.begin(), flatten_prune_scales.end());
+    const int flatten_regrid_interval = params.value("flatten_regrid_interval", 0);
+    const int flatten_regrid_min_valid = params.value("flatten_regrid_min_valid", 64);
+    const int flatten_regrid_abf_iterations = params.value("flatten_regrid_abf_iterations", flatten_prune_abf_iterations);
+    const int flatten_regrid_max_displacement = params.value("flatten_regrid_max_displacement", 50);
+    const float flatten_regrid_min_keep_ratio = params.value("flatten_regrid_min_keep_ratio", 0.90f);
 
     // Optional hard z-range constraint: [z_min, z_max]
     bool enforce_z_range = false;
@@ -1452,6 +1619,33 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::cout << "  z_loc_loss_w: " << z_loc_loss_w << std::endl;
     std::cout << "  dist_loss_2d_w: " << dist_loss_2d_w << std::endl;
     std::cout << "  dist_loss_3d_w: " << dist_loss_3d_w << std::endl;
+    std::cout << "  param_metric_2d_w: " << param_metric_2d_w << std::endl;
+    if (param_metric_2d_w > 0.f) {
+        std::cout << "  param_metric_2d_area_w: " << param_metric_2d_area_w << std::endl;
+        std::cout << "  param_metric_2d_min_area_ratio: " << param_metric_2d_min_area_ratio << std::endl;
+    }
+    std::cout << "  symmetric_dirichlet_3d_w: " << symmetric_dirichlet_3d_w << std::endl;
+    std::cout << "  flatten_prune_interval: " << flatten_prune_interval << std::endl;
+    if (flatten_prune_interval > 0) {
+        std::cout << "  flatten_prune_max_vertices: " << flatten_prune_max_vertices << std::endl;
+        std::cout << "  flatten_prune_score_threshold: " << flatten_prune_score_threshold << std::endl;
+        std::cout << "  flatten_prune_min_valid: " << flatten_prune_min_valid << std::endl;
+        std::cout << "  flatten_prune_abf_iterations: " << flatten_prune_abf_iterations << std::endl;
+        std::cout << "  flatten_prune_exploded_only: "
+                  << (flatten_prune_exploded_only ? "true" : "false") << std::endl;
+        std::cout << "  flatten_prune_scales:";
+        for (int scale : flatten_prune_scales) {
+            std::cout << " " << scale;
+        }
+        std::cout << std::endl;
+    }
+    std::cout << "  flatten_regrid_interval: " << flatten_regrid_interval << std::endl;
+    if (flatten_regrid_interval > 0) {
+        std::cout << "  flatten_regrid_min_valid: " << flatten_regrid_min_valid << std::endl;
+        std::cout << "  flatten_regrid_abf_iterations: " << flatten_regrid_abf_iterations << std::endl;
+        std::cout << "  flatten_regrid_max_displacement: " << flatten_regrid_max_displacement << std::endl;
+        std::cout << "  flatten_regrid_min_keep_ratio: " << flatten_regrid_min_keep_ratio << std::endl;
+    }
     std::cout << "  max_width: " << max_width << std::endl;
     std::cout << "  max_height: " << max_height << std::endl;
     std::cout << "  use_patch_cache: "
@@ -2233,6 +2427,642 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         std::cout << "flip_x mirror applied at used_area " << used_area << std::endl;
     };
 
+    auto prune_point = [&](const cv::Vec2i& p) {
+        std::set<QuadSurface*> attached = data.surfsC(p);
+        for (QuadSurface* surf : attached) {
+            data.erase(surf, p);
+        }
+        data._surfs.erase(p);
+
+        auto it = data._data.begin();
+        while (it != data._data.end()) {
+            if (it->first.second == p) {
+                it = data._data.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        data._res_blocks.clear();
+
+        state(p) = 0;
+        generations(p) = 0;
+        points(p) = {-1, -1, -1};
+        inliers_sum_dbg(p) = 0;
+    };
+
+    auto recompute_used_area_from_state = [&]() {
+        cv::Rect next_used_area;
+        bool have = false;
+        for (int y = 0; y < state.rows; ++y) {
+            for (int x = 0; x < state.cols; ++x) {
+                if ((state(y, x) & STATE_LOC_VALID) == 0 || points(y, x)[0] == -1) {
+                    continue;
+                }
+                const cv::Rect cell(x, y, 1, 1);
+                next_used_area = have ? (next_used_area | cell) : cell;
+                have = true;
+            }
+        }
+        if (have) {
+            used_area = next_used_area;
+            used_area_hr = scaled_rect_trunc(used_area, step);
+        }
+    };
+
+    auto rebuild_frontier_from_state = [&]() {
+        fringe.clear();
+        const cv::Rect active = used_area & cv::Rect(0, 0, state.cols, state.rows);
+        for (int y = active.y; y < active.br().y; ++y) {
+            for (int x = active.x; x < active.br().x; ++x) {
+                const cv::Vec2i p(y, x);
+                if ((state(p) & STATE_LOC_VALID) == 0) {
+                    continue;
+                }
+                for (const auto& n : neighs) {
+                    const cv::Vec2i pn = p + n;
+                    if (pn[0] < 0 || pn[0] >= state.rows || pn[1] < 0 || pn[1] >= state.cols ||
+                        (state(pn) & STATE_LOC_VALID) == 0) {
+                        fringe.insert(p);
+                        break;
+                    }
+                }
+            }
+        }
+    };
+
+    auto prune_to_largest_2d_component = [&]() -> int {
+        const cv::Rect active = used_area & cv::Rect(0, 0, state.cols, state.rows);
+        if (active.area() <= 0) {
+            return 0;
+        }
+
+        cv::Mat_<uint8_t> visited(active.height, active.width, uint8_t{0});
+        std::vector<std::vector<cv::Vec2i>> components;
+        const std::vector<cv::Vec2i> component_neighs = {
+            { 1,  0},
+            { 0,  1},
+            {-1,  0},
+            { 0, -1},
+        };
+
+        for (int y = active.y; y < active.br().y; ++y) {
+            for (int x = active.x; x < active.br().x; ++x) {
+                if (visited(y - active.y, x - active.x) ||
+                    (state(y, x) & STATE_LOC_VALID) == 0 ||
+                    points(y, x)[0] == -1) {
+                    continue;
+                }
+
+                components.emplace_back();
+                std::queue<cv::Vec2i> pending;
+                pending.push({y, x});
+                visited(y - active.y, x - active.x) = 1;
+
+                while (!pending.empty()) {
+                    const cv::Vec2i p = pending.front();
+                    pending.pop();
+                    components.back().push_back(p);
+
+                    for (const cv::Vec2i& n : component_neighs) {
+                        const cv::Vec2i pn = p + n;
+                        if (!active.contains(cv::Point(pn[1], pn[0])) ||
+                            visited(pn[0] - active.y, pn[1] - active.x) ||
+                            (state(pn) & STATE_LOC_VALID) == 0 ||
+                            points(pn)[0] == -1) {
+                            continue;
+                        }
+                        visited(pn[0] - active.y, pn[1] - active.x) = 1;
+                        pending.push(pn);
+                    }
+                }
+            }
+        }
+
+        if (components.size() <= 1) {
+            return 0;
+        }
+
+        std::size_t keep_index = 0;
+        for (std::size_t i = 1; i < components.size(); ++i) {
+            if (components[i].size() > components[keep_index].size()) {
+                keep_index = i;
+            } else if (components[i].size() == components[keep_index].size()) {
+                const bool i_has_seed = std::find(components[i].begin(), components[i].end(), data.seed_loc) != components[i].end();
+                const bool keep_has_seed = std::find(components[keep_index].begin(), components[keep_index].end(), data.seed_loc) != components[keep_index].end();
+                if (i_has_seed && !keep_has_seed) {
+                    keep_index = i;
+                }
+            }
+        }
+
+        int removed = 0;
+        for (std::size_t i = 0; i < components.size(); ++i) {
+            if (i == keep_index) {
+                continue;
+            }
+            for (const cv::Vec2i& p : components[i]) {
+                prune_point(p);
+                removed++;
+            }
+        }
+
+        std::cout << "flatten prune: kept largest 2D component "
+                  << components[keep_index].size()
+                  << " / " << components.size()
+                  << " components, removed " << removed
+                  << " disconnected vertices" << std::endl;
+
+        return removed;
+    };
+
+    auto run_flatten_prune = [&](int generation) -> int {
+        if (flatten_prune_interval <= 0 || flatten_prune_max_vertices <= 0) {
+            return 0;
+        }
+        if ((generation + 1) % flatten_prune_interval != 0) {
+            return 0;
+        }
+
+        const cv::Rect active = used_area & cv::Rect(0, 0, points.cols, points.rows);
+        if (active.area() <= 0) {
+            return 0;
+        }
+
+        int valid_count = 0;
+        for (int y = active.y; y < active.br().y; ++y) {
+            for (int x = active.x; x < active.br().x; ++x) {
+                if ((state(y, x) & STATE_LOC_VALID) && points(y, x)[0] != -1) {
+                    valid_count++;
+                }
+            }
+        }
+        if (valid_count < flatten_prune_min_valid) {
+            return 0;
+        }
+
+        vc::ABFConfig config;
+        config.maxIterations = static_cast<std::size_t>(std::max(1, flatten_prune_abf_iterations));
+        config.useABF = true;
+        config.scaleToOriginalArea = false;
+        config.downsampleFactor = 1;
+        config.alignToInputGrid = true;
+
+        cv::Mat_<float> accumulated_badness(active.height, active.width, 0.f);
+        bool any_success = false;
+        bool any_exploded = false;
+        float max_accumulated_badness = 0.f;
+        for (int scale : flatten_prune_scales) {
+            const int scaled_rows = (active.height + scale - 1) / scale;
+            const int scaled_cols = (active.width + scale - 1) / scale;
+            if (scaled_rows < 2 || scaled_cols < 2) {
+                continue;
+            }
+
+            cv::Mat_<cv::Vec3f> diagnostic_points(scaled_rows, scaled_cols, cv::Vec3f(-1, -1, -1));
+            int scale_valid_count = 0;
+            for (int y = 0; y < scaled_rows; ++y) {
+                for (int x = 0; x < scaled_cols; ++x) {
+                    const int src_y = active.y + y * scale;
+                    const int src_x = active.x + x * scale;
+                    if (src_y >= active.br().y || src_x >= active.br().x) {
+                        continue;
+                    }
+                    if ((state(src_y, src_x) & STATE_LOC_VALID) == 0 || points(src_y, src_x)[0] == -1) {
+                        continue;
+                    }
+                    const cv::Vec3d& p3 = points(src_y, src_x);
+                    diagnostic_points(y, x) = {
+                        static_cast<float>(p3[0]),
+                        static_cast<float>(p3[1]),
+                        static_cast<float>(p3[2])
+                    };
+                    scale_valid_count++;
+                }
+            }
+            if (scale_valid_count < std::max(16, flatten_prune_min_valid / std::max(1, scale * scale))) {
+                continue;
+            }
+
+            cv::Mat_<cv::Vec3f>* diagnostic_points_ptr = new cv::Mat_<cv::Vec3f>(diagnostic_points);
+            QuadSurface diagnostic_surface(diagnostic_points_ptr, {1.f, 1.f});
+            vc::ABFDiagnostics diagnostics = vc::diagnoseAbfFlattening(
+                diagnostic_surface,
+                config,
+                static_cast<std::size_t>(flatten_prune_max_vertices * 8));
+
+            std::cout << "flatten prune scale " << scale
+                      << ": success=" << (diagnostics.success ? "true" : "false")
+                      << " exploded=" << (diagnostics.exploded ? "true" : "false")
+                      << " grad=" << diagnostics.abfGradient
+                      << " valid_uv=" << diagnostics.validUvCount
+                      << " flipped=" << diagnostics.flippedTriangles
+                      << " near_zero=" << diagnostics.nearZeroUvTriangles
+                      << " crowded=" << diagnostics.crowdedUvPairs
+                      << " max_badness=" << diagnostics.maxVertexBadness << std::endl;
+            if (!diagnostics.failureReason.empty()) {
+                std::cout << "flatten prune scale " << scale << ": " << diagnostics.failureReason << std::endl;
+            }
+            if (!diagnostics.success) {
+                continue;
+            }
+            any_success = true;
+            any_exploded = any_exploded || diagnostics.exploded;
+
+            for (const vc::ABFVertexIssue& issue : diagnostics.worstVertices) {
+                if (issue.score <= 0.f) {
+                    continue;
+                }
+                const int center_y = issue.point[0] * scale;
+                const int center_x = issue.point[1] * scale;
+                const int radius = std::max(0, scale / 2);
+                const int y0_bad = std::max(0, center_y - radius);
+                const int y1_bad = std::min(active.height - 1, center_y + radius);
+                const int x0_bad = std::max(0, center_x - radius);
+                const int x1_bad = std::min(active.width - 1, center_x + radius);
+                for (int yy = y0_bad; yy <= y1_bad; ++yy) {
+                    for (int xx = x0_bad; xx <= x1_bad; ++xx) {
+                        const cv::Vec2i p(active.y + yy, active.x + xx);
+                        if ((state(p) & STATE_LOC_VALID) == 0 || points(p)[0] == -1) {
+                            continue;
+                        }
+                        const float weight = scale == 1 ? 1.f : 0.75f;
+                        accumulated_badness(yy, xx) += issue.score * weight;
+                        max_accumulated_badness = std::max(max_accumulated_badness, accumulated_badness(yy, xx));
+                    }
+                }
+            }
+        }
+
+        std::cout << "flatten prune: multiscale success=" << (any_success ? "true" : "false")
+                  << " exploded=" << (any_exploded ? "true" : "false")
+                  << " max_badness=" << max_accumulated_badness << std::endl;
+
+        if (!any_success || (flatten_prune_exploded_only && !any_exploded)) {
+            return 0;
+        }
+
+        std::vector<vc::ABFVertexIssue> worst_vertices;
+        worst_vertices.reserve(static_cast<std::size_t>(active.area()));
+        for (int y = 0; y < active.height; ++y) {
+            for (int x = 0; x < active.width; ++x) {
+                const float score = accumulated_badness(y, x);
+                if (score >= flatten_prune_score_threshold) {
+                    worst_vertices.push_back({cv::Vec2i(active.y + y, active.x + x), score});
+                }
+            }
+        }
+        std::sort(worst_vertices.begin(), worst_vertices.end(),
+                  [](const vc::ABFVertexIssue& a, const vc::ABFVertexIssue& b) {
+                      return a.score > b.score;
+                  });
+
+        std::vector<cv::Vec2i> to_prune;
+        to_prune.reserve(static_cast<std::size_t>(flatten_prune_max_vertices));
+        std::unordered_set<cv::Vec2i, vec2i_hash> seen;
+        for (const vc::ABFVertexIssue& issue : worst_vertices) {
+            if (issue.score < flatten_prune_score_threshold) {
+                break;
+            }
+            const cv::Vec2i p = issue.point;
+            if (p == data.seed_loc) {
+                continue;
+            }
+            if (p[0] < 0 || p[0] >= points.rows || p[1] < 0 || p[1] >= points.cols) {
+                continue;
+            }
+            if ((state(p) & STATE_LOC_VALID) == 0 || points(p)[0] == -1) {
+                continue;
+            }
+            if (!seen.insert(p).second) {
+                continue;
+            }
+            to_prune.push_back(p);
+            if (static_cast<int>(to_prune.size()) >= flatten_prune_max_vertices) {
+                break;
+            }
+        }
+
+        for (const cv::Vec2i& p : to_prune) {
+            prune_point(p);
+        }
+
+        if (!to_prune.empty()) {
+            const int disconnected_pruned = prune_to_largest_2d_component();
+            recompute_used_area_from_state();
+            rebuild_frontier_from_state();
+
+            for (int i = 0; i < omp_get_max_threads(); i++) {
+                data_ths[i] = data;
+                added_points_threads[i].clear();
+            }
+
+            std::cout << "flatten prune: removed " << to_prune.size()
+                      << " vertices after generation " << generation;
+            if (disconnected_pruned > 0) {
+                std::cout << " plus " << disconnected_pruned << " disconnected vertices";
+            }
+            std::cout << std::endl;
+        }
+
+        return static_cast<int>(to_prune.size());
+    };
+
+    auto run_flatten_regrid = [&](int generation) -> int {
+        if (flatten_regrid_interval <= 0) {
+            return 0;
+        }
+        if ((generation + 1) % flatten_regrid_interval != 0) {
+            return 0;
+        }
+
+        const cv::Rect active = used_area & cv::Rect(0, 0, points.cols, points.rows);
+        if (active.area() <= 0) {
+            return 0;
+        }
+
+        int valid_count = 0;
+        for (int y = active.y; y < active.br().y; ++y) {
+            for (int x = active.x; x < active.br().x; ++x) {
+                if ((state(y, x) & STATE_LOC_VALID) && points(y, x)[0] != -1) {
+                    valid_count++;
+                }
+            }
+        }
+        if (valid_count < flatten_regrid_min_valid) {
+            return 0;
+        }
+
+        cv::Mat_<cv::Vec3f> diagnostic_points(active.height, active.width, cv::Vec3f(-1, -1, -1));
+        for (int y = 0; y < active.height; ++y) {
+            for (int x = 0; x < active.width; ++x) {
+                const int src_y = active.y + y;
+                const int src_x = active.x + x;
+                if ((state(src_y, src_x) & STATE_LOC_VALID) == 0 || points(src_y, src_x)[0] == -1) {
+                    continue;
+                }
+                const cv::Vec3d& p3 = points(src_y, src_x);
+                diagnostic_points(y, x) = {
+                    static_cast<float>(p3[0]),
+                    static_cast<float>(p3[1]),
+                    static_cast<float>(p3[2])
+                };
+            }
+        }
+
+        cv::Mat_<cv::Vec3f>* diagnostic_points_ptr = new cv::Mat_<cv::Vec3f>(diagnostic_points);
+        QuadSurface diagnostic_surface(diagnostic_points_ptr, {1.f, 1.f});
+        vc::ABFConfig config;
+        config.maxIterations = static_cast<std::size_t>(std::max(1, flatten_regrid_abf_iterations));
+        config.useABF = true;
+        config.scaleToOriginalArea = false;
+        config.downsampleFactor = 1;
+        config.alignToInputGrid = true;
+        vc::ABFDiagnostics diagnostics = vc::diagnoseAbfFlattening(diagnostic_surface, config, 0);
+        std::cout << "flatten regrid: success=" << (diagnostics.success ? "true" : "false")
+                  << " exploded=" << (diagnostics.exploded ? "true" : "false")
+                  << " grad=" << diagnostics.abfGradient
+                  << " valid_uv=" << diagnostics.validUvCount
+                  << " flipped=" << diagnostics.flippedTriangles
+                  << " near_zero=" << diagnostics.nearZeroUvTriangles << std::endl;
+        if (!diagnostics.failureReason.empty()) {
+            std::cout << "flatten regrid: " << diagnostics.failureReason << std::endl;
+        }
+        if (!diagnostics.success || diagnostics.exploded || diagnostics.uv.empty()) {
+            return 0;
+        }
+
+        int usable_uv_count = 0;
+        cv::Vec2d uv_mean(0.0, 0.0);
+        cv::Vec2d grid_mean(0.0, 0.0);
+        for (int y = 0; y < active.height; ++y) {
+            for (int x = 0; x < active.width; ++x) {
+                const int src_y = active.y + y;
+                const int src_x = active.x + x;
+                if ((state(src_y, src_x) & STATE_LOC_VALID) == 0 || points(src_y, src_x)[0] == -1) {
+                    continue;
+                }
+                const cv::Vec2f& uv = diagnostics.uv(y, x);
+                if (uv[0] == -1.f || !std::isfinite(uv[0]) || !std::isfinite(uv[1])) {
+                    continue;
+                }
+                uv_mean += cv::Vec2d(uv[0], uv[1]);
+                grid_mean += cv::Vec2d(src_x, src_y);
+                usable_uv_count++;
+            }
+        }
+        if (usable_uv_count < flatten_regrid_min_valid) {
+            return 0;
+        }
+
+        uv_mean *= 1.0 / static_cast<double>(usable_uv_count);
+        grid_mean *= 1.0 / static_cast<double>(usable_uv_count);
+
+        double denom = 0.0;
+        double a_num = 0.0;
+        double b_num = 0.0;
+        for (int y = 0; y < active.height; ++y) {
+            for (int x = 0; x < active.width; ++x) {
+                const int src_y = active.y + y;
+                const int src_x = active.x + x;
+                if ((state(src_y, src_x) & STATE_LOC_VALID) == 0 || points(src_y, src_x)[0] == -1) {
+                    continue;
+                }
+                const cv::Vec2f& uv = diagnostics.uv(y, x);
+                if (uv[0] == -1.f || !std::isfinite(uv[0]) || !std::isfinite(uv[1])) {
+                    continue;
+                }
+                const double ux = static_cast<double>(uv[0]) - uv_mean[0];
+                const double uy = static_cast<double>(uv[1]) - uv_mean[1];
+                const double gx = static_cast<double>(src_x) - grid_mean[0];
+                const double gy = static_cast<double>(src_y) - grid_mean[1];
+                denom += ux * ux + uy * uy;
+                a_num += gx * ux + gy * uy;
+                b_num += gy * ux - gx * uy;
+            }
+        }
+        if (!std::isfinite(denom) || denom <= 1e-12) {
+            return 0;
+        }
+        const double fit_a = a_num / denom;
+        const double fit_b = b_num / denom;
+        if (!std::isfinite(fit_a) || !std::isfinite(fit_b) || (fit_a * fit_a + fit_b * fit_b) <= 1e-12) {
+            return 0;
+        }
+
+        auto map_uv_to_grid = [&](const cv::Vec2f& uv) -> cv::Vec2i {
+            const double ux = static_cast<double>(uv[0]) - uv_mean[0];
+            const double uy = static_cast<double>(uv[1]) - uv_mean[1];
+            const double gx = fit_a * ux - fit_b * uy + grid_mean[0];
+            const double gy = fit_b * ux + fit_a * uy + grid_mean[1];
+            const int mapped_x = std::clamp(static_cast<int>(std::lround(gx)), 0, points.cols - 1);
+            const int mapped_y = std::clamp(static_cast<int>(std::lround(gy)), 0, points.rows - 1);
+            return {mapped_y, mapped_x};
+        };
+
+        struct RegridMove {
+            cv::Vec2i from;
+            cv::Vec2i to;
+            int priority = 0;
+        };
+        std::vector<RegridMove> moves;
+        moves.reserve(static_cast<std::size_t>(usable_uv_count));
+        std::unordered_set<cv::Vec2i, vec2i_hash> occupied;
+        auto in_active = [&](const cv::Vec2i& p) {
+            return active.contains(cv::Point(p[1], p[0]));
+        };
+        const bool seed_in_active =
+            in_active(data.seed_loc) &&
+            (state(data.seed_loc) & STATE_LOC_VALID) != 0 &&
+            points(data.seed_loc)[0] != -1;
+        for (int y = 0; y < active.height; ++y) {
+            for (int x = 0; x < active.width; ++x) {
+                const cv::Vec2i from(active.y + y, active.x + x);
+                if ((state(from) & STATE_LOC_VALID) == 0 || points(from)[0] == -1) {
+                    continue;
+                }
+                const cv::Vec2f& uv = diagnostics.uv(y, x);
+                if (uv[0] == -1.f || !std::isfinite(uv[0]) || !std::isfinite(uv[1])) {
+                    continue;
+                }
+                const cv::Vec2i to = map_uv_to_grid(uv);
+                if (!active.contains(cv::Point(to[1], to[0]))) {
+                    continue;
+                }
+                if (flatten_regrid_max_displacement > 0 &&
+                    (std::abs(to[0] - from[0]) > flatten_regrid_max_displacement ||
+                     std::abs(to[1] - from[1]) > flatten_regrid_max_displacement)) {
+                    continue;
+                }
+                int priority = static_cast<int>(inliers_sum_dbg(from));
+                if (from == data.seed_loc) {
+                    priority = std::numeric_limits<int>::max();
+                }
+                moves.push_back({from, to, priority});
+            }
+        }
+
+        std::sort(moves.begin(), moves.end(), [](const RegridMove& a, const RegridMove& b) {
+            if (a.priority != b.priority) {
+                return a.priority > b.priority;
+            }
+            if (a.from[0] != b.from[0]) {
+                return a.from[0] < b.from[0];
+            }
+            return a.from[1] < b.from[1];
+        });
+
+        std::vector<RegridMove> kept_moves;
+        kept_moves.reserve(moves.size());
+        bool seed_kept = !seed_in_active;
+        for (const RegridMove& move : moves) {
+            if (!occupied.insert(move.to).second) {
+                continue;
+            }
+            kept_moves.push_back(move);
+            seed_kept = seed_kept || move.from == data.seed_loc;
+        }
+        if (kept_moves.empty()) {
+            return 0;
+        }
+        if (!seed_kept) {
+            std::cout << "flatten regrid: rejecting remap; seed would be removed" << std::endl;
+            return 0;
+        }
+        const double keep_ratio = static_cast<double>(kept_moves.size()) / static_cast<double>(valid_count);
+        if (keep_ratio < static_cast<double>(flatten_regrid_min_keep_ratio)) {
+            std::cout << "flatten regrid: rejecting remap; kept ratio "
+                      << keep_ratio << " below " << flatten_regrid_min_keep_ratio << std::endl;
+            return 0;
+        }
+
+        SurfTrackerData old_data = data;
+        cv::Mat_<uint8_t> old_state = state.clone();
+        cv::Mat_<uint16_t> old_generations = generations.clone();
+        cv::Mat_<cv::Vec3d> old_points = points.clone();
+        cv::Mat_<uint16_t> old_inliers = inliers_sum_dbg.clone();
+
+        for (int y = active.y; y < active.br().y; ++y) {
+            for (int x = active.x; x < active.br().x; ++x) {
+                const cv::Vec2i p(y, x);
+                state(p) = 0;
+                generations(p) = 0;
+                points(p) = {-1, -1, -1};
+                inliers_sum_dbg(p) = 0;
+            }
+        }
+
+        auto data_it = data._data.begin();
+        while (data_it != data._data.end()) {
+            if (in_active(data_it->first.second)) {
+                data_it = data._data.erase(data_it);
+            } else {
+                ++data_it;
+            }
+        }
+        auto surfs_it = data._surfs.begin();
+        while (surfs_it != data._surfs.end()) {
+            if (in_active(surfs_it->first)) {
+                surfs_it = data._surfs.erase(surfs_it);
+            } else {
+                ++surfs_it;
+            }
+        }
+        data._res_blocks.clear();
+
+        int moved_seed = 0;
+        for (const RegridMove& move : kept_moves) {
+            state(move.to) = old_state(move.from);
+            generations(move.to) = old_generations(move.from);
+            points(move.to) = old_points(move.from);
+            inliers_sum_dbg(move.to) = old_inliers(move.from);
+
+            data.surfs(move.to) = old_data.surfsC(move.from);
+            for (QuadSurface* surf : data.surfs(move.to)) {
+                if (old_data.has(surf, move.from)) {
+                    data.loc(surf, move.to) = old_data._data[{surf, move.from}];
+                }
+            }
+            if (move.from == old_data.seed_loc) {
+                data.seed_loc = move.to;
+                moved_seed++;
+            }
+        }
+        data.seed_coord = old_data.seed_coord;
+
+        recompute_used_area_from_state();
+        fringe.clear();
+        for (const RegridMove& move : kept_moves) {
+            if ((state(move.to) & STATE_LOC_VALID) == 0) {
+                continue;
+            }
+            for (const auto& n : neighs) {
+                const cv::Vec2i pn = move.to + n;
+                if (pn[0] < 0 || pn[0] >= state.rows || pn[1] < 0 || pn[1] >= state.cols) {
+                    continue;
+                }
+                if ((state(pn) & STATE_LOC_VALID) == 0) {
+                    fringe.insert(move.to);
+                    break;
+                }
+            }
+        }
+
+        for (int i = 0; i < omp_get_max_threads(); i++) {
+            data_ths[i] = data;
+            added_points_threads[i].clear();
+        }
+
+        std::cout << "flatten regrid: moved " << kept_moves.size()
+                  << " / " << moves.size()
+                  << " vertices after generation " << generation;
+        if (moved_seed > 0) {
+            std::cout << " (seed moved to " << data.seed_loc << ")";
+        }
+        std::cout << std::endl;
+
+        return static_cast<int>(kept_moves.size());
+    };
+
     bool at_right_border = false;
     std::optional<std::filesystem::path> current_snapshot_path;
     for(int generation=0;generation<stop_gen;generation++) {
@@ -2268,7 +3098,44 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
         std::cout << "go with cands " << cands.size() << " inl_th " << curr_best_inl_th << std::endl;
 
-        OmpThreadPointCol threadcol(3, cands);
+        struct OrderedCandidate {
+            cv::Vec2i p;
+            int valid_neighbor_count = 0;
+        };
+        std::vector<OrderedCandidate> ordered_cands;
+        ordered_cands.reserve(cands.size());
+        auto count_valid_neighbors = [&](const cv::Vec2i& p) {
+            int count = 0;
+            for (const auto& n : all_8_neighs) {
+                const cv::Vec2i pn = p + n;
+                if (pn[0] >= 0 && pn[0] < state.rows &&
+                    pn[1] >= 0 && pn[1] < state.cols &&
+                    (state(pn) & STATE_LOC_VALID)) {
+                    count++;
+                }
+            }
+            return count;
+        };
+        for (const cv::Vec2i& p : cands) {
+            ordered_cands.push_back({p, count_valid_neighbors(p)});
+        }
+        std::sort(ordered_cands.begin(), ordered_cands.end(),
+                  [](const OrderedCandidate& a, const OrderedCandidate& b) {
+                      if (a.valid_neighbor_count != b.valid_neighbor_count) {
+                          return a.valid_neighbor_count > b.valid_neighbor_count;
+                      }
+                      if (a.p[0] != b.p[0]) {
+                          return a.p[0] < b.p[0];
+                      }
+                      return a.p[1] < b.p[1];
+                  });
+        std::vector<cv::Vec2i> ordered_points;
+        ordered_points.reserve(ordered_cands.size());
+        for (const OrderedCandidate& cand : ordered_cands) {
+            ordered_points.push_back(cand.p);
+        }
+
+        OmpThreadPointCol threadcol(3, ordered_points);
 
         std::shared_mutex mutex;
         int best_inliers_gen = 0;
@@ -2565,6 +3432,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 best_inliers_gen = std::max(best_inliers_gen, best_inliers);
             }
         }
+
+        run_flatten_prune(generation);
+        run_flatten_regrid(generation);
 
         if (!flip_x_done && generation >= 1) {
             if (has_horizontal_extent_to_flip()) {

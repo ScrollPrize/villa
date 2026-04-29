@@ -890,13 +890,20 @@ static void alignUVsToInputGrid(const cv::Mat_<cv::Vec3f>& points, cv::Mat_<cv::
  */
 static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
                                               const ABFConfig& config,
-                                              int* skippedDegenerateOut = nullptr) {
+                                              int* skippedDegenerateOut = nullptr,
+                                              ABFDiagnostics* diagnosticsOut = nullptr) {
     if (skippedDegenerateOut) {
         *skippedDegenerateOut = 0;
+    }
+    if (diagnosticsOut) {
+        *diagnosticsOut = ABFDiagnostics{};
     }
     const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
     if (!points || points->empty()) {
         std::cerr << "ABF++: Empty surface" << std::endl;
+        if (diagnosticsOut) {
+            diagnosticsOut->failureReason = "empty surface";
+        }
         return cv::Mat_<cv::Vec2f>();
     }
 
@@ -980,6 +987,9 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
 
     if (triangles.empty()) {
         std::cerr << "ABF++: No non-degenerate faces found" << std::endl;
+        if (diagnosticsOut) {
+            diagnosticsOut->failureReason = "no non-degenerate faces";
+        }
         return cv::Mat_<cv::Vec2f>();
     }
 
@@ -1227,6 +1237,9 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
 
     if (selectedTriangles.empty()) {
         std::cerr << "ABF++: No valid triangles left after boundary cleanup" << std::endl;
+        if (diagnosticsOut) {
+            diagnosticsOut->failureReason = "no valid triangles after boundary cleanup";
+        }
         return cv::Mat_<cv::Vec2f>();
     }
 
@@ -1303,12 +1316,16 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
     gridToVertex.reserve(selectedTriangles.size() * 2);
 
     std::size_t vertexIdx = 0;
+    const auto baseGridIndex = [&](int vid) -> int {
+        auto it = syntheticToBaseGrid.find(vid);
+        return it == syntheticToBaseGrid.end() ? vid : it->second;
+    };
     auto getOrInsertVertex = [&](int gridIdx) -> std::size_t {
         auto it = gridToVertex.find(gridIdx);
         if (it != gridToVertex.end()) {
             return it->second;
         }
-        const int baseGridIdx = gridIdx < gridVertexCount ? gridIdx : syntheticToBaseGrid.at(gridIdx);
+        const int baseGridIdx = baseGridIndex(gridIdx);
         const int row = baseGridIdx / points->cols;
         const int col = baseGridIdx % points->cols;
         const cv::Vec3f& pt = (*points)(row, col);
@@ -1326,6 +1343,8 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
     };
 
     int faceCount = 0;
+    std::vector<TriangleIdx> faceToBaseGrid;
+    faceToBaseGrid.reserve(selectedTriangles.size());
     try {
         for (const auto& t : selectedTriangles) {
             const std::size_t v0 = getOrInsertVertex(t.i0);
@@ -1333,10 +1352,14 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
             const std::size_t v2 = getOrInsertVertex(t.i2);
             std::vector<std::size_t> face = {v0, v1, v2};
             hem->insert_face(face);
+            faceToBaseGrid.push_back({baseGridIndex(t.i0), baseGridIndex(t.i1), baseGridIndex(t.i2)});
             faceCount++;
         }
     } catch (const OpenABF::MeshException& e) {
         std::cerr << "ABF++: Failed to insert mesh faces: " << e.what() << std::endl;
+        if (diagnosticsOut) {
+            diagnosticsOut->failureReason = std::string("failed to insert mesh faces: ") + e.what();
+        }
         return cv::Mat_<cv::Vec2f>();
     }
 
@@ -1367,6 +1390,9 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
     }
     if (faceCount == 0) {
         std::cerr << "ABF++: No non-degenerate faces found after filtering" << std::endl;
+        if (diagnosticsOut) {
+            diagnosticsOut->failureReason = "no non-degenerate faces after filtering";
+        }
         return cv::Mat_<cv::Vec2f>();
     }
 
@@ -1374,16 +1400,24 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
         hem->update_boundary();
     } catch (const OpenABF::MeshException& e) {
         std::cerr << "ABF++: Boundary update failed: " << e.what() << std::endl;
+        if (diagnosticsOut) {
+            diagnosticsOut->failureReason = std::string("boundary update failed: ") + e.what();
+        }
         return cv::Mat_<cv::Vec2f>();
     }
 
     // Step 3: Check manifold
     if (!OpenABF::IsManifold(hem)) {
         std::cerr << "ABF++: Mesh is not manifold" << std::endl;
+        if (diagnosticsOut) {
+            diagnosticsOut->failureReason = "mesh is not manifold";
+        }
         return cv::Mat_<cv::Vec2f>();
     }
 
     // Step 4: Run ABF++ optimization
+    std::vector<double> abfVertexError;
+    std::vector<double> abfFaceError;
     if (config.useABF) {
         std::cout << "ABF++: Running angle optimization (max " << config.maxIterations << " iterations)..." << std::endl;
         std::size_t iters = 0;
@@ -1391,8 +1425,22 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
         try {
             ABF::Compute(hem, iters, grad, config.maxIterations);
             std::cout << "ABF++: Completed in " << iters << " iterations, final grad: " << grad << std::endl;
+            if (diagnosticsOut) {
+                diagnosticsOut->abfIterations = iters;
+                diagnosticsOut->abfGradient = grad;
+                try {
+                    const auto stats = OpenABF::ComputeABFDiagnostics<double>(hem);
+                    abfVertexError = stats.vertexConstraintError;
+                    abfFaceError = stats.faceConstraintError;
+                } catch (const std::exception& e) {
+                    std::cerr << "ABF++: Diagnostics failed: " << e.what() << std::endl;
+                }
+            }
         } catch (const OpenABF::SolverException& e) {
             std::cerr << "ABF++: Solver failed (" << e.what() << "), falling back to LSCM only" << std::endl;
+            if (diagnosticsOut) {
+                diagnosticsOut->failureReason = std::string("ABF solver failed; used LSCM fallback: ") + e.what();
+            }
         }
     }
 
@@ -1402,6 +1450,9 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
         LSCM::Compute(hem);
     } catch (const std::exception& e) {
         std::cerr << "ABF++: LSCM failed: " << e.what() << std::endl;
+        if (diagnosticsOut) {
+            diagnosticsOut->failureReason = std::string("LSCM failed: ") + e.what();
+        }
         return cv::Mat_<cv::Vec2f>();
     }
 
@@ -1436,6 +1487,230 @@ static cv::Mat_<cv::Vec2f> abfFlattenInternal(const QuadSurface& surface,
                     }
                 }
             }
+        }
+    }
+
+    if (diagnosticsOut) {
+        diagnosticsOut->success = true;
+        diagnosticsOut->uv = uvs.clone();
+        diagnosticsOut->vertexBadness = cv::Mat_<float>(points->size(), 0.f);
+        diagnosticsOut->validUvCount = 0;
+
+        for (int row = 0; row < uvs.rows; ++row) {
+            for (int col = 0; col < uvs.cols; ++col) {
+                const cv::Vec2f& uv = uvs(row, col);
+                if (uv[0] != -1.f && std::isfinite(uv[0]) && std::isfinite(uv[1])) {
+                    diagnosticsOut->validUvCount++;
+                } else if (isValidSurfacePoint((*points)(row, col))) {
+                    diagnosticsOut->vertexBadness(row, col) += 1000.f;
+                }
+            }
+        }
+
+        auto addGridBadness = [&](int linearIdx, float value) {
+            if (!std::isfinite(value) || linearIdx < 0 || linearIdx >= points->rows * points->cols) {
+                return;
+            }
+            const int row = linearIdx / points->cols;
+            const int col = linearIdx % points->cols;
+            diagnosticsOut->vertexBadness(row, col) += value;
+            diagnosticsOut->maxVertexBadness = std::max(diagnosticsOut->maxVertexBadness,
+                                                        diagnosticsOut->vertexBadness(row, col));
+        };
+
+        if (!abfVertexError.empty()) {
+            for (const auto& [hemIdx, gridIdx] : vertexToGrid) {
+                if (hemIdx < abfVertexError.size()) {
+                    addGridBadness(gridIdx, static_cast<float>(abfVertexError[hemIdx]));
+                }
+            }
+        }
+
+        if (!abfFaceError.empty()) {
+            for (std::size_t faceIdx = 0; faceIdx < faceToBaseGrid.size() && faceIdx < abfFaceError.size(); ++faceIdx) {
+                const float contribution = static_cast<float>(abfFaceError[faceIdx]);
+                addGridBadness(faceToBaseGrid[faceIdx].i0, contribution);
+                addGridBadness(faceToBaseGrid[faceIdx].i1, contribution);
+                addGridBadness(faceToBaseGrid[faceIdx].i2, contribution);
+            }
+        }
+
+        std::vector<float> stretchRatios;
+        std::vector<std::pair<TriangleIdx, float>> signedUvAreas;
+        stretchRatios.reserve(faceToBaseGrid.size() * 3);
+        signedUvAreas.reserve(faceToBaseGrid.size());
+        auto addUvTriangleDiagnostics = [&](const TriangleIdx& t) {
+            const std::array<int, 3> idx{t.i0, t.i1, t.i2};
+            std::array<cv::Vec3f, 3> p3;
+            std::array<cv::Vec2f, 3> p2;
+            for (int k = 0; k < 3; ++k) {
+                const int row = idx[k] / points->cols;
+                const int col = idx[k] % points->cols;
+                p3[k] = (*points)(row, col);
+                p2[k] = uvs(row, col);
+                if (!isValidSurfacePoint(p3[k]) || p2[k][0] == -1.f ||
+                    !std::isfinite(p2[k][0]) || !std::isfinite(p2[k][1])) {
+                    for (int badIdx : idx) {
+                        addGridBadness(badIdx, 1000.f);
+                    }
+                    diagnosticsOut->exploded = true;
+                    return;
+                }
+            }
+
+            const cv::Vec2f e20 = p2[1] - p2[0];
+            const cv::Vec2f e21 = p2[2] - p2[0];
+            const float uvSignedArea2 = e20[0] * e21[1] - e20[1] * e21[0];
+            const float uvArea2 = std::abs(uvSignedArea2);
+            if (!std::isfinite(uvArea2) || uvArea2 < 1e-6f) {
+                diagnosticsOut->nearZeroUvTriangles++;
+                for (int badIdx : idx) {
+                    addGridBadness(badIdx, 250.f);
+                }
+            }
+            if (std::isfinite(uvSignedArea2) && uvArea2 >= 1e-6f) {
+                signedUvAreas.push_back({t, uvSignedArea2});
+            }
+
+            for (int k = 0; k < 3; ++k) {
+                const int n = (k + 1) % 3;
+                const cv::Vec3f d3 = p3[k] - p3[n];
+                const cv::Vec2f d2 = p2[k] - p2[n];
+                const float len3 = std::sqrt(d3.dot(d3));
+                const float len2 = std::sqrt(d2.dot(d2));
+                if (std::isfinite(len3) && std::isfinite(len2) && len3 > 1e-6f && len2 > 1e-6f) {
+                    stretchRatios.push_back(len2 / len3);
+                }
+            }
+        };
+
+        for (const TriangleIdx& t : faceToBaseGrid) {
+            addUvTriangleDiagnostics(t);
+        }
+
+        if (!signedUvAreas.empty()) {
+            int positive = 0;
+            int negative = 0;
+            for (const auto& [_, signedArea] : signedUvAreas) {
+                if (signedArea > 0.f) {
+                    positive++;
+                } else if (signedArea < 0.f) {
+                    negative++;
+                }
+            }
+            const int majoritySign = positive >= negative ? 1 : -1;
+            for (const auto& [t, signedArea] : signedUvAreas) {
+                if ((signedArea > 0.f ? 1 : -1) == majoritySign) {
+                    continue;
+                }
+                diagnosticsOut->flippedTriangles++;
+                addGridBadness(t.i0, 500.f);
+                addGridBadness(t.i1, 500.f);
+                addGridBadness(t.i2, 500.f);
+            }
+        }
+
+        float stretchP50 = 0.f;
+        if (!stretchRatios.empty()) {
+            std::sort(stretchRatios.begin(), stretchRatios.end());
+            stretchP50 = stretchRatios[stretchRatios.size() / 2];
+        }
+        if (stretchP50 > 1e-6f) {
+            auto addStretchBadness = [&](const TriangleIdx& t) {
+                const std::array<int, 3> idx{t.i0, t.i1, t.i2};
+                for (int k = 0; k < 3; ++k) {
+                    const int n = (k + 1) % 3;
+                    const int row0 = idx[k] / points->cols;
+                    const int col0 = idx[k] % points->cols;
+                    const int row1 = idx[n] / points->cols;
+                    const int col1 = idx[n] % points->cols;
+                    const cv::Vec3f d3 = (*points)(row0, col0) - (*points)(row1, col1);
+                    const cv::Vec2f d2 = uvs(row0, col0) - uvs(row1, col1);
+                    const float len3 = std::sqrt(d3.dot(d3));
+                    const float len2 = std::sqrt(d2.dot(d2));
+                    if (!std::isfinite(len3) || !std::isfinite(len2) || len3 <= 1e-6f || len2 <= 1e-6f) {
+                        continue;
+                    }
+                    const float ratio = len2 / len3;
+                    const float rel = std::max(ratio / stretchP50, stretchP50 / ratio);
+                    if (rel > 8.f) {
+                        const float score = std::min(1000.f, rel * 20.f);
+                        addGridBadness(idx[k], score);
+                        addGridBadness(idx[n], score);
+                    }
+                }
+            };
+            for (const TriangleIdx& t : faceToBaseGrid) {
+                addStretchBadness(t);
+            }
+        }
+
+        if (stretchP50 > 1e-6f) {
+            struct UVSample {
+                int row;
+                int col;
+                cv::Vec2f uv;
+            };
+            std::vector<UVSample> samples;
+            samples.reserve(static_cast<std::size_t>(diagnosticsOut->validUvCount));
+            for (int row = 0; row < uvs.rows; ++row) {
+                for (int col = 0; col < uvs.cols; ++col) {
+                    if (!isValidSurfacePoint((*points)(row, col))) {
+                        continue;
+                    }
+                    const cv::Vec2f& uv = uvs(row, col);
+                    if (uv[0] == -1.f || !std::isfinite(uv[0]) || !std::isfinite(uv[1])) {
+                        continue;
+                    }
+                    samples.push_back({row, col, uv});
+                }
+            }
+
+            const float crowdRadius = std::max(1e-4f, stretchP50 * 0.35f);
+            const float crowdRadiusSq = crowdRadius * crowdRadius;
+            const int maxSamplesForQuadraticCrowdCheck = 12000;
+            if (static_cast<int>(samples.size()) <= maxSamplesForQuadraticCrowdCheck) {
+                for (std::size_t i = 0; i < samples.size(); ++i) {
+                    for (std::size_t j = i + 1; j < samples.size(); ++j) {
+                        const int gridDist = std::max(std::abs(samples[i].row - samples[j].row),
+                                                      std::abs(samples[i].col - samples[j].col));
+                        if (gridDist <= 1) {
+                            continue;
+                        }
+                        const cv::Vec2f d = samples[i].uv - samples[j].uv;
+                        const float distSq = d.dot(d);
+                        if (!std::isfinite(distSq) || distSq >= crowdRadiusSq) {
+                            continue;
+                        }
+                        const float closeness = 1.f - distSq / crowdRadiusSq;
+                        const float score = 300.f + 700.f * std::clamp(closeness, 0.f, 1.f);
+                        addGridBadness(samples[i].row * points->cols + samples[i].col, score);
+                        addGridBadness(samples[j].row * points->cols + samples[j].col, score);
+                        diagnosticsOut->crowdedUvPairs++;
+                    }
+                }
+            }
+        }
+
+        diagnosticsOut->worstVertices.clear();
+        diagnosticsOut->worstVertices.reserve(static_cast<std::size_t>(points->rows * points->cols));
+        for (int row = 0; row < diagnosticsOut->vertexBadness.rows; ++row) {
+            for (int col = 0; col < diagnosticsOut->vertexBadness.cols; ++col) {
+                const float score = diagnosticsOut->vertexBadness(row, col);
+                diagnosticsOut->maxVertexBadness = std::max(diagnosticsOut->maxVertexBadness, score);
+                if (score > 0.f && std::isfinite(score)) {
+                    diagnosticsOut->worstVertices.push_back({cv::Vec2i(row, col), score});
+                }
+            }
+        }
+        std::sort(diagnosticsOut->worstVertices.begin(), diagnosticsOut->worstVertices.end(),
+                  [](const ABFVertexIssue& a, const ABFVertexIssue& b) {
+                      return a.score > b.score;
+                  });
+
+        if (diagnosticsOut->flippedTriangles > 0 || diagnosticsOut->nearZeroUvTriangles > 0 ||
+            !std::isfinite(diagnosticsOut->abfGradient)) {
+            diagnosticsOut->exploded = true;
         }
     }
 
@@ -1568,6 +1843,25 @@ cv::Mat_<cv::Vec2f> abfFlatten(const QuadSurface& surface, const ABFConfig& conf
         alignUVsToInputGrid(*points, result);
     }
     return result;
+}
+
+ABFDiagnostics diagnoseAbfFlattening(const QuadSurface& surface,
+                                     const ABFConfig& config,
+                                     std::size_t maxWorstVertices)
+{
+    ABFConfig diagnosticConfig = config;
+    diagnosticConfig.downsampleFactor = 1;
+
+    ABFDiagnostics diagnostics;
+    (void)abfFlattenInternal(surface, diagnosticConfig, nullptr, &diagnostics);
+    const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
+    if (config.alignToInputGrid && points && !points->empty() && !diagnostics.uv.empty()) {
+        alignUVsToInputGrid(*points, diagnostics.uv);
+    }
+    if (diagnostics.worstVertices.size() > maxWorstVertices) {
+        diagnostics.worstVertices.resize(maxWorstVertices);
+    }
+    return diagnostics;
 }
 
 bool abfFlattenInPlace(QuadSurface& surface, const ABFConfig& config) {

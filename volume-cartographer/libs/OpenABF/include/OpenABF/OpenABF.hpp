@@ -2193,6 +2193,54 @@ auto Gradient(const MeshPtr& mesh) -> T
 }
 }  // namespace detail::ABF
 
+template <typename T>
+struct ABFDiagnosticStats {
+    T globalGradient{0};
+    std::vector<T> vertexConstraintError;
+    std::vector<T> faceConstraintError;
+    std::vector<T> edgeAngleGradient;
+};
+
+template <typename T, class MeshPtr>
+auto ComputeABFDiagnostics(const MeshPtr& mesh) -> ABFDiagnosticStats<T>
+{
+    using namespace detail::ABF;
+
+    ABFDiagnosticStats<T> stats;
+    stats.globalGradient = Gradient<T>(mesh);
+    stats.vertexConstraintError.assign(mesh->num_vertices(), T(0));
+    stats.faceConstraintError.assign(mesh->num_faces(), T(0));
+    stats.edgeAngleGradient.assign(mesh->num_edges(), T(0));
+
+    for (const auto& f : mesh->faces()) {
+        const T tri = TriGrad<T>(f);
+        const T faceError = std::abs(tri);
+        if (f->idx < stats.faceConstraintError.size()) {
+            stats.faceConstraintError[f->idx] = faceError;
+        }
+        for (const auto& e : *f) {
+            const T alpha = std::abs(AlphaGrad<T>(e));
+            if (e->idx < stats.edgeAngleGradient.size()) {
+                stats.edgeAngleGradient[e->idx] = alpha;
+            }
+            if (e->vertex->idx < stats.vertexConstraintError.size()) {
+                stats.vertexConstraintError[e->vertex->idx] += faceError + alpha;
+            }
+        }
+    }
+
+    for (const auto& v : mesh->vertices_interior()) {
+        const T plan = PlanGrad<T>(v);
+        const T len = LenGrad<T>(v);
+        const T vertexError = std::sqrt(plan * plan + len * len);
+        if (v->idx < stats.vertexConstraintError.size()) {
+            stats.vertexConstraintError[v->idx] += vertexError;
+        }
+    }
+
+    return stats;
+}
+
 /**
  * @brief Compute parameterized interior angles using Angle-based flattening
  *
