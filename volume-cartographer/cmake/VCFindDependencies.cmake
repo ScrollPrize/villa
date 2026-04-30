@@ -142,6 +142,9 @@ find_package(TIFF REQUIRED)
 # ---- Boost (apps/utils only) -------------------------------------------------
 find_package(Boost REQUIRED COMPONENTS program_options)
 
+# ---- libbacktrace (crash dumper, file/line resolution) -----------------------
+find_library(VC_LIBBACKTRACE NAMES backtrace REQUIRED)
+
 # ---- PaStiX ------------------------------------------------------------------
 if (VC_WITH_PASTIX)
   find_package(PaStiX REQUIRED)

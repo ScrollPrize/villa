@@ -10,6 +10,7 @@ add_library(vc_core
         src/SurfacePatchIndex.cpp
         src/PointIndex.cpp
         src/Logging.cpp
+        src/CrashHandler.cpp
         src/SparseChunkSpool.cpp
         src/Slicing.cpp
         src/Compositing.cpp
@@ -65,6 +66,7 @@ target_link_libraries(vc_core PUBLIC
 )
 target_link_libraries(vc_core PRIVATE
     $<BUILD_INTERFACE:blosc_static>
+    ${VC_LIBBACKTRACE}
 )
 
 
