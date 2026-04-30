@@ -111,14 +111,6 @@ if [[ "$MODE" == "root" ]]; then
     log "Ephemeral: /ephemeral already mounted; skipping"
   fi
 
-  log "apt: pin xtl 0.7.7 + xtensor 0.25"
-  tmpd="$(mktemp -d)"; pushd "$tmpd" >/dev/null
-  wget -q http://archive.ubuntu.com/ubuntu/pool/universe/x/xtl/xtl-dev_0.7.7-1_all.deb
-  wget -q http://archive.ubuntu.com/ubuntu/pool/universe/x/xtensor/libxtensor-dev_0.25.0-2ubuntu1_all.deb
-  apt-get install -y --no-install-recommends ./xtl-dev_0.7.7-1_all.deb ./libxtensor-dev_0.25.0-2ubuntu1_all.deb
-  apt-mark hold xtl-dev libxtensor-dev
-  popd >/dev/null; rm -rf "$tmpd"
-
   # ---- CUDA path: cuDSS + Ceres-from-source --------------------------------
   if [[ "$USE_CUDA" == "1" ]]; then
     log "apt: CUDA toolkit"
@@ -172,6 +164,7 @@ if [[ "$MODE" == "root" ]]; then
   tar -xzf "$LIBS_DIR/scotch_6.0.4.tar.gz" -C "$SCOTCH_SRC" --strip-components=1
   pushd "$SCOTCH_SRC/src" >/dev/null
   cp ./Make.inc/Makefile.inc.x86-64_pc_linux2 Makefile.inc
+  sed -i -E 's|^(CFLAGS[[:space:]]*=.*)$|\1 -std=gnu89 -fpermissive|' Makefile.inc
   make -j"$JOBS" scotch
   mkdir -p /usr/local/scotch/{bin,include,lib,share/man/man1}
   make prefix=/usr/local/scotch install
@@ -229,26 +222,6 @@ fi
 
 rm -rf "$BUILD_DIR" "$INSTALL_PREFIX"
 mkdir -p "$BUILD_DIR" "$INSTALL_PREFIX"
-
-# ---- z5 --------------------------------------------------------------------
-log "z5 → $INSTALL_PREFIX"
-pushd "$BUILD_DIR" >/dev/null
-git clone https://github.com/constantinpape/z5.git z5
-pushd z5 >/dev/null
-Z5_COMMIT=ee2081bb974fe0d0d702538400c31c38b09f1629
-git fetch origin "$Z5_COMMIT" --depth 1
-git checkout --detach "$Z5_COMMIT"
-sed -i 's|xtensor/containers/xadapt.hpp|xtensor/xadapt.hpp|' \
-  include/z5/multiarray/xtensor_util.hxx || true
-popd >/dev/null
-cmake -S z5 -B z5/build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
-  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-  -DWITH_BLOSC=ON -DWITH_ZLIB=ON -DBUILD_Z5PY=OFF -DBUILD_TESTS=OFF
-cmake --build z5/build -j"$JOBS"
-cmake --install z5/build
-popd >/dev/null
 
 # ---- libigl + Flatboi ------------------------------------------------------
 log "libigl clone (pinned)"
