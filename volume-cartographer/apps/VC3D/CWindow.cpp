@@ -2865,6 +2865,8 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId, bool isExpand, bool isRandomSeed) {
                 _segmentationCommandHandler->onGrowSeeds(segmentId.toStdString(), isExpand, isRandomSeed);
             });
+    connect(_surfacePanel.get(), &SurfacePanelController::editGrowParamsRequested,
+            _segmentationCommandHandler.get(), &SegmentationCommandHandler::onEditGrowParams);
     connect(_surfacePanel.get(), &SurfacePanelController::teleaInpaintRequested,
             this, [this]() {
                 if (_menuController) {
