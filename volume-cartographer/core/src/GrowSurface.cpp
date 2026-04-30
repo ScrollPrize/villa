@@ -1669,10 +1669,22 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     for(auto sm : approved_sm)
         std::cout << "approved: " << surface_name(sm) << std::endl;
 
-    for(auto &sm : surfs_v)
-        for(const auto& name : sm->overlappingIds())
-            if (surfs.contains(name))
-                overlaps[sm].insert(surfs[name]);
+    for(auto &sm : surfs_v) {
+        auto source_it = surfs.find(surface_name(sm));
+        if (source_it == surfs.end())
+            continue;
+
+        for(const auto& name : sm->overlappingIds()) {
+            auto target_it = surfs.find(name);
+            if (target_it == surfs.end())
+                continue;
+
+            QuadSurface* source = source_it->second;
+            QuadSurface* target = target_it->second;
+            overlaps[source].insert(target);
+            overlaps[target].insert(source);
+        }
+    }
 
     std::cout << "total surface count (after defective filter): " << surfs.size() << std::endl;
     std::cout << "seed " << seed << " name " << surface_name(seed) << " seed overlapping: "
