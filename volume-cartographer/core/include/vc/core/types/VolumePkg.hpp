@@ -124,6 +124,8 @@ public:
     [[nodiscard]] std::string getVolpkgDirectory() const;
     [[nodiscard]] std::string getSegmentationDirectory() const;
     [[nodiscard]] std::vector<std::string> getAvailableSegmentationDirectories() const;
+    [[nodiscard]] std::vector<std::filesystem::path> availableSegmentPaths() const;
+    [[nodiscard]] std::filesystem::path findSegmentPathByName(const std::string& dirName) const;
     void setSegmentationDirectory(const std::string& dirName);
     void refreshSegmentations();
     bool addSingleSegmentation(const std::string& id);

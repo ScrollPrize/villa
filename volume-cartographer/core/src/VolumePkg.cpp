@@ -1009,16 +1009,37 @@ std::vector<std::string> VolumePkg::getAvailableSegmentationDirectories() const
     out.reserve(segments_.size());
     for (const auto& e : segments_) {
         if (vc::project::isLocationRemote(e.location)) continue;
-        out.push_back(vc::project::resolveLocalPath(e.location).filename().string());
+        out.push_back(vc::project::resolveLocalPath(e.location, path_.parent_path()).filename().string());
     }
     return out;
+}
+
+std::vector<fs::path> VolumePkg::availableSegmentPaths() const
+{
+    std::vector<fs::path> out;
+    out.reserve(segments_.size());
+    for (const auto& e : segments_) {
+        if (vc::project::isLocationRemote(e.location)) continue;
+        out.push_back(vc::project::resolveLocalPath(e.location, path_.parent_path()));
+    }
+    return out;
+}
+
+fs::path VolumePkg::findSegmentPathByName(const std::string& dirName) const
+{
+    for (const auto& e : segments_) {
+        if (vc::project::isLocationRemote(e.location)) continue;
+        const auto p = vc::project::resolveLocalPath(e.location, path_.parent_path());
+        if (p.filename().string() == dirName) return p;
+    }
+    return {};
 }
 
 void VolumePkg::setSegmentationDirectory(const std::string& dirName)
 {
     for (const auto& e : segments_) {
         if (vc::project::isLocationRemote(e.location)) continue;
-        if (vc::project::resolveLocalPath(e.location).filename().string() == dirName) {
+        if (vc::project::resolveLocalPath(e.location, path_.parent_path()).filename().string() == dirName) {
             setOutputSegments(e.location);
             return;
         }
