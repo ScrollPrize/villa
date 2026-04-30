@@ -143,28 +143,32 @@ find_package(TIFF REQUIRED)
 find_package(Boost REQUIRED COMPONENTS program_options)
 
 # ---- libbacktrace (crash dumper, file/line resolution) -----------------------
+# Only required on Linux; the crash handler is Linux-only and reduces to a
+# no-op stub on other platforms (see core/src/CrashHandler.cpp).
 # libbacktrace ships bundled with gcc as a static archive at
 # /usr/lib/gcc/<triple>/<ver>/libbacktrace.a. It's also packaged standalone on
 # some distros (Ubuntu 26.04+) as libbacktrace-dev. Try the standalone shared
 # library first and fall back to gcc's bundled static archive — that path is
 # universally available wherever gcc is installed (including Ubuntu 24.04 CI).
-find_library(VC_LIBBACKTRACE NAMES backtrace)
-if(NOT VC_LIBBACKTRACE)
-    find_program(VC_BACKTRACE_GCC NAMES gcc cc REQUIRED)
-    execute_process(
-        COMMAND ${VC_BACKTRACE_GCC} -print-file-name=libbacktrace.a
-        OUTPUT_VARIABLE VC_LIBBACKTRACE_PATH
-        OUTPUT_STRIP_TRAILING_WHITESPACE)
-    if(VC_LIBBACKTRACE_PATH AND EXISTS "${VC_LIBBACKTRACE_PATH}")
-        set(VC_LIBBACKTRACE "${VC_LIBBACKTRACE_PATH}"
-            CACHE FILEPATH "libbacktrace static archive bundled with gcc" FORCE)
-        message(STATUS "libbacktrace: using gcc bundled static ${VC_LIBBACKTRACE}")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    find_library(VC_LIBBACKTRACE NAMES backtrace)
+    if(NOT VC_LIBBACKTRACE)
+        find_program(VC_BACKTRACE_GCC NAMES gcc cc REQUIRED)
+        execute_process(
+            COMMAND ${VC_BACKTRACE_GCC} -print-file-name=libbacktrace.a
+            OUTPUT_VARIABLE VC_LIBBACKTRACE_PATH
+            OUTPUT_STRIP_TRAILING_WHITESPACE)
+        if(VC_LIBBACKTRACE_PATH AND EXISTS "${VC_LIBBACKTRACE_PATH}")
+            set(VC_LIBBACKTRACE "${VC_LIBBACKTRACE_PATH}"
+                CACHE FILEPATH "libbacktrace static archive bundled with gcc" FORCE)
+            message(STATUS "libbacktrace: using gcc bundled static ${VC_LIBBACKTRACE}")
+        endif()
     endif()
-endif()
-if(NOT VC_LIBBACKTRACE)
-    message(FATAL_ERROR
-        "libbacktrace not found. Install libbacktrace-dev (Ubuntu 26.04+) or "
-        "ensure gcc is installed (gcc bundles libbacktrace.a).")
+    if(NOT VC_LIBBACKTRACE)
+        message(FATAL_ERROR
+            "libbacktrace not found. Install libbacktrace-dev (Ubuntu 26.04+) or "
+            "ensure gcc is installed (gcc bundles libbacktrace.a).")
+    endif()
 endif()
 
 # ---- PaStiX ------------------------------------------------------------------

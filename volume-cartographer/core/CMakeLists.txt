@@ -67,8 +67,10 @@ target_link_libraries(vc_core PUBLIC
 )
 target_link_libraries(vc_core PRIVATE
     $<BUILD_INTERFACE:blosc_static>
-    ${VC_LIBBACKTRACE}
 )
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_link_libraries(vc_core PRIVATE ${VC_LIBBACKTRACE})
+endif()
 
 
 

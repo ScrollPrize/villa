@@ -1,4 +1,12 @@
 #include "vc/core/util/CrashHandler.hpp"
+
+#if !defined(__linux__)
+// Crash handler implementation is Linux-only — it depends on /proc, prctl,
+// SYS_gettid, sigaltstack semantics, libbacktrace, etc. On other platforms
+// install() is a no-op so callers don't need #ifdef gating at the call site.
+namespace vc::crash { void install() {} }
+#else
+
 #include "vc/core/Version.hpp"
 
 #include <atomic>
@@ -984,3 +992,5 @@ void install()
 }
 
 }
+
+#endif // __linux__
