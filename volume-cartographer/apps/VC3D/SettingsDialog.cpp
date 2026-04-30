@@ -19,8 +19,8 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
-    edtDefaultPathVolpkg->setText(settings.value(volpkg::DEFAULT_PATH).toString());
-    chkAutoOpenVolpkg->setChecked(settings.value(volpkg::AUTO_OPEN, volpkg::AUTO_OPEN_DEFAULT).toInt() != 0);
+    edtDefaultPathVolpkg->setText(settings.value(project::DEFAULT_PATH).toString());
+    chkAutoOpenVolpkg->setChecked(settings.value(project::AUTO_OPEN, project::AUTO_OPEN_DEFAULT).toInt() != 0);
 
     spinFwdBackStepMs->setValue(settings.value(viewer::FWD_BACK_STEP_MS, viewer::FWD_BACK_STEP_MS_DEFAULT).toInt());
     chkCenterOnZoom->setChecked(settings.value(viewer::CENTER_ON_ZOOM, viewer::CENTER_ON_ZOOM_DEFAULT).toInt() != 0);
@@ -103,8 +103,8 @@ void SettingsDialog::accept()
     using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
-    settings.setValue(volpkg::DEFAULT_PATH, edtDefaultPathVolpkg->text());
-    settings.setValue(volpkg::AUTO_OPEN, chkAutoOpenVolpkg->isChecked() ? "1" : "0");
+    settings.setValue(project::DEFAULT_PATH, edtDefaultPathVolpkg->text());
+    settings.setValue(project::AUTO_OPEN, chkAutoOpenVolpkg->isChecked() ? "1" : "0");
 
     settings.setValue(viewer::FWD_BACK_STEP_MS, spinFwdBackStepMs->value());
     settings.setValue(viewer::CENTER_ON_ZOOM, chkCenterOnZoom->isChecked() ? "1" : "0");

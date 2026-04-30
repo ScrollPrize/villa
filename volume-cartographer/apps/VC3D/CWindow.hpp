@@ -46,7 +46,7 @@
 #define MAX_RECENT_VOLPKG 10
 
 // Volpkg version required by this app
-static constexpr int VOLPKG_MIN_VERSION = 6;
+static constexpr int VOLPKG_MIN_VERSION = 1;
 static constexpr int VOLPKG_SLICE_MIN_INDEX = 0;
 
 
@@ -269,17 +269,6 @@ private:
     CommandLineToolRunner* _cmdRunner;
     bool _normalGridAvailable{false};
     QString _normalGridPath;
-
-    // Remote scroll state for on-demand segment downloading
-    struct RemoteScrollState {
-        std::string baseUrl;
-        std::string segmentsBaseUrl;
-        std::string cachePath;
-        vc::cache::HttpAuth auth;
-        vc::RemoteSegmentSource segSource = vc::RemoteSegmentSource::Segments;
-        bool active = false;
-    };
-    RemoteScrollState _remoteScroll;
 
     std::unique_ptr<FileWatcherService> _fileWatcher;
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;

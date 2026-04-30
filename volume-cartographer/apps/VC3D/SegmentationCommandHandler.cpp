@@ -1929,7 +1929,11 @@ void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentI
     }
     outputDirPath = outDir.absolutePath();
 
-    const QString normalGridPath = QDir(volpkgRoot).filePath(QStringLiteral("normal_grids"));
+    QString normalGridPath;
+    if (_state && _state->vpkg()) {
+        const auto paths = _state->vpkg()->normalGridPaths();
+        if (!paths.empty()) normalGridPath = QString::fromStdString(paths.front().string());
+    }
 
     QJsonObject pass1Params;
     pass1Params["normal_grid_path"] = normalGridPath;
@@ -2105,7 +2109,11 @@ void SegmentationCommandHandler::onResumeLocalGrowPatchRequested(const QString& 
     }
     outputDirPath = outDir.absolutePath();
 
-    const QString normalGridPath = QDir(volpkgRoot).filePath(QStringLiteral("normal_grids"));
+    QString normalGridPath;
+    if (_state && _state->vpkg()) {
+        const auto paths = _state->vpkg()->normalGridPaths();
+        if (!paths.empty()) normalGridPath = QString::fromStdString(paths.front().string());
+    }
 
     QJsonObject params;
     params["normal_grid_path"] = normalGridPath;
