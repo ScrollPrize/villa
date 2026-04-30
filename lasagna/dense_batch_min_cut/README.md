@@ -21,10 +21,13 @@ cd path/to/workdir
 
 Outputs:
 
+- `<stem>_binary.tif`: 8-bit binary mask from a fixed threshold of 127.
 - `<stem>_dt.tif`: normalized 16-bit distance transform visualization.
-- `<stem>_ridges.tif`: 8-bit local maxima traced from the distance transform.
-- `<stem>_skeleton.tif`: 8-bit thinned ridge skeleton.
+- `<stem>_skeleton_zs.tif`: 8-bit Zhang-Suen thinning of the binary foreground.
+- `<stem>_skeleton_dt_ordered.tif`: 8-bit distance-ordered topology-preserving
+  thinning of the binary foreground.
 
-The current ridge tracing is a deterministic local-maximum pass over the distance
-transform. Skeletonization uses an in-tree Zhang-Suen thinning implementation so
-the tool only depends on standard OpenCV modules.
+The threshold is intentionally fixed for repeatable comparisons. The two
+skeletonizers both operate on the binary foreground; the distance transform is
+used for visualization and to order candidate removals in the distance-ordered
+variant.
