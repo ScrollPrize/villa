@@ -3699,7 +3699,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             if (points(p)[0] != -1)
                 throw std::runtime_error("oops points(p)[0]");
 
-            if (!best_approved && (best_inliers >= curr_best_inl_th || best_ref_seed))
+            if (best_inliers >= curr_best_inl_th || best_ref_seed)
             {
                 if (enforce_z_range && (best_coord[2] < z_min || best_coord[2] > z_max)) {
                     // Final guard: reject best candidate outside z-range
@@ -4003,7 +4003,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                     throw std::runtime_error("oops points(p)[0]");
                 }
 
-                if (!result.best_approved && result.accepted(curr_best_inl_th)) {
+                if (result.accepted(curr_best_inl_th)) {
                     if (enforce_z_range && (result.best_coord[2] < z_min || result.best_coord[2] > z_max)) {
                         result.best_inliers = -1;
                         result.best_ref_seed = false;
@@ -4139,6 +4139,32 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                     generations(p) = 0;
                     points(p) = {-1,-1,-1};
                     return false;
+                }
+                cv::Vec2f tmp_loc_;
+                cv::Rect used_th = used_area;
+                if (used_th.width > 3 && used_th.height > 3) {
+                    float dist = pointTo(tmp_loc_, points(used_th), eval.best_coord, same_surface_th, 1000, 1.0/(step*src_step));
+                    tmp_loc_ += cv::Vec2f(used_th.x,used_th.y);
+                    if (dist <= same_surface_th) {
+                        const int y = static_cast<int>(tmp_loc_[1]);
+                        const int x = static_cast<int>(tmp_loc_[0]);
+                        int state_sum = 0;
+                        for (int dy = 0; dy <= 1; ++dy) {
+                            for (int dx = 0; dx <= 1; ++dx) {
+                                const int yy = y + dy;
+                                const int xx = x + dx;
+                                if (yy >= 0 && yy < state.rows && xx >= 0 && xx < state.cols) {
+                                    state_sum += state(yy, xx);
+                                }
+                            }
+                        }
+                        if (!state_sum)
+                            throw std::runtime_error("this should not have any location?!");
+                        state(p) = 0;
+                        generations(p) = 0;
+                        points(p) = {-1,-1,-1};
+                        return false;
+                    }
                 }
 
                 SurfTrackerData data_commit = data;
