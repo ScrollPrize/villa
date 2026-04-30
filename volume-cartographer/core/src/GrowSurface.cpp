@@ -1260,6 +1260,13 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     SurfTrackerData data_new;
     data_new._data = data._data;
 
+    const cv::Rect requested_used_area = used_area;
+    if ((requested_used_area & static_bounds) == requested_used_area) {
+        std::cout << "optimizer: ignoring all-covering static bounds for active window "
+                  << requested_used_area << std::endl;
+        static_bounds = cv::Rect();
+    }
+
     used_area = cv::Rect(used_area.x-2,used_area.y-2,used_area.size().width+4,used_area.size().height+4);
     cv::Rect used_area_hr = scaled_rect_trunc(used_area, step);
 
