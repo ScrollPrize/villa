@@ -21,6 +21,7 @@
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
+#include "vc/core/util/VolpkgConvert.hpp"
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/util/RemoteScroll.hpp"
 #include "vc/core/types/Segmentation.hpp"
@@ -1217,14 +1218,25 @@ bool MenuActionController::runLegacyVolpkgConvert(const QString& inputLocation, 
     if (out.isEmpty()) return false;
     if (!out.endsWith(".volpkg.json", Qt::CaseInsensitive)) out += ".volpkg.json";
 
-    QString tool = QCoreApplication::applicationDirPath() + "/vc_volpkg_convert";
-    QProcess proc;
-    proc.start(tool, {inputLocation, out});
-    proc.waitForFinished(-1);
-    if (proc.exitCode() != 0) {
-        QMessageBox::warning(_window, QObject::tr("Convert failed"),
-            QString::fromUtf8(proc.readAllStandardError()) + "\n" + QString::fromUtf8(proc.readAllStandardOutput()));
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    auto r = vc::convertVolpkg(inputLocation.toStdString(), std::filesystem::path(out.toStdString()));
+    QApplication::restoreOverrideCursor();
+
+    if (!r.ok) {
+        QMessageBox box(_window);
+        box.setWindowTitle(QObject::tr("Volpkg conversion failed"));
+        box.setIcon(QMessageBox::Warning);
+        box.setText(QObject::tr("Could not convert this volpkg to .volpkg.json."));
+        box.setInformativeText(QObject::tr("Input:  %1\nOutput: %2\n\nReason: %3")
+            .arg(inputLocation, out, QString::fromStdString(r.message)));
+        box.setStandardButtons(QMessageBox::Ok);
+        box.setStyleSheet("QLabel{min-width:600px;}");
+        box.exec();
         return false;
+    }
+    if (!r.message.empty()) {
+        QMessageBox::information(_window, QObject::tr("Volpkg converted with warnings"),
+            QString::fromStdString(r.message));
     }
     if (convertedOut) *convertedOut = out;
     return true;

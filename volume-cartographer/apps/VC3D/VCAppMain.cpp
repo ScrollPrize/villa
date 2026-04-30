@@ -14,6 +14,7 @@
 #include <QSettings>
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
+#include "vc/core/util/CrashHandler.hpp"
 #include "vc/core/util/Logging.hpp"
 
 #include <opencv2/core.hpp>
@@ -58,6 +59,8 @@ static auto preinitFn = &setThreadPoliciesEarly;
 __attribute__((visibility("default")))
 auto main(int argc, char* argv[]) -> int
 {
+    vc::crash::install();
+
 #ifndef __linux__
     // On non-Linux, preinit_array is unavailable so set env vars at start of main.
     // This may be too late for some libraries that init in static constructors.
