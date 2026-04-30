@@ -30,6 +30,8 @@ Outputs:
   belong to different nearest foreground components.
 - `<stem>_component_voronoi_cell_loops.tif`: contour loops of each component's
   raster Voronoi cell.
+- `<stem>_component_voronoi_cell_loops_connected.tif`: cell loops plus
+  shortest single-pixel connector ridges between disconnected loop groups.
 - `<stem>_component_voronoi_rings.tif`: per-component Voronoi cells with the
   source component carved out, rendered as candidate rings.
 - `<stem>_binary_contour_loops.tif`: hole contours from the binary foreground

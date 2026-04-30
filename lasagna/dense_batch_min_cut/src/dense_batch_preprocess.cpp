@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
+#include <limits>
 #include <queue>
 #include <stdexcept>
 #include <string>
@@ -691,10 +692,101 @@ cv::Mat binary_contour_loops(const cv::Mat& binary) {
     return out;
 }
 
+cv::Mat connect_loop_components(const cv::Mat& loops) {
+    CV_Assert(loops.type() == CV_8U);
+
+    cv::Mat labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int num_labels =
+        cv::connectedComponentsWithStats(loops, labels, stats, centroids, 8,
+                                         CV_32S);
+    if (num_labels <= 2) {
+        return loops.clone();
+    }
+
+    int start_label = 1;
+    int best_area = stats.at<int>(1, cv::CC_STAT_AREA);
+    for (int label = 2; label < num_labels; ++label) {
+        const int area = stats.at<int>(label, cv::CC_STAT_AREA);
+        if (area > best_area) {
+            best_area = area;
+            start_label = label;
+        }
+    }
+
+    cv::Mat out = loops.clone();
+    std::vector<std::uint8_t> connected(static_cast<std::size_t>(num_labels), 0);
+    connected[start_label] = 1;
+    int connected_count = 1;
+
+    while (connected_count < num_labels - 1) {
+        cv::Mat connected_sources = cv::Mat::ones(loops.size(), CV_8U) * 255;
+        for (int y = 0; y < labels.rows; ++y) {
+            for (int x = 0; x < labels.cols; ++x) {
+                const int label = labels.at<int>(y, x);
+                if (label > 0 && connected[label] != 0) {
+                    connected_sources.at<std::uint8_t>(y, x) = 0;
+                }
+            }
+        }
+
+        cv::Mat dist;
+        cv::Mat source_labels;
+        cv::distanceTransform(connected_sources, dist, source_labels,
+                              cv::DIST_L2, cv::DIST_MASK_5,
+                              cv::DIST_LABEL_PIXEL);
+        const std::vector<cv::Point> source_points =
+            label_source_points(connected_sources, source_labels);
+
+        int best_label = 0;
+        cv::Point best_point(-1, -1);
+        cv::Point best_source(-1, -1);
+        float best_dist = std::numeric_limits<float>::max();
+
+        for (int y = 0; y < labels.rows; ++y) {
+            for (int x = 0; x < labels.cols; ++x) {
+                const int label = labels.at<int>(y, x);
+                if (label <= 0 || connected[label] != 0) {
+                    continue;
+                }
+                const float d = dist.at<float>(y, x);
+                if (d >= best_dist) {
+                    continue;
+                }
+                const int source_label = source_labels.at<int>(y, x);
+                if (source_label <= 0 ||
+                    source_label >= static_cast<int>(source_points.size())) {
+                    continue;
+                }
+                const cv::Point source = source_points[source_label];
+                if (source.x < 0) {
+                    continue;
+                }
+                best_dist = d;
+                best_label = label;
+                best_point = cv::Point(x, y);
+                best_source = source;
+            }
+        }
+
+        if (best_label <= 0) {
+            break;
+        }
+
+        cv::line(out, best_source, best_point, cv::Scalar(255), 1, cv::LINE_8);
+        connected[best_label] = 1;
+        ++connected_count;
+    }
+
+    return out;
+}
+
 struct ComponentVoronoiResult {
     cv::Mat labels_u16;
     cv::Mat boundaries;
     cv::Mat cell_loops;
+    cv::Mat cell_loops_connected;
     cv::Mat rings;
 };
 
@@ -830,8 +922,10 @@ ComponentVoronoiResult component_voronoi(const cv::Mat& binary) {
         }
     }
 
+    const cv::Mat cell_loops_connected = connect_loop_components(cell_loops);
+
     return {labels_to_u16(nearest_component, num_components - 1), boundaries,
-            cell_loops, rings};
+            cell_loops, cell_loops_connected, rings};
 }
 
 void write_image(const fs::path& path, const cv::Mat& image) {
@@ -873,6 +967,9 @@ int main(int argc, char** argv) {
                     component_voronoi_result.boundaries);
         write_image(workdir / (stem + "_component_voronoi_cell_loops.tif"),
                     component_voronoi_result.cell_loops);
+        write_image(workdir /
+                        (stem + "_component_voronoi_cell_loops_connected.tif"),
+                    component_voronoi_result.cell_loops_connected);
         write_image(workdir / (stem + "_component_voronoi_rings.tif"),
                     component_voronoi_result.rings);
         write_image(workdir / (stem + "_binary_contour_loops.tif"),
@@ -889,6 +986,10 @@ int main(int argc, char** argv) {
                   << "\n"
                   << "  "
                   << (workdir / (stem + "_component_voronoi_cell_loops.tif"))
+                  << "\n"
+                  << "  "
+                  << (workdir /
+                      (stem + "_component_voronoi_cell_loops_connected.tif"))
                   << "\n"
                   << "  "
                   << (workdir / (stem + "_component_voronoi_rings.tif"))
