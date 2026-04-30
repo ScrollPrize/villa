@@ -25,13 +25,21 @@ Outputs:
 - `<stem>_dt.tif`: normalized 16-bit distance transform visualization.
 - `<stem>_skeleton_dt_ordered.tif`: 8-bit distance-ordered topology-preserving
   thinning of the binary foreground.
-- `<stem>_ridges_voronoi_labels.tif`: 8-bit approximate medial ridges from
+- `<stem>_ridges_voronoi_labels.tif`: global approximate medial ridges from
   OpenCV distance-transform labels.
+- `<stem>_ridges_voronoi_same_cc.tif`: global label ridges, but neighbor checks
+  are restricted to the same foreground connected component.
+- `<stem>_ridges_cc_voronoi.tif`: per-foreground-component labeled distance
+  transform ridges.
+- `<stem>_ridges_cc_voronoi_angular.tif`: per-component ridges filtered to keep
+  only pixels whose nearest boundary sites are separated by at least 120 degrees.
+- `<stem>_ridges_cc_voronoi_angular_2core.tif`: thinned angular per-component
+  ridges with iterative leaf pruning, intended to keep cyclic/core structures.
 
 The threshold is intentionally fixed for repeatable comparisons. Skeletonization
 operates on the binary foreground; the distance transform is used for
 visualization and to order candidate removals in the distance-ordered variant.
-The CLI prints timings in milliseconds.
+The CLI prints timings in milliseconds for each experimental path.
 
 ## Candidate Optimizations
 

@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <iostream>
@@ -18,6 +19,8 @@ namespace fs = std::filesystem;
 namespace {
 
 constexpr double kFixedThreshold = 127.0;
+constexpr float kMinComponentRidgeRadius = 2.0f;
+constexpr double kMinBoundaryAngleDegrees = 120.0;
 using Clock = std::chrono::steady_clock;
 
 struct Args {
@@ -415,8 +418,53 @@ cv::Mat distance_ordered_thinning_full_pass_reference(const cv::Mat& binary,
     return img;
 }
 
-cv::Mat voronoi_label_ridges(const cv::Mat& binary) {
+bool has_label(const std::vector<int>& values, int label) {
+    return std::find(values.begin(), values.end(), label) != values.end();
+}
+
+double max_boundary_angle_degrees(const std::vector<int>& labels,
+                                  const std::vector<cv::Point>& source_points,
+                                  cv::Point pixel) {
+    double min_dot = 1.0;
+    bool have_pair = false;
+    for (std::size_t i = 0; i < labels.size(); ++i) {
+        const cv::Point a = source_points[labels[i]];
+        if (a.x < 0) {
+            continue;
+        }
+        const double ax = static_cast<double>(a.x - pixel.x);
+        const double ay = static_cast<double>(a.y - pixel.y);
+        const double alen = std::sqrt(ax * ax + ay * ay);
+        if (alen == 0.0) {
+            continue;
+        }
+        for (std::size_t j = i + 1; j < labels.size(); ++j) {
+            const cv::Point b = source_points[labels[j]];
+            if (b.x < 0) {
+                continue;
+            }
+            const double bx = static_cast<double>(b.x - pixel.x);
+            const double by = static_cast<double>(b.y - pixel.y);
+            const double blen = std::sqrt(bx * bx + by * by);
+            if (blen == 0.0) {
+                continue;
+            }
+            const double dot = (ax * bx + ay * by) / (alen * blen);
+            min_dot = std::min(min_dot, std::max(-1.0, std::min(1.0, dot)));
+            have_pair = true;
+        }
+    }
+
+    if (!have_pair) {
+        return 0.0;
+    }
+    return std::acos(min_dot) * 180.0 / CV_PI;
+}
+
+cv::Mat voronoi_label_ridges(const cv::Mat& binary,
+                             const cv::Mat* foreground_labels = nullptr) {
     CV_Assert(binary.type() == CV_8U);
+    CV_Assert(foreground_labels == nullptr || foreground_labels->type() == CV_32S);
 
     cv::Mat dt_approx;
     cv::Mat labels;
@@ -429,6 +477,8 @@ cv::Mat voronoi_label_ridges(const cv::Mat& binary) {
             if (binary.at<std::uint8_t>(y, x) == 0) {
                 continue;
             }
+            const int foreground_label =
+                foreground_labels == nullptr ? 0 : foreground_labels->at<int>(y, x);
 
             const int center_label = labels.at<int>(y, x);
             bool touches_multiple_sites = false;
@@ -438,6 +488,11 @@ cv::Mat voronoi_label_ridges(const cv::Mat& binary) {
                         continue;
                     }
                     if (binary.at<std::uint8_t>(y + dy, x + dx) == 0) {
+                        continue;
+                    }
+                    if (foreground_labels != nullptr &&
+                        foreground_labels->at<int>(y + dy, x + dx) !=
+                            foreground_label) {
                         continue;
                     }
                     if (labels.at<int>(y + dy, x + dx) != center_label) {
@@ -454,6 +509,158 @@ cv::Mat voronoi_label_ridges(const cv::Mat& binary) {
     }
 
     return ridges;
+}
+
+std::vector<cv::Point> label_source_points(const cv::Mat& zero_source_mask,
+                                           const cv::Mat& labels) {
+    int max_label = 0;
+    for (int y = 0; y < labels.rows; ++y) {
+        for (int x = 0; x < labels.cols; ++x) {
+            max_label = std::max(max_label, labels.at<int>(y, x));
+        }
+    }
+
+    std::vector<cv::Point> source_points(static_cast<std::size_t>(max_label + 1),
+                                         cv::Point(-1, -1));
+    for (int y = 0; y < zero_source_mask.rows; ++y) {
+        for (int x = 0; x < zero_source_mask.cols; ++x) {
+            if (zero_source_mask.at<std::uint8_t>(y, x) != 0) {
+                continue;
+            }
+            const int label = labels.at<int>(y, x);
+            if (label > 0 && source_points[label].x < 0) {
+                source_points[label] = cv::Point(x, y);
+            }
+        }
+    }
+    return source_points;
+}
+
+cv::Mat per_component_voronoi_ridges(const cv::Mat& binary,
+                                     bool require_angular_separation) {
+    CV_Assert(binary.type() == CV_8U);
+
+    cv::Mat component_labels;
+    cv::Mat stats;
+    cv::Mat centroids;
+    const int num_components = cv::connectedComponentsWithStats(
+        binary, component_labels, stats, centroids, 8, CV_32S);
+
+    cv::Mat ridges = cv::Mat::zeros(binary.size(), CV_8U);
+    for (int component = 1; component < num_components; ++component) {
+        const int area = stats.at<int>(component, cv::CC_STAT_AREA);
+        if (area < 8) {
+            continue;
+        }
+
+        const int left = stats.at<int>(component, cv::CC_STAT_LEFT);
+        const int top = stats.at<int>(component, cv::CC_STAT_TOP);
+        const int width = stats.at<int>(component, cv::CC_STAT_WIDTH);
+        const int height = stats.at<int>(component, cv::CC_STAT_HEIGHT);
+        const int x0 = std::max(0, left - 1);
+        const int y0 = std::max(0, top - 1);
+        const int x1 = std::min(binary.cols, left + width + 1);
+        const int y1 = std::min(binary.rows, top + height + 1);
+        const cv::Rect roi(x0, y0, x1 - x0, y1 - y0);
+
+        cv::Mat component_mask = cv::Mat::zeros(roi.size(), CV_8U);
+        for (int y = 0; y < roi.height; ++y) {
+            for (int x = 0; x < roi.width; ++x) {
+                if (component_labels.at<int>(roi.y + y, roi.x + x) == component) {
+                    component_mask.at<std::uint8_t>(y, x) = 255;
+                }
+            }
+        }
+
+        cv::Mat component_dt;
+        cv::Mat nearest_labels;
+        cv::distanceTransform(component_mask, component_dt, nearest_labels,
+                              cv::DIST_L2, cv::DIST_MASK_5,
+                              cv::DIST_LABEL_PIXEL);
+        const std::vector<cv::Point> source_points =
+            label_source_points(component_mask, nearest_labels);
+
+        for (int y = 1; y < roi.height - 1; ++y) {
+            for (int x = 1; x < roi.width - 1; ++x) {
+                if (component_mask.at<std::uint8_t>(y, x) == 0 ||
+                    component_dt.at<float>(y, x) < kMinComponentRidgeRadius) {
+                    continue;
+                }
+
+                std::vector<int> local_labels;
+                const int radius = require_angular_separation ? 2 : 1;
+                for (int dy = -radius; dy <= radius; ++dy) {
+                    for (int dx = -radius; dx <= radius; ++dx) {
+                        const int nx = x + dx;
+                        const int ny = y + dy;
+                        if (nx < 0 || nx >= roi.width || ny < 0 ||
+                            ny >= roi.height ||
+                            component_mask.at<std::uint8_t>(ny, nx) == 0) {
+                            continue;
+                        }
+                        const int label = nearest_labels.at<int>(ny, nx);
+                        if (label > 0 && !has_label(local_labels, label)) {
+                            local_labels.push_back(label);
+                        }
+                    }
+                }
+
+                if (local_labels.size() < 2) {
+                    continue;
+                }
+                if (require_angular_separation &&
+                    max_boundary_angle_degrees(local_labels, source_points,
+                                               cv::Point(x, y)) <
+                        kMinBoundaryAngleDegrees) {
+                    continue;
+                }
+
+                ridges.at<std::uint8_t>(roi.y + y, roi.x + x) = 255;
+            }
+        }
+    }
+
+    return ridges;
+}
+
+int ridge_degree(const cv::Mat& img, int x, int y) {
+    int degree = 0;
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) {
+                continue;
+            }
+            if (img.at<std::uint8_t>(y + dy, x + dx) != 0) {
+                ++degree;
+            }
+        }
+    }
+    return degree;
+}
+
+cv::Mat prune_to_2core(const cv::Mat& src) {
+    CV_Assert(src.type() == CV_8U);
+
+    cv::Mat img;
+    cv::threshold(src, img, 0, 255, cv::THRESH_BINARY);
+
+    bool changed = false;
+    do {
+        changed = false;
+        cv::Mat remove = cv::Mat::zeros(img.size(), CV_8U);
+        for (int y = 1; y < img.rows - 1; ++y) {
+            for (int x = 1; x < img.cols - 1; ++x) {
+                if (img.at<std::uint8_t>(y, x) != 0 &&
+                    ridge_degree(img, x, y) <= 1) {
+                    remove.at<std::uint8_t>(y, x) = 255;
+                    changed = true;
+                }
+            }
+        }
+        img.setTo(0, remove);
+    } while (changed);
+
+    return img;
 }
 
 void write_image(const fs::path& path, const cv::Mat& image) {
@@ -478,9 +685,33 @@ int main(int argc, char** argv) {
         const auto dt_ordered_start = Clock::now();
         const cv::Mat skeleton_dt_ordered = distance_ordered_thinning(binary, dt);
         const auto dt_ordered_end = Clock::now();
+
         const auto voronoi_start = Clock::now();
         const cv::Mat ridges_voronoi_labels = voronoi_label_ridges(binary);
         const auto voronoi_end = Clock::now();
+
+        cv::Mat foreground_labels;
+        const auto same_cc_start = Clock::now();
+        cv::connectedComponents(binary, foreground_labels, 8, CV_32S);
+        const cv::Mat ridges_voronoi_same_cc =
+            voronoi_label_ridges(binary, &foreground_labels);
+        const auto same_cc_end = Clock::now();
+
+        const auto cc_voronoi_start = Clock::now();
+        const cv::Mat ridges_cc_voronoi =
+            per_component_voronoi_ridges(binary, false);
+        const auto cc_voronoi_end = Clock::now();
+
+        const auto cc_angular_start = Clock::now();
+        const cv::Mat ridges_cc_voronoi_angular =
+            per_component_voronoi_ridges(binary, true);
+        const auto cc_angular_end = Clock::now();
+
+        const auto cc_angular_2core_start = Clock::now();
+        const cv::Mat ridges_cc_voronoi_angular_2core =
+            prune_to_2core(zhang_suen_thinning(ridges_cc_voronoi_angular));
+        const auto cc_angular_2core_end = Clock::now();
+
         const cv::Mat dt_u16 = normalized_dt_u16(dt);
 
         const std::string stem = args.input.stem().string();
@@ -490,6 +721,14 @@ int main(int argc, char** argv) {
                     skeleton_dt_ordered);
         write_image(workdir / (stem + "_ridges_voronoi_labels.tif"),
                     ridges_voronoi_labels);
+        write_image(workdir / (stem + "_ridges_voronoi_same_cc.tif"),
+                    ridges_voronoi_same_cc);
+        write_image(workdir / (stem + "_ridges_cc_voronoi.tif"),
+                    ridges_cc_voronoi);
+        write_image(workdir / (stem + "_ridges_cc_voronoi_angular.tif"),
+                    ridges_cc_voronoi_angular);
+        write_image(workdir / (stem + "_ridges_cc_voronoi_angular_2core.tif"),
+                    ridges_cc_voronoi_angular_2core);
 
         std::cout << "Wrote:\n"
                   << "  " << (workdir / (stem + "_binary.tif")) << "\n"
@@ -497,6 +736,17 @@ int main(int argc, char** argv) {
                   << "  " << (workdir / (stem + "_skeleton_dt_ordered.tif"))
                   << "\n"
                   << "  " << (workdir / (stem + "_ridges_voronoi_labels.tif"))
+                  << "\n"
+                  << "  " << (workdir / (stem + "_ridges_voronoi_same_cc.tif"))
+                  << "\n"
+                  << "  " << (workdir / (stem + "_ridges_cc_voronoi.tif"))
+                  << "\n"
+                  << "  "
+                  << (workdir / (stem + "_ridges_cc_voronoi_angular.tif"))
+                  << "\n"
+                  << "  "
+                  << (workdir /
+                      (stem + "_ridges_cc_voronoi_angular_2core.tif"))
                   << "\n";
         std::cout << "Timings:\n"
                   << "  skeleton_dt_ordered_ms: "
@@ -507,6 +757,26 @@ int main(int argc, char** argv) {
                   << "  ridges_voronoi_labels_ms: "
                   << std::chrono::duration<double, std::milli>(
                          voronoi_end - voronoi_start)
+                         .count()
+                  << "\n"
+                  << "  ridges_voronoi_same_cc_ms: "
+                  << std::chrono::duration<double, std::milli>(
+                         same_cc_end - same_cc_start)
+                         .count()
+                  << "\n"
+                  << "  ridges_cc_voronoi_ms: "
+                  << std::chrono::duration<double, std::milli>(
+                         cc_voronoi_end - cc_voronoi_start)
+                         .count()
+                  << "\n"
+                  << "  ridges_cc_voronoi_angular_ms: "
+                  << std::chrono::duration<double, std::milli>(
+                         cc_angular_end - cc_angular_start)
+                         .count()
+                  << "\n"
+                  << "  ridges_cc_voronoi_angular_2core_ms: "
+                  << std::chrono::duration<double, std::milli>(
+                         cc_angular_2core_end - cc_angular_2core_start)
                          .count()
                   << "\n";
     } catch (const std::exception& e) {
