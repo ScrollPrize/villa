@@ -23,11 +23,10 @@ Outputs:
 
 - `<stem>_binary.tif`: 8-bit binary mask from a fixed threshold of 127.
 - `<stem>_dt.tif`: normalized 16-bit distance transform visualization.
-- `<stem>_skeleton_zs.tif`: 8-bit Zhang-Suen thinning of the binary foreground.
 - `<stem>_skeleton_dt_ordered.tif`: 8-bit distance-ordered topology-preserving
   thinning of the binary foreground.
 
-The threshold is intentionally fixed for repeatable comparisons. The two
-skeletonizers both operate on the binary foreground; the distance transform is
-used for visualization and to order candidate removals in the distance-ordered
-variant.
+The threshold is intentionally fixed for repeatable comparisons. Skeletonization
+operates on the binary foreground; the distance transform is used for
+visualization and to order candidate removals in the distance-ordered variant.
+The CLI prints the skeletonization runtime in milliseconds.
