@@ -185,14 +185,18 @@ if [[ "$MODE" == "root" ]]; then
   popd >/dev/null
 
   # ---- xpra (from xpra.org apt repo — matches distro Python) --------------
-  # We don't build from source because xpra master uses Python APIs (e.g.
-  # PyMemoryView_CheckExact) newer than noble's Python 3.12 — the lz4 .so
-  # builds with warnings and fails at runtime with "undefined symbol".
-  # xpra.org ships prebuilt packages compiled against each distro's Python.
-  log "xpra: add xpra.org apt repo and install"
+  # On noble (24.04) we pull the beta channel for newer xpra; otherwise we
+  # fall back to the stable noble repo (works on hosts with Python 3.12).
+  . /etc/os-release
+  if [[ "${VERSION_CODENAME:-}" == "noble" ]]; then
+    XPRA_REPO="https://xpra.org/beta/"
+  else
+    XPRA_REPO="https://xpra.org/"
+  fi
+  log "xpra: add xpra apt repo ($XPRA_REPO) and install"
   install -d -m 0755 /usr/share/keyrings
   wget -qO- https://xpra.org/xpra.asc | gpg --dearmor > /usr/share/keyrings/xpra.gpg
-  echo "deb [signed-by=/usr/share/keyrings/xpra.gpg] https://xpra.org/ noble main" \
+  echo "deb [signed-by=/usr/share/keyrings/xpra.gpg] $XPRA_REPO noble main" \
     > /etc/apt/sources.list.d/xpra.list
   apt-get update
   apt-get install -y -o Dpkg::Options::="--force-confnew" xpra xpra-codecs xvfb
