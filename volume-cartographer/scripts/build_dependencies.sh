@@ -190,7 +190,8 @@ if [[ "$MODE" == "root" ]]; then
     python3-dev python3-pip python3-setuptools python3-wheel cython3 \
     libcairo2-dev libgirepository-2.0-dev \
     libgtk-3-dev gir1.2-gtk-3.0 \
-    python3-gi python3-cairo python3-gi-cairo python3-pil \
+    python3-gi python-gi-dev python3-cairo python3-cairo-dev python3-gi-cairo python3-pil \
+    libxxhash-dev libbrotli-dev liblz4-dev \
     libxres-dev libxtst-dev libxkbfile-dev \
     libxcb1-dev libxcb-render0-dev libxcb-randr0-dev libxcb-shape0-dev \
     libxcb-composite0-dev libxcb-damage0-dev libxcb-keysyms1-dev \
@@ -206,7 +207,8 @@ if [[ "$MODE" == "root" ]]; then
   rm -rf "$XPRA_SRC"
   git clone --depth 1 https://github.com/Xpra-org/xpra.git "$XPRA_SRC"
   pushd "$XPRA_SRC" >/dev/null
-  python3 -m pip install --break-system-packages .
+  python3 setup.py build_ext -j"$JOBS"
+  python3 setup.py install
   popd >/dev/null
   log "xpra installed: $(command -v xpra)"
 
