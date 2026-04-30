@@ -28,6 +28,49 @@ static inline bool isValidSurfacePoint(const cv::Vec3f& p)
     return p[0] != -1.f && std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]);
 }
 
+static cv::Mat_<cv::Vec3f> resizePointsLinearPreservingInvalids(const cv::Mat_<cv::Vec3f>& points,
+                                                                const cv::Size& size)
+{
+    cv::Mat_<cv::Vec3f> resized(size.height, size.width, cv::Vec3f(-1.f, -1.f, -1.f));
+    if (points.empty() || size.width <= 0 || size.height <= 0) {
+        return resized;
+    }
+
+    const float xScale = static_cast<float>(points.cols) / static_cast<float>(size.width);
+    const float yScale = static_cast<float>(points.rows) / static_cast<float>(size.height);
+
+    for (int y = 0; y < size.height; ++y) {
+        float srcY = (static_cast<float>(y) + 0.5f) * yScale - 0.5f;
+        srcY = std::clamp(srcY, 0.f, static_cast<float>(points.rows - 1));
+        const int y0 = static_cast<int>(std::floor(srcY));
+        const int y1 = std::min(y0 + 1, points.rows - 1);
+        const float fy = srcY - static_cast<float>(y0);
+
+        for (int x = 0; x < size.width; ++x) {
+            float srcX = (static_cast<float>(x) + 0.5f) * xScale - 0.5f;
+            srcX = std::clamp(srcX, 0.f, static_cast<float>(points.cols - 1));
+            const int x0 = static_cast<int>(std::floor(srcX));
+            const int x1 = std::min(x0 + 1, points.cols - 1);
+            const float fx = srcX - static_cast<float>(x0);
+
+            const cv::Vec3f& p00 = points(y0, x0);
+            const cv::Vec3f& p01 = points(y0, x1);
+            const cv::Vec3f& p10 = points(y1, x0);
+            const cv::Vec3f& p11 = points(y1, x1);
+            if (!isValidSurfacePoint(p00) || !isValidSurfacePoint(p01) ||
+                !isValidSurfacePoint(p10) || !isValidSurfacePoint(p11)) {
+                continue;
+            }
+
+            const cv::Vec3f top = p00 * (1.f - fx) + p01 * fx;
+            const cv::Vec3f bottom = p10 * (1.f - fx) + p11 * fx;
+            resized(y, x) = top * (1.f - fy) + bottom * fy;
+        }
+    }
+
+    return resized;
+}
+
 static inline bool hasZeroLengthEdge(const cv::Vec3f& a, const cv::Vec3f& b, const cv::Vec3f& c)
 {
     const cv::Vec3f ab = b - a;
@@ -709,9 +752,7 @@ static cv::Mat_<cv::Vec3f> regridPointsForFlattening(const cv::Mat_<cv::Vec3f>& 
 
     cv::Mat_<cv::Vec3f> reg = tmp.rawPoints();
     if (reg.rows != points.rows || reg.cols != points.cols) {
-        cv::Mat resized;
-        cv::resize(reg, resized, points.size(), 0, 0, cv::INTER_LINEAR);
-        reg = resized;
+        reg = resizePointsLinearPreservingInvalids(reg, points.size());
     }
 
     auto countGridNeighbors = [&](int row, int col) -> int {

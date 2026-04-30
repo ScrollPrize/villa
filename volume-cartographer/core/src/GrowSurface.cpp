@@ -502,6 +502,32 @@ static std::set<QuadSurface*> surface_patch_candidates(SurfacePatchIndex* surfac
     return candidates;
 }
 
+static std::vector<SurfacePatchIndex::LookupResult> surface_patch_hits(SurfacePatchIndex* surface_patch_index,
+                                                                       const cv::Vec3d& coord,
+                                                                       QuadSurface* exclude = nullptr)
+{
+    std::vector<SurfacePatchIndex::LookupResult> hits;
+    if (!surface_patch_index || surface_patch_index->empty() || coord[0] == -1) {
+        return hits;
+    }
+
+    SurfacePatchIndex::PointQuery query;
+    query.worldPoint = {
+        static_cast<float>(coord[0]),
+        static_cast<float>(coord[1]),
+        static_cast<float>(coord[2])
+    };
+    query.tolerance = same_surface_th;
+
+    for (auto hit : surface_patch_index->locateAll(query)) {
+        QuadSurface* raw = hit.surface.get();
+        if (raw && raw != exclude) {
+            hits.push_back(std::move(hit));
+        }
+    }
+    return hits;
+}
+
 static int add_surface_patch_candidates(const cv::Vec2i& p,
                                         const cv::Vec3d& coord,
                                         SurfTrackerData& data,
@@ -1490,13 +1516,11 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
         for(int j=used_area.y;j<used_area.br().y-1;j++)
             for(int i=used_area.x;i<used_area.br().x-1;i++)
                 if (!static_bounds.contains(cv::Point(i,j)) && state_out(j,i) & STATE_LOC_VALID && (fringe(j, i) || fringe_next(j, i))) {
-                    mutex.lock_shared();
-                    std::set<QuadSurface *> surf_cands = data_out.surfs({j,i});
-                    mutex.unlock();
-                    auto patch_cands = surface_patch_candidates(surface_patch_index, points_out(j, i));
-                    surf_cands.insert(patch_cands.begin(), patch_cands.end());
-
-                    for(auto test_surf : surf_cands) {
+                    for(const auto& hit : surface_patch_hits(surface_patch_index, points_out(j, i))) {
+                        QuadSurface* test_surf = hit.surface.get();
+                        if (!test_surf) {
+                            continue;
+                        }
                         mutex.lock_shared();
                         if (data_out.has(test_surf, {j,i})) {
                             mutex.unlock();
@@ -1504,13 +1528,8 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                         }
                         mutex.unlock();
 
-                        auto ptr = test_surf->pointer();
-                        if (test_surf->pointTo(ptr, points_out(j, i), same_surface_th, 10,
-                                                           surface_patch_index) > same_surface_th)
-                            continue;
-
                         int count = 0;
-                        cv::Vec3f loc_3d = test_surf->loc_raw(ptr);
+                        cv::Vec3f loc_3d = test_surf->loc_raw(hit.ptr);
                         int straight_count = 0;
                         float cost;
                         mutex.lock();
@@ -3716,7 +3735,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 ceres::Problem problem;
                 surftrack_add_local(best_surf, p, data_th, problem, state, points, step, src_step, SURF_LOSS | LOSS_ZLOC);
 
-                std::set<QuadSurface *> more_local_surfs;
+                std::vector<SurfacePatchIndex::LookupResult> more_local_hits;
 
                 for(auto test_surf : local_surfs) {
                     if (test_surf == best_surf)
@@ -3739,32 +3758,33 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                     }
                 }
 
-                auto patch_cands = surface_patch_candidates(surface_patch_index_ptr, best_coord, best_surf);
-                for (auto* s : patch_cands)
-                    if (!local_surfs.contains(s))
-                        more_local_surfs.insert(s);
+                for (auto hit : surface_patch_hits(surface_patch_index_ptr, best_coord, best_surf)) {
+                    QuadSurface* s = hit.surface.get();
+                    if (s && !local_surfs.contains(s)) {
+                        more_local_hits.push_back(std::move(hit));
+                    }
+                }
 
                 ceres::Solver::Summary summary;
 
                 ceres::Solve(options, &problem, &summary);
 
                 //TODO only add/test if we have 2 neighs which both find locations
-                for(auto test_surf : more_local_surfs) {
-                    auto ptr = test_surf->pointer();
-                    float res = test_surf->pointTo(ptr, best_coord, same_surface_th, 10,
-                                                               surface_patch_index_ptr);
-                    if (res <= same_surface_th) {
-                        cv::Vec3f loc = test_surf->loc_raw(ptr);
-                        cv::Vec3f coord = SurfTrackerData::lookup_int_loc(test_surf, {loc[1], loc[0]});
-                        if (coord[0] == -1) {
-                            continue;
-                        }
-                        int count = 0;
-                        float cost = local_cost_destructive(test_surf, p, data_th, state, points, step, src_step, loc, &count);
-                        if (cost < local_cost_inl_th) {
-                            data_th.loc(test_surf, p) = {loc[1], loc[0]};
-                            data_th.surfs(p).insert(test_surf);
-                        };
+                for(const auto& hit : more_local_hits) {
+                    QuadSurface* test_surf = hit.surface.get();
+                    if (!test_surf) {
+                        continue;
+                    }
+                    cv::Vec3f loc = test_surf->loc_raw(hit.ptr);
+                    cv::Vec3f coord = SurfTrackerData::lookup_int_loc(test_surf, {loc[1], loc[0]});
+                    if (coord[0] == -1) {
+                        continue;
+                    }
+                    int count = 0;
+                    float cost = local_cost_destructive(test_surf, p, data_th, state, points, step, src_step, loc, &count);
+                    if (cost < local_cost_inl_th) {
+                        data_th.loc(test_surf, p) = {loc[1], loc[0]};
+                        data_th.surfs(p).insert(test_surf);
                     }
                 }
 
@@ -4138,7 +4158,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 ceres::Problem problem;
                 surftrack_add_local(eval.best_surf, p, data_commit, problem, state, points, step, src_step, SURF_LOSS | LOSS_ZLOC);
 
-                std::set<QuadSurface *> more_local_surfs;
+                std::vector<SurfacePatchIndex::LookupResult> more_local_hits;
                 for(auto test_surf : local_surfs) {
                     if (test_surf == eval.best_surf)
                         continue;
@@ -4159,30 +4179,31 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                     }
                 }
 
-                auto patch_cands = surface_patch_candidates(surface_patch_index_ptr, eval.best_coord, eval.best_surf);
-                for (auto* s : patch_cands)
-                    if (!local_surfs.contains(s))
-                        more_local_surfs.insert(s);
+                for (auto hit : surface_patch_hits(surface_patch_index_ptr, eval.best_coord, eval.best_surf)) {
+                    QuadSurface* s = hit.surface.get();
+                    if (s && !local_surfs.contains(s)) {
+                        more_local_hits.push_back(std::move(hit));
+                    }
+                }
 
                 ceres::Solver::Summary summary;
                 ceres::Solve(options, &problem, &summary);
 
-                for(auto test_surf : more_local_surfs) {
-                    auto ptr = test_surf->pointer();
-                    float res = test_surf->pointTo(ptr, eval.best_coord, same_surface_th, 10,
-                                                               surface_patch_index_ptr);
-                    if (res <= same_surface_th) {
-                        cv::Vec3f loc = test_surf->loc_raw(ptr);
-                        cv::Vec3f coord = SurfTrackerData::lookup_int_loc(test_surf, {loc[1], loc[0]});
-                        if (coord[0] == -1) {
-                            continue;
-                        }
-                        int count = 0;
-                        float cost = local_cost_destructive(test_surf, p, data_commit, state, points, step, src_step, loc, &count);
-                        if (cost < local_cost_inl_th) {
-                            data_commit.loc(test_surf, p) = {loc[1], loc[0]};
-                            data_commit.surfs(p).insert(test_surf);
-                        };
+                for(const auto& hit : more_local_hits) {
+                    QuadSurface* test_surf = hit.surface.get();
+                    if (!test_surf) {
+                        continue;
+                    }
+                    cv::Vec3f loc = test_surf->loc_raw(hit.ptr);
+                    cv::Vec3f coord = SurfTrackerData::lookup_int_loc(test_surf, {loc[1], loc[0]});
+                    if (coord[0] == -1) {
+                        continue;
+                    }
+                    int count = 0;
+                    float cost = local_cost_destructive(test_surf, p, data_commit, state, points, step, src_step, loc, &count);
+                    if (cost < local_cost_inl_th) {
+                        data_commit.loc(test_surf, p) = {loc[1], loc[0]};
+                        data_commit.surfs(p).insert(test_surf);
                     }
                 }
 

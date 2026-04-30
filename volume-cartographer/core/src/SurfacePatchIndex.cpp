@@ -222,6 +222,246 @@ RawSurfaceFilter makeRawSurfaceFilter(const SurfacePatchIndex::SurfaceFilter& fi
     return raw;
 }
 
+struct TiffMmapInfo {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint16_t bits = 0;
+    uint16_t sampleFormat = SAMPLEFORMAT_UINT;
+    uint16_t samplesPerPixel = 1;
+    uint16_t compression = COMPRESSION_NONE;
+    uint32_t rowsPerStrip = 0;
+    tstrip_t strips = 0;
+    bool tiled = false;
+    bool byteSwapped = false;
+};
+
+TiffMmapInfo readTiffMmapInfo(const std::filesystem::path& path)
+{
+    TIFF* tif = TIFFOpen(path.string().c_str(), "r");
+    if (!tif) {
+        throw std::runtime_error("failed to open TIFF: " + path.string());
+    }
+
+    TiffMmapInfo info;
+    TIFFGetField(tif, TIFFTAG_IMAGEWIDTH, &info.width);
+    TIFFGetField(tif, TIFFTAG_IMAGELENGTH, &info.height);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_BITSPERSAMPLE, &info.bits);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLEFORMAT, &info.sampleFormat);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_SAMPLESPERPIXEL, &info.samplesPerPixel);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_COMPRESSION, &info.compression);
+    TIFFGetFieldDefaulted(tif, TIFFTAG_ROWSPERSTRIP, &info.rowsPerStrip);
+    info.strips = TIFFNumberOfStrips(tif);
+    info.tiled = TIFFIsTiled(tif);
+    info.byteSwapped = TIFFIsByteSwapped(tif);
+    TIFFClose(tif);
+    return info;
+}
+
+bool isTiffMmapCompatible(const TiffMmapInfo& info)
+{
+    return !info.tiled &&
+           !info.byteSwapped &&
+           info.samplesPerPixel == 1 &&
+           info.bits == 32 &&
+           info.sampleFormat == SAMPLEFORMAT_IEEEFP &&
+           info.compression == COMPRESSION_NONE &&
+           info.strips > 0 &&
+           info.rowsPerStrip > 0;
+}
+
+float tiffSampleToFloat(const uint8_t* p, uint16_t sampleFormat, uint16_t bits)
+{
+    switch (sampleFormat) {
+        case SAMPLEFORMAT_IEEEFP:
+            if (bits == 32) {
+                float v = 0.0f;
+                std::memcpy(&v, p, sizeof(v));
+                return v;
+            }
+            if (bits == 64) {
+                double v = 0.0;
+                std::memcpy(&v, p, sizeof(v));
+                return static_cast<float>(v);
+            }
+            break;
+        case SAMPLEFORMAT_UINT:
+            if (bits == 8) {
+                return static_cast<float>(*p);
+            }
+            if (bits == 16) {
+                uint16_t v = 0;
+                std::memcpy(&v, p, sizeof(v));
+                return static_cast<float>(v);
+            }
+            if (bits == 32) {
+                uint32_t v = 0;
+                std::memcpy(&v, p, sizeof(v));
+                return static_cast<float>(v);
+            }
+            break;
+        case SAMPLEFORMAT_INT:
+            if (bits == 8) {
+                return static_cast<float>(*reinterpret_cast<const int8_t*>(p));
+            }
+            if (bits == 16) {
+                int16_t v = 0;
+                std::memcpy(&v, p, sizeof(v));
+                return static_cast<float>(v);
+            }
+            if (bits == 32) {
+                int32_t v = 0;
+                std::memcpy(&v, p, sizeof(v));
+                return static_cast<float>(v);
+            }
+            break;
+        default:
+            break;
+    }
+    throw std::runtime_error("unsupported TIFF sample type");
+}
+
+std::vector<float> readTiffBandAsFloat(const std::filesystem::path& path, TiffMmapInfo* outInfo)
+{
+    TIFF* tif = TIFFOpen(path.string().c_str(), "r");
+    if (!tif) {
+        throw std::runtime_error("failed to open TIFF: " + path.string());
+    }
+
+    TiffMmapInfo info = readTiffMmapInfo(path);
+    if (info.width == 0 || info.height == 0 || info.samplesPerPixel != 1) {
+        TIFFClose(tif);
+        throw std::runtime_error("unsupported TIFF geometry: " + path.string());
+    }
+    if (!(info.bits == 8 || info.bits == 16 || info.bits == 32 || info.bits == 64)) {
+        TIFFClose(tif);
+        throw std::runtime_error("unsupported TIFF bits per sample: " + path.string());
+    }
+    const int bytesPer = (info.bits + 7) / 8;
+
+    std::vector<float> pixels(static_cast<std::size_t>(info.width) * info.height);
+    if (TIFFIsTiled(tif)) {
+        uint32_t tileW = 0;
+        uint32_t tileH = 0;
+        TIFFGetField(tif, TIFFTAG_TILEWIDTH, &tileW);
+        TIFFGetField(tif, TIFFTAG_TILELENGTH, &tileH);
+        if (tileW == 0 || tileH == 0) {
+            TIFFClose(tif);
+            throw std::runtime_error("invalid TIFF tile geometry: " + path.string());
+        }
+
+        const tmsize_t tileBytes = TIFFTileSize(tif);
+        std::vector<uint8_t> tileBuf(static_cast<std::size_t>(tileBytes));
+        for (uint32_t y0 = 0; y0 < info.height; y0 += tileH) {
+            const uint32_t dy = std::min(tileH, info.height - y0);
+            for (uint32_t x0 = 0; x0 < info.width; x0 += tileW) {
+                const uint32_t dx = std::min(tileW, info.width - x0);
+                const ttile_t tidx = TIFFComputeTile(tif, x0, y0, 0, 0);
+                if (TIFFReadEncodedTile(tif, tidx, tileBuf.data(), tileBytes) < 0) {
+                    TIFFClose(tif);
+                    throw std::runtime_error("failed reading tile: " + path.string());
+                }
+                for (uint32_t y = 0; y < dy; ++y) {
+                    const uint8_t* row = tileBuf.data() + static_cast<std::size_t>(y) * tileW * bytesPer;
+                    for (uint32_t x = 0; x < dx; ++x) {
+                        pixels[static_cast<std::size_t>(y0 + y) * info.width + x0 + x] =
+                            tiffSampleToFloat(row + static_cast<std::size_t>(x) * bytesPer,
+                                              info.sampleFormat,
+                                              info.bits);
+                    }
+                }
+            }
+        }
+    } else {
+        const tmsize_t scanBytes = TIFFScanlineSize(tif);
+        std::vector<uint8_t> scanBuf(static_cast<std::size_t>(scanBytes));
+        for (uint32_t y = 0; y < info.height; ++y) {
+            if (TIFFReadScanline(tif, scanBuf.data(), y, 0) != 1) {
+                TIFFClose(tif);
+                throw std::runtime_error("failed reading scanline: " + path.string());
+            }
+            for (uint32_t x = 0; x < info.width; ++x) {
+                pixels[static_cast<std::size_t>(y) * info.width + x] =
+                    tiffSampleToFloat(scanBuf.data() + static_cast<std::size_t>(x) * bytesPer,
+                                      info.sampleFormat,
+                                      info.bits);
+            }
+        }
+    }
+
+    TIFFClose(tif);
+    if (outInfo) {
+        *outInfo = info;
+    }
+    return pixels;
+}
+
+void writeMmapCompatibleTiffBand(const std::filesystem::path& path,
+                                 const TiffMmapInfo& info,
+                                 const std::vector<float>& pixels)
+{
+    const std::filesystem::path tmp = path.string() + ".mmap_tmp";
+    TIFF* out = TIFFOpen(tmp.string().c_str(), "w");
+    if (!out) {
+        throw std::runtime_error("failed to create " + tmp.string());
+    }
+
+    TIFFSetField(out, TIFFTAG_IMAGEWIDTH, info.width);
+    TIFFSetField(out, TIFFTAG_IMAGELENGTH, info.height);
+    TIFFSetField(out, TIFFTAG_SAMPLESPERPIXEL, 1);
+    TIFFSetField(out, TIFFTAG_BITSPERSAMPLE, 32);
+    TIFFSetField(out, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
+    TIFFSetField(out, TIFFTAG_COMPRESSION, COMPRESSION_NONE);
+    TIFFSetField(out, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+    TIFFSetField(out, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
+    TIFFSetField(out, TIFFTAG_ROWSPERSTRIP, info.height);
+
+    const tsize_t bytes = static_cast<tsize_t>(pixels.size() * sizeof(float));
+    if (TIFFWriteEncodedStrip(out, 0, const_cast<float*>(pixels.data()), bytes) < 0) {
+        TIFFClose(out);
+        std::error_code ec;
+        std::filesystem::remove(tmp, ec);
+        throw std::runtime_error("failed writing " + tmp.string());
+    }
+    TIFFClose(out);
+    std::filesystem::rename(tmp, path);
+}
+
+bool repairTifxyzBandForMmap(const std::filesystem::path& path)
+{
+    const TiffMmapInfo info = readTiffMmapInfo(path);
+    if (isTiffMmapCompatible(info)) {
+        return false;
+    }
+    if (info.samplesPerPixel != 1 ||
+        info.bits != 32 ||
+        info.sampleFormat != SAMPLEFORMAT_IEEEFP) {
+        std::ostringstream oss;
+        oss << "cannot repair TIFF for mmap without changing sample type: "
+            << path.string()
+            << " spp=" << info.samplesPerPixel
+            << " bps=" << info.bits
+            << " sample_format=" << info.sampleFormat;
+        throw std::runtime_error(oss.str());
+    }
+
+    TiffMmapInfo readBack;
+    auto pixels = readTiffBandAsFloat(path, &readBack);
+    writeMmapCompatibleTiffBand(path, readBack, pixels);
+    return true;
+}
+
+void repairTifxyzForMmapIfNeeded(const std::filesystem::path& dir)
+{
+    bool changed = false;
+    changed = repairTifxyzBandForMmap(dir / "x.tif") || changed;
+    changed = repairTifxyzBandForMmap(dir / "y.tif") || changed;
+    changed = repairTifxyzBandForMmap(dir / "z.tif") || changed;
+    if (changed) {
+        std::cout << "[SurfacePatchIndex] repaired tifxyz TIFF layout for mmap: "
+                  << dir.string() << std::endl;
+    }
+}
+
 class FileMapping {
 public:
     FileMapping() = default;
@@ -404,6 +644,7 @@ class MappedTifxyzSurface {
 public:
     explicit MappedTifxyzSurface(const std::filesystem::path& dir)
     {
+        repairTifxyzForMmapIfNeeded(dir);
         x_.open(dir / "x.tif");
         y_.open(dir / "y.tif");
         z_.open(dir / "z.tif");

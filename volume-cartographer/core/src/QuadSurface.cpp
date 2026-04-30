@@ -120,6 +120,63 @@ cv::Mat_<cv::Vec3f> resamplePointsLinearPreservingInvalids(
     return resampled;
 }
 
+cv::Mat_<cv::Vec3f> warpAffinePointsLinearPreservingInvalids(
+    const cv::Mat_<cv::Vec3f>& points,
+    const cv::Mat& srcToDst,
+    const cv::Size& dstSize)
+{
+    cv::Mat_<cv::Vec3f> warped(dstSize.height, dstSize.width,
+                               cv::Vec3f(-1.0f, -1.0f, -1.0f));
+    if (points.empty() || dstSize.width <= 0 || dstSize.height <= 0) {
+        return warped;
+    }
+
+    cv::Mat dstToSrc;
+    cv::invertAffineTransform(srcToDst, dstToSrc);
+
+    constexpr double kBoundsEpsilon = 1e-5;
+    for (int dstY = 0; dstY < dstSize.height; ++dstY) {
+        for (int dstX = 0; dstX < dstSize.width; ++dstX) {
+            double srcX = dstToSrc.at<double>(0, 0) * dstX
+                        + dstToSrc.at<double>(0, 1) * dstY
+                        + dstToSrc.at<double>(0, 2);
+            double srcY = dstToSrc.at<double>(1, 0) * dstX
+                        + dstToSrc.at<double>(1, 1) * dstY
+                        + dstToSrc.at<double>(1, 2);
+
+            if (srcX < -kBoundsEpsilon || srcY < -kBoundsEpsilon
+                || srcX > static_cast<double>(points.cols - 1) + kBoundsEpsilon
+                || srcY > static_cast<double>(points.rows - 1) + kBoundsEpsilon) {
+                continue;
+            }
+
+            srcX = std::clamp(srcX, 0.0, static_cast<double>(points.cols - 1));
+            srcY = std::clamp(srcY, 0.0, static_cast<double>(points.rows - 1));
+            const int x0 = static_cast<int>(std::floor(srcX));
+            const int y0 = static_cast<int>(std::floor(srcY));
+            const int x1 = std::min(x0 + 1, points.cols - 1);
+            const int y1 = std::min(y0 + 1, points.rows - 1);
+            const float fx = static_cast<float>(srcX - static_cast<double>(x0));
+            const float fy = static_cast<float>(srcY - static_cast<double>(y0));
+
+            const cv::Vec3f& p00 = points(y0, x0);
+            const cv::Vec3f& p01 = points(y0, x1);
+            const cv::Vec3f& p10 = points(y1, x0);
+            const cv::Vec3f& p11 = points(y1, x1);
+            if (!isValidPointSample(p00) || !isValidPointSample(p01)
+                || !isValidPointSample(p10) || !isValidPointSample(p11)) {
+                continue;
+            }
+
+            const cv::Vec3f top = p00 * (1.0f - fx) + p01 * fx;
+            const cv::Vec3f bottom = p10 * (1.0f - fx) + p11 * fx;
+            warped(dstY, dstX) = top * (1.0f - fy) + bottom * fy;
+        }
+    }
+
+    return warped;
+}
+
 } // namespace
 
 // Axis-aligned src-sample warps used by QuadSurface::gen().  The original
@@ -2027,24 +2084,10 @@ void QuadSurface::rotate(float angleDeg)
     rotMat.at<double>(0, 2) += bbox.width / 2.0 - center.x;
     rotMat.at<double>(1, 2) += bbox.height / 2.0 - center.y;
 
-    // Rotate points
-    cv::Mat rotatedMat;
-    cv::warpAffine(
-        *_points,
-        rotatedMat,
-        rotMat,
-        bbox.size(),
-        cv::INTER_LINEAR,
-        cv::BORDER_CONSTANT,
-        cv::Scalar(-1.f, -1.f, -1.f)
-    );
-
-    // Clean up edge artifacts from interpolation: dilate invalid region by 1 pixel
-    cv::Mat mask;
-    cv::inRange(rotatedMat, cv::Scalar(-1, -1, -1), cv::Scalar(-1, -1, -1), mask);
-    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, cv::Size(3, 3));
-    cv::dilate(mask, mask, kernel, cv::Point(-1, -1), 1);
-    rotatedMat.setTo(cv::Scalar(-1.f, -1.f, -1.f), mask);
+    // Rotate points without blending invalid sentinels into finite coordinates.
+    const cv::Size dstSize = bbox.size();
+    cv::Mat_<cv::Vec3f> rotatedMat =
+        warpAffinePointsLinearPreservingInvalids(*_points, rotMat, dstSize);
 
     // Update points
     *_points = rotatedMat;
@@ -2059,7 +2102,7 @@ void QuadSurface::rotate(float angleDeg)
             channel,
             rotatedChannel,
             rotMat,
-            bbox.size(),
+            dstSize,
             cv::INTER_LINEAR,
             cv::BORDER_CONSTANT,
             borderValue
