@@ -9,6 +9,8 @@
 #include <ctime>
 #include <exception>
 
+#include <dirent.h>
+#include <dlfcn.h>
 #include <execinfo.h>
 #include <fcntl.h>
 #include <pthread.h>
@@ -16,6 +18,7 @@
 #include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -29,6 +32,7 @@ constexpr int OUT_FD = STDERR_FILENO;
 std::atomic<int> g_inHandler{0};
 ::backtrace_state* g_btState = nullptr;
 char g_exePath[4096];
+int g_memFd = -1;
 
 void writeStr(const char* s, std::size_t n)
 {
@@ -79,6 +83,66 @@ void writeHex(unsigned long long v, int padTo = 0)
     while (len < padTo && i >= 0) { buf[i--] = '0'; ++len; }
     writeStr("0x");
     writeStr(buf + i + 1);
+}
+
+bool safeRead(uintptr_t addr, void* dst, std::size_t n)
+{
+    // pread on /proc/self/mem returns the bytes if the page is mapped+readable,
+    // and -EFAULT/-EIO otherwise. Never faults the caller, never blocks on
+    // mmap_sem in a way that matters here. Async-signal-safe.
+    if (g_memFd < 0) return false;
+    auto* d = static_cast<unsigned char*>(dst);
+    std::size_t total = 0;
+    while (total < n) {
+        const ssize_t r = ::pread(g_memFd, d + total, n - total,
+                                  static_cast<off_t>(addr + total));
+        if (r <= 0) return false;
+        total += static_cast<std::size_t>(r);
+    }
+    return true;
+}
+
+void dumpHexAt(const char* label, uintptr_t base, std::size_t bytes)
+{
+    writeStr(label);
+    writeStr(" @ ");
+    writeHex(base, 16);
+    writeStr(" (");
+    writeUDec(bytes);
+    writeStr(" bytes)\n");
+    constexpr std::size_t row = 16;
+    unsigned char buf[row];
+    for (std::size_t off = 0; off < bytes; off += row) {
+        const std::size_t take = (bytes - off < row) ? (bytes - off) : row;
+        if (!safeRead(base + off, buf, take)) {
+            writeStr("  ");
+            writeHex(base + off, 16);
+            writeStr("  <unreadable>\n");
+            continue;
+        }
+        writeStr("  ");
+        writeHex(base + off, 16);
+        writeStr("  ");
+        for (std::size_t i = 0; i < row; ++i) {
+            if (i == 8) writeChar(' ');
+            if (i < take) {
+                const unsigned d = buf[i];
+                const char hi = static_cast<char>((d >> 4) < 10 ? '0' + (d >> 4) : 'a' + (d >> 4) - 10);
+                const char lo = static_cast<char>((d & 0xF) < 10 ? '0' + (d & 0xF) : 'a' + (d & 0xF) - 10);
+                writeChar(hi);
+                writeChar(lo);
+                writeChar(' ');
+            } else {
+                writeStr("   ");
+            }
+        }
+        writeStr(" |");
+        for (std::size_t i = 0; i < take; ++i) {
+            const unsigned char c = buf[i];
+            writeChar((c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '.');
+        }
+        writeStr("|\n");
+    }
 }
 
 void dumpFile(const char* path, std::size_t maxBytes = 1024 * 1024)
@@ -258,10 +322,25 @@ struct PcInfoCtx {
     bool resolved;
 };
 
+bool functionIsCrashHandlerInternal(const char* fn)
+{
+    if (!fn) return false;
+    return std::strstr(fn, "crashHandler") != nullptr
+        || std::strstr(fn, "dumpStack") != nullptr
+        || std::strstr(fn, "dumpFrame") != nullptr
+        || std::strstr(fn, "vc::crash::") != nullptr;
+}
+
+bool g_probableCrashSiteMarked = false;
+
 int btPcinfoCallback(void* data, uintptr_t pc, const char* filename, int lineno, const char* function)
 {
     auto* ctx = static_cast<PcInfoCtx*>(data);
     if (!ctx->resolved) {
+        if (!g_probableCrashSiteMarked && function && !functionIsCrashHandlerInternal(function)) {
+            writeStr("  >>>>> PROBABLE CRASH SITE (first non-handler frame) <<<<<\n");
+            g_probableCrashSiteMarked = true;
+        }
         writeStr("  #");
         if (ctx->frame < 100) writeChar(' ');
         if (ctx->frame < 10) writeChar(' ');
@@ -305,9 +384,47 @@ void btErrorCallback(void* /*data*/, const char* msg, int errnum)
     writeStr("]\n");
 }
 
+uintptr_t stripPac(uintptr_t addr)
+{
+#if defined(__aarch64__)
+    // ARMv8.3 PAC: auth bits live in the upper 16 bits of return-address slots
+    // saved on the stack. ARM also reserves the top byte (TBI). User-space
+    // virtual addresses are at most 48-bit on Linux aarch64, so masking the
+    // top 16 bits recovers the true PC. xpaci would be cleaner but doesn't
+    // exist on pre-v8.3 hardware; the mask works everywhere.
+    return addr & 0x0000FFFFFFFFFFFFULL;
+#else
+    return addr;
+#endif
+}
+
+void writeDladdr(uintptr_t pc)
+{
+    Dl_info info{};
+    if (!dladdr(reinterpret_cast<void*>(pc), &info) || !info.dli_fname) {
+        writeStr("  ??\n");
+        return;
+    }
+    if (info.dli_sname) {
+        writeStr("  ");
+        writeStr(info.dli_sname);
+        writeStr(" + ");
+        writeHex(pc - reinterpret_cast<uintptr_t>(info.dli_saddr));
+        writeStr("\n        in ");
+        writeStr(info.dli_fname);
+        writeChar('\n');
+        return;
+    }
+    writeStr("  ??\n        in ");
+    writeStr(info.dli_fname);
+    writeStr(" + ");
+    writeHex(pc - reinterpret_cast<uintptr_t>(info.dli_fbase));
+    writeChar('\n');
+}
+
 void dumpFrame(int frame, void* addr)
 {
-    const auto pc = reinterpret_cast<uintptr_t>(addr);
+    const auto pc = stripPac(reinterpret_cast<uintptr_t>(addr));
     PcInfoCtx ctx{frame, false};
     if (g_btState != nullptr) {
         ::backtrace_pcinfo(g_btState, pc, btPcinfoCallback, btErrorCallback, &ctx);
@@ -319,7 +436,7 @@ void dumpFrame(int frame, void* addr)
         writeUDec(static_cast<unsigned long long>(frame));
         writeStr("  ");
         writeHex(static_cast<unsigned long long>(pc), 16);
-        writeStr("  ??\n");
+        writeDladdr(pc);
     }
 }
 
@@ -496,6 +613,229 @@ void dumpResourceUsage()
     }
 }
 
+void dumpOsInfo()
+{
+    utsname u{};
+    if (::uname(&u) == 0) {
+        writeStr("uname:    ");
+        writeStr(u.sysname); writeChar(' ');
+        writeStr(u.nodename); writeChar(' ');
+        writeStr(u.release); writeChar(' ');
+        writeStr(u.version); writeChar(' ');
+        writeStr(u.machine);
+        writeChar('\n');
+    }
+    writeStr("kernel:   ");
+    dumpFile("/proc/version", 512);
+    writeStr("distro:   ");
+    dumpFile("/etc/os-release", 1024);
+    writeStr("cpuinfo (first cpu only):\n");
+    {
+        const int fd = ::open("/proc/cpuinfo", O_RDONLY | O_CLOEXEC);
+        if (fd >= 0) {
+            char buf[4096];
+            const ssize_t r = ::read(fd, buf, sizeof(buf) - 1);
+            ::close(fd);
+            if (r > 0) {
+                // Print up to the first blank line (= end of first CPU's block).
+                ssize_t end = 0;
+                while (end < r) {
+                    if (end + 1 < r && buf[end] == '\n' && buf[end + 1] == '\n') {
+                        end += 1;
+                        break;
+                    }
+                    ++end;
+                }
+                writeStr(buf, static_cast<std::size_t>(end));
+                writeChar('\n');
+            }
+        }
+    }
+}
+
+void dumpAllThreads()
+{
+    DIR* dir = ::opendir("/proc/self/task");
+    if (!dir) {
+        writeStr("(could not open /proc/self/task)\n");
+        return;
+    }
+    int count = 0;
+    while (auto* ent = ::readdir(dir)) {
+        const char* n = ent->d_name;
+        if (n[0] == '.') continue;
+        ++count;
+        char path[256];
+        // build "/proc/self/task/<tid>/comm"
+        char* p = path;
+        const char prefix[] = "/proc/self/task/";
+        std::memcpy(p, prefix, sizeof(prefix) - 1); p += sizeof(prefix) - 1;
+        std::size_t nlen = std::strlen(n);
+        std::memcpy(p, n, nlen); p += nlen;
+        char* tidEnd = p;
+
+        std::memcpy(p, "/comm", 6);
+        char comm[64] = {};
+        const int fdc = ::open(path, O_RDONLY | O_CLOEXEC);
+        if (fdc >= 0) { ssize_t r = ::read(fdc, comm, sizeof(comm) - 1); if (r > 0) { if (comm[r-1] == '\n') comm[r-1] = '\0'; else comm[r] = '\0'; } ::close(fdc); }
+
+        std::memcpy(tidEnd, "/wchan", 7);
+        char wchan[128] = {};
+        const int fdw = ::open(path, O_RDONLY | O_CLOEXEC);
+        if (fdw >= 0) { ssize_t r = ::read(fdw, wchan, sizeof(wchan) - 1); if (r > 0) { wchan[r] = '\0'; } ::close(fdw); }
+
+        std::memcpy(tidEnd, "/stat", 6);
+        char stat[256] = {};
+        char state = '?';
+        const int fds = ::open(path, O_RDONLY | O_CLOEXEC);
+        if (fds >= 0) { ssize_t r = ::read(fds, stat, sizeof(stat) - 1); if (r > 0) { stat[r] = '\0'; const char* rp = std::strrchr(stat, ')'); if (rp && rp[1] == ' ') state = rp[2]; } ::close(fds); }
+
+        writeStr("  tid=");
+        writeStr(n);
+        writeStr(" state=");
+        writeChar(state);
+        writeStr(" comm=");
+        writeStr(comm[0] ? comm : "?");
+        writeStr(" wchan=");
+        writeStr(wchan[0] ? wchan : "0");
+        writeChar('\n');
+    }
+    ::closedir(dir);
+    writeStr("(");
+    writeDec(count);
+    writeStr(" threads)\n");
+}
+
+void dumpOpenFds()
+{
+    DIR* dir = ::opendir("/proc/self/fd");
+    if (!dir) {
+        writeStr("(could not open /proc/self/fd)\n");
+        return;
+    }
+    int count = 0;
+    while (auto* ent = ::readdir(dir)) {
+        const char* n = ent->d_name;
+        if (n[0] == '.') continue;
+        ++count;
+        if (count > 256) continue;
+        char path[256];
+        char* p = path;
+        const char prefix[] = "/proc/self/fd/";
+        std::memcpy(p, prefix, sizeof(prefix) - 1); p += sizeof(prefix) - 1;
+        std::size_t nlen = std::strlen(n);
+        std::memcpy(p, n, nlen); p += nlen;
+        *p = '\0';
+        char target[1024];
+        const ssize_t r = ::readlink(path, target, sizeof(target) - 1);
+        writeStr("  fd=");
+        writeStr(n);
+        writeStr(" -> ");
+        if (r > 0) { target[r] = '\0'; writeStr(target); }
+        else       { writeStr("(readlink failed)"); }
+        writeChar('\n');
+    }
+    ::closedir(dir);
+    if (count > 256) {
+        writeStr("(...");
+        writeDec(count - 256);
+        writeStr(" more not shown; ");
+        writeDec(count);
+        writeStr(" total)\n");
+    } else {
+        writeStr("(");
+        writeDec(count);
+        writeStr(" fds)\n");
+    }
+}
+
+bool envNameLooksSecret(const char* name, std::size_t len)
+{
+    static const char* needles[] = {
+        "KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "AUTH",
+        "CRED", "PRIVATE", "API_", "SESSION", "COOKIE",
+    };
+    for (const char* needle : needles) {
+        const std::size_t nlen = std::strlen(needle);
+        if (len < nlen) continue;
+        for (std::size_t i = 0; i + nlen <= len; ++i) {
+            bool match = true;
+            for (std::size_t j = 0; j < nlen; ++j) {
+                char c = name[i + j];
+                if (c >= 'a' && c <= 'z') c = static_cast<char>(c - 'a' + 'A');
+                if (c != needle[j]) { match = false; break; }
+            }
+            if (match) return true;
+        }
+    }
+    return false;
+}
+
+void dumpEnvironment()
+{
+    const int fd = ::open("/proc/self/environ", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        writeStr("(could not open /proc/self/environ)\n");
+        return;
+    }
+    static char buf[64 * 1024];
+    const ssize_t r = ::read(fd, buf, sizeof(buf) - 1);
+    ::close(fd);
+    if (r <= 0) return;
+    ssize_t i = 0;
+    while (i < r) {
+        const char* entry = buf + i;
+        ssize_t end = i;
+        while (end < r && buf[end] != '\0') ++end;
+        const std::size_t entLen = static_cast<std::size_t>(end - i);
+        const char* eq = static_cast<const char*>(std::memchr(entry, '=', entLen));
+        const std::size_t nameLen = eq ? static_cast<std::size_t>(eq - entry) : entLen;
+        const bool secret = envNameLooksSecret(entry, nameLen);
+        writeStr("  ");
+        writeStr(entry, nameLen);
+        if (eq) {
+            writeChar('=');
+            if (secret) writeStr("<redacted>");
+            else        writeStr(eq + 1, entLen - nameLen - 1);
+        }
+        writeChar('\n');
+        i = end + 1;
+    }
+}
+
+void dumpStackBytes(const ucontext_t* uc)
+{
+    if (!uc) return;
+    uintptr_t sp = 0;
+#if defined(__x86_64__)
+    sp = static_cast<uintptr_t>(uc->uc_mcontext.gregs[REG_RSP]);
+#elif defined(__aarch64__)
+    sp = static_cast<uintptr_t>(uc->uc_mcontext.sp);
+#endif
+    if (sp != 0) dumpHexAt("Stack from SP", sp, 256);
+}
+
+void dumpPcBytes(const ucontext_t* uc)
+{
+    if (!uc) return;
+    uintptr_t pc = 0;
+#if defined(__x86_64__)
+    pc = static_cast<uintptr_t>(uc->uc_mcontext.gregs[REG_RIP]);
+#elif defined(__aarch64__)
+    pc = static_cast<uintptr_t>(uc->uc_mcontext.pc);
+#endif
+    if (pc != 0) dumpHexAt("Bytes at PC (instruction context)", pc, 64);
+}
+
+void dumpFaultBytes(const siginfo_t* si)
+{
+    if (!si) return;
+    const uintptr_t a = reinterpret_cast<uintptr_t>(si->si_addr);
+    if (a == 0 || a == ~uintptr_t(0)) return;
+    const uintptr_t base = a >= 64 ? a - 64 : 0;
+    dumpHexAt("Memory near si_addr", base, 128);
+}
+
 void dumpCmdline()
 {
     const int fd = ::open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
@@ -521,6 +861,7 @@ void crashHandler(int sig, siginfo_t* si, void* uc_v)
     }
 
     auto* uc = static_cast<ucontext_t*>(uc_v);
+    g_probableCrashSiteMarked = false;
 
     dumpHeader(sig, si);
 
@@ -532,8 +873,29 @@ void crashHandler(int sig, siginfo_t* si, void* uc_v)
     dumpStack();
     dumpManualUnwind(uc);
 
+    writeStr("\n--- BYTES AT PC ---\n");
+    dumpPcBytes(uc);
+
+    writeStr("\n--- STACK MEMORY ---\n");
+    dumpStackBytes(uc);
+
+    writeStr("\n--- MEMORY NEAR FAULT ADDRESS ---\n");
+    dumpFaultBytes(si);
+
     writeStr("\n--- COMMAND LINE ---\n");
     dumpCmdline();
+
+    writeStr("\n--- OS / KERNEL / CPU ---\n");
+    dumpOsInfo();
+
+    writeStr("\n--- ALL THREADS ---\n");
+    dumpAllThreads();
+
+    writeStr("\n--- OPEN FILE DESCRIPTORS ---\n");
+    dumpOpenFds();
+
+    writeStr("\n--- ENVIRONMENT (secrets redacted) ---\n");
+    dumpEnvironment();
 
     writeStr("\n--- RESOURCE USAGE ---\n");
     dumpResourceUsage();
@@ -595,6 +957,11 @@ void install()
                                          /*threaded*/ 1,
                                          btErrorCallback,
                                          nullptr);
+
+    // Open /proc/self/mem so the handler can probe memory addresses without
+    // risking a SIGSEGV. Held open for the lifetime of the process; in the
+    // handler we use pread which is async-signal-safe.
+    g_memFd = ::open("/proc/self/mem", O_RDONLY | O_CLOEXEC);
 
     static char altstack[16 * 1024 * 1024];
     stack_t ss{};
