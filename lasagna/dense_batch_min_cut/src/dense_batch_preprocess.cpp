@@ -692,8 +692,9 @@ cv::Mat binary_contour_loops(const cv::Mat& binary) {
     return out;
 }
 
-cv::Mat connect_loop_components(const cv::Mat& loops) {
+cv::Mat connect_loop_components(const cv::Mat& loops, const cv::Mat& binary) {
     CV_Assert(loops.type() == CV_8U);
+    CV_Assert(binary.type() == CV_8U);
 
     cv::Mat labels;
     cv::Mat stats;
@@ -719,62 +720,83 @@ cv::Mat connect_loop_components(const cv::Mat& loops) {
     std::vector<std::uint8_t> connected(static_cast<std::size_t>(num_labels), 0);
     connected[start_label] = 1;
     int connected_count = 1;
+    constexpr std::array<std::pair<int, int>, 8> kDirs = {
+        {{-1, -1}, {0, -1}, {1, -1}, {-1, 0},
+         {1, 0},   {-1, 1}, {0, 1},  {1, 1}}};
 
     while (connected_count < num_labels - 1) {
-        cv::Mat connected_sources = cv::Mat::ones(loops.size(), CV_8U) * 255;
+        std::vector<int> parent(static_cast<std::size_t>(loops.rows * loops.cols),
+                                -1);
+        std::queue<int> queue;
+
         for (int y = 0; y < labels.rows; ++y) {
             for (int x = 0; x < labels.cols; ++x) {
                 const int label = labels.at<int>(y, x);
-                if (label > 0 && connected[label] != 0) {
-                    connected_sources.at<std::uint8_t>(y, x) = 0;
+                const bool connected_loop =
+                    label > 0 && connected[label] != 0;
+                const bool connector_pixel =
+                    out.at<std::uint8_t>(y, x) != 0 && label == 0;
+                if (connected_loop || connector_pixel) {
+                    const int idx = y * loops.cols + x;
+                    parent[idx] = idx;
+                    queue.push(idx);
                 }
             }
         }
-
-        cv::Mat dist;
-        cv::Mat source_labels;
-        cv::distanceTransform(connected_sources, dist, source_labels,
-                              cv::DIST_L2, cv::DIST_MASK_5,
-                              cv::DIST_LABEL_PIXEL);
-        const std::vector<cv::Point> source_points =
-            label_source_points(connected_sources, source_labels);
 
         int best_label = 0;
-        cv::Point best_point(-1, -1);
-        cv::Point best_source(-1, -1);
-        float best_dist = std::numeric_limits<float>::max();
+        int best_idx = -1;
+        while (!queue.empty() && best_label == 0) {
+            const int idx = queue.front();
+            queue.pop();
+            const int x = idx % loops.cols;
+            const int y = idx / loops.cols;
 
-        for (int y = 0; y < labels.rows; ++y) {
-            for (int x = 0; x < labels.cols; ++x) {
-                const int label = labels.at<int>(y, x);
-                if (label <= 0 || connected[label] != 0) {
-                    continue;
-                }
-                const float d = dist.at<float>(y, x);
-                if (d >= best_dist) {
-                    continue;
-                }
-                const int source_label = source_labels.at<int>(y, x);
-                if (source_label <= 0 ||
-                    source_label >= static_cast<int>(source_points.size())) {
-                    continue;
-                }
-                const cv::Point source = source_points[source_label];
-                if (source.x < 0) {
-                    continue;
-                }
-                best_dist = d;
+            const int label = labels.at<int>(y, x);
+            if (label > 0 && connected[label] == 0) {
                 best_label = label;
-                best_point = cv::Point(x, y);
-                best_source = source;
+                best_idx = idx;
+                break;
+            }
+
+            for (const auto& dir : kDirs) {
+                const int nx = x + dir.first;
+                const int ny = y + dir.second;
+                if (nx < 0 || nx >= loops.cols || ny < 0 || ny >= loops.rows) {
+                    continue;
+                }
+                const int next_idx = ny * loops.cols + nx;
+                if (parent[next_idx] != -1) {
+                    continue;
+                }
+
+                const bool in_white_domain =
+                    binary.at<std::uint8_t>(ny, nx) == 0;
+                const bool on_existing_graph =
+                    out.at<std::uint8_t>(ny, nx) != 0 ||
+                    loops.at<std::uint8_t>(ny, nx) != 0;
+                if (!in_white_domain && !on_existing_graph) {
+                    continue;
+                }
+
+                parent[next_idx] = idx;
+                queue.push(next_idx);
             }
         }
 
-        if (best_label <= 0) {
+        if (best_label <= 0 || best_idx < 0) {
             break;
         }
 
-        cv::line(out, best_source, best_point, cv::Scalar(255), 1, cv::LINE_8);
+        int idx = best_idx;
+        while (parent[idx] != idx) {
+            const int x = idx % loops.cols;
+            const int y = idx / loops.cols;
+            out.at<std::uint8_t>(y, x) = 255;
+            idx = parent[idx];
+        }
+        out.at<std::uint8_t>(idx / loops.cols, idx % loops.cols) = 255;
+
         connected[best_label] = 1;
         ++connected_count;
     }
@@ -922,7 +944,8 @@ ComponentVoronoiResult component_voronoi(const cv::Mat& binary) {
         }
     }
 
-    const cv::Mat cell_loops_connected = connect_loop_components(cell_loops);
+    const cv::Mat cell_loops_connected =
+        connect_loop_components(cell_loops, binary);
 
     return {labels_to_u16(nearest_component, num_components - 1), boundaries,
             cell_loops, cell_loops_connected, rings};
