@@ -415,6 +415,47 @@ cv::Mat distance_ordered_thinning_full_pass_reference(const cv::Mat& binary,
     return img;
 }
 
+cv::Mat voronoi_label_ridges(const cv::Mat& binary) {
+    CV_Assert(binary.type() == CV_8U);
+
+    cv::Mat dt_approx;
+    cv::Mat labels;
+    cv::distanceTransform(binary, dt_approx, labels, cv::DIST_L2, cv::DIST_MASK_5,
+                          cv::DIST_LABEL_PIXEL);
+
+    cv::Mat ridges = cv::Mat::zeros(binary.size(), CV_8U);
+    for (int y = 1; y < binary.rows - 1; ++y) {
+        for (int x = 1; x < binary.cols - 1; ++x) {
+            if (binary.at<std::uint8_t>(y, x) == 0) {
+                continue;
+            }
+
+            const int center_label = labels.at<int>(y, x);
+            bool touches_multiple_sites = false;
+            for (int dy = -1; dy <= 1 && !touches_multiple_sites; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) {
+                        continue;
+                    }
+                    if (binary.at<std::uint8_t>(y + dy, x + dx) == 0) {
+                        continue;
+                    }
+                    if (labels.at<int>(y + dy, x + dx) != center_label) {
+                        touches_multiple_sites = true;
+                        break;
+                    }
+                }
+            }
+
+            if (touches_multiple_sites) {
+                ridges.at<std::uint8_t>(y, x) = 255;
+            }
+        }
+    }
+
+    return ridges;
+}
+
 void write_image(const fs::path& path, const cv::Mat& image) {
     if (!cv::imwrite(path.string(), image)) {
         throw std::runtime_error("failed to write image: " + path.string());
@@ -437,6 +478,9 @@ int main(int argc, char** argv) {
         const auto dt_ordered_start = Clock::now();
         const cv::Mat skeleton_dt_ordered = distance_ordered_thinning(binary, dt);
         const auto dt_ordered_end = Clock::now();
+        const auto voronoi_start = Clock::now();
+        const cv::Mat ridges_voronoi_labels = voronoi_label_ridges(binary);
+        const auto voronoi_end = Clock::now();
         const cv::Mat dt_u16 = normalized_dt_u16(dt);
 
         const std::string stem = args.input.stem().string();
@@ -444,16 +488,25 @@ int main(int argc, char** argv) {
         write_image(workdir / (stem + "_dt.tif"), dt_u16);
         write_image(workdir / (stem + "_skeleton_dt_ordered.tif"),
                     skeleton_dt_ordered);
+        write_image(workdir / (stem + "_ridges_voronoi_labels.tif"),
+                    ridges_voronoi_labels);
 
         std::cout << "Wrote:\n"
                   << "  " << (workdir / (stem + "_binary.tif")) << "\n"
                   << "  " << (workdir / (stem + "_dt.tif")) << "\n"
                   << "  " << (workdir / (stem + "_skeleton_dt_ordered.tif"))
+                  << "\n"
+                  << "  " << (workdir / (stem + "_ridges_voronoi_labels.tif"))
                   << "\n";
         std::cout << "Timings:\n"
                   << "  skeleton_dt_ordered_ms: "
                   << std::chrono::duration<double, std::milli>(
                          dt_ordered_end - dt_ordered_start)
+                         .count()
+                  << "\n"
+                  << "  ridges_voronoi_labels_ms: "
+                  << std::chrono::duration<double, std::milli>(
+                         voronoi_end - voronoi_start)
                          .count()
                   << "\n";
     } catch (const std::exception& e) {

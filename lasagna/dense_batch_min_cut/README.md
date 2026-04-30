@@ -25,8 +25,29 @@ Outputs:
 - `<stem>_dt.tif`: normalized 16-bit distance transform visualization.
 - `<stem>_skeleton_dt_ordered.tif`: 8-bit distance-ordered topology-preserving
   thinning of the binary foreground.
+- `<stem>_ridges_voronoi_labels.tif`: 8-bit approximate medial ridges from
+  OpenCV distance-transform labels.
 
 The threshold is intentionally fixed for repeatable comparisons. Skeletonization
 operates on the binary foreground; the distance transform is used for
 visualization and to order candidate removals in the distance-ordered variant.
-The CLI prints the skeletonization runtime in milliseconds.
+The CLI prints timings in milliseconds.
+
+## Candidate Optimizations
+
+Ideas to test later:
+
+- Boundary-only initialization for distance-ordered thinning, so interior pixels
+  enter the queue only after becoming exposed.
+- Bucket queue over quantized distance values instead of `std::priority_queue`.
+- OpenCV labeled distance-transform ridges, using nearest-background label
+  changes as an approximate medial axis.
+- Chamfer/integer distance transforms (`DIST_MASK_3` or `DIST_MASK_5`) if metric
+  approximation is acceptable.
+- A single `mask -> removable` lookup table for endpoint and topology rules.
+- Two-phase approximation: fast DT/label ridge candidates, then thinning or
+  pruning only around candidate regions.
+- Tile processing with halos for parallelism, with explicit boundary
+  reconciliation.
+- Connected-component split and parallel skeletonization per component.
+- ITK or another proven implementation as a performance/correctness baseline.
