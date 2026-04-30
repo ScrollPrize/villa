@@ -209,6 +209,11 @@ if [[ "$MODE" == "root" ]]; then
   pushd "$XPRA_SRC" >/dev/null
   python3 setup.py build_ext -j"$JOBS"
   python3 setup.py install
+  # setup.py install drops broken pkg_resources wrappers in /usr/local/bin
+  # (dist-info has no entry_points.txt). Replace with the real scripts that
+  # setup.py shipped in the .egg.
+  EGG_SCRIPTS=$(echo /usr/local/lib/python3.*/dist-packages/xpra-*.egg)/EGG-INFO/scripts
+  install -m 0755 "$EGG_SCRIPTS"/* /usr/local/bin/
   popd >/dev/null
   log "xpra installed: $(command -v xpra)"
 
