@@ -74,7 +74,7 @@ if [[ "$MODE" == "root" ]]; then
     qt6-base-dev libboost-system-dev libboost-program-options-dev \
     libcgal-dev libsuitesparse-dev \
     libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev libgsl-dev libsdl2-dev \
-    libavahi-client-dev libde265-dev libx265-dev rclone nlohmann-json3-dev liblz4-dev libbacktrace-dev \
+    libavahi-client-dev libde265-dev libx265-dev rclone nlohmann-json3-dev liblz4-dev \
     libcurl4-openssl-dev file curl unzip ca-certificates bzip2 wget fuse jq gimp \
     desktop-file-utils flex bison zlib1g-dev gfortran libopenblas-dev liblapack-dev \
     libscotch-dev libhwloc-dev libomp-dev \

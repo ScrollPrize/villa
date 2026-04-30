@@ -106,7 +106,7 @@ jobs:
             build-essential git cmake ninja-build ccache \
             qt6-base-dev libboost-system-dev libboost-program-options-dev \
             libceres-dev libcgal-dev xtensor-dev libopencv-dev libxsimd-dev libblosc-dev libspdlog-dev \
-            libgsl-dev libsdl2-dev libcurl4-openssl-dev libbacktrace-dev
+            libgsl-dev libsdl2-dev libcurl4-openssl-dev
 
       - name: Restore ccache
         if: needs.changes.outputs.vc == 'true'

@@ -148,7 +148,7 @@ FROMSCRATCH_APT_PACKAGES=(
     libdbus-1-dev libicu-dev
     # Misc (needed by VC3D directly, not built by fromscratch.sh)
     libcurl4-openssl-dev libspdlog-dev libsdl2-dev libavahi-client-dev
-    libblosc-dev libgsl-dev libbacktrace-dev
+    libblosc-dev libgsl-dev
     python3
 )
 
@@ -476,7 +476,7 @@ sudo apt-get install -y -qq --no-install-recommends \
     libfontconfig1-dev libfreetype-dev libharfbuzz-dev \
     libdbus-1-dev libicu-dev \
     libcurl4-openssl-dev libspdlog-dev libsdl2-dev libavahi-client-dev \
-    libblosc-dev libgsl-dev libbacktrace-dev
+    libblosc-dev libgsl-dev
 REMOTE_PREREQS
 
     # --- CMake ---

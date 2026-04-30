@@ -14,7 +14,7 @@ RUN apt -y install --no-install-recommends \
     libcgal-dev \
     libopencv-dev libopencv-contrib-dev \
     libblosc-dev libspdlog-dev libgsl-dev libsdl2-dev libcurl4-openssl-dev nlohmann-json3-dev libavahi-client-dev \
-    libde265-dev libx265-dev liblz4-dev libbacktrace-dev \
+    libde265-dev libx265-dev liblz4-dev \
     file curl unzip ca-certificates bzip2 wget fuse jq gimp desktop-file-utils \
  && rm -rf /var/lib/apt/lists/*
 
