@@ -111,14 +111,6 @@ if [[ "$MODE" == "root" ]]; then
     log "Ephemeral: /ephemeral already mounted; skipping"
   fi
 
-  log "apt: pin xtl 0.7.7 + xtensor 0.25"
-  tmpd="$(mktemp -d)"; pushd "$tmpd" >/dev/null
-  wget -q http://archive.ubuntu.com/ubuntu/pool/universe/x/xtl/xtl-dev_0.7.7-1_all.deb
-  wget -q http://archive.ubuntu.com/ubuntu/pool/universe/x/xtensor/libxtensor-dev_0.25.0-2ubuntu1_all.deb
-  apt-get install -y --no-install-recommends ./xtl-dev_0.7.7-1_all.deb ./libxtensor-dev_0.25.0-2ubuntu1_all.deb
-  apt-mark hold xtl-dev libxtensor-dev
-  popd >/dev/null; rm -rf "$tmpd"
-
   # ---- CUDA path: cuDSS + Ceres-from-source --------------------------------
   if [[ "$USE_CUDA" == "1" ]]; then
     log "apt: CUDA toolkit"
@@ -172,6 +164,7 @@ if [[ "$MODE" == "root" ]]; then
   tar -xzf "$LIBS_DIR/scotch_6.0.4.tar.gz" -C "$SCOTCH_SRC" --strip-components=1
   pushd "$SCOTCH_SRC/src" >/dev/null
   cp ./Make.inc/Makefile.inc.x86-64_pc_linux2 Makefile.inc
+  sed -i -E 's|^(CFLAGS[[:space:]]*=.*)$|\1 -std=gnu89 -fpermissive|' Makefile.inc
   make -j"$JOBS" scotch
   mkdir -p /usr/local/scotch/{bin,include,lib,share/man/man1}
   make prefix=/usr/local/scotch install
@@ -186,22 +179,42 @@ if [[ "$MODE" == "root" ]]; then
   pushd "$PASTIX_SRC/src" >/dev/null
   cp "$LIBS_DIR/config.in" config.in
   sed -i -E "s|^SCOTCH_HOME[[:space:]]*=.*$|SCOTCH_HOME = /usr/local/scotch|" config.in
+  sed -i -E 's|^(CCFOPT[[:space:]]*=[[:space:]]*-O3.*)$|\1 -std=gnu89 -fpermissive -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=int-conversion -Wno-error=implicit-int|' config.in
   make SCOTCH_HOME=/usr/local/scotch
   make install SCOTCH_HOME=/usr/local/scotch
   popd >/dev/null
 
-  # ---- xpra (from xpra.org apt repo — matches distro Python) --------------
-  # We don't build from source because xpra master uses Python APIs (e.g.
-  # PyMemoryView_CheckExact) newer than noble's Python 3.12 — the lz4 .so
-  # builds with warnings and fails at runtime with "undefined symbol".
-  # xpra.org ships prebuilt packages compiled against each distro's Python.
-  log "xpra: add xpra.org apt repo and install"
-  install -d -m 0755 /usr/share/keyrings
-  wget -qO- https://xpra.org/xpra.asc | gpg --dearmor > /usr/share/keyrings/xpra.gpg
-  echo "deb [signed-by=/usr/share/keyrings/xpra.gpg] https://xpra.org/ noble main" \
-    > /etc/apt/sources.list.d/xpra.list
-  apt-get update
-  apt-get install -y -o Dpkg::Options::="--force-confnew" xpra xpra-codecs xvfb
+  # ---- xpra (build from source — works on any distro/python) -------------
+  log "xpra: install build deps + build from source"
+  apt-get install -y --no-install-recommends \
+    python3-dev python3-pip python3-setuptools python3-wheel cython3 \
+    libcairo2-dev libgirepository-2.0-dev \
+    libgtk-3-dev gir1.2-gtk-3.0 \
+    python3-gi python-gi-dev python3-cairo python3-cairo-dev python3-gi-cairo python3-pil \
+    libxxhash-dev libbrotli-dev liblz4-dev \
+    libxres-dev libxtst-dev libxkbfile-dev \
+    libxcb1-dev libxcb-render0-dev libxcb-randr0-dev libxcb-shape0-dev \
+    libxcb-composite0-dev libxcb-damage0-dev libxcb-keysyms1-dev \
+    libxcb-cursor-dev libxcb-image0-dev libxcb-xfixes0-dev \
+    libavcodec-dev libavformat-dev libswscale-dev libavutil-dev libavfilter-dev \
+    libvpx-dev libwebp-dev libturbojpeg0-dev libyuv-dev \
+    libpulse-dev gstreamer1.0-plugins-base python3-gst-1.0 \
+    libdbus-1-dev libdbus-glib-1-dev python3-dbus \
+    libpam0g-dev libsystemd-dev \
+    xvfb
+
+  XPRA_SRC=/tmp/xpra
+  rm -rf "$XPRA_SRC"
+  git clone --depth 1 https://github.com/Xpra-org/xpra.git "$XPRA_SRC"
+  pushd "$XPRA_SRC" >/dev/null
+  python3 setup.py build_ext -j"$JOBS"
+  python3 setup.py install
+  # setup.py install drops broken pkg_resources wrappers in /usr/local/bin
+  # (dist-info has no entry_points.txt). Replace with the real scripts that
+  # setup.py shipped in the .egg.
+  EGG_SCRIPTS=$(echo /usr/local/lib/python3.*/dist-packages/xpra-*.egg)/EGG-INFO/scripts
+  install -m 0755 "$EGG_SCRIPTS"/* /usr/local/bin/
+  popd >/dev/null
   log "xpra installed: $(command -v xpra)"
 
   log "ROOT pass complete. Next: run WITHOUT sudo to build VC3D."
@@ -229,26 +242,6 @@ fi
 
 rm -rf "$BUILD_DIR" "$INSTALL_PREFIX"
 mkdir -p "$BUILD_DIR" "$INSTALL_PREFIX"
-
-# ---- z5 --------------------------------------------------------------------
-log "z5 → $INSTALL_PREFIX"
-pushd "$BUILD_DIR" >/dev/null
-git clone https://github.com/constantinpape/z5.git z5
-pushd z5 >/dev/null
-Z5_COMMIT=ee2081bb974fe0d0d702538400c31c38b09f1629
-git fetch origin "$Z5_COMMIT" --depth 1
-git checkout --detach "$Z5_COMMIT"
-sed -i 's|xtensor/containers/xadapt.hpp|xtensor/xadapt.hpp|' \
-  include/z5/multiarray/xtensor_util.hxx || true
-popd >/dev/null
-cmake -S z5 -B z5/build -G Ninja \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DCMAKE_INSTALL_PREFIX="$INSTALL_PREFIX" \
-  -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
-  -DWITH_BLOSC=ON -DWITH_ZLIB=ON -DBUILD_Z5PY=OFF -DBUILD_TESTS=OFF
-cmake --build z5/build -j"$JOBS"
-cmake --install z5/build
-popd >/dev/null
 
 # ---- libigl + Flatboi ------------------------------------------------------
 log "libigl clone (pinned)"
