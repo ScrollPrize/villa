@@ -1849,14 +1849,79 @@ ABFDiagnostics diagnoseAbfFlattening(const QuadSurface& surface,
                                      const ABFConfig& config,
                                      std::size_t maxWorstVertices)
 {
-    ABFConfig diagnosticConfig = config;
-    diagnosticConfig.downsampleFactor = 1;
-
     ABFDiagnostics diagnostics;
-    (void)abfFlattenInternal(surface, diagnosticConfig, nullptr, &diagnostics);
     const cv::Mat_<cv::Vec3f>* points = surface.rawPointsPtr();
-    if (config.alignToInputGrid && points && !points->empty() && !diagnostics.uv.empty()) {
-        alignUVsToInputGrid(*points, diagnostics.uv);
+
+    if (config.downsampleFactor <= 1) {
+        ABFConfig diagnosticConfig = config;
+        diagnosticConfig.downsampleFactor = 1;
+        (void)abfFlattenInternal(surface, diagnosticConfig, nullptr, &diagnostics);
+        if (config.alignToInputGrid && points && !points->empty() && !diagnostics.uv.empty()) {
+            alignUVsToInputGrid(*points, diagnostics.uv);
+        }
+    } else if (!points || points->empty()) {
+        diagnostics.failureReason = "empty surface";
+    } else {
+        const int originalRows = points->rows;
+        const int originalCols = points->cols;
+        cv::Mat_<cv::Vec3f> coarseGrid = downsampleGrid(*points, config.downsampleFactor);
+        cv::Mat_<cv::Vec3f>* coarsePointsPtr = new cv::Mat_<cv::Vec3f>(coarseGrid);
+        cv::Vec2f coarseScale = surface._scale * static_cast<float>(config.downsampleFactor);
+        QuadSurface coarseSurface(coarsePointsPtr, coarseScale);
+
+        ABFConfig diagnosticConfig = config;
+        diagnosticConfig.downsampleFactor = 1;
+        (void)abfFlattenInternal(coarseSurface, diagnosticConfig, nullptr, &diagnostics);
+
+        if (!diagnostics.uv.empty()) {
+            diagnostics.uv = upsampleUVs(diagnostics.uv, originalRows, originalCols, config.downsampleFactor);
+            if (config.alignToInputGrid) {
+                alignUVsToInputGrid(*points, diagnostics.uv);
+            }
+        }
+
+        if (!diagnostics.vertexBadness.empty()) {
+            cv::Mat_<float> fullBadness(originalRows, originalCols, 0.f);
+            for (int row = 0; row < originalRows; ++row) {
+                for (int col = 0; col < originalCols; ++col) {
+                    const int coarseRow = std::min(row / config.downsampleFactor, diagnostics.vertexBadness.rows - 1);
+                    const int coarseCol = std::min(col / config.downsampleFactor, diagnostics.vertexBadness.cols - 1);
+                    fullBadness(row, col) = diagnostics.vertexBadness(coarseRow, coarseCol);
+                }
+            }
+            diagnostics.vertexBadness = std::move(fullBadness);
+        }
+
+        diagnostics.validUvCount = 0;
+        if (!diagnostics.uv.empty()) {
+            for (int row = 0; row < diagnostics.uv.rows; ++row) {
+                for (int col = 0; col < diagnostics.uv.cols; ++col) {
+                    const cv::Vec2f& uv = diagnostics.uv(row, col);
+                    if (uv[0] != -1.f && std::isfinite(uv[0]) && std::isfinite(uv[1])) {
+                        diagnostics.validUvCount++;
+                    }
+                }
+            }
+        }
+
+        diagnostics.worstVertices.clear();
+        if (!diagnostics.vertexBadness.empty()) {
+            diagnostics.maxVertexBadness = 0.f;
+            diagnostics.worstVertices.reserve(static_cast<std::size_t>(originalRows * originalCols));
+            for (int row = 0; row < diagnostics.vertexBadness.rows; ++row) {
+                for (int col = 0; col < diagnostics.vertexBadness.cols; ++col) {
+                    const float score = diagnostics.vertexBadness(row, col);
+                    diagnostics.maxVertexBadness = std::max(diagnostics.maxVertexBadness, score);
+                    if (score > 0.f && std::isfinite(score)) {
+                        diagnostics.worstVertices.push_back({cv::Vec2i(row, col), score});
+                    }
+                }
+            }
+            std::sort(diagnostics.worstVertices.begin(), diagnostics.worstVertices.end(),
+                      [](const ABFVertexIssue& a, const ABFVertexIssue& b) {
+                          return a.score > b.score;
+                      });
+        }
     }
     if (diagnostics.worstVertices.size() > maxWorstVertices) {
         diagnostics.worstVertices.resize(maxWorstVertices);

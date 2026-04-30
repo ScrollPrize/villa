@@ -497,35 +497,35 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
         patchHelp(tr("Weights neighbor-distance preservation in 3D volume coordinates."),
                   tr("Increase to keep 3D point spacing closer to the grid spacing; decrease to allow more stretch or compression.")));
     _spinPatchSdir3dRadius = addIntParam(
-        tr("SDIR radius 3D"), 0, 8, 1, _patchSdir3dRadius, 2,
+        tr("SDIR radius 3D"), 0, 8, 1, _patchSdir3dRadius, 0,
         patchHelp(tr("Checks 3D symmetric-Dirichlet metric distortion across this many grid strides."),
                   tr("Increase to catch broader 3D distortion; set to 0 to disable 3D metric preservation checks.")));
     _spinPatchSdir3dWeight = addDoubleParam(
-        tr("SDIR weight 3D"), 0.0, 100.0, 0.1, _patchSdir3dWeight, 0.5,
+        tr("SDIR weight 3D"), 0.0, 100.0, 0.1, _patchSdir3dWeight, 0.0,
         patchHelp(tr("Weights local 3D metric-preservation constraints during per-point solves."),
                   tr("Increase to resist local stretching or folding; decrease to let candidates follow patch evidence more freely.")));
     _spinPatchSdir3dGlobalWeight = addDoubleParam(
-        tr("SDIR global weight 3D"), 0.0, 100.0, 0.1, _patchSdir3dGlobalWeight, 0.25,
+        tr("SDIR global weight 3D"), 0.0, 100.0, 0.1, _patchSdir3dGlobalWeight, 0.0,
         patchHelp(tr("Weights 3D metric-preservation constraints during global/window optimization."),
                   tr("Increase to smooth larger 3D distortions during global passes; decrease to reduce this regularization.")));
     _spinPatchSdir3dCandidateMax = addDoubleParam(
-        tr("SDIR candidate max"), 0.0, 1000.0, 0.1, _patchSdir3dCandidateMax, 4.0,
+        tr("SDIR candidate max"), 0.0, 1000.0, 0.1, _patchSdir3dCandidateMax, 0.0,
         patchHelp(tr("Rejects candidates whose local 3D metric residual is above this threshold."),
                   tr("Increase to allow more distorted 3D candidates; decrease to reject stretched or folded candidates sooner.")));
     _spinPatchParamSdir2dRadius = addIntParam(
-        tr("Param SDIR radius 2D"), 0, 8, 1, _patchParamSdir2dRadius, 2,
+        tr("Param SDIR radius 2D"), 0, 8, 1, _patchParamSdir2dRadius, 0,
         patchHelp(tr("Checks 2D source-surface parameter distortion across this many grid strides."),
                   tr("Increase to catch broader crowding; decrease or set to 0 to limit or disable this check.")));
     _spinPatchParamSdir2dWeight = addDoubleParam(
-        tr("Param SDIR weight 2D"), 0.0, 100.0, 0.1, _patchParamSdir2dWeight, 0.4,
+        tr("Param SDIR weight 2D"), 0.0, 100.0, 0.1, _patchParamSdir2dWeight, 0.0,
         patchHelp(tr("Weights the local 2D parameter metric loss during per-point solves."),
                   tr("Increase to resist local 2D distortion more; decrease to let candidates follow surface evidence more freely.")));
     _spinPatchParamSdir2dGlobalWeight = addDoubleParam(
-        tr("Param SDIR global weight 2D"), 0.0, 100.0, 0.1, _patchParamSdir2dGlobalWeight, 0.2,
+        tr("Param SDIR global weight 2D"), 0.0, 100.0, 0.1, _patchParamSdir2dGlobalWeight, 0.0,
         patchHelp(tr("Weights the 2D parameter metric loss during window/global optimization."),
                   tr("Increase to open crowded parameterization more aggressively; decrease to preserve the existing mapping more.")));
     _spinPatchParamSdir2dCandidateMax = addDoubleParam(
-        tr("Param SDIR candidate max"), 0.0, 1000.0, 0.1, _patchParamSdir2dCandidateMax, 4.0,
+        tr("Param SDIR candidate max"), 0.0, 1000.0, 0.1, _patchParamSdir2dCandidateMax, 0.0,
         patchHelp(tr("Rejects candidates whose local 2D parameter metric residual is above this threshold."),
                   tr("Increase to allow more distorted candidates; decrease to reject skinny or folded cells sooner.")));
     _spinPatchParamAreaMinRatio = addDoubleParam(
@@ -1383,14 +1383,14 @@ void SegmentationGrowthPanel::resetPatchTracerParams(bool persist)
     _patchZLocationLossWeight = 0.1;
     _patchDistLoss2dWeight = 1.0;
     _patchDistLoss3dWeight = 2.0;
-    _patchSdir3dRadius = 2;
-    _patchSdir3dWeight = 0.5;
-    _patchSdir3dGlobalWeight = 0.25;
-    _patchSdir3dCandidateMax = 4.0;
-    _patchParamSdir2dRadius = 2;
-    _patchParamSdir2dWeight = 0.4;
-    _patchParamSdir2dGlobalWeight = 0.2;
-    _patchParamSdir2dCandidateMax = 4.0;
+    _patchSdir3dRadius = 0;
+    _patchSdir3dWeight = 0.0;
+    _patchSdir3dGlobalWeight = 0.0;
+    _patchSdir3dCandidateMax = 0.0;
+    _patchParamSdir2dRadius = 0;
+    _patchParamSdir2dWeight = 0.0;
+    _patchParamSdir2dGlobalWeight = 0.0;
+    _patchParamSdir2dCandidateMax = 0.0;
     _patchParamAreaMinRatio = 0.25;
     _patchParamAreaWeight = 2.0;
     _patchParamNonneighborMinRatio = 0.5;
