@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -11,6 +10,9 @@
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include <pwd.h>
+#include <unistd.h>
 
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/util/Logging.hpp"
@@ -106,9 +108,9 @@ bool anyImmediateSubdir(const fs::path& dir, bool (*test)(const fs::path&))
 fs::path defaultAutosaveRoot()
 {
     if (!VolumePkg::autosaveRoot().empty()) return VolumePkg::autosaveRoot();
-    const char* home = std::getenv("HOME");
-    if (home == nullptr || home[0] == '\0') return {};
-    return fs::path(home) / ".VC3D";
+    const struct passwd* pw = getpwuid(geteuid());
+    if (pw == nullptr || pw->pw_dir == nullptr || pw->pw_dir[0] == '\0') return {};
+    return fs::path(pw->pw_dir) / ".VC3D";
 }
 
 void atomicWriteString(const fs::path& target, const std::string& text)
