@@ -116,6 +116,21 @@ static bool parseS3Url(const std::string& url, std::string& bucketHost, std::str
     return true;
 }
 
+static std::string urlEncodeToken(const std::string& s)
+{
+    std::ostringstream o;
+    o << std::hex << std::uppercase << std::setfill('0');
+    for (unsigned char c : s) {
+        const bool unreserved = (c >= 'A' && c <= 'Z')
+                             || (c >= 'a' && c <= 'z')
+                             || (c >= '0' && c <= '9')
+                             || c == '-' || c == '_' || c == '.' || c == '~';
+        if (unreserved) o << static_cast<char>(c);
+        else o << '%' << std::setw(2) << static_cast<int>(c);
+    }
+    return o.str();
+}
+
 S3ListResult s3ListObjects(const std::string& httpsBaseUrl, const HttpAuth& auth)
 {
     S3ListResult result;
@@ -124,68 +139,78 @@ S3ListResult s3ListObjects(const std::string& httpsBaseUrl, const HttpAuth& auth
     if (!parseS3Url(httpsBaseUrl, bucketHost, prefix))
         return result;
 
-    // URL-encode the prefix manually (simple: just encode spaces and special chars)
-    // For simplicity, build the URL directly — S3 prefixes are typically clean paths.
-    std::string listUrl = bucketHost + "/?list-type=2&delimiter=/";
-    if (!prefix.empty()) {
-        listUrl += "&prefix=" + prefix;
-    }
-
-    if (auto* log = cacheDebugLog())
-        std::fprintf(log, "[S3] ListObjects: %s\n", listUrl.c_str());
-
     auto client = makeClient(auth, 30);
-    auto resp = client.get(listUrl);
+    std::string continuationToken;
 
-    if (auto* log = cacheDebugLog())
-        std::fprintf(log, "[S3] ListObjects HTTP %ld\n", resp.status_code);
-
-    if (!resp.ok()) {
-        auto body = std::string(resp.body_string());
-        if (auto* log = cacheDebugLog()) {
-            if (!body.empty())
-                std::fprintf(log, "[S3] Response: %.500s\n", body.c_str());
+    do {
+        std::string listUrl = bucketHost + "/?list-type=2&delimiter=/";
+        if (!prefix.empty()) listUrl += "&prefix=" + prefix;
+        if (!continuationToken.empty()) {
+            listUrl += "&continuation-token=" + urlEncodeToken(continuationToken);
         }
 
-        if (resp.status_code == 400 || resp.status_code == 401 || resp.status_code == 403) {
-            auto codes = extractXmlTags(body, "Code");
-            for (const auto& code : codes) {
-                if (code == "ExpiredToken" || code == "AccessDenied" ||
-                    code == "InvalidAccessKeyId" || code == "SignatureDoesNotMatch" ||
-                    code == "TokenRefreshRequired" || code == "InvalidToken") {
+        if (auto* log = cacheDebugLog())
+            std::fprintf(log, "[S3] ListObjects: %s\n", listUrl.c_str());
+
+        auto resp = client.get(listUrl);
+
+        if (auto* log = cacheDebugLog())
+            std::fprintf(log, "[S3] ListObjects HTTP %ld\n", resp.status_code);
+
+        if (!resp.ok()) {
+            auto body = std::string(resp.body_string());
+            if (auto* log = cacheDebugLog()) {
+                if (!body.empty())
+                    std::fprintf(log, "[S3] Response: %.500s\n", body.c_str());
+            }
+
+            if (resp.status_code == 400 || resp.status_code == 401 || resp.status_code == 403) {
+                auto codes = extractXmlTags(body, "Code");
+                for (const auto& code : codes) {
+                    if (code == "ExpiredToken" || code == "AccessDenied" ||
+                        code == "InvalidAccessKeyId" || code == "SignatureDoesNotMatch" ||
+                        code == "TokenRefreshRequired" || code == "InvalidToken") {
+                        result.authError = true;
+                        auto msgs = extractXmlTags(body, "Message");
+                        if (!msgs.empty()) result.errorMessage = msgs.front();
+                        break;
+                    }
+                }
+                if (!result.authError && (resp.status_code == 401 || resp.status_code == 403)) {
                     result.authError = true;
-                    auto msgs = extractXmlTags(body, "Message");
-                    if (!msgs.empty()) result.errorMessage = msgs.front();
-                    break;
+                    result.errorMessage = "HTTP " + std::to_string(resp.status_code);
                 }
             }
-            if (!result.authError && (resp.status_code == 401 || resp.status_code == 403)) {
-                result.authError = true;
-                result.errorMessage = "HTTP " + std::to_string(resp.status_code);
+            return result;
+        }
+
+        auto xml = std::string(resp.body_string());
+
+        for (const auto& p : extractXmlTags(xml, "Prefix")) {
+            if (prefix.empty() || p.rfind(prefix, 0) == 0) {
+                std::string relative = p.substr(prefix.size());
+                while (!relative.empty() && relative.back() == '/')
+                    relative.pop_back();
+                if (!relative.empty())
+                    result.prefixes.push_back(relative);
             }
         }
-        return result;
-    }
 
-    auto xml = std::string(resp.body_string());
-
-    for (const auto& p : extractXmlTags(xml, "Prefix")) {
-        if (prefix.empty() || p.rfind(prefix, 0) == 0) {
-            std::string relative = p.substr(prefix.size());
-            while (!relative.empty() && relative.back() == '/')
-                relative.pop_back();
-            if (!relative.empty())
-                result.prefixes.push_back(relative);
+        for (const auto& k : extractXmlTags(xml, "Key")) {
+            if (prefix.empty() || k.rfind(prefix, 0) == 0) {
+                std::string relative = k.substr(prefix.size());
+                if (!relative.empty())
+                    result.objects.push_back(relative);
+            }
         }
-    }
 
-    for (const auto& k : extractXmlTags(xml, "Key")) {
-        if (prefix.empty() || k.rfind(prefix, 0) == 0) {
-            std::string relative = k.substr(prefix.size());
-            if (!relative.empty())
-                result.objects.push_back(relative);
+        continuationToken.clear();
+        auto truncatedTags = extractXmlTags(xml, "IsTruncated");
+        if (!truncatedTags.empty() && truncatedTags.front() == "true") {
+            auto tokens = extractXmlTags(xml, "NextContinuationToken");
+            if (!tokens.empty()) continuationToken = tokens.front();
         }
-    }
+    } while (!continuationToken.empty());
 
     if (auto* log = cacheDebugLog())
         std::fprintf(log, "[S3] Found %zu prefixes, %zu objects\n",

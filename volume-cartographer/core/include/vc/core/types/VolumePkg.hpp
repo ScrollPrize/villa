@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -9,7 +10,6 @@
 #include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include "utils/Json.hpp"
@@ -38,13 +38,9 @@ struct RemoteSegmentInfo {
 };
 
 bool isLocationRemote(const std::string& location);
-std::filesystem::path resolveLocalPath(const std::string& location);
+std::filesystem::path resolveLocalPath(const std::string& location,
+                                       const std::filesystem::path& base = {});
 
-// Verifies that `location` looks like a valid entry of the given category.
-// Local paths are checked structurally (zarr markers / segment meta / xy-xz-yz).
-// Remote URLs are sanity-checked for scheme + host (no network probe here —
-// the load path will surface a warning if the resource is unreachable).
-// Returns an empty string on success; otherwise a human-readable reason.
 std::string validateLocation(Category category, const std::string& location);
 
 }
@@ -97,7 +93,6 @@ public:
     bool addSingleVolume(const std::string& volumeDirName);
     bool removeSingleVolume(const std::string& volumeIdOrDirName);
     bool reloadSingleVolume(const std::string& volumeId);
-    static void setLoadFirstSegmentationDirectory(const std::string& dirName);
 
     [[nodiscard]] bool hasSegmentations() const;
     [[nodiscard]] std::vector<std::string> segmentationIDs() const;
@@ -124,10 +119,6 @@ public:
 
     [[nodiscard]] bool isRemote() const;
 
-    // Set a callback fired when async remote segment loading produces new
-    // entries, or when the in-flight remote load finishes. The callback may
-    // be invoked from a background thread, so consumers must marshal to the
-    // UI thread themselves.
     void setSegmentsChangedCallback(std::function<void()> cb);
 
     [[nodiscard]] std::string getVolpkgDirectory() const;
@@ -161,9 +152,9 @@ private:
 
     void resolveAll();
     void resolveVolumeEntry(const vc::project::Entry& e);
-    void resolveSegmentsEntry(const vc::project::Entry& e);
+    void resolveSegmentsEntry(const vc::project::Entry& e, std::uint64_t generation);
     void resolveNormalGridEntry(const vc::project::Entry& e);
-    void loadRemoteSegmentsAsync(vc::project::Entry e);
+    void loadRemoteSegmentsAsync(vc::project::Entry e, std::uint64_t generation);
     void notifySegmentsChanged();
 
     void writeJsonTo(const std::filesystem::path& target) const;
@@ -175,6 +166,6 @@ private:
 
     mutable std::mutex segmentsMutex_;
     std::function<void()> segmentsChangedCb_;
-    std::vector<std::thread> bgLoaders_;
+    std::atomic<std::uint64_t> loadGeneration_{0};
     std::atomic<bool> shuttingDown_{false};
 };

@@ -5370,8 +5370,6 @@ void CWindow::CloseVolume(void)
         _surfacePanel->resetTagUi();
     }
 
-    _remoteScroll.active = false;
-
     // Update UI
     UpdateView();
     if (treeWidgetSurfaces) {

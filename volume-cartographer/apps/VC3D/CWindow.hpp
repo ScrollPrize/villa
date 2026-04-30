@@ -262,17 +262,6 @@ private:
     bool _normalGridAvailable{false};
     QString _normalGridPath;
 
-    // Remote scroll state for on-demand segment downloading
-    struct RemoteScrollState {
-        std::string baseUrl;
-        std::string segmentsBaseUrl;
-        std::string cachePath;
-        vc::cache::HttpAuth auth;
-        vc::RemoteSegmentSource segSource = vc::RemoteSegmentSource::Segments;
-        bool active = false;
-    };
-    RemoteScrollState _remoteScroll;
-
     std::unique_ptr<FileWatcherService> _fileWatcher;
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
     bool _maskRenderInProgress{false};

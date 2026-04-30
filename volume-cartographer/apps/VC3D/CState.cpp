@@ -158,13 +158,14 @@ void CState::closeAll()
         }
     }
 
-    _vpkg = nullptr;
     _currentVolume = nullptr;
     _currentVolumeId.clear();
     _segmentationGrowthVolumeId.clear();
 
     _pois.clear();
     _pointCollection->clearAll();
+
+    setVpkg(nullptr);
 }
 
 // --- Surface methods (from CSurfaceCollection) ---

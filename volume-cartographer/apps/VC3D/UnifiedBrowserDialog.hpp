@@ -49,7 +49,6 @@ private:
     void navigateLocal(const QString& absDir);
     void navigateRemote(const QString& urlPrefix);
     bool ensureRemoteAuth(const QString& probeUrl);
-    static QString normalizeUriForMode(QString uri, Mode m);
     static Mode detectModeFromUri(const QString& uri);
     QString currentUri() const;
     QString itemUri(const QListWidgetItem* item) const;

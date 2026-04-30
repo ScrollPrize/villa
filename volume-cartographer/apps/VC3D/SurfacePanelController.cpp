@@ -560,6 +560,7 @@ void SurfacePanelController::populateSurfaceTree()
 
     const QSignalBlocker blocker{_ui.treeWidget};
     _ui.treeWidget->clear();
+    _remoteStubSegments.clear();
 
     for (const auto& id : _volumePkg->segmentationIDs()) {
         auto surf = _volumePkg->getSurface(id);

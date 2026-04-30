@@ -20,7 +20,6 @@ class MenuActionController : public QObject
 
 public:
     static constexpr int kMaxRecentVolpkg = 10;
-    static constexpr int kMaxRecentRemote = 10;
 
     explicit MenuActionController(CWindow* window);
 

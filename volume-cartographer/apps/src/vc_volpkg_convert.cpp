@@ -38,11 +38,7 @@ std::string lastPrefixComponent(const std::string& prefix)
 utils::Json parseConfig(const std::string& body)
 {
     if (body.empty()) return utils::Json::object();
-    try {
-        return utils::Json::parse(body);
-    } catch (...) {
-        return utils::Json::object();
-    }
+    return utils::Json::parse(body);
 }
 
 void appendBareEntry(utils::Json& arr, const std::string& location)
@@ -65,6 +61,14 @@ void appendTaggedEntry(utils::Json& arr, const std::string& location,
     arr.push_back(obj);
 }
 
+static std::string relPath(const fs::path& target, const fs::path& base)
+{
+    std::error_code ec;
+    auto rel = fs::relative(target, base, ec);
+    if (ec || rel.empty()) return target.string();
+    return rel.string();
+}
+
 int convertLocal(const fs::path& root, const fs::path& outFile)
 {
     if (!fs::is_directory(root)) {
@@ -72,11 +76,14 @@ int convertLocal(const fs::path& root, const fs::path& outFile)
         return 2;
     }
 
+    const auto absRoot = fs::absolute(root);
+    const auto absOutDir = fs::absolute(outFile.parent_path().empty() ? fs::current_path() : outFile.parent_path());
+
     utils::Json out = utils::Json::object();
-    out["name"] = root.filename().string();
+    out["name"] = absRoot.filename().string();
     out["version"] = 1;
 
-    const auto cfg = root / "config.json";
+    const auto cfg = absRoot / "config.json";
     if (fs::exists(cfg)) {
         auto j = utils::Json::parse_file(cfg);
         if (j.contains("name") && j.at("name").is_string()) {
@@ -89,27 +96,27 @@ int convertLocal(const fs::path& root, const fs::path& outFile)
     auto segments = utils::Json::array();
     auto normalGrids = utils::Json::array();
 
-    if (fs::is_directory(root / "volumes")) {
-        appendBareEntry(volumes, (root / "volumes").string());
+    if (fs::is_directory(absRoot / "volumes")) {
+        appendBareEntry(volumes, relPath(absRoot / "volumes", absOutDir));
     }
 
     std::optional<std::string> firstSegmentsLoc;
     for (const auto& d : {"paths", "traces", "export"}) {
-        if (fs::is_directory(root / d)) {
-            const auto loc = (root / d).string();
+        if (fs::is_directory(absRoot / d)) {
+            const auto loc = relPath(absRoot / d, absOutDir);
             appendBareEntry(segments, loc);
             if (!firstSegmentsLoc) firstSegmentsLoc = loc;
         }
     }
 
-    if (fs::is_directory(root / "normal_grids")) {
-        appendBareEntry(normalGrids, (root / "normal_grids").string());
+    if (fs::is_directory(absRoot / "normal_grids")) {
+        appendBareEntry(normalGrids, relPath(absRoot / "normal_grids", absOutDir));
     }
 
-    if (fs::is_directory(root / "normal3d")) {
-        for (const auto& e : fs::directory_iterator(root / "normal3d")) {
+    if (fs::is_directory(absRoot / "normal3d")) {
+        for (const auto& e : fs::directory_iterator(absRoot / "normal3d")) {
             if (e.is_directory()) {
-                appendTaggedEntry(volumes, e.path().string(), {"normal3d"});
+                appendTaggedEntry(volumes, relPath(e.path(), absOutDir), {"normal3d"});
             }
         }
     }
@@ -131,7 +138,6 @@ int convertRemote(const std::string& input, const fs::path& outFile)
 {
     auto resolved = vc::resolveRemoteUrl(input);
     auto httpsBase = ensureTrailingSlash(resolved.httpsUrl);
-    // Preserve the user-supplied form (s3:// or https://) for output entries.
     auto displayBase = ensureTrailingSlash(input);
 
     vc::cache::HttpAuth auth;
@@ -161,7 +167,10 @@ int convertRemote(const std::string& input, const fs::path& outFile)
             const auto n = j.at("name").get_string();
             if (n != "NULL") out["name"] = n;
         }
-    } catch (...) {}
+    } catch (const std::exception& e) {
+        std::cerr << "warning: cannot read " << cfgUrl << ": " << e.what()
+                  << " (using directory name as project name)\n";
+    }
 
     auto volumes = utils::Json::array();
     auto segments = utils::Json::array();
@@ -194,13 +203,15 @@ int convertRemote(const std::string& input, const fs::path& outFile)
     }
 
     if (hasSubprefix("normal3d")) {
-        try {
-            auto sub = vc::cache::s3ListObjects(httpsBase + "normal3d/", auth);
-            for (const auto& subName : sub.prefixes) {
-                appendTaggedEntry(volumes,
-                    displayBase + "normal3d/" + subName + "/", {"normal3d"});
-            }
-        } catch (...) {}
+        auto sub = vc::cache::s3ListObjects(httpsBase + "normal3d/", auth);
+        if (sub.authError) {
+            std::cerr << "auth error listing normal3d: " << sub.errorMessage << "\n";
+            return 4;
+        }
+        for (const auto& subName : sub.prefixes) {
+            appendTaggedEntry(volumes,
+                displayBase + "normal3d/" + subName + "/", {"normal3d"});
+        }
     }
 
     out["volumes"] = volumes;

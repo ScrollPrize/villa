@@ -379,8 +379,8 @@ void MenuActionController::openVolpkg()
     if (file.isEmpty()) return;
 
     if (!file.endsWith(".volpkg.json", Qt::CaseInsensitive)) {
-        QMessageBox::information(_window, QObject::tr("Legacy volpkg"),
-            QObject::tr("This looks like a legacy volpkg. It will be converted to a .volpkg.json — pick where to save the converted project."));
+        QMessageBox::information(_window, QObject::tr("Convert to .volpkg.json"),
+            QObject::tr("This needs to be converted to a .volpkg.json — pick where to save the converted project."));
         QString converted;
         if (!runLegacyVolpkgConvert(file, &converted)) return;
         file = converted;
@@ -924,9 +924,13 @@ void MenuActionController::importObjAsPatch()
         return;
     }
 
-    auto pathsDirFs = std::filesystem::path(_window->_state->vpkg()->getVolpkgDirectory()) /
-                      std::filesystem::path(_window->_state->vpkg()->getSegmentationDirectory());
-    QString pathsDir = QString::fromStdString(pathsDirFs.string());
+    const auto outDir = _window->_state->vpkg()->outputSegmentsPath();
+    if (outDir.empty()) {
+        QMessageBox::warning(_window, QObject::tr("Error"),
+                             QObject::tr("Project has no output segments directory configured."));
+        return;
+    }
+    QString pathsDir = QString::fromStdString(outDir.string());
 
     QStringList successfulIds;
     QStringList failedFiles;
@@ -1035,7 +1039,9 @@ QString MenuActionController::promptLocation(const QString& title,
     if (dlg.exec() != QDialog::Accepted) return {};
     QString uri = dlg.selectedUri();
     if (uri.startsWith("file://", Qt::CaseInsensitive)) uri = uri.mid(7);
-    while (uri.endsWith('/')) uri.chop(1);
+    const int schemeSep = uri.indexOf("://");
+    const int minLen = (schemeSep < 0) ? 1 : schemeSep + 4;
+    while (uri.size() > minLen && uri.endsWith('/')) uri.chop(1);
     return uri;
 }
 

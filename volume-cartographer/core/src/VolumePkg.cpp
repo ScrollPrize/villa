@@ -34,13 +34,14 @@ bool isLocationRemote(const std::string& location)
     return false;
 }
 
-fs::path resolveLocalPath(const std::string& location)
+fs::path resolveLocalPath(const std::string& location, const fs::path& base)
 {
     constexpr const char* kFile = "file://";
-    if (location.rfind(kFile, 0) == 0) {
-        return fs::path(location.substr(std::strlen(kFile)));
-    }
-    return fs::path(location);
+    fs::path p = (location.rfind(kFile, 0) == 0)
+        ? fs::path(location.substr(std::strlen(kFile)))
+        : fs::path(location);
+    if (p.is_absolute() || base.empty()) return p;
+    return base / p;
 }
 
 }
@@ -210,7 +211,13 @@ std::string validateLocation(Category category, const std::string& location)
 }
 
 VolumePkg::VolumePkg() = default;
-VolumePkg::~VolumePkg() = default;
+
+VolumePkg::~VolumePkg()
+{
+    shuttingDown_.store(true, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(segmentsMutex_);
+    segmentsChangedCb_ = nullptr;
+}
 
 void VolumePkg::setAutosaveRoot(const fs::path& dir) { autosaveRoot_ = dir; }
 fs::path VolumePkg::autosaveRoot() { return autosaveRoot_; }
@@ -244,6 +251,7 @@ std::shared_ptr<VolumePkg> VolumePkg::loadAutosave(const vc::project::LoadOption
     if (file.empty() || !fs::exists(file)) return nullptr;
     auto p = std::shared_ptr<VolumePkg>(new VolumePkg());
     p->opts_ = opts;
+    p->path_ = file;
     p->readJsonFrom(file);
     p->resolveAll();
     return p;
@@ -278,7 +286,7 @@ bool VolumePkg::addSegmentsEntry(const std::string& location, std::vector<std::s
     if (location.empty()) return false;
     for (const auto& e : segments_) if (e.location == location) return false;
     segments_.push_back({location, std::move(tags)});
-    resolveSegmentsEntry(segments_.back());
+    resolveSegmentsEntry(segments_.back(), loadGeneration_.load(std::memory_order_relaxed));
     saveAutosave();
     return true;
 }
@@ -302,18 +310,12 @@ bool VolumePkg::removeEntry(const std::string& location)
         v.erase(it);
         return true;
     };
-    bool removed = eraseFrom(volumes_) || eraseFrom(segments_) || eraseFrom(normalGrids_);
+    bool removed = false;
+    if (eraseFrom(volumes_)) removed = true;
+    if (eraseFrom(segments_)) removed = true;
+    if (eraseFrom(normalGrids_)) removed = true;
     if (removed) {
         if (outputSegments_ && *outputSegments_ == location) outputSegments_.reset();
-        loadedVolumes_.clear();
-        volumeTagsByID_.clear();
-        {
-            std::lock_guard<std::mutex> lk(segmentsMutex_);
-            loadedSegmentations_.clear();
-            segmentationTagsByID_.clear();
-            remoteSegmentInfo_.clear();
-        }
-        resolvedNormalGridPaths_.clear();
         resolveAll();
         saveAutosave();
     }
@@ -338,7 +340,7 @@ fs::path VolumePkg::outputSegmentsPath() const
 {
     if (!outputSegments_) return {};
     if (vc::project::isLocationRemote(*outputSegments_)) return {};
-    return vc::project::resolveLocalPath(*outputSegments_);
+    return vc::project::resolveLocalPath(*outputSegments_, path_.parent_path());
 }
 
 bool VolumePkg::hasVolumes() const { return !loadedVolumes_.empty(); }
@@ -374,10 +376,62 @@ bool VolumePkg::addVolume(const std::shared_ptr<Volume>& volume)
     return result.second;
 }
 
-bool VolumePkg::addSingleVolume(const std::string&) { return false; }
-bool VolumePkg::removeSingleVolume(const std::string&) { return false; }
-bool VolumePkg::reloadSingleVolume(const std::string&) { return false; }
-void VolumePkg::setLoadFirstSegmentationDirectory(const std::string&) {}
+bool VolumePkg::addSingleVolume(const std::string& volumeDirName)
+{
+    if (volumeDirName.empty()) return false;
+    for (const auto& e : volumes_) {
+        if (vc::project::isLocationRemote(e.location)) continue;
+        const auto base = vc::project::resolveLocalPath(e.location, path_.parent_path());
+        const auto candidate = base / volumeDirName;
+        if (!isSingleZarrVolumeDir(candidate)) continue;
+        try {
+            auto v = Volume::New(candidate);
+            const auto id = v->id();
+            if (loadedVolumes_.count(id) > 0) return false;
+            loadedVolumes_.emplace(id, v);
+            if (!e.tags.empty()) volumeTagsByID_[id] = e.tags;
+            return true;
+        } catch (const std::exception& ex) {
+            Logger()->warn("addSingleVolume('{}'): {}", volumeDirName, ex.what());
+            return false;
+        }
+    }
+    return false;
+}
+
+bool VolumePkg::removeSingleVolume(const std::string& volumeIdOrDirName)
+{
+    if (loadedVolumes_.erase(volumeIdOrDirName) > 0) {
+        volumeTagsByID_.erase(volumeIdOrDirName);
+        return true;
+    }
+    for (auto it = loadedVolumes_.begin(); it != loadedVolumes_.end(); ++it) {
+        if (it->second && it->second->path().filename().string() == volumeIdOrDirName) {
+            const auto id = it->first;
+            loadedVolumes_.erase(it);
+            volumeTagsByID_.erase(id);
+            return true;
+        }
+    }
+    return false;
+}
+
+bool VolumePkg::reloadSingleVolume(const std::string& volumeId)
+{
+    auto it = loadedVolumes_.find(volumeId);
+    if (it == loadedVolumes_.end() || !it->second) return false;
+    const auto vp = it->second->path();
+    loadedVolumes_.erase(it);
+    volumeTagsByID_.erase(volumeId);
+    try {
+        auto v = Volume::New(vp);
+        loadedVolumes_.emplace(v->id(), v);
+        return true;
+    } catch (const std::exception& ex) {
+        Logger()->warn("reloadSingleVolume('{}'): {}", volumeId, ex.what());
+        return false;
+    }
+}
 
 bool VolumePkg::hasSegmentations() const
 {
@@ -638,20 +692,24 @@ void VolumePkg::saveAutosave()
 
 void VolumePkg::resolveAll()
 {
+    const auto gen = loadGeneration_.fetch_add(1, std::memory_order_relaxed) + 1;
     loadedVolumes_.clear();
     volumeTagsByID_.clear();
-    loadedSegmentations_.clear();
-    segmentationTagsByID_.clear();
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        loadedSegmentations_.clear();
+        segmentationTagsByID_.clear();
+        remoteSegmentInfo_.clear();
+    }
     resolvedNormalGridPaths_.clear();
     for (const auto& e : volumes_) resolveVolumeEntry(e);
-    for (const auto& e : segments_) resolveSegmentsEntry(e);
+    for (const auto& e : segments_) resolveSegmentsEntry(e, gen);
     for (const auto& e : normalGrids_) resolveNormalGridEntry(e);
 }
 
 void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
 {
     if (vc::project::isLocationRemote(e.location)) {
-        // Try the location as a single zarr first.
         try {
             auto v = Volume::NewFromUrl(e.location, opts_.remoteCacheRoot, {});
             const auto id = v->id();
@@ -659,7 +717,6 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
             if (!e.tags.empty()) volumeTagsByID_[id] = e.tags;
             return;
         } catch (const std::exception&) {
-            // Fall through to folder-of-zarrs handling.
         }
 
         auto resolved = vc::resolveRemoteUrl(e.location);
@@ -701,7 +758,7 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
         return;
     }
 
-    const auto path = vc::project::resolveLocalPath(e.location);
+    const auto path = vc::project::resolveLocalPath(e.location, path_.parent_path());
     if (!fs::exists(path)) {
         Logger()->warn("Skipping volume '{}': path does not exist", e.location);
         return;
@@ -729,23 +786,19 @@ void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
     }
 }
 
-void VolumePkg::resolveSegmentsEntry(const vc::project::Entry& e)
+void VolumePkg::resolveSegmentsEntry(const vc::project::Entry& e, std::uint64_t generation)
 {
     if (vc::project::isLocationRemote(e.location)) {
-        // Remote segment metadata download is network-bound and hundreds of
-        // segments per volpkg is normal. Run it on a detached background
-        // thread so the UI doesn't freeze; the worker holds a shared_ptr to
-        // this object so it stays alive until the work completes.
         auto self = weak_from_this();
-        std::thread([self, e]() {
+        std::thread([self, e, generation]() {
             auto pkg = self.lock();
             if (!pkg) return;
-            pkg->loadRemoteSegmentsAsync(e);
+            pkg->loadRemoteSegmentsAsync(e, generation);
         }).detach();
         return;
     }
 
-    const auto path = vc::project::resolveLocalPath(e.location);
+    const auto path = vc::project::resolveLocalPath(e.location, path_.parent_path());
     if (!fs::exists(path)) {
         Logger()->warn("Skipping segments '{}': path does not exist", e.location);
         return;
@@ -774,8 +827,14 @@ void VolumePkg::resolveSegmentsEntry(const vc::project::Entry& e)
     }
 }
 
-void VolumePkg::loadRemoteSegmentsAsync(vc::project::Entry e)
+void VolumePkg::loadRemoteSegmentsAsync(vc::project::Entry e, std::uint64_t generation)
 {
+    auto stale = [&]() {
+        return shuttingDown_.load(std::memory_order_relaxed)
+            || loadGeneration_.load(std::memory_order_relaxed) != generation;
+    };
+    if (stale()) return;
+
     auto resolved = vc::resolveRemoteUrl(e.location);
     std::string base = resolved.httpsUrl;
     if (base.empty()) {
@@ -797,6 +856,7 @@ void VolumePkg::loadRemoteSegmentsAsync(vc::project::Entry e)
         Logger()->warn("Auth error listing remote segments at '{}': {}", e.location, listing.errorMessage);
         return;
     }
+    if (stale()) return;
 
     const auto cacheRoot = opts_.remoteCacheRoot.empty()
         ? (defaultAutosaveRoot() / "remote_cache")
@@ -810,10 +870,10 @@ void VolumePkg::loadRemoteSegmentsAsync(vc::project::Entry e)
 
     const size_t threadCount = std::min<size_t>(16, total);
     std::atomic<size_t> nextIdx{0};
-    std::atomic<size_t> sinceLastNotify{0};
+    std::atomic<size_t> insertedSinceNotify{0};
 
     auto worker = [&]() {
-        while (!shuttingDown_.load(std::memory_order_relaxed)) {
+        while (!stale()) {
             const size_t i = nextIdx.fetch_add(1);
             if (i >= total) return;
             const auto& prefix = listing.prefixes[i];
@@ -827,16 +887,22 @@ void VolumePkg::loadRemoteSegmentsAsync(vc::project::Entry e)
                     baseNoSlash, segId, cacheRoot, auth, vc::RemoteSegmentSource::Direct);
                 auto s = Segmentation::New(localDir);
                 const auto id = s->id();
+                bool inserted = false;
                 {
                     std::lock_guard<std::mutex> lk(segmentsMutex_);
+                    if (stale()) return;
                     if (loadedSegmentations_.count(id) > 0) continue;
                     loadedSegmentations_.emplace(id, s);
                     if (!e.tags.empty()) segmentationTagsByID_[id] = e.tags;
                     remoteSegmentInfo_[id] = {baseNoSlash, cacheRoot, auth};
+                    inserted = true;
                 }
-                if (sinceLastNotify.fetch_add(1) >= 16) {
-                    sinceLastNotify.store(0);
-                    notifySegmentsChanged();
+                if (inserted) {
+                    size_t prev = insertedSinceNotify.fetch_add(1);
+                    if (prev + 1 >= 16) {
+                        insertedSinceNotify.fetch_sub(prev + 1);
+                        notifySegmentsChanged();
+                    }
                 }
             } catch (const std::exception& ex) {
                 Logger()->warn("Failed remote segment '{}': {}", segId, ex.what());
@@ -849,7 +915,7 @@ void VolumePkg::loadRemoteSegmentsAsync(vc::project::Entry e)
     for (size_t t = 0; t < threadCount; ++t) threads.emplace_back(worker);
     for (auto& th : threads) th.join();
 
-    notifySegmentsChanged();
+    if (!stale()) notifySegmentsChanged();
 }
 
 void VolumePkg::setSegmentsChangedCallback(std::function<void()> cb)
@@ -874,7 +940,7 @@ void VolumePkg::resolveNormalGridEntry(const vc::project::Entry& e)
         Logger()->warn("Remote normal_grid entry '{}' not yet supported.", e.location);
         return;
     }
-    const auto path = vc::project::resolveLocalPath(e.location);
+    const auto path = vc::project::resolveLocalPath(e.location, path_.parent_path());
     if (!fs::exists(path)) {
         Logger()->warn("Skipping normal_grid '{}': path does not exist", e.location);
         return;
@@ -962,13 +1028,14 @@ void VolumePkg::setSegmentationDirectory(const std::string& dirName)
 
 void VolumePkg::refreshSegmentations()
 {
+    const auto gen = loadGeneration_.fetch_add(1, std::memory_order_relaxed) + 1;
     {
         std::lock_guard<std::mutex> lk(segmentsMutex_);
         loadedSegmentations_.clear();
         segmentationTagsByID_.clear();
         remoteSegmentInfo_.clear();
     }
-    for (const auto& e : segments_) resolveSegmentsEntry(e);
+    for (const auto& e : segments_) resolveSegmentsEntry(e, gen);
 }
 
 bool VolumePkg::addSingleSegmentation(const std::string& id)
