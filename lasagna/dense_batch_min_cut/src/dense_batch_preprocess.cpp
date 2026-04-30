@@ -89,7 +89,7 @@ cv::Mat to_u8_for_threshold(const cv::Mat& src) {
 cv::Mat binarize_fixed_threshold(const cv::Mat& gray) {
     cv::Mat u8 = to_u8_for_threshold(gray);
     cv::Mat binary;
-    cv::threshold(u8, binary, kFixedThreshold, 255, cv::THRESH_BINARY);
+    cv::threshold(u8, binary, kFixedThreshold, 255, cv::THRESH_BINARY_INV);
     return binary;
 }
 
@@ -663,6 +663,177 @@ cv::Mat prune_to_2core(const cv::Mat& src) {
     return img;
 }
 
+cv::Mat biconnected_cycle_pixels(const cv::Mat& ridge_mask) {
+    CV_Assert(ridge_mask.type() == CV_8U);
+
+    return prune_to_2core(zhang_suen_thinning(ridge_mask));
+}
+
+cv::Mat binary_contour_loops(const cv::Mat& binary) {
+    CV_Assert(binary.type() == CV_8U);
+
+    std::vector<std::vector<cv::Point>> contours;
+    std::vector<cv::Vec4i> hierarchy;
+    cv::findContours(binary.clone(), contours, hierarchy, cv::RETR_TREE,
+                     cv::CHAIN_APPROX_NONE);
+
+    cv::Mat out = cv::Mat::zeros(binary.size(), CV_8U);
+    for (std::size_t i = 0; i < contours.size(); ++i) {
+        if (hierarchy.empty() || hierarchy[i][3] < 0) {
+            continue;
+        }
+        if (std::abs(cv::contourArea(contours[i])) < 8.0) {
+            continue;
+        }
+        cv::drawContours(out, contours, static_cast<int>(i), cv::Scalar(255), 1,
+                         cv::LINE_8, hierarchy);
+    }
+    return out;
+}
+
+struct ComponentVoronoiResult {
+    cv::Mat labels_u16;
+    cv::Mat boundaries;
+    cv::Mat cell_loops;
+    cv::Mat rings;
+};
+
+cv::Mat labels_to_u16(const cv::Mat& labels, int max_label) {
+    CV_Assert(labels.type() == CV_32S);
+
+    cv::Mat out(labels.size(), CV_16U, cv::Scalar(0));
+    if (max_label <= 0) {
+        return out;
+    }
+
+    const double scale = max_label > 65535 ? 65535.0 / max_label : 1.0;
+    for (int y = 0; y < labels.rows; ++y) {
+        for (int x = 0; x < labels.cols; ++x) {
+            const int label = labels.at<int>(y, x);
+            if (label > 0) {
+                out.at<std::uint16_t>(y, x) =
+                    static_cast<std::uint16_t>(std::lround(label * scale));
+            }
+        }
+    }
+    return out;
+}
+
+ComponentVoronoiResult component_voronoi(const cv::Mat& binary) {
+    CV_Assert(binary.type() == CV_8U);
+
+    cv::Mat component_labels;
+    const int num_components = cv::connectedComponents(binary, component_labels, 8,
+                                                       CV_32S);
+
+    cv::Mat source_mask(binary.size(), CV_8U, cv::Scalar(255));
+    source_mask.setTo(0, binary);
+
+    cv::Mat dt_to_component;
+    cv::Mat source_pixel_labels;
+    cv::distanceTransform(source_mask, dt_to_component, source_pixel_labels,
+                          cv::DIST_L2, cv::DIST_MASK_5, cv::DIST_LABEL_PIXEL);
+
+    const std::vector<cv::Point> source_points =
+        label_source_points(source_mask, source_pixel_labels);
+
+    cv::Mat nearest_component(binary.size(), CV_32S, cv::Scalar(0));
+    for (int y = 0; y < binary.rows; ++y) {
+        for (int x = 0; x < binary.cols; ++x) {
+            if (binary.at<std::uint8_t>(y, x) != 0) {
+                nearest_component.at<int>(y, x) = component_labels.at<int>(y, x);
+                continue;
+            }
+
+            const int source_label = source_pixel_labels.at<int>(y, x);
+            if (source_label <= 0 ||
+                source_label >= static_cast<int>(source_points.size())) {
+                continue;
+            }
+            const cv::Point source = source_points[source_label];
+            if (source.x >= 0) {
+                nearest_component.at<int>(y, x) =
+                    component_labels.at<int>(source.y, source.x);
+            }
+        }
+    }
+
+    cv::Mat boundaries = cv::Mat::zeros(binary.size(), CV_8U);
+    for (int y = 1; y < binary.rows - 1; ++y) {
+        for (int x = 1; x < binary.cols - 1; ++x) {
+            if (binary.at<std::uint8_t>(y, x) != 0) {
+                continue;
+            }
+            const int center = nearest_component.at<int>(y, x);
+            if (center <= 0) {
+                continue;
+            }
+            bool touches_other = false;
+            for (int dy = -1; dy <= 1 && !touches_other; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) {
+                        continue;
+                    }
+                    const int other = nearest_component.at<int>(y + dy, x + dx);
+                    if (other > 0 && other != center) {
+                        touches_other = true;
+                        break;
+                    }
+                }
+            }
+            if (touches_other) {
+                boundaries.at<std::uint8_t>(y, x) = 255;
+            }
+        }
+    }
+
+    cv::Mat cell_loops = cv::Mat::zeros(binary.size(), CV_8U);
+    cv::Mat rings = cv::Mat::zeros(binary.size(), CV_8U);
+    for (int component = 1; component < num_components; ++component) {
+        cv::Mat cell_mask;
+        cv::compare(nearest_component, component, cell_mask, cv::CMP_EQ);
+
+        std::vector<std::vector<cv::Point>> contours;
+        cv::findContours(cell_mask, contours, cv::RETR_EXTERNAL,
+                         cv::CHAIN_APPROX_NONE);
+        for (std::size_t i = 0; i < contours.size(); ++i) {
+            if (std::abs(cv::contourArea(contours[i])) < 8.0) {
+                continue;
+            }
+            cv::drawContours(cell_loops, contours, static_cast<int>(i),
+                             cv::Scalar(255), 1);
+        }
+
+        cv::Mat ring_mask = cell_mask.clone();
+        ring_mask.setTo(0, component_labels == component);
+
+        std::vector<std::vector<cv::Point>> ring_contours;
+        std::vector<cv::Vec4i> ring_hierarchy;
+        cv::findContours(ring_mask, ring_contours, ring_hierarchy, cv::RETR_TREE,
+                         cv::CHAIN_APPROX_NONE);
+        for (std::size_t i = 0; i < ring_contours.size(); ++i) {
+            if (std::abs(cv::contourArea(ring_contours[i])) < 8.0) {
+                continue;
+            }
+
+            const cv::Rect bounds = cv::boundingRect(ring_contours[i]);
+            const bool touches_image_border =
+                bounds.x <= 0 || bounds.y <= 0 ||
+                bounds.x + bounds.width >= binary.cols ||
+                bounds.y + bounds.height >= binary.rows;
+            if (touches_image_border && ring_hierarchy[i][3] < 0) {
+                continue;
+            }
+
+            cv::drawContours(rings, ring_contours, static_cast<int>(i),
+                             cv::Scalar(255), 1);
+        }
+    }
+
+    return {labels_to_u16(nearest_component, num_components - 1), boundaries,
+            cell_loops, rings};
+}
+
 void write_image(const fs::path& path, const cv::Mat& image) {
     if (!cv::imwrite(path.string(), image)) {
         throw std::runtime_error("failed to write image: " + path.string());
@@ -682,101 +853,57 @@ int main(int argc, char** argv) {
         cv::Mat dt;
         cv::distanceTransform(binary, dt, cv::DIST_L2, cv::DIST_MASK_PRECISE);
 
-        const auto dt_ordered_start = Clock::now();
-        const cv::Mat skeleton_dt_ordered = distance_ordered_thinning(binary, dt);
-        const auto dt_ordered_end = Clock::now();
+        const auto component_voronoi_start = Clock::now();
+        const ComponentVoronoiResult component_voronoi_result =
+            component_voronoi(binary);
+        const auto component_voronoi_end = Clock::now();
 
-        const auto voronoi_start = Clock::now();
-        const cv::Mat ridges_voronoi_labels = voronoi_label_ridges(binary);
-        const auto voronoi_end = Clock::now();
-
-        cv::Mat foreground_labels;
-        const auto same_cc_start = Clock::now();
-        cv::connectedComponents(binary, foreground_labels, 8, CV_32S);
-        const cv::Mat ridges_voronoi_same_cc =
-            voronoi_label_ridges(binary, &foreground_labels);
-        const auto same_cc_end = Clock::now();
-
-        const auto cc_voronoi_start = Clock::now();
-        const cv::Mat ridges_cc_voronoi =
-            per_component_voronoi_ridges(binary, false);
-        const auto cc_voronoi_end = Clock::now();
-
-        const auto cc_angular_start = Clock::now();
-        const cv::Mat ridges_cc_voronoi_angular =
-            per_component_voronoi_ridges(binary, true);
-        const auto cc_angular_end = Clock::now();
-
-        const auto cc_angular_2core_start = Clock::now();
-        const cv::Mat ridges_cc_voronoi_angular_2core =
-            prune_to_2core(zhang_suen_thinning(ridges_cc_voronoi_angular));
-        const auto cc_angular_2core_end = Clock::now();
+        const auto contour_loops_start = Clock::now();
+        const cv::Mat contour_loops = binary_contour_loops(binary);
+        const auto contour_loops_end = Clock::now();
 
         const cv::Mat dt_u16 = normalized_dt_u16(dt);
 
         const std::string stem = args.input.stem().string();
         write_image(workdir / (stem + "_binary.tif"), binary);
         write_image(workdir / (stem + "_dt.tif"), dt_u16);
-        write_image(workdir / (stem + "_skeleton_dt_ordered.tif"),
-                    skeleton_dt_ordered);
-        write_image(workdir / (stem + "_ridges_voronoi_labels.tif"),
-                    ridges_voronoi_labels);
-        write_image(workdir / (stem + "_ridges_voronoi_same_cc.tif"),
-                    ridges_voronoi_same_cc);
-        write_image(workdir / (stem + "_ridges_cc_voronoi.tif"),
-                    ridges_cc_voronoi);
-        write_image(workdir / (stem + "_ridges_cc_voronoi_angular.tif"),
-                    ridges_cc_voronoi_angular);
-        write_image(workdir / (stem + "_ridges_cc_voronoi_angular_2core.tif"),
-                    ridges_cc_voronoi_angular_2core);
+        write_image(workdir / (stem + "_component_voronoi_labels.tif"),
+                    component_voronoi_result.labels_u16);
+        write_image(workdir / (stem + "_component_voronoi_boundaries.tif"),
+                    component_voronoi_result.boundaries);
+        write_image(workdir / (stem + "_component_voronoi_cell_loops.tif"),
+                    component_voronoi_result.cell_loops);
+        write_image(workdir / (stem + "_component_voronoi_rings.tif"),
+                    component_voronoi_result.rings);
+        write_image(workdir / (stem + "_binary_contour_loops.tif"),
+                    contour_loops);
 
         std::cout << "Wrote:\n"
                   << "  " << (workdir / (stem + "_binary.tif")) << "\n"
                   << "  " << (workdir / (stem + "_dt.tif")) << "\n"
-                  << "  " << (workdir / (stem + "_skeleton_dt_ordered.tif"))
-                  << "\n"
-                  << "  " << (workdir / (stem + "_ridges_voronoi_labels.tif"))
-                  << "\n"
-                  << "  " << (workdir / (stem + "_ridges_voronoi_same_cc.tif"))
-                  << "\n"
-                  << "  " << (workdir / (stem + "_ridges_cc_voronoi.tif"))
+                  << "  "
+                  << (workdir / (stem + "_component_voronoi_labels.tif"))
                   << "\n"
                   << "  "
-                  << (workdir / (stem + "_ridges_cc_voronoi_angular.tif"))
+                  << (workdir / (stem + "_component_voronoi_boundaries.tif"))
                   << "\n"
                   << "  "
-                  << (workdir /
-                      (stem + "_ridges_cc_voronoi_angular_2core.tif"))
+                  << (workdir / (stem + "_component_voronoi_cell_loops.tif"))
+                  << "\n"
+                  << "  "
+                  << (workdir / (stem + "_component_voronoi_rings.tif"))
+                  << "\n"
+                  << "  " << (workdir / (stem + "_binary_contour_loops.tif"))
                   << "\n";
         std::cout << "Timings:\n"
-                  << "  skeleton_dt_ordered_ms: "
+                  << "  component_voronoi_ms: "
                   << std::chrono::duration<double, std::milli>(
-                         dt_ordered_end - dt_ordered_start)
+                         component_voronoi_end - component_voronoi_start)
                          .count()
                   << "\n"
-                  << "  ridges_voronoi_labels_ms: "
+                  << "  binary_contour_loops_ms: "
                   << std::chrono::duration<double, std::milli>(
-                         voronoi_end - voronoi_start)
-                         .count()
-                  << "\n"
-                  << "  ridges_voronoi_same_cc_ms: "
-                  << std::chrono::duration<double, std::milli>(
-                         same_cc_end - same_cc_start)
-                         .count()
-                  << "\n"
-                  << "  ridges_cc_voronoi_ms: "
-                  << std::chrono::duration<double, std::milli>(
-                         cc_voronoi_end - cc_voronoi_start)
-                         .count()
-                  << "\n"
-                  << "  ridges_cc_voronoi_angular_ms: "
-                  << std::chrono::duration<double, std::milli>(
-                         cc_angular_end - cc_angular_start)
-                         .count()
-                  << "\n"
-                  << "  ridges_cc_voronoi_angular_2core_ms: "
-                  << std::chrono::duration<double, std::milli>(
-                         cc_angular_2core_end - cc_angular_2core_start)
+                         contour_loops_end - contour_loops_start)
                          .count()
                   << "\n";
     } catch (const std::exception& e) {

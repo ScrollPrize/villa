@@ -21,25 +21,24 @@ cd path/to/workdir
 
 Outputs:
 
-- `<stem>_binary.tif`: 8-bit binary mask from a fixed threshold of 127.
+- `<stem>_binary.tif`: 8-bit binary mask from a fixed inverted threshold of 127;
+  dark input pixels become the foreground island/components.
 - `<stem>_dt.tif`: normalized 16-bit distance transform visualization.
-- `<stem>_skeleton_dt_ordered.tif`: 8-bit distance-ordered topology-preserving
-  thinning of the binary foreground.
-- `<stem>_ridges_voronoi_labels.tif`: global approximate medial ridges from
-  OpenCV distance-transform labels.
-- `<stem>_ridges_voronoi_same_cc.tif`: global label ridges, but neighbor checks
-  are restricted to the same foreground connected component.
-- `<stem>_ridges_cc_voronoi.tif`: per-foreground-component labeled distance
-  transform ridges.
-- `<stem>_ridges_cc_voronoi_angular.tif`: per-component ridges filtered to keep
-  only pixels whose nearest boundary sites are separated by at least 120 degrees.
-- `<stem>_ridges_cc_voronoi_angular_2core.tif`: thinned angular per-component
-  ridges with iterative leaf pruning, intended to keep cyclic/core structures.
+- `<stem>_component_voronoi_labels.tif`: 16-bit visualization of nearest
+  foreground connected-component ids.
+- `<stem>_component_voronoi_boundaries.tif`: boundaries where neighboring pixels
+  belong to different nearest foreground components.
+- `<stem>_component_voronoi_cell_loops.tif`: contour loops of each component's
+  raster Voronoi cell.
+- `<stem>_component_voronoi_rings.tif`: per-component Voronoi cells with the
+  source component carved out, rendered as candidate rings.
+- `<stem>_binary_contour_loops.tif`: hole contours from the binary foreground
+  contour hierarchy.
 
-The threshold is intentionally fixed for repeatable comparisons. Skeletonization
-operates on the binary foreground; the distance transform is used for
-visualization and to order candidate removals in the distance-ordered variant.
-The CLI prints timings in milliseconds for each experimental path.
+The threshold and polarity are intentionally fixed for repeatable comparisons.
+The component Voronoi path treats each dark foreground connected component as
+one fat site, and computes cells/rings in the surrounding light region. The CLI
+prints timings in milliseconds for the component Voronoi and contour-loop paths.
 
 ## Candidate Optimizations
 
