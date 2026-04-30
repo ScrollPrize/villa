@@ -179,6 +179,7 @@ if [[ "$MODE" == "root" ]]; then
   pushd "$PASTIX_SRC/src" >/dev/null
   cp "$LIBS_DIR/config.in" config.in
   sed -i -E "s|^SCOTCH_HOME[[:space:]]*=.*$|SCOTCH_HOME = /usr/local/scotch|" config.in
+  sed -i -E 's|^(CCFOPT[[:space:]]*=[[:space:]]*-O3.*)$|\1 -std=gnu89 -fpermissive -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=int-conversion -Wno-error=implicit-int|' config.in
   make SCOTCH_HOME=/usr/local/scotch
   make install SCOTCH_HOME=/usr/local/scotch
   popd >/dev/null
