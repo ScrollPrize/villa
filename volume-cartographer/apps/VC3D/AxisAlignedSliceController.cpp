@@ -130,6 +130,17 @@ void AxisAlignedSliceController::resetTilt()
     applyOrientation();
 }
 
+void AxisAlignedSliceController::resetAll()
+{
+    _segXZRotationDeg = 0.0f;
+    _segYZRotationDeg = 0.0f;
+    _xyTilt = QPointF(0.0, 0.0);
+    _segXZTilt = 0.0;
+    _segYZTilt = 0.0;
+    _drags.clear();
+    cancelOrientationTimer();
+}
+
 void AxisAlignedSliceController::onTiltHandleChanged(CTiledVolumeViewer* viewer, QPointF tilt)
 {
     if (!_enabled || !viewer) {

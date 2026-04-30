@@ -36,6 +36,7 @@ public:
 
     void resetRotations();
     void resetTilt();
+    void resetAll();
 
     // Mouse event handlers for rotation dragging
     void onMousePress(CTiledVolumeViewer* viewer, const cv::Vec3f& volLoc, Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
