@@ -1001,7 +1001,7 @@ int main(int argc, char *argv[])
             ("sweep-max-runs", po::value<int>()->default_value(0), "Maximum runs for --sweep-strategy lhs")
             ("sweep-max-gen", po::value<int>()->default_value(-1), "Maximum grow generations per sweep run")
             ("sweep-max-width", po::value<int>()->default_value(-1), "Seed-only sweep max_width; skips target comparison metrics")
-            ("sweep-max-height", po::value<int>()->default_value(-1), "Seed-only sweep max_height; defaults to --sweep-max-width when omitted")
+            ("sweep-max-height", po::value<int>()->default_value(-1), "Seed-only sweep max_height")
             ("sweep-min-area", po::value<double>()->default_value(1.0), "Minimum area in cm^2 for seed-only best complete mesh selection")
             ("sweep-seed", po::value<uint32_t>()->default_value(1), "Deterministic seed for sampled sweep strategies")
             ("sweep-cutout-cm", po::value<double>()->default_value(5.0), "Center cutout edge length used as sweep seed")
@@ -1105,10 +1105,6 @@ int main(int argc, char *argv[])
             std::cerr << "ERROR: --sweep-max-height must be positive when set" << std::endl;
             return EXIT_FAILURE;
         }
-        if (sweep_max_height > 0 && sweep_max_width <= 0) {
-            std::cerr << "ERROR: --sweep-max-height requires --sweep-max-width" << std::endl;
-            return EXIT_FAILURE;
-        }
         if (!std::isfinite(sweep_min_area_cm2) || sweep_min_area_cm2 < 0.0) {
             std::cerr << "ERROR: --sweep-min-area must be a non-negative cm^2 value" << std::endl;
             return EXIT_FAILURE;
@@ -1156,9 +1152,9 @@ int main(int argc, char *argv[])
     std::filesystem::create_directories(tgt_dir);
 
     if (!sweep_target_path.empty()) {
-        const bool seed_only_sweep = sweep_max_width > 0;
+        const bool seed_only_sweep = sweep_max_width > 0 || sweep_max_height > 0;
         const int seed_only_max_width = sweep_max_width;
-        const int seed_only_max_height = sweep_max_height > 0 ? sweep_max_height : sweep_max_width;
+        const int seed_only_max_height = sweep_max_height;
         auto target = load_quad_from_tifxyz(sweep_target_path.string());
         if (!target) {
             std::cerr << "Error: failed to load sweep target tifxyz " << sweep_target_path << std::endl;
@@ -1210,8 +1206,14 @@ int main(int argc, char *argv[])
                   << (seed_only_sweep ? "from seed " : "against ")
                   << sweep_target_path << std::endl;
         if (seed_only_sweep) {
-            std::cout << "Seed-only sweep bounds max_width=" << seed_only_max_width
-                      << " max_height=" << seed_only_max_height << std::endl;
+            std::cout << "Seed-only sweep bounds";
+            if (seed_only_max_width > 0) {
+                std::cout << " max_width=" << seed_only_max_width;
+            }
+            if (seed_only_max_height > 0) {
+                std::cout << " max_height=" << seed_only_max_height;
+            }
+            std::cout << std::endl;
         } else {
             std::cout << "Target valid_points=" << target_valid_points
                       << " valid_quads=" << target_valid_quads
@@ -1262,8 +1264,12 @@ int main(int argc, char *argv[])
                 run_params["steps"] = sweep_max_gen;
             }
             if (seed_only_sweep) {
-                run_params["max_width"] = seed_only_max_width;
-                run_params["max_height"] = seed_only_max_height;
+                if (seed_only_max_width > 0) {
+                    run_params["max_width"] = seed_only_max_width;
+                }
+                if (seed_only_max_height > 0) {
+                    run_params["max_height"] = seed_only_max_height;
+                }
             } else {
                 const double run_src_step = std::max(1.0, json_number_or(run_params, "src_step", 20.0));
                 run_params["max_width"] = static_cast<int>(std::ceil(target_grid_size.width * run_src_step));
