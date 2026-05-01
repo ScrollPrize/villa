@@ -1248,7 +1248,7 @@ ComponentVoronoiResult component_voronoi(const cv::Mat& binary) {
     }
 
     cv::Mat connected_skeleton = connect_clean_skeleton_with_source_ridges(
-        boundary_skeleton_pruned, source_pixel_ridge_skeleton, dt_to_component);
+        boundary_skeleton_pruned, source_pixel_ridges, dt_to_component);
     cv::Mat cell_loops_connected;
     cv::bitwise_or(cell_loops, connected_skeleton, cell_loops_connected);
 
