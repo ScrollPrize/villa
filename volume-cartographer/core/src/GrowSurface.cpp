@@ -1389,7 +1389,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 {
     bool flip_x = params.value("flip_x", 0);
     bool bidirectional = params.value("bidirectional", false);
-    int global_steps_per_window = params.value("global_steps_per_window", 0);
+    int global_steps_per_window = params.value("global_steps_per_window", 1);
 
 
     std::cout << "global_steps_per_window: " << global_steps_per_window << std::endl;
