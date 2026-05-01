@@ -34,10 +34,19 @@ Outputs:
 - `<stem>_component_voronoi_boundary_skeleton_pruned.tif`: boundary skeleton
   with short dead-end spurs removed when their maximum raw DT value is below the
   fixed pruning threshold.
+- `<stem>_source_pixel_voronoi_ridges.tif`: the older dense ridge detector:
+  pixels where neighboring OpenCV labeled-DT source-pixel ids differ.
+- `<stem>_source_pixel_voronoi_ridge_skeleton.tif`: one-pixel thinning of the
+  dense source-pixel ridge candidates used as hybrid connector paths.
+- `<stem>_component_voronoi_boundary_skeleton_hybrid.tif`: clean pruned
+  component-boundary skeleton plus selected source-pixel ridge connector pieces.
 - `<stem>_component_voronoi_cell_loops.tif`: contour loops of each component's
   raster Voronoi cell.
 - `<stem>_component_voronoi_cell_loops_connected.tif`: cell loops overlaid with
-  the pruned Voronoi boundary skeleton.
+  the clean pruned component-boundary skeleton plus selected source-pixel ridge
+  skeleton paths that attach to two disconnected clean skeleton components. The
+  selected connector path maximizes the minimum DT value along the path, with
+  shorter paths used as the tie-breaker.
 - `<stem>_component_voronoi_rings.tif`: per-component Voronoi cells with the
   source component carved out, rendered as candidate rings.
 - `<stem>_binary_contour_loops.tif`: hole contours from the binary foreground

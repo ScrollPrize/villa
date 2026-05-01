@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <iostream>
 #include <limits>
+#include <numeric>
 #include <queue>
 #include <stdexcept>
 #include <string>
@@ -775,11 +776,332 @@ cv::Mat prune_short_low_dt_spurs(const cv::Mat& skeleton, const cv::Mat& dt) {
     return img;
 }
 
+cv::Mat source_pixel_label_ridges(const cv::Mat& white_domain,
+                                  const cv::Mat& source_pixel_labels) {
+    CV_Assert(white_domain.type() == CV_8U);
+    CV_Assert(source_pixel_labels.type() == CV_32S);
+
+    cv::Mat ridges = cv::Mat::zeros(white_domain.size(), CV_8U);
+    for (int y = 1; y < white_domain.rows - 1; ++y) {
+        for (int x = 1; x < white_domain.cols - 1; ++x) {
+            if (white_domain.at<std::uint8_t>(y, x) == 0) {
+                continue;
+            }
+            const int center = source_pixel_labels.at<int>(y, x);
+            if (center <= 0) {
+                continue;
+            }
+
+            bool touches_other = false;
+            for (int dy = -1; dy <= 1 && !touches_other; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) {
+                        continue;
+                    }
+                    if (white_domain.at<std::uint8_t>(y + dy, x + dx) == 0) {
+                        continue;
+                    }
+                    const int other = source_pixel_labels.at<int>(y + dy, x + dx);
+                    if (other > 0 && other != center) {
+                        touches_other = true;
+                        break;
+                    }
+                }
+            }
+
+            if (touches_other) {
+                ridges.at<std::uint8_t>(y, x) = 255;
+            }
+        }
+    }
+
+    return ridges;
+}
+
+cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
+                                                  const cv::Mat& source_skeleton,
+                                                  const cv::Mat& dt) {
+    CV_Assert(clean_skeleton.type() == CV_8U);
+    CV_Assert(source_skeleton.type() == CV_8U);
+    CV_Assert(dt.type() == CV_32F);
+
+    cv::Mat clean;
+    cv::threshold(clean_skeleton, clean, 0, 255, cv::THRESH_BINARY);
+
+    cv::Mat clean_labels;
+    const int num_clean_components =
+        cv::connectedComponents(clean, clean_labels, 8, CV_32S);
+    if (num_clean_components <= 2) {
+        return clean.clone();
+    }
+
+    cv::Mat connector_candidates;
+    cv::threshold(source_skeleton, connector_candidates, 0, 255,
+                  cv::THRESH_BINARY);
+    connector_candidates.setTo(0, clean);
+
+    cv::Mat candidate_labels;
+    const int num_candidates =
+        cv::connectedComponents(connector_candidates, candidate_labels, 8,
+                                CV_32S);
+    if (num_candidates <= 1) {
+        return clean.clone();
+    }
+
+    cv::Mat clean_source_mask(clean.size(), CV_8U, cv::Scalar(255));
+    clean_source_mask.setTo(0, clean);
+
+    cv::Mat distance_to_clean;
+    cv::Mat nearest_clean_pixel;
+    cv::distanceTransform(clean_source_mask, distance_to_clean,
+                          nearest_clean_pixel, cv::DIST_L2, cv::DIST_MASK_5,
+                          cv::DIST_LABEL_PIXEL);
+    const std::vector<cv::Point> clean_source_points =
+        label_source_points(clean_source_mask, nearest_clean_pixel);
+
+    struct Attachment {
+        int component = 0;
+        cv::Point pixel{-1, -1};
+    };
+
+    struct CandidateEdge {
+        int label = 0;
+        int a = 0;
+        int b = 0;
+        float bottleneck_dt = 0.0f;
+        int length = 0;
+        std::vector<cv::Point> path;
+    };
+
+    struct DisjointSet {
+        std::vector<int> parent;
+        explicit DisjointSet(int n) : parent(static_cast<std::size_t>(n)) {
+            std::iota(parent.begin(), parent.end(), 0);
+        }
+        int find(int x) {
+            while (parent[x] != x) {
+                parent[x] = parent[parent[x]];
+                x = parent[x];
+            }
+            return x;
+        }
+        bool unite(int a, int b) {
+            a = find(a);
+            b = find(b);
+            if (a == b) {
+                return false;
+            }
+            parent[b] = a;
+            return true;
+        }
+    };
+
+    constexpr float kMaxAttachDistance = 3.0f;
+    const std::array<cv::Point, 8> kDirs = {
+        {{-1, -1}, {0, -1}, {1, -1}, {-1, 0},
+         {1, 0},   {-1, 1}, {0, 1},  {1, 1}}};
+    std::vector<std::vector<Attachment>> attachments(
+        static_cast<std::size_t>(num_candidates));
+
+    for (int y = 0; y < candidate_labels.rows; ++y) {
+        for (int x = 0; x < candidate_labels.cols; ++x) {
+            const int candidate_label = candidate_labels.at<int>(y, x);
+            if (candidate_label <= 0) {
+                continue;
+            }
+
+            if (distance_to_clean.at<float>(y, x) > kMaxAttachDistance) {
+                continue;
+            }
+
+            const int source_label = nearest_clean_pixel.at<int>(y, x);
+            if (source_label <= 0 ||
+                source_label >= static_cast<int>(clean_source_points.size())) {
+                continue;
+            }
+            const cv::Point source = clean_source_points[source_label];
+            if (source.x < 0) {
+                continue;
+            }
+
+            const int clean_label = clean_labels.at<int>(source.y, source.x);
+            if (clean_label <= 0) {
+                continue;
+            }
+
+            attachments[candidate_label].push_back(
+                {clean_label, cv::Point(x, y)});
+        }
+    }
+
+    const auto widest_path = [&](int candidate_label, int component_a,
+                                 int component_b) -> CandidateEdge {
+        struct State {
+            int idx = 0;
+            float bottleneck = 0.0f;
+            int length = 0;
+        };
+        struct StateLess {
+            bool operator()(const State& a, const State& b) const {
+                if (a.bottleneck != b.bottleneck) {
+                    return a.bottleneck < b.bottleneck;
+                }
+                return a.length > b.length;
+            }
+        };
+
+        const int cols = candidate_labels.cols;
+        const int total = candidate_labels.rows * candidate_labels.cols;
+        std::vector<std::uint8_t> target(static_cast<std::size_t>(total), 0);
+        std::vector<float> best(static_cast<std::size_t>(total), -1.0f);
+        std::vector<int> best_length(static_cast<std::size_t>(total),
+                                     std::numeric_limits<int>::max());
+        std::vector<int> parent(static_cast<std::size_t>(total), -1);
+        std::priority_queue<State, std::vector<State>, StateLess> queue;
+
+        for (const Attachment& attachment : attachments[candidate_label]) {
+            const int idx = attachment.pixel.y * cols + attachment.pixel.x;
+            if (attachment.component == component_b) {
+                target[idx] = 1;
+            }
+        }
+
+        for (const Attachment& attachment : attachments[candidate_label]) {
+            if (attachment.component != component_a) {
+                continue;
+            }
+            const int idx = attachment.pixel.y * cols + attachment.pixel.x;
+            const float start_dt =
+                dt.at<float>(attachment.pixel.y, attachment.pixel.x);
+            if (start_dt > best[idx]) {
+                best[idx] = start_dt;
+                best_length[idx] = 1;
+                parent[idx] = idx;
+                queue.push({idx, start_dt, 1});
+            }
+        }
+
+        int target_idx = -1;
+        while (!queue.empty()) {
+            const State state = queue.top();
+            queue.pop();
+            if (state.bottleneck < best[state.idx] ||
+                (state.bottleneck == best[state.idx] &&
+                 state.length > best_length[state.idx])) {
+                continue;
+            }
+
+            if (target[state.idx] != 0) {
+                target_idx = state.idx;
+                break;
+            }
+
+            const int x = state.idx % cols;
+            const int y = state.idx / cols;
+            for (const cv::Point dir : kDirs) {
+                const int nx = x + dir.x;
+                const int ny = y + dir.y;
+                if (nx < 0 || nx >= candidate_labels.cols || ny < 0 ||
+                    ny >= candidate_labels.rows ||
+                    candidate_labels.at<int>(ny, nx) != candidate_label) {
+                    continue;
+                }
+
+                const int next_idx = ny * cols + nx;
+                const float next_bottleneck =
+                    std::min(state.bottleneck, dt.at<float>(ny, nx));
+                const int next_length = state.length + 1;
+                if (next_bottleneck > best[next_idx] ||
+                    (next_bottleneck == best[next_idx] &&
+                     next_length < best_length[next_idx])) {
+                    best[next_idx] = next_bottleneck;
+                    best_length[next_idx] = next_length;
+                    parent[next_idx] = state.idx;
+                    queue.push({next_idx, next_bottleneck, next_length});
+                }
+            }
+        }
+
+        CandidateEdge edge;
+        edge.label = candidate_label;
+        edge.a = component_a;
+        edge.b = component_b;
+        if (target_idx < 0) {
+            return edge;
+        }
+
+        edge.bottleneck_dt = best[target_idx];
+        edge.length = best_length[target_idx];
+        for (int idx = target_idx; idx >= 0 && parent[idx] != idx;
+             idx = parent[idx]) {
+            edge.path.push_back(cv::Point(idx % cols, idx / cols));
+        }
+        int root = target_idx;
+        while (parent[root] != root && parent[root] >= 0) {
+            root = parent[root];
+        }
+        if (root >= 0) {
+            edge.path.push_back(cv::Point(root % cols, root / cols));
+        }
+        return edge;
+    };
+
+    std::vector<CandidateEdge> edges;
+    for (int label = 1; label < num_candidates; ++label) {
+        std::vector<int> touched;
+        for (const Attachment& attachment : attachments[label]) {
+            if (std::find(touched.begin(), touched.end(), attachment.component) ==
+                touched.end()) {
+                touched.push_back(attachment.component);
+            }
+        }
+        if (touched.size() < 2) {
+            continue;
+        }
+        std::sort(touched.begin(), touched.end());
+        for (std::size_t i = 0; i < touched.size(); ++i) {
+            for (std::size_t j = i + 1; j < touched.size(); ++j) {
+                CandidateEdge edge = widest_path(label, touched[i], touched[j]);
+                if (!edge.path.empty()) {
+                    edges.push_back(std::move(edge));
+                }
+            }
+        }
+    }
+
+    std::sort(edges.begin(), edges.end(), [](const CandidateEdge& a,
+                                             const CandidateEdge& b) {
+        if (a.bottleneck_dt != b.bottleneck_dt) {
+            return a.bottleneck_dt > b.bottleneck_dt;
+        }
+        if (a.length != b.length) {
+            return a.length < b.length;
+        }
+        return a.label < b.label;
+    });
+
+    cv::Mat out = clean.clone();
+    DisjointSet sets(num_clean_components);
+    for (const CandidateEdge& edge : edges) {
+        if (!sets.unite(edge.a, edge.b)) {
+            continue;
+        }
+        for (const cv::Point pixel : edge.path) {
+            out.at<std::uint8_t>(pixel.y, pixel.x) = 255;
+        }
+    }
+
+    return out;
+}
+
 struct ComponentVoronoiResult {
     cv::Mat labels_u16;
     cv::Mat boundaries;
     cv::Mat boundary_skeleton;
     cv::Mat boundary_skeleton_pruned;
+    cv::Mat source_pixel_ridges;
+    cv::Mat source_pixel_ridge_skeleton;
+    cv::Mat boundary_skeleton_hybrid;
     cv::Mat cell_loops;
     cv::Mat cell_loops_connected;
     cv::Mat rings;
@@ -877,6 +1199,10 @@ ComponentVoronoiResult component_voronoi(const cv::Mat& binary) {
     const cv::Mat boundary_skeleton = zhang_suen_thinning(boundaries);
     const cv::Mat boundary_skeleton_pruned =
         prune_short_low_dt_spurs(boundary_skeleton, dt_to_component);
+    const cv::Mat source_pixel_ridges =
+        source_pixel_label_ridges(source_mask, source_pixel_labels);
+    const cv::Mat source_pixel_ridge_skeleton =
+        zhang_suen_thinning(source_pixel_ridges);
 
     cv::Mat cell_loops = cv::Mat::zeros(binary.size(), CV_8U);
     cv::Mat rings = cv::Mat::zeros(binary.size(), CV_8U);
@@ -921,11 +1247,14 @@ ComponentVoronoiResult component_voronoi(const cv::Mat& binary) {
         }
     }
 
+    cv::Mat connected_skeleton = connect_clean_skeleton_with_source_ridges(
+        boundary_skeleton_pruned, source_pixel_ridge_skeleton, dt_to_component);
     cv::Mat cell_loops_connected;
-    cv::bitwise_or(cell_loops, boundary_skeleton_pruned, cell_loops_connected);
+    cv::bitwise_or(cell_loops, connected_skeleton, cell_loops_connected);
 
     return {labels_to_u16(nearest_component, num_components - 1), boundaries,
-            boundary_skeleton, boundary_skeleton_pruned, cell_loops,
+            boundary_skeleton, boundary_skeleton_pruned, source_pixel_ridges,
+            source_pixel_ridge_skeleton, connected_skeleton, cell_loops,
             cell_loops_connected, rings};
 }
 
@@ -977,6 +1306,15 @@ int main(int argc, char** argv) {
             workdir /
                 (stem + "_component_voronoi_boundary_skeleton_pruned.tif"),
             component_voronoi_result.boundary_skeleton_pruned);
+        write_image(workdir /
+                        (stem + "_source_pixel_voronoi_ridges.tif"),
+                    component_voronoi_result.source_pixel_ridges);
+        write_image(workdir /
+                        (stem + "_source_pixel_voronoi_ridge_skeleton.tif"),
+                    component_voronoi_result.source_pixel_ridge_skeleton);
+        write_image(workdir /
+                        (stem + "_component_voronoi_boundary_skeleton_hybrid.tif"),
+                    component_voronoi_result.boundary_skeleton_hybrid);
         write_image(workdir / (stem + "_component_voronoi_cell_loops.tif"),
                     component_voronoi_result.cell_loops);
         write_image(workdir /
@@ -1004,6 +1342,18 @@ int main(int argc, char** argv) {
                   << (workdir /
                       (stem +
                        "_component_voronoi_boundary_skeleton_pruned.tif"))
+                  << "\n"
+                  << "  "
+                  << (workdir / (stem + "_source_pixel_voronoi_ridges.tif"))
+                  << "\n"
+                  << "  "
+                  << (workdir /
+                      (stem + "_source_pixel_voronoi_ridge_skeleton.tif"))
+                  << "\n"
+                  << "  "
+                  << (workdir /
+                      (stem +
+                       "_component_voronoi_boundary_skeleton_hybrid.tif"))
                   << "\n"
                   << "  "
                   << (workdir / (stem + "_component_voronoi_cell_loops.tif"))
