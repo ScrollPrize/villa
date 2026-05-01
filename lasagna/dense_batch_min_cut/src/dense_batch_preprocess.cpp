@@ -16,6 +16,7 @@
 #include <limits>
 #include <numeric>
 #include <queue>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -29,6 +30,7 @@ namespace {
 constexpr double kFixedThreshold = 127.0;
 constexpr float kMinComponentRidgeRadius = 2.0f;
 constexpr double kMinBoundaryAngleDegrees = 120.0;
+constexpr float kCapacityScale = 2.0f;
 using Clock = std::chrono::steady_clock;
 
 struct TimingMark {
@@ -55,6 +57,10 @@ StageTiming finish_timing(const std::string& name, const TimingMark& start) {
                 .count(),
             1000.0 * static_cast<double>(cpu_end - start.cpu) /
                 static_cast<double>(CLOCKS_PER_SEC)};
+}
+
+float capacity_from_dt(float value) {
+    return kCapacityScale * value;
 }
 
 void print_stage_timings(const std::vector<StageTiming>& timings) {
@@ -1566,7 +1572,8 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
             visited_edges.at<std::uint8_t>(current.y, current.x) = 255;
             edge.pixels.push_back(current);
             edge.capacity =
-                std::min(edge.capacity, dt.at<float>(current.y, current.x));
+                std::min(edge.capacity,
+                         capacity_from_dt(dt.at<float>(current.y, current.x)));
 
             if (next.x < 0) {
                 nodes = adjacent_nodes(current);
@@ -1688,6 +1695,27 @@ void draw_graph_edge(cv::Mat& out, const GraphEdge& edge,
                           static_cast<std::uint8_t>(color[2]));
         }
     }
+}
+
+std::string format_scalar_value(double value) {
+    std::ostringstream out;
+    out << std::fixed << std::setprecision(0) << value;
+    return out.str();
+}
+
+void draw_debug_label(cv::Mat& image, const cv::Point anchor,
+                      const std::string& text, const cv::Scalar color) {
+    if (text.empty()) {
+        return;
+    }
+    cv::Point pos(anchor.x + 3, anchor.y - 3);
+    pos.x = std::clamp(pos.x, 0, std::max(0, image.cols - 1));
+    pos.y = std::clamp(pos.y, 8, std::max(8, image.rows - 1));
+    cv::putText(image, text, pos + cv::Point(1, 1),
+                cv::FONT_HERSHEY_PLAIN, 0.55, cv::Scalar(0, 0, 0), 1,
+                cv::LINE_AA);
+    cv::putText(image, text, pos, cv::FONT_HERSHEY_PLAIN, 0.55, color, 1,
+                cv::LINE_AA);
 }
 
 cv::Mat render_graph_random_colors(const SkeletonGraph& graph, cv::Size size) {
@@ -1859,13 +1887,15 @@ void write_graph_connectivity_report(const fs::path& path,
     }
 }
 
-cv::Mat render_graph_capacity(const SkeletonGraph& graph, cv::Size size) {
+cv::Mat render_graph_capacity(const SkeletonGraph& graph, cv::Size size,
+                              std::uint8_t background) {
     float max_capacity = 0.0f;
     for (const GraphEdge& edge : graph.edges) {
         max_capacity = std::max(max_capacity, edge.capacity);
     }
 
-    cv::Mat out(size, CV_8UC1, cv::Scalar(0));
+    cv::Mat out(size, CV_8UC3,
+                cv::Scalar(background, background, background));
     for (const GraphEdge& edge : graph.edges) {
         const int value =
             max_capacity > 0.0f
@@ -1873,11 +1903,19 @@ cv::Mat render_graph_capacity(const SkeletonGraph& graph, cv::Size size) {
                       std::clamp(edge.capacity / max_capacity, 0.0f, 1.0f) *
                       255.0f))
                 : 0;
-        draw_graph_edge(out, edge, cv::Scalar(value));
+        draw_graph_edge(out, edge, cv::Scalar(value, value, value));
     }
     for (std::size_t label = 1; label < graph.nodes.size(); ++label) {
-        cv::circle(out, graph.nodes[label], 3, cv::Scalar(255), cv::FILLED,
-                   cv::LINE_8);
+        cv::circle(out, graph.nodes[label], 3, cv::Scalar(180, 180, 180),
+                   cv::FILLED, cv::LINE_8);
+    }
+    for (const GraphEdge& edge : graph.edges) {
+        if (edge.pixels.empty()) {
+            continue;
+        }
+        draw_debug_label(out, edge.pixels[edge.pixels.size() / 2],
+                         format_scalar_value(edge.capacity),
+                         cv::Scalar(255, 255, 255));
     }
     return out;
 }
@@ -1966,7 +2004,9 @@ struct DenseFlowResult {
     cv::Mat dense_flow;
     cv::Mat dense_flow_u16;
     cv::Mat graph_edge_flow;
+    cv::Mat graph_edge_flow_gray_bg;
     cv::Mat edge_flow_px;
+    cv::Mat edge_flow_px_gray_bg;
     cv::Mat graph_source_edges;
     int source_edges = 0;
     int seeded_nodes = 0;
@@ -2360,13 +2400,17 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             float min_dt = static_cast<float>(
                 std::min(side_a, static_cast<double>(kDenseFlowInf)));
             for (std::size_t i = 0; i < ordered.size(); ++i) {
-                min_dt = std::min(min_dt, dt.at<float>(ordered[i].y, ordered[i].x));
+                min_dt = std::min(
+                    min_dt,
+                    capacity_from_dt(dt.at<float>(ordered[i].y, ordered[i].x)));
                 left[i] = min_dt;
             }
             min_dt = static_cast<float>(
                 std::min(side_b, static_cast<double>(kDenseFlowInf)));
             for (std::size_t i = ordered.size(); i-- > 0;) {
-                min_dt = std::min(min_dt, dt.at<float>(ordered[i].y, ordered[i].x));
+                min_dt = std::min(
+                    min_dt,
+                    capacity_from_dt(dt.at<float>(ordered[i].y, ordered[i].x)));
                 right[i] = min_dt;
             }
 
@@ -2415,7 +2459,8 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                         graph_pixel_flow.at<float>(graph_pixel.y,
                                                    graph_pixel.x);
                     dense_flow.at<float>(y, x) =
-                        std::min(dt.at<float>(y, x), edge_value);
+                        std::min(capacity_from_dt(dt.at<float>(y, x)),
+                                 edge_value);
                 }
             }
         });
@@ -2423,8 +2468,12 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     }
 
     cv::Mat dense_flow_u16 = normalized_dt_u16(dense_flow);
-    cv::Mat graph_edge_flow(white_domain.size(), CV_8U, cv::Scalar(0));
-    cv::Mat edge_flow_px(white_domain.size(), CV_8U, cv::Scalar(0));
+    cv::Mat graph_edge_flow(white_domain.size(), CV_8UC3, cv::Scalar(0, 0, 0));
+    cv::Mat graph_edge_flow_gray_bg(white_domain.size(), CV_8UC3,
+                                    cv::Scalar(127, 127, 127));
+    cv::Mat edge_flow_px(white_domain.size(), CV_8UC3, cv::Scalar(0, 0, 0));
+    cv::Mat edge_flow_px_gray_bg(white_domain.size(), CV_8UC3,
+                                 cv::Scalar(127, 127, 127));
     cv::Mat graph_source_edges(white_domain.size(), CV_8U, cv::Scalar(0));
     double max_edge_flow = 0.0;
     double max_edge_px_flow = 0.0;
@@ -2463,7 +2512,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             if (value <= 0.0f) {
                 continue;
             }
-            edge_flow_px.at<std::uint8_t>(y, x) =
+            const std::uint8_t gray =
                 value >= kDenseFlowInf * 0.5f
                     ? 255
                     : static_cast<std::uint8_t>(std::lround(
@@ -2471,6 +2520,9 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                                          static_cast<float>(max_edge_px_flow),
                                      0.0f, 1.0f) *
                           255.0f));
+            edge_flow_px.at<cv::Vec3b>(y, x) = cv::Vec3b(gray, gray, gray);
+            edge_flow_px_gray_bg.at<cv::Vec3b>(y, x) =
+                cv::Vec3b(gray, gray, gray);
         }
     }
     for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
@@ -2483,17 +2535,63 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                                                0.0f, 1.0f) *
                                     255.0f));
         draw_graph_edge(graph_edge_flow, graph.edges[edge_index],
-                        cv::Scalar(value));
+                        cv::Scalar(value, value, value));
+        draw_graph_edge(graph_edge_flow_gray_bg, graph.edges[edge_index],
+                        cv::Scalar(value, value, value));
         if (source_edges[edge_index] != 0) {
             draw_graph_edge(graph_source_edges, graph.edges[edge_index],
                             cv::Scalar(255));
         }
     }
 
+    const auto flow_text = [&](double value) {
+        if (value >= static_cast<double>(kDenseFlowInf) * 0.5) {
+            return std::string("inf");
+        }
+        return format_scalar_value(value);
+    };
+
+    for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
+         ++edge_index) {
+        const GraphEdge& edge = graph.edges[edge_index];
+        const std::vector<cv::Point> ordered = order_edge_pixels(edge, graph);
+        if (ordered.empty()) {
+            continue;
+        }
+        const cv::Point anchor = ordered[ordered.size() / 2];
+        const std::string edge_text = flow_text(edge_flow[edge_index]);
+        const float px_value = graph_pixel_flow.at<float>(anchor.y, anchor.x);
+        const std::string px_text = flow_text(px_value);
+        draw_debug_label(graph_edge_flow, anchor, edge_text,
+                         cv::Scalar(255, 255, 255));
+        draw_debug_label(graph_edge_flow_gray_bg, anchor, edge_text,
+                         cv::Scalar(255, 255, 255));
+        draw_debug_label(edge_flow_px, anchor, px_text,
+                         cv::Scalar(255, 255, 255));
+        draw_debug_label(edge_flow_px_gray_bg, anchor, px_text,
+                         cv::Scalar(255, 255, 255));
+    }
+
+    for (int node = 1; node < node_count; ++node) {
+        const cv::Point anchor(cvRound(graph.nodes[node].x),
+                               cvRound(graph.nodes[node].y));
+        const std::string text = flow_text(node_flow[node]);
+        draw_debug_label(graph_edge_flow, anchor, text,
+                         cv::Scalar(180, 180, 180));
+        draw_debug_label(graph_edge_flow_gray_bg, anchor, text,
+                         cv::Scalar(180, 180, 180));
+        draw_debug_label(edge_flow_px, anchor, text,
+                         cv::Scalar(180, 180, 180));
+        draw_debug_label(edge_flow_px_gray_bg, anchor, text,
+                         cv::Scalar(180, 180, 180));
+    }
+
     return {dense_flow,
             dense_flow_u16,
             graph_edge_flow,
+            graph_edge_flow_gray_bg,
             edge_flow_px,
+            edge_flow_px_gray_bg,
             graph_source_edges,
             source_edge_count,
             seeded_node_count,
@@ -2897,9 +2995,12 @@ int main(int argc, char** argv) {
         }
 
         cv::Mat graph_capacity;
+        cv::Mat graph_capacity_gray_bg;
         {
             const TimingMark timing = start_timing();
-            graph_capacity = render_graph_capacity(graph, binary.size());
+            graph_capacity = render_graph_capacity(graph, binary.size(), 0);
+            graph_capacity_gray_bg =
+                render_graph_capacity(graph, binary.size(), 127);
             timings.push_back(finish_timing("graph_capacity_render", timing));
         }
 
@@ -2971,6 +3072,8 @@ int main(int argc, char** argv) {
                         graph_nodes);
             write_image(workdir / (stem + "_graph_capacity.tif"),
                         graph_capacity);
+            write_image(workdir / (stem + "_graph_capacity_gray_bg.tif"),
+                        graph_capacity_gray_bg);
             write_graph_connectivity_report(
                 workdir / (stem + "_graph_components.txt"), graph_stats);
             timings.push_back(finish_timing("write_regular_outputs", timing));
@@ -2984,8 +3087,12 @@ int main(int argc, char** argv) {
                         dense_flow_result.dense_flow_u16);
             write_image(workdir / (stem + "_graph_edge_flow.tif"),
                         dense_flow_result.graph_edge_flow);
+            write_image(workdir / (stem + "_graph_edge_flow_gray_bg.tif"),
+                        dense_flow_result.graph_edge_flow_gray_bg);
             write_image(workdir / (stem + "_edge_flow_px.tif"),
                         dense_flow_result.edge_flow_px);
+            write_image(workdir / (stem + "_edge_flow_px_gray_bg.tif"),
+                        dense_flow_result.edge_flow_px_gray_bg);
             write_image(workdir / (stem + "_graph_source_edges.tif"),
                         dense_flow_result.graph_source_edges);
             timings.push_back(finish_timing("dense_flow_write", timing));
@@ -3001,6 +3108,7 @@ int main(int argc, char** argv) {
             {"graph_edges_random", graph_edges_random_colors},
             {"graph_nodes", to_bgr_layer(graph_nodes)},
             {"graph_capacity", to_bgr_layer(graph_capacity)},
+            {"graph_capacity_gray_bg", to_bgr_layer(graph_capacity_gray_bg)},
         };
         if (has_dense_flow) {
             layered_tiff.push_back(
@@ -3009,7 +3117,13 @@ int main(int argc, char** argv) {
                 {"graph_edge_flow",
                  to_bgr_layer(dense_flow_result.graph_edge_flow)});
             layered_tiff.push_back(
+                {"graph_edge_flow_gray_bg",
+                 to_bgr_layer(dense_flow_result.graph_edge_flow_gray_bg)});
+            layered_tiff.push_back(
                 {"edge_flow_px", to_bgr_layer(dense_flow_result.edge_flow_px)});
+            layered_tiff.push_back(
+                {"edge_flow_px_gray_bg",
+                 to_bgr_layer(dense_flow_result.edge_flow_px_gray_bg)});
             layered_tiff.push_back(
                 {"graph_source_edges",
                  to_bgr_layer(dense_flow_result.graph_source_edges)});
@@ -3125,6 +3239,9 @@ int main(int argc, char** argv) {
                   << "\n"
                   << "  " << (workdir / (stem + "_graph_capacity.tif"))
                   << "\n"
+                  << "  "
+                  << (workdir / (stem + "_graph_capacity_gray_bg.tif"))
+                  << "\n"
                   << "  " << (workdir / (stem + "_graph_components.txt"))
                   << "\n"
                   << "  " << (workdir / (stem + "_layers.tif")) << "\n";
@@ -3135,7 +3252,13 @@ int main(int argc, char** argv) {
                       << "\n"
                       << "  " << (workdir / (stem + "_graph_edge_flow.tif"))
                       << "\n"
+                      << "  "
+                      << (workdir / (stem + "_graph_edge_flow_gray_bg.tif"))
+                      << "\n"
                       << "  " << (workdir / (stem + "_edge_flow_px.tif"))
+                      << "\n"
+                      << "  "
+                      << (workdir / (stem + "_edge_flow_px_gray_bg.tif"))
                       << "\n"
                       << "  " << (workdir / (stem + "_graph_source_edges.tif"))
                       << "\n";
