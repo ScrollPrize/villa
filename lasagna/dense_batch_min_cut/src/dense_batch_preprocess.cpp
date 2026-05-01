@@ -1966,6 +1966,7 @@ struct DenseFlowResult {
     cv::Mat dense_flow;
     cv::Mat dense_flow_u16;
     cv::Mat graph_edge_flow;
+    cv::Mat edge_flow_px;
     cv::Mat graph_source_edges;
     int source_edges = 0;
     int seeded_nodes = 0;
@@ -2141,46 +2142,104 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     std::vector<char> source_edges(graph.edges.size(), 0);
     {
         const TimingMark timing = start_timing();
-        cv::Mat domain_without_graph = white_domain.clone();
-        domain_without_graph.setTo(0, graph_edge_mask);
-        domain_without_graph.setTo(0, graph.node_mask);
+        const std::array<cv::Point, 8> kDirs = {
+            {{-1, -1}, {0, -1}, {1, -1}, {-1, 0},
+             {1, 0},   {-1, 1}, {0, 1},  {1, 1}}};
 
-        cv::Mat region_labels;
-        cv::connectedComponents(domain_without_graph, region_labels, 4, CV_32S);
-        const int source_region = region_labels.at<int>(source.y, source.x);
-        const std::array<cv::Point, 4> kCardinalDirs = {
-            {{0, -1}, {-1, 0}, {1, 0}, {0, 1}}};
+        const auto valid_domain = [&](const cv::Point pixel) {
+            return pixel.x >= 0 && pixel.x < white_domain.cols &&
+                   pixel.y >= 0 && pixel.y < white_domain.rows &&
+                   white_domain.at<std::uint8_t>(pixel.y, pixel.x) != 0;
+        };
 
-        for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
-             ++edge_index) {
-            const GraphEdge& edge = graph.edges[edge_index];
-            bool touches_source = false;
-            for (const cv::Point pixel : edge.pixels) {
-                if (pixel == source) {
-                    touches_source = true;
-                    break;
+        int source_edge = graph_edge_index.at<int>(source.y, source.x);
+        cv::Point current = source;
+        cv::Mat visited = cv::Mat::zeros(white_domain.size(), CV_8U);
+        constexpr float kDtEpsilon = 1.0e-4f;
+        while (source_edge < 0 && valid_domain(current) &&
+               visited.at<std::uint8_t>(current.y, current.x) == 0) {
+            visited.at<std::uint8_t>(current.y, current.x) = 255;
+
+            cv::Point best_edge_pixel(-1, -1);
+            float best_edge_dt = -std::numeric_limits<float>::infinity();
+            for (const cv::Point dir : kDirs) {
+                const cv::Point neighbor = current + dir;
+                if (neighbor.x < 0 || neighbor.x >= graph_edge_index.cols ||
+                    neighbor.y < 0 || neighbor.y >= graph_edge_index.rows) {
+                    continue;
                 }
-                for (const cv::Point dir : kCardinalDirs) {
-                    const int x = pixel.x + dir.x;
-                    const int y = pixel.y + dir.y;
-                    if (x < 0 || x >= region_labels.cols || y < 0 ||
-                        y >= region_labels.rows) {
-                        continue;
-                    }
-                    if (region_labels.at<int>(y, x) == source_region &&
-                        source_region > 0) {
-                        touches_source = true;
-                        break;
-                    }
+                const int edge_index =
+                    graph_edge_index.at<int>(neighbor.y, neighbor.x);
+                if (edge_index < 0) {
+                    continue;
                 }
-                if (touches_source) {
-                    break;
+                const float neighbor_dt = dt.at<float>(neighbor.y, neighbor.x);
+                if (neighbor_dt > best_edge_dt ||
+                    (neighbor_dt == best_edge_dt &&
+                     (neighbor.y < best_edge_pixel.y ||
+                      (neighbor.y == best_edge_pixel.y &&
+                       neighbor.x < best_edge_pixel.x)))) {
+                    best_edge_dt = neighbor_dt;
+                    best_edge_pixel = neighbor;
+                    source_edge = edge_index;
                 }
             }
-            if (!touches_source) {
-                continue;
+            if (source_edge >= 0) {
+                break;
             }
-            source_edges[edge_index] = 1;
+
+            const float current_dt = dt.at<float>(current.y, current.x);
+            cv::Point next(-1, -1);
+            float best_dt = current_dt;
+            for (const cv::Point dir : kDirs) {
+                const cv::Point neighbor = current + dir;
+                if (!valid_domain(neighbor) ||
+                    graph.node_mask.at<std::uint8_t>(neighbor.y, neighbor.x) !=
+                        0 ||
+                    visited.at<std::uint8_t>(neighbor.y, neighbor.x) != 0) {
+                    continue;
+                }
+                const float neighbor_dt = dt.at<float>(neighbor.y, neighbor.x);
+                if (neighbor_dt > best_dt + kDtEpsilon ||
+                    (neighbor_dt > best_dt - kDtEpsilon &&
+                     next.x >= 0 && neighbor_dt == best_dt &&
+                     (neighbor.y < next.y ||
+                      (neighbor.y == next.y && neighbor.x < next.x)))) {
+                    best_dt = neighbor_dt;
+                    next = neighbor;
+                }
+            }
+            if (next.x < 0 || best_dt <= current_dt + kDtEpsilon) {
+                break;
+            }
+            current = next;
+        }
+
+        if (source_edge < 0) {
+            cv::Mat graph_source_mask(white_domain.size(), CV_8U,
+                                      cv::Scalar(255));
+            graph_source_mask.setTo(0, graph_edge_mask);
+            cv::Mat nearest_dt;
+            cv::Mat nearest_graph_pixel;
+            cv::distanceTransform(graph_source_mask, nearest_dt,
+                                  nearest_graph_pixel, cv::DIST_L2,
+                                  cv::DIST_MASK_5, cv::DIST_LABEL_PIXEL);
+            const std::vector<cv::Point> graph_source_points =
+                label_source_points(graph_source_mask, nearest_graph_pixel);
+            const int label = nearest_graph_pixel.at<int>(source.y, source.x);
+            if (label > 0 &&
+                label < static_cast<int>(graph_source_points.size())) {
+                const cv::Point graph_pixel = graph_source_points[label];
+                if (graph_pixel.x >= 0) {
+                    source_edge =
+                        graph_edge_index.at<int>(graph_pixel.y, graph_pixel.x);
+                }
+            }
+        }
+
+        if (source_edge >= 0 &&
+            source_edge < static_cast<int>(source_edges.size())) {
+            source_edges[source_edge] = 1;
         }
 
         for (int edge_index = 0;
@@ -2365,8 +2424,10 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
 
     cv::Mat dense_flow_u16 = normalized_dt_u16(dense_flow);
     cv::Mat graph_edge_flow(white_domain.size(), CV_8U, cv::Scalar(0));
+    cv::Mat edge_flow_px(white_domain.size(), CV_8U, cv::Scalar(0));
     cv::Mat graph_source_edges(white_domain.size(), CV_8U, cv::Scalar(0));
     double max_edge_flow = 0.0;
+    double max_edge_px_flow = 0.0;
     float finite_edge_flow_min = std::numeric_limits<float>::max();
     float finite_edge_flow_max = 0.0f;
     int finite_edge_flow_count = 0;
@@ -2383,6 +2444,34 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     }
     if (max_edge_flow <= 0.0) {
         max_edge_flow = 1.0;
+    }
+    for (int y = 0; y < graph_pixel_flow.rows; ++y) {
+        for (int x = 0; x < graph_pixel_flow.cols; ++x) {
+            const float value = graph_pixel_flow.at<float>(y, x);
+            if (value > 0.0f && value < kDenseFlowInf * 0.5f) {
+                max_edge_px_flow =
+                    std::max(max_edge_px_flow, static_cast<double>(value));
+            }
+        }
+    }
+    if (max_edge_px_flow <= 0.0) {
+        max_edge_px_flow = 1.0;
+    }
+    for (int y = 0; y < graph_pixel_flow.rows; ++y) {
+        for (int x = 0; x < graph_pixel_flow.cols; ++x) {
+            const float value = graph_pixel_flow.at<float>(y, x);
+            if (value <= 0.0f) {
+                continue;
+            }
+            edge_flow_px.at<std::uint8_t>(y, x) =
+                value >= kDenseFlowInf * 0.5f
+                    ? 255
+                    : static_cast<std::uint8_t>(std::lround(
+                          std::clamp(value /
+                                         static_cast<float>(max_edge_px_flow),
+                                     0.0f, 1.0f) *
+                          255.0f));
+        }
     }
     for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
          ++edge_index) {
@@ -2404,6 +2493,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     return {dense_flow,
             dense_flow_u16,
             graph_edge_flow,
+            edge_flow_px,
             graph_source_edges,
             source_edge_count,
             seeded_node_count,
@@ -2894,6 +2984,8 @@ int main(int argc, char** argv) {
                         dense_flow_result.dense_flow_u16);
             write_image(workdir / (stem + "_graph_edge_flow.tif"),
                         dense_flow_result.graph_edge_flow);
+            write_image(workdir / (stem + "_edge_flow_px.tif"),
+                        dense_flow_result.edge_flow_px);
             write_image(workdir / (stem + "_graph_source_edges.tif"),
                         dense_flow_result.graph_source_edges);
             timings.push_back(finish_timing("dense_flow_write", timing));
@@ -2916,6 +3008,8 @@ int main(int argc, char** argv) {
             layered_tiff.push_back(
                 {"graph_edge_flow",
                  to_bgr_layer(dense_flow_result.graph_edge_flow)});
+            layered_tiff.push_back(
+                {"edge_flow_px", to_bgr_layer(dense_flow_result.edge_flow_px)});
             layered_tiff.push_back(
                 {"graph_source_edges",
                  to_bgr_layer(dense_flow_result.graph_source_edges)});
@@ -3040,6 +3134,8 @@ int main(int argc, char** argv) {
                       << "  " << (workdir / (stem + "_dense_flow_u16.tif"))
                       << "\n"
                       << "  " << (workdir / (stem + "_graph_edge_flow.tif"))
+                      << "\n"
+                      << "  " << (workdir / (stem + "_edge_flow_px.tif"))
                       << "\n"
                       << "  " << (workdir / (stem + "_graph_source_edges.tif"))
                       << "\n";
