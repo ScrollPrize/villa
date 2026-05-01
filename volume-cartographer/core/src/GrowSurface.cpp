@@ -9,13 +9,16 @@
 #include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
-#include "vc/core/util/Umbilicus.hpp"
 #include "vc/flattening/ABFFlattening.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
 #include "vc/core/util/OMPThreadPointCollection.hpp"
 #include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/HashFunctions.hpp"
 #include "vc/core/types/ChunkedTensor.hpp"
+
+#include "growth_strategies/CandidateOrdering.hpp"
+#include "growth_strategies/ComponentPruning.hpp"
+#include "growth_strategies/GrowthConfig.hpp"
 
 #include "vc/core/util/LifeTime.hpp"
 #include "vc/tracer/Tracer.hpp"
@@ -30,7 +33,6 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
-#include <queue>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -109,76 +111,6 @@ static bool looks_like_resume_surface(const QuadSurface* surf, const nlohmann::j
         return true;
     }
     return false;
-}
-
-using Umbilicus = vc::core::util::Umbilicus;
-
-static cv::Vec3i volume_shape_from_params(const nlohmann::json& params)
-{
-    if (!params.contains("_volume_shape") || !params["_volume_shape"].is_array() || params["_volume_shape"].size() != 3) {
-        throw std::runtime_error("\"single wrap\" requires internal _volume_shape [z, y, x]; command callers should derive it from the volume path");
-    }
-
-    return {
-        params["_volume_shape"][0].get<int>(),
-        params["_volume_shape"][1].get<int>(),
-        params["_volume_shape"][2].get<int>()
-    };
-}
-
-static std::optional<Umbilicus> single_wrap_umbilicus_from_params(const nlohmann::json& params)
-{
-    if (!params.value("single wrap", false)) {
-        return std::nullopt;
-    }
-    if (!params.contains("umbilicus_path") || !params["umbilicus_path"].is_string()) {
-        throw std::runtime_error("\"single wrap\" requires an umbilicus_path parameter");
-    }
-
-    Umbilicus umbilicus = Umbilicus::FromFile(params["umbilicus_path"].get<std::string>(),
-                                              volume_shape_from_params(params));
-    umbilicus.set_seam(Umbilicus::SeamDirection::NegativeX);
-    return umbilicus;
-}
-
-static bool crosses_single_wrap_seam(const Umbilicus& umbilicus,
-                                     const cv::Vec3d& a,
-                                     const cv::Vec3d& b)
-{
-    const int za = static_cast<int>(std::lround(a[2]));
-    const int zb = static_cast<int>(std::lround(b[2]));
-    if (za != zb) {
-        return false;
-    }
-
-    const cv::Vec3f af{static_cast<float>(a[0]), static_cast<float>(a[1]), static_cast<float>(a[2])};
-    const cv::Vec3f bf{static_cast<float>(b[0]), static_cast<float>(b[1]), static_cast<float>(b[2])};
-    const double theta_a = umbilicus.theta(af);
-    const double theta_b = umbilicus.theta(bf);
-    double delta = std::abs(theta_a - theta_b);
-    if (delta > 360.0) {
-        delta = std::fmod(delta, 360.0);
-    }
-    return delta > 180.0;
-}
-
-static bool same_single_wrap_z(const cv::Vec3d& a, const cv::Vec3d& b)
-{
-    return static_cast<int>(std::lround(a[2])) == static_cast<int>(std::lround(b[2]));
-}
-
-static double angular_distance_degrees(double a, double b)
-{
-    double delta = std::abs(a - b);
-    if (delta > 360.0) {
-        delta = std::fmod(delta, 360.0);
-    }
-    return std::min(delta, 360.0 - delta);
-}
-
-static cv::Vec3f vec3d_to_vec3f(const cv::Vec3d& p)
-{
-    return {static_cast<float>(p[0]), static_cast<float>(p[1]), static_cast<float>(p[2])};
 }
 
 } // namespace
@@ -1462,7 +1394,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     const float flatten_prune_score_threshold = params.value("flatten_prune_score_threshold", 500.f);
     const int flatten_prune_min_valid = params.value("flatten_prune_min_valid", 64);
     const int flatten_prune_abf_iterations = params.value("flatten_prune_abf_iterations", 5);
-    const bool flatten_prune_exploded_only = params.value("flatten_prune_exploded_only", true);
+    const int flatten_prune_preserve_min_neighbors =
+        std::max(0, params.value("flatten_prune_preserve_min_neighbors", 3));
     const bool flatten_prune_connected_components = params.value("flatten_prune_connected_components", true);
     std::vector<int> flatten_prune_scales = {1};
     if (params.contains("flatten_prune_scales") && params["flatten_prune_scales"].is_array()) {
@@ -1486,22 +1419,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         flatten_prune_scales = {1, 2, 4};
     }
     std::sort(flatten_prune_scales.begin(), flatten_prune_scales.end());
-    const int flatten_regrid_interval = params.value("flatten_regrid_interval", 0);
-    const int flatten_regrid_min_valid = params.value("flatten_regrid_min_valid", 64);
-    const int flatten_regrid_abf_iterations = params.value("flatten_regrid_abf_iterations", flatten_prune_abf_iterations);
-    const int flatten_regrid_max_displacement = params.value("flatten_regrid_max_displacement", 50);
-    const float flatten_regrid_min_keep_ratio = params.value("flatten_regrid_min_keep_ratio", 0.90f);
-    const std::string flatten_regrid_diagnostic_grid =
-        params.value("flatten_regrid_diagnostic_grid", std::string("coarse"));
-    const bool flatten_regrid_use_hr =
-        flatten_regrid_diagnostic_grid == "hr" ||
-        flatten_regrid_diagnostic_grid == "highres" ||
-        flatten_regrid_diagnostic_grid == "high_res";
-    const int flatten_regrid_hr_downsample = std::max(
-        1,
-        params.value("flatten_regrid_hr_downsample",
-                     std::max(1, static_cast<int>(std::lround(step)))));
-
     // Optional hard z-range constraint: [z_min, z_max]
     bool enforce_z_range = false;
     double z_min = 0.0, z_max = 0.0;
@@ -1547,8 +1464,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         std::cout << "  flatten_prune_score_threshold: " << flatten_prune_score_threshold << std::endl;
         std::cout << "  flatten_prune_min_valid: " << flatten_prune_min_valid << std::endl;
         std::cout << "  flatten_prune_abf_iterations: " << flatten_prune_abf_iterations << std::endl;
-        std::cout << "  flatten_prune_exploded_only: "
-                  << (flatten_prune_exploded_only ? "true" : "false") << std::endl;
+        std::cout << "  flatten_prune_preserve_min_neighbors: "
+                  << flatten_prune_preserve_min_neighbors << std::endl;
         std::cout << "  flatten_prune_connected_components: "
                   << (flatten_prune_connected_components ? "true" : "false") << std::endl;
         std::cout << "  flatten_prune_scales:";
@@ -1556,19 +1473,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             std::cout << " " << scale;
         }
         std::cout << std::endl;
-    }
-    std::cout << "  flatten_regrid_interval: " << flatten_regrid_interval << std::endl;
-    if (flatten_regrid_interval > 0) {
-        std::cout << "  flatten_regrid_min_valid: " << flatten_regrid_min_valid << std::endl;
-        std::cout << "  flatten_regrid_abf_iterations: " << flatten_regrid_abf_iterations << std::endl;
-        std::cout << "  flatten_regrid_diagnostic_grid: "
-                  << (flatten_regrid_use_hr ? "hr" : "coarse") << std::endl;
-        if (flatten_regrid_use_hr) {
-            std::cout << "  flatten_regrid_hr_downsample: "
-                      << flatten_regrid_hr_downsample << std::endl;
-        }
-        std::cout << "  flatten_regrid_max_displacement: " << flatten_regrid_max_displacement << std::endl;
-        std::cout << "  flatten_regrid_min_keep_ratio: " << flatten_regrid_min_keep_ratio << std::endl;
     }
     std::cout << "  max_width: " << max_width << std::endl;
     std::cout << "  max_height: " << max_height << std::endl;
@@ -1583,28 +1487,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     }
     if (enforce_z_range)
         std::cout << "  z_range: [" << z_min << ", " << z_max << "]" << std::endl;
-
-    std::optional<Umbilicus> single_wrap_umbilicus = single_wrap_umbilicus_from_params(params);
-    if (single_wrap_umbilicus) {
-        std::cout << "  single wrap: true, seam direction: -x, umbilicus_path: "
-                  << params["umbilicus_path"].get<std::string>() << std::endl;
-    }
-    const int single_wrap_gap_search = std::max(0, params.value("single_wrap_gap_search", 0));
-    const double single_wrap_ray_angle_deg = std::max(0.0, params.value("single_wrap_ray_angle_deg", 2.0));
-    const double single_wrap_ray_z_tolerance = std::max(0.0, params.value("single_wrap_ray_z_tolerance", 1.0));
-    const double single_wrap_ray_radius_tolerance = std::max(
-        0.0,
-        params.value("single_wrap_ray_radius_tolerance",
-                     static_cast<double>(std::max(src_step * step, 1.0f)) * 0.75));
-    if (single_wrap_umbilicus) {
-        std::cout << "  single_wrap_gap_search: "
-                  << (single_wrap_gap_search == 0 ? std::string("used-area") : std::to_string(single_wrap_gap_search))
-                  << std::endl;
-        std::cout << "  single_wrap_ray_angle_deg: " << single_wrap_ray_angle_deg
-                  << ", single_wrap_ray_z_tolerance: " << single_wrap_ray_z_tolerance
-                  << ", single_wrap_ray_radius_tolerance: " << single_wrap_ray_radius_tolerance
-                  << std::endl;
-    }
 
     std::cout << "total surface count: " << surfs_v.size() << std::endl;
 
@@ -1689,8 +1571,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     }
 
     cv::Mat_<cv::Vec3f> seed_points = seed->rawPoints();
-    const std::string growth_mode = params.value("growth_mode", std::string("point"));
-    const bool radial_frontier_requested = growth_mode == "radial_frontier";
     const bool resume_growth = looks_like_resume_surface(seed, params);
     const int grid_step = std::max(1, static_cast<int>(std::lround(step)));
 
@@ -1704,151 +1584,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     int sliding_w = static_cast<int>(1000/src_step/step*2 * sliding_w_scale);
     int w = 2000/src_step/step*2+10+2*closing_r;
     int h = max_height/src_step/step*2+10+2*closing_r;
-    const bool has_growth_directions = params.contains("growth_directions") && params["growth_directions"].is_array();
-    bool grow_down = false;
-    bool grow_right = true;
-    bool grow_up = false;
-    bool grow_left = bidirectional && !has_growth_directions;
-    const bool disable_grid_expansion = params.value("disable_grid_expansion", params.value("fill_growth", false));
-    const std::vector<cv::Vec2i> legacy_4_neighs = {
-        { 1,  0},
-        { 0,  1},
-        {-1,  0},
-        { 0, -1},
-    };
-    const std::vector<cv::Vec2i> all_8_neighs = {
-        { 1,  0},
-        { 1,  1},
-        { 0,  1},
-        {-1,  1},
-        {-1,  0},
-        {-1, -1},
-        { 0, -1},
-        { 1, -1},
-    };
-    auto append_unique_neigh = [](std::vector<cv::Vec2i>& neighs, const cv::Vec2i& value) {
-        for (const auto& existing : neighs) {
-            if (existing == value) {
-                return;
-            }
-        }
-        neighs.push_back(value);
-    };
-
-    int requested_neighbor_count = params.value("growth_neighbor_count", 4);
-    if (requested_neighbor_count != 4 && requested_neighbor_count != 8) {
-        std::cerr << "warning: growth_neighbor_count must be 4 or 8; defaulting to 4" << std::endl;
-        requested_neighbor_count = 4;
-    }
-    const int max_no_growth_expansions = params.value("max_no_growth_expansions", 5);
-    std::vector<cv::Vec2i> neighs = requested_neighbor_count == 8 ? all_8_neighs : legacy_4_neighs;
-    const bool radial_frontier_growth = radial_frontier_requested;
-    if (growth_mode != "point" &&
-        growth_mode != "radial_frontier") {
-        std::cerr << "warning: unknown growth_mode '" << growth_mode
-                  << "'; defaulting to point growth" << std::endl;
-    }
-    const std::string candidate_priority = params.value("candidate_priority", std::string("valid_neighbors"));
-    const bool candidate_priority_existing_depth = candidate_priority == "existing_depth";
-    if (candidate_priority != "valid_neighbors" && candidate_priority != "existing_depth") {
-        std::cerr << "warning: unknown candidate_priority '" << candidate_priority
-                  << "'; defaulting to valid_neighbors" << std::endl;
-    }
-    const int candidate_support_depth_radius =
-        candidate_priority_existing_depth ? std::max(1, params.value("candidate_support_depth_radius", 8)) : 0;
-    const double radial_frontier_radius_band = std::max(0.0, params.value("radial_frontier_radius_band", 1.0));
-    const bool radial_frontier_strict_band = params.value("radial_frontier_strict_band", true);
-    const int radial_frontier_prune_interval = std::max(0, params.value("frontier_prune_interval", 0));
-    const int radial_frontier_prune_attempts = std::max(1, params.value("frontier_prune_attempts", 3));
-    const int radial_frontier_prune_max_points = std::max(1, params.value("frontier_prune_max_points", 32));
-    const int radial_frontier_prune_max_neighbors = std::max(0, params.value("frontier_prune_max_neighbors", 2));
-
-    if (has_growth_directions) {
-        grow_down = grow_right = grow_up = grow_left = false;
-        neighs.clear();
-        for (const auto& dir : params["growth_directions"]) {
-            if (!dir.is_string()) {
-                continue;
-            }
-            const std::string value = dir.get<std::string>();
-            if (value == "all") {
-                grow_down = grow_right = grow_up = grow_left = true;
-                neighs = all_8_neighs;
-                break;
-            }
-            if (value == "down") {
-                grow_down = true;
-                append_unique_neigh(neighs, {1, 0});
-            }
-            else if (value == "right") {
-                grow_right = true;
-                append_unique_neigh(neighs, {0, 1});
-            }
-            else if (value == "up") {
-                grow_up = true;
-                append_unique_neigh(neighs, {-1, 0});
-            }
-            else if (value == "left") {
-                grow_left = true;
-                append_unique_neigh(neighs, {0, -1});
-            }
-        }
-        if (!grow_down && !grow_right && !grow_up && !grow_left) {
-            grow_down = grow_right = grow_up = grow_left = true;
-            neighs = all_8_neighs;
-        }
-    }
-    if (flip_x) {
-        std::swap(grow_left, grow_right);
-        for (auto& neigh : neighs) {
-            neigh[1] = -neigh[1];
-        }
-    }
-    if (radial_frontier_growth && has_growth_directions) {
-        std::vector<cv::Vec2i> radial_neighs;
-        auto add_radial_neigh = [&](bool enabled, const cv::Vec2i& value) {
-            if (enabled) {
-                append_unique_neigh(radial_neighs, value);
-            }
-        };
-
-        add_radial_neigh(grow_down, {1, 0});
-        add_radial_neigh(grow_right, {0, 1});
-        add_radial_neigh(grow_up, {-1, 0});
-        add_radial_neigh(grow_left, {0, -1});
-
-        if (requested_neighbor_count == 8) {
-            add_radial_neigh(grow_down && grow_right, {1, 1});
-            add_radial_neigh(grow_down && grow_left, {1, -1});
-            add_radial_neigh(grow_up && grow_right, {-1, 1});
-            add_radial_neigh(grow_up && grow_left, {-1, -1});
-        }
-
-        if (!radial_neighs.empty()) {
-            neighs = std::move(radial_neighs);
-        }
-    }
-    std::cout << "growth directions:"
-              << " down=" << grow_down
-              << " right=" << grow_right
-              << " up=" << grow_up
-              << " left=" << grow_left
-              << " neighbor_count=" << neighs.size()
-              << " max_no_growth_expansions=" << max_no_growth_expansions
-              << " expand_grid=" << !disable_grid_expansion
-              << " growth_mode=" << (radial_frontier_growth ? "radial_frontier" : "point")
-              << " candidate_priority=" << (candidate_priority_existing_depth ? "existing_depth" : "valid_neighbors")
-              << " support_depth_radius=" << candidate_support_depth_radius
-              << " steps=" << stop_gen << std::endl;
-    if (radial_frontier_growth) {
-        std::cout << "radial frontier growth:"
-                  << " radius_band=" << radial_frontier_radius_band
-                  << " strict_band=" << radial_frontier_strict_band
-                  << " prune_interval=" << radial_frontier_prune_interval
-                  << " prune_attempts=" << radial_frontier_prune_attempts
-                  << " prune_max_points=" << radial_frontier_prune_max_points
-                  << " prune_max_neighbors=" << radial_frontier_prune_max_neighbors << std::endl;
-    }
+    const GrowthConfig growth_config = parse_growth_config(params, bidirectional, flip_x);
+    growth_config.log(std::cout, stop_gen);
 
     const int grid_margin = closing_r + 5;
     const auto requested_extra_lr = [grid_step](const char* key, const nlohmann::json& p) {
@@ -1883,18 +1620,18 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     if (resume_growth) {
         const int resume_cols = (seed_points.cols + grid_step - 1) / grid_step + 1;
         const int resume_rows = (seed_points.rows + grid_step - 1) / grid_step + 1;
-        const int extra_left = grow_left ? grow_initial_extra_cols_lr : 0;
-        const int extra_right = grow_right ? grow_initial_extra_cols_lr : 0;
-        const int extra_up = grow_up ? grow_initial_extra_rows_lr : 0;
-        const int extra_down = grow_down ? grow_initial_extra_rows_lr : 0;
+        const int extra_left = growth_config.grow_left ? grow_initial_extra_cols_lr : 0;
+        const int extra_right = growth_config.grow_right ? grow_initial_extra_cols_lr : 0;
+        const int extra_up = growth_config.grow_up ? grow_initial_extra_rows_lr : 0;
+        const int extra_down = growth_config.grow_down ? grow_initial_extra_rows_lr : 0;
         expanded_left = extra_left;
         expanded_right = extra_right;
         expanded_up = extra_up;
         expanded_down = extra_down;
-        max_extra_left = grow_left ? grow_max_extra_cols_lr : 0;
-        max_extra_right = grow_right ? grow_max_extra_cols_lr : 0;
-        max_extra_up = grow_up ? grow_max_extra_rows_lr : 0;
-        max_extra_down = grow_down ? grow_max_extra_rows_lr : 0;
+        max_extra_left = growth_config.grow_left ? grow_max_extra_cols_lr : 0;
+        max_extra_right = growth_config.grow_right ? grow_max_extra_cols_lr : 0;
+        max_extra_up = growth_config.grow_up ? grow_max_extra_rows_lr : 0;
+        max_extra_down = growth_config.grow_down ? grow_max_extra_rows_lr : 0;
         resume_origin = cv::Point(grid_margin + extra_left, grid_margin + extra_up);
         grid_limit_w = grid_margin + max_extra_left + resume_cols + max_extra_right + grid_margin;
         grid_limit_h = grid_margin + max_extra_up + resume_rows + max_extra_down + grid_margin;
@@ -1925,14 +1662,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     cv::Rect save_bounds_inv(closing_r+5,closing_r+5,h-closing_r-10,w-closing_r-10);
     cv::Rect active_bounds(closing_r+5,closing_r+5,w-closing_r-10,h-closing_r-10);
     cv::Rect static_bounds(0,0,0,h);
-    auto reset_growth_windows_to_inner_grid = [&]() {
-        save_bounds_inv = {closing_r + 5, closing_r + 5, h - closing_r - 10, w - closing_r - 10};
-        active_bounds = {closing_r + 5, closing_r + 5, w - closing_r - 10, h - closing_r - 10};
-        static_bounds = cv::Rect(0, 0, 0, h);
-    };
-    bool regrid_retry_full_active = false;
     const bool constrain_to_resume_grid =
-        disable_grid_expansion && resume_growth && resume_grid_bounds.area() > 0;
+        growth_config.disable_grid_expansion && resume_growth && resume_grid_bounds.area() > 0;
 
     int x0 = w/2;
     int y0 = h/2;
@@ -2019,7 +1750,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                         continue;
                     }
                     bool has_invalid_neighbor = false;
-                    for (const auto& n : neighs) {
+                    for (const auto& n : growth_config.neighs) {
                         const cv::Vec2i pn = p + n;
                         if (pn[0] < 0 || pn[0] >= state.rows || pn[1] < 0 || pn[1] >= state.cols ||
                             (state(pn) & STATE_LOC_VALID) == 0) {
@@ -2160,7 +1891,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
     auto count_all_valid_neighbors = [&](const cv::Vec2i& p) {
         int count = 0;
-        for (const auto& n : all_8_neighs) {
+        for (const auto& n : growth_config.all_8_neighs) {
             const cv::Vec2i pn = p + n;
             if (pn[0] >= 0 && pn[0] < state.rows &&
                 pn[1] >= 0 && pn[1] < state.cols &&
@@ -2169,6 +1900,24 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             }
         }
         return count;
+    };
+
+    auto count_direct_valid_neighbors = [&](const cv::Vec2i& p) {
+        int count = 0;
+        for (const auto& n : growth_config.legacy_4_neighs) {
+            const cv::Vec2i pn = p + n;
+            if (pn[0] >= 0 && pn[0] < state.rows &&
+                pn[1] >= 0 && pn[1] < state.cols &&
+                (state(pn) & STATE_LOC_VALID)) {
+                count++;
+            }
+        }
+        return count;
+    };
+
+    auto flatten_prune_preserves_point = [&](const cv::Vec2i& p) {
+        return flatten_prune_preserve_min_neighbors > 0 &&
+               count_direct_valid_neighbors(p) >= flatten_prune_preserve_min_neighbors;
     };
 
     auto radius_sq_from_seed = [&](const cv::Vec2i& p) {
@@ -2191,189 +1940,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 }
             }
         }
-        return false;
-    };
-
-    auto violates_single_wrap = [&](const cv::Vec2i& p, const cv::Vec3d& coord) {
-        if (!single_wrap_umbilicus) {
-            return false;
-        }
-
-        auto valid_existing_point = [&](const cv::Vec2i& pn) {
-            return pn[0] >= 0 && pn[0] < points.rows &&
-                   pn[1] >= 0 && pn[1] < points.cols &&
-                   (state(pn) & STATE_LOC_VALID) != 0 &&
-                   points(pn)[0] != -1;
-        };
-
-        auto crosses_existing_point = [&](const cv::Vec2i& pn) {
-            return valid_existing_point(pn) &&
-                   crosses_single_wrap_seam(*single_wrap_umbilicus, points(pn), coord);
-        };
-
-        for (const auto& n : neighs) {
-            const cv::Vec2i pn = p + n;
-            if (crosses_existing_point(pn)) {
-                return true;
-            }
-        }
-
-        const int max_gap = single_wrap_gap_search > 0
-            ? single_wrap_gap_search
-            : std::max(points.rows, points.cols);
-        const cv::Rect scan_area = (used_area | cv::Rect(p[1], p[0], 1, 1)) &
-                                   cv::Rect(0, 0, points.cols, points.rows);
-        for (const auto& n : neighs) {
-            cv::Vec2i pn = p + n;
-            for (int gap = 1; gap <= max_gap; ++gap, pn += n) {
-                if (!scan_area.contains(cv::Point(pn[1], pn[0]))) {
-                    break;
-                }
-                if (!valid_existing_point(pn)) {
-                    continue;
-                }
-                if (same_single_wrap_z(points(pn), coord) &&
-                    crosses_single_wrap_seam(*single_wrap_umbilicus, points(pn), coord)) {
-                    return true;
-                }
-                break;
-            }
-        }
-
-        if (single_wrap_ray_angle_deg > 0.0) {
-            const cv::Vec3f coord_f = vec3d_to_vec3f(coord);
-            const double coord_theta = single_wrap_umbilicus->theta(coord_f);
-            const double coord_radius = single_wrap_umbilicus->distance_to_umbilicus(coord_f);
-            const int z_index = std::clamp(static_cast<int>(std::lround(coord[2])),
-                                           0,
-                                           single_wrap_umbilicus->volume_shape()[0] - 1);
-            const cv::Vec3f center_f = single_wrap_umbilicus->center_at(z_index);
-            const cv::Point2d ray_origin(center_f[0], center_f[1]);
-            const cv::Point2d ray_target(coord[0], coord[1]);
-            const cv::Point2d ray_dir = ray_target - ray_origin;
-            const double ray_len = std::hypot(ray_dir.x, ray_dir.y);
-
-            auto point_at_z_on_edge = [&](const cv::Vec3d& a,
-                                          const cv::Vec3d& b,
-                                          cv::Point2d& out) {
-                const double da = a[2] - coord[2];
-                const double db = b[2] - coord[2];
-                constexpr double z_eps = 1e-9;
-                if (std::abs(da) <= z_eps && std::abs(db) <= z_eps) {
-                    out = {a[0], a[1]};
-                    return true;
-                }
-                if ((da < 0.0 && db < 0.0) || (da > 0.0 && db > 0.0) || std::abs(a[2] - b[2]) <= z_eps) {
-                    return false;
-                }
-                const double t = (coord[2] - a[2]) / (b[2] - a[2]);
-                if (t < -z_eps || t > 1.0 + z_eps) {
-                    return false;
-                }
-                out = {a[0] + t * (b[0] - a[0]), a[1] + t * (b[1] - a[1])};
-                return true;
-            };
-
-            auto radial_segment_conflicts = [&](const cv::Point2d& a, const cv::Point2d& b) {
-                if (ray_len <= 0.0) {
-                    return false;
-                }
-
-                const cv::Point2d seg = b - a;
-                const cv::Point2d rel = a - ray_origin;
-                const double denom = ray_dir.x * seg.y - ray_dir.y * seg.x;
-                const double scale = 1.0 / ray_len;
-                if (std::abs(denom) <= 1e-9 * ray_len * std::max(1.0, std::hypot(seg.x, seg.y))) {
-                    for (const cv::Point2d& endpoint : {a, b}) {
-                        const cv::Point2d d = endpoint - ray_origin;
-                        const double radius = std::hypot(d.x, d.y);
-                        if (radius <= 0.0) {
-                            continue;
-                        }
-                        const double cross = std::abs(ray_dir.x * d.y - ray_dir.y * d.x) * scale;
-                        if (cross <= single_wrap_ray_radius_tolerance &&
-                            ray_dir.x * d.x + ray_dir.y * d.y >= 0.0 &&
-                            std::abs(radius - coord_radius) > single_wrap_ray_radius_tolerance) {
-                            return true;
-                        }
-                    }
-                    return false;
-                }
-
-                const double t = (rel.x * seg.y - rel.y * seg.x) / denom;
-                const double u = (rel.x * ray_dir.y - rel.y * ray_dir.x) / denom;
-                if (t < 0.0 || u < 0.0 || u > 1.0) {
-                    return false;
-                }
-
-                const double radius = t * ray_len;
-                return std::abs(radius - coord_radius) > single_wrap_ray_radius_tolerance;
-            };
-
-            auto triangle_conflicts = [&](const cv::Vec3d& a, const cv::Vec3d& b, const cv::Vec3d& c) {
-                std::vector<cv::Point2d> intersections;
-                intersections.reserve(3);
-                cv::Point2d hit;
-                if (point_at_z_on_edge(a, b, hit)) {
-                    intersections.push_back(hit);
-                }
-                if (point_at_z_on_edge(b, c, hit)) {
-                    intersections.push_back(hit);
-                }
-                if (point_at_z_on_edge(c, a, hit)) {
-                    intersections.push_back(hit);
-                }
-                if (intersections.size() < 2) {
-                    return false;
-                }
-
-                return radial_segment_conflicts(intersections[0], intersections[1]);
-            };
-
-            const cv::Rect scan_area = used_area & cv::Rect(0, 0, points.cols, points.rows);
-            for (int y = scan_area.y; y < scan_area.br().y - 1; ++y) {
-                for (int x = scan_area.x; x < scan_area.br().x - 1; ++x) {
-                    const cv::Vec2i p00(y, x);
-                    const cv::Vec2i p10(y + 1, x);
-                    const cv::Vec2i p01(y, x + 1);
-                    const cv::Vec2i p11(y + 1, x + 1);
-                    if (valid_existing_point(p00) && valid_existing_point(p10) && valid_existing_point(p11) &&
-                        triangle_conflicts(points(p00), points(p10), points(p11))) {
-                        return true;
-                    }
-                    if (valid_existing_point(p00) && valid_existing_point(p11) && valid_existing_point(p01) &&
-                        triangle_conflicts(points(p00), points(p11), points(p01))) {
-                        return true;
-                    }
-                }
-            }
-
-            for (int y = scan_area.y; y < scan_area.br().y; ++y) {
-                for (int x = scan_area.x; x < scan_area.br().x; ++x) {
-                    const cv::Vec2i pn(y, x);
-                    if (pn == p || !valid_existing_point(pn)) {
-                        continue;
-                    }
-
-                    const cv::Vec3d& existing = points(pn);
-                    if (std::abs(existing[2] - coord[2]) > single_wrap_ray_z_tolerance) {
-                        continue;
-                    }
-
-                    const cv::Vec3f existing_f = vec3d_to_vec3f(existing);
-                    if (angular_distance_degrees(single_wrap_umbilicus->theta(existing_f), coord_theta) >
-                        single_wrap_ray_angle_deg) {
-                        continue;
-                    }
-
-                    const double existing_radius = single_wrap_umbilicus->distance_to_umbilicus(existing_f);
-                    if (std::abs(existing_radius - coord_radius) > single_wrap_ray_radius_tolerance) {
-                        return true;
-                    }
-                }
-            }
-        }
-
         return false;
     };
 
@@ -2490,7 +2056,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 if ((state(p) & STATE_LOC_VALID) == 0) {
                     continue;
                 }
-                for (const auto& n : neighs) {
+                for (const auto& n : growth_config.neighs) {
                     const cv::Vec2i pn = p + n;
                     if (pn[0] < 0 || pn[0] >= state.rows || pn[1] < 0 || pn[1] >= state.cols ||
                         (state(pn) & STATE_LOC_VALID) == 0) {
@@ -2502,89 +2068,29 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         }
     };
 
-    auto prune_to_largest_2d_component = [&]() -> int {
+    auto prune_to_largest_2d_component = [&](bool preserve_flatten_prune_neighbors) -> int {
         const cv::Rect active = used_area & cv::Rect(0, 0, state.cols, state.rows);
-        if (active.area() <= 0) {
+        const ComponentPruneResult component_prune = find_largest_component_prune_points(
+            active,
+            data.seed_loc,
+            [&](const cv::Vec2i& p) {
+                return (state(p) & STATE_LOC_VALID) != 0 && points(p)[0] != -1;
+            },
+            [&](const cv::Vec2i& p) {
+                return preserve_flatten_prune_neighbors && flatten_prune_preserves_point(p);
+            });
+        if (component_prune.component_count <= 1) {
             return 0;
         }
 
-        cv::Mat_<uint8_t> visited(active.height, active.width, uint8_t{0});
-        std::vector<std::vector<cv::Vec2i>> components;
-        const std::vector<cv::Vec2i> component_neighs = {
-            {-1,  0},
-            {-1,  1},
-            { 0,  1},
-            { 1,  1},
-            { 1,  0},
-            { 1, -1},
-            { 0, -1},
-            {-1, -1},
-        };
-
-        for (int y = active.y; y < active.br().y; ++y) {
-            for (int x = active.x; x < active.br().x; ++x) {
-                if (visited(y - active.y, x - active.x) ||
-                    (state(y, x) & STATE_LOC_VALID) == 0 ||
-                    points(y, x)[0] == -1) {
-                    continue;
-                }
-
-                components.emplace_back();
-                std::queue<cv::Vec2i> pending;
-                pending.push({y, x});
-                visited(y - active.y, x - active.x) = 1;
-
-                while (!pending.empty()) {
-                    const cv::Vec2i p = pending.front();
-                    pending.pop();
-                    components.back().push_back(p);
-
-                    for (const cv::Vec2i& n : component_neighs) {
-                        const cv::Vec2i pn = p + n;
-                        if (!active.contains(cv::Point(pn[1], pn[0])) ||
-                            visited(pn[0] - active.y, pn[1] - active.x) ||
-                            (state(pn) & STATE_LOC_VALID) == 0 ||
-                            points(pn)[0] == -1) {
-                            continue;
-                        }
-                        visited(pn[0] - active.y, pn[1] - active.x) = 1;
-                        pending.push(pn);
-                    }
-                }
-            }
+        for (const cv::Vec2i& p : component_prune.points_to_prune) {
+            prune_point(p);
         }
-
-        if (components.size() <= 1) {
-            return 0;
-        }
-
-        std::size_t keep_index = 0;
-        for (std::size_t i = 1; i < components.size(); ++i) {
-            if (components[i].size() > components[keep_index].size()) {
-                keep_index = i;
-            } else if (components[i].size() == components[keep_index].size()) {
-                const bool i_has_seed = std::find(components[i].begin(), components[i].end(), data.seed_loc) != components[i].end();
-                const bool keep_has_seed = std::find(components[keep_index].begin(), components[keep_index].end(), data.seed_loc) != components[keep_index].end();
-                if (i_has_seed && !keep_has_seed) {
-                    keep_index = i;
-                }
-            }
-        }
-
-        int removed = 0;
-        for (std::size_t i = 0; i < components.size(); ++i) {
-            if (i == keep_index) {
-                continue;
-            }
-            for (const cv::Vec2i& p : components[i]) {
-                prune_point(p);
-                removed++;
-            }
-        }
+        const int removed = static_cast<int>(component_prune.points_to_prune.size());
 
         std::cout << "flatten prune: kept largest 2D component "
-                  << components[keep_index].size()
-                  << " / " << components.size()
+                  << component_prune.kept_component_size
+                  << " / " << component_prune.component_count
                   << " components, removed " << removed
                   << " disconnected vertices" << std::endl;
 
@@ -2592,17 +2098,17 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     };
 
     auto run_frontier_attempt_prune = [&](int generation) -> int {
-        if (!radial_frontier_growth || radial_frontier_prune_interval <= 0) {
+        if (!growth_config.radial_growth || growth_config.radial_prune_interval <= 0) {
             return 0;
         }
-        if ((generation + 1) % radial_frontier_prune_interval != 0) {
+        if ((generation + 1) % growth_config.radial_prune_interval != 0) {
             return 0;
         }
 
         rebuild_frontier_from_state();
 
         std::vector<cv::Vec2i> to_prune;
-        to_prune.reserve(static_cast<std::size_t>(radial_frontier_prune_max_points));
+        to_prune.reserve(static_cast<std::size_t>(growth_config.radial_prune_max_points));
         for (const cv::Vec2i& p : fringe) {
             if (p == data.seed_loc) {
                 continue;
@@ -2613,10 +2119,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             if ((state(p) & STATE_LOC_VALID) == 0 || points(p)[0] == -1) {
                 continue;
             }
-            if (fringe_attempts(p) < radial_frontier_prune_attempts) {
+            if (fringe_attempts(p) < growth_config.radial_prune_attempts) {
                 continue;
             }
-            if (count_all_valid_neighbors(p) > radial_frontier_prune_max_neighbors) {
+            if (count_all_valid_neighbors(p) > growth_config.radial_prune_max_neighbors) {
                 continue;
             }
             to_prune.push_back(p);
@@ -2636,8 +2142,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             }
             return a[1] < b[1];
         });
-        if (static_cast<int>(to_prune.size()) > radial_frontier_prune_max_points) {
-            to_prune.resize(static_cast<std::size_t>(radial_frontier_prune_max_points));
+        if (static_cast<int>(to_prune.size()) > growth_config.radial_prune_max_points) {
+            to_prune.resize(static_cast<std::size_t>(growth_config.radial_prune_max_points));
         }
 
         for (const cv::Vec2i& p : to_prune) {
@@ -2645,7 +2151,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         }
 
         if (!to_prune.empty()) {
-            const int disconnected_pruned = flatten_prune_connected_components ? prune_to_largest_2d_component() : 0;
+            const int disconnected_pruned = flatten_prune_connected_components ? prune_to_largest_2d_component(false) : 0;
             recompute_used_area_from_state();
             rebuild_frontier_from_state();
 
@@ -2787,7 +2293,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                   << " exploded=" << (any_exploded ? "true" : "false")
                   << " max_badness=" << max_accumulated_badness << std::endl;
 
-        if (!any_success || (flatten_prune_exploded_only && !any_exploded)) {
+        if (!any_success) {
             return 0;
         }
 
@@ -2823,6 +2329,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             if ((state(p) & STATE_LOC_VALID) == 0 || points(p)[0] == -1) {
                 continue;
             }
+            if (flatten_prune_preserves_point(p)) {
+                continue;
+            }
             if (!seen.insert(p).second) {
                 continue;
             }
@@ -2837,7 +2346,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         }
 
         if (!to_prune.empty()) {
-            const int disconnected_pruned = flatten_prune_connected_components ? prune_to_largest_2d_component() : 0;
+            const int disconnected_pruned = flatten_prune_connected_components ? prune_to_largest_2d_component(true) : 0;
             recompute_used_area_from_state();
             rebuild_frontier_from_state();
 
@@ -2857,609 +2366,15 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         return static_cast<int>(to_prune.size());
     };
 
-    auto run_flatten_regrid = [&](int generation) -> int {
-        if (flatten_regrid_interval <= 0) {
-            return 0;
-        }
-        if ((generation + 1) % flatten_regrid_interval != 0) {
-            return 0;
-        }
-
-        const cv::Rect active = used_area & cv::Rect(0, 0, points.cols, points.rows);
-        if (active.area() <= 0) {
-            return 0;
-        }
-
-        int valid_count = 0;
-        for (int y = active.y; y < active.br().y; ++y) {
-            for (int x = active.x; x < active.br().x; ++x) {
-                if ((state(y, x) & STATE_LOC_VALID) && points(y, x)[0] != -1) {
-                    valid_count++;
-                }
-            }
-        }
-        if (valid_count < flatten_regrid_min_valid) {
-            return 0;
-        }
-
-        cv::Mat_<cv::Vec3f> diagnostic_points;
-        int diagnostic_hr_step = 1;
-        if (flatten_regrid_use_hr) {
-            diagnostic_hr_step = std::max(1, static_cast<int>(std::lround(step)));
-            cv::Mat_<cv::Vec3d> points_hr = surftrack_genpoints_hr(data, state, points, active, step, src_step);
-            const cv::Rect active_hr = scaled_rect_trunc(active, step) &
-                                       cv::Rect(0, 0, points_hr.cols, points_hr.rows);
-            if (active_hr.width < 2 || active_hr.height < 2) {
-                return 0;
-            }
-            diagnostic_points = cv::Mat_<cv::Vec3f>(active_hr.height, active_hr.width, cv::Vec3f(-1, -1, -1));
-            for (int y = 0; y < active_hr.height; ++y) {
-                for (int x = 0; x < active_hr.width; ++x) {
-                    const cv::Vec3d& p3 = points_hr(active_hr.y + y, active_hr.x + x);
-                    if (p3[0] == -1) {
-                        continue;
-                    }
-                    diagnostic_points(y, x) = {
-                        static_cast<float>(p3[0]),
-                        static_cast<float>(p3[1]),
-                        static_cast<float>(p3[2])
-                    };
-                }
-            }
-        } else {
-            diagnostic_points = cv::Mat_<cv::Vec3f>(active.height, active.width, cv::Vec3f(-1, -1, -1));
-            for (int y = 0; y < active.height; ++y) {
-                for (int x = 0; x < active.width; ++x) {
-                    const int src_y = active.y + y;
-                    const int src_x = active.x + x;
-                    if ((state(src_y, src_x) & STATE_LOC_VALID) == 0 || points(src_y, src_x)[0] == -1) {
-                        continue;
-                    }
-                    const cv::Vec3d& p3 = points(src_y, src_x);
-                    diagnostic_points(y, x) = {
-                        static_cast<float>(p3[0]),
-                        static_cast<float>(p3[1]),
-                        static_cast<float>(p3[2])
-                    };
-                }
-            }
-        }
-
-        cv::Mat_<cv::Vec3f>* diagnostic_points_ptr = new cv::Mat_<cv::Vec3f>(diagnostic_points);
-        QuadSurface diagnostic_surface(
-            diagnostic_points_ptr,
-            flatten_regrid_use_hr
-                ? cv::Vec2f(1.f / static_cast<float>(diagnostic_hr_step),
-                            1.f / static_cast<float>(diagnostic_hr_step))
-                : cv::Vec2f(1.f, 1.f));
-        vc::ABFConfig config;
-        config.maxIterations = static_cast<std::size_t>(std::max(1, flatten_regrid_abf_iterations));
-        config.useABF = true;
-        config.scaleToOriginalArea = false;
-        config.downsampleFactor = flatten_regrid_use_hr ? flatten_regrid_hr_downsample : 1;
-        config.alignToInputGrid = true;
-        vc::ABFDiagnostics diagnostics = vc::diagnoseAbfFlattening(
-            diagnostic_surface,
-            config,
-            static_cast<std::size_t>(std::max(16, flatten_prune_max_vertices * 2)));
-        std::cout << "flatten regrid: success=" << (diagnostics.success ? "true" : "false")
-                  << " grid=" << (flatten_regrid_use_hr ? "hr" : "coarse")
-                  << " diagnostic_size=" << diagnostic_points.cols << "x" << diagnostic_points.rows
-                  << " downsample=" << config.downsampleFactor
-                  << " exploded=" << (diagnostics.exploded ? "true" : "false")
-                  << " grad=" << diagnostics.abfGradient
-                  << " valid_uv=" << diagnostics.validUvCount
-                  << " flipped=" << diagnostics.flippedTriangles
-                  << " near_zero=" << diagnostics.nearZeroUvTriangles << std::endl;
-        if (!diagnostics.failureReason.empty()) {
-            std::cout << "flatten regrid: " << diagnostics.failureReason << std::endl;
-        }
-        auto repair_bad_diagnostic_vertices = [&]() -> int {
-            if (!diagnostics.success || diagnostics.worstVertices.empty()) {
-                return 0;
-            }
-            if (diagnostics.flippedTriangles <= 0 && diagnostics.nearZeroUvTriangles <= 0) {
-                return 0;
-            }
-
-            std::vector<vc::ABFVertexIssue> bad_vertices;
-            bad_vertices.reserve(diagnostics.worstVertices.size());
-            for (const vc::ABFVertexIssue& issue : diagnostics.worstVertices) {
-                if (issue.score >= flatten_prune_score_threshold) {
-                    bad_vertices.push_back(issue);
-                }
-            }
-            if (bad_vertices.empty()) {
-                return 0;
-            }
-
-            std::vector<cv::Vec2i> to_prune;
-            to_prune.reserve(static_cast<std::size_t>(flatten_prune_max_vertices));
-            std::unordered_set<cv::Vec2i, vec2i_hash> seen;
-            const int diagnostic_to_active_step =
-                flatten_regrid_use_hr ? std::max(1, diagnostic_hr_step) : 1;
-            for (const vc::ABFVertexIssue& issue : bad_vertices) {
-                const int local_y = static_cast<int>(std::lround(
-                    static_cast<double>(issue.point[0]) / diagnostic_to_active_step));
-                const int local_x = static_cast<int>(std::lround(
-                    static_cast<double>(issue.point[1]) / diagnostic_to_active_step));
-                const cv::Vec2i p(active.y + local_y, active.x + local_x);
-                if (p == data.seed_loc) {
-                    continue;
-                }
-                if (p[0] < 0 || p[0] >= points.rows || p[1] < 0 || p[1] >= points.cols) {
-                    continue;
-                }
-                if ((state(p) & STATE_LOC_VALID) == 0 || points(p)[0] == -1) {
-                    continue;
-                }
-                if (!seen.insert(p).second) {
-                    continue;
-                }
-                to_prune.push_back(p);
-                if (static_cast<int>(to_prune.size()) >= std::max(1, flatten_prune_max_vertices)) {
-                    break;
-                }
-            }
-
-            for (const cv::Vec2i& p : to_prune) {
-                prune_point(p);
-            }
-            if (to_prune.empty()) {
-                return 0;
-            }
-
-            const int disconnected_pruned = flatten_prune_connected_components ? prune_to_largest_2d_component() : 0;
-            recompute_used_area_from_state();
-            rebuild_frontier_from_state();
-
-            for (int i = 0; i < omp_get_max_threads(); i++) {
-                data_ths[i] = data;
-                added_points_threads[i].clear();
-            }
-
-            std::cout << "flatten regrid: repaired "
-                      << (diagnostics.flippedTriangles > 0 ? "flipped" : "degenerate")
-                      << " triangle diagnostic by pruning " << to_prune.size()
-                      << " vertices";
-            if (disconnected_pruned > 0) {
-                std::cout << " plus " << disconnected_pruned << " disconnected vertices";
-            }
-            std::cout << std::endl;
-            return static_cast<int>(to_prune.size());
-        };
-        if (!diagnostics.success || diagnostics.exploded || diagnostics.uv.empty()) {
-            if (diagnostics.exploded && repair_bad_diagnostic_vertices() > 0) {
-                return 0;
-            }
-            return 0;
-        }
-        auto diagnostic_uv_at_coarse = [&](int local_y, int local_x) -> cv::Vec2f {
-            int uv_y = local_y;
-            int uv_x = local_x;
-            if (flatten_regrid_use_hr) {
-                uv_y = local_y * diagnostic_hr_step;
-                uv_x = local_x * diagnostic_hr_step;
-            }
-            if (uv_y < 0 || uv_y >= diagnostics.uv.rows ||
-                uv_x < 0 || uv_x >= diagnostics.uv.cols) {
-                return cv::Vec2f(-1.f, -1.f);
-            }
-            return diagnostics.uv(uv_y, uv_x);
-        };
-
-        int usable_uv_count = 0;
-        cv::Vec2d uv_mean(0.0, 0.0);
-        cv::Vec2d grid_mean(0.0, 0.0);
-        for (int y = 0; y < active.height; ++y) {
-            for (int x = 0; x < active.width; ++x) {
-                const int src_y = active.y + y;
-                const int src_x = active.x + x;
-                if ((state(src_y, src_x) & STATE_LOC_VALID) == 0 || points(src_y, src_x)[0] == -1) {
-                    continue;
-                }
-                const cv::Vec2f uv = diagnostic_uv_at_coarse(y, x);
-                if (uv[0] == -1.f || !std::isfinite(uv[0]) || !std::isfinite(uv[1])) {
-                    continue;
-                }
-                uv_mean += cv::Vec2d(uv[0], uv[1]);
-                grid_mean += cv::Vec2d(src_x, src_y);
-                usable_uv_count++;
-            }
-        }
-        if (usable_uv_count < flatten_regrid_min_valid) {
-            return 0;
-        }
-
-        uv_mean *= 1.0 / static_cast<double>(usable_uv_count);
-        grid_mean *= 1.0 / static_cast<double>(usable_uv_count);
-
-        double denom = 0.0;
-        double a_num = 0.0;
-        double b_num = 0.0;
-        for (int y = 0; y < active.height; ++y) {
-            for (int x = 0; x < active.width; ++x) {
-                const int src_y = active.y + y;
-                const int src_x = active.x + x;
-                if ((state(src_y, src_x) & STATE_LOC_VALID) == 0 || points(src_y, src_x)[0] == -1) {
-                    continue;
-                }
-                const cv::Vec2f uv = diagnostic_uv_at_coarse(y, x);
-                if (uv[0] == -1.f || !std::isfinite(uv[0]) || !std::isfinite(uv[1])) {
-                    continue;
-                }
-                const double ux = static_cast<double>(uv[0]) - uv_mean[0];
-                const double uy = static_cast<double>(uv[1]) - uv_mean[1];
-                const double gx = static_cast<double>(src_x) - grid_mean[0];
-                const double gy = static_cast<double>(src_y) - grid_mean[1];
-                denom += ux * ux + uy * uy;
-                a_num += gx * ux + gy * uy;
-                b_num += gy * ux - gx * uy;
-            }
-        }
-        if (!std::isfinite(denom) || denom <= 1e-12) {
-            return 0;
-        }
-        const double fit_a = a_num / denom;
-        const double fit_b = b_num / denom;
-        if (!std::isfinite(fit_a) || !std::isfinite(fit_b) || (fit_a * fit_a + fit_b * fit_b) <= 1e-12) {
-            return 0;
-        }
-
-        auto map_uv_to_grid_cont = [&](const cv::Vec2f& uv) -> cv::Vec2d {
-            const double ux = static_cast<double>(uv[0]) - uv_mean[0];
-            const double uy = static_cast<double>(uv[1]) - uv_mean[1];
-            const double gx = fit_a * ux - fit_b * uy + grid_mean[0];
-            const double gy = fit_b * ux + fit_a * uy + grid_mean[1];
-            return {gy, gx};
-        };
-
-        double min_grid_x = std::numeric_limits<double>::infinity();
-        double min_grid_y = std::numeric_limits<double>::infinity();
-        double max_grid_x = -std::numeric_limits<double>::infinity();
-        double max_grid_y = -std::numeric_limits<double>::infinity();
-        auto in_active = [&](const cv::Vec2i& p) {
-            return active.contains(cv::Point(p[1], p[0]));
-        };
-        const bool seed_in_active =
-            in_active(data.seed_loc) &&
-            (state(data.seed_loc) & STATE_LOC_VALID) != 0 &&
-            points(data.seed_loc)[0] != -1;
-        for (int y = 0; y < active.height; ++y) {
-            for (int x = 0; x < active.width; ++x) {
-                const int src_y = active.y + y;
-                const int src_x = active.x + x;
-                if ((state(src_y, src_x) & STATE_LOC_VALID) == 0 || points(src_y, src_x)[0] == -1) {
-                    continue;
-                }
-                const cv::Vec2f uv = diagnostic_uv_at_coarse(y, x);
-                if (uv[0] == -1.f || !std::isfinite(uv[0]) || !std::isfinite(uv[1])) {
-                    continue;
-                }
-                const cv::Vec2d mapped = map_uv_to_grid_cont(uv);
-                min_grid_y = std::min(min_grid_y, mapped[0]);
-                min_grid_x = std::min(min_grid_x, mapped[1]);
-                max_grid_y = std::max(max_grid_y, mapped[0]);
-                max_grid_x = std::max(max_grid_x, mapped[1]);
-            }
-        }
-        if (!std::isfinite(min_grid_x) || !std::isfinite(min_grid_y) ||
-            !std::isfinite(max_grid_x) || !std::isfinite(max_grid_y)) {
-            return 0;
-        }
-
-        constexpr int regrid_padding = 2;
-        const int lattice_w = std::max(2, static_cast<int>(std::ceil(max_grid_x - min_grid_x)) + 1 + 2 * regrid_padding);
-        const int lattice_h = std::max(2, static_cast<int>(std::ceil(max_grid_y - min_grid_y)) + 1 + 2 * regrid_padding);
-        const int max_grid_extent = std::max(1, static_cast<int>(max_width / step));
-        const int max_grid_height = std::max(1, static_cast<int>(max_height / step));
-        const int max_grid_w = std::min(max_grid_extent, grid_limit_w);
-        const int max_grid_h = std::min(max_grid_height, grid_limit_h);
-        if (lattice_w > max_grid_w || lattice_h > max_grid_h) {
-            std::cout << "flatten regrid: rejecting raster grid " << lattice_w << "x" << lattice_h
-                      << " above limit " << max_grid_w << "x" << max_grid_h << std::endl;
-            return 0;
-        }
-
-        cv::Vec2i seed_local(-1, -1);
-        if (seed_in_active) {
-            const cv::Vec2f seed_uv = diagnostic_uv_at_coarse(data.seed_loc[0] - active.y,
-                                                              data.seed_loc[1] - active.x);
-            if (seed_uv[0] != -1.f && std::isfinite(seed_uv[0]) && std::isfinite(seed_uv[1])) {
-                const cv::Vec2d mapped = map_uv_to_grid_cont(seed_uv);
-                seed_local = {
-                    static_cast<int>(std::lround(mapped[0] - min_grid_y)) + regrid_padding,
-                    static_cast<int>(std::lround(mapped[1] - min_grid_x)) + regrid_padding
-                };
-            }
-            if (seed_local[0] < 0) {
-                std::cout << "flatten regrid: rejecting raster grid; seed has no valid UV" << std::endl;
-                return 0;
-            }
-        }
-
-        cv::Point lattice_origin(
-            static_cast<int>(std::lround(grid_mean[0] - lattice_w * 0.5)),
-            static_cast<int>(std::lround(grid_mean[1] - lattice_h * 0.5)));
-        if (seed_in_active && seed_local[0] >= 0) {
-            lattice_origin.x = data.seed_loc[1] - seed_local[1];
-            lattice_origin.y = data.seed_loc[0] - seed_local[0];
-        }
-
-        int add_left = std::max(0, -lattice_origin.x);
-        int add_up = std::max(0, -lattice_origin.y);
-        int add_right = std::max(0, lattice_origin.x + lattice_w - points.cols);
-        int add_down = std::max(0, lattice_origin.y + lattice_h - points.rows);
-        if (disable_grid_expansion && (add_left > 0 || add_up > 0 || add_right > 0 || add_down > 0)) {
-            std::cout << "flatten regrid: rejecting raster grid; expansion disabled" << std::endl;
-            return 0;
-        }
-        if (points.cols + add_left + add_right > max_grid_w || points.rows + add_up + add_down > max_grid_h) {
-            std::cout << "flatten regrid: rejecting raster grid; expanded size "
-                      << (points.cols + add_left + add_right) << "x" << (points.rows + add_up + add_down)
-                      << " above limit " << max_grid_w << "x" << max_grid_h << std::endl;
-            return 0;
-        }
-        lattice_origin.x += add_left;
-        lattice_origin.y += add_up;
-
-        SurfTrackerData old_data = data;
-        const cv::Mat_<uint8_t> old_state = state.clone();
-        const cv::Mat_<uint16_t> old_generations = generations.clone();
-        const cv::Mat_<cv::Vec3d> old_points = points.clone();
-        const cv::Mat_<uint16_t> old_inliers = inliers_sum_dbg.clone();
-
-        const cv::Size new_size(points.cols + add_left + add_right, points.rows + add_up + add_down);
-        cv::Mat_<uint8_t> next_state(new_size, uint8_t{0});
-        cv::Mat_<uint16_t> next_generations(new_size, static_cast<uint16_t>(0));
-        cv::Mat_<cv::Vec3d> next_points(new_size, cv::Vec3d(-1, -1, -1));
-        cv::Mat_<uint16_t> next_inliers(new_size, static_cast<uint16_t>(0));
-        SurfTrackerData next_data;
-        next_data.seed_loc = {-1, -1};
-        next_data.seed_coord = old_data.seed_coord;
-
-        auto has_valid_uv = [](const cv::Vec2f& uv) {
-            return uv[0] != -1.f && std::isfinite(uv[0]) && std::isfinite(uv[1]);
-        };
-        auto has_valid_src = [&](const cv::Vec2i& p) {
-            return p[0] >= 0 && p[0] < old_points.rows &&
-                   p[1] >= 0 && p[1] < old_points.cols &&
-                   (old_state(p) & STATE_LOC_VALID) != 0 &&
-                   old_points(p)[0] != -1;
-        };
-        auto to_lattice = [&](const cv::Vec2f& uv) {
-            const cv::Vec2d mapped = map_uv_to_grid_cont(uv);
-            return cv::Vec2f(
-                static_cast<float>(mapped[1] - min_grid_x + regrid_padding + lattice_origin.x),
-                static_cast<float>(mapped[0] - min_grid_y + regrid_padding + lattice_origin.y));
-        };
-        auto barycentric = [](const cv::Vec2f& p, const cv::Vec2f& a, const cv::Vec2f& b, const cv::Vec2f& c,
-                              cv::Vec3d& out) {
-            const cv::Vec2f v0 = b - a;
-            const cv::Vec2f v1 = c - a;
-            const cv::Vec2f v2 = p - a;
-            const double d00 = v0.dot(v0);
-            const double d01 = v0.dot(v1);
-            const double d11 = v1.dot(v1);
-            const double d20 = v2.dot(v0);
-            const double d21 = v2.dot(v1);
-            const double denom = d00 * d11 - d01 * d01;
-            if (!std::isfinite(denom) || std::abs(denom) < 1e-20) {
-                return false;
-            }
-            const double v = (d11 * d20 - d01 * d21) / denom;
-            const double w = (d00 * d21 - d01 * d20) / denom;
-            const double u = 1.0 - v - w;
-            constexpr double eps = -1e-5;
-            if (u < eps || v < eps || w < eps) {
-                return false;
-            }
-            out = {u, v, w};
-            return true;
-        };
-        auto clear_next_data_at = [&](const cv::Vec2i& p) {
-            next_data._surfs.erase(p);
-            auto it = next_data._data.begin();
-            while (it != next_data._data.end()) {
-                if (it->first.second == p) {
-                    it = next_data._data.erase(it);
-                } else {
-                    ++it;
-                }
-            }
-        };
-        auto raster_triangle = [&](const cv::Vec2i& p0, const cv::Vec2i& p1, const cv::Vec2i& p2,
-                                   const cv::Vec2f& uv0, const cv::Vec2f& uv1, const cv::Vec2f& uv2) {
-            if (!has_valid_src(p0) || !has_valid_src(p1) || !has_valid_src(p2) ||
-                !has_valid_uv(uv0) || !has_valid_uv(uv1) || !has_valid_uv(uv2)) {
-                return;
-            }
-            const cv::Vec2f g0 = to_lattice(uv0);
-            const cv::Vec2f g1 = to_lattice(uv1);
-            const cv::Vec2f g2 = to_lattice(uv2);
-            const int min_x = std::max(0, static_cast<int>(std::floor(std::min({g0[0], g1[0], g2[0]}))) - 1);
-            const int max_x = std::min(next_points.cols - 1, static_cast<int>(std::ceil(std::max({g0[0], g1[0], g2[0]}))) + 1);
-            const int min_y = std::max(0, static_cast<int>(std::floor(std::min({g0[1], g1[1], g2[1]}))) - 1);
-            const int max_y = std::min(next_points.rows - 1, static_cast<int>(std::ceil(std::max({g0[1], g1[1], g2[1]}))) + 1);
-            for (int y = min_y; y <= max_y; ++y) {
-                for (int x = min_x; x <= max_x; ++x) {
-                    cv::Vec3d bary;
-                    if (!barycentric(cv::Vec2f(static_cast<float>(x), static_cast<float>(y)), g0, g1, g2, bary)) {
-                        continue;
-                    }
-                    const cv::Vec2i dst(y, x);
-                    const int priority = static_cast<int>(std::lround(
-                        bary[0] * old_inliers(p0) + bary[1] * old_inliers(p1) + bary[2] * old_inliers(p2)));
-                    if ((next_state(dst) & STATE_LOC_VALID) != 0 && priority <= next_inliers(dst)) {
-                        continue;
-                    }
-
-                    std::set<QuadSurface*> dst_surfs;
-                    for (QuadSurface* surf : old_data.surfsC(p0)) {
-                        if (!old_data.surfsC(p1).contains(surf) || !old_data.surfsC(p2).contains(surf) ||
-                            !old_data.has(surf, p0) || !old_data.has(surf, p1) || !old_data.has(surf, p2)) {
-                            continue;
-                        }
-                        dst_surfs.insert(surf);
-                    }
-                    if (dst_surfs.empty()) {
-                        continue;
-                    }
-
-                    clear_next_data_at(dst);
-                    next_state(dst) = STATE_LOC_VALID | STATE_COORD_VALID;
-                    next_generations(dst) = static_cast<uint16_t>(std::clamp<int>(
-                        static_cast<int>(std::lround(bary[0] * old_generations(p0) +
-                                                     bary[1] * old_generations(p1) +
-                                                     bary[2] * old_generations(p2))),
-                        0,
-                        std::numeric_limits<uint16_t>::max()));
-                    next_points(dst) = bary[0] * old_points(p0) + bary[1] * old_points(p1) + bary[2] * old_points(p2);
-                    next_inliers(dst) = static_cast<uint16_t>(std::clamp(priority, 0, static_cast<int>(std::numeric_limits<uint16_t>::max())));
-                    next_data.surfs(dst) = dst_surfs;
-                    for (QuadSurface* surf : dst_surfs) {
-                        next_data.loc(surf, dst) =
-                            bary[0] * old_data._data[{surf, p0}] +
-                            bary[1] * old_data._data[{surf, p1}] +
-                            bary[2] * old_data._data[{surf, p2}];
-                    }
-                }
-            }
-        };
-
-        for (int y = 0; y < active.height - 1; ++y) {
-            for (int x = 0; x < active.width - 1; ++x) {
-                const cv::Vec2i p00(active.y + y, active.x + x);
-                const cv::Vec2i p01(active.y + y, active.x + x + 1);
-                const cv::Vec2i p10(active.y + y + 1, active.x + x);
-                const cv::Vec2i p11(active.y + y + 1, active.x + x + 1);
-                const cv::Vec2f uv00 = diagnostic_uv_at_coarse(y, x);
-                const cv::Vec2f uv01 = diagnostic_uv_at_coarse(y, x + 1);
-                const cv::Vec2f uv10 = diagnostic_uv_at_coarse(y + 1, x);
-                const cv::Vec2f uv11 = diagnostic_uv_at_coarse(y + 1, x + 1);
-                raster_triangle(p10, p00, p01, uv10, uv00, uv01);
-                raster_triangle(p10, p01, p11, uv10, uv01, uv11);
-            }
-        }
-
-        int rasterized_count = 0;
-        cv::Rect next_used_area;
-        bool have_next_used_area = false;
-        for (int y = 0; y < next_state.rows; ++y) {
-            for (int x = 0; x < next_state.cols; ++x) {
-                if ((next_state(y, x) & STATE_LOC_VALID) == 0 || next_points(y, x)[0] == -1) {
-                    continue;
-                }
-                rasterized_count++;
-                const cv::Rect cell(x, y, 1, 1);
-                next_used_area = have_next_used_area ? (next_used_area | cell) : cell;
-                have_next_used_area = true;
-            }
-        }
-        if (!have_next_used_area || rasterized_count < flatten_regrid_min_valid) {
-            return 0;
-        }
-        const double keep_ratio = static_cast<double>(std::min(rasterized_count, valid_count)) / static_cast<double>(valid_count);
-        if (keep_ratio < static_cast<double>(flatten_regrid_min_keep_ratio)) {
-            std::cout << "flatten regrid: rejecting raster grid; rasterized ratio "
-                      << keep_ratio << " below " << flatten_regrid_min_keep_ratio << std::endl;
-            return 0;
-        }
-
-        if (seed_in_active) {
-            cv::Vec2i mapped_seed(lattice_origin.y + seed_local[0], lattice_origin.x + seed_local[1]);
-            cv::Vec2i best_seed(-1, -1);
-            int best_seed_dist = std::numeric_limits<int>::max();
-            for (int y = next_used_area.y; y < next_used_area.br().y; ++y) {
-                for (int x = next_used_area.x; x < next_used_area.br().x; ++x) {
-                    const cv::Vec2i p(y, x);
-                    if ((next_state(p) & STATE_LOC_VALID) == 0 || next_points(p)[0] == -1) {
-                        continue;
-                    }
-                    const int dy = y - mapped_seed[0];
-                    const int dx = x - mapped_seed[1];
-                    const int dist = dy * dy + dx * dx;
-                    if (dist < best_seed_dist) {
-                        best_seed_dist = dist;
-                        best_seed = p;
-                    }
-                }
-            }
-            if (best_seed[0] < 0) {
-                std::cout << "flatten regrid: rejecting raster grid; seed would be removed" << std::endl;
-                return 0;
-            }
-            next_data.seed_loc = best_seed;
-            next_data.seed_coord = next_points(best_seed);
-        } else {
-            next_data.seed_loc = old_data.seed_loc + cv::Vec2i(add_up, add_left);
-            next_data.seed_coord = old_data.seed_coord;
-        }
-
-        points = std::move(next_points);
-        state = std::move(next_state);
-        generations = std::move(next_generations);
-        inliers_sum_dbg = std::move(next_inliers);
-        fringe_attempts = cv::Mat_<uint16_t>(new_size, static_cast<uint16_t>(0));
-        data = std::move(next_data);
-        w = points.cols;
-        h = points.rows;
-        size = {w, h};
-        bounds = {0, 0, w - 1, h - 1};
-        reset_growth_windows_to_inner_grid();
-        regrid_retry_full_active = true;
-        if (add_left > 0 || add_up > 0) {
-            expanded_left += add_left;
-            expanded_up += add_up;
-            x0 += add_left;
-            y0 += add_up;
-        }
-        used_area = next_used_area;
-        used_area_hr = scaled_rect_trunc(used_area, step);
-        fringe.clear();
-        for (int y = used_area.y; y < used_area.br().y; ++y) {
-            for (int x = used_area.x; x < used_area.br().x; ++x) {
-                const cv::Vec2i p(y, x);
-                if ((state(p) & STATE_LOC_VALID) == 0) {
-                    continue;
-                }
-                for (const auto& n : neighs) {
-                    const cv::Vec2i pn = p + n;
-                    if (pn[0] < 0 || pn[0] >= state.rows || pn[1] < 0 || pn[1] >= state.cols ||
-                        (state(pn) & STATE_LOC_VALID) == 0) {
-                        fringe.insert(p);
-                        break;
-                    }
-                }
-            }
-        }
-
-        for (int i = 0; i < omp_get_max_threads(); i++) {
-            data_ths[i] = data;
-            added_points_threads[i].clear();
-        }
-
-        std::cout << "flatten regrid: rasterized " << rasterized_count
-                  << " points into " << lattice_w << "x" << lattice_h
-                  << " lattice after generation " << generation;
-        if (seed_in_active) {
-            std::cout << " (seed moved to " << data.seed_loc << ")";
-        }
-        std::cout << std::endl;
-
-        return rasterized_count;
-    };
-
     bool at_right_border = false;
-    int radial_frontier_max_radius_sq = -1;
+    int radial_max_radius_sq = -1;
     std::optional<std::filesystem::path> current_snapshot_path;
     for(int generation=0;generation<stop_gen;generation++) {
-        const int generation_start_succ = succ;
         std::unordered_set<cv::Vec2i,vec2i_hash> cands;
         std::unordered_map<cv::Vec2i, std::vector<cv::Vec2i>, vec2i_hash> candidate_parents;
         std::unordered_set<cv::Vec2i, vec2i_hash> attempted_fringe_parents;
         std::unordered_set<cv::Vec2i, vec2i_hash> committed_points_generation;
-        if (radial_frontier_growth) {
+        if (growth_config.radial_growth) {
             rebuild_frontier_from_state();
         }
         if (generation == 0 && !initialized_from_resume) {
@@ -3471,7 +2386,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 if ((state(p) & STATE_LOC_VALID) == 0)
                     continue;
 
-                for(const auto& n : neighs) {
+                for(const auto& n : growth_config.neighs) {
                     cv::Vec2i pn = p+n;
                     if (constrain_to_resume_grid &&
                         !resume_grid_bounds.contains(cv::Point(pn[1], pn[0]))) {
@@ -3484,7 +2399,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                         state(pn) |= STATE_PROCESSING;
                         cands.insert(pn);
                     }
-                    if (radial_frontier_growth &&
+                    if (growth_config.radial_growth &&
                         save_bounds_inv.contains(cv::Point(pn)) &&
                         (state(pn) & STATE_LOC_VALID) == 0) {
                         candidate_parents[pn].push_back(p);
@@ -3498,42 +2413,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
         std::cout << "go with cands " << cands.size() << " inl_th " << curr_best_inl_th << std::endl;
 
-        struct OrderedCandidate {
-            cv::Vec2i p;
-            int valid_neighbor_count = 0;
-            int radius_sq = 0;
-            int support_depth = 0;
-        };
-        std::vector<OrderedCandidate> ordered_cands;
-        ordered_cands.reserve(cands.size());
-        int min_candidate_radius_sq = std::numeric_limits<int>::max();
-        if (radial_frontier_growth && radial_frontier_strict_band) {
-            for (const cv::Vec2i& p : cands) {
-                const int radius_sq = radius_sq_from_seed(p);
-                min_candidate_radius_sq = std::min(min_candidate_radius_sq, radius_sq);
-            }
-        }
-        const int radial_band_min_radius_sq = min_candidate_radius_sq;
-        if (radial_frontier_growth &&
-            radial_frontier_strict_band &&
-            radial_frontier_max_radius_sq < 0 &&
-            min_candidate_radius_sq != std::numeric_limits<int>::max()) {
-            const double initial_radius =
-                std::sqrt(static_cast<double>(min_candidate_radius_sq)) + radial_frontier_radius_band;
-            radial_frontier_max_radius_sq =
-                static_cast<int>(std::floor(initial_radius * initial_radius));
-        }
-        int next_candidate_radius_sq = std::numeric_limits<int>::max();
-        if (radial_frontier_growth && radial_frontier_strict_band && radial_frontier_max_radius_sq >= 0) {
-            for (const cv::Vec2i& p : cands) {
-                const int radius_sq = radius_sq_from_seed(p);
-                if (radius_sq > radial_frontier_max_radius_sq) {
-                    next_candidate_radius_sq = std::min(next_candidate_radius_sq, radius_sq);
-                }
-            }
-        }
+        const std::vector<cv::Vec2i> candidate_points(cands.begin(), cands.end());
         auto has_inward_valid_neighbor = [&](const cv::Vec2i& p, int radius_sq) {
-            for (const auto& n : all_8_neighs) {
+            for (const auto& n : growth_config.all_8_neighs) {
                 const cv::Vec2i pn = p + n;
                 if (pn[0] < 0 || pn[0] >= state.rows ||
                     pn[1] < 0 || pn[1] >= state.cols ||
@@ -3547,13 +2429,13 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             return false;
         };
         auto existing_support_depth = [&](const cv::Vec2i& p) {
-            if (!candidate_priority_existing_depth) {
+            if (!growth_config.candidate_priority_existing_depth) {
                 return 0;
             }
             int best_depth = 0;
-            for (const cv::Vec2i& dir : legacy_4_neighs) {
+            for (const cv::Vec2i& dir : growth_config.legacy_4_neighs) {
                 int depth = 0;
-                for (int step_idx = 1; step_idx <= candidate_support_depth_radius; ++step_idx) {
+                for (int step_idx = 1; step_idx <= growth_config.candidate_support_depth_radius; ++step_idx) {
                     const cv::Vec2i q = p + step_idx * dir;
                     if (q[0] < 0 || q[0] >= state.rows ||
                         q[1] < 0 || q[1] >= state.cols ||
@@ -3566,52 +2448,28 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             }
             return best_depth;
         };
-        for (const cv::Vec2i& p : cands) {
-            const int radius_sq = radius_sq_from_seed(p);
-            if (radial_frontier_growth && radial_frontier_strict_band &&
-                (radial_frontier_max_radius_sq >= 0 &&
-                 radius_sq > radial_frontier_max_radius_sq ||
-                 !has_inward_valid_neighbor(p, radius_sq))) {
+        const GrowthCandidateOrdering candidate_ordering = order_growth_candidates(
+            candidate_points,
+            growth_config,
+            radial_max_radius_sq,
+            radius_sq_from_seed,
+            count_all_valid_neighbors,
+            has_inward_valid_neighbor,
+            existing_support_depth,
+            [&](const cv::Vec2i& p) {
                 state(p) = 0;
-                continue;
-            }
-            ordered_cands.push_back({
-                p,
-                count_all_valid_neighbors(p),
-                radius_sq,
-                existing_support_depth(p)
             });
-            if (radial_frontier_growth) {
+        if (growth_config.radial_growth) {
+            for (const cv::Vec2i& p : candidate_ordering.points) {
                 auto parents_it = candidate_parents.find(p);
                 if (parents_it != candidate_parents.end()) {
                     attempted_fringe_parents.insert(parents_it->second.begin(), parents_it->second.end());
                 }
             }
         }
-        std::sort(ordered_cands.begin(), ordered_cands.end(),
-                  [radial_frontier_growth, candidate_priority_existing_depth](const OrderedCandidate& a, const OrderedCandidate& b) {
-                      if (radial_frontier_growth && a.radius_sq != b.radius_sq) {
-                          return a.radius_sq < b.radius_sq;
-                      }
-                      if (candidate_priority_existing_depth && a.support_depth != b.support_depth) {
-                          return a.support_depth > b.support_depth;
-                      }
-                      if (a.valid_neighbor_count != b.valid_neighbor_count) {
-                          return a.valid_neighbor_count > b.valid_neighbor_count;
-                      }
-                      if (a.p[0] != b.p[0]) {
-                          return a.p[0] < b.p[0];
-                      }
-                      return a.p[1] < b.p[1];
-                  });
-        std::vector<cv::Vec2i> ordered_points;
-        ordered_points.reserve(ordered_cands.size());
-        for (const OrderedCandidate& cand : ordered_cands) {
-            ordered_points.push_back(cand.p);
-        }
 
         int best_inliers_gen = 0;
-        OmpThreadPointCol threadcol(3, ordered_points);
+        OmpThreadPointCol threadcol(3, candidate_ordering.points);
 
         std::shared_mutex mutex;
 #pragma omp parallel
@@ -3806,12 +2664,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             if (best_inliers >= curr_best_inl_th || best_ref_seed) {
                 if (best_coord[0] == -1)
                     throw std::runtime_error("oops best_cord[0]");
-                if (violates_single_wrap(p, best_coord)) {
-                    state(p) = 0;
-                    generations(p) = 0;
-                    points(p) = {-1,-1,-1};
-                    continue;
-                }
 
                 data_th.surfs(p).insert(best_surf);
                 data_th.loc(best_surf, p) = best_loc;
@@ -3910,7 +2762,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             }
         }
 
-        if (radial_frontier_growth) {
+        if (growth_config.radial_growth) {
             std::unordered_set<cv::Vec2i, vec2i_hash> successful_fringe_parents;
             for (const cv::Vec2i& committed : committed_points_generation) {
                 auto parents_it = candidate_parents.find(committed);
@@ -3936,12 +2788,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         }
 
         run_flatten_prune(generation);
-        const int regrid_rasterized = run_flatten_regrid(generation);
-        const bool regrid_after_no_growth = regrid_rasterized > 0 && succ == generation_start_succ;
-        if (regrid_rasterized > 0) {
-            reset_growth_windows_to_inner_grid();
-            regrid_retry_full_active = true;
-        }
 
         if (!flip_x_done && generation >= 1) {
             if (has_horizontal_extent_to_flip()) {
@@ -3959,19 +2805,17 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         if (!at_right_border && curr_best_inl_th <= inl_lower_bound)
             inl_lower_bound = inl_lower_bound_b;
 
-        const bool allow_threshold_retry = fringe.empty() || regrid_after_no_growth;
+        const bool allow_threshold_retry = fringe.empty();
         const bool radial_no_candidates_in_disk =
-            radial_frontier_growth &&
-            radial_frontier_strict_band &&
-            ordered_cands.empty() &&
-            next_candidate_radius_sq != std::numeric_limits<int>::max();
+            growth_config.radial_growth &&
+            candidate_ordering.candidates.empty() &&
+            candidate_ordering.next_candidate_radius_sq != std::numeric_limits<int>::max();
         const bool radial_disk_exhausted =
-            radial_frontier_growth &&
-            radial_frontier_strict_band &&
+            growth_config.radial_growth &&
             (radial_no_candidates_in_disk ||
-             (fringe.empty() &&
-              curr_best_inl_th <= inl_lower_bound &&
-              radial_band_min_radius_sq != std::numeric_limits<int>::max()));
+              (fringe.empty() &&
+               curr_best_inl_th <= inl_lower_bound &&
+              candidate_ordering.radial_min_candidate_radius_sq != std::numeric_limits<int>::max()));
         if (!radial_no_candidates_in_disk && allow_threshold_retry && curr_best_inl_th > inl_lower_bound) {
             const int smooth_next = std::max(inl_lower_bound, curr_best_inl_th - inlier_threshold_drop_step);
             const int best_failed_target = std::max(best_inliers_gen, inl_lower_bound);
@@ -3979,13 +2823,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 ? std::max(smooth_next, best_failed_target)
                 : smooth_next;
             if (curr_best_inl_th >= inl_lower_bound) {
-                if (regrid_retry_full_active) {
-                    reset_growth_windows_to_inner_grid();
-                    regrid_retry_full_active = false;
-                }
-                if (regrid_after_no_growth) {
-                    fringe.clear();
-                }
                 cv::Rect active = active_bounds & used_area;
                 if (active.area() > 0) {
                     for(int j=std::max(0, active.y-2);j<=std::min(active.br().y+2, state.rows-1);j++)
@@ -3995,19 +2832,13 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 }
             }
         }
-        else if (regrid_after_no_growth) {
-            fringe.clear();
-            regrid_retry_full_active = false;
-        }
         else
             curr_best_inl_th = inlier_base_threshold;
 
-        if (radial_disk_exhausted && next_candidate_radius_sq != std::numeric_limits<int>::max()) {
-            const double next_radius =
-                std::sqrt(static_cast<double>(next_candidate_radius_sq)) + radial_frontier_radius_band;
-            radial_frontier_max_radius_sq = std::max(
-                radial_frontier_max_radius_sq + 1,
-                static_cast<int>(std::floor(next_radius * next_radius)));
+        if (radial_disk_exhausted && candidate_ordering.next_candidate_radius_sq != std::numeric_limits<int>::max()) {
+            radial_max_radius_sq = std::max(
+                radial_max_radius_sq + 1,
+                candidate_ordering.next_candidate_radius_sq);
             curr_best_inl_th = inlier_base_threshold;
             rebuild_frontier_from_state();
         }
@@ -4136,12 +2967,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                generation, static_cast<unsigned long>(cands.size()), succ, static_cast<unsigned long>(fringe.size()),
                current_area_vx2, current_area_cm2, best_inliers_gen);
 
-        if (fringe.empty() && regrid_retry_full_active) {
-            reset_growth_windows_to_inner_grid();
-            rebuild_frontier_from_state();
-            regrid_retry_full_active = false;
-        }
-
         //continue expansion
         const int max_grid_extent = std::max(1, static_cast<int>(max_width / step));
         const int max_grid_height = std::max(1, static_cast<int>(max_height / step));
@@ -4157,10 +2982,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         const int remaining_right = remaining_extra(max_extra_right, expanded_right);
         const int remaining_up = remaining_extra(max_extra_up, expanded_up);
         const int remaining_down = remaining_extra(max_extra_down, expanded_down);
-        const bool can_expand_left = !disable_grid_expansion && grow_left && remaining_left > 0 && w < max_grid_w;
-        const bool can_expand_right = !disable_grid_expansion && grow_right && remaining_right > 0 && w < max_grid_w;
-        const bool can_expand_up = !disable_grid_expansion && grow_up && remaining_up > 0 && h < max_grid_h;
-        const bool can_expand_down = !disable_grid_expansion && grow_down && remaining_down > 0 && h < max_grid_h;
+        const bool can_expand_left = !growth_config.disable_grid_expansion && growth_config.grow_left && remaining_left > 0 && w < max_grid_w;
+        const bool can_expand_right = !growth_config.disable_grid_expansion && growth_config.grow_right && remaining_right > 0 && w < max_grid_w;
+        const bool can_expand_up = !growth_config.disable_grid_expansion && growth_config.grow_up && remaining_up > 0 && h < max_grid_h;
+        const bool can_expand_down = !growth_config.disable_grid_expansion && growth_config.grow_down && remaining_down > 0 && h < max_grid_h;
         if (fringe.empty() && (can_expand_left || can_expand_right || can_expand_up || can_expand_down))
         {
             if (loc_valid_count <= last_expansion_loc_valid_count) {
@@ -4169,7 +2994,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 no_growth_expansions = 0;
             }
             last_expansion_loc_valid_count = loc_valid_count;
-            if (max_no_growth_expansions > 0 && no_growth_expansions >= max_no_growth_expansions) {
+            if (growth_config.max_no_growth_expansions > 0 && no_growth_expansions >= growth_config.max_no_growth_expansions) {
                 std::cout << "stopping growth after " << no_growth_expansions
                           << " expansions with no valid-count increase"
                           << " (valid=" << loc_valid_count << ")" << std::endl;

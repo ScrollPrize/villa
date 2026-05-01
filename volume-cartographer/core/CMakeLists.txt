@@ -147,7 +147,15 @@ endif()
 add_library(vc_flattening src/ABFFlattening.cpp)
 target_link_libraries(vc_flattening PUBLIC vc_core OpenABF)
 
-add_library(vc_tracer src/GrowPatch.cpp src/GrowSurface.cpp src/NeuralTracerConnection.cpp src/ChunkedTensor.cpp)
+add_library(vc_tracer
+    src/GrowPatch.cpp
+    src/GrowSurface.cpp
+    src/NeuralTracerConnection.cpp
+    src/ChunkedTensor.cpp
+    src/growth_strategies/CandidateOrdering.cpp
+    src/growth_strategies/ComponentPruning.cpp
+    src/growth_strategies/GrowthConfig.cpp
+)
 target_link_libraries(vc_tracer PUBLIC vc_core vc_ui vc_flattening Ceres::ceres Qt6::Core)
 target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
 if(VC_USE_PCH)
