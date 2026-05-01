@@ -23,16 +23,21 @@ Outputs:
 
 - `<stem>_binary.tif`: 8-bit binary mask from a fixed inverted threshold of 127;
   dark input pixels become the foreground island/components.
-- `<stem>_dt.tif`: normalized 16-bit distance transform visualization.
+- `<stem>_dt.tif`: normalized 16-bit distance transform through the light domain
+  to the nearest dark foreground island.
 - `<stem>_component_voronoi_labels.tif`: 16-bit visualization of nearest
   foreground connected-component ids.
 - `<stem>_component_voronoi_boundaries.tif`: boundaries where neighboring pixels
   belong to different nearest foreground components.
+- `<stem>_component_voronoi_boundary_skeleton.tif`: one-pixel thinning of the
+  dense Voronoi boundary mask.
+- `<stem>_component_voronoi_boundary_skeleton_pruned.tif`: boundary skeleton
+  with short dead-end spurs removed when their maximum raw DT value is below the
+  fixed pruning threshold.
 - `<stem>_component_voronoi_cell_loops.tif`: contour loops of each component's
   raster Voronoi cell.
-- `<stem>_component_voronoi_cell_loops_connected.tif`: cell loops plus shortest
-  single-pixel connector ridges between disconnected loop groups, constrained to
-  the light distance domain so connectors do not cross dark islands.
+- `<stem>_component_voronoi_cell_loops_connected.tif`: cell loops overlaid with
+  the pruned Voronoi boundary skeleton.
 - `<stem>_component_voronoi_rings.tif`: per-component Voronoi cells with the
   source component carved out, rendered as candidate rings.
 - `<stem>_binary_contour_loops.tif`: hole contours from the binary foreground
