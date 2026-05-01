@@ -1,5 +1,6 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <opencv2/ximgproc.hpp>
 #include <tiffio.h>
 
 #include <algorithm>
@@ -7,7 +8,9 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
+#include <iomanip>
 #include <iostream>
 #include <limits>
 #include <numeric>
@@ -25,6 +28,74 @@ constexpr double kFixedThreshold = 127.0;
 constexpr float kMinComponentRidgeRadius = 2.0f;
 constexpr double kMinBoundaryAngleDegrees = 120.0;
 using Clock = std::chrono::steady_clock;
+
+struct TimingMark {
+    Clock::time_point elapsed;
+    std::clock_t cpu = 0;
+};
+
+struct StageTiming {
+    std::string name;
+    double elapsed_ms = 0.0;
+    double cpu_ms = 0.0;
+};
+
+TimingMark start_timing() {
+    return {Clock::now(), std::clock()};
+}
+
+StageTiming finish_timing(const std::string& name, const TimingMark& start) {
+    const auto elapsed_end = Clock::now();
+    const std::clock_t cpu_end = std::clock();
+    return {name,
+            std::chrono::duration<double, std::milli>(elapsed_end -
+                                                       start.elapsed)
+                .count(),
+            1000.0 * static_cast<double>(cpu_end - start.cpu) /
+                static_cast<double>(CLOCKS_PER_SEC)};
+}
+
+void print_stage_timings(const std::vector<StageTiming>& timings) {
+    constexpr int kStageWidth = 44;
+    constexpr int kNumericWidth = 14;
+    double total_elapsed_ms = 0.0;
+    for (const StageTiming& timing : timings) {
+        if (timing.name == "total") {
+            total_elapsed_ms = timing.elapsed_ms;
+            break;
+        }
+    }
+    if (total_elapsed_ms <= 0.0 && !timings.empty()) {
+        total_elapsed_ms = timings.back().elapsed_ms;
+    }
+
+    std::cout << "Timings:\n"
+              << "  " << std::left << std::setw(kStageWidth) << "stage"
+              << std::right << std::setw(kNumericWidth) << "runtime_%"
+              << std::setw(kNumericWidth) << "elapsed_ms"
+              << std::setw(kNumericWidth) << "cpu_ms"
+              << std::setw(kNumericWidth) << "cpu/elapsed"
+              << "\n";
+    std::cout << "  "
+              << std::string(kStageWidth + 4 * kNumericWidth, '-')
+              << "\n";
+    for (const StageTiming& timing : timings) {
+        const double runtime_percent =
+            total_elapsed_ms > 0.0
+                ? (100.0 * timing.elapsed_ms / total_elapsed_ms)
+                : 0.0;
+        const double utilization =
+            timing.elapsed_ms > 0.0 ? timing.cpu_ms / timing.elapsed_ms : 0.0;
+        std::cout << "  " << std::left << std::setw(kStageWidth)
+                  << timing.name
+                  << std::right << std::fixed << std::setprecision(2)
+                  << std::setw(kNumericWidth) << runtime_percent
+                  << std::setw(kNumericWidth) << timing.elapsed_ms
+                  << std::setw(kNumericWidth) << timing.cpu_ms
+                  << std::setw(kNumericWidth) << utilization
+                  << "\n";
+    }
+}
 
 struct Args {
     fs::path input;
@@ -180,6 +251,16 @@ cv::Mat zhang_suen_thinning(const cv::Mat& src) {
 
     img *= 255;
     return img;
+}
+
+cv::Mat optimized_thinning(const cv::Mat& src) {
+    CV_Assert(src.type() == CV_8U);
+
+    cv::Mat binary;
+    cv::threshold(src, binary, 0, 255, cv::THRESH_BINARY);
+    cv::Mat out;
+    cv::ximgproc::thinning(binary, out, cv::ximgproc::THINNING_ZHANGSUEN);
+    return out;
 }
 
 struct PixelByDistance {
@@ -783,38 +864,43 @@ cv::Mat source_pixel_label_ridges(const cv::Mat& white_domain,
     CV_Assert(source_pixel_labels.type() == CV_32S);
 
     cv::Mat ridges = cv::Mat::zeros(white_domain.size(), CV_8U);
-    for (int y = 1; y < white_domain.rows - 1; ++y) {
-        for (int x = 1; x < white_domain.cols - 1; ++x) {
-            if (white_domain.at<std::uint8_t>(y, x) == 0) {
-                continue;
-            }
-            const int center = source_pixel_labels.at<int>(y, x);
-            if (center <= 0) {
-                continue;
-            }
+    cv::parallel_for_(cv::Range(1, white_domain.rows - 1),
+                      [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            for (int x = 1; x < white_domain.cols - 1; ++x) {
+                if (white_domain.at<std::uint8_t>(y, x) == 0) {
+                    continue;
+                }
+                const int center = source_pixel_labels.at<int>(y, x);
+                if (center <= 0) {
+                    continue;
+                }
 
-            bool touches_other = false;
-            for (int dy = -1; dy <= 1 && !touches_other; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    if (dx == 0 && dy == 0) {
-                        continue;
-                    }
-                    if (white_domain.at<std::uint8_t>(y + dy, x + dx) == 0) {
-                        continue;
-                    }
-                    const int other = source_pixel_labels.at<int>(y + dy, x + dx);
-                    if (other > 0 && other != center) {
-                        touches_other = true;
-                        break;
+                bool touches_other = false;
+                for (int dy = -1; dy <= 1 && !touches_other; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        if (dx == 0 && dy == 0) {
+                            continue;
+                        }
+                        if (white_domain.at<std::uint8_t>(y + dy, x + dx) ==
+                            0) {
+                            continue;
+                        }
+                        const int other =
+                            source_pixel_labels.at<int>(y + dy, x + dx);
+                        if (other > 0 && other != center) {
+                            touches_other = true;
+                            break;
+                        }
                     }
                 }
-            }
 
-            if (touches_other) {
-                ridges.at<std::uint8_t>(y, x) = 255;
+                if (touches_other) {
+                    ridges.at<std::uint8_t>(y, x) = 255;
+                }
             }
         }
-    }
+    });
 
     return ridges;
 }
@@ -842,11 +928,50 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
     connector_candidates.setTo(0, clean);
 
     cv::Mat candidate_labels;
-    const int num_candidates =
-        cv::connectedComponents(connector_candidates, candidate_labels, 8,
-                                CV_32S);
+    cv::Mat candidate_stats;
+    cv::Mat candidate_centroids;
+    const int num_candidates = cv::connectedComponentsWithStats(
+        connector_candidates, candidate_labels, candidate_stats,
+        candidate_centroids, 8, CV_32S);
     if (num_candidates <= 1) {
         return clean.clone();
+    }
+
+    struct CandidateWorkspace {
+        cv::Rect bounds;
+        std::vector<cv::Point> pixels;
+        cv::Mat local_index;
+    };
+
+    std::vector<CandidateWorkspace> candidate_workspaces(
+        static_cast<std::size_t>(num_candidates));
+    for (int label = 1; label < num_candidates; ++label) {
+        const int left = candidate_stats.at<int>(label, cv::CC_STAT_LEFT);
+        const int top = candidate_stats.at<int>(label, cv::CC_STAT_TOP);
+        const int width = candidate_stats.at<int>(label, cv::CC_STAT_WIDTH);
+        const int height = candidate_stats.at<int>(label, cv::CC_STAT_HEIGHT);
+        CandidateWorkspace& workspace = candidate_workspaces[label];
+        workspace.bounds = cv::Rect(left, top, width, height);
+        workspace.pixels.reserve(
+            static_cast<std::size_t>(
+                candidate_stats.at<int>(label, cv::CC_STAT_AREA)));
+        workspace.local_index =
+            cv::Mat(height, width, CV_32S, cv::Scalar(-1));
+    }
+
+    for (int y = 0; y < candidate_labels.rows; ++y) {
+        for (int x = 0; x < candidate_labels.cols; ++x) {
+            const int label = candidate_labels.at<int>(y, x);
+            if (label <= 0) {
+                continue;
+            }
+            CandidateWorkspace& workspace = candidate_workspaces[label];
+            const int local =
+                static_cast<int>(workspace.pixels.size());
+            workspace.pixels.push_back(cv::Point(x, y));
+            workspace.local_index.at<int>(y - workspace.bounds.y,
+                                          x - workspace.bounds.x) = local;
+        }
     }
 
     cv::Mat clean_source_mask(clean.size(), CV_8U, cv::Scalar(255));
@@ -954,8 +1079,9 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
             }
         };
 
-        const int cols = candidate_labels.cols;
-        const int total = candidate_labels.rows * candidate_labels.cols;
+        const CandidateWorkspace& workspace =
+            candidate_workspaces[candidate_label];
+        const int total = static_cast<int>(workspace.pixels.size());
         std::vector<std::uint8_t> target(static_cast<std::size_t>(total), 0);
         std::vector<float> best(static_cast<std::size_t>(total), -1.0f);
         std::vector<int> best_length(static_cast<std::size_t>(total),
@@ -968,7 +1094,12 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
         std::priority_queue<State, std::vector<State>, StateLess> queue;
 
         for (const Attachment& attachment : attachments[candidate_label]) {
-            const int idx = attachment.pixel.y * cols + attachment.pixel.x;
+            const int idx = workspace.local_index.at<int>(
+                attachment.pixel.y - workspace.bounds.y,
+                attachment.pixel.x - workspace.bounds.x);
+            if (idx < 0) {
+                continue;
+            }
             if (attachment.component == component_b) {
                 target[idx] = 1;
                 target_clean[idx] = attachment.clean_pixel;
@@ -979,7 +1110,12 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
             if (attachment.component != component_a) {
                 continue;
             }
-            const int idx = attachment.pixel.y * cols + attachment.pixel.x;
+            const int idx = workspace.local_index.at<int>(
+                attachment.pixel.y - workspace.bounds.y,
+                attachment.pixel.x - workspace.bounds.x);
+            if (idx < 0) {
+                continue;
+            }
             const float start_dt =
                 dt.at<float>(attachment.pixel.y, attachment.pixel.x);
             if (start_dt > best[idx]) {
@@ -1006,18 +1142,21 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
                 break;
             }
 
-            const int x = state.idx % cols;
-            const int y = state.idx / cols;
+            const cv::Point pixel = workspace.pixels[state.idx];
+            const int x = pixel.x;
+            const int y = pixel.y;
             for (const cv::Point dir : kDirs) {
                 const int nx = x + dir.x;
                 const int ny = y + dir.y;
-                if (nx < 0 || nx >= candidate_labels.cols || ny < 0 ||
-                    ny >= candidate_labels.rows ||
-                    candidate_labels.at<int>(ny, nx) != candidate_label) {
+                if (!workspace.bounds.contains(cv::Point(nx, ny))) {
+                    continue;
+                }
+                const int next_idx = workspace.local_index.at<int>(
+                    ny - workspace.bounds.y, nx - workspace.bounds.x);
+                if (next_idx < 0) {
                     continue;
                 }
 
-                const int next_idx = ny * cols + nx;
                 const float next_bottleneck =
                     std::min(state.bottleneck, dt.at<float>(ny, nx));
                 const int next_length = state.length + 1;
@@ -1047,38 +1186,51 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
         edge.length = best_length[target_idx];
         for (int idx = target_idx; idx >= 0 && parent[idx] != idx;
              idx = parent[idx]) {
-            edge.path.push_back(cv::Point(idx % cols, idx / cols));
+            edge.path.push_back(workspace.pixels[idx]);
         }
         int root = target_idx;
         while (parent[root] != root && parent[root] >= 0) {
             root = parent[root];
         }
         if (root >= 0) {
-            edge.path.push_back(cv::Point(root % cols, root / cols));
+            edge.path.push_back(workspace.pixels[root]);
         }
         return edge;
     };
 
-    std::vector<CandidateEdge> edges;
-    for (int label = 1; label < num_candidates; ++label) {
-        std::vector<int> touched;
-        for (const Attachment& attachment : attachments[label]) {
-            if (std::find(touched.begin(), touched.end(), attachment.component) ==
-                touched.end()) {
-                touched.push_back(attachment.component);
-            }
-        }
-        if (touched.size() < 2) {
-            continue;
-        }
-        std::sort(touched.begin(), touched.end());
-        for (std::size_t i = 0; i < touched.size(); ++i) {
-            for (std::size_t j = i + 1; j < touched.size(); ++j) {
-                CandidateEdge edge = widest_path(label, touched[i], touched[j]);
-                if (!edge.path.empty()) {
-                    edges.push_back(std::move(edge));
+    std::vector<std::vector<CandidateEdge>> edges_by_candidate(
+        static_cast<std::size_t>(num_candidates));
+    cv::parallel_for_(cv::Range(1, num_candidates), [&](const cv::Range& range) {
+        for (int label = range.start; label < range.end; ++label) {
+            std::vector<int> touched;
+            for (const Attachment& attachment : attachments[label]) {
+                if (std::find(touched.begin(), touched.end(),
+                              attachment.component) == touched.end()) {
+                    touched.push_back(attachment.component);
                 }
             }
+            if (touched.size() < 2) {
+                continue;
+            }
+            std::sort(touched.begin(), touched.end());
+            std::vector<CandidateEdge> local_edges;
+            for (std::size_t i = 0; i < touched.size(); ++i) {
+                for (std::size_t j = i + 1; j < touched.size(); ++j) {
+                    CandidateEdge edge =
+                        widest_path(label, touched[i], touched[j]);
+                    if (!edge.path.empty()) {
+                        local_edges.push_back(std::move(edge));
+                    }
+                }
+            }
+            edges_by_candidate[label] = std::move(local_edges);
+        }
+    });
+
+    std::vector<CandidateEdge> edges;
+    for (int label = 1; label < num_candidates; ++label) {
+        for (CandidateEdge& edge : edges_by_candidate[label]) {
+            edges.push_back(std::move(edge));
         }
     }
 
@@ -1128,6 +1280,7 @@ struct ComponentVoronoiResult {
     cv::Mat cell_loops;
     cv::Mat cell_loops_connected;
     cv::Mat rings;
+    std::vector<StageTiming> timings;
 };
 
 struct GraphEdge {
@@ -1491,146 +1644,198 @@ cv::Mat labels_to_u16(const cv::Mat& labels, int max_label) {
     }
 
     const double scale = max_label > 65535 ? 65535.0 / max_label : 1.0;
-    for (int y = 0; y < labels.rows; ++y) {
-        for (int x = 0; x < labels.cols; ++x) {
-            const int label = labels.at<int>(y, x);
-            if (label > 0) {
-                out.at<std::uint16_t>(y, x) =
-                    static_cast<std::uint16_t>(std::lround(label * scale));
+    cv::parallel_for_(cv::Range(0, labels.rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            for (int x = 0; x < labels.cols; ++x) {
+                const int label = labels.at<int>(y, x);
+                if (label > 0) {
+                    out.at<std::uint16_t>(y, x) =
+                        static_cast<std::uint16_t>(std::lround(label * scale));
+                }
             }
         }
-    }
+    });
     return out;
 }
 
 ComponentVoronoiResult component_voronoi(const cv::Mat& binary) {
     CV_Assert(binary.type() == CV_8U);
 
-    cv::Mat component_labels;
-    const int num_components = cv::connectedComponents(binary, component_labels, 8,
-                                                       CV_32S);
+    std::vector<StageTiming> timings;
 
-    cv::Mat source_mask(binary.size(), CV_8U, cv::Scalar(255));
-    source_mask.setTo(0, binary);
+    cv::Mat component_labels;
+    int num_components = 0;
+    {
+        const TimingMark timing = start_timing();
+        num_components = cv::connectedComponents(binary, component_labels, 8,
+                                                 CV_32S);
+        timings.push_back(
+            finish_timing("component.connected_components", timing));
+    }
+
+    cv::Mat source_mask;
+    {
+        const TimingMark timing = start_timing();
+        source_mask = cv::Mat(binary.size(), CV_8U, cv::Scalar(255));
+        source_mask.setTo(0, binary);
+        timings.push_back(finish_timing("component.source_mask", timing));
+    }
 
     cv::Mat dt_to_component;
     cv::Mat source_pixel_labels;
-    cv::distanceTransform(source_mask, dt_to_component, source_pixel_labels,
-                          cv::DIST_L2, cv::DIST_MASK_5, cv::DIST_LABEL_PIXEL);
-
-    const std::vector<cv::Point> source_points =
-        label_source_points(source_mask, source_pixel_labels);
-
-    cv::Mat nearest_component(binary.size(), CV_32S, cv::Scalar(0));
-    for (int y = 0; y < binary.rows; ++y) {
-        for (int x = 0; x < binary.cols; ++x) {
-            if (binary.at<std::uint8_t>(y, x) != 0) {
-                nearest_component.at<int>(y, x) = component_labels.at<int>(y, x);
-                continue;
-            }
-
-            const int source_label = source_pixel_labels.at<int>(y, x);
-            if (source_label <= 0 ||
-                source_label >= static_cast<int>(source_points.size())) {
-                continue;
-            }
-            const cv::Point source = source_points[source_label];
-            if (source.x >= 0) {
-                nearest_component.at<int>(y, x) =
-                    component_labels.at<int>(source.y, source.x);
-            }
-        }
+    {
+        const TimingMark timing = start_timing();
+        cv::distanceTransform(source_mask, dt_to_component, source_pixel_labels,
+                              cv::DIST_L2, cv::DIST_MASK_5,
+                              cv::DIST_LABEL_PIXEL);
+        timings.push_back(finish_timing("component.labeled_dt", timing));
     }
 
-    cv::Mat boundaries = cv::Mat::zeros(binary.size(), CV_8U);
-    for (int y = 1; y < binary.rows - 1; ++y) {
-        for (int x = 1; x < binary.cols - 1; ++x) {
-            if (binary.at<std::uint8_t>(y, x) != 0) {
-                continue;
-            }
-            const int center = nearest_component.at<int>(y, x);
-            if (center <= 0) {
-                continue;
-            }
-            bool touches_other = false;
-            for (int dy = -1; dy <= 1 && !touches_other; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    if (dx == 0 && dy == 0) {
+    std::vector<cv::Point> source_points;
+    {
+        const TimingMark timing = start_timing();
+        source_points = label_source_points(source_mask, source_pixel_labels);
+        timings.push_back(
+            finish_timing("component.label_source_points", timing));
+    }
+
+    cv::Mat nearest_component(binary.size(), CV_32S, cv::Scalar(0));
+    {
+        const TimingMark timing = start_timing();
+        cv::parallel_for_(cv::Range(0, binary.rows),
+                          [&](const cv::Range& range) {
+            for (int y = range.start; y < range.end; ++y) {
+                for (int x = 0; x < binary.cols; ++x) {
+                    if (binary.at<std::uint8_t>(y, x) != 0) {
+                        nearest_component.at<int>(y, x) =
+                            component_labels.at<int>(y, x);
                         continue;
                     }
-                    const int other = nearest_component.at<int>(y + dy, x + dx);
-                    if (other > 0 && other != center) {
-                        touches_other = true;
-                        break;
+
+                    const int source_label = source_pixel_labels.at<int>(y, x);
+                    if (source_label <= 0 ||
+                        source_label >=
+                            static_cast<int>(source_points.size())) {
+                        continue;
+                    }
+                    const cv::Point source = source_points[source_label];
+                    if (source.x >= 0) {
+                        nearest_component.at<int>(y, x) =
+                            component_labels.at<int>(source.y, source.x);
                     }
                 }
             }
-            if (touches_other) {
-                boundaries.at<std::uint8_t>(y, x) = 255;
-            }
-        }
+        });
+        timings.push_back(finish_timing("component.nearest_component", timing));
     }
 
-    const cv::Mat boundary_skeleton = zhang_suen_thinning(boundaries);
-    const cv::Mat boundary_skeleton_pruned =
-        prune_short_low_dt_spurs(boundary_skeleton, dt_to_component);
-    const cv::Mat source_pixel_ridges =
-        source_pixel_label_ridges(source_mask, source_pixel_labels);
-    const cv::Mat source_pixel_ridge_skeleton =
-        zhang_suen_thinning(source_pixel_ridges);
+    cv::Mat boundaries = cv::Mat::zeros(binary.size(), CV_8U);
+    {
+        const TimingMark timing = start_timing();
+        cv::parallel_for_(cv::Range(1, binary.rows - 1),
+                          [&](const cv::Range& range) {
+            for (int y = range.start; y < range.end; ++y) {
+                for (int x = 1; x < binary.cols - 1; ++x) {
+                    if (binary.at<std::uint8_t>(y, x) != 0) {
+                        continue;
+                    }
+                    const int center = nearest_component.at<int>(y, x);
+                    if (center <= 0) {
+                        continue;
+                    }
+                    bool touches_other = false;
+                    for (int dy = -1; dy <= 1 && !touches_other; ++dy) {
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            if (dx == 0 && dy == 0) {
+                                continue;
+                            }
+                            const int other =
+                                nearest_component.at<int>(y + dy, x + dx);
+                            if (other > 0 && other != center) {
+                                touches_other = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (touches_other) {
+                        boundaries.at<std::uint8_t>(y, x) = 255;
+                    }
+                }
+            }
+        });
+        timings.push_back(finish_timing("component.boundaries", timing));
+    }
+
+    cv::Mat boundary_skeleton;
+    {
+        const TimingMark timing = start_timing();
+        boundary_skeleton = optimized_thinning(boundaries);
+        timings.push_back(
+            finish_timing("component.boundary_skeleton", timing));
+    }
+
+    cv::Mat boundary_skeleton_pruned;
+    {
+        const TimingMark timing = start_timing();
+        boundary_skeleton_pruned =
+            prune_short_low_dt_spurs(boundary_skeleton, dt_to_component);
+        timings.push_back(finish_timing("component.prune_spurs", timing));
+    }
+
+    cv::Mat source_pixel_ridges;
+    {
+        const TimingMark timing = start_timing();
+        source_pixel_ridges =
+            source_pixel_label_ridges(source_mask, source_pixel_labels);
+        timings.push_back(
+            finish_timing("component.source_pixel_ridges", timing));
+    }
+
+    cv::Mat source_pixel_ridge_skeleton;
+    {
+        const TimingMark timing = start_timing();
+        source_pixel_ridge_skeleton =
+            cv::Mat::zeros(source_pixel_ridges.size(), CV_8U);
+        timings.push_back(
+            finish_timing("component.source_ridge_skeleton_skipped", timing));
+    }
 
     cv::Mat cell_loops = cv::Mat::zeros(binary.size(), CV_8U);
     cv::Mat rings = cv::Mat::zeros(binary.size(), CV_8U);
-    for (int component = 1; component < num_components; ++component) {
-        cv::Mat cell_mask;
-        cv::compare(nearest_component, component, cell_mask, cv::CMP_EQ);
-
-        std::vector<std::vector<cv::Point>> contours;
-        cv::findContours(cell_mask, contours, cv::RETR_EXTERNAL,
-                         cv::CHAIN_APPROX_NONE);
-        for (std::size_t i = 0; i < contours.size(); ++i) {
-            if (std::abs(cv::contourArea(contours[i])) < 8.0) {
-                continue;
-            }
-            cv::drawContours(cell_loops, contours, static_cast<int>(i),
-                             cv::Scalar(255), 1);
-        }
-
-        cv::Mat ring_mask = cell_mask.clone();
-        ring_mask.setTo(0, component_labels == component);
-
-        std::vector<std::vector<cv::Point>> ring_contours;
-        std::vector<cv::Vec4i> ring_hierarchy;
-        cv::findContours(ring_mask, ring_contours, ring_hierarchy, cv::RETR_TREE,
-                         cv::CHAIN_APPROX_NONE);
-        for (std::size_t i = 0; i < ring_contours.size(); ++i) {
-            if (std::abs(cv::contourArea(ring_contours[i])) < 8.0) {
-                continue;
-            }
-
-            const cv::Rect bounds = cv::boundingRect(ring_contours[i]);
-            const bool touches_image_border =
-                bounds.x <= 0 || bounds.y <= 0 ||
-                bounds.x + bounds.width >= binary.cols ||
-                bounds.y + bounds.height >= binary.rows;
-            if (touches_image_border && ring_hierarchy[i][3] < 0) {
-                continue;
-            }
-
-            cv::drawContours(rings, ring_contours, static_cast<int>(i),
-                             cv::Scalar(255), 1);
-        }
+    {
+        const TimingMark timing = start_timing();
+        timings.push_back(
+            finish_timing("component.cell_ring_contours_skipped", timing));
     }
 
-    cv::Mat connected_skeleton = connect_clean_skeleton_with_source_ridges(
-        boundary_skeleton_pruned, source_pixel_ridges, dt_to_component);
+    cv::Mat connected_skeleton;
+    {
+        const TimingMark timing = start_timing();
+        connected_skeleton = connect_clean_skeleton_with_source_ridges(
+            boundary_skeleton_pruned, source_pixel_ridges, dt_to_component);
+        timings.push_back(finish_timing("component.connect_ridges", timing));
+    }
     cv::Mat cell_loops_connected;
     connected_skeleton.copyTo(cell_loops_connected);
 
-    return {labels_to_u16(nearest_component, num_components - 1), boundaries,
-            boundary_skeleton, boundary_skeleton_pruned, source_pixel_ridges,
-            source_pixel_ridge_skeleton, connected_skeleton, cell_loops,
-            cell_loops_connected, rings};
+    cv::Mat labels_u16;
+    {
+        const TimingMark timing = start_timing();
+        labels_u16 = labels_to_u16(nearest_component, num_components - 1);
+        timings.push_back(finish_timing("component.labels_to_u16", timing));
+    }
+
+    return {labels_u16,
+            boundaries,
+            boundary_skeleton,
+            boundary_skeleton_pruned,
+            source_pixel_ridges,
+            source_pixel_ridge_skeleton,
+            connected_skeleton,
+            cell_loops,
+            cell_loops_connected,
+            rings,
+            timings};
 }
 
 void write_image(const fs::path& path, const cv::Mat& image) {
@@ -1723,73 +1928,125 @@ void write_named_layered_tiff(const fs::path& path,
 
 int main(int argc, char** argv) {
     try {
+        const TimingMark total_start = start_timing();
+        std::vector<StageTiming> timings;
+
         const Args args = parse_args(argc, argv);
         const fs::path workdir = fs::current_path();
 
-        const cv::Mat gray = load_grayscale(args.input);
-        const cv::Mat binary = binarize_fixed_threshold(gray);
+        cv::Mat gray;
+        {
+            const TimingMark timing = start_timing();
+            gray = load_grayscale(args.input);
+            timings.push_back(finish_timing("input_load", timing));
+        }
+
+        cv::Mat binary;
+        {
+            const TimingMark timing = start_timing();
+            binary = binarize_fixed_threshold(gray);
+            timings.push_back(finish_timing("binarize", timing));
+        }
 
         cv::Mat white_domain(binary.size(), CV_8U, cv::Scalar(255));
         white_domain.setTo(0, binary);
 
         cv::Mat dt;
-        cv::distanceTransform(white_domain, dt, cv::DIST_L2,
-                              cv::DIST_MASK_PRECISE);
+        {
+            const TimingMark timing = start_timing();
+            cv::distanceTransform(white_domain, dt, cv::DIST_L2,
+                                  cv::DIST_MASK_PRECISE);
+            timings.push_back(finish_timing("precise_dt", timing));
+        }
 
-        const auto component_voronoi_start = Clock::now();
-        const ComponentVoronoiResult component_voronoi_result =
-            component_voronoi(binary);
-        const auto component_voronoi_end = Clock::now();
+        ComponentVoronoiResult component_voronoi_result;
+        {
+            const TimingMark timing = start_timing();
+            component_voronoi_result = component_voronoi(binary);
+            timings.push_back(finish_timing("component_voronoi", timing));
+            timings.insert(timings.end(),
+                           component_voronoi_result.timings.begin(),
+                           component_voronoi_result.timings.end());
+        }
 
-        const auto graph_start = Clock::now();
-        const SkeletonGraph graph = extract_skeleton_graph(
-            component_voronoi_result.cell_loops_connected, dt);
-        const cv::Mat graph_random_colors =
-            render_graph_random_colors(graph, binary.size());
-        const cv::Mat graph_capacity = render_graph_capacity(graph, binary.size());
-        const auto graph_end = Clock::now();
+        SkeletonGraph graph;
+        {
+            const TimingMark timing = start_timing();
+            graph = extract_skeleton_graph(
+                component_voronoi_result.cell_loops_connected, dt);
+            timings.push_back(finish_timing("graph_extract", timing));
+        }
 
-        const auto contour_loops_start = Clock::now();
-        const cv::Mat contour_loops = binary_contour_loops(binary);
-        const auto contour_loops_end = Clock::now();
+        cv::Mat graph_random_colors;
+        {
+            const TimingMark timing = start_timing();
+            graph_random_colors = render_graph_random_colors(graph, binary.size());
+            timings.push_back(finish_timing("graph_random_color_render", timing));
+        }
 
-        const cv::Mat dt_u16 = normalized_dt_u16(dt);
+        cv::Mat graph_capacity;
+        {
+            const TimingMark timing = start_timing();
+            graph_capacity = render_graph_capacity(graph, binary.size());
+            timings.push_back(finish_timing("graph_capacity_render", timing));
+        }
+
+        cv::Mat contour_loops;
+        {
+            const TimingMark timing = start_timing();
+            contour_loops = binary_contour_loops(binary);
+            timings.push_back(finish_timing("binary_contour_loops", timing));
+        }
+
+        cv::Mat dt_u16;
+        {
+            const TimingMark timing = start_timing();
+            dt_u16 = normalized_dt_u16(dt);
+            timings.push_back(finish_timing("dt_normalize", timing));
+        }
 
         const std::string stem = args.input.stem().string();
-        write_image(workdir / (stem + "_binary.tif"), binary);
-        write_image(workdir / (stem + "_dt.tif"), dt_u16);
-        write_image(workdir / (stem + "_component_voronoi_labels.tif"),
-                    component_voronoi_result.labels_u16);
-        write_image(workdir / (stem + "_component_voronoi_boundaries.tif"),
-                    component_voronoi_result.boundaries);
-        write_image(workdir /
-                        (stem + "_component_voronoi_boundary_skeleton.tif"),
-                    component_voronoi_result.boundary_skeleton);
-        write_image(
-            workdir /
-                (stem + "_component_voronoi_boundary_skeleton_pruned.tif"),
-            component_voronoi_result.boundary_skeleton_pruned);
-        write_image(workdir /
-                        (stem + "_source_pixel_voronoi_ridges.tif"),
-                    component_voronoi_result.source_pixel_ridges);
-        write_image(workdir /
-                        (stem + "_source_pixel_voronoi_ridge_skeleton.tif"),
-                    component_voronoi_result.source_pixel_ridge_skeleton);
-        write_image(workdir /
-                        (stem + "_component_voronoi_boundary_skeleton_hybrid.tif"),
-                    component_voronoi_result.boundary_skeleton_hybrid);
-        write_image(workdir / (stem + "_component_voronoi_cell_loops.tif"),
-                    component_voronoi_result.cell_loops);
-        write_image(workdir /
-                        (stem + "_component_voronoi_cell_loops_connected.tif"),
-                    component_voronoi_result.cell_loops_connected);
-        write_image(workdir / (stem + "_component_voronoi_rings.tif"),
-                    component_voronoi_result.rings);
-        write_image(workdir / (stem + "_binary_contour_loops.tif"),
-                    contour_loops);
-        write_image(workdir / (stem + "_graph_random_edges.tif"),
-                    graph_random_colors);
-        write_image(workdir / (stem + "_graph_capacity.tif"), graph_capacity);
+        {
+            const TimingMark timing = start_timing();
+            write_image(workdir / (stem + "_binary.tif"), binary);
+            write_image(workdir / (stem + "_dt.tif"), dt_u16);
+            write_image(workdir / (stem + "_component_voronoi_labels.tif"),
+                        component_voronoi_result.labels_u16);
+            write_image(workdir / (stem + "_component_voronoi_boundaries.tif"),
+                        component_voronoi_result.boundaries);
+            write_image(workdir /
+                            (stem + "_component_voronoi_boundary_skeleton.tif"),
+                        component_voronoi_result.boundary_skeleton);
+            write_image(
+                workdir /
+                    (stem + "_component_voronoi_boundary_skeleton_pruned.tif"),
+                component_voronoi_result.boundary_skeleton_pruned);
+            write_image(workdir /
+                            (stem + "_source_pixel_voronoi_ridges.tif"),
+                        component_voronoi_result.source_pixel_ridges);
+            write_image(workdir /
+                            (stem + "_source_pixel_voronoi_ridge_skeleton.tif"),
+                        component_voronoi_result.source_pixel_ridge_skeleton);
+            write_image(
+                workdir /
+                    (stem + "_component_voronoi_boundary_skeleton_hybrid.tif"),
+                component_voronoi_result.boundary_skeleton_hybrid);
+            write_image(workdir / (stem + "_component_voronoi_cell_loops.tif"),
+                        component_voronoi_result.cell_loops);
+            write_image(
+                workdir /
+                    (stem + "_component_voronoi_cell_loops_connected.tif"),
+                component_voronoi_result.cell_loops_connected);
+            write_image(workdir / (stem + "_component_voronoi_rings.tif"),
+                        component_voronoi_result.rings);
+            write_image(workdir / (stem + "_binary_contour_loops.tif"),
+                        contour_loops);
+            write_image(workdir / (stem + "_graph_random_edges.tif"),
+                        graph_random_colors);
+            write_image(workdir / (stem + "_graph_capacity.tif"),
+                        graph_capacity);
+            timings.push_back(finish_timing("write_regular_outputs", timing));
+        }
 
         const std::vector<NamedLayer> layered_tiff = {
             {"dt", to_bgr_layer(dt_u16)},
@@ -1799,8 +2056,21 @@ int main(int argc, char** argv) {
             {"graph_random_edges", graph_random_colors},
             {"graph_capacity", to_bgr_layer(graph_capacity)},
         };
-        write_named_layered_tiff(workdir / (stem + "_layers.tif"),
-                                 layered_tiff);
+        {
+            const TimingMark timing = start_timing();
+            write_named_layered_tiff(workdir / (stem + "_layers.tif"),
+                                     layered_tiff);
+            timings.push_back(finish_timing("write_layered_tiff", timing));
+        }
+        timings.push_back(finish_timing("total", total_start));
+
+        print_stage_timings(timings);
+        std::cout << "Graph:\n"
+                  << "  graph_nodes: " << (graph.nodes.size() > 0
+                                               ? graph.nodes.size() - 1
+                                               : 0)
+                  << "\n"
+                  << "  graph_edges: " << graph.edges.size() << "\n";
 
         std::cout << "Wrote:\n"
                   << "  " << (workdir / (stem + "_binary.tif")) << "\n"
@@ -1849,27 +2119,6 @@ int main(int argc, char** argv) {
                   << "  " << (workdir / (stem + "_graph_capacity.tif"))
                   << "\n"
                   << "  " << (workdir / (stem + "_layers.tif"))
-                  << "\n";
-        std::cout << "Timings:\n"
-                  << "  component_voronoi_ms: "
-                  << std::chrono::duration<double, std::milli>(
-                         component_voronoi_end - component_voronoi_start)
-                         .count()
-                  << "\n"
-                  << "  graph_extract_and_render_ms: "
-                  << std::chrono::duration<double, std::milli>(
-                         graph_end - graph_start)
-                         .count()
-                  << "\n"
-                  << "  graph_nodes: " << (graph.nodes.size() > 0
-                                               ? graph.nodes.size() - 1
-                                               : 0)
-                  << "\n"
-                  << "  graph_edges: " << graph.edges.size() << "\n"
-                  << "  binary_contour_loops_ms: "
-                  << std::chrono::duration<double, std::milli>(
-                         contour_loops_end - contour_loops_start)
-                         .count()
                   << "\n";
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";

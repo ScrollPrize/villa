@@ -4,8 +4,8 @@ Small C++/OpenCV experiments for dense batched min-cut preprocessing.
 
 ## Build
 
-Requires OpenCV with `core`, `imgcodecs`, and `imgproc`, plus libtiff for
-named multipage TIFF layers.
+Requires OpenCV with `core`, `imgcodecs`, `imgproc`, and `ximgproc`, plus
+libtiff for named multipage TIFF layers.
 
 ```bash
 cmake -S lasagna/dense_batch_min_cut -B lasagna/dense_batch_min_cut/build
@@ -37,20 +37,24 @@ Outputs:
   fixed pruning threshold.
 - `<stem>_source_pixel_voronoi_ridges.tif`: the older dense ridge detector:
   pixels where neighboring OpenCV labeled-DT source-pixel ids differ.
-- `<stem>_source_pixel_voronoi_ridge_skeleton.tif`: one-pixel thinning of the
-  dense source-pixel ridge candidates, written only as a diagnostic.
+- `<stem>_source_pixel_voronoi_ridge_skeleton.tif`: reserved diagnostic output.
+  It is currently written as a blank image because the graph connector uses the
+  dense source-pixel ridges directly.
 - `<stem>_component_voronoi_boundary_skeleton_hybrid.tif`: clean pruned
   component-boundary skeleton plus selected source-pixel ridge connector pieces.
-- `<stem>_component_voronoi_cell_loops.tif`: contour loops of each component's
-  raster Voronoi cell.
+- `<stem>_component_voronoi_cell_loops.tif`: reserved diagnostic output for
+  raster Voronoi-cell contour loops. It is currently written blank in the fast
+  path because graph extraction does not use it.
 - `<stem>_component_voronoi_cell_loops_connected.tif`: clean pruned
   component-boundary skeleton plus selected source-pixel ridge paths. The path
   search runs on the dense source-pixel ridge mask, not the thinned diagnostic,
   and maximizes the minimum DT value along the path, with shorter paths used as
   the tie-breaker. Short attachment segments are drawn to close 1-pixel gaps
   between selected paths and the clean skeleton.
-- `<stem>_component_voronoi_rings.tif`: per-component Voronoi cells with the
-  source component carved out, rendered as candidate rings.
+- `<stem>_component_voronoi_rings.tif`: reserved diagnostic output for
+  per-component Voronoi cells with the source component carved out. It is
+  currently written blank in the fast path because graph extraction does not use
+  it.
 - `<stem>_binary_contour_loops.tif`: hole contours from the binary foreground
   contour hierarchy.
 - `<stem>_graph_random_edges.tif`: graph visualization extracted from
@@ -66,9 +70,9 @@ Outputs:
 
 The threshold and polarity are intentionally fixed for repeatable comparisons.
 The component Voronoi path treats each dark foreground connected component as
-one fat site, and computes cells/rings in the surrounding light region. The CLI
-prints timings in milliseconds for the component Voronoi, graph extraction, and
-contour-loop paths.
+one fat site. The CLI prints a fixed-width timing table with elapsed time, CPU
+time, and estimated CPU/elapsed utilization for the main stages and component
+Voronoi substages.
 
 ## Candidate Optimizations
 
