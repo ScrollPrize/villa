@@ -1063,167 +1063,178 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
         }
     }
 
-    const auto widest_path = [&](int candidate_label, int component_a,
-                                 int component_b) -> CandidateEdge {
-        struct State {
-            int idx = 0;
-            float bottleneck = 0.0f;
-            int length = 0;
-        };
-        struct StateLess {
-            bool operator()(const State& a, const State& b) const {
-                if (a.bottleneck != b.bottleneck) {
-                    return a.bottleneck < b.bottleneck;
-                }
-                return a.length > b.length;
-            }
-        };
-
-        const CandidateWorkspace& workspace =
-            candidate_workspaces[candidate_label];
-        const int total = static_cast<int>(workspace.pixels.size());
-        std::vector<std::uint8_t> target(static_cast<std::size_t>(total), 0);
-        std::vector<float> best(static_cast<std::size_t>(total), -1.0f);
-        std::vector<int> best_length(static_cast<std::size_t>(total),
-                                     std::numeric_limits<int>::max());
-        std::vector<int> parent(static_cast<std::size_t>(total), -1);
-        std::vector<cv::Point> start_clean(static_cast<std::size_t>(total),
-                                           cv::Point(-1, -1));
-        std::vector<cv::Point> target_clean(static_cast<std::size_t>(total),
-                                            cv::Point(-1, -1));
-        std::priority_queue<State, std::vector<State>, StateLess> queue;
-
-        for (const Attachment& attachment : attachments[candidate_label]) {
-            const int idx = workspace.local_index.at<int>(
-                attachment.pixel.y - workspace.bounds.y,
-                attachment.pixel.x - workspace.bounds.x);
-            if (idx < 0) {
-                continue;
-            }
-            if (attachment.component == component_b) {
-                target[idx] = 1;
-                target_clean[idx] = attachment.clean_pixel;
-            }
-        }
-
-        for (const Attachment& attachment : attachments[candidate_label]) {
-            if (attachment.component != component_a) {
-                continue;
-            }
-            const int idx = workspace.local_index.at<int>(
-                attachment.pixel.y - workspace.bounds.y,
-                attachment.pixel.x - workspace.bounds.x);
-            if (idx < 0) {
-                continue;
-            }
-            const float start_dt =
-                dt.at<float>(attachment.pixel.y, attachment.pixel.x);
-            if (start_dt > best[idx]) {
-                best[idx] = start_dt;
-                best_length[idx] = 1;
-                parent[idx] = idx;
-                start_clean[idx] = attachment.clean_pixel;
-                queue.push({idx, start_dt, 1});
-            }
-        }
-
-        int target_idx = -1;
-        while (!queue.empty()) {
-            const State state = queue.top();
-            queue.pop();
-            if (state.bottleneck < best[state.idx] ||
-                (state.bottleneck == best[state.idx] &&
-                 state.length > best_length[state.idx])) {
-                continue;
-            }
-
-            if (target[state.idx] != 0) {
-                target_idx = state.idx;
-                break;
-            }
-
-            const cv::Point pixel = workspace.pixels[state.idx];
-            const int x = pixel.x;
-            const int y = pixel.y;
-            for (const cv::Point dir : kDirs) {
-                const int nx = x + dir.x;
-                const int ny = y + dir.y;
-                if (!workspace.bounds.contains(cv::Point(nx, ny))) {
-                    continue;
-                }
-                const int next_idx = workspace.local_index.at<int>(
-                    ny - workspace.bounds.y, nx - workspace.bounds.x);
-                if (next_idx < 0) {
-                    continue;
-                }
-
-                const float next_bottleneck =
-                    std::min(state.bottleneck, dt.at<float>(ny, nx));
-                const int next_length = state.length + 1;
-                if (next_bottleneck > best[next_idx] ||
-                    (next_bottleneck == best[next_idx] &&
-                     next_length < best_length[next_idx])) {
-                    best[next_idx] = next_bottleneck;
-                    best_length[next_idx] = next_length;
-                    parent[next_idx] = state.idx;
-                    start_clean[next_idx] = start_clean[state.idx];
-                    queue.push({next_idx, next_bottleneck, next_length});
-                }
-            }
-        }
-
-        CandidateEdge edge;
-        edge.label = candidate_label;
-        edge.a = component_a;
-        edge.b = component_b;
-        if (target_idx < 0) {
-            return edge;
-        }
-
-        edge.clean_a = start_clean[target_idx];
-        edge.clean_b = target_clean[target_idx];
-        edge.bottleneck_dt = best[target_idx];
-        edge.length = best_length[target_idx];
-        for (int idx = target_idx; idx >= 0 && parent[idx] != idx;
-             idx = parent[idx]) {
-            edge.path.push_back(workspace.pixels[idx]);
-        }
-        int root = target_idx;
-        while (parent[root] != root && parent[root] >= 0) {
-            root = parent[root];
-        }
-        if (root >= 0) {
-            edge.path.push_back(workspace.pixels[root]);
-        }
-        return edge;
-    };
-
     std::vector<std::vector<CandidateEdge>> edges_by_candidate(
         static_cast<std::size_t>(num_candidates));
     cv::parallel_for_(cv::Range(1, num_candidates), [&](const cv::Range& range) {
         for (int label = range.start; label < range.end; ++label) {
-            std::vector<int> touched;
-            for (const Attachment& attachment : attachments[label]) {
-                if (std::find(touched.begin(), touched.end(),
-                              attachment.component) == touched.end()) {
-                    touched.push_back(attachment.component);
+            struct State {
+                int idx = 0;
+                int owner = 0;
+                float bottleneck = 0.0f;
+                int length = 0;
+            };
+            struct StateLess {
+                bool operator()(const State& a, const State& b) const {
+                    if (a.bottleneck != b.bottleneck) {
+                        return a.bottleneck < b.bottleneck;
+                    }
+                    if (a.length != b.length) {
+                        return a.length > b.length;
+                    }
+                    return a.owner > b.owner;
                 }
-            }
-            if (touched.size() < 2) {
+            };
+
+            const CandidateWorkspace& workspace = candidate_workspaces[label];
+            const int total = static_cast<int>(workspace.pixels.size());
+            if (total == 0) {
                 continue;
             }
-            std::sort(touched.begin(), touched.end());
+
+            std::vector<float> best(static_cast<std::size_t>(total), -1.0f);
+            std::vector<int> best_length(static_cast<std::size_t>(total),
+                                         std::numeric_limits<int>::max());
+            std::vector<int> parent(static_cast<std::size_t>(total), -1);
+            std::vector<int> owner(static_cast<std::size_t>(total), 0);
+            std::vector<cv::Point> owner_clean(
+                static_cast<std::size_t>(total), cv::Point(-1, -1));
+            std::priority_queue<State, std::vector<State>, StateLess> queue;
+
+            for (const Attachment& attachment : attachments[label]) {
+                const int idx = workspace.local_index.at<int>(
+                    attachment.pixel.y - workspace.bounds.y,
+                    attachment.pixel.x - workspace.bounds.x);
+                if (idx < 0) {
+                    continue;
+                }
+                const float start_dt =
+                    dt.at<float>(attachment.pixel.y, attachment.pixel.x);
+                const bool better =
+                    start_dt > best[idx] ||
+                    (start_dt == best[idx] &&
+                     (owner[idx] == 0 || attachment.component < owner[idx]));
+                if (!better) {
+                    continue;
+                }
+                best[idx] = start_dt;
+                best_length[idx] = 1;
+                parent[idx] = idx;
+                owner[idx] = attachment.component;
+                owner_clean[idx] = attachment.clean_pixel;
+                queue.push({idx, attachment.component, start_dt, 1});
+            }
+
             std::vector<CandidateEdge> local_edges;
-            for (std::size_t i = 0; i < touched.size(); ++i) {
-                for (std::size_t j = i + 1; j < touched.size(); ++j) {
-                    CandidateEdge edge =
-                        widest_path(label, touched[i], touched[j]);
-                    if (!edge.path.empty()) {
+
+            const auto path_to_root = [&](int idx) {
+                std::vector<cv::Point> path;
+                while (idx >= 0) {
+                    path.push_back(workspace.pixels[idx]);
+                    if (parent[idx] == idx) {
+                        break;
+                    }
+                    idx = parent[idx];
+                }
+                return path;
+            };
+
+            while (!queue.empty()) {
+                const State state = queue.top();
+                queue.pop();
+                if (state.owner != owner[state.idx] ||
+                    state.bottleneck < best[state.idx] ||
+                    (state.bottleneck == best[state.idx] &&
+                     state.length > best_length[state.idx])) {
+                    continue;
+                }
+
+                const cv::Point pixel = workspace.pixels[state.idx];
+                for (const cv::Point dir : kDirs) {
+                    const cv::Point next_pixel = pixel + dir;
+                    if (!workspace.bounds.contains(next_pixel)) {
+                        continue;
+                    }
+                    const int next_idx = workspace.local_index.at<int>(
+                        next_pixel.y - workspace.bounds.y,
+                        next_pixel.x - workspace.bounds.x);
+                    if (next_idx < 0) {
+                        continue;
+                    }
+
+                    if (owner[next_idx] > 0 &&
+                        owner[next_idx] != state.owner) {
+                        CandidateEdge edge;
+                        edge.label = label;
+                        edge.a = state.owner;
+                        edge.b = owner[next_idx];
+                        edge.clean_a = owner_clean[state.idx];
+                        edge.clean_b = owner_clean[next_idx];
+                        edge.bottleneck_dt =
+                            std::min(state.bottleneck, best[next_idx]);
+
+                        std::vector<cv::Point> b_path =
+                            path_to_root(next_idx);
+                        std::reverse(b_path.begin(), b_path.end());
+                        edge.path = std::move(b_path);
+                        std::vector<cv::Point> a_path =
+                            path_to_root(state.idx);
+                        edge.path.insert(edge.path.end(), a_path.begin(),
+                                         a_path.end());
+                        edge.length = static_cast<int>(edge.path.size());
                         local_edges.push_back(std::move(edge));
+                        continue;
+                    }
+
+                    const float next_bottleneck =
+                        std::min(state.bottleneck,
+                                 dt.at<float>(next_pixel.y, next_pixel.x));
+                    const int next_length = state.length + 1;
+                    if (owner[next_idx] == 0 ||
+                        next_bottleneck > best[next_idx] ||
+                        (owner[next_idx] == state.owner &&
+                         next_bottleneck == best[next_idx] &&
+                         next_length < best_length[next_idx])) {
+                        best[next_idx] = next_bottleneck;
+                        best_length[next_idx] = next_length;
+                        parent[next_idx] = state.idx;
+                        owner[next_idx] = state.owner;
+                        owner_clean[next_idx] = owner_clean[state.idx];
+                        queue.push({next_idx, state.owner, next_bottleneck,
+                                    next_length});
                     }
                 }
             }
-            edges_by_candidate[label] = std::move(local_edges);
+
+            std::sort(local_edges.begin(), local_edges.end(),
+                      [](const CandidateEdge& a, const CandidateEdge& b) {
+                const int a0 = std::min(a.a, a.b);
+                const int a1 = std::max(a.a, a.b);
+                const int b0 = std::min(b.a, b.b);
+                const int b1 = std::max(b.a, b.b);
+                if (a0 != b0) {
+                    return a0 < b0;
+                }
+                if (a1 != b1) {
+                    return a1 < b1;
+                }
+                if (a.bottleneck_dt != b.bottleneck_dt) {
+                    return a.bottleneck_dt > b.bottleneck_dt;
+                }
+                return a.length < b.length;
+            });
+
+            std::vector<CandidateEdge> deduped_edges;
+            for (CandidateEdge& edge : local_edges) {
+                if (!deduped_edges.empty()) {
+                    const CandidateEdge& prev = deduped_edges.back();
+                    if (std::min(prev.a, prev.b) == std::min(edge.a, edge.b) &&
+                        std::max(prev.a, prev.b) == std::max(edge.a, edge.b)) {
+                        continue;
+                    }
+                }
+                deduped_edges.push_back(std::move(edge));
+            }
+            edges_by_candidate[label] = std::move(deduped_edges);
         }
     });
 
