@@ -2841,8 +2841,17 @@ cv::Mat add_valid_frame_to_skeleton(const cv::Mat& skeleton, const cv::Mat& dt) 
 
     cv::Mat out;
     cv::threshold(skeleton, out, 0, 255, cv::THRESH_BINARY);
+    const cv::Mat original = out.clone();
+    cv::Mat added_frame = cv::Mat::zeros(out.size(), CV_8U);
+    const auto on_frame = [&](const cv::Point pixel) {
+        return pixel.x == 0 || pixel.y == 0 || pixel.x == out.cols - 1 ||
+               pixel.y == out.rows - 1;
+    };
     const auto add_if_valid = [&](const cv::Point pixel) {
         if (dt.at<float>(pixel.y, pixel.x) > 0.0f) {
+            if (original.at<std::uint8_t>(pixel.y, pixel.x) == 0) {
+                added_frame.at<std::uint8_t>(pixel.y, pixel.x) = 255;
+            }
             out.at<std::uint8_t>(pixel.y, pixel.x) = 255;
         }
     };
@@ -2858,6 +2867,74 @@ cv::Mat add_valid_frame_to_skeleton(const cv::Mat& skeleton, const cv::Mat& dt) 
         if (out.cols > 1) {
             add_if_valid(cv::Point(out.cols - 1, y));
         }
+    }
+
+    std::vector<cv::Point> frame_pixels;
+    frame_pixels.reserve(static_cast<std::size_t>(2 * out.cols + 2 * out.rows));
+    for (int x = 0; x < out.cols; ++x) {
+        frame_pixels.push_back(cv::Point(x, 0));
+    }
+    for (int y = 1; y < out.rows; ++y) {
+        frame_pixels.push_back(cv::Point(out.cols - 1, y));
+    }
+    if (out.rows > 1) {
+        for (int x = out.cols - 2; x >= 0; --x) {
+            frame_pixels.push_back(cv::Point(x, out.rows - 1));
+        }
+    }
+    if (out.cols > 1) {
+        for (int y = out.rows - 2; y >= 1; --y) {
+            frame_pixels.push_back(cv::Point(0, y));
+        }
+    }
+
+    const auto has_non_frame_neighbor = [&](const cv::Point pixel) {
+        for (int dy = -1; dy <= 1; ++dy) {
+            for (int dx = -1; dx <= 1; ++dx) {
+                if (dx == 0 && dy == 0) {
+                    continue;
+                }
+                const int x = pixel.x + dx;
+                const int y = pixel.y + dy;
+                if (x < 0 || x >= out.cols || y < 0 || y >= out.rows) {
+                    continue;
+                }
+                const cv::Point neighbor(x, y);
+                if (!on_frame(neighbor) &&
+                    out.at<std::uint8_t>(y, x) != 0) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    const int frame_count = static_cast<int>(frame_pixels.size());
+    std::vector<char> removed(static_cast<std::size_t>(frame_count), 0);
+    const auto cleanup_from_invalid = [&](int invalid_index, int step) {
+        int index = (invalid_index + step + frame_count) % frame_count;
+        while (removed[index] == 0) {
+            const cv::Point pixel = frame_pixels[index];
+            if (added_frame.at<std::uint8_t>(pixel.y, pixel.x) == 0) {
+                break;
+            }
+            if (has_non_frame_neighbor(pixel)) {
+                break;
+            }
+            out.at<std::uint8_t>(pixel.y, pixel.x) = 0;
+            added_frame.at<std::uint8_t>(pixel.y, pixel.x) = 0;
+            removed[index] = 1;
+            index = (index + step + frame_count) % frame_count;
+        }
+    };
+
+    for (int i = 0; i < frame_count; ++i) {
+        const cv::Point pixel = frame_pixels[i];
+        if (dt.at<float>(pixel.y, pixel.x) > 0.0f) {
+            continue;
+        }
+        cleanup_from_invalid(i, 1);
+        cleanup_from_invalid(i, -1);
     }
     return out;
 }
