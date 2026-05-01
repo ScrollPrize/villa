@@ -1729,6 +1729,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             int inliers = -1;
             bool ref_seed = false;
         };
+        struct RolloutResult {
+            int score = std::numeric_limits<int>::min();
+            std::vector<RolloutProbe> accepted_probes;
+        };
         auto probe_candidate = [&](const cv::Vec2i& p,
                                    SurfTrackerData& probe_data,
                                    cv::Mat_<uint8_t>& probe_state,
@@ -1914,6 +1918,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             return true;
         };
         auto rollout_score_root = [&](const cv::Vec2i& root) {
+            RolloutResult result;
             SurfTrackerData rollout_data = data;
             cv::Mat_<uint8_t> rollout_state = state.clone();
             cv::Mat_<cv::Vec3d> rollout_points = points.clone();
@@ -1937,9 +1942,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
             RolloutProbe root_probe = probe_candidate(root, rollout_data, rollout_state, rollout_points, rollout_used_area, false);
             if (!root_probe.accepted)
-                return std::numeric_limits<int>::min();
+                return result;
             if (!commit_rollout_probe(root_probe, rollout_data, rollout_state, rollout_points, rollout_used_area, frontier))
-                return std::numeric_limits<int>::min();
+                return result;
+            result.accepted_probes.push_back(root_probe);
             accepted_count++;
             inlier_sum += std::max(0, root_probe.inliers);
             connection_sum += static_cast<int>(rollout_data.surfs(root).size()) + rollout_valid_neighbors(root);
@@ -1975,6 +1981,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                     RolloutProbe probe = probe_candidate(p, rollout_data, rollout_state, rollout_points, rollout_used_area, false);
                     if (!commit_rollout_probe(probe, rollout_data, rollout_state, rollout_points, rollout_used_area, next_frontier))
                         continue;
+                    result.accepted_probes.push_back(probe);
                     accepted_count++;
                     inlier_sum += std::max(0, probe.inliers);
                     connection_sum += static_cast<int>(rollout_data.surfs(p).size()) + rollout_valid_neighbors(p);
@@ -1982,9 +1989,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 frontier = std::move(next_frontier);
             }
 
-            return accepted_count * growth_config.rollout_area_weight +
-                   inlier_sum * growth_config.rollout_inlier_weight +
-                   connection_sum * growth_config.rollout_connection_weight;
+            result.score = accepted_count * growth_config.rollout_area_weight +
+                           inlier_sum * growth_config.rollout_inlier_weight +
+                           connection_sum * growth_config.rollout_connection_weight;
+            return result;
         };
         if (growth_config.rollout_growth &&
             generation >= rollout_warmup_generations &&
@@ -1994,21 +2002,43 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 static_cast<std::size_t>(growth_config.rollout_width));
             int best_score = std::numeric_limits<int>::min();
             cv::Vec2i best_root = candidate_ordering.points.front();
+            std::vector<RolloutProbe> best_rollout_probes;
             for (std::size_t idx = 0; idx < width; ++idx) {
                 const cv::Vec2i root = candidate_ordering.points[idx];
-                const int score = rollout_score_root(root);
-                if (score > best_score ||
-                    (score == best_score && (root[0] < best_root[0] ||
-                                             (root[0] == best_root[0] && root[1] < best_root[1])))) {
-                    best_score = score;
+                const RolloutResult rollout = rollout_score_root(root);
+                if (rollout.score > best_score ||
+                    (rollout.score == best_score && (root[0] < best_root[0] ||
+                                                     (root[0] == best_root[0] && root[1] < best_root[1])))) {
+                    best_score = rollout.score;
                     best_root = root;
+                    best_rollout_probes = rollout.accepted_probes;
                 }
             }
             if (best_score != std::numeric_limits<int>::min()) {
                 std::cout << "rollout selected " << best_root
                           << " score " << best_score
+                          << " with " << best_rollout_probes.size() << " accepted points"
                           << " from " << width << " roots" << std::endl;
-                candidate_ordering.points = {best_root};
+                for (const cv::Vec2i& p : candidate_ordering.points) {
+                    if (!(state(p) & STATE_LOC_VALID)) {
+                        state(p) = static_cast<uint8_t>(state(p) & ~STATE_PROCESSING);
+                    }
+                }
+                std::vector<cv::Vec2i> rollout_frontier_committed;
+                for (const RolloutProbe& probe : best_rollout_probes) {
+                    if (state(probe.p) & STATE_LOC_VALID)
+                        continue;
+                    if (!commit_rollout_probe(probe, data, state, points, used_area, rollout_frontier_committed))
+                        continue;
+                    generations(probe.p) = static_cast<uint16_t>(std::min(generation + 1, static_cast<int>(std::numeric_limits<uint16_t>::max())));
+                    inliers_sum_dbg(probe.p) = probe.inliers;
+                    for(int t=0;t<omp_get_max_threads();t++)
+                        added_points_threads[t].push_back(probe.p);
+                    fringe.insert(probe.p);
+                    succ++;
+                }
+                used_area_hr = scaled_rect_trunc(used_area, step);
+                candidate_ordering.points.clear();
             }
         }
         int best_inliers_gen = 0;
