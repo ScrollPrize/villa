@@ -3440,16 +3440,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
         const int current_remaining_left = remaining_extra(max_extra_left, expanded_left);
         const int current_remaining_right = remaining_extra(max_extra_right, expanded_right);
-        const int current_remaining_up = remaining_extra(max_extra_up, expanded_up);
-        const int current_remaining_down = remaining_extra(max_extra_down, expanded_down);
         const bool can_expand_width_now =
             !growth_config.disable_grid_expansion &&
             ((growth_config.grow_left && current_remaining_left > 0 && w < max_grid_w) ||
              (growth_config.grow_right && current_remaining_right > 0 && w < max_grid_w));
-        const bool can_expand_height_now =
-            !growth_config.disable_grid_expansion &&
-            ((growth_config.grow_up && current_remaining_up > 0 && h < max_grid_h) ||
-             (growth_config.grow_down && current_remaining_down > 0 && h < max_grid_h));
         const bool max_width_limit_reached =
             max_grid_extent <= grid_limit_w && w >= max_grid_w;
         const bool horizontal_expansion_blocked_by_max_width =
@@ -3461,7 +3455,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             fringe.empty() &&
             emergency_consensus_limit_th > 2 &&
             !can_expand_width_now &&
-            !can_expand_height_now &&
             horizontal_expansion_blocked_by_max_width) {
             --emergency_consensus_limit_th;
             curr_best_inl_th = emergency_consensus_limit_th;
@@ -3476,6 +3469,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                           << " after stalled expansion" << std::endl;
                 continue;
             }
+            std::cout << "last-chance consensus retry at inl_th "
+                      << curr_best_inl_th
+                      << " could not reseed after width-limited stalled expansion" << std::endl;
         }
 
         if (fringe.empty())
