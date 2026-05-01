@@ -150,6 +150,7 @@ target_link_libraries(vc_flattening PUBLIC vc_core OpenABF)
 add_library(vc_tracer
     src/GrowPatch.cpp
     src/GrowSurface.cpp
+    src/SurfTrackerData.cpp
     src/NeuralTracerConnection.cpp
     src/ChunkedTensor.cpp
     src/growth_strategies/CandidateOrdering.cpp
