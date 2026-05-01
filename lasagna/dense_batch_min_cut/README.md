@@ -69,6 +69,9 @@ Outputs:
   `<stem>_component_voronoi_cell_loops_connected.tif`; graph nodes are small
   circles at connected junction clusters, and edges are deterministic
   pseudo-random colors.
+- `<stem>_graph_edges_random.tif`: edge-only version of the deterministic
+  pseudo-random graph edge visualization.
+- `<stem>_graph_nodes.tif`: node-only graph visualization.
 - `<stem>_graph_capacity.tif`: graph edges rendered in grayscale by edge
   capacity, where capacity is the minimum raw distance-transform value along
   the complete traced edge.
@@ -83,9 +86,9 @@ Outputs:
   with internal infinite capacity.
 - `<stem>_layers.tif`: named multipage TIFF for easier inspection in GIMP.
   The pages are `binary_threshold`, `dt`, `loops`, `loops_connected`,
-  `graph_random_edges`, and `graph_capacity`. When `--source x,y` is provided,
-  the pages `dense_flow`, `graph_edge_flow`, and `graph_source_edges` are
-  appended.
+  `graph_random_edges`, `graph_edges_random`, `graph_nodes`, and
+  `graph_capacity`. When `--source x,y` is provided, the pages `dense_flow`,
+  `graph_edge_flow`, and `graph_source_edges` are appended.
 
 The threshold and polarity are intentionally fixed for repeatable comparisons.
 The component Voronoi path treats each dark foreground connected component as

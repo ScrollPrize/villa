@@ -1561,6 +1561,8 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
             edge.b = start_node;
             edge.capacity = start_capacity;
             edge.pixels.push_back(start_pixel);
+            assigned_edge_pixels.at<std::uint8_t>(first_pixel.y,
+                                                  first_pixel.x) = 255;
 
             cv::Point previous = start_pixel;
             cv::Point current = first_pixel;
@@ -1788,6 +1790,25 @@ cv::Mat render_graph_random_colors(const SkeletonGraph& graph, cv::Size size) {
         cv::circle(out, graph.nodes[label], 3, cv::Scalar(255, 255, 255),
                    cv::FILLED, cv::LINE_8);
         cv::circle(out, graph.nodes[label], 4, cv::Scalar(0, 0, 0), 1,
+                   cv::LINE_8);
+    }
+    return out;
+}
+
+cv::Mat render_graph_edges_random_colors(const SkeletonGraph& graph,
+                                         cv::Size size) {
+    cv::Mat out(size, CV_8UC3, cv::Scalar(0, 0, 0));
+    for (std::size_t i = 0; i < graph.edges.size(); ++i) {
+        draw_graph_edge(out, graph.edges[i],
+                        deterministic_edge_color(static_cast<int>(i)));
+    }
+    return out;
+}
+
+cv::Mat render_graph_nodes(const SkeletonGraph& graph, cv::Size size) {
+    cv::Mat out(size, CV_8UC1, cv::Scalar(0));
+    for (std::size_t label = 1; label < graph.nodes.size(); ++label) {
+        cv::circle(out, graph.nodes[label], 3, cv::Scalar(255), cv::FILLED,
                    cv::LINE_8);
     }
     return out;
@@ -2704,6 +2725,22 @@ int main(int argc, char** argv) {
             timings.push_back(finish_timing("graph_random_color_render", timing));
         }
 
+        cv::Mat graph_edges_random_colors;
+        {
+            const TimingMark timing = start_timing();
+            graph_edges_random_colors =
+                render_graph_edges_random_colors(graph, binary.size());
+            timings.push_back(
+                finish_timing("graph_edge_only_random_color_render", timing));
+        }
+
+        cv::Mat graph_nodes;
+        {
+            const TimingMark timing = start_timing();
+            graph_nodes = render_graph_nodes(graph, binary.size());
+            timings.push_back(finish_timing("graph_node_render", timing));
+        }
+
         cv::Mat graph_capacity;
         {
             const TimingMark timing = start_timing();
@@ -2773,6 +2810,10 @@ int main(int argc, char** argv) {
                         contour_loops);
             write_image(workdir / (stem + "_graph_random_edges.tif"),
                         graph_random_colors);
+            write_image(workdir / (stem + "_graph_edges_random.tif"),
+                        graph_edges_random_colors);
+            write_image(workdir / (stem + "_graph_nodes.tif"),
+                        graph_nodes);
             write_image(workdir / (stem + "_graph_capacity.tif"),
                         graph_capacity);
             timings.push_back(finish_timing("write_regular_outputs", timing));
@@ -2798,6 +2839,8 @@ int main(int argc, char** argv) {
             {"loops_connected",
              to_bgr_layer(component_voronoi_result.cell_loops_connected)},
             {"graph_random_edges", graph_random_colors},
+            {"graph_edges_random", graph_edges_random_colors},
+            {"graph_nodes", to_bgr_layer(graph_nodes)},
             {"graph_capacity", to_bgr_layer(graph_capacity)},
         };
         if (has_dense_flow) {
@@ -2885,6 +2928,10 @@ int main(int argc, char** argv) {
                   << "  " << (workdir / (stem + "_binary_contour_loops.tif"))
                   << "\n"
                   << "  " << (workdir / (stem + "_graph_random_edges.tif"))
+                  << "\n"
+                  << "  " << (workdir / (stem + "_graph_edges_random.tif"))
+                  << "\n"
+                  << "  " << (workdir / (stem + "_graph_nodes.tif"))
                   << "\n"
                   << "  " << (workdir / (stem + "_graph_capacity.tif"))
                   << "\n"
