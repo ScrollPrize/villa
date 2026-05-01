@@ -75,6 +75,10 @@ Outputs:
 - `<stem>_graph_capacity.tif`: graph edges rendered in grayscale by edge
   capacity, where capacity is the minimum raw distance-transform value along
   the complete traced edge.
+- `<stem>_graph_components.txt`: graph connectivity report with component node
+  and edge counts, plus counts for self-loop, one-endpoint, and zero-endpoint
+  edges. It also reports skeleton coverage: total skeleton pixels, node pixels,
+  unique edge pixels, edge path pixels, and missing pixels.
 - `<stem>_dense_flow.tif`: optional 32-bit float dense source-flow map, written
   only when `--source x,y` is provided.
 - `<stem>_dense_flow_u16.tif`: optional normalized 16-bit visualization of the
