@@ -78,10 +78,14 @@ Outputs:
   dense source-flow map.
 - `<stem>_graph_edge_flow.tif`: optional graph-edge visualization of propagated
   source flow.
+- `<stem>_graph_source_edges.tif`: optional diagnostic showing which graph edges
+  were treated as directly adjacent to the source region and therefore seeded
+  with internal infinite capacity.
 - `<stem>_layers.tif`: named multipage TIFF for easier inspection in GIMP.
   The pages are `binary_threshold`, `dt`, `loops`, `loops_connected`,
   `graph_random_edges`, and `graph_capacity`. When `--source x,y` is provided,
-  the pages `dense_flow` and `graph_edge_flow` are appended.
+  the pages `dense_flow`, `graph_edge_flow`, and `graph_source_edges` are
+  appended.
 
 The threshold and polarity are intentionally fixed for repeatable comparisons.
 The component Voronoi path treats each dark foreground connected component as

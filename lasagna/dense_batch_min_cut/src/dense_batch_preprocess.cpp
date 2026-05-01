@@ -17,6 +17,7 @@
 #include <queue>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -1447,81 +1448,260 @@ SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt)
                         static_cast<float>(node_sums[label].y / node_counts[label]));
     }
 
-    cv::Mat node_mask;
-    cv::compare(node_labels, 0, node_mask, cv::CMP_GT);
-
-    cv::Mat edge_mask = skel.clone();
-    edge_mask.setTo(0, node_mask);
-
-    cv::Mat edge_labels;
-    const int num_edge_components =
-        cv::connectedComponents(edge_mask, edge_labels, 8, CV_32S);
-    std::vector<GraphEdge> edge_components(
-        static_cast<std::size_t>(num_edge_components));
-    std::vector<std::vector<int>> touched_nodes(
-        static_cast<std::size_t>(num_edge_components));
-
-    for (int y = 0; y < edge_labels.rows; ++y) {
-        for (int x = 0; x < edge_labels.cols; ++x) {
-            const int edge_label = edge_labels.at<int>(y, x);
-            if (edge_label <= 0) {
+    cv::Mat skeleton_pixel_ids(skel.size(), CV_32S, cv::Scalar(-1));
+    std::vector<cv::Point> skeleton_pixels;
+    for (int y = 0; y < skel.rows; ++y) {
+        for (int x = 0; x < skel.cols; ++x) {
+            if (skel.at<std::uint8_t>(y, x) == 0) {
                 continue;
             }
+            const int id = static_cast<int>(skeleton_pixels.size());
+            skeleton_pixel_ids.at<int>(y, x) = id;
+            skeleton_pixels.push_back(cv::Point(x, y));
+        }
+    }
 
-            GraphEdge& edge = edge_components[edge_label];
-            edge.pixels.push_back(cv::Point(x, y));
-            if (edge.pixels.size() == 1) {
-                edge.capacity = dt.at<float>(y, x);
-            } else {
-                edge.capacity = std::min(edge.capacity, dt.at<float>(y, x));
+    const auto edge_step_key = [](int a, int b) {
+        const std::uint32_t lo = static_cast<std::uint32_t>(std::min(a, b));
+        const std::uint32_t hi = static_cast<std::uint32_t>(std::max(a, b));
+        return (static_cast<std::uint64_t>(lo) << 32U) |
+               static_cast<std::uint64_t>(hi);
+    };
+
+    std::unordered_set<std::uint64_t> visited_steps;
+    visited_steps.reserve(skeleton_pixels.size() * 2);
+    cv::Mat assigned_edge_pixels = cv::Mat::zeros(skel.size(), CV_8U);
+
+    const auto pixel_id = [&](const cv::Point pixel) {
+        if (pixel.x < 0 || pixel.x >= skeleton_pixel_ids.cols || pixel.y < 0 ||
+            pixel.y >= skeleton_pixel_ids.rows) {
+            return -1;
+        }
+        return skeleton_pixel_ids.at<int>(pixel.y, pixel.x);
+    };
+
+    const auto mark_step = [&](const cv::Point a, const cv::Point b) {
+        const int a_id = pixel_id(a);
+        const int b_id = pixel_id(b);
+        if (a_id < 0 || b_id < 0) {
+            return;
+        }
+        visited_steps.insert(edge_step_key(a_id, b_id));
+    };
+
+    const auto has_step = [&](const cv::Point a, const cv::Point b) {
+        const int a_id = pixel_id(a);
+        const int b_id = pixel_id(b);
+        if (a_id < 0 || b_id < 0) {
+            return true;
+        }
+        return visited_steps.find(edge_step_key(a_id, b_id)) !=
+               visited_steps.end();
+    };
+
+    const auto ordered_neighbors = [&](const cv::Point pixel) {
+        std::vector<cv::Point> neighbors = skeleton_neighbors(skel, pixel);
+        std::sort(neighbors.begin(), neighbors.end(),
+                  [](const cv::Point& a, const cv::Point& b) {
+            if (a.y != b.y) {
+                return a.y < b.y;
             }
+            return a.x < b.x;
+        });
+        return neighbors;
+    };
 
-            for (int dy = -1; dy <= 1; ++dy) {
-                for (int dx = -1; dx <= 1; ++dx) {
-                    if (dx == 0 && dy == 0) {
-                        continue;
-                    }
-                    const int nx = x + dx;
-                    const int ny = y + dy;
-                    if (nx < 0 || nx >= node_labels.cols || ny < 0 ||
-                        ny >= node_labels.rows) {
-                        continue;
-                    }
-                    const int node_label = node_labels.at<int>(ny, nx);
-                    if (node_label > 0) {
-                        add_unique_label(touched_nodes[edge_label], node_label);
-                        edge.capacity =
-                            std::min(edge.capacity, dt.at<float>(ny, nx));
-                    }
+    std::vector<std::vector<cv::Point>> node_ports(
+        static_cast<std::size_t>(num_nodes));
+    for (int start_node = 1; start_node < num_nodes; ++start_node) {
+        for (const cv::Point start_pixel : node_pixels[start_node]) {
+            for (const cv::Point port : ordered_neighbors(start_pixel)) {
+                if (node_labels.at<int>(port.y, port.x) > 0) {
+                    continue;
+                }
+                if (std::find(node_ports[start_node].begin(),
+                              node_ports[start_node].end(),
+                              port) == node_ports[start_node].end()) {
+                    node_ports[start_node].push_back(port);
                 }
             }
         }
     }
 
-    for (int edge_label = 1; edge_label < num_edge_components; ++edge_label) {
-        GraphEdge& edge = edge_components[edge_label];
-        if (edge.pixels.empty() || touched_nodes[edge_label].empty()) {
-            continue;
-        }
-
-        std::sort(touched_nodes[edge_label].begin(),
-                  touched_nodes[edge_label].end());
-        edge.a = touched_nodes[edge_label].front();
-        edge.b = touched_nodes[edge_label].size() > 1
-                     ? touched_nodes[edge_label][1]
-                     : touched_nodes[edge_label].front();
-        for (const int node : {edge.a, edge.b}) {
-            if (node <= 0 ||
-                node >= static_cast<int>(node_pixels.size())) {
+    for (int start_node = 1; start_node < num_nodes; ++start_node) {
+        std::sort(node_ports[start_node].begin(), node_ports[start_node].end(),
+                  [](const cv::Point& a, const cv::Point& b) {
+            if (a.y != b.y) {
+                return a.y < b.y;
+            }
+            return a.x < b.x;
+        });
+        for (const cv::Point first_pixel : node_ports[start_node]) {
+            if (assigned_edge_pixels.at<std::uint8_t>(first_pixel.y,
+                                                      first_pixel.x) != 0) {
                 continue;
             }
-            for (const cv::Point pixel : node_pixels[node]) {
+
+            cv::Point start_pixel(-1, -1);
+            float start_capacity = std::numeric_limits<float>::max();
+            for (const cv::Point neighbor : ordered_neighbors(first_pixel)) {
+                if (node_labels.at<int>(neighbor.y, neighbor.x) == start_node) {
+                    start_pixel = neighbor;
+                    start_capacity =
+                        std::min(start_capacity,
+                                 dt.at<float>(neighbor.y, neighbor.x));
+                }
+            }
+            if (start_pixel.x < 0 || has_step(start_pixel, first_pixel)) {
+                continue;
+            }
+
+            GraphEdge edge;
+            edge.a = start_node;
+            edge.b = start_node;
+            edge.capacity = start_capacity;
+            edge.pixels.push_back(start_pixel);
+
+            cv::Point previous = start_pixel;
+            cv::Point current = first_pixel;
+            std::unordered_set<int> path_pixels;
+            path_pixels.reserve(256);
+            path_pixels.insert(pixel_id(start_pixel));
+            while (true) {
+                mark_step(previous, current);
+                const int current_id = pixel_id(current);
+                if (current_id < 0 ||
+                    path_pixels.find(current_id) != path_pixels.end()) {
+                    break;
+                }
+                path_pixels.insert(current_id);
+
+                const int current_node =
+                    node_labels.at<int>(current.y, current.x);
+                if (current_node > 0) {
+                    edge.b = current_node;
+                    edge.pixels.push_back(current);
+                    edge.capacity =
+                        std::min(edge.capacity,
+                                 dt.at<float>(current.y, current.x));
+                    break;
+                }
+
+                if (assigned_edge_pixels.at<std::uint8_t>(current.y,
+                                                          current.x) != 0) {
+                    break;
+                }
+                assigned_edge_pixels.at<std::uint8_t>(current.y, current.x) =
+                    255;
+                edge.pixels.push_back(current);
+                edge.capacity =
+                    std::min(edge.capacity,
+                             dt.at<float>(current.y, current.x));
+
+                std::vector<cv::Point> next_pixels;
+                std::vector<cv::Point> endpoint_pixels;
+                for (const cv::Point neighbor : ordered_neighbors(current)) {
+                    if (neighbor == previous) {
+                        continue;
+                    }
+                    const int neighbor_node =
+                        node_labels.at<int>(neighbor.y, neighbor.x);
+                    if (neighbor_node > 0) {
+                        if (neighbor_node != start_node ||
+                            edge.pixels.size() > 2) {
+                            endpoint_pixels.push_back(neighbor);
+                        }
+                        continue;
+                    }
+                    if (assigned_edge_pixels.at<std::uint8_t>(neighbor.y,
+                                                              neighbor.x) != 0 ||
+                        has_step(current, neighbor)) {
+                        continue;
+                    }
+                    next_pixels.push_back(neighbor);
+                }
+
+                if (!endpoint_pixels.empty()) {
+                    std::sort(endpoint_pixels.begin(), endpoint_pixels.end(),
+                              [](const cv::Point& a, const cv::Point& b) {
+                        if (a.y != b.y) {
+                            return a.y < b.y;
+                        }
+                        return a.x < b.x;
+                    });
+                    previous = current;
+                    current = endpoint_pixels.front();
+                    continue;
+                }
+
+                if (next_pixels.empty()) {
+                    break;
+                }
+
+                if (next_pixels.size() > 1) {
+                    // This means a branching pixel escaped node detection.
+                    // Stop here instead of coloring several logical edges as
+                    // one corridor; the remaining ports will trace out.
+                    break;
+                }
+
+                previous = current;
+                current = next_pixels.front();
+            }
+
+            if (edge.pixels.size() >= 2) {
+                graph.edges.push_back(std::move(edge));
+            }
+        }
+    }
+
+    for (int y = 0; y < skel.rows; ++y) {
+        for (int x = 0; x < skel.cols; ++x) {
+            if (skel.at<std::uint8_t>(y, x) == 0 ||
+                node_labels.at<int>(y, x) > 0 ||
+                assigned_edge_pixels.at<std::uint8_t>(y, x) != 0) {
+                continue;
+            }
+            const cv::Point start_pixel(x, y);
+            GraphEdge edge;
+            edge.a = 0;
+            edge.b = 0;
+            edge.capacity = dt.at<float>(y, x);
+            std::queue<cv::Point> queue;
+            queue.push(start_pixel);
+            assigned_edge_pixels.at<std::uint8_t>(y, x) = 255;
+            while (!queue.empty()) {
+                const cv::Point pixel = queue.front();
+                queue.pop();
                 edge.pixels.push_back(pixel);
                 edge.capacity =
                     std::min(edge.capacity, dt.at<float>(pixel.y, pixel.x));
+                for (const cv::Point neighbor : ordered_neighbors(pixel)) {
+                    const int node = node_labels.at<int>(neighbor.y, neighbor.x);
+                    if (node > 0) {
+                        if (edge.a == 0) {
+                            edge.a = node;
+                        } else if (edge.b == 0 && node != edge.a) {
+                            edge.b = node;
+                        }
+                        continue;
+                    }
+                    if (assigned_edge_pixels.at<std::uint8_t>(neighbor.y,
+                                                              neighbor.x) != 0) {
+                        continue;
+                    }
+                    assigned_edge_pixels.at<std::uint8_t>(neighbor.y,
+                                                          neighbor.x) = 255;
+                    queue.push(neighbor);
+                }
+            }
+            if (edge.b == 0) {
+                edge.b = edge.a;
+            }
+            if (!edge.pixels.empty()) {
+                graph.edges.push_back(std::move(edge));
             }
         }
-        graph.edges.push_back(std::move(edge));
     }
 
     cv::Mat covered = cv::Mat::zeros(skel.size(), CV_8U);
@@ -1720,6 +1900,12 @@ struct DenseFlowResult {
     cv::Mat dense_flow;
     cv::Mat dense_flow_u16;
     cv::Mat graph_edge_flow;
+    cv::Mat graph_source_edges;
+    int source_edges = 0;
+    int seeded_nodes = 0;
+    float finite_edge_flow_min = 0.0f;
+    float finite_edge_flow_max = 0.0f;
+    int finite_edge_flows = 0;
     std::vector<StageTiming> timings;
 };
 
@@ -1934,6 +2120,19 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         timings.push_back(finish_timing("source_region_detect", timing));
     }
 
+    int source_edge_count = 0;
+    for (char value : source_edges) {
+        if (value != 0) {
+            ++source_edge_count;
+        }
+    }
+    int seeded_node_count = 0;
+    for (int node = 1; node < node_count; ++node) {
+        if (seeded_nodes[node] != 0) {
+            ++seeded_node_count;
+        }
+    }
+
     const auto max_flow_to_node = [&](int target, int removed_edge) {
         if (target <= 0 || target >= node_count) {
             return 0.0;
@@ -2087,11 +2286,21 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
 
     cv::Mat dense_flow_u16 = normalized_dt_u16(dense_flow);
     cv::Mat graph_edge_flow(white_domain.size(), CV_8U, cv::Scalar(0));
+    cv::Mat graph_source_edges(white_domain.size(), CV_8U, cv::Scalar(0));
     double max_edge_flow = 0.0;
+    float finite_edge_flow_min = std::numeric_limits<float>::max();
+    float finite_edge_flow_max = 0.0f;
+    int finite_edge_flow_count = 0;
     for (float value : edge_flow) {
         if (value < kDenseFlowInf * 0.5f) {
+            finite_edge_flow_min = std::min(finite_edge_flow_min, value);
+            finite_edge_flow_max = std::max(finite_edge_flow_max, value);
+            ++finite_edge_flow_count;
             max_edge_flow = std::max(max_edge_flow, static_cast<double>(value));
         }
+    }
+    if (finite_edge_flow_count == 0) {
+        finite_edge_flow_min = 0.0f;
     }
     if (max_edge_flow <= 0.0) {
         max_edge_flow = 1.0;
@@ -2107,9 +2316,22 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                                     255.0f));
         draw_graph_edge(graph_edge_flow, graph.edges[edge_index],
                         cv::Scalar(value));
+        if (source_edges[edge_index] != 0) {
+            draw_graph_edge(graph_source_edges, graph.edges[edge_index],
+                            cv::Scalar(255));
+        }
     }
 
-    return {dense_flow, dense_flow_u16, graph_edge_flow, timings};
+    return {dense_flow,
+            dense_flow_u16,
+            graph_edge_flow,
+            graph_source_edges,
+            source_edge_count,
+            seeded_node_count,
+            finite_edge_flow_min,
+            finite_edge_flow_max,
+            finite_edge_flow_count,
+            timings};
 }
 
 cv::Mat to_bgr_layer(const cv::Mat& image) {
@@ -2564,6 +2786,8 @@ int main(int argc, char** argv) {
                         dense_flow_result.dense_flow_u16);
             write_image(workdir / (stem + "_graph_edge_flow.tif"),
                         dense_flow_result.graph_edge_flow);
+            write_image(workdir / (stem + "_graph_source_edges.tif"),
+                        dense_flow_result.graph_source_edges);
             timings.push_back(finish_timing("dense_flow_write", timing));
         }
 
@@ -2582,6 +2806,9 @@ int main(int argc, char** argv) {
             layered_tiff.push_back(
                 {"graph_edge_flow",
                  to_bgr_layer(dense_flow_result.graph_edge_flow)});
+            layered_tiff.push_back(
+                {"graph_source_edges",
+                 to_bgr_layer(dense_flow_result.graph_source_edges)});
         }
         {
             const TimingMark timing = start_timing();
@@ -2598,6 +2825,22 @@ int main(int argc, char** argv) {
                                                : 0)
                   << "\n"
                   << "  graph_edges: " << graph.edges.size() << "\n";
+        if (has_dense_flow) {
+            std::cout << "Dense flow:\n"
+                      << "  source_edges: "
+                      << dense_flow_result.source_edges << " / "
+                      << graph.edges.size() << "\n"
+                      << "  seeded_nodes: "
+                      << dense_flow_result.seeded_nodes << " / "
+                      << (graph.nodes.size() > 0 ? graph.nodes.size() - 1 : 0)
+                      << "\n"
+                      << "  finite_edge_flows: "
+                      << dense_flow_result.finite_edge_flows << "\n"
+                      << "  finite_edge_flow_min: "
+                      << dense_flow_result.finite_edge_flow_min << "\n"
+                      << "  finite_edge_flow_max: "
+                      << dense_flow_result.finite_edge_flow_max << "\n";
+        }
 
         std::cout << "Wrote:\n"
                   << "  " << (workdir / (stem + "_binary.tif")) << "\n"
@@ -2652,6 +2895,8 @@ int main(int argc, char** argv) {
                       << "  " << (workdir / (stem + "_dense_flow_u16.tif"))
                       << "\n"
                       << "  " << (workdir / (stem + "_graph_edge_flow.tif"))
+                      << "\n"
+                      << "  " << (workdir / (stem + "_graph_source_edges.tif"))
                       << "\n";
         }
     } catch (const std::exception& e) {
