@@ -4,6 +4,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <cstdint>
 #include <iosfwd>
 #include <vector>
 
@@ -23,9 +24,13 @@ struct GrowthConfig {
     int rollout_width = 8;
     int rollout_depth = 2;
     int rollout_max_children = 4;
-    int rollout_area_weight = 100;
-    int rollout_inlier_weight = 1;
-    int rollout_connection_weight = 10;
+    int rollout_max_commits_per_generation = 1;
+    int rollout_min_separation = 3;
+    int64_t rollout_area_weight = 100;
+    int64_t rollout_inlier_weight = 1;
+    int64_t rollout_connection_weight = 10;
+    int64_t rollout_base_connection_weight = 0;
+    int64_t rollout_internal_connection_weight = 0;
 
     std::vector<cv::Vec2i> legacy_4_neighs;
     std::vector<cv::Vec2i> all_8_neighs;

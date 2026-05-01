@@ -1,6 +1,7 @@
 #include "GrowthConfig.hpp"
 
 #include <algorithm>
+#include <cstdint>
 #include <iostream>
 #include <string>
 #include <utility>
@@ -15,6 +16,13 @@ void append_unique_neigh(std::vector<cv::Vec2i>& neighs, const cv::Vec2i& value)
         }
     }
     neighs.push_back(value);
+}
+
+int64_t nonnegative_int64_param(const nlohmann::json& params,
+                                const char* key,
+                                int64_t default_value)
+{
+    return std::max<int64_t>(0, params.value(key, default_value));
 }
 
 } // namespace
@@ -69,9 +77,15 @@ GrowthConfig parse_growth_config(const nlohmann::json& params, bool bidirectiona
     config.rollout_width = std::max(1, params.value("rollout_width", 8));
     config.rollout_depth = std::max(1, params.value("rollout_depth", 2));
     config.rollout_max_children = std::max(1, params.value("rollout_max_children", 4));
-    config.rollout_area_weight = std::max(0, params.value("rollout_area_weight", 100));
-    config.rollout_inlier_weight = std::max(0, params.value("rollout_inlier_weight", 1));
-    config.rollout_connection_weight = std::max(0, params.value("rollout_connection_weight", 10));
+    config.rollout_max_commits_per_generation =
+        std::max(1, params.value("rollout_max_commits_per_generation", 1));
+    config.rollout_min_separation =
+        std::max(0, params.value("rollout_min_separation", config.rollout_depth + 1));
+    config.rollout_area_weight = nonnegative_int64_param(params, "rollout_area_weight", 100);
+    config.rollout_inlier_weight = nonnegative_int64_param(params, "rollout_inlier_weight", 1);
+    config.rollout_connection_weight = nonnegative_int64_param(params, "rollout_connection_weight", 10);
+    config.rollout_base_connection_weight = nonnegative_int64_param(params, "rollout_base_connection_weight", 0);
+    config.rollout_internal_connection_weight = nonnegative_int64_param(params, "rollout_internal_connection_weight", 0);
 
     if (config.has_growth_directions) {
         config.grow_down = config.grow_right = config.grow_up = config.grow_left = false;
@@ -136,8 +150,12 @@ void GrowthConfig::log(std::ostream& out, int stop_gen) const
             << " width=" << rollout_width
             << " depth=" << rollout_depth
             << " max_children=" << rollout_max_children
+            << " max_commits_per_generation=" << rollout_max_commits_per_generation
+            << " min_separation=" << rollout_min_separation
             << " area_weight=" << rollout_area_weight
             << " inlier_weight=" << rollout_inlier_weight
-            << " connection_weight=" << rollout_connection_weight << std::endl;
+            << " connection_weight=" << rollout_connection_weight
+            << " base_connection_weight=" << rollout_base_connection_weight
+            << " internal_connection_weight=" << rollout_internal_connection_weight << std::endl;
     }
 }

@@ -129,6 +129,25 @@ static int inlier_base_threshold = 20;     // Starting threshold for inliers
 static int inlier_threshold_drop_step = 2; // Maximum retry drop per stalled generation
 static constexpr int rollout_warmup_generations = 30;
 
+static double deterministic_probe_noise(uint32_t y, uint32_t x, uint32_t salt)
+{
+    uint32_t v = y * 0x9E3779B9u ^ x * 0x85EBCA6Bu ^ salt * 0xC2B2AE35u;
+    v ^= v >> 16;
+    v *= 0x7FEB352Du;
+    v ^= v >> 15;
+    v *= 0x846CA68Bu;
+    v ^= v >> 16;
+    return static_cast<double>(v & 0xFFFFu) / 32768.0 - 1.0;
+}
+
+static cv::Vec2d deterministic_probe_jitter(const cv::Vec2i& p)
+{
+    return {
+        deterministic_probe_noise(static_cast<uint32_t>(p[0]), static_cast<uint32_t>(p[1]), 0),
+        deterministic_probe_noise(static_cast<uint32_t>(p[0]), static_cast<uint32_t>(p[1]), 1)
+    };
+}
+
 static void copy(const SurfTrackerData &src, SurfTrackerData &tgt, const cv::Rect &roi_)
 {
     cv::Rect roi(roi_.y,roi_.x,roi_.height,roi_.width);
@@ -1728,9 +1747,10 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             cv::Vec2d loc{-1, -1};
             int inliers = -1;
             bool ref_seed = false;
+            bool approved = false;
         };
         struct RolloutResult {
-            int score = std::numeric_limits<int>::min();
+            int64_t score = std::numeric_limits<int64_t>::min();
             std::vector<RolloutProbe> accepted_probes;
         };
         auto probe_candidate = [&](const cv::Vec2i& p,
@@ -1749,12 +1769,21 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 return probe;
 
             constexpr int r = 1;
-            std::set<QuadSurface *> local_surfs = {seed};
+            std::vector<QuadSurface*> local_surfs;
+            local_surfs.reserve(8);
+            auto add_local_surf = [&](QuadSurface* surf) {
+                if (surf && std::find(local_surfs.begin(), local_surfs.end(), surf) == local_surfs.end()) {
+                    local_surfs.push_back(surf);
+                }
+            };
+            add_local_surf(seed);
             for(int oy=std::max(p[0]-r,0);oy<=std::min(p[0]+r,h-1);oy++)
                 for(int ox=std::max(p[1]-r,0);ox<=std::min(p[1]+r,w-1);ox++)
                     if (probe_state(oy,ox) & STATE_LOC_VALID) {
                         auto p_surfs = probe_data.surfsC({oy,ox});
-                        local_surfs.insert(p_surfs.begin(), p_surfs.end());
+                        for (auto* surf : p_surfs) {
+                            add_local_surf(surf);
+                        }
                     }
 
             cv::Vec3d best_coord = {-1,-1,-1};
@@ -1762,6 +1791,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             QuadSurface *best_surf = nullptr;
             cv::Vec2d best_loc = {-1,-1};
             bool best_ref_seed = false;
+            bool best_approved = false;
 
             for(auto ref_surf : local_surfs) {
                 int ref_count = 0;
@@ -1780,7 +1810,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                     continue;
 
                 avg /= ref_count;
-                probe_data.loc(ref_surf,p) = avg;
+                const uint8_t probe_state_old = probe_state(p);
+                probe_data.loc(ref_surf,p) = avg + deterministic_probe_jitter(p);
                 probe_state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
 
                 ceres::Problem problem;
@@ -1802,12 +1833,12 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 }
 
                 if (fail) {
-                    probe_state(p) = 0;
+                    probe_state(p) = probe_state_old;
                     probe_data.erase(ref_surf, p);
                     continue;
                 }
 
-                probe_state(p) = 0;
+                probe_state(p) = probe_state_old;
                 int inliers_sum = 0;
                 int inliers_count = 0;
 
@@ -1825,6 +1856,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                     best_surf = ref_surf;
                     best_loc = ref_loc;
                     best_ref_seed = ref_seed;
+                    best_approved = true;
                     probe_data.erase(ref_surf, p);
                     break;
                 }
@@ -1839,7 +1871,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                         cv::Vec3f loc = test_surf->loc_raw(ptr);
                         probe_data.loc(test_surf, p) = {loc[1], loc[0]};
                         float cost = local_cost(test_surf, p, probe_data, probe_state, probe_points, step, src_step, &count, &straight_count, &coord);
-                        probe_state(p) = 0;
+                        probe_state(p) = probe_state_old;
                         probe_data.erase(test_surf, p);
                         if (cost < local_cost_inl_th && (ref_seed || (count >= 2 && straight_count >= straight_min_count))) {
                             inliers_sum += count;
@@ -1857,6 +1889,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                     best_surf = ref_surf;
                     best_loc = ref_loc;
                     best_ref_seed = ref_seed;
+                    best_approved = false;
                 }
                 probe_data.erase(ref_surf, p);
             }
@@ -1881,15 +1914,16 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 probe.loc = best_loc;
                 probe.inliers = best_inliers;
                 probe.ref_seed = best_ref_seed;
+                probe.approved = best_approved;
             }
             return probe;
         };
-        auto commit_rollout_probe = [&](const RolloutProbe& probe,
-                                        SurfTrackerData& rollout_data,
-                                        cv::Mat_<uint8_t>& rollout_state,
-                                        cv::Mat_<cv::Vec3d>& rollout_points,
-                                        cv::Rect& rollout_used_area,
-                                        std::vector<cv::Vec2i>& rollout_frontier) {
+        auto commit_rollout_probe_speculative = [&](const RolloutProbe& probe,
+                                                    SurfTrackerData& rollout_data,
+                                                    cv::Mat_<uint8_t>& rollout_state,
+                                                    cv::Mat_<cv::Vec3d>& rollout_points,
+                                                    cv::Rect& rollout_used_area,
+                                                    std::vector<cv::Vec2i>& rollout_frontier) {
             if (!probe.accepted || !probe.surf)
                 return false;
             rollout_data.surfs(probe.p).insert(probe.surf);
@@ -1917,6 +1951,136 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             rollout_frontier.push_back(probe.p);
             return true;
         };
+        auto commit_rollout_probe_final = [&](const RolloutProbe& probe,
+                                              std::vector<cv::Vec2i>& rollout_frontier) {
+            if (!probe.accepted || !probe.surf || (state(probe.p) & STATE_LOC_VALID))
+                return false;
+            if (probe.coord[0] == -1)
+                throw std::runtime_error("oops rollout probe coord[0]");
+
+            constexpr int r = 1;
+            std::vector<QuadSurface*> local_surfs;
+            local_surfs.reserve(8);
+            auto add_local_surf = [&](QuadSurface* surf) {
+                if (surf && std::find(local_surfs.begin(), local_surfs.end(), surf) == local_surfs.end()) {
+                    local_surfs.push_back(surf);
+                }
+            };
+            add_local_surf(seed);
+            for(int oy=std::max(probe.p[0]-r,0);oy<=std::min(probe.p[0]+r,h-1);oy++)
+                for(int ox=std::max(probe.p[1]-r,0);ox<=std::min(probe.p[1]+r,w-1);ox++)
+                    if (state(oy,ox) & STATE_LOC_VALID) {
+                        auto p_surfs = data.surfsC({oy,ox});
+                        for (auto* surf : p_surfs) {
+                            add_local_surf(surf);
+                        }
+                    }
+
+            if (probe.approved && used_approved_names.insert(probe.surf->id).second) {
+                std::cout << "found approved sm " << probe.surf->id << std::endl;
+                approved_log << probe.surf->id << std::endl;
+                approved_log.flush();
+            }
+
+            data.surfs(probe.p).insert(probe.surf);
+            data.loc(probe.surf, probe.p) = probe.loc;
+            state(probe.p) = STATE_LOC_VALID | STATE_COORD_VALID;
+            points(probe.p) = probe.coord;
+
+            ceres::Problem problem;
+            surftrack_add_local(probe.surf, probe.p, data, problem, state, points, step, src_step, SURF_LOSS | LOSS_ZLOC);
+
+            std::vector<SurfacePatchIndex::LookupResult> more_local_hits;
+            for(auto test_surf : local_surfs) {
+                if (test_surf == probe.surf)
+                    continue;
+
+                auto ptr = test_surf->pointer();
+                if (test_surf->pointTo(ptr, probe.coord, same_surface_th, 10,
+                                                   surface_patch_index_ptr) <= same_surface_th) {
+                    cv::Vec3f loc = test_surf->loc_raw(ptr);
+                    data.loc(test_surf, probe.p) = {loc[1], loc[0]};
+                    int count = 0;
+                    float cost = local_cost(test_surf, probe.p, data, state, points, step, src_step, &count);
+                    if (cost < local_cost_inl_th) {
+                        data.surfs(probe.p).insert(test_surf);
+                        surftrack_add_local(test_surf, probe.p, data, problem, state, points, step, src_step, SURF_LOSS | LOSS_ZLOC);
+                    }
+                    else {
+                        data.erase(test_surf, probe.p);
+                    }
+                }
+            }
+
+            for (auto hit : surface_patch_hits(surface_patch_index_ptr, probe.coord, probe.surf)) {
+                QuadSurface* s = hit.surface.get();
+                if (s && std::find(local_surfs.begin(), local_surfs.end(), s) == local_surfs.end()) {
+                    more_local_hits.push_back(std::move(hit));
+                }
+            }
+
+            ceres::Solver::Summary summary;
+            ceres::Solve(options, &problem, &summary);
+
+            for(const auto& hit : more_local_hits) {
+                QuadSurface* test_surf = hit.surface.get();
+                if (!test_surf) {
+                    continue;
+                }
+                cv::Vec3f loc = test_surf->loc_raw(hit.ptr);
+                cv::Vec3f coord = SurfTrackerData::lookup_int_loc(test_surf, {loc[1], loc[0]});
+                if (coord[0] == -1) {
+                    continue;
+                }
+                int count = 0;
+                float cost = local_cost_destructive(test_surf, probe.p, data, state, points, step, src_step, loc, &count);
+                if (cost < local_cost_inl_th) {
+                    data.loc(test_surf, probe.p) = {loc[1], loc[0]};
+                    data.surfs(probe.p).insert(test_surf);
+                }
+            }
+
+            if (!used_area.contains(cv::Point(probe.p[1], probe.p[0]))) {
+                used_area = used_area | cv::Rect(probe.p[1],probe.p[0],1,1);
+            }
+            rollout_frontier.push_back(probe.p);
+            return true;
+        };
+        auto completes_existing_l_shape = [&](const cv::Vec2i& p) {
+            const cv::Vec2i block_origins[] = {
+                p,
+                p + cv::Vec2i{-1, 0},
+                p + cv::Vec2i{0, -1},
+                p + cv::Vec2i{-1, -1},
+            };
+            for (const cv::Vec2i& origin : block_origins) {
+                int valid_count = 0;
+                bool contains_p = false;
+                for (int dy = 0; dy <= 1; ++dy) {
+                    for (int dx = 0; dx <= 1; ++dx) {
+                        const cv::Vec2i q = origin + cv::Vec2i{dy, dx};
+                        if (q == p) {
+                            contains_p = true;
+                            continue;
+                        }
+                        if (q[0] < 0 || q[0] >= state.rows ||
+                            q[1] < 0 || q[1] >= state.cols ||
+                            (state(q) & STATE_LOC_VALID) == 0) {
+                            valid_count = -1;
+                            break;
+                        }
+                        valid_count++;
+                    }
+                    if (valid_count < 0) {
+                        break;
+                    }
+                }
+                if (contains_p && valid_count == 3) {
+                    return true;
+                }
+            }
+            return false;
+        };
         auto rollout_score_root = [&](const cv::Vec2i& root) {
             RolloutResult result;
             SurfTrackerData rollout_data = data;
@@ -1924,9 +2088,14 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             cv::Mat_<cv::Vec3d> rollout_points = points.clone();
             cv::Rect rollout_used_area = used_area;
             std::vector<cv::Vec2i> frontier;
-            int accepted_count = 0;
-            int inlier_sum = 0;
-            int connection_sum = 0;
+            int64_t accepted_count = 0;
+            int64_t inlier_sum = 0;
+            int64_t connection_sum = 0;
+            int64_t base_connection_sum = 0;
+            int64_t internal_connection_sum = 0;
+            std::vector<cv::Vec2i> rollout_accepted;
+            rollout_accepted.reserve(static_cast<std::size_t>(
+                1 + growth_config.rollout_depth * growth_config.rollout_max_children));
             auto rollout_valid_neighbors = [&](const cv::Vec2i& p) {
                 int count = 0;
                 for (const auto& n : growth_config.all_8_neighs) {
@@ -1939,107 +2108,279 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 }
                 return count;
             };
+            auto rollout_base_neighbors = [&](const cv::Vec2i& p) {
+                int count = 0;
+                for (const auto& n : growth_config.all_8_neighs) {
+                    const cv::Vec2i pn = p + n;
+                    if (pn[0] >= 0 && pn[0] < state.rows &&
+                        pn[1] >= 0 && pn[1] < state.cols &&
+                        (state(pn) & STATE_LOC_VALID)) {
+                        count++;
+                    }
+                }
+                return count;
+            };
+            auto rollout_internal_neighbors = [&](const cv::Vec2i& p) {
+                int count = 0;
+                for (const auto& n : growth_config.all_8_neighs) {
+                    const cv::Vec2i pn = p + n;
+                    if (std::find(rollout_accepted.begin(), rollout_accepted.end(), pn) != rollout_accepted.end()) {
+                        count++;
+                    }
+                }
+                return count;
+            };
 
             RolloutProbe root_probe = probe_candidate(root, rollout_data, rollout_state, rollout_points, rollout_used_area, false);
             if (!root_probe.accepted)
                 return result;
-            if (!commit_rollout_probe(root_probe, rollout_data, rollout_state, rollout_points, rollout_used_area, frontier))
+            if (!commit_rollout_probe_speculative(root_probe, rollout_data, rollout_state, rollout_points, rollout_used_area, frontier))
                 return result;
             result.accepted_probes.push_back(root_probe);
             accepted_count++;
             inlier_sum += std::max(0, root_probe.inliers);
+            rollout_accepted.push_back(root);
             connection_sum += static_cast<int>(rollout_data.surfs(root).size()) + rollout_valid_neighbors(root);
+            base_connection_sum += rollout_base_neighbors(root);
+            internal_connection_sum += rollout_internal_neighbors(root);
 
             for (int depth = 1; depth < growth_config.rollout_depth && !frontier.empty(); ++depth) {
-                std::vector<cv::Vec2i> next_candidates;
-                std::unordered_set<cv::Vec2i, vec2i_hash> seen_next;
+                struct RolloutCandidate {
+                    cv::Vec2i p;
+                    int valid_neighbors = 0;
+                };
+                std::vector<RolloutCandidate> next_candidates;
+                std::vector<cv::Vec2i> seen_next;
+                next_candidates.reserve(frontier.size() * growth_config.neighs.size());
+                seen_next.reserve(frontier.size() * growth_config.neighs.size());
                 for (const cv::Vec2i& p : frontier) {
                     for (const cv::Vec2i& n : growth_config.neighs) {
                         const cv::Vec2i pn = p + n;
                         if (!save_bounds_inv.contains(cv::Point(pn)) ||
                             (rollout_state(pn) & STATE_LOC_VALID) ||
-                            !seen_next.insert(pn).second) {
+                            std::find(seen_next.begin(), seen_next.end(), pn) != seen_next.end()) {
                             continue;
                         }
-                        next_candidates.push_back(pn);
+                        seen_next.push_back(pn);
+                        next_candidates.push_back({pn, rollout_valid_neighbors(pn)});
                     }
                 }
-                std::sort(next_candidates.begin(), next_candidates.end(), [&](const cv::Vec2i& a, const cv::Vec2i& b) {
-                    const int ac = rollout_valid_neighbors(a);
-                    const int bc = rollout_valid_neighbors(b);
-                    if (ac != bc)
-                        return ac > bc;
-                    if (a[0] != b[0])
-                        return a[0] < b[0];
-                    return a[1] < b[1];
+                std::sort(next_candidates.begin(), next_candidates.end(), [](const RolloutCandidate& a, const RolloutCandidate& b) {
+                    if (a.valid_neighbors != b.valid_neighbors)
+                        return a.valid_neighbors > b.valid_neighbors;
+                    if (a.p[0] != b.p[0])
+                        return a.p[0] < b.p[0];
+                    return a.p[1] < b.p[1];
                 });
                 if (static_cast<int>(next_candidates.size()) > growth_config.rollout_max_children) {
                     next_candidates.resize(static_cast<std::size_t>(growth_config.rollout_max_children));
                 }
                 std::vector<cv::Vec2i> next_frontier;
-                for (const cv::Vec2i& p : next_candidates) {
-                    RolloutProbe probe = probe_candidate(p, rollout_data, rollout_state, rollout_points, rollout_used_area, false);
-                    if (!commit_rollout_probe(probe, rollout_data, rollout_state, rollout_points, rollout_used_area, next_frontier))
+                for (const RolloutCandidate& candidate : next_candidates) {
+                    RolloutProbe probe = probe_candidate(candidate.p, rollout_data, rollout_state, rollout_points, rollout_used_area, false);
+                    if (!commit_rollout_probe_speculative(probe, rollout_data, rollout_state, rollout_points, rollout_used_area, next_frontier))
                         continue;
                     result.accepted_probes.push_back(probe);
                     accepted_count++;
                     inlier_sum += std::max(0, probe.inliers);
-                    connection_sum += static_cast<int>(rollout_data.surfs(p).size()) + rollout_valid_neighbors(p);
+                    rollout_accepted.push_back(candidate.p);
+                    connection_sum += static_cast<int>(rollout_data.surfs(candidate.p).size()) + rollout_valid_neighbors(candidate.p);
+                    base_connection_sum += rollout_base_neighbors(candidate.p);
+                    internal_connection_sum += rollout_internal_neighbors(candidate.p);
                 }
                 frontier = std::move(next_frontier);
             }
 
             result.score = accepted_count * growth_config.rollout_area_weight +
                            inlier_sum * growth_config.rollout_inlier_weight +
-                           connection_sum * growth_config.rollout_connection_weight;
+                           connection_sum * growth_config.rollout_connection_weight +
+                           base_connection_sum * growth_config.rollout_base_connection_weight +
+                           internal_connection_sum * growth_config.rollout_internal_connection_weight;
             return result;
         };
-        if (growth_config.rollout_growth &&
-            generation >= rollout_warmup_generations &&
-            !candidate_ordering.points.empty()) {
-            const std::size_t width = std::min<std::size_t>(
+        auto reset_candidate_processing = [&]() {
+            for (const cv::Vec2i& p : candidate_ordering.points) {
+                if (!(state(p) & STATE_LOC_VALID)) {
+                    state(p) = static_cast<uint8_t>(state(p) & ~STATE_PROCESSING);
+                }
+            }
+        };
+        const bool rollout_mode_active = growth_config.rollout_growth &&
+                                         generation >= rollout_warmup_generations &&
+                                         !candidate_ordering.points.empty();
+        if (rollout_mode_active) {
+            std::vector<cv::Vec2i> rollout_roots;
+            const std::size_t root_count = std::min<std::size_t>(
                 candidate_ordering.points.size(),
                 static_cast<std::size_t>(growth_config.rollout_width));
-            int best_score = std::numeric_limits<int>::min();
-            cv::Vec2i best_root = candidate_ordering.points.front();
-            std::vector<RolloutProbe> best_rollout_probes;
-            for (std::size_t idx = 0; idx < width; ++idx) {
-                const cv::Vec2i root = candidate_ordering.points[idx];
-                const RolloutResult rollout = rollout_score_root(root);
-                if (rollout.score > best_score ||
-                    (rollout.score == best_score && (root[0] < best_root[0] ||
-                                                     (root[0] == best_root[0] && root[1] < best_root[1])))) {
-                    best_score = rollout.score;
-                    best_root = root;
-                    best_rollout_probes = rollout.accepted_probes;
+            rollout_roots.reserve(root_count);
+            if (root_count == candidate_ordering.points.size()) {
+                rollout_roots = candidate_ordering.points;
+            } else {
+                std::vector<uint8_t> selected(candidate_ordering.points.size(), 0);
+                std::vector<int> nearest_dist_sq(candidate_ordering.points.size(), std::numeric_limits<int>::max());
+                auto select_root = [&](std::size_t idx) {
+                    selected[idx] = 1;
+                    const cv::Vec2i root = candidate_ordering.points[idx];
+                    rollout_roots.push_back(root);
+                    for (std::size_t cand_idx = 0; cand_idx < candidate_ordering.points.size(); ++cand_idx) {
+                        if (selected[cand_idx]) {
+                            nearest_dist_sq[cand_idx] = 0;
+                            continue;
+                        }
+                        const cv::Vec2i delta = candidate_ordering.points[cand_idx] - root;
+                        nearest_dist_sq[cand_idx] = std::min(nearest_dist_sq[cand_idx], delta.dot(delta));
+                    }
+                };
+
+                select_root(0);
+                while (rollout_roots.size() < root_count) {
+                    std::size_t best_idx = std::numeric_limits<std::size_t>::max();
+                    int best_dist_sq = -1;
+                    for (std::size_t idx = 0; idx < candidate_ordering.points.size(); ++idx) {
+                        if (selected[idx]) {
+                            continue;
+                        }
+                        if (nearest_dist_sq[idx] > best_dist_sq) {
+                            best_dist_sq = nearest_dist_sq[idx];
+                            best_idx = idx;
+                        }
+                    }
+                    if (best_idx == std::numeric_limits<std::size_t>::max()) {
+                        break;
+                    }
+                    select_root(best_idx);
                 }
             }
-            if (best_score != std::numeric_limits<int>::min()) {
-                std::cout << "rollout selected " << best_root
-                          << " score " << best_score
-                          << " with " << best_rollout_probes.size() << " accepted points"
-                          << " from " << width << " roots" << std::endl;
-                for (const cv::Vec2i& p : candidate_ordering.points) {
-                    if (!(state(p) & STATE_LOC_VALID)) {
-                        state(p) = static_cast<uint8_t>(state(p) & ~STATE_PROCESSING);
+            std::vector<RolloutResult> rollout_results(rollout_roots.size());
+#pragma omp parallel for schedule(dynamic)
+            for (int root_idx = 0; root_idx < static_cast<int>(rollout_roots.size()); ++root_idx) {
+                rollout_results[static_cast<std::size_t>(root_idx)] = rollout_score_root(rollout_roots[static_cast<std::size_t>(root_idx)]);
+            }
+            struct RankedRollout {
+                std::size_t root_idx = 0;
+                int64_t score = std::numeric_limits<int64_t>::min();
+            };
+            std::vector<RankedRollout> ranked_rollouts;
+            ranked_rollouts.reserve(rollout_roots.size());
+            for (std::size_t root_idx = 0; root_idx < rollout_roots.size(); ++root_idx) {
+                const RolloutResult& rollout = rollout_results[root_idx];
+                if (rollout.accepted_probes.size() == 1 &&
+                    !completes_existing_l_shape(rollout.accepted_probes.front().p)) {
+                    continue;
+                }
+                if (rollout.score == std::numeric_limits<int64_t>::min()) {
+                    continue;
+                }
+                ranked_rollouts.push_back({root_idx, rollout.score});
+            }
+            std::sort(ranked_rollouts.begin(), ranked_rollouts.end(),
+                [&](const RankedRollout& a, const RankedRollout& b) {
+                    if (a.score != b.score)
+                        return a.score > b.score;
+                    const cv::Vec2i& root_a = rollout_roots[a.root_idx];
+                    const cv::Vec2i& root_b = rollout_roots[b.root_idx];
+                    if (root_a[0] != root_b[0])
+                        return root_a[0] < root_b[0];
+                    return root_a[1] < root_b[1];
+                });
+            if (!ranked_rollouts.empty()) {
+                struct SelectedRollout {
+                    cv::Vec2i root;
+                    int64_t score = std::numeric_limits<int64_t>::min();
+                    std::vector<RolloutProbe> probes;
+                };
+                std::vector<SelectedRollout> selected_rollouts;
+                selected_rollouts.reserve(static_cast<std::size_t>(
+                    std::min(growth_config.rollout_max_commits_per_generation,
+                             static_cast<int>(ranked_rollouts.size()))));
+                std::vector<cv::Vec2i> selected_probe_points;
+                const int min_separation_sq = growth_config.rollout_min_separation *
+                                              growth_config.rollout_min_separation;
+                auto rollout_is_separated = [&](const RolloutResult& rollout) {
+                    if (min_separation_sq <= 0) {
+                        return true;
+                    }
+                    for (const RolloutProbe& probe : rollout.accepted_probes) {
+                        for (const cv::Vec2i& selected_p : selected_probe_points) {
+                            const cv::Vec2i delta = probe.p - selected_p;
+                            if (delta.dot(delta) < min_separation_sq) {
+                                return false;
+                            }
+                        }
+                    }
+                    return true;
+                };
+                for (const RankedRollout& ranked : ranked_rollouts) {
+                    if (static_cast<int>(selected_rollouts.size()) >=
+                        growth_config.rollout_max_commits_per_generation) {
+                        break;
+                    }
+                    const RolloutResult& rollout = rollout_results[ranked.root_idx];
+                    if (!rollout_is_separated(rollout)) {
+                        continue;
+                    }
+                    for (const RolloutProbe& probe : rollout.accepted_probes) {
+                        selected_probe_points.push_back(probe.p);
+                    }
+                    selected_rollouts.push_back({
+                        rollout_roots[ranked.root_idx],
+                        ranked.score,
+                        rollout.accepted_probes,
+                    });
+                }
+                std::cout << "rollout selected " << selected_rollouts.size()
+                          << " of " << ranked_rollouts.size()
+                          << " valid rollouts from " << rollout_roots.size()
+                          << " roots" << std::endl;
+                reset_candidate_processing();
+                int total_rollout_committed = 0;
+                for (const SelectedRollout& selected_rollout : selected_rollouts) {
+                    std::cout << "rollout selected root " << selected_rollout.root
+                              << " score " << selected_rollout.score
+                              << " with " << selected_rollout.probes.size()
+                              << " accepted points" << std::endl;
+                    std::vector<RolloutProbe> live_rollout_probes;
+                    live_rollout_probes.reserve(selected_rollout.probes.size());
+                    for (const RolloutProbe& probe : selected_rollout.probes) {
+                        RolloutProbe live_probe = probe_candidate(probe.p, data, state, points, used_area, false);
+                        if (live_probe.accepted && live_probe.surf) {
+                            live_rollout_probes.push_back(live_probe);
+                        }
+                    }
+                    if (live_rollout_probes.size() == 1 &&
+                        !completes_existing_l_shape(live_rollout_probes.front().p)) {
+                        std::cout << "rollout rejected one non-L point after live revalidation" << std::endl;
+                        live_rollout_probes.clear();
+                    }
+                    std::vector<cv::Vec2i> rollout_frontier_committed;
+                    int rollout_committed = 0;
+                    for (const RolloutProbe& live_probe : live_rollout_probes) {
+                        if (!commit_rollout_probe_final(live_probe, rollout_frontier_committed))
+                            continue;
+                        generations(live_probe.p) = static_cast<uint16_t>(std::min(generation + 1, static_cast<int>(std::numeric_limits<uint16_t>::max())));
+                        inliers_sum_dbg(live_probe.p) = live_probe.inliers;
+                        for(int t=0;t<omp_get_max_threads();t++)
+                            added_points_threads[t].push_back(live_probe.p);
+                        fringe.insert(live_probe.p);
+                        succ++;
+                        rollout_committed++;
+                    }
+                    total_rollout_committed += rollout_committed;
+                    if (rollout_committed != static_cast<int>(selected_rollout.probes.size())) {
+                        std::cout << "rollout committed " << rollout_committed
+                                  << " of " << selected_rollout.probes.size()
+                                  << " after live revalidation" << std::endl;
                     }
                 }
-                std::vector<cv::Vec2i> rollout_frontier_committed;
-                for (const RolloutProbe& probe : best_rollout_probes) {
-                    if (state(probe.p) & STATE_LOC_VALID)
-                        continue;
-                    if (!commit_rollout_probe(probe, data, state, points, used_area, rollout_frontier_committed))
-                        continue;
-                    generations(probe.p) = static_cast<uint16_t>(std::min(generation + 1, static_cast<int>(std::numeric_limits<uint16_t>::max())));
-                    inliers_sum_dbg(probe.p) = probe.inliers;
-                    for(int t=0;t<omp_get_max_threads();t++)
-                        added_points_threads[t].push_back(probe.p);
-                    fringe.insert(probe.p);
-                    succ++;
+                if (total_rollout_committed > 0) {
+                    used_area_hr = scaled_rect_trunc(used_area, step);
                 }
-                used_area_hr = scaled_rect_trunc(used_area, step);
-                candidate_ordering.points.clear();
             }
+            else {
+                reset_candidate_processing();
+            }
+            candidate_ordering.points.clear();
         }
         int best_inliers_gen = 0;
         OmpThreadPointCol threadcol(3, candidate_ordering.points);
@@ -2237,6 +2578,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             if (best_inliers >= curr_best_inl_th || best_ref_seed) {
                 if (best_coord[0] == -1)
                     throw std::runtime_error("oops best_cord[0]");
+                if (rollout_mode_active && !completes_existing_l_shape(p))
+                    continue;
 
                 data_th.surfs(p).insert(best_surf);
                 data_th.loc(best_surf, p) = best_loc;
