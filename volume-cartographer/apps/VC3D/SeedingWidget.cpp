@@ -29,10 +29,98 @@
 #include <fstream>
 #include <algorithm>
 #include <functional>
+#include <utility>
 
 using PathPrimitive = ViewerOverlayControllerBase::PathPrimitive;
 using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 using PathRenderMode = ViewerOverlayControllerBase::PathRenderMode;
+
+namespace {
+enum class RayPlane {
+    XY,
+    XZ,
+    YZ,
+};
+
+RayPlane rayPlaneFromNormal(const cv::Vec3f& normal)
+{
+    const float ax = std::abs(normal[0]);
+    const float ay = std::abs(normal[1]);
+    const float az = std::abs(normal[2]);
+
+    if (ax >= ay && ax >= az) {
+        return RayPlane::YZ;
+    }
+    if (ay >= ax && ay >= az) {
+        return RayPlane::XZ;
+    }
+    return RayPlane::XY;
+}
+
+QString rayPlaneLabel(RayPlane plane)
+{
+    switch (plane) {
+    case RayPlane::XZ:
+        return QStringLiteral("XZ");
+    case RayPlane::YZ:
+        return QStringLiteral("YZ");
+    case RayPlane::XY:
+    default:
+        return QStringLiteral("XY");
+    }
+}
+
+cv::Vec3f pointOnRayPlane(const cv::Vec3f& startPoint,
+                          const cv::Vec2f& rayDir,
+                          float distance,
+                          RayPlane plane)
+{
+    switch (plane) {
+    case RayPlane::XZ:
+        return {startPoint[0] + distance * rayDir[0],
+                startPoint[1],
+                startPoint[2] + distance * rayDir[1]};
+    case RayPlane::YZ:
+        return {startPoint[0],
+                startPoint[1] + distance * rayDir[0],
+                startPoint[2] + distance * rayDir[1]};
+    case RayPlane::XY:
+    default:
+        return {startPoint[0] + distance * rayDir[0],
+                startPoint[1] + distance * rayDir[1],
+                startPoint[2]};
+    }
+}
+
+cv::Vec3f planeSamplePoint(int col, int row, const cv::Vec3f& startPoint, RayPlane plane)
+{
+    switch (plane) {
+    case RayPlane::XZ:
+        return {static_cast<float>(col), startPoint[1], static_cast<float>(row)};
+    case RayPlane::YZ:
+        return {startPoint[0], static_cast<float>(col), static_cast<float>(row)};
+    case RayPlane::XY:
+    default:
+        return {static_cast<float>(col), static_cast<float>(row), startPoint[2]};
+    }
+}
+
+cv::Vec2i distanceTransformPixel(const cv::Vec3f& point, RayPlane plane)
+{
+    switch (plane) {
+    case RayPlane::XZ:
+        return {static_cast<int>(std::round(point[0])),
+                static_cast<int>(std::round(point[2]))};
+    case RayPlane::YZ:
+        return {static_cast<int>(std::round(point[1])),
+                static_cast<int>(std::round(point[2]))};
+    case RayPlane::XY:
+    default:
+        return {static_cast<int>(std::round(point[0])),
+                static_cast<int>(std::round(point[1]))};
+    }
+}
+} // namespace
 
 
 
@@ -453,6 +541,7 @@ void SeedingWidget::onPreviewRaysClicked()
     const int numSteps = static_cast<int>(360.0 / angleStep);
     const int maxRadius = maxRadiusSpinBox->value();
     const cv::Vec3f& startPoint = focus_poi->p;
+    const RayPlane rayPlane = rayPlaneFromNormal(focus_poi->n);
 
     std::vector<cv::Vec3f> preview_points;
 
@@ -463,11 +552,7 @@ void SeedingWidget::onPreviewRaysClicked()
 
         for (int j = 1; j <= pointsPerRay; ++j) {
             const float dist = (static_cast<float>(j) / pointsPerRay) * maxRadius;
-            cv::Vec3f pointOnRay;
-            pointOnRay[0] = startPoint[0] + dist * rayDir[0];
-            pointOnRay[1] = startPoint[1] + dist * rayDir[1];
-            pointOnRay[2] = startPoint[2];
-            preview_points.push_back(pointOnRay);
+            preview_points.push_back(pointOnRayPlane(startPoint, rayDir, dist, rayPlane));
         }
     }
 
@@ -475,7 +560,9 @@ void SeedingWidget::onPreviewRaysClicked()
         _point_collection->addPoints("ray_preview", preview_points);
     }
 
-    infoLabel->setText(QString("Previewing %1 rays.").arg(numSteps));
+    infoLabel->setText(QString("Previewing %1 %2-plane rays.")
+                           .arg(numSteps)
+                           .arg(rayPlaneLabel(rayPlane)));
 }
 
 void SeedingWidget::onCastRaysClicked()
@@ -509,12 +596,16 @@ void SeedingWidget::onCastRaysClicked()
     const int zSlice = currentZSlice;
     const cv::Vec3f startPoint = _castRaysWasPointMode
         ? _state->poi("focus")->p : cv::Vec3f(0, 0, 0);
+    const cv::Vec3f distanceTransformAnchor = _castRaysWasPointMode
+        ? startPoint : cv::Vec3f(0, 0, static_cast<float>(zSlice));
+    const RayPlane rayPlane = _castRaysWasPointMode
+        ? rayPlaneFromNormal(_state->poi("focus")->n) : RayPlane::XY;
     const QList<PathPrimitive> pathsCopy = paths;  // snapshot for draw mode
 
     // Disable button, show status
     castRaysButton->setEnabled(false);
-    infoLabel->setText("Computing rays...");
-    emit sendStatusMessageAvailable("Computing rays...", 0);
+    infoLabel->setText(QString("Computing %1-plane rays...").arg(rayPlaneLabel(rayPlane)));
+    emit sendStatusMessageAvailable(QString("Computing %1-plane rays...").arg(rayPlaneLabel(rayPlane)), 0);
 
     // Clear previous results
     _castRaysPeaks.clear();
@@ -522,17 +613,25 @@ void SeedingWidget::onCastRaysClicked()
     // Launch background computation
     auto future = QtConcurrent::run(
         [this, currentVolume, angleStep, maxRadius, threshold,
-         zSlice, startPoint, pathsCopy]() {
+         startPoint, distanceTransformAnchor, rayPlane, pathsCopy]() {
 
         // --- Compute distance transform ---
-        const int width = currentVolume->sliceWidth();
-        const int height = currentVolume->sliceHeight();
+        const auto [volumeWidth, volumeHeight, volumeDepth] = currentVolume->shape();
+        int planeWidth = currentVolume->sliceWidth();
+        int planeHeight = currentVolume->sliceHeight();
+        if (rayPlane == RayPlane::XZ) {
+            planeWidth = static_cast<int>(volumeWidth);
+            planeHeight = static_cast<int>(volumeDepth);
+        } else if (rayPlane == RayPlane::YZ) {
+            planeWidth = static_cast<int>(volumeHeight);
+            planeHeight = static_cast<int>(volumeDepth);
+        }
 
-        cv::Mat_<uint8_t> sliceData(height, width);
-        cv::Mat_<cv::Vec3f> coords(height, width);
-        for (int y = 0; y < height; y++) {
-            for (int x = 0; x < width; x++) {
-                coords(y, x) = cv::Vec3f(x, y, zSlice);
+        cv::Mat_<uint8_t> sliceData(planeHeight, planeWidth);
+        cv::Mat_<cv::Vec3f> coords(planeHeight, planeWidth);
+        for (int y = 0; y < planeHeight; y++) {
+            for (int x = 0; x < planeWidth; x++) {
+                coords(y, x) = planeSamplePoint(x, y, distanceTransformAnchor, rayPlane);
             }
         }
         currentVolume->sample(sliceData, coords, vc::SampleParams{});
@@ -546,8 +645,9 @@ void SeedingWidget::onCastRaysClicked()
         // --- Helper lambdas ---
         auto sampleDistAt = [&](const cv::Vec3f& p) -> float {
             if (dt.empty()) return 0.0f;
-            int px = std::max(0, std::min(dt.cols - 1, int(std::round(p[0]))));
-            int py = std::max(0, std::min(dt.rows - 1, int(std::round(p[1]))));
+            const cv::Vec2i dtPixel = distanceTransformPixel(p, rayPlane);
+            int px = std::max(0, std::min(dt.cols - 1, dtPixel[0]));
+            int py = std::max(0, std::min(dt.rows - 1, dtPixel[1]));
             return dt.at<float>(py, px);
         };
 
@@ -637,10 +737,7 @@ void SeedingWidget::onCastRaysClicked()
                 std::vector<cv::Vec3f> positions;
 
                 for (int dist = 1; dist < maxRadius; dist++) {
-                    cv::Vec3f point;
-                    point[0] = startPoint[0] + dist * rayDir[0];
-                    point[1] = startPoint[1] + dist * rayDir[1];
-                    point[2] = startPoint[2];
+                    cv::Vec3f point = pointOnRayPlane(startPoint, rayDir, static_cast<float>(dist), rayPlane);
 
                     if (point[0] < bx0 || point[0] >= bx1 ||
                         point[1] < by0 || point[1] >= by1 ||
