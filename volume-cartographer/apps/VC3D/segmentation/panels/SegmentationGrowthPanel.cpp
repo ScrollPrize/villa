@@ -496,54 +496,6 @@ SegmentationGrowthPanel::SegmentationGrowthPanel(const QString& settingsGroup, Q
         tr("Dist loss 3D"), 0.0, 100.0, 0.1, _patchDistLoss3dWeight, 2.0,
         patchHelp(tr("Weights neighbor-distance preservation in 3D volume coordinates."),
                   tr("Increase to keep 3D point spacing closer to the grid spacing; decrease to allow more stretch or compression.")));
-    _spinPatchSdir3dRadius = addIntParam(
-        tr("SDIR radius 3D"), 0, 8, 1, _patchSdir3dRadius, 0,
-        patchHelp(tr("Checks 3D symmetric-Dirichlet metric distortion across this many grid strides."),
-                  tr("Increase to catch broader 3D distortion; set to 0 to disable 3D metric preservation checks.")));
-    _spinPatchSdir3dWeight = addDoubleParam(
-        tr("SDIR weight 3D"), 0.0, 100.0, 0.1, _patchSdir3dWeight, 0.0,
-        patchHelp(tr("Weights local 3D metric-preservation constraints during per-point solves."),
-                  tr("Increase to resist local stretching or folding; decrease to let candidates follow patch evidence more freely.")));
-    _spinPatchSdir3dGlobalWeight = addDoubleParam(
-        tr("SDIR global weight 3D"), 0.0, 100.0, 0.1, _patchSdir3dGlobalWeight, 0.0,
-        patchHelp(tr("Weights 3D metric-preservation constraints during global/window optimization."),
-                  tr("Increase to smooth larger 3D distortions during global passes; decrease to reduce this regularization.")));
-    _spinPatchSdir3dCandidateMax = addDoubleParam(
-        tr("SDIR candidate max"), 0.0, 1000.0, 0.1, _patchSdir3dCandidateMax, 0.0,
-        patchHelp(tr("Rejects candidates whose local 3D metric residual is above this threshold."),
-                  tr("Increase to allow more distorted 3D candidates; decrease to reject stretched or folded candidates sooner.")));
-    _spinPatchParamSdir2dRadius = addIntParam(
-        tr("Param SDIR radius 2D"), 0, 8, 1, _patchParamSdir2dRadius, 0,
-        patchHelp(tr("Checks 2D source-surface parameter distortion across this many grid strides."),
-                  tr("Increase to catch broader crowding; decrease or set to 0 to limit or disable this check.")));
-    _spinPatchParamSdir2dWeight = addDoubleParam(
-        tr("Param SDIR weight 2D"), 0.0, 100.0, 0.1, _patchParamSdir2dWeight, 0.0,
-        patchHelp(tr("Weights the local 2D parameter metric loss during per-point solves."),
-                  tr("Increase to resist local 2D distortion more; decrease to let candidates follow surface evidence more freely.")));
-    _spinPatchParamSdir2dGlobalWeight = addDoubleParam(
-        tr("Param SDIR global weight 2D"), 0.0, 100.0, 0.1, _patchParamSdir2dGlobalWeight, 0.0,
-        patchHelp(tr("Weights the 2D parameter metric loss during window/global optimization."),
-                  tr("Increase to open crowded parameterization more aggressively; decrease to preserve the existing mapping more.")));
-    _spinPatchParamSdir2dCandidateMax = addDoubleParam(
-        tr("Param SDIR candidate max"), 0.0, 1000.0, 0.1, _patchParamSdir2dCandidateMax, 0.0,
-        patchHelp(tr("Rejects candidates whose local 2D parameter metric residual is above this threshold."),
-                  tr("Increase to allow more distorted candidates; decrease to reject skinny or folded cells sooner.")));
-    _spinPatchParamAreaMinRatio = addDoubleParam(
-        tr("Param area min ratio"), 0.0, 10.0, 0.05, _patchParamAreaMinRatio, 0.25,
-        patchHelp(tr("Requires local 2D parameter cells to keep at least this fraction of ideal area."),
-                  tr("Increase to keep more room in grid space; decrease to allow more compression in difficult regions.")));
-    _spinPatchParamAreaWeight = addDoubleParam(
-        tr("Param area weight"), 0.0, 100.0, 0.1, _patchParamAreaWeight, 2.0,
-        patchHelp(tr("Weights the optimizer barrier against collapsed or flipped 2D parameter cells."),
-                  tr("Increase to push harder against collapse; decrease to make the area barrier less influential.")));
-    _spinPatchParamNonneighborMinRatio = addDoubleParam(
-        tr("Param non-neighbor min ratio"), 0.0, 10.0, 0.05, _patchParamNonneighborMinRatio, 0.5,
-        patchHelp(tr("Rejects a candidate when a non-neighbor grid point is closer than this fraction of the grid step in parameter space."),
-                  tr("Increase for stronger anti-crowding; decrease to allow denser local packing.")));
-    _spinPatchParamNonneighborRadius = addIntParam(
-        tr("Param non-neighbor radius"), 0, 64, 1, _patchParamNonneighborRadius, 4,
-        patchHelp(tr("Searches this many grid cells around a candidate for non-neighbor parameter-space crowding."),
-                  tr("Increase to catch farther crowding at higher cost; decrease or set near 1 to make the check local or effectively off.")));
     _spinPatchStraightMinCount = addDoubleParam(
         tr("Straight min count"), 0.0, 16.0, 0.5, _patchStraightMinCount, 1.0,
         patchHelp(tr("Minimum number of straightness constraints required for a non-seed candidate to count as an inlier."),
@@ -1069,18 +1021,6 @@ utils::Json SegmentationGrowthPanel::patchTracerParamsJson() const
     params["z_loc_loss_w"] = _patchZLocationLossWeight;
     params["dist_loss_2d_w"] = _patchDistLoss2dWeight;
     params["dist_loss_3d_w"] = _patchDistLoss3dWeight;
-    params["sdir_3d_radius"] = _patchSdir3dRadius;
-    params["sdir_3d_w"] = _patchSdir3dWeight;
-    params["sdir_3d_global_w"] = _patchSdir3dGlobalWeight;
-    params["sdir_3d_candidate_max"] = _patchSdir3dCandidateMax;
-    params["param_sdir_2d_radius"] = _patchParamSdir2dRadius;
-    params["param_sdir_2d_w"] = _patchParamSdir2dWeight;
-    params["param_sdir_2d_global_w"] = _patchParamSdir2dGlobalWeight;
-    params["param_sdir_2d_candidate_max"] = _patchParamSdir2dCandidateMax;
-    params["param_area_min_ratio"] = _patchParamAreaMinRatio;
-    params["param_area_w"] = _patchParamAreaWeight;
-    params["param_nonneighbor_min_ratio"] = _patchParamNonneighborMinRatio;
-    params["param_nonneighbor_radius"] = _patchParamNonneighborRadius;
     params["straight_min_count"] = _patchStraightMinCount;
     params["inlier_base_threshold"] = _patchInlierBaseThreshold;
     params["consensus_default_th"] = _patchConsensusDefaultThreshold;
@@ -1383,18 +1323,6 @@ void SegmentationGrowthPanel::resetPatchTracerParams(bool persist)
     _patchZLocationLossWeight = 0.1;
     _patchDistLoss2dWeight = 1.0;
     _patchDistLoss3dWeight = 2.0;
-    _patchSdir3dRadius = 0;
-    _patchSdir3dWeight = 0.0;
-    _patchSdir3dGlobalWeight = 0.0;
-    _patchSdir3dCandidateMax = 0.0;
-    _patchParamSdir2dRadius = 0;
-    _patchParamSdir2dWeight = 0.0;
-    _patchParamSdir2dGlobalWeight = 0.0;
-    _patchParamSdir2dCandidateMax = 0.0;
-    _patchParamAreaMinRatio = 0.25;
-    _patchParamAreaWeight = 2.0;
-    _patchParamNonneighborMinRatio = 0.5;
-    _patchParamNonneighborRadius = 4;
     _patchStraightMinCount = 1.0;
     _patchInlierBaseThreshold = 20;
     _patchConsensusDefaultThreshold = 10;
@@ -1426,18 +1354,6 @@ void SegmentationGrowthPanel::syncPatchTracerParamsUi()
     setSpin(_spinPatchZLocationLossWeight, _patchZLocationLossWeight);
     setSpin(_spinPatchDistLoss2dWeight, _patchDistLoss2dWeight);
     setSpin(_spinPatchDistLoss3dWeight, _patchDistLoss3dWeight);
-    setSpin(_spinPatchSdir3dRadius, _patchSdir3dRadius);
-    setSpin(_spinPatchSdir3dWeight, _patchSdir3dWeight);
-    setSpin(_spinPatchSdir3dGlobalWeight, _patchSdir3dGlobalWeight);
-    setSpin(_spinPatchSdir3dCandidateMax, _patchSdir3dCandidateMax);
-    setSpin(_spinPatchParamSdir2dRadius, _patchParamSdir2dRadius);
-    setSpin(_spinPatchParamSdir2dWeight, _patchParamSdir2dWeight);
-    setSpin(_spinPatchParamSdir2dGlobalWeight, _patchParamSdir2dGlobalWeight);
-    setSpin(_spinPatchParamSdir2dCandidateMax, _patchParamSdir2dCandidateMax);
-    setSpin(_spinPatchParamAreaMinRatio, _patchParamAreaMinRatio);
-    setSpin(_spinPatchParamAreaWeight, _patchParamAreaWeight);
-    setSpin(_spinPatchParamNonneighborMinRatio, _patchParamNonneighborMinRatio);
-    setSpin(_spinPatchParamNonneighborRadius, _patchParamNonneighborRadius);
     setSpin(_spinPatchStraightMinCount, _patchStraightMinCount);
     setSpin(_spinPatchInlierBaseThreshold, _patchInlierBaseThreshold);
     setSpin(_spinPatchConsensusDefaultThreshold, _patchConsensusDefaultThreshold);
@@ -1473,18 +1389,6 @@ void SegmentationGrowthPanel::persistPatchTracerParams()
     if (_spinPatchZLocationLossWeight) _patchZLocationLossWeight = _spinPatchZLocationLossWeight->value();
     if (_spinPatchDistLoss2dWeight) _patchDistLoss2dWeight = _spinPatchDistLoss2dWeight->value();
     if (_spinPatchDistLoss3dWeight) _patchDistLoss3dWeight = _spinPatchDistLoss3dWeight->value();
-    if (_spinPatchSdir3dRadius) _patchSdir3dRadius = _spinPatchSdir3dRadius->value();
-    if (_spinPatchSdir3dWeight) _patchSdir3dWeight = _spinPatchSdir3dWeight->value();
-    if (_spinPatchSdir3dGlobalWeight) _patchSdir3dGlobalWeight = _spinPatchSdir3dGlobalWeight->value();
-    if (_spinPatchSdir3dCandidateMax) _patchSdir3dCandidateMax = _spinPatchSdir3dCandidateMax->value();
-    if (_spinPatchParamSdir2dRadius) _patchParamSdir2dRadius = _spinPatchParamSdir2dRadius->value();
-    if (_spinPatchParamSdir2dWeight) _patchParamSdir2dWeight = _spinPatchParamSdir2dWeight->value();
-    if (_spinPatchParamSdir2dGlobalWeight) _patchParamSdir2dGlobalWeight = _spinPatchParamSdir2dGlobalWeight->value();
-    if (_spinPatchParamSdir2dCandidateMax) _patchParamSdir2dCandidateMax = _spinPatchParamSdir2dCandidateMax->value();
-    if (_spinPatchParamAreaMinRatio) _patchParamAreaMinRatio = _spinPatchParamAreaMinRatio->value();
-    if (_spinPatchParamAreaWeight) _patchParamAreaWeight = _spinPatchParamAreaWeight->value();
-    if (_spinPatchParamNonneighborMinRatio) _patchParamNonneighborMinRatio = _spinPatchParamNonneighborMinRatio->value();
-    if (_spinPatchParamNonneighborRadius) _patchParamNonneighborRadius = _spinPatchParamNonneighborRadius->value();
     if (_spinPatchStraightMinCount) _patchStraightMinCount = _spinPatchStraightMinCount->value();
     if (_spinPatchInlierBaseThreshold) _patchInlierBaseThreshold = _spinPatchInlierBaseThreshold->value();
     if (_spinPatchConsensusDefaultThreshold) _patchConsensusDefaultThreshold = _spinPatchConsensusDefaultThreshold->value();
@@ -1508,18 +1412,6 @@ void SegmentationGrowthPanel::persistPatchTracerParams()
     writeSetting(QStringLiteral("patch_z_loc_loss_w"), _patchZLocationLossWeight);
     writeSetting(QStringLiteral("patch_dist_loss_2d_w"), _patchDistLoss2dWeight);
     writeSetting(QStringLiteral("patch_dist_loss_3d_w"), _patchDistLoss3dWeight);
-    writeSetting(QStringLiteral("patch_sdir_3d_radius"), _patchSdir3dRadius);
-    writeSetting(QStringLiteral("patch_sdir_3d_w"), _patchSdir3dWeight);
-    writeSetting(QStringLiteral("patch_sdir_3d_global_w"), _patchSdir3dGlobalWeight);
-    writeSetting(QStringLiteral("patch_sdir_3d_candidate_max"), _patchSdir3dCandidateMax);
-    writeSetting(QStringLiteral("patch_param_sdir_2d_radius"), _patchParamSdir2dRadius);
-    writeSetting(QStringLiteral("patch_param_sdir_2d_w"), _patchParamSdir2dWeight);
-    writeSetting(QStringLiteral("patch_param_sdir_2d_global_w"), _patchParamSdir2dGlobalWeight);
-    writeSetting(QStringLiteral("patch_param_sdir_2d_candidate_max"), _patchParamSdir2dCandidateMax);
-    writeSetting(QStringLiteral("patch_param_area_min_ratio"), _patchParamAreaMinRatio);
-    writeSetting(QStringLiteral("patch_param_area_w"), _patchParamAreaWeight);
-    writeSetting(QStringLiteral("patch_param_nonneighbor_min_ratio"), _patchParamNonneighborMinRatio);
-    writeSetting(QStringLiteral("patch_param_nonneighbor_radius"), _patchParamNonneighborRadius);
     writeSetting(QStringLiteral("patch_straight_min_count"), _patchStraightMinCount);
     writeSetting(QStringLiteral("patch_inlier_base_threshold"), _patchInlierBaseThreshold);
     writeSetting(QStringLiteral("patch_consensus_default_th"), _patchConsensusDefaultThreshold);
@@ -1626,18 +1518,6 @@ void SegmentationGrowthPanel::restoreSettings(QSettings& settings)
     _patchZLocationLossWeight = std::clamp(settings.value(QStringLiteral("patch_z_loc_loss_w"), _patchZLocationLossWeight).toDouble(), 0.0, 100.0);
     _patchDistLoss2dWeight = std::clamp(settings.value(QStringLiteral("patch_dist_loss_2d_w"), _patchDistLoss2dWeight).toDouble(), 0.0, 100.0);
     _patchDistLoss3dWeight = std::clamp(settings.value(QStringLiteral("patch_dist_loss_3d_w"), _patchDistLoss3dWeight).toDouble(), 0.0, 100.0);
-    _patchSdir3dRadius = std::clamp(settings.value(QStringLiteral("patch_sdir_3d_radius"), _patchSdir3dRadius).toInt(), 0, 8);
-    _patchSdir3dWeight = std::clamp(settings.value(QStringLiteral("patch_sdir_3d_w"), _patchSdir3dWeight).toDouble(), 0.0, 100.0);
-    _patchSdir3dGlobalWeight = std::clamp(settings.value(QStringLiteral("patch_sdir_3d_global_w"), _patchSdir3dGlobalWeight).toDouble(), 0.0, 100.0);
-    _patchSdir3dCandidateMax = std::clamp(settings.value(QStringLiteral("patch_sdir_3d_candidate_max"), _patchSdir3dCandidateMax).toDouble(), 0.0, 1000.0);
-    _patchParamSdir2dRadius = std::clamp(settings.value(QStringLiteral("patch_param_sdir_2d_radius"), _patchParamSdir2dRadius).toInt(), 0, 8);
-    _patchParamSdir2dWeight = std::clamp(settings.value(QStringLiteral("patch_param_sdir_2d_w"), _patchParamSdir2dWeight).toDouble(), 0.0, 100.0);
-    _patchParamSdir2dGlobalWeight = std::clamp(settings.value(QStringLiteral("patch_param_sdir_2d_global_w"), _patchParamSdir2dGlobalWeight).toDouble(), 0.0, 100.0);
-    _patchParamSdir2dCandidateMax = std::clamp(settings.value(QStringLiteral("patch_param_sdir_2d_candidate_max"), _patchParamSdir2dCandidateMax).toDouble(), 0.0, 1000.0);
-    _patchParamAreaMinRatio = std::clamp(settings.value(QStringLiteral("patch_param_area_min_ratio"), _patchParamAreaMinRatio).toDouble(), 0.0, 10.0);
-    _patchParamAreaWeight = std::clamp(settings.value(QStringLiteral("patch_param_area_w"), _patchParamAreaWeight).toDouble(), 0.0, 100.0);
-    _patchParamNonneighborMinRatio = std::clamp(settings.value(QStringLiteral("patch_param_nonneighbor_min_ratio"), _patchParamNonneighborMinRatio).toDouble(), 0.0, 10.0);
-    _patchParamNonneighborRadius = std::clamp(settings.value(QStringLiteral("patch_param_nonneighbor_radius"), _patchParamNonneighborRadius).toInt(), 0, 64);
     _patchStraightMinCount = std::clamp(settings.value(QStringLiteral("patch_straight_min_count"), _patchStraightMinCount).toDouble(), 0.0, 16.0);
     _patchInlierBaseThreshold = std::clamp(settings.value(QStringLiteral("patch_inlier_base_threshold"), _patchInlierBaseThreshold).toInt(), 0, 10000);
     _patchConsensusDefaultThreshold = std::clamp(settings.value(QStringLiteral("patch_consensus_default_th"), _patchConsensusDefaultThreshold).toInt(), 0, 10000);
