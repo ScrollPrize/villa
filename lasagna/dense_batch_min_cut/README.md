@@ -20,6 +20,14 @@ cd path/to/workdir
   -i path/to/image.tif
 ```
 
+Optional dense source-flow estimation:
+
+```bash
+cd path/to/workdir
+/path/to/villa2/lasagna/dense_batch_min_cut/build/dense_batch_preprocess \
+  -i path/to/image.tif --source x,y
+```
+
 Outputs:
 
 - `<stem>_binary.tif`: 8-bit binary mask from a fixed inverted threshold of 127;
@@ -64,15 +72,29 @@ Outputs:
 - `<stem>_graph_capacity.tif`: graph edges rendered in grayscale by edge
   capacity, where capacity is the minimum raw distance-transform value along
   the complete traced edge.
+- `<stem>_dense_flow.tif`: optional 32-bit float dense source-flow map, written
+  only when `--source x,y` is provided.
+- `<stem>_dense_flow_u16.tif`: optional normalized 16-bit visualization of the
+  dense source-flow map.
+- `<stem>_graph_edge_flow.tif`: optional graph-edge visualization of propagated
+  source flow.
 - `<stem>_layers.tif`: named multipage TIFF for easier inspection in GIMP.
-  The pages are `dt`, `loops`, `loops_connected`, `graph_random_edges`, and
-  `graph_capacity`.
+  The pages are `binary_threshold`, `dt`, `loops`, `loops_connected`,
+  `graph_random_edges`, and `graph_capacity`. When `--source x,y` is provided,
+  the pages `dense_flow` and `graph_edge_flow` are appended.
 
 The threshold and polarity are intentionally fixed for repeatable comparisons.
 The component Voronoi path treats each dark foreground connected component as
 one fat site. The CLI prints a fixed-width timing table with elapsed time, CPU
 time, and estimated CPU/elapsed utilization for the main stages and component
 Voronoi substages.
+
+`--source x,y` must point into the light/white distance domain, not into a dark
+foreground island. The graph edge(s) bordering the source region are seeded with
+internal infinite capacity. The small extracted graph is then evaluated with
+exact per-node max-flow, edge flow is assigned from the maximum of its endpoint
+flows, and dense pixels take the minimum of their raw DT value and the flow at
+the nearest graph-edge pixel.
 
 ## Candidate Optimizations
 

@@ -99,10 +99,12 @@ void print_stage_timings(const std::vector<StageTiming>& timings) {
 
 struct Args {
     fs::path input;
+    bool has_source = false;
+    cv::Point source{-1, -1};
 };
 
 void print_usage(const char* argv0) {
-    std::cerr << "Usage: " << argv0 << " -i <image>\n";
+    std::cerr << "Usage: " << argv0 << " -i <image> [--source x,y]\n";
 }
 
 Args parse_args(int argc, char** argv) {
@@ -111,6 +113,15 @@ Args parse_args(int argc, char** argv) {
         const std::string key(argv[i]);
         if ((key == "--input" || key == "-i") && i + 1 < argc) {
             args.input = argv[++i];
+        } else if (key == "--source" && i + 1 < argc) {
+            const std::string value(argv[++i]);
+            const std::size_t comma = value.find(',');
+            if (comma == std::string::npos) {
+                throw std::runtime_error("--source must be formatted as x,y");
+            }
+            args.source.x = std::stoi(value.substr(0, comma));
+            args.source.y = std::stoi(value.substr(comma + 1));
+            args.has_source = true;
         } else if (key == "--help" || key == "-h") {
             print_usage(argv[0]);
             std::exit(0);
@@ -1625,6 +1636,482 @@ cv::Mat render_graph_capacity(const SkeletonGraph& graph, cv::Size size) {
     return out;
 }
 
+struct DinicEdge {
+    int to = 0;
+    int rev = 0;
+    double cap = 0.0;
+};
+
+class Dinic {
+   public:
+    explicit Dinic(int n) : graph_(static_cast<std::size_t>(n)) {}
+
+    void add_edge(int from, int to, double cap) {
+        DinicEdge forward{to, static_cast<int>(graph_[to].size()), cap};
+        DinicEdge reverse{from, static_cast<int>(graph_[from].size()), 0.0};
+        graph_[from].push_back(forward);
+        graph_[to].push_back(reverse);
+    }
+
+    double max_flow(int source, int sink) {
+        double flow = 0.0;
+        while (build_levels(source, sink)) {
+            next_.assign(graph_.size(), 0);
+            while (true) {
+                const double pushed = push(source, sink, kFlowInf);
+                if (pushed <= kFlowEpsilon) {
+                    break;
+                }
+                flow += pushed;
+            }
+        }
+        return flow;
+    }
+
+   private:
+    static constexpr double kFlowInf = 1.0e18;
+    static constexpr double kFlowEpsilon = 1.0e-9;
+
+    bool build_levels(int source, int sink) {
+        level_.assign(graph_.size(), -1);
+        std::queue<int> queue;
+        level_[source] = 0;
+        queue.push(source);
+        while (!queue.empty()) {
+            const int v = queue.front();
+            queue.pop();
+            for (const DinicEdge& edge : graph_[v]) {
+                if (edge.cap > kFlowEpsilon && level_[edge.to] < 0) {
+                    level_[edge.to] = level_[v] + 1;
+                    queue.push(edge.to);
+                }
+            }
+        }
+        return level_[sink] >= 0;
+    }
+
+    double push(int v, int sink, double flow) {
+        if (v == sink) {
+            return flow;
+        }
+        for (int& i = next_[v]; i < static_cast<int>(graph_[v].size()); ++i) {
+            DinicEdge& edge = graph_[v][i];
+            if (edge.cap <= kFlowEpsilon || level_[edge.to] != level_[v] + 1) {
+                continue;
+            }
+            const double pushed =
+                push(edge.to, sink, std::min(flow, edge.cap));
+            if (pushed <= kFlowEpsilon) {
+                continue;
+            }
+            edge.cap -= pushed;
+            graph_[edge.to][edge.rev].cap += pushed;
+            return pushed;
+        }
+        return 0.0;
+    }
+
+    std::vector<std::vector<DinicEdge>> graph_;
+    std::vector<int> level_;
+    std::vector<int> next_;
+};
+
+struct DenseFlowResult {
+    cv::Mat dense_flow;
+    cv::Mat dense_flow_u16;
+    cv::Mat graph_edge_flow;
+    std::vector<StageTiming> timings;
+};
+
+std::vector<cv::Point> unique_edge_pixels(const std::vector<cv::Point>& pixels) {
+    std::vector<cv::Point> unique = pixels;
+    std::sort(unique.begin(), unique.end(), [](const cv::Point& a,
+                                               const cv::Point& b) {
+        if (a.y != b.y) {
+            return a.y < b.y;
+        }
+        return a.x < b.x;
+    });
+    unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+    return unique;
+}
+
+std::vector<cv::Point> order_edge_pixels(const GraphEdge& edge,
+                                         const SkeletonGraph& graph) {
+    std::vector<cv::Point> pixels = unique_edge_pixels(edge.pixels);
+    if (pixels.size() <= 2) {
+        return pixels;
+    }
+
+    cv::Rect bounds = cv::boundingRect(pixels);
+    cv::Mat local_index(bounds.height, bounds.width, CV_32S, cv::Scalar(-1));
+    for (int i = 0; i < static_cast<int>(pixels.size()); ++i) {
+        local_index.at<int>(pixels[i].y - bounds.y, pixels[i].x - bounds.x) = i;
+    }
+
+    std::vector<int> degree(pixels.size(), 0);
+    const std::array<cv::Point, 8> kDirs = {
+        {{-1, -1}, {0, -1}, {1, -1}, {-1, 0},
+         {1, 0},   {-1, 1}, {0, 1},  {1, 1}}};
+    for (int i = 0; i < static_cast<int>(pixels.size()); ++i) {
+        for (const cv::Point dir : kDirs) {
+            const cv::Point next = pixels[i] + dir;
+            if (!bounds.contains(next)) {
+                continue;
+            }
+            if (local_index.at<int>(next.y - bounds.y, next.x - bounds.x) >= 0) {
+                ++degree[i];
+            }
+        }
+    }
+
+    const auto distance_to_node = [&](int pixel_index, int node) {
+        if (node <= 0 || node >= static_cast<int>(graph.nodes.size())) {
+            return std::numeric_limits<double>::max();
+        }
+        const cv::Point2f center = graph.nodes[node];
+        const double dx = static_cast<double>(pixels[pixel_index].x) - center.x;
+        const double dy = static_cast<double>(pixels[pixel_index].y) - center.y;
+        return dx * dx + dy * dy;
+    };
+
+    int start = 0;
+    int end = -1;
+    if (edge.a != edge.b) {
+        double best_start = std::numeric_limits<double>::max();
+        double best_end = std::numeric_limits<double>::max();
+        for (int i = 0; i < static_cast<int>(pixels.size()); ++i) {
+            const double da = distance_to_node(i, edge.a);
+            const double db = distance_to_node(i, edge.b);
+            if (da < best_start) {
+                best_start = da;
+                start = i;
+            }
+            if (db < best_end) {
+                best_end = db;
+                end = i;
+            }
+        }
+    } else {
+        for (int i = 0; i < static_cast<int>(degree.size()); ++i) {
+            if (degree[i] <= 1) {
+                start = i;
+                break;
+            }
+        }
+    }
+
+    std::vector<char> visited(pixels.size(), 0);
+    std::vector<cv::Point> ordered;
+    ordered.reserve(pixels.size());
+    int current = start;
+    int previous = -1;
+    while (current >= 0 && !visited[current]) {
+        visited[current] = 1;
+        ordered.push_back(pixels[current]);
+
+        int next_index = -1;
+        double best_score = std::numeric_limits<double>::max();
+        for (const cv::Point dir : kDirs) {
+            const cv::Point next = pixels[current] + dir;
+            if (!bounds.contains(next)) {
+                continue;
+            }
+            const int candidate =
+                local_index.at<int>(next.y - bounds.y, next.x - bounds.x);
+            if (candidate < 0 || visited[candidate] || candidate == previous) {
+                continue;
+            }
+            double score = 0.0;
+            if (end >= 0) {
+                const double dx = pixels[candidate].x - pixels[end].x;
+                const double dy = pixels[candidate].y - pixels[end].y;
+                score = dx * dx + dy * dy;
+            } else {
+                score = degree[candidate];
+            }
+            if (score < best_score) {
+                best_score = score;
+                next_index = candidate;
+            }
+        }
+        previous = current;
+        current = next_index;
+    }
+
+    if (ordered.size() == pixels.size()) {
+        return ordered;
+    }
+    for (int i = 0; i < static_cast<int>(pixels.size()); ++i) {
+        if (!visited[i]) {
+            ordered.push_back(pixels[i]);
+        }
+    }
+    return ordered;
+}
+
+DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
+                                          const cv::Mat& dt,
+                                          const SkeletonGraph& graph,
+                                          const cv::Point source) {
+    CV_Assert(white_domain.type() == CV_8U);
+    CV_Assert(dt.type() == CV_32F);
+
+    if (source.x < 0 || source.x >= white_domain.cols || source.y < 0 ||
+        source.y >= white_domain.rows) {
+        throw std::runtime_error("--source is outside the image");
+    }
+    if (white_domain.at<std::uint8_t>(source.y, source.x) == 0) {
+        throw std::runtime_error("--source must be inside the white distance domain");
+    }
+
+    std::vector<StageTiming> timings;
+    constexpr float kDenseFlowInf = 1.0e9f;
+    constexpr double kGraphFlowInf = 1.0e12;
+    const int node_count = static_cast<int>(graph.nodes.size());
+
+    cv::Mat graph_edge_mask(white_domain.size(), CV_8U, cv::Scalar(0));
+    cv::Mat graph_pixel_flow(white_domain.size(), CV_32F, cv::Scalar(0));
+    for (const GraphEdge& edge : graph.edges) {
+        for (const cv::Point pixel : edge.pixels) {
+            if (pixel.x >= 0 && pixel.x < graph_edge_mask.cols &&
+                pixel.y >= 0 && pixel.y < graph_edge_mask.rows) {
+                graph_edge_mask.at<std::uint8_t>(pixel.y, pixel.x) = 255;
+            }
+        }
+    }
+
+    std::vector<char> seeded_nodes(static_cast<std::size_t>(node_count), 0);
+    std::vector<char> source_edges(graph.edges.size(), 0);
+    {
+        const TimingMark timing = start_timing();
+        cv::Mat domain_without_graph = white_domain.clone();
+        domain_without_graph.setTo(0, graph_edge_mask);
+
+        cv::Mat region_labels;
+        cv::connectedComponents(domain_without_graph, region_labels, 8, CV_32S);
+        const int source_region = region_labels.at<int>(source.y, source.x);
+
+        for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
+             ++edge_index) {
+            const GraphEdge& edge = graph.edges[edge_index];
+            bool touches_source = false;
+            for (const cv::Point pixel : edge.pixels) {
+                if (pixel == source) {
+                    touches_source = true;
+                    break;
+                }
+                for (int dy = -1; dy <= 1 && !touches_source; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int x = pixel.x + dx;
+                        const int y = pixel.y + dy;
+                        if (x < 0 || x >= region_labels.cols || y < 0 ||
+                            y >= region_labels.rows) {
+                            continue;
+                        }
+                        if (region_labels.at<int>(y, x) == source_region &&
+                            source_region > 0) {
+                            touches_source = true;
+                            break;
+                        }
+                    }
+                }
+                if (touches_source) {
+                    break;
+                }
+            }
+            if (!touches_source) {
+                continue;
+            }
+            source_edges[edge_index] = 1;
+            if (edge.a > 0 && edge.a < node_count) {
+                seeded_nodes[edge.a] = 1;
+            }
+            if (edge.b > 0 && edge.b < node_count) {
+                seeded_nodes[edge.b] = 1;
+            }
+        }
+        timings.push_back(finish_timing("source_region_detect", timing));
+    }
+
+    const auto max_flow_to_node = [&](int target, int removed_edge) {
+        if (target <= 0 || target >= node_count) {
+            return 0.0;
+        }
+        if (seeded_nodes[target] != 0) {
+            return kGraphFlowInf;
+        }
+
+        Dinic flow(node_count);
+        constexpr int kSuperSource = 0;
+        for (int node = 1; node < node_count; ++node) {
+            if (seeded_nodes[node] != 0) {
+                flow.add_edge(kSuperSource, node, kGraphFlowInf);
+            }
+        }
+        for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
+             ++edge_index) {
+            if (edge_index == removed_edge) {
+                continue;
+            }
+            const GraphEdge& edge = graph.edges[edge_index];
+            if (edge.a <= 0 || edge.b <= 0 || edge.a >= node_count ||
+                edge.b >= node_count || edge.a == edge.b) {
+                continue;
+            }
+            const double capacity =
+                source_edges[edge_index] != 0
+                    ? kGraphFlowInf
+                    : std::max(0.0f, edge.capacity);
+            flow.add_edge(edge.a, edge.b, capacity);
+            flow.add_edge(edge.b, edge.a, capacity);
+        }
+        return flow.max_flow(kSuperSource, target);
+    };
+
+    std::vector<double> node_flow(static_cast<std::size_t>(node_count), 0.0);
+    std::vector<float> edge_flow(graph.edges.size(), 0.0f);
+    {
+        const TimingMark timing = start_timing();
+        for (int node = 1; node < node_count; ++node) {
+            node_flow[node] = max_flow_to_node(node, -1);
+        }
+        for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
+             ++edge_index) {
+            const GraphEdge& edge = graph.edges[edge_index];
+            double value = 0.0;
+            if (source_edges[edge_index] != 0) {
+                value = kGraphFlowInf;
+            } else {
+                if (edge.a > 0 && edge.a < node_count) {
+                    value = std::max(value, node_flow[edge.a]);
+                }
+                if (edge.b > 0 && edge.b < node_count) {
+                    value = std::max(value, node_flow[edge.b]);
+                }
+            }
+            edge_flow[edge_index] =
+                value >= kGraphFlowInf * 0.5
+                    ? kDenseFlowInf
+                    : static_cast<float>(std::max(0.0, value));
+        }
+        timings.push_back(finish_timing("graph_node_maxflow", timing));
+    }
+
+    {
+        const TimingMark timing = start_timing();
+        for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
+             ++edge_index) {
+            const GraphEdge& edge = graph.edges[edge_index];
+            std::vector<cv::Point> ordered = order_edge_pixels(edge, graph);
+            if (ordered.empty()) {
+                continue;
+            }
+
+            double side_a = source_edges[edge_index] != 0
+                                ? kGraphFlowInf
+                                : max_flow_to_node(edge.a, edge_index);
+            double side_b = 0.0;
+            if (edge.b != edge.a) {
+                side_b = source_edges[edge_index] != 0
+                             ? kGraphFlowInf
+                             : max_flow_to_node(edge.b, edge_index);
+            }
+
+            std::vector<float> left(ordered.size(), 0.0f);
+            std::vector<float> right(ordered.size(), 0.0f);
+            float min_dt = static_cast<float>(
+                std::min(side_a, static_cast<double>(kDenseFlowInf)));
+            for (std::size_t i = 0; i < ordered.size(); ++i) {
+                min_dt = std::min(min_dt, dt.at<float>(ordered[i].y, ordered[i].x));
+                left[i] = min_dt;
+            }
+            min_dt = static_cast<float>(
+                std::min(side_b, static_cast<double>(kDenseFlowInf)));
+            for (std::size_t i = ordered.size(); i-- > 0;) {
+                min_dt = std::min(min_dt, dt.at<float>(ordered[i].y, ordered[i].x));
+                right[i] = min_dt;
+            }
+
+            for (std::size_t i = 0; i < ordered.size(); ++i) {
+                const cv::Point pixel = ordered[i];
+                const float value =
+                    std::min(kDenseFlowInf, left[i] + right[i]);
+                graph_pixel_flow.at<float>(pixel.y, pixel.x) =
+                    std::max(graph_pixel_flow.at<float>(pixel.y, pixel.x),
+                             value);
+            }
+        }
+        timings.push_back(finish_timing("graph_edge_point_flow", timing));
+    }
+
+    cv::Mat dense_flow(white_domain.size(), CV_32F, cv::Scalar(0));
+    {
+        const TimingMark timing = start_timing();
+        cv::Mat graph_source_mask(white_domain.size(), CV_8U, cv::Scalar(255));
+        graph_source_mask.setTo(0, graph_edge_mask);
+        cv::Mat nearest_dt;
+        cv::Mat nearest_graph_pixel;
+        cv::distanceTransform(graph_source_mask, nearest_dt, nearest_graph_pixel,
+                              cv::DIST_L2, cv::DIST_MASK_5,
+                              cv::DIST_LABEL_PIXEL);
+        const std::vector<cv::Point> graph_source_points =
+            label_source_points(graph_source_mask, nearest_graph_pixel);
+
+        cv::parallel_for_(cv::Range(0, white_domain.rows),
+                          [&](const cv::Range& range) {
+            for (int y = range.start; y < range.end; ++y) {
+                for (int x = 0; x < white_domain.cols; ++x) {
+                    if (white_domain.at<std::uint8_t>(y, x) == 0) {
+                        continue;
+                    }
+                    const int label = nearest_graph_pixel.at<int>(y, x);
+                    if (label <= 0 ||
+                        label >= static_cast<int>(graph_source_points.size())) {
+                        continue;
+                    }
+                    const cv::Point graph_pixel = graph_source_points[label];
+                    if (graph_pixel.x < 0) {
+                        continue;
+                    }
+                    const float edge_value =
+                        graph_pixel_flow.at<float>(graph_pixel.y,
+                                                   graph_pixel.x);
+                    dense_flow.at<float>(y, x) =
+                        std::min(dt.at<float>(y, x), edge_value);
+                }
+            }
+        });
+        timings.push_back(finish_timing("dense_flow_nearest_edge", timing));
+    }
+
+    cv::Mat dense_flow_u16 = normalized_dt_u16(dense_flow);
+    cv::Mat graph_edge_flow(white_domain.size(), CV_8U, cv::Scalar(0));
+    double max_edge_flow = 0.0;
+    for (float value : edge_flow) {
+        if (value < kDenseFlowInf * 0.5f) {
+            max_edge_flow = std::max(max_edge_flow, static_cast<double>(value));
+        }
+    }
+    if (max_edge_flow <= 0.0) {
+        max_edge_flow = 1.0;
+    }
+    for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
+         ++edge_index) {
+        const int value = edge_flow[edge_index] >= kDenseFlowInf * 0.5f
+                              ? 255
+                              : static_cast<int>(std::lround(
+                                    std::clamp(edge_flow[edge_index] /
+                                                   static_cast<float>(max_edge_flow),
+                                               0.0f, 1.0f) *
+                                    255.0f));
+        draw_graph_edge(graph_edge_flow, graph.edges[edge_index],
+                        cv::Scalar(value));
+    }
+
+    return {dense_flow, dense_flow_u16, graph_edge_flow, timings};
+}
+
 cv::Mat to_bgr_layer(const cv::Mat& image) {
     if (image.type() == CV_8UC3) {
         return image;
@@ -2002,6 +2489,16 @@ int main(int argc, char** argv) {
             timings.push_back(finish_timing("graph_capacity_render", timing));
         }
 
+        DenseFlowResult dense_flow_result;
+        bool has_dense_flow = false;
+        if (args.has_source) {
+            dense_flow_result =
+                compute_dense_source_flow(white_domain, dt, graph, args.source);
+            timings.insert(timings.end(), dense_flow_result.timings.begin(),
+                           dense_flow_result.timings.end());
+            has_dense_flow = true;
+        }
+
         cv::Mat contour_loops;
         {
             const TimingMark timing = start_timing();
@@ -2059,7 +2556,19 @@ int main(int argc, char** argv) {
             timings.push_back(finish_timing("write_regular_outputs", timing));
         }
 
-        const std::vector<NamedLayer> layered_tiff = {
+        if (has_dense_flow) {
+            const TimingMark timing = start_timing();
+            write_image(workdir / (stem + "_dense_flow.tif"),
+                        dense_flow_result.dense_flow);
+            write_image(workdir / (stem + "_dense_flow_u16.tif"),
+                        dense_flow_result.dense_flow_u16);
+            write_image(workdir / (stem + "_graph_edge_flow.tif"),
+                        dense_flow_result.graph_edge_flow);
+            timings.push_back(finish_timing("dense_flow_write", timing));
+        }
+
+        std::vector<NamedLayer> layered_tiff = {
+            {"binary_threshold", to_bgr_layer(binary)},
             {"dt", to_bgr_layer(dt_u16)},
             {"loops", to_bgr_layer(component_voronoi_result.boundary_skeleton_pruned)},
             {"loops_connected",
@@ -2067,6 +2576,13 @@ int main(int argc, char** argv) {
             {"graph_random_edges", graph_random_colors},
             {"graph_capacity", to_bgr_layer(graph_capacity)},
         };
+        if (has_dense_flow) {
+            layered_tiff.push_back(
+                {"dense_flow", to_bgr_layer(dense_flow_result.dense_flow_u16)});
+            layered_tiff.push_back(
+                {"graph_edge_flow",
+                 to_bgr_layer(dense_flow_result.graph_edge_flow)});
+        }
         {
             const TimingMark timing = start_timing();
             write_named_layered_tiff(workdir / (stem + "_layers.tif"),
@@ -2129,8 +2645,15 @@ int main(int argc, char** argv) {
                   << "\n"
                   << "  " << (workdir / (stem + "_graph_capacity.tif"))
                   << "\n"
-                  << "  " << (workdir / (stem + "_layers.tif"))
-                  << "\n";
+                  << "  " << (workdir / (stem + "_layers.tif")) << "\n";
+        if (has_dense_flow) {
+            std::cout << "  " << (workdir / (stem + "_dense_flow.tif"))
+                      << "\n"
+                      << "  " << (workdir / (stem + "_dense_flow_u16.tif"))
+                      << "\n"
+                      << "  " << (workdir / (stem + "_graph_edge_flow.tif"))
+                      << "\n";
+        }
     } catch (const std::exception& e) {
         std::cerr << "error: " << e.what() << "\n";
         print_usage(argv[0]);
