@@ -862,6 +862,7 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
     struct Attachment {
         int component = 0;
         cv::Point pixel{-1, -1};
+        cv::Point clean_pixel{-1, -1};
     };
 
     struct CandidateEdge {
@@ -870,6 +871,8 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
         int b = 0;
         float bottleneck_dt = 0.0f;
         int length = 0;
+        cv::Point clean_a{-1, -1};
+        cv::Point clean_b{-1, -1};
         std::vector<cv::Point> path;
     };
 
@@ -930,7 +933,7 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
             }
 
             attachments[candidate_label].push_back(
-                {clean_label, cv::Point(x, y)});
+                {clean_label, cv::Point(x, y), source});
         }
     }
 
@@ -957,12 +960,17 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
         std::vector<int> best_length(static_cast<std::size_t>(total),
                                      std::numeric_limits<int>::max());
         std::vector<int> parent(static_cast<std::size_t>(total), -1);
+        std::vector<cv::Point> start_clean(static_cast<std::size_t>(total),
+                                           cv::Point(-1, -1));
+        std::vector<cv::Point> target_clean(static_cast<std::size_t>(total),
+                                            cv::Point(-1, -1));
         std::priority_queue<State, std::vector<State>, StateLess> queue;
 
         for (const Attachment& attachment : attachments[candidate_label]) {
             const int idx = attachment.pixel.y * cols + attachment.pixel.x;
             if (attachment.component == component_b) {
                 target[idx] = 1;
+                target_clean[idx] = attachment.clean_pixel;
             }
         }
 
@@ -977,6 +985,7 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
                 best[idx] = start_dt;
                 best_length[idx] = 1;
                 parent[idx] = idx;
+                start_clean[idx] = attachment.clean_pixel;
                 queue.push({idx, start_dt, 1});
             }
         }
@@ -1017,6 +1026,7 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
                     best[next_idx] = next_bottleneck;
                     best_length[next_idx] = next_length;
                     parent[next_idx] = state.idx;
+                    start_clean[next_idx] = start_clean[state.idx];
                     queue.push({next_idx, next_bottleneck, next_length});
                 }
             }
@@ -1030,6 +1040,8 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
             return edge;
         }
 
+        edge.clean_a = start_clean[target_idx];
+        edge.clean_b = target_clean[target_idx];
         edge.bottleneck_dt = best[target_idx];
         edge.length = best_length[target_idx];
         for (int idx = target_idx; idx >= 0 && parent[idx] != idx;
@@ -1088,6 +1100,16 @@ cv::Mat connect_clean_skeleton_with_source_ridges(const cv::Mat& clean_skeleton,
         }
         for (const cv::Point pixel : edge.path) {
             out.at<std::uint8_t>(pixel.y, pixel.x) = 255;
+        }
+        if (!edge.path.empty()) {
+            if (edge.clean_a.x >= 0) {
+                cv::line(out, edge.clean_a, edge.path.back(), cv::Scalar(255),
+                         1, cv::LINE_8);
+            }
+            if (edge.clean_b.x >= 0) {
+                cv::line(out, edge.clean_b, edge.path.front(), cv::Scalar(255),
+                         1, cv::LINE_8);
+            }
         }
     }
 
@@ -1250,7 +1272,7 @@ ComponentVoronoiResult component_voronoi(const cv::Mat& binary) {
     cv::Mat connected_skeleton = connect_clean_skeleton_with_source_ridges(
         boundary_skeleton_pruned, source_pixel_ridges, dt_to_component);
     cv::Mat cell_loops_connected;
-    cv::bitwise_or(cell_loops, connected_skeleton, cell_loops_connected);
+    connected_skeleton.copyTo(cell_loops_connected);
 
     return {labels_to_u16(nearest_component, num_components - 1), boundaries,
             boundary_skeleton, boundary_skeleton_pruned, source_pixel_ridges,

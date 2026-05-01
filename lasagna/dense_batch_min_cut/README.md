@@ -42,12 +42,12 @@ Outputs:
   component-boundary skeleton plus selected source-pixel ridge connector pieces.
 - `<stem>_component_voronoi_cell_loops.tif`: contour loops of each component's
   raster Voronoi cell.
-- `<stem>_component_voronoi_cell_loops_connected.tif`: cell loops overlaid with
-  the clean pruned component-boundary skeleton plus selected source-pixel ridge
-  paths that attach to two disconnected clean skeleton components. The path
+- `<stem>_component_voronoi_cell_loops_connected.tif`: clean pruned
+  component-boundary skeleton plus selected source-pixel ridge paths. The path
   search runs on the dense source-pixel ridge mask, not the thinned diagnostic,
   and maximizes the minimum DT value along the path, with shorter paths used as
-  the tie-breaker.
+  the tie-breaker. Short attachment segments are drawn to close 1-pixel gaps
+  between selected paths and the clean skeleton.
 - `<stem>_component_voronoi_rings.tif`: per-component Voronoi cells with the
   source component carved out, rendered as candidate rings.
 - `<stem>_binary_contour_loops.tif`: hole contours from the binary foreground
