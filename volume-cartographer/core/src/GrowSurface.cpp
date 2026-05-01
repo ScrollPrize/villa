@@ -3303,21 +3303,35 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         const bool can_expand_right = !growth_config.disable_grid_expansion && growth_config.grow_right && remaining_right > 0 && w < max_grid_w;
         const bool can_expand_up = !growth_config.disable_grid_expansion && growth_config.grow_up && remaining_up > 0 && h < max_grid_h;
         const bool can_expand_down = !growth_config.disable_grid_expansion && growth_config.grow_down && remaining_down > 0 && h < max_grid_h;
+        auto emergency_consensus_retry = [&](const char* reason) {
+            if (configured_consensus_limit_th <= 2 ||
+                emergency_consensus_limit_th <= 2 ||
+                !fringe.empty()) {
+                return false;
+            }
+
+            --emergency_consensus_limit_th;
+            curr_best_inl_th = emergency_consensus_limit_th;
+            reseed_fringe_from_valid(used_area);
+            if (!fringe.empty()) {
+                std::cout << "last-chance consensus retry at inl_th "
+                          << curr_best_inl_th
+                          << " before " << reason
+                          << "; reseeded whole used_area " << used_area
+                          << std::endl;
+                return true;
+            }
+
+            std::cout << "last-chance consensus retry at inl_th "
+                      << curr_best_inl_th
+                      << " could not reseed whole used_area " << used_area
+                      << " before " << reason
+                      << std::endl;
+            return false;
+        };
+
         if (fringe.empty() && (can_expand_left || can_expand_right || can_expand_up || can_expand_down))
         {
-            if (loc_valid_count <= last_expansion_loc_valid_count) {
-                no_growth_expansions++;
-            } else {
-                no_growth_expansions = 0;
-            }
-            last_expansion_loc_valid_count = loc_valid_count;
-            if (growth_config.max_no_growth_expansions > 0 && no_growth_expansions >= growth_config.max_no_growth_expansions) {
-                std::cout << "stopping growth after " << no_growth_expansions
-                          << " expansions with no valid-count increase"
-                          << " (valid=" << loc_valid_count << ")" << std::endl;
-                break;
-            }
-            at_right_border = false;
             int width_capacity = max_grid_w - w;
             int height_capacity = max_grid_h - h;
             const int add_left = can_expand_left ? std::min({sliding_w, remaining_left, width_capacity}) : 0;
@@ -3331,6 +3345,62 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             if (new_w == w && new_h == h) {
                 break;
             }
+
+            const int overlap = 5;
+            const int inner_x0 = closing_r + 5;
+            const int inner_y0 = closing_r + 5;
+            const int inner_x1 = new_w - closing_r - 5;
+            const int inner_y1 = new_h - closing_r - 5;
+            const auto active_axis = [overlap](int add_before,
+                                               int add_after,
+                                               int used_start,
+                                               int used_end,
+                                               int inner_start,
+                                               int inner_end) {
+                if (add_before > 0 && add_after > 0) {
+                    return std::pair<int, int>(inner_start, inner_end);
+                }
+                if (add_before > 0) {
+                    return std::pair<int, int>(
+                        std::max(inner_start, used_start - add_before - overlap),
+                        std::min(inner_end, used_start + overlap));
+                }
+                if (add_after > 0) {
+                    return std::pair<int, int>(
+                        std::max(inner_start, used_end - overlap),
+                        std::min(inner_end, used_end + add_after + overlap));
+                }
+                return std::pair<int, int>(inner_start, inner_end);
+            };
+            const cv::Rect predicted_used_area =
+                used_area + cv::Point(add_left, add_up);
+            const auto [predicted_active_x0, predicted_active_x1] = active_axis(
+                add_left, add_right, predicted_used_area.x, predicted_used_area.br().x, inner_x0, inner_x1);
+            const auto [predicted_active_y0, predicted_active_y1] = active_axis(
+                add_up, add_down, predicted_used_area.y, predicted_used_area.br().y, inner_y0, inner_y1);
+            const cv::Rect predicted_active_bounds(
+                predicted_active_x0,
+                predicted_active_y0,
+                std::max(0, predicted_active_x1 - predicted_active_x0),
+                std::max(0, predicted_active_y1 - predicted_active_y0));
+            if ((predicted_active_bounds & predicted_used_area).area() == 0 &&
+                emergency_consensus_retry("terminal empty-active expansion")) {
+                continue;
+            }
+
+            if (loc_valid_count <= last_expansion_loc_valid_count) {
+                no_growth_expansions++;
+            } else {
+                no_growth_expansions = 0;
+            }
+            last_expansion_loc_valid_count = loc_valid_count;
+            if (growth_config.max_no_growth_expansions > 0 && no_growth_expansions >= growth_config.max_no_growth_expansions) {
+                std::cout << "stopping growth after " << no_growth_expansions
+                          << " expansions with no valid-count increase"
+                          << " (valid=" << loc_valid_count << ")" << std::endl;
+                break;
+            }
+            at_right_border = false;
             std::cout << "expanding by left=" << add_left
                       << " right=" << add_right
                       << " up=" << add_up
@@ -3374,32 +3444,6 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 y0 += add_up;
             }
 
-            int overlap = 5;
-            const int inner_x0 = closing_r + 5;
-            const int inner_y0 = closing_r + 5;
-            const int inner_x1 = w - closing_r - 5;
-            const int inner_y1 = h - closing_r - 5;
-            const auto active_axis = [overlap](int add_before,
-                                               int add_after,
-                                               int used_start,
-                                               int used_end,
-                                               int inner_start,
-                                               int inner_end) {
-                if (add_before > 0 && add_after > 0) {
-                    return std::pair<int, int>(inner_start, inner_end);
-                }
-                if (add_before > 0) {
-                    return std::pair<int, int>(
-                        std::max(inner_start, used_start - add_before - overlap),
-                        std::min(inner_end, used_start + overlap));
-                }
-                if (add_after > 0) {
-                    return std::pair<int, int>(
-                        std::max(inner_start, used_end - overlap),
-                        std::min(inner_end, used_end + add_after + overlap));
-                }
-                return std::pair<int, int>(inner_start, inner_end);
-            };
             const auto [active_x0, active_x1] = active_axis(
                 add_left, add_right, used_area.x, used_area.br().x, inner_x0, inner_x1);
             const auto [active_y0, active_y1] = active_axis(
@@ -3460,32 +3504,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             fringe.empty() &&
             emergency_consensus_limit_th > 2 &&
             horizontal_expansion_blocked) {
-            --emergency_consensus_limit_th;
-            curr_best_inl_th = emergency_consensus_limit_th;
-            cv::Rect active = active_bounds & used_area;
-            reseed_fringe_from_valid(active);
-            if (fringe.empty()) {
-                reseed_fringe_from_valid(used_area);
-            }
-            if (!fringe.empty()) {
-                std::cout << "last-chance consensus retry at inl_th "
-                          << curr_best_inl_th
-                          << " after horizontally blocked expansion"
-                          << " (w=" << w
-                          << " max_grid_w=" << max_grid_w
-                          << " remaining_left=" << current_remaining_left
-                          << " remaining_right=" << current_remaining_right
-                          << ")" << std::endl;
+            if (emergency_consensus_retry("horizontally blocked expansion")) {
                 continue;
             }
-            std::cout << "last-chance consensus retry at inl_th "
-                      << curr_best_inl_th
-                      << " could not reseed after horizontally blocked expansion"
-                      << " (w=" << w
-                      << " max_grid_w=" << max_grid_w
-                      << " remaining_left=" << current_remaining_left
-                      << " remaining_right=" << current_remaining_right
-                      << ")" << std::endl;
         }
 
         if (fringe.empty())
