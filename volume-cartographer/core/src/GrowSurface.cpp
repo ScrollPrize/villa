@@ -7,6 +7,7 @@
 
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Geometry.hpp"
+#include "vc/core/util/PointIndex.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/tracer/SurfaceModeling.hpp"
@@ -148,6 +149,124 @@ static cv::Vec2d deterministic_probe_jitter(const cv::Vec2i& p)
     };
 }
 
+struct LocalSurfaceLocSample
+{
+    cv::Vec2d grid_offset;
+    cv::Vec2d loc;
+};
+
+static cv::Vec2d median_surface_loc(std::vector<LocalSurfaceLocSample> samples)
+{
+    auto median_component = [&](int component) {
+        std::vector<double> values;
+        values.reserve(samples.size());
+        for (const auto& sample : samples) {
+            values.push_back(sample.loc[component]);
+        }
+        const size_t mid = values.size() / 2;
+        std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(mid), values.end());
+        double median = values[mid];
+        if ((values.size() % 2) == 0) {
+            std::nth_element(values.begin(), values.begin() + static_cast<std::ptrdiff_t>(mid - 1), values.end());
+            median = 0.5 * (median + values[mid - 1]);
+        }
+        return median;
+    };
+
+    return {median_component(0), median_component(1)};
+}
+
+static std::optional<cv::Vec2d> affine_surface_loc_prediction(
+    const std::vector<LocalSurfaceLocSample>& samples,
+    const std::optional<size_t>& skip_sample = std::nullopt)
+{
+    const size_t fit_count = samples.size() - (skip_sample.has_value() ? 1 : 0);
+    if (fit_count < 3) {
+        return std::nullopt;
+    }
+
+    cv::Mat_<double> a(static_cast<int>(fit_count), 3);
+    cv::Mat_<double> bu(static_cast<int>(fit_count), 1);
+    cv::Mat_<double> bv(static_cast<int>(fit_count), 1);
+    int row = 0;
+    for (size_t idx = 0; idx < samples.size(); ++idx) {
+        if (skip_sample.has_value() && idx == *skip_sample) {
+            continue;
+        }
+        const auto& sample = samples[idx];
+        a(row, 0) = 1.0;
+        a(row, 1) = sample.grid_offset[0];
+        a(row, 2) = sample.grid_offset[1];
+        bu(row, 0) = sample.loc[0];
+        bv(row, 0) = sample.loc[1];
+        ++row;
+    }
+
+    cv::Mat_<double> xu;
+    cv::Mat_<double> xv;
+    if (!cv::solve(a, bu, xu, cv::DECOMP_SVD) || !cv::solve(a, bv, xv, cv::DECOMP_SVD)) {
+        return std::nullopt;
+    }
+
+    return cv::Vec2d(xu(0, 0), xv(0, 0));
+}
+
+static cv::Vec2d robust_affine_surface_loc_prediction(const std::vector<LocalSurfaceLocSample>& samples)
+{
+    if (samples.empty()) {
+        return {-1, -1};
+    }
+    if (samples.size() < 3) {
+        return median_surface_loc(samples);
+    }
+
+    auto prediction = affine_surface_loc_prediction(samples);
+    if (!prediction.has_value()) {
+        return median_surface_loc(samples);
+    }
+
+    if (samples.size() < 4) {
+        return *prediction;
+    }
+
+    size_t worst_idx = 0;
+    double worst_residual_sq = -1.0;
+    for (size_t idx = 0; idx < samples.size(); ++idx) {
+        const auto& sample = samples[idx];
+        cv::Matx<double, 1, 3> row(1.0, sample.grid_offset[0], sample.grid_offset[1]);
+
+        cv::Mat_<double> a(static_cast<int>(samples.size()), 3);
+        cv::Mat_<double> bu(static_cast<int>(samples.size()), 1);
+        cv::Mat_<double> bv(static_cast<int>(samples.size()), 1);
+        for (size_t fit_idx = 0; fit_idx < samples.size(); ++fit_idx) {
+            const auto& fit_sample = samples[fit_idx];
+            a(static_cast<int>(fit_idx), 0) = 1.0;
+            a(static_cast<int>(fit_idx), 1) = fit_sample.grid_offset[0];
+            a(static_cast<int>(fit_idx), 2) = fit_sample.grid_offset[1];
+            bu(static_cast<int>(fit_idx), 0) = fit_sample.loc[0];
+            bv(static_cast<int>(fit_idx), 0) = fit_sample.loc[1];
+        }
+        cv::Mat_<double> xu;
+        cv::Mat_<double> xv;
+        if (!cv::solve(a, bu, xu, cv::DECOMP_SVD) || !cv::solve(a, bv, xv, cv::DECOMP_SVD)) {
+            return median_surface_loc(samples);
+        }
+
+        const cv::Vec2d fitted(
+            row(0, 0) * xu(0, 0) + row(0, 1) * xu(1, 0) + row(0, 2) * xu(2, 0),
+            row(0, 0) * xv(0, 0) + row(0, 1) * xv(1, 0) + row(0, 2) * xv(2, 0));
+        const cv::Vec2d residual = fitted - sample.loc;
+        const double residual_sq = residual.dot(residual);
+        if (residual_sq > worst_residual_sq) {
+            worst_residual_sq = residual_sq;
+            worst_idx = idx;
+        }
+    }
+
+    auto trimmed_prediction = affine_surface_loc_prediction(samples, worst_idx);
+    return trimmed_prediction.value_or(*prediction);
+}
+
 static void copy(const SurfTrackerData &src, SurfTrackerData &tgt, const cv::Rect &roi_)
 {
     cv::Rect roi(roi_.y,roi_.x,roi_.height,roi_.width);
@@ -181,6 +300,74 @@ static void copy(const SurfTrackerData &src, SurfTrackerData &tgt, const cv::Rec
 
     // tgt.seed_loc = src.seed_loc;
     // tgt.seed_coord = src.seed_coord;
+}
+
+static int remove_components_disconnected_from_seed(SurfTrackerData& data,
+                                                    cv::Mat_<uint8_t>& state,
+                                                    cv::Mat_<cv::Vec3d>& points)
+{
+    const cv::Vec2i seed = data.seed_loc;
+    if (seed[0] < 0 || seed[0] >= state.rows || seed[1] < 0 || seed[1] >= state.cols ||
+        !(state(seed) & STATE_LOC_VALID)) {
+        std::cout << "connected components: seed is not valid, skipping cleanup at "
+                  << seed << std::endl;
+        return 0;
+    }
+
+    cv::Mat_<uint8_t> reachable(state.size(), static_cast<uint8_t>(0));
+    std::vector<cv::Vec2i> queue;
+    queue.reserve(static_cast<size_t>(std::max(1, state.rows * state.cols / 8)));
+    reachable(seed) = 1;
+    queue.push_back(seed);
+
+    const cv::Vec2i offsets[] = {
+        {-1, -1},
+        {-1,  0},
+        {-1,  1},
+        { 0, -1},
+        { 0,  1},
+        { 1, -1},
+        { 1,  0},
+        { 1,  1},
+    };
+
+    for (size_t idx = 0; idx < queue.size(); ++idx) {
+        const cv::Vec2i p = queue[idx];
+        for (const cv::Vec2i& offset : offsets) {
+            const cv::Vec2i q = p + offset;
+            if (q[0] < 0 || q[0] >= state.rows || q[1] < 0 || q[1] >= state.cols)
+                continue;
+            if (reachable(q) || !(state(q) & STATE_LOC_VALID))
+                continue;
+            reachable(q) = 1;
+            queue.push_back(q);
+        }
+    }
+
+    int removed = 0;
+    for (int j = 0; j < state.rows; ++j) {
+        for (int i = 0; i < state.cols; ++i) {
+            const cv::Vec2i p(j, i);
+            if (!(state(p) & STATE_LOC_VALID) || reachable(p))
+                continue;
+
+            std::set<QuadSurface*> surf_src = data.surfsC(p);
+            for (QuadSurface* surf : surf_src) {
+                data.erase(surf, p);
+                data.eraseSurf(surf, p);
+            }
+            data._surfs.erase(p);
+            state(p) = 0;
+            points(p) = {-1, -1, -1};
+            ++removed;
+        }
+    }
+
+    if (removed > 0) {
+        std::cout << "connected components: removed " << removed
+                  << " points disconnected from seed " << seed << std::endl;
+    }
+    return removed;
 }
 
 static std::set<QuadSurface*> surface_patch_candidates(SurfacePatchIndex* surface_patch_index,
@@ -808,9 +995,16 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
     cv::Rect static_bounds, float step, float src_step, const cv::Vec2i &seed, int closing_r, bool keep_inpainted = false,
     const std::filesystem::path& tgt_dir = std::filesystem::path(),
     SurfacePatchIndex* surface_patch_index = nullptr,
-    bool debug_images = false)
+    bool debug_images = false,
+    int reopt_support_radius = 0,
+    bool reopt_robust_affine_support = false,
+    bool reopt_drop_unsupported_points = true)
 {
     std::cout << "optimizer: optimizing surface " << state.size() << " " << used_area <<  " " << static_bounds << std::endl;
+    reopt_support_radius = std::max(0, reopt_support_radius);
+    std::cout << "optimizer: reopt_support_radius " << reopt_support_radius
+              << " reopt_robust_affine_support " << reopt_robust_affine_support
+              << " reopt_drop_unsupported_points " << reopt_drop_unsupported_points << std::endl;
 
     cv::Mat_<cv::Vec3d> points_new = points.clone();
     // QuadSurface destruction can release storage shared with optimizer helper
@@ -1011,10 +1205,24 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                     state_out(j, i) = STATE_LOC_VALID | STATE_COORD_VALID;
 
                     std::set<QuadSurface *> surfs;
-                    surfs.insert(data.surfsC({y,x}).begin(), data.surfsC({y,x}).end());
-                    surfs.insert(data.surfsC({y,x+1}).begin(), data.surfsC({y,x+1}).end());
-                    surfs.insert(data.surfsC({y+1,x}).begin(), data.surfsC({y+1,x}).end());
-                    surfs.insert(data.surfsC({y+1,x+1}).begin(), data.surfsC({y+1,x+1}).end());
+                    const cv::Vec2d src_loc = data_inp.loc(sm_inp, {j,i});
+                    auto add_support_surfs_at = [&](int yy, int xx) {
+                        if (yy < 0 || yy >= state.rows || xx < 0 || xx >= state.cols)
+                            return;
+                        const auto& cell_surfs = data.surfsC({yy, xx});
+                        surfs.insert(cell_surfs.begin(), cell_surfs.end());
+                    };
+
+                    if (reopt_support_radius > 0) {
+                        for (int yy = y - reopt_support_radius; yy <= y + reopt_support_radius + 1; ++yy)
+                            for (int xx = x - reopt_support_radius; xx <= x + reopt_support_radius + 1; ++xx)
+                                add_support_surfs_at(yy, xx);
+                    } else {
+                        add_support_surfs_at(y, x);
+                        add_support_surfs_at(y, x + 1);
+                        add_support_surfs_at(y + 1, x);
+                        add_support_surfs_at(y + 1, x + 1);
+                    }
 
                     for(auto &s : surfs) {
                         auto ptr = s->pointer();
@@ -1026,6 +1234,37 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
                             cv::Vec3f loc = s->loc_raw(ptr);
                             data_out.loc(s, {j,i}) = {loc[1], loc[0]};
                             mutex.unlock();
+                        }
+                        else if (reopt_robust_affine_support) {
+                            std::vector<LocalSurfaceLocSample> loc_samples;
+                            const int sample_radius = std::max(1, reopt_support_radius);
+                            for (int yy = y - sample_radius; yy <= y + sample_radius + 1; ++yy) {
+                                for (int xx = x - sample_radius; xx <= x + sample_radius + 1; ++xx) {
+                                    if (yy < 0 || yy >= state.rows || xx < 0 || xx >= state.cols)
+                                        continue;
+                                    if ((state(yy, xx) & STATE_LOC_VALID) == 0 || !data.valid_int(s, {yy, xx}))
+                                        continue;
+                                    loc_samples.push_back({
+                                        cv::Vec2d(static_cast<double>(yy) - src_loc[0],
+                                                  static_cast<double>(xx) - src_loc[1]),
+                                        data.loc(s, {yy, xx})
+                                    });
+                                }
+                            }
+
+                            if (!loc_samples.empty()) {
+                                const cv::Vec2d predicted_loc = robust_affine_surface_loc_prediction(loc_samples);
+                                const cv::Vec3d coord = SurfTrackerData::lookup_int_loc(
+                                    s,
+                                    cv::Vec2f(static_cast<float>(predicted_loc[0]),
+                                              static_cast<float>(predicted_loc[1])));
+                                if (coord[0] != -1 && cv::norm(coord - points_out(j, i)) <= same_surface_th) {
+                                    mutex.lock();
+                                    data_out.surfs({j,i}).insert(s);
+                                    data_out.loc(s, {j,i}) = predicted_loc;
+                                    mutex.unlock();
+                                }
+                            }
                         }
                     }
                 }
@@ -1099,22 +1338,26 @@ static void optimize_surface_mapping(SurfTrackerData &data, cv::Mat_<uint8_t> &s
         std::cout << "optimizer: added " << added << std::endl;
     }
 
-    //reset unsupported points
+    if (reopt_drop_unsupported_points) {
+        //reset unsupported points
 #pragma omp parallel for
-    for(int j=used_area.y;j<used_area.br().y-1;j++)
-        for(int i=used_area.x;i<used_area.br().x-1;i++)
-            if (!static_bounds.contains(cv::Point(i,j))) {
-                if (state_out(j,i) & STATE_LOC_VALID) {
-                    if (data_out.surfs({j,i}).empty()) {
+        for(int j=used_area.y;j<used_area.br().y-1;j++)
+            for(int i=used_area.x;i<used_area.br().x-1;i++)
+                if (!static_bounds.contains(cv::Point(i,j))) {
+                    if (state_out(j,i) & STATE_LOC_VALID) {
+                        if (data_out.surfs({j,i}).empty()) {
+                            state_out(j,i) = 0;
+                            points_out(j, i) = {-1,-1,-1};
+                        }
+                    }
+                    else {
                         state_out(j,i) = 0;
                         points_out(j, i) = {-1,-1,-1};
                     }
                 }
-                else {
-                    state_out(j,i) = 0;
-                    points_out(j, i) = {-1,-1,-1};
-                }
-            }
+    } else {
+        std::cout << "optimizer: retaining unsupported points after reopt" << std::endl;
+    }
 
     points = points_out;
     state = state_out;
@@ -1160,6 +1403,27 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     int max_width = params.value("max_width", 80000);
     int max_height = std::max(1, params.value("max_height", 50000));
     const bool debug_images = params.value("debug_images", false);
+    const bool robust_affine_initial_guess = params.value("robust_affine_initial_guess", false);
+    const int robust_affine_sample_radius = std::max(1, params.value("robust_affine_sample_radius", 1));
+    const int reopt_support_radius = std::max(0, params.value("reopt_support_radius", 0));
+    const bool reopt_robust_affine_support = params.value("reopt_robust_affine_support", false);
+    const bool reopt_drop_unsupported_points = params.value("reopt_drop_unsupported_points", true);
+    const bool reopt_drop_disconnected_components = params.value("reopt_drop_disconnected_components", false);
+    const bool sweep_prune_distance_enabled = params.value("sweep_prune_distance_enabled", false);
+    const std::string sweep_prune_target_path = params.value("sweep_prune_target_path", std::string{});
+    const double sweep_prune_best_coverage_adjusted_distance_vx =
+        params.value("sweep_prune_best_coverage_adjusted_distance_vx", std::numeric_limits<double>::infinity());
+    const double sweep_prune_target_area_vx2 =
+        params.value("sweep_prune_target_area_vx2", 0.0);
+    const double sweep_prune_distance_margin =
+        std::max(1.0, params.value("sweep_prune_distance_margin", 1.5));
+    const double sweep_prune_search_radius_vx =
+        std::max(1.0, params.value("sweep_prune_search_radius_vx", 1000.0));
+    const int sweep_prune_min_generations = std::max(0, params.value("sweep_prune_min_generations", 1000));
+    const int sweep_prune_interval_generations = std::max(1, params.value("sweep_prune_interval_generations", 10));
+    const int sweep_prune_min_valid_cells = std::max(1, params.value("sweep_prune_min_valid_cells", 100));
+    const int sweep_prune_max_samples = std::max(1, params.value("sweep_prune_max_samples", 2000));
+    const int reopt_interval = std::max(0, params.value("reopt_interval", 0));
 
     local_cost_inl_th = params.value("local_cost_inl_th", 0.2f);
     same_surface_th = params.value("same_surface_th", 2.0f);
@@ -1213,6 +1477,21 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     std::cout << "  dist_loss_3d_w: " << dist_loss_3d_w << std::endl;
     std::cout << "  max_width: " << max_width << std::endl;
     std::cout << "  max_height: " << max_height << std::endl;
+    std::cout << "  robust_affine_initial_guess: " << robust_affine_initial_guess << std::endl;
+    std::cout << "  robust_affine_sample_radius: " << robust_affine_sample_radius << std::endl;
+    std::cout << "  reopt_support_radius: " << reopt_support_radius << std::endl;
+    std::cout << "  reopt_robust_affine_support: " << reopt_robust_affine_support << std::endl;
+    std::cout << "  reopt_drop_unsupported_points: " << reopt_drop_unsupported_points << std::endl;
+    std::cout << "  reopt_drop_disconnected_components: " << reopt_drop_disconnected_components << std::endl;
+    if (sweep_prune_distance_enabled) {
+        std::cout << "  sweep_prune_distance: best_coverage_adjusted_vx=" << sweep_prune_best_coverage_adjusted_distance_vx
+                  << " target=" << sweep_prune_target_path
+                  << " target_area_vx2=" << sweep_prune_target_area_vx2
+                  << " margin=" << sweep_prune_distance_margin
+                  << " search_radius_vx=" << sweep_prune_search_radius_vx
+                  << " min_generations=" << sweep_prune_min_generations << std::endl;
+    }
+    std::cout << "  reopt_interval: " << reopt_interval << std::endl;
     if (external_surface_patch_index) {
         std::cout << "  external_surface_patch_index: true" << std::endl;
     }
@@ -1384,6 +1663,30 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
     SurfTrackerData data;
 
+    bool sweep_prune_distance_active = false;
+    std::shared_ptr<QuadSurface> sweep_prune_target_surface;
+    SurfacePatchIndex sweep_prune_target_index;
+    if (sweep_prune_distance_enabled &&
+        !sweep_prune_target_path.empty() &&
+        std::isfinite(sweep_prune_best_coverage_adjusted_distance_vx) &&
+        sweep_prune_target_area_vx2 > 0.0) {
+        try {
+            sweep_prune_target_surface = std::make_shared<QuadSurface>(std::filesystem::path(sweep_prune_target_path));
+            sweep_prune_target_surface->ensureLoaded();
+            sweep_prune_target_index.setReadOnly(true);
+            sweep_prune_target_index.rebuild({sweep_prune_target_surface}, 0.0f);
+            sweep_prune_distance_active = !sweep_prune_target_index.empty();
+            if (sweep_prune_distance_active) {
+                std::cout << "sweep distance prune target indexed: "
+                          << sweep_prune_target_path
+                          << " patches=" << sweep_prune_target_index.patchCount() << std::endl;
+            }
+        } catch (const std::exception& e) {
+            std::cout << "sweep distance prune disabled: failed to index target "
+                      << sweep_prune_target_path << ": " << e.what() << std::endl;
+        }
+    }
+
     bool initialized_from_resume = false;
     if (resume_growth) {
         cv::Mat resume_generations = seed->channel("generations");
@@ -1552,6 +1855,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     int succ = 0;
     int curr_best_inl_th = inlier_base_threshold;
     int last_succ_parametrization = 0;
+    bool suppress_empty_fringe_reopt_after_component_drop = false;
+    int component_drop_valid_count = 0;
+    bool component_drop_reopt_skip_logged = false;
 
     auto count_loc_valid_in_rect = [](const cv::Mat_<uint8_t>& state_, const cv::Rect& area) {
         const cv::Rect safe = area & cv::Rect(0, 0, state_.cols, state_.rows);
@@ -1796,12 +2102,20 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             for(auto ref_surf : local_surfs) {
                 int ref_count = 0;
                 cv::Vec2d avg = {0,0};
+                std::vector<LocalSurfaceLocSample> loc_samples;
                 bool ref_seed = false;
-                for(int oy=std::max(p[0]-r,0);oy<=std::min(p[0]+r,h-1);oy++)
-                    for(int ox=std::max(p[1]-r,0);ox<=std::min(p[1]+r,w-1);ox++)
+                const int sample_r = robust_affine_initial_guess ? robust_affine_sample_radius : r;
+                for(int oy=std::max(p[0]-sample_r,0);oy<=std::min(p[0]+sample_r,h-1);oy++)
+                    for(int ox=std::max(p[1]-sample_r,0);ox<=std::min(p[1]+sample_r,w-1);ox++)
                         if ((probe_state(oy,ox) & STATE_LOC_VALID) && probe_data.valid_int(ref_surf,{oy,ox})) {
+                            const cv::Vec2d loc = probe_data.loc(ref_surf,{oy,ox});
                             ref_count++;
-                            avg += probe_data.loc(ref_surf,{oy,ox});
+                            avg += loc;
+                            loc_samples.push_back({
+                                cv::Vec2d(static_cast<double>(oy - p[0]),
+                                          static_cast<double>(ox - p[1])),
+                                loc
+                            });
                             if (probe_data.seed_loc == cv::Vec2i(oy,ox))
                                 ref_seed = true;
                         }
@@ -1811,7 +2125,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
                 avg /= ref_count;
                 const uint8_t probe_state_old = probe_state(p);
-                probe_data.loc(ref_surf,p) = avg + deterministic_probe_jitter(p);
+                probe_data.loc(ref_surf,p) = robust_affine_initial_guess
+                    ? robust_affine_surface_loc_prediction(loc_samples)
+                    : avg + deterministic_probe_jitter(p);
                 probe_state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
 
                 ceres::Problem problem;
@@ -2340,22 +2656,38 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                               << " score " << selected_rollout.score
                               << " with " << selected_rollout.probes.size()
                               << " accepted points" << std::endl;
-                    std::vector<RolloutProbe> live_rollout_probes;
-                    live_rollout_probes.reserve(selected_rollout.probes.size());
+                    SurfTrackerData rollout_revalidate_data = data;
+                    cv::Mat_<uint8_t> rollout_revalidate_state = state.clone();
+                    cv::Mat_<cv::Vec3d> rollout_revalidate_points = points.clone();
+                    cv::Rect rollout_revalidate_used_area = used_area;
+                    std::vector<cv::Vec2i> rollout_revalidate_frontier;
+                    std::vector<RolloutProbe> revalidated_rollout_probes;
+                    revalidated_rollout_probes.reserve(selected_rollout.probes.size());
                     for (const RolloutProbe& probe : selected_rollout.probes) {
-                        RolloutProbe live_probe = probe_candidate(probe.p, data, state, points, used_area, false);
-                        if (live_probe.accepted && live_probe.surf) {
-                            live_rollout_probes.push_back(live_probe);
+                        RolloutProbe revalidated_probe = probe_candidate(probe.p,
+                                                                         rollout_revalidate_data,
+                                                                         rollout_revalidate_state,
+                                                                         rollout_revalidate_points,
+                                                                         rollout_revalidate_used_area,
+                                                                         false);
+                        if (commit_rollout_probe_speculative(revalidated_probe,
+                                                             rollout_revalidate_data,
+                                                             rollout_revalidate_state,
+                                                             rollout_revalidate_points,
+                                                             rollout_revalidate_used_area,
+                                                             rollout_revalidate_frontier)) {
+                            revalidated_rollout_probes.push_back(revalidated_probe);
                         }
                     }
-                    if (live_rollout_probes.size() == 1 &&
-                        !completes_existing_l_shape(live_rollout_probes.front().p)) {
+                    if (revalidated_rollout_probes.size() == 1 &&
+                        !completes_existing_l_shape(revalidated_rollout_probes.front().p)) {
                         std::cout << "rollout rejected one non-L point after live revalidation" << std::endl;
-                        live_rollout_probes.clear();
+                        revalidated_rollout_probes.clear();
                     }
                     std::vector<cv::Vec2i> rollout_frontier_committed;
                     int rollout_committed = 0;
-                    for (const RolloutProbe& live_probe : live_rollout_probes) {
+                    for (const RolloutProbe& probe : revalidated_rollout_probes) {
+                        RolloutProbe live_probe = probe_candidate(probe.p, data, state, points, used_area, false);
                         if (!commit_rollout_probe_final(live_probe, rollout_frontier_committed))
                             continue;
                         generations(live_probe.p) = static_cast<uint16_t>(std::min(generation + 1, static_cast<int>(std::numeric_limits<uint16_t>::max())));
@@ -2437,12 +2769,20 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             for(auto ref_surf : local_surfs) {
                 int ref_count = 0;
                 cv::Vec2d avg = {0,0};
+                std::vector<LocalSurfaceLocSample> loc_samples;
                 bool ref_seed = false;
-                for(int oy=std::max(p[0]-r,0);oy<=std::min(p[0]+r,h-1);oy++)
-                    for(int ox=std::max(p[1]-r,0);ox<=std::min(p[1]+r,w-1);ox++)
+                const int sample_r = robust_affine_initial_guess ? robust_affine_sample_radius : r;
+                for(int oy=std::max(p[0]-sample_r,0);oy<=std::min(p[0]+sample_r,h-1);oy++)
+                    for(int ox=std::max(p[1]-sample_r,0);ox<=std::min(p[1]+sample_r,w-1);ox++)
                         if ((state(oy,ox) & STATE_LOC_VALID) && data_th.valid_int(ref_surf,{oy,ox})) {
+                            const cv::Vec2d loc = data_th.loc(ref_surf,{oy,ox});
                             ref_count++;
-                            avg += data_th.loc(ref_surf,{oy,ox});
+                            avg += loc;
+                            loc_samples.push_back({
+                                cv::Vec2d(static_cast<double>(oy - p[0]),
+                                          static_cast<double>(ox - p[1])),
+                                loc
+                            });
                             if (data_th.seed_loc == cv::Vec2i(oy,ox))
                                 ref_seed = true;
                         }
@@ -2452,7 +2792,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
 
                 avg /= ref_count;
 
-                data_th.loc(ref_surf,p) = avg + cv::Vec2d((rand() % 1000)/500.0-1, (rand() % 1000)/500.0-1);
+                data_th.loc(ref_surf,p) = robust_affine_initial_guess
+                    ? robust_affine_surface_loc_prediction(loc_samples)
+                    : avg + cv::Vec2d((rand() % 1000)/500.0-1, (rand() % 1000)/500.0-1);
 
                 state(p) = STATE_LOC_VALID | STATE_COORD_VALID;
 
@@ -2568,8 +2910,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                         int state_sum = state(tmp_loc_[1],tmp_loc_[0]) + state(tmp_loc_[1]+1,tmp_loc_[0]) + state(tmp_loc_[1],tmp_loc_[0]+1) + state(tmp_loc_[1]+1,tmp_loc_[0]+1);
                         best_inliers = -1;
                         best_ref_seed = false;
-                        if (!state_sum)
-                            throw std::runtime_error("this should not have any location?!");
+                        if (!state_sum && debug_images)
+                            std::cout << "candidate rejected: nearest same-surface location had no valid state" << std::endl;
                     }
                 }
                 }
@@ -2720,14 +3062,29 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         if (loc_valid_count > best_loc_valid_count) {
             save_best_surface(loc_valid_count);
         }
+        if (suppress_empty_fringe_reopt_after_component_drop &&
+            loc_valid_count > component_drop_valid_count) {
+            suppress_empty_fringe_reopt_after_component_drop = false;
+            component_drop_reopt_skip_logged = false;
+        }
 
-        bool update_mapping = (succ >= 1000 && (loc_valid_count-last_succ_parametrization) >= std::max(100.0, 0.3*last_succ_parametrization));
-        if (fringe.empty() && final_opts) {
+        const bool reopt_interval_due = reopt_interval > 0 && generation > 0 && (generation % reopt_interval) == 0;
+        bool update_mapping = reopt_interval > 0
+            ? reopt_interval_due
+            : (succ >= 1000 && (loc_valid_count-last_succ_parametrization) >= std::max(100.0, 0.3*last_succ_parametrization));
+        if (fringe.empty() && suppress_empty_fringe_reopt_after_component_drop) {
+            if (!component_drop_reopt_skip_logged) {
+                std::cout << "optimizer: skipping empty-fringe reopt after component cleanup"
+                          << " until new growth is accepted" << std::endl;
+                component_drop_reopt_skip_logged = true;
+            }
+            update_mapping = false;
+        } else if (fringe.empty() && final_opts && (reopt_interval == 0 || reopt_interval_due)) {
             final_opts--;
             update_mapping = true;
         }
 
-        if (!global_steps_per_window)
+        if (!global_steps_per_window && reopt_interval == 0)
             update_mapping = false;
 
         if (generation % 50 == 0 || update_mapping /*|| generation < 10*/) {
@@ -2783,7 +3140,9 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 const int valid_before_opt = count_loc_valid_in(state, active);
 
                 optimize_surface_mapping(opt_data, opt_state, opt_points, active, static_bounds, step, src_step,
-                                         opt_data.seed_loc, closing_r, true, tgt_dir, surface_patch_index_ptr, debug_images);
+                                         opt_data.seed_loc, closing_r, true, tgt_dir, surface_patch_index_ptr, debug_images,
+                                         reopt_support_radius, reopt_robust_affine_support,
+                                         reopt_drop_unsupported_points);
                 const int valid_after_opt = count_loc_valid_in(opt_state, active);
                 if (valid_before_opt > 0 && valid_after_opt * 2 < valid_before_opt) {
                     std::cout << "optimizer: rejecting mapping; valid points collapsed "
@@ -2792,6 +3151,13 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                     copy(opt_data, data, active);
                     opt_points(active).copyTo(points(active));
                     opt_state(active).copyTo(state(active));
+                    if (reopt_drop_disconnected_components &&
+                        remove_components_disconnected_from_seed(data, state, points) > 0) {
+                        loc_valid_count = count_loc_valid_in(state, used_area);
+                        suppress_empty_fringe_reopt_after_component_drop = true;
+                        component_drop_valid_count = loc_valid_count;
+                        component_drop_reopt_skip_logged = false;
+                    }
                 }
 
                 for(int i=0;i<omp_get_max_threads();i++) {
@@ -2835,6 +3201,78 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         printf("gen %d processing %lu fringe cands (total done %d fringe: %lu) area %.0f vx^2 (%f cm^2) best th: %d\n",
                generation, static_cast<unsigned long>(cands.size()), succ, static_cast<unsigned long>(fringe.size()),
                current_area_vx2, current_area_cm2, best_inliers_gen);
+
+        if (sweep_prune_distance_active &&
+            generation >= sweep_prune_min_generations &&
+            (generation % sweep_prune_interval_generations) == 0 &&
+            loc_valid_count >= sweep_prune_min_valid_cells) {
+            const int sample_stride = std::max(
+                1,
+                static_cast<int>(std::ceil(std::sqrt(
+                    static_cast<double>(loc_valid_count) /
+                    static_cast<double>(sweep_prune_max_samples)))));
+            double sum_distance = 0.0;
+            double max_distance = 0.0;
+            int samples = 0;
+            int misses = 0;
+            const cv::Rect safe_used_area = used_area & cv::Rect(0, 0, state.cols, state.rows);
+            for (int j = safe_used_area.y; j < safe_used_area.br().y; ++j) {
+                for (int i = safe_used_area.x; i < safe_used_area.br().x; ++i) {
+                    if ((j % sample_stride) != 0 || (i % sample_stride) != 0) {
+                        continue;
+                    }
+                    if ((state(j, i) & STATE_LOC_VALID) == 0) {
+                        continue;
+                    }
+                    const cv::Vec3d& p = points(j, i);
+                    if (!std::isfinite(p[0]) || !std::isfinite(p[1]) || !std::isfinite(p[2]) ||
+                        p[0] == -1.0) {
+                        continue;
+                    }
+
+                    SurfacePatchIndex::PointQuery query;
+                    query.worldPoint = cv::Vec3f(
+                        static_cast<float>(p[0]),
+                        static_cast<float>(p[1]),
+                        static_cast<float>(p[2]));
+                    query.tolerance = static_cast<float>(sweep_prune_search_radius_vx);
+                    auto hit = sweep_prune_target_index.locate(query);
+                    if (!hit) {
+                        misses++;
+                        continue;
+                    }
+                    sum_distance += hit->distance;
+                    max_distance = std::max(max_distance, static_cast<double>(hit->distance));
+                    samples++;
+                }
+            }
+
+            if (samples >= std::min(25, sweep_prune_min_valid_cells)) {
+                const double mean_distance = sum_distance / static_cast<double>(samples);
+                const double live_coverage =
+                    std::clamp(static_cast<double>(current_area_vx2) / sweep_prune_target_area_vx2, 0.0, 1.0);
+                const double coverage_adjusted_distance =
+                    mean_distance / std::max(0.05, live_coverage);
+                const double cutoff = std::max(
+                    sweep_prune_best_coverage_adjusted_distance_vx * sweep_prune_distance_margin,
+                    sweep_prune_best_coverage_adjusted_distance_vx + 1.0);
+                std::cout << "sweep distance prune check: gen=" << generation
+                          << " mean_vx=" << mean_distance
+                          << " live_coverage=" << live_coverage
+                          << " coverage_adjusted_vx=" << coverage_adjusted_distance
+                          << " best_coverage_adjusted_vx=" << sweep_prune_best_coverage_adjusted_distance_vx
+                          << " cutoff_vx=" << cutoff
+                          << " samples=" << samples
+                          << " misses=" << misses
+                          << " max_vx=" << max_distance << std::endl;
+                if (coverage_adjusted_distance > cutoff) {
+                    std::cout << "sweep distance prune: stopping run at generation " << generation
+                              << " because coverage-adjusted valid-cell mesh distance " << coverage_adjusted_distance
+                              << " exceeds cutoff " << cutoff << std::endl;
+                    break;
+                }
+            }
+        }
 
         //continue expansion
         const int max_grid_extent = std::max(1, static_cast<int>(max_width / step));

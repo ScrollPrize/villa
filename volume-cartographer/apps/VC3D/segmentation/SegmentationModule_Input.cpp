@@ -381,6 +381,10 @@ void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
                                           Qt::KeyboardModifiers modifiers,
                                           const QPointF& scenePos)
 {
+    if (_patchGraphCaptureActive) {
+        return;
+    }
+
     const bool isLeftButton = (button == Qt::LeftButton);
     const bool isRightButton = (button == Qt::RightButton);
 
@@ -536,6 +540,10 @@ void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
                                          Qt::KeyboardModifiers modifiers,
                                          const QPointF& scenePos)
 {
+    if (_patchGraphCaptureActive) {
+        return;
+    }
+
     if (_manualAddMode && handleManualAddMouseMove(viewer, buttons, scenePos)) {
         return;
     }
@@ -657,6 +665,10 @@ void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
                                             Qt::KeyboardModifiers /*modifiers*/,
                                             const QPointF& scenePos)
 {
+    if (_patchGraphCaptureActive) {
+        return;
+    }
+
     if (_manualAddMode) {
         Q_UNUSED(viewer);
         Q_UNUSED(worldPos);

@@ -100,6 +100,7 @@
 #include "SurfaceTreeWidget.hpp"
 #include "SeedingWidget.hpp"
 #include "DrawingWidget.hpp"
+#include "PatchGraphWidget.hpp"
 #include "CommandLineToolRunner.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
 #include "segmentation/SegmentationModule.hpp"
@@ -980,6 +981,9 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     _pathsOverlay = std::make_unique<PathsOverlayController>(this);
     _viewerManager->setPathsOverlay(_pathsOverlay.get());
 
+    _patchGraphOverlay = std::make_unique<PatchGraphOverlayController>(this);
+    _patchGraphOverlay->bindToViewerManager(_viewerManager.get());
+
     _bboxOverlay = std::make_unique<BBoxOverlayController>(this);
     _viewerManager->setBBoxOverlay(_bboxOverlay.get());
 
@@ -1127,6 +1131,7 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     // Ensure right-side tabified docks have a usable minimum size
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                _lasagnaDock,
+                               _patchGraphDock,
                                ui.dockWidgetDistanceTransform,
                                ui.dockWidgetDrawing }) {
         if (dock) {
@@ -1143,6 +1148,7 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
 
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                _lasagnaDock,
+                               _patchGraphDock,
                                ui.dockWidgetDistanceTransform,
                                ui.dockWidgetDrawing,
                                ui.dockWidgetVolumes,
@@ -1470,6 +1476,14 @@ void CWindow::configureViewerConnections(CTiledVolumeViewer* viewer)
         connect(viewer, &CTiledVolumeViewer::sendZSliceChanged,
                 _seedingWidget, &SeedingWidget::updateCurrentZSlice, Qt::UniqueConnection);
         viewer->setProperty("vc_seeding_bound", true);
+    }
+
+    if (_patchGraphWidget && !viewer->property("vc_patch_graph_bound").toBool()) {
+        connect(viewer, &CTiledVolumeViewer::sendMouseMoveVolume,
+                _patchGraphWidget, &PatchGraphWidget::onViewerMouseMove, Qt::UniqueConnection);
+        connect(viewer, &CTiledVolumeViewer::sendMouseReleaseVolume,
+                _patchGraphWidget, &PatchGraphWidget::onViewerMouseRelease, Qt::UniqueConnection);
+        viewer->setProperty("vc_patch_graph_bound", true);
     }
 
     if (_point_collection_widget && !viewer->property("vc_points_bound").toBool()) {
@@ -3062,6 +3076,19 @@ void CWindow::CreateWidgets(void)
     connect(_segmentationModule.get(), &SegmentationModule::approvalMaskSaved,
             _fileWatcher.get(), &FileWatcherService::markSegmentRecentlyEdited);
 
+    _patchGraphWidget = new PatchGraphWidget(_segmentationModule.get(),
+                                             _patchGraphOverlay.get(),
+                                             this);
+    _patchGraphDock = new QDockWidget(tr("Patch Graph"), this);
+    _patchGraphDock->setObjectName(QStringLiteral("dockWidgetPatchGraph"));
+    attachScrollAreaToDock(_patchGraphDock, _patchGraphWidget, QStringLiteral("dockWidgetPatchGraphContent"));
+    addDockWidget(Qt::RightDockWidgetArea, _patchGraphDock);
+    _patchGraphWidget->setEditingEnabled(_segmentationModule->editingEnabled());
+    connect(_segmentationModule.get(), &SegmentationModule::editingEnabledChanged,
+            _patchGraphWidget, &PatchGraphWidget::setEditingEnabled);
+    connect(_patchGraphWidget, &PatchGraphWidget::captureActiveChanged,
+            _segmentationModule.get(), &SegmentationModule::setPatchGraphCaptureActive);
+
     SegmentationGrower::Context growerContext{
         _segmentationModule.get(),
         _segmentationWidget,
@@ -3540,6 +3567,7 @@ void CWindow::CreateWidgets(void)
 
     // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, and Drawing together
     tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
+    tabifyDockWidget(ui.dockWidgetSegmentation, _patchGraphDock);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
     tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDrawing);

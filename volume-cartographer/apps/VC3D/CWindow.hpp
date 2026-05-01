@@ -27,6 +27,7 @@
 #include "overlays/PointsOverlayController.hpp"
 #include "overlays/RawPointsOverlayController.hpp"
 #include "overlays/PathsOverlayController.hpp"
+#include "overlays/PatchGraphOverlayController.hpp"
 #include "overlays/BBoxOverlayController.hpp"
 #include "overlays/VectorOverlayController.hpp"
 #include "overlays/PlaneSlicingOverlayController.hpp"
@@ -65,6 +66,7 @@ class QStandardItemModel;
 class FileWatcherService;
 class AxisAlignedSliceController;
 class SegmentationCommandHandler;
+class PatchGraphWidget;
 
 class CWindow : public QMainWindow
 {
@@ -195,6 +197,8 @@ private:
     SeedingWidget* _seedingWidget;
     SegmentationWidget* _segmentationWidget{nullptr};
     QDockWidget* _lasagnaDock{nullptr};
+    QDockWidget* _patchGraphDock{nullptr};
+    PatchGraphWidget* _patchGraphWidget{nullptr};
     DrawingWidget* _drawingWidget;
     CPointCollectionWidget* _point_collection_widget;
 
@@ -252,6 +256,7 @@ private:
     std::unique_ptr<PointsOverlayController> _pointsOverlay;
     std::unique_ptr<RawPointsOverlayController> _rawPointsOverlay;
     std::unique_ptr<PathsOverlayController> _pathsOverlay;
+    std::unique_ptr<PatchGraphOverlayController> _patchGraphOverlay;
     std::unique_ptr<BBoxOverlayController> _bboxOverlay;
     std::unique_ptr<VectorOverlayController> _vectorOverlay;
     std::unique_ptr<PlaneSlicingOverlayController> _planeSlicingOverlay;
