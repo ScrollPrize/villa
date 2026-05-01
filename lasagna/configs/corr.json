@@ -2,7 +2,7 @@
 	"base": {
 		"normal": 1.0,
 		"step": 10.0,
-		"smooth": 0.0001,
+		"smooth": 0.1,
 		"station_n": 0.0,
 		"station_t": 0.0001,
 		"winding_density": 0.01,
@@ -12,6 +12,9 @@
 		"corr": 0.0001,
 		"bend": 100.0,
 		"ext_offset": 0.0
+	},
+	"args": {
+		"winding_tgt_lr": 100.0
 	},
 	"stages": [
 		{
