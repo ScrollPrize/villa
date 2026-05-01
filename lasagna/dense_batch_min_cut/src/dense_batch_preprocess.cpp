@@ -883,10 +883,10 @@ cv::Mat source_pixel_label_ridges(const cv::Mat& white_domain,
     CV_Assert(source_pixel_labels.type() == CV_32S);
 
     cv::Mat ridges = cv::Mat::zeros(white_domain.size(), CV_8U);
-    cv::parallel_for_(cv::Range(1, white_domain.rows - 1),
+    cv::parallel_for_(cv::Range(0, white_domain.rows),
                       [&](const cv::Range& range) {
         for (int y = range.start; y < range.end; ++y) {
-            for (int x = 1; x < white_domain.cols - 1; ++x) {
+            for (int x = 0; x < white_domain.cols; ++x) {
                 if (white_domain.at<std::uint8_t>(y, x) == 0) {
                     continue;
                 }
@@ -901,12 +901,15 @@ cv::Mat source_pixel_label_ridges(const cv::Mat& white_domain,
                         if (dx == 0 && dy == 0) {
                             continue;
                         }
-                        if (white_domain.at<std::uint8_t>(y + dy, x + dx) ==
-                            0) {
+                        const int nx = x + dx;
+                        const int ny = y + dy;
+                        if (nx < 0 || nx >= white_domain.cols || ny < 0 ||
+                            ny >= white_domain.rows ||
+                            white_domain.at<std::uint8_t>(ny, nx) == 0) {
                             continue;
                         }
                         const int other =
-                            source_pixel_labels.at<int>(y + dy, x + dx);
+                            source_pixel_labels.at<int>(ny, nx);
                         if (other > 0 && other != center) {
                             touches_other = true;
                             break;
@@ -2719,10 +2722,10 @@ ComponentVoronoiResult component_voronoi(const cv::Mat& binary) {
     cv::Mat boundaries = cv::Mat::zeros(binary.size(), CV_8U);
     {
         const TimingMark timing = start_timing();
-        cv::parallel_for_(cv::Range(1, binary.rows - 1),
+        cv::parallel_for_(cv::Range(0, binary.rows),
                           [&](const cv::Range& range) {
             for (int y = range.start; y < range.end; ++y) {
-                for (int x = 1; x < binary.cols - 1; ++x) {
+                for (int x = 0; x < binary.cols; ++x) {
                     if (binary.at<std::uint8_t>(y, x) != 0) {
                         continue;
                     }
@@ -2736,8 +2739,14 @@ ComponentVoronoiResult component_voronoi(const cv::Mat& binary) {
                             if (dx == 0 && dy == 0) {
                                 continue;
                             }
+                            const int nx = x + dx;
+                            const int ny = y + dy;
+                            if (nx < 0 || nx >= binary.cols || ny < 0 ||
+                                ny >= binary.rows) {
+                                continue;
+                            }
                             const int other =
-                                nearest_component.at<int>(y + dy, x + dx);
+                                nearest_component.at<int>(ny, nx);
                             if (other > 0 && other != center) {
                                 touches_other = true;
                                 break;
@@ -2823,6 +2832,34 @@ ComponentVoronoiResult component_voronoi(const cv::Mat& binary) {
             cell_loops_connected,
             rings,
             timings};
+}
+
+cv::Mat add_valid_frame_to_skeleton(const cv::Mat& skeleton, const cv::Mat& dt) {
+    CV_Assert(skeleton.type() == CV_8U);
+    CV_Assert(dt.type() == CV_32F);
+    CV_Assert(skeleton.size() == dt.size());
+
+    cv::Mat out;
+    cv::threshold(skeleton, out, 0, 255, cv::THRESH_BINARY);
+    const auto add_if_valid = [&](const cv::Point pixel) {
+        if (dt.at<float>(pixel.y, pixel.x) > 0.0f) {
+            out.at<std::uint8_t>(pixel.y, pixel.x) = 255;
+        }
+    };
+
+    for (int x = 0; x < out.cols; ++x) {
+        add_if_valid(cv::Point(x, 0));
+        if (out.rows > 1) {
+            add_if_valid(cv::Point(x, out.rows - 1));
+        }
+    }
+    for (int y = 1; y < out.rows - 1; ++y) {
+        add_if_valid(cv::Point(0, y));
+        if (out.cols > 1) {
+            add_if_valid(cv::Point(out.cols - 1, y));
+        }
+    }
+    return out;
 }
 
 void write_image(const fs::path& path, const cv::Mat& image) {
@@ -2954,6 +2991,14 @@ int main(int argc, char** argv) {
             timings.insert(timings.end(),
                            component_voronoi_result.timings.begin(),
                            component_voronoi_result.timings.end());
+        }
+
+        {
+            const TimingMark timing = start_timing();
+            component_voronoi_result.cell_loops_connected =
+                add_valid_frame_to_skeleton(
+                    component_voronoi_result.cell_loops_connected, dt);
+            timings.push_back(finish_timing("add_valid_frame", timing));
         }
 
         SkeletonGraph graph;
