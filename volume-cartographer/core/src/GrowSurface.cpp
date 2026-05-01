@@ -3455,8 +3455,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
         const bool horizontal_expansion_blocked_by_max_width =
             !growth_config.disable_grid_expansion &&
             max_width_limit_reached &&
-            ((growth_config.grow_left && current_remaining_left > 0) ||
-             (growth_config.grow_right && current_remaining_right > 0));
+            (growth_config.grow_left || growth_config.grow_right);
 
         if (configured_consensus_limit_th > 2 &&
             fringe.empty() &&
