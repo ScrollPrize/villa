@@ -1,5 +1,6 @@
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <tiffio.h>
 
 #include <algorithm>
 #include <array>
@@ -1129,6 +1130,358 @@ struct ComponentVoronoiResult {
     cv::Mat rings;
 };
 
+struct GraphEdge {
+    int a = 0;
+    int b = 0;
+    float capacity = 0.0f;
+    std::vector<cv::Point> pixels;
+};
+
+struct SkeletonGraph {
+    std::vector<cv::Point2f> nodes;
+    std::vector<GraphEdge> edges;
+};
+
+std::vector<cv::Point> skeleton_neighbors(const cv::Mat& skeleton,
+                                          const cv::Point pixel) {
+    std::vector<cv::Point> neighbors;
+    neighbors.reserve(8);
+    for (int dy = -1; dy <= 1; ++dy) {
+        for (int dx = -1; dx <= 1; ++dx) {
+            if (dx == 0 && dy == 0) {
+                continue;
+            }
+            const int x = pixel.x + dx;
+            const int y = pixel.y + dy;
+            if (x < 0 || x >= skeleton.cols || y < 0 || y >= skeleton.rows) {
+                continue;
+            }
+            if (skeleton.at<std::uint8_t>(y, x) != 0) {
+                neighbors.push_back(cv::Point(x, y));
+            }
+        }
+    }
+    return neighbors;
+}
+
+int skeleton_topological_branch_count(const cv::Mat& skeleton,
+                                      const cv::Point pixel) {
+    const auto get = [&](int y, int x) -> std::uint8_t {
+        if (x < 0 || x >= skeleton.cols || y < 0 || y >= skeleton.rows) {
+            return 0;
+        }
+        return skeleton.at<std::uint8_t>(y, x);
+    };
+    const std::uint8_t p[8] = {
+        get(pixel.y - 1, pixel.x),     get(pixel.y - 1, pixel.x + 1),
+        get(pixel.y, pixel.x + 1),     get(pixel.y + 1, pixel.x + 1),
+        get(pixel.y + 1, pixel.x),     get(pixel.y + 1, pixel.x - 1),
+        get(pixel.y, pixel.x - 1),     get(pixel.y - 1, pixel.x - 1),
+    };
+    return transition_count(p);
+}
+
+void add_unique_label(std::vector<int>& labels, int label) {
+    if (label > 0 && std::find(labels.begin(), labels.end(), label) ==
+                         labels.end()) {
+        labels.push_back(label);
+    }
+}
+
+SkeletonGraph extract_skeleton_graph(const cv::Mat& skeleton, const cv::Mat& dt) {
+    CV_Assert(skeleton.type() == CV_8U);
+    CV_Assert(dt.type() == CV_32F);
+
+    cv::Mat skel;
+    cv::threshold(skeleton, skel, 0, 255, cv::THRESH_BINARY);
+
+    cv::Mat node_seed = cv::Mat::zeros(skel.size(), CV_8U);
+    for (int y = 0; y < skel.rows; ++y) {
+        for (int x = 0; x < skel.cols; ++x) {
+            if (skel.at<std::uint8_t>(y, x) == 0) {
+                continue;
+            }
+            const cv::Point pixel(x, y);
+            const int degree =
+                static_cast<int>(skeleton_neighbors(skel, pixel).size());
+            const int branches = skeleton_topological_branch_count(skel, pixel);
+            if (degree <= 1 || branches >= 3) {
+                node_seed.at<std::uint8_t>(y, x) = 255;
+            }
+        }
+    }
+
+    cv::Mat node_labels;
+    int num_nodes = cv::connectedComponents(node_seed, node_labels, 8, CV_32S);
+    std::vector<cv::Point2d> node_sums(static_cast<std::size_t>(num_nodes));
+    std::vector<int> node_counts(static_cast<std::size_t>(num_nodes), 0);
+    std::vector<std::vector<cv::Point>> node_pixels(
+        static_cast<std::size_t>(num_nodes));
+    for (int y = 0; y < node_labels.rows; ++y) {
+        for (int x = 0; x < node_labels.cols; ++x) {
+            const int label = node_labels.at<int>(y, x);
+            if (label <= 0) {
+                continue;
+            }
+            node_sums[label] += cv::Point2d(x, y);
+            ++node_counts[label];
+            node_pixels[label].push_back(cv::Point(x, y));
+        }
+    }
+
+    cv::Mat skeleton_components;
+    const int num_skeleton_components =
+        cv::connectedComponents(skel, skeleton_components, 8, CV_32S);
+    std::vector<char> component_has_node(
+        static_cast<std::size_t>(num_skeleton_components), 0);
+    std::vector<cv::Point> component_first_pixel(
+        static_cast<std::size_t>(num_skeleton_components), cv::Point(-1, -1));
+    for (int y = 0; y < skel.rows; ++y) {
+        for (int x = 0; x < skel.cols; ++x) {
+            if (skel.at<std::uint8_t>(y, x) == 0) {
+                continue;
+            }
+            const int component = skeleton_components.at<int>(y, x);
+            if (component_first_pixel[component].x < 0) {
+                component_first_pixel[component] = cv::Point(x, y);
+            }
+            if (node_labels.at<int>(y, x) > 0) {
+                component_has_node[component] = 1;
+            }
+        }
+    }
+
+    for (int component = 1; component < num_skeleton_components; ++component) {
+        if (component_has_node[component] != 0 ||
+            component_first_pixel[component].x < 0) {
+            continue;
+        }
+        const int label = num_nodes++;
+        const cv::Point pixel = component_first_pixel[component];
+        node_labels.at<int>(pixel.y, pixel.x) = label;
+        node_sums.push_back(cv::Point2d(pixel.x, pixel.y));
+        node_counts.push_back(1);
+        node_pixels.push_back({pixel});
+    }
+
+    SkeletonGraph graph;
+    graph.nodes.resize(static_cast<std::size_t>(num_nodes));
+    for (int label = 1; label < num_nodes; ++label) {
+        graph.nodes[label] =
+            cv::Point2f(static_cast<float>(node_sums[label].x / node_counts[label]),
+                        static_cast<float>(node_sums[label].y / node_counts[label]));
+    }
+
+    cv::Mat node_mask;
+    cv::compare(node_labels, 0, node_mask, cv::CMP_GT);
+
+    cv::Mat edge_mask = skel.clone();
+    edge_mask.setTo(0, node_mask);
+
+    cv::Mat edge_labels;
+    const int num_edge_components =
+        cv::connectedComponents(edge_mask, edge_labels, 8, CV_32S);
+    std::vector<GraphEdge> edge_components(
+        static_cast<std::size_t>(num_edge_components));
+    std::vector<std::vector<int>> touched_nodes(
+        static_cast<std::size_t>(num_edge_components));
+
+    for (int y = 0; y < edge_labels.rows; ++y) {
+        for (int x = 0; x < edge_labels.cols; ++x) {
+            const int edge_label = edge_labels.at<int>(y, x);
+            if (edge_label <= 0) {
+                continue;
+            }
+
+            GraphEdge& edge = edge_components[edge_label];
+            edge.pixels.push_back(cv::Point(x, y));
+            if (edge.pixels.size() == 1) {
+                edge.capacity = dt.at<float>(y, x);
+            } else {
+                edge.capacity = std::min(edge.capacity, dt.at<float>(y, x));
+            }
+
+            for (int dy = -1; dy <= 1; ++dy) {
+                for (int dx = -1; dx <= 1; ++dx) {
+                    if (dx == 0 && dy == 0) {
+                        continue;
+                    }
+                    const int nx = x + dx;
+                    const int ny = y + dy;
+                    if (nx < 0 || nx >= node_labels.cols || ny < 0 ||
+                        ny >= node_labels.rows) {
+                        continue;
+                    }
+                    const int node_label = node_labels.at<int>(ny, nx);
+                    if (node_label > 0) {
+                        add_unique_label(touched_nodes[edge_label], node_label);
+                        edge.capacity =
+                            std::min(edge.capacity, dt.at<float>(ny, nx));
+                    }
+                }
+            }
+        }
+    }
+
+    for (int edge_label = 1; edge_label < num_edge_components; ++edge_label) {
+        GraphEdge& edge = edge_components[edge_label];
+        if (edge.pixels.empty() || touched_nodes[edge_label].empty()) {
+            continue;
+        }
+
+        std::sort(touched_nodes[edge_label].begin(),
+                  touched_nodes[edge_label].end());
+        edge.a = touched_nodes[edge_label].front();
+        edge.b = touched_nodes[edge_label].size() > 1
+                     ? touched_nodes[edge_label][1]
+                     : touched_nodes[edge_label].front();
+        for (const int node : {edge.a, edge.b}) {
+            if (node <= 0 ||
+                node >= static_cast<int>(node_pixels.size())) {
+                continue;
+            }
+            for (const cv::Point pixel : node_pixels[node]) {
+                edge.pixels.push_back(pixel);
+                edge.capacity =
+                    std::min(edge.capacity, dt.at<float>(pixel.y, pixel.x));
+            }
+        }
+        graph.edges.push_back(std::move(edge));
+    }
+
+    cv::Mat covered = cv::Mat::zeros(skel.size(), CV_8U);
+    for (const GraphEdge& edge : graph.edges) {
+        for (const cv::Point pixel : edge.pixels) {
+            covered.at<std::uint8_t>(pixel.y, pixel.x) = 255;
+        }
+    }
+    cv::Mat uncovered;
+    cv::bitwise_and(skel, ~covered, uncovered);
+    cv::Mat uncovered_labels;
+    const int num_uncovered =
+        cv::connectedComponents(uncovered, uncovered_labels, 8, CV_32S);
+    std::vector<GraphEdge> uncovered_edges(
+        static_cast<std::size_t>(num_uncovered));
+    for (int y = 0; y < uncovered.rows; ++y) {
+        for (int x = 0; x < uncovered.cols; ++x) {
+            const int label = uncovered_labels.at<int>(y, x);
+            if (label <= 0) {
+                continue;
+            }
+            GraphEdge& edge = uncovered_edges[label];
+            edge.a = node_labels.at<int>(y, x);
+            edge.b = edge.a;
+            edge.pixels.push_back(cv::Point(x, y));
+            if (edge.pixels.size() == 1) {
+                edge.capacity = dt.at<float>(y, x);
+            } else {
+                edge.capacity = std::min(edge.capacity, dt.at<float>(y, x));
+            }
+        }
+    }
+    for (int label = 1; label < num_uncovered; ++label) {
+        if (!uncovered_edges[label].pixels.empty()) {
+            graph.edges.push_back(std::move(uncovered_edges[label]));
+        }
+    }
+
+    return graph;
+}
+
+cv::Scalar deterministic_edge_color(int edge_index) {
+    std::uint32_t value =
+        0x9E3779B9u * static_cast<std::uint32_t>(edge_index + 1);
+    int b = 96 + static_cast<int>(value & 0x7Fu);
+    int g = 96 + static_cast<int>((value >> 8U) & 0x7Fu);
+    int r = 96 + static_cast<int>((value >> 16U) & 0x7Fu);
+    switch ((value >> 24U) % 3U) {
+        case 0:
+            b = 255;
+            break;
+        case 1:
+            g = 255;
+            break;
+        default:
+            r = 255;
+            break;
+    }
+    return cv::Scalar(b, g, r);
+}
+
+void draw_graph_edge(cv::Mat& out, const GraphEdge& edge,
+                     const cv::Scalar color) {
+    for (const cv::Point pixel : edge.pixels) {
+        if (out.channels() == 1) {
+            out.at<std::uint8_t>(pixel.y, pixel.x) =
+                static_cast<std::uint8_t>(color[0]);
+        } else {
+            out.at<cv::Vec3b>(pixel.y, pixel.x) =
+                cv::Vec3b(static_cast<std::uint8_t>(color[0]),
+                          static_cast<std::uint8_t>(color[1]),
+                          static_cast<std::uint8_t>(color[2]));
+        }
+    }
+}
+
+cv::Mat render_graph_random_colors(const SkeletonGraph& graph, cv::Size size) {
+    cv::Mat out(size, CV_8UC3, cv::Scalar(0, 0, 0));
+    for (std::size_t i = 0; i < graph.edges.size(); ++i) {
+        draw_graph_edge(out, graph.edges[i],
+                        deterministic_edge_color(static_cast<int>(i)));
+    }
+    for (std::size_t label = 1; label < graph.nodes.size(); ++label) {
+        cv::circle(out, graph.nodes[label], 3, cv::Scalar(255, 255, 255),
+                   cv::FILLED, cv::LINE_8);
+        cv::circle(out, graph.nodes[label], 4, cv::Scalar(0, 0, 0), 1,
+                   cv::LINE_8);
+    }
+    return out;
+}
+
+cv::Mat render_graph_capacity(const SkeletonGraph& graph, cv::Size size) {
+    float max_capacity = 0.0f;
+    for (const GraphEdge& edge : graph.edges) {
+        max_capacity = std::max(max_capacity, edge.capacity);
+    }
+
+    cv::Mat out(size, CV_8UC1, cv::Scalar(0));
+    for (const GraphEdge& edge : graph.edges) {
+        const int value =
+            max_capacity > 0.0f
+                ? static_cast<int>(std::lround(
+                      std::clamp(edge.capacity / max_capacity, 0.0f, 1.0f) *
+                      255.0f))
+                : 0;
+        draw_graph_edge(out, edge, cv::Scalar(value));
+    }
+    for (std::size_t label = 1; label < graph.nodes.size(); ++label) {
+        cv::circle(out, graph.nodes[label], 3, cv::Scalar(255), cv::FILLED,
+                   cv::LINE_8);
+    }
+    return out;
+}
+
+cv::Mat to_bgr_layer(const cv::Mat& image) {
+    if (image.type() == CV_8UC3) {
+        return image;
+    }
+    cv::Mat u8;
+    if (image.depth() == CV_8U) {
+        u8 = image.channels() == 1 ? image : cv::Mat();
+    } else {
+        double max_value = 0.0;
+        cv::minMaxLoc(image, nullptr, &max_value);
+        if (max_value > 0.0) {
+            image.convertTo(u8, CV_8U, 255.0 / max_value);
+        } else {
+            u8 = cv::Mat::zeros(image.size(), CV_8U);
+        }
+    }
+    cv::Mat bgr;
+    cv::cvtColor(u8, bgr, cv::COLOR_GRAY2BGR);
+    return bgr;
+}
+
 cv::Mat labels_to_u16(const cv::Mat& labels, int max_label) {
     CV_Assert(labels.type() == CV_32S);
 
@@ -1286,6 +1639,86 @@ void write_image(const fs::path& path, const cv::Mat& image) {
     }
 }
 
+struct NamedLayer {
+    std::string name;
+    cv::Mat image;
+};
+
+void write_named_layered_tiff(const fs::path& path,
+                              const std::vector<NamedLayer>& layers) {
+    TIFF* tiff = TIFFOpen(path.string().c_str(), "w");
+    if (tiff == nullptr) {
+        throw std::runtime_error("failed to open layered TIFF: " +
+                                 path.string());
+    }
+
+    for (std::size_t layer_index = 0; layer_index < layers.size();
+         ++layer_index) {
+        const NamedLayer& layer = layers[layer_index];
+        CV_Assert(layer.image.depth() == CV_8U);
+        CV_Assert(layer.image.channels() == 1 || layer.image.channels() == 3);
+
+        cv::Mat image;
+        if (layer.image.isContinuous()) {
+            image = layer.image;
+        } else {
+            image = layer.image.clone();
+        }
+
+        const int channels = image.channels();
+        TIFFSetField(tiff, TIFFTAG_IMAGEWIDTH,
+                     static_cast<std::uint32_t>(image.cols));
+        TIFFSetField(tiff, TIFFTAG_IMAGELENGTH,
+                     static_cast<std::uint32_t>(image.rows));
+        TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL,
+                     static_cast<std::uint16_t>(channels));
+        TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE, static_cast<std::uint16_t>(8));
+        TIFFSetField(tiff, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
+        TIFFSetField(tiff, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
+        TIFFSetField(tiff, TIFFTAG_COMPRESSION, COMPRESSION_LZW);
+        TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC,
+                     channels == 1 ? PHOTOMETRIC_MINISBLACK : PHOTOMETRIC_RGB);
+        TIFFSetField(tiff, TIFFTAG_SUBFILETYPE, FILETYPE_PAGE);
+        TIFFSetField(tiff, TIFFTAG_PAGENUMBER,
+                     static_cast<std::uint16_t>(layer_index),
+                     static_cast<std::uint16_t>(layers.size()));
+        TIFFSetField(tiff, TIFFTAG_PAGENAME, layer.name.c_str());
+
+        std::vector<std::uint8_t> rgb_row(
+            static_cast<std::size_t>(image.cols * channels));
+        for (int y = 0; y < image.rows; ++y) {
+            const std::uint8_t* row = image.ptr<std::uint8_t>(y);
+            void* row_to_write = const_cast<std::uint8_t*>(row);
+            if (channels == 3) {
+                for (int x = 0; x < image.cols; ++x) {
+                    rgb_row[static_cast<std::size_t>(x * 3 + 0)] =
+                        row[x * 3 + 2];
+                    rgb_row[static_cast<std::size_t>(x * 3 + 1)] =
+                        row[x * 3 + 1];
+                    rgb_row[static_cast<std::size_t>(x * 3 + 2)] =
+                        row[x * 3 + 0];
+                }
+                row_to_write = rgb_row.data();
+            }
+
+            if (TIFFWriteScanline(tiff, row_to_write,
+                                  static_cast<std::uint32_t>(y), 0) < 0) {
+                TIFFClose(tiff);
+                throw std::runtime_error("failed to write layered TIFF row: " +
+                                         path.string());
+            }
+        }
+
+        if (TIFFWriteDirectory(tiff) != 1) {
+            TIFFClose(tiff);
+            throw std::runtime_error("failed to write layered TIFF directory: " +
+                                     path.string());
+        }
+    }
+
+    TIFFClose(tiff);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1307,6 +1740,14 @@ int main(int argc, char** argv) {
         const ComponentVoronoiResult component_voronoi_result =
             component_voronoi(binary);
         const auto component_voronoi_end = Clock::now();
+
+        const auto graph_start = Clock::now();
+        const SkeletonGraph graph = extract_skeleton_graph(
+            component_voronoi_result.cell_loops_connected, dt);
+        const cv::Mat graph_random_colors =
+            render_graph_random_colors(graph, binary.size());
+        const cv::Mat graph_capacity = render_graph_capacity(graph, binary.size());
+        const auto graph_end = Clock::now();
 
         const auto contour_loops_start = Clock::now();
         const cv::Mat contour_loops = binary_contour_loops(binary);
@@ -1346,6 +1787,20 @@ int main(int argc, char** argv) {
                     component_voronoi_result.rings);
         write_image(workdir / (stem + "_binary_contour_loops.tif"),
                     contour_loops);
+        write_image(workdir / (stem + "_graph_random_edges.tif"),
+                    graph_random_colors);
+        write_image(workdir / (stem + "_graph_capacity.tif"), graph_capacity);
+
+        const std::vector<NamedLayer> layered_tiff = {
+            {"dt", to_bgr_layer(dt_u16)},
+            {"loops", to_bgr_layer(component_voronoi_result.boundary_skeleton_pruned)},
+            {"loops_connected",
+             to_bgr_layer(component_voronoi_result.cell_loops_connected)},
+            {"graph_random_edges", graph_random_colors},
+            {"graph_capacity", to_bgr_layer(graph_capacity)},
+        };
+        write_named_layered_tiff(workdir / (stem + "_layers.tif"),
+                                 layered_tiff);
 
         std::cout << "Wrote:\n"
                   << "  " << (workdir / (stem + "_binary.tif")) << "\n"
@@ -1388,6 +1843,12 @@ int main(int argc, char** argv) {
                   << (workdir / (stem + "_component_voronoi_rings.tif"))
                   << "\n"
                   << "  " << (workdir / (stem + "_binary_contour_loops.tif"))
+                  << "\n"
+                  << "  " << (workdir / (stem + "_graph_random_edges.tif"))
+                  << "\n"
+                  << "  " << (workdir / (stem + "_graph_capacity.tif"))
+                  << "\n"
+                  << "  " << (workdir / (stem + "_layers.tif"))
                   << "\n";
         std::cout << "Timings:\n"
                   << "  component_voronoi_ms: "
@@ -1395,6 +1856,16 @@ int main(int argc, char** argv) {
                          component_voronoi_end - component_voronoi_start)
                          .count()
                   << "\n"
+                  << "  graph_extract_and_render_ms: "
+                  << std::chrono::duration<double, std::milli>(
+                         graph_end - graph_start)
+                         .count()
+                  << "\n"
+                  << "  graph_nodes: " << (graph.nodes.size() > 0
+                                               ? graph.nodes.size() - 1
+                                               : 0)
+                  << "\n"
+                  << "  graph_edges: " << graph.edges.size() << "\n"
                   << "  binary_contour_loops_ms: "
                   << std::chrono::duration<double, std::milli>(
                          contour_loops_end - contour_loops_start)

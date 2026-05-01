@@ -4,7 +4,8 @@ Small C++/OpenCV experiments for dense batched min-cut preprocessing.
 
 ## Build
 
-Requires OpenCV with `core`, `imgcodecs`, and `imgproc`.
+Requires OpenCV with `core`, `imgcodecs`, and `imgproc`, plus libtiff for
+named multipage TIFF layers.
 
 ```bash
 cmake -S lasagna/dense_batch_min_cut -B lasagna/dense_batch_min_cut/build
@@ -52,11 +53,22 @@ Outputs:
   source component carved out, rendered as candidate rings.
 - `<stem>_binary_contour_loops.tif`: hole contours from the binary foreground
   contour hierarchy.
+- `<stem>_graph_random_edges.tif`: graph visualization extracted from
+  `<stem>_component_voronoi_cell_loops_connected.tif`; graph nodes are small
+  circles at connected junction clusters, and edges are deterministic
+  pseudo-random colors.
+- `<stem>_graph_capacity.tif`: graph edges rendered in grayscale by edge
+  capacity, where capacity is the minimum raw distance-transform value along
+  the complete traced edge.
+- `<stem>_layers.tif`: named multipage TIFF for easier inspection in GIMP.
+  The pages are `dt`, `loops`, `loops_connected`, `graph_random_edges`, and
+  `graph_capacity`.
 
 The threshold and polarity are intentionally fixed for repeatable comparisons.
 The component Voronoi path treats each dark foreground connected component as
 one fat site, and computes cells/rings in the surrounding light region. The CLI
-prints timings in milliseconds for the component Voronoi and contour-loop paths.
+prints timings in milliseconds for the component Voronoi, graph extraction, and
+contour-loop paths.
 
 ## Candidate Optimizations
 
