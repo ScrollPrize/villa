@@ -1858,6 +1858,8 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     bool suppress_empty_fringe_reopt_after_component_drop = false;
     int component_drop_valid_count = 0;
     bool component_drop_reopt_skip_logged = false;
+    const int configured_consensus_limit_th = params.value("consensus_limit_th", 2);
+    int emergency_consensus_limit_th = configured_consensus_limit_th;
 
     auto count_loc_valid_in_rect = [](const cv::Mat_<uint8_t>& state_, const cv::Rect& area) {
         const cv::Rect safe = area & cv::Rect(0, 0, state_.cols, state_.rows);
@@ -1907,6 +1909,17 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             }
         }
         return count;
+    };
+
+    auto reseed_fringe_from_valid = [&](const cv::Rect& area) {
+        const cv::Rect active = area & cv::Rect(0, 0, state.cols, state.rows);
+        if (active.area() <= 0) {
+            return;
+        }
+        for(int j=std::max(0, active.y-2);j<=std::min(active.br().y+2, state.rows-1);j++)
+            for(int i=std::max(0, active.x-2);i<=std::min(active.br().x+2, state.cols-1);i++)
+                if (state(j,i) & STATE_LOC_VALID)
+                    fringe.insert(cv::Vec2i(j,i));
     };
 
     bool flip_x_done = !flip_x || initialized_from_resume;
@@ -1987,6 +2000,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
     bool at_right_border = false;
     std::optional<std::filesystem::path> current_snapshot_path;
     for(int generation=0;generation<stop_gen;generation++) {
+        const int succ_before_generation = succ;
         std::unordered_set<cv::Vec2i,vec2i_hash> cands;
         if (generation == 0 && !initialized_from_resume) {
             cands.insert(cv::Vec2i(y0-1,x0));
@@ -3027,8 +3041,12 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             }
         }
 
+        if (succ > succ_before_generation) {
+            emergency_consensus_limit_th = configured_consensus_limit_th;
+        }
+
         int inl_lower_bound_reg = params.value("consensus_default_th", 10);
-        int inl_lower_bound_b = params.value("consensus_limit_th", 2);
+        int inl_lower_bound_b = emergency_consensus_limit_th;
         int inl_lower_bound = inl_lower_bound_reg;
 
         if (!at_right_border && curr_best_inl_th <= inl_lower_bound)
@@ -3043,12 +3061,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
                 : smooth_next;
             if (curr_best_inl_th >= inl_lower_bound) {
                 cv::Rect active = active_bounds & used_area;
-                if (active.area() > 0) {
-                    for(int j=std::max(0, active.y-2);j<=std::min(active.br().y+2, state.rows-1);j++)
-                        for(int i=std::max(0, active.x-2);i<=std::min(active.br().x+2, state.cols-1);i++)
-                            if (state(j,i) & STATE_LOC_VALID)
-                                    fringe.insert(cv::Vec2i(j,i));
-                }
+                reseed_fringe_from_valid(active);
             }
         }
         else
@@ -3171,10 +3184,7 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             fringe.clear();
             curr_best_inl_th = inlier_base_threshold;
             if (active.area() > 0) {
-                for(int j=std::max(0, active.y-2);j<=std::min(active.br().y+2, state.rows-1);j++)
-                    for(int i=std::max(0, active.x-2);i<=std::min(active.br().x+2, state.cols-1);i++)
-                        if (state(j,i) & STATE_LOC_VALID)
-                            fringe.insert(cv::Vec2i(j,i));
+                reseed_fringe_from_valid(active);
             }
 
             if (debug_images) {
@@ -3422,14 +3432,52 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             fringe.clear();
             curr_best_inl_th = inlier_base_threshold;
             if (active.area() > 0) {
-                for(int j=std::max(0, active.y-2);j<=std::min(active.br().y+2, state.rows-1);j++)
-                    for(int i=std::max(0, active.x-2);i<=std::min(active.br().x+2, state.cols-1);i++)
-                        if (state(j,i) & STATE_LOC_VALID)
-                            fringe.insert(cv::Vec2i(j,i));
+                reseed_fringe_from_valid(active);
             }
         }
 
         cv::imwrite((tgt_dir / "inliers_sum.tif").string(), inliers_sum_dbg(used_area));
+
+        const int current_remaining_left = remaining_extra(max_extra_left, expanded_left);
+        const int current_remaining_right = remaining_extra(max_extra_right, expanded_right);
+        const int current_remaining_up = remaining_extra(max_extra_up, expanded_up);
+        const int current_remaining_down = remaining_extra(max_extra_down, expanded_down);
+        const bool can_expand_width_now =
+            !growth_config.disable_grid_expansion &&
+            ((growth_config.grow_left && current_remaining_left > 0 && w < max_grid_w) ||
+             (growth_config.grow_right && current_remaining_right > 0 && w < max_grid_w));
+        const bool can_expand_height_now =
+            !growth_config.disable_grid_expansion &&
+            ((growth_config.grow_up && current_remaining_up > 0 && h < max_grid_h) ||
+             (growth_config.grow_down && current_remaining_down > 0 && h < max_grid_h));
+        const bool max_width_limit_reached =
+            max_grid_extent <= grid_limit_w && w >= max_grid_w;
+        const bool horizontal_expansion_blocked_by_max_width =
+            !growth_config.disable_grid_expansion &&
+            max_width_limit_reached &&
+            ((growth_config.grow_left && current_remaining_left > 0) ||
+             (growth_config.grow_right && current_remaining_right > 0));
+
+        if (configured_consensus_limit_th > 2 &&
+            fringe.empty() &&
+            emergency_consensus_limit_th > 2 &&
+            !can_expand_width_now &&
+            !can_expand_height_now &&
+            horizontal_expansion_blocked_by_max_width) {
+            --emergency_consensus_limit_th;
+            curr_best_inl_th = emergency_consensus_limit_th;
+            cv::Rect active = active_bounds & used_area;
+            reseed_fringe_from_valid(active);
+            if (fringe.empty()) {
+                reseed_fringe_from_valid(used_area);
+            }
+            if (!fringe.empty()) {
+                std::cout << "last-chance consensus retry at inl_th "
+                          << curr_best_inl_th
+                          << " after stalled expansion" << std::endl;
+                continue;
+            }
+        }
 
         if (fringe.empty())
             break;
