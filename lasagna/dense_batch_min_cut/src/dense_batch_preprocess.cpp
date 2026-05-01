@@ -2143,6 +2143,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         const TimingMark timing = start_timing();
         cv::Mat domain_without_graph = white_domain.clone();
         domain_without_graph.setTo(0, graph_edge_mask);
+        domain_without_graph.setTo(0, graph.node_mask);
 
         cv::Mat region_labels;
         cv::connectedComponents(domain_without_graph, region_labels, 4, CV_32S);
@@ -2180,32 +2181,6 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                 continue;
             }
             source_edges[edge_index] = 1;
-        }
-
-        cv::Mat source_edge_mask(white_domain.size(), CV_8U, cv::Scalar(0));
-        for (int edge_index = 0;
-             edge_index < static_cast<int>(graph.edges.size()); ++edge_index) {
-            if (source_edges[edge_index] == 0) {
-                continue;
-            }
-            for (const cv::Point pixel : graph.edges[edge_index].pixels) {
-                source_edge_mask.at<std::uint8_t>(pixel.y, pixel.x) = 255;
-            }
-        }
-
-        cv::Mat dilated_source_edges;
-        cv::dilate(source_edge_mask, dilated_source_edges, cv::Mat());
-        for (int y = 0; y < dilated_source_edges.rows; ++y) {
-            for (int x = 0; x < dilated_source_edges.cols; ++x) {
-                if (dilated_source_edges.at<std::uint8_t>(y, x) == 0 ||
-                    graph_edge_mask.at<std::uint8_t>(y, x) == 0) {
-                    continue;
-                }
-                const int edge_index = graph_edge_index.at<int>(y, x);
-                if (edge_index >= 0) {
-                    source_edges[edge_index] = 1;
-                }
-            }
         }
 
         for (int edge_index = 0;
