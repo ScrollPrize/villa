@@ -3444,18 +3444,22 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             !growth_config.disable_grid_expansion &&
             ((growth_config.grow_left && current_remaining_left > 0 && w < max_grid_w) ||
              (growth_config.grow_right && current_remaining_right > 0 && w < max_grid_w));
-        const bool max_width_limit_reached =
-            max_grid_extent <= grid_limit_w && w >= max_grid_w;
-        const bool horizontal_expansion_blocked_by_max_width =
+        const bool horizontal_growth_requested =
+            growth_config.grow_left || growth_config.grow_right;
+        const bool horizontal_grid_limit_reached = w >= max_grid_w;
+        const bool horizontal_extra_limit_reached =
+            (!growth_config.grow_left || current_remaining_left <= 0) &&
+            (!growth_config.grow_right || current_remaining_right <= 0);
+        const bool horizontal_expansion_blocked =
             !growth_config.disable_grid_expansion &&
-            max_width_limit_reached &&
-            (growth_config.grow_left || growth_config.grow_right);
+            horizontal_growth_requested &&
+            !can_expand_width_now &&
+            (horizontal_grid_limit_reached || horizontal_extra_limit_reached);
 
         if (configured_consensus_limit_th > 2 &&
             fringe.empty() &&
             emergency_consensus_limit_th > 2 &&
-            !can_expand_width_now &&
-            horizontal_expansion_blocked_by_max_width) {
+            horizontal_expansion_blocked) {
             --emergency_consensus_limit_th;
             curr_best_inl_th = emergency_consensus_limit_th;
             cv::Rect active = active_bounds & used_area;
@@ -3466,12 +3470,22 @@ static QuadSurface *grow_surf_from_surfs_impl(QuadSurface *seed,
             if (!fringe.empty()) {
                 std::cout << "last-chance consensus retry at inl_th "
                           << curr_best_inl_th
-                          << " after stalled expansion" << std::endl;
+                          << " after horizontally blocked expansion"
+                          << " (w=" << w
+                          << " max_grid_w=" << max_grid_w
+                          << " remaining_left=" << current_remaining_left
+                          << " remaining_right=" << current_remaining_right
+                          << ")" << std::endl;
                 continue;
             }
             std::cout << "last-chance consensus retry at inl_th "
                       << curr_best_inl_th
-                      << " could not reseed after width-limited stalled expansion" << std::endl;
+                      << " could not reseed after horizontally blocked expansion"
+                      << " (w=" << w
+                      << " max_grid_w=" << max_grid_w
+                      << " remaining_left=" << current_remaining_left
+                      << " remaining_right=" << current_remaining_right
+                      << ")" << std::endl;
         }
 
         if (fringe.empty())
