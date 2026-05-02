@@ -953,7 +953,24 @@ void CChunkedVolumeViewer::markInteractiveMotion(double motionPx)
 
 int CChunkedVolumeViewer::genericPreviewDownsampleFactor() const
 {
-    return 1;
+    if (!_interactivePreview || _framebuffer.isNull())
+        return 1;
+
+    auto surf = _surfWeak.lock();
+    if (!surf || !dynamic_cast<QuadSurface*>(surf.get()))
+        return 1;
+
+    if (_overlayVolume || _compositeSettings.enabled || _compositeSettings.planeEnabled)
+        return 1;
+
+    const int pixels = _framebuffer.width() * _framebuffer.height();
+    if (pixels < 1024 * 768 && _interactionSpeedPxPerSec < kFastMotionPxPerSec)
+        return 1;
+
+    if (pixels >= 2560 * 1440 || _interactionSpeedPxPerSec >= kFastMotionPxPerSec)
+        return 4;
+
+    return 2;
 }
 
 bool CChunkedVolumeViewer::streamingCompositeUnsupported() const
