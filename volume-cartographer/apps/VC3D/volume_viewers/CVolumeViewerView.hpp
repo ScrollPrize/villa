@@ -18,7 +18,6 @@ public:
     void keyPressEvent(QKeyEvent *event) override;
     void keyReleaseEvent(QKeyEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
-    void mouseDoubleClickEvent(QMouseEvent *event) override;
     void setVoxelSize(double sx, double sy) { m_vx = sx; m_vy = sy; update(); }
     void setMiddleButtonPanEnabled(bool enabled) { _middleButtonPanEnabled = enabled; }
     bool middleButtonPanEnabled() const { return _middleButtonPanEnabled; }

@@ -605,7 +605,6 @@ CWindow::CWindow(size_t cacheSizeGB) :
         for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                    _lasagnaDock,
                                    ui.dockWidgetDistanceTransform,
-                                   ui.dockWidgetDrawing,
                                    ui.dockWidgetVolumes,
                                    ui.dockWidgetViewerControls,
                                    static_cast<QDockWidget*>(_point_collection_widget) }) {
@@ -623,9 +622,9 @@ CWindow::CWindow(size_t cacheSizeGB) :
     }
 
     // If enabled, auto open the last used local volume package.
-    if (settings.value(vc3d::settings::volpkg::AUTO_OPEN, vc3d::settings::volpkg::AUTO_OPEN_DEFAULT).toInt() != 0) {
+    if (settings.value(vc3d::settings::project::AUTO_OPEN, vc3d::settings::project::AUTO_OPEN_DEFAULT).toInt() != 0) {
 
-        QStringList files = settings.value(vc3d::settings::volpkg::RECENT).toStringList();
+        QStringList files = settings.value(vc3d::settings::project::RECENT).toStringList();
 
         if (!files.empty() && !files.at(0).isEmpty()) {
             QString path = files[0];
@@ -1884,12 +1883,11 @@ void CWindow::CreateWidgets(void)
     connect(_fiberWidget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
     connect(_fiberWidget, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
 
-    // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, Fibers, and Drawing together
+    // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, and Fibers together
     tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
     tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
     tabifyDockWidget(ui.dockWidgetSegmentation, _fiberWidget);
-    tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDrawing);
 
     // Make Segmentation dock the active tab by default
     ui.dockWidgetSegmentation->raise();
@@ -3801,7 +3799,7 @@ void CWindow::onNewFiberRequested()
 void CWindow::onFiberCrosshairModeChanged(bool active)
 {
     if (!_viewerManager) return;
-    _viewerManager->forEachViewer([active](CTiledVolumeViewer* v) {
+    _viewerManager->forEachBaseViewer([active](VolumeViewerBase* v) {
         if (v->graphicsView()) {
             v->graphicsView()->setCursor(active ? Qt::CrossCursor : Qt::ArrowCursor);
         }

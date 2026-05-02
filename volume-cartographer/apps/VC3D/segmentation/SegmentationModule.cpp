@@ -1391,7 +1391,11 @@ void SegmentationModule::handleCorrectionPointAdded(const cv::Vec3f& worldPos, u
                 const auto* pts = surface->rawPointsPtr();
                 if (pts && pts->rows > 0 && pts->cols > 0) {
                     float tol = std::max(surface->scale()[0] * 64.0f, 512.0f);
-                    auto hit = patchIndex->locate(worldPos, tol, surfQ);
+                    SurfacePatchIndex::PointQuery query;
+                    query.worldPoint = worldPos;
+                    query.tolerance = tol;
+                    query.surfaces.only = surfQ;
+                    auto hit = patchIndex->locate(query);
                     if (hit) {
                         cv::Vec2f grid = surface->ptrToGrid(hit->ptr);
                         int col = std::clamp(static_cast<int>(std::round(grid[0])), 0, pts->cols - 1);

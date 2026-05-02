@@ -116,9 +116,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _openAct->setShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::OpenVolpkg));
     connect(_openAct, &QAction::triggered, this, &MenuActionController::openVolpkg);
 
-    _openLocalZarrAct = new QAction(QObject::tr("Open Local &Zarr..."), this);
-    connect(_openLocalZarrAct, &QAction::triggered, this, &MenuActionController::openLocalZarr);
-
     _attachRemoteZarrAct = new QAction(QObject::tr("Attach Remote &Zarr..."), this);
     connect(_attachRemoteZarrAct, &QAction::triggered, this, &MenuActionController::attachRemoteZarr);
 
@@ -177,7 +174,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _fileMenu->addSeparator();
     _fileMenu->addAction(_convertLegacyAct);
     _fileMenu->addSeparator();
-    _fileMenu->addAction(_openLocalZarrAct);
     _fileMenu->addAction(_attachRemoteZarrAct);
 
     _recentMenu = new QMenu(QObject::tr("Open &recent project"), _fileMenu);
