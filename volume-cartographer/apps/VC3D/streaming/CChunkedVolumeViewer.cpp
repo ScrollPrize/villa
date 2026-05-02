@@ -188,7 +188,16 @@ float activeSegmentationIntersectionWidth(float baseWidth)
                     baseWidth + kActiveIntersectionMinWidthDelta);
 }
 
-std::unique_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::shared_ptr<Volume>& volume)
+std::size_t streamingCacheCapacityBytes(const CState* state)
+{
+    constexpr std::size_t kFallbackCapacity = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+    if (!state || state->cacheSizeBytes() == 0)
+        return kFallbackCapacity;
+    return state->cacheSizeBytes();
+}
+
+std::unique_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::shared_ptr<Volume>& volume,
+                                                                std::size_t decodedByteCapacity)
 {
     if (!volume)
         return nullptr;
@@ -203,7 +212,9 @@ std::unique_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::share
         return nullptr;
 
     vc::render::ChunkCache::Options options;
-    options.decodedByteCapacity = 2ULL * 1024ULL * 1024ULL * 1024ULL;
+    options.decodedByteCapacity = decodedByteCapacity > 0
+        ? decodedByteCapacity
+        : streamingCacheCapacityBytes(nullptr);
     options.maxConcurrentReads = 16;
     if (isRemote) {
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
@@ -342,7 +353,7 @@ void CChunkedVolumeViewer::rebuildChunkArray()
         return;
 
     try {
-        _chunkArray = makeChunkCacheForVolume(_volume);
+        _chunkArray = makeChunkCacheForVolume(_volume, streamingCacheCapacityBytes(_state));
     } catch (const std::exception& e) {
         if (_lbl)
             _lbl->setText(QString("Streaming unavailable: %1").arg(e.what()));
@@ -407,8 +418,21 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
                                             const std::shared_ptr<Surface>& surf,
                                             bool)
 {
-    if (_surfName != name)
+    const bool isCurrentSurface = (_surfName == name);
+    const bool isIntersectionTarget =
+        _intersectTgts.count(name) != 0 ||
+        (_intersectTgts.count("visible_segmentation") != 0 &&
+         (name == "segmentation" || _highlightedSurfaceIds.count(name) != 0));
+
+    if (!isCurrentSurface) {
+        if (isIntersectionTarget) {
+            invalidateIntersect(name);
+            renderIntersections();
+            emit overlaysUpdated();
+        }
         return;
+    }
+
     _surfWeak = surf;
     _genCacheDirty = true;
     invalidateIntersect(name);
@@ -1325,7 +1349,7 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
     _overlayChunkArray.reset();
     if (_overlayVolume) {
         try {
-            _overlayChunkArray = makeChunkCacheForVolume(_overlayVolume);
+            _overlayChunkArray = makeChunkCacheForVolume(_overlayVolume, streamingCacheCapacityBytes(_state));
         } catch (const std::exception&) {
             _overlayChunkArray.reset();
         }
