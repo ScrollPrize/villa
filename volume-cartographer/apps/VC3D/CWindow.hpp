@@ -81,7 +81,6 @@ signals:
 public slots:
     void onShowStatusMessage(QString text, int timeout);
     void onLocChanged(void);
-    void onManualPlaneChanged(void);
     void onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onVisLasagnaObj(const std::string& segmentId);
     void onGrowSegmentationSurface(SegmentationGrowthMethod method,
@@ -195,7 +194,6 @@ private:
 
     //TODO abstract these into separate QWidget class?
     QLineEdit* lblLocFocus;
-    QDoubleSpinBox* spNorm[3];
     QPushButton* btnZoomIn;
    QPushButton* btnZoomOut;
     QCheckBox* chkAxisAlignedSlices;

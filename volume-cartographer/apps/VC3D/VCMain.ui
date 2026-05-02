@@ -1779,70 +1779,6 @@
          </property>
         </widget>
        </item>
-       <item row="1" column="2">
-        <widget class="QDoubleSpinBox" name="dspNY">
-         <property name="enabled">
-          <bool>false</bool>
-         </property>
-         <property name="minimum">
-          <double>-10.000000000000000</double>
-         </property>
-         <property name="maximum">
-          <double>10.000000000000000</double>
-         </property>
-         <property name="singleStep">
-          <double>0.010000000000000</double>
-         </property>
-         <property name="value">
-          <double>0.500000000000000</double>
-         </property>
-        </widget>
-       </item>
-       <item row="1" column="1">
-        <widget class="QDoubleSpinBox" name="dspNX">
-         <property name="enabled">
-          <bool>false</bool>
-         </property>
-         <property name="minimum">
-          <double>-10.000000000000000</double>
-         </property>
-         <property name="maximum">
-          <double>10.000000000000000</double>
-         </property>
-         <property name="singleStep">
-          <double>0.010000000000000</double>
-         </property>
-         <property name="value">
-          <double>0.500000000000000</double>
-         </property>
-        </widget>
-       </item>
-       <item row="1" column="0">
-        <widget class="QLabel" name="label_12">
-         <property name="text">
-          <string>Normal</string>
-         </property>
-        </widget>
-       </item>
-       <item row="1" column="3">
-        <widget class="QDoubleSpinBox" name="dspNZ">
-         <property name="enabled">
-          <bool>false</bool>
-         </property>
-         <property name="minimum">
-          <double>-10.000000000000000</double>
-         </property>
-         <property name="maximum">
-          <double>10.000000000000000</double>
-         </property>
-         <property name="singleStep">
-          <double>0.010000000000000</double>
-         </property>
-         <property name="value">
-          <double>0.500000000000000</double>
-         </property>
-        </widget>
-       </item>
        <item row="0" column="1" colspan="2">
         <widget class="QLineEdit" name="sliceFocus">
          <property name="text">
@@ -1961,16 +1897,6 @@
        </property>
      </widget>
     </item>
-    <item row="4" column="0">
-      <widget class="QLabel" name="labelIntersectionSampling">
-       <property name="text">
-        <string>Intersection sampling</string>
-       </property>
-      </widget>
-     </item>
-     <item row="4" column="1" colspan="2">
-      <widget class="QComboBox" name="comboIntersectionSampling"/>
-     </item>
      <item row="5" column="0">
       <widget class="QLabel" name="labelIntersectionThickness">
        <property name="text">
@@ -2000,32 +1926,6 @@
        </property>
        <property name="toolTip">
         <string>Distance on either side of the plane (in voxels) considered a hit</string>
-       </property>
-      </widget>
-     </item>
-     <item row="6" column="0">
-      <widget class="QLabel" name="labelIntersectionMaxSurfaces">
-       <property name="text">
-        <string>Max intersection surfaces</string>
-       </property>
-      </widget>
-     </item>
-     <item row="6" column="1" colspan="2">
-      <widget class="QSpinBox" name="spinIntersectionMaxSurfaces">
-       <property name="minimum">
-        <number>0</number>
-       </property>
-       <property name="maximum">
-        <number>10000</number>
-       </property>
-       <property name="value">
-        <number>0</number>
-       </property>
-       <property name="specialValueText">
-        <string>Unlimited</string>
-       </property>
-       <property name="toolTip">
-        <string>Max surfaces to load for intersection rendering (0 = unlimited). Lower values reduce RAM usage.</string>
        </property>
       </widget>
      </item>

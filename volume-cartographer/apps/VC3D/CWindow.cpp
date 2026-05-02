@@ -1958,7 +1958,6 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
         _state->setPOI("focus", poi);
     }
 
-    onManualPlaneChanged();
     _axisAlignedSliceController->applyOrientation(_state ? _state->surface("segmentation").get() : nullptr);
 }
 
@@ -3266,9 +3265,7 @@ void CWindow::CreateWidgets(void)
         auto* cmbInterp = new QComboBox;
         cmbInterp->addItem(tr("Nearest"));
         cmbInterp->addItem(tr("Trilinear"));
-        cmbInterp->addItem(tr("Tricubic"));
-        cmbInterp->addItem(tr("Lanczos"));
-        cmbInterp->setCurrentIndex(settings.value(perf::INTERPOLATION_METHOD, 1).toInt());
+        cmbInterp->setCurrentIndex(std::clamp(settings.value(perf::INTERPOLATION_METHOD, 1).toInt(), 0, 1));
         interpLayout->addWidget(cmbInterp);
         connect(cmbInterp, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int idx) {
             QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
@@ -3847,78 +3844,8 @@ void CWindow::CreateWidgets(void)
         }
     }
 
-    auto* comboIntersectionSampling = ui.comboIntersectionSampling;
-    if (comboIntersectionSampling) {
-        struct SamplingOption {
-            const char* label;
-            int stride;
-        };
-        const SamplingOption options[] = {
-            {"Full (1x)", 1},
-            {"2x", 2},
-            {"4x", 4},
-            {"8x", 8},
-            {"16x", 16},
-            {"32x", 32},
-        };
-        comboIntersectionSampling->clear();
-        for (const auto& opt : options) {
-            comboIntersectionSampling->addItem(tr(opt.label), opt.stride);
-        }
-
-        const bool strideUserSet = settings.value(vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE_USER_SET,
-                                                  false).toBool();
-        const int savedStride = strideUserSet
-            ? settings.value(vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE,
-                             vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE_DEFAULT).toInt()
-            : vc3d::settings::viewer::INTERSECTION_SAMPLING_STRIDE_DEFAULT;
-        int selectedIndex = comboIntersectionSampling->findData(savedStride);
-        if (selectedIndex < 0) {
-            selectedIndex = comboIntersectionSampling->findData(1);
-        }
-        if (selectedIndex >= 0) {
-            comboIntersectionSampling->setCurrentIndex(selectedIndex);
-        }
-
-        connect(comboIntersectionSampling,
-                QOverload<int>::of(&QComboBox::currentIndexChanged),
-                this,
-                [this, comboIntersectionSampling](int) {
-                    if (!_viewerManager) {
-                        return;
-                    }
-                    const int stride = std::max(1, comboIntersectionSampling->currentData().toInt());
-                    _viewerManager->setSurfacePatchSamplingStride(stride);
-                });
-
-        // Update combobox when stride changes programmatically.
-        if (_viewerManager) {
-            connect(_viewerManager.get(),
-                    &ViewerManager::samplingStrideChanged,
-                    this,
-                    [comboIntersectionSampling](int stride) {
-                        const int index = comboIntersectionSampling->findData(stride);
-                        if (index >= 0 && index != comboIntersectionSampling->currentIndex()) {
-                            QSignalBlocker blocker(comboIntersectionSampling);
-                            comboIntersectionSampling->setCurrentIndex(index);
-                        }
-                    });
-        }
-    }
-
-    // Max intersection surfaces spinbox
-    if (auto* spinMaxSurfaces = ui.spinIntersectionMaxSurfaces) {
-        const int savedMax =
-            settings.value(vc3d::settings::viewer::INTERSECTION_MAX_SURFACES, vc3d::settings::viewer::INTERSECTION_MAX_SURFACES_DEFAULT).toInt();
-        spinMaxSurfaces->setValue(std::max(0, savedMax));
-        connect(spinMaxSurfaces, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-            if (_viewerManager) {
-                _viewerManager->setIntersectionMaxSurfaces(value);
-            }
-        });
-        if (_viewerManager) {
-            _viewerManager->setIntersectionMaxSurfaces(savedMax);
-        }
+    if (_viewerManager) {
+        _viewerManager->setSurfacePatchSamplingStride(1, false);
     }
 
     chkAxisAlignedSlices = ui.chkAxisAlignedSlices;
@@ -3929,18 +3856,6 @@ void CWindow::CreateWidgets(void)
         chkAxisAlignedSlices->setChecked(useAxisAligned);
         connect(chkAxisAlignedSlices, &QCheckBox::toggled, this, &CWindow::onAxisAlignedSlicesToggled);
     }
-
-    spNorm[0] = ui.dspNX;
-    spNorm[1] = ui.dspNY;
-    spNorm[2] = ui.dspNZ;
-
-    for (int i = 0; i < 3; i++) {
-        spNorm[i]->setRange(-10, 10);
-    }
-
-    connect(spNorm[0], &QDoubleSpinBox::valueChanged, this, &CWindow::onManualPlaneChanged);
-    connect(spNorm[1], &QDoubleSpinBox::valueChanged, this, &CWindow::onManualPlaneChanged);
-    connect(spNorm[2], &QDoubleSpinBox::valueChanged, this, &CWindow::onManualPlaneChanged);
 
     connect(ui.btnEditMask, &QPushButton::pressed, this, &CWindow::onEditMaskPressed);
     connect(ui.btnAppendMask, &QPushButton::pressed, this, &CWindow::onAppendMaskPressed);  // Add this
@@ -5070,24 +4985,6 @@ void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf
     }
     else {
     }
-}
-
-void CWindow::onManualPlaneChanged(void)
-{
-    cv::Vec3f normal;
-
-    for(int i=0;i<3;i++) {
-        normal[i] = spNorm[i]->value();
-    }
-
-    auto planeShared = _state->surface("manual plane");
-    PlaneSurface *plane = dynamic_cast<PlaneSurface*>(planeShared.get());
-
-    if (!plane)
-        return;
-
-    plane->setNormal(normal);
-    _state->setSurface("manual plane", planeShared);
 }
 
 void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)

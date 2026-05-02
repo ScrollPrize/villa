@@ -57,15 +57,10 @@ ViewerManager::ViewerManager(CState* state,
     const float minHigh = std::min(_volumeWindowLow + 1.0f, 255.0f);
     _volumeWindowHigh = std::clamp(storedBaseHigh, minHigh, 255.0f);
 
-    const bool strideUserSet = settings.value(viewer::INTERSECTION_SAMPLING_STRIDE_USER_SET, false).toBool();
-    const int storedSampling = settings.value(viewer::INTERSECTION_SAMPLING_STRIDE,
-                                              viewer::INTERSECTION_SAMPLING_STRIDE_DEFAULT).toInt();
-    _surfacePatchSamplingStride = std::max(1, strideUserSet
-                                                  ? storedSampling
-                                                  : viewer::INTERSECTION_SAMPLING_STRIDE_DEFAULT);
+    _surfacePatchSamplingStride = viewer::INTERSECTION_SAMPLING_STRIDE_DEFAULT;
     const float storedThickness = settings.value(viewer::INTERSECTION_THICKNESS, viewer::INTERSECTION_THICKNESS_DEFAULT).toFloat();
     _intersectionThickness = std::max(0.0f, storedThickness);
-    _intersectionMaxSurfaces = std::max(0, settings.value(viewer::INTERSECTION_MAX_SURFACES, viewer::INTERSECTION_MAX_SURFACES_DEFAULT).toInt());
+    _intersectionMaxSurfaces = viewer::INTERSECTION_MAX_SURFACES_DEFAULT;
 
     _surfacePatchIndexWatcher =
         new QFutureWatcher<std::shared_ptr<SurfacePatchIndex>>(this);

@@ -337,7 +337,7 @@ void CChunkedVolumeViewer::reloadPerfSettings()
     _zoomSensitivity = std::max(0.01f, s.value(viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT).toFloat());
     _zScrollSensitivity = std::max(0.01f, s.value(viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT).toFloat());
     const int interpIdx = s.value(perf::INTERPOLATION_METHOD, 1).toInt();
-    _samplingMethod = static_cast<vc::Sampling>(std::clamp(interpIdx, 0, 3));
+    _samplingMethod = static_cast<vc::Sampling>(std::clamp(interpIdx, 0, 1));
 }
 
 void CChunkedVolumeViewer::setSurface(const std::string& name)
