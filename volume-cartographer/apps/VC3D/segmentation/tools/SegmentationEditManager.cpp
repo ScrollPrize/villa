@@ -1000,6 +1000,8 @@ bool SegmentationEditManager::buildActiveSamples(const std::pair<int, int>& grid
 
     const float stepX = _gridScale[0];
     const float stepY = _gridScale[1];
+    const float sigmaWorld = std::max(0.001f, _sigmaSteps * stepNorm);
+    const float invTwoSigmaSq = 1.0f / (2.0f * sigmaWorld * sigmaWorld);
 
     for (int r = rowStart; r <= rowEnd; ++r) {
         for (int c = colStart; c <= colEnd; ++c) {
@@ -1016,7 +1018,11 @@ bool SegmentationEditManager::buildActiveSamples(const std::pair<int, int>& grid
                 continue;
             }
 
-            _activeDrag.samples.push_back({r, c, baseWorld, distanceWorldSq});
+            float gaussianWeight = 1.0f;
+            if (distanceWorldSq > 0.0f) {
+                gaussianWeight = std::exp(-distanceWorldSq * invTwoSigmaSq);
+            }
+            _activeDrag.samples.push_back({r, c, baseWorld, distanceWorldSq, gaussianWeight});
         }
     }
 
@@ -1036,26 +1042,29 @@ void SegmentationEditManager::applyGaussianToSamples(const cv::Vec3f& delta)
         return;
     }
 
-    const float stepNorm = stepNormalization();
-    const float sigmaWorld = std::max(0.001f, _sigmaSteps * stepNorm);
-    const float invTwoSigmaSq = 1.0f / (2.0f * sigmaWorld * sigmaWorld);
-
     const cv::Vec3f scaledDelta = delta * _editScale;
 
     _recentTouched.clear();
     _recentTouched.reserve(_activeDrag.samples.size());
 
-    for (const auto& sample : _activeDrag.samples) {
-        float weight = 1.0f;
-        if (sample.distanceWorldSq > 0.0f) {
-            weight = std::exp(-sample.distanceWorldSq * invTwoSigmaSq);
-        }
+    int minRow = std::numeric_limits<int>::max();
+    int maxRow = std::numeric_limits<int>::min();
+    int minCol = std::numeric_limits<int>::max();
+    int maxCol = std::numeric_limits<int>::min();
 
-        cv::Vec3f newWorld = sample.baseWorld + scaledDelta * weight;
+    for (const auto& sample : _activeDrag.samples) {
+        cv::Vec3f newWorld = sample.baseWorld + scaledDelta * sample.gaussianWeight;
         (*_previewPoints)(sample.row, sample.col) = newWorld;
-        recordVertexEdit(sample.row, sample.col, newWorld);
+        recordVertexEdit(sample.row, sample.col, newWorld, false);
         _recentTouched.push_back(GridKey{sample.row, sample.col});
+
+        minRow = std::min(minRow, sample.row);
+        maxRow = std::max(maxRow, sample.row);
+        minCol = std::min(minCol, sample.col);
+        maxCol = std::max(maxCol, sample.col);
     }
+
+    queuePatchIndexRangeForVertices(minRow, maxRow, minCol, maxCol);
 
     _hasPendingEdits = true;
     if (_pendingGrowthMarking) {
@@ -1063,7 +1072,7 @@ void SegmentationEditManager::applyGaussianToSamples(const cv::Vec3f& delta)
     }
 }
 
-void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f& newWorld)
+void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f& newWorld, bool queuePatchIndexUpdate)
 {
     if (!_originalPoints) {
         return;
@@ -1081,7 +1090,7 @@ void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f
     const float delta = static_cast<float>(cv::norm(newWorld - original));
 
     // Queue cell updates in SurfacePatchIndex for R-tree sync
-    if (_viewerManager && _baseSurface) {
+    if (queuePatchIndexUpdate && _viewerManager && _baseSurface) {
         if (auto* index = _viewerManager->surfacePatchIndex()) {
             index->queueCellUpdateForVertex(_baseSurface, row, col);
         }
@@ -1103,6 +1112,20 @@ void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f
             it->second.isGrowth = true;
         }
     }
+}
+
+void SegmentationEditManager::queuePatchIndexRangeForVertices(int minRow, int maxRow, int minCol, int maxCol)
+{
+    if (!_viewerManager || !_baseSurface || minRow > maxRow || minCol > maxCol) {
+        return;
+    }
+
+    auto* index = _viewerManager->surfacePatchIndex();
+    if (!index) {
+        return;
+    }
+
+    index->queueCellRangeUpdate(_baseSurface, minRow - 1, maxRow + 1, minCol - 1, maxCol + 1);
 }
 
 void SegmentationEditManager::clearActiveDrag()

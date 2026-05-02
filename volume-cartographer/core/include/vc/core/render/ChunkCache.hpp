@@ -74,6 +74,7 @@ private:
         std::shared_ptr<const std::vector<std::byte>> bytes;
         std::string error;
         std::size_t decodedBytes = 0;
+        bool persisted = false;
         bool inLru = false;
         std::list<ChunkKey>::iterator lruIt;
     };
@@ -110,9 +111,12 @@ private:
     static ChunkResult resultFromEntryLocked(State& state, const ChunkKey& key, Entry& entry);
     static void queueFetchLocked(const std::shared_ptr<State>& state, const ChunkKey& key, std::uint64_t generation);
     static void fetchAndStore(const std::shared_ptr<State>& state, ChunkKey key, std::uint64_t generation);
-    static void storeFetchResultLocked(const std::shared_ptr<State>& state, const ChunkKey& key, ChunkFetchResult fetch);
+    static void storeFetchResultLocked(const std::shared_ptr<State>& state,
+                                       const ChunkKey& key,
+                                       ChunkFetchResult fetch,
+                                       bool loadedFromPersistentCache);
     static std::optional<std::vector<std::byte>> readPersistent(const State& state, const ChunkKey& key);
-    static void queuePersistentWrite(const std::shared_ptr<State>& state,
+    static bool queuePersistentWrite(const std::shared_ptr<State>& state,
                                      const ChunkKey& key,
                                      std::shared_ptr<const std::vector<std::byte>> bytes);
     static void writePersistent(const State& state, const ChunkKey& key, const std::vector<std::byte>& bytes);

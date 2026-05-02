@@ -270,10 +270,12 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state, ChunkKey key
     }
 
     ChunkFetchResult fetch;
+    bool loadedFromPersistentCache = false;
     try {
         if (auto cached = readPersistent(*state, key)) {
             fetch.status = ChunkFetchStatus::Found;
             fetch.bytes = std::move(*cached);
+            loadedFromPersistentCache = true;
         } else {
             fetch = state->fetchers_.at(static_cast<std::size_t>(key.level))->fetch(key);
         }
@@ -289,13 +291,16 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state, ChunkKey key
         std::lock_guard lock(state->mutex_);
         if (generation != state->generation_)
             return;
-        storeFetchResultLocked(state, key, std::move(fetch));
+        storeFetchResultLocked(state, key, std::move(fetch), loadedFromPersistentCache);
     }
     state->cv_.notify_all();
     notifyListeners(state);
 }
 
-void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state, const ChunkKey& key, ChunkFetchResult fetch)
+void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
+                                        const ChunkKey& key,
+                                        ChunkFetchResult fetch,
+                                        bool loadedFromPersistentCache)
 {
     auto it = state->entries_.find(key);
     if (it == state->entries_.end())
@@ -312,6 +317,7 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state, con
     entry.bytes.reset();
     entry.error.clear();
     entry.decodedBytes = 0;
+    entry.persisted = false;
 
     switch (fetch.status) {
     case ChunkFetchStatus::Found:
@@ -328,6 +334,8 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state, con
         entry.decodedBytes = fetch.bytes.size();
         entry.bytes = std::make_shared<const std::vector<std::byte>>(std::move(fetch.bytes));
         state->decodedBytes_ += entry.decodedBytes;
+        entry.persisted = loadedFromPersistentCache ||
+            queuePersistentWrite(state, key, entry.bytes);
         break;
     case ChunkFetchStatus::Missing:
         entry.status = EntryStatus::AllFill;
@@ -368,18 +376,19 @@ std::optional<std::vector<std::byte>> ChunkCache::readPersistent(const State& st
     return bytes;
 }
 
-void ChunkCache::queuePersistentWrite(const std::shared_ptr<State>& state,
+bool ChunkCache::queuePersistentWrite(const std::shared_ptr<State>& state,
                                       const ChunkKey& key,
                                       std::shared_ptr<const std::vector<std::byte>> bytes)
 {
     if (!state || !state->options_.persistentCachePath || !bytes)
-        return;
+        return false;
     if (bytes->size() != expectedChunkBytes(*state, key))
-        return;
+        return false;
 
     persistentCacheWriterPool().enqueue([state, key, bytes = std::move(bytes)] {
         writePersistent(*state, key, *bytes);
     });
+    return true;
 }
 
 void ChunkCache::writePersistent(const State& state, const ChunkKey& key, const std::vector<std::byte>& bytes)
@@ -439,8 +448,8 @@ void ChunkCache::enforceCapacityLocked(const std::shared_ptr<State>& state)
         Entry& entry = it->second;
         entry.inLru = false;
         if (entry.status == EntryStatus::Data) {
-            if (entry.bytes)
-                queuePersistentWrite(state, victim, entry.bytes);
+            if (entry.bytes && !entry.persisted)
+                (void)queuePersistentWrite(state, victim, entry.bytes);
             state->decodedBytes_ -= entry.decodedBytes;
         }
         state->entries_.erase(it);

@@ -42,12 +42,13 @@
 
 namespace {
 
-constexpr float kMinScale = 0.02f;
+constexpr float kMinScale = 0.002f;
 constexpr float kMaxScale = 128.0f;
 constexpr int kInteractionSettleMs = 140;
 constexpr int kResizeSettleMs = 140;
 constexpr int kChunkReadyActiveDelayMs = 500;
 constexpr float kResolutionLodZoomBias = 0.5f;
+constexpr float kSegmentationResolutionLodZoomBias = 1.0f;
 constexpr int kSurfaceResolutionLevelBias = 1;
 constexpr int kInitialSegmentationSurfaceLevel = 5;
 constexpr double kSlowMotionPxPerSec = 180.0;
@@ -601,7 +602,10 @@ void CChunkedVolumeViewer::updateContentBounds()
 void CChunkedVolumeViewer::recalcPyramidLevel()
 {
     const int n = _chunkArray ? _chunkArray->numLevels() : (_volume ? static_cast<int>(_volume->numScales()) : 1);
-    const float lodScale = std::max(_scale * kResolutionLodZoomBias, 1e-6f);
+    const float lodZoomBias = _surfName == "segmentation"
+        ? kSegmentationResolutionLodZoomBias
+        : kResolutionLodZoomBias;
+    const float lodScale = std::max(_scale * lodZoomBias, 1e-6f);
     _dsScaleIdx = std::clamp(
         static_cast<int>(std::floor(std::max(0.0f, std::log2(1.0f / lodScale)))),
         0, std::max(0, n - 1));
