@@ -58,8 +58,6 @@ set(srcs
     segmentation/panels/SegmentationCustomParamsPanel.hpp
     segmentation/panels/SegmentationApprovalMaskPanel.cpp
     segmentation/panels/SegmentationApprovalMaskPanel.hpp
-    segmentation/panels/SegmentationCellReoptPanel.cpp
-    segmentation/panels/SegmentationCellReoptPanel.hpp
     segmentation/panels/SegmentationNeuralTracerPanel.cpp
     segmentation/panels/SegmentationNeuralTracerPanel.hpp
     segmentation/panels/SegmentationDirectionFieldPanel.cpp
@@ -77,8 +75,6 @@ set(srcs
     segmentation/tools/ApprovalMaskBrushTool.hpp
     segmentation/tools/SurfaceMaskBrushTool.cpp
     segmentation/tools/SurfaceMaskBrushTool.hpp
-    segmentation/tools/CellReoptimizationTool.cpp
-    segmentation/tools/CellReoptimizationTool.hpp
     segmentation/tools/ManualAddTool.cpp
     segmentation/tools/ManualAddTool.hpp
     segmentation/tools/ThinPlateSpline3d.cpp

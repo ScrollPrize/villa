@@ -51,7 +51,6 @@ class SegmentationLineTool;
 class SegmentationPushPullTool;
 class ApprovalMaskBrushTool;
 class SurfaceMaskBrushTool;
-class CellReoptimizationTool;
 
 class SegmentationModule : public QObject
 {
@@ -118,15 +117,6 @@ public:
     [[nodiscard]] float approvalBrushDepth() const { return _approvalBrushDepth; }
     [[nodiscard]] QColor approvalBrushColor() const { return _approvalBrushColor; }
     void undoApprovalStroke();
-
-    // Cell reoptimization
-    void setCellReoptimizationMode(bool enabled);
-    [[nodiscard]] bool cellReoptimizationMode() const { return _cellReoptMode; }
-    [[nodiscard]] bool cellReoptCollectionPending() const { return _cellReoptCollectionId != 0; }
-    void setCellReoptMaxSteps(int steps);
-    void setCellReoptMaxPoints(int points);
-    void setCellReoptMinSpacing(float spacing);
-    void setCellReoptPerimeterOffset(float offset);
 
     void applyEdits();
     void resetEdits();
@@ -260,7 +250,6 @@ private:
     void emitPendingChanges();
     void refreshOverlay();
     void updateCorrectionsWidget();
-    void updateCellReoptCollections();
     void setCorrectionsAnnotateMode(bool enabled, bool userInitiated);
     void setActiveCorrectionCollection(uint64_t collectionId, bool userInitiated);
     uint64_t createCorrectionCollection(bool announce);
@@ -393,16 +382,12 @@ private:
     std::unique_ptr<SegmentationPushPullTool> _pushPullTool;
     std::unique_ptr<ApprovalMaskBrushTool> _approvalTool;
     std::unique_ptr<SurfaceMaskBrushTool> _surfaceMaskTool;
-    std::unique_ptr<CellReoptimizationTool> _cellReoptTool;
     std::unique_ptr<ManualAddTool> _manualAddTool;
     bool _manualAddMode{false};
     cv::Mat _pendingManualAddTracerMask;
     SegmentationGrowthMethod _previousGrowthMethodBeforeManualAdd{SegmentationGrowthMethod::Tracer};
 
     bool _showApprovalMask{false};
-    bool _cellReoptMode{false};
-    bool _skipAutoApprovalOnGrowth{false};
-    uint64_t _cellReoptCollectionId{0};  // Specific collection for cell reopt (0 = use all)
     bool _editApprovedMask{false};
     bool _editUnapprovedMask{false};
     bool _drawMaskEnabled{false};

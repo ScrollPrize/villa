@@ -7,7 +7,6 @@
 #include "panels/SegmentationCorrectionsPanel.hpp"
 #include "panels/SegmentationCustomParamsPanel.hpp"
 #include "panels/SegmentationApprovalMaskPanel.hpp"
-#include "panels/SegmentationCellReoptPanel.hpp"
 #include "panels/SegmentationNeuralTracerPanel.hpp"
 #include "panels/SegmentationDirectionFieldPanel.hpp"
 #include "panels/SegmentationLasagnaPanel.hpp"
@@ -50,9 +49,6 @@ void SegmentationWidget::buildUi()
 
     _approvalMaskPanel = new SegmentationApprovalMaskPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_approvalMaskPanel);
-
-    _cellReoptPanel = new SegmentationCellReoptPanel(QStringLiteral("segmentation_edit"), this);
-    layout->addWidget(_cellReoptPanel);
 
     _directionFieldPanel = new SegmentationDirectionFieldPanel(QStringLiteral("segmentation_edit"), this);
     layout->addWidget(_directionFieldPanel);
@@ -139,20 +135,6 @@ void SegmentationWidget::buildUi()
     connect(_approvalMaskPanel, &SegmentationApprovalMaskPanel::approvalStrokesUndoRequested,
             this, &SegmentationWidget::approvalStrokesUndoRequested);
 
-    // Forward cell reopt panel signals
-    connect(_cellReoptPanel, &SegmentationCellReoptPanel::cellReoptModeChanged,
-            this, &SegmentationWidget::cellReoptModeChanged);
-    connect(_cellReoptPanel, &SegmentationCellReoptPanel::cellReoptMaxStepsChanged,
-            this, &SegmentationWidget::cellReoptMaxStepsChanged);
-    connect(_cellReoptPanel, &SegmentationCellReoptPanel::cellReoptMaxPointsChanged,
-            this, &SegmentationWidget::cellReoptMaxPointsChanged);
-    connect(_cellReoptPanel, &SegmentationCellReoptPanel::cellReoptMinSpacingChanged,
-            this, &SegmentationWidget::cellReoptMinSpacingChanged);
-    connect(_cellReoptPanel, &SegmentationCellReoptPanel::cellReoptPerimeterOffsetChanged,
-            this, &SegmentationWidget::cellReoptPerimeterOffsetChanged);
-    connect(_cellReoptPanel, &SegmentationCellReoptPanel::cellReoptGrowthRequested,
-            this, &SegmentationWidget::cellReoptGrowthRequested);
-
     // Forward growth panel signals
     connect(_growthPanel, &SegmentationGrowthPanel::growSurfaceRequested,
             this, &SegmentationWidget::growSurfaceRequested);
@@ -227,7 +209,6 @@ void SegmentationWidget::syncUiState()
     _growthPanel->syncUiState(_editingEnabled, _growthInProgress);
     _editingPanel->setVisible(true);
     _approvalMaskPanel->setVisible(!manualAddVisible);
-    _cellReoptPanel->setVisible(!manualAddVisible);
     _directionFieldPanel->setVisible(!manualAddVisible);
     _neuralTracerPanel->setVisible(!manualAddVisible);
     _correctionsPanel->setVisible(!manualAddVisible);
@@ -237,7 +218,6 @@ void SegmentationWidget::syncUiState()
     _directionFieldPanel->syncUiState(_editingEnabled);
     _correctionsPanel->syncUiState(_editingEnabled, _growthInProgress);
     _approvalMaskPanel->syncUiState();
-    _cellReoptPanel->syncUiState(_approvalMaskPanel->showApprovalMask(), _growthInProgress);
     _neuralTracerPanel->syncUiState();
     _lasagnaPanel->syncUiState(_editingEnabled, false);
 }
@@ -258,7 +238,6 @@ void SegmentationWidget::restoreSettings()
     _customParamsPanel->restoreSettings(settings);
     _approvalMaskPanel->restoreSettings(settings);
     _neuralTracerPanel->restoreSettings(settings);
-    _cellReoptPanel->restoreSettings(settings);
     _lasagnaPanel->restoreSettings(settings);
 
     settings.endGroup();
@@ -350,17 +329,6 @@ void SegmentationWidget::setApprovalBrushRadius(float radius) { _approvalMaskPan
 void SegmentationWidget::setApprovalBrushDepth(float depth) { _approvalMaskPanel->setApprovalBrushDepth(depth); }
 void SegmentationWidget::setApprovalMaskOpacity(int opacity) { _approvalMaskPanel->setApprovalMaskOpacity(opacity); }
 void SegmentationWidget::setApprovalBrushColor(const QColor& color) { _approvalMaskPanel->setApprovalBrushColor(color); }
-
-// --- Cell reoptimization delegations ---
-
-bool SegmentationWidget::cellReoptMode() const { return _cellReoptPanel->cellReoptMode(); }
-int SegmentationWidget::cellReoptMaxSteps() const { return _cellReoptPanel->cellReoptMaxSteps(); }
-int SegmentationWidget::cellReoptMaxPoints() const { return _cellReoptPanel->cellReoptMaxPoints(); }
-float SegmentationWidget::cellReoptMinSpacing() const { return _cellReoptPanel->cellReoptMinSpacing(); }
-float SegmentationWidget::cellReoptPerimeterOffset() const { return _cellReoptPanel->cellReoptPerimeterOffset(); }
-
-void SegmentationWidget::setCellReoptMode(bool enabled) { _cellReoptPanel->setCellReoptMode(enabled); syncUiState(); }
-void SegmentationWidget::setCellReoptCollections(const QVector<QPair<uint64_t, QString>>& collections) { _cellReoptPanel->setCellReoptCollections(collections); syncUiState(); }
 
 void SegmentationWidget::setPendingChanges(bool pending)
 {

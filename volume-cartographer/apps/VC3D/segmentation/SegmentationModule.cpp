@@ -9,7 +9,6 @@
 #include "tools/SegmentationPushPullTool.hpp"
 #include "tools/ApprovalMaskBrushTool.hpp"
 #include "tools/SurfaceMaskBrushTool.hpp"
-#include "tools/CellReoptimizationTool.hpp"
 #include "growth/SegmentationCorrections.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
@@ -191,19 +190,6 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     _approvalTool = std::make_unique<ApprovalMaskBrushTool>(*this, _editManager, _widget);
     _surfaceMaskTool = std::make_unique<SurfaceMaskBrushTool>(*this);
 
-    _cellReoptTool = std::make_unique<CellReoptimizationTool>(*this, _editManager, _overlay, _pointCollection, this);
-    connect(_cellReoptTool.get(), &CellReoptimizationTool::statusMessage,
-            this, [this](const QString& msg, int timeout) {
-                emit statusMessageRequested(msg, timeout);
-            });
-    connect(_cellReoptTool.get(), &CellReoptimizationTool::collectionCreated,
-            this, [this](uint64_t collectionId) {
-                // Register the new collection with the corrections system so it will be used
-                if (_corrections) {
-                    _corrections->setActiveCollection(collectionId, false);
-                }
-            });
-
     _corrections = std::make_unique<segmentation::CorrectionsState>(*this, _widget, _pointCollection);
     _manualAddTool = std::make_unique<ManualAddTool>();
 
@@ -226,7 +212,6 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
                 _corrections->onCollectionRemoved(id);
                 updateCorrectionsWidget();
             }
-            updateCellReoptCollections();
             scheduleCorrectionsAutoSave();
         });
 
@@ -234,12 +219,10 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
             if (_corrections) {
                 _corrections->onCollectionChanged(id);
             }
-            updateCellReoptCollections();
             scheduleCorrectionsAutoSave();
         });
 
         connect(_pointCollection, &VCCollection::collectionsAdded, this, [this](const std::vector<uint64_t>&) {
-            updateCellReoptCollections();
             scheduleCorrectionsAutoSave();
         });
 
@@ -257,7 +240,6 @@ SegmentationModule::SegmentationModule(SegmentationWidget* widget,
     }
 
     updateCorrectionsWidget();
-    updateCellReoptCollections();
 
     if (_widget) {
         if (auto range = _widget->correctionsZRange()) {
@@ -435,29 +417,6 @@ void SegmentationModule::bindWidgetSignals()
             _overlay, &SegmentationOverlayController::setApprovalMaskOpacity);
     connect(_widget, &SegmentationWidget::approvalStrokesUndoRequested,
             this, &SegmentationModule::undoApprovalStroke);
-    connect(_widget, &SegmentationWidget::cellReoptModeChanged,
-            this, &SegmentationModule::setCellReoptimizationMode);
-    connect(_widget, &SegmentationWidget::cellReoptMaxStepsChanged,
-            this, &SegmentationModule::setCellReoptMaxSteps);
-    connect(_widget, &SegmentationWidget::cellReoptMaxPointsChanged,
-            this, &SegmentationModule::setCellReoptMaxPoints);
-    connect(_widget, &SegmentationWidget::cellReoptMinSpacingChanged,
-            this, &SegmentationModule::setCellReoptMinSpacing);
-    connect(_widget, &SegmentationWidget::cellReoptPerimeterOffsetChanged,
-            this, &SegmentationModule::setCellReoptPerimeterOffset);
-    connect(_widget, &SegmentationWidget::cellReoptGrowthRequested,
-            this, [this](uint64_t collectionId) {
-                if (isEditingApprovalMask()) {
-                    saveApprovalMaskToDisk();
-                }
-                // Cell reoptimization should not auto-approve the growth region
-                _skipAutoApprovalOnGrowth = true;
-                // Store the specific collection ID to use for this growth
-                _cellReoptCollectionId = collectionId;
-                emit growSurfaceRequested(SegmentationGrowthMethod::Corrections,
-                                          SegmentationGrowthDirection::All,
-                                          0, false);
-            });
     connect(_widget, &SegmentationWidget::manualAddConfigChanged, this, [this]() {
         if (_manualAddTool && _widget) {
             _manualAddTool->setConfig(_widget->manualAddConfig());
@@ -1010,57 +969,6 @@ void SegmentationModule::undoApprovalStroke()
     }
 }
 
-void SegmentationModule::setCellReoptimizationMode(bool enabled)
-{
-    if (_cellReoptMode == enabled) {
-        return;
-    }
-    _cellReoptMode = enabled;
-
-    // Disable conflicting modes when enabling cell reopt
-    if (enabled) {
-        setCorrectionsAnnotateMode(false, false);
-        setEditApprovedMask(false);
-        setEditUnapprovedMask(false);
-    }
-}
-
-void SegmentationModule::setCellReoptMaxSteps(int steps)
-{
-    if (_cellReoptTool) {
-        auto config = _cellReoptTool->config();
-        config.maxFloodSteps = std::clamp(steps, 10, 10000);
-        _cellReoptTool->setConfig(config);
-    }
-}
-
-void SegmentationModule::setCellReoptMaxPoints(int points)
-{
-    if (_cellReoptTool) {
-        auto config = _cellReoptTool->config();
-        config.maxCorrectionPoints = std::clamp(points, 3, 200);
-        _cellReoptTool->setConfig(config);
-    }
-}
-
-void SegmentationModule::setCellReoptMinSpacing(float spacing)
-{
-    if (_cellReoptTool) {
-        auto config = _cellReoptTool->config();
-        config.minBoundarySpacing = std::clamp(spacing, 1.0f, 50.0f);
-        _cellReoptTool->setConfig(config);
-    }
-}
-
-void SegmentationModule::setCellReoptPerimeterOffset(float offset)
-{
-    if (_cellReoptTool) {
-        auto config = _cellReoptTool->config();
-        config.perimeterOffset = std::clamp(offset, -50.0f, 50.0f);
-        _cellReoptTool->setConfig(config);
-    }
-}
-
 void SegmentationModule::applyEdits()
 {
     if (!_editManager || !_editManager->hasSession()) {
@@ -1152,8 +1060,6 @@ void SegmentationModule::setGrowthInProgress(bool running)
         _corrections->setGrowthInProgress(running);
     }
     if (running) {
-        // Clear the cell reopt collection ID now that payload has been built
-        _cellReoptCollectionId = 0;
         setCorrectionsAnnotateMode(false, false);
         clearLineDragStroke();
         _lineDrawKeyActive = false;
@@ -1407,26 +1313,6 @@ void SegmentationModule::updateCorrectionsWidget()
     }
 }
 
-void SegmentationModule::updateCellReoptCollections()
-{
-    if (!_widget || !_pointCollection) {
-        return;
-    }
-
-    QVector<QPair<uint64_t, QString>> entries;
-    const auto& collections = _pointCollection->getAllCollections();
-    entries.reserve(static_cast<int>(collections.size()));
-    for (const auto& [id, col] : collections) {
-        entries.append({id, QString::fromStdString(col.name)});
-    }
-
-    // Sort by collection name for consistent ordering
-    std::sort(entries.begin(), entries.end(),
-              [](const auto& a, const auto& b) { return a.second < b.second; });
-
-    _widget->setCellReoptCollections(entries);
-}
-
 void SegmentationModule::setCorrectionsAnnotateMode(bool enabled, bool userInitiated)
 {
     if (!_corrections) {
@@ -1634,11 +1520,6 @@ SegmentationCorrectionsPayload SegmentationModule::buildCorrectionsPayload(bool 
         return SegmentationCorrectionsPayload{};
     }
 
-    // If a specific collection ID is set for cell reoptimization, build payload with only that
-    if (_cellReoptCollectionId != 0) {
-        return _corrections->buildPayloadForCollection(_cellReoptCollectionId);
-    }
-
     return _corrections->buildPayload(onlyActiveCollection);
 }
 void SegmentationModule::handleGrowSurfaceRequested(SegmentationGrowthMethod method,
@@ -1787,8 +1668,6 @@ bool SegmentationModule::beginManualAdd()
     setCorrectionsAnnotateMode(false, false);
     setEditApprovedMask(false);
     setEditUnapprovedMask(false);
-    setCellReoptimizationMode(false);
-
     _previousGrowthMethodBeforeManualAdd = _widget->growthMethod();
     if (_previousGrowthMethodBeforeManualAdd == SegmentationGrowthMethod::ManualAdd) {
         _previousGrowthMethodBeforeManualAdd = _widget->lastNonManualGrowthMethod();

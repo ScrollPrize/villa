@@ -1771,15 +1771,6 @@ bool SegmentationGrower::start(const VolumeContext& volumeContext,
             request.customParams = std::move(customParams);
         }
     }
-    if (method == SegmentationGrowthMethod::Corrections &&
-        _context.module && _context.module->cellReoptCollectionPending()) {
-        if (request.customParams.is_null()) {
-            request.customParams = utils::Json::object();
-        }
-        request.customParams["cell_reopt_mode"] = true;
-        qCInfo(lcSegGrowth) << "Cell reoptimization mode enabled for tracer params.";
-    }
-
     const bool manualAddTracerMask = !request.allowedGrowthMask.empty();
     const bool neuralTracerEnabled = _context.widget->neuralTracerEnabled();
     const bool denseMode = neuralTracerEnabled &&
