@@ -380,10 +380,6 @@ void SegmentationModule::handleMousePress(VolumeViewerBase* viewer,
                                           Qt::KeyboardModifiers modifiers,
                                           const QPointF& scenePos)
 {
-    if (_patchGraphCaptureActive) {
-        return;
-    }
-
     const bool isLeftButton = (button == Qt::LeftButton);
     const bool isRightButton = (button == Qt::RightButton);
 
@@ -539,10 +535,6 @@ void SegmentationModule::handleMouseMove(VolumeViewerBase* viewer,
                                          Qt::KeyboardModifiers modifiers,
                                          const QPointF& scenePos)
 {
-    if (_patchGraphCaptureActive) {
-        return;
-    }
-
     if (_manualAddMode && handleManualAddMouseMove(viewer, buttons, scenePos)) {
         return;
     }
@@ -664,10 +656,6 @@ void SegmentationModule::handleMouseRelease(VolumeViewerBase* viewer,
                                             Qt::KeyboardModifiers /*modifiers*/,
                                             const QPointF& scenePos)
 {
-    if (_patchGraphCaptureActive) {
-        return;
-    }
-
     if (_manualAddMode) {
         Q_UNUSED(viewer);
         Q_UNUSED(worldPos);

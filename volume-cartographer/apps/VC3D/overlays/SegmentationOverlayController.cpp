@@ -1390,7 +1390,7 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
 
     // Check if this viewer is displaying a PlaneSurface (XY/XZ/YZ orthogonal view)
     // For plane viewers, the approval mask is rendered via modified intersection lines
-    // in CTiledVolumeViewerIntersections.cpp, not here
+    // in the viewer's intersection renderer, not here.
     Surface* viewerSurf = viewer->currentSurface();
     const bool isPlaneViewer = dynamic_cast<PlaneSurface*>(viewerSurf) != nullptr;
 

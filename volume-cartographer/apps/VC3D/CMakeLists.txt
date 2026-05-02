@@ -19,8 +19,6 @@ set(srcs
     FileWatcherService.hpp
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
-    PatchGraphWidget.cpp
-    PatchGraphWidget.hpp
     SurfaceAreaCalculator.cpp
     SurfaceAreaCalculator.hpp
     SegmentationCommandHandler.cpp
@@ -107,8 +105,6 @@ set(srcs
     overlays/BBoxOverlayController.hpp
     overlays/PathsOverlayController.cpp
     overlays/PathsOverlayController.hpp
-    overlays/PatchGraphOverlayController.cpp
-    overlays/PatchGraphOverlayController.hpp
     overlays/VectorOverlayController.cpp
     overlays/VectorOverlayController.hpp
     overlays/PlaneSlicingOverlayController.cpp

@@ -93,15 +93,6 @@ target_link_libraries(vc_diffuse_winding
         Ceres::ceres
 )
 
-add_executable(vc_render_bench src/vc_render_bench.cpp)
-target_link_libraries(vc_render_bench vc_core)
-
-add_executable(vc_io_bench src/vc_io_bench.cpp)
-target_link_libraries(vc_io_bench vc_core)
-
-add_executable(vc_blockcache_bench src/vc_blockcache_bench.cpp)
-target_link_libraries(vc_blockcache_bench vc_core)
-
 add_executable(vc_transpose_bench src/vc_transpose_bench.cpp)
 target_link_libraries(vc_transpose_bench vc_core)
 
@@ -113,9 +104,6 @@ target_link_libraries(vc_tifxyz_bench vc_core)
 
 add_executable(vc_tifxyz_mmap_prepare src/vc_tifxyz_mmap_prepare.cpp)
 target_link_libraries(vc_tifxyz_mmap_prepare TIFF::TIFF)
-
-add_executable(vc_surface_patch_index_bench src/vc_surface_patch_index_bench.cpp)
-target_link_libraries(vc_surface_patch_index_bench vc_core)
 
 add_executable(vc_coord_regression src/vc_coord_regression.cpp)
 target_link_libraries(vc_coord_regression vc_core)
@@ -130,16 +118,6 @@ add_executable(vc_visualize src/vc_visualize.cpp)
 target_link_libraries(vc_visualize vc_core Boost::program_options)
 
 
-add_executable(vc_ced2d src/vc_ced2d.cpp)
-target_link_libraries(vc_ced2d
-    vc_core
-    opencv_core
-    opencv_imgcodecs
-    opencv_imgproc
-    Boost::program_options
-    OpenMP::OpenMP_CXX
-)
-
 # Apply affine + scale to OBJ, single TIFXYZ, or batch TIFXYZ subfolders
 add_executable(vc_transform_geom src/vc_transform_geom.cpp)
 target_link_libraries(vc_transform_geom vc_core Boost::program_options)
@@ -152,13 +130,6 @@ target_include_directories(vc_gen_normalgrids PRIVATE diffusion)
 # Read / visualize NormalGridVolume
 add_executable(vc_ngrids src/vc_ngrids.cpp)
 target_link_libraries(vc_ngrids vc_core Boost::program_options opencv_core Ceres::ceres OpenMP::OpenMP_CXX)
-
-# Generate normal3d Zarr directly from tifxyz patches
-add_executable(vc_patch_normals3d src/vc_patch_normals3d.cpp)
-target_link_libraries(vc_patch_normals3d vc_core Boost::program_options opencv_core OpenMP::OpenMP_CXX)
-
-add_executable(vc_patch_graph src/vc_patch_graph.cpp)
-target_link_libraries(vc_patch_graph vc_core Boost::program_options opencv_core)
 
 add_executable(vc_tifxyz2rgb src/vc_tifxyz2rgb.cpp)
 target_link_libraries(vc_tifxyz2rgb
@@ -173,15 +144,6 @@ target_link_libraries(vc_rgb2tifxyz
     opencv_core
     opencv_imgcodecs
     # nlohmann_json::nlohmann_json
-)
-
-add_executable(vc_telea_inpaint src/vc_telea_inpaint.cpp)
-target_link_libraries(vc_telea_inpaint
-    vc_core
-    opencv_core
-    opencv_imgcodecs
-    opencv_imgproc
-    opencv_photo
 )
 
 add_executable(vc_thinning src/vc_thinning.cpp)
@@ -228,21 +190,15 @@ if(VC_USE_PCH)
         vc_calc_surface_metrics
         vc_tifxyz_gengt
         vc_diffuse_winding
-        vc_render_bench
         vc_tifxyz_mmap_prepare
-        vc_surface_patch_index_bench
         vc_create_segment_mask
         vc_surface_diff
         vc_visualize
-        vc_ced2d
         vc_transform_geom
         vc_gen_normalgrids
         vc_ngrids
-        vc_patch_normals3d
-        vc_patch_graph
         vc_tifxyz2rgb
         vc_rgb2tifxyz
-        vc_telea_inpaint
         vc_thinning
         vc_tifxyz
         vc_project_tifxyz

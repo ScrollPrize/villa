@@ -49,14 +49,6 @@ const ShortcutDef OpenVolpkg{
     nullptr,
     QKeySequence::Open
 };
-const ShortcutDef TeleaInpaint{
-    "telea_inpaint",
-    kSectionFileMenu,
-    "Inpaint (Telea) & Rebuild Segment",
-    ShortcutKind::Text,
-    "Ctrl+I",
-    QKeySequence::Open
-};
 const ShortcutDef AxisAlignedSlices{
     "axis_aligned_slices",
     kSectionViewMenu,
@@ -484,8 +476,6 @@ QString buildKeybindsHelpText()
 {
     const HelpEntry kHelpEntries[] = {
         { kSectionFileMenu, shortcuts::OpenVolpkg.description, HelpKeyType::Shortcut, &shortcuts::OpenVolpkg, nullptr, nullptr },
-        { kSectionFileMenu, shortcuts::TeleaInpaint.description, HelpKeyType::Shortcut, &shortcuts::TeleaInpaint, nullptr, nullptr },
-
         { kSectionViewMenu, shortcuts::AxisAlignedSlices.description, HelpKeyType::Shortcut, &shortcuts::AxisAlignedSlices, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::SurfaceNormals.description, HelpKeyType::Shortcut, &shortcuts::SurfaceNormals, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::DirectionHints.description, HelpKeyType::Shortcut, &shortcuts::DirectionHints, nullptr, nullptr },

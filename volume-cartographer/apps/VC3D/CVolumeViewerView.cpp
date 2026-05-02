@@ -317,7 +317,7 @@ void CVolumeViewerView::keyPressEvent(QKeyEvent *event)
 {
     // When scroll-pan is disabled (tiled renderer), block arrow keys from
     // reaching QGraphicsView's built-in scroll handler.  They'll be handled
-    // via sendKeyRelease → onKeyRelease in CTiledVolumeViewer instead.
+    // via sendKeyRelease -> onKeyRelease in the volume viewer instead.
     if (_scrollPanDisabled) {
         switch (event->key()) {
         case Qt::Key_Left:

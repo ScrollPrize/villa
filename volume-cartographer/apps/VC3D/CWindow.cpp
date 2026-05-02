@@ -101,7 +101,6 @@
 #include "SurfaceTreeWidget.hpp"
 #include "SeedingWidget.hpp"
 #include "DrawingWidget.hpp"
-#include "PatchGraphWidget.hpp"
 #include "CommandLineToolRunner.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
 #include "segmentation/SegmentationModule.hpp"
@@ -992,9 +991,6 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     _pathsOverlay = std::make_unique<PathsOverlayController>(this);
     _viewerManager->setPathsOverlay(_pathsOverlay.get());
 
-    _patchGraphOverlay = std::make_unique<PatchGraphOverlayController>(this);
-    _patchGraphOverlay->bindToViewerManager(_viewerManager.get());
-
     _bboxOverlay = std::make_unique<BBoxOverlayController>(this);
     _viewerManager->setBBoxOverlay(_bboxOverlay.get());
 
@@ -1142,7 +1138,6 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     // Ensure right-side tabified docks have a usable minimum size
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                _lasagnaDock,
-                               _patchGraphDock,
                                ui.dockWidgetDistanceTransform,
                                ui.dockWidgetDrawing }) {
         if (dock) {
@@ -1159,7 +1154,6 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
 
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                _lasagnaDock,
-                               _patchGraphDock,
                                ui.dockWidgetDistanceTransform,
                                ui.dockWidgetDrawing,
                                ui.dockWidgetVolumes,
@@ -1474,14 +1468,6 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
         connect(viewer, &CChunkedVolumeViewer::sendZSliceChanged,
                 _seedingWidget, &SeedingWidget::updateCurrentZSlice, Qt::UniqueConnection);
         viewer->setProperty("vc_seeding_bound", true);
-    }
-
-    if (_patchGraphWidget && !viewer->property("vc_patch_graph_bound").toBool()) {
-        connect(viewer, &CChunkedVolumeViewer::sendMouseMoveVolume,
-                _patchGraphWidget, &PatchGraphWidget::onViewerMouseMove, Qt::UniqueConnection);
-        connect(viewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
-                _patchGraphWidget, &PatchGraphWidget::onViewerMouseRelease, Qt::UniqueConnection);
-        viewer->setProperty("vc_patch_graph_bound", true);
     }
 
     if (_point_collection_widget && !viewer->property("vc_points_bound").toBool()) {
@@ -2956,12 +2942,6 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId, bool isExpand, bool isRandomSeed) {
                 _segmentationCommandHandler->onGrowSeeds(segmentId.toStdString(), isExpand, isRandomSeed);
             });
-    connect(_surfacePanel.get(), &SurfacePanelController::teleaInpaintRequested,
-            this, [this]() {
-                if (_menuController) {
-                    _menuController->triggerTeleaInpaint();
-                }
-            });
     connect(_surfacePanel.get(), &SurfacePanelController::recalcAreaRequested,
             this, [this](const QStringList& segmentIds) {
                 if (segmentIds.isEmpty()) return;
@@ -3107,19 +3087,6 @@ void CWindow::CreateWidgets(void)
             this, &CWindow::onGrowSegmentationSurface);
     connect(_segmentationModule.get(), &SegmentationModule::approvalMaskSaved,
             _fileWatcher.get(), &FileWatcherService::markSegmentRecentlyEdited);
-
-    _patchGraphWidget = new PatchGraphWidget(_segmentationModule.get(),
-                                             _patchGraphOverlay.get(),
-                                             this);
-    _patchGraphDock = new QDockWidget(tr("Patch Graph"), this);
-    _patchGraphDock->setObjectName(QStringLiteral("dockWidgetPatchGraph"));
-    attachScrollAreaToDock(_patchGraphDock, _patchGraphWidget, QStringLiteral("dockWidgetPatchGraphContent"));
-    addDockWidget(Qt::RightDockWidgetArea, _patchGraphDock);
-    _patchGraphWidget->setEditingEnabled(_segmentationModule->editingEnabled());
-    connect(_segmentationModule.get(), &SegmentationModule::editingEnabledChanged,
-            _patchGraphWidget, &PatchGraphWidget::setEditingEnabled);
-    connect(_patchGraphWidget, &PatchGraphWidget::captureActiveChanged,
-            _segmentationModule.get(), &SegmentationModule::setPatchGraphCaptureActive);
 
     SegmentationGrower::Context growerContext{
         _segmentationModule.get(),
@@ -3603,7 +3570,6 @@ void CWindow::CreateWidgets(void)
 
     // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, and Drawing together
     tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
-    tabifyDockWidget(ui.dockWidgetSegmentation, _patchGraphDock);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
     tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDrawing);

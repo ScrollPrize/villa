@@ -816,7 +816,7 @@ void ApprovalMaskBrushTool::finishStrokeFromWorld()
 std::optional<std::pair<int, int>> ApprovalMaskBrushTool::surfaceToGridIndex(const QPointF& surfacePos) const
 {
     // Convert surface parameter coordinates to grid indices.
-    // Surface coords come from TileScene::sceneToSurface() and range from
+    // Surface coords come from the viewer surface transform and range from
     // -center to +center. Grid indices = (surfacePos + center) * scale.
     if (!_surface) {
         return std::nullopt;

@@ -30,7 +30,6 @@ struct KeyPressDef {
 
 namespace shortcuts {
 extern const ShortcutDef OpenVolpkg;
-extern const ShortcutDef TeleaInpaint;
 extern const ShortcutDef AxisAlignedSlices;
 extern const ShortcutDef SurfaceNormals;
 extern const ShortcutDef DirectionHints;

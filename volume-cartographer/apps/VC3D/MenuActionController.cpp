@@ -188,13 +188,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _selectionClearAct = new QAction(QObject::tr("Clear"), this);
     connect(_selectionClearAct, &QAction::triggered, this, &MenuActionController::clearSelection);
 
-    _teleaAct = new QAction(QObject::tr("Inpaint (Telea) && Rebuild Segment"), this);
-    _teleaAct->setToolTip(QObject::tr("Generate RGB, Telea-inpaint it, then convert back to tifxyz into a new segment"));
-#if (QT_VERSION >= QT_VERSION_CHECK(5, 10, 0))
-    _teleaAct->setShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::TeleaInpaint));
-#endif
-    connect(_teleaAct, &QAction::triggered, this, &MenuActionController::runTeleaInpaint);
-
     _importObjAct = new QAction(QObject::tr("Import OBJ as Patch..."), this);
     connect(_importObjAct, &QAction::triggered, this, &MenuActionController::importObjAsPatch);
 
@@ -255,14 +248,10 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _transformsMenu = new QMenu(QObject::tr("&Transforms"), _actionsMenu);
     _transformsMenu->addAction(_rotateSurfaceAct);
     _actionsMenu->addMenu(_transformsMenu);
-    _actionsMenu->addSeparator();
-    _actionsMenu->addAction(_teleaAct);
 
     _selectionMenu = new QMenu(QObject::tr("&Selection"), qWindow);
     _selectionMenu->addAction(_surfaceFromSelectionAct);
     _selectionMenu->addAction(_selectionClearAct);
-    _selectionMenu->addSeparator();
-    _selectionMenu->addAction(_teleaAct);
 
     _helpMenu = new QMenu(QObject::tr("&Help"), qWindow);
     _helpMenu->addAction(_keybindsAct);
@@ -1740,11 +1729,6 @@ void MenuActionController::openRemoteScroll(
     discoveryWatcher->setFuture(discoveryFuture);
 }
 
-void MenuActionController::triggerTeleaInpaint()
-{
-    runTeleaInpaint();
-}
-
 void MenuActionController::showSettingsDialog()
 {
     if (!_window) {
@@ -2064,109 +2048,6 @@ void MenuActionController::clearSelection()
 
     segViewer->clearSelections();
     _window->statusBar()->showMessage(QObject::tr("Selections cleared"), 2000);
-}
-
-void MenuActionController::runTeleaInpaint()
-{
-    if (!_window) {
-        return;
-    }
-
-    QList<QTreeWidgetItem*> selectedItems = _window->treeWidgetSurfaces->selectedItems();
-    if (selectedItems.isEmpty()) {
-        QMessageBox::information(_window, QObject::tr("Info"), QObject::tr("Select a patch/trace first in the Surfaces list."));
-        return;
-    }
-
-    const QString vc_tifxyz2rgb = find_tool("vc_tifxyz2rgb");
-    const QString vc_telea_inpaint = find_tool("vc_telea_inpaint");
-    const QString vc_rgb2tifxyz = find_tool("vc_rgb2tifxyz");
-
-    int successCount = 0;
-    int failCount = 0;
-
-    for (QTreeWidgetItem* item : selectedItems) {
-        const std::string id = item->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString();
-        auto surf = _window->_state->vpkg() ? _window->_state->vpkg()->getSurface(id) : nullptr;
-        if (!surf) {
-            ++failCount;
-            continue;
-        }
-
-        const std::filesystem::path segDir = surf->path;
-        const std::filesystem::path parentDir = segDir.parent_path();
-        const std::filesystem::path metaJson = segDir / "meta.json";
-
-        if (!std::filesystem::exists(metaJson)) {
-            QMessageBox::warning(_window, QObject::tr("Error"),
-                                 QObject::tr("Missing meta.json for %1").arg(QString::fromStdString(id)));
-            ++failCount;
-            continue;
-        }
-
-        const QString stamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmsszzz");
-        const QString rgbPngName = QString::fromStdString(id) + "_xyz_rgb_" + stamp + ".png";
-        const QString newSegName = QString::fromStdString(id) + "_telea_" + stamp;
-
-        QTemporaryDir tmpInDir;
-        QTemporaryDir tmpOutDir;
-        if (!tmpInDir.isValid() || !tmpOutDir.isValid()) {
-            QMessageBox::warning(_window, QObject::tr("Error"), QObject::tr("Failed to create temporary directories."));
-            ++failCount;
-            continue;
-        }
-
-        const QString rgbPng = QDir(tmpInDir.path()).filePath(rgbPngName);
-        {
-            QStringList args;
-            args << QString::fromStdString(segDir.string())
-                 << rgbPng;
-            QString log;
-            if (!run_cli(_window, vc_tifxyz2rgb, args, &log)) {
-                ++failCount;
-                continue;
-            }
-        }
-
-        QString inpaintedPng;
-        {
-            QStringList args;
-            args << rgbPng
-                 << (inpaintedPng = QDir(tmpOutDir.path()).filePath(QString::fromStdString(id) + "_inpainted_" + stamp + ".png"))
-                 << "--patch" << QString::number(9)
-                 << "--iterations" << QString::number(100);
-            QString log;
-            if (!run_cli(_window, vc_telea_inpaint, args, &log)) {
-                ++failCount;
-                continue;
-            }
-        }
-
-        {
-            QStringList args;
-            args << inpaintedPng
-                 << QString::fromStdString(metaJson.string())
-                 << QString::fromStdString(parentDir.string())
-                 << newSegName
-                 << "--invalid-black";
-            QString log;
-            if (!run_cli(_window, vc_rgb2tifxyz, args, &log)) {
-                ++failCount;
-                continue;
-            }
-        }
-
-        ++successCount;
-    }
-
-    if (successCount > 0 && _window->_surfacePanel) {
-        _window->_surfacePanel->reloadSurfacesFromDisk();
-    }
-
-    _window->statusBar()->showMessage(QObject::tr("Telea inpaint pipeline complete. Success: %1, Failed: %2")
-                                         .arg(successCount)
-                                         .arg(failCount),
-                                     6000);
 }
 
 void MenuActionController::importObjAsPatch()

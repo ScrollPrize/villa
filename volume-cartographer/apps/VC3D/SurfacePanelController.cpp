@@ -1077,13 +1077,6 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
         });
     }
 
-    contextMenu.addSeparator();
-
-    QAction* inpaintTeleaAction = contextMenu.addAction(tr("Inpaint (Telea) && Rebuild Segment"));
-    connect(inpaintTeleaAction, &QAction::triggered, this, [this]() {
-        emit teleaInpaintRequested();
-    });
-
     QStringList recalcTargets = selectedSegmentIds;
     if (recalcTargets.isEmpty()) {
         recalcTargets << segmentId;

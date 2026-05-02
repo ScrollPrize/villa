@@ -29,8 +29,8 @@ class Volume;
 class VCCollection;
 namespace vc::cache { class BlockPipeline; }
 
-// Abstract interface for volume viewers (CVolumeViewer and CTiledVolumeViewer).
-// Overlay controllers work through this interface to support both viewer types.
+// Abstract interface for volume viewers.
+// Overlay controllers work through this interface instead of depending on a concrete viewer.
 class VolumeViewerBase
 {
 public:

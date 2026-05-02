@@ -175,7 +175,6 @@ public:
     [[nodiscard]] bool isSegmentationViewer(const VolumeViewerBase* viewer) const;
 
     void setRotationHandleHitTester(std::function<bool(VolumeViewerBase*, const cv::Vec3f&)> tester);
-    void setPatchGraphCaptureActive(bool active) { _patchGraphCaptureActive = active; }
 
     [[nodiscard]] bool manualAddMode() const { return _manualAddMode; }
     [[nodiscard]] cv::Mat takePendingManualAddTracerMask();
@@ -363,7 +362,6 @@ private:
     VCCollection* _pointCollection{nullptr};
 
     bool _editingEnabled{false};
-    bool _patchGraphCaptureActive{false};
     float _dragRadiusSteps{5.0f};
     float _dragSigmaSteps{2.0f};
     float _lineRadiusSteps{5.0f};

@@ -1,6 +1,7 @@
 #include "AxisAlignedSliceController.hpp"
 #include "CState.hpp"
 #include "ViewerManager.hpp"
+#include "VolumeViewerBase.hpp"
 #include "overlays/PlaneSlicingOverlayController.hpp"
 #include "CVolumeViewerView.hpp"
 #include "VCSettings.hpp"

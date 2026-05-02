@@ -30,7 +30,6 @@ public:
     void refreshRecentMenu();
     void openVolpkgAt(const QString& path);
     void loadAttachedRemoteVolumesForCurrentPackage();
-    void triggerTeleaInpaint();
     void openRemoteUrl(const QString& url, bool isRetry = false);
 
 private slots:
@@ -52,7 +51,6 @@ private slots:
     void toggleCursorMirroring(bool enabled);
     void surfaceFromSelection();
     void clearSelection();
-    void runTeleaInpaint();
     void importObjAsPatch();
     void beginRotateSurfaceTransform();
     void exitApplication();
@@ -120,7 +118,6 @@ private:
     QAction* _mirrorCursorAct{nullptr};
     QAction* _surfaceFromSelectionAct{nullptr};
     QAction* _selectionClearAct{nullptr};
-    QAction* _teleaAct{nullptr};
     QAction* _importObjAct{nullptr};
     QAction* _rotateSurfaceAct{nullptr};
     int _remoteOpenAuthRetries{0};
