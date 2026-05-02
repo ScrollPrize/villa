@@ -7,6 +7,8 @@
 #include "viewer_controls/panels/ViewerCompositePanel.hpp"
 #include "viewer_controls/panels/ViewerNavigationPanel.hpp"
 #include "viewer_controls/panels/ViewerNormalVisualizationPanel.hpp"
+#include "viewer_controls/panels/ViewerPostprocessingPanel.hpp"
+#include "viewer_controls/panels/ViewerPreprocessingPanel.hpp"
 #include "viewer_controls/panels/ViewerTransformsPanel.hpp"
 #include "viewer_controls/panels/ViewerViewExtrasPanel.hpp"
 
@@ -178,12 +180,35 @@ void ViewerControlsPanel::addViewerGroups()
                    viewer::GROUP_NORMAL_VIS_EXPANDED,
                    viewer::GROUP_NORMAL_VIS_EXPANDED_DEFAULT);
 
+    ViewerPreprocessingPanel::UiRefs preprocessingUi{
+        .scrollArea = _uiRefs.preprocessingScrollArea,
+        .contents = _uiRefs.preprocessingContents,
+        .isoCutoff = _uiRefs.isoCutoff,
+        .isoCutoffValue = _uiRefs.isoCutoffValue,
+    };
+    _preprocessingPanel = new ViewerPreprocessingPanel(preprocessingUi, _viewerManager, _uiRefs.contents);
     addViewerGroup(tr("Preprocessing"),
-                   detachScrollContents(_uiRefs.preprocessingScrollArea, _uiRefs.preprocessingContents),
+                   _preprocessingPanel,
                    viewer::GROUP_PREPROCESSING_EXPANDED,
                    viewer::GROUP_PREPROCESSING_EXPANDED_DEFAULT);
+
+    ViewerPostprocessingPanel::UiRefs postprocessingUi{
+        .scrollArea = _uiRefs.postprocessingScrollArea,
+        .contents = _uiRefs.postprocessingContents,
+        .baseColormap = _uiRefs.baseColormap,
+        .stretchValues = _uiRefs.stretchValuesPost,
+        .removeSmallComponents = _uiRefs.removeSmallComponents,
+        .minComponentSizeLabel = _uiRefs.minComponentSizeLabel,
+        .minComponentSize = _uiRefs.minComponentSize,
+        .claheEnabled = _uiRefs.claheEnabled,
+        .claheClipLimitLabel = _uiRefs.claheClipLimitLabel,
+        .claheClipLimit = _uiRefs.claheClipLimit,
+        .claheTileSizeLabel = _uiRefs.claheTileSizeLabel,
+        .claheTileSize = _uiRefs.claheTileSize,
+    };
+    _postprocessingPanel = new ViewerPostprocessingPanel(postprocessingUi, _viewerManager, _uiRefs.contents);
     addViewerGroup(tr("Postprocessing"),
-                   detachScrollContents(_uiRefs.postprocessingScrollArea, _uiRefs.postprocessingContents),
+                   _postprocessingPanel,
                    viewer::GROUP_POSTPROCESSING_EXPANDED,
                    viewer::GROUP_POSTPROCESSING_EXPANDED_DEFAULT);
 

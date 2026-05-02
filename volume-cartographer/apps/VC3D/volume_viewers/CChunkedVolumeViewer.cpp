@@ -988,28 +988,6 @@ void CChunkedVolumeViewer::markInteractiveMotion(double motionPx)
         _settleRenderTimer->start();
 }
 
-int CChunkedVolumeViewer::genericPreviewDownsampleFactor() const
-{
-    if (!_interactivePreview || _framebuffer.isNull())
-        return 1;
-
-    auto surf = _surfWeak.lock();
-    if (!surf || !dynamic_cast<QuadSurface*>(surf.get()))
-        return 1;
-
-    if (_overlayVolume || _compositeSettings.enabled || _compositeSettings.planeEnabled)
-        return 1;
-
-    const int pixels = _framebuffer.width() * _framebuffer.height();
-    if (pixels < 1024 * 768 && _interactionSpeedPxPerSec < kFastMotionPxPerSec)
-        return 1;
-
-    if (pixels >= 2560 * 1440 || _interactionSpeedPxPerSec >= kFastMotionPxPerSec)
-        return 4;
-
-    return 2;
-}
-
 bool CChunkedVolumeViewer::streamingCompositeUnsupported() const
 {
     return !isSupportedStreamingCompositeMethod(_compositeSettings.params.method) ||
@@ -1350,72 +1328,6 @@ void CChunkedVolumeViewer::submitRender()
         prefetchPlaneHalo(origin, vxStep, vyStep, startLevel, options);
     } else {
         const int startLevel = renderStartLevel(true);
-        const int previewFactor = genericPreviewDownsampleFactor();
-        if (previewFactor > 1) {
-            const int previewW = std::max(1, (fbW + previewFactor - 1) / previewFactor);
-            const int previewH = std::max(1, (fbH + previewFactor - 1) / previewFactor);
-            const float previewScale = std::max(kMinScale, _scale / float(previewFactor));
-            const cv::Vec3f offset(_surfacePtrX * previewScale - float(previewW) * 0.5f,
-                                   _surfacePtrY * previewScale - float(previewH) * 0.5f,
-                                   0.0f);
-            cv::Mat_<cv::Vec3f> previewCoords;
-            cv::Mat_<cv::Vec3f> previewNormals;
-            surf->gen(&previewCoords,
-                      _zOff != 0.0f ? &previewNormals : nullptr,
-                      cv::Size(previewW, previewH), {0, 0, 0}, previewScale, offset);
-            if (_zOff != 0.0f &&
-                _zOffWorldDir == cv::Vec3f(0.0f, 0.0f, 0.0f) &&
-                !previewNormals.empty()) {
-                const cv::Vec3f n = previewNormals(previewNormals.rows / 2, previewNormals.cols / 2);
-                const float len = static_cast<float>(cv::norm(n));
-                if (len > 1e-6f)
-                    _zOffWorldDir = n / len;
-            }
-            if (_zOff != 0.0f && _zOffWorldDir != cv::Vec3f(0.0f, 0.0f, 0.0f)) {
-                const cv::Vec3f tr = _zOffWorldDir * _zOff;
-                for (int y = 0; y < previewCoords.rows; ++y) {
-                    auto* row = previewCoords.ptr<cv::Vec3f>(y);
-                    for (int x = 0; x < previewCoords.cols; ++x) {
-                        if (row[x][0] == row[x][0] && row[x][0] != -1.0f)
-                            row[x] += tr;
-                    }
-                }
-            }
-
-            cv::Mat_<uint8_t> previewValues(previewH, previewW, uint8_t(0));
-            cv::Mat_<uint8_t> previewCoverage(previewH, previewW, uint8_t(0));
-            if (_interactivePreview) {
-                vc::render::ChunkedPlaneSampler::sampleCoordsLevel(
-                    *_chunkArray, startLevel, previewCoords, previewValues, previewCoverage, options);
-            } else {
-                vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
-                    *_chunkArray, startLevel, previewCoords, previewValues, previewCoverage, options);
-            }
-
-            std::array<uint32_t, 256> lut{};
-            vc::buildWindowLevelColormapLut(lut, _windowLow, _windowHigh, _baseColormapId);
-            QImage previewImage(previewW, previewH, QImage::Format_RGB32);
-            auto* previewBits = reinterpret_cast<uint32_t*>(previewImage.bits());
-            const int previewStride = previewImage.bytesPerLine() / 4;
-            for (int y = 0; y < previewH; ++y) {
-                auto* row = previewBits + size_t(y) * size_t(previewStride);
-                const auto* src = previewValues.ptr<uint8_t>(y);
-                const auto* cov = previewCoverage.ptr<uint8_t>(y);
-                for (int x = 0; x < previewW; ++x)
-                    row[x] = cov[x] ? lut[src[x]] : 0xFF000000u;
-            }
-            _framebuffer = previewImage.scaled(fbW, fbH, Qt::IgnoreAspectRatio, Qt::FastTransformation);
-            syncCameraTransform();
-            if (_interactivePreview)
-                updateIntersectionPreviewTransform();
-            else
-                renderIntersections();
-            emit overlaysUpdated();
-            _view->viewport()->update();
-            updateStatusLabel();
-            return;
-        }
-
         cv::Vec3f offset(_surfacePtrX * _scale - float(fbW) * 0.5f,
                          _surfacePtrY * _scale - float(fbH) * 0.5f,
                          0.0f);

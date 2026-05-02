@@ -13,6 +13,8 @@ class QSpinBox;
 class ViewerManager;
 class WindowRangeWidget;
 class ViewerCompositePanel;
+class ViewerPostprocessingPanel;
+class ViewerPreprocessingPanel;
 class ViewerTransformsPanel;
 
 class ViewerControlsPanel : public QWidget
@@ -117,9 +119,21 @@ public:
 
         QScrollArea* preprocessingScrollArea{nullptr};
         QWidget* preprocessingContents{nullptr};
+        QSlider* isoCutoff{nullptr};
+        QLabel* isoCutoffValue{nullptr};
 
         QScrollArea* postprocessingScrollArea{nullptr};
         QWidget* postprocessingContents{nullptr};
+        QComboBox* baseColormap{nullptr};
+        QCheckBox* stretchValuesPost{nullptr};
+        QCheckBox* removeSmallComponents{nullptr};
+        QLabel* minComponentSizeLabel{nullptr};
+        QSpinBox* minComponentSize{nullptr};
+        QCheckBox* claheEnabled{nullptr};
+        QLabel* claheClipLimitLabel{nullptr};
+        QDoubleSpinBox* claheClipLimit{nullptr};
+        QLabel* claheTileSizeLabel{nullptr};
+        QSpinBox* claheTileSize{nullptr};
 
         QPushButton* zoomInButton{nullptr};
         QPushButton* zoomOutButton{nullptr};
@@ -163,6 +177,8 @@ private:
     UiRefs _uiRefs;
     ViewerManager* _viewerManager{nullptr};
     ViewerCompositePanel* _compositePanel{nullptr};
+    ViewerPreprocessingPanel* _preprocessingPanel{nullptr};
+    ViewerPostprocessingPanel* _postprocessingPanel{nullptr};
     ViewerTransformsPanel* _transformsPanel{nullptr};
     WindowRangeWidget* _volumeWindowWidget{nullptr};
     WindowRangeWidget* _overlayWindowWidget{nullptr};

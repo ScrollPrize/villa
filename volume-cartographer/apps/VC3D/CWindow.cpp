@@ -56,7 +56,6 @@
 #include <QStringList>
 
 #include "volume_viewers/CVolumeViewerView.hpp"
-#include "VolumeViewerCmaps.hpp"
 #include "viewer_controls/ViewerControlsPanel.hpp"
 #include "viewer_controls/panels/ViewerTransformsPanel.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
@@ -2236,8 +2235,20 @@ void CWindow::CreateWidgets(void)
         .normalMaxArrowsValueLabel = ui.labelNormalMaxArrowsValue,
         .preprocessingScrollArea = ui.scrollAreaPreprocessing,
         .preprocessingContents = ui.dockWidgetPreprocessingContents,
+        .isoCutoff = ui.sliderIsoCutoff,
+        .isoCutoffValue = ui.lblIsoCutoffValue,
         .postprocessingScrollArea = ui.scrollAreaPostprocessing,
         .postprocessingContents = ui.dockWidgetPostprocessingContents,
+        .baseColormap = ui.baseColormapSelect,
+        .stretchValuesPost = ui.chkStretchValuesPost,
+        .removeSmallComponents = ui.chkRemoveSmallComponents,
+        .minComponentSizeLabel = ui.lblMinComponentSize,
+        .minComponentSize = ui.spinMinComponentSize,
+        .claheEnabled = ui.chkClaheEnabled,
+        .claheClipLimitLabel = ui.lblClaheClipLimit,
+        .claheClipLimit = ui.spinClaheClipLimit,
+        .claheTileSizeLabel = ui.lblClaheTileSize,
+        .claheTileSize = ui.spinClaheTileSize,
         .zoomInButton = ui.btnZoomIn,
         .zoomOutButton = ui.btnZoomOut,
         .sliceStepSizeSpin = ui.spinSliceStepSize,
@@ -2337,25 +2348,6 @@ void CWindow::CreateWidgets(void)
             _viewerControlsPanel->setOverlayWindowAvailable(_volumeOverlay->hasOverlaySelection());
         }
     }
-
-        // Setup base colormap selector
-    {
-        const auto& entries = volume_viewer_cmaps::entries(volume_viewer_cmaps::EntryScope::SharedOnly);
-        ui.baseColormapSelect->clear();
-        ui.baseColormapSelect->addItem(tr("None (Grayscale)"), QString());
-        for (const auto& entry : entries) {
-            ui.baseColormapSelect->addItem(entry.label, QString::fromStdString(entry.id));
-        }
-        ui.baseColormapSelect->setCurrentIndex(0);
-    }
-
-    connect(ui.baseColormapSelect, qOverload<int>(&QComboBox::currentIndexChanged), [this](int index) {
-        if (index < 0 || !_viewerManager) return;
-        const QString id = ui.baseColormapSelect->currentData().toString();
-        _viewerManager->forEachBaseViewer([&id](VolumeViewerBase* viewer) {
-            viewer->setBaseColormap(id.toStdString());
-        });
-    });
 
     // Setup surface overlay controls
     connect(ui.chkSurfaceOverlay, &QCheckBox::toggled, [this](bool checked) {
@@ -2480,88 +2472,6 @@ void CWindow::CreateWidgets(void)
     if (auto* chkAxisOverlays = ui.chkAxisOverlays) {
         onAxisOverlayVisibilityToggled(chkAxisOverlays->isChecked());
     }
-
-    // Connect ISO Cutoff slider - applies to all viewers (segmentation, XY, XZ, YZ)
-    connect(ui.sliderIsoCutoff, &QSlider::valueChanged, this, [this](int value) {
-        ui.lblIsoCutoffValue->setText(QString::number(value));
-        if (!_viewerManager) {
-            return;
-        }
-        _viewerManager->forEachBaseViewer([value](VolumeViewerBase* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.isoCutoff = static_cast<uint8_t>(std::clamp(value, 0, 255));
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
-
-    // Connect Postprocessing controls
-    connect(ui.chkStretchValuesPost, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.postStretchValues = checked;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    connect(ui.chkRemoveSmallComponents, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.postRemoveSmallComponents = checked;
-            viewer->setCompositeRenderSettings(s);
-        }
-        // Enable/disable the min component size spinbox based on checkbox state
-        ui.spinMinComponentSize->setEnabled(checked);
-        ui.lblMinComponentSize->setEnabled(checked);
-    });
-
-    connect(ui.spinMinComponentSize, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.postMinComponentSize = std::clamp(value, 1, 100000);
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Initialize min component size controls based on checkbox state
-    ui.spinMinComponentSize->setEnabled(ui.chkRemoveSmallComponents->isChecked());
-    ui.lblMinComponentSize->setEnabled(ui.chkRemoveSmallComponents->isChecked());
-
-    // CLAHE postprocessing — applied to every viewer
-    auto setClaheEnabled = [this](bool on) {
-        ui.spinClaheClipLimit->setEnabled(on);
-        ui.spinClaheTileSize->setEnabled(on);
-        ui.lblClaheClipLimit->setEnabled(on);
-        ui.lblClaheTileSize->setEnabled(on);
-    };
-    setClaheEnabled(ui.chkClaheEnabled->isChecked());
-
-    connect(ui.chkClaheEnabled, &QCheckBox::toggled, this, [this, setClaheEnabled](bool checked) {
-        setClaheEnabled(checked);
-        if (!_viewerManager) return;
-        _viewerManager->forEachBaseViewer([checked](VolumeViewerBase* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.postClaheEnabled = checked;
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
-
-    connect(ui.spinClaheClipLimit, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        if (!_viewerManager) return;
-        _viewerManager->forEachBaseViewer([value](VolumeViewerBase* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.postClaheClipLimit = static_cast<float>(value);
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
-
-    connect(ui.spinClaheTileSize, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (!_viewerManager) return;
-        _viewerManager->forEachBaseViewer([value](VolumeViewerBase* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.postClaheTileSize = std::clamp(value, 2, 64);
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
 
     bool resetViewOnSurfaceChange = settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
                                                    vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
