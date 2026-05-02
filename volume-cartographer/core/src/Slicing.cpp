@@ -130,6 +130,9 @@ struct BlockSampler {
     BlockPipeline& cache;
     int level;
     VolumeShape shape;
+    int chunkBlocksZ = 1;
+    int chunkBlocksY = 1;
+    int chunkBlocksX = 1;
     // Frame snapshot captured at construction; released in the destructor.
     // When non-null we can bypass `cache.blockAt` on known-empty chunks
     // via a plain-memory binary search instead of an atomic probe loop.
@@ -150,7 +153,13 @@ struct BlockSampler {
         : cache(c), level(lvl), shape(c, lvl),
           frame(TickCoordinator::currentFrameGlobal()),
           slots(std::make_unique<HotSlot[]>(kSlots)),
-          slotBlocks(std::make_unique<BlockPtr[]>(kSlots)) {}
+          slotBlocks(std::make_unique<BlockPtr[]>(kSlots))
+    {
+        const auto chunkShape = cache.chunkShape(level);
+        chunkBlocksZ = std::max(1, chunkShape[0] / kBlockSize);
+        chunkBlocksY = std::max(1, chunkShape[1] / kBlockSize);
+        chunkBlocksX = std::max(1, chunkShape[2] / kBlockSize);
+    }
 
     ~BlockSampler() {
         TickCoordinator::releaseFrameGlobal(frame);
@@ -205,10 +214,14 @@ struct BlockSampler {
         // Known-empty chunk short-circuit. FrameState::emptyChunkKeys is
         // a sorted vector published once per tick by TickCoordinator; a
         // binary search is plain memory, vs. the atomic probe loop inside
-        // BlockPipeline::blockAt. Canonical chunks are 128³ = 8 blocks per
-        // axis, so chunk coord = block coord >> 3.
+        // BlockPipeline::blockAt. Chunk shapes are dataset-specific, so
+        // map block coordinates back through the metadata-derived grid.
         if (frame) {
-            const ChunkKey ck{level, bz >> 3, by >> 3, bx >> 3};
+            const ChunkKey ck{
+                level,
+                bz / chunkBlocksZ,
+                by / chunkBlocksY,
+                bx / chunkBlocksX};
             if (std::binary_search(frame->emptyChunkKeys.begin(),
                                    frame->emptyChunkKeys.end(), ck)) {
                 slotBlocks[idx] = &kSliceZeroBlock;
@@ -434,62 +447,6 @@ VoxelBounds planeViewportBounds(const cv::Vec3f& origin,
         }
     }
     return b;
-}
-
-// Surface-aware chunk enumeration. Bbox enumeration is correct for planes
-// (the plane really does span its bbox) but disastrous for curved surfaces:
-// a flattened scroll surface might span a 4000x4000x500 voxel bbox while
-// actually crossing only a few hundred chunks. The other thousands of
-// bbox-interior chunks are off-surface and would trigger pointless S3
-// fetches. Walk per-pixel coords, map each to its chunk, dedup.
-// Sub-sample to keep the dedup set cheap.
-void appendChunksForCoordsSurface(BlockPipeline& cache, int level,
-                                  const cv::Mat_<cv::Vec3f>& coords,
-                                  std::vector<vc::cache::ChunkKey>& out) {
-    auto cs = cache.chunkShape(level);
-    if (cs[0] <= 0 || cs[1] <= 0 || cs[2] <= 0) return;
-    auto ls = cache.levelShape(level);
-    const int chunksZ = (ls[0] + cs[0] - 1) / cs[0];
-    const int chunksY = (ls[1] + cs[1] - 1) / cs[1];
-    const int chunksX = (ls[2] + cs[2] - 1) / cs[2];
-
-    const float scale = (level > 0) ? 1.0f / float(1 << level) : 1.0f;
-    // Sub-sample stride for the prefetch walk. Missing a chunk here is not
-    // a correctness bug — the render sampler faults it in lazily — just a
-    // prefetch miss, so stride=8 trades a rare lazy fetch on steeply
-    // oblique surfaces for ~64x less work on large surfaces.
-    const int stride = (coords.rows > 256) ? 8 : 1;
-
-    // Thread-local dedup set to avoid heap churn across frames. Cleared on
-    // entry; capacity grows monotonically with the largest surface ever seen
-    // on this thread, which is exactly what we want (amortizes allocations).
-    thread_local std::unordered_set<vc::cache::ChunkKey, vc::cache::ChunkKeyHash> seen;
-    seen.clear();
-    const size_t sampleEstimate =
-        size_t((coords.rows + stride - 1) / stride) *
-        size_t((coords.cols + stride - 1) / stride);
-    // Rough: spatial coherence keeps unique-chunk count ≪ sample count.
-    seen.reserve(std::max<size_t>(512, sampleEstimate / 8));
-
-    for (int r = 0; r < coords.rows; r += stride) {
-        const cv::Vec3f* row = coords.ptr<cv::Vec3f>(r);
-        for (int c = 0; c < coords.cols; c += stride) {
-            const cv::Vec3f& v = row[c];
-            // Skip NaN / zero-sentinel pixels (off-surface).
-            if (!isfinite_bitwise(v[0])) continue;
-            if (v[0] == 0.f && v[1] == 0.f && v[2] == 0.f) continue;
-            const int ix_ = int(std::floor(v[0] * scale));
-            const int iy_ = int(std::floor(v[1] * scale));
-            const int iz_ = int(std::floor(v[2] * scale));
-            if (ix_ < 0 || iy_ < 0 || iz_ < 0) continue;
-            const int cx = ix_ / cs[2];
-            const int cy = iy_ / cs[1];
-            const int cz = iz_ / cs[0];
-            if (cx >= chunksX || cy >= chunksY || cz >= chunksZ) continue;
-            vc::cache::ChunkKey k{level, cz, cy, cx};
-            if (seen.insert(k).second) out.push_back(k);
-        }
-    }
 }
 
 // Sort prefetch keys by 3D distance from the viewport-center voxel (in
@@ -1182,31 +1139,7 @@ void sampleSingleLayerAdaptiveImpl(
     if (!skipPrefetch) {
     cv::Vec3f viewCenterL0(0, 0, 0);
     bool haveCenter = false;
-    if (coords) {
-        thread_local std::vector<vc::cache::ChunkKey> keys;
-        keys.clear();
-        for (int lvl = desiredLevel; lvl < numLevels; ++lvl) {
-            appendChunksForCoordsSurface(cache, lvl, *coords, keys);
-        }
-        const cv::Vec3f cvCenter = (*coords)(coords->rows / 2, coords->cols / 2);
-        if (isfinite_bitwise(cvCenter[0])
-            && (cvCenter[0] * cvCenter[0] + cvCenter[1] * cvCenter[1]
-                + cvCenter[2] * cvCenter[2]) > 0.25f) {
-            viewCenterL0 = cvCenter;
-            haveCenter = true;
-        }
-        if (!keys.empty()) {
-            if (haveCenter) {
-                std::array<std::array<int, 3>, vc::cache::kMaxLevels> shapes{};
-                for (int lvl = 0; lvl < numLevels && lvl < vc::cache::kMaxLevels; ++lvl)
-                    shapes[lvl] = cache.chunkShape(lvl);
-                sortKeysByCenterDistance(keys, shapes.data(),
-                                         std::min(numLevels, int(vc::cache::kMaxLevels)),
-                                         viewCenterL0);
-            }
-            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel);
-        }
-    } else {
+    if (!coords) {
         const VoxelBounds b = planeViewportBounds(
             *origin, *vx_step, *vy_step, w, h, *planeNormal,
             zOffConst, zOffConst);
@@ -1324,6 +1257,7 @@ void sampleSingleLayerAdaptiveImpl(
                     }
                 }
                 if (!got) {
+                    fallbackRepair.template recordSample<SMode>(tid, swz, swy, swx);
                     for (int i=0; i<nSamplers; i++) {
                         const float r = scalesRatio[i];
                         if (trySampleNB<SMode>(sampler(i),
@@ -1375,7 +1309,9 @@ void sampleSingleLayerAdaptiveImpl(
 
     if (promoteFallbackChunks) {
         auto repairKeys = fallbackRepair.merged();
-        if (!repairKeys.empty()) cache.fetchInteractive(repairKeys, desiredLevel);
+        if (!repairKeys.empty()) {
+            cache.fetchInteractive(repairKeys, desiredLevel, /*forceResidentReload=*/true);
+        }
     }
 }
 
@@ -1416,41 +1352,7 @@ void sampleCompositeAdaptiveImpl(
     if (!skipPrefetch) {
     cv::Vec3f viewCenterL0(0, 0, 0);
     bool haveCenter = false;
-    if (coords) {
-        // Surface-aware enumeration replaces bbox: a curved scroll surface
-        // spans a huge bbox while only crossing a few hundred chunks. Use
-        // the per-pixel coords to enqueue exactly the chunks the surface
-        // touches; bbox enumeration is left in place only to compute the
-        // view center fallback when the central pixel is NaN.
-        thread_local std::vector<vc::cache::ChunkKey> keys;
-        keys.clear();
-        for (int lvl = desiredLevel; lvl < numLevels; ++lvl) {
-            appendChunksForCoordsSurface(cache, lvl, *coords, keys);
-        }
-        const cv::Vec3f cvCenter = (*coords)(coords->rows / 2, coords->cols / 2);
-        // Guard against the (0,0,0) off-surface sentinel — we don't want
-        // it biasing the viewport-centre prefetch priority toward origin.
-        if (isfinite_bitwise(cvCenter[0])
-            && (cvCenter[0] * cvCenter[0] + cvCenter[1] * cvCenter[1]
-                + cvCenter[2] * cvCenter[2]) > 0.25f) {
-            viewCenterL0 = cvCenter;
-            haveCenter = true;
-        }
-        if (!keys.empty()) {
-            if (haveCenter) {
-                // Without a real center (viewCenterL0 would fall back to
-                // the (0,0,0) default), the distance sort would wrongly
-                // bias prefetch toward the volume origin.
-                std::array<std::array<int, 3>, vc::cache::kMaxLevels> shapes{};
-                for (int lvl = 0; lvl < numLevels && lvl < vc::cache::kMaxLevels; ++lvl)
-                    shapes[lvl] = cache.chunkShape(lvl);
-                sortKeysByCenterDistance(keys, shapes.data(),
-                                         std::min(numLevels, int(vc::cache::kMaxLevels)),
-                                         viewCenterL0);
-            }
-            TickCoordinator::enqueuePrefetchGlobal(&cache, keys, desiredLevel);
-        }
-    } else {
+    if (!coords) {
         const VoxelBounds b = planeViewportBounds(
             *origin, *vx_step, *vy_step, w, h, *planeNormal,
             zMin, zMax);
@@ -1699,6 +1601,8 @@ void sampleCompositeAdaptiveImpl(
                         bool got = trySampleNearestUnchecked(*samplers[0],
                             svz, svy, svx, v);
                         if (!got) {
+                            fallbackRepair.template recordSample<SMode>(
+                                tid, svz, svy, svx);
                             for (int i = 0; i < nSamplers; i++) {
                                 float scl = scales[i];
                                 if (trySampleNB<SMode>(sampler(i),
@@ -1859,6 +1763,8 @@ void sampleCompositeAdaptiveImpl(
                                 // instead of black until the fine chunk
                                 // arrives.
                                 uint8_t fv = 0;
+                                fallbackRepair.template recordSample<SMode>(
+                                    tid, swz, swy, swx);
                                 for (int i = 1; i < nSamplers; i++) {
                                     const float r = scalesRatio[i];
                                     if (trySampleNB<SMode>(sampler(i),
@@ -1914,6 +1820,8 @@ void sampleCompositeAdaptiveImpl(
                                 // zero. Keeps progressive render showing
                                 // coarse data instead of flashing black.
                                 uint8_t fv = 0;
+                                fallbackRepair.template recordSample<SMode>(
+                                    tid, swz, swy, swx);
                                 for (int i = 1; i < nSamplers; i++) {
                                     const float r = scalesRatio[i];
                                     if (trySampleNB<SMode>(sampler(i),
@@ -1948,6 +1856,10 @@ void sampleCompositeAdaptiveImpl(
                                         tid, swz, swy, swx);
                                 }
                                 break;
+                            }
+                            if (i == 0) {
+                                fallbackRepair.template recordSample<SMode>(
+                                    tid, swz, swy, swx);
                             }
                         }
                         if (preTfOn) v = preTfLut[v];
@@ -2501,7 +2413,9 @@ void sampleCompositeAdaptiveImpl(
 
     if (promoteFallbackChunks) {
         auto repairKeys = fallbackRepair.merged();
-        if (!repairKeys.empty()) cache.fetchInteractive(repairKeys, desiredLevel);
+        if (!repairKeys.empty()) {
+            cache.fetchInteractive(repairKeys, desiredLevel, /*forceResidentReload=*/true);
+        }
     }
 }
 

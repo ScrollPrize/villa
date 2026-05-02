@@ -9,7 +9,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -19,12 +18,6 @@
 #include <utils/http_fetch.hpp>
 
 namespace vc::cache {
-
-static bool envFlagEnabled(const char* name) noexcept {
-    const char* value = std::getenv(name);
-    if (!value || value[0] == '\0') return false;
-    return !(value[0] == '0' && value[1] == '\0');
-}
 
 static std::array<size_t, 3> chunkIndices(const ChunkKey& key) {
     return {size_t(key.iz), size_t(key.iy), size_t(key.ix)};
@@ -852,121 +845,27 @@ void BlockPipeline::bloomClear() noexcept {
     for (auto& w : negativeBloom_) w.store(0, std::memory_order_relaxed);
 }
 
-void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys, int targetLevel) {
-    static const bool disableFetchInteractiveDedup =
-        envFlagEnabled("VC_DISABLE_FETCHINTERACTIVE_DEDUP");
-    static bool printedDedupDisabled = false;
-    if (disableFetchInteractiveDedup && !printedDedupDisabled) {
-        printedDedupDisabled = true;
-        std::fprintf(stderr,
-            "[BlockPipeline] VC_DISABLE_FETCHINTERACTIVE_DEDUP=1: "
-            "fetchInteractive dedup disabled\n");
-    }
+void BlockPipeline::fetchInteractive(const std::vector<ChunkKey>& keys,
+                                     int targetLevel,
+                                     bool /*forceResidentReload*/) {
     static int fetchDbgCount = 0;
     if (fetchDbgCount++ < 5 || fetchDbgCount % 100 == 0)
         fprintf(stderr, "[BlockPipeline] fetchInteractive %p: %zu keys, targetLevel=%d\n",
                 (void*)this, keys.size(), targetLevel);
     if (keys.empty()) return;
-    // Dedup: the renderer calls this every frame, and viewport-idle frames
-    // pass the same keys + targetLevel as the previous call. When the
-    // BlockCache and I/O pools have not changed since the last submit,
-    // nothing downstream would change — the expensive containsBatch,
-    // emptyChunks snapshot, classification, and (most importantly)
-    // IOPool queue rebuilds would reproduce their previous outputs. Skip.
-    if (!disableFetchInteractiveDedup) {
-        // Commutative hash so order-insensitive dedup works across
-        // render paths that enumerate chunks in different orders.
-        uint64_t h = uint64_t(uint32_t(targetLevel)) * 0x9E3779B97F4A7C15ULL;
-        ChunkKeyHash kh;
-        for (const auto& k : keys) h ^= kh(k);
-        const uint64_t evictionNow = blockCache_.evictionVersion();
-        const std::array<uint64_t, 4> ioVersionsNow{
-            downloaderPool_.stateVersion(),
-            loaderPool_.stateVersion(),
-            encodePool_.stateVersion(),
-            decodePool_.stateVersion()
-        };
-        std::lock_guard lk(fetchInteractiveDedupMutex_);
-        if (haveLastFetchInteractive_
-            && lastFetchInteractiveHash_ == h
-            && lastFetchInteractiveEviction_ == evictionNow
-            && lastFetchInteractiveIoVersions_ == ioVersionsNow
-            && lastFetchInteractiveTargetLevel_ == targetLevel) {
-            return;
-        }
-        lastFetchInteractiveHash_ = h;
-        lastFetchInteractiveEviction_ = evictionNow;
-        lastFetchInteractiveIoVersions_ = ioVersionsNow;
-        lastFetchInteractiveTargetLevel_ = targetLevel;
-        haveLastFetchInteractive_ = true;
-    }
-    // Triage by disk presence: chunks already on disk go straight to the
-    // loader pool (fast, CPU-bound decode), chunks that need fetching go
-    // to the downloader pool (slow, network-bound). The two pools are
-    // fully independent so the loader can't be starved by in-flight S3
-    // work. Before either, skip chunks already resident in the block
-    // cache — otherwise IOPool re-queues every viewport chunk every frame
-    // (Done shards are re-queueable for eviction recovery) and loader
-    // workers endlessly re-decode data we already have.
-    constexpr int kMaxL = 16;
-    std::array<int, kMaxL> bpcZ{}, bpcY{}, bpcX{};
-    std::array<bool, kMaxL> shapeCached{};
-    auto ensureShapeCached = [&](int level) {
-        if (level < 0 || level >= kMaxL) return;
-        if (!shapeCached[level] && source_) {
-            auto csk = chunkShape(level);
-            if (csk[0] > 0) {
-                bpcZ[level] = csk[0] / kBlockSize;
-                bpcY[level] = csk[1] / kBlockSize;
-                bpcX[level] = csk[2] / kBlockSize;
-            }
-            shapeCached[level] = true;
-        }
-    };
 
-    // Build per-key BlockKey pairs (first + last block of each chunk) and
-    // batch-query the block cache. Checking two blocks instead of one
-    // catches partial eviction: if the first block survives the clock
-    // sweep but interior blocks were reclaimed, a single-block check
-    // would falsely skip the chunk, leaving visual holes until the first
-    // block is also evicted.
-    std::vector<BlockKey> probeKeys;
-    probeKeys.reserve(keys.size() * 2);
-    for (const auto& key : keys) {
-        if (key.level < 0 || key.level >= kMaxL) {
-            probeKeys.push_back({-1, 0, 0, 0});
-            probeKeys.push_back({-1, 0, 0, 0});
-            continue;
-        }
-        ensureShapeCached(key.level);
-        const int z = bpcZ[key.level], y = bpcY[key.level], x = bpcX[key.level];
-        if (z <= 0 || y <= 0 || x <= 0) {
-            probeKeys.push_back({-1, 0, 0, 0});
-            probeKeys.push_back({-1, 0, 0, 0});
-            continue;
-        }
-        // First block of the chunk
-        probeKeys.push_back({key.level, key.iz * z, key.iy * y, key.ix * x});
-        // Last block of the chunk
-        probeKeys.push_back({key.level, key.iz * z + z - 1,
-                                        key.iy * y + y - 1,
-                                        key.ix * x + x - 1});
-    }
-    std::vector<uint8_t> resident;
-    blockCache_.containsBatch(probeKeys, resident);
-
-    // Empty-chunks lookup is now lock-free per probe — no snapshot needed.
+    // Viewport demand must be level-triggered, not edge-triggered. Do not
+    // suppress a requested chunk because some cache probe says it is already
+    // resident: block-granular eviction and partial decode failures can make
+    // that false and leave permanent coarse/fill holes. IOPool already
+    // deduplicates InFlight work and allows Done work to be requeued for
+    // eviction recovery, so this layer only classifies source-of-truth.
     std::vector<ChunkKey> loaderKeys, downloaderKeys;
     loaderKeys.reserve(keys.size());
     downloaderKeys.reserve(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        const auto& key = keys[i];
+    for (const auto& key : keys) {
         if (isNegativeCached(key)) continue;
         if (isEmptyChunk(key)) continue;
-        // Both first and last block of the chunk must be resident to
-        // consider the chunk fully cached. See comment above probeKeys.
-        if (probeKeys[i * 2].level >= 0
-            && resident[i * 2] && resident[i * 2 + 1]) continue;
 
         auto* dz = (key.level < int(diskLevels_.size())) ? diskLevels_[key.level].get() : nullptr;
         const bool diskPresent = dz
@@ -993,15 +892,19 @@ BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
     // BlockCache::get() now owns the hit counter (per-shard, no contention);
     // we no longer bump statBlockHits_ here on the fast path.
     if (auto b = blockCache_.get(key); b) return b;
-    // Miss: could be an "empty chunk" (all-zero canonical chunk that we
-    // don't store). Canonical chunks are (canonical_side / block_side)
-    // blocks along each axis — 8 for h265 (128³ / 16³), 16 for c3d
-    // (256³ / 16³). Reverse-map the block coord to its enclosing
-    // canonical-chunk index and query via the lock-free hash set. No
-    // rwlock on the miss path — every blockAt miss used to hit
-    // pthread_rwlock_rdlock here.
-    const int cps = kCanonicalChunkSide / kBlockSize;
-    const ChunkKey chunkKey{key.level, key.bz / cps, key.by / cps, key.bx / cps};
+    // Miss: could be an "empty chunk" (all-zero source chunk that we don't
+    // store). Chunk shapes are dataset-specific for local volumes, so
+    // reverse-map the block coord to its enclosing chunk via metadata
+    // instead of assuming one canonical cube size.
+    const auto chunkDims = chunkShape(key.level);
+    const int blocksZ = std::max(1, chunkDims[0] / kBlockSize);
+    const int blocksY = std::max(1, chunkDims[1] / kBlockSize);
+    const int blocksX = std::max(1, chunkDims[2] / kBlockSize);
+    const ChunkKey chunkKey{
+        key.level,
+        key.bz / blocksZ,
+        key.by / blocksY,
+        key.bx / blocksX};
     if (isEmptyChunk(chunkKey)) {
         // One canonical zero block shared by every caller asking for
         // a block inside any empty chunk — no arena consumption.
@@ -1158,10 +1061,6 @@ void BlockPipeline::insertChunkAsBlocks(const ChunkKey& key,
 }
 
 void BlockPipeline::notifyChunkReady(const ChunkKey& key) {
-    if (chunkArrivedFlag_.exchange(true, std::memory_order_acq_rel)) {
-        return;
-    }
-
     // Snapshot callbacks under lock and release before firing so a slow
     // listener can't serialize the decode/fetch hot path or deadlock with
     // add/remove calls that need the same mutex.
@@ -1287,32 +1186,9 @@ bool BlockPipeline::isNegativeCached(const ChunkKey& key) const {
 size_t BlockPipeline::countAvailable(const std::vector<ChunkKey>& keys) const {
     size_t n = 0;
     if (!source_) return 0;
-    // Cache chunk shape per level. chunkShape() is virtual and typically
-    // hits a std::array lookup; avoiding the per-key call matters when
-    // countAvailable is invoked with thousands of keys per frame.
-    constexpr int kMaxL = 16;
-    std::array<int, kMaxL> bpcZ{}, bpcY{}, bpcX{};
-    std::array<bool, kMaxL> shapeCached{};
-    // Empty-chunk probe is now lock-free — no snapshot needed.
     for (const auto& key : keys) {
         if (isNegativeCached(key)) { n++; continue; }
         if (isEmptyChunk(key)) { n++; continue; }
-        if (key.level < 0 || key.level >= kMaxL) continue;
-        if (!shapeCached[key.level]) {
-            auto csk = chunkShape(key.level);
-            if (csk[0] <= 0) { shapeCached[key.level] = true; continue; }
-            bpcZ[key.level] = csk[0] / kBlockSize;
-            bpcY[key.level] = csk[1] / kBlockSize;
-            bpcX[key.level] = csk[2] / kBlockSize;
-            shapeCached[key.level] = true;
-        }
-        const int z = bpcZ[key.level], y = bpcY[key.level], x = bpcX[key.level];
-        if (z <= 0 || y <= 0 || x <= 0) continue;
-        // Check first + last block (matches fetchInteractive's two-block
-        // probe) so partial eviction doesn't report the chunk as available.
-        BlockKey first{key.level, key.iz * z, key.iy * y, key.ix * x};
-        BlockKey last{key.level, key.iz * z + z - 1, key.iy * y + y - 1, key.ix * x + x - 1};
-        if (blockCache_.contains(first) && blockCache_.contains(last)) n++;
     }
     return n;
 }
@@ -1323,46 +1199,8 @@ std::vector<ChunkKey> BlockPipeline::chunksMissingFromCache(
     std::vector<ChunkKey> missing;
     if (!source_) return keys;
 
-    constexpr int kMaxL = 16;
-    std::array<int, kMaxL> bpcZ{}, bpcY{}, bpcX{};
-    std::array<bool, kMaxL> shapeCached{};
-
-    auto ensureShapeCached = [&](int level) {
-        if (level < 0 || level >= kMaxL || shapeCached[level]) return;
-        auto csk = chunkShape(level);
-        if (csk[0] > 0) {
-            bpcZ[level] = csk[0] / kBlockSize;
-            bpcY[level] = csk[1] / kBlockSize;
-            bpcX[level] = csk[2] / kBlockSize;
-        }
-        shapeCached[level] = true;
-    };
-
     for (const auto& key : keys) {
         if (isNegativeCached(key) || isEmptyChunk(key)) continue;
-
-        bool resident = false;
-        if (key.level >= 0 && key.level < kMaxL) {
-            ensureShapeCached(key.level);
-            const int z = bpcZ[key.level], y = bpcY[key.level], x = bpcX[key.level];
-            if (z > 0 && y > 0 && x > 0) {
-                const BlockKey first{key.level, key.iz * z, key.iy * y, key.ix * x};
-                const BlockKey last{key.level, key.iz * z + z - 1,
-                                               key.iy * y + y - 1,
-                                               key.ix * x + x - 1};
-                resident = blockCache_.contains(first) && blockCache_.contains(last);
-            }
-        }
-        if (resident) continue;
-
-        auto* dz = (key.level >= 0 && key.level < int(diskLevels_.size()))
-            ? diskLevels_[key.level].get()
-            : nullptr;
-        const bool diskPresent = dz
-            && dz->is_sharded()
-            && dz->inner_chunk_exists(chunkIndices(key));
-        if (diskPresent) continue;
-
         missing.push_back(key);
     }
 
@@ -1385,7 +1223,9 @@ void BlockPipeline::removeChunkReadyListener(ChunkReadyCallbackId id) {
 }
 
 void BlockPipeline::clearChunkArrivedFlag() noexcept {
-    chunkArrivedFlag_.store(false, std::memory_order_release);
+    // Retained for older call sites. Chunk-ready notification coalescing is
+    // intentionally handled by each viewer's render timer, not by the shared
+    // pipeline, so an arrival can never suppress later repaint requests.
 }
 
 auto BlockPipeline::stats() const -> Stats {

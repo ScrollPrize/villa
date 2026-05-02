@@ -114,7 +114,9 @@ public:
     // into 16^3 blocks and inserted into the block cache. targetLevel is
     // the pyramid level the viewer is currently displaying at; shards at
     // that level get the highest IO priority.
-    void fetchInteractive(const std::vector<ChunkKey>& keys, int targetLevel = 0);
+    void fetchInteractive(const std::vector<ChunkKey>& keys,
+                          int targetLevel = 0,
+                          bool forceResidentReload = false);
 
     // --- Cache management ---
     void clearMemory();
@@ -403,24 +405,6 @@ private:
     mutable std::mutex callbackMutex_;
     std::vector<std::pair<ChunkReadyCallbackId, ChunkReadyCallback>> chunkReadyListeners_;
     std::atomic<ChunkReadyCallbackId> nextListenerId_{1};
-    std::atomic<bool> chunkArrivedFlag_{false};
-
-    // fetchInteractive dedup: the renderer calls fetchInteractive every
-    // frame, but when the viewport is idle the keys + targetLevel are
-    // identical back-to-back, and identical across multiple viewers. A
-    // commutative XOR hash of (key, targetLevel) + the BlockCache eviction
-    // version is enough to detect "nothing has changed since we last did
-    // the expensive probe/classify/updateInteractive work" and skip.
-    // Guarded by fetchInteractiveDedupMutex_ so cross-viewer calls
-    // serialize their compare-and-update of the stored state — without it
-    // two identical calls could both see a stale match and each do the
-    // work, defeating the dedup.
-    mutable std::mutex fetchInteractiveDedupMutex_;
-    uint64_t lastFetchInteractiveHash_ = 0;
-    uint64_t lastFetchInteractiveEviction_ = 0;
-    std::array<uint64_t, 4> lastFetchInteractiveIoVersions_{};
-    int lastFetchInteractiveTargetLevel_ = -1;
-    bool haveLastFetchInteractive_ = false;
 
     mutable std::mutex dataBoundsMutex_;
     DataBoundsL0 dataBoundsL0_;

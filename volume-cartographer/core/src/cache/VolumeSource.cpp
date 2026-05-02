@@ -7,6 +7,7 @@
 #include <cstring>
 #include <fstream>
 #include <stdexcept>
+#include <span>
 #include "utils/Json.hpp"
 #include <utils/http_fetch.hpp>
 #include <utils/zarr.hpp>
@@ -16,6 +17,11 @@ namespace vc::cache {
 // --- Shared metadata helpers ---
 
 using LevelMeta = FileSystemSource::LevelMeta;
+
+static std::array<size_t, 3> chunkIndices(const ChunkKey& key)
+{
+    return {size_t(key.iz), size_t(key.iy), size_t(key.ix)};
+}
 
 static int levelsNumLevels(const std::vector<LevelMeta>& levels) noexcept
 {
@@ -56,7 +62,10 @@ FileSystemSource::FileSystemSource(
     std::vector<LevelMeta> levels)
     : root_(zarrRoot), delimiter_(delimiter), levels_(std::move(levels))
 {
+    openLevelArrays();
 }
+
+FileSystemSource::~FileSystemSource() = default;
 
 void FileSystemSource::discoverLevels()
 {
@@ -108,6 +117,33 @@ void FileSystemSource::discoverLevels()
             continue;
         }
     }
+    openLevelArrays();
+}
+
+void FileSystemSource::openLevelArrays()
+{
+    levelArrays_.clear();
+    levelArrays_.resize(levels_.size());
+    for (size_t i = 0; i < levels_.size(); ++i) {
+        const auto& level = levels_[i];
+        if (level.chunkShape[0] <= 0 || level.chunkShape[1] <= 0 || level.chunkShape[2] <= 0) {
+            continue;
+        }
+        const auto& dir = level.dirName.empty()
+            ? std::to_string(i)
+            : level.dirName;
+        const auto levelPath = root_ / dir;
+        try {
+            levelArrays_[i] = std::make_unique<utils::ZarrArray>(
+                utils::ZarrArray::open(levelPath));
+        } catch (const std::exception& e) {
+            if (auto* log = cacheDebugLog()) {
+                std::fprintf(log,
+                             "[CHUNK_SOURCE] Warning: failed to open local zarr level %s: %s\n",
+                             levelPath.c_str(), e.what());
+            }
+        }
+    }
 }
 
 std::filesystem::path FileSystemSource::chunkPath(const ChunkKey& key) const
@@ -120,6 +156,26 @@ std::filesystem::path FileSystemSource::chunkPath(const ChunkKey& key) const
 
 std::vector<uint8_t> FileSystemSource::fetch(const ChunkKey& key)
 {
+    if (key.level >= 0 && key.level < int(levelArrays_.size())) {
+        if (auto* zarr = levelArrays_[key.level].get()) {
+            const auto idx = chunkIndices(key);
+            std::optional<std::vector<std::byte>> bytes;
+            try {
+                bytes = zarr->is_sharded()
+                    ? zarr->read_inner_chunk_from_shard(std::span<const size_t>(idx.data(), idx.size()))
+                    : zarr->read_chunk_raw(std::span<const size_t>(idx.data(), idx.size()));
+            } catch (...) {
+                bytes.reset();
+            }
+            if (bytes && !bytes->empty()) {
+                std::vector<uint8_t> out(bytes->size());
+                std::memcpy(out.data(), bytes->data(), bytes->size());
+                return out;
+            }
+        }
+    }
+
+    // Fallback for legacy local layouts if a level handle failed to open.
     auto result = readFileToVector(chunkPath(key));
     return result ? std::move(*result) : std::vector<uint8_t>{};
 }

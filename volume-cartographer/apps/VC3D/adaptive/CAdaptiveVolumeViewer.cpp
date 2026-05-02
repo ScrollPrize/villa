@@ -247,20 +247,18 @@ void CAdaptiveVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
         // dispatch time whether the cache we were notified about is still
         // the viewer's current cache, and only then touch it.
         std::weak_ptr<Volume> volumeWeak = _volume;
+        vc::cache::BlockPipeline* notifiedCache = cache;
         _chunkCbId = cache->addChunkReadyListener(
-            [guard, volumeWeak](const vc::cache::ChunkKey&) {
-                // The pipeline's chunkArrivedFlag_ is edge-triggered via
-                // atomic exchange — this callback only fires when the flag
-                // flips false→true. Deferring the clear to submitRender (on
-                // the 16ms render timer) ensures every subsequent arrival in
-                // the same tick window finds the flag already set and takes
-                // the exchange=true/return-early branch — no listener fire,
-                // no cross-thread event post. One wake per 16ms tick max,
-                // instead of one per chunk burst.
-                QMetaObject::invokeMethod(qApp, [guard, volumeWeak]() {
+            [guard, volumeWeak, notifiedCache](const vc::cache::ChunkKey&) {
+                // Per-arrival notification is intentional. scheduleRender()
+                // coalesces on the viewer's timer, while keeping the shared
+                // pipeline from suppressing repaint requests after a queued
+                // render was skipped, failed, or raced a cache swap.
+                QMetaObject::invokeMethod(qApp, [guard, volumeWeak, notifiedCache]() {
                     if (!guard) return;
                     auto vol = volumeWeak.lock();
                     if (!vol || guard->_volume != vol) return;
+                    if (vol->tieredCache() != notifiedCache) return;
                     guard->scheduleRender();
                 }, Qt::QueuedConnection);
             });
@@ -684,10 +682,8 @@ float CAdaptiveVolumeViewer::measuredFps() const
 
 void CAdaptiveVolumeViewer::submitRender()
 {
-    // Re-arm the chunk-arrival edge detector for the next tick window.
-    // Any chunk that decodes during this render will set the flag again and
-    // fire exactly one post-event to trigger the next render. See the
-    // addChunkReadyListener callback above for why the clear lives here.
+    // Compatibility no-op for older BlockPipeline implementations; current
+    // chunk-ready coalescing is done by scheduleRender()'s timer.
     if (_volume) {
         if (auto* c = _volume->tieredCache()) c->clearChunkArrivedFlag();
     }
@@ -2780,12 +2776,14 @@ void CAdaptiveVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
         auto* cache = _overlayVolume->tieredCache();
         QPointer<CAdaptiveVolumeViewer> guard(this);
         std::weak_ptr<Volume> volumeWeak = _overlayVolume;
+        vc::cache::BlockPipeline* notifiedCache = cache;
         _overlayChunkCbId = cache->addChunkReadyListener(
-            [guard, volumeWeak](const vc::cache::ChunkKey&) {
-                QMetaObject::invokeMethod(qApp, [guard, volumeWeak]() {
+            [guard, volumeWeak, notifiedCache](const vc::cache::ChunkKey&) {
+                QMetaObject::invokeMethod(qApp, [guard, volumeWeak, notifiedCache]() {
                     if (!guard) return;
                     auto vol = volumeWeak.lock();
                     if (!vol || guard->_overlayVolume != vol) return;
+                    if (vol->tieredCache() != notifiedCache) return;
                     guard->scheduleRender();
                 }, Qt::QueuedConnection);
             });

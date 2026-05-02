@@ -188,16 +188,20 @@ void TickCoordinator::runLoop(std::stop_token stop) noexcept
             ++chunksThisTick;
             if (!ce.pipeline || ce.key.level < 0 || ce.key.level >= 32) continue;
             if (!(activeLevelMask & (1u << ce.key.level))) continue;
-            // Resolve 512 blocks in the newly-landed canonical chunk.
-            // Canonical chunks are 128^3 = 8 blocks per axis. blockAt
-            // returns nullptr for blocks that weren't stored (e.g. the
-            // zero-chunk shortcut); skip those.
-            const int baseBz = ce.key.iz * 8;
-            const int baseBy = ce.key.iy * 8;
-            const int baseBx = ce.key.ix * 8;
-            for (int dz = 0; dz < 8; ++dz) {
-                for (int dy = 0; dy < 8; ++dy) {
-                    for (int dx = 0; dx < 8; ++dx) {
+            // Resolve blocks in the newly-landed chunk. Local volumes may
+            // use 128^3, 256^3, or non-cubic chunk shapes; derive the block
+            // grid from metadata instead of assuming a canonical size.
+            const auto chunkShape = ce.pipeline->chunkShape(ce.key.level);
+            const int blocksZ = chunkShape[0] / kBlockSize;
+            const int blocksY = chunkShape[1] / kBlockSize;
+            const int blocksX = chunkShape[2] / kBlockSize;
+            if (blocksZ <= 0 || blocksY <= 0 || blocksX <= 0) continue;
+            const int baseBz = ce.key.iz * blocksZ;
+            const int baseBy = ce.key.iy * blocksY;
+            const int baseBx = ce.key.ix * blocksX;
+            for (int dz = 0; dz < blocksZ; ++dz) {
+                for (int dy = 0; dy < blocksY; ++dy) {
+                    for (int dx = 0; dx < blocksX; ++dx) {
                         const int bz = baseBz + dz;
                         const int by = baseBy + dy;
                         const int bx = baseBx + dx;

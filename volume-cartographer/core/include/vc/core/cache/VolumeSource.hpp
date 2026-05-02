@@ -15,6 +15,7 @@
 #include "HttpMetadataFetcher.hpp"  // HttpAuth (= utils::AwsAuth)
 
 namespace utils { class HttpClient; }
+namespace utils { class ZarrArray; }
 namespace utils::detail { struct ShardIndex; }
 
 namespace vc::cache {
@@ -47,6 +48,8 @@ public:
         const std::string& delimiter,
         std::vector<LevelMeta> levels);
 
+    ~FileSystemSource() override;
+
     [[nodiscard]] std::vector<uint8_t> fetch(const ChunkKey& key) override;
     [[nodiscard]] int numLevels() const noexcept override;
     [[nodiscard]] std::array<int, 3> chunkShape(int level) const noexcept override;
@@ -55,10 +58,12 @@ public:
 private:
     std::filesystem::path chunkPath(const ChunkKey& key) const;
     void discoverLevels();
+    void openLevelArrays();
 
     std::filesystem::path root_;
     std::string delimiter_;
     std::vector<LevelMeta> levels_;
+    std::vector<std::unique_ptr<utils::ZarrArray>> levelArrays_;
 };
 
 struct ShardConfig;
