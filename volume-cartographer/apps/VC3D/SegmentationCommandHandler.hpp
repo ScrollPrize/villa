@@ -113,7 +113,6 @@ signals:
 public slots:
     void onRenderSegment(const std::string& segmentId);
     void onGrowSegmentFromSegment(const std::string& segmentId);
-    void onAddOverlap(const std::string& segmentId);
     void onConvertToObj(const std::string& segmentId);
     void onCropSurfaceToValidRegion(const std::string& segmentId);
     void onFlipSurface(const std::string& segmentId, bool flipU);
@@ -121,11 +120,9 @@ public slots:
     void onAlphaCompRefine(const std::string& segmentId);
     void onSlimFlatten(const std::string& segmentId);
     void onABFFlatten(const std::string& segmentId);
-    void onAWSUpload(const std::string& segmentId);
     void onExportWidthChunks(const std::string& segmentId);
     void onRasterizeSegments(const QStringList& segmentIds);
     void onAddIgnoreLabel();
-    void onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed = false);
     void onNeighborCopyRequested(const QString& segmentId, bool copyOut);
     void onResumeLocalGrowPatchRequested(const QString& segmentId);
     void onReloadFromBackup(const QString& segmentId, int backupIndex);

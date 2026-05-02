@@ -32,8 +32,6 @@ public:
     enum class Tool {
         RenderTifXYZ,
         GrowSegFromSegment,
-        GrowSegFromSeeds,
-        SegAddOverlap,
         tifxyz2obj,
         obj2tifxyz,
         AlphaCompRefine,
@@ -54,9 +52,7 @@ public:
     void setRenderAdvanced(int cropX, int cropY, int cropWidth, int cropHeight,
                            const QString& affinePath, bool invertAffine,
                            float scaleSegmentation, double rotateDegrees, int flipAxis);
-    void setGrowParams(QString volumePath, QString tgtDir, QString jsonParams, int seed_x = 0, int seed_y = 0, int seed_z = 0, bool useExpandMode = false, bool useRandomSeed = false);
     void setTraceParams(QString volumePath, QString srcDir, QString tgtDir, QString jsonParams, QString srcSegment);
-    void setAddOverlapParams(QString tgtDir, QString tifxyzPath);
     void setToObjParams(QString tifxyzPath, QString objPath);
     void setToObjOptions(bool normalizeUV, bool alignGrid);
     void setObj2TifxyzParams(const QString& objPath, const QString& outputDir,
@@ -125,11 +121,6 @@ private:
     float _scale;
     int _resolution;
     int _layers;
-    int _seed_x;
-    int _seed_y;
-    int _seed_z;
-    bool _useExpandMode;
-    bool _useRandomSeed;
     int _parallelProcesses;  // processes for xargs
     int _iterationCount;     // iterations for xargs
 

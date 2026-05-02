@@ -895,28 +895,9 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
 
     contextMenu.addSeparator();
 
-    QMenu* seedMenu = contextMenu.addMenu(tr("Run Seed"));
-    QAction* seedWithSeedAction = seedMenu->addAction(tr("Seed from Focus Point"));
-    connect(seedWithSeedAction, &QAction::triggered, this, [this, segmentId]() {
-        emit growSeedsRequested(segmentId, false, false);
-    });
-    QAction* seedWithRandomAction = seedMenu->addAction(tr("Random Seed"));
-    connect(seedWithRandomAction, &QAction::triggered, this, [this, segmentId]() {
-        emit growSeedsRequested(segmentId, false, true);
-    });
-    QAction* seedWithExpandAction = seedMenu->addAction(tr("Expand Seed"));
-    connect(seedWithExpandAction, &QAction::triggered, this, [this, segmentId]() {
-        emit growSeedsRequested(segmentId, true, false);
-    });
-
     QAction* growSegmentAction = contextMenu.addAction(tr("Run Trace"));
     connect(growSegmentAction, &QAction::triggered, this, [this, segmentId]() {
         emit growSegmentRequested(segmentId);
-    });
-
-    QAction* addOverlapAction = contextMenu.addAction(tr("Add overlap"));
-    connect(addOverlapAction, &QAction::triggered, this, [this, segmentId]() {
-        emit addOverlapRequested(segmentId);
     });
 
     if (_volumePkg) {
@@ -1040,11 +1021,6 @@ void SurfacePanelController::showContextMenu(const QPoint& pos)
     QAction* abfFlattenAction = contextMenu.addAction(tr("ABF++ flatten"));
     connect(abfFlattenAction, &QAction::triggered, this, [this, segmentId]() {
         emit abfFlattenRequested(segmentId);
-    });
-
-    QAction* awsUploadAction = contextMenu.addAction(tr("Upload artifacts to AWS"));
-    connect(awsUploadAction, &QAction::triggered, this, [this, segmentId]() {
-        emit awsUploadRequested(segmentId);
     });
 
     contextMenu.addSeparator();
