@@ -223,6 +223,13 @@ float scaleForSurfaceRenderStartLevel(int renderLevel, int numLevels)
     return std::clamp(0.75f / (dsScale * kResolutionLodZoomBias), kMinScale, kMaxScale);
 }
 
+float scaleForCoarsestPlaneRenderLevel(int numLevels)
+{
+    const int coarsestLevel = std::max(0, numLevels - 1);
+    const float dsScale = static_cast<float>(std::uint64_t{1} << coarsestLevel);
+    return std::clamp(0.75f / (dsScale * kResolutionLodZoomBias), kMinScale, kMaxScale);
+}
+
 std::unique_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::shared_ptr<Volume>& volume,
                                                                 std::size_t decodedByteCapacity)
 {
@@ -437,6 +444,11 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
     _volume = std::move(vol);
     rebuildChunkArray();
     ensureDefaultSurface();
+    if (_volume && isAxisAlignedView()) {
+        const int n = _chunkArray ? _chunkArray->numLevels()
+                                  : static_cast<int>(_volume->numScales());
+        _scale = scaleForCoarsestPlaneRenderLevel(n);
+    }
     recalcPyramidLevel();
     if (_volume) {
         const double vs = _volume->voxelSize() / static_cast<double>(_dsScale);
