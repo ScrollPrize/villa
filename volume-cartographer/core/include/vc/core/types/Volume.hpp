@@ -39,8 +39,7 @@ public:
 
     // Create a Volume backed by a remote zarr store over HTTP.
     // If auth is provided, it is used as-is; otherwise credentials are read
-    // from environment variables. cacheRoot is only used for sidecar files
-    // such as downloaded transform.json.
+    // from environment variables. cacheRoot is currently ignored.
     static std::shared_ptr<Volume> NewFromUrl(
         const std::string& url,
         const std::filesystem::path& cacheRoot = {},

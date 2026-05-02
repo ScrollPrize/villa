@@ -3,8 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
-#include <fstream>
 #include <iomanip>
 #include <limits>
 #include <mutex>
@@ -290,7 +288,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     const std::filesystem::path& cacheRoot,
     const vc::HttpAuth& authIn)
 {
-    namespace fs = std::filesystem;
+    (void)cacheRoot;
 
     // Resolve s3:// URLs to https:// and detect AWS credentials
     auto resolved = vc::resolveRemoteUrl(url);
@@ -336,12 +334,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
         8ULL << 30,
         16);
 
-    fs::path sidecarPath;
-    if (!cacheRoot.empty()) {
-        sidecarPath = fs::path(cacheRoot) / deriveRemoteVolumeId(remoteUrl);
-    }
-
-    auto vol = std::make_shared<Volume>(std::move(sidecarPath), RemoteConstructTag{});
+    auto vol = std::make_shared<Volume>(std::filesystem::path{}, RemoteConstructTag{});
 
     vol->isRemote_ = true;
     vol->remoteUrl_ = remoteUrl;
