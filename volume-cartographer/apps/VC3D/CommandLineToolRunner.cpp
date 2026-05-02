@@ -107,6 +107,22 @@ void CommandLineToolRunner::setVolumePath(const QString& path)
     _explicitVolumePath = !_volumePath.isEmpty();
 }
 
+void CommandLineToolRunner::setRemoteVolumeUrl(const QString& url)
+{
+    _remoteVolumeUrl = url.trimmed();
+}
+
+void CommandLineToolRunner::setRemoteVolumeAuth(const QString& accessKey,
+                                                const QString& secretKey,
+                                                const QString& sessionToken,
+                                                const QString& region)
+{
+    _remoteAccessKey = accessKey;
+    _remoteSecretKey = secretKey;
+    _remoteSessionToken = sessionToken;
+    _remoteRegion = region;
+}
+
 void CommandLineToolRunner::setSegmentPath(const QString& path)
 {
     _segmentPath = path;
@@ -323,6 +339,27 @@ bool CommandLineToolRunner::execute(Tool tool)
                 _logStream->flush();
             }
         }
+        if (!_remoteVolumeUrl.isEmpty() && !_remoteAccessKey.isEmpty() && !_remoteSecretKey.isEmpty()) {
+            env.insert("AWS_ACCESS_KEY_ID", _remoteAccessKey);
+            env.insert("AWS_SECRET_ACCESS_KEY", _remoteSecretKey);
+            if (!_remoteSessionToken.isEmpty()) {
+                env.insert("AWS_SESSION_TOKEN", _remoteSessionToken);
+            }
+            if (!_remoteRegion.isEmpty()) {
+                env.insert("AWS_DEFAULT_REGION", _remoteRegion);
+            }
+            if (_logStream) {
+                *_logStream << "ENV: AWS_ACCESS_KEY_ID=<set>" << Qt::endl;
+                *_logStream << "ENV: AWS_SECRET_ACCESS_KEY=<set>" << Qt::endl;
+                if (!_remoteSessionToken.isEmpty()) {
+                    *_logStream << "ENV: AWS_SESSION_TOKEN=<set>" << Qt::endl;
+                }
+                if (!_remoteRegion.isEmpty()) {
+                    *_logStream << "ENV: AWS_DEFAULT_REGION=" << _remoteRegion << Qt::endl;
+                }
+                _logStream->flush();
+            }
+        }
         _process->setProcessEnvironment(env);
     }
 
@@ -536,6 +573,9 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                  << "--scale" << QString::number(_scale)
                  << "--group-idx" << QString::number(_resolution)
                  << "--num-slices" << QString::number(_layers);
+            if (!_remoteVolumeUrl.isEmpty()) {
+                args << "--remote-url" << _remoteVolumeUrl;
+            }
             // Advanced / optional args
             if (_cropWidth > 0 && _cropHeight > 0) {
                 args << "--crop-x" << QString::number(_cropX)

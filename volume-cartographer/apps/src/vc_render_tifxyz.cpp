@@ -1297,8 +1297,9 @@ int main(int argc, char *argv[])
 
     if (useRemoteCache) {
         try {
+            vc::HttpAuth remoteAuth = vc::HttpAuth::from_env();
             ownedChunkCache = vc::render::createChunkCache(
-                vc::render::openHttpZarrPyramid(remoteUrl),
+                vc::render::openHttpZarrPyramid(remoteUrl, remoteAuth),
                 cache_bytes);
             chunk_cache = ownedChunkCache.get();
             if (cacheLevel < 0 || cacheLevel >= chunk_cache->numLevels()) {

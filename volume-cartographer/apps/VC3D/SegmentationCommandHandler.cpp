@@ -1273,6 +1273,28 @@ QString SegmentationCommandHandler::getCurrentVolumePath() const
     return QString::fromStdString(_state->currentVolume()->path().string());
 }
 
+QString SegmentationCommandHandler::getCurrentRenderVolumePath(QString* remoteUrlOut) const
+{
+    if (remoteUrlOut) {
+        remoteUrlOut->clear();
+    }
+
+    auto volume = _state ? _state->currentVolume() : nullptr;
+    if (!volume) {
+        return QString();
+    }
+
+    if (volume->isRemote()) {
+        const QString remoteUrl = QString::fromStdString(volume->remoteUrl());
+        if (remoteUrlOut) {
+            *remoteUrlOut = remoteUrl;
+        }
+        return remoteUrl;
+    }
+
+    return QString::fromStdString(volume->path().string());
+}
+
 QuadSurface* SegmentationCommandHandler::requireSurfaceAndRunner(
     const std::string& segmentId,
     bool checkRunner)
@@ -1354,7 +1376,9 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
-    const QString volumePath = getCurrentVolumePath();
+    auto renderVolume = _state ? _state->currentVolume() : nullptr;
+    QString remoteVolumeUrl;
+    const QString volumePath = getCurrentRenderVolumePath(&remoteVolumeUrl);
     const QString segmentPath = QString::fromStdString(surf->path.string());
     const QString segmentOutDir = QString::fromStdString(surf->path.string());
     const QString outputFormat = "%s/layers";
@@ -1384,6 +1408,17 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
     _cmdRunner->setRenderParams(static_cast<float>(dlg.scale()), dlg.groupIdx(), dlg.numSlices());
     _cmdRunner->setOmpThreads(dlg.ompThreads());
     _cmdRunner->setVolumePath(dlg.volumePath());
+    const bool useRemoteVolume = dlg.volumePath() == volumePath && !remoteVolumeUrl.isEmpty();
+    _cmdRunner->setRemoteVolumeUrl(useRemoteVolume ? remoteVolumeUrl : QString());
+    if (useRemoteVolume && renderVolume && renderVolume->isRemote()) {
+        const auto& auth = renderVolume->remoteAuth();
+        _cmdRunner->setRemoteVolumeAuth(QString::fromStdString(auth.access_key),
+                                        QString::fromStdString(auth.secret_key),
+                                        QString::fromStdString(auth.session_token),
+                                        QString::fromStdString(auth.region));
+    } else {
+        _cmdRunner->setRemoteVolumeAuth(QString(), QString(), QString(), QString());
+    }
     _cmdRunner->setRenderAdvanced(
         dlg.cropX(), dlg.cropY(), dlg.cropWidth(), dlg.cropHeight(),
         dlg.affinePath(), dlg.invertAffine(),

@@ -148,6 +148,7 @@ public:
 private:
     /** Helper: get current volume path from state */
     QString getCurrentVolumePath() const;
+    QString getCurrentRenderVolumePath(QString* remoteUrlOut = nullptr) const;
 
     /**
      * Validate that a volume package is loaded and the surface exists.

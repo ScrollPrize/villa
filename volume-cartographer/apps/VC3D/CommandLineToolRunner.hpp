@@ -40,6 +40,11 @@ public:
     };
 
     void setVolumePath(const QString& path);
+    void setRemoteVolumeUrl(const QString& url);
+    void setRemoteVolumeAuth(const QString& accessKey,
+                             const QString& secretKey,
+                             const QString& sessionToken,
+                             const QString& region);
     void setSegmentPath(const QString& path);
     void setOutputPattern(const QString& pattern);
 
@@ -105,6 +110,11 @@ private:
     bool _autoShowConsole;
     
     QString _volumePath;
+    QString _remoteVolumeUrl;
+    QString _remoteAccessKey;
+    QString _remoteSecretKey;
+    QString _remoteSessionToken;
+    QString _remoteRegion;
     QString _segmentPath;
     QString _outputPattern;
     QString _tgtDir;
