@@ -62,7 +62,6 @@ public:
 
     std::string surfName() const override { return _surfName; }
     std::shared_ptr<Volume> currentVolume() const override { return _volume; }
-    vc::cache::BlockPipeline* chunkCachePtr() const override { return nullptr; }
     float getCurrentScale() const override { return _scale; }
     float dsScale() const override { return _dsScale; }
     float normalOffset() const override { return _zOff; }

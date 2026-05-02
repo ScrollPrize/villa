@@ -27,7 +27,6 @@ class Surface;
 class QuadSurface;
 class Volume;
 class VCCollection;
-namespace vc::cache { class BlockPipeline; }
 
 // Abstract interface for volume viewers.
 // Overlay controllers work through this interface instead of depending on a concrete viewer.
@@ -80,7 +79,6 @@ public:
     virtual std::string surfName() const = 0;
     virtual std::shared_ptr<Volume> currentVolume() const = 0;
     virtual VCCollection* pointCollection() const = 0;
-    virtual vc::cache::BlockPipeline* chunkCachePtr() const = 0;
 
     // --- Display settings ---
     virtual float getCurrentScale() const = 0;

@@ -2697,46 +2697,6 @@ void dispatchCompositeAdaptive(
 
 } // namespace
 
-void sampleAdaptiveARGB32(
-    uint32_t* outBuf, int outStride,
-    vc::cache::BlockPipeline* cache,
-    int desiredLevel, int numLevels,
-    const cv::Mat_<cv::Vec3f>* coords,
-    const cv::Vec3f* origin, const cv::Vec3f* vx_step, const cv::Vec3f* vy_step,
-    const cv::Mat_<cv::Vec3f>* normals,
-    const cv::Vec3f* planeNormal,
-    int numLayers, int zStart, float zStep,
-    int width, int height,
-    const std::string& compositeMethod,
-    const uint32_t lut[256],
-    vc::Sampling method,
-    const CompositeParams* lightParams,
-    uint8_t* levelOut,
-    int levelStride,
-    bool skipPrefetch,
-    bool promoteFallbackChunks)
-{
-    if (numLayers <= 0) numLayers = 1;
-    // Composite rendering forces Nearest: averaging N layers already
-    // low-passes aliasing so per-voxel trilinear precision is wasted.
-    // Pin the template instantiation to SampleMode::Nearest so the entire
-    // inner loop compiles without any interp branch.
-    const bool composite = numLayers > 1;
-    if (composite || method == vc::Sampling::Nearest) {
-        dispatchCompositeAdaptive<SampleMode::Nearest>(
-            outBuf, outStride, *cache, desiredLevel, numLevels,
-            coords, origin, vx_step, vy_step, normals, planeNormal,
-            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams,
-            levelOut, levelStride, skipPrefetch, promoteFallbackChunks);
-    } else {
-        dispatchCompositeAdaptive<SampleMode::Trilinear>(
-            outBuf, outStride, *cache, desiredLevel, numLevels,
-            coords, origin, vx_step, vy_step, normals, planeNormal,
-            numLayers, zStart, zStep, width, height, compositeMethod, lut, lightParams,
-            levelOut, levelStride, skipPrefetch, promoteFallbackChunks);
-    }
-}
-
 // ----------------------------------------------------------------------------
 // Composite rendering
 // ----------------------------------------------------------------------------
@@ -2857,86 +2817,6 @@ void readCompositeFast(
         default:
             readCompositeFastImpl<uint8_t, SampleMode::Nearest>(out, *cache, level,
                 baseCoords, normals, zStep, zStart, zEnd, params); break;
-    }
-}
-
-void samplePlaneCompositeARGB32(
-    uint32_t* outBuf, int outStride,
-    BlockPipeline* cache, int level,
-    const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
-    const cv::Vec3f& normal, float zStep, int zStart, int numLayers,
-    int w, int h,
-    const std::string& compositeMethod,
-    const uint32_t lut[256])
-{
-    AccumMode mode = AccumMode::Mean;
-    if (needsLayerStorage(compositeMethod)) mode = AccumMode::LayerStorage;
-    else if (compositeMethod == "max") mode = AccumMode::Max;
-    else if (compositeMethod == "min") mode = AccumMode::Min;
-
-    // Prefetch outer bbox including all layers.
-    cv::Vec3f layerOffsetMin = normal * (float(zStart) * zStep);
-    cv::Vec3f layerOffsetMax = normal * (float(zStart + numLayers - 1) * zStep);
-    cv::Vec3f p0 = origin + layerOffsetMin;
-    cv::Vec3f p1 = origin + vx_step * float(w - 1) + vy_step * float(h - 1) + layerOffsetMax;
-    float minVx = std::min(p0[0], p1[0]), maxVx = std::max(p0[0], p1[0]);
-    float minVy = std::min(p0[1], p1[1]), maxVy = std::max(p0[1], p1[1]);
-    float minVz = std::min(p0[2], p1[2]), maxVz = std::max(p0[2], p1[2]);
-    prefetchRegion(*cache, level, minVx, minVy, minVz, maxVx, maxVy, maxVz);
-
-    #pragma omp parallel
-    {
-        BlockSampler<uint8_t> s(*cache, level);
-        std::vector<float> layerVals(numLayers);
-        #pragma omp for schedule(dynamic, 16)
-        for (int y = 0; y < h; y++) {
-            uint32_t* outRow = outBuf + size_t(y) * size_t(outStride);
-            for (int x = 0; x < w; x++) {
-                cv::Vec3f base = origin + vx_step * float(x) + vy_step * float(y);
-
-                float accum = 0.f, mx = 0.f, mn = 255.f;
-                int count = 0;
-                for (int li = 0; li < numLayers; li++) {
-                    float z = float(zStart + li) * zStep;
-                    float vx = base[0] + normal[0] * z;
-                    float vy = base[1] + normal[1] * z;
-                    float vz = base[2] + normal[2] * z;
-                    float v = float(sampleOne<uint8_t, SampleMode::Nearest>(s, vz, vy, vx));
-                    switch (mode) {
-                        case AccumMode::Max: mx = std::max(mx, v); break;
-                        case AccumMode::Min: mn = std::min(mn, v); break;
-                        case AccumMode::Mean: accum += v; count++; break;
-                        case AccumMode::LayerStorage: layerVals[li] = v; break;
-                    }
-                }
-
-                float val = 0.f;
-                switch (mode) {
-                    case AccumMode::Max:  val = mx; break;
-                    case AccumMode::Min:  val = mn; break;
-                    case AccumMode::Mean: val = count > 0 ? accum / float(count) : 0.f; break;
-                    case AccumMode::LayerStorage: {
-                        if (compositeMethod == "median") {
-                            std::nth_element(layerVals.begin(),
-                                             layerVals.begin() + numLayers / 2,
-                                             layerVals.end());
-                            val = layerVals[numLayers / 2];
-                        } else if (compositeMethod == "minabs") {
-                            float best = layerVals[0];
-                            for (int i = 1; i < numLayers; i++)
-                                if (std::abs(layerVals[i] - 127.5f) < std::abs(best - 127.5f))
-                                    best = layerVals[i];
-                            val = best;
-                        } else {
-                            val = count > 0 ? accum / float(count) : 0.f;
-                        }
-                        break;
-                    }
-                }
-                if (val < 0.f) val = 0.f; if (val > 255.f) val = 255.f;
-                outRow[x] = lut[uint8_t(val)];
-            }
-        }
     }
 }
 

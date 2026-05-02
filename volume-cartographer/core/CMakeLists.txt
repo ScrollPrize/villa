@@ -36,7 +36,6 @@ add_library(vc_core
         src/Geometry.cpp
         src/Thinning.cpp
         src/Umbilicus.cpp
-        src/render/AdaptiveCamera.cpp
         src/render/ChunkCache.cpp
         src/render/ChunkedPlaneSampler.cpp
         src/render/Colormaps.cpp

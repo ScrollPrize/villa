@@ -651,82 +651,6 @@ void Volume::sample(cv::Mat_<uint16_t>& out,
     readInterpolated3D(out, tieredCache(), params.level, scaled, params.method);
 }
 
-int Volume::sampleBestEffort(cv::Mat_<uint8_t>& out,
-                              const cv::Mat_<cv::Vec3f>& coords,
-                              const vc::SampleParams& params)
-{
-    const int nScales = static_cast<int>(numScales());
-    const int level = std::clamp(params.level, 0, std::max(0, nScales - 1));
-    const auto& scaled = scaleCoords(coords, level);
-    readInterpolated3D(out, tieredCache(), level, scaled, params.method);
-    if (!out.empty())
-        applyOptionalPostProcess(out, params);
-    return level;
-}
-
-void Volume::sampleComposite(cv::Mat_<uint8_t>& out,
-                              const cv::Mat_<cv::Vec3f>& coords,
-                              const cv::Mat_<cv::Vec3f>& normals,
-                              const vc::SampleParams& params)
-{
-    float scale = (params.level > 0) ? (1.0f / static_cast<float>(1 << params.level)) : 1.0f;
-    const auto& scaled = scaleCoords(coords, params.level);
-    readCompositeFast(out, tieredCache(), params.level, scaled, normals, scale,
-                      params.zStart, params.zEnd,
-                      params.composite.value_or(CompositeParams{}),
-                      params.method);
-    applyOptionalPostProcess(out, params);
-}
-
-int Volume::sampleCompositeBestEffort(cv::Mat_<uint8_t>& out,
-                                       const cv::Mat_<cv::Vec3f>& coords,
-                                       const cv::Mat_<cv::Vec3f>& normals,
-                                       const vc::SampleParams& params)
-{
-    const int nScales = static_cast<int>(numScales());
-    const int level = std::clamp(params.level, 0, std::max(0, nScales - 1));
-    vc::SampleParams lvlParams = params;
-    lvlParams.level = level;
-    sampleComposite(out, coords, normals, lvlParams);
-    return level;
-}
-
-
-int Volume::samplePlaneBestEffort(cv::Mat_<uint8_t>& out,
-                                   const cv::Vec3f& origin,
-                                   const cv::Vec3f& vx_step,
-                                   const cv::Vec3f& vy_step,
-                                   int width, int height,
-                                   const vc::SampleParams& params)
-{
-    const int nScales = static_cast<int>(numScales());
-    const int level = params.level;
-
-    int lvl = std::clamp(level, 0, std::max(0, nScales - 1));
-    float scale = (lvl > 0) ? (1.0f / static_cast<float>(1 << lvl)) : 1.0f;
-    samplePlane(out, tieredCache(), lvl,
-                origin * scale, vx_step * scale, vy_step * scale,
-                width, height, params.method);
-    if (!out.empty())
-        applyOptionalPostProcess(out, params);
-    return lvl;
-}
-
-int Volume::samplePlaneCompositeBestEffortARGB32(
-    uint32_t* outBuf, int outStride,
-    const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
-    const cv::Vec3f& normal, float zStep, int zStart, int numLayers,
-    int width, int height,
-    const std::string& compositeMethod,
-    const uint32_t lut[256])
-{
-    samplePlaneCompositeARGB32(outBuf, outStride, tieredCache(), 0,
-        origin, vx_step, vy_step,
-        normal, zStep, zStart, numLayers,
-        width, height, compositeMethod, lut);
-    return 0;
-}
-
 // ============================================================================
 // Composite-aware chunk helpers
 // ============================================================================
@@ -769,4 +693,3 @@ const Volume::DataBounds& Volume::dataBounds() const
     });
     return dataBounds_;
 }
-

@@ -120,37 +120,6 @@ public:
                 const cv::Mat_<cv::Vec3f>& coords,
                 const vc::SampleParams& params);
 
-    // Single-slice non-blocking (returns actual level used)
-    int sampleBestEffort(cv::Mat_<uint8_t>& out,
-                         const cv::Mat_<cv::Vec3f>& coords,
-                         const vc::SampleParams& params);
-
-    // Composite non-blocking (returns actual level used)
-    int sampleCompositeBestEffort(cv::Mat_<uint8_t>& out,
-                                  const cv::Mat_<cv::Vec3f>& coords,
-                                  const cv::Mat_<cv::Vec3f>& normals,
-                                  const vc::SampleParams& params);
-
-    // Fused plane sampling: generates coordinates inline during sampling,
-    // eliminating the intermediate coords Mat. origin/vx_step/vy_step are
-    // in world (level-0) coordinates. Returns actual pyramid level used.
-    int samplePlaneBestEffort(cv::Mat_<uint8_t>& out,
-                              const cv::Vec3f& origin,
-                              const cv::Vec3f& vx_step,
-                              const cv::Vec3f& vy_step,
-                              int width, int height,
-                              const vc::SampleParams& params);
-
-    // Fused plane composite: nearest-neighbor per layer + composite + LUT → ARGB32.
-    // No coord matrix. For PlaneSurface composite rendering.
-    int samplePlaneCompositeBestEffortARGB32(
-        uint32_t* outBuf, int outStride,
-        const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
-        const cv::Vec3f& normal, float zStep, int zStart, int numLayers,
-        int width, int height,
-        const std::string& compositeMethod,
-        const uint32_t lut[256]);
-
     // --- Data bounds ---
     [[nodiscard]] const DataBounds& dataBounds() const;
     void computeDataBounds();
@@ -182,11 +151,6 @@ protected:
     // Data bounds (lazy-computed from volume shape)
     mutable DataBounds dataBounds_;
     mutable std::once_flag boundsOnce_;
-
-    void sampleComposite(cv::Mat_<uint8_t>& out,
-                         const cv::Mat_<cv::Vec3f>& coords,
-                         const cv::Mat_<cv::Vec3f>& normals,
-                         const vc::SampleParams& params);
 
     void loadMetadata();
 
