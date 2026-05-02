@@ -3,9 +3,12 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <mutex>
+#include <sstream>
 
 #ifdef __aarch64__
 #include <arm_neon.h>
@@ -15,11 +18,11 @@
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
-#include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include "vc/core/util/NetworkFilesystem.hpp"
 #include "vc/core/util/PostProcess.hpp"
 #include "vc/core/types/VcDataset.hpp"
+#include "utils/hash.hpp"
 
 static const std::filesystem::path METADATA_FILE = "meta.json";
 static const std::filesystem::path METADATA_FILE_ALT = "metadata.json";
@@ -42,6 +45,34 @@ bool isRemoteAuthError(const std::exception& e)
            msg.find("HTTP 403") != std::string::npos;
 }
 
+std::string normalizeRemoteVolumeUrl(std::string url)
+{
+    while (!url.empty() && url.back() == '/')
+        url.pop_back();
+    return url;
+}
+
+std::string deriveRemoteVolumeName(const std::string& url)
+{
+    const auto normalized = normalizeRemoteVolumeUrl(url);
+    const auto pos = normalized.rfind('/');
+    if (pos != std::string::npos && pos + 1 < normalized.size())
+        return normalized.substr(pos + 1);
+    return normalized.empty() ? std::string("remote") : normalized;
+}
+
+std::string deriveRemoteVolumeId(const std::string& url)
+{
+    const auto normalized = normalizeRemoteVolumeUrl(url);
+    const auto name = deriveRemoteVolumeName(normalized);
+    const auto hash = utils::fnv1a(std::string_view(normalized));
+
+    std::ostringstream out;
+    out << name << "-" << std::hex << std::nouppercase << std::setw(16)
+        << std::setfill('0') << hash;
+    return out.str();
+}
+
 } // namespace
 
 Volume::Volume(std::filesystem::path path) : path_(std::move(path))
@@ -55,6 +86,8 @@ Volume::Volume(std::filesystem::path path) : path_(std::move(path))
     zarrOpen();
     mountInfo_ = vc::detectNetworkMount(path_);
 }
+
+Volume::Volume(std::filesystem::path path, RemoteConstructTag) : path_(std::move(path)) {}
 
 Volume::~Volume() noexcept = default;
 
@@ -275,43 +308,61 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
         auth.region = resolved.awsRegion;
     }
 
-    // Determine cache root
-    fs::path root = cacheRoot;
-    if (root.empty()) {
-        root = fs::path(std::getenv("HOME") ? std::getenv("HOME") : "/tmp") / ".VC3D" / "remote_cache";
-    }
+    const std::string remoteUrl = normalizeRemoteVolumeUrl(resolved.httpsUrl);
 
-    // Fetch remote metadata (downloads .zarray files, synthesizes meta.json).
+    vc::render::OpenedChunkedZarr opened;
+    std::unique_ptr<vc::render::ChunkCache> cache;
+    // Open the zarr metadata in memory. This performs the normal zarr metadata
+    // reads, but does not stage .zarray/meta.json files on disk.
     // If stale AWS credentials are present, public buckets may reject the
     // signed request even though the same object is readable anonymously.
-    vc::cache::RemoteZarrInfo info;
     try {
-        info = vc::cache::fetchRemoteZarrMetadata(resolved.httpsUrl, root, auth);
+        opened = vc::render::openHttpZarrPyramid(remoteUrl, auth);
     } catch (const std::exception& e) {
         if (!resolved.useAwsSigv4 || auth.empty() || !isRemoteAuthError(e)) {
             throw;
         }
 
         vc::HttpAuth anonymousAuth;
-        info = vc::cache::fetchRemoteZarrMetadata(resolved.httpsUrl, root, anonymousAuth);
+        opened = vc::render::openHttpZarrPyramid(remoteUrl, anonymousAuth);
         auth = std::move(anonymousAuth);
     }
 
-    // Temporarily skip shape validation (staging dir has no chunk data)
-    struct SkipShapeGuard {
-        bool prev;
-        SkipShapeGuard() : prev(skipShapeCheck) { skipShapeCheck = true; }
-        ~SkipShapeGuard() { skipShapeCheck = prev; }
-    };
-    SkipShapeGuard guard;
+    if (opened.shapes.empty())
+        throw std::runtime_error("No zarr levels found at " + remoteUrl);
 
-    auto vol = std::make_shared<Volume>(info.stagingDir);
+    cache = vc::render::createChunkCache(
+        std::move(opened),
+        8ULL << 30,
+        16);
+
+    fs::path sidecarPath;
+    if (!cacheRoot.empty()) {
+        sidecarPath = fs::path(cacheRoot) / deriveRemoteVolumeId(remoteUrl);
+    }
+
+    auto vol = std::make_shared<Volume>(std::move(sidecarPath), RemoteConstructTag{});
 
     vol->isRemote_ = true;
-    vol->remoteUrl_ = info.url;
-    vol->remoteDelimiter_ = info.delimiter;
+    vol->remoteUrl_ = remoteUrl;
     vol->remoteAuth_ = auth;
-    vol->remoteShardConfig_ = info.shardConfig;
+    vol->remoteNumScales_ = static_cast<size_t>(cache->numLevels());
+    vol->_slices = cache->shape(0)[0];
+    vol->_height = cache->shape(0)[1];
+    vol->_width = cache->shape(0)[2];
+
+    const auto id = deriveRemoteVolumeId(remoteUrl);
+    vol->metadata_["uuid"] = id;
+    vol->metadata_["name"] = deriveRemoteVolumeName(remoteUrl);
+    vol->metadata_["type"] = "vol";
+    vol->metadata_["format"] = "zarr";
+    vol->metadata_["width"] = vol->_width;
+    vol->metadata_["height"] = vol->_height;
+    vol->metadata_["slices"] = vol->_slices;
+    vol->metadata_["voxelsize"] = double{};
+    vol->metadata_["min"] = double{};
+    vol->metadata_["max"] = double{};
+    vol->chunkedCache_ = std::move(cache);
 
     return vol;
 }
@@ -345,6 +396,8 @@ vc::VcDataset *Volume::zarrDataset(int level) const {
 }
 
 size_t Volume::numScales() const noexcept {
+    if (isRemote_)
+        return remoteNumScales_;
     return zarrDs_.size();
 }
 

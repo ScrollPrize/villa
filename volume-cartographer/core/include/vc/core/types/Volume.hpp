@@ -10,8 +10,8 @@
 
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/types/SampleParams.hpp"
-#include "vc/core/cache/HttpMetadataFetcher.hpp"  // ShardConfig
 #include "vc/core/util/NetworkFilesystem.hpp"
+#include "vc/core/util/RemoteAuth.hpp"
 
 // Forward declarations
 namespace vc { class VcDataset; }
@@ -29,6 +29,8 @@ public:
     Volume() = delete;
 
     explicit Volume(std::filesystem::path path);
+    struct RemoteConstructTag {};
+    Volume(std::filesystem::path path, RemoteConstructTag);
 
     ~Volume() noexcept;
 
@@ -36,10 +38,9 @@ public:
     static std::shared_ptr<Volume> New(std::filesystem::path path);
 
     // Create a Volume backed by a remote zarr store over HTTP.
-    // Downloads metadata (.zarray files) to a local staging dir, then
-    // fetches chunk data on demand via HttpSource.
-    // If auth is provided, it is used as-is; otherwise credentials are
-    // read from environment variables.
+    // If auth is provided, it is used as-is; otherwise credentials are read
+    // from environment variables. cacheRoot is only used for sidecar files
+    // such as downloaded transform.json.
     static std::shared_ptr<Volume> NewFromUrl(
         const std::string& url,
         const std::filesystem::path& cacheRoot = {},
@@ -50,8 +51,6 @@ public:
     [[nodiscard]] std::string name() const;
     [[nodiscard]] const std::string& remoteUrl() const noexcept { return remoteUrl_; }
     [[nodiscard]] const vc::HttpAuth& remoteAuth() const noexcept { return remoteAuth_; }
-    [[nodiscard]] const std::string& remoteDelimiter() const noexcept { return remoteDelimiter_; }
-    [[nodiscard]] const vc::cache::ShardConfig& remoteShardConfig() const noexcept { return remoteShardConfig_; }
     [[nodiscard]] std::filesystem::path path() const noexcept { return path_; }
 
     [[nodiscard]] int sliceWidth() const noexcept;
@@ -114,7 +113,6 @@ protected:
     // Remote volume state
     bool isRemote_ = false;
     std::string remoteUrl_;
-    std::string remoteDelimiter_ = ".";
     vc::HttpAuth remoteAuth_;
-    vc::cache::ShardConfig remoteShardConfig_;
+    size_t remoteNumScales_ = 0;
 };

@@ -9,6 +9,7 @@
 #include <QPointF>
 #include <QString>
 #include <memory>
+#include <optional>
 #include <vector>
 #include "ui_VCMain.h"
 
@@ -36,7 +37,6 @@ class CChunkedVolumeViewer;
 #include "segmentation/SegmentationWidget.hpp"
 #include "segmentation/growth/SegmentationGrowth.hpp"
 #include "SeedingWidget.hpp"
-#include "vc/core/cache/TickCoordinator.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -206,6 +206,7 @@ private:
     QLabel* _transformStatusLabel{nullptr};
     enum class RemoteTransformFetchState { Unknown, Pending, Available, Missing };
     std::unordered_map<std::string, RemoteTransformFetchState> _remoteTransformFetchStates;
+    std::unordered_map<std::string, cv::Matx44d> _remoteTransformMatrices;
     WindowRangeWidget* _volumeWindowWidget{nullptr};
     WindowRangeWidget* _overlayWindowWidget{nullptr};
     QLabel* _segmentationGrowthWarning{nullptr};
@@ -219,12 +220,6 @@ private:
     bool can_change_volume_();
 
     size_t _cacheSizeBytes = 0;
-
-    // Declared early so that the publisher thread joins (via ~jthread) after
-    // all viewers and caches below have been destroyed. Readers hold raw
-    // const pointers into FrameState buffers owned here; the coordinator
-    // must outlive every possible reader.
-    std::unique_ptr<vc::cache::TickCoordinator> _tickCoordinator;
 
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;
@@ -261,7 +256,7 @@ private:
     std::shared_ptr<QuadSurface> _transformPreviewSurface;
     QString _customTransformSource;
     std::filesystem::path _customTransformLocalPath;
-    std::unique_ptr<QTemporaryDir> _customTransformTempDir;
+    std::optional<cv::Matx44d> _customTransformMatrix;
 
     // Keyboard shortcuts
     QShortcut* fCompositeViewShortcut;
@@ -303,7 +298,7 @@ private:
     bool setCustomTransformSource(const QString& source, QString* errorMessage = nullptr);
     std::filesystem::path localCurrentTransformJsonPath() const;
     std::string currentRemoteTransformJsonUrl() const;
-    std::filesystem::path currentTransformJsonPath(bool allowRemoteFetch = true);
+    std::optional<cv::Matx44d> currentTransformMatrix(bool allowRemoteFetch = true);
 
 
 };  // class CWindow

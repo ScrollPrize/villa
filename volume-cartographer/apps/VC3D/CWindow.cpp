@@ -4,7 +4,7 @@
 #include <functional>
 #include <mutex>
 
-#include "vc/core/cache/HttpMetadataFetcher.hpp"
+#include "vc/core/util/HttpFetch.hpp"
 #include "WindowRangeWidget.hpp"
 #include "VCSettings.hpp"
 #include "Keybinds.hpp"
@@ -369,17 +369,8 @@ float signedAngleBetween(const cv::Vec3f& from, const cv::Vec3f& to, const cv::V
     return angle * sign;
 }
 
-cv::Matx44d loadAffineTransformMatrix(const std::filesystem::path& path)
+cv::Matx44d parseAffineTransformMatrix(const utils::Json& json)
 {
-    if (path.empty()) {
-        throw std::runtime_error("transform path is empty");
-    }
-    if (!std::filesystem::exists(path)) {
-        throw std::runtime_error("transform.json not found");
-    }
-
-    utils::Json json = utils::Json::parse_file(path);
-
     if (!json.contains("transformation_matrix")) {
         throw std::runtime_error("transform.json is missing transformation_matrix");
     }
@@ -410,6 +401,25 @@ cv::Matx44d loadAffineTransformMatrix(const std::filesystem::path& path)
     }
 
     return matrix;
+}
+
+cv::Matx44d loadAffineTransformMatrix(const std::filesystem::path& path)
+{
+    if (path.empty()) {
+        throw std::runtime_error("transform path is empty");
+    }
+    if (!std::filesystem::exists(path)) {
+        throw std::runtime_error("transform.json not found");
+    }
+
+    return parseAffineTransformMatrix(utils::Json::parse_file(path));
+}
+
+cv::Matx44d loadAffineTransformMatrixFromString(const std::string& text)
+{
+    if (text.empty())
+        throw std::runtime_error("transform.json not found");
+    return parseAffineTransformMatrix(utils::Json::parse(text));
 }
 
 cv::Matx44d invertAffineTransformMatrix(const cv::Matx44d& matrix)
@@ -675,8 +685,6 @@ CWindow::CWindow(size_t cacheSizeGB) :
 
     _cacheSizeBytes = cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
     std::cout << "chunk cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
-
-    _tickCoordinator = std::make_unique<vc::cache::TickCoordinator>();
 
     _state = new CState(_cacheSizeBytes, this);
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
@@ -1372,60 +1380,48 @@ void CWindow::ensureCurrentRemoteTransformJsonAsync()
         return;
     }
 
-    const auto volumePath = currentVolume->path();
-    if (volumePath.empty()) {
-        return;
-    }
-
-    const auto localTransformPath = volumePath / "transform.json";
-    if (std::filesystem::exists(localTransformPath)) {
-        const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
-        if (!remoteTransformUrl.empty()) {
-            _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Available;
-        }
-        return;
-    }
-
     const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
     if (remoteTransformUrl.empty()) {
         return;
     }
 
     auto& fetchState = _remoteTransformFetchStates[remoteTransformUrl];
-    if (fetchState == RemoteTransformFetchState::Available &&
-        !std::filesystem::exists(localTransformPath)) {
-        fetchState = RemoteTransformFetchState::Unknown;
-    }
     if (fetchState != RemoteTransformFetchState::Unknown) {
         return;
     }
 
     fetchState = RemoteTransformFetchState::Pending;
     const auto auth = currentVolume->remoteAuth();
-    auto* watcher = new QFutureWatcher<bool>(this);
-    connect(watcher, &QFutureWatcher<bool>::finished, this,
-            [this, watcher, remoteTransformUrl, localTransformPath]() {
+    auto* watcher = new QFutureWatcher<std::optional<cv::Matx44d>>(this);
+    connect(watcher, &QFutureWatcher<std::optional<cv::Matx44d>>::finished, this,
+            [this, watcher, remoteTransformUrl]() {
                 watcher->deleteLater();
 
-                bool downloaded = false;
+                std::optional<cv::Matx44d> matrix;
                 try {
-                    downloaded = watcher->result();
+                    matrix = watcher->result();
                 } catch (const std::exception&) {
-                    downloaded = false;
+                    matrix.reset();
                 }
 
-                _remoteTransformFetchStates[remoteTransformUrl] =
-                    (downloaded && std::filesystem::exists(localTransformPath))
-                        ? RemoteTransformFetchState::Available
-                        : RemoteTransformFetchState::Missing;
+                if (matrix) {
+                    _remoteTransformMatrices[remoteTransformUrl] = *matrix;
+                    _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Available;
+                } else {
+                    _remoteTransformMatrices.erase(remoteTransformUrl);
+                    _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Missing;
+                }
 
                 if (currentRemoteTransformJsonUrl() == remoteTransformUrl) {
                     refreshTransformsPanelState();
                 }
             });
     watcher->setFuture(QtConcurrent::run(
-        [remoteTransformUrl, localTransformPath, auth]() {
-            return vc::cache::httpDownloadFile(remoteTransformUrl, localTransformPath, auth);
+        [remoteTransformUrl, auth]() -> std::optional<cv::Matx44d> {
+            const auto body = vc::httpGetString(remoteTransformUrl, auth);
+            if (body.empty())
+                return std::nullopt;
+            return loadAffineTransformMatrixFromString(body);
         }));
 }
 
@@ -1435,34 +1431,24 @@ bool CWindow::setCustomTransformSource(const QString& source, QString* errorMess
     if (trimmed.isEmpty()) {
         _customTransformSource.clear();
         _customTransformLocalPath.clear();
-        _customTransformTempDir.reset();
+        _customTransformMatrix.reset();
         return true;
     }
 
     try {
-        std::filesystem::path resolvedPath;
         if (isRemoteTransformSource(trimmed)) {
-            if (!_customTransformTempDir) {
-                _customTransformTempDir = std::make_unique<QTemporaryDir>();
-            }
-            if (!_customTransformTempDir || !_customTransformTempDir->isValid()) {
-                throw std::runtime_error("failed to create temporary directory for affine download");
-            }
-
             const auto resolved = vc::resolveRemoteUrl(trimmed.toStdString());
             const auto auth = authForRemoteTransformSource(trimmed);
-            const auto tempRoot = std::filesystem::path(_customTransformTempDir->path().toStdString());
-            resolvedPath = tempRoot / "custom_transform.json";
-            if (!vc::cache::httpDownloadFile(resolved.httpsUrl, resolvedPath, auth)) {
-                throw std::runtime_error("failed to download affine from the provided path");
-            }
+            const auto body = vc::httpGetString(resolved.httpsUrl, auth);
+            _customTransformMatrix = loadAffineTransformMatrixFromString(body);
+            _customTransformLocalPath.clear();
         } else {
-            resolvedPath = expandLocalTransformPath(trimmed);
+            auto resolvedPath = expandLocalTransformPath(trimmed);
+            _customTransformMatrix = loadAffineTransformMatrix(resolvedPath);
+            _customTransformLocalPath = std::move(resolvedPath);
         }
 
-        loadAffineTransformMatrix(resolvedPath);
         _customTransformSource = trimmed;
-        _customTransformLocalPath = std::move(resolvedPath);
         return true;
     } catch (const std::exception& ex) {
         if (errorMessage) {
@@ -1472,10 +1458,10 @@ bool CWindow::setCustomTransformSource(const QString& source, QString* errorMess
     }
 }
 
-std::filesystem::path CWindow::currentTransformJsonPath(bool allowRemoteFetch)
+std::optional<cv::Matx44d> CWindow::currentTransformMatrix(bool allowRemoteFetch)
 {
     if (!_customTransformSource.trimmed().isEmpty()) {
-        return _customTransformLocalPath;
+        return _customTransformMatrix;
     }
 
     if (const auto localTransformPath = localCurrentTransformJsonPath();
@@ -1484,43 +1470,46 @@ std::filesystem::path CWindow::currentTransformJsonPath(bool allowRemoteFetch)
         if (!remoteTransformUrl.empty()) {
             _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Available;
         }
-        return localTransformPath;
+        return loadAffineTransformMatrix(localTransformPath);
     }
 
     if (!_state) {
-        return {};
+        return std::nullopt;
     }
 
     auto currentVolume = _state->currentVolume();
     if (!currentVolume) {
-        return {};
-    }
-
-    const auto volumePath = currentVolume->path();
-    if (volumePath.empty()) {
-        return {};
+        return std::nullopt;
     }
 
     if (!currentVolume->isRemote() || currentVolume->remoteUrl().empty()) {
-        return {};
+        return std::nullopt;
     }
 
     const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
-    const auto localTransformPath = volumePath / "transform.json";
+    if (remoteTransformUrl.empty())
+        return std::nullopt;
+
+    if (auto it = _remoteTransformMatrices.find(remoteTransformUrl);
+        it != _remoteTransformMatrices.end()) {
+        return it->second;
+    }
 
     if (!allowRemoteFetch) {
-        return {};
+        return std::nullopt;
     }
 
-    if (vc::cache::httpDownloadFile(remoteTransformUrl,
-                                    localTransformPath,
-                                    currentVolume->remoteAuth())) {
+    const auto body = vc::httpGetString(remoteTransformUrl, currentVolume->remoteAuth());
+    if (!body.empty()) {
+        auto matrix = loadAffineTransformMatrixFromString(body);
+        _remoteTransformMatrices[remoteTransformUrl] = matrix;
         _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Available;
-        return localTransformPath;
+        return matrix;
     }
 
+    _remoteTransformMatrices.erase(remoteTransformUrl);
     _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Missing;
-    return {};
+    return std::nullopt;
 }
 
 void CWindow::clearTransformPreview(bool restoreDisplayedSurface)
@@ -1564,9 +1553,8 @@ bool CWindow::applyTransformPreview(bool allowRemoteFetch)
     const bool scaleOnly = _scaleOnlyTransformCheck && _scaleOnlyTransformCheck->isChecked();
     std::optional<cv::Matx44d> matrix;
     if (!scaleOnly) {
-        const auto transformPath = currentTransformJsonPath(allowRemoteFetch);
-        if (!transformPath.empty() && std::filesystem::exists(transformPath)) {
-            matrix = loadAffineTransformMatrix(transformPath);
+        matrix = currentTransformMatrix(allowRemoteFetch);
+        if (matrix) {
             if (_invertTransformCheck && _invertTransformCheck->isChecked()) {
                 matrix = invertAffineTransformMatrix(*matrix);
             }
@@ -1612,20 +1600,19 @@ void CWindow::refreshTransformsPanelState()
     const auto sourceSurface = currentTransformSourceSurface();
     const auto currentVolume = _state ? _state->currentVolume() : nullptr;
     const bool scaleOnly = _scaleOnlyTransformCheck->isChecked();
-    const auto transformPath = localCurrentTransformJsonPath();
-    const bool hasTransform = !transformPath.empty() && std::filesystem::exists(transformPath);
+    const auto localTransformPath = localCurrentTransformJsonPath();
+    bool hasTransform = _customTransformMatrix.has_value() ||
+                        (!localTransformPath.empty() && std::filesystem::exists(localTransformPath));
     const int scale = _transformScaleSpin->value();
     const bool hasScaleOnlyTransform = scale != 1;
-    const bool previewEnabled =
-        sourceSurface && !editingEnabled &&
-        (hasScaleOnlyTransform || (!scaleOnly && hasTransform));
-    const bool saveEnabled = previewEnabled && sourceSurface && !sourceSurface->path.empty();
     const bool hasCustomTransform = !_customTransformSource.trimmed().isEmpty();
     const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
     RemoteTransformFetchState remoteFetchState = RemoteTransformFetchState::Unknown;
     if (!scaleOnly && !hasCustomTransform && currentVolume && currentVolume->isRemote() &&
         !remoteTransformUrl.empty()) {
-        if (hasTransform) {
+        if (auto it = _remoteTransformMatrices.find(remoteTransformUrl);
+            it != _remoteTransformMatrices.end()) {
+            hasTransform = true;
             _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Available;
         } else {
             ensureCurrentRemoteTransformJsonAsync();
@@ -1635,6 +1622,10 @@ void CWindow::refreshTransformsPanelState()
             }
         }
     }
+    const bool previewEnabled =
+        sourceSurface && !editingEnabled &&
+        (hasScaleOnlyTransform || (!scaleOnly && hasTransform));
+    const bool saveEnabled = previewEnabled && sourceSurface && !sourceSurface->path.empty();
 
     const QString transformLocation = currentTransformSourceDescription();
 
@@ -1778,8 +1769,10 @@ void CWindow::onSaveTransformedRequested()
 
     const int scale = _transformScaleSpin ? _transformScaleSpin->value() : 1;
     const bool scaleOnly = _scaleOnlyTransformCheck && _scaleOnlyTransformCheck->isChecked();
-    const auto transformPath = scaleOnly ? std::filesystem::path{} : currentTransformJsonPath();
-    const bool hasTransform = !transformPath.empty() && std::filesystem::exists(transformPath);
+    std::optional<cv::Matx44d> matrix = scaleOnly
+        ? std::nullopt
+        : currentTransformMatrix();
+    const bool hasTransform = matrix.has_value();
     if (!hasTransform && scale == 1) {
         QMessageBox::warning(this, tr("Missing Transform"),
                              scaleOnly
@@ -1829,9 +1822,7 @@ void CWindow::onSaveTransformedRequested()
     }
 
     try {
-        std::optional<cv::Matx44d> matrix;
         if (hasTransform) {
-            matrix = loadAffineTransformMatrix(transformPath);
             if (_invertTransformCheck && _invertTransformCheck->isChecked()) {
                 matrix = invertAffineTransformMatrix(*matrix);
             }
@@ -1904,7 +1895,7 @@ void CWindow::onLoadAffineRequested()
     }
 
     if (source.isEmpty() && _previewTransformCheck && _previewTransformCheck->isChecked()) {
-        currentTransformJsonPath();
+        currentTransformMatrix();
     }
 
     if (source.isEmpty()) {

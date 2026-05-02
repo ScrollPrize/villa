@@ -1,6 +1,5 @@
 #include <iostream>
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
