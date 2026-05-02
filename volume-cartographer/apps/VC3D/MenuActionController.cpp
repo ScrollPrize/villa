@@ -626,6 +626,7 @@ void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
     const QString cacheDir = remoteCacheDirectory();
     int attachedCount = 0;
     int skippedCount = 0;
+    QString firstAttachedId;
 
     for (const auto& entry : root["volumes"]) {
         if (!entry.is_object()) {
@@ -651,6 +652,9 @@ void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
                 continue;
             }
             if (_window->_state->vpkg()->addVolume(volume)) {
+                if (firstAttachedId.isEmpty()) {
+                    firstAttachedId = QString::fromStdString(volume->id());
+                }
                 attachedCount++;
             } else {
                 skippedCount++;
@@ -662,7 +666,7 @@ void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
     }
 
     if (attachedCount > 0) {
-        _window->refreshCurrentVolumePackageUi(currentId, false);
+        _window->refreshCurrentVolumePackageUi(firstAttachedId.isEmpty() ? currentId : firstAttachedId, false);
         _window->UpdateView();
     }
 

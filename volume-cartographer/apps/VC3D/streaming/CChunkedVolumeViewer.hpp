@@ -238,6 +238,7 @@ private:
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     int genericPreviewDownsampleFactor() const;
     bool streamingCompositeUnsupported() const;
+    void updateCursorCrosshair(const QPointF& scenePos);
     void updateFocusMarker(POI* poi = nullptr);
     void clearIntersectionItems();
     void updateIntersectionPreviewTransform();

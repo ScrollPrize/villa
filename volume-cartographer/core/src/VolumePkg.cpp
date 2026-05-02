@@ -173,7 +173,10 @@ bool VolumePkg::addVolume(const std::shared_ptr<Volume>& volume)
         return false;
     }
 
-    Logger()->info("Added external volume '{}' from '{}'", volumeId, volume->path().string());
+    const auto source = volume->isRemote()
+        ? volume->remoteUrl()
+        : volume->path().string();
+    Logger()->info("Added external volume '{}' from '{}'", volumeId, source);
     return true;
 }
 

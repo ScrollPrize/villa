@@ -307,7 +307,6 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     const std::string remoteUrl = normalizeRemoteVolumeUrl(resolved.httpsUrl);
 
     vc::render::OpenedChunkedZarr opened;
-    std::unique_ptr<vc::render::ChunkCache> cache;
     // Open the zarr metadata in memory. This performs the normal zarr metadata
     // reads, but does not stage .zarray/meta.json files on disk.
     // If stale AWS credentials are present, public buckets may reject the
@@ -327,20 +326,15 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     if (opened.shapes.empty())
         throw std::runtime_error("No zarr levels found at " + remoteUrl);
 
-    cache = vc::render::createChunkCache(
-        std::move(opened),
-        8ULL << 30,
-        16);
-
     auto vol = std::make_shared<Volume>(std::filesystem::path{}, RemoteConstructTag{});
 
     vol->isRemote_ = true;
     vol->remoteUrl_ = remoteUrl;
     vol->remoteAuth_ = auth;
-    vol->remoteNumScales_ = static_cast<size_t>(cache->numLevels());
-    vol->_slices = cache->shape(0)[0];
-    vol->_height = cache->shape(0)[1];
-    vol->_width = cache->shape(0)[2];
+    vol->remoteNumScales_ = opened.shapes.size();
+    vol->_slices = opened.shapes[0][0];
+    vol->_height = opened.shapes[0][1];
+    vol->_width = opened.shapes[0][2];
 
     const auto id = deriveRemoteVolumeId(remoteUrl);
     vol->metadata_["uuid"] = id;
@@ -353,7 +347,6 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
     vol->metadata_["voxelsize"] = double{};
     vol->metadata_["min"] = double{};
     vol->metadata_["max"] = double{};
-    vol->chunkedCache_ = std::move(cache);
 
     return vol;
 }

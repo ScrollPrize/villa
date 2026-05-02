@@ -65,7 +65,6 @@ constexpr int kActiveIntersectionZ = 120;
 constexpr float kActiveIntersectionOpacityScale = 1.2f;
 constexpr float kActiveIntersectionWidthScale = 1.3f;
 constexpr float kActiveIntersectionMinWidthDelta = 0.75f;
-constexpr float kLinkedCursorPlaneTolerance = 0.5f;
 
 struct IntersectionStyle {
     QRgb color = 0;
@@ -1607,6 +1606,7 @@ void CChunkedVolumeViewer::onResized()
 void CChunkedVolumeViewer::onCursorMove(QPointF scenePos)
 {
     _lastScenePos = scenePos;
+    updateCursorCrosshair(scenePos);
     if (_viewerManager) {
         auto surf = _surfWeak.lock();
         if (surf) {
@@ -1676,6 +1676,7 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
 void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
     _lastScenePos = scenePos;
+    updateCursorCrosshair(scenePos);
     if (_bboxMode && _surfName == "segmentation" && button == Qt::LeftButton) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
         _bboxStart = QPointF(sp[0], sp[1]);
@@ -1690,6 +1691,7 @@ void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons button
 {
     Q_UNUSED(modifiers);
     _lastScenePos = scenePos;
+    updateCursorCrosshair(scenePos);
     if (_bboxMode && _activeBBoxSurfRect && (buttons & Qt::LeftButton)) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
         _activeBBoxSurfRect = QRectF(_bboxStart, QPointF(sp[0], sp[1])).normalized();
@@ -1702,6 +1704,7 @@ void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons button
 void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
     _lastScenePos = scenePos;
+    updateCursorCrosshair(scenePos);
     if (_bboxMode && _surfName == "segmentation" && button == Qt::LeftButton &&
         _activeBBoxSurfRect) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
@@ -1792,46 +1795,10 @@ QPointF CChunkedVolumeViewer::volumeToScene(const cv::Vec3f& volPoint)
     return {};
 }
 
-void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>& point)
+void CChunkedVolumeViewer::updateCursorCrosshair(const QPointF& scenePos)
 {
-    if (!_scene)
+    if (!_scene || !std::isfinite(scenePos.x()) || !std::isfinite(scenePos.y()))
         return;
-    auto surf = _surfWeak.lock();
-    if (!point || !surf) {
-        if (_cursorCrosshair)
-            _cursorCrosshair->hide();
-        return;
-    }
-
-    QPointF scenePos;
-    if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
-        const cv::Vec3f n = plane->normal({0, 0, 0});
-        const float planeDistance = std::abs(plane->scalarp(*point) - _zOff);
-        if (planeDistance > kLinkedCursorPlaneTolerance) {
-            if (_cursorCrosshair)
-                _cursorCrosshair->hide();
-            return;
-        }
-        const cv::Vec3f proj = plane->project(*point - n * _zOff, 1.0f, 1.0f);
-        scenePos = surfaceToScene(proj[0], proj[1]);
-    } else if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
-        cv::Vec3f query = *point;
-        if (_zOff != 0.0f && _zOffWorldDir != cv::Vec3f(0.0f, 0.0f, 0.0f))
-            query -= _zOffWorldDir * _zOff;
-        cv::Vec3f ptr = quad->pointer();
-        auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-        if (quad->pointTo(ptr, query, 4.0f, 100, patchIndex) < 0.0f) {
-            if (_cursorCrosshair)
-                _cursorCrosshair->hide();
-            return;
-        }
-        const cv::Vec3f loc = quad->loc(ptr);
-        scenePos = surfaceToScene(loc[0], loc[1]);
-    } else {
-        if (_cursorCrosshair)
-            _cursorCrosshair->hide();
-        return;
-    }
 
     if (!_cursorCrosshair || !_cursorCrosshair->scene()) {
         QPainterPath path;
@@ -1859,13 +1826,15 @@ void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Ve
         _cursorCrosshair = marker;
     }
 
-    if (!std::isfinite(scenePos.x()) || !std::isfinite(scenePos.y())) {
-        _cursorCrosshair->hide();
-        return;
-    }
-
     _cursorCrosshair->setPos(scenePos);
     _cursorCrosshair->show();
+}
+
+void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>&)
+{
+    // The chunked viewer shows the cursor marker at its local mouse position.
+    // Cross-view projection was unreliable for mixed surface/plane views and is
+    // intentionally ignored here.
 }
 
 void CChunkedVolumeViewer::updateFocusMarker(POI* poi)
