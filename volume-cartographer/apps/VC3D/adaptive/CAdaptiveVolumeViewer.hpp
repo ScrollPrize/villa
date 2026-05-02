@@ -73,7 +73,7 @@ public:
     // thickness / surface-change / intersect-target slider) don't each
     // pay the full rtree + triangle-clip cost on the main thread.
     void renderIntersectionsNow();
-    void invalidateVis() {}
+    void invalidateVis() override {}
     void invalidateIntersect(const std::string& = "") override;
     void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) override;
     void centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender = false);
@@ -127,8 +127,8 @@ public:
     bool isShowSurfaceNormals() const override { return _showSurfaceNormals; }
     float normalArrowLengthScale() const override { return _normalArrowLengthScale; }
     int normalMaxArrows() const override { return _normalMaxArrows; }
-    void setNormalArrowLengthScale(float scale) { _normalArrowLengthScale = scale; emit overlaysUpdated(); }
-    void setNormalMaxArrows(int maxArrows) { _normalMaxArrows = maxArrows; emit overlaysUpdated(); }
+    void setNormalArrowLengthScale(float scale) override { _normalArrowLengthScale = scale; emit overlaysUpdated(); }
+    void setNormalMaxArrows(int maxArrows) override { _normalMaxArrows = maxArrows; emit overlaysUpdated(); }
 
     // --- Overlay volume ---
     void setOverlayVolume(std::shared_ptr<Volume> volume) override;
@@ -181,17 +181,17 @@ public:
     bool surfaceOverlayEnabled() const override { return _surfaceOverlayEnabled; }
     const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override { return _surfaceOverlays; }
     float surfaceOverlapThreshold() const override { return _surfaceOverlapThreshold; }
-    void setSurfaceOverlayEnabled(bool enabled) {
+    void setSurfaceOverlayEnabled(bool enabled) override {
         if (_surfaceOverlayEnabled == enabled) return;
         _surfaceOverlayEnabled = enabled;
         emit overlaysUpdated();
     }
-    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) {
+    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) override {
         if (_surfaceOverlays == overlays) return;
         _surfaceOverlays = overlays;
         if (_surfaceOverlayEnabled) emit overlaysUpdated();
     }
-    void setSurfaceOverlapThreshold(float threshold) {
+    void setSurfaceOverlapThreshold(float threshold) override {
         const float clamped = std::max(0.0f, threshold);
         if (std::abs(_surfaceOverlapThreshold - clamped) < 1e-6f) return;
         _surfaceOverlapThreshold = clamped;
@@ -212,10 +212,10 @@ public:
     void resetSurfaceOffsets() override;
 
     // --- BBox tool ---
-    void setBBoxMode(bool enabled);
+    void setBBoxMode(bool enabled) override;
     bool isBBoxMode() const { return _bboxMode; }
-    QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF& sceneRect);
-    void clearSelections();
+    QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF& sceneRect) override;
+    void clearSelections() override;
 
     // --- Compat accessors ---
     CVolumeViewerView* fGraphicsView = nullptr;  // alias for _view, set in constructor
@@ -234,7 +234,7 @@ public:
 
     void updateStatusLabel();
     void fitSurfaceInView() override;
-    void requestRender();
+    void requestRender() override;
     bool isWindowMinimized() const;
     bool eventFilter(QObject* watched, QEvent* event) override;
 
@@ -496,7 +496,7 @@ public:
     // Call after the user toggles values in the Viewer Controls panel;
     // submitRender() reads the cached members on every frame instead of
     // opening QSettings.
-    void reloadPerfSettings();
+    void reloadPerfSettings() override;
 
 private:
 

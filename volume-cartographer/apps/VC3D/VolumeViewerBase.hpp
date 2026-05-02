@@ -65,6 +65,8 @@ public:
     virtual void setSurface(const std::string& name) = 0;
     virtual void setIntersects(const std::set<std::string>& names) = 0;
     virtual void renderVisible(bool force = false) = 0;
+    virtual void requestRender() = 0;
+    virtual void invalidateVis() = 0;
     virtual void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) = 0;
     virtual void adjustZoomByFactor(float factor) = 0;
     virtual void adjustSurfaceOffset(float delta) = 0;
@@ -90,6 +92,8 @@ public:
     virtual bool isShowSurfaceNormals() const = 0;
     virtual float normalArrowLengthScale() const = 0;
     virtual int normalMaxArrows() const = 0;
+    virtual void setNormalArrowLengthScale(float scale) = 0;
+    virtual void setNormalMaxArrows(int maxArrows) = 0;
 
     // --- Composite settings ---
     virtual const CompositeRenderSettings& compositeRenderSettings() const = 0;
@@ -108,6 +112,7 @@ public:
     virtual void setOverlayColormap(const std::string& colormapId) = 0;
     virtual void setOverlayThreshold(float threshold) = 0;
     virtual void setOverlayWindow(float low, float high) = 0;
+    virtual void reloadPerfSettings() = 0;
 
     // --- Interaction state ---
     virtual uint64_t highlightedPointId() const = 0;
@@ -124,6 +129,9 @@ public:
     // --- BBox ---
     virtual std::vector<std::pair<QRectF, QColor>> selections() const = 0;
     virtual std::optional<QRectF> activeBBoxSceneRect() const = 0;
+    virtual void setBBoxMode(bool enabled) = 0;
+    virtual QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF& sceneRect) = 0;
+    virtual void clearSelections() = 0;
 
     // --- Intersection rendering ---
     virtual void renderIntersections() = 0;
@@ -140,6 +148,9 @@ public:
     virtual bool surfaceOverlayEnabled() const = 0;
     virtual const std::map<std::string, cv::Vec3b>& surfaceOverlays() const = 0;
     virtual float surfaceOverlapThreshold() const = 0;
+    virtual void setSurfaceOverlayEnabled(bool enabled) = 0;
+    virtual void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) = 0;
+    virtual void setSurfaceOverlapThreshold(float threshold) = 0;
 
     // --- Active segmentation ---
     virtual const ActiveSegmentationHandle& activeSegmentationHandle() const = 0;

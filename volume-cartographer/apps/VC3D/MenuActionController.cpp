@@ -1759,7 +1759,7 @@ void MenuActionController::showSettingsDialog()
     bool showDirHints = settings.value(vc3d::settings::viewer::SHOW_DIRECTION_HINTS,
                                        vc3d::settings::viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
     if (_window->_viewerManager) {
-        _window->_viewerManager->forEachViewer([showDirHints](CTiledVolumeViewer* viewer) {
+        _window->_viewerManager->forEachBaseViewer([showDirHints](VolumeViewerBase* viewer) {
             if (viewer) {
                 viewer->setShowDirectionHints(showDirHints);
             }
@@ -1970,7 +1970,7 @@ void MenuActionController::toggleDrawBBox(bool enabled)
         return;
     }
 
-    _window->_viewerManager->forEachViewer([this, enabled](CTiledVolumeViewer* viewer) {
+    _window->_viewerManager->forEachBaseViewer([this, enabled](VolumeViewerBase* viewer) {
         if (viewer && viewer->surfName() == "segmentation") {
             viewer->setBBoxMode(enabled);
             if (_window->statusBar()) {
@@ -1996,12 +1996,7 @@ void MenuActionController::surfaceFromSelection()
         return;
     }
 
-    CTiledVolumeViewer* segViewer = nullptr;
-    _window->_viewerManager->forEachViewer([&segViewer](CTiledVolumeViewer* viewer) {
-        if (viewer && viewer->surfName() == "segmentation") {
-            segViewer = viewer;
-        }
-    });
+    VolumeViewerBase* segViewer = _window->segmentationBaseViewer();
 
     if (!segViewer) {
         _window->statusBar()->showMessage(QObject::tr("No Surface viewer found"), 3000);
@@ -2062,7 +2057,7 @@ void MenuActionController::clearSelection()
         return;
     }
 
-    CTiledVolumeViewer* segViewer = _window->segmentationViewer();
+    VolumeViewerBase* segViewer = _window->segmentationBaseViewer();
     if (!segViewer) {
         _window->statusBar()->showMessage(QObject::tr("No Surface viewer found"), 3000);
         return;

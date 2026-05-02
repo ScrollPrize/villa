@@ -166,9 +166,7 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         bool resetView = settings.value(viewer::RESET_VIEW_ON_SURFACE_CHANGE, viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
         baseViewer->setResetViewOnSurfaceChange(resetView);
-        if (adaptiveViewer) {
-            _resetDefaults[adaptiveViewer] = resetView;
-        }
+        _resetDefaults[baseViewer] = resetView;
     }
 
     baseViewer->setSurface(surfaceName);
@@ -184,8 +182,8 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
     connect(widget, &QObject::destroyed, this, [this, baseViewer, adaptiveViewer]() {
         if (adaptiveViewer) {
             _viewers.erase(std::remove(_viewers.begin(), _viewers.end(), adaptiveViewer), _viewers.end());
-            _resetDefaults.erase(adaptiveViewer);
         }
+        _resetDefaults.erase(baseViewer);
         _baseViewers.erase(std::remove(_baseViewers.begin(), _baseViewers.end(), baseViewer), _baseViewers.end());
     });
 
@@ -892,13 +890,13 @@ void ViewerManager::handleSurfaceWillBeDeleted(std::string name, std::shared_ptr
     }
 }
 
-bool ViewerManager::resetDefaultFor(CTiledVolumeViewer* viewer) const
+bool ViewerManager::resetDefaultFor(VolumeViewerBase* viewer) const
 {
     auto it = _resetDefaults.find(viewer);
     return it != _resetDefaults.end() ? it->second : true;
 }
 
-void ViewerManager::setResetDefaultFor(CTiledVolumeViewer* viewer, bool value)
+void ViewerManager::setResetDefaultFor(VolumeViewerBase* viewer, bool value)
 {
     if (!viewer) {
         return;

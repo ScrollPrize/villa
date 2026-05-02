@@ -2180,8 +2180,7 @@ const std::vector<ViewerOverlayControllerBase::PathPrimitive>& CChunkedVolumeVie
 
 const std::map<std::string, cv::Vec3b>& CChunkedVolumeViewer::surfaceOverlays() const
 {
-    static std::map<std::string, cv::Vec3b> empty;
-    return empty;
+    return _surfaceOverlays;
 }
 
 void CChunkedVolumeViewer::updateStatusLabel()

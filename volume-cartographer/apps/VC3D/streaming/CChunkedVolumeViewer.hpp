@@ -5,6 +5,7 @@
 #include <QPointF>
 #include <QWidget>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <map>
@@ -51,6 +52,8 @@ public:
     void setSurface(const std::string& name) override;
     void setIntersects(const std::set<std::string>& names) override { _intersectTgts = names; renderIntersections(); }
     void renderVisible(bool force = false) override;
+    void requestRender() override { scheduleRender(); }
+    void invalidateVis() override {}
     void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) override;
     void adjustSurfaceOffset(float delta) override;
     void resetSurfaceOffsets() override;
@@ -83,8 +86,8 @@ public:
     bool isShowSurfaceNormals() const override { return _showSurfaceNormals; }
     float normalArrowLengthScale() const override { return _normalArrowLengthScale; }
     int normalMaxArrows() const override { return _normalMaxArrows; }
-    void setNormalArrowLengthScale(float scale) { _normalArrowLengthScale = scale; emit overlaysUpdated(); }
-    void setNormalMaxArrows(int maxArrows) { _normalMaxArrows = maxArrows; emit overlaysUpdated(); }
+    void setNormalArrowLengthScale(float scale) override { _normalArrowLengthScale = scale; emit overlaysUpdated(); }
+    void setNormalMaxArrows(int maxArrows) override { _normalMaxArrows = maxArrows; emit overlaysUpdated(); }
 
     void setOverlayVolume(std::shared_ptr<Volume> volume) override;
     void setOverlayOpacity(float opacity) override;
@@ -108,6 +111,9 @@ public:
 
     std::vector<std::pair<QRectF, QColor>> selections() const override { return {}; }
     std::optional<QRectF> activeBBoxSceneRect() const override { return std::nullopt; }
+    void setBBoxMode(bool) override {}
+    QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF&) override { return nullptr; }
+    void clearSelections() override {}
 
     void renderIntersections() override;
     void invalidateIntersect(const std::string& = "") override;
@@ -119,12 +125,12 @@ public:
     void setHighlightedSurfaceIds(const std::vector<std::string>& ids) override;
     void setSurfacePatchSamplingStride(int s) override { _surfacePatchSamplingStride = s; invalidateIntersect(); renderIntersections(); }
 
-    bool surfaceOverlayEnabled() const override { return false; }
+    bool surfaceOverlayEnabled() const override { return _surfaceOverlayEnabled; }
     const std::map<std::string, cv::Vec3b>& surfaceOverlays() const override;
-    float surfaceOverlapThreshold() const override { return 5.0f; }
-    void setSurfaceOverlayEnabled(bool) {}
-    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>&) {}
-    void setSurfaceOverlapThreshold(float) {}
+    float surfaceOverlapThreshold() const override { return _surfaceOverlapThreshold; }
+    void setSurfaceOverlayEnabled(bool enabled) override { _surfaceOverlayEnabled = enabled; emit overlaysUpdated(); }
+    void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) override { _surfaceOverlays = overlays; emit overlaysUpdated(); }
+    void setSurfaceOverlapThreshold(float threshold) override { _surfaceOverlapThreshold = std::max(0.0f, threshold); emit overlaysUpdated(); }
 
     QPointF volumeToScene(const cv::Vec3f& volPoint) override;
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const override;
@@ -139,7 +145,7 @@ public:
         return connect(this, &CChunkedVolumeViewer::overlaysUpdated, receiver, callback);
     }
 
-    void reloadPerfSettings();
+    void reloadPerfSettings() override;
 
 public slots:
     void OnVolumeChanged(std::shared_ptr<Volume> vol);
@@ -303,6 +309,9 @@ private:
     bool _showSurfaceNormals = false;
     float _normalArrowLengthScale = 1.0f;
     int _normalMaxArrows = 32;
+    bool _surfaceOverlayEnabled = false;
+    std::map<std::string, cv::Vec3b> _surfaceOverlays;
+    float _surfaceOverlapThreshold = 5.0f;
     float _intersectionOpacity = 0.7f;
     float _intersectionThickness = 0.0f;
     int _surfacePatchSamplingStride = 2;

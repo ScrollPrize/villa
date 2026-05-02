@@ -1754,7 +1754,7 @@ void SurfacePanelController::applyFiltersInternal()
         collectVisibleSurfaces(intersects);
 
         if (_viewerManager) {
-            _viewerManager->forEachViewer([&intersects](CTiledVolumeViewer* viewer) {
+            _viewerManager->forEachBaseViewer([&intersects](VolumeViewerBase* viewer) {
                 if (viewer && viewer->surfName() != "segmentation") {
                     viewer->setIntersects(intersects);
                 }
@@ -1914,7 +1914,7 @@ void SurfacePanelController::applyFiltersInternal()
     }
 
     if (_viewerManager) {
-        _viewerManager->forEachViewer([&intersects](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([&intersects](VolumeViewerBase* viewer) {
             if (viewer && viewer->surfName() != "segmentation") {
                 viewer->setIntersects(intersects);
             }

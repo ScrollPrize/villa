@@ -175,6 +175,8 @@ private slots:
     void configureViewerConnections(CTiledVolumeViewer* viewer);
 
     CTiledVolumeViewer* segmentationViewer() const;
+    VolumeViewerBase* segmentationBaseViewer() const;
+    VolumeViewerBase* activeBaseViewer() const;
     void clearSurfaceSelection();
     void onSurfaceActivated(const QString& surfaceId, QuadSurface* surface);
     void onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface);

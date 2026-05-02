@@ -93,6 +93,7 @@
 
 #include "CVolumeViewerView.hpp"
 #include "VolumeViewerCmaps.hpp"
+#include "streaming/CChunkedVolumeViewer.hpp"
 #include "vc/ui/UDataManipulateUtils.hpp"
 #include "SettingsDialog.hpp"
 #include "elements/VolumeSelector.hpp"
@@ -141,6 +142,17 @@ using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 
 namespace
 {
+
+VolumeViewerBase* baseViewerFromWidget(QWidget* widget)
+{
+    if (auto* adaptiveViewer = qobject_cast<CTiledVolumeViewer*>(widget)) {
+        return adaptiveViewer;
+    }
+    if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(widget)) {
+        return chunkedViewer;
+    }
+    return nullptr;
+}
 
 std::string compositeMethodForModeIndex(int index)
 {
@@ -967,6 +979,13 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
         if (!viewer) {
             return;
         }
+        if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())) {
+            connect(chunkedViewer,
+                    &CChunkedVolumeViewer::sendVolumeClicked,
+                    this,
+                    &CWindow::onVolumeClicked,
+                    Qt::UniqueConnection);
+        }
         auto s = viewer->compositeRenderSettings();
         s.params.method = compositeMethodForModeIndex(ui.cmbCompositeMode->currentIndex());
         viewer->setCompositeRenderSettings(s);
@@ -1218,7 +1237,7 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     fCompositeViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CompositeView), this);
     fCompositeViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fCompositeViewShortcut, &QShortcut::activated, [this]() {
-        auto* viewer = segmentationViewer();
+        auto* viewer = segmentationBaseViewer();
         if (!viewer) {
             return;
         }
@@ -1239,7 +1258,7 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
         bool next = !current;
         settings.setValue(viewer::SHOW_DIRECTION_HINTS, next ? "1" : "0");
         if (_viewerManager) {
-            _viewerManager->forEachViewer([next](CTiledVolumeViewer* viewer) {
+            _viewerManager->forEachBaseViewer([next](VolumeViewerBase* viewer) {
                 if (viewer) {
                     viewer->setShowDirectionHints(next);
                 }
@@ -1257,7 +1276,7 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
         bool next = !current;
         settings.setValue(viewer::SHOW_SURFACE_NORMALS, next ? "1" : "0");
         if (_viewerManager) {
-            _viewerManager->forEachViewer([next](CTiledVolumeViewer* viewer) {
+            _viewerManager->forEachBaseViewer([next](VolumeViewerBase* viewer) {
                 if (viewer) {
                     viewer->setShowSurfaceNormals(next);
                 }
@@ -1293,22 +1312,16 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     fZoomInShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ZoomIn), this);
     fZoomInShortcut->setContext(Qt::ApplicationShortcut);
     connect(fZoomInShortcut, &QShortcut::activated, [this]() {
-        if (!mdiArea) return;
-        if (auto* subWindow = mdiArea->activeSubWindow()) {
-            if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
-                viewer->adjustZoomByFactor(ZOOM_FACTOR);
-            }
+        if (auto* viewer = activeBaseViewer()) {
+            viewer->adjustZoomByFactor(ZOOM_FACTOR);
         }
     });
 
     fZoomOutShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ZoomOut), this);
     fZoomOutShortcut->setContext(Qt::ApplicationShortcut);
     connect(fZoomOutShortcut, &QShortcut::activated, [this]() {
-        if (!mdiArea) return;
-        if (auto* subWindow = mdiArea->activeSubWindow()) {
-            if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
-                viewer->adjustZoomByFactor(1.0f / ZOOM_FACTOR);
-            }
+        if (auto* viewer = activeBaseViewer()) {
+            viewer->adjustZoomByFactor(1.0f / ZOOM_FACTOR);
         }
     });
 
@@ -1316,13 +1329,10 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     fResetViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ResetView), this);
     fResetViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fResetViewShortcut, &QShortcut::activated, [this]() {
-        if (!mdiArea) return;
-        if (auto* subWindow = mdiArea->activeSubWindow()) {
-            if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
-                viewer->resetSurfaceOffsets();
-                viewer->fitSurfaceInView();
-                viewer->renderVisible(true);
-            }
+        if (auto* viewer = activeBaseViewer()) {
+            viewer->resetSurfaceOffsets();
+            viewer->fitSurfaceInView();
+            viewer->renderVisible(true);
         }
     });
 
@@ -1330,22 +1340,16 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     fWorldOffsetZPosShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::WorldOffsetZPos), this);
     fWorldOffsetZPosShortcut->setContext(Qt::ApplicationShortcut);
     connect(fWorldOffsetZPosShortcut, &QShortcut::activated, [this]() {
-        if (!mdiArea) return;
-        if (auto* subWindow = mdiArea->activeSubWindow()) {
-            if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
-                viewer->adjustSurfaceOffset(1.0f);
-            }
+        if (auto* viewer = activeBaseViewer()) {
+            viewer->adjustSurfaceOffset(1.0f);
         }
     });
 
     fWorldOffsetZNegShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::WorldOffsetZNeg), this);
     fWorldOffsetZNegShortcut->setContext(Qt::ApplicationShortcut);
     connect(fWorldOffsetZNegShortcut, &QShortcut::activated, [this]() {
-        if (!mdiArea) return;
-        if (auto* subWindow = mdiArea->activeSubWindow()) {
-            if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
-                viewer->adjustSurfaceOffset(-1.0f);
-            }
+        if (auto* viewer = activeBaseViewer()) {
+            viewer->adjustSurfaceOffset(-1.0f);
         }
     });
 
@@ -1550,6 +1554,31 @@ CTiledVolumeViewer* CWindow::segmentationViewer() const
         }
     }
     return nullptr;
+}
+
+VolumeViewerBase* CWindow::segmentationBaseViewer() const
+{
+    if (!_viewerManager) {
+        return nullptr;
+    }
+    for (auto* viewer : _viewerManager->baseViewers()) {
+        if (viewer && viewer->surfName() == "segmentation") {
+            return viewer;
+        }
+    }
+    return nullptr;
+}
+
+VolumeViewerBase* CWindow::activeBaseViewer() const
+{
+    if (!mdiArea) {
+        return nullptr;
+    }
+    auto* subWindow = mdiArea->activeSubWindow();
+    if (!subWindow) {
+        return nullptr;
+    }
+    return baseViewerFromWidget(subWindow->widget());
 }
 
 void CWindow::clearSurfaceSelection()
@@ -2601,7 +2630,7 @@ void CWindow::recenterPlaneViewersOn(const cv::Vec3f& position)
         return;
     }
 
-    _viewerManager->forEachViewer([&position](CTiledVolumeViewer* viewer) {
+    _viewerManager->forEachBaseViewer([&position](VolumeViewerBase* viewer) {
         if (!viewer) {
             return;
         }
@@ -2662,7 +2691,7 @@ bool CWindow::recenterViewersOnCurrentFocus()
     }
 
     const cv::Vec3f position = focus->p;
-    _viewerManager->forEachViewer([&position](CTiledVolumeViewer* viewer) {
+    _viewerManager->forEachBaseViewer([&position](VolumeViewerBase* viewer) {
         if (viewer) {
             viewer->centerOnVolumePoint(position, true);
         }
@@ -2678,12 +2707,18 @@ bool CWindow::centerFocusOnCursor()
     }
 
     const QPoint globalPos = QCursor::pos();
-    auto tryCenterFromViewer = [&](CTiledVolumeViewer* viewer) -> bool {
-        if (!viewer || !viewer->isVisible()) {
+    auto tryCenterFromViewer = [&](VolumeViewerBase* viewer) -> bool {
+        if (!viewer) {
             return false;
         }
 
-        auto* gv = viewer->fGraphicsView;
+        auto* viewerObject = viewer->asQObject();
+        auto* viewerWidget = qobject_cast<QWidget*>(viewerObject);
+        if (viewerWidget && !viewerWidget->isVisible()) {
+            return false;
+        }
+
+        auto* gv = viewer->graphicsView();
         auto* viewport = gv ? gv->viewport() : nullptr;
         if (!viewport) {
             return false;
@@ -2694,10 +2729,11 @@ bool CWindow::centerFocusOnCursor()
             return false;
         }
 
-        cv::Vec3f p, n;
         const QPointF scenePos = gv->mapToScene(viewportPos);
-        if (!viewer->sceneToVolumePN(p, n, scenePos)) {
-            return false;
+        cv::Vec3f p = viewer->sceneToVolume(scenePos);
+        cv::Vec3f n(0, 0, 1);
+        if (auto* plane = dynamic_cast<PlaneSurface*>(viewer->currentSurface())) {
+            n = plane->normal(cv::Vec3f(0, 0, 0), {});
         }
 
         return centerFocusAt(p, n, viewer->surfName());
@@ -2708,7 +2744,7 @@ bool CWindow::centerFocusOnCursor()
     // makes the focus jump use the wrong scene transform.
     if (QWidget* hoveredWidget = QApplication::widgetAt(globalPos)) {
         for (QWidget* widget = hoveredWidget; widget; widget = widget->parentWidget()) {
-            if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(widget)) {
+            if (auto* viewer = baseViewerFromWidget(widget)) {
                 if (tryCenterFromViewer(viewer)) {
                     return true;
                 }
@@ -2718,7 +2754,7 @@ bool CWindow::centerFocusOnCursor()
     }
 
     if (_viewerManager) {
-        for (auto* viewer : _viewerManager->viewers()) {
+        for (auto* viewer : _viewerManager->baseViewers()) {
             if (tryCenterFromViewer(viewer)) {
                 return true;
             }
@@ -2728,7 +2764,7 @@ bool CWindow::centerFocusOnCursor()
     // Fall back to the active viewer if the cursor isn't currently over any
     // tiled viewport.
     if (auto* subWindow = mdiArea->activeSubWindow()) {
-        if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
+        if (auto* viewer = baseViewerFromWidget(subWindow->widget())) {
             if (tryCenterFromViewer(viewer)) {
                 return true;
             }
@@ -3760,9 +3796,9 @@ void CWindow::CreateWidgets(void)
         connect(cmbInterp, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int idx) {
             QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
             s.setValue(vc3d::settings::perf::INTERPOLATION_METHOD, idx);
-            _viewerManager->forEachViewer([](CTiledVolumeViewer* v) {
+            _viewerManager->forEachBaseViewer([](VolumeViewerBase* v) {
                 v->reloadPerfSettings();
-                v->update();
+                v->renderVisible(true);
             });
         });
         viewExtrasLayout->addWidget(interpWidget);
@@ -3782,7 +3818,7 @@ void CWindow::CreateWidgets(void)
             QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
             s.setValue("viewer_controls/highlight_downscaled", on);
             if (_viewerManager) {
-                _viewerManager->forEachViewer([](CTiledVolumeViewer* v) {
+                _viewerManager->forEachBaseViewer([](VolumeViewerBase* v) {
                     v->reloadPerfSettings();
                     v->renderVisible(true);
                 });
@@ -3810,7 +3846,7 @@ void CWindow::CreateWidgets(void)
                 QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
                 s.setValue(settingsKey, v);
                 if (_viewerManager) {
-                    _viewerManager->forEachViewer([](CTiledVolumeViewer* v) {
+                    _viewerManager->forEachBaseViewer([](VolumeViewerBase* v) {
                         v->reloadPerfSettings();
                     });
                 }
@@ -3927,7 +3963,7 @@ void CWindow::CreateWidgets(void)
     connect(ui.baseColormapSelect, qOverload<int>(&QComboBox::currentIndexChanged), [this](int index) {
         if (index < 0 || !_viewerManager) return;
         const QString id = ui.baseColormapSelect->currentData().toString();
-        _viewerManager->forEachViewer([&id](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([&id](VolumeViewerBase* viewer) {
             viewer->setBaseColormap(id.toStdString());
         });
     });
@@ -3935,7 +3971,7 @@ void CWindow::CreateWidgets(void)
     // Setup surface overlay controls
     connect(ui.chkSurfaceOverlay, &QCheckBox::toggled, [this](bool checked) {
         if (!_viewerManager) return;
-        _viewerManager->forEachViewer([checked](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([checked](VolumeViewerBase* viewer) {
             viewer->setSurfaceOverlayEnabled(checked);
         });
         ui.surfaceOverlaySelect->setEnabled(checked);
@@ -3944,7 +3980,7 @@ void CWindow::CreateWidgets(void)
 
     connect(ui.spinOverlapThreshold, qOverload<double>(&QDoubleSpinBox::valueChanged), [this](double value) {
         if (!_viewerManager) return;
-        _viewerManager->forEachViewer([value](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([value](VolumeViewerBase* viewer) {
             viewer->setSurfaceOverlapThreshold(static_cast<float>(value));
         });
     });
@@ -4084,7 +4120,7 @@ void CWindow::CreateWidgets(void)
             QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
             s.setValue(viewer::SHOW_SURFACE_NORMALS, checked ? "1" : "0");
             if (_viewerManager) {
-                _viewerManager->forEachViewer([checked](CTiledVolumeViewer* viewer) {
+                _viewerManager->forEachBaseViewer([checked](VolumeViewerBase* viewer) {
                     if (viewer) {
                         viewer->setShowSurfaceNormals(checked);
                     }
@@ -4126,7 +4162,7 @@ void CWindow::CreateWidgets(void)
 
         float scaleFloat = static_cast<float>(savedScale) / 100.0f;
         if (_viewerManager) {
-            _viewerManager->forEachViewer([scaleFloat](CTiledVolumeViewer* viewer) {
+            _viewerManager->forEachBaseViewer([scaleFloat](VolumeViewerBase* viewer) {
                 if (viewer) {
                     viewer->setNormalArrowLengthScale(scaleFloat);
                 }
@@ -4144,7 +4180,7 @@ void CWindow::CreateWidgets(void)
 
             float scaleFloat = static_cast<float>(value) / 100.0f;
             if (_viewerManager) {
-                _viewerManager->forEachViewer([scaleFloat](CTiledVolumeViewer* viewer) {
+                _viewerManager->forEachBaseViewer([scaleFloat](VolumeViewerBase* viewer) {
                     if (viewer) {
                         viewer->setNormalArrowLengthScale(scaleFloat);
                     }
@@ -4165,7 +4201,7 @@ void CWindow::CreateWidgets(void)
         }
 
         if (_viewerManager) {
-            _viewerManager->forEachViewer([savedMaxArrows](CTiledVolumeViewer* viewer) {
+            _viewerManager->forEachBaseViewer([savedMaxArrows](VolumeViewerBase* viewer) {
                 if (viewer) {
                     viewer->setNormalMaxArrows(savedMaxArrows);
                 }
@@ -4182,7 +4218,7 @@ void CWindow::CreateWidgets(void)
             }
 
             if (_viewerManager) {
-                _viewerManager->forEachViewer([value](CTiledVolumeViewer* viewer) {
+                _viewerManager->forEachBaseViewer([value](VolumeViewerBase* viewer) {
                     if (viewer) {
                         viewer->setNormalMaxArrows(value);
                     }
@@ -4433,7 +4469,7 @@ void CWindow::CreateWidgets(void)
     connect(ui.btnAppendMask, &QPushButton::pressed, this, &CWindow::onAppendMaskPressed);  // Add this
     // Connect composite view controls
     connect(ui.chkCompositeEnabled, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.enabled = checked;
             viewer->setCompositeRenderSettings(s);
@@ -4445,7 +4481,7 @@ void CWindow::CreateWidgets(void)
             return;
         }
         const std::string method = compositeMethodForModeIndex(index);
-        _viewerManager->forEachViewer([&method](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([&method](VolumeViewerBase* viewer) {
             if (!viewer) {
                 return;
             }
@@ -4467,7 +4503,7 @@ void CWindow::CreateWidgets(void)
 
     // Connect Layers In Front controls
     connect(ui.spinLayersInFront, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.layersFront = value;
             viewer->setCompositeRenderSettings(s);
@@ -4476,7 +4512,7 @@ void CWindow::CreateWidgets(void)
 
     // Connect Layers Behind controls
     connect(ui.spinLayersBehind, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.layersBehind = value;
             viewer->setCompositeRenderSettings(s);
@@ -4485,7 +4521,7 @@ void CWindow::CreateWidgets(void)
 
     // Connect Alpha Min controls
     connect(ui.spinAlphaMin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.alphaMin = value / 255.0f;
             viewer->setCompositeRenderSettings(s);
@@ -4494,7 +4530,7 @@ void CWindow::CreateWidgets(void)
 
     // Connect Alpha Max controls
     connect(ui.spinAlphaMax, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.alphaMax = value / 255.0f;
             viewer->setCompositeRenderSettings(s);
@@ -4503,7 +4539,7 @@ void CWindow::CreateWidgets(void)
 
     // Connect Alpha Threshold controls
     connect(ui.spinAlphaThreshold, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.alphaCutoff = value / 10000.0f;
             viewer->setCompositeRenderSettings(s);
@@ -4512,7 +4548,7 @@ void CWindow::CreateWidgets(void)
 
     // Connect Material controls
     connect(ui.spinMaterial, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.alphaOpacity = value / 255.0f;
             viewer->setCompositeRenderSettings(s);
@@ -4521,7 +4557,7 @@ void CWindow::CreateWidgets(void)
 
     // Connect Reverse Direction control
     connect(ui.chkReverseDirection, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.reverseDirection = checked;
             viewer->setCompositeRenderSettings(s);
@@ -4530,7 +4566,7 @@ void CWindow::CreateWidgets(void)
 
     // Connect Beer-Lambert Extinction control
     connect(ui.spinBLExtinction, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.blExtinction = static_cast<float>(value);
             viewer->setCompositeRenderSettings(s);
@@ -4539,7 +4575,7 @@ void CWindow::CreateWidgets(void)
 
     // Connect Beer-Lambert Emission control
     connect(ui.spinBLEmission, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.blEmission = static_cast<float>(value);
             viewer->setCompositeRenderSettings(s);
@@ -4548,7 +4584,7 @@ void CWindow::CreateWidgets(void)
 
     // Connect Beer-Lambert Ambient control
     connect(ui.spinBLAmbient, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.blAmbient = static_cast<float>(value);
             viewer->setCompositeRenderSettings(s);
@@ -4557,7 +4593,7 @@ void CWindow::CreateWidgets(void)
 
     // Connect Lighting Enable control
     connect(ui.chkLightingEnabled, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.lightingEnabled = checked;
             viewer->setCompositeRenderSettings(s);
@@ -4566,7 +4602,7 @@ void CWindow::CreateWidgets(void)
 
     // Connect Light Azimuth control
     connect(ui.spinLightAzimuth, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.lightAzimuth = static_cast<float>(value);
             s.params.updateLightDir();
@@ -4576,7 +4612,7 @@ void CWindow::CreateWidgets(void)
 
     // Connect Light Elevation control
     connect(ui.spinLightElevation, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.lightElevation = static_cast<float>(value);
             s.params.updateLightDir();
@@ -4586,7 +4622,7 @@ void CWindow::CreateWidgets(void)
 
     // Connect Light Diffuse control
     connect(ui.spinLightDiffuse, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.lightDiffuse = static_cast<float>(value);
             viewer->setCompositeRenderSettings(s);
@@ -4595,7 +4631,7 @@ void CWindow::CreateWidgets(void)
 
     // Connect Light Ambient control
     connect(ui.spinLightAmbient, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.lightAmbient = static_cast<float>(value);
             viewer->setCompositeRenderSettings(s);
@@ -4605,7 +4641,7 @@ void CWindow::CreateWidgets(void)
     // Connect Volume Gradients checkbox — switches the lighting normal
     // source between mesh-interpolated (0) and per-sample volume gradient (1).
     connect(ui.chkUseVolumeGradients, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.useVolumeGradients = checked;
             s.params.lightNormalSource = checked ? 1 : 0;
@@ -4615,7 +4651,7 @@ void CWindow::CreateWidgets(void)
 
     // Connect Shadow Steps spinbox (Volumetric method)
     connect(ui.spinShadowSteps, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.shadowSteps = std::clamp(value, 1, 64);
             viewer->setCompositeRenderSettings(s);
@@ -4624,14 +4660,14 @@ void CWindow::CreateWidgets(void)
 
     // Per-ray layer preprocess (applied to N composite samples before composite method)
     connect(ui.chkPreNormalizeLayers, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.preNormalizeLayers = checked;
             viewer->setCompositeRenderSettings(s);
         }
     });
     connect(ui.chkPreHistEqLayers, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.params.preHistEqLayers = checked;
             viewer->setCompositeRenderSettings(s);
@@ -4641,7 +4677,7 @@ void CWindow::CreateWidgets(void)
     // Pre-TF / Post-TF: 4-knot piecewise-linear LUTs. Endpoints (0,0) and
     // (255,255) are fixed; only the two middle knots are editable.
     auto applyTfParam = [this](auto&& mutate) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             mutate(s.params);
             viewer->setCompositeRenderSettings(s);
@@ -4682,7 +4718,7 @@ void CWindow::CreateWidgets(void)
         if (!_viewerManager) {
             return;
         }
-        _viewerManager->forEachViewer([value](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([value](VolumeViewerBase* viewer) {
             auto s = viewer->compositeRenderSettings();
             s.params.isoCutoff = static_cast<uint8_t>(std::clamp(value, 0, 255));
             viewer->setCompositeRenderSettings(s);
@@ -4817,7 +4853,7 @@ void CWindow::CreateWidgets(void)
     // Connect Plane Composite controls (separate enable for XY/XZ/YZ, shared layer counts)
     connect(ui.chkPlaneCompositeXY, &QCheckBox::toggled, this, [this](bool checked) {
         if (!_viewerManager) return;
-        for (auto* viewer : _viewerManager->viewers()) {
+        for (auto* viewer : _viewerManager->baseViewers()) {
             if (viewer->surfName() == "xy plane") {
                 auto s = viewer->compositeRenderSettings();
                 s.planeEnabled = checked;
@@ -4828,7 +4864,7 @@ void CWindow::CreateWidgets(void)
 
     connect(ui.chkPlaneCompositeXZ, &QCheckBox::toggled, this, [this](bool checked) {
         if (!_viewerManager) return;
-        for (auto* viewer : _viewerManager->viewers()) {
+        for (auto* viewer : _viewerManager->baseViewers()) {
             if (viewer->surfName() == "seg xz") {
                 auto s = viewer->compositeRenderSettings();
                 s.planeEnabled = checked;
@@ -4839,7 +4875,7 @@ void CWindow::CreateWidgets(void)
 
     connect(ui.chkPlaneCompositeYZ, &QCheckBox::toggled, this, [this](bool checked) {
         if (!_viewerManager) return;
-        for (auto* viewer : _viewerManager->viewers()) {
+        for (auto* viewer : _viewerManager->baseViewers()) {
             if (viewer->surfName() == "seg yz") {
                 auto s = viewer->compositeRenderSettings();
                 s.planeEnabled = checked;
@@ -4855,7 +4891,7 @@ void CWindow::CreateWidgets(void)
     connect(ui.spinPlaneLayersFront, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, isPlaneViewer](int value) {
         if (!_viewerManager) return;
         int behind = ui.spinPlaneLayersBehind->value();
-        for (auto* viewer : _viewerManager->viewers()) {
+        for (auto* viewer : _viewerManager->baseViewers()) {
             if (isPlaneViewer(viewer->surfName())) {
                 auto s = viewer->compositeRenderSettings();
                 s.planeLayersFront = std::max(0, value);
@@ -4868,7 +4904,7 @@ void CWindow::CreateWidgets(void)
     connect(ui.spinPlaneLayersBehind, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, isPlaneViewer](int value) {
         if (!_viewerManager) return;
         int front = ui.spinPlaneLayersFront->value();
-        for (auto* viewer : _viewerManager->viewers()) {
+        for (auto* viewer : _viewerManager->baseViewers()) {
             if (isPlaneViewer(viewer->surfName())) {
                 auto s = viewer->compositeRenderSettings();
                 s.planeLayersFront = std::max(0, front);
@@ -4880,7 +4916,7 @@ void CWindow::CreateWidgets(void)
 
     // Connect Postprocessing controls
     connect(ui.chkStretchValuesPost, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.postStretchValues = checked;
             viewer->setCompositeRenderSettings(s);
@@ -4888,7 +4924,7 @@ void CWindow::CreateWidgets(void)
     });
 
     connect(ui.chkRemoveSmallComponents, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.postRemoveSmallComponents = checked;
             viewer->setCompositeRenderSettings(s);
@@ -4899,7 +4935,7 @@ void CWindow::CreateWidgets(void)
     });
 
     connect(ui.spinMinComponentSize, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationViewer()) {
+        if (auto* viewer = segmentationBaseViewer()) {
             auto s = viewer->compositeRenderSettings();
             s.postMinComponentSize = std::clamp(value, 1, 100000);
             viewer->setCompositeRenderSettings(s);
@@ -4922,7 +4958,7 @@ void CWindow::CreateWidgets(void)
     connect(ui.chkClaheEnabled, &QCheckBox::toggled, this, [this, setClaheEnabled](bool checked) {
         setClaheEnabled(checked);
         if (!_viewerManager) return;
-        _viewerManager->forEachViewer([checked](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([checked](VolumeViewerBase* viewer) {
             auto s = viewer->compositeRenderSettings();
             s.postClaheEnabled = checked;
             viewer->setCompositeRenderSettings(s);
@@ -4931,7 +4967,7 @@ void CWindow::CreateWidgets(void)
 
     connect(ui.spinClaheClipLimit, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
         if (!_viewerManager) return;
-        _viewerManager->forEachViewer([value](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([value](VolumeViewerBase* viewer) {
             auto s = viewer->compositeRenderSettings();
             s.postClaheClipLimit = static_cast<float>(value);
             viewer->setCompositeRenderSettings(s);
@@ -4940,7 +4976,7 @@ void CWindow::CreateWidgets(void)
 
     connect(ui.spinClaheTileSize, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
         if (!_viewerManager) return;
-        _viewerManager->forEachViewer([value](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([value](VolumeViewerBase* viewer) {
             auto s = viewer->compositeRenderSettings();
             s.postClaheTileSize = std::clamp(value, 2, 64);
             viewer->setCompositeRenderSettings(s);
@@ -4963,7 +4999,7 @@ void CWindow::CreateWidgets(void)
     connect(ui.chkRakingEnabled, &QCheckBox::toggled, this, [this, setRakingEnabled](bool checked) {
         setRakingEnabled(checked);
         if (!_viewerManager) return;
-        _viewerManager->forEachViewer([checked](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([checked](VolumeViewerBase* viewer) {
             auto s = viewer->compositeRenderSettings();
             s.postRakingEnabled = checked;
             viewer->setCompositeRenderSettings(s);
@@ -4971,7 +5007,7 @@ void CWindow::CreateWidgets(void)
     });
     connect(ui.spinRakingAzimuth, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
         if (!_viewerManager) return;
-        _viewerManager->forEachViewer([v](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([v](VolumeViewerBase* viewer) {
             auto s = viewer->compositeRenderSettings();
             s.postRakingAzimuth = float(v);
             viewer->setCompositeRenderSettings(s);
@@ -4979,7 +5015,7 @@ void CWindow::CreateWidgets(void)
     });
     connect(ui.spinRakingElevation, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
         if (!_viewerManager) return;
-        _viewerManager->forEachViewer([v](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([v](VolumeViewerBase* viewer) {
             auto s = viewer->compositeRenderSettings();
             s.postRakingElevation = float(v);
             viewer->setCompositeRenderSettings(s);
@@ -4987,7 +5023,7 @@ void CWindow::CreateWidgets(void)
     });
     connect(ui.spinRakingStrength, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
         if (!_viewerManager) return;
-        _viewerManager->forEachViewer([v](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([v](VolumeViewerBase* viewer) {
             auto s = viewer->compositeRenderSettings();
             s.postRakingStrength = std::clamp(float(v), 0.0f, 1.0f);
             viewer->setCompositeRenderSettings(s);
@@ -4995,7 +5031,7 @@ void CWindow::CreateWidgets(void)
     });
     connect(ui.spinRakingDepthScale, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
         if (!_viewerManager) return;
-        _viewerManager->forEachViewer([v](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([v](VolumeViewerBase* viewer) {
             auto s = viewer->compositeRenderSettings();
             s.postRakingDepthScale = std::max(0.01f, float(v));
             viewer->setCompositeRenderSettings(s);
@@ -5006,7 +5042,7 @@ void CWindow::CreateWidgets(void)
     bool resetViewOnSurfaceChange = settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
                                                    vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
     if (_viewerManager) {
-        for (auto* viewer : _viewerManager->viewers()) {
+        for (auto* viewer : _viewerManager->baseViewers()) {
             viewer->setResetViewOnSurfaceChange(resetViewOnSurfaceChange);
             _viewerManager->setResetDefaultFor(viewer, resetViewOnSurfaceChange);
         }
@@ -5699,7 +5735,7 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSu
                 if (targetSurface) {
                     _segmentationModule->endEditingSession();
                     if (_segmentationModule->beginEditingSession(targetSurface) && _viewerManager) {
-                        _viewerManager->forEachViewer([](CTiledVolumeViewer* viewer) {
+                        _viewerManager->forEachBaseViewer([](VolumeViewerBase* viewer) {
                             if (viewer) {
                                 viewer->clearOverlayGroup("segmentation_radius_indicator");
                             }
@@ -6004,20 +6040,9 @@ void CWindow::onManualLocationChanged()
 
 void CWindow::onZoomIn()
 {
-    // Get the active sub-window
-    QMdiSubWindow* activeWindow = mdiArea->activeSubWindow();
-    if (!activeWindow) return;
-
-    // Get the viewer from the active window
-    CTiledVolumeViewer* viewer = qobject_cast<CTiledVolumeViewer*>(activeWindow->widget());
-    if (!viewer) return;
-
-    // Get the center of the current view as the zoom point
-    QPointF center = viewer->fGraphicsView->mapToScene(
-        viewer->fGraphicsView->viewport()->rect().center());
-
-    // Trigger zoom in (positive steps)
-    viewer->onZoom(1, center, Qt::NoModifier);
+    if (auto* viewer = activeBaseViewer()) {
+        viewer->adjustZoomByFactor(1.15f);
+    }
 }
 
 void CWindow::onFocusPOIChanged(std::string name, POI* poi)
@@ -6109,20 +6134,9 @@ void CWindow::onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId)
 
 void CWindow::onZoomOut()
 {
-    // Get the active sub-window
-    QMdiSubWindow* activeWindow = mdiArea->activeSubWindow();
-    if (!activeWindow) return;
-
-    // Get the viewer from the active window
-    CTiledVolumeViewer* viewer = qobject_cast<CTiledVolumeViewer*>(activeWindow->widget());
-    if (!viewer) return;
-
-    // Get the center of the current view as the zoom point
-    QPointF center = viewer->fGraphicsView->mapToScene(
-        viewer->fGraphicsView->viewport()->rect().center());
-
-    // Trigger zoom out (negative steps)
-    viewer->onZoom(-1, center, Qt::NoModifier);
+    if (auto* viewer = activeBaseViewer()) {
+        viewer->adjustZoomByFactor(1.0f / 1.15f);
+    }
 }
 
 void CWindow::onCopyCoordinates()
@@ -6197,7 +6211,7 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
 
     // Set flag BEFORE beginEditingSession so the surface change doesn't reset view
     if (_viewerManager) {
-        _viewerManager->forEachViewer([this, enabled](CTiledVolumeViewer* viewer) {
+        _viewerManager->forEachBaseViewer([this, enabled](VolumeViewerBase* viewer) {
             if (!viewer) {
                 return;
             }
@@ -6226,7 +6240,7 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
         }
 
         if (_viewerManager) {
-            _viewerManager->forEachViewer([](CTiledVolumeViewer* viewer) {
+            _viewerManager->forEachBaseViewer([](VolumeViewerBase* viewer) {
                 if (viewer) {
                     viewer->clearOverlayGroup("segmentation_radius_indicator");
                 }
@@ -6425,7 +6439,7 @@ void CWindow::onSurfaceOverlaySelectionChanged(const QModelIndex& topLeft,
     }
 
     // Propagate to all viewers
-    _viewerManager->forEachViewer([&selectedSurfaces](CTiledVolumeViewer* viewer) {
+    _viewerManager->forEachBaseViewer([&selectedSurfaces](VolumeViewerBase* viewer) {
         viewer->setSurfaceOverlays(selectedSurfaces);
     });
 }

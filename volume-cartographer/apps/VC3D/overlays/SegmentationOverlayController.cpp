@@ -1361,7 +1361,7 @@ void SegmentationOverlayController::invalidatePlaneIntersections()
         return;
     }
 
-    _viewerManager->forEachViewer([](CTiledVolumeViewer* viewer) {
+    _viewerManager->forEachBaseViewer([](VolumeViewerBase* viewer) {
         if (!viewer) {
             return;
         }

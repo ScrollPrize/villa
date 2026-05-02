@@ -95,8 +95,8 @@ public:
     void primeSurfacePatchIndicesAsync();
     void resetStrideUserOverride() {}
 
-    bool resetDefaultFor(CTiledVolumeViewer* viewer) const;
-    void setResetDefaultFor(CTiledVolumeViewer* viewer, bool value);
+    bool resetDefaultFor(VolumeViewerBase* viewer) const;
+    void setResetDefaultFor(VolumeViewerBase* viewer, bool value);
 
     void setSegmentationCursorMirroring(bool enabled);
     bool segmentationCursorMirroring() const { return _mirrorCursorToSegmentation; }
@@ -177,7 +177,7 @@ private:
     SegmentationModule* _segmentationModule{nullptr};
     std::vector<CTiledVolumeViewer*> _viewers;
     std::vector<VolumeViewerBase*> _baseViewers;
-    std::unordered_map<CTiledVolumeViewer*, bool> _resetDefaults;
+    std::unordered_map<VolumeViewerBase*, bool> _resetDefaults;
     float _intersectionOpacity{1.0f};
     float _intersectionThickness{0.0f};
     std::shared_ptr<Volume> _overlayVolume;

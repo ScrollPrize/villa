@@ -246,14 +246,14 @@ void TransformOverlayController::setViewerManager(ViewerManager* manager)
         return;
     }
 
-    _viewerCreatedConn = QObject::connect(_viewerManager, &ViewerManager::viewerCreated,
+    _viewerCreatedConn = QObject::connect(_viewerManager, &ViewerManager::baseViewerCreated,
                                           this, [this](auto* viewer) { attachViewer(viewer); });
     _managerDestroyedConn = QObject::connect(_viewerManager, &QObject::destroyed,
                                              this, [this]() {
                                                  clearWidgets();
                                                  _viewerManager = nullptr;
                                              });
-    _viewerManager->forEachViewer([this](auto* viewer) { attachViewer(viewer); });
+    _viewerManager->forEachBaseViewer([this](auto* viewer) { attachViewer(viewer); });
 }
 
 void TransformOverlayController::beginRotate()
@@ -339,7 +339,7 @@ VolumeViewerBase* TransformOverlayController::targetViewer() const
     }
 
     VolumeViewerBase* fallback = nullptr;
-    for (auto* viewer : _viewerManager->viewers()) {
+    for (auto* viewer : _viewerManager->baseViewers()) {
         if (!viewer) {
             continue;
         }

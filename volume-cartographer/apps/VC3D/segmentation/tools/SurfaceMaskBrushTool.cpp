@@ -556,7 +556,7 @@ void SurfaceMaskBrushTool::refreshSurfacePatchIndex(const cv::Rect& changedRegio
 void SurfaceMaskBrushTool::invalidateViewers()
 {
     if (auto* manager = _module.viewerManager()) {
-        manager->forEachViewer([](CTiledVolumeViewer* viewer) {
+        manager->forEachBaseViewer([](VolumeViewerBase* viewer) {
             if (viewer) {
                 viewer->invalidateIntersect();
                 viewer->renderIntersections();

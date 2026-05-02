@@ -636,7 +636,7 @@ void refreshSegmentationViewers(ViewerManager* manager)
         return;
     }
 
-    manager->forEachViewer([](CTiledVolumeViewer* viewer) {
+    manager->forEachBaseViewer([](VolumeViewerBase* viewer) {
         if (!viewer) {
             return;
         }
@@ -2841,10 +2841,10 @@ void SegmentationGrower::onFutureFinished()
         _context.module->requestAutosaveFromGrowth();
     }
 
-    std::vector<std::pair<CTiledVolumeViewer*, bool>> resetDefaults;
+    std::vector<std::pair<VolumeViewerBase*, bool>> resetDefaults;
     if (_context.viewerManager) {
         ViewerManager* manager = _context.viewerManager;
-        manager->forEachViewer([manager, &resetDefaults](CTiledVolumeViewer* viewer) {
+        manager->forEachBaseViewer([manager, &resetDefaults](VolumeViewerBase* viewer) {
             if (!viewer || viewer->surfName() != "segmentation") {
                 return;
             }
