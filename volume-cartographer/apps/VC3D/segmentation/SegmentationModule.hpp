@@ -395,7 +395,7 @@ private:
     CState* _state{nullptr};
     VCCollection* _pointCollection{nullptr};
 
-    bool _annotateMode{true};
+    bool _annotateMode{false};
     bool _editingEnabled{false};
     float _dragRadiusSteps{5.0f};
     float _dragSigmaSteps{2.0f};

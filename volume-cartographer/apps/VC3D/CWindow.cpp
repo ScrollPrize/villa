@@ -2363,6 +2363,9 @@ auto CWindow::InitializeVolumePkg(const std::string& nVpkgPath) -> bool
     if (_segmentationModule && _segmentationModule->editingEnabled()) {
         _segmentationModule->setEditingEnabled(false);
     }
+    if (_segmentationModule) {
+        _segmentationModule->setAnnotateMode(false);
+    }
     if (_segmentationWidget) {
         if (!_segmentationModule || _segmentationWidget->isEditingEnabled()) {
             _segmentationWidget->setEditingEnabled(false);
