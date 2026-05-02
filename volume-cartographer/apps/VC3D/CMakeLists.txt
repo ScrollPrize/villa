@@ -111,8 +111,6 @@ set(srcs
     SurfacePanelController.hpp
     MenuActionController.cpp
     MenuActionController.hpp
-    S3BrowserDialog.cpp
-    S3BrowserDialog.hpp
     segmentation/SegmentationModule.cpp
     segmentation/SegmentationModule.hpp
     segmentation/growth/SegmentationCorrections.cpp
