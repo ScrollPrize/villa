@@ -15,9 +15,6 @@
 #include <vector>
 
 #include <opencv2/core.hpp>
-
-// Include for PathPrimitive type. No circular dependency because
-// ViewerOverlayControllerBase.hpp only forward-declares VolumeViewerBase.
 #include "overlays/ViewerOverlayControllerBase.hpp"
 #include "vc/core/util/Compositing.hpp"
 
