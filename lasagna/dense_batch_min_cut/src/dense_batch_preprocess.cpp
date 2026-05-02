@@ -1997,6 +1997,10 @@ class Dinic {
 struct DenseFlowResult {
     cv::Mat dense_flow;
     cv::Mat ambient_flow;
+    cv::Mat voronoi_tree_flow;
+    cv::Mat voronoi_tree_flow_gray_bg;
+    cv::Mat tree_dense_flow;
+    cv::Mat tree_flow_attn;
     cv::Mat flow_attn;
     cv::Mat graph_edge_flow;
     cv::Mat graph_edge_flow_gray_bg;
@@ -2204,9 +2208,12 @@ std::vector<cv::Point> order_edge_pixels(const GraphEdge& edge,
 DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                                           const cv::Mat& dt,
                                           const SkeletonGraph& graph,
+                                          const cv::Mat& source_pixel_ridges,
                                           const cv::Point source) {
     CV_Assert(white_domain.type() == CV_8U);
     CV_Assert(dt.type() == CV_32F);
+    CV_Assert(source_pixel_ridges.type() == CV_8U);
+    CV_Assert(source_pixel_ridges.size() == white_domain.size());
 
     if (source.x < 0 || source.x >= white_domain.cols || source.y < 0 ||
         source.y >= white_domain.rows) {
@@ -2518,6 +2525,194 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             }
         }
         timings.push_back(finish_timing("graph_edge_point_flow", timing));
+    }
+
+    cv::Mat tree_pixel_flow(white_domain.size(), CV_32F, cv::Scalar(0));
+    cv::Mat tree_parent(white_domain.size(), CV_32SC2, cv::Scalar(-1, -1));
+    {
+        const TimingMark timing = start_timing();
+        cv::Mat tree_mask = cv::Mat::zeros(white_domain.size(), CV_8U);
+        for (int y = 0; y < white_domain.rows; ++y) {
+            for (int x = 0; x < white_domain.cols; ++x) {
+                if (white_domain.at<std::uint8_t>(y, x) != 0 &&
+                    source_pixel_ridges.at<std::uint8_t>(y, x) != 0) {
+                    tree_mask.at<std::uint8_t>(y, x) = 255;
+                }
+            }
+        }
+
+        cv::Mat graph_flow_mask = graph_pixel_flow > 0.0f;
+        cv::Mat graph_flow_dilated;
+        cv::dilate(graph_flow_mask, graph_flow_dilated, cv::Mat());
+
+        struct QueueItem {
+            float flow = 0.0f;
+            cv::Point pixel;
+            bool operator<(const QueueItem& other) const {
+                return flow < other.flow;
+            }
+        };
+        std::priority_queue<QueueItem> queue;
+        constexpr float kFlowEpsilon = 1.0e-4f;
+        for (int y = 0; y < tree_mask.rows; ++y) {
+            for (int x = 0; x < tree_mask.cols; ++x) {
+                if (tree_mask.at<std::uint8_t>(y, x) == 0 ||
+                    graph_flow_dilated.at<std::uint8_t>(y, x) == 0) {
+                    continue;
+                }
+                float best_flow = 0.0f;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int nx = x + dx;
+                        const int ny = y + dy;
+                        if (nx < 0 || nx >= graph_pixel_flow.cols || ny < 0 ||
+                            ny >= graph_pixel_flow.rows) {
+                            continue;
+                        }
+                        best_flow =
+                            std::max(best_flow,
+                                     graph_pixel_flow.at<float>(ny, nx));
+                    }
+                }
+                if (best_flow <= 0.0f) {
+                    continue;
+                }
+                const float rooted_flow =
+                    std::min(best_flow, capacity_from_dt(dt.at<float>(y, x)));
+                if (rooted_flow > tree_pixel_flow.at<float>(y, x) +
+                                      kFlowEpsilon) {
+                    tree_pixel_flow.at<float>(y, x) = rooted_flow;
+                    tree_parent.at<cv::Vec2i>(y, x) = cv::Vec2i(x, y);
+                    queue.push({rooted_flow, cv::Point(x, y)});
+                }
+            }
+        }
+        timings.push_back(finish_timing("voronoi_tree_seed", timing));
+
+        const TimingMark propagate_timing = start_timing();
+        const std::array<cv::Point, 8> kDirs = {
+            cv::Point(-1, -1), cv::Point(0, -1), cv::Point(1, -1),
+            cv::Point(-1, 0),                    cv::Point(1, 0),
+            cv::Point(-1, 1),  cv::Point(0, 1),  cv::Point(1, 1)};
+        while (!queue.empty()) {
+            const QueueItem item = queue.top();
+            queue.pop();
+            if (item.flow + kFlowEpsilon <
+                tree_pixel_flow.at<float>(item.pixel.y, item.pixel.x)) {
+                continue;
+            }
+            for (const cv::Point dir : kDirs) {
+                const cv::Point next = item.pixel + dir;
+                if (next.x < 0 || next.x >= tree_mask.cols || next.y < 0 ||
+                    next.y >= tree_mask.rows ||
+                    tree_mask.at<std::uint8_t>(next.y, next.x) == 0) {
+                    continue;
+                }
+                const float candidate =
+                    std::min(item.flow,
+                             capacity_from_dt(dt.at<float>(next.y, next.x)));
+                if (candidate <=
+                    tree_pixel_flow.at<float>(next.y, next.x) +
+                        kFlowEpsilon) {
+                    continue;
+                }
+                tree_pixel_flow.at<float>(next.y, next.x) = candidate;
+                tree_parent.at<cv::Vec2i>(next.y, next.x) =
+                    cv::Vec2i(item.pixel.x, item.pixel.y);
+                queue.push({candidate, next});
+            }
+        }
+        timings.push_back(
+            finish_timing("voronoi_tree_propagate", propagate_timing));
+    }
+
+    cv::Mat tree_dense_flow(white_domain.size(), CV_32F, cv::Scalar(0));
+    {
+        const TimingMark timing = start_timing();
+        cv::Mat tree_source_mask(white_domain.size(), CV_8U, cv::Scalar(255));
+        for (int y = 0; y < tree_pixel_flow.rows; ++y) {
+            for (int x = 0; x < tree_pixel_flow.cols; ++x) {
+                if (tree_pixel_flow.at<float>(y, x) > 0.0f) {
+                    tree_source_mask.at<std::uint8_t>(y, x) = 0;
+                }
+            }
+        }
+
+        if (cv::countNonZero(tree_source_mask == 0) > 0) {
+            cv::Mat nearest_tree_distance;
+            cv::Mat nearest_tree_label;
+            cv::distanceTransform(tree_source_mask, nearest_tree_distance,
+                                  nearest_tree_label, cv::DIST_L2,
+                                  cv::DIST_MASK_5, cv::DIST_LABEL_PIXEL);
+            const std::vector<cv::Point> tree_source_points =
+                label_source_points(tree_source_mask, nearest_tree_label);
+            timings.push_back(finish_timing("voronoi_tree_nearest", timing));
+
+            const TimingMark dense_timing = start_timing();
+            constexpr float kTreeRadius = 300.0f;
+            constexpr float kFlowEpsilon = 1.0e-4f;
+            const auto step_distance = [](const cv::Point a,
+                                          const cv::Point b) {
+                const int dx = std::abs(a.x - b.x);
+                const int dy = std::abs(a.y - b.y);
+                return dx + dy == 2 ? static_cast<float>(std::sqrt(2.0))
+                                    : 1.0f;
+            };
+
+            for (int y = 0; y < white_domain.rows; ++y) {
+                for (int x = 0; x < white_domain.cols; ++x) {
+                    if (white_domain.at<std::uint8_t>(y, x) == 0) {
+                        continue;
+                    }
+                    const int label = nearest_tree_label.at<int>(y, x);
+                    if (label <= 0 ||
+                        label >= static_cast<int>(tree_source_points.size())) {
+                        continue;
+                    }
+                    const cv::Point tree_pixel = tree_source_points[label];
+                    if (tree_pixel.x < 0) {
+                        continue;
+                    }
+                    const float tree_flow =
+                        tree_pixel_flow.at<float>(tree_pixel.y,
+                                                    tree_pixel.x);
+                    if (tree_flow <= 0.0f) {
+                        continue;
+                    }
+
+                    const float lookup_distance =
+                        nearest_tree_distance.at<float>(y, x);
+                    float remaining =
+                        std::max(0.0f, kTreeRadius - lookup_distance);
+
+                    cv::Point current = tree_pixel;
+                    float endpoint_flow = tree_flow;
+                    while (remaining > kFlowEpsilon) {
+                        const cv::Vec2i parent_vec =
+                            tree_parent.at<cv::Vec2i>(current.y, current.x);
+                        const cv::Point parent(parent_vec[0], parent_vec[1]);
+                        if (parent.x < 0 || parent == current) {
+                            break;
+                        }
+                        const float step = step_distance(current, parent);
+                        const float segment = std::min(step, remaining);
+                        remaining -= segment;
+                        if (segment < step) {
+                            break;
+                        }
+                        endpoint_flow =
+                            tree_pixel_flow.at<float>(parent.y, parent.x);
+                        current = parent;
+                    }
+
+                    tree_dense_flow.at<float>(y, x) = endpoint_flow;
+                }
+            }
+            timings.push_back(finish_timing("tree_dense_flow", dense_timing));
+        } else {
+            timings.push_back(finish_timing("voronoi_tree_nearest", timing));
+            timings.push_back({"tree_dense_flow", 0.0, 0.0});
+        }
     }
 
     cv::Mat ambient_flow(white_domain.size(), CV_32F, cv::Scalar(0));
@@ -2930,6 +3125,12 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     cv::Mat edge_flow_px_gray_bg(white_domain.size(), CV_32FC3,
                                  cv::Scalar(127, 127, 127));
     cv::Mat flow_attn(white_domain.size(), CV_32FC3, cv::Scalar(0, 0, 0));
+    cv::Mat voronoi_tree_flow(white_domain.size(), CV_32FC3,
+                              cv::Scalar(0, 0, 0));
+    cv::Mat voronoi_tree_flow_gray_bg(white_domain.size(), CV_32FC3,
+                                      cv::Scalar(127, 127, 127));
+    cv::Mat tree_flow_attn(white_domain.size(), CV_32FC3,
+                           cv::Scalar(0, 0, 0));
     cv::Mat graph_source_edges(white_domain.size(), CV_8U, cv::Scalar(0));
     double max_edge_flow = 0.0;
     float finite_edge_flow_min = std::numeric_limits<float>::max();
@@ -2949,6 +3150,12 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     if (max_edge_flow <= 0.0) {
         max_edge_flow = 1.0;
     }
+    const auto flow_text = [&](double value) {
+        if (value >= static_cast<double>(kDenseFlowInf) * 0.5) {
+            return std::string("inf");
+        }
+        return format_scalar_value(value);
+    };
     for (int y = 0; y < graph_pixel_flow.rows; ++y) {
         for (int x = 0; x < graph_pixel_flow.cols; ++x) {
             const float value = graph_pixel_flow.at<float>(y, x);
@@ -2964,6 +3171,38 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             flow_attn.at<cv::Vec3f>(y, x) = cv::Vec3f(attn, attn, attn);
         }
     }
+    {
+        const TimingMark timing = start_timing();
+        int tree_label_stride = 0;
+        for (int y = 0; y < tree_pixel_flow.rows; ++y) {
+            for (int x = 0; x < tree_pixel_flow.cols; ++x) {
+                const float value = tree_pixel_flow.at<float>(y, x);
+                if (value <= 0.0f) {
+                    continue;
+                }
+                voronoi_tree_flow.at<cv::Vec3f>(y, x) =
+                    cv::Vec3f(value, value, value);
+                voronoi_tree_flow_gray_bg.at<cv::Vec3f>(y, x) =
+                    cv::Vec3f(value, value, value);
+                const float local_dt = dt.at<float>(y, x);
+                const float attn = local_dt > 1e-4f ? value / local_dt : value;
+                tree_flow_attn.at<cv::Vec3f>(y, x) =
+                    cv::Vec3f(attn, attn, attn);
+                if ((tree_label_stride++ % 1800) == 0) {
+                    const cv::Point anchor(x, y);
+                    draw_debug_label(voronoi_tree_flow, anchor,
+                                     flow_text(value),
+                                     cv::Scalar(255, 255, 255));
+                    draw_debug_label(voronoi_tree_flow_gray_bg, anchor,
+                                     flow_text(value),
+                                     cv::Scalar(255, 255, 255));
+                    draw_debug_label(tree_flow_attn, anchor, flow_text(attn),
+                                     cv::Scalar(255, 255, 255));
+                }
+            }
+        }
+        timings.push_back(finish_timing("tree_flow_render", timing));
+    }
     for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
          ++edge_index) {
         const float raw_value = edge_flow[edge_index];
@@ -2976,13 +3215,6 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                             cv::Scalar(255));
         }
     }
-
-    const auto flow_text = [&](double value) {
-        if (value >= static_cast<double>(kDenseFlowInf) * 0.5) {
-            return std::string("inf");
-        }
-        return format_scalar_value(value);
-    };
 
     for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
          ++edge_index) {
@@ -3033,6 +3265,10 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
 
     return {dense_flow,
             ambient_flow,
+            voronoi_tree_flow,
+            voronoi_tree_flow_gray_bg,
+            tree_dense_flow,
+            tree_flow_attn,
             flow_attn,
             graph_edge_flow,
             graph_edge_flow_gray_bg,
@@ -3552,7 +3788,9 @@ int main(int argc, char** argv) {
         bool has_dense_flow = false;
         if (args.has_source) {
             dense_flow_result =
-                compute_dense_source_flow(white_domain, dt, graph, args.source);
+                compute_dense_source_flow(
+                    white_domain, dt, graph,
+                    component_voronoi_result.source_pixel_ridges, args.source);
             timings.insert(timings.end(), dense_flow_result.timings.begin(),
                            dense_flow_result.timings.end());
             has_dense_flow = true;
@@ -3622,6 +3860,14 @@ int main(int argc, char** argv) {
                         dense_flow_result.dense_flow);
             write_image(workdir / (stem + "_ambient_flow.tif"),
                         dense_flow_result.ambient_flow);
+            write_image(workdir / (stem + "_voronoi_tree_flow.tif"),
+                        dense_flow_result.voronoi_tree_flow);
+            write_image(workdir / (stem + "_voronoi_tree_flow_gray_bg.tif"),
+                        dense_flow_result.voronoi_tree_flow_gray_bg);
+            write_image(workdir / (stem + "_tree_dense_flow.tif"),
+                        dense_flow_result.tree_dense_flow);
+            write_image(workdir / (stem + "_tree_flow_attn.tif"),
+                        dense_flow_result.tree_flow_attn);
             write_image(workdir / (stem + "_flow_attn.tif"),
                         dense_flow_result.flow_attn);
             write_image(workdir / (stem + "_graph_edge_flow.tif"),
@@ -3656,6 +3902,18 @@ int main(int argc, char** argv) {
             layered_tiff.push_back(
                 {"ambient_flow",
                  to_float_layer(dense_flow_result.ambient_flow)});
+            layered_tiff.push_back(
+                {"voronoi_tree_flow",
+                 to_float_layer(dense_flow_result.voronoi_tree_flow)});
+            layered_tiff.push_back(
+                {"voronoi_tree_flow_gray_bg",
+                 to_float_layer(dense_flow_result.voronoi_tree_flow_gray_bg)});
+            layered_tiff.push_back(
+                {"tree_dense_flow",
+                 to_float_layer(dense_flow_result.tree_dense_flow)});
+            layered_tiff.push_back(
+                {"tree_flow_attn",
+                 to_float_layer(dense_flow_result.tree_flow_attn)});
             layered_tiff.push_back(
                 {"flow_attn", to_float_layer(dense_flow_result.flow_attn)});
             layered_tiff.push_back(
@@ -3795,6 +4053,17 @@ int main(int argc, char** argv) {
             std::cout << "  " << (workdir / (stem + "_dense_flow.tif"))
                       << "\n"
                       << "  " << (workdir / (stem + "_ambient_flow.tif"))
+                      << "\n"
+                      << "  "
+                      << (workdir / (stem + "_voronoi_tree_flow.tif"))
+                      << "\n"
+                      << "  "
+                      << (workdir /
+                          (stem + "_voronoi_tree_flow_gray_bg.tif"))
+                      << "\n"
+                      << "  " << (workdir / (stem + "_tree_dense_flow.tif"))
+                      << "\n"
+                      << "  " << (workdir / (stem + "_tree_flow_attn.tif"))
                       << "\n"
                       << "  " << (workdir / (stem + "_flow_attn.tif"))
                       << "\n"
