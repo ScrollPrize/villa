@@ -4,6 +4,7 @@
 #include "ViewerManager.hpp"
 #include "WindowRangeWidget.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
+#include "viewer_controls/panels/ViewerCompositePanel.hpp"
 #include "viewer_controls/panels/ViewerNavigationPanel.hpp"
 #include "viewer_controls/panels/ViewerNormalVisualizationPanel.hpp"
 #include "viewer_controls/panels/ViewerTransformsPanel.hpp"
@@ -74,8 +75,84 @@ void ViewerControlsPanel::addViewerGroups()
                    detachScrollContents(_uiRefs.overlayScrollArea, _uiRefs.overlayContents),
                    viewer::GROUP_OVERLAY_EXPANDED,
                    viewer::GROUP_OVERLAY_EXPANDED_DEFAULT);
+    ViewerCompositePanel::UiRefs compositeUi{
+        .scrollArea = _uiRefs.compositeScrollArea,
+        .contents = _uiRefs.compositeContents,
+        .compositeEnabled = _uiRefs.compositeEnabled,
+        .compositeMode = _uiRefs.compositeMode,
+        .layersInFront = _uiRefs.layersInFront,
+        .layersBehind = _uiRefs.layersBehind,
+        .alphaMinLabel = _uiRefs.alphaMinLabel,
+        .alphaMin = _uiRefs.alphaMin,
+        .alphaMaxLabel = _uiRefs.alphaMaxLabel,
+        .alphaMax = _uiRefs.alphaMax,
+        .alphaThresholdLabel = _uiRefs.alphaThresholdLabel,
+        .alphaThreshold = _uiRefs.alphaThreshold,
+        .materialLabel = _uiRefs.materialLabel,
+        .material = _uiRefs.material,
+        .reverseDirection = _uiRefs.reverseDirection,
+        .methodScaleLabel = _uiRefs.methodScaleLabel,
+        .methodScale = _uiRefs.methodScale,
+        .methodScaleValue = _uiRefs.methodScaleValue,
+        .methodParamLabel = _uiRefs.methodParamLabel,
+        .methodParam = _uiRefs.methodParam,
+        .methodParamValue = _uiRefs.methodParamValue,
+        .blExtinctionLabel = _uiRefs.blExtinctionLabel,
+        .blExtinction = _uiRefs.blExtinction,
+        .blEmissionLabel = _uiRefs.blEmissionLabel,
+        .blEmission = _uiRefs.blEmission,
+        .blAmbientLabel = _uiRefs.blAmbientLabel,
+        .blAmbient = _uiRefs.blAmbient,
+        .lightingEnabled = _uiRefs.lightingEnabled,
+        .lightAzimuthLabel = _uiRefs.lightAzimuthLabel,
+        .lightAzimuth = _uiRefs.lightAzimuth,
+        .lightElevationLabel = _uiRefs.lightElevationLabel,
+        .lightElevation = _uiRefs.lightElevation,
+        .lightDiffuseLabel = _uiRefs.lightDiffuseLabel,
+        .lightDiffuse = _uiRefs.lightDiffuse,
+        .lightAmbientLabel = _uiRefs.lightAmbientLabel,
+        .lightAmbient = _uiRefs.lightAmbient,
+        .useVolumeGradients = _uiRefs.useVolumeGradients,
+        .shadowStepsLabel = _uiRefs.shadowStepsLabel,
+        .shadowSteps = _uiRefs.shadowSteps,
+        .rakingEnabled = _uiRefs.rakingEnabled,
+        .rakingAzimuthLabel = _uiRefs.rakingAzimuthLabel,
+        .rakingAzimuth = _uiRefs.rakingAzimuth,
+        .rakingElevationLabel = _uiRefs.rakingElevationLabel,
+        .rakingElevation = _uiRefs.rakingElevation,
+        .rakingStrengthLabel = _uiRefs.rakingStrengthLabel,
+        .rakingStrength = _uiRefs.rakingStrength,
+        .rakingDepthLabel = _uiRefs.rakingDepthLabel,
+        .rakingDepthScale = _uiRefs.rakingDepthScale,
+        .preNormalizeLayers = _uiRefs.preNormalizeLayers,
+        .preHistEqLayers = _uiRefs.preHistEqLayers,
+        .preTfEnabled = _uiRefs.preTfEnabled,
+        .preTfX1 = _uiRefs.preTfX1,
+        .preTfY1 = _uiRefs.preTfY1,
+        .preTfKnot2Label = _uiRefs.preTfKnot2Label,
+        .preTfX2 = _uiRefs.preTfX2,
+        .preTfY2 = _uiRefs.preTfY2,
+        .postTfEnabled = _uiRefs.postTfEnabled,
+        .postTfX1 = _uiRefs.postTfX1,
+        .postTfY1 = _uiRefs.postTfY1,
+        .postTfKnot2Label = _uiRefs.postTfKnot2Label,
+        .postTfX2 = _uiRefs.postTfX2,
+        .postTfY2 = _uiRefs.postTfY2,
+        .dvrAmbientLabel = _uiRefs.dvrAmbientLabel,
+        .dvrAmbient = _uiRefs.dvrAmbient,
+        .pbrRoughnessLabel = _uiRefs.pbrRoughnessLabel,
+        .pbrRoughness = _uiRefs.pbrRoughness,
+        .pbrMetallicLabel = _uiRefs.pbrMetallicLabel,
+        .pbrMetallic = _uiRefs.pbrMetallic,
+        .planeCompositeXY = _uiRefs.planeCompositeXY,
+        .planeCompositeXZ = _uiRefs.planeCompositeXZ,
+        .planeCompositeYZ = _uiRefs.planeCompositeYZ,
+        .planeLayersFront = _uiRefs.planeLayersFront,
+        .planeLayersBehind = _uiRefs.planeLayersBehind,
+    };
+    _compositePanel = new ViewerCompositePanel(compositeUi, _viewerManager, _uiRefs.contents);
     addViewerGroup(tr("Composite View"),
-                   detachScrollContents(_uiRefs.compositeScrollArea, _uiRefs.compositeContents),
+                   _compositePanel,
                    viewer::GROUP_COMPOSITE_EXPANDED,
                    viewer::GROUP_COMPOSITE_EXPANDED_DEFAULT);
     addViewerGroup(tr("Render Settings"),
@@ -128,6 +205,13 @@ void ViewerControlsPanel::setViewControlsEnabled(bool enabled)
         _volumeWindowWidget->setControlsEnabled(enabled);
     }
     updateOverlayWindowControlsEnabled();
+}
+
+void ViewerControlsPanel::toggleSegmentationComposite()
+{
+    if (_compositePanel) {
+        _compositePanel->toggleSegmentationComposite();
+    }
 }
 
 void ViewerControlsPanel::setOverlayWindowAvailable(bool available)

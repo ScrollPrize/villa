@@ -130,48 +130,6 @@ void centerViewerOnSurfacePointForNavigation(VolumeViewerBase* viewer, const cv:
     viewer->centerOnSurfacePoint(position, !isChunkedViewer(viewer));
 }
 
-std::string compositeMethodForModeIndex(int index)
-{
-    switch (index) {
-        case 0:  return "max";
-        case 1:  return "mean";
-        case 2:  return "min";
-        case 3:  return "alpha";
-        case 4:  return "beerLambert";
-        case 5:  return "volumetric";
-        case 6:  return "dvr";
-        case 7:  return "firstHitIso";
-        case 8:  return "devFromMean";
-        case 9:  return "emissionDvr";
-        case 10: return "maxAboveIso";
-        case 11: return "gammaWeighted";
-        case 12: return "gradientMag";
-        case 13: return "pbrIso";
-        case 14: return "shadedDvr";
-        default: return "mean";
-    }
-}
-
-int compositeModeIndexForMethod(const std::string& method)
-{
-    if (method == "max") return 0;
-    if (method == "mean") return 1;
-    if (method == "min") return 2;
-    if (method == "alpha") return 3;
-    if (method == "beerLambert") return 4;
-    if (method == "volumetric") return 5;
-    if (method == "dvr") return 6;
-    if (method == "firstHitIso") return 7;
-    if (method == "devFromMean") return 8;
-    if (method == "emissionDvr") return 9;
-    if (method == "maxAboveIso") return 10;
-    if (method == "gammaWeighted") return 11;
-    if (method == "gradientMag") return 12;
-    if (method == "pbrIso") return 13;
-    if (method == "shadedDvr") return 14;
-    return 1;
-}
-
 void ensureDockWidgetFeatures(QDockWidget* dock)
 {
     if (!dock) {
@@ -425,7 +383,6 @@ CWindow::CWindow(size_t cacheSizeGB) :
                                                   vc3d::settings::viewer::MIRROR_CURSOR_TO_SEGMENTATION_DEFAULT).toBool();
     setWindowIcon(QPixmap(":/images/logo.png"));
     ui.setupUi(this);
-    ui.cmbCompositeMode->setCurrentIndex(compositeModeIndexForMethod("max"));
     const QString baseTitle = windowTitle();
     const QString repoShortHash = QString::fromStdString(ProjectInfo::RepositoryShortHash()).trimmed();
     if (!repoShortHash.isEmpty() && !repoShortHash.startsWith('@')
@@ -459,13 +416,6 @@ CWindow::CWindow(size_t cacheSizeGB) :
         }
         if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())) {
             configureChunkedViewerConnections(chunkedViewer);
-        }
-        auto s = viewer->compositeRenderSettings();
-        s.params.method = compositeMethodForModeIndex(ui.cmbCompositeMode->currentIndex());
-        viewer->setCompositeRenderSettings(s);
-        if (viewer->surfName() == "segmentation") {
-            QSignalBlocker blocker(ui.chkCompositeEnabled);
-            ui.chkCompositeEnabled->setChecked(s.enabled);
         }
     });
 
@@ -686,15 +636,9 @@ CWindow::CWindow(size_t cacheSizeGB) :
     fCompositeViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CompositeView), this);
     fCompositeViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fCompositeViewShortcut, &QShortcut::activated, [this]() {
-        auto* viewer = segmentationBaseViewer();
-        if (!viewer) {
-            return;
+        if (_viewerControlsPanel) {
+            _viewerControlsPanel->toggleSegmentationComposite();
         }
-        auto s = viewer->compositeRenderSettings();
-        s.enabled = !s.enabled;
-        viewer->setCompositeRenderSettings(s);
-        QSignalBlocker blocker(ui.chkCompositeEnabled);
-        ui.chkCompositeEnabled->setChecked(s.enabled);
     });
 
     // Toggle direction hints overlay (Ctrl+T)
@@ -2209,6 +2153,77 @@ void CWindow::CreateWidgets(void)
         .overlayContents = ui.dockWidgetOverlayContents,
         .compositeScrollArea = ui.scrollAreaComposite,
         .compositeContents = ui.dockWidgetCompositeContents,
+        .compositeEnabled = ui.chkCompositeEnabled,
+        .compositeMode = ui.cmbCompositeMode,
+        .layersInFront = ui.spinLayersInFront,
+        .layersBehind = ui.spinLayersBehind,
+        .alphaMinLabel = ui.lblAlphaMin,
+        .alphaMin = ui.spinAlphaMin,
+        .alphaMaxLabel = ui.lblAlphaMax,
+        .alphaMax = ui.spinAlphaMax,
+        .alphaThresholdLabel = ui.lblAlphaThreshold,
+        .alphaThreshold = ui.spinAlphaThreshold,
+        .materialLabel = ui.lblMaterial,
+        .material = ui.spinMaterial,
+        .reverseDirection = ui.chkReverseDirection,
+        .methodScaleLabel = ui.lblMethodScale,
+        .methodScale = ui.sliderMethodScale,
+        .methodScaleValue = ui.lblMethodScaleValue,
+        .methodParamLabel = ui.lblMethodParam,
+        .methodParam = ui.sliderMethodParam,
+        .methodParamValue = ui.lblMethodParamValue,
+        .blExtinctionLabel = ui.lblBLExtinction,
+        .blExtinction = ui.spinBLExtinction,
+        .blEmissionLabel = ui.lblBLEmission,
+        .blEmission = ui.spinBLEmission,
+        .blAmbientLabel = ui.lblBLAmbient,
+        .blAmbient = ui.spinBLAmbient,
+        .lightingEnabled = ui.chkLightingEnabled,
+        .lightAzimuthLabel = ui.lblLightAzimuth,
+        .lightAzimuth = ui.spinLightAzimuth,
+        .lightElevationLabel = ui.lblLightElevation,
+        .lightElevation = ui.spinLightElevation,
+        .lightDiffuseLabel = ui.lblLightDiffuse,
+        .lightDiffuse = ui.spinLightDiffuse,
+        .lightAmbientLabel = ui.lblLightAmbient,
+        .lightAmbient = ui.spinLightAmbient,
+        .useVolumeGradients = ui.chkUseVolumeGradients,
+        .shadowStepsLabel = ui.lblShadowSteps,
+        .shadowSteps = ui.spinShadowSteps,
+        .rakingEnabled = ui.chkRakingEnabled,
+        .rakingAzimuthLabel = ui.lblRakingAzimuth,
+        .rakingAzimuth = ui.spinRakingAzimuth,
+        .rakingElevationLabel = ui.lblRakingElevation,
+        .rakingElevation = ui.spinRakingElevation,
+        .rakingStrengthLabel = ui.lblRakingStrength,
+        .rakingStrength = ui.spinRakingStrength,
+        .rakingDepthLabel = ui.lblRakingDepth,
+        .rakingDepthScale = ui.spinRakingDepthScale,
+        .preNormalizeLayers = ui.chkPreNormalizeLayers,
+        .preHistEqLayers = ui.chkPreHistEqLayers,
+        .preTfEnabled = ui.chkPreTfEnabled,
+        .preTfX1 = ui.spinPreTfX1,
+        .preTfY1 = ui.spinPreTfY1,
+        .preTfKnot2Label = ui.lblPreTfKnot2,
+        .preTfX2 = ui.spinPreTfX2,
+        .preTfY2 = ui.spinPreTfY2,
+        .postTfEnabled = ui.chkPostTfEnabled,
+        .postTfX1 = ui.spinPostTfX1,
+        .postTfY1 = ui.spinPostTfY1,
+        .postTfKnot2Label = ui.lblPostTfKnot2,
+        .postTfX2 = ui.spinPostTfX2,
+        .postTfY2 = ui.spinPostTfY2,
+        .dvrAmbientLabel = ui.lblDvrAmbient,
+        .dvrAmbient = ui.spinDvrAmbient,
+        .pbrRoughnessLabel = ui.lblPbrRoughness,
+        .pbrRoughness = ui.spinPbrRoughness,
+        .pbrMetallicLabel = ui.lblPbrMetallic,
+        .pbrMetallic = ui.spinPbrMetallic,
+        .planeCompositeXY = ui.chkPlaneCompositeXY,
+        .planeCompositeXZ = ui.chkPlaneCompositeXZ,
+        .planeCompositeYZ = ui.chkPlaneCompositeYZ,
+        .planeLayersFront = ui.spinPlaneLayersFront,
+        .planeLayersBehind = ui.spinPlaneLayersBehind,
         .renderSettingsScrollArea = ui.scrollAreaRenderSettings,
         .renderSettingsContents = ui.dockWidgetRenderSettingsContents,
         .normalVisualizationContents = ui.dockWidgetNormalVisContents,
@@ -2455,29 +2470,6 @@ void CWindow::CreateWidgets(void)
 
     connect(ui.btnEditMask, &QPushButton::pressed, this, &CWindow::onEditMaskPressed);
     connect(ui.btnAppendMask, &QPushButton::pressed, this, &CWindow::onAppendMaskPressed);  // Add this
-    // Connect composite view controls
-    connect(ui.chkCompositeEnabled, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.enabled = checked;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    connect(ui.cmbCompositeMode, QOverload<int>::of(&QComboBox::currentIndexChanged), this, [this](int index) {
-        if (!_viewerManager) {
-            return;
-        }
-        const std::string method = compositeMethodForModeIndex(index);
-        _viewerManager->forEachBaseViewer([&method](VolumeViewerBase* viewer) {
-            if (!viewer) {
-                return;
-            }
-            auto s = viewer->compositeRenderSettings();
-            s.params.method = method;
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
 
     if (chkAxisAlignedSlices) {
         onAxisAlignedSlicesToggled(chkAxisAlignedSlices->isChecked());
@@ -2488,217 +2480,6 @@ void CWindow::CreateWidgets(void)
     if (auto* chkAxisOverlays = ui.chkAxisOverlays) {
         onAxisOverlayVisibilityToggled(chkAxisOverlays->isChecked());
     }
-
-    // Connect Layers In Front controls
-    connect(ui.spinLayersInFront, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.layersFront = value;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Layers Behind controls
-    connect(ui.spinLayersBehind, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.layersBehind = value;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Alpha Min controls
-    connect(ui.spinAlphaMin, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.alphaMin = value / 255.0f;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Alpha Max controls
-    connect(ui.spinAlphaMax, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.alphaMax = value / 255.0f;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Alpha Threshold controls
-    connect(ui.spinAlphaThreshold, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.alphaCutoff = value / 10000.0f;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Material controls
-    connect(ui.spinMaterial, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.alphaOpacity = value / 255.0f;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Reverse Direction control
-    connect(ui.chkReverseDirection, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.reverseDirection = checked;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Beer-Lambert Extinction control
-    connect(ui.spinBLExtinction, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.blExtinction = static_cast<float>(value);
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Beer-Lambert Emission control
-    connect(ui.spinBLEmission, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.blEmission = static_cast<float>(value);
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Beer-Lambert Ambient control
-    connect(ui.spinBLAmbient, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.blAmbient = static_cast<float>(value);
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Lighting Enable control
-    connect(ui.chkLightingEnabled, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.lightingEnabled = checked;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Light Azimuth control
-    connect(ui.spinLightAzimuth, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.lightAzimuth = static_cast<float>(value);
-            s.params.updateLightDir();
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Light Elevation control
-    connect(ui.spinLightElevation, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.lightElevation = static_cast<float>(value);
-            s.params.updateLightDir();
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Light Diffuse control
-    connect(ui.spinLightDiffuse, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.lightDiffuse = static_cast<float>(value);
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Light Ambient control
-    connect(ui.spinLightAmbient, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double value) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.lightAmbient = static_cast<float>(value);
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Volume Gradients checkbox — switches the lighting normal
-    // source between mesh-interpolated (0) and per-sample volume gradient (1).
-    connect(ui.chkUseVolumeGradients, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.useVolumeGradients = checked;
-            s.params.lightNormalSource = checked ? 1 : 0;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Connect Shadow Steps spinbox (Volumetric method)
-    connect(ui.spinShadowSteps, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.shadowSteps = std::clamp(value, 1, 64);
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Per-ray layer preprocess (applied to N composite samples before composite method)
-    connect(ui.chkPreNormalizeLayers, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.preNormalizeLayers = checked;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-    connect(ui.chkPreHistEqLayers, &QCheckBox::toggled, this, [this](bool checked) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            s.params.preHistEqLayers = checked;
-            viewer->setCompositeRenderSettings(s);
-        }
-    });
-
-    // Pre-TF / Post-TF: 4-knot piecewise-linear LUTs. Endpoints (0,0) and
-    // (255,255) are fixed; only the two middle knots are editable.
-    auto applyTfParam = [this](auto&& mutate) {
-        if (auto* viewer = segmentationBaseViewer()) {
-            auto s = viewer->compositeRenderSettings();
-            mutate(s.params);
-            viewer->setCompositeRenderSettings(s);
-        }
-    };
-    connect(ui.chkPreTfEnabled, &QCheckBox::toggled, this, [applyTfParam](bool v) {
-        applyTfParam([v](CompositeParams& p) { p.preTfEnabled = v; });
-    });
-    connect(ui.spinPreTfX1, QOverload<int>::of(&QSpinBox::valueChanged), this,
-        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.preTfX1 = uint8_t(v); }); });
-    connect(ui.spinPreTfY1, QOverload<int>::of(&QSpinBox::valueChanged), this,
-        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.preTfY1 = uint8_t(v); }); });
-    connect(ui.spinPreTfX2, QOverload<int>::of(&QSpinBox::valueChanged), this,
-        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.preTfX2 = uint8_t(v); }); });
-    connect(ui.spinPreTfY2, QOverload<int>::of(&QSpinBox::valueChanged), this,
-        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.preTfY2 = uint8_t(v); }); });
-    connect(ui.chkPostTfEnabled, &QCheckBox::toggled, this, [applyTfParam](bool v) {
-        applyTfParam([v](CompositeParams& p) { p.postTfEnabled = v; });
-    });
-    connect(ui.spinPostTfX1, QOverload<int>::of(&QSpinBox::valueChanged), this,
-        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.postTfX1 = uint8_t(v); }); });
-    connect(ui.spinPostTfY1, QOverload<int>::of(&QSpinBox::valueChanged), this,
-        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.postTfY1 = uint8_t(v); }); });
-    connect(ui.spinPostTfX2, QOverload<int>::of(&QSpinBox::valueChanged), this,
-        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.postTfX2 = uint8_t(v); }); });
-    connect(ui.spinPostTfY2, QOverload<int>::of(&QSpinBox::valueChanged), this,
-        [applyTfParam](int v) { applyTfParam([v](CompositeParams& p) { p.postTfY2 = uint8_t(v); }); });
-    connect(ui.spinDvrAmbient, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
-        [applyTfParam](double v) { applyTfParam([v](CompositeParams& p) { p.dvrAmbient = float(v); }); });
-    connect(ui.spinPbrRoughness, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
-        [applyTfParam](double v) { applyTfParam([v](CompositeParams& p) { p.pbrRoughness = float(v); }); });
-    connect(ui.spinPbrMetallic, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this,
-        [applyTfParam](double v) { applyTfParam([v](CompositeParams& p) { p.pbrMetallic = float(v); }); });
 
     // Connect ISO Cutoff slider - applies to all viewers (segmentation, XY, XZ, YZ)
     connect(ui.sliderIsoCutoff, &QSlider::valueChanged, this, [this](int value) {
@@ -2711,195 +2492,6 @@ void CWindow::CreateWidgets(void)
             s.params.isoCutoff = static_cast<uint8_t>(std::clamp(value, 0, 255));
             viewer->setCompositeRenderSettings(s);
         });
-    });
-
-    // Connect Method Scale slider (for methods with scale parameters)
-    connect(ui.sliderMethodScale, &QSlider::valueChanged, this, [this](int value) {
-        // Convert slider value (1-100) to scale (0.1-10.0)
-        float scale = value / 10.0f;
-        ui.lblMethodScaleValue->setText(QString::number(scale, 'f', 1));
-
-        if (!_viewerManager) {
-            return;
-        }
-
-        // Currently no methods use the scale parameter
-        (void)scale;
-    });
-
-    // Connect Method Param slider (for methods with threshold/percentile parameters)
-    connect(ui.sliderMethodParam, &QSlider::valueChanged, this, [this](int value) {
-        // Currently no methods use this parameter
-        (void)value;
-    });
-
-    // Helper lambda to update visibility of method-specific parameters
-    auto updateCompositeParamsVisibility = [this]() {
-        const int methodIndex = ui.cmbCompositeMode->currentIndex();
-        const bool lightingOn = ui.chkLightingEnabled->isChecked();
-        const bool preTfOn = ui.chkPreTfEnabled->isChecked();
-        const bool postTfOn = ui.chkPostTfEnabled->isChecked();
-
-        // Method-family flags.
-        const bool isAlpha    = (methodIndex == 3);
-        const bool isBL       = (methodIndex == 4);
-        const bool isVolum    = (methodIndex == 5);
-        const bool isDvr      = (methodIndex == 6);
-        const bool isFirstHit = (methodIndex == 7);
-        const bool isPbr      = (methodIndex == 13);
-        const bool isShadedDvr = (methodIndex == 14);
-
-        // Alpha knobs: only for the Alpha method.
-        ui.lblAlphaMin->setVisible(isAlpha);
-        ui.spinAlphaMin->setVisible(isAlpha);
-        ui.lblAlphaMax->setVisible(isAlpha);
-        ui.spinAlphaMax->setVisible(isAlpha);
-        ui.lblAlphaThreshold->setVisible(isAlpha);
-        ui.spinAlphaThreshold->setVisible(isAlpha);
-        ui.lblMaterial->setVisible(isAlpha);
-        ui.spinMaterial->setVisible(isAlpha);
-
-        // Beer-Lambert knobs: shared by Beer-Lambert and Volumetric modes.
-        const bool showBL = isBL || isVolum;
-        ui.lblBLExtinction->setVisible(showBL);
-        ui.spinBLExtinction->setVisible(showBL);
-        ui.lblBLEmission->setVisible(showBL);
-        ui.spinBLEmission->setVisible(showBL);
-        ui.lblBLAmbient->setVisible(showBL);
-        ui.spinBLAmbient->setVisible(showBL);
-
-        // Shadow-ray steps: only Volumetric uses the secondary shadow ray.
-        ui.lblShadowSteps->setVisible(isVolum);
-        ui.spinShadowSteps->setVisible(isVolum);
-
-        // DVR ambient: DVR and shaded-DVR methods.
-        const bool showDvrAmbient = isDvr || isShadedDvr;
-        ui.lblDvrAmbient->setVisible(showDvrAmbient);
-        ui.spinDvrAmbient->setVisible(showDvrAmbient);
-
-        // PBR roughness/metallic knobs: only the PBR method.
-        ui.lblPbrRoughness->setVisible(isPbr);
-        ui.spinPbrRoughness->setVisible(isPbr);
-        ui.lblPbrMetallic->setVisible(isPbr);
-        ui.spinPbrMetallic->setVisible(isPbr);
-
-        // Lighting: check always visible (user toggles on/off); the
-        // direction/diffuse/ambient knobs appear only when lighting is
-        // actually on. First-Hit Iso is a shading-heavy method so we
-        // gently enforce its need for lighting by showing the chk always.
-        ui.chkLightingEnabled->setVisible(true);
-        ui.lblLightAzimuth->setVisible(lightingOn);
-        ui.spinLightAzimuth->setVisible(lightingOn);
-        ui.lblLightElevation->setVisible(lightingOn);
-        ui.spinLightElevation->setVisible(lightingOn);
-        ui.lblLightDiffuse->setVisible(lightingOn);
-        ui.spinLightDiffuse->setVisible(lightingOn);
-        ui.lblLightAmbient->setVisible(lightingOn);
-        ui.spinLightAmbient->setVisible(lightingOn);
-        ui.chkUseVolumeGradients->setVisible(lightingOn);
-
-        // Pre/Post TF knots: spinboxes + knot-2 labels appear only when
-        // the corresponding enable checkbox is ticked.
-        ui.spinPreTfX1->setVisible(preTfOn);
-        ui.spinPreTfY1->setVisible(preTfOn);
-        ui.spinPreTfX2->setVisible(preTfOn);
-        ui.spinPreTfY2->setVisible(preTfOn);
-        ui.lblPreTfKnot2->setVisible(preTfOn);
-        ui.spinPostTfX1->setVisible(postTfOn);
-        ui.spinPostTfY1->setVisible(postTfOn);
-        ui.spinPostTfX2->setVisible(postTfOn);
-        ui.spinPostTfY2->setVisible(postTfOn);
-        ui.lblPostTfKnot2->setVisible(postTfOn);
-
-        // No methods currently use scale or param sliders.
-        ui.lblMethodScale->setVisible(false);
-        ui.sliderMethodScale->setVisible(false);
-        ui.lblMethodScaleValue->setVisible(false);
-        ui.lblMethodParam->setVisible(false);
-        ui.sliderMethodParam->setVisible(false);
-        ui.lblMethodParamValue->setVisible(false);
-
-        (void)isFirstHit;  // reserved for future First-Hit-specific knobs
-        (void)isShadedDvr; (void)isPbr; // already consumed above
-    };
-
-    // Re-run visibility logic whenever any of the inputs that gate widgets
-    // change — composite method, or any of the three enable checkboxes
-    // that each control a sub-group of knobs.
-    connect(ui.cmbCompositeMode, QOverload<int>::of(&QComboBox::currentIndexChanged),
-            this, [updateCompositeParamsVisibility](int) { updateCompositeParamsVisibility(); });
-    connect(ui.chkLightingEnabled, &QCheckBox::toggled,
-            this, [updateCompositeParamsVisibility](bool) { updateCompositeParamsVisibility(); });
-    connect(ui.chkPreTfEnabled, &QCheckBox::toggled,
-            this, [updateCompositeParamsVisibility](bool) { updateCompositeParamsVisibility(); });
-    connect(ui.chkPostTfEnabled, &QCheckBox::toggled,
-            this, [updateCompositeParamsVisibility](bool) { updateCompositeParamsVisibility(); });
-
-    // Initialize visibility from current UI state.
-    updateCompositeParamsVisibility();
-
-    // Connect Plane Composite controls (separate enable for XY/XZ/YZ, shared layer counts)
-    connect(ui.chkPlaneCompositeXY, &QCheckBox::toggled, this, [this](bool checked) {
-        if (!_viewerManager) return;
-        for (auto* viewer : _viewerManager->baseViewers()) {
-            if (viewer->surfName() == "xy plane") {
-                auto s = viewer->compositeRenderSettings();
-                s.planeEnabled = checked;
-                viewer->setCompositeRenderSettings(s);
-            }
-        }
-    });
-
-    connect(ui.chkPlaneCompositeXZ, &QCheckBox::toggled, this, [this](bool checked) {
-        if (!_viewerManager) return;
-        for (auto* viewer : _viewerManager->baseViewers()) {
-            if (viewer->surfName() == "seg xz") {
-                auto s = viewer->compositeRenderSettings();
-                s.planeEnabled = checked;
-                viewer->setCompositeRenderSettings(s);
-            }
-        }
-    });
-
-    connect(ui.chkPlaneCompositeYZ, &QCheckBox::toggled, this, [this](bool checked) {
-        if (!_viewerManager) return;
-        for (auto* viewer : _viewerManager->baseViewers()) {
-            if (viewer->surfName() == "seg yz") {
-                auto s = viewer->compositeRenderSettings();
-                s.planeEnabled = checked;
-                viewer->setCompositeRenderSettings(s);
-            }
-        }
-    });
-
-    auto isPlaneViewer = [](const std::string& name) {
-        return name == "seg xz" || name == "seg yz" || name == "xy plane";
-    };
-
-    connect(ui.spinPlaneLayersFront, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, isPlaneViewer](int value) {
-        if (!_viewerManager) return;
-        int behind = ui.spinPlaneLayersBehind->value();
-        for (auto* viewer : _viewerManager->baseViewers()) {
-            if (isPlaneViewer(viewer->surfName())) {
-                auto s = viewer->compositeRenderSettings();
-                s.planeLayersFront = std::max(0, value);
-                s.planeLayersBehind = std::max(0, behind);
-                viewer->setCompositeRenderSettings(s);
-            }
-        }
-    });
-
-    connect(ui.spinPlaneLayersBehind, QOverload<int>::of(&QSpinBox::valueChanged), this, [this, isPlaneViewer](int value) {
-        if (!_viewerManager) return;
-        int front = ui.spinPlaneLayersFront->value();
-        for (auto* viewer : _viewerManager->baseViewers()) {
-            if (isPlaneViewer(viewer->surfName())) {
-                auto s = viewer->compositeRenderSettings();
-                s.planeLayersFront = std::max(0, front);
-                s.planeLayersBehind = std::max(0, value);
-                viewer->setCompositeRenderSettings(s);
-            }
-        }
     });
 
     // Connect Postprocessing controls
@@ -2970,62 +2562,6 @@ void CWindow::CreateWidgets(void)
             viewer->setCompositeRenderSettings(s);
         });
     });
-
-    // Raking light — heightfield post-process
-    auto setRakingEnabled = [this](bool on) {
-        ui.spinRakingAzimuth->setEnabled(on);
-        ui.spinRakingElevation->setEnabled(on);
-        ui.spinRakingStrength->setEnabled(on);
-        ui.spinRakingDepthScale->setEnabled(on);
-        ui.lblRakingAzimuth->setEnabled(on);
-        ui.lblRakingElevation->setEnabled(on);
-        ui.lblRakingStrength->setEnabled(on);
-        ui.lblRakingDepth->setEnabled(on);
-    };
-    setRakingEnabled(ui.chkRakingEnabled->isChecked());
-
-    connect(ui.chkRakingEnabled, &QCheckBox::toggled, this, [this, setRakingEnabled](bool checked) {
-        setRakingEnabled(checked);
-        if (!_viewerManager) return;
-        _viewerManager->forEachBaseViewer([checked](VolumeViewerBase* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.postRakingEnabled = checked;
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
-    connect(ui.spinRakingAzimuth, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
-        if (!_viewerManager) return;
-        _viewerManager->forEachBaseViewer([v](VolumeViewerBase* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.postRakingAzimuth = float(v);
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
-    connect(ui.spinRakingElevation, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
-        if (!_viewerManager) return;
-        _viewerManager->forEachBaseViewer([v](VolumeViewerBase* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.postRakingElevation = float(v);
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
-    connect(ui.spinRakingStrength, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
-        if (!_viewerManager) return;
-        _viewerManager->forEachBaseViewer([v](VolumeViewerBase* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.postRakingStrength = std::clamp(float(v), 0.0f, 1.0f);
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
-    connect(ui.spinRakingDepthScale, QOverload<double>::of(&QDoubleSpinBox::valueChanged), this, [this](double v) {
-        if (!_viewerManager) return;
-        _viewerManager->forEachBaseViewer([v](VolumeViewerBase* viewer) {
-            auto s = viewer->compositeRenderSettings();
-            s.postRakingDepthScale = std::max(0.01f, float(v));
-            viewer->setCompositeRenderSettings(s);
-        });
-    });
-
 
     bool resetViewOnSurfaceChange = settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
                                                    vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();

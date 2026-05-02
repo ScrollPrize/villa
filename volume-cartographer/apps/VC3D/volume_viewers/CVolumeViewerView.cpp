@@ -23,10 +23,7 @@ double CVolumeViewerView::chooseNiceLength(double nominal) const
 
 void CVolumeViewerView::drawForeground(QPainter* p, const QRectF& sceneRect)
 {
-    // 1) Let QGraphicsView draw any foreground items
     QGraphicsView::drawForeground(p, sceneRect);
-
-    // 2) Scalebar overlay, in **viewport** coords so it never moves
     const double dpr = devicePixelRatioF();
     const double m11 = transform().m11();
     const int vpW = viewport()->width();
@@ -216,9 +213,6 @@ void CVolumeViewerView::wheelEvent(QWheelEvent *event)
         return;
     }
 
-    // Accumulate fractional degrees so high-resolution trackpads and mice
-    // with fine scroll steps don't lose precision to integer truncation.
-    // Standard mice send 120 units (= 15 degrees) per notch.
     _wheelAccum += event->angleDelta().y();
     constexpr int kStepThreshold = 120;  // one notch = one step
     int steps = _wheelAccum / kStepThreshold;
@@ -228,9 +222,6 @@ void CVolumeViewerView::wheelEvent(QWheelEvent *event)
     }
     _wheelAccum -= steps * kStepThreshold;
 
-    // Pass viewport-relative mouse position directly (not scene coords).
-    // Scene coords depend on Qt scroll position which shifts when the
-    // tile grid is windowed, causing zoom-at-point to jump.
     QPointF vp_loc = viewport()->mapFromGlobal(event->globalPosition());
     sendZoom(steps, vp_loc, event->modifiers());
     event->accept();
@@ -300,9 +291,6 @@ void CVolumeViewerView::mouseReleaseEvent(QMouseEvent *event)
     {
         QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
         QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
-        
-        // Emit both signals - the clicked signal for compatibility and the release signal
-        // to allow for drawing
         sendVolumeClicked(scene_loc, event->button(), event->modifiers());
         sendMouseRelease(scene_loc, event->button(), event->modifiers());
         
@@ -315,9 +303,6 @@ void CVolumeViewerView::mouseReleaseEvent(QMouseEvent *event)
 
 void CVolumeViewerView::keyPressEvent(QKeyEvent *event)
 {
-    // When scroll-pan is disabled (tiled renderer), block arrow keys from
-    // reaching QGraphicsView's built-in scroll handler.  They'll be handled
-    // via sendKeyRelease -> onKeyRelease in the volume viewer instead.
     if (_scrollPanDisabled) {
         switch (event->key()) {
         case Qt::Key_Left:
@@ -421,10 +406,6 @@ void CVolumeViewerView::mouseDoubleClickEvent(QMouseEvent *event)
 
 void CVolumeViewerView::resizeEvent(QResizeEvent *event)
 {
-    // Base class first so viewport()->size() reflects the new dimensions.
-    // Otherwise the tiled viewer's onResized reads the stale viewport size,
-    // leaves the framebuffer/sceneRect at the old dims, and subsequent mouse
-    // events map through an offset proportional to the resize delta.
     QGraphicsView::resizeEvent(event);
     emit sendResized();
 }
@@ -457,8 +438,6 @@ void CVolumeViewerView::mouseMoveEvent(QMouseEvent *event)
         _last_pan_position = QPoint(event->position().x(), event->position().y());
         event->accept();
 
-        // Tiled viewers disable scrollbars and perform panning in their
-        // mouse-move handler, so they still need pan-motion updates here.
         if (!_scrollPanDisabled) {
             return;
         }
@@ -469,9 +448,8 @@ void CVolumeViewerView::mouseMoveEvent(QMouseEvent *event)
 
     emit sendCursorMove(scene_loc);
 
-    // Forward mouse move events even without a pressed button so tools that
+    // mouse move events must be forwarded even without a pressed button so tools that
     // rely on hover state (e.g. segmentation editing) receive continuous
-    // volume coordinates. Consumers that only care about drags can still
-    // ignore events where no buttons are pressed.
+    // volume coordinates.
     sendMouseMove(scene_loc, event->buttons(), event->modifiers());
 }

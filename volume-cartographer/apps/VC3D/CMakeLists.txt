@@ -128,6 +128,8 @@ set(srcs
     ViewerManager.hpp
     viewer_controls/ViewerControlsPanel.cpp
     viewer_controls/ViewerControlsPanel.hpp
+    viewer_controls/panels/ViewerCompositePanel.cpp
+    viewer_controls/panels/ViewerCompositePanel.hpp
     viewer_controls/panels/ViewerNavigationPanel.cpp
     viewer_controls/panels/ViewerNavigationPanel.hpp
     viewer_controls/panels/ViewerNormalVisualizationPanel.cpp

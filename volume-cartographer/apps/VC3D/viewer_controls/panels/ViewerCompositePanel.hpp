@@ -2,38 +2,32 @@
 
 #include <QWidget>
 
+#include <functional>
+
+class QCheckBox;
+class QComboBox;
 class QDoubleSpinBox;
 class QLabel;
-class QPushButton;
-class QCheckBox;
 class QScrollArea;
 class QSlider;
 class QSpinBox;
 class ViewerManager;
-class WindowRangeWidget;
-class ViewerCompositePanel;
-class ViewerTransformsPanel;
+class VolumeViewerBase;
 
-class ViewerControlsPanel : public QWidget
+class ViewerCompositePanel : public QWidget
 {
     Q_OBJECT
 
 public:
     struct UiRefs {
+        QScrollArea* scrollArea{nullptr};
         QWidget* contents{nullptr};
 
-        QScrollArea* viewScrollArea{nullptr};
-        QWidget* viewContents{nullptr};
-
-        QScrollArea* overlayScrollArea{nullptr};
-        QWidget* overlayContents{nullptr};
-
-        QScrollArea* compositeScrollArea{nullptr};
-        QWidget* compositeContents{nullptr};
         QCheckBox* compositeEnabled{nullptr};
         QComboBox* compositeMode{nullptr};
         QSpinBox* layersInFront{nullptr};
         QSpinBox* layersBehind{nullptr};
+
         QLabel* alphaMinLabel{nullptr};
         QSpinBox* alphaMin{nullptr};
         QLabel* alphaMaxLabel{nullptr};
@@ -43,18 +37,21 @@ public:
         QLabel* materialLabel{nullptr};
         QSpinBox* material{nullptr};
         QCheckBox* reverseDirection{nullptr};
+
         QLabel* methodScaleLabel{nullptr};
         QSlider* methodScale{nullptr};
         QLabel* methodScaleValue{nullptr};
         QLabel* methodParamLabel{nullptr};
         QSlider* methodParam{nullptr};
         QLabel* methodParamValue{nullptr};
+
         QLabel* blExtinctionLabel{nullptr};
         QDoubleSpinBox* blExtinction{nullptr};
         QLabel* blEmissionLabel{nullptr};
         QDoubleSpinBox* blEmission{nullptr};
         QLabel* blAmbientLabel{nullptr};
         QDoubleSpinBox* blAmbient{nullptr};
+
         QCheckBox* lightingEnabled{nullptr};
         QLabel* lightAzimuthLabel{nullptr};
         QSpinBox* lightAzimuth{nullptr};
@@ -67,6 +64,7 @@ public:
         QCheckBox* useVolumeGradients{nullptr};
         QLabel* shadowStepsLabel{nullptr};
         QSpinBox* shadowSteps{nullptr};
+
         QCheckBox* rakingEnabled{nullptr};
         QLabel* rakingAzimuthLabel{nullptr};
         QDoubleSpinBox* rakingAzimuth{nullptr};
@@ -76,6 +74,7 @@ public:
         QDoubleSpinBox* rakingStrength{nullptr};
         QLabel* rakingDepthLabel{nullptr};
         QDoubleSpinBox* rakingDepthScale{nullptr};
+
         QCheckBox* preNormalizeLayers{nullptr};
         QCheckBox* preHistEqLayers{nullptr};
         QCheckBox* preTfEnabled{nullptr};
@@ -96,76 +95,31 @@ public:
         QDoubleSpinBox* pbrRoughness{nullptr};
         QLabel* pbrMetallicLabel{nullptr};
         QDoubleSpinBox* pbrMetallic{nullptr};
+
         QCheckBox* planeCompositeXY{nullptr};
         QCheckBox* planeCompositeXZ{nullptr};
         QCheckBox* planeCompositeYZ{nullptr};
         QSpinBox* planeLayersFront{nullptr};
         QSpinBox* planeLayersBehind{nullptr};
-
-        QScrollArea* renderSettingsScrollArea{nullptr};
-        QWidget* renderSettingsContents{nullptr};
-
-        QWidget* normalVisualizationContents{nullptr};
-        QCheckBox* showSurfaceNormals{nullptr};
-        QLabel* normalArrowLengthLabel{nullptr};
-        QSlider* normalArrowLengthSlider{nullptr};
-        QLabel* normalArrowLengthValueLabel{nullptr};
-        QLabel* normalMaxArrowsLabel{nullptr};
-        QSlider* normalMaxArrowsSlider{nullptr};
-        QLabel* normalMaxArrowsValueLabel{nullptr};
-
-        QScrollArea* preprocessingScrollArea{nullptr};
-        QWidget* preprocessingContents{nullptr};
-
-        QScrollArea* postprocessingScrollArea{nullptr};
-        QWidget* postprocessingContents{nullptr};
-
-        QPushButton* zoomInButton{nullptr};
-        QPushButton* zoomOutButton{nullptr};
-        QSpinBox* sliceStepSizeSpin{nullptr};
-        QWidget* volumeWindowContainer{nullptr};
-        QWidget* overlayWindowContainer{nullptr};
-        QSpinBox* intersectionOpacitySpin{nullptr};
-        QDoubleSpinBox* intersectionThicknessSpin{nullptr};
     };
 
-    explicit ViewerControlsPanel(const UiRefs& uiRefs,
-                                 ViewerManager* viewerManager,
-                                 QWidget* parent = nullptr);
+    explicit ViewerCompositePanel(const UiRefs& uiRefs,
+                                  ViewerManager* viewerManager,
+                                  QWidget* parent = nullptr);
 
-    ViewerTransformsPanel* transformsPanel() const { return _transformsPanel; }
-    ViewerCompositePanel* compositePanel() const { return _compositePanel; }
     void toggleSegmentationComposite();
-    void setViewControlsEnabled(bool enabled);
-    void setOverlayWindowAvailable(bool available);
-    void setSliceStepSize(int value);
-
-signals:
-    void zoomInRequested();
-    void zoomOutRequested();
-    void sliceStepSizeChanged(int value);
-    void statusMessageRequested(QString text, int timeoutMs);
+    void setSegmentationCompositeChecked(bool checked);
 
 private:
-    QWidget* detachScrollContents(QScrollArea* scrollArea, QWidget* contents);
-    void addViewerGroups();
-    void setupViewerControlWiring();
-    void setupWindowRangeControls();
-    void setupIntersectionControls();
-    void updateOverlayWindowControlsEnabled();
-    void rememberGroupState(class CollapsibleSettingsGroup* group, const char* key);
-    class CollapsibleSettingsGroup* addViewerGroup(const QString& title,
-                                                   QWidget* contents,
-                                                   const char* key,
-                                                   bool defaultExpanded);
+    void setupControls();
+    void initializeExistingViewers();
+    void applyInitialSettingsToViewer(VolumeViewerBase* viewer);
+    void updateCompositeParamsVisibility();
+    void updateRakingControlsEnabled(bool enabled);
+    void applyToSegmentationViewer(const std::function<void(VolumeViewerBase*)>& apply);
+    void applyToAllViewers(const std::function<void(VolumeViewerBase*)>& apply);
+    void applyToPlaneViewers(const std::function<void(VolumeViewerBase*)>& apply);
 
     UiRefs _uiRefs;
     ViewerManager* _viewerManager{nullptr};
-    ViewerCompositePanel* _compositePanel{nullptr};
-    ViewerTransformsPanel* _transformsPanel{nullptr};
-    WindowRangeWidget* _volumeWindowWidget{nullptr};
-    WindowRangeWidget* _overlayWindowWidget{nullptr};
-    QSpinBox* _sliceStepSizeSpin{nullptr};
-    bool _viewControlsEnabled{true};
-    bool _overlayWindowAvailable{false};
 };

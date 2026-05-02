@@ -18,8 +18,6 @@ public:
     void keyReleaseEvent(QKeyEvent *event) override;
     void resizeEvent(QResizeEvent *event) override;
     void mouseDoubleClickEvent(QMouseEvent *event) override;
-    /// Set physical voxel size (units per scene-unit, e.g. µm/pixel).
-    /// Call this after you load your Zarr spacing metadata.
     void setVoxelSize(double sx, double sy) { m_vx = sx; m_vy = sy; update(); }
     void setMiddleButtonPanEnabled(bool enabled) { _middleButtonPanEnabled = enabled; }
     bool middleButtonPanEnabled() const { return _middleButtonPanEnabled; }
@@ -79,8 +77,6 @@ private:
     bool _scrollPanDisabled = false;
     bool _sceneWidgetMouseCapture = false;
     int _wheelAccum = 0;  // fractional wheel delta accumulator
-
-    // Scalebar cache — avoid recomputing font/text every frame
     mutable QFont _cachedFont;
     mutable bool _scalebarCacheDirty = true;
     mutable double _cachedBarPx = 0;
