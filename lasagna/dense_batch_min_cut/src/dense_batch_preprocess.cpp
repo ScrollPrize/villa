@@ -1996,6 +1996,7 @@ class Dinic {
 
 struct DenseFlowResult {
     cv::Mat dense_flow;
+    cv::Mat flow_attn;
     cv::Mat graph_edge_flow;
     cv::Mat graph_edge_flow_gray_bg;
     cv::Mat edge_flow_px;
@@ -2485,42 +2486,165 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     cv::Mat dense_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     {
         const TimingMark timing = start_timing();
-        cv::Mat graph_source_mask(white_domain.size(), CV_8U, cv::Scalar(255));
-        graph_source_mask.setTo(0, graph_edge_mask);
-        cv::Mat nearest_dt;
-        cv::Mat nearest_graph_pixel;
-        cv::distanceTransform(graph_source_mask, nearest_dt, nearest_graph_pixel,
-                              cv::DIST_L2, cv::DIST_MASK_5,
-                              cv::DIST_LABEL_PIXEL);
-        const std::vector<cv::Point> graph_source_points =
-            label_source_points(graph_source_mask, nearest_graph_pixel);
-
-        cv::parallel_for_(cv::Range(0, white_domain.rows),
-                          [&](const cv::Range& range) {
-            for (int y = range.start; y < range.end; ++y) {
-                for (int x = 0; x < white_domain.cols; ++x) {
-                    if (white_domain.at<std::uint8_t>(y, x) == 0) {
-                        continue;
-                    }
-                    const int label = nearest_graph_pixel.at<int>(y, x);
-                    if (label <= 0 ||
-                        label >= static_cast<int>(graph_source_points.size())) {
-                        continue;
-                    }
-                    const cv::Point graph_pixel = graph_source_points[label];
-                    if (graph_pixel.x < 0) {
-                        continue;
-                    }
-                    const float edge_value =
-                        graph_pixel_flow.at<float>(graph_pixel.y,
-                                                   graph_pixel.x);
-                    dense_flow.at<float>(y, x) =
-                        std::min(capacity_from_dt(dt.at<float>(y, x)),
-                                 edge_value);
+        dense_flow.setTo(-1.0f, white_domain);
+        cv::Mat cached_flow(white_domain.size(), CV_32F, cv::Scalar(-1.0f));
+        cv::Mat cached_flow_pixel(white_domain.size(), CV_32SC2,
+                                  cv::Scalar(-1, -1));
+        for (int y = 0; y < graph_pixel_flow.rows; ++y) {
+            for (int x = 0; x < graph_pixel_flow.cols; ++x) {
+                const float value = graph_pixel_flow.at<float>(y, x);
+                if (value > 0.0f) {
+                    cached_flow.at<float>(y, x) = value;
+                    cached_flow_pixel.at<cv::Vec2i>(y, x) = cv::Vec2i(x, y);
+                    dense_flow.at<float>(y, x) = value;
                 }
             }
-        });
-        timings.push_back(finish_timing("dense_flow_nearest_edge", timing));
+        }
+
+        const std::array<cv::Point, 8> kDirs = {
+            cv::Point(-1, -1), cv::Point(0, -1), cv::Point(1, -1),
+            cv::Point(-1, 0),                    cv::Point(1, 0),
+            cv::Point(-1, 1),  cv::Point(0, 1),  cv::Point(1, 1)};
+        constexpr float kDtStepEps = 1e-4f;
+        const auto in_white_domain = [&](const cv::Point pixel) {
+            return pixel.x >= 0 && pixel.x < white_domain.cols &&
+                   pixel.y >= 0 && pixel.y < white_domain.rows &&
+                   white_domain.at<std::uint8_t>(pixel.y, pixel.x) != 0;
+        };
+        const auto next_ascent_pixel = [&](const cv::Point pixel) {
+            const float current_dt = dt.at<float>(pixel.y, pixel.x);
+            cv::Point best(-1, -1);
+            float best_dt = current_dt;
+            for (const cv::Point dir : kDirs) {
+                const cv::Point next = pixel + dir;
+                if (!in_white_domain(next)) {
+                    continue;
+                }
+                const float next_dt = dt.at<float>(next.y, next.x);
+                if (next_dt <= current_dt + kDtStepEps) {
+                    continue;
+                }
+                if (best.x < 0 || next_dt > best_dt + kDtStepEps ||
+                    (std::abs(next_dt - best_dt) <= kDtStepEps &&
+                     (std::abs(dir.x) + std::abs(dir.y) == 1))) {
+                    best = next;
+                    best_dt = next_dt;
+                }
+            }
+            return best;
+        };
+        const auto attenuation_value = [&](float flow_value,
+                                           const cv::Point query_pixel) {
+            const float query_dt = dt.at<float>(query_pixel.y, query_pixel.x);
+            if (query_dt <= kDtStepEps) {
+                return flow_value;
+            }
+            return flow_value / query_dt;
+        };
+        const auto nearby_graph_flow = [&](const cv::Point pixel, int radius,
+                                           cv::Point& flow_pixel) {
+            float best = 0.0f;
+            flow_pixel = cv::Point(-1, -1);
+            for (int dy = -radius; dy <= radius; ++dy) {
+                for (int dx = -radius; dx <= radius; ++dx) {
+                    const cv::Point next(pixel.x + dx, pixel.y + dy);
+                    if (next.x < 0 || next.x >= graph_pixel_flow.cols ||
+                        next.y < 0 || next.y >= graph_pixel_flow.rows) {
+                        continue;
+                    }
+                    const float value =
+                        graph_pixel_flow.at<float>(next.y, next.x);
+                    if (value > best) {
+                        best = value;
+                        flow_pixel = next;
+                    }
+                }
+            }
+            return best;
+        };
+        const auto nearby_higher_dt_pixel = [&](const cv::Point pixel,
+                                                int radius) {
+            const float current_dt = dt.at<float>(pixel.y, pixel.x);
+            cv::Point best(-1, -1);
+            float best_dt = current_dt;
+            for (int dy = -radius; dy <= radius; ++dy) {
+                for (int dx = -radius; dx <= radius; ++dx) {
+                    if (dx == 0 && dy == 0) {
+                        continue;
+                    }
+                    const cv::Point next(pixel.x + dx, pixel.y + dy);
+                    if (!in_white_domain(next)) {
+                        continue;
+                    }
+                    const float next_dt = dt.at<float>(next.y, next.x);
+                    if (next_dt > best_dt + kDtStepEps) {
+                        best = next;
+                        best_dt = next_dt;
+                    }
+                }
+            }
+            return best;
+        };
+
+        std::vector<cv::Point> path;
+        path.reserve(256);
+        for (int y = 0; y < white_domain.rows; ++y) {
+            for (int x = 0; x < white_domain.cols; ++x) {
+                if (white_domain.at<std::uint8_t>(y, x) == 0 ||
+                    dense_flow.at<float>(y, x) >= 0.0f) {
+                    continue;
+                }
+
+                path.clear();
+                cv::Point current(x, y);
+                float result_flow = 0.0f;
+                cv::Point result_pixel(-1, -1);
+                while (in_white_domain(current)) {
+                    const float cached =
+                        cached_flow.at<float>(current.y, current.x);
+                    if (cached >= 0.0f) {
+                        result_flow = cached;
+                        const cv::Vec2i cached_pixel =
+                            cached_flow_pixel.at<cv::Vec2i>(current.y,
+                                                             current.x);
+                        result_pixel =
+                            cv::Point(cached_pixel[0], cached_pixel[1]);
+                        break;
+                    }
+                    path.push_back(current);
+                    const cv::Point next = next_ascent_pixel(current);
+                    if (next.x < 0) {
+                        result_flow =
+                            nearby_graph_flow(current, 2, result_pixel);
+                        if (result_flow > 0.0f) {
+                            break;
+                        }
+                        const cv::Point jump = nearby_higher_dt_pixel(current, 2);
+                        if (jump.x >= 0) {
+                            current = jump;
+                            continue;
+                        }
+                        break;
+                    }
+                    current = next;
+                }
+
+                for (const cv::Point pixel : path) {
+                    if (result_flow > 0.0f && result_pixel.x >= 0) {
+                        cached_flow.at<float>(pixel.y, pixel.x) = result_flow;
+                        cached_flow_pixel.at<cv::Vec2i>(pixel.y, pixel.x) =
+                            cv::Vec2i(result_pixel.x, result_pixel.y);
+                        dense_flow.at<float>(pixel.y, pixel.x) =
+                            attenuation_value(result_flow, pixel);
+                    } else {
+                        dense_flow.at<float>(pixel.y, pixel.x) =
+                            ((pixel.x + pixel.y) & 1) != 0 ? 127.0f : 0.0f;
+                    }
+                }
+            }
+        }
+        dense_flow.setTo(0.0f, dense_flow < 0.0f);
+        timings.push_back(finish_timing("dense_flow_dt_ascent", timing));
     }
 
     cv::Mat graph_edge_flow(white_domain.size(), CV_32FC3,
@@ -2530,6 +2654,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     cv::Mat edge_flow_px(white_domain.size(), CV_32FC3, cv::Scalar(0, 0, 0));
     cv::Mat edge_flow_px_gray_bg(white_domain.size(), CV_32FC3,
                                  cv::Scalar(127, 127, 127));
+    cv::Mat flow_attn(white_domain.size(), CV_32FC3, cv::Scalar(0, 0, 0));
     cv::Mat graph_source_edges(white_domain.size(), CV_8U, cv::Scalar(0));
     double max_edge_flow = 0.0;
     float finite_edge_flow_min = std::numeric_limits<float>::max();
@@ -2559,6 +2684,9 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                 cv::Vec3f(value, value, value);
             edge_flow_px_gray_bg.at<cv::Vec3f>(y, x) =
                 cv::Vec3f(value, value, value);
+            const float local_dt = dt.at<float>(y, x);
+            const float attn = local_dt > 1e-4f ? value / local_dt : value;
+            flow_attn.at<cv::Vec3f>(y, x) = cv::Vec3f(attn, attn, attn);
         }
     }
     for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
@@ -2592,6 +2720,10 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         const std::string edge_text = flow_text(edge_flow[edge_index]);
         const float px_value = graph_pixel_flow.at<float>(anchor.y, anchor.x);
         const std::string px_text = flow_text(px_value);
+        const float anchor_dt = dt.at<float>(anchor.y, anchor.x);
+        const float attn_value =
+            anchor_dt > 1e-4f ? px_value / anchor_dt : px_value;
+        const std::string attn_text = flow_text(attn_value);
         draw_debug_label(graph_edge_flow_gray_bg, anchor, edge_text,
                          cv::Scalar(255, 255, 255));
         draw_debug_label(graph_edge_flow, anchor, edge_text,
@@ -2600,12 +2732,18 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                          cv::Scalar(255, 255, 255));
         draw_debug_label(edge_flow_px_gray_bg, anchor, px_text,
                          cv::Scalar(255, 255, 255));
+        draw_debug_label(flow_attn, anchor, attn_text,
+                         cv::Scalar(255, 255, 255));
     }
 
     for (int node = 1; node < node_count; ++node) {
         const cv::Point anchor(cvRound(graph.nodes[node].x),
                                cvRound(graph.nodes[node].y));
         const std::string text = flow_text(node_flow[node]);
+        const float node_dt = dt.at<float>(anchor.y, anchor.x);
+        const double node_attn =
+            node_dt > 1e-4f ? node_flow[node] / node_dt : node_flow[node];
+        const std::string attn_text = flow_text(node_attn);
         draw_debug_label(graph_edge_flow_gray_bg, anchor, text,
                          cv::Scalar(180, 180, 180));
         draw_debug_label(graph_edge_flow, anchor, text,
@@ -2614,9 +2752,12 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                          cv::Scalar(180, 180, 180));
         draw_debug_label(edge_flow_px_gray_bg, anchor, text,
                          cv::Scalar(180, 180, 180));
+        draw_debug_label(flow_attn, anchor, attn_text,
+                         cv::Scalar(180, 180, 180));
     }
 
     return {dense_flow,
+            flow_attn,
             graph_edge_flow,
             graph_edge_flow_gray_bg,
             edge_flow_px,
@@ -3203,6 +3344,8 @@ int main(int argc, char** argv) {
             const TimingMark timing = start_timing();
             write_image(workdir / (stem + "_dense_flow.tif"),
                         dense_flow_result.dense_flow);
+            write_image(workdir / (stem + "_flow_attn.tif"),
+                        dense_flow_result.flow_attn);
             write_image(workdir / (stem + "_graph_edge_flow.tif"),
                         dense_flow_result.graph_edge_flow);
             write_image(workdir / (stem + "_graph_edge_flow_gray_bg.tif"),
@@ -3232,6 +3375,8 @@ int main(int argc, char** argv) {
         if (has_dense_flow) {
             layered_tiff.push_back(
                 {"dense_flow", to_float_layer(dense_flow_result.dense_flow)});
+            layered_tiff.push_back(
+                {"flow_attn", to_float_layer(dense_flow_result.flow_attn)});
             layered_tiff.push_back(
                 {"graph_edge_flow",
                  to_float_layer(dense_flow_result.graph_edge_flow)});
@@ -3367,6 +3512,8 @@ int main(int argc, char** argv) {
                   << "  " << (workdir / (stem + "_layers.tif")) << "\n";
         if (has_dense_flow) {
             std::cout << "  " << (workdir / (stem + "_dense_flow.tif"))
+                      << "\n"
+                      << "  " << (workdir / (stem + "_flow_attn.tif"))
                       << "\n"
                       << "  " << (workdir / (stem + "_graph_edge_flow.tif"))
                       << "\n"
