@@ -194,7 +194,8 @@ std::unique_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::share
     if (!volume)
         return nullptr;
 
-    vc::render::OpenedChunkedZarr opened = volume->isRemote()
+    const bool isRemote = volume->isRemote();
+    vc::render::OpenedChunkedZarr opened = isRemote
         ? vc::render::openHttpZarrPyramid(
               volume->remoteUrl(), volume->remoteAuth(), volume->baseScaleLevel())
         : vc::render::openLocalZarrPyramid(volume->path());
@@ -205,8 +206,15 @@ std::unique_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::share
     vc::render::ChunkCache::Options options;
     options.decodedByteCapacity = 2ULL * 1024ULL * 1024ULL * 1024ULL;
     options.maxConcurrentReads = 16;
-    const auto cacheRoot = std::filesystem::path("/home/sean/.VC3D/remote_cache");
-    options.persistentCachePath = cacheRoot / stableHexHash(normalizedVolumeCacheIdentity(volume));
+    if (isRemote) {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        const QString defaultCache = vc3d::defaultCacheBase() + "/remote_cache";
+        const auto cacheRoot = std::filesystem::path(
+            settings.value(vc3d::settings::viewer::REMOTE_CACHE_DIR, defaultCache)
+                .toString()
+                .toStdString());
+        options.persistentCachePath = cacheRoot / stableHexHash(normalizedVolumeCacheIdentity(volume));
+    }
 
     return std::make_unique<vc::render::ChunkCache>(
         makeLevelInfo(opened), opened.fetchers, opened.fillValue, options);

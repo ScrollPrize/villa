@@ -33,6 +33,15 @@ utils::PriorityThreadPool& chunkWorkerPool(std::size_t workerCount)
     return *pool;
 }
 
+utils::ThreadPool& persistentCacheWriterPool()
+{
+    // Keep disk-cache writes off the chunk read/fetch pool. A single writer
+    // avoids same-path tmp/rename races while preventing writeback from
+    // occupying workers needed by the current view.
+    static utils::ThreadPool pool(1);
+    return pool;
+}
+
 std::string fetchErrorMessage(const ChunkFetchResult& fetch)
 {
     if (!fetch.message.empty())
@@ -278,25 +287,25 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state, ChunkKey key
         std::lock_guard lock(state->mutex_);
         if (generation != state->generation_)
             return;
-        storeFetchResultLocked(*state, key, std::move(fetch));
+        storeFetchResultLocked(state, key, std::move(fetch));
     }
     state->cv_.notify_all();
     notifyListeners(state);
 }
 
-void ChunkCache::storeFetchResultLocked(State& state, const ChunkKey& key, ChunkFetchResult fetch)
+void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state, const ChunkKey& key, ChunkFetchResult fetch)
 {
-    auto it = state.entries_.find(key);
-    if (it == state.entries_.end())
+    auto it = state->entries_.find(key);
+    if (it == state->entries_.end())
         return;
 
     Entry& entry = it->second;
     if (entry.inLru) {
-        state.lru_.erase(entry.lruIt);
+        state->lru_.erase(entry.lruIt);
         entry.inLru = false;
     }
     if (entry.status == EntryStatus::Data)
-        state.decodedBytes_ -= entry.decodedBytes;
+        state->decodedBytes_ -= entry.decodedBytes;
 
     entry.bytes.reset();
     entry.error.clear();
@@ -304,19 +313,19 @@ void ChunkCache::storeFetchResultLocked(State& state, const ChunkKey& key, Chunk
 
     switch (fetch.status) {
     case ChunkFetchStatus::Found:
-        if (fetch.bytes.size() != expectedChunkBytes(state, key)) {
+        if (fetch.bytes.size() != expectedChunkBytes(*state, key)) {
             entry.status = EntryStatus::Error;
             entry.error = "decoded chunk byte size does not match full chunk shape";
             break;
         }
-        if (isAllFill(state, fetch.bytes)) {
+        if (isAllFill(*state, fetch.bytes)) {
             entry.status = EntryStatus::AllFill;
             break;
         }
         entry.status = EntryStatus::Data;
         entry.decodedBytes = fetch.bytes.size();
         entry.bytes = std::make_shared<const std::vector<std::byte>>(std::move(fetch.bytes));
-        state.decodedBytes_ += entry.decodedBytes;
+        state->decodedBytes_ += entry.decodedBytes;
         break;
     case ChunkFetchStatus::Missing:
         entry.status = EntryStatus::AllFill;
@@ -329,7 +338,7 @@ void ChunkCache::storeFetchResultLocked(State& state, const ChunkKey& key, Chunk
         break;
     }
 
-    touchLocked(state, key, entry);
+    touchLocked(*state, key, entry);
     enforceCapacityLocked(state);
 }
 
@@ -355,6 +364,20 @@ std::optional<std::vector<std::byte>> ChunkCache::readPersistent(const State& st
     if (bytes.size() != expectedChunkBytes(state, key))
         return std::nullopt;
     return bytes;
+}
+
+void ChunkCache::queuePersistentWrite(const std::shared_ptr<State>& state,
+                                      const ChunkKey& key,
+                                      std::shared_ptr<const std::vector<std::byte>> bytes)
+{
+    if (!state || !state->options_.persistentCachePath || !bytes)
+        return;
+    if (bytes->size() != expectedChunkBytes(*state, key))
+        return;
+
+    persistentCacheWriterPool().enqueue([state, key, bytes = std::move(bytes)] {
+        writePersistent(*state, key, *bytes);
+    });
 }
 
 void ChunkCache::writePersistent(const State& state, const ChunkKey& key, const std::vector<std::byte>& bytes)
@@ -403,22 +426,22 @@ void ChunkCache::touchLocked(State& state, const ChunkKey& key, Entry& entry)
     entry.inLru = true;
 }
 
-void ChunkCache::enforceCapacityLocked(State& state)
+void ChunkCache::enforceCapacityLocked(const std::shared_ptr<State>& state)
 {
-    while (state.decodedBytes_ > state.options_.decodedByteCapacity && !state.lru_.empty()) {
-        const ChunkKey victim = state.lru_.back();
-        state.lru_.pop_back();
-        auto it = state.entries_.find(victim);
-        if (it == state.entries_.end())
+    while (state->decodedBytes_ > state->options_.decodedByteCapacity && !state->lru_.empty()) {
+        const ChunkKey victim = state->lru_.back();
+        state->lru_.pop_back();
+        auto it = state->entries_.find(victim);
+        if (it == state->entries_.end())
             continue;
         Entry& entry = it->second;
         entry.inLru = false;
         if (entry.status == EntryStatus::Data) {
             if (entry.bytes)
-                writePersistent(state, victim, *entry.bytes);
-            state.decodedBytes_ -= entry.decodedBytes;
+                queuePersistentWrite(state, victim, entry.bytes);
+            state->decodedBytes_ -= entry.decodedBytes;
         }
-        state.entries_.erase(it);
+        state->entries_.erase(it);
     }
 }
 
