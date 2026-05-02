@@ -2649,16 +2649,6 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             timings.push_back(finish_timing("voronoi_tree_nearest", timing));
 
             const TimingMark dense_timing = start_timing();
-            constexpr float kTreeRadius = 300.0f;
-            constexpr float kFlowEpsilon = 1.0e-4f;
-            const auto step_distance = [](const cv::Point a,
-                                          const cv::Point b) {
-                const int dx = std::abs(a.x - b.x);
-                const int dy = std::abs(a.y - b.y);
-                return dx + dy == 2 ? static_cast<float>(std::sqrt(2.0))
-                                    : 1.0f;
-            };
-
             for (int y = 0; y < white_domain.rows; ++y) {
                 for (int x = 0; x < white_domain.cols; ++x) {
                     if (white_domain.at<std::uint8_t>(y, x) == 0) {
@@ -2679,33 +2669,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                     if (tree_flow <= 0.0f) {
                         continue;
                     }
-
-                    const float lookup_distance =
-                        nearest_tree_distance.at<float>(y, x);
-                    float remaining =
-                        std::max(0.0f, kTreeRadius - lookup_distance);
-
-                    cv::Point current = tree_pixel;
-                    float endpoint_flow = tree_flow;
-                    while (remaining > kFlowEpsilon) {
-                        const cv::Vec2i parent_vec =
-                            tree_parent.at<cv::Vec2i>(current.y, current.x);
-                        const cv::Point parent(parent_vec[0], parent_vec[1]);
-                        if (parent.x < 0 || parent == current) {
-                            break;
-                        }
-                        const float step = step_distance(current, parent);
-                        const float segment = std::min(step, remaining);
-                        remaining -= segment;
-                        if (segment < step) {
-                            break;
-                        }
-                        endpoint_flow =
-                            tree_pixel_flow.at<float>(parent.y, parent.x);
-                        current = parent;
-                    }
-
-                    tree_dense_flow.at<float>(y, x) = endpoint_flow;
+                    tree_dense_flow.at<float>(y, x) = tree_flow;
                 }
             }
             timings.push_back(finish_timing("tree_dense_flow", dense_timing));
