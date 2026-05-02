@@ -100,7 +100,11 @@ OverlapMaps computeOverlap(const std::shared_ptr<QuadSurface>& a,
             const cv::Vec3f& p = pts(r, c);
             if (p[0] < 0) continue;
 
-            auto res = idx.locate(p, threshold, b);
+            SurfacePatchIndex::PointQuery query;
+            query.worldPoint = p;
+            query.tolerance = threshold;
+            query.surfaces.only = b;
+            auto res = idx.locate(query);
             if (!res || res->distance >= threshold) continue;
 
             m.mask(r, c) = 1;
@@ -302,7 +306,11 @@ std::vector<Anchor> pickAnchors(const std::shared_ptr<QuadSurface>& A,
             if (bestR < 0) continue;
 
             const cv::Vec3f& aw = ptsA(bestR, bestC);
-            auto res = idx.locate(aw, locateTolerance, B);
+            SurfacePatchIndex::PointQuery query;
+            query.worldPoint = aw;
+            query.tolerance = locateTolerance;
+            query.surfaces.only = B;
+            auto res = idx.locate(query);
             if (!res || res->distance >= locateTolerance) continue;
 
             const cv::Vec2f bg = B->ptrToGrid(res->ptr);
@@ -2580,4 +2588,3 @@ int main(int argc, char** argv)
         return EXIT_FAILURE;
     }
 }
-
