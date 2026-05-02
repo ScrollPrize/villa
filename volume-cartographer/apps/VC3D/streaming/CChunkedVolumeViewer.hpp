@@ -164,6 +164,7 @@ public slots:
     void onKeyPress(int key, Qt::KeyboardModifiers modifiers);
     void onKeyRelease(int, Qt::KeyboardModifiers) {}
     void onScrolled() {}
+    void onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
     void onPOIChanged(const std::string& name, POI* poi);
     void adjustZoomByFactor(float factor) override;
 
@@ -373,6 +374,7 @@ private:
     QPointF _lastPanSceneF;
     QPointF _lastScenePos;
 
+    std::vector<ViewerOverlayControllerBase::PathPrimitive> _drawingPaths;
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
     QGraphicsItem* _cursorCrosshair = nullptr;
     QGraphicsItem* _focusMarker = nullptr;

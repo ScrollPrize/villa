@@ -1832,6 +1832,16 @@ void CAdaptiveVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton but
     emit sendMouseReleaseVolume(p, button, modifiers, scenePos);
 }
 
+void CAdaptiveVolumeViewer::onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths)
+{
+    _drawingPaths.clear();
+    _drawingPaths.reserve(static_cast<std::size_t>(paths.size()));
+    for (const auto& path : paths) {
+        _drawingPaths.push_back(path);
+    }
+    emit overlaysUpdated();
+}
+
 void CAdaptiveVolumeViewer::setBBoxMode(bool enabled)
 {
     _bboxMode = enabled;

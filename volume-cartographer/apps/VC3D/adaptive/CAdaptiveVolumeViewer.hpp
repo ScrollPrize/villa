@@ -151,8 +151,7 @@ public:
     uint64_t selectedCollectionId() const override { return 0; }
     bool isPointDragActive() const override { return false; }
     const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const override {
-        static std::vector<ViewerOverlayControllerBase::PathPrimitive> empty;
-        return empty;
+        return _drawingPaths;
     }
 
     // --- Overlay management ---
@@ -259,7 +258,7 @@ public slots:
 
     void onCollectionSelected(uint64_t) {}
     void onPointSelected(uint64_t) {}
-    void onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>&) {}
+    void onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
     void onDrawingModeActive(bool, float = 3.0f, bool = false) {}
     void adjustZoomByFactor(float factor) override;
 
@@ -510,6 +509,7 @@ private:
     QPointF _lastScenePos;
 
     // --- Overlay groups (stored for VolumeViewerBase interface) ---
+    std::vector<ViewerOverlayControllerBase::PathPrimitive> _drawingPaths;
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
     QGraphicsItem* _focusMarker = nullptr;
 

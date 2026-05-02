@@ -1615,6 +1615,16 @@ void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton butt
     emit sendMouseReleaseVolume(sceneToVolume(scenePos), button, modifiers, scenePos);
 }
 
+void CChunkedVolumeViewer::onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths)
+{
+    _drawingPaths.clear();
+    _drawingPaths.reserve(static_cast<std::size_t>(paths.size()));
+    for (const auto& path : paths) {
+        _drawingPaths.push_back(path);
+    }
+    emit overlaysUpdated();
+}
+
 void CChunkedVolumeViewer::onKeyPress(int key, Qt::KeyboardModifiers)
 {
     constexpr float kPanPx = 64.0f;
@@ -2130,8 +2140,7 @@ const VolumeViewerBase::ActiveSegmentationHandle& CChunkedVolumeViewer::activeSe
 
 const std::vector<ViewerOverlayControllerBase::PathPrimitive>& CChunkedVolumeViewer::drawingPaths() const
 {
-    static std::vector<ViewerOverlayControllerBase::PathPrimitive> empty;
-    return empty;
+    return _drawingPaths;
 }
 
 const std::map<std::string, cv::Vec3b>& CChunkedVolumeViewer::surfaceOverlays() const

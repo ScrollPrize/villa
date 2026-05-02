@@ -985,6 +985,32 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
                     this,
                     &CWindow::onVolumeClicked,
                     Qt::UniqueConnection);
+            if (_drawingWidget && !chunkedViewer->property("vc_drawing_bound").toBool()) {
+                connect(_drawingWidget, &DrawingWidget::sendPathsChanged,
+                        chunkedViewer, &CChunkedVolumeViewer::onPathsChanged, Qt::UniqueConnection);
+                connect(chunkedViewer, &CChunkedVolumeViewer::sendMousePressVolume,
+                        _drawingWidget, &DrawingWidget::onMousePress, Qt::UniqueConnection);
+                connect(chunkedViewer, &CChunkedVolumeViewer::sendMouseMoveVolume,
+                        _drawingWidget, &DrawingWidget::onMouseMove, Qt::UniqueConnection);
+                connect(chunkedViewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
+                        _drawingWidget, &DrawingWidget::onMouseRelease, Qt::UniqueConnection);
+                connect(chunkedViewer, &CChunkedVolumeViewer::sendZSliceChanged,
+                        _drawingWidget, &DrawingWidget::updateCurrentZSlice, Qt::UniqueConnection);
+                chunkedViewer->setProperty("vc_drawing_bound", true);
+            }
+            if (_seedingWidget && !chunkedViewer->property("vc_seeding_bound").toBool()) {
+                connect(_seedingWidget, &SeedingWidget::sendPathsChanged,
+                        chunkedViewer, &CChunkedVolumeViewer::onPathsChanged, Qt::UniqueConnection);
+                connect(chunkedViewer, &CChunkedVolumeViewer::sendMousePressVolume,
+                        _seedingWidget, &SeedingWidget::onMousePress, Qt::UniqueConnection);
+                connect(chunkedViewer, &CChunkedVolumeViewer::sendMouseMoveVolume,
+                        _seedingWidget, &SeedingWidget::onMouseMove, Qt::UniqueConnection);
+                connect(chunkedViewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
+                        _seedingWidget, &SeedingWidget::onMouseRelease, Qt::UniqueConnection);
+                connect(chunkedViewer, &CChunkedVolumeViewer::sendZSliceChanged,
+                        _seedingWidget, &SeedingWidget::updateCurrentZSlice, Qt::UniqueConnection);
+                chunkedViewer->setProperty("vc_seeding_bound", true);
+            }
         }
         auto s = viewer->compositeRenderSettings();
         s.params.method = compositeMethodForModeIndex(ui.cmbCompositeMode->currentIndex());
