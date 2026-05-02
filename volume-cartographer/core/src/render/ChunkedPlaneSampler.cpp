@@ -51,7 +51,9 @@ bool finiteCoord(const cv::Vec3f& p)
 
 bool surfaceSentinel(const cv::Vec3f& p)
 {
-    return !finiteCoord(p) || (p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f);
+    return !finiteCoord(p)
+        || p[0] == -1.0f || p[1] == -1.0f || p[2] == -1.0f
+        || (p[0] == 0.0f && p[1] == 0.0f && p[2] == 0.0f);
 }
 
 LevelAccess makeLevelAccess(IChunkedArray& array, int level)

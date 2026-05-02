@@ -625,6 +625,9 @@ bool CChunkedVolumeViewer::renderInteractiveAxisAlignedSlicePreview()
     if (std::abs(uStep[fixedAxis]) > 1e-5f || std::abs(vStep[fixedAxis]) > 1e-5f)
         return false;
 
+    if (origin[fixedAxis] < 0.0f || origin[fixedAxis] >= float(shapeXyz[fixedAxis]))
+        return false;
+
     const int fixed = std::clamp(int(std::lround(origin[fixedAxis])), 0, shapeXyz[fixedAxis] - 1);
     const float u0 = origin[uAxis];
     const float u1 = origin[uAxis] + uStep[uAxis] * float(std::max(0, fbW - 1));
@@ -825,12 +828,12 @@ int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const
         return 0;
 
     // `_dsScaleIdx` intentionally waits for about 2x more zoom before moving
-    // to a finer level. During active motion, bias coarser as motion gets
-    // faster; the normal settled render removes this bias.
+    // to a finer level. Plane views can bias coarser during active motion;
+    // surface-resolution views keep their target level to avoid panning blur.
     int level = _dsScaleIdx;
     if (preferSurfaceResolution)
         level -= kSurfaceResolutionLevelBias;
-    if (_interactivePreview && _chunkArray->numLevels() > 1) {
+    if (_interactivePreview && !preferSurfaceResolution && _chunkArray->numLevels() > 1) {
         const double speed = std::max(0.0, _interactionSpeedPxPerSec);
         const double t = std::clamp((speed - kSlowMotionPxPerSec) /
                                     (kFastMotionPxPerSec - kSlowMotionPxPerSec),
@@ -863,11 +866,7 @@ void CChunkedVolumeViewer::markInteractiveMotion(double motionPx)
 
 int CChunkedVolumeViewer::genericPreviewDownsampleFactor() const
 {
-    if (!_interactivePreview)
-        return 1;
-    if (_interactionSpeedPxPerSec >= kSlowMotionPxPerSec)
-        return 2;
-    return 2;
+    return 1;
 }
 
 bool CChunkedVolumeViewer::streamingCompositeUnsupported() const
@@ -967,7 +966,7 @@ void CChunkedVolumeViewer::samplePlaneIntoValues(
             vc::render::ChunkedPlaneSampler::samplePlaneLevel(
                 *_chunkArray, startLevel, origin, vxStep, vyStep, values, coverage, options);
         } else {
-            vc::render::ChunkedPlaneSampler::samplePlaneCoarseToFine(
+            vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
                 *_chunkArray, startLevel, origin, vxStep, vyStep, values, coverage, options);
         }
         return;
@@ -993,7 +992,7 @@ void CChunkedVolumeViewer::samplePlaneIntoValues(
                 *_chunkArray, startLevel, layerOrigin, vxStep, vyStep,
                 layerValues.back(), layerCoverage.back(), compositeOptions);
         } else {
-            vc::render::ChunkedPlaneSampler::samplePlaneCoarseToFine(
+            vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
                 *_chunkArray, startLevel, layerOrigin, vxStep, vyStep,
                 layerValues.back(), layerCoverage.back(), compositeOptions);
         }
@@ -1039,7 +1038,7 @@ void CChunkedVolumeViewer::sampleCoordsIntoValues(
             vc::render::ChunkedPlaneSampler::sampleCoordsLevel(
                 *_chunkArray, startLevel, coords, values, coverage, options);
         } else {
-            vc::render::ChunkedPlaneSampler::sampleCoordsCoarseToFine(
+            vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
                 *_chunkArray, startLevel, coords, values, coverage, options);
         }
         return;
@@ -1078,7 +1077,7 @@ void CChunkedVolumeViewer::sampleCoordsIntoValues(
                 *_chunkArray, startLevel, layerCoords,
                 layerValues.back(), layerCoverage.back(), compositeOptions);
         } else {
-            vc::render::ChunkedPlaneSampler::sampleCoordsCoarseToFine(
+            vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
                 *_chunkArray, startLevel, layerCoords,
                 layerValues.back(), layerCoverage.back(), compositeOptions);
         }
@@ -1188,7 +1187,7 @@ void CChunkedVolumeViewer::submitRender()
                 vc::render::ChunkedPlaneSampler::sampleCoordsLevel(
                     *_chunkArray, startLevel, previewCoords, previewValues, previewCoverage, options);
             } else {
-                vc::render::ChunkedPlaneSampler::sampleCoordsCoarseToFine(
+                vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
                     *_chunkArray, startLevel, previewCoords, previewValues, previewCoverage, options);
             }
 
@@ -1333,7 +1332,7 @@ void CChunkedVolumeViewer::renderOverlayVolumeForPlane(
             *_overlayChunkArray, level, origin, vxStep, vyStep,
             overlayValues, overlayCoverage, options);
     } else {
-        vc::render::ChunkedPlaneSampler::samplePlaneCoarseToFine(
+        vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
             *_overlayChunkArray, level, origin, vxStep, vyStep,
             overlayValues, overlayCoverage, options);
     }
@@ -1359,7 +1358,7 @@ void CChunkedVolumeViewer::renderOverlayVolumeForCoords(
         vc::render::ChunkedPlaneSampler::sampleCoordsLevel(
             *_overlayChunkArray, level, coords, overlayValues, overlayCoverage, options);
     } else {
-        vc::render::ChunkedPlaneSampler::sampleCoordsCoarseToFine(
+        vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
             *_overlayChunkArray, level, coords, overlayValues, overlayCoverage, options);
     }
 }
