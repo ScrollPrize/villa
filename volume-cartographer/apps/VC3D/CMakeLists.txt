@@ -101,8 +101,8 @@ set(srcs
     overlays/VectorOverlayController.hpp
     overlays/PlaneSlicingOverlayController.cpp
     overlays/PlaneSlicingOverlayController.hpp
-    overlays/TransformOverlayController.cpp
-    overlays/TransformOverlayController.hpp
+    overlays/SurfaceRotationOverlayController.cpp
+    overlays/SurfaceRotationOverlayController.hpp
     overlays/VolumeOverlayController.cpp
     overlays/VolumeOverlayController.hpp
     overlays/ViewerOverlayControllerBase.cpp

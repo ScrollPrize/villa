@@ -2377,8 +2377,8 @@ void CWindow::CreateWidgets(void)
     _segmentationOverlay = std::make_unique<SegmentationOverlayController>(_state, this);
     _segmentationOverlay->setEditManager(_segmentationEdit.get());
     _segmentationOverlay->setViewerManager(_viewerManager.get());
-    _transformOverlay = std::make_unique<TransformOverlayController>(_state, this);
-    _transformOverlay->setViewerManager(_viewerManager.get());
+    _surfaceRotationOverlay = std::make_unique<SurfaceRotationOverlayController>(_state, this);
+    _surfaceRotationOverlay->setViewerManager(_viewerManager.get());
 
     _segmentationModule = std::make_unique<SegmentationModule>(
         _segmentationWidget,

@@ -14,11 +14,11 @@ class QGraphicsProxyWidget;
 class ViewerManager;
 class VolumeViewerBase;
 
-class TransformOverlayController : public QObject
+class SurfaceRotationOverlayController : public QObject
 {
 public:
-    explicit TransformOverlayController(CState* state, QObject* parent = nullptr);
-    ~TransformOverlayController() override;
+    explicit SurfaceRotationOverlayController(CState* state, QObject* parent = nullptr);
+    ~SurfaceRotationOverlayController() override;
 
     void setViewerManager(ViewerManager* manager);
     void beginRotate();

@@ -28,7 +28,7 @@
 #include "overlays/BBoxOverlayController.hpp"
 #include "overlays/VectorOverlayController.hpp"
 #include "overlays/PlaneSlicingOverlayController.hpp"
-#include "overlays/TransformOverlayController.hpp"
+#include "overlays/SurfaceRotationOverlayController.hpp"
 #include "overlays/VolumeOverlayController.hpp"
 
 class CChunkedVolumeViewer;
@@ -221,7 +221,7 @@ private:
     std::unique_ptr<BBoxOverlayController> _bboxOverlay;
     std::unique_ptr<VectorOverlayController> _vectorOverlay;
     std::unique_ptr<PlaneSlicingOverlayController> _planeSlicingOverlay;
-    std::unique_ptr<TransformOverlayController> _transformOverlay;
+    std::unique_ptr<SurfaceRotationOverlayController> _surfaceRotationOverlay;
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<MenuActionController> _menuController;

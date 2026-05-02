@@ -1,4 +1,4 @@
-#include "TransformOverlayController.hpp"
+#include "SurfaceRotationOverlayController.hpp"
 
 #include "../CState.hpp"
 #include "../volume_viewers/CVolumeViewerView.hpp"
@@ -214,13 +214,13 @@ private:
 };
 } // namespace
 
-TransformOverlayController::TransformOverlayController(CState* state, QObject* parent)
+SurfaceRotationOverlayController::SurfaceRotationOverlayController(CState* state, QObject* parent)
     : QObject(parent)
     , _state(state)
 {
 }
 
-TransformOverlayController::~TransformOverlayController()
+SurfaceRotationOverlayController::~SurfaceRotationOverlayController()
 {
     clearWidgets();
     if (_viewerManager) {
@@ -229,7 +229,7 @@ TransformOverlayController::~TransformOverlayController()
     }
 }
 
-void TransformOverlayController::setViewerManager(ViewerManager* manager)
+void SurfaceRotationOverlayController::setViewerManager(ViewerManager* manager)
 {
     if (_viewerManager == manager) {
         return;
@@ -255,7 +255,7 @@ void TransformOverlayController::setViewerManager(ViewerManager* manager)
     _viewerManager->forEachBaseViewer([this](auto* viewer) { attachViewer(viewer); });
 }
 
-void TransformOverlayController::beginRotate()
+void SurfaceRotationOverlayController::beginRotate()
 {
     auto source = currentSourceSurface();
     if (!source) {
@@ -274,7 +274,7 @@ void TransformOverlayController::beginRotate()
     ensureWidgetForTarget();
 }
 
-void TransformOverlayController::cancelRotate()
+void SurfaceRotationOverlayController::cancelRotate()
 {
     if (_rotateActive && _state && _sourceSurface) {
         _state->setSurface("segmentation", _sourceSurface, false, true);
@@ -286,7 +286,7 @@ void TransformOverlayController::cancelRotate()
     clearWidgets();
 }
 
-void TransformOverlayController::attachViewer(VolumeViewerBase* viewer)
+void SurfaceRotationOverlayController::attachViewer(VolumeViewerBase* viewer)
 {
     if (!viewer) {
         return;
@@ -314,7 +314,7 @@ void TransformOverlayController::attachViewer(VolumeViewerBase* viewer)
     _viewers.push_back(entry);
 }
 
-void TransformOverlayController::detachViewer(VolumeViewerBase* viewer)
+void SurfaceRotationOverlayController::detachViewer(VolumeViewerBase* viewer)
 {
     auto it = std::remove_if(_viewers.begin(), _viewers.end(), [viewer](ViewerEntry& entry) {
         if (entry.viewer != viewer) {
@@ -331,7 +331,7 @@ void TransformOverlayController::detachViewer(VolumeViewerBase* viewer)
     _viewers.erase(it, _viewers.end());
 }
 
-VolumeViewerBase* TransformOverlayController::targetViewer() const
+VolumeViewerBase* SurfaceRotationOverlayController::targetViewer() const
 {
     if (!_viewerManager) {
         return nullptr;
@@ -352,7 +352,7 @@ VolumeViewerBase* TransformOverlayController::targetViewer() const
     return fallback;
 }
 
-std::shared_ptr<QuadSurface> TransformOverlayController::currentSourceSurface() const
+std::shared_ptr<QuadSurface> SurfaceRotationOverlayController::currentSourceSurface() const
 {
     if (!_state) {
         return nullptr;
@@ -364,7 +364,7 @@ std::shared_ptr<QuadSurface> TransformOverlayController::currentSourceSurface() 
     return std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
 }
 
-void TransformOverlayController::ensureWidgetForTarget()
+void SurfaceRotationOverlayController::ensureWidgetForTarget()
 {
     clearWidgets();
     if (!_rotateActive) {
@@ -403,7 +403,7 @@ void TransformOverlayController::ensureWidgetForTarget()
     positionWidget(*it);
 }
 
-void TransformOverlayController::clearWidgets()
+void SurfaceRotationOverlayController::clearWidgets()
 {
     for (auto& entry : _viewers) {
         if (entry.viewer) {
@@ -413,7 +413,7 @@ void TransformOverlayController::clearWidgets()
     }
 }
 
-void TransformOverlayController::positionWidget(ViewerEntry& entry) const
+void SurfaceRotationOverlayController::positionWidget(ViewerEntry& entry) const
 {
     if (!entry.proxy || !entry.viewer || !entry.viewer->graphicsView()) {
         return;
@@ -423,7 +423,7 @@ void TransformOverlayController::positionWidget(ViewerEntry& entry) const
     entry.proxy->setPos(sceneAnchor);
 }
 
-void TransformOverlayController::setAngle(double angleDeg)
+void SurfaceRotationOverlayController::setAngle(double angleDeg)
 {
     const double clamped = std::clamp(angleDeg, -360.0, 360.0);
     if (std::abs(_angleDeg - clamped) < 1e-4) {
@@ -433,7 +433,7 @@ void TransformOverlayController::setAngle(double angleDeg)
     updatePreview();
 }
 
-void TransformOverlayController::updatePreview()
+void SurfaceRotationOverlayController::updatePreview()
 {
     if (!_rotateActive || !_state || !_sourceSurface) {
         return;
@@ -453,7 +453,7 @@ void TransformOverlayController::updatePreview()
     _state->setSurface("segmentation", _previewSurface, false, true);
 }
 
-void TransformOverlayController::applyRotation()
+void SurfaceRotationOverlayController::applyRotation()
 {
     if (!_rotateActive || !_state || !_sourceSurface) {
         cancelRotate();
@@ -489,7 +489,7 @@ void TransformOverlayController::applyRotation()
     clearWidgets();
 }
 
-std::shared_ptr<QuadSurface> TransformOverlayController::cloneSurface(const std::shared_ptr<QuadSurface>& surface)
+std::shared_ptr<QuadSurface> SurfaceRotationOverlayController::cloneSurface(const std::shared_ptr<QuadSurface>& surface)
 {
     if (!surface) {
         return nullptr;

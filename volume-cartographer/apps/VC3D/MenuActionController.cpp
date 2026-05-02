@@ -1150,7 +1150,7 @@ void MenuActionController::importObjAsPatch()
 
 void MenuActionController::beginRotateSurfaceTransform()
 {
-    if (!_window || !_window->_transformOverlay) {
+    if (!_window || !_window->_surfaceRotationOverlay) {
         return;
     }
 
@@ -1167,7 +1167,7 @@ void MenuActionController::beginRotateSurfaceTransform()
         return;
     }
 
-    _window->_transformOverlay->beginRotate();
+    _window->_surfaceRotationOverlay->beginRotate();
     if (_window->statusBar()) {
         _window->statusBar()->showMessage(QObject::tr("Surface rotation active"), 3000);
     }
