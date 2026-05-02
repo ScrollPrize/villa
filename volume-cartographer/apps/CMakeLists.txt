@@ -93,20 +93,8 @@ target_link_libraries(vc_diffuse_winding
         Ceres::ceres
 )
 
-add_executable(vc_transpose_bench src/vc_transpose_bench.cpp)
-target_link_libraries(vc_transpose_bench vc_core)
-
-add_executable(vc_coord_bench src/vc_coord_bench.cpp)
-target_link_libraries(vc_coord_bench vc_core)
-
-add_executable(vc_tifxyz_bench src/vc_tifxyz_bench.cpp)
-target_link_libraries(vc_tifxyz_bench vc_core)
-
 add_executable(vc_tifxyz_mmap_prepare src/vc_tifxyz_mmap_prepare.cpp)
 target_link_libraries(vc_tifxyz_mmap_prepare TIFF::TIFF)
-
-add_executable(vc_coord_regression src/vc_coord_regression.cpp)
-target_link_libraries(vc_coord_regression vc_core)
 
 add_executable(vc_create_segment_mask src/vc_create_segment_mask.cpp)
 target_link_libraries(vc_create_segment_mask vc_core Boost::program_options)
