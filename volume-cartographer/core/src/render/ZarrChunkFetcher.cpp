@@ -14,6 +14,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 
 namespace vc::render {
@@ -34,6 +35,18 @@ private:
     long status_ = 0;
 };
 
+bool hasSuffix(std::string_view value, std::string_view suffix)
+{
+    return value.size() >= suffix.size() &&
+           value.substr(value.size() - suffix.size()) == suffix;
+}
+
+bool isOptionalMetadataProbe(const std::string& key)
+{
+    return key == "zarr.json" || key == ".zattrs" ||
+           hasSuffix(key, "/zarr.json") || hasSuffix(key, "/.zattrs");
+}
+
 class ClassifyingHttpStore final : public utils::Store {
 public:
     explicit ClassifyingHttpStore(std::string baseUrl, vc::HttpAuth auth = {})
@@ -48,6 +61,8 @@ public:
         if (response.ok())
             return true;
         if (response.not_found())
+            return false;
+        if (response.status_code == 403 && isOptionalMetadataProbe(key))
             return false;
         throw HttpStatusError(response.status_code, key);
     }
@@ -66,6 +81,8 @@ public:
         if (response.ok())
             return std::move(response.body);
         if (response.not_found())
+            return std::nullopt;
+        if (response.status_code == 403 && isOptionalMetadataProbe(key))
             return std::nullopt;
         throw HttpStatusError(response.status_code, key);
     }
@@ -216,6 +233,55 @@ std::vector<int> localLevelNumbers(const std::filesystem::path& root)
     return levels;
 }
 
+std::vector<std::string> remoteLevelKeysFromZattrs(
+    const std::shared_ptr<utils::Store>& store,
+    int firstLevel)
+{
+    auto data = store->get_if_exists(".zattrs");
+    if (!data)
+        return {};
+
+    const std::string json(reinterpret_cast<const char*>(data->data()), data->size());
+    auto attrs = utils::json_parse(json);
+    if (!attrs.contains("multiscales") || !attrs["multiscales"].is_array() ||
+        attrs["multiscales"].empty()) {
+        return {};
+    }
+
+    const auto& ms0 = attrs["multiscales"][0];
+    if (!ms0.contains("datasets") || !ms0["datasets"].is_array())
+        return {};
+
+    std::vector<std::string> keys;
+    int datasetIndex = 0;
+    for (const auto& dataset : ms0["datasets"]) {
+        if (!dataset.contains("path") || !dataset["path"].is_string()) {
+            ++datasetIndex;
+            continue;
+        }
+        std::string path = dataset["path"].get_string();
+        while (!path.empty() && path.front() == '/')
+            path.erase(path.begin());
+        while (!path.empty() && path.back() == '/')
+            path.pop_back();
+        if (!path.empty() && datasetIndex >= firstLevel)
+            keys.push_back(std::move(path));
+        ++datasetIndex;
+    }
+    return keys;
+}
+
+void addRemoteLevelFromKey(
+    OpenedChunkedZarr& opened,
+    const std::shared_ptr<utils::Store>& store,
+    const std::string& key)
+{
+    auto array = utils::ZarrArray::open(store, key, vc::buildZarrCodecRegistry(1));
+    if (array.metadata().dtype == utils::ZarrDtype::uint16)
+        array = utils::ZarrArray::open(store, key, vc::buildZarrCodecRegistry(2));
+    addLevel(opened, std::move(array));
+}
+
 } // namespace
 
 OpenedChunkedZarr openLocalZarrPyramid(const std::filesystem::path& root)
@@ -247,13 +313,19 @@ OpenedChunkedZarr openHttpZarrPyramid(
     auto store = std::make_shared<ClassifyingHttpStore>(url, auth);
     OpenedChunkedZarr opened;
     const int firstPhysicalLevel = std::max(0, baseScaleLevel);
+
+    const auto zattrsLevelKeys = remoteLevelKeysFromZattrs(store, firstPhysicalLevel);
+    if (!zattrsLevelKeys.empty()) {
+        for (const auto& key : zattrsLevelKeys) {
+            addRemoteLevelFromKey(opened, store, key);
+        }
+        return opened;
+    }
+
     for (int physicalLevel = firstPhysicalLevel; physicalLevel < 32; ++physicalLevel) {
         const auto key = std::to_string(physicalLevel);
         try {
-            auto array = utils::ZarrArray::open(store, key, vc::buildZarrCodecRegistry(1));
-            if (array.metadata().dtype == utils::ZarrDtype::uint16)
-                array = utils::ZarrArray::open(store, key, vc::buildZarrCodecRegistry(2));
-            addLevel(opened, std::move(array));
+            addRemoteLevelFromKey(opened, store, key);
         } catch (const HttpStatusError& e) {
             if (e.status() == 404)
                 break;
