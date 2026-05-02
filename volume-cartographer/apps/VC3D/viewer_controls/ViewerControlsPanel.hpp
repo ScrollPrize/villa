@@ -6,6 +6,7 @@ class QDoubleSpinBox;
 class QLabel;
 class QPushButton;
 class QCheckBox;
+class QComboBox;
 class QScrollArea;
 class QSlider;
 class QSpinBox;

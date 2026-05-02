@@ -86,14 +86,14 @@ void moveLayoutItems(QLayout* from, QLayout* to, QWidget* newParent)
     }
 }
 
-void setVisible(QWidget* widget, bool visible)
+void setWidgetVisible(QWidget* widget, bool visible)
 {
     if (widget) {
         widget->setVisible(visible);
     }
 }
 
-void setEnabled(QWidget* widget, bool enabled)
+void setWidgetEnabled(QWidget* widget, bool enabled)
 {
     if (widget) {
         widget->setEnabled(enabled);
@@ -570,74 +570,74 @@ void ViewerCompositePanel::updateCompositeParamsVisibility()
     const bool isPbr = methodIndex == 13;
     const bool isShadedDvr = methodIndex == 14;
 
-    setVisible(_uiRefs.alphaMinLabel, isAlpha);
-    setVisible(_uiRefs.alphaMin, isAlpha);
-    setVisible(_uiRefs.alphaMaxLabel, isAlpha);
-    setVisible(_uiRefs.alphaMax, isAlpha);
-    setVisible(_uiRefs.alphaThresholdLabel, isAlpha);
-    setVisible(_uiRefs.alphaThreshold, isAlpha);
-    setVisible(_uiRefs.materialLabel, isAlpha);
-    setVisible(_uiRefs.material, isAlpha);
+    setWidgetVisible(_uiRefs.alphaMinLabel, isAlpha);
+    setWidgetVisible(_uiRefs.alphaMin, isAlpha);
+    setWidgetVisible(_uiRefs.alphaMaxLabel, isAlpha);
+    setWidgetVisible(_uiRefs.alphaMax, isAlpha);
+    setWidgetVisible(_uiRefs.alphaThresholdLabel, isAlpha);
+    setWidgetVisible(_uiRefs.alphaThreshold, isAlpha);
+    setWidgetVisible(_uiRefs.materialLabel, isAlpha);
+    setWidgetVisible(_uiRefs.material, isAlpha);
 
     const bool showBL = isBL || isVolum;
-    setVisible(_uiRefs.blExtinctionLabel, showBL);
-    setVisible(_uiRefs.blExtinction, showBL);
-    setVisible(_uiRefs.blEmissionLabel, showBL);
-    setVisible(_uiRefs.blEmission, showBL);
-    setVisible(_uiRefs.blAmbientLabel, showBL);
-    setVisible(_uiRefs.blAmbient, showBL);
+    setWidgetVisible(_uiRefs.blExtinctionLabel, showBL);
+    setWidgetVisible(_uiRefs.blExtinction, showBL);
+    setWidgetVisible(_uiRefs.blEmissionLabel, showBL);
+    setWidgetVisible(_uiRefs.blEmission, showBL);
+    setWidgetVisible(_uiRefs.blAmbientLabel, showBL);
+    setWidgetVisible(_uiRefs.blAmbient, showBL);
 
-    setVisible(_uiRefs.shadowStepsLabel, isVolum);
-    setVisible(_uiRefs.shadowSteps, isVolum);
+    setWidgetVisible(_uiRefs.shadowStepsLabel, isVolum);
+    setWidgetVisible(_uiRefs.shadowSteps, isVolum);
 
     const bool showDvrAmbient = isDvr || isShadedDvr;
-    setVisible(_uiRefs.dvrAmbientLabel, showDvrAmbient);
-    setVisible(_uiRefs.dvrAmbient, showDvrAmbient);
-    setVisible(_uiRefs.pbrRoughnessLabel, isPbr);
-    setVisible(_uiRefs.pbrRoughness, isPbr);
-    setVisible(_uiRefs.pbrMetallicLabel, isPbr);
-    setVisible(_uiRefs.pbrMetallic, isPbr);
+    setWidgetVisible(_uiRefs.dvrAmbientLabel, showDvrAmbient);
+    setWidgetVisible(_uiRefs.dvrAmbient, showDvrAmbient);
+    setWidgetVisible(_uiRefs.pbrRoughnessLabel, isPbr);
+    setWidgetVisible(_uiRefs.pbrRoughness, isPbr);
+    setWidgetVisible(_uiRefs.pbrMetallicLabel, isPbr);
+    setWidgetVisible(_uiRefs.pbrMetallic, isPbr);
 
-    setVisible(_uiRefs.lightingEnabled, true);
-    setVisible(_uiRefs.lightAzimuthLabel, lightingOn);
-    setVisible(_uiRefs.lightAzimuth, lightingOn);
-    setVisible(_uiRefs.lightElevationLabel, lightingOn);
-    setVisible(_uiRefs.lightElevation, lightingOn);
-    setVisible(_uiRefs.lightDiffuseLabel, lightingOn);
-    setVisible(_uiRefs.lightDiffuse, lightingOn);
-    setVisible(_uiRefs.lightAmbientLabel, lightingOn);
-    setVisible(_uiRefs.lightAmbient, lightingOn);
-    setVisible(_uiRefs.useVolumeGradients, lightingOn);
+    setWidgetVisible(_uiRefs.lightingEnabled, true);
+    setWidgetVisible(_uiRefs.lightAzimuthLabel, lightingOn);
+    setWidgetVisible(_uiRefs.lightAzimuth, lightingOn);
+    setWidgetVisible(_uiRefs.lightElevationLabel, lightingOn);
+    setWidgetVisible(_uiRefs.lightElevation, lightingOn);
+    setWidgetVisible(_uiRefs.lightDiffuseLabel, lightingOn);
+    setWidgetVisible(_uiRefs.lightDiffuse, lightingOn);
+    setWidgetVisible(_uiRefs.lightAmbientLabel, lightingOn);
+    setWidgetVisible(_uiRefs.lightAmbient, lightingOn);
+    setWidgetVisible(_uiRefs.useVolumeGradients, lightingOn);
 
-    setVisible(_uiRefs.preTfX1, preTfOn);
-    setVisible(_uiRefs.preTfY1, preTfOn);
-    setVisible(_uiRefs.preTfX2, preTfOn);
-    setVisible(_uiRefs.preTfY2, preTfOn);
-    setVisible(_uiRefs.preTfKnot2Label, preTfOn);
-    setVisible(_uiRefs.postTfX1, postTfOn);
-    setVisible(_uiRefs.postTfY1, postTfOn);
-    setVisible(_uiRefs.postTfX2, postTfOn);
-    setVisible(_uiRefs.postTfY2, postTfOn);
-    setVisible(_uiRefs.postTfKnot2Label, postTfOn);
+    setWidgetVisible(_uiRefs.preTfX1, preTfOn);
+    setWidgetVisible(_uiRefs.preTfY1, preTfOn);
+    setWidgetVisible(_uiRefs.preTfX2, preTfOn);
+    setWidgetVisible(_uiRefs.preTfY2, preTfOn);
+    setWidgetVisible(_uiRefs.preTfKnot2Label, preTfOn);
+    setWidgetVisible(_uiRefs.postTfX1, postTfOn);
+    setWidgetVisible(_uiRefs.postTfY1, postTfOn);
+    setWidgetVisible(_uiRefs.postTfX2, postTfOn);
+    setWidgetVisible(_uiRefs.postTfY2, postTfOn);
+    setWidgetVisible(_uiRefs.postTfKnot2Label, postTfOn);
 
-    setVisible(_uiRefs.methodScaleLabel, false);
-    setVisible(_uiRefs.methodScale, false);
-    setVisible(_uiRefs.methodScaleValue, false);
-    setVisible(_uiRefs.methodParamLabel, false);
-    setVisible(_uiRefs.methodParam, false);
-    setVisible(_uiRefs.methodParamValue, false);
+    setWidgetVisible(_uiRefs.methodScaleLabel, false);
+    setWidgetVisible(_uiRefs.methodScale, false);
+    setWidgetVisible(_uiRefs.methodScaleValue, false);
+    setWidgetVisible(_uiRefs.methodParamLabel, false);
+    setWidgetVisible(_uiRefs.methodParam, false);
+    setWidgetVisible(_uiRefs.methodParamValue, false);
 }
 
 void ViewerCompositePanel::updateRakingControlsEnabled(bool enabled)
 {
-    setEnabled(_uiRefs.rakingAzimuth, enabled);
-    setEnabled(_uiRefs.rakingElevation, enabled);
-    setEnabled(_uiRefs.rakingStrength, enabled);
-    setEnabled(_uiRefs.rakingDepthScale, enabled);
-    setEnabled(_uiRefs.rakingAzimuthLabel, enabled);
-    setEnabled(_uiRefs.rakingElevationLabel, enabled);
-    setEnabled(_uiRefs.rakingStrengthLabel, enabled);
-    setEnabled(_uiRefs.rakingDepthLabel, enabled);
+    setWidgetEnabled(_uiRefs.rakingAzimuth, enabled);
+    setWidgetEnabled(_uiRefs.rakingElevation, enabled);
+    setWidgetEnabled(_uiRefs.rakingStrength, enabled);
+    setWidgetEnabled(_uiRefs.rakingDepthScale, enabled);
+    setWidgetEnabled(_uiRefs.rakingAzimuthLabel, enabled);
+    setWidgetEnabled(_uiRefs.rakingElevationLabel, enabled);
+    setWidgetEnabled(_uiRefs.rakingStrengthLabel, enabled);
+    setWidgetEnabled(_uiRefs.rakingDepthLabel, enabled);
 }
 
 void ViewerCompositePanel::applyToSegmentationViewer(const std::function<void(VolumeViewerBase*)>& apply)
