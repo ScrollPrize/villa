@@ -1790,13 +1790,21 @@ void CChunkedVolumeViewer::centerOnSurfacePoint(const cv::Vec2f& point, bool for
     if (!std::isfinite(point[0]) || !std::isfinite(point[1]))
         return;
 
+    const float oldSurfacePtrX = _surfacePtrX;
+    const float oldSurfacePtrY = _surfacePtrY;
     _surfacePtrX = point[0];
     _surfacePtrY = point[1];
     _genCacheDirty = true;
-    _stableFramebufferValid = false;
     if (forceRender) {
+        _stableFramebufferValid = false;
         renderVisible(true);
     } else {
+        const double motionPx = std::hypot(double(_surfacePtrX - oldSurfacePtrX),
+                                          double(_surfacePtrY - oldSurfacePtrY)) *
+                                double(std::max(_scale, kMinScale));
+        markInteractiveMotion(motionPx);
+        if (shouldRefreshInteractivePreview())
+            updateInteractivePreviewFromStableFrame(_surfacePtrX, _surfacePtrY, _scale);
         scheduleRender();
     }
     emit overlaysUpdated();

@@ -136,6 +136,27 @@ VolumeViewerBase* baseViewerFromWidget(QWidget* widget)
     return nullptr;
 }
 
+bool isChunkedViewer(VolumeViewerBase* viewer)
+{
+    return viewer && qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject());
+}
+
+void centerViewerOnVolumePointForNavigation(VolumeViewerBase* viewer, const cv::Vec3f& position)
+{
+    if (!viewer) {
+        return;
+    }
+    viewer->centerOnVolumePoint(position, !isChunkedViewer(viewer));
+}
+
+void centerViewerOnSurfacePointForNavigation(VolumeViewerBase* viewer, const cv::Vec2f& position)
+{
+    if (!viewer) {
+        return;
+    }
+    viewer->centerOnSurfacePoint(position, !isChunkedViewer(viewer));
+}
+
 std::string compositeMethodForModeIndex(int index)
 {
     switch (index) {
@@ -2157,7 +2178,7 @@ void CWindow::recenterPlaneViewersOn(const cv::Vec3f& position)
 
         const std::string name = viewer->surfName();
         if (name == "xy plane" || name == "seg xz" || name == "seg yz") {
-            viewer->centerOnVolumePoint(position, true);
+            centerViewerOnVolumePointForNavigation(viewer, position);
         }
     });
 }
@@ -2195,7 +2216,7 @@ void CWindow::recenterSegmentationViewerNear(const cv::Vec3f& position)
     auto hit = patchIndex->locate(query);
     if (hit && hit->distance <= kMaxDistanceVoxels) {
         const cv::Vec3f loc = activeSurface->loc(hit->ptr);
-        viewer->centerOnSurfacePoint({loc[0], loc[1]}, true);
+        centerViewerOnSurfacePointForNavigation(viewer, {loc[0], loc[1]});
     }
 }
 
@@ -2213,7 +2234,7 @@ bool CWindow::recenterViewersOnCurrentFocus()
     const cv::Vec3f position = focus->p;
     _viewerManager->forEachBaseViewer([&position](VolumeViewerBase* viewer) {
         if (viewer) {
-            viewer->centerOnVolumePoint(position, true);
+            centerViewerOnVolumePointForNavigation(viewer, position);
         }
     });
 
