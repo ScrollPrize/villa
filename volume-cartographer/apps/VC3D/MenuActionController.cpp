@@ -32,7 +32,6 @@
 #include <QDialog>
 #include <QDialogButtonBox>
 #include <QDir>
-#include <QFile>
 #include <QFileDialog>
 #include <QFileInfo>
 #include <QLabel>
@@ -51,7 +50,6 @@
 #include <QTreeWidget>
 #include <QTimer>
 #include <QTreeWidgetItem>
-#include <QTextStream>
 #include <QUrl>
 #include <QVBoxLayout>
 
@@ -59,7 +57,6 @@
 
 #include <algorithm>
 #include <filesystem>
-#include <map>
 #include <unordered_map>
 
 namespace
@@ -155,9 +152,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _showConsoleAct = new QAction(QObject::tr("Show Console Output"), this);
     connect(_showConsoleAct, &QAction::triggered, this, &MenuActionController::toggleConsoleOutput);
 
-    _reportingAct = new QAction(QObject::tr("Generate Review Report..."), this);
-    connect(_reportingAct, &QAction::triggered, this, &MenuActionController::generateReviewReport);
-
     _drawBBoxAct = new QAction(QObject::tr("Draw BBox"), this);
     _drawBBoxAct->setCheckable(true);
     connect(_drawBBoxAct, &QAction::toggled, this, &MenuActionController::toggleDrawBBox);
@@ -193,8 +187,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
 
     ensureRecentActions();
 
-    _fileMenu->addSeparator();
-    _fileMenu->addAction(_reportingAct);
     _fileMenu->addSeparator();
     _fileMenu->addAction(_settingsAct);
     _fileMenu->addSeparator();
@@ -970,103 +962,6 @@ void MenuActionController::toggleConsoleOutput()
         QMessageBox::information(_window, QObject::tr("Console Output"),
                                  QObject::tr("No command line tool has been run yet. The console will be available after running a tool."));
     }
-}
-
-void MenuActionController::generateReviewReport()
-{
-    if (!_window || !_window->_state->vpkg()) {
-        QMessageBox::warning(_window, QObject::tr("Error"), QObject::tr("No volume package loaded."));
-        return;
-    }
-
-    QString fileName = QFileDialog::getSaveFileName(_window,
-        QObject::tr("Save Review Report"),
-        "review_report.csv",
-        QObject::tr("CSV Files (*.csv)"));
-
-    if (fileName.isEmpty()) {
-        return;
-    }
-
-    struct UserStats {
-        double totalArea = 0.0;
-        int surfaceCount = 0;
-    };
-
-    std::map<QString, std::map<QString, UserStats>> dailyStats;
-    int totalReviewedCount = 0;
-    double grandTotalArea = 0.0;
-
-    for (const auto& id : _window->_state->vpkg()->getLoadedSurfaceIDs()) {
-        auto surf = _window->_state->vpkg()->getSurface(id);
-        if (!surf || surf->meta.is_null()) {
-            continue;
-        }
-
-        const auto tags = vc::json::tags_or_empty(surf->meta);
-        if (!tags.contains("reviewed") || !tags["reviewed"].is_object()) {
-            continue;
-        }
-
-        const auto& reviewed = tags["reviewed"];
-
-        QString reviewDate = "Unknown";
-        const std::string reviewDateRaw = vc::json::string_or(reviewed, "date", std::string{});
-        if (!reviewDateRaw.empty()) {
-            reviewDate = QString::fromStdString(reviewDateRaw).left(10);
-        } else {
-            QFileInfo metaFile(QString::fromStdString(surf->path.string()) + "/meta.json");
-            if (metaFile.exists()) {
-                reviewDate = metaFile.lastModified().toString("yyyy-MM-dd");
-            }
-        }
-
-        QString username = "Unknown";
-        const std::string reviewerUser = vc::json::string_or(reviewed, "user", std::string{});
-        if (!reviewerUser.empty()) {
-            username = QString::fromStdString(reviewerUser);
-        }
-
-        const double area = vc::json::number_or(surf->meta, "area_cm2", 0.0);
-
-        dailyStats[reviewDate][username].totalArea += area;
-        dailyStats[reviewDate][username].surfaceCount++;
-        totalReviewedCount++;
-        grandTotalArea += area;
-    }
-
-    QFile file(fileName);
-    if (!file.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        QMessageBox::warning(_window, QObject::tr("Error"), QObject::tr("Could not open file for writing."));
-        return;
-    }
-
-    QTextStream stream(&file);
-    stream << "Date,Username,CM² Reviewed,Surface Count\n";
-
-    for (const auto& dateEntry : dailyStats) {
-        const QString& date = dateEntry.first;
-        for (const auto& userEntry : dateEntry.second) {
-            const QString& username = userEntry.first;
-            const UserStats& stats = userEntry.second;
-            stream << date << ","
-                   << username << ","
-                   << QString::number(stats.totalArea, 'f', 3) << ","
-                   << stats.surfaceCount << "\n";
-        }
-    }
-
-    file.close();
-
-    QString message = QObject::tr("Review report saved successfully.\n\n"
-                                   "Total reviewed surfaces: %1\n"
-                                   "Total area reviewed: %2 cm²\n"
-                                   "Days covered: %3")
-                           .arg(totalReviewedCount)
-                           .arg(grandTotalArea, 0, 'f', 3)
-                           .arg(dailyStats.size());
-
-    QMessageBox::information(_window, QObject::tr("Report Generated"), message);
 }
 
 void MenuActionController::toggleDrawBBox(bool enabled)

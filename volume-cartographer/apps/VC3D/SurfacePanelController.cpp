@@ -1192,7 +1192,6 @@ void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCol
 
     _filters.focusPoints = nullptr;
     _filters.unreviewed = nullptr;
-    _filters.revisit = nullptr;
     _filters.hideUnapproved = nullptr;
     _filters.noExpansion = nullptr;
     _filters.noDefective = nullptr;
@@ -1226,7 +1225,6 @@ void SurfacePanelController::configureFilters(const FilterUiRefs& filters, VCCol
     addFilterOption(_filters.focusPoints, tr("Focus Point"), QStringLiteral("chkFilterFocusPoints"));
     addSeparator();
     addFilterOption(_filters.unreviewed, tr("Unreviewed"), QStringLiteral("chkFilterUnreviewed"));
-    addFilterOption(_filters.revisit, tr("Revisit"), QStringLiteral("chkFilterRevisit"));
     addFilterOption(_filters.hideUnapproved, tr("Hide Unapproved"), QStringLiteral("chkFilterHideUnapproved"));
     addSeparator();
     addFilterOption(_filters.noExpansion, tr("Hide Expansion"), QStringLiteral("chkFilterNoExpansion"));
@@ -1289,7 +1287,6 @@ void SurfacePanelController::resetTagUi()
     resetBox(_tags.approved);
     resetBox(_tags.defective);
     resetBox(_tags.reviewed);
-    resetBox(_tags.revisit);
     resetBox(_tags.inspect);
 }
 
@@ -1305,7 +1302,6 @@ bool SurfacePanelController::toggleTag(Tag tag)
         case Tag::Approved: target = _tags.approved; break;
         case Tag::Defective: target = _tags.defective; break;
         case Tag::Reviewed: target = _tags.reviewed; break;
-        case Tag::Revisit: target = _tags.revisit; break;
         case Tag::Inspect: target = _tags.inspect; break;
     }
 
@@ -1373,7 +1369,6 @@ void SurfacePanelController::connectFilterSignals()
 
     connectToggle(_filters.focusPoints);
     connectToggle(_filters.unreviewed);
-    connectToggle(_filters.revisit);
     connectToggle(_filters.noExpansion);
     connectToggle(_filters.noDefective);
     connectToggle(_filters.partialReview);
@@ -1458,7 +1453,6 @@ void SurfacePanelController::connectTagSignals()
     connectBox(_tags.approved);
     connectBox(_tags.defective);
     connectBox(_tags.reviewed);
-    connectBox(_tags.revisit);
     connectBox(_tags.inspect);
 }
 
@@ -1516,7 +1510,6 @@ void SurfacePanelController::updateFilterSummary()
 
     countIfChecked(_filters.focusPoints);
     countIfChecked(_filters.unreviewed);
-    countIfChecked(_filters.revisit);
     countIfChecked(_filters.hideUnapproved);
     countIfChecked(_filters.noExpansion);
     countIfChecked(_filters.noDefective);
@@ -1562,13 +1555,11 @@ void SurfacePanelController::onTagCheckboxToggled()
             sync_tag(tags, _tags.approved && _tags.approved->checkState() == Qt::Checked, "approved", username);
             sync_tag(tags, _tags.defective && _tags.defective->checkState() == Qt::Checked, "defective", username);
             sync_tag(tags, _tags.reviewed && _tags.reviewed->checkState() == Qt::Checked, "reviewed", username);
-            sync_tag(tags, _tags.revisit && _tags.revisit->checkState() == Qt::Checked, "revisit", username);
             sync_tag(tags, _tags.inspect && _tags.inspect->checkState() == Qt::Checked, "inspect", username);
             surface->save_meta();
         } else if ((_tags.approved && _tags.approved->checkState() == Qt::Checked) ||
                    (_tags.defective && _tags.defective->checkState() == Qt::Checked) ||
                    (_tags.reviewed && _tags.reviewed->checkState() == Qt::Checked) ||
-                   (_tags.revisit && _tags.revisit->checkState() == Qt::Checked) ||
                    (_tags.inspect && _tags.inspect->checkState() == Qt::Checked)) {
             surface->meta["tags"] = utils::Json::object();
             auto& tags = surface->meta["tags"];
@@ -1589,12 +1580,6 @@ void SurfacePanelController::onTagCheckboxToggled()
                 tags["reviewed"] = utils::Json::object();
                 if (!username.empty()) {
                     tags["reviewed"]["user"] = username;
-                }
-            }
-            if (_tags.revisit && _tags.revisit->checkState() == Qt::Checked) {
-                tags["revisit"] = utils::Json::object();
-                if (!username.empty()) {
-                    tags["revisit"]["user"] = username;
                 }
             }
             if (_tags.inspect && _tags.inspect->checkState() == Qt::Checked) {
@@ -1661,7 +1646,6 @@ void SurfacePanelController::applyFiltersInternal()
 
     bool hasActiveFilters = isChecked(_filters.focusPoints) ||
                             isChecked(_filters.unreviewed) ||
-                            isChecked(_filters.revisit) ||
                             isChecked(_filters.noExpansion) ||
                             isChecked(_filters.noDefective) ||
                             isChecked(_filters.partialReview) ||
@@ -1803,15 +1787,6 @@ void SurfacePanelController::applyFiltersInternal()
                 }
             }
 
-            if (isChecked(_filters.revisit)) {
-                if (!surf->meta.is_null()) {
-                    const auto tags = vc::json::tags_or_empty(surf->meta);
-                    show = show && tags.contains("revisit");
-                } else {
-                    show = false;
-                }
-            }
-
             if (isChecked(_filters.noExpansion)) {
                 if (!surf->meta.is_null()) {
                     const auto mode = vc::json::string_or(surf->meta, "vc_gsfs_mode", std::string{});
@@ -1897,18 +1872,17 @@ void SurfacePanelController::updateTagCheckboxStatesForSurface(QuadSurface* surf
     resetState(_tags.approved);
     resetState(_tags.defective);
     resetState(_tags.reviewed);
-    resetState(_tags.revisit);
     resetState(_tags.inspect);
 
     if (!surface) {
-        setTagCheckboxEnabled(false, false, false, false, false);
+        setTagCheckboxEnabled(false, false, false, false);
         return;
     }
 
-    setTagCheckboxEnabled(true, true, true, true, true);
+    setTagCheckboxEnabled(true, true, true, true);
 
     if (surface->meta.is_null()) {
-        setTagCheckboxEnabled(false, false, true, true, true);
+        setTagCheckboxEnabled(false, false, true, true);
         return;
     }
 
@@ -1927,14 +1901,12 @@ void SurfacePanelController::updateTagCheckboxStatesForSurface(QuadSurface* surf
     applyTag(_tags.approved, "approved");
     applyTag(_tags.defective, "defective");
     applyTag(_tags.reviewed, "reviewed");
-    applyTag(_tags.revisit, "revisit");
     applyTag(_tags.inspect, "inspect");
 }
 
 void SurfacePanelController::setTagCheckboxEnabled(bool enabledApproved,
                                                    bool enabledDefective,
                                                    bool enabledReviewed,
-                                                   bool enabledRevisit,
                                                    bool enabledInspect)
 {
     if (_tags.approved) {
@@ -1945,9 +1917,6 @@ void SurfacePanelController::setTagCheckboxEnabled(bool enabledApproved,
     }
     if (_tags.reviewed) {
         _tags.reviewed->setEnabled(enabledReviewed);
-    }
-    if (_tags.revisit) {
-        _tags.revisit->setEnabled(enabledRevisit);
     }
     if (_tags.inspect) {
         _tags.inspect->setEnabled(enabledInspect);

@@ -40,7 +40,6 @@ private slots:
     void showKeybindings();
     void resetSegmentationViews();
     void toggleConsoleOutput();
-    void generateReviewReport();
     void toggleDrawBBox(bool enabled);
     void toggleCursorMirroring(bool enabled);
     void surfaceFromSelection();
@@ -88,7 +87,6 @@ private:
     QAction* _aboutAct{nullptr};
     QAction* _resetViewsAct{nullptr};
     QAction* _showConsoleAct{nullptr};
-    QAction* _reportingAct{nullptr};
     QAction* _drawBBoxAct{nullptr};
     QAction* _mirrorCursorAct{nullptr};
     QAction* _surfaceFromSelectionAct{nullptr};

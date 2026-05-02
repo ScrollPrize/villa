@@ -47,7 +47,6 @@ public:
         QPushButton* pointSetNone{nullptr};
         QComboBox* pointSetMode{nullptr};
         QCheckBox* unreviewed{nullptr};
-        QCheckBox* revisit{nullptr};
         QCheckBox* noExpansion{nullptr};
         QCheckBox* noDefective{nullptr};
         QCheckBox* partialReview{nullptr};
@@ -61,7 +60,6 @@ public:
         QCheckBox* approved{nullptr};
         QCheckBox* defective{nullptr};
         QCheckBox* reviewed{nullptr};
-        QCheckBox* revisit{nullptr};
         QCheckBox* inspect{nullptr};
     };
 
@@ -69,7 +67,6 @@ public:
         Approved,
         Defective,
         Reviewed,
-        Revisit,
         Inspect,
     };
 
@@ -175,7 +172,6 @@ private:
     void setTagCheckboxEnabled(bool enabledApproved,
                                bool enabledDefective,
                                bool enabledReviewed,
-                               bool enabledRevisit,
                                bool enabledInspect);
     void logSurfaceLoadSummary() const;
     void applyHighlightSelection(const std::string& id, bool enabled);

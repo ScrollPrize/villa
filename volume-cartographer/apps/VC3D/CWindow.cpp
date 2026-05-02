@@ -3505,7 +3505,6 @@ void CWindow::CreateWidgets(void)
         .approved = ui.chkApproved,
         .defective = ui.chkDefective,
         .reviewed = ui.chkReviewed,
-        .revisit = ui.chkRevisit,
         .inspect = ui.chkInspect,
     };
     _surfacePanel->configureTags(tagUi);

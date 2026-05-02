@@ -388,13 +388,6 @@
               </widget>
              </item>
              <item row="1" column="3">
-              <widget class="QCheckBox" name="chkRevisit">
-               <property name="text">
-                <string>Revisit</string>
-               </property>
-              </widget>
-             </item>
-             <item row="1" column="4">
               <widget class="QCheckBox" name="chkInspect">
                <property name="text">
                 <string>Inspect</string>
