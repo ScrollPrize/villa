@@ -28,6 +28,7 @@
 #include <QTimer>
 #include <QTransform>
 #include <QVBoxLayout>
+#include <QtConcurrent/QtConcurrentRun>
 
 #include <algorithm>
 #include <cmath>
@@ -1329,12 +1330,323 @@ void CChunkedVolumeViewer::prefetchSurfaceHalo(
     _overlayChunkArray->prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
 }
 
+struct CChunkedVolumeViewer::RenderContext {
+    std::uint64_t serial = 0;
+    int fbW = 0;
+    int fbH = 0;
+    float surfacePtrX = 0.0f;
+    float surfacePtrY = 0.0f;
+    float scale = 1.0f;
+    float zOff = 0.0f;
+    cv::Vec3f zOffWorldDir{0, 0, 0};
+    int startLevel = 0;
+    vc::Sampling samplingMethod = vc::Sampling::Trilinear;
+    CompositeRenderSettings compositeSettings;
+    float windowLow = 0.0f;
+    float windowHigh = 255.0f;
+    std::string baseColormapId;
+    std::shared_ptr<Surface> surf;
+    std::shared_ptr<vc::render::ChunkCache> chunkArray;
+    std::shared_ptr<Volume> overlayVolume;
+    std::shared_ptr<vc::render::ChunkCache> overlayChunkArray;
+    float overlayOpacity = 0.0f;
+    std::string overlayColormapId;
+    float overlayWindowLow = 0.0f;
+    float overlayWindowHigh = 255.0f;
+    bool interactivePreview = false;
+};
+
+struct CChunkedVolumeViewer::RenderResult {
+    std::uint64_t serial = 0;
+    QImage framebuffer;
+    float surfacePtrX = 0.0f;
+    float surfacePtrY = 0.0f;
+    float scale = 1.0f;
+};
+
+CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderContext ctx)
+{
+    RenderResult result;
+    result.serial = ctx.serial;
+    result.surfacePtrX = ctx.surfacePtrX;
+    result.surfacePtrY = ctx.surfacePtrY;
+    result.scale = ctx.scale;
+    result.framebuffer = QImage(std::max(1, ctx.fbW), std::max(1, ctx.fbH), QImage::Format_RGB32);
+    result.framebuffer.fill(QColor(64, 64, 64));
+
+    if (!ctx.surf || !ctx.chunkArray || ctx.fbW <= 0 || ctx.fbH <= 0)
+        return result;
+
+    cv::Mat_<uint8_t> values(ctx.fbH, ctx.fbW, uint8_t(0));
+    cv::Mat_<uint8_t> coverage(ctx.fbH, ctx.fbW, uint8_t(0));
+    cv::Mat_<uint8_t> overlayValues;
+    cv::Mat_<uint8_t> overlayCoverage;
+    const vc::render::ChunkedPlaneSampler::Options options(ctx.samplingMethod, 32);
+
+    auto streamingCompositeUnsupported = [&]() {
+        return !isSupportedStreamingCompositeMethod(ctx.compositeSettings.params.method) ||
+               ctx.compositeSettings.params.lightingEnabled ||
+               ctx.compositeSettings.params.method == "beerLambert" ||
+               ctx.compositeSettings.postClaheEnabled ||
+               ctx.compositeSettings.postRakingEnabled ||
+               ctx.compositeSettings.postRemoveSmallComponents ||
+               ctx.compositeSettings.useVolumeGradients;
+    };
+
+    auto samplePlane = [&](const cv::Vec3f& origin,
+                           const cv::Vec3f& vxStep,
+                           const cv::Vec3f& vyStep,
+                           const cv::Vec3f& normal,
+                           cv::Mat_<uint8_t>& dst,
+                           cv::Mat_<uint8_t>& cov,
+                           vc::render::ChunkCache& array) {
+        const bool wantComposite = ctx.compositeSettings.planeEnabled && !streamingCompositeUnsupported();
+        if (!wantComposite) {
+            if (ctx.interactivePreview) {
+                vc::render::ChunkedPlaneSampler::samplePlaneLevel(
+                    array, ctx.startLevel, origin, vxStep, vyStep, dst, cov, options);
+            } else {
+                vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
+                    array, ctx.startLevel, origin, vxStep, vyStep, dst, cov, options);
+            }
+            return;
+        }
+
+        const int front = std::max(0, ctx.compositeSettings.planeLayersFront);
+        const int behind = std::max(0, ctx.compositeSettings.planeLayersBehind);
+        const int numLayers = front + behind + 1;
+        const int zStart = -behind;
+        const float zStep = ctx.compositeSettings.reverseDirection ? -1.0f : 1.0f;
+        const auto compositeOptions = vc::render::ChunkedPlaneSampler::Options(vc::Sampling::Nearest, options.tileSize);
+        std::vector<cv::Mat_<uint8_t>> layerValues;
+        std::vector<cv::Mat_<uint8_t>> layerCoverage;
+        layerValues.reserve(numLayers);
+        layerCoverage.reserve(numLayers);
+        for (int i = 0; i < numLayers; ++i) {
+            layerValues.emplace_back(dst.rows, dst.cols, uint8_t(0));
+            layerCoverage.emplace_back(dst.rows, dst.cols, uint8_t(0));
+            const cv::Vec3f layerOrigin = origin + normal * (float(zStart + i) * zStep);
+            if (ctx.interactivePreview) {
+                vc::render::ChunkedPlaneSampler::samplePlaneLevel(
+                    array, ctx.startLevel, layerOrigin, vxStep, vyStep,
+                    layerValues.back(), layerCoverage.back(), compositeOptions);
+            } else {
+                vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
+                    array, ctx.startLevel, layerOrigin, vxStep, vyStep,
+                    layerValues.back(), layerCoverage.back(), compositeOptions);
+            }
+        }
+        LayerStack stack;
+        stack.values.resize(numLayers);
+        for (int y = 0; y < dst.rows; ++y) {
+            auto* dstRow = dst.ptr<uint8_t>(y);
+            auto* covRow = cov.ptr<uint8_t>(y);
+            for (int x = 0; x < dst.cols; ++x) {
+                stack.validCount = 0;
+                for (int i = 0; i < numLayers; ++i) {
+                    if (!layerCoverage[i](y, x))
+                        continue;
+                    const float value = static_cast<float>(layerValues[i](y, x));
+                    if (value < static_cast<float>(ctx.compositeSettings.params.isoCutoff))
+                        continue;
+                    stack.values[stack.validCount++] = value;
+                }
+                if (stack.validCount > 0) {
+                    dstRow[x] = static_cast<uint8_t>(std::clamp(
+                        compositeLayerStack(stack, ctx.compositeSettings.params), 0.0f, 255.0f));
+                    covRow[x] = 1;
+                }
+            }
+        }
+    };
+
+    auto sampleCoords = [&](const cv::Mat_<cv::Vec3f>& coords,
+                            const cv::Mat_<cv::Vec3f>& normals,
+                            cv::Mat_<uint8_t>& dst,
+                            cv::Mat_<uint8_t>& cov,
+                            vc::render::ChunkCache& array) {
+        const bool wantComposite = ctx.compositeSettings.enabled &&
+                                   !streamingCompositeUnsupported() &&
+                                   !normals.empty();
+        if (!wantComposite) {
+            if (ctx.interactivePreview) {
+                vc::render::ChunkedPlaneSampler::sampleCoordsLevel(
+                    array, ctx.startLevel, coords, dst, cov, options);
+            } else {
+                vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
+                    array, ctx.startLevel, coords, dst, cov, options);
+            }
+            return;
+        }
+
+        const int front = std::max(0, ctx.compositeSettings.layersFront);
+        const int behind = std::max(0, ctx.compositeSettings.layersBehind);
+        const int numLayers = front + behind + 1;
+        const int zStart = -behind;
+        const float zStep = ctx.compositeSettings.reverseDirection ? -1.0f : 1.0f;
+        const auto compositeOptions = vc::render::ChunkedPlaneSampler::Options(vc::Sampling::Nearest, options.tileSize);
+        std::vector<cv::Mat_<uint8_t>> layerValues;
+        std::vector<cv::Mat_<uint8_t>> layerCoverage;
+        cv::Mat_<cv::Vec3f> layerCoords(coords.rows, coords.cols);
+        layerValues.reserve(numLayers);
+        layerCoverage.reserve(numLayers);
+        for (int i = 0; i < numLayers; ++i) {
+            const float offset = float(zStart + i) * zStep;
+            for (int y = 0; y < coords.rows; ++y) {
+                const auto* src = coords.ptr<cv::Vec3f>(y);
+                const auto* nrow = normals.ptr<cv::Vec3f>(y);
+                auto* dstRow = layerCoords.ptr<cv::Vec3f>(y);
+                for (int x = 0; x < coords.cols; ++x) {
+                    if (!std::isfinite(src[x][0]) || src[x][0] == -1.0f)
+                        dstRow[x] = src[x];
+                    else
+                        dstRow[x] = src[x] + nrow[x] * offset;
+                }
+            }
+            layerValues.emplace_back(dst.rows, dst.cols, uint8_t(0));
+            layerCoverage.emplace_back(dst.rows, dst.cols, uint8_t(0));
+            if (ctx.interactivePreview) {
+                vc::render::ChunkedPlaneSampler::sampleCoordsLevel(
+                    array, ctx.startLevel, layerCoords,
+                    layerValues.back(), layerCoverage.back(), compositeOptions);
+            } else {
+                vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
+                    array, ctx.startLevel, layerCoords,
+                    layerValues.back(), layerCoverage.back(), compositeOptions);
+            }
+        }
+        LayerStack stack;
+        stack.values.resize(numLayers);
+        for (int y = 0; y < dst.rows; ++y) {
+            auto* dstRow = dst.ptr<uint8_t>(y);
+            auto* covRow = cov.ptr<uint8_t>(y);
+            for (int x = 0; x < dst.cols; ++x) {
+                stack.validCount = 0;
+                for (int i = 0; i < numLayers; ++i) {
+                    if (!layerCoverage[i](y, x))
+                        continue;
+                    const float value = static_cast<float>(layerValues[i](y, x));
+                    if (value < static_cast<float>(ctx.compositeSettings.params.isoCutoff))
+                        continue;
+                    stack.values[stack.validCount++] = value;
+                }
+                if (stack.validCount > 0) {
+                    dstRow[x] = static_cast<uint8_t>(std::clamp(
+                        compositeLayerStack(stack, ctx.compositeSettings.params), 0.0f, 255.0f));
+                    covRow[x] = 1;
+                }
+            }
+        }
+    };
+
+    const bool planeView = dynamic_cast<PlaneSurface*>(ctx.surf.get()) != nullptr;
+    if (auto* plane = dynamic_cast<PlaneSurface*>(ctx.surf.get())) {
+        const cv::Vec3f vx = plane->basisX();
+        const cv::Vec3f vy = plane->basisY();
+        const cv::Vec3f n = plane->normal({0, 0, 0});
+        const float halfW = static_cast<float>(ctx.fbW) * 0.5f / ctx.scale;
+        const float halfH = static_cast<float>(ctx.fbH) * 0.5f / ctx.scale;
+        const cv::Vec3f origin = vx * (ctx.surfacePtrX - halfW)
+                               + vy * (ctx.surfacePtrY - halfH)
+                               + plane->origin()
+                               + n * ctx.zOff;
+        const cv::Vec3f vxStep = vx / ctx.scale;
+        const cv::Vec3f vyStep = vy / ctx.scale;
+        samplePlane(origin, vxStep, vyStep, n, values, coverage, *ctx.chunkArray);
+        if (ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f) {
+            overlayValues.create(ctx.fbH, ctx.fbW);
+            overlayCoverage.create(ctx.fbH, ctx.fbW);
+            overlayValues.setTo(0);
+            overlayCoverage.setTo(0);
+            const int level = std::clamp(ctx.startLevel, 0, ctx.overlayChunkArray->numLevels() - 1);
+            if (ctx.interactivePreview) {
+                vc::render::ChunkedPlaneSampler::samplePlaneLevel(
+                    *ctx.overlayChunkArray, level, origin, vxStep, vyStep,
+                    overlayValues, overlayCoverage, options);
+            } else {
+                vc::render::ChunkedPlaneSampler::samplePlaneFineToCoarse(
+                    *ctx.overlayChunkArray, level, origin, vxStep, vyStep,
+                    overlayValues, overlayCoverage, options);
+            }
+        }
+    } else {
+        cv::Mat_<cv::Vec3f> coords;
+        cv::Mat_<cv::Vec3f> normals;
+        const cv::Vec3f offset(ctx.surfacePtrX * ctx.scale - float(ctx.fbW) * 0.5f,
+                               ctx.surfacePtrY * ctx.scale - float(ctx.fbH) * 0.5f,
+                               0.0f);
+        ctx.surf->gen(&coords, &normals, cv::Size(ctx.fbW, ctx.fbH), {0, 0, 0}, ctx.scale, offset);
+        cv::Vec3f zOffWorldDir = ctx.zOffWorldDir;
+        if (ctx.zOff != 0.0f && zOffWorldDir == cv::Vec3f(0.0f, 0.0f, 0.0f) && !normals.empty()) {
+            const cv::Vec3f n = normals(normals.rows / 2, normals.cols / 2);
+            const float len = static_cast<float>(cv::norm(n));
+            if (len > 1e-6f)
+                zOffWorldDir = n / len;
+        }
+        if (ctx.zOff != 0.0f && zOffWorldDir != cv::Vec3f(0.0f, 0.0f, 0.0f)) {
+            const cv::Vec3f tr = zOffWorldDir * ctx.zOff;
+            for (int y = 0; y < coords.rows; ++y) {
+                auto* row = coords.ptr<cv::Vec3f>(y);
+                for (int x = 0; x < coords.cols; ++x) {
+                    if (row[x][0] == row[x][0] && row[x][0] != -1.0f)
+                        row[x] += tr;
+                }
+            }
+        }
+        if (!coords.empty()) {
+            sampleCoords(coords, normals, values, coverage, *ctx.chunkArray);
+            if (ctx.overlayChunkArray && ctx.overlayVolume && ctx.overlayOpacity > 0.0f) {
+                overlayValues.create(ctx.fbH, ctx.fbW);
+                overlayCoverage.create(ctx.fbH, ctx.fbW);
+                overlayValues.setTo(0);
+                overlayCoverage.setTo(0);
+                const int level = std::clamp(ctx.startLevel, 0, ctx.overlayChunkArray->numLevels() - 1);
+                if (ctx.interactivePreview) {
+                    vc::render::ChunkedPlaneSampler::sampleCoordsLevel(
+                        *ctx.overlayChunkArray, level, coords, overlayValues, overlayCoverage, options);
+                } else {
+                    vc::render::ChunkedPlaneSampler::sampleCoordsFineToCoarse(
+                        *ctx.overlayChunkArray, level, coords, overlayValues, overlayCoverage, options);
+                }
+            }
+        }
+    }
+
+    std::array<uint32_t, 256> lut{};
+    vc::buildWindowLevelColormapLut(lut, ctx.windowLow, ctx.windowHigh, ctx.baseColormapId);
+    std::array<uint32_t, 256> overlayLut{};
+    const bool hasOverlay = !overlayValues.empty() && !overlayCoverage.empty() &&
+                            ctx.overlayOpacity > 0.0f;
+    if (hasOverlay) {
+        vc::buildWindowLevelColormapLut(
+            overlayLut, ctx.overlayWindowLow, ctx.overlayWindowHigh, ctx.overlayColormapId);
+    }
+    auto* fbBits = reinterpret_cast<uint32_t*>(result.framebuffer.bits());
+    const int fbStride = result.framebuffer.bytesPerLine() / 4;
+    const uint32_t uncoveredPixel = planeView ? 0xFF404040u : 0xFF000000u;
+    for (int y = 0; y < ctx.fbH; ++y) {
+        auto* row = fbBits + size_t(y) * size_t(fbStride);
+        const auto* src = values.ptr<uint8_t>(y);
+        const auto* cov = coverage.ptr<uint8_t>(y);
+        const auto* overlaySrc = hasOverlay ? overlayValues.ptr<uint8_t>(y) : nullptr;
+        const auto* overlayCov = hasOverlay ? overlayCoverage.ptr<uint8_t>(y) : nullptr;
+        for (int x = 0; x < ctx.fbW; ++x) {
+            uint32_t pixel = cov[x] ? lut[src[x]] : uncoveredPixel;
+            if (hasOverlay && overlayCov[x] &&
+                overlaySrc[x] >= ctx.overlayWindowLow && overlaySrc[x] <= ctx.overlayWindowHigh) {
+                pixel = alphaBlendArgb(pixel, overlayLut[overlaySrc[x]], ctx.overlayOpacity);
+            }
+            row[x] = pixel;
+        }
+    }
+    return result;
+}
+
 void CChunkedVolumeViewer::submitRender()
 {
     auto surf = _surfWeak.lock();
-    if (!surf || !_volume || !_chunkArray) {
+    if (!surf || !_volume || !_chunkArray)
         return;
-    }
 
     resizeFramebuffer();
     const int fbW = _framebuffer.width();
@@ -1342,125 +1654,98 @@ void CChunkedVolumeViewer::submitRender()
     if (fbW <= 0 || fbH <= 0)
         return;
 
-    _values.create(fbH, fbW);
-    _coverage.create(fbH, fbW);
-    _values.setTo(0);
-    _coverage.setTo(0);
-    cv::Mat_<uint8_t> overlayValues;
-    cv::Mat_<uint8_t> overlayCoverage;
-
-    const vc::render::ChunkedPlaneSampler::Options options(_samplingMethod, 32);
-
-    if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
-        const int startLevel = renderStartLevel(false);
-        const cv::Vec3f vx = plane->basisX();
-        const cv::Vec3f vy = plane->basisY();
-        const cv::Vec3f n = plane->normal({0, 0, 0});
-        const float halfW = static_cast<float>(fbW) * 0.5f / _scale;
-        const float halfH = static_cast<float>(fbH) * 0.5f / _scale;
-        const cv::Vec3f origin = vx * (_surfacePtrX - halfW)
-                               + vy * (_surfacePtrY - halfH)
-                               + plane->origin()
-                               + n * _zOff;
-        const cv::Vec3f vxStep = vx / _scale;
-        const cv::Vec3f vyStep = vy / _scale;
-        samplePlaneIntoValues(origin, vxStep, vyStep, n, startLevel, options, _values, _coverage);
-        renderOverlayVolumeForPlane(origin, vxStep, vyStep, startLevel, options,
-                                    overlayValues, overlayCoverage);
-        prefetchPlaneHalo(origin, vxStep, vyStep, startLevel, options);
-    } else {
-        const int startLevel = renderStartLevel(true);
-        cv::Vec3f offset(_surfacePtrX * _scale - float(fbW) * 0.5f,
-                         _surfacePtrY * _scale - float(fbH) * 0.5f,
-                         0.0f);
-        const bool cacheHit = !_genCacheDirty &&
-                              _genCacheSurfKey == surf.get() &&
-                              _genCacheFbW == fbW &&
-                              _genCacheFbH == fbH &&
-                              _genCacheScale == _scale &&
-                              _genCacheOffset == offset &&
-                              _genCacheZOff == _zOff &&
-                              _genCacheZOffDir == _zOffWorldDir &&
-                              !_genCoords.empty();
-        if (!cacheHit) {
-            surf->gen(&_genCoords, &_genNormals, cv::Size(fbW, fbH), {0, 0, 0}, _scale, offset);
-            if (_zOff != 0.0f &&
-                _zOffWorldDir == cv::Vec3f(0.0f, 0.0f, 0.0f) &&
-                !_genNormals.empty()) {
-                const cv::Vec3f n = _genNormals(_genNormals.rows / 2, _genNormals.cols / 2);
-                const float len = static_cast<float>(cv::norm(n));
-                if (len > 1e-6f)
-                    _zOffWorldDir = n / len;
-            }
-            if (_zOff != 0.0f && _zOffWorldDir != cv::Vec3f(0.0f, 0.0f, 0.0f)) {
-                const cv::Vec3f tr = _zOffWorldDir * _zOff;
-                for (int y = 0; y < _genCoords.rows; ++y) {
-                    auto* row = _genCoords.ptr<cv::Vec3f>(y);
-                    for (int x = 0; x < _genCoords.cols; ++x) {
-                        if (row[x][0] == row[x][0] && row[x][0] != -1.0f)
-                            row[x] += tr;
-                    }
-                }
-            }
-            _genCacheSurfKey = surf.get();
-            _genCacheFbW = fbW;
-            _genCacheFbH = fbH;
-            _genCacheScale = _scale;
-            _genCacheOffset = offset;
-            _genCacheZOff = _zOff;
-            _genCacheZOffDir = _zOffWorldDir;
-            _genCacheDirty = false;
-        }
-        if (!_genCoords.empty()) {
-            sampleCoordsIntoValues(_genCoords, _genNormals, startLevel, options, _values, _coverage);
-            renderOverlayVolumeForCoords(_genCoords, startLevel, options,
-                                         overlayValues, overlayCoverage);
-            prefetchSurfaceHalo(*surf, startLevel, options, fbW, fbH);
-        }
+    if (_renderWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
+        ++_renderSerial;
+        _renderPendingAfterWorker = true;
+        return;
     }
 
-    std::array<uint32_t, 256> lut{};
-    vc::buildWindowLevelColormapLut(lut, _windowLow, _windowHigh, _baseColormapId);
-    std::array<uint32_t, 256> overlayLut{};
-    const bool hasOverlay = !overlayValues.empty() && !overlayCoverage.empty() &&
-                            _overlayOpacity > 0.0f;
-    if (hasOverlay) {
-        vc::buildWindowLevelColormapLut(
-            overlayLut, _overlayWindowLow, _overlayWindowHigh, _overlayColormapId);
-    }
-    auto* fbBits = reinterpret_cast<uint32_t*>(_framebuffer.bits());
-    const int fbStride = _framebuffer.bytesPerLine() / 4;
-    const bool planeView = dynamic_cast<PlaneSurface*>(surf.get()) != nullptr;
-    const uint32_t uncoveredPixel = planeView ? 0xFF404040u : 0xFF000000u;
-    for (int y = 0; y < fbH; ++y) {
-        auto* row = fbBits + size_t(y) * size_t(fbStride);
-        const auto* src = _values.ptr<uint8_t>(y);
-        const auto* cov = _coverage.ptr<uint8_t>(y);
-        const auto* overlaySrc = hasOverlay ? overlayValues.ptr<uint8_t>(y) : nullptr;
-        const auto* overlayCov = hasOverlay ? overlayCoverage.ptr<uint8_t>(y) : nullptr;
-        for (int x = 0; x < fbW; ++x) {
-            uint32_t pixel = cov[x] ? lut[src[x]] : uncoveredPixel;
-            if (hasOverlay && overlayCov[x] &&
-                overlaySrc[x] >= _overlayWindowLow && overlaySrc[x] <= _overlayWindowHigh) {
-                pixel = alphaBlendArgb(pixel, overlayLut[overlaySrc[x]], _overlayOpacity);
-            }
-            row[x] = pixel;
+    RenderContext ctx;
+    ctx.serial = ++_renderSerial;
+    ctx.fbW = fbW;
+    ctx.fbH = fbH;
+    ctx.surfacePtrX = _surfacePtrX;
+    ctx.surfacePtrY = _surfacePtrY;
+    ctx.scale = _scale;
+    ctx.zOff = _zOff;
+    ctx.zOffWorldDir = _zOffWorldDir;
+    ctx.startLevel = renderStartLevel(dynamic_cast<PlaneSurface*>(surf.get()) == nullptr);
+    ctx.samplingMethod = _samplingMethod;
+    ctx.compositeSettings = _compositeSettings;
+    ctx.windowLow = _windowLow;
+    ctx.windowHigh = _windowHigh;
+    ctx.baseColormapId = _baseColormapId;
+    ctx.surf = std::move(surf);
+    ctx.chunkArray = _chunkArray;
+    ctx.overlayVolume = _overlayVolume;
+    ctx.overlayChunkArray = _overlayChunkArray;
+    ctx.overlayOpacity = _overlayOpacity;
+    ctx.overlayColormapId = _overlayColormapId;
+    ctx.overlayWindowLow = _overlayWindowLow;
+    ctx.overlayWindowHigh = _overlayWindowHigh;
+    ctx.interactivePreview = _interactivePreview;
+
+    QPointer<CChunkedVolumeViewer> guard(this);
+    (void)QtConcurrent::run([guard, ctx = std::move(ctx)]() mutable {
+        auto result = std::make_shared<RenderResult>(renderFrame(std::move(ctx)));
+        QMetaObject::invokeMethod(qApp, [guard, result = std::move(result)]() mutable {
+            if (guard)
+                guard->finishRenderOnMainThread(std::move(result));
+        }, Qt::QueuedConnection);
+    });
+}
+
+void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult> result)
+{
+    _renderWorkerBusy.store(false, std::memory_order_release);
+    if (!result || result->serial != _renderSerial) {
+        if (_renderPendingAfterWorker) {
+            _renderPendingAfterWorker = false;
+            scheduleRender();
         }
+        return;
     }
 
+    _framebuffer = std::move(result->framebuffer);
     syncCameraTransform();
     if (_interactivePreview)
         updateIntersectionPreviewTransform();
     else
         renderIntersections();
+    if (!_interactivePreview) {
+        if (auto surf = _surfWeak.lock()) {
+            const vc::render::ChunkedPlaneSampler::Options options(_samplingMethod, 32);
+            if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
+                const int startLevel = renderStartLevel(false);
+                const cv::Vec3f vx = plane->basisX();
+                const cv::Vec3f vy = plane->basisY();
+                const cv::Vec3f n = plane->normal({0, 0, 0});
+                const float halfW = static_cast<float>(_framebuffer.width()) * 0.5f / _scale;
+                const float halfH = static_cast<float>(_framebuffer.height()) * 0.5f / _scale;
+                const cv::Vec3f origin = vx * (_surfacePtrX - halfW)
+                                       + vy * (_surfacePtrY - halfH)
+                                       + plane->origin()
+                                       + n * _zOff;
+                prefetchPlaneHalo(origin, vx / _scale, vy / _scale, startLevel, options);
+            } else {
+                prefetchSurfaceHalo(*surf, renderStartLevel(true), options,
+                                    _framebuffer.width(), _framebuffer.height());
+            }
+        }
+    }
     _stableFramebuffer = _framebuffer.copy();
-    _stableSurfX = _surfacePtrX;
-    _stableSurfY = _surfacePtrY;
-    _stableScale = _scale;
+    _stableSurfX = result->surfacePtrX;
+    _stableSurfY = result->surfacePtrY;
+    _stableScale = result->scale;
     _stableFramebufferValid = !_stableFramebuffer.isNull();
     emit overlaysUpdated();
     _view->viewport()->update();
     updateStatusLabel();
+
+    if (_renderPendingAfterWorker) {
+        _renderPendingAfterWorker = false;
+        scheduleRender();
+    }
 }
 
 void CChunkedVolumeViewer::renderOverlayVolumeForPlane(

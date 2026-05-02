@@ -246,6 +246,10 @@ private:
                              const vc::render::ChunkedPlaneSampler::Options& options,
                              int fbW,
                              int fbH);
+    struct RenderContext;
+    struct RenderResult;
+    static RenderResult renderFrame(RenderContext ctx);
+    void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
     void markInteractiveMotion(double motionPx);
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     bool streamingCompositeUnsupported() const;
@@ -287,6 +291,9 @@ private:
     float _stableSurfY = 0.0f;
     float _stableScale = 1.0f;
     bool _stableFramebufferValid = false;
+    std::atomic<bool> _renderWorkerBusy{false};
+    bool _renderPendingAfterWorker = false;
+    std::uint64_t _renderSerial = 0;
     cv::Mat_<uint8_t> _values;
     cv::Mat_<uint8_t> _coverage;
     cv::Mat_<cv::Vec3f> _genCoords;
