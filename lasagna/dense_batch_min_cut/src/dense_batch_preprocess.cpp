@@ -1996,6 +1996,7 @@ class Dinic {
 
 struct DenseFlowResult {
     cv::Mat dense_flow;
+    cv::Mat ambient_flow;
     cv::Mat flow_attn;
     cv::Mat graph_edge_flow;
     cv::Mat graph_edge_flow_gray_bg;
@@ -2519,6 +2520,244 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         timings.push_back(finish_timing("graph_edge_point_flow", timing));
     }
 
+    cv::Mat ambient_flow(white_domain.size(), CV_32F, cv::Scalar(0));
+    {
+        const TimingMark timing = start_timing();
+        constexpr float kAmbientRadius = 300.0f;
+        constexpr float kFlowEpsilon = 1.0e-4f;
+        const std::array<cv::Point, 8> kDirs = {
+            cv::Point(-1, -1), cv::Point(0, -1), cv::Point(1, -1),
+            cv::Point(-1, 0),                    cv::Point(1, 0),
+            cv::Point(-1, 1),  cv::Point(0, 1),  cv::Point(1, 1)};
+
+        cv::Mat flow_pixel_index(white_domain.size(), CV_32S, cv::Scalar(-1));
+        cv::Mat ray_flow_pixel_index(white_domain.size(), CV_32S,
+                                     cv::Scalar(-1));
+        std::vector<cv::Point> flow_pixels;
+        flow_pixels.reserve(static_cast<std::size_t>(cv::countNonZero(graph_pixel_flow > 0)));
+        for (int y = 0; y < graph_pixel_flow.rows; ++y) {
+            for (int x = 0; x < graph_pixel_flow.cols; ++x) {
+                if (graph_pixel_flow.at<float>(y, x) <= 0.0f) {
+                    continue;
+                }
+                flow_pixel_index.at<int>(y, x) =
+                    static_cast<int>(flow_pixels.size());
+                flow_pixels.emplace_back(x, y);
+            }
+        }
+        cv::Mat dilated_flow_mask;
+        cv::dilate(graph_pixel_flow > 0, dilated_flow_mask, cv::Mat());
+        for (int y = 0; y < dilated_flow_mask.rows; ++y) {
+            for (int x = 0; x < dilated_flow_mask.cols; ++x) {
+                if (dilated_flow_mask.at<std::uint8_t>(y, x) == 0 ||
+                    white_domain.at<std::uint8_t>(y, x) == 0) {
+                    continue;
+                }
+                int best_index = -1;
+                float best_flow = -std::numeric_limits<float>::infinity();
+                for (int dy = -1; dy <= 1; ++dy) {
+                    for (int dx = -1; dx <= 1; ++dx) {
+                        const int nx = x + dx;
+                        const int ny = y + dy;
+                        if (nx < 0 || nx >= flow_pixel_index.cols || ny < 0 ||
+                            ny >= flow_pixel_index.rows) {
+                            continue;
+                        }
+                        const int index = flow_pixel_index.at<int>(ny, nx);
+                        if (index < 0) {
+                            continue;
+                        }
+                        const float value =
+                            graph_pixel_flow.at<float>(ny, nx);
+                        if (value > best_flow ||
+                            (value == best_flow &&
+                             (ny < flow_pixels[best_index].y ||
+                              (ny == flow_pixels[best_index].y &&
+                               nx < flow_pixels[best_index].x)))) {
+                            best_flow = value;
+                            best_index = index;
+                        }
+                    }
+                }
+                if (best_index >= 0) {
+                    ray_flow_pixel_index.at<int>(y, x) = best_index;
+                }
+            }
+        }
+
+        std::vector<int> next_greedy(flow_pixels.size(), -1);
+        std::vector<float> next_distance(flow_pixels.size(), 0.0f);
+        for (int index = 0; index < static_cast<int>(flow_pixels.size());
+             ++index) {
+            const cv::Point pixel = flow_pixels[index];
+            const float current_flow =
+                graph_pixel_flow.at<float>(pixel.y, pixel.x);
+            int best_index = -1;
+            float best_flow = current_flow;
+            float best_step = 0.0f;
+            for (const cv::Point dir : kDirs) {
+                const cv::Point next = pixel + dir;
+                if (next.x < 0 || next.x >= flow_pixel_index.cols ||
+                    next.y < 0 || next.y >= flow_pixel_index.rows) {
+                    continue;
+                }
+                const int next_index =
+                    flow_pixel_index.at<int>(next.y, next.x);
+                if (next_index < 0) {
+                    continue;
+                }
+                const float next_flow =
+                    graph_pixel_flow.at<float>(next.y, next.x);
+                const float step =
+                    std::abs(dir.x) + std::abs(dir.y) == 2
+                        ? static_cast<float>(std::sqrt(2.0))
+                        : 1.0f;
+                if (next_flow > best_flow + kFlowEpsilon ||
+                    (next_flow > current_flow + kFlowEpsilon &&
+                     std::abs(next_flow - best_flow) <= kFlowEpsilon &&
+                     (best_index < 0 || step < best_step ||
+                      (step == best_step &&
+                       (next.y < flow_pixels[best_index].y ||
+                        (next.y == flow_pixels[best_index].y &&
+                         next.x < flow_pixels[best_index].x)))))) {
+                    best_index = next_index;
+                    best_flow = next_flow;
+                    best_step = step;
+                }
+            }
+            if (best_index >= 0) {
+                next_greedy[index] = best_index;
+                next_distance[index] = best_step;
+            }
+        }
+
+        int jump_levels = 1;
+        while ((1 << jump_levels) <= static_cast<int>(kAmbientRadius) + 1) {
+            ++jump_levels;
+        }
+        std::vector<std::vector<int>> jump_to(
+            jump_levels, std::vector<int>(flow_pixels.size(), -1));
+        std::vector<std::vector<float>> jump_dist(
+            jump_levels, std::vector<float>(flow_pixels.size(), 0.0f));
+        std::vector<std::vector<float>> jump_max(
+            jump_levels, std::vector<float>(flow_pixels.size(), 0.0f));
+        for (int index = 0; index < static_cast<int>(flow_pixels.size());
+             ++index) {
+            jump_to[0][index] = next_greedy[index];
+            jump_dist[0][index] = next_distance[index];
+            if (next_greedy[index] >= 0) {
+                const cv::Point next = flow_pixels[next_greedy[index]];
+                jump_max[0][index] =
+                    graph_pixel_flow.at<float>(next.y, next.x);
+            }
+        }
+        for (int level = 1; level < jump_levels; ++level) {
+            for (int index = 0; index < static_cast<int>(flow_pixels.size());
+                 ++index) {
+                const int mid = jump_to[level - 1][index];
+                if (mid < 0) {
+                    continue;
+                }
+                const int end = jump_to[level - 1][mid];
+                if (end < 0) {
+                    continue;
+                }
+                jump_to[level][index] = end;
+                jump_dist[level][index] =
+                    jump_dist[level - 1][index] + jump_dist[level - 1][mid];
+                jump_max[level][index] =
+                    std::max(jump_max[level - 1][index],
+                             jump_max[level - 1][mid]);
+            }
+        }
+
+        const auto greedy_reach_value = [&](int start_index,
+                                            float budget) {
+            if (start_index < 0) {
+                return 0.0f;
+            }
+            cv::Point start = flow_pixels[start_index];
+            float best = graph_pixel_flow.at<float>(start.y, start.x);
+            int current = start_index;
+            float remaining = budget;
+            for (int level = jump_levels - 1; level >= 0; --level) {
+                if (current < 0 || jump_to[level][current] < 0 ||
+                    jump_dist[level][current] <= 0.0f ||
+                    jump_dist[level][current] > remaining + kFlowEpsilon) {
+                    continue;
+                }
+                best = std::max(best, jump_max[level][current]);
+                remaining -= jump_dist[level][current];
+                current = jump_to[level][current];
+            }
+            return best;
+        };
+
+        for (const cv::Point dir : kDirs) {
+            cv::Mat hit_index(white_domain.size(), CV_32S, cv::Scalar(-1));
+            cv::Mat hit_distance(white_domain.size(), CV_32F, cv::Scalar(0));
+            const float step =
+                std::abs(dir.x) + std::abs(dir.y) == 2
+                    ? static_cast<float>(std::sqrt(2.0))
+                    : 1.0f;
+            const int x_begin = dir.x > 0 ? white_domain.cols - 1 : 0;
+            const int x_end = dir.x > 0 ? -1 : white_domain.cols;
+            const int x_step = dir.x > 0 ? -1 : 1;
+            const int y_begin = dir.y > 0 ? white_domain.rows - 1 : 0;
+            const int y_end = dir.y > 0 ? -1 : white_domain.rows;
+            const int y_step = dir.y > 0 ? -1 : 1;
+            for (int y = y_begin; y != y_end; y += y_step) {
+                for (int x = x_begin; x != x_end; x += x_step) {
+                    if (white_domain.at<std::uint8_t>(y, x) == 0) {
+                        continue;
+                    }
+                    const int index = ray_flow_pixel_index.at<int>(y, x);
+                    if (index >= 0) {
+                        hit_index.at<int>(y, x) = index;
+                        hit_distance.at<float>(y, x) = 0.0f;
+                        continue;
+                    }
+                    const int nx = x + dir.x;
+                    const int ny = y + dir.y;
+                    if (nx < 0 || nx >= white_domain.cols || ny < 0 ||
+                        ny >= white_domain.rows) {
+                        continue;
+                    }
+                    if (white_domain.at<std::uint8_t>(ny, nx) == 0) {
+                        continue;
+                    }
+                    const int next_index = hit_index.at<int>(ny, nx);
+                    if (next_index < 0) {
+                        continue;
+                    }
+                    hit_index.at<int>(y, x) = next_index;
+                    hit_distance.at<float>(y, x) =
+                        hit_distance.at<float>(ny, nx) + step;
+                }
+            }
+
+            for (int y = 0; y < white_domain.rows; ++y) {
+                for (int x = 0; x < white_domain.cols; ++x) {
+                    if (white_domain.at<std::uint8_t>(y, x) == 0) {
+                        continue;
+                    }
+                    const int index = hit_index.at<int>(y, x);
+                    if (index < 0) {
+                        continue;
+                    }
+                    const float ray_distance =
+                        hit_distance.at<float>(y, x);
+                    const float budget =
+                        std::max(0.0f, kAmbientRadius - ray_distance);
+                    ambient_flow.at<float>(y, x) +=
+                        greedy_reach_value(index, budget);
+                }
+            }
+        }
+        ambient_flow *= 1.0f / static_cast<float>(kDirs.size());
+        timings.push_back(finish_timing("ambient_flow", timing));
+    }
+
     cv::Mat dense_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     {
         const TimingMark timing = start_timing();
@@ -2793,6 +3032,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     }
 
     return {dense_flow,
+            ambient_flow,
             flow_attn,
             graph_edge_flow,
             graph_edge_flow_gray_bg,
@@ -3380,6 +3620,8 @@ int main(int argc, char** argv) {
             const TimingMark timing = start_timing();
             write_image(workdir / (stem + "_dense_flow.tif"),
                         dense_flow_result.dense_flow);
+            write_image(workdir / (stem + "_ambient_flow.tif"),
+                        dense_flow_result.ambient_flow);
             write_image(workdir / (stem + "_flow_attn.tif"),
                         dense_flow_result.flow_attn);
             write_image(workdir / (stem + "_graph_edge_flow.tif"),
@@ -3411,6 +3653,9 @@ int main(int argc, char** argv) {
         if (has_dense_flow) {
             layered_tiff.push_back(
                 {"dense_flow", to_float_layer(dense_flow_result.dense_flow)});
+            layered_tiff.push_back(
+                {"ambient_flow",
+                 to_float_layer(dense_flow_result.ambient_flow)});
             layered_tiff.push_back(
                 {"flow_attn", to_float_layer(dense_flow_result.flow_attn)});
             layered_tiff.push_back(
@@ -3548,6 +3793,8 @@ int main(int argc, char** argv) {
                   << "  " << (workdir / (stem + "_layers.tif")) << "\n";
         if (has_dense_flow) {
             std::cout << "  " << (workdir / (stem + "_dense_flow.tif"))
+                      << "\n"
+                      << "  " << (workdir / (stem + "_ambient_flow.tif"))
                       << "\n"
                       << "  " << (workdir / (stem + "_flow_attn.tif"))
                       << "\n"
