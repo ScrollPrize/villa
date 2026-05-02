@@ -709,7 +709,7 @@ struct Vec3iEqual {
 };
 
 struct SDTContext {
-    vc::cache::BlockPipeline* cache = nullptr;
+    vc::render::IChunkedArray* cache = nullptr;
     int level = 0;
     int chunk_size = 64;
     float threshold = 1.0f;
@@ -745,7 +745,7 @@ static SDTChunk* get_or_compute_sdt_chunk(SDTContext& ctx, const cv::Vec3f& worl
     const cv::Vec3i size(cs, cs, cs);
     Array3D<uint8_t> binary_data({static_cast<size_t>(cs), static_cast<size_t>(cs), static_cast<size_t>(cs)});
 
-    auto shape = ctx.cache->levelShape(ctx.level); // z,y,x
+    auto shape = ctx.cache->shape(ctx.level); // z,y,x
     cv::Vec3i clamped_origin(
         std::max(0, origin[0]),
         std::max(0, origin[1]),
@@ -2937,7 +2937,7 @@ struct thresholdedDistance
 };
 
 
-QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::cache::BlockPipeline *cache, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections, const cv::Mat* allowed_growth_mask)
+QuadSurface *tracer(vc::VcDataset *ds, float scale, vc::render::IChunkedArray *cache, int level, cv::Vec3f origin, const utils::Json &params, const std::string &cache_root, float voxelsize, std::vector<DirectionField> const &direction_fields, QuadSurface* resume_surf, const std::filesystem::path& tgt_path, const utils::Json& meta_params, const VCCollection &corrections, const cv::Mat* allowed_growth_mask)
 {
     std::unique_ptr<NeuralTracerConnection> neural_tracer;
     int pre_neural_gens = 0, neural_batch_size = 1;

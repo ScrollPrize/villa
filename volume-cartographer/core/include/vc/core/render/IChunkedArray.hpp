@@ -20,7 +20,8 @@ enum class ChunkStatus {
 };
 
 enum class ChunkDtype {
-    UInt8
+    UInt8,
+    UInt16
 };
 
 struct ChunkResult {

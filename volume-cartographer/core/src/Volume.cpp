@@ -18,6 +18,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/cache/BlockCache.hpp"
 #include "vc/core/cache/BlockPipeline.hpp"
+#include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/cache/VolumeSource.hpp"
 #include "vc/core/cache/VcDecompressor.hpp"
 #include <utils/zarr.hpp>
@@ -568,18 +569,35 @@ vc::cache::BlockPipeline* Volume::tieredCache()
     return tieredCache_.get();
 }
 
+vc::render::IChunkedArray* Volume::chunkedCache()
+{
+    std::lock_guard<std::mutex> lock(cacheMutex_);
+    if (!chunkedCache_) {
+        vc::render::OpenedChunkedZarr opened = isRemote_
+            ? vc::render::openHttpZarrPyramid(remoteUrl_, remoteAuth_)
+            : vc::render::openLocalZarrPyramid(path_);
+        chunkedCache_ = vc::render::createChunkCache(
+            std::move(opened),
+            cacheBudgetHot_,
+            ioThreads_ > 0 ? static_cast<std::size_t>(ioThreads_) : 16);
+    }
+    return chunkedCache_.get();
+}
+
 void Volume::resetTieredCache()
 {
     fprintf(stderr, "[Volume] %p resetTieredCache: destroying pipeline=%p\n",
             (void*)this, (void*)tieredCache_.get());
     std::lock_guard<std::mutex> lock(cacheMutex_);
     tieredCache_.reset();
+    chunkedCache_.reset();
     fprintf(stderr, "[Volume] %p resetTieredCache: done\n", (void*)this);
 }
 
 void Volume::setCacheBudget(size_t hotBytes)
 {
     cacheBudgetHot_ = hotBytes;
+    chunkedCache_.reset();
 }
 
 void Volume::setBlockCache(vc::cache::BlockCache* bc)
@@ -591,6 +609,7 @@ void Volume::setBlockCache(vc::cache::BlockCache* bc)
 void Volume::setIOThreads(int count)
 {
     ioThreads_ = count;
+    chunkedCache_.reset();
 }
 
 void Volume::setEncodeParams(const utils::C3dCodecParams& params)
@@ -639,7 +658,7 @@ void Volume::sample(cv::Mat_<uint8_t>& out,
                     const vc::SampleParams& params)
 {
     const auto& scaled = scaleCoords(coords, params.level);
-    readInterpolated3D(out, tieredCache(), params.level, scaled, params.method);
+    readInterpolated3D(out, chunkedCache(), params.level, scaled, params.method);
     applyOptionalPostProcess(out, params);
 }
 
@@ -648,7 +667,7 @@ void Volume::sample(cv::Mat_<uint16_t>& out,
                     const vc::SampleParams& params)
 {
     const auto& scaled = scaleCoords(coords, params.level);
-    readInterpolated3D(out, tieredCache(), params.level, scaled, params.method);
+    readInterpolated3D(out, chunkedCache(), params.level, scaled, params.method);
 }
 
 // ============================================================================

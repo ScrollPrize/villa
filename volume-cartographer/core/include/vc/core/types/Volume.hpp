@@ -21,6 +21,7 @@
 namespace vc { class VcDataset; }
 
 namespace vc::cache { class BlockPipeline; class BlockCache; }
+namespace vc::render { class ChunkCache; class IChunkedArray; }
 namespace utils { class ZarrArray; }
 
 struct CompositeParams;
@@ -86,6 +87,7 @@ public:
     // Thread-safe: creates on first call, returns same cache thereafter.
     // After resetTieredCache(), the next call re-creates the pipeline.
     [[nodiscard]] vc::cache::BlockPipeline* tieredCache();
+    [[nodiscard]] vc::render::IChunkedArray* chunkedCache();
 
     // Destroy the current pipeline so the next tieredCache() call creates
     // a fresh one.  Call after shutdown() on a volume that may be re-used.
@@ -140,6 +142,7 @@ protected:
 
     // Cache ownership
     mutable std::unique_ptr<vc::cache::BlockPipeline> tieredCache_;
+    mutable std::unique_ptr<vc::render::ChunkCache> chunkedCache_;
     mutable std::mutex cacheMutex_;
     vc::cache::BlockCache* sharedBlockCache_ = nullptr;
     size_t cacheBudgetHot_ = 8ULL << 30;   // 8 GB default

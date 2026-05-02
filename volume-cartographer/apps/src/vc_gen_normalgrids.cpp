@@ -19,7 +19,7 @@
 
 #include "vc/core/types/VcDataset.hpp"
 #include "vc/core/util/Slicing.hpp"
-#include "vc/core/cache/BlockPipeline.hpp"
+#include "vc/core/render/ZarrChunkFetcher.hpp"
 #include <vc/core/util/GridStore.hpp>
 #include "vc/core/util/NormalGridGenerate.hpp"
 #include "vc/core/util/Thinning.hpp"
@@ -524,7 +524,9 @@ void run_generate(const po::variables_map& vm) {
         256ull * 1024ull * 1024ull,
         std::max<size_t>(64ull * 1024ull * 1024ull, max_estimated_batch_bytes / 2));
 
-    auto cache = vc::cache::openFilesystemPipeline(ds.get(), cache_budget_bytes, ds->path());
+    auto cache = vc::render::createChunkCache(
+        vc::render::openLocalZarrPyramid(ds->path()),
+        cache_budget_bytes);
 
     RunMetrics run_metrics;
     run_metrics.inputPath = input_path;

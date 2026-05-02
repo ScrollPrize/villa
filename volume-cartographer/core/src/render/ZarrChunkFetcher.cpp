@@ -171,8 +171,14 @@ std::array<int, 3> toArray3(const std::vector<std::size_t>& values, const char* 
 void addLevel(OpenedChunkedZarr& opened, utils::ZarrArray array)
 {
     const auto& meta = array.metadata();
-    if (meta.dtype != utils::ZarrDtype::uint8)
-        throw std::runtime_error("streaming zarr fetcher currently supports uint8 only");
+    ChunkDtype dtype = ChunkDtype::UInt8;
+    if (meta.dtype == utils::ZarrDtype::uint16) {
+        dtype = ChunkDtype::UInt16;
+    } else if (meta.dtype != utils::ZarrDtype::uint8) {
+        throw std::runtime_error("streaming zarr fetcher currently supports uint8 and uint16 only");
+    }
+    if (!opened.fetchers.empty() && opened.dtype != dtype)
+        throw std::runtime_error("streaming zarr fetcher requires all levels to have the same dtype");
 
     std::vector<std::size_t> chunkShape = meta.chunks;
     if (meta.shard_config)
@@ -186,6 +192,7 @@ void addLevel(OpenedChunkedZarr& opened, utils::ZarrArray array)
     transform.scaleFromLevel0 = {invScale, invScale, invScale};
     opened.transforms.push_back(transform);
     opened.fillValue = meta.fill_value.value_or(0.0);
+    opened.dtype = dtype;
     opened.fetchers.push_back(std::make_shared<ZarrChunkFetcher>(std::move(array)));
 }
 
@@ -215,11 +222,19 @@ OpenedChunkedZarr openLocalZarrPyramid(const std::filesystem::path& root)
 {
     OpenedChunkedZarr opened;
     for (int level : localLevelNumbers(root)) {
-        addLevel(opened, utils::ZarrArray::open(root / std::to_string(level),
-                                                vc::buildZarrCodecRegistry(1)));
+        auto array = utils::ZarrArray::open(root / std::to_string(level),
+                                            vc::buildZarrCodecRegistry(1));
+        if (array.metadata().dtype == utils::ZarrDtype::uint16) {
+            array = utils::ZarrArray::open(root / std::to_string(level),
+                                           vc::buildZarrCodecRegistry(2));
+        }
+        addLevel(opened, std::move(array));
     }
     if (opened.fetchers.empty()) {
-        addLevel(opened, utils::ZarrArray::open(root, vc::buildZarrCodecRegistry(1)));
+        auto array = utils::ZarrArray::open(root, vc::buildZarrCodecRegistry(1));
+        if (array.metadata().dtype == utils::ZarrDtype::uint16)
+            array = utils::ZarrArray::open(root, vc::buildZarrCodecRegistry(2));
+        addLevel(opened, std::move(array));
     }
     return opened;
 }
@@ -235,7 +250,10 @@ OpenedChunkedZarr openHttpZarrPyramid(
     for (int physicalLevel = firstPhysicalLevel; physicalLevel < 32; ++physicalLevel) {
         const auto key = std::to_string(physicalLevel);
         try {
-            addLevel(opened, utils::ZarrArray::open(store, key, vc::buildZarrCodecRegistry(1)));
+            auto array = utils::ZarrArray::open(store, key, vc::buildZarrCodecRegistry(1));
+            if (array.metadata().dtype == utils::ZarrDtype::uint16)
+                array = utils::ZarrArray::open(store, key, vc::buildZarrCodecRegistry(2));
+            addLevel(opened, std::move(array));
         } catch (const HttpStatusError& e) {
             if (e.status() == 404)
                 break;
@@ -246,14 +264,40 @@ OpenedChunkedZarr openHttpZarrPyramid(
             break;
         }
     }
-    if (opened.fetchers.empty() && firstPhysicalLevel == 0)
-        addLevel(opened, utils::ZarrArray::open(store, "", vc::buildZarrCodecRegistry(1)));
+    if (opened.fetchers.empty() && firstPhysicalLevel == 0) {
+        auto array = utils::ZarrArray::open(store, "", vc::buildZarrCodecRegistry(1));
+        if (array.metadata().dtype == utils::ZarrDtype::uint16)
+            array = utils::ZarrArray::open(store, "", vc::buildZarrCodecRegistry(2));
+        addLevel(opened, std::move(array));
+    }
     return opened;
 }
 
 OpenedChunkedZarr openHttpZarrPyramid(const std::string& url)
 {
     return openHttpZarrPyramid(url, vc::HttpAuth{}, 0);
+}
+
+std::unique_ptr<ChunkCache> createChunkCache(
+    OpenedChunkedZarr opened,
+    std::size_t decodedByteCapacity,
+    std::size_t maxConcurrentReads)
+{
+    std::vector<ChunkCache::LevelInfo> levels;
+    levels.reserve(opened.shapes.size());
+    for (std::size_t i = 0; i < opened.shapes.size(); ++i) {
+        levels.push_back({opened.shapes[i], opened.chunkShapes[i], opened.transforms[i]});
+    }
+
+    ChunkCache::Options options;
+    options.decodedByteCapacity = decodedByteCapacity;
+    options.maxConcurrentReads = maxConcurrentReads;
+    return std::make_unique<ChunkCache>(
+        std::move(levels),
+        std::move(opened.fetchers),
+        opened.fillValue,
+        opened.dtype,
+        std::move(options));
 }
 
 } // namespace vc::render

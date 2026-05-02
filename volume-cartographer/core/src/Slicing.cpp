@@ -1,10 +1,7 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Compositing.hpp"
 #include "vc/core/types/Sampling.hpp"
-#include "vc/core/types/VcDataset.hpp"
-#include "vc/core/cache/BlockCache.hpp"
-#include "vc/core/cache/BlockPipeline.hpp"
-#include "vc/core/cache/TickCoordinator.hpp"
+#include "vc/core/render/IChunkedArray.hpp"
 
 #include <opencv2/core.hpp>
 
@@ -13,7 +10,9 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <vector>
 #include <omp.h>
 
@@ -25,25 +24,10 @@
 
 namespace {
 
-using vc::cache::Block;
-using vc::cache::BlockKey;
-using vc::cache::BlockPtr;
-using vc::cache::BlockPipeline;
-using vc::cache::ChunkKey;
-using vc::cache::FrameState;
-using vc::cache::kBlockSize;
-using vc::cache::TickCoordinator;
-
-// Shared static zero-block for chunks known to be all-zero. Using one
-// instance keeps the cold-cache footprint at 4 KiB instead of one per
-// sampler; the BlockPipeline already uses an identical pattern for its
-// own empty-chunk short-circuit path.
-inline constinit Block kSliceZeroBlock{};
-
-constexpr int kBlockShift = 4;       // log2(16)
-constexpr int kBlockMask = 15;
-constexpr size_t kStrideY = kBlockSize;              // 16
-constexpr size_t kStrideZ = kBlockSize * kBlockSize; // 256
+using vc::render::ChunkKey;
+using vc::render::ChunkResult;
+using vc::render::ChunkStatus;
+using vc::render::IChunkedArray;
 
 VC_FORCE_INLINE bool isnan_bitwise(float f) {
     uint32_t u;
@@ -80,87 +64,57 @@ struct VolumeShape {
     float szf = 0.f, syf = 0.f, sxf = 0.f;
 
     VolumeShape() = default;
-    explicit VolumeShape(BlockPipeline& cache, int level) {
-        auto s = cache.levelShape(level);
+    explicit VolumeShape(IChunkedArray& cache, int level) {
+        auto s = cache.shape(level);
         sz = s[0]; sy = s[1]; sx = s[2];
         szf = float(sz); syf = float(sy); sxf = float(sx);
     }
 };
 
-// Direct-mapped block cache keyed by (bz, by, bx). On miss, consults the
-// block cache only — never blocks on disk or network. Missing blocks make
-// sampleInt return 0 (black) for that voxel. Viewport-demand fetches feed
-// the cache asynchronously via BlockPipeline::fetchInteractive.
+// Direct-mapped chunk cache keyed by (cz, cy, cx). The backing IChunkedArray
+// owns decoded chunk caching and may serve local or HTTP zarr data.
 template<typename T, int kSlots = 16384>
-struct BlockSampler {
+struct ChunkSampler {
     static_assert((kSlots & (kSlots - 1)) == 0, "kSlots must be power of 2");
     static constexpr int kSlotMask = kSlots - 1;
 
-    // Hot slot: packed key + data pointer, 16 bytes. 16384 slots × 16B =
-    // 256 KB per sampler — fits in L2D on Oryon (typically 1-2 MB/core).
-    // Sized up from 4096 after observing heavy Max-composite workloads
-    // (65 layers × 1M pixels, ~500K unique blocks across the frame)
-    // sending ~25% of lookups to the BlockCache slow path. The slow
-    // path's pthread_rwlock_rdlock/unlock chain was ~44% of CPU in those
-    // frames. Quadrupling the per-thread cache drops the direct-mapped
-    // collision rate roughly 4× by lowering occupancy, and keeps far
-    // more of the hot working set in the per-sampler private cache
-    // (where lookups are 2 instructions, no atomics).
-    // The BlockPtr (non-owning) lives in a cold parallel array,
-    // touched only on miss. Both arrays are heap-allocated so the
     struct HotSlot {
         uint64_t key = UINT64_MAX;
         const T* data = nullptr;
+        std::shared_ptr<const std::vector<std::byte>> bytes;
+        bool allFill = false;
     };
 
-    BlockPipeline& cache;
+    IChunkedArray& cache;
     int level;
     VolumeShape shape;
-    int chunkBlocksZ = 1;
-    int chunkBlocksY = 1;
-    int chunkBlocksX = 1;
-    // Frame snapshot captured at construction; released in the destructor.
-    // When non-null we can bypass `cache.blockAt` on known-empty chunks
-    // via a plain-memory binary search instead of an atomic probe loop.
-    const FrameState* frame;
+    std::array<int, 3> chunkShape{};
+    int chunkStrideY = 0;
+    int chunkStrideZ = 0;
     std::unique_ptr<HotSlot[]> slots;
-    std::unique_ptr<BlockPtr[]> slotBlocks;  // cold: refcount keep-alive
-    // Last-block (bz,by,bx) cache as separate ints. Most pixels in a tile
-    // sample the same block, so comparing three ints lets us skip packKey's
-    // 3 shifts + 2 ORs on every same-block call. lastBz=INT_MIN seeds a
-    // guaranteed miss on the first access.
-    int lastBz = std::numeric_limits<int>::min();
-    int lastBy = 0;
-    int lastBx = 0;
+    int lastCz = std::numeric_limits<int>::min();
+    int lastCy = 0;
+    int lastCx = 0;
     uint64_t lastKey = UINT64_MAX;
     const T* data = nullptr;
+    bool allFill = false;
 
-    BlockSampler(BlockPipeline& c, int lvl)
+    ChunkSampler(IChunkedArray& c, int lvl)
         : cache(c), level(lvl), shape(c, lvl),
-          frame(TickCoordinator::currentFrameGlobal()),
-          slots(std::make_unique<HotSlot[]>(kSlots)),
-          slotBlocks(std::make_unique<BlockPtr[]>(kSlots))
+          chunkShape(c.chunkShape(lvl)),
+          chunkStrideY(chunkShape[2]),
+          chunkStrideZ(chunkShape[1] * chunkShape[2]),
+          slots(std::make_unique<HotSlot[]>(kSlots))
     {
-        const auto chunkShape = cache.chunkShape(level);
-        chunkBlocksZ = std::max(1, chunkShape[0] / kBlockSize);
-        chunkBlocksY = std::max(1, chunkShape[1] / kBlockSize);
-        chunkBlocksX = std::max(1, chunkShape[2] / kBlockSize);
     }
 
-    ~BlockSampler() {
-        TickCoordinator::releaseFrameGlobal(frame);
+    ChunkSampler(const ChunkSampler&) = delete;
+    ChunkSampler& operator=(const ChunkSampler&) = delete;
+
+    VC_FORCE_INLINE static uint64_t packKey(int cz, int cy, int cx) {
+        return (uint64_t(uint32_t(cz)) << 42) | (uint64_t(uint32_t(cy)) << 21) | uint64_t(uint32_t(cx));
     }
 
-    BlockSampler(const BlockSampler&) = delete;
-    BlockSampler& operator=(const BlockSampler&) = delete;
-
-    VC_FORCE_INLINE static uint64_t packKey(int bz, int by, int bx) {
-        return (uint64_t(uint32_t(bz)) << 42) | (uint64_t(uint32_t(by)) << 21) | uint64_t(uint32_t(bx));
-    }
-
-    // Cheap finalizer over the already-packed key. Reuses packKey's output
-    // instead of re-hashing the three int coords with three multiplies;
-    // the xor-fold mixes all three 21/22-bit axis fields into the low bits.
     VC_FORCE_INLINE int slotIndexFromKey(uint64_t key) const {
         uint64_t h = key ^ (key >> 21) ^ (key >> 42);
         h ^= h >> 15;
@@ -168,88 +122,40 @@ struct BlockSampler {
         return int(h) & kSlotMask;
     }
 
-    VC_FORCE_INLINE int slotIndex(int bz, int by, int bx) const {
-        return slotIndexFromKey(packKey(bz, by, bx));
-    }
+    VC_FORCE_INLINE void updateChunk(int cz, int cy, int cx) {
+        if (cz == lastCz && cy == lastCy && cx == lastCx) [[likely]] return;
 
-    // Fetch the block pointer for (bz, by, bx). Non-blocking: returns null
-    // data if the block isn't resident in the cache.
-    VC_FORCE_INLINE void updateBlock(int bz, int by, int bx) {
-        tryUpdateBlockNonBlocking(bz, by, bx);
-    }
-
-    // Identical; kept for callers that want to be explicit about intent.
-    VC_FORCE_INLINE void tryUpdateBlockNonBlocking(int bz, int by, int bx) {
-        // Int-level fast path: consecutive samples within a tile almost
-        // always land in the same 16³ block. Compare three ints and skip
-        // packKey + slot hash entirely on a match — saves ~5 cycles/sample
-        // on the ~80% of samples that hit the same block as the last.
-        if (bz == lastBz && by == lastBy && bx == lastBx) [[likely]] return;
-
-        const uint64_t key = packKey(bz, by, bx);
-        lastBz = bz; lastBy = by; lastBx = bx;
+        const uint64_t key = packKey(cz, cy, cx);
+        lastCz = cz; lastCy = cy; lastCx = cx;
         lastKey = key;
 
         int idx = slotIndexFromKey(key);
         HotSlot& slot = slots[idx];
         if (slot.key == key) [[likely]] {
             data = slot.data;
+            allFill = slot.allFill;
             return;
         }
 
-        // Known-empty chunk short-circuit. FrameState::emptyChunkKeys is
-        // a sorted vector published once per tick by TickCoordinator; a
-        // binary search is plain memory, vs. the atomic probe loop inside
-        // BlockPipeline::blockAt. Chunk shapes are dataset-specific, so
-        // map block coordinates back through the metadata-derived grid.
-        if (frame) {
-            const ChunkKey ck{
-                level,
-                bz / chunkBlocksZ,
-                by / chunkBlocksY,
-                bx / chunkBlocksX};
-            if (std::binary_search(frame->emptyChunkKeys.begin(),
-                                   frame->emptyChunkKeys.end(), ck)) {
-                slotBlocks[idx] = &kSliceZeroBlock;
-                slot.data = reinterpret_cast<const T*>(kSliceZeroBlock.data);
-                slot.key  = key;
-                data = slot.data;
-                return;
-            }
-            // Slice L1: freshly-landed blocks at active pyramid levels.
-            // Plain-memory binary search saves the atomic-heavy
-            // BlockCache::get / isEmptyChunk probes for the first access
-            // of hot data. The slice may contain multiple entries for a
-            // given packedKey; scan the run looking for matching pipeline
-            // and pyramid level.
-            if (!frame->slice.empty()) {
-                auto it = std::lower_bound(
-                    frame->slice.begin(), frame->slice.end(), key,
-                    [](const vc::cache::SliceEntry& e, std::uint64_t k) {
-                        return e.packedKey < k;
-                    });
-                while (it != frame->slice.end() && it->packedKey == key) {
-                    if (it->pipeline == &cache && it->level == level && it->block) {
-                        slotBlocks[idx] = const_cast<BlockPtr>(it->block);
-                        slot.data = reinterpret_cast<const T*>(it->block->data);
-                        slot.key  = key;
-                        data = slot.data;
-                        return;
-                    }
-                    ++it;
-                }
-            }
+        const ChunkResult result = cache.getChunkBlocking(level, cz, cy, cx);
+        slot.bytes.reset();
+        slot.data = nullptr;
+        slot.allFill = false;
+        if (result.status == ChunkStatus::AllFill) {
+            slot.allFill = true;
+        } else if (result.status == ChunkStatus::Data && result.bytes) {
+            slot.bytes = result.bytes;
+            slot.data = reinterpret_cast<const T*>(slot.bytes->data());
+        } else if (result.status == ChunkStatus::Error) {
+            throw std::runtime_error(result.error.empty() ? "chunk fetch failed" : result.error);
         }
-
-        BlockKey bk{level, bz, by, bx};
-        slotBlocks[idx] = cache.blockAt(bk);
-        slot.data = slotBlocks[idx] ? reinterpret_cast<const T*>(slotBlocks[idx]->data) : nullptr;
         slot.key = key;
         data = slot.data;
+        allFill = slot.allFill;
     }
 
-    VC_FORCE_INLINE static size_t voxelOffset(int lz, int ly, int lx) {
-        return size_t(lz) * kStrideZ + size_t(ly) * kStrideY + size_t(lx);
+    VC_FORCE_INLINE size_t voxelOffset(int lz, int ly, int lx) const {
+        return size_t(lz) * size_t(chunkStrideZ) + size_t(ly) * size_t(chunkStrideY) + size_t(lx);
     }
 
     VC_FORCE_INLINE bool inBounds(float vz, float vy, float vx) const {
@@ -264,32 +170,20 @@ struct BlockSampler {
             unsigned(ix) >= unsigned(shape.sx))
             return 0;
 
-        int bz = iz >> kBlockShift;
-        int by = iy >> kBlockShift;
-        int bx = ix >> kBlockShift;
-        updateBlock(bz, by, bx);
-        if (!data) return 0;
+        int cz = iz / chunkShape[0];
+        int cy = iy / chunkShape[1];
+        int cx = ix / chunkShape[2];
+        updateChunk(cz, cy, cx);
+        if (allFill || !data) return 0;
 
-        int lz = iz & kBlockMask;
-        int ly = iy & kBlockMask;
-        int lx = ix & kBlockMask;
+        int lz = iz - cz * chunkShape[0];
+        int ly = iy - cy * chunkShape[1];
+        int lx = ix - cx * chunkShape[2];
         return data[voxelOffset(lz, ly, lx)];
     }
 
-    // Non-blocking version — skips blocks not yet in RAM.
     VC_FORCE_INLINE bool sampleIntNB(int iz, int iy, int ix, T& out) {
-        if (unsigned(iz) >= unsigned(shape.sz) ||
-            unsigned(iy) >= unsigned(shape.sy) ||
-            unsigned(ix) >= unsigned(shape.sx)) {
-            out = 0; return true;
-        }
-        int bz = iz >> kBlockShift;
-        int by = iy >> kBlockShift;
-        int bx = ix >> kBlockShift;
-        tryUpdateBlockNonBlocking(bz, by, bx);
-        if (!data) return false;
-        int lz = iz & kBlockMask, ly = iy & kBlockMask, lx = ix & kBlockMask;
-        out = data[voxelOffset(lz, ly, lx)];
+        out = sampleInt(iz, iy, ix);
         return true;
     }
 
@@ -359,18 +253,14 @@ struct BlockSampler {
     }
 };
 
-// Append the chunk keys that enclose a world-space bbox to `out`. Callers
-// that submit multiple regions/levels in one frame should accumulate into
-// a single vector and call cache.fetchInteractive(keys) exactly once —
-// every fetchInteractive call rebuilds the IOPool priority queue, so
-// batching matters.
-void appendChunksForRegion(BlockPipeline& cache, int level,
+// Append the chunk keys that enclose a voxel-space bbox to `out`.
+void appendChunksForRegion(IChunkedArray& cache, int level,
                            float minVx, float minVy, float minVz,
                            float maxVx, float maxVy, float maxVz,
-                           std::vector<vc::cache::ChunkKey>& out) {
+                           std::vector<ChunkKey>& out) {
     auto cs = cache.chunkShape(level);
     if (cs[0] <= 0) return;
-    auto ls = cache.levelShape(level);
+    auto ls = cache.shape(level);
     int chunksZ = (ls[0] + cs[0] - 1) / cs[0];
     int chunksY = (ls[1] + cs[1] - 1) / cs[1];
     int chunksX = (ls[2] + cs[2] - 1) / cs[2];
@@ -440,12 +330,12 @@ VoxelBounds planeViewportBounds(const cv::Vec3f& origin,
 // the front of its priority queue, so center-most chunks land at the head
 // of the download/load queue and stream in first. `centerL0` is in level-0
 // voxel coordinates.
-void sortKeysByCenterDistance(std::vector<vc::cache::ChunkKey>& keys,
+void sortKeysByCenterDistance(std::vector<ChunkKey>& keys,
                               const std::array<int, 3>* chunkShapesByLevel,
                               int numLevels,
                               const cv::Vec3f& centerL0) {
     if (keys.size() < 2) return;
-    auto sqDist = [&](const vc::cache::ChunkKey& k) -> float {
+    auto sqDist = [&](const ChunkKey& k) -> float {
         if (k.level < 0 || k.level >= numLevels) return std::numeric_limits<float>::max();
         const auto& cs = chunkShapesByLevel[k.level];
         if (cs[0] <= 0) return std::numeric_limits<float>::max();
@@ -460,23 +350,23 @@ void sortKeysByCenterDistance(std::vector<vc::cache::ChunkKey>& keys,
         return dx*dx + dy*dy + dz*dz;
     };
     std::sort(keys.begin(), keys.end(),
-        [&](const vc::cache::ChunkKey& a, const vc::cache::ChunkKey& b) {
+        [&](const ChunkKey& a, const ChunkKey& b) {
             return sqDist(a) < sqDist(b);
         });
 }
 
 // Convenience wrapper: single-region, single-level. Submits immediately.
-void prefetchRegion(BlockPipeline& cache, int level,
+void prefetchRegion(IChunkedArray& cache, int level,
                     float minVx, float minVy, float minVz,
                     float maxVx, float maxVy, float maxVz) {
-    thread_local std::vector<vc::cache::ChunkKey> keys;
+    thread_local std::vector<ChunkKey> keys;
     keys.clear();
     appendChunksForRegion(cache, level, minVx, minVy, minVz,
                           maxVx, maxVy, maxVz, keys);
-    if (!keys.empty()) TickCoordinator::enqueuePrefetchGlobal(&cache, keys, level);
+    if (!keys.empty()) cache.prefetchChunks(keys, false);
 }
 
-void prefetchCoordsRegion(BlockPipeline& cache, int level,
+void prefetchCoordsRegion(IChunkedArray& cache, int level,
                           const cv::Mat_<cv::Vec3f>& coords) {
     // Unconditional min/max reductions so the vectorizer can fold the
     // inner loop: invalid points are sentinels (usually NaN), and
@@ -497,7 +387,7 @@ void prefetchCoordsRegion(BlockPipeline& cache, int level,
         prefetchRegion(cache, level, minVx, minVy, minVz, maxVx, maxVy, maxVz);
 }
 
-void prefetchPlaneRegion(BlockPipeline& cache, int level,
+void prefetchPlaneRegion(IChunkedArray& cache, int level,
                          const cv::Vec3f& origin,
                          const cv::Vec3f& vx_step,
                          const cv::Vec3f& vy_step,
@@ -522,7 +412,7 @@ void prefetchPlaneRegion(BlockPipeline& cache, int level,
 enum class SampleMode : std::uint8_t { Nearest, Trilinear, Tricubic };
 
 template<typename T, SampleMode Mode>
-VC_FORCE_INLINE T sampleOne(BlockSampler<T>& s, float vz, float vy, float vx) {
+VC_FORCE_INLINE T sampleOne(ChunkSampler<T>& s, float vz, float vy, float vx) {
     if constexpr (Mode == SampleMode::Nearest) {
         if (!s.inBounds(vz, vy, vx)) return 0;
         return s.sampleNearest(vz, vy, vx);
@@ -544,7 +434,7 @@ VC_FORCE_INLINE T sampleOne(BlockSampler<T>& s, float vz, float vy, float vx) {
 }
 
 template<typename T, SampleMode Mode>
-void readVolumeImpl(cv::Mat_<T>& out, BlockPipeline& cache, int level,
+void readVolumeImpl(cv::Mat_<T>& out, IChunkedArray& cache, int level,
                     const cv::Mat_<cv::Vec3f>& coords)
 {
     prefetchCoordsRegion(cache, level, coords);
@@ -553,7 +443,7 @@ void readVolumeImpl(cv::Mat_<T>& out, BlockPipeline& cache, int level,
     const int w = coords.cols;
     #pragma omp parallel
     {
-        BlockSampler<T> s(cache, level);
+        ChunkSampler<T> s(cache, level);
         #pragma omp for schedule(dynamic, 16)
         for (int y = 0; y < h; y++) {
             const cv::Vec3f* row = coords.ptr<cv::Vec3f>(y);
@@ -572,7 +462,7 @@ void readVolumeImpl(cv::Mat_<T>& out, BlockPipeline& cache, int level,
 // Public API
 // ============================================================================
 
-void readInterpolated3D(cv::Mat_<uint8_t>& out, BlockPipeline* cache, int level,
+void readInterpolated3D(cv::Mat_<uint8_t>& out, IChunkedArray* cache, int level,
                         const cv::Mat_<cv::Vec3f>& coords, bool nearest_neighbor) {
     if (nearest_neighbor)
         readVolumeImpl<uint8_t, SampleMode::Nearest>(out, *cache, level, coords);
@@ -580,7 +470,7 @@ void readInterpolated3D(cv::Mat_<uint8_t>& out, BlockPipeline* cache, int level,
         readVolumeImpl<uint8_t, SampleMode::Trilinear>(out, *cache, level, coords);
 }
 
-void readInterpolated3D(cv::Mat_<uint16_t>& out, BlockPipeline* cache, int level,
+void readInterpolated3D(cv::Mat_<uint16_t>& out, IChunkedArray* cache, int level,
                         const cv::Mat_<cv::Vec3f>& coords, bool nearest_neighbor) {
     if (nearest_neighbor)
         readVolumeImpl<uint16_t, SampleMode::Nearest>(out, *cache, level, coords);
@@ -588,7 +478,7 @@ void readInterpolated3D(cv::Mat_<uint16_t>& out, BlockPipeline* cache, int level
         readVolumeImpl<uint16_t, SampleMode::Trilinear>(out, *cache, level, coords);
 }
 
-void readInterpolated3D(cv::Mat_<uint8_t>& out, BlockPipeline* cache, int level,
+void readInterpolated3D(cv::Mat_<uint8_t>& out, IChunkedArray* cache, int level,
                         const cv::Mat_<cv::Vec3f>& coords, vc::Sampling method) {
     switch (method) {
         case vc::Sampling::Nearest:
@@ -600,7 +490,7 @@ void readInterpolated3D(cv::Mat_<uint8_t>& out, BlockPipeline* cache, int level,
     }
 }
 
-void readInterpolated3D(cv::Mat_<uint16_t>& out, BlockPipeline* cache, int level,
+void readInterpolated3D(cv::Mat_<uint16_t>& out, IChunkedArray* cache, int level,
                         const cv::Mat_<cv::Vec3f>& coords, vc::Sampling method) {
     switch (method) {
         case vc::Sampling::Nearest:
@@ -616,7 +506,7 @@ namespace {
 
 template<typename T>
 void readArea3DImpl(Array3D<T>& out, const cv::Vec3i& offset,
-                    BlockPipeline* cache, int level) {
+                    IChunkedArray* cache, int level) {
     int d = int(out.shape()[0]), h = int(out.shape()[1]), w = int(out.shape()[2]);
     // Prefetch
     prefetchRegion(*cache, level,
@@ -625,7 +515,7 @@ void readArea3DImpl(Array3D<T>& out, const cv::Vec3i& offset,
 
     #pragma omp parallel
     {
-        BlockSampler<T> s(*cache, level);
+        ChunkSampler<T> s(*cache, level);
         #pragma omp for schedule(dynamic, 4) collapse(2)
         for (int z = 0; z < d; z++) {
             for (int y = 0; y < h; y++) {
@@ -643,12 +533,12 @@ void readArea3DImpl(Array3D<T>& out, const cv::Vec3i& offset,
 } // namespace
 
 void readArea3D(Array3D<uint8_t>& out, const cv::Vec3i& offset,
-                BlockPipeline* cache, int level) {
+                IChunkedArray* cache, int level) {
     readArea3DImpl(out, offset, cache, level);
 }
 
 void readArea3D(Array3D<uint16_t>& out, const cv::Vec3i& offset,
-                BlockPipeline* cache, int level) {
+                IChunkedArray* cache, int level) {
     readArea3DImpl(out, offset, cache, level);
 }
 
@@ -659,14 +549,14 @@ void readArea3D(Array3D<uint16_t>& out, const cv::Vec3i& offset,
 namespace {
 
 template<SampleMode Mode>
-void samplePlaneImpl(cv::Mat_<uint8_t>& out, BlockPipeline& cache, int level,
+void samplePlaneImpl(cv::Mat_<uint8_t>& out, IChunkedArray& cache, int level,
                      const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
                      int w, int h) {
     prefetchPlaneRegion(cache, level, origin, vx_step, vy_step, w, h);
 
     #pragma omp parallel
     {
-        BlockSampler<uint8_t> s(cache, level);
+        ChunkSampler<uint8_t> s(cache, level);
         #pragma omp for schedule(dynamic, 16)
         for (int y = 0; y < h; y++) {
             uint8_t* outRow = out.ptr<uint8_t>(y);
@@ -681,7 +571,7 @@ void samplePlaneImpl(cv::Mat_<uint8_t>& out, BlockPipeline& cache, int level,
 
 } // namespace
 
-void samplePlane(cv::Mat_<uint8_t>& out, BlockPipeline* cache, int level,
+void samplePlane(cv::Mat_<uint8_t>& out, IChunkedArray* cache, int level,
                  const cv::Vec3f& origin, const cv::Vec3f& vx_step, const cv::Vec3f& vy_step,
                  int w, int h, vc::Sampling method) {
     switch (method) {
@@ -709,7 +599,7 @@ static bool needsLayerStorage(const std::string& m) {
 template<typename T, SampleMode Mode>
 void readCompositeFastImpl(
     cv::Mat_<uint8_t>& out,
-    BlockPipeline& cache,
+    IChunkedArray& cache,
     int level,
     const cv::Mat_<cv::Vec3f>& baseCoords,
     const cv::Mat_<cv::Vec3f>& normals,
@@ -730,7 +620,7 @@ void readCompositeFastImpl(
 
     #pragma omp parallel
     {
-        BlockSampler<T> s(cache, level);
+        ChunkSampler<T> s(cache, level);
         std::vector<float> layerVals(numLayers);
         #pragma omp for schedule(dynamic, 16)
         for (int y = 0; y < h; y++) {
@@ -795,7 +685,7 @@ void readCompositeFastImpl(
 
 void readCompositeFast(
     cv::Mat_<uint8_t>& out,
-    BlockPipeline* cache,
+    IChunkedArray* cache,
     int level,
     const cv::Mat_<cv::Vec3f>& baseCoords,
     const cv::Mat_<cv::Vec3f>& normals,
@@ -826,7 +716,7 @@ namespace {
 template<typename T>
 void readMultiSliceImpl(
     std::vector<cv::Mat_<T>>& out,
-    BlockPipeline* cache,
+    IChunkedArray* cache,
     int level,
     const cv::Mat_<cv::Vec3f>& basePoints,
     const cv::Mat_<cv::Vec3f>& stepDirs,
@@ -863,7 +753,7 @@ void readMultiSliceImpl(
 
     #pragma omp parallel
     {
-        BlockSampler<T> s(*cache, level);
+        ChunkSampler<T> s(*cache, level);
         #pragma omp for schedule(dynamic, 16)
         for (int y = 0; y < h; y++) {
             const cv::Vec3f* bRow = basePoints.ptr<cv::Vec3f>(y);
@@ -894,7 +784,7 @@ void readMultiSliceImpl(
 template<typename T>
 void sampleTileSlicesImpl(
     std::vector<cv::Mat_<T>>& out,
-    BlockPipeline* cache,
+    IChunkedArray* cache,
     int level,
     const cv::Mat_<cv::Vec3f>& basePoints,
     const cv::Mat_<cv::Vec3f>& stepDirs,
@@ -905,7 +795,7 @@ void sampleTileSlicesImpl(
     out.resize(nSlices);
     for (int i = 0; i < nSlices; i++) out[i].create(h, w);
 
-    BlockSampler<T> s(*cache, level);
+    ChunkSampler<T> s(*cache, level);
     for (int y = 0; y < h; y++) {
         const cv::Vec3f* bRow = basePoints.ptr<cv::Vec3f>(y);
         const cv::Vec3f* sRow = stepDirs.ptr<cv::Vec3f>(y);
@@ -933,25 +823,25 @@ void sampleTileSlicesImpl(
 
 } // namespace
 
-void readMultiSlice(std::vector<cv::Mat_<uint8_t>>& out, BlockPipeline* cache, int level,
+void readMultiSlice(std::vector<cv::Mat_<uint8_t>>& out, IChunkedArray* cache, int level,
                     const cv::Mat_<cv::Vec3f>& basePoints, const cv::Mat_<cv::Vec3f>& stepDirs,
                     const std::vector<float>& offsets) {
     readMultiSliceImpl(out, cache, level, basePoints, stepDirs, offsets);
 }
 
-void readMultiSlice(std::vector<cv::Mat_<uint16_t>>& out, BlockPipeline* cache, int level,
+void readMultiSlice(std::vector<cv::Mat_<uint16_t>>& out, IChunkedArray* cache, int level,
                     const cv::Mat_<cv::Vec3f>& basePoints, const cv::Mat_<cv::Vec3f>& stepDirs,
                     const std::vector<float>& offsets) {
     readMultiSliceImpl(out, cache, level, basePoints, stepDirs, offsets);
 }
 
-void sampleTileSlices(std::vector<cv::Mat_<uint8_t>>& out, BlockPipeline* cache, int level,
+void sampleTileSlices(std::vector<cv::Mat_<uint8_t>>& out, IChunkedArray* cache, int level,
                       const cv::Mat_<cv::Vec3f>& basePoints, const cv::Mat_<cv::Vec3f>& stepDirs,
                       const std::vector<float>& offsets) {
     sampleTileSlicesImpl(out, cache, level, basePoints, stepDirs, offsets);
 }
 
-void sampleTileSlices(std::vector<cv::Mat_<uint16_t>>& out, BlockPipeline* cache, int level,
+void sampleTileSlices(std::vector<cv::Mat_<uint16_t>>& out, IChunkedArray* cache, int level,
                       const cv::Mat_<cv::Vec3f>& basePoints, const cv::Mat_<cv::Vec3f>& stepDirs,
                       const std::vector<float>& offsets) {
     sampleTileSlicesImpl(out, cache, level, basePoints, stepDirs, offsets);

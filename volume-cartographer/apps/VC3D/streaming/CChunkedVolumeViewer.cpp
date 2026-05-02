@@ -241,7 +241,7 @@ std::unique_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::share
     }
 
     return std::make_unique<vc::render::ChunkCache>(
-        makeLevelInfo(opened), opened.fetchers, opened.fillValue, options);
+        makeLevelInfo(opened), opened.fetchers, opened.fillValue, opened.dtype, options);
 }
 
 } // namespace

@@ -64,16 +64,18 @@ std::string fetchErrorMessage(const ChunkFetchResult& fetch)
 
 ChunkCache::ChunkCache(std::vector<LevelInfo> levels,
                        std::vector<std::shared_ptr<IChunkFetcher>> fetchers,
-                       double fillValue)
-    : ChunkCache(std::move(levels), std::move(fetchers), fillValue, Options{})
+                       double fillValue,
+                       ChunkDtype dtype)
+    : ChunkCache(std::move(levels), std::move(fetchers), fillValue, dtype, Options{})
 {
 }
 
 ChunkCache::ChunkCache(std::vector<LevelInfo> levels,
                        std::vector<std::shared_ptr<IChunkFetcher>> fetchers,
                        double fillValue,
+                       ChunkDtype dtype,
                        Options options)
-    : state_(std::make_shared<State>(std::move(levels), std::move(fetchers), fillValue, std::move(options)))
+    : state_(std::make_shared<State>(std::move(levels), std::move(fetchers), fillValue, dtype, std::move(options)))
 {
     if (state_->levels_.empty())
         throw std::invalid_argument("ChunkCache requires at least one level");
@@ -115,7 +117,7 @@ std::array<int, 3> ChunkCache::chunkShape(int level) const
 
 ChunkDtype ChunkCache::dtype() const
 {
-    return ChunkDtype::UInt8;
+    return state_->dtype_;
 }
 
 double ChunkCache::fillValue() const
@@ -133,19 +135,19 @@ ChunkResult ChunkCache::tryGetChunk(int level, int iz, int iy, int ix)
     auto state = state_;
     const ChunkKey key{level, iz, iy, ix};
     if (!isValidKey(*state, key))
-        return ChunkResult{ChunkStatus::AllFill, ChunkDtype::UInt8, {}, {}, {}};
+        return ChunkResult{ChunkStatus::AllFill, state->dtype_, {}, {}, {}};
 
     std::unique_lock lock(state->mutex_);
     auto it = state->entries_.find(key);
     if (it != state->entries_.end()) {
         if (it->second.status == EntryStatus::InFlight)
-            return ChunkResult{ChunkStatus::MissQueued, ChunkDtype::UInt8, state->levels_[level].chunkShape, {}, {}};
+            return ChunkResult{ChunkStatus::MissQueued, state->dtype_, state->levels_[level].chunkShape, {}, {}};
         return resultFromEntryLocked(*state, key, it->second);
     }
 
     state->entries_.emplace(key, Entry{});
     queueFetchLocked(state, key, state->generation_);
-    return ChunkResult{ChunkStatus::MissQueued, ChunkDtype::UInt8, state->levels_[level].chunkShape, {}, {}};
+    return ChunkResult{ChunkStatus::MissQueued, state->dtype_, state->levels_[level].chunkShape, {}, {}};
 }
 
 ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
@@ -153,7 +155,7 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
     auto state = state_;
     const ChunkKey key{level, iz, iy, ix};
     if (!isValidKey(*state, key))
-        return ChunkResult{ChunkStatus::AllFill, ChunkDtype::UInt8, {}, {}, {}};
+        return ChunkResult{ChunkStatus::AllFill, state->dtype_, {}, {}, {}};
 
     std::unique_lock lock(state->mutex_);
     auto [it, inserted] = state->entries_.emplace(key, Entry{});
@@ -162,7 +164,7 @@ ChunkResult ChunkCache::getChunkBlocking(int level, int iz, int iy, int ix)
     waitForResolvedLocked(*state, lock, key);
     it = state->entries_.find(key);
     if (it == state->entries_.end())
-        return ChunkResult{ChunkStatus::Error, ChunkDtype::UInt8, state->levels_[level].chunkShape, {}, "chunk invalidated"};
+        return ChunkResult{ChunkStatus::Error, state->dtype_, state->levels_[level].chunkShape, {}, "chunk invalidated"};
     return resultFromEntryLocked(*state, key, it->second);
 }
 
@@ -224,7 +226,7 @@ void ChunkCache::invalidate()
 ChunkResult ChunkCache::resultFromEntryLocked(State& state, const ChunkKey& key, Entry& entry)
 {
     ChunkResult result;
-    result.dtype = ChunkDtype::UInt8;
+    result.dtype = state.dtype_;
     result.shape = state.levels_[static_cast<std::size_t>(key.level)].chunkShape;
 
     switch (entry.status) {
@@ -463,11 +465,34 @@ bool ChunkCache::isValidKey(const State& state, const ChunkKey& key)
 
 bool ChunkCache::isAllFill(const State& state, const std::vector<std::byte>& bytes)
 {
-    const auto fill = static_cast<unsigned char>(std::clamp(
-        state.fillValue_, 0.0, static_cast<double>(std::numeric_limits<unsigned char>::max())));
-    return std::all_of(bytes.begin(), bytes.end(), [fill](std::byte value) {
-        return static_cast<unsigned char>(value) == fill;
+    if (state.dtype_ == ChunkDtype::UInt8) {
+        const auto fill = static_cast<unsigned char>(std::clamp(
+            state.fillValue_, 0.0, static_cast<double>(std::numeric_limits<unsigned char>::max())));
+        return std::all_of(bytes.begin(), bytes.end(), [fill](std::byte value) {
+            return static_cast<unsigned char>(value) == fill;
+        });
+    }
+
+    const auto fill = static_cast<std::uint16_t>(std::clamp(
+        state.fillValue_, 0.0, static_cast<double>(std::numeric_limits<std::uint16_t>::max())));
+    if (bytes.size() % sizeof(std::uint16_t) != 0)
+        return false;
+    const auto* ptr = reinterpret_cast<const std::uint16_t*>(bytes.data());
+    const std::size_t count = bytes.size() / sizeof(std::uint16_t);
+    return std::all_of(ptr, ptr + count, [fill](std::uint16_t value) {
+        return value == fill;
     });
+}
+
+std::size_t ChunkCache::dtypeSize(ChunkDtype dtype)
+{
+    switch (dtype) {
+    case ChunkDtype::UInt8:
+        return 1;
+    case ChunkDtype::UInt16:
+        return 2;
+    }
+    return 1;
 }
 
 std::size_t ChunkCache::expectedChunkBytes(const State& state, const ChunkKey& key)
@@ -475,7 +500,8 @@ std::size_t ChunkCache::expectedChunkBytes(const State& state, const ChunkKey& k
     const auto& chunk = state.levels_[static_cast<std::size_t>(key.level)].chunkShape;
     return static_cast<std::size_t>(chunk[0]) *
            static_cast<std::size_t>(chunk[1]) *
-           static_cast<std::size_t>(chunk[2]);
+           static_cast<std::size_t>(chunk[2]) *
+           dtypeSize(state.dtype_);
 }
 
 void ChunkCache::notifyListeners(const std::shared_ptr<State>& state)
