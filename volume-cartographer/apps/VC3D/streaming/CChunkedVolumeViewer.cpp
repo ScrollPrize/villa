@@ -49,6 +49,7 @@ constexpr int kResizeSettleMs = 140;
 constexpr int kChunkReadyActiveDelayMs = 500;
 constexpr float kResolutionLodZoomBias = 0.5f;
 constexpr int kSurfaceResolutionLevelBias = 1;
+constexpr int kInitialSegmentationSurfaceLevel = 5;
 constexpr double kSlowMotionPxPerSec = 180.0;
 constexpr double kFastMotionPxPerSec = 1800.0;
 constexpr qint64 kInteractivePreviewMinIntervalMs = 50;
@@ -208,6 +209,18 @@ std::size_t streamingCacheCapacityBytes(const CState* state)
     if (!state || state->cacheSizeBytes() == 0)
         return kFallbackCapacity;
     return state->cacheSizeBytes();
+}
+
+float scaleForSurfaceRenderStartLevel(int renderLevel, int numLevels)
+{
+    const int maxLevel = std::max(0, numLevels - 1);
+    const int clampedRenderLevel = std::clamp(renderLevel, 0, maxLevel);
+    int dsLevel = clampedRenderLevel + kSurfaceResolutionLevelBias;
+    if (dsLevel > maxLevel)
+        dsLevel = maxLevel;
+
+    const float dsScale = static_cast<float>(std::uint64_t{1} << dsLevel);
+    return std::clamp(0.75f / (dsScale * kResolutionLodZoomBias), kMinScale, kMaxScale);
 }
 
 std::unique_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::shared_ptr<Volume>& volume,
@@ -438,7 +451,7 @@ void CChunkedVolumeViewer::OnVolumeChanged(std::shared_ptr<Volume> vol)
 
 void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
                                             const std::shared_ptr<Surface>& surf,
-                                            bool)
+                                            bool isEditUpdate)
 {
     const bool isCurrentSurface = (_surfName == name);
     const bool isIntersectionTarget =
@@ -457,6 +470,8 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
 
     _surfWeak = surf;
     _genCacheDirty = true;
+    _zOffWorldDir = {0, 0, 0};
+    _stableFramebufferValid = false;
     invalidateIntersect(name);
     if (!surf) {
         clearIntersectionItems();
@@ -467,6 +482,16 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         return;
     }
     updateContentBounds();
+    if (!isEditUpdate && _resetViewOnSurfaceChange && _surfName == "segmentation" &&
+        dynamic_cast<QuadSurface*>(surf.get())) {
+        _surfacePtrX = 0.0f;
+        _surfacePtrY = 0.0f;
+        _zOff = 0.0f;
+        const int n = _chunkArray ? _chunkArray->numLevels()
+                                  : (_volume ? static_cast<int>(_volume->numScales()) : 1);
+        _scale = scaleForSurfaceRenderStartLevel(kInitialSegmentationSurfaceLevel, n);
+        recalcPyramidLevel();
+    }
     updateFocusMarker();
     scheduleRender();
     renderIntersections();
@@ -877,7 +902,7 @@ int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const
     // to a finer level. Plane views can bias coarser during active motion;
     // surface-resolution views keep their target level to avoid panning blur.
     int level = _dsScaleIdx;
-    if (preferSurfaceResolution)
+    if (preferSurfaceResolution && _chunkArray && level < _chunkArray->numLevels() - 1)
         level -= kSurfaceResolutionLevelBias;
     if (_interactivePreview && !preferSurfaceResolution && _chunkArray->numLevels() > 1) {
         const double speed = std::max(0.0, _interactionSpeedPxPerSec);
