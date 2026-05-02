@@ -8,23 +8,12 @@
 
 #include <opencv2/core.hpp>
 
-#if defined(__linux__)
-#include <pthread.h>
-#include <cstdio>
-#endif
-
 #include <algorithm>
 #include <array>
-#include <atomic>
 #include <cmath>
 #include <cstdint>
-#include <functional>
 #include <limits>
 #include <mutex>
-#include <optional>
-#include <semaphore>
-#include <thread>
-#include <unordered_set>
 #include <vector>
 #include <omp.h>
 
@@ -43,7 +32,6 @@ using vc::cache::BlockPipeline;
 using vc::cache::ChunkKey;
 using vc::cache::FrameState;
 using vc::cache::kBlockSize;
-using vc::cache::kMaxLevels;
 using vc::cache::TickCoordinator;
 
 // Shared static zero-block for chunks known to be all-zero. Using one
@@ -120,9 +108,6 @@ struct BlockSampler {
     // (where lookups are 2 instructions, no atomics).
     // The BlockPtr (non-owning) lives in a cold parallel array,
     // touched only on miss. Both arrays are heap-allocated so the
-    // sampler itself stays ~100 bytes — render workers stack an
-    // array<optional<BlockSampler>, kMaxLevels=8> and inline 384 KB
-    // per slot would blow past a macOS default pthread stack.
     struct HotSlot {
         uint64_t key = UINT64_MAX;
         const T* data = nullptr;
@@ -491,11 +476,6 @@ void prefetchRegion(BlockPipeline& cache, int level,
     if (!keys.empty()) TickCoordinator::enqueuePrefetchGlobal(&cache, keys, level);
 }
 
-// prefetchCoordsRegion / prefetchPlaneRegion: inputs are already in
-// LEVEL-space voxels (callers either pass already-scaled args or operate
-// at a single level). For the world-space → multi-level adaptive path,
-// see sampleCompositeAdaptiveImpl / sampleSingleLayerAdaptiveImpl which
-// scale per-level before prefetching.
 void prefetchCoordsRegion(BlockPipeline& cache, int level,
                           const cv::Mat_<cv::Vec3f>& coords) {
     // Unconditional min/max reductions so the vectorizer can fold the
