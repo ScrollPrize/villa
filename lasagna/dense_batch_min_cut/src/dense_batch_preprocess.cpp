@@ -2442,42 +2442,78 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                 continue;
             }
 
-            double side_a = source_edges[edge_index] != 0
-                                ? kGraphFlowInf
-                                : max_flow_to_node(edge.a, edge_index);
-            double side_b = 0.0;
-            if (edge.b != edge.a) {
-                side_b = source_edges[edge_index] != 0
-                             ? kGraphFlowInf
-                             : max_flow_to_node(edge.b, edge_index);
+            if (source_edges[edge_index] != 0) {
+                for (const cv::Point pixel : ordered) {
+                    graph_pixel_flow.at<float>(pixel.y, pixel.x) =
+                        kDenseFlowInf;
+                }
+                continue;
             }
 
-            std::vector<float> left(ordered.size(), 0.0f);
-            std::vector<float> right(ordered.size(), 0.0f);
-            float min_dt = static_cast<float>(
-                std::min(side_a, static_cast<double>(kDenseFlowInf)));
+            std::vector<float> cap_a(ordered.size(), 0.0f);
+            std::vector<float> cap_b(ordered.size(), 0.0f);
+            std::vector<double> dist_a(ordered.size(), 0.0);
+            std::vector<double> dist_b(ordered.size(), 0.0);
+            const float node_a_flow =
+                edge.a > 0 && edge.a < node_count
+                    ? static_cast<float>(std::min(
+                          static_cast<double>(kDenseFlowInf),
+                          std::max(0.0, node_flow[edge.a])))
+                    : 0.0f;
+            const float node_b_flow =
+                edge.b > 0 && edge.b < node_count
+                    ? static_cast<float>(std::min(
+                          static_cast<double>(kDenseFlowInf),
+                          std::max(0.0, node_flow[edge.b])))
+                    : node_a_flow;
+
+            float min_capacity = node_a_flow;
             for (std::size_t i = 0; i < ordered.size(); ++i) {
-                min_dt = std::min(
-                    min_dt,
+                if (i > 0) {
+                    const int dx = std::abs(ordered[i].x - ordered[i - 1].x);
+                    const int dy = std::abs(ordered[i].y - ordered[i - 1].y);
+                    dist_a[i] = dist_a[i - 1] +
+                                (dx + dy == 2 ? std::sqrt(2.0) : 1.0);
+                }
+                min_capacity = std::min(
+                    min_capacity,
                     capacity_from_dt(dt.at<float>(ordered[i].y, ordered[i].x)));
-                left[i] = min_dt;
+                cap_a[i] = min_capacity;
             }
-            min_dt = static_cast<float>(
-                std::min(side_b, static_cast<double>(kDenseFlowInf)));
+            min_capacity = node_b_flow;
             for (std::size_t i = ordered.size(); i-- > 0;) {
-                min_dt = std::min(
-                    min_dt,
+                if (i + 1 < ordered.size()) {
+                    const int dx = std::abs(ordered[i].x - ordered[i + 1].x);
+                    const int dy = std::abs(ordered[i].y - ordered[i + 1].y);
+                    dist_b[i] = dist_b[i + 1] +
+                                (dx + dy == 2 ? std::sqrt(2.0) : 1.0);
+                }
+                min_capacity = std::min(
+                    min_capacity,
                     capacity_from_dt(dt.at<float>(ordered[i].y, ordered[i].x)));
-                right[i] = min_dt;
+                cap_b[i] = min_capacity;
             }
 
+            double edge_sum = 0.0;
             for (std::size_t i = 0; i < ordered.size(); ++i) {
+                const double total_dist = dist_a[i] + dist_b[i];
+                const double weight_a =
+                    total_dist > 0.0 ? dist_b[i] / total_dist : 0.5;
+                const double weight_b =
+                    total_dist > 0.0 ? dist_a[i] / total_dist : 0.5;
+                const float value = static_cast<float>(std::min(
+                    static_cast<double>(kDenseFlowInf),
+                    weight_a * cap_a[i] + weight_b * cap_b[i]));
                 const cv::Point pixel = ordered[i];
-                const float value =
-                    std::min(kDenseFlowInf, left[i] + right[i]);
                 graph_pixel_flow.at<float>(pixel.y, pixel.x) =
                     std::max(graph_pixel_flow.at<float>(pixel.y, pixel.x),
                              value);
+                edge_sum += value;
+            }
+            if (!ordered.empty()) {
+                edge_flow[edge_index] = static_cast<float>(
+                    std::min(static_cast<double>(kDenseFlowInf),
+                             edge_sum / static_cast<double>(ordered.size())));
             }
         }
         timings.push_back(finish_timing("graph_edge_point_flow", timing));
