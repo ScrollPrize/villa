@@ -2787,7 +2787,9 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
         }
     }
 
-    if (_axisAlignedSliceController) {
+    const bool activatingAxisAlignedPlane =
+        newSurfId == "xy plane" || newSurfId == "seg xz" || newSurfId == "seg yz";
+    if (_axisAlignedSliceController && !activatingAxisAlignedPlane) {
         _axisAlignedSliceController->resetAll();
     }
 
@@ -3817,8 +3819,11 @@ void CWindow::onFiberViewersRequested()
     for (int i = 0; i < N; ++i) {
         QString title = (i == 0) ? tr("Fiber Ref") : tr("Fiber Annotate");
 
-        auto* viewer = newConnectedViewer(
+        auto* baseViewer = newConnectedViewer(
             FiberAnnotationController::fiberSurfaceName(i), title, mdiArea);
+        auto* viewer = baseViewer
+            ? qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject())
+            : nullptr;
         if (!viewer) continue;
 
         _fiberController->setFiberViewer(i, viewer);
