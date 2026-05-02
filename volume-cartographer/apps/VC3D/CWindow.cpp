@@ -1,16 +1,8 @@
 #include "CWindow.hpp"
 #include <iostream>
-#include "RamStats.hpp"
 
-#include <cstdlib>
 #include <functional>
 #include <mutex>
-#if defined(__GLIBC__)
-#include <malloc.h>
-#endif
-#if defined(VC_HAVE_MIMALLOC)
-#include <mimalloc.h>
-#endif
 
 #include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "WindowRangeWidget.hpp"
@@ -666,24 +658,6 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _windowStateSaveTimer->setSingleShot(true);
     _windowStateSaveTimer->setInterval(500);
     connect(_windowStateSaveTimer, &QTimer::timeout, this, &CWindow::saveWindowState);
-
-    // Periodic heap trim: under mimalloc, mi_collect asks it to purge
-    // thread / segment caches and return freed pages to the OS. Under
-    // glibc, malloc_trim returns sbrk-grown segments. Also dumps a RAM
-    // stats line for live monitoring.
-    auto* trimTimer = new QTimer(this);
-    trimTimer->setInterval(1000);
-    connect(trimTimer, &QTimer::timeout, this, [this]() {
-#if defined(VC_HAVE_MIMALLOC)
-        mi_collect(false);
-#elif defined(__GLIBC__)
-        ::malloc_trim(0);
-#endif
-        if (DebugLoggingEnabled()) {
-            vc3d::ramstats::dumpOnce(_viewerManager.get(), _state);
-        }
-    });
-    trimTimer->start();
 
     const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     _mirrorCursorToSegmentation = settings.value(vc3d::settings::viewer::MIRROR_CURSOR_TO_SEGMENTATION,
@@ -2440,10 +2414,6 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onGrowSegmentFromSegment(segmentId.toStdString());
             });
-    connect(_surfacePanel.get(), &SurfacePanelController::addOverlapRequested,
-            this, [this](const QString& segmentId) {
-                _segmentationCommandHandler->onAddOverlap(segmentId.toStdString());
-            });
     connect(_surfacePanel.get(), &SurfacePanelController::neighborCopyRequested,
             this, [this](const QString& segmentId, bool copyOut) {
                 _segmentationCommandHandler->onNeighborCopyRequested(segmentId, copyOut);
@@ -2506,10 +2476,6 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onABFFlatten(segmentId.toStdString());
             });
-    connect(_surfacePanel.get(), &SurfacePanelController::awsUploadRequested,
-            this, [this](const QString& segmentId) {
-                _segmentationCommandHandler->onAWSUpload(segmentId.toStdString());
-            });
     connect(_surfacePanel.get(), &SurfacePanelController::exportTifxyzChunksRequested,
         this, [this](const QString& segmentId) {
             _segmentationCommandHandler->onExportWidthChunks(segmentId.toStdString());
@@ -2522,10 +2488,6 @@ void CWindow::CreateWidgets(void)
         this, [this]() {
             _segmentationCommandHandler->onAddIgnoreLabel();
         });
-    connect(_surfacePanel.get(), &SurfacePanelController::growSeedsRequested,
-            this, [this](const QString& segmentId, bool isExpand, bool isRandomSeed) {
-                _segmentationCommandHandler->onGrowSeeds(segmentId.toStdString(), isExpand, isRandomSeed);
-            });
     connect(_surfacePanel.get(), &SurfacePanelController::recalcAreaRequested,
             this, [this](const QStringList& segmentIds) {
                 if (segmentIds.isEmpty()) return;

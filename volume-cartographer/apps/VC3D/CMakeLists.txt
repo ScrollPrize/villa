@@ -9,8 +9,6 @@ set(srcs
     CState.hpp
     SurfaceLRU.cpp
     SurfaceLRU.hpp
-    RamStats.cpp
-    RamStats.hpp
     Keybinds.cpp
     Keybinds.hpp
     CWindow.cpp
