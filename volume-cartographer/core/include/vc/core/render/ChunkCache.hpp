@@ -7,6 +7,8 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
+#include <deque>
 #include <filesystem>
 #include <list>
 #include <memory>
@@ -34,6 +36,14 @@ public:
         std::optional<std::filesystem::path> persistentCachePath;
     };
 
+    struct Stats {
+        std::size_t decodedBytes = 0;
+        std::size_t decodedByteCapacity = 0;
+        std::size_t persistentCacheBytes = 0;
+        std::size_t remoteFetchesInFlight = 0;
+        double remoteDownloadBytesPerSecond = 0.0;
+    };
+
     ChunkCache(std::vector<LevelInfo> levels,
                std::vector<std::shared_ptr<IChunkFetcher>> fetchers,
                double fillValue,
@@ -59,6 +69,7 @@ public:
     ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback cb) override;
     void removeChunkReadyListener(ChunkReadyCallbackId id) override;
 
+    Stats stats() const;
     void invalidate();
 
 private:
@@ -109,6 +120,10 @@ private:
         std::uint64_t nextFetchSerial_ = 1;
         ChunkReadyCallbackId nextCallbackId_ = 1;
         std::unordered_map<ChunkReadyCallbackId, ChunkReadyCallback> callbacks_;
+        std::size_t remoteFetchesInFlight_ = 0;
+        std::deque<std::pair<std::chrono::steady_clock::time_point, std::size_t>> remoteDownloadHistory_;
+        std::chrono::steady_clock::time_point lastPersistentCacheSizeScan_{};
+        std::size_t cachedPersistentCacheBytes_ = 0;
     };
 
     static ChunkResult resultFromEntryLocked(State& state, const ChunkKey& key, Entry& entry);
@@ -130,6 +145,8 @@ private:
                                      std::shared_ptr<const std::vector<std::byte>> bytes);
     static void writePersistent(const State& state, const ChunkKey& key, const std::vector<std::byte>& bytes);
     static std::filesystem::path persistentPath(const State& state, const ChunkKey& key);
+    static std::size_t persistentCacheBytes(const std::optional<std::filesystem::path>& path);
+    static void pruneDownloadHistoryLocked(State& state, std::chrono::steady_clock::time_point now);
     static void touchLocked(State& state, const ChunkKey& key, Entry& entry);
     static void enforceCapacityLocked(const std::shared_ptr<State>& state);
     static bool isValidKey(const State& state, const ChunkKey& key);

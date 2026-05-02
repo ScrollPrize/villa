@@ -12,6 +12,9 @@ namespace vc::render {
 
 namespace {
 
+constexpr auto kDownloadStatsWindow = std::chrono::seconds{3};
+constexpr auto kPersistentCacheSizeScanInterval = std::chrono::seconds{2};
+
 std::size_t normalizedWorkerCount(std::size_t requested)
 {
     return std::max<std::size_t>(1, requested);
@@ -213,6 +216,45 @@ void ChunkCache::removeChunkReadyListener(ChunkReadyCallbackId id)
     state->callbacks_.erase(id);
 }
 
+ChunkCache::Stats ChunkCache::stats() const
+{
+    auto state = state_;
+    std::optional<std::filesystem::path> persistentPath;
+    bool scanPersistentCacheBytes = false;
+    Stats result;
+    {
+        std::lock_guard lock(state->mutex_);
+        const auto now = std::chrono::steady_clock::now();
+        pruneDownloadHistoryLocked(*state, now);
+
+        std::size_t recentBytes = 0;
+        for (const auto& [time, bytes] : state->remoteDownloadHistory_) {
+            (void)time;
+            recentBytes += bytes;
+        }
+
+        result.decodedBytes = state->decodedBytes_;
+        result.decodedByteCapacity = state->options_.decodedByteCapacity;
+        result.remoteFetchesInFlight = state->remoteFetchesInFlight_;
+        result.remoteDownloadBytesPerSecond =
+            static_cast<double>(recentBytes) /
+            std::chrono::duration<double>(kDownloadStatsWindow).count();
+        result.persistentCacheBytes = state->cachedPersistentCacheBytes_;
+        persistentPath = state->options_.persistentCachePath;
+        scanPersistentCacheBytes = persistentPath.has_value() &&
+            (state->lastPersistentCacheSizeScan_ == std::chrono::steady_clock::time_point{} ||
+             now - state->lastPersistentCacheSizeScan_ >= kPersistentCacheSizeScanInterval);
+        if (scanPersistentCacheBytes)
+            state->lastPersistentCacheSizeScan_ = now;
+    }
+    if (scanPersistentCacheBytes) {
+        result.persistentCacheBytes = persistentCacheBytes(persistentPath);
+        std::lock_guard lock(state->mutex_);
+        state->cachedPersistentCacheBytes_ = result.persistentCacheBytes;
+    }
+    return result;
+}
+
 void ChunkCache::invalidate()
 {
     auto state = state_;
@@ -222,6 +264,8 @@ void ChunkCache::invalidate()
         state->entries_.clear();
         state->lru_.clear();
         state->decodedBytes_ = 0;
+        state->remoteFetchesInFlight_ = 0;
+        state->remoteDownloadHistory_.clear();
     }
     state->cv_.notify_all();
 }
@@ -292,12 +336,18 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state,
 
     ChunkFetchResult fetch;
     bool loadedFromPersistentCache = false;
+    bool trackedRemoteFetch = false;
     try {
         if (auto cached = readPersistent(*state, key)) {
             fetch.status = ChunkFetchStatus::Found;
             fetch.bytes = std::move(*cached);
             loadedFromPersistentCache = true;
         } else {
+            if (state->options_.persistentCachePath) {
+                trackedRemoteFetch = true;
+                std::lock_guard lock(state->mutex_);
+                ++state->remoteFetchesInFlight_;
+            }
             fetch = state->fetchers_.at(static_cast<std::size_t>(key.level))->fetch(key);
         }
     } catch (const std::exception& e) {
@@ -310,6 +360,13 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state,
 
     {
         std::lock_guard lock(state->mutex_);
+        if (trackedRemoteFetch && state->remoteFetchesInFlight_ > 0)
+            --state->remoteFetchesInFlight_;
+        if (trackedRemoteFetch && fetch.status == ChunkFetchStatus::Found && !fetch.bytes.empty()) {
+            const auto now = std::chrono::steady_clock::now();
+            state->remoteDownloadHistory_.emplace_back(now, fetch.bytes.size());
+            pruneDownloadHistoryLocked(*state, now);
+        }
         if (generation != state->generation_)
             return;
         auto it = state->entries_.find(key);
@@ -448,6 +505,43 @@ std::filesystem::path ChunkCache::persistentPath(const State& state, const Chunk
            std::to_string(key.iz) /
            std::to_string(key.iy) /
            (std::to_string(key.ix) + ".bin");
+}
+
+std::size_t ChunkCache::persistentCacheBytes(const std::optional<std::filesystem::path>& path)
+{
+    if (!path)
+        return 0;
+
+    std::error_code ec;
+    if (!std::filesystem::exists(*path, ec))
+        return 0;
+
+    std::size_t bytes = 0;
+    std::filesystem::recursive_directory_iterator it(
+        *path,
+        std::filesystem::directory_options::skip_permission_denied,
+        ec);
+    const std::filesystem::recursive_directory_iterator end;
+    while (!ec && it != end) {
+        if (it->is_regular_file(ec)) {
+            const auto size = it->file_size(ec);
+            if (!ec)
+                bytes += static_cast<std::size_t>(size);
+        } else {
+            ec.clear();
+        }
+        it.increment(ec);
+    }
+    return bytes;
+}
+
+void ChunkCache::pruneDownloadHistoryLocked(State& state, std::chrono::steady_clock::time_point now)
+{
+    const auto cutoff = now - kDownloadStatsWindow;
+    while (!state.remoteDownloadHistory_.empty() &&
+           state.remoteDownloadHistory_.front().first < cutoff) {
+        state.remoteDownloadHistory_.pop_front();
+    }
 }
 
 void ChunkCache::touchLocked(State& state, const ChunkKey& key, Entry& entry)

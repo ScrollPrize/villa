@@ -264,6 +264,7 @@ private:
     QTimer* _renderTimer = nullptr;
     QTimer* _settleRenderTimer = nullptr;
     QTimer* _resizeRenderTimer = nullptr;
+    QTimer* _statusTimer = nullptr;
     bool _renderPending = false;
     bool _interactivePreview = false;
     QElapsedTimer _interactionClock;

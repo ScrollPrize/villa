@@ -206,6 +206,27 @@ QString planeCoordinateText(PlaneSurface& plane)
     return QString("plane pos %1").arg(formatVec3(plane.origin()));
 }
 
+QString formatByteSize(std::size_t bytes)
+{
+    constexpr double kKiB = 1024.0;
+    constexpr double kMiB = kKiB * 1024.0;
+    constexpr double kGiB = kMiB * 1024.0;
+    const double value = static_cast<double>(bytes);
+    if (value >= kGiB)
+        return QString("%1 GB").arg(value / kGiB, 0, 'f', 2);
+    if (value >= kMiB)
+        return QString("%1 MB").arg(value / kMiB, 0, 'f', 1);
+    if (value >= kKiB)
+        return QString("%1 KB").arg(value / kKiB, 0, 'f', 1);
+    return QString("%1 B").arg(bytes);
+}
+
+QString formatMegabytesPerSecond(double bytesPerSecond)
+{
+    constexpr double kMiB = 1024.0 * 1024.0;
+    return QString("%1 MB/s").arg(std::max(0.0, bytesPerSecond) / kMiB, 0, 'f', 1);
+}
+
 std::size_t streamingCacheCapacityBytes(const CState* state)
 {
     constexpr std::size_t kFallbackCapacity = 2ULL * 1024ULL * 1024ULL * 1024ULL;
@@ -334,6 +355,13 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
         scheduleRender();
         emit overlaysUpdated();
     });
+
+    _statusTimer = new QTimer(this);
+    _statusTimer->setInterval(500);
+    connect(_statusTimer, &QTimer::timeout, this, [this]() {
+        updateStatusLabel();
+    });
+    _statusTimer->start();
 
     reloadPerfSettings();
 
@@ -2750,6 +2778,20 @@ void CChunkedVolumeViewer::updateStatusLabel()
         suffix = QString("  composite %1").arg(QString::fromStdString(_compositeSettings.params.method));
     }
 
+    QString cacheInfo;
+    if (_chunkArray) {
+        const auto stats = _chunkArray->stats();
+        cacheInfo = QString("  RAM %1/%2  disk %3")
+            .arg(formatByteSize(stats.decodedBytes))
+            .arg(formatByteSize(stats.decodedByteCapacity))
+            .arg(formatByteSize(stats.persistentCacheBytes));
+        if (stats.remoteFetchesInFlight > 0) {
+            cacheInfo += QString("  downloading %1 @ %2")
+                .arg(stats.remoteFetchesInFlight)
+                .arg(formatMegabytesPerSecond(stats.remoteDownloadBytesPerSecond));
+        }
+    }
+
     QString viewInfo;
     auto surf = _surfWeak.lock();
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
@@ -2762,11 +2804,12 @@ void CChunkedVolumeViewer::updateStatusLabel()
         }
     }
 
-    _lbl->setText(QString("Streaming L%1  scale %2  %3x%4%5%6")
+    _lbl->setText(QString("Streaming L%1  scale %2  %3x%4%5%6%7")
         .arg(_dsScaleIdx)
         .arg(_scale, 0, 'f', 2)
         .arg(_framebuffer.width())
         .arg(_framebuffer.height())
+        .arg(cacheInfo)
         .arg(viewInfo)
         .arg(suffix));
     _lbl->adjustSize();
