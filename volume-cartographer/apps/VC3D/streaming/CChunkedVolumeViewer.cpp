@@ -45,6 +45,7 @@ namespace {
 constexpr float kMinScale = 0.02f;
 constexpr float kMaxScale = 128.0f;
 constexpr int kInteractionSettleMs = 140;
+constexpr int kResizeSettleMs = 140;
 constexpr int kChunkReadyActiveDelayMs = 500;
 constexpr float kResolutionLodZoomBias = 0.5f;
 constexpr int kSurfaceResolutionLevelBias = 1;
@@ -302,6 +303,14 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
             _interactivePreview = false;
             scheduleRender();
         }
+    });
+
+    _resizeRenderTimer = new QTimer(this);
+    _resizeRenderTimer->setSingleShot(true);
+    _resizeRenderTimer->setInterval(kResizeSettleMs);
+    connect(_resizeRenderTimer, &QTimer::timeout, this, [this]() {
+        scheduleRender();
+        emit overlaysUpdated();
     });
 
     reloadPerfSettings();
@@ -1469,6 +1478,21 @@ void CChunkedVolumeViewer::adjustZoomByFactor(float factor)
     zoomStepsAt(steps, QPointF(_view->viewport()->width() * 0.5, _view->viewport()->height() * 0.5));
 }
 
+void CChunkedVolumeViewer::notifyInteractiveViewChange(double motionPx)
+{
+    if (!_volume || !_chunkArray)
+        return;
+
+    markInteractiveMotion(motionPx);
+    _genCacheDirty = true;
+    if (shouldRefreshInteractivePreview()) {
+        _renderPending = false;
+        submitRender();
+    }
+    scheduleRender();
+    emit overlaysUpdated();
+}
+
 void CChunkedVolumeViewer::adjustSurfaceOffset(float delta)
 {
     float maxZ = 10000.0f;
@@ -1572,8 +1596,12 @@ void CChunkedVolumeViewer::onResized()
 {
     resizeFramebuffer();
     _genCacheDirty = true;
-    scheduleRender();
-    emit overlaysUpdated();
+    if (_renderTimer && _renderTimer->isActive())
+        _renderTimer->stop();
+    _renderPending = false;
+    if (_resizeRenderTimer)
+        _resizeRenderTimer->start();
+    _view->viewport()->update();
 }
 
 void CChunkedVolumeViewer::onCursorMove(QPointF scenePos)

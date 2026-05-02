@@ -78,7 +78,9 @@ private:
 
     QTimer* _rotationTimer{nullptr};
     bool _orientationDirty{false};
+    double _pendingOrientationMotionPx{0.0};
 
     void processOrientationUpdate();
+    void notifyInteractiveOrientationViewers(double motionPx);
     void updateTiltHandles();
 };

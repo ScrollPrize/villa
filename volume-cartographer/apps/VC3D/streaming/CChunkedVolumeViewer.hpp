@@ -59,6 +59,7 @@ public:
     void adjustSurfaceOffset(float delta) override;
     void resetSurfaceOffsets() override;
     void fitSurfaceInView() override;
+    void notifyInteractiveViewChange(double motionPx);
 
     std::string surfName() const override { return _surfName; }
     std::shared_ptr<Volume> currentVolume() const override { return _volume; }
@@ -251,6 +252,7 @@ private:
     QLabel* _lbl = nullptr;
     QTimer* _renderTimer = nullptr;
     QTimer* _settleRenderTimer = nullptr;
+    QTimer* _resizeRenderTimer = nullptr;
     bool _renderPending = false;
     bool _interactivePreview = false;
     QElapsedTimer _interactionClock;
