@@ -2761,8 +2761,10 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                                 next_flow * t;
                     } else {
                         const int next_bucket = std::clamp(
-                            cvRound((budget - neighbor.distance) / kDpBucket),
-                            0, kDpBuckets - 1);
+                            static_cast<int>(
+                                std::floor((budget - neighbor.distance) /
+                                           kDpBucket)),
+                            0, bucket - 1);
                         value = dp_at(neighbor.node, next_bucket);
                     }
                     const float weight =
@@ -2778,6 +2780,75 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                         : carriers[node].flow;
             }
         }
+
+        const auto print_carrier_debug = [&](const cv::Point query) {
+            int best_node = -1;
+            double best_distance = std::numeric_limits<double>::max();
+            for (int node = 0; node < static_cast<int>(carriers.size());
+                 ++node) {
+                const double distance = cv::norm(query - carriers[node].pixel);
+                if (distance < best_distance) {
+                    best_distance = distance;
+                    best_node = node;
+                }
+            }
+            std::cout << "Carrier debug query=(" << query.x << "," << query.y
+                      << ")\n";
+            if (query.x >= 0 && query.x < cols && query.y >= 0 &&
+                query.y < rows) {
+                const int query_index = linear_index(query);
+                std::cout << "  query_white="
+                          << static_cast<int>(
+                                 white_domain.at<std::uint8_t>(query.y,
+                                                               query.x))
+                          << " query_routed_flow="
+                          << routed_flow[query_index]
+                          << " query_graph_px="
+                          << graph_pixel_flow.at<float>(query.y, query.x)
+                          << " query_graph_node="
+                          << graph_node_flow.at<float>(query.y, query.x)
+                          << " query_dt=" << dt.at<float>(query.y, query.x)
+                          << "\n";
+            }
+            if (best_node < 0) {
+                std::cout << "  no carrier nodes\n";
+                return;
+            }
+            const CarrierNode& carrier = carriers[best_node];
+            std::cout << "  nearest_carrier=" << best_node
+                      << " pixel=(" << carrier.pixel.x << ","
+                      << carrier.pixel.y << ")"
+                      << " distance=" << best_distance
+                      << " is_grid=" << carrier.grid
+                      << " flow=" << carrier.flow
+                      << " dp300=" << dp_at(best_node, kDpBuckets - 1)
+                      << " degree=" << carrier_edges[best_node].size()
+                      << "\n";
+            std::vector<CarrierNeighbor> neighbors = carrier_edges[best_node];
+            std::sort(neighbors.begin(), neighbors.end(),
+                      [&](const CarrierNeighbor a, const CarrierNeighbor b) {
+                          return carriers[a.node].flow > carriers[b.node].flow;
+                      });
+            const int limit =
+                std::min(12, static_cast<int>(neighbors.size()));
+            for (int i = 0; i < limit; ++i) {
+                const CarrierNeighbor neighbor = neighbors[i];
+                const CarrierNode& next = carriers[neighbor.node];
+                std::cout << "    neighbor_" << i
+                          << " id=" << neighbor.node
+                          << " pixel=(" << next.pixel.x << ","
+                          << next.pixel.y << ")"
+                          << " is_grid=" << next.grid
+                          << " dist=" << neighbor.distance
+                          << " flow=" << next.flow
+                          << " dp300=" << dp_at(neighbor.node,
+                                                kDpBuckets - 1)
+                          << " uphill="
+                          << (next.flow > carrier.flow + kFlowEpsilon)
+                          << "\n";
+            }
+        };
+        print_carrier_debug(cv::Point(400, 150));
 
         const auto grid_node_id = [&](const int gx, const int gy) {
             if (gx < 0 || gx >= grid_cols || gy < 0 || gy >= grid_rows) {
