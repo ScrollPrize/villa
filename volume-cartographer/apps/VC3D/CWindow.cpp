@@ -3098,7 +3098,7 @@ void CWindow::CreateWidgets(void)
     if (_segmentationModule && _planeSlicingOverlay) {
         QPointer<PlaneSlicingOverlayController> overlayPtr(_planeSlicingOverlay.get());
         _segmentationModule->setRotationHandleHitTester(
-            [overlayPtr](CTiledVolumeViewer* viewer, const cv::Vec3f& worldPos) {
+            [overlayPtr](VolumeViewerBase* viewer, const cv::Vec3f& worldPos) {
                 if (!overlayPtr) {
                     return false;
                 }

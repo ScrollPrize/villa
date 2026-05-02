@@ -200,8 +200,8 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
     baseViewer->setOverlayColormap(_overlayColormapId);
     baseViewer->setOverlayWindow(_overlayWindowLow, _overlayWindowHigh);
 
-    if (_segmentationModule && adaptiveViewer) {
-        _segmentationModule->attachViewer(adaptiveViewer);
+    if (_segmentationModule) {
+        _segmentationModule->attachViewer(baseViewer);
     }
     if (adaptiveViewer) {
         emit viewerCreated(adaptiveViewer);
@@ -241,7 +241,7 @@ void ViewerManager::setSegmentationModule(SegmentationModule* module)
         return;
     }
 
-    forEachViewer([this](CTiledVolumeViewer* v) { _segmentationModule->attachViewer(v); });
+    forEachBaseViewer([this](VolumeViewerBase* v) { _segmentationModule->attachViewer(v); });
 }
 
 void ViewerManager::setPointsOverlay(PointsOverlayController* overlay)

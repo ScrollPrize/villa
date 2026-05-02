@@ -45,7 +45,6 @@ constexpr float kMinScale = 0.02f;
 constexpr float kMaxScale = 128.0f;
 constexpr int kInteractionSettleMs = 140;
 constexpr int kChunkReadyActiveDelayMs = 500;
-constexpr float kPrefetchAreaScale = 0.8f;
 constexpr float kResolutionLodZoomBias = 0.5f;
 constexpr int kSurfaceResolutionLevelBias = 1;
 constexpr double kSlowMotionPxPerSec = 180.0;
@@ -880,76 +879,6 @@ bool CChunkedVolumeViewer::streamingCompositeUnsupported() const
            _compositeSettings.useVolumeGradients;
 }
 
-void CChunkedVolumeViewer::prefetchAroundView(Surface& surf,
-                                              int startLevel,
-                                              const vc::render::ChunkedPlaneSampler::Options& options)
-{
-    if (!_chunkArray || _framebuffer.isNull())
-        return;
-
-    const int fbW = _framebuffer.width();
-    const int fbH = _framebuffer.height();
-    if (fbW <= 0 || fbH <= 0)
-        return;
-
-    cv::Mat_<uint8_t> prefetchCoverage(fbH, fbW, uint8_t(0));
-    const int firstLevel = std::clamp(startLevel, 0, _chunkArray->numLevels() - 1);
-    const int levelEnd = std::min(firstLevel + 1, _chunkArray->numLevels());
-
-    if (auto* plane = dynamic_cast<PlaneSurface*>(&surf)) {
-        const float prefetchScale = std::max(kMinScale, _scale * kPrefetchAreaScale);
-        const cv::Vec3f vx = plane->basisX();
-        const cv::Vec3f vy = plane->basisY();
-        const cv::Vec3f n = plane->normal({0, 0, 0});
-        const float halfW = static_cast<float>(fbW) * 0.5f / prefetchScale;
-        const float halfH = static_cast<float>(fbH) * 0.5f / prefetchScale;
-        const cv::Vec3f origin = vx * (_surfacePtrX - halfW)
-                               + vy * (_surfacePtrY - halfH)
-                               + plane->origin()
-                               + n * _zOff;
-        for (int level = firstLevel; level < levelEnd; ++level) {
-            vc::render::ChunkedPlaneSampler::requestPlaneDependencies(
-                *_chunkArray, level, origin, vx / prefetchScale, vy / prefetchScale,
-                prefetchCoverage, options);
-        }
-        return;
-    }
-
-    if (!_genCoords.empty()) {
-        for (int level = firstLevel; level < levelEnd; ++level) {
-            vc::render::ChunkedPlaneSampler::requestCoordsDependencies(
-                *_chunkArray, level, _genCoords, prefetchCoverage, options);
-        }
-    }
-
-    if (_interactivePreview)
-        return;
-
-    const float prefetchScale = std::max(kMinScale, _scale * kPrefetchAreaScale);
-    const cv::Vec3f offset(_surfacePtrX * prefetchScale - float(fbW) * 0.5f,
-                           _surfacePtrY * prefetchScale - float(fbH) * 0.5f,
-                           0.0f);
-    cv::Mat_<cv::Vec3f> prefetchCoords;
-    cv::Mat_<cv::Vec3f> prefetchNormals;
-    surf.gen(&prefetchCoords,
-             _zOff != 0.0f ? &prefetchNormals : nullptr,
-             cv::Size(fbW, fbH), {0, 0, 0}, prefetchScale, offset);
-    if (_zOff != 0.0f && _zOffWorldDir != cv::Vec3f(0.0f, 0.0f, 0.0f)) {
-        const cv::Vec3f tr = _zOffWorldDir * _zOff;
-        for (int y = 0; y < prefetchCoords.rows; ++y) {
-            auto* row = prefetchCoords.ptr<cv::Vec3f>(y);
-            for (int x = 0; x < prefetchCoords.cols; ++x) {
-                if (std::isfinite(row[x][0]) && row[x][0] != -1.0f)
-                    row[x] += tr;
-            }
-        }
-    }
-    for (int level = firstLevel; level < levelEnd; ++level) {
-        vc::render::ChunkedPlaneSampler::requestCoordsDependencies(
-            *_chunkArray, level, prefetchCoords, prefetchCoverage, options);
-    }
-}
-
 void CChunkedVolumeViewer::samplePlaneIntoValues(
     const cv::Vec3f& origin,
     const cv::Vec3f& vxStep,
@@ -1131,8 +1060,6 @@ void CChunkedVolumeViewer::submitRender()
 
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
         const int startLevel = renderStartLevel(false);
-        if (!_interactivePreview)
-            prefetchAroundView(*surf, startLevel, options);
         const cv::Vec3f vx = plane->basisX();
         const cv::Vec3f vy = plane->basisY();
         const cv::Vec3f n = plane->normal({0, 0, 0});
@@ -1257,8 +1184,6 @@ void CChunkedVolumeViewer::submitRender()
             _genCacheDirty = false;
         }
         if (!_genCoords.empty()) {
-            if (!_interactivePreview)
-                prefetchAroundView(*surf, startLevel, options);
             sampleCoordsIntoValues(_genCoords, _genNormals, startLevel, options, _values, _coverage);
             renderOverlayVolumeForCoords(_genCoords, startLevel, options,
                                          overlayValues, overlayCoverage);
@@ -1650,20 +1575,20 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
 void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
     _lastScenePos = scenePos;
-    emit sendMousePressVolume(sceneToVolume(scenePos), {0, 0, 1}, button, modifiers);
+    emit sendMousePressVolume(sceneToVolume(scenePos), {0, 0, 1}, button, modifiers, scenePos);
 }
 
 void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers)
 {
     Q_UNUSED(modifiers);
     _lastScenePos = scenePos;
-    emit sendMouseMoveVolume(sceneToVolume(scenePos), buttons, modifiers);
+    emit sendMouseMoveVolume(sceneToVolume(scenePos), buttons, modifiers, scenePos);
 }
 
 void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
     _lastScenePos = scenePos;
-    emit sendMouseReleaseVolume(sceneToVolume(scenePos), button, modifiers);
+    emit sendMouseReleaseVolume(sceneToVolume(scenePos), button, modifiers, scenePos);
 }
 
 void CChunkedVolumeViewer::onKeyPress(int key, Qt::KeyboardModifiers)

@@ -1,6 +1,7 @@
 #include "PlaneSlicingOverlayController.hpp"
 
 #include "../adaptive/CAdaptiveVolumeViewer.hpp"
+#include "../streaming/CChunkedVolumeViewer.hpp"
 #include "../VolumeViewerBase.hpp"
 #include "../CState.hpp"
 #include "vc/core/util/Surface.hpp"
@@ -105,24 +106,42 @@ void PlaneSlicingOverlayController::installInteractions(VolumeViewerBase* viewer
         return;
     }
 
-    auto* cviewer = dynamic_cast<CTiledVolumeViewer*>(viewer->asQObject());
-    if (!cviewer) {
+    QObject* viewerObject = viewer->asQObject();
+    if (!viewerObject) {
         return;
     }
 
-    state.pressConn = QObject::connect(cviewer, &CTiledVolumeViewer::sendMousePressVolume,
-                                       this, [this, viewer](cv::Vec3f volLoc, cv::Vec3f /*normal*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
-                                           handleMousePress(viewer, volLoc, button, modifiers);
-                                       });
-    state.moveConn = QObject::connect(cviewer, &CTiledVolumeViewer::sendMouseMoveVolume,
-                                      this, [this, viewer](cv::Vec3f volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers) {
-                                          handleMouseMove(viewer, volLoc, buttons, modifiers);
-                                      });
-    state.releaseConn = QObject::connect(cviewer, &CTiledVolumeViewer::sendMouseReleaseVolume,
-                                         this, [this, viewer](cv::Vec3f /*volLoc*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
-                                             handleMouseRelease(viewer, button, modifiers);
-                                         });
-    state.destroyedConn = QObject::connect(cviewer, &QObject::destroyed,
+    if (auto* adaptiveViewer = qobject_cast<CTiledVolumeViewer*>(viewerObject)) {
+        state.pressConn = QObject::connect(adaptiveViewer, &CTiledVolumeViewer::sendMousePressVolume,
+                                           this, [this, viewer](cv::Vec3f volLoc, cv::Vec3f /*normal*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
+                                               handleMousePress(viewer, volLoc, button, modifiers);
+                                           });
+        state.moveConn = QObject::connect(adaptiveViewer, &CTiledVolumeViewer::sendMouseMoveVolume,
+                                          this, [this, viewer](cv::Vec3f volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers) {
+                                              handleMouseMove(viewer, volLoc, buttons, modifiers);
+                                          });
+        state.releaseConn = QObject::connect(adaptiveViewer, &CTiledVolumeViewer::sendMouseReleaseVolume,
+                                             this, [this, viewer](cv::Vec3f /*volLoc*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
+                                                 handleMouseRelease(viewer, button, modifiers);
+                                             });
+    } else if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewerObject)) {
+        state.pressConn = QObject::connect(chunkedViewer, &CChunkedVolumeViewer::sendMousePressVolume,
+                                           this, [this, viewer](cv::Vec3f volLoc, cv::Vec3f /*normal*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers, QPointF /*scenePos*/) {
+                                               handleMousePress(viewer, volLoc, button, modifiers);
+                                           });
+        state.moveConn = QObject::connect(chunkedViewer, &CChunkedVolumeViewer::sendMouseMoveVolume,
+                                          this, [this, viewer](cv::Vec3f volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers, QPointF /*scenePos*/) {
+                                              handleMouseMove(viewer, volLoc, buttons, modifiers);
+                                          });
+        state.releaseConn = QObject::connect(chunkedViewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
+                                             this, [this, viewer](cv::Vec3f /*volLoc*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers, QPointF /*scenePos*/) {
+                                                 handleMouseRelease(viewer, button, modifiers);
+                                             });
+    } else {
+        return;
+    }
+
+    state.destroyedConn = QObject::connect(viewerObject, &QObject::destroyed,
                                            this, [this, viewer]() {
                                                clearViewerState(viewer);
                                            });

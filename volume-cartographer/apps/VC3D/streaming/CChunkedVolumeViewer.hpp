@@ -172,11 +172,12 @@ signals:
                            Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void sendZSliceChanged(int zValue);
     void sendMousePressVolume(cv::Vec3f volLoc, cv::Vec3f normal,
-                              Qt::MouseButton button, Qt::KeyboardModifiers modifiers);
+                              Qt::MouseButton button, Qt::KeyboardModifiers modifiers,
+                              QPointF scenePos);
     void sendMouseMoveVolume(cv::Vec3f volLoc, Qt::MouseButtons buttons,
-                             Qt::KeyboardModifiers modifiers);
+                             Qt::KeyboardModifiers modifiers, QPointF scenePos);
     void sendMouseReleaseVolume(cv::Vec3f volLoc, Qt::MouseButton button,
-                                Qt::KeyboardModifiers modifiers);
+                                Qt::KeyboardModifiers modifiers, QPointF scenePos);
     void sendCollectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
     void pointClicked(uint64_t pointId);
@@ -227,7 +228,6 @@ private:
                                 const vc::render::ChunkedPlaneSampler::Options& options,
                                 cv::Mat_<uint8_t>& values,
                                 cv::Mat_<uint8_t>& coverage);
-    void prefetchAroundView(Surface& surf, int startLevel, const vc::render::ChunkedPlaneSampler::Options& options);
     void markInteractiveMotion(double motionPx);
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     int genericPreviewDownsampleFactor() const;

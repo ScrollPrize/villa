@@ -374,7 +374,7 @@ bool SegmentationModule::handleKeyRelease(QKeyEvent* event)
     return false;
 }
 
-void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
+void SegmentationModule::handleMousePress(VolumeViewerBase* viewer,
                                           const cv::Vec3f& worldPos,
                                           const cv::Vec3f& /*surfaceNormal*/,
                                           Qt::MouseButton button,
@@ -534,7 +534,7 @@ void SegmentationModule::handleMousePress(CTiledVolumeViewer* viewer,
     refreshOverlay();
 }
 
-void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
+void SegmentationModule::handleMouseMove(VolumeViewerBase* viewer,
                                          const cv::Vec3f& worldPos,
                                          Qt::MouseButtons buttons,
                                          Qt::KeyboardModifiers modifiers,
@@ -659,7 +659,7 @@ void SegmentationModule::handleMouseMove(CTiledVolumeViewer* viewer,
     }
 }
 
-void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
+void SegmentationModule::handleMouseRelease(VolumeViewerBase* viewer,
                                             const cv::Vec3f& worldPos,
                                             Qt::MouseButton button,
                                             Qt::KeyboardModifiers /*modifiers*/,
@@ -745,7 +745,7 @@ void SegmentationModule::handleMouseRelease(CTiledVolumeViewer* viewer,
     finishDrag();
 }
 
-void SegmentationModule::handleWheel(CTiledVolumeViewer* viewer,
+void SegmentationModule::handleWheel(VolumeViewerBase* viewer,
                                      int deltaSteps,
                                      const QPointF& scenePos,
                                      const cv::Vec3f& worldPos)
