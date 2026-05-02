@@ -54,7 +54,6 @@ class SurfacePanelController;
 class MenuActionController;
 class SegmentationGrower;
 class ViewerControlsPanel;
-class WindowRangeWidget;
 class QLabel;
 class QSpinBox;
 class QStandardItemModel;
@@ -186,8 +185,6 @@ private:
 
     //TODO abstract these into separate QWidget class?
     QLineEdit* lblLocFocus;
-    QPushButton* btnZoomIn;
-   QPushButton* btnZoomOut;
     QCheckBox* chkAxisAlignedSlices;
     QCheckBox* _previewTransformCheck{nullptr};
     QCheckBox* _scaleOnlyTransformCheck{nullptr};
@@ -199,8 +196,6 @@ private:
     enum class RemoteTransformFetchState { Unknown, Pending, Available, Missing };
     std::unordered_map<std::string, RemoteTransformFetchState> _remoteTransformFetchStates;
     std::unordered_map<std::string, cv::Matx44d> _remoteTransformMatrices;
-    WindowRangeWidget* _volumeWindowWidget{nullptr};
-    WindowRangeWidget* _overlayWindowWidget{nullptr};
     QLabel* _segmentationGrowthWarning{nullptr};
     QLabel* _sliceStepLabel{nullptr};
     QString _segmentationGrowthStatusText;

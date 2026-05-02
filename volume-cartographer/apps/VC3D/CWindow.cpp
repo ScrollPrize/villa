@@ -4,10 +4,8 @@
 #include <functional>
 
 #include "vc/core/util/HttpFetch.hpp"
-#include "WindowRangeWidget.hpp"
 #include "VCSettings.hpp"
 #include "Keybinds.hpp"
-#include <QHBoxLayout>
 #include <QGridLayout>
 #include <QCursor>
 #include <QKeyEvent>
@@ -3085,14 +3083,39 @@ void CWindow::CreateWidgets(void)
         .renderSettingsScrollArea = ui.scrollAreaRenderSettings,
         .renderSettingsContents = ui.dockWidgetRenderSettingsContents,
         .normalVisualizationContents = ui.dockWidgetNormalVisContents,
+        .showSurfaceNormals = ui.chkShowSurfaceNormals,
+        .normalArrowLengthLabel = ui.labelNormalArrowLength,
+        .normalArrowLengthSlider = ui.sliderNormalArrowLength,
+        .normalArrowLengthValueLabel = ui.labelNormalArrowLengthValue,
+        .normalMaxArrowsLabel = ui.labelNormalMaxArrows,
+        .normalMaxArrowsSlider = ui.sliderNormalMaxArrows,
+        .normalMaxArrowsValueLabel = ui.labelNormalMaxArrowsValue,
         .preprocessingScrollArea = ui.scrollAreaPreprocessing,
         .preprocessingContents = ui.dockWidgetPreprocessingContents,
         .postprocessingScrollArea = ui.scrollAreaPostprocessing,
         .postprocessingContents = ui.dockWidgetPostprocessingContents,
+        .zoomInButton = ui.btnZoomIn,
+        .zoomOutButton = ui.btnZoomOut,
+        .sliceStepSizeSpin = ui.spinSliceStepSize,
+        .volumeWindowContainer = ui.volumeWindowContainer,
+        .overlayWindowContainer = ui.overlayWindowContainer,
+        .intersectionOpacitySpin = ui.spinIntersectionOpacity,
+        .intersectionThicknessSpin = ui.doubleSpinIntersectionThickness,
     };
     _viewerControlsPanel = std::make_unique<ViewerControlsPanel>(viewerControlsUi,
                                                                  _viewerManager.get(),
                                                                  ui.dockWidgetViewerControlsContents);
+    connect(_viewerControlsPanel.get(), &ViewerControlsPanel::zoomInRequested,
+            this, &CWindow::onZoomIn);
+    connect(_viewerControlsPanel.get(), &ViewerControlsPanel::zoomOutRequested,
+            this, &CWindow::onZoomOut);
+    connect(_viewerControlsPanel.get(), &ViewerControlsPanel::sliceStepSizeChanged,
+            this, &CWindow::onSliceStepSizeChanged);
+    connect(_viewerControlsPanel.get(), &ViewerControlsPanel::statusMessageRequested,
+            this, &CWindow::onShowStatusMessage);
+    if (_viewerControlsPanel) {
+        _viewerControlsPanel->setViewControlsEnabled(!ui.grpVolManager || ui.grpVolManager->isEnabled());
+    }
 
     const auto& transformControls = _viewerControlsPanel->transformControls();
     _previewTransformCheck = transformControls.preview;
@@ -3171,6 +3194,9 @@ void CWindow::CreateWidgets(void)
             .thresholdSpin = ui.overlayThresholdSpin,
         };
         _volumeOverlay->setUi(overlayUi);
+        if (_viewerControlsPanel) {
+            _viewerControlsPanel->setOverlayWindowAvailable(_volumeOverlay->hasOverlaySelection());
+        }
     }
 
         // Setup base colormap selector
@@ -3290,311 +3316,8 @@ void CWindow::CreateWidgets(void)
         connect(spinAxisOverlayOpacity, qOverload<int>(&QSpinBox::valueChanged), this, &CWindow::onAxisOverlayOpacityChanged);
     }
 
-    if (auto* spinSliceStep = ui.spinSliceStepSize) {
-        int savedStep = settings.value(vc3d::settings::viewer::SLICE_STEP_SIZE,
-                                       vc3d::settings::viewer::SLICE_STEP_SIZE_DEFAULT).toInt();
-        savedStep = std::clamp(savedStep, spinSliceStep->minimum(), spinSliceStep->maximum());
-        QSignalBlocker blocker(spinSliceStep);
-        spinSliceStep->setValue(savedStep);
-        if (_viewerManager) {
-            _viewerManager->setSliceStepSize(savedStep);
-        }
-        connect(spinSliceStep, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
-            if (_viewerManager) {
-                _viewerManager->setSliceStepSize(value);
-            }
-            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-            s.setValue(vc3d::settings::viewer::SLICE_STEP_SIZE, value);
-            if (_sliceStepLabel) {
-                _sliceStepLabel->setText(tr("Step: %1").arg(value));
-            }
-        });
-    }
-
-    // Surface normals visualization controls
-    if (auto* chkShowNormals = ui.chkShowSurfaceNormals) {
-        bool showNormals = settings.value(vc3d::settings::viewer::SHOW_SURFACE_NORMALS,
-                                          vc3d::settings::viewer::SHOW_SURFACE_NORMALS_DEFAULT).toBool();
-        QSignalBlocker blocker(chkShowNormals);
-        chkShowNormals->setChecked(showNormals);
-
-        // Enable/disable the arrow length and max arrows controls based on checkbox state
-        if (auto* lblArrowLength = ui.labelNormalArrowLength) {
-            lblArrowLength->setEnabled(showNormals);
-        }
-        if (auto* sliderArrowLength = ui.sliderNormalArrowLength) {
-            sliderArrowLength->setEnabled(showNormals);
-        }
-        if (auto* lblArrowLengthValue = ui.labelNormalArrowLengthValue) {
-            lblArrowLengthValue->setEnabled(showNormals);
-        }
-        if (auto* lblMaxArrows = ui.labelNormalMaxArrows) {
-            lblMaxArrows->setEnabled(showNormals);
-        }
-        if (auto* sliderMaxArrows = ui.sliderNormalMaxArrows) {
-            sliderMaxArrows->setEnabled(showNormals);
-        }
-        if (auto* lblMaxArrowsValue = ui.labelNormalMaxArrowsValue) {
-            lblMaxArrowsValue->setEnabled(showNormals);
-        }
-
-        connect(chkShowNormals, &QCheckBox::toggled, this, [this](bool checked) {
-            using namespace vc3d::settings;
-            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-            s.setValue(viewer::SHOW_SURFACE_NORMALS, checked ? "1" : "0");
-            if (_viewerManager) {
-                _viewerManager->forEachBaseViewer([checked](VolumeViewerBase* viewer) {
-                    if (viewer) {
-                        viewer->setShowSurfaceNormals(checked);
-                    }
-                });
-            }
-            // Enable/disable arrow length and max arrows controls
-            if (auto* lblArrowLength = ui.labelNormalArrowLength) {
-                lblArrowLength->setEnabled(checked);
-            }
-            if (auto* sliderArrowLength = ui.sliderNormalArrowLength) {
-                sliderArrowLength->setEnabled(checked);
-            }
-            if (auto* lblArrowLengthValue = ui.labelNormalArrowLengthValue) {
-                lblArrowLengthValue->setEnabled(checked);
-            }
-            if (auto* lblMaxArrows = ui.labelNormalMaxArrows) {
-                lblMaxArrows->setEnabled(checked);
-            }
-            if (auto* sliderMaxArrows = ui.sliderNormalMaxArrows) {
-                sliderMaxArrows->setEnabled(checked);
-            }
-            if (auto* lblMaxArrowsValue = ui.labelNormalMaxArrowsValue) {
-                lblMaxArrowsValue->setEnabled(checked);
-            }
-            statusBar()->showMessage(checked ? tr("Surface normals: ON") : tr("Surface normals: OFF"), 2000);
-        });
-    }
-
-    if (auto* sliderArrowLength = ui.sliderNormalArrowLength) {
-        int savedScale = settings.value(vc3d::settings::viewer::NORMAL_ARROW_LENGTH_SCALE,
-                                        vc3d::settings::viewer::NORMAL_ARROW_LENGTH_SCALE_DEFAULT).toInt();
-        savedScale = std::clamp(savedScale, sliderArrowLength->minimum(), sliderArrowLength->maximum());
-        QSignalBlocker blocker(sliderArrowLength);
-        sliderArrowLength->setValue(savedScale);
-
-        if (auto* lblArrowLengthValue = ui.labelNormalArrowLengthValue) {
-            lblArrowLengthValue->setText(tr("%1%").arg(savedScale));
-        }
-
-        float scaleFloat = static_cast<float>(savedScale) / 100.0f;
-        if (_viewerManager) {
-            _viewerManager->forEachBaseViewer([scaleFloat](VolumeViewerBase* viewer) {
-                if (viewer) {
-                    viewer->setNormalArrowLengthScale(scaleFloat);
-                }
-            });
-        }
-
-        connect(sliderArrowLength, &QSlider::valueChanged, this, [this](int value) {
-            using namespace vc3d::settings;
-            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-            s.setValue(viewer::NORMAL_ARROW_LENGTH_SCALE, value);
-
-            if (auto* lblArrowLengthValue = ui.labelNormalArrowLengthValue) {
-                lblArrowLengthValue->setText(tr("%1%").arg(value));
-            }
-
-            float scaleFloat = static_cast<float>(value) / 100.0f;
-            if (_viewerManager) {
-                _viewerManager->forEachBaseViewer([scaleFloat](VolumeViewerBase* viewer) {
-                    if (viewer) {
-                        viewer->setNormalArrowLengthScale(scaleFloat);
-                    }
-                });
-            }
-        });
-    }
-
-    if (auto* sliderMaxArrows = ui.sliderNormalMaxArrows) {
-        int savedMaxArrows = settings.value(vc3d::settings::viewer::NORMAL_MAX_ARROWS,
-                                            vc3d::settings::viewer::NORMAL_MAX_ARROWS_DEFAULT).toInt();
-        savedMaxArrows = std::clamp(savedMaxArrows, sliderMaxArrows->minimum(), sliderMaxArrows->maximum());
-        QSignalBlocker blocker(sliderMaxArrows);
-        sliderMaxArrows->setValue(savedMaxArrows);
-
-        if (auto* lblMaxArrowsValue = ui.labelNormalMaxArrowsValue) {
-            lblMaxArrowsValue->setText(QString::number(savedMaxArrows));
-        }
-
-        if (_viewerManager) {
-            _viewerManager->forEachBaseViewer([savedMaxArrows](VolumeViewerBase* viewer) {
-                if (viewer) {
-                    viewer->setNormalMaxArrows(savedMaxArrows);
-                }
-            });
-        }
-
-        connect(sliderMaxArrows, &QSlider::valueChanged, this, [this](int value) {
-            using namespace vc3d::settings;
-            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-            s.setValue(viewer::NORMAL_MAX_ARROWS, value);
-
-            if (auto* lblMaxArrowsValue = ui.labelNormalMaxArrowsValue) {
-                lblMaxArrowsValue->setText(QString::number(value));
-            }
-
-            if (_viewerManager) {
-                _viewerManager->forEachBaseViewer([value](VolumeViewerBase* viewer) {
-                    if (viewer) {
-                        viewer->setNormalMaxArrows(value);
-                    }
-                });
-            }
-        });
-    }
-
     if (auto* btnResetRot = ui.btnResetAxisRotations) {
         connect(btnResetRot, &QPushButton::clicked, this, &CWindow::onResetAxisAlignedRotations);
-    }
-
-    // Zoom buttons
-    btnZoomIn = ui.btnZoomIn;
-    btnZoomOut = ui.btnZoomOut;
-
-    connect(btnZoomIn, &QPushButton::clicked, this, &CWindow::onZoomIn);
-    connect(btnZoomOut, &QPushButton::clicked, this, &CWindow::onZoomOut);
-
-    if (auto* volumeContainer = ui.volumeWindowContainer) {
-        auto* layout = new QHBoxLayout(volumeContainer);
-        layout->setContentsMargins(0, 0, 0, 0);
-        layout->setSpacing(6);
-
-        _volumeWindowWidget = new WindowRangeWidget(volumeContainer);
-        _volumeWindowWidget->setRange(0, 255);
-        _volumeWindowWidget->setMinimumSeparation(1);
-        _volumeWindowWidget->setControlsEnabled(false);
-        layout->addWidget(_volumeWindowWidget);
-
-        connect(_volumeWindowWidget, &WindowRangeWidget::windowValuesChanged,
-                this, [this](int low, int high) {
-                    if (_viewerManager) {
-                        _viewerManager->setVolumeWindow(static_cast<float>(low),
-                                                        static_cast<float>(high));
-                    }
-                });
-
-        if (_viewerManager) {
-            connect(_viewerManager.get(), &ViewerManager::volumeWindowChanged,
-                    this, [this](float low, float high) {
-                        if (!_volumeWindowWidget) {
-                            return;
-                        }
-                        const int lowInt = static_cast<int>(std::lround(low));
-                        const int highInt = static_cast<int>(std::lround(high));
-                        _volumeWindowWidget->setWindowValues(lowInt, highInt);
-                    });
-
-            _volumeWindowWidget->setWindowValues(
-                static_cast<int>(std::lround(_viewerManager->volumeWindowLow())),
-                static_cast<int>(std::lround(_viewerManager->volumeWindowHigh())));
-        }
-
-        const bool viewEnabled = !ui.grpVolManager || ui.grpVolManager->isEnabled();
-        _volumeWindowWidget->setControlsEnabled(viewEnabled);
-    }
-
-    if (auto* container = ui.overlayWindowContainer) {
-        auto* layout = new QHBoxLayout(container);
-        layout->setContentsMargins(0, 0, 0, 0);
-        layout->setSpacing(6);
-
-        _overlayWindowWidget = new WindowRangeWidget(container);
-        _overlayWindowWidget->setRange(0, 255);
-        _overlayWindowWidget->setMinimumSeparation(1);
-        _overlayWindowWidget->setControlsEnabled(false);
-        layout->addWidget(_overlayWindowWidget);
-
-        connect(_overlayWindowWidget, &WindowRangeWidget::windowValuesChanged,
-                this, [this](int low, int high) {
-                    if (_viewerManager) {
-                        _viewerManager->setOverlayWindow(static_cast<float>(low),
-                                                         static_cast<float>(high));
-                    }
-                });
-
-        if (_viewerManager) {
-            connect(_viewerManager.get(), &ViewerManager::overlayWindowChanged,
-                    this, [this](float low, float high) {
-                        if (!_overlayWindowWidget) {
-                            return;
-                        }
-                        const int lowInt = static_cast<int>(std::lround(low));
-                        const int highInt = static_cast<int>(std::lround(high));
-                        _overlayWindowWidget->setWindowValues(lowInt, highInt);
-                    });
-
-            _overlayWindowWidget->setWindowValues(
-                static_cast<int>(std::lround(_viewerManager->overlayWindowLow())),
-                static_cast<int>(std::lround(_viewerManager->overlayWindowHigh())));
-        }
-    }
-
-    if (_viewerManager && _overlayWindowWidget) {
-        connect(_viewerManager.get(), &ViewerManager::overlayVolumeAvailabilityChanged,
-                this, [this](bool hasOverlay) {
-                    if (!_overlayWindowWidget) {
-                        return;
-                    }
-                    const bool viewEnabled = !ui.grpVolManager || ui.grpVolManager->isEnabled();
-                    _overlayWindowWidget->setControlsEnabled(hasOverlay && viewEnabled);
-                });
-    }
-
-    if (_overlayWindowWidget) {
-        const bool hasOverlay = _volumeOverlay && _volumeOverlay->hasOverlaySelection();
-        const bool viewEnabled = !ui.grpVolManager || ui.grpVolManager->isEnabled();
-        _overlayWindowWidget->setControlsEnabled(hasOverlay && viewEnabled);
-    }
-
-    auto* spinIntersectionOpacity = ui.spinIntersectionOpacity;
-    const int savedIntersectionOpacity = settings.value(vc3d::settings::viewer::INTERSECTION_OPACITY,
-                                                        spinIntersectionOpacity->value()).toInt();
-    const int boundedIntersectionOpacity = std::clamp(savedIntersectionOpacity,
-                                                      spinIntersectionOpacity->minimum(),
-                                                      spinIntersectionOpacity->maximum());
-    spinIntersectionOpacity->setValue(boundedIntersectionOpacity);
-
-    connect(spinIntersectionOpacity, QOverload<int>::of(&QSpinBox::valueChanged), this, [this](int value) {
-        if (!_viewerManager) {
-            return;
-        }
-        const float normalized = std::clamp(static_cast<float>(value) / 100.0f, 0.0f, 1.0f);
-        _viewerManager->setIntersectionOpacity(normalized);
-    });
-    if (_viewerManager) {
-        _viewerManager->setIntersectionOpacity(spinIntersectionOpacity->value() / 100.0f);
-    }
-
-    if (auto* spinIntersectionThickness = ui.doubleSpinIntersectionThickness) {
-        const double savedThickness = settings.value(vc3d::settings::viewer::INTERSECTION_THICKNESS,
-                                                     spinIntersectionThickness->value()).toDouble();
-        const double boundedThickness = std::clamp(savedThickness,
-                                                   static_cast<double>(spinIntersectionThickness->minimum()),
-                                                   static_cast<double>(spinIntersectionThickness->maximum()));
-        spinIntersectionThickness->setValue(boundedThickness);
-        connect(spinIntersectionThickness,
-                QOverload<double>::of(&QDoubleSpinBox::valueChanged),
-                this,
-                [this](double value) {
-                    if (!_viewerManager) {
-                        return;
-                    }
-                    _viewerManager->setIntersectionThickness(static_cast<float>(value));
-                });
-        if (_viewerManager) {
-            _viewerManager->setIntersectionThickness(static_cast<float>(spinIntersectionThickness->value()));
-        }
-    }
-
-    if (_viewerManager) {
-        _viewerManager->setSurfacePatchSamplingStride(1, false);
     }
 
     chkAxisAlignedSlices = ui.chkAxisAlignedSlices;
@@ -4296,12 +4019,9 @@ void CWindow::closeEvent(QCloseEvent* event)
 void CWindow::setWidgetsEnabled(bool state)
 {
     ui.grpVolManager->setEnabled(state);
-    if (_volumeWindowWidget) {
-        _volumeWindowWidget->setControlsEnabled(state);
-    }
-    if (_overlayWindowWidget) {
-        const bool hasOverlay = _volumeOverlay && _volumeOverlay->hasOverlaySelection();
-        _overlayWindowWidget->setControlsEnabled(state && hasOverlay);
+    if (_viewerControlsPanel) {
+        _viewerControlsPanel->setViewControlsEnabled(state);
+        _viewerControlsPanel->setOverlayWindowAvailable(_volumeOverlay && _volumeOverlay->hasOverlaySelection());
     }
 }
 
