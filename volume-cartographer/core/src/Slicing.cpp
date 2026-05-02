@@ -21,6 +21,7 @@
 #include <functional>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <thread>
 #include <unordered_set>
@@ -55,6 +56,9 @@ constexpr int kBlockShift = 4;       // log2(16)
 constexpr int kBlockMask = 15;
 constexpr size_t kStrideY = kBlockSize;              // 16
 constexpr size_t kStrideZ = kBlockSize * kBlockSize; // 256
+constexpr bool kUseAdaptiveProactivePrefetch = false;
+
+inline int renderThreadCount();
 
 VC_FORCE_INLINE bool isnan_bitwise(float f) {
     uint32_t u;
@@ -370,6 +374,145 @@ struct BlockSampler {
             }
         }
         return std::clamp(result, 0.0f, float(std::numeric_limits<T>::max()));
+    }
+};
+
+struct ChunkDemandCollector {
+    std::vector<std::vector<ChunkKey>> keysByThread;
+    std::vector<std::unordered_set<ChunkKey, vc::cache::ChunkKeyHash>> seenByThread;
+
+    ChunkDemandCollector()
+    {
+        const int n = std::max(1, renderThreadCount());
+        keysByThread.resize(n);
+        seenByThread.resize(n);
+        for (auto& seen : seenByThread) seen.reserve(512);
+    }
+
+    VC_FORCE_INLINE void record(int tid, const ChunkKey& key)
+    {
+        tid = std::clamp(tid, 0, int(keysByThread.size()) - 1);
+        auto& keys = keysByThread[tid];
+        if (keys.size() >= 8192) return;
+        if (seenByThread[tid].insert(key).second) keys.push_back(key);
+    }
+
+    std::vector<ChunkKey> merged()
+    {
+        std::vector<ChunkKey> out;
+        size_t total = 0;
+        for (const auto& keys : keysByThread) total += keys.size();
+        out.reserve(total);
+        for (const auto& keys : keysByThread)
+            out.insert(out.end(), keys.begin(), keys.end());
+        std::sort(out.begin(), out.end());
+        out.erase(std::unique(out.begin(), out.end()), out.end());
+        return out;
+    }
+};
+
+template<typename T, int kSlots = 4096>
+struct ChunkSampler {
+    static_assert((kSlots & (kSlots - 1)) == 0, "kSlots must be power of 2");
+    static constexpr int kSlotMask = kSlots - 1;
+
+    struct Slot {
+        ChunkKey key{-1, -1, -1, -1};
+        typename BlockPipeline::DecodedChunkPtr chunk;
+        const T* data = nullptr;
+    };
+
+    BlockPipeline& cache;
+    int level;
+    int tid;
+    ChunkDemandCollector* demand;
+    VolumeShape shape;
+    std::array<int, 3> chunkShape{};
+    std::unique_ptr<Slot[]> slots;
+    ChunkKey lastKey{-1, -1, -1, -1};
+    typename BlockPipeline::DecodedChunkPtr currentChunk;
+    const T* data = nullptr;
+
+    ChunkSampler(BlockPipeline& c, int lvl, int threadId, ChunkDemandCollector& demandCollector)
+        : cache(c), level(lvl), tid(threadId), demand(&demandCollector),
+          shape(c, lvl), chunkShape(c.chunkShape(lvl)),
+          slots(std::make_unique<Slot[]>(kSlots))
+    {
+        for (int i = 0; i < 3; ++i)
+            chunkShape[i] = std::max(1, chunkShape[i]);
+    }
+
+    VC_FORCE_INLINE bool inBounds(float vz, float vy, float vx) const {
+        return vz >= 0 && vy >= 0 && vx >= 0
+            && vz < shape.szf && vy < shape.syf && vx < shape.sxf;
+    }
+
+    VC_FORCE_INLINE int slotIndex(const ChunkKey& key) const {
+        return int(vc::cache::ChunkKeyHash{}(key)) & kSlotMask;
+    }
+
+    VC_FORCE_INLINE void updateChunk(const ChunkKey& key) {
+        if (key == lastKey) return;
+        lastKey = key;
+
+        Slot& slot = slots[slotIndex(key)];
+        if (slot.key == key) {
+            currentChunk = slot.chunk;
+            data = slot.data;
+            return;
+        }
+
+        currentChunk = cache.decodedChunkAt(key);
+        slot.key = key;
+        slot.chunk = currentChunk;
+        slot.data = currentChunk ? reinterpret_cast<const T*>(currentChunk->rawData()) : nullptr;
+        data = slot.data;
+    }
+
+    VC_FORCE_INLINE void tryUpdateBlockNonBlocking(int, int, int) {
+        data = nullptr;
+    }
+
+    VC_FORCE_INLINE bool sampleIntNB(int iz, int iy, int ix, T& out) {
+        if (unsigned(iz) >= unsigned(shape.sz) ||
+            unsigned(iy) >= unsigned(shape.sy) ||
+            unsigned(ix) >= unsigned(shape.sx)) {
+            out = 0; return true;
+        }
+
+        const ChunkKey ck{
+            level,
+            iz / chunkShape[0],
+            iy / chunkShape[1],
+            ix / chunkShape[2]};
+        updateChunk(ck);
+        if (!currentChunk) {
+            if (cache.isChunkKnownEmpty(ck) || cache.isNegativeCached(ck)) {
+                out = 0;
+                return true;
+            }
+            if (demand) demand->record(tid, ck);
+            return false;
+        }
+        if (currentChunk->elementSize != sizeof(T)) {
+            out = 0;
+            return false;
+        }
+
+        const int lz = iz - ck.iz * chunkShape[0];
+        const int ly = iy - ck.iy * chunkShape[1];
+        const int lx = ix - ck.ix * chunkShape[2];
+        if (unsigned(lz) >= unsigned(currentChunk->shape[0]) ||
+            unsigned(ly) >= unsigned(currentChunk->shape[1]) ||
+            unsigned(lx) >= unsigned(currentChunk->shape[2])) {
+            out = 0;
+            return true;
+        }
+
+        out = data[size_t(lz) * size_t(currentChunk->strideZ())
+                 + size_t(ly) * size_t(currentChunk->strideY())
+                 + size_t(lx)];
+        return true;
     }
 };
 
@@ -1061,6 +1204,53 @@ VC_FORCE_INLINE bool trySampleNB(BlockSampler<uint8_t>& s, float vz, float vy, f
     }
 }
 
+VC_FORCE_INLINE bool trySampleNearestUnchecked(ChunkSampler<uint8_t>& s,
+                                               float vz, float vy, float vx,
+                                               uint8_t& out) {
+    int iz = int(vz + 0.5f), iy = int(vy + 0.5f), ix = int(vx + 0.5f);
+    if (iz >= s.shape.sz) iz = s.shape.sz - 1;
+    if (iy >= s.shape.sy) iy = s.shape.sy - 1;
+    if (ix >= s.shape.sx) ix = s.shape.sx - 1;
+    return s.sampleIntNB(iz, iy, ix, out);
+}
+
+template<SampleMode Mode>
+VC_FORCE_INLINE bool trySampleNB(ChunkSampler<uint8_t>& s, float vz, float vy, float vx,
+                                 uint8_t& out) {
+    if constexpr (Mode == SampleMode::Nearest) {
+        if (vz < 0.f || vy < 0.f || vx < 0.f) { out = 0; return true; }
+        return s.sampleIntNB(int(vz + 0.5f), int(vy + 0.5f), int(vx + 0.5f), out);
+    }
+
+    if (!s.inBounds(vz, vy, vx)) { out = 0; return true; }
+    const int iz = int(vz), iy = int(vy), ix = int(vx);
+    uint8_t v000, v100, v010, v110, v001, v101, v011, v111;
+    if (!s.sampleIntNB(iz,     iy,     ix,     v000)) return false;
+    if (!s.sampleIntNB(iz + 1, iy,     ix,     v100)) return false;
+    if (!s.sampleIntNB(iz,     iy + 1, ix,     v010)) return false;
+    if (!s.sampleIntNB(iz + 1, iy + 1, ix,     v110)) return false;
+    if (!s.sampleIntNB(iz,     iy,     ix + 1, v001)) return false;
+    if (!s.sampleIntNB(iz + 1, iy,     ix + 1, v101)) return false;
+    if (!s.sampleIntNB(iz,     iy + 1, ix + 1, v011)) return false;
+    if (!s.sampleIntNB(iz + 1, iy + 1, ix + 1, v111)) return false;
+
+    const float fz = vz - float(iz), fy = vy - float(iy), fx = vx - float(ix);
+    const float v000f = float(v000), v100f = float(v100);
+    const float v010f = float(v010), v110f = float(v110);
+    const float v001f = float(v001), v101f = float(v101);
+    const float v011f = float(v011), v111f = float(v111);
+    const float c00 = std::fma(fx, v001f - v000f, v000f);
+    const float c01 = std::fma(fx, v011f - v010f, v010f);
+    const float c10 = std::fma(fx, v101f - v100f, v100f);
+    const float c11 = std::fma(fx, v111f - v110f, v110f);
+    const float c0  = std::fma(fy, c01 - c00, c00);
+    const float c1  = std::fma(fy, c11 - c10, c10);
+    float v = std::fma(fz, c1 - c0, c0);
+    if (v < 0.f) v = 0.f; if (v > 255.f) v = 255.f;
+    out = uint8_t(v);
+    return true;
+}
+
 
 // ----------------------------------------------------------------------------
 // Unified composite-capable adaptive sampler.
@@ -1136,6 +1326,7 @@ void sampleSingleLayerAdaptiveImpl(
     // When skipPrefetch is set, the caller is asserting that coords haven't
     // changed since the prior frame — the fetchInteractive queue is already
     // seeded, and rerunning the enumeration is pure overhead.
+    if constexpr (kUseAdaptiveProactivePrefetch) {
     if (!skipPrefetch) {
     cv::Vec3f viewCenterL0(0, 0, 0);
     bool haveCenter = false;
@@ -1168,6 +1359,7 @@ void sampleSingleLayerAdaptiveImpl(
         }
     }
     }  // skipPrefetch guard
+    }
 
     float scales[kMaxLevels] = {};
     const int nSamplersTotal = numLevels - desiredLevel;
@@ -1184,15 +1376,16 @@ void sampleSingleLayerAdaptiveImpl(
     const int nTilesX = (w + kTile - 1) / kTile;
     const int totalTiles = nTilesY * nTilesX;
     std::atomic<int> nextTile{0};
-    FallbackRepairCollector fallbackRepair(cache, desiredLevel, promoteFallbackChunks);
+    ChunkDemandCollector demand;
+    FallbackRepairCollector fallbackRepair(cache, desiredLevel, false);
 
     runRenderThreads([&](int tid) {
         const int nSamplers = numLevels - desiredLevel;
-        std::array<std::optional<BlockSampler<uint8_t>>, kMaxLevels> samplers;
-        if (nSamplers > 0) samplers[0].emplace(cache, desiredLevel);
-        auto sampler = [&](int i) -> BlockSampler<uint8_t>& {
+        std::array<std::optional<ChunkSampler<uint8_t>>, kMaxLevels> samplers;
+        if (nSamplers > 0) samplers[0].emplace(cache, desiredLevel, tid, demand);
+        auto sampler = [&](int i) -> ChunkSampler<uint8_t>& {
             if (!samplers[i].has_value())
-                samplers[i].emplace(cache, desiredLevel + i);
+                samplers[i].emplace(cache, desiredLevel + i, tid, demand);
             return *samplers[i];
         };
 
@@ -1257,14 +1450,12 @@ void sampleSingleLayerAdaptiveImpl(
                     }
                 }
                 if (!got) {
-                    fallbackRepair.template recordSample<SMode>(tid, swz, swy, swx);
                     for (int i=0; i<nSamplers; i++) {
                         const float r = scalesRatio[i];
                         if (trySampleNB<SMode>(sampler(i),
                             swz * r, swy * r, swx * r, v)) {
                             if (uint8_t(i) > pxLevel) {
                                 pxLevel = uint8_t(i);
-                                fallbackRepair.template recordSample<SMode>(tid, swz, swy, swx);
                             }
                             break;
                         }
@@ -1307,11 +1498,9 @@ void sampleSingleLayerAdaptiveImpl(
         }  // while tiles
     });
 
-    if (promoteFallbackChunks) {
-        auto repairKeys = fallbackRepair.merged();
-        if (!repairKeys.empty()) {
-            cache.fetchInteractive(repairKeys, desiredLevel, /*forceResidentReload=*/true);
-        }
+    auto missingKeys = demand.merged();
+    if (!missingKeys.empty()) {
+        cache.fetchInteractive(missingKeys, desiredLevel);
     }
 }
 
@@ -1349,6 +1538,7 @@ void sampleCompositeAdaptiveImpl(
     // Prefetch covered bbox across all fallback levels.
     // Skip entirely when the caller knows coords are unchanged since the
     // prior frame — same rationale as in sampleSingleLayerAdaptiveImpl.
+    if constexpr (kUseAdaptiveProactivePrefetch) {
     if (!skipPrefetch) {
     cv::Vec3f viewCenterL0(0, 0, 0);
     bool haveCenter = false;
@@ -1381,6 +1571,7 @@ void sampleCompositeAdaptiveImpl(
         }
     }
     }  // skipPrefetch guard
+    }
 
     // Precompute per-level scale factor once (1.0 / 2^lvl). Hoists the
     // integer shift + int->float convert + fdiv out of the hot inner loop.
@@ -1478,7 +1669,8 @@ void sampleCompositeAdaptiveImpl(
     const int nTilesX = (w + kTile - 1) / kTile;
     const int totalTiles = nTilesY * nTilesX;
     std::atomic<int> nextTile{0};
-    FallbackRepairCollector fallbackRepair(cache, desiredLevel, promoteFallbackChunks);
+    ChunkDemandCollector demand;
+    FallbackRepairCollector fallbackRepair(cache, desiredLevel, false);
 
     runRenderThreads([&](int tid) {
         // Lazy per-level samplers: construct the level-0 sampler eagerly
@@ -1487,11 +1679,11 @@ void sampleCompositeAdaptiveImpl(
         // ~4KB hot slot cache; we don't want to pay that cost for levels
         // we never touch.
         const int nSamplers = numLevels - desiredLevel;
-        std::array<std::optional<BlockSampler<uint8_t>>, kMaxLevels> samplers;
-        if (nSamplers > 0) samplers[0].emplace(cache, desiredLevel);
-        auto sampler = [&](int i) -> BlockSampler<uint8_t>& {
+        std::array<std::optional<ChunkSampler<uint8_t>>, kMaxLevels> samplers;
+        if (nSamplers > 0) samplers[0].emplace(cache, desiredLevel, tid, demand);
+        auto sampler = [&](int i) -> ChunkSampler<uint8_t>& {
             if (!samplers[i].has_value())
-                samplers[i].emplace(cache, desiredLevel + i);
+                samplers[i].emplace(cache, desiredLevel + i, tid, demand);
             return *samplers[i];
         };
         std::vector<float> layerVals;
@@ -1698,8 +1890,8 @@ void sampleCompositeAdaptiveImpl(
                 // current block ptr and only re-resolve on (bz,by,bx)
                 // change. Saves packKey + lastKey compare (~5 cycles/sample)
                 // on every same-block step — i.e. most steps.
-                BlockSampler<uint8_t>& s0 = *samplers[0];
-                if (fullyInBounds) {
+                auto& s0 = *samplers[0];
+                if (false && fullyInBounds) {
                     // Chunk-grouped sampling: precompute per-layer block
                     // coordinates and in-block offsets in a pure-linear pass
                     // (compiler vectorizes), then walk layers grouped by
@@ -2411,11 +2603,9 @@ void sampleCompositeAdaptiveImpl(
         }  // while tiles
     });
 
-    if (promoteFallbackChunks) {
-        auto repairKeys = fallbackRepair.merged();
-        if (!repairKeys.empty()) {
-            cache.fetchInteractive(repairKeys, desiredLevel, /*forceResidentReload=*/true);
-        }
+    auto missingKeys = demand.merged();
+    if (!missingKeys.empty()) {
+        cache.fetchInteractive(missingKeys, desiredLevel);
     }
 }
 

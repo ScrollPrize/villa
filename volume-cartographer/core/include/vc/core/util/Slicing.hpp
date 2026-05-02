@@ -111,17 +111,12 @@ void sampleAdaptiveARGB32(
     // (0 = desired level, 1..N = fallback depth). Stride is in bytes.
     uint8_t* levelOut = nullptr,
     int levelStride = 0,
-    // When true, skip the per-frame chunk enumeration + sort + fetchInteractive
-    // that the kernel normally runs before dispatching tiles. Intended for
-    // callers that can prove the coords haven't changed since the last
-    // render (e.g. QuadSurface gen cache hit) — the prior frame already
-    // queued the needed blocks, so rerunning the enumeration is pure
-    // overhead. No correctness impact on block residency: the per-sample
-    // adaptive fallback still handles any block not yet loaded.
+    // Retained for ABI/source compatibility. Adaptive rendering now records
+    // missing chunks during sampling and submits one merged demand set after
+    // the frame, so it no longer performs proactive viewport enumeration.
     bool skipPrefetch = false,
-    // When true, pixels that visibly fall back to a coarser level are
-    // aggregated back to desired-level ChunkKeys and submitted immediately as
-    // an interactive repair request. Intended for idle catch-up frames.
+    // Retained for ABI/source compatibility. Missing desired/fallback chunks
+    // are demand-recorded directly during sampling.
     bool promoteFallbackChunks = false);
 
 // Fused plane composite: inline coords + nearest-neighbor per layer + composite + LUT → ARGB32.

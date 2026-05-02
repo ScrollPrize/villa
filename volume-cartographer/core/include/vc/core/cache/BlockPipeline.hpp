@@ -28,11 +28,12 @@ namespace vc { class VcDataset; }
 
 namespace vc::cache {
 
-// Block-granular cache pipeline. Data flows ice (remote) → cold (disk) →
-// decoded bytes → 16^3 blocks in the BlockCache.
+// Chunk-first cache pipeline. Data flows ice (remote) → cold (disk) →
+// decoded chunks. Interactive renderers can sample those chunks directly;
+// legacy block callers lazily materialize 16^3 blocks from resident chunks.
 //
-// Callers see only blocks. Chunks are an on-disk/IO artifact used internally
-// to amortize S3 and codec overhead.
+// Chunks are the IO/decode/render residency unit. Blocks remain a compatibility
+// layer for older APIs that still call blockAt().
 class BlockPipeline {
 public:
     struct Config {
@@ -78,6 +79,12 @@ public:
         // hundreds of MiB here. 256 MiB ≈ a few thousand chunks max.
         size_t maxDecodeStagingBytes = 256ULL << 20;
 
+        // Decoded chunk cache used by VC3D's Khartes-style progressive
+        // renderer. This keeps the render residency unit aligned with the
+        // IO/decode unit instead of depending on partial 16^3 block
+        // residency. Set to 0 to disable chunk-resident rendering.
+        size_t decodedChunkCacheBytes = 4ULL << 30;
+
         // When non-zero, declares the source is byte-identical to our local
         // canonical c3d disk format: zarr v3, 4096³ shards with 256³ inner
         // C3DC chunks. The downloader then bypasses the encoder entirely —
@@ -109,11 +116,20 @@ public:
     // Evicted blocks stay alive while any caller still holds a shared_ptr.
     [[nodiscard]] BlockPtr blockAt(const BlockKey& key) noexcept;
 
+    using DecodedChunkPtr = std::shared_ptr<const ChunkData>;
+
+    // --- Chunk-level access ---
+    // Returns a decoded native/canonical chunk, or null if it is not resident.
+    // This is non-blocking and is intended for demand-driven progressive
+    // rendering: callers record the missing ChunkKey and submit it after the
+    // frame instead of probing smaller block residency.
+    [[nodiscard]] DecodedChunkPtr decodedChunkAt(const ChunkKey& key) const noexcept;
+    [[nodiscard]] bool isChunkKnownEmpty(const ChunkKey& key) const noexcept;
+
     // --- Interactive fetch (for viewport chunks) ---
-    // Chunk keys are still the IO unit — after decode, each chunk is split
-    // into 16^3 blocks and inserted into the block cache. targetLevel is
-    // the pyramid level the viewer is currently displaying at; shards at
-    // that level get the highest IO priority.
+    // Chunk keys are the IO and decode unit. targetLevel is the pyramid
+    // level the viewer is currently displaying at; shards at that level get
+    // the highest IO priority.
     void fetchInteractive(const std::vector<ChunkKey>& keys,
                           int targetLevel = 0,
                           bool forceResidentReload = false);
@@ -309,6 +325,21 @@ private:
 
     std::unique_ptr<BlockCache> ownedBlockCache_;  // per-pipeline fallback when no shared cache
     BlockCache& blockCache_;
+
+    struct DecodedChunkEntry {
+        ChunkKey key;
+        DecodedChunkPtr chunk;
+        size_t bytes = 0;
+    };
+    mutable std::mutex decodedChunkMutex_;
+    mutable std::list<DecodedChunkEntry> decodedChunkLru_;  // front = most recent
+    mutable std::unordered_map<ChunkKey,
+                               std::list<DecodedChunkEntry>::iterator,
+                               ChunkKeyHash> decodedChunkMap_;
+    mutable size_t decodedChunkBytes_ = 0;
+    [[nodiscard]] DecodedChunkPtr retainDecodedChunk(
+        const ChunkKey& key, ChunkDataPtr chunk) noexcept;
+    void clearDecodedChunks() noexcept;
 
     // Assemble a canonical 128^3 chunk from one or more source chunks at
     // `canonKey.level`, rechunking as needed. Null if the canonical region

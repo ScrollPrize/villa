@@ -630,7 +630,7 @@ BlockPipeline::BlockPipeline(
         }
         if (!decoded) return {};
 
-        insertChunkAsBlocks(key, *decoded);
+        (void)retainDecodedChunk(key, std::move(decoded));
         notifyChunkReady(key);
         return {};
     });
@@ -917,10 +917,99 @@ BlockPtr BlockPipeline::blockAt(const BlockKey& key) noexcept {
             statEmptyHits_.fetch_add(1024, std::memory_order_relaxed);
         return &kZeroBlock;
     }
+    if (auto chunk = decodedChunkAt(chunkKey); chunk && chunk->elementSize == 1) {
+        thread_local std::array<uint8_t, kBlockBytes> tmpBlock;
+        tmpBlock.fill(0);
+
+        const int localBlockZ = key.bz - chunkKey.iz * blocksZ;
+        const int localBlockY = key.by - chunkKey.iy * blocksY;
+        const int localBlockX = key.bx - chunkKey.ix * blocksX;
+        const int srcZ0 = localBlockZ * kBlockSize;
+        const int srcY0 = localBlockY * kBlockSize;
+        const int srcX0 = localBlockX * kBlockSize;
+        const int copyZ = std::clamp(chunk->shape[0] - srcZ0, 0, kBlockSize);
+        const int copyY = std::clamp(chunk->shape[1] - srcY0, 0, kBlockSize);
+        const int copyX = std::clamp(chunk->shape[2] - srcX0, 0, kBlockSize);
+
+        uint8_t* dst = tmpBlock.data();
+        const uint8_t* src = chunk->rawData();
+        for (int z = 0; z < copyZ; ++z) {
+            for (int y = 0; y < copyY; ++y) {
+                const uint8_t* row = src
+                    + size_t(srcZ0 + z) * size_t(chunk->strideZ())
+                    + size_t(srcY0 + y) * size_t(chunk->strideY())
+                    + size_t(srcX0);
+                std::memcpy(dst + size_t(z) * kBlockSize * kBlockSize
+                                + size_t(y) * kBlockSize,
+                            row, size_t(copyX));
+            }
+        }
+
+        blockCache_.put(key, tmpBlock.data(), blockCache_.generation());
+        if (auto b = blockCache_.get(key); b) return b;
+    }
     thread_local uint64_t localMisses = 0;
     if ((++localMisses & 1023) == 0)
         statMisses_.fetch_add(1024, std::memory_order_relaxed);
     return nullptr;
+}
+
+auto BlockPipeline::decodedChunkAt(const ChunkKey& key) const noexcept -> DecodedChunkPtr
+{
+    std::lock_guard lk(decodedChunkMutex_);
+    auto it = decodedChunkMap_.find(key);
+    if (it == decodedChunkMap_.end()) return {};
+    decodedChunkLru_.splice(decodedChunkLru_.begin(), decodedChunkLru_, it->second);
+    return it->second->chunk;
+}
+
+bool BlockPipeline::isChunkKnownEmpty(const ChunkKey& key) const noexcept
+{
+    return isEmptyChunk(key);
+}
+
+auto BlockPipeline::retainDecodedChunk(
+    const ChunkKey& key, ChunkDataPtr chunk) noexcept -> DecodedChunkPtr
+{
+    if (!chunk) return {};
+    if (chunk->isEmpty) {
+        addEmptyChunk(key);
+        TickCoordinator::notifyEmptyChunkNoted(key);
+        return {};
+    }
+
+    std::shared_ptr<const ChunkData> ptr(chunk.release(), ChunkDataPoolDeleter{});
+    const size_t bytes = ptr->totalBytes();
+    const size_t budget = config_.decodedChunkCacheBytes;
+    if (budget == 0 || bytes > budget) return ptr;
+
+    std::lock_guard lk(decodedChunkMutex_);
+    if (auto it = decodedChunkMap_.find(key); it != decodedChunkMap_.end()) {
+        decodedChunkBytes_ -= it->second->bytes;
+        decodedChunkLru_.erase(it->second);
+        decodedChunkMap_.erase(it);
+    }
+
+    decodedChunkLru_.push_front({key, ptr, bytes});
+    decodedChunkMap_[key] = decodedChunkLru_.begin();
+    decodedChunkBytes_ += bytes;
+
+    while (!decodedChunkLru_.empty() && decodedChunkBytes_ > budget) {
+        auto& victim = decodedChunkLru_.back();
+        decodedChunkBytes_ -= victim.bytes;
+        decodedChunkMap_.erase(victim.key);
+        decodedChunkLru_.pop_back();
+    }
+
+    return ptr;
+}
+
+void BlockPipeline::clearDecodedChunks() noexcept
+{
+    std::lock_guard lk(decodedChunkMutex_);
+    decodedChunkLru_.clear();
+    decodedChunkMap_.clear();
+    decodedChunkBytes_ = 0;
 }
 
 // Rechunk source chunks into a canonical 128^3 chunk. Returns a decoded
@@ -1078,6 +1167,7 @@ void BlockPipeline::notifyChunkReady(const ChunkKey& key) {
 
 void BlockPipeline::clearMemory() {
     blockCache_.clear();
+    clearDecodedChunks();
     clearEmptyChunks();
     for (auto& bucket : shardCacheBuckets_) {
         std::lock_guard lk(bucket.mutex);
@@ -1108,6 +1198,7 @@ void BlockPipeline::clearAll() {
         bucket.bytes = 0;
     }
     shardCacheGlobalBytes_.store(0, std::memory_order_relaxed);
+    clearDecodedChunks();
     blockCache_.clear();
     clearEmptyChunks();
     bloomClear();
@@ -1189,6 +1280,7 @@ size_t BlockPipeline::countAvailable(const std::vector<ChunkKey>& keys) const {
     for (const auto& key : keys) {
         if (isNegativeCached(key)) { n++; continue; }
         if (isEmptyChunk(key)) { n++; continue; }
+        if (decodedChunkAt(key)) { n++; continue; }
     }
     return n;
 }
@@ -1201,6 +1293,7 @@ std::vector<ChunkKey> BlockPipeline::chunksMissingFromCache(
 
     for (const auto& key : keys) {
         if (isNegativeCached(key) || isEmptyChunk(key)) continue;
+        if (decodedChunkAt(key)) continue;
         missing.push_back(key);
     }
 
