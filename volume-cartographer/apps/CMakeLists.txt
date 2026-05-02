@@ -56,12 +56,6 @@ target_link_libraries(vc_tifxyz_inp_mask vc_core)
 add_executable(vc_tifxyz_winding src/vc_tifxyz_winding.cpp)
 target_link_libraries(vc_tifxyz_winding vc_core)
 
-add_executable(vc_fill_quadmesh src/vc_fill_quadmesh.cpp)
-target_link_libraries(vc_fill_quadmesh vc_core vc_tracer Ceres::ceres)
-
-add_executable(vc_tiffxyz_upscale_grounding src/vc_tiffxyz_upscale_grounding.cpp)
-target_link_libraries(vc_tiffxyz_upscale_grounding vc_core vc_tracer)
-
 add_executable(vc_calc_surface_metrics src/vc_calc_surface_metrics.cpp)
 target_link_libraries(vc_calc_surface_metrics vc_core vc_ui Boost::program_options)
 
@@ -98,9 +92,6 @@ target_link_libraries(vc_tifxyz_mmap_prepare TIFF::TIFF)
 
 add_executable(vc_create_segment_mask src/vc_create_segment_mask.cpp)
 target_link_libraries(vc_create_segment_mask vc_core Boost::program_options)
-
-add_executable(vc_surface_diff src/vc_surface_diff.cpp)
-target_link_libraries(vc_surface_diff vc_core Boost::program_options)
 
 add_executable(vc_visualize src/vc_visualize.cpp)
 target_link_libraries(vc_visualize vc_core Boost::program_options)
@@ -146,9 +137,6 @@ target_link_libraries(vc_project_tifxyz vc_core Boost::program_options opencv_co
 add_executable(vc_zarr_to_tiff src/vc_zarr_to_tiff.cpp)
 target_link_libraries(vc_zarr_to_tiff vc_core Boost::program_options TIFF::TIFF)
 
-add_executable(vc_zarr_raw_frames src/vc_zarr_raw_frames.cpp)
-target_link_libraries(vc_zarr_raw_frames vc_core)
-
 add_executable(vc_zarr_recompress src/vc_zarr_recompress.cpp)
 target_link_libraries(vc_zarr_recompress vc_core blosc_static)
 
@@ -169,14 +157,11 @@ if(VC_USE_PCH)
         vc_tifxyz_winding
         vc_tifxyz2zarr_sparse
         vc_add_ignore_label
-        vc_fill_quadmesh
-        vc_tiffxyz_upscale_grounding
         vc_calc_surface_metrics
         vc_tifxyz_gengt
         vc_diffuse_winding
         vc_tifxyz_mmap_prepare
         vc_create_segment_mask
-        vc_surface_diff
         vc_visualize
         vc_transform_geom
         vc_gen_normalgrids
