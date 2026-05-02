@@ -186,18 +186,6 @@ cv::Mat binarize_fixed_threshold(const cv::Mat& gray) {
     return binary;
 }
 
-cv::Mat normalized_dt_u16(const cv::Mat& dt) {
-    double max_value = 0.0;
-    cv::minMaxLoc(dt, nullptr, &max_value);
-    cv::Mat out;
-    if (max_value <= 0.0) {
-        out = cv::Mat::zeros(dt.size(), CV_16U);
-    } else {
-        dt.convertTo(out, CV_16U, 65535.0 / max_value);
-    }
-    return out;
-}
-
 int transition_count(const std::uint8_t p[8]) {
     int count = 0;
     for (int i = 0; i < 8; ++i) {
@@ -1689,13 +1677,25 @@ void draw_graph_edge(cv::Mat& out, const GraphEdge& edge,
                      const cv::Scalar color) {
     for (const cv::Point pixel : edge.pixels) {
         if (out.channels() == 1) {
-            out.at<std::uint8_t>(pixel.y, pixel.x) =
-                static_cast<std::uint8_t>(color[0]);
+            if (out.depth() == CV_32F) {
+                out.at<float>(pixel.y, pixel.x) =
+                    static_cast<float>(color[0]);
+            } else {
+                out.at<std::uint8_t>(pixel.y, pixel.x) =
+                    static_cast<std::uint8_t>(color[0]);
+            }
         } else {
-            out.at<cv::Vec3b>(pixel.y, pixel.x) =
-                cv::Vec3b(static_cast<std::uint8_t>(color[0]),
-                          static_cast<std::uint8_t>(color[1]),
-                          static_cast<std::uint8_t>(color[2]));
+            if (out.depth() == CV_32F) {
+                out.at<cv::Vec3f>(pixel.y, pixel.x) =
+                    cv::Vec3f(static_cast<float>(color[0]),
+                              static_cast<float>(color[1]),
+                              static_cast<float>(color[2]));
+            } else {
+                out.at<cv::Vec3b>(pixel.y, pixel.x) =
+                    cv::Vec3b(static_cast<std::uint8_t>(color[0]),
+                              static_cast<std::uint8_t>(color[1]),
+                              static_cast<std::uint8_t>(color[2]));
+            }
         }
     }
 }
@@ -1892,21 +1892,12 @@ void write_graph_connectivity_report(const fs::path& path,
 
 cv::Mat render_graph_capacity(const SkeletonGraph& graph, cv::Size size,
                               std::uint8_t background) {
-    float max_capacity = 0.0f;
-    for (const GraphEdge& edge : graph.edges) {
-        max_capacity = std::max(max_capacity, edge.capacity);
-    }
-
-    cv::Mat out(size, CV_8UC3,
+    cv::Mat out(size, CV_32FC3,
                 cv::Scalar(background, background, background));
     for (const GraphEdge& edge : graph.edges) {
-        const int value =
-            max_capacity > 0.0f
-                ? static_cast<int>(std::lround(
-                      std::clamp(edge.capacity / max_capacity, 0.0f, 1.0f) *
-                      255.0f))
-                : 0;
-        draw_graph_edge(out, edge, cv::Scalar(value, value, value));
+        draw_graph_edge(out, edge,
+                        cv::Scalar(edge.capacity, edge.capacity,
+                                   edge.capacity));
     }
     for (std::size_t label = 1; label < graph.nodes.size(); ++label) {
         cv::circle(out, graph.nodes[label], 3, cv::Scalar(180, 180, 180),
@@ -2005,7 +1996,6 @@ class Dinic {
 
 struct DenseFlowResult {
     cv::Mat dense_flow;
-    cv::Mat dense_flow_u16;
     cv::Mat graph_edge_flow;
     cv::Mat graph_edge_flow_gray_bg;
     cv::Mat edge_flow_px;
@@ -2020,15 +2010,13 @@ struct DenseFlowResult {
 };
 
 std::vector<cv::Point> unique_edge_pixels(const std::vector<cv::Point>& pixels) {
-    std::vector<cv::Point> unique = pixels;
-    std::sort(unique.begin(), unique.end(), [](const cv::Point& a,
-                                               const cv::Point& b) {
-        if (a.y != b.y) {
-            return a.y < b.y;
+    std::vector<cv::Point> unique;
+    unique.reserve(pixels.size());
+    for (const cv::Point pixel : pixels) {
+        if (std::find(unique.begin(), unique.end(), pixel) == unique.end()) {
+            unique.push_back(pixel);
         }
-        return a.x < b.x;
-    });
-    unique.erase(std::unique(unique.begin(), unique.end()), unique.end());
+    }
     return unique;
 }
 
@@ -2097,27 +2085,29 @@ std::vector<cv::Point> order_edge_pixels(const GraphEdge& edge,
         }
     }
 
-    std::vector<char> visited(pixels.size(), 0);
-    std::vector<cv::Point> ordered;
-    ordered.reserve(pixels.size());
-    int current = start;
-    int previous = -1;
-    while (current >= 0 && !visited[current]) {
-        visited[current] = 1;
-        ordered.push_back(pixels[current]);
+    const auto four_connected = [&](int a, int b) {
+        return std::abs(pixels[a].x - pixels[b].x) +
+                   std::abs(pixels[a].y - pixels[b].y) ==
+               1;
+    };
 
-        int next_index = -1;
+    const auto choose_next = [&](int current,
+                                 const std::vector<int>& candidates) {
+        if (candidates.empty()) {
+            return -1;
+        }
+        std::vector<int> four_candidates;
+        for (int candidate : candidates) {
+            if (four_connected(current, candidate)) {
+                four_candidates.push_back(candidate);
+            }
+        }
+        const std::vector<int>& choices =
+            four_candidates.empty() ? candidates : four_candidates;
+
+        int best = choices.front();
         double best_score = std::numeric_limits<double>::max();
-        for (const cv::Point dir : kDirs) {
-            const cv::Point next = pixels[current] + dir;
-            if (!bounds.contains(next)) {
-                continue;
-            }
-            const int candidate =
-                local_index.at<int>(next.y - bounds.y, next.x - bounds.x);
-            if (candidate < 0 || visited[candidate] || candidate == previous) {
-                continue;
-            }
+        for (int candidate : choices) {
             double score = 0.0;
             if (end >= 0) {
                 const double dx = pixels[candidate].x - pixels[end].x;
@@ -2126,21 +2116,84 @@ std::vector<cv::Point> order_edge_pixels(const GraphEdge& edge,
             } else {
                 score = degree[candidate];
             }
-            if (score < best_score) {
+            if (score < best_score ||
+                (score == best_score &&
+                 (pixels[candidate].y < pixels[best].y ||
+                  (pixels[candidate].y == pixels[best].y &&
+                   pixels[candidate].x < pixels[best].x)))) {
                 best_score = score;
-                next_index = candidate;
+                best = candidate;
             }
         }
-        previous = current;
-        current = next_index;
+        return best;
+    };
+
+    std::vector<char> visited(pixels.size(), 0);
+    std::vector<cv::Point> ordered;
+    ordered.reserve(pixels.size());
+    int current = start;
+    while (current >= 0 && !visited[current]) {
+        visited[current] = 1;
+        ordered.push_back(pixels[current]);
+
+        std::vector<int> candidates;
+        for (const cv::Point dir : kDirs) {
+            const cv::Point next = pixels[current] + dir;
+            if (!bounds.contains(next)) {
+                continue;
+            }
+            const int candidate =
+                local_index.at<int>(next.y - bounds.y, next.x - bounds.x);
+            if (candidate >= 0 && !visited[candidate]) {
+                candidates.push_back(candidate);
+            }
+        }
+        current = choose_next(current, candidates);
     }
 
     if (ordered.size() == pixels.size()) {
         return ordered;
     }
-    for (int i = 0; i < static_cast<int>(pixels.size()); ++i) {
-        if (!visited[i]) {
-            ordered.push_back(pixels[i]);
+
+    while (ordered.size() < pixels.size()) {
+        int restart = -1;
+        double best_restart = std::numeric_limits<double>::max();
+        for (int i = 0; i < static_cast<int>(pixels.size()); ++i) {
+            if (visited[i]) {
+                continue;
+            }
+            double score = 0.0;
+            if (!ordered.empty()) {
+                const cv::Point last = ordered.back();
+                const double dx = pixels[i].x - last.x;
+                const double dy = pixels[i].y - last.y;
+                score = dx * dx + dy * dy;
+            }
+            if (restart < 0 || score < best_restart) {
+                best_restart = score;
+                restart = i;
+            }
+        }
+        if (restart < 0) {
+            break;
+        }
+        current = restart;
+        while (current >= 0 && !visited[current]) {
+            visited[current] = 1;
+            ordered.push_back(pixels[current]);
+            std::vector<int> candidates;
+            for (const cv::Point dir : kDirs) {
+                const cv::Point next = pixels[current] + dir;
+                if (!bounds.contains(next)) {
+                    continue;
+                }
+                const int candidate =
+                    local_index.at<int>(next.y - bounds.y, next.x - bounds.x);
+                if (candidate >= 0 && !visited[candidate]) {
+                    candidates.push_back(candidate);
+                }
+            }
+            current = choose_next(current, candidates);
         }
     }
     return ordered;
@@ -2470,16 +2523,15 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         timings.push_back(finish_timing("dense_flow_nearest_edge", timing));
     }
 
-    cv::Mat dense_flow_u16 = normalized_dt_u16(dense_flow);
-    cv::Mat graph_edge_flow(white_domain.size(), CV_8UC3, cv::Scalar(0, 0, 0));
-    cv::Mat graph_edge_flow_gray_bg(white_domain.size(), CV_8UC3,
+    cv::Mat graph_edge_flow(white_domain.size(), CV_32FC3,
+                            cv::Scalar(0, 0, 0));
+    cv::Mat graph_edge_flow_gray_bg(white_domain.size(), CV_32FC3,
                                     cv::Scalar(127, 127, 127));
-    cv::Mat edge_flow_px(white_domain.size(), CV_8UC3, cv::Scalar(0, 0, 0));
-    cv::Mat edge_flow_px_gray_bg(white_domain.size(), CV_8UC3,
+    cv::Mat edge_flow_px(white_domain.size(), CV_32FC3, cv::Scalar(0, 0, 0));
+    cv::Mat edge_flow_px_gray_bg(white_domain.size(), CV_32FC3,
                                  cv::Scalar(127, 127, 127));
     cv::Mat graph_source_edges(white_domain.size(), CV_8U, cv::Scalar(0));
     double max_edge_flow = 0.0;
-    double max_edge_px_flow = 0.0;
     float finite_edge_flow_min = std::numeric_limits<float>::max();
     float finite_edge_flow_max = 0.0f;
     int finite_edge_flow_count = 0;
@@ -2500,47 +2552,22 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     for (int y = 0; y < graph_pixel_flow.rows; ++y) {
         for (int x = 0; x < graph_pixel_flow.cols; ++x) {
             const float value = graph_pixel_flow.at<float>(y, x);
-            if (value > 0.0f && value < kDenseFlowInf * 0.5f) {
-                max_edge_px_flow =
-                    std::max(max_edge_px_flow, static_cast<double>(value));
-            }
-        }
-    }
-    if (max_edge_px_flow <= 0.0) {
-        max_edge_px_flow = 1.0;
-    }
-    for (int y = 0; y < graph_pixel_flow.rows; ++y) {
-        for (int x = 0; x < graph_pixel_flow.cols; ++x) {
-            const float value = graph_pixel_flow.at<float>(y, x);
             if (value <= 0.0f) {
                 continue;
             }
-            const std::uint8_t gray =
-                value >= kDenseFlowInf * 0.5f
-                    ? 255
-                    : static_cast<std::uint8_t>(std::lround(
-                          std::clamp(value /
-                                         static_cast<float>(max_edge_px_flow),
-                                     0.0f, 1.0f) *
-                          255.0f));
-            edge_flow_px.at<cv::Vec3b>(y, x) = cv::Vec3b(gray, gray, gray);
-            edge_flow_px_gray_bg.at<cv::Vec3b>(y, x) =
-                cv::Vec3b(gray, gray, gray);
+            edge_flow_px.at<cv::Vec3f>(y, x) =
+                cv::Vec3f(value, value, value);
+            edge_flow_px_gray_bg.at<cv::Vec3f>(y, x) =
+                cv::Vec3f(value, value, value);
         }
     }
     for (int edge_index = 0; edge_index < static_cast<int>(graph.edges.size());
          ++edge_index) {
-        const int value = edge_flow[edge_index] >= kDenseFlowInf * 0.5f
-                              ? 255
-                              : static_cast<int>(std::lround(
-                                    std::clamp(edge_flow[edge_index] /
-                                                   static_cast<float>(max_edge_flow),
-                                               0.0f, 1.0f) *
-                                    255.0f));
+        const float raw_value = edge_flow[edge_index];
         draw_graph_edge(graph_edge_flow, graph.edges[edge_index],
-                        cv::Scalar(value, value, value));
+                        cv::Scalar(raw_value, raw_value, raw_value));
         draw_graph_edge(graph_edge_flow_gray_bg, graph.edges[edge_index],
-                        cv::Scalar(value, value, value));
+                        cv::Scalar(raw_value, raw_value, raw_value));
         if (source_edges[edge_index] != 0) {
             draw_graph_edge(graph_source_edges, graph.edges[edge_index],
                             cv::Scalar(255));
@@ -2565,9 +2592,9 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         const std::string edge_text = flow_text(edge_flow[edge_index]);
         const float px_value = graph_pixel_flow.at<float>(anchor.y, anchor.x);
         const std::string px_text = flow_text(px_value);
-        draw_debug_label(graph_edge_flow, anchor, edge_text,
-                         cv::Scalar(255, 255, 255));
         draw_debug_label(graph_edge_flow_gray_bg, anchor, edge_text,
+                         cv::Scalar(255, 255, 255));
+        draw_debug_label(graph_edge_flow, anchor, edge_text,
                          cv::Scalar(255, 255, 255));
         draw_debug_label(edge_flow_px, anchor, px_text,
                          cv::Scalar(255, 255, 255));
@@ -2579,9 +2606,9 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         const cv::Point anchor(cvRound(graph.nodes[node].x),
                                cvRound(graph.nodes[node].y));
         const std::string text = flow_text(node_flow[node]);
-        draw_debug_label(graph_edge_flow, anchor, text,
-                         cv::Scalar(180, 180, 180));
         draw_debug_label(graph_edge_flow_gray_bg, anchor, text,
+                         cv::Scalar(180, 180, 180));
+        draw_debug_label(graph_edge_flow, anchor, text,
                          cv::Scalar(180, 180, 180));
         draw_debug_label(edge_flow_px, anchor, text,
                          cv::Scalar(180, 180, 180));
@@ -2590,7 +2617,6 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     }
 
     return {dense_flow,
-            dense_flow_u16,
             graph_edge_flow,
             graph_edge_flow_gray_bg,
             edge_flow_px,
@@ -2604,24 +2630,16 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             timings};
 }
 
-cv::Mat to_bgr_layer(const cv::Mat& image) {
-    if (image.type() == CV_8UC3) {
-        return image;
+cv::Mat to_float_layer(const cv::Mat& image) {
+    CV_Assert(image.channels() == 1 || image.channels() == 3);
+    cv::Mat float_image;
+    image.convertTo(float_image, CV_MAKETYPE(CV_32F, image.channels()));
+    if (float_image.channels() == 3) {
+        return float_image;
     }
-    cv::Mat u8;
-    if (image.depth() == CV_8U) {
-        u8 = image.channels() == 1 ? image : cv::Mat();
-    } else {
-        double max_value = 0.0;
-        cv::minMaxLoc(image, nullptr, &max_value);
-        if (max_value > 0.0) {
-            image.convertTo(u8, CV_8U, 255.0 / max_value);
-        } else {
-            u8 = cv::Mat::zeros(image.size(), CV_8U);
-        }
-    }
+
     cv::Mat bgr;
-    cv::cvtColor(u8, bgr, cv::COLOR_GRAY2BGR);
+    cv::cvtColor(float_image, bgr, cv::COLOR_GRAY2BGR);
     return bgr;
 }
 
@@ -2961,14 +2979,13 @@ void write_named_layered_tiff(const fs::path& path,
     for (std::size_t layer_index = 0; layer_index < layers.size();
          ++layer_index) {
         const NamedLayer& layer = layers[layer_index];
-        CV_Assert(layer.image.depth() == CV_8U);
-        CV_Assert(layer.image.channels() == 1 || layer.image.channels() == 3);
+        CV_Assert(layer.image.depth() == CV_32F);
+        CV_Assert(layer.image.channels() == 3);
 
         cv::Mat image;
-        if (layer.image.isContinuous()) {
-            image = layer.image;
-        } else {
-            image = layer.image.clone();
+        cv::cvtColor(layer.image, image, cv::COLOR_BGR2RGB);
+        if (!image.isContinuous()) {
+            image = image.clone();
         }
 
         const int channels = image.channels();
@@ -2978,34 +2995,22 @@ void write_named_layered_tiff(const fs::path& path,
                      static_cast<std::uint32_t>(image.rows));
         TIFFSetField(tiff, TIFFTAG_SAMPLESPERPIXEL,
                      static_cast<std::uint16_t>(channels));
-        TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE, static_cast<std::uint16_t>(8));
+        TIFFSetField(tiff, TIFFTAG_BITSPERSAMPLE,
+                     static_cast<std::uint16_t>(32));
+        TIFFSetField(tiff, TIFFTAG_SAMPLEFORMAT, SAMPLEFORMAT_IEEEFP);
         TIFFSetField(tiff, TIFFTAG_ORIENTATION, ORIENTATION_TOPLEFT);
         TIFFSetField(tiff, TIFFTAG_PLANARCONFIG, PLANARCONFIG_CONTIG);
         TIFFSetField(tiff, TIFFTAG_COMPRESSION, COMPRESSION_LZW);
-        TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC,
-                     channels == 1 ? PHOTOMETRIC_MINISBLACK : PHOTOMETRIC_RGB);
+        TIFFSetField(tiff, TIFFTAG_PHOTOMETRIC, PHOTOMETRIC_RGB);
         TIFFSetField(tiff, TIFFTAG_SUBFILETYPE, FILETYPE_PAGE);
         TIFFSetField(tiff, TIFFTAG_PAGENUMBER,
                      static_cast<std::uint16_t>(layer_index),
                      static_cast<std::uint16_t>(layers.size()));
         TIFFSetField(tiff, TIFFTAG_PAGENAME, layer.name.c_str());
 
-        std::vector<std::uint8_t> rgb_row(
-            static_cast<std::size_t>(image.cols * channels));
         for (int y = 0; y < image.rows; ++y) {
-            const std::uint8_t* row = image.ptr<std::uint8_t>(y);
-            void* row_to_write = const_cast<std::uint8_t*>(row);
-            if (channels == 3) {
-                for (int x = 0; x < image.cols; ++x) {
-                    rgb_row[static_cast<std::size_t>(x * 3 + 0)] =
-                        row[x * 3 + 2];
-                    rgb_row[static_cast<std::size_t>(x * 3 + 1)] =
-                        row[x * 3 + 1];
-                    rgb_row[static_cast<std::size_t>(x * 3 + 2)] =
-                        row[x * 3 + 0];
-                }
-                row_to_write = rgb_row.data();
-            }
+            const float* row = image.ptr<float>(y);
+            void* row_to_write = const_cast<float*>(row);
 
             if (TIFFWriteScanline(tiff, row_to_write,
                                   static_cast<std::uint32_t>(y), 0) < 0) {
@@ -3143,18 +3148,11 @@ int main(int argc, char** argv) {
             timings.push_back(finish_timing("binary_contour_loops", timing));
         }
 
-        cv::Mat dt_u16;
-        {
-            const TimingMark timing = start_timing();
-            dt_u16 = normalized_dt_u16(dt);
-            timings.push_back(finish_timing("dt_normalize", timing));
-        }
-
         const std::string stem = args.input.stem().string();
         {
             const TimingMark timing = start_timing();
             write_image(workdir / (stem + "_binary.tif"), binary);
-            write_image(workdir / (stem + "_dt.tif"), dt_u16);
+            write_image(workdir / (stem + "_dt.tif"), dt);
             write_image(workdir / (stem + "_component_voronoi_labels.tif"),
                         component_voronoi_result.labels_u16);
             write_image(workdir / (stem + "_component_voronoi_boundaries.tif"),
@@ -3205,8 +3203,6 @@ int main(int argc, char** argv) {
             const TimingMark timing = start_timing();
             write_image(workdir / (stem + "_dense_flow.tif"),
                         dense_flow_result.dense_flow);
-            write_image(workdir / (stem + "_dense_flow_u16.tif"),
-                        dense_flow_result.dense_flow_u16);
             write_image(workdir / (stem + "_graph_edge_flow.tif"),
                         dense_flow_result.graph_edge_flow);
             write_image(workdir / (stem + "_graph_edge_flow_gray_bg.tif"),
@@ -3221,34 +3217,36 @@ int main(int argc, char** argv) {
         }
 
         std::vector<NamedLayer> layered_tiff = {
-            {"binary_threshold", to_bgr_layer(binary)},
-            {"dt", to_bgr_layer(dt_u16)},
-            {"loops", to_bgr_layer(component_voronoi_result.boundary_skeleton_pruned)},
+            {"binary_threshold", to_float_layer(binary)},
+            {"dt", to_float_layer(dt)},
+            {"loops",
+             to_float_layer(component_voronoi_result.boundary_skeleton_pruned)},
             {"loops_connected",
-             to_bgr_layer(component_voronoi_result.cell_loops_connected)},
-            {"graph_random_edges", graph_random_colors},
-            {"graph_edges_random", graph_edges_random_colors},
-            {"graph_nodes", to_bgr_layer(graph_nodes)},
-            {"graph_capacity", to_bgr_layer(graph_capacity)},
-            {"graph_capacity_gray_bg", to_bgr_layer(graph_capacity_gray_bg)},
+             to_float_layer(component_voronoi_result.cell_loops_connected)},
+            {"graph_random_edges", to_float_layer(graph_random_colors)},
+            {"graph_edges_random", to_float_layer(graph_edges_random_colors)},
+            {"graph_nodes", to_float_layer(graph_nodes)},
+            {"graph_capacity", to_float_layer(graph_capacity)},
+            {"graph_capacity_gray_bg", to_float_layer(graph_capacity_gray_bg)},
         };
         if (has_dense_flow) {
             layered_tiff.push_back(
-                {"dense_flow", to_bgr_layer(dense_flow_result.dense_flow_u16)});
+                {"dense_flow", to_float_layer(dense_flow_result.dense_flow)});
             layered_tiff.push_back(
                 {"graph_edge_flow",
-                 to_bgr_layer(dense_flow_result.graph_edge_flow)});
+                 to_float_layer(dense_flow_result.graph_edge_flow)});
             layered_tiff.push_back(
                 {"graph_edge_flow_gray_bg",
-                 to_bgr_layer(dense_flow_result.graph_edge_flow_gray_bg)});
+                 to_float_layer(dense_flow_result.graph_edge_flow_gray_bg)});
             layered_tiff.push_back(
-                {"edge_flow_px", to_bgr_layer(dense_flow_result.edge_flow_px)});
+                {"edge_flow_px",
+                 to_float_layer(dense_flow_result.edge_flow_px)});
             layered_tiff.push_back(
                 {"edge_flow_px_gray_bg",
-                 to_bgr_layer(dense_flow_result.edge_flow_px_gray_bg)});
+                 to_float_layer(dense_flow_result.edge_flow_px_gray_bg)});
             layered_tiff.push_back(
                 {"graph_source_edges",
-                 to_bgr_layer(dense_flow_result.graph_source_edges)});
+                 to_float_layer(dense_flow_result.graph_source_edges)});
         }
         {
             const TimingMark timing = start_timing();
@@ -3369,8 +3367,6 @@ int main(int argc, char** argv) {
                   << "  " << (workdir / (stem + "_layers.tif")) << "\n";
         if (has_dense_flow) {
             std::cout << "  " << (workdir / (stem + "_dense_flow.tif"))
-                      << "\n"
-                      << "  " << (workdir / (stem + "_dense_flow_u16.tif"))
                       << "\n"
                       << "  " << (workdir / (stem + "_graph_edge_flow.tif"))
                       << "\n"
