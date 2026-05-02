@@ -35,6 +35,7 @@
 #include <cstring>
 #include <filesystem>
 #include <limits>
+#include <mutex>
 #include <sstream>
 #include <unordered_map>
 
@@ -263,7 +264,7 @@ float scaleForCoarsestPlaneRenderLevel(int numLevels)
     return std::clamp(0.75f / (dsScale * kResolutionLodZoomBias), kMinScale, kMaxScale);
 }
 
-std::unique_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::shared_ptr<Volume>& volume,
+std::shared_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::shared_ptr<Volume>& volume,
                                                                 std::size_t decodedByteCapacity)
 {
     if (!volume)
@@ -293,8 +294,45 @@ std::unique_ptr<vc::render::ChunkCache> makeChunkCacheForVolume(const std::share
         options.persistentCachePath = cacheRoot / stableHexHash(normalizedVolumeCacheIdentity(volume));
     }
 
-    return std::make_unique<vc::render::ChunkCache>(
+    return std::make_shared<vc::render::ChunkCache>(
         makeLevelInfo(opened), opened.fetchers, opened.fillValue, opened.dtype, options);
+}
+
+std::shared_ptr<vc::render::ChunkCache> sharedChunkCacheForVolume(const std::shared_ptr<Volume>& volume,
+                                                                  std::size_t decodedByteCapacity)
+{
+    if (!volume)
+        return nullptr;
+
+    const std::size_t capacity = decodedByteCapacity > 0
+        ? decodedByteCapacity
+        : streamingCacheCapacityBytes(nullptr);
+    const std::string key = normalizedVolumeCacheIdentity(volume) +
+                            "|decoded=" + std::to_string(capacity);
+
+    static std::mutex cacheMutex;
+    static std::unordered_map<std::string, std::weak_ptr<vc::render::ChunkCache>> caches;
+
+    {
+        std::lock_guard<std::mutex> lock(cacheMutex);
+        auto it = caches.find(key);
+        if (it != caches.end()) {
+            if (auto cache = it->second.lock())
+                return cache;
+            caches.erase(it);
+        }
+    }
+
+    auto cache = makeChunkCacheForVolume(volume, capacity);
+    if (!cache)
+        return nullptr;
+
+    std::lock_guard<std::mutex> lock(cacheMutex);
+    auto& slot = caches[key];
+    if (auto existing = slot.lock())
+        return existing;
+    slot = cache;
+    return cache;
 }
 
 } // namespace
@@ -437,7 +475,7 @@ void CChunkedVolumeViewer::rebuildChunkArray()
         return;
 
     try {
-        _chunkArray = makeChunkCacheForVolume(_volume, streamingCacheCapacityBytes(_state));
+        _chunkArray = sharedChunkCacheForVolume(_volume, streamingCacheCapacityBytes(_state));
     } catch (const std::exception& e) {
         if (_statsBar)
             _statsBar->setItems({QString("Streaming unavailable: %1").arg(e.what())});
@@ -1516,7 +1554,7 @@ void CChunkedVolumeViewer::setOverlayVolume(std::shared_ptr<Volume> volume)
     _overlayChunkArray.reset();
     if (_overlayVolume) {
         try {
-            _overlayChunkArray = makeChunkCacheForVolume(_overlayVolume, streamingCacheCapacityBytes(_state));
+            _overlayChunkArray = sharedChunkCacheForVolume(_overlayVolume, streamingCacheCapacityBytes(_state));
         } catch (const std::exception&) {
             _overlayChunkArray.reset();
         }
