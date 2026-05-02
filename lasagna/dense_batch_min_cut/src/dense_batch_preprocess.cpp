@@ -1999,6 +1999,7 @@ struct DenseFlowResult {
     cv::Mat voronoi_tree_flow;
     cv::Mat voronoi_tree_flow_gray_bg;
     cv::Mat tree_dense_nn_flow;
+    cv::Mat dense_backtrack_nn_flow;
     cv::Mat tree_dense_flow;
     cv::Mat tree_path_debug;
     cv::Mat tree_flow_attn;
@@ -2204,6 +2205,296 @@ std::vector<cv::Point> order_edge_pixels(const GraphEdge& edge,
         }
     }
     return ordered;
+}
+
+struct DenseBacktrackResult {
+    cv::Mat nn_flow;
+    cv::Mat flow;
+    cv::Mat debug_paths;
+    int seeded_pixels = 0;
+    int reached_pixels = 0;
+    int unreached_white_pixels = 0;
+    std::vector<StageTiming> timings;
+};
+
+DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
+                                                  const cv::Mat& dt,
+                                                  const cv::Mat& graph_pixel_flow) {
+    CV_Assert(white_domain.type() == CV_8U);
+    CV_Assert(dt.type() == CV_32F);
+    CV_Assert(graph_pixel_flow.type() == CV_32F);
+
+    DenseBacktrackResult result;
+    result.nn_flow = cv::Mat(white_domain.size(), CV_32F, cv::Scalar(0));
+    result.flow = cv::Mat(white_domain.size(), CV_32F, cv::Scalar(0));
+    result.debug_paths =
+        cv::Mat(white_domain.size(), CV_32FC3, cv::Scalar(0, 0, 0));
+
+    constexpr float kFlowEpsilon = 1.0e-4f;
+    constexpr float kBacktrackRadius = 300.0f;
+    const int rows = white_domain.rows;
+    const int cols = white_domain.cols;
+    const int pixel_count = rows * cols;
+    const auto linear_index = [cols](const cv::Point pixel) {
+        return pixel.y * cols + pixel.x;
+    };
+    const auto point_from_index = [cols](int index) {
+        return cv::Point(index % cols, index / cols);
+    };
+    const auto step_distance = [](const cv::Point a, const cv::Point b) {
+        const int dx = std::abs(a.x - b.x);
+        const int dy = std::abs(a.y - b.y);
+        return dx + dy == 2 ? static_cast<float>(std::sqrt(2.0f)) : 1.0f;
+    };
+    const auto in_white_domain = [&](const cv::Point pixel) {
+        return pixel.x >= 0 && pixel.x < cols && pixel.y >= 0 &&
+               pixel.y < rows &&
+               white_domain.at<std::uint8_t>(pixel.y, pixel.x) != 0;
+    };
+
+    std::vector<float> routed_flow(static_cast<std::size_t>(pixel_count), 0.0f);
+    std::vector<float> routed_distance(
+        static_cast<std::size_t>(pixel_count),
+        std::numeric_limits<float>::infinity());
+    std::vector<int> next_pixel(static_cast<std::size_t>(pixel_count), -1);
+    std::vector<float> next_distance(static_cast<std::size_t>(pixel_count),
+                                     0.0f);
+
+    struct QueueItem {
+        float flow = 0.0f;
+        float distance = 0.0f;
+        int index = -1;
+        bool operator<(const QueueItem& other) const {
+            if (flow != other.flow) {
+                return flow < other.flow;
+            }
+            return distance > other.distance;
+        }
+    };
+    std::priority_queue<QueueItem> queue;
+
+    {
+        const TimingMark timing = start_timing();
+        for (int y = 0; y < rows; ++y) {
+            for (int x = 0; x < cols; ++x) {
+                if (white_domain.at<std::uint8_t>(y, x) == 0) {
+                    continue;
+                }
+                const float seed = graph_pixel_flow.at<float>(y, x);
+                if (seed <= 0.0f) {
+                    continue;
+                }
+                const float flow =
+                    std::min(seed, capacity_from_dt(dt.at<float>(y, x)));
+                if (flow <= 0.0f) {
+                    continue;
+                }
+                const int index = y * cols + x;
+                routed_flow[index] = flow;
+                routed_distance[index] = 0.0f;
+                next_pixel[index] = -1;
+                queue.push({flow, 0.0f, index});
+                ++result.seeded_pixels;
+            }
+        }
+        result.timings.push_back(finish_timing("dense_backtrack_seed", timing));
+    }
+
+    {
+        const TimingMark timing = start_timing();
+        const std::array<cv::Point, 8> kDirs = {
+            cv::Point(-1, -1), cv::Point(0, -1), cv::Point(1, -1),
+            cv::Point(-1, 0),                    cv::Point(1, 0),
+            cv::Point(-1, 1),  cv::Point(0, 1),  cv::Point(1, 1)};
+        while (!queue.empty()) {
+            const QueueItem item = queue.top();
+            queue.pop();
+            if (item.flow + kFlowEpsilon < routed_flow[item.index] ||
+                (std::abs(item.flow - routed_flow[item.index]) <=
+                     kFlowEpsilon &&
+                 item.distance >
+                     routed_distance[item.index] + kFlowEpsilon)) {
+                continue;
+            }
+            const cv::Point pixel = point_from_index(item.index);
+            for (const cv::Point dir : kDirs) {
+                const cv::Point next = pixel + dir;
+                if (!in_white_domain(next)) {
+                    continue;
+                }
+                const int next_index = linear_index(next);
+                const float candidate =
+                    std::min(item.flow,
+                             capacity_from_dt(dt.at<float>(next.y, next.x)));
+                const float candidate_distance =
+                    item.distance + step_distance(next, pixel);
+                const bool better_flow =
+                    candidate > routed_flow[next_index] + kFlowEpsilon;
+                const bool same_flow_shorter =
+                    std::abs(candidate - routed_flow[next_index]) <=
+                        kFlowEpsilon &&
+                    candidate_distance + kFlowEpsilon <
+                        routed_distance[next_index];
+                if (!better_flow && !same_flow_shorter) {
+                    continue;
+                }
+                routed_flow[next_index] = candidate;
+                routed_distance[next_index] = candidate_distance;
+                next_pixel[next_index] = item.index;
+                next_distance[next_index] = step_distance(next, pixel);
+                queue.push({candidate, candidate_distance, next_index});
+            }
+        }
+        result.timings.push_back(
+            finish_timing("dense_backtrack_flood", timing));
+    }
+
+    int jump_levels = 1;
+    while ((1 << jump_levels) <= static_cast<int>(kBacktrackRadius) + 2) {
+        ++jump_levels;
+    }
+    std::vector<std::vector<int>> jump_to(
+        jump_levels, std::vector<int>(static_cast<std::size_t>(pixel_count), -1));
+    std::vector<std::vector<float>> jump_dist(
+        jump_levels, std::vector<float>(static_cast<std::size_t>(pixel_count),
+                                        0.0f));
+    {
+        const TimingMark timing = start_timing();
+        for (int index = 0; index < pixel_count; ++index) {
+            jump_to[0][index] = next_pixel[index];
+            jump_dist[0][index] = next_distance[index];
+        }
+        for (int level = 1; level < jump_levels; ++level) {
+            for (int index = 0; index < pixel_count; ++index) {
+                const int mid = jump_to[level - 1][index];
+                if (mid < 0) {
+                    continue;
+                }
+                const int end = jump_to[level - 1][mid];
+                if (end < 0) {
+                    continue;
+                }
+                jump_to[level][index] = end;
+                jump_dist[level][index] =
+                    jump_dist[level - 1][index] + jump_dist[level - 1][mid];
+            }
+        }
+        result.timings.push_back(finish_timing("dense_backtrack_jump", timing));
+    }
+
+    {
+        const TimingMark timing = start_timing();
+        cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+            for (int y = range.start; y < range.end; ++y) {
+                for (int x = 0; x < cols; ++x) {
+                    if (white_domain.at<std::uint8_t>(y, x) == 0) {
+                        continue;
+                    }
+                    int current_index = y * cols + x;
+                    if (routed_flow[current_index] <= 0.0f) {
+                        continue;
+                    }
+                    result.nn_flow.at<float>(y, x) =
+                        routed_flow[current_index];
+                    float remaining = kBacktrackRadius;
+                    float endpoint_flow = routed_flow[current_index];
+                    for (int level = jump_levels - 1; level >= 0; --level) {
+                        if (current_index < 0 ||
+                            jump_to[level][current_index] < 0 ||
+                            jump_dist[level][current_index] <= 0.0f ||
+                            jump_dist[level][current_index] >
+                                remaining + kFlowEpsilon) {
+                            continue;
+                        }
+                        remaining -= jump_dist[level][current_index];
+                        current_index = jump_to[level][current_index];
+                        endpoint_flow = routed_flow[current_index];
+                    }
+                    if (remaining > kFlowEpsilon && current_index >= 0 &&
+                        next_pixel[current_index] >= 0) {
+                        const int next_index = next_pixel[current_index];
+                        const float step = next_distance[current_index];
+                        const float segment = std::min(step, remaining);
+                        const float t = step > 0.0f ? segment / step : 0.0f;
+                        endpoint_flow =
+                            routed_flow[current_index] * (1.0f - t) +
+                            routed_flow[next_index] * t;
+                    }
+                    result.flow.at<float>(y, x) = endpoint_flow;
+                }
+            }
+        });
+        result.timings.push_back(
+            finish_timing("dense_backtrack_resolve", timing));
+    }
+
+    {
+        const TimingMark timing = start_timing();
+        const std::array<cv::Point, 2> kDebugPoints = {
+            cv::Point(849, 816), cv::Point(906, 869)};
+        const std::array<cv::Scalar, 2> kColors = {
+            cv::Scalar(255.0, 0.0, 0.0), cv::Scalar(0.0, 255.0, 0.0)};
+        for (std::size_t point_index = 0; point_index < kDebugPoints.size();
+             ++point_index) {
+            const cv::Point query = kDebugPoints[point_index];
+            std::cout << "Dense backtrack debug point " << point_index
+                      << " query=(" << query.x << "," << query.y << ")\n";
+            if (!in_white_domain(query)) {
+                std::cout << "  skipped: outside image or not in white domain\n";
+                continue;
+            }
+            int current_index = linear_index(query);
+            std::cout << "  start_flow=" << routed_flow[current_index]
+                      << " next=" << next_pixel[current_index] << "\n";
+            float remaining = kBacktrackRadius;
+            int steps = 0;
+            while (remaining > kFlowEpsilon && current_index >= 0 &&
+                   next_pixel[current_index] >= 0) {
+                const int next_index = next_pixel[current_index];
+                const cv::Point current = point_from_index(current_index);
+                const cv::Point next = point_from_index(next_index);
+                const float step = next_distance[current_index];
+                if (steps < 40) {
+                    std::cout << "    step " << steps << ": current=("
+                              << current.x << "," << current.y
+                              << ") flow=" << routed_flow[current_index]
+                              << " next=(" << next.x << "," << next.y
+                              << ") next_flow=" << routed_flow[next_index]
+                              << " step_len=" << step
+                              << " remaining=" << remaining << "\n";
+                }
+                cv::line(result.debug_paths, current, next, kColors[point_index],
+                         1, cv::LINE_8);
+                if (step >= remaining - kFlowEpsilon) {
+                    break;
+                }
+                remaining -= step;
+                current_index = next_index;
+                ++steps;
+            }
+            std::cout << "  finished: steps=" << steps
+                      << " remaining=" << remaining
+                      << " final_index=" << current_index << "\n";
+        }
+        result.timings.push_back(
+            finish_timing("dense_backtrack_debug_render", timing));
+    }
+
+    for (int y = 0; y < rows; ++y) {
+        for (int x = 0; x < cols; ++x) {
+            if (white_domain.at<std::uint8_t>(y, x) == 0) {
+                continue;
+            }
+            const int index = y * cols + x;
+            if (routed_flow[index] > 0.0f) {
+                ++result.reached_pixels;
+            } else {
+                ++result.unreached_white_pixels;
+            }
+        }
+    }
+
+    return result;
 }
 
 DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
@@ -2690,6 +2981,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     }
 
     cv::Mat tree_dense_nn_flow(white_domain.size(), CV_32F, cv::Scalar(0));
+    cv::Mat dense_backtrack_nn_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     cv::Mat tree_dense_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     cv::Mat tree_path_debug(white_domain.size(), CV_32FC3,
                             cv::Scalar(0, 0, 0));
@@ -3098,6 +3390,23 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         }
     }
 
+    {
+        const DenseBacktrackResult dense_backtrack =
+            compute_dense_backtrack_flow(white_domain, dt, graph_pixel_flow);
+        dense_backtrack_nn_flow = dense_backtrack.nn_flow;
+        tree_dense_flow = dense_backtrack.flow;
+        tree_path_debug = dense_backtrack.debug_paths;
+        timings.insert(timings.end(), dense_backtrack.timings.begin(),
+                       dense_backtrack.timings.end());
+        std::cout << "Dense backtrack:\n"
+                  << "  seeded_pixels: " << dense_backtrack.seeded_pixels
+                  << "\n"
+                  << "  reached_pixels: " << dense_backtrack.reached_pixels
+                  << "\n"
+                  << "  unreached_white_pixels: "
+                  << dense_backtrack.unreached_white_pixels << "\n";
+    }
+
     cv::Mat dense_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     {
         const TimingMark timing = start_timing();
@@ -3412,6 +3721,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             voronoi_tree_flow,
             voronoi_tree_flow_gray_bg,
             tree_dense_nn_flow,
+            dense_backtrack_nn_flow,
             tree_dense_flow,
             tree_path_debug,
             tree_flow_attn,
@@ -4010,6 +4320,8 @@ int main(int argc, char** argv) {
                         dense_flow_result.voronoi_tree_flow_gray_bg);
             write_image(workdir / (stem + "_tree_dense_nn_flow.tif"),
                         dense_flow_result.tree_dense_nn_flow);
+            write_image(workdir / (stem + "_dense_backtrack_nn_flow.tif"),
+                        dense_flow_result.dense_backtrack_nn_flow);
             write_image(workdir / (stem + "_tree_dense_flow.tif"),
                         dense_flow_result.tree_dense_flow);
             write_image(workdir / (stem + "_tree_paths_debug.tif"),
@@ -4056,6 +4368,9 @@ int main(int argc, char** argv) {
             layered_tiff.push_back(
                 {"tree_dense_nn_flow",
                  to_float_layer(dense_flow_result.tree_dense_nn_flow)});
+            layered_tiff.push_back(
+                {"dense_backtrack_nn_flow",
+                 to_float_layer(dense_flow_result.dense_backtrack_nn_flow)});
             layered_tiff.push_back(
                 {"tree_dense_flow",
                  to_float_layer(dense_flow_result.tree_dense_flow)});
@@ -4209,6 +4524,9 @@ int main(int argc, char** argv) {
                       << "\n"
                       << "  "
                       << (workdir / (stem + "_tree_dense_nn_flow.tif"))
+                      << "\n"
+                      << "  "
+                      << (workdir / (stem + "_dense_backtrack_nn_flow.tif"))
                       << "\n"
                       << "  " << (workdir / (stem + "_tree_dense_flow.tif"))
                       << "\n"
