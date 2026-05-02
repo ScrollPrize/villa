@@ -1,4 +1,8 @@
 function(vc_add_test name)
+    if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${name}.cpp")
+        message(STATUS "Skipping ${name} (source file not found)")
+        return()
+    endif()
     add_executable(${name} ${ARGN})
     target_link_libraries(${name} PRIVATE vc_core)
     target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
