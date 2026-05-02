@@ -20,7 +20,6 @@ add_library(vc_core
         src/Tiff.cpp
         src/Zarr.cpp
         src/VcDataset.cpp
-        src/NetworkFilesystem.cpp
         src/LoadJson.cpp
         src/RemoteUrl.cpp
         src/HttpFetch.cpp

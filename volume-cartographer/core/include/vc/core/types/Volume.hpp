@@ -10,7 +10,6 @@
 
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/types/SampleParams.hpp"
-#include "vc/core/util/NetworkFilesystem.hpp"
 #include "vc/core/util/RemoteAuth.hpp"
 
 // Forward declarations
@@ -105,9 +104,6 @@ protected:
     int ioThreads_ = 0;  // 0 = use default
 
     void loadMetadata();
-
-    // Filesystem mount info (detected once at construction)
-    vc::NetworkMountInfo mountInfo_;
 
     // Remote volume state
     bool isRemote_ = false;

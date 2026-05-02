@@ -17,7 +17,6 @@
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
-#include "vc/core/util/NetworkFilesystem.hpp"
 #include "vc/core/util/PostProcess.hpp"
 #include "vc/core/types/VcDataset.hpp"
 #include "utils/hash.hpp"
@@ -82,7 +81,6 @@ Volume::Volume(std::filesystem::path path) : path_(std::move(path))
     _slices = metadata_["slices"].get_int();
 
     zarrOpen();
-    mountInfo_ = vc::detectNetworkMount(path_);
 }
 
 Volume::Volume(std::filesystem::path path, RemoteConstructTag) : path_(std::move(path)) {}

@@ -113,7 +113,6 @@
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/Slicing.hpp"
 #include "vc/core/util/Render.hpp"
-#include "vc/core/util/NetworkFilesystem.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 #include <utils/zarr.hpp>
 
@@ -4714,26 +4713,6 @@ void CWindow::OpenVolume(const QString& path)
     // Open volume package
     if (!InitializeVolumePkg(aVpkgPath.toStdString() + "/")) {
         return;
-    }
-
-    // Detect network-mounted volpkg and inform user about auto-caching
-    {
-        namespace fs = std::filesystem;
-        auto mountInfo = vc::detectNetworkMount(fs::path(aVpkgPath.toStdString()));
-        if (mountInfo.type == vc::FilesystemType::NetworkMount) {
-            auto label = mountInfo.label;
-            if (!mountInfo.cacheDir.empty()) {
-                statusBar()->showMessage(
-                    tr("Detected %1 mount (use_cache active) \u2014 using s3fs disk cache")
-                        .arg(QString::fromStdString(label)), 8000);
-                Logger()->info("Detected {} mount with use_cache={}; using s3fs disk cache",
-                               label, mountInfo.cacheDir);
-            } else {
-                statusBar()->showMessage(
-                    tr("Detected %1 mount").arg(QString::fromStdString(label)), 8000);
-                Logger()->info("Detected network filesystem ({})", label);
-            }
-        }
     }
 
     // Check version number
