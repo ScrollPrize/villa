@@ -2531,10 +2531,6 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
     {
         const TimingMark timing = start_timing();
         constexpr int kGridStep = 50;
-        constexpr float kDpBucket = 10.0f;
-        constexpr int kDpBuckets =
-            static_cast<int>(kBacktrackRadius / kDpBucket) + 1;
-        constexpr float kMinWeightDelta = 0.05f;
 
         struct CarrierNode {
             cv::Point pixel;
@@ -2729,55 +2725,84 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
             }
         }
 
-        std::vector<float> carrier_dp(
-            carriers.size() * static_cast<std::size_t>(kDpBuckets), 0.0f);
-        const auto dp_at = [&](const int node, const int bucket) -> float& {
-            return carrier_dp[static_cast<std::size_t>(node) * kDpBuckets +
-                              bucket];
-        };
-        for (int node = 0; node < static_cast<int>(carriers.size()); ++node) {
-            dp_at(node, 0) = carriers[node].flow;
-        }
-        for (int bucket = 1; bucket < kDpBuckets; ++bucket) {
-            const float budget = bucket * kDpBucket;
-            for (int node = 0; node < static_cast<int>(carriers.size());
-                 ++node) {
-                double weighted_sum = 0.0;
-                double weight_sum = 0.0;
-                for (const CarrierNeighbor neighbor : carrier_edges[node]) {
-                    const float next_flow = carriers[neighbor.node].flow;
-                    const float delta = next_flow - carriers[node].flow;
-                    if (delta <= kFlowEpsilon) {
-                        continue;
-                    }
-                    float value = next_flow;
-                    if (neighbor.distance >= budget - kFlowEpsilon) {
-                        const float t =
-                            neighbor.distance > 0.0f
-                                ? std::clamp(budget / neighbor.distance, 0.0f,
-                                             1.0f)
-                                : 1.0f;
-                        value = carriers[node].flow * (1.0f - t) +
-                                next_flow * t;
-                    } else {
-                        const int next_bucket = std::clamp(
-                            static_cast<int>(
-                                std::floor((budget - neighbor.distance) /
-                                           kDpBucket)),
-                            0, bucket - 1);
-                        value = dp_at(neighbor.node, next_bucket);
-                    }
-                    const float weight =
-                        std::max(kMinWeightDelta, delta) *
-                        std::max(kMinWeightDelta, delta) /
-                        std::max(1.0f, neighbor.distance);
-                    weighted_sum += value * weight;
-                    weight_sum += weight;
+        std::vector<float> carrier_route_flow(carriers.size(), 0.0f);
+        std::vector<float> carrier_route_distance(
+            carriers.size(), std::numeric_limits<float>::infinity());
+        std::vector<int> carrier_route_source(carriers.size(), -1);
+
+        struct CarrierRouteItem {
+            float flow = 0.0f;
+            float distance = 0.0f;
+            int node = -1;
+            int source = -1;
+            bool operator<(const CarrierRouteItem& other) const {
+                if (flow != other.flow) {
+                    return flow < other.flow;
                 }
-                dp_at(node, bucket) =
-                    weight_sum > 0.0
-                        ? static_cast<float>(weighted_sum / weight_sum)
-                        : carriers[node].flow;
+                if (distance != other.distance) {
+                    return distance > other.distance;
+                }
+                if (source != other.source) {
+                    return source > other.source;
+                }
+                return node > other.node;
+            }
+        };
+
+        const auto better_carrier_route = [&](const float flow,
+                                              const float distance,
+                                              const int source,
+                                              const int node) {
+            if (flow > carrier_route_flow[node] + kFlowEpsilon) {
+                return true;
+            }
+            if (std::abs(flow - carrier_route_flow[node]) > kFlowEpsilon) {
+                return false;
+            }
+            if (distance + kFlowEpsilon < carrier_route_distance[node]) {
+                return true;
+            }
+            if (std::abs(distance - carrier_route_distance[node]) >
+                kFlowEpsilon) {
+                return false;
+            }
+            return carrier_route_source[node] < 0 ||
+                   source < carrier_route_source[node];
+        };
+
+        std::priority_queue<CarrierRouteItem> carrier_queue;
+        for (int node = 0; node < static_cast<int>(carriers.size()); ++node) {
+            carrier_route_flow[node] = carriers[node].flow;
+            carrier_route_distance[node] = 0.0f;
+            carrier_route_source[node] = node;
+            carrier_queue.push({carriers[node].flow, 0.0f, node, node});
+        }
+
+        while (!carrier_queue.empty()) {
+            const CarrierRouteItem item = carrier_queue.top();
+            carrier_queue.pop();
+            if (std::abs(item.flow - carrier_route_flow[item.node]) >
+                    kFlowEpsilon ||
+                item.distance >
+                    carrier_route_distance[item.node] + kFlowEpsilon ||
+                item.source != carrier_route_source[item.node]) {
+                continue;
+            }
+            for (const CarrierNeighbor neighbor : carrier_edges[item.node]) {
+                const float next_distance =
+                    item.distance + neighbor.distance;
+                if (next_distance > kBacktrackRadius + kFlowEpsilon) {
+                    continue;
+                }
+                if (!better_carrier_route(item.flow, next_distance,
+                                          item.source, neighbor.node)) {
+                    continue;
+                }
+                carrier_route_flow[neighbor.node] = item.flow;
+                carrier_route_distance[neighbor.node] = next_distance;
+                carrier_route_source[neighbor.node] = item.source;
+                carrier_queue.push(
+                    {item.flow, next_distance, neighbor.node, item.source});
             }
         }
 
@@ -2821,7 +2846,11 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                       << " distance=" << best_distance
                       << " is_grid=" << carrier.grid
                       << " flow=" << carrier.flow
-                      << " dp300=" << dp_at(best_node, kDpBuckets - 1)
+                      << " route300=" << carrier_route_flow[best_node]
+                      << " route_dist="
+                      << carrier_route_distance[best_node]
+                      << " route_source="
+                      << carrier_route_source[best_node]
                       << " degree=" << carrier_edges[best_node].size()
                       << "\n";
             std::vector<CarrierNeighbor> neighbors = carrier_edges[best_node];
@@ -2841,8 +2870,12 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                           << " is_grid=" << next.grid
                           << " dist=" << neighbor.distance
                           << " flow=" << next.flow
-                          << " dp300=" << dp_at(neighbor.node,
-                                                kDpBuckets - 1)
+                          << " route300="
+                          << carrier_route_flow[neighbor.node]
+                          << " route_dist="
+                          << carrier_route_distance[neighbor.node]
+                          << " route_source="
+                          << carrier_route_source[neighbor.node]
                           << " uphill="
                           << (next.flow > carrier.flow + kFlowEpsilon)
                           << "\n";
@@ -2908,7 +2941,7 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                         if (!line_in_white(pixel, carriers[node].pixel)) {
                             continue;
                         }
-                        weighted_sum += dp_at(node, kDpBuckets - 1) *
+                        weighted_sum += carrier_route_flow[node] *
                                         bilinear_weight;
                         weight_sum += bilinear_weight;
                     }
@@ -2924,13 +2957,30 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
         for (const std::vector<CarrierNeighbor>& edges : carrier_edges) {
             carrier_edges_count += static_cast<int>(edges.size());
         }
+        int improved_carriers = 0;
+        float min_route_distance = std::numeric_limits<float>::infinity();
+        float max_route_distance = 0.0f;
+        for (int node = 0; node < static_cast<int>(carriers.size()); ++node) {
+            if (carrier_route_source[node] >= 0 &&
+                carrier_route_source[node] != node) {
+                ++improved_carriers;
+                min_route_distance =
+                    std::min(min_route_distance, carrier_route_distance[node]);
+                max_route_distance =
+                    std::max(max_route_distance, carrier_route_distance[node]);
+            }
+        }
+        if (improved_carriers == 0) {
+            min_route_distance = 0.0f;
+        }
         std::cout << "Dense grid carrier backtrack:\n"
                   << "  grid_step: " << kGridStep << "\n"
                   << "  grid_carriers: " << grid_carriers << "\n"
                   << "  graph_carriers: " << graph_carriers << "\n"
                   << "  carrier_edges: " << (carrier_edges_count / 2) << "\n"
-                  << "  dp_bucket_px: " << kDpBucket << "\n"
-                  << "  dp_buckets: " << kDpBuckets << "\n";
+                  << "  improved_carriers: " << improved_carriers << "\n"
+                  << "  min_route_distance: " << min_route_distance << "\n"
+                  << "  max_route_distance: " << max_route_distance << "\n";
         result.timings.push_back(
             finish_timing("dense_backtrack_grid_carrier", timing));
     }
