@@ -45,8 +45,8 @@ class CChunkedVolumeViewer;
 
 #define MAX_RECENT_VOLPKG 10
 
-// Volpkg version required by this app
-static constexpr int VOLPKG_MIN_VERSION = 6;
+// Project JSON schema version required by this app.
+static constexpr int VOLPKG_MIN_VERSION = 1;
 
 
 //forward declaration to avoid circular inclusion as CommandLineToolRunner needs CWindow.hpp
