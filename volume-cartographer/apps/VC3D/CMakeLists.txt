@@ -34,6 +34,8 @@ set(srcs
     elements/VolumeSelector.hpp
     elements/RangeSlider.cpp
     elements/RangeSlider.hpp
+    elements/ViewerStatsBar.cpp
+    elements/ViewerStatsBar.hpp
     SettingsDialog.cpp
     SurfaceTreeWidget.hpp
     SurfaceTreeWidget.cpp

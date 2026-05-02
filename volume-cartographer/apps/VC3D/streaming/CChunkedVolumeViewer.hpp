@@ -30,11 +30,11 @@
 class CState;
 class QGraphicsItem;
 class QGraphicsScene;
-class QLabel;
 class QTimer;
 struct POI;
 class Surface;
 class ViewerManager;
+class ViewerStatsBar;
 class VCCollection;
 class Volume;
 
@@ -260,7 +260,7 @@ private:
     VCCollection* _pointCollection = nullptr;
     CVolumeViewerView* _view = nullptr;
     QGraphicsScene* _scene = nullptr;
-    QLabel* _lbl = nullptr;
+    ViewerStatsBar* _statsBar = nullptr;
     QTimer* _renderTimer = nullptr;
     QTimer* _settleRenderTimer = nullptr;
     QTimer* _resizeRenderTimer = nullptr;

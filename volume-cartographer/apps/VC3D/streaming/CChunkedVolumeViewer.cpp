@@ -1,6 +1,7 @@
 #include "streaming/CChunkedVolumeViewer.hpp"
 
 #include "CState.hpp"
+#include "elements/ViewerStatsBar.hpp"
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
 #include "vc/core/render/Colormaps.hpp"
@@ -20,7 +21,6 @@
 #include <QGraphicsItem>
 #include <QGraphicsPathItem>
 #include <QGraphicsScene>
-#include <QLabel>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPointer>
@@ -369,10 +369,8 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     layout->addWidget(_view);
     setLayout(layout);
 
-    _lbl = new QLabel(this);
-    _lbl->setStyleSheet("QLabel { color : #00FF00; background-color: rgba(0,0,0,128); padding: 2px 4px; }");
-    _lbl->setMinimumWidth(520);
-    _lbl->move(10, 5);
+    _statsBar = new ViewerStatsBar(this);
+    _statsBar->move(10, 5);
 }
 
 CChunkedVolumeViewer::~CChunkedVolumeViewer()
@@ -428,8 +426,8 @@ void CChunkedVolumeViewer::rebuildChunkArray()
     try {
         _chunkArray = makeChunkCacheForVolume(_volume, streamingCacheCapacityBytes(_state));
     } catch (const std::exception& e) {
-        if (_lbl)
-            _lbl->setText(QString("Streaming unavailable: %1").arg(e.what()));
+        if (_statsBar)
+            _statsBar->setItems({QString("Streaming unavailable: %1").arg(e.what())});
         return;
     }
 
@@ -2769,48 +2767,43 @@ const std::map<std::string, cv::Vec3b>& CChunkedVolumeViewer::surfaceOverlays() 
 
 void CChunkedVolumeViewer::updateStatusLabel()
 {
-    if (!_lbl)
+    if (!_statsBar)
         return;
-    QString suffix;
+
+    QStringList items;
+    items << QString("Streaming L%1").arg(_dsScaleIdx);
+    items << QString("scale %1").arg(_scale, 0, 'f', 2);
+    items << QString("%1x%2").arg(_framebuffer.width()).arg(_framebuffer.height());
+
     if ((_compositeSettings.enabled || _compositeSettings.planeEnabled) && streamingCompositeUnsupported()) {
-        suffix = QString("  composite unsupported: %1").arg(QString::fromStdString(_compositeSettings.params.method));
+        items << QString("composite unsupported: %1").arg(QString::fromStdString(_compositeSettings.params.method));
     } else if (_compositeSettings.enabled || _compositeSettings.planeEnabled) {
-        suffix = QString("  composite %1").arg(QString::fromStdString(_compositeSettings.params.method));
+        items << QString("composite %1").arg(QString::fromStdString(_compositeSettings.params.method));
     }
 
-    QString cacheInfo;
     if (_chunkArray) {
         const auto stats = _chunkArray->stats();
-        cacheInfo = QString("  RAM %1/%2  disk %3")
+        items << QString("RAM %1/%2")
             .arg(formatByteSize(stats.decodedBytes))
-            .arg(formatByteSize(stats.decodedByteCapacity))
-            .arg(formatByteSize(stats.persistentCacheBytes));
+            .arg(formatByteSize(stats.decodedByteCapacity));
+        items << QString("disk %1").arg(formatByteSize(stats.persistentCacheBytes));
         if (stats.remoteFetchesInFlight > 0) {
-            cacheInfo += QString("  downloading %1 @ %2")
+            items << QString("downloading %1 @ %2")
                 .arg(stats.remoteFetchesInFlight)
                 .arg(formatMegabytesPerSecond(stats.remoteDownloadBytesPerSecond));
         }
     }
 
-    QString viewInfo;
     auto surf = _surfWeak.lock();
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
-        viewInfo = QString("  %1").arg(planeCoordinateText(*plane));
+        items << planeCoordinateText(*plane);
     } else if (dynamic_cast<QuadSurface*>(surf.get())) {
-        viewInfo = QString("  normal offset %1").arg(_zOff, 0, 'f', 1);
+        items << QString("normal offset %1").arg(_zOff, 0, 'f', 1);
         if (_state) {
             if (auto* poi = _state->poi("focus"))
-                viewInfo += QString("  POI %1").arg(formatVec3(poi->p));
+                items << QString("POI %1").arg(formatVec3(poi->p));
         }
     }
 
-    _lbl->setText(QString("Streaming L%1  scale %2  %3x%4%5%6%7")
-        .arg(_dsScaleIdx)
-        .arg(_scale, 0, 'f', 2)
-        .arg(_framebuffer.width())
-        .arg(_framebuffer.height())
-        .arg(cacheInfo)
-        .arg(viewInfo)
-        .arg(suffix));
-    _lbl->adjustSize();
+    _statsBar->setItems(items);
 }

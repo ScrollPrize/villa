@@ -327,7 +327,8 @@ OpenedChunkedZarr openHttpZarrPyramid(
         try {
             addRemoteLevelFromKey(opened, store, key);
         } catch (const HttpStatusError& e) {
-            if (e.status() == 404)
+            if (e.status() == 404 ||
+                (e.status() == 403 && (!opened.fetchers.empty() || firstPhysicalLevel == 0)))
                 break;
             throw;
         } catch (const std::exception&) {
