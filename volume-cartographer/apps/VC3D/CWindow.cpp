@@ -1616,9 +1616,9 @@ void CWindow::refreshTransformsPanelState()
             _remoteTransformFetchStates[remoteTransformUrl] = RemoteTransformFetchState::Available;
         } else {
             ensureCurrentRemoteTransformJsonAsync();
-            auto it = _remoteTransformFetchStates.find(remoteTransformUrl);
-            if (it != _remoteTransformFetchStates.end()) {
-                remoteFetchState = it->second;
+            auto stateIt = _remoteTransformFetchStates.find(remoteTransformUrl);
+            if (stateIt != _remoteTransformFetchStates.end()) {
+                remoteFetchState = stateIt->second;
             }
         }
     }
