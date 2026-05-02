@@ -2,39 +2,31 @@
 #include <iostream>
 
 #include <functional>
-#include <mutex>
 
 #include "vc/core/util/HttpFetch.hpp"
 #include "WindowRangeWidget.hpp"
 #include "VCSettings.hpp"
 #include "Keybinds.hpp"
-#include <QKeySequence>
 #include <QHBoxLayout>
 #include <QGridLayout>
 #include <QCursor>
 #include <QKeyEvent>
 #include <QResizeEvent>
-#include <QWheelEvent>
 #include <QSettings>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QApplication>
 #include <QGuiApplication>
 #include <QScreen>
-#include <QStyleHints>
 #include <QDesktopServices>
-#include <QDialog>
 #include <QUrl>
 #include <QClipboard>
-#include <QDateTime>
 #include <QFileDialog>
-#include <QTextStream>
 #include <QFileInfo>
+#include <QPointF>
 #include <QDir>
-#include <QEventLoop>
 #include <QMessageBox>
 #include <QInputDialog>
-#include <QThread>
 #include <QtConcurrent/QtConcurrent>
 #include <QComboBox>
 #include <QFutureWatcher>
@@ -45,10 +37,7 @@
 #include <QDoubleSpinBox>
 #include <QSpinBox>
 #include <QSizePolicy>
-#include <QProcess>
 #include <QTemporaryDir>
-#include <QToolBar>
-#include <QFileInfo>
 #include <QTimer>
 #include <QSize>
 #include <QVector>
@@ -57,26 +46,17 @@
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include "utils/Json.hpp"
-#include <QGraphicsSimpleTextItem>
 #include <QPointer>
-#include <QPen>
 #include <QListView>
-#include <QFont>
-#include <QPainter>
 #include <algorithm>
-#include <atomic>
-#include <cmath>
 #include <cmath>
 #include "vc/core/types/Segmentation.hpp"
 #include <limits>
 #include <optional>
 #include <cctype>
-#include <algorithm>
 #include <utility>
 #include <filesystem>
-#include <fstream>
 #include <vector>
-#include <initializer_list>
 #include <opencv2/imgproc.hpp>
 #include <opencv2/imgcodecs.hpp>
 #include <QStringList>
@@ -1990,26 +1970,6 @@ bool CWindow::attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume
                                   needSurfaceLoad);
     UpdateView();
     return true;
-}
-
-void CWindow::setRemoteSurfaces(const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& surfaces)
-{
-    if (surfaces.empty()) return;
-
-    if (_surfacePanel) {
-        _surfacePanel->loadRemoteSurfaces(surfaces);
-    }
-
-    // Set the first surface as the active segmentation
-    if (_state) {
-        const auto& [firstId, firstSurf] = surfaces.front();
-        _state->setSurface("segmentation", firstSurf);
-        _state->setActiveSurface(firstId, std::dynamic_pointer_cast<QuadSurface>(firstSurf));
-        _state->emitSurfacesChanged();
-    }
-
-    emit _state->surfacesLoaded();
-    refreshTransformsPanelState();
 }
 
 void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
@@ -4686,20 +4646,6 @@ void CWindow::onSliceStepSizeChanged(int newSize)
     }
 }
 
-std::filesystem::path seg_path_name(const std::filesystem::path &path)
-{
-    std::string name;
-    bool store = false;
-    for(auto elm : path) {
-        if (store)
-            name += "/"+elm.string();
-        else if (elm == "paths")
-            store = true;
-    }
-    name.erase(0,1);
-    return name;
-}
-
 // Open volume package
 void CWindow::OpenVolume(const QString& path)
 {
@@ -4950,13 +4896,6 @@ auto CWindow::can_change_volume_() -> bool
         return true;
     }
     return false;
-}
-
-// Handle request to step impact range down
-void CWindow::onLocChanged(void)
-{
-    // std::cout << "loc changed!" << "\n";
-
 }
 
 void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers)

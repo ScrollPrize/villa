@@ -6,7 +6,6 @@
 #include <opencv2/core.hpp>
 #include <QComboBox>
 #include <QCheckBox>
-#include <QPointF>
 #include <QString>
 #include <memory>
 #include <optional>
@@ -46,7 +45,6 @@ class CChunkedVolumeViewer;
 
 // Volpkg version required by this app
 static constexpr int VOLPKG_MIN_VERSION = 6;
-static constexpr int VOLPKG_SLICE_MIN_INDEX = 0;
 
 
 //forward declaration to avoid circular inclusion as CommandLineToolRunner needs CWindow.hpp
@@ -58,8 +56,6 @@ class SegmentationGrower;
 class WindowRangeWidget;
 class QLabel;
 class QSpinBox;
-class QTemporaryFile;
-class QTemporaryDir;
 class QStandardItemModel;
 class FileWatcherService;
 class AxisAlignedSliceController;
@@ -73,14 +69,10 @@ class CWindow : public QMainWindow
     friend class MenuActionController;
 
 public:
-    enum SaveResponse : bool { Cancelled, Continue };
-
-
 signals:
 
 public slots:
     void onShowStatusMessage(QString text, int timeout);
-    void onLocChanged(void);
     void onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers);
     void onVisLasagnaObj(const std::string& segmentId);
     void onGrowSegmentationSurface(SegmentationGrowthMethod method,
@@ -129,7 +121,6 @@ private:
     void setVolume(std::shared_ptr<Volume> newvol);
     bool attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
                                       const QString& preferredVolumeId = QString());
-    void setRemoteSurfaces(const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& surfaces);
     void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
                                        bool reloadSurfaces = true);
     void updateNormalGridAvailability();
