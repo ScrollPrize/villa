@@ -3,7 +3,7 @@
 #include "SurfaceTreeWidget.hpp"
 #include "ViewerManager.hpp"
 #include "CState.hpp"
-#include "streaming/CChunkedVolumeViewer.hpp"
+#include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "elements/DropdownChecklistButton.hpp"
 #include "VCSettings.hpp"
 

@@ -1,7 +1,7 @@
 #include "SegmentationModule.hpp"
 
-#include "streaming/CChunkedVolumeViewer.hpp"
-#include "CVolumeViewerView.hpp"
+#include "volume_viewers/CChunkedVolumeViewer.hpp"
+#include "volume_viewers/CVolumeViewerView.hpp"
 #include "CState.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "SegmentationWidget.hpp"

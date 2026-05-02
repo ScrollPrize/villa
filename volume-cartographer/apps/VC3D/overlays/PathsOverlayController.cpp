@@ -1,6 +1,6 @@
 #include "PathsOverlayController.hpp"
 
-#include "../VolumeViewerBase.hpp"
+#include "../volume_viewers/VolumeViewerBase.hpp"
 
 #include "vc/core/util/Surface.hpp"
 

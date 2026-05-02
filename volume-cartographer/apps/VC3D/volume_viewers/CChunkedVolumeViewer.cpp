@@ -1,4 +1,4 @@
-#include "streaming/CChunkedVolumeViewer.hpp"
+#include "CChunkedVolumeViewer.hpp"
 
 #include "CState.hpp"
 #include "elements/ViewerStatsBar.hpp"

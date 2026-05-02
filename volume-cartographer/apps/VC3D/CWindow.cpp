@@ -59,11 +59,11 @@
 #include <opencv2/imgcodecs.hpp>
 #include <QStringList>
 
-#include "CVolumeViewerView.hpp"
+#include "volume_viewers/CVolumeViewerView.hpp"
 #include "VolumeViewerCmaps.hpp"
 #include "viewer_controls/ViewerControlsPanel.hpp"
 #include "viewer_controls/panels/ViewerTransformsPanel.hpp"
-#include "streaming/CChunkedVolumeViewer.hpp"
+#include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "vc/ui/UDataManipulateUtils.hpp"
 #include "SettingsDialog.hpp"
 #include "elements/VolumeSelector.hpp"

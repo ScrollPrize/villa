@@ -1,7 +1,7 @@
 #include "ViewerOverlayControllerBase.hpp"
 
-#include "../CVolumeViewerView.hpp"
-#include "../VolumeViewerBase.hpp"
+#include "../volume_viewers/CVolumeViewerView.hpp"
+#include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../ViewerManager.hpp"
 #include "../elements/COutlinedTextItem.hpp"
 

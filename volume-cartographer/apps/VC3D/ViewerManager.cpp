@@ -1,8 +1,8 @@
 #include "ViewerManager.hpp"
 
 #include "VCSettings.hpp"
-#include "VolumeViewerBase.hpp"
-#include "streaming/CChunkedVolumeViewer.hpp"
+#include "volume_viewers/VolumeViewerBase.hpp"
+#include "volume_viewers/CChunkedVolumeViewer.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
 #include "overlays/RawPointsOverlayController.hpp"

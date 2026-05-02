@@ -19,7 +19,7 @@ set(srcs
     SurfaceAreaCalculator.hpp
     SegmentationCommandHandler.cpp
     SegmentationCommandHandler.hpp
-    CVolumeViewerView.cpp
+    volume_viewers/CVolumeViewerView.cpp
     VolumeViewerCmaps.cpp
     VolumeViewerCmaps.hpp
     WindowRangeWidget.cpp
@@ -147,8 +147,8 @@ set(srcs
     CPointCollectionWidget.cpp
     elements/COutlinedTextItem.hpp
     elements/COutlinedTextItem.cpp
-    streaming/CChunkedVolumeViewer.cpp
-    streaming/CChunkedVolumeViewer.hpp
+    volume_viewers/CChunkedVolumeViewer.cpp
+    volume_viewers/CChunkedVolumeViewer.hpp
 )
 
 if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)

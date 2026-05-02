@@ -2,7 +2,7 @@
 
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
-#include "VolumeViewerBase.hpp"
+#include "volume_viewers/VolumeViewerBase.hpp"
 #include "elements/LabeledControlRow.hpp"
 
 #include <QDoubleSpinBox>

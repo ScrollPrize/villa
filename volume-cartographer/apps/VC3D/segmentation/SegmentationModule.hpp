@@ -20,7 +20,7 @@
 
 #include <opencv2/core.hpp>
 
-#include "../VolumeViewerBase.hpp"
+#include "../volume_viewers/VolumeViewerBase.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "tools/ManualAddTool.hpp"
 #include "growth/SegmentationGrowth.hpp"

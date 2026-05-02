@@ -1,9 +1,9 @@
 #include "TransformOverlayController.hpp"
 
 #include "../CState.hpp"
-#include "../CVolumeViewerView.hpp"
+#include "../volume_viewers/CVolumeViewerView.hpp"
 #include "../ViewerManager.hpp"
-#include "../VolumeViewerBase.hpp"
+#include "../volume_viewers/VolumeViewerBase.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"
 

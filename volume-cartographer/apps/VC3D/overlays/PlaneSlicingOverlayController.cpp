@@ -1,7 +1,7 @@
 #include "PlaneSlicingOverlayController.hpp"
 
-#include "../streaming/CChunkedVolumeViewer.hpp"
-#include "../VolumeViewerBase.hpp"
+#include "../volume_viewers/CChunkedVolumeViewer.hpp"
+#include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../CState.hpp"
 #include "vc/core/util/Surface.hpp"
 

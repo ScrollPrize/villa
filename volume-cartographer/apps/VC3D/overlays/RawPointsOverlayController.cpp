@@ -1,7 +1,7 @@
 #include "RawPointsOverlayController.hpp"
 
 #include "../CState.hpp"
-#include "../VolumeViewerBase.hpp"
+#include "../volume_viewers/VolumeViewerBase.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
