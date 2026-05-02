@@ -248,6 +248,7 @@ private:
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     int genericPreviewDownsampleFactor() const;
     bool streamingCompositeUnsupported() const;
+    std::optional<cv::Vec3f> cursorVolumePosition(const QPointF& scenePos) const;
     void updateCursorCrosshair(const QPointF& scenePos);
     void updateFocusMarker(POI* poi = nullptr);
     void clearIntersectionItems();
@@ -395,6 +396,7 @@ private:
     float _smoothedPanDy = 0.0f;
     QPointF _lastPanSceneF;
     QPointF _lastScenePos;
+    std::optional<cv::Vec3f> _lastCursorVolumePos;
 
     std::vector<ViewerOverlayControllerBase::PathPrimitive> _drawingPaths;
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;

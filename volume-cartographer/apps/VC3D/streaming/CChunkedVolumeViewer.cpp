@@ -201,9 +201,12 @@ QString formatVec3(const cv::Vec3f& v)
         .arg(v[2], 0, 'f', 1);
 }
 
-QString planeCoordinateText(PlaneSurface& plane)
+QString formatWholeVolumePosition(const cv::Vec3f& v)
 {
-    return QString("plane pos %1").arg(formatVec3(plane.origin()));
+    return QString("[%1, %2, %3]")
+        .arg(v[0], 0, 'f', 0)
+        .arg(v[1], 0, 'f', 0)
+        .arg(v[2], 0, 'f', 0);
 }
 
 QString formatByteSize(std::size_t bytes)
@@ -219,6 +222,12 @@ QString formatByteSize(std::size_t bytes)
     if (value >= kKiB)
         return QString("%1 KB").arg(value / kKiB, 0, 'f', 1);
     return QString("%1 B").arg(bytes);
+}
+
+QString formatGigabytes(std::size_t bytes)
+{
+    constexpr double kGiB = 1024.0 * 1024.0 * 1024.0;
+    return QString("%1").arg(static_cast<double>(bytes) / kGiB, 0, 'f', 1);
 }
 
 QString formatMegabytesPerSecond(double bytesPerSecond)
@@ -1825,21 +1834,11 @@ void CChunkedVolumeViewer::onResized()
 void CChunkedVolumeViewer::onCursorMove(QPointF scenePos)
 {
     _lastScenePos = scenePos;
+    _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
+    updateStatusLabel();
     if (_viewerManager) {
-        auto surf = _surfWeak.lock();
-        if (surf) {
-            cv::Vec3f p = sceneToVolume(scenePos);
-            if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
-                p += plane->normal({0, 0, 0}) * _zOff;
-            } else if (_zOff != 0.0f &&
-                       _zOffWorldDir != cv::Vec3f(0.0f, 0.0f, 0.0f)) {
-                p += _zOffWorldDir * _zOff;
-            }
-            _viewerManager->broadcastLinkedCursor(this, p);
-        } else {
-            _viewerManager->broadcastLinkedCursor(this, std::nullopt);
-        }
+        _viewerManager->broadcastLinkedCursor(this, _lastCursorVolumePos);
     }
     if (!_isPanning)
         return;
@@ -1895,7 +1894,9 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
 void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
     _lastScenePos = scenePos;
+    _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
+    updateStatusLabel();
     if (_bboxMode && _surfName == "segmentation" && button == Qt::LeftButton) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
         _bboxStart = QPointF(sp[0], sp[1]);
@@ -1910,7 +1911,9 @@ void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons button
 {
     Q_UNUSED(modifiers);
     _lastScenePos = scenePos;
+    _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
+    updateStatusLabel();
     if (_bboxMode && _activeBBoxSurfRect && (buttons & Qt::LeftButton)) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
         _activeBBoxSurfRect = QRectF(_bboxStart, QPointF(sp[0], sp[1])).normalized();
@@ -1923,7 +1926,9 @@ void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons button
 void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
     _lastScenePos = scenePos;
+    _lastCursorVolumePos = cursorVolumePosition(scenePos);
     updateCursorCrosshair(scenePos);
+    updateStatusLabel();
     if (_bboxMode && _surfName == "segmentation" && button == Qt::LeftButton &&
         _activeBBoxSurfRect) {
         const cv::Vec2f sp = sceneToSurface(scenePos);
@@ -2047,6 +2052,22 @@ void CChunkedVolumeViewer::updateCursorCrosshair(const QPointF& scenePos)
 
     _cursorCrosshair->setPos(scenePos);
     _cursorCrosshair->show();
+}
+
+std::optional<cv::Vec3f> CChunkedVolumeViewer::cursorVolumePosition(const QPointF& scenePos) const
+{
+    auto surf = _surfWeak.lock();
+    if (!surf)
+        return std::nullopt;
+
+    cv::Vec3f p = sceneToVolume(scenePos);
+    if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
+        p += plane->normal({0, 0, 0}) * _zOff;
+    } else if (_zOff != 0.0f &&
+               _zOffWorldDir != cv::Vec3f(0.0f, 0.0f, 0.0f)) {
+        p += _zOffWorldDir * _zOff;
+    }
+    return p;
 }
 
 void CChunkedVolumeViewer::setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>&)
@@ -2771,7 +2792,7 @@ void CChunkedVolumeViewer::updateStatusLabel()
         return;
 
     QStringList items;
-    items << QString("Streaming L%1").arg(_dsScaleIdx);
+    items << QString("L%1").arg(_dsScaleIdx);
     items << QString("scale %1").arg(_scale, 0, 'f', 2);
     items << QString("%1x%2").arg(_framebuffer.width()).arg(_framebuffer.height());
 
@@ -2783,9 +2804,9 @@ void CChunkedVolumeViewer::updateStatusLabel()
 
     if (_chunkArray) {
         const auto stats = _chunkArray->stats();
-        items << QString("RAM %1/%2")
-            .arg(formatByteSize(stats.decodedBytes))
-            .arg(formatByteSize(stats.decodedByteCapacity));
+        items << QString("RAM %1/%2 GB")
+            .arg(formatGigabytes(stats.decodedBytes))
+            .arg(formatGigabytes(stats.decodedByteCapacity));
         items << QString("disk %1").arg(formatByteSize(stats.persistentCacheBytes));
         if (stats.remoteFetchesInFlight > 0) {
             items << QString("downloading %1 @ %2")
@@ -2795,9 +2816,9 @@ void CChunkedVolumeViewer::updateStatusLabel()
     }
 
     auto surf = _surfWeak.lock();
-    if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
-        items << planeCoordinateText(*plane);
-    } else if (dynamic_cast<QuadSurface*>(surf.get())) {
+    if (_lastCursorVolumePos)
+        items << formatWholeVolumePosition(*_lastCursorVolumePos);
+    if (dynamic_cast<QuadSurface*>(surf.get())) {
         items << QString("normal offset %1").arg(_zOff, 0, 'f', 1);
         if (_state) {
             if (auto* poi = _state->poi("focus"))
