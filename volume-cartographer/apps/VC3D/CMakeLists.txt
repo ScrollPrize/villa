@@ -124,8 +124,16 @@ set(srcs
     segmentation/panels/SegmentationLasagnaPanel.hpp
     ViewerManager.cpp
     ViewerManager.hpp
-    viewer/ViewerControlsPanel.cpp
-    viewer/ViewerControlsPanel.hpp
+    viewer_controls/ViewerControlsPanel.cpp
+    viewer_controls/ViewerControlsPanel.hpp
+    viewer_controls/panels/ViewerNavigationPanel.cpp
+    viewer_controls/panels/ViewerNavigationPanel.hpp
+    viewer_controls/panels/ViewerNormalVisualizationPanel.cpp
+    viewer_controls/panels/ViewerNormalVisualizationPanel.hpp
+    viewer_controls/panels/ViewerTransformsPanel.cpp
+    viewer_controls/panels/ViewerTransformsPanel.hpp
+    viewer_controls/panels/ViewerViewExtrasPanel.cpp
+    viewer_controls/panels/ViewerViewExtrasPanel.hpp
     SegmentRenderThread.cpp
     SegmentRenderThread.hpp
     elements/ProgressUtil.cpp
