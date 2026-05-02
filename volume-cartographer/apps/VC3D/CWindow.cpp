@@ -2522,10 +2522,6 @@ void CWindow::CreateWidgets(void)
         this, [this]() {
             _segmentationCommandHandler->onAddIgnoreLabel();
         });
-    connect(_surfacePanel.get(), &SurfacePanelController::fetchRemoteChunksRequested,
-            this, [this](const QString& segmentId) {
-                _segmentationCommandHandler->onFetchRemoteChunks(segmentId.toStdString());
-            });
     connect(_surfacePanel.get(), &SurfacePanelController::growSeedsRequested,
             this, [this](const QString& segmentId, bool isExpand, bool isRandomSeed) {
                 _segmentationCommandHandler->onGrowSeeds(segmentId.toStdString(), isExpand, isRandomSeed);
@@ -3118,8 +3114,6 @@ void CWindow::CreateWidgets(void)
             [this](std::shared_ptr<Volume>, const std::string&) { refreshTransformsPanelState(); });
     connect(_seedingWidget, &SeedingWidget::sendStatusMessageAvailable, this, &CWindow::onShowStatusMessage);
     connect(_state, &CState::surfacesLoaded, _seedingWidget, &SeedingWidget::onSurfacesLoaded);
-
-    // Cache is now obtained from volume->tieredCache()
 
     // Create and add the point collection widget
     _point_collection_widget = new CPointCollectionWidget(_state->pointCollection(), this);

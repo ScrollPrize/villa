@@ -50,12 +50,6 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
     fprintf(stderr, "[CState] setCurrentVolume: begin (old=%p new=%p)\n",
             (void*)_currentVolume.get(), (void*)vol.get());
-    if (_currentVolume) {
-        _currentVolume->resetTieredCache();
-    }
-    if (_blockCache) {
-        _blockCache->clear();
-    }
     _currentVolume = std::move(vol);
     applyCacheBudget(_currentVolume);
     resolveCurrentVolumeId();
@@ -104,14 +98,6 @@ void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
 {
     if (vol && _cacheSizeBytes > 0) {
         vol->setCacheBudget(_cacheSizeBytes);
-        if (!_blockCache) {
-            vc::cache::BlockCache::Config bcfg;
-            bcfg.bytes = _cacheSizeBytes;
-            for (auto& f : bcfg.levelFloor) f = 4096;
-            const_cast<CState*>(this)->_blockCache =
-                std::make_unique<vc::cache::BlockCache>(bcfg);
-        }
-        vol->setBlockCache(_blockCache.get());
     }
 }
 

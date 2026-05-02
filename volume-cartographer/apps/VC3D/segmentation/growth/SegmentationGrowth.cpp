@@ -274,15 +274,7 @@ void ensureNormalsInward(QuadSurface* surface, const Volume* volume)
     cv::normalize(normal, normal);
 
     auto [w, h, d] = volume->shape();
-    const auto& db = volume->dataBounds();
-    cv::Vec3f volumeCenter;
-    if (db.valid) {
-        volumeCenter = cv::Vec3f((db.minX + db.maxX) * 0.5f,
-                                  (db.minY + db.maxY) * 0.5f,
-                                  (db.minZ + db.maxZ) * 0.5f);
-    } else {
-        volumeCenter = cv::Vec3f(w * 0.5f, h * 0.5f, d * 0.5f);
-    }
+    cv::Vec3f volumeCenter(w * 0.5f, h * 0.5f, d * 0.5f);
     cv::Vec3f toCenter = volumeCenter - p;
     toCenter[2] = 0.0f;
 

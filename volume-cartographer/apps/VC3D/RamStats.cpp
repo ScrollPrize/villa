@@ -4,7 +4,6 @@
 #include "ViewerManager.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/SurfacePatchIndex.hpp"
-#include "vc/core/cache/BlockPipeline.hpp"
 
 #include <cstdio>
 #include <fstream>
@@ -80,28 +79,9 @@ void dumpOnce(ViewerManager* viewerManager, CState* state)
     (void)mi;
 #endif
 
-    std::size_t blockBytes = 0;
-    std::size_t encStageChunks = 0;
-    std::size_t decStageBytes = 0;
-    std::size_t dlPending = 0, encPending = 0, ldPending = 0, decPending = 0;
-    std::size_t inflightShardReads = 0, inflightShardBytes = 0;
     std::size_t patchCount = 0;
     std::size_t surfaceCount = 0;
     if (viewerManager) {
-        if (auto* vol = state ? state->currentVolume().get() : nullptr) {
-            if (auto* bp = vol->tieredCache()) {
-                const auto stats = bp->stats();
-                blockBytes = stats.blocks * 4096;
-                encStageChunks = stats.encodeStagingChunks;
-                decStageBytes = stats.decodeStagingBytes;
-                dlPending = stats.downloadPending;
-                encPending = stats.encodePending;
-                ldPending = stats.loadPending;
-                decPending = stats.decodePending;
-                inflightShardReads = stats.inflightShardReads;
-                inflightShardBytes = stats.inflightShardBytes;
-            }
-        }
         if (auto* spi = viewerManager->surfacePatchIndex()) {
             patchCount = spi->patchCount();
             surfaceCount = spi->surfaceCount();
@@ -109,8 +89,6 @@ void dumpOnce(ViewerManager* viewerManager, CState* state)
     }
 
     const std::size_t surfaceBytes = estimateLoadedSurfaceBytes(state);
-    // 16 MiB per staged canonical chunk (256³ u8).
-    const std::size_t encStageMB = (encStageChunks * 16ULL * 1024 * 1024) / (1024 * 1024);
 
 #if defined(VC_HAVE_MIMALLOC)
     size_t mi_elapsed = 0, mi_user = 0, mi_sys = 0, mi_rss = 0, mi_peak_rss = 0;
@@ -127,9 +105,6 @@ void dumpOnce(ViewerManager* viewerManager, CState* state)
     std::fprintf(stderr,
         "[RAM] rss=%ldMB hwm=%ldMB swap=%ldMB"
         " | mi_commit=%zuMB mi_peak_commit=%zuMB mi_peak_rss=%zuMB"
-        " | blocks=%zuMB enc_stage=%zuc/%zuMB dec_stage=%zuKB"
-        " | pend dl=%zu enc=%zu ld=%zu dec=%zu"
-        " | shard_inflight=%zur/%zuMB"
         " | spi=%zup/%zus surfs=%zuMB\n",
         ps.vmRssKB / 1024,
         ps.vmHwmKB / 1024,
@@ -137,19 +112,11 @@ void dumpOnce(ViewerManager* viewerManager, CState* state)
         mi_commit / (1024*1024),
         mi_peak_commit / (1024*1024),
         mi_peak_rss / (1024*1024),
-        blockBytes / (1024*1024),
-        encStageChunks, encStageMB,
-        decStageBytes / 1024,
-        dlPending, encPending, ldPending, decPending,
-        inflightShardReads, inflightShardBytes / (1024*1024),
         patchCount, surfaceCount,
         surfaceBytes / (1024*1024));
 #else
     std::fprintf(stderr,
         "[RAM] rss=%ldMB hwm=%ldMB swap=%ldMB | malloc:in_use=%zuMB free=%zuMB mmap=%zuMB"
-        " | blocks=%zuMB enc_stage=%zuc/%zuMB dec_stage=%zuKB"
-        " | pend dl=%zu enc=%zu ld=%zu dec=%zu"
-        " | shard_inflight=%zur/%zuMB"
         " | spi=%zup/%zus surfs=%zuMB\n",
         ps.vmRssKB / 1024,
         ps.vmHwmKB / 1024,
@@ -157,11 +124,6 @@ void dumpOnce(ViewerManager* viewerManager, CState* state)
         std::size_t(mi.uordblks) / (1024*1024),
         std::size_t(mi.fordblks) / (1024*1024),
         std::size_t(mi.hblkhd) / (1024*1024),
-        blockBytes / (1024*1024),
-        encStageChunks, encStageMB,
-        decStageBytes / 1024,
-        dlPending, encPending, ldPending, decPending,
-        inflightShardReads, inflightShardBytes / (1024*1024),
         patchCount, surfaceCount,
         surfaceBytes / (1024*1024));
 #endif

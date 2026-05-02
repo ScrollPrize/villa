@@ -112,7 +112,6 @@ signals:
 
 public slots:
     void onRenderSegment(const std::string& segmentId);
-    void onFetchRemoteChunks(const std::string& segmentId);
     void onGrowSegmentFromSegment(const std::string& segmentId);
     void onAddOverlap(const std::string& segmentId);
     void onConvertToObj(const std::string& segmentId);

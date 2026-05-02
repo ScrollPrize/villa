@@ -1258,16 +1258,6 @@ float BlockPipeline::levelScaleFactor(int vectorIndex) const noexcept {
     return static_cast<float>(size_t{1} << vectorIndex);
 }
 
-void BlockPipeline::setDataBounds(int minX, int maxX, int minY, int maxY, int minZ, int maxZ) {
-    std::lock_guard lock(dataBoundsMutex_);
-    dataBoundsL0_ = {minX, maxX, minY, maxY, minZ, maxZ, true};
-}
-
-BlockPipeline::DataBoundsL0 BlockPipeline::dataBounds() const {
-    std::lock_guard lock(dataBoundsMutex_);
-    return dataBoundsL0_;
-}
-
 bool BlockPipeline::isNegativeCached(const ChunkKey& key) const {
     if (!bloomMayContain(key)) return false;
     std::lock_guard lock(negativeMutex_);

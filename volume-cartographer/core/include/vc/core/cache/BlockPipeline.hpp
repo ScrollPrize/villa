@@ -152,18 +152,6 @@ public:
     // Falls back to 2^vectorIndex if not set.
     [[nodiscard]] float levelScaleFactor(int vectorIndex) const noexcept;
 
-    // --- Logical data bounds ---
-    struct DataBoundsL0 {
-        int minX = 0, maxX = 0;
-        int minY = 0, maxY = 0;
-        int minZ = 0, maxZ = 0;
-        bool valid = false;
-        constexpr bool operator==(const DataBoundsL0&) const noexcept = default;
-    };
-
-    void setDataBounds(int minX, int maxX, int minY, int maxY, int minZ, int maxZ);
-    [[nodiscard]] DataBoundsL0 dataBounds() const;
-
     [[nodiscard]] bool isNegativeCached(const ChunkKey& key) const;
 
     // Counts how many of the given chunks are either already decoded
@@ -436,9 +424,6 @@ private:
     mutable std::mutex callbackMutex_;
     std::vector<std::pair<ChunkReadyCallbackId, ChunkReadyCallback>> chunkReadyListeners_;
     std::atomic<ChunkReadyCallbackId> nextListenerId_{1};
-
-    mutable std::mutex dataBoundsMutex_;
-    DataBoundsL0 dataBoundsL0_;
 
     // Hits from the empty-chunk canonical zero block (cold path in blockAt).
     // The hot-path block hit counter lives in BlockCache::shards_ — a single

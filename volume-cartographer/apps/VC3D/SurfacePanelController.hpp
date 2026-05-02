@@ -140,7 +140,6 @@ signals:
     void alphaCompRefineRequested(const QString& segmentId);
     void rasterizeSegmentsRequested(const QStringList& segmentIds);
     void addIgnoreLabelRequested();
-    void fetchRemoteChunksRequested(const QString& segmentId);
     void remoteSegmentDownloadRequested(const QString& segmentId);
     void statusMessageRequested(const QString& message, int timeoutMs);
     void moveToPathsRequested(const QString& segmentId);
