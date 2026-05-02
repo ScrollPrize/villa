@@ -53,6 +53,7 @@ class SegmentationModule;
 class SurfacePanelController;
 class MenuActionController;
 class SegmentationGrower;
+class ViewerControlsPanel;
 class WindowRangeWidget;
 class QLabel;
 class QSpinBox;
@@ -214,6 +215,7 @@ private:
 
     std::unique_ptr<VolumeOverlayController> _volumeOverlay;
     std::unique_ptr<ViewerManager> _viewerManager;
+    std::unique_ptr<ViewerControlsPanel> _viewerControlsPanel;
     bool _mirrorCursorToSegmentation{false};
     std::unique_ptr<SegmentationGrower> _segmentationGrower;
 

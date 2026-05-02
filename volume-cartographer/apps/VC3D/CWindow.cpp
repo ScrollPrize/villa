@@ -63,6 +63,7 @@
 
 #include "CVolumeViewerView.hpp"
 #include "VolumeViewerCmaps.hpp"
+#include "viewer/ViewerControlsPanel.hpp"
 #include "streaming/CChunkedVolumeViewer.hpp"
 #include "vc/ui/UDataManipulateUtils.hpp"
 #include "SettingsDialog.hpp"
@@ -71,7 +72,6 @@
 #include "SurfaceTreeWidget.hpp"
 #include "SeedingWidget.hpp"
 #include "CommandLineToolRunner.hpp"
-#include "elements/CollapsibleSettingsGroup.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "segmentation/growth/SegmentationGrowth.hpp"
 #include "segmentation/growth/SegmentationGrower.hpp"
@@ -3074,112 +3074,34 @@ void CWindow::CreateWidgets(void)
     // Make Segmentation dock the active tab by default
     ui.dockWidgetSegmentation->raise();
 
-    // Build Viewer Controls dock from the existing view-related panels.
-    auto* viewerControlsLayout = qobject_cast<QVBoxLayout*>(ui.dockWidgetViewerControlsContents->layout());
-    if (!viewerControlsLayout) {
-        viewerControlsLayout = new QVBoxLayout(ui.dockWidgetViewerControlsContents);
-        viewerControlsLayout->setContentsMargins(4, 4, 4, 4);
-        viewerControlsLayout->setSpacing(8);
-    }
-
-    auto detachScrollContents = [](QScrollArea* scrollArea, QWidget* contents) -> QWidget* {
-        if (!contents) {
-            return nullptr;
-        }
-        if (scrollArea && scrollArea->widget() == contents) {
-            scrollArea->takeWidget();
-        }
-        contents->setParent(nullptr);
-        return contents;
+    ViewerControlsPanel::UiRefs viewerControlsUi{
+        .contents = ui.dockWidgetViewerControlsContents,
+        .viewScrollArea = ui.scrollAreaView,
+        .viewContents = ui.dockWidgetViewContents,
+        .overlayScrollArea = ui.scrollAreaOverlay,
+        .overlayContents = ui.dockWidgetOverlayContents,
+        .compositeScrollArea = ui.scrollAreaComposite,
+        .compositeContents = ui.dockWidgetCompositeContents,
+        .renderSettingsScrollArea = ui.scrollAreaRenderSettings,
+        .renderSettingsContents = ui.dockWidgetRenderSettingsContents,
+        .normalVisualizationContents = ui.dockWidgetNormalVisContents,
+        .preprocessingScrollArea = ui.scrollAreaPreprocessing,
+        .preprocessingContents = ui.dockWidgetPreprocessingContents,
+        .postprocessingScrollArea = ui.scrollAreaPostprocessing,
+        .postprocessingContents = ui.dockWidgetPostprocessingContents,
     };
+    _viewerControlsPanel = std::make_unique<ViewerControlsPanel>(viewerControlsUi,
+                                                                 _viewerManager.get(),
+                                                                 ui.dockWidgetViewerControlsContents);
 
-    auto moveGridLayoutItems = [](QGridLayout* from, QGridLayout* to, QWidget* newParent) {
-        if (!from || !to) {
-            return;
-        }
-        to->setContentsMargins(from->contentsMargins());
-        to->setHorizontalSpacing(from->horizontalSpacing());
-        to->setVerticalSpacing(from->verticalSpacing());
-        for (int column = 0; column < from->columnCount(); ++column) {
-            to->setColumnStretch(column, from->columnStretch(column));
-            to->setColumnMinimumWidth(column, from->columnMinimumWidth(column));
-        }
-        for (int row = 0; row < from->rowCount(); ++row) {
-            to->setRowStretch(row, from->rowStretch(row));
-            to->setRowMinimumHeight(row, from->rowMinimumHeight(row));
-        }
-        for (int index = from->count() - 1; index >= 0; --index) {
-            int row = 0;
-            int column = 0;
-            int rowSpan = 1;
-            int columnSpan = 1;
-            from->getItemPosition(index, &row, &column, &rowSpan, &columnSpan);
-            if (auto* item = from->takeAt(index)) {
-                if (newParent) {
-                    if (auto* widget = item->widget()) {
-                        widget->setParent(newParent);
-                    } else if (auto* layout = item->layout()) {
-                        layout->setParent(newParent);
-                    }
-                }
-                to->addItem(item, row, column, rowSpan, columnSpan, item->alignment());
-            }
-        }
-    };
-
-    auto* normalVisContainer = new QWidget(ui.dockWidgetViewerControlsContents);
-    auto* normalVisLayout = new QGridLayout(normalVisContainer);
-    moveGridLayoutItems(qobject_cast<QGridLayout*>(ui.dockWidgetNormalVisContents->layout()),
-                        normalVisLayout,
-                        normalVisContainer);
-
-    auto* transformsContainer = new QWidget(ui.dockWidgetViewerControlsContents);
-    auto* transformsLayout = new QVBoxLayout(transformsContainer);
-    transformsLayout->setContentsMargins(0, 0, 0, 0);
-    transformsLayout->setSpacing(8);
-
-    _previewTransformCheck = new QCheckBox(tr("Preview Result"), transformsContainer);
-    _previewTransformCheck->setToolTip(
-        tr("Preview the scaled and/or affine-transformed segmentation."));
-    transformsLayout->addWidget(_previewTransformCheck);
-
-    _scaleOnlyTransformCheck = new QCheckBox(tr("Scale Only"), transformsContainer);
-    _scaleOnlyTransformCheck->setToolTip(
-        tr("Ignore any loaded or volume affine and apply scale only."));
-    transformsLayout->addWidget(_scaleOnlyTransformCheck);
-
-    _invertTransformCheck = new QCheckBox(tr("Invert Affine"), transformsContainer);
-    _invertTransformCheck->setToolTip(
-        tr("Invert the loaded affine. Ignored when no affine transform is loaded."));
-    transformsLayout->addWidget(_invertTransformCheck);
-
-    auto* transformScaleRow = new QHBoxLayout();
-    transformScaleRow->setContentsMargins(0, 0, 0, 0);
-    transformScaleRow->setSpacing(8);
-    transformScaleRow->addWidget(new QLabel(tr("Scale"), transformsContainer));
-    _transformScaleSpin = new QSpinBox(transformsContainer);
-    _transformScaleSpin->setMinimum(1);
-    _transformScaleSpin->setMaximum(1000);
-    _transformScaleSpin->setValue(1);
-    _transformScaleSpin->setToolTip(
-        tr("Multiply segmentation points by this integer. Works with or without an affine transform."));
-    transformScaleRow->addWidget(_transformScaleSpin);
-    transformsLayout->addLayout(transformScaleRow);
-
-    _loadAffineButton = new QPushButton(tr("Load Affine (Optional)"), transformsContainer);
-    _loadAffineButton->setToolTip(
-        tr("Load an affine JSON from a local path or URL. Leave the dialog blank to return to the current volume transform."));
-    transformsLayout->addWidget(_loadAffineButton);
-
-    _saveTransformedButton = new QPushButton(tr("Save Transformed"), transformsContainer);
-    _saveTransformedButton->setToolTip(
-        tr("Save a new surface using the current scale and optional affine transform."));
-    transformsLayout->addWidget(_saveTransformedButton);
-
-    _transformStatusLabel = new QLabel(transformsContainer);
-    _transformStatusLabel->setWordWrap(true);
-    _transformStatusLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
-    transformsLayout->addWidget(_transformStatusLabel);
+    const auto& transformControls = _viewerControlsPanel->transformControls();
+    _previewTransformCheck = transformControls.preview;
+    _scaleOnlyTransformCheck = transformControls.scaleOnly;
+    _invertTransformCheck = transformControls.invert;
+    _transformScaleSpin = transformControls.scale;
+    _loadAffineButton = transformControls.loadAffine;
+    _saveTransformedButton = transformControls.saveTransformed;
+    _transformStatusLabel = transformControls.status;
 
     connect(_previewTransformCheck, &QCheckBox::toggled,
             this, &CWindow::onPreviewTransformToggled);
@@ -3193,149 +3115,6 @@ void CWindow::CreateWidgets(void)
             this, &CWindow::onLoadAffineRequested);
     connect(_saveTransformedButton, &QPushButton::clicked,
             this, &CWindow::onSaveTransformedRequested);
-
-    auto rememberGroupState = [this](CollapsibleSettingsGroup* group, const char* key) {
-        if (!group) {
-            return;
-        }
-        connect(group, &CollapsibleSettingsGroup::toggled, this, [key](bool expanded) {
-            QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-            settings.setValue(key, expanded);
-        });
-    };
-
-    auto addViewerGroup = [this, &settings, viewerControlsLayout, &rememberGroupState](
-                              const QString& title, QWidget* contents, const char* key, bool defaultExpanded) {
-        if (!viewerControlsLayout || !contents) {
-            return static_cast<CollapsibleSettingsGroup*>(nullptr);
-        }
-        auto* group = new CollapsibleSettingsGroup(title, ui.dockWidgetViewerControlsContents);
-        group->contentLayout()->addWidget(contents);
-        viewerControlsLayout->addWidget(group);
-        group->setExpanded(settings.value(key, defaultExpanded).toBool());
-        rememberGroupState(group, key);
-        return group;
-    };
-
-    using namespace vc3d::settings;
-    auto* viewGroup = addViewerGroup(tr("View"),
-                   detachScrollContents(ui.scrollAreaView, ui.dockWidgetViewContents),
-                   viewer::GROUP_VIEW_EXPANDED,
-                   viewer::GROUP_VIEW_EXPANDED_DEFAULT);
-
-    // Interpolation + highlight-downscaled live inside the View group so
-    // all display-affecting toggles sit together.
-    auto* viewExtrasLayout = viewGroup ? viewGroup->contentLayout() : viewerControlsLayout;
-
-    // Interpolation method selector
-    {
-        auto* interpWidget = new QWidget;
-        auto* interpLayout = new QHBoxLayout(interpWidget);
-        interpLayout->setContentsMargins(2, 2, 2, 2);
-        interpLayout->addWidget(new QLabel(tr("Interpolation")));
-        auto* cmbInterp = new QComboBox;
-        cmbInterp->addItem(tr("Nearest"));
-        cmbInterp->addItem(tr("Trilinear"));
-        cmbInterp->setCurrentIndex(std::clamp(settings.value(perf::INTERPOLATION_METHOD, 1).toInt(), 0, 1));
-        interpLayout->addWidget(cmbInterp);
-        connect(cmbInterp, qOverload<int>(&QComboBox::currentIndexChanged), this, [this](int idx) {
-            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-            s.setValue(vc3d::settings::perf::INTERPOLATION_METHOD, idx);
-            _viewerManager->forEachBaseViewer([](VolumeViewerBase* v) {
-                v->reloadPerfSettings();
-                v->renderVisible(true);
-            });
-        });
-        viewExtrasLayout->addWidget(interpWidget);
-    }
-
-    // Highlight downscaled chunks — tints pixels that rendered against a
-    // coarser pyramid level than the zoom-level target (green → red).
-    {
-        auto* chkHighlight = new QCheckBox(tr("Highlight downscaled chunks"));
-        chkHighlight->setToolTip(
-            tr("Tint pixels sourced from a coarser pyramid level than the current zoom "
-               "target. Green = 1 level coarser; red = 5+ levels coarser. Untinted pixels "
-               "rendered at the requested resolution."));
-        chkHighlight->setChecked(
-            settings.value("viewer_controls/highlight_downscaled", false).toBool());
-        connect(chkHighlight, &QCheckBox::toggled, this, [this](bool on) {
-            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-            s.setValue("viewer_controls/highlight_downscaled", on);
-            if (_viewerManager) {
-                _viewerManager->forEachBaseViewer([](VolumeViewerBase* v) {
-                    v->reloadPerfSettings();
-                    v->renderVisible(true);
-                });
-            }
-        });
-        viewExtrasLayout->addWidget(chkHighlight);
-    }
-
-    // Navigation sensitivity controls
-    {
-        auto* navWidget = new QWidget;
-        auto* navLayout = new QGridLayout(navWidget);
-        navLayout->setContentsMargins(2, 2, 2, 2);
-        navLayout->setVerticalSpacing(2);
-
-        auto addSpin = [&](int row, const QString& label, const char* settingsKey, float defaultVal) {
-            navLayout->addWidget(new QLabel(label), row, 0);
-            auto* spin = new QDoubleSpinBox;
-            spin->setRange(0.1, 100.0);
-            spin->setSingleStep(0.1);
-            spin->setDecimals(1);
-            spin->setValue(settings.value(settingsKey, defaultVal).toDouble());
-            navLayout->addWidget(spin, row, 1);
-            connect(spin, &QDoubleSpinBox::valueChanged, this, [this, settingsKey](double v) {
-                QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-                s.setValue(settingsKey, v);
-                if (_viewerManager) {
-                    _viewerManager->forEachBaseViewer([](VolumeViewerBase* v) {
-                        v->reloadPerfSettings();
-                    });
-                }
-            });
-        };
-        addSpin(0, tr("Pan sensitivity"), viewer::PAN_SENSITIVITY, viewer::PAN_SENSITIVITY_DEFAULT);
-        addSpin(1, tr("Zoom sensitivity"), viewer::ZOOM_SENSITIVITY, viewer::ZOOM_SENSITIVITY_DEFAULT);
-        addSpin(2, tr("Z-scroll sensitivity"), viewer::ZSCROLL_SENSITIVITY, viewer::ZSCROLL_SENSITIVITY_DEFAULT);
-
-        addViewerGroup(tr("Navigation"),
-                       navWidget,
-                       "viewer_controls/group_navigation_expanded",
-                       true);
-    }
-
-    addViewerGroup(tr("Overlay"),
-                   detachScrollContents(ui.scrollAreaOverlay, ui.dockWidgetOverlayContents),
-                   viewer::GROUP_OVERLAY_EXPANDED,
-                   viewer::GROUP_OVERLAY_EXPANDED_DEFAULT);
-    addViewerGroup(tr("Composite View"),
-                   detachScrollContents(ui.scrollAreaComposite, ui.dockWidgetCompositeContents),
-                   viewer::GROUP_COMPOSITE_EXPANDED,
-                   viewer::GROUP_COMPOSITE_EXPANDED_DEFAULT);
-    addViewerGroup(tr("Render Settings"),
-                   detachScrollContents(ui.scrollAreaRenderSettings, ui.dockWidgetRenderSettingsContents),
-                   viewer::GROUP_RENDER_SETTINGS_EXPANDED,
-                   viewer::GROUP_RENDER_SETTINGS_EXPANDED_DEFAULT);
-    addViewerGroup(tr("Normal Visualization"),
-                   normalVisContainer,
-                   viewer::GROUP_NORMAL_VIS_EXPANDED,
-                   viewer::GROUP_NORMAL_VIS_EXPANDED_DEFAULT);
-    addViewerGroup(tr("Preprocessing"),
-                   detachScrollContents(ui.scrollAreaPreprocessing, ui.dockWidgetPreprocessingContents),
-                   viewer::GROUP_PREPROCESSING_EXPANDED,
-                   viewer::GROUP_PREPROCESSING_EXPANDED_DEFAULT);
-    addViewerGroup(tr("Postprocessing"),
-                   detachScrollContents(ui.scrollAreaPostprocessing, ui.dockWidgetPostprocessingContents),
-                   viewer::GROUP_POSTPROCESSING_EXPANDED,
-                   viewer::GROUP_POSTPROCESSING_EXPANDED_DEFAULT);
-    addViewerGroup(tr("Transforms"),
-                   transformsContainer,
-                   viewer::GROUP_TRANSFORMS_EXPANDED,
-                   viewer::GROUP_TRANSFORMS_EXPANDED_DEFAULT);
-    viewerControlsLayout->addStretch(1);
 
     addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetViewerControls);
     splitDockWidget(ui.dockWidgetVolumes, ui.dockWidgetViewerControls, Qt::Vertical);

@@ -30,6 +30,8 @@ set(srcs
     elements/DropdownChecklistButton.hpp
     elements/JsonProfileEditor.cpp
     elements/JsonProfileEditor.hpp
+    elements/LabeledControlRow.cpp
+    elements/LabeledControlRow.hpp
     elements/VolumeSelector.cpp
     elements/VolumeSelector.hpp
     elements/RangeSlider.cpp
@@ -122,6 +124,8 @@ set(srcs
     segmentation/panels/SegmentationLasagnaPanel.hpp
     ViewerManager.cpp
     ViewerManager.hpp
+    viewer/ViewerControlsPanel.cpp
+    viewer/ViewerControlsPanel.hpp
     SegmentRenderThread.cpp
     SegmentRenderThread.hpp
     elements/ProgressUtil.cpp
