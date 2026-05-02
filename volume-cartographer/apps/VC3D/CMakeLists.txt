@@ -65,8 +65,6 @@ set(srcs
     segmentation/panels/SegmentationManualAddPanel.cpp
     segmentation/panels/SegmentationManualAddPanel.hpp
     segmentation/growth/SegmentationGrowth.cpp
-    segmentation/growth/ExtrapolationGrowth.cpp
-    segmentation/growth/ExtrapolationGrowth.hpp
     segmentation/growth/SegmentationGrower.cpp
     segmentation/growth/SegmentationGrower.hpp
     segmentation/tools/SegmentationEditManager.cpp

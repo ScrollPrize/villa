@@ -360,16 +360,6 @@ void SegmentationWidget::setDrawMaskEnabled(bool enabled)
 
 SegmentationGrowthMethod SegmentationWidget::growthMethod() const { return _growthPanel->growthMethod(); }
 int SegmentationWidget::growthSteps() const { return _growthPanel->growthSteps(); }
-int SegmentationWidget::extrapolationPointCount() const { return _growthPanel->extrapolationPointCount(); }
-ExtrapolationType SegmentationWidget::extrapolationType() const { return _growthPanel->extrapolationType(); }
-int SegmentationWidget::sdtMaxSteps() const { return _growthPanel->sdtMaxSteps(); }
-float SegmentationWidget::sdtStepSize() const { return _growthPanel->sdtStepSize(); }
-float SegmentationWidget::sdtConvergence() const { return _growthPanel->sdtConvergence(); }
-int SegmentationWidget::sdtChunkSize() const { return _growthPanel->sdtChunkSize(); }
-int SegmentationWidget::skeletonConnectivity() const { return _growthPanel->skeletonConnectivity(); }
-int SegmentationWidget::skeletonSliceOrientation() const { return _growthPanel->skeletonSliceOrientation(); }
-int SegmentationWidget::skeletonChunkSize() const { return _growthPanel->skeletonChunkSize(); }
-int SegmentationWidget::skeletonSearchRadius() const { return _growthPanel->skeletonSearchRadius(); }
 bool SegmentationWidget::growthKeybindsEnabled() const { return _growthPanel->growthKeybindsEnabled(); }
 QString SegmentationWidget::normal3dZarrPath() const { return _growthPanel->normal3dZarrPath(); }
 QString SegmentationWidget::patchTracerSourcePath() const { return _growthPanel->patchTracerSourcePath(); }

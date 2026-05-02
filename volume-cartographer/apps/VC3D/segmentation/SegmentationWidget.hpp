@@ -50,16 +50,6 @@ public:
     [[nodiscard]] SegmentationGrowthMethod growthMethod() const;
     [[nodiscard]] SegmentationGrowthMethod lastNonManualGrowthMethod() const { return _lastNonManualGrowthMethod; }
     [[nodiscard]] int growthSteps() const;
-    [[nodiscard]] int extrapolationPointCount() const;
-    [[nodiscard]] ExtrapolationType extrapolationType() const;
-    [[nodiscard]] int sdtMaxSteps() const;
-    [[nodiscard]] float sdtStepSize() const;
-    [[nodiscard]] float sdtConvergence() const;
-    [[nodiscard]] int sdtChunkSize() const;
-    [[nodiscard]] int skeletonConnectivity() const;
-    [[nodiscard]] int skeletonSliceOrientation() const;
-    [[nodiscard]] int skeletonChunkSize() const;
-    [[nodiscard]] int skeletonSearchRadius() const;
     [[nodiscard]] QString customParamsText() const;
     [[nodiscard]] QString customParamsProfile() const;
     [[nodiscard]] bool customParamsValid() const;
