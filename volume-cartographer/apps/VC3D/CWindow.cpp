@@ -934,26 +934,16 @@ CWindow::CWindow(size_t cacheSizeGB) :
                std::max(height(), minWindowSize.height()));
     }
 
-    // If enabled, auto open the last used volume (local or remote, deferred so window shows first)
+    // If enabled, auto open the last used local volume package.
     if (settings.value(vc3d::settings::volpkg::AUTO_OPEN, vc3d::settings::volpkg::AUTO_OPEN_DEFAULT).toInt() != 0) {
 
         QStringList files = settings.value(vc3d::settings::volpkg::RECENT).toStringList();
-        QStringList remoteUrls = settings.value(vc3d::settings::viewer::REMOTE_RECENT_URLS).toStringList();
 
         if (!files.empty() && !files.at(0).isEmpty()) {
-            // Local volpkg available — open it
             QString path = files[0];
             QTimer::singleShot(0, this, [this, path]() {
                 if (_menuController) {
                     _menuController->openVolpkgAt(path);
-                }
-            });
-        } else if (!remoteUrls.empty() && !remoteUrls.at(0).isEmpty()) {
-            // No local volpkg but have a recent remote URL — open it
-            QString url = remoteUrls[0];
-            QTimer::singleShot(0, this, [this, url]() {
-                if (_menuController) {
-                    _menuController->openRemoteUrl(url, false);
                 }
             });
         }
@@ -2038,115 +2028,6 @@ void CWindow::setRemoteSurfaces(const std::vector<std::pair<std::string, std::sh
     refreshTransformsPanelState();
 }
 
-void CWindow::setRemoteStubs(
-    const std::vector<std::string>& segmentIds,
-    const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& cachedSurfaces)
-{
-    if (_surfacePanel) {
-        _surfacePanel->loadRemoteStubs(segmentIds, cachedSurfaces);
-    }
-
-    // Activate the first cached surface if available
-    if (_state && !cachedSurfaces.empty()) {
-        const auto& [firstId, firstSurf] = cachedSurfaces.front();
-        _state->setSurface("segmentation", firstSurf);
-        _state->setActiveSurface(firstId, std::dynamic_pointer_cast<QuadSurface>(firstSurf));
-        _state->emitSurfacesChanged();
-    }
-
-    emit _state->surfacesLoaded();
-    refreshTransformsPanelState();
-}
-
-void CWindow::downloadRemoteSegmentOnDemand(const QString& segmentId)
-{
-    const std::string segId = segmentId.toStdString();
-    const std::string dlBase = (_remoteScroll.segSource == vc::RemoteSegmentSource::Direct)
-        ? _remoteScroll.segmentsBaseUrl : _remoteScroll.baseUrl;
-    const std::string cachePath = _remoteScroll.cachePath;
-    const auto auth = _remoteScroll.auth;
-    const auto segSource = _remoteScroll.segSource;
-
-    if (statusBar()) {
-        statusBar()->showMessage(
-            tr("Downloading segment %1...").arg(segmentId));
-    }
-
-    auto* watcher = new QFutureWatcher<std::shared_ptr<QuadSurface>>(this);
-    // Capture the current session URL so the completion handler can detect
-    // a stale result if the user closed/switched volumes during download.
-    const std::string expectedBaseUrl = _remoteScroll.baseUrl;
-    connect(watcher, &QFutureWatcher<std::shared_ptr<QuadSurface>>::finished, this,
-        [this, watcher, segId, expectedBaseUrl]() {
-            watcher->deleteLater();
-            // If the remote scroll session changed, silently discard the
-            // result — applying a segment from a previous dataset to the
-            // current CState would corrupt surface state.
-            if (_remoteScroll.baseUrl != expectedBaseUrl) {
-                return;
-            }
-            std::shared_ptr<QuadSurface> surf;
-            try {
-                surf = watcher->result();
-            } catch (const std::exception& e) {
-                std::fprintf(stderr, "[RemoteScroll] Download failed for %s: %s\n",
-                    segId.c_str(), e.what());
-            }
-
-            if (surf) {
-                if (statusBar()) {
-                    statusBar()->showMessage(
-                        tr("Downloaded segment %1").arg(QString::fromStdString(segId)), 3000);
-                }
-                if (_surfacePanel) {
-                    _surfacePanel->replaceStubWithSurface(segId, surf);
-                }
-            } else {
-                if (statusBar()) {
-                    statusBar()->showMessage(
-                        tr("Failed to download segment %1").arg(QString::fromStdString(segId)), 5000);
-                }
-                // Reset the stub state so user can retry
-                if (_surfacePanel) {
-                    _surfacePanel->replaceStubWithSurface(segId, nullptr);
-                }
-            }
-        });
-
-    const std::string baseUrl = _remoteScroll.baseUrl;
-
-    auto future = QtConcurrent::run(
-        [dlBase, baseUrl, segId, cachePath, auth, segSource]() -> std::shared_ptr<QuadSurface> {
-            // Cache-root layout MUST match MenuActionController::promptAndLoadRemoteSegments
-            // so previously-preloaded segments are reused on demand instead
-            // of re-downloaded into a second location.
-            //   Direct sources: flat → cachePath/paths/<segId>
-            //   Segments/Paths (full volpkg): nested → cachePath/<volpkgName>/{paths|segments}/<segId>
-            std::filesystem::path segmentRoot = cachePath;
-            if (segSource != vc::RemoteSegmentSource::Direct) {
-                std::string volpkgName = baseUrl;
-                while (!volpkgName.empty() && volpkgName.back() == '/') volpkgName.pop_back();
-                auto slash = volpkgName.rfind('/');
-                if (slash != std::string::npos) volpkgName = volpkgName.substr(slash + 1);
-                segmentRoot = std::filesystem::path(cachePath) / volpkgName;
-            }
-
-            auto localDir = vc::downloadRemoteSegment(
-                dlBase, segId, segmentRoot, auth, segSource);
-
-            if (!std::filesystem::exists(localDir / "meta.json")) {
-                return nullptr;
-            }
-
-            auto seg = Segmentation::New(localDir);
-            if (seg && seg->canLoadSurface()) {
-                return seg->loadSurface();
-            }
-            return nullptr;
-        });
-    watcher->setFuture(future);
-}
-
 void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
                                             bool reloadSurfaces)
 {
@@ -2645,9 +2526,6 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onFetchRemoteChunks(segmentId.toStdString());
             });
-    connect(_surfacePanel.get(), &SurfacePanelController::remoteSegmentDownloadRequested,
-            this, &CWindow::downloadRemoteSegmentOnDemand);
-
     connect(_surfacePanel.get(), &SurfacePanelController::growSeedsRequested,
             this, [this](const QString& segmentId, bool isExpand, bool isRandomSeed) {
                 _segmentationCommandHandler->onGrowSeeds(segmentId.toStdString(), isExpand, isRandomSeed);
@@ -5186,8 +5064,6 @@ void CWindow::CloseVolume(void)
         _surfacePanel->setVolumePkg(nullptr);
         _surfacePanel->resetTagUi();
     }
-
-    _remoteScroll.active = false;
 
     // Update UI
     UpdateView();

@@ -41,7 +41,6 @@ class CChunkedVolumeViewer;
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/RemoteScroll.hpp"
 
 #define MAX_RECENT_VOLPKG 10
 
@@ -132,12 +131,6 @@ private:
     bool attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
                                       const QString& preferredVolumeId = QString());
     void setRemoteSurfaces(const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& surfaces);
-    // Lazy loading: set remote stubs (segments listed but not yet downloaded)
-    void setRemoteStubs(
-        const std::vector<std::string>& segmentIds,
-        const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& cachedSurfaces);
-    // Download a single remote segment on demand (called when user selects a stub)
-    void downloadRemoteSegmentOnDemand(const QString& segmentId);
     void refreshCurrentVolumePackageUi(const QString& preferredVolumeId = QString(),
                                        bool reloadSurfaces = true);
     void updateNormalGridAvailability();
@@ -261,17 +254,6 @@ private:
     CommandLineToolRunner* _cmdRunner;
     bool _normalGridAvailable{false};
     QString _normalGridPath;
-
-    // Remote scroll state for on-demand segment downloading
-    struct RemoteScrollState {
-        std::string baseUrl;
-        std::string segmentsBaseUrl;
-        std::string cachePath;
-        vc::HttpAuth auth;
-        vc::RemoteSegmentSource segSource = vc::RemoteSegmentSource::Segments;
-        bool active = false;
-    };
-    RemoteScrollState _remoteScroll;
 
     std::unique_ptr<FileWatcherService> _fileWatcher;
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;

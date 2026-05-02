@@ -137,14 +137,8 @@ namespace viewer {
     // Default: vc3d::defaultCacheBase() + "/remote_cache" — uses /ephemeral
     // when mounted, else ~/.VC3D.
 
-    // Recent remote volume URLs
+    // Recent remote zarr URLs used to pre-fill attach dialog
     constexpr auto REMOTE_RECENT_URLS = "viewer/remote_recent_urls";
-
-    // Last-used remote segments URL and the remote zarr URL it was attached
-    // to. Auto-open uses these so reopening the same zarr auto-re-attaches
-    // the same segments directory instead of showing the prompt.
-    constexpr auto LAST_REMOTE_SEGMENTS_URL = "viewer/last_remote_segments_url";
-    constexpr auto LAST_REMOTE_SEGMENTS_FOR_ZARR = "viewer/last_remote_segments_for_zarr";
 
     // Audio/UX
     constexpr auto PLAY_SOUND_AFTER_SEG_RUN = "viewer/play_sound_after_seg_run";

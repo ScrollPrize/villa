@@ -2,7 +2,6 @@
 
 #include <filesystem>
 #include <string>
-#include <vector>
 #include <array>
 
 #include "vc/core/util/RemoteAuth.hpp"
@@ -23,14 +22,6 @@ struct RemoteZarrInfo {
     ShardConfig shardConfig;
 };
 
-// Result of S3 ListObjectsV2 with delimiter.
-struct S3ListResult {
-    std::vector<std::string> prefixes;
-    std::vector<std::string> objects;
-    bool authError = false;
-    std::string errorMessage;
-};
-
 // Normalize a remote zarr URL for cache keying and source matching.
 std::string normalizeRemoteUrl(const std::string& url);
 
@@ -45,9 +36,6 @@ RemoteZarrInfo fetchRemoteZarrMetadata(
 
 // Fetch URL body as string. Empty on failure. Throws on auth errors.
 std::string httpGetString(const std::string& url, const HttpAuth& auth = {});
-
-// List objects under an S3 prefix using ListObjectsV2.
-S3ListResult s3ListObjects(const std::string& httpsBaseUrl, const HttpAuth& auth = {});
 
 // Download a URL to a local file. Returns true on success.
 bool httpDownloadFile(const std::string& url, const std::filesystem::path& dest, const HttpAuth& auth = {});

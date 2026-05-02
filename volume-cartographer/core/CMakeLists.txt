@@ -31,7 +31,6 @@ add_library(vc_core
         src/cache/VcDecompressor.cpp
         src/LoadJson.cpp
         src/RemoteUrl.cpp
-        src/RemoteScroll.cpp
         src/PostProcess.cpp
         src/Geometry.cpp
         src/Thinning.cpp

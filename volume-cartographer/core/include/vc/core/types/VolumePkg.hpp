@@ -12,7 +12,6 @@
 #include "utils/Json.hpp"
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/util/RemoteScroll.hpp"
 
 class VolumePkg
 {
