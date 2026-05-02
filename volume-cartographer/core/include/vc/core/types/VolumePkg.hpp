@@ -1,6 +1,5 @@
 #pragma once
 
-#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -13,7 +12,6 @@
 #include <vector>
 
 #include "utils/Json.hpp"
-#include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/types/Segmentation.hpp"
 #include "vc/core/types/Volume.hpp"
 
@@ -29,12 +27,6 @@ enum class Category { Volumes, Segments, NormalGrids };
 struct LoadOptions {
     std::filesystem::path remoteCacheRoot;
     bool failOnRemoteError = false;
-};
-
-struct RemoteSegmentInfo {
-    std::string baseUrl;
-    std::filesystem::path cacheRoot;
-    vc::cache::HttpAuth auth;
 };
 
 bool isLocationRemote(const std::string& location);
@@ -102,10 +94,6 @@ public:
     [[nodiscard]] std::vector<std::filesystem::path> normalGridPaths() const;
     [[nodiscard]] std::vector<std::filesystem::path> normal3dZarrPaths() const;
 
-    [[nodiscard]] bool isRemoteSegment(const std::string& id) const;
-    [[nodiscard]] bool isRemoteSegmentCached(const std::string& id) const;
-    bool ensureRemoteSegmentDownloaded(const std::string& id);
-
     [[nodiscard]] std::vector<std::string> volumeTags(const std::string& volumeId) const;
     [[nodiscard]] std::vector<std::string> segmentationTags(const std::string& segmentId) const;
 
@@ -150,13 +138,11 @@ private:
     std::map<std::string, std::shared_ptr<Segmentation>> loadedSegmentations_;
     std::map<std::string, std::vector<std::string>> segmentationTagsByID_;
     std::vector<std::filesystem::path> resolvedNormalGridPaths_;
-    std::map<std::string, vc::project::RemoteSegmentInfo> remoteSegmentInfo_;
 
     void resolveAll();
     void resolveVolumeEntry(const vc::project::Entry& e);
-    void resolveSegmentsEntry(const vc::project::Entry& e, std::uint64_t generation);
+    void resolveSegmentsEntry(const vc::project::Entry& e);
     void resolveNormalGridEntry(const vc::project::Entry& e);
-    void loadRemoteSegmentsAsync(vc::project::Entry e, std::uint64_t generation);
     void notifySegmentsChanged();
 
     void writeJsonTo(const std::filesystem::path& target) const;
@@ -168,6 +154,4 @@ private:
 
     mutable std::mutex segmentsMutex_;
     std::function<void()> segmentsChangedCb_;
-    std::atomic<std::uint64_t> loadGeneration_{0};
-    std::atomic<bool> shuttingDown_{false};
 };

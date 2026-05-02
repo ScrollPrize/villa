@@ -7,7 +7,6 @@
 
 #include <functional>
 #include <memory>
-#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -84,12 +83,6 @@ public:
     void loadSurfaces(bool reload);
     void loadSurfacesIncremental();
     void refreshSurfaceList();
-    void loadRemoteSurfaces(const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& surfaces);
-    void loadRemoteStubs(
-        const std::vector<std::string>& segmentIds,
-        const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& cachedSurfaces);
-    void replaceStubWithSurface(const std::string& segmentId, std::shared_ptr<Surface> surface);
-    bool isRemoteStub(const std::string& segmentId) const;
     void updateTreeItemIcon(SurfaceTreeWidgetItem* item);
     void refreshSurfaceMetrics(const std::string& surfaceId);
 
@@ -130,7 +123,6 @@ signals:
     void alphaCompRefineRequested(const QString& segmentId);
     void rasterizeSegmentsRequested(const QStringList& segmentIds);
     void addIgnoreLabelRequested();
-    void remoteSegmentDownloadRequested(const QString& segmentId);
     void statusMessageRequested(const QString& message, int timeoutMs);
     void moveToPathsRequested(const QString& segmentId);
     void renameSurfaceRequested(const QString& segmentId);
@@ -190,9 +182,4 @@ private:
     QStringList _lockedSelectionIds;
     bool _selectionLockNotified{false};
     std::unordered_set<std::string> _highlightedSurfaceIds;
-    // Segment IDs that are remote stubs (metadata-only, TIFFs not yet downloaded).
-    // Selecting one of these triggers an on-demand download.
-    std::unordered_set<std::string> _remoteStubSegments;
-    // Segment IDs currently being downloaded (avoid duplicate downloads).
-    std::unordered_set<std::string> _remoteDownloading;
 };

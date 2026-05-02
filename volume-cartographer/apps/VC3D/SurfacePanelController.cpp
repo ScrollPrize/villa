@@ -15,9 +15,7 @@
 #include "utils/Json.hpp"
 #include "vc/ui/VCCollection.hpp"
 
-#include <QBrush>
 #include <QCheckBox>
-#include <QColor>
 #include <QComboBox>
 #include <QLineEdit>
 #include <QAction>
@@ -116,8 +114,6 @@ void SurfacePanelController::clear()
         const QSignalBlocker blocker{_ui.treeWidget};
         _ui.treeWidget->clear();
     }
-    _remoteStubSegments.clear();
-    _remoteDownloading.clear();
 }
 
 bool SurfacePanelController::hasSurfaces() const
@@ -164,210 +160,6 @@ void SurfacePanelController::loadSurfaces(bool reload)
         _viewerManager->primeSurfacePatchIndicesAsync();
     }
     emit surfacesLoaded();
-}
-
-void SurfacePanelController::loadRemoteSurfaces(
-    const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& surfaces)
-{
-    if (!_ui.treeWidget || surfaces.empty()) {
-        return;
-    }
-
-    // Register each surface in the collection
-    for (const auto& [id, surf] : surfaces) {
-        if (_state && surf) {
-            _state->setSurface(id, surf, true, false);
-        }
-    }
-
-    // Populate tree widget
-    {
-        const QSignalBlocker blocker{_ui.treeWidget};
-        _ui.treeWidget->clear();
-
-        for (const auto& [id, surf] : surfaces) {
-            if (!surf) {
-                continue;
-            }
-            auto* item = new SurfaceTreeWidgetItem(_ui.treeWidget);
-            item->setText(SURFACE_ID_COLUMN, QString::fromStdString(id));
-            item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(id));
-
-            auto* quadSurf = dynamic_cast<QuadSurface*>(surf.get());
-            if (quadSurf && !quadSurf->meta.is_null()) {
-                const double areaCm2 = vc::json::number_or(quadSurf->meta, "area_cm2", -1.0);
-                const double avgCost = vc::json::number_or(quadSurf->meta, "avg_cost", -1.0);
-                item->setText(2, QString::number(areaCm2, 'f', 3));
-                item->setText(3, QString::number(avgCost, 'f', 3));
-                item->setText(4, QString::number(quadSurf->overlappingIds().size()));
-                QString timestamp;
-                if (quadSurf->meta.contains("date_last_modified")) {
-                    timestamp = QString::fromStdString(quadSurf->meta["date_last_modified"].get_string());
-                }
-                item->setText(5, timestamp);
-            }
-        }
-
-        _ui.treeWidget->resizeColumnToContents(0);
-        _ui.treeWidget->resizeColumnToContents(1);
-    }
-
-    applyFilters();
-    if (_filtersUpdated) {
-        _filtersUpdated();
-    }
-    if (_viewerManager) {
-        _viewerManager->primeSurfacePatchIndicesAsync();
-    }
-    emit surfacesLoaded();
-}
-
-void SurfacePanelController::loadRemoteStubs(
-    const std::vector<std::string>& segmentIds,
-    const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& cachedSurfaces)
-{
-    if (!_ui.treeWidget) {
-        return;
-    }
-
-    _remoteStubSegments.clear();
-    _remoteDownloading.clear();
-
-    // Build lookup of already-loaded surfaces
-    std::unordered_map<std::string, std::shared_ptr<Surface>> loaded;
-    for (const auto& [id, surf] : cachedSurfaces) {
-        loaded[id] = surf;
-    }
-
-    // Register loaded surfaces in the collection
-    for (const auto& [id, surf] : cachedSurfaces) {
-        if (_state && surf) {
-            _state->setSurface(id, surf, true, false);
-        }
-    }
-
-    // Populate tree widget
-    {
-        const QSignalBlocker blocker{_ui.treeWidget};
-        _ui.treeWidget->clear();
-
-        for (const auto& segId : segmentIds) {
-            auto* item = new SurfaceTreeWidgetItem(_ui.treeWidget);
-            item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(segId));
-
-            auto it = loaded.find(segId);
-            if (it != loaded.end() && it->second) {
-                // Fully cached segment - show normally
-                item->setText(SURFACE_ID_COLUMN, QString::fromStdString(segId));
-                auto* quadSurf = dynamic_cast<QuadSurface*>(it->second.get());
-                if (quadSurf && !quadSurf->meta.is_null()) {
-                    const double areaCm2 = vc::json::number_or(quadSurf->meta, "area_cm2", -1.0);
-                    const double avgCost = vc::json::number_or(quadSurf->meta, "avg_cost", -1.0);
-                    item->setText(2, QString::number(areaCm2, 'f', 3));
-                    item->setText(3, QString::number(avgCost, 'f', 3));
-                    item->setText(4, QString::number(quadSurf->overlappingIds().size()));
-                    QString timestamp;
-                    if (quadSurf->meta.contains("date_last_modified")) {
-                        timestamp = QString::fromStdString(quadSurf->meta["date_last_modified"].get_string());
-                    }
-                    item->setText(5, timestamp);
-                }
-            } else {
-                // Remote stub - not yet downloaded
-                item->setText(SURFACE_ID_COLUMN,
-                    QString::fromStdString(segId) + QStringLiteral(" [remote]"));
-                item->setForeground(SURFACE_ID_COLUMN, QBrush(Qt::gray));
-                _remoteStubSegments.insert(segId);
-            }
-        }
-
-        _ui.treeWidget->resizeColumnToContents(0);
-        _ui.treeWidget->resizeColumnToContents(1);
-    }
-
-    applyFilters();
-    if (_filtersUpdated) {
-        _filtersUpdated();
-    }
-    if (_viewerManager) {
-        _viewerManager->primeSurfacePatchIndicesAsync();
-    }
-    emit surfacesLoaded();
-}
-
-void SurfacePanelController::replaceStubWithSurface(
-    const std::string& segmentId,
-    std::shared_ptr<Surface> surface)
-{
-    _remoteDownloading.erase(segmentId);
-
-    if (!surface) {
-        // Download failed - revert to stub state so user can retry
-        _remoteStubSegments.insert(segmentId);
-        if (_ui.treeWidget) {
-            const QString idQStr = QString::fromStdString(segmentId);
-            QTreeWidgetItemIterator it(_ui.treeWidget);
-            while (*it) {
-                if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() == idQStr) {
-                    (*it)->setText(SURFACE_ID_COLUMN,
-                        idQStr + QStringLiteral(" [remote - retry]"));
-                    (*it)->setForeground(SURFACE_ID_COLUMN, QBrush(Qt::darkRed));
-                    break;
-                }
-                ++it;
-            }
-        }
-        return;
-    }
-
-    _remoteStubSegments.erase(segmentId);
-
-    // Register in state
-    if (_state) {
-        _state->setSurface(segmentId, surface, true, false);
-    }
-
-    // Update tree item
-    if (_ui.treeWidget) {
-        const QString idQStr = QString::fromStdString(segmentId);
-        QTreeWidgetItemIterator it(_ui.treeWidget);
-        while (*it) {
-            if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() == idQStr) {
-                auto* item = static_cast<SurfaceTreeWidgetItem*>(*it);
-                item->setText(SURFACE_ID_COLUMN, idQStr);
-                item->setForeground(SURFACE_ID_COLUMN, QBrush(Qt::black));
-
-                auto* quadSurf = dynamic_cast<QuadSurface*>(surface.get());
-                if (quadSurf && !quadSurf->meta.is_null()) {
-                    const double areaCm2 = vc::json::number_or(quadSurf->meta, "area_cm2", -1.0);
-                    const double avgCost = vc::json::number_or(quadSurf->meta, "avg_cost", -1.0);
-                    item->setText(2, QString::number(areaCm2, 'f', 3));
-                    item->setText(3, QString::number(avgCost, 'f', 3));
-                    item->setText(4, QString::number(quadSurf->overlappingIds().size()));
-                    QString timestamp;
-                    if (quadSurf->meta.contains("date_last_modified")) {
-                        timestamp = QString::fromStdString(quadSurf->meta["date_last_modified"].get_string());
-                    }
-                    item->setText(5, timestamp);
-                    updateTreeItemIcon(item);
-                }
-                break;
-            }
-            ++it;
-        }
-    }
-
-    // Activate it (the user was trying to select it)
-    if (_state) {
-        _state->setSurface("segmentation", surface, false, false);
-        _state->setActiveSurface(segmentId, std::dynamic_pointer_cast<QuadSurface>(surface));
-        _state->emitSurfacesChanged();
-    }
-}
-
-bool SurfacePanelController::isRemoteStub(const std::string& segmentId) const
-{
-    return _remoteStubSegments.count(segmentId) > 0;
 }
 
 void SurfacePanelController::refreshSurfaceList()
@@ -561,7 +353,6 @@ void SurfacePanelController::populateSurfaceTree()
 
     const QSignalBlocker blocker{_ui.treeWidget};
     _ui.treeWidget->clear();
-    _remoteStubSegments.clear();
 
     for (const auto& id : _volumePkg->segmentationIDs()) {
         auto surf = _volumePkg->getSurface(id);
@@ -582,11 +373,6 @@ void SurfacePanelController::populateSurfaceTree()
             }
             item->setText(5, timestamp);
             updateTreeItemIcon(item);
-        } else if (_volumePkg->isRemoteSegment(id) && !_volumePkg->isRemoteSegmentCached(id)) {
-            item->setText(SURFACE_ID_COLUMN,
-                QString::fromStdString(id) + QStringLiteral(" [remote]"));
-            item->setForeground(SURFACE_ID_COLUMN, QBrush(Qt::gray));
-            _remoteStubSegments.insert(id);
         } else {
             delete item;
         }
@@ -809,21 +595,6 @@ void SurfacePanelController::handleTreeSelectionChanged()
     auto* firstSelected = selectedItems.first();
     const QString idQString = firstSelected->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
     const std::string id = idQString.toStdString();
-
-    // If this is a remote stub, trigger on-demand download instead of loading
-    if (_remoteStubSegments.count(id) && !_remoteDownloading.count(id)) {
-        _remoteDownloading.insert(id);
-        // Update the label to show downloading state
-        firstSelected->setText(SURFACE_ID_COLUMN,
-            QString::fromStdString(id) + QStringLiteral(" [downloading...]"));
-        firstSelected->setForeground(SURFACE_ID_COLUMN, QBrush(QColor(0, 120, 215)));
-        emit remoteSegmentDownloadRequested(idQString);
-        return;
-    }
-    if (_remoteDownloading.count(id)) {
-        // Already downloading, don't do anything
-        return;
-    }
 
     std::shared_ptr<QuadSurface> surface = getSurfaceById(id);
     bool surfaceJustLoaded = (surface != nullptr);
