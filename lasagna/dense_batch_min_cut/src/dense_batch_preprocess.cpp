@@ -2805,30 +2805,46 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                     const cv::Point pixel(x, y);
                     const int gx0 = lower_axis_index(grid_xs, x);
                     const int gy0 = lower_axis_index(grid_ys, y);
+                    const int gx1 = std::min(gx0 + 1, grid_cols - 1);
+                    const int gy1 = std::min(gy0 + 1, grid_rows - 1);
+                    const float x0 = static_cast<float>(grid_xs[gx0]);
+                    const float x1 = static_cast<float>(grid_xs[gx1]);
+                    const float y0 = static_cast<float>(grid_ys[gy0]);
+                    const float y1 = static_cast<float>(grid_ys[gy1]);
+                    const float tx =
+                        x1 > x0 ? (static_cast<float>(x) - x0) / (x1 - x0)
+                                : 0.0f;
+                    const float ty =
+                        y1 > y0 ? (static_cast<float>(y) - y0) / (y1 - y0)
+                                : 0.0f;
+                    const std::array<std::tuple<int, int, double>, 4>
+                        corners = {
+                            std::make_tuple(gx0, gy0,
+                                            (1.0 - tx) * (1.0 - ty)),
+                            std::make_tuple(gx1, gy0, tx * (1.0 - ty)),
+                            std::make_tuple(gx0, gy1, (1.0 - tx) * ty),
+                            std::make_tuple(gx1, gy1, tx * ty)};
                     double weighted_sum = 0.0;
                     double weight_sum = 0.0;
-                    for (int gy : {gy0, gy0 + 1}) {
-                        for (int gx : {gx0, gx0 + 1}) {
-                            const int node = grid_node_id(gx, gy);
-                            if (node < 0) {
-                                continue;
-                            }
-                            const float distance = static_cast<float>(
-                                cv::norm(pixel - carriers[node].pixel));
-                            if (!line_in_white(pixel, carriers[node].pixel)) {
-                                continue;
-                            }
-                            const float remaining =
-                                std::max(0.0f, kBacktrackRadius - distance);
-                            const int bucket = std::clamp(
-                                cvRound(remaining / kDpBucket), 0,
-                                kDpBuckets - 1);
-                            const double weight =
-                                1.0 / std::max(1.0, static_cast<double>(
-                                                         distance * distance));
-                            weighted_sum += dp_at(node, bucket) * weight;
-                            weight_sum += weight;
+                    for (const auto [gx, gy, bilinear_weight] : corners) {
+                        if (bilinear_weight <= 0.0) {
+                            continue;
                         }
+                        const int node = grid_node_id(gx, gy);
+                        if (node < 0) {
+                            continue;
+                        }
+                        const float distance = static_cast<float>(
+                            cv::norm(pixel - carriers[node].pixel));
+                        if (!line_in_white(pixel, carriers[node].pixel)) {
+                            continue;
+                        }
+                        const float remaining =
+                            std::max(0.0f, kBacktrackRadius - distance);
+                        const int bucket = std::clamp(
+                            cvRound(remaining / kDpBucket), 0, kDpBuckets - 1);
+                        weighted_sum += dp_at(node, bucket) * bilinear_weight;
+                        weight_sum += bilinear_weight;
                     }
                     result.flow.at<float>(y, x) =
                         weight_sum > 0.0
