@@ -1109,6 +1109,49 @@ public:
         return ZarrArray(std::move(store), array_key, std::move(meta), std::move(codec));
     }
 
+    /// Open from a Store with a codec registry.
+    static ZarrArray open(std::shared_ptr<Store> store, const std::string& array_key,
+                          CodecRegistry registry) {
+        auto store_key = [&](const std::string& name) -> std::string {
+            return array_key.empty() ? name : array_key + "/" + name;
+        };
+        ZarrMetadata meta;
+        ZarrVersion version = ZarrVersion::v2;
+        if (store->exists(store_key("zarr.json"))) {
+            auto data = store->get_string(store_key("zarr.json"));
+            meta = detail::parse_zarr_json(data);
+            version = ZarrVersion::v3;
+        } else if (store->exists(store_key(".zarray"))) {
+            auto data = store->get_string(store_key(".zarray"));
+            meta = detail::parse_zarray(data);
+            version = ZarrVersion::v2;
+        } else {
+            throw std::runtime_error("zarr: no metadata found at store key: " + array_key);
+        }
+
+        Codec codec;
+        if (version == ZarrVersion::v2 && !meta.compressor_id.empty()) {
+            auto it = registry.find(meta.compressor_id);
+            if (it != registry.end()) codec = it->second;
+        } else if (version == ZarrVersion::v3) {
+            auto scan = [&](const std::vector<ZarrCodecConfig>& cs) {
+                for (const auto& cc : cs) {
+                    if (cc.name != "bytes" && cc.name != "transpose"
+                        && cc.name != "sharding_indexed") {
+                        auto it = registry.find(cc.name);
+                        if (it != registry.end()) { codec = it->second; return true; }
+                    }
+                }
+                return false;
+            };
+            if (meta.shard_config) scan(meta.shard_config->sub_codecs);
+            if (!codec.decompress) scan(meta.codecs);
+        }
+
+        return ZarrArray(std::move(store), array_key, std::move(meta), std::move(codec),
+                         std::move(registry));
+    }
+
     /// Open with pre-parsed metadata (no file I/O). Used by open_from_consolidated.
     static ZarrArray open_with_metadata(const std::filesystem::path& path,
                                          ZarrMetadata meta, Codec codec = {}) {

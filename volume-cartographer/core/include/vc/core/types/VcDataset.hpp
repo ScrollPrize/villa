@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "utils/Json.hpp"
+#include "utils/zarr.hpp"
 
 namespace vc {
 
@@ -96,5 +97,7 @@ std::unique_ptr<VcDataset> createZarrDataset(
     const std::string& compressor = "blosc",
     const std::string& dimensionSeparator = ".",
     std::int64_t fillValue = 0);
+
+utils::ZarrArray::CodecRegistry buildZarrCodecRegistry(int dtypeSize);
 
 }  // namespace vc

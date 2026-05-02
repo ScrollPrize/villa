@@ -114,6 +114,14 @@ auto main(int argc, char* argv[]) -> int
     cv::setNumThreads(1);
     blosc_set_nthreads(1);  // We parallelize at tile level; blosc internal threads just spin-wait
 
+    // VC3D's interactive renderer performs better without BlockPipeline's
+    // per-frame fetchInteractive dedup. Keep this app default scoped to VC3D,
+    // while allowing users to set VC_DISABLE_FETCHINTERACTIVE_DEDUP=0 to
+    // compare or debug the dedup path.
+    if (qEnvironmentVariableIsEmpty("VC_DISABLE_FETCHINTERACTIVE_DEDUP")) {
+        qputenv("VC_DISABLE_FETCHINTERACTIVE_DEDUP", "1");
+    }
+
     // Workaround for Qt dock widget issues on Wayland (QTBUG-87332)
     // Floating dock widgets become unmovable after initial drag on Wayland.
     // Force XCB (X11/XWayland) platform to restore full functionality.
@@ -121,6 +129,14 @@ auto main(int argc, char* argv[]) -> int
         if (!qEnvironmentVariableIsEmpty("WAYLAND_DISPLAY")) {
             qputenv("QT_QPA_PLATFORM", "xcb");
         }
+    }
+
+    // VC3D uses traditional QWidget painting for the shell UI. Avoid Qt's
+    // RHI-backed widget flushing path unless the user explicitly opts in;
+    // it can route ordinary exposes through GLX and crash in some NVIDIA
+    // driver/Qt combinations before any project code is on the stack.
+    if (qEnvironmentVariableIsEmpty("QT_WIDGETS_RHI")) {
+        qputenv("QT_WIDGETS_RHI", "0");
     }
 
     QApplication app(argc, argv);
@@ -148,11 +164,11 @@ auto main(int argc, char* argv[]) -> int
         QString::number(CHUNK_CACHE_SIZE_GB));
     parser.addOption(cacheSizeOption);
 
-    QCommandLineOption prefetchLevelOption(
-        "prefetch-level",
-        "For remote Zarr volumes, block on startup/open and prefetch the given pyramid level plus all coarser levels into the local cache.",
-        "level");
-    parser.addOption(prefetchLevelOption);
+    QCommandLineOption loadFirstOption(
+        "load-first",
+        "Load the named segmentation folder first instead of loading all segmentation folders.",
+        "folder");
+    parser.addOption(loadFirstOption);
 
     QCommandLineOption debugOption(
         "debug",
@@ -191,18 +207,14 @@ auto main(int argc, char* argv[]) -> int
         cacheSizeGB = static_cast<size_t>(parsed);
     }
 
-    int startupPrefetchLevel = -1;
-    if (parser.isSet(prefetchLevelOption)) {
-        bool ok = false;
-        const int parsed = parser.value(prefetchLevelOption).toInt(&ok);
-        if (!ok || parsed < 0) {
-            std::cerr << "Error: Invalid prefetch level. Must be a non-negative integer." << std::endl;
-            return 1;
+    if (parser.isSet(loadFirstOption)) {
+        const QString loadFirstDir = parser.value(loadFirstOption).trimmed();
+        if (!loadFirstDir.isEmpty()) {
+            VolumePkg::setLoadFirstSegmentationDirectory(loadFirstDir.toStdString());
         }
-        startupPrefetchLevel = parsed;
     }
 
-    CWindow aWin(cacheSizeGB, startupPrefetchLevel);
+    CWindow aWin(cacheSizeGB);
     aWin.show();
     return QApplication::exec();
 }

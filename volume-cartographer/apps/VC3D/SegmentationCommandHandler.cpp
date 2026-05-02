@@ -14,7 +14,6 @@
 #include <filesystem>
 #include <limits>
 #include <mutex>
-#include <condition_variable>
 
 #include <QSettings>
 #include <QMessageBox>
@@ -61,9 +60,6 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/flattening/ABFFlattening.hpp"
-#include "vc/core/cache/BlockPipeline.hpp"
-#include "vc/core/cache/ChunkKey.hpp"
-#include "vc/core/types/VcDataset.hpp"
 #include "ToolDialogs.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "elements/JsonProfilePresets.hpp"
@@ -700,7 +696,8 @@ public:
     }
 
 private:
-    // Write (or update) meta.json in 'dir' so that it contains:
+    // Write (or update) meta.json in 'dir' so that it contains tifxyz identity
+    // fields plus:
     //   "scale": [sx, sy]
     // Returns true on success; leaves other JSON keys intact if meta.json exists.
     static bool overwriteMetaScale_(const QString& dir, double sx, double sy) {
@@ -719,6 +716,19 @@ private:
 
         QJsonArray scaleArr; scaleArr.append(sx); scaleArr.append(sy);
         root.insert(QStringLiteral("scale"), scaleArr);
+        if (!root.contains(QStringLiteral("type"))) {
+            root.insert(QStringLiteral("type"), QStringLiteral("seg"));
+        }
+        if (!root.contains(QStringLiteral("uuid"))) {
+            QString uuid = QFileInfo(dir).fileName();
+            if (uuid.isEmpty()) {
+                uuid = QDir(dir).dirName();
+            }
+            root.insert(QStringLiteral("uuid"), uuid);
+        }
+        if (!root.contains(QStringLiteral("format"))) {
+            root.insert(QStringLiteral("format"), QStringLiteral("tifxyz"));
+        }
 
         QFile out(metaPath);
         if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate)) {
@@ -1242,203 +1252,6 @@ private:
     QPointer<QProgressDialog> progress_;
 };
 
-// ---- Remote chunk fetch helpers ----
-
-struct RemoteChunkFetchProgress {
-    enum class Phase { Planning, Fetching };
-    std::atomic<Phase> phase{Phase::Planning};
-    std::atomic<int> planRowsDone{0};
-    std::atomic<int> planRowsTotal{0};
-    std::atomic<size_t> plannedKeys{0};
-    std::atomic<size_t> availableKeys{0};
-    std::atomic<size_t> totalKeys{0};
-    std::atomic<size_t> ioPending{0};
-};
-
-struct RemoteChunkFetchResult {
-    bool success{false};
-    QString error;
-    size_t totalKeys{0};
-    size_t initialAvailable{0};
-    size_t fetchedKeys{0};
-    int levels{0};
-};
-
-constexpr float kRemoteChunkFetchMarginVoxels = 2.0f;
-
-static void addChunkKeysForBounds(
-    std::unordered_set<vc::cache::ChunkKey, vc::cache::ChunkKeyHash>& keys,
-    vc::VcDataset* ds, int level,
-    const cv::Vec3f& lo, const cv::Vec3f& hi)
-{
-    if (!ds) return;
-    const double scale = (level > 0) ? (1.0 / static_cast<double>(1 << level)) : 1.0;
-    const auto& chunkShape = ds->defaultChunkShape();
-    const auto& shape = ds->shape();
-
-    const double loX = static_cast<double>(lo[0]) * scale - kRemoteChunkFetchMarginVoxels;
-    const double loY = static_cast<double>(lo[1]) * scale - kRemoteChunkFetchMarginVoxels;
-    const double loZ = static_cast<double>(lo[2]) * scale - kRemoteChunkFetchMarginVoxels;
-    const double hiX = static_cast<double>(hi[0]) * scale + kRemoteChunkFetchMarginVoxels;
-    const double hiY = static_cast<double>(hi[1]) * scale + kRemoteChunkFetchMarginVoxels;
-    const double hiZ = static_cast<double>(hi[2]) * scale + kRemoteChunkFetchMarginVoxels;
-
-    const int minIx = std::max(0, static_cast<int>(std::floor(loX / chunkShape[2])));
-    const int maxIx = std::min(static_cast<int>((shape[2] - 1) / chunkShape[2]),
-                               static_cast<int>(std::ceil(hiX / chunkShape[2])));
-    const int minIy = std::max(0, static_cast<int>(std::floor(loY / chunkShape[1])));
-    const int maxIy = std::min(static_cast<int>((shape[1] - 1) / chunkShape[1]),
-                               static_cast<int>(std::ceil(hiY / chunkShape[1])));
-    const int minIz = std::max(0, static_cast<int>(std::floor(loZ / chunkShape[0])));
-    const int maxIz = std::min(static_cast<int>((shape[0] - 1) / chunkShape[0]),
-                               static_cast<int>(std::ceil(hiZ / chunkShape[0])));
-
-    if (minIx > maxIx || minIy > maxIy || minIz > maxIz) return;
-
-    for (int iz = minIz; iz <= maxIz; ++iz)
-        for (int iy = minIy; iy <= maxIy; ++iy)
-            for (int ix = minIx; ix <= maxIx; ++ix)
-                keys.insert(vc::cache::ChunkKey{level, iz, iy, ix});
-}
-
-static std::vector<vc::cache::ChunkKey> collectRemoteChunkKeysForSurface(
-    const QuadSurface& surface,
-    const std::shared_ptr<Volume>& volume,
-    const std::shared_ptr<RemoteChunkFetchProgress>& progress)
-{
-    std::unordered_set<vc::cache::ChunkKey, vc::cache::ChunkKeyHash> keys;
-    const auto* points = surface.rawPointsPtr();
-    if (!points || points->empty() || !volume) return {};
-
-    const int numLevels = static_cast<int>(volume->numScales());
-    const int quadRows = std::max(0, points->rows - 1);
-    progress->phase.store(RemoteChunkFetchProgress::Phase::Planning, std::memory_order_relaxed);
-    progress->planRowsDone.store(0, std::memory_order_relaxed);
-    progress->planRowsTotal.store(quadRows + points->rows, std::memory_order_relaxed);
-
-    for (int row = 0; row < quadRows; ++row) {
-        for (int col = 0; col < points->cols - 1; ++col) {
-            if (!surface.isQuadValid(row, col)) continue;
-
-            const cv::Vec3f& p00 = (*points)(row, col);
-            const cv::Vec3f& p01 = (*points)(row, col + 1);
-            const cv::Vec3f& p10 = (*points)(row + 1, col);
-            const cv::Vec3f& p11 = (*points)(row + 1, col + 1);
-
-            cv::Vec3f lo = p00, hi = p00;
-            for (const cv::Vec3f& point : {p01, p10, p11}) {
-                lo[0] = std::min(lo[0], point[0]); lo[1] = std::min(lo[1], point[1]); lo[2] = std::min(lo[2], point[2]);
-                hi[0] = std::max(hi[0], point[0]); hi[1] = std::max(hi[1], point[1]); hi[2] = std::max(hi[2], point[2]);
-            }
-
-            for (int level = 0; level < numLevels; ++level)
-                addChunkKeysForBounds(keys, volume->zarrDataset(level), level, lo, hi);
-        }
-        progress->planRowsDone.store(row + 1, std::memory_order_relaxed);
-        if (((row + 1) % 8) == 0 || row + 1 == quadRows)
-            progress->plannedKeys.store(keys.size(), std::memory_order_relaxed);
-    }
-
-    for (int row = 0; row < points->rows; ++row) {
-        for (int col = 0; col < points->cols; ++col) {
-            const cv::Vec3f& point = (*points)(row, col);
-            if (!isValidSurfacePoint(point)) continue;
-            for (int level = 0; level < numLevels; ++level)
-                addChunkKeysForBounds(keys, volume->zarrDataset(level), level, point, point);
-        }
-        progress->planRowsDone.store(quadRows + row + 1, std::memory_order_relaxed);
-        if (((row + 1) % 8) == 0 || row + 1 == points->rows)
-            progress->plannedKeys.store(keys.size(), std::memory_order_relaxed);
-    }
-
-    std::vector<vc::cache::ChunkKey> orderedKeys(keys.begin(), keys.end());
-    std::sort(orderedKeys.begin(), orderedKeys.end(), [](const auto& a, const auto& b) {
-        if (a.level != b.level) return a.level < b.level;
-        if (a.iz != b.iz) return a.iz < b.iz;
-        if (a.iy != b.iy) return a.iy < b.iy;
-        return a.ix < b.ix;
-    });
-
-    progress->totalKeys.store(orderedKeys.size(), std::memory_order_relaxed);
-    return orderedKeys;
-}
-
-static RemoteChunkFetchResult fetchRemoteChunkKeys(
-    vc::cache::BlockPipeline* cache,
-    const std::vector<vc::cache::ChunkKey>& keys,
-    const std::shared_ptr<RemoteChunkFetchProgress>& progress)
-{
-    RemoteChunkFetchResult result;
-    result.totalKeys = keys.size();
-    if (!cache) {
-        result.error = QObject::tr("Chunk cache is not available.");
-        return result;
-    }
-
-    progress->phase.store(RemoteChunkFetchProgress::Phase::Fetching, std::memory_order_relaxed);
-    progress->totalKeys.store(keys.size(), std::memory_order_relaxed);
-
-    if (keys.empty()) { result.success = true; return result; }
-
-    result.initialAvailable = cache->countAvailable(keys);
-    progress->availableKeys.store(result.initialAvailable, std::memory_order_relaxed);
-
-    // Use a condition_variable to wake up when chunks arrive instead of
-    // sleep-polling.  The cache fires its ChunkReadyCallback on the IO
-    // thread each time a chunk finishes; we signal the CV from there.
-    // BlockPipeline fires listeners from a snapshot taken under lock, so
-    // removeChunkReadyListener() does not stop an already-snapshotted call
-    // from running after we return. Keep the cv+mutex alive via shared_ptr
-    // so any in-flight callback can safely signal a no-op on a detached
-    // state rather than touch a destroyed stack variable.
-    struct WaitState {
-        std::mutex mtx;
-        std::condition_variable cv;
-    };
-    auto state = std::make_shared<WaitState>();
-    auto listenerId = cache->addChunkReadyListener(
-        [state](const vc::cache::ChunkKey&) { state->cv.notify_one(); });
-
-    cache->fetchInteractive(keys);
-
-    size_t available = result.initialAvailable;
-    size_t lastAvailable = available;
-    int idleRetries = 0;
-
-    while (available < keys.size()) {
-        {
-            std::unique_lock<std::mutex> lk(state->mtx);
-            state->cv.wait_for(lk, std::chrono::milliseconds(200));
-        }
-        available = cache->countAvailable(keys);
-        const auto stats = cache->stats();
-        progress->availableKeys.store(available, std::memory_order_relaxed);
-        progress->ioPending.store(stats.ioPending, std::memory_order_relaxed);
-
-        if (available >= keys.size()) break;
-
-        if (stats.ioPending == 0 && available == lastAvailable) {
-            ++idleRetries;
-            cache->fetchInteractive(keys);
-            if (idleRetries > 3) {
-                cache->removeChunkReadyListener(listenerId);
-                result.error = QObject::tr("Remote chunk fetch stalled at %1 / %2 chunks.")
-                                   .arg(available).arg(keys.size());
-                return result;
-            }
-        } else {
-            idleRetries = 0;
-        }
-        lastAvailable = available;
-    }
-
-    cache->removeChunkReadyListener(listenerId);
-
-    result.success = true;
-    result.fetchedKeys = keys.size() - result.initialAvailable;
-    return result;
-}
-
 } // -------------------- end anonymous namespace ------------------------------
 
 // ====================== SegmentationCommandHandler ============================
@@ -1458,6 +1271,28 @@ QString SegmentationCommandHandler::getCurrentVolumePath() const
         return QString();
     }
     return QString::fromStdString(_state->currentVolume()->path().string());
+}
+
+QString SegmentationCommandHandler::getCurrentRenderVolumePath(QString* remoteUrlOut) const
+{
+    if (remoteUrlOut) {
+        remoteUrlOut->clear();
+    }
+
+    auto volume = _state ? _state->currentVolume() : nullptr;
+    if (!volume) {
+        return QString();
+    }
+
+    if (volume->isRemote()) {
+        const QString remoteUrl = QString::fromStdString(volume->remoteUrl());
+        if (remoteUrlOut) {
+            *remoteUrlOut = remoteUrl;
+        }
+        return remoteUrl;
+    }
+
+    return QString::fromStdString(volume->path().string());
 }
 
 QuadSurface* SegmentationCommandHandler::requireSurfaceAndRunner(
@@ -1532,141 +1367,6 @@ SegmentationCommandHandler::buildVolumeOptionList(QString* defaultOut)
     return options;
 }
 
-void SegmentationCommandHandler::onFetchRemoteChunks(const std::string& segmentId)
-{
-    if (!_state) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Application state is not available."));
-        return;
-    }
-
-    const auto volume = _state->currentVolume();
-    if (!volume) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("No volume is currently loaded."));
-        return;
-    }
-    if (!volume->isRemote()) {
-        QMessageBox::information(_parentWidget, tr("Fetch Remote Chunks"),
-                                 tr("The current volume is local, so there are no remote chunks to fetch."));
-        return;
-    }
-
-    std::shared_ptr<QuadSurface> surface = std::dynamic_pointer_cast<QuadSurface>(_state->surface(segmentId));
-    if (!surface && _state->vpkg()) {
-        surface = std::dynamic_pointer_cast<QuadSurface>(_state->vpkg()->getSurface(segmentId));
-    }
-    if (!surface) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-                             tr("Could not find surface '%1'.").arg(QString::fromStdString(segmentId)));
-        return;
-    }
-    surface->ensureLoaded();
-
-    auto* cache = volume->tieredCache();
-    if (!cache) {
-        QMessageBox::warning(_parentWidget, tr("Error"),
-                             tr("Chunk cache is not available for the current volume."));
-        return;
-    }
-
-    const QString segmentName = QString::fromStdString(segmentId);
-    auto progressState = std::make_shared<RemoteChunkFetchProgress>();
-
-    QProgressDialog progress(tr("Planning remote chunk fetch for %1...").arg(segmentName),
-                             QString(), 0, 0, _parentWidget);
-    progress.setWindowTitle(tr("Fetch Remote Chunks"));
-    progress.setWindowModality(Qt::WindowModal);
-    progress.setAutoClose(false);
-    progress.setAutoReset(false);
-    progress.setMinimumDuration(0);
-    progress.setCancelButton(nullptr);
-
-    QFutureWatcher<RemoteChunkFetchResult> watcher;
-    QTimer timer;
-
-    connect(&watcher, &QFutureWatcher<RemoteChunkFetchResult>::finished,
-            &progress, &QDialog::accept);
-    connect(&timer, &QTimer::timeout, &progress, [&progress, progressState, segmentName]() {
-        const auto phase = progressState->phase.load(std::memory_order_relaxed);
-        if (phase == RemoteChunkFetchProgress::Phase::Planning) {
-            const int totalRows = progressState->planRowsTotal.load(std::memory_order_relaxed);
-            const int doneRows = progressState->planRowsDone.load(std::memory_order_relaxed);
-            if (totalRows > 0) {
-                progress.setRange(0, totalRows);
-                progress.setValue(std::min(doneRows, totalRows));
-            } else {
-                progress.setRange(0, 0);
-            }
-            progress.setLabelText(
-                QObject::tr("Planning remote chunk fetch for %1...\nRows: %2 / %3\nChunks identified: %4")
-                    .arg(segmentName).arg(doneRows).arg(totalRows)
-                    .arg(QString::number(static_cast<qulonglong>(
-                        progressState->plannedKeys.load(std::memory_order_relaxed)))));
-            return;
-        }
-
-        const size_t totalKeys = progressState->totalKeys.load(std::memory_order_relaxed);
-        const size_t availableKeys = progressState->availableKeys.load(std::memory_order_relaxed);
-        const size_t ioPending = progressState->ioPending.load(std::memory_order_relaxed);
-        if (totalKeys > 0) {
-            const int safeTotal = totalKeys > static_cast<size_t>(std::numeric_limits<int>::max())
-                ? std::numeric_limits<int>::max() : static_cast<int>(totalKeys);
-            progress.setRange(0, safeTotal);
-            progress.setValue(std::min(static_cast<int>(availableKeys), safeTotal));
-        } else {
-            progress.setRange(0, 0);
-        }
-        progress.setLabelText(
-            QObject::tr("Fetching remote chunks for %1...\nChunks ready: %2 / %3\nPending I/O: %4")
-                .arg(segmentName)
-                .arg(QString::number(static_cast<qulonglong>(availableKeys)))
-                .arg(QString::number(static_cast<qulonglong>(totalKeys)))
-                .arg(QString::number(static_cast<qulonglong>(ioPending))));
-    });
-
-    timer.start(100);
-    watcher.setFuture(QtConcurrent::run([surface, volume, cache, progressState]() {
-        RemoteChunkFetchResult result;
-        result.levels = static_cast<int>(volume->numScales());
-        const auto keys = collectRemoteChunkKeysForSurface(*surface, volume, progressState);
-        auto fetchResult = fetchRemoteChunkKeys(cache, keys, progressState);
-        fetchResult.levels = result.levels;
-        return fetchResult;
-    }));
-
-    if (!watcher.isFinished()) {
-        progress.exec();
-    }
-    timer.stop();
-
-    const auto result = watcher.result();
-    if (!result.success) {
-        QMessageBox::warning(_parentWidget, tr("Fetch Remote Chunks"),
-                             result.error.isEmpty()
-                                 ? tr("Failed to fetch remote chunks for '%1'.").arg(segmentName)
-                                 : result.error);
-        return;
-    }
-
-    if (result.totalKeys == 0) {
-        emit statusMessage(tr("No remote chunks were needed for '%1'.").arg(segmentName), 5000);
-        return;
-    }
-
-    if (result.fetchedKeys == 0) {
-        emit statusMessage(
-            tr("All %1 remote chunk(s) for '%2' were already cached.")
-                .arg(QString::number(static_cast<qulonglong>(result.totalKeys)))
-                .arg(segmentName), 7000);
-        return;
-    }
-
-    emit statusMessage(
-        tr("Fetched %1 remote chunk(s) for '%2' across %3 scale level(s) (%4 already cached).")
-            .arg(QString::number(static_cast<qulonglong>(result.fetchedKeys)))
-            .arg(segmentName).arg(result.levels)
-            .arg(QString::number(static_cast<qulonglong>(result.initialAvailable))), 7000);
-}
-
 void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
 {
     auto* surface = requireSurfaceAndRunner(segmentId, false);
@@ -1676,7 +1376,9 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
-    const QString volumePath = getCurrentVolumePath();
+    auto renderVolume = _state ? _state->currentVolume() : nullptr;
+    QString remoteVolumeUrl;
+    const QString volumePath = getCurrentRenderVolumePath(&remoteVolumeUrl);
     const QString segmentPath = QString::fromStdString(surf->path.string());
     const QString segmentOutDir = QString::fromStdString(surf->path.string());
     const QString outputFormat = "%s/layers";
@@ -1706,6 +1408,17 @@ void SegmentationCommandHandler::onRenderSegment(const std::string& segmentId)
     _cmdRunner->setRenderParams(static_cast<float>(dlg.scale()), dlg.groupIdx(), dlg.numSlices());
     _cmdRunner->setOmpThreads(dlg.ompThreads());
     _cmdRunner->setVolumePath(dlg.volumePath());
+    const bool useRemoteVolume = dlg.volumePath() == volumePath && !remoteVolumeUrl.isEmpty();
+    _cmdRunner->setRemoteVolumeUrl(useRemoteVolume ? remoteVolumeUrl : QString());
+    if (useRemoteVolume && renderVolume && renderVolume->isRemote()) {
+        const auto& auth = renderVolume->remoteAuth();
+        _cmdRunner->setRemoteVolumeAuth(QString::fromStdString(auth.access_key),
+                                        QString::fromStdString(auth.secret_key),
+                                        QString::fromStdString(auth.session_token),
+                                        QString::fromStdString(auth.region));
+    } else {
+        _cmdRunner->setRemoteVolumeAuth(QString(), QString(), QString(), QString());
+    }
     _cmdRunner->setRenderAdvanced(
         dlg.cropX(), dlg.cropY(), dlg.cropWidth(), dlg.cropHeight(),
         dlg.affinePath(), dlg.invertAffine(),
@@ -1837,20 +1550,6 @@ void SegmentationCommandHandler::onGrowSegmentFromSegment(const std::string& seg
     _cmdRunner->showConsoleOutput();
     _cmdRunner->execute(CommandLineToolRunner::Tool::GrowSegFromSegment);
     emit statusMessage(tr("Growing segment from: %1").arg(QString::fromStdString(segmentId)), 5000);
-}
-
-void SegmentationCommandHandler::onAddOverlap(const std::string& segmentId)
-{
-    auto* surface = requireSurfaceAndRunner(segmentId, true);
-    if (!surface) return;
-
-    std::filesystem::path volpkgPath = std::filesystem::path(_state->vpkgPath().toStdString());
-    std::filesystem::path pathsDir = volpkgPath / "paths";
-    QString tifxyzPath = QString::fromStdString(surface->path.string());
-
-    _cmdRunner->setAddOverlapParams(QString::fromStdString(pathsDir.string()), tifxyzPath);
-    _cmdRunner->execute(CommandLineToolRunner::Tool::SegAddOverlap);
-    emit statusMessage(tr("Adding overlap for segment: %1").arg(QString::fromStdString(segmentId)), 5000);
 }
 
 void SegmentationCommandHandler::onNeighborCopyRequested(const QString& segmentId, bool copyOut)
@@ -2472,65 +2171,6 @@ void SegmentationCommandHandler::onAlphaCompRefine(const std::string& segmentId)
     emit statusMessage(tr("Refining segment: %1").arg(QString::fromStdString(segmentId)), 5000);
 }
 
-void SegmentationCommandHandler::onGrowSeeds(const std::string& segmentId, bool isExpand, bool isRandomSeed)
-{
-    if (_state->currentVolume() == nullptr) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Cannot grow seeds: No volume loaded"));
-        return;
-    }
-
-    if (!_cmdRunner) {
-        emit statusMessage(tr("Command line tools not available"), 3000);
-        return;
-    }
-    if (_cmdRunner->isRunning()) {
-        QMessageBox::warning(_parentWidget, tr("Warning"), tr("A command line tool is already running."));
-        return;
-    }
-
-    std::filesystem::path volpkgPath = std::filesystem::path(_state->vpkgPath().toStdString());
-    std::filesystem::path pathsDir = volpkgPath / "paths";
-
-    if (!std::filesystem::exists(pathsDir)) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Paths directory not found in the volpkg"));
-        return;
-    }
-
-    QString jsonFileName = isExpand ? "expand.json" : "seed.json";
-    std::filesystem::path jsonParamsPath = volpkgPath / jsonFileName.toStdString();
-
-    if (!std::filesystem::exists(jsonParamsPath)) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("%1 not found in the volpkg").arg(jsonFileName));
-        return;
-    }
-
-    int seedX = 0, seedY = 0, seedZ = 0;
-    if (!isExpand && !isRandomSeed) {
-        POI *poi = _state->poi("focus");
-        if (!poi) {
-            QMessageBox::warning(_parentWidget, tr("Error"), tr("No focus point selected. Click on a volume with Ctrl key to set a seed point."));
-            return;
-        }
-        seedX = static_cast<int>(poi->p[0]);
-        seedY = static_cast<int>(poi->p[1]);
-        seedZ = static_cast<int>(poi->p[2]);
-    }
-
-    _cmdRunner->setGrowParams(
-        QString(),
-        QString::fromStdString(pathsDir.string()),
-        QString::fromStdString(jsonParamsPath.string()),
-        seedX, seedY, seedZ,
-        isExpand, isRandomSeed
-    );
-
-    _cmdRunner->execute(CommandLineToolRunner::Tool::GrowSegFromSeeds);
-
-    QString modeDesc = isExpand ? "expand mode" :
-                      (isRandomSeed ? "random seed mode" : "seed mode");
-    emit statusMessage(tr("Growing segment using %1 in %2").arg(jsonFileName).arg(modeDesc), 5000);
-}
-
 void SegmentationCommandHandler::handleNeighborCopyToolFinished(bool success)
 {
     if (!_neighborCopyJob) {
@@ -2662,310 +2302,6 @@ void SegmentationCommandHandler::launchNeighborCopySecondPass()
             tr("Copy %1 pass 2 running").arg(copyOut ? tr("out") : tr("in")),
             3000);
     });
-}
-
-// ---------------------------------------------------------------------------
-// AWSUploadJob -- async, signal-driven S3 upload that does NOT block the GUI.
-// Uploads are queued and executed one at a time via QProcess::finished.
-// ---------------------------------------------------------------------------
-class AWSUploadJob : public QObject {
-public:
-    struct UploadTask {
-        QString localPath;
-        QString s3Path;
-        QString description;
-        bool    isDirectory{false};
-    };
-
-    AWSUploadJob(QWidget* parentWidget,
-                 const QString& segDir,
-                 const QString& awsProfile,
-                 QList<UploadTask> tasks,
-                 SegmentationCommandHandler* handler)
-        : QObject(handler)
-        , parentWidget_(parentWidget)
-        , handler_(handler)
-        , segDir_(segDir)
-        , awsProfile_(awsProfile)
-        , tasks_(std::move(tasks))
-        , proc_(new QProcess(this))
-        , progress_(new QProgressDialog(
-              QObject::tr("Uploading to AWS S3..."),
-              QObject::tr("Cancel"), 0,
-              std::max(1, static_cast<int>(tasks_.size())),
-              parentWidget))
-    {
-        proc_->setWorkingDirectory(segDir_);
-        proc_->setProcessChannelMode(QProcess::MergedChannels);
-
-        progress_->setWindowModality(Qt::WindowModal);
-        progress_->setAutoClose(false);
-        progress_->setValue(0);
-        progress_->setAttribute(Qt::WA_DeleteOnClose);
-
-        QObject::connect(progress_, &QProgressDialog::canceled,
-                         this, &AWSUploadJob::onCanceled_);
-        QObject::connect(proc_, &QProcess::readyReadStandardOutput,
-                         this, &AWSUploadJob::onStdout_);
-        QObject::connect(proc_, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-                         this, &AWSUploadJob::onFinished_);
-        QObject::connect(proc_, &QProcess::errorOccurred,
-                         this, &AWSUploadJob::onProcError_);
-
-        if (tasks_.isEmpty()) {
-            showSummary_();
-            return;
-        }
-
-        startNext_();
-    }
-
-private:
-    void startNext_() {
-        if (canceled_) return;
-        lastOutput_.clear();
-
-        // Skip tasks whose source files don't exist.
-        while (taskIndex_ < tasks_.size()) {
-            const auto& t = tasks_[taskIndex_];
-            if (QFileInfo::exists(t.localPath) &&
-                (!t.isDirectory || QFileInfo(t.localPath).isDir())) {
-                break;
-            }
-            ++taskIndex_;
-        }
-
-        if (taskIndex_ >= tasks_.size()) {
-            showSummary_();
-            return;
-        }
-
-        const auto& task = tasks_[taskIndex_];
-
-        QStringList args;
-        args << "s3" << "cp" << task.localPath << task.s3Path;
-        if (task.isDirectory) args << "--recursive";
-        if (!awsProfile_.isEmpty()) { args << "--profile" << awsProfile_; }
-
-        if (progress_) {
-            progress_->setLabelText(QObject::tr("Uploading %1...").arg(task.description));
-        }
-        if (handler_) emit handler_->statusMessage(QObject::tr("Uploading %1...").arg(task.description), 0);
-
-        proc_->start("aws", args);
-    }
-
-    void onStdout_() {
-        const QByteArray raw = proc_->readAllStandardOutput();
-        lastOutput_ += raw;
-        const QString output = QString::fromLocal8Bit(raw);
-        if (output.isEmpty()) return;
-        const QStringList lines = output.split('\n', Qt::SkipEmptyParts);
-        for (const QString& line : lines) {
-            if (line.contains("Completed") || line.contains("upload:")) {
-                const QString& desc = tasks_[taskIndex_].description;
-                if (handler_) emit handler_->statusMessage(
-                    QString("Uploading %1: %2").arg(desc, line.trimmed()), 0);
-            }
-        }
-    }
-
-    void onFinished_(int exitCode, QProcess::ExitStatus st) {
-        if (canceled_) return;
-
-        const auto& task = tasks_[taskIndex_];
-        if (st == QProcess::NormalExit && exitCode == 0) {
-            uploadedFiles_ << task.description;
-        } else {
-            const QString error = QString::fromLocal8Bit(lastOutput_).trimmed();
-            failedFiles_ << QString("%1: %2").arg(task.description, error);
-        }
-
-        ++taskIndex_;
-        if (progress_) progress_->setValue(taskIndex_);
-
-        if (taskIndex_ < tasks_.size()) {
-            startNext_();
-        } else {
-            showSummary_();
-        }
-    }
-
-    void onProcError_(QProcess::ProcessError err) {
-        if (canceled_) return;
-        if (err == QProcess::FailedToStart) {
-            const auto& task = tasks_[taskIndex_];
-            failedFiles_ << QString("%1: Failed to start AWS CLI").arg(task.description);
-            ++taskIndex_;
-            if (progress_) progress_->setValue(taskIndex_);
-            if (taskIndex_ < tasks_.size()) {
-                startNext_();
-            } else {
-                showSummary_();
-            }
-        }
-    }
-
-    void onCanceled_() {
-        canceled_ = true;
-        if (proc_->state() != QProcess::NotRunning) {
-            proc_->kill();
-            proc_->waitForFinished(3000);
-        }
-        if (progress_) { progress_->close(); }
-        if (handler_) emit handler_->statusMessage(QObject::tr("AWS upload cancelled"), 3000);
-        deleteLater();
-    }
-
-    void showSummary_() {
-        if (progress_) {
-            progress_->setValue(progress_->maximum());
-            progress_->close();
-        }
-
-        if (!uploadedFiles_.isEmpty() && failedFiles_.isEmpty()) {
-            QMessageBox::information(parentWidget_, QObject::tr("Upload Complete"),
-                QObject::tr("Successfully uploaded to S3:\n\n%1").arg(uploadedFiles_.join("\n")));
-            if (handler_) emit handler_->statusMessage(QObject::tr("AWS upload complete"), 5000);
-        } else if (!uploadedFiles_.isEmpty() && !failedFiles_.isEmpty()) {
-            QMessageBox::warning(parentWidget_, QObject::tr("Partial Upload"),
-                QObject::tr("Uploaded:\n%1\n\nFailed:\n%2").arg(uploadedFiles_.join("\n"), failedFiles_.join("\n")));
-            if (handler_) emit handler_->statusMessage(QObject::tr("AWS upload partially complete"), 5000);
-        } else if (uploadedFiles_.isEmpty() && !failedFiles_.isEmpty()) {
-            QMessageBox::critical(parentWidget_, QObject::tr("Upload Failed"),
-                QObject::tr("All uploads failed:\n\n%1\n\nPlease check:\n"
-                   "- AWS CLI is installed\n"
-                   "- AWS credentials are configured\n"
-                   "- You have internet connection\n"
-                   "- You have permissions for the S3 bucket").arg(failedFiles_.join("\n")));
-            if (handler_) emit handler_->statusMessage(QObject::tr("AWS upload failed"), 5000);
-        } else {
-            QMessageBox::information(parentWidget_, QObject::tr("No Files to Upload"),
-                QObject::tr("No files were uploaded."));
-            if (handler_) emit handler_->statusMessage(QObject::tr("No files to upload"), 3000);
-        }
-
-        deleteLater();
-    }
-
-    QPointer<QWidget> parentWidget_;
-    QPointer<SegmentationCommandHandler> handler_;
-    QString segDir_;
-    QString awsProfile_;
-    QList<UploadTask> tasks_;
-    QProcess* proc_;
-    QProgressDialog* progress_;
-    QStringList uploadedFiles_;
-    QStringList failedFiles_;
-    QByteArray lastOutput_;
-    int taskIndex_{0};
-    bool canceled_{false};
-};
-
-// Helper: enqueue upload tasks for one segment directory.
-static void enqueueSegmentUploads(
-    QList<AWSUploadJob::UploadTask>& tasks,
-    const QString& targetDir,
-    const QString& segmentId,
-    const QString& segmentSuffix,
-    const QString& selectedScroll)
-{
-    const QString segmentName = segmentId + segmentSuffix;
-    const QString meshPath = QString("s3://vesuvius-challenge/%1/segments/meshes/%2/")
-        .arg(selectedScroll, segmentName);
-
-    const QString objFile = QDir(targetDir).filePath(segmentName + ".obj");
-    tasks.append({objFile, meshPath, QString("%1.obj").arg(segmentName), false});
-
-    const QString flatboiObjFile = QDir(targetDir).filePath(segmentName + "_flatboi.obj");
-    tasks.append({flatboiObjFile, meshPath, QString("%1_flatboi.obj").arg(segmentName), false});
-
-    const QString xTif = QDir(targetDir).filePath("x.tif");
-    const QString yTif = QDir(targetDir).filePath("y.tif");
-    const QString zTif = QDir(targetDir).filePath("z.tif");
-    const QString metaJson = QDir(targetDir).filePath("meta.json");
-
-    if (QFileInfo::exists(xTif) && QFileInfo::exists(yTif) &&
-        QFileInfo::exists(zTif) && QFileInfo::exists(metaJson)) {
-        tasks.append({xTif, meshPath, QString("%1/x.tif").arg(segmentName), false});
-        tasks.append({yTif, meshPath, QString("%1/y.tif").arg(segmentName), false});
-        tasks.append({zTif, meshPath, QString("%1/z.tif").arg(segmentName), false});
-        tasks.append({metaJson, meshPath, QString("%1/meta.json").arg(segmentName), false});
-    }
-
-    const QString overlappingJson = QDir(targetDir).filePath("overlapping.json");
-    tasks.append({overlappingJson, meshPath, QString("%1/overlapping.json").arg(segmentName), false});
-
-    const QString layersDir = QDir(targetDir).filePath("layers");
-    if (QFileInfo::exists(layersDir) && QFileInfo(layersDir).isDir()) {
-        const QString surfaceVolPath = QString("s3://vesuvius-challenge/%1/segments/surface-volumes/%2/layers/")
-            .arg(selectedScroll, segmentName);
-        tasks.append({layersDir, surfaceVolPath, QString("%1/layers").arg(segmentName), true});
-    }
-}
-
-void SegmentationCommandHandler::onAWSUpload(const std::string& segmentId)
-{
-    auto* surface = requireSurfaceAndRunner(segmentId, false);
-    if (!surface) return;
-    if (_cmdRunner && _cmdRunner->isRunning()) {
-        QMessageBox::warning(_parentWidget, tr("Warning"), tr("A command line tool is already running."));
-        return;
-    }
-
-    const std::filesystem::path segDirFs = surface->path;
-    const QString  segDir   = QString::fromStdString(segDirFs.string());
-    const QString  outTifxyz= segDir + "_flatboi";
-
-    if (!QFileInfo::exists(segDir)) {
-        QMessageBox::warning(_parentWidget, tr("Error"), tr("Cannot upload to AWS: Segment directory not found"));
-        return;
-    }
-
-    QStringList scrollOptions;
-    scrollOptions << "PHerc0172" << "PHerc0343P" << "PHerc0500P2";
-
-    bool ok;
-    QString selectedScroll = QInputDialog::getItem(
-        _parentWidget,
-        tr("Select Scroll for Upload"),
-        tr("Select the target scroll directory:"),
-        scrollOptions,
-        0, false, &ok
-    );
-
-    if (!ok || selectedScroll.isEmpty()) {
-        emit statusMessage(tr("AWS upload cancelled by user"), 3000);
-        return;
-    }
-
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    QString defaultProfile = settings.value(vc3d::settings::aws::DEFAULT_PROFILE,
-                                            vc3d::settings::aws::DEFAULT_PROFILE_DEFAULT).toString();
-
-    QString awsProfile = QInputDialog::getText(
-        _parentWidget, tr("AWS Profile"),
-        tr("Enter AWS profile name (leave empty for default credentials):"),
-        QLineEdit::Normal, defaultProfile, &ok
-    );
-
-    if (!ok) {
-        emit statusMessage(tr("AWS upload cancelled by user"), 3000);
-        return;
-    }
-
-    if (!awsProfile.isEmpty()) settings.setValue(vc3d::settings::aws::DEFAULT_PROFILE, awsProfile);
-
-    // Build the upload queue (non-existent files are skipped at upload time).
-    const QString segIdStr = QString::fromStdString(segmentId);
-    QList<AWSUploadJob::UploadTask> tasks;
-    enqueueSegmentUploads(tasks, segDir, segIdStr, QString(), selectedScroll);
-    if (QFileInfo::exists(outTifxyz) && QFileInfo(outTifxyz).isDir()) {
-        enqueueSegmentUploads(tasks, outTifxyz, segIdStr, QStringLiteral("_flatboi"), selectedScroll);
-    }
-
-    // AWSUploadJob is self-deleting (calls deleteLater() when finished).
-    new AWSUploadJob(_parentWidget, segDir, awsProfile, std::move(tasks), this);
 }
 
 void SegmentationCommandHandler::onRasterizeSegments(const QStringList& segmentIds)

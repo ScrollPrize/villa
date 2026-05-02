@@ -1,8 +1,7 @@
 #include "SegmentationOverlayController.hpp"
 
 #include "../CState.hpp"
-#include "../adaptive/CAdaptiveVolumeViewer.hpp"
-#include "../VolumeViewerBase.hpp"
+#include "../volume_viewers/VolumeViewerBase.hpp"
 #include "../ViewerManager.hpp"
 #include "../segmentation/tools/SegmentationEditManager.hpp"
 
@@ -675,10 +674,8 @@ bool SegmentationOverlayController::isOverlayEnabledFor(VolumeViewerBase* viewer
 
     // Also enable if surface overlap overlay is active on this viewer
     bool surfaceOverlapActive = false;
-    if (auto* tiledViewer = dynamic_cast<CTiledVolumeViewer*>(viewer)) {
-        surfaceOverlapActive = tiledViewer->surfaceOverlayEnabled() &&
-                               !tiledViewer->surfaceOverlays().empty();
-    }
+    surfaceOverlapActive = viewer && viewer->surfaceOverlayEnabled() &&
+                           !viewer->surfaceOverlays().empty();
 
     return _editingEnabled || approvalMaskActive || surfaceOverlapActive;
 }
@@ -701,10 +698,9 @@ void SegmentationOverlayController::collectPrimitives(VolumeViewerBase* viewer,
 
     if (state.manualAddActive) {
         const bool flattened = viewer->surfName() == "segmentation";
-        auto* tiledViewer = dynamic_cast<CTiledVolumeViewer*>(viewer);
         auto* quadSurface = flattened ? dynamic_cast<QuadSurface*>(viewer->currentSurface()) : nullptr;
         auto gridToScene = [&](const QPointF& grid) -> QPointF {
-            if (!tiledViewer || !quadSurface) {
+            if (!quadSurface) {
                 return {};
             }
             const cv::Vec2f surfScale = quadSurface->scale();
@@ -714,7 +710,7 @@ void SegmentationOverlayController::collectPrimitives(VolumeViewerBase* viewer,
             }
             const float surfX = static_cast<float>(grid.x()) / surfScale[0] - center[0];
             const float surfY = static_cast<float>(grid.y()) / surfScale[1] - center[1];
-            return tiledViewer->surfaceCoordsToScene(surfX, surfY);
+            return viewer->surfaceCoordsToScene(surfX, surfY);
         };
         auto drawLine = [&](const State::ManualAddLine& line) {
             std::vector<QPointF> points;
@@ -951,41 +947,38 @@ void SegmentationOverlayController::collectPrimitives(VolumeViewerBase* viewer,
     }
 
     if (!state.surfaceMaskPoints.empty() && viewer->surfName() == "segmentation") {
-        auto* tiledViewer = dynamic_cast<CTiledVolumeViewer*>(viewer);
-        if (tiledViewer) {
-            std::vector<QPointF> scenePoints;
-            scenePoints.reserve(state.surfaceMaskPoints.size());
-            for (const QPointF& surfacePoint : state.surfaceMaskPoints) {
-                const QPointF scene = tiledViewer->surfaceCoordsToScene(static_cast<float>(surfacePoint.x()),
-                                                                        static_cast<float>(surfacePoint.y()));
-                if (std::isfinite(scene.x()) && std::isfinite(scene.y())) {
-                    scenePoints.push_back(scene);
-                }
+        std::vector<QPointF> scenePoints;
+        scenePoints.reserve(state.surfaceMaskPoints.size());
+        for (const QPointF& surfacePoint : state.surfaceMaskPoints) {
+            const QPointF scene = viewer->surfaceCoordsToScene(static_cast<float>(surfacePoint.x()),
+                                                               static_cast<float>(surfacePoint.y()));
+            if (std::isfinite(scene.x()) && std::isfinite(scene.y())) {
+                scenePoints.push_back(scene);
+            }
+        }
+
+        if (!scenePoints.empty()) {
+            ViewerOverlayControllerBase::OverlayStyle style;
+            style.penColor = QColor(255, 80, 40, 230);
+            style.brushColor = QColor(255, 80, 40, 70);
+            style.penWidth = 2.0;
+            style.penStyle = Qt::DashLine;
+            style.dashPattern = {4.0, 4.0};
+            style.z = kMaskZ + 5.0;
+
+            const QPointF center = scenePoints.back();
+            const QPointF edge = viewer->surfaceCoordsToScene(
+                static_cast<float>(state.surfaceMaskPoints.back().x() + state.displayRadiusSteps),
+                static_cast<float>(state.surfaceMaskPoints.back().y()));
+            const qreal radiusPixels = std::hypot(edge.x() - center.x(), edge.y() - center.y());
+            if (radiusPixels > 1.0) {
+                builder.addCircle(center, radiusPixels, false, style);
             }
 
-            if (!scenePoints.empty()) {
-                ViewerOverlayControllerBase::OverlayStyle style;
-                style.penColor = QColor(255, 80, 40, 230);
-                style.brushColor = QColor(255, 80, 40, 70);
-                style.penWidth = 2.0;
-                style.penStyle = Qt::DashLine;
-                style.dashPattern = {4.0, 4.0};
-                style.z = kMaskZ + 5.0;
-
-                const QPointF center = scenePoints.back();
-                const QPointF edge = tiledViewer->surfaceCoordsToScene(
-                    static_cast<float>(state.surfaceMaskPoints.back().x() + state.displayRadiusSteps),
-                    static_cast<float>(state.surfaceMaskPoints.back().y()));
-                const qreal radiusPixels = std::hypot(edge.x() - center.x(), edge.y() - center.y());
-                if (radiusPixels > 1.0) {
-                    builder.addCircle(center, radiusPixels, false, style);
-                }
-
-                if (scenePoints.size() >= 2) {
-                    style.penWidth = std::max<qreal>(2.0, radiusPixels * 0.35);
-                    style.penStyle = Qt::SolidLine;
-                    builder.addLineStrip(scenePoints, false, style);
-                }
+            if (scenePoints.size() >= 2) {
+                style.penWidth = std::max<qreal>(2.0, radiusPixels * 0.35);
+                style.penStyle = Qt::SolidLine;
+                builder.addLineStrip(scenePoints, false, style);
             }
         }
     }
@@ -1361,7 +1354,7 @@ void SegmentationOverlayController::invalidatePlaneIntersections()
         return;
     }
 
-    _viewerManager->forEachViewer([](CTiledVolumeViewer* viewer) {
+    _viewerManager->forEachBaseViewer([](VolumeViewerBase* viewer) {
         if (!viewer) {
             return;
         }
@@ -1397,7 +1390,7 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
 
     // Check if this viewer is displaying a PlaneSurface (XY/XZ/YZ orthogonal view)
     // For plane viewers, the approval mask is rendered via modified intersection lines
-    // in CTiledVolumeViewerIntersections.cpp, not here
+    // in the viewer's intersection renderer, not here.
     Surface* viewerSurf = viewer->currentSurface();
     const bool isPlaneViewer = dynamic_cast<PlaneSurface*>(viewerSurf) != nullptr;
 
@@ -1557,14 +1550,7 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
 
     const ViewerImageCache& cache = it->second;
 
-    // Use the tiled viewer's TileScene for coordinate conversion (the correct system)
     const cv::Vec2f surfScale = state.surface->scale();
-    auto* tiledViewer = dynamic_cast<CTiledVolumeViewer*>(viewer);
-    TileScene* tileScene = tiledViewer ? tiledViewer->tileScene() : nullptr;
-
-    if (!tileScene) {
-        return;
-    }
 
     // Grid index (row, col) -> surface coords, then to scene coords.
     // Surface space is centered: grid center = (0,0) in surface space.
@@ -1573,7 +1559,7 @@ void SegmentationOverlayController::buildApprovalMaskOverlay(const State& state,
     auto gridToScene = [&](int row, int col) -> QPointF {
         const float surfX = static_cast<float>(col) / surfScale[0] - center[0];
         const float surfY = static_cast<float>(row) / surfScale[1] - center[1];
-        return tileScene->surfaceToScene(surfX, surfY);
+        return viewer->surfaceCoordsToScene(surfX, surfY);
     };
 
     // Calculate grid-to-scene scale from adjacent cells
@@ -1596,15 +1582,11 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
     VolumeViewerBase* viewer,
     ViewerOverlayControllerBase::OverlayBuilder& builder)
 {
-    auto* tiledViewer = dynamic_cast<CTiledVolumeViewer*>(viewer);
-    if (!tiledViewer) {
-        return;
-    }
-    if (!tiledViewer->surfaceOverlayEnabled()) {
+    if (!viewer || !viewer->surfaceOverlayEnabled()) {
         return;
     }
 
-    const auto& overlays = tiledViewer->surfaceOverlays();
+    const auto& overlays = viewer->surfaceOverlays();
     if (overlays.empty()) {
         return;
     }
@@ -1616,12 +1598,7 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
         return;
     }
 
-    TileScene* tileScene = tiledViewer->tileScene();
-    if (!tileScene) {
-        return;
-    }
-
-    const float threshold = tiledViewer->surfaceOverlapThreshold();
+    const float threshold = viewer->surfaceOverlapThreshold();
 
     // Check cache validity (cheap - stays on main thread)
     auto cacheIt = _overlapCaches.find(viewer);
@@ -1791,7 +1768,7 @@ void SegmentationOverlayController::buildSurfaceOverlapOverlay(
     auto gridToScene = [&](int row, int col) -> QPointF {
         const float surfX = static_cast<float>(col) / surfScale[0] - center[0];
         const float surfY = static_cast<float>(row) / surfScale[1] - center[1];
-        return tileScene->surfaceToScene(surfX, surfY);
+        return viewer->surfaceCoordsToScene(surfX, surfY);
     };
 
     QPointF p0 = gridToScene(0, 0);

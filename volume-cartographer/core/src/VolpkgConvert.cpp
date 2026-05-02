@@ -1,7 +1,6 @@
 #include "vc/core/util/VolpkgConvert.hpp"
 
 #include "utils/Json.hpp"
-#include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <fstream>
@@ -158,90 +157,9 @@ vc::VolpkgConvertResult convertLocal(const fs::path& root, const fs::path& outFi
 
 vc::VolpkgConvertResult convertRemote(const std::string& input, const fs::path& outFile)
 {
-    auto resolved = vc::resolveRemoteUrl(input);
-    auto httpsBase = ensureTrailingSlash(resolved.httpsUrl);
-    auto displayBase = ensureTrailingSlash(input);
-
-    vc::cache::HttpAuth auth;
-    if (resolved.useAwsSigv4) auth = vc::cache::loadAwsCredentials();
-
-    vc::cache::S3ListResult listing;
-    try {
-        listing = vc::cache::s3ListObjects(httpsBase, auth);
-    } catch (const std::exception& e) {
-        return {false, "list failed for " + httpsBase + ": " + e.what(), {}};
-    }
-    if (listing.authError) {
-        return {false, "auth error listing " + httpsBase + ": " + listing.errorMessage, {}};
-    }
-
-    utils::Json out = utils::Json::object();
-    out["name"] = lastPrefixComponent(displayBase);
-    out["version"] = 1;
-
-    std::string warning;
-    auto cfgUrl = httpsBase + "config.json";
-    try {
-        auto body = vc::cache::httpGetString(cfgUrl, auth);
-        auto j = parseConfig(body);
-        if (j.contains("name") && j.at("name").is_string()) {
-            const auto n = j.at("name").get_string();
-            if (n != "NULL") out["name"] = n;
-        }
-    } catch (const std::exception& e) {
-        warning = std::string("cannot read ") + cfgUrl + ": " + e.what()
-                + " (using directory name as project name)";
-    }
-
-    auto volumes = utils::Json::array();
-    auto segments = utils::Json::array();
-    auto normalGrids = utils::Json::array();
-
-    auto hasSubprefix = [&](const std::string& name) {
-        for (const auto& p : listing.prefixes) {
-            if (p == name) return true;
-        }
-        return false;
-    };
-
-    if (hasSubprefix("volumes")) {
-        appendBareEntry(volumes, displayBase + "volumes/");
-    }
-
-    std::optional<std::string> firstSegmentsLoc;
-    for (const auto& d : {"paths", "traces", "export"}) {
-        if (hasSubprefix(d)) {
-            const auto loc = displayBase + d + "/";
-            appendBareEntry(segments, loc);
-            if (!firstSegmentsLoc) firstSegmentsLoc = loc;
-        }
-    }
-
-    if (hasSubprefix("normal_grids")) {
-        appendBareEntry(normalGrids, displayBase + "normal_grids/");
-    }
-
-    if (hasSubprefix("normal3d")) {
-        try {
-            auto sub = vc::cache::s3ListObjects(httpsBase + "normal3d/", auth);
-            if (sub.authError) {
-                return {false, "auth error listing normal3d: " + sub.errorMessage, {}};
-            }
-            for (const auto& subName : sub.prefixes) {
-                appendTaggedEntry(volumes,
-                    displayBase + "normal3d/" + subName + "/", {"normal3d"});
-            }
-        } catch (const std::exception& e) {
-            return {false, std::string("normal3d list failed: ") + e.what(), {}};
-        }
-    }
-
-    out["volumes"] = volumes;
-    out["segments"] = segments;
-    out["normal_grids"] = normalGrids;
-    if (firstSegmentsLoc) out["output_segments"] = *firstSegmentsLoc;
-
-    return writeOut(outFile, out, warning);
+    (void)input;
+    (void)outFile;
+    return {false, "remote volpkg conversion is not supported in this branch", {}};
 }
 
 }

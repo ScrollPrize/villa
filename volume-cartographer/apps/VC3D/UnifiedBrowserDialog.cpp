@@ -7,7 +7,6 @@
 #include <QButtonGroup>
 #include <QDir>
 #include <QFileInfo>
-#include <QFutureWatcher>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
@@ -19,7 +18,6 @@
 #include <QStandardPaths>
 #include <QUrl>
 #include <QVBoxLayout>
-#include <QtConcurrent>
 
 namespace {
 
@@ -305,7 +303,7 @@ void UnifiedBrowserDialog::navigateRemote(const QString& urlPrefix)
     _currentRemoteUrl = withTrailingSlash(urlPrefix);
     _pathBar->setText(_currentRemoteUrl);
     _list->clear();
-    _status->setText(tr("Listing..."));
+    _status->setText(tr("Remote browsing is not available in this build"));
 
     const bool hasScheme =
         _currentRemoteUrl.startsWith(QLatin1String("s3://"), Qt::CaseInsensitive)
@@ -316,55 +314,6 @@ void UnifiedBrowserDialog::navigateRemote(const QString& urlPrefix)
         return;
     }
 
-    if (!ensureRemoteAuth(_currentRemoteUrl)) return;
-
-    // Convert s3:// to https for listing
-    QString httpsUrl = _currentRemoteUrl;
-    if (httpsUrl.startsWith(QLatin1String("s3://"), Qt::CaseInsensitive)) {
-        auto resolved = vc::resolveRemoteUrl(_currentRemoteUrl.toStdString());
-        httpsUrl = QString::fromStdString(resolved.httpsUrl);
-        if (!httpsUrl.endsWith('/')) httpsUrl += '/';
-    }
-
-    auto auth = _auth;
-    auto baseUri = _currentRemoteUrl;
-    auto* watcher = new QFutureWatcher<vc::cache::S3ListResult>(this);
-    connect(watcher, &QFutureWatcher<vc::cache::S3ListResult>::finished, this,
-        [this, watcher, mySeq, baseUri]() {
-            watcher->deleteLater();
-            if (mySeq != _listSeq) return;
-            const auto result = watcher->result();
-            if (result.authError) {
-                _status->setText(tr("Auth/list error: %1")
-                    .arg(QString::fromStdString(result.errorMessage)));
-                return;
-            }
-            int shown = 0;
-            for (const auto& pref : result.prefixes) {
-                auto* item = new QListWidgetItem();
-                const QString name = QString::fromStdString(pref);
-                item->setText(name);
-                item->setData(Qt::UserRole, baseUri + name);
-                item->setData(Qt::UserRole + 1, true);
-                _list->addItem(item);
-                ++shown;
-            }
-            for (const auto& obj : result.objects) {
-                if (!_acceptsFiles) continue;
-                auto* item = new QListWidgetItem();
-                const QString name = QString::fromStdString(obj);
-                item->setText(name);
-                item->setData(Qt::UserRole, baseUri + name);
-                item->setData(Qt::UserRole + 1, false);
-                _list->addItem(item);
-                ++shown;
-            }
-            _status->setText(tr("%1 items").arg(shown));
-        });
-    auto fut = QtConcurrent::run([httpsUrl, auth]() {
-        return vc::cache::s3ListObjects(httpsUrl.toStdString(), auth);
-    });
-    watcher->setFuture(fut);
 }
 
 void UnifiedBrowserDialog::onItemDoubleClicked(QListWidgetItem* item)

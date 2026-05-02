@@ -1,6 +1,6 @@
 #include "BBoxOverlayController.hpp"
 
-#include "../VolumeViewerBase.hpp"
+#include "../volume_viewers/VolumeViewerBase.hpp"
 
 namespace
 {

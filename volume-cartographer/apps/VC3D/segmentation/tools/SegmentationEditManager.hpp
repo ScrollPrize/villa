@@ -62,6 +62,7 @@ public:
         int col{0};
         cv::Vec3f baseWorld{0.0f, 0.0f, 0.0f};
         float distanceWorldSq{0.0f};
+        float gaussianWeight{1.0f};
     };
 
     struct ActiveDrag
@@ -146,7 +147,8 @@ private:
     void rebuildPreviewFromOriginal();
     bool buildActiveSamples(const std::pair<int, int>& gridIndex);
     void applyGaussianToSamples(const cv::Vec3f& delta);
-    void recordVertexEdit(int row, int col, const cv::Vec3f& newWorld);
+    void recordVertexEdit(int row, int col, const cv::Vec3f& newWorld, bool queuePatchIndexUpdate = true);
+    void queuePatchIndexRangeForVertices(int minRow, int maxRow, int minCol, int maxCol);
     void clearActiveDrag();
     float stepNormalization() const;
 

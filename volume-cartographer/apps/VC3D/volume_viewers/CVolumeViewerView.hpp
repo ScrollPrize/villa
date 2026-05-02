@@ -1,0 +1,93 @@
+#pragma once
+
+#include <QGraphicsView>
+#include <QPointF>
+
+class CVolumeViewerView : public QGraphicsView
+{
+    Q_OBJECT
+    
+public:
+    CVolumeViewerView(QWidget* parent = 0);
+    void mouseReleaseEvent(QMouseEvent *event) override;
+    void mousePressEvent(QMouseEvent *event) override;
+    void mouseDoubleClickEvent(QMouseEvent *event) override;
+    void mouseMoveEvent(QMouseEvent *event) override;
+    void wheelEvent(QWheelEvent *event) override;
+    void scrollContentsBy(int dx, int dy) override;
+    void keyPressEvent(QKeyEvent *event) override;
+    void keyReleaseEvent(QKeyEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
+    void setVoxelSize(double sx, double sy) { m_vx = sx; m_vy = sy; update(); }
+    void setMiddleButtonPanEnabled(bool enabled) { _middleButtonPanEnabled = enabled; }
+    bool middleButtonPanEnabled() const { return _middleButtonPanEnabled; }
+    void setScrollPanDisabled(bool disabled) { _scrollPanDisabled = disabled; }
+    enum class TiltHandleMode {
+        Hidden,
+        Square,
+        SemiCircleX,
+        SemiCircleY,
+    };
+    void setTiltHandle(TiltHandleMode mode, QPointF tilt);
+
+signals:
+    void sendResized();
+    void sendScrolled();
+    void sendZoom(int steps, QPointF scene_point, Qt::KeyboardModifiers);
+    void sendVolumeClicked(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
+    void sendPanRelease(Qt::MouseButton, Qt::KeyboardModifiers);
+    void sendPanStart(Qt::MouseButton, Qt::KeyboardModifiers);
+    void sendCursorMove(QPointF);
+    void sendMousePress(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
+    void sendMouseDoubleClick(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
+    void sendMouseMove(QPointF, Qt::MouseButtons, Qt::KeyboardModifiers);
+    void sendMouseRelease(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
+    void sendKeyPress(int key, Qt::KeyboardModifiers modifiers);
+    void sendKeyRelease(int key, Qt::KeyboardModifiers modifiers);
+    void sendTiltHandleChanged(QPointF tilt);
+    void sendTiltHandleReset();
+    
+protected:
+    bool _regular_pan = false;
+    QPoint _last_pan_position;
+    bool _left_button_pressed = false;
+    bool _right_button_mouse_forwarded = false;
+    bool _tiltHandleDragging = false;
+    /// Draw our scalebar on every repaint
+    void drawForeground(QPainter* painter, const QRectF& sceneRect) override;
+    /// Paint framebuffer directly, bypassing QGraphicsPixmapItem
+    void drawBackground(QPainter* painter, const QRectF& rect) override;
+
+public:
+    void setDirectFramebuffer(const QImage* fb) { _directFb = fb; }
+private:
+    const QImage* _directFb = nullptr;
+
+ private:
+    /// Round “ideal” length to 1,2 or 5 × 10^n
+    double chooseNiceLength(double nominal) const;
+    QRectF tiltHandleRect() const;
+    bool pointInTiltHandle(const QPointF& viewportPos) const;
+    QPointF tiltFromHandlePos(const QPointF& viewportPos) const;
+    void drawTiltHandle(QPainter* painter) const;
+    bool pointInSceneWidget(const QPointF& viewportPos) const;
+
+    // µm per scene-unit (pixel)
+    double m_vx = 32.0, m_vy = 32.0;
+    bool _middleButtonPanEnabled = true;
+    bool _scrollPanDisabled = false;
+    bool _sceneWidgetMouseCapture = false;
+    int _wheelAccum = 0;  // fractional wheel delta accumulator
+    mutable QFont _cachedFont;
+    mutable bool _scalebarCacheDirty = true;
+    mutable double _cachedBarPx = 0;
+    mutable QString _cachedBarLabel;
+    mutable double _cachedM11 = 0;
+    mutable double _cachedDpr = 0;
+    mutable int _cachedVpW = 0;
+    mutable int _cachedVpH = 0;
+    mutable double _cachedVx = 0;
+
+    TiltHandleMode _tiltHandleMode = TiltHandleMode::Hidden;
+    QPointF _tiltHandleValue{0.0, 0.0};
+};

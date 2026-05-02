@@ -3,7 +3,8 @@
 #include "vc/core/util/Slicing.hpp"
 #include <iostream>
 #include "vc/core/util/HashFunctions.hpp"
-#include "vc/core/cache/BlockPipeline.hpp"
+#include "vc/core/render/ChunkCache.hpp"
+#include "vc/core/render/ZarrChunkFetcher.hpp"
 #include "vc/core/types/Array3D.hpp"
 
 #include <opencv2/core.hpp>
@@ -59,6 +60,27 @@ static uint64_t chunk_compute_total = 0;
 
 template <typename T, typename C> class Chunked3dAccessor;
 
+inline std::unique_ptr<vc::render::ChunkCache> openChunkedArrayCache(
+    const std::filesystem::path& zarrPath,
+    std::size_t capacityBytes)
+{
+    auto opened = vc::render::openLocalZarrPyramid(zarrPath);
+    std::vector<vc::render::ChunkCache::LevelInfo> levels;
+    levels.reserve(opened.shapes.size());
+    for (std::size_t i = 0; i < opened.shapes.size(); ++i) {
+        levels.push_back({opened.shapes[i], opened.chunkShapes[i], opened.transforms[i]});
+    }
+
+    vc::render::ChunkCache::Options options;
+    options.decodedByteCapacity = capacityBytes;
+    return std::make_unique<vc::render::ChunkCache>(
+        std::move(levels),
+        std::move(opened.fetchers),
+        opened.fillValue,
+        opened.dtype,
+        options);
+}
+
 static std::string tmp_name_proc_thread()
 {
     std::stringstream ss;
@@ -72,7 +94,7 @@ class Chunked3d {
 public:
     using CHUNKT = Array3D<T>;
 
-    Chunked3d(C &compute_f, vc::VcDataset *ds, vc::cache::BlockPipeline *cache, int level) : _compute_f(compute_f), _ds(ds), _cache(cache), _level(level)
+    Chunked3d(C &compute_f, vc::VcDataset *ds, vc::render::IChunkedArray *cache, int level) : _compute_f(compute_f), _ds(ds), _cache(cache), _level(level)
     {
         _border = compute_f.BORDER;
     };
@@ -81,7 +103,7 @@ public:
         if (!_persistent)
             remove_all(_cache_dir);
     };
-    Chunked3d(C &compute_f, vc::VcDataset *ds, vc::cache::BlockPipeline *cache, int level, const std::filesystem::path &cache_root) : _compute_f(compute_f), _ds(ds), _cache(cache), _level(level)
+    Chunked3d(C &compute_f, vc::VcDataset *ds, vc::render::IChunkedArray *cache, int level, const std::filesystem::path &cache_root) : _compute_f(compute_f), _ds(ds), _cache(cache), _level(level)
     {
         _border = compute_f.BORDER;
         
@@ -429,7 +451,7 @@ public:
 
     std::unordered_map<cv::Vec3i,T*,vec3i_hash> _chunks;
     vc::VcDataset *_ds;
-    vc::cache::BlockPipeline *_cache;
+    vc::render::IChunkedArray *_cache;
     int _level;
     size_t _border;
     C &_compute_f;
@@ -658,7 +680,7 @@ struct Chunked3dFloatFromUint8
 {
     Chunked3dFloatFromUint8(std::unique_ptr<vc::VcDataset> &&ds, float scale, std::string const &cache_root, std::string const &unique_id) :
         _passthrough{unique_id},
-        _ownedCache(vc::cache::openFilesystemPipeline(ds.get(), 128ULL << 20, ds->path())),
+        _ownedCache(openChunkedArrayCache(ds->path(), 128ULL << 20)),
         _x(_passthrough, ds.get(), _ownedCache.get(), 0, cache_root),
         _scale(scale),
         _ds(std::move(ds))
@@ -680,7 +702,7 @@ struct Chunked3dFloatFromUint8
     }
 
     passTroughComputor _passthrough;
-    std::unique_ptr<vc::cache::BlockPipeline> _ownedCache;
+    std::unique_ptr<vc::render::IChunkedArray> _ownedCache;
     Chunked3d<uint8_t, passTroughComputor> _x;
     float _scale;
     std::unique_ptr<vc::VcDataset> _ds;
@@ -692,9 +714,9 @@ struct Chunked3dVec3fFromUint8
         _passthrough_x{unique_id + "_x"},
         _passthrough_y{unique_id + "_y"},
         _passthrough_z{unique_id + "_z"},
-        _cacheX(vc::cache::openFilesystemPipeline(dss[0].get(), 128ULL << 20, dss[0]->path())),
-        _cacheY(vc::cache::openFilesystemPipeline(dss[1].get(), 128ULL << 20, dss[1]->path())),
-        _cacheZ(vc::cache::openFilesystemPipeline(dss[2].get(), 128ULL << 20, dss[2]->path())),
+        _cacheX(openChunkedArrayCache(dss[0]->path(), 128ULL << 20)),
+        _cacheY(openChunkedArrayCache(dss[1]->path(), 128ULL << 20)),
+        _cacheZ(openChunkedArrayCache(dss[2]->path(), 128ULL << 20)),
         _x(_passthrough_x, dss[0].get(), _cacheX.get(), 0, cache_root),
         _y(_passthrough_y, dss[1].get(), _cacheY.get(), 0, cache_root),
         _z(_passthrough_z, dss[2].get(), _cacheZ.get(), 0, cache_root),
@@ -720,7 +742,7 @@ struct Chunked3dVec3fFromUint8
     }
 
     passTroughComputor _passthrough_x, _passthrough_y, _passthrough_z;
-    std::unique_ptr<vc::cache::BlockPipeline> _cacheX, _cacheY, _cacheZ;
+    std::unique_ptr<vc::render::IChunkedArray> _cacheX, _cacheY, _cacheZ;
     Chunked3d<uint8_t, passTroughComputor> _x, _y, _z;
     float _scale;
     std::vector<std::unique_ptr<vc::VcDataset>> _dss;

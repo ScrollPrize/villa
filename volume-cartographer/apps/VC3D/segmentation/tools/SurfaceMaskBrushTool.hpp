@@ -29,22 +29,24 @@ public:
     void cancelStroke();
 
 private:
-    [[nodiscard]] std::optional<std::pair<int, int>> surfaceToGridIndex(const QPointF& surfacePos) const;
+    [[nodiscard]] std::optional<std::pair<float, float>> surfaceToGridPosition(const QPointF& surfacePos) const;
     void ensureMask();
     void paintAt(int row, int col);
+    void appendOverlayPoint(const QPointF& surfacePos);
     void queueVertex(int row, int col);
     void fillEnclosedStrokeArea();
     void persistSurface();
     [[nodiscard]] cv::Rect applyPendingCells();
     void refreshSurfacePatchIndex(const cv::Rect& changedRegion);
-    void invalidateViewers();
+    void invalidateOverlay();
+    void invalidateViewers(bool surfaceChanged);
 
     SegmentationModule& _module;
     QuadSurface* _surface{nullptr};
     cv::Mat_<uint8_t> _mask;
     bool _active{false};
     bool _strokeActive{false};
-    std::optional<std::pair<int, int>> _lastGrid;
+    std::optional<std::pair<float, float>> _lastGridPosition;
     std::unordered_set<uint64_t> _paintedCells;
     std::vector<std::pair<int, int>> _pendingCells;
     std::vector<std::pair<int, int>> _strokeGridPoints;

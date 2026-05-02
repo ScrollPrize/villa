@@ -14,9 +14,10 @@
 
 #include <opencv2/core.hpp>
 
+#include "vc/core/util/QuadSurface.hpp"
+
 class QuadSurface;
 class PlaneSurface;
-struct Rect3D;
 
 class SurfacePatchIndex {
 public:
@@ -30,9 +31,9 @@ public:
 
     struct TriangleCandidate {
         SurfacePtr surface;
-        int i = 0;
-        int j = 0;
-        int triangleIndex = 0; // 0 = (p00,p10,p01), 1 = (p10,p11,p01)
+        int i = 0; // Grid column index (x)
+        int j = 0; // Grid row index (y)
+        int triangleIndex = 0; // 0 = (p00,p10,p01), 1 = (p10,p11,p01), pXY = (column,row)
         std::array<cv::Vec3f, 3> world{};
         std::array<cv::Vec3f, 3> surfaceParams{}; // ptr-space coordinates for vertices
     };
@@ -41,6 +42,37 @@ public:
         SurfacePtr surface;
         std::array<cv::Vec3f, 2> world{};
         std::array<cv::Vec3f, 2> surfaceParams{};
+    };
+
+    struct PatchBounds {
+        cv::Vec3f low = {0, 0, 0};
+        cv::Vec3f high = {0, 0, 0};
+    };
+
+    struct SurfaceFilter {
+        SurfacePtr only;
+        const std::unordered_set<SurfacePtr>* include = nullptr;
+        const std::unordered_set<SurfacePtr>* exclude = nullptr;
+    };
+
+    struct TriangleQuery {
+        Rect3D bounds;
+        SurfaceFilter surfaces;
+        std::function<bool(const PatchBounds&)> patchFilter;
+    };
+
+    struct PointQuery {
+        cv::Vec3f worldPoint = {0, 0, 0};
+        float tolerance = 0.0f;
+        SurfaceFilter surfaces;
+    };
+
+    struct RayQuery {
+        cv::Vec3f src = {0, 0, 0};
+        cv::Vec3f end = {0, 0, 0};
+        float minT = 0.0f;
+        float bboxPadding = 0.0f;
+        SurfaceFilter surfaces;
     };
 
     SurfacePatchIndex();
@@ -67,41 +99,18 @@ public:
     size_t surfaceCount() const;
     bool containsSurface(const SurfacePtr& surface) const;
 
-    std::optional<LookupResult> locate(const cv::Vec3f& worldPoint,
-                                       float tolerance,
-                                       const SurfacePtr& targetSurface = nullptr) const;
+    std::optional<LookupResult> locate(const PointQuery& query) const;
+    std::vector<LookupResult> locateAll(const PointQuery& query) const;
+    std::vector<SurfacePtr> locateSurfaces(const PointQuery& query) const;
 
-    void queryTriangles(const Rect3D& bounds,
-                        const SurfacePtr& targetSurface,
-                        std::vector<TriangleCandidate>& outCandidates) const;
-
-    void queryTriangles(const Rect3D& bounds,
-                        const std::unordered_set<SurfacePtr>& targetSurfaces,
-                        std::vector<TriangleCandidate>& outCandidates) const;
-
-    void forEachTriangle(const Rect3D& bounds,
-                         const SurfacePtr& targetSurface,
+    void forEachTriangle(const TriangleQuery& query,
                          const std::function<void(const TriangleCandidate&)>& visitor) const;
-
-    void forEachTriangleIntersectingRay(const Rect3D& bounds,
-                                        const SurfacePtr& targetSurface,
-                                        const cv::Vec3f& origin,
-                                        const cv::Vec3f& dir,
-                                        float minT,
-                                        float maxT,
-                                        const std::function<void(const TriangleCandidate&)>& visitor) const;
-
-    void forEachTriangle(const Rect3D& bounds,
-                         const std::unordered_set<SurfacePtr>& targetSurfaces,
+    void forEachTriangle(const RayQuery& query,
                          const std::function<void(const TriangleCandidate&)>& visitor) const;
 
     static std::optional<TriangleSegment> clipTriangleToPlane(const TriangleCandidate& tri,
                                                               const PlaneSurface& plane,
                                                               float epsilon = 1e-4f);
-
-    static bool segmentsEqual(const std::vector<TriangleSegment>& a,
-                              const std::vector<TriangleSegment>& b,
-                              float epsilon = 1e-4f);
 
     std::unordered_map<SurfacePtr, std::vector<TriangleSegment>>
     computePlaneIntersections(
@@ -120,7 +129,6 @@ public:
     bool setSamplingStride(int stride);
     int samplingStride() const;
     void setReadOnly(bool readOnly);
-    bool readOnly() const;
 
     // Pending update tracking for incremental R-tree updates
     // Queue the 4 cells surrounding a vertex for update
@@ -137,9 +145,7 @@ public:
     bool hasPendingUpdates(const SurfacePtr& surface = nullptr) const;
 
     // Generation tracking for undo/redo detection
-    void incrementGeneration(const SurfacePtr& surface);
     uint64_t generation(const SurfacePtr& surface) const;
-    void setGeneration(const SurfacePtr& surface, uint64_t gen);
 
 private:
     struct NoPatchFilter {
@@ -149,8 +155,7 @@ private:
 
     template <typename Visitor, typename PatchFilter = NoPatchFilter>
     void forEachTriangleImpl(const Rect3D& bounds,
-                             const SurfacePtr& targetSurface,
-                             const std::unordered_set<SurfacePtr>* filterSurfaces,
+                             const SurfaceFilter& surfaces,
                              Visitor&& visitor,
                              PatchFilter&& patchFilter = NoPatchFilter{}) const;
 

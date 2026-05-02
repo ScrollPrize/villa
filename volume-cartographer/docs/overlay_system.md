@@ -5,7 +5,7 @@ The VC3D overlay framework renders auxiliary graphics (points, paths, text, arro
 **Key takeaways up front**
 
 - Work in **volume coordinates**. Use `filterPoints()` or `volumeToScene()` to project onto whatever viewer surface is active (segmentation quad, seg xz/yz slice, etc.).
-- To pick a viewer, either branch on `viewer->surfName()` inside a controller or loop across viewers via `ViewerManager::forEachViewer` when using the inline helpers.
+- To pick a viewer, either branch on `viewer->surfName()` inside a controller or loop across viewers via `ViewerManager::forEachBaseViewer` when using the inline helpers.
 - For one-off or in-line overlays, use  `ViewerOverlayControllerBase::applyPrimitives(viewer, key, primitives)` , which lets lets you slap a primitive on any viewer by name without writing a full controller.
   - key is the overlay group identifier (a std::string) you pass to applyPrimitives. It tells the viewer which logical overlay slot to populate (so later calls with the same key replace existing primitives).
 

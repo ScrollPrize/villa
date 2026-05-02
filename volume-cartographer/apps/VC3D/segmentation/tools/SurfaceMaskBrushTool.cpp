@@ -151,7 +151,7 @@ void SurfaceMaskBrushTool::setSurface(QuadSurface* surface)
     }
     _surface = surface;
     _mask.release();
-    _lastGrid.reset();
+    _lastGridPosition.reset();
     _paintedCells.clear();
     _pendingCells.clear();
     _strokeGridPoints.clear();
@@ -175,10 +175,12 @@ void SurfaceMaskBrushTool::startStroke(const QPointF& surfacePos)
         return;
     }
 
-    const auto grid = surfaceToGridIndex(surfacePos);
-    if (!grid) {
+    const auto gridPos = surfaceToGridPosition(surfacePos);
+    if (!gridPos) {
         return;
     }
+    const int row = static_cast<int>(std::lround(gridPos->first));
+    const int col = static_cast<int>(std::lround(gridPos->second));
 
     ensureMask();
     _strokeActive = true;
@@ -186,9 +188,10 @@ void SurfaceMaskBrushTool::startStroke(const QPointF& surfacePos)
     _pendingCells.clear();
     _strokeGridPoints.clear();
     _overlaySurfacePoints.clear();
-    _lastGrid = grid;
-    paintAt(grid->first, grid->second);
-    invalidateViewers();
+    _lastGridPosition = gridPos;
+    appendOverlayPoint(surfacePos);
+    paintAt(row, col);
+    invalidateOverlay();
 }
 
 void SurfaceMaskBrushTool::extendStroke(const QPointF& surfacePos, bool forceSample)
@@ -197,11 +200,12 @@ void SurfaceMaskBrushTool::extendStroke(const QPointF& surfacePos, bool forceSam
         return;
     }
 
-    const auto grid = surfaceToGridIndex(surfacePos);
-    if (!grid) {
-        _lastGrid.reset();
+    const auto gridPos = surfaceToGridPosition(surfacePos);
+    if (!gridPos) {
+        _lastGridPosition.reset();
         return;
     }
+    appendOverlayPoint(surfacePos);
 
     const float avgScale = [&]() {
         const cv::Vec2f scale = _surface->scale();
@@ -211,27 +215,30 @@ void SurfaceMaskBrushTool::extendStroke(const QPointF& surfacePos, bool forceSam
     const float radius = std::max(1.0f, _module.approvalMaskBrushRadius() * avgScale);
     const float sampleSpacing = std::max(1.0f, radius / 3.0f);
 
-    if (_lastGrid) {
-        const int dr = grid->first - _lastGrid->first;
-        const int dc = grid->second - _lastGrid->second;
-        const float distance = std::sqrt(static_cast<float>(dr * dr + dc * dc));
+    if (_lastGridPosition) {
+        const float dr = gridPos->first - _lastGridPosition->first;
+        const float dc = gridPos->second - _lastGridPosition->second;
+        const float distance = std::sqrt(dr * dr + dc * dc);
         if (!forceSample && distance < sampleSpacing) {
+            invalidateOverlay();
             return;
         }
 
         const int steps = std::max(1, static_cast<int>(std::ceil(distance / sampleSpacing)));
         for (int step = 1; step <= steps; ++step) {
             const float t = static_cast<float>(step) / static_cast<float>(steps);
-            const int row = static_cast<int>(std::lround(_lastGrid->first + dr * t));
-            const int col = static_cast<int>(std::lround(_lastGrid->second + dc * t));
+            const int row = static_cast<int>(std::lround(_lastGridPosition->first + dr * t));
+            const int col = static_cast<int>(std::lround(_lastGridPosition->second + dc * t));
             paintAt(row, col);
         }
     } else {
-        paintAt(grid->first, grid->second);
+        const int row = static_cast<int>(std::lround(gridPos->first));
+        const int col = static_cast<int>(std::lround(gridPos->second));
+        paintAt(row, col);
     }
 
-    _lastGrid = grid;
-    invalidateViewers();
+    _lastGridPosition = gridPos;
+    invalidateOverlay();
 }
 
 void SurfaceMaskBrushTool::pauseStroke()
@@ -241,8 +248,8 @@ void SurfaceMaskBrushTool::pauseStroke()
     }
 
     _strokeActive = false;
-    _lastGrid.reset();
-    invalidateViewers();
+    _lastGridPosition.reset();
+    invalidateOverlay();
 }
 
 void SurfaceMaskBrushTool::finishStroke()
@@ -252,7 +259,7 @@ void SurfaceMaskBrushTool::finishStroke()
     }
 
     _strokeActive = false;
-    _lastGrid.reset();
+    _lastGridPosition.reset();
     fillEnclosedStrokeArea();
     const cv::Rect changedRegion = applyPendingCells();
     if (_module.hasActiveSession() && _module.activeBaseSurface() == _surface && !changedRegion.empty()) {
@@ -264,13 +271,13 @@ void SurfaceMaskBrushTool::finishStroke()
     _pendingCells.clear();
     _strokeGridPoints.clear();
     _overlaySurfacePoints.clear();
-    invalidateViewers();
+    invalidateViewers(!changedRegion.empty());
 }
 
 void SurfaceMaskBrushTool::cancelStroke()
 {
     _strokeActive = false;
-    _lastGrid.reset();
+    _lastGridPosition.reset();
     _paintedCells.clear();
     _pendingCells.clear();
     _strokeGridPoints.clear();
@@ -280,10 +287,10 @@ void SurfaceMaskBrushTool::cancelStroke()
     } else {
         _mask.release();
     }
-    invalidateViewers();
+    invalidateViewers(false);
 }
 
-std::optional<std::pair<int, int>> SurfaceMaskBrushTool::surfaceToGridIndex(const QPointF& surfacePos) const
+std::optional<std::pair<float, float>> SurfaceMaskBrushTool::surfaceToGridPosition(const QPointF& surfacePos) const
 {
     if (!_surface) {
         return std::nullopt;
@@ -300,8 +307,8 @@ std::optional<std::pair<int, int>> SurfaceMaskBrushTool::surfaceToGridIndex(cons
         return std::nullopt;
     }
 
-    const int col = static_cast<int>(std::lround((static_cast<float>(surfacePos.x()) + center[0]) * scale[0]));
-    const int row = static_cast<int>(std::lround((static_cast<float>(surfacePos.y()) + center[1]) * scale[1]));
+    const float col = (static_cast<float>(surfacePos.x()) + center[0]) * scale[0];
+    const float row = (static_cast<float>(surfacePos.y()) + center[1]) * scale[1];
     if (row < 0 || row >= points->rows || col < 0 || col >= points->cols) {
         return std::nullopt;
     }
@@ -348,9 +355,6 @@ void SurfaceMaskBrushTool::paintAt(int centerRow, int centerCol)
     const int radius = static_cast<int>(std::ceil(std::max(1.0f, _module.approvalMaskBrushRadius() *
                                                                  (avgScale > 1e-4f ? avgScale : 1.0f))));
     const float radiusSq = static_cast<float>(radius * radius);
-    const cv::Vec3f center = _surface->center();
-    _overlaySurfacePoints.emplace_back(static_cast<float>(centerCol) / scale[0] - center[0],
-                                       static_cast<float>(centerRow) / scale[1] - center[1]);
     if (_strokeGridPoints.empty() ||
         _strokeGridPoints.back().first != centerRow ||
         _strokeGridPoints.back().second != centerCol) {
@@ -394,6 +398,19 @@ void SurfaceMaskBrushTool::paintAt(int centerRow, int centerCol)
             queueVertex(cellRow + 1, cellCol + 1);
         }
     }
+}
+
+void SurfaceMaskBrushTool::appendOverlayPoint(const QPointF& surfacePos)
+{
+    if (!_overlaySurfacePoints.empty()) {
+        const QPointF delta = surfacePos - _overlaySurfacePoints.back();
+        if (delta.x() * delta.x() + delta.y() * delta.y() < 0.0625) {
+            _overlaySurfacePoints.back() = surfacePos;
+            return;
+        }
+    }
+
+    _overlaySurfacePoints.push_back(surfacePos);
 }
 
 void SurfaceMaskBrushTool::queueVertex(int row, int col)
@@ -553,14 +570,21 @@ void SurfaceMaskBrushTool::refreshSurfacePatchIndex(const cv::Rect& changedRegio
     manager->refreshSurfacePatchIndex(surface, changedRegion);
 }
 
-void SurfaceMaskBrushTool::invalidateViewers()
+void SurfaceMaskBrushTool::invalidateOverlay()
+{
+    _module.refreshOverlay();
+}
+
+void SurfaceMaskBrushTool::invalidateViewers(bool surfaceChanged)
 {
     if (auto* manager = _module.viewerManager()) {
-        manager->forEachViewer([](CTiledVolumeViewer* viewer) {
+        manager->forEachBaseViewer([surfaceChanged](VolumeViewerBase* viewer) {
             if (viewer) {
-                viewer->invalidateIntersect();
-                viewer->renderIntersections();
-                if (viewer->surfName() == "segmentation") {
+                if (surfaceChanged) {
+                    viewer->invalidateIntersect();
+                    viewer->renderIntersections();
+                }
+                if (surfaceChanged && viewer->surfName() == "segmentation") {
                     viewer->renderVisible(true);
                 }
                 viewer->requestRender();
