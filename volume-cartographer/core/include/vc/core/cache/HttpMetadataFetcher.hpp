@@ -3,20 +3,11 @@
 #include <filesystem>
 #include <string>
 #include <vector>
+#include <array>
 
-#include <utils/http_fetch.hpp>
+#include "vc/core/util/RemoteAuth.hpp"
 
 namespace vc::cache {
-
-// AWS credentials — unified via utils::AwsAuth.
-// The old vc::cache::HttpAuth struct is replaced by this alias.
-// awsSigv4 is implicitly true when access_key is non-empty.
-using HttpAuth = utils::AwsAuth;
-
-// Load AWS credentials (delegates to AwsAuth::load).
-inline HttpAuth loadAwsCredentials(const std::string& profile = "default") {
-    return utils::AwsAuth::load(profile);
-}
 
 // Shard configuration for zarr v3 sharded storage.
 struct ShardConfig {

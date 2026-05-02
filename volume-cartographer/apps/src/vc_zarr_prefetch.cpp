@@ -67,7 +67,7 @@ std::string urlJoin(const std::string& base, const std::string& tail) {
 // Per-level remote metadata. v3 → from zarr.json; v2 → from .zarray.
 // Returns empty optional if neither exists at the level.
 std::optional<utils::ZarrMetadata> fetchLevelMetadata(
-    const std::string& baseUrl, int level, const vc::cache::HttpAuth& auth)
+    const std::string& baseUrl, int level, const vc::HttpAuth& auth)
 {
     const std::string lvl = std::to_string(level);
     auto v3 = vc::cache::httpGetString(urlJoin(baseUrl, lvl + "/zarr.json"), auth);
@@ -566,7 +566,7 @@ int main(int argc, char** argv) {
     // Resolve s3:// → https:// once for raw metadata fetches.
     auto resolved = vc::resolveRemoteUrl(url);
     const std::string baseUrl = resolved.httpsUrl;
-    vc::cache::HttpAuth auth = vol->remoteAuth();
+    vc::HttpAuth auth = vol->remoteAuth();
 
     // Per-level info indexed by the actual pyramid level index. Only entries
     // for levels we'll touch get populated.

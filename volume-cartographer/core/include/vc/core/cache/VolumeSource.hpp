@@ -12,7 +12,7 @@
 #include <vector>
 
 #include "ChunkKey.hpp"
-#include "HttpMetadataFetcher.hpp"  // HttpAuth (= utils::AwsAuth)
+#include "HttpMetadataFetcher.hpp"  // HttpAuth, ShardConfig
 
 namespace utils { class HttpClient; }
 namespace utils { class ZarrArray; }

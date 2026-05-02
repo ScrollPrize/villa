@@ -13,7 +13,7 @@
 
 #include "vc/core/types/Sampling.hpp"
 #include "vc/core/types/SampleParams.hpp"
-#include "vc/core/cache/HttpMetadataFetcher.hpp"  // HttpAuth
+#include "vc/core/cache/HttpMetadataFetcher.hpp"  // ShardConfig
 #include "vc/core/util/NetworkFilesystem.hpp"
 #include "utils/c3d_codec.hpp"
 
@@ -56,13 +56,13 @@ public:
     static std::shared_ptr<Volume> NewFromUrl(
         const std::string& url,
         const std::filesystem::path& cacheRoot = {},
-        const vc::cache::HttpAuth& auth = {});
+        const vc::HttpAuth& auth = {});
 
     [[nodiscard]] bool isRemote() const noexcept { return isRemote_; }
     [[nodiscard]] std::string id() const;
     [[nodiscard]] std::string name() const;
     [[nodiscard]] const std::string& remoteUrl() const noexcept { return remoteUrl_; }
-    [[nodiscard]] const vc::cache::HttpAuth& remoteAuth() const noexcept { return remoteAuth_; }
+    [[nodiscard]] const vc::HttpAuth& remoteAuth() const noexcept { return remoteAuth_; }
     [[nodiscard]] const std::string& remoteDelimiter() const noexcept { return remoteDelimiter_; }
     [[nodiscard]] const vc::cache::ShardConfig& remoteShardConfig() const noexcept { return remoteShardConfig_; }
     [[nodiscard]] std::filesystem::path path() const noexcept { return path_; }
@@ -161,6 +161,6 @@ protected:
     bool isRemote_ = false;
     std::string remoteUrl_;
     std::string remoteDelimiter_ = ".";
-    vc::cache::HttpAuth remoteAuth_;
+    vc::HttpAuth remoteAuth_;
     vc::cache::ShardConfig remoteShardConfig_;
 };

@@ -3,13 +3,14 @@
 #include <chrono>
 #include <fstream>
 
+#include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "utils/Json.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/Logging.hpp"
 
 namespace vc {
 
-RemoteScrollInfo discoverRemoteScroll(const std::string& httpsUrl, const cache::HttpAuth& auth)
+RemoteScrollInfo discoverRemoteScroll(const std::string& httpsUrl, const vc::HttpAuth& auth)
 {
     // Normalize: ensure trailing slash
     std::string baseUrl = httpsUrl;
@@ -67,7 +68,7 @@ std::filesystem::path downloadRemoteSegment(
     const std::string& baseUrl,
     const std::string& segmentId,
     const std::filesystem::path& cacheDir,
-    const cache::HttpAuth& auth,
+    const vc::HttpAuth& auth,
     RemoteSegmentSource source)
 {
     namespace fs = std::filesystem;
@@ -180,7 +181,7 @@ std::filesystem::path downloadRemoteSegmentMetadataOnly(
     const std::string& baseUrl,
     const std::string& segmentId,
     const std::filesystem::path& cacheDir,
-    const cache::HttpAuth& auth,
+    const vc::HttpAuth& auth,
     RemoteSegmentSource source)
 {
     namespace fs = std::filesystem;

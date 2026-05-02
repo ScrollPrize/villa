@@ -4,7 +4,7 @@
 #include <string>
 #include <vector>
 
-#include "vc/core/cache/HttpMetadataFetcher.hpp"
+#include "vc/core/util/RemoteAuth.hpp"
 
 namespace vc {
 
@@ -20,7 +20,7 @@ struct RemoteScrollInfo {
     std::vector<std::string> segmentIds;    // e.g. ["20230205180739"]
     RemoteSegmentSource segmentSource = RemoteSegmentSource::Segments;
     std::string segmentsBaseUrl;            // For Direct source: URL containing segment dirs
-    cache::HttpAuth auth;
+    vc::HttpAuth auth;
     bool authError = false;                 // true if discovery failed due to auth
     std::string authErrorMessage;           // e.g. "The provided token has expired."
 };
@@ -29,7 +29,7 @@ struct RemoteScrollInfo {
 // Returns discovered volume names and segment IDs.
 // If the URL doesn't look like a scroll (no volumes/ or segments/), returns
 // empty lists.
-RemoteScrollInfo discoverRemoteScroll(const std::string& httpsUrl, const cache::HttpAuth& auth);
+RemoteScrollInfo discoverRemoteScroll(const std::string& httpsUrl, const vc::HttpAuth& auth);
 
 // Download a single remote segment's tifxyz files to a local cache directory.
 // For Paths source: downloads from paths/<segId>/{meta.json, x.tif, y.tif, z.tif}
@@ -41,7 +41,7 @@ std::filesystem::path downloadRemoteSegment(
     const std::string& baseUrl,
     const std::string& segmentId,
     const std::filesystem::path& cacheDir,
-    const cache::HttpAuth& auth,
+    const vc::HttpAuth& auth,
     RemoteSegmentSource source = RemoteSegmentSource::Segments);
 
 // Download only meta.json for a single remote segment (fast, tiny file).
@@ -52,7 +52,7 @@ std::filesystem::path downloadRemoteSegmentMetadataOnly(
     const std::string& baseUrl,
     const std::string& segmentId,
     const std::filesystem::path& cacheDir,
-    const cache::HttpAuth& auth,
+    const vc::HttpAuth& auth,
     RemoteSegmentSource source = RemoteSegmentSource::Segments);
 
 // Check whether a segment's TIFF data (x.tif, y.tif, z.tif) is already cached.

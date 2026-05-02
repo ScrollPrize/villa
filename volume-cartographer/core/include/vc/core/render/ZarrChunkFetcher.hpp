@@ -2,7 +2,7 @@
 
 #include "vc/core/render/ChunkFetch.hpp"
 #include "vc/core/render/IChunkedArray.hpp"
-#include "vc/core/cache/HttpMetadataFetcher.hpp"
+#include "vc/core/util/RemoteAuth.hpp"
 
 #include <filesystem>
 #include <memory>
@@ -23,7 +23,7 @@ OpenedChunkedZarr openLocalZarrPyramid(const std::filesystem::path& root);
 OpenedChunkedZarr openHttpZarrPyramid(const std::string& url);
 OpenedChunkedZarr openHttpZarrPyramid(
     const std::string& url,
-    const vc::cache::HttpAuth& auth,
+    const vc::HttpAuth& auth,
     int baseScaleLevel = 0);
 
 } // namespace vc::render

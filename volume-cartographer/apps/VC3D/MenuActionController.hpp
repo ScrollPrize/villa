@@ -5,7 +5,7 @@
 #include <array>
 #include <string>
 
-#include "vc/core/cache/HttpMetadataFetcher.hpp"
+#include "vc/core/util/RemoteAuth.hpp"
 
 class QAction;
 class QDialog;
@@ -67,20 +67,20 @@ private:
     void refreshRecentRemoteMenu();
     void ensureRecentRemoteActions();
     void attachRemoteZarrUrl(const QString& url, bool persistEntry = true);
-    void openRemoteZarr(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
-    void openRemoteScroll(const std::string& httpsUrl, const vc::cache::HttpAuth& auth, const std::string& cachePath);
-    void promptAndLoadRemoteSegments(const vc::cache::HttpAuth& auth, const std::string& cachePath);
+    void openRemoteZarr(const std::string& httpsUrl, const vc::HttpAuth& auth, const std::string& cachePath);
+    void openRemoteScroll(const std::string& httpsUrl, const vc::HttpAuth& auth, const std::string& cachePath);
+    void promptAndLoadRemoteSegments(const vc::HttpAuth& auth, const std::string& cachePath);
     // Non-prompting variant: attaches the supplied segments URL and triggers
     // the same discovery + surface-caching pipeline as the prompting path.
     // On success, persists (segUrl, zarrUrl) in QSettings so auto-open of
     // the same remote zarr can skip the prompt next time. Pass the current
     // remote volume's URL as zarrUrl; empty disables persistence.
     void loadRemoteSegmentsWithUrl(const QString& segUrl,
-                                   const vc::cache::HttpAuth& auth,
+                                   const vc::HttpAuth& auth,
                                    const std::string& cachePath,
                                    const QString& zarrUrl);
     bool tryResolveRemoteAuth(const QString& url,
-                              vc::cache::HttpAuth* authOut,
+                              vc::HttpAuth* authOut,
                               bool allowPrompt,
                               QString* errorMessage = nullptr) const;
     QString remoteCacheDirectory() const;

@@ -36,7 +36,7 @@ private:
 
 class ClassifyingHttpStore final : public utils::Store {
 public:
-    explicit ClassifyingHttpStore(std::string baseUrl, vc::cache::HttpAuth auth = {})
+    explicit ClassifyingHttpStore(std::string baseUrl, vc::HttpAuth auth = {})
         : baseUrl_(stripTrailingSlash(std::move(baseUrl)))
         , client_(makeClient(std::move(auth)))
     {
@@ -104,7 +104,7 @@ private:
         return value;
     }
 
-    static utils::HttpClient makeClient(vc::cache::HttpAuth auth)
+    static utils::HttpClient makeClient(vc::HttpAuth auth)
     {
         utils::HttpClient::Config config;
         config.aws_auth = std::move(auth);
@@ -226,7 +226,7 @@ OpenedChunkedZarr openLocalZarrPyramid(const std::filesystem::path& root)
 
 OpenedChunkedZarr openHttpZarrPyramid(
     const std::string& url,
-    const vc::cache::HttpAuth& auth,
+    const vc::HttpAuth& auth,
     int baseScaleLevel)
 {
     auto store = std::make_shared<ClassifyingHttpStore>(url, auth);
@@ -253,7 +253,7 @@ OpenedChunkedZarr openHttpZarrPyramid(
 
 OpenedChunkedZarr openHttpZarrPyramid(const std::string& url)
 {
-    return openHttpZarrPyramid(url, vc::cache::HttpAuth{}, 0);
+    return openHttpZarrPyramid(url, vc::HttpAuth{}, 0);
 }
 
 } // namespace vc::render

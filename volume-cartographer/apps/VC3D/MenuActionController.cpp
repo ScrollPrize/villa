@@ -1,6 +1,5 @@
 #include "MenuActionController.hpp"
 
-#include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "VCSettings.hpp"
 #include "CWindow.hpp"
 #include "SurfacePanelController.hpp"
@@ -563,7 +562,7 @@ void MenuActionController::browseS3()
     // Resolve auth before opening the dialog
     // Use a dummy s3:// URL to trigger AWS credential resolution
     QString probeUrl = startUrl.isEmpty() ? QStringLiteral("s3://probe") : startUrl;
-    vc::cache::HttpAuth auth;
+    vc::HttpAuth auth;
     QString authError;
     if (!tryResolveRemoteAuth(probeUrl, &auth, true, &authError)) {
         return;
@@ -640,7 +639,7 @@ void MenuActionController::attachRemoteZarr()
 }
 
 bool MenuActionController::tryResolveRemoteAuth(const QString& url,
-                                                vc::cache::HttpAuth* authOut,
+                                                vc::HttpAuth* authOut,
                                                 bool allowPrompt,
                                                 QString* errorMessage) const
 {
@@ -655,7 +654,7 @@ bool MenuActionController::tryResolveRemoteAuth(const QString& url,
     }
 
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    *authOut = vc::cache::loadAwsCredentials();
+    *authOut = vc::loadAwsCredentials();
     if (authOut->region.empty()) authOut->region = resolved.awsRegion;
 
     if (authOut->access_key.empty() || authOut->secret_key.empty()) {
@@ -809,7 +808,7 @@ void MenuActionController::loadAttachedRemoteVolumesForCurrentPackage()
             continue;
         }
 
-        vc::cache::HttpAuth auth;
+        vc::HttpAuth auth;
         QString authError;
         if (!tryResolveRemoteAuth(url, &auth, false, &authError)) {
             Logger()->warn("Skipping persisted remote volume '{}': {}", url.toStdString(), authError.toStdString());
@@ -869,7 +868,7 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url, bool persistE
         return;
     }
 
-    vc::cache::HttpAuth auth;
+    vc::HttpAuth auth;
     QString authError;
     if (!tryResolveRemoteAuth(url, &auth, true, &authError)) {
         if (!authError.isEmpty() && authError != QObject::tr("AWS credential entry canceled.")) {
@@ -992,7 +991,7 @@ void MenuActionController::openRemoteUrl(const QString& url, bool isRetry)
 
     auto urlStr = url.toStdString();
     auto resolved = vc::resolveRemoteUrl(urlStr);
-    vc::cache::HttpAuth auth;
+    vc::HttpAuth auth;
     QString authError;
     if (!tryResolveRemoteAuth(url, &auth, true, &authError)) {
         return;
@@ -1068,7 +1067,7 @@ bool isAuthError(const QString& msg)
 
 void MenuActionController::openRemoteZarr(
     const std::string& httpsUrl,
-    const vc::cache::HttpAuth& auth,
+    const vc::HttpAuth& auth,
     const std::string& cachePath)
 {
     auto* watcher = new QFutureWatcher<std::shared_ptr<Volume>>(this);
@@ -1205,7 +1204,7 @@ struct ScrollOpenResult {
 };
 
 void MenuActionController::promptAndLoadRemoteSegments(
-    const vc::cache::HttpAuth& auth,
+    const vc::HttpAuth& auth,
     const std::string& cachePath)
 {
     bool ok = false;
@@ -1229,7 +1228,7 @@ void MenuActionController::promptAndLoadRemoteSegments(
 
 void MenuActionController::loadRemoteSegmentsWithUrl(
     const QString& segUrlIn,
-    const vc::cache::HttpAuth& auth,
+    const vc::HttpAuth& auth,
     const std::string& cachePath,
     const QString& zarrUrl)
 {
@@ -1238,7 +1237,7 @@ void MenuActionController::loadRemoteSegmentsWithUrl(
         return;
 
     auto segResolved = vc::resolveRemoteUrl(segUrlTrim.toStdString());
-    vc::cache::HttpAuth segAuth = auth;
+    vc::HttpAuth segAuth = auth;
     if (segResolved.useAwsSigv4 && segAuth.region.empty())
         segAuth.region = segResolved.awsRegion;
 
@@ -1361,7 +1360,7 @@ void MenuActionController::loadRemoteSegmentsWithUrl(
 
 void MenuActionController::openRemoteScroll(
     const std::string& httpsUrl,
-    const vc::cache::HttpAuth& auth,
+    const vc::HttpAuth& auth,
     const std::string& cachePath)
 {
     // Phase 1: Discover scroll structure on background thread
@@ -1388,7 +1387,7 @@ void MenuActionController::openRemoteScroll(
                     .arg(QString::fromStdString(scrollInfo.authErrorMessage));
                 QMessageBox::warning(_window, QObject::tr("Credentials Expired"), msg);
 
-                vc::cache::HttpAuth freshAuth = auth;
+                vc::HttpAuth freshAuth = auth;
                 bool credOk = false;
                 QString accessKey = QInputDialog::getText(
                     _window, QObject::tr("AWS Credentials"),
@@ -1664,7 +1663,7 @@ void MenuActionController::openRemoteScroll(
 
                 if (segOk && !segUrl.trimmed().isEmpty()) {
                     auto segResolved = vc::resolveRemoteUrl(segUrl.trimmed().toStdString());
-                    vc::cache::HttpAuth segAuth = auth;
+                    vc::HttpAuth segAuth = auth;
                     if (segResolved.useAwsSigv4 && segAuth.region.empty()) {
                         segAuth.region = segResolved.awsRegion;
                     }

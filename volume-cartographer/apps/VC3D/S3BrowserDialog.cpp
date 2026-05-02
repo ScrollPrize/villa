@@ -1,5 +1,6 @@
 #include "S3BrowserDialog.hpp"
 
+#include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
 
 #include <QApplication>
@@ -14,7 +15,7 @@
 #include <QFutureWatcher>
 
 S3BrowserDialog::S3BrowserDialog(
-    const vc::cache::HttpAuth& auth,
+    const vc::HttpAuth& auth,
     const QString& initialUrl,
     QWidget* parent)
     : QDialog(parent)
@@ -107,7 +108,7 @@ void S3BrowserDialog::navigateTo(const QString& s3Url)
     setLoading(true);
 
     QString httpsUrl = s3ToHttps(_currentUrl);
-    vc::cache::HttpAuth auth = _auth;
+    vc::HttpAuth auth = _auth;
 
     // Bump the sequence for every navigation so a late-arriving response
     // to an older request is dropped instead of overwriting the current

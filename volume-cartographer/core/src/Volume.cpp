@@ -261,15 +261,15 @@ std::shared_ptr<Volume> Volume::New(std::filesystem::path path)
 std::shared_ptr<Volume> Volume::NewFromUrl(
     const std::string& url,
     const std::filesystem::path& cacheRoot,
-    const vc::cache::HttpAuth& authIn)
+    const vc::HttpAuth& authIn)
 {
     namespace fs = std::filesystem;
 
     // Resolve s3:// URLs to https:// and detect AWS credentials
     auto resolved = vc::resolveRemoteUrl(url);
-    vc::cache::HttpAuth auth = authIn;
+    vc::HttpAuth auth = authIn;
     if (resolved.useAwsSigv4 && auth.empty()) {
-        auth = vc::cache::loadAwsCredentials();
+        auth = vc::loadAwsCredentials();
         if (auth.region.empty())
             auth.region = resolved.awsRegion;
         // SigV4 is implicitly enabled when access_key is non-empty.
@@ -298,7 +298,7 @@ std::shared_ptr<Volume> Volume::NewFromUrl(
             throw;
         }
 
-        vc::cache::HttpAuth anonymousAuth;
+        vc::HttpAuth anonymousAuth;
         info = vc::cache::fetchRemoteZarrMetadata(resolved.httpsUrl, root, anonymousAuth);
         auth = std::move(anonymousAuth);
     }

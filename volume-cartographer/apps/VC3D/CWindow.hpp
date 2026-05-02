@@ -95,8 +95,7 @@ public slots:
     void onFocusViewsRequested(uint64_t collectionId, uint64_t pointId);
 
 public:
-    explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB,
-                     int startupPrefetchLevel = -1);
+    explicit CWindow(size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB);
     ~CWindow(void);
 
     // Helper method to get the current volume path
@@ -130,7 +129,6 @@ private:
 
 
     void setVolume(std::shared_ptr<Volume> newvol);
-    void runStartupPrefetchForVolume(const std::shared_ptr<Volume>& volume);
     bool attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
                                       const QString& preferredVolumeId = QString());
     void setRemoteSurfaces(const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& surfaces);
@@ -230,7 +228,6 @@ private:
     bool can_change_volume_();
 
     size_t _cacheSizeBytes = 0;
-    int _startupPrefetchLevel = -1;
 
     // Declared early so that the publisher thread joins (via ~jthread) after
     // all viewers and caches below have been destroyed. Readers hold raw
@@ -270,7 +267,7 @@ private:
         std::string baseUrl;
         std::string segmentsBaseUrl;
         std::string cachePath;
-        vc::cache::HttpAuth auth;
+        vc::HttpAuth auth;
         vc::RemoteSegmentSource segSource = vc::RemoteSegmentSource::Segments;
         bool active = false;
     };

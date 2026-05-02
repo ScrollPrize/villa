@@ -6,7 +6,7 @@
 
 #include <cstdint>
 
-#include "vc/core/cache/HttpMetadataFetcher.hpp"
+#include "vc/core/util/RemoteAuth.hpp"
 
 class QLineEdit;
 class QListWidget;
@@ -19,7 +19,7 @@ class S3BrowserDialog : public QDialog
     Q_OBJECT
 
 public:
-    explicit S3BrowserDialog(const vc::cache::HttpAuth& auth,
+    explicit S3BrowserDialog(const vc::HttpAuth& auth,
                              const QString& initialUrl = QString(),
                              QWidget* parent = nullptr);
 
@@ -38,7 +38,7 @@ private:
     // Convert s3://bucket/prefix/ to HTTPS URL for s3ListObjects
     QString s3ToHttps(const QString& s3Url) const;
 
-    vc::cache::HttpAuth _auth;
+    vc::HttpAuth _auth;
     QString _currentUrl;   // e.g. "s3://bucket/prefix/"
     QString _selectedUrl;
     // Monotonic counter incremented on every navigateTo() — late-arriving

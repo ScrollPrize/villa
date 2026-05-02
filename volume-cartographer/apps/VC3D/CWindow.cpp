@@ -3,7 +3,6 @@
 #include "RamStats.hpp"
 
 #include <cstdlib>
-#include <condition_variable>
 #include <functional>
 #include <mutex>
 #if defined(__GLIBC__)
@@ -41,7 +40,6 @@
 #include <QFileInfo>
 #include <QDir>
 #include <QEventLoop>
-#include <QProgressDialog>
 #include <QMessageBox>
 #include <QInputDialog>
 #include <QThread>
@@ -114,8 +112,6 @@
 #include "LasagnaServiceManager.hpp"
 #include "segmentation/panels/SegmentationLasagnaPanel.hpp"
 #include "vc/core/Version.hpp"
-#include "vc/core/cache/BlockPipeline.hpp"
-
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
@@ -216,15 +212,15 @@ std::filesystem::path expandLocalTransformPath(const QString& source)
     return fsPath;
 }
 
-vc::cache::HttpAuth authForRemoteTransformSource(const QString& source)
+vc::HttpAuth authForRemoteTransformSource(const QString& source)
 {
-    vc::cache::HttpAuth auth;
+    vc::HttpAuth auth;
     const auto resolved = vc::resolveRemoteUrl(source.trimmed().toStdString());
     if (!resolved.useAwsSigv4) {
         return auth;
     }
 
-    auth = vc::cache::loadAwsCredentials();
+    auth = vc::loadAwsCredentials();
     if (auth.region.empty())
         auth.region = resolved.awsRegion;
     // Fall back to saved QSettings if ~/.aws/ files had nothing
@@ -560,236 +556,6 @@ std::shared_ptr<QuadSurface> cloneSurfaceForTransform(const std::shared_ptr<Quad
     return clone;
 }
 
-struct StartupLevelPrefetchProgress {
-    std::atomic<size_t> totalKeys{0};
-    std::atomic<size_t> cachedKeys{0};
-    std::atomic<size_t> missingKeys{0};
-    std::atomic<size_t> ioPending{0};
-};
-
-struct StartupLevelPrefetchResult {
-    bool success{false};
-    QString error;
-    int level{-1};
-    size_t totalKeys{0};
-    size_t initialCached{0};
-    size_t fetchedKeys{0};
-};
-
-std::vector<vc::cache::ChunkKey> collectLevelChunkKeys(
-    vc::cache::BlockPipeline* cache,
-    int level)
-{
-    if (!cache) {
-        throw std::runtime_error("chunk cache is not available");
-    }
-    if (level < 0 || level >= cache->numLevels()) {
-        throw std::runtime_error(
-            "pyramid level " + std::to_string(level)
-            + " is not present in this volume");
-    }
-
-    const auto levelShape = cache->levelShape(level);
-    const auto chunkShape = cache->chunkShape(level);
-    if (levelShape[0] <= 0 || levelShape[1] <= 0 || levelShape[2] <= 0 ||
-        chunkShape[0] <= 0 || chunkShape[1] <= 0 || chunkShape[2] <= 0) {
-        throw std::runtime_error(
-            "pyramid level " + std::to_string(level)
-            + " has invalid shape or chunk shape");
-    }
-
-    const int gridZ = (levelShape[0] + chunkShape[0] - 1) / chunkShape[0];
-    const int gridY = (levelShape[1] + chunkShape[1] - 1) / chunkShape[1];
-    const int gridX = (levelShape[2] + chunkShape[2] - 1) / chunkShape[2];
-    const size_t total = size_t(gridZ) * size_t(gridY) * size_t(gridX);
-
-    std::vector<vc::cache::ChunkKey> keys;
-    keys.reserve(total);
-    for (int iz = 0; iz < gridZ; ++iz)
-        for (int iy = 0; iy < gridY; ++iy)
-            for (int ix = 0; ix < gridX; ++ix)
-                keys.push_back(vc::cache::ChunkKey{level, iz, iy, ix});
-    return keys;
-}
-
-StartupLevelPrefetchResult prefetchRemoteLevelBlocking(
-    const std::shared_ptr<Volume>& volume,
-    int level,
-    const std::shared_ptr<StartupLevelPrefetchProgress>& progress)
-{
-    StartupLevelPrefetchResult result;
-    result.level = level;
-    if (!volume) {
-        result.error = QObject::tr("Volume is not available.");
-        return result;
-    }
-
-    try {
-        auto* cache = volume->tieredCache();
-        const auto keys = collectLevelChunkKeys(cache, level);
-        result.totalKeys = keys.size();
-        progress->totalKeys.store(keys.size(), std::memory_order_relaxed);
-
-        auto missing = cache->chunksMissingFromCache(keys);
-        result.initialCached = keys.size() - missing.size();
-        progress->cachedKeys.store(result.initialCached, std::memory_order_relaxed);
-        progress->missingKeys.store(missing.size(), std::memory_order_relaxed);
-
-        if (missing.empty()) {
-            result.success = true;
-            return result;
-        }
-
-        struct WaitState {
-            std::mutex mtx;
-            std::condition_variable cv;
-        };
-        auto waitState = std::make_shared<WaitState>();
-        const auto listenerId = cache->addChunkReadyListener(
-            [waitState](const vc::cache::ChunkKey&) {
-                waitState->cv.notify_one();
-            });
-
-        cache->fetchInteractive(missing, level);
-
-        size_t lastMissing = missing.size();
-        int idleRetries = 0;
-        while (!missing.empty()) {
-            {
-                std::unique_lock<std::mutex> lk(waitState->mtx);
-                waitState->cv.wait_for(lk, std::chrono::milliseconds(200));
-            }
-
-            missing = cache->chunksMissingFromCache(missing);
-            const auto stats = cache->stats();
-            progress->cachedKeys.store(keys.size() - missing.size(), std::memory_order_relaxed);
-            progress->missingKeys.store(missing.size(), std::memory_order_relaxed);
-            progress->ioPending.store(stats.ioPending, std::memory_order_relaxed);
-
-            if (missing.empty()) break;
-
-            if (stats.ioPending == 0 && missing.size() == lastMissing) {
-                ++idleRetries;
-                cache->fetchInteractive(missing, level);
-                if (idleRetries > 3) {
-                    cache->removeChunkReadyListener(listenerId);
-                    result.error = QObject::tr(
-                        "Remote level prefetch stalled at %1 / %2 chunks cached.")
-                        .arg(keys.size() - missing.size())
-                        .arg(keys.size());
-                    return result;
-                }
-            } else {
-                idleRetries = 0;
-            }
-            lastMissing = missing.size();
-        }
-
-        cache->removeChunkReadyListener(listenerId);
-        result.success = true;
-        result.fetchedKeys = result.totalKeys - result.initialCached;
-        return result;
-    } catch (const std::exception& e) {
-        result.error = QString::fromStdString(e.what());
-        return result;
-    } catch (...) {
-        result.error = QObject::tr("Unknown error during remote level prefetch.");
-        return result;
-    }
-}
-
-void prefetchRemoteLevelWithDialog(CWindow* window,
-                                   const std::shared_ptr<Volume>& volume,
-                                   int level)
-{
-    if (!window || !volume) return;
-
-    auto progressState = std::make_shared<StartupLevelPrefetchProgress>();
-    QProgressDialog progress(
-        QObject::tr("Planning remote level %1 prefetch...").arg(level),
-        QString(), 0, 0, window);
-    progress.setWindowTitle(QObject::tr("Prefetch Remote Volume"));
-    progress.setWindowModality(Qt::ApplicationModal);
-    progress.setAutoClose(false);
-    progress.setAutoReset(false);
-    progress.setMinimumDuration(0);
-    progress.setCancelButton(nullptr);
-
-    QFutureWatcher<StartupLevelPrefetchResult> watcher;
-    QTimer timer;
-    QObject::connect(&watcher, &QFutureWatcher<StartupLevelPrefetchResult>::finished,
-                     &progress, &QDialog::accept);
-    QObject::connect(&timer, &QTimer::timeout, &progress,
-                     [&progress, progressState, level]() {
-        const size_t total = progressState->totalKeys.load(std::memory_order_relaxed);
-        const size_t cached = progressState->cachedKeys.load(std::memory_order_relaxed);
-        const size_t missing = progressState->missingKeys.load(std::memory_order_relaxed);
-        const size_t pending = progressState->ioPending.load(std::memory_order_relaxed);
-
-        if (total > 0) {
-            const int safeTotal = total > size_t(std::numeric_limits<int>::max())
-                ? std::numeric_limits<int>::max()
-                : static_cast<int>(total);
-            const int safeCached = cached > size_t(safeTotal)
-                ? safeTotal
-                : static_cast<int>(cached);
-            progress.setRange(0, safeTotal);
-            progress.setValue(safeCached);
-        } else {
-            progress.setRange(0, 0);
-        }
-
-        progress.setLabelText(
-            QObject::tr("Prefetching remote pyramid level %1...\n"
-                        "Chunks cached: %2 / %3\n"
-                        "Chunks needing download: %4\n"
-                        "Pending I/O: %5")
-                .arg(level)
-                .arg(QString::number(static_cast<qulonglong>(cached)))
-                .arg(QString::number(static_cast<qulonglong>(total)))
-                .arg(QString::number(static_cast<qulonglong>(missing)))
-                .arg(QString::number(static_cast<qulonglong>(pending))));
-    });
-
-    timer.start(100);
-    watcher.setFuture(QtConcurrent::run([volume, level, progressState]() {
-        return prefetchRemoteLevelBlocking(volume, level, progressState);
-    }));
-
-    if (!watcher.isFinished()) {
-        progress.exec();
-    }
-    timer.stop();
-
-    const auto result = watcher.result();
-    if (!result.success) {
-        QMessageBox::warning(
-            window,
-            QObject::tr("Prefetch Remote Volume"),
-            result.error.isEmpty()
-                ? QObject::tr("Failed to prefetch remote pyramid level %1.").arg(level)
-                : result.error);
-        return;
-    }
-
-    if (window->statusBar()) {
-        if (result.fetchedKeys == 0) {
-            window->statusBar()->showMessage(
-                QObject::tr("All %1 chunk(s) for remote level %2 were already cached.")
-                    .arg(QString::number(static_cast<qulonglong>(result.totalKeys)))
-                    .arg(level),
-                7000);
-        } else {
-            window->statusBar()->showMessage(
-                QObject::tr("Prefetched %1 missing chunk(s) for remote level %2 (%3 already cached).")
-                    .arg(QString::number(static_cast<qulonglong>(result.fetchedKeys)))
-                    .arg(level)
-                    .arg(QString::number(static_cast<qulonglong>(result.initialCached))),
-                7000);
-        }
-    }
-}
-
 } // namespace
 
 // Dark mode detection - works on all Qt 6.x versions
@@ -890,13 +656,11 @@ static bool windowStateMetaMatches(const QSettings& settings,
 }
 
 // Constructor
-CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
+CWindow::CWindow(size_t cacheSizeGB) :
     _cmdRunner(nullptr),
     _seedingWidget(nullptr),
     _point_collection_widget(nullptr)
 {
-    _startupPrefetchLevel = startupPrefetchLevel;
-
     // Initialize timer for debounced window state saving (500ms delay)
     _windowStateSaveTimer = new QTimer(this);
     _windowStateSaveTimer->setSingleShot(true);
@@ -2196,8 +1960,6 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     // CState handles cache budget and volume ID resolution, and emits volumeChanged
     _state->setCurrentVolume(newvol);
 
-    runStartupPrefetchForVolume(newvol);
-
     const bool growthVolumeValid = _state->hasVpkg() && !_state->segmentationGrowthVolumeId().empty() &&
                                    _state->vpkg()->hasVolume(_state->segmentationGrowthVolumeId());
     if (!growthVolumeValid) {
@@ -2236,24 +1998,6 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
     _axisAlignedSliceController->applyOrientation(_state ? _state->surface("segmentation").get() : nullptr);
 }
 
-void CWindow::runStartupPrefetchForVolume(const std::shared_ptr<Volume>& volume)
-{
-    if (_startupPrefetchLevel < 0 || !volume || !volume->isRemote()) {
-        return;
-    }
-
-    volume->setCacheBudget(_cacheSizeBytes);
-    const int numLevels = static_cast<int>(volume->numScales());
-    if (_startupPrefetchLevel >= numLevels) {
-        prefetchRemoteLevelWithDialog(this, volume, _startupPrefetchLevel);
-        return;
-    }
-
-    for (int level = _startupPrefetchLevel; level < numLevels; ++level) {
-        prefetchRemoteLevelWithDialog(this, volume, level);
-    }
-}
-
 bool CWindow::attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
                                            const QString& preferredVolumeId)
 {
@@ -2264,8 +2008,6 @@ bool CWindow::attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume
     if (!_state->vpkg()->addVolume(volume)) {
         return false;
     }
-
-    runStartupPrefetchForVolume(volume);
 
     const bool needSurfaceLoad = _surfacePanel && !_surfacePanel->hasSurfaces();
     refreshCurrentVolumePackageUi(preferredVolumeId.isEmpty()
