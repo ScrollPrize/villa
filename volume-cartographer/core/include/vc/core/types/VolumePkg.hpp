@@ -47,6 +47,7 @@ public:
 
     static std::shared_ptr<VolumePkg> New(const std::filesystem::path& jsonFile);
 
+    static void setLoadFirstSegmentationDirectory(const std::string& dirName);
     static void setAutosaveRoot(const std::filesystem::path& dir);
     static std::filesystem::path autosaveRoot();
     static std::filesystem::path autosaveFile();
@@ -151,6 +152,7 @@ private:
     void fromJson(const utils::Json& j);
 
     static std::filesystem::path autosaveRoot_;
+    static std::optional<std::string> loadFirstSegmentationDir_;
 
     mutable std::mutex segmentsMutex_;
     std::function<void()> segmentsChangedCb_;

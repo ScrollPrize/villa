@@ -1,6 +1,7 @@
 #include "vc/core/types/VolumePkg.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -18,6 +19,7 @@
 namespace fs = std::filesystem;
 
 std::filesystem::path VolumePkg::autosaveRoot_;
+std::optional<std::string> VolumePkg::loadFirstSegmentationDir_{};
 
 namespace vc::project {
 
@@ -43,6 +45,13 @@ fs::path resolveLocalPath(const std::string& location, const fs::path& base)
 }
 
 namespace {
+
+std::string asciiLower(std::string value)
+{
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return value;
+}
 
 bool hasZarrMarkerAtRoot(const fs::path& dir)
 {
@@ -219,6 +228,15 @@ VolumePkg::~VolumePkg()
 
 void VolumePkg::setAutosaveRoot(const fs::path& dir) { autosaveRoot_ = dir; }
 fs::path VolumePkg::autosaveRoot() { return autosaveRoot_; }
+
+void VolumePkg::setLoadFirstSegmentationDirectory(const std::string& dirName)
+{
+    if (dirName.empty()) {
+        loadFirstSegmentationDir_.reset();
+        return;
+    }
+    loadFirstSegmentationDir_ = dirName;
+}
 
 fs::path VolumePkg::autosaveFile()
 {
@@ -655,7 +673,25 @@ void VolumePkg::resolveAll()
     }
     resolvedNormalGridPaths_.clear();
     for (const auto& e : volumes_) resolveVolumeEntry(e);
-    for (const auto& e : segments_) resolveSegmentsEntry(e);
+    bool loadedPreferredSegments = false;
+    if (loadFirstSegmentationDir_ && !loadFirstSegmentationDir_->empty()) {
+        const auto requested = asciiLower(*loadFirstSegmentationDir_);
+        for (const auto& e : segments_) {
+            if (vc::project::isLocationRemote(e.location)) continue;
+            const auto path = vc::project::resolveLocalPath(e.location, path_.parent_path());
+            if (asciiLower(path.filename().string()) != requested) continue;
+            resolveSegmentsEntry(e);
+            loadedPreferredSegments = true;
+            break;
+        }
+        if (!loadedPreferredSegments) {
+            Logger()->warn("Requested load-first segmentation directory '{}' not available; loading all segmentations.",
+                           *loadFirstSegmentationDir_);
+        }
+    }
+    if (!loadFirstSegmentationDir_ || !loadedPreferredSegments) {
+        for (const auto& e : segments_) resolveSegmentsEntry(e);
+    }
     for (const auto& e : normalGrids_) resolveNormalGridEntry(e);
 }
 
@@ -867,7 +903,25 @@ void VolumePkg::refreshSegmentations()
         loadedSegmentations_.clear();
         segmentationTagsByID_.clear();
     }
-    for (const auto& e : segments_) resolveSegmentsEntry(e);
+    bool loadedPreferredSegments = false;
+    if (loadFirstSegmentationDir_ && !loadFirstSegmentationDir_->empty()) {
+        const auto requested = asciiLower(*loadFirstSegmentationDir_);
+        for (const auto& e : segments_) {
+            if (vc::project::isLocationRemote(e.location)) continue;
+            const auto path = vc::project::resolveLocalPath(e.location, path_.parent_path());
+            if (asciiLower(path.filename().string()) != requested) continue;
+            resolveSegmentsEntry(e);
+            loadedPreferredSegments = true;
+            break;
+        }
+        if (!loadedPreferredSegments) {
+            Logger()->warn("Requested load-first segmentation directory '{}' not available; loading all segmentations.",
+                           *loadFirstSegmentationDir_);
+        }
+    }
+    if (!loadFirstSegmentationDir_ || !loadedPreferredSegments) {
+        for (const auto& e : segments_) resolveSegmentsEntry(e);
+    }
 }
 
 bool VolumePkg::addSingleSegmentation(const std::string& id)
