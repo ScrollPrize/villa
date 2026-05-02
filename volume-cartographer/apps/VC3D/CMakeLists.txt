@@ -7,8 +7,6 @@ set(srcs
     VCAppMain.cpp
     CState.cpp
     CState.hpp
-    SurfaceLRU.cpp
-    SurfaceLRU.hpp
     Keybinds.cpp
     Keybinds.hpp
     CWindow.cpp
