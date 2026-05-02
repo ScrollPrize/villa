@@ -535,7 +535,7 @@ TracerGrowthResult runTracerGrowth(const SegmentationGrowthRequest& request,
 
         QuadSurface* surface = tracer(dataset,
                                       1.0f,
-                                      context.volume->tieredCache(),
+                                      context.volume->chunkedCache(),
                                       context.level,
                                       origin,
                                       params,

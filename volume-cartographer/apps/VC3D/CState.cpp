@@ -51,12 +51,6 @@ void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
     fprintf(stderr, "[CState] setCurrentVolume: begin (old=%p new=%p)\n",
             (void*)_currentVolume.get(), (void*)vol.get());
     if (_currentVolume) {
-        auto* oldPipeline = _currentVolume->tieredCache();
-        if (oldPipeline) {
-            fprintf(stderr, "[CState] shutdown + clearMemory on old pipeline\n");
-            oldPipeline->shutdown();
-            oldPipeline->clearMemory();
-        }
         _currentVolume->resetTieredCache();
     }
     if (_blockCache) {
