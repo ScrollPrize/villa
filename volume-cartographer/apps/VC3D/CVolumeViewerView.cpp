@@ -467,6 +467,8 @@ void CVolumeViewerView::mouseMoveEvent(QMouseEvent *event)
     QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
     QPointF scene_loc = mapToScene({int(global_loc.x()),int(global_loc.y())});
 
+    emit sendCursorMove(scene_loc);
+
     // Forward mouse move events even without a pressed button so tools that
     // rely on hover state (e.g. segmentation editing) receive continuous
     // volume coordinates. Consumers that only care about drags can still

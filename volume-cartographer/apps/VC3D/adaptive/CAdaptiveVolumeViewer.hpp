@@ -62,11 +62,11 @@ public:
 
     // --- Data setup ---
     void setPointCollection(VCCollection* pc) { _pointCollection = pc; }
-    void setSurface(const std::string& name);
-    void setIntersects(const std::set<std::string>& names) { _intersectTgts = names; renderIntersections(); }
+    void setSurface(const std::string& name) override;
+    void setIntersects(const std::set<std::string>& names) override { _intersectTgts = names; renderIntersections(); }
 
     // --- Rendering ---
-    void renderVisible(bool force = false);
+    void renderVisible(bool force = false) override;
     void renderIntersections() override;
     // Synchronous body of renderIntersections(). The public override just
     // schedules a coalesced debounce so rapid-fire UI setters (opacity /
@@ -75,7 +75,7 @@ public:
     void renderIntersectionsNow();
     void invalidateVis() {}
     void invalidateIntersect(const std::string& = "") override;
-    void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false);
+    void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) override;
     void centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender = false);
 
     // --- Accessors ---
@@ -100,7 +100,7 @@ public:
     // coalesce timer still fires, but it triggers a full frame for zero
     // visible change. Skipping identical settings keeps the pipeline
     // idle when nothing actually changed.
-    void setCompositeRenderSettings(const CompositeRenderSettings& s) {
+    void setCompositeRenderSettings(const CompositeRenderSettings& s) override {
         if (_compositeSettings == s) return;
         _compositeSettings = s;
         scheduleRender();
@@ -109,10 +109,10 @@ public:
     bool isCompositeEnabled() const override { return _compositeSettings.enabled; }
     bool isPlaneCompositeEnabled() const override { return _compositeSettings.planeEnabled; }
 
-    void setVolumeWindow(float low, float high);
+    void setVolumeWindow(float low, float high) override;
     float volumeWindowLow() const { return _windowLow; }
     float volumeWindowHigh() const { return _windowHigh; }
-    void setBaseColormap(const std::string& id) {
+    void setBaseColormap(const std::string& id) override {
         if (_baseColormapId == id) return;
         _baseColormapId = id;
         scheduleRender();
@@ -120,10 +120,10 @@ public:
     void setStretchValues(bool) { scheduleRender(); }
 
     // --- Display stubs ---
-    void setResetViewOnSurfaceChange(bool v) { _resetViewOnSurfaceChange = v; }
-    void setShowDirectionHints(bool on) { _showDirectionHints = on; emit overlaysUpdated(); }
+    void setResetViewOnSurfaceChange(bool v) override { _resetViewOnSurfaceChange = v; }
+    void setShowDirectionHints(bool on) override { _showDirectionHints = on; emit overlaysUpdated(); }
     bool isShowDirectionHints() const override { return _showDirectionHints; }
-    void setShowSurfaceNormals(bool on) { _showSurfaceNormals = on; emit overlaysUpdated(); }
+    void setShowSurfaceNormals(bool on) override { _showSurfaceNormals = on; emit overlaysUpdated(); }
     bool isShowSurfaceNormals() const override { return _showSurfaceNormals; }
     float normalArrowLengthScale() const override { return _normalArrowLengthScale; }
     int normalMaxArrows() const override { return _normalMaxArrows; }
@@ -131,15 +131,15 @@ public:
     void setNormalMaxArrows(int maxArrows) { _normalMaxArrows = maxArrows; emit overlaysUpdated(); }
 
     // --- Overlay volume ---
-    void setOverlayVolume(std::shared_ptr<Volume> volume);
-    void setOverlayOpacity(float opacity);
-    void setOverlayColormap(const std::string& colormapId);
-    void setOverlayThreshold(float threshold);
-    void setOverlayWindow(float low, float high);
+    void setOverlayVolume(std::shared_ptr<Volume> volume) override;
+    void setOverlayOpacity(float opacity) override;
+    void setOverlayColormap(const std::string& colormapId) override;
+    void setOverlayThreshold(float threshold) override;
+    void setOverlayWindow(float low, float high) override;
 
     // --- Segmentation stubs ---
-    void setSegmentationEditActive(bool) {}
-    void setSegmentationCursorMirroring(bool) {}
+    void setSegmentationEditActive(bool) override {}
+    void setSegmentationCursorMirroring(bool) override {}
     const ActiveSegmentationHandle& activeSegmentationHandle() const override {
         static ActiveSegmentationHandle h;
         return h;
@@ -168,14 +168,14 @@ public:
     float intersectionOpacity() const override { return _intersectionOpacity; }
     float intersectionThickness() const override { return _intersectionThickness; }
     int surfacePatchSamplingStride() const override { return _surfacePatchSamplingStride; }
-    void setIntersectionOpacity(float v) { _intersectionOpacity = v; renderIntersections(); }
-    void setIntersectionThickness(float v) { _intersectionThickness = v; renderIntersections(); }
-    void setHighlightedSurfaceIds(const std::vector<std::string>& ids) {
+    void setIntersectionOpacity(float v) override { _intersectionOpacity = v; renderIntersections(); }
+    void setIntersectionThickness(float v) override { _intersectionThickness = v; renderIntersections(); }
+    void setHighlightedSurfaceIds(const std::vector<std::string>& ids) override {
         _highlightedSurfaceIds.clear();
         for (const auto& id : ids) _highlightedSurfaceIds.insert(id);
         renderIntersections();
     }
-    void setSurfacePatchSamplingStride(int s) { _surfacePatchSamplingStride = s; }
+    void setSurfacePatchSamplingStride(int s) override { _surfacePatchSamplingStride = s; }
 
     // --- Surface overlays ---
     bool surfaceOverlayEnabled() const override { return _surfaceOverlayEnabled; }
@@ -201,14 +201,15 @@ public:
     // --- Coordinate transforms ---
     QPointF volumeToScene(const cv::Vec3f& vol_point) override;
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const override;
-    cv::Vec2f sceneToSurfaceCoords(const QPointF& scenePos) const;
+    cv::Vec2f sceneToSurfaceCoords(const QPointF& scenePos) const override;
+    void setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>&) override {}
     QPointF surfaceCoordsToScene(float surfX, float surfY) const { return surfaceToScene(surfX, surfY); }
     bool sceneToVolumePN(cv::Vec3f& p, cv::Vec3f& n, const QPointF& scenePos) const;
-    QPointF lastScenePosition() const { return _lastScenePos; }
+    QPointF lastScenePosition() const override { return _lastScenePos; }
 
     // --- Surface offset ---
-    void adjustSurfaceOffset(float dn);
-    void resetSurfaceOffsets();
+    void adjustSurfaceOffset(float dn) override;
+    void resetSurfaceOffsets() override;
 
     // --- BBox tool ---
     void setBBoxMode(bool enabled);
@@ -232,7 +233,7 @@ public:
     }
 
     void updateStatusLabel();
-    void fitSurfaceInView();
+    void fitSurfaceInView() override;
     void requestRender();
     bool isWindowMinimized() const;
     bool eventFilter(QObject* watched, QEvent* event) override;
@@ -260,7 +261,7 @@ public slots:
     void onPointSelected(uint64_t) {}
     void onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>&) {}
     void onDrawingModeActive(bool, float = 3.0f, bool = false) {}
-    void adjustZoomByFactor(float factor);
+    void adjustZoomByFactor(float factor) override;
 
 signals:
     void sendVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface* surf,

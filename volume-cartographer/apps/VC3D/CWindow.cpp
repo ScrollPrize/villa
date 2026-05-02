@@ -963,6 +963,18 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
             ui.chkCompositeEnabled->setChecked(s.enabled);
         }
     });
+    connect(_viewerManager.get(), &ViewerManager::baseViewerCreated, this, [this](VolumeViewerBase* viewer) {
+        if (!viewer) {
+            return;
+        }
+        auto s = viewer->compositeRenderSettings();
+        s.params.method = compositeMethodForModeIndex(ui.cmbCompositeMode->currentIndex());
+        viewer->setCompositeRenderSettings(s);
+        if (viewer->surfName() == "segmentation") {
+            QSignalBlocker blocker(ui.chkCompositeEnabled);
+            ui.chkCompositeEnabled->setChecked(s.enabled);
+        }
+    });
 
     // Slice step size label in status bar
     _sliceStepLabel = new QLabel(this);
@@ -1410,18 +1422,20 @@ CWindow::~CWindow()
     CloseVolume();
 }
 
-CTiledVolumeViewer *CWindow::newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea)
+VolumeViewerBase *CWindow::newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea)
 {
     if (!_viewerManager) {
         return nullptr;
     }
 
-    CTiledVolumeViewer* viewer = _viewerManager->createViewer(surfaceName, title, mdiArea);
+    VolumeViewerBase* viewer = _viewerManager->createViewer(surfaceName, title, mdiArea);
     if (!viewer) {
         return nullptr;
     }
 
-    configureViewerConnections(viewer);
+    if (auto* adaptiveViewer = qobject_cast<CTiledVolumeViewer*>(viewer->asQObject())) {
+        configureViewerConnections(adaptiveViewer);
+    }
     return viewer;
 }
 
@@ -2766,8 +2780,10 @@ void CWindow::CreateWidgets(void)
     // Ensure the viewer's graphics view gets focus when subwindow is activated
     connect(mdiArea, &QMdiArea::subWindowActivated, [](QMdiSubWindow* subWindow) {
         if (subWindow) {
-            if (auto* viewer = qobject_cast<CTiledVolumeViewer*>(subWindow->widget())) {
-                viewer->fGraphicsView->setFocus();
+            if (auto* viewer = dynamic_cast<VolumeViewerBase*>(subWindow->widget())) {
+                if (auto* graphicsView = viewer->graphicsView()) {
+                    graphicsView->setFocus();
+                }
             }
         }
     });

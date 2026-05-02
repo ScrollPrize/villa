@@ -75,6 +75,7 @@ public:
 
     [[nodiscard]] vc::VcDataset *zarrDataset(int level = 0) const;
     [[nodiscard]] size_t numScales() const noexcept;
+    [[nodiscard]] int baseScaleLevel() const noexcept { return 0; }
 
     // Create a BlockPipeline backed by this volume's zarr data.
     [[nodiscard]] std::unique_ptr<vc::cache::BlockPipeline> createTieredCache() const;

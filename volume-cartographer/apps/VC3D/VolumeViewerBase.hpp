@@ -10,6 +10,7 @@
 #include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -56,6 +57,19 @@ public:
     // --- Coordinate transforms ---
     virtual QPointF volumeToScene(const cv::Vec3f& vol_point) = 0;
     virtual cv::Vec3f sceneToVolume(const QPointF& scenePoint) const = 0;
+    virtual cv::Vec2f sceneToSurfaceCoords(const QPointF& scenePos) const = 0;
+    virtual QPointF lastScenePosition() const = 0;
+    virtual void setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>& point) = 0;
+
+    // --- Common viewer controls ---
+    virtual void setSurface(const std::string& name) = 0;
+    virtual void setIntersects(const std::set<std::string>& names) = 0;
+    virtual void renderVisible(bool force = false) = 0;
+    virtual void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) = 0;
+    virtual void adjustZoomByFactor(float factor) = 0;
+    virtual void adjustSurfaceOffset(float delta) = 0;
+    virtual void resetSurfaceOffsets() = 0;
+    virtual void fitSurfaceInView() = 0;
 
     // --- Data access ---
     virtual Surface* currentSurface() const = 0;
@@ -81,6 +95,19 @@ public:
     virtual const CompositeRenderSettings& compositeRenderSettings() const = 0;
     virtual bool isCompositeEnabled() const = 0;
     virtual bool isPlaneCompositeEnabled() const = 0;
+    virtual void setCompositeRenderSettings(const CompositeRenderSettings& settings) = 0;
+    virtual void setVolumeWindow(float low, float high) = 0;
+    virtual void setBaseColormap(const std::string& id) = 0;
+    virtual void setResetViewOnSurfaceChange(bool enabled) = 0;
+    virtual void setShowDirectionHints(bool enabled) = 0;
+    virtual void setShowSurfaceNormals(bool enabled) = 0;
+    virtual void setSegmentationEditActive(bool active) = 0;
+    virtual void setSegmentationCursorMirroring(bool enabled) = 0;
+    virtual void setOverlayVolume(std::shared_ptr<Volume> volume) = 0;
+    virtual void setOverlayOpacity(float opacity) = 0;
+    virtual void setOverlayColormap(const std::string& colormapId) = 0;
+    virtual void setOverlayThreshold(float threshold) = 0;
+    virtual void setOverlayWindow(float low, float high) = 0;
 
     // --- Interaction state ---
     virtual uint64_t highlightedPointId() const = 0;
@@ -104,6 +131,10 @@ public:
     virtual float intersectionOpacity() const = 0;
     virtual float intersectionThickness() const = 0;
     virtual int surfacePatchSamplingStride() const = 0;
+    virtual void setIntersectionOpacity(float opacity) = 0;
+    virtual void setIntersectionThickness(float thickness) = 0;
+    virtual void setHighlightedSurfaceIds(const std::vector<std::string>& ids) = 0;
+    virtual void setSurfacePatchSamplingStride(int stride) = 0;
 
     // --- Surface overlays ---
     virtual bool surfaceOverlayEnabled() const = 0;

@@ -153,6 +153,8 @@ set(srcs
     elements/COutlinedTextItem.cpp
     adaptive/CAdaptiveVolumeViewer.cpp
     adaptive/CAdaptiveVolumeViewer.hpp
+    streaming/CChunkedVolumeViewer.cpp
+    streaming/CChunkedVolumeViewer.hpp
 )
 
 if(VC_ENABLE_TSAN OR VC_ENABLE_LSAN OR VC_ENABLE_UBSAN OR VC_ENABLE_ASAN)
@@ -165,6 +167,7 @@ add_executable(VC3D ${srcs} resources.qrc)
 target_include_directories(VC3D
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_SOURCE_DIR}/core/src
         ${CMAKE_SOURCE_DIR}/libs/edt
         ${CMAKE_SOURCE_DIR}/libs/cc3d
         ${CMAKE_SOURCE_DIR}/libs/djikstra3d

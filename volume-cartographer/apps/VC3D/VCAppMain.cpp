@@ -153,6 +153,11 @@ auto main(int argc, char* argv[]) -> int
         "Skip validation of zarr shape against meta.json dimensions");
     parser.addOption(skipShapeCheckOption);
 
+    QCommandLineOption useChunkedViewerOption(
+        "use-chunked-viewer",
+        "Use the experimental chunked streaming viewer for viewer windows.");
+    parser.addOption(useChunkedViewerOption);
+
     QCommandLineOption loadFirstOption(
         "load-first",
         "Load segmentations from the specified directory first and defer others (e.g. paths or traces).",
@@ -187,6 +192,9 @@ auto main(int argc, char* argv[]) -> int
 
     if (parser.isSet(skipShapeCheckOption)) {
         Volume::skipShapeCheck = true;
+    }
+    if (parser.isSet(useChunkedViewerOption)) {
+        app.setProperty("vc3d/useChunkedViewer", true);
     }
     if (parser.isSet(loadFirstOption)) {
         QString loadFirstDir = parser.value(loadFirstOption).trimmed().toLower();

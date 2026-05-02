@@ -120,7 +120,7 @@ private:
     // Helper method for command line tools
     bool initializeCommandLineRunner(void);
 
-    CTiledVolumeViewer *newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea);
+    VolumeViewerBase *newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea);
     void closeEvent(QCloseEvent* event) override;
 
     void setWidgetsEnabled(bool state);

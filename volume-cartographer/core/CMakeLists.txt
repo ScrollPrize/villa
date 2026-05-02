@@ -37,8 +37,11 @@ add_library(vc_core
         src/Thinning.cpp
         src/Umbilicus.cpp
         src/render/AdaptiveCamera.cpp
+        src/render/ChunkCache.cpp
+        src/render/ChunkedPlaneSampler.cpp
         src/render/Colormaps.cpp
         src/render/PostProcess.cpp
+        src/render/ZarrChunkFetcher.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )
 
