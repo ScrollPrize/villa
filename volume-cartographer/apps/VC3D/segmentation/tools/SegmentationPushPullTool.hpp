@@ -17,6 +17,7 @@ class CState;
 class SegmentationModule;
 class QuadSurface;
 class Volume;
+class VolumeViewerBase;
 class QTimer;
 
 class SegmentationPushPullTool : public SegmentationTool
@@ -64,6 +65,7 @@ private:
     void ensureTimer();
     void launchAlphaCompute();
     void applyAlphaResult();
+    void refreshActiveViewer(VolumeViewerBase* viewer);
 
     static std::optional<cv::Vec3f> computeAlphaTargetStatic(
         const cv::Vec3f& centerWorld,

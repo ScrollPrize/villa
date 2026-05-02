@@ -132,6 +132,7 @@ public:
 
     // --- Intersection rendering ---
     virtual void renderIntersections() = 0;
+    virtual void renderEditedSurfaceIntersections(const cv::Rect&) {}
     virtual void invalidateIntersect(const std::string& name = "") = 0;
     virtual float intersectionOpacity() const = 0;
     virtual float intersectionThickness() const = 0;
