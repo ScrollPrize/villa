@@ -45,6 +45,8 @@ Q_LOGGING_CATEGORY(lcSegModule, "vc.segmentation.module")
 
 namespace
 {
+constexpr std::size_t kMaxInteractiveNeighborMarkers = 512;
+
 float averageScale(const cv::Vec2f& scale)
 {
     const float sx = std::abs(scale[0]);
@@ -291,10 +293,14 @@ bool SegmentationModule::ensureHoverTarget()
         return false;
     }
 
-    // Push/pull calls this from a timer while the cursor can move between
-    // mouse-move events delivered to the segmentation module. Refresh from the
-    // viewer cursor first so the resolved grid target follows the mouse even
-    // when hover preview is disabled.
+    // Push/pull calls this from a timer. Reuse the hover resolved by mouse-move
+    // events when possible; polling the widget under the cursor and doing a
+    // patch-index lookup every tick makes held push/pull noticeably choppy.
+    if (_hoverPreviewEnabled && _hover.valid && _hoverPointer.valid &&
+        _hover.viewer == _hoverPointer.viewer) {
+        return true;
+    }
+
     recoverHoverPointerFromCursor();
 
     if (_hover.valid && _hoverPointer.valid && _hover.viewer != _hoverPointer.viewer) {
@@ -1183,8 +1189,12 @@ void SegmentationModule::refreshOverlay()
 
     if (_drag.active) {
         const auto touched = _editManager->recentTouched();
-        state.neighbours.reserve(touched.size());
-        for (const auto& key : touched) {
+        const std::size_t stride = touched.size() > kMaxInteractiveNeighborMarkers
+            ? (touched.size() + kMaxInteractiveNeighborMarkers - 1) / kMaxInteractiveNeighborMarkers
+            : 1;
+        state.neighbours.reserve(std::min(touched.size(), kMaxInteractiveNeighborMarkers));
+        for (std::size_t i = 0; i < touched.size(); i += stride) {
+            const auto& key = touched[i];
             if (key.row == _drag.row && key.col == _drag.col) {
                 continue;
             }

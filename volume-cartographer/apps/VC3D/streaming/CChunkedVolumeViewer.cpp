@@ -55,6 +55,8 @@ constexpr double kSlowMotionPxPerSec = 180.0;
 constexpr double kFastMotionPxPerSec = 1800.0;
 constexpr qint64 kInteractivePreviewMinIntervalMs = 50;
 constexpr float kPanSmoothingAlpha = 0.65f;
+constexpr int kChunkPrefetchHaloPx = 128;
+constexpr int kChunkPrefetchPriorityOffset = 1024;
 constexpr std::array<QRgb, 12> kIntersectionPalette = {
     qRgb(255, 120, 120), qRgb(120, 200, 255), qRgb(120, 255, 140),
     qRgb(255, 220, 100), qRgb(220, 140, 255), qRgb(255, 160, 200),
@@ -1141,6 +1143,137 @@ void CChunkedVolumeViewer::sampleCoordsIntoValues(
     }
 }
 
+void CChunkedVolumeViewer::prefetchPlaneHalo(
+    const cv::Vec3f& origin,
+    const cv::Vec3f& vxStep,
+    const cv::Vec3f& vyStep,
+    int startLevel,
+    const vc::render::ChunkedPlaneSampler::Options& options)
+{
+    if (!_chunkArray || _interactivePreview || _framebuffer.isNull())
+        return;
+
+    const int fbW = _framebuffer.width();
+    const int fbH = _framebuffer.height();
+    if (fbW <= 0 || fbH <= 0)
+        return;
+
+    const int halo = kChunkPrefetchHaloPx;
+    const int expandedW = fbW + 2 * halo;
+    std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> uniqueKeys;
+    auto collect = [&](vc::render::IChunkedArray& array,
+                       const cv::Vec3f& stripOrigin,
+                       int stripW,
+                       int stripH) {
+        if (stripW <= 0 || stripH <= 0)
+            return;
+        cv::Mat_<uint8_t> stripCoverage(stripH, stripW, uint8_t(0));
+        auto keys = vc::render::ChunkedPlaneSampler::collectPlaneDependencies(
+            array, startLevel, stripOrigin, vxStep, vyStep, stripCoverage, options);
+        uniqueKeys.insert(keys.begin(), keys.end());
+    };
+
+    collect(*_chunkArray, origin - vxStep * float(halo) - vyStep * float(halo),
+            expandedW, halo);
+    collect(*_chunkArray, origin - vxStep * float(halo) + vyStep * float(fbH),
+            expandedW, halo);
+    collect(*_chunkArray, origin - vxStep * float(halo), halo, fbH);
+    collect(*_chunkArray, origin + vxStep * float(fbW), halo, fbH);
+
+    std::vector<vc::render::ChunkKey> keys;
+    keys.reserve(uniqueKeys.size());
+    for (const auto& key : uniqueKeys)
+        keys.push_back(key);
+    _chunkArray->prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
+
+    if (!_overlayChunkArray || !_overlayVolume || _overlayOpacity <= 0.0f)
+        return;
+    uniqueKeys.clear();
+    collect(*_overlayChunkArray, origin - vxStep * float(halo) - vyStep * float(halo),
+            expandedW, halo);
+    collect(*_overlayChunkArray, origin - vxStep * float(halo) + vyStep * float(fbH),
+            expandedW, halo);
+    collect(*_overlayChunkArray, origin - vxStep * float(halo), halo, fbH);
+    collect(*_overlayChunkArray, origin + vxStep * float(fbW), halo, fbH);
+    keys.clear();
+    keys.reserve(uniqueKeys.size());
+    for (const auto& key : uniqueKeys)
+        keys.push_back(key);
+    _overlayChunkArray->prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
+}
+
+void CChunkedVolumeViewer::prefetchSurfaceHalo(
+    Surface& surf,
+    int startLevel,
+    const vc::render::ChunkedPlaneSampler::Options& options,
+    int fbW,
+    int fbH)
+{
+    if (!_chunkArray || _interactivePreview || fbW <= 0 || fbH <= 0)
+        return;
+
+    const int halo = kChunkPrefetchHaloPx;
+    const cv::Vec3f baseOffset(_surfacePtrX * _scale - float(fbW) * 0.5f,
+                               _surfacePtrY * _scale - float(fbH) * 0.5f,
+                               0.0f);
+    std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> uniqueKeys;
+
+    auto collect = [&](vc::render::IChunkedArray& array,
+                       int sceneX,
+                       int sceneY,
+                       int stripW,
+                       int stripH) {
+        if (stripW <= 0 || stripH <= 0)
+            return;
+
+        cv::Mat_<cv::Vec3f> coords;
+        cv::Mat_<cv::Vec3f> normals;
+        const cv::Vec3f offset = baseOffset + cv::Vec3f(float(sceneX), float(sceneY), 0.0f);
+        surf.gen(&coords, _zOff != 0.0f ? &normals : nullptr,
+                 cv::Size(stripW, stripH), {0, 0, 0}, _scale, offset);
+
+        if (_zOff != 0.0f && _zOffWorldDir != cv::Vec3f(0.0f, 0.0f, 0.0f)) {
+            const cv::Vec3f tr = _zOffWorldDir * _zOff;
+            for (int y = 0; y < coords.rows; ++y) {
+                auto* row = coords.ptr<cv::Vec3f>(y);
+                for (int x = 0; x < coords.cols; ++x) {
+                    if (row[x][0] == row[x][0] && row[x][0] != -1.0f)
+                        row[x] += tr;
+                }
+            }
+        }
+
+        cv::Mat_<uint8_t> coverage(stripH, stripW, uint8_t(0));
+        auto keys = vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
+            array, startLevel, coords, coverage, options);
+        uniqueKeys.insert(keys.begin(), keys.end());
+    };
+
+    collect(*_chunkArray, -halo, -halo, fbW + 2 * halo, halo);
+    collect(*_chunkArray, -halo, fbH, fbW + 2 * halo, halo);
+    collect(*_chunkArray, -halo, 0, halo, fbH);
+    collect(*_chunkArray, fbW, 0, halo, fbH);
+
+    std::vector<vc::render::ChunkKey> keys;
+    keys.reserve(uniqueKeys.size());
+    for (const auto& key : uniqueKeys)
+        keys.push_back(key);
+    _chunkArray->prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
+
+    if (!_overlayChunkArray || !_overlayVolume || _overlayOpacity <= 0.0f)
+        return;
+    uniqueKeys.clear();
+    collect(*_overlayChunkArray, -halo, -halo, fbW + 2 * halo, halo);
+    collect(*_overlayChunkArray, -halo, fbH, fbW + 2 * halo, halo);
+    collect(*_overlayChunkArray, -halo, 0, halo, fbH);
+    collect(*_overlayChunkArray, fbW, 0, halo, fbH);
+    keys.clear();
+    keys.reserve(uniqueKeys.size());
+    for (const auto& key : uniqueKeys)
+        keys.push_back(key);
+    _overlayChunkArray->prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
+}
+
 void CChunkedVolumeViewer::submitRender()
 {
     auto surf = _surfWeak.lock();
@@ -1179,6 +1312,7 @@ void CChunkedVolumeViewer::submitRender()
         samplePlaneIntoValues(origin, vxStep, vyStep, n, startLevel, options, _values, _coverage);
         renderOverlayVolumeForPlane(origin, vxStep, vyStep, startLevel, options,
                                     overlayValues, overlayCoverage);
+        prefetchPlaneHalo(origin, vxStep, vyStep, startLevel, options);
     } else {
         const int startLevel = renderStartLevel(true);
         const int previewFactor = genericPreviewDownsampleFactor();
@@ -1292,6 +1426,7 @@ void CChunkedVolumeViewer::submitRender()
             sampleCoordsIntoValues(_genCoords, _genNormals, startLevel, options, _values, _coverage);
             renderOverlayVolumeForCoords(_genCoords, startLevel, options,
                                          overlayValues, overlayCoverage);
+            prefetchSurfaceHalo(*surf, startLevel, options, fbW, fbH);
         }
     }
 

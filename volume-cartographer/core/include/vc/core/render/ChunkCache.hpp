@@ -54,7 +54,7 @@ public:
 
     ChunkResult tryGetChunk(int level, int iz, int iy, int ix) override;
     ChunkResult getChunkBlocking(int level, int iz, int iy, int ix) override;
-    void prefetchChunks(const std::vector<ChunkKey>& keys, bool wait) override;
+    void prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, int priorityOffset = 0) override;
 
     ChunkReadyCallbackId addChunkReadyListener(ChunkReadyCallback cb) override;
     void removeChunkReadyListener(ChunkReadyCallbackId id) override;
@@ -76,6 +76,8 @@ private:
         std::size_t decodedBytes = 0;
         bool persisted = false;
         bool inLru = false;
+        int priority = 0;
+        std::uint64_t fetchSerial = 0;
         std::list<ChunkKey>::iterator lruIt;
     };
 
@@ -104,13 +106,20 @@ private:
         std::list<ChunkKey> lru_;
         std::size_t decodedBytes_ = 0;
         std::uint64_t generation_ = 0;
+        std::uint64_t nextFetchSerial_ = 1;
         ChunkReadyCallbackId nextCallbackId_ = 1;
         std::unordered_map<ChunkReadyCallbackId, ChunkReadyCallback> callbacks_;
     };
 
     static ChunkResult resultFromEntryLocked(State& state, const ChunkKey& key, Entry& entry);
-    static void queueFetchLocked(const std::shared_ptr<State>& state, const ChunkKey& key, std::uint64_t generation);
-    static void fetchAndStore(const std::shared_ptr<State>& state, ChunkKey key, std::uint64_t generation);
+    static void queueFetchLocked(const std::shared_ptr<State>& state,
+                                 const ChunkKey& key,
+                                 std::uint64_t generation,
+                                 int priorityOffset);
+    static void fetchAndStore(const std::shared_ptr<State>& state,
+                              ChunkKey key,
+                              std::uint64_t generation,
+                              std::uint64_t fetchSerial);
     static void storeFetchResultLocked(const std::shared_ptr<State>& state,
                                        const ChunkKey& key,
                                        ChunkFetchResult fetch,

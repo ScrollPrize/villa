@@ -49,6 +49,20 @@ public:
                                            const cv::Mat_<uint8_t>& coverage,
                                            const Options& options = Options());
 
+    static std::vector<ChunkKey> collectPlaneDependencies(IChunkedArray& array,
+                                                          int level,
+                                                          const cv::Vec3f& origin,
+                                                          const cv::Vec3f& vxStep,
+                                                          const cv::Vec3f& vyStep,
+                                                          const cv::Mat_<uint8_t>& coverage,
+                                                          const Options& options = Options());
+
+    static std::vector<ChunkKey> collectCoordsDependencies(IChunkedArray& array,
+                                                           int level,
+                                                           const cv::Mat_<cv::Vec3f>& coords,
+                                                           const cv::Mat_<uint8_t>& coverage,
+                                                           const Options& options = Options());
+
     // Samples one pyramid level into `out` for pixels not already marked in
     // `coverage`. Coordinates are logical level-0 XYZ voxel coordinates.
     static Stats samplePlaneLevel(IChunkedArray& array,

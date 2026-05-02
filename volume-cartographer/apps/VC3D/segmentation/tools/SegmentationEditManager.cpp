@@ -1087,7 +1087,8 @@ void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f
     }
 
     GridKey key{row, col};
-    const float delta = static_cast<float>(cv::norm(newWorld - original));
+    const cv::Vec3f diff = newWorld - original;
+    const float deltaSq = diff.dot(diff);
 
     // Queue cell updates in SurfacePatchIndex for R-tree sync
     if (queuePatchIndexUpdate && _viewerManager && _baseSurface) {
@@ -1098,7 +1099,7 @@ void SegmentationEditManager::recordVertexEdit(int row, int col, const cv::Vec3f
     _hasPendingEdits = true;
 
     // But only track in _editedVertices if change is significant
-    if (delta < 1e-4f) {
+    if (deltaSq < 1e-8f) {
         _editedVertices.erase(key);
         return;
     }

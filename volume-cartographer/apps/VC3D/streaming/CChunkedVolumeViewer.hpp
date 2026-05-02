@@ -234,6 +234,16 @@ private:
                                 const vc::render::ChunkedPlaneSampler::Options& options,
                                 cv::Mat_<uint8_t>& values,
                                 cv::Mat_<uint8_t>& coverage);
+    void prefetchPlaneHalo(const cv::Vec3f& origin,
+                           const cv::Vec3f& vxStep,
+                           const cv::Vec3f& vyStep,
+                           int startLevel,
+                           const vc::render::ChunkedPlaneSampler::Options& options);
+    void prefetchSurfaceHalo(Surface& surf,
+                             int startLevel,
+                             const vc::render::ChunkedPlaneSampler::Options& options,
+                             int fbW,
+                             int fbH);
     void markInteractiveMotion(double motionPx);
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     int genericPreviewDownsampleFactor() const;
