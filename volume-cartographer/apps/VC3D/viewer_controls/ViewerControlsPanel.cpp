@@ -41,12 +41,6 @@ ViewerControlsPanel::ViewerControlsPanel(const UiRefs& uiRefs,
     setupViewerControlWiring();
 }
 
-const ViewerControlsPanel::TransformControls& ViewerControlsPanel::transformControls() const
-{
-    static const TransformControls emptyControls;
-    return _transformsPanel ? _transformsPanel->controls() : emptyControls;
-}
-
 QWidget* ViewerControlsPanel::detachScrollContents(QScrollArea* scrollArea, QWidget* contents)
 {
     if (!contents) {
@@ -142,6 +136,17 @@ void ViewerControlsPanel::setOverlayWindowAvailable(bool available)
     updateOverlayWindowControlsEnabled();
 }
 
+void ViewerControlsPanel::setSliceStepSize(int value)
+{
+    if (!_sliceStepSizeSpin) {
+        return;
+    }
+    QSignalBlocker blocker(_sliceStepSizeSpin);
+    _sliceStepSizeSpin->setValue(std::clamp(value,
+                                            _sliceStepSizeSpin->minimum(),
+                                            _sliceStepSizeSpin->maximum()));
+}
+
 void ViewerControlsPanel::setupViewerControlWiring()
 {
     setupWindowRangeControls();
@@ -155,6 +160,7 @@ void ViewerControlsPanel::setupViewerControlWiring()
     }
 
     if (auto* spinSliceStep = _uiRefs.sliceStepSizeSpin) {
+        _sliceStepSizeSpin = spinSliceStep;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         int savedStep = settings.value(vc3d::settings::viewer::SLICE_STEP_SIZE,
                                        vc3d::settings::viewer::SLICE_STEP_SIZE_DEFAULT).toInt();

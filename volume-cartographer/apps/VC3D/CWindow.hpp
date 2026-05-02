@@ -60,6 +60,7 @@ class QStandardItemModel;
 class FileWatcherService;
 class AxisAlignedSliceController;
 class SegmentationCommandHandler;
+class ViewerTransformsPanel;
 
 class CWindow : public QMainWindow
 {
@@ -186,13 +187,6 @@ private:
     //TODO abstract these into separate QWidget class?
     QLineEdit* lblLocFocus;
     QCheckBox* chkAxisAlignedSlices;
-    QCheckBox* _previewTransformCheck{nullptr};
-    QCheckBox* _scaleOnlyTransformCheck{nullptr};
-    QCheckBox* _invertTransformCheck{nullptr};
-    QSpinBox* _transformScaleSpin{nullptr};
-    QPushButton* _loadAffineButton{nullptr};
-    QPushButton* _saveTransformedButton{nullptr};
-    QLabel* _transformStatusLabel{nullptr};
     enum class RemoteTransformFetchState { Unknown, Pending, Available, Missing };
     std::unordered_map<std::string, RemoteTransformFetchState> _remoteTransformFetchStates;
     std::unordered_map<std::string, cv::Matx44d> _remoteTransformMatrices;
@@ -278,6 +272,7 @@ private:
     void scheduleWindowStateSave();
     void saveWindowState();
     void refreshTransformsPanelState();
+    ViewerTransformsPanel* transformsPanel() const;
     void ensureCurrentRemoteTransformJsonAsync();
     void clearTransformPreview(bool restoreDisplayedSurface = true);
     bool applyTransformPreview(bool allowRemoteFetch = true);

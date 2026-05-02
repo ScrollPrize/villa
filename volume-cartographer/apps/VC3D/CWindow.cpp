@@ -62,6 +62,7 @@
 #include "CVolumeViewerView.hpp"
 #include "VolumeViewerCmaps.hpp"
 #include "viewer_controls/ViewerControlsPanel.hpp"
+#include "viewer_controls/panels/ViewerTransformsPanel.hpp"
 #include "streaming/CChunkedVolumeViewer.hpp"
 #include "vc/ui/UDataManipulateUtils.hpp"
 #include "SettingsDialog.hpp"
@@ -1547,13 +1548,14 @@ bool CWindow::applyTransformPreview(bool allowRemoteFetch)
         return false;
     }
 
-    const int scale = _transformScaleSpin ? _transformScaleSpin->value() : 1;
-    const bool scaleOnly = _scaleOnlyTransformCheck && _scaleOnlyTransformCheck->isChecked();
+    auto* transformPanel = transformsPanel();
+    const int scale = transformPanel ? transformPanel->scaleValue() : 1;
+    const bool scaleOnly = transformPanel && transformPanel->scaleOnlyChecked();
     std::optional<cv::Matx44d> matrix;
     if (!scaleOnly) {
         matrix = currentTransformMatrix(allowRemoteFetch);
         if (matrix) {
-            if (_invertTransformCheck && _invertTransformCheck->isChecked()) {
+            if (transformPanel && transformPanel->invertChecked()) {
                 matrix = invertAffineTransformMatrix(*matrix);
             }
         } else if (scale == 1) {
@@ -1587,21 +1589,26 @@ bool CWindow::applyTransformPreview(bool allowRemoteFetch)
     return true;
 }
 
+ViewerTransformsPanel* CWindow::transformsPanel() const
+{
+    return _viewerControlsPanel ? _viewerControlsPanel->transformsPanel() : nullptr;
+}
+
 void CWindow::refreshTransformsPanelState()
 {
-    if (!_previewTransformCheck || !_scaleOnlyTransformCheck || !_invertTransformCheck || !_transformScaleSpin ||
-        !_loadAffineButton || !_saveTransformedButton || !_transformStatusLabel) {
+    auto* transformPanel = transformsPanel();
+    if (!transformPanel) {
         return;
     }
 
     const bool editingEnabled = _segmentationModule && _segmentationModule->editingEnabled();
     const auto sourceSurface = currentTransformSourceSurface();
     const auto currentVolume = _state ? _state->currentVolume() : nullptr;
-    const bool scaleOnly = _scaleOnlyTransformCheck->isChecked();
+    const bool scaleOnly = transformPanel->scaleOnlyChecked();
     const auto localTransformPath = localCurrentTransformJsonPath();
     bool hasTransform = _customTransformMatrix.has_value() ||
                         (!localTransformPath.empty() && std::filesystem::exists(localTransformPath));
-    const int scale = _transformScaleSpin->value();
+    const int scale = transformPanel->scaleValue();
     const bool hasScaleOnlyTransform = scale != 1;
     const bool hasCustomTransform = !_customTransformSource.trimmed().isEmpty();
     const auto remoteTransformUrl = currentRemoteTransformJsonUrl();
@@ -1679,46 +1686,47 @@ void CWindow::refreshTransformsPanelState()
         statusText = hasCustomTransform
             ? tr("Using custom affine %1%2 with scale %3")
                   .arg(transformLocation,
-                       (_invertTransformCheck->isChecked() ? tr(" (inverted)") : QString()))
+                       (transformPanel->invertChecked() ? tr(" (inverted)") : QString()))
                   .arg(scale)
             : tr("Using %1%2 with scale %3")
                   .arg(transformLocation,
-                       (_invertTransformCheck->isChecked() ? tr(" (inverted)") : QString()))
+                       (transformPanel->invertChecked() ? tr(" (inverted)") : QString()))
                   .arg(scale);
     }
 
-    if (!previewEnabled && _previewTransformCheck->isChecked()) {
-        const QSignalBlocker blocker(_previewTransformCheck);
-        _previewTransformCheck->setChecked(false);
+    if (!previewEnabled && transformPanel->previewChecked()) {
+        transformPanel->setPreviewChecked(false);
         clearTransformPreview(true);
-    } else if (previewEnabled && _previewTransformCheck->isChecked()) {
+    } else if (previewEnabled && transformPanel->previewChecked()) {
         try {
             if (!applyTransformPreview(false)) {
                 clearTransformPreview(true);
             }
         } catch (const std::exception& ex) {
             clearTransformPreview(true);
-            const QSignalBlocker blocker(_previewTransformCheck);
-            _previewTransformCheck->setChecked(false);
+            transformPanel->setPreviewChecked(false);
             statusText = tr("Failed to load transform.json: %1")
                 .arg(QString::fromUtf8(ex.what()));
         }
-    } else if (!_previewTransformCheck->isChecked()) {
+    } else if (!transformPanel->previewChecked()) {
         clearTransformPreview(true);
     }
 
-    _previewTransformCheck->setEnabled(previewEnabled);
-    _scaleOnlyTransformCheck->setEnabled(sourceSurface && !editingEnabled);
-    _invertTransformCheck->setEnabled(!editingEnabled && hasTransform && !scaleOnly);
-    _transformScaleSpin->setEnabled(sourceSurface && !editingEnabled);
-    _loadAffineButton->setEnabled(!editingEnabled);
-    _saveTransformedButton->setEnabled(saveEnabled);
-    _transformStatusLabel->setText(statusText);
+    transformPanel->applyUiState(ViewerTransformsPanel::UiState{
+        .previewAvailable = previewEnabled,
+        .sourceAvailable = static_cast<bool>(sourceSurface),
+        .editingEnabled = editingEnabled,
+        .affineAvailable = hasTransform,
+        .scaleOnly = scaleOnly,
+        .saveAvailable = saveEnabled,
+        .statusText = statusText,
+    });
 }
 
 void CWindow::onPreviewTransformToggled(bool enabled)
 {
-    if (!_previewTransformCheck) {
+    auto* transformPanel = transformsPanel();
+    if (!transformPanel) {
         return;
     }
 
@@ -1734,10 +1742,7 @@ void CWindow::onPreviewTransformToggled(bool enabled)
         }
     } catch (const std::exception& ex) {
         clearTransformPreview(true);
-        {
-            const QSignalBlocker blocker(_previewTransformCheck);
-            _previewTransformCheck->setChecked(false);
-        }
+        transformPanel->setPreviewChecked(false);
         statusBar()->showMessage(tr("Failed to preview transform: %1")
                                      .arg(QString::fromUtf8(ex.what())),
                                  5000);
@@ -1765,8 +1770,9 @@ void CWindow::onSaveTransformedRequested()
         return;
     }
 
-    const int scale = _transformScaleSpin ? _transformScaleSpin->value() : 1;
-    const bool scaleOnly = _scaleOnlyTransformCheck && _scaleOnlyTransformCheck->isChecked();
+    auto* transformPanel = transformsPanel();
+    const int scale = transformPanel ? transformPanel->scaleValue() : 1;
+    const bool scaleOnly = transformPanel && transformPanel->scaleOnlyChecked();
     std::optional<cv::Matx44d> matrix = scaleOnly
         ? std::nullopt
         : currentTransformMatrix();
@@ -1821,7 +1827,7 @@ void CWindow::onSaveTransformedRequested()
 
     try {
         if (hasTransform) {
-            if (_invertTransformCheck && _invertTransformCheck->isChecked()) {
+            if (transformPanel && transformPanel->invertChecked()) {
                 matrix = invertAffineTransformMatrix(*matrix);
             }
         }
@@ -1892,7 +1898,8 @@ void CWindow::onLoadAffineRequested()
         return;
     }
 
-    if (source.isEmpty() && _previewTransformCheck && _previewTransformCheck->isChecked()) {
+    auto* transformPanel = transformsPanel();
+    if (source.isEmpty() && transformPanel && transformPanel->previewChecked()) {
         currentTransformMatrix();
     }
 
@@ -3117,27 +3124,16 @@ void CWindow::CreateWidgets(void)
         _viewerControlsPanel->setViewControlsEnabled(!ui.grpVolManager || ui.grpVolManager->isEnabled());
     }
 
-    const auto& transformControls = _viewerControlsPanel->transformControls();
-    _previewTransformCheck = transformControls.preview;
-    _scaleOnlyTransformCheck = transformControls.scaleOnly;
-    _invertTransformCheck = transformControls.invert;
-    _transformScaleSpin = transformControls.scale;
-    _loadAffineButton = transformControls.loadAffine;
-    _saveTransformedButton = transformControls.saveTransformed;
-    _transformStatusLabel = transformControls.status;
-
-    connect(_previewTransformCheck, &QCheckBox::toggled,
-            this, &CWindow::onPreviewTransformToggled);
-    connect(_scaleOnlyTransformCheck, &QCheckBox::toggled,
-            this, [this](bool) { refreshTransformsPanelState(); });
-    connect(_invertTransformCheck, &QCheckBox::toggled,
-            this, [this](bool) { refreshTransformsPanelState(); });
-    connect(_transformScaleSpin, QOverload<int>::of(&QSpinBox::valueChanged),
-            this, [this](int) { refreshTransformsPanelState(); });
-    connect(_loadAffineButton, &QPushButton::clicked,
-            this, &CWindow::onLoadAffineRequested);
-    connect(_saveTransformedButton, &QPushButton::clicked,
-            this, &CWindow::onSaveTransformedRequested);
+    if (auto* transformPanel = _viewerControlsPanel->transformsPanel()) {
+        connect(transformPanel, &ViewerTransformsPanel::previewToggled,
+                this, &CWindow::onPreviewTransformToggled);
+        connect(transformPanel, &ViewerTransformsPanel::stateChanged,
+                this, &CWindow::refreshTransformsPanelState);
+        connect(transformPanel, &ViewerTransformsPanel::loadAffineRequested,
+                this, &CWindow::onLoadAffineRequested);
+        connect(transformPanel, &ViewerTransformsPanel::saveTransformedRequested,
+                this, &CWindow::onSaveTransformedRequested);
+    }
 
     addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetViewerControls);
     splitDockWidget(ui.dockWidgetVolumes, ui.dockWidgetViewerControls, Qt::Vertical);
@@ -4138,10 +4134,8 @@ void CWindow::onSliceStepSizeChanged(int newSize)
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::viewer::SLICE_STEP_SIZE, newSize);
 
-    // Update View dock widget spinbox
-    if (auto* spinSliceStep = ui.spinSliceStepSize) {
-        QSignalBlocker blocker(spinSliceStep);
-        spinSliceStep->setValue(newSize);
+    if (_viewerControlsPanel) {
+        _viewerControlsPanel->setSliceStepSize(newSize);
     }
 }
 

@@ -1,7 +1,5 @@
 #pragma once
 
-#include "viewer_controls/panels/ViewerTransformsPanel.hpp"
-
 #include <QWidget>
 
 class QDoubleSpinBox;
@@ -20,8 +18,6 @@ class ViewerControlsPanel : public QWidget
     Q_OBJECT
 
 public:
-    using TransformControls = ViewerTransformControls;
-
     struct UiRefs {
         QWidget* contents{nullptr};
 
@@ -65,9 +61,10 @@ public:
                                  ViewerManager* viewerManager,
                                  QWidget* parent = nullptr);
 
-    const TransformControls& transformControls() const;
+    ViewerTransformsPanel* transformsPanel() const { return _transformsPanel; }
     void setViewControlsEnabled(bool enabled);
     void setOverlayWindowAvailable(bool available);
+    void setSliceStepSize(int value);
 
 signals:
     void zoomInRequested();
@@ -93,6 +90,7 @@ private:
     ViewerTransformsPanel* _transformsPanel{nullptr};
     WindowRangeWidget* _volumeWindowWidget{nullptr};
     WindowRangeWidget* _overlayWindowWidget{nullptr};
+    QSpinBox* _sliceStepSizeSpin{nullptr};
     bool _viewControlsEnabled{true};
     bool _overlayWindowAvailable{false};
 };
