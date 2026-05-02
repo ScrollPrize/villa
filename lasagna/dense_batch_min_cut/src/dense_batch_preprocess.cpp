@@ -1996,10 +1996,11 @@ class Dinic {
 
 struct DenseFlowResult {
     cv::Mat dense_flow;
-    cv::Mat ambient_flow;
     cv::Mat voronoi_tree_flow;
     cv::Mat voronoi_tree_flow_gray_bg;
+    cv::Mat tree_dense_nn_flow;
     cv::Mat tree_dense_flow;
+    cv::Mat tree_path_debug;
     cv::Mat tree_flow_attn;
     cv::Mat flow_attn;
     cv::Mat graph_edge_flow;
@@ -2529,6 +2530,7 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
 
     cv::Mat tree_pixel_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     cv::Mat tree_parent(white_domain.size(), CV_32SC2, cv::Scalar(-1, -1));
+    cv::Mat graph_flow_dilated;
     {
         const TimingMark timing = start_timing();
         cv::Mat tree_mask = cv::Mat::zeros(white_domain.size(), CV_8U);
@@ -2542,7 +2544,6 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         }
 
         cv::Mat graph_flow_mask = graph_pixel_flow > 0.0f;
-        cv::Mat graph_flow_dilated;
         cv::dilate(graph_flow_mask, graph_flow_dilated, cv::Mat());
 
         struct QueueItem {
@@ -2625,8 +2626,51 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         timings.push_back(
             finish_timing("voronoi_tree_propagate", propagate_timing));
     }
+    {
+        const TimingMark timing = start_timing();
+        constexpr int kTreeFlowSmoothIterations = 2;
+        for (int iteration = 0; iteration < kTreeFlowSmoothIterations;
+             ++iteration) {
+            cv::Mat smoothed = tree_pixel_flow.clone();
+            for (int y = 0; y < tree_pixel_flow.rows; ++y) {
+                for (int x = 0; x < tree_pixel_flow.cols; ++x) {
+                    if (tree_pixel_flow.at<float>(y, x) <= 0.0f) {
+                        continue;
+                    }
+                    double sum = 0.0;
+                    int count = 0;
+                    for (int dy = -1; dy <= 1; ++dy) {
+                        for (int dx = -1; dx <= 1; ++dx) {
+                            const int nx = x + dx;
+                            const int ny = y + dy;
+                            if (nx < 0 || nx >= tree_pixel_flow.cols ||
+                                ny < 0 || ny >= tree_pixel_flow.rows) {
+                                continue;
+                            }
+                            const float value =
+                                tree_pixel_flow.at<float>(ny, nx);
+                            if (value <= 0.0f) {
+                                continue;
+                            }
+                            sum += value;
+                            ++count;
+                        }
+                    }
+                    if (count > 0) {
+                        smoothed.at<float>(y, x) =
+                            static_cast<float>(sum / count);
+                    }
+                }
+            }
+            tree_pixel_flow = smoothed;
+        }
+        timings.push_back(finish_timing("voronoi_tree_flow_smooth", timing));
+    }
 
+    cv::Mat tree_dense_nn_flow(white_domain.size(), CV_32F, cv::Scalar(0));
     cv::Mat tree_dense_flow(white_domain.size(), CV_32F, cv::Scalar(0));
+    cv::Mat tree_path_debug(white_domain.size(), CV_32FC3,
+                            cv::Scalar(0, 0, 0));
     {
         const TimingMark timing = start_timing();
         cv::Mat tree_source_mask(white_domain.size(), CV_8U, cv::Scalar(255));
@@ -2662,131 +2706,236 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                 cv::Point(-1, -1), cv::Point(0, -1), cv::Point(1, -1),
                 cv::Point(-1, 0),                    cv::Point(1, 0),
                 cv::Point(-1, 1),  cv::Point(0, 1),  cv::Point(1, 1)};
-            const auto tree_neighbors = [&](const cv::Point pixel) {
-                std::vector<cv::Point> neighbors;
+            cv::Mat tree_index(tree_pixel_flow.size(), CV_32S,
+                               cv::Scalar(-1));
+            std::vector<cv::Point> tree_pixels;
+            tree_pixels.reserve(static_cast<std::size_t>(
+                cv::countNonZero(tree_pixel_flow > 0.0f)));
+            for (int ty = 0; ty < tree_pixel_flow.rows; ++ty) {
+                for (int tx = 0; tx < tree_pixel_flow.cols; ++tx) {
+                    if (tree_pixel_flow.at<float>(ty, tx) <= 0.0f) {
+                        continue;
+                    }
+                    tree_index.at<int>(ty, tx) =
+                        static_cast<int>(tree_pixels.size());
+                    tree_pixels.emplace_back(tx, ty);
+                }
+            }
+            const auto tree_neighbor_indices = [&](const int index) {
+                std::vector<int> neighbors;
                 neighbors.reserve(8);
+                const cv::Point pixel = tree_pixels[index];
                 for (const cv::Point dir : kTreeDirs) {
                     const cv::Point next = pixel + dir;
                     if (next.x < 0 || next.x >= tree_pixel_flow.cols ||
-                        next.y < 0 || next.y >= tree_pixel_flow.rows ||
-                        tree_pixel_flow.at<float>(next.y, next.x) <= 0.0f) {
+                        next.y < 0 || next.y >= tree_pixel_flow.rows) {
                         continue;
                     }
-                    neighbors.push_back(next);
+                    const int next_index =
+                        tree_index.at<int>(next.y, next.x);
+                    if (next_index >= 0) {
+                        neighbors.push_back(next_index);
+                    }
                 }
                 return neighbors;
             };
-            const auto branch_score = [&](const cv::Point current,
-                                          const cv::Point first) {
-                cv::Point previous = current;
-                cv::Point pixel = first;
-                float best_flow =
-                    tree_pixel_flow.at<float>(pixel.y, pixel.x);
-                constexpr int kLookaheadSteps = 512;
-                for (int step = 0; step < kLookaheadSteps; ++step) {
-                    std::vector<cv::Point> neighbors = tree_neighbors(pixel);
-                    neighbors.erase(
-                        std::remove(neighbors.begin(), neighbors.end(),
-                                    previous),
-                        neighbors.end());
-                    if (neighbors.empty()) {
-                        break;
+            cv::Mat tree_root_distance(tree_pixel_flow.size(), CV_32F,
+                                       cv::Scalar(
+                                           std::numeric_limits<float>::infinity()));
+            {
+                const TimingMark root_timing = start_timing();
+                struct RootQueueItem {
+                    float distance = 0.0f;
+                    int index = -1;
+                    bool operator<(const RootQueueItem& other) const {
+                        return distance > other.distance;
                     }
-                    if (neighbors.size() > 1) {
-                        for (const cv::Point next : neighbors) {
-                            best_flow = std::max(
-                                best_flow,
-                                tree_pixel_flow.at<float>(next.y, next.x));
-                        }
-                        break;
-                    }
-                    previous = pixel;
-                    pixel = neighbors.front();
-                    best_flow = std::max(
-                        best_flow,
-                        tree_pixel_flow.at<float>(pixel.y, pixel.x));
-                }
-                return best_flow;
-            };
-            const auto next_tree_pixel = [&](const cv::Point current,
-                                             const cv::Point previous) {
-                const float current_flow =
-                    tree_pixel_flow.at<float>(current.y, current.x);
-                std::vector<cv::Point> neighbors = tree_neighbors(current);
-                if (previous.x >= 0) {
-                    neighbors.erase(
-                        std::remove(neighbors.begin(), neighbors.end(),
-                                    previous),
-                        neighbors.end());
-                }
-                if (neighbors.empty()) {
-                    return cv::Point(-1, -1);
-                }
-
-                cv::Point best(-1, -1);
-                float best_flow = current_flow;
-                float best_step = 0.0f;
-                for (const cv::Point next : neighbors) {
-                    const float next_flow =
-                        tree_pixel_flow.at<float>(next.y, next.x);
-                    if (next_flow <= current_flow + kFlowEpsilon) {
+                };
+                std::priority_queue<RootQueueItem> root_queue;
+                for (int index = 0; index < static_cast<int>(tree_pixels.size());
+                     ++index) {
+                    const cv::Point pixel = tree_pixels[index];
+                    if (graph_flow_dilated.at<std::uint8_t>(pixel.y,
+                                                            pixel.x) == 0) {
                         continue;
                     }
-                    const float step = step_distance(current, next);
-                    if (best.x < 0 || next_flow > best_flow + kFlowEpsilon ||
-                        (std::abs(next_flow - best_flow) <= kFlowEpsilon &&
+                    tree_root_distance.at<float>(pixel.y, pixel.x) = 0.0f;
+                    root_queue.push({0.0f, index});
+                }
+                while (!root_queue.empty()) {
+                    const RootQueueItem item = root_queue.top();
+                    root_queue.pop();
+                    const cv::Point pixel = tree_pixels[item.index];
+                    if (item.distance >
+                        tree_root_distance.at<float>(pixel.y, pixel.x) +
+                            kFlowEpsilon) {
+                        continue;
+                    }
+                    for (const int next_index :
+                         tree_neighbor_indices(item.index)) {
+                        const cv::Point next = tree_pixels[next_index];
+                        const float candidate =
+                            item.distance + step_distance(pixel, next);
+                        if (candidate + kFlowEpsilon >=
+                            tree_root_distance.at<float>(next.y, next.x)) {
+                            continue;
+                        }
+                        tree_root_distance.at<float>(next.y, next.x) =
+                            candidate;
+                        root_queue.push({candidate, next_index});
+                    }
+                }
+                timings.push_back(
+                    finish_timing("voronoi_tree_root_distance", root_timing));
+            }
+            std::vector<int> next_tree(tree_pixels.size(), -1);
+            std::vector<float> next_tree_distance(tree_pixels.size(), 0.0f);
+            const auto choose_next_tree_index = [&](const int current_index) {
+                const cv::Point current = tree_pixels[current_index];
+                const float current_distance =
+                    tree_root_distance.at<float>(current.y, current.x);
+                std::vector<int> neighbors =
+                    tree_neighbor_indices(current_index);
+                if (neighbors.empty()) {
+                    return -1;
+                }
+
+                int best = -1;
+                float best_distance = current_distance;
+                float best_step = 0.0f;
+                for (const int next_index : neighbors) {
+                    const cv::Point next = tree_pixels[next_index];
+                    const float next_distance =
+                        tree_root_distance.at<float>(next.y, next.x);
+                    if (!std::isfinite(next_distance) ||
+                        next_distance >= current_distance - kFlowEpsilon) {
+                        continue;
+                    }
+                    const float step =
+                        step_distance(tree_pixels[current_index], next);
+                    if (best < 0 ||
+                        next_distance < best_distance - kFlowEpsilon ||
+                        (std::abs(next_distance - best_distance) <=
+                             kFlowEpsilon &&
                          (step < best_step ||
                           (step == best_step &&
-                           (next.y < best.y ||
-                            (next.y == best.y && next.x < best.x)))))) {
-                        best = next;
-                        best_flow = next_flow;
+                           (next.y < tree_pixels[best].y ||
+                            (next.y == tree_pixels[best].y &&
+                             next.x < tree_pixels[best].x)))))) {
+                        best = next_index;
+                        best_distance = next_distance;
                         best_step = step;
                     }
                 }
-                if (best.x >= 0) {
-                    return best;
-                }
-
-                if (previous.x >= 0) {
-                    const cv::Point incoming = current - previous;
-                    cv::Point straight(-1, -1);
-                    int best_dot = std::numeric_limits<int>::min();
-                    float straight_flow = 0.0f;
-                    for (const cv::Point next : neighbors) {
-                        const cv::Point outgoing = next - current;
-                        const int dot = incoming.x * outgoing.x +
-                                        incoming.y * outgoing.y;
-                        const float next_flow =
-                            tree_pixel_flow.at<float>(next.y, next.x);
-                        if (dot > best_dot ||
-                            (dot == best_dot &&
-                             next_flow > straight_flow + kFlowEpsilon)) {
-                            straight = next;
-                            best_dot = dot;
-                            straight_flow = next_flow;
-                        }
-                    }
-                    return straight;
-                }
-
-                cv::Point branch(-1, -1);
-                float best_branch_score =
-                    -std::numeric_limits<float>::infinity();
-                for (const cv::Point next : neighbors) {
-                    const float score = branch_score(current, next);
-                    if (branch.x < 0 ||
-                        score > best_branch_score + kFlowEpsilon ||
-                        (std::abs(score - best_branch_score) <=
-                             kFlowEpsilon &&
-                         (next.y < branch.y ||
-                          (next.y == branch.y && next.x < branch.x)))) {
-                        branch = next;
-                        best_branch_score = score;
-                    }
-                }
-                return branch;
+                return best;
             };
+            for (int index = 0; index < static_cast<int>(tree_pixels.size());
+                 ++index) {
+                const int next_index = choose_next_tree_index(index);
+                if (next_index < 0) {
+                    continue;
+                }
+                next_tree[index] = next_index;
+                next_tree_distance[index] =
+                    step_distance(tree_pixels[index], tree_pixels[next_index]);
+            }
+
+            int jump_levels = 1;
+            while ((1 << jump_levels) <= static_cast<int>(kTreeRadius) + 2) {
+                ++jump_levels;
+            }
+            std::vector<std::vector<int>> jump_to(
+                jump_levels, std::vector<int>(tree_pixels.size(), -1));
+            std::vector<std::vector<float>> jump_dist(
+                jump_levels, std::vector<float>(tree_pixels.size(), 0.0f));
+            for (int index = 0; index < static_cast<int>(tree_pixels.size());
+                 ++index) {
+                jump_to[0][index] = next_tree[index];
+                jump_dist[0][index] = next_tree_distance[index];
+            }
+            for (int level = 1; level < jump_levels; ++level) {
+                for (int index = 0;
+                     index < static_cast<int>(tree_pixels.size()); ++index) {
+                    const int mid = jump_to[level - 1][index];
+                    if (mid < 0) {
+                        continue;
+                    }
+                    const int end = jump_to[level - 1][mid];
+                    if (end < 0) {
+                        continue;
+                    }
+                    jump_to[level][index] = end;
+                    jump_dist[level][index] =
+                        jump_dist[level - 1][index] +
+                        jump_dist[level - 1][mid];
+                }
+            }
+            {
+                const TimingMark debug_timing = start_timing();
+                const std::array<cv::Point, 4> kDebugPoints = {
+                    cv::Point(983, 732), cv::Point(984, 732),
+                    cv::Point(973, 726), cv::Point(993, 736)};
+                const std::array<cv::Scalar, 4> kBrightColors = {
+                    cv::Scalar(255.0, 0.0, 0.0),
+                    cv::Scalar(0.0, 255.0, 0.0),
+                    cv::Scalar(0.0, 0.0, 255.0),
+                    cv::Scalar(255.0, 255.0, 0.0)};
+                const auto dark_color = [](const cv::Scalar color) {
+                    return cv::Scalar(color[0] * 0.35, color[1] * 0.35,
+                                      color[2] * 0.35);
+                };
+                for (std::size_t point_index = 0;
+                     point_index < kDebugPoints.size(); ++point_index) {
+                    const cv::Point query = kDebugPoints[point_index];
+                    if (query.x < 0 || query.x >= white_domain.cols ||
+                        query.y < 0 || query.y >= white_domain.rows ||
+                        white_domain.at<std::uint8_t>(query.y, query.x) == 0) {
+                        continue;
+                    }
+                    const int label =
+                        nearest_tree_label.at<int>(query.y, query.x);
+                    if (label <= 0 ||
+                        label >=
+                            static_cast<int>(tree_source_points.size())) {
+                        continue;
+                    }
+                    const cv::Point tree_pixel = tree_source_points[label];
+                    if (tree_pixel.x < 0) {
+                        continue;
+                    }
+                    const cv::Scalar backtrack_color =
+                        kBrightColors[point_index];
+                    const cv::Scalar nn_color = dark_color(backtrack_color);
+                    cv::line(tree_path_debug, query, tree_pixel, nn_color, 1,
+                             cv::LINE_8);
+
+                    float remaining =
+                        std::max(0.0f, kTreeRadius -
+                                           nearest_tree_distance.at<float>(
+                                               query.y, query.x));
+                    int current_index =
+                        tree_index.at<int>(tree_pixel.y, tree_pixel.x);
+                    if (current_index < 0) {
+                        continue;
+                    }
+                    while (remaining > kFlowEpsilon &&
+                           next_tree[current_index] >= 0) {
+                        const int next_index = next_tree[current_index];
+                        const cv::Point current = tree_pixels[current_index];
+                        const cv::Point next = tree_pixels[next_index];
+                        const float step = step_distance(current, next);
+                        cv::line(tree_path_debug, current, next,
+                                 backtrack_color, 1, cv::LINE_8);
+                        if (step >= remaining - kFlowEpsilon) {
+                            break;
+                        }
+                        remaining -= step;
+                        current_index = next_index;
+                    }
+                }
+                timings.push_back(
+                    finish_timing("tree_path_debug_render", debug_timing));
+            }
             cv::parallel_for_(cv::Range(0, white_domain.rows),
                               [&](const cv::Range& range) {
                 for (int y = range.start; y < range.end; ++y) {
@@ -2809,34 +2958,43 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                     if (tree_flow <= 0.0f) {
                         continue;
                     }
+                    tree_dense_nn_flow.at<float>(y, x) = tree_flow;
 
                     float remaining =
                         std::max(0.0f, kTreeRadius -
                                            nearest_tree_distance.at<float>(y, x));
-                    cv::Point previous(-1, -1);
-                    cv::Point current = tree_pixel;
+                    int current_index =
+                        tree_index.at<int>(tree_pixel.y, tree_pixel.x);
+                    if (current_index < 0) {
+                        continue;
+                    }
                     float endpoint_flow = tree_flow;
-                    while (remaining > kFlowEpsilon) {
-                        const cv::Point next =
-                            next_tree_pixel(current, previous);
-                        if (next.x < 0) {
-                            break;
+                    for (int level = jump_levels - 1; level >= 0; --level) {
+                        if (current_index < 0 ||
+                            jump_to[level][current_index] < 0 ||
+                            jump_dist[level][current_index] <= 0.0f ||
+                            jump_dist[level][current_index] >
+                                remaining + kFlowEpsilon) {
+                            continue;
                         }
+                        remaining -= jump_dist[level][current_index];
+                        current_index = jump_to[level][current_index];
+                        const cv::Point current = tree_pixels[current_index];
+                        endpoint_flow =
+                            tree_pixel_flow.at<float>(current.y, current.x);
+                    }
+                    if (remaining > kFlowEpsilon && current_index >= 0 &&
+                        next_tree[current_index] >= 0) {
+                        const cv::Point current = tree_pixels[current_index];
+                        const cv::Point next =
+                            tree_pixels[next_tree[current_index]];
                         const float step = step_distance(current, next);
                         const float segment = std::min(step, remaining);
-                        if (segment < step) {
-                            const float next_flow =
-                                tree_pixel_flow.at<float>(next.y, next.x);
-                            const float t = segment / step;
-                            endpoint_flow =
-                                endpoint_flow * (1.0f - t) + next_flow * t;
-                            break;
-                        }
-                        remaining -= step;
-                        endpoint_flow =
+                        const float next_flow =
                             tree_pixel_flow.at<float>(next.y, next.x);
-                        previous = current;
-                        current = next;
+                        const float t = step > 0.0f ? segment / step : 0.0f;
+                        endpoint_flow =
+                            endpoint_flow * (1.0f - t) + next_flow * t;
                     }
 
                     tree_dense_flow.at<float>(y, x) = endpoint_flow;
@@ -2848,244 +3006,6 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
             timings.push_back(finish_timing("voronoi_tree_nearest", timing));
             timings.push_back({"tree_dense_flow", 0.0, 0.0});
         }
-    }
-
-    cv::Mat ambient_flow(white_domain.size(), CV_32F, cv::Scalar(0));
-    {
-        const TimingMark timing = start_timing();
-        constexpr float kAmbientRadius = 300.0f;
-        constexpr float kFlowEpsilon = 1.0e-4f;
-        const std::array<cv::Point, 8> kDirs = {
-            cv::Point(-1, -1), cv::Point(0, -1), cv::Point(1, -1),
-            cv::Point(-1, 0),                    cv::Point(1, 0),
-            cv::Point(-1, 1),  cv::Point(0, 1),  cv::Point(1, 1)};
-
-        cv::Mat flow_pixel_index(white_domain.size(), CV_32S, cv::Scalar(-1));
-        cv::Mat ray_flow_pixel_index(white_domain.size(), CV_32S,
-                                     cv::Scalar(-1));
-        std::vector<cv::Point> flow_pixels;
-        flow_pixels.reserve(static_cast<std::size_t>(cv::countNonZero(graph_pixel_flow > 0)));
-        for (int y = 0; y < graph_pixel_flow.rows; ++y) {
-            for (int x = 0; x < graph_pixel_flow.cols; ++x) {
-                if (graph_pixel_flow.at<float>(y, x) <= 0.0f) {
-                    continue;
-                }
-                flow_pixel_index.at<int>(y, x) =
-                    static_cast<int>(flow_pixels.size());
-                flow_pixels.emplace_back(x, y);
-            }
-        }
-        cv::Mat dilated_flow_mask;
-        cv::dilate(graph_pixel_flow > 0, dilated_flow_mask, cv::Mat());
-        for (int y = 0; y < dilated_flow_mask.rows; ++y) {
-            for (int x = 0; x < dilated_flow_mask.cols; ++x) {
-                if (dilated_flow_mask.at<std::uint8_t>(y, x) == 0 ||
-                    white_domain.at<std::uint8_t>(y, x) == 0) {
-                    continue;
-                }
-                int best_index = -1;
-                float best_flow = -std::numeric_limits<float>::infinity();
-                for (int dy = -1; dy <= 1; ++dy) {
-                    for (int dx = -1; dx <= 1; ++dx) {
-                        const int nx = x + dx;
-                        const int ny = y + dy;
-                        if (nx < 0 || nx >= flow_pixel_index.cols || ny < 0 ||
-                            ny >= flow_pixel_index.rows) {
-                            continue;
-                        }
-                        const int index = flow_pixel_index.at<int>(ny, nx);
-                        if (index < 0) {
-                            continue;
-                        }
-                        const float value =
-                            graph_pixel_flow.at<float>(ny, nx);
-                        if (value > best_flow ||
-                            (value == best_flow &&
-                             (ny < flow_pixels[best_index].y ||
-                              (ny == flow_pixels[best_index].y &&
-                               nx < flow_pixels[best_index].x)))) {
-                            best_flow = value;
-                            best_index = index;
-                        }
-                    }
-                }
-                if (best_index >= 0) {
-                    ray_flow_pixel_index.at<int>(y, x) = best_index;
-                }
-            }
-        }
-
-        std::vector<int> next_greedy(flow_pixels.size(), -1);
-        std::vector<float> next_distance(flow_pixels.size(), 0.0f);
-        for (int index = 0; index < static_cast<int>(flow_pixels.size());
-             ++index) {
-            const cv::Point pixel = flow_pixels[index];
-            const float current_flow =
-                graph_pixel_flow.at<float>(pixel.y, pixel.x);
-            int best_index = -1;
-            float best_flow = current_flow;
-            float best_step = 0.0f;
-            for (const cv::Point dir : kDirs) {
-                const cv::Point next = pixel + dir;
-                if (next.x < 0 || next.x >= flow_pixel_index.cols ||
-                    next.y < 0 || next.y >= flow_pixel_index.rows) {
-                    continue;
-                }
-                const int next_index =
-                    flow_pixel_index.at<int>(next.y, next.x);
-                if (next_index < 0) {
-                    continue;
-                }
-                const float next_flow =
-                    graph_pixel_flow.at<float>(next.y, next.x);
-                const float step =
-                    std::abs(dir.x) + std::abs(dir.y) == 2
-                        ? static_cast<float>(std::sqrt(2.0))
-                        : 1.0f;
-                if (next_flow > best_flow + kFlowEpsilon ||
-                    (next_flow > current_flow + kFlowEpsilon &&
-                     std::abs(next_flow - best_flow) <= kFlowEpsilon &&
-                     (best_index < 0 || step < best_step ||
-                      (step == best_step &&
-                       (next.y < flow_pixels[best_index].y ||
-                        (next.y == flow_pixels[best_index].y &&
-                         next.x < flow_pixels[best_index].x)))))) {
-                    best_index = next_index;
-                    best_flow = next_flow;
-                    best_step = step;
-                }
-            }
-            if (best_index >= 0) {
-                next_greedy[index] = best_index;
-                next_distance[index] = best_step;
-            }
-        }
-
-        int jump_levels = 1;
-        while ((1 << jump_levels) <= static_cast<int>(kAmbientRadius) + 1) {
-            ++jump_levels;
-        }
-        std::vector<std::vector<int>> jump_to(
-            jump_levels, std::vector<int>(flow_pixels.size(), -1));
-        std::vector<std::vector<float>> jump_dist(
-            jump_levels, std::vector<float>(flow_pixels.size(), 0.0f));
-        std::vector<std::vector<float>> jump_max(
-            jump_levels, std::vector<float>(flow_pixels.size(), 0.0f));
-        for (int index = 0; index < static_cast<int>(flow_pixels.size());
-             ++index) {
-            jump_to[0][index] = next_greedy[index];
-            jump_dist[0][index] = next_distance[index];
-            if (next_greedy[index] >= 0) {
-                const cv::Point next = flow_pixels[next_greedy[index]];
-                jump_max[0][index] =
-                    graph_pixel_flow.at<float>(next.y, next.x);
-            }
-        }
-        for (int level = 1; level < jump_levels; ++level) {
-            for (int index = 0; index < static_cast<int>(flow_pixels.size());
-                 ++index) {
-                const int mid = jump_to[level - 1][index];
-                if (mid < 0) {
-                    continue;
-                }
-                const int end = jump_to[level - 1][mid];
-                if (end < 0) {
-                    continue;
-                }
-                jump_to[level][index] = end;
-                jump_dist[level][index] =
-                    jump_dist[level - 1][index] + jump_dist[level - 1][mid];
-                jump_max[level][index] =
-                    std::max(jump_max[level - 1][index],
-                             jump_max[level - 1][mid]);
-            }
-        }
-
-        const auto greedy_reach_value = [&](int start_index,
-                                            float budget) {
-            if (start_index < 0) {
-                return 0.0f;
-            }
-            cv::Point start = flow_pixels[start_index];
-            float best = graph_pixel_flow.at<float>(start.y, start.x);
-            int current = start_index;
-            float remaining = budget;
-            for (int level = jump_levels - 1; level >= 0; --level) {
-                if (current < 0 || jump_to[level][current] < 0 ||
-                    jump_dist[level][current] <= 0.0f ||
-                    jump_dist[level][current] > remaining + kFlowEpsilon) {
-                    continue;
-                }
-                best = std::max(best, jump_max[level][current]);
-                remaining -= jump_dist[level][current];
-                current = jump_to[level][current];
-            }
-            return best;
-        };
-
-        for (const cv::Point dir : kDirs) {
-            cv::Mat hit_index(white_domain.size(), CV_32S, cv::Scalar(-1));
-            cv::Mat hit_distance(white_domain.size(), CV_32F, cv::Scalar(0));
-            const float step =
-                std::abs(dir.x) + std::abs(dir.y) == 2
-                    ? static_cast<float>(std::sqrt(2.0))
-                    : 1.0f;
-            const int x_begin = dir.x > 0 ? white_domain.cols - 1 : 0;
-            const int x_end = dir.x > 0 ? -1 : white_domain.cols;
-            const int x_step = dir.x > 0 ? -1 : 1;
-            const int y_begin = dir.y > 0 ? white_domain.rows - 1 : 0;
-            const int y_end = dir.y > 0 ? -1 : white_domain.rows;
-            const int y_step = dir.y > 0 ? -1 : 1;
-            for (int y = y_begin; y != y_end; y += y_step) {
-                for (int x = x_begin; x != x_end; x += x_step) {
-                    if (white_domain.at<std::uint8_t>(y, x) == 0) {
-                        continue;
-                    }
-                    const int index = ray_flow_pixel_index.at<int>(y, x);
-                    if (index >= 0) {
-                        hit_index.at<int>(y, x) = index;
-                        hit_distance.at<float>(y, x) = 0.0f;
-                        continue;
-                    }
-                    const int nx = x + dir.x;
-                    const int ny = y + dir.y;
-                    if (nx < 0 || nx >= white_domain.cols || ny < 0 ||
-                        ny >= white_domain.rows) {
-                        continue;
-                    }
-                    if (white_domain.at<std::uint8_t>(ny, nx) == 0) {
-                        continue;
-                    }
-                    const int next_index = hit_index.at<int>(ny, nx);
-                    if (next_index < 0) {
-                        continue;
-                    }
-                    hit_index.at<int>(y, x) = next_index;
-                    hit_distance.at<float>(y, x) =
-                        hit_distance.at<float>(ny, nx) + step;
-                }
-            }
-
-            for (int y = 0; y < white_domain.rows; ++y) {
-                for (int x = 0; x < white_domain.cols; ++x) {
-                    if (white_domain.at<std::uint8_t>(y, x) == 0) {
-                        continue;
-                    }
-                    const int index = hit_index.at<int>(y, x);
-                    if (index < 0) {
-                        continue;
-                    }
-                    const float ray_distance =
-                        hit_distance.at<float>(y, x);
-                    const float budget =
-                        std::max(0.0f, kAmbientRadius - ray_distance);
-                    ambient_flow.at<float>(y, x) +=
-                        greedy_reach_value(index, budget);
-                }
-            }
-        }
-        ambient_flow *= 1.0f / static_cast<float>(kDirs.size());
-        timings.push_back(finish_timing("ambient_flow", timing));
     }
 
     cv::Mat dense_flow(white_domain.size(), CV_32F, cv::Scalar(0));
@@ -3399,10 +3319,11 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
     }
 
     return {dense_flow,
-            ambient_flow,
             voronoi_tree_flow,
             voronoi_tree_flow_gray_bg,
+            tree_dense_nn_flow,
             tree_dense_flow,
+            tree_path_debug,
             tree_flow_attn,
             flow_attn,
             graph_edge_flow,
@@ -3993,14 +3914,16 @@ int main(int argc, char** argv) {
             const TimingMark timing = start_timing();
             write_image(workdir / (stem + "_dense_flow.tif"),
                         dense_flow_result.dense_flow);
-            write_image(workdir / (stem + "_ambient_flow.tif"),
-                        dense_flow_result.ambient_flow);
             write_image(workdir / (stem + "_voronoi_tree_flow.tif"),
                         dense_flow_result.voronoi_tree_flow);
             write_image(workdir / (stem + "_voronoi_tree_flow_gray_bg.tif"),
                         dense_flow_result.voronoi_tree_flow_gray_bg);
+            write_image(workdir / (stem + "_tree_dense_nn_flow.tif"),
+                        dense_flow_result.tree_dense_nn_flow);
             write_image(workdir / (stem + "_tree_dense_flow.tif"),
                         dense_flow_result.tree_dense_flow);
+            write_image(workdir / (stem + "_tree_paths_debug.tif"),
+                        dense_flow_result.tree_path_debug);
             write_image(workdir / (stem + "_tree_flow_attn.tif"),
                         dense_flow_result.tree_flow_attn);
             write_image(workdir / (stem + "_flow_attn.tif"),
@@ -4035,14 +3958,14 @@ int main(int argc, char** argv) {
             layered_tiff.push_back(
                 {"dense_flow", to_float_layer(dense_flow_result.dense_flow)});
             layered_tiff.push_back(
-                {"ambient_flow",
-                 to_float_layer(dense_flow_result.ambient_flow)});
-            layered_tiff.push_back(
                 {"voronoi_tree_flow",
                  to_float_layer(dense_flow_result.voronoi_tree_flow)});
             layered_tiff.push_back(
                 {"voronoi_tree_flow_gray_bg",
                  to_float_layer(dense_flow_result.voronoi_tree_flow_gray_bg)});
+            layered_tiff.push_back(
+                {"tree_dense_nn_flow",
+                 to_float_layer(dense_flow_result.tree_dense_nn_flow)});
             layered_tiff.push_back(
                 {"tree_dense_flow",
                  to_float_layer(dense_flow_result.tree_dense_flow)});
@@ -4187,8 +4110,6 @@ int main(int argc, char** argv) {
         if (has_dense_flow) {
             std::cout << "  " << (workdir / (stem + "_dense_flow.tif"))
                       << "\n"
-                      << "  " << (workdir / (stem + "_ambient_flow.tif"))
-                      << "\n"
                       << "  "
                       << (workdir / (stem + "_voronoi_tree_flow.tif"))
                       << "\n"
@@ -4196,7 +4117,12 @@ int main(int argc, char** argv) {
                       << (workdir /
                           (stem + "_voronoi_tree_flow_gray_bg.tif"))
                       << "\n"
+                      << "  "
+                      << (workdir / (stem + "_tree_dense_nn_flow.tif"))
+                      << "\n"
                       << "  " << (workdir / (stem + "_tree_dense_flow.tif"))
+                      << "\n"
+                      << "  " << (workdir / (stem + "_tree_paths_debug.tif"))
                       << "\n"
                       << "  " << (workdir / (stem + "_tree_flow_attn.tif"))
                       << "\n"
