@@ -30,6 +30,7 @@
 #include "overlays/PlaneSlicingOverlayController.hpp"
 #include "overlays/SurfaceRotationOverlayController.hpp"
 #include "overlays/VolumeOverlayController.hpp"
+#include "SurfaceAffineTransformController.hpp"
 
 class CChunkedVolumeViewer;
 #include "ViewerManager.hpp"
@@ -165,9 +166,6 @@ private slots:
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
     void onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId);
     void refreshVolumeSelectionUi(const QString& preferredVolumeId = QString());
-    void onPreviewTransformToggled(bool enabled);
-    void onSaveTransformedRequested();
-    void onLoadAffineRequested();
 
 private:
     CState* _state;
@@ -187,9 +185,6 @@ private:
     //TODO abstract these into separate QWidget class?
     QLineEdit* lblLocFocus;
     QCheckBox* chkAxisAlignedSlices;
-    enum class RemoteTransformFetchState { Unknown, Pending, Available, Missing };
-    std::unordered_map<std::string, RemoteTransformFetchState> _remoteTransformFetchStates;
-    std::unordered_map<std::string, cv::Matx44d> _remoteTransformMatrices;
     QLabel* _segmentationGrowthWarning{nullptr};
     QLabel* _sliceStepLabel{nullptr};
     QString _segmentationGrowthStatusText;
@@ -225,6 +220,7 @@ private:
     std::unique_ptr<SegmentationModule> _segmentationModule;
     std::unique_ptr<SurfacePanelController> _surfacePanel;
     std::unique_ptr<MenuActionController> _menuController;
+    std::unique_ptr<SurfaceAffineTransformController> _surfaceAffineTransforms;
     // runner for command line tools
     CommandLineToolRunner* _cmdRunner;
     bool _normalGridAvailable{false};
@@ -234,12 +230,6 @@ private:
     std::unique_ptr<AxisAlignedSliceController> _axisAlignedSliceController;
     bool _maskRenderInProgress{false};
     std::unique_ptr<SegmentationCommandHandler> _segmentationCommandHandler;
-    std::shared_ptr<QuadSurface> _transformPreviewSourceSurface;
-    std::shared_ptr<QuadSurface> _transformPreviewSurface;
-    QString _customTransformSource;
-    std::filesystem::path _customTransformLocalPath;
-    std::optional<cv::Matx44d> _customTransformMatrix;
-
     // Keyboard shortcuts
     QShortcut* fCompositeViewShortcut;
     QShortcut* fDirectionHintsShortcut;
@@ -271,17 +261,5 @@ private:
     QTimer* _windowStateSaveTimer{nullptr};
     void scheduleWindowStateSave();
     void saveWindowState();
-    void refreshTransformsPanelState();
-    ViewerTransformsPanel* transformsPanel() const;
-    void ensureCurrentRemoteTransformJsonAsync();
-    void clearTransformPreview(bool restoreDisplayedSurface = true);
-    bool applyTransformPreview(bool allowRemoteFetch = true);
-    std::shared_ptr<QuadSurface> currentTransformSourceSurface() const;
-    QString currentTransformSourceDescription() const;
-    bool setCustomTransformSource(const QString& source, QString* errorMessage = nullptr);
-    std::filesystem::path localCurrentTransformJsonPath() const;
-    std::string currentRemoteTransformJsonUrl() const;
-    std::optional<cv::Matx44d> currentTransformMatrix(bool allowRemoteFetch = true);
-
 
 };  // class CWindow

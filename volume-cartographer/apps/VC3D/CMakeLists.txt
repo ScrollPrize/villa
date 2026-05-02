@@ -15,6 +15,8 @@ set(srcs
     FileWatcherService.hpp
     AxisAlignedSliceController.cpp
     AxisAlignedSliceController.hpp
+    SurfaceAffineTransformController.cpp
+    SurfaceAffineTransformController.hpp
     SurfaceAreaCalculator.cpp
     SurfaceAreaCalculator.hpp
     SegmentationCommandHandler.cpp
