@@ -229,7 +229,6 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     _viewMenu->addAction(qWindow->ui.dockWidgetVolumes->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetSegmentation->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetDistanceTransform->toggleViewAction());
-    _viewMenu->addAction(qWindow->ui.dockWidgetDrawing->toggleViewAction());
     _viewMenu->addAction(qWindow->ui.dockWidgetViewerControls->toggleViewAction());
 
     if (qWindow->_point_collection_widget) {

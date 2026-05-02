@@ -34,7 +34,6 @@ extern const ShortcutDef AxisAlignedSlices;
 extern const ShortcutDef SurfaceNormals;
 extern const ShortcutDef DirectionHints;
 extern const ShortcutDef CompositeView;
-extern const ShortcutDef DrawingMode;
 extern const ShortcutDef RawPointsOverlay;
 extern const ShortcutDef ZoomIn;
 extern const ShortcutDef ZoomOut;

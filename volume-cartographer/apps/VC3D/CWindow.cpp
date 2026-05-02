@@ -100,7 +100,6 @@
 #include "CPointCollectionWidget.hpp"
 #include "SurfaceTreeWidget.hpp"
 #include "SeedingWidget.hpp"
-#include "DrawingWidget.hpp"
 #include "CommandLineToolRunner.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
 #include "segmentation/SegmentationModule.hpp"
@@ -894,7 +893,6 @@ static bool windowStateMetaMatches(const QSettings& settings,
 CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     _cmdRunner(nullptr),
     _seedingWidget(nullptr),
-    _drawingWidget(nullptr),
     _point_collection_widget(nullptr)
 {
     _startupPrefetchLevel = startupPrefetchLevel;
@@ -1138,8 +1136,7 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     // Ensure right-side tabified docks have a usable minimum size
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                _lasagnaDock,
-                               ui.dockWidgetDistanceTransform,
-                               ui.dockWidgetDrawing }) {
+                               ui.dockWidgetDistanceTransform }) {
         if (dock) {
             dock->setMinimumWidth(250);
             dock->setMinimumHeight(120);
@@ -1155,7 +1152,6 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                _lasagnaDock,
                                ui.dockWidgetDistanceTransform,
-                               ui.dockWidgetDrawing,
                                ui.dockWidgetVolumes,
                                ui.dockWidgetViewerControls  }) {
         ensureDockWidgetFeatures(dock);
@@ -1200,14 +1196,6 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
     }
 
     // Create application-wide keyboard shortcuts
-    fDrawingModeShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::DrawingMode), this);
-    fDrawingModeShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fDrawingModeShortcut, &QShortcut::activated, [this]() {
-        if (_drawingWidget) {
-            _drawingWidget->toggleDrawingMode();
-        }
-    });
-
     fCompositeViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CompositeView), this);
     fCompositeViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fCompositeViewShortcut, &QShortcut::activated, [this]() {
@@ -1434,26 +1422,6 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                 viewer, &CChunkedVolumeViewer::onMouseMove, Qt::UniqueConnection);
         connect(graphicsView, &CVolumeViewerView::sendMouseRelease,
                 viewer, &CChunkedVolumeViewer::onMouseRelease, Qt::UniqueConnection);
-    }
-
-    if (_drawingWidget && !viewer->property("vc_drawing_bound").toBool()) {
-        connect(_drawingWidget, &DrawingWidget::sendPathsChanged,
-                viewer, &CChunkedVolumeViewer::onPathsChanged, Qt::UniqueConnection);
-        connect(viewer, &CChunkedVolumeViewer::sendMousePressVolume,
-                _drawingWidget, &DrawingWidget::onMousePress, Qt::UniqueConnection);
-        connect(viewer, &CChunkedVolumeViewer::sendMouseMoveVolume,
-                _drawingWidget, &DrawingWidget::onMouseMove, Qt::UniqueConnection);
-        connect(viewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
-                _drawingWidget, &DrawingWidget::onMouseRelease, Qt::UniqueConnection);
-        connect(viewer, &CChunkedVolumeViewer::sendZSliceChanged,
-                _drawingWidget, &DrawingWidget::updateCurrentZSlice, Qt::UniqueConnection);
-        connect(_drawingWidget, &DrawingWidget::sendDrawingModeActive,
-                this, [this, viewer](bool active) {
-                    viewer->onDrawingModeActive(active,
-                        _drawingWidget->getBrushSize(),
-                        _drawingWidget->getBrushShape() == PathBrushShape::Square);
-                });
-        viewer->setProperty("vc_drawing_bound", true);
     }
 
     if (_seedingWidget && !viewer->property("vc_seeding_bound").toBool()) {
@@ -2984,10 +2952,6 @@ void CWindow::CreateWidgets(void)
                 statusBar()->showMessage(message, timeoutMs);
             });
 
-    // i recognize that having both a seeding widget and a drawing widget that both handle mouse events and paths is redundant,
-    // but i can't find an easy way yet to merge them and maintain the path iteration that the seeding widget currently uses
-    // so for now we have both. i suppose i could probably add a 'mode' , but for now i will just hate this section :(
-
     const auto attachScrollAreaToDock = [](QDockWidget* dock, QWidget* content, const QString& objectName) {
         if (!dock || !content) {
             return;
@@ -3523,18 +3487,6 @@ void CWindow::CreateWidgets(void)
         // corr_points_results will be loaded when the new segment is activated
     });
 
-    // Create Drawing widget
-    _drawingWidget = new DrawingWidget();
-    _drawingWidget->setState(_state);
-    attachScrollAreaToDock(ui.dockWidgetDrawing, _drawingWidget, QStringLiteral("dockWidgetDrawingContent"));
-
-    connect(_state, &CState::volumeChanged, _drawingWidget,
-            static_cast<void (DrawingWidget::*)(std::shared_ptr<Volume>, const std::string&)>(&DrawingWidget::onVolumeChanged));
-    connect(_drawingWidget, &DrawingWidget::sendStatusMessageAvailable, this, &CWindow::onShowStatusMessage);
-    connect(_state, &CState::surfacesLoaded, _drawingWidget, &DrawingWidget::onSurfacesLoaded);
-
-    // Cache is now obtained from volume->tieredCache()
-
     // Create Seeding widget
     _seedingWidget = new SeedingWidget(_state->pointCollection(), _state);
     attachScrollAreaToDock(ui.dockWidgetDistanceTransform, _seedingWidget, QStringLiteral("dockWidgetDistanceTransformContent"));
@@ -3568,11 +3520,10 @@ void CWindow::CreateWidgets(void)
     connect(_point_collection_widget, &CPointCollectionWidget::convertPointToAnchorRequested, this, &CWindow::onConvertPointToAnchor);
     connect(_point_collection_widget, &CPointCollectionWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
 
-    // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, and Drawing together
+    // Tab the docks - keep Segmentation, Lasagna, Seeding, and Point Collections together
     tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
     tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
-    tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDrawing);
 
     // Make Segmentation dock the active tab by default
     ui.dockWidgetSegmentation->raise();

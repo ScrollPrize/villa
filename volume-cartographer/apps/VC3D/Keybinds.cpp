@@ -81,14 +81,6 @@ const ShortcutDef CompositeView{
     "C",
     QKeySequence::Open
 };
-const ShortcutDef DrawingMode{
-    "drawing_mode",
-    kSectionViewMenu,
-    "Toggle drawing mode",
-    ShortcutKind::Text,
-    "Ctrl+Shift+D",
-    QKeySequence::Open
-};
 const ShortcutDef RawPointsOverlay{
     "raw_points_overlay",
     kSectionViewMenu,
@@ -480,7 +472,6 @@ QString buildKeybindsHelpText()
         { kSectionViewMenu, shortcuts::SurfaceNormals.description, HelpKeyType::Shortcut, &shortcuts::SurfaceNormals, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::DirectionHints.description, HelpKeyType::Shortcut, &shortcuts::DirectionHints, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::CompositeView.description, HelpKeyType::Shortcut, &shortcuts::CompositeView, nullptr, nullptr },
-        { kSectionViewMenu, shortcuts::DrawingMode.description, HelpKeyType::Shortcut, &shortcuts::DrawingMode, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::RawPointsOverlay.description, HelpKeyType::Shortcut, &shortcuts::RawPointsOverlay, nullptr, nullptr },
         { kSectionViewMenu, keypress::ToggleVolumeOverlay.description, HelpKeyType::KeyPress, nullptr, &keypress::ToggleVolumeOverlay, nullptr },
         { kSectionViewMenu, shortcuts::FocusedView.description, HelpKeyType::Shortcut, &shortcuts::FocusedView, nullptr, nullptr },

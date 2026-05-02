@@ -20,7 +20,6 @@
 
 #include "CPointCollectionWidget.hpp"
 #include "CState.hpp"
-#include "DrawingWidget.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
@@ -198,7 +197,6 @@ private:
     SeedingWidget* _seedingWidget;
     SegmentationWidget* _segmentationWidget{nullptr};
     QDockWidget* _lasagnaDock{nullptr};
-    DrawingWidget* _drawingWidget;
     CPointCollectionWidget* _point_collection_widget;
 
     SurfaceTreeWidget *treeWidgetSurfaces;
@@ -289,7 +287,6 @@ private:
     std::unique_ptr<QTemporaryDir> _customTransformTempDir;
 
     // Keyboard shortcuts
-    QShortcut* fDrawingModeShortcut;
     QShortcut* fCompositeViewShortcut;
     QShortcut* fDirectionHintsShortcut;
     QShortcut* fSurfaceNormalsShortcut;
