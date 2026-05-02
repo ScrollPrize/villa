@@ -1029,15 +1029,6 @@ bool CWindow::initializeCommandLineRunner()
     if (!_cmdRunner) {
         _cmdRunner = new CommandLineToolRunner(statusBar(), this, this);
 
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        int parallelProcesses = settings.value(vc3d::settings::perf::PARALLEL_PROCESSES,
-                                               vc3d::settings::perf::PARALLEL_PROCESSES_DEFAULT).toInt();
-        int iterationCount = settings.value(vc3d::settings::perf::ITERATION_COUNT,
-                                            vc3d::settings::perf::ITERATION_COUNT_DEFAULT).toInt();
-
-        _cmdRunner->setParallelProcesses(parallelProcesses);
-        _cmdRunner->setIterationCount(iterationCount);
-
         if (_segmentationCommandHandler) {
             _segmentationCommandHandler->setCmdRunner(_cmdRunner);
         }

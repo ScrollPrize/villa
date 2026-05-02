@@ -66,8 +66,6 @@ CommandLineToolRunner::CommandLineToolRunner(QStatusBar* statusBar, CWindow* mai
     , _scale(1.0f)
     , _resolution(0)
     , _layers(31)
-    , _parallelProcesses(8)
-    , _iterationCount(1000)
     , _logFile(nullptr)
     , _logStream(nullptr)
 {
@@ -406,16 +404,6 @@ void CommandLineToolRunner::setAutoShowConsoleOutput(bool autoShow)
 void CommandLineToolRunner::setPreserveConsoleOutput(bool preserve)
 {
     _preserveConsoleOutput = preserve;
-}
-
-void CommandLineToolRunner::setParallelProcesses(int count)
-{
-    _parallelProcesses = count;
-}
-
-void CommandLineToolRunner::setIterationCount(int count)
-{
-    _iterationCount = count;
 }
 
 void CommandLineToolRunner::onProcessReadyRead()

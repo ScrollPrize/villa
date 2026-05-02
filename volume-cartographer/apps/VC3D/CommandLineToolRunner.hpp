@@ -75,8 +75,6 @@ public:
     void showConsoleOutput();
     void hideConsoleOutput();
     void setAutoShowConsoleOutput(bool autoShow);
-    void setParallelProcesses(int count);
-    void setIterationCount(int count);
     void setIncludeTifs(bool include);
     void setOmpThreads(int threads);
     void setFlattenOptions(bool flatten, int iterations, int downsample = 1);
@@ -121,9 +119,6 @@ private:
     float _scale;
     int _resolution;
     int _layers;
-    int _parallelProcesses;  // processes for xargs
-    int _iterationCount;     // iterations for xargs
-
     // Advanced render options
     int _cropX{0};
     int _cropY{0};
