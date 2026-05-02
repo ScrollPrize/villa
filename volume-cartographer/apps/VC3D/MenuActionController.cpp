@@ -714,6 +714,8 @@ void MenuActionController::attachRemoteZarrUrl(const QString& url, bool persistE
                             return;
                         }
 
+                        _window->_state->vpkg()->addVolumeEntry(url.trimmed().toStdString());
+
                         if (persistEntry) {
                             persistAttachedRemoteVolume(url, volume);
                         }

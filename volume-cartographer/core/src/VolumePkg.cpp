@@ -280,7 +280,7 @@ std::shared_ptr<VolumePkg> VolumePkg::New(const fs::path& jsonFile)
 
 fs::path VolumePkg::path() const { return path_; }
 std::string VolumePkg::name() const { return name_; }
-void VolumePkg::setName(const std::string& v) { name_ = v; saveAutosave(); }
+void VolumePkg::setName(const std::string& v) { name_ = v; persistProjectState(); }
 int VolumePkg::version() const { return version_; }
 
 const std::vector<vc::project::Entry>& VolumePkg::volumeEntries() const { return volumes_; }
@@ -293,7 +293,7 @@ bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::str
     for (const auto& e : volumes_) if (e.location == location) return false;
     volumes_.push_back({location, std::move(tags)});
     resolveVolumeEntry(volumes_.back());
-    saveAutosave();
+    persistProjectState();
     return true;
 }
 
@@ -303,7 +303,7 @@ bool VolumePkg::addSegmentsEntry(const std::string& location, std::vector<std::s
     for (const auto& e : segments_) if (e.location == location) return false;
     segments_.push_back({location, std::move(tags)});
     resolveSegmentsEntry(segments_.back());
-    saveAutosave();
+    persistProjectState();
     return true;
 }
 
@@ -313,7 +313,7 @@ bool VolumePkg::addNormalGridEntry(const std::string& location, std::vector<std:
     for (const auto& e : normalGrids_) if (e.location == location) return false;
     normalGrids_.push_back({location, std::move(tags)});
     resolveNormalGridEntry(normalGrids_.back());
-    saveAutosave();
+    persistProjectState();
     return true;
 }
 
@@ -333,7 +333,7 @@ bool VolumePkg::removeEntry(const std::string& location)
     if (removed) {
         if (outputSegments_ && *outputSegments_ == location) outputSegments_.reset();
         resolveAll();
-        saveAutosave();
+        persistProjectState();
     }
     return removed;
 }
@@ -341,13 +341,13 @@ bool VolumePkg::removeEntry(const std::string& location)
 void VolumePkg::setOutputSegments(const std::string& location)
 {
     outputSegments_ = location;
-    saveAutosave();
+    persistProjectState();
 }
 
 void VolumePkg::clearOutputSegments()
 {
     outputSegments_.reset();
-    saveAutosave();
+    persistProjectState();
 }
 
 bool VolumePkg::hasOutputSegments() const { return outputSegments_.has_value(); }
@@ -660,6 +660,14 @@ void VolumePkg::saveAutosave()
     const auto file = autosaveFile();
     if (file.empty()) return;
     writeJsonTo(file);
+}
+
+void VolumePkg::persistProjectState()
+{
+    saveAutosave();
+    if (!path_.empty()) {
+        writeJsonTo(path_);
+    }
 }
 
 void VolumePkg::resolveAll()

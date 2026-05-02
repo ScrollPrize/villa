@@ -146,6 +146,7 @@ private:
     void resolveNormalGridEntry(const vc::project::Entry& e);
     void notifySegmentsChanged();
 
+    void persistProjectState();
     void writeJsonTo(const std::filesystem::path& target) const;
     void readJsonFrom(const std::filesystem::path& source);
     [[nodiscard]] utils::Json toJson() const;
