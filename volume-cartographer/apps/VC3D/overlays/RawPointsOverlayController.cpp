@@ -1,7 +1,6 @@
 #include "RawPointsOverlayController.hpp"
 
 #include "../CState.hpp"
-#include "../adaptive/CAdaptiveVolumeViewer.hpp"
 #include "../VolumeViewerBase.hpp"
 
 #include "vc/core/util/QuadSurface.hpp"

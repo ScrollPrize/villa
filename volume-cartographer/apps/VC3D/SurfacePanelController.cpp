@@ -3,7 +3,7 @@
 #include "SurfaceTreeWidget.hpp"
 #include "ViewerManager.hpp"
 #include "CState.hpp"
-#include "adaptive/CAdaptiveVolumeViewer.hpp"
+#include "streaming/CChunkedVolumeViewer.hpp"
 #include "elements/DropdownChecklistButton.hpp"
 #include "VCSettings.hpp"
 
@@ -74,7 +74,7 @@ void sync_tag(utils::Json& dict, bool checked, const std::string& name, const st
 SurfacePanelController::SurfacePanelController(const UiRefs& ui,
                                                CState* state,
                                                ViewerManager* viewerManager,
-                                               std::function<CTiledVolumeViewer*()> segmentationViewerProvider,
+                                               std::function<CChunkedVolumeViewer*()> segmentationViewerProvider,
                                                std::function<void()> filtersUpdated,
                                                QObject* parent)
     : QObject(parent)

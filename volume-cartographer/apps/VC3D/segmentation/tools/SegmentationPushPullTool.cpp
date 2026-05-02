@@ -2,7 +2,6 @@
 
 #include "../SegmentationModule.hpp"
 #include "../../ViewerManager.hpp"
-#include "../../adaptive/CAdaptiveVolumeViewer.hpp"
 #include "SegmentationEditManager.hpp"
 #include "../SegmentationWidget.hpp"
 #include "../../overlays/SegmentationOverlayController.hpp"

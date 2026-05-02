@@ -145,9 +145,6 @@ namespace
 
 VolumeViewerBase* baseViewerFromWidget(QWidget* widget)
 {
-    if (auto* adaptiveViewer = qobject_cast<CTiledVolumeViewer*>(widget)) {
-        return adaptiveViewer;
-    }
     if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(widget)) {
         return chunkedViewer;
     }
@@ -962,55 +959,12 @@ CWindow::CWindow(size_t cacheSizeGB, int startupPrefetchLevel) :
 
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
     _viewerManager->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
-    connect(_viewerManager.get(), &ViewerManager::viewerCreated, this, [this](CTiledVolumeViewer* viewer) {
-        configureViewerConnections(viewer);
-        if (!viewer) {
-            return;
-        }
-        auto s = viewer->compositeRenderSettings();
-        s.params.method = compositeMethodForModeIndex(ui.cmbCompositeMode->currentIndex());
-        viewer->setCompositeRenderSettings(s);
-        if (viewer->surfName() == "segmentation") {
-            QSignalBlocker blocker(ui.chkCompositeEnabled);
-            ui.chkCompositeEnabled->setChecked(s.enabled);
-        }
-    });
     connect(_viewerManager.get(), &ViewerManager::baseViewerCreated, this, [this](VolumeViewerBase* viewer) {
         if (!viewer) {
             return;
         }
         if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())) {
-            connect(chunkedViewer,
-                    &CChunkedVolumeViewer::sendVolumeClicked,
-                    this,
-                    &CWindow::onVolumeClicked,
-                    Qt::UniqueConnection);
-            if (_drawingWidget && !chunkedViewer->property("vc_drawing_bound").toBool()) {
-                connect(_drawingWidget, &DrawingWidget::sendPathsChanged,
-                        chunkedViewer, &CChunkedVolumeViewer::onPathsChanged, Qt::UniqueConnection);
-                connect(chunkedViewer, &CChunkedVolumeViewer::sendMousePressVolume,
-                        _drawingWidget, &DrawingWidget::onMousePress, Qt::UniqueConnection);
-                connect(chunkedViewer, &CChunkedVolumeViewer::sendMouseMoveVolume,
-                        _drawingWidget, &DrawingWidget::onMouseMove, Qt::UniqueConnection);
-                connect(chunkedViewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
-                        _drawingWidget, &DrawingWidget::onMouseRelease, Qt::UniqueConnection);
-                connect(chunkedViewer, &CChunkedVolumeViewer::sendZSliceChanged,
-                        _drawingWidget, &DrawingWidget::updateCurrentZSlice, Qt::UniqueConnection);
-                chunkedViewer->setProperty("vc_drawing_bound", true);
-            }
-            if (_seedingWidget && !chunkedViewer->property("vc_seeding_bound").toBool()) {
-                connect(_seedingWidget, &SeedingWidget::sendPathsChanged,
-                        chunkedViewer, &CChunkedVolumeViewer::onPathsChanged, Qt::UniqueConnection);
-                connect(chunkedViewer, &CChunkedVolumeViewer::sendMousePressVolume,
-                        _seedingWidget, &SeedingWidget::onMousePress, Qt::UniqueConnection);
-                connect(chunkedViewer, &CChunkedVolumeViewer::sendMouseMoveVolume,
-                        _seedingWidget, &SeedingWidget::onMouseMove, Qt::UniqueConnection);
-                connect(chunkedViewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
-                        _seedingWidget, &SeedingWidget::onMouseRelease, Qt::UniqueConnection);
-                connect(chunkedViewer, &CChunkedVolumeViewer::sendZSliceChanged,
-                        _seedingWidget, &SeedingWidget::updateCurrentZSlice, Qt::UniqueConnection);
-                chunkedViewer->setProperty("vc_seeding_bound", true);
-            }
+            configureChunkedViewerConnections(chunkedViewer);
         }
         auto s = viewer->compositeRenderSettings();
         s.params.method = compositeMethodForModeIndex(ui.cmbCompositeMode->currentIndex());
@@ -1463,104 +1417,104 @@ VolumeViewerBase *CWindow::newConnectedViewer(std::string surfaceName, QString t
         return nullptr;
     }
 
-    if (auto* adaptiveViewer = qobject_cast<CTiledVolumeViewer*>(viewer->asQObject())) {
-        configureViewerConnections(adaptiveViewer);
+    if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())) {
+        configureChunkedViewerConnections(chunkedViewer);
     }
     return viewer;
 }
 
-void CWindow::configureViewerConnections(CTiledVolumeViewer* viewer)
+void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
 {
     if (!viewer) {
         return;
     }
 
-    connect(_state, &CState::volumeChanged, viewer, &CTiledVolumeViewer::OnVolumeChanged, Qt::UniqueConnection);
-    connect(_state, &CState::volumeClosing, viewer, &CTiledVolumeViewer::onVolumeClosing, Qt::UniqueConnection);
-    connect(viewer, &CTiledVolumeViewer::sendVolumeClicked, this, &CWindow::onVolumeClicked, Qt::UniqueConnection);
+    connect(_state, &CState::volumeChanged, viewer, &CChunkedVolumeViewer::OnVolumeChanged, Qt::UniqueConnection);
+    connect(_state, &CState::volumeClosing, viewer, &CChunkedVolumeViewer::onVolumeClosing, Qt::UniqueConnection);
+    connect(viewer, &CChunkedVolumeViewer::sendVolumeClicked, this, &CWindow::onVolumeClicked, Qt::UniqueConnection);
 
-    if (viewer->fGraphicsView) {
-        connect(viewer->fGraphicsView, &CVolumeViewerView::sendMousePress,
-                viewer, &CTiledVolumeViewer::onMousePress, Qt::UniqueConnection);
-        connect(viewer->fGraphicsView, &CVolumeViewerView::sendMouseMove,
-                viewer, &CTiledVolumeViewer::onMouseMove, Qt::UniqueConnection);
-        connect(viewer->fGraphicsView, &CVolumeViewerView::sendMouseRelease,
-                viewer, &CTiledVolumeViewer::onMouseRelease, Qt::UniqueConnection);
+    if (auto* graphicsView = viewer->graphicsView()) {
+        connect(graphicsView, &CVolumeViewerView::sendMousePress,
+                viewer, &CChunkedVolumeViewer::onMousePress, Qt::UniqueConnection);
+        connect(graphicsView, &CVolumeViewerView::sendMouseMove,
+                viewer, &CChunkedVolumeViewer::onMouseMove, Qt::UniqueConnection);
+        connect(graphicsView, &CVolumeViewerView::sendMouseRelease,
+                viewer, &CChunkedVolumeViewer::onMouseRelease, Qt::UniqueConnection);
     }
 
     if (_drawingWidget && !viewer->property("vc_drawing_bound").toBool()) {
         connect(_drawingWidget, &DrawingWidget::sendPathsChanged,
-                viewer, &CTiledVolumeViewer::onPathsChanged, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendMousePressVolume,
+                viewer, &CChunkedVolumeViewer::onPathsChanged, Qt::UniqueConnection);
+        connect(viewer, &CChunkedVolumeViewer::sendMousePressVolume,
                 _drawingWidget, &DrawingWidget::onMousePress, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendMouseMoveVolume,
+        connect(viewer, &CChunkedVolumeViewer::sendMouseMoveVolume,
                 _drawingWidget, &DrawingWidget::onMouseMove, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendMouseReleaseVolume,
+        connect(viewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
                 _drawingWidget, &DrawingWidget::onMouseRelease, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendZSliceChanged,
+        connect(viewer, &CChunkedVolumeViewer::sendZSliceChanged,
                 _drawingWidget, &DrawingWidget::updateCurrentZSlice, Qt::UniqueConnection);
-    connect(_drawingWidget, &DrawingWidget::sendDrawingModeActive,
-            this, [this, viewer](bool active) {
-                viewer->onDrawingModeActive(active,
-                    _drawingWidget->getBrushSize(),
-                    _drawingWidget->getBrushShape() == PathBrushShape::Square);
-            });
+        connect(_drawingWidget, &DrawingWidget::sendDrawingModeActive,
+                this, [this, viewer](bool active) {
+                    viewer->onDrawingModeActive(active,
+                        _drawingWidget->getBrushSize(),
+                        _drawingWidget->getBrushShape() == PathBrushShape::Square);
+                });
         viewer->setProperty("vc_drawing_bound", true);
     }
 
     if (_seedingWidget && !viewer->property("vc_seeding_bound").toBool()) {
         connect(_seedingWidget, &SeedingWidget::sendPathsChanged,
-                viewer, &CTiledVolumeViewer::onPathsChanged, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendMousePressVolume,
+                viewer, &CChunkedVolumeViewer::onPathsChanged, Qt::UniqueConnection);
+        connect(viewer, &CChunkedVolumeViewer::sendMousePressVolume,
                 _seedingWidget, &SeedingWidget::onMousePress, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendMouseMoveVolume,
+        connect(viewer, &CChunkedVolumeViewer::sendMouseMoveVolume,
                 _seedingWidget, &SeedingWidget::onMouseMove, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendMouseReleaseVolume,
+        connect(viewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
                 _seedingWidget, &SeedingWidget::onMouseRelease, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendZSliceChanged,
+        connect(viewer, &CChunkedVolumeViewer::sendZSliceChanged,
                 _seedingWidget, &SeedingWidget::updateCurrentZSlice, Qt::UniqueConnection);
         viewer->setProperty("vc_seeding_bound", true);
     }
 
     if (_patchGraphWidget && !viewer->property("vc_patch_graph_bound").toBool()) {
-        connect(viewer, &CTiledVolumeViewer::sendMouseMoveVolume,
+        connect(viewer, &CChunkedVolumeViewer::sendMouseMoveVolume,
                 _patchGraphWidget, &PatchGraphWidget::onViewerMouseMove, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendMouseReleaseVolume,
+        connect(viewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
                 _patchGraphWidget, &PatchGraphWidget::onViewerMouseRelease, Qt::UniqueConnection);
         viewer->setProperty("vc_patch_graph_bound", true);
     }
 
     if (_point_collection_widget && !viewer->property("vc_points_bound").toBool()) {
         connect(_point_collection_widget, &CPointCollectionWidget::collectionSelected,
-                viewer, &CTiledVolumeViewer::onCollectionSelected, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::sendCollectionSelected,
+                viewer, &CChunkedVolumeViewer::onCollectionSelected, Qt::UniqueConnection);
+        connect(viewer, &CChunkedVolumeViewer::sendCollectionSelected,
                 _point_collection_widget, &CPointCollectionWidget::selectCollection, Qt::UniqueConnection);
         connect(_point_collection_widget, &CPointCollectionWidget::pointSelected,
-                viewer, &CTiledVolumeViewer::onPointSelected, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::pointSelected,
+                viewer, &CChunkedVolumeViewer::onPointSelected, Qt::UniqueConnection);
+        connect(viewer, &CChunkedVolumeViewer::pointSelected,
                 _point_collection_widget, &CPointCollectionWidget::selectPoint, Qt::UniqueConnection);
-        connect(viewer, &CTiledVolumeViewer::pointClicked,
+        connect(viewer, &CChunkedVolumeViewer::pointClicked,
                 _point_collection_widget, &CPointCollectionWidget::selectPoint, Qt::UniqueConnection);
         viewer->setProperty("vc_points_bound", true);
     }
 
     const std::string& surfName = viewer->surfName();
     if ((surfName == "seg xz" || surfName == "seg yz") && !viewer->property("vc_axisaligned_bound").toBool()) {
-        if (viewer->fGraphicsView) {
-            viewer->fGraphicsView->setMiddleButtonPanEnabled(!_axisAlignedSliceController->isEnabled());
+        if (auto* graphicsView = viewer->graphicsView()) {
+            graphicsView->setMiddleButtonPanEnabled(!_axisAlignedSliceController->isEnabled());
         }
 
-        connect(viewer, &CTiledVolumeViewer::sendMousePressVolume,
+        connect(viewer, &CChunkedVolumeViewer::sendMousePressVolume,
                 this, [this, viewer](cv::Vec3f volLoc, cv::Vec3f /*normal*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
                     _axisAlignedSliceController->onMousePress(viewer, volLoc, button, modifiers);
                 });
 
-        connect(viewer, &CTiledVolumeViewer::sendMouseMoveVolume,
+        connect(viewer, &CChunkedVolumeViewer::sendMouseMoveVolume,
                 this, [this, viewer](cv::Vec3f volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers) {
                     _axisAlignedSliceController->onMouseMove(viewer, volLoc, buttons, modifiers);
                 });
 
-        connect(viewer, &CTiledVolumeViewer::sendMouseReleaseVolume,
+        connect(viewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
                 this, [this, viewer](cv::Vec3f /*volLoc*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
                     _axisAlignedSliceController->onMouseRelease(viewer, button, modifiers);
                 });
@@ -1569,14 +1523,14 @@ void CWindow::configureViewerConnections(CTiledVolumeViewer* viewer)
     }
 }
 
-CTiledVolumeViewer* CWindow::segmentationViewer() const
+CChunkedVolumeViewer* CWindow::segmentationViewer() const
 {
     if (!_viewerManager) {
         return nullptr;
     }
-    for (auto* viewer : _viewerManager->viewers()) {
+    for (auto* viewer : _viewerManager->baseViewers()) {
         if (viewer && viewer->surfName() == "segmentation") {
-            return viewer;
+            return qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject());
         }
     }
     return nullptr;
@@ -3635,9 +3589,13 @@ void CWindow::CreateWidgets(void)
 
     // Selection dock (removed per request; selection actions remain in the menu)
     if (_viewerManager) {
-        _viewerManager->forEachViewer([this](CTiledVolumeViewer* viewer) {
-            configureViewerConnections(viewer);
-        });
+        for (auto* viewer : _viewerManager->baseViewers()) {
+            if (viewer) {
+                if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())) {
+                    configureChunkedViewerConnections(chunkedViewer);
+                }
+            }
+        }
     }
     connect(_point_collection_widget, &CPointCollectionWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
     connect(_point_collection_widget, &CPointCollectionWidget::convertPointToAnchorRequested, this, &CWindow::onConvertPointToAnchor);

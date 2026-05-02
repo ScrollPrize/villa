@@ -13,10 +13,6 @@ class CState;
 class ViewerManager;
 class PlaneSlicingOverlayController;
 class VolumeViewerBase;
-class CAdaptiveVolumeViewer;
-#ifndef CTiledVolumeViewer
-#define CTiledVolumeViewer CAdaptiveVolumeViewer
-#endif
 class Surface;
 
 class AxisAlignedSliceController : public QObject

@@ -1,6 +1,5 @@
 #include "TransformOverlayController.hpp"
 
-#include "../adaptive/CAdaptiveVolumeViewer.hpp"
 #include "../CState.hpp"
 #include "../CVolumeViewerView.hpp"
 #include "../ViewerManager.hpp"

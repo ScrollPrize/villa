@@ -1,6 +1,5 @@
 #include "VectorOverlayController.hpp"
 
-#include "../adaptive/CAdaptiveVolumeViewer.hpp"
 #include "../VolumeViewerBase.hpp"
 #include "../CState.hpp"
 #include "../VCSettings.hpp"

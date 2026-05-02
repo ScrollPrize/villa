@@ -10,6 +10,7 @@
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
+#include "vc/core/util/Geometry.hpp"
 #include "vc/core/util/Surface.hpp"
 
 #include <QApplication>
@@ -186,6 +187,19 @@ float activeSegmentationIntersectionWidth(float baseWidth)
 {
     return std::max(baseWidth * kActiveIntersectionWidthScale,
                     baseWidth + kActiveIntersectionMinWidthDelta);
+}
+
+QString formatVec3(const cv::Vec3f& v)
+{
+    return QString("(%1, %2, %3)")
+        .arg(v[0], 0, 'f', 1)
+        .arg(v[1], 0, 'f', 1)
+        .arg(v[2], 0, 'f', 1);
+}
+
+QString planeCoordinateText(PlaneSurface& plane)
+{
+    return QString("plane pos %1").arg(formatVec3(plane.origin()));
 }
 
 std::size_t streamingCacheCapacityBytes(const CState* state)
@@ -485,6 +499,7 @@ void CChunkedVolumeViewer::onPOIChanged(const std::string& name, POI* poi)
     }
 
     updateFocusMarker(poi);
+    updateStatusLabel();
     emit overlaysUpdated();
     scheduleRender();
     renderIntersections();
@@ -1494,12 +1509,46 @@ void CChunkedVolumeViewer::centerOnVolumePoint(const cv::Vec3f& point, bool forc
     auto surf = _surfWeak.lock();
     if (!surf)
         return;
+    cv::Vec2f surfacePoint(0.0f, 0.0f);
+    bool haveSurfacePoint = false;
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
         const cv::Vec3f projected = plane->project(point, 1.0, 1.0);
-        _surfacePtrX = projected[0];
-        _surfacePtrY = projected[1];
-        forceRender ? renderVisible(true) : scheduleRender();
+        surfacePoint = {projected[0], projected[1]};
+        haveSurfacePoint = true;
+    } else if (auto* quad = dynamic_cast<QuadSurface*>(surf.get())) {
+        cv::Vec3f ptr = quad->pointer();
+        auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+        if (quad->pointTo(ptr, point, 4.0f, 100, patchIndex) >= 0.0f) {
+            const cv::Vec3f loc = quad->loc(ptr);
+            surfacePoint = {loc[0], loc[1]};
+            haveSurfacePoint = true;
+        }
     }
+
+    if (!haveSurfacePoint ||
+        !std::isfinite(surfacePoint[0]) ||
+        !std::isfinite(surfacePoint[1])) {
+        return;
+    }
+
+    centerOnSurfacePoint(surfacePoint, forceRender);
+}
+
+void CChunkedVolumeViewer::centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender)
+{
+    if (!std::isfinite(point[0]) || !std::isfinite(point[1]))
+        return;
+
+    _surfacePtrX = point[0];
+    _surfacePtrY = point[1];
+    _genCacheDirty = true;
+    _stableFramebufferValid = false;
+    if (forceRender) {
+        renderVisible(true);
+    } else {
+        scheduleRender();
+    }
+    emit overlaysUpdated();
 }
 
 void CChunkedVolumeViewer::onZoom(int steps, QPointF scenePoint, Qt::KeyboardModifiers modifiers)
@@ -1599,6 +1648,13 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
 void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
     _lastScenePos = scenePos;
+    if (_bboxMode && _surfName == "segmentation" && button == Qt::LeftButton) {
+        const cv::Vec2f sp = sceneToSurface(scenePos);
+        _bboxStart = QPointF(sp[0], sp[1]);
+        _activeBBoxSurfRect = QRectF(_bboxStart, QSizeF(0.0, 0.0));
+        emit overlaysUpdated();
+        return;
+    }
     emit sendMousePressVolume(sceneToVolume(scenePos), {0, 0, 1}, button, modifiers, scenePos);
 }
 
@@ -1606,12 +1662,29 @@ void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons button
 {
     Q_UNUSED(modifiers);
     _lastScenePos = scenePos;
+    if (_bboxMode && _activeBBoxSurfRect && (buttons & Qt::LeftButton)) {
+        const cv::Vec2f sp = sceneToSurface(scenePos);
+        _activeBBoxSurfRect = QRectF(_bboxStart, QPointF(sp[0], sp[1])).normalized();
+        emit overlaysUpdated();
+        return;
+    }
     emit sendMouseMoveVolume(sceneToVolume(scenePos), buttons, modifiers, scenePos);
 }
 
 void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
 {
     _lastScenePos = scenePos;
+    if (_bboxMode && _surfName == "segmentation" && button == Qt::LeftButton &&
+        _activeBBoxSurfRect) {
+        const cv::Vec2f sp = sceneToSurface(scenePos);
+        const QRectF surfRect = QRectF(_bboxStart, QPointF(sp[0], sp[1])).normalized();
+        const int idx = static_cast<int>(_selections.size());
+        const QColor color = QColor::fromHsv((idx * 53) % 360, 200, 255);
+        _selections.push_back({surfRect, color});
+        _activeBBoxSurfRect.reset();
+        emit overlaysUpdated();
+        return;
+    }
     emit sendMouseReleaseVolume(sceneToVolume(scenePos), button, modifiers, scenePos);
 }
 
@@ -1655,6 +1728,15 @@ cv::Vec2f CChunkedVolumeViewer::sceneToSurface(const QPointF& scenePos) const
     const float vpCy = static_cast<float>(_framebuffer.height()) * 0.5f;
     return {(static_cast<float>(vp.x()) - vpCx) / _camScale + _camSurfX,
             (static_cast<float>(vp.y()) - vpCy) / _camScale + _camSurfY};
+}
+
+QRectF CChunkedVolumeViewer::surfaceRectToSceneRect(const QRectF& surfRect) const
+{
+    const QPointF a = surfaceToScene(static_cast<float>(surfRect.left()),
+                                     static_cast<float>(surfRect.top()));
+    const QPointF b = surfaceToScene(static_cast<float>(surfRect.right()),
+                                     static_cast<float>(surfRect.bottom()));
+    return QRectF(a, b).normalized();
 }
 
 cv::Vec2f CChunkedVolumeViewer::sceneToSurfaceCoords(const QPointF& scenePos) const
@@ -1830,6 +1912,151 @@ void CChunkedVolumeViewer::clearAllOverlayGroups()
     _overlayGroups.clear();
 }
 
+std::vector<std::pair<QRectF, QColor>> CChunkedVolumeViewer::selections() const
+{
+    std::vector<std::pair<QRectF, QColor>> out;
+    out.reserve(_selections.size());
+    for (const auto& selection : _selections) {
+        out.emplace_back(surfaceRectToSceneRect(selection.surfRect), selection.color);
+    }
+    return out;
+}
+
+std::optional<QRectF> CChunkedVolumeViewer::activeBBoxSceneRect() const
+{
+    if (!_activeBBoxSurfRect)
+        return std::nullopt;
+    return surfaceRectToSceneRect(*_activeBBoxSurfRect);
+}
+
+void CChunkedVolumeViewer::setBBoxMode(bool enabled)
+{
+    _bboxMode = enabled;
+    if (!enabled && _activeBBoxSurfRect) {
+        _activeBBoxSurfRect.reset();
+        emit overlaysUpdated();
+    }
+}
+
+QuadSurface* CChunkedVolumeViewer::makeBBoxFilteredSurfaceFromSceneRect(const QRectF& sceneRect)
+{
+    if (_surfName != "segmentation")
+        return nullptr;
+
+    auto surf = _surfWeak.lock();
+    auto* quad = dynamic_cast<QuadSurface*>(surf.get());
+    if (!quad)
+        return nullptr;
+
+    const cv::Mat_<cv::Vec3f> src = quad->rawPoints();
+    const int h = src.rows;
+    const int w = src.cols;
+    if (h <= 0 || w <= 0)
+        return nullptr;
+
+    const cv::Vec2f sp0 = sceneToSurface(sceneRect.topLeft());
+    const cv::Vec2f sp1 = sceneToSurface(sceneRect.bottomRight());
+    QRectF surfRect(QPointF(sp0[0], sp0[1]), QPointF(sp1[0], sp1[1]));
+    surfRect = surfRect.normalized();
+
+    const double cx = w * 0.5;
+    const double cy = h * 0.5;
+    const cv::Vec2f scale = quad->scale();
+    if (scale[0] == 0.0f || scale[1] == 0.0f)
+        return nullptr;
+
+    const int i0 = std::max(0, static_cast<int>(std::floor(cx + surfRect.left() * scale[0])));
+    const int i1 = std::min(w - 1, static_cast<int>(std::ceil(cx + surfRect.right() * scale[0])));
+    const int j0 = std::max(0, static_cast<int>(std::floor(cy + surfRect.top() * scale[1])));
+    const int j1 = std::min(h - 1, static_cast<int>(std::ceil(cy + surfRect.bottom() * scale[1])));
+    if (i0 > i1 || j0 > j1)
+        return nullptr;
+
+    cv::Mat_<cv::Vec3f> cropped(j1 - j0 + 1, i1 - i0 + 1, cv::Vec3f(-1.0f, -1.0f, -1.0f));
+    for (int j = j0; j <= j1; ++j) {
+        for (int i = i0; i <= i1; ++i) {
+            const cv::Vec3f& p = src(j, i);
+            if (p[0] == -1.0f && p[1] == -1.0f && p[2] == -1.0f)
+                continue;
+            const double u = (i - cx) / scale[0];
+            const double v = (j - cy) / scale[1];
+            if (u >= surfRect.left() && u <= surfRect.right() &&
+                v >= surfRect.top() && v <= surfRect.bottom()) {
+                cropped(j - j0, i - i0) = p;
+            }
+        }
+    }
+
+    cv::Mat_<cv::Vec3f> cleaned = clean_surface_outliers(cropped);
+
+    auto countValidInCol = [&](int c) {
+        int count = 0;
+        for (int r = 0; r < cleaned.rows; ++r) {
+            if (cleaned(r, c)[0] != -1.0f)
+                ++count;
+        }
+        return count;
+    };
+    auto countValidInRow = [&](int r) {
+        int count = 0;
+        for (int c = 0; c < cleaned.cols; ++c) {
+            if (cleaned(r, c)[0] != -1.0f)
+                ++count;
+        }
+        return count;
+    };
+
+    const int minValidCol = std::max(1, std::min(3, cleaned.rows));
+    const int minValidRow = std::max(1, std::min(3, cleaned.cols));
+    int left = 0;
+    int right = cleaned.cols - 1;
+    int top = 0;
+    int bottom = cleaned.rows - 1;
+    while (left <= right && countValidInCol(left) < minValidCol)
+        ++left;
+    while (right >= left && countValidInCol(right) < minValidCol)
+        --right;
+    while (top <= bottom && countValidInRow(top) < minValidRow)
+        ++top;
+    while (bottom >= top && countValidInRow(bottom) < minValidRow)
+        --bottom;
+
+    if (left > right || top > bottom) {
+        left = cleaned.cols;
+        right = -1;
+        top = cleaned.rows;
+        bottom = -1;
+        for (int j = 0; j < cleaned.rows; ++j) {
+            for (int i = 0; i < cleaned.cols; ++i) {
+                if (cleaned(j, i)[0] != -1.0f) {
+                    left = std::min(left, i);
+                    right = std::max(right, i);
+                    top = std::min(top, j);
+                    bottom = std::max(bottom, j);
+                }
+            }
+        }
+        if (right < 0 || bottom < 0)
+            return nullptr;
+    }
+
+    cv::Mat_<cv::Vec3f> finalPts(bottom - top + 1, right - left + 1,
+                                  cv::Vec3f(-1.0f, -1.0f, -1.0f));
+    for (int j = top; j <= bottom; ++j) {
+        for (int i = left; i <= right; ++i) {
+            finalPts(j - top, i - left) = cleaned(j, i);
+        }
+    }
+
+    return new QuadSurface(finalPts, quad->scale());
+}
+
+void CChunkedVolumeViewer::clearSelections()
+{
+    _selections.clear();
+    emit overlaysUpdated();
+}
+
 void CChunkedVolumeViewer::invalidateIntersect(const std::string&)
 {
     clearIntersectionItems();
@@ -1872,13 +2099,187 @@ void CChunkedVolumeViewer::updateIntersectionPreviewTransform()
     }
 }
 
+void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Surface>& surf)
+{
+    auto activeSeg = std::dynamic_pointer_cast<QuadSurface>(surf);
+    if (!activeSeg || !_state || _state->surface("segmentation") != activeSeg) {
+        invalidateIntersect();
+        _lastIntersectFp = {};
+        return;
+    }
+
+    auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+    if (!patchIndex || patchIndex->empty()) {
+        invalidateIntersect();
+        _lastIntersectFp = {};
+        return;
+    }
+
+    struct PlaneEntry {
+        std::shared_ptr<PlaneSurface> plane;
+        QColor color;
+    };
+    const std::array<std::pair<const char*, QColor>, 3> kPlaneSpecs = {{
+        {"seg xy", QColor(255, 140, 0)},
+        {"seg xz", QColor(Qt::red)},
+        {"seg yz", QColor(Qt::yellow)},
+    }};
+    std::vector<PlaneEntry> planes;
+    planes.reserve(kPlaneSpecs.size());
+    for (const auto& [name, color] : kPlaneSpecs) {
+        if (!_intersectTgts.count(name))
+            continue;
+        if (auto p = std::dynamic_pointer_cast<PlaneSurface>(_state->surface(name))) {
+            planes.push_back({std::move(p), color});
+        }
+    }
+    if (planes.empty()) {
+        invalidateIntersect();
+        _lastIntersectFp = {};
+        return;
+    }
+
+    auto mix = [](std::size_t s, std::size_t v) {
+        return s ^ (v + 0x9e3779b9u + (s << 6) + (s >> 2));
+    };
+    auto hashVec = [&](std::size_t s, const cv::Vec3f& v) {
+        for (int i = 0; i < 3; ++i)
+            s = mix(s, std::hash<int>{}(int(std::lround(v[i] * 1000.0f))));
+        return s;
+    };
+
+    std::size_t planesHash = 0;
+    for (const auto& e : planes) {
+        planesHash = hashVec(planesHash, e.plane->origin());
+        planesHash = hashVec(planesHash, e.plane->normal({}, {}));
+        planesHash = hashVec(planesHash, e.plane->basisX());
+        planesHash = hashVec(planesHash, e.plane->basisY());
+        planesHash = mix(planesHash, std::hash<uint32_t>{}(uint32_t(e.color.rgba())));
+    }
+
+    IntersectFingerprint fp;
+    fp.flattenedPlanesHash = planesHash;
+    fp.opacityQ = int(std::lround(_intersectionOpacity * 1000.0f));
+    fp.thicknessQ = int(std::lround(_intersectionThickness * 1000.0f));
+    fp.indexSamplingStride = patchIndex->samplingStride();
+    fp.patchCount = patchIndex->patchCount();
+    fp.surfaceCount = patchIndex->surfaceCount();
+    fp.activeSegHash = std::hash<const void*>{}(activeSeg.get());
+    fp.targetGenerationHash = std::hash<uint64_t>{}(patchIndex->generation(activeSeg));
+
+    auto hashInt = [&](std::size_t s, int v) {
+        return mix(s, std::hash<int>{}(v));
+    };
+    std::size_t cameraHash = 0;
+    cameraHash = hashInt(cameraHash, int(std::lround(_camSurfX * 1000.0f)));
+    cameraHash = hashInt(cameraHash, int(std::lround(_camSurfY * 1000.0f)));
+    cameraHash = hashInt(cameraHash, int(std::lround(_camScale * 1000.0f)));
+    cameraHash = hashInt(cameraHash, _framebuffer.width());
+    cameraHash = hashInt(cameraHash, _framebuffer.height());
+    if (_view) {
+        const QTransform t = _view->transform();
+        auto q = [](qreal v) { return int(std::lround(v * 1000.0)); };
+        cameraHash = hashInt(cameraHash, q(t.m11()));
+        cameraHash = hashInt(cameraHash, q(t.m12()));
+        cameraHash = hashInt(cameraHash, q(t.m21()));
+        cameraHash = hashInt(cameraHash, q(t.m22()));
+        cameraHash = hashInt(cameraHash, q(t.dx()));
+        cameraHash = hashInt(cameraHash, q(t.dy()));
+    }
+    fp.cameraHash = cameraHash;
+    fp.valid = true;
+    if (_lastIntersectFp == fp && !_intersectionItems.empty()) {
+        updateIntersectionPreviewTransform();
+        return;
+    }
+
+    clearIntersectionItems();
+    _lastIntersectFp = fp;
+    _intersectionGeometryCache = {};
+
+    Rect3D allBounds{cv::Vec3f(0, 0, 0), cv::Vec3f(1, 1, 1)};
+    if (_volume) {
+        auto [w, h, d] = _volume->shape();
+        allBounds.high = {static_cast<float>(w),
+                          static_cast<float>(h),
+                          static_cast<float>(d)};
+    }
+
+    const float clipTol = std::max(_intersectionThickness, 1e-4f);
+    const float penWidth = std::max(_intersectionThickness,
+                                    kActiveIntersectionMinWidthDelta);
+    const float opacity = std::clamp(
+        _intersectionOpacity * kActiveIntersectionOpacityScale, 0.0f, 1.0f);
+
+    auto isFiniteScalar = [](double v) {
+        uint64_t bits;
+        std::memcpy(&bits, &v, sizeof(bits));
+        return (bits & 0x7FF0000000000000ULL) != 0x7FF0000000000000ULL;
+    };
+    auto isFinitePoint = [&](const QPointF& p) {
+        return isFiniteScalar(p.x()) && isFiniteScalar(p.y());
+    };
+
+    std::vector<QPainterPath> paths(planes.size());
+    SurfacePatchIndex::TriangleQuery query;
+    query.bounds = allBounds;
+    query.surfaces.only = activeSeg;
+    patchIndex->forEachTriangle(query,
+        [&](const SurfacePatchIndex::TriangleCandidate& tri) {
+            for (size_t idx = 0; idx < planes.size(); ++idx) {
+                auto seg = SurfacePatchIndex::clipTriangleToPlane(
+                    tri, *planes[idx].plane, clipTol);
+                if (!seg)
+                    continue;
+                const cv::Vec3f a = activeSeg->loc(seg->surfaceParams[0]);
+                const cv::Vec3f b = activeSeg->loc(seg->surfaceParams[1]);
+                const QPointF pa = surfaceToScene(a[0], a[1]);
+                const QPointF pb = surfaceToScene(b[0], b[1]);
+                if (!isFinitePoint(pa) || !isFinitePoint(pb))
+                    continue;
+                paths[idx].moveTo(pa);
+                paths[idx].lineTo(pb);
+            }
+        });
+
+    _intersectionItems.reserve(paths.size());
+    for (size_t idx = 0; idx < paths.size(); ++idx) {
+        if (paths[idx].isEmpty())
+            continue;
+        QColor color = planes[idx].color;
+        color.setAlphaF(opacity);
+        auto* item = new QGraphicsPathItem(paths[idx]);
+        QPen pen(color);
+        pen.setWidthF(static_cast<qreal>(penWidth));
+        pen.setCapStyle(Qt::RoundCap);
+        pen.setJoinStyle(Qt::RoundJoin);
+        pen.setCosmetic(true);
+        item->setPen(pen);
+        item->setBrush(Qt::NoBrush);
+        item->setZValue(kActiveIntersectionZ);
+        item->setAcceptedMouseButtons(Qt::NoButton);
+        _scene->addItem(item);
+        _intersectionItems.push_back(item);
+    }
+
+    _intersectionItemsCamSurfX = _camSurfX;
+    _intersectionItemsCamSurfY = _camSurfY;
+    _intersectionItemsCamScale = _camScale;
+    _intersectionItemsHaveCamera = !_intersectionItems.empty();
+    _view->viewport()->update();
+}
+
 void CChunkedVolumeViewer::renderIntersections()
 {
     auto surf = _surfWeak.lock();
     auto* plane = dynamic_cast<PlaneSurface*>(surf.get());
-    if (!plane || !_state || !_viewerManager || !_scene || !_view) {
+    if (!surf || !_state || !_viewerManager || !_scene || !_view) {
         invalidateIntersect();
         _lastIntersectFp = {};
+        return;
+    }
+    if (!plane) {
+        renderFlattenedIntersections(surf);
         return;
     }
 
@@ -2158,11 +2559,25 @@ void CChunkedVolumeViewer::updateStatusLabel()
     } else if (_compositeSettings.enabled || _compositeSettings.planeEnabled) {
         suffix = QString("  composite %1").arg(QString::fromStdString(_compositeSettings.params.method));
     }
-    _lbl->setText(QString("Streaming L%1  scale %2  %3x%4%5")
+
+    QString viewInfo;
+    auto surf = _surfWeak.lock();
+    if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
+        viewInfo = QString("  %1").arg(planeCoordinateText(*plane));
+    } else if (dynamic_cast<QuadSurface*>(surf.get())) {
+        viewInfo = QString("  normal offset %1").arg(_zOff, 0, 'f', 1);
+        if (_state) {
+            if (auto* poi = _state->poi("focus"))
+                viewInfo += QString("  POI %1").arg(formatVec3(poi->p));
+        }
+    }
+
+    _lbl->setText(QString("Streaming L%1  scale %2  %3x%4%5%6")
         .arg(_dsScaleIdx)
         .arg(_scale, 0, 'f', 2)
         .arg(_framebuffer.width())
         .arg(_framebuffer.height())
+        .arg(viewInfo)
         .arg(suffix));
     _lbl->adjustSize();
 }

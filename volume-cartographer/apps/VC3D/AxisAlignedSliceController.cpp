@@ -2,7 +2,6 @@
 #include "CState.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/PlaneSlicingOverlayController.hpp"
-#include "adaptive/CAdaptiveVolumeViewer.hpp"
 #include "CVolumeViewerView.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/util/PlaneSurface.hpp"

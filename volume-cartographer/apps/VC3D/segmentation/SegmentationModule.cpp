@@ -1,6 +1,5 @@
 #include "SegmentationModule.hpp"
 
-#include "adaptive/CAdaptiveVolumeViewer.hpp"
 #include "streaming/CChunkedVolumeViewer.hpp"
 #include "CVolumeViewerView.hpp"
 #include "CState.hpp"
@@ -484,34 +483,7 @@ void SegmentationModule::bindViewerSignals(VolumeViewerBase* viewer)
         return;
     }
 
-    if (auto* adaptiveViewer = qobject_cast<CTiledVolumeViewer*>(viewerObject)) {
-        connect(adaptiveViewer, &CTiledVolumeViewer::sendMousePressVolume,
-                this, [this, viewer](const cv::Vec3f& worldPos,
-                                     const cv::Vec3f& normal,
-                                     Qt::MouseButton button,
-                                     Qt::KeyboardModifiers modifiers,
-                                     const QPointF& scenePos) {
-                    handleMousePress(viewer, worldPos, normal, button, modifiers, scenePos);
-                });
-        connect(adaptiveViewer, &CTiledVolumeViewer::sendMouseMoveVolume,
-                this, [this, viewer](const cv::Vec3f& worldPos,
-                                     Qt::MouseButtons buttons,
-                                     Qt::KeyboardModifiers modifiers,
-                                     const QPointF& scenePos) {
-                    handleMouseMove(viewer, worldPos, buttons, modifiers, scenePos);
-                });
-        connect(adaptiveViewer, &CTiledVolumeViewer::sendMouseReleaseVolume,
-                this, [this, viewer](const cv::Vec3f& worldPos,
-                                     Qt::MouseButton button,
-                                     Qt::KeyboardModifiers modifiers,
-                                     const QPointF& scenePos) {
-                    handleMouseRelease(viewer, worldPos, button, modifiers, scenePos);
-                });
-        connect(adaptiveViewer, &CTiledVolumeViewer::sendSegmentationRadiusWheel,
-                this, [this, viewer](int steps, const QPointF& scenePoint, const cv::Vec3f& worldPos) {
-                    handleWheel(viewer, steps, scenePoint, worldPos);
-                });
-    } else if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewerObject)) {
+    if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewerObject)) {
         connect(chunkedViewer, &CChunkedVolumeViewer::sendMousePressVolume,
                 this, [this, viewer](const cv::Vec3f& worldPos,
                                      const cv::Vec3f& normal,

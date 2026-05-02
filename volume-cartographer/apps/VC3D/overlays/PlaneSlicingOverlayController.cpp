@@ -1,6 +1,5 @@
 #include "PlaneSlicingOverlayController.hpp"
 
-#include "../adaptive/CAdaptiveVolumeViewer.hpp"
 #include "../streaming/CChunkedVolumeViewer.hpp"
 #include "../VolumeViewerBase.hpp"
 #include "../CState.hpp"
@@ -111,20 +110,7 @@ void PlaneSlicingOverlayController::installInteractions(VolumeViewerBase* viewer
         return;
     }
 
-    if (auto* adaptiveViewer = qobject_cast<CTiledVolumeViewer*>(viewerObject)) {
-        state.pressConn = QObject::connect(adaptiveViewer, &CTiledVolumeViewer::sendMousePressVolume,
-                                           this, [this, viewer](cv::Vec3f volLoc, cv::Vec3f /*normal*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
-                                               handleMousePress(viewer, volLoc, button, modifiers);
-                                           });
-        state.moveConn = QObject::connect(adaptiveViewer, &CTiledVolumeViewer::sendMouseMoveVolume,
-                                          this, [this, viewer](cv::Vec3f volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers) {
-                                              handleMouseMove(viewer, volLoc, buttons, modifiers);
-                                          });
-        state.releaseConn = QObject::connect(adaptiveViewer, &CTiledVolumeViewer::sendMouseReleaseVolume,
-                                             this, [this, viewer](cv::Vec3f /*volLoc*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
-                                                 handleMouseRelease(viewer, button, modifiers);
-                                             });
-    } else if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewerObject)) {
+    if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewerObject)) {
         state.pressConn = QObject::connect(chunkedViewer, &CChunkedVolumeViewer::sendMousePressVolume,
                                            this, [this, viewer](cv::Vec3f volLoc, cv::Vec3f /*normal*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers, QPointF /*scenePos*/) {
                                                handleMousePress(viewer, volLoc, button, modifiers);

@@ -16,11 +16,7 @@
 #include "vc/core/util/SurfacePatchIndex.hpp"
 
 class QMdiArea;
-class CAdaptiveVolumeViewer;
 class CChunkedVolumeViewer;
-#ifndef CTiledVolumeViewer
-#define CTiledVolumeViewer CAdaptiveVolumeViewer
-#endif
 class CState;
 class VCCollection;
 class SegmentationOverlayController;
@@ -50,7 +46,6 @@ public:
                                    const QString& title,
                                    QMdiArea* mdiArea);
 
-    const std::vector<CTiledVolumeViewer*>& viewers() const { return _viewers; }
     const std::vector<VolumeViewerBase*>& baseViewers() const { return _baseViewers; }
 
     void setSegmentationOverlay(SegmentationOverlayController* overlay);
@@ -106,7 +101,6 @@ public:
     void setSliceStepSize(int size);
     int sliceStepSize() const { return _sliceStepSize; }
 
-    void forEachViewer(const std::function<void(CTiledVolumeViewer*)>& fn) const;
     void forEachBaseViewer(const std::function<void(VolumeViewerBase*)>& fn) const;
     void setIntersectionThickness(float thickness);
     float intersectionThickness() const { return _intersectionThickness; }
@@ -123,7 +117,6 @@ public:
     void beginShutdown() noexcept { _shuttingDown = true; }
 
 signals:
-    void viewerCreated(CTiledVolumeViewer* viewer);
     void baseViewerCreated(VolumeViewerBase* viewer);
     void overlayWindowChanged(float low, float high);
     void volumeWindowChanged(float low, float high);
@@ -156,7 +149,6 @@ private:
     };
 
     void registerOverlay(ViewerOverlayControllerBase* overlay);
-    bool useChunkedViewer() const;
     bool updateSurfacePatchIndexForSurface(const SurfacePatchIndex::SurfacePtr& quad, bool isEditUpdate);
     void queueSurfacePatchIndexTask(SurfacePatchIndexTask task);
     void startNextSurfacePatchIndexTask();
@@ -175,7 +167,6 @@ private:
     std::vector<ViewerOverlayControllerBase*> _allOverlays;
     bool _segmentationEditActive{false};
     SegmentationModule* _segmentationModule{nullptr};
-    std::vector<CTiledVolumeViewer*> _viewers;
     std::vector<VolumeViewerBase*> _baseViewers;
     std::unordered_map<VolumeViewerBase*, bool> _resetDefaults;
     float _intersectionOpacity{1.0f};

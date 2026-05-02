@@ -151,8 +151,6 @@ set(srcs
     CPointCollectionWidget.cpp
     elements/COutlinedTextItem.hpp
     elements/COutlinedTextItem.cpp
-    adaptive/CAdaptiveVolumeViewer.cpp
-    adaptive/CAdaptiveVolumeViewer.hpp
     streaming/CChunkedVolumeViewer.cpp
     streaming/CChunkedVolumeViewer.hpp
 )

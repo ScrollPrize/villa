@@ -5,7 +5,6 @@
 #include "../SegmentationModule.hpp"
 #include "../SegmentationWidget.hpp"
 
-#include "../../adaptive/CAdaptiveVolumeViewer.hpp"
 #include "../../CState.hpp"
 #include "../../ViewerManager.hpp"
 #include "../../SurfacePanelController.hpp"

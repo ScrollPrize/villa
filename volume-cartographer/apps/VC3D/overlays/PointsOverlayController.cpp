@@ -1,6 +1,5 @@
 #include "PointsOverlayController.hpp"
 
-#include "../adaptive/CAdaptiveVolumeViewer.hpp"
 #include "../VolumeViewerBase.hpp"
 #include "../ViewerManager.hpp"
 

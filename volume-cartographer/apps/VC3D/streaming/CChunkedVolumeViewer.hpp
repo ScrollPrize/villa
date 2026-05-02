@@ -55,6 +55,7 @@ public:
     void requestRender() override { scheduleRender(); }
     void invalidateVis() override {}
     void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) override;
+    void centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender = false) override;
     void adjustSurfaceOffset(float delta) override;
     void resetSurfaceOffsets() override;
     void fitSurfaceInView() override;
@@ -109,11 +110,11 @@ public:
     void clearOverlayGroup(const std::string& key) override;
     void clearAllOverlayGroups() override;
 
-    std::vector<std::pair<QRectF, QColor>> selections() const override { return {}; }
-    std::optional<QRectF> activeBBoxSceneRect() const override { return std::nullopt; }
-    void setBBoxMode(bool) override {}
-    QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF&) override { return nullptr; }
-    void clearSelections() override {}
+    std::vector<std::pair<QRectF, QColor>> selections() const override;
+    std::optional<QRectF> activeBBoxSceneRect() const override;
+    void setBBoxMode(bool enabled) override;
+    QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF& sceneRect) override;
+    void clearSelections() override;
 
     void renderIntersections() override;
     void invalidateIntersect(const std::string& = "") override;
@@ -135,6 +136,7 @@ public:
     QPointF volumeToScene(const cv::Vec3f& volPoint) override;
     cv::Vec3f sceneToVolume(const QPointF& scenePoint) const override;
     cv::Vec2f sceneToSurfaceCoords(const QPointF& scenePos) const override;
+    QPointF surfaceCoordsToScene(float surfX, float surfY) const override { return surfaceToScene(surfX, surfY); }
     void setLinkedCursorVolumePoint(const std::optional<cv::Vec3f>& point) override;
     QPointF lastScenePosition() const override { return _lastScenePos; }
 
@@ -165,6 +167,9 @@ public slots:
     void onKeyRelease(int, Qt::KeyboardModifiers) {}
     void onScrolled() {}
     void onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths);
+    void onCollectionSelected(uint64_t) {}
+    void onPointSelected(uint64_t) {}
+    void onDrawingModeActive(bool, float = 3.0f, bool = false) {}
     void onPOIChanged(const std::string& name, POI* poi);
     void adjustZoomByFactor(float factor) override;
 
@@ -236,6 +241,8 @@ private:
     void updateFocusMarker(POI* poi = nullptr);
     void clearIntersectionItems();
     void updateIntersectionPreviewTransform();
+    void renderFlattenedIntersections(const std::shared_ptr<Surface>& surf);
+    QRectF surfaceRectToSceneRect(const QRectF& surfRect) const;
 
     CState* _state = nullptr;
     ViewerManager* _viewerManager = nullptr;
@@ -341,6 +348,8 @@ private:
         size_t targetGenerationHash = 0;
         size_t activeSegHash = 0;
         size_t highlightedSurfaceHash = 0;
+        size_t flattenedPlanesHash = 0;
+        size_t cameraHash = 0;
         bool valid = false;
         bool operator==(const IntersectFingerprint&) const = default;
     };
@@ -378,4 +387,13 @@ private:
     std::unordered_map<std::string, std::vector<QGraphicsItem*>> _overlayGroups;
     QGraphicsItem* _cursorCrosshair = nullptr;
     QGraphicsItem* _focusMarker = nullptr;
+
+    bool _bboxMode = false;
+    QPointF _bboxStart;
+    std::optional<QRectF> _activeBBoxSurfRect;
+    struct Selection {
+        QRectF surfRect;
+        QColor color;
+    };
+    std::vector<Selection> _selections;
 };

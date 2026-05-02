@@ -20,7 +20,6 @@
 
 #include <opencv2/core.hpp>
 
-#include "../adaptive/CAdaptiveVolumeViewer.hpp"
 #include "../VolumeViewerBase.hpp"
 #include "tools/SegmentationEditManager.hpp"
 #include "tools/ManualAddTool.hpp"
@@ -38,10 +37,6 @@ inline constexpr int kStatusLong = 5000;
 
 
 class CState;
-class CAdaptiveVolumeViewer;
-#ifndef CTiledVolumeViewer
-#define CTiledVolumeViewer CAdaptiveVolumeViewer
-#endif
 class PlaneSurface;
 class Surface;
 class QuadSurface;

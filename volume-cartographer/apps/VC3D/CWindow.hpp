@@ -20,7 +20,6 @@
 
 #include "CPointCollectionWidget.hpp"
 #include "CState.hpp"
-#include "adaptive/CAdaptiveVolumeViewer.hpp"
 #include "DrawingWidget.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
@@ -33,6 +32,8 @@
 #include "overlays/PlaneSlicingOverlayController.hpp"
 #include "overlays/TransformOverlayController.hpp"
 #include "overlays/VolumeOverlayController.hpp"
+
+class CChunkedVolumeViewer;
 #include "ViewerManager.hpp"
 #include "segmentation/SegmentationWidget.hpp"
 #include "segmentation/growth/SegmentationGrowth.hpp"
@@ -172,9 +173,9 @@ private slots:
     void onAxisOverlayOpacityChanged(int value);
     void onSegmentationEditingModeChanged(bool enabled);
     void onSegmentationStopToolsRequested();
-    void configureViewerConnections(CTiledVolumeViewer* viewer);
+    void configureChunkedViewerConnections(CChunkedVolumeViewer* viewer);
 
-    CTiledVolumeViewer* segmentationViewer() const;
+    CChunkedVolumeViewer* segmentationViewer() const;
     VolumeViewerBase* segmentationBaseViewer() const;
     VolumeViewerBase* activeBaseViewer() const;
     void clearSurfaceSelection();

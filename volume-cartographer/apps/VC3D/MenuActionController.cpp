@@ -6,7 +6,6 @@
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
 #include "segmentation/SegmentationModule.hpp"
-#include "adaptive/CAdaptiveVolumeViewer.hpp"
 #include "CVolumeViewerView.hpp"
 #include "CommandLineToolRunner.hpp"
 #include "SettingsDialog.hpp"

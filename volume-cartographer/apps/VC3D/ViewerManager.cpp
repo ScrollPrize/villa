@@ -2,7 +2,6 @@
 
 #include "VCSettings.hpp"
 #include "VolumeViewerBase.hpp"
-#include "adaptive/CAdaptiveVolumeViewer.hpp"
 #include "streaming/CChunkedVolumeViewer.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 #include "overlays/PointsOverlayController.hpp"
@@ -18,7 +17,6 @@
 #include "vc/core/util/Logging.hpp"
 
 #include <QMdiArea>
-#include <QCoreApplication>
 #include <QThread>
 #include <QMdiSubWindow>
 #include <QSettings>
@@ -95,12 +93,6 @@ ViewerManager::ViewerManager(CState* state,
     }
 }
 
-bool ViewerManager::useChunkedViewer() const
-{
-    const auto* app = QCoreApplication::instance();
-    return app && app->property("vc3d/useChunkedViewer").toBool();
-}
-
 VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
                                               const QString& title,
                                               QMdiArea* mdiArea)
@@ -111,44 +103,23 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
 
     QWidget* widget = nullptr;
     VolumeViewerBase* baseViewer = nullptr;
-    CTiledVolumeViewer* adaptiveViewer = nullptr;
-    CChunkedVolumeViewer* chunkedViewer = nullptr;
-
-    if (useChunkedViewer()) {
-        chunkedViewer = new CChunkedVolumeViewer(_state, this, mdiArea);
-        widget = chunkedViewer;
-        baseViewer = chunkedViewer;
-    } else {
-        adaptiveViewer = new CTiledVolumeViewer(_state, this, mdiArea);
-        widget = adaptiveViewer;
-        baseViewer = adaptiveViewer;
-    }
+    auto* chunkedViewer = new CChunkedVolumeViewer(_state, this, mdiArea);
+    widget = chunkedViewer;
+    baseViewer = chunkedViewer;
 
     auto* win = mdiArea->addSubWindow(widget);
     win->setWindowTitle(title);
     win->setWindowFlags(Qt::WindowTitleHint | Qt::WindowMinMaxButtonsHint);
     win->installEventFilter(widget);
 
-    if (adaptiveViewer) {
-        adaptiveViewer->setPointCollection(_points);
-    }
-    if (chunkedViewer) {
-        chunkedViewer->setPointCollection(_points);
-    }
+    chunkedViewer->setPointCollection(_points);
 
     if (_state) {
-        if (adaptiveViewer) {
-            connect(_state, &CState::surfaceChanged, adaptiveViewer, &CTiledVolumeViewer::onSurfaceChanged);
-            connect(_state, &CState::surfaceWillBeDeleted, adaptiveViewer, &CTiledVolumeViewer::onSurfaceWillBeDeleted);
-            connect(_state, &CState::poiChanged, adaptiveViewer, &CTiledVolumeViewer::onPOIChanged);
-        }
-        if (chunkedViewer) {
-            connect(_state, &CState::surfaceChanged, chunkedViewer, &CChunkedVolumeViewer::onSurfaceChanged);
-            connect(_state, &CState::surfaceWillBeDeleted, chunkedViewer, &CChunkedVolumeViewer::onSurfaceWillBeDeleted);
-            connect(_state, &CState::poiChanged, chunkedViewer, &CChunkedVolumeViewer::onPOIChanged);
-            connect(_state, &CState::volumeChanged, chunkedViewer, &CChunkedVolumeViewer::OnVolumeChanged);
-            connect(_state, &CState::volumeClosing, chunkedViewer, &CChunkedVolumeViewer::onVolumeClosing);
-        }
+        connect(_state, &CState::surfaceChanged, chunkedViewer, &CChunkedVolumeViewer::onSurfaceChanged);
+        connect(_state, &CState::surfaceWillBeDeleted, chunkedViewer, &CChunkedVolumeViewer::onSurfaceWillBeDeleted);
+        connect(_state, &CState::poiChanged, chunkedViewer, &CChunkedVolumeViewer::onPOIChanged);
+        connect(_state, &CState::volumeChanged, chunkedViewer, &CChunkedVolumeViewer::OnVolumeChanged);
+        connect(_state, &CState::volumeClosing, chunkedViewer, &CChunkedVolumeViewer::onVolumeClosing);
     }
 
     // Restore persisted viewer preferences
@@ -173,16 +144,10 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
     baseViewer->setSegmentationEditActive(_segmentationEditActive);
     baseViewer->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
 
-    if (adaptiveViewer) {
-        _viewers.push_back(adaptiveViewer);
-    }
     _baseViewers.push_back(baseViewer);
 
     // Clean up when viewer is destroyed (e.g. MDI sub-window closed)
-    connect(widget, &QObject::destroyed, this, [this, baseViewer, adaptiveViewer]() {
-        if (adaptiveViewer) {
-            _viewers.erase(std::remove(_viewers.begin(), _viewers.end(), adaptiveViewer), _viewers.end());
-        }
+    connect(widget, &QObject::destroyed, this, [this, baseViewer]() {
         _resetDefaults.erase(baseViewer);
         _baseViewers.erase(std::remove(_baseViewers.begin(), _baseViewers.end(), baseViewer), _baseViewers.end());
     });
@@ -202,9 +167,6 @@ VolumeViewerBase* ViewerManager::createViewer(const std::string& surfaceName,
 
     if (_segmentationModule) {
         _segmentationModule->attachViewer(baseViewer);
-    }
-    if (adaptiveViewer) {
-        emit viewerCreated(adaptiveViewer);
     }
     emit baseViewerCreated(baseViewer);
     return baseViewer;
@@ -923,18 +885,6 @@ void ViewerManager::broadcastLinkedCursor(VolumeViewerBase* source,
 void ViewerManager::setSliceStepSize(int size)
 {
     _sliceStepSize = std::max(1, size);
-}
-
-void ViewerManager::forEachViewer(const std::function<void(CTiledVolumeViewer*)>& fn) const
-{
-    if (!fn) {
-        return;
-    }
-    for (auto* viewer : _viewers) {
-        if (viewer) {
-            fn(viewer);
-        }
-    }
 }
 
 void ViewerManager::forEachBaseViewer(const std::function<void(VolumeViewerBase*)>& fn) const
