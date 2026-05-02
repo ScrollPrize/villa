@@ -113,7 +113,12 @@ class SegmentRenderer {
 
 public:
     SegmentRenderer(const fs::path& volpkg_path, const std::string& volume_id) {
-        vpkg_ = VolumePkg::New(volpkg_path.string());
+        if (fs::is_directory(volpkg_path)) {
+            throw std::runtime_error(
+                "directory inputs are no longer supported; convert with vc_volpkg_convert "
+                + volpkg_path.string() + " <out.volpkg.json>");
+        }
+        vpkg_ = VolumePkg::load(volpkg_path);
 
         if (volume_id.empty()) {
             throw std::runtime_error("You must provide a volume id");
@@ -522,7 +527,7 @@ int main(int argc, char* argv[]) {
         desc.add_options()
             ("help,h", "Show help message")
             ("volpkg-path,v", po::value<std::string>()->required(),
-                "Path to volume package")
+                "Path to volume package JSON file (*.volpkg.json)")
             ("volume-id", po::value<std::string>()->required(),
                 "ID of volume to use")
             ("segment-id,s", po::value<std::string>()->required(),

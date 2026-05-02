@@ -113,6 +113,8 @@ set(srcs
     SurfacePanelController.hpp
     MenuActionController.cpp
     MenuActionController.hpp
+    UnifiedBrowserDialog.cpp
+    UnifiedBrowserDialog.hpp
     segmentation/SegmentationModule.cpp
     segmentation/SegmentationModule.hpp
     segmentation/growth/SegmentationCorrections.cpp
@@ -153,6 +155,10 @@ set(srcs
     ConsoleOutputWidget.cpp
     ConsoleOutputWidget.hpp
     CPointCollectionWidget.cpp
+    CFiberWidget.cpp
+    CFiberWidget.hpp
+    FiberAnnotationController.cpp
+    FiberAnnotationController.hpp
     elements/COutlinedTextItem.hpp
     elements/COutlinedTextItem.cpp
     volume_viewers/CChunkedVolumeViewer.cpp

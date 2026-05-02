@@ -32,6 +32,12 @@ public:
     float inPlaneRotation() const { return _inPlaneRotation; }
     cv::Vec3f basisX() const { return _vx; }
     cv::Vec3f basisY() const { return _vy; }
+
+    // Set plane from origin, normal, and up hint. Computes orthonormal basis
+    // directly: vx = cross(upHint, normal), vy = cross(normal, vx).
+    // Bypasses vxy_from_normal — no discontinuous sign flips.
+    void setFromNormalAndUp(cv::Vec3f origin, cv::Vec3f normal, cv::Vec3f upHint);
+
 protected:
     void update();
     cv::Vec3f _normal = {0,0,1};

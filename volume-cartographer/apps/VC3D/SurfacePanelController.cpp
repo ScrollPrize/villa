@@ -370,6 +370,14 @@ bool SurfacePanelController::isRemoteStub(const std::string& segmentId) const
     return _remoteStubSegments.count(segmentId) > 0;
 }
 
+void SurfacePanelController::refreshSurfaceList()
+{
+    if (!_volumePkg) return;
+    populateSurfaceTree();
+    applyFilters();
+    if (_filtersUpdated) _filtersUpdated();
+}
+
 void SurfacePanelController::loadSurfacesIncremental()
 {
     if (!_volumePkg) {
@@ -553,27 +561,35 @@ void SurfacePanelController::populateSurfaceTree()
 
     const QSignalBlocker blocker{_ui.treeWidget};
     _ui.treeWidget->clear();
+    _remoteStubSegments.clear();
 
     for (const auto& id : _volumePkg->segmentationIDs()) {
         auto surf = _volumePkg->getSurface(id);
-        if (!surf) {
-            continue;
-        }
 
         auto* item = new SurfaceTreeWidgetItem(_ui.treeWidget);
-        item->setText(SURFACE_ID_COLUMN, QString::fromStdString(id));
         item->setData(SURFACE_ID_COLUMN, Qt::UserRole, QString::fromStdString(id));
-        const double areaCm2 = vc::json::number_or(surf->meta, "area_cm2", -1.0);
-        const double avgCost = vc::json::number_or(surf->meta, "avg_cost", -1.0);
-        item->setText(2, QString::number(areaCm2, 'f', 3));
-        item->setText(3, QString::number(avgCost, 'f', 3));
-        item->setText(4, QString::number(surf->overlappingIds().size()));
-        QString timestamp;
-        if (!surf->meta.is_null() && surf->meta.contains("date_last_modified")) {
-            timestamp = QString::fromStdString(surf->meta["date_last_modified"].get_string());
+
+        if (surf) {
+            item->setText(SURFACE_ID_COLUMN, QString::fromStdString(id));
+            const double areaCm2 = vc::json::number_or(surf->meta, "area_cm2", -1.0);
+            const double avgCost = vc::json::number_or(surf->meta, "avg_cost", -1.0);
+            item->setText(2, QString::number(areaCm2, 'f', 3));
+            item->setText(3, QString::number(avgCost, 'f', 3));
+            item->setText(4, QString::number(surf->overlappingIds().size()));
+            QString timestamp;
+            if (!surf->meta.is_null() && surf->meta.contains("date_last_modified")) {
+                timestamp = QString::fromStdString(surf->meta["date_last_modified"].get_string());
+            }
+            item->setText(5, timestamp);
+            updateTreeItemIcon(item);
+        } else if (_volumePkg->isRemoteSegment(id) && !_volumePkg->isRemoteSegmentCached(id)) {
+            item->setText(SURFACE_ID_COLUMN,
+                QString::fromStdString(id) + QStringLiteral(" [remote]"));
+            item->setForeground(SURFACE_ID_COLUMN, QBrush(Qt::gray));
+            _remoteStubSegments.insert(id);
+        } else {
+            delete item;
         }
-        item->setText(5, timestamp);
-        updateTreeItemIcon(item);
     }
 
     _ui.treeWidget->resizeColumnToContents(0);

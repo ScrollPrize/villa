@@ -6,18 +6,21 @@
 
 namespace vc3d {
 
-// Prefer /ephemeral/VC3D when the host has local NVMe instance storage
-// mounted there (see scripts/build_dependencies.sh); fall back to ~/.VC3D.
+// Prefer fast local storage when available — /ephemeral (NVMe instance store
+// set up by scripts/build_dependencies.sh) or /volpkgs (manually-mounted
+// scratch volume), whichever exists first. Fall back to ~/.VC3D.
 // Cached on first call because filesystem state doesn't change during a run.
 inline QString defaultCacheBase()
 {
     static const QString base = []() {
-        const QString eph = QStringLiteral("/ephemeral");
-        QFileInfo fi(eph);
-        if (fi.isDir() && fi.isWritable()) {
-            QString p = eph + "/VC3D";
-            QDir().mkpath(p);
-            return p;
+        for (const QString& root : {QStringLiteral("/ephemeral"),
+                                    QStringLiteral("/volpkgs")}) {
+            QFileInfo fi(root);
+            if (fi.isDir() && fi.isWritable()) {
+                QString p = root + "/VC3D";
+                QDir().mkpath(p);
+                return p;
+            }
         }
         return QDir::homePath() + "/.VC3D";
     }();
@@ -47,10 +50,10 @@ namespace settings {
 // -----------------------------------------------------------------------------
 // Volume Package Settings
 // -----------------------------------------------------------------------------
-namespace volpkg {
-    constexpr auto DEFAULT_PATH = "volpkg/default_path";
-    constexpr auto AUTO_OPEN = "volpkg/auto_open";
-    constexpr auto RECENT = "volpkg/recent";
+namespace project {
+    constexpr auto DEFAULT_PATH = "project/default_path";
+    constexpr auto AUTO_OPEN = "project/auto_open";
+    constexpr auto RECENT = "project/recent";
 
     constexpr bool AUTO_OPEN_DEFAULT = true;
 }
@@ -185,6 +188,13 @@ namespace perf {
     constexpr int DOWNSCALE_OVERRIDE_DEFAULT = 0;
     constexpr bool ENABLE_FILE_WATCHING_DEFAULT = true;
     constexpr int RAM_CACHE_SIZE_GB_DEFAULT = 10;
+
+    // When true the disk cache stores c3d-compressed sharded zarr (smaller,
+    // lossy).  When false it stores source chunk bytes unchanged at the
+    // volume's native chunk size (larger, lossless).  Both modes use
+    // independent directories so they can coexist.  Requires restart.
+    constexpr auto DISK_CACHE_COMPRESSED = "perf/disk_cache_compressed";
+    constexpr bool DISK_CACHE_COMPRESSED_DEFAULT = true;
 
     // LOD synthesis method.  Selects how c3d chunks are decoded when a
     // downscaled view is requested.  Value is one of:

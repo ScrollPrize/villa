@@ -19,6 +19,7 @@
 #include <map>
 
 #include "CPointCollectionWidget.hpp"
+#include "CFiberWidget.hpp"
 #include "CState.hpp"
 #include "segmentation/tools/SegmentationEditManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
@@ -50,6 +51,7 @@ static constexpr int VOLPKG_MIN_VERSION = 6;
 
 //forward declaration to avoid circular inclusion as CommandLineToolRunner needs CWindow.hpp
 class CommandLineToolRunner;
+class FiberAnnotationController;
 class SegmentationModule;
 class SurfacePanelController;
 class MenuActionController;
@@ -165,6 +167,10 @@ private slots:
     void onSliceStepSizeChanged(int newSize);
     void onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf);
     void onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId);
+    void onNewFiberRequested();
+    void onFiberCrosshairModeChanged(bool active);
+    void onFiberViewersRequested();
+    void onFiberAnnotationFinished(uint64_t fiberId);
     void refreshVolumeSelectionUi(const QString& preferredVolumeId = QString());
 
 private:
@@ -178,6 +184,8 @@ private:
     SegmentationWidget* _segmentationWidget{nullptr};
     QDockWidget* _lasagnaDock{nullptr};
     CPointCollectionWidget* _point_collection_widget;
+    CFiberWidget* _fiberWidget{nullptr};
+    std::unique_ptr<FiberAnnotationController> _fiberController;
 
     SurfaceTreeWidget *treeWidgetSurfaces;
     QPushButton *btnReloadSurfaces;

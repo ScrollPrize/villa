@@ -673,9 +673,11 @@ struct LoadedSurface {
     bool loadedForIndex = false;
 };
 
-struct MappedSurfaceForIndex {
+struct SurfaceForIndex {
     SurfacePtr surface;
     std::shared_ptr<MappedTifxyzSurface> mapped;
+    int rows = 0;
+    int cols = 0;
 };
 
 std::vector<LoadedSurface> loadSurfacesInBatches(const std::vector<SurfacePtr>& surfaces)
@@ -1740,7 +1742,7 @@ SurfacePatchIndex::Impl::collectEntriesForRebuild(QuadSurface* surface,
 
     for (int row = 0; row < cellRowCount; row += samplingStride) {
         for (int col = 0; col < cellColCount; col += samplingStride) {
-            Entry entry;
+            Entry entry{Box3{}, PatchRecord{}};
             if (!buildEntryForCell(surface, points, col, row, samplingStride, bboxPadding, entry)) {
                 continue;
             }
@@ -1834,7 +1836,7 @@ SurfacePatchIndex::Impl::collectMappedEntriesForRebuild(QuadSurface* surface,
 
     for (int row = 0; row < cellRowCount; row += samplingStride) {
         for (int col = 0; col < cellColCount; col += samplingStride) {
-            Entry entry;
+            Entry entry{Box3{}, PatchRecord{}};
             if (!buildMappedEntryForCell(surface, points, col, row, samplingStride, bboxPadding, entry)) {
                 continue;
             }
@@ -1857,22 +1859,55 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     impl_->surfaceRecords.clear();
     impl_->patchCount = 0;
 
-    std::vector<MappedSurfaceForIndex> mappedSurfaces;
-    mappedSurfaces.reserve(surfaces.size());
+    std::vector<SurfaceForIndex> indexSurfaces;
+    indexSurfaces.reserve(surfaces.size());
     for (const auto& surface : surfaces) {
         if (!surface) {
             continue;
         }
-        if (surface->path.empty()) {
-            throw std::runtime_error("SurfacePatchIndex mmap rebuild requires disk-backed tifxyz surfaces: " + surface->id);
+        std::shared_ptr<MappedTifxyzSurface> mapped;
+        if (!surface->path.empty()) {
+            try {
+                mapped = std::make_shared<MappedTifxyzSurface>(surface->path);
+            } catch (const std::exception& e) {
+                std::cerr << "[SurfacePatchIndex] mmap unavailable for "
+                          << surface->id << ": " << e.what()
+                          << " -- falling back to loaded points" << std::endl;
+            }
         }
-        auto mapped = std::make_shared<MappedTifxyzSurface>(surface->path);
-        mappedSurfaces.push_back(MappedSurfaceForIndex{surface, std::move(mapped)});
+
+        int rows = 0;
+        int cols = 0;
+        if (mapped) {
+            rows = mapped->rows();
+            cols = mapped->cols();
+        } else {
+            try {
+                const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr();
+                if (points) {
+                    rows = points->rows;
+                    cols = points->cols;
+                }
+            } catch (const std::exception& e) {
+                std::cerr << "[SurfacePatchIndex] failed to load fallback points for "
+                          << surface->id << ": " << e.what()
+                          << " -- skipping surface" << std::endl;
+                continue;
+            }
+        }
+
+        if (rows < 2 || cols < 2) {
+            std::cerr << "[SurfacePatchIndex] skipping surface with insufficient points: "
+                      << surface->id << " rows=" << rows << " cols=" << cols << std::endl;
+            continue;
+        }
+        indexSurfaces.push_back(SurfaceForIndex{surface, std::move(mapped), rows, cols});
     }
 
-    const size_t surfaceCount = mappedSurfaces.size();
+    const size_t surfaceCount = indexSurfaces.size();
     if (DebugLoggingEnabled()) {
-        std::cout << "[SurfacePatchIndex] rebuild: " << surfaceCount << " of " << surfaces.size() << " surfaces mmap-opened" << std::endl;
+        std::cout << "[SurfacePatchIndex] rebuild: " << surfaceCount
+                  << " of " << surfaces.size() << " surfaces available" << std::endl;
     }
     if (surfaceCount == 0) {
         impl_->tree.reset();
@@ -1892,12 +1927,12 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     if (debugLogging) {
         std::cout << "[SurfacePatchIndex] creating masks for " << surfaceCount << " surfaces" << std::endl;
     }
-    for (const auto& item : mappedSurfaces) {
+    for (const auto& item : indexSurfaces) {
         Impl::SurfaceRecord& rec = impl_->surfaceRecords[item.surface.get()];
         rec.surface = item.surface;
         rec.mapped = item.mapped;
-        rec.mask.ensureSize(std::max(0, item.mapped->rows() - 1),
-                            std::max(0, item.mapped->cols() - 1),
+        rec.mask.ensureSize(std::max(0, item.rows - 1),
+                            std::max(0, item.cols - 1),
                             stride);
     }
 
@@ -1910,11 +1945,26 @@ void SurfacePatchIndex::rebuild(const std::vector<SurfacePtr>& surfaces, float b
     // Parallel phase: collect entries and update masks for each surface
     #pragma omp parallel for schedule(dynamic, 1)
     for (size_t i = 0; i < surfaceCount; ++i) {
-        const SurfacePtr& surface = mappedSurfaces[i].surface;
+        const SurfacePtr& surface = indexSurfaces[i].surface;
         auto* rec = impl_->getRecord(surface.get());
-        if (rec && mappedSurfaces[i].mapped) {
-            perSurfaceEntries[i] = Impl::collectMappedEntriesForRebuild(
-                surface.get(), *mappedSurfaces[i].mapped, rec->mask, padding, stride);
+        if (rec) {
+            if (indexSurfaces[i].mapped) {
+                perSurfaceEntries[i] = Impl::collectMappedEntriesForRebuild(
+                    surface.get(), *indexSurfaces[i].mapped, rec->mask, padding, stride);
+            } else {
+                try {
+                    if (const cv::Mat_<cv::Vec3f>* points = surface->rawPointsPtr()) {
+                        perSurfaceEntries[i] = Impl::collectEntriesForRebuild(
+                            surface.get(), *points, rec->mask, padding, stride);
+                    }
+                } catch (const std::exception& e) {
+                    #pragma omp critical(surface_patch_index_fallback_warning)
+                    {
+                        std::cerr << "[SurfacePatchIndex] failed to index fallback points for "
+                                  << surface->id << ": " << e.what() << std::endl;
+                    }
+                }
+            }
         }
 
         const size_t done = indexedSurfaces.fetch_add(1, std::memory_order_relaxed) + 1;
@@ -3085,7 +3135,7 @@ bool SurfacePatchIndex::Impl::buildCellEntry(const SurfacePtr& surface,
                                              float bboxPadding,
                                              CellEntry& outEntry)
 {
-    Entry entry;
+    Entry entry{Box3{}, PatchRecord{}};
     if (!buildEntryForCell(surface.get(), points, col, row, stride, bboxPadding, entry)) {
         return false;
     }

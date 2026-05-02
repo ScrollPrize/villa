@@ -318,6 +318,7 @@ void CVolumeViewerView::keyPressEvent(QKeyEvent *event)
     }
 
     QGraphicsView::keyPressEvent(event);
+    event->ignore();  // let unhandled keys propagate to CWindow
 }
 
 void CVolumeViewerView::keyReleaseEvent(QKeyEvent *event)
@@ -398,6 +399,13 @@ void CVolumeViewerView::mouseDoubleClickEvent(QMouseEvent *event)
     if (event->button() == Qt::LeftButton && pointInTiltHandle(event->position())) {
         _tiltHandleDragging = false;
         emit sendTiltHandleReset();
+        event->accept();
+        return;
+    }
+    if (event->button() == Qt::LeftButton) {
+        QPointF global_loc = viewport()->mapFromGlobal(event->globalPosition());
+        QPointF scene_loc = mapToScene({int(global_loc.x()), int(global_loc.y())});
+        emit sendMouseDoubleClick(scene_loc, event->button(), event->modifiers());
         event->accept();
         return;
     }

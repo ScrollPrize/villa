@@ -6,6 +6,10 @@ import torch.nn.functional as F
 import model as fit_model
 
 
+WINDING_DENSITY_BARRIER_MARGIN = 0.2
+WINDING_DENSITY_BARRIER_SCALE = 10.0
+
+
 def winding_density_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tensor, torch.Tensor]:
 	"""Return (lm, mask) for winding-density period-sum loss.
 
@@ -81,9 +85,11 @@ def winding_density_loss_maps(*, res: fit_model.FitResult3D) -> tuple[torch.Tens
 		# Midpoint-rule line integral
 		integral = mag.mean(dim=-1) * signed_len  # (D, H, W)
 
-		# Huber loss on (integral - target): handles target=0 and near-zero integrals
+		# L2 loss on signed integral residual plus a squared hinge barrier for
+		# near-zero / wrong-side signed integrals.
 		err = integral - target
-		lm = torch.where(err.abs() <= 1.0, 0.5 * err * err, err.abs() - 0.5)  # (D, H, W)
+		barrier_err = torch.relu(WINDING_DENSITY_BARRIER_MARGIN - integral) * WINDING_DENSITY_BARRIER_SCALE
+		lm = err * err + barrier_err * barrier_err  # (D, H, W)
 
 		# Strip validity: all sample points must have grad_mag > 0
 		sv = (sampled.grad_mag.squeeze(0).squeeze(0) > 0.0).to(dtype=dtype)

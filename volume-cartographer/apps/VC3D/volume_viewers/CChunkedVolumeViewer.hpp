@@ -184,6 +184,8 @@ signals:
                              Qt::KeyboardModifiers modifiers, QPointF scenePos);
     void sendMouseReleaseVolume(cv::Vec3f volLoc, Qt::MouseButton button,
                                 Qt::KeyboardModifiers modifiers, QPointF scenePos);
+    void sendMouseDoubleClickVolume(cv::Vec3f volLoc, Qt::MouseButton button,
+                                    Qt::KeyboardModifiers modifiers);
     void sendCollectionSelected(uint64_t collectionId);
     void pointSelected(uint64_t pointId);
     void pointClicked(uint64_t pointId);

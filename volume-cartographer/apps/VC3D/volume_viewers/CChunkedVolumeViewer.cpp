@@ -323,6 +323,10 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     connect(_view, &CVolumeViewerView::sendMousePress, this, &CChunkedVolumeViewer::onMousePress);
     connect(_view, &CVolumeViewerView::sendMouseMove, this, &CChunkedVolumeViewer::onMouseMove);
     connect(_view, &CVolumeViewerView::sendMouseRelease, this, &CChunkedVolumeViewer::onMouseRelease);
+    connect(_view, &CVolumeViewerView::sendMouseDoubleClick, this,
+            [this](QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
+                emit sendMouseDoubleClickVolume(sceneToVolume(scenePos), button, modifiers);
+            });
     connect(_view, &CVolumeViewerView::sendKeyPress, this, &CChunkedVolumeViewer::onKeyPress);
     connect(_view, &CVolumeViewerView::sendKeyRelease, this, &CChunkedVolumeViewer::onKeyRelease);
 

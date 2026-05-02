@@ -48,14 +48,10 @@ std::string CState::currentVolumeId() const { return _currentVolumeId; }
 
 void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
-    fprintf(stderr, "[CState] setCurrentVolume: begin (old=%p new=%p)\n",
-            (void*)_currentVolume.get(), (void*)vol.get());
     _currentVolume = std::move(vol);
     applyCacheBudget(_currentVolume);
     resolveCurrentVolumeId();
-    fprintf(stderr, "[CState] emitting volumeChanged\n");
     emit volumeChanged(_currentVolume, _currentVolumeId);
-    fprintf(stderr, "[CState] setCurrentVolume: done\n");
 }
 
 std::string CState::segmentationGrowthVolumeId() const { return _segmentationGrowthVolumeId; }
@@ -138,13 +134,14 @@ void CState::closeAll()
         }
     }
 
-    _vpkg = nullptr;
     _currentVolume = nullptr;
     _currentVolumeId.clear();
     _segmentationGrowthVolumeId.clear();
 
     _pois.clear();
     _pointCollection->clearAll();
+
+    setVpkg(nullptr);
 }
 
 // --- Surface methods (from CSurfaceCollection) ---

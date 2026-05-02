@@ -594,10 +594,10 @@
           <item row="2" column="0" colspan="3">
            <widget class="QCheckBox" name="chkVideoRecompress">
             <property name="text">
-             <string>Recompress remote chunks with video codec (reduces local cache disk usage)</string>
+             <string>Compress disk cache (c3d)</string>
             </property>
             <property name="toolTip">
-             <string>When enabled, chunks fetched from remote volumes are re-encoded with a video codec before storing to the disk cache. This significantly reduces disk usage at the cost of some quality loss. Requires restart.</string>
+             <string>When enabled, chunks fetched from remote volumes are re-encoded with the c3d codec before storing to the disk cache. Reduces disk usage but is lossy. When disabled, source chunk bytes are stored unchanged at the source volume's native chunk size. Both modes use separate directories. Requires restart.</string>
             </property>
            </widget>
           </item>

@@ -1,6 +1,7 @@
 #include "MenuActionController.hpp"
 
 #include "VCSettings.hpp"
+#include "UnifiedBrowserDialog.hpp"
 #include "CWindow.hpp"
 #include "SurfacePanelController.hpp"
 #include "ViewerManager.hpp"
@@ -18,6 +19,7 @@
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/util/LoadJson.hpp"
 #include "vc/core/util/RemoteUrl.hpp"
+#include "vc/core/util/VolpkgConvert.hpp"
 #include "vc/core/types/Segmentation.hpp"
 
 #include <QAction>
@@ -56,8 +58,10 @@
 #include "utils/Json.hpp"
 
 #include <algorithm>
+#include <fstream>
 #include <filesystem>
 #include <unordered_map>
+#include <vector>
 
 namespace
 {
@@ -65,46 +69,6 @@ constexpr auto kRemoteVolumeRegistryFile = "remote_volumes.json";
 constexpr int kMaxStoredRemoteUrls = 10;
 QString extractExceptionMessage(const std::exception& e);
 bool isAuthError(const QString& msg);
-
-static bool run_cli(QWidget* parent, const QString& program, const QStringList& args, QString* outLog = nullptr)
-{
-    QProcess process;
-    process.setProcessChannelMode(QProcess::MergedChannels);
-    process.start(program, args);
-    if (!process.waitForStarted()) {
-        QMessageBox::critical(parent, QObject::tr("Error"), QObject::tr("Failed to start %1").arg(program));
-        return false;
-    }
-    process.waitForFinished(-1);
-    const QString log = process.readAll();
-    if (outLog) {
-        *outLog = log;
-    }
-    if (process.exitStatus() != QProcess::NormalExit || process.exitCode() != 0) {
-        QMessageBox::critical(parent, QObject::tr("Command Failed"),
-                              QObject::tr("%1 exited with code %2.\n\n%3")
-                                  .arg(program)
-                                  .arg(process.exitCode())
-                                  .arg(log));
-        return false;
-    }
-    return true;
-}
-
-static QString find_tool(const char* baseName)
-{
-#ifdef _WIN32
-    const QString exe = QString::fromLatin1(baseName) + ".exe";
-#else
-    const QString exe = QString::fromLatin1(baseName);
-#endif
-    const QString appDir = QCoreApplication::applicationDirPath();
-    const QString local = appDir + QDir::separator() + exe;
-    if (QFileInfo::exists(local)) {
-        return local;
-    }
-    return exe;
-}
 
 } // namespace
 
@@ -124,7 +88,31 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
     auto* qWindow = _window;
 
     // Create actions
-    _openAct = new QAction(qWindow->style()->standardIcon(QStyle::SP_DialogOpenButton), QObject::tr("&Open volpkg..."), this);
+    _newProjectAct = new QAction(QObject::tr("&New Project"), this);
+    connect(_newProjectAct, &QAction::triggered, this, &MenuActionController::newProject);
+
+    _saveProjectAsAct = new QAction(QObject::tr("Save Project &As..."), this);
+    connect(_saveProjectAsAct, &QAction::triggered, this, &MenuActionController::saveProjectAs);
+
+    _attachVolumeAct = new QAction(QObject::tr("Attach &Volume..."), this);
+    connect(_attachVolumeAct, &QAction::triggered, this, &MenuActionController::attachVolume);
+
+    _attachSegmentsAct = new QAction(QObject::tr("Attach Se&gments..."), this);
+    connect(_attachSegmentsAct, &QAction::triggered, this, &MenuActionController::attachSegments);
+
+    _attachNormalGridAct = new QAction(QObject::tr("Attach &Normal Grid..."), this);
+    connect(_attachNormalGridAct, &QAction::triggered, this, &MenuActionController::attachNormalGrid);
+
+    _detachEntryAct = new QAction(QObject::tr("&Detach..."), this);
+    connect(_detachEntryAct, &QAction::triggered, this, &MenuActionController::detachEntry);
+
+    _setOutputSegmentsAct = new QAction(QObject::tr("Set Output Segments..."), this);
+    connect(_setOutputSegmentsAct, &QAction::triggered, this, &MenuActionController::setOutputSegments);
+
+    _convertLegacyAct = new QAction(QObject::tr("Convert Legacy Volpkg..."), this);
+    connect(_convertLegacyAct, &QAction::triggered, this, &MenuActionController::convertLegacyVolpkg);
+
+    _openAct = new QAction(qWindow->style()->standardIcon(QStyle::SP_DialogOpenButton), QObject::tr("&Open Project..."), this);
     _openAct->setShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::OpenVolpkg));
     connect(_openAct, &QAction::triggered, this, &MenuActionController::openVolpkg);
 
@@ -177,11 +165,22 @@ void MenuActionController::populateMenus(QMenuBar* menuBar)
 
     // Build menus
     _fileMenu = new QMenu(QObject::tr("&File"), qWindow);
+    _fileMenu->addAction(_newProjectAct);
     _fileMenu->addAction(_openAct);
+    _fileMenu->addAction(_saveProjectAsAct);
+    _fileMenu->addSeparator();
+    _fileMenu->addAction(_attachVolumeAct);
+    _fileMenu->addAction(_attachSegmentsAct);
+    _fileMenu->addAction(_attachNormalGridAct);
+    _fileMenu->addAction(_detachEntryAct);
+    _fileMenu->addAction(_setOutputSegmentsAct);
+    _fileMenu->addSeparator();
+    _fileMenu->addAction(_convertLegacyAct);
+    _fileMenu->addSeparator();
     _fileMenu->addAction(_openLocalZarrAct);
     _fileMenu->addAction(_attachRemoteZarrAct);
 
-    _recentMenu = new QMenu(QObject::tr("Open &recent volpkg"), _fileMenu);
+    _recentMenu = new QMenu(QObject::tr("Open &recent project"), _fileMenu);
     _recentMenu->setEnabled(false);
     _fileMenu->addMenu(_recentMenu);
 
@@ -256,13 +255,13 @@ void MenuActionController::ensureRecentActions()
 QStringList MenuActionController::loadRecentPaths() const
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    return settings.value(vc3d::settings::volpkg::RECENT).toStringList();
+    return settings.value(vc3d::settings::project::RECENT).toStringList();
 }
 
 void MenuActionController::saveRecentPaths(const QStringList& paths)
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue(vc3d::settings::volpkg::RECENT, paths);
+    settings.setValue(vc3d::settings::project::RECENT, paths);
 }
 
 void MenuActionController::refreshRecentMenu()
@@ -331,56 +330,24 @@ void MenuActionController::openVolpkg()
     if (!_window) {
         return;
     }
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    auto file = promptLocation(QObject::tr("Open Project"),
+        QObject::tr("Pick a .volpkg.json file, a legacy volpkg folder, or a remote volpkg URL."),
+        settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
+        {"*.volpkg.json"}, true, true);
+    if (file.isEmpty()) return;
 
+    if (!file.endsWith(".volpkg.json", Qt::CaseInsensitive)) {
+        QMessageBox::information(_window, QObject::tr("Convert to .volpkg.json"),
+            QObject::tr("This needs to be converted to a .volpkg.json — pick where to save the converted project."));
+        QString converted;
+        if (!runLegacyVolpkgConvert(file, &converted)) return;
+        file = converted;
+    }
     _window->CloseVolume();
-    _window->OpenVolume(QString());
+    _window->OpenVolume(file);
     loadAttachedRemoteVolumesForCurrentPackage();
     _window->UpdateView();
-}
-
-void MenuActionController::openLocalZarr()
-{
-    if (!_window) return;
-
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    QString dir = QFileDialog::getExistingDirectory(
-        _window,
-        QObject::tr("Open Local OME-Zarr Directory"),
-        settings.value(vc3d::settings::volpkg::DEFAULT_PATH).toString(),
-        QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks |
-        QFileDialog::ReadOnly | QFileDialog::DontUseNativeDialog);
-
-    if (dir.isEmpty()) return;
-
-    auto path = std::filesystem::path(dir.toStdString());
-
-    // Validate that this looks like a zarr directory
-    if (!Volume::checkDir(path)) {
-        QMessageBox::warning(
-            _window, QObject::tr("Not a Zarr Volume"),
-            QObject::tr("The selected directory does not appear to be an "
-                         "OME-Zarr volume (no .zgroup, .zattrs, or meta.json found)."));
-        return;
-    }
-
-    try {
-        auto vol = Volume::New(path);
-        _window->CloseVolume();
-        _window->setVolume(vol);
-        _window->UpdateView();
-
-        if (_window->statusBar()) {
-            _window->statusBar()->showMessage(
-                QObject::tr("Opened local zarr: %1")
-                    .arg(QString::fromStdString(vol->id())),
-                5000);
-        }
-    } catch (const std::exception& e) {
-        QMessageBox::critical(
-            _window, QObject::tr("Error Opening Zarr"),
-            QObject::tr("Failed to open zarr volume:\n%1")
-                .arg(QString::fromStdString(e.what())));
-    }
 }
 
 void MenuActionController::openRecentVolpkg()
@@ -1088,9 +1055,13 @@ void MenuActionController::importObjAsPatch()
         return;
     }
 
-    auto pathsDirFs = std::filesystem::path(_window->_state->vpkg()->getVolpkgDirectory()) /
-                      std::filesystem::path(_window->_state->vpkg()->getSegmentationDirectory());
-    QString pathsDir = QString::fromStdString(pathsDirFs.string());
+    const auto outDir = _window->_state->vpkg()->outputSegmentsPath();
+    if (outDir.empty()) {
+        QMessageBox::warning(_window, QObject::tr("Error"),
+                             QObject::tr("Project has no output segments directory configured."));
+        return;
+    }
+    QString pathsDir = QString::fromStdString(outDir.string());
 
     QStringList successfulIds;
     QStringList failedFiles;
@@ -1171,4 +1142,273 @@ void MenuActionController::beginRotateSurfaceTransform()
     if (_window->statusBar()) {
         _window->statusBar()->showMessage(QObject::tr("Surface rotation active"), 3000);
     }
+}
+
+void MenuActionController::newProject()
+{
+    if (!_window) return;
+    auto pkg = VolumePkg::newEmpty();
+    pkg->saveAutosave();
+    _window->_state->setVpkg(pkg);
+    _window->refreshCurrentVolumePackageUi(QString(), true);
+}
+
+void MenuActionController::saveProjectAs()
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    QString defaultDir = settings.value(vc3d::settings::project::DEFAULT_PATH).toString();
+    QString file = QFileDialog::getSaveFileName(
+        _window, QObject::tr("Save Project As"), defaultDir,
+        QObject::tr("Project (*.volpkg.json)"));
+    if (file.isEmpty()) return;
+    if (!file.endsWith(".volpkg.json", Qt::CaseInsensitive)) file += ".volpkg.json";
+    try {
+        _window->_state->vpkg()->save(std::filesystem::path(file.toStdString()));
+        settings.setValue(vc3d::settings::project::DEFAULT_PATH, QFileInfo(file).absolutePath());
+        updateRecentVolpkgList(file);
+    } catch (const std::exception& e) {
+        QMessageBox::warning(_window, QObject::tr("Save failed"), QString::fromUtf8(e.what()));
+    }
+}
+
+QString MenuActionController::promptLocation(const QString& title,
+                                             const QString& hint,
+                                             const QString& defaultDir,
+                                             const QStringList& localFilters,
+                                             bool acceptFiles,
+                                             bool acceptDirs)
+{
+    UnifiedBrowserDialog dlg(_window);
+    dlg.setWindowTitle(title);
+    dlg.setHint(hint);
+    dlg.setStartUri(defaultDir);
+    dlg.setLocalNameFilters(localFilters);
+    dlg.setAcceptsFiles(acceptFiles);
+    dlg.setAcceptsDirs(acceptDirs);
+    dlg.setAuthResolver([this](const QString& url, vc::HttpAuth* out, QString* err) {
+        return tryResolveRemoteAuth(url, out, true, err);
+    });
+    if (dlg.exec() != QDialog::Accepted) return {};
+    QString uri = dlg.selectedUri();
+    if (uri.startsWith("file://", Qt::CaseInsensitive)) uri = uri.mid(7);
+    const int schemeSep = uri.indexOf("://");
+    const int minLen = (schemeSep < 0) ? 1 : schemeSep + 4;
+    while (uri.size() > minLen && uri.endsWith('/')) uri.chop(1);
+    return uri;
+}
+
+void MenuActionController::attachVolume()
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    auto loc = promptLocation(QObject::tr("Attach Volume"),
+                              QObject::tr("Pick a zarr volume or a folder of zarrs (local or s3://, https://)."),
+                              settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
+                              {}, false, true);
+    if (loc.isEmpty()) return;
+    const auto err = vc::project::validateLocation(vc::project::Category::Volumes, loc.toStdString());
+    if (!err.empty()) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"),
+            QObject::tr("Not a valid volume location:\n\n%1").arg(QString::fromStdString(err)));
+        return;
+    }
+    bool ok = false;
+    QString tagsStr = QInputDialog::getText(_window, QObject::tr("Attach Volume"),
+        QObject::tr("Tags (comma-separated, optional; e.g. normal3d):"),
+        QLineEdit::Normal, QString(), &ok);
+    if (!ok) return;
+    std::vector<std::string> tags;
+    for (const auto& t : tagsStr.split(',', Qt::SkipEmptyParts)) {
+        const auto trimmed = t.trimmed().toStdString();
+        if (!trimmed.empty()) tags.push_back(trimmed);
+    }
+    if (!_window->_state->vpkg()->addVolumeEntry(loc.toStdString(), tags)) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Could not add volume (already attached?)"));
+        return;
+    }
+    _window->refreshCurrentVolumePackageUi(QString(), true);
+}
+
+void MenuActionController::attachSegments()
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    auto loc = promptLocation(QObject::tr("Attach Segments"),
+                              QObject::tr("Pick a segment or a folder of segments (local or s3://, https://)."),
+                              settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
+                              {}, false, true);
+    if (loc.isEmpty()) return;
+    const auto err = vc::project::validateLocation(vc::project::Category::Segments, loc.toStdString());
+    if (!err.empty()) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"),
+            QObject::tr("Not a valid segments location:\n\n%1").arg(QString::fromStdString(err)));
+        return;
+    }
+    auto pkg = _window->_state->vpkg();
+    if (!pkg->addSegmentsEntry(loc.toStdString())) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Could not add segments (already attached?)"));
+        return;
+    }
+    if (!pkg->hasOutputSegments()) pkg->setOutputSegments(loc.toStdString());
+    _window->refreshCurrentVolumePackageUi(QString(), true);
+}
+
+void MenuActionController::attachNormalGrid()
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    auto loc = promptLocation(QObject::tr("Attach Normal Grid"),
+                              QObject::tr("Pick a normal_grids root (xy/xz/yz subdirs)."),
+                              settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
+                              {}, false, true);
+    if (loc.isEmpty()) return;
+    const auto err = vc::project::validateLocation(vc::project::Category::NormalGrids, loc.toStdString());
+    if (!err.empty()) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"),
+            QObject::tr("Not a valid normal-grid location:\n\n%1").arg(QString::fromStdString(err)));
+        return;
+    }
+    if (!_window->_state->vpkg()->addNormalGridEntry(loc.toStdString())) {
+        QMessageBox::warning(_window, QObject::tr("Attach failed"), QObject::tr("Could not add normal grid (already attached?)"));
+        return;
+    }
+    _window->refreshCurrentVolumePackageUi(QString(), true);
+}
+
+void MenuActionController::detachEntry()
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    auto pkg = _window->_state->vpkg();
+    QStringList items;
+    QStringList locations;
+    for (const auto& e : pkg->volumeEntries()) {
+        items << QObject::tr("[volume] %1").arg(QString::fromStdString(e.location));
+        locations << QString::fromStdString(e.location);
+    }
+    for (const auto& e : pkg->segmentEntries()) {
+        items << QObject::tr("[segments] %1").arg(QString::fromStdString(e.location));
+        locations << QString::fromStdString(e.location);
+    }
+    for (const auto& e : pkg->normalGridEntries()) {
+        items << QObject::tr("[normal_grid] %1").arg(QString::fromStdString(e.location));
+        locations << QString::fromStdString(e.location);
+    }
+    if (items.isEmpty()) {
+        QMessageBox::information(_window, QObject::tr("Detach"),
+            QObject::tr("Nothing to detach — project has no entries."));
+        return;
+    }
+    bool ok = false;
+    const QString picked = QInputDialog::getItem(_window, QObject::tr("Detach"),
+        QObject::tr("Select an entry to remove from the project:"),
+        items, 0, false, &ok);
+    if (!ok || picked.isEmpty()) return;
+    const int idx = items.indexOf(picked);
+    if (idx < 0) return;
+    const QString loc = locations.at(idx);
+    if (QMessageBox::question(_window, QObject::tr("Detach"),
+            QObject::tr("Remove this entry from the project?\n\n%1").arg(loc),
+            QMessageBox::Yes | QMessageBox::No, QMessageBox::No) != QMessageBox::Yes) {
+        return;
+    }
+    if (!pkg->removeEntry(loc.toStdString())) {
+        QMessageBox::warning(_window, QObject::tr("Detach failed"),
+            QObject::tr("Could not remove entry (not found)."));
+        return;
+    }
+    _window->refreshCurrentVolumePackageUi(QString(), true);
+}
+
+void MenuActionController::setOutputSegments()
+{
+    if (!_window || !_window->_state || !_window->_state->vpkg()) {
+        QMessageBox::information(_window, QObject::tr("No project"), QObject::tr("Open or create a project first."));
+        return;
+    }
+    auto pkg = _window->_state->vpkg();
+    QStringList items;
+    for (const auto& e : pkg->segmentEntries()) items << QString::fromStdString(e.location);
+    if (items.isEmpty()) {
+        QMessageBox::information(_window, QObject::tr("No segments"),
+                                 QObject::tr("Attach a segments source first."));
+        return;
+    }
+    bool ok = false;
+    int currentIdx = 0;
+    if (pkg->hasOutputSegments()) {
+        const auto cur = QString::fromStdString(pkg->outputSegmentsPath().string());
+        for (int i = 0; i < items.size(); ++i) {
+            if (items[i] == cur) { currentIdx = i; break; }
+        }
+    }
+    QString chosen = QInputDialog::getItem(_window, QObject::tr("Set Output Segments"),
+        QObject::tr("Where new segments will land:"), items, currentIdx, false, &ok);
+    if (!ok || chosen.isEmpty()) return;
+    pkg->setOutputSegments(chosen.toStdString());
+}
+
+bool MenuActionController::runLegacyVolpkgConvert(const QString& inputLocation, QString* convertedOut)
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    QString out = QFileDialog::getSaveFileName(_window,
+        QObject::tr("Save converted .volpkg.json"),
+        settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
+        QObject::tr("Project (*.volpkg.json)"));
+    if (out.isEmpty()) return false;
+    if (!out.endsWith(".volpkg.json", Qt::CaseInsensitive)) out += ".volpkg.json";
+
+    QApplication::setOverrideCursor(Qt::WaitCursor);
+    auto r = vc::convertVolpkg(inputLocation.toStdString(), std::filesystem::path(out.toStdString()));
+    QApplication::restoreOverrideCursor();
+
+    if (!r.ok) {
+        QMessageBox box(_window);
+        box.setWindowTitle(QObject::tr("Volpkg conversion failed"));
+        box.setIcon(QMessageBox::Warning);
+        box.setText(QObject::tr("Could not convert this volpkg to .volpkg.json."));
+        box.setInformativeText(QObject::tr("Input:  %1\nOutput: %2\n\nReason: %3")
+            .arg(inputLocation, out, QString::fromStdString(r.message)));
+        box.setStandardButtons(QMessageBox::Ok);
+        box.setStyleSheet("QLabel{min-width:600px;}");
+        box.exec();
+        return false;
+    }
+    if (!r.message.empty()) {
+        QMessageBox::information(_window, QObject::tr("Volpkg converted with warnings"),
+            QString::fromStdString(r.message));
+    }
+    if (convertedOut) *convertedOut = out;
+    return true;
+}
+
+void MenuActionController::convertLegacyVolpkg()
+{
+    if (!_window) return;
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    auto in = promptLocation(QObject::tr("Convert Legacy Volpkg"),
+                             QObject::tr("Pick the legacy volpkg directory or remote URL."),
+                             settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
+                             {}, false, true);
+    if (in.isEmpty()) return;
+    QString out;
+    if (!runLegacyVolpkgConvert(in, &out)) return;
+    auto reply = QMessageBox::question(_window, QObject::tr("Open converted project?"),
+        QObject::tr("Wrote %1 — open it now?").arg(out));
+    if (reply == QMessageBox::Yes) openVolpkgAt(out);
 }

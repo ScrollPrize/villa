@@ -10,20 +10,6 @@ import model as fit_model
 _dbg_call_count = 0
 _last_results: dict | None = None
 
-# Snap-mode anchor state (persists across calls)
-_snap_anchors_h: torch.Tensor | None = None
-_snap_anchors_w: torch.Tensor | None = None
-_snap_anchors_u: torch.Tensor | None = None
-_snap_anchors_v: torch.Tensor | None = None
-_snap_anchors_dir: torch.Tensor | None = None  # 0=prev, 1=next
-_snap_initialized: bool = False
-
-# Corr-snap-to-surface anchor state (persists across calls)
-_csnap_anchors_h: torch.Tensor | None = None    # (K,) int — quad row
-_csnap_anchors_w: torch.Tensor | None = None    # (K,) int — quad col
-_csnap_anchors_valid: torch.Tensor | None = None # (K,) bool — per-anchor validity
-_csnap_initialized: bool = False
-
 # Winding-mode anchor state (persists across calls)
 # Correspondence indices: 0=closest_low, 1=closest_up, 2=avg_low, 3=avg_up
 _wind_anchors_d: torch.Tensor | None = None      # (K, 4) int — depth layer
@@ -36,290 +22,41 @@ _wind_obs_per_point: torch.Tensor | None = None      # (K,) float — last raw w
 _wind_reinit_counter: int = 0
 _wind_prev_any_valid: torch.Tensor | None = None     # (K,) bool — per-point "had valid anchor last step"
 
+# Phase D Gaussian splat config: σ in mesh-vertex units. 1.0 → 7×7 neighborhood (~3-vertex radius).
+# Set per stage via opt_loss_corr.set_splat_sigma(...) from optimizer.py.
+_corr_splat_sigma: float = 1.0
+
+
+def set_splat_sigma(sigma: float) -> None:
+	"""Set the Gaussian σ used by Phase D's height-map splat (units: mesh vertices)."""
+	global _corr_splat_sigma
+	_corr_splat_sigma = float(sigma)
+
+
+def reset_state() -> None:
+	"""Reset persistent corr state between independent optimization jobs."""
+	global _dbg_call_count, _last_results
+	global _wind_anchors_d, _wind_anchors_h, _wind_anchors_w, _wind_anchors_valid
+	global _wind_initialized, _wind_target_per_point, _wind_obs_per_point
+	global _wind_reinit_counter, _wind_prev_any_valid
+
+	_dbg_call_count = 0
+	_last_results = None
+	_wind_anchors_d = None
+	_wind_anchors_h = None
+	_wind_anchors_w = None
+	_wind_anchors_valid = None
+	_wind_initialized = False
+	_wind_target_per_point = None
+	_wind_obs_per_point = None
+	_wind_reinit_counter = 0
+	_wind_prev_any_valid = None
+
 
 def corr_winding_loss(
 	*, res: fit_model.FitResult3D,
 ) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
 	return _corr_winding_loss(res=res)
-
-
-def corr_snap_loss(
-	*, res: fit_model.FitResult3D,
-) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	return _corr_snap_to_surface_loss(res=res)
-
-
-def corr_legacy_loss(
-	*, res: fit_model.FitResult3D,
-) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	return _corr_legacy_loss(res=res)
-
-
-def corr_signed_loss(
-	*, res: fit_model.FitResult3D,
-) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	return _corr_snap_loss(res=res)
-
-
-def _corr_legacy_loss(
-	*, res: fit_model.FitResult3D,
-) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Legacy 3D correction point loss: point-to-quad nearest surface, collection-coupled winding error."""
-	global _dbg_call_count, _last_results
-	_dbg_call_count += 1
-	dbg = (_dbg_call_count == 1)
-
-	dev = res.xyz_lr.device
-	dt = res.xyz_lr.dtype
-
-	pts_c = res.data.corr_points
-	if pts_c is None or pts_c.points_xyz_winda.shape[0] == 0:
-		if _dbg_call_count <= 2:
-			print("[corr] no correction points")
-		z = torch.zeros((), device=dev, dtype=dt)
-		em = torch.zeros((1,), device=dev, dtype=dt)
-		mk = torch.zeros_like(em)
-		return z, (em,), (mk,)
-
-	pts = pts_c.points_xyz_winda.to(device=dev, dtype=dt)   # (K, 4)
-	col = pts_c.collection_idx.to(device=dev, dtype=torch.int64)  # (K,)
-	pt_ids = pts_c.point_ids.to(device=dev, dtype=torch.int64)  # (K,)
-	K = int(pts.shape[0])
-	P = pts[:, :3]      # (K, 3)
-	winda = pts[:, 3]   # (K,)
-
-	xyz_lr = res.xyz_lr          # (D, Hm, Wm, 3) — has grad
-	normals = res.normals        # (D, Hm, Wm, 3) — detached
-	D, Hm, Wm, _ = xyz_lr.shape
-
-	if dbg:
-		print(f"[corr] step={_dbg_call_count}: K={K} points, mesh=({D},{Hm},{Wm}), "
-			  f"collections={torch.unique(col).tolist()}")
-
-	# --- Step 2: unit normals (detached) ---
-	n_unit = normals / (normals.norm(dim=-1, keepdim=True) + 1e-12)  # (D, Hm, Wm, 3)
-
-	# --- Step 3: per-depth-layer nearest quad search ---
-	Qh = Hm - 1
-	Qw = Wm - 1
-	NQ_layer = Qh * Qw
-	if Qh <= 0 or Qw <= 0 or D < 2:
-		z = torch.zeros((), device=dev, dtype=dt)
-		em = torch.zeros((1,), device=dev, dtype=dt)
-		mk = torch.zeros_like(em)
-		return z, (em,), (mk,)
-
-	xyz_det = xyz_lr.detach()
-	v00 = xyz_det[:, :-1, :-1]  # (D, Qh, Qw, 3)
-	v10 = xyz_det[:, 1:, :-1]
-	v01 = xyz_det[:, :-1, 1:]
-	v11 = xyz_det[:, 1:, 1:]
-	v00_f = v00.reshape(D, NQ_layer, 3)
-	v10_f = v10.reshape(D, NQ_layer, 3)
-	v01_f = v01.reshape(D, NQ_layer, 3)
-	v11_f = v11.reshape(D, NQ_layer, 3)
-
-	P_exp = P.unsqueeze(1)  # (K, 1, 3)
-	kidx = torch.arange(K, device=dev)
-
-	nearest_qi = torch.zeros(K, D, dtype=torch.long, device=dev)
-	u_per_d = torch.zeros(K, D, device=dev, dtype=dt)
-	v_per_d = torch.zeros(K, D, device=dev, dtype=dt)
-
-	for d in range(D):
-		v00_d = v00_f[d].unsqueeze(0)  # (1, NQ_layer, 3)
-		v10_d = v10_f[d].unsqueeze(0)
-		v01_d = v01_f[d].unsqueeze(0)
-		v11_d = v11_f[d].unsqueeze(0)
-
-		e1 = v10_d - v00_d
-		e2 = v01_d - v00_d
-		g = P_exp - v00_d
-
-		e1e1 = (e1 * e1).sum(-1)
-		e1e2 = (e1 * e2).sum(-1)
-		e2e2 = (e2 * e2).sum(-1)
-		ge1 = (g * e1).sum(-1)
-		ge2 = (g * e2).sum(-1)
-
-		det = e1e1 * e2e2 - e1e2 * e1e2
-		det_safe = det + (det.abs() < 1e-20).float() * 1e-20
-		u_d = ((ge1 * e2e2 - ge2 * e1e2) / det_safe).clamp(0.0, 1.0)
-		v_d = ((ge2 * e1e1 - ge1 * e1e2) / det_safe).clamp(0.0, 1.0)
-
-		u1 = u_d.unsqueeze(-1)
-		v1 = v_d.unsqueeze(-1)
-		Q_closest = (v00_d * (1 - u1) * (1 - v1) + v10_d * u1 * (1 - v1) +
-					 v01_d * (1 - u1) * v1 + v11_d * u1 * v1)
-
-		diff = P_exp - Q_closest
-		dist_sq = (diff * diff).sum(-1)  # (K, NQ_layer)
-
-		best = dist_sq.argmin(dim=1)  # (K,)
-		nearest_qi[:, d] = best
-		u_per_d[:, d] = u_d[kidx, best]
-		v_per_d[:, d] = v_d[kidx, best]
-
-	# --- Step 4: per-layer signed distances, edge checks, bracket pair ---
-	def _edge_check(va, vb, na, nb):
-		edge = vb - va
-		wn_a = torch.cross(na, edge, dim=-1)
-		wn_b = torch.cross(nb, edge, dim=-1)
-		side_a = ((P - va) * wn_a).sum(-1)
-		side_b = ((P - vb) * wn_b).sum(-1)
-		return (side_a >= 0) | (side_b >= 0)
-
-	signed_dist_per_d = torch.zeros(K, D, device=dev, dtype=dt)
-	edge_valid_per_d = torch.zeros(K, D, dtype=torch.bool, device=dev)
-
-	for d in range(D):
-		qi = nearest_qi[:, d]
-		h_idx = qi // Qw
-		w_idx = qi % Qw
-
-		c00 = v00_f[d][qi]; c10 = v10_f[d][qi]
-		c01 = v01_f[d][qi]; c11 = v11_f[d][qi]
-
-		ud = u_per_d[:, d].unsqueeze(-1)
-		vd = v_per_d[:, d].unsqueeze(-1)
-		Q_pos = (c00 * (1 - ud) * (1 - vd) + c10 * ud * (1 - vd) +
-				 c01 * (1 - ud) * vd + c11 * ud * vd)
-
-		nn00 = n_unit[d, h_idx, w_idx]
-		nn10 = n_unit[d, h_idx + 1, w_idx]
-		nn01 = n_unit[d, h_idx, w_idx + 1]
-		nn11 = n_unit[d, h_idx + 1, w_idx + 1]
-
-		n_interp = (nn00 * (1 - ud) * (1 - vd) + nn10 * ud * (1 - vd) +
-					nn01 * (1 - ud) * vd + nn11 * ud * vd)
-		n_interp = n_interp / (n_interp.norm(dim=-1, keepdim=True) + 1e-12)
-
-		signed_dist_per_d[:, d] = ((P - Q_pos) * n_interp).sum(-1)
-
-		ok_e0 = _edge_check(c00, c10, nn00, nn10)
-		ok_e1 = _edge_check(c10, c11, nn10, nn11)
-		ok_e2 = _edge_check(c11, c01, nn11, nn01)
-		ok_e3 = _edge_check(c01, c00, nn01, nn00)
-		edge_valid_per_d[:, d] = ok_e0 & ok_e1 & ok_e2 & ok_e3
-
-	bracket_d = torch.zeros(K, device=dev, dtype=torch.long)
-	bracket_valid = torch.zeros(K, dtype=torch.bool, device=dev)
-	bracket_score = torch.full((K,), float('inf'), device=dev, dtype=dt)
-
-	for d in range(D - 1):
-		sd_lo = signed_dist_per_d[:, d]
-		sd_hi = signed_dist_per_d[:, d + 1]
-		between = (sd_lo * sd_hi) < 0
-		both_valid = edge_valid_per_d[:, d] & edge_valid_per_d[:, d + 1]
-		pair_ok = between & both_valid
-		score = sd_lo.abs() + sd_hi.abs()
-		better = pair_ok & (score < bracket_score)
-		bracket_d[better] = d
-		bracket_valid[better] = True
-		bracket_score[better] = score[better]
-
-	valid = bracket_valid
-
-	# --- Step 5: winding number observation (with grad) ---
-	bd = bracket_d
-	bd1 = bd + 1
-
-	qi_lo = nearest_qi[kidx, bd]
-	qi_hi = nearest_qi[kidx, bd1]
-	h_lo = qi_lo // Qw; w_lo = qi_lo % Qw
-	h_hi = qi_hi // Qw; w_hi = qi_hi % Qw
-
-	v00_g_lo = xyz_lr[bd, h_lo, w_lo]
-	v10_g_lo = xyz_lr[bd, h_lo + 1, w_lo]
-	v01_g_lo = xyz_lr[bd, h_lo, w_lo + 1]
-	v11_g_lo = xyz_lr[bd, h_lo + 1, w_lo + 1]
-
-	v00_g_hi = xyz_lr[bd1, h_hi, w_hi]
-	v10_g_hi = xyz_lr[bd1, h_hi + 1, w_hi]
-	v01_g_hi = xyz_lr[bd1, h_hi, w_hi + 1]
-	v11_g_hi = xyz_lr[bd1, h_hi + 1, w_hi + 1]
-
-	u_lo = u_per_d[kidx, bd].detach().unsqueeze(-1)
-	v_lo = v_per_d[kidx, bd].detach().unsqueeze(-1)
-	u_hi = u_per_d[kidx, bd1].detach().unsqueeze(-1)
-	v_hi = v_per_d[kidx, bd1].detach().unsqueeze(-1)
-
-	Q_lo = (v00_g_lo * (1 - u_lo) * (1 - v_lo) + v10_g_lo * u_lo * (1 - v_lo) +
-			v01_g_lo * (1 - u_lo) * v_lo + v11_g_lo * u_lo * v_lo)
-	Q_hi = (v00_g_hi * (1 - u_hi) * (1 - v_hi) + v10_g_hi * u_hi * (1 - v_hi) +
-			v01_g_hi * (1 - u_hi) * v_hi + v11_g_hi * u_hi * v_hi)
-
-	n_lo_00 = n_unit[bd, h_lo, w_lo]
-	n_lo_10 = n_unit[bd, h_lo + 1, w_lo]
-	n_lo_01 = n_unit[bd, h_lo, w_lo + 1]
-	n_lo_11 = n_unit[bd, h_lo + 1, w_lo + 1]
-	n_lo_i = (n_lo_00 * (1 - u_lo) * (1 - v_lo) + n_lo_10 * u_lo * (1 - v_lo) +
-			  n_lo_01 * (1 - u_lo) * v_lo + n_lo_11 * u_lo * v_lo)
-	n_lo_i = n_lo_i / (n_lo_i.norm(dim=-1, keepdim=True) + 1e-12)
-
-	n_hi_00 = n_unit[bd1, h_hi, w_hi]
-	n_hi_10 = n_unit[bd1, h_hi + 1, w_hi]
-	n_hi_01 = n_unit[bd1, h_hi, w_hi + 1]
-	n_hi_11 = n_unit[bd1, h_hi + 1, w_hi + 1]
-	n_hi_i = (n_hi_00 * (1 - u_hi) * (1 - v_hi) + n_hi_10 * u_hi * (1 - v_hi) +
-			  n_hi_01 * (1 - u_hi) * v_hi + n_hi_11 * u_hi * v_hi)
-	n_hi_i = n_hi_i / (n_hi_i.norm(dim=-1, keepdim=True) + 1e-12)
-
-	dist_d = ((P - Q_lo) * n_lo_i).sum(-1)
-	dist_d1 = ((P - Q_hi) * n_hi_i).sum(-1)
-
-	denom = dist_d - dist_d1
-	denom_safe = denom + (denom.abs() < 1e-12).float() * 1e-12
-	frac = (dist_d / denom_safe).clamp(0.0, 1.0)
-
-	obs = bd.to(dtype=dt) + frac
-
-	# --- Step 6: collection-coupled +/- winda error ---
-	err = torch.full((K,), float("nan"), device=dev, dtype=dt)
-	avg_per_point = torch.full((K,), float("nan"), device=dev, dtype=dt)
-	uc = torch.unique(col)
-	for cid in uc.tolist():
-		m = (col == int(cid)) & valid
-		if not bool(m.any()):
-			continue
-		obs_m = obs[m]
-		wa_m = winda[m]
-		avg_pos = (obs_m - wa_m).mean()
-		err_pos = obs_m - (avg_pos + wa_m)
-		mse_pos = (err_pos * err_pos).mean()
-		avg_neg = (obs_m + wa_m).mean()
-		err_neg = obs_m - (avg_neg - wa_m)
-		mse_neg = (err_neg * err_neg).mean()
-		use_neg = bool((mse_neg < mse_pos).item())
-		err[m] = err_neg if use_neg else err_pos
-		avg_per_point[col == int(cid)] = float(avg_neg.item()) if use_neg else float(avg_pos.item())
-
-	point_valid = torch.isfinite(err)
-
-	if not bool(point_valid.any()):
-		if dbg:
-			print("[corr] no valid points after collection coupling")
-		z = torch.zeros((), device=dev, dtype=dt)
-		em = torch.zeros((1,), device=dev, dtype=dt)
-		mk = torch.zeros_like(em)
-		return z, (em,), (mk,)
-
-	# --- Step 7: loss ---
-	err_sq = torch.where(point_valid, err * err, torch.zeros_like(err))
-	loss = err_sq[point_valid].sum()
-
-	if dbg:
-		print(f"[corr] loss={loss.item():.6f}, valid={point_valid.sum().item()}/{K}, "
-			  f"rms_err={loss.item()**0.5:.4f}")
-
-	# --- Build results dict for feedback (JSON-serializable) ---
-	_last_results = _build_results(
-		obs=obs, avg=avg_per_point, err=err,
-		pt_ids=pt_ids, col=col, pts=pts, valid=point_valid,
-	)
-
-	mask = point_valid.to(dtype=dt)
-	return loss, (err_sq,), (mask,)
 
 
 def get_last_results() -> dict | None:
@@ -358,7 +95,7 @@ def print_detail(label: str = "") -> None:
 		print(f"  collection {cid}: avg_winding={avg}")
 
 	# Per-point table
-	print(f"  {'pid':>6s}  {'col':>4s}  {'pos':>26s}  {'w_obs':>8s}  {'w_tgt':>8s}  {'w_err':>8s}  {'valid':>5s}  {'abs':>3s}", end="")
+	print(f"  {'pid':>6s}  {'col':>4s}  {'pos':>26s}  {'w_obs':>8s}  {'w_tgt':>8s}  {'w_err':>8s}  {'n_dot':>7s}  {'p_n':>23s}  {'tgt_n':>23s}  {'valid':>5s}  {'abs':>3s}", end="")
 	# Anchor columns (winding mode only)
 	has_anchors = _wind_anchors_d is not None
 	if has_anchors:
@@ -380,10 +117,14 @@ def print_detail(label: str = "") -> None:
 		w_obs = p.get("winding_obs")
 		w_tgt = p.get("winding_target")
 		w_err = p.get("winding_err")
+		n_dot = p.get("normal_alignment")
+		point_normal = p.get("point_normal")
+		target_normal = p.get("target_normal")
 		valid = p.get("valid", False)
 		is_abs = p.get("absolute", False)
 		print(f"  {pid:>6s}  {p.get('collection_id', '?'):>4}  {pos_s}  "
-			  f"{_fmt(w_obs):>8s}  {_fmt(w_tgt):>8s}  {_fmt(w_err):>8s}  "
+			  f"{_fmt(w_obs):>8s}  {_fmt(w_tgt):>8s}  {_fmt(w_err):>8s}  {_fmt(n_dot):>7s}  "
+			  f"{_fmt_vec(point_normal):>23s}  {_fmt_vec(target_normal):>23s}  "
 			  f"{'  yes' if valid else '   no':>5s}  {'  Y' if is_abs else '  N':>3s}", end="")
 		if has_anchors:
 			idx = pid_to_idx.get(int(pid))
@@ -408,45 +149,11 @@ def _fmt(v) -> str:
 	return f"{v:.4f}"
 
 
-def _build_results(
-	*, obs: torch.Tensor, avg: torch.Tensor, err: torch.Tensor,
-	pt_ids: torch.Tensor, col: torch.Tensor, pts: torch.Tensor,
-	valid: torch.Tensor,
-) -> dict:
-	"""Build JSON-serializable dict of per-point winding results."""
-	result: dict = {"points": {}, "collection_avgs": {}}
-	K = int(obs.shape[0])
-	for i in range(K):
-		pid = int(pt_ids[i].item())
-		cid = int(col[i].item())
-		o = float(obs[i].item())
-		e = float(err[i].item()) if bool(valid[i]) else None
-		a = float(avg[i].item())
-		entry: dict = {
-			"collection_id": cid,
-			"p": [round(float(pts[i, 0].item()), 2),
-				  round(float(pts[i, 1].item()), 2),
-				  round(float(pts[i, 2].item()), 2)],
-		}
-		entry["winding_obs"] = round(o, 6) if math.isfinite(o) else None
-		entry["winding_err"] = round(e, 6) if e is not None and math.isfinite(e) else None
-		entry["valid"] = bool(valid[i])
-		result["points"][str(pid)] = entry
-	# Per-collection averages
-	uc = torch.unique(col)
-	for cid_t in uc.tolist():
-		cid_int = int(cid_t)
-		mask = (col == cid_int) & valid
-		if mask.any():
-			v = float(avg[mask][0].item())
-			if math.isfinite(v):
-				result["collection_avgs"][str(cid_int)] = round(v, 6)
-	return result
+def _fmt_vec(v) -> str:
+	if v is None:
+		return "---"
+	return "(" + ",".join(f"{float(x):.3f}" for x in v) + ")"
 
-
-# ---------------------------------------------------------------------------
-# Snap-to-surface corr loss
-# ---------------------------------------------------------------------------
 
 def _bilinear_project(P: torch.Tensor, v00: torch.Tensor, v10: torch.Tensor,
 					  v01: torch.Tensor, v11: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -471,6 +178,32 @@ def _bilinear_project(P: torch.Tensor, v00: torch.Tensor, v10: torch.Tensor,
 	return u, v
 
 
+def _ray_quad_intersect(P: torch.Tensor, gt_n_p: torch.Tensor,
+						v00: torch.Tensor, v10: torch.Tensor,
+						v01: torch.Tensor, v11: torch.Tensor
+						) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+	"""Ray from P along gt_n_p → bilinear-quad intersection.
+
+	Uniform GT-normal projection used by both the obs (avg-feeding) and the Phase D
+	splat — see plan. Returns (u_clamped, v_clamped, in_bounds), all (Kp,):
+
+	  - u, v clamped to [0, 1] so Q always stays on the quad and the strip integral
+	    can't blow up if the ray glances the quad.
+	  - in_bounds tells the caller whether the *unclamped* hit was inside the quad,
+	    so they can fold "ray missed the quad" into their validity mask (and exclude
+	    the point from the avg / from the splat).
+	"""
+	Kp = P.shape[0]
+	dev = P.device
+	dt = P.dtype
+	fh = torch.full((Kp,), 0.5, device=dev, dtype=dt)
+	fw = torch.full((Kp,), 0.5, device=dev, dtype=dt)
+	u, v = fit_model.Model3D._ray_bilinear_intersect(
+		P, gt_n_p, v00, v10, v01, v11, fh, fw)
+	in_bounds = (u >= 0.0) & (u <= 1.0) & (v >= 0.0) & (v <= 1.0)
+	return u.clamp(0.0, 1.0), v.clamp(0.0, 1.0), in_bounds
+
+
 def _bilinear_interp(v00: torch.Tensor, v10: torch.Tensor,
 					 v01: torch.Tensor, v11: torch.Tensor,
 					 u: torch.Tensor, v: torch.Tensor) -> torch.Tensor:
@@ -482,348 +215,6 @@ def _bilinear_interp(v00: torch.Tensor, v10: torch.Tensor,
 		u = u.unsqueeze(-1)
 		v = v.unsqueeze(-1)
 	return v00 * (1 - u) * (1 - v) + v10 * u * (1 - v) + v01 * (1 - u) * v + v11 * u * v
-
-
-def _snap_brute_force(P: torch.Tensor, xyz_det: torch.Tensor, wind_d: torch.Tensor,
-					  conn_prev: torch.Tensor, conn_next: torch.Tensor,
-					  mask_conn: torch.Tensor, Qh: int, Qw: int,
-					  ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-	"""Brute-force nearest quad search for snap mode.
-
-	P: (K, 3) point positions
-	xyz_det: (D, Hm, Wm, 3) detached mesh
-	wind_d: (K,) int — target winding per point
-	conn_prev/next: (D, Hm, Wm, 3) — conn direction unit vectors
-	mask_conn: (D, 1, Hm, Wm, 3) — connection validity
-	Returns: (h_idx, w_idx, u, v, direction) each (K,)
-	"""
-	K = P.shape[0]
-	dev = P.device
-	dt = P.dtype
-	NQ = Qh * Qw
-
-	best_h = torch.zeros(K, dtype=torch.long, device=dev)
-	best_w = torch.zeros(K, dtype=torch.long, device=dev)
-	best_u = torch.zeros(K, dtype=dt, device=dev)
-	best_v = torch.zeros(K, dtype=dt, device=dev)
-	best_dir = torch.zeros(K, dtype=torch.long, device=dev)
-	best_dist = torch.full((K,), float("inf"), dtype=dt, device=dev)
-
-	h_q = torch.arange(Qh, device=dev).unsqueeze(1).expand(Qh, Qw).reshape(NQ)
-	w_q = torch.arange(Qw, device=dev).unsqueeze(0).expand(Qh, Qw).reshape(NQ)
-
-	unique_d = torch.unique(wind_d)
-	for d_val in unique_d.tolist():
-		d = int(d_val)
-		if d < 0 or d >= xyz_det.shape[0]:
-			continue
-		pmask = (wind_d == d)
-		if not pmask.any():
-			continue
-		P_sub = P[pmask]  # (Ks, 3)
-		Ks = P_sub.shape[0]
-
-		# Get quads on layer d
-		v00 = xyz_det[d, :-1, :-1].reshape(NQ, 3).unsqueeze(0)  # (1, NQ, 3)
-		v10 = xyz_det[d, 1:, :-1].reshape(NQ, 3).unsqueeze(0)
-		v01 = xyz_det[d, :-1, 1:].reshape(NQ, 3).unsqueeze(0)
-		v11 = xyz_det[d, 1:, 1:].reshape(NQ, 3).unsqueeze(0)
-
-		P_exp = P_sub.unsqueeze(1)  # (Ks, 1, 3)
-		u_all, v_all = _bilinear_project(P_exp, v00, v10, v01, v11)  # (Ks, NQ)
-		Q = _bilinear_interp(v00, v10, v01, v11, u_all, v_all)  # (Ks, NQ, 3)
-
-		# Euclidean distance to quad surface point
-		diff = P_exp - Q  # (Ks, NQ, 3)
-		dist_eucl = diff.norm(dim=-1)  # (Ks, NQ)
-
-		min_dist, min_qi = dist_eucl.min(dim=1)  # (Ks,)
-		pidx = pmask.nonzero(as_tuple=True)[0]
-		better = min_dist < best_dist[pidx]
-		if better.any():
-			bi = better.nonzero(as_tuple=True)[0]
-			gi = pidx[bi]
-			qi = min_qi[bi]
-			best_h[gi] = h_q[qi]
-			best_w[gi] = w_q[qi]
-			best_u[gi] = u_all[bi, qi]
-			best_v[gi] = v_all[bi, qi]
-			best_dist[gi] = min_dist[bi]
-
-	# Pick best conn direction per point at its best quad
-	v00_b = xyz_det[wind_d, best_h, best_w]
-	v10_b = xyz_det[wind_d, best_h + 1, best_w]
-	v01_b = xyz_det[wind_d, best_h, best_w + 1]
-	v11_b = xyz_det[wind_d, best_h + 1, best_w + 1]
-	Q_best = _bilinear_interp(v00_b, v10_b, v01_b, v11_b, best_u, best_v)
-	offset = P - Q_best
-
-	best_dir_dist = torch.full((K,), float("inf"), dtype=dt, device=dev)
-	for dir_idx, conn_dir in enumerate([conn_prev, conn_next]):
-		cn00 = conn_dir[wind_d, best_h, best_w]
-		cn10 = conn_dir[wind_d, best_h + 1, best_w]
-		cn01 = conn_dir[wind_d, best_h, best_w + 1]
-		cn11 = conn_dir[wind_d, best_h + 1, best_w + 1]
-		n = _bilinear_interp(cn00, cn10, cn01, cn11, best_u, best_v)
-		n = n / (n.norm(dim=-1, keepdim=True) + 1e-12)
-		dist = (offset * n).sum(-1).abs()
-		use_this = dist < best_dir_dist
-		best_dir[use_this] = dir_idx
-		best_dir_dist[use_this] = dist[use_this]
-
-	return best_h, best_w, best_u, best_v, best_dir
-
-
-def _snap_update_anchors(P: torch.Tensor, xyz_det: torch.Tensor, wind_d: torch.Tensor,
-						 anchor_h: torch.Tensor, anchor_w: torch.Tensor,
-						 anchor_u: torch.Tensor, anchor_v: torch.Tensor,
-						 anchor_dir: torch.Tensor,
-						 conn_prev: torch.Tensor, conn_next: torch.Tensor,
-						 Qh: int, Qw: int,
-						 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-	"""Local anchor update: re-project points onto current quads.
-
-	Computes unclamped (u, v) to get full integer shift, then re-projects.
-	"""
-	K = P.shape[0]
-	dev = P.device
-	dt = P.dtype
-	D, Hm, Wm, _ = xyz_det.shape
-
-	h_old = anchor_h.clone()
-	w_old = anchor_w.clone()
-	d = wind_d
-
-	# --- Dist before update (for debug) ---
-	v00_old = xyz_det[d, h_old, w_old]
-	v10_old = xyz_det[d, h_old + 1, w_old]
-	v01_old = xyz_det[d, h_old, w_old + 1]
-	v11_old = xyz_det[d, h_old + 1, w_old + 1]
-	Q_old = _bilinear_interp(v00_old, v10_old, v01_old, v11_old, anchor_u, anchor_v)
-	dist_before = (P - Q_old).norm(dim=-1)
-
-	# --- Unclamped bilinear project to get full shift ---
-	e1 = v10_old - v00_old
-	e2 = v01_old - v00_old
-	g = P - v00_old
-	e1e1 = (e1 * e1).sum(-1)
-	e1e2 = (e1 * e2).sum(-1)
-	e2e2 = (e2 * e2).sum(-1)
-	ge1 = (g * e1).sum(-1)
-	ge2 = (g * e2).sum(-1)
-	det = e1e1 * e2e2 - e1e2 * e1e2
-	det_safe = det + (det.abs() < 1e-20).float() * 1e-20
-	u_raw = (ge1 * e2e2 - ge2 * e1e2) / det_safe
-	v_raw = (ge2 * e1e1 - ge1 * e1e2) / det_safe
-
-	# Full integer shift
-	h = (h_old + u_raw.floor().to(torch.long)).clamp(0, Qh - 1)
-	w = (w_old + v_raw.floor().to(torch.long)).clamp(0, Qw - 1)
-
-	# Re-project on updated quads (clamped)
-	v00 = xyz_det[d, h, w]
-	v10 = xyz_det[d, h + 1, w]
-	v01 = xyz_det[d, h, w + 1]
-	v11 = xyz_det[d, h + 1, w + 1]
-	u_new, v_new = _bilinear_project(P, v00, v10, v01, v11)  # clamped [0,1]
-
-	# Re-check direction: pick the one with smaller |dist|
-	Q_new = _bilinear_interp(v00, v10, v01, v11, u_new, v_new)
-	offset = P - Q_new
-
-	new_dir = torch.zeros(K, dtype=torch.long, device=dev)
-	for dir_idx, conn_dir in enumerate([conn_prev, conn_next]):
-		cn00 = conn_dir[d, h, w]
-		cn10 = conn_dir[d, h + 1, w]
-		cn01 = conn_dir[d, h, w + 1]
-		cn11 = conn_dir[d, h + 1, w + 1]
-		n = _bilinear_interp(cn00, cn10, cn01, cn11, u_new, v_new)
-		n = n / (n.norm(dim=-1, keepdim=True) + 1e-12)
-		dist = (offset * n).sum(-1).abs()
-		if dir_idx == 0:
-			best_dist = dist.clone()
-		else:
-			use_this = dist < best_dist
-			new_dir[use_this] = dir_idx
-
-	# --- Dist after update (for debug) ---
-	# dist_after = offset.norm(dim=-1)
- #
-	# # Debug: print per-point distances and indices before/after
-	# def _fmt(t):
-	# 	return " ".join(f"{v:.2f}" for v in t.tolist())
-	# def _fmtpair(h_t, w_t):
-	# 	return " ".join(f"({int(hi)},{int(wi)})" for hi, wi in zip(h_t.tolist(), w_t.tolist()))
-	# print(f"[corr-snap-update] dist_before: {_fmt(dist_before)}")
-	# print(f"[corr-snap-update] dist_after:  {_fmt(dist_after)}")
-	# print(f"[corr-snap-update] idx_before:  {_fmtpair(h_old, w_old)}")
-	# print(f"[corr-snap-update] idx_after:   {_fmtpair(h, w)}")
-
-	return h, w, u_new, v_new, new_dir
-
-
-def _corr_snap_loss(
-	*, res: fit_model.FitResult3D,
-) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Snap-to-surface corr loss: penalize distance from surface to known-winding points."""
-	global _dbg_call_count, _last_results
-	global _snap_anchors_h, _snap_anchors_w, _snap_anchors_u, _snap_anchors_v
-	global _snap_anchors_dir, _snap_initialized
-
-	_dbg_call_count += 1
-	dbg = (_dbg_call_count <= 2)
-
-	dev = res.xyz_lr.device
-	dt = res.xyz_lr.dtype
-
-	pts_c = res.data.corr_points
-	if pts_c is None or pts_c.points_xyz_winda.shape[0] == 0:
-		if _dbg_call_count <= 2:
-			print("[corr-snap] no correction points")
-		z = torch.zeros((), device=dev, dtype=dt)
-		return z, (torch.zeros((1,), device=dev, dtype=dt),), (torch.zeros((1,), device=dev, dtype=dt),)
-
-	pts = pts_c.points_xyz_winda.to(device=dev, dtype=dt)   # (K, 4)
-	col = pts_c.collection_idx.to(device=dev, dtype=torch.int64)
-	pt_ids = pts_c.point_ids.to(device=dev, dtype=torch.int64)
-	# wind_a (column 3) is the depth index from d.tif, stored as winding_annotation
-	wind_d = pts[:, 3].round().to(torch.int64)  # (K,)
-	K = int(pts.shape[0])
-	P = pts[:, :3]  # (K, 3)
-
-	xyz_lr = res.xyz_lr          # (D, Hm, Wm, 3) — has grad
-	xy_conn = res.xy_conn        # (D, Hm, Wm, 3, 3) — [prev, self, next]
-	mask_conn = res.mask_conn    # (D, 1, Hm, Wm, 3)
-	D, Hm, Wm, _ = xyz_lr.shape
-	Qh = Hm - 1
-	Qw = Wm - 1
-
-	if Qh <= 0 or Qw <= 0:
-		z = torch.zeros((), device=dev, dtype=dt)
-		return z, (torch.zeros((1,), device=dev, dtype=dt),), (torch.zeros((1,), device=dev, dtype=dt),)
-
-	# Filter out points with invalid depth index
-	valid_d = (wind_d >= 0) & (wind_d < D)
-	if not valid_d.any():
-		if dbg:
-			print("[corr-snap] no points with valid depth index")
-		z = torch.zeros((), device=dev, dtype=dt)
-		return z, (torch.zeros((1,), device=dev, dtype=dt),), (torch.zeros((1,), device=dev, dtype=dt),)
-
-	# Conn direction vectors (detached)
-	xy_conn_det = xy_conn.detach()
-	conn_prev = xy_conn_det[:, :, :, :, 0] - xy_conn_det[:, :, :, :, 1]  # (D, Hm, Wm, 3)
-	conn_next = xy_conn_det[:, :, :, :, 2] - xy_conn_det[:, :, :, :, 1]  # (D, Hm, Wm, 3)
-	# Normalize
-	conn_prev = conn_prev / (conn_prev.norm(dim=-1, keepdim=True) + 1e-12)
-	conn_next = conn_next / (conn_next.norm(dim=-1, keepdim=True) + 1e-12)
-
-	xyz_det = xyz_lr.detach()
-
-	# --- Anchor init or update ---
-	if not _snap_initialized or _snap_anchors_h is None or _snap_anchors_h.shape[0] != K:
-		# Brute force initial search
-		if dbg:
-			print(f"[corr-snap] brute-force init: K={K} points, mesh=({D},{Hm},{Wm})")
-		_snap_anchors_h, _snap_anchors_w, _snap_anchors_u, _snap_anchors_v, _snap_anchors_dir = \
-			_snap_brute_force(P, xyz_det, wind_d, conn_prev, conn_next, mask_conn.detach(), Qh, Qw)
-		_snap_initialized = True
-
-	else:
-		# Local update
-		_snap_anchors_h, _snap_anchors_w, _snap_anchors_u, _snap_anchors_v, _snap_anchors_dir = \
-			_snap_update_anchors(P, xyz_det, wind_d,
-								_snap_anchors_h, _snap_anchors_w,
-								_snap_anchors_u, _snap_anchors_v,
-								_snap_anchors_dir,
-								conn_prev, conn_next, Qh, Qw)
-
-	# --- Loss computation (with grad) ---
-	h = _snap_anchors_h
-	w = _snap_anchors_w
-	u = _snap_anchors_u.detach()
-	v = _snap_anchors_v.detach()
-	d = wind_d
-
-	# Check valid: d in range AND anchor found (best_dist < inf)
-	anchor_valid = valid_d
-
-	if not anchor_valid.any():
-		z = torch.zeros((), device=dev, dtype=dt)
-		return z, (torch.zeros((1,), device=dev, dtype=dt),), (torch.zeros((1,), device=dev, dtype=dt),)
-
-	# Gather quad corners WITH grad
-	v00_g = xyz_lr[d, h, w]          # (K, 3)
-	v10_g = xyz_lr[d, h + 1, w]
-	v01_g = xyz_lr[d, h, w + 1]
-	v11_g = xyz_lr[d, h + 1, w + 1]
-
-	Q = _bilinear_interp(v00_g, v10_g, v01_g, v11_g, u, v)  # (K, 3) — has grad
-
-	# Pick conn direction (detached, normalized)
-	use_next = (_snap_anchors_dir == 1)
-	cn00_p = conn_prev[d, h, w]
-	cn10_p = conn_prev[d, h + 1, w]
-	cn01_p = conn_prev[d, h, w + 1]
-	cn11_p = conn_prev[d, h + 1, w + 1]
-	n_prev_i = _bilinear_interp(cn00_p, cn10_p, cn01_p, cn11_p, u, v)
-	n_prev_i = n_prev_i / (n_prev_i.norm(dim=-1, keepdim=True) + 1e-12)
-
-	cn00_n = conn_next[d, h, w]
-	cn10_n = conn_next[d, h + 1, w]
-	cn01_n = conn_next[d, h, w + 1]
-	cn11_n = conn_next[d, h + 1, w + 1]
-	n_next_i = _bilinear_interp(cn00_n, cn10_n, cn01_n, cn11_n, u, v)
-	n_next_i = n_next_i / (n_next_i.norm(dim=-1, keepdim=True) + 1e-12)
-
-	n_conn = torch.where(use_next.unsqueeze(-1), n_next_i, n_prev_i)  # (K, 3)
-
-	# Signed distance along conn normal
-	signed_dist = ((P - Q) * n_conn).sum(-1)  # (K,)
-
-	err = torch.where(anchor_valid, signed_dist, torch.zeros_like(signed_dist))
-	err_sq = err * err
-	loss = err_sq[anchor_valid].sum()
-
-	if dbg:
-		rms = loss.item() ** 0.5
-		print(f"[corr-snap] loss={loss.item():.6f}, valid={anchor_valid.sum().item()}/{K}, "
-			  f"rms_dist={rms:.2f} voxels")
-
-	# --- Build results ---
-	_last_results = _build_snap_results(
-		wind_d=wind_d, signed_dist=signed_dist,
-		pt_ids=pt_ids, col=col, pts=pts, valid=anchor_valid,
-	)
-
-	mask = anchor_valid.to(dtype=dt)
-	return loss, (err_sq,), (mask,)
-
-
-def _build_snap_results(
-	*, wind_d: torch.Tensor, signed_dist: torch.Tensor,
-	pt_ids: torch.Tensor, col: torch.Tensor, pts: torch.Tensor,
-	valid: torch.Tensor,
-) -> dict:
-	"""Build JSON-serializable dict of per-point snap results."""
-	result: dict = {"points": {}}
-	K = int(pts.shape[0])
-	for i in range(K):
-		pid = int(pt_ids[i].item())
-		cid = int(col[i].item())
-		wd = int(wind_d[i].item())
-		sd = float(signed_dist[i].item()) if bool(valid[i]) else None
-		entry: dict = {
-			"collection_id": cid,
-			"p": [round(float(pts[i, 0].item()), 2),
-				  round(float(pts[i, 1].item()), 2),
-				  round(float(pts[i, 2].item()), 2)],
-			"winding_obs": wd if wd >= 0 else None,
-			"winding_err": round(sd, 4) if sd is not None and math.isfinite(sd) else None,
-			"valid": bool(valid[i]),
-		}
-		result["points"][str(pid)] = entry
-	return result
 
 
 # ---------------------------------------------------------------------------
@@ -960,6 +351,63 @@ def _wind_strip_integral(
 	strip_valid = (mag > 0).all(dim=-1)
 
 	return signed_winding, unsigned_winding, strip_valid
+
+
+def _height_map_splat(
+	d_p: torch.Tensor,            # (Kp,) int   — layer per point
+	h_floor_p: torch.Tensor,      # (Kp,) int   — quad row
+	w_floor_p: torch.Tensor,      # (Kp,) int   — quad col
+	h_cont_p: torch.Tensor,       # (Kp,) float — continuous mesh-row position
+	w_cont_p: torch.Tensor,       # (Kp,) float — continuous mesh-col position
+	signed_delta_p: torch.Tensor, # (Kp,) float — scalar per-point displacement (sign baked in)
+	mask_p: torch.Tensor,         # (Kp,) float — soft per-point validity weight
+	sigma: float,
+	D: int, Hm: int, Wm: int,
+	H_map: torch.Tensor,          # (D, Hm, Wm) — accumulator (mutated in place)
+	W_map: torch.Tensor,          # (D, Hm, Wm) — accumulator (mutated in place)
+) -> None:
+	"""Splat per-corr-point scalar displacements onto (D, Hm, Wm) accumulators with a Gaussian
+	kernel in mesh-vertex coordinates. R = ceil(3σ) neighborhood; out-of-bounds neighbors
+	get weight 0 (no spillover). All inputs are detached scalars/tensors.
+	"""
+	Kp = d_p.shape[0]
+	if Kp == 0:
+		return
+	dev = d_p.device
+	dt = signed_delta_p.dtype
+
+	R = int(math.ceil(3.0 * sigma))
+	if R < 1:
+		R = 1
+	N_off = 2 * R + 1
+
+	off = torch.arange(-R, R + 1, device=dev, dtype=torch.long)
+	oh_grid, ow_grid = torch.meshgrid(off, off, indexing="ij")           # (N, N)
+	oh_grid = oh_grid.reshape(1, N_off, N_off)                            # (1, N, N)
+	ow_grid = ow_grid.reshape(1, N_off, N_off)
+
+	v_h = h_floor_p.view(Kp, 1, 1) + oh_grid                              # (Kp, N, N)
+	v_w = w_floor_p.view(Kp, 1, 1) + ow_grid
+
+	# Gaussian distance from continuous corr-point position to integer vertex (h_v, w_v).
+	dh = v_h.to(dt) - h_cont_p.view(Kp, 1, 1)
+	dw = v_w.to(dt) - w_cont_p.view(Kp, 1, 1)
+	gauss = torch.exp(-(dh * dh + dw * dw) / (2.0 * float(sigma) * float(sigma)))
+
+	# Out-of-bounds → zero weight (no spillover at mesh edge). Normalize each
+	# per-point splat so sigma changes spread, not total correction strength.
+	in_bounds = (v_h >= 0) & (v_h < Hm) & (v_w >= 0) & (v_w < Wm)
+	base_weight = gauss * in_bounds.to(dt)
+	base_weight = base_weight / base_weight.sum(dim=(1, 2), keepdim=True).clamp_min(1e-8)
+	weight = base_weight * mask_p.view(Kp, 1, 1)
+	delta = weight * signed_delta_p.view(Kp, 1, 1)
+
+	v_h_c = v_h.clamp(0, Hm - 1)
+	v_w_c = v_w.clamp(0, Wm - 1)
+	flat_idx = (d_p.view(Kp, 1, 1) * Hm * Wm + v_h_c * Wm + v_w_c).reshape(-1)
+
+	H_map.view(-1).scatter_add_(0, flat_idx, delta.reshape(-1))
+	W_map.view(-1).scatter_add_(0, flat_idx, weight.reshape(-1))
 
 
 def _wind_collection_average(
@@ -1213,29 +661,34 @@ def _wind_brute_force_init(
 	target = _wind_collection_average(winding_obs, winda, col, obs_valid, is_absolute)
 
 	# --- Avg pair anchors from target winding ---
+	# Honor the actual target value: no clamping, no rounding.  Three regimes:
+	#   inside  (0 <= target <= D-1): two anchors at floor(target), floor(target)+1
+	#   below   (target < 0):         one-sided, anchor on layer 0
+	#   above   (target > D-1):       one-sided, anchor on layer D-1
 	target_finite = torch.isfinite(target)
-	# Replace NaN with 0 before floor/long to avoid garbage integers
 	target_safe = torch.where(target_finite, target, torch.zeros_like(target))
-	avg_lo_d = target_safe.floor().clamp(0, max(D - 2, 0)).long()
-	avg_hi_d = (avg_lo_d + 1).clamp(max=D - 1)
+	inside = target_finite & (target_safe >= 0.0) & (target_safe <= float(D - 1))
+	below = target_finite & (target_safe < 0.0)
+	above = target_finite & (target_safe > float(D - 1))
 
-	# Find quads on avg layers — only valid if point projects within quad (u,v in [0,1])
+	floor_t = target_safe.floor().long()
+	layer_lo = torch.where(below, torch.zeros_like(floor_t), floor_t)
+	layer_hi = torch.where(above, torch.full_like(floor_t, D - 1), floor_t + 1)
+
 	if target_finite.any():
-		# avg_low
-		al_h, al_w, al_u, al_v = _wind_nearest_quad_on_layer(P, gt_n, xyz_det, avg_lo_d, Qh, Qw)
+		al_h, al_w, al_u, al_v = _wind_nearest_quad_on_layer(P, gt_n, xyz_det, layer_lo, Qh, Qw)
 		al_in_quad = (al_u >= 0) & (al_u <= 1) & (al_v >= 0) & (al_v <= 1)
-		anchors_d[:, 2] = avg_lo_d
+		anchors_d[:, 2] = layer_lo
 		anchors_h[:, 2] = al_h
 		anchors_w[:, 2] = al_w
-		anchors_valid[:, 2] = target_finite & (avg_lo_d >= 0) & (avg_lo_d < D) & al_in_quad
+		anchors_valid[:, 2] = (inside | below) & al_in_quad & (layer_lo >= 0) & (layer_lo < D)
 
-		# avg_up — only valid if it's a different layer from avg_lo (requires D >= 2)
-		ah_h, ah_w, ah_u, ah_v = _wind_nearest_quad_on_layer(P, gt_n, xyz_det, avg_hi_d, Qh, Qw)
+		ah_h, ah_w, ah_u, ah_v = _wind_nearest_quad_on_layer(P, gt_n, xyz_det, layer_hi, Qh, Qw)
 		ah_in_quad = (ah_u >= 0) & (ah_u <= 1) & (ah_v >= 0) & (ah_v <= 1)
-		anchors_d[:, 3] = avg_hi_d
+		anchors_d[:, 3] = layer_hi
 		anchors_h[:, 3] = ah_h
 		anchors_w[:, 3] = ah_w
-		anchors_valid[:, 3] = target_finite & (avg_hi_d > avg_lo_d) & ah_in_quad
+		anchors_valid[:, 3] = (inside | above) & ah_in_quad & (layer_hi >= 0) & (layer_hi < D)
 
 	return anchors_d, anchors_h, anchors_w, anchors_valid, target, winding_obs
 
@@ -1269,6 +722,27 @@ def _wind_update_anchors(
 				xyz_det[d, (h + 1).clamp(max=Qh), w],
 				xyz_det[d, h, (w + 1).clamp(max=Qw)],
 				xyz_det[d, (h + 1).clamp(max=Qh), (w + 1).clamp(max=Qw)])
+
+	# --- Avg-pair (ci=2, ci=3): non-sticky validity.  Recompute layers from the current
+	# target and reset eligibility BEFORE the refine loop so points process their refine
+	# whenever the regime allows, not only when they happened to be valid last iteration.
+	target_finite = torch.isfinite(target)
+	target_safe = torch.where(target_finite, target, torch.zeros_like(target))
+	inside = target_finite & (target_safe >= 0.0) & (target_safe <= float(D - 1))
+	below = target_finite & (target_safe < 0.0)
+	above = target_finite & (target_safe > float(D - 1))
+
+	floor_t = target_safe.floor().long()
+	new_layer_lo = torch.where(below, torch.zeros_like(floor_t), floor_t)
+	new_layer_hi = torch.where(above, torch.full_like(floor_t, D - 1), floor_t + 1)
+	anchors_d[:, 2] = new_layer_lo
+	anchors_d[:, 3] = new_layer_hi
+
+	# Reset avg-pair validity to regime-eligible.  The refine loop below will then re-evaluate
+	# in_bounds and write the final True/False — so previously-invalid points get a fresh shot
+	# instead of staying stuck.  Closest-pair (ci=0, ci=1) keeps its sticky semantics.
+	anchors_valid[:, 2] = (inside | below) & (new_layer_lo >= 0) & (new_layer_lo < D)
+	anchors_valid[:, 3] = (inside | above) & (new_layer_hi >= 0) & (new_layer_hi < D)
 
 	# --- Two-pass update for all 4 anchor types ---
 	for ci in range(4):
@@ -1337,16 +811,7 @@ def _wind_update_anchors(
 			anchors_valid[lost, 0] = False
 			anchors_valid[lost, 1] = False
 
-	# --- Update avg pair depth layers if target changed ---
-	target_finite = torch.isfinite(target)
-	target_safe = torch.where(target_finite, target, torch.zeros_like(target))
-	new_avg_lo_d = target_safe.floor().clamp(0, max(D - 2, 0)).long()
-	new_avg_hi_d = (new_avg_lo_d + 1).clamp(max=D - 1)
-	anchors_d[:, 2] = new_avg_lo_d
-	anchors_d[:, 3] = new_avg_hi_d
-	# Invalidate avg anchors where target is not finite or layer out of range
-	anchors_valid[:, 2] = anchors_valid[:, 2] & target_finite & (new_avg_lo_d >= 0) & (new_avg_lo_d < D)
-	anchors_valid[:, 3] = anchors_valid[:, 3] & target_finite & (new_avg_hi_d > new_avg_lo_d)
+	# Avg-pair layer assignment + eligibility was already done before the refine loop.
 
 	return anchors_h, anchors_w, anchors_valid
 
@@ -1425,6 +890,7 @@ def _corr_winding_loss(
 				bk = has_bracket
 				bki = bk.nonzero(as_tuple=True)[0]
 				Q_pair = []
+				ib_pair = [None, None]
 				for ci in [0, 1]:
 					d_ci = _wind_anchors_d[bki, ci]
 					h_ci = _wind_anchors_h[bki, ci]
@@ -1433,8 +899,9 @@ def _corr_winding_loss(
 					v10 = xyz_det[d_ci, (h_ci + 1).clamp(max=Qh), w_ci]
 					v01 = xyz_det[d_ci, h_ci, (w_ci + 1).clamp(max=Qw)]
 					v11 = xyz_det[d_ci, (h_ci + 1).clamp(max=Qh), (w_ci + 1).clamp(max=Qw)]
-					u_c, v_c = _bilinear_project(P[bki], v00, v10, v01, v11)
+					u_c, v_c, ib_c = _ray_quad_intersect(P[bki], gt_n[bki], v00, v10, v01, v11)
 					Q_pair.append(_bilinear_interp(v00, v10, v01, v11, u_c, v_c))
+					ib_pair[ci] = ib_c
 
 				Q_lo, Q_hi = Q_pair
 				P_bk = P[bki]
@@ -1444,7 +911,8 @@ def _corr_winding_loss(
 				frac = uint_lo / (uint_lo + uint_hi + 1e-8)
 				d_lo = _wind_anchors_d[bki, 0].to(dt)
 				winding_obs[bki] = d_lo + frac
-				obs_valid[bki] = sv_lo & sv_hi
+				# Bracketed obs only valid if both ray hits land in-quad on each layer.
+				obs_valid[bki] = sv_lo & sv_hi & ib_pair[0] & ib_pair[1]
 
 			# Single-sided points
 			single = _wind_anchors_valid[:, 0] & ~_wind_anchors_valid[:, 1]
@@ -1457,7 +925,7 @@ def _corr_winding_loss(
 				v10 = xyz_det[d_s, (h_s + 1).clamp(max=Qh), w_s]
 				v01 = xyz_det[d_s, h_s, (w_s + 1).clamp(max=Qw)]
 				v11 = xyz_det[d_s, (h_s + 1).clamp(max=Qh), (w_s + 1).clamp(max=Qw)]
-				u_c, v_c = _bilinear_project(P[si], v00, v10, v01, v11)
+				u_c, v_c, ib = _ray_quad_intersect(P[si], gt_n[si], v00, v10, v01, v11)
 				Q_s = _bilinear_interp(v00, v10, v01, v11, u_c, v_c)
 				_, uw, sv = _wind_strip_integral(P[si], Q_s, gt_n[si], res.data, strip_samples)
 				# Use model surface normal at Q for consistent sign
@@ -1471,7 +939,8 @@ def _corr_winding_loss(
 				above = ((P[si] - Q_s) * surf_n).sum(dim=-1) > 0
 				w_est = torch.where(above, d_s.to(dt) + uw, d_s.to(dt) - uw)
 				winding_obs[si] = w_est
-				obs_valid[si] = sv & (uw < 1.0)
+				# Single-sided obs invalid if ray missed the quad (in_bounds=False).
+				obs_valid[si] = sv & (uw < 1.0) & ib
 
 			# Phase B: Collection averaging
 			_wind_obs_per_point = winding_obs.clone()
@@ -1515,14 +984,15 @@ def _corr_winding_loss(
 				new_d1 = rd[:, 1].tolist()
 				new_v0 = rv[:, 0].tolist()
 				new_v1 = rv[:, 1].tolist()
-				print(f"[corr-wind] re-init {n_ri} points (just_lost={int(just_lost.sum())}, "
-					  f"persistent={int(persistent_lost.sum())}, step={_wind_reinit_counter})")
-				for j in range(n_ri):
-					old_b = f"{old_d0[j]}-{old_d1[j]}" if old_v0[j] and old_v1[j] else "---"
-					new_b = f"{new_d0[j]}-{new_d1[j]}" if new_v0[j] and new_v1[j] else "---"
-					print(f"  pt {int(ri[j])}: bracket {old_b} -> {new_b}")
+				if dbg:
+					print(f"[corr-wind] re-init {n_ri} points (just_lost={int(just_lost.sum())}, "
+						  f"persistent={int(persistent_lost.sum())}, step={_wind_reinit_counter})")
+					for j in range(n_ri):
+						old_b = f"{old_d0[j]}-{old_d1[j]}" if old_v0[j] and old_v1[j] else "---"
+						new_b = f"{new_d0[j]}-{new_d1[j]}" if new_v0[j] and new_v1[j] else "---"
+						print(f"  pt {int(ri[j])}: bracket {old_b} -> {new_b}")
 
-	# === Phase D: Proxy correction loss (avg pair, WITH gradients) ===
+	# === Phase D: Gaussian-splat height-map proxy (avg pair, WITH gradients) ===
 	target = _wind_target_per_point
 	target_finite = torch.isfinite(target)
 	if not target_finite.any():
@@ -1531,101 +1001,169 @@ def _corr_winding_loss(
 		z = torch.zeros((), device=dev, dtype=dt)
 		return z, (torch.zeros((1,), device=dev, dtype=dt),), (torch.zeros((1,), device=dev, dtype=dt),)
 
-	frac = (target - _wind_anchors_d[:, 2].to(dt)).clamp(0.0, 1.0)
+	# Regime classification — must match _wind_brute_force_init / _wind_update_anchors.
+	target_safe = torch.where(target_finite, target, torch.zeros_like(target))
+	inside_t = target_finite & (target_safe >= 0.0) & (target_safe <= float(D - 1))
+
+	# Per-anchor blend weight:
+	#   inside-mesh: smooth lerp between layer_lo and layer_hi (frac ∈ [0,1] by construction)
+	#   one-sided  : full weight 1 on the single active anchor.
+	frac_lo = target_safe - _wind_anchors_d[:, 2].to(dt)              # = target - layer_lo
+	frac_hi = target_safe - (_wind_anchors_d[:, 3].to(dt) - 1.0)      # = target - (layer_hi - 1)
+	ones_t = torch.ones_like(target_safe)
+	frac_weight = {
+		2: torch.where(inside_t, 1.0 - frac_lo, ones_t),
+		3: torch.where(inside_t, frac_hi,        ones_t),
+	}
+
+	all_err = torch.zeros(K, device=dev, dtype=dt)
+	all_too_far = torch.zeros(K, dtype=torch.bool, device=dev)
+	target_obs_sum = torch.zeros(K, device=dev, dtype=dt)
+	target_obs_wsum = torch.zeros(K, device=dev, dtype=dt)
+	normal_align_sum = torch.zeros(K, device=dev, dtype=dt)
+	normal_align_wsum = torch.zeros(K, device=dev, dtype=dt)
+	target_normal_sum = torch.zeros(K, 3, device=dev, dtype=dt)
+
+	# Shared scalar height map and weight accumulator across both ci=2 and ci=3 splats.
+	# H_map carries signed-delta contributions; W_map carries Gaussian × soft-mask weights.
+	H_map = torch.zeros(D, Hm, Wm, device=dev, dtype=dt)
+	W_map = torch.zeros(D, Hm, Wm, device=dev, dtype=dt)
+
+	# Per-corr-point detached pipeline for each ci, then splat into the shared height map.
+	with torch.no_grad():
+		for ci in [2, 3]:
+			valid = _wind_anchors_valid[:, ci] & target_finite
+			if not valid.any():
+				continue
+			vi = valid.nonzero(as_tuple=True)[0]
+			d_ci = _wind_anchors_d[vi, ci]
+			h_ci = _wind_anchors_h[vi, ci]
+			w_ci = _wind_anchors_w[vi, ci]
+
+			# Detached quad corners and ray-along-gt_n projection (same intersection
+			# method as obs / brute_force_init — see plan).
+			M00_det = xyz_det[d_ci, h_ci, w_ci]
+			M10_det = xyz_det[d_ci, h_ci + 1, w_ci]
+			M01_det = xyz_det[d_ci, h_ci, w_ci + 1]
+			M11_det = xyz_det[d_ci, h_ci + 1, w_ci + 1]
+			u_ci, v_ci, ib = _ray_quad_intersect(P[vi], gt_n[vi], M00_det, M10_det, M01_det, M11_det)
+			Q_det = _bilinear_interp(M00_det, M10_det, M01_det, M11_det, u_ci, v_ci)
+
+			# Strip integral → signed winding and validity.  tgt = layer_d − target lets the
+			# same formula serve inside-mesh (frac ∈ [0,1]) AND one-sided (signed offset to
+			# the boundary layer); no clamps.
+			sw, uw, sv = _wind_strip_integral(P[vi], Q_det, gt_n[vi], res.data, strip_samples)
+			layer_d = d_ci.to(dt)
+			tgt = layer_d - target[vi]
+			err = sw - tgt
+			gt_n_q_sampled = res.data.grid_sample_fullres(Q_det.reshape(1, 1, int(Q_det.shape[0]), 3))
+			gt_n_q = gt_n_q_sampled.normal_3d.reshape(int(Q_det.shape[0]), 3)
+			gt_n_q = gt_n_q / (gt_n_q.norm(dim=-1, keepdim=True) + 1e-8)
+			normal_align = (gt_n_q * gt_n[vi]).sum(dim=-1).clamp(-1.0, 1.0)
+			normal_sign = torch.where(normal_align >= 0.0, torch.ones_like(normal_align), -torch.ones_like(normal_align))
+			normal_weight = normal_align.abs()
+
+			# Keep the closest-pair bracket as a trust gate for applying force.
+			# Target-pair measurements are useful for reporting, but if the point
+			# is not bracketed by the current stack and the strip is far away, the
+			# target anchor can produce large, unstable pulls.
+			is_bracketed = _wind_anchors_valid[vi, 0] & _wind_anchors_valid[vi, 1]
+			too_far = ~is_bracketed & (uw > 2.0)
+			all_too_far[vi] |= too_far
+
+			# Track per-point error for reporting (blend-weighted across the two anchors)
+			fw_ci = frac_weight[ci][vi]
+			all_err[vi] += err * fw_ci
+			measure_ok = sv & ib
+			fw_measure = fw_ci * measure_ok.to(dt)
+			target_obs_sum[vi] += (target[vi] - err) * fw_measure
+			target_obs_wsum[vi] += fw_measure
+			normal_align_sum[vi] += normal_align * fw_measure
+			normal_align_wsum[vi] += fw_measure
+			target_normal_sum[vi] += gt_n_q * fw_measure.unsqueeze(-1)
+
+			# Scalar per-point displacement along the sampled target normals.  The error
+			# is measured in the correction-point normal frame, so flip it when the target
+			# intersection normal points the other way.
+			signed_delta = -err * normal_sign
+			# Fold ray-in-bounds and normal alignment into the soft mask: perpendicular
+			# normals contribute no correction; aligned/opposite normals contribute fully.
+			mask_p = sv.to(dt) * (~too_far).to(dt) * fw_ci * ib.to(dt) * normal_weight
+
+			# Continuous mesh-space position of the corr point on the avg-pair quad.
+			h_cont = h_ci.to(dt) + u_ci
+			w_cont = w_ci.to(dt) + v_ci
+
+			_height_map_splat(
+				d_ci, h_ci, w_ci, h_cont, w_cont,
+				signed_delta, mask_p,
+				_corr_splat_sigma, D, Hm, Wm,
+				H_map, W_map,
+			)
+
+	# Apply the height map: for each active vertex, target = M_det + gt_n_v · (H/W).
+	# Sample GT normal at the active vertex 3D positions (one extra grid_sample call).
+	active = W_map > 1e-8
+	n_active = int(active.sum().item())
 
 	total_loss = torch.zeros((), device=dev, dtype=dt)
 	total_wsum = 0.0
-	n_surfaces = 0
-	all_err = torch.zeros(K, device=dev, dtype=dt)
+	if n_active > 0:
+		# Gather active indices and tensors
+		d_idx, h_idx, w_idx = active.nonzero(as_tuple=True)
+		M_active = xyz_lr[d_idx, h_idx, w_idx]                       # live, (Na, 3)
+		M_det_active = xyz_det[d_idx, h_idx, w_idx]                  # detached, (Na, 3)
+		H_active = H_map[d_idx, h_idx, w_idx]                        # (Na,)
+		W_active = W_map[d_idx, h_idx, w_idx]                        # (Na,)
 
-	# Per-surface frac weight: tgt_lo (ci=2) gets 1-frac, tgt_hi (ci=3) gets frac.
-	# Integer targets naturally zero out the second surface.
-	frac_weight = {2: (1.0 - frac), 3: frac}
+		# Sample GT normal at each active vertex's 3D position (detached)
+		Na = int(M_active.shape[0])
+		gt_n_v_sampled = res.data.grid_sample_fullres(M_det_active.reshape(1, 1, Na, 3))
+		gt_n_v = gt_n_v_sampled.normal_3d.reshape(Na, 3)
+		gt_n_v = gt_n_v / (gt_n_v.norm(dim=-1, keepdim=True) + 1e-8)
 
-	for ci, tgt_fn in [(2, lambda f: -f), (3, lambda f: 1.0 - f)]:
-		valid = _wind_anchors_valid[:, ci] & target_finite
-		if not valid.any():
-			continue
-		vi = valid.nonzero(as_tuple=True)[0]
-		d_ci = _wind_anchors_d[vi, ci]
-		h_ci = _wind_anchors_h[vi, ci]
-		w_ci = _wind_anchors_w[vi, ci]
+		# target_v = M_det_v + gt_n_v · (H_v / W_v)  (3D)
+		h_per_v = (H_active / W_active.clamp_min(1e-8)).unsqueeze(-1)
+		target_active = M_det_active + gt_n_v * h_per_v
 
-		# Gather 4 model quad corners WITH gradients
-		M00 = xyz_lr[d_ci, h_ci, w_ci]
-		M10 = xyz_lr[d_ci, h_ci + 1, w_ci]
-		M01 = xyz_lr[d_ci, h_ci, w_ci + 1]
-		M11 = xyz_lr[d_ci, h_ci + 1, w_ci + 1]
-
-		with torch.no_grad():
-			M00_det = M00.detach()
-			M10_det = M10.detach()
-			M01_det = M01.detach()
-			M11_det = M11.detach()
-
-			# Project P onto quad (detached u,v for weights)
-			u_ci, v_ci = _bilinear_project(P[vi], M00_det, M10_det, M01_det, M11_det)
-
-			# Bilinear model point (detached)
-			uf = u_ci.unsqueeze(-1)
-			vf = v_ci.unsqueeze(-1)
-			Q = (1 - uf) * (1 - vf) * M00_det + uf * (1 - vf) * M10_det + \
-				(1 - uf) * vf * M01_det + uf * vf * M11_det
-
-			# Strip from P to Q: signed winding
-			sw, _, sv = _wind_strip_integral(P[vi], Q, gt_n[vi], res.data, strip_samples)
-
-			# Target offset
-			tgt = tgt_fn(frac[vi])
-			err = sw - tgt
-
-			# Store error for results (weighted by frac proximity)
-			fw = frac_weight[ci][vi]
-			all_err[vi] += err * fw
-
-			# Proxies: shift each corner by gt_n * err
-			we = err.unsqueeze(-1)
-			gt_n_vi = gt_n[vi]
-			proxy00 = M00_det - gt_n_vi * we
-			proxy10 = M10_det - gt_n_vi * we
-			proxy01 = M01_det - gt_n_vi * we
-			proxy11 = M11_det - gt_n_vi * we
-
-		# Bilinear weights
-		w00 = (1 - u_ci) * (1 - v_ci)
-		w10 = u_ci * (1 - v_ci)
-		w01 = (1 - u_ci) * v_ci
-		w11 = u_ci * v_ci
-
-		# L2 loss (gradients flow through M00..M11)
-		lm00 = (M00 - proxy00).square().sum(dim=-1)
-		lm10 = (M10 - proxy10).square().sum(dim=-1)
-		lm01 = (M01 - proxy01).square().sum(dim=-1)
-		lm11 = (M11 - proxy11).square().sum(dim=-1)
-
-		lm = w00 * lm00 + w10 * lm10 + w01 * lm01 + w11 * lm11
-
-		# Mask by strip validity, weighted by frac proximity to target
-		mask_ci = sv.to(dt) * frac_weight[ci][vi]
-		wsum = float(mask_ci.sum().detach().cpu())
-		if wsum > 0:
-			total_loss = total_loss + (lm * mask_ci).sum()
-			total_wsum += wsum
-		n_surfaces += 1
+		# loss = Σ W_v · ||M_v - target_v||²  (gradient flows through M_active)
+		diff = M_active - target_active
+		total_loss = total_loss + (W_active * diff.square().sum(dim=-1)).sum()
+		total_wsum = float(W_active.sum().detach().cpu())
 
 	if dbg:
 		n_valid = int(target_finite.sum().item())
 		rms = float(total_loss.detach().sqrt().item()) if total_wsum > 0 else float("nan")
 		print(f"[corr-wind] loss={float(total_loss.detach().item()):.6f}, "
-			  f"valid={n_valid}/{K}, rms_proxy={rms:.4f}")
+			  f"valid={n_valid}/{K}, active_verts={n_active}, rms_proxy={rms:.4f}")
 
-	# Build results — point is valid only if it has at least one valid tgt anchor
+	# Build results — point is valid only if it has a valid tgt anchor and is not too far
 	has_tgt_anchor = _wind_anchors_valid[:, 2] | _wind_anchors_valid[:, 3]
-	point_valid = target_finite & has_tgt_anchor
+	point_valid = target_finite & has_tgt_anchor & ~all_too_far
+	target_obs = torch.where(
+		target_obs_wsum > 1e-8,
+		target_obs_sum / target_obs_wsum.clamp_min(1e-8),
+		torch.full_like(target_obs_sum, float("nan")))
+	normal_alignment = torch.where(
+		normal_align_wsum > 1e-8,
+		normal_align_sum / normal_align_wsum.clamp_min(1e-8),
+		torch.full_like(normal_align_sum, float("nan")))
+	target_normal = target_normal_sum / normal_align_wsum.clamp_min(1e-8).unsqueeze(-1)
+	target_normal = target_normal / target_normal.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+	target_normal = torch.where(
+		(normal_align_wsum > 1e-8).unsqueeze(-1),
+		target_normal,
+		torch.full_like(target_normal, float("nan")))
+	report_obs = torch.where(
+		is_absolute & torch.isfinite(target_obs),
+		target_obs,
+		_wind_obs_per_point)
 	_last_results = _build_winding_results(
-		winding_obs=_wind_obs_per_point, target=target,
+		winding_obs=report_obs, target=target,
 		err=all_err, pt_ids=pt_ids, col=col, pts=pts, winda=winda,
 		valid=point_valid, is_absolute=is_absolute,
+		point_normal=gt_n, target_normal=target_normal,
+		normal_alignment=normal_alignment,
 	)
 	if _dbg_call_count == 1:
 		print_detail("INIT")
@@ -1639,23 +1177,40 @@ def _build_winding_results(
 	*, winding_obs: torch.Tensor, target: torch.Tensor,
 	err: torch.Tensor, pt_ids: torch.Tensor, col: torch.Tensor,
 	pts: torch.Tensor, winda: torch.Tensor, valid: torch.Tensor,
-	is_absolute: torch.Tensor,
+	is_absolute: torch.Tensor, point_normal: torch.Tensor,
+	target_normal: torch.Tensor, normal_alignment: torch.Tensor,
 ) -> dict:
 	"""Build JSON-serializable dict of per-point winding results."""
 	result: dict = {"points": {}, "collection_avgs": {}}
 	K = int(pts.shape[0])
+
+	def _finite_float(t: torch.Tensor) -> float | None:
+		v = float(t.item())
+		return v if math.isfinite(v) else None
+
+	def _finite_vec(t: torch.Tensor) -> list[float] | None:
+		vals = [float(t[j].item()) for j in range(int(t.shape[0]))]
+		if not all(math.isfinite(v) for v in vals):
+			return None
+		return [round(v, 6) for v in vals]
+
 	for i in range(K):
 		pid = int(pt_ids[i].item())
 		cid = int(col[i].item())
-		w_obs = float(winding_obs[i].item()) if math.isfinite(float(winding_obs[i].item())) else None
-		w_tgt = float(target[i].item()) if math.isfinite(float(target[i].item())) else None
-		e = float(err[i].item()) if bool(valid[i]) and math.isfinite(float(err[i].item())) else None
+		w_obs = _finite_float(winding_obs[i])
+		w_tgt = _finite_float(target[i])
+		e_raw = _finite_float(err[i])
+		e = e_raw if bool(valid[i]) else None
+		n_dot = _finite_float(normal_alignment[i])
 		entry: dict = {
 			"collection_id": cid,
 			"p": [round(float(pts[i, j].item()), 2) for j in range(3)],
 			"winding_obs": round(w_obs, 6) if w_obs is not None else None,
 			"winding_target": round(w_tgt, 6) if w_tgt is not None else None,
 			"winding_err": round(e, 6) if e is not None else None,
+			"normal_alignment": round(n_dot, 6) if n_dot is not None else None,
+			"point_normal": _finite_vec(point_normal[i]),
+			"target_normal": _finite_vec(target_normal[i]),
 			"valid": bool(valid[i]),
 			"absolute": bool(is_absolute[i]),
 		}
@@ -1669,238 +1224,4 @@ def _build_winding_results(
 			v = float(target[mask].mean().item())
 			if math.isfinite(v):
 				result["collection_avgs"][str(cid_int)] = round(v, 6)
-	return result
-
-
-# ---------------------------------------------------------------------------
-# Corr snap-to-surface loss (D=1 only, single anchor per point)
-# ---------------------------------------------------------------------------
-
-def _corr_snap_to_surface_loss(
-	*, res: fit_model.FitResult3D,
-) -> tuple[torch.Tensor, tuple[torch.Tensor, ...], tuple[torch.Tensor, ...]]:
-	"""Snap-to-surface corr loss: push single winding toward each corr point.
-
-	D=1 only. One ray-bilinear anchor per point on layer 0. Proxy correction
-	pushes the surface toward P, scaled by the grad_mag strip integral between
-	the surface and P (so far-away points with weak signal contribute less).
-	"""
-	global _dbg_call_count, _last_results
-	global _csnap_anchors_h, _csnap_anchors_w, _csnap_anchors_valid, _csnap_initialized
-
-	_dbg_call_count += 1
-	dbg = (_dbg_call_count <= 2)
-
-	dev = res.xyz_lr.device
-	dt = res.xyz_lr.dtype
-	zero = torch.zeros((), device=dev, dtype=dt)
-	dummy_ret = (zero, (torch.zeros((1,), device=dev, dtype=dt),),
-				 (torch.zeros((1,), device=dev, dtype=dt),))
-
-	pts_c = res.data.corr_points
-	if pts_c is None or pts_c.points_xyz_winda.shape[0] == 0:
-		if dbg:
-			print("[corr-snap2s] no correction points")
-		return dummy_ret
-
-	# Filter to absolute-only points
-	abs_mask = pts_c.is_absolute.to(device=dev)
-	if not abs_mask.any():
-		if dbg:
-			print("[corr-snap2s] no absolute points")
-		return dummy_ret
-
-	pts = pts_c.points_xyz_winda[abs_mask].to(device=dev, dtype=dt)
-	col = pts_c.collection_idx[abs_mask].to(device=dev, dtype=torch.int64)
-	pt_ids = pts_c.point_ids[abs_mask].to(device=dev, dtype=torch.int64)
-	K = int(pts.shape[0])
-	P = pts[:, :3]
-
-	xyz_lr = res.xyz_lr
-	D, Hm, Wm, _ = xyz_lr.shape
-	Qh, Qw = Hm - 1, Wm - 1
-
-	if D != 1:
-		if dbg:
-			print(f"[corr-snap2s] D={D} != 1, corr_snap only for single-winding models")
-		return dummy_ret
-	if Qh <= 0 or Qw <= 0:
-		return dummy_ret
-
-	xyz_det = xyz_lr.detach()
-	strip_samples = max(2, int(res.params.subsample_mesh) + 1)
-
-	# GT normal at corr point positions (for strip integral sign + proxy direction)
-	gt_n_sampled = res.data.grid_sample_fullres(P.reshape(1, 1, K, 3))
-	gt_n = gt_n_sampled.normal_3d.reshape(K, 3)
-	gt_n = gt_n / (gt_n.norm(dim=-1, keepdim=True) + 1e-8)
-
-	# --- Initialize or update anchors ---
-	d_layer = torch.zeros(K, dtype=torch.long, device=dev)  # always layer 0
-
-	if not _csnap_initialized or _csnap_anchors_h is None or _csnap_anchors_h.shape[0] != K:
-		if dbg:
-			print(f"[corr-snap2s] brute-force init: K={K} points, mesh=(1,{Hm},{Wm})")
-		with torch.no_grad():
-			ah, aw, au, av = _wind_nearest_quad_on_layer(P, gt_n, xyz_det, d_layer, Qh, Qw)
-			in_bounds = (au >= 0) & (au <= 1) & (av >= 0) & (av <= 1)
-			_csnap_anchors_h = ah
-			_csnap_anchors_w = aw
-			_csnap_anchors_valid = in_bounds
-		_csnap_initialized = True
-		# Fall through to the update step below for distance validation
-
-	# Two-pass ray-bilinear update + distance validation (runs every step, including after init)
-	with torch.no_grad():
-		def _gather_quad_cs(d, h, w):
-			return (xyz_det[d, h, w],
-					xyz_det[d, (h + 1).clamp(max=Qh), w],
-					xyz_det[d, h, (w + 1).clamp(max=Qw)],
-					xyz_det[d, (h + 1).clamp(max=Qh), (w + 1).clamp(max=Qw)])
-
-		row = _csnap_anchors_h
-		col_a = _csnap_anchors_w
-
-		# Pass 1: intersect on current quad
-		M00, M10, M01, M11 = _gather_quad_cs(d_layer, row, col_a)
-		frac_h = torch.full_like(row, 0.5, dtype=dt)
-		frac_w = torch.full_like(col_a, 0.5, dtype=dt)
-		u1, v1 = fit_model.Model3D._ray_bilinear_intersect(
-			P, gt_n, M00, M10, M01, M11, frac_h, frac_w)
-
-		# Shift quad idx
-		new_h = (row.float() + u1).clamp(0, Hm - 2)
-		new_w = (col_a.float() + v1).clamp(0, Wm - 2)
-		new_row = new_h.floor().clamp(0, Hm - 2).long()
-		new_col = new_w.floor().clamp(0, Wm - 2).long()
-		new_frac_h = new_h - new_row.float()
-		new_frac_w = new_w - new_col.float()
-
-		# Pass 2: re-intersect on shifted quad
-		M00, M10, M01, M11 = _gather_quad_cs(d_layer, new_row, new_col)
-		u2, v2 = fit_model.Model3D._ray_bilinear_intersect(
-			P, gt_n, M00, M10, M01, M11, new_frac_h, new_frac_w)
-
-		final_h = (new_row.float() + u2).nan_to_num_(0.0).clamp(0, Hm - 2)
-		final_w = (new_col.float() + v2).nan_to_num_(0.0).clamp(0, Wm - 2)
-		_csnap_anchors_h = final_h.floor().long()
-		_csnap_anchors_w = final_w.floor().long()
-		_csnap_anchors_valid = (u2 >= 0) & (u2 <= 1) & (v2 >= 0) & (v2 <= 1)
-
-	# --- Proxy correction loss ---
-	valid = _csnap_anchors_valid
-	if not valid.any():
-		if dbg:
-			print("[corr-snap2s] no valid anchors")
-		_last_results = _build_csnap_results(
-			pt_ids=pt_ids, col_idx=col, pts=pts, valid=valid,
-			signed_dist=torch.zeros(K, device=dev, dtype=dt))
-		return dummy_ret
-
-	vi = valid.nonzero(as_tuple=True)[0]
-	h_vi = _csnap_anchors_h[vi]
-	w_vi = _csnap_anchors_w[vi]
-	d_vi = torch.zeros_like(h_vi)  # layer 0
-
-	# Gather model quad corners WITH gradients
-	M00 = xyz_lr[d_vi, h_vi, w_vi]
-	M10 = xyz_lr[d_vi, h_vi + 1, w_vi]
-	M01 = xyz_lr[d_vi, h_vi, w_vi + 1]
-	M11 = xyz_lr[d_vi, h_vi + 1, w_vi + 1]
-
-	with torch.no_grad():
-		M00_det = M00.detach()
-		M10_det = M10.detach()
-		M01_det = M01.detach()
-		M11_det = M11.detach()
-
-		# Project P onto quad (detached u,v for bilinear weights)
-		u_ci, v_ci = _bilinear_project(P[vi], M00_det, M10_det, M01_det, M11_det)
-
-		# Bilinear model point (detached)
-		uf = u_ci.unsqueeze(-1)
-		vf = v_ci.unsqueeze(-1)
-		Q = (1 - uf) * (1 - vf) * M00_det + uf * (1 - vf) * M10_det + \
-			(1 - uf) * vf * M01_det + uf * vf * M11_det
-
-		# Strip integral from P to Q
-		sw, uw, sv = _wind_strip_integral(P[vi], Q, gt_n[vi], res.data, strip_samples)
-
-		# Error: signed winding from surface to point should be 0
-		# (we want surface AT the point, so target offset is 0)
-		err = sw
-
-		# Invalidate points too far from the surface (> 2 windings)
-		too_far = uw > 2.0
-		if too_far.any():
-			# Update validity — mark as invalid in anchor state
-			vi_too_far = vi[too_far]
-			_csnap_anchors_valid[vi_too_far] = False
-
-		# Store signed distance for results
-		all_signed_dist = torch.zeros(K, device=dev, dtype=dt)
-		all_signed_dist[vi] = err.detach()
-
-		# Proxies: shift each corner by gt_n * err
-		we = err.unsqueeze(-1)
-		gt_n_vi = gt_n[vi]
-		proxy00 = M00_det - gt_n_vi * we
-		proxy10 = M10_det - gt_n_vi * we
-		proxy01 = M01_det - gt_n_vi * we
-		proxy11 = M11_det - gt_n_vi * we
-
-	# Bilinear weights
-	w00 = (1 - u_ci) * (1 - v_ci)
-	w10 = u_ci * (1 - v_ci)
-	w01 = (1 - u_ci) * v_ci
-	w11 = u_ci * v_ci
-
-	# L2 loss (gradients flow through M00..M11), masked by distance threshold
-	lm00 = (M00 - proxy00).square().sum(dim=-1)
-	lm10 = (M10 - proxy10).square().sum(dim=-1)
-	lm01 = (M01 - proxy01).square().sum(dim=-1)
-	lm11 = (M11 - proxy11).square().sum(dim=-1)
-	lm = w00 * lm00 + w10 * lm10 + w01 * lm01 + w11 * lm11
-	lm_mask = (~too_far).to(dt)
-	loss = (lm * lm_mask).sum()
-
-	# Re-read valid after too_far update
-	valid = _csnap_anchors_valid
-	if dbg:
-		rms = float(loss.detach().sqrt().item()) if loss.item() > 0 else float("nan")
-		n_valid = int(valid.sum().item())
-		print(f"[corr-snap2s] loss={float(loss.detach().item()):.6f}, "
-			  f"valid={n_valid}/{K}, rms_proxy={rms:.4f}")
-
-	_last_results = _build_csnap_results(
-		pt_ids=pt_ids, col_idx=col, pts=pts, valid=valid,
-		signed_dist=all_signed_dist)
-	if _dbg_call_count == 1:
-		print_detail("INIT")
-
-	err_sq_all = all_signed_dist * all_signed_dist
-	mask_out = valid.to(dt)
-	return loss, (err_sq_all,), (mask_out,)
-
-
-def _build_csnap_results(
-	*, pt_ids: torch.Tensor, col_idx: torch.Tensor, pts: torch.Tensor,
-	valid: torch.Tensor, signed_dist: torch.Tensor,
-) -> dict:
-	"""Build JSON-serializable dict of per-point corr_snap results."""
-	result: dict = {"points": {}, "collection_avgs": {}}
-	K = int(pts.shape[0])
-	for i in range(K):
-		pid = int(pt_ids[i].item())
-		cid = int(col_idx[i].item())
-		sd = float(signed_dist[i].item()) if bool(valid[i]) else None
-		entry: dict = {
-			"collection_id": cid,
-			"p": [round(float(pts[i, j].item()), 2) for j in range(3)],
-			"winding_obs": 0.0 if bool(valid[i]) else None,
-			"winding_target": 0.0 if bool(valid[i]) else None,
-			"winding_err": round(sd, 6) if sd is not None and math.isfinite(sd) else None,
-			"valid": bool(valid[i]),
-		}
-		result["points"][str(pid)] = entry
 	return result

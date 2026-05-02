@@ -3,6 +3,7 @@
 #include <QObject>
 #include <QPointer>
 #include <array>
+#include <memory>
 #include <string>
 
 #include "vc/core/util/RemoteAuth.hpp"
@@ -31,6 +32,14 @@ public:
     void loadAttachedRemoteVolumesForCurrentPackage();
 
 private slots:
+    void newProject();
+    void saveProjectAs();
+    void attachVolume();
+    void attachSegments();
+    void attachNormalGrid();
+    void detachEntry();
+    void setOutputSegments();
+    void convertLegacyVolpkg();
     void openVolpkg();
     void openRecentVolpkg();
     void openLocalZarr();
@@ -51,7 +60,6 @@ private slots:
 private:
     QStringList loadRecentPaths() const;
     void saveRecentPaths(const QStringList& paths);
-    void rebuildRecentMenu();
     void ensureRecentActions();
 
     QStringList loadRecentRemoteUrls() const;
@@ -62,9 +70,19 @@ private:
                               vc::HttpAuth* authOut,
                               bool allowPrompt,
                               QString* errorMessage = nullptr) const;
+    // Runs vc_volpkg_convert against `inputLocation` (legacy folder or remote URL),
+    // prompts the user for an output .volpkg.json, and returns the written path
+    // via `convertedOut` on success.
+    bool runLegacyVolpkgConvert(const QString& inputLocation, QString* convertedOut);
     QString remoteCacheDirectory() const;
     QString remoteVolumeRegistryPath() const;
     void persistAttachedRemoteVolume(const QString& url, const std::shared_ptr<Volume>& volume);
+    QString promptLocation(const QString& title,
+                           const QString& hint,
+                           const QString& defaultDir,
+                           const QStringList& localFilters,
+                           bool acceptFiles,
+                           bool acceptDirs);
 
     CWindow* _window{nullptr};
 
@@ -77,6 +95,14 @@ private:
     QMenu* _helpMenu{nullptr};
     QMenu* _recentMenu{nullptr};
 
+    QAction* _newProjectAct{nullptr};
+    QAction* _saveProjectAsAct{nullptr};
+    QAction* _attachVolumeAct{nullptr};
+    QAction* _attachSegmentsAct{nullptr};
+    QAction* _attachNormalGridAct{nullptr};
+    QAction* _detachEntryAct{nullptr};
+    QAction* _setOutputSegmentsAct{nullptr};
+    QAction* _convertLegacyAct{nullptr};
     QAction* _openAct{nullptr};
     QAction* _openLocalZarrAct{nullptr};
     QAction* _attachRemoteZarrAct{nullptr};

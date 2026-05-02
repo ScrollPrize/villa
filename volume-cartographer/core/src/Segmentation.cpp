@@ -94,7 +94,7 @@ std::shared_ptr<Segmentation> Segmentation::New(const std::filesystem::path& pat
 
 bool Segmentation::isSurfaceLoaded() const
 {
-    return surface_ != nullptr;
+    return surface_ != nullptr && surface_->isLoaded();
 }
 
 bool Segmentation::canLoadSurface() const

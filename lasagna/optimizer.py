@@ -152,9 +152,6 @@ lambda_global: dict[str, float] = {
 	"data_plain": 0.0,
 	"pred_dt": 0.0,
 	"corr": 0.0,
-	"corr_snap": 0.0,
-	"corr_legacy": 0.0,
-	"corr_signed": 0.0,
 	"winding_vol": 0.0,
 	"station_n": 0.0,
 	"station_t": 0.0,
@@ -276,6 +273,7 @@ def optimize(
 	ensure_data_fn=None,
 	seed_xyz: tuple[float, float, float] | None = None,
 ) -> fit_data.FitData3D:
+	opt_loss_corr.reset_state()
 
 	terms = {
 		"step": {"loss": opt_loss_step.step_loss},
@@ -286,9 +284,6 @@ def optimize(
 		"data_plain": {"loss": opt_loss_data.data_plain_loss},
 		"pred_dt": {"loss": opt_loss_pred_dt.pred_dt_loss},
 		"corr": {"loss": opt_loss_corr.corr_winding_loss},
-		"corr_snap": {"loss": opt_loss_corr.corr_snap_loss},
-		"corr_legacy": {"loss": opt_loss_corr.corr_legacy_loss},
-		"corr_signed": {"loss": opt_loss_corr.corr_signed_loss},
 		"winding_vol": {"loss": opt_loss_winding_volume.winding_volume_loss},
 		"station": {"loss": opt_loss_station.station_loss, "sub": ["station_n", "station_t"]},
 		"bend": {"loss": opt_loss_bend.bend_loss},
@@ -302,6 +297,10 @@ def optimize(
 			  f"lr={opt_cfg.lr} min_scaledown={opt_cfg.min_scaledown}", flush=True)
 		if opt_cfg.steps <= 0:
 			return data
+
+		# Configure corr Phase D Gaussian-splat σ (default 1.0; 7×7 vertex neighborhood).
+		corr_splat_sigma = float(opt_cfg.args.get("corr_splat_sigma", 1.0)) if opt_cfg.args else 1.0
+		opt_loss_corr.set_splat_sigma(corr_splat_sigma)
 
 		# If arc/straight params not in optimized set, bake into mesh
 		arc_params_set = {"arc_cx", "arc_cy", "arc_radius", "arc_angle0", "arc_angle1"}
@@ -328,7 +327,7 @@ def optimize(
 				for p in group:
 					param_groups.append({"params": [p], "lr": lr_last})
 		if not param_groups:
-			return
+			return data
 		opt = torch.optim.Adam(param_groups)
 
 		# winding_offset_autocrop: compute offset/direction then crop invalid depth layers
@@ -396,12 +395,6 @@ def optimize(
 		if ensure_data_fn is not None:
 			data = ensure_data_fn(data, _needed_channels)
 
-		# Station-keeping: set seed point anchor (once, on first stage that uses it)
-		if (_need_term("station_n", opt_cfg.eff) > 0 or _need_term("station_t", opt_cfg.eff) > 0) and seed_xyz is not None:
-			dev = next(model.parameters()).device
-			seed_t = torch.tensor(list(seed_xyz), device=dev, dtype=torch.float32)
-			opt_loss_station.set_seed(seed_t, data, Hm=model.mesh_h, Wm=model.mesh_w, D=model.depth)
-
 		# Initial evaluation
 		def _eval_terms(res_, eff_):
 			"""Evaluate all loss terms, handling both single and multi-loss returns."""
@@ -453,8 +446,22 @@ def optimize(
 			for _cache in _active_caches:
 				_sp = data._spacing_for(_cache.channels[0])
 				_cache.prefetch(_xyz_hr_pf, data.origin_fullres, _sp)
+			# Also prefetch chunks for corr points (static positions, loaded once)
+			if data.corr_points is not None and data.corr_points.points_xyz_winda.shape[0] > 0:
+				_corr_xyz = data.corr_points.points_xyz_winda[:, :3].to(
+					device=next(model.parameters()).device, dtype=torch.float32)
+				for _cache in _active_caches:
+					_sp = data._spacing_for(_cache.channels[0])
+					_cache.prefetch(_corr_xyz, data.origin_fullres, _sp)
 			for _cache in _active_caches:
 				_cache.sync()
+
+		# Station-keeping: set seed point anchor (once, on first stage that uses it)
+		# Must be AFTER prefetch+sync so grid_sample_fullres can read loaded chunks.
+		if (_need_term("station_n", opt_cfg.eff) > 0 or _need_term("station_t", opt_cfg.eff) > 0) and seed_xyz is not None:
+			dev = next(model.parameters()).device
+			seed_t = torch.tensor(list(seed_xyz), device=dev, dtype=torch.float32)
+			opt_loss_station.set_seed(seed_t, data, Hm=model.mesh_h, Wm=model.mesh_w, D=model.depth)
 
 		with torch.no_grad():
 			res0 = model(data)
@@ -467,7 +474,7 @@ def optimize(
 			param_vals0 = {k: round(v, 4) for k, v in param_vals0.items()}
 			_print_status(step_label=f"{label} 0/{opt_cfg.steps}", loss_val=loss0.item(), tv=term_vals0, pv=param_vals0)
 			# Print corr detail after initial eval (first stage only)
-			if not _corr_start_printed[0] and any(t in term_vals0 for t in ("corr", "corr_snap", "corr_legacy", "corr_signed")):
+			if not _corr_start_printed[0] and "corr" in term_vals0:
 				opt_loss_corr.print_detail("START")
 				_corr_start_printed[0] = True
 		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data, res=res0)
@@ -553,7 +560,7 @@ def optimize(
 	_num_stages = len(stages)
 
 	# Debug: show corr status
-	_corr_terms = ("corr", "corr_snap", "corr_legacy", "corr_signed")
+	_corr_terms = ("corr",)
 	has_corr_pts = data.corr_points is not None and data.corr_points.points_xyz_winda.shape[0] > 0
 	corr_weights = {t: [(_need_term(t, s.global_opt.eff), s.name) for s in stages if s.global_opt.steps > 0]
 					for t in _corr_terms}
@@ -569,6 +576,14 @@ def optimize(
 	for si, stage in enumerate(stages):
 		if stage.global_opt.steps > 0:
 			data = _run_opt(si=si, label=f"stage{si}", stage=stage, opt_cfg=stage.global_opt, data=data)
+			if active_corr:
+				opt_loss_corr.print_detail(f"stage{si} END")
+				opt_loss_corr.print_summary()
+
+	# Print sparse cache summary
+	if data.sparse_caches:
+		for _cache in data.sparse_caches.values():
+			_cache.print_summary()
 
 	if active_corr:
 		opt_loss_corr.print_detail("END")

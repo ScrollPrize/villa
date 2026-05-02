@@ -11,6 +11,7 @@ public:
     CVolumeViewerView(QWidget* parent = 0);
     void mouseReleaseEvent(QMouseEvent *event) override;
     void mousePressEvent(QMouseEvent *event) override;
+    void mouseDoubleClickEvent(QMouseEvent *event) override;
     void mouseMoveEvent(QMouseEvent *event) override;
     void wheelEvent(QWheelEvent *event) override;
     void scrollContentsBy(int dx, int dy) override;
@@ -39,6 +40,7 @@ signals:
     void sendPanStart(Qt::MouseButton, Qt::KeyboardModifiers);
     void sendCursorMove(QPointF);
     void sendMousePress(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
+    void sendMouseDoubleClick(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void sendMouseMove(QPointF, Qt::MouseButtons, Qt::KeyboardModifiers);
     void sendMouseRelease(QPointF, Qt::MouseButton, Qt::KeyboardModifiers);
     void sendKeyPress(int key, Qt::KeyboardModifiers modifiers);

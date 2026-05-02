@@ -348,6 +348,8 @@ void SegmentationModule::bindWidgetSignals()
 
     connect(_widget, &SegmentationWidget::editingModeChanged,
             this, &SegmentationModule::setEditingEnabled);
+    connect(_widget, &SegmentationWidget::annotateToggled,
+            this, &SegmentationModule::setAnnotateMode);
     connect(_widget, &SegmentationWidget::drawMaskChanged,
             this, &SegmentationModule::setDrawMaskEnabled);
     connect(_widget, &SegmentationWidget::dragRadiusChanged,
@@ -394,8 +396,6 @@ void SegmentationModule::bindWidgetSignals()
             this, &SegmentationModule::onCorrectionsCreateRequested);
     connect(_widget, &SegmentationWidget::correctionsCollectionSelected,
             this, &SegmentationModule::onCorrectionsCollectionSelected);
-    connect(_widget, &SegmentationWidget::correctionsAnnotateToggled,
-            this, &SegmentationModule::onCorrectionsAnnotateToggled);
     connect(_widget, &SegmentationWidget::correctionsZRangeChanged,
             this, &SegmentationModule::onCorrectionsZRangeChanged);
     connect(_widget, &SegmentationWidget::showApprovalMaskChanged,
@@ -471,6 +471,12 @@ void SegmentationModule::bindViewerSignals(VolumeViewerBase* viewer)
                                      const QPointF& scenePos) {
                     handleMouseRelease(viewer, worldPos, button, modifiers, scenePos);
                 });
+        connect(chunkedViewer, &CChunkedVolumeViewer::sendMouseDoubleClickVolume,
+                this, [this, viewer](const cv::Vec3f& worldPos,
+                                     Qt::MouseButton button,
+                                     Qt::KeyboardModifiers modifiers) {
+                    handleMouseDoubleClick(viewer, worldPos, button, modifiers);
+                });
         connect(chunkedViewer, &CChunkedVolumeViewer::sendSegmentationRadiusWheel,
                 this, [this, viewer](int steps, const QPointF& scenePoint, const cv::Vec3f& worldPos) {
                     handleWheel(viewer, steps, scenePoint, worldPos);
@@ -521,6 +527,15 @@ void SegmentationModule::setIgnoreSegSurfaceChange(bool ignore)
     _ignoreSegSurfaceChange = ignore;
 }
 
+void SegmentationModule::setAnnotateMode(bool enabled)
+{
+    if (_annotateMode == enabled) {
+        return;
+    }
+    _annotateMode = enabled;
+    emit annotateModeChanged(enabled);
+}
+
 void SegmentationModule::setEditingEnabled(bool enabled)
 {
     if (_editingEnabled == enabled) {
@@ -535,7 +550,6 @@ void SegmentationModule::setEditingEnabled(bool enabled)
     if (!enabled) {
         resetManualAddState(true);
         stopAllPushPull();
-        setCorrectionsAnnotateMode(false, false);
         clearLineDragStroke();
         _lineDrawKeyActive = false;
         clearUndoStack();
@@ -1066,7 +1080,7 @@ void SegmentationModule::setGrowthInProgress(bool running)
         _corrections->setGrowthInProgress(running);
     }
     if (running) {
-        setCorrectionsAnnotateMode(false, false);
+        setAnnotateMode(false);
         clearLineDragStroke();
         _lineDrawKeyActive = false;
         resetHoverLookupDetail();
@@ -1323,18 +1337,6 @@ void SegmentationModule::updateCorrectionsWidget()
     }
 }
 
-void SegmentationModule::setCorrectionsAnnotateMode(bool enabled, bool userInitiated)
-{
-    if (!_corrections) {
-        return;
-    }
-
-    const bool wasActive = _corrections->annotateMode();
-    const bool isActive = _corrections->setAnnotateMode(enabled, userInitiated, _editingEnabled);
-    if (isActive && !wasActive) {
-    }
-}
-
 void SegmentationModule::setActiveCorrectionCollection(uint64_t collectionId, bool userInitiated)
 {
     if (_corrections) {
@@ -1347,15 +1349,59 @@ uint64_t SegmentationModule::createCorrectionCollection(bool announce)
     return _corrections ? _corrections->createCollection(announce) : 0;
 }
 
-void SegmentationModule::handleCorrectionPointAdded(const cv::Vec3f& worldPos)
+void SegmentationModule::handleCorrectionPointAdded(const cv::Vec3f& worldPos, uint64_t collectionId)
 {
     if (!_corrections) return;
 
+    // If a specific collection is requested, switch to it
+    if (collectionId != 0) {
+        _corrections->setActiveCollection(collectionId, false);
+    }
+
+    // Auto-create collection on first annotation
+    if (!_corrections->hasActiveCollection()) {
+        createCorrectionCollection(false);
+    }
+
     // Look up winding depth index from d.tif channel → store in winding_annotation
     float wind_a = NAN;
-    auto* surface = activeBaseSurface();
-    if (surface && _editManager) {
-        auto gridIdx = _editManager->worldToGridIndex(worldPos);
+    QuadSurface* surface = activeBaseSurface();
+    std::shared_ptr<Surface> surfaceHolder;
+
+    // Fallback: get surface from state if no editing session
+    if (!surface && _state) {
+        surfaceHolder = _state->surface("segmentation");
+        surface = dynamic_cast<QuadSurface*>(surfaceHolder.get());
+    }
+
+    if (surface) {
+        // Try edit manager first (has preview points if editing)
+        std::optional<std::pair<int, int>> gridIdx;
+        if (_editManager && _editManager->hasSession()) {
+            gridIdx = _editManager->worldToGridIndex(worldPos);
+        }
+
+        // Fallback: use patch index directly
+        if (!gridIdx) {
+            auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
+            auto surfQ = surfaceHolder
+                ? std::dynamic_pointer_cast<QuadSurface>(surfaceHolder)
+                : activeBaseSurfaceShared();
+            if (patchIndex && !patchIndex->empty() && surfQ) {
+                const auto* pts = surface->rawPointsPtr();
+                if (pts && pts->rows > 0 && pts->cols > 0) {
+                    float tol = std::max(surface->scale()[0] * 64.0f, 512.0f);
+                    auto hit = patchIndex->locate(worldPos, tol, surfQ);
+                    if (hit) {
+                        cv::Vec2f grid = surface->ptrToGrid(hit->ptr);
+                        int col = std::clamp(static_cast<int>(std::round(grid[0])), 0, pts->cols - 1);
+                        int row = std::clamp(static_cast<int>(std::round(grid[1])), 0, pts->rows - 1);
+                        gridIdx = {row, col};
+                    }
+                }
+            }
+        }
+
         if (gridIdx) {
             wind_a = lookupDepthIndex(surface, gridIdx->first, gridIdx->second);
         }
@@ -1480,29 +1526,103 @@ void SegmentationModule::cancelCorrectionDrag()
     }
 }
 
+SegmentationModule::NearestPointResult SegmentationModule::findNearestPoint(const cv::Vec3f& worldPos, float maxDist)
+{
+    NearestPointResult result;
+    if (!_pointCollection) {
+        return result;
+    }
+
+    const auto& collections = _pointCollection->getAllCollections();
+    for (const auto& [colId, col] : collections) {
+        for (const auto& [ptId, pt] : col.points) {
+            const float dist = static_cast<float>(cv::norm(pt.p - worldPos));
+            if (dist < result.distance && dist <= maxDist) {
+                result.pointId = ptId;
+                result.collectionId = colId;
+                result.distance = dist;
+            }
+        }
+    }
+    return result;
+}
+
+void SegmentationModule::setSelectedAnnotationCollection(uint64_t collectionId)
+{
+    _selectedAnnotationCollectionId = collectionId;
+}
+
+void SegmentationModule::beginPointMoveDrag(uint64_t pointId, uint64_t collectionId,
+                                            VolumeViewerBase* viewer, const cv::Vec3f& worldPos)
+{
+    _pointMoveDrag.active = true;
+    _pointMoveDrag.pointId = pointId;
+    _pointMoveDrag.collectionId = collectionId;
+    _pointMoveDrag.startWorld = worldPos;
+    _pointMoveDrag.currentWorld = worldPos;
+    _pointMoveDrag.viewer = viewer;
+    _pointMoveDrag.moved = false;
+}
+
+void SegmentationModule::updatePointMoveDrag(const cv::Vec3f& worldPos)
+{
+    if (!_pointMoveDrag.active) {
+        return;
+    }
+
+    const cv::Vec3f delta = worldPos - _pointMoveDrag.startWorld;
+    const float distance = cv::norm(delta);
+    if (distance > 1.0f) {
+        _pointMoveDrag.moved = true;
+    }
+    _pointMoveDrag.currentWorld = worldPos;
+}
+
+void SegmentationModule::finishPointMoveDrag()
+{
+    if (!_pointMoveDrag.active) {
+        return;
+    }
+
+    const bool didMove = _pointMoveDrag.moved;
+    const uint64_t pointId = _pointMoveDrag.pointId;
+    const uint64_t collectionId = _pointMoveDrag.collectionId;
+    const cv::Vec3f targetWorld = _pointMoveDrag.currentWorld;
+
+    _pointMoveDrag.reset();
+
+    if (didMove) {
+        // Update point position
+        if (_pointCollection) {
+            auto ptOpt = _pointCollection->getPoint(pointId);
+            if (ptOpt) {
+                ColPoint updated = *ptOpt;
+                updated.p = targetWorld;
+                _pointCollection->updatePoint(updated);
+                qCInfo(lcSegModule) << "Moved point" << pointId << "to"
+                                    << targetWorld[0] << targetWorld[1] << targetWorld[2];
+            }
+        }
+        updateCorrectionsWidget();
+    } else {
+        // Click without drag: select the point
+        emit annotationPointSelected(pointId);
+        emit annotationCollectionSelected(collectionId);
+    }
+}
+
 void SegmentationModule::onCorrectionsCreateRequested()
 {
     if (!_corrections) {
         return;
     }
 
-    const bool wasActive = _corrections->annotateMode();
-    const uint64_t created = _corrections->createCollection(true);
-    if (created != 0) {
-        const bool nowActive = _corrections->setAnnotateMode(true, false, _editingEnabled);
-        if (nowActive && !wasActive) {
-            }
-    }
+    _corrections->createCollection(true);
 }
 
 void SegmentationModule::onCorrectionsCollectionSelected(uint64_t id)
 {
     setActiveCorrectionCollection(id, true);
-}
-
-void SegmentationModule::onCorrectionsAnnotateToggled(bool enabled)
-{
-    setCorrectionsAnnotateMode(enabled, true);
 }
 
 void SegmentationModule::onCorrectionsZRangeChanged(bool enabled, int zMin, int zMax)
@@ -1515,7 +1635,7 @@ void SegmentationModule::onCorrectionsZRangeChanged(bool enabled, int zMin, int 
 void SegmentationModule::clearPendingCorrections()
 {
     if (_corrections) {
-        _corrections->clearAll(_editingEnabled);
+        _corrections->clearAll();
     }
 }
 
@@ -1675,7 +1795,7 @@ bool SegmentationModule::beginManualAdd()
     clearLineDragStroke();
     cancelDrag();
     cancelCorrectionDrag();
-    setCorrectionsAnnotateMode(false, false);
+    setAnnotateMode(false);
     setEditApprovedMask(false);
     setEditUnapprovedMask(false);
     _previousGrowthMethodBeforeManualAdd = _widget->growthMethod();

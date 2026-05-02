@@ -249,17 +249,7 @@ bool SegmentationModule::handleKeyPress(QKeyEvent* event)
 
     if (event->key() == vc3d::keybinds::keypress::ToggleAnnotation.key &&
         event->modifiers() == vc3d::keybinds::keypress::ToggleAnnotation.modifiers) {
-        if (!_editingEnabled) {
-            setEditingEnabled(true);
-            if (_widget) {
-                _widget->setEditingEnabled(true);
-            }
-            setCorrectionsAnnotateMode(true, true);
-        } else {
-            // Toggle correction point annotation mode
-            bool currentMode = _corrections && _corrections->annotateMode();
-            setCorrectionsAnnotateMode(!currentMode, true);
-        }
+        setAnnotateMode(!_annotateMode);
         event->accept();
         return true;
     }
@@ -428,36 +418,42 @@ void SegmentationModule::handleMousePress(VolumeViewerBase* viewer,
         return;
     }
 
+    // Annotation mode works independently of surface editing
+    if (_annotateMode) {
+        if (!isLeftButton) {
+            return;
+        }
+        // Ctrl+click: remove nearest point (unchanged)
+        if (modifiers.testFlag(Qt::ControlModifier)) {
+            handleCorrectionPointRemove(worldPos);
+            updateCorrectionsWidget();
+            return;
+        }
+        // Shift+click: add new point to selected collection
+        if (modifiers.testFlag(Qt::ShiftModifier)) {
+            handleCorrectionPointAdded(worldPos, _selectedAnnotationCollectionId);
+            updateCorrectionsWidget();
+            return;
+        }
+        // Plain click: find nearest point for select or drag-to-move
+        auto nearest = findNearestPoint(worldPos);
+        if (nearest.pointId != 0) {
+            // Start point move drag (select happens on release if no movement)
+            beginPointMoveDrag(nearest.pointId, nearest.collectionId, viewer, worldPos);
+            return;
+        }
+        // Click on empty space: deselect
+        emit annotationPointSelected(0);
+        emit annotationCollectionSelected(0);
+        return;
+    }
+
     // Surface editing requires _editingEnabled
     if (!_editingEnabled) {
         return;
     }
 
     if (isLeftButton && isNearRotationHandle(viewer, worldPos)) {
-        return;
-    }
-
-    if (_corrections && _corrections->annotateMode()) {
-        if (!isLeftButton) {
-            return;
-        }
-        if (modifiers.testFlag(Qt::ControlModifier)) {
-            handleCorrectionPointRemove(worldPos);
-            updateCorrectionsWidget();
-            return;
-        }
-        // Shift+click+drag: start correction drag with anchor2d
-        // Click without Shift: add correction point directly (old behavior)
-        if (modifiers.testFlag(Qt::ShiftModifier) && _editManager) {
-            auto gridIndex = _editManager->worldToGridIndex(worldPos);
-            if (gridIndex) {
-                beginCorrectionDrag(gridIndex->first, gridIndex->second, viewer, worldPos);
-                return;
-            }
-        }
-        // Default: add correction point at clicked position
-        handleCorrectionPointAdded(worldPos);
-        updateCorrectionsWidget();
         return;
     }
 
@@ -603,6 +599,11 @@ void SegmentationModule::handleMouseMove(VolumeViewerBase* viewer,
         return;
     }
 
+    if (_pointMoveDrag.active) {
+        updatePointMoveDrag(worldPos);
+        return;
+    }
+
     if (_drag.active) {
         updateDrag(worldPos);
         return;
@@ -613,7 +614,7 @@ void SegmentationModule::handleMouseMove(VolumeViewerBase* viewer,
         return;
     }
 
-    if (_corrections && _corrections->annotateMode()) {
+    if (_annotateMode) {
         return;
     }
 
@@ -688,6 +689,12 @@ void SegmentationModule::handleMouseRelease(VolumeViewerBase* viewer,
         return;
     }
 
+    if (_pointMoveDrag.active && button == Qt::LeftButton) {
+        updatePointMoveDrag(worldPos);
+        finishPointMoveDrag();
+        return;
+    }
+
     if (_correctionDrag.active && button == Qt::LeftButton) {
         updateCorrectionDrag(worldPos);
         finishCorrectionDrag();
@@ -695,7 +702,7 @@ void SegmentationModule::handleMouseRelease(VolumeViewerBase* viewer,
     }
 
     if (!_drag.active || button != Qt::LeftButton) {
-        if (_corrections && _corrections->annotateMode() && button == Qt::LeftButton) {
+        if (_annotateMode && button == Qt::LeftButton) {
             return;
         }
         return;
@@ -703,6 +710,28 @@ void SegmentationModule::handleMouseRelease(VolumeViewerBase* viewer,
 
     updateDrag(worldPos);
     finishDrag();
+}
+
+void SegmentationModule::handleMouseDoubleClick(VolumeViewerBase* /*viewer*/,
+                                                 const cv::Vec3f& worldPos,
+                                                 Qt::MouseButton button,
+                                                 Qt::KeyboardModifiers /*modifiers*/)
+{
+    if (!_annotateMode || button != Qt::LeftButton) {
+        return;
+    }
+
+    // Cancel any in-progress point move drag from the first click
+    _pointMoveDrag.reset();
+
+    // Double-click on a point: select + focus
+    auto nearest = findNearestPoint(worldPos);
+    if (nearest.pointId != 0) {
+        _selectedAnnotationCollectionId = nearest.collectionId;
+        emit annotationCollectionSelected(nearest.collectionId);
+        emit annotationPointSelected(nearest.pointId);
+        emit annotationPointFocused(nearest.pointId);
+    }
 }
 
 void SegmentationModule::handleWheel(VolumeViewerBase* viewer,

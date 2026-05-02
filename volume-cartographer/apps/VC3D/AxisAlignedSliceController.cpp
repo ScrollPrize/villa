@@ -131,6 +131,17 @@ void AxisAlignedSliceController::resetTilt()
     applyOrientation();
 }
 
+void AxisAlignedSliceController::resetAll()
+{
+    _segXZRotationDeg = 0.0f;
+    _segYZRotationDeg = 0.0f;
+    _xyTilt = QPointF(0.0, 0.0);
+    _segXZTilt = 0.0;
+    _segYZTilt = 0.0;
+    _drags.clear();
+    cancelOrientationTimer();
+}
+
 void AxisAlignedSliceController::onTiltHandleChanged(VolumeViewerBase* viewer, QPointF tilt)
 {
     if (!_enabled || !viewer) {
@@ -311,28 +322,22 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
     // Always update the XY plane
     auto xyPlane = configurePlane("xy plane", xyNormalFromTilt());
 
-    if (_enabled) {
-        auto segXZShared = configurePlane("seg xz", {0.0f, 1.0f, 0.0f}, _segXZRotationDeg, _segXZTilt);
-        auto segYZShared = configurePlane("seg yz", {1.0f, 0.0f, 0.0f}, _segYZRotationDeg, _segYZTilt);
-
-        if (_planeSlicingOverlay) {
-            _planeSlicingOverlay->refreshAll();
-        }
-        updateTiltHandles();
-        return;
+    // Resolve segment so we can decide whether to fall back to canonical axes.
+    QuadSurface* segment = nullptr;
+    std::shared_ptr<Surface> segmentHolder;  // Keep surface alive during this scope
+    if (sourceOverride) {
+        segment = dynamic_cast<QuadSurface*>(sourceOverride);
     } else {
-        QuadSurface* segment = nullptr;
-        std::shared_ptr<Surface> segmentHolder;  // Keep surface alive during this scope
-        if (sourceOverride) {
-            segment = dynamic_cast<QuadSurface*>(sourceOverride);
-        } else {
-            segmentHolder = _state->surface("segmentation");
-            segment = dynamic_cast<QuadSurface*>(segmentHolder.get());
-        }
-        if (!segment) {
-            return;
-        }
+        segmentHolder = _state->surface("segmentation");
+        segment = dynamic_cast<QuadSurface*>(segmentHolder.get());
+    }
 
+    const bool useCanonical = _enabled || !segment;
+
+    if (useCanonical) {
+        configurePlane("seg xz", {0.0f, 1.0f, 0.0f}, _segXZRotationDeg, _segXZTilt);
+        configurePlane("seg yz", {1.0f, 0.0f, 0.0f}, _segYZRotationDeg, _segYZTilt);
+    } else {
         auto segXZShared = std::dynamic_pointer_cast<PlaneSurface>(_state->surface("seg xz"));
         auto segYZShared = std::dynamic_pointer_cast<PlaneSurface>(_state->surface("seg yz"));
 
@@ -343,28 +348,31 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
             segYZShared = std::make_shared<PlaneSurface>();
         }
 
-        segXZShared->setOrigin(origin);
-        segYZShared->setOrigin(origin);
-
         cv::Vec3f ptr(0, 0, 0);
         auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndexIfReady() : nullptr;
         segment->pointTo(ptr, origin, 1.0f, 1000, patchIndex);
 
+        // Use the closest surface point as origin for the slicing planes,
+        // not the raw focus point — ensures normals are true surface tangents
+        cv::Vec3f surfOrigin = segment->coord(ptr, {0, 0, 0});
+        segXZShared->setOrigin(surfOrigin);
+        segYZShared->setOrigin(surfOrigin);
+
         cv::Vec3f xDir = segment->coord(ptr, {1, 0, 0});
         cv::Vec3f yDir = segment->coord(ptr, {0, 1, 0});
-        segXZShared->setNormal(xDir - origin);
-        segYZShared->setNormal(yDir - origin);
+        segXZShared->setNormal(xDir - surfOrigin);
+        segYZShared->setNormal(yDir - surfOrigin);
         segXZShared->setInPlaneRotation(0.0f);
         segYZShared->setInPlaneRotation(0.0f);
 
         _state->setSurface("seg xz", segXZShared);
         _state->setSurface("seg yz", segYZShared);
-        if (_planeSlicingOverlay) {
-            _planeSlicingOverlay->refreshAll();
-        }
-        updateTiltHandles();
-        return;
     }
+
+    if (_planeSlicingOverlay) {
+        _planeSlicingOverlay->refreshAll();
+    }
+    updateTiltHandles();
 }
 
 float AxisAlignedSliceController::normalizeDegrees(float degrees)

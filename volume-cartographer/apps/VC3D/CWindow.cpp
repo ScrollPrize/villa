@@ -14,6 +14,7 @@
 #include <QMdiSubWindow>
 #include <QApplication>
 #include <QGuiApplication>
+#include <QWindow>
 #include <QScreen>
 #include <QDesktopServices>
 #include <QUrl>
@@ -63,6 +64,8 @@
 #include "SettingsDialog.hpp"
 #include "elements/VolumeSelector.hpp"
 #include "CPointCollectionWidget.hpp"
+#include "CFiberWidget.hpp"
+#include "FiberAnnotationController.hpp"
 #include "SurfaceTreeWidget.hpp"
 #include "SeedingWidget.hpp"
 #include "CommandLineToolRunner.hpp"
@@ -154,25 +157,15 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
         return QString();
     }
 
-    std::filesystem::path rootPath(pkg->getVolpkgDirectory());
-    if (rootPath.empty()) {
-        qCInfo(lcSegGrowth) << "Normal grid lookup skipped (volume package path empty)";
+    auto paths = pkg->normalGridPaths();
+    if (paths.empty()) {
+        qCInfo(lcSegGrowth) << "Normal grid lookup: no normal_grids entries in project";
         return QString();
     }
-
-    const std::filesystem::path candidate = rootPath / "normal_grids";
-    const QString candidateStr = QString::fromStdString(candidate.string());
-    if (checkedPath) {
-        *checkedPath = candidateStr;
-    }
-
-    if (std::filesystem::exists(candidate) && std::filesystem::is_directory(candidate)) {
-        qCInfo(lcSegGrowth) << "Normal grid lookup at" << candidateStr << ": found";
-        return candidateStr;
-    }
-
-    qCInfo(lcSegGrowth) << "Normal grid lookup at" << candidateStr << ": missing";
-    return QString();
+    const QString candidateStr = QString::fromStdString(paths.front().string());
+    if (checkedPath) *checkedPath = candidateStr;
+    qCInfo(lcSegGrowth) << "Normal grid resolved to" << candidateStr;
+    return candidateStr;
 }
 
 QStringList normal3dZarrCandidatesForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
@@ -187,41 +180,15 @@ QStringList normal3dZarrCandidatesForVolumePkg(const std::shared_ptr<VolumePkg>&
         }
         return {};
     }
-    std::filesystem::path rootPath(pkg->getVolpkgDirectory());
-    if (rootPath.empty()) {
-        if (hint) {
-            *hint = QObject::tr("Normal3D lookup skipped (volume package path empty)");
-        }
-        return {};
-    }
-    const std::filesystem::path base = rootPath / "normal3d";
-    const QString baseStr = QString::fromStdString(base.string());
-    if (hint) {
-        *hint = QObject::tr("Checked: %1").arg(baseStr);
-    }
-    std::error_code ec;
-    if (!std::filesystem::exists(base, ec) || !std::filesystem::is_directory(base, ec)) {
-        return {};
-    }
-
+    auto paths = pkg->normal3dZarrPaths();
     QStringList candidates;
-    for (const auto& entry : std::filesystem::directory_iterator(base, ec)) {
-        if (ec) {
-            break;
-        }
-        if (!entry.is_directory(ec) || ec) {
-            continue;
-        }
-        const std::filesystem::path p = entry.path();
-        // Heuristic: treat as zarr if it contains x/0, y/0, z/0.
-        if (std::filesystem::is_directory(p / "x" / "0") &&
-            std::filesystem::is_directory(p / "y" / "0") &&
-            std::filesystem::is_directory(p / "z" / "0")) {
-            candidates.push_back(QString::fromStdString(p.string()));
-        }
-    }
-
+    for (const auto& p : paths) candidates.push_back(QString::fromStdString(p.string()));
     candidates.sort();
+    if (hint) {
+        *hint = candidates.isEmpty()
+            ? QObject::tr("No volumes tagged 'normal3d' in project")
+            : QObject::tr("%1 normal3d zarr(s) tagged").arg(candidates.size());
+    }
     return candidates;
 }
 
@@ -396,6 +363,19 @@ CWindow::CWindow(size_t cacheSizeGB) :
     _state = new CState(_cacheSizeBytes, this);
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
+    connect(_state, &CState::vpkgChanged, this,
+            [this](std::shared_ptr<VolumePkg> pkg) {
+                if (!pkg) return;
+                pkg->setSegmentsChangedCallback(
+                    [self = QPointer<CWindow>(this)]() {
+                        QMetaObject::invokeMethod(self.data(), [self]() {
+                            auto* w = self.data();
+                            if (!w || !w->_surfacePanel || !w->_state || !w->_state->vpkg()) return;
+                            w->_surfacePanel->setVolumePkg(w->_state->vpkg());
+                            w->_surfacePanel->refreshSurfaceList();
+                        }, Qt::QueuedConnection);
+                    });
+            });
 
     _fileWatcher = std::make_unique<FileWatcherService>(_state, this);
     connect(_fileWatcher.get(), &FileWatcherService::statusMessage,
@@ -608,6 +588,32 @@ CWindow::CWindow(size_t cacheSizeGB) :
     ensureDockWidgetFeatures(_point_collection_widget);
     connect(_point_collection_widget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
     connect(_point_collection_widget, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
+
+    // Wayland workaround: dock drags trigger grabMouse() which fails,
+    // leaving Qt's internal state stuck so all mouse events stop.
+    // Synthesize a mouse release to clear the stuck button state.
+    if (QGuiApplication::platformName() == QLatin1String("wayland")) {
+        auto fixGrab = [this](){
+            // Defer to after Qt finishes its internal dock drag processing.
+            QTimer::singleShot(100, this, [](){
+                if (auto* g = QWidget::mouseGrabber())
+                    g->releaseMouse();
+                for (auto* w : QGuiApplication::topLevelWindows())
+                    w->setMouseGrabEnabled(false);
+            });
+        };
+        for (QDockWidget* dock : { ui.dockWidgetSegmentation,
+                                   _lasagnaDock,
+                                   ui.dockWidgetDistanceTransform,
+                                   ui.dockWidgetDrawing,
+                                   ui.dockWidgetVolumes,
+                                   ui.dockWidgetViewerControls,
+                                   static_cast<QDockWidget*>(_point_collection_widget) }) {
+            if (!dock) continue;
+            connect(dock, &QDockWidget::topLevelChanged, this, fixGrab);
+            connect(dock, &QDockWidget::dockLocationChanged, this, fixGrab);
+        }
+    }
 
     const QSize minWindowSize(960, 640);
     setMinimumSize(minWindowSize);
@@ -1493,12 +1499,24 @@ void CWindow::CreateWidgets(void)
                 auto* quad = dynamic_cast<QuadSurface*>(surf.get());
                 if (!quad) return;
                 quad->ensureLoaded();
-                cv::Vec3f c = quad->center();
-                POI* poi = _state->poi("focus");
-                if (!poi) poi = new POI;
-                poi->p = c;
-                poi->n = {0, 0, 0};
-                _state->setPOI("focus", poi);
+                const cv::Vec3f worldCenter = quad->coord({0, 0, 0}, {0, 0, 0});
+                if (!std::isfinite(worldCenter[0]) || worldCenter[0] < 0.0f) return;
+                cv::Vec3f normal = quad->normal({0, 0, 0}, {0, 0, 0});
+                if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) || !std::isfinite(normal[2])) {
+                    normal = cv::Vec3f(0, 0, 1);
+                }
+                if (auto vol = _state->currentVolume()) {
+                    auto [w, h, d] = vol->shape();
+                    cv::Vec3f clamped = worldCenter;
+                    clamped[0] = std::clamp(clamped[0], 0.0f, static_cast<float>(w - 1));
+                    clamped[1] = std::clamp(clamped[1], 0.0f, static_cast<float>(h - 1));
+                    clamped[2] = std::clamp(clamped[2], 0.0f, static_cast<float>(d - 1));
+                    POI* poi = new POI;
+                    poi->p = clamped;
+                    poi->n = normal;
+                    poi->surfaceId = segmentId.toStdString();
+                    _state->setPOI("focus", poi);
+                }
             });
     connect(_surfacePanel.get(), &SurfacePanelController::alphaCompRefineRequested,
             this, [this](const QString& segmentId) {
@@ -1647,6 +1665,13 @@ void CWindow::CreateWidgets(void)
     if (_viewerManager) {
         _viewerManager->setSegmentationOverlay(_segmentationOverlay.get());
     }
+
+    // Wire annotate mode: module -> header row (via SegmentationWidget)
+    // NOTE: connections involving _point_collection_widget are below, after it is created.
+    connect(_segmentationModule.get(), &SegmentationModule::annotateModeChanged,
+            _segmentationWidget, &SegmentationWidget::setAnnotateChecked);
+    connect(_segmentationModule.get(), &SegmentationModule::annotationPointFocused,
+            this, &CWindow::onPointDoubleClicked);
 
     connect(_segmentationModule.get(), &SegmentationModule::editingEnabledChanged,
             this, &CWindow::onSegmentationEditingModeChanged);
@@ -1820,9 +1845,51 @@ void CWindow::CreateWidgets(void)
     connect(_point_collection_widget, &CPointCollectionWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
 
     // Tab the docks - keep Segmentation, Lasagna, Seeding, and Point Collections together
+    // Wire annotate mode & annotation selection: dock widget <-> segmentation module
+    // (must be after _point_collection_widget creation)
+    connect(_point_collection_widget, &CPointCollectionWidget::annotateToggled,
+            _segmentationModule.get(), &SegmentationModule::setAnnotateMode);
+    connect(_segmentationModule.get(), &SegmentationModule::annotateModeChanged,
+            _point_collection_widget, &CPointCollectionWidget::setAnnotateChecked);
+    connect(_segmentationModule.get(), &SegmentationModule::annotationPointSelected,
+            _point_collection_widget, &CPointCollectionWidget::selectPoint);
+    connect(_segmentationModule.get(), &SegmentationModule::annotationCollectionSelected,
+            _point_collection_widget, &CPointCollectionWidget::selectCollection);
+    connect(_point_collection_widget, &CPointCollectionWidget::collectionSelected,
+            _segmentationModule.get(), &SegmentationModule::setSelectedAnnotationCollection);
+
+    // Create fiber annotation controller and dock
+    _fiberController = std::make_unique<FiberAnnotationController>(
+        _state, _state->pointCollection(), this);
+    _fiberController->setMdiArea(mdiArea);
+
+    _fiberWidget = new CFiberWidget(_state->pointCollection(), this);
+    _fiberWidget->setObjectName("fiberDock");
+    addDockWidget(Qt::RightDockWidgetArea, _fiberWidget);
+
+    connect(_fiberWidget, &CFiberWidget::newFiberRequested,
+            this, &CWindow::onNewFiberRequested);
+    connect(_fiberWidget, &CFiberWidget::stepChanged,
+            _fiberController.get(), &FiberAnnotationController::onStepChanged);
+    connect(_fiberWidget, &CFiberWidget::invertDirectionRequested,
+            _fiberController.get(), &FiberAnnotationController::invertDirection);
+    connect(_fiberController.get(), &FiberAnnotationController::crosshairModeChanged,
+            this, &CWindow::onFiberCrosshairModeChanged);
+    connect(_fiberController.get(), &FiberAnnotationController::requestFiberViewers,
+            this, &CWindow::onFiberViewersRequested);
+    connect(_fiberController.get(), &FiberAnnotationController::annotationFinished,
+            this, &CWindow::onFiberAnnotationFinished);
+
+    ensureDockWidgetFeatures(_fiberWidget);
+    connect(_fiberWidget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(_fiberWidget, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
+
+    // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, Fibers, and Drawing together
     tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
     tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
     tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
+    tabifyDockWidget(ui.dockWidgetSegmentation, _fiberWidget);
+    tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDrawing);
 
     // Make Segmentation dock the active tab by default
     ui.dockWidgetSegmentation->raise();
@@ -2171,6 +2238,16 @@ void CWindow::CreateWidgets(void)
 // Create actions
 void CWindow::keyPressEvent(QKeyEvent* event)
 {
+    // Let fiber controller handle Escape first
+    if (event->key() == Qt::Key_Escape && _fiberController && _fiberController->handleEscape()) {
+        event->accept();
+        return;
+    }
+
+    // Fiber animation (P key)
+    if (_fiberController && _fiberController->handleKeyPress(event))
+        return;
+
     if (event->key() == vc3d::keybinds::keypress::ToggleVolumeOverlay.key &&
         event->modifiers() == vc3d::keybinds::keypress::ToggleVolumeOverlay.modifiers) {
         toggleVolumeOverlayVisibility();
@@ -2265,6 +2342,9 @@ void CWindow::closeEvent(QCloseEvent* event)
     if (_viewerManager) {
         _viewerManager->beginShutdown();
     }
+    if (_state && _state->vpkg()) {
+        try { _state->vpkg()->saveAutosave(); } catch (...) {}
+    }
     saveWindowState();
     event->accept();
 }
@@ -2294,16 +2374,17 @@ auto CWindow::InitializeVolumePkg(const std::string& nVpkgPath) -> bool
     }
 
     try {
-        _state->setVpkg(VolumePkg::New(nVpkgPath));
+        _state->setVpkg(VolumePkg::load(nVpkgPath));
     } catch (const std::exception& e) {
         Logger()->error("Failed to initialize volpkg: {}", e.what());
     }
 
     if (_state->vpkg() == nullptr) {
-        Logger()->error("Cannot open .volpkg: {}", nVpkgPath);
+        Logger()->error("Cannot open project: {}", nVpkgPath);
         QMessageBox::warning(
             this, "Error",
-            "Volume package failed to load. Package might be corrupt. Check the console log for a detailed error message.");
+            "Project failed to load. Falling back to a new blank project.");
+        _state->setVpkg(VolumePkg::newEmpty());
         return false;
     }
     return true;
@@ -2403,32 +2484,17 @@ void CWindow::OpenVolume(const QString& path)
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
     if (aVpkgPath.isEmpty()) {
-        aVpkgPath = QFileDialog::getExistingDirectory(
-            this, tr("Open Directory"), settings.value(vc3d::settings::volpkg::DEFAULT_PATH).toString(),
-            QFileDialog::ShowDirsOnly | QFileDialog::DontResolveSymlinks | QFileDialog::ReadOnly | QFileDialog::DontUseNativeDialog);
-        // Dialog box cancelled
-        if (aVpkgPath.length() == 0) {
-            Logger()->info("Open .volpkg canceled");
+        aVpkgPath = QFileDialog::getOpenFileName(
+            this, tr("Open Project"), settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
+            tr("Project (*.volpkg.json);;All files (*.*)"),
+            nullptr, QFileDialog::DontResolveSymlinks | QFileDialog::ReadOnly | QFileDialog::DontUseNativeDialog);
+        if (aVpkgPath.isEmpty()) {
+            Logger()->info("Open project canceled");
             return;
         }
     }
 
-    // Checks the folder path for .volpkg extension
-    auto const extension = aVpkgPath.toStdString().substr(
-        aVpkgPath.toStdString().length() - 7, aVpkgPath.toStdString().length());
-    if (extension != ".volpkg") {
-        QMessageBox::warning(
-            this, tr("ERROR"),
-            "The selected file is not of the correct type: \".volpkg\"");
-        Logger()->error(
-            "Selected file is not .volpkg: {}", aVpkgPath.toStdString());
-        _state->setVpkg(nullptr);  // Is needed for User Experience, clears screen.
-        updateNormalGridAvailability();
-        return;
-    }
-
-    // Open volume package
-    if (!InitializeVolumePkg(aVpkgPath.toStdString() + "/")) {
+    if (!InitializeVolumePkg(aVpkgPath.toStdString())) {
         return;
     }
 
@@ -2654,6 +2720,10 @@ auto CWindow::can_change_volume_() -> bool
 
 void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers)
 {
+    // Let fiber annotation controller consume the click if in WaitingForFirstClick mode
+    if (_fiberController && _fiberController->handleVolumeClick(vol_loc, normal, surf, buttons, modifiers))
+        return;
+
     if (modifiers & Qt::ShiftModifier) {
         return;
     }
@@ -2714,6 +2784,38 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
             } else {
                 _point_collection_widget->clearCorrPointsResults();
             }
+        }
+    }
+
+    if (_axisAlignedSliceController) {
+        _axisAlignedSliceController->resetAll();
+    }
+
+    if (auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf)) {
+        try {
+            quadSurf->ensureLoaded();
+            const cv::Vec3f worldCenter = quadSurf->coord({0, 0, 0}, {0, 0, 0});
+            const bool centerValid = std::isfinite(worldCenter[0])
+                && std::isfinite(worldCenter[1])
+                && std::isfinite(worldCenter[2])
+                && worldCenter[0] >= 0.0f;
+            if (centerValid) {
+                if (auto vol = _state->currentVolume()) {
+                    auto [w, h, d] = vol->shape();
+                    cv::Vec3f clamped = worldCenter;
+                    clamped[0] = std::clamp(clamped[0], 0.0f, static_cast<float>(w - 1));
+                    clamped[1] = std::clamp(clamped[1], 0.0f, static_cast<float>(h - 1));
+                    clamped[2] = std::clamp(clamped[2], 0.0f, static_cast<float>(d - 1));
+                    POI* poi = new POI;
+                    poi->p = clamped;
+                    poi->n = cv::Vec3f(0, 0, 0);
+                    poi->surfaceId = newSurfId;
+                    _state->setPOI("focus", poi);
+                }
+            }
+        } catch (const std::exception& e) {
+            qWarning() << "Could not compute world center for"
+                       << surfaceId << ":" << e.what();
         }
     }
 
@@ -3081,16 +3183,10 @@ void CWindow::onManualLocationChanged()
     // Update the line edit with clamped values
     lblLocFocus->setText(QString("%1, %2, %3").arg(x).arg(y).arg(z));
 
-    // Update the focus POI
-    POI* poi = _state->poi("focus");
-    if (!poi) {
-        poi = new POI;
-    }
-
-    poi->p = cv::Vec3f(x, y, z);
-    poi->n = cv::Vec3f(0, 0, 1); // Default normal for XY plane
-
-    _state->setPOI("focus", poi);
+    // Route through centerFocusAt so slice planes reorient (canonical fallback
+    // when no segment is loaded, segment-tangent otherwise) — same behaviour
+    // as ctrl-click in a viewer.
+    centerFocusAt(cv::Vec3f(x, y, z), cv::Vec3f(0, 0, 1), std::string());
 
     if (_surfacePanel) {
         _surfacePanel->refreshFiltersOnly();
@@ -3131,24 +3227,7 @@ void CWindow::onPointDoubleClicked(uint64_t pointId)
 {
     auto point_opt = _state->pointCollection()->getPoint(pointId);
     if (point_opt) {
-        POI *poi = _state->poi("focus");
-        if (!poi) {
-            poi = new POI;
-        }
-        poi->p = point_opt->p;
-
-        // Find the closest normal on the segmentation surface
-        auto seg_surface = _state->surface("segmentation");
-        if (auto* quad_surface = dynamic_cast<QuadSurface*>(seg_surface.get())) {
-            cv::Vec3f ptr(0, 0, 0);
-            auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-            quad_surface->pointTo(ptr, point_opt->p, 4.0, 100, patchIndex);
-            poi->n = quad_surface->normal(ptr, quad_surface->loc(ptr));
-        } else {
-            poi->n = cv::Vec3f(0, 0, 1); // Default normal if no surface
-        }
-
-        _state->setPOI("focus", poi);
+        centerFocusAt(point_opt->p, cv::Vec3f(0, 0, 0), "");
     }
 }
 
@@ -3706,4 +3785,79 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
     }
 
     statusBar()->showMessage(tr("Focused & aligned view to %1 points").arg(pts.size()), 3000);
+}
+
+// ---- Fiber annotation slots -------------------------------------------------
+
+void CWindow::onNewFiberRequested()
+{
+    if (_fiberController) {
+        _fiberController->beginNewFiber();
+    }
+}
+
+void CWindow::onFiberCrosshairModeChanged(bool active)
+{
+    if (!_viewerManager) return;
+    _viewerManager->forEachViewer([active](CTiledVolumeViewer* v) {
+        if (v->graphicsView()) {
+            v->graphicsView()->setCursor(active ? Qt::CrossCursor : Qt::ArrowCursor);
+        }
+    });
+}
+
+void CWindow::onFiberViewersRequested()
+{
+    if (!_fiberController) return;
+
+    constexpr int N = FiberAnnotationController::kNumViews;
+
+    QMdiSubWindow* subWindows[N] = {};
+
+    for (int i = 0; i < N; ++i) {
+        QString title = (i == 0) ? tr("Fiber Ref") : tr("Fiber Annotate");
+
+        auto* viewer = newConnectedViewer(
+            FiberAnnotationController::fiberSurfaceName(i), title, mdiArea);
+        if (!viewer) continue;
+
+        _fiberController->setFiberViewer(i, viewer);
+
+        // Isolate from segmentation module and global focus POI
+        disconnect(_state, &CState::poiChanged, viewer, &CTiledVolumeViewer::onPOIChanged);
+        if (_segmentationModule)
+            disconnect(viewer, nullptr, _segmentationModule.get(), nullptr);
+
+        // Only the last view (annotation) handles clicks
+        if (i == N - 1) {
+            connect(viewer, &CTiledVolumeViewer::sendVolumeClicked,
+                    _fiberController.get(), &FiberAnnotationController::onAnnotationViewerClicked);
+        }
+
+        if (_state->currentVolume())
+            viewer->OnVolumeChanged(_state->currentVolume());
+
+        subWindows[i] = qobject_cast<QMdiSubWindow*>(viewer->parentWidget());
+        if (subWindows[i])
+            subWindows[i]->show();
+    }
+
+    // Layout: 2 columns × 1 row — ref on the left, annotate on the right.
+    QRect area = mdiArea->contentsRect();
+    int colW = area.width() / 2;
+    int rowH = area.height();
+
+    for (int i = 0; i < N; ++i) {
+        if (!subWindows[i]) continue;
+        int x = area.x() + i * colW;
+        int y = area.y();
+        subWindows[i]->setGeometry(x, y, colW, rowH);
+    }
+}
+
+void CWindow::onFiberAnnotationFinished(uint64_t fiberId)
+{
+    if (_fiberWidget) {
+        _fiberWidget->selectFiber(fiberId);
+    }
 }

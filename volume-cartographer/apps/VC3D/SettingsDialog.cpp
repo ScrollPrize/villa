@@ -19,8 +19,8 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
-    edtDefaultPathVolpkg->setText(settings.value(volpkg::DEFAULT_PATH).toString());
-    chkAutoOpenVolpkg->setChecked(settings.value(volpkg::AUTO_OPEN, volpkg::AUTO_OPEN_DEFAULT).toInt() != 0);
+    edtDefaultPathVolpkg->setText(settings.value(project::DEFAULT_PATH).toString());
+    chkAutoOpenVolpkg->setChecked(settings.value(project::AUTO_OPEN, project::AUTO_OPEN_DEFAULT).toInt() != 0);
 
     spinFwdBackStepMs->setValue(settings.value(viewer::FWD_BACK_STEP_MS, viewer::FWD_BACK_STEP_MS_DEFAULT).toInt());
     chkCenterOnZoom->setChecked(settings.value(viewer::CENTER_ON_ZOOM, viewer::CENTER_ON_ZOOM_DEFAULT).toInt() != 0);
@@ -70,8 +70,11 @@ SettingsDialog::SettingsDialog(QWidget *parent) : QDialog(parent)
     if (auto* lbl = findChild<QLabel*>("labelIOThreads")) lbl->hide();
     if (spinIOThreads) spinIOThreads->hide();
 
-    // Hide removed recompression UI — the disk cache now always uses c3d.
-    chkVideoRecompress->hide();
+    // Disk-cache compression toggle (repurposed from old recompression UI)
+    chkVideoRecompress->setChecked(
+        settings.value(perf::DISK_CACHE_COMPRESSED, perf::DISK_CACHE_COMPRESSED_DEFAULT).toBool());
+
+    // Codec-type and quality-preset combos are unused — keep hidden.
     cmbVideoQualityPreset->hide();
     cmbVideoCodecType->hide();
     if (auto* label = findChild<QLabel*>("labelVideoQualityPreset"))
@@ -100,8 +103,8 @@ void SettingsDialog::accept()
     using namespace vc3d::settings;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
-    settings.setValue(volpkg::DEFAULT_PATH, edtDefaultPathVolpkg->text());
-    settings.setValue(volpkg::AUTO_OPEN, chkAutoOpenVolpkg->isChecked() ? "1" : "0");
+    settings.setValue(project::DEFAULT_PATH, edtDefaultPathVolpkg->text());
+    settings.setValue(project::AUTO_OPEN, chkAutoOpenVolpkg->isChecked() ? "1" : "0");
 
     settings.setValue(viewer::FWD_BACK_STEP_MS, spinFwdBackStepMs->value());
     settings.setValue(viewer::CENTER_ON_ZOOM, chkCenterOnZoom->isChecked() ? "1" : "0");
@@ -135,6 +138,7 @@ void SettingsDialog::accept()
     // Cache settings
     settings.setValue(perf::RAM_CACHE_SIZE_GB, spinRamCacheSizeGB->value());
     settings.setValue(viewer::REMOTE_CACHE_DIR, edtRemoteCachePath->text());
+    settings.setValue(perf::DISK_CACHE_COMPRESSED, chkVideoRecompress->isChecked());
 
     // IO_THREADS setting removed — see CState::applyCacheBudget.
 

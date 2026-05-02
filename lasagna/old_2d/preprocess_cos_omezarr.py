@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import sys
 import time
 
 import cv2
@@ -152,6 +153,23 @@ def run_preprocess(
 	)
 	model.eval()
 
+	# GPU pause support — allow other processes to temporarily claim the GPU.
+	_gpu_ctx = None
+	try:
+		sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+		from gpu_pause import gpu_pause_context
+		def _offload():
+			model.cpu()
+			torch.cuda.empty_cache()
+			print("[gpu_pause] offloaded model to CPU", flush=True)
+		def _reload():
+			model.to(torch_device)
+			print("[gpu_pause] reloaded model to GPU", flush=True)
+		_gpu_ctx = gpu_pause_context(offload_fn=_offload, reload_fn=_reload)
+		_gpu_ctx.__enter__()
+	except ImportError:
+		pass
+
 	# Output chunk sizes in ZYX order
 	chunk_sizes = [0, 0, 0]
 	chunk_sizes[slice_dim] = max(1, int(chunk_z))
@@ -202,6 +220,11 @@ def run_preprocess(
 	read0 = (int(slice_start) // int(read_chunk)) * int(read_chunk)
 	done = 0
 	for sr0 in range(read0, int(slice_end), int(read_chunk)):
+		# GPU pause checkpoint — only the model is on GPU here.
+		# All per-slice tensors (raw_blk, pred_i, blur intermediates) from
+		# the previous iteration are already .cpu()'d or out of scope.
+		if _gpu_ctx is not None:
+			_gpu_ctx.check()
 		sr1 = min(int(slice_end), sr0 + int(read_chunk))
 		if sr1 <= int(slice_start):
 			continue
@@ -327,6 +350,8 @@ def run_preprocess(
 		f"infer_avg={((1000.0 * t_infer_sum) / max(1, proc_count)):.2f}ms "
 		f"write_avg={((1000.0 * t_write_sum) / max(1, proc_count)):.2f}ms"
 	)
+	if _gpu_ctx is not None:
+		_gpu_ctx.__exit__(None, None, None)
 
 
 def _compute_pred_dt_channel(
@@ -338,6 +363,7 @@ def _compute_pred_dt_channel(
 	downscale_xy: int,
 	z_step_eff: int,
 	crop_xyzwhd: list[int] | None,
+	pause_check=None,
 	chunk_depth: int = 1000,
 	chunk_yx: int = 1024,
 	overlap: int = 255,
@@ -421,6 +447,8 @@ def _compute_pred_dt_channel(
 				read_x1 = min(p_x1, x_chunk_end + overlap)
 
 				chunk_i += 1
+				if pause_check is not None:
+					pause_check()
 				read_sz = (read_z1 - read_z0, read_y1 - read_y0, read_x1 - read_x0)
 				print(
 					f"[pred_dt] chunk {chunk_i}/{n_chunks}  "
@@ -645,15 +673,36 @@ def run_integrate_directions(
 	if pred_dt_path:
 		pred_dt_ch = channel_names.index("pred_dt")
 		crop_param = z_params.get("crop_xyzwhd", None)
-		_compute_pred_dt_channel(
-			pred_path=pred_dt_path,
-			output_arr=out,
-			channel_idx=pred_dt_ch,
-			ref_z=ref_z, ref_y=ref_y, ref_x=ref_x,
-			downscale_xy=int(z_params.get("downscale_xy", 1)),
-			z_step_eff=z_step_eff,
-			crop_xyzwhd=crop_param,
-		)
+		# GPU pause for pred-dt (CuPy EDT)
+		_dt_gpu_ctx = None
+		_dt_pause_check = None
+		try:
+			sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+			from gpu_pause import gpu_pause_context
+			def _dt_offload():
+				if _HAS_CUPY:
+					cp.get_default_memory_pool().free_all_blocks()
+					cp.get_default_pinned_memory_pool().free_all_blocks()
+				print("[gpu_pause] freed CuPy memory", flush=True)
+			_dt_gpu_ctx = gpu_pause_context(offload_fn=_dt_offload)
+			_dt_gpu_ctx.__enter__()
+			_dt_pause_check = _dt_gpu_ctx.check
+		except ImportError:
+			pass
+		try:
+			_compute_pred_dt_channel(
+				pred_path=pred_dt_path,
+				output_arr=out,
+				channel_idx=pred_dt_ch,
+				ref_z=ref_z, ref_y=ref_y, ref_x=ref_x,
+				downscale_xy=int(z_params.get("downscale_xy", 1)),
+				z_step_eff=z_step_eff,
+				crop_xyzwhd=crop_param,
+				pause_check=_dt_pause_check,
+			)
+		finally:
+			if _dt_gpu_ctx is not None:
+				_dt_gpu_ctx.__exit__(None, None, None)
 
 
 # ---------------------------------------------------------------------------

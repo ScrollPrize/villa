@@ -83,16 +83,12 @@ public:
 
     void loadSurfaces(bool reload);
     void loadSurfacesIncremental();
+    void refreshSurfaceList();
     void loadRemoteSurfaces(const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& surfaces);
-    // Populate tree with remote segment stubs (metadata-only, not yet downloaded).
-    // Segments that are already fully cached get loaded normally; the rest appear
-    // as placeholder entries that trigger on-demand download when selected.
     void loadRemoteStubs(
         const std::vector<std::string>& segmentIds,
         const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& cachedSurfaces);
-    // Replace a stub entry with a fully downloaded surface.
     void replaceStubWithSurface(const std::string& segmentId, std::shared_ptr<Surface> surface);
-    // Check if a segment is a remote stub (not yet downloaded).
     bool isRemoteStub(const std::string& segmentId) const;
     void updateTreeItemIcon(SurfaceTreeWidgetItem* item);
     void refreshSurfaceMetrics(const std::string& surfaceId);

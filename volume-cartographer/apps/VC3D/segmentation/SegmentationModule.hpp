@@ -11,6 +11,7 @@
 #include <deque>
 #include <filesystem>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <set>
@@ -68,7 +69,9 @@ public:
     ~SegmentationModule();
 
     [[nodiscard]] bool editingEnabled() const { return _editingEnabled; }
+    [[nodiscard]] bool annotateMode() const { return _annotateMode; }
     void setEditingEnabled(bool enabled);
+    void setAnnotateMode(bool enabled);
     void setIgnoreSegSurfaceChange(bool ignore);
     [[nodiscard]] bool ignoreSegSurfaceChange() const { return _ignoreSegSurfaceChange; }
     void setDragRadius(float radiusSteps);
@@ -166,12 +169,24 @@ public:
 
     void setRotationHandleHitTester(std::function<bool(VolumeViewerBase*, const cv::Vec3f&)> tester);
 
+    struct NearestPointResult {
+        uint64_t pointId{0};
+        uint64_t collectionId{0};
+        float distance{std::numeric_limits<float>::max()};
+    };
+
+    NearestPointResult findNearestPoint(const cv::Vec3f& worldPos, float maxDist = 20.0f);
+
     [[nodiscard]] bool manualAddMode() const { return _manualAddMode; }
     [[nodiscard]] cv::Mat takePendingManualAddTracerMask();
     bool applyManualAddTracerPreview(QuadSurface* surface);
 
+public slots:
+    void setSelectedAnnotationCollection(uint64_t collectionId);
+
 signals:
     void editingEnabledChanged(bool enabled);
+    void annotateModeChanged(bool enabled);
     void statusMessageRequested(const QString& text, int timeoutMs);
     void pendingChangesChanged(bool pending);
     void stopToolsRequested();
@@ -182,6 +197,9 @@ signals:
                               bool inpaintOnly);
     void growthInProgressChanged(bool running);
     void approvalMaskSaved(const std::string& segmentId);
+    void annotationPointSelected(uint64_t pointId);
+    void annotationCollectionSelected(uint64_t collectionId);
+    void annotationPointFocused(uint64_t pointId);
 
 private:
     friend class SegmentationLineTool;
@@ -244,26 +262,49 @@ private:
         }
     };
 
+    struct PointMoveDragState
+    {
+        bool active{false};
+        uint64_t pointId{0};
+        uint64_t collectionId{0};
+        cv::Vec3f startWorld{0.0f, 0.0f, 0.0f};
+        cv::Vec3f currentWorld{0.0f, 0.0f, 0.0f};
+        VolumeViewerBase* viewer{nullptr};
+        bool moved{false};
+
+        void reset() {
+            active = false;
+            pointId = 0;
+            collectionId = 0;
+            startWorld = {0.0f, 0.0f, 0.0f};
+            currentWorld = {0.0f, 0.0f, 0.0f};
+            viewer = nullptr;
+            moved = false;
+        }
+    };
+
     void bindWidgetSignals();
     void bindViewerSignals(VolumeViewerBase* viewer);
 
     void emitPendingChanges();
     void refreshOverlay();
     void updateCorrectionsWidget();
-    void setCorrectionsAnnotateMode(bool enabled, bool userInitiated);
     void setActiveCorrectionCollection(uint64_t collectionId, bool userInitiated);
     uint64_t createCorrectionCollection(bool announce);
-    void handleCorrectionPointAdded(const cv::Vec3f& worldPos);
+    void handleCorrectionPointAdded(const cv::Vec3f& worldPos, uint64_t collectionId = 0);
     void handleCorrectionPointRemove(const cv::Vec3f& worldPos);
     void beginCorrectionDrag(int row, int col, VolumeViewerBase* viewer, const cv::Vec3f& worldPos);
     void updateCorrectionDrag(const cv::Vec3f& worldPos);
     void finishCorrectionDrag();
     void cancelCorrectionDrag();
 
+    void beginPointMoveDrag(uint64_t pointId, uint64_t collectionId, VolumeViewerBase* viewer, const cv::Vec3f& worldPos);
+    void updatePointMoveDrag(const cv::Vec3f& worldPos);
+    void finishPointMoveDrag();
+
     void pruneMissingCorrections();
     void onCorrectionsCreateRequested();
     void onCorrectionsCollectionSelected(uint64_t id);
-    void onCorrectionsAnnotateToggled(bool enabled);
     void onCorrectionsZRangeChanged(bool enabled, int zMin, int zMax);
 
     void handleGrowSurfaceRequested(SegmentationGrowthMethod method,
@@ -292,6 +333,10 @@ private:
                           Qt::MouseButton button,
                           Qt::KeyboardModifiers modifiers,
                           const QPointF& scenePos);
+    void handleMouseDoubleClick(VolumeViewerBase* viewer,
+                                const cv::Vec3f& worldPos,
+                                Qt::MouseButton button,
+                                Qt::KeyboardModifiers modifiers);
     void handleMouseMove(VolumeViewerBase* viewer,
                          const cv::Vec3f& worldPos,
                          Qt::MouseButtons buttons,
@@ -350,6 +395,7 @@ private:
     CState* _state{nullptr};
     VCCollection* _pointCollection{nullptr};
 
+    bool _annotateMode{true};
     bool _editingEnabled{false};
     float _dragRadiusSteps{5.0f};
     float _dragSigmaSteps{2.0f};
@@ -371,6 +417,8 @@ private:
     DragState _drag;
     HoverState _hover;
     CorrectionDragState _correctionDrag;
+    PointMoveDragState _pointMoveDrag;
+    uint64_t _selectedAnnotationCollectionId{0};
     QSet<VolumeViewerBase*> _attachedViewers;
 
     std::function<bool(VolumeViewerBase*, const cv::Vec3f&)> _rotationHandleHitTester;

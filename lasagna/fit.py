@@ -128,8 +128,8 @@ def _parse_corr_points(obj: dict, device: torch.device) -> fit_data.CorrPoints3D
 				continue
 			wa = pd.get("wind_a", None)
 			if wa is None:
-				raise ValueError(f"[fit] corr point {_pid} in collection {_cid} has no wind_a "
-								 f"— d.tif was not available when this point was placed")
+				print(f"[fit] WARNING: corr point {_pid} in collection {_cid} has no wind_a, skipping")
+				continue
 			try:
 				pid_i = int(_pid)
 			except Exception:

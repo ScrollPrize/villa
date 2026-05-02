@@ -26,11 +26,9 @@ public:
 
     // Getters
     [[nodiscard]] bool correctionsEnabled() const { return _correctionsEnabled; }
-    [[nodiscard]] bool correctionsAnnotateChecked() const { return _correctionsAnnotateChecked; }
 
     // Setters
     void setCorrectionsEnabled(bool enabled);
-    void setCorrectionsAnnotateChecked(bool enabled);
     void setCorrectionCollections(const QVector<QPair<uint64_t, QString>>& collections,
                                   std::optional<uint64_t> activeId);
 
@@ -40,7 +38,6 @@ public:
 signals:
     void correctionsCreateRequested();
     void correctionsCollectionSelected(uint64_t collectionId);
-    void correctionsAnnotateToggled(bool enabled);
 
 private:
     void writeSetting(const QString& key, const QVariant& value);
@@ -48,10 +45,8 @@ private:
     QGroupBox* _groupCorrections{nullptr};
     QComboBox* _comboCorrections{nullptr};
     QPushButton* _btnCorrectionsNew{nullptr};
-    QCheckBox* _chkCorrectionsAnnotate{nullptr};
 
     bool _correctionsEnabled{false};
-    bool _correctionsAnnotateChecked{false};
 
     bool _restoringSettings{false};
     const QString _settingsGroup;

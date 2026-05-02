@@ -1,162 +1,371 @@
 #include "vc/core/types/VolumePkg.hpp"
 
 #include <algorithm>
-#include <set>
-#include <utility>
+#include <atomic>
 #include <cstring>
+#include <fstream>
+#include <mutex>
+#include <set>
+#include <stdexcept>
+#include <thread>
+#include <utility>
+#include <vector>
 
-#include "vc/core/util/DateTime.hpp"
-#include "vc/core/util/LoadJson.hpp"
+#include <pwd.h>
+#include <unistd.h>
+
+#include "vc/core/cache/HttpMetadataFetcher.hpp"
 #include "vc/core/util/Logging.hpp"
+#include "vc/core/util/RemoteScroll.hpp"
+#include "vc/core/util/RemoteUrl.hpp"
 
-constexpr auto CONFIG = "config.json";
+namespace fs = std::filesystem;
 
-std::optional<std::string> VolumePkg::loadFirstSegmentationDir_{};
+std::filesystem::path VolumePkg::autosaveRoot_;
 
-void VolumePkg::setLoadFirstSegmentationDirectory(const std::string& dirName)
+namespace vc::project {
+
+bool isLocationRemote(const std::string& location)
 {
-    if (dirName.empty()) {
-        loadFirstSegmentationDir_.reset();
-        return;
-    }
-    loadFirstSegmentationDir_ = dirName;
+    if (location.rfind("s3://", 0) == 0) return true;
+    if (location.rfind("s3+", 0) == 0) return true;
+    if (location.rfind("http://", 0) == 0) return true;
+    if (location.rfind("https://", 0) == 0) return true;
+    return false;
 }
 
-VolumePkg::VolumePkg(const std::filesystem::path& fileLocation) : rootDir_{fileLocation}
+fs::path resolveLocalPath(const std::string& location, const fs::path& base)
 {
-    auto configPath = fileLocation / ::CONFIG;
-    config_ = vc::json::load_json_file(configPath);
-    vc::json::require_fields(config_, {"name", "version"}, configPath.string());
+    constexpr const char* kFile = "file://";
+    fs::path p = (location.rfind(kFile, 0) == 0)
+        ? fs::path(location.substr(std::strlen(kFile)))
+        : fs::path(location);
+    if (p.is_absolute() || base.empty()) return p;
+    return base / p;
+}
 
-    std::vector<std::string> dirs = {"volumes","paths","traces","transforms","renders","backups"};
+}
 
-    for (const auto& d : dirs) {
-        if (not std::filesystem::exists(rootDir_ / d)) {
-            std::filesystem::create_directory(rootDir_ / d);
-        }
+namespace {
 
+bool hasZarrMarkerAtRoot(const fs::path& dir)
+{
+    return fs::exists(dir / ".zarray")
+        || fs::exists(dir / ".zgroup")
+        || fs::exists(dir / ".zattrs")
+        || fs::exists(dir / "zarr.json");
+}
+
+bool isSingleZarrVolumeDir(const fs::path& dir)
+{
+    if (!fs::is_directory(dir)) return false;
+    bool meta = fs::exists(dir / "meta.json")
+             || fs::exists(dir / "metadata.json")
+             || hasZarrMarkerAtRoot(dir);
+    if (!meta) return false;
+    for (const auto& e : fs::directory_iterator(dir)) {
+        if (e.is_directory() && fs::exists(e.path() / ".zarray")) return true;
     }
+    return false;
+}
 
-    for (const auto& entry : std::filesystem::directory_iterator(rootDir_ / "volumes")) {
-        if (!entry.is_directory()) {
+bool isSegmentDir(const fs::path& dir)
+{
+    if (!fs::is_directory(dir)) return false;
+    return Segmentation::checkDir(dir);
+}
+
+bool isNormalGridDir(const fs::path& dir)
+{
+    if (!fs::is_directory(dir)) return false;
+    return fs::is_directory(dir / "xy")
+        && fs::is_directory(dir / "xz")
+        && fs::is_directory(dir / "yz")
+        && fs::exists(dir / "metadata.json");
+}
+
+std::vector<fs::path> immediateSubdirs(const fs::path& dir)
+{
+    std::vector<fs::path> out;
+    if (!fs::is_directory(dir)) return out;
+    for (const auto& e : fs::directory_iterator(dir)) {
+        if (!e.is_directory()) continue;
+        const auto name = e.path().filename().string();
+        if (name.empty() || name[0] == '.' || name == ".tmp") continue;
+        out.push_back(e.path());
+    }
+    std::sort(out.begin(), out.end());
+    return out;
+}
+
+bool anyImmediateSubdir(const fs::path& dir, bool (*test)(const fs::path&))
+{
+    for (const auto& child : immediateSubdirs(dir)) {
+        if (test(child)) return true;
+    }
+    return false;
+}
+
+fs::path defaultAutosaveRoot()
+{
+    if (!VolumePkg::autosaveRoot().empty()) return VolumePkg::autosaveRoot();
+    const struct passwd* pw = getpwuid(geteuid());
+    if (pw == nullptr || pw->pw_dir == nullptr || pw->pw_dir[0] == '\0') return {};
+    return fs::path(pw->pw_dir) / ".VC3D";
+}
+
+void atomicWriteString(const fs::path& target, const std::string& text)
+{
+    fs::create_directories(target.parent_path());
+    auto tmp = target;
+    tmp += ".tmp";
+    {
+        std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+        if (!out) throw std::runtime_error("cannot open " + tmp.string() + " for write");
+        out.write(text.data(), static_cast<std::streamsize>(text.size()));
+        if (!out) throw std::runtime_error("write failed for " + tmp.string());
+    }
+    fs::rename(tmp, target);
+}
+
+utils::Json entriesToJson(const std::vector<vc::project::Entry>& entries)
+{
+    auto arr = utils::Json::array();
+    for (const auto& e : entries) {
+        if (e.tags.empty()) {
+            arr.push_back(utils::Json(e.location));
+        } else {
+            auto obj = utils::Json::object();
+            obj["location"] = e.location;
+            auto t = utils::Json::array();
+            for (const auto& s : e.tags) t.push_back(utils::Json(s));
+            obj["tags"] = t;
+            arr.push_back(obj);
+        }
+    }
+    return arr;
+}
+
+std::vector<vc::project::Entry> entriesFromJson(const utils::Json& arr)
+{
+    std::vector<vc::project::Entry> out;
+    if (!arr.is_array()) return out;
+    for (const auto& v : arr) {
+        vc::project::Entry e;
+        if (v.is_string()) {
+            e.location = v.get_string();
+        } else if (v.is_object()) {
+            e.location = v.at("location").get_string();
+            if (v.contains("tags")) {
+                e.tags = v.at("tags").get_string_array();
+            }
+        } else {
             continue;
         }
-        const auto dirName = entry.path().filename().string();
-        if (!addSingleVolume(dirName)) {
-            Logger()->warn("Skipping initial volume '{}' (invalid or duplicate)", dirName);
+        if (!e.location.empty()) out.push_back(std::move(e));
+    }
+    return out;
+}
+
+}
+
+namespace vc::project {
+
+std::string validateLocation(Category category, const std::string& location)
+{
+    if (location.empty()) return "Location is empty.";
+
+    if (isLocationRemote(location)) {
+        const auto schemeEnd = location.find("://");
+        if (schemeEnd == std::string::npos) {
+            return "Remote URL is missing scheme separator (expected '://').";
         }
-    }
-
-    auto availableDirs = getAvailableSegmentationDirectories();
-    bool loadFirstOnly = false;
-    std::string loadFirstDir = currentSegmentationDir_;
-    if (loadFirstSegmentationDir_ && !loadFirstSegmentationDir_->empty()) {
-        loadFirstOnly = true;
-        loadFirstDir = *loadFirstSegmentationDir_;
-        if (std::find(availableDirs.begin(), availableDirs.end(), loadFirstDir) == availableDirs.end()) {
-            Logger()->warn("Requested load-first segmentation directory '{}' not available; loading all segmentations.",
-                           loadFirstDir);
-            loadFirstOnly = false;
-        } else {
-            currentSegmentationDir_ = loadFirstDir;
+        if (location.size() <= schemeEnd + 3) {
+            return "Remote URL is missing host/bucket after scheme.";
         }
+        return {};
     }
 
-    if (loadFirstOnly) {
-        loadSegmentationsFromDirectory(loadFirstDir);
-        loadedSegmentationDirs_.insert(loadFirstDir);
-    } else {
-        for (const auto& dirName : availableDirs) {
-            loadSegmentationsFromDirectory(dirName);
-            loadedSegmentationDirs_.insert(dirName);
-        }
+    const auto path = resolveLocalPath(location);
+    std::error_code ec;
+    if (!fs::exists(path, ec)) return "Path does not exist: " + path.string();
+    if (!fs::is_directory(path, ec)) return "Path is not a directory: " + path.string();
+
+    switch (category) {
+        case Category::Volumes:
+            if (isSingleZarrVolumeDir(path)) return {};
+            if (anyImmediateSubdir(path, &isSingleZarrVolumeDir)) return {};
+            return "Not a zarr volume and contains no zarr volumes (expected meta.json + chunk-level .zarray).";
+        case Category::Segments:
+            if (isSegmentDir(path)) return {};
+            if (anyImmediateSubdir(path, &isSegmentDir)) return {};
+            return "Not a segment directory and contains no segments (expected tifxyz layout with meta.json).";
+        case Category::NormalGrids:
+            if (isNormalGridDir(path)) return {};
+            if (anyImmediateSubdir(path, &isNormalGridDir)) return {};
+            return "Not a normal-grid directory (expected xy/, xz/, yz/ subdirs and metadata.json).";
     }
-
-    ensureSegmentScrollSource();
+    return "Unknown category.";
 }
 
-std::shared_ptr<VolumePkg> VolumePkg::New(const std::filesystem::path& fileLocation)
-{
-    return std::make_shared<VolumePkg>(fileLocation);
 }
 
-bool VolumePkg::isRemote() const { return isRemote_; }
+VolumePkg::VolumePkg() = default;
 
-
-std::string VolumePkg::name() const
+VolumePkg::~VolumePkg()
 {
-    auto name = config_["name"].get_string();
-    if (name != "NULL") {
-        return name;
+    shuttingDown_.store(true, std::memory_order_relaxed);
+    std::lock_guard<std::mutex> lk(segmentsMutex_);
+    segmentsChangedCb_ = nullptr;
+}
+
+void VolumePkg::setAutosaveRoot(const fs::path& dir) { autosaveRoot_ = dir; }
+fs::path VolumePkg::autosaveRoot() { return autosaveRoot_; }
+
+fs::path VolumePkg::autosaveFile()
+{
+    const auto root = defaultAutosaveRoot();
+    if (root.empty()) return {};
+    return root / "current_project.json";
+}
+
+std::shared_ptr<VolumePkg> VolumePkg::newEmpty()
+{
+    return std::shared_ptr<VolumePkg>(new VolumePkg());
+}
+
+std::shared_ptr<VolumePkg> VolumePkg::load(const fs::path& jsonFile,
+                                           const vc::project::LoadOptions& opts)
+{
+    auto p = std::shared_ptr<VolumePkg>(new VolumePkg());
+    p->opts_ = opts;
+    p->path_ = jsonFile;
+    p->readJsonFrom(jsonFile);
+    p->resolveAll();
+    return p;
+}
+
+std::shared_ptr<VolumePkg> VolumePkg::loadAutosave(const vc::project::LoadOptions& opts)
+{
+    const auto file = autosaveFile();
+    if (file.empty() || !fs::exists(file)) return nullptr;
+    auto p = std::shared_ptr<VolumePkg>(new VolumePkg());
+    p->opts_ = opts;
+    p->path_ = file;
+    p->readJsonFrom(file);
+    p->resolveAll();
+    return p;
+}
+
+std::shared_ptr<VolumePkg> VolumePkg::New(const fs::path& jsonFile)
+{
+    return load(jsonFile);
+}
+
+fs::path VolumePkg::path() const { return path_; }
+std::string VolumePkg::name() const { return name_; }
+void VolumePkg::setName(const std::string& v) { name_ = v; saveAutosave(); }
+int VolumePkg::version() const { return version_; }
+
+const std::vector<vc::project::Entry>& VolumePkg::volumeEntries() const { return volumes_; }
+const std::vector<vc::project::Entry>& VolumePkg::segmentEntries() const { return segments_; }
+const std::vector<vc::project::Entry>& VolumePkg::normalGridEntries() const { return normalGrids_; }
+
+bool VolumePkg::addVolumeEntry(const std::string& location, std::vector<std::string> tags)
+{
+    if (location.empty()) return false;
+    for (const auto& e : volumes_) if (e.location == location) return false;
+    volumes_.push_back({location, std::move(tags)});
+    resolveVolumeEntry(volumes_.back());
+    saveAutosave();
+    return true;
+}
+
+bool VolumePkg::addSegmentsEntry(const std::string& location, std::vector<std::string> tags)
+{
+    if (location.empty()) return false;
+    for (const auto& e : segments_) if (e.location == location) return false;
+    segments_.push_back({location, std::move(tags)});
+    resolveSegmentsEntry(segments_.back(), loadGeneration_.load(std::memory_order_relaxed));
+    saveAutosave();
+    return true;
+}
+
+bool VolumePkg::addNormalGridEntry(const std::string& location, std::vector<std::string> tags)
+{
+    if (location.empty()) return false;
+    for (const auto& e : normalGrids_) if (e.location == location) return false;
+    normalGrids_.push_back({location, std::move(tags)});
+    resolveNormalGridEntry(normalGrids_.back());
+    saveAutosave();
+    return true;
+}
+
+bool VolumePkg::removeEntry(const std::string& location)
+{
+    auto eraseFrom = [&](std::vector<vc::project::Entry>& v) {
+        auto it = std::find_if(v.begin(), v.end(),
+                               [&](const auto& e) { return e.location == location; });
+        if (it == v.end()) return false;
+        v.erase(it);
+        return true;
+    };
+    bool removed = false;
+    if (eraseFrom(volumes_)) removed = true;
+    if (eraseFrom(segments_)) removed = true;
+    if (eraseFrom(normalGrids_)) removed = true;
+    if (removed) {
+        if (outputSegments_ && *outputSegments_ == location) outputSegments_.reset();
+        resolveAll();
+        saveAutosave();
     }
-
-    return "UnnamedVolume";
+    return removed;
 }
 
-int VolumePkg::version() const { return config_["version"].get_int(); }
-
-bool VolumePkg::hasVolumes() const { return !volumes_.empty(); }
-
-bool VolumePkg::hasVolume(const std::string& id) const
+void VolumePkg::setOutputSegments(const std::string& location)
 {
-    return volumes_.count(id) > 0;
+    outputSegments_ = location;
+    saveAutosave();
 }
 
-std::size_t VolumePkg::numberOfVolumes() const
+void VolumePkg::clearOutputSegments()
 {
-    return volumes_.size();
+    outputSegments_.reset();
+    saveAutosave();
 }
+
+bool VolumePkg::hasOutputSegments() const { return outputSegments_.has_value(); }
+
+fs::path VolumePkg::outputSegmentsPath() const
+{
+    if (!outputSegments_) return {};
+    if (vc::project::isLocationRemote(*outputSegments_)) return {};
+    return vc::project::resolveLocalPath(*outputSegments_, path_.parent_path());
+}
+
+bool VolumePkg::hasVolumes() const { return !loadedVolumes_.empty(); }
+bool VolumePkg::hasVolume(const std::string& id) const { return loadedVolumes_.count(id) > 0; }
+std::size_t VolumePkg::numberOfVolumes() const { return loadedVolumes_.size(); }
 
 std::vector<std::string> VolumePkg::volumeIDs() const
 {
-    std::vector<std::string> ids;
-    for (const auto& v : volumes_) {
-        ids.emplace_back(v.first);
-    }
-    return ids;
-}
-
-std::shared_ptr<Volume> VolumePkg::volume()
-{
-    if (volumes_.empty()) {
-        throw std::out_of_range("No volumes in VolPkg");
-    }
-    return volumes_.begin()->second;
+    std::vector<std::string> out;
+    out.reserve(loadedVolumes_.size());
+    for (const auto& [id, _] : loadedVolumes_) out.push_back(id);
+    return out;
 }
 
 std::shared_ptr<Volume> VolumePkg::volume(const std::string& id)
 {
-    return volumes_.at(id);
+    auto it = loadedVolumes_.find(id);
+    if (it == loadedVolumes_.end()) return nullptr;
+    return it->second;
 }
 
-bool VolumePkg::isValidVolumeDirectory(const std::filesystem::path& dirpath) const
+std::shared_ptr<Volume> VolumePkg::volume()
 {
-    if (!std::filesystem::is_directory(dirpath)) {
-        return false;
-    }
-
-    // Accept meta.json, metadata.json, or zarr group markers (.zgroup/.zattrs).
-    // Volume::Volume() auto-generates metadata from zarr shapes when no
-    // meta.json exists, so we just need evidence this is a zarr volume.
-    bool hasMetadata = std::filesystem::exists(dirpath / "meta.json") ||
-                       std::filesystem::exists(dirpath / "metadata.json") ||
-                       std::filesystem::exists(dirpath / ".zgroup") ||
-                       std::filesystem::exists(dirpath / ".zattrs");
-    if (!hasMetadata) {
-        return false;
-    }
-
-    for (const auto& entry : std::filesystem::directory_iterator(dirpath)) {
-        if (!entry.is_directory()) {
-            continue;
-        }
-
-        if (std::filesystem::exists(entry.path() / ".zarray")) {
-            return true;
-        }
-    }
-
-    return false;
+    if (loadedVolumes_.empty()) return nullptr;
+    return loadedVolumes_.begin()->second;
 }
 
 bool VolumePkg::addVolume(const std::shared_ptr<Volume>& volume)
@@ -166,402 +375,304 @@ bool VolumePkg::addVolume(const std::shared_ptr<Volume>& volume)
         return false;
     }
 
-    const auto volumeId = volume->id();
-    auto result = volumes_.emplace(volumeId, volume);
+    const auto id = volume->id();
+    auto result = loadedVolumes_.emplace(id, volume);
     if (!result.second) {
-        Logger()->warn("Volume '{}' already exists in package", volumeId);
+        Logger()->warn("Volume '{}' already exists in package", id);
         return false;
     }
 
     const auto source = volume->isRemote()
         ? volume->remoteUrl()
         : volume->path().string();
-    Logger()->info("Added external volume '{}' from '{}'", volumeId, source);
+    Logger()->info("Added external volume '{}' from '{}'", id, source);
     return true;
 }
 
 bool VolumePkg::addSingleVolume(const std::string& volumeDirName)
 {
-    std::filesystem::path dirpath = rootDir_ / "volumes" / volumeDirName;
-
-    if (!std::filesystem::exists(dirpath) || !std::filesystem::is_directory(dirpath)) {
-        Logger()->warn("Cannot add volume '{}': path not found or not a directory", volumeDirName);
-        return false;
-    }
-
-    if (!isValidVolumeDirectory(dirpath)) {
-        Logger()->warn("Skipping volume '{}': missing required metadata or zarr level", volumeDirName);
-        return false;
-    }
-
-    try {
-        auto v = Volume::New(dirpath);
-        if (hasVolume(v->id())) {
-            Logger()->warn("Volume '{}' already exists in package under id '{}'", volumeDirName, v->id());
+    if (volumeDirName.empty()) return false;
+    for (const auto& e : volumes_) {
+        if (vc::project::isLocationRemote(e.location)) continue;
+        const auto base = vc::project::resolveLocalPath(e.location, path_.parent_path());
+        const auto candidate = base / volumeDirName;
+        if (!isSingleZarrVolumeDir(candidate)) continue;
+        try {
+            auto v = Volume::New(candidate);
+            const auto id = v->id();
+            if (loadedVolumes_.count(id) > 0) return false;
+            loadedVolumes_.emplace(id, v);
+            if (!e.tags.empty()) volumeTagsByID_[id] = e.tags;
+            return true;
+        } catch (const std::exception& ex) {
+            Logger()->warn("addSingleVolume('{}'): {}", volumeDirName, ex.what());
             return false;
         }
-        return addVolume(v);
-    } catch (const std::exception& exc) {
-        Logger()->warn("Failed to add volume '{}': {}", volumeDirName, exc.what());
-        return false;
     }
+    return false;
 }
 
 bool VolumePkg::removeSingleVolume(const std::string& volumeIdOrDirName)
 {
-    auto direct = volumes_.find(volumeIdOrDirName);
-    if (direct != volumes_.end()) {
-        volumes_.erase(direct);
-        Logger()->info("Removed volume '{}'", volumeIdOrDirName);
+    if (loadedVolumes_.erase(volumeIdOrDirName) > 0) {
+        volumeTagsByID_.erase(volumeIdOrDirName);
         return true;
     }
-
-    for (auto it = volumes_.begin(); it != volumes_.end(); ++it) {
-        if (it->second->path().filename().string() == volumeIdOrDirName) {
-            Logger()->info("Removed volume '{}' (directory '{}')",
-                           it->first,
-                           volumeIdOrDirName);
-            volumes_.erase(it);
+    for (auto it = loadedVolumes_.begin(); it != loadedVolumes_.end(); ++it) {
+        if (it->second && it->second->path().filename().string() == volumeIdOrDirName) {
+            const auto id = it->first;
+            loadedVolumes_.erase(it);
+            volumeTagsByID_.erase(id);
             return true;
         }
     }
-
-    Logger()->warn("Cannot remove volume '{}': not found", volumeIdOrDirName);
     return false;
 }
 
 bool VolumePkg::reloadSingleVolume(const std::string& volumeId)
 {
-    auto it = volumes_.find(volumeId);
-    if (it == volumes_.end()) {
-        if (!addSingleVolume(volumeId)) {
-            return false;
-        }
+    auto it = loadedVolumes_.find(volumeId);
+    if (it == loadedVolumes_.end() || !it->second) return false;
+    const auto vp = it->second->path();
+    loadedVolumes_.erase(it);
+    volumeTagsByID_.erase(volumeId);
+    try {
+        auto v = Volume::New(vp);
+        loadedVolumes_.emplace(v->id(), v);
         return true;
+    } catch (const std::exception& ex) {
+        Logger()->warn("reloadSingleVolume('{}'): {}", volumeId, ex.what());
+        return false;
     }
-
-    const auto volumePath = it->second->path();
-    removeSingleVolume(volumeId);
-    return addSingleVolume(volumePath.filename().string());
 }
 
 bool VolumePkg::hasSegmentations() const
 {
-    return !segmentations_.empty();
-}
-
-
-std::shared_ptr<Segmentation> VolumePkg::segmentation(const std::string& id)
-{
-    auto it = segmentations_.find(id);
-    if (it == segmentations_.end()) {
-        return nullptr;
-    }
-    return it->second;
+    std::lock_guard<std::mutex> lk(segmentsMutex_);
+    return !loadedSegmentations_.empty();
 }
 
 std::vector<std::string> VolumePkg::segmentationIDs() const
 {
-    std::vector<std::string> ids;
-    // Only return IDs from the current directory
-    for (const auto& s : segmentations_) {
-        auto it = segmentationDirectories_.find(s.first);
-        if (it != segmentationDirectories_.end() && it->second == currentSegmentationDir_) {
-            ids.emplace_back(s.first);
-        }
-    }
-    return ids;
+    std::lock_guard<std::mutex> lk(segmentsMutex_);
+    std::vector<std::string> out;
+    out.reserve(loadedSegmentations_.size());
+    for (const auto& [id, _] : loadedSegmentations_) out.push_back(id);
+    return out;
 }
 
-
-void VolumePkg::loadSegmentationsFromDirectory(const std::string& dirName)
+std::shared_ptr<Segmentation> VolumePkg::segmentation(const std::string& id)
 {
-    // DO NOT clear existing segmentations - we keep all directories in memory
-    // Only remove segmentations from this specific directory
-    std::vector<std::string> toRemove;
-    for (const auto& pair : segmentationDirectories_) {
-        if (pair.second == dirName) {
-            toRemove.push_back(pair.first);
-        }
-    }
-
-    // Remove old segmentations from this directory
-    for (const auto& id : toRemove) {
-        segmentations_.erase(id);
-        segmentationDirectories_.erase(id);
-    }
-
-    // Check if directory exists
-    const auto segDir = rootDir_ / dirName;
-    if (!std::filesystem::exists(segDir)) {
-        Logger()->warn("Segmentation directory '{}' does not exist", dirName);
-        return;
-    }
-
-    // Load segmentations from the specified directory
-    int loadedCount = 0;
-    int skippedCount = 0;
-    int failedCount = 0;
-    for (const auto& entry : std::filesystem::directory_iterator(segDir)) {
-        std::filesystem::path dirpath = std::filesystem::canonical(entry);
-        if (std::filesystem::is_directory(dirpath)) {
-            // Skip hidden directories and .tmp folders
-            const auto dirName_ = dirpath.filename().string();
-            if (dirName_.empty() || dirName_[0] == '.' || dirName_ == ".tmp") {
-                skippedCount++;
-                continue;
-            }
-            try {
-                auto s = Segmentation::New(dirpath);
-                auto result = segmentations_.emplace(s->id(), s);
-                if (result.second) {
-                    // Track which directory this segmentation came from
-                    segmentationDirectories_[s->id()] = dirName;
-                    loadedCount++;
-                } else {
-                    Logger()->warn("Duplicate segment ID '{}' - already loaded from different path, skipping: {}",
-                                   s->id(), dirpath.string());
-                    skippedCount++;
-                }
-            }
-            catch (const std::exception &exc) {
-                Logger()->warn("Failed to load segment dir: {} - {}", dirpath.string(), exc.what());
-                failedCount++;
-            }
-        }
-    }
-    Logger()->info("Loaded {} segments from '{}' (skipped={}, failed={})",
-                   loadedCount, dirName, skippedCount, failedCount);
-}
-
-void VolumePkg::ensureSegmentScrollSource()
-{
-    if (segmentations_.empty() || volumes_.empty()) {
-        return;
-    }
-
-    auto scrollName = config_["name"].get_string();
-    auto vol = volumes_.begin()->second;
-    auto volumeUuid = vol->id();
-
-    for (auto& [id, seg] : segmentations_) {
-        seg->ensureScrollSource(scrollName, volumeUuid);
-    }
-}
-
-void VolumePkg::setSegmentationDirectory(const std::string& dirName)
-{
-    if (currentSegmentationDir_ == dirName) {
-        return;
-    }
-    if (loadedSegmentationDirs_.find(dirName) == loadedSegmentationDirs_.end()) {
-        const auto segDir = rootDir_ / dirName;
-        if (!std::filesystem::exists(segDir)) {
-            Logger()->warn("Segmentation directory '{}' does not exist", dirName);
-        } else {
-            loadSegmentationsFromDirectory(dirName);
-            loadedSegmentationDirs_.insert(dirName);
-        }
-    }
-    currentSegmentationDir_ = dirName;
-}
-
-auto VolumePkg::getSegmentationDirectory() const -> std::string
-{
-    return currentSegmentationDir_;
-}
-
-auto VolumePkg::getVolpkgDirectory() const -> std::string
-{
-    return rootDir_;
-}
-
-
-auto VolumePkg::getAvailableSegmentationDirectories() const -> std::vector<std::string>
-{
-    if (isRemote_) {
-        return {"paths"};
-    }
-
-    std::vector<std::string> dirs;
-
-    // Check for common segmentation directories
-    const std::vector<std::string> commonDirs = {"paths", "traces", "export"};
-    for (const auto& dir : commonDirs) {
-        if (std::filesystem::exists(rootDir_ / dir) && std::filesystem::is_directory(rootDir_ / dir)) {
-            dirs.push_back(dir);
-        }
-    }
-
-    return dirs;
+    std::lock_guard<std::mutex> lk(segmentsMutex_);
+    auto it = loadedSegmentations_.find(id);
+    if (it == loadedSegmentations_.end()) return nullptr;
+    return it->second;
 }
 
 void VolumePkg::removeSegmentation(const std::string& id)
 {
-    // Check if segmentation exists
-    auto it = segmentations_.find(id);
-    if (it == segmentations_.end()) {
-        throw std::runtime_error("Segmentation not found: " + id);
+    fs::path segPath;
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        auto it = loadedSegmentations_.find(id);
+        if (it == loadedSegmentations_.end()) {
+            throw std::runtime_error("Segmentation not found: " + id);
+        }
+        segPath = it->second->path();
+        loadedSegmentations_.erase(it);
+        segmentationTagsByID_.erase(id);
     }
+    if (fs::exists(segPath)) fs::remove_all(segPath);
+}
 
-    // Get the path before removing
-    std::filesystem::path segPath = it->second->path();
+std::vector<fs::path> VolumePkg::normalGridPaths() const
+{
+    return resolvedNormalGridPaths_;
+}
 
-    // Remove from internal map
-    segmentations_.erase(it);
+bool VolumePkg::isRemoteSegment(const std::string& id) const
+{
+    std::lock_guard<std::mutex> lk(segmentsMutex_);
+    return remoteSegmentInfo_.count(id) > 0;
+}
 
-    // Delete the physical folder
-    if (std::filesystem::exists(segPath)) {
-        std::filesystem::remove_all(segPath);
+bool VolumePkg::isRemoteSegmentCached(const std::string& id) const
+{
+    vc::project::RemoteSegmentInfo info;
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        auto it = remoteSegmentInfo_.find(id);
+        if (it == remoteSegmentInfo_.end()) return true;
+        info = it->second;
+    }
+    return vc::isRemoteSegmentFullyCached(info.cacheRoot, id, vc::RemoteSegmentSource::Direct);
+}
+
+bool VolumePkg::ensureRemoteSegmentDownloaded(const std::string& id)
+{
+    vc::project::RemoteSegmentInfo info;
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        auto it = remoteSegmentInfo_.find(id);
+        if (it == remoteSegmentInfo_.end()) return true;
+        info = it->second;
+    }
+    if (vc::isRemoteSegmentFullyCached(info.cacheRoot, id, vc::RemoteSegmentSource::Direct)) return true;
+    try {
+        vc::downloadRemoteSegment(info.baseUrl, id, info.cacheRoot,
+                                  info.auth, vc::RemoteSegmentSource::Direct);
+        return true;
+    } catch (const std::exception& ex) {
+        Logger()->error("Remote segment '{}' TIFF download failed: {}", id, ex.what());
+        return false;
     }
 }
 
-void VolumePkg::refreshSegmentations()
+std::vector<fs::path> VolumePkg::normal3dZarrPaths() const
 {
-    const auto segDir = rootDir_ / currentSegmentationDir_;
-    if (!std::filesystem::exists(segDir)) {
-        Logger()->warn("Segmentation directory '{}' does not exist", currentSegmentationDir_);
-        return;
+    std::vector<fs::path> out;
+    for (const auto& [id, tags] : volumeTagsByID_) {
+        if (std::find(tags.begin(), tags.end(), "normal3d") == tags.end()) continue;
+        auto it = loadedVolumes_.find(id);
+        if (it == loadedVolumes_.end()) continue;
+        out.push_back(it->second->path());
     }
+    return out;
+}
 
-    // Build a set of current segmentation paths on disk for the current directory
-    std::set<std::filesystem::path> diskPaths;
-    for (const auto& entry : std::filesystem::directory_iterator(segDir)) {
-        std::filesystem::path dirpath = std::filesystem::canonical(entry);
-        if (std::filesystem::is_directory(dirpath)) {
-            // Skip hidden directories and .tmp folders
-            const auto dirName = dirpath.filename().string();
-            if (dirName.empty() || dirName[0] == '.' || dirName == ".tmp") {
-                continue;
-            }
-            diskPaths.insert(dirpath);
-        }
-    }
+std::vector<std::string> VolumePkg::volumeTags(const std::string& volumeId) const
+{
+    auto it = volumeTagsByID_.find(volumeId);
+    if (it == volumeTagsByID_.end()) return {};
+    return it->second;
+}
 
-    // Find segmentations to remove (loaded from current directory but not on disk anymore)
-    std::vector<std::string> toRemove;
-    for (const auto& seg : segmentations_) {
-        auto dirIt = segmentationDirectories_.find(seg.first);
-        if (dirIt != segmentationDirectories_.end() && dirIt->second == currentSegmentationDir_) {
-            // This segmentation belongs to the current directory
-            // Check if it still exists on disk
-            if (diskPaths.find(seg.second->path()) == diskPaths.end()) {
-                // Not on disk anymore - mark for removal
-                toRemove.push_back(seg.first);
-            }
-        }
-    }
-
-    // Remove segmentations that no longer exist
-    for (const auto& id : toRemove) {
-        Logger()->info("Removing segmentation '{}' - no longer exists on disk", id);
-
-        // Get the path before removing the segmentation
-        std::filesystem::path segPath;
-        auto segIt = segmentations_.find(id);
-        if (segIt != segmentations_.end()) {
-            segPath = segIt->second->path();
-        }
-
-        // Remove from segmentations map
-        segmentations_.erase(id);
-
-        // Remove from directories map
-        segmentationDirectories_.erase(id);
-    }
-
-    // Find and add new segmentations (on disk but not in memory)
-    // Build a set of currently loaded paths for O(1) lookup
-    std::set<std::filesystem::path> loadedPaths;
-    for (const auto& seg : segmentations_) {
-        loadedPaths.insert(seg.second->path());
-    }
-
-    for (const auto& diskPath : diskPaths) {
-        if (loadedPaths.find(diskPath) == loadedPaths.end()) {
-            try {
-                auto s = Segmentation::New(diskPath);
-                segmentations_.emplace(s->id(), s);
-                segmentationDirectories_[s->id()] = currentSegmentationDir_;
-                Logger()->info("Added new segmentation '{}'", s->id());
-            }
-            catch (const std::exception &exc) {
-                Logger()->warn("Failed to load segment dir: {} - {}", diskPath.string(), exc.what());
-            }
-        }
-    }
+std::vector<std::string> VolumePkg::segmentationTags(const std::string& segmentId) const
+{
+    std::lock_guard<std::mutex> lk(segmentsMutex_);
+    auto it = segmentationTagsByID_.find(segmentId);
+    if (it == segmentationTagsByID_.end()) return {};
+    return it->second;
 }
 
 bool VolumePkg::isSurfaceLoaded(const std::string& id) const
 {
-    auto segIt = segmentations_.find(id);
-    if (segIt == segmentations_.end()) {
-        return false;
+    std::shared_ptr<Segmentation> seg;
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        auto it = loadedSegmentations_.find(id);
+        if (it == loadedSegmentations_.end()) return false;
+        seg = it->second;
     }
-    return segIt->second->isSurfaceLoaded();
+    return seg->isSurfaceLoaded();
 }
 
 std::shared_ptr<QuadSurface> VolumePkg::loadSurface(const std::string& id)
 {
-    auto segIt = segmentations_.find(id);
-    if (segIt == segmentations_.end()) {
-        Logger()->error("Cannot load surface - segmentation {} not found", id);
-        return nullptr;
+    std::shared_ptr<Segmentation> seg;
+    std::optional<vc::project::RemoteSegmentInfo> remoteInfo;
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        auto it = loadedSegmentations_.find(id);
+        if (it == loadedSegmentations_.end()) {
+            Logger()->error("Cannot load surface - segmentation {} not found", id);
+            return nullptr;
+        }
+        seg = it->second;
+        auto rit = remoteSegmentInfo_.find(id);
+        if (rit != remoteSegmentInfo_.end()) remoteInfo = rit->second;
     }
-    return segIt->second->loadSurface();
+    if (remoteInfo &&
+        !vc::isRemoteSegmentFullyCached(remoteInfo->cacheRoot, id, vc::RemoteSegmentSource::Direct))
+    {
+        try {
+            vc::downloadRemoteSegment(remoteInfo->baseUrl, id, remoteInfo->cacheRoot,
+                                      remoteInfo->auth, vc::RemoteSegmentSource::Direct);
+        } catch (const std::exception& ex) {
+            Logger()->error("Remote segment '{}' TIFF download failed: {}", id, ex.what());
+            return nullptr;
+        }
+    }
+    return seg->loadSurface();
 }
 
 std::shared_ptr<QuadSurface> VolumePkg::getSurface(const std::string& id)
 {
-    auto segIt = segmentations_.find(id);
-    if (segIt == segmentations_.end()) {
-        return nullptr;
+    std::shared_ptr<Segmentation> seg;
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        auto it = loadedSegmentations_.find(id);
+        if (it == loadedSegmentations_.end()) return nullptr;
+        seg = it->second;
     }
-    return segIt->second->getSurface();
-}
-
-
-std::vector<std::string> VolumePkg::getLoadedSurfaceIDs() const
-{
-    std::vector<std::string> ids;
-    for (const auto& [id, seg] : segmentations_) {
-        if (seg->isSurfaceLoaded()) {
-            ids.push_back(id);
-        }
-    }
-    return ids;
-}
-
-void VolumePkg::unloadAllSurfaces()
-{
-    for (auto& [id, seg] : segmentations_) {
-        seg->unloadSurface();
-    }
+    return seg->getSurface();
 }
 
 bool VolumePkg::unloadSurface(const std::string& id)
 {
-    auto segIt = segmentations_.find(id);
-    if (segIt == segmentations_.end()) {
-        return false;
+    std::shared_ptr<Segmentation> seg;
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        auto it = loadedSegmentations_.find(id);
+        if (it == loadedSegmentations_.end()) return false;
+        seg = it->second;
     }
-    segIt->second->unloadSurface();
+    seg->unloadSurface();
     return true;
 }
 
+std::vector<std::string> VolumePkg::getLoadedSurfaceIDs() const
+{
+    std::vector<std::shared_ptr<Segmentation>> snapshot;
+    std::vector<std::string> ids;
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        snapshot.reserve(loadedSegmentations_.size());
+        ids.reserve(loadedSegmentations_.size());
+        for (const auto& [id, seg] : loadedSegmentations_) {
+            ids.push_back(id);
+            snapshot.push_back(seg);
+        }
+    }
+    std::vector<std::string> out;
+    out.reserve(snapshot.size());
+    for (size_t i = 0; i < snapshot.size(); ++i) {
+        if (snapshot[i]->isSurfaceLoaded()) out.push_back(ids[i]);
+    }
+    return out;
+}
+
+void VolumePkg::unloadAllSurfaces()
+{
+    std::vector<std::shared_ptr<Segmentation>> snapshot;
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        snapshot.reserve(loadedSegmentations_.size());
+        for (auto& [id, seg] : loadedSegmentations_) snapshot.push_back(seg);
+    }
+    for (auto& seg : snapshot) seg->unloadSurface();
+}
 
 void VolumePkg::loadSurfacesBatch(const std::vector<std::string>& ids)
 {
     std::vector<std::shared_ptr<Segmentation>> toLoad;
-    for (const auto& id : ids) {
-        auto segIt = segmentations_.find(id);
-        if (segIt != segmentations_.end() && !segIt->second->isSurfaceLoaded() && segIt->second->canLoadSurface()) {
-            toLoad.push_back(segIt->second);
+    toLoad.reserve(ids.size());
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        for (const auto& id : ids) {
+            auto it = loadedSegmentations_.find(id);
+            if (it == loadedSegmentations_.end()) continue;
+            if (it->second->isSurfaceLoaded() || !it->second->canLoadSurface()) continue;
+            if (remoteSegmentInfo_.count(id) > 0
+                && !vc::isRemoteSegmentFullyCached(remoteSegmentInfo_.at(id).cacheRoot, id, vc::RemoteSegmentSource::Direct))
+            {
+                continue;
+            }
+            toLoad.push_back(it->second);
         }
     }
-
-#pragma omp parallel for schedule(dynamic,1)
-    for (auto & seg : toLoad) {
+#pragma omp parallel for schedule(dynamic, 1)
+    for (auto& seg : toLoad) {
         try {
             seg->loadSurface();
         } catch (const std::exception& e) {
@@ -570,84 +681,437 @@ void VolumePkg::loadSurfacesBatch(const std::vector<std::string>& ids)
     }
 }
 
-VolumePkg::~VolumePkg()
+bool VolumePkg::isRemote() const
 {
+    auto anyRemote = [](const std::vector<vc::project::Entry>& v) {
+        return std::any_of(v.begin(), v.end(),
+                           [](const auto& e) { return vc::project::isLocationRemote(e.location); });
+    };
+    return anyRemote(volumes_) || anyRemote(segments_) || anyRemote(normalGrids_);
+}
+
+void VolumePkg::save(const fs::path& target)
+{
+    writeJsonTo(target);
+    path_ = target;
+}
+
+void VolumePkg::saveAutosave()
+{
+    const auto file = autosaveFile();
+    if (file.empty()) return;
+    writeJsonTo(file);
+}
+
+void VolumePkg::resolveAll()
+{
+    const auto gen = loadGeneration_.fetch_add(1, std::memory_order_relaxed) + 1;
+    loadedVolumes_.clear();
+    volumeTagsByID_.clear();
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        loadedSegmentations_.clear();
+        segmentationTagsByID_.clear();
+        remoteSegmentInfo_.clear();
+    }
+    resolvedNormalGridPaths_.clear();
+    for (const auto& e : volumes_) resolveVolumeEntry(e);
+    for (const auto& e : segments_) resolveSegmentsEntry(e, gen);
+    for (const auto& e : normalGrids_) resolveNormalGridEntry(e);
+}
+
+void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
+{
+    if (vc::project::isLocationRemote(e.location)) {
+        try {
+            auto v = Volume::NewFromUrl(e.location, opts_.remoteCacheRoot, {});
+            const auto id = v->id();
+            loadedVolumes_.emplace(id, v);
+            if (!e.tags.empty()) volumeTagsByID_[id] = e.tags;
+            return;
+        } catch (const std::exception&) {
+        }
+
+        auto resolved = vc::resolveRemoteUrl(e.location);
+        std::string base = resolved.httpsUrl;
+        if (base.empty()) {
+            Logger()->warn("Cannot resolve remote volumes URL '{}'", e.location);
+            return;
+        }
+        if (base.back() != '/') base += '/';
+        vc::cache::HttpAuth auth;
+        if (resolved.useAwsSigv4) auth = vc::cache::loadAwsCredentials();
+
+        vc::cache::S3ListResult listing;
+        try {
+            listing = vc::cache::s3ListObjects(base, auth);
+        } catch (const std::exception& ex) {
+            Logger()->warn("Cannot list remote volumes at '{}': {}", e.location, ex.what());
+            return;
+        }
+        if (listing.authError) {
+            Logger()->warn("Auth error listing remote volumes at '{}': {}", e.location, listing.errorMessage);
+            return;
+        }
+
+        std::string locBase = e.location;
+        if (locBase.empty() || locBase.back() != '/') locBase += '/';
+        for (const auto& subName : listing.prefixes) {
+            const std::string subUrl = locBase + subName + "/";
+            try {
+                auto v = Volume::NewFromUrl(subUrl, opts_.remoteCacheRoot, {});
+                const auto id = v->id();
+                if (loadedVolumes_.count(id) > 0) continue;
+                loadedVolumes_.emplace(id, v);
+                if (!e.tags.empty()) volumeTagsByID_[id] = e.tags;
+            } catch (const std::exception& ex) {
+                Logger()->warn("Skipping remote volume '{}': {}", subUrl, ex.what());
+            }
+        }
+        return;
+    }
+
+    const auto path = vc::project::resolveLocalPath(e.location, path_.parent_path());
+    if (!fs::exists(path)) {
+        Logger()->warn("Skipping volume '{}': path does not exist", e.location);
+        return;
+    }
+    auto loadOne = [&](const fs::path& vp) {
+        try {
+            auto v = Volume::New(vp);
+            const auto id = v->id();
+            if (loadedVolumes_.count(id) > 0) {
+                Logger()->warn("Duplicate volume id '{}' from '{}', skipping", id, vp.string());
+                return;
+            }
+            loadedVolumes_.emplace(id, v);
+            if (!e.tags.empty()) volumeTagsByID_[id] = e.tags;
+        } catch (const std::exception& ex) {
+            Logger()->warn("Failed to load volume '{}': {}", vp.string(), ex.what());
+        }
+    };
+    if (isSingleZarrVolumeDir(path)) {
+        loadOne(path);
+    } else {
+        for (const auto& child : immediateSubdirs(path)) {
+            if (isSingleZarrVolumeDir(child)) loadOne(child);
+        }
+    }
+}
+
+void VolumePkg::resolveSegmentsEntry(const vc::project::Entry& e, std::uint64_t generation)
+{
+    if (vc::project::isLocationRemote(e.location)) {
+        auto self = weak_from_this();
+        std::thread([self, e, generation]() {
+            auto pkg = self.lock();
+            if (!pkg) return;
+            pkg->loadRemoteSegmentsAsync(e, generation);
+        }).detach();
+        return;
+    }
+
+    const auto path = vc::project::resolveLocalPath(e.location, path_.parent_path());
+    if (!fs::exists(path)) {
+        Logger()->warn("Skipping segments '{}': path does not exist", e.location);
+        return;
+    }
+    auto loadOne = [&](const fs::path& sp) {
+        try {
+            auto s = Segmentation::New(sp);
+            const auto id = s->id();
+            std::lock_guard<std::mutex> lk(segmentsMutex_);
+            if (loadedSegmentations_.count(id) > 0) {
+                Logger()->warn("Duplicate segment id '{}' from '{}', skipping", id, sp.string());
+                return;
+            }
+            loadedSegmentations_.emplace(id, s);
+            if (!e.tags.empty()) segmentationTagsByID_[id] = e.tags;
+        } catch (const std::exception& ex) {
+            Logger()->warn("Failed to load segment '{}': {}", sp.string(), ex.what());
+        }
+    };
+    if (isSegmentDir(path)) {
+        loadOne(path);
+    } else {
+        for (const auto& child : immediateSubdirs(path)) {
+            if (isSegmentDir(child)) loadOne(child);
+        }
+    }
+}
+
+void VolumePkg::loadRemoteSegmentsAsync(vc::project::Entry e, std::uint64_t generation)
+{
+    auto stale = [&]() {
+        return shuttingDown_.load(std::memory_order_relaxed)
+            || loadGeneration_.load(std::memory_order_relaxed) != generation;
+    };
+    if (stale()) return;
+
+    auto resolved = vc::resolveRemoteUrl(e.location);
+    std::string base = resolved.httpsUrl;
+    if (base.empty()) {
+        Logger()->warn("Cannot resolve remote segments URL '{}'", e.location);
+        return;
+    }
+    if (base.back() != '/') base += '/';
+    vc::cache::HttpAuth auth;
+    if (resolved.useAwsSigv4) auth = vc::cache::loadAwsCredentials();
+
+    vc::cache::S3ListResult listing;
+    try {
+        listing = vc::cache::s3ListObjects(base, auth);
+    } catch (const std::exception& ex) {
+        Logger()->warn("Cannot list remote segments at '{}': {}", e.location, ex.what());
+        return;
+    }
+    if (listing.authError) {
+        Logger()->warn("Auth error listing remote segments at '{}': {}", e.location, listing.errorMessage);
+        return;
+    }
+    if (stale()) return;
+
+    const auto cacheRoot = opts_.remoteCacheRoot.empty()
+        ? (defaultAutosaveRoot() / "remote_cache")
+        : opts_.remoteCacheRoot;
+
+    std::string baseNoSlash = base;
+    while (!baseNoSlash.empty() && baseNoSlash.back() == '/') baseNoSlash.pop_back();
+
+    const size_t total = listing.prefixes.size();
+    if (total == 0) return;
+
+    const size_t threadCount = std::min<size_t>(16, total);
+    std::atomic<size_t> nextIdx{0};
+    std::atomic<size_t> insertedSinceNotify{0};
+
+    auto worker = [&]() {
+        while (!stale()) {
+            const size_t i = nextIdx.fetch_add(1);
+            if (i >= total) return;
+            const auto& prefix = listing.prefixes[i];
+            std::string trimmed = prefix;
+            if (!trimmed.empty() && trimmed.back() == '/') trimmed.pop_back();
+            const auto slash = trimmed.find_last_of('/');
+            std::string segId = (slash == std::string::npos) ? trimmed : trimmed.substr(slash + 1);
+            if (segId.empty() || segId[0] == '.') continue;
+            try {
+                auto localDir = vc::downloadRemoteSegmentMetadataOnly(
+                    baseNoSlash, segId, cacheRoot, auth, vc::RemoteSegmentSource::Direct);
+                auto s = Segmentation::New(localDir);
+                const auto id = s->id();
+                bool inserted = false;
+                {
+                    std::lock_guard<std::mutex> lk(segmentsMutex_);
+                    if (stale()) return;
+                    if (loadedSegmentations_.count(id) > 0) continue;
+                    loadedSegmentations_.emplace(id, s);
+                    if (!e.tags.empty()) segmentationTagsByID_[id] = e.tags;
+                    remoteSegmentInfo_[id] = {baseNoSlash, cacheRoot, auth};
+                    inserted = true;
+                }
+                if (inserted) {
+                    size_t prev = insertedSinceNotify.fetch_add(1);
+                    if (prev + 1 >= 16) {
+                        insertedSinceNotify.fetch_sub(prev + 1);
+                        notifySegmentsChanged();
+                    }
+                }
+            } catch (const std::exception& ex) {
+                Logger()->warn("Failed remote segment '{}': {}", segId, ex.what());
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(threadCount);
+    for (size_t t = 0; t < threadCount; ++t) threads.emplace_back(worker);
+    for (auto& th : threads) th.join();
+
+    if (!stale()) notifySegmentsChanged();
+}
+
+void VolumePkg::setSegmentsChangedCallback(std::function<void()> cb)
+{
+    std::lock_guard<std::mutex> lk(segmentsMutex_);
+    segmentsChangedCb_ = std::move(cb);
+}
+
+void VolumePkg::notifySegmentsChanged()
+{
+    std::function<void()> cb;
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        cb = segmentsChangedCb_;
+    }
+    if (cb) cb();
+}
+
+void VolumePkg::resolveNormalGridEntry(const vc::project::Entry& e)
+{
+    if (vc::project::isLocationRemote(e.location)) {
+        Logger()->warn("Remote normal_grid entry '{}' not yet supported.", e.location);
+        return;
+    }
+    const auto path = vc::project::resolveLocalPath(e.location, path_.parent_path());
+    if (!fs::exists(path)) {
+        Logger()->warn("Skipping normal_grid '{}': path does not exist", e.location);
+        return;
+    }
+    if (isNormalGridDir(path)) {
+        resolvedNormalGridPaths_.push_back(path);
+    } else {
+        for (const auto& child : immediateSubdirs(path)) {
+            if (isNormalGridDir(child)) resolvedNormalGridPaths_.push_back(child);
+        }
+    }
+}
+
+utils::Json VolumePkg::toJson() const
+{
+    auto j = utils::Json::object();
+    j["name"] = name_;
+    j["version"] = version_;
+    j["volumes"] = entriesToJson(volumes_);
+    j["segments"] = entriesToJson(segments_);
+    j["normal_grids"] = entriesToJson(normalGrids_);
+    if (outputSegments_) j["output_segments"] = *outputSegments_;
+    return j;
+}
+
+void VolumePkg::fromJson(const utils::Json& j)
+{
+    name_ = j.value("name", std::string("Untitled"));
+    version_ = j.value("version", 1);
+    if (j.contains("volumes")) volumes_ = entriesFromJson(j.at("volumes"));
+    if (j.contains("segments")) segments_ = entriesFromJson(j.at("segments"));
+    if (j.contains("normal_grids")) normalGrids_ = entriesFromJson(j.at("normal_grids"));
+    if (j.contains("output_segments")) outputSegments_ = j.at("output_segments").get_string();
+}
+
+void VolumePkg::writeJsonTo(const fs::path& target) const
+{
+    atomicWriteString(target, toJson().dump(2));
+}
+
+void VolumePkg::readJsonFrom(const fs::path& source)
+{
+    if (!fs::exists(source)) {
+        throw std::runtime_error("project file not found: " + source.string());
+    }
+    auto j = utils::Json::parse_file(source);
+    fromJson(j);
+}
+
+std::string VolumePkg::getVolpkgDirectory() const
+{
+    if (path_.empty()) return {};
+    return path_.parent_path().string();
+}
+
+std::string VolumePkg::getSegmentationDirectory() const
+{
+    const auto p = outputSegmentsPath();
+    if (p.empty()) return {};
+    return p.filename().string();
+}
+
+std::vector<std::string> VolumePkg::getAvailableSegmentationDirectories() const
+{
+    std::vector<std::string> out;
+    out.reserve(segments_.size());
+    for (const auto& e : segments_) {
+        if (vc::project::isLocationRemote(e.location)) continue;
+        out.push_back(vc::project::resolveLocalPath(e.location, path_.parent_path()).filename().string());
+    }
+    return out;
+}
+
+std::vector<fs::path> VolumePkg::availableSegmentPaths() const
+{
+    std::vector<fs::path> out;
+    out.reserve(segments_.size());
+    for (const auto& e : segments_) {
+        if (vc::project::isLocationRemote(e.location)) continue;
+        out.push_back(vc::project::resolveLocalPath(e.location, path_.parent_path()));
+    }
+    return out;
+}
+
+fs::path VolumePkg::findSegmentPathByName(const std::string& dirName) const
+{
+    for (const auto& e : segments_) {
+        if (vc::project::isLocationRemote(e.location)) continue;
+        const auto p = vc::project::resolveLocalPath(e.location, path_.parent_path());
+        if (p.filename().string() == dirName) return p;
+    }
+    return {};
+}
+
+void VolumePkg::setSegmentationDirectory(const std::string& dirName)
+{
+    for (const auto& e : segments_) {
+        if (vc::project::isLocationRemote(e.location)) continue;
+        if (vc::project::resolveLocalPath(e.location, path_.parent_path()).filename().string() == dirName) {
+            setOutputSegments(e.location);
+            return;
+        }
+    }
+    Logger()->warn("setSegmentationDirectory('{}'): no matching segments entry", dirName);
+}
+
+void VolumePkg::refreshSegmentations()
+{
+    const auto gen = loadGeneration_.fetch_add(1, std::memory_order_relaxed) + 1;
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        loadedSegmentations_.clear();
+        segmentationTagsByID_.clear();
+        remoteSegmentInfo_.clear();
+    }
+    for (const auto& e : segments_) resolveSegmentsEntry(e, gen);
 }
 
 bool VolumePkg::addSingleSegmentation(const std::string& id)
 {
-    // Check if already loaded
-    if (segmentations_.find(id) != segmentations_.end()) {
-        return false; // Already exists
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        if (loadedSegmentations_.count(id) > 0) return false;
     }
-
-    // Build the path to the segment
-    std::filesystem::path segPath = rootDir_ / currentSegmentationDir_ / id;
-
-    if (!std::filesystem::exists(segPath) || !std::filesystem::is_directory(segPath)) {
-        Logger()->warn("Segment directory does not exist: {}", segPath.string());
-        return false;
-    }
-
+    const auto outDir = outputSegmentsPath();
+    if (outDir.empty()) return false;
+    const auto segPath = outDir / id;
+    if (!fs::is_directory(segPath)) return false;
     try {
         auto s = Segmentation::New(segPath);
-        if (!volumes_.empty()) {
-            auto scrollName = config_["name"].get_string();
-            auto volumeUuid = volumes_.begin()->second->id();
-            s->ensureScrollSource(scrollName, volumeUuid);
-        }
-        segmentations_.emplace(s->id(), s);
-        segmentationDirectories_[s->id()] = currentSegmentationDir_;
-        Logger()->info("Added segmentation: {}", id);
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        loadedSegmentations_.emplace(s->id(), s);
         return true;
-    } catch (const std::exception& e) {
-        Logger()->error("Failed to add segmentation {}: {}", id, e.what());
+    } catch (const std::exception& ex) {
+        Logger()->error("Failed to add segmentation {}: {}", id, ex.what());
         return false;
     }
 }
 
 bool VolumePkg::removeSingleSegmentation(const std::string& id)
 {
-    auto it = segmentations_.find(id);
-    if (it == segmentations_.end()) {
-        Logger()->warn("Cannot remove segment {} - not found", id);
-        return false; // Don't crash, just return false
+    std::shared_ptr<Segmentation> seg;
+    {
+        std::lock_guard<std::mutex> lk(segmentsMutex_);
+        auto it = loadedSegmentations_.find(id);
+        if (it == loadedSegmentations_.end()) return false;
+        seg = it->second;
+        loadedSegmentations_.erase(it);
+        segmentationTagsByID_.erase(id);
     }
-
-    // Check if this segment belongs to the current directory
-    auto dirIt = segmentationDirectories_.find(id);
-    if (dirIt != segmentationDirectories_.end()) {
-        // Only log if it's from a different directory
-        if (dirIt->second != currentSegmentationDir_) {
-            Logger()->debug("Removing segment {} from {} directory (current is {})",
-                          id, dirIt->second, currentSegmentationDir_);
-        }
-    }
-
-    // Unload surface if loaded
-    it->second->unloadSurface();
-
-    // Remove from maps
-    segmentations_.erase(it);
-    segmentationDirectories_.erase(id);
-
-    Logger()->info("Removed segmentation: {}", id);
+    seg->unloadSurface();
     return true;
 }
 
 bool VolumePkg::reloadSingleSegmentation(const std::string& id)
 {
-    // First check if the segment exists on disk
-    std::filesystem::path segPath = rootDir_ / currentSegmentationDir_ / id;
-
-    if (!std::filesystem::exists(segPath) || !std::filesystem::is_directory(segPath)) {
-        Logger()->warn("Cannot reload - segment directory does not exist: {}", segPath.string());
-        return false;
-    }
-
-    // Remove if it exists (this also unloads the surface)
+    const auto outDir = outputSegmentsPath();
+    if (outDir.empty() || !fs::is_directory(outDir / id)) return false;
     removeSingleSegmentation(id);
-
-    // Add it back
     return addSingleSegmentation(id);
 }
