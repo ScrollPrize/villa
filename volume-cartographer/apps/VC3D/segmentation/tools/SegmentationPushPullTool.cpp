@@ -939,9 +939,9 @@ void SegmentationPushPullTool::refreshActiveViewer(VolumeViewerBase* viewer)
     }
 
     viewer->invalidateVis();
-    if (const auto bounds = _editManager->recentTouchedBounds()) {
-        viewer->renderEditedSurfaceIntersections(*bounds);
-    }
+    viewer->invalidateIntersect("segmentation");
+    viewer->renderIntersections();
+    viewer->requestRender();
 }
 
 void SegmentationPushPullTool::applyAlphaResult()

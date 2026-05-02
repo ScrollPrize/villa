@@ -117,7 +117,6 @@ public:
     void clearSelections() override;
 
     void renderIntersections() override;
-    void renderEditedSurfaceIntersections(const cv::Rect& vertexRect) override;
     void invalidateIntersect(const std::string& = "") override;
     float intersectionOpacity() const override { return _intersectionOpacity; }
     float intersectionThickness() const override { return _intersectionThickness; }
@@ -252,7 +251,6 @@ private:
     void updateCursorCrosshair(const QPointF& scenePos);
     void updateFocusMarker(POI* poi = nullptr);
     void clearIntersectionItems();
-    void clearEditIntersectionItems();
     void updateIntersectionPreviewTransform();
     void renderFlattenedIntersections(const std::shared_ptr<Surface>& surf);
     QRectF surfaceRectToSceneRect(const QRectF& surfRect) const;
@@ -341,7 +339,6 @@ private:
     std::set<std::string> _intersectTgts;
     std::unordered_set<std::string> _highlightedSurfaceIds;
     std::vector<QGraphicsItem*> _intersectionItems;
-    std::vector<QGraphicsItem*> _editIntersectionItems;
     float _intersectionItemsCamSurfX = 0.0f;
     float _intersectionItemsCamSurfY = 0.0f;
     float _intersectionItemsCamScale = 1.0f;
