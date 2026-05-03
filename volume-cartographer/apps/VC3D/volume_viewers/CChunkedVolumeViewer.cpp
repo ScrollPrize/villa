@@ -559,6 +559,14 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
         }
     });
 
+    _intersectionRenderTimer = new QTimer(this);
+    _intersectionRenderTimer->setSingleShot(true);
+    _intersectionRenderTimer->setInterval(50);
+    connect(_intersectionRenderTimer, &QTimer::timeout, this, [this]() {
+        renderIntersections();
+        emit overlaysUpdated();
+    });
+
     _resizeRenderTimer = new QTimer(this);
     _resizeRenderTimer->setSingleShot(true);
     _resizeRenderTimer->setInterval(kResizeSettleMs);
@@ -761,8 +769,7 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
     if (!isCurrentSurface) {
         if (isIntersectionTarget) {
             invalidateIntersect(name);
-            renderIntersections();
-            emit overlaysUpdated();
+            scheduleIntersectionRender();
         }
         return;
     }
@@ -775,8 +782,7 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
         updateContentBounds();
         updateFocusMarker();
         scheduleRender();
-        renderIntersections();
-        emit overlaysUpdated();
+        scheduleIntersectionRender();
         return;
     }
 
@@ -806,8 +812,7 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
     }
     updateFocusMarker();
     scheduleRender();
-    renderIntersections();
-    emit overlaysUpdated();
+    scheduleIntersectionRender();
 }
 
 void CChunkedVolumeViewer::onSurfaceWillBeDeleted(const std::string&, const std::shared_ptr<Surface>& surf)
@@ -935,6 +940,13 @@ void CChunkedVolumeViewer::scheduleRender()
     }
     if (_renderTimer && !_renderTimer->isActive())
         _renderTimer->start();
+}
+
+void CChunkedVolumeViewer::scheduleIntersectionRender()
+{
+    if (_intersectionRenderTimer) {
+        _intersectionRenderTimer->start();
+    }
 }
 
 void CChunkedVolumeViewer::syncCameraTransform()
@@ -2151,7 +2163,7 @@ void CChunkedVolumeViewer::finishRenderOnMainThread(std::shared_ptr<RenderResult
     if (_interactivePreview)
         updateIntersectionPreviewTransform();
     else
-        renderIntersections();
+        scheduleIntersectionRender();
     if (!_interactivePreview) {
         if (auto surf = _surfWeak.lock()) {
             const vc::render::ChunkedPlaneSampler::Options options(_samplingMethod, 32);
@@ -3034,6 +3046,7 @@ void CChunkedVolumeViewer::invalidateIntersectRegion(const std::string& name,
                   : (*_flattenedIntersectionDirtyCells | changedCells)
             : changedCells;
     _lastIntersectFp = {};
+    scheduleIntersectionRender();
 }
 
 void CChunkedVolumeViewer::clearIntersectionItems()
@@ -3198,27 +3211,74 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
         !cacheCompatible ||
         (_flattenedIntersectionCache.generation != activeGeneration &&
          !_flattenedIntersectionDirtyCells);
-    std::unordered_set<std::uint64_t> dirtyTiles;
+    std::unordered_map<std::uint64_t, std::unordered_set<int>> dirtyTilePlanes;
 
-    auto removeFlattenedTileItems = [&](std::uint64_t tileKey) {
+    auto removeFlattenedTilePlaneItem = [&](std::uint64_t tileKey, int planeIndex) {
         auto it = _flattenedIntersectionCache.tileItems.find(tileKey);
-        if (it == _flattenedIntersectionCache.tileItems.end()) {
+        if (it == _flattenedIntersectionCache.tileItems.end() ||
+            planeIndex < 0 || static_cast<std::size_t>(planeIndex) >= it->second.size()) {
             return;
         }
-        for (auto* item : it->second) {
-            if (!item) {
-                continue;
-            }
-            if (item->scene()) {
-                _scene->removeItem(item);
-            }
-            auto vecIt = std::find(_intersectionItems.begin(), _intersectionItems.end(), item);
-            if (vecIt != _intersectionItems.end()) {
-                _intersectionItems.erase(vecIt);
-            }
-            delete item;
+        auto*& item = it->second[static_cast<std::size_t>(planeIndex)];
+        if (!item) {
+            return;
         }
-        _flattenedIntersectionCache.tileItems.erase(it);
+        if (item->scene()) {
+            _scene->removeItem(item);
+        }
+        auto vecIt = std::find(_intersectionItems.begin(), _intersectionItems.end(), item);
+        if (vecIt != _intersectionItems.end()) {
+            _intersectionItems.erase(vecIt);
+        }
+        delete item;
+        item = nullptr;
+    };
+
+    auto lineMatchesPlane = [](const FlattenedIntersectionLine& line, int planeIndex) {
+        return line.planeIndex == planeIndex;
+    };
+    auto markChangedCellPlanes = [&](std::uint64_t cellKey,
+                                     const std::vector<FlattenedIntersectionLine>& newLines) {
+        const int col = int(std::uint32_t(cellKey));
+        const int row = int(std::uint32_t(cellKey >> 32));
+        const std::uint64_t tileKey = surfaceCellTileKey(col, row);
+        const auto oldIt = _flattenedIntersectionCache.cellLines.find(cellKey);
+        const auto* oldLines = oldIt == _flattenedIntersectionCache.cellLines.end()
+            ? nullptr
+            : &oldIt->second;
+
+        for (std::size_t planeIdx = 0; planeIdx < planes.size(); ++planeIdx) {
+            const int idx = static_cast<int>(planeIdx);
+            std::vector<const FlattenedIntersectionLine*> oldPlaneLines;
+            std::vector<const FlattenedIntersectionLine*> newPlaneLines;
+            if (oldLines) {
+                for (const auto& line : *oldLines) {
+                    if (lineMatchesPlane(line, idx)) {
+                        oldPlaneLines.push_back(&line);
+                    }
+                }
+            }
+            for (const auto& line : newLines) {
+                if (lineMatchesPlane(line, idx)) {
+                    newPlaneLines.push_back(&line);
+                }
+            }
+
+            bool changed = oldPlaneLines.size() != newPlaneLines.size();
+            if (!changed) {
+                for (std::size_t i = 0; i < oldPlaneLines.size(); ++i) {
+                    const auto& oldLine = *oldPlaneLines[i];
+                    const auto& newLine = *newPlaneLines[i];
+                    if (oldLine.a != newLine.a || oldLine.b != newLine.b) {
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+            if (changed) {
+                dirtyTilePlanes[tileKey].insert(idx);
+            }
+        }
     };
 
     auto rebuildFlattenedCells = [&](const cv::Rect& requestedCells) {
@@ -3239,12 +3299,12 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
         for (int row = rowStart; row < rowEnd && row < points->rows - 1; row += stride) {
             for (int col = colStart; col < colEnd && col < points->cols - 1; col += stride) {
                 const std::uint64_t key = surfaceTileKey(col, row);
-                dirtyTiles.insert(surfaceCellTileKey(col, row));
                 std::vector<FlattenedIntersectionLine> lines;
 
                 const int strideX = std::min(stride, points->cols - 1 - col);
                 const int strideY = std::min(stride, points->rows - 1 - row);
                 if (strideX <= 0 || strideY <= 0) {
+                    markChangedCellPlanes(key, lines);
                     _flattenedIntersectionCache.cellLines.erase(key);
                     continue;
                 }
@@ -3257,6 +3317,7 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
                 };
                 if (!validSurfacePoint(corners[0]) || !validSurfacePoint(corners[1]) ||
                     !validSurfacePoint(corners[2]) || !validSurfacePoint(corners[3])) {
+                    markChangedCellPlanes(key, lines);
                     _flattenedIntersectionCache.cellLines.erase(key);
                     continue;
                 }
@@ -3311,8 +3372,10 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
                 }
 
                 if (lines.empty()) {
+                    markChangedCellPlanes(key, lines);
                     _flattenedIntersectionCache.cellLines.erase(key);
                 } else {
+                    markChangedCellPlanes(key, lines);
                     _flattenedIntersectionCache.cellLines[key] = std::move(lines);
                 }
             }
@@ -3347,15 +3410,18 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
         displayOnlyRefresh ||
         _flattenedIntersectionCache.tileItems.empty();
     if (rebuildAllTileItems) {
-        dirtyTiles.clear();
+        dirtyTilePlanes.clear();
         for (const auto& [cellKey, _] : _flattenedIntersectionCache.cellLines) {
             const int col = int(std::uint32_t(cellKey));
             const int row = int(std::uint32_t(cellKey >> 32));
-            dirtyTiles.insert(surfaceCellTileKey(col, row));
+            const std::uint64_t tileKey = surfaceCellTileKey(col, row);
+            for (const auto& line : _) {
+                dirtyTilePlanes[tileKey].insert(line.planeIndex);
+            }
         }
     }
 
-    if (dirtyTiles.empty()) {
+    if (dirtyTilePlanes.empty()) {
         _intersectionItemsCamSurfX = _camSurfX;
         _intersectionItemsCamSurfY = _camSurfY;
         _intersectionItemsCamScale = _camScale;
@@ -3365,9 +3431,8 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
     }
 
     std::unordered_map<std::uint64_t, std::vector<QPainterPath>> tilePaths;
-    tilePaths.reserve(dirtyTiles.size());
-    for (std::uint64_t tileKey : dirtyTiles) {
-        removeFlattenedTileItems(tileKey);
+    tilePaths.reserve(dirtyTilePlanes.size());
+    for (const auto& [tileKey, _] : dirtyTilePlanes) {
         tilePaths.emplace(tileKey, std::vector<QPainterPath>(planes.size()));
     }
 
@@ -3384,36 +3449,56 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
             if (line.planeIndex < 0 || static_cast<size_t>(line.planeIndex) >= paths.size()) {
                 continue;
             }
+            const auto dirtyIt = dirtyTilePlanes.find(tileKey);
+            if (dirtyIt == dirtyTilePlanes.end() ||
+                dirtyIt->second.count(line.planeIndex) == 0) {
+                continue;
+            }
             paths[line.planeIndex].moveTo(line.a);
             paths[line.planeIndex].lineTo(line.b);
         }
     }
 
     for (auto& [tileKey, paths] : tilePaths) {
-        std::vector<QGraphicsItem*> tileItems;
-        tileItems.reserve(paths.size());
-        for (size_t idx = 0; idx < paths.size(); ++idx) {
-            if (paths[idx].isEmpty()) {
+        auto& tileItems = _flattenedIntersectionCache.tileItems[tileKey];
+        if (tileItems.size() < paths.size()) {
+            tileItems.resize(paths.size(), nullptr);
+        }
+        const auto dirtyIt = dirtyTilePlanes.find(tileKey);
+        for (std::size_t idx = 0; idx < paths.size(); ++idx) {
+            if (dirtyIt == dirtyTilePlanes.end() ||
+                dirtyIt->second.count(static_cast<int>(idx)) == 0) {
                 continue;
             }
             QColor color = planes[idx].color;
             color.setAlphaF(opacity);
-            auto* item = new QGraphicsPathItem(paths[idx]);
             QPen pen(color);
             pen.setWidthF(static_cast<qreal>(penWidth));
             pen.setCapStyle(Qt::RoundCap);
             pen.setJoinStyle(Qt::RoundJoin);
             pen.setCosmetic(true);
+            if (paths[idx].isEmpty()) {
+                removeFlattenedTilePlaneItem(tileKey, static_cast<int>(idx));
+                continue;
+            }
+            auto*& item = tileItems[idx];
+            if (!item) {
+                item = new QGraphicsPathItem();
+                item->setBrush(Qt::NoBrush);
+                item->setZValue(kActiveIntersectionZ);
+                item->setAcceptedMouseButtons(Qt::NoButton);
+                _scene->addItem(item);
+                _intersectionItems.push_back(item);
+            }
+            item->setTransform(QTransform());
+            item->setPath(paths[idx]);
             item->setPen(pen);
-            item->setBrush(Qt::NoBrush);
-            item->setZValue(kActiveIntersectionZ);
-            item->setAcceptedMouseButtons(Qt::NoButton);
-            _scene->addItem(item);
-            _intersectionItems.push_back(item);
-            tileItems.push_back(item);
         }
-        if (!tileItems.empty()) {
-            _flattenedIntersectionCache.tileItems[tileKey] = std::move(tileItems);
+    }
+
+    for (auto* item : _intersectionItems) {
+        if (item) {
+            item->setTransform(QTransform());
         }
     }
 

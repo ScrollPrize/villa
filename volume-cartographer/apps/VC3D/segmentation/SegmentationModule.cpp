@@ -2182,7 +2182,6 @@ void SegmentationModule::updateDrag(const cv::Vec3f& worldPos)
             _drag.viewer->invalidateVis();
             _drag.viewer->invalidateIntersect("segmentation");
         }
-        _drag.viewer->renderIntersections();
         _drag.viewer->requestRender();
     }
 

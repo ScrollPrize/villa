@@ -951,7 +951,6 @@ void SegmentationPushPullTool::refreshActiveViewer(VolumeViewerBase* viewer)
         viewer->invalidateVis();
         viewer->invalidateIntersect("segmentation");
     }
-    viewer->renderIntersections();
     viewer->requestRender();
 }
 

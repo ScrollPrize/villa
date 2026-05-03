@@ -29,6 +29,7 @@
 
 class CState;
 class QGraphicsItem;
+class QGraphicsPathItem;
 class QGraphicsScene;
 class QTimer;
 struct POI;
@@ -197,6 +198,7 @@ signals:
 
 private:
     void scheduleRender();
+    void scheduleIntersectionRender();
     void submitRender();
     void updateStatusLabel();
     void rebuildChunkArray();
@@ -277,6 +279,7 @@ private:
     ViewerStatsBar* _statsBar = nullptr;
     QTimer* _renderTimer = nullptr;
     QTimer* _settleRenderTimer = nullptr;
+    QTimer* _intersectionRenderTimer = nullptr;
     QTimer* _resizeRenderTimer = nullptr;
     QTimer* _statusTimer = nullptr;
     bool _renderPending = false;
@@ -416,7 +419,7 @@ private:
         uint64_t generation = 0;
         bool valid = false;
         std::unordered_map<std::uint64_t, std::vector<FlattenedIntersectionLine>> cellLines;
-        std::unordered_map<std::uint64_t, std::vector<QGraphicsItem*>> tileItems;
+        std::unordered_map<std::uint64_t, std::vector<QGraphicsPathItem*>> tileItems;
     };
     FlattenedIntersectionCache _flattenedIntersectionCache;
     std::optional<cv::Rect> _flattenedIntersectionDirtyCells;
