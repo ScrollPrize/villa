@@ -24,7 +24,7 @@ constexpr float kAxisRotationDegreesPerScenePixel = 0.25f;
 constexpr float kMaxTiltDegrees = 45.0f;
 constexpr float kEpsilon = 1e-6f;
 constexpr float kDegToRad = static_cast<float>(CV_PI / 180.0);
-constexpr int kRotationApplyDelayMs = 25;
+constexpr int kRotationApplyDelayMs = 120;
 
 cv::Vec3f rotateAroundZ(const cv::Vec3f& v, float radians)
 {
@@ -212,7 +212,7 @@ void AxisAlignedSliceController::onMouseMove(VolumeViewerBase* viewer, const cv:
     const float candidate = normalizeDegrees(state.startRotationDegrees - dragPixels * kAxisRotationDegreesPerScenePixel);
     const float currentRotation = currentRotationDegrees(surfaceName);
 
-    if (std::abs(candidate - currentRotation) < 0.01f) {
+    if (std::abs(candidate - currentRotation) < 0.5f) {
         return;
     }
 

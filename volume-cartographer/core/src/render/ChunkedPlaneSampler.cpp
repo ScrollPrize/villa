@@ -291,14 +291,17 @@ bool sampleTrilinear(IChunkedArray& array,
 
     uint8_t v000 = 0, v001 = 0, v010 = 0, v011 = 0;
     uint8_t v100 = 0, v101 = 0, v110 = 0, v111 = 0;
-    if (!readVoxel(array, cache, access, level, iz,     iy,     ix,     v000, requested, errors)) return false;
-    if (!readVoxel(array, cache, access, level, iz,     iy,     ix + 1, v001, requested, errors)) return false;
-    if (!readVoxel(array, cache, access, level, iz,     iy + 1, ix,     v010, requested, errors)) return false;
-    if (!readVoxel(array, cache, access, level, iz,     iy + 1, ix + 1, v011, requested, errors)) return false;
-    if (!readVoxel(array, cache, access, level, iz + 1, iy,     ix,     v100, requested, errors)) return false;
-    if (!readVoxel(array, cache, access, level, iz + 1, iy,     ix + 1, v101, requested, errors)) return false;
-    if (!readVoxel(array, cache, access, level, iz + 1, iy + 1, ix,     v110, requested, errors)) return false;
-    if (!readVoxel(array, cache, access, level, iz + 1, iy + 1, ix + 1, v111, requested, errors)) return false;
+    bool ready = true;
+    ready = readVoxel(array, cache, access, level, iz,     iy,     ix,     v000, requested, errors) && ready;
+    ready = readVoxel(array, cache, access, level, iz,     iy,     ix + 1, v001, requested, errors) && ready;
+    ready = readVoxel(array, cache, access, level, iz,     iy + 1, ix,     v010, requested, errors) && ready;
+    ready = readVoxel(array, cache, access, level, iz,     iy + 1, ix + 1, v011, requested, errors) && ready;
+    ready = readVoxel(array, cache, access, level, iz + 1, iy,     ix,     v100, requested, errors) && ready;
+    ready = readVoxel(array, cache, access, level, iz + 1, iy,     ix + 1, v101, requested, errors) && ready;
+    ready = readVoxel(array, cache, access, level, iz + 1, iy + 1, ix,     v110, requested, errors) && ready;
+    ready = readVoxel(array, cache, access, level, iz + 1, iy + 1, ix + 1, v111, requested, errors) && ready;
+    if (!ready)
+        return false;
 
     const float c00 = std::fma(fx, float(v001) - float(v000), float(v000));
     const float c01 = std::fma(fx, float(v011) - float(v010), float(v010));
@@ -547,23 +550,8 @@ ChunkedPlaneSampler::Stats samplePlaneLevelImpl(
     auto processTileRange = [&](std::size_t begin, std::size_t end) {
         ChunkedPlaneSampler::Stats localStats;
         LocalChunkCache chunkCache(array);
-        std::unordered_set<ChunkKey, ChunkKeyHash> tileKeys;
-        tileKeys.reserve(std::size_t(tile) * std::size_t(tile) * 2);
         for (std::size_t i = begin; i < end; ++i) {
             const SampleTile& sampleTile = tiles[i];
-            tileKeys.clear();
-            for (int y = sampleTile.ty; y < sampleTile.yEnd; ++y) {
-                const uint8_t* coverageRow = coverage.ptr<uint8_t>(y);
-                const cv::Vec3f rowBase = origin + vyStep * float(y);
-                for (int x = sampleTile.tx; x < sampleTile.xEnd; ++x) {
-                    if (!overwriteCovered && coverageRow[x])
-                        continue;
-                    (void)collectPointDependencies(array, access, level, rowBase + vxStep * float(x),
-                                                   options.sampling, false, tileKeys);
-                }
-            }
-            requestDependencies(chunkCache, tileKeys, localStats);
-
             for (int y = sampleTile.ty; y < sampleTile.yEnd; ++y) {
                 uint8_t* outRow = out.ptr<uint8_t>(y);
                 uint8_t* coverageRow = coverage.ptr<uint8_t>(y);
