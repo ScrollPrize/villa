@@ -89,6 +89,19 @@ bool isNormalGridDir(const fs::path& dir)
         && fs::exists(dir / "metadata.json");
 }
 
+bool isDirectRemoteZarrLocation(std::string location)
+{
+    location = asciiLower(std::move(location));
+    const auto fragment = location.find('#');
+    if (fragment != std::string::npos) location.erase(fragment);
+    const auto query = location.find('?');
+    if (query != std::string::npos) location.erase(query);
+    while (!location.empty() && location.back() == '/') location.pop_back();
+    constexpr std::string_view suffix = ".zarr";
+    return location.size() >= suffix.size()
+        && location.compare(location.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
+
 std::vector<fs::path> immediateSubdirs(const fs::path& dir)
 {
     std::vector<fs::path> out;
@@ -706,16 +719,28 @@ void VolumePkg::resolveAll()
 void VolumePkg::resolveVolumeEntry(const vc::project::Entry& e)
 {
     if (vc::project::isLocationRemote(e.location)) {
+        if (!isDirectRemoteZarrLocation(e.location)) {
+            Logger()->warn("Skipping remote volume collection '{}': remote listing is not supported in this branch", e.location);
+            return;
+        }
+
         try {
             auto v = Volume::NewFromUrl(e.location, opts_.remoteCacheRoot, {});
             const auto id = v->id();
+            if (loadedVolumes_.count(id) > 0) {
+                Logger()->warn("Duplicate remote volume id '{}' from '{}', skipping", id, e.location);
+                return;
+            }
             loadedVolumes_.emplace(id, v);
             if (!e.tags.empty()) volumeTagsByID_[id] = e.tags;
             return;
-        } catch (const std::exception&) {
+        } catch (const std::exception& ex) {
+            if (opts_.failOnRemoteError) {
+                throw;
+            }
+            Logger()->warn("Failed to load remote zarr volume '{}': {}", e.location, ex.what());
         }
 
-        Logger()->warn("Skipping remote volume collection '{}': remote listing is not supported in this branch", e.location);
         return;
     }
 
