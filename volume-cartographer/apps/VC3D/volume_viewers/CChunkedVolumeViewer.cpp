@@ -2090,13 +2090,12 @@ void CChunkedVolumeViewer::submitRender()
     if (fbW <= 0 || fbH <= 0)
         return;
 
-    prefetchVisibleSurfaceChunks();
-
     if (_renderWorkerBusy.exchange(true, std::memory_order_acq_rel)) {
-        ++_renderSerial;
         _renderPendingAfterWorker = true;
         return;
     }
+
+    prefetchVisibleSurfaceChunks();
 
     RenderContext ctx;
     ctx.serial = ++_renderSerial;
