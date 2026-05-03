@@ -182,8 +182,12 @@ void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, in
         if (!isValidKey(*state, key))
             continue;
         auto [it, inserted] = state->entries_.emplace(key, Entry{});
-        if (inserted)
+        if (inserted) {
             queueFetchLocked(state, key, state->generation_, priorityOffset);
+        } else if (it->second.status == EntryStatus::InFlight &&
+                   key.level + priorityOffset < it->second.priority) {
+            queueFetchLocked(state, key, state->generation_, priorityOffset);
+        }
     }
     if (!wait)
         return;
@@ -342,6 +346,9 @@ void ChunkCache::fetchAndStore(const std::shared_ptr<State>& state,
             fetch.status = ChunkFetchStatus::Found;
             fetch.bytes = std::move(*cached);
             loadedFromPersistentCache = true;
+        } else if (readPersistentEmpty(*state, key)) {
+            fetch.status = ChunkFetchStatus::Missing;
+            loadedFromPersistentCache = true;
         } else {
             if (state->options_.persistentCachePath) {
                 trackedRemoteFetch = true;
@@ -409,6 +416,8 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
         }
         if (isAllFill(*state, fetch.bytes)) {
             entry.status = EntryStatus::AllFill;
+            entry.persisted = loadedFromPersistentCache ||
+                queuePersistentEmptyWrite(state, key);
             break;
         }
         entry.status = EntryStatus::Data;
@@ -420,6 +429,8 @@ void ChunkCache::storeFetchResultLocked(const std::shared_ptr<State>& state,
         break;
     case ChunkFetchStatus::Missing:
         entry.status = EntryStatus::AllFill;
+        entry.persisted = loadedFromPersistentCache ||
+            queuePersistentEmptyWrite(state, key);
         break;
     case ChunkFetchStatus::HttpError:
     case ChunkFetchStatus::IoError:
@@ -457,6 +468,14 @@ std::optional<std::vector<std::byte>> ChunkCache::readPersistent(const State& st
     return bytes;
 }
 
+bool ChunkCache::readPersistentEmpty(const State& state, const ChunkKey& key)
+{
+    if (!state.options_.persistentCachePath)
+        return false;
+    std::error_code ec;
+    return std::filesystem::exists(persistentEmptyPath(state, key), ec) && !ec;
+}
+
 bool ChunkCache::queuePersistentWrite(const std::shared_ptr<State>& state,
                                       const ChunkKey& key,
                                       std::shared_ptr<const std::vector<std::byte>> bytes)
@@ -468,6 +487,18 @@ bool ChunkCache::queuePersistentWrite(const std::shared_ptr<State>& state,
 
     persistentCacheWriterPool().enqueue([state, key, bytes = std::move(bytes)] {
         writePersistent(*state, key, *bytes);
+    });
+    return true;
+}
+
+bool ChunkCache::queuePersistentEmptyWrite(const std::shared_ptr<State>& state,
+                                           const ChunkKey& key)
+{
+    if (!state || !state->options_.persistentCachePath)
+        return false;
+
+    persistentCacheWriterPool().enqueue([state, key] {
+        writePersistentEmpty(*state, key);
     });
     return true;
 }
@@ -498,6 +529,31 @@ void ChunkCache::writePersistent(const State& state, const ChunkKey& key, const 
     }
 }
 
+void ChunkCache::writePersistentEmpty(const State& state, const ChunkKey& key)
+{
+    if (!state.options_.persistentCachePath)
+        return;
+
+    const auto path = persistentEmptyPath(state, key);
+    std::filesystem::create_directories(path.parent_path());
+    const auto tmp = path.string() + ".tmp";
+    {
+        std::ofstream file(tmp, std::ios::binary | std::ios::trunc);
+        if (!file)
+            return;
+        file.put('\n');
+        if (!file)
+            return;
+    }
+    std::error_code ec;
+    std::filesystem::rename(tmp, path, ec);
+    if (ec) {
+        std::filesystem::remove(path, ec);
+        ec.clear();
+        std::filesystem::rename(tmp, path, ec);
+    }
+}
+
 std::filesystem::path ChunkCache::persistentPath(const State& state, const ChunkKey& key)
 {
     return *state.options_.persistentCachePath /
@@ -505,6 +561,15 @@ std::filesystem::path ChunkCache::persistentPath(const State& state, const Chunk
            std::to_string(key.iz) /
            std::to_string(key.iy) /
            (std::to_string(key.ix) + ".bin");
+}
+
+std::filesystem::path ChunkCache::persistentEmptyPath(const State& state, const ChunkKey& key)
+{
+    return *state.options_.persistentCachePath /
+           ("level_" + std::to_string(key.level)) /
+           std::to_string(key.iz) /
+           std::to_string(key.iy) /
+           (std::to_string(key.ix) + ".empty");
 }
 
 std::size_t ChunkCache::persistentCacheBytes(const std::optional<std::filesystem::path>& path)
@@ -557,7 +622,9 @@ void ChunkCache::touchLocked(State& state, const ChunkKey& key, Entry& entry)
 
 void ChunkCache::enforceCapacityLocked(const std::shared_ptr<State>& state)
 {
-    while (state->decodedBytes_ > state->options_.decodedByteCapacity && !state->lru_.empty()) {
+    while ((state->decodedBytes_ > state->options_.decodedByteCapacity ||
+            state->entries_.size() > state->options_.metadataEntryCapacity) &&
+           !state->lru_.empty()) {
         const ChunkKey victim = state->lru_.back();
         state->lru_.pop_back();
         auto it = state->entries_.find(victim);

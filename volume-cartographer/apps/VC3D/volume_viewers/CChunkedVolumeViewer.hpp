@@ -32,6 +32,7 @@ class QGraphicsItem;
 class QGraphicsScene;
 class QTimer;
 struct POI;
+class PlaneSurface;
 class Surface;
 class ViewerManager;
 class ViewerStatsBar;
@@ -53,7 +54,7 @@ public:
     void setIntersects(const std::set<std::string>& names) override { _intersectTgts = names; renderIntersections(); }
     void renderVisible(bool force = false) override;
     void requestRender() override { scheduleRender(); }
-    void invalidateVis() override { _genCacheDirty = true; _stableFramebufferValid = false; }
+    void invalidateVis() override;
     void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) override;
     void centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender = false) override;
     void adjustSurfaceOffset(float delta) override;
@@ -241,11 +242,20 @@ private:
                            const cv::Vec3f& vyStep,
                            int startLevel,
                            const vc::render::ChunkedPlaneSampler::Options& options);
+    void prefetchPlaneNormalNeighbors(PlaneSurface& plane,
+                                      int startLevel,
+                                      const vc::render::ChunkedPlaneSampler::Options& options);
     void prefetchSurfaceHalo(Surface& surf,
                              int startLevel,
                              const vc::render::ChunkedPlaneSampler::Options& options,
                              int fbW,
                              int fbH);
+    void prefetchVisibleSurfaceChunks(int priorityOffset = 0);
+    struct RenderContext;
+    struct RenderResult;
+    struct GeneratedSurfaceCache;
+    static RenderResult renderFrame(RenderContext ctx);
+    void finishRenderOnMainThread(std::shared_ptr<RenderResult> result);
     void markInteractiveMotion(double motionPx);
     int renderStartLevel(bool preferSurfaceResolution = false) const;
     bool streamingCompositeUnsupported() const;
@@ -272,7 +282,6 @@ private:
     QElapsedTimer _interactionClock;
     qint64 _lastInteractionMs = -1;
     qint64 _lastInteractivePreviewMs = -1;
-    double _interactionSpeedPxPerSec = 0.0;
 
     std::shared_ptr<Volume> _volume;
     std::weak_ptr<Surface> _surfWeak;
@@ -287,18 +296,23 @@ private:
     float _stableSurfY = 0.0f;
     float _stableScale = 1.0f;
     bool _stableFramebufferValid = false;
+    std::atomic<bool> _renderWorkerBusy{false};
+    bool _renderPendingAfterWorker = false;
+    std::uint64_t _renderSerial = 0;
     cv::Mat_<uint8_t> _values;
     cv::Mat_<uint8_t> _coverage;
-    cv::Mat_<cv::Vec3f> _genCoords;
-    cv::Mat_<cv::Vec3f> _genNormals;
+    std::shared_ptr<GeneratedSurfaceCache> _genSurfaceCache;
     bool _genCacheDirty = true;
-    Surface* _genCacheSurfKey = nullptr;
-    int _genCacheFbW = 0;
-    int _genCacheFbH = 0;
-    float _genCacheScale = 0.0f;
-    cv::Vec3f _genCacheOffset{0, 0, 0};
-    float _genCacheZOff = 0.0f;
-    cv::Vec3f _genCacheZOffDir{0, 0, 0};
+
+    struct SurfaceChunkPrefetchCache {
+        Surface* surface = nullptr;
+        int level = -1;
+        vc::Sampling sampling = vc::Sampling::Trilinear;
+        bool valid = false;
+        cv::Rect prefetchedCellRect;
+        std::unordered_map<std::uint64_t, std::vector<vc::render::ChunkKey>> tileKeys;
+    };
+    SurfaceChunkPrefetchCache _surfaceChunkPrefetchCache;
 
     float _surfacePtrX = 0.0f;
     float _surfacePtrY = 0.0f;

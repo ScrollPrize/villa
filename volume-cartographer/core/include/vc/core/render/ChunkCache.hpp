@@ -29,6 +29,10 @@ public:
 
     struct Options {
         std::size_t decodedByteCapacity = 512ULL * 1024ULL * 1024ULL;
+        // Bound resolved non-data entries (all-fill/missing/error). These
+        // entries are small individually, but sparse remote volumes can touch
+        // unbounded empty chunk grids during exploration.
+        std::size_t metadataEntryCapacity = 1ULL << 20;
         // Number of process-wide chunk I/O workers used by this cache. The
         // pool is shared by caches with the same worker count and is not
         // destroyed when a viewer is closed.
@@ -140,11 +144,16 @@ private:
                                        ChunkFetchResult fetch,
                                        bool loadedFromPersistentCache);
     static std::optional<std::vector<std::byte>> readPersistent(const State& state, const ChunkKey& key);
+    static bool readPersistentEmpty(const State& state, const ChunkKey& key);
     static bool queuePersistentWrite(const std::shared_ptr<State>& state,
                                      const ChunkKey& key,
                                      std::shared_ptr<const std::vector<std::byte>> bytes);
+    static bool queuePersistentEmptyWrite(const std::shared_ptr<State>& state,
+                                          const ChunkKey& key);
     static void writePersistent(const State& state, const ChunkKey& key, const std::vector<std::byte>& bytes);
+    static void writePersistentEmpty(const State& state, const ChunkKey& key);
     static std::filesystem::path persistentPath(const State& state, const ChunkKey& key);
+    static std::filesystem::path persistentEmptyPath(const State& state, const ChunkKey& key);
     static std::size_t persistentCacheBytes(const std::optional<std::filesystem::path>& path);
     static void pruneDownloadHistoryLocked(State& state, std::chrono::steady_clock::time_point now);
     static void touchLocked(State& state, const ChunkKey& key, Entry& entry);
