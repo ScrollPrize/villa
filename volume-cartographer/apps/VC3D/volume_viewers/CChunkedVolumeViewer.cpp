@@ -53,8 +53,6 @@ constexpr float kResolutionLodZoomBias = 0.5f;
 constexpr float kSegmentationResolutionLodZoomBias = 1.0f;
 constexpr int kSurfaceResolutionLevelBias = 1;
 constexpr int kInitialSegmentationSurfaceLevel = 5;
-constexpr double kSlowMotionPxPerSec = 180.0;
-constexpr double kFastMotionPxPerSec = 1800.0;
 constexpr qint64 kInteractivePreviewMinIntervalMs = 50;
 constexpr float kPanSmoothingAlpha = 0.65f;
 constexpr int kChunkPrefetchHaloPx = 128;
@@ -200,6 +198,30 @@ bool validSurfacePoint(const cv::Vec3f& p)
 {
     return std::isfinite(p[0]) && std::isfinite(p[1]) && std::isfinite(p[2]) &&
            p[0] != -1.0f && p[1] != -1.0f && p[2] != -1.0f;
+}
+
+void applyPerPixelNormalOffset(cv::Mat_<cv::Vec3f>& coords,
+                               const cv::Mat_<cv::Vec3f>& normals,
+                               float zOff)
+{
+    if (zOff == 0.0f || coords.empty() || normals.empty())
+        return;
+
+    const int h = std::min(coords.rows, normals.rows);
+    const int w = std::min(coords.cols, normals.cols);
+    for (int y = 0; y < h; ++y) {
+        auto* coordRow = coords.ptr<cv::Vec3f>(y);
+        const auto* normalRow = normals.ptr<cv::Vec3f>(y);
+        for (int x = 0; x < w; ++x) {
+            cv::Vec3f& p = coordRow[x];
+            const cv::Vec3f& n = normalRow[x];
+            if (!validSurfacePoint(p) ||
+                !std::isfinite(n[0]) || !std::isfinite(n[1]) || !std::isfinite(n[2])) {
+                continue;
+            }
+            p += n * zOff;
+        }
+    }
 }
 
 std::uint64_t surfaceTileKey(int tx, int ty)
@@ -491,7 +513,9 @@ CChunkedVolumeViewer::CChunkedVolumeViewer(CState* state, ViewerManager* manager
     connect(_view, &CVolumeViewerView::sendMouseRelease, this, &CChunkedVolumeViewer::onMouseRelease);
     connect(_view, &CVolumeViewerView::sendMouseDoubleClick, this,
             [this](QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
-                emit sendMouseDoubleClickVolume(sceneToVolume(scenePos), button, modifiers);
+                emit sendMouseDoubleClickVolume(
+                    cursorVolumePosition(scenePos).value_or(sceneToVolume(scenePos)),
+                    button, modifiers);
             });
     connect(_view, &CVolumeViewerView::sendKeyPress, this, &CChunkedVolumeViewer::onKeyPress);
     connect(_view, &CVolumeViewerView::sendKeyRelease, this, &CChunkedVolumeViewer::onKeyRelease);
@@ -1135,36 +1159,20 @@ int CChunkedVolumeViewer::renderStartLevel(bool preferSurfaceResolution) const
         return 0;
 
     // `_dsScaleIdx` intentionally waits for about 2x more zoom before moving
-    // to a finer level. Plane views can bias coarser during active motion;
-    // surface-resolution views keep their target level to avoid panning blur.
+    // to a finer level. Surface-resolution views keep their target level to
+    // avoid panning blur.
     int level = _dsScaleIdx;
     if (preferSurfaceResolution && _chunkArray && level < _chunkArray->numLevels() - 1)
         level -= kSurfaceResolutionLevelBias;
-    if (_interactivePreview && !preferSurfaceResolution && _chunkArray->numLevels() > 1) {
-        const double speed = std::max(0.0, _interactionSpeedPxPerSec);
-        const double t = std::clamp((speed - kSlowMotionPxPerSec) /
-                                    (kFastMotionPxPerSec - kSlowMotionPxPerSec),
-                                    0.0, 1.0);
-        const int maxBias = std::max(0, _chunkArray->numLevels() - 1 - level);
-        const int bias = int(std::ceil(t * double(maxBias)));
-        level += bias;
-    }
     return std::clamp(level, 0, _chunkArray->numLevels() - 1);
 }
 
-void CChunkedVolumeViewer::markInteractiveMotion(double motionPx)
+void CChunkedVolumeViewer::markInteractiveMotion(double)
 {
     if (!_interactionClock.isValid())
         _interactionClock.start();
 
     const qint64 now = _interactionClock.elapsed();
-    if (_lastInteractionMs >= 0) {
-        const qint64 dtMs = std::max<qint64>(1, now - _lastInteractionMs);
-        const double instantaneous = std::max(0.0, motionPx) * 1000.0 / double(dtMs);
-        _interactionSpeedPxPerSec = 0.65 * _interactionSpeedPxPerSec + 0.35 * instantaneous;
-    } else {
-        _interactionSpeedPxPerSec = std::max(0.0, motionPx) * 60.0;
-    }
     _lastInteractionMs = now;
     _interactivePreview = true;
     if (_settleRenderTimer)
@@ -1519,16 +1527,7 @@ void CChunkedVolumeViewer::prefetchSurfaceHalo(
         surf.gen(&coords, _zOff != 0.0f ? &normals : nullptr,
                  cv::Size(stripW, stripH), {0, 0, 0}, _scale, offset);
 
-        if (_zOff != 0.0f && _zOffWorldDir != cv::Vec3f(0.0f, 0.0f, 0.0f)) {
-            const cv::Vec3f tr = _zOffWorldDir * _zOff;
-            for (int y = 0; y < coords.rows; ++y) {
-                auto* row = coords.ptr<cv::Vec3f>(y);
-                for (int x = 0; x < coords.cols; ++x) {
-                    if (row[x][0] == row[x][0] && row[x][0] != -1.0f)
-                        row[x] += tr;
-                }
-            }
-        }
+        applyPerPixelNormalOffset(coords, normals, _zOff);
 
         cv::Mat_<uint8_t> coverage(stripH, stripW, uint8_t(0));
         auto keys = vc::render::ChunkedPlaneSampler::collectCoordsDependencies(
@@ -1615,11 +1614,6 @@ void CChunkedVolumeViewer::prefetchVisibleSurfaceChunks(int priorityOffset)
         return;
 
     auto& cache = _surfaceChunkPrefetchCache;
-    if (cache.valid && cache.surface == quad && cache.level == level &&
-        cache.sampling == _samplingMethod && rectContains(cache.prefetchedCellRect, visibleCells)) {
-        return;
-    }
-
     if (!cache.valid || cache.surface != quad || cache.level != level ||
         cache.sampling != _samplingMethod) {
         cache = {};
@@ -1628,39 +1622,57 @@ void CChunkedVolumeViewer::prefetchVisibleSurfaceChunks(int priorityOffset)
         cache.sampling = _samplingMethod;
     }
 
-    std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> uniqueKeys;
-    const int tx0 = paddedCells.x / kSurfacePrefetchTileCells;
-    const int ty0 = paddedCells.y / kSurfacePrefetchTileCells;
-    const int tx1 = (paddedCells.x + paddedCells.width - 1) / kSurfacePrefetchTileCells;
-    const int ty1 = (paddedCells.y + paddedCells.height - 1) / kSurfacePrefetchTileCells;
-    for (int ty = ty0; ty <= ty1; ++ty) {
-        for (int tx = tx0; tx <= tx1; ++tx) {
-            const std::uint64_t key = surfaceTileKey(tx, ty);
-            auto it = cache.tileKeys.find(key);
-            if (it == cache.tileKeys.end()) {
-                cv::Rect tileCells(tx * kSurfacePrefetchTileCells,
-                                   ty * kSurfacePrefetchTileCells,
-                                   kSurfacePrefetchTileCells,
-                                   kSurfacePrefetchTileCells);
-                tileCells &= cellBounds;
-                it = cache.tileKeys.emplace(
-                    key,
-                    collectSurfaceCellChunkKeys(*_chunkArray, *quad, tileCells, level, _samplingMethod)).first;
+    auto collectKeysForCells = [&](const cv::Rect& cells,
+                                   std::unordered_set<vc::render::ChunkKey,
+                                                      vc::render::ChunkKeyHash>& keys) {
+        if (cells.empty())
+            return;
+        const int tx0 = cells.x / kSurfacePrefetchTileCells;
+        const int ty0 = cells.y / kSurfacePrefetchTileCells;
+        const int tx1 = (cells.x + cells.width - 1) / kSurfacePrefetchTileCells;
+        const int ty1 = (cells.y + cells.height - 1) / kSurfacePrefetchTileCells;
+        for (int ty = ty0; ty <= ty1; ++ty) {
+            for (int tx = tx0; tx <= tx1; ++tx) {
+                const std::uint64_t key = surfaceTileKey(tx, ty);
+                auto it = cache.tileKeys.find(key);
+                if (it == cache.tileKeys.end()) {
+                    cv::Rect tileCells(tx * kSurfacePrefetchTileCells,
+                                       ty * kSurfacePrefetchTileCells,
+                                       kSurfacePrefetchTileCells,
+                                       kSurfacePrefetchTileCells);
+                    tileCells &= cellBounds;
+                    it = cache.tileKeys.emplace(
+                        key,
+                        collectSurfaceCellChunkKeys(*_chunkArray, *quad, tileCells, level, _samplingMethod)).first;
+                }
+                keys.insert(it->second.begin(), it->second.end());
             }
-            uniqueKeys.insert(it->second.begin(), it->second.end());
         }
-    }
+    };
+
+    std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> visibleKeys;
+    std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash> speculativeKeys;
+    collectKeysForCells(visibleCells, visibleKeys);
+    collectKeysForCells(paddedCells, speculativeKeys);
+    for (const auto& key : visibleKeys)
+        speculativeKeys.erase(key);
 
     cache.valid = true;
-    cache.prefetchedCellRect = paddedCells;
-    if (uniqueKeys.empty())
-        return;
+    cache.prefetchedCellRect = rectContains(cache.prefetchedCellRect, paddedCells)
+        ? cache.prefetchedCellRect
+        : paddedCells;
 
     std::vector<vc::render::ChunkKey> keys;
-    keys.reserve(uniqueKeys.size());
-    for (const auto& key : uniqueKeys)
+    keys.reserve(visibleKeys.size());
+    for (const auto& key : visibleKeys)
         keys.push_back(key);
     _chunkArray->prefetchChunks(keys, false, priorityOffset);
+
+    keys.clear();
+    keys.reserve(speculativeKeys.size());
+    for (const auto& key : speculativeKeys)
+        keys.push_back(key);
+    _chunkArray->prefetchChunks(keys, false, kChunkPrefetchPriorityOffset);
 }
 
 struct CChunkedVolumeViewer::RenderContext {
@@ -1943,23 +1955,7 @@ CChunkedVolumeViewer::RenderResult CChunkedVolumeViewer::renderFrame(RenderConte
         if (!genCacheHit) {
             ctx.surf->gen(&coords, needSurfaceNormals ? &normals : nullptr,
                           cv::Size(ctx.fbW, ctx.fbH), {0, 0, 0}, ctx.scale, offset);
-            cv::Vec3f zOffWorldDir = ctx.zOffWorldDir;
-            if (ctx.zOff != 0.0f && zOffWorldDir == cv::Vec3f(0.0f, 0.0f, 0.0f) && !normals.empty()) {
-                const cv::Vec3f n = normals(normals.rows / 2, normals.cols / 2);
-                const float len = static_cast<float>(cv::norm(n));
-                if (len > 1e-6f)
-                    zOffWorldDir = n / len;
-            }
-            if (ctx.zOff != 0.0f && zOffWorldDir != cv::Vec3f(0.0f, 0.0f, 0.0f)) {
-                const cv::Vec3f tr = zOffWorldDir * ctx.zOff;
-                for (int y = 0; y < coords.rows; ++y) {
-                    auto* row = coords.ptr<cv::Vec3f>(y);
-                    for (int x = 0; x < coords.cols; ++x) {
-                        if (row[x][0] == row[x][0] && row[x][0] != -1.0f)
-                            row[x] += tr;
-                    }
-                }
-            }
+            applyPerPixelNormalOffset(coords, normals, ctx.zOff);
 
             if (ctx.genCache && !coords.empty()) {
                 std::lock_guard lock(ctx.genCache->mutex);
@@ -2527,9 +2523,19 @@ void CChunkedVolumeViewer::onVolumeClicked(QPointF scenePos, Qt::MouseButton but
 {
     auto surf = _surfWeak.lock();
     cv::Vec3f n(0, 0, 1);
-    if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get()))
+    if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
         n = plane->normal({0, 0, 0});
-    emit sendVolumeClicked(sceneToVolume(scenePos), n, surf.get(), button, modifiers);
+    } else if (surf) {
+        const cv::Vec2f sp = sceneToSurface(scenePos);
+        const cv::Vec3f surfaceNormal = surf->normal({0, 0, 0}, {sp[0], sp[1], 0.0f});
+        if (std::isfinite(surfaceNormal[0]) &&
+            std::isfinite(surfaceNormal[1]) &&
+            std::isfinite(surfaceNormal[2])) {
+            n = surfaceNormal;
+        }
+    }
+    emit sendVolumeClicked(cursorVolumePosition(scenePos).value_or(sceneToVolume(scenePos)),
+                           n, surf.get(), button, modifiers);
 }
 
 void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
@@ -2545,7 +2551,8 @@ void CChunkedVolumeViewer::onMousePress(QPointF scenePos, Qt::MouseButton button
         emit overlaysUpdated();
         return;
     }
-    emit sendMousePressVolume(sceneToVolume(scenePos), {0, 0, 1}, button, modifiers, scenePos);
+    emit sendMousePressVolume(cursorVolumePosition(scenePos).value_or(sceneToVolume(scenePos)),
+                              {0, 0, 1}, button, modifiers, scenePos);
 }
 
 void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers)
@@ -2561,7 +2568,8 @@ void CChunkedVolumeViewer::onMouseMove(QPointF scenePos, Qt::MouseButtons button
         emit overlaysUpdated();
         return;
     }
-    emit sendMouseMoveVolume(sceneToVolume(scenePos), buttons, modifiers, scenePos);
+    emit sendMouseMoveVolume(cursorVolumePosition(scenePos).value_or(sceneToVolume(scenePos)),
+                             buttons, modifiers, scenePos);
 }
 
 void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton button, Qt::KeyboardModifiers modifiers)
@@ -2581,7 +2589,8 @@ void CChunkedVolumeViewer::onMouseRelease(QPointF scenePos, Qt::MouseButton butt
         emit overlaysUpdated();
         return;
     }
-    emit sendMouseReleaseVolume(sceneToVolume(scenePos), button, modifiers, scenePos);
+    emit sendMouseReleaseVolume(cursorVolumePosition(scenePos).value_or(sceneToVolume(scenePos)),
+                                button, modifiers, scenePos);
 }
 
 void CChunkedVolumeViewer::onPathsChanged(const QList<ViewerOverlayControllerBase::PathPrimitive>& paths)
@@ -2704,9 +2713,11 @@ std::optional<cv::Vec3f> CChunkedVolumeViewer::cursorVolumePosition(const QPoint
     cv::Vec3f p = sceneToVolume(scenePos);
     if (auto* plane = dynamic_cast<PlaneSurface*>(surf.get())) {
         p += plane->normal({0, 0, 0}) * _zOff;
-    } else if (_zOff != 0.0f &&
-               _zOffWorldDir != cv::Vec3f(0.0f, 0.0f, 0.0f)) {
-        p += _zOffWorldDir * _zOff;
+    } else if (_zOff != 0.0f) {
+        const cv::Vec2f sp = sceneToSurface(scenePos);
+        const cv::Vec3f n = surf->normal({0, 0, 0}, {sp[0], sp[1], 0.0f});
+        if (std::isfinite(n[0]) && std::isfinite(n[1]) && std::isfinite(n[2]))
+            p += n * _zOff;
     }
     return p;
 }

@@ -182,8 +182,12 @@ void ChunkCache::prefetchChunks(const std::vector<ChunkKey>& keys, bool wait, in
         if (!isValidKey(*state, key))
             continue;
         auto [it, inserted] = state->entries_.emplace(key, Entry{});
-        if (inserted)
+        if (inserted) {
             queueFetchLocked(state, key, state->generation_, priorityOffset);
+        } else if (it->second.status == EntryStatus::InFlight &&
+                   key.level + priorityOffset < it->second.priority) {
+            queueFetchLocked(state, key, state->generation_, priorityOffset);
+        }
     }
     if (!wait)
         return;

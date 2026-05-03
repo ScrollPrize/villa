@@ -282,7 +282,6 @@ private:
     QElapsedTimer _interactionClock;
     qint64 _lastInteractionMs = -1;
     qint64 _lastInteractivePreviewMs = -1;
-    double _interactionSpeedPxPerSec = 0.0;
 
     std::shared_ptr<Volume> _volume;
     std::weak_ptr<Surface> _surfWeak;
