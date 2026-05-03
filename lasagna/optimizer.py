@@ -276,6 +276,13 @@ def optimize(
 ) -> fit_data.FitData3D:
 	opt_loss_corr.reset_state()
 
+	def _stage_start(name: str) -> float:
+		print(f"[optimizer] stage start: {name}", flush=True)
+		return time.perf_counter()
+
+	def _stage_done(name: str, t0: float) -> None:
+		print(f"[optimizer] stage done: {name} ({time.perf_counter() - t0:.3f}s)", flush=True)
+
 	terms = {
 		"step": {"loss": opt_loss_step.step_loss},
 		"smooth": {"loss": opt_loss_smooth.smooth_loss},
@@ -294,12 +301,14 @@ def optimize(
 	_corr_start_printed = [False]
 
 	def _run_opt(*, si: int, label: str, stage: Stage, opt_cfg: OptSettings, data: fit_data.FitData3D) -> fit_data.FitData3D:
+		_t_stage_total = _stage_start(f"{label}.total")
 		print(f"[optimizer] {label}: params={opt_cfg.params} steps={opt_cfg.steps} "
 			  f"lr={opt_cfg.lr} min_scaledown={opt_cfg.min_scaledown}", flush=True)
 		if opt_cfg.steps <= 0:
 			return data
 
 		# Configure corr Phase D Gaussian-splat σ (default 1.0; 7×7 vertex neighborhood).
+		_t = _stage_start(f"{label}.configure_losses")
 		corr_splat_sigma = float(opt_cfg.args.get("corr_splat_sigma", 1.0)) if opt_cfg.args else 1.0
 		opt_loss_corr.set_splat_sigma(corr_splat_sigma)
 		pred_dt_flow_gate_cfg = opt_cfg.args.get("pred_dt_flow_gate") if opt_cfg.args else None
@@ -309,8 +318,10 @@ def optimize(
 			seed_xyz=seed_xyz,
 			out_dir=out_dir,
 		)
+		_stage_done(f"{label}.configure_losses", _t)
 
 		# If arc/straight params not in optimized set, bake into mesh
+		_t = _stage_start(f"{label}.prepare_model_params")
 		arc_params_set = {"arc_cx", "arc_cy", "arc_radius", "arc_angle0", "arc_angle1"}
 		if not arc_params_set.intersection(opt_cfg.params):
 			if hasattr(model, "arc_enabled") and model.arc_enabled:
@@ -319,7 +330,9 @@ def optimize(
 		if not straight_params_set.intersection(opt_cfg.params):
 			if hasattr(model, "straight_enabled") and model.straight_enabled:
 				model.bake_straight_into_mesh()
+		_stage_done(f"{label}.prepare_model_params", _t)
 
+		_t = _stage_start(f"{label}.build_optimizer")
 		all_params = model.opt_params()
 		param_groups: list[dict] = []
 		for name in opt_cfg.params:
@@ -337,9 +350,11 @@ def optimize(
 		if not param_groups:
 			return data
 		opt = torch.optim.Adam(param_groups)
+		_stage_done(f"{label}.build_optimizer", _t)
 
 		# winding_offset_autocrop: compute offset/direction then crop invalid depth layers
 		if opt_cfg.args and opt_cfg.args.get("winding_offset_autocrop") and _need_term("winding_vol", opt_cfg.eff) > 0:
+			_t = _stage_start(f"{label}.winding_offset_autocrop")
 			with torch.no_grad():
 				res_ao = model(data)
 			ao_offset, ao_dir = opt_loss_winding_volume.compute_auto_offset(res=res_ao)
@@ -371,6 +386,7 @@ def optimize(
 				if not param_groups:
 					return data
 				opt = torch.optim.Adam(param_groups)
+			_stage_done(f"{label}.winding_offset_autocrop", _t)
 
 		_status_rows = 0
 
@@ -401,7 +417,9 @@ def optimize(
 		if _need_term("data", opt_cfg.eff) > 0 or _need_term("data_plain", opt_cfg.eff) > 0:
 			_needed_channels.add("cos")
 		if ensure_data_fn is not None:
+			_t = _stage_start(f"{label}.ensure_data")
 			data = ensure_data_fn(data, _needed_channels)
+			_stage_done(f"{label}.ensure_data", _t)
 
 		# Initial evaluation
 		def _eval_terms(res_, eff_):
@@ -433,6 +451,8 @@ def optimize(
 					lv, lms, masks = result
 					w = _need_term(name, eff_)
 					tv[name] = float(lv.detach().cpu())
+					if name == "pred_dt":
+						tv.update(opt_loss_pred_dt.flow_gate_last_stats())
 					total = total + w * lv
 			return total, tv
 
@@ -448,6 +468,7 @@ def optimize(
 
 		# Initial prefetch for streaming mode
 		if _active_caches:
+			_t = _stage_start(f"{label}.initial_prefetch")
 			with torch.no_grad():
 				_xyz_lr_pf = model._grid_xyz()
 				_xyz_hr_pf = model._grid_xyz_hr(_xyz_lr_pf)
@@ -463,14 +484,18 @@ def optimize(
 					_cache.prefetch(_corr_xyz, data.origin_fullres, _sp)
 			for _cache in _active_caches:
 				_cache.sync()
+			_stage_done(f"{label}.initial_prefetch", _t)
 
 		# Station-keeping: set seed point anchor (once, on first stage that uses it)
 		# Must be AFTER prefetch+sync so grid_sample_fullres can read loaded chunks.
 		if (_need_term("station_n", opt_cfg.eff) > 0 or _need_term("station_t", opt_cfg.eff) > 0) and seed_xyz is not None:
+			_t = _stage_start(f"{label}.station_seed")
 			dev = next(model.parameters()).device
 			seed_t = torch.tensor(list(seed_xyz), device=dev, dtype=torch.float32)
 			opt_loss_station.set_seed(seed_t, data, Hm=model.mesh_h, Wm=model.mesh_w, D=model.depth)
+			_stage_done(f"{label}.station_seed", _t)
 
+		_t = _stage_start(f"{label}.initial_eval")
 		with torch.no_grad():
 			res0 = model(data)
 			loss0, term_vals0 = _eval_terms(res0, opt_cfg.eff)
@@ -485,12 +510,16 @@ def optimize(
 			if not _corr_start_printed[0] and "corr" in term_vals0:
 				opt_loss_corr.print_detail("START")
 				_corr_start_printed[0] = True
+		_stage_done(f"{label}.initial_eval", _t)
+		_t = _stage_start(f"{label}.initial_snapshot")
 		snapshot_fn(stage=label, step=0, loss=float(loss0.detach().cpu()), data=data, res=res0)
+		_stage_done(f"{label}.initial_snapshot", _t)
 
 		max_steps = opt_cfg.steps
 		_t_wall_start = time.perf_counter()
 		_t_steps_acc = 0
 		loss = loss0
+		status_interval = 1
 
 		for step in range(max_steps):
 			# Sync: wait for chunks loaded by last prefetch
@@ -535,7 +564,7 @@ def optimize(
 					stage_name=stage.name,
 				)
 
-			if step == 0 or step1 == max_steps or (step1 % 100) == 0:
+			if step == 0 or step1 == max_steps or (step1 % status_interval) == 0:
 				param_vals: dict[str, float] = {}
 				for k, vs in all_params.items():
 					if len(vs) == 1 and vs[0].numel() == 1:
@@ -556,7 +585,10 @@ def optimize(
 			if snap_int > 0 and (step1 % snap_int) == 0:
 				snapshot_fn(stage=label, step=step1, loss=float(loss.detach().cpu()), data=data, res=res)
 
+		_t = _stage_start(f"{label}.final_snapshot")
 		snapshot_fn(stage=label, step=max_steps, loss=float(loss.detach().cpu()), data=data, res=res)
+		_stage_done(f"{label}.final_snapshot", _t)
+		_stage_done(f"{label}.total", _t_stage_total)
 		return data
 
 	snap_int = int(snapshot_interval)

@@ -28,7 +28,7 @@ namespace fs = std::filesystem;
 
 namespace {
 
-constexpr double kFixedThreshold = 127.0;
+constexpr double kFixedThreshold = 100.0;
 constexpr float kMinComponentRidgeRadius = 2.0f;
 constexpr double kMinBoundaryAngleDegrees = 120.0;
 constexpr float kCapacityScale = 2.0f;
@@ -117,10 +117,14 @@ struct Args {
     fs::path input;
     bool has_source = false;
     cv::Point source{-1, -1};
+    int grid_step = 50;
+    float backtrack_distance = 10.0f;
 };
 
 void print_usage(const char* argv0) {
-    std::cerr << "Usage: " << argv0 << " -i <image> [--source x,y]\n";
+    std::cerr << "Usage: " << argv0
+              << " -i <image> [--source x,y] [--grid-step pixels]"
+              << " [--backtrack-distance pixels]\n";
 }
 
 Args parse_args(int argc, char** argv) {
@@ -138,6 +142,11 @@ Args parse_args(int argc, char** argv) {
             args.source.x = std::stoi(value.substr(0, comma));
             args.source.y = std::stoi(value.substr(comma + 1));
             args.has_source = true;
+        } else if (key == "--grid-step" && i + 1 < argc) {
+            args.grid_step = std::max(1, std::stoi(argv[++i]));
+        } else if (key == "--backtrack-distance" && i + 1 < argc) {
+            args.backtrack_distance =
+                std::max(0.0f, std::stof(argv[++i]));
         } else if (key == "--help" || key == "-h") {
             print_usage(argv[0]);
             std::exit(0);
@@ -189,8 +198,14 @@ cv::Mat to_u8_for_threshold(const cv::Mat& src) {
 
 cv::Mat binarize_fixed_threshold(const cv::Mat& gray) {
     cv::Mat u8 = to_u8_for_threshold(gray);
+    cv::Mat white_domain;
+    cv::threshold(u8, white_domain, kFixedThreshold, 255, cv::THRESH_BINARY);
+    cv::Mat kernel = cv::getStructuringElement(cv::MORPH_RECT, {3, 3});
+    cv::dilate(white_domain, white_domain, kernel, {-1, -1}, 2);
+    cv::erode(white_domain, white_domain, kernel, {-1, -1}, 2);
+
     cv::Mat binary;
-    cv::threshold(u8, binary, kFixedThreshold, 255, cv::THRESH_BINARY_INV);
+    cv::bitwise_not(white_domain, binary);
     return binary;
 }
 
@@ -2275,13 +2290,18 @@ struct DenseBacktrackResult {
     std::vector<StageTiming> timings;
 };
 
+cv::Mat bilinear_from_regular_grid_samples(const cv::Mat& source,
+                                           int grid_step);
+
 DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
                                                   const cv::Mat& dt,
                                                   const cv::Mat& graph_pixel_flow,
                                                   const cv::Mat& graph_node_flow,
                                                   const cv::Mat& source_edge_mask,
                                                   const cv::Mat& graph_node_mask,
-                                                  const SkeletonGraph& graph) {
+                                                  const SkeletonGraph& graph,
+                                                  int grid_step,
+                                                  float backtrack_distance) {
     CV_Assert(white_domain.type() == CV_8U);
     CV_Assert(dt.type() == CV_32F);
     CV_Assert(graph_pixel_flow.type() == CV_32F);
@@ -2297,7 +2317,7 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
         cv::Mat(white_domain.size(), CV_32FC3, cv::Scalar(0, 0, 0));
 
     constexpr float kFlowEpsilon = 1.0e-4f;
-    constexpr float kBacktrackRadius = 300.0f;
+    const float kBacktrackRadius = std::max(0.0f, backtrack_distance);
     const int rows = white_domain.rows;
     const int cols = white_domain.cols;
     const int pixel_count = rows * cols;
@@ -2560,7 +2580,7 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
 
     {
         const TimingMark timing = start_timing();
-        constexpr int kGridStep = 50;
+        const int kGridStep = std::max(1, grid_step);
 
         struct CarrierNode {
             cv::Point pixel;
@@ -2587,7 +2607,7 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
             }
             return true;
         };
-        const auto add_axis = [](const int limit) {
+        const auto add_axis = [kGridStep](const int limit) {
             std::vector<int> axis;
             for (int value = 0; value < limit; value += kGridStep) {
                 axis.push_back(value);
@@ -2885,7 +2905,7 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
         }
 
         constexpr float kCarrierRouteBucketPx = 10.0f;
-        constexpr int kCarrierRouteBuckets =
+        const int kCarrierRouteBuckets =
             static_cast<int>(kBacktrackRadius / kCarrierRouteBucketPx) + 1;
         const int carrier_count = static_cast<int>(carriers.size());
         std::vector<float> carrier_route_dp(
@@ -3410,7 +3430,7 @@ DenseBacktrackResult compute_dense_backtrack_flow(const cv::Mat& white_domain,
         }
 
         constexpr int kScoreBucketSize = 4;
-        constexpr int kScoreBucketCount =
+        const int kScoreBucketCount =
             static_cast<int>(kBacktrackRadius) / kScoreBucketSize + 1;
         constexpr float kMaxScoreDistanceMargin = 32.0f;
         std::vector<float> graph_source_score_cache(
@@ -3887,7 +3907,9 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
                                           const cv::Mat& dt,
                                           const SkeletonGraph& input_graph,
                                           const cv::Mat& source_pixel_ridges,
-                                          const cv::Point source) {
+                                          const cv::Point source,
+                                          int grid_step = 50,
+                                          float backtrack_distance = 10.0f) {
     CV_Assert(white_domain.type() == CV_8U);
     CV_Assert(dt.type() == CV_32F);
     CV_Assert(source_pixel_ridges.type() == CV_8U);
@@ -4883,12 +4905,15 @@ DenseFlowResult compute_dense_source_flow(const cv::Mat& white_domain,
         const DenseBacktrackResult dense_backtrack =
             compute_dense_backtrack_flow(white_domain, dt, graph_pixel_flow,
                                          graph_node_flow, source_edge_mask,
-                                         graph.node_mask, graph);
+                                         graph.node_mask, graph, grid_step,
+                                         backtrack_distance);
         // Reference dense flood: useful for later experiments, but its TIFF is
         // disabled by default so timing focuses on the current tree dense flow.
         dense_backtrack_nn_flow = dense_backtrack.nn_flow;
-        smooth_grid_flow = dense_backtrack.smooth_grid_flow;
-        tree_dense_flow = dense_backtrack.flow;
+        smooth_grid_flow = bilinear_from_regular_grid_samples(
+            dense_backtrack.smooth_grid_flow, grid_step);
+        tree_dense_flow =
+            bilinear_from_regular_grid_samples(dense_backtrack.flow, grid_step);
         tree_path_debug = dense_backtrack.debug_paths;
         timings.insert(timings.end(), dense_backtrack.timings.begin(),
                        dense_backtrack.timings.end());
@@ -5267,6 +5292,73 @@ cv::Mat to_float_layer(const cv::Mat& image) {
     cv::Mat bgr;
     cv::cvtColor(float_image, bgr, cv::COLOR_GRAY2BGR);
     return bgr;
+}
+
+std::vector<int> regular_grid_axis(const int limit, const int step) {
+    std::vector<int> axis;
+    const int safe_step = std::max(1, step);
+    for (int value = 0; value < limit; value += safe_step) {
+        axis.push_back(value);
+    }
+    if (axis.empty() || axis.back() != limit - 1) {
+        axis.push_back(limit - 1);
+    }
+    return axis;
+}
+
+cv::Mat bilinear_from_regular_grid_samples(const cv::Mat& source,
+                                           const int grid_step) {
+    CV_Assert(source.type() == CV_32F);
+    const int rows = source.rows;
+    const int cols = source.cols;
+    const std::vector<int> grid_xs = regular_grid_axis(cols, grid_step);
+    const std::vector<int> grid_ys = regular_grid_axis(rows, grid_step);
+    cv::Mat out(source.size(), CV_32F, cv::Scalar(0));
+
+    const auto lower_axis_index = [](const std::vector<int>& axis,
+                                     const int value) {
+        const auto upper = std::upper_bound(axis.begin(), axis.end(), value);
+        if (upper == axis.begin()) {
+            return 0;
+        }
+        return static_cast<int>(std::distance(axis.begin(), upper)) - 1;
+    };
+
+    cv::parallel_for_(cv::Range(0, rows), [&](const cv::Range& range) {
+        for (int y = range.start; y < range.end; ++y) {
+            const int gy0 = lower_axis_index(grid_ys, y);
+            const int gy1 = std::min(gy0 + 1,
+                                     static_cast<int>(grid_ys.size()) - 1);
+            const float y0 = static_cast<float>(grid_ys[gy0]);
+            const float y1 = static_cast<float>(grid_ys[gy1]);
+            const float ty =
+                y1 > y0 ? (static_cast<float>(y) - y0) / (y1 - y0) : 0.0f;
+            float* dst = out.ptr<float>(y);
+            for (int x = 0; x < cols; ++x) {
+                const int gx0 = lower_axis_index(grid_xs, x);
+                const int gx1 = std::min(
+                    gx0 + 1, static_cast<int>(grid_xs.size()) - 1);
+                const float x0 = static_cast<float>(grid_xs[gx0]);
+                const float x1 = static_cast<float>(grid_xs[gx1]);
+                const float tx =
+                    x1 > x0 ? (static_cast<float>(x) - x0) / (x1 - x0)
+                            : 0.0f;
+                const float v00 =
+                    source.at<float>(grid_ys[gy0], grid_xs[gx0]);
+                const float v10 =
+                    source.at<float>(grid_ys[gy0], grid_xs[gx1]);
+                const float v01 =
+                    source.at<float>(grid_ys[gy1], grid_xs[gx0]);
+                const float v11 =
+                    source.at<float>(grid_ys[gy1], grid_xs[gx1]);
+                const float v0 = v00 * (1.0f - tx) + v10 * tx;
+                const float v1 = v01 * (1.0f - tx) + v11 * tx;
+                dst[x] = v0 * (1.0f - ty) + v1 * ty;
+            }
+        }
+    });
+
+    return out;
 }
 
 cv::Mat labels_to_u16(const cv::Mat& labels, int max_label) {
@@ -5667,6 +5759,10 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
                                         int query_count,
                                         float* query_flow,
                                         float* dense_flow,
+                                        float* smooth_grid_flow,
+                                        float* graph_edge_flow_rgb,
+                                        int grid_step,
+                                        float backtrack_distance,
                                         char* error_message,
                                         int error_message_size,
                                         int verbose) {
@@ -5772,7 +5868,8 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
         DenseFlowResult dense_flow_result =
             compute_dense_source_flow(
                 white_domain, dt, graph,
-                component_voronoi_result.source_pixel_ridges, source);
+                component_voronoi_result.source_pixel_ridges, source,
+                grid_step, backtrack_distance);
         timings.insert(timings.end(), dense_flow_result.timings.begin(),
                        dense_flow_result.timings.end());
 
@@ -5782,6 +5879,31 @@ extern "C" int dense_batch_flow_grid_u8(const unsigned char* image,
                     dense_flow_result.tree_dense_flow.ptr<float>(y);
                 std::copy(src_row, src_row + width,
                           dense_flow + static_cast<std::size_t>(y) * width);
+            }
+        }
+        if (smooth_grid_flow != nullptr) {
+            for (int y = 0; y < height; ++y) {
+                const float* src_row =
+                    dense_flow_result.smooth_grid_flow.ptr<float>(y);
+                std::copy(src_row, src_row + width,
+                          smooth_grid_flow +
+                              static_cast<std::size_t>(y) * width);
+            }
+        }
+        if (graph_edge_flow_rgb != nullptr) {
+            cv::Mat graph_rgb;
+            cv::cvtColor(dense_flow_result.graph_edge_flow_gray_bg, graph_rgb,
+                         cv::COLOR_BGR2RGB);
+            for (int y = 0; y < height; ++y) {
+                const cv::Vec3f* src_row = graph_rgb.ptr<cv::Vec3f>(y);
+                float* dst_row =
+                    graph_edge_flow_rgb +
+                    static_cast<std::size_t>(y) * width * 3;
+                for (int x = 0; x < width; ++x) {
+                    dst_row[3 * x + 0] = src_row[x][0];
+                    dst_row[3 * x + 1] = src_row[x][1];
+                    dst_row[3 * x + 2] = src_row[x][2];
+                }
             }
         }
 
@@ -5942,10 +6064,11 @@ int main(int argc, char** argv) {
         DenseFlowResult dense_flow_result;
         bool has_dense_flow = false;
         if (args.has_source) {
-            dense_flow_result =
+        dense_flow_result =
                 compute_dense_source_flow(
                     white_domain, dt, graph,
-                    component_voronoi_result.source_pixel_ridges, args.source);
+                    component_voronoi_result.source_pixel_ridges, args.source,
+                    args.grid_step, args.backtrack_distance);
             timings.insert(timings.end(), dense_flow_result.timings.begin(),
                            dense_flow_result.timings.end());
             has_dense_flow = true;

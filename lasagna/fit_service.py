@@ -34,6 +34,43 @@ _data_dir: str | None = None  # Set via --data-dir CLI flag
 _gpu_pause_enabled: bool = True  # Set via --no-gpu-pause CLI flag
 
 
+def _config_enables_pred_dt_flow_gate(cfg: dict[str, Any]) -> bool:
+    stages = cfg.get("stages")
+    if not isinstance(stages, list):
+        return False
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        opt_cfg = stage.get("global_opt")
+        if not isinstance(opt_cfg, dict):
+            opt_cfg = stage
+        args = opt_cfg.get("args")
+        if not isinstance(args, dict):
+            continue
+        gate = args.get("pred_dt_flow_gate")
+        if isinstance(gate, dict) and bool(gate.get("enabled", False)):
+            return True
+    return False
+
+
+def _set_pred_dt_flow_gate_debug_out_dir(cfg: dict[str, Any], out_dir: str) -> None:
+    stages = cfg.get("stages")
+    if not isinstance(stages, list):
+        return
+    for stage in stages:
+        if not isinstance(stage, dict):
+            continue
+        opt_cfg = stage.get("global_opt")
+        if not isinstance(opt_cfg, dict):
+            opt_cfg = stage
+        args = opt_cfg.get("args")
+        if not isinstance(args, dict):
+            continue
+        gate = args.get("pred_dt_flow_gate")
+        if isinstance(gate, dict) and bool(gate.get("enabled", False)):
+            gate.setdefault("debug_out_dir", out_dir)
+
+
 # ---------------------------------------------------------------------------
 # Service announcement (file-based discovery)
 # ---------------------------------------------------------------------------
@@ -287,6 +324,8 @@ def _run_optimization(body: dict[str, Any]) -> None:
         # Use a temp directory for all intermediate files (config json,
         # model output, etc.) so nothing leaks into the volpkg paths dir.
         tmp_dir = tempfile.mkdtemp(prefix="fit_reopt_")
+        service_workdir = Path.cwd()
+        print(f"[fit-service] cwd: {service_workdir}", flush=True)
 
         # Handle model_data (external/remote mode): decode and save to temp
         if model_data:
@@ -331,10 +370,13 @@ def _run_optimization(body: dict[str, Any]) -> None:
         if model_input:
             args_section["model-input"] = str(model_input)
         args_section["model-output"] = str(model_output)
-        # Only set out-dir if explicitly requested (enables debug vis output).
-        # By default we skip vis output for speed.
+        # Only set fit.py out-dir if explicitly requested. pred_dt_flow_gate
+        # debug slices use their own debug_out_dir so enabling them does not
+        # make fit.py export model_final/tifxyz into the service cwd.
         if body.get("out_dir"):
             args_section["out-dir"] = str(body["out_dir"])
+        elif _config_enables_pred_dt_flow_gate(cfg):
+            _set_pred_dt_flow_gate_debug_out_dir(cfg, str(service_workdir))
         cfg["args"] = args_section
         cfg_path = str(Path(tmp_dir) / "fit_config.json")
         has_corr = "corr_points" in cfg

@@ -35,6 +35,10 @@ def _load_library() -> ctypes.CDLL:
 				ctypes.c_int,
 				ctypes.POINTER(ctypes.c_float),
 				ctypes.POINTER(ctypes.c_float),
+				ctypes.POINTER(ctypes.c_float),
+				ctypes.POINTER(ctypes.c_float),
+				ctypes.c_int,
+				ctypes.c_float,
 				ctypes.c_char_p,
 				ctypes.c_int,
 				ctypes.c_int,
@@ -57,7 +61,10 @@ def compute_flow_grid(
 	source_xy: tuple[int, int],
 	query_xy: np.ndarray,
 	verbose: bool = False,
-) -> tuple[np.ndarray, np.ndarray]:
+	return_debug: bool = False,
+	grid_step: int = 50,
+	backtrack_distance: float = 10.0,
+) -> tuple[np.ndarray, np.ndarray] | tuple[np.ndarray, np.ndarray, np.ndarray]:
 	"""Run dense source flow and sample it at explicit image-space points.
 
 	image_u8: (H, W) uint8 pred_dt render.
@@ -74,6 +81,8 @@ def compute_flow_grid(
 	height, width = image.shape
 	query_flow = np.zeros((query.shape[0],), dtype=np.float32)
 	dense_flow = np.zeros((height, width), dtype=np.float32)
+	smooth_grid_flow = np.zeros((height, width), dtype=np.float32) if return_debug else None
+	graph_edge_flow = np.zeros((height, width, 3), dtype=np.float32) if return_debug else None
 	err = ctypes.create_string_buffer(4096)
 	lib = _load_library()
 	rc = lib.dense_batch_flow_grid_u8(
@@ -86,6 +95,18 @@ def compute_flow_grid(
 		int(query.shape[0]),
 		query_flow.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
 		dense_flow.ctypes.data_as(ctypes.POINTER(ctypes.c_float)),
+		(
+			smooth_grid_flow.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+			if smooth_grid_flow is not None
+			else None
+		),
+		(
+			graph_edge_flow.ctypes.data_as(ctypes.POINTER(ctypes.c_float))
+			if graph_edge_flow is not None
+			else None
+		),
+		int(max(1, grid_step)),
+		ctypes.c_float(max(0.0, float(backtrack_distance))),
 		err,
 		ctypes.sizeof(err),
 		1 if verbose else 0,
@@ -93,4 +114,6 @@ def compute_flow_grid(
 	if rc != 0:
 		message = err.value.decode("utf-8", errors="replace")
 		raise RuntimeError(f"dense_batch_flow failed: {message}")
+	if return_debug:
+		return query_flow, dense_flow, smooth_grid_flow, graph_edge_flow
 	return query_flow, dense_flow
