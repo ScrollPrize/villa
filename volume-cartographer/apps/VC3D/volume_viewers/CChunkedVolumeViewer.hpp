@@ -55,6 +55,7 @@ public:
     void renderVisible(bool force = false) override;
     void requestRender() override { scheduleRender(); }
     void invalidateVis() override;
+    void invalidateVisRegion(const std::string& name, const cv::Rect& changedCells) override;
     void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) override;
     void centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender = false) override;
     void adjustSurfaceOffset(float delta) override;
@@ -119,6 +120,7 @@ public:
 
     void renderIntersections() override;
     void invalidateIntersect(const std::string& = "") override;
+    void invalidateIntersectRegion(const std::string& name, const cv::Rect& changedCells) override;
     float intersectionOpacity() const override { return _intersectionOpacity; }
     float intersectionThickness() const override { return _intersectionThickness; }
     int surfacePatchSamplingStride() const override { return _surfacePatchSamplingStride; }
@@ -400,6 +402,24 @@ private:
                            std::vector<SurfacePatchIndex::TriangleSegment>> intersections;
     };
     IntersectionGeometryCache _intersectionGeometryCache;
+
+    struct FlattenedIntersectionLine {
+        int planeIndex = 0;
+        QPointF a;
+        QPointF b;
+    };
+
+    struct FlattenedIntersectionCache {
+        QuadSurface* surface = nullptr;
+        size_t planesHash = 0;
+        int indexSamplingStride = 0;
+        uint64_t generation = 0;
+        bool valid = false;
+        std::unordered_map<std::uint64_t, std::vector<FlattenedIntersectionLine>> cellLines;
+        std::unordered_map<std::uint64_t, std::vector<QGraphicsItem*>> tileItems;
+    };
+    FlattenedIntersectionCache _flattenedIntersectionCache;
+    std::optional<cv::Rect> _flattenedIntersectionDirtyCells;
 
     float _contentMinU = 0.0f;
     float _contentMaxU = 0.0f;

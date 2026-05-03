@@ -64,6 +64,12 @@ public:
     virtual void renderVisible(bool force = false) = 0;
     virtual void requestRender() = 0;
     virtual void invalidateVis() = 0;
+    virtual void invalidateVisRegion(const std::string& name, const cv::Rect& changedCells)
+    {
+        (void)name;
+        (void)changedCells;
+        invalidateVis();
+    }
     virtual void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) = 0;
     virtual void centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender = false) = 0;
     virtual void adjustZoomByFactor(float factor) = 0;
@@ -133,6 +139,12 @@ public:
     // --- Intersection rendering ---
     virtual void renderIntersections() = 0;
     virtual void invalidateIntersect(const std::string& name = "") = 0;
+    virtual void invalidateIntersectRegion(const std::string& name, const cv::Rect& changedCells)
+    {
+        (void)name;
+        (void)changedCells;
+        invalidateIntersect();
+    }
     virtual float intersectionOpacity() const = 0;
     virtual float intersectionThickness() const = 0;
     virtual int surfacePatchSamplingStride() const = 0;

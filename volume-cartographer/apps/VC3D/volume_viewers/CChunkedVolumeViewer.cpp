@@ -58,6 +58,7 @@ constexpr float kPanSmoothingAlpha = 0.65f;
 constexpr int kChunkPrefetchHaloPx = 128;
 constexpr int kChunkPrefetchPriorityOffset = 1024;
 constexpr int kNormalPrefetchSampleStridePx = 32;
+constexpr int kSurfaceCellTileSize = 64;
 constexpr std::array<QRgb, 12> kIntersectionPalette = {
     qRgb(255, 120, 120), qRgb(120, 200, 255), qRgb(120, 255, 140),
     qRgb(255, 220, 100), qRgb(220, 140, 255), qRgb(255, 160, 200),
@@ -227,6 +228,13 @@ void applyPerPixelNormalOffset(cv::Mat_<cv::Vec3f>& coords,
 std::uint64_t surfaceTileKey(int tx, int ty)
 {
     return (std::uint64_t(std::uint32_t(ty)) << 32) | std::uint32_t(tx);
+}
+
+std::uint64_t surfaceCellTileKey(int col, int row)
+{
+    const int tx = col >= 0 ? col / kSurfaceCellTileSize : (col - kSurfaceCellTileSize + 1) / kSurfaceCellTileSize;
+    const int ty = row >= 0 ? row / kSurfaceCellTileSize : (row - kSurfaceCellTileSize + 1) / kSurfaceCellTileSize;
+    return surfaceTileKey(tx, ty);
 }
 
 void addChunkBox(std::unordered_set<vc::render::ChunkKey, vc::render::ChunkKeyHash>& keys,
@@ -705,11 +713,46 @@ void CChunkedVolumeViewer::invalidateVis()
     _surfaceChunkPrefetchCache = {};
 }
 
+void CChunkedVolumeViewer::invalidateVisRegion(const std::string& name, const cv::Rect& changedCells)
+{
+    if (changedCells.empty() || name != _surfName || _surfName != "segmentation") {
+        invalidateVis();
+        return;
+    }
+
+    auto surf = _surfWeak.lock();
+    auto* quad = dynamic_cast<QuadSurface*>(surf.get());
+    if (!quad) {
+        invalidateVis();
+        return;
+    }
+
+    _genCacheDirty = true;
+    _stableFramebufferValid = false;
+
+    auto& cache = _surfaceChunkPrefetchCache;
+    if (!cache.valid || cache.surface != quad) {
+        return;
+    }
+
+    const int tx0 = changedCells.x / kSurfaceCellTileSize;
+    const int ty0 = changedCells.y / kSurfaceCellTileSize;
+    const int tx1 = (changedCells.x + changedCells.width - 1) / kSurfaceCellTileSize;
+    const int ty1 = (changedCells.y + changedCells.height - 1) / kSurfaceCellTileSize;
+    for (int ty = ty0; ty <= ty1; ++ty) {
+        for (int tx = tx0; tx <= tx1; ++tx) {
+            cache.tileKeys.erase(surfaceTileKey(tx, ty));
+        }
+    }
+}
+
 void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
                                             const std::shared_ptr<Surface>& surf,
                                             bool isEditUpdate)
 {
     const bool isCurrentSurface = (_surfName == name);
+    const auto previousSurface = _surfWeak.lock();
+    const bool isSameCurrentSurface = isCurrentSurface && previousSurface && previousSurface == surf;
     const bool isIntersectionTarget =
         _intersectTgts.count(name) != 0 ||
         (_intersectTgts.count("visible_segmentation") != 0 &&
@@ -725,6 +768,19 @@ void CChunkedVolumeViewer::onSurfaceChanged(const std::string& name,
     }
 
     _surfWeak = surf;
+    if (isSameCurrentSurface && isEditUpdate) {
+        _genCacheDirty = true;
+        _surfaceChunkPrefetchCache = {};
+        _zOffWorldDir = {0, 0, 0};
+        _stableFramebufferValid = false;
+        updateContentBounds();
+        updateFocusMarker();
+        scheduleRender();
+        renderIntersections();
+        emit overlaysUpdated();
+        return;
+    }
+
     _genCacheDirty = true;
     _surfaceChunkPrefetchCache = {};
     _zOffWorldDir = {0, 0, 0};
@@ -1601,9 +1657,8 @@ void CChunkedVolumeViewer::prefetchVisibleSurfaceChunks(int priorityOffset)
     if (visibleCells.empty())
         return;
 
-    constexpr int kSurfacePrefetchTileCells = 64;
-    const int padX = std::max(kSurfacePrefetchTileCells, visibleCells.width / 2);
-    const int padY = std::max(kSurfacePrefetchTileCells, visibleCells.height / 2);
+    const int padX = std::max(kSurfaceCellTileSize, visibleCells.width / 2);
+    const int padY = std::max(kSurfaceCellTileSize, visibleCells.height / 2);
     cv::Rect paddedCells(
         visibleCells.x - padX,
         visibleCells.y - padY,
@@ -1627,19 +1682,19 @@ void CChunkedVolumeViewer::prefetchVisibleSurfaceChunks(int priorityOffset)
                                                       vc::render::ChunkKeyHash>& keys) {
         if (cells.empty())
             return;
-        const int tx0 = cells.x / kSurfacePrefetchTileCells;
-        const int ty0 = cells.y / kSurfacePrefetchTileCells;
-        const int tx1 = (cells.x + cells.width - 1) / kSurfacePrefetchTileCells;
-        const int ty1 = (cells.y + cells.height - 1) / kSurfacePrefetchTileCells;
+        const int tx0 = cells.x / kSurfaceCellTileSize;
+        const int ty0 = cells.y / kSurfaceCellTileSize;
+        const int tx1 = (cells.x + cells.width - 1) / kSurfaceCellTileSize;
+        const int ty1 = (cells.y + cells.height - 1) / kSurfaceCellTileSize;
         for (int ty = ty0; ty <= ty1; ++ty) {
             for (int tx = tx0; tx <= tx1; ++tx) {
                 const std::uint64_t key = surfaceTileKey(tx, ty);
                 auto it = cache.tileKeys.find(key);
                 if (it == cache.tileKeys.end()) {
-                    cv::Rect tileCells(tx * kSurfacePrefetchTileCells,
-                                       ty * kSurfacePrefetchTileCells,
-                                       kSurfacePrefetchTileCells,
-                                       kSurfacePrefetchTileCells);
+                    cv::Rect tileCells(tx * kSurfaceCellTileSize,
+                                       ty * kSurfaceCellTileSize,
+                                       kSurfaceCellTileSize,
+                                       kSurfaceCellTileSize);
                     tileCells &= cellBounds;
                     it = cache.tileKeys.emplace(
                         key,
@@ -2951,6 +3006,32 @@ void CChunkedVolumeViewer::invalidateIntersect(const std::string&)
     clearIntersectionItems();
     _lastIntersectFp = {};
     _intersectionGeometryCache = {};
+    _flattenedIntersectionCache = {};
+    _flattenedIntersectionDirtyCells.reset();
+}
+
+void CChunkedVolumeViewer::invalidateIntersectRegion(const std::string& name,
+                                                     const cv::Rect& changedCells)
+{
+    if (changedCells.empty()) {
+        return;
+    }
+    if (name.empty() || name != "segmentation") {
+        invalidateIntersect(name);
+        return;
+    }
+    if (_surfName != "segmentation") {
+        invalidateIntersect(name);
+        return;
+    }
+
+    _flattenedIntersectionDirtyCells =
+        _flattenedIntersectionDirtyCells
+            ? rectContains(*_flattenedIntersectionDirtyCells, changedCells)
+                  ? *_flattenedIntersectionDirtyCells
+                  : (*_flattenedIntersectionDirtyCells | changedCells)
+            : changedCells;
+    _lastIntersectFp = {};
 }
 
 void CChunkedVolumeViewer::clearIntersectionItems()
@@ -2961,6 +3042,7 @@ void CChunkedVolumeViewer::clearIntersectionItems()
         delete item;
     }
     _intersectionItems.clear();
+    _flattenedIntersectionCache.tileItems.clear();
     _intersectionItemsHaveCamera = false;
 }
 
@@ -3054,7 +3136,8 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
     fp.patchCount = patchIndex->patchCount();
     fp.surfaceCount = patchIndex->surfaceCount();
     fp.activeSegHash = std::hash<const void*>{}(activeSeg.get());
-    fp.targetGenerationHash = std::hash<uint64_t>{}(patchIndex->generation(activeSeg));
+    const uint64_t activeGeneration = patchIndex->generation(activeSeg);
+    fp.targetGenerationHash = std::hash<uint64_t>{}(activeGeneration);
 
     // Flattened intersections are built in surface-view scene coordinates.
     // Pan/zoom can reuse the same paths by transforming the existing items.
@@ -3064,10 +3147,6 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
         updateIntersectionPreviewTransform();
         return;
     }
-
-    clearIntersectionItems();
-    _lastIntersectFp = fp;
-    _intersectionGeometryCache = {};
 
     Rect3D allBounds{cv::Vec3f(0, 0, 0), cv::Vec3f(1, 1, 1)};
     if (_volume) {
@@ -3092,46 +3171,253 @@ void CChunkedVolumeViewer::renderFlattenedIntersections(const std::shared_ptr<Su
         return isFiniteScalar(p.x()) && isFiniteScalar(p.y());
     };
 
-    std::vector<QPainterPath> paths(planes.size());
-    SurfacePatchIndex::TriangleQuery query;
-    query.bounds = allBounds;
-    query.surfaces.only = activeSeg;
-    patchIndex->forEachTriangle(query,
-        [&](const SurfacePatchIndex::TriangleCandidate& tri) {
-            for (size_t idx = 0; idx < planes.size(); ++idx) {
-                auto seg = SurfacePatchIndex::clipTriangleToPlane(
-                    tri, *planes[idx].plane, clipTol);
-                if (!seg)
-                    continue;
-                const cv::Vec3f a = activeSeg->loc(seg->surfaceParams[0]);
-                const cv::Vec3f b = activeSeg->loc(seg->surfaceParams[1]);
-                const QPointF pa = surfaceToScene(a[0], a[1]);
-                const QPointF pb = surfaceToScene(b[0], b[1]);
-                if (!isFinitePoint(pa) || !isFinitePoint(pb))
-                    continue;
-                paths[idx].moveTo(pa);
-                paths[idx].lineTo(pb);
-            }
-        });
+    const cv::Mat_<cv::Vec3f>* points = activeSeg->rawPointsPtr();
+    if (!points || points->cols < 2 || points->rows < 2) {
+        invalidateIntersect();
+        _lastIntersectFp = {};
+        return;
+    }
 
-    _intersectionItems.reserve(paths.size());
-    for (size_t idx = 0; idx < paths.size(); ++idx) {
-        if (paths[idx].isEmpty())
+    auto cellBounds = [&]() {
+        return cv::Rect(0, 0, points->cols - 1, points->rows - 1);
+    };
+    const int stride = std::max(1, patchIndex->samplingStride());
+    const bool cacheCompatible =
+        _flattenedIntersectionCache.valid &&
+        _flattenedIntersectionCache.surface == activeSeg.get() &&
+        _flattenedIntersectionCache.planesHash == planesHash &&
+        _flattenedIntersectionCache.indexSamplingStride == stride;
+    const bool displayOnlyRefresh =
+        cacheCompatible &&
+        _flattenedIntersectionCache.generation == activeGeneration &&
+        !_flattenedIntersectionDirtyCells;
+    const bool needsFullRebuild =
+        !cacheCompatible ||
+        (_flattenedIntersectionCache.generation != activeGeneration &&
+         !_flattenedIntersectionDirtyCells);
+    std::unordered_set<std::uint64_t> dirtyTiles;
+
+    auto removeFlattenedTileItems = [&](std::uint64_t tileKey) {
+        auto it = _flattenedIntersectionCache.tileItems.find(tileKey);
+        if (it == _flattenedIntersectionCache.tileItems.end()) {
+            return;
+        }
+        for (auto* item : it->second) {
+            if (!item) {
+                continue;
+            }
+            if (item->scene()) {
+                _scene->removeItem(item);
+            }
+            auto vecIt = std::find(_intersectionItems.begin(), _intersectionItems.end(), item);
+            if (vecIt != _intersectionItems.end()) {
+                _intersectionItems.erase(vecIt);
+            }
+            delete item;
+        }
+        _flattenedIntersectionCache.tileItems.erase(it);
+    };
+
+    auto rebuildFlattenedCells = [&](const cv::Rect& requestedCells) {
+        const cv::Rect cells = requestedCells & cellBounds();
+        if (cells.empty()) {
+            return;
+        }
+
+        const cv::Vec3f center = activeSeg->center();
+        const cv::Vec2f gridScale = activeSeg->scale();
+        const float cx = center[0] * gridScale[0];
+        const float cy = center[1] * gridScale[1];
+
+        const int rowStart = (cells.y / stride) * stride;
+        const int colStart = (cells.x / stride) * stride;
+        const int rowEnd = cells.y + cells.height;
+        const int colEnd = cells.x + cells.width;
+        for (int row = rowStart; row < rowEnd && row < points->rows - 1; row += stride) {
+            for (int col = colStart; col < colEnd && col < points->cols - 1; col += stride) {
+                const std::uint64_t key = surfaceTileKey(col, row);
+                dirtyTiles.insert(surfaceCellTileKey(col, row));
+                std::vector<FlattenedIntersectionLine> lines;
+
+                const int strideX = std::min(stride, points->cols - 1 - col);
+                const int strideY = std::min(stride, points->rows - 1 - row);
+                if (strideX <= 0 || strideY <= 0) {
+                    _flattenedIntersectionCache.cellLines.erase(key);
+                    continue;
+                }
+
+                const std::array<cv::Vec3f, 4> corners = {
+                    (*points)(row, col),
+                    (*points)(row, col + strideX),
+                    (*points)(row + strideY, col + strideX),
+                    (*points)(row + strideY, col),
+                };
+                if (!validSurfacePoint(corners[0]) || !validSurfacePoint(corners[1]) ||
+                    !validSurfacePoint(corners[2]) || !validSurfacePoint(corners[3])) {
+                    _flattenedIntersectionCache.cellLines.erase(key);
+                    continue;
+                }
+
+                const float baseX = static_cast<float>(col);
+                const float baseY = static_cast<float>(row);
+                const std::array<cv::Vec3f, 4> params = {
+                    cv::Vec3f(baseX - cx, baseY - cy, 0.0f),
+                    cv::Vec3f(baseX + float(strideX) - cx, baseY - cy, 0.0f),
+                    cv::Vec3f(baseX + float(strideX) - cx, baseY + float(strideY) - cy, 0.0f),
+                    cv::Vec3f(baseX - cx, baseY + float(strideY) - cy, 0.0f),
+                };
+
+                for (int triIdx = 0; triIdx < 2; ++triIdx) {
+                    SurfacePatchIndex::TriangleCandidate tri;
+                    tri.surface = activeSeg;
+                    tri.i = col;
+                    tri.j = row;
+                    tri.triangleIndex = triIdx;
+                    if (triIdx == 0) {
+                        tri.world = {corners[0], corners[1], corners[3]};
+                        tri.surfaceParams = {params[0], params[1], params[3]};
+                    } else {
+                        tri.world = {corners[1], corners[2], corners[3]};
+                        tri.surfaceParams = {params[1], params[2], params[3]};
+                    }
+
+                    if ((tri.world[0][0] < allBounds.low[0] && tri.world[1][0] < allBounds.low[0] && tri.world[2][0] < allBounds.low[0]) ||
+                        (tri.world[0][0] > allBounds.high[0] && tri.world[1][0] > allBounds.high[0] && tri.world[2][0] > allBounds.high[0]) ||
+                        (tri.world[0][1] < allBounds.low[1] && tri.world[1][1] < allBounds.low[1] && tri.world[2][1] < allBounds.low[1]) ||
+                        (tri.world[0][1] > allBounds.high[1] && tri.world[1][1] > allBounds.high[1] && tri.world[2][1] > allBounds.high[1]) ||
+                        (tri.world[0][2] < allBounds.low[2] && tri.world[1][2] < allBounds.low[2] && tri.world[2][2] < allBounds.low[2]) ||
+                        (tri.world[0][2] > allBounds.high[2] && tri.world[1][2] > allBounds.high[2] && tri.world[2][2] > allBounds.high[2])) {
+                        continue;
+                    }
+
+                    for (size_t idx = 0; idx < planes.size(); ++idx) {
+                        auto seg = SurfacePatchIndex::clipTriangleToPlane(
+                            tri, *planes[idx].plane, clipTol);
+                        if (!seg) {
+                            continue;
+                        }
+                        const cv::Vec3f a = activeSeg->loc(seg->surfaceParams[0]);
+                        const cv::Vec3f b = activeSeg->loc(seg->surfaceParams[1]);
+                        const QPointF pa = surfaceToScene(a[0], a[1]);
+                        const QPointF pb = surfaceToScene(b[0], b[1]);
+                        if (!isFinitePoint(pa) || !isFinitePoint(pb)) {
+                            continue;
+                        }
+                        lines.push_back(FlattenedIntersectionLine{static_cast<int>(idx), pa, pb});
+                    }
+                }
+
+                if (lines.empty()) {
+                    _flattenedIntersectionCache.cellLines.erase(key);
+                } else {
+                    _flattenedIntersectionCache.cellLines[key] = std::move(lines);
+                }
+            }
+        }
+    };
+
+    if (needsFullRebuild) {
+        clearIntersectionItems();
+        _flattenedIntersectionCache = {};
+        _flattenedIntersectionCache.surface = activeSeg.get();
+        _flattenedIntersectionCache.planesHash = planesHash;
+        _flattenedIntersectionCache.indexSamplingStride = stride;
+        _flattenedIntersectionCache.cellLines.reserve(
+            std::size_t(points->rows / stride + 1) * std::size_t(points->cols / stride + 1) / 8 + 1024);
+        rebuildFlattenedCells(cellBounds());
+        _flattenedIntersectionCache.valid = true;
+    } else if (_flattenedIntersectionDirtyCells) {
+        rebuildFlattenedCells(*_flattenedIntersectionDirtyCells);
+    } else if (!cacheCompatible) {
+        invalidateIntersect();
+        _lastIntersectFp = {};
+        return;
+    }
+    _flattenedIntersectionCache.generation = activeGeneration;
+    _flattenedIntersectionDirtyCells.reset();
+
+    _lastIntersectFp = fp;
+    _intersectionGeometryCache = {};
+
+    const bool rebuildAllTileItems =
+        needsFullRebuild ||
+        displayOnlyRefresh ||
+        _flattenedIntersectionCache.tileItems.empty();
+    if (rebuildAllTileItems) {
+        dirtyTiles.clear();
+        for (const auto& [cellKey, _] : _flattenedIntersectionCache.cellLines) {
+            const int col = int(std::uint32_t(cellKey));
+            const int row = int(std::uint32_t(cellKey >> 32));
+            dirtyTiles.insert(surfaceCellTileKey(col, row));
+        }
+    }
+
+    if (dirtyTiles.empty()) {
+        _intersectionItemsCamSurfX = _camSurfX;
+        _intersectionItemsCamSurfY = _camSurfY;
+        _intersectionItemsCamScale = _camScale;
+        _intersectionItemsHaveCamera = !_intersectionItems.empty();
+        _view->viewport()->update();
+        return;
+    }
+
+    std::unordered_map<std::uint64_t, std::vector<QPainterPath>> tilePaths;
+    tilePaths.reserve(dirtyTiles.size());
+    for (std::uint64_t tileKey : dirtyTiles) {
+        removeFlattenedTileItems(tileKey);
+        tilePaths.emplace(tileKey, std::vector<QPainterPath>(planes.size()));
+    }
+
+    for (const auto& [cellKey, lines] : _flattenedIntersectionCache.cellLines) {
+        const int col = int(std::uint32_t(cellKey));
+        const int row = int(std::uint32_t(cellKey >> 32));
+        const std::uint64_t tileKey = surfaceCellTileKey(col, row);
+        auto pathsIt = tilePaths.find(tileKey);
+        if (pathsIt == tilePaths.end()) {
             continue;
-        QColor color = planes[idx].color;
-        color.setAlphaF(opacity);
-        auto* item = new QGraphicsPathItem(paths[idx]);
-        QPen pen(color);
-        pen.setWidthF(static_cast<qreal>(penWidth));
-        pen.setCapStyle(Qt::RoundCap);
-        pen.setJoinStyle(Qt::RoundJoin);
-        pen.setCosmetic(true);
-        item->setPen(pen);
-        item->setBrush(Qt::NoBrush);
-        item->setZValue(kActiveIntersectionZ);
-        item->setAcceptedMouseButtons(Qt::NoButton);
-        _scene->addItem(item);
-        _intersectionItems.push_back(item);
+        }
+        auto& paths = pathsIt->second;
+        for (const auto& line : lines) {
+            if (line.planeIndex < 0 || static_cast<size_t>(line.planeIndex) >= paths.size()) {
+                continue;
+            }
+            paths[line.planeIndex].moveTo(line.a);
+            paths[line.planeIndex].lineTo(line.b);
+        }
+    }
+
+    for (auto& [tileKey, paths] : tilePaths) {
+        std::vector<QGraphicsItem*> tileItems;
+        tileItems.reserve(paths.size());
+        for (size_t idx = 0; idx < paths.size(); ++idx) {
+            if (paths[idx].isEmpty()) {
+                continue;
+            }
+            QColor color = planes[idx].color;
+            color.setAlphaF(opacity);
+            auto* item = new QGraphicsPathItem(paths[idx]);
+            QPen pen(color);
+            pen.setWidthF(static_cast<qreal>(penWidth));
+            pen.setCapStyle(Qt::RoundCap);
+            pen.setJoinStyle(Qt::RoundJoin);
+            pen.setCosmetic(true);
+            item->setPen(pen);
+            item->setBrush(Qt::NoBrush);
+            item->setZValue(kActiveIntersectionZ);
+            item->setAcceptedMouseButtons(Qt::NoButton);
+            _scene->addItem(item);
+            _intersectionItems.push_back(item);
+            tileItems.push_back(item);
+        }
+        if (!tileItems.empty()) {
+            _flattenedIntersectionCache.tileItems[tileKey] = std::move(tileItems);
+        }
+    }
+
+    if (_intersectionItems.empty()) {
+        _intersectionItemsHaveCamera = false;
+        _view->viewport()->update();
+        return;
     }
 
     _intersectionItemsCamSurfX = _camSurfX;

@@ -149,6 +149,10 @@ void CState::closeAll()
 void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, bool noSignalSend, bool isEditUpdate)
 {
     auto it = _surfs.find(name);
+    const bool sameSurface = it != _surfs.end() && it->second == surf;
+    if (sameSurface && !isEditUpdate && surf != nullptr) {
+        return;
+    }
     if (it != _surfs.end() && it->second && it->second != surf) {
         emit surfaceWillBeDeleted(name, it->second);
     }

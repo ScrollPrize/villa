@@ -938,8 +938,17 @@ void SegmentationPushPullTool::refreshActiveViewer(VolumeViewerBase* viewer)
         }
     }
 
-    viewer->invalidateVis();
-    viewer->invalidateIntersect("segmentation");
+    if (const auto touched = _editManager->recentTouchedBounds()) {
+        const cv::Rect changedCells(touched->x - 1,
+                                    touched->y - 1,
+                                    touched->width + 1,
+                                    touched->height + 1);
+        viewer->invalidateVisRegion("segmentation", changedCells);
+        viewer->invalidateIntersectRegion("segmentation", changedCells);
+    } else {
+        viewer->invalidateVis();
+        viewer->invalidateIntersect("segmentation");
+    }
     viewer->renderIntersections();
     viewer->requestRender();
 }
