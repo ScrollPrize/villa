@@ -68,6 +68,8 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
 
     emitPendingChanges();
     _pendingAutosave = false;
+    _pendingAutosaveVertexUpdates.clear();
+    _saveSnapshot.reset();
     _autosaveNotifiedFailure = false;
     updateAutosaveState();
     return true;
@@ -115,6 +117,10 @@ void SegmentationModule::endEditingSession()
     if (_editManager) {
         _editManager->endSession();
     }
+    if (!_saveInProgress) {
+        _saveSnapshot.reset();
+    }
+    _pendingAutosaveVertexUpdates.clear();
     updateAutosaveState();
 }
 

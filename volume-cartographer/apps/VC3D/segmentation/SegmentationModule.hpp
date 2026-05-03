@@ -387,6 +387,7 @@ private:
     void ensureAutosaveTimer();
     void updateAutosaveState();
     void saveApprovalMaskToDisk();
+    void queueAutosaveVertexUpdates(const std::vector<SegmentationEditManager::VertexEdit>& edits);
 
     SegmentationWidget* _widget{nullptr};
     SegmentationEditManager* _editManager{nullptr};
@@ -458,7 +459,16 @@ private:
     bool _autosaveNotifiedFailure{false};
 
     // Async save state
-    QFuture<void> _saveFuture;
+    struct AutosaveVertexUpdate
+    {
+        int row{0};
+        int col{0};
+        cv::Vec3f world{0.0f, 0.0f, 0.0f};
+    };
+
+    QFuture<std::shared_ptr<QuadSurface>> _saveFuture;
+    std::shared_ptr<QuadSurface> _saveSnapshot;
+    std::vector<AutosaveVertexUpdate> _pendingAutosaveVertexUpdates;
     bool _saveInProgress{false};
     bool _dirtyAfterSave{false};
 

@@ -995,6 +995,9 @@ void SegmentationModule::applyEdits()
         return;
     }
     const bool hadPendingChanges = _editManager->hasPendingChanges();
+    const auto autosaveEdits = hadPendingChanges
+        ? _editManager->editedVertices()
+        : std::vector<SegmentationEditManager::VertexEdit>{};
 
     // Capture delta for undo before applyPreview() clears edited vertices
     if (hadPendingChanges) {
@@ -1016,6 +1019,7 @@ void SegmentationModule::applyEdits()
         _state->setSurface("segmentation", preview, false, true);
     }
     emitPendingChanges();
+    queueAutosaveVertexUpdates(autosaveEdits);
     markAutosaveNeeded(true);
     if (hadPendingChanges) {
         emit statusMessageRequested(tr("Applied segmentation edits."), kStatusShort);
@@ -2482,6 +2486,10 @@ void SegmentationModule::markAutosaveNeeded(bool immediate)
         return;
     }
 
+    if (_editManager->hasPendingChanges()) {
+        queueAutosaveVertexUpdates(_editManager->editedVertices());
+    }
+
     _pendingAutosave = true;
     _autosaveNotifiedFailure = false;
 
@@ -2492,6 +2500,23 @@ void SegmentationModule::markAutosaveNeeded(bool immediate)
 
     if (immediate) {
         performAutosave();
+    }
+}
+
+void SegmentationModule::queueAutosaveVertexUpdates(
+    const std::vector<SegmentationEditManager::VertexEdit>& edits)
+{
+    if (edits.empty()) {
+        return;
+    }
+
+    _pendingAutosaveVertexUpdates.reserve(_pendingAutosaveVertexUpdates.size() + edits.size());
+    for (const auto& edit : edits) {
+        _pendingAutosaveVertexUpdates.push_back(AutosaveVertexUpdate{
+            edit.row,
+            edit.col,
+            edit.currentWorld
+        });
     }
 }
 
@@ -2526,19 +2551,36 @@ void SegmentationModule::performAutosave()
 
     ensureSurfaceMetaObject(surfacePtr.get());
 
-    // Snapshot the surface data on the main thread so the background write
-    // does not race with ongoing edits.
-    auto snapshot = std::make_shared<QuadSurface>(surfacePtr->rawPoints(), surfacePtr->scale());
-    for (const auto& name : surfacePtr->channelNames()) {
-        cv::Mat ch = surfacePtr->channel(name, SURF_CHANNEL_NORESIZE);
-        if (!ch.empty()) {
-            snapshot->setChannel(name, ch.clone());
-        }
+    auto vertexUpdates = std::move(_pendingAutosaveVertexUpdates);
+    _pendingAutosaveVertexUpdates.clear();
+
+    auto snapshot = _saveSnapshot;
+    const auto savePath = surfacePtr->path;
+    const auto saveId = surfacePtr->id;
+    const auto saveMeta = surfacePtr->meta;
+    const cv::Vec2f saveScale = surfacePtr->scale();
+    const cv::Mat_<cv::Vec3f>* sourcePoints = surfacePtr->rawPointsPtr();
+    const cv::Size sourceSize = sourcePoints ? sourcePoints->size() : cv::Size();
+
+    // Non-vertex saves, such as channel/mask changes, still need the full
+    // surface state. Keep that compatibility path while avoiding it for the
+    // common geometry-edit case where vertexUpdates carries the precise delta.
+    if (snapshot && (snapshot->path != savePath || snapshot->id != saveId)) {
+        snapshot.reset();
     }
-    // Copy metadata needed by save()
-    snapshot->path = surfacePtr->path;
-    snapshot->id = surfacePtr->id;
-    snapshot->meta = surfacePtr->meta;
+
+    if (vertexUpdates.empty()) {
+        snapshot = std::make_shared<QuadSurface>(surfacePtr->rawPoints(), saveScale);
+        for (const auto& name : surfacePtr->channelNames()) {
+            cv::Mat ch = surfacePtr->channel(name, SURF_CHANNEL_NORESIZE);
+            if (!ch.empty()) {
+                snapshot->setChannel(name, ch.clone());
+            }
+        }
+        snapshot->path = savePath;
+        snapshot->id = saveId;
+        snapshot->meta = saveMeta;
+    }
 
     _pendingAutosave = false;
     _saveInProgress = true;
@@ -2546,8 +2588,42 @@ void SegmentationModule::performAutosave()
 
     emit statusMessageRequested(tr("Saving..."), kStatusShort);
 
-    _saveFuture = QtConcurrent::run([snapshot]() {
+    _saveFuture = QtConcurrent::run([snapshot,
+                                      vertexUpdates = std::move(vertexUpdates),
+                                      savePath,
+                                      saveId,
+                                      saveMeta,
+                                      sourceSize]() mutable -> std::shared_ptr<QuadSurface> {
+        if (!snapshot) {
+            snapshot = std::make_shared<QuadSurface>(savePath);
+            snapshot->ensureLoaded();
+        }
+
+        auto* points = snapshot->rawPointsPtr();
+        if (!points || points->empty()) {
+            throw std::runtime_error("Autosave snapshot has no point data");
+        }
+
+        if (!sourceSize.empty() && points->size() != sourceSize) {
+            throw std::runtime_error("Autosave snapshot size does not match the active surface");
+        }
+
+        if (!vertexUpdates.empty()) {
+            for (const auto& update : vertexUpdates) {
+                if (update.row < 0 || update.row >= points->rows ||
+                    update.col < 0 || update.col >= points->cols) {
+                    continue;
+                }
+                (*points)(update.row, update.col) = update.world;
+            }
+            snapshot->invalidateCache();
+        }
+
+        snapshot->path = savePath;
+        snapshot->id = saveId;
+        snapshot->meta = saveMeta;
         snapshot->saveOverwrite();
+        return snapshot;
     });
 
     // Poll for completion via a single-shot timer to avoid blocking
@@ -2566,6 +2642,7 @@ void SegmentationModule::performAutosave()
         // Check for exceptions from the future
         try {
             _saveFuture.waitForFinished();
+            _saveSnapshot = _saveFuture.result();
             _autosaveNotifiedFailure = false;
             emit statusMessageRequested(tr("Saved"), kStatusShort);
         } catch (const std::exception& ex) {
